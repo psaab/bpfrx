@@ -150,9 +150,25 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"nat": {children: map[string]*schemaNode{
-			"source":      {children: nil},
-			"destination": {children: nil},
-			"static":      {children: nil},
+			"source": {children: map[string]*schemaNode{
+				"rule-set": {args: 1, children: map[string]*schemaNode{
+					"rule": {args: 1, children: map[string]*schemaNode{
+						"match": {children: nil},
+						"then":  {children: nil},
+					}},
+					// from zone <zone>, to zone <zone> → leaves
+				}},
+			}},
+			"destination": {children: map[string]*schemaNode{
+				"pool": {args: 1, children: nil},
+				"rule-set": {args: 1, children: map[string]*schemaNode{
+					"rule": {args: 1, children: map[string]*schemaNode{
+						"match": {children: nil},
+						"then":  {children: nil},
+					}},
+				}},
+			}},
+			"static": {children: nil},
 		}},
 		"address-book": {children: map[string]*schemaNode{
 			"global": {children: map[string]*schemaNode{

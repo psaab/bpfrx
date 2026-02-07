@@ -29,9 +29,27 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	meta->ingress_zone = *zone_id;
 
 	/*
+	 * Pre-routing NAT: check dnat_table before FIB lookup.
+	 * This handles both static DNAT entries (from config) and
+	 * dynamic SNAT return entries (from xdp_policy).
+	 */
+	struct dnat_key dk = {
+		.protocol = meta->protocol,
+		.dst_ip   = meta->dst_ip,
+		.dst_port = meta->dst_port,
+	};
+	struct dnat_value *dv = bpf_map_lookup_elem(&dnat_table, &dk);
+	if (dv) {
+		meta->nat_dst_ip   = meta->dst_ip;    /* save original for session */
+		meta->nat_dst_port = meta->dst_port;
+		meta->dst_ip       = dv->new_dst_ip;  /* translate for FIB + conntrack */
+		meta->dst_port     = dv->new_dst_port;
+		meta->nat_flags   |= SESS_FLAG_DNAT;  /* signal pre-routing NAT applied */
+	}
+
+	/*
 	 * FIB lookup to determine egress interface.
-	 * This tells us where the packet would be forwarded,
-	 * which lets us determine the egress zone for policy.
+	 * Uses the (possibly translated) dst_ip for routing.
 	 */
 	struct bpf_fib_lookup fib = {};
 	fib.family    = AF_INET;
@@ -72,7 +90,6 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		 * No route or packet is destined locally.
 		 * Egress zone stays 0 (unset). Later policy stages
 		 * can handle host-inbound traffic.
-		 * For Phase 1, just pass to kernel.
 		 */
 		return XDP_PASS;
 	}

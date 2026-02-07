@@ -55,6 +55,10 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 			if err := compileScreen(child, sec); err != nil {
 				return fmt.Errorf("screen: %w", err)
 			}
+		case "nat":
+			if err := compileNAT(child, sec); err != nil {
+				return fmt.Errorf("nat: %w", err)
+			}
 		case "address-book":
 			if err := compileAddressBook(child, sec); err != nil {
 				return fmt.Errorf("address-book: %w", err)
@@ -329,6 +333,189 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 		}
 
 		ifaces.Interfaces[ifName] = ifc
+	}
+	return nil
+}
+
+func compileNAT(node *Node, sec *SecurityConfig) error {
+	srcNode := node.FindChild("source")
+	if srcNode != nil {
+		if err := compileNATSource(srcNode, sec); err != nil {
+			return fmt.Errorf("source: %w", err)
+		}
+	}
+
+	dstNode := node.FindChild("destination")
+	if dstNode != nil {
+		if err := compileNATDestination(dstNode, sec); err != nil {
+			return fmt.Errorf("destination: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func compileNATSource(node *Node, sec *SecurityConfig) error {
+	for _, rsNode := range node.FindChildren("rule-set") {
+		if len(rsNode.Keys) < 2 {
+			continue
+		}
+		rs := &NATRuleSet{Name: rsNode.Keys[1]}
+
+		// Parse from/to zone
+		for _, child := range rsNode.Children {
+			if child.Name() == "from" && len(child.Keys) >= 3 && child.Keys[1] == "zone" {
+				rs.FromZone = child.Keys[2]
+			}
+			if child.Name() == "to" && len(child.Keys) >= 3 && child.Keys[1] == "zone" {
+				rs.ToZone = child.Keys[2]
+			}
+		}
+
+		// Parse rules
+		for _, ruleNode := range rsNode.FindChildren("rule") {
+			if len(ruleNode.Keys) < 2 {
+				continue
+			}
+			rule := &NATRule{Name: ruleNode.Keys[1]}
+
+			matchNode := ruleNode.FindChild("match")
+			if matchNode != nil {
+				for _, m := range matchNode.Children {
+					switch m.Name() {
+					case "source-address":
+						if len(m.Keys) >= 2 {
+							rule.Match.SourceAddress = m.Keys[1]
+						}
+					case "destination-address":
+						if len(m.Keys) >= 2 {
+							rule.Match.DestinationAddress = m.Keys[1]
+						}
+					case "destination-port":
+						if len(m.Keys) >= 2 {
+							if v, err := strconv.Atoi(m.Keys[1]); err == nil {
+								rule.Match.DestinationPort = v
+							}
+						}
+					}
+				}
+			}
+
+			thenNode := ruleNode.FindChild("then")
+			if thenNode != nil {
+				for _, t := range thenNode.Children {
+					if t.Name() == "source-nat" && len(t.Keys) >= 2 {
+						if t.Keys[1] == "interface" {
+							rule.Then.Type = NATSource
+							rule.Then.Interface = true
+						} else if t.Keys[1] == "pool" && len(t.Keys) >= 3 {
+							rule.Then.Type = NATSource
+							rule.Then.PoolName = t.Keys[2]
+						}
+					}
+				}
+			}
+
+			rs.Rules = append(rs.Rules, rule)
+		}
+
+		sec.NAT.Source = append(sec.NAT.Source, rs)
+	}
+	return nil
+}
+
+func compileNATDestination(node *Node, sec *SecurityConfig) error {
+	if sec.NAT.Destination == nil {
+		sec.NAT.Destination = &DestinationNATConfig{
+			Pools: make(map[string]*NATPool),
+		}
+	}
+
+	// Parse pools
+	for _, poolNode := range node.FindChildren("pool") {
+		if len(poolNode.Keys) < 2 {
+			continue
+		}
+		pool := &NATPool{Name: poolNode.Keys[1]}
+
+		for _, prop := range poolNode.Children {
+			switch prop.Name() {
+			case "address":
+				if len(prop.Keys) >= 2 {
+					pool.Address = prop.Keys[1]
+				}
+			case "port":
+				if len(prop.Keys) >= 2 {
+					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
+						pool.Port = v
+					}
+				}
+			}
+		}
+
+		sec.NAT.Destination.Pools[pool.Name] = pool
+	}
+
+	// Parse rule-sets
+	for _, rsNode := range node.FindChildren("rule-set") {
+		if len(rsNode.Keys) < 2 {
+			continue
+		}
+		rs := &NATRuleSet{Name: rsNode.Keys[1]}
+
+		for _, child := range rsNode.Children {
+			if child.Name() == "from" && len(child.Keys) >= 3 && child.Keys[1] == "zone" {
+				rs.FromZone = child.Keys[2]
+			}
+			if child.Name() == "to" && len(child.Keys) >= 3 && child.Keys[1] == "zone" {
+				rs.ToZone = child.Keys[2]
+			}
+		}
+
+		for _, ruleNode := range rsNode.FindChildren("rule") {
+			if len(ruleNode.Keys) < 2 {
+				continue
+			}
+			rule := &NATRule{Name: ruleNode.Keys[1]}
+
+			matchNode := ruleNode.FindChild("match")
+			if matchNode != nil {
+				for _, m := range matchNode.Children {
+					switch m.Name() {
+					case "destination-address":
+						if len(m.Keys) >= 2 {
+							rule.Match.DestinationAddress = m.Keys[1]
+						}
+					case "destination-port":
+						if len(m.Keys) >= 2 {
+							if v, err := strconv.Atoi(m.Keys[1]); err == nil {
+								rule.Match.DestinationPort = v
+							}
+						}
+					case "source-address":
+						if len(m.Keys) >= 2 {
+							rule.Match.SourceAddress = m.Keys[1]
+						}
+					}
+				}
+			}
+
+			thenNode := ruleNode.FindChild("then")
+			if thenNode != nil {
+				for _, t := range thenNode.Children {
+					if t.Name() == "destination-nat" && len(t.Keys) >= 3 {
+						if t.Keys[1] == "pool" {
+							rule.Then.Type = NATDestination
+							rule.Then.PoolName = t.Keys[2]
+						}
+					}
+				}
+			}
+
+			rs.Rules = append(rs.Rules, rule)
+		}
+
+		sec.NAT.Destination.RuleSets = append(sec.NAT.Destination.RuleSets, rs)
 	}
 	return nil
 }

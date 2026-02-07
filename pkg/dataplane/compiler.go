@@ -60,6 +60,11 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		return nil, fmt.Errorf("compile policies: %w", err)
 	}
 
+	// Phase 6: Compile NAT
+	if err := m.compileNAT(cfg, result); err != nil {
+		return nil, fmt.Errorf("compile nat: %w", err)
+	}
+
 	slog.Info("config compiled to dataplane",
 		"zones", len(result.ZoneIDs),
 		"addresses", len(result.AddrIDs),
@@ -329,6 +334,177 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 	}
 
 	return nil
+}
+
+func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
+	// Clear previous NAT entries
+	if err := m.ClearSNATRules(); err != nil {
+		slog.Warn("failed to clear snat_rules", "err", err)
+	}
+	if err := m.ClearDNATStatic(); err != nil {
+		slog.Warn("failed to clear static dnat entries", "err", err)
+	}
+
+	natCfg := &cfg.Security.NAT
+
+	// Source NAT
+	for _, rs := range natCfg.Source {
+		fromZone, ok := result.ZoneIDs[rs.FromZone]
+		if !ok {
+			slog.Warn("source NAT from-zone not found", "zone", rs.FromZone)
+			continue
+		}
+		toZone, ok := result.ZoneIDs[rs.ToZone]
+		if !ok {
+			slog.Warn("source NAT to-zone not found", "zone", rs.ToZone)
+			continue
+		}
+
+		for _, rule := range rs.Rules {
+			if !rule.Then.Interface {
+				slog.Warn("only interface mode SNAT supported",
+					"rule", rule.Name, "rule-set", rs.Name)
+				continue
+			}
+
+			// Find the to-zone's interface and get its primary IPv4 address
+			toZoneCfg, ok := cfg.Security.Zones[rs.ToZone]
+			if !ok || len(toZoneCfg.Interfaces) == 0 {
+				slog.Warn("to-zone has no interfaces",
+					"zone", rs.ToZone, "rule-set", rs.Name)
+				continue
+			}
+
+			ifaceName := toZoneCfg.Interfaces[0]
+			snatIP, err := getInterfaceIP(ifaceName)
+			if err != nil {
+				slog.Warn("cannot get interface IP for SNAT",
+					"interface", ifaceName, "err", err)
+				continue
+			}
+
+			val := SNATValue{
+				SNATIP: ipToUint32BE(snatIP),
+				Mode:   0, // interface mode
+			}
+			if err := m.SetSNATRule(fromZone, toZone, val); err != nil {
+				return fmt.Errorf("set snat rule %s/%s: %w",
+					rs.Name, rule.Name, err)
+			}
+
+			slog.Info("source NAT rule compiled",
+				"rule-set", rs.Name, "rule", rule.Name,
+				"from", rs.FromZone, "to", rs.ToZone,
+				"snat_ip", snatIP)
+		}
+	}
+
+	// Destination NAT
+	if natCfg.Destination != nil {
+		for _, rs := range natCfg.Destination.RuleSets {
+			for _, rule := range rs.Rules {
+				if rule.Then.PoolName == "" {
+					continue
+				}
+
+				pool, ok := natCfg.Destination.Pools[rule.Then.PoolName]
+				if !ok {
+					slog.Warn("DNAT pool not found",
+						"pool", rule.Then.PoolName,
+						"rule", rule.Name)
+					continue
+				}
+
+				// Parse match destination address
+				if rule.Match.DestinationAddress == "" {
+					slog.Warn("DNAT rule has no match destination-address",
+						"rule", rule.Name)
+					continue
+				}
+
+				matchIP, _, err := net.ParseCIDR(rule.Match.DestinationAddress)
+				if err != nil {
+					// Try as plain IP
+					matchIP = net.ParseIP(rule.Match.DestinationAddress)
+					if matchIP == nil {
+						slog.Warn("invalid DNAT match address",
+							"addr", rule.Match.DestinationAddress)
+						continue
+					}
+				}
+
+				// Parse pool address
+				poolIP, _, err := net.ParseCIDR(pool.Address)
+				if err != nil {
+					poolIP = net.ParseIP(pool.Address)
+					if poolIP == nil {
+						slog.Warn("invalid DNAT pool address",
+							"addr", pool.Address)
+						continue
+					}
+				}
+
+				// Determine port (use pool port if set, else match port)
+				dstPort := uint16(rule.Match.DestinationPort)
+				poolPort := dstPort
+				if pool.Port != 0 {
+					poolPort = uint16(pool.Port)
+				}
+
+				// Determine protocol (default TCP if port specified)
+				proto := uint8(0) // any
+				if dstPort != 0 {
+					proto = 6 // TCP default for port-based DNAT
+				}
+
+				dk := DNATKey{
+					Protocol: proto,
+					DstIP:    ipToUint32BE(matchIP),
+					DstPort:  htons(dstPort),
+				}
+				dv := DNATValue{
+					NewDstIP:   ipToUint32BE(poolIP),
+					NewDstPort: htons(poolPort),
+					Flags:      DNATFlagStatic,
+				}
+				if err := m.SetDNATEntry(dk, dv); err != nil {
+					return fmt.Errorf("set dnat entry %s/%s: %w",
+						rs.Name, rule.Name, err)
+				}
+
+				slog.Info("destination NAT rule compiled",
+					"rule-set", rs.Name, "rule", rule.Name,
+					"match_ip", matchIP, "match_port", dstPort,
+					"pool", pool.Name, "pool_ip", poolIP,
+					"pool_port", poolPort)
+			}
+		}
+	}
+
+	return nil
+}
+
+// getInterfaceIP returns the first IPv4 address of a network interface.
+func getInterfaceIP(ifaceName string) (net.IP, error) {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return nil, fmt.Errorf("interface %s: %w", ifaceName, err)
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, fmt.Errorf("interface %s addrs: %w", ifaceName, err)
+	}
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipNet.IP.To4()
+		if ip4 != nil {
+			return ip4, nil
+		}
+	}
+	return nil, fmt.Errorf("no IPv4 address on interface %s", ifaceName)
 }
 
 // protocolNumber converts a protocol name to its IANA number.

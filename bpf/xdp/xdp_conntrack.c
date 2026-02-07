@@ -77,6 +77,37 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 	meta->ct_direction = direction;
 	meta->policy_id = sess->policy_id;
 
+	/*
+	 * NAT info propagation for established sessions.
+	 * Determine if this is a forward or reverse packet relative
+	 * to the original session initiator:
+	 *   is_fwd = true when we matched the entry whose direction
+	 *            matches the original flow direction.
+	 */
+	int is_fwd = (direction == sess->is_reverse);
+
+	if (sess->flags & SESS_FLAG_SNAT) {
+		if (is_fwd) {
+			/* Forward SNAT: translate source to NAT IP */
+			meta->src_ip   = sess->nat_src_ip;
+			meta->src_port = sess->nat_src_port;
+		}
+		/* Reverse SNAT is handled by dnat_table in xdp_zone */
+	}
+	if (sess->flags & SESS_FLAG_DNAT) {
+		if (!is_fwd) {
+			/* Reverse DNAT: restore original VIP as source */
+			meta->src_ip   = sess->nat_dst_ip;
+			meta->src_port = sess->nat_dst_port;
+		}
+		/* Forward DNAT is handled by dnat_table in xdp_zone */
+	}
+
+	/* Determine tail call target: NAT stage if session has NAT flags */
+	__u32 next_prog = XDP_PROG_FORWARD;
+	if (sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT))
+		next_prog = XDP_PROG_NAT;
+
 	/* Fast-path decision based on state */
 	switch (sess->state) {
 	case SESS_STATE_CLOSED:
@@ -88,14 +119,14 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 	case SESS_STATE_FIN_WAIT:
 	case SESS_STATE_CLOSE_WAIT:
 	case SESS_STATE_TIME_WAIT:
-		/* Fast-path: skip policy, go directly to forward */
-		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+		/* Fast-path: skip policy */
+		bpf_tail_call(ctx, &xdp_progs, next_prog);
 		return XDP_PASS;
 
 	case SESS_STATE_SYN_SENT:
 	case SESS_STATE_SYN_RECV:
 		/* Handshake in progress: session already permitted */
-		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+		bpf_tail_call(ctx, &xdp_progs, next_prog);
 		return XDP_PASS;
 
 	default:

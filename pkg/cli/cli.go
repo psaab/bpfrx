@@ -210,6 +210,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		fmt.Println("  zones            Show security zones")
 		fmt.Println("  policies         Show security policies")
 		fmt.Println("  flow session     Show active sessions")
+		fmt.Println("  nat source       Show source NAT information")
 		return nil
 	}
 
@@ -258,6 +259,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 			return c.showFlowSession()
 		}
 		return fmt.Errorf("unknown show security flow target")
+
+	case "nat":
+		return c.handleShowNAT(args[1:])
 
 	default:
 		return fmt.Errorf("unknown show security target: %s", args[0])
@@ -348,6 +352,21 @@ func (c *CLI) showFlowSession() error {
 		fmt.Printf("  In: %s:%d --> %s:%d;%s,",
 			srcIP, srcPort, dstIP, dstPort, protoName)
 		fmt.Printf(" Zone: %d -> %d\n", val.IngressZone, val.EgressZone)
+
+		// Show NAT translations
+		if val.Flags&dataplane.SessFlagSNAT != 0 {
+			natIP := uint32ToIP(val.NATSrcIP)
+			natPort := ntohs(val.NATSrcPort)
+			fmt.Printf("  NAT: src %s:%d -> %s:%d\n",
+				srcIP, srcPort, natIP, natPort)
+		}
+		if val.Flags&dataplane.SessFlagDNAT != 0 {
+			natIP := uint32ToIP(val.NATDstIP)
+			natPort := ntohs(val.NATDstPort)
+			fmt.Printf("  NAT: dst %s:%d -> %s:%d\n",
+				natIP, natPort, dstIP, dstPort)
+		}
+
 		fmt.Printf("  Packets: %d/%d, Bytes: %d/%d\n",
 			val.FwdPackets, val.RevPackets, val.FwdBytes, val.RevBytes)
 		return true
@@ -357,6 +376,69 @@ func (c *CLI) showFlowSession() error {
 	}
 	fmt.Printf("Total sessions: %d\n", count)
 	return nil
+}
+
+func (c *CLI) handleShowNAT(args []string) error {
+	cfg := c.store.ActiveConfig()
+
+	if len(args) == 0 {
+		fmt.Println("show security nat:")
+		fmt.Println("  source           Show source NAT rules and sessions")
+		return nil
+	}
+
+	switch args[0] {
+	case "source":
+		return c.showNATSource(cfg, args[1:])
+	default:
+		return fmt.Errorf("unknown show security nat target: %s", args[0])
+	}
+}
+
+func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
+	// Show configured source NAT rules
+	if cfg != nil {
+		for _, rs := range cfg.Security.NAT.Source {
+			fmt.Printf("Source NAT rule-set: %s\n", rs.Name)
+			fmt.Printf("  From zone: %s, To zone: %s\n", rs.FromZone, rs.ToZone)
+			for _, rule := range rs.Rules {
+				action := "interface"
+				if rule.Then.PoolName != "" {
+					action = "pool " + rule.Then.PoolName
+				}
+				fmt.Printf("  Rule: %s -> %s\n", rule.Name, action)
+				if rule.Match.SourceAddress != "" {
+					fmt.Printf("    Match source-address: %s\n", rule.Match.SourceAddress)
+				}
+			}
+			fmt.Println()
+		}
+	}
+
+	// Show summary of active SNAT sessions
+	if c.dp == nil || !c.dp.IsLoaded() {
+		return nil
+	}
+
+	snatCount := 0
+	_ = c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if val.Flags&dataplane.SessFlagSNAT != 0 {
+			snatCount++
+		}
+		return true
+	})
+	fmt.Printf("Active SNAT sessions: %d\n", snatCount)
+	return nil
+}
+
+// uint32ToIP converts a network byte order uint32 to net.IP.
+func uint32ToIP(v uint32) net.IP {
+	ip := make(net.IP, 4)
+	binary.BigEndian.PutUint32(ip, v)
+	return ip
 }
 
 func sessionStateName(state uint8) string {

@@ -32,6 +32,8 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["tc_progs"] = mainObjs.TcProgs
 	m.maps["events"] = mainObjs.Events
 	m.maps["pkt_meta_scratch"] = mainObjs.PktMetaScratch
+	m.maps["dnat_table"] = mainObjs.DnatTable
+	m.maps["snat_rules"] = mainObjs.SnatRules
 
 	// Store main program.
 	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
@@ -55,6 +57,8 @@ func (m *Manager) loadAllObjects() error {
 			"policy_counters":   mainObjs.PolicyCounters,
 			"zone_counters":     mainObjs.ZoneCounters,
 			"events":            mainObjs.Events,
+			"dnat_table":        mainObjs.DnatTable,
+			"snat_rules":        mainObjs.SnatRules,
 		},
 	}
 
@@ -79,6 +83,13 @@ func (m *Manager) loadAllObjects() error {
 	}
 	m.programs["xdp_policy_prog"] = polObjs.XdpPolicyProg
 
+	// Load XDP NAT program.
+	var natObjs bpfrxXdpNatObjects
+	if err := loadBpfrxXdpNatObjects(&natObjs, replaceOpts); err != nil {
+		return fmt.Errorf("load xdp_nat: %w", err)
+	}
+	m.programs["xdp_nat_prog"] = natObjs.XdpNatProg
+
 	// Load XDP forward program.
 	var fwdObjs bpfrxXdpForwardObjects
 	if err := loadBpfrxXdpForwardObjects(&fwdObjs, replaceOpts); err != nil {
@@ -92,6 +103,7 @@ func (m *Manager) loadAllObjects() error {
 		XDPProgZone:      zoneObjs.XdpZoneProg,
 		XDPProgConntrack: ctObjs.XdpConntrackProg,
 		XDPProgPolicy:    polObjs.XdpPolicyProg,
+		XDPProgNAT:       natObjs.XdpNatProg,
 		XDPProgForward:   fwdObjs.XdpForwardProg,
 	}
 	for idx, prog := range tailCalls {

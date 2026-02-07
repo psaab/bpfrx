@@ -220,4 +220,54 @@ struct {
 	__uint(max_entries, 1 << 20); /* 1MB */
 } events SEC(".maps");
 
+/* ============================================================
+ * NAT tables
+ * ============================================================ */
+
+/* Pre-routing NAT table: (proto, dst_ip, dst_port) -> new destination.
+ * Used for both static DNAT entries (from config) and dynamic SNAT
+ * return entries (created by xdp_policy when SNAT session is established). */
+struct dnat_key {
+	__u8   protocol;
+	__u8   pad[3];
+	__be32 dst_ip;
+	__be16 dst_port;
+	__be16 pad2;
+};
+
+struct dnat_value {
+	__be32 new_dst_ip;
+	__be16 new_dst_port;
+	__u8   flags;       /* 0=dynamic/SNAT-return, 1=static/DNAT-config */
+	__u8   pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_SESSIONS);
+	__type(key, struct dnat_key);
+	__type(value, struct dnat_value);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} dnat_table SEC(".maps");
+
+/* Source NAT config: (from_zone, to_zone) -> SNAT IP.
+ * Populated by the compiler on commit. */
+struct snat_key {
+	__u16 from_zone;
+	__u16 to_zone;
+};
+
+struct snat_value {
+	__be32 snat_ip;
+	__u8   mode;        /* 0=interface */
+	__u8   pad[3];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_ZONES * MAX_ZONES);
+	__type(key, struct snat_key);
+	__type(value, struct snat_value);
+} snat_rules SEC(".maps");
+
 #endif /* __BPFRX_MAPS_H__ */

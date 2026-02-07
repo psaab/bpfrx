@@ -154,9 +154,85 @@ func (m *Manager) ClearApplications() error {
 	return nil
 }
 
+// SetDNATEntry writes a dnat_table entry.
+func (m *Manager) SetDNATEntry(key DNATKey, val DNATValue) error {
+	zm, ok := m.maps["dnat_table"]
+	if !ok {
+		return fmt.Errorf("dnat_table map not found")
+	}
+	return zm.Update(key, val, ebpf.UpdateAny)
+}
+
+// DeleteDNATEntry deletes a dnat_table entry.
+func (m *Manager) DeleteDNATEntry(key DNATKey) error {
+	zm, ok := m.maps["dnat_table"]
+	if !ok {
+		return fmt.Errorf("dnat_table map not found")
+	}
+	return zm.Delete(key)
+}
+
+// ClearDNATStatic deletes all static (flags=1) dnat_table entries.
+func (m *Manager) ClearDNATStatic() error {
+	zm, ok := m.maps["dnat_table"]
+	if !ok {
+		return fmt.Errorf("dnat_table map not found")
+	}
+	var key DNATKey
+	var val DNATValue
+	iter := zm.Iterate()
+	var toDelete []DNATKey
+	for iter.Next(&key, &val) {
+		if val.Flags == DNATFlagStatic {
+			toDelete = append(toDelete, key)
+		}
+	}
+	for _, k := range toDelete {
+		zm.Delete(k)
+	}
+	return nil
+}
+
+// SetSNATRule writes a snat_rules entry.
+func (m *Manager) SetSNATRule(fromZone, toZone uint16, val SNATValue) error {
+	zm, ok := m.maps["snat_rules"]
+	if !ok {
+		return fmt.Errorf("snat_rules map not found")
+	}
+	key := SNATKey{FromZone: fromZone, ToZone: toZone}
+	return zm.Update(key, val, ebpf.UpdateAny)
+}
+
+// ClearSNATRules deletes all snat_rules entries.
+func (m *Manager) ClearSNATRules() error {
+	zm, ok := m.maps["snat_rules"]
+	if !ok {
+		return fmt.Errorf("snat_rules map not found")
+	}
+	var key SNATKey
+	iter := zm.Iterate()
+	var keys []SNATKey
+	for iter.Next(&key, nil) {
+		keys = append(keys, key)
+	}
+	for _, k := range keys {
+		zm.Delete(k)
+	}
+	return nil
+}
+
 // htons converts a uint16 from host to network byte order.
 func htons(v uint16) uint16 {
 	var b [2]byte
 	binary.BigEndian.PutUint16(b[:], v)
 	return binary.NativeEndian.Uint16(b[:])
+}
+
+// ipToUint32BE converts a net.IP to a uint32 in network byte order.
+func ipToUint32BE(ip net.IP) uint32 {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return 0
+	}
+	return binary.BigEndian.Uint32(ip4)
 }

@@ -38,11 +38,18 @@ func (gc *GC) Run(ctx context.Context) {
 	}
 }
 
+// expiredSession holds session data needed for cleanup.
+type expiredSession struct {
+	key dataplane.SessionKey
+	val dataplane.SessionValue
+}
+
 func (gc *GC) sweep() {
 	now := monotonicSeconds()
 
 	var total, established, expired int
 	var toDelete []dataplane.SessionKey
+	var snatExpired []expiredSession
 
 	err := gc.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		total++
@@ -62,6 +69,11 @@ func (gc *GC) sweep() {
 			// Delete both forward and reverse entries
 			toDelete = append(toDelete, key)
 			toDelete = append(toDelete, val.ReverseKey)
+
+			// Track SNAT sessions for dnat_table cleanup
+			if val.Flags&dataplane.SessFlagSNAT != 0 {
+				snatExpired = append(snatExpired, expiredSession{key: key, val: val})
+			}
 		}
 		return true
 	})
@@ -76,11 +88,24 @@ func (gc *GC) sweep() {
 		}
 	}
 
+	// Clean up dynamic dnat_table entries for expired SNAT sessions
+	for _, s := range snatExpired {
+		dk := dataplane.DNATKey{
+			Protocol: s.key.Protocol,
+			DstIP:    s.val.NATSrcIP,
+			DstPort:  s.key.SrcPort,
+		}
+		if err := gc.dp.DeleteDNATEntry(dk); err != nil {
+			slog.Debug("conntrack GC dnat cleanup failed", "err", err)
+		}
+	}
+
 	if expired > 0 {
 		slog.Info("conntrack GC sweep",
 			"total_entries", total,
 			"established", established,
-			"expired_deleted", expired)
+			"expired_deleted", expired,
+			"snat_dnat_cleaned", len(snatExpired))
 	}
 }
 

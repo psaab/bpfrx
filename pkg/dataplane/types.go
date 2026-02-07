@@ -192,6 +192,48 @@ type AppValue struct {
 	Pad     [3]byte
 }
 
+// Session flag constants.
+const (
+	SessFlagSNAT = 1 << 0
+	SessFlagDNAT = 1 << 1
+)
+
+// DNAT table flags.
+const (
+	DNATFlagDynamic = 0 // dynamic/SNAT-return entry
+	DNATFlagStatic  = 1 // static/DNAT-config entry
+)
+
+// DNATKey mirrors the C struct dnat_key.
+type DNATKey struct {
+	Protocol uint8
+	Pad      [3]byte
+	DstIP    uint32 // network byte order
+	DstPort  uint16 // network byte order
+	Pad2     uint16
+}
+
+// DNATValue mirrors the C struct dnat_value.
+type DNATValue struct {
+	NewDstIP   uint32 // network byte order
+	NewDstPort uint16 // network byte order
+	Flags      uint8
+	Pad        uint8
+}
+
+// SNATKey mirrors the C struct snat_key.
+type SNATKey struct {
+	FromZone uint16
+	ToZone   uint16
+}
+
+// SNATValue mirrors the C struct snat_value.
+type SNATValue struct {
+	SNATIP uint32 // network byte order
+	Mode   uint8
+	Pad    [3]byte
+}
+
 // Event type constants.
 const (
 	EventTypeSessionOpen  = 1

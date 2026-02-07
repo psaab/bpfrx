@@ -76,10 +76,13 @@ emit_event(struct pkt_meta *meta, __u8 event_type, __u8 action,
 
 /*
  * Create dual session entries for a permitted connection.
+ * nat_flags, nat_src_ip/port, nat_dst_ip/port carry NAT state.
  * Returns 0 on success, -1 on failure.
  */
 static __always_inline int
-create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log)
+create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
+	       __u8 nat_flags, __be32 nat_src_ip, __be16 nat_src_port,
+	       __be32 nat_dst_ip, __be16 nat_dst_port)
 {
 	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
 
@@ -107,7 +110,7 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log)
 	/* Forward entry */
 	struct session_value fwd_val = {};
 	fwd_val.state        = initial_state;
-	fwd_val.flags        = 0;
+	fwd_val.flags        = nat_flags;
 	fwd_val.tcp_state    = 0;
 	fwd_val.is_reverse   = 0;
 	fwd_val.created      = now;
@@ -120,16 +123,20 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log)
 	fwd_val.fwd_bytes    = meta->pkt_len;
 	fwd_val.log_flags    = log;
 	fwd_val.reverse_key  = rev_key;
+	fwd_val.nat_src_ip   = nat_src_ip;
+	fwd_val.nat_src_port = nat_src_port;
+	fwd_val.nat_dst_ip   = nat_dst_ip;
+	fwd_val.nat_dst_port = nat_dst_port;
 
 	int ret = bpf_map_update_elem(&sessions, &fwd_key, &fwd_val,
 				      BPF_NOEXIST);
 	if (ret < 0)
 		return -1;
 
-	/* Reverse entry */
+	/* Reverse entry -- carries same NAT info */
 	struct session_value rev_val = {};
 	rev_val.state        = initial_state;
-	rev_val.flags        = 0;
+	rev_val.flags        = nat_flags;
 	rev_val.tcp_state    = 0;
 	rev_val.is_reverse   = 1;
 	rev_val.created      = now;
@@ -140,6 +147,10 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log)
 	rev_val.egress_zone  = meta->ingress_zone;
 	rev_val.log_flags    = log;
 	rev_val.reverse_key  = fwd_key;
+	rev_val.nat_src_ip   = nat_src_ip;
+	rev_val.nat_src_port = nat_src_port;
+	rev_val.nat_dst_ip   = nat_dst_ip;
+	rev_val.nat_dst_port = nat_dst_port;
 
 	ret = bpf_map_update_elem(&sessions, &rev_key, &rev_val,
 				  BPF_NOEXIST);
@@ -229,18 +240,67 @@ int xdp_policy_prog(struct xdp_md *ctx)
 		meta->policy_id = rule->rule_id;
 
 		if (rule->action == ACTION_PERMIT) {
+			__u8 sess_nat_flags = 0;
+			__be32 sess_nat_src_ip = 0, sess_nat_dst_ip = 0;
+			__be16 sess_nat_src_port = 0, sess_nat_dst_port = 0;
+			__be32 orig_src_ip = meta->src_ip;
+			__be16 orig_src_port = meta->src_port;
+
+			/* Check for source NAT rule */
+			struct snat_key sk = {
+				.from_zone = meta->ingress_zone,
+				.to_zone   = meta->egress_zone,
+			};
+			struct snat_value *sv = bpf_map_lookup_elem(&snat_rules, &sk);
+			if (sv) {
+				/* Apply SNAT: translate source IP */
+				meta->src_ip = sv->snat_ip;
+				/* Port preserved (no port allocation) */
+				sess_nat_flags |= SESS_FLAG_SNAT;
+				sess_nat_src_ip = sv->snat_ip;
+				sess_nat_src_port = meta->src_port;
+			}
+
+			/* Check for pre-routing DNAT (set by xdp_zone) */
+			if (meta->nat_flags & SESS_FLAG_DNAT) {
+				sess_nat_flags |= SESS_FLAG_DNAT;
+				sess_nat_dst_ip = meta->nat_dst_ip;
+				sess_nat_dst_port = meta->nat_dst_port;
+			}
+
 			/* Create session entries */
-			if (create_session(meta, rule->rule_id, rule->log) < 0) {
-				/* Session creation failed, drop */
+			if (create_session(meta, rule->rule_id, rule->log,
+					   sess_nat_flags,
+					   sess_nat_src_ip, sess_nat_src_port,
+					   sess_nat_dst_ip, sess_nat_dst_port) < 0) {
 				inc_counter(GLOBAL_CTR_DROPS);
 				return XDP_DROP;
+			}
+
+			/* For SNAT: insert dnat_table entry for return traffic */
+			if (sess_nat_flags & SESS_FLAG_SNAT) {
+				struct dnat_key dk = {
+					.protocol = meta->protocol,
+					.dst_ip   = sv->snat_ip,
+					.dst_port = orig_src_port,
+				};
+				struct dnat_value dv = {
+					.new_dst_ip   = orig_src_ip,
+					.new_dst_port = orig_src_port,
+					.flags        = 0, /* dynamic */
+				};
+				bpf_map_update_elem(&dnat_table, &dk, &dv,
+						    BPF_NOEXIST);
 			}
 
 			if (rule->log)
 				emit_event(meta, EVENT_TYPE_SESSION_OPEN,
 					   ACTION_PERMIT, 0, 0);
 
-			bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+			if (sess_nat_flags)
+				bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
+			else
+				bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
 			return XDP_PASS;
 		}
 
@@ -254,7 +314,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 	/* No rule matched: apply default action */
 	if (ps->default_action == ACTION_PERMIT) {
-		if (create_session(meta, 0, 0) < 0) {
+		if (create_session(meta, 0, 0, 0, 0, 0, 0, 0) < 0) {
 			inc_counter(GLOBAL_CTR_DROPS);
 			return XDP_DROP;
 		}
