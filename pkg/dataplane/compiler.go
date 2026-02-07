@@ -82,6 +82,31 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 		zc := ZoneConfig{
 			ZoneID: zid,
 		}
+
+		// Compile host-inbound-traffic flags
+		if zone.HostInboundTraffic != nil {
+			var flags uint32
+			for _, svc := range zone.HostInboundTraffic.SystemServices {
+				if f, ok := HostInboundServiceFlags[svc]; ok {
+					flags |= f
+				} else {
+					slog.Warn("unknown host-inbound system-service",
+						"service", svc, "zone", name)
+				}
+			}
+			for _, proto := range zone.HostInboundTraffic.Protocols {
+				if f, ok := HostInboundProtocolFlags[proto]; ok {
+					flags |= f
+				} else {
+					slog.Warn("unknown host-inbound protocol",
+						"protocol", proto, "zone", name)
+				}
+			}
+			zc.HostInbound = flags
+			slog.Info("host-inbound-traffic compiled",
+				"zone", name, "flags", fmt.Sprintf("0x%x", flags))
+		}
+
 		if err := m.SetZoneConfig(zid, zc); err != nil {
 			return fmt.Errorf("set zone config %s: %w", name, err)
 		}
@@ -108,6 +133,13 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 				// May already be attached from a previous compile
 				if !strings.Contains(err.Error(), "already attached") {
 					return fmt.Errorf("attach XDP to %s: %w", ifaceName, err)
+				}
+			}
+
+			if err := m.AttachTC(iface.Index); err != nil {
+				// May already be attached from a previous compile
+				if !strings.Contains(err.Error(), "already attached") {
+					return fmt.Errorf("attach TC to %s: %w", ifaceName, err)
 				}
 			}
 

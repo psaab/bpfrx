@@ -170,16 +170,67 @@ const (
 
 // Global counter indices -- must match C constants.
 const (
-	GlobalCtrRxPackets    = 0
-	GlobalCtrTxPackets    = 1
-	GlobalCtrDrops        = 2
-	GlobalCtrSessionsNew  = 3
-	GlobalCtrSessionsClosed = 4
-	GlobalCtrScreenDrops  = 5
-	GlobalCtrPolicyDeny   = 6
-	GlobalCtrNATAllocFail = 7
-	GlobalCtrMax          = 8
+	GlobalCtrRxPackets       = 0
+	GlobalCtrTxPackets       = 1
+	GlobalCtrDrops           = 2
+	GlobalCtrSessionsNew     = 3
+	GlobalCtrSessionsClosed  = 4
+	GlobalCtrScreenDrops     = 5
+	GlobalCtrPolicyDeny      = 6
+	GlobalCtrNATAllocFail    = 7
+	GlobalCtrHostInboundDeny = 8
+	GlobalCtrTCEgressPackets = 9
+	GlobalCtrMax             = 10
 )
+
+// Host-inbound-traffic service flags (bitmap in zone_config.host_inbound_flags).
+const (
+	HostInboundSSH        = 1 << 0
+	HostInboundPing       = 1 << 1
+	HostInboundDNS        = 1 << 2
+	HostInboundHTTP       = 1 << 3
+	HostInboundHTTPS      = 1 << 4
+	HostInboundDHCP       = 1 << 5
+	HostInboundNTP        = 1 << 6
+	HostInboundSNMP       = 1 << 7
+	HostInboundBGP        = 1 << 8
+	HostInboundOSPF       = 1 << 9
+	HostInboundTraceroute = 1 << 10
+	HostInboundTelnet     = 1 << 11
+	HostInboundFTP        = 1 << 12
+	HostInboundNetconf    = 1 << 13
+	HostInboundSyslog     = 1 << 14
+	HostInboundRadius     = 1 << 15
+	HostInboundIKE        = 1 << 16
+	HostInboundAll        = 0xFFFFFFFF
+)
+
+// HostInboundServiceFlags maps system-service names to flag bits.
+var HostInboundServiceFlags = map[string]uint32{
+	"ssh":        HostInboundSSH,
+	"ping":       HostInboundPing,
+	"dns":        HostInboundDNS,
+	"http":       HostInboundHTTP,
+	"https":      HostInboundHTTPS,
+	"dhcp":       HostInboundDHCP,
+	"ntp":        HostInboundNTP,
+	"snmp":       HostInboundSNMP,
+	"traceroute": HostInboundTraceroute,
+	"telnet":     HostInboundTelnet,
+	"ftp":        HostInboundFTP,
+	"netconf":    HostInboundNetconf,
+	"syslog":     HostInboundSyslog,
+	"radius":     HostInboundRadius,
+	"ike":        HostInboundIKE,
+	"all":        HostInboundAll,
+}
+
+// HostInboundProtocolFlags maps protocol names to flag bits.
+var HostInboundProtocolFlags = map[string]uint32{
+	"ospf": HostInboundOSPF,
+	"bgp":  HostInboundBGP,
+	"all":  HostInboundAll,
+}
 
 // Session state constants.
 const (

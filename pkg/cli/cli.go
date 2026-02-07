@@ -211,11 +211,12 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		fmt.Println("  policies         Show security policies")
 		fmt.Println("  flow session     Show active sessions")
 		fmt.Println("  nat source       Show source NAT information")
+		fmt.Println("  statistics       Show global statistics")
 		return nil
 	}
 
 	cfg := c.store.ActiveConfig()
-	if cfg == nil {
+	if cfg == nil && args[0] != "statistics" {
 		fmt.Println("no active configuration")
 		return nil
 	}
@@ -227,6 +228,16 @@ func (c *CLI) handleShowSecurity(args []string) error {
 			fmt.Printf("  Interfaces: %s\n", strings.Join(zone.Interfaces, ", "))
 			if zone.ScreenProfile != "" {
 				fmt.Printf("  Screen: %s\n", zone.ScreenProfile)
+			}
+			if zone.HostInboundTraffic != nil {
+				if len(zone.HostInboundTraffic.SystemServices) > 0 {
+					fmt.Printf("  Host-inbound system-services: %s\n",
+						strings.Join(zone.HostInboundTraffic.SystemServices, ", "))
+				}
+				if len(zone.HostInboundTraffic.Protocols) > 0 {
+					fmt.Printf("  Host-inbound protocols: %s\n",
+						strings.Join(zone.HostInboundTraffic.Protocols, ", "))
+				}
 			}
 			fmt.Println()
 		}
@@ -263,9 +274,57 @@ func (c *CLI) handleShowSecurity(args []string) error {
 	case "nat":
 		return c.handleShowNAT(args[1:])
 
+	case "statistics":
+		return c.showStatistics()
+
 	default:
 		return fmt.Errorf("unknown show security target: %s", args[0])
 	}
+}
+
+func (c *CLI) showStatistics() error {
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("Statistics: dataplane not loaded")
+		return nil
+	}
+
+	ctrMap := c.dp.Map("global_counters")
+	if ctrMap == nil {
+		fmt.Println("Statistics: global_counters map not found")
+		return nil
+	}
+
+	// Read per-CPU values and sum across CPUs for each counter index.
+	names := []struct {
+		idx  uint32
+		name string
+	}{
+		{dataplane.GlobalCtrRxPackets, "RX packets"},
+		{dataplane.GlobalCtrTxPackets, "TX packets"},
+		{dataplane.GlobalCtrDrops, "Drops"},
+		{dataplane.GlobalCtrSessionsNew, "Sessions created"},
+		{dataplane.GlobalCtrSessionsClosed, "Sessions closed"},
+		{dataplane.GlobalCtrScreenDrops, "Screen drops"},
+		{dataplane.GlobalCtrPolicyDeny, "Policy denies"},
+		{dataplane.GlobalCtrNATAllocFail, "NAT alloc failures"},
+		{dataplane.GlobalCtrHostInboundDeny, "Host-inbound denies"},
+		{dataplane.GlobalCtrTCEgressPackets, "TC egress packets"},
+	}
+
+	fmt.Println("Global statistics:")
+	for _, n := range names {
+		var perCPU []uint64
+		if err := ctrMap.Lookup(n.idx, &perCPU); err != nil {
+			fmt.Printf("  %-25s (error: %v)\n", n.name+":", err)
+			continue
+		}
+		var total uint64
+		for _, v := range perCPU {
+			total += v
+		}
+		fmt.Printf("  %-25s %d\n", n.name+":", total)
+	}
+	return nil
 }
 
 func (c *CLI) handleConfigShow(args []string) error {

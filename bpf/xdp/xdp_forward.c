@@ -12,6 +12,53 @@
 #include "../headers/bpfrx_maps.h"
 #include "../headers/bpfrx_helpers.h"
 
+/*
+ * Map a packet's protocol/port to the corresponding host-inbound-traffic
+ * flag bit. Returns 0 if the service is not recognized (unknown services
+ * are allowed through by default).
+ */
+static __always_inline __u32
+host_inbound_flag(struct pkt_meta *meta)
+{
+	__u8 proto = meta->protocol;
+
+	/* ICMP/ICMPv6 echo request → HOST_INBOUND_PING */
+	if (proto == PROTO_ICMP || proto == PROTO_ICMPV6) {
+		if (meta->icmp_type == 8 || meta->icmp_type == 128)
+			return HOST_INBOUND_PING;
+		return 0; /* other ICMP always allowed */
+	}
+
+	/* OSPF is IP protocol 89, not port-based */
+	if (proto == 89)
+		return HOST_INBOUND_OSPF;
+
+	/* TCP/UDP port-based services */
+	__u16 port = bpf_ntohs(meta->dst_port);
+	switch (port) {
+	case 22:           return HOST_INBOUND_SSH;
+	case 53:           return HOST_INBOUND_DNS;
+	case 80:           return HOST_INBOUND_HTTP;
+	case 443:          return HOST_INBOUND_HTTPS;
+	case 67: case 68:  return HOST_INBOUND_DHCP;
+	case 123:          return HOST_INBOUND_NTP;
+	case 161:          return HOST_INBOUND_SNMP;
+	case 179:          return HOST_INBOUND_BGP;
+	case 23:           return HOST_INBOUND_TELNET;
+	case 21:           return HOST_INBOUND_FTP;
+	case 830:          return HOST_INBOUND_NETCONF;
+	case 514:          return HOST_INBOUND_SYSLOG;
+	case 1812: case 1813: return HOST_INBOUND_RADIUS;
+	case 500:          return HOST_INBOUND_IKE;
+	}
+
+	/* Traceroute: UDP ports 33434-33523 */
+	if (proto == PROTO_UDP && port >= 33434 && port <= 33523)
+		return HOST_INBOUND_TRACEROUTE;
+
+	return 0; /* unknown service → allow by default */
+}
+
 SEC("xdp")
 int xdp_forward_prog(struct xdp_md *ctx)
 {
@@ -24,11 +71,23 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		return XDP_DROP;
 
 	/*
-	 * If no egress interface was resolved, or it's the same as
-	 * ingress (locally destined), pass to kernel stack.
+	 * If no egress interface was resolved, the packet is locally
+	 * destined. Check host-inbound-traffic policy before passing
+	 * to the kernel stack.
 	 */
-	if (meta->fwd_ifindex == 0)
+	if (meta->fwd_ifindex == 0) {
+		__u32 zone_key = (__u32)meta->ingress_zone;
+		struct zone_config *zcfg = bpf_map_lookup_elem(&zone_configs, &zone_key);
+		if (zcfg && zcfg->host_inbound_flags != 0) {
+			__u32 flag = host_inbound_flag(meta);
+			if (flag != 0 && !(zcfg->host_inbound_flags & flag)) {
+				inc_counter(GLOBAL_CTR_HOST_INBOUND_DENY);
+				return XDP_DROP;
+			}
+		}
+		/* flags==0 means no host-inbound configured → allow all */
 		return XDP_PASS;
+	}
 
 	/* Rewrite Ethernet header */
 	struct ethhdr *eth = data;

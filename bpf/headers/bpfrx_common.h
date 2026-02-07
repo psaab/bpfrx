@@ -212,8 +212,10 @@ struct icmp6hdr {
 #define GLOBAL_CTR_SESSIONS_CLOSED 4
 #define GLOBAL_CTR_SCREEN_DROPS    5
 #define GLOBAL_CTR_POLICY_DENY     6
-#define GLOBAL_CTR_NAT_ALLOC_FAIL  7
-#define GLOBAL_CTR_MAX             8
+#define GLOBAL_CTR_NAT_ALLOC_FAIL      7
+#define GLOBAL_CTR_HOST_INBOUND_DENY   8
+#define GLOBAL_CTR_TC_EGRESS_PACKETS   9
+#define GLOBAL_CTR_MAX                 10
 
 /* Screen option flags */
 #define SCREEN_SYN_FLOOD         (1 << 0)
@@ -229,6 +231,26 @@ struct icmp6hdr {
 #define SCREEN_TCP_FIN_NO_ACK    (1 << 10)
 #define SCREEN_WINNUKE           (1 << 11)
 #define SCREEN_IP_SOURCE_ROUTE   (1 << 12)
+
+/* Host-inbound-traffic service flags (zone_config.host_inbound_flags) */
+#define HOST_INBOUND_SSH         (1 << 0)
+#define HOST_INBOUND_PING        (1 << 1)   /* ICMP + ICMPv6 echo */
+#define HOST_INBOUND_DNS         (1 << 2)
+#define HOST_INBOUND_HTTP        (1 << 3)
+#define HOST_INBOUND_HTTPS       (1 << 4)
+#define HOST_INBOUND_DHCP        (1 << 5)
+#define HOST_INBOUND_NTP         (1 << 6)
+#define HOST_INBOUND_SNMP        (1 << 7)
+#define HOST_INBOUND_BGP         (1 << 8)
+#define HOST_INBOUND_OSPF        (1 << 9)
+#define HOST_INBOUND_TRACEROUTE  (1 << 10)
+#define HOST_INBOUND_TELNET      (1 << 11)
+#define HOST_INBOUND_FTP         (1 << 12)
+#define HOST_INBOUND_NETCONF     (1 << 13)
+#define HOST_INBOUND_SYSLOG      (1 << 14)
+#define HOST_INBOUND_RADIUS      (1 << 15)
+#define HOST_INBOUND_IKE         (1 << 16)
+#define HOST_INBOUND_ALL         0xFFFFFFFF  /* permit all services */
 
 /* ============================================================
  * Address family agnostic IP address.

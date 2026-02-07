@@ -17,6 +17,10 @@ import (
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpPolicy ../../bpf/xdp/xdp_policy.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpNat ../../bpf/xdp/xdp_nat.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpForward ../../bpf/xdp/xdp_forward.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxTcMain ../../bpf/tc/tc_main.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxTcConntrack ../../bpf/tc/tc_conntrack.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxTcNat ../../bpf/tc/tc_nat.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxTcForward ../../bpf/tc/tc_forward.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 
 // Manager manages the eBPF dataplane: programs, maps, and attachments.
 type Manager struct {
@@ -25,6 +29,7 @@ type Manager struct {
 	maps     map[string]*ebpf.Map
 	colls    []*ebpf.Collection
 	xdpLinks map[int]link.Link
+	tcLinks  map[int]link.Link
 }
 
 // New creates a new dataplane Manager.
@@ -33,6 +38,7 @@ func New() *Manager {
 		programs: make(map[string]*ebpf.Program),
 		maps:     make(map[string]*ebpf.Map),
 		xdpLinks: make(map[int]link.Link),
+		tcLinks:  make(map[int]link.Link),
 	}
 }
 
@@ -118,6 +124,49 @@ func (m *Manager) AddTxPort(ifindex int) error {
 	return tm.Update(uint32(ifindex), val, ebpf.UpdateAny)
 }
 
+// AttachTC attaches the TC main program to the egress path of the given interface.
+func (m *Manager) AttachTC(ifindex int) error {
+	if !m.loaded {
+		return fmt.Errorf("eBPF programs not loaded")
+	}
+
+	prog, ok := m.programs["tc_main_prog"]
+	if !ok {
+		return fmt.Errorf("tc_main_prog not found")
+	}
+
+	if _, exists := m.tcLinks[ifindex]; exists {
+		return fmt.Errorf("TC already attached to ifindex %d", ifindex)
+	}
+
+	l, err := link.AttachTCX(link.TCXOptions{
+		Program:   prog,
+		Attach:    ebpf.AttachTCXEgress,
+		Interface: ifindex,
+	})
+	if err != nil {
+		return fmt.Errorf("attach TC to ifindex %d: %w", ifindex, err)
+	}
+
+	m.tcLinks[ifindex] = l
+	slog.Info("attached TC egress program", "ifindex", ifindex)
+	return nil
+}
+
+// DetachTC detaches the TC program from the given interface.
+func (m *Manager) DetachTC(ifindex int) error {
+	l, exists := m.tcLinks[ifindex]
+	if !exists {
+		return nil
+	}
+	if err := l.Close(); err != nil {
+		return fmt.Errorf("detach TC from ifindex %d: %w", ifindex, err)
+	}
+	delete(m.tcLinks, ifindex)
+	slog.Info("detached TC egress program", "ifindex", ifindex)
+	return nil
+}
+
 // Map returns a named eBPF map, or nil if not found.
 func (m *Manager) Map(name string) *ebpf.Map {
 	return m.maps[name]
@@ -128,6 +177,11 @@ func (m *Manager) Close() error {
 	for ifindex, l := range m.xdpLinks {
 		if err := l.Close(); err != nil {
 			slog.Error("failed to detach XDP", "ifindex", ifindex, "err", err)
+		}
+	}
+	for ifindex, l := range m.tcLinks {
+		if err := l.Close(); err != nil {
+			slog.Error("failed to detach TC", "ifindex", ifindex, "err", err)
 		}
 	}
 	for _, coll := range m.colls {

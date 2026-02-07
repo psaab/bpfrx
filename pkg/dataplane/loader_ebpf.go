@@ -107,7 +107,7 @@ func (m *Manager) loadAllObjects() error {
 	}
 	m.programs["xdp_forward_prog"] = fwdObjs.XdpForwardProg
 
-	// Populate tail call program array.
+	// Populate XDP tail call program array.
 	xdpProgs := mainObjs.XdpProgs
 	tailCalls := map[uint32]*ebpf.Program{
 		XDPProgZone:      zoneObjs.XdpZoneProg,
@@ -120,6 +120,48 @@ func (m *Manager) loadAllObjects() error {
 		fd := uint32(prog.FD())
 		if err := xdpProgs.Update(idx, fd, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("xdp tail call index %d: %w", idx, err)
+		}
+	}
+
+	// Load TC main program.
+	var tcMainObjs bpfrxTcMainObjects
+	if err := loadBpfrxTcMainObjects(&tcMainObjs, replaceOpts); err != nil {
+		return fmt.Errorf("load tc_main: %w", err)
+	}
+	m.programs["tc_main_prog"] = tcMainObjs.TcMainProg
+
+	// Load TC conntrack program.
+	var tcCtObjs bpfrxTcConntrackObjects
+	if err := loadBpfrxTcConntrackObjects(&tcCtObjs, replaceOpts); err != nil {
+		return fmt.Errorf("load tc_conntrack: %w", err)
+	}
+	m.programs["tc_conntrack_prog"] = tcCtObjs.TcConntrackProg
+
+	// Load TC NAT program.
+	var tcNatObjs bpfrxTcNatObjects
+	if err := loadBpfrxTcNatObjects(&tcNatObjs, replaceOpts); err != nil {
+		return fmt.Errorf("load tc_nat: %w", err)
+	}
+	m.programs["tc_nat_prog"] = tcNatObjs.TcNatProg
+
+	// Load TC forward program.
+	var tcFwdObjs bpfrxTcForwardObjects
+	if err := loadBpfrxTcForwardObjects(&tcFwdObjs, replaceOpts); err != nil {
+		return fmt.Errorf("load tc_forward: %w", err)
+	}
+	m.programs["tc_forward_prog"] = tcFwdObjs.TcForwardProg
+
+	// Populate TC tail call program array.
+	tcProgs := mainObjs.TcProgs
+	tcTailCalls := map[uint32]*ebpf.Program{
+		TCProgConntrack:    tcCtObjs.TcConntrackProg,
+		TCProgNAT:          tcNatObjs.TcNatProg,
+		TCProgForward:      tcFwdObjs.TcForwardProg,
+	}
+	for idx, prog := range tcTailCalls {
+		fd := uint32(prog.FD())
+		if err := tcProgs.Update(idx, fd, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("tc tail call index %d: %w", idx, err)
 		}
 	}
 
