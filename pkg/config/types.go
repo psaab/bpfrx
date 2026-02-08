@@ -9,11 +9,12 @@ type Config struct {
 
 // SecurityConfig holds all security-related configuration.
 type SecurityConfig struct {
-	Zones       map[string]*ZoneConfig       // keyed by zone name
-	Policies    []*ZonePairPolicies          // ordered list of zone-pair policy sets
-	NAT         NATConfig
-	Screen      map[string]*ScreenProfile    // keyed by profile name
-	AddressBook *AddressBook
+	Zones         map[string]*ZoneConfig       // keyed by zone name
+	Policies      []*ZonePairPolicies          // ordered list of zone-pair policy sets
+	DefaultPolicy PolicyAction                 // global fallback policy (permit-all or deny-all)
+	NAT           NATConfig
+	Screen        map[string]*ScreenProfile    // keyed by profile name
+	AddressBook   *AddressBook
 }
 
 // ZoneConfig represents a security zone.

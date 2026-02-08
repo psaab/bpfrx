@@ -406,4 +406,15 @@ struct {
 	__type(value, struct snat_value_v6);
 } snat_rules_v6 SEC(".maps");
 
+/* ============================================================
+ * Default policy (global fallback when no zone-pair policy exists)
+ * ============================================================ */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u8);  /* ACTION_DENY=0, ACTION_PERMIT=1 */
+} default_policy SEC(".maps");
+
 #endif /* __BPFRX_MAPS_H__ */

@@ -81,6 +81,11 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		return nil, fmt.Errorf("compile screen profiles: %w", err)
 	}
 
+	// Phase 8: Compile default policy
+	if err := m.compileDefaultPolicy(cfg); err != nil {
+		return nil, fmt.Errorf("compile default policy: %w", err)
+	}
+
 	slog.Info("config compiled to dataplane",
 		"zones", len(result.ZoneIDs),
 		"addresses", len(result.AddrIDs),
@@ -767,6 +772,22 @@ func (m *Manager) compileScreenProfiles(cfg *config.Config, result *CompileResul
 			"udp_thresh", sc.UDPFloodThresh)
 	}
 
+	return nil
+}
+
+func (m *Manager) compileDefaultPolicy(cfg *config.Config) error {
+	action := uint8(ActionDeny) // default deny
+	if cfg.Security.DefaultPolicy == config.PolicyPermit {
+		action = ActionPermit
+	}
+	if err := m.SetDefaultPolicy(action); err != nil {
+		return fmt.Errorf("set default policy: %w", err)
+	}
+	if action == ActionPermit {
+		slog.Info("default policy compiled", "action", "permit-all")
+	} else {
+		slog.Info("default policy compiled", "action", "deny-all")
+	}
 	return nil
 }
 

@@ -274,6 +274,92 @@ func (t *ConfigTree) SetPath(path []string) error {
 	return nil
 }
 
+// DeletePath removes a node at the given path from the tree.
+// Uses the same schema-driven traversal as SetPath to navigate the tree,
+// then removes the target node from its parent's Children slice.
+func (t *ConfigTree) DeletePath(path []string) error {
+	if len(path) == 0 {
+		return fmt.Errorf("empty path")
+	}
+
+	return deletePath(&t.Children, path, setSchema, 0)
+}
+
+func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) error {
+	if i >= len(path) {
+		return fmt.Errorf("path not found")
+	}
+
+	keyword := path[i]
+
+	// Look up keyword in current schema level.
+	var childSchema *schemaNode
+	if schema != nil {
+		if s, ok := schema.children[keyword]; ok {
+			childSchema = s
+		} else if schema.wildcard != nil {
+			childSchema = schema.wildcard
+		}
+	}
+
+	if childSchema == nil {
+		// No schema match: remaining tokens form leaf keys, remove matching node.
+		leafKeys := path[i:]
+		return removeMatchingNode(current, leafKeys)
+	}
+
+	// Consume keyword + extra args as this node's keys.
+	nodeKeyCount := 1 + childSchema.args
+	if i+nodeKeyCount > len(path) {
+		// Not enough tokens; treat remainder as leaf keys.
+		leafKeys := path[i:]
+		return removeMatchingNode(current, leafKeys)
+	}
+
+	nodeKeys := path[i : i+nodeKeyCount]
+	i += nodeKeyCount
+
+	if i >= len(path) {
+		// No more tokens: this container node itself is the target.
+		return removeMatchingNode(current, nodeKeys)
+	}
+
+	// More tokens remain: find matching container and descend.
+	for _, n := range *current {
+		if !n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+			return deletePath(&n.Children, path, childSchema, i)
+		}
+	}
+
+	return fmt.Errorf("path not found: container %q does not exist", strings.Join(nodeKeys, " "))
+}
+
+// removeMatchingNode removes the first node whose keys match targetKeys
+// (using prefix matching) from the nodes slice.
+func removeMatchingNode(nodes *[]*Node, targetKeys []string) error {
+	for i, n := range *nodes {
+		if keysMatch(n.Keys, targetKeys) {
+			*nodes = append((*nodes)[:i], (*nodes)[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("path not found: no node matching %q", strings.Join(targetKeys, " "))
+}
+
+// keysMatch returns true if nodeKeys starts with all elements of targetKeys.
+// This allows "delete ... address srv1" to match a leaf ["address", "srv1", "10.0.1.0/32"].
+func keysMatch(nodeKeys, targetKeys []string) bool {
+	if len(targetKeys) > len(nodeKeys) {
+		return false
+	}
+	for i, tk := range targetKeys {
+		if nodeKeys[i] != tk {
+			return false
+		}
+	}
+	return true
+}
+
 // keysEqual returns true if two key slices are identical.
 func keysEqual(a, b []string) bool {
 	if len(a) != len(b) {

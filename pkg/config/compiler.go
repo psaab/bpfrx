@@ -114,6 +114,14 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 func compilePolicies(node *Node, sec *SecurityConfig) error {
 	for _, child := range node.Children {
 		if child.Name() == "default-policy" {
+			if len(child.Keys) >= 2 {
+				switch child.Keys[1] {
+				case "permit-all":
+					sec.DefaultPolicy = PolicyPermit
+				case "deny-all":
+					sec.DefaultPolicy = PolicyDeny
+				}
+			}
 			continue
 		}
 		// "from-zone trust to-zone untrust { ... }"

@@ -46,6 +46,7 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["nat_pool_ips_v6"] = mainObjs.NatPoolIpsV6
 	m.maps["nat_port_counters"] = mainObjs.NatPortCounters
 	m.maps["interface_counters"] = mainObjs.InterfaceCounters
+	m.maps["default_policy"] = mainObjs.DefaultPolicy
 
 	// Store main program.
 	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
@@ -79,6 +80,7 @@ func (m *Manager) loadAllObjects() error {
 			"screen_configs":     mainObjs.ScreenConfigs,
 			"flood_counters":     mainObjs.FloodCounters,
 			"interface_counters": mainObjs.InterfaceCounters,
+			"default_policy":     mainObjs.DefaultPolicy,
 		},
 	}
 

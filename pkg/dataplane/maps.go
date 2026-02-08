@@ -468,6 +468,15 @@ func (m *Manager) ReadPolicyCounters(policyID uint32) (CounterValue, error) {
 	return total, nil
 }
 
+// SetDefaultPolicy writes the global default policy action (0=deny, 1=permit).
+func (m *Manager) SetDefaultPolicy(action uint8) error {
+	zm, ok := m.maps["default_policy"]
+	if !ok {
+		return fmt.Errorf("default_policy map not found")
+	}
+	return zm.Update(uint32(0), action, ebpf.UpdateAny)
+}
+
 // htons converts a uint16 from host to network byte order.
 func htons(v uint16) uint16 {
 	var b [2]byte

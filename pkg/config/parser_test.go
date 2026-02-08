@@ -437,6 +437,94 @@ func TestSetPathSchema(t *testing.T) {
 	}
 }
 
+func TestDeletePath(t *testing.T) {
+	// Build a tree via set commands.
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set security zones security-zone trust interfaces eth0.0",
+		"set security zones security-zone trust interfaces eth2.0",
+		"set security zones security-zone trust host-inbound-traffic system-services ssh",
+		"set security zones security-zone untrust interfaces eth1.0",
+		"set security address-book global address srv1 10.0.1.10/32",
+		"set security address-book global address srv2 10.0.2.10/32",
+		"set security policies from-zone trust to-zone untrust policy allow-web match source-address any",
+		"set security policies from-zone trust to-zone untrust policy allow-web match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy allow-web match application junos-http",
+		"set security policies from-zone trust to-zone untrust policy allow-web then permit",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath: %v", err)
+		}
+	}
+
+	// Test 1: Delete a leaf (single interface from a zone).
+	path, _ := ParseSetCommand("delete security zones security-zone trust interfaces eth2.0")
+	if err := tree.DeletePath(path); err != nil {
+		t.Fatalf("delete interface leaf: %v", err)
+	}
+	// Verify eth2.0 is gone but eth0.0 remains.
+	setOut := tree.FormatSet()
+	if strings.Contains(setOut, "eth2.0") {
+		t.Error("eth2.0 should have been deleted")
+	}
+	if !strings.Contains(setOut, "eth0.0") {
+		t.Error("eth0.0 should still exist")
+	}
+
+	// Test 2: Delete address by name prefix (without CIDR value).
+	path, _ = ParseSetCommand("delete security address-book global address srv1")
+	if err := tree.DeletePath(path); err != nil {
+		t.Fatalf("delete address by prefix: %v", err)
+	}
+	setOut = tree.FormatSet()
+	if strings.Contains(setOut, "srv1") {
+		t.Error("srv1 should have been deleted")
+	}
+	if !strings.Contains(setOut, "srv2") {
+		t.Error("srv2 should still exist")
+	}
+
+	// Test 3: Delete a container (entire zone).
+	path, _ = ParseSetCommand("delete security zones security-zone untrust")
+	if err := tree.DeletePath(path); err != nil {
+		t.Fatalf("delete container: %v", err)
+	}
+	setOut = tree.FormatSet()
+	if strings.Contains(setOut, "security-zone untrust") {
+		t.Error("untrust zone should have been deleted")
+	}
+	if !strings.Contains(setOut, "security-zone trust") {
+		t.Error("trust zone should still exist")
+	}
+
+	// Test 4: Delete nonexistent path returns error.
+	path, _ = ParseSetCommand("delete security zones security-zone nonexistent")
+	if err := tree.DeletePath(path); err == nil {
+		t.Error("deleting nonexistent path should return error")
+	}
+
+	// Test 5: Remaining config compiles successfully.
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig after deletions: %v", err)
+	}
+	if len(cfg.Security.Zones) != 1 {
+		t.Errorf("expected 1 zone after deletions, got %d", len(cfg.Security.Zones))
+	}
+	if cfg.Security.Zones["trust"] == nil {
+		t.Error("trust zone should remain after deletions")
+	}
+	if len(cfg.Security.Zones["trust"].Interfaces) != 1 {
+		t.Errorf("trust zone should have 1 interface, got %d",
+			len(cfg.Security.Zones["trust"].Interfaces))
+	}
+}
+
 func TestFormatSet(t *testing.T) {
 	input := `security {
     zones {

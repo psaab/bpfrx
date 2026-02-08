@@ -139,7 +139,10 @@ func (c *CLI) dispatchConfig(line string) error {
 		return c.store.SetFromInput(strings.Join(parts[1:], " "))
 
 	case "delete":
-		return fmt.Errorf("delete: not yet implemented")
+		if len(parts) < 2 {
+			return fmt.Errorf("delete: missing path")
+		}
+		return c.store.DeleteFromInput(strings.Join(parts[1:], " "))
 
 	case "show":
 		return c.handleConfigShow(parts[1:])
@@ -468,6 +471,11 @@ func (c *CLI) showStatistics() error {
 func (c *CLI) handleConfigShow(args []string) error {
 	// Check for pipe commands
 	line := strings.Join(args, " ")
+
+	if strings.Contains(line, "| compare") {
+		fmt.Print(c.store.ShowCompare())
+		return nil
+	}
 
 	if strings.Contains(line, "| display set") {
 		fmt.Print(c.store.ShowCandidateSet())
@@ -872,6 +880,7 @@ func (c *CLI) showConfigHelp() {
 	fmt.Println("  set <path>         Set a configuration value")
 	fmt.Println("  delete <path>      Delete a configuration element")
 	fmt.Println("  show               Show candidate configuration")
+	fmt.Println("  show | compare     Show pending changes")
 	fmt.Println("  show | display set Show as flat set commands")
 	fmt.Println("  commit             Validate and apply configuration")
 	fmt.Println("  commit check       Validate without applying")

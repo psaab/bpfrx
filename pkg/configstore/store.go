@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -128,6 +129,31 @@ func (s *Store) SetFromInput(input string) error {
 	return s.Set(path)
 }
 
+// Delete removes a node at the given path from the candidate configuration.
+func (s *Store) Delete(path []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.candidate == nil {
+		return fmt.Errorf("not in configuration mode")
+	}
+
+	if err := s.candidate.DeletePath(path); err != nil {
+		return err
+	}
+	s.dirty = true
+	return nil
+}
+
+// DeleteFromInput parses a "delete ..." command string and applies it.
+func (s *Store) DeleteFromInput(input string) error {
+	path, err := config.ParseSetCommand("delete " + input)
+	if err != nil {
+		return err
+	}
+	return s.Delete(path)
+}
+
 // CommitCheck validates the candidate configuration without applying it.
 func (s *Store) CommitCheck() (*config.Config, error) {
 	s.mu.RLock()
@@ -248,4 +274,64 @@ func (s *Store) ExportJSON() ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return json.MarshalIndent(s.compiled, "", "  ")
+}
+
+// ShowCompare returns a diff between the active and candidate configurations
+// as set commands, with "-" for removed lines and "+" for added lines.
+func (s *Store) ShowCompare() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.candidate == nil {
+		return ""
+	}
+
+	activeSet := s.active.FormatSet()
+	candidateSet := s.candidate.FormatSet()
+
+	activeLines := splitLines(activeSet)
+	candidateLines := splitLines(candidateSet)
+
+	// Build sets for O(n) diff
+	activeMap := make(map[string]bool, len(activeLines))
+	for _, line := range activeLines {
+		activeMap[line] = true
+	}
+	candidateMap := make(map[string]bool, len(candidateLines))
+	for _, line := range candidateLines {
+		candidateMap[line] = true
+	}
+
+	var b strings.Builder
+
+	// Removed lines (in active but not candidate)
+	for _, line := range activeLines {
+		if !candidateMap[line] {
+			fmt.Fprintf(&b, "- %s\n", line)
+		}
+	}
+
+	// Added lines (in candidate but not active)
+	for _, line := range candidateLines {
+		if !activeMap[line] {
+			fmt.Fprintf(&b, "+ %s\n", line)
+		}
+	}
+
+	if b.Len() == 0 {
+		return "[no changes]\n"
+	}
+	return b.String()
+}
+
+// splitLines splits a string into non-empty lines.
+func splitLines(s string) []string {
+	var lines []string
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
 }

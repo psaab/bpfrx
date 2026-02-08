@@ -340,6 +340,25 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 	struct policy_set *ps = bpf_map_lookup_elem(&zone_pair_policies, &zpk);
 	if (!ps) {
+		/* No zone-pair policy: check global default policy */
+		__u32 dp_key = 0;
+		__u8 *dp = bpf_map_lookup_elem(&default_policy, &dp_key);
+		if (dp && *dp == ACTION_PERMIT) {
+			if (meta->addr_family == AF_INET) {
+				if (create_session(meta, 0, 0, 0, 0, 0, 0, 0) < 0) {
+					inc_counter(GLOBAL_CTR_DROPS);
+					return XDP_DROP;
+				}
+			} else {
+				__u8 zero_ip[16] = {};
+				if (create_session_v6(meta, 0, 0, 0, zero_ip, 0, zero_ip, 0) < 0) {
+					inc_counter(GLOBAL_CTR_DROPS);
+					return XDP_DROP;
+				}
+			}
+			bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+			return XDP_PASS;
+		}
 		inc_counter(GLOBAL_CTR_POLICY_DENY);
 		return XDP_DROP;
 	}
