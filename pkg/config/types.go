@@ -2,9 +2,11 @@ package config
 
 // Config is the top-level typed configuration, compiled from the AST.
 type Config struct {
-	Security     SecurityConfig
-	Interfaces   InterfacesConfig
-	Applications ApplicationsConfig
+	Security       SecurityConfig
+	Interfaces     InterfacesConfig
+	Applications   ApplicationsConfig
+	RoutingOptions RoutingOptionsConfig
+	Protocols      ProtocolsConfig
 }
 
 // SecurityConfig holds all security-related configuration.
@@ -17,6 +19,7 @@ type SecurityConfig struct {
 	AddressBook   *AddressBook
 	Log           LogConfig
 	Flow          FlowConfig
+	IPsec         IPsecConfig
 }
 
 // FlowConfig holds flow/session timeout configuration.
@@ -244,8 +247,9 @@ type InterfacesConfig struct {
 
 // InterfaceConfig represents a network interface.
 type InterfaceConfig struct {
-	Name  string
-	Units map[int]*InterfaceUnit
+	Name   string
+	Units  map[int]*InterfaceUnit
+	Tunnel *TunnelConfig // non-nil for tunnel interfaces (gre0, etc.)
 }
 
 // InterfaceUnit represents a logical unit on an interface.
@@ -271,4 +275,107 @@ type Application struct {
 	Name            string
 	Protocol        string // tcp, udp, icmp
 	DestinationPort string // "80", "8080-8090"
+}
+
+// RoutingOptionsConfig holds static routing configuration.
+type RoutingOptionsConfig struct {
+	StaticRoutes []*StaticRoute
+}
+
+// StaticRoute defines a single static route.
+type StaticRoute struct {
+	Destination string // CIDR: "10.0.0.0/8" or "::/0"
+	NextHop     string // IP or ""
+	Interface   string // outgoing interface or ""
+	Discard     bool   // null route (blackhole)
+	Preference  int    // route preference (admin distance), default 5
+}
+
+// ProtocolsConfig holds dynamic routing protocol configuration.
+type ProtocolsConfig struct {
+	OSPF *OSPFConfig
+	BGP  *BGPConfig
+}
+
+// OSPFConfig holds OSPF routing configuration.
+type OSPFConfig struct {
+	RouterID string // e.g. "10.0.0.1"
+	Areas    []*OSPFArea
+	Export   []string // export policy names (future)
+}
+
+// OSPFArea defines an OSPF area.
+type OSPFArea struct {
+	ID         string // "0.0.0.0" (backbone) or area number
+	Interfaces []*OSPFInterface
+}
+
+// OSPFInterface defines an interface participating in OSPF.
+type OSPFInterface struct {
+	Name    string
+	Passive bool // passive interface (no hello)
+	Cost    int  // OSPF cost, 0 = default
+}
+
+// BGPConfig holds BGP routing configuration.
+type BGPConfig struct {
+	LocalAS   uint32
+	RouterID  string
+	Neighbors []*BGPNeighbor
+}
+
+// BGPNeighbor defines a BGP peer.
+type BGPNeighbor struct {
+	Address     string // peer IP
+	PeerAS      uint32
+	Description string
+	MultihopTTL int // 0 = directly connected
+}
+
+// TunnelConfig defines a GRE or other tunnel interface.
+type TunnelConfig struct {
+	Name        string   // e.g. "gre0"
+	Mode        string   // "gre" (future: "ip-ip", "vxlan")
+	Source      string   // local tunnel endpoint IP
+	Destination string   // remote tunnel endpoint IP
+	Key         uint32   // GRE key, 0 = none
+	TTL         int      // tunnel TTL, 0 = default 64
+	Addresses   []string // IPs to assign to tunnel interface (CIDR)
+}
+
+// IPsecConfig holds IPsec VPN configuration.
+type IPsecConfig struct {
+	Proposals map[string]*IPsecProposal
+	Gateways  map[string]*IPsecGateway
+	VPNs      map[string]*IPsecVPN
+}
+
+// IPsecProposal defines encryption and authentication parameters.
+type IPsecProposal struct {
+	Name            string
+	Protocol        string // "esp"
+	EncryptionAlg   string // "aes-256-cbc", "aes-128-gcm"
+	AuthAlg         string // "hmac-sha-256" (ignored for GCM)
+	DHGroup         int    // DH group number
+	LifetimeSeconds int
+}
+
+// IPsecGateway defines a remote IKE gateway.
+type IPsecGateway struct {
+	Name          string
+	Address       string // remote gateway IP
+	LocalAddress  string // local IP
+	IKEPolicy     string // ike proposal reference
+	ExternalIface string // external-facing interface
+}
+
+// IPsecVPN defines an IPsec VPN tunnel.
+type IPsecVPN struct {
+	Name        string
+	Gateway     string // remote gateway IP or gateway reference
+	IPsecPolicy string // reference to IPsecProposal
+	LocalID     string // local traffic selector (CIDR)
+	RemoteID    string // remote traffic selector (CIDR)
+	PSK         string // pre-shared key
+	LocalAddr   string // local address
 }

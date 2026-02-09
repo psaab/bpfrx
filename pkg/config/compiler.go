@@ -35,6 +35,14 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 			if err := compileApplications(node, &cfg.Applications); err != nil {
 				return nil, fmt.Errorf("applications: %w", err)
 			}
+		case "routing-options":
+			if err := compileRoutingOptions(node, &cfg.RoutingOptions); err != nil {
+				return nil, fmt.Errorf("routing-options: %w", err)
+			}
+		case "protocols":
+			if err := compileProtocols(node, &cfg.Protocols); err != nil {
+				return nil, fmt.Errorf("protocols: %w", err)
+			}
 		}
 	}
 
@@ -71,6 +79,10 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 		case "flow":
 			if err := compileFlow(child, sec); err != nil {
 				return fmt.Errorf("flow: %w", err)
+			}
+		case "ipsec":
+			if err := compileIPsec(child, sec); err != nil {
+				return fmt.Errorf("ipsec: %w", err)
 			}
 		}
 	}
@@ -344,6 +356,44 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 			Units: make(map[int]*InterfaceUnit),
 		}
 
+		// Check for tunnel configuration
+		tunnelNode := child.FindChild("tunnel")
+		if tunnelNode != nil {
+			tc := &TunnelConfig{
+				Name: ifName,
+				Mode: "gre", // default
+			}
+			for _, prop := range tunnelNode.Children {
+				switch prop.Name() {
+				case "source":
+					if len(prop.Keys) >= 2 {
+						tc.Source = prop.Keys[1]
+					}
+				case "destination":
+					if len(prop.Keys) >= 2 {
+						tc.Destination = prop.Keys[1]
+					}
+				case "mode":
+					if len(prop.Keys) >= 2 {
+						tc.Mode = prop.Keys[1]
+					}
+				case "key":
+					if len(prop.Keys) >= 2 {
+						if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
+							tc.Key = uint32(v)
+						}
+					}
+				case "ttl":
+					if len(prop.Keys) >= 2 {
+						if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
+							tc.TTL = v
+						}
+					}
+				}
+			}
+			ifc.Tunnel = tc
+		}
+
 		for _, unitNode := range child.FindChildren("unit") {
 			if len(unitNode.Keys) < 2 {
 				continue
@@ -375,6 +425,11 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 			}
 
 			ifc.Units[unitNum] = unit
+
+			// Collect tunnel addresses from unit config
+			if ifc.Tunnel != nil {
+				ifc.Tunnel.Addresses = append(ifc.Tunnel.Addresses, unit.Addresses...)
+			}
 		}
 
 		ifaces.Interfaces[ifName] = ifc
@@ -784,6 +839,239 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		}
 
 		apps.ApplicationSets[as.Name] = as
+	}
+
+	return nil
+}
+
+func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
+	staticNode := node.FindChild("static")
+	if staticNode == nil {
+		return nil
+	}
+
+	for _, routeNode := range staticNode.FindChildren("route") {
+		if len(routeNode.Keys) < 2 {
+			continue
+		}
+		route := &StaticRoute{
+			Destination: routeNode.Keys[1],
+			Preference:  5, // default
+		}
+
+		for _, prop := range routeNode.Children {
+			switch prop.Name() {
+			case "next-hop":
+				if len(prop.Keys) >= 2 {
+					route.NextHop = prop.Keys[1]
+				}
+			case "discard":
+				route.Discard = true
+			case "preference":
+				if len(prop.Keys) >= 2 {
+					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
+						route.Preference = v
+					}
+				}
+			case "qualified-next-hop":
+				if len(prop.Keys) >= 2 {
+					route.NextHop = prop.Keys[1]
+				}
+				// Check for "interface <name>" among remaining keys
+				for j := 2; j < len(prop.Keys)-1; j++ {
+					if prop.Keys[j] == "interface" {
+						route.Interface = prop.Keys[j+1]
+					}
+				}
+			}
+		}
+
+		ro.StaticRoutes = append(ro.StaticRoutes, route)
+	}
+	return nil
+}
+
+func compileProtocols(node *Node, proto *ProtocolsConfig) error {
+	ospfNode := node.FindChild("ospf")
+	if ospfNode != nil {
+		proto.OSPF = &OSPFConfig{}
+
+		// Router ID at the ospf level
+		for _, child := range ospfNode.Children {
+			if child.Name() == "router-id" && len(child.Keys) >= 2 {
+				proto.OSPF.RouterID = child.Keys[1]
+			}
+		}
+
+		for _, areaNode := range ospfNode.FindChildren("area") {
+			if len(areaNode.Keys) < 2 {
+				continue
+			}
+			area := &OSPFArea{ID: areaNode.Keys[1]}
+
+			for _, child := range areaNode.Children {
+				if child.Name() == "interface" && len(child.Keys) >= 2 {
+					iface := &OSPFInterface{Name: child.Keys[1]}
+					// Check for "passive" flag in remaining keys
+					for _, k := range child.Keys[2:] {
+						if k == "passive" {
+							iface.Passive = true
+						}
+					}
+					// Check children for cost etc.
+					for _, prop := range child.Children {
+						switch prop.Name() {
+						case "passive":
+							iface.Passive = true
+						case "cost":
+							if len(prop.Keys) >= 2 {
+								if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
+									iface.Cost = v
+								}
+							}
+						}
+					}
+					area.Interfaces = append(area.Interfaces, iface)
+				}
+			}
+
+			proto.OSPF.Areas = append(proto.OSPF.Areas, area)
+		}
+	}
+
+	bgpNode := node.FindChild("bgp")
+	if bgpNode != nil {
+		proto.BGP = &BGPConfig{}
+
+		for _, child := range bgpNode.Children {
+			switch child.Name() {
+			case "local-as":
+				if len(child.Keys) >= 2 {
+					if v, err := strconv.Atoi(child.Keys[1]); err == nil {
+						proto.BGP.LocalAS = uint32(v)
+					}
+				}
+			case "router-id":
+				if len(child.Keys) >= 2 {
+					proto.BGP.RouterID = child.Keys[1]
+				}
+			}
+		}
+
+		for _, groupNode := range bgpNode.FindChildren("group") {
+			if len(groupNode.Keys) < 2 {
+				continue
+			}
+			var peerAS uint32
+			for _, child := range groupNode.Children {
+				switch child.Name() {
+				case "peer-as":
+					if len(child.Keys) >= 2 {
+						if v, err := strconv.Atoi(child.Keys[1]); err == nil {
+							peerAS = uint32(v)
+						}
+					}
+				case "neighbor":
+					if len(child.Keys) >= 2 {
+						neighbor := &BGPNeighbor{
+							Address: child.Keys[1],
+							PeerAS:  peerAS,
+						}
+						proto.BGP.Neighbors = append(proto.BGP.Neighbors, neighbor)
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func compileIPsec(node *Node, sec *SecurityConfig) error {
+	if sec.IPsec.Proposals == nil {
+		sec.IPsec.Proposals = make(map[string]*IPsecProposal)
+	}
+	if sec.IPsec.Gateways == nil {
+		sec.IPsec.Gateways = make(map[string]*IPsecGateway)
+	}
+	if sec.IPsec.VPNs == nil {
+		sec.IPsec.VPNs = make(map[string]*IPsecVPN)
+	}
+
+	for _, child := range node.FindChildren("proposal") {
+		if len(child.Keys) < 2 {
+			continue
+		}
+		prop := &IPsecProposal{Name: child.Keys[1]}
+
+		for _, p := range child.Children {
+			switch p.Name() {
+			case "protocol":
+				if len(p.Keys) >= 2 {
+					prop.Protocol = p.Keys[1]
+				}
+			case "encryption-algorithm":
+				if len(p.Keys) >= 2 {
+					prop.EncryptionAlg = p.Keys[1]
+				}
+			case "authentication-algorithm":
+				if len(p.Keys) >= 2 {
+					prop.AuthAlg = p.Keys[1]
+				}
+			case "dh-group":
+				if len(p.Keys) >= 2 {
+					if v, err := strconv.Atoi(p.Keys[1]); err == nil {
+						prop.DHGroup = v
+					}
+				}
+			case "lifetime-seconds":
+				if len(p.Keys) >= 2 {
+					if v, err := strconv.Atoi(p.Keys[1]); err == nil {
+						prop.LifetimeSeconds = v
+					}
+				}
+			}
+		}
+
+		sec.IPsec.Proposals[prop.Name] = prop
+	}
+
+	for _, child := range node.FindChildren("vpn") {
+		if len(child.Keys) < 2 {
+			continue
+		}
+		vpn := &IPsecVPN{Name: child.Keys[1]}
+
+		for _, p := range child.Children {
+			switch p.Name() {
+			case "gateway":
+				if len(p.Keys) >= 2 {
+					vpn.Gateway = p.Keys[1]
+				}
+			case "local-address":
+				if len(p.Keys) >= 2 {
+					vpn.LocalAddr = p.Keys[1]
+				}
+			case "ipsec-policy":
+				if len(p.Keys) >= 2 {
+					vpn.IPsecPolicy = p.Keys[1]
+				}
+			case "local-identity":
+				if len(p.Keys) >= 2 {
+					vpn.LocalID = p.Keys[1]
+				}
+			case "remote-identity":
+				if len(p.Keys) >= 2 {
+					vpn.RemoteID = p.Keys[1]
+				}
+			case "pre-shared-key":
+				if len(p.Keys) >= 2 {
+					vpn.PSK = p.Keys[1]
+				}
+			}
+		}
+
+		sec.IPsec.VPNs[vpn.Name] = vpn
 	}
 
 	return nil

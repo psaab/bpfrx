@@ -15,7 +15,10 @@ import (
 	"github.com/psviderski/bpfrx/pkg/config"
 	"github.com/psviderski/bpfrx/pkg/configstore"
 	"github.com/psviderski/bpfrx/pkg/dataplane"
+	"github.com/psviderski/bpfrx/pkg/frr"
+	"github.com/psviderski/bpfrx/pkg/ipsec"
 	"github.com/psviderski/bpfrx/pkg/logging"
+	"github.com/psviderski/bpfrx/pkg/routing"
 )
 
 // CLI is the interactive command-line interface.
@@ -25,12 +28,15 @@ type CLI struct {
 	dp          *dataplane.Manager
 	eventBuf    *logging.EventBuffer
 	eventReader *logging.EventReader
+	routing     *routing.Manager
+	frr         *frr.Manager
+	ipsec       *ipsec.Manager
 	hostname    string
 	username    string
 }
 
 // New creates a new CLI.
-func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.EventBuffer, eventReader *logging.EventReader) *CLI {
+func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.EventBuffer, eventReader *logging.EventReader, rm *routing.Manager, fm *frr.Manager, im *ipsec.Manager) *CLI {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "bpfrx"
@@ -45,6 +51,9 @@ func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.Even
 		dp:          dp,
 		eventBuf:    eventBuf,
 		eventReader: eventReader,
+		routing:     rm,
+		frr:         fm,
+		ipsec:       im,
 		hostname:    hostname,
 		username:    username,
 	}
@@ -61,11 +70,12 @@ var operationalTree = map[string]*completionNode{
 	"configure": {desc: "Enter configuration mode"},
 	"show": {desc: "Show information", children: map[string]*completionNode{
 		"configuration": {desc: "Show active configuration"},
+		"route":         {desc: "Show routing table"},
 		"security": {desc: "Show security information", children: map[string]*completionNode{
-			"zones":        {desc: "Show security zones"},
-			"policies":     {desc: "Show security policies"},
-			"screen":       {desc: "Show screen/IDS profiles"},
-			"flow":         {desc: "Show flow information", children: map[string]*completionNode{
+			"zones":    {desc: "Show security zones"},
+			"policies": {desc: "Show security policies"},
+			"screen":   {desc: "Show screen/IDS profiles"},
+			"flow": {desc: "Show flow information", children: map[string]*completionNode{
 				"session": {desc: "Show active sessions"},
 			}},
 			"nat": {desc: "Show NAT information", children: map[string]*completionNode{
@@ -73,12 +83,27 @@ var operationalTree = map[string]*completionNode{
 				"destination": {desc: "Show destination NAT"},
 				"static":      {desc: "Show static NAT"},
 			}},
-			"address-book":  {desc: "Show address book entries"},
-			"applications":  {desc: "Show application definitions"},
-			"log":           {desc: "Show recent security events [N] [zone <z>] [protocol <p>] [action <a>]"},
-			"statistics":    {desc: "Show global statistics"},
+			"address-book": {desc: "Show address book entries"},
+			"applications": {desc: "Show application definitions"},
+			"log":          {desc: "Show recent security events [N] [zone <z>] [protocol <p>] [action <a>]"},
+			"statistics":   {desc: "Show global statistics"},
+			"ipsec": {desc: "Show IPsec status", children: map[string]*completionNode{
+				"security-associations": {desc: "Show IPsec SAs"},
+			}},
 		}},
-		"interfaces": {desc: "Show interface status"},
+		"interfaces": {desc: "Show interface status", children: map[string]*completionNode{
+			"tunnel": {desc: "Show tunnel interfaces"},
+		}},
+		"protocols": {desc: "Show protocol information", children: map[string]*completionNode{
+			"ospf": {desc: "Show OSPF information", children: map[string]*completionNode{
+				"neighbor": {desc: "Show OSPF neighbors"},
+				"database": {desc: "Show OSPF database"},
+			}},
+			"bgp": {desc: "Show BGP information", children: map[string]*completionNode{
+				"summary": {desc: "Show BGP peer summary"},
+				"routes":  {desc: "Show BGP routes"},
+			}},
+		}},
 		"system": {desc: "Show system information", children: map[string]*completionNode{
 			"rollback": {desc: "Show rollback history"},
 		}},
@@ -443,8 +468,10 @@ func (c *CLI) handleShow(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("show: specify what to show")
 		fmt.Println("  configuration    Show active configuration")
+		fmt.Println("  route            Show routing table")
 		fmt.Println("  security         Show security information")
 		fmt.Println("  interfaces       Show interface status")
+		fmt.Println("  protocols        Show protocol information")
 		fmt.Println("  system           Show system information")
 		return nil
 	}
@@ -459,11 +486,17 @@ func (c *CLI) handleShow(args []string) error {
 		}
 		return nil
 
+	case "route":
+		return c.showRoutes()
+
 	case "security":
 		return c.handleShowSecurity(args[1:])
 
 	case "interfaces":
 		return c.showInterfaces(args[1:])
+
+	case "protocols":
+		return c.handleShowProtocols(args[1:])
 
 	case "system":
 		return c.handleShowSystem(args[1:])
@@ -485,13 +518,14 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		fmt.Println("  nat destination  Show destination NAT information")
 		fmt.Println("  address-book     Show address book entries")
 		fmt.Println("  applications     Show application definitions")
+		fmt.Println("  ipsec            Show IPsec VPN status")
 		fmt.Println("  log [N] [zone <name>] [protocol <proto>] [action <act>]")
 		fmt.Println("  statistics       Show global statistics")
 		return nil
 	}
 
 	cfg := c.store.ActiveConfig()
-	if cfg == nil && args[0] != "statistics" {
+	if cfg == nil && args[0] != "statistics" && args[0] != "ipsec" {
 		fmt.Println("no active configuration")
 		return nil
 	}
@@ -604,6 +638,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 
 	case "statistics":
 		return c.showStatistics()
+
+	case "ipsec":
+		return c.showIPsec(args[1:])
 
 	default:
 		return fmt.Errorf("unknown show security target: %s", args[0])
@@ -863,12 +900,50 @@ func (c *CLI) reloadSyslog(cfg *config.Config) {
 }
 
 func (c *CLI) applyToDataplane(cfg *config.Config) error {
-	if c.dp == nil || !c.dp.IsLoaded() {
-		return nil
+	// 1. Create tunnel interfaces first
+	if c.routing != nil {
+		var tunnels []*config.TunnelConfig
+		for _, ifc := range cfg.Interfaces.Interfaces {
+			if ifc.Tunnel != nil {
+				tunnels = append(tunnels, ifc.Tunnel)
+			}
+		}
+		if len(tunnels) > 0 {
+			if err := c.routing.ApplyTunnels(tunnels); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: tunnel apply failed: %v\n", err)
+			}
+		}
 	}
 
-	_, err := c.dp.Compile(cfg)
-	return err
+	// 2. Compile eBPF dataplane
+	if c.dp != nil && c.dp.IsLoaded() {
+		if _, err := c.dp.Compile(cfg); err != nil {
+			return err
+		}
+	}
+
+	// 3. Install static routes
+	if c.routing != nil && len(cfg.RoutingOptions.StaticRoutes) > 0 {
+		if err := c.routing.ApplyStaticRoutes(cfg.RoutingOptions.StaticRoutes); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: static routes apply failed: %v\n", err)
+		}
+	}
+
+	// 4. Apply FRR config
+	if c.frr != nil && (cfg.Protocols.OSPF != nil || cfg.Protocols.BGP != nil) {
+		if err := c.frr.Apply(cfg.Protocols.OSPF, cfg.Protocols.BGP); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: FRR apply failed: %v\n", err)
+		}
+	}
+
+	// 5. Apply IPsec config
+	if c.ipsec != nil && len(cfg.Security.IPsec.VPNs) > 0 {
+		if err := c.ipsec.Apply(&cfg.Security.IPsec); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: IPsec apply failed: %v\n", err)
+		}
+	}
+
+	return nil
 }
 
 // sessionFilter holds parsed filter criteria for session display.
@@ -1435,6 +1510,240 @@ func (c *CLI) showApplications() error {
 	return nil
 }
 
+func (c *CLI) showRoutes() error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+
+	entries, err := c.routing.GetRoutes()
+	if err != nil {
+		return fmt.Errorf("get routes: %w", err)
+	}
+
+	fmt.Println("Routing table:")
+	fmt.Printf("  %-24s %-20s %-14s %-12s %s\n",
+		"Destination", "Next-hop", "Interface", "Proto", "Pref")
+	for _, e := range entries {
+		fmt.Printf("  %-24s %-20s %-14s %-12s %d\n",
+			e.Destination, e.NextHop, e.Interface, e.Protocol, e.Preference)
+	}
+	return nil
+}
+
+func (c *CLI) handleShowProtocols(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("show protocols:")
+		fmt.Println("  ospf             Show OSPF information")
+		fmt.Println("  bgp              Show BGP information")
+		return nil
+	}
+
+	switch args[0] {
+	case "ospf":
+		return c.showOSPF(args[1:])
+	case "bgp":
+		return c.showBGP(args[1:])
+	default:
+		return fmt.Errorf("unknown show protocols target: %s", args[0])
+	}
+}
+
+func (c *CLI) showOSPF(args []string) error {
+	if c.frr == nil {
+		fmt.Println("FRR manager not available")
+		return nil
+	}
+
+	if len(args) == 0 {
+		fmt.Println("show protocols ospf:")
+		fmt.Println("  neighbor         Show OSPF neighbors")
+		fmt.Println("  database         Show OSPF database")
+		return nil
+	}
+
+	switch args[0] {
+	case "neighbor":
+		neighbors, err := c.frr.GetOSPFNeighbors()
+		if err != nil {
+			return fmt.Errorf("OSPF neighbors: %w", err)
+		}
+		if len(neighbors) == 0 {
+			fmt.Println("No OSPF neighbors")
+			return nil
+		}
+		fmt.Printf("  %-18s %-10s %-16s %-18s %s\n",
+			"Neighbor ID", "Priority", "State", "Address", "Interface")
+		for _, n := range neighbors {
+			fmt.Printf("  %-18s %-10s %-16s %-18s %s\n",
+				n.NeighborID, n.Priority, n.State, n.Address, n.Interface)
+		}
+		return nil
+
+	case "database":
+		output, err := c.frr.GetOSPFDatabase()
+		if err != nil {
+			return fmt.Errorf("OSPF database: %w", err)
+		}
+		fmt.Print(output)
+		return nil
+
+	default:
+		return fmt.Errorf("unknown show protocols ospf target: %s", args[0])
+	}
+}
+
+func (c *CLI) showBGP(args []string) error {
+	if c.frr == nil {
+		fmt.Println("FRR manager not available")
+		return nil
+	}
+
+	if len(args) == 0 {
+		fmt.Println("show protocols bgp:")
+		fmt.Println("  summary          Show BGP peer summary")
+		fmt.Println("  routes           Show BGP routes")
+		return nil
+	}
+
+	switch args[0] {
+	case "summary":
+		peers, err := c.frr.GetBGPSummary()
+		if err != nil {
+			return fmt.Errorf("BGP summary: %w", err)
+		}
+		if len(peers) == 0 {
+			fmt.Println("No BGP peers")
+			return nil
+		}
+		fmt.Printf("  %-20s %-8s %-10s %-10s %-12s %s\n",
+			"Neighbor", "AS", "MsgRcvd", "MsgSent", "Up/Down", "State")
+		for _, p := range peers {
+			fmt.Printf("  %-20s %-8s %-10s %-10s %-12s %s\n",
+				p.Neighbor, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State)
+		}
+		return nil
+
+	case "routes":
+		routes, err := c.frr.GetBGPRoutes()
+		if err != nil {
+			return fmt.Errorf("BGP routes: %w", err)
+		}
+		if len(routes) == 0 {
+			fmt.Println("No BGP routes")
+			return nil
+		}
+		fmt.Printf("  %-24s %-20s %s\n", "Network", "Next-hop", "Path")
+		for _, r := range routes {
+			fmt.Printf("  %-24s %-20s %s\n", r.Network, r.NextHop, r.Path)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unknown show protocols bgp target: %s", args[0])
+	}
+}
+
+func (c *CLI) showIPsec(args []string) error {
+	if c.ipsec == nil {
+		fmt.Println("IPsec manager not available")
+		return nil
+	}
+
+	if len(args) > 0 && args[0] == "security-associations" {
+		sas, err := c.ipsec.GetSAStatus()
+		if err != nil {
+			return fmt.Errorf("IPsec SA status: %w", err)
+		}
+		if len(sas) == 0 {
+			fmt.Println("No IPsec security associations")
+			return nil
+		}
+		for _, sa := range sas {
+			fmt.Printf("SA: %s\n", sa.Name)
+			fmt.Printf("  State: %s\n", sa.State)
+			if sa.LocalAddr != "" {
+				fmt.Printf("  Local: %s\n", sa.LocalAddr)
+			}
+			if sa.RemoteAddr != "" {
+				fmt.Printf("  Remote: %s\n", sa.RemoteAddr)
+			}
+			if sa.LocalTS != "" {
+				fmt.Printf("  Local TS: %s\n", sa.LocalTS)
+			}
+			if sa.RemoteTS != "" {
+				fmt.Printf("  Remote TS: %s\n", sa.RemoteTS)
+			}
+			fmt.Println()
+		}
+		return nil
+	}
+
+	// Default: show configured VPNs
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+
+	if len(cfg.Security.IPsec.VPNs) == 0 {
+		fmt.Println("No IPsec VPNs configured")
+		return nil
+	}
+
+	for name, vpn := range cfg.Security.IPsec.VPNs {
+		fmt.Printf("VPN: %s\n", name)
+		fmt.Printf("  Gateway: %s\n", vpn.Gateway)
+		if vpn.LocalAddr != "" {
+			fmt.Printf("  Local address: %s\n", vpn.LocalAddr)
+		}
+		if vpn.IPsecPolicy != "" {
+			fmt.Printf("  IPsec policy: %s\n", vpn.IPsecPolicy)
+		}
+		if vpn.LocalID != "" {
+			fmt.Printf("  Local identity: %s\n", vpn.LocalID)
+		}
+		if vpn.RemoteID != "" {
+			fmt.Printf("  Remote identity: %s\n", vpn.RemoteID)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *CLI) showTunnelInterfaces() error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+
+	tunnels, err := c.routing.GetTunnelStatus()
+	if err != nil {
+		return fmt.Errorf("tunnel status: %w", err)
+	}
+
+	if len(tunnels) == 0 {
+		fmt.Println("No tunnel interfaces")
+		return nil
+	}
+
+	for _, t := range tunnels {
+		fmt.Printf("Tunnel interface: %s\n", t.Name)
+		fmt.Printf("  State: %s\n", t.State)
+		if t.Source != "" {
+			fmt.Printf("  Source: %s\n", t.Source)
+		}
+		if t.Destination != "" {
+			fmt.Printf("  Destination: %s\n", t.Destination)
+		}
+		for _, addr := range t.Addresses {
+			fmt.Printf("  Address: %s\n", addr)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
 func (c *CLI) showSecurityLog(args []string) error {
 	if c.eventBuf == nil {
 		fmt.Println("no events (event buffer not initialized)")
@@ -1510,6 +1819,11 @@ func (c *CLI) showSecurityLog(args []string) error {
 }
 
 func (c *CLI) showInterfaces(args []string) error {
+	// Handle "show interfaces tunnel" sub-command
+	if len(args) > 0 && args[0] == "tunnel" {
+		return c.showTunnelInterfaces()
+	}
+
 	cfg := c.store.ActiveConfig()
 	if cfg == nil {
 		fmt.Println("no active configuration")
@@ -1867,11 +2181,14 @@ func (c *CLI) showOperationalHelp() {
 	fmt.Println("  configure                          Enter configuration mode")
 	fmt.Println("  show configuration                 Show running configuration")
 	fmt.Println("  show configuration | display set   Show as flat set commands")
+	fmt.Println("  show route                         Show routing table")
 	fmt.Println("  show security                      Show security information")
+	fmt.Println("  show security ipsec                Show IPsec VPN status")
 	fmt.Println("  show security log [N]              Show recent security events")
+	fmt.Println("  show interfaces tunnel             Show tunnel interfaces")
+	fmt.Println("  show protocols ospf neighbor       Show OSPF neighbors")
+	fmt.Println("  show protocols bgp summary         Show BGP peer summary")
 	fmt.Println("  show system rollback               Show rollback history")
-	fmt.Println("  show system rollback N             Show specific rollback content")
-	fmt.Println("  show system rollback N | display set")
 	fmt.Println("  clear security flow session        Clear all sessions")
 	fmt.Println("  clear security counters            Clear all counters")
 	fmt.Println("  quit                               Exit CLI")

@@ -209,9 +209,13 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"stream": {args: 1, valueHint: ValueHintStreamName, children: nil},
 		}},
 		"flow": {children: map[string]*schemaNode{
-			"tcp-session": {children: nil},
-			"udp-session": {children: nil},
+			"tcp-session":  {children: nil},
+			"udp-session":  {children: nil},
 			"icmp-session": {children: nil},
+		}},
+		"ipsec": {children: map[string]*schemaNode{
+			"proposal": {args: 1, children: nil},
+			"vpn":      {args: 1, children: nil},
 		}},
 	}},
 	"interfaces": {wildcard: &schemaNode{valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
@@ -221,10 +225,24 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"inet6": {children: nil},
 			}},
 		}},
+		"tunnel": {children: nil}, // tunnel source/destination/key/ttl are leaves
 	}}},
 	"applications": {children: map[string]*schemaNode{
 		"application":     {args: 1, valueHint: ValueHintAppName, children: nil},
 		"application-set": {args: 1, valueHint: ValueHintAppSetName, children: nil},
+	}},
+	"routing-options": {children: map[string]*schemaNode{
+		"static": {children: map[string]*schemaNode{
+			"route": {args: 1, children: nil}, // route <prefix/len>
+		}},
+	}},
+	"protocols": {children: map[string]*schemaNode{
+		"ospf": {children: map[string]*schemaNode{
+			"area": {args: 1, children: nil}, // area <id>
+		}},
+		"bgp": {children: map[string]*schemaNode{
+			"group": {args: 1, children: nil}, // group <name>
+		}},
 	}},
 }}
 
