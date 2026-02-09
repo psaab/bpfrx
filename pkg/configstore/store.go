@@ -5,7 +5,9 @@ package configstore
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +62,7 @@ func (s *Store) Load() error {
 
 	s.active = tree
 	s.compiled = compiled
+	s.loadRollbackHistory()
 	return nil
 }
 
@@ -205,6 +208,7 @@ func (s *Store) Commit() (*config.Config, error) {
 			// Non-fatal: log but don't fail the commit
 			fmt.Fprintf(os.Stderr, "warning: failed to save config: %v\n", err)
 		}
+		s.saveRollbackFiles()
 	}
 
 	return compiled, nil
@@ -274,6 +278,88 @@ func (s *Store) ExportJSON() ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return json.MarshalIndent(s.compiled, "", "  ")
+}
+
+// ListHistory returns all history entries, most recent first (goroutine-safe).
+func (s *Store) ListHistory() []*HistoryEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.history.List()
+}
+
+// rollbackPath returns the file path for rollback slot n (1-based).
+func (s *Store) rollbackPath(n int) string {
+	return filepath.Join(filepath.Dir(s.filePath), fmt.Sprintf("%s.%d", filepath.Base(s.filePath), n))
+}
+
+// saveRollbackFiles writes rollback history entries to numbered files.
+// Must be called under write lock.
+func (s *Store) saveRollbackFiles() {
+	if s.filePath == "" {
+		return
+	}
+
+	entries := s.history.List() // most-recent-first
+	for i, entry := range entries {
+		path := s.rollbackPath(i + 1)
+		data := entry.Config.Format()
+		if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+			slog.Warn("failed to write rollback file", "path", path, "err", err)
+		}
+	}
+	s.cleanupRollbackFiles(len(entries) + 1)
+}
+
+// cleanupRollbackFiles removes stale rollback files starting from startIdx.
+func (s *Store) cleanupRollbackFiles(startIdx int) {
+	for i := startIdx; i <= s.history.MaxSize()+1; i++ {
+		path := s.rollbackPath(i)
+		if err := os.Remove(path); err != nil {
+			break // stop on first not-found (contiguous sequence)
+		}
+	}
+}
+
+// loadRollbackHistory reads numbered rollback files and populates the history.
+// Must be called under write lock.
+func (s *Store) loadRollbackHistory() {
+	if s.filePath == "" {
+		return
+	}
+
+	var entries []*HistoryEntry
+	for i := 1; i <= s.history.MaxSize(); i++ {
+		path := s.rollbackPath(i)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			break // stop on first not-found
+		}
+		parser := config.NewParser(string(data))
+		tree, errs := parser.Parse()
+		if len(errs) > 0 {
+			slog.Warn("skipping corrupt rollback file", "path", path, "err", errs[0])
+			continue
+		}
+		// Use file modification time as timestamp
+		info, _ := os.Stat(path)
+		ts := time.Now()
+		if info != nil {
+			ts = info.ModTime()
+		}
+		entries = append(entries, &HistoryEntry{
+			Config:    tree,
+			Timestamp: ts,
+		})
+	}
+
+	// Push oldest-first so History ordering is correct
+	for i := len(entries) - 1; i >= 0; i-- {
+		s.history.Push(entries[i])
+	}
+
+	if len(entries) > 0 {
+		slog.Info("loaded rollback history", "entries", len(entries))
+	}
 }
 
 // ShowCompare returns a diff between the active and candidate configurations

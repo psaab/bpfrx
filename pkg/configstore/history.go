@@ -51,6 +51,11 @@ func (h *History) Len() int {
 	return len(h.entries)
 }
 
+// MaxSize returns the maximum number of history entries.
+func (h *History) MaxSize() int {
+	return h.maxSize
+}
+
 // List returns all history entries, most recent first.
 func (h *History) List() []*HistoryEntry {
 	result := make([]*HistoryEntry, len(h.entries))

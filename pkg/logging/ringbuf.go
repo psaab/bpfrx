@@ -39,6 +39,17 @@ func (er *EventReader) SetSyslogClients(clients []*SyslogClient) {
 	er.syslogMu.Unlock()
 }
 
+// ReplaceSyslogClients atomically swaps syslog clients and closes old ones.
+func (er *EventReader) ReplaceSyslogClients(clients []*SyslogClient) {
+	er.syslogMu.Lock()
+	old := er.syslogClients
+	er.syslogClients = clients
+	er.syslogMu.Unlock()
+	for _, c := range old {
+		c.Close()
+	}
+}
+
 // Run starts reading events. It blocks until ctx is cancelled.
 func (er *EventReader) Run(ctx context.Context) {
 	if er.eventsMap == nil {

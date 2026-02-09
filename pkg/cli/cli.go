@@ -18,16 +18,17 @@ import (
 
 // CLI is the interactive command-line interface.
 type CLI struct {
-	rl       *readline.Instance
-	store    *configstore.Store
-	dp       *dataplane.Manager
-	eventBuf *logging.EventBuffer
-	hostname string
-	username string
+	rl          *readline.Instance
+	store       *configstore.Store
+	dp          *dataplane.Manager
+	eventBuf    *logging.EventBuffer
+	eventReader *logging.EventReader
+	hostname    string
+	username    string
 }
 
 // New creates a new CLI.
-func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.EventBuffer) *CLI {
+func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.EventBuffer, eventReader *logging.EventReader) *CLI {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "bpfrx"
@@ -38,11 +39,12 @@ func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.Even
 	}
 
 	return &CLI{
-		store:    store,
-		dp:       dp,
-		eventBuf: eventBuf,
-		hostname: hostname,
-		username: username,
+		store:       store,
+		dp:          dp,
+		eventBuf:    eventBuf,
+		eventReader: eventReader,
+		hostname:    hostname,
+		username:    username,
 	}
 }
 
@@ -197,6 +199,7 @@ func (c *CLI) handleShow(args []string) error {
 		fmt.Println("  configuration    Show active configuration")
 		fmt.Println("  security         Show security information")
 		fmt.Println("  interfaces       Show interface status")
+		fmt.Println("  system           Show system information")
 		return nil
 	}
 
@@ -210,6 +213,9 @@ func (c *CLI) handleShow(args []string) error {
 
 	case "interfaces":
 		return c.showInterfaces(args[1:])
+
+	case "system":
+		return c.handleShowSystem(args[1:])
 
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
@@ -527,8 +533,27 @@ func (c *CLI) handleCommit(args []string) error {
 		}
 	}
 
+	// Hot-reload syslog clients
+	c.reloadSyslog(compiled)
+
 	fmt.Println("commit complete")
 	return nil
+}
+
+func (c *CLI) reloadSyslog(cfg *config.Config) {
+	if c.eventReader == nil {
+		return
+	}
+	var clients []*logging.SyslogClient
+	for name, stream := range cfg.Security.Log.Streams {
+		client, err := logging.NewSyslogClient(stream.Host, stream.Port)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: syslog stream %s: %v\n", name, err)
+			continue
+		}
+		clients = append(clients, client)
+	}
+	c.eventReader.ReplaceSyslogClients(clients)
 }
 
 func (c *CLI) applyToDataplane(cfg *config.Config) error {
@@ -1054,6 +1079,29 @@ func (c *CLI) showInterfaces(args []string) error {
 	return nil
 }
 
+func (c *CLI) handleShowSystem(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("show system:")
+		fmt.Println("  rollback         Show rollback history")
+		return nil
+	}
+
+	switch args[0] {
+	case "rollback":
+		entries := c.store.ListHistory()
+		if len(entries) == 0 {
+			fmt.Println("No rollback history available")
+			return nil
+		}
+		for i, entry := range entries {
+			fmt.Printf("  rollback %d: %s\n", i+1, entry.Timestamp.Format("2006-01-02 15:04:05"))
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown show system target: %s", args[0])
+	}
+}
+
 func protoNameFromNum(p uint8) string {
 	switch p {
 	case 6:
@@ -1122,6 +1170,7 @@ func (c *CLI) showOperationalHelp() {
 	fmt.Println("  show configuration           Show running configuration")
 	fmt.Println("  show security                Show security information")
 	fmt.Println("  show security log [N]        Show recent security events")
+	fmt.Println("  show system rollback         Show rollback history")
 	fmt.Println("  clear security flow session  Clear all sessions")
 	fmt.Println("  clear security counters      Clear all counters")
 	fmt.Println("  quit                         Exit CLI")

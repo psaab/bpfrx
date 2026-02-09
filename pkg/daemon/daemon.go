@@ -102,7 +102,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	// Start CLI shell
-	shell := cli.New(d.store, d.dp, eventBuf)
+	shell := cli.New(d.store, d.dp, eventBuf, er)
 
 	// Run CLI in a goroutine so we can still handle signals
 	errCh := make(chan error, 1)
