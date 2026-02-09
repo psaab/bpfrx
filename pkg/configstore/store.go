@@ -362,6 +362,85 @@ func (s *Store) loadRollbackHistory() {
 	}
 }
 
+// ShowActiveSet returns the active configuration as flat set commands.
+func (s *Store) ShowActiveSet() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.active.FormatSet()
+}
+
+// ShowRollback returns the content of rollback slot n (1-based) as hierarchical text.
+func (s *Store) ShowRollback(n int) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	entry, err := s.history.Get(n - 1)
+	if err != nil {
+		return "", err
+	}
+	return entry.Config.Format(), nil
+}
+
+// ShowRollbackSet returns the content of rollback slot n (1-based) as flat set commands.
+func (s *Store) ShowRollbackSet(n int) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	entry, err := s.history.Get(n - 1)
+	if err != nil {
+		return "", err
+	}
+	return entry.Config.FormatSet(), nil
+}
+
+// ShowCompareRollback returns a diff between rollback slot n and the candidate.
+func (s *Store) ShowCompareRollback(n int) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.candidate == nil {
+		return "", fmt.Errorf("not in configuration mode")
+	}
+
+	entry, err := s.history.Get(n - 1)
+	if err != nil {
+		return "", err
+	}
+
+	rollbackSet := entry.Config.FormatSet()
+	candidateSet := s.candidate.FormatSet()
+
+	rollbackLines := splitLines(rollbackSet)
+	candidateLines := splitLines(candidateSet)
+
+	rollbackMap := make(map[string]bool, len(rollbackLines))
+	for _, line := range rollbackLines {
+		rollbackMap[line] = true
+	}
+	candidateMap := make(map[string]bool, len(candidateLines))
+	for _, line := range candidateLines {
+		candidateMap[line] = true
+	}
+
+	var b strings.Builder
+
+	for _, line := range rollbackLines {
+		if !candidateMap[line] {
+			fmt.Fprintf(&b, "- %s\n", line)
+		}
+	}
+	for _, line := range candidateLines {
+		if !rollbackMap[line] {
+			fmt.Fprintf(&b, "+ %s\n", line)
+		}
+	}
+
+	if b.Len() == 0 {
+		return "[no changes]\n", nil
+	}
+	return b.String(), nil
+}
+
 // ShowCompare returns a diff between the active and candidate configurations
 // as set commands, with "-" for removed lines and "+" for added lines.
 func (s *Store) ShowCompare() string {

@@ -385,6 +385,55 @@ func keysEqual(a, b []string) bool {
 	return true
 }
 
+// CompleteSetPath returns possible completions for a partial set/delete path.
+// It walks setSchema consuming tokens; at the current position it returns
+// child keyword names. If the current position expects a dynamic argument
+// (wildcard or args > 0), it returns nil (user must type a name).
+func CompleteSetPath(tokens []string) []string {
+	schema := setSchema
+	i := 0
+
+	for i < len(tokens) {
+		if schema == nil || schema.children == nil {
+			return nil // at a leaf or no more schema
+		}
+
+		keyword := tokens[i]
+
+		// Look up keyword in current schema level.
+		var childSchema *schemaNode
+		if s, ok := schema.children[keyword]; ok {
+			childSchema = s
+		} else if schema.wildcard != nil {
+			childSchema = schema.wildcard
+		} else {
+			return nil // unknown keyword, no completions
+		}
+
+		// Consume keyword + extra args.
+		nodeKeyCount := 1 + childSchema.args
+		i += nodeKeyCount
+
+		if i > len(tokens) {
+			// Still consuming args for this node — user needs to type a value.
+			return nil
+		}
+
+		schema = childSchema
+	}
+
+	// We've consumed all tokens. Return child keywords at this schema level.
+	if schema == nil || schema.children == nil {
+		return nil
+	}
+
+	var completions []string
+	for name := range schema.children {
+		completions = append(completions, name)
+	}
+	return completions
+}
+
 // Format renders the tree as Junos hierarchical configuration text.
 func (t *ConfigTree) Format() string {
 	var b strings.Builder

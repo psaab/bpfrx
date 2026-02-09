@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/chzyer/readline"
@@ -48,6 +50,176 @@ func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.Even
 	}
 }
 
+// completionNode is a static command completion tree node.
+type completionNode struct {
+	desc     string
+	children map[string]*completionNode
+}
+
+// operationalTree defines tab completion for operational mode.
+var operationalTree = map[string]*completionNode{
+	"configure": {desc: "Enter configuration mode"},
+	"show": {desc: "Show information", children: map[string]*completionNode{
+		"configuration": {desc: "Show active configuration"},
+		"security": {desc: "Show security information", children: map[string]*completionNode{
+			"zones":        {desc: "Show security zones"},
+			"policies":     {desc: "Show security policies"},
+			"screen":       {desc: "Show screen/IDS profiles"},
+			"flow":         {desc: "Show flow information", children: map[string]*completionNode{
+				"session": {desc: "Show active sessions"},
+			}},
+			"nat": {desc: "Show NAT information", children: map[string]*completionNode{
+				"source":      {desc: "Show source NAT"},
+				"destination": {desc: "Show destination NAT"},
+				"static":      {desc: "Show static NAT"},
+			}},
+			"address-book":  {desc: "Show address book entries"},
+			"applications":  {desc: "Show application definitions"},
+			"log":           {desc: "Show recent security events"},
+			"statistics":    {desc: "Show global statistics"},
+		}},
+		"interfaces": {desc: "Show interface status"},
+		"system": {desc: "Show system information", children: map[string]*completionNode{
+			"rollback": {desc: "Show rollback history"},
+		}},
+	}},
+	"clear": {desc: "Clear information", children: map[string]*completionNode{
+		"security": {desc: "Clear security information", children: map[string]*completionNode{
+			"flow": {desc: "Clear flow information", children: map[string]*completionNode{
+				"session": {desc: "Clear all sessions"},
+			}},
+			"counters": {desc: "Clear all counters"},
+		}},
+	}},
+	"quit": {desc: "Exit CLI"},
+	"exit": {desc: "Exit CLI"},
+}
+
+// configTopLevel defines tab completion for config mode top-level commands.
+var configTopLevel = map[string]*completionNode{
+	"set":      {desc: "Set a configuration value"},
+	"delete":   {desc: "Delete a configuration element"},
+	"show":     {desc: "Show candidate configuration"},
+	"commit":   {desc: "Commit configuration", children: map[string]*completionNode{
+		"check": {desc: "Validate without applying"},
+	}},
+	"rollback": {desc: "Revert to previous configuration"},
+	"run":      {desc: "Run operational command"},
+	"exit":     {desc: "Exit configuration mode"},
+	"quit":     {desc: "Exit configuration mode"},
+}
+
+// cliCompleter implements readline.AutoCompleter.
+type cliCompleter struct {
+	cli *CLI
+}
+
+func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
+	// Only complete up to cursor position.
+	text := string(line[:pos])
+	words := strings.Fields(text)
+
+	// Detect if cursor is at a space after the last word (ready for new word).
+	trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
+
+	var partial string
+	if !trailingSpace && len(words) > 0 {
+		partial = words[len(words)-1]
+		words = words[:len(words)-1]
+	}
+
+	var candidates []string
+
+	if cc.cli.store.InConfigMode() {
+		candidates = cc.completeConfig(words, partial)
+	} else {
+		candidates = cc.completeOperational(words, partial)
+	}
+
+	if len(candidates) == 0 {
+		return nil, 0
+	}
+
+	sort.Strings(candidates)
+
+	var result [][]rune
+	for _, c := range candidates {
+		suffix := c[len(partial):]
+		result = append(result, []rune(suffix+" "))
+	}
+	return result, len(partial)
+}
+
+func (cc *cliCompleter) completeOperational(words []string, partial string) []string {
+	return completeFromTree(operationalTree, words, partial)
+}
+
+func (cc *cliCompleter) completeConfig(words []string, partial string) []string {
+	if len(words) == 0 {
+		// Complete top-level config commands.
+		return filterPrefix(keysOf(configTopLevel), partial)
+	}
+
+	switch words[0] {
+	case "set", "delete":
+		// Use schema-driven completion for the path after set/delete.
+		schemaCompletions := config.CompleteSetPath(words[1:])
+		if schemaCompletions == nil {
+			return nil
+		}
+		return filterPrefix(schemaCompletions, partial)
+
+	case "run":
+		// Delegate to operational completions for the rest.
+		return completeFromTree(operationalTree, words[1:], partial)
+
+	case "commit":
+		if len(words) == 1 {
+			return filterPrefix([]string{"check"}, partial)
+		}
+		return nil
+
+	default:
+		return nil
+	}
+}
+
+func completeFromTree(tree map[string]*completionNode, words []string, partial string) []string {
+	current := tree
+	for _, w := range words {
+		node, ok := current[w]
+		if !ok {
+			return nil
+		}
+		if node.children == nil {
+			return nil
+		}
+		current = node.children
+	}
+	return filterPrefix(keysOf(current), partial)
+}
+
+func keysOf(m map[string]*completionNode) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func filterPrefix(items []string, prefix string) []string {
+	if prefix == "" {
+		return items
+	}
+	var result []string
+	for _, item := range items {
+		if strings.HasPrefix(item, prefix) {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
 // Run starts the interactive CLI loop.
 func (c *CLI) Run() error {
 	var err error
@@ -56,6 +228,7 @@ func (c *CLI) Run() error {
 		HistoryFile:     "/tmp/bpfrx_history",
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
+		AutoComplete:    &cliCompleter{cli: c},
 	})
 	if err != nil {
 		return fmt.Errorf("readline init: %w", err)
@@ -96,6 +269,12 @@ func (c *CLI) Run() error {
 var errExit = fmt.Errorf("exit")
 
 func (c *CLI) dispatch(line string) error {
+	// Context-sensitive help: trailing ? shows available completions.
+	if strings.HasSuffix(line, "?") {
+		c.showContextHelp(strings.TrimSuffix(line, "?"))
+		return nil
+	}
+
 	if c.store.InConfigMode() {
 		return c.dispatchConfig(line)
 	}
@@ -205,7 +384,12 @@ func (c *CLI) handleShow(args []string) error {
 
 	switch args[0] {
 	case "configuration":
-		fmt.Print(c.store.ShowActive())
+		rest := strings.Join(args[1:], " ")
+		if strings.Contains(rest, "| display set") {
+			fmt.Print(c.store.ShowActiveSet())
+		} else {
+			fmt.Print(c.store.ShowActive())
+		}
 		return nil
 
 	case "security":
@@ -498,6 +682,20 @@ func (c *CLI) handleConfigShow(args []string) error {
 	line := strings.Join(args, " ")
 
 	if strings.Contains(line, "| compare") {
+		// Check for "| compare rollback N"
+		if idx := strings.Index(line, "| compare rollback"); idx >= 0 {
+			rest := strings.TrimSpace(line[idx+len("| compare rollback"):])
+			n, err := strconv.Atoi(rest)
+			if err != nil || n < 1 {
+				return fmt.Errorf("usage: show | compare rollback <N>")
+			}
+			diff, err := c.store.ShowCompareRollback(n)
+			if err != nil {
+				return err
+			}
+			fmt.Print(diff)
+			return nil
+		}
 		fmt.Print(c.store.ShowCompare())
 		return nil
 	}
@@ -1088,6 +1286,30 @@ func (c *CLI) handleShowSystem(args []string) error {
 
 	switch args[0] {
 	case "rollback":
+		if len(args) >= 2 {
+			// "show system rollback N" — show specific rollback content.
+			n, err := strconv.Atoi(args[1])
+			if err != nil || n < 1 {
+				return fmt.Errorf("usage: show system rollback <N>")
+			}
+			rest := strings.Join(args[2:], " ")
+			if strings.Contains(rest, "| display set") {
+				content, err := c.store.ShowRollbackSet(n)
+				if err != nil {
+					return err
+				}
+				fmt.Print(content)
+			} else {
+				content, err := c.store.ShowRollback(n)
+				if err != nil {
+					return err
+				}
+				fmt.Print(content)
+			}
+			return nil
+		}
+
+		// List all rollback entries with timestamps.
 		entries := c.store.ListHistory()
 		if len(entries) == 0 {
 			fmt.Println("No rollback history available")
@@ -1156,6 +1378,78 @@ func ntohs(v uint16) uint16 {
 	return binary.NativeEndian.Uint16(b[:])
 }
 
+func (c *CLI) showContextHelp(prefix string) {
+	prefix = strings.TrimSpace(prefix)
+	words := strings.Fields(prefix)
+
+	if c.store.InConfigMode() {
+		c.showConfigContextHelp(words)
+	} else {
+		c.showOperationalContextHelp(words)
+	}
+}
+
+func (c *CLI) showOperationalContextHelp(words []string) {
+	// Navigate to the appropriate tree level.
+	current := operationalTree
+	for _, w := range words {
+		node, ok := current[w]
+		if !ok {
+			fmt.Println("  (no help available)")
+			return
+		}
+		if node.children == nil {
+			fmt.Printf("  %-20s %s\n", w, node.desc)
+			return
+		}
+		current = node.children
+	}
+
+	// Show children with descriptions.
+	items := make([]string, 0, len(current))
+	for name := range current {
+		items = append(items, name)
+	}
+	sort.Strings(items)
+	for _, name := range items {
+		fmt.Printf("  %-20s %s\n", name, current[name].desc)
+	}
+}
+
+func (c *CLI) showConfigContextHelp(words []string) {
+	if len(words) == 0 {
+		// Show top-level config commands.
+		items := make([]string, 0, len(configTopLevel))
+		for name := range configTopLevel {
+			items = append(items, name)
+		}
+		sort.Strings(items)
+		for _, name := range items {
+			fmt.Printf("  %-20s %s\n", name, configTopLevel[name].desc)
+		}
+		return
+	}
+
+	switch words[0] {
+	case "set", "delete":
+		completions := config.CompleteSetPath(words[1:])
+		if completions == nil {
+			fmt.Println("  (value expected)")
+			return
+		}
+		sort.Strings(completions)
+		for _, name := range completions {
+			fmt.Printf("  %s\n", name)
+		}
+
+	case "run":
+		c.showOperationalContextHelp(words[1:])
+
+	default:
+		fmt.Println("  (no help available)")
+	}
+}
+
 func (c *CLI) operationalPrompt() string {
 	return fmt.Sprintf("%s@%s> ", c.username, c.hostname)
 }
@@ -1166,26 +1460,34 @@ func (c *CLI) configPrompt() string {
 
 func (c *CLI) showOperationalHelp() {
 	fmt.Println("Operational mode commands:")
-	fmt.Println("  configure                    Enter configuration mode")
-	fmt.Println("  show configuration           Show running configuration")
-	fmt.Println("  show security                Show security information")
-	fmt.Println("  show security log [N]        Show recent security events")
-	fmt.Println("  show system rollback         Show rollback history")
-	fmt.Println("  clear security flow session  Clear all sessions")
-	fmt.Println("  clear security counters      Clear all counters")
-	fmt.Println("  quit                         Exit CLI")
+	fmt.Println("  configure                          Enter configuration mode")
+	fmt.Println("  show configuration                 Show running configuration")
+	fmt.Println("  show configuration | display set   Show as flat set commands")
+	fmt.Println("  show security                      Show security information")
+	fmt.Println("  show security log [N]              Show recent security events")
+	fmt.Println("  show system rollback               Show rollback history")
+	fmt.Println("  show system rollback N             Show specific rollback content")
+	fmt.Println("  show system rollback N | display set")
+	fmt.Println("  clear security flow session        Clear all sessions")
+	fmt.Println("  clear security counters            Clear all counters")
+	fmt.Println("  quit                               Exit CLI")
+	fmt.Println()
+	fmt.Println("  Use <TAB> for command completion, ? for context help")
 }
 
 func (c *CLI) showConfigHelp() {
 	fmt.Println("Configuration mode commands:")
-	fmt.Println("  set <path>         Set a configuration value")
-	fmt.Println("  delete <path>      Delete a configuration element")
-	fmt.Println("  show               Show candidate configuration")
-	fmt.Println("  show | compare     Show pending changes")
-	fmt.Println("  show | display set Show as flat set commands")
-	fmt.Println("  commit             Validate and apply configuration")
-	fmt.Println("  commit check       Validate without applying")
-	fmt.Println("  rollback [n]       Revert to previous configuration")
-	fmt.Println("  run <cmd>          Run operational command")
-	fmt.Println("  exit               Exit configuration mode")
+	fmt.Println("  set <path>                   Set a configuration value")
+	fmt.Println("  delete <path>                Delete a configuration element")
+	fmt.Println("  show                         Show candidate configuration")
+	fmt.Println("  show | compare               Show pending changes vs active")
+	fmt.Println("  show | compare rollback N    Show changes vs rollback N")
+	fmt.Println("  show | display set           Show as flat set commands")
+	fmt.Println("  commit                       Validate and apply configuration")
+	fmt.Println("  commit check                 Validate without applying")
+	fmt.Println("  rollback [n]                 Revert to previous configuration")
+	fmt.Println("  run <cmd>                    Run operational command")
+	fmt.Println("  exit                         Exit configuration mode")
+	fmt.Println()
+	fmt.Println("  Use <TAB> for command completion, ? for context help")
 }
