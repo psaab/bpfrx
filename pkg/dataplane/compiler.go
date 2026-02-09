@@ -272,12 +272,25 @@ func (m *Manager) compileApplications(cfg *config.Config, result *CompileResult)
 	appID := uint32(1)
 	userApps := cfg.Applications.Applications
 
-	// Collect all referenced application names from policies
+	// Collect all referenced application names from policies,
+	// expanding application-sets to individual apps.
 	referenced := make(map[string]bool)
 	for _, zpp := range cfg.Security.Policies {
 		for _, pol := range zpp.Policies {
 			for _, appName := range pol.Match.Applications {
-				if appName != "any" {
+				if appName == "any" {
+					continue
+				}
+				// Check if it's an application-set
+				if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+					expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications)
+					if err != nil {
+						return fmt.Errorf("expand application-set %q: %w", appName, err)
+					}
+					for _, a := range expanded {
+						referenced[a] = true
+					}
+				} else {
 					referenced[appName] = true
 				}
 			}
@@ -444,7 +457,7 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 		var expanded []expandedRule
 
 		for _, pol := range zpp.Policies {
-			// Resolve application list
+			// Resolve application list, expanding application-sets
 			var appIDs []uint32
 			hasAny := false
 			for _, appName := range pol.Match.Applications {
@@ -456,8 +469,22 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 			if hasAny || len(pol.Match.Applications) == 0 {
 				appIDs = []uint32{0} // single rule with app_id=0 (any)
 			} else {
+				seen := make(map[uint32]bool)
 				for _, appName := range pol.Match.Applications {
-					if id, ok := result.AppIDs[appName]; ok {
+					// Expand application-sets
+					if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+						expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications)
+						if err != nil {
+							return fmt.Errorf("policy %s expand app-set %q: %w", pol.Name, appName, err)
+						}
+						for _, a := range expanded {
+							if id, ok := result.AppIDs[a]; ok && !seen[id] {
+								seen[id] = true
+								appIDs = append(appIDs, id)
+							}
+						}
+					} else if id, ok := result.AppIDs[appName]; ok && !seen[id] {
+						seen[id] = true
 						appIDs = append(appIDs, id)
 					}
 				}
@@ -976,6 +1003,9 @@ func (m *Manager) compileScreenProfiles(cfg *config.Config, result *CompileResul
 		}
 		if profile.TCP.WinNuke {
 			flags |= ScreenWinNuke
+		}
+		if profile.TCP.SynFrag {
+			flags |= ScreenSynFrag
 		}
 		if profile.TCP.SynFlood != nil && profile.TCP.SynFlood.AttackThreshold > 0 {
 			flags |= ScreenSynFlood

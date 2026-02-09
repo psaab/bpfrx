@@ -447,6 +447,7 @@ const (
 	ScreenTCPFinNoAck   = 1 << 10
 	ScreenWinNuke       = 1 << 11
 	ScreenIPSourceRoute = 1 << 12
+	ScreenSynFrag       = 1 << 13
 )
 
 // ScreenFlagNames maps screen flag values to human-readable names.
@@ -464,6 +465,7 @@ var ScreenFlagNames = map[uint32]string{
 	ScreenTCPFinNoAck:   "TCP FIN-no-ACK",
 	ScreenWinNuke:       "WinNuke",
 	ScreenIPSourceRoute: "IP source-route",
+	ScreenSynFrag:       "SYN fragment",
 }
 
 // Per-rule logging flags (matches C LOG_FLAG_* defines).

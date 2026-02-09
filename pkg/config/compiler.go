@@ -16,7 +16,8 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 			Interfaces: make(map[string]*InterfaceConfig),
 		},
 		Applications: ApplicationsConfig{
-			Applications: make(map[string]*Application),
+			Applications:    make(map[string]*Application),
+			ApplicationSets: make(map[string]*ApplicationSet),
 		},
 	}
 
@@ -426,8 +427,16 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					pool.Addresses = append(pool.Addresses, prop.Keys[1])
 				}
 			case "port":
-				// parse "range low N high M" or individual port
-				if len(prop.Keys) >= 2 {
+				// "port range low N high M" or "port N"
+				if len(prop.Keys) >= 6 && prop.Keys[1] == "range" &&
+					prop.Keys[2] == "low" && prop.Keys[4] == "high" {
+					if v, err := strconv.Atoi(prop.Keys[3]); err == nil {
+						pool.PortLow = v
+					}
+					if v, err := strconv.Atoi(prop.Keys[5]); err == nil {
+						pool.PortHigh = v
+					}
+				} else if len(prop.Keys) >= 2 {
 					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
 						pool.PortLow = v
 						pool.PortHigh = v
@@ -761,5 +770,21 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 
 		apps.Applications[app.Name] = app
 	}
+
+	for _, child := range node.FindChildren("application-set") {
+		if len(child.Keys) < 2 {
+			continue
+		}
+		as := &ApplicationSet{Name: child.Keys[1]}
+
+		for _, member := range child.Children {
+			if member.Name() == "application" && len(member.Keys) >= 2 {
+				as.Applications = append(as.Applications, member.Keys[1])
+			}
+		}
+
+		apps.ApplicationSets[as.Name] = as
+	}
+
 	return nil
 }

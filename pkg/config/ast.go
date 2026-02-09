@@ -116,6 +116,7 @@ const (
 	ValueHintInterfaceName           // interfaces <name>
 	ValueHintScreenProfile           // ids-option <name>
 	ValueHintStreamName              // stream <name>
+	ValueHintAppSetName              // application-set <name>
 )
 
 // ValueProvider returns possible values for a given hint.
@@ -222,7 +223,8 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 	}}},
 	"applications": {children: map[string]*schemaNode{
-		"application": {args: 1, valueHint: ValueHintAppName, children: nil},
+		"application":     {args: 1, valueHint: ValueHintAppName, children: nil},
+		"application-set": {args: 1, valueHint: ValueHintAppSetName, children: nil},
 	}},
 }}
 

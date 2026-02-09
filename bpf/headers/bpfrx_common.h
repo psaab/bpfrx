@@ -245,6 +245,7 @@ struct icmp6hdr {
 #define SCREEN_TCP_FIN_NO_ACK    (1 << 10)
 #define SCREEN_WINNUKE           (1 << 11)
 #define SCREEN_IP_SOURCE_ROUTE   (1 << 12)
+#define SCREEN_SYN_FRAG          (1 << 13)
 
 /* Host-inbound-traffic service flags (zone_config.host_inbound_flags) */
 #define HOST_INBOUND_SSH         (1 << 0)

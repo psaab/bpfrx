@@ -25,6 +25,12 @@ type Store struct {
 	dirty     bool
 	configDir bool // true if in configuration mode
 	filePath  string
+
+	// Commit confirmed state
+	confirmTimer    *time.Timer
+	confirmPrevTree *config.ConfigTree // active tree before confirmed commit
+	confirmPrevCfg  *config.Config     // compiled config before confirmed commit
+	autoRollbackFn  func(*config.Config) // callback for dataplane re-apply
 }
 
 // New creates a new config store.
@@ -212,6 +218,138 @@ func (s *Store) Commit() (*config.Config, error) {
 	}
 
 	return compiled, nil
+}
+
+// SetAutoRollbackHandler registers a callback for auto-rollback dataplane re-apply.
+func (s *Store) SetAutoRollbackHandler(fn func(*config.Config)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.autoRollbackFn = fn
+}
+
+// CommitConfirmed validates, compiles, and applies the candidate with an
+// automatic rollback timer. If minutes is 0, defaults to 10.
+// If a bare "commit" is not issued within the timeout, the config auto-reverts.
+func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.candidate == nil {
+		return nil, fmt.Errorf("not in configuration mode")
+	}
+
+	compiled, err := config.CompileConfig(s.candidate)
+	if err != nil {
+		return nil, fmt.Errorf("commit check failed: %w", err)
+	}
+
+	if minutes <= 0 {
+		minutes = 10
+	}
+
+	// Cancel any existing pending confirmation
+	if s.confirmTimer != nil {
+		s.confirmTimer.Stop()
+		s.confirmTimer = nil
+	}
+
+	// Save current active state for potential rollback
+	s.confirmPrevTree = s.active.Clone()
+	s.confirmPrevCfg = s.compiled
+
+	// Push current active to history
+	s.history.Push(&HistoryEntry{
+		Config:    s.active.Clone(),
+		Timestamp: time.Now(),
+	})
+
+	// Promote candidate to active
+	s.active = s.candidate
+	s.candidate = s.active.Clone()
+	s.compiled = compiled
+	s.dirty = false
+
+	// Persist to disk
+	data := s.active.Format()
+	if s.filePath != "" {
+		if err := os.WriteFile(s.filePath, []byte(data), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to save config: %v\n", err)
+		}
+		s.saveRollbackFiles()
+	}
+
+	// Start auto-rollback timer
+	s.confirmTimer = time.AfterFunc(time.Duration(minutes)*time.Minute, func() {
+		s.performAutoRollback()
+	})
+
+	slog.Info("commit confirmed started", "timeout_minutes", minutes)
+	return compiled, nil
+}
+
+// ConfirmCommit cancels the auto-rollback timer, confirming the config.
+func (s *Store) ConfirmCommit() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.confirmTimer == nil {
+		return fmt.Errorf("no pending confirmed commit")
+	}
+
+	s.confirmTimer.Stop()
+	s.confirmTimer = nil
+	s.confirmPrevTree = nil
+	s.confirmPrevCfg = nil
+
+	slog.Info("commit confirmed")
+	return nil
+}
+
+// IsConfirmPending returns true if a commit confirmed is awaiting confirmation.
+func (s *Store) IsConfirmPending() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.confirmTimer != nil
+}
+
+// performAutoRollback reverts the active config to the saved pre-confirmed state.
+func (s *Store) performAutoRollback() {
+	s.mu.Lock()
+
+	if s.confirmPrevTree == nil {
+		s.mu.Unlock()
+		return
+	}
+
+	s.active = s.confirmPrevTree
+	s.compiled = s.confirmPrevCfg
+	if s.candidate != nil {
+		s.candidate = s.active.Clone()
+	}
+	s.dirty = false
+
+	s.confirmTimer = nil
+	s.confirmPrevTree = nil
+	prevCfg := s.confirmPrevCfg
+	s.confirmPrevCfg = nil
+
+	// Persist reverted config to disk
+	if s.filePath != "" {
+		data := s.active.Format()
+		if err := os.WriteFile(s.filePath, []byte(data), 0644); err != nil {
+			slog.Warn("failed to save reverted config", "err", err)
+		}
+	}
+
+	fn := s.autoRollbackFn
+	s.mu.Unlock()
+
+	slog.Warn("commit confirmed timed out, configuration rolled back")
+
+	// Call dataplane re-apply outside the lock
+	if fn != nil && prevCfg != nil {
+		fn(prevCfg)
+	}
 }
 
 // Rollback reverts the candidate to a previous configuration.

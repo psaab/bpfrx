@@ -256,7 +256,14 @@ type InterfaceUnit struct {
 
 // ApplicationsConfig holds application definitions.
 type ApplicationsConfig struct {
-	Applications map[string]*Application
+	Applications    map[string]*Application
+	ApplicationSets map[string]*ApplicationSet
+}
+
+// ApplicationSet groups multiple applications or nested application-sets.
+type ApplicationSet struct {
+	Name         string
+	Applications []string // references to Application or ApplicationSet names
 }
 
 // Application defines a network application by protocol and port.

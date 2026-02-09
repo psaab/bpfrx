@@ -525,6 +525,115 @@ func TestDeletePath(t *testing.T) {
 	}
 }
 
+func TestApplicationSet(t *testing.T) {
+	// Test hierarchical syntax
+	input := `applications {
+    application my-app {
+        protocol tcp;
+        destination-port 8080;
+    }
+    application-set web-apps {
+        application junos-http;
+        application junos-https;
+        application my-app;
+    }
+}
+security {
+    zones {
+        security-zone trust {
+            interfaces {
+                eth0.0;
+            }
+        }
+        security-zone untrust {
+            interfaces {
+                eth1.0;
+            }
+        }
+    }
+    policies {
+        from-zone trust to-zone untrust {
+            policy allow-web {
+                match {
+                    source-address any;
+                    destination-address any;
+                    application web-apps;
+                }
+                then {
+                    permit;
+                }
+            }
+        }
+    }
+}`
+
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	// Verify application-set
+	if len(cfg.Applications.ApplicationSets) != 1 {
+		t.Fatalf("expected 1 application-set, got %d", len(cfg.Applications.ApplicationSets))
+	}
+	as := cfg.Applications.ApplicationSets["web-apps"]
+	if as == nil {
+		t.Fatal("missing application-set web-apps")
+	}
+	if len(as.Applications) != 3 {
+		t.Errorf("expected 3 members, got %d: %v", len(as.Applications), as.Applications)
+	}
+
+	// Verify expansion
+	expanded, err := ExpandApplicationSet("web-apps", &cfg.Applications)
+	if err != nil {
+		t.Fatalf("expand error: %v", err)
+	}
+	if len(expanded) != 3 {
+		t.Errorf("expected 3 expanded apps, got %d: %v", len(expanded), expanded)
+	}
+
+	// Policy should reference web-apps
+	pol := cfg.Security.Policies[0].Policies[0]
+	if len(pol.Match.Applications) != 1 || pol.Match.Applications[0] != "web-apps" {
+		t.Errorf("policy apps: %v", pol.Match.Applications)
+	}
+
+	// Test set syntax round-trip
+	tree2 := &ConfigTree{}
+	setCommands := []string{
+		"set applications application-set web-apps application junos-http",
+		"set applications application-set web-apps application junos-https",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree2.SetPath(path); err != nil {
+			t.Fatalf("SetPath: %v", err)
+		}
+	}
+
+	cfg2, err := CompileConfig(tree2)
+	if err != nil {
+		t.Fatalf("compile set syntax: %v", err)
+	}
+	as2 := cfg2.Applications.ApplicationSets["web-apps"]
+	if as2 == nil {
+		t.Fatal("missing application-set from set syntax")
+	}
+	if len(as2.Applications) != 2 {
+		t.Errorf("expected 2 members from set syntax, got %d", len(as2.Applications))
+	}
+}
+
 func TestFormatSet(t *testing.T) {
 	input := `security {
     zones {

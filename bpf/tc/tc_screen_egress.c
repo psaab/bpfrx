@@ -148,6 +148,11 @@ int tc_screen_egress_prog(struct __sk_buff *skb)
 		if ((sc->flags & SCREEN_WINNUKE) &&
 		    (tf & 0x20) && meta->dst_port == bpf_htons(139))
 			return screen_drop_tc(meta, SCREEN_WINNUKE);
+
+		/* TCP SYN fragment: SYN on a fragmented packet */
+		if ((sc->flags & SCREEN_SYN_FRAG) &&
+		    (tf & 0x02) && meta->is_fragment)
+			return screen_drop_tc(meta, SCREEN_SYN_FRAG);
 	}
 
 	/* IP source-route option (IPv4 only) */

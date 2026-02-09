@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 // PredefinedApplications contains built-in Junos application definitions.
 var PredefinedApplications = map[string]*Application{
 	"junos-ftp":         {Name: "junos-ftp", Protocol: "tcp", DestinationPort: "21"},
@@ -44,4 +46,62 @@ func ResolveApplication(name string, userApps map[string]*Application) (*Applica
 		return app, true
 	}
 	return nil, false
+}
+
+// ResolveApplicationSet looks up an application-set by name.
+func ResolveApplicationSet(name string, appSets map[string]*ApplicationSet) (*ApplicationSet, bool) {
+	if appSets != nil {
+		if as, ok := appSets[name]; ok {
+			return as, true
+		}
+	}
+	return nil, false
+}
+
+// ExpandApplicationSet recursively expands an application-set to individual
+// application names. Returns an error if a member is not found. Max depth 3.
+func ExpandApplicationSet(name string, apps *ApplicationsConfig) ([]string, error) {
+	return expandAppSet(name, apps, 0)
+}
+
+func expandAppSet(name string, apps *ApplicationsConfig, depth int) ([]string, error) {
+	if depth > 3 {
+		return nil, fmt.Errorf("application-set nesting too deep (max 3): %s", name)
+	}
+
+	as, ok := apps.ApplicationSets[name]
+	if !ok {
+		return nil, fmt.Errorf("application-set %q not found", name)
+	}
+
+	var result []string
+	seen := make(map[string]bool)
+
+	for _, memberName := range as.Applications {
+		// Check if it's another application-set (recurse)
+		if _, isSet := apps.ApplicationSets[memberName]; isSet {
+			expanded, err := expandAppSet(memberName, apps, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			for _, a := range expanded {
+				if !seen[a] {
+					seen[a] = true
+					result = append(result, a)
+				}
+			}
+			continue
+		}
+
+		// Must be an individual application
+		if _, found := ResolveApplication(memberName, apps.Applications); !found {
+			return nil, fmt.Errorf("application-set %q: member %q not found", name, memberName)
+		}
+		if !seen[memberName] {
+			seen[memberName] = true
+			result = append(result, memberName)
+		}
+	}
+
+	return result, nil
 }

@@ -101,7 +101,8 @@ var configTopLevel = map[string]*completionNode{
 	"delete":   {desc: "Delete a configuration element"},
 	"show":     {desc: "Show candidate configuration"},
 	"commit":   {desc: "Commit configuration", children: map[string]*completionNode{
-		"check": {desc: "Validate without applying"},
+		"check":     {desc: "Validate without applying"},
+		"confirmed": {desc: "Auto-rollback if not confirmed [minutes]"},
 	}},
 	"rollback": {desc: "Revert to previous configuration"},
 	"run":      {desc: "Run operational command"},
@@ -175,7 +176,7 @@ func (cc *cliCompleter) completeConfig(words []string, partial string) []string 
 
 	case "commit":
 		if len(words) == 1 {
-			return filterPrefix([]string{"check"}, partial)
+			return filterPrefix([]string{"check", "confirmed"}, partial)
 		}
 		return nil
 
@@ -235,11 +236,25 @@ func (c *CLI) Run() error {
 	}
 	defer c.rl.Close()
 
+	// Register auto-rollback handler for commit confirmed
+	c.store.SetAutoRollbackHandler(func(cfg *config.Config) {
+		if c.dp != nil {
+			if err := c.applyToDataplane(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "\nwarning: auto-rollback dataplane apply failed: %v\n", err)
+			}
+		}
+		c.reloadSyslog(cfg)
+		fmt.Fprintf(os.Stderr, "\ncommit confirmed timed out, configuration has been rolled back\n")
+	})
+
 	fmt.Println("bpfrx firewall - Junos-style eBPF firewall")
 	fmt.Println("Type '?' for help")
 	fmt.Println()
 
 	for {
+		if c.store.IsConfirmPending() {
+			fmt.Println("[commit confirmed pending - issue 'commit' to confirm]")
+		}
 		line, err := c.rl.Readline()
 		if err != nil {
 			if err == readline.ErrInterrupt {
@@ -635,6 +650,9 @@ func (c *CLI) showScreen() error {
 		if profile.TCP.WinNuke {
 			fmt.Println("  TCP WinNuke detection: enabled")
 		}
+		if profile.TCP.SynFrag {
+			fmt.Println("  TCP SYN fragment detection: enabled")
+		}
 		if profile.TCP.SynFlood != nil {
 			fmt.Printf("  TCP SYN flood protection: attack-threshold %d\n",
 				profile.TCP.SynFlood.AttackThreshold)
@@ -772,6 +790,40 @@ func (c *CLI) handleCommit(args []string) error {
 			return fmt.Errorf("commit check failed: %w", err)
 		}
 		fmt.Println("configuration check succeeds")
+		return nil
+	}
+
+	if len(args) > 0 && args[0] == "confirmed" {
+		minutes := 10
+		if len(args) >= 2 {
+			if v, err := strconv.Atoi(args[1]); err == nil && v > 0 {
+				minutes = v
+			}
+		}
+
+		compiled, err := c.store.CommitConfirmed(minutes)
+		if err != nil {
+			return fmt.Errorf("commit confirmed failed: %w", err)
+		}
+
+		// Apply to dataplane
+		if c.dp != nil {
+			if err := c.applyToDataplane(compiled); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: dataplane apply failed: %v\n", err)
+			}
+		}
+		c.reloadSyslog(compiled)
+
+		fmt.Printf("commit confirmed will be automatically rolled back in %d minutes unless confirmed\n", minutes)
+		return nil
+	}
+
+	// Bare commit: if a confirmed commit is pending, confirm it
+	if c.store.IsConfirmPending() {
+		if err := c.store.ConfirmCommit(); err != nil {
+			return fmt.Errorf("confirm commit: %w", err)
+		}
+		fmt.Println("commit confirmed")
 		return nil
 	}
 
@@ -1361,6 +1413,15 @@ func (c *CLI) showApplications() error {
 		fmt.Println()
 	}
 
+	// User-defined application-sets
+	if cfg != nil && len(cfg.Applications.ApplicationSets) > 0 {
+		fmt.Println("Application sets:")
+		for _, as := range cfg.Applications.ApplicationSets {
+			fmt.Printf("  %-24s members: %s\n", as.Name, strings.Join(as.Applications, ", "))
+		}
+		fmt.Println()
+	}
+
 	// Predefined applications
 	fmt.Println("Predefined applications:")
 	for _, app := range config.PredefinedApplications {
@@ -1747,8 +1808,17 @@ func (c *CLI) valueProvider(hint config.ValueHint) []string {
 		for _, app := range cfg.Applications.Applications {
 			names = append(names, app.Name)
 		}
+		for _, as := range cfg.Applications.ApplicationSets {
+			names = append(names, as.Name)
+		}
 		for name := range config.PredefinedApplications {
 			names = append(names, name)
+		}
+		return names
+	case config.ValueHintAppSetName:
+		var names []string
+		for _, as := range cfg.Applications.ApplicationSets {
+			names = append(names, as.Name)
 		}
 		return names
 	case config.ValueHintPoolName:
@@ -1820,6 +1890,7 @@ func (c *CLI) showConfigHelp() {
 	fmt.Println("  show | display set           Show as flat set commands")
 	fmt.Println("  commit                       Validate and apply configuration")
 	fmt.Println("  commit check                 Validate without applying")
+	fmt.Println("  commit confirmed [minutes]   Auto-rollback unless confirmed")
 	fmt.Println("  rollback [n]                 Revert to previous configuration")
 	fmt.Println("  run <cmd>                    Run operational command")
 	fmt.Println("  exit                         Exit configuration mode")

@@ -159,6 +159,11 @@ int xdp_screen_prog(struct xdp_md *ctx)
 		if ((sc->flags & SCREEN_WINNUKE) &&
 		    (tf & 0x20) && meta->dst_port == bpf_htons(139))
 			return screen_drop(meta, SCREEN_WINNUKE);
+
+		/* TCP SYN fragment: SYN on a fragmented packet */
+		if ((sc->flags & SCREEN_SYN_FRAG) &&
+		    (tf & 0x02) && meta->is_fragment)
+			return screen_drop(meta, SCREEN_SYN_FRAG);
 	}
 
 	/* IP source-route option (IPv4 only) */
