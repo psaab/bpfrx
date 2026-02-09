@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -47,6 +48,50 @@ func (eb *EventBuffer) Add(rec EventRecord) {
 		eb.count++
 	}
 	eb.mu.Unlock()
+}
+
+// EventFilter specifies criteria for filtering events.
+type EventFilter struct {
+	Zone     uint16 // match if InZone or OutZone equals this; 0 = no filter
+	Protocol string // case-insensitive substring match on Protocol
+	Action   string // case-insensitive substring match on Action
+}
+
+// IsEmpty returns true if no filter criteria are set.
+func (f EventFilter) IsEmpty() bool {
+	return f.Zone == 0 && f.Protocol == "" && f.Action == ""
+}
+
+func (f EventFilter) matches(rec *EventRecord) bool {
+	if f.Zone != 0 && rec.InZone != f.Zone && rec.OutZone != f.Zone {
+		return false
+	}
+	if f.Protocol != "" && !strings.Contains(strings.ToLower(rec.Protocol), strings.ToLower(f.Protocol)) {
+		return false
+	}
+	if f.Action != "" && !strings.Contains(strings.ToLower(rec.Action), strings.ToLower(f.Action)) {
+		return false
+	}
+	return true
+}
+
+// LatestFiltered returns the most recent n events matching the filter, newest first.
+func (eb *EventBuffer) LatestFiltered(n int, f EventFilter) []EventRecord {
+	eb.mu.RLock()
+	defer eb.mu.RUnlock()
+
+	if n <= 0 {
+		return nil
+	}
+
+	var result []EventRecord
+	for i := 0; i < eb.count && len(result) < n; i++ {
+		idx := (eb.head - 1 - i + eb.size) % eb.size
+		if f.matches(&eb.buf[idx]) {
+			result = append(result, eb.buf[idx])
+		}
+	}
+	return result
 }
 
 // Latest returns the most recent n events, newest first.

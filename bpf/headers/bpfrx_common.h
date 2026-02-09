@@ -187,6 +187,10 @@ struct icmp6hdr {
 #define SESS_FLAG_PREDICTED    (1 << 5)
 #define SESS_FLAG_STATIC_NAT   (1 << 6)
 
+/* Per-rule logging flags (policy_rule.log and session_value.log_flags) */
+#define LOG_FLAG_SESSION_INIT  (1 << 0)
+#define LOG_FLAG_SESSION_CLOSE (1 << 1)
+
 /* Policy actions */
 #define ACTION_DENY            0
 #define ACTION_PERMIT          1

@@ -496,8 +496,13 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 			}
 
 			// Logging
-			if pol.Log != nil && (pol.Log.SessionInit || pol.Log.SessionClose) {
-				rule.Log = 1
+			if pol.Log != nil {
+				if pol.Log.SessionInit {
+					rule.Log |= LogFlagSessionInit
+				}
+				if pol.Log.SessionClose {
+					rule.Log |= LogFlagSessionClose
+				}
 			}
 
 			// Source address (supports multiple via implicit address-set)

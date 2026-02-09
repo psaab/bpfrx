@@ -792,7 +792,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					meta->src_port = sess_nat_src_port;
 				}
 
-				if (rule->log)
+				if (rule->log & LOG_FLAG_SESSION_INIT)
 					emit_event(meta, EVENT_TYPE_SESSION_OPEN,
 						   ACTION_PERMIT, 0, 0);
 
@@ -926,7 +926,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					meta->src_port = sess_nat_src_port;
 				}
 
-				if (rule->log)
+				if (rule->log & LOG_FLAG_SESSION_INIT)
 					emit_event(meta, EVENT_TYPE_SESSION_OPEN,
 						   ACTION_PERMIT, 0, 0);
 

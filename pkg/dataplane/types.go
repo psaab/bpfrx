@@ -466,6 +466,12 @@ var ScreenFlagNames = map[uint32]string{
 	ScreenIPSourceRoute: "IP source-route",
 }
 
+// Per-rule logging flags (matches C LOG_FLAG_* defines).
+const (
+	LogFlagSessionInit  = 1 << 0
+	LogFlagSessionClose = 1 << 1
+)
+
 // Event type constants.
 const (
 	EventTypeSessionOpen  = 1

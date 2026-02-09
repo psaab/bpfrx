@@ -104,12 +104,30 @@ func cloneNodes(nodes []*Node) []*Node {
 	return result
 }
 
+// ValueHint identifies what kind of dynamic value is expected at a schema position.
+type ValueHint int
+
+const (
+	ValueHintNone          ValueHint = iota
+	ValueHintZoneName                // security-zone <name>
+	ValueHintAddressName             // address-set <name>
+	ValueHintAppName                 // application <name>
+	ValueHintPoolName                // pool <name>
+	ValueHintInterfaceName           // interfaces <name>
+	ValueHintScreenProfile           // ids-option <name>
+	ValueHintStreamName              // stream <name>
+)
+
+// ValueProvider returns possible values for a given hint.
+type ValueProvider func(hint ValueHint) []string
+
 // schemaNode defines a container keyword in the Junos config hierarchy.
 // It tells SetPath how to group flat path tokens into the correct tree structure.
 type schemaNode struct {
-	args     int                    // extra tokens consumed as part of this node's key
-	children map[string]*schemaNode // known container children
-	wildcard *schemaNode            // matches any keyword not in children (for dynamic names)
+	args      int                    // extra tokens consumed as part of this node's key
+	children  map[string]*schemaNode // known container children
+	wildcard  *schemaNode            // matches any keyword not in children (for dynamic names)
+	valueHint ValueHint              // hint for dynamic value completion (when args > 0)
 }
 
 // setSchema defines the Junos configuration tree structure.
@@ -118,7 +136,7 @@ type schemaNode struct {
 var setSchema = &schemaNode{children: map[string]*schemaNode{
 	"security": {children: map[string]*schemaNode{
 		"zones": {children: map[string]*schemaNode{
-			"security-zone": {args: 1, children: map[string]*schemaNode{
+			"security-zone": {args: 1, valueHint: ValueHintZoneName, children: map[string]*schemaNode{
 				"interfaces": {children: nil},
 				"host-inbound-traffic": {children: map[string]*schemaNode{
 					"system-services": {children: nil},
@@ -139,7 +157,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"screen": {children: map[string]*schemaNode{
-			"ids-option": {args: 1, children: map[string]*schemaNode{
+			"ids-option": {args: 1, valueHint: ValueHintScreenProfile, children: map[string]*schemaNode{
 				"icmp": {children: nil},
 				"tcp": {children: map[string]*schemaNode{
 					"syn-flood": {children: nil},
@@ -151,7 +169,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"nat": {children: map[string]*schemaNode{
 			"source": {children: map[string]*schemaNode{
-				"pool": {args: 1, children: nil},
+				"pool": {args: 1, valueHint: ValueHintPoolName, children: nil},
 				"rule-set": {args: 1, children: map[string]*schemaNode{
 					"rule": {args: 1, children: map[string]*schemaNode{
 						"match": {children: nil},
@@ -161,7 +179,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				}},
 			}},
 			"destination": {children: map[string]*schemaNode{
-				"pool": {args: 1, children: nil},
+				"pool": {args: 1, valueHint: ValueHintPoolName, children: nil},
 				"rule-set": {args: 1, children: map[string]*schemaNode{
 					"rule": {args: 1, children: map[string]*schemaNode{
 						"match": {children: nil},
@@ -182,15 +200,15 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"address-book": {children: map[string]*schemaNode{
 			"global": {children: map[string]*schemaNode{
-				"address-set": {args: 1, children: nil},
+				"address-set": {args: 1, valueHint: ValueHintAddressName, children: nil},
 				// "address <name> <cidr>" not listed → leaf
 			}},
 		}},
 		"log": {children: map[string]*schemaNode{
-			"stream": {args: 1, children: nil},
+			"stream": {args: 1, valueHint: ValueHintStreamName, children: nil},
 		}},
 	}},
-	"interfaces": {wildcard: &schemaNode{children: map[string]*schemaNode{
+	"interfaces": {wildcard: &schemaNode{valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 		"unit": {args: 1, children: map[string]*schemaNode{
 			"family": {children: map[string]*schemaNode{
 				"inet":  {children: nil},
@@ -199,7 +217,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 	}}},
 	"applications": {children: map[string]*schemaNode{
-		"application": {args: 1, children: nil},
+		"application": {args: 1, valueHint: ValueHintAppName, children: nil},
 	}},
 }}
 
@@ -390,6 +408,12 @@ func keysEqual(a, b []string) bool {
 // child keyword names. If the current position expects a dynamic argument
 // (wildcard or args > 0), it returns nil (user must type a name).
 func CompleteSetPath(tokens []string) []string {
+	return CompleteSetPathWithValues(tokens, nil)
+}
+
+// CompleteSetPathWithValues is like CompleteSetPath but uses a ValueProvider
+// to suggest dynamic values at positions where schema expects a name argument.
+func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []string {
 	schema := setSchema
 	i := 0
 
@@ -416,6 +440,10 @@ func CompleteSetPath(tokens []string) []string {
 
 		if i > len(tokens) {
 			// Still consuming args for this node — user needs to type a value.
+			// Try to provide dynamic values via the provider.
+			if provider != nil && childSchema.valueHint != ValueHintNone {
+				return provider(childSchema.valueHint)
+			}
 			return nil
 		}
 

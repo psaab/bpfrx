@@ -75,7 +75,7 @@ var operationalTree = map[string]*completionNode{
 			}},
 			"address-book":  {desc: "Show address book entries"},
 			"applications":  {desc: "Show application definitions"},
-			"log":           {desc: "Show recent security events"},
+			"log":           {desc: "Show recent security events [N] [zone <z>] [protocol <p>] [action <a>]"},
 			"statistics":    {desc: "Show global statistics"},
 		}},
 		"interfaces": {desc: "Show interface status"},
@@ -163,7 +163,7 @@ func (cc *cliCompleter) completeConfig(words []string, partial string) []string 
 	switch words[0] {
 	case "set", "delete":
 		// Use schema-driven completion for the path after set/delete.
-		schemaCompletions := config.CompleteSetPath(words[1:])
+		schemaCompletions := config.CompleteSetPathWithValues(words[1:], cc.cli.valueProvider)
 		if schemaCompletions == nil {
 			return nil
 		}
@@ -275,10 +275,62 @@ func (c *CLI) dispatch(line string) error {
 		return nil
 	}
 
+	// Extract | match pipe (but not | display set or | compare).
+	if cmd, pattern, ok := extractMatchPipe(line); ok && pattern != "" {
+		return c.dispatchWithMatchPipe(cmd, pattern)
+	}
+
 	if c.store.InConfigMode() {
 		return c.dispatchConfig(line)
 	}
 	return c.dispatchOperational(line)
+}
+
+// extractMatchPipe splits a line at "| match <pattern>".
+// Returns the command part, the pattern, and whether a match pipe was found.
+func extractMatchPipe(line string) (string, string, bool) {
+	idx := strings.Index(line, "| match ")
+	if idx < 0 {
+		return line, "", false
+	}
+	cmd := strings.TrimSpace(line[:idx])
+	pattern := strings.TrimSpace(line[idx+len("| match "):])
+	return cmd, pattern, true
+}
+
+// dispatchWithMatchPipe runs the command and filters output lines by pattern.
+func (c *CLI) dispatchWithMatchPipe(cmd, pattern string) error {
+	// Capture stdout.
+	origStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("pipe: %w", err)
+	}
+	os.Stdout = w
+
+	// Run the inner command.
+	var cmdErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cmdErr = c.dispatch(cmd)
+	}()
+	<-done
+	w.Close()
+	os.Stdout = origStdout
+
+	// Read captured output and filter.
+	output, _ := io.ReadAll(r)
+	r.Close()
+
+	lowerPattern := strings.ToLower(pattern)
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.Contains(strings.ToLower(line), lowerPattern) {
+			fmt.Fprintln(origStdout, line)
+		}
+	}
+
+	return cmdErr
 }
 
 func (c *CLI) dispatchOperational(line string) error {
@@ -417,7 +469,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		fmt.Println("  nat destination  Show destination NAT information")
 		fmt.Println("  address-book     Show address book entries")
 		fmt.Println("  applications     Show application definitions")
-		fmt.Println("  log [N]          Show recent security events")
+		fmt.Println("  log [N] [zone <name>] [protocol <proto>] [action <act>]")
 		fmt.Println("  statistics       Show global statistics")
 		return nil
 	}
@@ -1150,11 +1202,49 @@ func (c *CLI) showSecurityLog(args []string) error {
 	}
 
 	n := 50
-	if len(args) > 0 {
-		fmt.Sscanf(args[0], "%d", &n)
+	var filter logging.EventFilter
+
+	// Parse arguments: [N] [zone <name>] [protocol <proto>] [action <act>]
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "zone":
+			if i+1 < len(args) {
+				i++
+				zoneName := args[i]
+				if c.dp != nil {
+					if cr := c.dp.LastCompileResult(); cr != nil {
+						if zid, ok := cr.ZoneIDs[zoneName]; ok {
+							filter.Zone = zid
+						} else {
+							return fmt.Errorf("zone %q not found", zoneName)
+						}
+					}
+				}
+			}
+		case "protocol":
+			if i+1 < len(args) {
+				i++
+				filter.Protocol = args[i]
+			}
+		case "action":
+			if i+1 < len(args) {
+				i++
+				filter.Action = args[i]
+			}
+		default:
+			// Try parsing as count.
+			if v, err := strconv.Atoi(args[i]); err == nil {
+				n = v
+			}
+		}
 	}
 
-	events := c.eventBuf.Latest(n)
+	var events []logging.EventRecord
+	if !filter.IsEmpty() {
+		events = c.eventBuf.LatestFiltered(n, filter)
+	} else {
+		events = c.eventBuf.Latest(n)
+	}
 	if len(events) == 0 {
 		fmt.Println("no events recorded")
 		return nil
@@ -1432,7 +1522,7 @@ func (c *CLI) showConfigContextHelp(words []string) {
 
 	switch words[0] {
 	case "set", "delete":
-		completions := config.CompleteSetPath(words[1:])
+		completions := config.CompleteSetPathWithValues(words[1:], c.valueProvider)
 		if completions == nil {
 			fmt.Println("  (value expected)")
 			return
@@ -1448,6 +1538,71 @@ func (c *CLI) showConfigContextHelp(words []string) {
 	default:
 		fmt.Println("  (no help available)")
 	}
+}
+
+func (c *CLI) valueProvider(hint config.ValueHint) []string {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		return nil
+	}
+	switch hint {
+	case config.ValueHintZoneName:
+		names := make([]string, 0, len(cfg.Security.Zones))
+		for name := range cfg.Security.Zones {
+			names = append(names, name)
+		}
+		return names
+	case config.ValueHintAddressName:
+		var names []string
+		if cfg.Security.AddressBook != nil {
+			for _, addr := range cfg.Security.AddressBook.Addresses {
+				names = append(names, addr.Name)
+			}
+			for _, as := range cfg.Security.AddressBook.AddressSets {
+				names = append(names, as.Name)
+			}
+		}
+		return names
+	case config.ValueHintAppName:
+		var names []string
+		for _, app := range cfg.Applications.Applications {
+			names = append(names, app.Name)
+		}
+		for name := range config.PredefinedApplications {
+			names = append(names, name)
+		}
+		return names
+	case config.ValueHintPoolName:
+		var names []string
+		for name := range cfg.Security.NAT.SourcePools {
+			names = append(names, name)
+		}
+		if cfg.Security.NAT.Destination != nil {
+			for name := range cfg.Security.NAT.Destination.Pools {
+				names = append(names, name)
+			}
+		}
+		return names
+	case config.ValueHintScreenProfile:
+		names := make([]string, 0, len(cfg.Security.Screen))
+		for name := range cfg.Security.Screen {
+			names = append(names, name)
+		}
+		return names
+	case config.ValueHintStreamName:
+		names := make([]string, 0, len(cfg.Security.Log.Streams))
+		for name := range cfg.Security.Log.Streams {
+			names = append(names, name)
+		}
+		return names
+	case config.ValueHintInterfaceName:
+		var names []string
+		for _, zone := range cfg.Security.Zones {
+			names = append(names, zone.Interfaces...)
+		}
+		return names
+	}
+	return nil
 }
 
 func (c *CLI) operationalPrompt() string {
@@ -1472,6 +1627,7 @@ func (c *CLI) showOperationalHelp() {
 	fmt.Println("  clear security counters            Clear all counters")
 	fmt.Println("  quit                               Exit CLI")
 	fmt.Println()
+	fmt.Println("  <command> | match <pattern>         Filter output by pattern")
 	fmt.Println("  Use <TAB> for command completion, ? for context help")
 }
 
