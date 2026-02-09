@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -18,6 +19,9 @@ type CompileResult struct {
 	AppIDs     map[string]uint32 // application name -> app ID
 	PoolIDs    map[string]uint8  // NAT pool name -> pool ID (0-based)
 	PolicySets int               // number of policy sets created
+
+	nextAddrID   uint32            // next available address ID (after address book)
+	implicitSets map[string]uint32 // cache of implicit set key -> set ID
 }
 
 // Compile translates a typed Config into eBPF map entries.
@@ -30,11 +34,12 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 	}
 
 	result := &CompileResult{
-		ZoneIDs:   make(map[string]uint16),
-		ScreenIDs: make(map[string]uint16),
-		AddrIDs:   make(map[string]uint32),
-		AppIDs:    make(map[string]uint32),
-		PoolIDs:   make(map[string]uint8),
+		ZoneIDs:      make(map[string]uint16),
+		ScreenIDs:    make(map[string]uint16),
+		AddrIDs:      make(map[string]uint32),
+		AppIDs:       make(map[string]uint32),
+		PoolIDs:      make(map[string]uint8),
+		implicitSets: make(map[string]uint32),
 	}
 
 	// Phase 1: Assign zone IDs (1-based; 0 = unassigned)
@@ -193,6 +198,7 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 func (m *Manager) compileAddressBook(cfg *config.Config, result *CompileResult) error {
 	ab := cfg.Security.AddressBook
 	if ab == nil {
+		result.nextAddrID = 1 // start from 1 for implicit entries
 		return nil
 	}
 
@@ -249,6 +255,7 @@ func (m *Manager) compileAddressBook(cfg *config.Config, result *CompileResult) 
 			"members", len(addrSet.Addresses))
 	}
 
+	result.nextAddrID = addrID
 	return nil
 }
 
@@ -310,6 +317,102 @@ func (m *Manager) compileApplications(cfg *config.Config, result *CompileResult)
 	return nil
 }
 
+// resolveAddrList resolves a list of address names to a single address ID.
+// If the list has one entry, returns that entry's ID directly.
+// If the list has multiple entries, creates an implicit address-set containing
+// all referenced addresses and returns the set's ID.
+func (m *Manager) resolveAddrList(names []string, result *CompileResult) (uint32, error) {
+	if len(names) == 0 {
+		return 0, nil
+	}
+
+	// Filter out "any" entries
+	var filtered []string
+	for _, n := range names {
+		if n != "any" {
+			filtered = append(filtered, n)
+		}
+	}
+	if len(filtered) == 0 {
+		return 0, nil // all "any"
+	}
+
+	// Single address: return its ID directly
+	if len(filtered) == 1 {
+		id, ok := result.AddrIDs[filtered[0]]
+		if !ok {
+			return 0, fmt.Errorf("address %q not found", filtered[0])
+		}
+		return id, nil
+	}
+
+	// Multiple addresses: build implicit address-set
+	sorted := make([]string, len(filtered))
+	copy(sorted, filtered)
+	sort.Strings(sorted)
+	cacheKey := strings.Join(sorted, ",")
+
+	if setID, ok := result.implicitSets[cacheKey]; ok {
+		return setID, nil
+	}
+
+	setID := result.nextAddrID
+	result.nextAddrID++
+
+	for _, name := range sorted {
+		memberID, ok := result.AddrIDs[name]
+		if !ok {
+			return 0, fmt.Errorf("address %q not found", name)
+		}
+		if err := m.SetAddressMembership(memberID, setID); err != nil {
+			return 0, fmt.Errorf("set implicit membership %s in set %d: %w", name, setID, err)
+		}
+	}
+
+	result.implicitSets[cacheKey] = setID
+	slog.Debug("implicit address-set created", "id", setID, "members", sorted)
+	return setID, nil
+}
+
+// resolveSNATMatchAddr resolves a SNAT match CIDR to an address ID.
+// If the CIDR already exists as an address-book entry, reuses that ID.
+// Otherwise, creates an implicit address-book entry with a synthetic name.
+// Returns 0 (any) if the CIDR is empty.
+func (m *Manager) resolveSNATMatchAddr(cidr string, result *CompileResult) (uint32, error) {
+	if cidr == "" {
+		return 0, nil
+	}
+
+	// Normalize CIDR
+	if !strings.Contains(cidr, "/") {
+		if strings.Contains(cidr, ":") {
+			cidr += "/128"
+		} else {
+			cidr += "/32"
+		}
+	}
+
+	// Create implicit address-book entry (LPM trie handles deduplication)
+	synthName := "_snat_match_" + cidr
+	if id, ok := result.AddrIDs[synthName]; ok {
+		return id, nil
+	}
+
+	addrID := result.nextAddrID
+	result.nextAddrID++
+	result.AddrIDs[synthName] = addrID
+
+	if err := m.SetAddressBookEntry(cidr, addrID); err != nil {
+		return 0, fmt.Errorf("set implicit address %s: %w", cidr, err)
+	}
+	if err := m.SetAddressMembership(addrID, addrID); err != nil {
+		return 0, fmt.Errorf("set self-membership for implicit %s: %w", cidr, err)
+	}
+
+	slog.Debug("implicit SNAT match address created", "cidr", cidr, "id", addrID)
+	return addrID, nil
+}
+
 func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) error {
 	if err := m.ClearZonePairPolicies(); err != nil {
 		slog.Warn("failed to clear zone pair policies", "err", err)
@@ -327,9 +430,45 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 			return fmt.Errorf("policy to-zone %q not found", zpp.ToZone)
 		}
 
+		// Expand rules: each config rule with N applications becomes N BPF rules.
+		// Collect expanded rules first to know the total count.
+		type expandedRule struct {
+			pol    *config.Policy
+			appID  uint32
+		}
+		var expanded []expandedRule
+
+		for _, pol := range zpp.Policies {
+			// Resolve application list
+			var appIDs []uint32
+			hasAny := false
+			for _, appName := range pol.Match.Applications {
+				if appName == "any" {
+					hasAny = true
+					break
+				}
+			}
+			if hasAny || len(pol.Match.Applications) == 0 {
+				appIDs = []uint32{0} // single rule with app_id=0 (any)
+			} else {
+				for _, appName := range pol.Match.Applications {
+					if id, ok := result.AppIDs[appName]; ok {
+						appIDs = append(appIDs, id)
+					}
+				}
+				if len(appIDs) == 0 {
+					appIDs = []uint32{0}
+				}
+			}
+
+			for _, aid := range appIDs {
+				expanded = append(expanded, expandedRule{pol: pol, appID: aid})
+			}
+		}
+
 		ps := PolicySet{
 			PolicySetID:   policySetID,
-			NumRules:      uint16(len(zpp.Policies)),
+			NumRules:      uint16(len(expanded)),
 			DefaultAction: ActionDeny,
 		}
 		if err := m.SetZonePairPolicy(fromZone, toZone, ps); err != nil {
@@ -337,11 +476,13 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 				zpp.FromZone, zpp.ToZone, err)
 		}
 
-		for i, pol := range zpp.Policies {
+		for i, er := range expanded {
+			pol := er.pol
 			rule := PolicyRule{
 				RuleID:      uint32(policySetID*MaxRulesPerPolicy + uint32(i)),
 				PolicySetID: policySetID,
 				Sequence:    uint16(i),
+				AppID:       er.appID,
 			}
 
 			// Map action
@@ -359,35 +500,19 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 				rule.Log = 1
 			}
 
-			// Source address
-			if len(pol.Match.SourceAddresses) > 0 {
-				addrName := pol.Match.SourceAddresses[0]
-				if addrName != "any" {
-					if id, ok := result.AddrIDs[addrName]; ok {
-						rule.SrcAddrID = id
-					}
-				}
+			// Source address (supports multiple via implicit address-set)
+			srcID, err := m.resolveAddrList(pol.Match.SourceAddresses, result)
+			if err != nil {
+				return fmt.Errorf("policy %s source address: %w", pol.Name, err)
 			}
+			rule.SrcAddrID = srcID
 
-			// Destination address
-			if len(pol.Match.DestinationAddresses) > 0 {
-				addrName := pol.Match.DestinationAddresses[0]
-				if addrName != "any" {
-					if id, ok := result.AddrIDs[addrName]; ok {
-						rule.DstAddrID = id
-					}
-				}
+			// Destination address (supports multiple via implicit address-set)
+			dstID, err := m.resolveAddrList(pol.Match.DestinationAddresses, result)
+			if err != nil {
+				return fmt.Errorf("policy %s destination address: %w", pol.Name, err)
 			}
-
-			// Application
-			if len(pol.Match.Applications) > 0 {
-				appName := pol.Match.Applications[0]
-				if appName != "any" {
-					if id, ok := result.AppIDs[appName]; ok {
-						rule.AppID = id
-					}
-				}
-			}
+			rule.DstAddrID = dstID
 
 			if err := m.SetPolicyRule(policySetID, uint32(i), rule); err != nil {
 				return fmt.Errorf("set policy rule %s[%d]: %w",
@@ -397,7 +522,7 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 			slog.Debug("policy rule compiled",
 				"from", zpp.FromZone, "to", zpp.ToZone,
 				"policy", pol.Name, "action", rule.Action,
-				"index", i)
+				"index", i, "app_id", er.appID)
 		}
 
 		result.PolicySets++
@@ -432,6 +557,11 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 
 	// Source NAT: allocate pool IDs and compile pools + rules
 	poolID := uint8(0)
+
+	// Track per-zone-pair v4/v6 rule indices for multiple SNAT rules
+	type zonePairIdx struct{ from, to uint16 }
+	v4RuleIdx := make(map[zonePairIdx]uint16)
+	v6RuleIdx := make(map[zonePairIdx]uint16)
 
 	for _, rs := range natCfg.Source {
 		fromZone, ok := result.ZoneIDs[rs.FromZone]
@@ -565,35 +695,61 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 				return fmt.Errorf("set pool config %d: %w", curPoolID, err)
 			}
 
+			// Resolve SNAT match criteria to address IDs
+			srcAddrID, err := m.resolveSNATMatchAddr(rule.Match.SourceAddress, result)
+			if err != nil {
+				return fmt.Errorf("snat rule %s/%s source match: %w",
+					rs.Name, rule.Name, err)
+			}
+			dstAddrID, err := m.resolveSNATMatchAddr(rule.Match.DestinationAddress, result)
+			if err != nil {
+				return fmt.Errorf("snat rule %s/%s dest match: %w",
+					rs.Name, rule.Name, err)
+			}
+
+			zp := zonePairIdx{fromZone, toZone}
+
 			// Write SNAT rule (v4)
 			if len(v4IPs) > 0 {
 				val := SNATValue{
-					Mode: curPoolID,
+					Mode:      curPoolID,
+					SrcAddrID: srcAddrID,
+					DstAddrID: dstAddrID,
 				}
-				if err := m.SetSNATRule(fromZone, toZone, val); err != nil {
+				ri := v4RuleIdx[zp]
+				if err := m.SetSNATRule(fromZone, toZone, ri, val); err != nil {
 					return fmt.Errorf("set snat rule %s/%s: %w",
 						rs.Name, rule.Name, err)
 				}
+				v4RuleIdx[zp] = ri + 1
 				slog.Info("source NAT rule compiled",
 					"rule-set", rs.Name, "rule", rule.Name,
 					"from", rs.FromZone, "to", rs.ToZone,
-					"pool_id", curPoolID, "v4_ips", len(v4IPs),
+					"pool_id", curPoolID, "rule_idx", ri,
+					"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+					"v4_ips", len(v4IPs),
 					"ports", fmt.Sprintf("%d-%d", poolCfg.PortLow, poolCfg.PortHigh))
 			}
 
 			// Write SNAT rule (v6)
 			if len(v6IPs) > 0 {
 				val := SNATValueV6{
-					Mode: curPoolID,
+					Mode:      curPoolID,
+					SrcAddrID: srcAddrID,
+					DstAddrID: dstAddrID,
 				}
-				if err := m.SetSNATRuleV6(fromZone, toZone, val); err != nil {
+				ri := v6RuleIdx[zp]
+				if err := m.SetSNATRuleV6(fromZone, toZone, ri, val); err != nil {
 					return fmt.Errorf("set snat_v6 rule %s/%s: %w",
 						rs.Name, rule.Name, err)
 				}
+				v6RuleIdx[zp] = ri + 1
 				slog.Info("source NAT v6 rule compiled",
 					"rule-set", rs.Name, "rule", rule.Name,
 					"from", rs.FromZone, "to", rs.ToZone,
-					"pool_id", curPoolID, "v6_ips", len(v6IPs))
+					"pool_id", curPoolID, "rule_idx", ri,
+					"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+					"v6_ips", len(v6IPs))
 			}
 		}
 	}

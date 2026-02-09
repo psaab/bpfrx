@@ -346,24 +346,32 @@ struct {
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } dnat_table SEC(".maps");
 
-/* Source NAT config: (from_zone, to_zone) -> SNAT IP.
- * Populated by the compiler on commit. */
+/* Source NAT config: (from_zone, to_zone, rule_idx) -> SNAT IP + match.
+ * Populated by the compiler on commit. Multiple rules per zone-pair
+ * are iterated sequentially (0..MAX-1) until first match. */
+#define MAX_SNAT_RULES_PER_PAIR 8
+
 struct snat_key {
 	__u16 from_zone;
 	__u16 to_zone;
+	__u16 rule_idx;    /* 0-based rule index within zone-pair */
+	__u16 pad;
 };
 
 struct snat_value {
 	__be32 snat_ip;
-	__u8   mode;        /* 0=interface */
+	__u32  src_addr_id;  /* 0 = any */
+	__u32  dst_addr_id;  /* 0 = any */
+	__u8   mode;         /* pool ID */
 	__u8   pad[3];
 };
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, MAX_ZONES * MAX_ZONES);
+	__uint(max_entries, MAX_ZONES * MAX_ZONES * MAX_SNAT_RULES_PER_PAIR);
 	__type(key, struct snat_key);
 	__type(value, struct snat_value);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 } snat_rules SEC(".maps");
 
 /* ============================================================
@@ -395,15 +403,18 @@ struct {
 
 struct snat_value_v6 {
 	__u8   snat_ip[16];
-	__u8   mode;        /* 0=interface */
+	__u32  src_addr_id;  /* 0 = any */
+	__u32  dst_addr_id;  /* 0 = any */
+	__u8   mode;         /* pool ID */
 	__u8   pad[3];
 };
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, MAX_ZONES * MAX_ZONES);
+	__uint(max_entries, MAX_ZONES * MAX_ZONES * MAX_SNAT_RULES_PER_PAIR);
 	__type(key, struct snat_key);
 	__type(value, struct snat_value_v6);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 } snat_rules_v6 SEC(".maps");
 
 /* ============================================================

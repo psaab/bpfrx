@@ -203,13 +203,13 @@ func (m *Manager) ClearDNATStatic() error {
 	return nil
 }
 
-// SetSNATRule writes a snat_rules entry.
-func (m *Manager) SetSNATRule(fromZone, toZone uint16, val SNATValue) error {
+// SetSNATRule writes a snat_rules entry at the given rule index.
+func (m *Manager) SetSNATRule(fromZone, toZone, ruleIdx uint16, val SNATValue) error {
 	zm, ok := m.maps["snat_rules"]
 	if !ok {
 		return fmt.Errorf("snat_rules map not found")
 	}
-	key := SNATKey{FromZone: fromZone, ToZone: toZone}
+	key := SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ruleIdx}
 	return zm.Update(key, val, ebpf.UpdateAny)
 }
 
@@ -297,13 +297,13 @@ func (m *Manager) ClearDNATStaticV6() error {
 	return nil
 }
 
-// SetSNATRuleV6 writes a snat_rules_v6 entry.
-func (m *Manager) SetSNATRuleV6(fromZone, toZone uint16, val SNATValueV6) error {
+// SetSNATRuleV6 writes a snat_rules_v6 entry at the given rule index.
+func (m *Manager) SetSNATRuleV6(fromZone, toZone, ruleIdx uint16, val SNATValueV6) error {
 	zm, ok := m.maps["snat_rules_v6"]
 	if !ok {
 		return fmt.Errorf("snat_rules_v6 map not found")
 	}
-	key := SNATKey{FromZone: fromZone, ToZone: toZone}
+	key := SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ruleIdx}
 	return zm.Update(key, val, ebpf.UpdateAny)
 }
 

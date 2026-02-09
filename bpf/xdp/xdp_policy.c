@@ -771,7 +771,25 @@ int xdp_policy_prog(struct xdp_md *ctx)
 						.from_zone = meta->ingress_zone,
 						.to_zone   = meta->egress_zone,
 					};
-					struct snat_value *sv = bpf_map_lookup_elem(&snat_rules, &sk);
+					struct snat_value *sv = NULL;
+
+					/* Iterate SNAT rules for this zone-pair */
+					#pragma unroll 1
+					for (__u16 ri = 0; ri < MAX_SNAT_RULES_PER_PAIR; ri++) {
+						sk.rule_idx = ri;
+						struct snat_value *candidate = bpf_map_lookup_elem(&snat_rules, &sk);
+						if (!candidate)
+							break;
+						if (candidate->src_addr_id != 0 &&
+						    !addr_matches(meta->src_ip.v4, candidate->src_addr_id))
+							continue;
+						if (candidate->dst_addr_id != 0 &&
+						    !addr_matches(meta->dst_ip.v4, candidate->dst_addr_id))
+							continue;
+						sv = candidate;
+						break;
+					}
+
 					if (sv) {
 						/*
 						 * NAT port collision retry: try dnat_table
@@ -887,7 +905,25 @@ int xdp_policy_prog(struct xdp_md *ctx)
 						.from_zone = meta->ingress_zone,
 						.to_zone   = meta->egress_zone,
 					};
-					struct snat_value_v6 *sv6 = bpf_map_lookup_elem(&snat_rules_v6, &sk);
+					struct snat_value_v6 *sv6 = NULL;
+
+					/* Iterate SNAT rules for this zone-pair */
+					#pragma unroll 1
+					for (__u16 ri = 0; ri < MAX_SNAT_RULES_PER_PAIR; ri++) {
+						sk.rule_idx = ri;
+						struct snat_value_v6 *candidate = bpf_map_lookup_elem(&snat_rules_v6, &sk);
+						if (!candidate)
+							break;
+						if (candidate->src_addr_id != 0 &&
+						    !addr_matches_v6(meta->src_ip.v6, candidate->src_addr_id))
+							continue;
+						if (candidate->dst_addr_id != 0 &&
+						    !addr_matches_v6(meta->dst_ip.v6, candidate->dst_addr_id))
+							continue;
+						sv6 = candidate;
+						break;
+					}
+
 					if (sv6) {
 						/*
 						 * NAT port collision retry with

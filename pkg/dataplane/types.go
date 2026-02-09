@@ -394,20 +394,26 @@ type DNATValueV6 struct {
 type SNATKey struct {
 	FromZone uint16
 	ToZone   uint16
+	RuleIdx  uint16
+	Pad      uint16
 }
 
 // SNATValue mirrors the C struct snat_value.
 type SNATValue struct {
-	SNATIP uint32 // network byte order
-	Mode   uint8
-	Pad    [3]byte
+	SNATIP    uint32 // network byte order
+	SrcAddrID uint32 // 0 = any
+	DstAddrID uint32 // 0 = any
+	Mode      uint8
+	Pad       [3]byte
 }
 
 // SNATValueV6 mirrors the C struct snat_value_v6.
 type SNATValueV6 struct {
-	SNATIP [16]byte
-	Mode   uint8
-	Pad    [3]byte
+	SNATIP    [16]byte
+	SrcAddrID uint32 // 0 = any
+	DstAddrID uint32 // 0 = any
+	Mode      uint8
+	Pad       [3]byte
 }
 
 // ScreenConfig mirrors the C struct screen_config.
