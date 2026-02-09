@@ -2,15 +2,101 @@
 /*
  * bpfrx TC egress connection tracking stage.
  *
- * Looks up existing sessions (v4 and v6) and updates last_seen
- * timestamp and reverse-direction counters for egress packets.
- * Tail-calls to the TC NAT stage.
+ * Looks up existing sessions (v4 and v6), updates last_seen timestamp
+ * and counters for egress packets, propagates NAT metadata from the
+ * session, and routes to TC NAT or TC forward accordingly.
  */
 
 #include "../headers/bpfrx_common.h"
 #include "../headers/bpfrx_maps.h"
 #include "../headers/bpfrx_helpers.h"
 #include "../headers/bpfrx_conntrack.h"
+
+/*
+ * Handle a conntrack hit for an IPv4 session on TC egress.
+ * Updates counters and propagates NAT metadata.
+ */
+static __always_inline void
+tc_ct_hit_v4(struct __sk_buff *skb, struct pkt_meta *meta,
+	     struct session_value *sess, __u8 direction)
+{
+	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+	sess->last_seen = now;
+
+	int is_fwd = (direction == sess->is_reverse);
+
+	if (is_fwd) {
+		__sync_fetch_and_add(&sess->fwd_packets, 1);
+		__sync_fetch_and_add(&sess->fwd_bytes, meta->pkt_len);
+	} else {
+		__sync_fetch_and_add(&sess->rev_packets, 1);
+		__sync_fetch_and_add(&sess->rev_bytes, meta->pkt_len);
+	}
+
+	/* Propagate NAT metadata */
+	meta->nat_flags = sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT);
+
+	if (sess->flags & SESS_FLAG_SNAT) {
+		if (is_fwd) {
+			__builtin_memset(&meta->src_ip, 0, sizeof(meta->src_ip));
+			meta->src_ip.v4 = sess->nat_src_ip;
+			meta->src_port  = sess->nat_src_port;
+		}
+	}
+	if (sess->flags & SESS_FLAG_DNAT) {
+		if (!is_fwd) {
+			__builtin_memset(&meta->src_ip, 0, sizeof(meta->src_ip));
+			meta->src_ip.v4 = sess->nat_dst_ip;
+			meta->src_port  = sess->nat_dst_port;
+		}
+	}
+
+	/* Route to NAT if needed, otherwise forward */
+	__u32 next = (meta->nat_flags) ? TC_PROG_NAT : TC_PROG_FORWARD;
+	bpf_tail_call(skb, &tc_progs, next);
+}
+
+/*
+ * Handle a conntrack hit for an IPv6 session on TC egress.
+ * Updates counters and propagates NAT metadata.
+ */
+static __always_inline void
+tc_ct_hit_v6(struct __sk_buff *skb, struct pkt_meta *meta,
+	     struct session_value_v6 *sess, __u8 direction)
+{
+	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+	sess->last_seen = now;
+
+	int is_fwd = (direction == sess->is_reverse);
+
+	if (is_fwd) {
+		__sync_fetch_and_add(&sess->fwd_packets, 1);
+		__sync_fetch_and_add(&sess->fwd_bytes, meta->pkt_len);
+	} else {
+		__sync_fetch_and_add(&sess->rev_packets, 1);
+		__sync_fetch_and_add(&sess->rev_bytes, meta->pkt_len);
+	}
+
+	/* Propagate NAT metadata */
+	meta->nat_flags = sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT);
+
+	if (sess->flags & SESS_FLAG_SNAT) {
+		if (is_fwd) {
+			__builtin_memcpy(meta->src_ip.v6, sess->nat_src_ip, 16);
+			meta->src_port = sess->nat_src_port;
+		}
+	}
+	if (sess->flags & SESS_FLAG_DNAT) {
+		if (!is_fwd) {
+			__builtin_memcpy(meta->src_ip.v6, sess->nat_dst_ip, 16);
+			meta->src_port = sess->nat_dst_port;
+		}
+	}
+
+	/* Route to NAT if needed, otherwise forward */
+	__u32 next = (meta->nat_flags) ? TC_PROG_NAT : TC_PROG_FORWARD;
+	bpf_tail_call(skb, &tc_progs, next);
+}
 
 SEC("tc")
 int tc_conntrack_prog(struct __sk_buff *skb)
@@ -20,12 +106,8 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 	if (!meta)
 		return TC_ACT_SHOT;
 
-	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
-
 	if (meta->addr_family == AF_INET) {
-		/* Build session key from egress packet.
-		 * Egress packets are the "reverse" direction of inbound sessions,
-		 * so try both forward and reverse lookups. */
+		/* Build session key from egress packet */
 		struct session_key fwd_key = {};
 		fwd_key.src_ip   = meta->src_ip.v4;
 		fwd_key.dst_ip   = meta->dst_ip.v4;
@@ -35,18 +117,13 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 
 		struct session_value *sess = bpf_map_lookup_elem(&sessions, &fwd_key);
 		if (sess) {
-			sess->last_seen = now;
-			__sync_fetch_and_add(&sess->fwd_packets, 1);
-			__sync_fetch_and_add(&sess->fwd_bytes, meta->pkt_len);
+			tc_ct_hit_v4(skb, meta, sess, 0);
 		} else {
 			struct session_key rev_key;
 			ct_reverse_key(&fwd_key, &rev_key);
 			sess = bpf_map_lookup_elem(&sessions, &rev_key);
-			if (sess) {
-				sess->last_seen = now;
-				__sync_fetch_and_add(&sess->rev_packets, 1);
-				__sync_fetch_and_add(&sess->rev_bytes, meta->pkt_len);
-			}
+			if (sess)
+				tc_ct_hit_v4(skb, meta, sess, 1);
 		}
 	} else {
 		/* IPv6 path */
@@ -59,23 +136,18 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 
 		struct session_value_v6 *sess = bpf_map_lookup_elem(&sessions_v6, &fwd_key);
 		if (sess) {
-			sess->last_seen = now;
-			__sync_fetch_and_add(&sess->fwd_packets, 1);
-			__sync_fetch_and_add(&sess->fwd_bytes, meta->pkt_len);
+			tc_ct_hit_v6(skb, meta, sess, 0);
 		} else {
 			struct session_key_v6 rev_key;
 			ct_reverse_key_v6(&fwd_key, &rev_key);
 			sess = bpf_map_lookup_elem(&sessions_v6, &rev_key);
-			if (sess) {
-				sess->last_seen = now;
-				__sync_fetch_and_add(&sess->rev_packets, 1);
-				__sync_fetch_and_add(&sess->rev_bytes, meta->pkt_len);
-			}
+			if (sess)
+				tc_ct_hit_v6(skb, meta, sess, 1);
 		}
 	}
 
-	/* Tail call to NAT stage */
-	bpf_tail_call(skb, &tc_progs, TC_PROG_NAT);
+	/* No session found -- tail-call to forward (pass through) */
+	bpf_tail_call(skb, &tc_progs, TC_PROG_FORWARD);
 	return TC_ACT_OK; /* fallthrough = pass */
 }
 

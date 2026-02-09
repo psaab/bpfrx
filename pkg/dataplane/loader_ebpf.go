@@ -180,6 +180,13 @@ func (m *Manager) loadAllObjects() error {
 	}
 	m.programs["tc_nat_prog"] = tcNatObjs.TcNatProg
 
+	// Load TC screen egress program.
+	var tcScreenObjs bpfrxTcScreenEgressObjects
+	if err := loadBpfrxTcScreenEgressObjects(&tcScreenObjs, replaceOpts); err != nil {
+		return fmt.Errorf("load tc_screen_egress: %w", err)
+	}
+	m.programs["tc_screen_egress_prog"] = tcScreenObjs.TcScreenEgressProg
+
 	// Load TC forward program.
 	var tcFwdObjs bpfrxTcForwardObjects
 	if err := loadBpfrxTcForwardObjects(&tcFwdObjs, replaceOpts); err != nil {
@@ -192,6 +199,7 @@ func (m *Manager) loadAllObjects() error {
 	tcTailCalls := map[uint32]*ebpf.Program{
 		TCProgConntrack:    tcCtObjs.TcConntrackProg,
 		TCProgNAT:          tcNatObjs.TcNatProg,
+		TCProgScreenEgress: tcScreenObjs.TcScreenEgressProg,
 		TCProgForward:      tcFwdObjs.TcForwardProg,
 	}
 	for idx, prog := range tcTailCalls {

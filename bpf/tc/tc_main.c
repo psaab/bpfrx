@@ -3,7 +3,7 @@
  * bpfrx TC egress main entry point.
  *
  * Parses Ethernet/IPv4/IPv6/L4 headers, populates per-CPU packet metadata,
- * and tail-calls to the TC conntrack stage.
+ * classifies the egress zone, and tail-calls to the TC screen stage.
  */
 
 #include "../headers/bpfrx_common.h"
@@ -63,8 +63,14 @@ int tc_main_prog(struct __sk_buff *skb)
 	inc_counter(GLOBAL_CTR_TC_EGRESS_PACKETS);
 	inc_iface_tx(skb->ifindex, meta->pkt_len);
 
-	/* Tail call to conntrack */
-	bpf_tail_call(skb, &tc_progs, TC_PROG_CONNTRACK);
+	/* Look up egress zone from outgoing interface */
+	__u32 ifindex = skb->ifindex;
+	__u16 *zone_ptr = bpf_map_lookup_elem(&iface_zone_map, &ifindex);
+	if (zone_ptr)
+		meta->egress_zone = *zone_ptr;
+
+	/* Tail call to egress screen */
+	bpf_tail_call(skb, &tc_progs, TC_PROG_SCREEN_EGRESS);
 	return TC_ACT_OK; /* fallthrough = pass */
 }
 
