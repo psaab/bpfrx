@@ -117,8 +117,8 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 				slog.Info("zone screen profile assigned",
 					"zone", name, "screen", zone.ScreenProfile, "id", sid)
 			} else {
-				slog.Warn("screen profile not found for zone",
-					"zone", name, "screen", zone.ScreenProfile)
+				return fmt.Errorf("screen profile %q not found for zone %q",
+					zone.ScreenProfile, name)
 			}
 		}
 
@@ -236,9 +236,8 @@ func (m *Manager) compileAddressBook(cfg *config.Config, result *CompileResult) 
 		for _, memberName := range addrSet.Addresses {
 			memberID, ok := result.AddrIDs[memberName]
 			if !ok {
-				slog.Warn("address set member not found",
-					"set", setName, "member", memberName)
-				continue
+				return fmt.Errorf("address set %q: member %q not found",
+					setName, memberName)
 			}
 			if err := m.SetAddressMembership(memberID, setID); err != nil {
 				return fmt.Errorf("set membership %s in %s: %w",
@@ -276,8 +275,7 @@ func (m *Manager) compileApplications(cfg *config.Config, result *CompileResult)
 	for appName := range referenced {
 		app, found := config.ResolveApplication(appName, userApps)
 		if !found {
-			slog.Warn("application not found", "name", appName)
-			continue
+			return fmt.Errorf("application %q not found", appName)
 		}
 
 		proto := protocolNumber(app.Protocol)
@@ -322,13 +320,11 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 	for _, zpp := range cfg.Security.Policies {
 		fromZone, ok := result.ZoneIDs[zpp.FromZone]
 		if !ok {
-			slog.Warn("from-zone not found", "zone", zpp.FromZone)
-			continue
+			return fmt.Errorf("policy from-zone %q not found", zpp.FromZone)
 		}
 		toZone, ok := result.ZoneIDs[zpp.ToZone]
 		if !ok {
-			slog.Warn("to-zone not found", "zone", zpp.ToZone)
-			continue
+			return fmt.Errorf("policy to-zone %q not found", zpp.ToZone)
 		}
 
 		ps := PolicySet{
@@ -440,13 +436,11 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 	for _, rs := range natCfg.Source {
 		fromZone, ok := result.ZoneIDs[rs.FromZone]
 		if !ok {
-			slog.Warn("source NAT from-zone not found", "zone", rs.FromZone)
-			continue
+			return fmt.Errorf("source NAT from-zone %q not found", rs.FromZone)
 		}
 		toZone, ok := result.ZoneIDs[rs.ToZone]
 		if !ok {
-			slog.Warn("source NAT to-zone not found", "zone", rs.ToZone)
-			continue
+			return fmt.Errorf("source NAT to-zone %q not found", rs.ToZone)
 		}
 
 		for _, rule := range rs.Rules {
@@ -501,9 +495,8 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 				// Pool mode: look up named pool
 				pool, ok := natCfg.SourcePools[rule.Then.PoolName]
 				if !ok {
-					slog.Warn("source NAT pool not found",
-						"pool", rule.Then.PoolName, "rule", rule.Name)
-					continue
+					return fmt.Errorf("source NAT pool %q not found (rule %q)",
+						rule.Then.PoolName, rule.Name)
 				}
 
 				// Check if pool already has an ID assigned
@@ -615,10 +608,8 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 
 				pool, ok := natCfg.Destination.Pools[rule.Then.PoolName]
 				if !ok {
-					slog.Warn("DNAT pool not found",
-						"pool", rule.Then.PoolName,
-						"rule", rule.Name)
-					continue
+					return fmt.Errorf("DNAT pool %q not found (rule %q)",
+						rule.Then.PoolName, rule.Name)
 				}
 
 				// Parse match destination address

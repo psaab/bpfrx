@@ -113,6 +113,9 @@ func (c *CLI) dispatchOperational(line string) error {
 	case "show":
 		return c.handleShow(parts[1:])
 
+	case "clear":
+		return c.handleClear(parts[1:])
+
 	case "quit", "exit":
 		return errExit
 
@@ -218,6 +221,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		fmt.Println("  screen           Show screen/IDS profiles")
 		fmt.Println("  flow session     Show active sessions")
 		fmt.Println("  nat source       Show source NAT information")
+		fmt.Println("  nat destination  Show destination NAT information")
 		fmt.Println("  statistics       Show global statistics")
 		return nil
 	}
@@ -615,12 +619,33 @@ func (c *CLI) showFlowSession() error {
 	return nil
 }
 
+func (c *CLI) handleClear(args []string) error {
+	if len(args) < 3 || args[0] != "security" || args[1] != "flow" || args[2] != "session" {
+		fmt.Println("clear:")
+		fmt.Println("  security flow session    Clear all sessions")
+		return nil
+	}
+
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("dataplane not loaded")
+		return nil
+	}
+
+	v4, v6, err := c.dp.ClearAllSessions()
+	if err != nil {
+		return fmt.Errorf("clear sessions: %w", err)
+	}
+	fmt.Printf("%d IPv4 and %d IPv6 session entries cleared\n", v4, v6)
+	return nil
+}
+
 func (c *CLI) handleShowNAT(args []string) error {
 	cfg := c.store.ActiveConfig()
 
 	if len(args) == 0 {
 		fmt.Println("show security nat:")
 		fmt.Println("  source           Show source NAT rules and sessions")
+		fmt.Println("  destination      Show destination NAT rules")
 		fmt.Println("  static           Show static 1:1 NAT rules")
 		return nil
 	}
@@ -628,6 +653,8 @@ func (c *CLI) handleShowNAT(args []string) error {
 	switch args[0] {
 	case "source":
 		return c.showNATSource(cfg, args[1:])
+	case "destination":
+		return c.showNATDestination(cfg)
 	case "static":
 		return c.showNATStatic(cfg)
 	default:
@@ -705,6 +732,73 @@ func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 			}
 			fmt.Printf("NAT allocation failures: %d\n", total)
 		}
+	}
+
+	return nil
+}
+
+func (c *CLI) showNATDestination(cfg *config.Config) error {
+	if cfg == nil || cfg.Security.NAT.Destination == nil {
+		fmt.Println("No destination NAT rules configured.")
+		return nil
+	}
+
+	dnat := cfg.Security.NAT.Destination
+
+	// Show destination NAT pools
+	if len(dnat.Pools) > 0 {
+		fmt.Println("Destination NAT pools:")
+		for name, pool := range dnat.Pools {
+			fmt.Printf("  Pool: %s\n", name)
+			fmt.Printf("    Address: %s\n", pool.Address)
+			if pool.Port != 0 {
+				fmt.Printf("    Port: %d\n", pool.Port)
+			}
+		}
+		fmt.Println()
+	}
+
+	// Show destination NAT rule sets
+	for _, rs := range dnat.RuleSets {
+		fmt.Printf("Destination NAT rule-set: %s\n", rs.Name)
+		fmt.Printf("  From zone: %s, To zone: %s\n", rs.FromZone, rs.ToZone)
+		for _, rule := range rs.Rules {
+			fmt.Printf("  Rule: %s\n", rule.Name)
+			if rule.Match.DestinationAddress != "" {
+				fmt.Printf("    Match destination-address: %s\n", rule.Match.DestinationAddress)
+			}
+			if rule.Match.DestinationPort != 0 {
+				fmt.Printf("    Match destination-port: %d\n", rule.Match.DestinationPort)
+			}
+			if rule.Then.PoolName != "" {
+				fmt.Printf("    Then pool: %s\n", rule.Then.PoolName)
+			}
+		}
+		fmt.Println()
+	}
+
+	// Show summary of active DNAT sessions
+	if c.dp != nil && c.dp.IsLoaded() {
+		dnatCount := 0
+		_ = c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse != 0 {
+				return true
+			}
+			if val.Flags&dataplane.SessFlagDNAT != 0 {
+				dnatCount++
+			}
+			return true
+		})
+		_ = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse != 0 {
+				return true
+			}
+			if val.Flags&dataplane.SessFlagDNAT != 0 {
+				dnatCount++
+			}
+			return true
+		})
+		fmt.Printf("Active DNAT sessions: %d\n", dnatCount)
 	}
 
 	return nil
@@ -892,10 +986,11 @@ func (c *CLI) configPrompt() string {
 
 func (c *CLI) showOperationalHelp() {
 	fmt.Println("Operational mode commands:")
-	fmt.Println("  configure          Enter configuration mode")
-	fmt.Println("  show configuration Show running configuration")
-	fmt.Println("  show security      Show security information")
-	fmt.Println("  quit               Exit CLI")
+	fmt.Println("  configure                    Enter configuration mode")
+	fmt.Println("  show configuration           Show running configuration")
+	fmt.Println("  show security                Show security information")
+	fmt.Println("  clear security flow session  Clear all sessions")
+	fmt.Println("  quit                         Exit CLI")
 }
 
 func (c *CLI) showConfigHelp() {

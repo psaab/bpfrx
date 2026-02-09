@@ -68,6 +68,9 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 
 	switch (sess->state) {
 	case SESS_STATE_CLOSED:
+		emit_event(meta, EVENT_TYPE_SESSION_CLOSE, ACTION_DENY,
+			   sess->fwd_packets + sess->rev_packets,
+			   sess->fwd_bytes + sess->rev_bytes);
 		inc_counter(GLOBAL_CTR_DROPS);
 		return XDP_DROP;
 	case SESS_STATE_ESTABLISHED:
@@ -136,6 +139,9 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 
 	switch (sess->state) {
 	case SESS_STATE_CLOSED:
+		emit_event(meta, EVENT_TYPE_SESSION_CLOSE, ACTION_DENY,
+			   sess->fwd_packets + sess->rev_packets,
+			   sess->fwd_bytes + sess->rev_bytes);
 		inc_counter(GLOBAL_CTR_DROPS);
 		return XDP_DROP;
 	case SESS_STATE_ESTABLISHED:

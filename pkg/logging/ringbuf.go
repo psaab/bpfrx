@@ -114,7 +114,21 @@ func (er *EventReader) logEvent(data []byte) {
 	actionName := actionName(evt.Action)
 	protoName := protoName(evt.Protocol)
 
-	if evt.EventType == dataplane.EventTypeScreenDrop {
+	if evt.EventType == dataplane.EventTypeSessionClose {
+		sessionPkts := binary.LittleEndian.Uint64(data[56:64])
+		sessionBytes := binary.LittleEndian.Uint64(data[64:72])
+		slog.Info("firewall event",
+			"type", eventName,
+			"src", srcStr,
+			"dst", dstStr,
+			"proto", protoName,
+			"action", actionName,
+			"policy_id", evt.PolicyID,
+			"ingress_zone", evt.IngressZone,
+			"egress_zone", evt.EgressZone,
+			"session_packets", sessionPkts,
+			"session_bytes", sessionBytes)
+	} else if evt.EventType == dataplane.EventTypeScreenDrop {
 		screenName := screenFlagName(evt.PolicyID)
 		slog.Info("firewall event",
 			"type", eventName,

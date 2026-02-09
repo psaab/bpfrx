@@ -527,6 +527,70 @@ func (m *Manager) ClearStaticNATEntries() error {
 	return nil
 }
 
+// ClearAllSessions deletes all IPv4 and IPv6 sessions, plus associated
+// dynamic DNAT table entries for SNAT sessions. Returns (v4_deleted, v6_deleted, err).
+func (m *Manager) ClearAllSessions() (int, int, error) {
+	v4Deleted := 0
+	v6Deleted := 0
+
+	// IPv4: collect all keys and SNAT entries for DNAT cleanup
+	var v4Keys []SessionKey
+	var snatDNATKeys []DNATKey
+	if err := m.IterateSessions(func(key SessionKey, val SessionValue) bool {
+		v4Keys = append(v4Keys, key)
+		// Track dynamic SNAT sessions for dnat_table cleanup
+		if val.IsReverse == 0 &&
+			val.Flags&SessFlagSNAT != 0 &&
+			val.Flags&SessFlagStaticNAT == 0 {
+			snatDNATKeys = append(snatDNATKeys, DNATKey{
+				Protocol: key.Protocol,
+				DstIP:    val.NATSrcIP,
+				DstPort:  val.NATSrcPort,
+			})
+		}
+		return true
+	}); err != nil {
+		return 0, 0, fmt.Errorf("iterate sessions: %w", err)
+	}
+	for _, key := range v4Keys {
+		if err := m.DeleteSession(key); err == nil {
+			v4Deleted++
+		}
+	}
+	for _, dk := range snatDNATKeys {
+		m.DeleteDNATEntry(dk)
+	}
+
+	// IPv6: collect all keys and SNAT entries for DNAT cleanup
+	var v6Keys []SessionKeyV6
+	var snatDNATKeysV6 []DNATKeyV6
+	if err := m.IterateSessionsV6(func(key SessionKeyV6, val SessionValueV6) bool {
+		v6Keys = append(v6Keys, key)
+		if val.IsReverse == 0 &&
+			val.Flags&SessFlagSNAT != 0 &&
+			val.Flags&SessFlagStaticNAT == 0 {
+			snatDNATKeysV6 = append(snatDNATKeysV6, DNATKeyV6{
+				Protocol: key.Protocol,
+				DstIP:    val.NATSrcIP,
+				DstPort:  val.NATSrcPort,
+			})
+		}
+		return true
+	}); err != nil {
+		return v4Deleted, 0, fmt.Errorf("iterate sessions_v6: %w", err)
+	}
+	for _, key := range v6Keys {
+		if err := m.DeleteSessionV6(key); err == nil {
+			v6Deleted++
+		}
+	}
+	for _, dk := range snatDNATKeysV6 {
+		m.DeleteDNATEntryV6(dk)
+	}
+
+	return v4Deleted, v6Deleted, nil
+}
+
 // htons converts a uint16 from host to network byte order.
 func htons(v uint16) uint16 {
 	var b [2]byte
