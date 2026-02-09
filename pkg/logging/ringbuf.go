@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -16,12 +18,25 @@ import (
 
 // EventReader reads events from the eBPF ring buffer.
 type EventReader struct {
-	eventsMap *ebpf.Map
+	eventsMap     *ebpf.Map
+	buffer        *EventBuffer
+	syslogMu      sync.RWMutex
+	syslogClients []*SyslogClient
 }
 
 // NewEventReader creates a new event reader for the given events map.
-func NewEventReader(eventsMap *ebpf.Map) *EventReader {
-	return &EventReader{eventsMap: eventsMap}
+func NewEventReader(eventsMap *ebpf.Map, buffer *EventBuffer) *EventReader {
+	return &EventReader{
+		eventsMap: eventsMap,
+		buffer:    buffer,
+	}
+}
+
+// SetSyslogClients replaces the set of syslog clients (goroutine-safe).
+func (er *EventReader) SetSyslogClients(clients []*SyslogClient) {
+	er.syslogMu.Lock()
+	er.syslogClients = clients
+	er.syslogMu.Unlock()
 }
 
 // Run starts reading events. It blocks until ctx is cancelled.
@@ -68,21 +83,6 @@ func (er *EventReader) Run(ctx context.Context) {
 }
 
 func (er *EventReader) logEvent(data []byte) {
-	// Event struct layout (with 16-byte IPs):
-	// [0:8]   timestamp (u64)
-	// [8:24]  src_ip (16 bytes)
-	// [24:40] dst_ip (16 bytes)
-	// [40:42] src_port (u16 BE)
-	// [42:44] dst_port (u16 BE)
-	// [44:48] policy_id (u32)
-	// [48:50] ingress_zone (u16)
-	// [50:52] egress_zone (u16)
-	// [52]    event_type (u8)
-	// [53]    protocol (u8)
-	// [54]    action (u8)
-	// [55]    addr_family (u8)
-	// [56:64] session_packets (u64)
-	// [64:72] session_bytes (u64)
 	var evt dataplane.Event
 	evt.Timestamp = binary.LittleEndian.Uint64(data[0:8])
 	copy(evt.SrcIP[:], data[8:24])
@@ -111,44 +111,111 @@ func (er *EventReader) logEvent(data []byte) {
 	}
 
 	eventName := eventTypeName(evt.EventType)
-	actionName := actionName(evt.Action)
-	protoName := protoName(evt.Protocol)
+	actionStr := actionName(evt.Action)
+	protoStr := protoName(evt.Protocol)
+
+	// Build EventRecord
+	rec := EventRecord{
+		Time:     time.Now(),
+		Type:     eventName,
+		SrcAddr:  srcStr,
+		DstAddr:  dstStr,
+		Protocol: protoStr,
+		Action:   actionStr,
+		PolicyID: evt.PolicyID,
+		InZone:   evt.IngressZone,
+		OutZone:  evt.EgressZone,
+	}
 
 	if evt.EventType == dataplane.EventTypeSessionClose {
-		sessionPkts := binary.LittleEndian.Uint64(data[56:64])
-		sessionBytes := binary.LittleEndian.Uint64(data[64:72])
+		rec.SessionPkts = binary.LittleEndian.Uint64(data[56:64])
+		rec.SessionBytes = binary.LittleEndian.Uint64(data[64:72])
+	}
+	if evt.EventType == dataplane.EventTypeScreenDrop {
+		rec.ScreenCheck = screenFlagName(evt.PolicyID)
+	}
+
+	// Store in buffer
+	if er.buffer != nil {
+		er.buffer.Add(rec)
+	}
+
+	// Log to slog (existing behavior)
+	if evt.EventType == dataplane.EventTypeSessionClose {
 		slog.Info("firewall event",
 			"type", eventName,
 			"src", srcStr,
 			"dst", dstStr,
-			"proto", protoName,
-			"action", actionName,
+			"proto", protoStr,
+			"action", actionStr,
 			"policy_id", evt.PolicyID,
 			"ingress_zone", evt.IngressZone,
 			"egress_zone", evt.EgressZone,
-			"session_packets", sessionPkts,
-			"session_bytes", sessionBytes)
+			"session_packets", rec.SessionPkts,
+			"session_bytes", rec.SessionBytes)
 	} else if evt.EventType == dataplane.EventTypeScreenDrop {
-		screenName := screenFlagName(evt.PolicyID)
 		slog.Info("firewall event",
 			"type", eventName,
-			"screen_check", screenName,
+			"screen_check", rec.ScreenCheck,
 			"src", srcStr,
 			"dst", dstStr,
-			"proto", protoName,
-			"action", actionName,
+			"proto", protoStr,
+			"action", actionStr,
 			"ingress_zone", evt.IngressZone)
 	} else {
 		slog.Info("firewall event",
 			"type", eventName,
 			"src", srcStr,
 			"dst", dstStr,
-			"proto", protoName,
-			"action", actionName,
+			"proto", protoStr,
+			"action", actionStr,
 			"policy_id", evt.PolicyID,
 			"ingress_zone", evt.IngressZone,
 			"egress_zone", evt.EgressZone)
 	}
+
+	// Forward to syslog clients
+	er.syslogMu.RLock()
+	clients := er.syslogClients
+	er.syslogMu.RUnlock()
+
+	if len(clients) > 0 {
+		severity := eventSeverity(evt.EventType)
+		msg := formatSyslogMsg(rec)
+		for _, c := range clients {
+			if err := c.Send(severity, msg); err != nil {
+				slog.Debug("syslog send failed", "err", err)
+			}
+		}
+	}
+}
+
+// eventSeverity maps event types to syslog severity levels.
+func eventSeverity(eventType uint8) int {
+	switch eventType {
+	case dataplane.EventTypeScreenDrop:
+		return SyslogError
+	case dataplane.EventTypePolicyDeny:
+		return SyslogWarning
+	default:
+		return SyslogInfo
+	}
+}
+
+// formatSyslogMsg formats an EventRecord as a syslog message body.
+func formatSyslogMsg(rec EventRecord) string {
+	if rec.Type == "SCREEN_DROP" {
+		return fmt.Sprintf("RT_FLOW %s screen=%s src=%s dst=%s proto=%s action=%s zone=%d",
+			rec.Type, rec.ScreenCheck, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action, rec.InZone)
+	}
+	if rec.Type == "SESSION_CLOSE" {
+		return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s policy=%d zone=%d->%d pkts=%d bytes=%d",
+			rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action,
+			rec.PolicyID, rec.InZone, rec.OutZone, rec.SessionPkts, rec.SessionBytes)
+	}
+	return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s policy=%d zone=%d->%d",
+		rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action,
+		rec.PolicyID, rec.InZone, rec.OutZone)
 }
 
 func eventTypeName(t uint8) string {

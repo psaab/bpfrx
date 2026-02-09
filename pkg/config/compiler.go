@@ -63,6 +63,10 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 			if err := compileAddressBook(child, sec); err != nil {
 				return fmt.Errorf("address-book: %w", err)
 			}
+		case "log":
+			if err := compileLog(child, sec); err != nil {
+				return fmt.Errorf("log: %w", err)
+			}
 		}
 	}
 	return nil
@@ -644,6 +648,39 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 		}
 
 		sec.NAT.Static = append(sec.NAT.Static, rs)
+	}
+	return nil
+}
+
+func compileLog(node *Node, sec *SecurityConfig) error {
+	if sec.Log.Streams == nil {
+		sec.Log.Streams = make(map[string]*SyslogStream)
+	}
+	for _, streamNode := range node.FindChildren("stream") {
+		if len(streamNode.Keys) < 2 {
+			continue
+		}
+		stream := &SyslogStream{
+			Name: streamNode.Keys[1],
+			Port: 514, // default
+		}
+		for _, prop := range streamNode.Children {
+			switch prop.Name() {
+			case "host":
+				if len(prop.Keys) >= 2 {
+					stream.Host = prop.Keys[1]
+				}
+			case "port":
+				if len(prop.Keys) >= 2 {
+					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
+						stream.Port = v
+					}
+				}
+			}
+		}
+		if stream.Host != "" {
+			sec.Log.Streams[stream.Name] = stream
+		}
 	}
 	return nil
 }

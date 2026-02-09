@@ -15,6 +15,19 @@ type SecurityConfig struct {
 	NAT           NATConfig
 	Screen        map[string]*ScreenProfile    // keyed by profile name
 	AddressBook   *AddressBook
+	Log           LogConfig
+}
+
+// LogConfig holds logging/syslog configuration.
+type LogConfig struct {
+	Streams map[string]*SyslogStream
+}
+
+// SyslogStream defines a syslog forwarding destination.
+type SyslogStream struct {
+	Name string
+	Host string
+	Port int // default 514
 }
 
 // ZoneConfig represents a security zone.

@@ -186,6 +186,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				// "address <name> <cidr>" not listed → leaf
 			}},
 		}},
+		"log": {children: map[string]*schemaNode{
+			"stream": {args: 1, children: nil},
+		}},
 	}},
 	"interfaces": {wildcard: &schemaNode{children: map[string]*schemaNode{
 		"unit": {args: 1, children: map[string]*schemaNode{

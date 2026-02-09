@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/psviderski/bpfrx/pkg/cli"
+	"github.com/psviderski/bpfrx/pkg/config"
 	"github.com/psviderski/bpfrx/pkg/configstore"
 	"github.com/psviderski/bpfrx/pkg/conntrack"
 	"github.com/psviderski/bpfrx/pkg/dataplane"
@@ -19,7 +20,7 @@ import (
 
 // Options configures the daemon.
 type Options struct {
-	ConfigFile string
+	ConfigFile  string
 	NoDataplane bool // set to true to run without eBPF (config-only mode)
 }
 
@@ -79,20 +80,29 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// Create event buffer (shared between event reader and CLI)
+	eventBuf := logging.NewEventBuffer(1000)
+
 	// Start background services if dataplane is loaded
+	var er *logging.EventReader
 	if d.dp != nil {
 		gc := conntrack.NewGC(d.dp, 10*time.Second)
 		go gc.Run(ctx)
 
 		eventsMap := d.dp.Map("events")
 		if eventsMap != nil {
-			er := logging.NewEventReader(eventsMap)
+			er = logging.NewEventReader(eventsMap, eventBuf)
 			go er.Run(ctx)
+
+			// Set up syslog clients from active config
+			if cfg := d.store.ActiveConfig(); cfg != nil {
+				applySyslogConfig(er, cfg)
+			}
 		}
 	}
 
 	// Start CLI shell
-	shell := cli.New(d.store, d.dp)
+	shell := cli.New(d.store, d.dp, eventBuf)
 
 	// Run CLI in a goroutine so we can still handle signals
 	errCh := make(chan error, 1)
@@ -109,5 +119,28 @@ func (d *Daemon) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		slog.Info("shutting down")
 		return nil
+	}
+}
+
+// applySyslogConfig constructs syslog clients from the config and applies them
+// to the event reader.
+func applySyslogConfig(er *logging.EventReader, cfg *config.Config) {
+	if er == nil || len(cfg.Security.Log.Streams) == 0 {
+		return
+	}
+	var clients []*logging.SyslogClient
+	for name, stream := range cfg.Security.Log.Streams {
+		client, err := logging.NewSyslogClient(stream.Host, stream.Port)
+		if err != nil {
+			slog.Warn("failed to create syslog client",
+				"stream", name, "host", stream.Host, "err", err)
+			continue
+		}
+		slog.Info("syslog stream configured",
+			"stream", name, "host", stream.Host, "port", stream.Port)
+		clients = append(clients, client)
+	}
+	if len(clients) > 0 {
+		er.SetSyslogClients(clients)
 	}
 }

@@ -591,6 +591,78 @@ func (m *Manager) ClearAllSessions() (int, int, error) {
 	return v4Deleted, v6Deleted, nil
 }
 
+// ClearGlobalCounters zeroes all global counter entries.
+func (m *Manager) ClearGlobalCounters() error {
+	zm, ok := m.maps["global_counters"]
+	if !ok {
+		return fmt.Errorf("global_counters map not found")
+	}
+	numCPUs := ebpf.MustPossibleCPU()
+	zero := make([]uint64, numCPUs)
+	for i := uint32(0); i < GlobalCtrMax; i++ {
+		if err := zm.Update(i, zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("clear global counter %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// ClearInterfaceCounters zeroes all interface counter entries.
+func (m *Manager) ClearInterfaceCounters() error {
+	zm, ok := m.maps["interface_counters"]
+	if !ok {
+		return fmt.Errorf("interface_counters map not found")
+	}
+	numCPUs := ebpf.MustPossibleCPU()
+	zero := make([]InterfaceCounterValue, numCPUs)
+	for i := uint32(0); i < 256; i++ {
+		zm.Update(i, zero, ebpf.UpdateAny)
+	}
+	return nil
+}
+
+// ClearZoneCounters zeroes all zone counter entries.
+func (m *Manager) ClearZoneCounters() error {
+	zm, ok := m.maps["zone_counters"]
+	if !ok {
+		return fmt.Errorf("zone_counters map not found")
+	}
+	numCPUs := ebpf.MustPossibleCPU()
+	zero := make([]CounterValue, numCPUs)
+	for i := uint32(0); i < 128; i++ {
+		zm.Update(i, zero, ebpf.UpdateAny)
+	}
+	return nil
+}
+
+// ClearPolicyCounters zeroes all policy counter entries.
+func (m *Manager) ClearPolicyCounters() error {
+	zm, ok := m.maps["policy_counters"]
+	if !ok {
+		return fmt.Errorf("policy_counters map not found")
+	}
+	numCPUs := ebpf.MustPossibleCPU()
+	zero := make([]CounterValue, numCPUs)
+	for i := uint32(0); i < 4096; i++ {
+		zm.Update(i, zero, ebpf.UpdateAny)
+	}
+	return nil
+}
+
+// ClearAllCounters zeroes all counter maps (global, interface, zone, policy).
+func (m *Manager) ClearAllCounters() error {
+	if err := m.ClearGlobalCounters(); err != nil {
+		return err
+	}
+	if err := m.ClearInterfaceCounters(); err != nil {
+		return err
+	}
+	if err := m.ClearZoneCounters(); err != nil {
+		return err
+	}
+	return m.ClearPolicyCounters()
+}
+
 // htons converts a uint16 from host to network byte order.
 func htons(v uint16) uint16 {
 	var b [2]byte

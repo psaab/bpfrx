@@ -13,6 +13,7 @@ import (
 	"github.com/psviderski/bpfrx/pkg/config"
 	"github.com/psviderski/bpfrx/pkg/configstore"
 	"github.com/psviderski/bpfrx/pkg/dataplane"
+	"github.com/psviderski/bpfrx/pkg/logging"
 )
 
 // CLI is the interactive command-line interface.
@@ -20,12 +21,13 @@ type CLI struct {
 	rl       *readline.Instance
 	store    *configstore.Store
 	dp       *dataplane.Manager
+	eventBuf *logging.EventBuffer
 	hostname string
 	username string
 }
 
 // New creates a new CLI.
-func New(store *configstore.Store, dp *dataplane.Manager) *CLI {
+func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.EventBuffer) *CLI {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "bpfrx"
@@ -38,6 +40,7 @@ func New(store *configstore.Store, dp *dataplane.Manager) *CLI {
 	return &CLI{
 		store:    store,
 		dp:       dp,
+		eventBuf: eventBuf,
 		hostname: hostname,
 		username: username,
 	}
@@ -222,6 +225,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		fmt.Println("  flow session     Show active sessions")
 		fmt.Println("  nat source       Show source NAT information")
 		fmt.Println("  nat destination  Show destination NAT information")
+		fmt.Println("  address-book     Show address book entries")
+		fmt.Println("  applications     Show application definitions")
+		fmt.Println("  log [N]          Show recent security events")
 		fmt.Println("  statistics       Show global statistics")
 		return nil
 	}
@@ -325,6 +331,15 @@ func (c *CLI) handleShowSecurity(args []string) error {
 
 	case "nat":
 		return c.handleShowNAT(args[1:])
+
+	case "address-book":
+		return c.showAddressBook()
+
+	case "applications":
+		return c.showApplications()
+
+	case "log":
+		return c.showSecurityLog(args[1:])
 
 	case "statistics":
 		return c.showStatistics()
@@ -620,23 +635,46 @@ func (c *CLI) showFlowSession() error {
 }
 
 func (c *CLI) handleClear(args []string) error {
-	if len(args) < 3 || args[0] != "security" || args[1] != "flow" || args[2] != "session" {
+	if len(args) < 2 || args[0] != "security" {
 		fmt.Println("clear:")
 		fmt.Println("  security flow session    Clear all sessions")
+		fmt.Println("  security counters        Clear all counters")
 		return nil
 	}
 
-	if c.dp == nil || !c.dp.IsLoaded() {
-		fmt.Println("dataplane not loaded")
+	switch args[1] {
+	case "flow":
+		if len(args) < 3 || args[2] != "session" {
+			return fmt.Errorf("usage: clear security flow session")
+		}
+		if c.dp == nil || !c.dp.IsLoaded() {
+			fmt.Println("dataplane not loaded")
+			return nil
+		}
+		v4, v6, err := c.dp.ClearAllSessions()
+		if err != nil {
+			return fmt.Errorf("clear sessions: %w", err)
+		}
+		fmt.Printf("%d IPv4 and %d IPv6 session entries cleared\n", v4, v6)
+		return nil
+
+	case "counters":
+		if c.dp == nil || !c.dp.IsLoaded() {
+			fmt.Println("dataplane not loaded")
+			return nil
+		}
+		if err := c.dp.ClearAllCounters(); err != nil {
+			return fmt.Errorf("clear counters: %w", err)
+		}
+		fmt.Println("all counters cleared")
+		return nil
+
+	default:
+		fmt.Println("clear security:")
+		fmt.Println("  flow session    Clear all sessions")
+		fmt.Println("  counters        Clear all counters")
 		return nil
 	}
-
-	v4, v6, err := c.dp.ClearAllSessions()
-	if err != nil {
-		return fmt.Errorf("clear sessions: %w", err)
-	}
-	fmt.Printf("%d IPv4 and %d IPv6 session entries cleared\n", v4, v6)
-	return nil
 }
 
 func (c *CLI) handleShowNAT(args []string) error {
@@ -824,6 +862,100 @@ func (c *CLI) showNATStatic(cfg *config.Config) error {
 	return nil
 }
 
+func (c *CLI) showAddressBook() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.Security.AddressBook == nil {
+		fmt.Println("No address book configured")
+		return nil
+	}
+	ab := cfg.Security.AddressBook
+
+	if len(ab.Addresses) > 0 {
+		fmt.Println("Addresses:")
+		for _, addr := range ab.Addresses {
+			fmt.Printf("  %-24s %s\n", addr.Name, addr.Value)
+		}
+	}
+
+	if len(ab.AddressSets) > 0 {
+		fmt.Println("Address sets:")
+		for _, as := range ab.AddressSets {
+			fmt.Printf("  %-24s members: %s\n", as.Name, strings.Join(as.Addresses, ", "))
+		}
+	}
+
+	if len(ab.Addresses) == 0 && len(ab.AddressSets) == 0 {
+		fmt.Println("Address book is empty")
+	}
+
+	return nil
+}
+
+func (c *CLI) showApplications() error {
+	cfg := c.store.ActiveConfig()
+
+	// User-defined applications
+	if cfg != nil && len(cfg.Applications.Applications) > 0 {
+		fmt.Println("User-defined applications:")
+		for _, app := range cfg.Applications.Applications {
+			port := app.DestinationPort
+			if port == "" {
+				port = "-"
+			}
+			fmt.Printf("  %-24s protocol: %-6s port: %s\n", app.Name, app.Protocol, port)
+		}
+		fmt.Println()
+	}
+
+	// Predefined applications
+	fmt.Println("Predefined applications:")
+	for _, app := range config.PredefinedApplications {
+		port := app.DestinationPort
+		if port == "" {
+			port = "-"
+		}
+		fmt.Printf("  %-24s protocol: %-6s port: %s\n", app.Name, app.Protocol, port)
+	}
+
+	return nil
+}
+
+func (c *CLI) showSecurityLog(args []string) error {
+	if c.eventBuf == nil {
+		fmt.Println("no events (event buffer not initialized)")
+		return nil
+	}
+
+	n := 50
+	if len(args) > 0 {
+		fmt.Sscanf(args[0], "%d", &n)
+	}
+
+	events := c.eventBuf.Latest(n)
+	if len(events) == 0 {
+		fmt.Println("no events recorded")
+		return nil
+	}
+
+	for _, e := range events {
+		ts := e.Time.Format("15:04:05")
+		if e.Type == "SCREEN_DROP" {
+			fmt.Printf("%s %-14s screen=%-16s %s -> %s %s action=%s zone=%d\n",
+				ts, e.Type, e.ScreenCheck, e.SrcAddr, e.DstAddr, e.Protocol, e.Action, e.InZone)
+		} else if e.Type == "SESSION_CLOSE" {
+			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%d zone=%d->%d pkts=%d bytes=%d\n",
+				ts, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
+				e.PolicyID, e.InZone, e.OutZone, e.SessionPkts, e.SessionBytes)
+		} else {
+			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%d zone=%d->%d\n",
+				ts, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
+				e.PolicyID, e.InZone, e.OutZone)
+		}
+	}
+	fmt.Printf("(%d events shown)\n", len(events))
+	return nil
+}
+
 func (c *CLI) showInterfaces(args []string) error {
 	cfg := c.store.ActiveConfig()
 	if cfg == nil {
@@ -989,7 +1121,9 @@ func (c *CLI) showOperationalHelp() {
 	fmt.Println("  configure                    Enter configuration mode")
 	fmt.Println("  show configuration           Show running configuration")
 	fmt.Println("  show security                Show security information")
+	fmt.Println("  show security log [N]        Show recent security events")
 	fmt.Println("  clear security flow session  Clear all sessions")
+	fmt.Println("  clear security counters      Clear all counters")
 	fmt.Println("  quit                         Exit CLI")
 }
 
