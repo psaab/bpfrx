@@ -16,6 +16,22 @@ type SecurityConfig struct {
 	Screen        map[string]*ScreenProfile    // keyed by profile name
 	AddressBook   *AddressBook
 	Log           LogConfig
+	Flow          FlowConfig
+}
+
+// FlowConfig holds flow/session timeout configuration.
+type FlowConfig struct {
+	TCPSession         *TCPSessionConfig
+	UDPSessionTimeout  int // seconds, 0 = default (60s)
+	ICMPSessionTimeout int // seconds, 0 = default (30s)
+}
+
+// TCPSessionConfig holds TCP session timeout configuration.
+type TCPSessionConfig struct {
+	EstablishedTimeout int // default 1800
+	InitialTimeout     int // default 30
+	ClosingTimeout     int // default 30
+	TimeWaitTimeout    int // default 120
 }
 
 // LogConfig holds logging/syslog configuration.

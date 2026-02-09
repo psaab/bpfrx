@@ -296,6 +296,49 @@ ip_addr_eq_v6(const __u8 *a, const __u8 *b)
 }
 
 /* ============================================================
+ * Configurable session timeout lookup (falls back to defaults)
+ * ============================================================ */
+
+static __always_inline __u32
+ct_get_timeout(__u8 protocol, __u8 state)
+{
+	__u32 idx;
+	switch (protocol) {
+	case PROTO_TCP:
+		switch (state) {
+		case SESS_STATE_ESTABLISHED:
+			idx = FLOW_TIMEOUT_TCP_ESTABLISHED;
+			break;
+		case SESS_STATE_FIN_WAIT:
+		case SESS_STATE_CLOSE_WAIT:
+			idx = FLOW_TIMEOUT_TCP_CLOSING;
+			break;
+		case SESS_STATE_TIME_WAIT:
+			idx = FLOW_TIMEOUT_TCP_TIME_WAIT;
+			break;
+		default:
+			idx = FLOW_TIMEOUT_TCP_INITIAL;
+			break;
+		}
+		break;
+	case PROTO_UDP:
+		idx = FLOW_TIMEOUT_UDP;
+		break;
+	case PROTO_ICMP:
+	case PROTO_ICMPV6:
+		idx = FLOW_TIMEOUT_ICMP;
+		break;
+	default:
+		idx = FLOW_TIMEOUT_OTHER;
+		break;
+	}
+	__u32 *val = bpf_map_lookup_elem(&flow_timeouts, &idx);
+	if (val && *val > 0)
+		return *val;
+	return ct_get_timeout_default(protocol, state);
+}
+
+/* ============================================================
  * Global counter increment helper
  * ============================================================ */
 

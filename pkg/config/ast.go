@@ -207,6 +207,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"log": {children: map[string]*schemaNode{
 			"stream": {args: 1, valueHint: ValueHintStreamName, children: nil},
 		}},
+		"flow": {children: map[string]*schemaNode{
+			"tcp-session": {children: nil},
+			"udp-session": {children: nil},
+			"icmp-session": {children: nil},
+		}},
 	}},
 	"interfaces": {wildcard: &schemaNode{valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 		"unit": {args: 1, children: map[string]*schemaNode{

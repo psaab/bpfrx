@@ -96,6 +96,11 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		return nil, fmt.Errorf("compile default policy: %w", err)
 	}
 
+	// Phase 9: Compile flow timeouts
+	if err := m.compileFlowTimeouts(cfg); err != nil {
+		return nil, fmt.Errorf("compile flow timeouts: %w", err)
+	}
+
 	slog.Info("config compiled to dataplane",
 		"zones", len(result.ZoneIDs),
 		"addresses", len(result.AddrIDs),
@@ -1027,6 +1032,44 @@ func (m *Manager) compileDefaultPolicy(cfg *config.Config) error {
 	} else {
 		slog.Info("default policy compiled", "action", "deny-all")
 	}
+	return nil
+}
+
+func (m *Manager) compileFlowTimeouts(cfg *config.Config) error {
+	flow := &cfg.Security.Flow
+
+	// Write all timeout slots; 0 means "use BPF default".
+	timeouts := [FlowTimeoutMax]uint32{}
+
+	if flow.TCPSession != nil {
+		timeouts[FlowTimeoutTCPEstablished] = uint32(flow.TCPSession.EstablishedTimeout)
+		timeouts[FlowTimeoutTCPInitial] = uint32(flow.TCPSession.InitialTimeout)
+		timeouts[FlowTimeoutTCPClosing] = uint32(flow.TCPSession.ClosingTimeout)
+		timeouts[FlowTimeoutTCPTimeWait] = uint32(flow.TCPSession.TimeWaitTimeout)
+	}
+	timeouts[FlowTimeoutUDP] = uint32(flow.UDPSessionTimeout)
+	timeouts[FlowTimeoutICMP] = uint32(flow.ICMPSessionTimeout)
+
+	for idx := uint32(0); idx < FlowTimeoutMax; idx++ {
+		if err := m.SetFlowTimeout(idx, timeouts[idx]); err != nil {
+			return fmt.Errorf("set flow timeout %d: %w", idx, err)
+		}
+	}
+
+	// Log only if any non-default value was set.
+	for _, v := range timeouts {
+		if v > 0 {
+			slog.Info("flow timeouts compiled",
+				"tcp_established", timeouts[FlowTimeoutTCPEstablished],
+				"tcp_initial", timeouts[FlowTimeoutTCPInitial],
+				"tcp_closing", timeouts[FlowTimeoutTCPClosing],
+				"tcp_time_wait", timeouts[FlowTimeoutTCPTimeWait],
+				"udp", timeouts[FlowTimeoutUDP],
+				"icmp", timeouts[FlowTimeoutICMP])
+			break
+		}
+	}
+
 	return nil
 }
 

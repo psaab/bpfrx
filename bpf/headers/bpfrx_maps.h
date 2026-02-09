@@ -468,4 +468,15 @@ struct {
 	__type(value, __u8);  /* ACTION_DENY=0, ACTION_PERMIT=1 */
 } default_policy SEC(".maps");
 
+/* ============================================================
+ * Configurable flow/session timeouts
+ * ============================================================ */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, FLOW_TIMEOUT_MAX);
+	__type(key, __u32);
+	__type(value, __u32);
+} flow_timeouts SEC(".maps");
+
 #endif /* __BPFRX_MAPS_H__ */

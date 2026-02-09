@@ -67,6 +67,10 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 			if err := compileLog(child, sec); err != nil {
 				return fmt.Errorf("log: %w", err)
 			}
+		case "flow":
+			if err := compileFlow(child, sec); err != nil {
+				return fmt.Errorf("flow: %w", err)
+			}
 		}
 	}
 	return nil
@@ -682,6 +686,56 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 			sec.Log.Streams[stream.Name] = stream
 		}
 	}
+	return nil
+}
+
+func compileFlow(node *Node, sec *SecurityConfig) error {
+	tcpNode := node.FindChild("tcp-session")
+	if tcpNode != nil {
+		sec.Flow.TCPSession = &TCPSessionConfig{}
+		for _, opt := range tcpNode.Children {
+			if len(opt.Keys) < 2 {
+				continue
+			}
+			val, err := strconv.Atoi(opt.Keys[1])
+			if err != nil {
+				continue
+			}
+			switch opt.Name() {
+			case "established-timeout":
+				sec.Flow.TCPSession.EstablishedTimeout = val
+			case "initial-timeout":
+				sec.Flow.TCPSession.InitialTimeout = val
+			case "closing-timeout":
+				sec.Flow.TCPSession.ClosingTimeout = val
+			case "time-wait-timeout":
+				sec.Flow.TCPSession.TimeWaitTimeout = val
+			}
+		}
+	}
+
+	udpNode := node.FindChild("udp-session")
+	if udpNode != nil {
+		for _, opt := range udpNode.Children {
+			if opt.Name() == "timeout" && len(opt.Keys) >= 2 {
+				if v, err := strconv.Atoi(opt.Keys[1]); err == nil {
+					sec.Flow.UDPSessionTimeout = v
+				}
+			}
+		}
+	}
+
+	icmpNode := node.FindChild("icmp-session")
+	if icmpNode != nil {
+		for _, opt := range icmpNode.Children {
+			if opt.Name() == "timeout" && len(opt.Keys) >= 2 {
+				if v, err := strconv.Atoi(opt.Keys[1]); err == nil {
+					sec.Flow.ICMPSessionTimeout = v
+				}
+			}
+		}
+	}
+
 	return nil
 }
 

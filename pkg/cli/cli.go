@@ -464,7 +464,8 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		fmt.Println("  zones            Show security zones")
 		fmt.Println("  policies         Show security policies")
 		fmt.Println("  screen           Show screen/IDS profiles")
-		fmt.Println("  flow session     Show active sessions")
+		fmt.Println("  flow             Show flow timeouts")
+		fmt.Println("  flow session     Show active sessions [zone <n>] [protocol <p>] [source-prefix <cidr>] [destination-prefix <cidr>] [summary]")
 		fmt.Println("  nat source       Show source NAT information")
 		fmt.Println("  nat destination  Show destination NAT information")
 		fmt.Println("  address-book     Show address book entries")
@@ -564,7 +565,10 @@ func (c *CLI) handleShowSecurity(args []string) error {
 
 	case "flow":
 		if len(args) >= 2 && args[1] == "session" {
-			return c.showFlowSession()
+			return c.showFlowSession(args[2:])
+		}
+		if len(args) == 1 {
+			return c.showFlowTimeouts()
 		}
 		return fmt.Errorf("unknown show security flow target")
 
@@ -815,12 +819,124 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 	return err
 }
 
-func (c *CLI) showFlowSession() error {
+// sessionFilter holds parsed filter criteria for session display.
+type sessionFilter struct {
+	zoneID  uint16   // 0 = any
+	proto   uint8    // 0 = any
+	srcNet  *net.IPNet
+	dstNet  *net.IPNet
+	summary bool     // only show count
+}
+
+func (c *CLI) parseSessionFilter(args []string) sessionFilter {
+	var f sessionFilter
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "zone":
+			if i+1 < len(args) {
+				i++
+				if c.dp != nil {
+					if cr := c.dp.LastCompileResult(); cr != nil {
+						f.zoneID = cr.ZoneIDs[args[i]]
+					}
+				}
+			}
+		case "protocol":
+			if i+1 < len(args) {
+				i++
+				switch strings.ToLower(args[i]) {
+				case "tcp":
+					f.proto = 6
+				case "udp":
+					f.proto = 17
+				case "icmp":
+					f.proto = 1
+				case "icmpv6":
+					f.proto = dataplane.ProtoICMPv6
+				}
+			}
+		case "source-prefix":
+			if i+1 < len(args) {
+				i++
+				cidr := args[i]
+				if !strings.Contains(cidr, "/") {
+					if strings.Contains(cidr, ":") {
+						cidr += "/128"
+					} else {
+						cidr += "/32"
+					}
+				}
+				_, ipNet, err := net.ParseCIDR(cidr)
+				if err == nil {
+					f.srcNet = ipNet
+				}
+			}
+		case "destination-prefix":
+			if i+1 < len(args) {
+				i++
+				cidr := args[i]
+				if !strings.Contains(cidr, "/") {
+					if strings.Contains(cidr, ":") {
+						cidr += "/128"
+					} else {
+						cidr += "/32"
+					}
+				}
+				_, ipNet, err := net.ParseCIDR(cidr)
+				if err == nil {
+					f.dstNet = ipNet
+				}
+			}
+		case "summary":
+			f.summary = true
+		}
+	}
+	return f
+}
+
+func (f *sessionFilter) matchesV4(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	if f.zoneID != 0 && val.IngressZone != f.zoneID && val.EgressZone != f.zoneID {
+		return false
+	}
+	if f.proto != 0 && key.Protocol != f.proto {
+		return false
+	}
+	if f.srcNet != nil && !f.srcNet.Contains(net.IP(key.SrcIP[:])) {
+		return false
+	}
+	if f.dstNet != nil && !f.dstNet.Contains(net.IP(key.DstIP[:])) {
+		return false
+	}
+	return true
+}
+
+func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	if f.zoneID != 0 && val.IngressZone != f.zoneID && val.EgressZone != f.zoneID {
+		return false
+	}
+	if f.proto != 0 && key.Protocol != f.proto {
+		return false
+	}
+	if f.srcNet != nil && !f.srcNet.Contains(net.IP(key.SrcIP[:])) {
+		return false
+	}
+	if f.dstNet != nil && !f.dstNet.Contains(net.IP(key.DstIP[:])) {
+		return false
+	}
+	return true
+}
+
+func (f *sessionFilter) hasFilter() bool {
+	return f.zoneID != 0 || f.proto != 0 || f.srcNet != nil || f.dstNet != nil
+}
+
+func (c *CLI) showFlowSession(args []string) error {
 	if c.dp == nil || !c.dp.IsLoaded() {
 		fmt.Println("Session table: dataplane not loaded")
 		return nil
 	}
 
+	f := c.parseSessionFilter(args)
 	count := 0
 
 	// IPv4 sessions
@@ -828,7 +944,14 @@ func (c *CLI) showFlowSession() error {
 		if val.IsReverse != 0 {
 			return true
 		}
+		if f.hasFilter() && !f.matchesV4(key, val) {
+			return true
+		}
 		count++
+
+		if f.summary {
+			return true
+		}
 
 		srcIP := net.IP(key.SrcIP[:])
 		dstIP := net.IP(key.DstIP[:])
@@ -869,7 +992,14 @@ func (c *CLI) showFlowSession() error {
 		if val.IsReverse != 0 {
 			return true
 		}
+		if f.hasFilter() && !f.matchesV6(key, val) {
+			return true
+		}
 		count++
+
+		if f.summary {
+			return true
+		}
 
 		srcIP := net.IP(key.SrcIP[:])
 		dstIP := net.IP(key.DstIP[:])
@@ -906,6 +1036,55 @@ func (c *CLI) showFlowSession() error {
 	}
 
 	fmt.Printf("Total sessions: %d\n", count)
+	return nil
+}
+
+func (c *CLI) showFlowTimeouts() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+
+	flow := &cfg.Security.Flow
+
+	fmt.Println("Flow session timeouts:")
+
+	// TCP
+	if flow.TCPSession != nil {
+		tcp := flow.TCPSession
+		printTimeout := func(name string, val, def int) {
+			if val > 0 {
+				fmt.Printf("  %-30s %ds\n", name+":", val)
+			} else {
+				fmt.Printf("  %-30s %ds (default)\n", name+":", def)
+			}
+		}
+		printTimeout("TCP established timeout", tcp.EstablishedTimeout, 1800)
+		printTimeout("TCP initial timeout", tcp.InitialTimeout, 30)
+		printTimeout("TCP closing timeout", tcp.ClosingTimeout, 30)
+		printTimeout("TCP time-wait timeout", tcp.TimeWaitTimeout, 120)
+	} else {
+		fmt.Println("  TCP established timeout:       1800s (default)")
+		fmt.Println("  TCP initial timeout:           30s (default)")
+		fmt.Println("  TCP closing timeout:           30s (default)")
+		fmt.Println("  TCP time-wait timeout:         120s (default)")
+	}
+
+	// UDP
+	if flow.UDPSessionTimeout > 0 {
+		fmt.Printf("  %-30s %ds\n", "UDP session timeout:", flow.UDPSessionTimeout)
+	} else {
+		fmt.Println("  UDP session timeout:           60s (default)")
+	}
+
+	// ICMP
+	if flow.ICMPSessionTimeout > 0 {
+		fmt.Printf("  %-30s %ds\n", "ICMP session timeout:", flow.ICMPSessionTimeout)
+	} else {
+		fmt.Println("  ICMP session timeout:          30s (default)")
+	}
+
 	return nil
 }
 

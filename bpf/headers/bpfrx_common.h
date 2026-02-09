@@ -221,6 +221,16 @@ struct icmp6hdr {
 #define GLOBAL_CTR_TC_EGRESS_PACKETS   9
 #define GLOBAL_CTR_MAX                 10
 
+/* Flow timeout indices for flow_timeouts ARRAY map */
+#define FLOW_TIMEOUT_TCP_ESTABLISHED   0
+#define FLOW_TIMEOUT_TCP_INITIAL       1
+#define FLOW_TIMEOUT_TCP_CLOSING       2
+#define FLOW_TIMEOUT_TCP_TIME_WAIT     3
+#define FLOW_TIMEOUT_UDP               4
+#define FLOW_TIMEOUT_ICMP              5
+#define FLOW_TIMEOUT_OTHER             6
+#define FLOW_TIMEOUT_MAX               7
+
 /* Screen option flags */
 #define SCREEN_SYN_FLOOD         (1 << 0)
 #define SCREEN_ICMP_FLOOD        (1 << 1)

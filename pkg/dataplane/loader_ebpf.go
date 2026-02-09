@@ -49,6 +49,7 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["default_policy"] = mainObjs.DefaultPolicy
 	m.maps["static_nat_v4"] = mainObjs.StaticNatV4
 	m.maps["static_nat_v6"] = mainObjs.StaticNatV6
+	m.maps["flow_timeouts"] = mainObjs.FlowTimeouts
 
 	// Store main program.
 	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
@@ -85,6 +86,7 @@ func (m *Manager) loadAllObjects() error {
 			"default_policy":     mainObjs.DefaultPolicy,
 			"static_nat_v4":      mainObjs.StaticNatV4,
 			"static_nat_v6":      mainObjs.StaticNatV6,
+			"flow_timeouts":      mainObjs.FlowTimeouts,
 		},
 	}
 

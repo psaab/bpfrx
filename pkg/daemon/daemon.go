@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -65,7 +66,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 				"err", err)
 			d.dp = nil
 		} else {
-			defer d.dp.Close()
 			// Apply current config to dataplane
 			if cfg := d.store.ActiveConfig(); cfg != nil {
 				slog.Info("applying active configuration to dataplane")
@@ -83,16 +83,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Create event buffer (shared between event reader and CLI)
 	eventBuf := logging.NewEventBuffer(1000)
 
+	// WaitGroup for coordinated shutdown of background goroutines
+	var wg sync.WaitGroup
+
 	// Start background services if dataplane is loaded
 	var er *logging.EventReader
 	if d.dp != nil {
 		gc := conntrack.NewGC(d.dp, 10*time.Second)
-		go gc.Run(ctx)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gc.Run(ctx)
+		}()
 
 		eventsMap := d.dp.Map("events")
 		if eventsMap != nil {
 			er = logging.NewEventReader(eventsMap, eventBuf)
-			go er.Run(ctx)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				er.Run(ctx)
+			}()
 
 			// Set up syslog clients from active config
 			if cfg := d.store.ActiveConfig(); cfg != nil {
@@ -110,16 +121,67 @@ func (d *Daemon) Run(ctx context.Context) error {
 		errCh <- shell.Run()
 	}()
 
+	var runErr error
 	select {
 	case err := <-errCh:
 		if err != nil {
-			return fmt.Errorf("CLI: %w", err)
+			runErr = fmt.Errorf("CLI: %w", err)
 		}
-		return nil
 	case <-ctx.Done():
-		slog.Info("shutting down")
-		return nil
+		slog.Info("signal received, shutting down")
 	}
+
+	// Cancel context to stop background goroutines, then wait for them.
+	stop()
+	wg.Wait()
+
+	// Log final stats before closing dataplane.
+	if d.dp != nil {
+		logFinalStats(d.dp)
+		d.dp.Close()
+	}
+
+	slog.Info("shutdown complete")
+	return runErr
+}
+
+// logFinalStats reads and logs global counter summary before shutdown.
+func logFinalStats(dp *dataplane.Manager) {
+	if !dp.IsLoaded() {
+		return
+	}
+	ctrMap := dp.Map("global_counters")
+	if ctrMap == nil {
+		return
+	}
+
+	indices := []struct {
+		idx  uint32
+		name string
+	}{
+		{dataplane.GlobalCtrRxPackets, "rx_packets"},
+		{dataplane.GlobalCtrTxPackets, "tx_packets"},
+		{dataplane.GlobalCtrDrops, "drops"},
+		{dataplane.GlobalCtrSessionsNew, "sessions_created"},
+		{dataplane.GlobalCtrSessionsClosed, "sessions_closed"},
+		{dataplane.GlobalCtrScreenDrops, "screen_drops"},
+		{dataplane.GlobalCtrPolicyDeny, "policy_denies"},
+	}
+
+	attrs := make([]any, 0, len(indices)*2)
+	for _, n := range indices {
+		var perCPU []uint64
+		if err := ctrMap.Lookup(n.idx, &perCPU); err != nil {
+			continue
+		}
+		var total uint64
+		for _, v := range perCPU {
+			total += v
+		}
+		attrs = append(attrs, n.name, total)
+	}
+
+	slog.Info("final statistics", attrs...)
 }
 
 // applySyslogConfig constructs syslog clients from the config and applies them

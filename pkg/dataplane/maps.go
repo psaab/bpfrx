@@ -477,6 +477,15 @@ func (m *Manager) SetDefaultPolicy(action uint8) error {
 	return zm.Update(uint32(0), action, ebpf.UpdateAny)
 }
 
+// SetFlowTimeout writes a flow timeout value (in seconds) at the given index.
+func (m *Manager) SetFlowTimeout(idx, seconds uint32) error {
+	zm, ok := m.maps["flow_timeouts"]
+	if !ok {
+		return fmt.Errorf("flow_timeouts map not found")
+	}
+	return zm.Update(idx, seconds, ebpf.UpdateAny)
+}
+
 // SetStaticNATEntryV4 writes a static NAT v4 entry.
 func (m *Manager) SetStaticNATEntryV4(ip uint32, direction uint8, translated uint32) error {
 	zm, ok := m.maps["static_nat_v4"]

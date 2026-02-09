@@ -147,9 +147,9 @@ ct_tcp_update_state(__u8 current_state, __u8 tcp_flags, __u8 direction)
 	return current_state;
 }
 
-/* Get session timeout based on protocol and state. */
+/* Get default session timeout based on protocol and state. */
 static __always_inline __u32
-ct_get_timeout(__u8 protocol, __u8 state)
+ct_get_timeout_default(__u8 protocol, __u8 state)
 {
 	switch (protocol) {
 	case PROTO_TCP:

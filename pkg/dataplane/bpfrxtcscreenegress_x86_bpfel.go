@@ -393,6 +393,7 @@ type bpfrxTcScreenEgressMapSpecs struct {
 	DnatTableV6       *ebpf.MapSpec `ebpf:"dnat_table_v6"`
 	Events            *ebpf.MapSpec `ebpf:"events"`
 	FloodCounters     *ebpf.MapSpec `ebpf:"flood_counters"`
+	FlowTimeouts      *ebpf.MapSpec `ebpf:"flow_timeouts"`
 	GlobalCounters    *ebpf.MapSpec `ebpf:"global_counters"`
 	IfaceZoneMap      *ebpf.MapSpec `ebpf:"iface_zone_map"`
 	InterfaceCounters *ebpf.MapSpec `ebpf:"interface_counters"`
@@ -450,6 +451,7 @@ type bpfrxTcScreenEgressMaps struct {
 	DnatTableV6       *ebpf.Map `ebpf:"dnat_table_v6"`
 	Events            *ebpf.Map `ebpf:"events"`
 	FloodCounters     *ebpf.Map `ebpf:"flood_counters"`
+	FlowTimeouts      *ebpf.Map `ebpf:"flow_timeouts"`
 	GlobalCounters    *ebpf.Map `ebpf:"global_counters"`
 	IfaceZoneMap      *ebpf.Map `ebpf:"iface_zone_map"`
 	InterfaceCounters *ebpf.Map `ebpf:"interface_counters"`
@@ -483,6 +485,7 @@ func (m *bpfrxTcScreenEgressMaps) Close() error {
 		m.DnatTableV6,
 		m.Events,
 		m.FloodCounters,
+		m.FlowTimeouts,
 		m.GlobalCounters,
 		m.IfaceZoneMap,
 		m.InterfaceCounters,

@@ -480,6 +480,18 @@ const (
 	EventTypeScreenDrop   = 4
 )
 
+// Flow timeout indices -- must match C FLOW_TIMEOUT_* defines.
+const (
+	FlowTimeoutTCPEstablished = 0
+	FlowTimeoutTCPInitial     = 1
+	FlowTimeoutTCPClosing     = 2
+	FlowTimeoutTCPTimeWait    = 3
+	FlowTimeoutUDP            = 4
+	FlowTimeoutICMP           = 5
+	FlowTimeoutOther          = 6
+	FlowTimeoutMax            = 7
+)
+
 // Address family constants.
 const (
 	AFInet  = 2
