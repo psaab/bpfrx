@@ -557,13 +557,24 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 			thenNode := ruleNode.FindChild("then")
 			if thenNode != nil {
 				for _, t := range thenNode.Children {
-					if t.Name() == "source-nat" && len(t.Keys) >= 2 {
-						if t.Keys[1] == "interface" {
+					if t.Name() == "source-nat" {
+						if len(t.Keys) >= 2 {
+							// Flat form: source-nat interface; / source-nat pool <name>;
+							if t.Keys[1] == "interface" {
+								rule.Then.Type = NATSource
+								rule.Then.Interface = true
+							} else if t.Keys[1] == "pool" && len(t.Keys) >= 3 {
+								rule.Then.Type = NATSource
+								rule.Then.PoolName = t.Keys[2]
+							}
+						} else if t.FindChild("interface") != nil {
+							// Hierarchical form: source-nat { interface; }
 							rule.Then.Type = NATSource
 							rule.Then.Interface = true
-						} else if t.Keys[1] == "pool" && len(t.Keys) >= 3 {
+						} else if poolNode := t.FindChild("pool"); poolNode != nil && len(poolNode.Keys) >= 2 {
+							// Hierarchical form: source-nat { pool <name>; }
 							rule.Then.Type = NATSource
-							rule.Then.PoolName = t.Keys[2]
+							rule.Then.PoolName = poolNode.Keys[1]
 						}
 					}
 				}

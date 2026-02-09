@@ -225,6 +225,18 @@ provision_instance() {
 		iface_dmz=eth3; iface_tunnel=eth4
 	fi
 
+	# Wait for systemd to be ready (VM agent may respond before systemd is up)
+	info "Waiting for system to be ready..."
+	local stries=0
+	while ! incus exec "$INSTANCE_NAME" -- systemctl is-system-running &>/dev/null 2>&1; do
+		sleep 2
+		stries=$((stries + 1))
+		if [[ $stries -ge 30 ]]; then
+			warn "systemd did not become ready after 60 seconds, continuing anyway"
+			break
+		fi
+	done
+
 	# Detect network manager: systemd-networkd or ifupdown
 	local use_networkd=false
 	if incus exec "$INSTANCE_NAME" -- systemctl is-active systemd-networkd &>/dev/null; then
