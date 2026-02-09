@@ -16,10 +16,10 @@ int xdp_main_prog(struct xdp_md *ctx)
 {
 	void *data     = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
-	__u16 l3_offset, eth_proto;
+	__u16 l3_offset, eth_proto, vlan_id = 0;
 
-	/* Parse Ethernet header */
-	if (parse_ethhdr(data, data_end, &l3_offset, &eth_proto) < 0)
+	/* Parse Ethernet header (extracts VLAN ID if present) */
+	if (parse_ethhdr(data, data_end, &l3_offset, &eth_proto, &vlan_id) < 0)
 		return XDP_DROP;
 
 	/* Get per-CPU scratch space for packet metadata */
@@ -29,9 +29,21 @@ int xdp_main_prog(struct xdp_md *ctx)
 		return XDP_DROP;
 
 	__builtin_memset(meta, 0, sizeof(*meta));
-	meta->l3_offset = l3_offset;
 	meta->direction = 0; /* ingress */
 	meta->ingress_ifindex = ctx->ingress_ifindex;
+	meta->ingress_vlan_id = vlan_id;
+
+	/* Strip VLAN tag if present so pipeline sees plain Ethernet */
+	if (vlan_id != 0) {
+		if (xdp_vlan_tag_pop(ctx) < 0)
+			return XDP_DROP;
+		/* Re-read pointers after adjust_head */
+		data     = (void *)(long)ctx->data;
+		data_end = (void *)(long)ctx->data_end;
+		l3_offset = sizeof(struct ethhdr);
+	}
+
+	meta->l3_offset = l3_offset;
 
 	/* Parse L3 header based on EtherType */
 	if (eth_proto == ETH_P_IP) {

@@ -362,6 +362,11 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 			Units: make(map[int]*InterfaceUnit),
 		}
 
+		// Check for vlan-tagging flag
+		if child.FindChild("vlan-tagging") != nil {
+			ifc.VlanTagging = true
+		}
+
 		// Check for tunnel configuration
 		tunnelNode := child.FindChild("tunnel")
 		if tunnelNode != nil {
@@ -409,6 +414,14 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 				continue
 			}
 			unit := &InterfaceUnit{Number: unitNum}
+
+			// Parse vlan-id on unit
+			vlanNode := unitNode.FindChild("vlan-id")
+			if vlanNode != nil && len(vlanNode.Keys) >= 2 {
+				if v, err := strconv.Atoi(vlanNode.Keys[1]); err == nil {
+					unit.VlanID = v
+				}
+			}
 
 			familyNode := unitNode.FindChild("family")
 			if familyNode != nil {

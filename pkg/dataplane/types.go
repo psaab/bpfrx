@@ -500,6 +500,20 @@ const (
 	AFInet6 = 10
 )
 
+// IfaceZoneKey mirrors the C struct iface_zone_key (composite key for HASH map).
+type IfaceZoneKey struct {
+	Ifindex uint32
+	VlanID  uint16
+	Pad     uint16
+}
+
+// VlanIfaceInfo mirrors the C struct vlan_iface_info.
+type VlanIfaceInfo struct {
+	ParentIfindex uint32
+	VlanID        uint16
+	Pad           uint16
+}
+
 // Protocol number constants.
 const (
 	ProtoICMPv6 = 58

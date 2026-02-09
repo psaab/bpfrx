@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/vishvananda/netlink"
 )
 
 // CompileResult holds the result of a config compilation for reference.
@@ -111,7 +112,109 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 	return result, nil
 }
 
+// resolveInterfaceRef parses an interface reference like "enp6s0" or "enp6s0.100"
+// and returns the physical interface name, unit number, and VLAN ID from config.
+func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, unitNum int, vlanID int) {
+	parts := strings.SplitN(ref, ".", 2)
+	physName = parts[0]
+	if len(parts) == 2 {
+		unitNum, _ = strconv.Atoi(parts[1])
+	}
+
+	// Look up VLAN ID from interface config
+	if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+		if unit, ok := ifCfg.Units[unitNum]; ok {
+			vlanID = unit.VlanID
+		}
+	}
+	return
+}
+
+// ensureVLANSubInterface creates a Linux VLAN sub-interface if it doesn't exist.
+// Returns the sub-interface's ifindex.
+func ensureVLANSubInterface(parentName string, vlanID int) (int, error) {
+	parent, err := netlink.LinkByName(parentName)
+	if err != nil {
+		return 0, fmt.Errorf("parent interface %s: %w", parentName, err)
+	}
+
+	subName := fmt.Sprintf("%s.%d", parentName, vlanID)
+
+	// Check if sub-interface already exists
+	existing, err := netlink.LinkByName(subName)
+	if err == nil {
+		// Already exists, ensure it's up
+		if existing.Attrs().OperState != netlink.OperUp {
+			netlink.LinkSetUp(existing)
+		}
+		return existing.Attrs().Index, nil
+	}
+
+	// Create VLAN sub-interface
+	vlan := &netlink.Vlan{
+		LinkAttrs: netlink.LinkAttrs{
+			Name:        subName,
+			ParentIndex: parent.Attrs().Index,
+		},
+		VlanId: vlanID,
+	}
+	if err := netlink.LinkAdd(vlan); err != nil {
+		return 0, fmt.Errorf("create VLAN sub-interface %s: %w", subName, err)
+	}
+
+	// Bring it up
+	link, err := netlink.LinkByName(subName)
+	if err != nil {
+		return 0, fmt.Errorf("find created VLAN sub-interface %s: %w", subName, err)
+	}
+	if err := netlink.LinkSetUp(link); err != nil {
+		return 0, fmt.Errorf("set VLAN sub-interface %s up: %w", subName, err)
+	}
+
+	slog.Info("created VLAN sub-interface",
+		"name", subName, "parent", parentName, "vlan_id", vlanID,
+		"ifindex", link.Attrs().Index)
+
+	return link.Attrs().Index, nil
+}
+
+// assignSubInterfaceAddresses assigns configured addresses to a VLAN sub-interface via netlink.
+func assignSubInterfaceAddresses(subName string, addresses []string) {
+	link, err := netlink.LinkByName(subName)
+	if err != nil {
+		slog.Warn("cannot find sub-interface for address assignment",
+			"name", subName, "err", err)
+		return
+	}
+	for _, addrStr := range addresses {
+		addr, err := netlink.ParseAddr(addrStr)
+		if err != nil {
+			slog.Warn("invalid address for sub-interface",
+				"addr", addrStr, "name", subName, "err", err)
+			continue
+		}
+		if err := netlink.AddrAdd(link, addr); err != nil {
+			// EEXIST is fine
+			if !strings.Contains(err.Error(), "exists") {
+				slog.Warn("failed to add address to sub-interface",
+					"addr", addrStr, "name", subName, "err", err)
+			}
+		}
+	}
+}
+
 func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error {
+	// Clear previous zone and VLAN mappings for recompile
+	if err := m.ClearIfaceZoneMap(); err != nil {
+		slog.Warn("failed to clear iface_zone_map", "err", err)
+	}
+	if err := m.ClearVlanIfaceMap(); err != nil {
+		slog.Warn("failed to clear vlan_iface_map", "err", err)
+	}
+
+	// Track which physical interfaces we've already attached to
+	attached := make(map[int]bool)
+
 	for name, zone := range cfg.Security.Zones {
 		zid := result.ZoneIDs[name]
 
@@ -161,40 +264,74 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 		}
 
 		// Map interfaces to zone
-		for _, ifaceName := range zone.Interfaces {
-			iface, err := net.InterfaceByName(ifaceName)
+		for _, ifaceRef := range zone.Interfaces {
+			physName, unitNum, vlanID := resolveInterfaceRef(ifaceRef, cfg)
+
+			// Get the physical interface
+			physIface, err := net.InterfaceByName(physName)
 			if err != nil {
 				slog.Warn("interface not found, skipping",
-					"interface", ifaceName, "zone", name, "err", err)
+					"interface", physName, "zone", name, "err", err)
 				continue
 			}
 
-			if err := m.SetZone(iface.Index, zid); err != nil {
-				return fmt.Errorf("set zone for %s (ifindex %d): %w",
-					ifaceName, iface.Index, err)
-			}
-
-			if err := m.AddTxPort(iface.Index); err != nil {
-				return fmt.Errorf("add tx port %s: %w", ifaceName, err)
-			}
-
-			if err := m.AttachXDP(iface.Index); err != nil {
-				// May already be attached from a previous compile
-				if !strings.Contains(err.Error(), "already attached") {
-					return fmt.Errorf("attach XDP to %s: %w", ifaceName, err)
+			if vlanID > 0 {
+				// VLAN sub-interface: create it, populate vlan_iface_map
+				subIfindex, err := ensureVLANSubInterface(physName, vlanID)
+				if err != nil {
+					return fmt.Errorf("VLAN sub-interface %s.%d: %w",
+						physName, vlanID, err)
 				}
+
+				if err := m.SetVlanIfaceInfo(subIfindex, physIface.Index, uint16(vlanID)); err != nil {
+					return fmt.Errorf("set vlan_iface_info %s.%d: %w",
+						physName, vlanID, err)
+				}
+
+				// Assign addresses from unit config to sub-interface
+				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+					if unit, ok := ifCfg.Units[unitNum]; ok && len(unit.Addresses) > 0 {
+						subName := fmt.Sprintf("%s.%d", physName, vlanID)
+						assignSubInterfaceAddresses(subName, unit.Addresses)
+					}
+				}
+
+				slog.Info("VLAN sub-interface configured",
+					"parent", physName, "vlan_id", vlanID,
+					"sub_ifindex", subIfindex, "zone", name)
 			}
 
-			if err := m.AttachTC(iface.Index); err != nil {
-				// May already be attached from a previous compile
-				if !strings.Contains(err.Error(), "already attached") {
-					return fmt.Errorf("attach TC to %s: %w", ifaceName, err)
+			// Set zone mapping using composite key {physIfindex, vlanID}
+			if err := m.SetZone(physIface.Index, uint16(vlanID), zid); err != nil {
+				return fmt.Errorf("set zone for %s vlan %d (ifindex %d): %w",
+					physName, vlanID, physIface.Index, err)
+			}
+
+			// Add physical interface to tx_ports and attach XDP/TC (once per phys iface)
+			if !attached[physIface.Index] {
+				if err := m.AddTxPort(physIface.Index); err != nil {
+					return fmt.Errorf("add tx port %s: %w", physName, err)
 				}
+
+				if err := m.AttachXDP(physIface.Index); err != nil {
+					if !strings.Contains(err.Error(), "already attached") {
+						return fmt.Errorf("attach XDP to %s: %w", physName, err)
+					}
+				}
+
+				if err := m.AttachTC(physIface.Index); err != nil {
+					if !strings.Contains(err.Error(), "already attached") {
+						return fmt.Errorf("attach TC to %s: %w", physName, err)
+					}
+				}
+
+				attached[physIface.Index] = true
 			}
 
 			slog.Info("zone interface configured",
-				"zone", name, "interface", ifaceName,
-				"ifindex", iface.Index, "zone_id", zid)
+				"zone", name, "interface", ifaceRef,
+				"phys_ifindex", physIface.Index, "vlan_id", vlanID,
+				"zone_id", zid)
 		}
 	}
 	return nil

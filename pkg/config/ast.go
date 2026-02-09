@@ -219,7 +219,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 	}},
 	"interfaces": {wildcard: &schemaNode{valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
+		"vlan-tagging": {children: nil},
 		"unit": {args: 1, children: map[string]*schemaNode{
+			"vlan-id": {args: 1, children: nil},
 			"family": {children: map[string]*schemaNode{
 				"inet":  {children: nil},
 				"inet6": {children: nil},

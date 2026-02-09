@@ -95,9 +95,12 @@ int xdp_screen_prog(struct xdp_md *ctx)
 	if (!meta)
 		return XDP_DROP;
 
-	/* Look up ingress zone from interface index */
-	__u32 ifindex = meta->ingress_ifindex;
-	__u16 *zone_ptr = bpf_map_lookup_elem(&iface_zone_map, &ifindex);
+	/* Look up ingress zone from {ifindex, vlan_id} composite key */
+	struct iface_zone_key zk = {
+		.ifindex = meta->ingress_ifindex,
+		.vlan_id = meta->ingress_vlan_id,
+	};
+	__u16 *zone_ptr = bpf_map_lookup_elem(&iface_zone_map, &zk);
 	if (!zone_ptr) {
 		inc_counter(GLOBAL_CTR_DROPS);
 		return XDP_DROP;

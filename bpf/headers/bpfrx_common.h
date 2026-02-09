@@ -141,6 +141,7 @@ struct icmp6hdr {
 /* Maximum values */
 #define MAX_ZONES              64
 #define MAX_INTERFACES         256
+#define MAX_LOGICAL_INTERFACES 512
 #define MAX_POLICIES           4096
 #define MAX_RULES_PER_POLICY   256
 #define MAX_SESSIONS           1048576  /* 1M sessions */
@@ -281,6 +282,24 @@ struct ip_addr {
 };
 
 /* ============================================================
+ * VLAN / logical interface support
+ * ============================================================ */
+
+/* Composite key for iface_zone_map (HASH): {ifindex, vlan_id} -> zone_id */
+struct iface_zone_key {
+	__u32 ifindex;
+	__u16 vlan_id;
+	__u16 pad;
+};
+
+/* Reverse mapping: sub-interface ifindex -> parent physical info */
+struct vlan_iface_info {
+	__u32 parent_ifindex;
+	__u16 vlan_id;
+	__u16 pad;
+};
+
+/* ============================================================
  * Packet metadata -- passed between tail call stages via
  * per-CPU scratch map at index 0.
  * ============================================================ */
@@ -315,6 +334,8 @@ struct pkt_meta {
 	__u16 ingress_zone;
 	__u16 egress_zone;
 	__u32 ingress_ifindex;
+	__u16 ingress_vlan_id;
+	__u16 egress_vlan_id;
 
 	/* Pipeline state */
 	__u8  direction;    /* 0=ingress, 1=egress */

@@ -103,6 +103,13 @@ type bpfrxTcScreenEgressIfaceCounterValue struct {
 	TxBytes   uint64
 }
 
+type bpfrxTcScreenEgressIfaceZoneKey struct {
+	_       structs.HostLayout
+	Ifindex uint32
+	VlanId  uint16
+	Pad     uint16
+}
+
 type bpfrxTcScreenEgressLpmKeyV4 struct {
 	_         structs.HostLayout
 	Prefixlen uint32
@@ -145,6 +152,8 @@ type bpfrxTcScreenEgressPktMeta struct {
 	IngressZone    uint16
 	EgressZone     uint16
 	IngressIfindex uint32
+	IngressVlanId  uint16
+	EgressVlanId   uint16
 	Direction      uint8
 	IsFragment     uint8
 	CtState        uint8
@@ -322,6 +331,13 @@ type bpfrxTcScreenEgressStaticNatValueV6 struct {
 	Ip [16]uint8
 }
 
+type bpfrxTcScreenEgressVlanIfaceInfo struct {
+	_             structs.HostLayout
+	ParentIfindex uint32
+	VlanId        uint16
+	Pad           uint16
+}
+
 type bpfrxTcScreenEgressZoneConfig struct {
 	_                structs.HostLayout
 	ZoneId           uint16
@@ -410,6 +426,7 @@ type bpfrxTcScreenEgressMapSpecs struct {
 	StaticNatV6       *ebpf.MapSpec `ebpf:"static_nat_v6"`
 	TcProgs           *ebpf.MapSpec `ebpf:"tc_progs"`
 	TxPorts           *ebpf.MapSpec `ebpf:"tx_ports"`
+	VlanIfaceMap      *ebpf.MapSpec `ebpf:"vlan_iface_map"`
 	XdpProgs          *ebpf.MapSpec `ebpf:"xdp_progs"`
 	ZoneConfigs       *ebpf.MapSpec `ebpf:"zone_configs"`
 	ZoneCounters      *ebpf.MapSpec `ebpf:"zone_counters"`
@@ -468,6 +485,7 @@ type bpfrxTcScreenEgressMaps struct {
 	StaticNatV6       *ebpf.Map `ebpf:"static_nat_v6"`
 	TcProgs           *ebpf.Map `ebpf:"tc_progs"`
 	TxPorts           *ebpf.Map `ebpf:"tx_ports"`
+	VlanIfaceMap      *ebpf.Map `ebpf:"vlan_iface_map"`
 	XdpProgs          *ebpf.Map `ebpf:"xdp_progs"`
 	ZoneConfigs       *ebpf.Map `ebpf:"zone_configs"`
 	ZoneCounters      *ebpf.Map `ebpf:"zone_counters"`
@@ -502,6 +520,7 @@ func (m *bpfrxTcScreenEgressMaps) Close() error {
 		m.StaticNatV6,
 		m.TcProgs,
 		m.TxPorts,
+		m.VlanIfaceMap,
 		m.XdpProgs,
 		m.ZoneConfigs,
 		m.ZoneCounters,

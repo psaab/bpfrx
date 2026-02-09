@@ -16,9 +16,11 @@ struct vlan_hdr {
 /*
  * Parse Ethernet header, handling one level of VLAN tagging.
  * Returns the EtherType of the inner protocol and updates l3_offset.
+ * If vlan_id is non-NULL, writes the extracted VLAN ID (0 if untagged).
  */
 static __always_inline int
-parse_ethhdr(void *data, void *data_end, __u16 *l3_offset, __u16 *eth_proto)
+parse_ethhdr(void *data, void *data_end, __u16 *l3_offset, __u16 *eth_proto,
+	     __u16 *vlan_id)
 {
 	struct ethhdr *eth = data;
 
@@ -27,15 +29,100 @@ parse_ethhdr(void *data, void *data_end, __u16 *l3_offset, __u16 *eth_proto)
 
 	*eth_proto = bpf_ntohs(eth->h_proto);
 	*l3_offset = sizeof(struct ethhdr);
+	if (vlan_id)
+		*vlan_id = 0;
 
 	/* Handle one level of VLAN */
 	if (*eth_proto == ETH_P_8021Q || *eth_proto == ETH_P_8021AD) {
 		struct vlan_hdr *vlan = data + sizeof(struct ethhdr);
 		if ((void *)(vlan + 1) > data_end)
 			return -1;
+		if (vlan_id)
+			*vlan_id = bpf_ntohs(vlan->h_vlan_TCI) & 0x0FFF;
 		*eth_proto = bpf_ntohs(vlan->h_vlan_encapsulated_proto);
 		*l3_offset += sizeof(struct vlan_hdr);
 	}
+
+	return 0;
+}
+
+/*
+ * Strip 802.1Q VLAN tag from an XDP packet by shifting the Ethernet
+ * header 4 bytes forward and shrinking the head.
+ * Returns 0 on success, -1 on failure.
+ */
+static __always_inline int
+xdp_vlan_tag_pop(struct xdp_md *ctx)
+{
+	void *data     = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return -1;
+
+	/* Save the original Ethernet src/dst MAC and copy them after the shift */
+	__u8 dmac[ETH_ALEN];
+	__u8 smac[ETH_ALEN];
+	__builtin_memcpy(dmac, eth->h_dest, ETH_ALEN);
+	__builtin_memcpy(smac, eth->h_source, ETH_ALEN);
+
+	/* Move head forward by 4 bytes (VLAN header size) */
+	if (bpf_xdp_adjust_head(ctx, (int)sizeof(struct vlan_hdr)))
+		return -1;
+
+	/* Re-read pointers after adjust */
+	data     = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+
+	eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return -1;
+
+	/* Restore MACs -- the inner EtherType is already in place
+	 * because we shifted past the VLAN header. But the MACs were
+	 * in the old position, so copy them into the new eth header. */
+	__builtin_memcpy(eth->h_dest, dmac, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, smac, ETH_ALEN);
+
+	return 0;
+}
+
+/*
+ * Push an 802.1Q VLAN tag onto an XDP packet by growing the head
+ * by 4 bytes and inserting the VLAN header.
+ * Returns 0 on success, -1 on failure.
+ */
+static __always_inline int
+xdp_vlan_tag_push(struct xdp_md *ctx, __u16 vid)
+{
+	/* Grow head by 4 bytes */
+	if (bpf_xdp_adjust_head(ctx, -(int)sizeof(struct vlan_hdr)))
+		return -1;
+
+	void *data     = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return -1;
+
+	/* The old Ethernet header is at data + 4. Copy MACs from there. */
+	struct ethhdr *old_eth = data + sizeof(struct vlan_hdr);
+	if ((void *)(old_eth + 1) > data_end)
+		return -1;
+
+	__builtin_memcpy(eth->h_dest, old_eth->h_dest, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, old_eth->h_source, ETH_ALEN);
+	eth->h_proto = bpf_htons(ETH_P_8021Q);
+
+	/* Write VLAN header between Ethernet and inner EtherType */
+	struct vlan_hdr *vhdr = data + sizeof(struct ethhdr);
+	if ((void *)(vhdr + 1) > data_end)
+		return -1;
+
+	vhdr->h_vlan_TCI = bpf_htons(vid);
+	vhdr->h_vlan_encapsulated_proto = old_eth->h_proto;
 
 	return 0;
 }

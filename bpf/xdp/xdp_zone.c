@@ -19,9 +19,12 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	if (!meta)
 		return XDP_DROP;
 
-	/* Look up ingress zone from interface index */
-	__u32 ifindex = meta->ingress_ifindex;
-	__u16 *zone_id = bpf_map_lookup_elem(&iface_zone_map, &ifindex);
+	/* Look up ingress zone from {ifindex, vlan_id} composite key */
+	struct iface_zone_key izk = {
+		.ifindex = meta->ingress_ifindex,
+		.vlan_id = meta->ingress_vlan_id,
+	};
+	__u16 *zone_id = bpf_map_lookup_elem(&iface_zone_map, &izk);
 	if (!zone_id) {
 		/* Interface not assigned to any zone -- drop */
 		inc_counter(GLOBAL_CTR_DROPS);
@@ -119,14 +122,23 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
 
 	if (rc == BPF_FIB_LKUP_RET_SUCCESS) {
-		/* Store forwarding info */
-		meta->fwd_ifindex = fib.ifindex;
+		/* Store forwarding info -- resolve VLAN sub-interface */
+		__u32 egress_if = fib.ifindex;
+		__u16 egress_vlan = 0;
+		__u32 egress_phys_if = egress_if;
+		struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map, &egress_if);
+		if (vi) {
+			egress_phys_if = vi->parent_ifindex;
+			egress_vlan = vi->vlan_id;
+		}
+		meta->fwd_ifindex = egress_phys_if;
+		meta->egress_vlan_id = egress_vlan;
 		__builtin_memcpy(meta->fwd_dmac, fib.dmac, ETH_ALEN);
 		__builtin_memcpy(meta->fwd_smac, fib.smac, ETH_ALEN);
 
-		/* Look up egress zone */
-		__u32 egress_if = fib.ifindex;
-		__u16 *ez = bpf_map_lookup_elem(&iface_zone_map, &egress_if);
+		/* Look up egress zone using {physical_ifindex, vlan_id} */
+		struct iface_zone_key ezk = { .ifindex = egress_phys_if, .vlan_id = egress_vlan };
+		__u16 *ez = bpf_map_lookup_elem(&iface_zone_map, &ezk);
 		if (ez)
 			meta->egress_zone = *ez;
 
@@ -136,9 +148,19 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		 * Store the ifindex for zone lookup; pass to kernel
 		 * to trigger neighbor resolution.
 		 */
-		meta->fwd_ifindex = fib.ifindex;
 		__u32 egress_if = fib.ifindex;
-		__u16 *ez = bpf_map_lookup_elem(&iface_zone_map, &egress_if);
+		__u16 egress_vlan = 0;
+		__u32 egress_phys_if = egress_if;
+		struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map, &egress_if);
+		if (vi) {
+			egress_phys_if = vi->parent_ifindex;
+			egress_vlan = vi->vlan_id;
+		}
+		meta->fwd_ifindex = egress_phys_if;
+		meta->egress_vlan_id = egress_vlan;
+
+		struct iface_zone_key ezk = { .ifindex = egress_phys_if, .vlan_id = egress_vlan };
+		__u16 *ez = bpf_map_lookup_elem(&iface_zone_map, &ezk);
 		if (ez)
 			meta->egress_zone = *ez;
 

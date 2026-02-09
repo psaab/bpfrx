@@ -69,13 +69,23 @@ struct {
  * Zone configuration
  * ============================================================ */
 
-/* Interface ifindex -> zone_id */
+/* {ifindex, vlan_id} -> zone_id (HASH for VLAN support) */
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, MAX_INTERFACES);
-	__type(key, __u32);
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_LOGICAL_INTERFACES);
+	__type(key, struct iface_zone_key);
 	__type(value, __u16);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 } iface_zone_map SEC(".maps");
+
+/* sub-interface ifindex -> {parent_ifindex, vlan_id} */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_LOGICAL_INTERFACES);
+	__type(key, __u32);
+	__type(value, struct vlan_iface_info);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} vlan_iface_map SEC(".maps");
 
 /* zone_id -> zone_config */
 struct {

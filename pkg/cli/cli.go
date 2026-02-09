@@ -1857,14 +1857,63 @@ func (c *CLI) showInterfaces(args []string) error {
 		return fmt.Errorf("interface %s not found in configuration", filterName)
 	}
 
+	// Build physical interface -> VLAN info from config
+	type logicalIface struct {
+		zoneName string
+		physName string
+		unitNum  int
+		vlanID   int
+	}
+	var logicals []logicalIface
+
 	for _, ifaceName := range ifaceNames {
 		zoneName := ifaceZone[ifaceName]
+		// Parse "enp6s0.100" into physical + unit
+		parts := strings.SplitN(ifaceName, ".", 2)
+		physName := parts[0]
+		unitNum := 0
+		if len(parts) == 2 {
+			unitNum, _ = strconv.Atoi(parts[1])
+		}
+		// Resolve VLAN ID from interface config
+		vlanID := 0
+		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+			if unit, ok := ifCfg.Units[unitNum]; ok {
+				vlanID = unit.VlanID
+			}
+		}
+		logicals = append(logicals, logicalIface{
+			zoneName: zoneName,
+			physName: physName,
+			unitNum:  unitNum,
+			vlanID:   vlanID,
+		})
+	}
+
+	// Group logicals by physical interface
+	physGroups := make(map[string][]logicalIface)
+	var physOrder []string
+	for _, li := range logicals {
+		if _, seen := physGroups[li.physName]; !seen {
+			physOrder = append(physOrder, li.physName)
+		}
+		physGroups[li.physName] = append(physGroups[li.physName], li)
+	}
+
+	for _, physName := range physOrder {
+		group := physGroups[physName]
 
 		// Query live system for link info
-		iface, err := net.InterfaceByName(ifaceName)
+		iface, err := net.InterfaceByName(physName)
 		if err != nil {
-			fmt.Printf("Physical interface: %s, Not present\n", ifaceName)
-			fmt.Printf("  Security zone: %s\n", zoneName)
+			fmt.Printf("Physical interface: %s, Not present\n", physName)
+			for _, li := range group {
+				fmt.Printf("  Security zone: %s (unit %d", li.zoneName, li.unitNum)
+				if li.vlanID > 0 {
+					fmt.Printf(", vlan-id %d", li.vlanID)
+				}
+				fmt.Println(")")
+			}
 			fmt.Println()
 			continue
 		}
@@ -1878,11 +1927,19 @@ func (c *CLI) showInterfaces(args []string) error {
 			enabled = "Disabled"
 		}
 
+		// Check if vlan-tagging is enabled
+		vlanTagging := false
+		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+			vlanTagging = ifCfg.VlanTagging
+		}
+
 		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n",
-			ifaceName, enabled, upDown)
+			physName, enabled, upDown)
 		fmt.Printf("  Link-level type: Ethernet, MTU: %d, MAC: %s\n",
 			iface.MTU, iface.HardwareAddr)
-		fmt.Printf("  Security zone: %s\n", zoneName)
+		if vlanTagging {
+			fmt.Println("  VLAN tagging: Enabled")
+		}
 
 		// Traffic counters from BPF map
 		if c.dp != nil && c.dp.IsLoaded() {
@@ -1896,21 +1953,39 @@ func (c *CLI) showInterfaces(args []string) error {
 			}
 		}
 
-		// Addresses
-		addrs, err := iface.Addrs()
-		if err == nil && len(addrs) > 0 {
-			fmt.Printf("\n  Logical interface %s.0\n", ifaceName)
-			fmt.Println("    Addresses:")
-			for _, addr := range addrs {
-				ipNet, ok := addr.(*net.IPNet)
-				if !ok {
-					continue
-				}
-				ones, _ := ipNet.Mask.Size()
-				if ipNet.IP.To4() != nil {
-					fmt.Printf("      inet  %s/%d\n", ipNet.IP, ones)
-				} else {
-					fmt.Printf("      inet6 %s/%d\n", ipNet.IP, ones)
+		// Show each logical unit
+		for _, li := range group {
+			lookupName := physName
+			if li.vlanID > 0 {
+				lookupName = fmt.Sprintf("%s.%d", physName, li.vlanID)
+			}
+
+			fmt.Printf("\n  Logical interface %s.%d", physName, li.unitNum)
+			if li.vlanID > 0 {
+				fmt.Printf(" (vlan-id %d)", li.vlanID)
+			}
+			fmt.Printf(", Zone: %s\n", li.zoneName)
+
+			// Look up addresses from the logical/sub-interface
+			liface, err := net.InterfaceByName(lookupName)
+			if err != nil {
+				// Fall back to physical interface
+				liface = iface
+			}
+			addrs, err := liface.Addrs()
+			if err == nil && len(addrs) > 0 {
+				fmt.Println("    Addresses:")
+				for _, addr := range addrs {
+					ipNet, ok := addr.(*net.IPNet)
+					if !ok {
+						continue
+					}
+					ones, _ := ipNet.Mask.Size()
+					if ipNet.IP.To4() != nil {
+						fmt.Printf("      inet  %s/%d\n", ipNet.IP, ones)
+					} else {
+						fmt.Printf("      inet6 %s/%d\n", ipNet.IP, ones)
+					}
 				}
 			}
 		}
@@ -2185,6 +2260,7 @@ func (c *CLI) showOperationalHelp() {
 	fmt.Println("  show security                      Show security information")
 	fmt.Println("  show security ipsec                Show IPsec VPN status")
 	fmt.Println("  show security log [N]              Show recent security events")
+	fmt.Println("  show interfaces [name]             Show interfaces (VLAN support)")
 	fmt.Println("  show interfaces tunnel             Show tunnel interfaces")
 	fmt.Println("  show protocols ospf neighbor       Show OSPF neighbors")
 	fmt.Println("  show protocols bgp summary         Show BGP peer summary")

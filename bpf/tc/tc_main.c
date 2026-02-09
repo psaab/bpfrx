@@ -25,12 +25,13 @@ int tc_main_prog(struct __sk_buff *skb)
 	__builtin_memset(meta, 0, sizeof(*meta));
 	meta->direction = 1; /* egress */
 
-	/* Parse Ethernet header */
+	/* Parse Ethernet header (extract VLAN ID for zone lookup) */
 	struct ethhdr *eth = data;
 	if ((void *)(eth + 1) > data_end)
 		return TC_ACT_OK;
 
 	__u16 eth_proto = bpf_ntohs(eth->h_proto);
+	__u16 vlan_id = 0;
 	meta->l3_offset = sizeof(struct ethhdr);
 
 	/* Handle one level of VLAN */
@@ -38,6 +39,7 @@ int tc_main_prog(struct __sk_buff *skb)
 		struct vlan_hdr *vlan = data + sizeof(struct ethhdr);
 		if ((void *)(vlan + 1) > data_end)
 			return TC_ACT_OK;
+		vlan_id = bpf_ntohs(vlan->h_vlan_TCI) & 0x0FFF;
 		eth_proto = bpf_ntohs(vlan->h_vlan_encapsulated_proto);
 		meta->l3_offset += sizeof(struct vlan_hdr);
 	}
@@ -63,9 +65,12 @@ int tc_main_prog(struct __sk_buff *skb)
 	inc_counter(GLOBAL_CTR_TC_EGRESS_PACKETS);
 	inc_iface_tx(skb->ifindex, meta->pkt_len);
 
-	/* Look up egress zone from outgoing interface */
-	__u32 ifindex = skb->ifindex;
-	__u16 *zone_ptr = bpf_map_lookup_elem(&iface_zone_map, &ifindex);
+	/* Look up egress zone from {ifindex, vlan_id} composite key */
+	struct iface_zone_key zk = {
+		.ifindex = skb->ifindex,
+		.vlan_id = vlan_id,
+	};
+	__u16 *zone_ptr = bpf_map_lookup_elem(&iface_zone_map, &zk);
 	if (zone_ptr)
 		meta->egress_zone = *zone_ptr;
 

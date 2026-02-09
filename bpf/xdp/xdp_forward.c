@@ -89,6 +89,14 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		return XDP_PASS;
 	}
 
+	/* Push VLAN tag if egress is a VLAN sub-interface */
+	if (meta->egress_vlan_id != 0) {
+		if (xdp_vlan_tag_push(ctx, meta->egress_vlan_id) < 0)
+			return XDP_DROP;
+		data     = (void *)(long)ctx->data;
+		data_end = (void *)(long)ctx->data_end;
+	}
+
 	/* Rewrite Ethernet header */
 	struct ethhdr *eth = data;
 	if ((void *)(eth + 1) > data_end)
@@ -97,13 +105,18 @@ int xdp_forward_prog(struct xdp_md *ctx)
 	__builtin_memcpy(eth->h_dest, meta->fwd_dmac, ETH_ALEN);
 	__builtin_memcpy(eth->h_source, meta->fwd_smac, ETH_ALEN);
 
+	/* Compute L3 offset: 14 + optional 4-byte VLAN header */
+	__u16 l3_off = sizeof(struct ethhdr);
+	if (meta->egress_vlan_id != 0)
+		l3_off += sizeof(struct vlan_hdr);
+
 	/* Bound l3_offset for verifier */
-	if (meta->l3_offset >= 64)
+	if (l3_off >= 64)
 		return XDP_DROP;
 
 	if (meta->addr_family == AF_INET) {
 		/* IPv4: Decrement TTL + update IP checksum */
-		struct iphdr *iph = data + meta->l3_offset;
+		struct iphdr *iph = data + l3_off;
 		if ((void *)(iph + 1) > data_end)
 			return XDP_DROP;
 
@@ -117,7 +130,7 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		csum_update_2(&iph->check, old_ttl_proto, new_ttl_proto);
 	} else {
 		/* IPv6: Decrement hop_limit (no checksum update needed) */
-		struct ipv6hdr *ip6h = data + meta->l3_offset;
+		struct ipv6hdr *ip6h = data + l3_off;
 		if ((void *)(ip6h + 1) > data_end)
 			return XDP_DROP;
 

@@ -108,13 +108,60 @@ func (m *Manager) DetachXDP(ifindex int) error {
 	return nil
 }
 
-// SetZone maps an interface to a security zone in the BPF map.
-func (m *Manager) SetZone(ifindex int, zoneID uint16) error {
+// SetZone maps an {ifindex, vlanID} to a security zone in the BPF map.
+func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16) error {
 	zm, ok := m.maps["iface_zone_map"]
 	if !ok {
 		return fmt.Errorf("iface_zone_map not found")
 	}
-	return zm.Update(uint32(ifindex), zoneID, ebpf.UpdateAny)
+	key := IfaceZoneKey{Ifindex: uint32(ifindex), VlanID: vlanID}
+	return zm.Update(key, zoneID, ebpf.UpdateAny)
+}
+
+// SetVlanIfaceInfo maps a VLAN sub-interface ifindex to its parent info.
+func (m *Manager) SetVlanIfaceInfo(subIfindex int, parentIfindex int, vlanID uint16) error {
+	zm, ok := m.maps["vlan_iface_map"]
+	if !ok {
+		return fmt.Errorf("vlan_iface_map not found")
+	}
+	val := VlanIfaceInfo{ParentIfindex: uint32(parentIfindex), VlanID: vlanID}
+	return zm.Update(uint32(subIfindex), val, ebpf.UpdateAny)
+}
+
+// ClearIfaceZoneMap deletes all iface_zone_map entries.
+func (m *Manager) ClearIfaceZoneMap() error {
+	zm, ok := m.maps["iface_zone_map"]
+	if !ok {
+		return fmt.Errorf("iface_zone_map not found")
+	}
+	var key IfaceZoneKey
+	iter := zm.Iterate()
+	var keys []IfaceZoneKey
+	for iter.Next(&key, nil) {
+		keys = append(keys, key)
+	}
+	for _, k := range keys {
+		zm.Delete(k)
+	}
+	return nil
+}
+
+// ClearVlanIfaceMap deletes all vlan_iface_map entries.
+func (m *Manager) ClearVlanIfaceMap() error {
+	zm, ok := m.maps["vlan_iface_map"]
+	if !ok {
+		return fmt.Errorf("vlan_iface_map not found")
+	}
+	var key uint32
+	iter := zm.Iterate()
+	var keys []uint32
+	for iter.Next(&key, nil) {
+		keys = append(keys, key)
+	}
+	for _, k := range keys {
+		zm.Delete(k)
+	}
+	return nil
 }
 
 // AddTxPort adds an interface to the devmap for XDP_REDIRECT.

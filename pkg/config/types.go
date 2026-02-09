@@ -247,14 +247,16 @@ type InterfacesConfig struct {
 
 // InterfaceConfig represents a network interface.
 type InterfaceConfig struct {
-	Name   string
-	Units  map[int]*InterfaceUnit
-	Tunnel *TunnelConfig // non-nil for tunnel interfaces (gre0, etc.)
+	Name        string
+	VlanTagging bool // 802.1Q trunk mode
+	Units       map[int]*InterfaceUnit
+	Tunnel      *TunnelConfig // non-nil for tunnel interfaces (gre0, etc.)
 }
 
 // InterfaceUnit represents a logical unit on an interface.
 type InterfaceUnit struct {
 	Number    int
+	VlanID    int      // 0 = native/untagged, >0 = 802.1Q tagged
 	Addresses []string // CIDR notation
 }
 
