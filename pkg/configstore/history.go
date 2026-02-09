@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/psviderski/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/config"
 )
 
 // HistoryEntry is a snapshot of a committed configuration.

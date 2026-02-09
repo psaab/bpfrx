@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/psviderski/bpfrx/pkg/dataplane"
+	"github.com/psaab/bpfrx/pkg/dataplane"
 	"golang.org/x/sys/unix"
 )
 

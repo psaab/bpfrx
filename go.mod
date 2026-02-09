@@ -1,4 +1,4 @@
-module github.com/psviderski/bpfrx
+module github.com/psaab/bpfrx
 
 go 1.24.9
 

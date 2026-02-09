@@ -7,7 +7,7 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/psviderski/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )

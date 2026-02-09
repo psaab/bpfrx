@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/psviderski/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/config"
 )
 
 // Store manages the candidate and active configuration.

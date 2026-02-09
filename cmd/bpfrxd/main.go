@@ -11,7 +11,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/psviderski/bpfrx/pkg/daemon"
+	"github.com/psaab/bpfrx/pkg/daemon"
 )
 
 func main() {

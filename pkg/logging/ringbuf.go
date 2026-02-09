@@ -13,7 +13,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
-	"github.com/psviderski/bpfrx/pkg/dataplane"
+	"github.com/psaab/bpfrx/pkg/dataplane"
 )
 
 // EventReader reads events from the eBPF ring buffer.

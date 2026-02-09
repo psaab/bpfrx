@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/psviderski/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/config"
 )
 
 // CompileResult holds the result of a config compilation for reference.

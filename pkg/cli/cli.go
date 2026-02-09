@@ -12,13 +12,13 @@ import (
 	"strings"
 
 	"github.com/chzyer/readline"
-	"github.com/psviderski/bpfrx/pkg/config"
-	"github.com/psviderski/bpfrx/pkg/configstore"
-	"github.com/psviderski/bpfrx/pkg/dataplane"
-	"github.com/psviderski/bpfrx/pkg/frr"
-	"github.com/psviderski/bpfrx/pkg/ipsec"
-	"github.com/psviderski/bpfrx/pkg/logging"
-	"github.com/psviderski/bpfrx/pkg/routing"
+	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/configstore"
+	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/bpfrx/pkg/frr"
+	"github.com/psaab/bpfrx/pkg/ipsec"
+	"github.com/psaab/bpfrx/pkg/logging"
+	"github.com/psaab/bpfrx/pkg/routing"
 )
 
 // CLI is the interactive command-line interface.
