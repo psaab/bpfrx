@@ -661,12 +661,13 @@ func (c *ctl) showRoutes() error {
 		return fmt.Errorf("%v", err)
 	}
 	if len(resp.Routes) == 0 {
-		fmt.Println("No static routes configured")
+		fmt.Println("No routes")
 		return nil
 	}
-	fmt.Printf("  %-24s %-20s %-14s %s\n", "Destination", "Next-hop", "Interface", "Pref")
+	fmt.Println("Routing table:")
+	fmt.Printf("  %-24s %-20s %-14s %-12s %s\n", "Destination", "Next-hop", "Interface", "Proto", "Pref")
 	for _, r := range resp.Routes {
-		fmt.Printf("  %-24s %-20s %-14s %d\n", r.Destination, r.NextHop, r.Interface, r.Preference)
+		fmt.Printf("  %-24s %-20s %-14s %-12s %d\n", r.Destination, r.NextHop, r.Interface, r.Protocol, r.Preference)
 	}
 	return nil
 }

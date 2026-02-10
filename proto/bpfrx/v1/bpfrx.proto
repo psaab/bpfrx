@@ -343,6 +343,7 @@ message RouteInfo {
   string next_hop = 2;
   string interface = 3;
   int32 preference = 4;
+  string protocol = 5;
 }
 
 message GetOSPFStatusRequest { string type = 1; }

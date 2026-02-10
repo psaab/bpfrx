@@ -1012,18 +1012,23 @@ func (s *Server) ClearDHCPClientIdentifier(_ context.Context, req *pb.ClearDHCPC
 }
 
 func (s *Server) GetRoutes(_ context.Context, _ *pb.GetRoutesRequest) (*pb.GetRoutesResponse, error) {
-	cfg := s.store.ActiveConfig()
-	if cfg == nil {
+	if s.routing == nil {
 		return &pb.GetRoutesResponse{}, nil
 	}
 
+	entries, err := s.routing.GetRoutes()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "get routes: %v", err)
+	}
+
 	resp := &pb.GetRoutesResponse{}
-	for _, r := range cfg.RoutingOptions.StaticRoutes {
+	for _, e := range entries {
 		resp.Routes = append(resp.Routes, &pb.RouteInfo{
-			Destination: r.Destination,
-			NextHop:     r.NextHop,
-			Interface:   r.Interface,
-			Preference:  int32(r.Preference),
+			Destination: e.Destination,
+			NextHop:     e.NextHop,
+			Interface:   e.Interface,
+			Preference:  int32(e.Preference),
+			Protocol:    e.Protocol,
 		})
 	}
 	return resp, nil

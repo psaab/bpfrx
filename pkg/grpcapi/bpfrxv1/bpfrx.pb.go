@@ -3863,6 +3863,7 @@ type RouteInfo struct {
 	NextHop       string                 `protobuf:"bytes,2,opt,name=next_hop,json=nextHop,proto3" json:"next_hop,omitempty"`
 	Interface     string                 `protobuf:"bytes,3,opt,name=interface,proto3" json:"interface,omitempty"`
 	Preference    int32                  `protobuf:"varint,4,opt,name=preference,proto3" json:"preference,omitempty"`
+	Protocol      string                 `protobuf:"bytes,5,opt,name=protocol,proto3" json:"protocol,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3923,6 +3924,13 @@ func (x *RouteInfo) GetPreference() int32 {
 		return x.Preference
 	}
 	return 0
+}
+
+func (x *RouteInfo) GetProtocol() string {
+	if x != nil {
+		return x.Protocol
+	}
+	return ""
 }
 
 type GetOSPFStatusRequest struct {
@@ -4690,14 +4698,15 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\amessage\x18\x01 \x01(\tR\amessage\"\x12\n" +
 	"\x10GetRoutesRequest\"@\n" +
 	"\x11GetRoutesResponse\x12+\n" +
-	"\x06routes\x18\x01 \x03(\v2\x13.bpfrx.v1.RouteInfoR\x06routes\"\x86\x01\n" +
+	"\x06routes\x18\x01 \x03(\v2\x13.bpfrx.v1.RouteInfoR\x06routes\"\xa2\x01\n" +
 	"\tRouteInfo\x12 \n" +
 	"\vdestination\x18\x01 \x01(\tR\vdestination\x12\x19\n" +
 	"\bnext_hop\x18\x02 \x01(\tR\anextHop\x12\x1c\n" +
 	"\tinterface\x18\x03 \x01(\tR\tinterface\x12\x1e\n" +
 	"\n" +
 	"preference\x18\x04 \x01(\x05R\n" +
-	"preference\"*\n" +
+	"preference\x12\x1a\n" +
+	"\bprotocol\x18\x05 \x01(\tR\bprotocol\"*\n" +
 	"\x14GetOSPFStatusRequest\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\"/\n" +
 	"\x15GetOSPFStatusResponse\x12\x16\n" +
