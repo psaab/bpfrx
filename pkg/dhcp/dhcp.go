@@ -5,16 +5,20 @@ package dhcp
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4/nclient4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/insomniacslk/dhcp/dhcpv6/nclient6"
+	"github.com/insomniacslk/dhcp/iana"
 	"github.com/vishvananda/netlink"
 )
 
@@ -52,14 +56,18 @@ type Manager struct {
 	mu              sync.Mutex
 	clients         map[clientKey]*dhcpClient
 	leases          map[clientKey]*Lease
+	duids           map[string]dhcpv6.DUID // interface name -> cached DUID
+	duidTypes       map[string]string      // interface name -> "duid-ll" or "duid-llt"
 	onAddressChange func()
 	nlHandle        *netlink.Handle
 	recompileTimer  *time.Timer
+	stateDir        string
 }
 
-// New creates a DHCP manager. The onAddressChange callback is called
-// (debounced by 2 seconds) when a lease changes an interface address.
-func New(onAddressChange func()) (*Manager, error) {
+// New creates a DHCP manager. stateDir is where DUID files are persisted.
+// The onAddressChange callback is called (debounced by 2 seconds) when a
+// lease changes an interface address.
+func New(stateDir string, onAddressChange func()) (*Manager, error) {
 	nlh, err := netlink.NewHandle()
 	if err != nil {
 		return nil, fmt.Errorf("netlink handle: %w", err)
@@ -67,9 +75,20 @@ func New(onAddressChange func()) (*Manager, error) {
 	return &Manager{
 		clients:         make(map[clientKey]*dhcpClient),
 		leases:          make(map[clientKey]*Lease),
+		duids:           make(map[string]dhcpv6.DUID),
+		duidTypes:       make(map[string]string),
 		onAddressChange: onAddressChange,
 		nlHandle:        nlh,
+		stateDir:        stateDir,
 	}, nil
+}
+
+// SetDUIDType configures the DUID type for an interface's DHCPv6 client.
+// Must be called before Start(). Valid types: "duid-ll", "duid-llt".
+func (m *Manager) SetDUIDType(ifaceName, duidType string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.duidTypes[ifaceName] = duidType
 }
 
 // Start begins a DHCP client for the given interface and address family.
@@ -128,6 +147,147 @@ func (m *Manager) Close() {
 	if m.nlHandle != nil {
 		m.nlHandle.Close()
 	}
+}
+
+// DUIDInfo holds information about a DHCPv6 DUID for display.
+type DUIDInfo struct {
+	Interface string
+	Type      string // "DUID-LL" or "DUID-LLT"
+	HexBytes  string
+	Display   string
+}
+
+// DUIDs returns information about all configured/persisted DHCPv6 DUIDs.
+func (m *Manager) DUIDs() []DUIDInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var result []DUIDInfo
+	for ifName := range m.duidTypes {
+		duid := m.duids[ifName]
+		if duid == nil {
+			// Try loading from disk
+			if d, err := m.loadDUID(ifName); err == nil {
+				duid = d
+			}
+		}
+		if duid != nil {
+			result = append(result, DUIDInfo{
+				Interface: ifName,
+				Type:      duid.DUIDType().String(),
+				HexBytes:  hex.EncodeToString(duid.ToBytes()),
+				Display:   duid.String(),
+			})
+		}
+	}
+	return result
+}
+
+// ClearDUID removes the persisted DUID for an interface. The next DHCPv6
+// request will generate a fresh DUID.
+func (m *Manager) ClearDUID(ifaceName string) error {
+	m.mu.Lock()
+	delete(m.duids, ifaceName)
+	m.mu.Unlock()
+
+	path := m.duidPath(ifaceName)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	slog.Info("DHCPv6: DUID cleared", "interface", ifaceName)
+	return nil
+}
+
+// ClearAllDUIDs removes all persisted DUIDs.
+func (m *Manager) ClearAllDUIDs() {
+	m.mu.Lock()
+	ifaces := make([]string, 0, len(m.duids))
+	for k := range m.duids {
+		ifaces = append(ifaces, k)
+	}
+	m.mu.Unlock()
+
+	for _, ifName := range ifaces {
+		m.ClearDUID(ifName)
+	}
+}
+
+// getDUID returns the DUID for an interface, loading from disk or generating
+// a new one as needed. The result is cached in memory and persisted.
+func (m *Manager) getDUID(ifaceName string) (dhcpv6.DUID, error) {
+	m.mu.Lock()
+	if d, ok := m.duids[ifaceName]; ok {
+		m.mu.Unlock()
+		return d, nil
+	}
+	duidType := m.duidTypes[ifaceName]
+	m.mu.Unlock()
+
+	// Try loading persisted DUID
+	if d, err := m.loadDUID(ifaceName); err == nil {
+		m.mu.Lock()
+		m.duids[ifaceName] = d
+		m.mu.Unlock()
+		slog.Info("DHCPv6: loaded persisted DUID",
+			"interface", ifaceName, "duid", d)
+		return d, nil
+	}
+
+	// Generate new DUID
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return nil, fmt.Errorf("interface lookup for DUID: %w", err)
+	}
+
+	var duid dhcpv6.DUID
+	switch duidType {
+	case "duid-llt":
+		// Time-based — stable only via persistence
+		epoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+		duid = &dhcpv6.DUIDLLT{
+			HWType:        iana.HWTypeEthernet,
+			Time:          uint32(time.Since(epoch).Seconds()),
+			LinkLayerAddr: iface.HardwareAddr,
+		}
+	default: // "duid-ll" or empty (default to LL)
+		duid = &dhcpv6.DUIDLL{
+			HWType:        iana.HWTypeEthernet,
+			LinkLayerAddr: iface.HardwareAddr,
+		}
+	}
+
+	// Persist
+	if err := m.saveDUID(ifaceName, duid); err != nil {
+		slog.Warn("DHCPv6: failed to persist DUID",
+			"interface", ifaceName, "err", err)
+	}
+
+	m.mu.Lock()
+	m.duids[ifaceName] = duid
+	m.mu.Unlock()
+
+	slog.Info("DHCPv6: generated DUID",
+		"interface", ifaceName, "duid", duid)
+	return duid, nil
+}
+
+func (m *Manager) duidPath(ifaceName string) string {
+	return filepath.Join(m.stateDir, "dhcpv6-duid-"+ifaceName)
+}
+
+func (m *Manager) loadDUID(ifaceName string) (dhcpv6.DUID, error) {
+	data, err := os.ReadFile(m.duidPath(ifaceName))
+	if err != nil {
+		return nil, err
+	}
+	return dhcpv6.DUIDFromBytes(data)
+}
+
+func (m *Manager) saveDUID(ifaceName string, duid dhcpv6.DUID) error {
+	if err := os.MkdirAll(m.stateDir, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(m.duidPath(ifaceName), duid.ToBytes(), 0644)
 }
 
 // Leases returns a snapshot of all current DHCP leases.
@@ -367,11 +527,6 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 
 // doDHCPv6 performs a single DHCPv6 solicit/request exchange.
 func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*Lease, error) {
-	iface, err := net.InterfaceByName(ifaceName)
-	if err != nil {
-		return nil, fmt.Errorf("interface lookup: %w", err)
-	}
-
 	client, err := nclient6.New(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("create DHCPv6 client: %w", err)
@@ -381,21 +536,24 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*Lease, error
 	exCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	// Try rapid solicit first
-	adv, err := client.RapidSolicit(exCtx)
+	// Build modifiers — use persistent DUID if configured
+	var mods []dhcpv6.Modifier
+	if duid, err := m.getDUID(ifaceName); err == nil {
+		mods = append(mods, dhcpv6.WithClientID(duid))
+	}
+
+	adv, err := client.RapidSolicit(exCtx, mods...)
 	if err != nil {
 		return nil, fmt.Errorf("DHCPv6 solicit: %w", err)
 	}
-
-	_ = iface
 
 	// Extract IA_NA addresses
 	var addr netip.Addr
 	var validLT time.Duration
 
 	for _, opt := range adv.Options.Options {
-		if iana, ok := opt.(*dhcpv6.OptIANA); ok {
-			for _, subOpt := range iana.Options.Options {
+		if ianaOpt, ok := opt.(*dhcpv6.OptIANA); ok {
+			for _, subOpt := range ianaOpt.Options.Options {
 				if iaaddr, ok := subOpt.(*dhcpv6.OptIAAddress); ok {
 					if a, ok2 := netip.AddrFromSlice(iaaddr.IPv6Addr); ok2 {
 						addr = a

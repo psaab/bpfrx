@@ -256,11 +256,17 @@ type InterfaceConfig struct {
 
 // InterfaceUnit represents a logical unit on an interface.
 type InterfaceUnit struct {
-	Number    int
-	VlanID    int      // 0 = native/untagged, >0 = 802.1Q tagged
-	Addresses []string // CIDR notation
-	DHCP      bool     // family inet { dhcp; }
-	DHCPv6    bool     // family inet6 { dhcpv6; }
+	Number       int
+	VlanID       int      // 0 = native/untagged, >0 = 802.1Q tagged
+	Addresses    []string // CIDR notation
+	DHCP         bool     // family inet { dhcp; }
+	DHCPv6       bool     // family inet6 { dhcpv6; }
+	DHCPv6Client *DHCPv6ClientConfig
+}
+
+// DHCPv6ClientConfig holds DHCPv6 client options (dhcpv6-client stanza).
+type DHCPv6ClientConfig struct {
+	DUIDType string // "duid-ll" or "duid-llt"
 }
 
 // ApplicationsConfig holds application definitions.

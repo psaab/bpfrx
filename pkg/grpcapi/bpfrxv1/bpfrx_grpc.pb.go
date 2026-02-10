@@ -19,39 +19,41 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	BpfrxService_EnterConfigure_FullMethodName      = "/bpfrx.v1.BpfrxService/EnterConfigure"
-	BpfrxService_ExitConfigure_FullMethodName       = "/bpfrx.v1.BpfrxService/ExitConfigure"
-	BpfrxService_GetConfigModeStatus_FullMethodName = "/bpfrx.v1.BpfrxService/GetConfigModeStatus"
-	BpfrxService_Set_FullMethodName                 = "/bpfrx.v1.BpfrxService/Set"
-	BpfrxService_Delete_FullMethodName              = "/bpfrx.v1.BpfrxService/Delete"
-	BpfrxService_Commit_FullMethodName              = "/bpfrx.v1.BpfrxService/Commit"
-	BpfrxService_CommitCheck_FullMethodName         = "/bpfrx.v1.BpfrxService/CommitCheck"
-	BpfrxService_CommitConfirmed_FullMethodName     = "/bpfrx.v1.BpfrxService/CommitConfirmed"
-	BpfrxService_ConfirmCommit_FullMethodName       = "/bpfrx.v1.BpfrxService/ConfirmCommit"
-	BpfrxService_Rollback_FullMethodName            = "/bpfrx.v1.BpfrxService/Rollback"
-	BpfrxService_ShowConfig_FullMethodName          = "/bpfrx.v1.BpfrxService/ShowConfig"
-	BpfrxService_ShowCompare_FullMethodName         = "/bpfrx.v1.BpfrxService/ShowCompare"
-	BpfrxService_ShowRollback_FullMethodName        = "/bpfrx.v1.BpfrxService/ShowRollback"
-	BpfrxService_ListHistory_FullMethodName         = "/bpfrx.v1.BpfrxService/ListHistory"
-	BpfrxService_GetStatus_FullMethodName           = "/bpfrx.v1.BpfrxService/GetStatus"
-	BpfrxService_GetGlobalStats_FullMethodName      = "/bpfrx.v1.BpfrxService/GetGlobalStats"
-	BpfrxService_GetZones_FullMethodName            = "/bpfrx.v1.BpfrxService/GetZones"
-	BpfrxService_GetPolicies_FullMethodName         = "/bpfrx.v1.BpfrxService/GetPolicies"
-	BpfrxService_GetSessions_FullMethodName         = "/bpfrx.v1.BpfrxService/GetSessions"
-	BpfrxService_GetSessionSummary_FullMethodName   = "/bpfrx.v1.BpfrxService/GetSessionSummary"
-	BpfrxService_GetNATSource_FullMethodName        = "/bpfrx.v1.BpfrxService/GetNATSource"
-	BpfrxService_GetNATDestination_FullMethodName   = "/bpfrx.v1.BpfrxService/GetNATDestination"
-	BpfrxService_GetScreen_FullMethodName           = "/bpfrx.v1.BpfrxService/GetScreen"
-	BpfrxService_GetEvents_FullMethodName           = "/bpfrx.v1.BpfrxService/GetEvents"
-	BpfrxService_GetInterfaces_FullMethodName       = "/bpfrx.v1.BpfrxService/GetInterfaces"
-	BpfrxService_GetDHCPLeases_FullMethodName       = "/bpfrx.v1.BpfrxService/GetDHCPLeases"
-	BpfrxService_GetRoutes_FullMethodName           = "/bpfrx.v1.BpfrxService/GetRoutes"
-	BpfrxService_GetOSPFStatus_FullMethodName       = "/bpfrx.v1.BpfrxService/GetOSPFStatus"
-	BpfrxService_GetBGPStatus_FullMethodName        = "/bpfrx.v1.BpfrxService/GetBGPStatus"
-	BpfrxService_GetIPsecSA_FullMethodName          = "/bpfrx.v1.BpfrxService/GetIPsecSA"
-	BpfrxService_ClearSessions_FullMethodName       = "/bpfrx.v1.BpfrxService/ClearSessions"
-	BpfrxService_ClearCounters_FullMethodName       = "/bpfrx.v1.BpfrxService/ClearCounters"
-	BpfrxService_Complete_FullMethodName            = "/bpfrx.v1.BpfrxService/Complete"
+	BpfrxService_EnterConfigure_FullMethodName            = "/bpfrx.v1.BpfrxService/EnterConfigure"
+	BpfrxService_ExitConfigure_FullMethodName             = "/bpfrx.v1.BpfrxService/ExitConfigure"
+	BpfrxService_GetConfigModeStatus_FullMethodName       = "/bpfrx.v1.BpfrxService/GetConfigModeStatus"
+	BpfrxService_Set_FullMethodName                       = "/bpfrx.v1.BpfrxService/Set"
+	BpfrxService_Delete_FullMethodName                    = "/bpfrx.v1.BpfrxService/Delete"
+	BpfrxService_Commit_FullMethodName                    = "/bpfrx.v1.BpfrxService/Commit"
+	BpfrxService_CommitCheck_FullMethodName               = "/bpfrx.v1.BpfrxService/CommitCheck"
+	BpfrxService_CommitConfirmed_FullMethodName           = "/bpfrx.v1.BpfrxService/CommitConfirmed"
+	BpfrxService_ConfirmCommit_FullMethodName             = "/bpfrx.v1.BpfrxService/ConfirmCommit"
+	BpfrxService_Rollback_FullMethodName                  = "/bpfrx.v1.BpfrxService/Rollback"
+	BpfrxService_ShowConfig_FullMethodName                = "/bpfrx.v1.BpfrxService/ShowConfig"
+	BpfrxService_ShowCompare_FullMethodName               = "/bpfrx.v1.BpfrxService/ShowCompare"
+	BpfrxService_ShowRollback_FullMethodName              = "/bpfrx.v1.BpfrxService/ShowRollback"
+	BpfrxService_ListHistory_FullMethodName               = "/bpfrx.v1.BpfrxService/ListHistory"
+	BpfrxService_GetStatus_FullMethodName                 = "/bpfrx.v1.BpfrxService/GetStatus"
+	BpfrxService_GetGlobalStats_FullMethodName            = "/bpfrx.v1.BpfrxService/GetGlobalStats"
+	BpfrxService_GetZones_FullMethodName                  = "/bpfrx.v1.BpfrxService/GetZones"
+	BpfrxService_GetPolicies_FullMethodName               = "/bpfrx.v1.BpfrxService/GetPolicies"
+	BpfrxService_GetSessions_FullMethodName               = "/bpfrx.v1.BpfrxService/GetSessions"
+	BpfrxService_GetSessionSummary_FullMethodName         = "/bpfrx.v1.BpfrxService/GetSessionSummary"
+	BpfrxService_GetNATSource_FullMethodName              = "/bpfrx.v1.BpfrxService/GetNATSource"
+	BpfrxService_GetNATDestination_FullMethodName         = "/bpfrx.v1.BpfrxService/GetNATDestination"
+	BpfrxService_GetScreen_FullMethodName                 = "/bpfrx.v1.BpfrxService/GetScreen"
+	BpfrxService_GetEvents_FullMethodName                 = "/bpfrx.v1.BpfrxService/GetEvents"
+	BpfrxService_GetInterfaces_FullMethodName             = "/bpfrx.v1.BpfrxService/GetInterfaces"
+	BpfrxService_GetDHCPLeases_FullMethodName             = "/bpfrx.v1.BpfrxService/GetDHCPLeases"
+	BpfrxService_GetDHCPClientIdentifiers_FullMethodName  = "/bpfrx.v1.BpfrxService/GetDHCPClientIdentifiers"
+	BpfrxService_GetRoutes_FullMethodName                 = "/bpfrx.v1.BpfrxService/GetRoutes"
+	BpfrxService_GetOSPFStatus_FullMethodName             = "/bpfrx.v1.BpfrxService/GetOSPFStatus"
+	BpfrxService_GetBGPStatus_FullMethodName              = "/bpfrx.v1.BpfrxService/GetBGPStatus"
+	BpfrxService_GetIPsecSA_FullMethodName                = "/bpfrx.v1.BpfrxService/GetIPsecSA"
+	BpfrxService_ClearSessions_FullMethodName             = "/bpfrx.v1.BpfrxService/ClearSessions"
+	BpfrxService_ClearCounters_FullMethodName             = "/bpfrx.v1.BpfrxService/ClearCounters"
+	BpfrxService_ClearDHCPClientIdentifier_FullMethodName = "/bpfrx.v1.BpfrxService/ClearDHCPClientIdentifier"
+	BpfrxService_Complete_FullMethodName                  = "/bpfrx.v1.BpfrxService/Complete"
 )
 
 // BpfrxServiceClient is the client API for BpfrxService service.
@@ -88,6 +90,7 @@ type BpfrxServiceClient interface {
 	GetEvents(ctx context.Context, in *GetEventsRequest, opts ...grpc.CallOption) (*GetEventsResponse, error)
 	GetInterfaces(ctx context.Context, in *GetInterfacesRequest, opts ...grpc.CallOption) (*GetInterfacesResponse, error)
 	GetDHCPLeases(ctx context.Context, in *GetDHCPLeasesRequest, opts ...grpc.CallOption) (*GetDHCPLeasesResponse, error)
+	GetDHCPClientIdentifiers(ctx context.Context, in *GetDHCPClientIdentifiersRequest, opts ...grpc.CallOption) (*GetDHCPClientIdentifiersResponse, error)
 	GetRoutes(ctx context.Context, in *GetRoutesRequest, opts ...grpc.CallOption) (*GetRoutesResponse, error)
 	GetOSPFStatus(ctx context.Context, in *GetOSPFStatusRequest, opts ...grpc.CallOption) (*GetOSPFStatusResponse, error)
 	GetBGPStatus(ctx context.Context, in *GetBGPStatusRequest, opts ...grpc.CallOption) (*GetBGPStatusResponse, error)
@@ -95,6 +98,7 @@ type BpfrxServiceClient interface {
 	// Mutations
 	ClearSessions(ctx context.Context, in *ClearSessionsRequest, opts ...grpc.CallOption) (*ClearSessionsResponse, error)
 	ClearCounters(ctx context.Context, in *ClearCountersRequest, opts ...grpc.CallOption) (*ClearCountersResponse, error)
+	ClearDHCPClientIdentifier(ctx context.Context, in *ClearDHCPClientIdentifierRequest, opts ...grpc.CallOption) (*ClearDHCPClientIdentifierResponse, error)
 	// Tab completion
 	Complete(ctx context.Context, in *CompleteRequest, opts ...grpc.CallOption) (*CompleteResponse, error)
 }
@@ -367,6 +371,16 @@ func (c *bpfrxServiceClient) GetDHCPLeases(ctx context.Context, in *GetDHCPLease
 	return out, nil
 }
 
+func (c *bpfrxServiceClient) GetDHCPClientIdentifiers(ctx context.Context, in *GetDHCPClientIdentifiersRequest, opts ...grpc.CallOption) (*GetDHCPClientIdentifiersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetDHCPClientIdentifiersResponse)
+	err := c.cc.Invoke(ctx, BpfrxService_GetDHCPClientIdentifiers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *bpfrxServiceClient) GetRoutes(ctx context.Context, in *GetRoutesRequest, opts ...grpc.CallOption) (*GetRoutesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetRoutesResponse)
@@ -427,6 +441,16 @@ func (c *bpfrxServiceClient) ClearCounters(ctx context.Context, in *ClearCounter
 	return out, nil
 }
 
+func (c *bpfrxServiceClient) ClearDHCPClientIdentifier(ctx context.Context, in *ClearDHCPClientIdentifierRequest, opts ...grpc.CallOption) (*ClearDHCPClientIdentifierResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ClearDHCPClientIdentifierResponse)
+	err := c.cc.Invoke(ctx, BpfrxService_ClearDHCPClientIdentifier_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *bpfrxServiceClient) Complete(ctx context.Context, in *CompleteRequest, opts ...grpc.CallOption) (*CompleteResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CompleteResponse)
@@ -471,6 +495,7 @@ type BpfrxServiceServer interface {
 	GetEvents(context.Context, *GetEventsRequest) (*GetEventsResponse, error)
 	GetInterfaces(context.Context, *GetInterfacesRequest) (*GetInterfacesResponse, error)
 	GetDHCPLeases(context.Context, *GetDHCPLeasesRequest) (*GetDHCPLeasesResponse, error)
+	GetDHCPClientIdentifiers(context.Context, *GetDHCPClientIdentifiersRequest) (*GetDHCPClientIdentifiersResponse, error)
 	GetRoutes(context.Context, *GetRoutesRequest) (*GetRoutesResponse, error)
 	GetOSPFStatus(context.Context, *GetOSPFStatusRequest) (*GetOSPFStatusResponse, error)
 	GetBGPStatus(context.Context, *GetBGPStatusRequest) (*GetBGPStatusResponse, error)
@@ -478,6 +503,7 @@ type BpfrxServiceServer interface {
 	// Mutations
 	ClearSessions(context.Context, *ClearSessionsRequest) (*ClearSessionsResponse, error)
 	ClearCounters(context.Context, *ClearCountersRequest) (*ClearCountersResponse, error)
+	ClearDHCPClientIdentifier(context.Context, *ClearDHCPClientIdentifierRequest) (*ClearDHCPClientIdentifierResponse, error)
 	// Tab completion
 	Complete(context.Context, *CompleteRequest) (*CompleteResponse, error)
 	mustEmbedUnimplementedBpfrxServiceServer()
@@ -568,6 +594,9 @@ func (UnimplementedBpfrxServiceServer) GetInterfaces(context.Context, *GetInterf
 func (UnimplementedBpfrxServiceServer) GetDHCPLeases(context.Context, *GetDHCPLeasesRequest) (*GetDHCPLeasesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetDHCPLeases not implemented")
 }
+func (UnimplementedBpfrxServiceServer) GetDHCPClientIdentifiers(context.Context, *GetDHCPClientIdentifiersRequest) (*GetDHCPClientIdentifiersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetDHCPClientIdentifiers not implemented")
+}
 func (UnimplementedBpfrxServiceServer) GetRoutes(context.Context, *GetRoutesRequest) (*GetRoutesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRoutes not implemented")
 }
@@ -585,6 +614,9 @@ func (UnimplementedBpfrxServiceServer) ClearSessions(context.Context, *ClearSess
 }
 func (UnimplementedBpfrxServiceServer) ClearCounters(context.Context, *ClearCountersRequest) (*ClearCountersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ClearCounters not implemented")
+}
+func (UnimplementedBpfrxServiceServer) ClearDHCPClientIdentifier(context.Context, *ClearDHCPClientIdentifierRequest) (*ClearDHCPClientIdentifierResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ClearDHCPClientIdentifier not implemented")
 }
 func (UnimplementedBpfrxServiceServer) Complete(context.Context, *CompleteRequest) (*CompleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Complete not implemented")
@@ -1078,6 +1110,24 @@ func _BpfrxService_GetDHCPLeases_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _BpfrxService_GetDHCPClientIdentifiers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetDHCPClientIdentifiersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BpfrxServiceServer).GetDHCPClientIdentifiers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BpfrxService_GetDHCPClientIdentifiers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BpfrxServiceServer).GetDHCPClientIdentifiers(ctx, req.(*GetDHCPClientIdentifiersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _BpfrxService_GetRoutes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetRoutesRequest)
 	if err := dec(in); err != nil {
@@ -1182,6 +1232,24 @@ func _BpfrxService_ClearCounters_Handler(srv interface{}, ctx context.Context, d
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(BpfrxServiceServer).ClearCounters(ctx, req.(*ClearCountersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BpfrxService_ClearDHCPClientIdentifier_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClearDHCPClientIdentifierRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BpfrxServiceServer).ClearDHCPClientIdentifier(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BpfrxService_ClearDHCPClientIdentifier_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BpfrxServiceServer).ClearDHCPClientIdentifier(ctx, req.(*ClearDHCPClientIdentifierRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1316,6 +1384,10 @@ var BpfrxService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _BpfrxService_GetDHCPLeases_Handler,
 		},
 		{
+			MethodName: "GetDHCPClientIdentifiers",
+			Handler:    _BpfrxService_GetDHCPClientIdentifiers_Handler,
+		},
+		{
 			MethodName: "GetRoutes",
 			Handler:    _BpfrxService_GetRoutes_Handler,
 		},
@@ -1338,6 +1410,10 @@ var BpfrxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ClearCounters",
 			Handler:    _BpfrxService_ClearCounters_Handler,
+		},
+		{
+			MethodName: "ClearDHCPClientIdentifier",
+			Handler:    _BpfrxService_ClearDHCPClientIdentifier_Handler,
 		},
 		{
 			MethodName: "Complete",

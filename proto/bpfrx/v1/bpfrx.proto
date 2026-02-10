@@ -35,6 +35,7 @@ service BpfrxService {
   rpc GetEvents(GetEventsRequest) returns (GetEventsResponse);
   rpc GetInterfaces(GetInterfacesRequest) returns (GetInterfacesResponse);
   rpc GetDHCPLeases(GetDHCPLeasesRequest) returns (GetDHCPLeasesResponse);
+  rpc GetDHCPClientIdentifiers(GetDHCPClientIdentifiersRequest) returns (GetDHCPClientIdentifiersResponse);
   rpc GetRoutes(GetRoutesRequest) returns (GetRoutesResponse);
   rpc GetOSPFStatus(GetOSPFStatusRequest) returns (GetOSPFStatusResponse);
   rpc GetBGPStatus(GetBGPStatusRequest) returns (GetBGPStatusResponse);
@@ -43,6 +44,7 @@ service BpfrxService {
   // Mutations
   rpc ClearSessions(ClearSessionsRequest) returns (ClearSessionsResponse);
   rpc ClearCounters(ClearCountersRequest) returns (ClearCountersResponse);
+  rpc ClearDHCPClientIdentifier(ClearDHCPClientIdentifierRequest) returns (ClearDHCPClientIdentifierResponse);
 
   // Tab completion
   rpc Complete(CompleteRequest) returns (CompleteResponse);
@@ -306,6 +308,24 @@ message DHCPLeaseInfo {
   repeated string dns = 5;
   string lease_time = 6;
   string obtained = 7;
+}
+
+message GetDHCPClientIdentifiersRequest {}
+message GetDHCPClientIdentifiersResponse {
+  repeated DHCPClientIdentifierInfo identifiers = 1;
+}
+message DHCPClientIdentifierInfo {
+  string interface = 1;
+  string type = 2;
+  string display = 3;
+  string hex = 4;
+}
+
+message ClearDHCPClientIdentifierRequest {
+  string interface = 1; // empty = clear all
+}
+message ClearDHCPClientIdentifierResponse {
+  string message = 1;
 }
 
 message GetRoutesRequest {}

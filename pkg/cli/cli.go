@@ -75,7 +75,8 @@ var operationalTree = map[string]*completionNode{
 	"show": {desc: "Show information", children: map[string]*completionNode{
 		"configuration": {desc: "Show active configuration"},
 		"dhcp": {desc: "Show DHCP information", children: map[string]*completionNode{
-			"leases": {desc: "Show DHCP leases"},
+			"leases":            {desc: "Show DHCP leases"},
+			"client-identifier": {desc: "Show DHCPv6 DUID(s)"},
 		}},
 		"route": {desc: "Show routing table"},
 		"security": {desc: "Show security information", children: map[string]*completionNode{
@@ -121,6 +122,9 @@ var operationalTree = map[string]*completionNode{
 				"session": {desc: "Clear all sessions"},
 			}},
 			"counters": {desc: "Clear all counters"},
+		}},
+		"dhcp": {desc: "Clear DHCP information", children: map[string]*completionNode{
+			"client-identifier": {desc: "Clear DHCPv6 DUID(s)"},
 		}},
 	}},
 	"quit": {desc: "Exit CLI"},
@@ -498,11 +502,17 @@ func (c *CLI) handleShow(args []string) error {
 		return nil
 
 	case "dhcp":
-		if len(args) >= 2 && args[1] == "leases" {
-			return c.showDHCPLeases()
+		if len(args) >= 2 {
+			switch args[1] {
+			case "leases":
+				return c.showDHCPLeases()
+			case "client-identifier":
+				return c.showDHCPClientIdentifier()
+			}
 		}
 		fmt.Println("show dhcp:")
-		fmt.Println("  leases           Show DHCP leases")
+		fmt.Println("  leases              Show DHCP leases")
+		fmt.Println("  client-identifier   Show DHCPv6 DUID(s)")
 		return nil
 
 	case "route":
@@ -1235,16 +1245,39 @@ func (c *CLI) showFlowTimeouts() error {
 }
 
 func (c *CLI) handleClear(args []string) error {
-	if len(args) < 2 || args[0] != "security" {
+	if len(args) < 1 {
 		fmt.Println("clear:")
-		fmt.Println("  security flow session    Clear all sessions")
-		fmt.Println("  security counters        Clear all counters")
+		fmt.Println("  security flow session          Clear all sessions")
+		fmt.Println("  security counters              Clear all counters")
+		fmt.Println("  dhcp client-identifier         Clear DHCPv6 DUID(s)")
 		return nil
 	}
 
-	switch args[1] {
+	switch args[0] {
+	case "security":
+		return c.handleClearSecurity(args[1:])
+	case "dhcp":
+		return c.handleClearDHCP(args[1:])
+	default:
+		fmt.Println("clear:")
+		fmt.Println("  security flow session          Clear all sessions")
+		fmt.Println("  security counters              Clear all counters")
+		fmt.Println("  dhcp client-identifier         Clear DHCPv6 DUID(s)")
+		return nil
+	}
+}
+
+func (c *CLI) handleClearSecurity(args []string) error {
+	if len(args) < 1 {
+		fmt.Println("clear security:")
+		fmt.Println("  flow session    Clear all sessions")
+		fmt.Println("  counters        Clear all counters")
+		return nil
+	}
+
+	switch args[0] {
 	case "flow":
-		if len(args) < 3 || args[2] != "session" {
+		if len(args) < 2 || args[1] != "session" {
 			return fmt.Errorf("usage: clear security flow session")
 		}
 		if c.dp == nil || !c.dp.IsLoaded() {
@@ -1275,6 +1308,33 @@ func (c *CLI) handleClear(args []string) error {
 		fmt.Println("  counters        Clear all counters")
 		return nil
 	}
+}
+
+func (c *CLI) handleClearDHCP(args []string) error {
+	if len(args) < 1 || args[0] != "client-identifier" {
+		fmt.Println("clear dhcp:")
+		fmt.Println("  client-identifier [interface <name>]    Clear DHCPv6 DUID(s)")
+		return nil
+	}
+
+	if c.dhcp == nil {
+		fmt.Println("No DHCP clients running")
+		return nil
+	}
+
+	// Optional interface filter: clear dhcp client-identifier interface <name>
+	if len(args) >= 3 && args[1] == "interface" {
+		ifName := args[2]
+		if err := c.dhcp.ClearDUID(ifName); err != nil {
+			return fmt.Errorf("clear DUID: %w", err)
+		}
+		fmt.Printf("DHCPv6 DUID cleared for %s\n", ifName)
+		return nil
+	}
+
+	c.dhcp.ClearAllDUIDs()
+	fmt.Println("All DHCPv6 DUIDs cleared")
+	return nil
 }
 
 func (c *CLI) handleShowNAT(args []string) error {
@@ -2342,6 +2402,29 @@ func (c *CLI) showDHCPLeases() error {
 		}
 		fmt.Printf("    Lease:     %s (remaining: %s)\n", l.LeaseTime.Round(time.Second), remaining.Round(time.Second))
 		fmt.Printf("    Obtained:  %s\n", l.Obtained.Format("2006-01-02 15:04:05"))
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *CLI) showDHCPClientIdentifier() error {
+	if c.dhcp == nil {
+		fmt.Println("No DHCP clients running")
+		return nil
+	}
+
+	duids := c.dhcp.DUIDs()
+	if len(duids) == 0 {
+		fmt.Println("No DHCPv6 DUIDs configured")
+		return nil
+	}
+
+	fmt.Println("DHCPv6 client identifiers:")
+	for _, d := range duids {
+		fmt.Printf("  Interface: %s\n", d.Interface)
+		fmt.Printf("    Type:    %s\n", d.Type)
+		fmt.Printf("    DUID:    %s\n", d.Display)
+		fmt.Printf("    Hex:     %s\n", d.HexBytes)
 		fmt.Println()
 	}
 	return nil

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -310,7 +311,10 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 		return
 	}
 
-	dm, err := dhcp.New(func() {
+	// State dir for DUID persistence — same directory as config file
+	stateDir := filepath.Dir(d.opts.ConfigFile)
+
+	dm, err := dhcp.New(stateDir, func() {
 		slog.Info("DHCP address changed, recompiling dataplane")
 		if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
 			d.applyConfig(activeCfg)
@@ -329,6 +333,12 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 				dm.Start(ctx, ifName, dhcp.AFInet)
 			}
 			if unit.DHCPv6 {
+				// Configure DUID type from dhcpv6-client stanza
+				if unit.DHCPv6Client != nil && unit.DHCPv6Client.DUIDType != "" {
+					dm.SetDUIDType(ifName, unit.DHCPv6Client.DUIDType)
+				} else {
+					dm.SetDUIDType(ifName, "duid-ll") // default
+				}
 				slog.Info("starting DHCPv6 client", "interface", ifName)
 				dm.Start(ctx, ifName, dhcp.AFInet6)
 			}

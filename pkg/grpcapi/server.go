@@ -695,6 +695,41 @@ func (s *Server) GetDHCPLeases(_ context.Context, _ *pb.GetDHCPLeasesRequest) (*
 	return resp, nil
 }
 
+func (s *Server) GetDHCPClientIdentifiers(_ context.Context, _ *pb.GetDHCPClientIdentifiersRequest) (*pb.GetDHCPClientIdentifiersResponse, error) {
+	if s.dhcp == nil {
+		return &pb.GetDHCPClientIdentifiersResponse{}, nil
+	}
+
+	resp := &pb.GetDHCPClientIdentifiersResponse{}
+	for _, d := range s.dhcp.DUIDs() {
+		resp.Identifiers = append(resp.Identifiers, &pb.DHCPClientIdentifierInfo{
+			Interface: d.Interface,
+			Type:      d.Type,
+			Display:   d.Display,
+			Hex:       d.HexBytes,
+		})
+	}
+	return resp, nil
+}
+
+func (s *Server) ClearDHCPClientIdentifier(_ context.Context, req *pb.ClearDHCPClientIdentifierRequest) (*pb.ClearDHCPClientIdentifierResponse, error) {
+	if s.dhcp == nil {
+		return &pb.ClearDHCPClientIdentifierResponse{Message: "No DHCP clients running"}, nil
+	}
+
+	if req.Interface != "" {
+		if err := s.dhcp.ClearDUID(req.Interface); err != nil {
+			return nil, fmt.Errorf("clear DUID: %w", err)
+		}
+		return &pb.ClearDHCPClientIdentifierResponse{
+			Message: fmt.Sprintf("DHCPv6 DUID cleared for %s", req.Interface),
+		}, nil
+	}
+
+	s.dhcp.ClearAllDUIDs()
+	return &pb.ClearDHCPClientIdentifierResponse{Message: "All DHCPv6 DUIDs cleared"}, nil
+}
+
 func (s *Server) GetRoutes(_ context.Context, _ *pb.GetRoutesRequest) (*pb.GetRoutesResponse, error) {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
@@ -957,7 +992,8 @@ var operationalTree = map[string]*completionNode{
 	"show": {desc: "Show information", children: map[string]*completionNode{
 		"configuration": {desc: "Show active configuration"},
 		"dhcp": {desc: "Show DHCP information", children: map[string]*completionNode{
-			"leases": {desc: "Show DHCP leases"},
+			"leases":            {desc: "Show DHCP leases"},
+			"client-identifier": {desc: "Show DHCPv6 DUID(s)"},
 		}},
 		"route": {desc: "Show routing table"},
 		"security": {desc: "Show security information", children: map[string]*completionNode{
@@ -1003,6 +1039,9 @@ var operationalTree = map[string]*completionNode{
 				"session": {desc: "Clear all sessions"},
 			}},
 			"counters": {desc: "Clear all counters"},
+		}},
+		"dhcp": {desc: "Clear DHCP information", children: map[string]*completionNode{
+			"client-identifier": {desc: "Clear DHCPv6 DUID(s)"},
 		}},
 	}},
 	"quit": {desc: "Exit CLI"},

@@ -279,11 +279,17 @@ func (c *ctl) handleShow(args []string) error {
 		return nil
 
 	case "dhcp":
-		if len(args) >= 2 && args[1] == "leases" {
-			return c.showDHCPLeases()
+		if len(args) >= 2 {
+			switch args[1] {
+			case "leases":
+				return c.showDHCPLeases()
+			case "client-identifier":
+				return c.showDHCPClientIdentifier()
+			}
 		}
 		fmt.Println("show dhcp:")
-		fmt.Println("  leases           Show DHCP leases")
+		fmt.Println("  leases              Show DHCP leases")
+		fmt.Println("  client-identifier   Show DHCPv6 DUID(s)")
 		return nil
 
 	case "route":
@@ -635,6 +641,26 @@ func (c *ctl) showDHCPLeases() error {
 	return nil
 }
 
+func (c *ctl) showDHCPClientIdentifier() error {
+	resp, err := c.client.GetDHCPClientIdentifiers(context.Background(), &pb.GetDHCPClientIdentifiersRequest{})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	if len(resp.Identifiers) == 0 {
+		fmt.Println("No DHCPv6 DUIDs configured")
+		return nil
+	}
+	fmt.Println("DHCPv6 client identifiers:")
+	for _, d := range resp.Identifiers {
+		fmt.Printf("  Interface: %s\n", d.Interface)
+		fmt.Printf("    Type:    %s\n", d.Type)
+		fmt.Printf("    DUID:    %s\n", d.Display)
+		fmt.Printf("    Hex:     %s\n", d.Hex)
+		fmt.Println()
+	}
+	return nil
+}
+
 func (c *ctl) showRoutes() error {
 	resp, err := c.client.GetRoutes(context.Background(), &pb.GetRoutesRequest{})
 	if err != nil {
@@ -802,16 +828,39 @@ func (c *ctl) handleCommit(args []string) error {
 }
 
 func (c *ctl) handleClear(args []string) error {
-	if len(args) < 2 || args[0] != "security" {
+	if len(args) < 1 {
 		fmt.Println("clear:")
-		fmt.Println("  security flow session    Clear all sessions")
-		fmt.Println("  security counters        Clear all counters")
+		fmt.Println("  security flow session          Clear all sessions")
+		fmt.Println("  security counters              Clear all counters")
+		fmt.Println("  dhcp client-identifier         Clear DHCPv6 DUID(s)")
 		return nil
 	}
 
-	switch args[1] {
+	switch args[0] {
+	case "security":
+		return c.handleClearSecurity(args[1:])
+	case "dhcp":
+		return c.handleClearDHCP(args[1:])
+	default:
+		fmt.Println("clear:")
+		fmt.Println("  security flow session          Clear all sessions")
+		fmt.Println("  security counters              Clear all counters")
+		fmt.Println("  dhcp client-identifier         Clear DHCPv6 DUID(s)")
+		return nil
+	}
+}
+
+func (c *ctl) handleClearSecurity(args []string) error {
+	if len(args) < 1 {
+		fmt.Println("clear security:")
+		fmt.Println("  flow session    Clear all sessions")
+		fmt.Println("  counters        Clear all counters")
+		return nil
+	}
+
+	switch args[0] {
 	case "flow":
-		if len(args) < 3 || args[2] != "session" {
+		if len(args) < 2 || args[1] != "session" {
 			return fmt.Errorf("usage: clear security flow session")
 		}
 		resp, err := c.client.ClearSessions(context.Background(), &pb.ClearSessionsRequest{})
@@ -835,6 +884,26 @@ func (c *ctl) handleClear(args []string) error {
 		fmt.Println("  counters        Clear all counters")
 		return nil
 	}
+}
+
+func (c *ctl) handleClearDHCP(args []string) error {
+	if len(args) < 1 || args[0] != "client-identifier" {
+		fmt.Println("clear dhcp:")
+		fmt.Println("  client-identifier [interface <name>]    Clear DHCPv6 DUID(s)")
+		return nil
+	}
+
+	req := &pb.ClearDHCPClientIdentifierRequest{}
+	if len(args) >= 3 && args[1] == "interface" {
+		req.Interface = args[2]
+	}
+
+	resp, err := c.client.ClearDHCPClientIdentifier(context.Background(), req)
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Println(resp.Message)
+	return nil
 }
 
 // --- Tab completion ---
@@ -917,6 +986,8 @@ func (c *ctl) showOperationalHelp() {
 	fmt.Println("  show configuration                 Show running configuration")
 	fmt.Println("  show configuration | display set   Show as flat set commands")
 	fmt.Println("  show dhcp leases                   Show DHCP leases")
+	fmt.Println("  show dhcp client-identifier        Show DHCPv6 DUID(s)")
+	fmt.Println("  clear dhcp client-identifier       Clear DHCPv6 DUID(s)")
 	fmt.Println("  show route                         Show routing table")
 	fmt.Println("  show security                      Show security information")
 	fmt.Println("  show security ipsec                Show IPsec VPN status")

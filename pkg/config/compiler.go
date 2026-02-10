@@ -461,6 +461,15 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 						if afNode.FindChild("dhcpv6") != nil {
 							unit.DHCPv6 = true
 						}
+						if dcNode := afNode.FindChild("dhcpv6-client"); dcNode != nil {
+							unit.DHCPv6 = true
+							unit.DHCPv6Client = &DHCPv6ClientConfig{}
+							if ciNode := dcNode.FindChild("client-identifier"); ciNode != nil {
+								if dtNode := ciNode.FindChild("duid-type"); dtNode != nil && len(dtNode.Keys) >= 2 {
+									unit.DHCPv6Client.DUIDType = dtNode.Keys[1]
+								}
+							}
+						}
 					}
 				}
 			}

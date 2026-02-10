@@ -223,8 +223,14 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"unit": {args: 1, children: map[string]*schemaNode{
 			"vlan-id": {args: 1, children: nil},
 			"family": {children: map[string]*schemaNode{
-				"inet":  {children: nil},
-				"inet6": {children: nil},
+				"inet": {children: nil},
+				"inet6": {children: map[string]*schemaNode{
+					"dhcpv6-client": {children: map[string]*schemaNode{
+						"client-identifier": {children: map[string]*schemaNode{
+							"duid-type": {args: 1, children: nil},
+						}},
+					}},
+				}},
 			}},
 		}},
 		"tunnel": {children: nil}, // tunnel source/destination/key/ttl are leaves
