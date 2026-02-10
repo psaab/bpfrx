@@ -518,4 +518,33 @@ struct {
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } nat64_state SEC(".maps");
 
+/* ============================================================
+ * Firewall filter maps
+ * ============================================================ */
+
+/* Interface filter assignment: {ifindex, vlan_id, family} -> filter_id */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_LOGICAL_INTERFACES * 2); /* *2 for inet + inet6 */
+	__type(key, struct iface_filter_key);
+	__type(value, __u32); /* filter_id (index into filter_configs) */
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} iface_filter_map SEC(".maps");
+
+/* Per-filter config: filter_id -> {num_rules, rule_start} */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_FILTER_CONFIGS);
+	__type(key, __u32);
+	__type(value, struct filter_config);
+} filter_configs SEC(".maps");
+
+/* Global filter rule array: indexed by rule_start + i */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_FILTER_RULES);
+	__type(key, __u32);
+	__type(value, struct filter_rule);
+} filter_rules SEC(".maps");
+
 #endif /* __BPFRX_MAPS_H__ */

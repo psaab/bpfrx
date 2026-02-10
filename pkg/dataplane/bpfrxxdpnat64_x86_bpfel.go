@@ -87,6 +87,30 @@ type bpfrxXdpNat64DnatValueV6 struct {
 	Pad        uint8
 }
 
+type bpfrxXdpNat64FilterConfig struct {
+	_         structs.HostLayout
+	NumRules  uint32
+	RuleStart uint32
+}
+
+type bpfrxXdpNat64FilterRule struct {
+	_            structs.HostLayout
+	MatchFlags   uint16
+	Dscp         uint8
+	Protocol     uint8
+	Action       uint8
+	IcmpType     uint8
+	IcmpCode     uint8
+	Family       uint8
+	DstPort      uint16
+	Pad          uint16
+	SrcAddr      [16]uint8
+	SrcMask      [16]uint8
+	DstAddr      [16]uint8
+	DstMask      [16]uint8
+	RoutingTable uint32
+}
+
 type bpfrxXdpNat64FloodState struct {
 	_           structs.HostLayout
 	SynCount    uint64
@@ -101,6 +125,14 @@ type bpfrxXdpNat64IfaceCounterValue struct {
 	RxBytes   uint64
 	TxPackets uint64
 	TxBytes   uint64
+}
+
+type bpfrxXdpNat64IfaceFilterKey struct {
+	_       structs.HostLayout
+	Ifindex uint32
+	VlanId  uint16
+	Family  uint8
+	Pad     uint8
 }
 
 type bpfrxXdpNat64IfaceZoneKey struct {
@@ -184,6 +216,8 @@ type bpfrxXdpNat64PktMeta struct {
 	TcpFlags       uint8
 	IpTtl          uint8
 	AddrFamily     uint8
+	Dscp           uint8
+	PadMeta        [3]uint8
 	IcmpId         uint16
 	IcmpType       uint8
 	IcmpCode       uint8
@@ -213,12 +247,13 @@ type bpfrxXdpNat64PktMeta struct {
 		V4 uint32
 		_  [12]byte
 	}
-	NatSrcPort uint16
-	NatDstPort uint16
-	NatFlags   uint32
-	FwdIfindex uint32
-	FwdDmac    [6]uint8
-	FwdSmac    [6]uint8
+	NatSrcPort   uint16
+	NatDstPort   uint16
+	NatFlags     uint32
+	FwdIfindex   uint32
+	FwdDmac      [6]uint8
+	FwdSmac      [6]uint8
+	RoutingTable uint32
 }
 
 type bpfrxXdpNat64PolicyRule struct {
@@ -452,9 +487,12 @@ type bpfrxXdpNat64MapSpecs struct {
 	DnatTable         *ebpf.MapSpec `ebpf:"dnat_table"`
 	DnatTableV6       *ebpf.MapSpec `ebpf:"dnat_table_v6"`
 	Events            *ebpf.MapSpec `ebpf:"events"`
+	FilterConfigs     *ebpf.MapSpec `ebpf:"filter_configs"`
+	FilterRules       *ebpf.MapSpec `ebpf:"filter_rules"`
 	FloodCounters     *ebpf.MapSpec `ebpf:"flood_counters"`
 	FlowTimeouts      *ebpf.MapSpec `ebpf:"flow_timeouts"`
 	GlobalCounters    *ebpf.MapSpec `ebpf:"global_counters"`
+	IfaceFilterMap    *ebpf.MapSpec `ebpf:"iface_filter_map"`
 	IfaceZoneMap      *ebpf.MapSpec `ebpf:"iface_zone_map"`
 	InterfaceCounters *ebpf.MapSpec `ebpf:"interface_counters"`
 	Nat64Configs      *ebpf.MapSpec `ebpf:"nat64_configs"`
@@ -518,9 +556,12 @@ type bpfrxXdpNat64Maps struct {
 	DnatTable         *ebpf.Map `ebpf:"dnat_table"`
 	DnatTableV6       *ebpf.Map `ebpf:"dnat_table_v6"`
 	Events            *ebpf.Map `ebpf:"events"`
+	FilterConfigs     *ebpf.Map `ebpf:"filter_configs"`
+	FilterRules       *ebpf.Map `ebpf:"filter_rules"`
 	FloodCounters     *ebpf.Map `ebpf:"flood_counters"`
 	FlowTimeouts      *ebpf.Map `ebpf:"flow_timeouts"`
 	GlobalCounters    *ebpf.Map `ebpf:"global_counters"`
+	IfaceFilterMap    *ebpf.Map `ebpf:"iface_filter_map"`
 	IfaceZoneMap      *ebpf.Map `ebpf:"iface_zone_map"`
 	InterfaceCounters *ebpf.Map `ebpf:"interface_counters"`
 	Nat64Configs      *ebpf.Map `ebpf:"nat64_configs"`
@@ -560,9 +601,12 @@ func (m *bpfrxXdpNat64Maps) Close() error {
 		m.DnatTable,
 		m.DnatTableV6,
 		m.Events,
+		m.FilterConfigs,
+		m.FilterRules,
 		m.FloodCounters,
 		m.FlowTimeouts,
 		m.GlobalCounters,
+		m.IfaceFilterMap,
 		m.IfaceZoneMap,
 		m.InterfaceCounters,
 		m.Nat64Configs,

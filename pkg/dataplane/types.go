@@ -530,3 +530,72 @@ type NAT64Config struct {
 	SNATPoolID uint8
 	Pad        [3]byte
 }
+
+// FilterConfig mirrors the C struct filter_config.
+type FilterConfig struct {
+	NumRules  uint32
+	RuleStart uint32
+}
+
+// IfaceFilterKey mirrors the C struct iface_filter_key.
+type IfaceFilterKey struct {
+	Ifindex uint32
+	VlanID  uint16
+	Family  uint8
+	Pad     uint8
+}
+
+// FilterRule mirrors the C struct filter_rule.
+type FilterRule struct {
+	MatchFlags   uint16
+	DSCP         uint8
+	Protocol     uint8
+	Action       uint8
+	ICMPType     uint8
+	ICMPCode     uint8
+	Family       uint8
+	DstPort      uint16 // network byte order
+	Pad          uint16
+	SrcAddr      [16]byte
+	SrcMask      [16]byte
+	DstAddr      [16]byte
+	DstMask      [16]byte
+	RoutingTable uint32
+}
+
+// Filter match flag constants.
+const (
+	FilterMatchDSCP     = 1 << 0
+	FilterMatchProtocol = 1 << 1
+	FilterMatchSrcAddr  = 1 << 2
+	FilterMatchDstAddr  = 1 << 3
+	FilterMatchDstPort  = 1 << 4
+	FilterMatchICMPType = 1 << 5
+	FilterMatchICMPCode = 1 << 6
+)
+
+// Filter action constants.
+const (
+	FilterActionAccept  = 0
+	FilterActionDiscard = 1
+	FilterActionReject  = 2
+	FilterActionRoute   = 3
+)
+
+// DSCPValues maps DSCP codepoint names to numeric values.
+var DSCPValues = map[string]uint8{
+	"ef":   46,
+	"af11": 10, "af12": 12, "af13": 14,
+	"af21": 18, "af22": 20, "af23": 22,
+	"af31": 26, "af32": 28, "af33": 30,
+	"af41": 34, "af42": 36, "af43": 38,
+	"cs0": 0, "cs1": 8, "cs2": 16, "cs3": 24,
+	"cs4": 32, "cs5": 40, "cs6": 48, "cs7": 56,
+	"be": 0,
+}
+
+// MaxFilterRules is the maximum number of filter rules.
+const MaxFilterRules = 512
+
+// MaxFilterConfigs is the maximum number of filter configs.
+const MaxFilterConfigs = 64

@@ -736,3 +736,62 @@ func ipTo16Bytes(ip net.IP) [16]byte {
 	copy(b[:], ip.To16())
 	return b
 }
+
+// SetIfaceFilter assigns a filter ID to an interface + family combination.
+func (m *Manager) SetIfaceFilter(key IfaceFilterKey, filterID uint32) error {
+	zm, ok := m.maps["iface_filter_map"]
+	if !ok {
+		return fmt.Errorf("iface_filter_map not found")
+	}
+	return zm.Update(key, filterID, ebpf.UpdateAny)
+}
+
+// ClearIfaceFilterMap removes all entries from the iface_filter_map.
+func (m *Manager) ClearIfaceFilterMap() error {
+	zm, ok := m.maps["iface_filter_map"]
+	if !ok {
+		return fmt.Errorf("iface_filter_map not found")
+	}
+	var key IfaceFilterKey
+	var val []byte
+	iter := zm.Iterate()
+	var keys []IfaceFilterKey
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	for _, k := range keys {
+		zm.Delete(k)
+	}
+	return nil
+}
+
+// SetFilterConfig writes a filter config entry.
+func (m *Manager) SetFilterConfig(filterID uint32, cfg FilterConfig) error {
+	zm, ok := m.maps["filter_configs"]
+	if !ok {
+		return fmt.Errorf("filter_configs not found")
+	}
+	return zm.Update(filterID, cfg, ebpf.UpdateAny)
+}
+
+// SetFilterRule writes a filter rule entry.
+func (m *Manager) SetFilterRule(index uint32, rule FilterRule) error {
+	zm, ok := m.maps["filter_rules"]
+	if !ok {
+		return fmt.Errorf("filter_rules not found")
+	}
+	return zm.Update(index, rule, ebpf.UpdateAny)
+}
+
+// ClearFilterConfigs clears all filter config and rule entries.
+func (m *Manager) ClearFilterConfigs() error {
+	zm, ok := m.maps["filter_configs"]
+	if !ok {
+		return fmt.Errorf("filter_configs not found")
+	}
+	var empty FilterConfig
+	for i := uint32(0); i < MaxFilterConfigs; i++ {
+		zm.Update(i, empty, ebpf.UpdateAny)
+	}
+	return nil
+}

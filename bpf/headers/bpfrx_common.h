@@ -318,6 +318,8 @@ struct pkt_meta {
 	__u8   tcp_flags;
 	__u8   ip_ttl;
 	__u8   addr_family;  /* AF_INET=2, AF_INET6=10 */
+	__u8   dscp;          /* DSCP value (top 6 bits of TOS/traffic-class) */
+	__u8   pad_meta[3];   /* alignment */
 
 	/* ICMP specific */
 	__be16 icmp_id;
@@ -360,6 +362,9 @@ struct pkt_meta {
 	__u32 fwd_ifindex;
 	__u8  fwd_dmac[ETH_ALEN];
 	__u8  fwd_smac[ETH_ALEN];
+
+	/* Policy-based routing (set by firewall filter) */
+	__u32 routing_table;  /* VRF table ID, 0 = main table */
 };
 
 /* ============================================================
@@ -454,6 +459,41 @@ struct nat_port_counter {
 
 #define MAX_NAT64_PREFIXES 4
 
+/* Firewall filter limits */
+#define MAX_FILTER_CONFIGS 64
+#define MAX_FILTER_RULES   512
+#define MAX_FILTER_RULES_PER_FILTER 32
+
+/* Filter match flags */
+#define FILTER_MATCH_DSCP      (1 << 0)
+#define FILTER_MATCH_PROTOCOL  (1 << 1)
+#define FILTER_MATCH_SRC_ADDR  (1 << 2)
+#define FILTER_MATCH_DST_ADDR  (1 << 3)
+#define FILTER_MATCH_DST_PORT  (1 << 4)
+#define FILTER_MATCH_ICMP_TYPE (1 << 5)
+#define FILTER_MATCH_ICMP_CODE (1 << 6)
+
+/* Filter actions */
+#define FILTER_ACTION_ACCEPT   0
+#define FILTER_ACTION_DISCARD  1
+#define FILTER_ACTION_REJECT   2
+#define FILTER_ACTION_ROUTE    3  /* routing-instance */
+
+/* DSCP codepoint values */
+#define DSCP_EF  46
+#define DSCP_AF11 10
+#define DSCP_AF12 12
+#define DSCP_AF13 14
+#define DSCP_AF21 18
+#define DSCP_AF22 20
+#define DSCP_AF23 22
+#define DSCP_AF31 26
+#define DSCP_AF32 28
+#define DSCP_AF33 30
+#define DSCP_AF41 34
+#define DSCP_AF42 36
+#define DSCP_AF43 38
+
 /* NAT64 prefix config entry: (prefix_hi, prefix_lo) is the /96 prefix,
  * snat_pool_id points to the IPv4 source pool for translated packets. */
 struct nat64_config {
@@ -479,6 +519,42 @@ struct nat64_state_value {
 	__be16 orig_src_port;   /* original client port */
 	__be16 orig_dst_port;   /* original dest port */
 	__u32  nat64_idx;       /* which NAT64 prefix was used */
+};
+
+/* ============================================================
+ * Firewall filter configuration
+ * ============================================================ */
+
+/* Per-filter config: number of rules and where they start in the rules array */
+struct filter_config {
+	__u32 num_rules;
+	__u32 rule_start;   /* index into filter_rules array */
+};
+
+/* Interface filter assignment key: {ifindex, vlan_id, family} -> filter_id */
+struct iface_filter_key {
+	__u32 ifindex;
+	__u16 vlan_id;
+	__u8  family;  /* AF_INET=2, AF_INET6=10 */
+	__u8  pad;
+};
+
+/* Unified filter rule (works for both v4 and v6) */
+struct filter_rule {
+	__u16  match_flags;     /* FILTER_MATCH_* bitmask */
+	__u8   dscp;            /* DSCP/traffic-class value (6 bits) */
+	__u8   protocol;        /* IP protocol number, 0=any */
+	__u8   action;          /* FILTER_ACTION_* */
+	__u8   icmp_type;       /* ICMP type, valid if FILTER_MATCH_ICMP_TYPE */
+	__u8   icmp_code;       /* ICMP code, valid if FILTER_MATCH_ICMP_CODE */
+	__u8   family;          /* AF_INET or AF_INET6 */
+	__be16 dst_port;        /* network byte order, 0=any */
+	__u16  pad;
+	__u8   src_addr[16];    /* v4: first 4 bytes, v6: all 16 */
+	__u8   src_mask[16];    /* prefix mask */
+	__u8   dst_addr[16];
+	__u8   dst_mask[16];
+	__u32  routing_table;   /* VRF table ID (for FILTER_ACTION_ROUTE) */
 };
 
 #endif /* __BPFRX_COMMON_H__ */

@@ -47,6 +47,10 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 			if err := compileRoutingInstances(node, cfg); err != nil {
 				return nil, fmt.Errorf("routing-instances: %w", err)
 			}
+		case "firewall":
+			if err := compileFirewall(node, &cfg.Firewall); err != nil {
+				return nil, fmt.Errorf("firewall: %w", err)
+			}
 		}
 	}
 
@@ -463,6 +467,11 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 						if afNode.FindChild("dhcp") != nil {
 							unit.DHCP = true
 						}
+						if filterNode := afNode.FindChild("filter"); filterNode != nil {
+							if inputNode := filterNode.FindChild("input"); inputNode != nil && len(inputNode.Keys) >= 2 {
+								unit.FilterInputV4 = inputNode.Keys[1]
+							}
+						}
 					case "inet6":
 						for _, addrNode := range afNode.FindChildren("address") {
 							if len(addrNode.Keys) >= 2 {
@@ -471,6 +480,11 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 						}
 						if afNode.FindChild("dhcpv6") != nil {
 							unit.DHCPv6 = true
+						}
+						if filterNode := afNode.FindChild("filter"); filterNode != nil {
+							if inputNode := filterNode.FindChild("input"); inputNode != nil && len(inputNode.Keys) >= 2 {
+								unit.FilterInputV6 = inputNode.Keys[1]
+							}
 						}
 						if dcNode := afNode.FindChild("dhcpv6-client"); dcNode != nil {
 							unit.DHCPv6 = true
@@ -1328,4 +1342,171 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 		cfg.RoutingInstances = append(cfg.RoutingInstances, ri)
 	}
 	return nil
+}
+
+func compileFirewall(node *Node, fw *FirewallConfig) error {
+	if fw.FiltersInet == nil {
+		fw.FiltersInet = make(map[string]*FirewallFilter)
+	}
+	if fw.FiltersInet6 == nil {
+		fw.FiltersInet6 = make(map[string]*FirewallFilter)
+	}
+
+	for _, familyNode := range node.FindChildren("family") {
+		var afNodes []*Node
+		var afName string
+
+		if len(familyNode.Keys) >= 2 {
+			// Hierarchical: family inet { ... }
+			afName = familyNode.Keys[1]
+			afNodes = []*Node{familyNode}
+		} else {
+			// Set-command shape: family { inet { ... } inet6 { ... } }
+			for _, child := range familyNode.Children {
+				afNodes = append(afNodes, child)
+			}
+		}
+
+		for _, afNode := range afNodes {
+			af := afName
+			if af == "" {
+				af = afNode.Keys[0]
+				if len(afNode.Keys) >= 2 {
+					af = afNode.Keys[1]
+				}
+			}
+
+			dest := fw.FiltersInet
+			if af == "inet6" {
+				dest = fw.FiltersInet6
+			}
+
+			for _, filterNode := range afNode.FindChildren("filter") {
+				if len(filterNode.Keys) < 2 {
+					continue
+				}
+				filter := &FirewallFilter{Name: filterNode.Keys[1]}
+
+				for _, termNode := range filterNode.FindChildren("term") {
+					if len(termNode.Keys) < 2 {
+						continue
+					}
+					term := &FirewallFilterTerm{
+						Name:     termNode.Keys[1],
+						ICMPType: -1,
+						ICMPCode: -1,
+					}
+
+					fromNode := termNode.FindChild("from")
+					if fromNode != nil {
+						compileFilterFrom(fromNode, term)
+					}
+
+					thenNode := termNode.FindChild("then")
+					if thenNode != nil {
+						compileFilterThen(thenNode, term)
+					}
+
+					filter.Terms = append(filter.Terms, term)
+				}
+
+				dest[filter.Name] = filter
+			}
+		}
+	}
+	return nil
+}
+
+func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
+	for _, child := range node.Children {
+		switch child.Name() {
+		case "dscp", "traffic-class":
+			if len(child.Keys) >= 2 {
+				term.DSCP = child.Keys[1]
+			}
+		case "protocol":
+			if len(child.Keys) >= 2 {
+				term.Protocol = child.Keys[1]
+			}
+		case "source-address":
+			// Can be a leaf with value or a block with address entries
+			if len(child.Keys) >= 2 {
+				term.SourceAddresses = append(term.SourceAddresses, child.Keys[1])
+			}
+			for _, addrNode := range child.Children {
+				if len(addrNode.Keys) >= 1 {
+					term.SourceAddresses = append(term.SourceAddresses, addrNode.Keys[0])
+				}
+			}
+		case "destination-address":
+			if len(child.Keys) >= 2 {
+				term.DestAddresses = append(term.DestAddresses, child.Keys[1])
+			}
+			for _, addrNode := range child.Children {
+				if len(addrNode.Keys) >= 1 {
+					term.DestAddresses = append(term.DestAddresses, addrNode.Keys[0])
+				}
+			}
+		case "destination-port":
+			if len(child.Keys) >= 2 {
+				// Can be a single port or bracket list
+				for _, k := range child.Keys[1:] {
+					term.DestinationPorts = append(term.DestinationPorts, k)
+				}
+			}
+		case "icmp-type":
+			if len(child.Keys) >= 2 {
+				if v, err := strconv.Atoi(child.Keys[1]); err == nil {
+					term.ICMPType = v
+				}
+			}
+		case "icmp-code":
+			if len(child.Keys) >= 2 {
+				if v, err := strconv.Atoi(child.Keys[1]); err == nil {
+					term.ICMPCode = v
+				}
+			}
+		}
+	}
+}
+
+func compileFilterThen(node *Node, term *FirewallFilterTerm) {
+	// Handle leaf form: "then discard;" or "then accept;" produces
+	// Keys=["then", "discard"] with IsLeaf=true and no children.
+	if node.IsLeaf && len(node.Keys) >= 2 {
+		for _, k := range node.Keys[1:] {
+			switch k {
+			case "accept":
+				term.Action = "accept"
+			case "reject":
+				term.Action = "reject"
+			case "discard":
+				term.Action = "discard"
+			case "log":
+				term.Log = true
+			case "syslog":
+				term.Log = true
+			}
+		}
+		return
+	}
+
+	for _, child := range node.Children {
+		switch child.Name() {
+		case "accept":
+			term.Action = "accept"
+		case "reject":
+			term.Action = "reject"
+		case "discard":
+			term.Action = "discard"
+		case "log":
+			term.Log = true
+		case "syslog":
+			term.Log = true
+		case "routing-instance":
+			if len(child.Keys) >= 2 {
+				term.RoutingInstance = child.Keys[1]
+			}
+		}
+	}
 }

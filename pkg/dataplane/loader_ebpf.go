@@ -54,6 +54,9 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["nat64_configs"] = mainObjs.Nat64Configs
 	m.maps["nat64_count"] = mainObjs.Nat64Count
 	m.maps["nat64_state"] = mainObjs.Nat64State
+	m.maps["iface_filter_map"] = mainObjs.IfaceFilterMap
+	m.maps["filter_configs"] = mainObjs.FilterConfigs
+	m.maps["filter_rules"] = mainObjs.FilterRules
 
 	// Store main program.
 	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
@@ -95,6 +98,9 @@ func (m *Manager) loadAllObjects() error {
 			"nat64_configs":      mainObjs.Nat64Configs,
 			"nat64_count":        mainObjs.Nat64Count,
 			"nat64_state":        mainObjs.Nat64State,
+			"iface_filter_map":   mainObjs.IfaceFilterMap,
+			"filter_configs":     mainObjs.FilterConfigs,
+			"filter_rules":       mainObjs.FilterRules,
 		},
 	}
 

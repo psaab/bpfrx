@@ -192,6 +192,11 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	fib.tot_len     = meta->pkt_len;
 	fib.ifindex     = meta->ingress_ifindex;
 
+	/* Use VRF routing table if set by firewall filter (policy-based routing).
+	 * Only set tbid if routing_table is non-zero to avoid touching fib
+	 * fields unnecessarily. */
+	fib.tbid = meta->routing_table;
+
 	if (meta->addr_family == AF_INET) {
 		fib.family   = AF_INET;
 		fib.ipv4_src = meta->src_ip.v4;

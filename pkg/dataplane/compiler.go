@@ -108,6 +108,11 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		return nil, fmt.Errorf("compile flow timeouts: %w", err)
 	}
 
+	// Phase 10: Compile firewall filters
+	if err := m.compileFirewallFilters(cfg, result); err != nil {
+		return nil, fmt.Errorf("compile firewall filters: %w", err)
+	}
+
 	slog.Info("config compiled to dataplane",
 		"zones", len(result.ZoneIDs),
 		"addresses", len(result.AddrIDs),
@@ -1458,4 +1463,347 @@ func parsePorts(spec string) ([]uint16, error) {
 		return nil, err
 	}
 	return []uint16{uint16(port)}, nil
+}
+
+// compileFirewallFilters compiles firewall filter config into BPF maps.
+// It creates filter_rules, filter_configs, and iface_filter_map entries.
+func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResult) error {
+	// Clear previous filter maps
+	if err := m.ClearIfaceFilterMap(); err != nil {
+		slog.Warn("failed to clear iface_filter_map", "err", err)
+	}
+	if err := m.ClearFilterConfigs(); err != nil {
+		slog.Warn("failed to clear filter_configs", "err", err)
+	}
+
+	// Build routing instance name -> table ID map
+	riTableIDs := make(map[string]uint32)
+	for _, ri := range cfg.RoutingInstances {
+		riTableIDs[ri.Name] = uint32(ri.TableID)
+	}
+
+	filterID := uint32(0)
+	ruleIdx := uint32(0)
+	filterIDs := make(map[string]uint32) // "inet:name" or "inet6:name" -> filter_id
+
+	// Compile inet filters
+	for name, filter := range cfg.Firewall.FiltersInet {
+		if filterID >= MaxFilterConfigs || ruleIdx >= MaxFilterRules {
+			slog.Warn("firewall filter limit reached", "filter", name)
+			break
+		}
+		startIdx := ruleIdx
+		for _, term := range filter.Terms {
+			rules := expandFilterTerm(term, AFInet, riTableIDs)
+			for _, rule := range rules {
+				if ruleIdx >= MaxFilterRules {
+					slog.Warn("filter rule limit reached", "filter", name, "term", term.Name)
+					break
+				}
+				if err := m.SetFilterRule(ruleIdx, rule); err != nil {
+					return fmt.Errorf("set filter rule %d: %w", ruleIdx, err)
+				}
+				ruleIdx++
+			}
+		}
+		numRules := ruleIdx - startIdx
+		if err := m.SetFilterConfig(filterID, FilterConfig{
+			NumRules:  numRules,
+			RuleStart: startIdx,
+		}); err != nil {
+			return fmt.Errorf("set filter config %s: %w", name, err)
+		}
+		filterIDs["inet:"+name] = filterID
+		slog.Info("compiled firewall filter",
+			"name", name, "family", "inet", "terms", len(filter.Terms),
+			"rules", numRules, "filter_id", filterID)
+		filterID++
+	}
+
+	// Compile inet6 filters
+	for name, filter := range cfg.Firewall.FiltersInet6 {
+		if filterID >= MaxFilterConfigs || ruleIdx >= MaxFilterRules {
+			slog.Warn("firewall filter limit reached", "filter", name)
+			break
+		}
+		startIdx := ruleIdx
+		for _, term := range filter.Terms {
+			rules := expandFilterTerm(term, AFInet6, riTableIDs)
+			for _, rule := range rules {
+				if ruleIdx >= MaxFilterRules {
+					slog.Warn("filter rule limit reached", "filter", name, "term", term.Name)
+					break
+				}
+				if err := m.SetFilterRule(ruleIdx, rule); err != nil {
+					return fmt.Errorf("set filter rule %d: %w", ruleIdx, err)
+				}
+				ruleIdx++
+			}
+		}
+		numRules := ruleIdx - startIdx
+		if err := m.SetFilterConfig(filterID, FilterConfig{
+			NumRules:  numRules,
+			RuleStart: startIdx,
+		}); err != nil {
+			return fmt.Errorf("set filter config %s: %w", name, err)
+		}
+		filterIDs["inet6:"+name] = filterID
+		slog.Info("compiled firewall filter",
+			"name", name, "family", "inet6", "terms", len(filter.Terms),
+			"rules", numRules, "filter_id", filterID)
+		filterID++
+	}
+
+	// Map interfaces to their assigned filters
+	for _, ifCfg := range cfg.Interfaces.Interfaces {
+		for _, unit := range ifCfg.Units {
+			if unit.FilterInputV4 == "" && unit.FilterInputV6 == "" {
+				continue
+			}
+
+			physName := ifCfg.Name
+			vlanID := uint16(unit.VlanID)
+
+			// Resolve ifindex
+			iface, err := net.InterfaceByName(physName)
+			if err != nil {
+				slog.Warn("interface not found for filter assignment",
+					"interface", physName, "err", err)
+				continue
+			}
+
+			ifindex := uint32(iface.Index)
+			// If VLAN sub-interface, use the sub-interface ifindex
+			if vlanID > 0 {
+				subName := fmt.Sprintf("%s.%d", physName, vlanID)
+				subIface, err := net.InterfaceByName(subName)
+				if err != nil {
+					slog.Warn("VLAN sub-interface not found for filter",
+						"name", subName, "err", err)
+					continue
+				}
+				ifindex = uint32(subIface.Index)
+				// Physical ifindex is used in iface_filter_key since
+				// xdp_main uses ctx->ingress_ifindex (parent phys NIC)
+				ifindex = uint32(iface.Index)
+			}
+
+			if unit.FilterInputV4 != "" {
+				fid, ok := filterIDs["inet:"+unit.FilterInputV4]
+				if !ok {
+					slog.Warn("filter not found for interface",
+						"filter", unit.FilterInputV4, "interface", physName)
+				} else {
+					key := IfaceFilterKey{
+						Ifindex: ifindex,
+						VlanID:  vlanID,
+						Family:  AFInet,
+					}
+					if err := m.SetIfaceFilter(key, fid); err != nil {
+						return fmt.Errorf("set iface filter %s inet: %w", physName, err)
+					}
+					slog.Info("assigned filter to interface",
+						"interface", physName, "vlan", vlanID,
+						"family", "inet", "filter", unit.FilterInputV4)
+				}
+			}
+
+			if unit.FilterInputV6 != "" {
+				fid, ok := filterIDs["inet6:"+unit.FilterInputV6]
+				if !ok {
+					slog.Warn("filter not found for interface",
+						"filter", unit.FilterInputV6, "interface", physName)
+				} else {
+					key := IfaceFilterKey{
+						Ifindex: ifindex,
+						VlanID:  vlanID,
+						Family:  AFInet6,
+					}
+					if err := m.SetIfaceFilter(key, fid); err != nil {
+						return fmt.Errorf("set iface filter %s inet6: %w", physName, err)
+					}
+					slog.Info("assigned filter to interface",
+						"interface", physName, "vlan", vlanID,
+						"family", "inet6", "filter", unit.FilterInputV6)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// expandFilterTerm expands a single filter term into one or more BPF filter rules.
+// Terms with multiple source/destination addresses generate the cross product of rules.
+func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs map[string]uint32) []FilterRule {
+	// Base rule with common fields
+	base := FilterRule{
+		Family: family,
+	}
+
+	// Set action
+	if term.RoutingInstance != "" {
+		base.Action = FilterActionRoute
+		if tableID, ok := riTableIDs[term.RoutingInstance]; ok {
+			base.RoutingTable = tableID
+		} else {
+			slog.Warn("routing-instance not found for filter term",
+				"term", term.Name, "instance", term.RoutingInstance)
+			base.Action = FilterActionAccept
+		}
+	} else {
+		switch term.Action {
+		case "discard":
+			base.Action = FilterActionDiscard
+		case "reject":
+			base.Action = FilterActionReject
+		default:
+			base.Action = FilterActionAccept
+		}
+	}
+
+	// DSCP match
+	if term.DSCP != "" {
+		base.MatchFlags |= FilterMatchDSCP
+		if val, ok := DSCPValues[strings.ToLower(term.DSCP)]; ok {
+			base.DSCP = val
+		} else if v, err := strconv.Atoi(term.DSCP); err == nil {
+			base.DSCP = uint8(v)
+		}
+	}
+
+	// Protocol match
+	if term.Protocol != "" {
+		base.MatchFlags |= FilterMatchProtocol
+		switch strings.ToLower(term.Protocol) {
+		case "tcp":
+			base.Protocol = 6
+		case "udp":
+			base.Protocol = 17
+		case "icmp":
+			base.Protocol = 1
+		case "icmpv6":
+			base.Protocol = 58
+		default:
+			if v, err := strconv.Atoi(term.Protocol); err == nil {
+				base.Protocol = uint8(v)
+			}
+		}
+	}
+
+	// ICMP type/code
+	if term.ICMPType >= 0 {
+		base.MatchFlags |= FilterMatchICMPType
+		base.ICMPType = uint8(term.ICMPType)
+	}
+	if term.ICMPCode >= 0 {
+		base.MatchFlags |= FilterMatchICMPCode
+		base.ICMPCode = uint8(term.ICMPCode)
+	}
+
+	// Destination port (first port only for now)
+	if len(term.DestinationPorts) > 0 {
+		base.MatchFlags |= FilterMatchDstPort
+		portStr := term.DestinationPorts[0]
+		// Resolve well-known port names
+		portNum := resolvePortName(portStr)
+		base.DstPort = htons(portNum)
+	}
+
+	// Expand source/destination address combinations
+	srcAddrs := term.SourceAddresses
+	dstAddrs := term.DestAddresses
+	if len(srcAddrs) == 0 {
+		srcAddrs = []string{""} // "any"
+	}
+	if len(dstAddrs) == 0 {
+		dstAddrs = []string{""} // "any"
+	}
+
+	var rules []FilterRule
+	for _, src := range srcAddrs {
+		for _, dst := range dstAddrs {
+			rule := base
+			if src != "" {
+				rule.MatchFlags |= FilterMatchSrcAddr
+				setFilterAddr(&rule.SrcAddr, &rule.SrcMask, src, family)
+			}
+			if dst != "" {
+				rule.MatchFlags |= FilterMatchDstAddr
+				setFilterAddr(&rule.DstAddr, &rule.DstMask, dst, family)
+			}
+			rules = append(rules, rule)
+		}
+	}
+
+	return rules
+}
+
+// setFilterAddr parses a CIDR string and populates addr/mask byte arrays.
+func setFilterAddr(addr, mask *[16]byte, cidr string, family uint8) {
+	// Strip "except" suffix (prefix-list negation — not supported yet, treat as positive match)
+	cidr = strings.TrimSuffix(cidr, " except")
+	cidr = strings.TrimSuffix(cidr, ";")
+
+	// If no prefix length, assume /32 (v4) or /128 (v6)
+	if !strings.Contains(cidr, "/") {
+		if family == AFInet {
+			cidr += "/32"
+		} else {
+			cidr += "/128"
+		}
+	}
+
+	ip, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		slog.Warn("invalid CIDR in filter term", "cidr", cidr, "err", err)
+		return
+	}
+
+	if family == AFInet {
+		ip4 := ip.To4()
+		if ip4 == nil {
+			return
+		}
+		copy(addr[:4], ip4)
+		copy(mask[:4], ipNet.Mask)
+	} else {
+		ip16 := ip.To16()
+		if ip16 == nil {
+			return
+		}
+		copy(addr[:], ip16)
+		copy(mask[:], ipNet.Mask)
+	}
+}
+
+// resolvePortName maps well-known port names to numbers.
+func resolvePortName(name string) uint16 {
+	switch strings.ToLower(name) {
+	case "ssh":
+		return 22
+	case "http":
+		return 80
+	case "https":
+		return 443
+	case "dns":
+		return 53
+	case "ftp":
+		return 21
+	case "smtp":
+		return 25
+	case "snmp":
+		return 161
+	case "bgp":
+		return 179
+	case "ntp":
+		return 123
+	case "telnet":
+		return 23
+	default:
+		if v, err := strconv.ParseUint(name, 10, 16); err == nil {
+			return uint16(v)
+		}
+		return 0
+	}
 }

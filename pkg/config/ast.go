@@ -228,11 +228,15 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	}},
 	"interfaces": {wildcard: &schemaNode{valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 		"vlan-tagging": {children: nil},
+		"tunnel":       {children: nil}, // tunnel source/destination/key/ttl are leaves
 		"unit": {args: 1, children: map[string]*schemaNode{
 			"vlan-id": {args: 1, children: nil},
 			"family": {children: map[string]*schemaNode{
-				"inet": {children: nil},
+				"inet": {children: map[string]*schemaNode{
+					"filter": {children: nil},
+				}},
 				"inet6": {children: map[string]*schemaNode{
+					"filter":        {children: nil},
 					"dhcpv6-client": {children: map[string]*schemaNode{
 						"client-identifier": {children: map[string]*schemaNode{
 							"duid-type": {args: 1, children: nil},
@@ -241,7 +245,6 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				}},
 			}},
 		}},
-		"tunnel": {children: nil}, // tunnel source/destination/key/ttl are leaves
 	}}},
 	"applications": {children: map[string]*schemaNode{
 		"application":     {args: 1, valueHint: ValueHintAppName, children: nil},
@@ -262,6 +265,26 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"router-advertisement": {children: map[string]*schemaNode{
 			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 				"prefix": {args: 1, children: nil}, // prefix <prefix/len>
+			}},
+		}},
+	}},
+	"firewall": {children: map[string]*schemaNode{
+		"family": {children: map[string]*schemaNode{
+			"inet": {children: map[string]*schemaNode{
+				"filter": {args: 1, children: map[string]*schemaNode{
+					"term": {args: 1, children: map[string]*schemaNode{
+						"from": {children: nil},
+						"then": {children: nil},
+					}},
+				}},
+			}},
+			"inet6": {children: map[string]*schemaNode{
+				"filter": {args: 1, children: map[string]*schemaNode{
+					"term": {args: 1, children: map[string]*schemaNode{
+						"from": {children: nil},
+						"then": {children: nil},
+					}},
+				}},
 			}},
 		}},
 	}},

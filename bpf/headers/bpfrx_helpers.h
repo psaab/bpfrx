@@ -156,6 +156,7 @@ parse_iphdr(void *data, void *data_end, struct pkt_meta *meta)
 	meta->dst_ip.v4 = iph->daddr;
 	meta->protocol  = iph->protocol;
 	meta->ip_ttl    = iph->ttl;
+	meta->dscp      = iph->tos >> 2;  /* top 6 bits of TOS = DSCP */
 	meta->l4_offset = meta->l3_offset + ihl;
 	meta->pkt_len   = bpf_ntohs(iph->tot_len);
 	meta->addr_family = AF_INET;
@@ -187,6 +188,7 @@ parse_ipv6hdr(void *data, void *data_end, struct pkt_meta *meta)
 	__builtin_memcpy(meta->dst_ip.v6, &ip6h->daddr, 16);
 
 	meta->ip_ttl      = ip6h->hop_limit;
+	meta->dscp        = (ip6h->priority << 2) | (ip6h->flow_lbl[0] >> 6);
 	meta->pkt_len     = bpf_ntohs(ip6h->payload_len) + 40;
 	meta->addr_family = AF_INET6;
 	meta->is_fragment = 0;
@@ -563,6 +565,141 @@ host_inbound_flag(struct pkt_meta *meta)
 		return HOST_INBOUND_TRACEROUTE;
 
 	return 0; /* unknown service → allow by default */
+}
+
+/* ============================================================
+ * Firewall filter evaluation
+ *
+ * Called from xdp_main after header parsing.
+ * Evaluates the filter assigned to the ingress interface.
+ * Returns:
+ *   0  = no filter or "accept" — continue pipeline
+ *   -1 = "discard" — drop the packet
+ *   -2 = "reject" — reject the packet (currently same as discard in XDP)
+ * On FILTER_ACTION_ROUTE: sets meta->routing_table and returns 0.
+ * ============================================================ */
+static __always_inline int
+evaluate_firewall_filter(struct pkt_meta *meta)
+{
+	/* Look up filter ID for this interface + family */
+	struct iface_filter_key fkey = {
+		.ifindex = meta->ingress_ifindex,
+		.vlan_id = meta->ingress_vlan_id,
+		.family  = meta->addr_family,
+	};
+	__u32 *filter_id = bpf_map_lookup_elem(&iface_filter_map, &fkey);
+	if (!filter_id)
+		return 0; /* no filter assigned */
+
+	/* Get filter config (num_rules, rule_start) */
+	struct filter_config *fcfg = bpf_map_lookup_elem(&filter_configs, filter_id);
+	if (!fcfg || fcfg->num_rules == 0)
+		return 0;
+
+	__u32 start = fcfg->rule_start;
+	__u32 count = fcfg->num_rules;
+	if (count > MAX_FILTER_RULES_PER_FILTER)
+		count = MAX_FILTER_RULES_PER_FILTER;
+
+	/* Evaluate terms sequentially (first-match wins) */
+	#pragma unroll
+	for (__u32 i = 0; i < MAX_FILTER_RULES_PER_FILTER; i++) {
+		if (i >= count)
+			break;
+
+		__u32 idx = start + i;
+		if (idx >= MAX_FILTER_RULES)
+			break;
+
+		struct filter_rule *rule = bpf_map_lookup_elem(&filter_rules, &idx);
+		if (!rule)
+			break;
+
+		__u16 flags = rule->match_flags;
+		int match = 1;
+
+		/* Check DSCP */
+		if ((flags & FILTER_MATCH_DSCP) && rule->dscp != meta->dscp)
+			match = 0;
+
+		/* Check protocol */
+		if (match && (flags & FILTER_MATCH_PROTOCOL) &&
+		    rule->protocol != meta->protocol)
+			match = 0;
+
+		/* Check destination port */
+		if (match && (flags & FILTER_MATCH_DST_PORT) &&
+		    rule->dst_port != meta->dst_port)
+			match = 0;
+
+		/* Check ICMP type */
+		if (match && (flags & FILTER_MATCH_ICMP_TYPE) &&
+		    rule->icmp_type != meta->icmp_type)
+			match = 0;
+
+		/* Check ICMP code */
+		if (match && (flags & FILTER_MATCH_ICMP_CODE) &&
+		    rule->icmp_code != meta->icmp_code)
+			match = 0;
+
+		/* Check source address (v4 or v6 depending on family) */
+		if (match && (flags & FILTER_MATCH_SRC_ADDR)) {
+			if (meta->addr_family == AF_INET) {
+				__be32 masked = meta->src_ip.v4 &
+					*(__be32 *)rule->src_mask;
+				if (masked != *(__be32 *)rule->src_addr)
+					match = 0;
+			} else {
+				/* IPv6: compare 4 x 32-bit words */
+				for (int j = 0; j < 16; j += 4) {
+					__u32 m = *(__u32 *)(meta->src_ip.v6 + j) &
+						  *(__u32 *)(rule->src_mask + j);
+					if (m != *(__u32 *)(rule->src_addr + j)) {
+						match = 0;
+						break;
+					}
+				}
+			}
+		}
+
+		/* Check destination address */
+		if (match && (flags & FILTER_MATCH_DST_ADDR)) {
+			if (meta->addr_family == AF_INET) {
+				__be32 masked = meta->dst_ip.v4 &
+					*(__be32 *)rule->dst_mask;
+				if (masked != *(__be32 *)rule->dst_addr)
+					match = 0;
+			} else {
+				for (int j = 0; j < 16; j += 4) {
+					__u32 m = *(__u32 *)(meta->dst_ip.v6 + j) &
+						  *(__u32 *)(rule->dst_mask + j);
+					if (m != *(__u32 *)(rule->dst_addr + j)) {
+						match = 0;
+						break;
+					}
+				}
+			}
+		}
+
+		if (!match)
+			continue;
+
+		/* Term matched — apply action */
+		switch (rule->action) {
+		case FILTER_ACTION_ACCEPT:
+			return 0;
+		case FILTER_ACTION_DISCARD:
+			return -1;
+		case FILTER_ACTION_REJECT:
+			return -2;
+		case FILTER_ACTION_ROUTE:
+			meta->routing_table = rule->routing_table;
+			return 0;
+		}
+	}
+
+	/* No term matched — implicit accept */
+	return 0;
 }
 
 #endif /* __BPFRX_HELPERS_H__ */

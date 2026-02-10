@@ -62,6 +62,11 @@ int xdp_main_prog(struct xdp_md *ctx)
 			return XDP_DROP;
 	}
 
+	/* Evaluate firewall filter (if assigned to this interface) */
+	int filt_rc = evaluate_firewall_filter(meta);
+	if (filt_rc < 0)
+		return XDP_DROP;  /* discard or reject */
+
 	/* Increment global RX counter and per-interface RX counter */
 	inc_counter(GLOBAL_CTR_RX_PACKETS);
 	inc_iface_rx(meta->ingress_ifindex, meta->pkt_len);

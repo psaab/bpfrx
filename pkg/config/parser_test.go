@@ -1277,3 +1277,228 @@ func TestFormatSet(t *testing.T) {
 		t.Errorf("set format missing expected line:\n%s", setOutput)
 	}
 }
+
+func TestFirewallFilter(t *testing.T) {
+	// Test hierarchical syntax
+	input := `firewall {
+    family inet {
+        filter inet-source-dscp {
+            term dscp-to-gigabitpro {
+                from {
+                    dscp ef;
+                }
+                then {
+                    routing-instance Comcast-GigabitPro;
+                }
+            }
+            term ip-to-atherton-fiber {
+                from {
+                    source-address {
+                        172.16.80.198/32;
+                        176.124.71.0/24;
+                    }
+                }
+                then {
+                    routing-instance Atherton-Fiber;
+                }
+            }
+            term default {
+                then accept;
+            }
+        }
+        filter filter-management {
+            term block_unauthorised {
+                from {
+                    source-address {
+                        0.0.0.0/0;
+                    }
+                    protocol tcp;
+                    destination-port ssh;
+                }
+                then {
+                    log;
+                    syslog;
+                    reject;
+                }
+            }
+            term accept_default {
+                then accept;
+            }
+        }
+    }
+    family inet6 {
+        filter block-ra-adv {
+            term t1 {
+                from {
+                    icmp-type 134;
+                    icmp-code 0;
+                }
+                then discard;
+            }
+            term t2 {
+                then accept;
+            }
+        }
+    }
+}
+routing-instances {
+    Comcast-GigabitPro {
+        instance-type virtual-router;
+    }
+    Atherton-Fiber {
+        instance-type virtual-router;
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	// Check inet filters
+	if cfg.Firewall.FiltersInet == nil {
+		t.Fatal("expected FiltersInet to be non-nil")
+	}
+	dscpFilter, ok := cfg.Firewall.FiltersInet["inet-source-dscp"]
+	if !ok {
+		t.Fatal("expected inet-source-dscp filter")
+	}
+	if len(dscpFilter.Terms) != 3 {
+		t.Errorf("expected 3 terms, got %d", len(dscpFilter.Terms))
+	}
+	if dscpFilter.Terms[0].DSCP != "ef" {
+		t.Errorf("expected dscp ef, got %q", dscpFilter.Terms[0].DSCP)
+	}
+	if dscpFilter.Terms[0].RoutingInstance != "Comcast-GigabitPro" {
+		t.Errorf("expected routing-instance Comcast-GigabitPro, got %q",
+			dscpFilter.Terms[0].RoutingInstance)
+	}
+	if len(dscpFilter.Terms[1].SourceAddresses) != 2 {
+		t.Errorf("expected 2 source addresses, got %d",
+			len(dscpFilter.Terms[1].SourceAddresses))
+	}
+
+	mgmtFilter, ok := cfg.Firewall.FiltersInet["filter-management"]
+	if !ok {
+		t.Fatal("expected filter-management filter")
+	}
+	if len(mgmtFilter.Terms) != 2 {
+		t.Errorf("expected 2 terms, got %d", len(mgmtFilter.Terms))
+	}
+	if mgmtFilter.Terms[0].Protocol != "tcp" {
+		t.Errorf("expected protocol tcp, got %q", mgmtFilter.Terms[0].Protocol)
+	}
+	if mgmtFilter.Terms[0].Action != "reject" {
+		t.Errorf("expected action reject, got %q", mgmtFilter.Terms[0].Action)
+	}
+	if len(mgmtFilter.Terms[0].DestinationPorts) != 1 {
+		t.Errorf("expected 1 destination port, got %d",
+			len(mgmtFilter.Terms[0].DestinationPorts))
+	}
+
+	// Check inet6 filters
+	if cfg.Firewall.FiltersInet6 == nil {
+		t.Fatal("expected FiltersInet6 to be non-nil")
+	}
+	raFilter, ok := cfg.Firewall.FiltersInet6["block-ra-adv"]
+	if !ok {
+		t.Fatal("expected block-ra-adv filter")
+	}
+	if len(raFilter.Terms) != 2 {
+		t.Errorf("expected 2 terms, got %d", len(raFilter.Terms))
+	}
+	if raFilter.Terms[0].ICMPType != 134 {
+		t.Errorf("expected icmp-type 134, got %d", raFilter.Terms[0].ICMPType)
+	}
+	if raFilter.Terms[0].Action != "discard" {
+		t.Errorf("expected action discard, got %q", raFilter.Terms[0].Action)
+	}
+
+	// Check routing instances were compiled
+	if len(cfg.RoutingInstances) != 2 {
+		t.Errorf("expected 2 routing instances, got %d", len(cfg.RoutingInstances))
+	}
+
+	// Test set-command format
+	setCommands := []string{
+		"set firewall family inet filter test-filter term t1 from dscp af43",
+		"set firewall family inet filter test-filter term t1 then routing-instance ATT",
+		"set firewall family inet filter test-filter term default then accept",
+	}
+	tree2 := &ConfigTree{}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree2.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg2, err := CompileConfig(tree2)
+	if err != nil {
+		t.Fatalf("set-command compile error: %v", err)
+	}
+	tf, ok := cfg2.Firewall.FiltersInet["test-filter"]
+	if !ok {
+		t.Fatal("expected test-filter from set commands")
+	}
+	if len(tf.Terms) != 2 {
+		t.Errorf("expected 2 terms from set commands, got %d", len(tf.Terms))
+	}
+	if tf.Terms[0].DSCP != "af43" {
+		t.Errorf("expected dscp af43, got %q", tf.Terms[0].DSCP)
+	}
+}
+
+func TestInterfaceFilterAssignment(t *testing.T) {
+	input := `interfaces {
+    enp6s0 {
+        unit 0 {
+            family inet {
+                filter {
+                    input inet-source-dscp;
+                }
+                address 192.168.0.1/24;
+            }
+            family inet6 {
+                filter {
+                    input inet6-source-dscp;
+                }
+                address fd35::1/64;
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	ifc, ok := cfg.Interfaces.Interfaces["enp6s0"]
+	if !ok {
+		t.Fatal("expected enp6s0 interface")
+	}
+	unit := ifc.Units[0]
+	if unit == nil {
+		t.Fatal("expected unit 0")
+	}
+	if unit.FilterInputV4 != "inet-source-dscp" {
+		t.Errorf("expected FilterInputV4=inet-source-dscp, got %q", unit.FilterInputV4)
+	}
+	if unit.FilterInputV6 != "inet6-source-dscp" {
+		t.Errorf("expected FilterInputV6=inet6-source-dscp, got %q", unit.FilterInputV6)
+	}
+}

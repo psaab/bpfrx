@@ -486,6 +486,7 @@ func (c *CLI) handleShow(args []string) error {
 		fmt.Println("show: specify what to show")
 		fmt.Println("  configuration    Show active configuration")
 		fmt.Println("  dhcp             Show DHCP information")
+		fmt.Println("  firewall         Show firewall filters")
 		fmt.Println("  route            Show routing table")
 		fmt.Println("  security         Show security information")
 		fmt.Println("  interfaces       Show interface status")
@@ -517,6 +518,9 @@ func (c *CLI) handleShow(args []string) error {
 		fmt.Println("  leases              Show DHCP leases")
 		fmt.Println("  client-identifier   Show DHCPv6 DUID(s)")
 		return nil
+
+	case "firewall":
+		return c.showFirewallFilters()
 
 	case "route":
 		return c.handleShowRoute(args[1:])
@@ -2632,4 +2636,63 @@ func (c *CLI) showConfigHelp() {
 	fmt.Println("  exit                         Exit configuration mode")
 	fmt.Println()
 	fmt.Println("  Use <TAB> for command completion, ? for context help")
+}
+
+func (c *CLI) showFirewallFilters() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	showFilters := func(family string, filters map[string]*config.FirewallFilter) {
+		for name, f := range filters {
+			fmt.Printf("Filter: %s (family %s)\n", name, family)
+			for _, term := range f.Terms {
+				fmt.Printf("  Term: %s\n", term.Name)
+				if term.DSCP != "" {
+					fmt.Printf("    from dscp %s\n", term.DSCP)
+				}
+				if term.Protocol != "" {
+					fmt.Printf("    from protocol %s\n", term.Protocol)
+				}
+				for _, addr := range term.SourceAddresses {
+					fmt.Printf("    from source-address %s\n", addr)
+				}
+				for _, addr := range term.DestAddresses {
+					fmt.Printf("    from destination-address %s\n", addr)
+				}
+				for _, port := range term.DestinationPorts {
+					fmt.Printf("    from destination-port %s\n", port)
+				}
+				if term.ICMPType >= 0 {
+					fmt.Printf("    from icmp-type %d\n", term.ICMPType)
+				}
+				if term.ICMPCode >= 0 {
+					fmt.Printf("    from icmp-code %d\n", term.ICMPCode)
+				}
+				action := term.Action
+				if action == "" {
+					action = "accept"
+				}
+				if term.RoutingInstance != "" {
+					fmt.Printf("    then routing-instance %s\n", term.RoutingInstance)
+				}
+				if term.Log {
+					fmt.Printf("    then log\n")
+				}
+				fmt.Printf("    then %s\n", action)
+			}
+			fmt.Println()
+		}
+	}
+
+	if len(cfg.Firewall.FiltersInet) == 0 && len(cfg.Firewall.FiltersInet6) == 0 {
+		fmt.Println("No firewall filters configured")
+		return nil
+	}
+
+	showFilters("inet", cfg.Firewall.FiltersInet)
+	showFilters("inet6", cfg.Firewall.FiltersInet6)
+	return nil
 }

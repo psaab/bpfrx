@@ -8,6 +8,34 @@ type Config struct {
 	RoutingOptions   RoutingOptionsConfig
 	Protocols        ProtocolsConfig
 	RoutingInstances []*RoutingInstanceConfig
+	Firewall         FirewallConfig
+}
+
+// FirewallConfig holds firewall filter definitions.
+type FirewallConfig struct {
+	FiltersInet  map[string]*FirewallFilter // family inet filters
+	FiltersInet6 map[string]*FirewallFilter // family inet6 filters
+}
+
+// FirewallFilter defines a named firewall filter with ordered terms.
+type FirewallFilter struct {
+	Name  string
+	Terms []*FirewallFilterTerm
+}
+
+// FirewallFilterTerm is a single match/action term within a filter.
+type FirewallFilterTerm struct {
+	Name             string
+	SourceAddresses  []string // CIDRs
+	DestAddresses    []string // CIDRs
+	DSCP             string   // DSCP/traffic-class name (ef, af43, etc.) or number
+	Protocol         string   // tcp, udp, icmp, icmpv6
+	DestinationPorts []string // port numbers or names
+	ICMPType         int      // -1 = not set
+	ICMPCode         int      // -1 = not set
+	Action           string   // "accept", "reject", "discard", ""
+	RoutingInstance  string   // routing-instance name (policy-based routing)
+	Log              bool
 }
 
 // SecurityConfig holds all security-related configuration.
@@ -266,12 +294,14 @@ type InterfaceConfig struct {
 
 // InterfaceUnit represents a logical unit on an interface.
 type InterfaceUnit struct {
-	Number       int
-	VlanID       int      // 0 = native/untagged, >0 = 802.1Q tagged
-	Addresses    []string // CIDR notation
-	DHCP         bool     // family inet { dhcp; }
-	DHCPv6       bool     // family inet6 { dhcpv6; }
-	DHCPv6Client *DHCPv6ClientConfig
+	Number        int
+	VlanID        int      // 0 = native/untagged, >0 = 802.1Q tagged
+	Addresses     []string // CIDR notation
+	DHCP          bool     // family inet { dhcp; }
+	DHCPv6        bool     // family inet6 { dhcpv6; }
+	DHCPv6Client  *DHCPv6ClientConfig
+	FilterInputV4 string // family inet { filter { input NAME; } }
+	FilterInputV6 string // family inet6 { filter { input NAME; } }
 }
 
 // DHCPv6ClientConfig holds DHCPv6 client options (dhcpv6-client stanza).
