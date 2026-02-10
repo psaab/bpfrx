@@ -431,7 +431,48 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*Lease, error
 		}
 	}
 
+	// DHCPv6 doesn't provide a default router — discover it from the
+	// kernel's IPv6 neighbor table (entries learned via Router Advertisements).
+	if gw := m.discoverIPv6Router(ifaceName); gw.IsValid() {
+		lease.Gateway = gw
+	}
+
 	return lease, nil
+}
+
+// discoverIPv6Router finds the link-local address of an IPv6 router on the
+// given interface by inspecting the kernel neighbor table for entries with
+// the NTF_ROUTER flag (learned from Router Advertisements).
+// Retries a few times since RAs may not have been processed yet.
+func (m *Manager) discoverIPv6Router(ifaceName string) netip.Addr {
+	link, err := m.nlHandle.LinkByName(ifaceName)
+	if err != nil {
+		return netip.Addr{}
+	}
+
+	for attempt := 0; attempt < 10; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Second)
+		}
+
+		neighbors, err := m.nlHandle.NeighList(link.Attrs().Index, netlink.FAMILY_V6)
+		if err != nil {
+			continue
+		}
+
+		for _, n := range neighbors {
+			// NTF_ROUTER = 0x80 (linux/neighbour.h)
+			if n.Flags&0x80 != 0 && n.IP.IsLinkLocalUnicast() {
+				if a, ok := netip.AddrFromSlice(n.IP); ok {
+					return a
+				}
+			}
+		}
+	}
+
+	slog.Warn("DHCPv6: no IPv6 router found in neighbor table",
+		"interface", ifaceName)
+	return netip.Addr{}
 }
 
 // waitForLinkLocal waits until the interface has a link-local IPv6 address.
