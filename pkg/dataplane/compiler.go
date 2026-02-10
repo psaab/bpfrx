@@ -178,6 +178,31 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, error) {
 	return link.Attrs().Index, nil
 }
 
+// assignInterfaceAddresses assigns configured addresses to a physical interface via netlink.
+func assignInterfaceAddresses(ifaceName string, addresses []string) {
+	link, err := netlink.LinkByName(ifaceName)
+	if err != nil {
+		slog.Warn("cannot find interface for address assignment",
+			"name", ifaceName, "err", err)
+		return
+	}
+	for _, addrStr := range addresses {
+		addr, err := netlink.ParseAddr(addrStr)
+		if err != nil {
+			slog.Warn("invalid address for interface",
+				"addr", addrStr, "name", ifaceName, "err", err)
+			continue
+		}
+		if err := netlink.AddrAdd(link, addr); err != nil {
+			// EEXIST is fine
+			if !strings.Contains(err.Error(), "exists") {
+				slog.Warn("failed to add address to interface",
+					"addr", addrStr, "name", ifaceName, "err", err)
+			}
+		}
+	}
+}
+
 // assignSubInterfaceAddresses assigns configured addresses to a VLAN sub-interface via netlink.
 func assignSubInterfaceAddresses(subName string, addresses []string) {
 	link, err := netlink.LinkByName(subName)
@@ -326,6 +351,15 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 				}
 
 				attached[physIface.Index] = true
+			}
+
+			// Assign addresses from config for non-VLAN interfaces
+			if vlanID == 0 {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+					if unit, ok := ifCfg.Units[unitNum]; ok && len(unit.Addresses) > 0 {
+						assignInterfaceAddresses(physName, unit.Addresses)
+					}
+				}
 			}
 
 			slog.Info("zone interface configured",

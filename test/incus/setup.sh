@@ -242,67 +242,29 @@ provision_instance() {
 		fi
 	done
 
-	# Detect network manager: systemd-networkd or ifupdown
-	local use_networkd=false
-	if incus exec "$INSTANCE_NAME" -- systemctl is-active systemd-networkd &>/dev/null; then
-		use_networkd=true
-	fi
+	# Bring up interfaces (IPs are assigned by bpfrxd from config)
+	info "Bringing up interfaces..."
+	incus exec "$INSTANCE_NAME" -- ip link set "$iface_trust" up 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- ip link set "$iface_untrust" up 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- ip link set "$iface_dmz" up 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- ip link set "$iface_tunnel" up 2>/dev/null || true
 
-	info "Configuring network interfaces..."
-	if [[ "$use_networkd" == "true" ]]; then
-		incus exec "$INSTANCE_NAME" -- bash -c "cat > /etc/systemd/network/${iface_trust}.network" <<-EOF
-		[Match]
-		Name=${iface_trust}
-		[Network]
-		Address=10.0.1.10/24
-		EOF
-
-		incus exec "$INSTANCE_NAME" -- bash -c "cat > /etc/systemd/network/${iface_untrust}.network" <<-EOF
-		[Match]
-		Name=${iface_untrust}
-		[Network]
-		Address=10.0.2.10/24
-		[Route]
-		Gateway=10.0.2.1
-		Metric=200
-		EOF
-
-		incus exec "$INSTANCE_NAME" -- bash -c "cat > /etc/systemd/network/${iface_dmz}.network" <<-EOF
-		[Match]
-		Name=${iface_dmz}
-		[Network]
-		Address=10.0.30.10/24
-		EOF
-
-		incus exec "$INSTANCE_NAME" -- bash -c "cat > /etc/systemd/network/${iface_tunnel}.network" <<-EOF
-		[Match]
-		Name=${iface_tunnel}
-		[Network]
-		Address=10.0.40.10/24
-		EOF
-
-		# Internet-facing SR-IOV interface (DHCP handled by bpfrxd)
-		if [[ "$type" == "vm" ]]; then
+	# Internet-facing interface: disable RequiredForOnline (DHCP handled by bpfrxd)
+	if [[ "$type" == "vm" ]]; then
+		local use_networkd=false
+		if incus exec "$INSTANCE_NAME" -- systemctl is-active systemd-networkd &>/dev/null; then
+			use_networkd=true
+		fi
+		if [[ "$use_networkd" == "true" ]]; then
 			incus exec "$INSTANCE_NAME" -- bash -c "cat > /etc/systemd/network/50-internet.network" <<-EOF
 			[Match]
 			Name=enp10s0
 			[Link]
 			RequiredForOnline=no
 			EOF
+			incus exec "$INSTANCE_NAME" -- networkctl reload
 		fi
-
-		incus exec "$INSTANCE_NAME" -- networkctl reload
-	else
-		# Fallback: direct ip commands
-		incus exec "$INSTANCE_NAME" -- ip addr add 10.0.1.10/24 dev "$iface_trust" 2>/dev/null || true
-		incus exec "$INSTANCE_NAME" -- ip addr add 10.0.2.10/24 dev "$iface_untrust" 2>/dev/null || true
-		incus exec "$INSTANCE_NAME" -- ip addr add 10.0.30.10/24 dev "$iface_dmz" 2>/dev/null || true
-		incus exec "$INSTANCE_NAME" -- ip addr add 10.0.40.10/24 dev "$iface_tunnel" 2>/dev/null || true
 	fi
-	incus exec "$INSTANCE_NAME" -- ip link set "$iface_trust" up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set "$iface_untrust" up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set "$iface_dmz" up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set "$iface_tunnel" up 2>/dev/null || true
 
 	info "Configuring sysctl..."
 	incus exec "$INSTANCE_NAME" -- bash -c 'cat > /etc/sysctl.d/99-bpf.conf <<EOF
@@ -366,8 +328,8 @@ cmd_deploy() {
 		die "Instance $INSTANCE_NAME does not exist. Run '$0 create-vm' or '$0 create-ct' first."
 	fi
 
-	info "Building bpfrxd..."
-	make -C "$PROJECT_ROOT" build
+	info "Building bpfrxd and bpfrxctl..."
+	make -C "$PROJECT_ROOT" build build-ctl
 
 	# Stop running bpfrxd if any (avoids "text file busy")
 	incus exec "$INSTANCE_NAME" -- pkill -9 bpfrxd 2>/dev/null || true
@@ -375,6 +337,9 @@ cmd_deploy() {
 
 	info "Pushing bpfrxd to $INSTANCE_NAME..."
 	incus file push "$PROJECT_ROOT/bpfrxd" "$INSTANCE_NAME/usr/local/sbin/bpfrxd" --mode 0755
+
+	info "Pushing bpfrxctl to $INSTANCE_NAME..."
+	incus file push "$PROJECT_ROOT/bpfrxctl" "$INSTANCE_NAME/usr/local/bin/bpfrxctl" --mode 0755
 
 	# Push test config if it exists
 	if [[ -f "${SCRIPT_DIR}/bpfrx-test.conf" ]]; then
