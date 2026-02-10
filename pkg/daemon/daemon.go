@@ -19,6 +19,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/dataplane"
 	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/frr"
+	"github.com/psaab/bpfrx/pkg/grpcapi"
 	"github.com/psaab/bpfrx/pkg/ipsec"
 	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/routing"
@@ -29,6 +30,7 @@ type Options struct {
 	ConfigFile  string
 	NoDataplane bool   // set to true to run without eBPF (config-only mode)
 	APIAddr     string // HTTP API listen address (empty = disabled)
+	GRPCAddr    string // gRPC API listen address (empty = disabled)
 }
 
 // Daemon is the main bpfrx daemon.
@@ -163,6 +165,29 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		}()
 		slog.Info("HTTP API server started", "addr", d.opts.APIAddr)
+	}
+
+	// Start gRPC API server if configured.
+	if d.opts.GRPCAddr != "" {
+		grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
+			Store:    d.store,
+			DP:       d.dp,
+			EventBuf: eventBuf,
+			GC:       gc,
+			Routing:  d.routing,
+			FRR:      d.frr,
+			IPsec:    d.ipsec,
+			DHCP:     d.dhcp,
+			ApplyFn:  d.applyConfig,
+		})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := grpcSrv.Run(ctx); err != nil {
+				slog.Error("gRPC server error", "err", err)
+			}
+		}()
+		slog.Info("gRPC API server started", "addr", d.opts.GRPCAddr)
 	}
 
 	// Start CLI shell

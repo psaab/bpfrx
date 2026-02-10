@@ -6,9 +6,9 @@ PREFIX ?= /usr/local
 # eBPF compilation flags
 BPF_CFLAGS := -O2 -g -Wall -Werror -target bpf
 
-.PHONY: all generate build install clean test
+.PHONY: all generate build build-ctl proto install clean test
 
-all: generate build
+all: generate build build-ctl
 
 # Generate Go bindings from eBPF C programs via bpf2go
 generate:
@@ -18,14 +18,26 @@ generate:
 build:
 	CGO_ENABLED=0 $(GO) build -o $(BINARY) ./cmd/bpfrxd
 
-install: build
+# Build the remote CLI client
+build-ctl:
+	CGO_ENABLED=0 $(GO) build -o bpfrxctl ./cmd/bpfrxctl
+
+# Generate protobuf/gRPC code
+proto:
+	protoc --proto_path=proto/bpfrx/v1 \
+		--go_out=pkg/grpcapi/bpfrxv1 --go_opt=paths=source_relative \
+		--go-grpc_out=pkg/grpcapi/bpfrxv1 --go-grpc_opt=paths=source_relative \
+		proto/bpfrx/v1/bpfrx.proto
+
+install: build build-ctl
 	install -m 0755 $(BINARY) $(PREFIX)/sbin/$(BINARY)
+	install -m 0755 bpfrxctl $(PREFIX)/bin/bpfrxctl
 
 test:
 	$(GO) test ./...
 
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) bpfrxctl
 	rm -f pkg/dataplane/*_bpfel.go pkg/dataplane/*_bpfeb.go
 	rm -f pkg/dataplane/*_bpfel.o pkg/dataplane/*_bpfeb.o
 
@@ -41,7 +53,7 @@ test-vm:
 test-ct:
 	./test/incus/setup.sh create-ct
 
-test-deploy: build
+test-deploy: build build-ctl
 	./test/incus/setup.sh deploy
 
 test-ssh:

@@ -1,0 +1,1245 @@
+// Package grpcapi implements the gRPC API server for bpfrx.
+package grpcapi
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"log/slog"
+	"net"
+	"sort"
+	"strings"
+	"time"
+
+	"golang.org/x/sys/unix"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/configstore"
+	"github.com/psaab/bpfrx/pkg/conntrack"
+	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/bpfrx/pkg/dhcp"
+	"github.com/psaab/bpfrx/pkg/frr"
+	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
+	"github.com/psaab/bpfrx/pkg/ipsec"
+	"github.com/psaab/bpfrx/pkg/logging"
+	"github.com/psaab/bpfrx/pkg/routing"
+)
+
+// Config configures the gRPC server.
+type Config struct {
+	Store    *configstore.Store
+	DP       *dataplane.Manager
+	EventBuf *logging.EventBuffer
+	GC       *conntrack.GC
+	Routing  *routing.Manager
+	FRR      *frr.Manager
+	IPsec    *ipsec.Manager
+	DHCP     *dhcp.Manager
+	ApplyFn  func(*config.Config) // daemon's applyConfig callback
+}
+
+// Server implements the BpfrxService gRPC service.
+type Server struct {
+	pb.UnimplementedBpfrxServiceServer
+	store     *configstore.Store
+	dp        *dataplane.Manager
+	eventBuf  *logging.EventBuffer
+	gc        *conntrack.GC
+	routing   *routing.Manager
+	frr       *frr.Manager
+	ipsec     *ipsec.Manager
+	dhcp      *dhcp.Manager
+	applyFn   func(*config.Config)
+	startTime time.Time
+	addr      string
+}
+
+// NewServer creates a new gRPC server.
+func NewServer(addr string, cfg Config) *Server {
+	return &Server{
+		store:     cfg.Store,
+		dp:        cfg.DP,
+		eventBuf:  cfg.EventBuf,
+		gc:        cfg.GC,
+		routing:   cfg.Routing,
+		frr:       cfg.FRR,
+		ipsec:     cfg.IPsec,
+		dhcp:      cfg.DHCP,
+		applyFn:   cfg.ApplyFn,
+		startTime: time.Now(),
+		addr:      addr,
+	}
+}
+
+// Run starts the gRPC server and blocks until ctx is cancelled.
+func (s *Server) Run(ctx context.Context) error {
+	lis, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("gRPC listen: %w", err)
+	}
+
+	srv := grpc.NewServer()
+	pb.RegisterBpfrxServiceServer(srv, s)
+
+	errCh := make(chan error, 1)
+	go func() {
+		slog.Info("gRPC server listening", "addr", s.addr)
+		if err := srv.Serve(lis); err != nil {
+			errCh <- err
+		}
+		close(errCh)
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+	}
+
+	srv.GracefulStop()
+	return nil
+}
+
+// --- Config lifecycle RPCs ---
+
+func (s *Server) EnterConfigure(_ context.Context, _ *pb.EnterConfigureRequest) (*pb.EnterConfigureResponse, error) {
+	if err := s.store.EnterConfigure(); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+	return &pb.EnterConfigureResponse{}, nil
+}
+
+func (s *Server) ExitConfigure(_ context.Context, _ *pb.ExitConfigureRequest) (*pb.ExitConfigureResponse, error) {
+	s.store.ExitConfigure()
+	return &pb.ExitConfigureResponse{}, nil
+}
+
+func (s *Server) GetConfigModeStatus(_ context.Context, _ *pb.GetConfigModeStatusRequest) (*pb.GetConfigModeStatusResponse, error) {
+	return &pb.GetConfigModeStatusResponse{
+		InConfigMode:   s.store.InConfigMode(),
+		Dirty:          s.store.IsDirty(),
+		ConfirmPending: s.store.IsConfirmPending(),
+	}, nil
+}
+
+func (s *Server) Set(_ context.Context, req *pb.SetRequest) (*pb.SetResponse, error) {
+	if err := s.store.SetFromInput(req.Input); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	return &pb.SetResponse{}, nil
+}
+
+func (s *Server) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+	if err := s.store.DeleteFromInput(req.Input); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	return &pb.DeleteResponse{}, nil
+}
+
+func (s *Server) Commit(_ context.Context, _ *pb.CommitRequest) (*pb.CommitResponse, error) {
+	// If a confirmed commit is pending, confirm it
+	if s.store.IsConfirmPending() {
+		if err := s.store.ConfirmCommit(); err != nil {
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
+		return &pb.CommitResponse{}, nil
+	}
+
+	compiled, err := s.store.Commit()
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if s.applyFn != nil {
+		s.applyFn(compiled)
+	}
+	return &pb.CommitResponse{}, nil
+}
+
+func (s *Server) CommitCheck(_ context.Context, _ *pb.CommitCheckRequest) (*pb.CommitCheckResponse, error) {
+	if _, err := s.store.CommitCheck(); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	return &pb.CommitCheckResponse{}, nil
+}
+
+func (s *Server) CommitConfirmed(_ context.Context, req *pb.CommitConfirmedRequest) (*pb.CommitConfirmedResponse, error) {
+	compiled, err := s.store.CommitConfirmed(int(req.Minutes))
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if s.applyFn != nil {
+		s.applyFn(compiled)
+	}
+	return &pb.CommitConfirmedResponse{}, nil
+}
+
+func (s *Server) ConfirmCommit(_ context.Context, _ *pb.ConfirmCommitRequest) (*pb.ConfirmCommitResponse, error) {
+	if err := s.store.ConfirmCommit(); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+	return &pb.ConfirmCommitResponse{}, nil
+}
+
+func (s *Server) Rollback(_ context.Context, req *pb.RollbackRequest) (*pb.RollbackResponse, error) {
+	if err := s.store.Rollback(int(req.N)); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	return &pb.RollbackResponse{}, nil
+}
+
+func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.ShowConfigResponse, error) {
+	var output string
+	switch {
+	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_SET:
+		output = s.store.ShowActiveSet()
+	case req.Target == pb.ConfigTarget_ACTIVE:
+		output = s.store.ShowActive()
+	case req.Format == pb.ConfigFormat_SET:
+		output = s.store.ShowCandidateSet()
+	default:
+		output = s.store.ShowCandidate()
+	}
+	return &pb.ShowConfigResponse{Output: output}, nil
+}
+
+func (s *Server) ShowCompare(_ context.Context, req *pb.ShowCompareRequest) (*pb.ShowCompareResponse, error) {
+	if req.RollbackN > 0 {
+		diff, err := s.store.ShowCompareRollback(int(req.RollbackN))
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		return &pb.ShowCompareResponse{Output: diff}, nil
+	}
+	return &pb.ShowCompareResponse{Output: s.store.ShowCompare()}, nil
+}
+
+func (s *Server) ShowRollback(_ context.Context, req *pb.ShowRollbackRequest) (*pb.ShowRollbackResponse, error) {
+	var output string
+	var err error
+	if req.Format == pb.ConfigFormat_SET {
+		output, err = s.store.ShowRollbackSet(int(req.N))
+	} else {
+		output, err = s.store.ShowRollback(int(req.N))
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	return &pb.ShowRollbackResponse{Output: output}, nil
+}
+
+func (s *Server) ListHistory(_ context.Context, _ *pb.ListHistoryRequest) (*pb.ListHistoryResponse, error) {
+	entries := s.store.ListHistory()
+	resp := &pb.ListHistoryResponse{}
+	for i, e := range entries {
+		resp.Entries = append(resp.Entries, &pb.HistoryEntry{
+			Index:     int32(i + 1),
+			Timestamp: e.Timestamp.Format("2006-01-02 15:04:05"),
+		})
+	}
+	return resp, nil
+}
+
+// --- Operational show RPCs ---
+
+func (s *Server) GetStatus(_ context.Context, _ *pb.GetStatusRequest) (*pb.GetStatusResponse, error) {
+	resp := &pb.GetStatusResponse{
+		Uptime:          time.Since(s.startTime).Truncate(time.Second).String(),
+		DataplaneLoaded: s.dp != nil && s.dp.IsLoaded(),
+		ConfigLoaded:    s.store.ActiveConfig() != nil,
+	}
+	if cfg := s.store.ActiveConfig(); cfg != nil {
+		resp.ZoneCount = int32(len(cfg.Security.Zones))
+	}
+	if s.gc != nil {
+		stats := s.gc.Stats()
+		resp.SessionCount = int32(stats.TotalEntries)
+	}
+	return resp, nil
+}
+
+func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) (*pb.GetGlobalStatsResponse, error) {
+	if s.dp == nil || !s.dp.IsLoaded() {
+		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
+	}
+	ctrMap := s.dp.Map("global_counters")
+	if ctrMap == nil {
+		return nil, status.Error(codes.Internal, "global_counters map not found")
+	}
+
+	readCounter := func(idx uint32) uint64 {
+		var perCPU []uint64
+		if err := ctrMap.Lookup(idx, &perCPU); err != nil {
+			return 0
+		}
+		var total uint64
+		for _, v := range perCPU {
+			total += v
+		}
+		return total
+	}
+
+	return &pb.GetGlobalStatsResponse{
+		RxPackets:        readCounter(dataplane.GlobalCtrRxPackets),
+		TxPackets:        readCounter(dataplane.GlobalCtrTxPackets),
+		Drops:            readCounter(dataplane.GlobalCtrDrops),
+		SessionsCreated:  readCounter(dataplane.GlobalCtrSessionsNew),
+		SessionsClosed:   readCounter(dataplane.GlobalCtrSessionsClosed),
+		ScreenDrops:      readCounter(dataplane.GlobalCtrScreenDrops),
+		PolicyDenies:     readCounter(dataplane.GlobalCtrPolicyDeny),
+		NatAllocFailures: readCounter(dataplane.GlobalCtrNATAllocFail),
+		HostInboundDenies: readCounter(dataplane.GlobalCtrHostInboundDeny),
+		TcEgressPackets:  readCounter(dataplane.GlobalCtrTCEgressPackets),
+	}, nil
+}
+
+func (s *Server) GetZones(_ context.Context, _ *pb.GetZonesRequest) (*pb.GetZonesResponse, error) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		return &pb.GetZonesResponse{}, nil
+	}
+
+	var cr *dataplane.CompileResult
+	if s.dp != nil {
+		cr = s.dp.LastCompileResult()
+	}
+
+	resp := &pb.GetZonesResponse{}
+	for zoneName, zone := range cfg.Security.Zones {
+		zi := &pb.ZoneInfo{
+			Name:       zoneName,
+			Interfaces: zone.Interfaces,
+		}
+		if zone.ScreenProfile != "" {
+			zi.ScreenProfile = zone.ScreenProfile
+		}
+		if zone.HostInboundTraffic != nil {
+			zi.HostInboundServices = append(zi.HostInboundServices, zone.HostInboundTraffic.SystemServices...)
+			zi.HostInboundServices = append(zi.HostInboundServices, zone.HostInboundTraffic.Protocols...)
+		}
+		if zi.Interfaces == nil {
+			zi.Interfaces = []string{}
+		}
+		if zi.HostInboundServices == nil {
+			zi.HostInboundServices = []string{}
+		}
+
+		if cr != nil {
+			if id, ok := cr.ZoneIDs[zoneName]; ok {
+				zi.Id = uint32(id)
+				if s.dp != nil && s.dp.IsLoaded() {
+					if ing, err := s.dp.ReadZoneCounters(id, 0); err == nil {
+						zi.IngressPackets = ing.Packets
+						zi.IngressBytes = ing.Bytes
+					}
+					if eg, err := s.dp.ReadZoneCounters(id, 1); err == nil {
+						zi.EgressPackets = eg.Packets
+						zi.EgressBytes = eg.Bytes
+					}
+				}
+			}
+		}
+		resp.Zones = append(resp.Zones, zi)
+	}
+	sort.Slice(resp.Zones, func(i, j int) bool { return resp.Zones[i].Name < resp.Zones[j].Name })
+	return resp, nil
+}
+
+func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.GetPoliciesResponse, error) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		return &pb.GetPoliciesResponse{}, nil
+	}
+
+	resp := &pb.GetPoliciesResponse{}
+	var policyID uint32
+	for _, zpp := range cfg.Security.Policies {
+		pi := &pb.PolicyInfo{
+			FromZone: zpp.FromZone,
+			ToZone:   zpp.ToZone,
+		}
+		for _, rule := range zpp.Policies {
+			pr := &pb.PolicyRule{
+				Name:         rule.Name,
+				Action:       policyActionStr(rule.Action),
+				SrcAddresses: rule.Match.SourceAddresses,
+				DstAddresses: rule.Match.DestinationAddresses,
+				Applications: rule.Match.Applications,
+				Log:          rule.Log != nil,
+				Count:        rule.Count,
+			}
+			if pr.SrcAddresses == nil {
+				pr.SrcAddresses = []string{}
+			}
+			if pr.DstAddresses == nil {
+				pr.DstAddresses = []string{}
+			}
+			if pr.Applications == nil {
+				pr.Applications = []string{}
+			}
+			if s.dp != nil && s.dp.IsLoaded() {
+				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
+					pr.HitPackets = ctrs.Packets
+					pr.HitBytes = ctrs.Bytes
+				}
+			}
+			policyID++
+			pi.Rules = append(pi.Rules, pr)
+		}
+		if pi.Rules == nil {
+			pi.Rules = []*pb.PolicyRule{}
+		}
+		resp.Policies = append(resp.Policies, pi)
+	}
+	return resp, nil
+}
+
+func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
+	if s.dp == nil || !s.dp.IsLoaded() {
+		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
+	}
+
+	limit := int(req.Limit)
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 10000 {
+		limit = 10000
+	}
+	offset := int(req.Offset)
+	zoneFilter := uint16(req.Zone)
+	protoFilter := req.Protocol
+
+	now := monotonicSeconds()
+	var all []*pb.SessionEntry
+	idx := 0
+
+	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if zoneFilter != 0 && val.IngressZone != zoneFilter && val.EgressZone != zoneFilter {
+			return true
+		}
+		proto := protoName(key.Protocol)
+		if protoFilter != "" && proto != protoFilter {
+			return true
+		}
+		if idx >= offset && len(all) < limit {
+			all = append(all, sessionEntryV4(key, val, now))
+		}
+		idx++
+		return true
+	})
+
+	_ = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if zoneFilter != 0 && val.IngressZone != zoneFilter && val.EgressZone != zoneFilter {
+			return true
+		}
+		proto := protoName(key.Protocol)
+		if protoFilter != "" && proto != protoFilter {
+			return true
+		}
+		if idx >= offset && len(all) < limit {
+			all = append(all, sessionEntryV6(key, val, now))
+		}
+		idx++
+		return true
+	})
+
+	return &pb.GetSessionsResponse{
+		Total:    int32(idx),
+		Limit:    int32(limit),
+		Offset:   int32(offset),
+		Sessions: all,
+	}, nil
+}
+
+func (s *Server) GetSessionSummary(_ context.Context, _ *pb.GetSessionSummaryRequest) (*pb.GetSessionSummaryResponse, error) {
+	if s.dp == nil || !s.dp.IsLoaded() {
+		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
+	}
+
+	resp := &pb.GetSessionSummaryResponse{}
+
+	_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+		resp.TotalEntries++
+		if val.IsReverse == 0 {
+			resp.ForwardOnly++
+			resp.Ipv4Sessions++
+			if val.State == dataplane.SessStateEstablished {
+				resp.Established++
+			}
+			if val.Flags&dataplane.SessFlagSNAT != 0 {
+				resp.SnatSessions++
+			}
+			if val.Flags&dataplane.SessFlagDNAT != 0 {
+				resp.DnatSessions++
+			}
+		}
+		return true
+	})
+
+	_ = s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		resp.TotalEntries++
+		if val.IsReverse == 0 {
+			resp.ForwardOnly++
+			resp.Ipv6Sessions++
+			if val.State == dataplane.SessStateEstablished {
+				resp.Established++
+			}
+			if val.Flags&dataplane.SessFlagSNAT != 0 {
+				resp.SnatSessions++
+			}
+			if val.Flags&dataplane.SessFlagDNAT != 0 {
+				resp.DnatSessions++
+			}
+		}
+		return true
+	})
+
+	return resp, nil
+}
+
+func (s *Server) GetNATSource(_ context.Context, _ *pb.GetNATSourceRequest) (*pb.GetNATSourceResponse, error) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		return &pb.GetNATSourceResponse{}, nil
+	}
+
+	resp := &pb.GetNATSourceResponse{}
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			info := &pb.NATSourceInfo{
+				FromZone: rs.FromZone,
+				ToZone:   rs.ToZone,
+			}
+			if rule.Then.Interface {
+				info.Type = "interface"
+			} else if rule.Then.PoolName != "" {
+				info.Type = "pool"
+				info.Pool = rule.Then.PoolName
+			}
+			resp.Rules = append(resp.Rules, info)
+		}
+	}
+	return resp, nil
+}
+
+func (s *Server) GetNATDestination(_ context.Context, _ *pb.GetNATDestinationRequest) (*pb.GetNATDestinationResponse, error) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil || cfg.Security.NAT.Destination == nil {
+		return &pb.GetNATDestinationResponse{}, nil
+	}
+
+	resp := &pb.GetNATDestinationResponse{}
+	for _, rs := range cfg.Security.NAT.Destination.RuleSets {
+		for _, rule := range rs.Rules {
+			info := &pb.NATDestInfo{
+				Name:    rule.Name,
+				DstAddr: rule.Match.DestinationAddress,
+			}
+			if rule.Match.DestinationPort > 0 {
+				info.DstPort = uint32(rule.Match.DestinationPort)
+			}
+			if pool, ok := cfg.Security.NAT.Destination.Pools[rule.Then.PoolName]; ok {
+				info.TranslateIp = pool.Address
+				if pool.Port > 0 {
+					info.TranslatePort = uint32(pool.Port)
+				}
+			}
+			resp.Rules = append(resp.Rules, info)
+		}
+	}
+	return resp, nil
+}
+
+func (s *Server) GetScreen(_ context.Context, _ *pb.GetScreenRequest) (*pb.GetScreenResponse, error) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		return &pb.GetScreenResponse{}, nil
+	}
+
+	resp := &pb.GetScreenResponse{}
+	for name, profile := range cfg.Security.Screen {
+		si := &pb.ScreenInfo{
+			Name:   name,
+			Checks: screenChecks(profile),
+		}
+		if si.Checks == nil {
+			si.Checks = []string{}
+		}
+		resp.Screens = append(resp.Screens, si)
+	}
+	sort.Slice(resp.Screens, func(i, j int) bool { return resp.Screens[i].Name < resp.Screens[j].Name })
+	return resp, nil
+}
+
+func (s *Server) GetEvents(_ context.Context, req *pb.GetEventsRequest) (*pb.GetEventsResponse, error) {
+	if s.eventBuf == nil {
+		return &pb.GetEventsResponse{}, nil
+	}
+
+	limit := int(req.Limit)
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 10000 {
+		limit = 10000
+	}
+
+	filter := logging.EventFilter{
+		Zone:     uint16(req.Zone),
+		Action:   req.Action,
+		Protocol: req.Protocol,
+	}
+
+	var events []logging.EventRecord
+	if filter.IsEmpty() {
+		events = s.eventBuf.Latest(limit)
+	} else {
+		events = s.eventBuf.LatestFiltered(limit, filter)
+	}
+
+	resp := &pb.GetEventsResponse{}
+	for _, ev := range events {
+		resp.Events = append(resp.Events, &pb.EventEntry{
+			Time:           ev.Time.Format(time.RFC3339),
+			Type:           ev.Type,
+			SrcAddr:        ev.SrcAddr,
+			DstAddr:        ev.DstAddr,
+			Protocol:       ev.Protocol,
+			Action:         ev.Action,
+			PolicyId:       ev.PolicyID,
+			IngressZone:    uint32(ev.InZone),
+			EgressZone:     uint32(ev.OutZone),
+			ScreenCheck:    ev.ScreenCheck,
+			SessionPackets: ev.SessionPkts,
+			SessionBytes:   ev.SessionBytes,
+		})
+	}
+	return resp, nil
+}
+
+func (s *Server) GetInterfaces(_ context.Context, _ *pb.GetInterfacesRequest) (*pb.GetInterfacesResponse, error) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		return &pb.GetInterfacesResponse{}, nil
+	}
+
+	ifZone := make(map[string]string)
+	for zoneName, zone := range cfg.Security.Zones {
+		for _, ifName := range zone.Interfaces {
+			ifZone[ifName] = zoneName
+		}
+	}
+
+	resp := &pb.GetInterfacesResponse{}
+	for ifName := range allInterfaceNames(cfg) {
+		iface, err := net.InterfaceByName(ifName)
+		ii := &pb.InterfaceInfo{
+			Name: ifName,
+			Zone: ifZone[ifName],
+		}
+		if err == nil {
+			ii.Ifindex = int32(iface.Index)
+			if s.dp != nil && s.dp.IsLoaded() {
+				if ctrs, err := s.dp.ReadInterfaceCounters(iface.Index); err == nil {
+					ii.RxPackets = ctrs.RxPackets
+					ii.RxBytes = ctrs.RxBytes
+					ii.TxPackets = ctrs.TxPackets
+					ii.TxBytes = ctrs.TxBytes
+				}
+			}
+		}
+		resp.Interfaces = append(resp.Interfaces, ii)
+	}
+	sort.Slice(resp.Interfaces, func(i, j int) bool { return resp.Interfaces[i].Name < resp.Interfaces[j].Name })
+	return resp, nil
+}
+
+func (s *Server) GetDHCPLeases(_ context.Context, _ *pb.GetDHCPLeasesRequest) (*pb.GetDHCPLeasesResponse, error) {
+	if s.dhcp == nil {
+		return &pb.GetDHCPLeasesResponse{}, nil
+	}
+
+	resp := &pb.GetDHCPLeasesResponse{}
+	for _, l := range s.dhcp.Leases() {
+		family := "inet"
+		if l.Family == 6 {
+			family = "inet6"
+		}
+		info := &pb.DHCPLeaseInfo{
+			Interface: l.Interface,
+			Family:    family,
+			Address:   l.Address.String(),
+			LeaseTime: l.LeaseTime.String(),
+			Obtained:  l.Obtained.Format(time.RFC3339),
+		}
+		if l.Gateway.IsValid() {
+			info.Gateway = l.Gateway.String()
+		}
+		for _, dns := range l.DNS {
+			info.Dns = append(info.Dns, dns.String())
+		}
+		if info.Dns == nil {
+			info.Dns = []string{}
+		}
+		resp.Leases = append(resp.Leases, info)
+	}
+	return resp, nil
+}
+
+func (s *Server) GetRoutes(_ context.Context, _ *pb.GetRoutesRequest) (*pb.GetRoutesResponse, error) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		return &pb.GetRoutesResponse{}, nil
+	}
+
+	resp := &pb.GetRoutesResponse{}
+	for _, r := range cfg.RoutingOptions.StaticRoutes {
+		resp.Routes = append(resp.Routes, &pb.RouteInfo{
+			Destination: r.Destination,
+			NextHop:     r.NextHop,
+			Interface:   r.Interface,
+			Preference:  int32(r.Preference),
+		})
+	}
+	return resp, nil
+}
+
+func (s *Server) GetOSPFStatus(_ context.Context, req *pb.GetOSPFStatusRequest) (*pb.GetOSPFStatusResponse, error) {
+	if s.frr == nil {
+		return &pb.GetOSPFStatusResponse{Output: "FRR not available"}, nil
+	}
+	var output string
+	var err error
+	switch req.Type {
+	case "database":
+		output, err = s.frr.GetOSPFDatabase()
+	default:
+		neighbors, nerr := s.frr.GetOSPFNeighbors()
+		if nerr != nil {
+			return nil, status.Errorf(codes.Internal, "%v", nerr)
+		}
+		var b strings.Builder
+		for _, n := range neighbors {
+			fmt.Fprintf(&b, "%-18s %-10s %-16s %-18s %s\n",
+				n.NeighborID, n.Priority, n.State, n.Address, n.Interface)
+		}
+		output = b.String()
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	return &pb.GetOSPFStatusResponse{Output: output}, nil
+}
+
+func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*pb.GetBGPStatusResponse, error) {
+	if s.frr == nil {
+		return &pb.GetBGPStatusResponse{Output: "FRR not available"}, nil
+	}
+	var b strings.Builder
+	switch req.Type {
+	case "routes":
+		routes, err := s.frr.GetBGPRoutes()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
+		for _, r := range routes {
+			fmt.Fprintf(&b, "%-24s %-20s %s\n", r.Network, r.NextHop, r.Path)
+		}
+	default:
+		peers, err := s.frr.GetBGPSummary()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
+		for _, p := range peers {
+			fmt.Fprintf(&b, "%-20s %-8s %-10s %-10s %-12s %s\n",
+				p.Neighbor, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State)
+		}
+	}
+	return &pb.GetBGPStatusResponse{Output: b.String()}, nil
+}
+
+func (s *Server) GetIPsecSA(_ context.Context, _ *pb.GetIPsecSARequest) (*pb.GetIPsecSAResponse, error) {
+	if s.ipsec == nil {
+		return &pb.GetIPsecSAResponse{Output: "IPsec not available"}, nil
+	}
+	sas, err := s.ipsec.GetSAStatus()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	var b strings.Builder
+	for _, sa := range sas {
+		fmt.Fprintf(&b, "SA: %s  State: %s", sa.Name, sa.State)
+		if sa.LocalAddr != "" {
+			fmt.Fprintf(&b, "  Local: %s", sa.LocalAddr)
+		}
+		if sa.RemoteAddr != "" {
+			fmt.Fprintf(&b, "  Remote: %s", sa.RemoteAddr)
+		}
+		b.WriteString("\n")
+	}
+	return &pb.GetIPsecSAResponse{Output: b.String()}, nil
+}
+
+// --- Mutation RPCs ---
+
+func (s *Server) ClearSessions(_ context.Context, _ *pb.ClearSessionsRequest) (*pb.ClearSessionsResponse, error) {
+	if s.dp == nil || !s.dp.IsLoaded() {
+		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
+	}
+	v4, v6, err := s.dp.ClearAllSessions()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	return &pb.ClearSessionsResponse{
+		Ipv4Cleared: int32(v4),
+		Ipv6Cleared: int32(v6),
+	}, nil
+}
+
+func (s *Server) ClearCounters(_ context.Context, _ *pb.ClearCountersRequest) (*pb.ClearCountersResponse, error) {
+	if s.dp == nil || !s.dp.IsLoaded() {
+		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
+	}
+	if err := s.dp.ClearAllCounters(); err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	return &pb.ClearCountersResponse{}, nil
+}
+
+// --- Completion RPC ---
+
+func (s *Server) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteResponse, error) {
+	text := req.Line
+	if int(req.Pos) < len(text) {
+		text = text[:req.Pos]
+	}
+
+	words := strings.Fields(text)
+	trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
+
+	var partial string
+	if !trailingSpace && len(words) > 0 {
+		partial = words[len(words)-1]
+		words = words[:len(words)-1]
+	}
+
+	var candidates []string
+	if req.ConfigMode {
+		candidates = s.completeConfig(words, partial)
+	} else {
+		candidates = s.completeOperational(words, partial)
+	}
+
+	sort.Strings(candidates)
+	return &pb.CompleteResponse{Candidates: candidates}, nil
+}
+
+func (s *Server) completeOperational(words []string, partial string) []string {
+	return completeFromTree(operationalTree, words, partial)
+}
+
+func (s *Server) completeConfig(words []string, partial string) []string {
+	if len(words) == 0 {
+		return filterPrefix(keysOf(configTopLevel), partial)
+	}
+
+	switch words[0] {
+	case "set", "delete":
+		schemaCompletions := config.CompleteSetPathWithValues(words[1:], s.valueProvider)
+		if schemaCompletions == nil {
+			return nil
+		}
+		return filterPrefix(schemaCompletions, partial)
+	case "run":
+		return completeFromTree(operationalTree, words[1:], partial)
+	case "commit":
+		if len(words) == 1 {
+			return filterPrefix([]string{"check", "confirmed"}, partial)
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+func (s *Server) valueProvider(hint config.ValueHint) []string {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		return nil
+	}
+	switch hint {
+	case config.ValueHintZoneName:
+		names := make([]string, 0, len(cfg.Security.Zones))
+		for name := range cfg.Security.Zones {
+			names = append(names, name)
+		}
+		return names
+	case config.ValueHintAddressName:
+		var names []string
+		if cfg.Security.AddressBook != nil {
+			for _, addr := range cfg.Security.AddressBook.Addresses {
+				names = append(names, addr.Name)
+			}
+			for _, as := range cfg.Security.AddressBook.AddressSets {
+				names = append(names, as.Name)
+			}
+		}
+		return names
+	case config.ValueHintAppName:
+		var names []string
+		for _, app := range cfg.Applications.Applications {
+			names = append(names, app.Name)
+		}
+		for _, as := range cfg.Applications.ApplicationSets {
+			names = append(names, as.Name)
+		}
+		for name := range config.PredefinedApplications {
+			names = append(names, name)
+		}
+		return names
+	case config.ValueHintAppSetName:
+		var names []string
+		for _, as := range cfg.Applications.ApplicationSets {
+			names = append(names, as.Name)
+		}
+		return names
+	case config.ValueHintPoolName:
+		var names []string
+		for name := range cfg.Security.NAT.SourcePools {
+			names = append(names, name)
+		}
+		if cfg.Security.NAT.Destination != nil {
+			for name := range cfg.Security.NAT.Destination.Pools {
+				names = append(names, name)
+			}
+		}
+		return names
+	case config.ValueHintScreenProfile:
+		names := make([]string, 0, len(cfg.Security.Screen))
+		for name := range cfg.Security.Screen {
+			names = append(names, name)
+		}
+		return names
+	case config.ValueHintStreamName:
+		names := make([]string, 0, len(cfg.Security.Log.Streams))
+		for name := range cfg.Security.Log.Streams {
+			names = append(names, name)
+		}
+		return names
+	case config.ValueHintInterfaceName:
+		var names []string
+		for _, zone := range cfg.Security.Zones {
+			names = append(names, zone.Interfaces...)
+		}
+		return names
+	}
+	return nil
+}
+
+// --- shared command trees (same as cli.go) ---
+
+type completionNode struct {
+	desc     string
+	children map[string]*completionNode
+}
+
+var operationalTree = map[string]*completionNode{
+	"configure": {desc: "Enter configuration mode"},
+	"show": {desc: "Show information", children: map[string]*completionNode{
+		"configuration": {desc: "Show active configuration"},
+		"dhcp": {desc: "Show DHCP information", children: map[string]*completionNode{
+			"leases": {desc: "Show DHCP leases"},
+		}},
+		"route": {desc: "Show routing table"},
+		"security": {desc: "Show security information", children: map[string]*completionNode{
+			"zones":    {desc: "Show security zones"},
+			"policies": {desc: "Show security policies"},
+			"screen":   {desc: "Show screen/IDS profiles"},
+			"flow": {desc: "Show flow information", children: map[string]*completionNode{
+				"session": {desc: "Show active sessions"},
+			}},
+			"nat": {desc: "Show NAT information", children: map[string]*completionNode{
+				"source":      {desc: "Show source NAT"},
+				"destination": {desc: "Show destination NAT"},
+				"static":      {desc: "Show static NAT"},
+			}},
+			"address-book": {desc: "Show address book entries"},
+			"applications": {desc: "Show application definitions"},
+			"log":          {desc: "Show recent security events"},
+			"statistics":   {desc: "Show global statistics"},
+			"ipsec": {desc: "Show IPsec status", children: map[string]*completionNode{
+				"security-associations": {desc: "Show IPsec SAs"},
+			}},
+		}},
+		"interfaces": {desc: "Show interface status", children: map[string]*completionNode{
+			"tunnel": {desc: "Show tunnel interfaces"},
+		}},
+		"protocols": {desc: "Show protocol information", children: map[string]*completionNode{
+			"ospf": {desc: "Show OSPF information", children: map[string]*completionNode{
+				"neighbor": {desc: "Show OSPF neighbors"},
+				"database": {desc: "Show OSPF database"},
+			}},
+			"bgp": {desc: "Show BGP information", children: map[string]*completionNode{
+				"summary": {desc: "Show BGP peer summary"},
+				"routes":  {desc: "Show BGP routes"},
+			}},
+		}},
+		"system": {desc: "Show system information", children: map[string]*completionNode{
+			"rollback": {desc: "Show rollback history"},
+		}},
+	}},
+	"clear": {desc: "Clear information", children: map[string]*completionNode{
+		"security": {desc: "Clear security information", children: map[string]*completionNode{
+			"flow": {desc: "Clear flow information", children: map[string]*completionNode{
+				"session": {desc: "Clear all sessions"},
+			}},
+			"counters": {desc: "Clear all counters"},
+		}},
+	}},
+	"quit": {desc: "Exit CLI"},
+	"exit": {desc: "Exit CLI"},
+}
+
+var configTopLevel = map[string]*completionNode{
+	"set":    {desc: "Set a configuration value"},
+	"delete": {desc: "Delete a configuration element"},
+	"show":   {desc: "Show candidate configuration"},
+	"commit": {desc: "Commit configuration", children: map[string]*completionNode{
+		"check":     {desc: "Validate without applying"},
+		"confirmed": {desc: "Auto-rollback if not confirmed"},
+	}},
+	"rollback": {desc: "Revert to previous configuration"},
+	"run":      {desc: "Run operational command"},
+	"exit":     {desc: "Exit configuration mode"},
+	"quit":     {desc: "Exit configuration mode"},
+}
+
+func completeFromTree(tree map[string]*completionNode, words []string, partial string) []string {
+	current := tree
+	for _, w := range words {
+		node, ok := current[w]
+		if !ok {
+			return nil
+		}
+		if node.children == nil {
+			return nil
+		}
+		current = node.children
+	}
+	return filterPrefix(keysOf(current), partial)
+}
+
+func keysOf(m map[string]*completionNode) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func filterPrefix(items []string, prefix string) []string {
+	if prefix == "" {
+		return items
+	}
+	var result []string
+	for _, item := range items {
+		if strings.HasPrefix(item, prefix) {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+// --- helpers ---
+
+func allInterfaceNames(cfg *config.Config) map[string]bool {
+	names := make(map[string]bool)
+	for ifName := range cfg.Interfaces.Interfaces {
+		names[ifName] = true
+	}
+	for _, zone := range cfg.Security.Zones {
+		for _, ifName := range zone.Interfaces {
+			names[ifName] = true
+		}
+	}
+	return names
+}
+
+func policyActionStr(a config.PolicyAction) string {
+	switch a {
+	case config.PolicyPermit:
+		return "permit"
+	case config.PolicyDeny:
+		return "deny"
+	case config.PolicyReject:
+		return "reject"
+	default:
+		return "unknown"
+	}
+}
+
+func protoName(p uint8) string {
+	switch p {
+	case 6:
+		return "TCP"
+	case 17:
+		return "UDP"
+	case 1:
+		return "ICMP"
+	case dataplane.ProtoICMPv6:
+		return "ICMPv6"
+	default:
+		return fmt.Sprintf("%d", p)
+	}
+}
+
+func sessionStateName(state uint8) string {
+	switch state {
+	case dataplane.SessStateNone:
+		return "None"
+	case dataplane.SessStateNew:
+		return "New"
+	case dataplane.SessStateSynSent:
+		return "SYN_SENT"
+	case dataplane.SessStateSynRecv:
+		return "SYN_RECV"
+	case dataplane.SessStateEstablished:
+		return "Established"
+	case dataplane.SessStateFINWait:
+		return "FIN_WAIT"
+	case dataplane.SessStateCloseWait:
+		return "CLOSE_WAIT"
+	case dataplane.SessStateTimeWait:
+		return "TIME_WAIT"
+	case dataplane.SessStateClosed:
+		return "Closed"
+	default:
+		return fmt.Sprintf("Unknown(%d)", state)
+	}
+}
+
+func ntohs(v uint16) uint16 {
+	var b [2]byte
+	binary.BigEndian.PutUint16(b[:], v)
+	return binary.NativeEndian.Uint16(b[:])
+}
+
+func uint32ToIP(v uint32) net.IP {
+	ip := make(net.IP, 4)
+	binary.BigEndian.PutUint32(ip, v)
+	return ip
+}
+
+func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64) *pb.SessionEntry {
+	se := &pb.SessionEntry{
+		SrcAddr:        net.IP(key.SrcIP[:]).String(),
+		DstAddr:        net.IP(key.DstIP[:]).String(),
+		SrcPort:        uint32(ntohs(key.SrcPort)),
+		DstPort:        uint32(ntohs(key.DstPort)),
+		Protocol:       protoName(key.Protocol),
+		State:          sessionStateName(val.State),
+		PolicyId:       val.PolicyID,
+		IngressZone:    uint32(val.IngressZone),
+		EgressZone:     uint32(val.EgressZone),
+		FwdPackets:     val.FwdPackets,
+		FwdBytes:       val.FwdBytes,
+		RevPackets:     val.RevPackets,
+		RevBytes:       val.RevBytes,
+		TimeoutSeconds: val.Timeout,
+	}
+	if val.LastSeen > 0 && now > val.LastSeen {
+		se.AgeSeconds = int64(now - val.LastSeen)
+	}
+	if val.Flags&dataplane.SessFlagSNAT != 0 {
+		se.Nat = fmt.Sprintf("SNAT %s:%d", uint32ToIP(val.NATSrcIP), ntohs(val.NATSrcPort))
+	}
+	if val.Flags&dataplane.SessFlagDNAT != 0 {
+		se.Nat = fmt.Sprintf("DNAT %s:%d", uint32ToIP(val.NATDstIP), ntohs(val.NATDstPort))
+	}
+	return se
+}
+
+func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64) *pb.SessionEntry {
+	se := &pb.SessionEntry{
+		SrcAddr:        net.IP(key.SrcIP[:]).String(),
+		DstAddr:        net.IP(key.DstIP[:]).String(),
+		SrcPort:        uint32(ntohs(key.SrcPort)),
+		DstPort:        uint32(ntohs(key.DstPort)),
+		Protocol:       protoName(key.Protocol),
+		State:          sessionStateName(val.State),
+		PolicyId:       val.PolicyID,
+		IngressZone:    uint32(val.IngressZone),
+		EgressZone:     uint32(val.EgressZone),
+		FwdPackets:     val.FwdPackets,
+		FwdBytes:       val.FwdBytes,
+		RevPackets:     val.RevPackets,
+		RevBytes:       val.RevBytes,
+		TimeoutSeconds: val.Timeout,
+	}
+	if val.LastSeen > 0 && now > val.LastSeen {
+		se.AgeSeconds = int64(now - val.LastSeen)
+	}
+	if val.Flags&dataplane.SessFlagSNAT != 0 {
+		se.Nat = fmt.Sprintf("SNAT [%s]:%d", net.IP(val.NATSrcIP[:]).String(), ntohs(val.NATSrcPort))
+	}
+	if val.Flags&dataplane.SessFlagDNAT != 0 {
+		se.Nat = fmt.Sprintf("DNAT [%s]:%d", net.IP(val.NATDstIP[:]).String(), ntohs(val.NATDstPort))
+	}
+	return se
+}
+
+func monotonicSeconds() uint64 {
+	var ts unix.Timespec
+	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	return uint64(ts.Sec)
+}
+
+func screenChecks(p *config.ScreenProfile) []string {
+	var checks []string
+	if p.TCP.SynFlood != nil {
+		checks = append(checks, "syn-flood")
+	}
+	if p.TCP.Land {
+		checks = append(checks, "land")
+	}
+	if p.TCP.WinNuke {
+		checks = append(checks, "winnuke")
+	}
+	if p.TCP.SynFrag {
+		checks = append(checks, "syn-frag")
+	}
+	if p.TCP.SynFin {
+		checks = append(checks, "syn-fin")
+	}
+	if p.TCP.NoFlag {
+		checks = append(checks, "tcp-no-flag")
+	}
+	if p.TCP.FinNoAck {
+		checks = append(checks, "fin-no-ack")
+	}
+	if p.ICMP.PingDeath {
+		checks = append(checks, "ping-death")
+	}
+	if p.ICMP.FloodThreshold > 0 {
+		checks = append(checks, "icmp-flood")
+	}
+	if p.UDP.FloodThreshold > 0 {
+		checks = append(checks, "udp-flood")
+	}
+	if p.IP.SourceRouteOption {
+		checks = append(checks, "source-route-option")
+	}
+	if p.IP.TearDrop {
+		checks = append(checks, "tear-drop")
+	}
+	return checks
+}

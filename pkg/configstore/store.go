@@ -82,12 +82,17 @@ func (s *Store) Save() error {
 }
 
 // EnterConfigure enters configuration mode by cloning the active config.
-func (s *Store) EnterConfigure() {
+// Returns an error if another session is already in config mode.
+func (s *Store) EnterConfigure() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.configDir {
+		return fmt.Errorf("configuration is locked by another user")
+	}
 	s.candidate = s.active.Clone()
 	s.configDir = true
 	s.dirty = false
+	return nil
 }
 
 // ExitConfigure exits configuration mode, discarding the candidate.

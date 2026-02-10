@@ -388,7 +388,9 @@ func (c *CLI) dispatchOperational(line string) error {
 
 	switch parts[0] {
 	case "configure":
-		c.store.EnterConfigure()
+		if err := c.store.EnterConfigure(); err != nil {
+			return err
+		}
 		c.rl.SetPrompt(c.configPrompt())
 		fmt.Println("Entering configuration mode")
 		return nil

@@ -1,0 +1,351 @@
+syntax = "proto3";
+
+package bpfrx.v1;
+
+option go_package = "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1";
+
+// BpfrxService provides gRPC access to the bpfrx firewall daemon.
+service BpfrxService {
+  // Config lifecycle
+  rpc EnterConfigure(EnterConfigureRequest) returns (EnterConfigureResponse);
+  rpc ExitConfigure(ExitConfigureRequest) returns (ExitConfigureResponse);
+  rpc GetConfigModeStatus(GetConfigModeStatusRequest) returns (GetConfigModeStatusResponse);
+  rpc Set(SetRequest) returns (SetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc CommitCheck(CommitCheckRequest) returns (CommitCheckResponse);
+  rpc CommitConfirmed(CommitConfirmedRequest) returns (CommitConfirmedResponse);
+  rpc ConfirmCommit(ConfirmCommitRequest) returns (ConfirmCommitResponse);
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+  rpc ShowConfig(ShowConfigRequest) returns (ShowConfigResponse);
+  rpc ShowCompare(ShowCompareRequest) returns (ShowCompareResponse);
+  rpc ShowRollback(ShowRollbackRequest) returns (ShowRollbackResponse);
+  rpc ListHistory(ListHistoryRequest) returns (ListHistoryResponse);
+
+  // Operational show RPCs
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc GetGlobalStats(GetGlobalStatsRequest) returns (GetGlobalStatsResponse);
+  rpc GetZones(GetZonesRequest) returns (GetZonesResponse);
+  rpc GetPolicies(GetPoliciesRequest) returns (GetPoliciesResponse);
+  rpc GetSessions(GetSessionsRequest) returns (GetSessionsResponse);
+  rpc GetSessionSummary(GetSessionSummaryRequest) returns (GetSessionSummaryResponse);
+  rpc GetNATSource(GetNATSourceRequest) returns (GetNATSourceResponse);
+  rpc GetNATDestination(GetNATDestinationRequest) returns (GetNATDestinationResponse);
+  rpc GetScreen(GetScreenRequest) returns (GetScreenResponse);
+  rpc GetEvents(GetEventsRequest) returns (GetEventsResponse);
+  rpc GetInterfaces(GetInterfacesRequest) returns (GetInterfacesResponse);
+  rpc GetDHCPLeases(GetDHCPLeasesRequest) returns (GetDHCPLeasesResponse);
+  rpc GetRoutes(GetRoutesRequest) returns (GetRoutesResponse);
+  rpc GetOSPFStatus(GetOSPFStatusRequest) returns (GetOSPFStatusResponse);
+  rpc GetBGPStatus(GetBGPStatusRequest) returns (GetBGPStatusResponse);
+  rpc GetIPsecSA(GetIPsecSARequest) returns (GetIPsecSAResponse);
+
+  // Mutations
+  rpc ClearSessions(ClearSessionsRequest) returns (ClearSessionsResponse);
+  rpc ClearCounters(ClearCountersRequest) returns (ClearCountersResponse);
+
+  // Tab completion
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+}
+
+// --- Config lifecycle messages ---
+
+message EnterConfigureRequest {}
+message EnterConfigureResponse {}
+
+message ExitConfigureRequest {}
+message ExitConfigureResponse {}
+
+message GetConfigModeStatusRequest {}
+message GetConfigModeStatusResponse {
+  bool in_config_mode = 1;
+  bool dirty = 2;
+  bool confirm_pending = 3;
+}
+
+message SetRequest { string input = 1; }
+message SetResponse {}
+
+message DeleteRequest { string input = 1; }
+message DeleteResponse {}
+
+message CommitRequest {}
+message CommitResponse {}
+
+message CommitCheckRequest {}
+message CommitCheckResponse {}
+
+message CommitConfirmedRequest { int32 minutes = 1; }
+message CommitConfirmedResponse {}
+
+message ConfirmCommitRequest {}
+message ConfirmCommitResponse {}
+
+message RollbackRequest { int32 n = 1; }
+message RollbackResponse {}
+
+enum ConfigFormat {
+  HIERARCHICAL = 0;
+  SET = 1;
+}
+
+enum ConfigTarget {
+  CANDIDATE = 0;
+  ACTIVE = 1;
+}
+
+message ShowConfigRequest {
+  ConfigFormat format = 1;
+  ConfigTarget target = 2;
+}
+message ShowConfigResponse { string output = 1; }
+
+message ShowCompareRequest {
+  int32 rollback_n = 1;  // 0 = compare candidate vs active
+}
+message ShowCompareResponse { string output = 1; }
+
+message ShowRollbackRequest {
+  int32 n = 1;
+  ConfigFormat format = 2;
+}
+message ShowRollbackResponse { string output = 1; }
+
+message ListHistoryRequest {}
+message ListHistoryResponse {
+  repeated HistoryEntry entries = 1;
+}
+message HistoryEntry {
+  int32 index = 1;
+  string timestamp = 2;
+}
+
+// --- Operational messages ---
+
+message GetStatusRequest {}
+message GetStatusResponse {
+  string uptime = 1;
+  bool dataplane_loaded = 2;
+  bool config_loaded = 3;
+  int32 zone_count = 4;
+  int32 session_count = 5;
+}
+
+message GetGlobalStatsRequest {}
+message GetGlobalStatsResponse {
+  uint64 rx_packets = 1;
+  uint64 tx_packets = 2;
+  uint64 drops = 3;
+  uint64 sessions_created = 4;
+  uint64 sessions_closed = 5;
+  uint64 screen_drops = 6;
+  uint64 policy_denies = 7;
+  uint64 nat_alloc_failures = 8;
+  uint64 host_inbound_denies = 9;
+  uint64 tc_egress_packets = 10;
+}
+
+message GetZonesRequest {}
+message GetZonesResponse {
+  repeated ZoneInfo zones = 1;
+}
+message ZoneInfo {
+  string name = 1;
+  uint32 id = 2;
+  string screen_profile = 3;
+  repeated string interfaces = 4;
+  repeated string host_inbound_services = 5;
+  uint64 ingress_packets = 6;
+  uint64 ingress_bytes = 7;
+  uint64 egress_packets = 8;
+  uint64 egress_bytes = 9;
+}
+
+message GetPoliciesRequest {}
+message GetPoliciesResponse {
+  repeated PolicyInfo policies = 1;
+}
+message PolicyInfo {
+  string from_zone = 1;
+  string to_zone = 2;
+  repeated PolicyRule rules = 3;
+}
+message PolicyRule {
+  string name = 1;
+  string action = 2;
+  repeated string src_addresses = 3;
+  repeated string dst_addresses = 4;
+  repeated string applications = 5;
+  bool log = 6;
+  bool count = 7;
+  uint64 hit_packets = 8;
+  uint64 hit_bytes = 9;
+}
+
+message GetSessionsRequest {
+  int32 limit = 1;
+  int32 offset = 2;
+  uint32 zone = 3;
+  string protocol = 4;
+}
+message GetSessionsResponse {
+  int32 total = 1;
+  int32 limit = 2;
+  int32 offset = 3;
+  repeated SessionEntry sessions = 4;
+}
+message SessionEntry {
+  string src_addr = 1;
+  string dst_addr = 2;
+  uint32 src_port = 3;
+  uint32 dst_port = 4;
+  string protocol = 5;
+  string state = 6;
+  uint32 policy_id = 7;
+  uint32 ingress_zone = 8;
+  uint32 egress_zone = 9;
+  uint64 fwd_packets = 10;
+  uint64 fwd_bytes = 11;
+  uint64 rev_packets = 12;
+  uint64 rev_bytes = 13;
+  string nat = 14;
+  int64 age_seconds = 15;
+  uint32 timeout_seconds = 16;
+}
+
+message GetSessionSummaryRequest {}
+message GetSessionSummaryResponse {
+  int32 total_entries = 1;
+  int32 forward_only = 2;
+  int32 established = 3;
+  int32 ipv4_sessions = 4;
+  int32 ipv6_sessions = 5;
+  int32 snat_sessions = 6;
+  int32 dnat_sessions = 7;
+}
+
+message GetNATSourceRequest {}
+message GetNATSourceResponse {
+  repeated NATSourceInfo rules = 1;
+}
+message NATSourceInfo {
+  string from_zone = 1;
+  string to_zone = 2;
+  string type = 3;
+  string pool = 4;
+}
+
+message GetNATDestinationRequest {}
+message GetNATDestinationResponse {
+  repeated NATDestInfo rules = 1;
+}
+message NATDestInfo {
+  string name = 1;
+  string dst_addr = 2;
+  uint32 dst_port = 3;
+  string translate_ip = 4;
+  uint32 translate_port = 5;
+}
+
+message GetScreenRequest {}
+message GetScreenResponse {
+  repeated ScreenInfo screens = 1;
+}
+message ScreenInfo {
+  string name = 1;
+  repeated string checks = 2;
+}
+
+message GetEventsRequest {
+  int32 limit = 1;
+  uint32 zone = 2;
+  string action = 3;
+  string protocol = 4;
+}
+message GetEventsResponse {
+  repeated EventEntry events = 1;
+}
+message EventEntry {
+  string time = 1;
+  string type = 2;
+  string src_addr = 3;
+  string dst_addr = 4;
+  string protocol = 5;
+  string action = 6;
+  uint32 policy_id = 7;
+  uint32 ingress_zone = 8;
+  uint32 egress_zone = 9;
+  string screen_check = 10;
+  uint64 session_packets = 11;
+  uint64 session_bytes = 12;
+}
+
+message GetInterfacesRequest {}
+message GetInterfacesResponse {
+  repeated InterfaceInfo interfaces = 1;
+}
+message InterfaceInfo {
+  string name = 1;
+  int32 ifindex = 2;
+  string zone = 3;
+  uint64 rx_packets = 4;
+  uint64 rx_bytes = 5;
+  uint64 tx_packets = 6;
+  uint64 tx_bytes = 7;
+}
+
+message GetDHCPLeasesRequest {}
+message GetDHCPLeasesResponse {
+  repeated DHCPLeaseInfo leases = 1;
+}
+message DHCPLeaseInfo {
+  string interface = 1;
+  string family = 2;
+  string address = 3;
+  string gateway = 4;
+  repeated string dns = 5;
+  string lease_time = 6;
+  string obtained = 7;
+}
+
+message GetRoutesRequest {}
+message GetRoutesResponse {
+  repeated RouteInfo routes = 1;
+}
+message RouteInfo {
+  string destination = 1;
+  string next_hop = 2;
+  string interface = 3;
+  int32 preference = 4;
+}
+
+message GetOSPFStatusRequest { string type = 1; }
+message GetOSPFStatusResponse { string output = 1; }
+
+message GetBGPStatusRequest { string type = 1; }
+message GetBGPStatusResponse { string output = 1; }
+
+message GetIPsecSARequest {}
+message GetIPsecSAResponse { string output = 1; }
+
+// --- Mutation messages ---
+
+message ClearSessionsRequest {}
+message ClearSessionsResponse {
+  int32 ipv4_cleared = 1;
+  int32 ipv6_cleared = 2;
+}
+
+message ClearCountersRequest {}
+message ClearCountersResponse {}
+
+// --- Completion messages ---
+
+message CompleteRequest {
+  string line = 1;
+  int32 pos = 2;
+  bool config_mode = 3;
+}
+message CompleteResponse {
+  repeated string candidates = 1;
+}
