@@ -135,9 +135,10 @@ func (m *Manager) ClearIfaceZoneMap() error {
 		return fmt.Errorf("iface_zone_map not found")
 	}
 	var key IfaceZoneKey
+	var val uint16
 	iter := zm.Iterate()
 	var keys []IfaceZoneKey
-	for iter.Next(&key, nil) {
+	for iter.Next(&key, &val) {
 		keys = append(keys, key)
 	}
 	for _, k := range keys {
@@ -153,9 +154,10 @@ func (m *Manager) ClearVlanIfaceMap() error {
 		return fmt.Errorf("vlan_iface_map not found")
 	}
 	var key uint32
+	var vval VlanIfaceInfo
 	iter := zm.Iterate()
 	var keys []uint32
-	for iter.Next(&key, nil) {
+	for iter.Next(&key, &vval) {
 		keys = append(keys, key)
 	}
 	for _, k := range keys {

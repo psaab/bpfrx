@@ -141,6 +141,11 @@ devices:
     name: enp9s0
     network: bpfrx-tunnel
     type: nic
+  eth5:
+    name: enp10s0
+    nictype: macvlan
+    parent: ge3
+    type: nic
 YAML
 }
 
@@ -275,6 +280,16 @@ provision_instance() {
 		[Network]
 		Address=10.0.40.10/24
 		EOF
+
+		# Internet-facing SR-IOV interface (DHCP handled by bpfrxd)
+		if [[ "$type" == "vm" ]]; then
+			incus exec "$INSTANCE_NAME" -- bash -c "cat > /etc/systemd/network/50-internet.network" <<-EOF
+			[Match]
+			Name=enp10s0
+			[Link]
+			RequiredForOnline=no
+			EOF
+		fi
 
 		incus exec "$INSTANCE_NAME" -- networkctl reload
 	else

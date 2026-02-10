@@ -266,6 +266,7 @@ struct icmp6hdr {
 #define HOST_INBOUND_SYSLOG      (1 << 14)
 #define HOST_INBOUND_RADIUS      (1 << 15)
 #define HOST_INBOUND_IKE         (1 << 16)
+#define HOST_INBOUND_DHCPV6      (1 << 17)
 #define HOST_INBOUND_ALL         0xFFFFFFFF  /* permit all services */
 
 /* ============================================================

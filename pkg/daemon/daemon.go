@@ -11,11 +11,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/psaab/bpfrx/pkg/api"
 	"github.com/psaab/bpfrx/pkg/cli"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/conntrack"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/frr"
 	"github.com/psaab/bpfrx/pkg/ipsec"
 	"github.com/psaab/bpfrx/pkg/logging"
@@ -25,7 +27,8 @@ import (
 // Options configures the daemon.
 type Options struct {
 	ConfigFile  string
-	NoDataplane bool // set to true to run without eBPF (config-only mode)
+	NoDataplane bool   // set to true to run without eBPF (config-only mode)
+	APIAddr     string // HTTP API listen address (empty = disabled)
 }
 
 // Daemon is the main bpfrx daemon.
@@ -36,6 +39,7 @@ type Daemon struct {
 	routing *routing.Manager
 	frr     *frr.Manager
 	ipsec   *ipsec.Manager
+	dhcp    *dhcp.Manager
 }
 
 // New creates a new Daemon.
@@ -104,8 +108,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start background services if dataplane is loaded
 	var er *logging.EventReader
+	var gc *conntrack.GC
 	if d.dp != nil {
-		gc := conntrack.NewGC(d.dp, 10*time.Second)
+		gc = conntrack.NewGC(d.dp, 10*time.Second)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -128,8 +133,40 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
+	// Start DHCP clients for interfaces configured with dhcp/dhcpv6.
+	// This must happen after BPF load + config compile so HOST_INBOUND_DHCP
+	// flags are active before DHCP packets start flowing.
+	if !d.opts.NoDataplane {
+		if cfg := d.store.ActiveConfig(); cfg != nil {
+			d.startDHCPClients(ctx, cfg)
+		}
+	}
+
+	// Start HTTP API server if configured.
+	if d.opts.APIAddr != "" {
+		srv := api.NewServer(api.Config{
+			Addr:     d.opts.APIAddr,
+			Store:    d.store,
+			DP:       d.dp,
+			EventBuf: eventBuf,
+			GC:       gc,
+			Routing:  d.routing,
+			FRR:      d.frr,
+			IPsec:    d.ipsec,
+			DHCP:     d.dhcp,
+		})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := srv.Run(ctx); err != nil {
+				slog.Error("API server error", "err", err)
+			}
+		}()
+		slog.Info("HTTP API server started", "addr", d.opts.APIAddr)
+	}
+
 	// Start CLI shell
-	shell := cli.New(d.store, d.dp, eventBuf, er, d.routing, d.frr, d.ipsec)
+	shell := cli.New(d.store, d.dp, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp)
 
 	// Run CLI in a goroutine so we can still handle signals
 	errCh := make(chan error, 1)
@@ -150,6 +187,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Cancel context to stop background goroutines, then wait for them.
 	stop()
 	wg.Wait()
+
+	// Clean up DHCP clients (releases leases, removes addresses).
+	if d.dhcp != nil {
+		d.dhcp.StopAll()
+		d.dhcp.Close()
+	}
 
 	// Clean up routing subsystems.
 	if d.ipsec != nil {
@@ -221,6 +264,49 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	if d.ipsec != nil && len(cfg.Security.IPsec.VPNs) > 0 {
 		if err := d.ipsec.Apply(&cfg.Security.IPsec); err != nil {
 			slog.Warn("failed to apply IPsec config", "err", err)
+		}
+	}
+}
+
+// startDHCPClients iterates the config and starts DHCP/DHCPv6 clients
+// for interfaces that have family inet { dhcp; } or family inet6 { dhcpv6; }.
+func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
+	// Check if any interface needs DHCP
+	needsDHCP := false
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		for _, unit := range ifc.Units {
+			if unit.DHCP || unit.DHCPv6 {
+				needsDHCP = true
+				break
+			}
+		}
+	}
+	if !needsDHCP {
+		return
+	}
+
+	dm, err := dhcp.New(func() {
+		slog.Info("DHCP address changed, recompiling dataplane")
+		if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
+			d.applyConfig(activeCfg)
+		}
+	})
+	if err != nil {
+		slog.Warn("failed to create DHCP manager", "err", err)
+		return
+	}
+	d.dhcp = dm
+
+	for ifName, ifc := range cfg.Interfaces.Interfaces {
+		for _, unit := range ifc.Units {
+			if unit.DHCP {
+				slog.Info("starting DHCPv4 client", "interface", ifName)
+				dm.Start(ctx, ifName, dhcp.AFInet)
+			}
+			if unit.DHCPv6 {
+				slog.Info("starting DHCPv6 client", "interface", ifName)
+				dm.Start(ctx, ifName, dhcp.AFInet6)
+			}
 		}
 	}
 }

@@ -137,7 +137,8 @@ func (m *Manager) ClearZonePairPolicies() error {
 	var key ZonePairKey
 	iter := zm.Iterate()
 	var keys []ZonePairKey
-	for iter.Next(&key, nil) {
+	var val []byte
+	for iter.Next(&key, &val) {
 		keys = append(keys, key)
 	}
 	for _, k := range keys {
@@ -155,7 +156,8 @@ func (m *Manager) ClearApplications() error {
 	var key AppKey
 	iter := zm.Iterate()
 	var keys []AppKey
-	for iter.Next(&key, nil) {
+	var val []byte
+	for iter.Next(&key, &val) {
 		keys = append(keys, key)
 	}
 	for _, k := range keys {
@@ -222,7 +224,8 @@ func (m *Manager) ClearSNATRules() error {
 	var key SNATKey
 	iter := zm.Iterate()
 	var keys []SNATKey
-	for iter.Next(&key, nil) {
+	var val []byte
+	for iter.Next(&key, &val) {
 		keys = append(keys, key)
 	}
 	for _, k := range keys {
@@ -316,7 +319,8 @@ func (m *Manager) ClearSNATRulesV6() error {
 	var key SNATKey
 	iter := zm.Iterate()
 	var keys []SNATKey
-	for iter.Next(&key, nil) {
+	var val []byte
+	for iter.Next(&key, &val) {
 		keys = append(keys, key)
 	}
 	for _, k := range keys {
@@ -514,7 +518,8 @@ func (m *Manager) ClearStaticNATEntries() error {
 		var key StaticNATKeyV4
 		iter := zm.Iterate()
 		var keys []StaticNATKeyV4
-		for iter.Next(&key, nil) {
+		var val []byte
+		for iter.Next(&key, &val) {
 			keys = append(keys, key)
 		}
 		for _, k := range keys {
@@ -526,7 +531,8 @@ func (m *Manager) ClearStaticNATEntries() error {
 		var key StaticNATKeyV6
 		iter := zm.Iterate()
 		var keys []StaticNATKeyV6
-		for iter.Next(&key, nil) {
+		var val []byte
+		for iter.Next(&key, &val) {
 			keys = append(keys, key)
 		}
 		for _, k := range keys {

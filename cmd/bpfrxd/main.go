@@ -17,6 +17,7 @@ import (
 func main() {
 	configFile := flag.String("config", "/etc/bpfrx/bpfrx.conf", "configuration file path")
 	noDataplane := flag.Bool("no-dataplane", false, "run without eBPF (config-only mode)")
+	apiAddr := flag.String("api-addr", "", "HTTP API listen address (e.g. 127.0.0.1:8080)")
 	debug := flag.Bool("debug", false, "enable debug logging")
 	flag.Parse()
 
@@ -32,6 +33,7 @@ func main() {
 	d := daemon.New(daemon.Options{
 		ConfigFile:  *configFile,
 		NoDataplane: *noDataplane,
+		APIAddr:     *apiAddr,
 	})
 
 	if err := d.Run(context.Background()); err != nil {

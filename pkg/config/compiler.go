@@ -423,21 +423,43 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 				}
 			}
 
-			familyNode := unitNode.FindChild("family")
-			if familyNode != nil {
-				inetNode := familyNode.FindChild("inet")
-				if inetNode != nil {
-					for _, addrNode := range inetNode.FindChildren("address") {
-						if len(addrNode.Keys) >= 2 {
-							unit.Addresses = append(unit.Addresses, addrNode.Keys[1])
-						}
-					}
+			// Handle two AST shapes:
+			// - set commands:  family { inet { address ...; dhcp; } }
+			//   Keys=["family"], child Keys=["inet"] with grandchildren
+			// - hierarchical:  family inet { address ...; dhcp; }
+			//   Keys=["family","inet"], children are address/dhcp directly
+			for _, familyNode := range unitNode.FindChildren("family") {
+				var afNodes []*Node
+				if len(familyNode.Keys) >= 2 {
+					// Hierarchical: Keys=["family","inet"] — node itself is the AF
+					afNodes = append(afNodes, familyNode)
+				} else {
+					// Set-command: Keys=["family"], children are inet/inet6
+					afNodes = append(afNodes, familyNode.Children...)
 				}
-				inet6Node := familyNode.FindChild("inet6")
-				if inet6Node != nil {
-					for _, addrNode := range inet6Node.FindChildren("address") {
-						if len(addrNode.Keys) >= 2 {
-							unit.Addresses = append(unit.Addresses, addrNode.Keys[1])
+				for _, afNode := range afNodes {
+					afName := afNode.Keys[0]
+					if len(afNode.Keys) >= 2 {
+						afName = afNode.Keys[1]
+					}
+					switch afName {
+					case "inet":
+						for _, addrNode := range afNode.FindChildren("address") {
+							if len(addrNode.Keys) >= 2 {
+								unit.Addresses = append(unit.Addresses, addrNode.Keys[1])
+							}
+						}
+						if afNode.FindChild("dhcp") != nil {
+							unit.DHCP = true
+						}
+					case "inet6":
+						for _, addrNode := range afNode.FindChildren("address") {
+							if len(addrNode.Keys) >= 2 {
+								unit.Addresses = append(unit.Addresses, addrNode.Keys[1])
+							}
+						}
+						if afNode.FindChild("dhcpv6") != nil {
+							unit.DHCPv6 = true
 						}
 					}
 				}

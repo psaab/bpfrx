@@ -259,6 +259,8 @@ type InterfaceUnit struct {
 	Number    int
 	VlanID    int      // 0 = native/untagged, >0 = 802.1Q tagged
 	Addresses []string // CIDR notation
+	DHCP      bool     // family inet { dhcp; }
+	DHCPv6    bool     // family inet6 { dhcpv6; }
 }
 
 // ApplicationsConfig holds application definitions.

@@ -602,6 +602,26 @@ int xdp_policy_prog(struct xdp_md *ctx)
 			bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
 			return XDP_PASS;
 		}
+		/*
+		 * Before denying: check if this is host-inbound traffic.
+		 * Host-inbound traffic (DHCP, SSH, ping, etc.) bypasses
+		 * zone-pair policies — only the per-zone host-inbound-traffic
+		 * flags control what's allowed to the firewall itself.
+		 * This handles packets where bpf_fib_lookup routed through
+		 * the default gateway instead of recognizing local delivery.
+		 */
+		{
+			__u32 zk = (__u32)meta->ingress_zone;
+			struct zone_config *zcfg = bpf_map_lookup_elem(&zone_configs, &zk);
+			if (zcfg) {
+				__u32 hif = host_inbound_flag(meta);
+				if (hif != 0 && (zcfg->host_inbound_flags & hif)) {
+					meta->fwd_ifindex = 0;
+					bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+					return XDP_PASS;
+				}
+			}
+		}
 		inc_counter(GLOBAL_CTR_POLICY_DENY);
 		return XDP_DROP;
 	}

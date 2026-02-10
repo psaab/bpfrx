@@ -211,6 +211,7 @@ const (
 	HostInboundSyslog     = 1 << 14
 	HostInboundRadius     = 1 << 15
 	HostInboundIKE        = 1 << 16
+	HostInboundDHCPv6     = 1 << 17
 	HostInboundAll        = 0xFFFFFFFF
 )
 
@@ -231,6 +232,7 @@ var HostInboundServiceFlags = map[string]uint32{
 	"syslog":     HostInboundSyslog,
 	"radius":     HostInboundRadius,
 	"ike":        HostInboundIKE,
+	"dhcpv6":     HostInboundDHCPv6,
 	"all":        HostInboundAll,
 }
 

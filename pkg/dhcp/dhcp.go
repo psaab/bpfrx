@@ -1,0 +1,579 @@
+// Package dhcp implements DHCPv4 and DHCPv6 clients for obtaining
+// addresses on firewall interfaces configured with "family inet { dhcp; }"
+// or "family inet6 { dhcpv6; }".
+package dhcp
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/netip"
+	"sync"
+	"time"
+
+	"github.com/insomniacslk/dhcp/dhcpv4/nclient4"
+	"github.com/insomniacslk/dhcp/dhcpv6"
+	"github.com/insomniacslk/dhcp/dhcpv6/nclient6"
+	"github.com/vishvananda/netlink"
+)
+
+// AddressFamily selects DHCPv4 or DHCPv6.
+type AddressFamily int
+
+const (
+	AFInet  AddressFamily = 4
+	AFInet6 AddressFamily = 6
+)
+
+// Lease holds the result of a DHCP negotiation.
+type Lease struct {
+	Interface string
+	Family    AddressFamily
+	Address   netip.Prefix
+	Gateway   netip.Addr
+	DNS       []netip.Addr
+	LeaseTime time.Duration
+	Obtained  time.Time
+}
+
+type clientKey struct {
+	iface  string
+	family AddressFamily
+}
+
+type dhcpClient struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// Manager manages DHCP clients for multiple interfaces.
+type Manager struct {
+	mu              sync.Mutex
+	clients         map[clientKey]*dhcpClient
+	leases          map[clientKey]*Lease
+	onAddressChange func()
+	nlHandle        *netlink.Handle
+	recompileTimer  *time.Timer
+}
+
+// New creates a DHCP manager. The onAddressChange callback is called
+// (debounced by 2 seconds) when a lease changes an interface address.
+func New(onAddressChange func()) (*Manager, error) {
+	nlh, err := netlink.NewHandle()
+	if err != nil {
+		return nil, fmt.Errorf("netlink handle: %w", err)
+	}
+	return &Manager{
+		clients:         make(map[clientKey]*dhcpClient),
+		leases:          make(map[clientKey]*Lease),
+		onAddressChange: onAddressChange,
+		nlHandle:        nlh,
+	}, nil
+}
+
+// Start begins a DHCP client for the given interface and address family.
+func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily) {
+	key := clientKey{iface: ifaceName, family: af}
+
+	m.mu.Lock()
+	if _, exists := m.clients[key]; exists {
+		m.mu.Unlock()
+		return
+	}
+
+	cctx, cancel := context.WithCancel(ctx)
+	dc := &dhcpClient{
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	m.clients[key] = dc
+	m.mu.Unlock()
+
+	go func() {
+		defer close(dc.done)
+		switch af {
+		case AFInet:
+			m.runDHCPv4(cctx, ifaceName)
+		case AFInet6:
+			m.runDHCPv6(cctx, ifaceName)
+		}
+	}()
+}
+
+// StopAll stops all running DHCP clients and releases leases.
+func (m *Manager) StopAll() {
+	m.mu.Lock()
+	clients := make(map[clientKey]*dhcpClient, len(m.clients))
+	for k, v := range m.clients {
+		clients[k] = v
+	}
+	m.mu.Unlock()
+
+	for _, dc := range clients {
+		dc.cancel()
+		<-dc.done
+	}
+
+	m.mu.Lock()
+	if m.recompileTimer != nil {
+		m.recompileTimer.Stop()
+		m.recompileTimer = nil
+	}
+	m.mu.Unlock()
+}
+
+// Close releases the netlink handle.
+func (m *Manager) Close() {
+	if m.nlHandle != nil {
+		m.nlHandle.Close()
+	}
+}
+
+// Leases returns a snapshot of all current DHCP leases.
+func (m *Manager) Leases() []*Lease {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	result := make([]*Lease, 0, len(m.leases))
+	for _, l := range m.leases {
+		lc := *l
+		result = append(result, &lc)
+	}
+	return result
+}
+
+// LeaseFor returns the current lease for a specific interface/family, or nil.
+func (m *Manager) LeaseFor(ifaceName string, af AddressFamily) *Lease {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	l, ok := m.leases[clientKey{iface: ifaceName, family: af}]
+	if !ok {
+		return nil
+	}
+	lc := *l
+	return &lc
+}
+
+// runDHCPv4 runs the DHCPv4 DORA cycle with retries and renewal.
+func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
+	key := clientKey{iface: ifaceName, family: AFInet}
+	backoff := time.Second
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		slog.Info("DHCPv4: starting discovery", "interface", ifaceName)
+
+		lease, err := m.doDHCPv4(ctx, ifaceName)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("DHCPv4: discovery failed, retrying",
+				"interface", ifaceName, "err", err, "backoff", backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			}
+			backoff = min(backoff*2, 60*time.Second)
+			continue
+		}
+
+		backoff = time.Second // reset on success
+
+		// Apply address
+		if err := m.applyAddress(ifaceName, lease); err != nil {
+			slog.Warn("DHCPv4: failed to apply address",
+				"interface", ifaceName, "err", err)
+			continue
+		}
+
+		m.mu.Lock()
+		m.leases[key] = lease
+		m.mu.Unlock()
+
+		m.scheduleRecompile()
+
+		slog.Info("DHCPv4: lease obtained",
+			"interface", ifaceName,
+			"address", lease.Address,
+			"gateway", lease.Gateway,
+			"lease_time", lease.LeaseTime)
+
+		// Wait for T1 (50% of lease time) for renewal
+		t1 := lease.LeaseTime / 2
+		if t1 < 30*time.Second {
+			t1 = 30 * time.Second
+		}
+
+		select {
+		case <-time.After(t1):
+			slog.Info("DHCPv4: T1 expired, renewing", "interface", ifaceName)
+		case <-ctx.Done():
+			// Release lease
+			m.removeAddress(ifaceName, lease)
+			m.mu.Lock()
+			delete(m.leases, key)
+			m.mu.Unlock()
+			return
+		}
+	}
+}
+
+// doDHCPv4 performs a single DORA exchange.
+func (m *Manager) doDHCPv4(ctx context.Context, ifaceName string) (*Lease, error) {
+	client, err := nclient4.New(ifaceName)
+	if err != nil {
+		return nil, fmt.Errorf("create DHCPv4 client: %w", err)
+	}
+	defer client.Close()
+
+	// Use a timeout context for the exchange
+	exCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	dhcpLease, err := client.Request(exCtx)
+	if err != nil {
+		return nil, fmt.Errorf("DHCPv4 request: %w", err)
+	}
+
+	ack := dhcpLease.ACK
+
+	// Extract lease info
+	yourIP := ack.YourIPAddr
+	if yourIP == nil || yourIP.IsUnspecified() {
+		return nil, fmt.Errorf("no IP in DHCP ACK")
+	}
+
+	// Subnet mask
+	mask := ack.SubnetMask()
+	if mask == nil {
+		mask = net.CIDRMask(24, 32) // fallback
+	}
+	ones, _ := net.IPMask(mask).Size()
+
+	addr, ok := netip.AddrFromSlice(yourIP.To4())
+	if !ok {
+		return nil, fmt.Errorf("invalid IP in DHCP ACK: %v", yourIP)
+	}
+
+	lease := &Lease{
+		Interface: ifaceName,
+		Family:    AFInet,
+		Address:   netip.PrefixFrom(addr, ones),
+		Obtained:  time.Now(),
+	}
+
+	// Gateway
+	routers := ack.Router()
+	if len(routers) > 0 {
+		if gw, ok := netip.AddrFromSlice(routers[0].To4()); ok {
+			lease.Gateway = gw
+		}
+	}
+
+	// DNS
+	dnsServers := ack.DNS()
+	for _, dns := range dnsServers {
+		if a, ok := netip.AddrFromSlice(dns.To4()); ok {
+			lease.DNS = append(lease.DNS, a)
+		}
+	}
+
+	// Lease time
+	lt := ack.IPAddressLeaseTime(3600 * time.Second) // default 1 hour
+	lease.LeaseTime = lt
+
+	return lease, nil
+}
+
+// runDHCPv6 runs the DHCPv6 solicit/request cycle with retries and renewal.
+func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
+	key := clientKey{iface: ifaceName, family: AFInet6}
+	backoff := time.Second
+
+	// Wait for link-local address
+	if err := m.waitForLinkLocal(ctx, ifaceName, 30*time.Second); err != nil {
+		slog.Warn("DHCPv6: no link-local address, aborting",
+			"interface", ifaceName, "err", err)
+		return
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		slog.Info("DHCPv6: starting solicit", "interface", ifaceName)
+
+		lease, err := m.doDHCPv6(ctx, ifaceName)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("DHCPv6: solicit failed, retrying",
+				"interface", ifaceName, "err", err, "backoff", backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			}
+			backoff = min(backoff*2, 60*time.Second)
+			continue
+		}
+
+		backoff = time.Second
+
+		if err := m.applyAddress(ifaceName, lease); err != nil {
+			slog.Warn("DHCPv6: failed to apply address",
+				"interface", ifaceName, "err", err)
+			continue
+		}
+
+		m.mu.Lock()
+		m.leases[key] = lease
+		m.mu.Unlock()
+
+		m.scheduleRecompile()
+
+		slog.Info("DHCPv6: lease obtained",
+			"interface", ifaceName,
+			"address", lease.Address,
+			"lease_time", lease.LeaseTime)
+
+		// Wait for T1
+		t1 := lease.LeaseTime / 2
+		if t1 < 30*time.Second {
+			t1 = 30 * time.Second
+		}
+
+		select {
+		case <-time.After(t1):
+			slog.Info("DHCPv6: T1 expired, renewing", "interface", ifaceName)
+		case <-ctx.Done():
+			m.removeAddress(ifaceName, lease)
+			m.mu.Lock()
+			delete(m.leases, key)
+			m.mu.Unlock()
+			return
+		}
+	}
+}
+
+// doDHCPv6 performs a single DHCPv6 solicit/request exchange.
+func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*Lease, error) {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return nil, fmt.Errorf("interface lookup: %w", err)
+	}
+
+	client, err := nclient6.New(ifaceName)
+	if err != nil {
+		return nil, fmt.Errorf("create DHCPv6 client: %w", err)
+	}
+	defer client.Close()
+
+	exCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Try rapid solicit first
+	adv, err := client.RapidSolicit(exCtx)
+	if err != nil {
+		return nil, fmt.Errorf("DHCPv6 solicit: %w", err)
+	}
+
+	_ = iface
+
+	// Extract IA_NA addresses
+	var addr netip.Addr
+	var validLT time.Duration
+
+	for _, opt := range adv.Options.Options {
+		if iana, ok := opt.(*dhcpv6.OptIANA); ok {
+			for _, subOpt := range iana.Options.Options {
+				if iaaddr, ok := subOpt.(*dhcpv6.OptIAAddress); ok {
+					if a, ok2 := netip.AddrFromSlice(iaaddr.IPv6Addr); ok2 {
+						addr = a
+						validLT = iaaddr.ValidLifetime
+					}
+				}
+			}
+		}
+	}
+
+	if !addr.IsValid() {
+		return nil, fmt.Errorf("no IA_NA address in DHCPv6 reply")
+	}
+
+	lease := &Lease{
+		Interface: ifaceName,
+		Family:    AFInet6,
+		Address:   netip.PrefixFrom(addr, 128),
+		Obtained:  time.Now(),
+		LeaseTime: validLT,
+	}
+
+	if lease.LeaseTime == 0 {
+		lease.LeaseTime = 3600 * time.Second
+	}
+
+	// Extract DNS
+	if dnsOpt := adv.Options.DNS(); len(dnsOpt) > 0 {
+		for _, dns := range dnsOpt {
+			if a, ok := netip.AddrFromSlice(dns); ok {
+				lease.DNS = append(lease.DNS, a)
+			}
+		}
+	}
+
+	return lease, nil
+}
+
+// waitForLinkLocal waits until the interface has a link-local IPv6 address.
+func (m *Manager) waitForLinkLocal(ctx context.Context, ifaceName string, timeout time.Duration) error {
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline:
+			return fmt.Errorf("timeout waiting for link-local on %s", ifaceName)
+		case <-ticker.C:
+			iface, err := net.InterfaceByName(ifaceName)
+			if err != nil {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, a := range addrs {
+				ipNet, ok := a.(*net.IPNet)
+				if !ok {
+					continue
+				}
+				if ipNet.IP.To4() == nil && ipNet.IP.IsLinkLocalUnicast() {
+					return nil
+				}
+			}
+		}
+	}
+}
+
+// applyAddress sets the DHCP-obtained address on the interface via netlink,
+// and installs a default route via the gateway if provided.
+func (m *Manager) applyAddress(ifaceName string, lease *Lease) error {
+	link, err := m.nlHandle.LinkByName(ifaceName)
+	if err != nil {
+		return fmt.Errorf("link lookup %s: %w", ifaceName, err)
+	}
+
+	addr := &netlink.Addr{
+		IPNet: prefixToIPNet(lease.Address),
+	}
+
+	if err := m.nlHandle.AddrReplace(link, addr); err != nil {
+		return fmt.Errorf("addr replace: %w", err)
+	}
+
+	// Install default route via gateway if provided
+	if lease.Gateway.IsValid() {
+		var dst *net.IPNet
+		if lease.Family == AFInet {
+			dst = &net.IPNet{
+				IP:   net.IPv4zero,
+				Mask: net.CIDRMask(0, 32),
+			}
+		} else {
+			dst = &net.IPNet{
+				IP:   net.IPv6zero,
+				Mask: net.CIDRMask(0, 128),
+			}
+		}
+
+		route := &netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Dst:       dst,
+			Gw:        lease.Gateway.AsSlice(),
+			Priority:  1024, // high metric so static routes win
+		}
+		if err := m.nlHandle.RouteReplace(route); err != nil {
+			slog.Warn("DHCP: failed to install default route",
+				"interface", ifaceName, "gateway", lease.Gateway, "err", err)
+		}
+	}
+
+	return nil
+}
+
+// removeAddress removes the DHCP address and default route from the interface.
+func (m *Manager) removeAddress(ifaceName string, lease *Lease) {
+	link, err := m.nlHandle.LinkByName(ifaceName)
+	if err != nil {
+		return
+	}
+
+	addr := &netlink.Addr{
+		IPNet: prefixToIPNet(lease.Address),
+	}
+	if err := m.nlHandle.AddrDel(link, addr); err != nil {
+		slog.Warn("DHCP: failed to remove address",
+			"interface", ifaceName, "address", lease.Address, "err", err)
+	}
+
+	// Remove default route
+	if lease.Gateway.IsValid() {
+		var dst *net.IPNet
+		if lease.Family == AFInet {
+			dst = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
+		} else {
+			dst = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
+		}
+		route := &netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Dst:       dst,
+			Gw:        lease.Gateway.AsSlice(),
+			Priority:  1024,
+		}
+		_ = m.nlHandle.RouteDel(route)
+	}
+}
+
+// scheduleRecompile debounces address change notifications.
+func (m *Manager) scheduleRecompile() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.recompileTimer != nil {
+		m.recompileTimer.Stop()
+	}
+	m.recompileTimer = time.AfterFunc(2*time.Second, func() {
+		if m.onAddressChange != nil {
+			m.onAddressChange()
+		}
+	})
+}
+
+// prefixToIPNet converts netip.Prefix to *net.IPNet.
+func prefixToIPNet(p netip.Prefix) *net.IPNet {
+	addr := p.Addr()
+	bits := p.Bits()
+	if addr.Is4() {
+		return &net.IPNet{
+			IP:   addr.AsSlice(),
+			Mask: net.CIDRMask(bits, 32),
+		}
+	}
+	return &net.IPNet{
+		IP:   addr.AsSlice(),
+		Mask: net.CIDRMask(bits, 128),
+	}
+}

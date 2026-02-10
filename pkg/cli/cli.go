@@ -10,11 +10,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/chzyer/readline"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/frr"
 	"github.com/psaab/bpfrx/pkg/ipsec"
 	"github.com/psaab/bpfrx/pkg/logging"
@@ -31,12 +33,13 @@ type CLI struct {
 	routing     *routing.Manager
 	frr         *frr.Manager
 	ipsec       *ipsec.Manager
+	dhcp        *dhcp.Manager
 	hostname    string
 	username    string
 }
 
 // New creates a new CLI.
-func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.EventBuffer, eventReader *logging.EventReader, rm *routing.Manager, fm *frr.Manager, im *ipsec.Manager) *CLI {
+func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.EventBuffer, eventReader *logging.EventReader, rm *routing.Manager, fm *frr.Manager, im *ipsec.Manager, dm *dhcp.Manager) *CLI {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "bpfrx"
@@ -54,6 +57,7 @@ func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.Even
 		routing:     rm,
 		frr:         fm,
 		ipsec:       im,
+		dhcp:        dm,
 		hostname:    hostname,
 		username:    username,
 	}
@@ -70,7 +74,10 @@ var operationalTree = map[string]*completionNode{
 	"configure": {desc: "Enter configuration mode"},
 	"show": {desc: "Show information", children: map[string]*completionNode{
 		"configuration": {desc: "Show active configuration"},
-		"route":         {desc: "Show routing table"},
+		"dhcp": {desc: "Show DHCP information", children: map[string]*completionNode{
+			"leases": {desc: "Show DHCP leases"},
+		}},
+		"route": {desc: "Show routing table"},
 		"security": {desc: "Show security information", children: map[string]*completionNode{
 			"zones":    {desc: "Show security zones"},
 			"policies": {desc: "Show security policies"},
@@ -468,6 +475,7 @@ func (c *CLI) handleShow(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("show: specify what to show")
 		fmt.Println("  configuration    Show active configuration")
+		fmt.Println("  dhcp             Show DHCP information")
 		fmt.Println("  route            Show routing table")
 		fmt.Println("  security         Show security information")
 		fmt.Println("  interfaces       Show interface status")
@@ -484,6 +492,14 @@ func (c *CLI) handleShow(args []string) error {
 		} else {
 			fmt.Print(c.store.ShowActive())
 		}
+		return nil
+
+	case "dhcp":
+		if len(args) >= 2 && args[1] == "leases" {
+			return c.showDHCPLeases()
+		}
+		fmt.Println("show dhcp:")
+		fmt.Println("  leases           Show DHCP leases")
 		return nil
 
 	case "route":
@@ -1966,6 +1982,18 @@ func (c *CLI) showInterfaces(args []string) error {
 			}
 			fmt.Printf(", Zone: %s\n", li.zoneName)
 
+			// Show DHCP annotations
+			if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+				if unit, ok := ifCfg.Units[li.unitNum]; ok {
+					if unit.DHCP {
+						fmt.Println("    DHCPv4: enabled")
+					}
+					if unit.DHCPv6 {
+						fmt.Println("    DHCPv6: enabled")
+					}
+				}
+			}
+
 			// Look up addresses from the logical/sub-interface
 			liface, err := net.InterfaceByName(lookupName)
 			if err != nil {
@@ -2256,6 +2284,7 @@ func (c *CLI) showOperationalHelp() {
 	fmt.Println("  configure                          Enter configuration mode")
 	fmt.Println("  show configuration                 Show running configuration")
 	fmt.Println("  show configuration | display set   Show as flat set commands")
+	fmt.Println("  show dhcp leases                   Show DHCP leases")
 	fmt.Println("  show route                         Show routing table")
 	fmt.Println("  show security                      Show security information")
 	fmt.Println("  show security ipsec                Show IPsec VPN status")
@@ -2271,6 +2300,48 @@ func (c *CLI) showOperationalHelp() {
 	fmt.Println()
 	fmt.Println("  <command> | match <pattern>         Filter output by pattern")
 	fmt.Println("  Use <TAB> for command completion, ? for context help")
+}
+
+func (c *CLI) showDHCPLeases() error {
+	if c.dhcp == nil {
+		fmt.Println("No DHCP clients running")
+		return nil
+	}
+
+	leases := c.dhcp.Leases()
+	if len(leases) == 0 {
+		fmt.Println("No active DHCP leases")
+		return nil
+	}
+
+	fmt.Println("DHCP leases:")
+	for _, l := range leases {
+		family := "inet"
+		if l.Family == dhcp.AFInet6 {
+			family = "inet6"
+		}
+		elapsed := time.Since(l.Obtained).Round(time.Second)
+		remaining := l.LeaseTime - elapsed
+		if remaining < 0 {
+			remaining = 0
+		}
+		fmt.Printf("  Interface: %s, Family: %s\n", l.Interface, family)
+		fmt.Printf("    Address:   %s\n", l.Address)
+		if l.Gateway.IsValid() {
+			fmt.Printf("    Gateway:   %s\n", l.Gateway)
+		}
+		if len(l.DNS) > 0 {
+			dnsStrs := make([]string, len(l.DNS))
+			for i, d := range l.DNS {
+				dnsStrs[i] = d.String()
+			}
+			fmt.Printf("    DNS:       %s\n", strings.Join(dnsStrs, ", "))
+		}
+		fmt.Printf("    Lease:     %s (remaining: %s)\n", l.LeaseTime.Round(time.Second), remaining.Round(time.Second))
+		fmt.Printf("    Obtained:  %s\n", l.Obtained.Format("2006-01-02 15:04:05"))
+		fmt.Println()
+	}
+	return nil
 }
 
 func (c *CLI) showConfigHelp() {

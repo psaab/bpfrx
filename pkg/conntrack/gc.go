@@ -4,21 +4,40 @@ package conntrack
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/psaab/bpfrx/pkg/dataplane"
 	"golang.org/x/sys/unix"
 )
 
+// GCStats holds statistics from the most recent GC sweep.
+type GCStats struct {
+	LastSweepTime       time.Time
+	LastSweepDuration   time.Duration
+	TotalEntries        int
+	EstablishedSessions int
+	ExpiredDeleted      int
+}
+
 // GC performs periodic garbage collection on the session table.
 type GC struct {
 	dp       *dataplane.Manager
 	interval time.Duration
+	mu       sync.RWMutex
+	stats    GCStats
 }
 
 // NewGC creates a new session garbage collector.
 func NewGC(dp *dataplane.Manager, interval time.Duration) *GC {
 	return &GC{dp: dp, interval: interval}
+}
+
+// Stats returns a snapshot of the most recent GC sweep statistics.
+func (gc *GC) Stats() GCStats {
+	gc.mu.RLock()
+	defer gc.mu.RUnlock()
+	return gc.stats
 }
 
 // Run starts the GC loop. It blocks until ctx is cancelled.
@@ -51,6 +70,7 @@ type expiredSessionV6 struct {
 }
 
 func (gc *GC) sweep() {
+	sweepStart := time.Now()
 	now := monotonicSeconds()
 
 	var total, established, expired int
@@ -165,6 +185,16 @@ func (gc *GC) sweep() {
 			"expired_deleted", expired,
 			"snat_dnat_cleaned", totalSnatCleaned)
 	}
+
+	gc.mu.Lock()
+	gc.stats = GCStats{
+		LastSweepTime:       sweepStart,
+		LastSweepDuration:   time.Since(sweepStart),
+		TotalEntries:        total,
+		EstablishedSessions: established,
+		ExpiredDeleted:      expired,
+	}
+	gc.mu.Unlock()
 }
 
 // monotonicSeconds returns the current monotonic clock in seconds,

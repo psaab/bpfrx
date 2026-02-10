@@ -117,6 +117,37 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	}
 
 	/*
+	 * Broadcast / multicast → host-bound traffic.
+	 * Skip the zone-pair policy pipeline and jump directly to the
+	 * forward stage which applies host-inbound-traffic filtering.
+	 * Without this, bpf_fib_lookup may match the default route and
+	 * send the packet through the policy pipeline where deny-all
+	 * would drop it (e.g. DHCP OFFER to 255.255.255.255).
+	 */
+	if (meta->addr_family == AF_INET) {
+		if (meta->dst_ip.v4 == (__be32)0xFFFFFFFF) {
+			meta->fwd_ifindex = 0;
+			bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+			return XDP_PASS;
+		}
+		/* IPv4 multicast: first byte 0xE0-0xEF (224.0.0.0/4) */
+		__u8 *ip4b = (__u8 *)&meta->dst_ip.v4;
+		if ((ip4b[0] & 0xF0) == 0xE0) {
+			meta->fwd_ifindex = 0;
+			bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+			return XDP_PASS;
+		}
+	} else {
+		/* IPv6 multicast: ff00::/8 */
+		__u8 *ip6b = (__u8 *)meta->dst_ip.v6;
+		if (ip6b[0] == 0xFF) {
+			meta->fwd_ifindex = 0;
+			bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+			return XDP_PASS;
+		}
+	}
+
+	/*
 	 * FIB lookup to determine egress interface.
 	 * Uses the (possibly translated) dst_ip for routing.
 	 */
