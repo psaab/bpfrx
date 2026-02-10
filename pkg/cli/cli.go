@@ -393,6 +393,7 @@ func (c *CLI) dispatchOperational(line string) error {
 		}
 		c.rl.SetPrompt(c.configPrompt())
 		fmt.Println("Entering configuration mode")
+		fmt.Println("[edit]")
 		return nil
 
 	case "show":
@@ -2278,7 +2279,7 @@ func (c *CLI) operationalPrompt() string {
 }
 
 func (c *CLI) configPrompt() string {
-	return fmt.Sprintf("[edit]\n%s@%s# ", c.username, c.hostname)
+	return fmt.Sprintf("%s@%s# ", c.username, c.hostname)
 }
 
 func (c *CLI) showOperationalHelp() {
