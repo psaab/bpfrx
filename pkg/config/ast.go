@@ -198,6 +198,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					}},
 				}},
 			}},
+			"nat64": {children: map[string]*schemaNode{
+				"rule-set": {args: 1, children: map[string]*schemaNode{
+					"prefix":      {args: 1, children: nil},
+					"source-pool": {args: 1, children: nil},
+				}},
+			}},
 		}},
 		"address-book": {children: map[string]*schemaNode{
 			"global": {children: map[string]*schemaNode{

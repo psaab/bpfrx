@@ -1189,6 +1189,76 @@ func TestRouterAdvertisement(t *testing.T) {
 	}
 }
 
+func TestNAT64(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		// Define a source NAT pool for NAT64 translated packets
+		"set security nat source pool nat64-pool address 203.0.113.0/24",
+		// Define NAT64 rule-set
+		"set security nat nat64 rule-set v6-to-v4 prefix 64:ff9b::/96",
+		"set security nat nat64 rule-set v6-to-v4 source-pool nat64-pool",
+	}
+
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig failed: %v", err)
+	}
+
+	// Verify NAT64 rule-set
+	if len(cfg.Security.NAT.NAT64) != 1 {
+		t.Fatalf("expected 1 NAT64 rule-set, got %d", len(cfg.Security.NAT.NAT64))
+	}
+
+	rs := cfg.Security.NAT.NAT64[0]
+	if rs.Name != "v6-to-v4" {
+		t.Errorf("rule-set name = %q, want %q", rs.Name, "v6-to-v4")
+	}
+	if rs.Prefix != "64:ff9b::/96" {
+		t.Errorf("prefix = %q, want %q", rs.Prefix, "64:ff9b::/96")
+	}
+	if rs.SourcePool != "nat64-pool" {
+		t.Errorf("source-pool = %q, want %q", rs.SourcePool, "nat64-pool")
+	}
+
+	// Also test hierarchical syntax
+	hierInput := `security {
+    nat {
+        nat64 {
+            rule-set wkp {
+                prefix 64:ff9b::/96;
+                source-pool pool1;
+            }
+        }
+    }
+}`
+	parser := NewParser(hierInput)
+	tree2, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("Parse hierarchical: %v", errs)
+	}
+	cfg2, err := CompileConfig(tree2)
+	if err != nil {
+		t.Fatalf("CompileConfig hierarchical: %v", err)
+	}
+	if len(cfg2.Security.NAT.NAT64) != 1 {
+		t.Fatalf("hierarchical: expected 1 NAT64 rule-set, got %d", len(cfg2.Security.NAT.NAT64))
+	}
+	rs2 := cfg2.Security.NAT.NAT64[0]
+	if rs2.Name != "wkp" || rs2.Prefix != "64:ff9b::/96" || rs2.SourcePool != "pool1" {
+		t.Errorf("hierarchical: got %+v", rs2)
+	}
+}
+
 func TestFormatSet(t *testing.T) {
 	input := `security {
     zones {

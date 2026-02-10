@@ -698,6 +698,38 @@ func ipToUint32BE(ip net.IP) uint32 {
 	return binary.NativeEndian.Uint32(ip4)
 }
 
+// SetNAT64Config writes a NAT64 prefix config at the given index.
+func (m *Manager) SetNAT64Config(index uint32, cfg NAT64Config) error {
+	zm, ok := m.maps["nat64_configs"]
+	if !ok {
+		return fmt.Errorf("nat64_configs not found")
+	}
+	return zm.Update(index, cfg, ebpf.UpdateAny)
+}
+
+// SetNAT64Count writes the number of active NAT64 prefixes.
+func (m *Manager) SetNAT64Count(count uint32) error {
+	zm, ok := m.maps["nat64_count"]
+	if !ok {
+		return fmt.Errorf("nat64_count not found")
+	}
+	var zero uint32
+	return zm.Update(zero, count, ebpf.UpdateAny)
+}
+
+// ClearNAT64Configs zeroes all NAT64 config entries and sets count to 0.
+func (m *Manager) ClearNAT64Configs() error {
+	zm, ok := m.maps["nat64_configs"]
+	if !ok {
+		return fmt.Errorf("nat64_configs not found")
+	}
+	var empty NAT64Config
+	for i := uint32(0); i < 4; i++ { // MAX_NAT64_PREFIXES
+		zm.Update(i, empty, ebpf.UpdateAny)
+	}
+	return m.SetNAT64Count(0)
+}
+
 // ipTo16Bytes converts a net.IP to a [16]byte array.
 func ipTo16Bytes(ip net.IP) [16]byte {
 	var b [16]byte

@@ -525,6 +525,38 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 		}
 	}
 
+	nat64Node := node.FindChild("nat64")
+	if nat64Node != nil {
+		if err := compileNAT64(nat64Node, sec); err != nil {
+			return fmt.Errorf("nat64: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func compileNAT64(node *Node, sec *SecurityConfig) error {
+	for _, rsNode := range node.FindChildren("rule-set") {
+		if len(rsNode.Keys) < 2 {
+			continue
+		}
+		rs := &NAT64RuleSet{Name: rsNode.Keys[1]}
+
+		for _, child := range rsNode.Children {
+			switch child.Name() {
+			case "prefix":
+				if len(child.Keys) >= 2 {
+					rs.Prefix = child.Keys[1]
+				}
+			case "source-pool":
+				if len(child.Keys) >= 2 {
+					rs.SourcePool = child.Keys[1]
+				}
+			}
+		}
+
+		sec.NAT.NAT64 = append(sec.NAT.NAT64, rs)
+	}
 	return nil
 }
 

@@ -170,6 +170,7 @@ const (
 	XDPProgPolicy    = 3
 	XDPProgNAT       = 4
 	XDPProgForward   = 5
+	XDPProgNAT64     = 6
 
 	TCProgConntrack   = 0
 	TCProgNAT         = 1
@@ -189,7 +190,8 @@ const (
 	GlobalCtrNATAllocFail    = 7
 	GlobalCtrHostInboundDeny = 8
 	GlobalCtrTCEgressPackets = 9
-	GlobalCtrMax             = 10
+	GlobalCtrNAT64Xlate      = 10
+	GlobalCtrMax             = 11
 )
 
 // Host-inbound-traffic service flags (bitmap in zone_config.host_inbound_flags).
@@ -521,3 +523,10 @@ type VlanIfaceInfo struct {
 const (
 	ProtoICMPv6 = 58
 )
+
+// NAT64Config mirrors the C struct nat64_config.
+type NAT64Config struct {
+	Prefix     [3]uint32 // first 96 bits of NAT64 prefix (3 x 32-bit words, network order)
+	SNATPoolID uint8
+	Pad        [3]byte
+}

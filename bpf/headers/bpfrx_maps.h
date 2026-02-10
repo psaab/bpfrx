@@ -489,4 +489,33 @@ struct {
 	__type(value, __u32);
 } flow_timeouts SEC(".maps");
 
+/* ============================================================
+ * NAT64 configuration & state
+ * ============================================================ */
+
+/* NAT64 prefix array: index -> nat64_config */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_NAT64_PREFIXES);
+	__type(key, __u32);
+	__type(value, struct nat64_config);
+} nat64_configs SEC(".maps");
+
+/* Number of active NAT64 prefixes (single-entry array) */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} nat64_count SEC(".maps");
+
+/* NAT64 reverse state: translated IPv4 5-tuple -> original IPv6 info */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_SESSIONS);
+	__type(key, struct nat64_state_key);
+	__type(value, struct nat64_state_value);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} nat64_state SEC(".maps");
+
 #endif /* __BPFRX_MAPS_H__ */

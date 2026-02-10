@@ -51,6 +51,9 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["static_nat_v6"] = mainObjs.StaticNatV6
 	m.maps["flow_timeouts"] = mainObjs.FlowTimeouts
 	m.maps["vlan_iface_map"] = mainObjs.VlanIfaceMap
+	m.maps["nat64_configs"] = mainObjs.Nat64Configs
+	m.maps["nat64_count"] = mainObjs.Nat64Count
+	m.maps["nat64_state"] = mainObjs.Nat64State
 
 	// Store main program.
 	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
@@ -89,6 +92,9 @@ func (m *Manager) loadAllObjects() error {
 			"static_nat_v6":      mainObjs.StaticNatV6,
 			"flow_timeouts":      mainObjs.FlowTimeouts,
 			"vlan_iface_map":     mainObjs.VlanIfaceMap,
+			"nat64_configs":      mainObjs.Nat64Configs,
+			"nat64_count":        mainObjs.Nat64Count,
+			"nat64_state":        mainObjs.Nat64State,
 		},
 	}
 
@@ -146,6 +152,13 @@ func (m *Manager) loadAllObjects() error {
 	}
 	m.programs["xdp_forward_prog"] = fwdObjs.XdpForwardProg
 
+	// Load XDP NAT64 program (uses NAT pool maps for SNAT allocation).
+	var nat64Objs bpfrxXdpNat64Objects
+	if err := loadBpfrxXdpNat64Objects(&nat64Objs, policyReplaceOpts); err != nil {
+		return fmt.Errorf("load xdp_nat64: %w", err)
+	}
+	m.programs["xdp_nat64_prog"] = nat64Objs.XdpNat64Prog
+
 	// Populate XDP tail call program array.
 	xdpProgs := mainObjs.XdpProgs
 	tailCalls := map[uint32]*ebpf.Program{
@@ -155,6 +168,7 @@ func (m *Manager) loadAllObjects() error {
 		XDPProgPolicy:    polObjs.XdpPolicyProg,
 		XDPProgNAT:       natObjs.XdpNatProg,
 		XDPProgForward:   fwdObjs.XdpForwardProg,
+		XDPProgNAT64:     nat64Objs.XdpNat64Prog,
 	}
 	for idx, prog := range tailCalls {
 		fd := uint32(prog.FD())

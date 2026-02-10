@@ -827,6 +827,78 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				__be16 sess_nat_src_port = 0, sess_nat_dst_port = 0;
 				__be16 orig_src_port = meta->src_port;
 
+				/*
+				 * NAT64 forward path: allocate IPv4 SNAT address
+				 * from the NAT64 source pool and skip regular SNAT.
+				 * meta->nat_flags has SESS_FLAG_NAT64 set by xdp_zone.
+				 */
+				if (meta->nat_flags & SESS_FLAG_NAT64) {
+					/* Find the matching NAT64 config to get pool ID */
+					__u32 n64_zero = 0;
+					__u32 *n64_cnt = bpf_map_lookup_elem(&nat64_count, &n64_zero);
+					__u8 pool_id = 0;
+					int found_pool = 0;
+					if (n64_cnt && *n64_cnt > 0) {
+						__u32 cnt = *n64_cnt;
+						if (cnt > MAX_NAT64_PREFIXES)
+							cnt = MAX_NAT64_PREFIXES;
+						__be32 *dst32 = (__be32 *)meta->dst_ip.v6;
+						#pragma unroll
+						for (__u32 ni = 0; ni < MAX_NAT64_PREFIXES; ni++) {
+							if (ni >= cnt) break;
+							struct nat64_config *n64 = bpf_map_lookup_elem(&nat64_configs, &ni);
+							if (!n64) break;
+							if (dst32[0] == n64->prefix[0] &&
+							    dst32[1] == n64->prefix[1] &&
+							    dst32[2] == n64->prefix[2]) {
+								pool_id = n64->snat_pool_id;
+								found_pool = 1;
+								break;
+							}
+						}
+					}
+
+					if (found_pool) {
+						__be32 alloc_v4_ip = 0;
+						__be16 alloc_v4_port = 0;
+						if (nat_pool_alloc_v4(pool_id, &alloc_v4_ip, &alloc_v4_port) == 0) {
+							sess_nat_flags = SESS_FLAG_NAT64 | SESS_FLAG_SNAT;
+							sess_nat_src_port = alloc_v4_port;
+							/* Store allocated v4 SNAT addr in meta->src_ip
+							 * (nat64 stage uses this as the IPv4 source) */
+							__builtin_memset(&meta->src_ip, 0, sizeof(meta->src_ip));
+							meta->src_ip.v4 = alloc_v4_ip;
+							meta->src_port = alloc_v4_port;
+
+							/* Create v6 session with NAT64 flag.
+							 * meta->src_ip already has v4 addr in first 4 bytes
+							 * (set above), rest zeroed — use it as nat_src. */
+							const __u8 *nat_dst_ptr = (meta->nat_flags & SESS_FLAG_DNAT) ?
+								meta->nat_dst_ip.v6 : NULL;
+							if (create_session_v6(meta, rule->rule_id, rule->log,
+									      sess_nat_flags,
+									      meta->src_ip.v6, alloc_v4_port,
+									      nat_dst_ptr, sess_nat_dst_port) < 0) {
+								inc_counter(GLOBAL_CTR_DROPS);
+								return XDP_DROP;
+							}
+
+							if (rule->log & LOG_FLAG_SESSION_INIT)
+								emit_event(meta, EVENT_TYPE_SESSION_OPEN,
+									   ACTION_PERMIT, 0, 0);
+
+							bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
+							return XDP_PASS;
+						}
+						/* Pool alloc failed */
+						inc_counter(GLOBAL_CTR_NAT_ALLOC_FAIL);
+						return XDP_DROP;
+					}
+					/* No pool found, drop */
+					inc_counter(GLOBAL_CTR_DROPS);
+					return XDP_DROP;
+				}
+
 				/* Save original src IP */
 				__u8 orig_src_ip_save[16];
 				__builtin_memcpy(orig_src_ip_save, meta->src_ip.v6, 16);

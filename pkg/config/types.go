@@ -108,6 +108,14 @@ type NATConfig struct {
 	SourcePools map[string]*NATPool    // named source NAT pools
 	Destination *DestinationNATConfig
 	Static      []*StaticNATRuleSet
+	NAT64       []*NAT64RuleSet
+}
+
+// NAT64RuleSet defines NAT64 translation rules.
+type NAT64RuleSet struct {
+	Name        string
+	Prefix      string // well-known prefix, e.g. "64:ff9b::/96"
+	SourcePool  string // IPv4 source pool name for translated packets
 }
 
 // StaticNATRuleSet is a set of static 1:1 NAT rules bound to a zone.

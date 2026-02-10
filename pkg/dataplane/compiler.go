@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -85,6 +86,11 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 	// Phase 6.5: Compile static NAT
 	if err := m.compileStaticNAT(cfg, result); err != nil {
 		return nil, fmt.Errorf("compile static nat: %w", err)
+	}
+
+	// Phase 6.6: Compile NAT64 prefixes
+	if err := m.compileNAT64(cfg, result); err != nil {
+		return nil, fmt.Errorf("compile nat64: %w", err)
 	}
 
 	// Phase 7: Compile screen profiles
@@ -1159,6 +1165,74 @@ func (m *Manager) compileStaticNAT(cfg *config.Config, result *CompileResult) er
 	if count > 0 {
 		slog.Info("static NAT compilation complete", "entries", count)
 	}
+	return nil
+}
+
+func (m *Manager) compileNAT64(cfg *config.Config, result *CompileResult) error {
+	if err := m.ClearNAT64Configs(); err != nil {
+		slog.Warn("failed to clear nat64_configs", "err", err)
+	}
+
+	ruleSets := cfg.Security.NAT.NAT64
+	if len(ruleSets) == 0 {
+		return nil
+	}
+
+	count := uint32(0)
+	for _, rs := range ruleSets {
+		if count >= 4 { // MAX_NAT64_PREFIXES
+			slog.Warn("max NAT64 prefixes exceeded, skipping", "rule-set", rs.Name)
+			break
+		}
+
+		// Parse the /96 prefix (e.g. "64:ff9b::/96")
+		ip, ipNet, err := net.ParseCIDR(rs.Prefix)
+		if err != nil {
+			return fmt.Errorf("NAT64 rule-set %q: invalid prefix %q: %w", rs.Name, rs.Prefix, err)
+		}
+		ones, _ := ipNet.Mask.Size()
+		if ones != 96 {
+			return fmt.Errorf("NAT64 rule-set %q: prefix must be /96, got /%d", rs.Name, ones)
+		}
+
+		// Extract first 96 bits as 3 x uint32.
+		// BPF stores these as __be32 (raw network bytes). cilium/ebpf serializes
+		// Go uint32 using native endian, so use NativeEndian.Uint32 on the raw
+		// IP bytes to preserve the byte pattern (same as ipToUint32BE).
+		ip16 := ip.To16()
+		if ip16 == nil {
+			return fmt.Errorf("NAT64 rule-set %q: prefix is not IPv6", rs.Name)
+		}
+		var prefix [3]uint32
+		prefix[0] = binary.NativeEndian.Uint32(ip16[0:4])
+		prefix[1] = binary.NativeEndian.Uint32(ip16[4:8])
+		prefix[2] = binary.NativeEndian.Uint32(ip16[8:12])
+
+		// Look up the source pool ID
+		poolID, ok := result.PoolIDs[rs.SourcePool]
+		if !ok {
+			return fmt.Errorf("NAT64 rule-set %q: source pool %q not found (must be defined in source NAT)", rs.Name, rs.SourcePool)
+		}
+
+		nat64Cfg := NAT64Config{
+			Prefix:     prefix,
+			SNATPoolID: poolID,
+		}
+		if err := m.SetNAT64Config(count, nat64Cfg); err != nil {
+			return fmt.Errorf("NAT64 rule-set %q: set config: %w", rs.Name, err)
+		}
+
+		slog.Info("compiled NAT64 prefix",
+			"rule-set", rs.Name, "prefix", rs.Prefix,
+			"pool", rs.SourcePool, "pool_id", poolID)
+		count++
+	}
+
+	if err := m.SetNAT64Count(count); err != nil {
+		return fmt.Errorf("set NAT64 count: %w", err)
+	}
+
+	slog.Info("NAT64 compilation complete", "prefixes", count)
 	return nil
 }
 

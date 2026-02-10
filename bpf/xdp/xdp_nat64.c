@@ -1,0 +1,642 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * bpfrx XDP NAT64 translation stage.
+ *
+ * Handles IPv6↔IPv4 header translation for NAT64.
+ * Called from xdp_nat when SESS_FLAG_NAT64 is set (forward path)
+ * or from xdp_conntrack when nat64_state matches (reverse path).
+ *
+ * Forward path (IPv6→IPv4):
+ *   - Shrinks packet by 20 bytes (IPv6 40B header → IPv4 20B header)
+ *   - Extracts IPv4 dst from last 32 bits of IPv6 dst
+ *   - Applies SNAT (IPv4 source from pool allocated earlier)
+ *   - Incrementally updates L4 checksums (pseudo-header swap)
+ *   - Creates nat64_state entry for reverse translation
+ *   - Forwards via bpf_fib_lookup + redirect
+ *
+ * Reverse path (IPv4→IPv6):
+ *   - Grows packet by 20 bytes (IPv4 20B header → IPv6 40B header)
+ *   - Restores original IPv6 src/dst from nat64_state
+ *   - Incrementally updates L4 checksums (pseudo-header swap)
+ *   - Forwards via bpf_fib_lookup + redirect
+ */
+
+#include "../headers/bpfrx_common.h"
+#define BPFRX_NAT_POOLS
+#include "../headers/bpfrx_maps.h"
+#include "../headers/bpfrx_helpers.h"
+
+/*
+ * Compute IPv4 header checksum from scratch (10 x 16-bit words).
+ */
+static __always_inline __sum16
+ipv4_csum(struct iphdr *iph)
+{
+	__u32 csum = 0;
+	__u16 *p = (__u16 *)iph;
+
+	#pragma unroll
+	for (int i = 0; i < 10; i++)
+		csum += p[i];
+
+	csum = (csum >> 16) + (csum & 0xFFFF);
+	csum += csum >> 16;
+	return (__sum16)(~csum);
+}
+
+/*
+ * Fold a 32-bit checksum accumulator to 16-bit ones-complement.
+ */
+static __always_inline __u16
+csum_fold(__u32 csum)
+{
+	csum = (csum >> 16) + (csum & 0xFFFF);
+	csum += csum >> 16;
+	return (__u16)csum;
+}
+
+/*
+ * Compute checksum of 16 bytes (e.g., an IPv6 address) as a running sum.
+ */
+static __always_inline __u32
+csum_bytes16(const __u8 *p)
+{
+	const __u16 *w = (const __u16 *)p;
+	__u32 s = 0;
+	#pragma unroll
+	for (int i = 0; i < 8; i++)
+		s += w[i];
+	return s;
+}
+
+/*
+ * Adjust L4 checksum when switching from IPv6 to IPv4 pseudo-header.
+ * old_csum is the existing L4 checksum (computed over IPv6 pseudo-header).
+ * We subtract the IPv6 pseudo-header contribution and add IPv4 pseudo-header.
+ *
+ * IPv6 pseudo-header: src(16) + dst(16) + upper-layer-len(4) + next-hdr(4)
+ * IPv4 pseudo-header: src(4) + dst(4) + zero+proto(2) + len(2)
+ *
+ * We also need to adjust for any port changes (SNAT source port).
+ */
+static __always_inline __sum16
+csum_v6_to_v4(__sum16 old_csum,
+	      const __u8 *old_src_v6, const __u8 *old_dst_v6,
+	      __be32 new_src_v4, __be32 new_dst_v4,
+	      __u8 proto, __u16 l4_len,
+	      __be16 old_sport, __be16 new_sport)
+{
+	__u32 csum;
+
+	/* Un-fold the existing checksum: ~old_csum gives us the running sum */
+	csum = (__u16)~old_csum;
+
+	/* Subtract IPv6 pseudo-header components */
+	__u32 v6sum = csum_bytes16(old_src_v6) + csum_bytes16(old_dst_v6);
+	/* IPv6 pseudo-header also includes length and next-header as 32-bit */
+	v6sum += bpf_htons(l4_len);
+	v6sum += bpf_htons((__u16)proto);
+
+	/* Fold v6sum */
+	v6sum = csum_fold(v6sum);
+
+	/* Subtract v6 pseudo-header (add its complement) */
+	csum += (__u16)~v6sum;
+
+	/* Add IPv4 pseudo-header */
+	__u32 v4sum = 0;
+	v4sum += (new_src_v4 >> 16) & 0xFFFF;
+	v4sum += new_src_v4 & 0xFFFF;
+	v4sum += (new_dst_v4 >> 16) & 0xFFFF;
+	v4sum += new_dst_v4 & 0xFFFF;
+
+	/* For ICMP: IPv4 ICMP doesn't use pseudo-header, but ICMPv6 does.
+	 * Handle this by not adding IPv4 pseudo-header for ICMP. */
+	if (proto != PROTO_ICMPV6) {
+		v4sum += bpf_htons((__u16)proto);
+		v4sum += bpf_htons(l4_len);
+	}
+
+	v4sum = csum_fold(v4sum);
+	csum += v4sum;
+
+	/* Adjust for port change */
+	if (old_sport != new_sport) {
+		csum += (__u16)~old_sport;
+		csum += new_sport;
+	}
+
+	return (__sum16)~csum_fold(csum);
+}
+
+/*
+ * Adjust L4 checksum when switching from IPv4 to IPv6 pseudo-header.
+ */
+static __always_inline __sum16
+csum_v4_to_v6(__sum16 old_csum,
+	      __be32 old_src_v4, __be32 old_dst_v4,
+	      const __u8 *new_src_v6, const __u8 *new_dst_v6,
+	      __u8 old_proto, __u8 new_proto, __u16 l4_len,
+	      __be16 old_dport, __be16 new_dport)
+{
+	__u32 csum;
+
+	csum = (__u16)~old_csum;
+
+	/* Subtract IPv4 pseudo-header.
+	 * For ICMP→ICMPv6: ICMPv4 has no pseudo-header, but ICMPv6 does.
+	 * So for ICMP we don't subtract anything. */
+	if (old_proto != PROTO_ICMP) {
+		__u32 v4sum = 0;
+		v4sum += (old_src_v4 >> 16) & 0xFFFF;
+		v4sum += old_src_v4 & 0xFFFF;
+		v4sum += (old_dst_v4 >> 16) & 0xFFFF;
+		v4sum += old_dst_v4 & 0xFFFF;
+		v4sum += bpf_htons((__u16)old_proto);
+		v4sum += bpf_htons(l4_len);
+		v4sum = csum_fold(v4sum);
+		csum += (__u16)~v4sum;
+	}
+
+	/* Add IPv6 pseudo-header */
+	__u32 v6sum = csum_bytes16(new_src_v6) + csum_bytes16(new_dst_v6);
+	v6sum += bpf_htons(l4_len);
+	v6sum += bpf_htons((__u16)new_proto);
+	v6sum = csum_fold(v6sum);
+	csum += v6sum;
+
+	/* Adjust for port change */
+	if (old_dport != new_dport) {
+		csum += (__u16)~old_dport;
+		csum += new_dport;
+	}
+
+	return (__sum16)~csum_fold(csum);
+}
+
+/*
+ * Translate ICMPv6 type/code to ICMPv4 equivalents.
+ * Returns 0 on success, -1 if not translatable.
+ */
+static __always_inline int
+icmpv6_to_icmpv4(__u8 v6_type, __u8 v6_code, __u8 *v4_type, __u8 *v4_code)
+{
+	switch (v6_type) {
+	case 128: /* Echo Request → 8 */
+		*v4_type = 8;
+		*v4_code = 0;
+		return 0;
+	case 129: /* Echo Reply → 0 */
+		*v4_type = 0;
+		*v4_code = 0;
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+/*
+ * Translate ICMPv4 type/code to ICMPv6 equivalents.
+ */
+static __always_inline int
+icmpv4_to_icmpv6(__u8 v4_type, __u8 v4_code, __u8 *v6_type, __u8 *v6_code)
+{
+	switch (v4_type) {
+	case 8: /* Echo Request → 128 */
+		*v6_type = 128;
+		*v6_code = 0;
+		return 0;
+	case 0: /* Echo Reply → 129 */
+		*v6_type = 129;
+		*v6_code = 0;
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+/*
+ * Forward NAT64 translation: IPv6 → IPv4.
+ *
+ * meta->nat_flags has SESS_FLAG_NAT64 set.
+ * meta->src_ip.v4 has allocated SNAT IPv4 address (set by policy).
+ * meta->src_port has allocated SNAT port.
+ * meta->dst_ip.v6 last 32 bits contain the embedded IPv4 dest.
+ */
+static __always_inline int
+nat64_xlate_6to4(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	void *data     = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+
+	/* Validate offsets */
+	if (meta->l3_offset >= 64 || meta->l4_offset >= 128)
+		return XDP_DROP;
+
+	struct ipv6hdr *ip6h = data + meta->l3_offset;
+	if ((void *)(ip6h + 1) > data_end)
+		return XDP_DROP;
+
+	/* Extract IPv4 destination from last 32 bits of IPv6 dst */
+	__be32 v4_dst = ip6h->daddr.u6_addr32[3];
+	__be32 v4_src = meta->src_ip.v4;  /* SNAT'd v4 address from policy */
+
+	/* Save original IPv6 addresses for nat64_state */
+	__u8 orig_src_v6[16], orig_dst_v6[16];
+	__builtin_memcpy(orig_src_v6, &ip6h->saddr, 16);
+	__builtin_memcpy(orig_dst_v6, &ip6h->daddr, 16);
+
+	/* Calculate L4 length (IPv6 payload, minus any ext headers we skipped) */
+	__u16 l4_len = bpf_ntohs(ip6h->payload_len);
+	__u16 ext_hdr_len = meta->l4_offset - meta->l3_offset - sizeof(struct ipv6hdr);
+	if (ext_hdr_len < l4_len)
+		l4_len -= ext_hdr_len;
+
+	__u8 orig_proto = meta->protocol;
+	__u8 ip4_proto = orig_proto;
+
+	/* Map ICMPv6 → ICMP */
+	if (orig_proto == PROTO_ICMPV6)
+		ip4_proto = PROTO_ICMP;
+
+	/* Save the original L4 checksum and port before we modify the packet */
+	__be16 old_sport = meta->src_port;
+	__be16 new_sport = meta->src_port; /* already set to SNAT port by policy */
+	__sum16 orig_l4_csum = 0;
+
+	/* Read original L4 checksum from packet */
+	void *old_l4 = data + meta->l4_offset;
+	if (orig_proto == PROTO_TCP) {
+		struct tcphdr *tcp = old_l4;
+		if ((void *)(tcp + 1) > data_end)
+			return XDP_DROP;
+		orig_l4_csum = tcp->check;
+		old_sport = tcp->source;
+	} else if (orig_proto == PROTO_UDP) {
+		struct udphdr *udp = old_l4;
+		if ((void *)(udp + 1) > data_end)
+			return XDP_DROP;
+		orig_l4_csum = udp->check;
+		old_sport = udp->source;
+	}
+	/* ICMP: will be handled specially below */
+
+	/* Shrink head by 20 bytes (IPv6→IPv4 header size difference).
+	 * MACs are not saved — bpf_fib_lookup below will provide correct ones. */
+	if (bpf_xdp_adjust_head(ctx, 20))
+		return XDP_DROP;
+
+	/* Re-read pointers */
+	data     = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+
+	/* Write new Ethernet header (MACs will be overwritten by FIB result) */
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return XDP_DROP;
+
+	eth->h_proto = bpf_htons(ETH_P_IP);
+
+	/* Write IPv4 header */
+	struct iphdr *iph = (void *)(eth + 1);
+	if ((void *)(iph + 1) > data_end)
+		return XDP_DROP;
+
+	__u16 tot_len = sizeof(struct iphdr) + l4_len;
+	iph->version  = 4;
+	iph->ihl      = 5;
+	iph->tos      = 0;
+	iph->tot_len  = bpf_htons(tot_len);
+	iph->id       = 0;
+	iph->frag_off = bpf_htons(0x4000); /* DF bit */
+	iph->ttl      = meta->ip_ttl;
+	iph->protocol = ip4_proto;
+	iph->check    = 0;
+	iph->saddr    = v4_src;
+	iph->daddr    = v4_dst;
+	iph->check    = ipv4_csum(iph);
+
+	/* L4 header starts right after IPv4 header */
+	void *l4 = (void *)(iph + 1);
+
+	if (ip4_proto == PROTO_TCP) {
+		struct tcphdr *tcp = l4;
+		if ((void *)(tcp + 1) > data_end)
+			return XDP_DROP;
+		tcp->source = new_sport;
+		tcp->check = csum_v6_to_v4(orig_l4_csum,
+					    orig_src_v6, orig_dst_v6,
+					    v4_src, v4_dst,
+					    orig_proto, l4_len,
+					    old_sport, new_sport);
+	} else if (ip4_proto == PROTO_UDP) {
+		struct udphdr *udp = l4;
+		if ((void *)(udp + 1) > data_end)
+			return XDP_DROP;
+		udp->source = new_sport;
+		udp->check = csum_v6_to_v4(orig_l4_csum,
+					    orig_src_v6, orig_dst_v6,
+					    v4_src, v4_dst,
+					    orig_proto, l4_len,
+					    old_sport, new_sport);
+		if (udp->check == 0)
+			udp->check = 0xFFFF;
+	} else if (ip4_proto == PROTO_ICMP) {
+		struct icmphdr *icmp = l4;
+		if ((void *)(icmp + 1) > data_end)
+			return XDP_DROP;
+		/* Translate ICMPv6 type/code → ICMPv4 */
+		__u8 v4_type, v4_code;
+		if (icmpv6_to_icmpv4(meta->icmp_type, meta->icmp_code,
+				     &v4_type, &v4_code) < 0)
+			return XDP_DROP;
+		__u8 old_type = icmp->type;
+		__u8 old_code = icmp->code;
+		icmp->type = v4_type;
+		icmp->code = v4_code;
+		/* ICMP checksum: no pseudo-header, just update type/code diff */
+		__u16 old_tc = ((__u16)old_type << 8) | old_code;
+		__u16 new_tc = ((__u16)v4_type << 8) | v4_code;
+		/* ICMPv6 checksum included pseudo-header, ICMPv4 doesn't.
+		 * Recompute: subtract IPv6 pseudo-header, subtract old type/code,
+		 * add new type/code. */
+		__u32 csum = (__u16)~icmp->checksum;
+
+		/* Remove IPv6 pseudo-header from ICMPv6 checksum */
+		__u32 v6ph = csum_bytes16(orig_src_v6) + csum_bytes16(orig_dst_v6);
+		v6ph += bpf_htons(l4_len);
+		v6ph += bpf_htons((__u16)PROTO_ICMPV6);
+		v6ph = csum_fold(v6ph);
+		csum += (__u16)~v6ph;
+
+		/* Adjust type/code */
+		csum += (__u16)~old_tc;
+		csum += new_tc;
+
+		icmp->checksum = (__sum16)~csum_fold(csum);
+	}
+
+	/* Insert nat64_state entry for reverse translation */
+	struct nat64_state_key rkey = {
+		.src_ip   = v4_dst,
+		.dst_ip   = v4_src,
+		.src_port = meta->dst_port,
+		.dst_port = new_sport,
+		.protocol = ip4_proto,
+	};
+	struct nat64_state_value rval = {};
+	__builtin_memcpy(rval.orig_src_v6, orig_src_v6, 16);
+	__builtin_memcpy(rval.orig_dst_v6, orig_dst_v6, 16);
+	rval.orig_src_port = old_sport;
+	rval.orig_dst_port = meta->dst_port;
+
+	bpf_map_update_elem(&nat64_state, &rkey, &rval, BPF_NOEXIST);
+
+	inc_counter(GLOBAL_CTR_NAT64_XLATE);
+
+	/* FIB lookup for the new IPv4 destination */
+	struct bpf_fib_lookup fib = {};
+	fib.family      = AF_INET;
+	fib.l4_protocol = ip4_proto;
+	fib.tot_len     = tot_len;
+	fib.ifindex     = meta->ingress_ifindex;
+	fib.ipv4_src    = v4_src;
+	fib.ipv4_dst    = v4_dst;
+
+	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
+		return XDP_PASS; /* let kernel handle */
+
+	/* Rewrite MACs and redirect */
+	eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return XDP_DROP;
+	__builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
+
+	/* Decrement TTL */
+	iph = (void *)(eth + 1);
+	if ((void *)(iph + 1) > data_end)
+		return XDP_DROP;
+	if (iph->ttl <= 1)
+		return XDP_PASS;
+	__u16 old_ttl_w = *(__u16 *)&iph->ttl;
+	iph->ttl--;
+	__u16 new_ttl_w = *(__u16 *)&iph->ttl;
+	csum_update_2(&iph->check, old_ttl_w, new_ttl_w);
+
+	inc_counter(GLOBAL_CTR_TX_PACKETS);
+
+	return bpf_redirect_map(&tx_ports, fib.ifindex, 0);
+}
+
+/*
+ * Reverse NAT64 translation: IPv4 → IPv6.
+ *
+ * meta->nat_flags has SESS_FLAG_NAT64 set.
+ * The nat64_state entry has been looked up by conntrack and stored:
+ *   meta->nat_src_ip.v6 = original client v6 addr (becomes dst)
+ *   meta->nat_dst_ip.v6 = original server v6 addr (becomes src)
+ *   meta->dst_port = original client port (restore to dst)
+ */
+static __always_inline int
+nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	void *data     = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+
+	if (meta->l3_offset >= 64)
+		return XDP_DROP;
+
+	struct iphdr *iph = data + meta->l3_offset;
+	if ((void *)(iph + 1) > data_end)
+		return XDP_DROP;
+
+	__be32 old_src_v4 = iph->saddr;
+	__be32 old_dst_v4 = iph->daddr;
+	__u16 ip4_tot_len = bpf_ntohs(iph->tot_len);
+	__u16 ip4_hdr_len = iph->ihl * 4;
+	__u16 l4_len = 0;
+	if (ip4_tot_len > ip4_hdr_len)
+		l4_len = ip4_tot_len - ip4_hdr_len;
+
+	__u8 orig_proto = iph->protocol;
+	__u8 ip6_proto = orig_proto;
+
+	/* Map ICMP → ICMPv6 */
+	if (orig_proto == PROTO_ICMP)
+		ip6_proto = PROTO_ICMPV6;
+
+	/* Original IPv6 addresses from nat64_state (set by conntrack):
+	 * nat_dst_ip = server v6 (prefix + v4 server) → becomes IPv6 src
+	 * nat_src_ip = client v6 (original requester) → becomes IPv6 dst */
+	__u8 v6_src[16], v6_dst[16];
+	__builtin_memcpy(v6_src, meta->nat_dst_ip.v6, 16);
+	__builtin_memcpy(v6_dst, meta->nat_src_ip.v6, 16);
+
+	/* Save L4 checksum and port before modifying */
+	__sum16 orig_l4_csum = 0;
+	__be16 old_dport = meta->dst_port;
+	__be16 new_dport = meta->dst_port; /* restored from nat64_state */
+
+	void *old_l4 = data + meta->l4_offset;
+	if (meta->l4_offset >= 128)
+		return XDP_DROP;
+	if (orig_proto == PROTO_TCP) {
+		struct tcphdr *tcp = old_l4;
+		if ((void *)(tcp + 1) > data_end)
+			return XDP_DROP;
+		orig_l4_csum = tcp->check;
+		old_dport = tcp->dest;
+	} else if (orig_proto == PROTO_UDP) {
+		struct udphdr *udp = old_l4;
+		if ((void *)(udp + 1) > data_end)
+			return XDP_DROP;
+		orig_l4_csum = udp->check;
+		old_dport = udp->dest;
+	}
+
+	/* Grow head by 20 bytes (IPv4→IPv6 header size difference).
+	 * MACs not saved — bpf_fib_lookup below provides correct ones. */
+	if (bpf_xdp_adjust_head(ctx, -20))
+		return XDP_DROP;
+
+	/* Re-read pointers */
+	data     = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+
+	/* Write new Ethernet header (MACs overwritten by FIB result) */
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return XDP_DROP;
+
+	eth->h_proto = bpf_htons(ETH_P_IPV6);
+
+	/* Write IPv6 header */
+	struct ipv6hdr *ip6h = (void *)(eth + 1);
+	if ((void *)(ip6h + 1) > data_end)
+		return XDP_DROP;
+
+	ip6h->version     = 6;
+	ip6h->priority    = 0;
+	ip6h->flow_lbl[0] = 0;
+	ip6h->flow_lbl[1] = 0;
+	ip6h->flow_lbl[2] = 0;
+	ip6h->payload_len = bpf_htons(l4_len);
+	ip6h->nexthdr     = ip6_proto;
+	ip6h->hop_limit   = meta->ip_ttl;
+	__builtin_memcpy(&ip6h->saddr, v6_src, 16);
+	__builtin_memcpy(&ip6h->daddr, v6_dst, 16);
+
+	/* L4 header starts right after IPv6 header */
+	void *l4 = (void *)(ip6h + 1);
+
+	if (ip6_proto == PROTO_TCP) {
+		struct tcphdr *tcp = l4;
+		if ((void *)(tcp + 1) > data_end)
+			return XDP_DROP;
+		tcp->dest = new_dport;
+		tcp->check = csum_v4_to_v6(orig_l4_csum,
+					    old_src_v4, old_dst_v4,
+					    v6_src, v6_dst,
+					    orig_proto, ip6_proto, l4_len,
+					    old_dport, new_dport);
+	} else if (ip6_proto == PROTO_UDP) {
+		struct udphdr *udp = l4;
+		if ((void *)(udp + 1) > data_end)
+			return XDP_DROP;
+		udp->dest = new_dport;
+		udp->check = csum_v4_to_v6(orig_l4_csum,
+					    old_src_v4, old_dst_v4,
+					    v6_src, v6_dst,
+					    orig_proto, ip6_proto, l4_len,
+					    old_dport, new_dport);
+		if (udp->check == 0)
+			udp->check = 0xFFFF;
+	} else if (ip6_proto == PROTO_ICMPV6) {
+		struct icmp6hdr *icmp6 = l4;
+		if ((void *)(icmp6 + 1) > data_end)
+			return XDP_DROP;
+		__u8 v6_type, v6_code;
+		if (icmpv4_to_icmpv6(icmp6->icmp6_type, icmp6->icmp6_code,
+				     &v6_type, &v6_code) < 0)
+			return XDP_DROP;
+		__u8 old_type = icmp6->icmp6_type;
+		__u8 old_code = icmp6->icmp6_code;
+		icmp6->icmp6_type = v6_type;
+		icmp6->icmp6_code = v6_code;
+		/* ICMPv4 has no pseudo-header, ICMPv6 does.
+		 * Add IPv6 pseudo-header + adjust type/code. */
+		__u32 csum = (__u16)~icmp6->icmp6_cksum;
+
+		/* Add IPv6 pseudo-header */
+		__u32 v6ph = csum_bytes16(v6_src) + csum_bytes16(v6_dst);
+		v6ph += bpf_htons(l4_len);
+		v6ph += bpf_htons((__u16)PROTO_ICMPV6);
+		v6ph = csum_fold(v6ph);
+		csum += v6ph;
+
+		/* Adjust type/code */
+		__u16 old_tc = ((__u16)old_type << 8) | old_code;
+		__u16 new_tc = ((__u16)v6_type << 8) | v6_code;
+		csum += (__u16)~old_tc;
+		csum += new_tc;
+
+		icmp6->icmp6_cksum = (__sum16)~csum_fold(csum);
+	}
+
+	inc_counter(GLOBAL_CTR_NAT64_XLATE);
+
+	/* FIB lookup for the IPv6 destination (the original client) */
+	struct bpf_fib_lookup fib = {};
+	fib.family      = AF_INET6;
+	fib.l4_protocol = ip6_proto;
+	fib.tot_len     = bpf_ntohs(ip6h->payload_len) + 40;
+	fib.ifindex     = meta->ingress_ifindex;
+	__builtin_memcpy(fib.ipv6_src, v6_src, 16);
+	__builtin_memcpy(fib.ipv6_dst, v6_dst, 16);
+
+	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
+		return XDP_PASS;
+
+	/* Rewrite MACs and redirect */
+	eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return XDP_DROP;
+	__builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
+
+	/* Decrement hop limit */
+	ip6h = (void *)(eth + 1);
+	if ((void *)(ip6h + 1) > data_end)
+		return XDP_DROP;
+	if (ip6h->hop_limit <= 1)
+		return XDP_PASS;
+	ip6h->hop_limit--;
+
+	inc_counter(GLOBAL_CTR_TX_PACKETS);
+
+	return bpf_redirect_map(&tx_ports, fib.ifindex, 0);
+}
+
+SEC("xdp")
+int xdp_nat64_prog(struct xdp_md *ctx)
+{
+	__u32 zero = 0;
+	struct pkt_meta *meta = bpf_map_lookup_elem(&pkt_meta_scratch, &zero);
+	if (!meta)
+		return XDP_DROP;
+
+	/*
+	 * Direction is determined by the original address family:
+	 * - AF_INET6 with NAT64 flag → forward (6→4)
+	 * - AF_INET with NAT64 flag  → reverse (4→6)
+	 */
+	if (meta->addr_family == AF_INET6)
+		return nat64_xlate_6to4(ctx, meta);
+	else
+		return nat64_xlate_4to6(ctx, meta);
+}
+
+char _license[] SEC("license") = "GPL";

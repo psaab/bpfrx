@@ -185,6 +185,42 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 			ct_reverse_key(&fwd_key, &rev_key);
 			sess = bpf_map_lookup_elem(&sessions, &rev_key);
 			if (!sess) {
+				/*
+				 * NAT64 reverse check: IPv4 return traffic
+				 * from a server that was translated from IPv6.
+				 * Look up nat64_state to find original v6 info.
+				 */
+				struct nat64_state_key n64k = {
+					.src_ip   = meta->src_ip.v4,
+					.dst_ip   = meta->dst_ip.v4,
+					.src_port = meta->src_port,
+					.dst_port = meta->dst_port,
+					.protocol = meta->protocol,
+				};
+				struct nat64_state_value *n64v =
+					bpf_map_lookup_elem(&nat64_state, &n64k);
+				if (n64v) {
+					/*
+					 * NAT64 reverse match: pass original
+					 * v6 addresses via meta for xdp_nat64
+					 * to do the v4→v6 translation.
+					 * nat_src_ip = client v6 (dst of rebuilt pkt)
+					 * nat_dst_ip = server v6 (src of rebuilt pkt)
+					 */
+					__builtin_memcpy(meta->nat_src_ip.v6,
+							 n64v->orig_src_v6, 16);
+					__builtin_memcpy(meta->nat_dst_ip.v6,
+							 n64v->orig_dst_v6, 16);
+					meta->nat_flags |= SESS_FLAG_NAT64;
+					meta->dst_port = n64v->orig_src_port;
+
+					/* Skip policy, go directly to NAT64
+					 * translation (this is return traffic). */
+					bpf_tail_call(ctx, &xdp_progs,
+						      XDP_PROG_NAT64);
+					return XDP_PASS;
+				}
+
 				meta->ct_state = SESS_STATE_NEW;
 				meta->ct_direction = 0;
 				bpf_tail_call(ctx, &xdp_progs, XDP_PROG_POLICY);

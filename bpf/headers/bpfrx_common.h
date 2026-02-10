@@ -159,7 +159,8 @@ struct icmp6hdr {
 #define XDP_PROG_POLICY        3
 #define XDP_PROG_NAT           4
 #define XDP_PROG_FORWARD       5
-#define XDP_PROG_MAX           6
+#define XDP_PROG_NAT64         6
+#define XDP_PROG_MAX           7
 
 /* TC tail call program indices */
 #define TC_PROG_CONNTRACK      0
@@ -187,6 +188,7 @@ struct icmp6hdr {
 #define SESS_FLAG_ALG          (1 << 4)
 #define SESS_FLAG_PREDICTED    (1 << 5)
 #define SESS_FLAG_STATIC_NAT   (1 << 6)
+#define SESS_FLAG_NAT64        (1 << 7)
 
 /* Per-rule logging flags (policy_rule.log and session_value.log_flags) */
 #define LOG_FLAG_SESSION_INIT  (1 << 0)
@@ -220,7 +222,8 @@ struct icmp6hdr {
 #define GLOBAL_CTR_NAT_ALLOC_FAIL      7
 #define GLOBAL_CTR_HOST_INBOUND_DENY   8
 #define GLOBAL_CTR_TC_EGRESS_PACKETS   9
-#define GLOBAL_CTR_MAX                 10
+#define GLOBAL_CTR_NAT64_XLATE        10
+#define GLOBAL_CTR_MAX                 11
 
 /* Flow timeout indices for flow_timeouts ARRAY map */
 #define FLOW_TIMEOUT_TCP_ESTABLISHED   0
@@ -443,6 +446,39 @@ struct nat_pool_ip_v6 {
 
 struct nat_port_counter {
 	__u64 counter;
+};
+
+/* ============================================================
+ * NAT64 configuration
+ * ============================================================ */
+
+#define MAX_NAT64_PREFIXES 4
+
+/* NAT64 prefix config entry: (prefix_hi, prefix_lo) is the /96 prefix,
+ * snat_pool_id points to the IPv4 source pool for translated packets. */
+struct nat64_config {
+	__be32 prefix[3];  /* first 96 bits of NAT64 prefix (3 x 32-bit words) */
+	__u8   snat_pool_id;
+	__u8   pad[3];
+};
+
+/* NAT64 reverse state: keyed by translated IPv4 5-tuple, maps back to
+ * original IPv6 client address + port for v4→v6 reverse translation. */
+struct nat64_state_key {
+	__be32 src_ip;    /* original v4 server IP */
+	__be32 dst_ip;    /* our SNAT'd v4 address */
+	__be16 src_port;  /* server port */
+	__be16 dst_port;  /* our SNAT'd port */
+	__u8   protocol;
+	__u8   pad[3];
+};
+
+struct nat64_state_value {
+	__u8   orig_src_v6[16]; /* original IPv6 client address */
+	__u8   orig_dst_v6[16]; /* original IPv6 dest (prefix + v4 addr) */
+	__be16 orig_src_port;   /* original client port */
+	__be16 orig_dst_port;   /* original dest port */
+	__u32  nat64_idx;       /* which NAT64 prefix was used */
 };
 
 #endif /* __BPFRX_COMMON_H__ */
