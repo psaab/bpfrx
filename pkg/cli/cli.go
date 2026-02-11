@@ -292,6 +292,9 @@ func (c *CLI) Run() error {
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
 		AutoComplete:    &cliCompleter{cli: c},
+		Stdin:           os.Stdin,
+		Stdout:          os.Stdout,
+		Stderr:          os.Stderr,
 	})
 	if err != nil {
 		return fmt.Errorf("readline init: %w", err)

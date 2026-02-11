@@ -66,6 +66,9 @@ func main() {
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
 		AutoComplete:    &remoteCompleter{ctl: c},
+		Stdin:           os.Stdin,
+		Stdout:          os.Stdout,
+		Stderr:          os.Stderr,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cli: readline: %v\n", err)
