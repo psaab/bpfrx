@@ -12,6 +12,142 @@
 #include "../headers/bpfrx_helpers.h"
 #include "../headers/bpfrx_trace.h"
 
+/*
+ * Fast-path conntrack update for established IPv4 sessions.
+ * Called when xdp_zone finds a session (for FIB cache), eliminating
+ * the duplicate session lookup that xdp_conntrack would perform.
+ */
+static __always_inline int
+zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
+		  struct session_value *sess, __u8 direction)
+{
+	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+	sess->last_seen = now;
+
+	if (direction == sess->is_reverse) {
+		__sync_fetch_and_add(&sess->fwd_packets, 1);
+		__sync_fetch_and_add(&sess->fwd_bytes, meta->pkt_len);
+	} else {
+		__sync_fetch_and_add(&sess->rev_packets, 1);
+		__sync_fetch_and_add(&sess->rev_bytes, meta->pkt_len);
+	}
+
+	if (meta->protocol == PROTO_TCP) {
+		__u8 new_state = ct_tcp_update_state(
+			sess->state, meta->tcp_flags, direction);
+		if (new_state != sess->state) {
+			sess->state = new_state;
+			sess->timeout = ct_get_timeout(PROTO_TCP, new_state);
+		}
+	}
+
+	meta->ct_state = sess->state;
+	meta->ct_direction = direction;
+	meta->policy_id = sess->policy_id;
+
+	int is_fwd = (direction == sess->is_reverse);
+
+	if (sess->flags & SESS_FLAG_SNAT) {
+		if (is_fwd) {
+			meta->src_ip.v4 = sess->nat_src_ip;
+			meta->src_port  = sess->nat_src_port;
+		}
+	}
+	if (sess->flags & SESS_FLAG_DNAT) {
+		if (!is_fwd) {
+			meta->src_ip.v4 = sess->nat_dst_ip;
+			meta->src_port  = sess->nat_dst_port;
+		}
+	}
+
+	__u32 next_prog = XDP_PROG_FORWARD;
+	if (sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT))
+		next_prog = XDP_PROG_NAT;
+
+	if (sess->state == SESS_STATE_CLOSED) {
+		if (meta->tcp_flags & 0x04) {
+			bpf_tail_call(ctx, &xdp_progs, next_prog);
+			return XDP_PASS;
+		}
+		if (sess->log_flags & LOG_FLAG_SESSION_CLOSE)
+			emit_event(meta, EVENT_TYPE_SESSION_CLOSE, ACTION_DENY,
+				   sess->fwd_packets + sess->rev_packets,
+				   sess->fwd_bytes + sess->rev_bytes);
+		inc_counter(GLOBAL_CTR_DROPS);
+		return XDP_DROP;
+	}
+
+	bpf_tail_call(ctx, &xdp_progs, next_prog);
+	return XDP_PASS;
+}
+
+/*
+ * Fast-path conntrack update for established IPv6 sessions.
+ */
+static __always_inline int
+zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
+		  struct session_value_v6 *sess, __u8 direction)
+{
+	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+	sess->last_seen = now;
+
+	if (direction == sess->is_reverse) {
+		__sync_fetch_and_add(&sess->fwd_packets, 1);
+		__sync_fetch_and_add(&sess->fwd_bytes, meta->pkt_len);
+	} else {
+		__sync_fetch_and_add(&sess->rev_packets, 1);
+		__sync_fetch_and_add(&sess->rev_bytes, meta->pkt_len);
+	}
+
+	if (meta->protocol == PROTO_TCP) {
+		__u8 new_state = ct_tcp_update_state(
+			sess->state, meta->tcp_flags, direction);
+		if (new_state != sess->state) {
+			sess->state = new_state;
+			sess->timeout = ct_get_timeout(PROTO_TCP, new_state);
+		}
+	}
+
+	meta->ct_state = sess->state;
+	meta->ct_direction = direction;
+	meta->policy_id = sess->policy_id;
+
+	int is_fwd = (direction == sess->is_reverse);
+
+	if (sess->flags & SESS_FLAG_SNAT) {
+		if (is_fwd) {
+			__builtin_memcpy(meta->src_ip.v6, sess->nat_src_ip, 16);
+			meta->src_port = sess->nat_src_port;
+		}
+	}
+	if (sess->flags & SESS_FLAG_DNAT) {
+		if (!is_fwd) {
+			__builtin_memcpy(meta->src_ip.v6, sess->nat_dst_ip, 16);
+			meta->src_port = sess->nat_dst_port;
+		}
+	}
+
+	__u32 next_prog = XDP_PROG_FORWARD;
+	if (sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT))
+		next_prog = XDP_PROG_NAT;
+
+	if (sess->state == SESS_STATE_CLOSED) {
+		if (meta->tcp_flags & 0x04) {
+			bpf_tail_call(ctx, &xdp_progs, next_prog);
+			return XDP_PASS;
+		}
+		if (sess->log_flags & LOG_FLAG_SESSION_CLOSE)
+			emit_event(meta, EVENT_TYPE_SESSION_CLOSE, ACTION_DENY,
+				   sess->fwd_packets + sess->rev_packets,
+				   sess->fwd_bytes + sess->rev_bytes);
+		inc_counter(GLOBAL_CTR_DROPS);
+		return XDP_DROP;
+	}
+
+	bpf_tail_call(ctx, &xdp_progs, next_prog);
+	return XDP_PASS;
+}
+
 SEC("xdp")
 int xdp_zone_prog(struct xdp_md *ctx)
 {
@@ -185,15 +321,20 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	}
 
 	/*
-	 * Fast-path: check session FIB cache to skip bpf_fib_lookup().
-	 * For established sessions the egress interface + next-hop MAC
-	 * are stable; caching them saves ~7% CPU.
+	 * Session lookup for FIB cache + conntrack fast-path.
+	 * For established sessions, the egress interface + next-hop MAC
+	 * are stable.  When cached, we also perform conntrack updates
+	 * here (counters, TCP state, NAT propagation), eliminating the
+	 * duplicate session lookup that xdp_conntrack would do.
 	 *
-	 * Skip for TCP SYN (new connections) — no session exists yet,
-	 * so the lookups would always miss (saves 4 hash lookups).
+	 * Skip for TCP SYN (new connections) — no session exists yet.
 	 */
 	int is_tcp_syn = (meta->protocol == PROTO_TCP &&
 			  (meta->tcp_flags & 0x12) == 0x02);
+
+	struct session_value *sv4 = NULL;
+	struct session_value_v6 *sv6 = NULL;
+	__u8 ct_direction = 0;
 
 	if (!is_tcp_syn && meta->addr_family == AF_INET) {
 		struct session_key sk = {};
@@ -203,20 +344,20 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		sk.dst_port = meta->dst_port;
 		sk.protocol = meta->protocol;
 
-		struct session_value *sv = bpf_map_lookup_elem(&sessions, &sk);
-		if (!sv) {
+		sv4 = bpf_map_lookup_elem(&sessions, &sk);
+		if (!sv4) {
 			struct session_key rk;
 			ct_reverse_key(&sk, &rk);
-			sv = bpf_map_lookup_elem(&sessions, &rk);
+			sv4 = bpf_map_lookup_elem(&sessions, &rk);
+			if (sv4) ct_direction = 1;
 		}
-		if (sv && sv->fib_ifindex != 0) {
-			meta->fwd_ifindex    = sv->fib_ifindex;
-			meta->egress_vlan_id = sv->fib_vlan_id;
-			__builtin_memcpy(meta->fwd_dmac, sv->fib_dmac, 6);
-			__builtin_memcpy(meta->fwd_smac, sv->fib_smac, 6);
-			meta->egress_zone    = sv->egress_zone;
-			bpf_tail_call(ctx, &xdp_progs, XDP_PROG_CONNTRACK);
-			return XDP_PASS;
+		if (sv4 && sv4->fib_ifindex != 0) {
+			meta->fwd_ifindex    = sv4->fib_ifindex;
+			meta->egress_vlan_id = sv4->fib_vlan_id;
+			__builtin_memcpy(meta->fwd_dmac, sv4->fib_dmac, 6);
+			__builtin_memcpy(meta->fwd_smac, sv4->fib_smac, 6);
+			meta->egress_zone    = sv4->egress_zone;
+			return zone_ct_update_v4(ctx, meta, sv4, ct_direction);
 		}
 	} else if (!is_tcp_syn) {
 		struct session_key_v6 sk6 = {};
@@ -226,11 +367,12 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		sk6.dst_port = meta->dst_port;
 		sk6.protocol = meta->protocol;
 
-		struct session_value_v6 *sv6 = bpf_map_lookup_elem(&sessions_v6, &sk6);
+		sv6 = bpf_map_lookup_elem(&sessions_v6, &sk6);
 		if (!sv6) {
 			struct session_key_v6 rk6;
 			ct_reverse_key_v6(&sk6, &rk6);
 			sv6 = bpf_map_lookup_elem(&sessions_v6, &rk6);
+			if (sv6) ct_direction = 1;
 		}
 		if (sv6 && sv6->fib_ifindex != 0) {
 			meta->fwd_ifindex    = sv6->fib_ifindex;
@@ -238,8 +380,7 @@ int xdp_zone_prog(struct xdp_md *ctx)
 			__builtin_memcpy(meta->fwd_dmac, sv6->fib_dmac, 6);
 			__builtin_memcpy(meta->fwd_smac, sv6->fib_smac, 6);
 			meta->egress_zone    = sv6->egress_zone;
-			bpf_tail_call(ctx, &xdp_progs, XDP_PROG_CONNTRACK);
-			return XDP_PASS;
+			return zone_ct_update_v6(ctx, meta, sv6, ct_direction);
 		}
 	}
 
@@ -291,48 +432,22 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		if (ez)
 			meta->egress_zone = *ez;
 
-		/* Populate session FIB cache for future packets.
-		 * Skip for TCP SYN — session doesn't exist yet. */
-		if (!is_tcp_syn && meta->addr_family == AF_INET) {
-			struct session_key ck = {};
-			ck.src_ip   = meta->src_ip.v4;
-			ck.dst_ip   = meta->dst_ip.v4;
-			ck.src_port = meta->src_port;
-			ck.dst_port = meta->dst_port;
-			ck.protocol = meta->protocol;
-
-			struct session_value *csv = bpf_map_lookup_elem(&sessions, &ck);
-			if (!csv) {
-				struct session_key crk;
-				ct_reverse_key(&ck, &crk);
-				csv = bpf_map_lookup_elem(&sessions, &crk);
-			}
-			if (csv && csv->fib_ifindex == 0) {
-				csv->fib_ifindex = meta->fwd_ifindex;
-				csv->fib_vlan_id = meta->egress_vlan_id;
-				__builtin_memcpy(csv->fib_dmac, meta->fwd_dmac, 6);
-				__builtin_memcpy(csv->fib_smac, meta->fwd_smac, 6);
-			}
-		} else if (!is_tcp_syn) {
-			struct session_key_v6 ck6 = {};
-			__builtin_memcpy(ck6.src_ip, meta->src_ip.v6, 16);
-			__builtin_memcpy(ck6.dst_ip, meta->dst_ip.v6, 16);
-			ck6.src_port = meta->src_port;
-			ck6.dst_port = meta->dst_port;
-			ck6.protocol = meta->protocol;
-
-			struct session_value_v6 *csv6 = bpf_map_lookup_elem(&sessions_v6, &ck6);
-			if (!csv6) {
-				struct session_key_v6 crk6;
-				ct_reverse_key_v6(&ck6, &crk6);
-				csv6 = bpf_map_lookup_elem(&sessions_v6, &crk6);
-			}
-			if (csv6 && csv6->fib_ifindex == 0) {
-				csv6->fib_ifindex = meta->fwd_ifindex;
-				csv6->fib_vlan_id = meta->egress_vlan_id;
-				__builtin_memcpy(csv6->fib_dmac, meta->fwd_dmac, 6);
-				__builtin_memcpy(csv6->fib_smac, meta->fwd_smac, 6);
-			}
+		/* Populate FIB cache + conntrack fast-path using session
+		 * pointer from FIB cache check above (avoids duplicate
+		 * session lookup in xdp_conntrack). */
+		if (sv4) {
+			sv4->fib_ifindex = meta->fwd_ifindex;
+			sv4->fib_vlan_id = meta->egress_vlan_id;
+			__builtin_memcpy(sv4->fib_dmac, meta->fwd_dmac, 6);
+			__builtin_memcpy(sv4->fib_smac, meta->fwd_smac, 6);
+			return zone_ct_update_v4(ctx, meta, sv4, ct_direction);
+		}
+		if (sv6) {
+			sv6->fib_ifindex = meta->fwd_ifindex;
+			sv6->fib_vlan_id = meta->egress_vlan_id;
+			__builtin_memcpy(sv6->fib_dmac, meta->fwd_dmac, 6);
+			__builtin_memcpy(sv6->fib_smac, meta->fwd_smac, 6);
+			return zone_ct_update_v6(ctx, meta, sv6, ct_direction);
 		}
 
 	} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {

@@ -511,6 +511,7 @@ type bpfrxTcScreenEgressMapSpecs struct {
 	PktMetaScratch    *ebpf.MapSpec `ebpf:"pkt_meta_scratch"`
 	PolicyCounters    *ebpf.MapSpec `ebpf:"policy_counters"`
 	PolicyRules       *ebpf.MapSpec `ebpf:"policy_rules"`
+	RedirectCapable   *ebpf.MapSpec `ebpf:"redirect_capable"`
 	ScreenConfigs     *ebpf.MapSpec `ebpf:"screen_configs"`
 	SessionV4Scratch  *ebpf.MapSpec `ebpf:"session_v4_scratch"`
 	SessionV6Scratch  *ebpf.MapSpec `ebpf:"session_v6_scratch"`
@@ -579,6 +580,7 @@ type bpfrxTcScreenEgressMaps struct {
 	PktMetaScratch    *ebpf.Map `ebpf:"pkt_meta_scratch"`
 	PolicyCounters    *ebpf.Map `ebpf:"policy_counters"`
 	PolicyRules       *ebpf.Map `ebpf:"policy_rules"`
+	RedirectCapable   *ebpf.Map `ebpf:"redirect_capable"`
 	ScreenConfigs     *ebpf.Map `ebpf:"screen_configs"`
 	SessionV4Scratch  *ebpf.Map `ebpf:"session_v4_scratch"`
 	SessionV6Scratch  *ebpf.Map `ebpf:"session_v6_scratch"`
@@ -623,6 +625,7 @@ func (m *bpfrxTcScreenEgressMaps) Close() error {
 		m.PktMetaScratch,
 		m.PolicyCounters,
 		m.PolicyRules,
+		m.RedirectCapable,
 		m.ScreenConfigs,
 		m.SessionV4Scratch,
 		m.SessionV6Scratch,

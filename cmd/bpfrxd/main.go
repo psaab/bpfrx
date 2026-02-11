@@ -13,15 +13,18 @@ import (
 
 	"github.com/psaab/bpfrx/pkg/daemon"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/bpfrx/pkg/frr"
 )
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "cleanup" {
 		if err := dataplane.Cleanup(); err != nil {
-			fmt.Fprintf(os.Stderr, "cleanup: %v\n", err)
+			fmt.Fprintf(os.Stderr, "cleanup BPF: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("all pinned BPF state removed")
+		// Also clear FRR managed routes so the kernel routing table is clean.
+		frr.New().Clear()
+		fmt.Println("all pinned BPF state and managed routes removed")
 		return
 	}
 

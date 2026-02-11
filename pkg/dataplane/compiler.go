@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cilium/ebpf"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/vishvananda/netlink"
 )
@@ -23,10 +24,16 @@ type CompileResult struct {
 	PoolIDs    map[string]uint8  // NAT pool name -> pool ID (0-based)
 	PolicySets int               // number of policy sets created
 
-	nextAddrID      uint32            // next available address ID (after address book)
-	implicitSets    map[string]uint32 // cache of implicit set key -> set ID
-	nextNATCounterID uint16           // next available NAT rule counter ID (1-based, 0 = no counter)
-	NATCounterIDs   map[string]uint16 // "rulesetName/ruleName" -> counter ID
+	nextAddrID       uint32            // next available address ID (after address book)
+	implicitSets     map[string]uint32 // cache of implicit set key -> set ID
+	nextNATCounterID uint16            // next available NAT rule counter ID (1-based, 0 = no counter)
+	NATCounterIDs    map[string]uint16 // "rulesetName/ruleName" -> counter ID
+
+	// pendingXDP/TC collect interface indexes for deferred program attachment.
+	// Attachment happens AFTER all compilation phases so that link.Update()
+	// atomically switches to programs with fully-populated maps.
+	pendingXDP []int
+	pendingTC  []int
 }
 
 // Compile translates a typed Config into eBPF map entries.
@@ -121,6 +128,43 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 	// Phase 10: Compile firewall filters
 	if err := m.compileFirewallFilters(cfg, result); err != nil {
 		return nil, fmt.Errorf("compile firewall filters: %w", err)
+	}
+
+	// All maps are now fully populated. Attach XDP/TC programs last so that
+	// link.Update() atomically switches to programs with complete config.
+	// This eliminates the brief window where new programs run with empty
+	// policy/NAT maps — critical for hitless restarts.
+	for _, ifidx := range result.pendingTC {
+		if err := m.AttachTC(ifidx); err != nil {
+			if !strings.Contains(err.Error(), "already attached") {
+				return nil, fmt.Errorf("attach TC to ifindex %d: %w", ifidx, err)
+			}
+		}
+	}
+
+	if len(result.pendingXDP) > 0 {
+		rcMap := m.maps["redirect_capable"]
+		for _, ifidx := range result.pendingXDP {
+			if err := m.AttachXDP(ifidx, false); err != nil {
+				if strings.Contains(err.Error(), "already attached") {
+					continue
+				}
+				slog.Info("native XDP not supported, using generic mode",
+					"ifindex", ifidx, "err", err)
+				if err := m.AttachXDP(ifidx, true); err != nil {
+					if !strings.Contains(err.Error(), "already attached") {
+						return nil, fmt.Errorf("attach XDP generic to ifindex %d: %w", ifidx, err)
+					}
+				}
+				if rcMap != nil {
+					rcMap.Update(uint32(ifidx), uint8(0), ebpf.UpdateAny)
+				}
+			} else {
+				if rcMap != nil {
+					rcMap.Update(uint32(ifidx), uint8(1), ebpf.UpdateAny)
+				}
+			}
+		}
 	}
 
 	slog.Info("config compiled to dataplane",
@@ -372,12 +416,6 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					slog.Info("disabled VLAN RX offload for XDP", "interface", physName)
 				}
 
-				if err := m.AttachTC(physIface.Index); err != nil {
-					if !strings.Contains(err.Error(), "already attached") {
-						return fmt.Errorf("attach TC to %s: %w", physName, err)
-					}
-				}
-
 				// Bring the interface UP so XDP can process traffic
 				if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
 					if err := netlink.LinkSetUp(nl); err != nil {
@@ -386,7 +424,10 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					}
 				}
 
+				// Defer actual XDP/TC attachment to after all compile phases
+				// so link.Update() switches to programs with fully-populated maps.
 				xdpIfindexes = append(xdpIfindexes, physIface.Index)
+				result.pendingTC = append(result.pendingTC, physIface.Index)
 				attached[physIface.Index] = true
 			}
 
@@ -406,39 +447,8 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 		}
 	}
 
-	// Two-phase XDP attachment: try native first, fall back to all-generic.
-	// bpf_redirect_map between native and generic XDP fails silently because
-	// generic-mode interfaces lack ndo_xdp_xmit. All interfaces must use the
-	// same mode for cross-zone forwarding to work.
-	if len(xdpIfindexes) > 0 {
-		useGeneric := false
-		for _, ifidx := range xdpIfindexes {
-			if err := m.AttachXDP(ifidx, false); err != nil {
-				if strings.Contains(err.Error(), "already attached") {
-					continue
-				}
-				slog.Info("native XDP not supported, will use generic mode for all interfaces",
-					"ifindex", ifidx, "err", err)
-				useGeneric = true
-				break
-			}
-		}
-
-		if useGeneric {
-			// Detach any native XDP we already attached
-			for _, ifidx := range xdpIfindexes {
-				m.DetachXDP(ifidx)
-			}
-			// Reattach all in generic mode
-			for _, ifidx := range xdpIfindexes {
-				if err := m.AttachXDP(ifidx, true); err != nil {
-					if !strings.Contains(err.Error(), "already attached") {
-						return fmt.Errorf("attach XDP generic to ifindex %d: %w", ifidx, err)
-					}
-				}
-			}
-		}
-	}
+	// Store pending XDP ifindexes for deferred attachment after all compile phases.
+	result.pendingXDP = xdpIfindexes
 
 	return nil
 }

@@ -52,6 +52,21 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		return XDP_PASS;
 	}
 
+	/*
+	 * Check if destination supports native XDP redirect.
+	 * If not, XDP_PASS lets the kernel forward the NAT'd packet.
+	 * Skip MAC rewrite, TTL decrement, and VLAN push — the kernel
+	 * handles all of that during its own forwarding path.
+	 */
+	__u32 fwd_key = meta->fwd_ifindex;
+	__u8 *can_redir = bpf_map_lookup_elem(&redirect_capable, &fwd_key);
+	if (!can_redir || *can_redir == 0) {
+		inc_counter(GLOBAL_CTR_TX_PACKETS);
+		inc_iface_tx(meta->fwd_ifindex, meta->pkt_len);
+		inc_zone_egress((__u32)meta->egress_zone, meta->pkt_len);
+		return XDP_PASS;
+	}
+
 	/* Push VLAN tag if egress is a VLAN sub-interface */
 	if (meta->egress_vlan_id != 0) {
 		if (xdp_vlan_tag_push(ctx, meta->egress_vlan_id) < 0)

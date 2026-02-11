@@ -112,6 +112,7 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["iface_filter_map"] = mainObjs.IfaceFilterMap
 	m.maps["filter_configs"] = mainObjs.FilterConfigs
 	m.maps["filter_rules"] = mainObjs.FilterRules
+	m.maps["redirect_capable"] = mainObjs.RedirectCapable
 
 	// Store main program.
 	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
@@ -157,6 +158,7 @@ func (m *Manager) loadAllObjects() error {
 			"iface_filter_map":   mainObjs.IfaceFilterMap,
 			"filter_configs":     mainObjs.FilterConfigs,
 			"filter_rules":       mainObjs.FilterRules,
+			"redirect_capable":   mainObjs.RedirectCapable,
 		},
 	}
 

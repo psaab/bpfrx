@@ -269,6 +269,16 @@ struct {
 	__type(value, struct bpf_devmap_val);
 } tx_ports SEC(".maps");
 
+/* Per-interface flag: 1 = native XDP redirect capable (has ndo_xdp_xmit).
+ * xdp_forward checks this before bpf_redirect_map; interfaces without
+ * native redirect support get XDP_PASS so the kernel forwards instead. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_INTERFACES);
+	__type(key, __u32);
+	__type(value, __u8);
+} redirect_capable SEC(".maps");
+
 /* ============================================================
  * Event ring buffer (kernel -> userspace)
  * ============================================================ */

@@ -326,39 +326,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.rpm.StopAll()
 	}
 
-	// Clean up DHCP clients (releases leases, removes addresses).
-	if d.dhcp != nil {
-		d.dhcp.StopAll()
-		d.dhcp.Close()
-	}
-
-	// Clean up DHCP relay.
-	if d.dhcpRelay != nil {
-		d.dhcpRelay.Stop()
-	}
-
-	// Clean up DHCP server.
-	if d.dhcpServer != nil {
-		d.dhcpServer.Clear()
-	}
-
-	// Clean up routing subsystems.
-	if d.radvd != nil {
-		d.radvd.Clear()
-	}
-	if d.ipsec != nil {
-		d.ipsec.Clear()
-	}
-	if d.frr != nil {
-		d.frr.Clear()
-	}
-	if d.routing != nil {
-		d.routing.ClearVRFs()
-		d.routing.ClearTunnels()
-		d.routing.Close()
-	}
-
-	// Log final stats before closing dataplane.
+	// For hitless restarts, preserve all control-plane state so the next
+	// daemon inherits working routes, DHCP leases, VRFs, and tunnels.
+	// BPF programs keep running via pinned links; leaving FRR routes and
+	// interface addresses intact means zero forwarding disruption.
+	//
+	// Only close Go file handles — pinned BPF maps/links survive in-kernel.
+	// Full teardown (DHCP release, route removal, VRF cleanup) is done
+	// by "bpfrxd cleanup".
 	if d.dp != nil {
 		logFinalStats(d.dp)
 		d.dp.Close()

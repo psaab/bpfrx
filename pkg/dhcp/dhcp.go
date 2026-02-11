@@ -101,7 +101,12 @@ func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily)
 		return
 	}
 
-	cctx, cancel := context.WithCancel(ctx)
+	// Use an independent context so DHCP clients are decoupled from the
+	// daemon lifecycle. Only explicit StopAll() triggers lease release and
+	// address removal. During graceful restart (SIGTERM), the process exits
+	// without calling StopAll(), so addresses stay on interfaces for the
+	// next daemon to reuse.
+	cctx, cancel := context.WithCancel(context.Background())
 	dc := &dhcpClient{
 		cancel: cancel,
 		done:   make(chan struct{}),
