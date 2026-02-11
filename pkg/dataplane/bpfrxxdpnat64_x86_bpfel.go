@@ -389,7 +389,8 @@ type bpfrxXdpNat64SnatValue struct {
 	SrcAddrId uint32
 	DstAddrId uint32
 	Mode      uint8
-	Pad       [3]uint8
+	Pad       uint8
+	CounterId uint16
 }
 
 type bpfrxXdpNat64SnatValueV6 struct {
@@ -398,7 +399,8 @@ type bpfrxXdpNat64SnatValueV6 struct {
 	SrcAddrId uint32
 	DstAddrId uint32
 	Mode      uint8
-	Pad       [3]uint8
+	Pad       uint8
+	CounterId uint16
 }
 
 type bpfrxXdpNat64StaticNatKeyV4 struct {
@@ -513,6 +515,7 @@ type bpfrxXdpNat64MapSpecs struct {
 	NatPoolIpsV4      *ebpf.MapSpec `ebpf:"nat_pool_ips_v4"`
 	NatPoolIpsV6      *ebpf.MapSpec `ebpf:"nat_pool_ips_v6"`
 	NatPortCounters   *ebpf.MapSpec `ebpf:"nat_port_counters"`
+	NatRuleCounters   *ebpf.MapSpec `ebpf:"nat_rule_counters"`
 	PktMetaScratch    *ebpf.MapSpec `ebpf:"pkt_meta_scratch"`
 	PolicyCounters    *ebpf.MapSpec `ebpf:"policy_counters"`
 	PolicyRules       *ebpf.MapSpec `ebpf:"policy_rules"`
@@ -583,6 +586,7 @@ type bpfrxXdpNat64Maps struct {
 	NatPoolIpsV4      *ebpf.Map `ebpf:"nat_pool_ips_v4"`
 	NatPoolIpsV6      *ebpf.Map `ebpf:"nat_pool_ips_v6"`
 	NatPortCounters   *ebpf.Map `ebpf:"nat_port_counters"`
+	NatRuleCounters   *ebpf.Map `ebpf:"nat_rule_counters"`
 	PktMetaScratch    *ebpf.Map `ebpf:"pkt_meta_scratch"`
 	PolicyCounters    *ebpf.Map `ebpf:"policy_counters"`
 	PolicyRules       *ebpf.Map `ebpf:"policy_rules"`
@@ -629,6 +633,7 @@ func (m *bpfrxXdpNat64Maps) Close() error {
 		m.NatPoolIpsV4,
 		m.NatPoolIpsV6,
 		m.NatPortCounters,
+		m.NatRuleCounters,
 		m.PktMetaScratch,
 		m.PolicyCounters,
 		m.PolicyRules,

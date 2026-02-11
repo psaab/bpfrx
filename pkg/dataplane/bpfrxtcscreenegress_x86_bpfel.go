@@ -371,7 +371,8 @@ type bpfrxTcScreenEgressSnatValue struct {
 	SrcAddrId uint32
 	DstAddrId uint32
 	Mode      uint8
-	Pad       [3]uint8
+	Pad       uint8
+	CounterId uint16
 }
 
 type bpfrxTcScreenEgressSnatValueV6 struct {
@@ -380,7 +381,8 @@ type bpfrxTcScreenEgressSnatValueV6 struct {
 	SrcAddrId uint32
 	DstAddrId uint32
 	Mode      uint8
-	Pad       [3]uint8
+	Pad       uint8
+	CounterId uint16
 }
 
 type bpfrxTcScreenEgressStaticNatKeyV4 struct {

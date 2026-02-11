@@ -41,6 +41,10 @@ service BpfrxService {
   rpc GetOSPFStatus(GetOSPFStatusRequest) returns (GetOSPFStatusResponse);
   rpc GetBGPStatus(GetBGPStatusRequest) returns (GetBGPStatusResponse);
   rpc GetIPsecSA(GetIPsecSARequest) returns (GetIPsecSAResponse);
+  rpc GetNATPoolStats(GetNATPoolStatsRequest) returns (GetNATPoolStatsResponse);
+  rpc GetNATRuleStats(GetNATRuleStatsRequest) returns (GetNATRuleStatsResponse);
+  rpc GetVRRPStatus(GetVRRPStatusRequest) returns (GetVRRPStatusResponse);
+  rpc MatchPolicies(MatchPoliciesRequest) returns (MatchPoliciesResponse);
 
   // Diagnostics
   rpc Ping(PingRequest) returns (PingResponse);
@@ -387,6 +391,77 @@ message ClearSessionsResponse {
 
 message ClearCountersRequest {}
 message ClearCountersResponse {}
+
+// --- NAT pool stats ---
+
+message GetNATPoolStatsRequest {}
+message GetNATPoolStatsResponse {
+  repeated NATPoolStats pools = 1;
+}
+message NATPoolStats {
+  string name = 1;
+  string address = 2;
+  int32 total_ports = 3;
+  int32 used_ports = 4;
+  int32 available_ports = 5;
+  string utilization = 6;
+  bool is_interface = 7;
+}
+
+// --- VRRP status ---
+
+message GetVRRPStatusRequest {}
+message GetVRRPStatusResponse {
+  repeated VRRPInstanceInfo instances = 1;
+  string service_status = 2;
+}
+message VRRPInstanceInfo {
+  string interface = 1;
+  int32 group_id = 2;
+  string state = 3;
+  int32 priority = 4;
+  repeated string virtual_addresses = 5;
+  bool preempt = 6;
+}
+
+// --- Policy match ---
+
+message MatchPoliciesRequest {
+  string from_zone = 1;
+  string to_zone = 2;
+  string source_ip = 3;
+  string destination_ip = 4;
+  int32 destination_port = 5;
+  string protocol = 6;
+}
+message MatchPoliciesResponse {
+  string policy_name = 1;
+  string action = 2;
+  repeated string src_addresses = 3;
+  repeated string dst_addresses = 4;
+  repeated string applications = 5;
+  bool matched = 6;
+}
+
+// --- NAT rule counters ---
+
+message GetNATRuleStatsRequest {
+  string rule_set = 1;  // rule-set name (empty = all)
+}
+message GetNATRuleStatsResponse {
+  repeated NATRuleStats rules = 1;
+}
+message NATRuleStats {
+  string rule_set = 1;
+  string rule_name = 2;
+  string from_zone = 3;
+  string to_zone = 4;
+  string action = 5;
+  string source_match = 6;
+  string destination_match = 7;
+  uint64 hit_packets = 8;
+  uint64 hit_bytes = 9;
+}
 
 // --- Completion messages ---
 

@@ -323,6 +323,7 @@ type NATPortCounter struct {
 }
 
 const MaxNATPoolIPsPerPool = 8
+const MaxNATRuleCounters = 256
 
 // Session flag constants.
 const (
@@ -410,7 +411,8 @@ type SNATValue struct {
 	SrcAddrID uint32 // 0 = any
 	DstAddrID uint32 // 0 = any
 	Mode      uint8
-	Pad       [3]byte
+	Pad       uint8
+	CounterID uint16 // index into nat_rule_counters
 }
 
 // SNATValueV6 mirrors the C struct snat_value_v6.
@@ -419,7 +421,8 @@ type SNATValueV6 struct {
 	SrcAddrID uint32 // 0 = any
 	DstAddrID uint32 // 0 = any
 	Mode      uint8
-	Pad       [3]byte
+	Pad       uint8
+	CounterID uint16 // index into nat_rule_counters
 }
 
 // ScreenConfig mirrors the C struct screen_config.

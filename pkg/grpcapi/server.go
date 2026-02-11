@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/ipsec"
 	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/routing"
+	"github.com/psaab/bpfrx/pkg/vrrp"
 )
 
 // Config configures the gRPC server.
@@ -1651,4 +1653,313 @@ func screenChecks(p *config.ScreenProfile) []string {
 		checks = append(checks, "tear-drop")
 	}
 	return checks
+}
+
+func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest) (*pb.GetNATPoolStatsResponse, error) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		return &pb.GetNATPoolStatsResponse{}, nil
+	}
+
+	resp := &pb.GetNATPoolStatsResponse{}
+
+	// Named pools
+	for name, pool := range cfg.Security.NAT.SourcePools {
+		portLow, portHigh := pool.PortLow, pool.PortHigh
+		if portLow == 0 {
+			portLow = 1024
+		}
+		if portHigh == 0 {
+			portHigh = 65535
+		}
+		totalPorts := int32((portHigh - portLow + 1) * len(pool.Addresses))
+		used := int32(0)
+
+		if s.dp != nil && s.dp.IsLoaded() {
+			if cr := s.dp.LastCompileResult(); cr != nil {
+				if id, ok := cr.PoolIDs[name]; ok {
+					cnt, err := s.dp.ReadNATPortCounter(uint32(id))
+					if err == nil {
+						used = int32(cnt)
+					}
+				}
+			}
+		}
+
+		avail := totalPorts - used
+		if avail < 0 {
+			avail = 0
+		}
+		util := "0.0%"
+		if totalPorts > 0 {
+			util = fmt.Sprintf("%.1f%%", float64(used)/float64(totalPorts)*100)
+		}
+
+		resp.Pools = append(resp.Pools, &pb.NATPoolStats{
+			Name:           name,
+			Address:        strings.Join(pool.Addresses, ","),
+			TotalPorts:     totalPorts,
+			UsedPorts:      used,
+			AvailablePorts: avail,
+			Utilization:    util,
+		})
+	}
+
+	// Interface-mode pools
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			if rule.Then.Interface {
+				used := int32(0)
+				if s.dp != nil && s.dp.IsLoaded() {
+					_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+						if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+							used++
+						}
+						return true
+					})
+				}
+				resp.Pools = append(resp.Pools, &pb.NATPoolStats{
+					Name:        fmt.Sprintf("%s->%s", rs.FromZone, rs.ToZone),
+					Address:     "interface",
+					UsedPorts:   used,
+					IsInterface: true,
+				})
+			}
+		}
+	}
+
+	return resp, nil
+}
+
+func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsRequest) (*pb.GetNATRuleStatsResponse, error) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		return &pb.GetNATRuleStatsResponse{}, nil
+	}
+
+	resp := &pb.GetNATRuleStatsResponse{}
+	for _, rs := range cfg.Security.NAT.Source {
+		if req.RuleSet != "" && rs.Name != req.RuleSet {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			action := "interface"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			}
+			srcMatch := "0.0.0.0/0"
+			if rule.Match.SourceAddress != "" {
+				srcMatch = rule.Match.SourceAddress
+			}
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+
+			var hitPkts, hitBytes uint64
+			if s.dp != nil && s.dp.IsLoaded() {
+				if cr := s.dp.LastCompileResult(); cr != nil {
+					ruleKey := rs.Name + "/" + rule.Name
+					if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
+						cnt, err := s.dp.ReadNATRuleCounter(uint32(cid))
+						if err == nil {
+							hitPkts = cnt.Packets
+							hitBytes = cnt.Bytes
+						}
+					}
+				}
+			}
+
+			resp.Rules = append(resp.Rules, &pb.NATRuleStats{
+				RuleSet:          rs.Name,
+				RuleName:         rule.Name,
+				FromZone:         rs.FromZone,
+				ToZone:           rs.ToZone,
+				Action:           action,
+				SourceMatch:      srcMatch,
+				DestinationMatch: dstMatch,
+				HitPackets:       hitPkts,
+				HitBytes:         hitBytes,
+			})
+		}
+	}
+
+	return resp, nil
+}
+
+func (s *Server) GetVRRPStatus(_ context.Context, _ *pb.GetVRRPStatusRequest) (*pb.GetVRRPStatusResponse, error) {
+	cfg := s.store.ActiveConfig()
+	resp := &pb.GetVRRPStatusResponse{}
+
+	if cfg != nil {
+		instances := vrrp.CollectInstances(cfg)
+		for _, inst := range instances {
+			resp.Instances = append(resp.Instances, &pb.VRRPInstanceInfo{
+				Interface:        inst.Interface,
+				GroupId:          int32(inst.GroupID),
+				State:            "BACKUP",
+				Priority:         int32(inst.Priority),
+				VirtualAddresses: inst.VirtualAddresses,
+				Preempt:          inst.Preempt,
+			})
+		}
+	}
+
+	status, _ := vrrp.Status()
+	resp.ServiceStatus = status
+
+	return resp, nil
+}
+
+func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) (*pb.MatchPoliciesResponse, error) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		return &pb.MatchPoliciesResponse{}, nil
+	}
+
+	parsedSrc := net.ParseIP(req.SourceIp)
+	parsedDst := net.ParseIP(req.DestinationIp)
+	dstPort := int(req.DestinationPort)
+
+	for _, zpp := range cfg.Security.Policies {
+		if zpp.FromZone != req.FromZone || zpp.ToZone != req.ToZone {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if !matchPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
+				continue
+			}
+			if !matchPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
+				continue
+			}
+			if !matchPolicyApp(pol.Match.Applications, req.Protocol, dstPort, cfg) {
+				continue
+			}
+
+			action := "permit"
+			switch pol.Action {
+			case 1:
+				action = "deny"
+			case 2:
+				action = "reject"
+			}
+
+			return &pb.MatchPoliciesResponse{
+				Matched:      true,
+				PolicyName:   pol.Name,
+				Action:       action,
+				SrcAddresses: pol.Match.SourceAddresses,
+				DstAddresses: pol.Match.DestinationAddresses,
+				Applications: pol.Match.Applications,
+			}, nil
+		}
+	}
+
+	return &pb.MatchPoliciesResponse{
+		Matched: false,
+		Action:  "deny (default)",
+	}, nil
+}
+
+// matchPolicyAddr checks if an IP matches a list of address-book references.
+func matchPolicyAddr(addrs []string, ip net.IP, cfg *config.Config) bool {
+	if len(addrs) == 0 || ip == nil {
+		return true
+	}
+	for _, a := range addrs {
+		if a == "any" {
+			return true
+		}
+		if cfg.Security.AddressBook == nil {
+			continue
+		}
+		if addr, ok := cfg.Security.AddressBook.Addresses[a]; ok {
+			_, cidr, err := net.ParseCIDR(addr.Value)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		}
+		if matchPolicyAddrSet(a, ip, cfg, 0) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchPolicyAddrSet(setName string, ip net.IP, cfg *config.Config, depth int) bool {
+	if depth > 5 || cfg.Security.AddressBook == nil {
+		return false
+	}
+	as, ok := cfg.Security.AddressBook.AddressSets[setName]
+	if !ok {
+		return false
+	}
+	for _, addrName := range as.Addresses {
+		if addr, ok := cfg.Security.AddressBook.Addresses[addrName]; ok {
+			_, cidr, err := net.ParseCIDR(addr.Value)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		}
+	}
+	for _, nested := range as.AddressSets {
+		if matchPolicyAddrSet(nested, ip, cfg, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchPolicyApp checks if a protocol/port matches application references.
+func matchPolicyApp(apps []string, proto string, dstPort int, cfg *config.Config) bool {
+	if len(apps) == 0 || proto == "" {
+		return true
+	}
+	for _, a := range apps {
+		if a == "any" {
+			return true
+		}
+		if matchSingleApp(a, proto, dstPort, cfg) {
+			return true
+		}
+		if cfg.Applications.ApplicationSets != nil {
+			if as, ok := cfg.Applications.ApplicationSets[a]; ok {
+				for _, appRef := range as.Applications {
+					if matchSingleApp(appRef, proto, dstPort, cfg) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func matchSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool {
+	if cfg.Applications.Applications == nil {
+		return false
+	}
+	app, ok := cfg.Applications.Applications[appName]
+	if !ok {
+		return false
+	}
+	if app.Protocol != "" && !strings.EqualFold(app.Protocol, proto) {
+		return false
+	}
+	if app.DestinationPort != "" && dstPort > 0 {
+		if strings.Contains(app.DestinationPort, "-") {
+			parts := strings.SplitN(app.DestinationPort, "-", 2)
+			lo, _ := strconv.Atoi(parts[0])
+			hi, _ := strconv.Atoi(parts[1])
+			if dstPort < lo || dstPort > hi {
+				return false
+			}
+		} else {
+			p, _ := strconv.Atoi(app.DestinationPort)
+			if p != dstPort {
+				return false
+			}
+		}
+	}
+	return true
 }

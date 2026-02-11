@@ -491,6 +491,61 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 						for _, addrNode := range afNode.FindChildren("address") {
 							if len(addrNode.Keys) >= 2 {
 								unit.Addresses = append(unit.Addresses, addrNode.Keys[1])
+								// Parse VRRP groups under address
+								for _, vrrpNode := range addrNode.FindChildren("vrrp-group") {
+									if len(vrrpNode.Keys) < 2 {
+										continue
+									}
+									groupID, err := strconv.Atoi(vrrpNode.Keys[1])
+									if err != nil {
+										continue
+									}
+									vg := &VRRPGroup{
+										ID:       groupID,
+										Priority: 100, // default
+									}
+									for _, prop := range vrrpNode.Children {
+										switch prop.Name() {
+										case "virtual-address":
+											if len(prop.Keys) >= 2 {
+												vg.VirtualAddresses = append(vg.VirtualAddresses, prop.Keys[1])
+											}
+										case "priority":
+											if len(prop.Keys) >= 2 {
+												vg.Priority, _ = strconv.Atoi(prop.Keys[1])
+											}
+										case "preempt":
+											vg.Preempt = true
+										case "accept-data":
+											vg.AcceptData = true
+										case "advertise-interval":
+											if len(prop.Keys) >= 2 {
+												vg.AdvertiseInterval, _ = strconv.Atoi(prop.Keys[1])
+											}
+										case "authentication-type":
+											if len(prop.Keys) >= 2 {
+												vg.AuthType = prop.Keys[1]
+											}
+										case "authentication-key":
+											if len(prop.Keys) >= 2 {
+												vg.AuthKey = prop.Keys[1]
+											}
+										case "track-interface":
+											if len(prop.Keys) >= 2 {
+												vg.TrackInterface = prop.Keys[1]
+											}
+										case "track-priority-cost":
+											if len(prop.Keys) >= 2 {
+												vg.TrackPriorityDelta, _ = strconv.Atoi(prop.Keys[1])
+											}
+										}
+									}
+									if unit.VRRPGroups == nil {
+										unit.VRRPGroups = make(map[string]*VRRPGroup)
+									}
+									key := fmt.Sprintf("%s_grp%d", addrNode.Keys[1], groupID)
+									unit.VRRPGroups[key] = vg
+								}
 							}
 						}
 						if afNode.FindChild("dhcp") != nil {

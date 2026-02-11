@@ -51,6 +51,10 @@ const (
 	BpfrxService_GetOSPFStatus_FullMethodName             = "/bpfrx.v1.BpfrxService/GetOSPFStatus"
 	BpfrxService_GetBGPStatus_FullMethodName              = "/bpfrx.v1.BpfrxService/GetBGPStatus"
 	BpfrxService_GetIPsecSA_FullMethodName                = "/bpfrx.v1.BpfrxService/GetIPsecSA"
+	BpfrxService_GetNATPoolStats_FullMethodName           = "/bpfrx.v1.BpfrxService/GetNATPoolStats"
+	BpfrxService_GetNATRuleStats_FullMethodName           = "/bpfrx.v1.BpfrxService/GetNATRuleStats"
+	BpfrxService_GetVRRPStatus_FullMethodName             = "/bpfrx.v1.BpfrxService/GetVRRPStatus"
+	BpfrxService_MatchPolicies_FullMethodName             = "/bpfrx.v1.BpfrxService/MatchPolicies"
 	BpfrxService_Ping_FullMethodName                      = "/bpfrx.v1.BpfrxService/Ping"
 	BpfrxService_Traceroute_FullMethodName                = "/bpfrx.v1.BpfrxService/Traceroute"
 	BpfrxService_ClearSessions_FullMethodName             = "/bpfrx.v1.BpfrxService/ClearSessions"
@@ -99,6 +103,10 @@ type BpfrxServiceClient interface {
 	GetOSPFStatus(ctx context.Context, in *GetOSPFStatusRequest, opts ...grpc.CallOption) (*GetOSPFStatusResponse, error)
 	GetBGPStatus(ctx context.Context, in *GetBGPStatusRequest, opts ...grpc.CallOption) (*GetBGPStatusResponse, error)
 	GetIPsecSA(ctx context.Context, in *GetIPsecSARequest, opts ...grpc.CallOption) (*GetIPsecSAResponse, error)
+	GetNATPoolStats(ctx context.Context, in *GetNATPoolStatsRequest, opts ...grpc.CallOption) (*GetNATPoolStatsResponse, error)
+	GetNATRuleStats(ctx context.Context, in *GetNATRuleStatsRequest, opts ...grpc.CallOption) (*GetNATRuleStatsResponse, error)
+	GetVRRPStatus(ctx context.Context, in *GetVRRPStatusRequest, opts ...grpc.CallOption) (*GetVRRPStatusResponse, error)
+	MatchPolicies(ctx context.Context, in *MatchPoliciesRequest, opts ...grpc.CallOption) (*MatchPoliciesResponse, error)
 	// Diagnostics
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
 	Traceroute(ctx context.Context, in *TracerouteRequest, opts ...grpc.CallOption) (*TracerouteResponse, error)
@@ -438,6 +446,46 @@ func (c *bpfrxServiceClient) GetIPsecSA(ctx context.Context, in *GetIPsecSAReque
 	return out, nil
 }
 
+func (c *bpfrxServiceClient) GetNATPoolStats(ctx context.Context, in *GetNATPoolStatsRequest, opts ...grpc.CallOption) (*GetNATPoolStatsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetNATPoolStatsResponse)
+	err := c.cc.Invoke(ctx, BpfrxService_GetNATPoolStats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *bpfrxServiceClient) GetNATRuleStats(ctx context.Context, in *GetNATRuleStatsRequest, opts ...grpc.CallOption) (*GetNATRuleStatsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetNATRuleStatsResponse)
+	err := c.cc.Invoke(ctx, BpfrxService_GetNATRuleStats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *bpfrxServiceClient) GetVRRPStatus(ctx context.Context, in *GetVRRPStatusRequest, opts ...grpc.CallOption) (*GetVRRPStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetVRRPStatusResponse)
+	err := c.cc.Invoke(ctx, BpfrxService_GetVRRPStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *bpfrxServiceClient) MatchPolicies(ctx context.Context, in *MatchPoliciesRequest, opts ...grpc.CallOption) (*MatchPoliciesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MatchPoliciesResponse)
+	err := c.cc.Invoke(ctx, BpfrxService_MatchPolicies_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *bpfrxServiceClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PingResponse)
@@ -538,6 +586,10 @@ type BpfrxServiceServer interface {
 	GetOSPFStatus(context.Context, *GetOSPFStatusRequest) (*GetOSPFStatusResponse, error)
 	GetBGPStatus(context.Context, *GetBGPStatusRequest) (*GetBGPStatusResponse, error)
 	GetIPsecSA(context.Context, *GetIPsecSARequest) (*GetIPsecSAResponse, error)
+	GetNATPoolStats(context.Context, *GetNATPoolStatsRequest) (*GetNATPoolStatsResponse, error)
+	GetNATRuleStats(context.Context, *GetNATRuleStatsRequest) (*GetNATRuleStatsResponse, error)
+	GetVRRPStatus(context.Context, *GetVRRPStatusRequest) (*GetVRRPStatusResponse, error)
+	MatchPolicies(context.Context, *MatchPoliciesRequest) (*MatchPoliciesResponse, error)
 	// Diagnostics
 	Ping(context.Context, *PingRequest) (*PingResponse, error)
 	Traceroute(context.Context, *TracerouteRequest) (*TracerouteResponse, error)
@@ -652,6 +704,18 @@ func (UnimplementedBpfrxServiceServer) GetBGPStatus(context.Context, *GetBGPStat
 }
 func (UnimplementedBpfrxServiceServer) GetIPsecSA(context.Context, *GetIPsecSARequest) (*GetIPsecSAResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetIPsecSA not implemented")
+}
+func (UnimplementedBpfrxServiceServer) GetNATPoolStats(context.Context, *GetNATPoolStatsRequest) (*GetNATPoolStatsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNATPoolStats not implemented")
+}
+func (UnimplementedBpfrxServiceServer) GetNATRuleStats(context.Context, *GetNATRuleStatsRequest) (*GetNATRuleStatsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNATRuleStats not implemented")
+}
+func (UnimplementedBpfrxServiceServer) GetVRRPStatus(context.Context, *GetVRRPStatusRequest) (*GetVRRPStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetVRRPStatus not implemented")
+}
+func (UnimplementedBpfrxServiceServer) MatchPolicies(context.Context, *MatchPoliciesRequest) (*MatchPoliciesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MatchPolicies not implemented")
 }
 func (UnimplementedBpfrxServiceServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
@@ -1268,6 +1332,78 @@ func _BpfrxService_GetIPsecSA_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _BpfrxService_GetNATPoolStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNATPoolStatsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BpfrxServiceServer).GetNATPoolStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BpfrxService_GetNATPoolStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BpfrxServiceServer).GetNATPoolStats(ctx, req.(*GetNATPoolStatsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BpfrxService_GetNATRuleStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNATRuleStatsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BpfrxServiceServer).GetNATRuleStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BpfrxService_GetNATRuleStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BpfrxServiceServer).GetNATRuleStats(ctx, req.(*GetNATRuleStatsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BpfrxService_GetVRRPStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetVRRPStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BpfrxServiceServer).GetVRRPStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BpfrxService_GetVRRPStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BpfrxServiceServer).GetVRRPStatus(ctx, req.(*GetVRRPStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BpfrxService_MatchPolicies_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MatchPoliciesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BpfrxServiceServer).MatchPolicies(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BpfrxService_MatchPolicies_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BpfrxServiceServer).MatchPolicies(ctx, req.(*MatchPoliciesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _BpfrxService_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PingRequest)
 	if err := dec(in); err != nil {
@@ -1510,6 +1646,22 @@ var BpfrxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetIPsecSA",
 			Handler:    _BpfrxService_GetIPsecSA_Handler,
+		},
+		{
+			MethodName: "GetNATPoolStats",
+			Handler:    _BpfrxService_GetNATPoolStats_Handler,
+		},
+		{
+			MethodName: "GetNATRuleStats",
+			Handler:    _BpfrxService_GetNATRuleStats_Handler,
+		},
+		{
+			MethodName: "GetVRRPStatus",
+			Handler:    _BpfrxService_GetVRRPStatus_Handler,
+		},
+		{
+			MethodName: "MatchPolicies",
+			Handler:    _BpfrxService_MatchPolicies_Handler,
 		},
 		{
 			MethodName: "Ping",

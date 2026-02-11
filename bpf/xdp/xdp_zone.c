@@ -153,6 +153,18 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	}
 
 	/*
+	 * VRRP multicast (224.0.0.18, proto 112) — allow to host for keepalived.
+	 * Must be checked before the generic multicast pass-through so it
+	 * reaches the host even with zone-pair deny-all.
+	 */
+	if (meta->addr_family == AF_INET && meta->protocol == PROTO_VRRP &&
+	    meta->dst_ip.v4 == bpf_htonl(0xE0000012)) {
+		meta->fwd_ifindex = 0;
+		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+		return XDP_PASS;
+	}
+
+	/*
 	 * Broadcast / multicast → host-bound traffic.
 	 * Skip the zone-pair policy pipeline and jump directly to the
 	 * forward stage which applies host-inbound-traffic filtering.

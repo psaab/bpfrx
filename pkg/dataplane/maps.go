@@ -859,3 +859,54 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 		policySetID++
 	}
 }
+
+// ReadNATRuleCounter reads the per-CPU NAT rule hit counter and returns
+// the summed packets and bytes across all CPUs.
+func (m *Manager) ReadNATRuleCounter(counterID uint32) (CounterValue, error) {
+	zm, ok := m.maps["nat_rule_counters"]
+	if !ok {
+		return CounterValue{}, fmt.Errorf("nat_rule_counters map not found")
+	}
+	var perCPU []CounterValue
+	if err := zm.Lookup(counterID, &perCPU); err != nil {
+		return CounterValue{}, err
+	}
+	var total CounterValue
+	for _, v := range perCPU {
+		total.Packets += v.Packets
+		total.Bytes += v.Bytes
+	}
+	return total, nil
+}
+
+// ClearNATRuleCounters zeroes all NAT rule counter entries.
+func (m *Manager) ClearNATRuleCounters() error {
+	zm, ok := m.maps["nat_rule_counters"]
+	if !ok {
+		return fmt.Errorf("nat_rule_counters map not found")
+	}
+	numCPUs := ebpf.MustPossibleCPU()
+	zero := make([]CounterValue, numCPUs)
+	for i := uint32(0); i < MaxNATRuleCounters; i++ {
+		zm.Update(i, zero, ebpf.UpdateAny)
+	}
+	return nil
+}
+
+// ReadNATPortCounter reads the per-CPU NAT port allocation counter for a pool
+// and returns the sum across all CPUs.
+func (m *Manager) ReadNATPortCounter(poolID uint32) (uint64, error) {
+	zm, ok := m.maps["nat_port_counters"]
+	if !ok {
+		return 0, fmt.Errorf("nat_port_counters map not found")
+	}
+	var perCPU []NATPortCounter
+	if err := zm.Lookup(poolID, &perCPU); err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, v := range perCPU {
+		total += v.Counter
+	}
+	return total, nil
+}

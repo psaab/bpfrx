@@ -35,6 +35,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/rpm"
 	"github.com/psaab/bpfrx/pkg/scheduler"
 	"github.com/psaab/bpfrx/pkg/snmp"
+	"github.com/psaab/bpfrx/pkg/vrrp"
 )
 
 // Options configures the daemon.
@@ -450,6 +451,14 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	if d.dhcpServer != nil && cfg.System.DHCPServer.DHCPLocalServer != nil {
 		if err := d.dhcpServer.Apply(&cfg.System.DHCPServer); err != nil {
 			slog.Warn("failed to apply DHCP server config", "err", err)
+		}
+	}
+
+	// 8. Apply VRRP config (keepalived)
+	instances := vrrp.CollectInstances(cfg)
+	if len(instances) > 0 {
+		if err := vrrp.Apply(instances); err != nil {
+			slog.Warn("failed to apply VRRP config", "err", err)
 		}
 	}
 }

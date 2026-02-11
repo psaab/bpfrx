@@ -325,6 +325,14 @@ struct {
 	__type(value, struct nat_port_counter);
 } nat_port_counters SEC(".maps");
 
+/* Per-rule NAT hit counters (translation hits) */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, MAX_NAT_RULE_COUNTERS);
+	__type(key, __u32);
+	__type(value, struct counter_value);
+} nat_rule_counters SEC(".maps");
+
 #endif /* BPFRX_NAT_POOLS */
 
 /* ============================================================
@@ -374,7 +382,8 @@ struct snat_value {
 	__u32  src_addr_id;  /* 0 = any */
 	__u32  dst_addr_id;  /* 0 = any */
 	__u8   mode;         /* pool ID */
-	__u8   pad[3];
+	__u8   pad;
+	__u16  counter_id;   /* index into nat_rule_counters */
 };
 
 struct {
@@ -417,7 +426,8 @@ struct snat_value_v6 {
 	__u32  src_addr_id;  /* 0 = any */
 	__u32  dst_addr_id;  /* 0 = any */
 	__u8   mode;         /* pool ID */
-	__u8   pad[3];
+	__u8   pad;
+	__u16  counter_id;   /* index into nat_rule_counters */
 };
 
 struct {

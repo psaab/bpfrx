@@ -147,6 +147,7 @@ struct icmp6hdr {
 #define MAX_SESSIONS           1048576  /* 1M sessions */
 #define MAX_NAT_POOLS          32
 #define MAX_NAT_POOL_IPS       256
+#define MAX_NAT_RULE_COUNTERS  256
 #define MAX_ADDRESSES          8192
 #define MAX_APPLICATIONS       1024
 #define MAX_SCREEN_PROFILES    64
@@ -203,6 +204,7 @@ struct icmp6hdr {
 #define PROTO_TCP              6
 #define PROTO_UDP              17
 #define PROTO_ICMP             1
+#define PROTO_VRRP             112
 
 /* Event types for ring buffer */
 #define EVENT_TYPE_SESSION_OPEN   1
@@ -270,6 +272,7 @@ struct icmp6hdr {
 #define HOST_INBOUND_RADIUS      (1 << 15)
 #define HOST_INBOUND_IKE         (1 << 16)
 #define HOST_INBOUND_DHCPV6      (1 << 17)
+#define HOST_INBOUND_VRRP        (1 << 18)
 #define HOST_INBOUND_ALL         0xFFFFFFFF  /* permit all services */
 
 /* ============================================================

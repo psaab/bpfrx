@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/chzyer/readline"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
@@ -22,6 +24,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/ipsec"
 	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/routing"
+	"github.com/psaab/bpfrx/pkg/vrrp"
 	"github.com/vishvananda/netlink"
 )
 
@@ -348,31 +351,53 @@ func (c *CLI) dispatch(line string) error {
 		return nil
 	}
 
-	// Extract | match pipe (but not | display set or | compare).
-	if cmd, pattern, ok := extractMatchPipe(line); ok && pattern != "" {
-		return c.dispatchWithMatchPipe(cmd, pattern)
+	// Extract pipe filter (| match, | except, | count, | last, | no-more).
+	// Skip | display set and | compare (handled separately).
+	if cmd, pipeType, pipeArg, ok := extractPipe(line); ok {
+		return c.dispatchWithPipe(cmd, pipeType, pipeArg)
 	}
 
 	if c.store.InConfigMode() {
 		return c.dispatchConfig(line)
 	}
+
+	// For show commands, auto-page output when it exceeds terminal height.
+	if strings.HasPrefix(strings.TrimSpace(line), "show ") {
+		return c.dispatchWithPager(line)
+	}
+
 	return c.dispatchOperational(line)
 }
 
-// extractMatchPipe splits a line at "| match <pattern>".
-// Returns the command part, the pattern, and whether a match pipe was found.
-func extractMatchPipe(line string) (string, string, bool) {
-	idx := strings.Index(line, "| match ")
+// extractPipe splits a line at the last "| <filter>" expression.
+// Recognized filters: match, except, count, last, no-more.
+// Returns the command part, pipe type, pipe argument, and whether a pipe was found.
+// Skips "| display set" and "| compare" which are handled separately.
+func extractPipe(line string) (string, string, string, bool) {
+	idx := strings.LastIndex(line, " | ")
 	if idx < 0 {
-		return line, "", false
+		return line, "", "", false
 	}
 	cmd := strings.TrimSpace(line[:idx])
-	pattern := strings.TrimSpace(line[idx+len("| match "):])
-	return cmd, pattern, true
+	pipe := strings.TrimSpace(line[idx+3:])
+	parts := strings.SplitN(pipe, " ", 2)
+	pipeType := parts[0]
+	var pipeArg string
+	if len(parts) > 1 {
+		pipeArg = parts[1]
+	}
+
+	switch pipeType {
+	case "match", "except", "count", "last", "no-more":
+		return cmd, pipeType, pipeArg, true
+	default:
+		// Not a recognized pipe filter (e.g. "| display set", "| compare")
+		return line, "", "", false
+	}
 }
 
-// dispatchWithMatchPipe runs the command and filters output lines by pattern.
-func (c *CLI) dispatchWithMatchPipe(cmd, pattern string) error {
+// dispatchWithPipe runs the command and applies the pipe filter to the output.
+func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 	// Capture stdout.
 	origStdout := os.Stdout
 	r, w, err := os.Pipe()
@@ -392,17 +417,141 @@ func (c *CLI) dispatchWithMatchPipe(cmd, pattern string) error {
 	w.Close()
 	os.Stdout = origStdout
 
-	// Read captured output and filter.
+	// Read captured output.
 	output, _ := io.ReadAll(r)
 	r.Close()
 
-	lowerPattern := strings.ToLower(pattern)
-	for _, line := range strings.Split(string(output), "\n") {
-		if strings.Contains(strings.ToLower(line), lowerPattern) {
+	lines := strings.Split(string(output), "\n")
+	// Remove trailing empty line from split
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+
+	switch pipeType {
+	case "match":
+		lowerPattern := strings.ToLower(pipeArg)
+		for _, line := range lines {
+			if strings.Contains(strings.ToLower(line), lowerPattern) {
+				fmt.Fprintln(origStdout, line)
+			}
+		}
+	case "except":
+		lowerPattern := strings.ToLower(pipeArg)
+		for _, line := range lines {
+			if !strings.Contains(strings.ToLower(line), lowerPattern) {
+				fmt.Fprintln(origStdout, line)
+			}
+		}
+	case "count":
+		fmt.Fprintf(origStdout, "Count: %d lines\n", len(lines))
+	case "last":
+		n := 10
+		if pipeArg != "" {
+			if v, err := strconv.Atoi(pipeArg); err == nil && v > 0 {
+				n = v
+			}
+		}
+		start := len(lines) - n
+		if start < 0 {
+			start = 0
+		}
+		for _, line := range lines[start:] {
+			fmt.Fprintln(origStdout, line)
+		}
+	case "no-more":
+		// Output without paging (we don't page by default, so just pass through)
+		for _, line := range lines {
 			fmt.Fprintln(origStdout, line)
 		}
 	}
 
+	return cmdErr
+}
+
+// dispatchWithPager runs a show command and pages the output if it exceeds
+// the terminal height. Press space for next page, enter for next line, q to quit.
+func (c *CLI) dispatchWithPager(line string) error {
+	origStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		return c.dispatchOperational(line)
+	}
+	os.Stdout = w
+
+	var cmdErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cmdErr = c.dispatchOperational(line)
+	}()
+	<-done
+	w.Close()
+	os.Stdout = origStdout
+
+	output, _ := io.ReadAll(r)
+	r.Close()
+
+	lines := strings.Split(string(output), "\n")
+	// Remove trailing empty line from split
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+
+	// Get terminal height
+	termHeight := 24
+	ws, err := unix.IoctlGetWinsize(int(origStdout.Fd()), unix.TIOCGWINSZ)
+	if err == nil && ws.Row > 0 {
+		termHeight = int(ws.Row)
+	}
+	pageSize := termHeight - 1 // leave one line for the --More-- prompt
+
+	// If output fits on screen, just print it
+	if len(lines) <= pageSize {
+		for _, line := range lines {
+			fmt.Fprintln(origStdout, line)
+		}
+		return cmdErr
+	}
+
+	// Page output
+	lineIdx := 0
+	for lineIdx < len(lines) {
+		// Print a page
+		end := lineIdx + pageSize
+		if end > len(lines) {
+			end = len(lines)
+		}
+		for _, line := range lines[lineIdx:end] {
+			fmt.Fprintln(origStdout, line)
+		}
+		lineIdx = end
+
+		if lineIdx >= len(lines) {
+			break
+		}
+
+		// Show --More-- prompt and wait for input
+		fmt.Fprint(origStdout, "\033[7m--More--\033[0m") // inverse video
+		buf := make([]byte, 1)
+		os.Stdin.Read(buf)
+		fmt.Fprint(origStdout, "\r        \r") // clear --More--
+
+		switch buf[0] {
+		case 'q', 'Q':
+			return cmdErr
+		case '\n', '\r':
+			// Show one more line
+			if lineIdx < len(lines) {
+				fmt.Fprintln(origStdout, lines[lineIdx])
+				lineIdx++
+			}
+			// Don't advance by pageSize, just continue the loop which will
+			// show the prompt again immediately
+			continue
+		default:
+			// space or any other key: show next page
+		}
+	}
 	return cmdErr
 }
 
@@ -433,6 +582,9 @@ func (c *CLI) dispatchOperational(line string) error {
 
 	case "traceroute":
 		return c.handleTraceroute(parts[1:])
+
+	case "monitor":
+		return c.handleMonitor(parts[1:])
 
 	case "quit", "exit":
 		return errExit
@@ -594,7 +746,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		fmt.Println("  policies         Show security policies")
 		fmt.Println("  screen           Show screen/IDS profiles")
 		fmt.Println("  flow             Show flow timeouts")
-		fmt.Println("  flow session     Show active sessions [zone <n>] [protocol <p>] [source-prefix <cidr>] [destination-prefix <cidr>] [summary]")
+		fmt.Println("  flow session     Show active sessions [zone <n>] [protocol <p>] [source-prefix <cidr>]")
+	fmt.Println("                   [destination-prefix <cidr>] [source-port <p>] [destination-port <p>]")
+	fmt.Println("                   [nat] [interface <name>] [summary]")
 		fmt.Println("  nat source       Show source NAT information")
 		fmt.Println("  nat destination  Show destination NAT information")
 		fmt.Println("  address-book     Show address book entries")
@@ -602,6 +756,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		fmt.Println("  alg              Show ALG (Application Layer Gateway) status")
 		fmt.Println("  ipsec            Show IPsec VPN status")
 		fmt.Println("  dynamic-address  Show dynamic address feeds")
+		fmt.Println("  match-policies   Match 5-tuple against policies")
 		fmt.Println("  log [N] [zone <name>] [protocol <proto>] [action <act>]")
 		fmt.Println("  statistics       Show global statistics")
 		return nil
@@ -730,6 +885,12 @@ func (c *CLI) handleShowSecurity(args []string) error {
 
 	case "dynamic-address":
 		return c.showDynamicAddress()
+
+	case "match-policies":
+		return c.showMatchPolicies(cfg, args[1:])
+
+	case "vrrp":
+		return c.showVRRP()
 
 	default:
 		return fmt.Errorf("unknown show security target: %s", args[0])
@@ -1059,6 +1220,10 @@ type sessionFilter struct {
 	proto   uint8    // 0 = any
 	srcNet  *net.IPNet
 	dstNet  *net.IPNet
+	srcPort uint16   // 0 = any
+	dstPort uint16   // 0 = any
+	natOnly bool     // show only NAT sessions
+	iface   string   // ingress interface name filter
 	summary bool     // only show count
 }
 
@@ -1121,6 +1286,27 @@ func (c *CLI) parseSessionFilter(args []string) sessionFilter {
 					f.dstNet = ipNet
 				}
 			}
+		case "source-port":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil {
+					f.srcPort = uint16(v)
+				}
+			}
+		case "destination-port":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil {
+					f.dstPort = uint16(v)
+				}
+			}
+		case "nat":
+			f.natOnly = true
+		case "interface":
+			if i+1 < len(args) {
+				i++
+				f.iface = args[i]
+			}
 		case "summary":
 			f.summary = true
 		}
@@ -1141,6 +1327,15 @@ func (f *sessionFilter) matchesV4(key dataplane.SessionKey, val dataplane.Sessio
 	if f.dstNet != nil && !f.dstNet.Contains(net.IP(key.DstIP[:])) {
 		return false
 	}
+	if f.srcPort != 0 && key.SrcPort != f.srcPort {
+		return false
+	}
+	if f.dstPort != 0 && key.DstPort != f.dstPort {
+		return false
+	}
+	if f.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
+		return false
+	}
 	return true
 }
 
@@ -1157,11 +1352,21 @@ func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.Sess
 	if f.dstNet != nil && !f.dstNet.Contains(net.IP(key.DstIP[:])) {
 		return false
 	}
+	if f.srcPort != 0 && key.SrcPort != f.srcPort {
+		return false
+	}
+	if f.dstPort != 0 && key.DstPort != f.dstPort {
+		return false
+	}
+	if f.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
+		return false
+	}
 	return true
 }
 
 func (f *sessionFilter) hasFilter() bool {
-	return f.zoneID != 0 || f.proto != 0 || f.srcNet != nil || f.dstNet != nil
+	return f.zoneID != 0 || f.proto != 0 || f.srcNet != nil || f.dstNet != nil ||
+		f.srcPort != 0 || f.dstPort != 0 || f.natOnly || f.iface != ""
 }
 
 func (c *CLI) showFlowSession(args []string) error {
@@ -1450,10 +1655,13 @@ func (c *CLI) handleShowNAT(args []string) error {
 
 	if len(args) == 0 {
 		fmt.Println("show security nat:")
-		fmt.Println("  source                     Show source NAT rules and sessions")
-		fmt.Println("  destination                Show destination NAT rules")
-		fmt.Println("  static                     Show static 1:1 NAT rules")
-		fmt.Println("  source persistent-nat-table Show persistent NAT bindings")
+		fmt.Println("  source                       Show source NAT rules and sessions")
+		fmt.Println("  source summary               Show source NAT pool utilization summary")
+		fmt.Println("  source pool <name|all>       Show source NAT pool details")
+		fmt.Println("  source rule-set <name>       Show source NAT rule-set details")
+		fmt.Println("  source persistent-nat-table  Show persistent NAT bindings")
+		fmt.Println("  destination                  Show destination NAT rules")
+		fmt.Println("  static                       Show static 1:1 NAT rules")
 		return nil
 	}
 
@@ -1473,6 +1681,26 @@ func (c *CLI) handleShowNAT(args []string) error {
 }
 
 func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
+	// Sub-command dispatch: summary, pool <name>, rule-set <name>
+	if len(args) > 0 {
+		switch args[0] {
+		case "summary":
+			return c.showNATSourceSummary(cfg)
+		case "pool":
+			poolName := ""
+			if len(args) > 1 {
+				poolName = args[1]
+			}
+			return c.showNATSourcePool(cfg, poolName)
+		case "rule-set":
+			if len(args) > 1 {
+				return c.showNATSourceRuleSet(cfg, args[1])
+			}
+			return fmt.Errorf("usage: show security nat source rule-set <name>")
+		}
+	}
+
+	// Default: show all pools, rules, and summary
 	// Show configured source NAT pools
 	if cfg != nil && len(cfg.Security.NAT.SourcePools) > 0 {
 		fmt.Println("Source NAT pools:")
@@ -1481,7 +1709,14 @@ func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 			for _, addr := range pool.Addresses {
 				fmt.Printf("    Address: %s\n", addr)
 			}
-			fmt.Printf("    Port range: %d-%d\n", pool.PortLow, pool.PortHigh)
+			portLow, portHigh := pool.PortLow, pool.PortHigh
+			if portLow == 0 {
+				portLow = 1024
+			}
+			if portHigh == 0 {
+				portHigh = 65535
+			}
+			fmt.Printf("    Port range: %d-%d\n", portLow, portHigh)
 		}
 		fmt.Println()
 	}
@@ -1544,6 +1779,210 @@ func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 		}
 	}
 
+	return nil
+}
+
+// showNATSourceSummary displays a Junos-style summary of all source NAT pools.
+func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
+	if cfg == nil {
+		fmt.Println("No source NAT configured")
+		return nil
+	}
+
+	// Count pools: named pools + interface-mode rules
+	type poolInfo struct {
+		name    string
+		address string
+		total   int // total ports (0 = N/A for interface)
+		used    int
+		isIface bool
+	}
+	var pools []poolInfo
+
+	// Named pools
+	for name, pool := range cfg.Security.NAT.SourcePools {
+		portLow, portHigh := pool.PortLow, pool.PortHigh
+		if portLow == 0 {
+			portLow = 1024
+		}
+		if portHigh == 0 {
+			portHigh = 65535
+		}
+		totalPorts := (portHigh - portLow + 1) * len(pool.Addresses)
+		addr := strings.Join(pool.Addresses, ",")
+		pools = append(pools, poolInfo{name: name, address: addr, total: totalPorts})
+	}
+
+	// Interface-mode pools (count from rules)
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			if rule.Then.Interface {
+				pools = append(pools, poolInfo{
+					name: fmt.Sprintf("%s/%s (interface)", rs.FromZone, rs.ToZone),
+					address: "interface", isIface: true,
+				})
+			}
+		}
+	}
+
+	// Read per-pool port counters from BPF
+	if c.dp != nil && c.dp.IsLoaded() {
+		if cr := c.dp.LastCompileResult(); cr != nil {
+			for i := range pools {
+				if pools[i].isIface {
+					continue
+				}
+				if id, ok := cr.PoolIDs[pools[i].name]; ok {
+					cnt, err := c.dp.ReadNATPortCounter(uint32(id))
+					if err == nil {
+						pools[i].used = int(cnt)
+					}
+				}
+			}
+		}
+		// Count interface NAT sessions
+		ifaceSNAT := 0
+		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				ifaceSNAT++
+			}
+			return true
+		})
+		for i := range pools {
+			if pools[i].isIface {
+				pools[i].used = ifaceSNAT
+			}
+		}
+	}
+
+	fmt.Printf("Total pools: %d\n", len(pools))
+	fmt.Printf("%-20s %-20s %-8s %-8s %-12s %-12s\n",
+		"Pool", "Address", "Ports", "Used", "Available", "Utilization")
+	for _, p := range pools {
+		ports := "N/A"
+		avail := "N/A"
+		util := "N/A"
+		if p.total > 0 {
+			ports = fmt.Sprintf("%d", p.total)
+			a := p.total - p.used
+			if a < 0 {
+				a = 0
+			}
+			avail = fmt.Sprintf("%d", a)
+			util = fmt.Sprintf("%.1f%%", float64(p.used)/float64(p.total)*100)
+		}
+		fmt.Printf("%-20s %-20s %-8s %-8d %-12s %-12s\n",
+			p.name, p.address, ports, p.used, avail, util)
+	}
+	return nil
+}
+
+// showNATSourcePool displays detailed information about a specific NAT pool.
+func (c *CLI) showNATSourcePool(cfg *config.Config, poolName string) error {
+	if cfg == nil {
+		fmt.Println("No source NAT configured")
+		return nil
+	}
+
+	// If poolName is empty or "all", show all pools
+	showAll := poolName == "" || poolName == "all"
+
+	for name, pool := range cfg.Security.NAT.SourcePools {
+		if !showAll && name != poolName {
+			continue
+		}
+
+		portLow, portHigh := pool.PortLow, pool.PortHigh
+		if portLow == 0 {
+			portLow = 1024
+		}
+		if portHigh == 0 {
+			portHigh = 65535
+		}
+		totalPorts := (portHigh - portLow + 1) * len(pool.Addresses)
+
+		fmt.Printf("Pool name: %s\n", name)
+		for _, addr := range pool.Addresses {
+			fmt.Printf("  Address: %s\n", addr)
+		}
+		fmt.Printf("  Port range: %d-%d\n", portLow, portHigh)
+
+		if c.dp != nil && c.dp.IsLoaded() {
+			if cr := c.dp.LastCompileResult(); cr != nil {
+				if id, ok := cr.PoolIDs[name]; ok {
+					cnt, err := c.dp.ReadNATPortCounter(uint32(id))
+					if err == nil {
+						avail := totalPorts - int(cnt)
+						if avail < 0 {
+							avail = 0
+						}
+						fmt.Printf("  Ports allocated: %d\n", cnt)
+						fmt.Printf("  Ports available: %d\n", avail)
+						if totalPorts > 0 {
+							fmt.Printf("  Utilization: %.1f%%\n",
+								float64(cnt)/float64(totalPorts)*100)
+						}
+					}
+				}
+			}
+		}
+		fmt.Println()
+	}
+
+	if !showAll {
+		if _, ok := cfg.Security.NAT.SourcePools[poolName]; !ok {
+			fmt.Printf("Pool %q not found\n", poolName)
+		}
+	}
+	return nil
+}
+
+// showNATSourceRuleSet displays a specific source NAT rule-set with hit counters.
+func (c *CLI) showNATSourceRuleSet(cfg *config.Config, rsName string) error {
+	if cfg == nil {
+		fmt.Println("No source NAT configured")
+		return nil
+	}
+
+	for _, rs := range cfg.Security.NAT.Source {
+		if rs.Name != rsName {
+			continue
+		}
+		fmt.Printf("Rule-set: %s\n", rs.Name)
+		fmt.Printf("  From zone: %s  To zone: %s\n", rs.FromZone, rs.ToZone)
+		for _, rule := range rs.Rules {
+			action := "interface"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			}
+			fmt.Printf("  Rule: %s\n", rule.Name)
+			srcMatch := "0.0.0.0/0"
+			if rule.Match.SourceAddress != "" {
+				srcMatch = rule.Match.SourceAddress
+			}
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+			fmt.Printf("    Match: source %s destination %s\n", srcMatch, dstMatch)
+			fmt.Printf("    Action: %s\n", action)
+
+			// Show hit counters if dataplane is loaded
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("    Translation hits: %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+		}
+		fmt.Println()
+		return nil
+	}
+	fmt.Printf("Rule-set %q not found\n", rsName)
 	return nil
 }
 
@@ -2658,11 +3097,17 @@ func (c *CLI) showOperationalHelp() {
 	fmt.Println("  show protocols ospf neighbor       Show OSPF neighbors")
 	fmt.Println("  show protocols bgp summary         Show BGP peer summary")
 	fmt.Println("  show system rollback               Show rollback history")
+	fmt.Println("  show security match-policies       Match a 5-tuple against policies")
+	fmt.Println("  monitor traffic interface <name>   Capture traffic (tcpdump)")
 	fmt.Println("  clear security flow session        Clear all sessions")
 	fmt.Println("  clear security counters            Clear all counters")
 	fmt.Println("  quit                               Exit CLI")
 	fmt.Println()
 	fmt.Println("  <command> | match <pattern>         Filter output by pattern")
+	fmt.Println("  <command> | except <pattern>        Exclude lines matching pattern")
+	fmt.Println("  <command> | count                   Count output lines")
+	fmt.Println("  <command> | last [N]                Show last N lines (default 10)")
+	fmt.Println("  <command> | no-more                 Disable paging")
 	fmt.Println("  Use <TAB> for command completion, ? for context help")
 }
 
@@ -3285,4 +3730,305 @@ func (c *CLI) clearPersistentNAT() error {
 	c.dp.PersistentNAT.Clear()
 	fmt.Printf("Cleared %d persistent NAT bindings\n", count)
 	return nil
+}
+
+// showVRRP displays VRRP/keepalived status.
+func (c *CLI) showVRRP() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	// Collect VRRP instances from config
+	instances := vrrp.CollectInstances(cfg)
+	if len(instances) == 0 {
+		fmt.Println("No VRRP groups configured")
+		return nil
+	}
+
+	// Try to read runtime state
+	status, _ := vrrp.Status()
+	if status != "" {
+		fmt.Println(status)
+	}
+
+	// Show configured instances
+	fmt.Printf("%-14s %-6s %-8s %-10s %-16s %-8s\n",
+		"Interface", "Group", "State", "Priority", "VIP", "Preempt")
+	for _, inst := range instances {
+		state := "BACKUP"
+		preempt := "no"
+		if inst.Preempt {
+			preempt = "yes"
+		}
+		vip := strings.Join(inst.VirtualAddresses, ",")
+		fmt.Printf("%-14s %-6d %-8s %-10d %-16s %-8s\n",
+			inst.Interface, inst.GroupID, state, inst.Priority, vip, preempt)
+	}
+	return nil
+}
+
+// showMatchPolicies performs a 5-tuple policy lookup and shows matching rules.
+func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	// Parse arguments: from-zone <z> to-zone <z> source-ip <ip> destination-ip <ip>
+	//                   destination-port <p> protocol <proto>
+	var fromZone, toZone, srcIP, dstIP, proto string
+	var dstPort int
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "from-zone":
+			if i+1 < len(args) {
+				i++
+				fromZone = args[i]
+			}
+		case "to-zone":
+			if i+1 < len(args) {
+				i++
+				toZone = args[i]
+			}
+		case "source-ip":
+			if i+1 < len(args) {
+				i++
+				srcIP = args[i]
+			}
+		case "destination-ip":
+			if i+1 < len(args) {
+				i++
+				dstIP = args[i]
+			}
+		case "destination-port":
+			if i+1 < len(args) {
+				i++
+				dstPort, _ = strconv.Atoi(args[i])
+			}
+		case "protocol":
+			if i+1 < len(args) {
+				i++
+				proto = args[i]
+			}
+		}
+	}
+
+	if fromZone == "" || toZone == "" {
+		fmt.Println("usage: show security match-policies from-zone <zone> to-zone <zone>")
+		fmt.Println("       source-ip <ip> destination-ip <ip> destination-port <port> protocol <tcp|udp>")
+		return nil
+	}
+
+	parsedSrc := net.ParseIP(srcIP)
+	parsedDst := net.ParseIP(dstIP)
+
+	// Find the zone-pair policy
+	for _, zpp := range cfg.Security.Policies {
+		if zpp.FromZone != fromZone || zpp.ToZone != toZone {
+			continue
+		}
+
+		for _, pol := range zpp.Policies {
+			// Check source address match
+			if !matchPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
+				continue
+			}
+			// Check destination address match
+			if !matchPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
+				continue
+			}
+			// Check application match
+			if !matchPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
+				continue
+			}
+
+			// Found a match
+			action := "permit"
+			switch pol.Action {
+			case 1:
+				action = "deny"
+			case 2:
+				action = "reject"
+			}
+			fmt.Printf("Matching policy:\n")
+			fmt.Printf("  From zone: %s, To zone: %s\n", fromZone, toZone)
+			fmt.Printf("  Policy: %s\n", pol.Name)
+			fmt.Printf("    Source addresses: %v\n", pol.Match.SourceAddresses)
+			fmt.Printf("    Destination addresses: %v\n", pol.Match.DestinationAddresses)
+			fmt.Printf("    Applications: %v\n", pol.Match.Applications)
+			fmt.Printf("    Action: %s\n", action)
+			return nil
+		}
+	}
+
+	fmt.Printf("No matching policy found for %s -> %s (default deny)\n", fromZone, toZone)
+	return nil
+}
+
+// matchPolicyAddr checks if an IP matches a list of address-book references.
+func matchPolicyAddr(addrs []string, ip net.IP, cfg *config.Config) bool {
+	if len(addrs) == 0 || ip == nil {
+		return true // no filter = match all
+	}
+	for _, a := range addrs {
+		if a == "any" {
+			return true
+		}
+		if cfg.Security.AddressBook == nil {
+			continue
+		}
+		// Check address entries
+		if addr, ok := cfg.Security.AddressBook.Addresses[a]; ok {
+			_, cidr, err := net.ParseCIDR(addr.Value)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		}
+		// Check address-set entries (recursive)
+		if matchPolicyAddrSet(a, ip, cfg, 0) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchPolicyAddrSet(setName string, ip net.IP, cfg *config.Config, depth int) bool {
+	if depth > 5 || cfg.Security.AddressBook == nil {
+		return false
+	}
+	as, ok := cfg.Security.AddressBook.AddressSets[setName]
+	if !ok {
+		return false
+	}
+	for _, addrName := range as.Addresses {
+		if addr, ok := cfg.Security.AddressBook.Addresses[addrName]; ok {
+			_, cidr, err := net.ParseCIDR(addr.Value)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		}
+	}
+	for _, nested := range as.AddressSets {
+		if matchPolicyAddrSet(nested, ip, cfg, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchPolicyApp checks if a protocol/port matches a list of application references.
+func matchPolicyApp(apps []string, proto string, dstPort int, cfg *config.Config) bool {
+	if len(apps) == 0 || proto == "" {
+		return true // no filter = match all
+	}
+	for _, a := range apps {
+		if a == "any" {
+			return true
+		}
+		// Check predefined and custom applications
+		if matchSingleApp(a, proto, dstPort, cfg) {
+			return true
+		}
+		// Check application sets
+		if cfg.Applications.ApplicationSets != nil {
+			if as, ok := cfg.Applications.ApplicationSets[a]; ok {
+				for _, appRef := range as.Applications {
+					if matchSingleApp(appRef, proto, dstPort, cfg) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func matchSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool {
+	if cfg.Applications.Applications == nil {
+		return false
+	}
+	app, ok := cfg.Applications.Applications[appName]
+	if !ok {
+		return false
+	}
+	if app.Protocol != "" && !strings.EqualFold(app.Protocol, proto) {
+		return false
+	}
+	if app.DestinationPort != "" && dstPort > 0 {
+		// Simple port match (handle single port or range)
+		if strings.Contains(app.DestinationPort, "-") {
+			parts := strings.SplitN(app.DestinationPort, "-", 2)
+			lo, _ := strconv.Atoi(parts[0])
+			hi, _ := strconv.Atoi(parts[1])
+			if dstPort < lo || dstPort > hi {
+				return false
+			}
+		} else {
+			p, _ := strconv.Atoi(app.DestinationPort)
+			if p != dstPort {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// handleMonitor dispatches monitor sub-commands.
+func (c *CLI) handleMonitor(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("monitor:")
+		fmt.Println("  traffic interface <name> [matching <filter>] [count <N>]")
+		return nil
+	}
+	if args[0] == "traffic" {
+		return c.handleMonitorTraffic(args[1:])
+	}
+	return fmt.Errorf("unknown monitor target: %s", args[0])
+}
+
+// handleMonitorTraffic wraps tcpdump for live packet capture.
+func (c *CLI) handleMonitorTraffic(args []string) error {
+	var iface, filter string
+	count := "0" // 0 = unlimited
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "interface":
+			if i+1 < len(args) {
+				i++
+				iface = args[i]
+			}
+		case "matching":
+			if i+1 < len(args) {
+				i++
+				filter = args[i]
+			}
+		case "count":
+			if i+1 < len(args) {
+				i++
+				count = args[i]
+			}
+		}
+	}
+
+	if iface == "" {
+		fmt.Println("usage: monitor traffic interface <name> [matching <filter>] [count <N>]")
+		return nil
+	}
+
+	cmdArgs := []string{"tcpdump", "-i", iface, "-n", "-l"}
+	if count != "0" {
+		cmdArgs = append(cmdArgs, "-c", count)
+	}
+	if filter != "" {
+		cmdArgs = append(cmdArgs, filter)
+	}
+
+	fmt.Printf("Monitoring traffic on %s (Ctrl+C to stop)...\n", iface)
+	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }

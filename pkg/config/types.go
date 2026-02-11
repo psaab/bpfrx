@@ -509,6 +509,21 @@ type InterfaceUnit struct {
 	DHCPv6Client  *DHCPv6ClientConfig
 	FilterInputV4 string // family inet { filter { input NAME; } }
 	FilterInputV6 string // family inet6 { filter { input NAME; } }
+	VRRPGroups    map[string]*VRRPGroup // keyed by address (CIDR), each address can have VRRP groups
+}
+
+// VRRPGroup defines a VRRP (Virtual Router Redundancy Protocol) group.
+type VRRPGroup struct {
+	ID                 int
+	VirtualAddresses   []string // virtual IP addresses
+	Priority           int      // 1-255, default 100
+	Preempt            bool
+	AcceptData         bool
+	AdvertiseInterval  int    // seconds, default 1
+	AuthType           string // "md5" or ""
+	AuthKey            string
+	TrackInterface     string // lower priority if interface is down
+	TrackPriorityDelta int    // how much to lower priority
 }
 
 // DHCPv6ClientConfig holds DHCPv6 client options (dhcpv6-client stanza).

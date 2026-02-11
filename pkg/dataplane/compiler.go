@@ -22,8 +22,10 @@ type CompileResult struct {
 	PoolIDs    map[string]uint8  // NAT pool name -> pool ID (0-based)
 	PolicySets int               // number of policy sets created
 
-	nextAddrID   uint32            // next available address ID (after address book)
-	implicitSets map[string]uint32 // cache of implicit set key -> set ID
+	nextAddrID      uint32            // next available address ID (after address book)
+	implicitSets    map[string]uint32 // cache of implicit set key -> set ID
+	nextNATCounterID uint16           // next available NAT rule counter ID (1-based, 0 = no counter)
+	NATCounterIDs   map[string]uint16 // "rulesetName/ruleName" -> counter ID
 }
 
 // Compile translates a typed Config into eBPF map entries.
@@ -36,12 +38,14 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 	}
 
 	result := &CompileResult{
-		ZoneIDs:      make(map[string]uint16),
-		ScreenIDs:    make(map[string]uint16),
-		AddrIDs:      make(map[string]uint32),
-		AppIDs:       make(map[string]uint32),
-		PoolIDs:      make(map[string]uint8),
-		implicitSets: make(map[string]uint32),
+		ZoneIDs:          make(map[string]uint16),
+		ScreenIDs:        make(map[string]uint16),
+		AddrIDs:          make(map[string]uint32),
+		AppIDs:           make(map[string]uint32),
+		PoolIDs:          make(map[string]uint8),
+		implicitSets:     make(map[string]uint32),
+		nextNATCounterID: 1, // 0 = no counter
+		NATCounterIDs:    make(map[string]uint16),
 	}
 
 	// Phase 1: Assign zone IDs (1-based; 0 = unassigned)
@@ -940,12 +944,19 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 
 			zp := zonePairIdx{fromZone, toZone}
 
+			// Assign NAT rule counter ID
+			ruleKey := rs.Name + "/" + rule.Name
+			counterID := result.nextNATCounterID
+			result.NATCounterIDs[ruleKey] = counterID
+			result.nextNATCounterID++
+
 			// Write SNAT rule (v4)
 			if len(v4IPs) > 0 {
 				val := SNATValue{
 					Mode:      curPoolID,
 					SrcAddrID: srcAddrID,
 					DstAddrID: dstAddrID,
+					CounterID: counterID,
 				}
 				ri := v4RuleIdx[zp]
 				if err := m.SetSNATRule(fromZone, toZone, ri, val); err != nil {
@@ -957,6 +968,7 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 					"rule-set", rs.Name, "rule", rule.Name,
 					"from", rs.FromZone, "to", rs.ToZone,
 					"pool_id", curPoolID, "rule_idx", ri,
+					"counter_id", counterID,
 					"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
 					"v4_ips", len(v4IPs),
 					"ports", fmt.Sprintf("%d-%d", poolCfg.PortLow, poolCfg.PortHigh))
@@ -968,6 +980,7 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 					Mode:      curPoolID,
 					SrcAddrID: srcAddrID,
 					DstAddrID: dstAddrID,
+					CounterID: counterID,
 				}
 				ri := v6RuleIdx[zp]
 				if err := m.SetSNATRuleV6(fromZone, toZone, ri, val); err != nil {
@@ -979,6 +992,7 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 					"rule-set", rs.Name, "rule", rule.Name,
 					"from", rs.FromZone, "to", rs.ToZone,
 					"pool_id", curPoolID, "rule_idx", ri,
+					"counter_id", counterID,
 					"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
 					"v6_ips", len(v6IPs))
 			}

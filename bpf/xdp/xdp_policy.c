@@ -741,6 +741,17 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					}
 
 					if (sv) {
+						/* Increment NAT rule counter */
+						if (sv->counter_id > 0) {
+							__u32 cid = sv->counter_id;
+							struct counter_value *ncnt =
+								bpf_map_lookup_elem(
+								&nat_rule_counters, &cid);
+							if (ncnt) {
+								ncnt->packets++;
+								ncnt->bytes += meta->pkt_len;
+							}
+						}
 						/*
 						 * NAT port collision retry: try dnat_table
 						 * insertion first, retry with new allocation
@@ -947,6 +958,17 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					}
 
 					if (sv6) {
+						/* Increment NAT rule counter */
+						if (sv6->counter_id > 0) {
+							__u32 cid = sv6->counter_id;
+							struct counter_value *ncnt =
+								bpf_map_lookup_elem(
+								&nat_rule_counters, &cid);
+							if (ncnt) {
+								ncnt->packets++;
+								ncnt->bytes += meta->pkt_len;
+							}
+						}
 						/*
 						 * NAT port collision retry with
 						 * dnat_table_v6 insertion.
