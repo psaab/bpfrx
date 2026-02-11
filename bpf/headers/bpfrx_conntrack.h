@@ -52,6 +52,13 @@ struct session_value {
 	__u8  alg_type;    /* 0=none, 1=FTP, 2=SIP, 3=DNS */
 	__u8  log_flags;
 	__u8  pad[2];
+
+	/* Cached FIB result (set by xdp_zone, 0 = not cached) */
+	__u32 fib_ifindex;
+	__u16 fib_vlan_id;
+	__u8  fib_dmac[6];
+	__u8  fib_smac[6];
+	__u8  pad_fib[2];
 };
 
 /* IPv6 session key -- 5-tuple with 128-bit addresses. */
@@ -103,6 +110,13 @@ struct session_value_v6 {
 	__u8  alg_type;    /* 0=none, 1=FTP, 2=SIP, 3=DNS */
 	__u8  log_flags;
 	__u8  pad[2];
+
+	/* Cached FIB result (set by xdp_zone, 0 = not cached) */
+	__u32 fib_ifindex;
+	__u16 fib_vlan_id;
+	__u8  fib_dmac[6];
+	__u8  fib_smac[6];
+	__u8  pad_fib[2];
 };
 
 /* TCP state machine transition. Returns new state. */

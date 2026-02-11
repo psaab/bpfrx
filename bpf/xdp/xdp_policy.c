@@ -102,48 +102,67 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 
 	__u32 timeout = ct_get_timeout(meta->protocol, initial_state);
 
-	struct session_value fwd_val = {};
-	fwd_val.state        = initial_state;
-	fwd_val.flags        = nat_flags;
-	fwd_val.is_reverse   = 0;
-	fwd_val.created      = now;
-	fwd_val.last_seen    = now;
-	fwd_val.timeout      = timeout;
-	fwd_val.policy_id    = policy_id;
-	fwd_val.ingress_zone = meta->ingress_zone;
-	fwd_val.egress_zone  = meta->egress_zone;
-	fwd_val.fwd_packets  = 1;
-	fwd_val.fwd_bytes    = meta->pkt_len;
-	fwd_val.log_flags    = log;
-	fwd_val.reverse_key  = rev_key;
-	fwd_val.nat_src_ip   = nat_src_ip;
-	fwd_val.nat_src_port = nat_src_port;
-	fwd_val.nat_dst_ip   = nat_dst_ip;
-	fwd_val.nat_dst_port = nat_dst_port;
+	/* Use per-CPU scratch map to avoid stack overflow */
+	__u32 idx0 = 0;
+	struct session_value *fwd_val = bpf_map_lookup_elem(
+		&session_v4_scratch, &idx0);
+	if (!fwd_val)
+		return -1;
 
-	int ret = bpf_map_update_elem(&sessions, &fwd_key, &fwd_val,
+	__builtin_memset(fwd_val, 0, sizeof(*fwd_val));
+	fwd_val->state        = initial_state;
+	fwd_val->flags        = nat_flags;
+	fwd_val->is_reverse   = 0;
+	fwd_val->created      = now;
+	fwd_val->last_seen    = now;
+	fwd_val->timeout      = timeout;
+	fwd_val->policy_id    = policy_id;
+	fwd_val->ingress_zone = meta->ingress_zone;
+	fwd_val->egress_zone  = meta->egress_zone;
+	fwd_val->fwd_packets  = 1;
+	fwd_val->fwd_bytes    = meta->pkt_len;
+	fwd_val->log_flags    = log;
+	fwd_val->reverse_key  = rev_key;
+	fwd_val->nat_src_ip   = nat_src_ip;
+	fwd_val->nat_src_port = nat_src_port;
+	fwd_val->nat_dst_ip   = nat_dst_ip;
+	fwd_val->nat_dst_port = nat_dst_port;
+	fwd_val->fib_ifindex  = meta->fwd_ifindex;
+	fwd_val->fib_vlan_id  = meta->egress_vlan_id;
+	__builtin_memcpy(fwd_val->fib_dmac, meta->fwd_dmac, 6);
+	__builtin_memcpy(fwd_val->fib_smac, meta->fwd_smac, 6);
+
+	int ret = bpf_map_update_elem(&sessions, &fwd_key, fwd_val,
 				      BPF_NOEXIST);
 	if (ret < 0)
 		return -1;
 
-	struct session_value rev_val = {};
-	rev_val.state        = initial_state;
-	rev_val.flags        = nat_flags;
-	rev_val.is_reverse   = 1;
-	rev_val.created      = now;
-	rev_val.last_seen    = now;
-	rev_val.timeout      = timeout;
-	rev_val.policy_id    = policy_id;
-	rev_val.ingress_zone = meta->egress_zone;
-	rev_val.egress_zone  = meta->ingress_zone;
-	rev_val.log_flags    = log;
-	rev_val.reverse_key  = fwd_key;
-	rev_val.nat_src_ip   = nat_src_ip;
-	rev_val.nat_src_port = nat_src_port;
-	rev_val.nat_dst_ip   = nat_dst_ip;
-	rev_val.nat_dst_port = nat_dst_port;
+	__u32 idx1 = 1;
+	struct session_value *rev_val = bpf_map_lookup_elem(
+		&session_v4_scratch, &idx1);
+	if (!rev_val) {
+		bpf_map_delete_elem(&sessions, &fwd_key);
+		return -1;
+	}
 
-	ret = bpf_map_update_elem(&sessions, &rev_key, &rev_val,
+	__builtin_memset(rev_val, 0, sizeof(*rev_val));
+	rev_val->state        = initial_state;
+	rev_val->flags        = nat_flags;
+	rev_val->is_reverse   = 1;
+	rev_val->created      = now;
+	rev_val->last_seen    = now;
+	rev_val->timeout      = timeout;
+	rev_val->policy_id    = policy_id;
+	rev_val->ingress_zone = meta->egress_zone;
+	rev_val->egress_zone  = meta->ingress_zone;
+	rev_val->log_flags    = log;
+	rev_val->reverse_key  = fwd_key;
+	rev_val->nat_src_ip   = nat_src_ip;
+	rev_val->nat_src_port = nat_src_port;
+	rev_val->nat_dst_ip   = nat_dst_ip;
+	rev_val->nat_dst_port = nat_dst_port;
+
+	ret = bpf_map_update_elem(&sessions, &rev_key, rev_val,
 				  BPF_NOEXIST);
 	if (ret < 0) {
 		bpf_map_delete_elem(&sessions, &fwd_key);
@@ -210,6 +229,10 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 		__builtin_memcpy(fwd_val->nat_src_ip, nat_src_ip, 16);
 	if (nat_dst_ip)
 		__builtin_memcpy(fwd_val->nat_dst_ip, nat_dst_ip, 16);
+	fwd_val->fib_ifindex  = meta->fwd_ifindex;
+	fwd_val->fib_vlan_id  = meta->egress_vlan_id;
+	__builtin_memcpy(fwd_val->fib_dmac, meta->fwd_dmac, 6);
+	__builtin_memcpy(fwd_val->fib_smac, meta->fwd_smac, 6);
 
 	int ret = bpf_map_update_elem(&sessions_v6, &fwd_key, fwd_val,
 				      BPF_NOEXIST);

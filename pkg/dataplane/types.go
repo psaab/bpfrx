@@ -43,7 +43,12 @@ type SessionValue struct {
 	ALGType  uint8
 	LogFlags uint8
 	Pad1     [2]byte
-	Pad2     [4]byte // trailing padding
+
+	FibIfindex uint32
+	FibVlanID  uint16
+	FibDmac    [6]byte
+	FibSmac    [6]byte
+	PadFib     [2]byte
 }
 
 // SessionKeyV6 mirrors the C struct session_key_v6 (5-tuple with 128-bit IPs).
@@ -87,7 +92,12 @@ type SessionValueV6 struct {
 	ALGType  uint8
 	LogFlags uint8
 	Pad1     [2]byte
-	Pad2     [4]byte // trailing padding for 8-byte struct alignment
+
+	FibIfindex uint32
+	FibVlanID  uint16
+	FibDmac    [6]byte
+	FibSmac    [6]byte
+	PadFib     [2]byte
 }
 
 // ZoneConfig mirrors the C struct zone_config.

@@ -332,7 +332,11 @@ type bpfrxTcScreenEgressSessionValue struct {
 	AlgType     uint8
 	LogFlags    uint8
 	Pad         [2]uint8
-	_           [4]byte
+	FibIfindex  uint32
+	FibVlanId   uint16
+	FibDmac     [6]uint8
+	FibSmac     [6]uint8
+	PadFib      [2]uint8
 }
 
 type bpfrxTcScreenEgressSessionValueV6 struct {
@@ -360,7 +364,11 @@ type bpfrxTcScreenEgressSessionValueV6 struct {
 	AlgType     uint8
 	LogFlags    uint8
 	Pad         [2]uint8
-	_           [4]byte
+	FibIfindex  uint32
+	FibVlanId   uint16
+	FibDmac     [6]uint8
+	FibSmac     [6]uint8
+	PadFib      [2]uint8
 }
 
 type bpfrxTcScreenEgressSnatKey struct {
@@ -504,6 +512,7 @@ type bpfrxTcScreenEgressMapSpecs struct {
 	PolicyCounters    *ebpf.MapSpec `ebpf:"policy_counters"`
 	PolicyRules       *ebpf.MapSpec `ebpf:"policy_rules"`
 	ScreenConfigs     *ebpf.MapSpec `ebpf:"screen_configs"`
+	SessionV4Scratch  *ebpf.MapSpec `ebpf:"session_v4_scratch"`
 	SessionV6Scratch  *ebpf.MapSpec `ebpf:"session_v6_scratch"`
 	Sessions          *ebpf.MapSpec `ebpf:"sessions"`
 	SessionsV6        *ebpf.MapSpec `ebpf:"sessions_v6"`
@@ -571,6 +580,7 @@ type bpfrxTcScreenEgressMaps struct {
 	PolicyCounters    *ebpf.Map `ebpf:"policy_counters"`
 	PolicyRules       *ebpf.Map `ebpf:"policy_rules"`
 	ScreenConfigs     *ebpf.Map `ebpf:"screen_configs"`
+	SessionV4Scratch  *ebpf.Map `ebpf:"session_v4_scratch"`
 	SessionV6Scratch  *ebpf.Map `ebpf:"session_v6_scratch"`
 	Sessions          *ebpf.Map `ebpf:"sessions"`
 	SessionsV6        *ebpf.Map `ebpf:"sessions_v6"`
@@ -614,6 +624,7 @@ func (m *bpfrxTcScreenEgressMaps) Close() error {
 		m.PolicyCounters,
 		m.PolicyRules,
 		m.ScreenConfigs,
+		m.SessionV4Scratch,
 		m.SessionV6Scratch,
 		m.Sessions,
 		m.SessionsV6,

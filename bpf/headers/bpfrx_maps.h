@@ -34,9 +34,16 @@ struct {
 } pkt_meta_scratch SEC(".maps");
 
 /* ============================================================
- * Per-CPU scratch space for session_value_v6 staging
+ * Per-CPU scratch space for session value staging
  * (avoids 512-byte BPF stack limit in xdp_policy)
  * ============================================================ */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 2); /* index 0: fwd_val, index 1: rev_val */
+	__type(key, __u32);
+	__type(value, struct session_value);
+} session_v4_scratch SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
