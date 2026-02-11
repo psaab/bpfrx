@@ -69,6 +69,12 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 
 	switch (sess->state) {
 	case SESS_STATE_CLOSED:
+		/* Forward the RST that closed the session so the peer
+		 * receives it.  Drop any subsequent non-RST packets. */
+		if (meta->tcp_flags & 0x04) {
+			bpf_tail_call(ctx, &xdp_progs, next_prog);
+			return XDP_PASS;
+		}
 		if (sess->log_flags & LOG_FLAG_SESSION_CLOSE)
 			emit_event(meta, EVENT_TYPE_SESSION_CLOSE, ACTION_DENY,
 				   sess->fwd_packets + sess->rev_packets,
@@ -141,6 +147,12 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 
 	switch (sess->state) {
 	case SESS_STATE_CLOSED:
+		/* Forward the RST that closed the session so the peer
+		 * receives it.  Drop any subsequent non-RST packets. */
+		if (meta->tcp_flags & 0x04) {
+			bpf_tail_call(ctx, &xdp_progs, next_prog);
+			return XDP_PASS;
+		}
 		if (sess->log_flags & LOG_FLAG_SESSION_CLOSE)
 			emit_event(meta, EVENT_TYPE_SESSION_CLOSE, ACTION_DENY,
 				   sess->fwd_packets + sess->rev_packets,
