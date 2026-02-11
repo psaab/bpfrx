@@ -144,25 +144,41 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 
 	if len(result.pendingXDP) > 0 {
 		rcMap := m.maps["redirect_capable"]
+
+		// Try native XDP on all interfaces first. If any interface lacks
+		// native support, ALL must use generic mode because bpf_redirect_map
+		// from native XDP cannot target non-ndo_xdp_xmit interfaces.
+		needGeneric := false
 		for _, ifidx := range result.pendingXDP {
 			if err := m.AttachXDP(ifidx, false); err != nil {
 				if strings.Contains(err.Error(), "already attached") {
 					continue
 				}
-				slog.Info("native XDP not supported, using generic mode",
+				slog.Info("native XDP not supported, falling back ALL to generic",
 					"ifindex", ifidx, "err", err)
+				needGeneric = true
+				break
+			}
+		}
+
+		if needGeneric {
+			// Detach any native links we just created, then attach all as generic.
+			for _, ifidx := range result.pendingXDP {
+				m.DetachXDP(ifidx)
+			}
+			for _, ifidx := range result.pendingXDP {
 				if err := m.AttachXDP(ifidx, true); err != nil {
 					if !strings.Contains(err.Error(), "already attached") {
 						return nil, fmt.Errorf("attach XDP generic to ifindex %d: %w", ifidx, err)
 					}
 				}
-				if rcMap != nil {
-					rcMap.Update(uint32(ifidx), uint8(0), ebpf.UpdateAny)
-				}
-			} else {
-				if rcMap != nil {
-					rcMap.Update(uint32(ifidx), uint8(1), ebpf.UpdateAny)
-				}
+			}
+		}
+
+		// All interfaces use the same mode — redirect works between all of them.
+		if rcMap != nil {
+			for _, ifidx := range result.pendingXDP {
+				rcMap.Update(uint32(ifidx), uint8(1), ebpf.UpdateAny)
 			}
 		}
 	}
