@@ -14,7 +14,7 @@
  */
 
 /* Toggle tracing: set to 1 to enable, 0 to disable */
-#define BPFRX_TRACE 1
+#define BPFRX_TRACE 0
 
 /* Optional: set to specific protocol number to filter (0 = trace all) */
 #define BPFRX_TRACE_PROTO 6  /* TCP only */
