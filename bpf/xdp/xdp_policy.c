@@ -294,7 +294,11 @@ nat_pool_alloc_v4(__u8 pool_id, __be32 *out_ip, __be16 *out_port)
 	if (!ctr)
 		return -1;
 
-	__u64 val = ctr->counter++;
+	/* CPU-interleaved counter: each CPU gets distinct port sequence.
+	 * CPU 0: 0,16,32..., CPU 1: 1,17,33..., etc.
+	 * Avoids cross-CPU collisions on PERCPU counters. */
+	__u32 cpu = bpf_get_smp_processor_id() & 0xF;
+	__u64 val = ctr->counter++ * 16 + cpu;
 	__u32 port_range = cfg->port_high - cfg->port_low + 1;
 	if (port_range == 0)
 		port_range = 1;
@@ -329,7 +333,9 @@ nat_pool_alloc_v6(__u8 pool_id, __u8 *out_ip, __be16 *out_port)
 	if (!ctr)
 		return -1;
 
-	__u64 val = ctr->counter++;
+	/* CPU-interleaved counter (same as v4 above) */
+	__u32 cpu = bpf_get_smp_processor_id() & 0xF;
+	__u64 val = ctr->counter++ * 16 + cpu;
 	__u32 port_range = cfg->port_high - cfg->port_low + 1;
 	if (port_range == 0)
 		port_range = 1;

@@ -188,8 +188,14 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	 * Fast-path: check session FIB cache to skip bpf_fib_lookup().
 	 * For established sessions the egress interface + next-hop MAC
 	 * are stable; caching them saves ~7% CPU.
+	 *
+	 * Skip for TCP SYN (new connections) — no session exists yet,
+	 * so the lookups would always miss (saves 4 hash lookups).
 	 */
-	if (meta->addr_family == AF_INET) {
+	int is_tcp_syn = (meta->protocol == PROTO_TCP &&
+			  (meta->tcp_flags & 0x12) == 0x02);
+
+	if (!is_tcp_syn && meta->addr_family == AF_INET) {
 		struct session_key sk = {};
 		sk.src_ip   = meta->src_ip.v4;
 		sk.dst_ip   = meta->dst_ip.v4;
@@ -212,7 +218,7 @@ int xdp_zone_prog(struct xdp_md *ctx)
 			bpf_tail_call(ctx, &xdp_progs, XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
-	} else {
+	} else if (!is_tcp_syn) {
 		struct session_key_v6 sk6 = {};
 		__builtin_memcpy(sk6.src_ip, meta->src_ip.v6, 16);
 		__builtin_memcpy(sk6.dst_ip, meta->dst_ip.v6, 16);
@@ -285,8 +291,9 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		if (ez)
 			meta->egress_zone = *ez;
 
-		/* Populate session FIB cache for future packets */
-		if (meta->addr_family == AF_INET) {
+		/* Populate session FIB cache for future packets.
+		 * Skip for TCP SYN — session doesn't exist yet. */
+		if (!is_tcp_syn && meta->addr_family == AF_INET) {
 			struct session_key ck = {};
 			ck.src_ip   = meta->src_ip.v4;
 			ck.dst_ip   = meta->dst_ip.v4;
@@ -306,7 +313,7 @@ int xdp_zone_prog(struct xdp_md *ctx)
 				__builtin_memcpy(csv->fib_dmac, meta->fwd_dmac, 6);
 				__builtin_memcpy(csv->fib_smac, meta->fwd_smac, 6);
 			}
-		} else {
+		} else if (!is_tcp_syn) {
 			struct session_key_v6 ck6 = {};
 			__builtin_memcpy(ck6.src_ip, meta->src_ip.v6, 16);
 			__builtin_memcpy(ck6.dst_ip, meta->dst_ip.v6, 16);
