@@ -262,21 +262,21 @@ done:
  * CHECKSUM_PARTIAL handling for XDP + TC paths.
  *
  * Virtio NICs deliver TCP/UDP packets with CHECKSUM_PARTIAL: the
- * L4 checksum field contains csum_fold(pseudo-header) = ~fold(PH),
- * and the NIC (or skb_checksum_help) finalizes by summing the
- * actual L4 data bytes.
+ * L4 checksum field contains fold(PH) — a non-complemented
+ * pseudo-header checksum seed.  The NIC (or skb_checksum_help)
+ * finalizes by summing the actual L4 data bytes.
  *
  * Detection: parse_l4hdr computes the pseudo-header checksum from
- * the IP header (with ones-complement, matching csum_fold output)
- * and compares it with the L4 checksum field. A match means the
- * checksum field is only a pseudo-header seed.
+ * the IP header and compares it with the L4 checksum field.
+ * A match means the checksum field is only a pseudo-header seed.
  *
  * Generic XDP path: XDP_REDIRECT goes through dev_queue_xmit ->
  * validate_xmit_skb which DOES finalize the checksum.  We must
  * skip incremental updates for non-pseudo-header fields (ports,
  * MSS options) to keep the PH seed intact for kernel finalization.
  * IP address updates still apply since they change pseudo-header
- * fields and the incremental update is correct.
+ * fields, but must use csum_update_partial_4 (not csum_update_4)
+ * because the seed is non-complemented: PH' = fold(PH + ~old + new).
  *
  * Native XDP path: XDP_REDIRECT uses __dev_direct_xmit which
  * bypasses finalization.  For native XDP, finalize_csum_partial()
@@ -511,6 +511,7 @@ parse_l4hdr(void *data, void *data_end, struct pkt_meta *meta)
 
 /*
  * Incremental checksum update (RFC 1624) for a 4-byte field change.
+ * For standard (complemented) checksums where field = ~fold(sum).
  */
 static __always_inline void
 csum_update_4(__sum16 *csum, __be32 old_val, __be32 new_val)
@@ -525,6 +526,29 @@ csum_update_4(__sum16 *csum, __be32 old_val, __be32 new_val)
 	sum = (sum & 0xFFFF) + (sum >> 16);
 	sum = (sum & 0xFFFF) + (sum >> 16);
 	*csum = bpf_htons(~sum & 0xFFFF);
+}
+
+/*
+ * Incremental pseudo-header seed update for CHECKSUM_PARTIAL packets.
+ *
+ * CHECKSUM_PARTIAL L4 field contains fold(PH) — a non-complemented
+ * pseudo-header checksum.  The standard RFC 1624 formula (csum_update_4)
+ * complements input and output, which is wrong for this representation.
+ * Correct formula: PH' = fold(PH + ~old + new).
+ */
+static __always_inline void
+csum_update_partial_4(__sum16 *csum, __be32 old_val, __be32 new_val)
+{
+	__u32 sum;
+
+	sum = ((__u32)bpf_ntohs(*csum)) & 0xFFFF;
+	sum += ~bpf_ntohl(old_val) & 0xFFFF;
+	sum += ~(bpf_ntohl(old_val) >> 16) & 0xFFFF;
+	sum += bpf_ntohl(new_val) & 0xFFFF;
+	sum += (bpf_ntohl(new_val) >> 16) & 0xFFFF;
+	sum = (sum & 0xFFFF) + (sum >> 16);
+	sum = (sum & 0xFFFF) + (sum >> 16);
+	*csum = bpf_htons(sum & 0xFFFF);
 }
 
 /*
@@ -558,6 +582,24 @@ csum_update_16(__sum16 *csum, const __u8 *old_addr, const __u8 *new_addr)
 		__builtin_memcpy(&new_word, new_addr + i * 4, 4);
 		if (old_word != new_word)
 			csum_update_4(csum, old_word, new_word);
+	}
+}
+
+/*
+ * Incremental pseudo-header seed update for a 128-bit (IPv6) address
+ * change on CHECKSUM_PARTIAL packets.
+ */
+static __always_inline void
+csum_update_partial_16(__sum16 *csum, const __u8 *old_addr,
+		       const __u8 *new_addr)
+{
+	#pragma unroll
+	for (int i = 0; i < 4; i++) {
+		__be32 old_word, new_word;
+		__builtin_memcpy(&old_word, old_addr + i * 4, 4);
+		__builtin_memcpy(&new_word, new_addr + i * 4, 4);
+		if (old_word != new_word)
+			csum_update_partial_4(csum, old_word, new_word);
 	}
 }
 

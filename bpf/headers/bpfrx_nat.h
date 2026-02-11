@@ -14,6 +14,7 @@
 
 /*
  * Update L4 (TCP/UDP) checksum for a 4-byte pseudo-header field change.
+ * For CHECKSUM_PARTIAL packets, uses the non-complemented seed update.
  * l4 must be pre-validated by caller.
  */
 static __always_inline void
@@ -24,18 +25,26 @@ nat_update_l4_csum(void *l4, void *data_end, struct pkt_meta *meta,
 		struct tcphdr *tcp = l4;
 		if ((void *)(tcp + 1) > data_end)
 			return;
-		csum_update_4(&tcp->check, old_ip, new_ip);
+		if (meta->csum_partial)
+			csum_update_partial_4(&tcp->check, old_ip, new_ip);
+		else
+			csum_update_4(&tcp->check, old_ip, new_ip);
 	} else if (meta->protocol == PROTO_UDP) {
 		struct udphdr *udp = l4;
 		if ((void *)(udp + 1) > data_end)
 			return;
-		if (udp->check != 0)
-			csum_update_4(&udp->check, old_ip, new_ip);
+		if (udp->check != 0) {
+			if (meta->csum_partial)
+				csum_update_partial_4(&udp->check, old_ip, new_ip);
+			else
+				csum_update_4(&udp->check, old_ip, new_ip);
+		}
 	}
 }
 
 /*
  * Update L4 checksum for a 128-bit IPv6 address change.
+ * For CHECKSUM_PARTIAL packets, uses the non-complemented seed update.
  * l4 must be pre-validated by caller.
  */
 static __always_inline void
@@ -46,19 +55,28 @@ nat_update_l4_csum_v6(void *l4, void *data_end, struct pkt_meta *meta,
 		struct tcphdr *tcp = l4;
 		if ((void *)(tcp + 1) > data_end)
 			return;
-		csum_update_16(&tcp->check, old_addr, new_addr);
+		if (meta->csum_partial)
+			csum_update_partial_16(&tcp->check, old_addr, new_addr);
+		else
+			csum_update_16(&tcp->check, old_addr, new_addr);
 	} else if (meta->protocol == PROTO_UDP) {
 		struct udphdr *udp = l4;
 		if ((void *)(udp + 1) > data_end)
 			return;
 		/* IPv6 UDP checksum is mandatory -- always update */
-		csum_update_16(&udp->check, old_addr, new_addr);
+		if (meta->csum_partial)
+			csum_update_partial_16(&udp->check, old_addr, new_addr);
+		else
+			csum_update_16(&udp->check, old_addr, new_addr);
 	} else if (meta->protocol == PROTO_ICMPV6) {
 		/* ICMPv6 checksum covers pseudo-header with addresses */
 		struct icmp6hdr *icmp6 = l4;
 		if ((void *)(icmp6 + 1) > data_end)
 			return;
-		csum_update_16(&icmp6->icmp6_cksum, old_addr, new_addr);
+		if (meta->csum_partial)
+			csum_update_partial_16(&icmp6->icmp6_cksum, old_addr, new_addr);
+		else
+			csum_update_16(&icmp6->icmp6_cksum, old_addr, new_addr);
 	}
 }
 

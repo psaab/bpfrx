@@ -44,19 +44,13 @@ int xdp_nat_prog(struct xdp_md *ctx)
 	/*
 	 * CHECKSUM_PARTIAL handling:
 	 *
-	 * Generic XDP: kernel finalizes L4 checksum after XDP via
-	 * validate_xmit_skb → skb_checksum_help.  We just skip
-	 * incremental updates for non-pseudo-header fields (ports)
-	 * when csum_partial=1, keeping the PH seed intact.
+	 * For CHECKSUM_PARTIAL packets, tcp->check contains the
+	 * pseudo-header seed: fold(PH).  NAT rewrite updates this
+	 * seed for IP changes (pseudo-header fields) but skips port
+	 * changes (L4 data that the NIC/kernel will finalize).
 	 *
-	 * Native XDP: XDP_REDIRECT bypasses kernel finalization.
-	 * finalize_csum_partial() computes the full checksum from
-	 * packet data, then clears csum_partial so nat_rewrite
-	 * does normal incremental updates.  Currently all our
-	 * target NICs use generic XDP, so finalization is disabled.
-	 *
-	 * To enable for native XDP, uncomment:
-	 *   finalize_csum_partial(data, data_end, meta);
+	 * generic_xdp_tx (devmap redirect) bypasses validate_xmit_skb,
+	 * so the NIC must finalize via HW TX checksum offload.
 	 */
 
 	TRACE_NAT_REWRITE(meta, "xdp-pre");

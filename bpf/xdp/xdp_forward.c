@@ -110,6 +110,22 @@ int xdp_forward_prog(struct xdp_md *ctx)
 
 	TRACE_FORWARD(meta);
 
+#if BPFRX_TRACE
+	/* Debug: trace actual packet checksums before redirect */
+	if (meta->addr_family == AF_INET && meta->protocol == PROTO_TCP) {
+		__u16 l4_off = l3_off + sizeof(struct iphdr);
+		if (l4_off < 128) {
+			struct tcphdr *_tcp = data + l4_off;
+			struct iphdr *_iph = data + l3_off;
+			if ((void *)(_tcp + 1) <= data_end &&
+			    (void *)(_iph + 1) <= data_end)
+				bpf_printk("TRACE fwd_csum: tcp=%04x ip=%04x saddr=%x daddr=%x",
+					   (__u16)_tcp->check, (__u16)_iph->check,
+					   _iph->saddr, _iph->daddr);
+		}
+	}
+#endif
+
 	/* Redirect via devmap to egress interface */
 	return bpf_redirect_map(&tx_ports, meta->fwd_ifindex, 0);
 }
