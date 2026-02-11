@@ -53,6 +53,7 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["vlan_iface_map"] = mainObjs.VlanIfaceMap
 	m.maps["nat64_configs"] = mainObjs.Nat64Configs
 	m.maps["nat64_count"] = mainObjs.Nat64Count
+	m.maps["nat64_prefix_map"] = mainObjs.Nat64PrefixMap
 	m.maps["nat64_state"] = mainObjs.Nat64State
 	m.maps["iface_filter_map"] = mainObjs.IfaceFilterMap
 	m.maps["filter_configs"] = mainObjs.FilterConfigs
@@ -97,6 +98,7 @@ func (m *Manager) loadAllObjects() error {
 			"vlan_iface_map":     mainObjs.VlanIfaceMap,
 			"nat64_configs":      mainObjs.Nat64Configs,
 			"nat64_count":        mainObjs.Nat64Count,
+			"nat64_prefix_map":   mainObjs.Nat64PrefixMap,
 			"nat64_state":        mainObjs.Nat64State,
 			"iface_filter_map":   mainObjs.IfaceFilterMap,
 			"filter_configs":     mainObjs.FilterConfigs,

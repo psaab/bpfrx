@@ -170,6 +170,11 @@ type bpfrxTcScreenEgressNat64Config struct {
 	Pad        [3]uint8
 }
 
+type bpfrxTcScreenEgressNat64PrefixKey struct {
+	_      structs.HostLayout
+	Prefix [3]uint32
+}
+
 type bpfrxTcScreenEgressNat64StateKey struct {
 	_        structs.HostLayout
 	SrcIp    uint32
@@ -492,6 +497,7 @@ type bpfrxTcScreenEgressMapSpecs struct {
 	InterfaceCounters *ebpf.MapSpec `ebpf:"interface_counters"`
 	Nat64Configs      *ebpf.MapSpec `ebpf:"nat64_configs"`
 	Nat64Count        *ebpf.MapSpec `ebpf:"nat64_count"`
+	Nat64PrefixMap    *ebpf.MapSpec `ebpf:"nat64_prefix_map"`
 	Nat64State        *ebpf.MapSpec `ebpf:"nat64_state"`
 	PktMetaScratch    *ebpf.MapSpec `ebpf:"pkt_meta_scratch"`
 	PolicyCounters    *ebpf.MapSpec `ebpf:"policy_counters"`
@@ -558,6 +564,7 @@ type bpfrxTcScreenEgressMaps struct {
 	InterfaceCounters *ebpf.Map `ebpf:"interface_counters"`
 	Nat64Configs      *ebpf.Map `ebpf:"nat64_configs"`
 	Nat64Count        *ebpf.Map `ebpf:"nat64_count"`
+	Nat64PrefixMap    *ebpf.Map `ebpf:"nat64_prefix_map"`
 	Nat64State        *ebpf.Map `ebpf:"nat64_state"`
 	PktMetaScratch    *ebpf.Map `ebpf:"pkt_meta_scratch"`
 	PolicyCounters    *ebpf.Map `ebpf:"policy_counters"`
@@ -600,6 +607,7 @@ func (m *bpfrxTcScreenEgressMaps) Close() error {
 		m.InterfaceCounters,
 		m.Nat64Configs,
 		m.Nat64Count,
+		m.Nat64PrefixMap,
 		m.Nat64State,
 		m.PktMetaScratch,
 		m.PolicyCounters,

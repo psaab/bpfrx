@@ -743,14 +743,11 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					if (sv) {
 						/* Increment NAT rule counter */
 						if (sv->counter_id > 0) {
-							__u32 cid = sv->counter_id;
-							struct counter_value *ncnt =
+							__u32 _cid = sv->counter_id;
+							struct counter_value *_c =
 								bpf_map_lookup_elem(
-								&nat_rule_counters, &cid);
-							if (ncnt) {
-								ncnt->packets++;
-								ncnt->bytes += meta->pkt_len;
-							}
+								&nat_rule_counters, &_cid);
+							if (_c) { _c->packets++; _c->bytes += meta->pkt_len; }
 						}
 						/*
 						 * NAT port collision retry: try dnat_table
@@ -848,32 +845,18 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				 * meta->nat_flags has SESS_FLAG_NAT64 set by xdp_zone.
 				 */
 				if (meta->nat_flags & SESS_FLAG_NAT64) {
-					/* Find the matching NAT64 config to get pool ID */
-					__u32 n64_zero = 0;
-					__u32 *n64_cnt = bpf_map_lookup_elem(&nat64_count, &n64_zero);
+					/* O(1) hash lookup for NAT64 pool ID.
+					 * Use dst_ip.v6 directly as key (first 12 bytes
+					 * match nat64_prefix_key layout) to save stack. */
+					struct nat64_config *n64 =
+						bpf_map_lookup_elem(
+						&nat64_prefix_map,
+						meta->dst_ip.v6);
 					__u8 pool_id = 0;
-					int found_pool = 0;
-					if (n64_cnt && *n64_cnt > 0) {
-						__u32 cnt = *n64_cnt;
-						if (cnt > MAX_NAT64_PREFIXES)
-							cnt = MAX_NAT64_PREFIXES;
-						__be32 *dst32 = (__be32 *)meta->dst_ip.v6;
-						#pragma unroll
-						for (__u32 ni = 0; ni < MAX_NAT64_PREFIXES; ni++) {
-							if (ni >= cnt) break;
-							struct nat64_config *n64 = bpf_map_lookup_elem(&nat64_configs, &ni);
-							if (!n64) break;
-							if (dst32[0] == n64->prefix[0] &&
-							    dst32[1] == n64->prefix[1] &&
-							    dst32[2] == n64->prefix[2]) {
-								pool_id = n64->snat_pool_id;
-								found_pool = 1;
-								break;
-							}
-						}
-					}
+					if (n64)
+						pool_id = n64->snat_pool_id;
 
-					if (found_pool) {
+					if (n64) {
 						__be32 alloc_v4_ip = 0;
 						__be16 alloc_v4_port = 0;
 						if (nat_pool_alloc_v4(pool_id, &alloc_v4_ip, &alloc_v4_port) == 0) {
@@ -914,12 +897,8 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					return XDP_DROP;
 				}
 
-				/* Save original src IP */
-				__u8 orig_src_ip_save[16];
-				__builtin_memcpy(orig_src_ip_save, meta->src_ip.v6, 16);
-
-				/* Allocated SNAT IP for session + dnat_table */
-				__u8 alloc_ip_v6[16] = {};
+				/* Zero meta->nat_src_ip for use as SNAT IP scratch */
+				__builtin_memset(&meta->nat_src_ip, 0, sizeof(meta->nat_src_ip));
 				int have_dynamic_snat = 0;
 
 				/* Static NAT SNAT check (before dynamic SNAT) */
@@ -928,7 +907,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				struct static_nat_value_v6 *sn_src6 = bpf_map_lookup_elem(&static_nat_v6, &snk6);
 				if (sn_src6) {
 					sess_nat_flags |= SESS_FLAG_SNAT | SESS_FLAG_STATIC_NAT;
-					__builtin_memcpy(alloc_ip_v6, sn_src6->ip, 16);
+					__builtin_memcpy(meta->nat_src_ip.v6, sn_src6->ip, 16);
 					sess_nat_src_port = meta->src_port;
 				}
 
@@ -978,19 +957,20 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 						#pragma unroll
 						for (int retry = 0; retry < 3; retry++) {
-							if (nat_pool_alloc_v6(sv6->mode, alloc_ip_v6, &alloc_port) < 0)
+							if (nat_pool_alloc_v6(sv6->mode, meta->nat_src_ip.v6, &alloc_port) < 0)
 								break;
 
 							struct dnat_key_v6 dk6 = {
 								.protocol = meta->protocol,
 								.dst_port = alloc_port,
 							};
-							__builtin_memcpy(dk6.dst_ip, alloc_ip_v6, 16);
+							__builtin_memcpy(dk6.dst_ip, meta->nat_src_ip.v6, 16);
 							struct dnat_value_v6 dv6 = {
 								.new_dst_port = orig_src_port,
 								.flags        = 0,
 							};
-							__builtin_memcpy(dv6.new_dst_ip, orig_src_ip_save, 16);
+							/* meta->src_ip.v6 is still the original (not yet modified) */
+							__builtin_memcpy(dv6.new_dst_ip, meta->src_ip.v6, 16);
 							if (bpf_map_update_elem(&dnat_table_v6, &dk6, &dv6,
 										 BPF_NOEXIST) == 0) {
 								snat_ok = 1;
@@ -1015,8 +995,8 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					sess_nat_dst_port = meta->nat_dst_port;
 				}
 
-				/* Pass NAT IPs through alloc_ip_v6 */
-				const __u8 *nat_src_ptr = (sess_nat_flags & SESS_FLAG_SNAT) ? alloc_ip_v6 : NULL;
+				/* NAT IPs from meta fields (no stack arrays needed) */
+				const __u8 *nat_src_ptr = (sess_nat_flags & SESS_FLAG_SNAT) ? meta->nat_src_ip.v6 : NULL;
 				const __u8 *nat_dst_ptr = (meta->nat_flags & SESS_FLAG_DNAT) ?
 					meta->nat_dst_ip.v6 : NULL;
 
@@ -1031,7 +1011,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 							.protocol = meta->protocol,
 							.dst_port = sess_nat_src_port,
 						};
-						__builtin_memcpy(dk6.dst_ip, alloc_ip_v6, 16);
+						__builtin_memcpy(dk6.dst_ip, meta->nat_src_ip.v6, 16);
 						bpf_map_delete_elem(&dnat_table_v6, &dk6);
 					}
 					inc_counter(GLOBAL_CTR_DROPS);
@@ -1040,7 +1020,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 				/* Set meta for NAT rewrite (AFTER session creation) */
 				if (sess_nat_flags & SESS_FLAG_SNAT) {
-					__builtin_memcpy(meta->src_ip.v6, alloc_ip_v6, 16);
+					__builtin_memcpy(meta->src_ip.v6, meta->nat_src_ip.v6, 16);
 					meta->src_port = sess_nat_src_port;
 				}
 

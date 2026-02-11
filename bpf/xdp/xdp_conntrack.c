@@ -259,6 +259,26 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 			ct_reverse_key_v6(&fwd_key, &rev_key);
 			sess = bpf_map_lookup_elem(&sessions_v6, &rev_key);
 			if (!sess) {
+				/*
+				 * NAT64 prefix check for new IPv6 sessions:
+				 * O(1) hash lookup by /96 prefix.
+				 * Use dst_ip.v6 directly as key (first 12 bytes
+				 * match nat64_prefix_key layout).
+				 */
+				struct nat64_config *n64 =
+					bpf_map_lookup_elem(
+					&nat64_prefix_map,
+					meta->dst_ip.v6);
+				if (n64) {
+					meta->nat_flags |= SESS_FLAG_NAT64;
+					__builtin_memset(
+						&meta->nat_dst_ip, 0,
+						sizeof(meta->nat_dst_ip));
+					__be32 *dst32 =
+						(__be32 *)meta->dst_ip.v6;
+					meta->nat_dst_ip.v4 = dst32[3];
+				}
+
 				meta->ct_state = SESS_STATE_NEW;
 				meta->ct_direction = 0;
 				bpf_tail_call(ctx, &xdp_progs, XDP_PROG_POLICY);

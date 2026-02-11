@@ -675,6 +675,10 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 
 	filterName := req.Filter
 
+	if req.Terse {
+		return s.showInterfacesTerse(cfg, filterName)
+	}
+
 	// Build interface -> zone mapping
 	ifaceZone := make(map[string]*config.ZoneConfig)
 	ifaceZoneName := make(map[string]string)
@@ -914,6 +918,165 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 		}
 
 		fmt.Fprintln(&buf)
+	}
+
+	return &pb.ShowInterfacesDetailResponse{Output: buf.String()}, nil
+}
+
+func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb.ShowInterfacesDetailResponse, error) {
+	// Build zone mapping: interface name -> zone name
+	ifaceZoneName := make(map[string]string)
+	for name, zone := range cfg.Security.Zones {
+		for _, ifName := range zone.Interfaces {
+			ifaceZoneName[ifName] = name
+		}
+	}
+
+	// Collect all configured interfaces with units
+	type ifUnit struct {
+		physName string
+		unitNum  int
+		vlanID   int
+	}
+	var units []ifUnit
+	seen := make(map[string]bool)
+	for physName, ifCfg := range cfg.Interfaces.Interfaces {
+		if filterName != "" && !strings.HasPrefix(physName, filterName) {
+			continue
+		}
+		seen[physName] = true
+		for unitNum, unit := range ifCfg.Units {
+			units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
+		}
+	}
+	// Also include zone-only interfaces not in interfaces config
+	for ifName := range ifaceZoneName {
+		parts := strings.SplitN(ifName, ".", 2)
+		physName := parts[0]
+		if filterName != "" && !strings.HasPrefix(physName, filterName) {
+			continue
+		}
+		if !seen[physName] {
+			seen[physName] = true
+			unitNum := 0
+			if len(parts) == 2 {
+				fmt.Sscanf(parts[1], "%d", &unitNum)
+			}
+			units = append(units, ifUnit{physName: physName, unitNum: unitNum})
+		}
+	}
+
+	// Sort by physical name then unit number
+	sort.Slice(units, func(i, j int) bool {
+		if units[i].physName != units[j].physName {
+			return units[i].physName < units[j].physName
+		}
+		return units[i].unitNum < units[j].unitNum
+	})
+
+	var buf strings.Builder
+	fmt.Fprintf(&buf, "%-24s%-6s%-6s%-9s%-22s\n", "Interface", "Admin", "Link", "Proto", "Local")
+
+	// Track which physical interfaces we've printed
+	printedPhys := make(map[string]bool)
+
+	for _, u := range units {
+		// Print the physical interface line if not printed yet
+		if !printedPhys[u.physName] {
+			printedPhys[u.physName] = true
+			admin := "up"
+			link := "up"
+			iface, err := net.InterfaceByName(u.physName)
+			if err != nil {
+				link = "down"
+			} else {
+				if iface.Flags&net.FlagUp == 0 {
+					admin = "down"
+				}
+				// Read operstate from sysfs
+				data, err := os.ReadFile("/sys/class/net/" + u.physName + "/operstate")
+				if err == nil {
+					state := strings.TrimSpace(string(data))
+					if state != "up" {
+						link = "down"
+					}
+				}
+			}
+			fmt.Fprintf(&buf, "%-24s%-6s%-6s\n", u.physName, admin, link)
+		}
+
+		// Determine the logical interface name
+		logicalName := fmt.Sprintf("%s.%d", u.physName, u.unitNum)
+		lookupName := u.physName
+		if u.vlanID > 0 {
+			lookupName = fmt.Sprintf("%s.%d", u.physName, u.vlanID)
+		}
+
+		// Get addresses for this logical interface
+		var v4Addrs, v6Addrs []string
+		liface, err := net.InterfaceByName(lookupName)
+		if err != nil {
+			// Try the physical interface for unit 0
+			liface, err = net.InterfaceByName(u.physName)
+		}
+		if err == nil {
+			addrs, _ := liface.Addrs()
+			for _, addr := range addrs {
+				ipNet, ok := addr.(*net.IPNet)
+				if !ok {
+					continue
+				}
+				ones, _ := ipNet.Mask.Size()
+				addrStr := fmt.Sprintf("%s/%d", ipNet.IP, ones)
+				if ipNet.IP.To4() != nil {
+					v4Addrs = append(v4Addrs, addrStr)
+				} else {
+					v6Addrs = append(v6Addrs, addrStr)
+				}
+			}
+		}
+
+		admin := "up"
+		link := "up"
+		if liface == nil {
+			link = "down"
+		} else {
+			if liface.Flags&net.FlagUp == 0 {
+				admin = "down"
+			}
+		}
+
+		// Print logical interface with first protocol/address
+		firstProto := ""
+		firstAddr := ""
+		if len(v4Addrs) > 0 {
+			firstProto = "inet"
+			firstAddr = v4Addrs[0]
+		} else if len(v6Addrs) > 0 {
+			firstProto = "inet6"
+			firstAddr = v6Addrs[0]
+		}
+
+		fmt.Fprintf(&buf, "%-24s%-6s%-6s%-9s%-22s\n", logicalName, admin, link, firstProto, firstAddr)
+
+		// Print remaining v4 addresses
+		if len(v4Addrs) > 1 {
+			for _, a := range v4Addrs[1:] {
+				fmt.Fprintf(&buf, "%-36s%-9s%-22s\n", "", "inet", a)
+			}
+		}
+
+		// Print v6 addresses (if v4 was first)
+		startIdx := 0
+		if firstProto == "inet6" {
+			startIdx = 1
+		}
+		if firstProto == "inet" {
+			startIdx = 0
+		}
+		for i := startIdx; i < len(v6Addrs); i++ {
+			fmt.Fprintf(&buf, "%-36s%-9s%-22s\n", "", "inet6", v6Addrs[i])
+		}
 	}
 
 	return &pb.ShowInterfacesDetailResponse{Output: buf.String()}, nil
@@ -1546,7 +1709,7 @@ func ntohs(v uint16) uint16 {
 
 func uint32ToIP(v uint32) net.IP {
 	ip := make(net.IP, 4)
-	binary.BigEndian.PutUint32(ip, v)
+	binary.NativeEndian.PutUint32(ip, v)
 	return ip
 }
 

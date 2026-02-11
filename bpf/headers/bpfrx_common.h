@@ -497,7 +497,12 @@ struct nat_port_counter {
 #define DSCP_AF42 36
 #define DSCP_AF43 38
 
-/* NAT64 prefix config entry: (prefix_hi, prefix_lo) is the /96 prefix,
+/* NAT64 prefix lookup key: first 96 bits of IPv6 destination address. */
+struct nat64_prefix_key {
+	__be32 prefix[3];
+};
+
+/* NAT64 prefix config entry:
  * snat_pool_id points to the IPv4 source pool for translated packets. */
 struct nat64_config {
 	__be32 prefix[3];  /* first 96 bits of NAT64 prefix (3 x 32-bit words) */

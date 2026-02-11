@@ -115,6 +115,7 @@ var operationalTree = map[string]*completionNode{
 			}},
 		}},
 		"interfaces": {desc: "Show interface status", children: map[string]*completionNode{
+			"terse":  {desc: "Show interface summary"},
 			"tunnel": {desc: "Show tunnel interfaces"},
 		}},
 		"protocols": {desc: "Show protocol information", children: map[string]*completionNode{
@@ -2514,6 +2515,11 @@ func (c *CLI) showInterfaces(args []string) error {
 		return c.showTunnelInterfaces()
 	}
 
+	// Handle "show interfaces terse" sub-command
+	if len(args) > 0 && args[0] == "terse" {
+		return c.showInterfacesTerse()
+	}
+
 	cfg := c.store.ActiveConfig()
 	if cfg == nil {
 		fmt.Println("no active configuration")
@@ -2804,6 +2810,120 @@ func (c *CLI) dhcpLease(ifaceName string, af dhcp.AddressFamily) *dhcp.Lease {
 		return nil
 	}
 	return c.dhcp.LeaseFor(ifaceName, af)
+}
+
+func (c *CLI) showInterfacesTerse() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+
+	type ifUnit struct {
+		physName string
+		unitNum  int
+		vlanID   int
+	}
+	var units []ifUnit
+
+	for physName, ifCfg := range cfg.Interfaces.Interfaces {
+		for unitNum, unit := range ifCfg.Units {
+			units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
+		}
+	}
+
+	sort.Slice(units, func(i, j int) bool {
+		if units[i].physName != units[j].physName {
+			return units[i].physName < units[j].physName
+		}
+		return units[i].unitNum < units[j].unitNum
+	})
+
+	fmt.Printf("%-24s%-6s%-6s%-9s%-22s\n", "Interface", "Admin", "Link", "Proto", "Local")
+
+	printedPhys := make(map[string]bool)
+
+	for _, u := range units {
+		if !printedPhys[u.physName] {
+			printedPhys[u.physName] = true
+			admin := "up"
+			link := "up"
+			iface, err := net.InterfaceByName(u.physName)
+			if err != nil {
+				link = "down"
+			} else {
+				if iface.Flags&net.FlagUp == 0 {
+					admin = "down"
+				}
+				data, err := os.ReadFile("/sys/class/net/" + u.physName + "/operstate")
+				if err == nil && strings.TrimSpace(string(data)) != "up" {
+					link = "down"
+				}
+			}
+			fmt.Printf("%-24s%-6s%-6s\n", u.physName, admin, link)
+		}
+
+		logicalName := fmt.Sprintf("%s.%d", u.physName, u.unitNum)
+		lookupName := u.physName
+		if u.vlanID > 0 {
+			lookupName = fmt.Sprintf("%s.%d", u.physName, u.vlanID)
+		}
+
+		var v4Addrs, v6Addrs []string
+		liface, err := net.InterfaceByName(lookupName)
+		if err != nil {
+			liface, err = net.InterfaceByName(u.physName)
+		}
+		if err == nil {
+			addrs, _ := liface.Addrs()
+			for _, addr := range addrs {
+				ipNet, ok := addr.(*net.IPNet)
+				if !ok {
+					continue
+				}
+				ones, _ := ipNet.Mask.Size()
+				addrStr := fmt.Sprintf("%s/%d", ipNet.IP, ones)
+				if ipNet.IP.To4() != nil {
+					v4Addrs = append(v4Addrs, addrStr)
+				} else {
+					v6Addrs = append(v6Addrs, addrStr)
+				}
+			}
+		}
+
+		admin := "up"
+		link := "up"
+		if liface == nil {
+			link = "down"
+		} else if liface.Flags&net.FlagUp == 0 {
+			admin = "down"
+		}
+
+		firstProto := ""
+		firstAddr := ""
+		if len(v4Addrs) > 0 {
+			firstProto = "inet"
+			firstAddr = v4Addrs[0]
+		} else if len(v6Addrs) > 0 {
+			firstProto = "inet6"
+			firstAddr = v6Addrs[0]
+		}
+
+		fmt.Printf("%-24s%-6s%-6s%-9s%-22s\n", logicalName, admin, link, firstProto, firstAddr)
+
+		for i := 1; i < len(v4Addrs); i++ {
+			fmt.Printf("%-36s%-9s%-22s\n", "", "inet", v4Addrs[i])
+		}
+		startIdx := 0
+		if firstProto == "inet6" {
+			startIdx = 1
+		}
+		for i := startIdx; i < len(v6Addrs); i++ {
+			fmt.Printf("%-36s%-9s%-22s\n", "", "inet6", v6Addrs[i])
+		}
+	}
+
+	return nil
 }
 
 // readLinkSpeed reads the link speed in Mbps from sysfs. Returns 0 on error.

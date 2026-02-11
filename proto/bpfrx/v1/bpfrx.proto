@@ -307,6 +307,7 @@ message InterfaceInfo {
 
 message ShowInterfacesDetailRequest {
   string filter = 1;  // optional interface name filter
+  bool terse = 2;     // terse (compact table) output
 }
 message ShowInterfacesDetailResponse { string output = 1; }
 

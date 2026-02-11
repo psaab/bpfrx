@@ -287,6 +287,35 @@ EOF'
 	info "Installing packages (this may take a few minutes)..."
 	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl'
 
+	# Upgrade kernel to latest from Debian unstable for full BPF verifier support
+	info "Adding Debian unstable repo for kernel upgrade..."
+	incus exec "$INSTANCE_NAME" -- bash -c 'cat > /etc/apt/sources.list.d/unstable.list <<EOF
+deb http://deb.debian.org/debian unstable main
+EOF
+cat > /etc/apt/preferences.d/pin-stable <<EOF
+Package: *
+Pin: release a=trixie
+Pin-Priority: 900
+
+Package: linux-image-amd64 linux-headers-amd64 linux-image-* linux-headers-*
+Pin: release a=unstable
+Pin-Priority: 990
+EOF'
+	info "Installing latest kernel from unstable..."
+	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-image-amd64 linux-headers-amd64'
+	info "Rebooting VM for new kernel..."
+	incus restart "$INSTANCE_NAME"
+	local ktries=0
+	while ! incus exec "$INSTANCE_NAME" -- true &>/dev/null; do
+		sleep 2
+		ktries=$((ktries + 1))
+		if [[ $ktries -ge 30 ]]; then
+			warn "VM did not come back after kernel upgrade reboot"
+			break
+		fi
+	done
+	incus exec "$INSTANCE_NAME" -- uname -r
+
 	incus exec "$INSTANCE_NAME" -- systemctl enable frr
 }
 

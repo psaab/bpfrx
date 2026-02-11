@@ -403,7 +403,7 @@ func (c *ctl) handleShow(args []string) error {
 		return c.handleShowSecurity(args[1:])
 
 	case "interfaces":
-		return c.showInterfaces()
+		return c.showInterfaces(args[1:])
 
 	case "protocols":
 		return c.handleShowProtocols(args[1:])
@@ -904,8 +904,16 @@ func (c *ctl) showIPsec(args []string) error {
 	return nil
 }
 
-func (c *ctl) showInterfaces() error {
-	resp, err := c.client.ShowInterfacesDetail(context.Background(), &pb.ShowInterfacesDetailRequest{})
+func (c *ctl) showInterfaces(args []string) error {
+	req := &pb.ShowInterfacesDetailRequest{}
+	for _, a := range args {
+		if a == "terse" {
+			req.Terse = true
+		} else {
+			req.Filter = a
+		}
+	}
+	resp, err := c.client.ShowInterfacesDetail(context.Background(), req)
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}

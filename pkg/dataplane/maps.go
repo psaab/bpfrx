@@ -718,13 +718,22 @@ func ipToUint32BE(ip net.IP) uint32 {
 	return binary.NativeEndian.Uint32(ip4)
 }
 
-// SetNAT64Config writes a NAT64 prefix config at the given index.
+// SetNAT64Config writes a NAT64 prefix config at the given index and hash map.
 func (m *Manager) SetNAT64Config(index uint32, cfg NAT64Config) error {
 	zm, ok := m.maps["nat64_configs"]
 	if !ok {
 		return fmt.Errorf("nat64_configs not found")
 	}
-	return zm.Update(index, cfg, ebpf.UpdateAny)
+	if err := zm.Update(index, cfg, ebpf.UpdateAny); err != nil {
+		return err
+	}
+	// Also write to the hash map for O(1) lookup in BPF
+	hm, ok := m.maps["nat64_prefix_map"]
+	if ok {
+		key := NAT64PrefixKey{Prefix: cfg.Prefix}
+		hm.Update(key, cfg, ebpf.UpdateAny)
+	}
+	return nil
 }
 
 // SetNAT64Count writes the number of active NAT64 prefixes.
@@ -746,6 +755,19 @@ func (m *Manager) ClearNAT64Configs() error {
 	var empty NAT64Config
 	for i := uint32(0); i < 4; i++ { // MAX_NAT64_PREFIXES
 		zm.Update(i, empty, ebpf.UpdateAny)
+	}
+	// Clear the hash map
+	if hm, ok := m.maps["nat64_prefix_map"]; ok {
+		var key NAT64PrefixKey
+		var val []byte
+		iter := hm.Iterate()
+		var keys []NAT64PrefixKey
+		for iter.Next(&key, &val) {
+			keys = append(keys, key)
+		}
+		for _, k := range keys {
+			hm.Delete(k)
+		}
 	}
 	return m.SetNAT64Count(0)
 }

@@ -80,42 +80,6 @@ int xdp_zone_prog(struct xdp_md *ctx)
 			}
 		}
 	} else {
-		/*
-		 * NAT64 prefix check: if dst IPv6 matches a configured
-		 * NAT64 /96 prefix, mark for NAT64 translation.
-		 * The last 32 bits of the IPv6 dest contain the embedded
-		 * IPv4 destination address.
-		 */
-		__u32 n64_zero = 0;
-		__u32 *n64_cnt = bpf_map_lookup_elem(&nat64_count, &n64_zero);
-		if (n64_cnt && *n64_cnt > 0) {
-			__u32 cnt = *n64_cnt;
-			if (cnt > MAX_NAT64_PREFIXES)
-				cnt = MAX_NAT64_PREFIXES;
-			#pragma unroll
-			for (__u32 ni = 0; ni < MAX_NAT64_PREFIXES; ni++) {
-				if (ni >= cnt)
-					break;
-				struct nat64_config *n64 = bpf_map_lookup_elem(
-					&nat64_configs, &ni);
-				if (!n64)
-					break;
-				/* Compare first 96 bits (3 x 32-bit words) */
-				__be32 *dst32 = (__be32 *)meta->dst_ip.v6;
-				if (dst32[0] == n64->prefix[0] &&
-				    dst32[1] == n64->prefix[1] &&
-				    dst32[2] == n64->prefix[2]) {
-					/* NAT64 match! Flag for translation. */
-					meta->nat_flags |= SESS_FLAG_NAT64;
-					/* Store embedded IPv4 dst in nat_dst_ip for later */
-					__builtin_memset(&meta->nat_dst_ip, 0,
-							 sizeof(meta->nat_dst_ip));
-					meta->nat_dst_ip.v4 = dst32[3];
-					break;
-				}
-			}
-		}
-
 		struct dnat_key_v6 dk6 = { .protocol = meta->protocol };
 		__builtin_memcpy(dk6.dst_ip, meta->dst_ip.v6, 16);
 		dk6.dst_port = meta->dst_port;

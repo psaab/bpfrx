@@ -528,6 +528,11 @@ const (
 	ProtoICMPv6 = 58
 )
 
+// NAT64PrefixKey mirrors the C struct nat64_prefix_key (hash map key).
+type NAT64PrefixKey struct {
+	Prefix [3]uint32
+}
+
 // NAT64Config mirrors the C struct nat64_config.
 type NAT64Config struct {
 	Prefix     [3]uint32 // first 96 bits of NAT64 prefix (3 x 32-bit words, network order)

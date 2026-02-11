@@ -370,6 +370,14 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					}
 				}
 
+				// Bring the interface UP so XDP can process traffic
+				if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
+					if err := netlink.LinkSetUp(nl); err != nil {
+						slog.Warn("failed to bring interface up",
+							"name", physName, "err", err)
+					}
+				}
+
 				attached[physIface.Index] = true
 			}
 

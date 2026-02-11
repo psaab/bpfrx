@@ -515,7 +515,7 @@ struct {
  * NAT64 configuration & state
  * ============================================================ */
 
-/* NAT64 prefix array: index -> nat64_config */
+/* NAT64 prefix array: index -> nat64_config (legacy, kept for loader) */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, MAX_NAT64_PREFIXES);
@@ -523,13 +523,21 @@ struct {
 	__type(value, struct nat64_config);
 } nat64_configs SEC(".maps");
 
-/* Number of active NAT64 prefixes (single-entry array) */
+/* Number of active NAT64 prefixes (single-entry array, legacy) */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
 	__type(value, __u32);
 } nat64_count SEC(".maps");
+
+/* NAT64 prefix hash map: O(1) lookup by /96 prefix (replaces array scan) */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_NAT64_PREFIXES);
+	__type(key, struct nat64_prefix_key);
+	__type(value, struct nat64_config);
+} nat64_prefix_map SEC(".maps");
 
 /* NAT64 reverse state: translated IPv4 5-tuple -> original IPv6 info */
 struct {

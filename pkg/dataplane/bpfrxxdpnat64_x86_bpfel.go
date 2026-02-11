@@ -170,6 +170,11 @@ type bpfrxXdpNat64Nat64Config struct {
 	Pad        [3]uint8
 }
 
+type bpfrxXdpNat64Nat64PrefixKey struct {
+	_      structs.HostLayout
+	Prefix [3]uint32
+}
+
 type bpfrxXdpNat64Nat64StateKey struct {
 	_        structs.HostLayout
 	SrcIp    uint32
@@ -510,6 +515,7 @@ type bpfrxXdpNat64MapSpecs struct {
 	InterfaceCounters *ebpf.MapSpec `ebpf:"interface_counters"`
 	Nat64Configs      *ebpf.MapSpec `ebpf:"nat64_configs"`
 	Nat64Count        *ebpf.MapSpec `ebpf:"nat64_count"`
+	Nat64PrefixMap    *ebpf.MapSpec `ebpf:"nat64_prefix_map"`
 	Nat64State        *ebpf.MapSpec `ebpf:"nat64_state"`
 	NatPoolConfigs    *ebpf.MapSpec `ebpf:"nat_pool_configs"`
 	NatPoolIpsV4      *ebpf.MapSpec `ebpf:"nat_pool_ips_v4"`
@@ -581,6 +587,7 @@ type bpfrxXdpNat64Maps struct {
 	InterfaceCounters *ebpf.Map `ebpf:"interface_counters"`
 	Nat64Configs      *ebpf.Map `ebpf:"nat64_configs"`
 	Nat64Count        *ebpf.Map `ebpf:"nat64_count"`
+	Nat64PrefixMap    *ebpf.Map `ebpf:"nat64_prefix_map"`
 	Nat64State        *ebpf.Map `ebpf:"nat64_state"`
 	NatPoolConfigs    *ebpf.Map `ebpf:"nat_pool_configs"`
 	NatPoolIpsV4      *ebpf.Map `ebpf:"nat_pool_ips_v4"`
@@ -628,6 +635,7 @@ func (m *bpfrxXdpNat64Maps) Close() error {
 		m.InterfaceCounters,
 		m.Nat64Configs,
 		m.Nat64Count,
+		m.Nat64PrefixMap,
 		m.Nat64State,
 		m.NatPoolConfigs,
 		m.NatPoolIpsV4,

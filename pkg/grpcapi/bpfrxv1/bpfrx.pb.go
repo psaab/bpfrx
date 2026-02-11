@@ -3284,6 +3284,7 @@ func (x *InterfaceInfo) GetTxBytes() uint64 {
 type ShowInterfacesDetailRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Filter        string                 `protobuf:"bytes,1,opt,name=filter,proto3" json:"filter,omitempty"` // optional interface name filter
+	Terse         bool                   `protobuf:"varint,2,opt,name=terse,proto3" json:"terse,omitempty"`  // terse (compact table) output
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3323,6 +3324,13 @@ func (x *ShowInterfacesDetailRequest) GetFilter() string {
 		return x.Filter
 	}
 	return ""
+}
+
+func (x *ShowInterfacesDetailRequest) GetTerse() bool {
+	if x != nil {
+		return x.Terse
+	}
+	return false
 }
 
 type ShowInterfacesDetailResponse struct {
@@ -5599,9 +5607,10 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\brx_bytes\x18\x05 \x01(\x04R\arxBytes\x12\x1d\n" +
 	"\n" +
 	"tx_packets\x18\x06 \x01(\x04R\ttxPackets\x12\x19\n" +
-	"\btx_bytes\x18\a \x01(\x04R\atxBytes\"5\n" +
+	"\btx_bytes\x18\a \x01(\x04R\atxBytes\"K\n" +
 	"\x1bShowInterfacesDetailRequest\x12\x16\n" +
-	"\x06filter\x18\x01 \x01(\tR\x06filter\"6\n" +
+	"\x06filter\x18\x01 \x01(\tR\x06filter\x12\x14\n" +
+	"\x05terse\x18\x02 \x01(\bR\x05terse\"6\n" +
 	"\x1cShowInterfacesDetailResponse\x12\x16\n" +
 	"\x06output\x18\x01 \x01(\tR\x06output\"\x16\n" +
 	"\x14GetDHCPLeasesRequest\"H\n" +
