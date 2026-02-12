@@ -317,6 +317,13 @@ Pin-Priority: 990
 EOF'
 	info "Installing latest kernel from unstable..."
 	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-image-amd64 linux-headers-amd64'
+
+	# Disable init_on_alloc — Debian enables CONFIG_INIT_ON_ALLOC_DEFAULT_ON which
+	# zeros every allocated page, costing ~20% CPU in the virtio-net XDP path.
+	info "Disabling init_on_alloc for XDP performance..."
+	incus exec "$INSTANCE_NAME" -- sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="[^"]*"/GRUB_CMDLINE_LINUX_DEFAULT="quiet init_on_alloc=0"/' /etc/default/grub
+	incus exec "$INSTANCE_NAME" -- update-grub
+
 	info "Rebooting VM for new kernel..."
 	incus restart "$INSTANCE_NAME"
 	local ktries=0
