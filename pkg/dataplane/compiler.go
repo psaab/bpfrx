@@ -387,8 +387,9 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 				// VLAN sub-interface: create it, populate vlan_iface_map
 				subIfindex, err := ensureVLANSubInterface(physName, vlanID)
 				if err != nil {
-					return fmt.Errorf("VLAN sub-interface %s.%d: %w",
-						physName, vlanID, err)
+					slog.Warn("VLAN sub-interface failed, skipping",
+						"parent", physName, "vlan_id", vlanID, "zone", name, "err", err)
+					continue
 				}
 
 				if err := m.SetVlanIfaceInfo(subIfindex, physIface.Index, uint16(vlanID)); err != nil {
