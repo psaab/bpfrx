@@ -53,6 +53,32 @@ int xdp_forward_prog(struct xdp_md *ctx)
 	}
 
 	/*
+	 * TTL/hop-limit expiry check: if TTL would expire after
+	 * decrement, XDP_PASS the unmodified packet so the kernel
+	 * generates ICMP Time Exceeded with correct addresses.
+	 * This catches non-NAT established sessions that bypass
+	 * xdp_nat (where the primary TTL check lives) via the
+	 * conntrack fast-path directly to xdp_forward.
+	 * For NAT'd traffic, xdp_nat catches TTL<=1 before we
+	 * reach here (before NAT rewrite, preserving original IPs).
+	 */
+	if (meta->addr_family == AF_INET) {
+		struct iphdr *iph_ttl = data + sizeof(struct ethhdr);
+		if ((void *)(iph_ttl + 1) <= data_end && iph_ttl->ttl <= 1) {
+			if (meta->ingress_vlan_id != 0)
+				xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
+			return XDP_PASS;
+		}
+	} else {
+		struct ipv6hdr *ip6h_ttl = data + sizeof(struct ethhdr);
+		if ((void *)(ip6h_ttl + 1) <= data_end && ip6h_ttl->hop_limit <= 1) {
+			if (meta->ingress_vlan_id != 0)
+				xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
+			return XDP_PASS;
+		}
+	}
+
+	/*
 	 * Check if destination supports native XDP redirect.
 	 * If not, XDP_PASS lets the kernel forward the NAT'd packet.
 	 * Skip MAC rewrite, TTL decrement, and VLAN push — the kernel
@@ -98,8 +124,8 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		if ((void *)(iph + 1) > data_end)
 			return XDP_DROP;
 
-		/* TTL=1 is caught in xdp_nat before NAT rewrite,
-		 * so we never see TTL <= 1 here. */
+		/* TTL<=1 is caught above (non-NAT) or in xdp_nat
+		 * (NAT'd traffic), so we always have TTL >= 2 here. */
 		__u16 old_ttl_proto = *(__u16 *)&iph->ttl;
 		iph->ttl--;
 		__u16 new_ttl_proto = *(__u16 *)&iph->ttl;
@@ -111,7 +137,7 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		if ((void *)(ip6h + 1) > data_end)
 			return XDP_DROP;
 
-		/* hop_limit=1 is caught in xdp_nat before NAT rewrite. */
+		/* hop_limit<=1 caught above or in xdp_nat. */
 		ip6h->hop_limit--;
 	}
 
