@@ -70,8 +70,9 @@ func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.Even
 
 // completionNode is a static command completion tree node.
 type completionNode struct {
-	desc     string
-	children map[string]*completionNode
+	desc      string
+	children  map[string]*completionNode
+	dynamicFn func(cfg *config.Config) []string
 }
 
 // operationalTree defines tab completion for operational mode.
@@ -85,10 +86,28 @@ var operationalTree = map[string]*completionNode{
 		}},
 		"flow-monitoring": {desc: "Show flow monitoring/NetFlow configuration"},
 		"route": {desc: "Show routing table [instance <name>]", children: map[string]*completionNode{
-			"instance": {desc: "Show routes for a routing instance"},
+			"instance": {desc: "Show routes for a routing instance", dynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.RoutingInstances))
+				for _, ri := range cfg.RoutingInstances {
+					names = append(names, ri.Name)
+				}
+				return names
+			}},
 		}},
 		"security": {desc: "Show security information", children: map[string]*completionNode{
-			"zones":           {desc: "Show security zones"},
+			"zones": {desc: "Show security zones", dynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.Security.Zones))
+				for name := range cfg.Security.Zones {
+					names = append(names, name)
+				}
+				return names
+			}},
 			"policies":        {desc: "Show security policies"},
 			"screen":          {desc: "Show screen/IDS profiles"},
 			"alg":             {desc: "Show ALG status"},
@@ -114,7 +133,16 @@ var operationalTree = map[string]*completionNode{
 				"probe-results": {desc: "Show RPM probe results"},
 			}},
 		}},
-		"interfaces": {desc: "Show interface status", children: map[string]*completionNode{
+		"interfaces": {desc: "Show interface status", dynamicFn: func(cfg *config.Config) []string {
+			if cfg == nil || cfg.Interfaces.Interfaces == nil {
+				return nil
+			}
+			names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+			for name := range cfg.Interfaces.Interfaces {
+				names = append(names, name)
+			}
+			return names
+		}, children: map[string]*completionNode{
 			"terse":  {desc: "Show interface summary"},
 			"tunnel": {desc: "Show tunnel interfaces"},
 		}},
@@ -214,7 +242,8 @@ func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
 }
 
 func (cc *cliCompleter) completeOperational(words []string, partial string) []string {
-	return completeFromTree(operationalTree, words, partial)
+	cfg := cc.cli.store.ActiveConfig()
+	return completeFromTree(operationalTree, words, partial, cfg)
 }
 
 func (cc *cliCompleter) completeConfig(words []string, partial string) []string {
@@ -234,7 +263,8 @@ func (cc *cliCompleter) completeConfig(words []string, partial string) []string 
 
 	case "run":
 		// Delegate to operational completions for the rest.
-		return completeFromTree(operationalTree, words[1:], partial)
+		cfg := cc.cli.store.ActiveConfig()
+		return completeFromTree(operationalTree, words[1:], partial, cfg)
 
 	case "commit":
 		if len(words) == 1 {
@@ -247,19 +277,29 @@ func (cc *cliCompleter) completeConfig(words []string, partial string) []string 
 	}
 }
 
-func completeFromTree(tree map[string]*completionNode, words []string, partial string) []string {
+func completeFromTree(tree map[string]*completionNode, words []string, partial string, cfg *config.Config) []string {
 	current := tree
+	var currentNode *completionNode
 	for _, w := range words {
 		node, ok := current[w]
 		if !ok {
-			return nil
+			return nil // dynamic value typed — no further completions
 		}
+		currentNode = node
 		if node.children == nil {
+			// Leaf node — only offer dynamic values if present.
+			if node.dynamicFn != nil && cfg != nil {
+				return filterPrefix(node.dynamicFn(cfg), partial)
+			}
 			return nil
 		}
 		current = node.children
 	}
-	return filterPrefix(keysOf(current), partial)
+	candidates := keysOf(current)
+	if currentNode != nil && currentNode.dynamicFn != nil && cfg != nil {
+		candidates = append(candidates, currentNode.dynamicFn(cfg)...)
+	}
+	return filterPrefix(candidates, partial)
 }
 
 func keysOf(m map[string]*completionNode) []string {
@@ -3066,6 +3106,7 @@ func (c *CLI) showContextHelp(prefix string) {
 func (c *CLI) showOperationalContextHelp(words []string) {
 	// Navigate to the appropriate tree level.
 	current := operationalTree
+	var currentNode *completionNode
 	for _, w := range words {
 		node, ok := current[w]
 		if !ok {
@@ -3073,9 +3114,22 @@ func (c *CLI) showOperationalContextHelp(words []string) {
 			return
 		}
 		if node.children == nil {
+			// Leaf node — show dynamic values if present.
+			if node.dynamicFn != nil {
+				cfg := c.store.ActiveConfig()
+				if cfg != nil {
+					dynItems := node.dynamicFn(cfg)
+					sort.Strings(dynItems)
+					for _, name := range dynItems {
+						fmt.Printf("  %-20s (configured)\n", name)
+					}
+					return
+				}
+			}
 			fmt.Printf("  %-20s %s\n", w, node.desc)
 			return
 		}
+		currentNode = node
 		current = node.children
 	}
 
@@ -3084,9 +3138,18 @@ func (c *CLI) showOperationalContextHelp(words []string) {
 	for name := range current {
 		items = append(items, name)
 	}
+	// Add dynamic values from active config.
+	cfg := c.store.ActiveConfig()
+	if currentNode != nil && currentNode.dynamicFn != nil && cfg != nil {
+		items = append(items, currentNode.dynamicFn(cfg)...)
+	}
 	sort.Strings(items)
 	for _, name := range items {
-		fmt.Printf("  %-20s %s\n", name, current[name].desc)
+		if node, ok := current[name]; ok {
+			fmt.Printf("  %-20s %s\n", name, node.desc)
+		} else {
+			fmt.Printf("  %-20s (configured)\n", name)
+		}
 	}
 }
 

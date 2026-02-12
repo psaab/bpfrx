@@ -1399,7 +1399,8 @@ func (s *Server) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Compl
 }
 
 func (s *Server) completeOperational(words []string, partial string) []string {
-	return completeFromTree(operationalTree, words, partial)
+	cfg := s.store.ActiveConfig()
+	return completeFromTree(operationalTree, words, partial, cfg)
 }
 
 func (s *Server) completeConfig(words []string, partial string) []string {
@@ -1415,7 +1416,8 @@ func (s *Server) completeConfig(words []string, partial string) []string {
 		}
 		return filterPrefix(schemaCompletions, partial)
 	case "run":
-		return completeFromTree(operationalTree, words[1:], partial)
+		cfg := s.store.ActiveConfig()
+		return completeFromTree(operationalTree, words[1:], partial, cfg)
 	case "commit":
 		if len(words) == 1 {
 			return filterPrefix([]string{"check", "confirmed"}, partial)
@@ -1503,8 +1505,9 @@ func (s *Server) valueProvider(hint config.ValueHint) []string {
 // --- shared command trees (same as cli.go) ---
 
 type completionNode struct {
-	desc     string
-	children map[string]*completionNode
+	desc      string
+	children  map[string]*completionNode
+	dynamicFn func(cfg *config.Config) []string
 }
 
 var operationalTree = map[string]*completionNode{
@@ -1518,11 +1521,31 @@ var operationalTree = map[string]*completionNode{
 			"client-identifier": {desc: "Show DHCPv6 DUID(s)"},
 			"relay":             {desc: "Show DHCP relay status"},
 		}},
-		"route":      {desc: "Show routing table"},
+		"route": {desc: "Show routing table", children: map[string]*completionNode{
+			"instance": {desc: "Show routes for a routing instance", dynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.RoutingInstances))
+				for _, ri := range cfg.RoutingInstances {
+					names = append(names, ri.Name)
+				}
+				return names
+			}},
+		}},
 		"schedulers": {desc: "Show policy schedulers"},
 		"snmp":       {desc: "Show SNMP statistics"},
 		"security": {desc: "Show security information", children: map[string]*completionNode{
-			"zones":    {desc: "Show security zones"},
+			"zones": {desc: "Show security zones", dynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.Security.Zones))
+				for name := range cfg.Security.Zones {
+					names = append(names, name)
+				}
+				return names
+			}},
 			"policies": {desc: "Show security policies"},
 			"screen":   {desc: "Show screen/IDS profiles"},
 			"flow": {desc: "Show flow information", children: map[string]*completionNode{
@@ -1541,7 +1564,16 @@ var operationalTree = map[string]*completionNode{
 				"security-associations": {desc: "Show IPsec SAs"},
 			}},
 		}},
-		"interfaces": {desc: "Show interface status", children: map[string]*completionNode{
+		"interfaces": {desc: "Show interface status", dynamicFn: func(cfg *config.Config) []string {
+			if cfg == nil || cfg.Interfaces.Interfaces == nil {
+				return nil
+			}
+			names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+			for name := range cfg.Interfaces.Interfaces {
+				names = append(names, name)
+			}
+			return names
+		}, children: map[string]*completionNode{
 			"tunnel": {desc: "Show tunnel interfaces"},
 		}},
 		"protocols": {desc: "Show protocol information", children: map[string]*completionNode{
@@ -1597,19 +1629,29 @@ var configTopLevel = map[string]*completionNode{
 	"quit":     {desc: "Exit configuration mode"},
 }
 
-func completeFromTree(tree map[string]*completionNode, words []string, partial string) []string {
+func completeFromTree(tree map[string]*completionNode, words []string, partial string, cfg *config.Config) []string {
 	current := tree
+	var currentNode *completionNode
 	for _, w := range words {
 		node, ok := current[w]
 		if !ok {
-			return nil
+			return nil // dynamic value typed — no further completions
 		}
+		currentNode = node
 		if node.children == nil {
+			// Leaf node — only offer dynamic values if present.
+			if node.dynamicFn != nil && cfg != nil {
+				return filterPrefix(node.dynamicFn(cfg), partial)
+			}
 			return nil
 		}
 		current = node.children
 	}
-	return filterPrefix(keysOf(current), partial)
+	candidates := keysOf(current)
+	if currentNode != nil && currentNode.dynamicFn != nil && cfg != nil {
+		candidates = append(candidates, currentNode.dynamicFn(cfg)...)
+	}
+	return filterPrefix(candidates, partial)
 }
 
 func keysOf(m map[string]*completionNode) []string {
