@@ -53,6 +53,12 @@ type bpfrxXdpNat64CounterValue struct {
 	Bytes   uint64
 }
 
+type bpfrxXdpNat64CpumapVal struct {
+	_         structs.HostLayout
+	Qsize     uint32
+	BpfProgFd uint32
+}
+
 type bpfrxXdpNat64DnatKey struct {
 	_        structs.HostLayout
 	Protocol uint8
@@ -509,6 +515,8 @@ type bpfrxXdpNat64MapSpecs struct {
 	AddressBookV6     *ebpf.MapSpec `ebpf:"address_book_v6"`
 	AddressMembership *ebpf.MapSpec `ebpf:"address_membership"`
 	Applications      *ebpf.MapSpec `ebpf:"applications"`
+	CpuMap            *ebpf.MapSpec `ebpf:"cpu_map"`
+	CpumapAvailable   *ebpf.MapSpec `ebpf:"cpumap_available"`
 	DefaultPolicy     *ebpf.MapSpec `ebpf:"default_policy"`
 	DnatTable         *ebpf.MapSpec `ebpf:"dnat_table"`
 	DnatTableV6       *ebpf.MapSpec `ebpf:"dnat_table_v6"`
@@ -583,6 +591,8 @@ type bpfrxXdpNat64Maps struct {
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
 	AddressMembership *ebpf.Map `ebpf:"address_membership"`
 	Applications      *ebpf.Map `ebpf:"applications"`
+	CpuMap            *ebpf.Map `ebpf:"cpu_map"`
+	CpumapAvailable   *ebpf.Map `ebpf:"cpumap_available"`
 	DefaultPolicy     *ebpf.Map `ebpf:"default_policy"`
 	DnatTable         *ebpf.Map `ebpf:"dnat_table"`
 	DnatTableV6       *ebpf.Map `ebpf:"dnat_table_v6"`
@@ -633,6 +643,8 @@ func (m *bpfrxXdpNat64Maps) Close() error {
 		m.AddressBookV6,
 		m.AddressMembership,
 		m.Applications,
+		m.CpuMap,
+		m.CpumapAvailable,
 		m.DefaultPolicy,
 		m.DnatTable,
 		m.DnatTableV6,

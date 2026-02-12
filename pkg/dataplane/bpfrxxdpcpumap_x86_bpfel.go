@@ -13,32 +13,32 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type bpfrxTcScreenEgressAddrMembershipKey struct {
+type bpfrxXdpCpumapAddrMembershipKey struct {
 	_         structs.HostLayout
 	Ip        uint32
 	AddressId uint32
 }
 
-type bpfrxTcScreenEgressAddrValue struct {
+type bpfrxXdpCpumapAddrValue struct {
 	_         structs.HostLayout
 	AddressId uint32
 }
 
-type bpfrxTcScreenEgressAppKey struct {
+type bpfrxXdpCpumapAppKey struct {
 	_        structs.HostLayout
 	Protocol uint8
 	Pad      uint8
 	DstPort  uint16
 }
 
-type bpfrxTcScreenEgressAppValue struct {
+type bpfrxXdpCpumapAppValue struct {
 	_       structs.HostLayout
 	AppId   uint32
 	AlgType uint8
 	Pad     [3]uint8
 }
 
-type bpfrxTcScreenEgressBpfDevmapVal struct {
+type bpfrxXdpCpumapBpfDevmapVal struct {
 	_       structs.HostLayout
 	Ifindex uint32
 	BpfProg struct {
@@ -47,19 +47,19 @@ type bpfrxTcScreenEgressBpfDevmapVal struct {
 	}
 }
 
-type bpfrxTcScreenEgressCounterValue struct {
+type bpfrxXdpCpumapCounterValue struct {
 	_       structs.HostLayout
 	Packets uint64
 	Bytes   uint64
 }
 
-type bpfrxTcScreenEgressCpumapVal struct {
+type bpfrxXdpCpumapCpumapVal struct {
 	_         structs.HostLayout
 	Qsize     uint32
 	BpfProgFd uint32
 }
 
-type bpfrxTcScreenEgressDnatKey struct {
+type bpfrxXdpCpumapDnatKey struct {
 	_        structs.HostLayout
 	Protocol uint8
 	Pad      [3]uint8
@@ -68,7 +68,7 @@ type bpfrxTcScreenEgressDnatKey struct {
 	Pad2     uint16
 }
 
-type bpfrxTcScreenEgressDnatKeyV6 struct {
+type bpfrxXdpCpumapDnatKeyV6 struct {
 	_        structs.HostLayout
 	Protocol uint8
 	Pad      [3]uint8
@@ -77,7 +77,7 @@ type bpfrxTcScreenEgressDnatKeyV6 struct {
 	Pad2     uint16
 }
 
-type bpfrxTcScreenEgressDnatValue struct {
+type bpfrxXdpCpumapDnatValue struct {
 	_          structs.HostLayout
 	NewDstIp   uint32
 	NewDstPort uint16
@@ -85,7 +85,7 @@ type bpfrxTcScreenEgressDnatValue struct {
 	Pad        uint8
 }
 
-type bpfrxTcScreenEgressDnatValueV6 struct {
+type bpfrxXdpCpumapDnatValueV6 struct {
 	_          structs.HostLayout
 	NewDstIp   [16]uint8
 	NewDstPort uint16
@@ -93,13 +93,13 @@ type bpfrxTcScreenEgressDnatValueV6 struct {
 	Pad        uint8
 }
 
-type bpfrxTcScreenEgressFilterConfig struct {
+type bpfrxXdpCpumapFilterConfig struct {
 	_         structs.HostLayout
 	NumRules  uint32
 	RuleStart uint32
 }
 
-type bpfrxTcScreenEgressFilterRule struct {
+type bpfrxXdpCpumapFilterRule struct {
 	_            structs.HostLayout
 	MatchFlags   uint16
 	Dscp         uint8
@@ -117,7 +117,7 @@ type bpfrxTcScreenEgressFilterRule struct {
 	RoutingTable uint32
 }
 
-type bpfrxTcScreenEgressFloodState struct {
+type bpfrxXdpCpumapFloodState struct {
 	_           structs.HostLayout
 	SynCount    uint64
 	IcmpCount   uint64
@@ -125,7 +125,7 @@ type bpfrxTcScreenEgressFloodState struct {
 	WindowStart uint64
 }
 
-type bpfrxTcScreenEgressFlowConfig struct {
+type bpfrxXdpCpumapFlowConfig struct {
 	_                 structs.HostLayout
 	TcpMssIpsec       uint16
 	TcpMssGre         uint16
@@ -134,7 +134,7 @@ type bpfrxTcScreenEgressFlowConfig struct {
 	Pad               [2]uint8
 }
 
-type bpfrxTcScreenEgressIfaceCounterValue struct {
+type bpfrxXdpCpumapIfaceCounterValue struct {
 	_         structs.HostLayout
 	RxPackets uint64
 	RxBytes   uint64
@@ -142,7 +142,7 @@ type bpfrxTcScreenEgressIfaceCounterValue struct {
 	TxBytes   uint64
 }
 
-type bpfrxTcScreenEgressIfaceFilterKey struct {
+type bpfrxXdpCpumapIfaceFilterKey struct {
 	_       structs.HostLayout
 	Ifindex uint32
 	VlanId  uint16
@@ -150,38 +150,38 @@ type bpfrxTcScreenEgressIfaceFilterKey struct {
 	Pad     uint8
 }
 
-type bpfrxTcScreenEgressIfaceZoneKey struct {
+type bpfrxXdpCpumapIfaceZoneKey struct {
 	_       structs.HostLayout
 	Ifindex uint32
 	VlanId  uint16
 	Pad     uint16
 }
 
-type bpfrxTcScreenEgressLpmKeyV4 struct {
+type bpfrxXdpCpumapLpmKeyV4 struct {
 	_         structs.HostLayout
 	Prefixlen uint32
 	Addr      uint32
 }
 
-type bpfrxTcScreenEgressLpmKeyV6 struct {
+type bpfrxXdpCpumapLpmKeyV6 struct {
 	_         structs.HostLayout
 	Prefixlen uint32
 	Addr      [16]uint8
 }
 
-type bpfrxTcScreenEgressNat64Config struct {
+type bpfrxXdpCpumapNat64Config struct {
 	_          structs.HostLayout
 	Prefix     [3]uint32
 	SnatPoolId uint8
 	Pad        [3]uint8
 }
 
-type bpfrxTcScreenEgressNat64PrefixKey struct {
+type bpfrxXdpCpumapNat64PrefixKey struct {
 	_      structs.HostLayout
 	Prefix [3]uint32
 }
 
-type bpfrxTcScreenEgressNat64StateKey struct {
+type bpfrxXdpCpumapNat64StateKey struct {
 	_        structs.HostLayout
 	SrcIp    uint32
 	DstIp    uint32
@@ -191,7 +191,7 @@ type bpfrxTcScreenEgressNat64StateKey struct {
 	Pad      [3]uint8
 }
 
-type bpfrxTcScreenEgressNat64StateValue struct {
+type bpfrxXdpCpumapNat64StateValue struct {
 	_           structs.HostLayout
 	OrigSrcV6   [16]uint8
 	OrigDstV6   [16]uint8
@@ -200,7 +200,7 @@ type bpfrxTcScreenEgressNat64StateValue struct {
 	Nat64Idx    uint32
 }
 
-type bpfrxTcScreenEgressPktMeta struct {
+type bpfrxXdpCpumapPktMeta struct {
 	_     structs.HostLayout
 	SrcIp struct {
 		_  structs.HostLayout
@@ -259,7 +259,7 @@ type bpfrxTcScreenEgressPktMeta struct {
 	RoutingTable uint32
 }
 
-type bpfrxTcScreenEgressPolicyRule struct {
+type bpfrxXdpCpumapPolicyRule struct {
 	_           structs.HostLayout
 	RuleId      uint32
 	PolicySetId uint32
@@ -278,14 +278,14 @@ type bpfrxTcScreenEgressPolicyRule struct {
 	CounterId   uint32
 }
 
-type bpfrxTcScreenEgressPolicySet struct {
+type bpfrxXdpCpumapPolicySet struct {
 	_             structs.HostLayout
 	PolicySetId   uint32
 	NumRules      uint16
 	DefaultAction uint16
 }
 
-type bpfrxTcScreenEgressScreenConfig struct {
+type bpfrxXdpCpumapScreenConfig struct {
 	_               structs.HostLayout
 	Flags           uint32
 	SynFloodThresh  uint32
@@ -293,7 +293,7 @@ type bpfrxTcScreenEgressScreenConfig struct {
 	UdpFloodThresh  uint32
 }
 
-type bpfrxTcScreenEgressSessionKey struct {
+type bpfrxXdpCpumapSessionKey struct {
 	_        structs.HostLayout
 	SrcIp    uint32
 	DstIp    uint32
@@ -303,7 +303,7 @@ type bpfrxTcScreenEgressSessionKey struct {
 	Pad      [3]uint8
 }
 
-type bpfrxTcScreenEgressSessionKeyV6 struct {
+type bpfrxXdpCpumapSessionKeyV6 struct {
 	_        structs.HostLayout
 	SrcIp    [16]uint8
 	DstIp    [16]uint8
@@ -313,7 +313,7 @@ type bpfrxTcScreenEgressSessionKeyV6 struct {
 	Pad      [3]uint8
 }
 
-type bpfrxTcScreenEgressSessionValue struct {
+type bpfrxXdpCpumapSessionValue struct {
 	_           structs.HostLayout
 	State       uint8
 	Flags       uint8
@@ -334,7 +334,7 @@ type bpfrxTcScreenEgressSessionValue struct {
 	FwdBytes    uint64
 	RevPackets  uint64
 	RevBytes    uint64
-	ReverseKey  bpfrxTcScreenEgressSessionKey
+	ReverseKey  bpfrxXdpCpumapSessionKey
 	AlgType     uint8
 	LogFlags    uint8
 	Pad         [2]uint8
@@ -345,7 +345,7 @@ type bpfrxTcScreenEgressSessionValue struct {
 	PadFib      [2]uint8
 }
 
-type bpfrxTcScreenEgressSessionValueV6 struct {
+type bpfrxXdpCpumapSessionValueV6 struct {
 	_           structs.HostLayout
 	State       uint8
 	Flags       uint8
@@ -366,7 +366,7 @@ type bpfrxTcScreenEgressSessionValueV6 struct {
 	FwdBytes    uint64
 	RevPackets  uint64
 	RevBytes    uint64
-	ReverseKey  bpfrxTcScreenEgressSessionKeyV6
+	ReverseKey  bpfrxXdpCpumapSessionKeyV6
 	AlgType     uint8
 	LogFlags    uint8
 	Pad         [2]uint8
@@ -377,7 +377,7 @@ type bpfrxTcScreenEgressSessionValueV6 struct {
 	PadFib      [2]uint8
 }
 
-type bpfrxTcScreenEgressSnatKey struct {
+type bpfrxXdpCpumapSnatKey struct {
 	_        structs.HostLayout
 	FromZone uint16
 	ToZone   uint16
@@ -385,7 +385,7 @@ type bpfrxTcScreenEgressSnatKey struct {
 	Pad      uint16
 }
 
-type bpfrxTcScreenEgressSnatValue struct {
+type bpfrxXdpCpumapSnatValue struct {
 	_         structs.HostLayout
 	SnatIp    uint32
 	SrcAddrId uint32
@@ -395,7 +395,7 @@ type bpfrxTcScreenEgressSnatValue struct {
 	CounterId uint16
 }
 
-type bpfrxTcScreenEgressSnatValueV6 struct {
+type bpfrxXdpCpumapSnatValueV6 struct {
 	_         structs.HostLayout
 	SnatIp    [16]uint8
 	SrcAddrId uint32
@@ -405,67 +405,67 @@ type bpfrxTcScreenEgressSnatValueV6 struct {
 	CounterId uint16
 }
 
-type bpfrxTcScreenEgressStaticNatKeyV4 struct {
+type bpfrxXdpCpumapStaticNatKeyV4 struct {
 	_         structs.HostLayout
 	Ip        uint32
 	Direction uint8
 	Pad       [3]uint8
 }
 
-type bpfrxTcScreenEgressStaticNatKeyV6 struct {
+type bpfrxXdpCpumapStaticNatKeyV6 struct {
 	_         structs.HostLayout
 	Ip        [16]uint8
 	Direction uint8
 	Pad       [3]uint8
 }
 
-type bpfrxTcScreenEgressStaticNatValueV6 struct {
+type bpfrxXdpCpumapStaticNatValueV6 struct {
 	_  structs.HostLayout
 	Ip [16]uint8
 }
 
-type bpfrxTcScreenEgressVlanIfaceInfo struct {
+type bpfrxXdpCpumapVlanIfaceInfo struct {
 	_             structs.HostLayout
 	ParentIfindex uint32
 	VlanId        uint16
 	Pad           uint16
 }
 
-type bpfrxTcScreenEgressZoneConfig struct {
+type bpfrxXdpCpumapZoneConfig struct {
 	_                structs.HostLayout
 	ZoneId           uint16
 	ScreenProfileId  uint16
 	HostInboundFlags uint32
 }
 
-type bpfrxTcScreenEgressZonePairKey struct {
+type bpfrxXdpCpumapZonePairKey struct {
 	_        structs.HostLayout
 	FromZone uint16
 	ToZone   uint16
 }
 
-// loadBpfrxTcScreenEgress returns the embedded CollectionSpec for bpfrxTcScreenEgress.
-func loadBpfrxTcScreenEgress() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxTcScreenEgressBytes)
+// loadBpfrxXdpCpumap returns the embedded CollectionSpec for bpfrxXdpCpumap.
+func loadBpfrxXdpCpumap() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_BpfrxXdpCpumapBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
-		return nil, fmt.Errorf("can't load bpfrxTcScreenEgress: %w", err)
+		return nil, fmt.Errorf("can't load bpfrxXdpCpumap: %w", err)
 	}
 
 	return spec, err
 }
 
-// loadBpfrxTcScreenEgressObjects loads bpfrxTcScreenEgress and converts it into a struct.
+// loadBpfrxXdpCpumapObjects loads bpfrxXdpCpumap and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
-//	*bpfrxTcScreenEgressObjects
-//	*bpfrxTcScreenEgressPrograms
-//	*bpfrxTcScreenEgressMaps
+//	*bpfrxXdpCpumapObjects
+//	*bpfrxXdpCpumapPrograms
+//	*bpfrxXdpCpumapMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxTcScreenEgressObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxTcScreenEgress()
+func loadBpfrxXdpCpumapObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadBpfrxXdpCpumap()
 	if err != nil {
 		return err
 	}
@@ -473,26 +473,26 @@ func loadBpfrxTcScreenEgressObjects(obj interface{}, opts *ebpf.CollectionOption
 	return spec.LoadAndAssign(obj, opts)
 }
 
-// bpfrxTcScreenEgressSpecs contains maps and programs before they are loaded into the kernel.
+// bpfrxXdpCpumapSpecs contains maps and programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type bpfrxTcScreenEgressSpecs struct {
-	bpfrxTcScreenEgressProgramSpecs
-	bpfrxTcScreenEgressMapSpecs
-	bpfrxTcScreenEgressVariableSpecs
+type bpfrxXdpCpumapSpecs struct {
+	bpfrxXdpCpumapProgramSpecs
+	bpfrxXdpCpumapMapSpecs
+	bpfrxXdpCpumapVariableSpecs
 }
 
-// bpfrxTcScreenEgressProgramSpecs contains programs before they are loaded into the kernel.
+// bpfrxXdpCpumapProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type bpfrxTcScreenEgressProgramSpecs struct {
-	TcScreenEgressProg *ebpf.ProgramSpec `ebpf:"tc_screen_egress_prog"`
+type bpfrxXdpCpumapProgramSpecs struct {
+	XdpCpumapProg *ebpf.ProgramSpec `ebpf:"xdp_cpumap_prog"`
 }
 
-// bpfrxTcScreenEgressMapSpecs contains maps before they are loaded into the kernel.
+// bpfrxXdpCpumapMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type bpfrxTcScreenEgressMapSpecs struct {
+type bpfrxXdpCpumapMapSpecs struct {
 	AddressBookV4     *ebpf.MapSpec `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.MapSpec `ebpf:"address_book_v6"`
 	AddressMembership *ebpf.MapSpec `ebpf:"address_membership"`
@@ -538,32 +538,32 @@ type bpfrxTcScreenEgressMapSpecs struct {
 	ZonePairPolicies  *ebpf.MapSpec `ebpf:"zone_pair_policies"`
 }
 
-// bpfrxTcScreenEgressVariableSpecs contains global variables before they are loaded into the kernel.
+// bpfrxXdpCpumapVariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type bpfrxTcScreenEgressVariableSpecs struct {
+type bpfrxXdpCpumapVariableSpecs struct {
 }
 
-// bpfrxTcScreenEgressObjects contains all objects after they have been loaded into the kernel.
+// bpfrxXdpCpumapObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
-type bpfrxTcScreenEgressObjects struct {
-	bpfrxTcScreenEgressPrograms
-	bpfrxTcScreenEgressMaps
-	bpfrxTcScreenEgressVariables
+// It can be passed to loadBpfrxXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
+type bpfrxXdpCpumapObjects struct {
+	bpfrxXdpCpumapPrograms
+	bpfrxXdpCpumapMaps
+	bpfrxXdpCpumapVariables
 }
 
-func (o *bpfrxTcScreenEgressObjects) Close() error {
-	return _BpfrxTcScreenEgressClose(
-		&o.bpfrxTcScreenEgressPrograms,
-		&o.bpfrxTcScreenEgressMaps,
+func (o *bpfrxXdpCpumapObjects) Close() error {
+	return _BpfrxXdpCpumapClose(
+		&o.bpfrxXdpCpumapPrograms,
+		&o.bpfrxXdpCpumapMaps,
 	)
 }
 
-// bpfrxTcScreenEgressMaps contains all maps after they have been loaded into the kernel.
+// bpfrxXdpCpumapMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
-type bpfrxTcScreenEgressMaps struct {
+// It can be passed to loadBpfrxXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
+type bpfrxXdpCpumapMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
 	AddressMembership *ebpf.Map `ebpf:"address_membership"`
@@ -609,8 +609,8 @@ type bpfrxTcScreenEgressMaps struct {
 	ZonePairPolicies  *ebpf.Map `ebpf:"zone_pair_policies"`
 }
 
-func (m *bpfrxTcScreenEgressMaps) Close() error {
-	return _BpfrxTcScreenEgressClose(
+func (m *bpfrxXdpCpumapMaps) Close() error {
+	return _BpfrxXdpCpumapClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -657,26 +657,26 @@ func (m *bpfrxTcScreenEgressMaps) Close() error {
 	)
 }
 
-// bpfrxTcScreenEgressVariables contains all global variables after they have been loaded into the kernel.
+// bpfrxXdpCpumapVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
-type bpfrxTcScreenEgressVariables struct {
+// It can be passed to loadBpfrxXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
+type bpfrxXdpCpumapVariables struct {
 }
 
-// bpfrxTcScreenEgressPrograms contains all programs after they have been loaded into the kernel.
+// bpfrxXdpCpumapPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
-type bpfrxTcScreenEgressPrograms struct {
-	TcScreenEgressProg *ebpf.Program `ebpf:"tc_screen_egress_prog"`
+// It can be passed to loadBpfrxXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
+type bpfrxXdpCpumapPrograms struct {
+	XdpCpumapProg *ebpf.Program `ebpf:"xdp_cpumap_prog"`
 }
 
-func (p *bpfrxTcScreenEgressPrograms) Close() error {
-	return _BpfrxTcScreenEgressClose(
-		p.TcScreenEgressProg,
+func (p *bpfrxXdpCpumapPrograms) Close() error {
+	return _BpfrxXdpCpumapClose(
+		p.XdpCpumapProg,
 	)
 }
 
-func _BpfrxTcScreenEgressClose(closers ...io.Closer) error {
+func _BpfrxXdpCpumapClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -687,5 +687,5 @@ func _BpfrxTcScreenEgressClose(closers ...io.Closer) error {
 
 // Do not access this directly.
 //
-//go:embed bpfrxtcscreenegress_x86_bpfel.o
-var _BpfrxTcScreenEgressBytes []byte
+//go:embed bpfrxxdpcpumap_x86_bpfel.o
+var _BpfrxXdpCpumapBytes []byte

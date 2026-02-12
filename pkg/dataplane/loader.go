@@ -23,6 +23,7 @@ const linkPinPath = "/sys/fs/bpf/bpfrx/links"
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpNat ../../bpf/xdp/xdp_nat.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpForward ../../bpf/xdp/xdp_forward.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpNat64 ../../bpf/xdp/xdp_nat64.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpCpumap ../../bpf/xdp/xdp_cpumap.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxTcMain ../../bpf/tc/tc_main.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxTcConntrack ../../bpf/tc/tc_conntrack.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxTcNat ../../bpf/tc/tc_nat.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
@@ -38,6 +39,7 @@ type Manager struct {
 	tcLinks       map[int]link.Link
 	lastCompile   *CompileResult
 	PersistentNAT *PersistentNATTable
+	EnableCPUMap  bool // Enable cpumap multi-CPU distribution (adds startup overhead)
 }
 
 // New creates a new dataplane Manager.

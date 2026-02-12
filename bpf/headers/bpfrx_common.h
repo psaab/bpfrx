@@ -152,6 +152,7 @@ struct icmp6hdr {
 #define MAX_APPLICATIONS       1024
 #define MAX_SCREEN_PROFILES    64
 #define MAX_PORT_SCAN_TRACK    65536
+#define MAX_CPUS               256
 
 /* XDP tail call program indices */
 #define XDP_PROG_SCREEN        0

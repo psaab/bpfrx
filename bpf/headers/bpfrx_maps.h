@@ -23,6 +23,30 @@ struct {
 } tc_progs SEC(".maps");
 
 /* ============================================================
+ * CPU map for distributing XDP processing across CPUs
+ * ============================================================ */
+
+struct cpumap_val {
+	__u32 qsize;
+	__u32 bpf_prog_fd;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_CPUMAP);
+	__uint(max_entries, MAX_CPUS);
+	__type(key, __u32);
+	__type(value, struct cpumap_val);
+} cpu_map SEC(".maps");
+
+/* Number of CPUs in cpu_map; 0 = cpumap disabled */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} cpumap_available SEC(".maps");
+
+/* ============================================================
  * Per-CPU scratch space for passing metadata between tail calls
  * ============================================================ */
 

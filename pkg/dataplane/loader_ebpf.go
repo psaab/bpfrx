@@ -1,10 +1,13 @@
 package dataplane
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 )
@@ -113,6 +116,8 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["filter_configs"] = mainObjs.FilterConfigs
 	m.maps["filter_rules"] = mainObjs.FilterRules
 	m.maps["redirect_capable"] = mainObjs.RedirectCapable
+	m.maps["cpu_map"] = mainObjs.CpuMap
+	m.maps["cpumap_available"] = mainObjs.CpumapAvailable
 
 	// Store main program.
 	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
@@ -159,6 +164,8 @@ func (m *Manager) loadAllObjects() error {
 			"filter_configs":     mainObjs.FilterConfigs,
 			"filter_rules":       mainObjs.FilterRules,
 			"redirect_capable":   mainObjs.RedirectCapable,
+			"cpu_map":            mainObjs.CpuMap,
+			"cpumap_available":   mainObjs.CpumapAvailable,
 		},
 	}
 
@@ -249,6 +256,16 @@ func (m *Manager) loadAllObjects() error {
 		}
 	}
 
+	// Load cpumap programs for multi-CPU XDP distribution (disabled by default).
+	// The cross-CPU overhead (cache misses, kthread scheduling) typically hurts
+	// throughput on virtio-net. Enable only when a single CPU genuinely can't
+	// keep up (40G/100G NICs).
+	if m.EnableCPUMap {
+		if err := m.loadCPUMapPrograms(replaceOpts, &mainObjs); err != nil {
+			return err
+		}
+	}
+
 	// Load TC main program.
 	var tcMainObjs bpfrxTcMainObjects
 	if err := loadBpfrxTcMainObjects(&tcMainObjs, replaceOpts); err != nil {
@@ -299,5 +316,174 @@ func (m *Manager) loadAllObjects() error {
 		}
 	}
 
+	return nil
+}
+
+// loadCPUMapPrograms loads the cpumap entry program and cpumap-compatible
+// copies of each pipeline program. cpumap programs require
+// expected_attach_type = BPF_XDP_CPUMAP, which is incompatible with
+// sharing a PROG_ARRAY created by regular XDP programs. So the cpumap
+// gets its own xdp_progs PROG_ARRAY populated with pipeline copies.
+func (m *Manager) loadCPUMapPrograms(replaceOpts *ebpf.CollectionOptions, mainObjs *bpfrxXdpMainObjects) error {
+	cpumapSpec, err := loadBpfrxXdpCpumap()
+	if err != nil {
+		return fmt.Errorf("load xdp_cpumap spec: %w", err)
+	}
+
+	// Share all maps EXCEPT xdp_progs and tc_progs (cpumap needs its own).
+	cpumapReplaceOpts := &ebpf.CollectionOptions{
+		MapReplacements: map[string]*ebpf.Map{},
+	}
+	for k, v := range replaceOpts.MapReplacements {
+		if k == "xdp_progs" || k == "tc_progs" {
+			continue
+		}
+		cpumapReplaceOpts.MapReplacements[k] = v
+	}
+
+	var cpumapObjs bpfrxXdpCpumapObjects
+	if err := cpumapSpec.LoadAndAssign(&cpumapObjs, cpumapReplaceOpts); err != nil {
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			slog.Error("cpumap verifier log", "log", ve.Error())
+		}
+		return fmt.Errorf("load xdp_cpumap: %w", err)
+	}
+	m.programs["xdp_cpumap_prog"] = cpumapObjs.XdpCpumapProg
+
+	// Store the cpumap's PROG_ARRAY to prevent GC from closing it.
+	cpumapXdpProgs := cpumapObjs.XdpProgs
+	m.maps["cpumap_xdp_progs"] = cpumapXdpProgs
+	cpumapReplaceOpts.MapReplacements["xdp_progs"] = cpumapXdpProgs
+
+	// Build per-program replacement variants.
+	cpumapPolicyOpts := &ebpf.CollectionOptions{
+		MapReplacements: map[string]*ebpf.Map{},
+	}
+	for k, v := range cpumapReplaceOpts.MapReplacements {
+		cpumapPolicyOpts.MapReplacements[k] = v
+	}
+	cpumapPolicyOpts.MapReplacements["nat_pool_configs"] = mainObjs.NatPoolConfigs
+	cpumapPolicyOpts.MapReplacements["nat_pool_ips_v4"] = mainObjs.NatPoolIpsV4
+	cpumapPolicyOpts.MapReplacements["nat_pool_ips_v6"] = mainObjs.NatPoolIpsV6
+	cpumapPolicyOpts.MapReplacements["nat_port_counters"] = mainObjs.NatPortCounters
+
+	cpumapCtOpts := &ebpf.CollectionOptions{
+		MapReplacements: map[string]*ebpf.Map{},
+	}
+	for k, v := range cpumapReplaceOpts.MapReplacements {
+		cpumapCtOpts.MapReplacements[k] = v
+	}
+	if fcm := m.maps["flow_config_map"]; fcm != nil {
+		cpumapCtOpts.MapReplacements["flow_config_map"] = fcm
+	}
+
+	// Load each pipeline program with BPF_XDP_CPUMAP attach type.
+	type cpumapProg struct {
+		index uint32
+		name  string
+		load  func() (*ebpf.CollectionSpec, error)
+		prog  string
+		opts  *ebpf.CollectionOptions
+	}
+	pipeline := []cpumapProg{
+		{XDPProgScreen, "screen", loadBpfrxXdpScreen, "xdp_screen_prog", cpumapReplaceOpts},
+		{XDPProgZone, "zone", loadBpfrxXdpZone, "xdp_zone_prog", cpumapReplaceOpts},
+		{XDPProgConntrack, "conntrack", loadBpfrxXdpConntrack, "xdp_conntrack_prog", cpumapCtOpts},
+		{XDPProgPolicy, "policy", loadBpfrxXdpPolicy, "xdp_policy_prog", cpumapPolicyOpts},
+		{XDPProgNAT, "nat", loadBpfrxXdpNat, "xdp_nat_prog", cpumapReplaceOpts},
+		{XDPProgForward, "forward", loadBpfrxXdpForward, "xdp_forward_prog", cpumapReplaceOpts},
+		{XDPProgNAT64, "nat64", loadBpfrxXdpNat64, "xdp_nat64_prog", cpumapPolicyOpts},
+	}
+	for _, p := range pipeline {
+		pSpec, err := p.load()
+		if err != nil {
+			return fmt.Errorf("load cpumap %s spec: %w", p.name, err)
+		}
+		for _, ps := range pSpec.Programs {
+			ps.AttachType = ebpf.AttachXDPCPUMap
+		}
+		coll, err := ebpf.NewCollectionWithOptions(pSpec, *p.opts)
+		if err != nil {
+			return fmt.Errorf("load cpumap %s: %w", p.name, err)
+		}
+		prog := coll.Programs[p.prog]
+		if prog == nil {
+			return fmt.Errorf("cpumap %s: program %s not found", p.name, p.prog)
+		}
+		delete(coll.Programs, p.prog)
+		coll.Close()
+		fd := uint32(prog.FD())
+		if err := cpumapXdpProgs.Update(p.index, fd, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("cpumap xdp tail call %s: %w", p.name, err)
+		}
+		m.programs["cpumap_"+p.name] = prog
+	}
+	slog.Info("cpumap pipeline programs loaded")
+
+	if err := m.setupCPUMap(cpumapObjs.XdpCpumapProg); err != nil {
+		slog.Warn("cpumap setup failed, single-CPU mode", "err", err)
+	}
+	return nil
+}
+
+// cpumapVal mirrors the kernel's struct bpf_cpumap_val:
+//
+//	struct { __u32 qsize; union { int fd; __u32 id; } bpf_prog; };
+type cpumapVal struct {
+	QSize  uint32
+	ProgFD int32
+}
+
+// setupCPUMap populates the BPF_MAP_TYPE_CPUMAP with one entry per
+// online CPU, each pointing to the cpumap XDP program.  It then sets
+// cpumap_available[0] = numCPUs so xdp_main knows to redirect.
+func (m *Manager) setupCPUMap(prog *ebpf.Program) error {
+	cpuMap, ok := m.maps["cpu_map"]
+	if !ok {
+		return fmt.Errorf("cpu_map not found")
+	}
+	availMap, ok := m.maps["cpumap_available"]
+	if !ok {
+		return fmt.Errorf("cpumap_available not found")
+	}
+
+	numCPUs := runtime.NumCPU()
+	if numCPUs > 256 {
+		numCPUs = 256
+	}
+	if numCPUs < 2 {
+		// Single CPU — cpumap adds overhead with no benefit.
+		slog.Info("single CPU detected, cpumap disabled")
+		return nil
+	}
+
+	progFD := prog.FD()
+
+	// Populate cpu_map: key=cpu_id, value={qsize, prog_fd}.
+	// bpf2go defines the value as uint32 (just qsize) because the C
+	// source uses __u32.  We write the full 8-byte struct via raw bytes.
+	for cpu := 0; cpu < numCPUs; cpu++ {
+		val := cpumapVal{
+			QSize:  2048,
+			ProgFD: int32(progFD),
+		}
+		buf := make([]byte, int(unsafe.Sizeof(val)))
+		binary.NativeEndian.PutUint32(buf[0:4], val.QSize)
+		binary.NativeEndian.PutUint32(buf[4:8], uint32(val.ProgFD))
+
+		if err := cpuMap.Update(uint32(cpu), buf, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("cpu_map update cpu %d: %w", cpu, err)
+		}
+	}
+
+	// Enable cpumap in xdp_main by writing the CPU count.
+	zero := uint32(0)
+	ncpus := uint32(numCPUs)
+	if err := availMap.Update(zero, ncpus, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("cpumap_available update: %w", err)
+	}
+
+	slog.Info("cpumap enabled", "cpus", numCPUs, "qsize", 2048)
 	return nil
 }
