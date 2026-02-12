@@ -2542,3 +2542,147 @@ func TestInterfaceFilterAssignment(t *testing.T) {
 		t.Errorf("expected FilterInputV6=inet6-source-dscp, got %q", unit.FilterInputV6)
 	}
 }
+
+func TestIPsecBindInterface(t *testing.T) {
+	input := `security {
+    ipsec {
+        proposal aes256gcm {
+            protocol esp;
+            encryption-algorithm aes-256-gcm;
+            dh-group 14;
+            lifetime-seconds 3600;
+        }
+        vpn site-a {
+            bind-interface st0.0;
+            gateway 203.0.113.1;
+            local-address 198.51.100.1;
+            ipsec-policy aes256gcm;
+            local-identity 10.0.0.0/24;
+            remote-identity 10.1.0.0/24;
+            pre-shared-key "secret123";
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	vpn := cfg.Security.IPsec.VPNs["site-a"]
+	if vpn == nil {
+		t.Fatal("missing VPN site-a")
+	}
+	if vpn.BindInterface != "st0.0" {
+		t.Errorf("expected BindInterface=st0.0, got %q", vpn.BindInterface)
+	}
+	if vpn.Gateway != "203.0.113.1" {
+		t.Errorf("expected Gateway=203.0.113.1, got %q", vpn.Gateway)
+	}
+	if vpn.LocalAddr != "198.51.100.1" {
+		t.Errorf("expected LocalAddr=198.51.100.1, got %q", vpn.LocalAddr)
+	}
+	if vpn.IPsecPolicy != "aes256gcm" {
+		t.Errorf("expected IPsecPolicy=aes256gcm, got %q", vpn.IPsecPolicy)
+	}
+
+	prop := cfg.Security.IPsec.Proposals["aes256gcm"]
+	if prop == nil {
+		t.Fatal("missing proposal aes256gcm")
+	}
+	if prop.EncryptionAlg != "aes-256-gcm" {
+		t.Errorf("expected EncryptionAlg=aes-256-gcm, got %q", prop.EncryptionAlg)
+	}
+}
+
+func TestIPsecBindInterfaceSetSyntax(t *testing.T) {
+	setCommands := []string{
+		`set security ipsec proposal aes256gcm protocol esp`,
+		`set security ipsec proposal aes256gcm encryption-algorithm aes-256-gcm`,
+		`set security ipsec proposal aes256gcm dh-group 14`,
+		`set security ipsec vpn site-b bind-interface st1.0`,
+		`set security ipsec vpn site-b gateway 10.2.0.1`,
+		`set security ipsec vpn site-b ipsec-policy aes256gcm`,
+		`set security ipsec vpn site-b local-identity 10.0.0.0/24`,
+		`set security ipsec vpn site-b remote-identity 10.2.0.0/24`,
+		`set security ipsec vpn site-b pre-shared-key "vpnkey"`,
+	}
+
+	tree := &ConfigTree{}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	vpn := cfg.Security.IPsec.VPNs["site-b"]
+	if vpn == nil {
+		t.Fatal("missing VPN site-b")
+	}
+	if vpn.BindInterface != "st1.0" {
+		t.Errorf("expected BindInterface=st1.0, got %q", vpn.BindInterface)
+	}
+	if vpn.Gateway != "10.2.0.1" {
+		t.Errorf("expected Gateway=10.2.0.1, got %q", vpn.Gateway)
+	}
+}
+
+func TestHostInboundIPsec(t *testing.T) {
+	input := `security {
+    zones {
+        security-zone vpn {
+            interfaces { st0; }
+            host-inbound-traffic {
+                system-services {
+                    ping;
+                    ipsec;
+                    ike;
+                }
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	zone := cfg.Security.Zones["vpn"]
+	if zone == nil {
+		t.Fatal("missing vpn zone")
+	}
+	if zone.HostInboundTraffic == nil {
+		t.Fatal("missing host-inbound-traffic")
+	}
+
+	services := zone.HostInboundTraffic.SystemServices
+	expected := map[string]bool{"ping": false, "ipsec": false, "ike": false}
+	for _, svc := range services {
+		if _, ok := expected[svc]; ok {
+			expected[svc] = true
+		}
+	}
+	for svc, found := range expected {
+		if !found {
+			t.Errorf("expected system-service %q not found in %v", svc, services)
+		}
+	}
+}

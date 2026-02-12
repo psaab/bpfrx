@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/psaab/bpfrx/pkg/config"
@@ -102,6 +103,9 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 			}
 		}
 
+		// Compute XFRM interface ID from bind-interface name
+		ifID := xfrmiIfID(vpn.BindInterface)
+
 		fmt.Fprintf(&b, "    children {\n")
 		fmt.Fprintf(&b, "      %s {\n", name)
 		if vpn.LocalID != "" {
@@ -111,6 +115,10 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 			fmt.Fprintf(&b, "        remote_ts = %s\n", vpn.RemoteID)
 		}
 		fmt.Fprintf(&b, "        esp_proposals = %s\n", espProposals)
+		if ifID > 0 {
+			fmt.Fprintf(&b, "        if_id_in = %d\n", ifID)
+			fmt.Fprintf(&b, "        if_id_out = %d\n", ifID)
+		}
 		fmt.Fprintf(&b, "      }\n")
 		fmt.Fprintf(&b, "    }\n")
 
@@ -159,6 +167,26 @@ func buildESPProposal(prop *config.IPsecProposal) string {
 	}
 
 	return strings.Join(parts, "-")
+}
+
+// xfrmiIfID derives the XFRM interface ID from a bind-interface name.
+// "st0.0" -> 1, "st1.0" -> 2, "" -> 0 (disabled).
+func xfrmiIfID(bindIface string) uint32 {
+	if bindIface == "" {
+		return 0
+	}
+	devName := bindIface
+	if dot := strings.IndexByte(bindIface, '.'); dot >= 0 {
+		devName = bindIface[:dot]
+	}
+	if len(devName) < 3 || devName[:2] != "st" {
+		return 0
+	}
+	idx, err := strconv.Atoi(devName[2:])
+	if err != nil {
+		return 0
+	}
+	return uint32(idx + 1)
 }
 
 func dhGroupBits(group int) int {

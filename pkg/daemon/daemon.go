@@ -413,6 +413,15 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
+	// 1.5. Create xfrmi interfaces for IPsec VPN tunnels.
+	// Must happen before BPF compilation so compileZones() can discover
+	// the xfrmi interfaces and map them to security zones.
+	if d.routing != nil && len(cfg.Security.IPsec.VPNs) > 0 {
+		if err := d.routing.ApplyXfrmi(cfg.Security.IPsec.VPNs); err != nil {
+			slog.Warn("failed to apply xfrmi interfaces", "err", err)
+		}
+	}
+
 	// 2. Compile eBPF dataplane
 	if d.dp != nil {
 		if _, err := d.dp.Compile(cfg); err != nil {

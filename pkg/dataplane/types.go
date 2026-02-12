@@ -226,6 +226,8 @@ const (
 	HostInboundRadius     = 1 << 15
 	HostInboundIKE        = 1 << 16
 	HostInboundDHCPv6     = 1 << 17
+	HostInboundVRRP       = 1 << 18
+	HostInboundESP        = 1 << 19
 	HostInboundAll        = 0xFFFFFFFF
 )
 
@@ -247,6 +249,7 @@ var HostInboundServiceFlags = map[string]uint32{
 	"radius":     HostInboundRadius,
 	"ike":        HostInboundIKE,
 	"dhcpv6":     HostInboundDHCPv6,
+	"ipsec":      HostInboundESP,
 	"all":        HostInboundAll,
 }
 

@@ -1538,6 +1538,10 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 				if len(p.Keys) >= 2 {
 					vpn.PSK = p.Keys[1]
 				}
+			case "bind-interface":
+				if len(p.Keys) >= 2 {
+					vpn.BindInterface = p.Keys[1]
+				}
 			}
 		}
 

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/vishvananda/netlink"
@@ -17,6 +18,7 @@ type Manager struct {
 	nlHandle *netlink.Handle
 	tunnels  []string // currently created tunnel interface names
 	vrfs     []string // currently created VRF device names
+	xfrmis   []string // currently created xfrmi interface names
 }
 
 // New creates a new routing Manager.
@@ -246,6 +248,116 @@ func (m *Manager) ClearTunnels() error {
 	}
 	m.tunnels = nil
 	return nil
+}
+
+// ApplyXfrmi creates XFRM virtual interfaces for IPsec VPN tunnels.
+// Each VPN with a BindInterface (e.g. "st0.0") gets an xfrmi device
+// with a unique XFRM interface ID derived from the "stN" index.
+func (m *Manager) ApplyXfrmi(vpns map[string]*config.IPsecVPN) error {
+	if err := m.ClearXfrmi(); err != nil {
+		slog.Warn("failed to clear previous xfrmi interfaces", "err", err)
+	}
+
+	for _, vpn := range vpns {
+		if vpn.BindInterface == "" {
+			continue
+		}
+
+		// Parse interface name: "st0.0" -> device "st0", if_id from index
+		ifName, ifID := parseXfrmiName(vpn.BindInterface)
+		if ifName == "" || ifID == 0 {
+			slog.Warn("invalid bind-interface name",
+				"vpn", vpn.Name, "bind-interface", vpn.BindInterface)
+			continue
+		}
+
+		// Check if already exists
+		if _, err := m.nlHandle.LinkByName(ifName); err == nil {
+			link, _ := m.nlHandle.LinkByName(ifName)
+			m.nlHandle.LinkSetUp(link)
+			slog.Debug("xfrmi already exists", "name", ifName, "if_id", ifID)
+			// Track if not already tracked
+			found := false
+			for _, x := range m.xfrmis {
+				if x == ifName {
+					found = true
+					break
+				}
+			}
+			if !found {
+				m.xfrmis = append(m.xfrmis, ifName)
+			}
+			continue
+		}
+
+		xfrmi := &netlink.Xfrmi{
+			LinkAttrs: netlink.LinkAttrs{
+				Name: ifName,
+			},
+			Ifid: ifID,
+		}
+
+		if err := m.nlHandle.LinkAdd(xfrmi); err != nil {
+			slog.Warn("failed to create xfrmi",
+				"name", ifName, "if_id", ifID, "err", err)
+			continue
+		}
+
+		link, err := m.nlHandle.LinkByName(ifName)
+		if err != nil {
+			slog.Warn("failed to find xfrmi after creation",
+				"name", ifName, "err", err)
+			continue
+		}
+
+		if err := m.nlHandle.LinkSetUp(link); err != nil {
+			slog.Warn("failed to bring up xfrmi",
+				"name", ifName, "err", err)
+		}
+
+		slog.Info("xfrmi created", "name", ifName, "if_id", ifID, "vpn", vpn.Name)
+		m.xfrmis = append(m.xfrmis, ifName)
+	}
+
+	return nil
+}
+
+// ClearXfrmi removes all previously created xfrmi interfaces.
+func (m *Manager) ClearXfrmi() error {
+	for _, name := range m.xfrmis {
+		link, err := m.nlHandle.LinkByName(name)
+		if err != nil {
+			continue // already gone
+		}
+		if err := m.nlHandle.LinkDel(link); err != nil {
+			slog.Warn("failed to delete xfrmi", "name", name, "err", err)
+		} else {
+			slog.Info("xfrmi removed", "name", name)
+		}
+	}
+	m.xfrmis = nil
+	return nil
+}
+
+// parseXfrmiName parses "st0.0" into device name "st0" and if_id 1,
+// or "st1.0" into "st1" and if_id 2. The if_id is stN_index + 1.
+func parseXfrmiName(bindIface string) (string, uint32) {
+	// Strip unit number: "st0.0" -> "st0"
+	devName := bindIface
+	if dot := strings.IndexByte(bindIface, '.'); dot >= 0 {
+		devName = bindIface[:dot]
+	}
+
+	// Parse "stN" to get N
+	if len(devName) < 3 || devName[:2] != "st" {
+		return "", 0
+	}
+	idx, err := strconv.Atoi(devName[2:])
+	if err != nil {
+		return "", 0
+	}
+	// if_id starts at 1 (st0 -> 1, st1 -> 2, etc.)
+	return devName, uint32(idx + 1)
 }
 
 // TunnelStatus holds the status of a tunnel interface.

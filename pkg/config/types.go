@@ -692,13 +692,14 @@ type IPsecGateway struct {
 
 // IPsecVPN defines an IPsec VPN tunnel.
 type IPsecVPN struct {
-	Name        string
-	Gateway     string // remote gateway IP or gateway reference
-	IPsecPolicy string // reference to IPsecProposal
-	LocalID     string // local traffic selector (CIDR)
-	RemoteID    string // remote traffic selector (CIDR)
-	PSK         string // pre-shared key
-	LocalAddr   string // local address
+	Name          string
+	Gateway       string // remote gateway IP or gateway reference
+	IPsecPolicy   string // reference to IPsecProposal
+	LocalID       string // local traffic selector (CIDR)
+	RemoteID      string // remote traffic selector (CIDR)
+	PSK           string // pre-shared key
+	LocalAddr     string // local address
+	BindInterface string // tunnel interface (e.g. "st0.0") — creates xfrmi with if_id
 }
 
 // RoutingInstanceConfig represents a VRF-based routing instance.

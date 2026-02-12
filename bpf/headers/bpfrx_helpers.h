@@ -469,6 +469,22 @@ parse_l4hdr(void *data, void *data_end, struct pkt_meta *meta)
 		l4_csum = icmp6->icmp6_cksum;
 		break;
 	}
+	case PROTO_ESP: {
+		/* ESP header: 4-byte SPI + 4-byte sequence number */
+		struct {
+			__be32 spi;
+			__be32 seq;
+		} *esp = l4;
+		if ((void *)(esp + 1) > data_end)
+			return -1;
+		/* Split 32-bit SPI into two 16-bit halves for session tracking.
+		 * Combined src_port+dst_port reconstructs the full SPI. */
+		meta->src_port = (__be16)(esp->spi >> 16);
+		meta->dst_port = (__be16)(esp->spi & 0xFFFF);
+		meta->payload_offset = meta->l4_offset + 8;
+		/* No L4 checksum for ESP (auth covers entire payload) */
+		break;
+	}
 	default:
 		meta->payload_offset = meta->l4_offset;
 		break;
@@ -768,6 +784,10 @@ host_inbound_flag(struct pkt_meta *meta)
 	if (proto == 89)
 		return HOST_INBOUND_OSPF;
 
+	/* ESP (protocol 50) → HOST_INBOUND_ESP */
+	if (proto == PROTO_ESP)
+		return HOST_INBOUND_ESP;
+
 	/* TCP/UDP port-based services */
 	__u16 port = bpf_ntohs(meta->dst_port);
 	switch (port) {
@@ -786,6 +806,7 @@ host_inbound_flag(struct pkt_meta *meta)
 	case 514:          return HOST_INBOUND_SYSLOG;
 	case 1812: case 1813: return HOST_INBOUND_RADIUS;
 	case 500:          return HOST_INBOUND_IKE;
+	case 4500:         return HOST_INBOUND_IKE;   /* IKE NAT-T */
 	}
 
 	/* Traceroute: UDP ports 33434-33523 */
