@@ -211,16 +211,18 @@ cmd_create_vm() {
 
 	# Hot-add SR-IOV VF via PCI passthrough after boot
 	# (NIC type fails with agent race; PCI type does raw VFIO passthrough)
-	local vf_pci
+	# Capture MAC before passthrough (host sysfs disappears after VFIO bind)
+	local vf_pci vf_mac
 	vf_pci=$(readlink -f /sys/class/net/enp101s0f0v0/device 2>/dev/null | xargs basename 2>/dev/null)
+	vf_mac=$(cat /sys/class/net/enp101s0f0v0/address 2>/dev/null || echo "")
 	if [[ -n "$vf_pci" ]]; then
-		info "Adding SR-IOV VF ($vf_pci) to VM via PCI passthrough..."
+		info "Adding SR-IOV VF ($vf_pci, MAC=$vf_mac) to VM via PCI passthrough..."
 		incus config device add "$INSTANCE_NAME" internet pci address="$vf_pci"
 	else
 		warn "SR-IOV VF enp101s0f0v0 not found, skipping internet interface"
 	fi
 
-	provision_instance vm
+	provision_instance vm "$vf_mac"
 	info "VM ready. Run '$0 deploy' to push bpfrxd binary."
 }
 
@@ -249,51 +251,63 @@ provision_instance() {
 		fi
 	done
 
-	# Bring up interfaces (IPs are assigned by bpfrxd from config)
-	info "Bringing up interfaces..."
-	incus exec "$INSTANCE_NAME" -- ip link set "$iface_trust" up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set "$iface_untrust" up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set "$iface_dmz" up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set "$iface_tunnel" up 2>/dev/null || true
-	# SR-IOV WAN interface (enp10s0 in VM, added via PCI passthrough)
+	# Bootstrap systemd-networkd .link files for interface renaming.
+	# bpfrxd writes the same files once running, but these bootstrap files
+	# ensure interfaces are renamed before the daemon's first start.
+	# All interfaces (including mgmt) are fully managed by bpfrxd.
+	info "Writing bootstrap networkd .link files..."
 	if [[ "$type" == "vm" ]]; then
-		incus exec "$INSTANCE_NAME" -- ip link set enp10s0 up 2>/dev/null || true
+		# Read MAC addresses from kernel interfaces
+		local mac_mgmt mac_trust mac_untrust mac_dmz mac_tunnel mac_wan
+		mac_mgmt=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_mgmt"/address 2>/dev/null || true)
+		mac_trust=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_trust"/address 2>/dev/null || true)
+		mac_untrust=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_untrust"/address 2>/dev/null || true)
+		mac_dmz=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_dmz"/address 2>/dev/null || true)
+		mac_tunnel=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_tunnel"/address 2>/dev/null || true)
+		mac_wan=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/enp10s0f0np0/address 2>/dev/null || true)
+
+		# Write .link files (same format bpfrxd generates)
+		for pair in "mgmt0:$mac_mgmt" "trust0:$mac_trust" "untrust0:$mac_untrust" \
+			"dmz0:$mac_dmz" "tunnel0:$mac_tunnel" "wan0:$mac_wan"; do
+			local name="${pair%%:*}" mac="${pair#*:}"
+			if [[ -n "$mac" ]]; then
+				incus exec "$INSTANCE_NAME" -- bash -c "cat > /etc/systemd/network/10-bpfrx-${name}.link << LINKEOF
+# Managed by bpfrxd — do not edit
+[Match]
+MACAddress=${mac}
+
+[Link]
+Name=${name}
+LINKEOF"
+			fi
+		done
+
+		# Remove any stale non-bpfrx networkd files for firewall interfaces
+		incus exec "$INSTANCE_NAME" -- rm -f \
+			/etc/systemd/network/enp5s0.network \
+			/etc/systemd/network/10-mgmt0.network \
+			/etc/systemd/network/10-mgmt0.link 2>/dev/null || true
+
+		incus exec "$INSTANCE_NAME" -- networkctl reload
+		sleep 1
 	fi
 
-	# Networkd config: FRR is sole route manager, suppress DHCP routes on mgmt + internet
-	if [[ "$type" == "vm" ]]; then
-		local use_networkd=false
-		if incus exec "$INSTANCE_NAME" -- systemctl is-active systemd-networkd &>/dev/null; then
-			use_networkd=true
-		fi
-		if [[ "$use_networkd" == "true" ]]; then
-			# Management interface: keep DHCP for address but suppress default route
-			incus exec "$INSTANCE_NAME" -- bash -c 'cat > /etc/systemd/network/enp5s0.network' <<-'EOF'
-			[Match]
-			Name=enp5s0
-			[Network]
-			DHCP=true
-			[DHCPv4]
-			UseRoutes=false
-			UseDomains=true
-			UseMTU=true
-			[DHCP]
-			ClientIdentifier=mac
-			EOF
-			# Internet interface: no networkd DHCP (bpfrxd manages this + FRR routes)
-			incus exec "$INSTANCE_NAME" -- bash -c 'cat > /etc/systemd/network/50-internet.network' <<-'EOF'
-			[Match]
-			Name=enp10s0*
-			[Link]
-			RequiredForOnline=no
-			EOF
-			incus exec "$INSTANCE_NAME" -- networkctl reload
-		fi
-	fi
+	# Bring up interfaces (IPs are assigned by bpfrxd from config)
+	info "Bringing up interfaces..."
+	incus exec "$INSTANCE_NAME" -- ip link set mgmt0 up 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- ip link set trust0 up 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- ip link set untrust0 up 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- ip link set dmz0 up 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- ip link set tunnel0 up 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- ip link set wan0 up 2>/dev/null || true
 
 	info "Configuring sysctl..."
 	incus exec "$INSTANCE_NAME" -- bash -c 'cat > /etc/sysctl.d/99-bpf.conf <<EOF
 net.core.bpf_jit_enable=1
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.all.accept_ra=0
+net.ipv6.conf.default.accept_ra=0
 EOF'
 	incus exec "$INSTANCE_NAME" -- sysctl --system
 

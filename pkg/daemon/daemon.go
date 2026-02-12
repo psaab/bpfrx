@@ -32,6 +32,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/grpcapi"
 	"github.com/psaab/bpfrx/pkg/ipsec"
 	"github.com/psaab/bpfrx/pkg/logging"
+	"github.com/psaab/bpfrx/pkg/networkd"
 	"github.com/psaab/bpfrx/pkg/radvd"
 	"github.com/psaab/bpfrx/pkg/routing"
 	"github.com/psaab/bpfrx/pkg/rpm"
@@ -53,6 +54,7 @@ type Daemon struct {
 	opts         Options
 	store        *configstore.Store
 	dp           *dataplane.Manager
+	networkd     *networkd.Manager
 	routing      *routing.Manager
 	frr          *frr.Manager
 	ipsec        *ipsec.Manager
@@ -106,6 +108,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.frr = frr.New()
 		d.ipsec = ipsec.New()
 		d.radvd = radvd.New()
+		d.networkd = networkd.New()
 		d.dhcpServer = dhcpserver.New()
 	}
 
@@ -349,20 +352,24 @@ func (d *Daemon) Run(ctx context.Context) error {
 }
 
 // isInteractive returns true if stdin is a real terminal (not /dev/null or a pipe).
-// enableForwarding enables IPv4 and IPv6 forwarding via sysctl.
+// enableForwarding enables IPv4 and IPv6 forwarding via sysctl
+// and disables RA acceptance on all interfaces.
 // A firewall must forward packets between interfaces; without this,
-// the kernel drops all transit traffic.
+// the kernel drops all transit traffic. A firewall must not accept
+// RAs — it uses its own configured routes exclusively.
 func enableForwarding() {
 	sysctls := map[string]string{
-		"/proc/sys/net/ipv4/ip_forward":          "1",
-		"/proc/sys/net/ipv6/conf/all/forwarding":  "1",
+		"/proc/sys/net/ipv4/ip_forward":             "1",
+		"/proc/sys/net/ipv6/conf/all/forwarding":    "1",
+		"/proc/sys/net/ipv6/conf/all/accept_ra":     "0",
+		"/proc/sys/net/ipv6/conf/default/accept_ra": "0",
 	}
 	for path, val := range sysctls {
 		if err := os.WriteFile(path, []byte(val), 0644); err != nil {
-			slog.Warn("failed to enable forwarding", "path", path, "err", err)
+			slog.Warn("failed to set sysctl", "path", path, "err", err)
 		}
 	}
-	slog.Info("IP forwarding enabled")
+	slog.Info("IP forwarding enabled, RA acceptance disabled")
 }
 
 func isInteractive() bool {
@@ -423,9 +430,18 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	}
 
 	// 2. Compile eBPF dataplane
+	var compileResult *dataplane.CompileResult
 	if d.dp != nil {
-		if _, err := d.dp.Compile(cfg); err != nil {
+		var err error
+		if compileResult, err = d.dp.Compile(cfg); err != nil {
 			slog.Warn("failed to compile dataplane", "err", err)
+		}
+	}
+
+	// 2.5. Write systemd-networkd config for managed interfaces
+	if d.networkd != nil && compileResult != nil && len(compileResult.ManagedInterfaces) > 0 {
+		if err := d.networkd.Apply(compileResult.ManagedInterfaces); err != nil {
+			slog.Warn("failed to apply networkd config", "err", err)
 		}
 	}
 

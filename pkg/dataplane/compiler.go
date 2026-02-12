@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/networkd"
 	"github.com/vishvananda/netlink"
 )
 
@@ -34,6 +36,10 @@ type CompileResult struct {
 	// atomically switches to programs with fully-populated maps.
 	pendingXDP []int
 	pendingTC  []int
+
+	// ManagedInterfaces describes all interfaces managed by the firewall,
+	// used by the networkd manager to generate .link and .network files.
+	ManagedInterfaces []networkd.InterfaceConfig
 }
 
 // Compile translates a typed Config into eBPF map entries.
@@ -252,6 +258,12 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, error) {
 		return 0, fmt.Errorf("set VLAN sub-interface %s up: %w", subName, err)
 	}
 
+	// Disable RA acceptance — firewall uses its own configured routes.
+	raPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_ra", subName)
+	if err := os.WriteFile(raPath, []byte("0"), 0644); err != nil {
+		slog.Warn("failed to disable accept_ra on VLAN sub-interface", "name", subName, "err", err)
+	}
+
 	slog.Info("created VLAN sub-interface",
 		"name", subName, "parent", parentName, "vlan_id", vlanID,
 		"ifindex", link.Attrs().Index)
@@ -420,15 +432,20 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 						physName, vlanID, err)
 				}
 
-				// Reconcile addresses on sub-interface (removes stale, adds missing)
+				// Reconcile addresses on sub-interface (removes stale, adds missing).
+				// DHCP-managed sub-interfaces are skipped.
 				subName := fmt.Sprintf("%s.%d", physName, vlanID)
 				var addrs []string
+				isDHCPSub := false
 				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
 					if unit, ok := ifCfg.Units[unitNum]; ok {
 						addrs = unit.Addresses
+						isDHCPSub = unit.DHCP || unit.DHCPv6
 					}
 				}
-				reconcileInterfaceAddresses(subName, addrs)
+				if !isDHCPSub {
+					reconcileInterfaceAddresses(subName, addrs)
+				}
 
 				slog.Info("VLAN sub-interface configured",
 					"parent", physName, "vlan_id", vlanID,
@@ -474,15 +491,20 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 				attached[physIface.Index] = true
 			}
 
-			// Reconcile addresses for non-VLAN interfaces (removes stale, adds missing)
+			// Reconcile addresses for non-VLAN, non-DHCP interfaces (removes stale, adds missing).
+			// DHCP-managed interfaces are skipped — the DHCP client manages their addresses.
 			if vlanID == 0 {
 				var addrs []string
+				isDHCP := false
 				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
 					if unit, ok := ifCfg.Units[unitNum]; ok {
 						addrs = unit.Addresses
+						isDHCP = unit.DHCP || unit.DHCPv6
 					}
 				}
-				reconcileInterfaceAddresses(physName, addrs)
+				if !isDHCP {
+					reconcileInterfaceAddresses(physName, addrs)
+				}
 			}
 
 			slog.Info("zone interface configured",
@@ -494,6 +516,134 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 
 	// Store pending XDP ifindexes for deferred attachment after all compile phases.
 	result.pendingXDP = xdpIfindexes
+
+	// Collect managed interface info for networkd config generation.
+	// Iterate over configured interfaces (not zones) to get a clean
+	// per-interface view including VLAN parent and sub-interface entries.
+	seen := make(map[string]bool)
+	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
+		physIface, err := net.InterfaceByName(ifName)
+		if err != nil {
+			continue
+		}
+		mac := physIface.HardwareAddr.String()
+		if mac == "" {
+			continue
+		}
+
+		if ifCfg.VlanTagging {
+			// VLAN parent: no addresses, just rename
+			if !seen[ifName] {
+				seen[ifName] = true
+				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
+					Name:         ifName,
+					MACAddress:   mac,
+					IsVLANParent: true,
+				})
+			}
+			// VLAN sub-interfaces get their own .network file
+			for _, unit := range ifCfg.Units {
+				if unit.VlanID > 0 {
+					subName := fmt.Sprintf("%s.%d", ifName, unit.VlanID)
+					if !seen[subName] {
+						seen[subName] = true
+						result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
+							Name:      subName,
+							Addresses: unit.Addresses,
+							DHCPv4:    unit.DHCP,
+							DHCPv6:    unit.DHCPv6,
+						})
+					}
+				}
+			}
+		} else {
+			// Regular interface (non-VLAN)
+			if !seen[ifName] {
+				seen[ifName] = true
+				// Collect addresses from all units
+				var addrs []string
+				var dhcpv4, dhcpv6 bool
+				for _, unit := range ifCfg.Units {
+					addrs = append(addrs, unit.Addresses...)
+					if unit.DHCP {
+						dhcpv4 = true
+					}
+					if unit.DHCPv6 {
+						dhcpv6 = true
+					}
+				}
+				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
+					Name:       ifName,
+					MACAddress: mac,
+					Addresses:  addrs,
+					DHCPv4:     dhcpv4,
+					DHCPv6:     dhcpv6,
+				})
+			}
+		}
+	}
+
+	// Discover all system interfaces and mark unconfigured ones as unmanaged.
+	// Unmanaged interfaces are brought down and have addresses removed to
+	// prevent traffic leaking through unconfigured paths.
+	//
+	// Skip interfaces created by the daemon itself (VRFs, tunnels).
+	daemonOwned := make(map[string]bool)
+	for _, ri := range cfg.RoutingInstances {
+		daemonOwned["vrf-"+ri.Name] = true
+	}
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc.Tunnel != nil {
+			daemonOwned[ifc.Tunnel.Name] = true
+		}
+	}
+
+	allIfaces, _ := net.Interfaces()
+	for _, iface := range allIfaces {
+		name := iface.Name
+		// Skip loopback, already-managed, and daemon-created interfaces
+		if name == "lo" || seen[name] || daemonOwned[name] {
+			continue
+		}
+		// Skip VLAN sub-interfaces of managed parents
+		if idx := strings.IndexByte(name, '.'); idx >= 0 {
+			if seen[name[:idx]] {
+				continue
+			}
+		}
+		mac := iface.HardwareAddr.String()
+		if mac == "" {
+			continue
+		}
+
+		seen[name] = true
+		result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
+			Name:       name,
+			MACAddress: mac,
+			Unmanaged:  true,
+		})
+
+		// Bring down and remove all non-link-local addresses immediately.
+		// The networkd .network file with ActivationPolicy=always-down
+		// ensures it stays down across reboots.
+		nl, err := netlink.LinkByIndex(iface.Index)
+		if err != nil {
+			continue
+		}
+		addrs, _ := netlink.AddrList(nl, netlink.FAMILY_ALL)
+		for i := range addrs {
+			if addrs[i].IP.IsLinkLocalUnicast() || addrs[i].IP.IsLinkLocalMulticast() {
+				continue
+			}
+			if err := netlink.AddrDel(nl, &addrs[i]); err == nil {
+				slog.Info("removed address from unmanaged interface",
+					"addr", addrs[i].IPNet, "name", name)
+			}
+		}
+		if err := netlink.LinkSetDown(nl); err == nil {
+			slog.Info("brought down unmanaged interface", "name", name)
+		}
+	}
 
 	return nil
 }
