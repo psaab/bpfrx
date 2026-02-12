@@ -209,25 +209,36 @@ cmd_create_vm() {
 		fi
 	done
 
-	# Hot-add SR-IOV VF via PCI passthrough after boot
+	# Hot-add PCI passthrough NICs after boot
 	# (NIC type fails with agent race; PCI type does raw VFIO passthrough)
-	# Capture MAC before passthrough (host sysfs disappears after VFIO bind)
-	local vf_pci vf_mac
-	vf_pci=$(readlink -f /sys/class/net/enp101s0f0v0/device 2>/dev/null | xargs basename 2>/dev/null)
-	vf_mac=$(cat /sys/class/net/enp101s0f0v0/address 2>/dev/null || echo "")
-	if [[ -n "$vf_pci" ]]; then
-		info "Adding SR-IOV VF ($vf_pci, MAC=$vf_mac) to VM via PCI passthrough..."
-		incus config device add "$INSTANCE_NAME" internet pci address="$vf_pci"
+	# Capture MACs before passthrough (host sysfs disappears after VFIO bind)
+	local wan_pci wan_mac loss_pci loss_mac
+	wan_pci=$(readlink -f /sys/class/net/enp101s0f0v0/device 2>/dev/null | xargs basename 2>/dev/null)
+	wan_mac=$(cat /sys/class/net/enp101s0f0v0/address 2>/dev/null || echo "")
+	if [[ -n "$wan_pci" ]]; then
+		info "Adding WAN NIC ($wan_pci, MAC=$wan_mac) to VM via PCI passthrough..."
+		incus config device add "$INSTANCE_NAME" internet pci address="$wan_pci"
 	else
-		warn "SR-IOV VF enp101s0f0v0 not found, skipping internet interface"
+		warn "WAN interface enp101s0f0v0 not found, skipping"
 	fi
 
-	provision_instance vm "$vf_mac"
+	loss_pci=$(readlink -f /sys/class/net/enp101s0f1np1/device 2>/dev/null | xargs basename 2>/dev/null)
+	loss_mac=$(cat /sys/class/net/enp101s0f1np1/address 2>/dev/null || echo "")
+	if [[ -n "$loss_pci" ]]; then
+		info "Adding loss NIC ($loss_pci, MAC=$loss_mac) to VM via PCI passthrough..."
+		incus config device add "$INSTANCE_NAME" loss pci address="$loss_pci"
+	else
+		warn "Loss interface enp101s0f1np1 not found, skipping"
+	fi
+
+	provision_instance vm "$wan_mac" "$loss_mac"
 	info "VM ready. Run '$0 deploy' to push bpfrxd binary."
 }
 
 provision_instance() {
 	local type="$1"  # "vm" or "ct"
+	local wan_mac_arg="${2:-}"
+	local loss_mac_arg="${3:-}"
 
 	# Interface names differ between VM (PCI enumeration) and container
 	local iface_mgmt iface_trust iface_untrust iface_dmz iface_tunnel
@@ -265,10 +276,14 @@ provision_instance() {
 		mac_dmz=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_dmz"/address 2>/dev/null || true)
 		mac_tunnel=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_tunnel"/address 2>/dev/null || true)
 		mac_wan=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/enp10s0f0np0/address 2>/dev/null || true)
+		# loss0 MAC: try reading from VM, fall back to arg passed from host
+		local mac_loss
+		mac_loss=$(incus exec "$INSTANCE_NAME" -- bash -c 'for i in /sys/class/net/enp*s0*np1/address; do cat "$i" 2>/dev/null && break; done' 2>/dev/null || true)
+		[[ -z "$mac_loss" ]] && mac_loss="$loss_mac_arg"
 
 		# Write .link files (same format bpfrxd generates)
 		for pair in "mgmt0:$mac_mgmt" "trust0:$mac_trust" "untrust0:$mac_untrust" \
-			"dmz0:$mac_dmz" "tunnel0:$mac_tunnel" "wan0:$mac_wan"; do
+			"dmz0:$mac_dmz" "tunnel0:$mac_tunnel" "wan0:$mac_wan" "loss0:$mac_loss"; do
 			local name="${pair%%:*}" mac="${pair#*:}"
 			if [[ -n "$mac" ]]; then
 				incus exec "$INSTANCE_NAME" -- bash -c "cat > /etc/systemd/network/10-bpfrx-${name}.link << LINKEOF
@@ -300,6 +315,7 @@ LINKEOF"
 	incus exec "$INSTANCE_NAME" -- ip link set dmz0 up 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- ip link set tunnel0 up 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- ip link set wan0 up 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- ip link set loss0 up 2>/dev/null || true
 
 	info "Configuring sysctl..."
 	incus exec "$INSTANCE_NAME" -- bash -c 'cat > /etc/sysctl.d/99-bpf.conf <<EOF
