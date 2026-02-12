@@ -316,11 +316,6 @@ incus exec bpfrx-fw -- curl -s http://127.0.0.1:8080/metrics | grep bpfrx
 
 ### Common Issues
 
-**Configure mode double echo via `incus exec -- cli`**
-- Extra echo when typing in configure mode
-- PTY multiplexing between incus exec and chzyer/readline
-- Workaround: use non-interactive mode for automated testing
-
 **"operation not supported" on XDP attach**
 - Interface driver doesn't support native XDP
 - Expected for iavf — falls back to generic automatically
