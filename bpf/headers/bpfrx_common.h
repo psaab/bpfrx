@@ -192,6 +192,9 @@ struct icmp6hdr {
 #define SESS_FLAG_STATIC_NAT   (1 << 6)
 #define SESS_FLAG_NAT64        (1 << 7)
 
+/* pkt_meta.meta_flags bits */
+#define META_FLAG_EMBEDDED_ICMP  (1 << 0)
+
 /* Per-rule logging flags (policy_rule.log and session_value.log_flags) */
 #define LOG_FLAG_SESSION_INIT  (1 << 0)
 #define LOG_FLAG_SESSION_CLOSE (1 << 1)
@@ -325,7 +328,8 @@ struct pkt_meta {
 	__u8   addr_family;  /* AF_INET=2, AF_INET6=10 */
 	__u8   dscp;          /* DSCP value (top 6 bits of TOS/traffic-class) */
 	__u8   csum_partial;  /* 1 = L4 csum is pseudo-header only (CHECKSUM_PARTIAL) */
-	__u8   pad_meta[2];   /* alignment */
+	__u8   meta_flags;     /* META_FLAG_* bits */
+	__u8   embedded_proto; /* inner protocol for ICMP error rewrite */
 
 	/* ICMP specific */
 	__be16 icmp_id;

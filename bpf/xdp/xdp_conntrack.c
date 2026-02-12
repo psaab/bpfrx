@@ -171,6 +171,168 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 	}
 }
 
+/*
+ * Handle ICMP error packets (Dest Unreachable, Time Exceeded, Param Problem)
+ * that contain an embedded original packet header.  Reverse-lookup the SNAT
+ * translation via dnat_table, match the original session, then set up
+ * forwarding + NAT rewrite metadata so the error reaches the client.
+ *
+ * Returns XDP_PASS on tail-call success, -1 on no match.
+ */
+static __always_inline int
+handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	void *data     = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+
+	/* Locate embedded IP header (starts after 8-byte ICMP header) */
+	__u16 emb_ip_off = meta->l4_offset + 8;
+	if (emb_ip_off >= 200)
+		return -1;
+	struct iphdr *emb_ip = data + emb_ip_off;
+	if ((void *)(emb_ip + 1) > data_end)
+		return -1;
+
+	/* Read all embedded IP fields to stack NOW -- the verifier
+	 * loses packet range tracking after branches below. */
+	__u8  emb_proto = emb_ip->protocol;
+	__u8  emb_ihl   = emb_ip->ihl;
+	__be32 emb_saddr = emb_ip->saddr;
+	__be32 emb_daddr = emb_ip->daddr;
+
+	if (emb_ihl < 5 || emb_ihl > 15)
+		return -1;
+
+	/* Parse embedded L4 ports (first 4 bytes guaranteed by RFC) */
+	__u16 emb_l4_off = emb_ip_off + ((__u16)emb_ihl) * 4;
+	if (emb_l4_off >= 250)
+		return -1;
+
+	/* Access embedded L4 through a single pointer variable so the
+	 * verifier tracks the bounds check and access on the same reg. */
+	__be16 emb_src_port = 0, emb_dst_port = 0;
+	void *emb_l4 = data + emb_l4_off;
+	if (emb_proto == PROTO_TCP || emb_proto == PROTO_UDP) {
+		if (emb_l4 + 4 > data_end)
+			return -1;
+		emb_src_port = *(__be16 *)emb_l4;
+		emb_dst_port = *(__be16 *)(emb_l4 + 2);
+	} else if (emb_proto == PROTO_ICMP) {
+		/* Echo ID is at offset 4 in ICMP header (type+code+csum+id) */
+		if (emb_l4 + 6 > data_end)
+			return -1;
+		emb_src_port = *(__be16 *)(emb_l4 + 4);
+		emb_dst_port = emb_src_port;
+	}
+
+	/* All packet data is now on the stack -- no more packet pointer
+	 * dereferences.  Use stack copies (emb_saddr, emb_daddr, etc.). */
+
+	/* Reverse SNAT via dnat_table: the embedded src is the SNAT'd address */
+	struct dnat_key dk = {
+		.protocol = emb_proto,
+		.dst_ip   = emb_saddr,
+		.dst_port = emb_src_port,
+	};
+	struct dnat_value *dv = bpf_map_lookup_elem(&dnat_table, &dk);
+
+	__be32 orig_src_ip;
+	__be16 orig_src_port;
+	int needs_nat = 0;
+
+	if (dv) {
+		/* SNAT flow: dnat_table gives us the pre-SNAT source */
+		orig_src_ip = dv->new_dst_ip;
+		orig_src_port = dv->new_dst_port;
+		needs_nat = 1;
+	} else {
+		/* Non-SNAT flow: use embedded addresses directly */
+		orig_src_ip = emb_saddr;
+		orig_src_port = emb_src_port;
+	}
+
+	/* Look up original session with pre-SNAT 5-tuple.
+	 * For ICMP echo, src_port == dst_port == echo_id.  SNAT rewrites
+	 * the echo ID, so both ports in the embedded packet are the
+	 * SNAT'd value.  Use the de-SNAT'd port for both. */
+	__be16 lookup_dst_port = emb_dst_port;
+	if (emb_proto == PROTO_ICMP && needs_nat)
+		lookup_dst_port = orig_src_port;
+
+	struct session_key sk = {
+		.src_ip   = orig_src_ip,
+		.dst_ip   = emb_daddr,
+		.src_port = orig_src_port,
+		.dst_port = lookup_dst_port,
+		.protocol = emb_proto,
+	};
+	struct session_value *sess = bpf_map_lookup_elem(&sessions, &sk);
+	if (!sess) {
+		struct session_key rk;
+		ct_reverse_key(&sk, &rk);
+		sess = bpf_map_lookup_elem(&sessions, &rk);
+	}
+	if (!sess)
+		return -1;  /* No matching session */
+
+	/* Touch the session so GC doesn't expire it while errors flow */
+	sess->last_seen = bpf_ktime_get_ns() / 1000000000ULL;
+
+	/* FIB lookup to route toward the original client */
+	struct bpf_fib_lookup fib = {};
+	fib.family = AF_INET;
+	fib.l4_protocol = PROTO_ICMP;
+	fib.tot_len = meta->pkt_len;
+	fib.ifindex = meta->ingress_ifindex;
+	fib.ipv4_src = meta->src_ip.v4;
+	fib.ipv4_dst = orig_src_ip;
+
+	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
+		return -1;
+
+	/* Resolve VLAN sub-interface */
+	__u32 egress_if = fib.ifindex;
+	struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map,
+							 &egress_if);
+	if (vi) {
+		meta->fwd_ifindex = vi->parent_ifindex;
+		meta->egress_vlan_id = vi->vlan_id;
+	} else {
+		meta->fwd_ifindex = egress_if;
+		meta->egress_vlan_id = 0;
+	}
+	__builtin_memcpy(meta->fwd_dmac, fib.dmac, 6);
+	__builtin_memcpy(meta->fwd_smac, fib.smac, 6);
+
+	/* Resolve egress zone */
+	struct iface_zone_key ezk = {
+		.ifindex = meta->fwd_ifindex,
+		.vlan_id = meta->egress_vlan_id,
+	};
+	__u16 *ez = bpf_map_lookup_elem(&iface_zone_map, &ezk);
+	if (ez)
+		meta->egress_zone = *ez;
+
+	if (needs_nat) {
+		/* Outer dst rewrite: WAN IP -> original client */
+		meta->dst_ip.v4 = orig_src_ip;
+		meta->nat_flags = SESS_FLAG_DNAT;
+		/* Embedded rewrite info */
+		__builtin_memset(&meta->nat_src_ip, 0,
+				 sizeof(meta->nat_src_ip));
+		meta->nat_src_ip.v4 = orig_src_ip;
+		meta->nat_src_port = orig_src_port;
+		meta->meta_flags = META_FLAG_EMBEDDED_ICMP;
+		meta->embedded_proto = emb_proto;
+		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
+	} else {
+		/* No NAT, just forward */
+		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+	}
+	return XDP_PASS;
+}
+
 SEC("xdp")
 int xdp_conntrack_prog(struct xdp_md *ctx)
 {
@@ -247,6 +409,24 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 					 * translation (this is return traffic). */
 					bpf_tail_call(ctx, &xdp_progs,
 						      XDP_PROG_NAT64);
+					return XDP_PASS;
+				}
+
+				/* ICMP error embedded packet matching */
+				if (meta->protocol == PROTO_ICMP &&
+				    (meta->icmp_type == 3 ||
+				     meta->icmp_type == 11 ||
+				     meta->icmp_type == 12)) {
+					int ret = handle_embedded_icmp_v4(
+						ctx, meta);
+					if (ret != -1)
+						return ret;
+					/* No matching forwarded session —
+					 * pass to kernel as host-inbound
+					 * (e.g. firewall-originated traceroute). */
+					meta->fwd_ifindex = 0;
+					bpf_tail_call(ctx, &xdp_progs,
+						      XDP_PROG_FORWARD);
 					return XDP_PASS;
 				}
 

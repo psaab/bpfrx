@@ -238,7 +238,8 @@ type bpfrxXdpNat64PktMeta struct {
 	AddrFamily     uint8
 	Dscp           uint8
 	CsumPartial    uint8
-	PadMeta        [2]uint8
+	MetaFlags      uint8
+	EmbeddedProto  uint8
 	IcmpId         uint16
 	IcmpType       uint8
 	IcmpCode       uint8

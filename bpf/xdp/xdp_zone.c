@@ -476,9 +476,27 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	} else {
 		/*
 		 * No route or packet is destined locally.
-		 * Send to xdp_forward which handles host-inbound
-		 * checks and VLAN tag restoration for sub-interfaces.
+		 *
+		 * ICMP error packets (Dest Unreachable, Time Exceeded,
+		 * Param Problem) with a locally-destined outer IP may
+		 * relate to a forwarded session whose original packet
+		 * was SNAT'd.  Route through conntrack for embedded
+		 * packet matching so the error reaches the client.
 		 */
+		if (meta->protocol == PROTO_ICMP &&
+		    (meta->icmp_type == 3 || meta->icmp_type == 11 ||
+		     meta->icmp_type == 12)) {
+			struct flow_config *fc =
+				bpf_map_lookup_elem(&flow_config_map, &zero);
+			if (fc && fc->allow_embedded_icmp) {
+				bpf_tail_call(ctx, &xdp_progs,
+					      XDP_PROG_CONNTRACK);
+				return XDP_PASS;
+			}
+		}
+
+		/* Send to xdp_forward which handles host-inbound
+		 * checks and VLAN tag restoration for sub-interfaces. */
 		meta->fwd_ifindex = 0;
 		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
 		return XDP_PASS;

@@ -158,8 +158,24 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 	 * triggers when XDP passed a packet to the kernel for ARP/NDP
 	 * neighbor resolution (NO_NEIGH case).
 	 */
-	if (meta->ingress_ifindex != 0)
+	if (meta->ingress_ifindex != 0) {
+		/* Allow ICMP error types through — these were already
+		 * validated by the XDP pipeline against an existing
+		 * session and rewritten to reach the original client. */
+		if (meta->protocol == PROTO_ICMP &&
+		    (meta->icmp_type == 3 || meta->icmp_type == 11 ||
+		     meta->icmp_type == 12)) {
+			__u32 fc_key = 0;
+			struct flow_config *fc =
+				bpf_map_lookup_elem(&flow_config_map, &fc_key);
+			if (fc && fc->allow_embedded_icmp) {
+				bpf_tail_call(skb, &tc_progs,
+					      TC_PROG_FORWARD);
+				return TC_ACT_OK;
+			}
+		}
 		return TC_ACT_SHOT;
+	}
 
 	/* Locally-originated traffic -- tail-call to forward (pass through) */
 	bpf_tail_call(skb, &tc_progs, TC_PROG_FORWARD);

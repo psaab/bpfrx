@@ -211,6 +211,83 @@ nat_rewrite_v4(void *data, void *data_end, struct pkt_meta *meta)
 }
 
 /*
+ * Rewrite the embedded original packet inside an ICMP error message.
+ * Reverses the SNAT translation so the error reaches the original client.
+ * Updates: embedded src IP, embedded src port, outer ICMP checksum.
+ */
+static __always_inline void
+nat_rewrite_embedded_v4(void *data, void *data_end, struct pkt_meta *meta)
+{
+	if (meta->l4_offset >= 128)
+		return;
+	struct icmphdr *outer_icmp = data + meta->l4_offset;
+	if ((void *)(outer_icmp + 1) > data_end)
+		return;
+
+	__u16 emb_ip_off = meta->l4_offset + 8;
+	if (emb_ip_off >= 200)
+		return;
+	struct iphdr *emb_ip = data + emb_ip_off;
+	if ((void *)(emb_ip + 1) > data_end)
+		return;
+
+	/* Rewrite embedded source IP.
+	 * The outer ICMP checksum covers the entire payload including the
+	 * embedded IP header.  Changing emb_ip->saddr AND emb_ip->check
+	 * both modify bytes in the outer ICMP payload, so the outer
+	 * checksum must account for both changes. */
+	__be32 old_src = emb_ip->saddr;
+	__be32 new_src = meta->nat_src_ip.v4;
+	if (old_src != new_src) {
+		__sum16 old_ip_check = emb_ip->check;
+		emb_ip->saddr = new_src;
+		csum_update_4(&emb_ip->check, old_src, new_src);
+		csum_update_4(&outer_icmp->checksum, old_src, new_src);
+		csum_update_2(&outer_icmp->checksum,
+			      old_ip_check, emb_ip->check);
+	}
+
+	/* Rewrite embedded L4 source port */
+	__u8 emb_ihl = emb_ip->ihl;
+	if (emb_ihl < 5 || emb_ihl > 15)
+		return;
+	__u16 emb_l4_off = emb_ip_off + ((__u16)emb_ihl) * 4;
+	if (emb_l4_off >= 250)
+		return;
+
+	__u8 emb_proto = meta->embedded_proto;
+	if (emb_proto == PROTO_TCP || emb_proto == PROTO_UDP) {
+		__be16 *ports = data + emb_l4_off;
+		if ((void *)(ports + 2) > data_end)
+			return;
+		__be16 old_port = ports[0];
+		__be16 new_port = meta->nat_src_port;
+		if (old_port != new_port) {
+			ports[0] = new_port;
+			csum_update_2(&outer_icmp->checksum,
+				      old_port, new_port);
+		}
+	} else if (emb_proto == PROTO_ICMP) {
+		struct icmphdr *emb_icmp = data + emb_l4_off;
+		if ((void *)(emb_icmp + 1) > data_end)
+			return;
+		__be16 old_id = emb_icmp->un.echo.id;
+		__be16 new_id = meta->nat_src_port;
+		if (old_id != new_id) {
+			__sum16 old_icmp_check = emb_icmp->checksum;
+			emb_icmp->un.echo.id = new_id;
+			csum_update_2(&emb_icmp->checksum,
+				      old_id, new_id);
+			csum_update_2(&outer_icmp->checksum,
+				      old_id, new_id);
+			csum_update_2(&outer_icmp->checksum,
+				      old_icmp_check,
+				      emb_icmp->checksum);
+		}
+	}
+}
+
+/*
  * IPv6 NAT rewrite.
  * IPv6 has no IP header checksum. Only L4 checksums need updating.
  */
