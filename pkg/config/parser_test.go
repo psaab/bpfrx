@@ -1913,6 +1913,590 @@ func TestRPMConfig(t *testing.T) {
 	}
 }
 
+func TestDHCPServerConfig(t *testing.T) {
+	// Test hierarchical syntax
+	input := `system {
+    services {
+        dhcp-local-server {
+            group lan-pool {
+                interface eth0.0;
+                interface eth1.0;
+                pool office-pool {
+                    subnet 10.0.1.0/24;
+                    address-range low 10.0.1.100 high 10.0.1.200;
+                    router 10.0.1.1;
+                    dns-server 8.8.8.8;
+                    dns-server 8.8.4.4;
+                    lease-time 3600;
+                    domain-name example.local;
+                }
+            }
+            group guest-pool {
+                interface eth2.0;
+                pool guest {
+                    subnet 10.0.2.0/24;
+                    address-range low 10.0.2.50 high 10.0.2.150;
+                    router 10.0.2.1;
+                }
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	dhcp := cfg.System.DHCPServer.DHCPLocalServer
+	if dhcp == nil {
+		t.Fatal("expected DHCPLocalServer to be non-nil")
+	}
+	if len(dhcp.Groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(dhcp.Groups))
+	}
+
+	lanGroup := dhcp.Groups["lan-pool"]
+	if lanGroup == nil {
+		t.Fatal("expected group lan-pool")
+	}
+	if len(lanGroup.Interfaces) != 2 {
+		t.Errorf("lan-pool interfaces: expected 2, got %d", len(lanGroup.Interfaces))
+	}
+	if len(lanGroup.Pools) != 1 {
+		t.Fatalf("lan-pool pools: expected 1, got %d", len(lanGroup.Pools))
+	}
+
+	pool := lanGroup.Pools[0]
+	if pool.Name != "office-pool" {
+		t.Errorf("pool name: got %q, want office-pool", pool.Name)
+	}
+	if pool.Subnet != "10.0.1.0/24" {
+		t.Errorf("pool subnet: got %q", pool.Subnet)
+	}
+	if pool.RangeLow != "10.0.1.100" || pool.RangeHigh != "10.0.1.200" {
+		t.Errorf("pool range: %s - %s", pool.RangeLow, pool.RangeHigh)
+	}
+	if pool.Router != "10.0.1.1" {
+		t.Errorf("pool router: got %q", pool.Router)
+	}
+	if len(pool.DNSServers) != 2 {
+		t.Errorf("pool dns: expected 2, got %d", len(pool.DNSServers))
+	}
+	if pool.LeaseTime != 3600 {
+		t.Errorf("pool lease-time: got %d, want 3600", pool.LeaseTime)
+	}
+	if pool.Domain != "example.local" {
+		t.Errorf("pool domain: got %q", pool.Domain)
+	}
+
+	// Test set-command syntax
+	tree2 := &ConfigTree{}
+	setCommands := []string{
+		"set system services dhcp-local-server group test interface eth3.0",
+		"set system services dhcp-local-server group test pool p1 subnet 172.16.0.0/24",
+		"set system services dhcp-local-server group test pool p1 address-range low 172.16.0.10 high 172.16.0.50",
+		"set system services dhcp-local-server group test pool p1 router 172.16.0.1",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree2.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg2, err := CompileConfig(tree2)
+	if err != nil {
+		t.Fatalf("set-command compile error: %v", err)
+	}
+	if cfg2.System.DHCPServer.DHCPLocalServer == nil {
+		t.Fatal("set syntax: DHCP server is nil")
+	}
+	testGroup := cfg2.System.DHCPServer.DHCPLocalServer.Groups["test"]
+	if testGroup == nil {
+		t.Fatal("set syntax: missing group test")
+	}
+	if len(testGroup.Pools) != 1 {
+		t.Fatalf("set syntax: expected 1 pool, got %d", len(testGroup.Pools))
+	}
+	if testGroup.Pools[0].Subnet != "172.16.0.0/24" {
+		t.Errorf("set syntax pool subnet: %q", testGroup.Pools[0].Subnet)
+	}
+}
+
+func TestDynamicAddressFeed(t *testing.T) {
+	// Test hierarchical syntax
+	input := `security {
+    dynamic-address {
+        feed-server threat-feed {
+            url "https://feeds.example.com/threats.txt";
+            update-interval 1800;
+            hold-interval 3600;
+            feed-name malware-ips;
+        }
+        feed-server geo-feed {
+            url "https://feeds.example.com/geo.txt";
+            update-interval 7200;
+            feed-name geo-block;
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	da := cfg.Security.DynamicAddress
+	if da.FeedServers == nil || len(da.FeedServers) != 2 {
+		t.Fatalf("expected 2 feed servers, got %v", da.FeedServers)
+	}
+
+	tf := da.FeedServers["threat-feed"]
+	if tf == nil {
+		t.Fatal("expected threat-feed server")
+	}
+	if tf.URL != "https://feeds.example.com/threats.txt" {
+		t.Errorf("url: got %q", tf.URL)
+	}
+	if tf.UpdateInterval != 1800 {
+		t.Errorf("update-interval: got %d, want 1800", tf.UpdateInterval)
+	}
+	if tf.HoldInterval != 3600 {
+		t.Errorf("hold-interval: got %d, want 3600", tf.HoldInterval)
+	}
+	if tf.FeedName != "malware-ips" {
+		t.Errorf("feed-name: got %q", tf.FeedName)
+	}
+}
+
+func TestMultipleSNATRules(t *testing.T) {
+	input := `security {
+    zones {
+        security-zone trust {
+            interfaces { eth0.0; }
+        }
+        security-zone untrust {
+            interfaces { eth1.0; }
+        }
+    }
+    nat {
+        source {
+            pool wan-pool {
+                address 203.0.113.1/32;
+            }
+            pool backup-pool {
+                address 203.0.113.2/32;
+            }
+            rule-set trust-to-untrust {
+                from zone trust;
+                to zone untrust;
+                rule web-traffic {
+                    match {
+                        source-address 10.0.1.0/24;
+                        destination-address 0.0.0.0/0;
+                    }
+                    then {
+                        source-nat {
+                            pool wan-pool;
+                        }
+                    }
+                }
+                rule backup-traffic {
+                    match {
+                        source-address 10.0.2.0/24;
+                    }
+                    then {
+                        source-nat {
+                            pool backup-pool;
+                        }
+                    }
+                }
+                rule default-snat {
+                    match {
+                        source-address 0.0.0.0/0;
+                    }
+                    then {
+                        source-nat {
+                            interface;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	if len(cfg.Security.NAT.Source) != 1 {
+		t.Fatalf("expected 1 source rule-set, got %d", len(cfg.Security.NAT.Source))
+	}
+
+	rs := cfg.Security.NAT.Source[0]
+	if rs.FromZone != "trust" || rs.ToZone != "untrust" {
+		t.Errorf("rule-set zones: from=%s to=%s", rs.FromZone, rs.ToZone)
+	}
+	if len(rs.Rules) != 3 {
+		t.Fatalf("expected 3 rules, got %d", len(rs.Rules))
+	}
+
+	// Verify first rule uses pool
+	r1 := rs.Rules[0]
+	if r1.Name != "web-traffic" {
+		t.Errorf("rule 1 name: %s", r1.Name)
+	}
+	if r1.Match.SourceAddress != "10.0.1.0/24" {
+		t.Errorf("rule 1 src: %s", r1.Match.SourceAddress)
+	}
+	if r1.Then.PoolName != "wan-pool" {
+		t.Errorf("rule 1 pool: %s", r1.Then.PoolName)
+	}
+
+	// Verify third rule uses interface
+	r3 := rs.Rules[2]
+	if r3.Name != "default-snat" {
+		t.Errorf("rule 3 name: %s", r3.Name)
+	}
+	if !r3.Then.Interface {
+		t.Error("rule 3 should use interface SNAT")
+	}
+
+	// Verify pools
+	if cfg.Security.NAT.SourcePools == nil {
+		t.Fatal("source pools nil")
+	}
+	if len(cfg.Security.NAT.SourcePools) != 2 {
+		t.Errorf("expected 2 source pools, got %d", len(cfg.Security.NAT.SourcePools))
+	}
+}
+
+func TestDNATWithProtocol(t *testing.T) {
+	input := `security {
+    zones {
+        security-zone untrust {
+            interfaces { eth1.0; }
+        }
+        security-zone dmz {
+            interfaces { eth2.0; }
+        }
+    }
+    nat {
+        destination {
+            pool web-server {
+                address 10.0.30.100;
+            }
+            rule-set untrust-to-dmz {
+                from zone untrust;
+                rule http-dnat {
+                    match {
+                        destination-address 203.0.113.10/32;
+                        destination-port 80;
+                        protocol tcp;
+                    }
+                    then {
+                        destination-nat {
+                            pool web-server;
+                        }
+                    }
+                }
+                rule https-dnat {
+                    match {
+                        destination-address 203.0.113.10/32;
+                        destination-port 443;
+                        protocol tcp;
+                    }
+                    then {
+                        destination-nat {
+                            pool web-server;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	dnat := cfg.Security.NAT.Destination
+	if dnat == nil {
+		t.Fatal("DNAT config nil")
+	}
+	if len(dnat.RuleSets) != 1 {
+		t.Fatalf("expected 1 DNAT rule-set, got %d", len(dnat.RuleSets))
+	}
+
+	rs := dnat.RuleSets[0]
+	if len(rs.Rules) != 2 {
+		t.Fatalf("expected 2 DNAT rules, got %d", len(rs.Rules))
+	}
+
+	r1 := rs.Rules[0]
+	if r1.Name != "http-dnat" {
+		t.Errorf("rule 1 name: %s", r1.Name)
+	}
+	if r1.Match.Protocol != "tcp" {
+		t.Errorf("rule 1 protocol: %s", r1.Match.Protocol)
+	}
+	if r1.Match.DestinationPort != 80 {
+		t.Errorf("rule 1 port: %d", r1.Match.DestinationPort)
+	}
+	if r1.Match.DestinationAddress != "203.0.113.10/32" {
+		t.Errorf("rule 1 dst: %s", r1.Match.DestinationAddress)
+	}
+	if r1.Then.PoolName != "web-server" {
+		t.Errorf("rule 1 pool: %s", r1.Then.PoolName)
+	}
+}
+
+func TestVLANInterfaceCompilation(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set interfaces enp7s0 vlan-tagging",
+		"set interfaces enp7s0 unit 100 vlan-id 100",
+		"set interfaces enp7s0 unit 100 family inet address 10.0.100.1/24",
+		"set interfaces enp7s0 unit 200 vlan-id 200",
+		"set interfaces enp7s0 unit 200 family inet address 10.0.200.1/24",
+		"set interfaces enp7s0 unit 200 family inet6 address fd00:200::1/64",
+	}
+
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath: %v", err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	ifc := cfg.Interfaces.Interfaces["enp7s0"]
+	if ifc == nil {
+		t.Fatal("missing interface enp7s0")
+	}
+	if !ifc.VlanTagging {
+		t.Error("expected vlan-tagging to be true")
+	}
+	if len(ifc.Units) != 2 {
+		t.Fatalf("expected 2 units, got %d", len(ifc.Units))
+	}
+
+	unit100 := ifc.Units[100]
+	if unit100 == nil {
+		t.Fatal("missing unit 100")
+	}
+	if unit100.VlanID != 100 {
+		t.Errorf("unit 100 vlan-id: got %d", unit100.VlanID)
+	}
+	if len(unit100.Addresses) != 1 || unit100.Addresses[0] != "10.0.100.1/24" {
+		t.Errorf("unit 100 addresses: %v", unit100.Addresses)
+	}
+
+	unit200 := ifc.Units[200]
+	if unit200 == nil {
+		t.Fatal("missing unit 200")
+	}
+	if unit200.VlanID != 200 {
+		t.Errorf("unit 200 vlan-id: got %d", unit200.VlanID)
+	}
+	if len(unit200.Addresses) != 2 {
+		t.Errorf("unit 200 addresses: expected 2, got %v", unit200.Addresses)
+	}
+}
+
+func TestEdgeCases(t *testing.T) {
+	// Empty block
+	input := `security {
+    zones {
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("empty block parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("empty block compile error: %v", err)
+	}
+	if len(cfg.Security.Zones) != 0 {
+		t.Errorf("expected 0 zones from empty block, got %d", len(cfg.Security.Zones))
+	}
+
+	// Trailing semicolon after block content
+	input2 := `security {
+    zones {
+        security-zone test {
+            interfaces {
+                eth0.0;
+            }
+        }
+    }
+}
+`
+	parser2 := NewParser(input2)
+	tree2, errs2 := parser2.Parse()
+	if len(errs2) > 0 {
+		t.Fatalf("trailing semicolon parse errors: %v", errs2)
+	}
+	cfg2, err := CompileConfig(tree2)
+	if err != nil {
+		t.Fatalf("trailing semicolon compile error: %v", err)
+	}
+	if len(cfg2.Security.Zones) != 1 {
+		t.Errorf("expected 1 zone, got %d", len(cfg2.Security.Zones))
+	}
+
+	// Deeply nested config (>10 levels via routing-instances)
+	tree3 := &ConfigTree{}
+	deepCommands := []string{
+		"set routing-instances deep-vr instance-type virtual-router",
+		"set routing-instances deep-vr routing-options static route 10.0.0.0/8 next-hop 192.168.1.1",
+		"set routing-instances deep-vr protocols ospf area 0.0.0.0 interface eth0",
+		"set routing-instances deep-vr protocols bgp local-as 65001",
+		"set routing-instances deep-vr protocols bgp group peer peer-as 65002",
+		"set routing-instances deep-vr protocols bgp group peer neighbor 10.1.0.1",
+	}
+	for _, cmd := range deepCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree3.SetPath(path); err != nil {
+			t.Fatalf("SetPath: %v", err)
+		}
+	}
+	cfg3, err := CompileConfig(tree3)
+	if err != nil {
+		t.Fatalf("deep config compile error: %v", err)
+	}
+	if len(cfg3.RoutingInstances) != 1 {
+		t.Errorf("expected 1 routing instance, got %d", len(cfg3.RoutingInstances))
+	}
+	ri := cfg3.RoutingInstances[0]
+	if ri.BGP == nil || ri.BGP.LocalAS != 65001 {
+		t.Error("deep config: BGP not compiled correctly")
+	}
+}
+
+func TestScreenCompilation(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set security screen ids-option wan-screen tcp syn-flood alarm-threshold 1000",
+		"set security screen ids-option wan-screen tcp syn-flood attack-threshold 2000",
+		"set security screen ids-option wan-screen tcp land",
+		"set security screen ids-option wan-screen tcp syn-fin",
+		"set security screen ids-option wan-screen tcp no-flag",
+		"set security screen ids-option wan-screen tcp winnuke",
+		"set security screen ids-option wan-screen tcp fin-no-ack",
+		"set security screen ids-option wan-screen icmp ping-death",
+		"set security screen ids-option wan-screen icmp flood threshold 500",
+		"set security screen ids-option wan-screen ip source-route-option",
+		"set security screen ids-option wan-screen ip tear-drop",
+		"set security screen ids-option wan-screen udp flood threshold 1000",
+	}
+
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath: %v", err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	screen := cfg.Security.Screen["wan-screen"]
+	if screen == nil {
+		t.Fatal("missing screen profile wan-screen")
+	}
+
+	// TCP checks
+	if !screen.TCP.Land {
+		t.Error("expected tcp land")
+	}
+	if !screen.TCP.SynFin {
+		t.Error("expected tcp syn-fin")
+	}
+	if !screen.TCP.NoFlag {
+		t.Error("expected tcp tcp-no-flag")
+	}
+	if !screen.TCP.WinNuke {
+		t.Error("expected tcp winnuke")
+	}
+	if !screen.TCP.FinNoAck {
+		t.Error("expected tcp fin-no-ack")
+	}
+	if screen.TCP.SynFlood == nil {
+		t.Fatal("expected syn-flood config")
+	}
+
+	// ICMP checks
+	if !screen.ICMP.PingDeath {
+		t.Error("expected icmp ping-death")
+	}
+	if screen.ICMP.FloodThreshold != 500 {
+		t.Errorf("icmp flood threshold: got %d, want 500", screen.ICMP.FloodThreshold)
+	}
+
+	// IP checks
+	if !screen.IP.SourceRouteOption {
+		t.Error("expected ip source-route-option")
+	}
+	if !screen.IP.TearDrop {
+		t.Error("expected ip tear-drop")
+	}
+
+	// UDP checks
+	if screen.UDP.FloodThreshold != 1000 {
+		t.Errorf("udp flood threshold: got %d, want 1000", screen.UDP.FloodThreshold)
+	}
+}
+
 func TestInterfaceFilterAssignment(t *testing.T) {
 	input := `interfaces {
     enp6s0 {

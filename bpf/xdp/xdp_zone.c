@@ -483,9 +483,12 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		 * was SNAT'd.  Route through conntrack for embedded
 		 * packet matching so the error reaches the client.
 		 */
-		if (meta->protocol == PROTO_ICMP &&
-		    (meta->icmp_type == 3 || meta->icmp_type == 11 ||
-		     meta->icmp_type == 12)) {
+		if ((meta->protocol == PROTO_ICMP &&
+		     (meta->icmp_type == 3 || meta->icmp_type == 11 ||
+		      meta->icmp_type == 12)) ||
+		    (meta->protocol == PROTO_ICMPV6 &&
+		     (meta->icmp_type == 1 || meta->icmp_type == 3 ||
+		      meta->icmp_type == 4))) {
 			struct flow_config *fc =
 				bpf_map_lookup_elem(&flow_config_map, &zero);
 			if (fc && fc->allow_embedded_icmp) {

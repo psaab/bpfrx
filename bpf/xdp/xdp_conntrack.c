@@ -333,6 +333,169 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 	return XDP_PASS;
 }
 
+/*
+ * Handle ICMPv6 error packets (Dest Unreachable type 1, Time Exceeded type 3,
+ * Param Problem type 4) that contain an embedded original IPv6 packet header.
+ * Reverse-lookup the SNAT translation via dnat_table_v6, match the original
+ * session, then set up forwarding + NAT rewrite metadata so the error reaches
+ * the original client.
+ *
+ * Returns XDP_PASS on tail-call success, -1 on no match.
+ */
+static __always_inline int
+handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	void *data     = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+
+	/* Locate embedded IPv6 header (starts after 8-byte ICMPv6 header) */
+	__u16 emb_ip_off = meta->l4_offset + 8;
+	if (emb_ip_off >= 200)
+		return -1;
+	struct ipv6hdr *emb_ip6 = data + emb_ip_off;
+	if ((void *)(emb_ip6 + 1) > data_end)
+		return -1;
+
+	/* Read embedded IPv6 addresses to stack NOW -- the verifier
+	 * loses packet range tracking after branches below. */
+	__u8 emb_saddr[16], emb_daddr[16];
+	__builtin_memcpy(emb_saddr, &emb_ip6->saddr, 16);
+	__builtin_memcpy(emb_daddr, &emb_ip6->daddr, 16);
+
+	/* Embedded L4 protocol: skip extension header walking.
+	 * Extension headers in ICMPv6 error embedded packets are
+	 * extremely rare — the embedded packet is the original
+	 * offending packet (typically TCP/UDP/ICMPv6 with no ext
+	 * headers).  Walking them causes BPF verifier failures:
+	 * variable-offset pkt pointer tracking requires var_off
+	 * bounded to ~8 bits, but ext header lengths are wider.
+	 * If next header isn't a direct L4 protocol, give up. */
+	__u8 emb_proto = emb_ip6->nexthdr;
+	if (emb_proto != PROTO_TCP && emb_proto != PROTO_UDP &&
+	    emb_proto != PROTO_ICMPV6)
+		return -1;
+
+	/* Parse embedded L4 ports.
+	 * Use a CONSTANT offset from the already-validated emb_ip6
+	 * pointer: (emb_ip6 + 1) is exactly +40 bytes, and the
+	 * verifier can track constant-offset range additions. This
+	 * avoids variable-offset pkt pointer arithmetic which causes
+	 * verifier failures (__u16 sign-extension + wide var_off). */
+	__be16 emb_src_port = 0, emb_dst_port = 0;
+	void *emb_l4 = (void *)(emb_ip6 + 1);
+	if (emb_l4 + 6 > data_end)
+		return -1;
+	if (emb_proto == PROTO_TCP || emb_proto == PROTO_UDP) {
+		emb_src_port = *(__be16 *)emb_l4;
+		emb_dst_port = *(__be16 *)(emb_l4 + 2);
+	} else if (emb_proto == PROTO_ICMPV6) {
+		/* Echo ID is at offset 4 in ICMPv6 header */
+		emb_src_port = *(__be16 *)(emb_l4 + 4);
+		emb_dst_port = emb_src_port;
+	}
+
+	/* All packet data is now on the stack -- use stack copies. */
+
+	/* Reverse SNAT via dnat_table_v6: embedded src is the SNAT'd address */
+	struct dnat_key_v6 dk6 = { .protocol = emb_proto };
+	__builtin_memcpy(dk6.dst_ip, emb_saddr, 16);
+	dk6.dst_port = emb_src_port;
+
+	struct dnat_value_v6 *dv6 = bpf_map_lookup_elem(&dnat_table_v6, &dk6);
+
+	__u8 orig_src_ip[16];
+	__be16 orig_src_port;
+	int needs_nat = 0;
+
+	if (dv6) {
+		/* SNAT flow: dnat_table_v6 gives us the pre-SNAT source */
+		__builtin_memcpy(orig_src_ip, dv6->new_dst_ip, 16);
+		orig_src_port = dv6->new_dst_port;
+		needs_nat = 1;
+	} else {
+		/* Non-SNAT flow: use embedded addresses directly */
+		__builtin_memcpy(orig_src_ip, emb_saddr, 16);
+		orig_src_port = emb_src_port;
+	}
+
+	/* Look up original session with pre-SNAT 5-tuple.
+	 * For ICMPv6 echo, src_port == dst_port == echo_id. SNAT rewrites
+	 * the echo ID, so use the de-SNAT'd port for both. */
+	__be16 lookup_dst_port = emb_dst_port;
+	if (emb_proto == PROTO_ICMPV6 && needs_nat)
+		lookup_dst_port = orig_src_port;
+
+	struct session_key_v6 sk6 = { .protocol = emb_proto };
+	__builtin_memcpy(sk6.src_ip, orig_src_ip, 16);
+	__builtin_memcpy(sk6.dst_ip, emb_daddr, 16);
+	sk6.src_port = orig_src_port;
+	sk6.dst_port = lookup_dst_port;
+
+	struct session_value_v6 *sess = bpf_map_lookup_elem(&sessions_v6, &sk6);
+	if (!sess) {
+		struct session_key_v6 rk6;
+		ct_reverse_key_v6(&sk6, &rk6);
+		sess = bpf_map_lookup_elem(&sessions_v6, &rk6);
+	}
+	if (!sess)
+		return -1;  /* No matching session */
+
+	/* Touch the session so GC doesn't expire it while errors flow */
+	sess->last_seen = bpf_ktime_get_ns() / 1000000000ULL;
+
+	/* FIB lookup to route toward the original client */
+	struct bpf_fib_lookup fib = {};
+	fib.family = AF_INET6;
+	fib.l4_protocol = PROTO_ICMPV6;
+	fib.tot_len = meta->pkt_len;
+	fib.ifindex = meta->ingress_ifindex;
+	__builtin_memcpy(fib.ipv6_src, meta->src_ip.v6, 16);
+	__builtin_memcpy(fib.ipv6_dst, orig_src_ip, 16);
+
+	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
+		return -1;
+
+	/* Resolve VLAN sub-interface */
+	__u32 egress_if = fib.ifindex;
+	struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map,
+							 &egress_if);
+	if (vi) {
+		meta->fwd_ifindex = vi->parent_ifindex;
+		meta->egress_vlan_id = vi->vlan_id;
+	} else {
+		meta->fwd_ifindex = egress_if;
+		meta->egress_vlan_id = 0;
+	}
+	__builtin_memcpy(meta->fwd_dmac, fib.dmac, 6);
+	__builtin_memcpy(meta->fwd_smac, fib.smac, 6);
+
+	/* Resolve egress zone */
+	struct iface_zone_key ezk = {
+		.ifindex = meta->fwd_ifindex,
+		.vlan_id = meta->egress_vlan_id,
+	};
+	__u16 *ez = bpf_map_lookup_elem(&iface_zone_map, &ezk);
+	if (ez)
+		meta->egress_zone = *ez;
+
+	if (needs_nat) {
+		/* Outer dst rewrite: WAN IP -> original client */
+		__builtin_memcpy(meta->dst_ip.v6, orig_src_ip, 16);
+		meta->nat_flags = SESS_FLAG_DNAT;
+		/* Embedded rewrite info */
+		__builtin_memcpy(meta->nat_src_ip.v6, orig_src_ip, 16);
+		meta->nat_src_port = orig_src_port;
+		meta->meta_flags = META_FLAG_EMBEDDED_ICMP;
+		meta->embedded_proto = emb_proto;
+		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
+	} else {
+		/* No NAT, just forward */
+		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+	}
+	return XDP_PASS;
+}
+
 SEC("xdp")
 int xdp_conntrack_prog(struct xdp_md *ctx)
 {
@@ -476,6 +639,24 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 					__be32 *dst32 =
 						(__be32 *)meta->dst_ip.v6;
 					meta->nat_dst_ip.v4 = dst32[3];
+				}
+
+				/* ICMPv6 error embedded packet matching */
+				if (meta->protocol == PROTO_ICMPV6 &&
+				    (meta->icmp_type == 1 ||
+				     meta->icmp_type == 3 ||
+				     meta->icmp_type == 4)) {
+					int ret = handle_embedded_icmp_v6(
+						ctx, meta);
+					if (ret != -1)
+						return ret;
+					/* No matching forwarded session —
+					 * pass to kernel as host-inbound
+					 * (e.g. firewall-originated traceroute6). */
+					meta->fwd_ifindex = 0;
+					bpf_tail_call(ctx, &xdp_progs,
+						      XDP_PROG_FORWARD);
+					return XDP_PASS;
 				}
 
 				meta->ct_state = SESS_STATE_NEW;

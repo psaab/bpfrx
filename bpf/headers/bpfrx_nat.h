@@ -288,6 +288,89 @@ nat_rewrite_embedded_v4(void *data, void *data_end, struct pkt_meta *meta)
 }
 
 /*
+ * Rewrite the embedded original packet inside an ICMPv6 error message.
+ * Reverses the SNAT translation so the error reaches the original client.
+ * IPv6 has no IP header checksum, simplifying the rewrite vs v4.
+ * Updates: embedded src address (16 bytes), embedded L4 port,
+ * outer ICMPv6 checksum (covers pseudo-header + full payload).
+ */
+static __always_inline void
+nat_rewrite_embedded_v6(void *data, void *data_end, struct pkt_meta *meta)
+{
+	if (meta->l4_offset >= 128)
+		return;
+	struct icmp6hdr *outer_icmp6 = data + meta->l4_offset;
+	if ((void *)(outer_icmp6 + 1) > data_end)
+		return;
+
+	/* Embedded IPv6 header starts after 8-byte ICMPv6 error header */
+	__u16 emb_ip_off = meta->l4_offset + 8;
+	if (emb_ip_off >= 200)
+		return;
+	struct ipv6hdr *emb_ip6 = data + emb_ip_off;
+	if ((void *)(emb_ip6 + 1) > data_end)
+		return;
+
+	/* Rewrite embedded source address (16 bytes).
+	 * The outer ICMPv6 checksum covers the entire payload including
+	 * the embedded IPv6 header, so changing emb_ip6->saddr requires
+	 * updating the outer checksum. No IP header checksum in IPv6. */
+	__u8 old_src[16];
+	__builtin_memcpy(old_src, &emb_ip6->saddr, 16);
+	if (!ip_addr_eq_v6(old_src, meta->nat_src_ip.v6)) {
+		__builtin_memcpy(&emb_ip6->saddr, meta->nat_src_ip.v6, 16);
+		csum_update_16(&outer_icmp6->icmp6_cksum,
+			       old_src, meta->nat_src_ip.v6);
+	}
+
+	/* Rewrite embedded L4 source port.
+	 * Use constant offset from emb_ip6 (already validated) to
+	 * avoid variable-offset pkt pointer issues with the verifier.
+	 * Skip extension headers — they are extremely rare in
+	 * embedded ICMPv6 error packets. */
+	__u8 emb_proto = meta->embedded_proto;
+	if (emb_proto != PROTO_TCP && emb_proto != PROTO_UDP &&
+	    emb_proto != PROTO_ICMPV6)
+		return;
+
+	void *emb_l4 = (void *)(emb_ip6 + 1);
+
+	if (emb_proto == PROTO_TCP || emb_proto == PROTO_UDP) {
+		__be16 *ports = emb_l4;
+		if ((void *)(ports + 2) > data_end)
+			return;
+		__be16 old_port = ports[0];
+		__be16 new_port = meta->nat_src_port;
+		if (old_port != new_port) {
+			ports[0] = new_port;
+			csum_update_2(&outer_icmp6->icmp6_cksum,
+				      old_port, new_port);
+		}
+	} else if (emb_proto == PROTO_ICMPV6) {
+		/* Embedded ICMPv6 echo: rewrite echo ID */
+		struct icmp6hdr *emb_icmp6 = emb_l4;
+		if ((void *)(emb_icmp6 + 1) > data_end)
+			return;
+		__be16 old_id = emb_icmp6->un.echo.id;
+		__be16 new_id = meta->nat_src_port;
+		if (old_id != new_id) {
+			__sum16 old_icmp6_check = emb_icmp6->icmp6_cksum;
+			emb_icmp6->un.echo.id = new_id;
+			csum_update_2(&emb_icmp6->icmp6_cksum,
+				      old_id, new_id);
+			/* Outer ICMPv6 checksum covers embedded bytes:
+			 * account for both the echo ID change and the
+			 * embedded checksum field change. */
+			csum_update_2(&outer_icmp6->icmp6_cksum,
+				      old_id, new_id);
+			csum_update_2(&outer_icmp6->icmp6_cksum,
+				      old_icmp6_check,
+				      emb_icmp6->icmp6_cksum);
+		}
+	}
+}
+
+/*
  * IPv6 NAT rewrite.
  * IPv6 has no IP header checksum. Only L4 checksums need updating.
  */

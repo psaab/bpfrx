@@ -162,9 +162,12 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 		/* Allow ICMP error types through — these were already
 		 * validated by the XDP pipeline against an existing
 		 * session and rewritten to reach the original client. */
-		if (meta->protocol == PROTO_ICMP &&
-		    (meta->icmp_type == 3 || meta->icmp_type == 11 ||
-		     meta->icmp_type == 12)) {
+		if ((meta->protocol == PROTO_ICMP &&
+		     (meta->icmp_type == 3 || meta->icmp_type == 11 ||
+		      meta->icmp_type == 12)) ||
+		    (meta->protocol == PROTO_ICMPV6 &&
+		     (meta->icmp_type == 1 || meta->icmp_type == 3 ||
+		      meta->icmp_type == 4))) {
 			__u32 fc_key = 0;
 			struct flow_config *fc =
 				bpf_map_lookup_elem(&flow_config_map, &fc_key);

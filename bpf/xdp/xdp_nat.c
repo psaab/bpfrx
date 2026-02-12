@@ -61,6 +61,8 @@ int xdp_nat_prog(struct xdp_md *ctx)
 			nat_rewrite_embedded_v4(data, data_end, meta);
 	} else {
 		nat_rewrite_v6(data, data_end, meta);
+		if (meta->meta_flags & META_FLAG_EMBEDDED_ICMP)
+			nat_rewrite_embedded_v6(data, data_end, meta);
 	}
 
 	TRACE_NAT_REWRITE(meta, "xdp-post");
