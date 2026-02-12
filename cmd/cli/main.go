@@ -164,7 +164,7 @@ func extractPipe(line string) (string, string, string, bool) {
 		pipeArg = parts[1]
 	}
 	switch pipeType {
-	case "match", "except", "count", "last", "no-more":
+	case "match", "grep", "except", "count", "last", "no-more":
 		return cmd, pipeType, pipeArg, true
 	default:
 		return line, "", "", false
@@ -199,7 +199,7 @@ func (c *ctl) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 	}
 
 	switch pipeType {
-	case "match":
+	case "match", "grep":
 		lp := strings.ToLower(pipeArg)
 		for _, line := range lines {
 			if strings.Contains(strings.ToLower(line), lp) {

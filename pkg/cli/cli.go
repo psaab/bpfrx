@@ -392,7 +392,7 @@ func extractPipe(line string) (string, string, string, bool) {
 	}
 
 	switch pipeType {
-	case "match", "except", "count", "last", "no-more":
+	case "match", "grep", "except", "count", "last", "no-more":
 		return cmd, pipeType, pipeArg, true
 	default:
 		// Not a recognized pipe filter (e.g. "| display set", "| compare")
@@ -432,7 +432,7 @@ func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 	}
 
 	switch pipeType {
-	case "match":
+	case "match", "grep":
 		lowerPattern := strings.ToLower(pipeArg)
 		for _, line := range lines {
 			if strings.Contains(strings.ToLower(line), lowerPattern) {
@@ -3227,7 +3227,7 @@ func (c *CLI) showOperationalHelp() {
 	fmt.Println("  clear security counters            Clear all counters")
 	fmt.Println("  quit                               Exit CLI")
 	fmt.Println()
-	fmt.Println("  <command> | match <pattern>         Filter output by pattern")
+	fmt.Println("  <command> | match/grep <pattern>    Filter output by pattern")
 	fmt.Println("  <command> | except <pattern>        Exclude lines matching pattern")
 	fmt.Println("  <command> | count                   Count output lines")
 	fmt.Println("  <command> | last [N]                Show last N lines (default 10)")
