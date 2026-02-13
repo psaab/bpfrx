@@ -1333,7 +1333,7 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 // applySystemLogin creates OS user accounts and SSH authorized_keys from
 // system { login { user ... } } configuration.
 func (d *Daemon) applySystemLogin(cfg *config.Config) {
-	if len(cfg.System.Login.Users) == 0 {
+	if cfg.System.Login == nil || len(cfg.System.Login.Users) == 0 {
 		return
 	}
 
