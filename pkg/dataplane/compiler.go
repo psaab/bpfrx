@@ -2026,7 +2026,7 @@ func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResu
 		}
 		startIdx := ruleIdx
 		for _, term := range filter.Terms {
-			rules := expandFilterTerm(term, AFInet, riTableIDs)
+			rules := expandFilterTerm(term, AFInet, riTableIDs, cfg.PolicyOptions.PrefixLists)
 			for _, rule := range rules {
 				if ruleIdx >= MaxFilterRules {
 					slog.Warn("filter rule limit reached", "filter", name, "term", term.Name)
@@ -2066,7 +2066,7 @@ func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResu
 		}
 		startIdx := ruleIdx
 		for _, term := range filter.Terms {
-			rules := expandFilterTerm(term, AFInet6, riTableIDs)
+			rules := expandFilterTerm(term, AFInet6, riTableIDs, cfg.PolicyOptions.PrefixLists)
 			for _, rule := range rules {
 				if ruleIdx >= MaxFilterRules {
 					slog.Warn("filter rule limit reached", "filter", name, "term", term.Name)
@@ -2236,7 +2236,7 @@ func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResu
 
 // expandFilterTerm expands a single filter term into one or more BPF filter rules.
 // Terms with multiple source/destination addresses generate the cross product of rules.
-func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs map[string]uint32) []FilterRule {
+func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs map[string]uint32, prefixLists map[string]*config.PrefixList) []FilterRule {
 	// Base rule with common fields
 	base := FilterRule{
 		Family: family,
@@ -2319,9 +2319,28 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		base.SrcPort = htons(portNum)
 	}
 
-	// Expand source/destination address combinations
-	srcAddrs := term.SourceAddresses
-	dstAddrs := term.DestAddresses
+	// Expand prefix list references into address lists
+	srcAddrs := append([]string{}, term.SourceAddresses...)
+	for _, ref := range term.SourcePrefixLists {
+		if !ref.Except {
+			if pl, ok := prefixLists[ref.Name]; ok {
+				srcAddrs = append(srcAddrs, pl.Prefixes...)
+			} else {
+				slog.Warn("prefix-list not found", "name", ref.Name, "term", term.Name)
+			}
+		}
+		// "except" prefix lists are not supported in BPF (would need negative matching)
+	}
+	dstAddrs := append([]string{}, term.DestAddresses...)
+	for _, ref := range term.DestPrefixLists {
+		if !ref.Except {
+			if pl, ok := prefixLists[ref.Name]; ok {
+				dstAddrs = append(dstAddrs, pl.Prefixes...)
+			} else {
+				slog.Warn("prefix-list not found", "name", ref.Name, "term", term.Name)
+			}
+		}
+	}
 	if len(srcAddrs) == 0 {
 		srcAddrs = []string{""} // "any"
 	}
