@@ -203,17 +203,29 @@ type FirewallFilter struct {
 
 // FirewallFilterTerm is a single match/action term within a filter.
 type FirewallFilterTerm struct {
-	Name             string
-	SourceAddresses  []string // CIDRs
-	DestAddresses    []string // CIDRs
-	DSCP             string   // DSCP/traffic-class name (ef, af43, etc.) or number
-	Protocol         string   // tcp, udp, icmp, icmpv6
-	DestinationPorts []string // port numbers or names
-	ICMPType         int      // -1 = not set
-	ICMPCode         int      // -1 = not set
-	Action           string   // "accept", "reject", "discard", ""
-	RoutingInstance  string   // routing-instance name (policy-based routing)
-	Log              bool
+	Name               string
+	SourceAddresses    []string            // CIDRs
+	DestAddresses      []string            // CIDRs
+	SourcePrefixLists  []PrefixListRef     // source-prefix-list references
+	DestPrefixLists    []PrefixListRef     // destination-prefix-list references
+	DSCP               string              // DSCP/traffic-class name (ef, af43, etc.) or number
+	Protocol           string              // tcp, udp, icmp, icmpv6
+	DestinationPorts   []string            // port numbers or names
+	SourcePorts        []string            // source port numbers or ranges
+	ICMPType           int                 // -1 = not set
+	ICMPCode           int                 // -1 = not set
+	Action             string              // "accept", "reject", "discard", ""
+	RoutingInstance    string              // routing-instance name (policy-based routing)
+	Log                bool
+	Count              string              // counter name
+	ForwardingClass    string              // forwarding-class name
+	LossPriority       string              // loss-priority (low, medium-low, medium-high, high)
+}
+
+// PrefixListRef references a named prefix-list with optional "except" modifier.
+type PrefixListRef struct {
+	Name   string
+	Except bool
 }
 
 // DHCPServerConfig holds DHCP server configuration.

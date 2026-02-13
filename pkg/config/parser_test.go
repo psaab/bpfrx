@@ -1614,6 +1614,85 @@ routing-instances {
 	}
 }
 
+func TestFirewallPrefixList(t *testing.T) {
+	input := `policy-options {
+    prefix-list management-hosts {
+        10.0.0.0/8;
+        172.16.0.0/12;
+    }
+}
+firewall {
+    family inet {
+        filter filter-mgmt {
+            term block_unauthorised {
+                from {
+                    source-address {
+                        0.0.0.0/0;
+                    }
+                    source-prefix-list {
+                        management-hosts except;
+                    }
+                    protocol tcp;
+                    destination-port ssh;
+                }
+                then {
+                    log;
+                    syslog;
+                    count block-counter;
+                    reject;
+                }
+            }
+            term accept_default {
+                then accept;
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	// Check prefix-list was compiled
+	pl := cfg.PolicyOptions.PrefixLists["management-hosts"]
+	if pl == nil {
+		t.Fatal("missing prefix-list management-hosts")
+	}
+	if len(pl.Prefixes) != 2 {
+		t.Errorf("expected 2 prefixes, got %d", len(pl.Prefixes))
+	}
+
+	// Check firewall filter
+	f := cfg.Firewall.FiltersInet["filter-mgmt"]
+	if f == nil {
+		t.Fatal("missing filter filter-mgmt")
+	}
+	term := f.Terms[0]
+	if len(term.SourcePrefixLists) != 1 {
+		t.Fatalf("expected 1 source-prefix-list, got %d", len(term.SourcePrefixLists))
+	}
+	if term.SourcePrefixLists[0].Name != "management-hosts" {
+		t.Errorf("prefix-list name = %q", term.SourcePrefixLists[0].Name)
+	}
+	if !term.SourcePrefixLists[0].Except {
+		t.Error("prefix-list should have except modifier")
+	}
+	if len(term.DestinationPorts) != 1 {
+		t.Errorf("expected 1 destination port, got %d", len(term.DestinationPorts))
+	}
+	if term.Count != "block-counter" {
+		t.Errorf("count = %q, want block-counter", term.Count)
+	}
+	if !term.Log {
+		t.Error("log should be set")
+	}
+}
+
 func TestFlowMonitoringConfig(t *testing.T) {
 	// Test hierarchical syntax
 	input := `services {

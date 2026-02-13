@@ -1747,6 +1747,49 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 	return nil
 }
 
+// namedInstances handles the dual AST shape for named config objects.
+// Hierarchical: Node Keys: ["type", "name"], Children are properties.
+// Flat set:     Node Keys: ["type"], Children are named instance nodes.
+// Returns (name, propertyNode) pairs for each instance.
+func namedInstances(nodes []*Node) []struct {
+	name string
+	node *Node
+} {
+	var result []struct {
+		name string
+		node *Node
+	}
+	for _, child := range nodes {
+		if len(child.Keys) >= 2 {
+			result = append(result, struct {
+				name string
+				node *Node
+			}{child.Keys[1], child})
+		} else {
+			for _, sub := range child.Children {
+				result = append(result, struct {
+					name string
+					node *Node
+				}{sub.Name(), sub})
+			}
+		}
+	}
+	return result
+}
+
+// nodeVal returns the value for a property node, handling both AST shapes.
+// Hierarchical: Keys: ["prop", "value"] → returns "value"
+// Flat set:     Keys: ["prop"], Children: [Node{Keys:["value"]}] → returns "value"
+func nodeVal(n *Node) string {
+	if len(n.Keys) >= 2 {
+		return n.Keys[1]
+	}
+	if len(n.Children) > 0 {
+		return n.Children[0].Name()
+	}
+	return ""
+}
+
 func compileIKE(node *Node, sec *SecurityConfig) error {
 	if sec.IPsec.IKEProposals == nil {
 		sec.IPsec.IKEProposals = make(map[string]*IKEProposal)
@@ -1759,39 +1802,26 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 	}
 
 	// IKE proposals (Phase 1 crypto)
-	for _, child := range node.FindChildren("proposal") {
-		if len(child.Keys) < 2 {
-			continue
-		}
-		prop := &IKEProposal{Name: child.Keys[1]}
-		for _, p := range child.Children {
+	for _, inst := range namedInstances(node.FindChildren("proposal")) {
+		prop := &IKEProposal{Name: inst.name}
+		for _, p := range inst.node.Children {
+			v := nodeVal(p)
 			switch p.Name() {
 			case "authentication-method":
-				if len(p.Keys) >= 2 {
-					prop.AuthMethod = p.Keys[1]
-				}
+				prop.AuthMethod = v
 			case "encryption-algorithm":
-				if len(p.Keys) >= 2 {
-					prop.EncryptionAlg = p.Keys[1]
-				}
+				prop.EncryptionAlg = v
 			case "authentication-algorithm":
-				if len(p.Keys) >= 2 {
-					prop.AuthAlg = p.Keys[1]
-				}
+				prop.AuthAlg = v
 			case "dh-group":
-				if len(p.Keys) >= 2 {
-					// Handle "group2" or "2" format
-					g := p.Keys[1]
-					g = strings.TrimPrefix(g, "group")
-					if v, err := strconv.Atoi(g); err == nil {
-						prop.DHGroup = v
-					}
+				// Handle "group2" or "2" format
+				g := strings.TrimPrefix(v, "group")
+				if n, err := strconv.Atoi(g); err == nil {
+					prop.DHGroup = n
 				}
 			case "lifetime-seconds":
-				if len(p.Keys) >= 2 {
-					if v, err := strconv.Atoi(p.Keys[1]); err == nil {
-						prop.LifetimeSeconds = v
-					}
+				if n, err := strconv.Atoi(v); err == nil {
+					prop.LifetimeSeconds = n
 				}
 			}
 		}
@@ -1799,29 +1829,23 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 	}
 
 	// IKE policies (Phase 1 mode + PSK + proposal ref)
-	for _, child := range node.FindChildren("policy") {
-		if len(child.Keys) < 2 {
-			continue
-		}
-		pol := &IKEPolicy{Name: child.Keys[1]}
-		for _, p := range child.Children {
+	for _, inst := range namedInstances(node.FindChildren("policy")) {
+		pol := &IKEPolicy{Name: inst.name}
+		for _, p := range inst.node.Children {
+			v := nodeVal(p)
 			switch p.Name() {
 			case "mode":
-				if len(p.Keys) >= 2 {
-					pol.Mode = p.Keys[1]
-				}
+				pol.Mode = v
 			case "proposals":
-				if len(p.Keys) >= 2 {
-					pol.Proposals = p.Keys[1]
-				}
+				pol.Proposals = v
 			case "pre-shared-key":
 				// "pre-shared-key ascii-text VALUE" or children
 				if len(p.Keys) >= 3 {
 					pol.PSK = p.Keys[2]
 				} else {
 					for _, c := range p.Children {
-						if c.Name() == "ascii-text" && len(c.Keys) >= 2 {
-							pol.PSK = c.Keys[1]
+						if c.Name() == "ascii-text" {
+							pol.PSK = nodeVal(c)
 						}
 					}
 				}
@@ -2321,6 +2345,29 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 					term.DestinationPorts = append(term.DestinationPorts, k)
 				}
 			}
+		case "source-prefix-list":
+			// Block form: source-prefix-list { mgmt-hosts except; }
+			for _, plNode := range child.Children {
+				ref := PrefixListRef{Name: plNode.Keys[0]}
+				if len(plNode.Keys) >= 2 && plNode.Keys[1] == "except" {
+					ref.Except = true
+				}
+				term.SourcePrefixLists = append(term.SourcePrefixLists, ref)
+			}
+		case "destination-prefix-list":
+			for _, plNode := range child.Children {
+				ref := PrefixListRef{Name: plNode.Keys[0]}
+				if len(plNode.Keys) >= 2 && plNode.Keys[1] == "except" {
+					ref.Except = true
+				}
+				term.DestPrefixLists = append(term.DestPrefixLists, ref)
+			}
+		case "source-port":
+			if len(child.Keys) >= 2 {
+				for _, k := range child.Keys[1:] {
+					term.SourcePorts = append(term.SourcePorts, k)
+				}
+			}
 		case "icmp-type":
 			if len(child.Keys) >= 2 {
 				if v, err := strconv.Atoi(child.Keys[1]); err == nil {
@@ -2373,6 +2420,18 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 		case "routing-instance":
 			if len(child.Keys) >= 2 {
 				term.RoutingInstance = child.Keys[1]
+			}
+		case "count":
+			if len(child.Keys) >= 2 {
+				term.Count = child.Keys[1]
+			}
+		case "forwarding-class":
+			if len(child.Keys) >= 2 {
+				term.ForwardingClass = child.Keys[1]
+			}
+		case "loss-priority":
+			if len(child.Keys) >= 2 {
+				term.LossPriority = child.Keys[1]
 			}
 		}
 	}
