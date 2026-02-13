@@ -1586,17 +1586,186 @@ func execDiagCmd(ctx context.Context, cmd []string) (string, error) {
 
 // --- Mutation RPCs ---
 
-func (s *Server) ClearSessions(_ context.Context, _ *pb.ClearSessionsRequest) (*pb.ClearSessionsResponse, error) {
+func (s *Server) ClearSessions(_ context.Context, req *pb.ClearSessionsRequest) (*pb.ClearSessionsResponse, error) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
-	v4, v6, err := s.dp.ClearAllSessions()
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+
+	// If no filters, clear all
+	if req.SourcePrefix == "" && req.DestinationPrefix == "" &&
+		req.Protocol == "" && req.Zone == "" &&
+		req.SourcePort == 0 && req.DestinationPort == 0 {
+		v4, v6, err := s.dp.ClearAllSessions()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
+		return &pb.ClearSessionsResponse{
+			Ipv4Cleared: int32(v4),
+			Ipv6Cleared: int32(v6),
+		}, nil
 	}
+
+	// Build filter
+	var srcNet, dstNet *net.IPNet
+	if req.SourcePrefix != "" {
+		cidr := req.SourcePrefix
+		if !strings.Contains(cidr, "/") {
+			if strings.Contains(cidr, ":") {
+				cidr += "/128"
+			} else {
+				cidr += "/32"
+			}
+		}
+		_, srcNet, _ = net.ParseCIDR(cidr)
+	}
+	if req.DestinationPrefix != "" {
+		cidr := req.DestinationPrefix
+		if !strings.Contains(cidr, "/") {
+			if strings.Contains(cidr, ":") {
+				cidr += "/128"
+			} else {
+				cidr += "/32"
+			}
+		}
+		_, dstNet, _ = net.ParseCIDR(cidr)
+	}
+
+	var proto uint8
+	switch strings.ToLower(req.Protocol) {
+	case "tcp":
+		proto = 6
+	case "udp":
+		proto = 17
+	case "icmp":
+		proto = 1
+	}
+
+	var zoneID uint16
+	if req.Zone != "" {
+		if cr := s.dp.LastCompileResult(); cr != nil {
+			zoneID = cr.ZoneIDs[req.Zone]
+		}
+	}
+
+	// Clear matching IPv4 sessions
+	v4Deleted := 0
+	var v4Keys []dataplane.SessionKey
+	var v4RevKeys []dataplane.SessionKey
+	var snatDNATKeys []dataplane.DNATKey
+	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if proto != 0 && key.Protocol != proto {
+			return true
+		}
+		if srcNet != nil && !srcNet.Contains(net.IP(key.SrcIP[:])) {
+			return true
+		}
+		if dstNet != nil && !dstNet.Contains(net.IP(key.DstIP[:])) {
+			return true
+		}
+		if zoneID != 0 && val.IngressZone != zoneID && val.EgressZone != zoneID {
+			return true
+		}
+		if req.SourcePort != 0 && key.SrcPort != uint16(req.SourcePort) {
+			return true
+		}
+		if req.DestinationPort != 0 && key.DstPort != uint16(req.DestinationPort) {
+			return true
+		}
+		v4Keys = append(v4Keys, key)
+		v4RevKeys = append(v4RevKeys, dataplane.SessionKey{
+			Protocol: key.Protocol,
+			SrcIP:    key.DstIP,
+			DstIP:    key.SrcIP,
+			SrcPort:  key.DstPort,
+			DstPort:  key.SrcPort,
+		})
+		if val.Flags&dataplane.SessFlagSNAT != 0 &&
+			val.Flags&dataplane.SessFlagStaticNAT == 0 {
+			snatDNATKeys = append(snatDNATKeys, dataplane.DNATKey{
+				Protocol: key.Protocol,
+				DstIP:    val.NATSrcIP,
+				DstPort:  val.NATSrcPort,
+			})
+		}
+		return true
+	})
+
+	for _, key := range v4Keys {
+		if err := s.dp.DeleteSession(key); err == nil {
+			v4Deleted++
+		}
+	}
+	for _, key := range v4RevKeys {
+		s.dp.DeleteSession(key)
+	}
+	for _, dk := range snatDNATKeys {
+		s.dp.DeleteDNATEntry(dk)
+	}
+
+	// Clear matching IPv6 sessions
+	v6Deleted := 0
+	var v6Keys []dataplane.SessionKeyV6
+	var v6RevKeys []dataplane.SessionKeyV6
+	var snatDNATKeysV6 []dataplane.DNATKeyV6
+	_ = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if proto != 0 && key.Protocol != proto {
+			return true
+		}
+		if srcNet != nil && !srcNet.Contains(net.IP(key.SrcIP[:])) {
+			return true
+		}
+		if dstNet != nil && !dstNet.Contains(net.IP(key.DstIP[:])) {
+			return true
+		}
+		if zoneID != 0 && val.IngressZone != zoneID && val.EgressZone != zoneID {
+			return true
+		}
+		if req.SourcePort != 0 && key.SrcPort != uint16(req.SourcePort) {
+			return true
+		}
+		if req.DestinationPort != 0 && key.DstPort != uint16(req.DestinationPort) {
+			return true
+		}
+		v6Keys = append(v6Keys, key)
+		v6RevKeys = append(v6RevKeys, dataplane.SessionKeyV6{
+			Protocol: key.Protocol,
+			SrcIP:    key.DstIP,
+			DstIP:    key.SrcIP,
+			SrcPort:  key.DstPort,
+			DstPort:  key.SrcPort,
+		})
+		if val.Flags&dataplane.SessFlagSNAT != 0 &&
+			val.Flags&dataplane.SessFlagStaticNAT == 0 {
+			snatDNATKeysV6 = append(snatDNATKeysV6, dataplane.DNATKeyV6{
+				Protocol: key.Protocol,
+				DstIP:    val.NATSrcIP,
+				DstPort:  val.NATSrcPort,
+			})
+		}
+		return true
+	})
+
+	for _, key := range v6Keys {
+		if err := s.dp.DeleteSessionV6(key); err == nil {
+			v6Deleted++
+		}
+	}
+	for _, key := range v6RevKeys {
+		s.dp.DeleteSessionV6(key)
+	}
+	for _, dk := range snatDNATKeysV6 {
+		s.dp.DeleteDNATEntryV6(dk)
+	}
+
 	return &pb.ClearSessionsResponse{
-		Ipv4Cleared: int32(v4),
-		Ipv6Cleared: int32(v6),
+		Ipv4Cleared: int32(v4Deleted),
+		Ipv6Cleared: int32(v6Deleted),
 	}, nil
 }
 

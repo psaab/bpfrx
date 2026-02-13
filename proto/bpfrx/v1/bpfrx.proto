@@ -426,7 +426,14 @@ message TracerouteResponse { string output = 1; }
 
 // --- Mutation messages ---
 
-message ClearSessionsRequest {}
+message ClearSessionsRequest {
+  string source_prefix = 1;      // optional CIDR filter
+  string destination_prefix = 2;  // optional CIDR filter
+  string protocol = 3;           // optional: "tcp", "udp", "icmp"
+  string zone = 4;               // optional: zone name
+  uint32 source_port = 5;        // optional
+  uint32 destination_port = 6;   // optional
+}
 message ClearSessionsResponse {
   int32 ipv4_cleared = 1;
   int32 ipv6_cleared = 2;

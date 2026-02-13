@@ -1552,9 +1552,39 @@ func (c *ctl) handleClearSecurity(args []string) error {
 	switch args[0] {
 	case "flow":
 		if len(args) < 2 || args[1] != "session" {
-			return fmt.Errorf("usage: clear security flow session")
+			return fmt.Errorf("usage: clear security flow session [filters...]")
 		}
-		resp, err := c.client.ClearSessions(context.Background(), &pb.ClearSessionsRequest{})
+		req := &pb.ClearSessionsRequest{}
+		for i := 2; i < len(args); i++ {
+			if i+1 >= len(args) {
+				break
+			}
+			switch args[i] {
+			case "source-prefix":
+				i++
+				req.SourcePrefix = args[i]
+			case "destination-prefix":
+				i++
+				req.DestinationPrefix = args[i]
+			case "protocol":
+				i++
+				req.Protocol = args[i]
+			case "zone":
+				i++
+				req.Zone = args[i]
+			case "source-port":
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil {
+					req.SourcePort = uint32(v)
+				}
+			case "destination-port":
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil {
+					req.DestinationPort = uint32(v)
+				}
+			}
+		}
+		resp, err := c.client.ClearSessions(context.Background(), req)
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}

@@ -4817,9 +4817,15 @@ func (x *TracerouteResponse) GetOutput() string {
 }
 
 type ClearSessionsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	SourcePrefix      string                 `protobuf:"bytes,1,opt,name=source_prefix,json=sourcePrefix,proto3" json:"source_prefix,omitempty"`                // optional CIDR filter
+	DestinationPrefix string                 `protobuf:"bytes,2,opt,name=destination_prefix,json=destinationPrefix,proto3" json:"destination_prefix,omitempty"` // optional CIDR filter
+	Protocol          string                 `protobuf:"bytes,3,opt,name=protocol,proto3" json:"protocol,omitempty"`                                            // optional: "tcp", "udp", "icmp"
+	Zone              string                 `protobuf:"bytes,4,opt,name=zone,proto3" json:"zone,omitempty"`                                                    // optional: zone name
+	SourcePort        uint32                 `protobuf:"varint,5,opt,name=source_port,json=sourcePort,proto3" json:"source_port,omitempty"`                     // optional
+	DestinationPort   uint32                 `protobuf:"varint,6,opt,name=destination_port,json=destinationPort,proto3" json:"destination_port,omitempty"`      // optional
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *ClearSessionsRequest) Reset() {
@@ -4850,6 +4856,48 @@ func (x *ClearSessionsRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use ClearSessionsRequest.ProtoReflect.Descriptor instead.
 func (*ClearSessionsRequest) Descriptor() ([]byte, []int) {
 	return file_bpfrx_proto_rawDescGZIP(), []int{89}
+}
+
+func (x *ClearSessionsRequest) GetSourcePrefix() string {
+	if x != nil {
+		return x.SourcePrefix
+	}
+	return ""
+}
+
+func (x *ClearSessionsRequest) GetDestinationPrefix() string {
+	if x != nil {
+		return x.DestinationPrefix
+	}
+	return ""
+}
+
+func (x *ClearSessionsRequest) GetProtocol() string {
+	if x != nil {
+		return x.Protocol
+	}
+	return ""
+}
+
+func (x *ClearSessionsRequest) GetZone() string {
+	if x != nil {
+		return x.Zone
+	}
+	return ""
+}
+
+func (x *ClearSessionsRequest) GetSourcePort() uint32 {
+	if x != nil {
+		return x.SourcePort
+	}
+	return 0
+}
+
+func (x *ClearSessionsRequest) GetDestinationPort() uint32 {
+	if x != nil {
+		return x.DestinationPort
+	}
+	return 0
 }
 
 type ClearSessionsResponse struct {
@@ -6373,8 +6421,15 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x06source\x18\x02 \x01(\tR\x06source\x12)\n" +
 	"\x10routing_instance\x18\x03 \x01(\tR\x0froutingInstance\",\n" +
 	"\x12TracerouteResponse\x12\x16\n" +
-	"\x06output\x18\x01 \x01(\tR\x06output\"\x16\n" +
-	"\x14ClearSessionsRequest\"]\n" +
+	"\x06output\x18\x01 \x01(\tR\x06output\"\xe6\x01\n" +
+	"\x14ClearSessionsRequest\x12#\n" +
+	"\rsource_prefix\x18\x01 \x01(\tR\fsourcePrefix\x12-\n" +
+	"\x12destination_prefix\x18\x02 \x01(\tR\x11destinationPrefix\x12\x1a\n" +
+	"\bprotocol\x18\x03 \x01(\tR\bprotocol\x12\x12\n" +
+	"\x04zone\x18\x04 \x01(\tR\x04zone\x12\x1f\n" +
+	"\vsource_port\x18\x05 \x01(\rR\n" +
+	"sourcePort\x12)\n" +
+	"\x10destination_port\x18\x06 \x01(\rR\x0fdestinationPort\"]\n" +
 	"\x15ClearSessionsResponse\x12!\n" +
 	"\fipv4_cleared\x18\x01 \x01(\x05R\vipv4Cleared\x12!\n" +
 	"\fipv6_cleared\x18\x02 \x01(\x05R\vipv6Cleared\"\x16\n" +
