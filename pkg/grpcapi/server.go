@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -2828,6 +2829,133 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 				fmt.Fprintf(&buf, "  Address: %s\n", a.IPNet)
 			}
 			fmt.Fprintln(&buf)
+		}
+
+	case "policies-hit-count":
+		cfg := s.store.ActiveConfig()
+		if cfg == nil {
+			fmt.Fprintln(&buf, "No active configuration")
+			break
+		}
+		fmt.Fprintf(&buf, "%-12s %-12s %-24s %-8s %12s %16s\n",
+			"From zone", "To zone", "Policy", "Action", "Packets", "Bytes")
+		fmt.Fprintln(&buf, strings.Repeat("-", 88))
+		policySetID := uint32(0)
+		var totalPkts, totalBytes uint64
+		for _, zpp := range cfg.Security.Policies {
+			for i, pol := range zpp.Policies {
+				action := "permit"
+				switch pol.Action {
+				case 1:
+					action = "deny"
+				case 2:
+					action = "reject"
+				}
+				ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+				var pkts, bytes uint64
+				if s.dp != nil && s.dp.IsLoaded() {
+					if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
+						pkts = counters.Packets
+						bytes = counters.Bytes
+					}
+				}
+				totalPkts += pkts
+				totalBytes += bytes
+				fmt.Fprintf(&buf, "%-12s %-12s %-24s %-8s %12d %16d\n",
+					zpp.FromZone, zpp.ToZone, pol.Name, action, pkts, bytes)
+			}
+			policySetID++
+		}
+		fmt.Fprintln(&buf, strings.Repeat("-", 88))
+		fmt.Fprintf(&buf, "%-48s %8s %12d %16d\n", "Total", "", totalPkts, totalBytes)
+
+	case "chassis-cluster":
+		cfg := s.store.ActiveConfig()
+		if cfg == nil || cfg.Chassis.Cluster == nil {
+			fmt.Fprintln(&buf, "Cluster not configured")
+			break
+		}
+		cluster := cfg.Chassis.Cluster
+		fmt.Fprintf(&buf, "Chassis cluster status:\n")
+		fmt.Fprintf(&buf, "  RETH count: %d\n\n", cluster.RethCount)
+		for _, rg := range cluster.RedundancyGroups {
+			fmt.Fprintf(&buf, "Redundancy group: %d\n", rg.ID)
+			for nodeID, priority := range rg.NodePriorities {
+				fmt.Fprintf(&buf, "  Node %d priority: %d\n", nodeID, priority)
+			}
+			if rg.GratuitousARPCount > 0 {
+				fmt.Fprintf(&buf, "  Gratuitous ARP count: %d\n", rg.GratuitousARPCount)
+			}
+			if len(rg.InterfaceMonitors) > 0 {
+				fmt.Fprintln(&buf, "  Interface monitors:")
+				for _, mon := range rg.InterfaceMonitors {
+					fmt.Fprintf(&buf, "    %-20s weight %d\n", mon.Interface, mon.Weight)
+				}
+			}
+			fmt.Fprintln(&buf)
+		}
+
+	case "chassis-environment":
+		thermalZones, _ := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")
+		if len(thermalZones) > 0 {
+			fmt.Fprintln(&buf, "Temperature:")
+			for _, tz := range thermalZones {
+				data, err := os.ReadFile(tz)
+				if err != nil {
+					continue
+				}
+				millideg, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+				if err != nil {
+					continue
+				}
+				typeFile := filepath.Join(filepath.Dir(tz), "type")
+				name := filepath.Base(filepath.Dir(tz))
+				if typeData, err := os.ReadFile(typeFile); err == nil {
+					name = strings.TrimSpace(string(typeData))
+				}
+				fmt.Fprintf(&buf, "  %-30s %d.%d C\n", name, millideg/1000, (millideg%1000)/100)
+			}
+			fmt.Fprintln(&buf)
+		}
+		var sysinfo unix.Sysinfo_t
+		if err := unix.Sysinfo(&sysinfo); err == nil {
+			days := sysinfo.Uptime / 86400
+			hours := (sysinfo.Uptime % 86400) / 3600
+			mins := (sysinfo.Uptime % 3600) / 60
+			fmt.Fprintf(&buf, "System uptime: %d days, %d:%02d\n", days, hours, mins)
+			fmt.Fprintf(&buf, "Load average: %.2f %.2f %.2f\n",
+				float64(sysinfo.Loads[0])/65536.0,
+				float64(sysinfo.Loads[1])/65536.0,
+				float64(sysinfo.Loads[2])/65536.0)
+		}
+
+	case "system-services":
+		cfg := s.store.ActiveConfig()
+		if cfg == nil {
+			fmt.Fprintln(&buf, "No active configuration")
+			break
+		}
+		fmt.Fprintln(&buf, "System services:")
+		fmt.Fprintln(&buf, "  gRPC:           127.0.0.1:50051 (always on)")
+		fmt.Fprintln(&buf, "  HTTP REST:      127.0.0.1:8080 (always on)")
+		if len(cfg.System.NameServers) > 0 {
+			fmt.Fprintf(&buf, "  DNS servers:    %s\n", strings.Join(cfg.System.NameServers, ", "))
+		}
+		if len(cfg.System.NTPServers) > 0 {
+			fmt.Fprintf(&buf, "  NTP servers:    %s\n", strings.Join(cfg.System.NTPServers, ", "))
+		}
+		if len(cfg.Security.Log.Streams) > 0 {
+			fmt.Fprintf(&buf, "  Syslog:         %d stream(s)\n", len(cfg.Security.Log.Streams))
+		}
+		if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.Version9 != nil {
+			fmt.Fprintf(&buf, "  NetFlow v9:     %d template(s)\n", len(cfg.Services.FlowMonitoring.Version9.Templates))
+		}
+		if cfg.Services.RPM != nil && len(cfg.Services.RPM.Probes) > 0 {
+			total := 0
+			for _, probe := range cfg.Services.RPM.Probes {
+				total += len(probe.Tests)
+			}
+			fmt.Fprintf(&buf, "  RPM probes:     %d probe(s), %d test(s)\n", len(cfg.Services.RPM.Probes), total)
 		}
 
 	default:

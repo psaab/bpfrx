@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,7 +98,9 @@ var operationalTree = map[string]*completionNode{
 	"configure": {desc: "Enter configuration mode"},
 	"show": {desc: "Show information", children: map[string]*completionNode{
 		"chassis": {desc: "Show hardware information", children: map[string]*completionNode{
-			"hardware": {desc: "Show hardware details"},
+			"cluster":     {desc: "Show cluster/HA status"},
+			"environment": {desc: "Show temperature and power"},
+			"hardware":    {desc: "Show hardware details"},
 		}},
 		"configuration": {desc: "Show active configuration"},
 		"dhcp": {desc: "Show DHCP information", children: map[string]*completionNode{
@@ -130,7 +133,8 @@ var operationalTree = map[string]*completionNode{
 				return names
 			}},
 			"policies": {desc: "Show security policies", children: map[string]*completionNode{
-				"brief": {desc: "Show brief policy summary"},
+				"brief":     {desc: "Show brief policy summary"},
+				"hit-count": {desc: "Show policy hit counters"},
 			}},
 			"screen":          {desc: "Show screen/IDS profiles"},
 			"alg":             {desc: "Show ALG status"},
@@ -201,6 +205,7 @@ var operationalTree = map[string]*completionNode{
 			"rollback": {desc: "Show rollback history", children: map[string]*completionNode{
 				"compare": {desc: "Compare rollback with active config"},
 			}},
+			"services":    {desc: "Show configured system services"},
 			"storage":     {desc: "Show filesystem usage"},
 			"uptime":      {desc: "Show system uptime"},
 			"memory":      {desc: "Show memory usage"},
@@ -1038,6 +1043,10 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		return nil
 
 	case "policies":
+		// "show security policies hit-count" — Junos-style hit count table
+		if len(args) >= 2 && args[1] == "hit-count" {
+			return c.showPoliciesHitCount(cfg)
+		}
 		brief := len(args) >= 2 && args[1] == "brief"
 		if brief {
 			// Brief tabular summary
@@ -1146,6 +1155,46 @@ func (c *CLI) handleShowSecurity(args []string) error {
 	default:
 		return fmt.Errorf("unknown show security target: %s", args[0])
 	}
+}
+
+// showPoliciesHitCount displays a Junos-style policy hit count table.
+func (c *CLI) showPoliciesHitCount(cfg *config.Config) error {
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("dataplane not loaded")
+		return nil
+	}
+
+	fmt.Printf("%-12s %-12s %-24s %-8s %12s %16s\n",
+		"From zone", "To zone", "Policy", "Action", "Packets", "Bytes")
+	fmt.Println(strings.Repeat("-", 88))
+
+	policySetID := uint32(0)
+	var totalPkts, totalBytes uint64
+	for _, zpp := range cfg.Security.Policies {
+		for i, pol := range zpp.Policies {
+			action := "permit"
+			switch pol.Action {
+			case 1:
+				action = "deny"
+			case 2:
+				action = "reject"
+			}
+			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+			var pkts, bytes uint64
+			if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+				pkts = counters.Packets
+				bytes = counters.Bytes
+			}
+			totalPkts += pkts
+			totalBytes += bytes
+			fmt.Printf("%-12s %-12s %-24s %-8s %12d %16d\n",
+				zpp.FromZone, zpp.ToZone, pol.Name, action, pkts, bytes)
+		}
+		policySetID++
+	}
+	fmt.Println(strings.Repeat("-", 88))
+	fmt.Printf("%-48s %8s %12d %16d\n", "Total", "", totalPkts, totalBytes)
+	return nil
 }
 
 func (c *CLI) showScreen() error {
@@ -3544,6 +3593,7 @@ func (c *CLI) handleShowSystem(args []string) error {
 		fmt.Println("  memory           Show memory usage")
 		fmt.Println("  processes        Show running processes")
 		fmt.Println("  rollback         Show rollback history")
+		fmt.Println("  services         Show configured system services")
 		fmt.Println("  storage          Show filesystem usage")
 		fmt.Println("  uptime           Show system uptime")
 		fmt.Println("  users            Show configured login users")
@@ -3656,9 +3706,95 @@ func (c *CLI) handleShowSystem(args []string) error {
 		fmt.Println("License: open-source (no license required)")
 		return nil
 
+	case "services":
+		return c.showSystemServices()
+
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])
 	}
+}
+
+// showSystemServices displays configured system services.
+func (c *CLI) showSystemServices() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	fmt.Println("System services:")
+
+	// gRPC
+	fmt.Println("  gRPC:           127.0.0.1:50051 (always on)")
+	// HTTP REST
+	fmt.Println("  HTTP REST:      127.0.0.1:8080 (always on)")
+
+	// SSH
+	if cfg.System.Services != nil && cfg.System.Services.SSH != nil {
+		if cfg.System.Services.SSH.RootLogin == "allow" {
+			fmt.Println("  SSH root login: enabled")
+		}
+	}
+
+	// SNMP
+	if cfg.System.SNMP != nil {
+		fmt.Println("  SNMP:           enabled")
+		if cfg.System.SNMP.Description != "" {
+			fmt.Printf("    Description:  %s\n", cfg.System.SNMP.Description)
+		}
+		if cfg.System.SNMP.Location != "" {
+			fmt.Printf("    Location:     %s\n", cfg.System.SNMP.Location)
+		}
+		for name, comm := range cfg.System.SNMP.Communities {
+			fmt.Printf("    Community:    %s (%s)\n", name, comm.Authorization)
+		}
+	}
+
+	// DHCP server
+	if cfg.System.DHCPServer.DHCPLocalServer != nil && len(cfg.System.DHCPServer.DHCPLocalServer.Groups) > 0 {
+		fmt.Printf("  DHCP server:    %d group(s)\n", len(cfg.System.DHCPServer.DHCPLocalServer.Groups))
+	}
+	if cfg.System.DHCPServer.DHCPv6LocalServer != nil && len(cfg.System.DHCPServer.DHCPv6LocalServer.Groups) > 0 {
+		fmt.Printf("  DHCPv6 server:  %d group(s)\n", len(cfg.System.DHCPServer.DHCPv6LocalServer.Groups))
+	}
+
+	// DNS
+	if len(cfg.System.NameServers) > 0 {
+		fmt.Printf("  DNS servers:    %s\n", strings.Join(cfg.System.NameServers, ", "))
+	}
+
+	// NTP
+	if len(cfg.System.NTPServers) > 0 {
+		fmt.Printf("  NTP servers:    %s\n", strings.Join(cfg.System.NTPServers, ", "))
+	}
+
+	// Syslog
+	if len(cfg.Security.Log.Streams) > 0 {
+		fmt.Printf("  Syslog:         %d stream(s)\n", len(cfg.Security.Log.Streams))
+		for _, stream := range cfg.Security.Log.Streams {
+			sev := "all"
+			if stream.Severity != "" {
+				sev = stream.Severity + "+"
+			}
+			fmt.Printf("    %-16s %s:%d (%s)\n", stream.Name, stream.Host, stream.Port, sev)
+		}
+	}
+
+	// Flow monitoring / NetFlow
+	if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.Version9 != nil {
+		fmt.Printf("  NetFlow v9:     %d template(s)\n", len(cfg.Services.FlowMonitoring.Version9.Templates))
+	}
+
+	// RPM probes
+	if cfg.Services.RPM != nil && len(cfg.Services.RPM.Probes) > 0 {
+		total := 0
+		for _, probe := range cfg.Services.RPM.Probes {
+			total += len(probe.Tests)
+		}
+		fmt.Printf("  RPM probes:     %d probe(s), %d test(s)\n", len(cfg.Services.RPM.Probes), total)
+	}
+
+	return nil
 }
 
 func protoNameFromNum(p uint8) string {
@@ -5235,11 +5371,131 @@ func (c *CLI) showVersion() error {
 
 // showChassis shows hardware information (like Junos "show chassis hardware").
 func (c *CLI) showChassis(args []string) error {
-	if len(args) > 0 && args[0] == "hardware" {
-		return c.showChassisHardware()
+	if len(args) > 0 {
+		switch args[0] {
+		case "hardware":
+			return c.showChassisHardware()
+		case "cluster":
+			return c.showChassisCluster(args[1:])
+		case "environment":
+			return c.showChassisEnvironment()
+		}
 	}
 	fmt.Println("show chassis:")
+	fmt.Println("  cluster          Show cluster/HA status")
+	fmt.Println("  environment      Show temperature and power information")
 	fmt.Println("  hardware         Show hardware information")
+	return nil
+}
+
+// showChassisCluster shows cluster/HA configuration and status.
+func (c *CLI) showChassisCluster(args []string) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	cluster := cfg.Chassis.Cluster
+
+	fmt.Println("Chassis cluster status:")
+	fmt.Printf("  RETH count: %d\n", cluster.RethCount)
+	fmt.Println()
+
+	for _, rg := range cluster.RedundancyGroups {
+		fmt.Printf("Redundancy group: %d\n", rg.ID)
+		for nodeID, priority := range rg.NodePriorities {
+			fmt.Printf("  Node %d priority: %d\n", nodeID, priority)
+		}
+		if rg.GratuitousARPCount > 0 {
+			fmt.Printf("  Gratuitous ARP count: %d\n", rg.GratuitousARPCount)
+		}
+		if len(rg.InterfaceMonitors) > 0 {
+			fmt.Println("  Interface monitors:")
+			for _, mon := range rg.InterfaceMonitors {
+				fmt.Printf("    %-20s weight %d\n", mon.Interface, mon.Weight)
+			}
+		}
+		fmt.Println()
+	}
+
+	// Show VRRP status if any
+	if cfg.Security.Zones != nil {
+		for _, zone := range cfg.Security.Zones {
+			for _, iface := range zone.Interfaces {
+				ifCfg, ok := cfg.Interfaces.Interfaces[iface]
+				if !ok {
+					continue
+				}
+				for _, unit := range ifCfg.Units {
+					for addr, vg := range unit.VRRPGroups {
+						fmt.Printf("VRRP on %s.%d: group %d, priority %d, VIP %s, address %s\n",
+							iface, unit.Number, vg.ID, vg.Priority,
+							strings.Join(vg.VirtualAddresses, ","), addr)
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// showChassisEnvironment shows system temperature and power info.
+func (c *CLI) showChassisEnvironment() error {
+	// Thermal zones
+	thermalZones, _ := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")
+	if len(thermalZones) > 0 {
+		fmt.Println("Temperature:")
+		for _, tz := range thermalZones {
+			data, err := os.ReadFile(tz)
+			if err != nil {
+				continue
+			}
+			millideg, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+			if err != nil {
+				continue
+			}
+			// Read type for zone name
+			typeFile := filepath.Join(filepath.Dir(tz), "type")
+			name := filepath.Base(filepath.Dir(tz))
+			if typeData, err := os.ReadFile(typeFile); err == nil {
+				name = strings.TrimSpace(string(typeData))
+			}
+			fmt.Printf("  %-30s %d.%d C\n", name, millideg/1000, (millideg%1000)/100)
+		}
+		fmt.Println()
+	}
+
+	// Power supply
+	powerFiles, _ := filepath.Glob("/sys/class/power_supply/*/status")
+	if len(powerFiles) > 0 {
+		fmt.Println("Power supplies:")
+		for _, pf := range powerFiles {
+			name := filepath.Base(filepath.Dir(pf))
+			status, err := os.ReadFile(pf)
+			if err != nil {
+				continue
+			}
+			fmt.Printf("  %-20s %s\n", name, strings.TrimSpace(string(status)))
+		}
+		fmt.Println()
+	}
+
+	// System uptime and load
+	var sysinfo unix.Sysinfo_t
+	if err := unix.Sysinfo(&sysinfo); err == nil {
+		days := sysinfo.Uptime / 86400
+		hours := (sysinfo.Uptime % 86400) / 3600
+		mins := (sysinfo.Uptime % 3600) / 60
+		fmt.Printf("System uptime: %d days, %d:%02d\n", days, hours, mins)
+		fmt.Printf("Load average: %.2f %.2f %.2f\n",
+			float64(sysinfo.Loads[0])/65536.0,
+			float64(sysinfo.Loads[1])/65536.0,
+			float64(sysinfo.Loads[2])/65536.0)
+		fmt.Printf("Total RAM: %s, Free: %s\n",
+			fmtBytes(sysinfo.Totalram), fmtBytes(sysinfo.Freeram))
+	}
+
 	return nil
 }
 
