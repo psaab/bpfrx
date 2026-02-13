@@ -111,6 +111,7 @@ var operationalTree = map[string]*completionNode{
 		"log":             {desc: "Show daemon log entries [N]"},
 		"route": {desc: "Show routing table [instance <name>]", children: map[string]*completionNode{
 			"summary": {desc: "Show route summary by protocol"},
+			"table":   {desc: "Show routes for a VRF table"},
 			"instance": {desc: "Show routes for a routing instance", dynamicFn: func(cfg *config.Config) []string {
 				if cfg == nil {
 					return nil
@@ -3554,6 +3555,9 @@ func (c *CLI) handleShowRoute(args []string) error {
 	if len(args) >= 2 && args[0] == "instance" {
 		return c.showRoutesForInstance(args[1])
 	}
+	if len(args) >= 2 && args[0] == "table" {
+		return c.showRoutesForVRF(args[1])
+	}
 	if len(args) >= 1 && args[0] == "summary" {
 		return c.showRouteSummary()
 	}
@@ -3612,6 +3616,32 @@ func (c *CLI) showRoutesForInstance(instanceName string) error {
 	}
 
 	fmt.Printf("Routing table for instance %s (table %d):\n", instanceName, tableID)
+	fmt.Printf("  %-24s %-20s %-14s %-12s %s\n",
+		"Destination", "Next-hop", "Interface", "Proto", "Pref")
+	for _, e := range entries {
+		fmt.Printf("  %-24s %-20s %-14s %-12s %d\n",
+			e.Destination, e.NextHop, e.Interface, e.Protocol, e.Preference)
+	}
+	return nil
+}
+
+func (c *CLI) showRoutesForVRF(vrfName string) error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+
+	entries, err := c.routing.GetVRFRoutes(vrfName)
+	if err != nil {
+		return fmt.Errorf("get VRF routes: %w", err)
+	}
+
+	if len(entries) == 0 {
+		fmt.Printf("No routes in table %s\n", vrfName)
+		return nil
+	}
+
+	fmt.Printf("Routing table: %s\n", vrfName)
 	fmt.Printf("  %-24s %-20s %-14s %-12s %s\n",
 		"Destination", "Next-hop", "Interface", "Proto", "Pref")
 	for _, e := range entries {

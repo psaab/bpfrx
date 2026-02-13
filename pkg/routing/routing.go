@@ -117,43 +117,48 @@ func (m *Manager) GetRoutesForTable(tableID int) ([]RouteEntry, error) {
 			continue
 		}
 		for _, r := range routes {
-			entry := RouteEntry{
-				Preference: r.Priority,
-				Protocol:   rtProtoName(r.Protocol),
-			}
-
-			if r.Dst != nil {
-				entry.Destination = r.Dst.String()
-			} else {
-				if family == netlink.FAMILY_V6 {
-					entry.Destination = "::/0"
-				} else {
-					entry.Destination = "0.0.0.0/0"
-				}
-			}
-
-			if r.Gw != nil {
-				entry.NextHop = r.Gw.String()
-			} else if r.Type == unix.RTN_BLACKHOLE {
-				entry.NextHop = "discard"
-			} else {
-				entry.NextHop = "direct"
-			}
-
-			if r.LinkIndex > 0 {
-				link, err := m.nlHandle.LinkByIndex(r.LinkIndex)
-				if err == nil {
-					entry.Interface = link.Attrs().Name
-				} else {
-					entry.Interface = strconv.Itoa(r.LinkIndex)
-				}
-			}
-
-			entries = append(entries, entry)
+			entries = append(entries, routeToEntry(m, r, family))
 		}
 	}
 
 	return entries, nil
+}
+
+// routeToEntry converts a netlink route to a RouteEntry.
+func routeToEntry(m *Manager, r netlink.Route, family int) RouteEntry {
+	entry := RouteEntry{
+		Preference: r.Priority,
+		Protocol:   rtProtoName(r.Protocol),
+	}
+
+	if r.Dst != nil {
+		entry.Destination = r.Dst.String()
+	} else {
+		if family == netlink.FAMILY_V6 {
+			entry.Destination = "::/0"
+		} else {
+			entry.Destination = "0.0.0.0/0"
+		}
+	}
+
+	if r.Gw != nil {
+		entry.NextHop = r.Gw.String()
+	} else if r.Type == unix.RTN_BLACKHOLE {
+		entry.NextHop = "discard"
+	} else {
+		entry.NextHop = "direct"
+	}
+
+	if r.LinkIndex > 0 {
+		link, err := m.nlHandle.LinkByIndex(r.LinkIndex)
+		if err == nil {
+			entry.Interface = link.Attrs().Name
+		} else {
+			entry.Interface = strconv.Itoa(r.LinkIndex)
+		}
+	}
+
+	return entry
 }
 
 // ApplyTunnels creates GRE tunnel interfaces, brings them up, and assigns addresses.
@@ -424,13 +429,24 @@ type RouteEntry struct {
 	Preference  int
 }
 
-// GetRoutes reads the kernel routing table (main table).
+// GetRoutes reads the main kernel routing table.
 func (m *Manager) GetRoutes() ([]RouteEntry, error) {
-	return m.getRoutesFromTable(0)
+	var entries []RouteEntry
+
+	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+		routes, err := m.nlHandle.RouteList(nil, family)
+		if err != nil {
+			continue
+		}
+		for _, r := range routes {
+			entries = append(entries, routeToEntry(m, r, family))
+		}
+	}
+
+	return entries, nil
 }
 
-// GetVRFRoutes reads routes from a VRF's routing table.
-// vrfName should be the Linux VRF device name (e.g. "vrf-tunnel-vr").
+// GetVRFRoutes reads routes from a VRF's routing table by VRF device name.
 func (m *Manager) GetVRFRoutes(vrfName string) ([]RouteEntry, error) {
 	link, err := m.nlHandle.LinkByName(vrfName)
 	if err != nil {
@@ -440,61 +456,7 @@ func (m *Manager) GetVRFRoutes(vrfName string) ([]RouteEntry, error) {
 	if !ok {
 		return nil, fmt.Errorf("%q is not a VRF device", vrfName)
 	}
-	return m.getRoutesFromTable(int(vrf.Table))
-}
-
-func (m *Manager) getRoutesFromTable(tableID int) ([]RouteEntry, error) {
-	var entries []RouteEntry
-
-	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		var routes []netlink.Route
-		var err error
-		if tableID > 0 {
-			routes, err = m.nlHandle.RouteListFiltered(family, &netlink.Route{Table: tableID}, netlink.RT_FILTER_TABLE)
-		} else {
-			routes, err = m.nlHandle.RouteList(nil, family)
-		}
-		if err != nil {
-			continue
-		}
-		for _, r := range routes {
-			entry := RouteEntry{
-				Preference: r.Priority,
-				Protocol:   rtProtoName(r.Protocol),
-			}
-
-			if r.Dst != nil {
-				entry.Destination = r.Dst.String()
-			} else {
-				if family == netlink.FAMILY_V6 {
-					entry.Destination = "::/0"
-				} else {
-					entry.Destination = "0.0.0.0/0"
-				}
-			}
-
-			if r.Gw != nil {
-				entry.NextHop = r.Gw.String()
-			} else if r.Type == unix.RTN_BLACKHOLE {
-				entry.NextHop = "discard"
-			} else {
-				entry.NextHop = "direct"
-			}
-
-			if r.LinkIndex > 0 {
-				link, err := m.nlHandle.LinkByIndex(r.LinkIndex)
-				if err == nil {
-					entry.Interface = link.Attrs().Name
-				} else {
-					entry.Interface = strconv.Itoa(r.LinkIndex)
-				}
-			}
-
-			entries = append(entries, entry)
-		}
-	}
-
-	return entries, nil
+	return m.GetRoutesForTable(int(vrf.Table))
 }
 
 func rtProtoName(p netlink.RouteProtocol) string {
