@@ -290,69 +290,106 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 			continue
 		}
 		// "from-zone trust to-zone untrust { ... }"
-		if child.Name() == "from-zone" && len(child.Keys) >= 4 {
-			fromZone := child.Keys[1]
-			toZone := child.Keys[3] // "to-zone" is at index 2
-			zpp := &ZonePairPolicies{
-				FromZone: fromZone,
-				ToZone:   toZone,
+		if child.Name() == "from-zone" {
+			type zonePair struct {
+				from, to   string
+				policyNode *Node
 			}
+			var pairs []zonePair
 
-			for _, policyNode := range child.FindChildren("policy") {
-				if len(policyNode.Keys) < 2 {
-					continue
-				}
-				pol := &Policy{Name: policyNode.Keys[1]}
-
-				matchNode := policyNode.FindChild("match")
-				if matchNode != nil {
-					for _, m := range matchNode.Children {
-						switch m.Name() {
-						case "source-address":
-							pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, m.Keys[1:]...)
-						case "destination-address":
-							pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, m.Keys[1:]...)
-						case "application":
-							pol.Match.Applications = append(pol.Match.Applications, m.Keys[1:]...)
-						}
+			if len(child.Keys) >= 4 {
+				// Hierarchical: Keys=["from-zone", "trust", "to-zone", "untrust"]
+				pairs = append(pairs, zonePair{child.Keys[1], child.Keys[3], child})
+			} else {
+				// Flat set: from-zone → <name> → to-zone → <name> → policy ...
+				for _, fzSub := range child.Children {
+					tzNode := fzSub.FindChild("to-zone")
+					if tzNode == nil {
+						continue
+					}
+					for _, tzSub := range tzNode.Children {
+						pairs = append(pairs, zonePair{fzSub.Name(), tzSub.Name(), tzSub})
 					}
 				}
+			}
 
-				thenNode := policyNode.FindChild("then")
-				if thenNode != nil {
-					for _, t := range thenNode.Children {
-						switch t.Name() {
-						case "permit":
-							pol.Action = PolicyPermit
-						case "deny":
-							pol.Action = PolicyDeny
-						case "reject":
-							pol.Action = PolicyReject
-						case "log":
-							pol.Log = &PolicyLog{}
-							for _, logOpt := range t.Children {
-								switch logOpt.Name() {
-								case "session-init":
-									pol.Log.SessionInit = true
-								case "session-close":
-									pol.Log.SessionClose = true
+			for _, zp := range pairs {
+				zpp := &ZonePairPolicies{
+					FromZone: zp.from,
+					ToZone:   zp.to,
+				}
+
+				for _, polInst := range namedInstances(zp.policyNode.FindChildren("policy")) {
+					pol := &Policy{Name: polInst.name}
+
+					matchNode := polInst.node.FindChild("match")
+					if matchNode != nil {
+						for _, m := range matchNode.Children {
+							switch m.Name() {
+							case "source-address":
+								if len(m.Keys) >= 2 {
+									pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, m.Keys[1:]...)
+								} else {
+									for _, c := range m.Children {
+										pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, c.Name())
+									}
+								}
+							case "destination-address":
+								if len(m.Keys) >= 2 {
+									pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, m.Keys[1:]...)
+								} else {
+									for _, c := range m.Children {
+										pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, c.Name())
+									}
+								}
+							case "application":
+								if len(m.Keys) >= 2 {
+									pol.Match.Applications = append(pol.Match.Applications, m.Keys[1:]...)
+								} else {
+									for _, c := range m.Children {
+										pol.Match.Applications = append(pol.Match.Applications, c.Name())
+									}
 								}
 							}
-						case "count":
-							pol.Count = true
 						}
 					}
+
+					thenNode := polInst.node.FindChild("then")
+					if thenNode != nil {
+						for _, t := range thenNode.Children {
+							switch t.Name() {
+							case "permit":
+								pol.Action = PolicyPermit
+							case "deny":
+								pol.Action = PolicyDeny
+							case "reject":
+								pol.Action = PolicyReject
+							case "log":
+								pol.Log = &PolicyLog{}
+								for _, logOpt := range t.Children {
+									switch logOpt.Name() {
+									case "session-init":
+										pol.Log.SessionInit = true
+									case "session-close":
+										pol.Log.SessionClose = true
+									}
+								}
+							case "count":
+								pol.Count = true
+							}
+						}
+					}
+
+					// scheduler-name at the policy level
+					if snNode := polInst.node.FindChild("scheduler-name"); snNode != nil {
+						pol.SchedulerName = nodeVal(snNode)
+					}
+
+					zpp.Policies = append(zpp.Policies, pol)
 				}
 
-				// scheduler-name at the policy level
-				if snNode := policyNode.FindChild("scheduler-name"); snNode != nil && len(snNode.Keys) >= 2 {
-					pol.SchedulerName = snNode.Keys[1]
-				}
-
-				zpp.Policies = append(zpp.Policies, pol)
+				sec.Policies = append(sec.Policies, zpp)
 			}
-
-			sec.Policies = append(sec.Policies, zpp)
 		}
 	}
 	return nil
@@ -558,21 +595,19 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 			ifc.Tunnel = tc
 		}
 
-		for _, unitNode := range child.FindChildren("unit") {
-			if len(unitNode.Keys) < 2 {
-				continue
-			}
-			unitNum, err := strconv.Atoi(unitNode.Keys[1])
+		for _, unitInst := range namedInstances(child.FindChildren("unit")) {
+			unitNum, err := strconv.Atoi(unitInst.name)
 			if err != nil {
 				continue
 			}
 			unit := &InterfaceUnit{Number: unitNum}
 
 			// Parse vlan-id on unit
-			vlanNode := unitNode.FindChild("vlan-id")
-			if vlanNode != nil && len(vlanNode.Keys) >= 2 {
-				if v, err := strconv.Atoi(vlanNode.Keys[1]); err == nil {
-					unit.VlanID = v
+			if vlanNode := unitInst.node.FindChild("vlan-id"); vlanNode != nil {
+				if v := nodeVal(vlanNode); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						unit.VlanID = n
+					}
 				}
 			}
 
@@ -581,13 +616,11 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 			//   Keys=["family"], child Keys=["inet"] with grandchildren
 			// - hierarchical:  family inet { address ...; dhcp; }
 			//   Keys=["family","inet"], children are address/dhcp directly
-			for _, familyNode := range unitNode.FindChildren("family") {
+			for _, familyNode := range unitInst.node.FindChildren("family") {
 				var afNodes []*Node
 				if len(familyNode.Keys) >= 2 {
-					// Hierarchical: Keys=["family","inet"] — node itself is the AF
 					afNodes = append(afNodes, familyNode)
 				} else {
-					// Set-command: Keys=["family"], children are inet/inet6
 					afNodes = append(afNodes, familyNode.Children...)
 				}
 				for _, afNode := range afNodes {
@@ -597,94 +630,81 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 					}
 					switch afName {
 					case "inet":
-						for _, addrNode := range afNode.FindChildren("address") {
-							if len(addrNode.Keys) >= 2 {
-								unit.Addresses = append(unit.Addresses, addrNode.Keys[1])
-								// Parse VRRP groups under address
-								for _, vrrpNode := range addrNode.FindChildren("vrrp-group") {
-									if len(vrrpNode.Keys) < 2 {
-										continue
-									}
-									groupID, err := strconv.Atoi(vrrpNode.Keys[1])
-									if err != nil {
-										continue
-									}
-									vg := &VRRPGroup{
-										ID:       groupID,
-										Priority: 100, // default
-									}
-									for _, prop := range vrrpNode.Children {
-										switch prop.Name() {
-										case "virtual-address":
-											if len(prop.Keys) >= 2 {
-												vg.VirtualAddresses = append(vg.VirtualAddresses, prop.Keys[1])
-											}
-										case "priority":
-											if len(prop.Keys) >= 2 {
-												vg.Priority, _ = strconv.Atoi(prop.Keys[1])
-											}
-										case "preempt":
-											vg.Preempt = true
-										case "accept-data":
-											vg.AcceptData = true
-										case "advertise-interval":
-											if len(prop.Keys) >= 2 {
-												vg.AdvertiseInterval, _ = strconv.Atoi(prop.Keys[1])
-											}
-										case "authentication-type":
-											if len(prop.Keys) >= 2 {
-												vg.AuthType = prop.Keys[1]
-											}
-										case "authentication-key":
-											if len(prop.Keys) >= 2 {
-												vg.AuthKey = prop.Keys[1]
-											}
-										case "track-interface":
-											if len(prop.Keys) >= 2 {
-												vg.TrackInterface = prop.Keys[1]
-											}
-										case "track-priority-cost":
-											if len(prop.Keys) >= 2 {
-												vg.TrackPriorityDelta, _ = strconv.Atoi(prop.Keys[1])
-											}
+						for _, addrInst := range namedInstances(afNode.FindChildren("address")) {
+							unit.Addresses = append(unit.Addresses, addrInst.name)
+							// Parse VRRP groups under address
+							for _, vrrpInst := range namedInstances(addrInst.node.FindChildren("vrrp-group")) {
+								groupID, err := strconv.Atoi(vrrpInst.name)
+								if err != nil {
+									continue
+								}
+								vg := &VRRPGroup{
+									ID:       groupID,
+									Priority: 100, // default
+								}
+								for _, prop := range vrrpInst.node.Children {
+									switch prop.Name() {
+									case "virtual-address":
+										if v := nodeVal(prop); v != "" {
+											vg.VirtualAddresses = append(vg.VirtualAddresses, v)
+										}
+									case "priority":
+										if v := nodeVal(prop); v != "" {
+											vg.Priority, _ = strconv.Atoi(v)
+										}
+									case "preempt":
+										vg.Preempt = true
+									case "accept-data":
+										vg.AcceptData = true
+									case "advertise-interval":
+										if v := nodeVal(prop); v != "" {
+											vg.AdvertiseInterval, _ = strconv.Atoi(v)
+										}
+									case "authentication-type":
+										vg.AuthType = nodeVal(prop)
+									case "authentication-key":
+										vg.AuthKey = nodeVal(prop)
+									case "track-interface":
+										vg.TrackInterface = nodeVal(prop)
+									case "track-priority-cost":
+										if v := nodeVal(prop); v != "" {
+											vg.TrackPriorityDelta, _ = strconv.Atoi(v)
 										}
 									}
-									if unit.VRRPGroups == nil {
-										unit.VRRPGroups = make(map[string]*VRRPGroup)
-									}
-									key := fmt.Sprintf("%s_grp%d", addrNode.Keys[1], groupID)
-									unit.VRRPGroups[key] = vg
 								}
+								if unit.VRRPGroups == nil {
+									unit.VRRPGroups = make(map[string]*VRRPGroup)
+								}
+								key := fmt.Sprintf("%s_grp%d", addrInst.name, groupID)
+								unit.VRRPGroups[key] = vg
 							}
 						}
 						if afNode.FindChild("dhcp") != nil {
 							unit.DHCP = true
 						}
 						if filterNode := afNode.FindChild("filter"); filterNode != nil {
-							if inputNode := filterNode.FindChild("input"); inputNode != nil && len(inputNode.Keys) >= 2 {
-								unit.FilterInputV4 = inputNode.Keys[1]
+							if inputNode := filterNode.FindChild("input"); inputNode != nil {
+								unit.FilterInputV4 = nodeVal(inputNode)
 							}
 						}
 					case "inet6":
-						for _, addrNode := range afNode.FindChildren("address") {
-							if len(addrNode.Keys) >= 2 {
-								unit.Addresses = append(unit.Addresses, addrNode.Keys[1])
-							}
+						for _, addrInst := range namedInstances(afNode.FindChildren("address")) {
+							unit.Addresses = append(unit.Addresses, addrInst.name)
 						}
 						if afNode.FindChild("dhcpv6") != nil {
 							unit.DHCPv6 = true
 						}
 						if filterNode := afNode.FindChild("filter"); filterNode != nil {
-							if inputNode := filterNode.FindChild("input"); inputNode != nil && len(inputNode.Keys) >= 2 {
-								unit.FilterInputV6 = inputNode.Keys[1]
+							if inputNode := filterNode.FindChild("input"); inputNode != nil {
+								unit.FilterInputV6 = nodeVal(inputNode)
 							}
 						}
 						if dcNode := afNode.FindChild("dhcpv6-client"); dcNode != nil {
 							unit.DHCPv6 = true
 							unit.DHCPv6Client = &DHCPv6ClientConfig{}
 							if ciNode := dcNode.FindChild("client-identifier"); ciNode != nil {
-								if dtNode := ciNode.FindChild("duid-type"); dtNode != nil && len(dtNode.Keys) >= 2 {
-									unit.DHCPv6Client.DUIDType = dtNode.Keys[1]
+								if dtNode := ciNode.FindChild("duid-type"); dtNode != nil {
+									unit.DHCPv6Client.DUIDType = nodeVal(dtNode)
 								}
 							}
 						}
@@ -743,22 +763,15 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 }
 
 func compileNAT64(node *Node, sec *SecurityConfig) error {
-	for _, rsNode := range node.FindChildren("rule-set") {
-		if len(rsNode.Keys) < 2 {
-			continue
-		}
-		rs := &NAT64RuleSet{Name: rsNode.Keys[1]}
+	for _, inst := range namedInstances(node.FindChildren("rule-set")) {
+		rs := &NAT64RuleSet{Name: inst.name}
 
-		for _, child := range rsNode.Children {
+		for _, child := range inst.node.Children {
 			switch child.Name() {
 			case "prefix":
-				if len(child.Keys) >= 2 {
-					rs.Prefix = child.Keys[1]
-				}
+				rs.Prefix = nodeVal(child)
 			case "source-pool":
-				if len(child.Keys) >= 2 {
-					rs.SourcePool = child.Keys[1]
-				}
+				rs.SourcePool = nodeVal(child)
 			}
 		}
 
@@ -769,17 +782,14 @@ func compileNAT64(node *Node, sec *SecurityConfig) error {
 
 func compileNATSource(node *Node, sec *SecurityConfig) error {
 	// Parse source NAT pools
-	for _, poolNode := range node.FindChildren("pool") {
-		if len(poolNode.Keys) < 2 {
-			continue
-		}
-		pool := &NATPool{Name: poolNode.Keys[1]}
+	for _, inst := range namedInstances(node.FindChildren("pool")) {
+		pool := &NATPool{Name: inst.name}
 
-		for _, prop := range poolNode.Children {
+		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "address":
-				if len(prop.Keys) >= 2 {
-					pool.Addresses = append(pool.Addresses, prop.Keys[1])
+				if v := nodeVal(prop); v != "" {
+					pool.Addresses = append(pool.Addresses, v)
 				}
 			case "port":
 				// "port range low N high M" or "port N"
@@ -791,10 +801,10 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					if v, err := strconv.Atoi(prop.Keys[5]); err == nil {
 						pool.PortHigh = v
 					}
-				} else if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						pool.PortLow = v
-						pool.PortHigh = v
+				} else if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						pool.PortLow = n
+						pool.PortHigh = n
 					}
 				}
 			case "persistent-nat":
@@ -802,13 +812,13 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 				for _, pnProp := range prop.Children {
 					switch pnProp.Name() {
 					case "permit":
-						if len(pnProp.Keys) >= 2 && pnProp.Keys[1] == "any-remote-host" {
+						if v := nodeVal(pnProp); v == "any-remote-host" {
 							pnat.PermitAnyRemoteHost = true
 						}
 					case "inactivity-timeout":
-						if len(pnProp.Keys) >= 2 {
-							if v, err := strconv.Atoi(pnProp.Keys[1]); err == nil {
-								pnat.InactivityTimeout = v
+						if v := nodeVal(pnProp); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								pnat.InactivityTimeout = n
 							}
 						}
 					}
@@ -826,57 +836,54 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 	}
 
 	// Parse source NAT rule-sets
-	for _, rsNode := range node.FindChildren("rule-set") {
-		if len(rsNode.Keys) < 2 {
-			continue
-		}
-		rs := &NATRuleSet{Name: rsNode.Keys[1]}
+	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
+		rs := &NATRuleSet{Name: rsInst.name}
 
 		// Parse from/to zone
-		for _, child := range rsNode.Children {
-			if child.Name() == "from" && len(child.Keys) >= 3 && child.Keys[1] == "zone" {
-				rs.FromZone = child.Keys[2]
+		for _, child := range rsInst.node.Children {
+			if child.Name() == "from" {
+				if len(child.Keys) >= 3 && child.Keys[1] == "zone" {
+					rs.FromZone = child.Keys[2]
+				} else if zn := child.FindChild("zone"); zn != nil {
+					rs.FromZone = nodeVal(zn)
+				}
 			}
-			if child.Name() == "to" && len(child.Keys) >= 3 && child.Keys[1] == "zone" {
-				rs.ToZone = child.Keys[2]
+			if child.Name() == "to" {
+				if len(child.Keys) >= 3 && child.Keys[1] == "zone" {
+					rs.ToZone = child.Keys[2]
+				} else if zn := child.FindChild("zone"); zn != nil {
+					rs.ToZone = nodeVal(zn)
+				}
 			}
 		}
 
 		// Parse rules
-		for _, ruleNode := range rsNode.FindChildren("rule") {
-			if len(ruleNode.Keys) < 2 {
-				continue
-			}
-			rule := &NATRule{Name: ruleNode.Keys[1]}
+		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
+			rule := &NATRule{Name: ruleInst.name}
 
-			matchNode := ruleNode.FindChild("match")
+			matchNode := ruleInst.node.FindChild("match")
 			if matchNode != nil {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "source-address":
-						if len(m.Keys) >= 2 {
-							rule.Match.SourceAddress = m.Keys[1]
-						}
+						rule.Match.SourceAddress = nodeVal(m)
 					case "destination-address":
-						if len(m.Keys) >= 2 {
-							rule.Match.DestinationAddress = m.Keys[1]
-						}
+						rule.Match.DestinationAddress = nodeVal(m)
 					case "destination-port":
-						if len(m.Keys) >= 2 {
-							if v, err := strconv.Atoi(m.Keys[1]); err == nil {
-								rule.Match.DestinationPort = v
+						if v := nodeVal(m); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								rule.Match.DestinationPort = n
 							}
 						}
 					}
 				}
 			}
 
-			thenNode := ruleNode.FindChild("then")
+			thenNode := ruleInst.node.FindChild("then")
 			if thenNode != nil {
 				for _, t := range thenNode.Children {
 					if t.Name() == "source-nat" {
 						if len(t.Keys) >= 2 {
-							// Flat form: source-nat interface; / source-nat pool <name>;
 							if t.Keys[1] == "interface" {
 								rule.Then.Type = NATSource
 								rule.Then.Interface = true
@@ -885,13 +892,11 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 								rule.Then.PoolName = t.Keys[2]
 							}
 						} else if t.FindChild("interface") != nil {
-							// Hierarchical form: source-nat { interface; }
 							rule.Then.Type = NATSource
 							rule.Then.Interface = true
-						} else if poolNode := t.FindChild("pool"); poolNode != nil && len(poolNode.Keys) >= 2 {
-							// Hierarchical form: source-nat { pool <name>; }
+						} else if poolNode := t.FindChild("pool"); poolNode != nil {
 							rule.Then.Type = NATSource
-							rule.Then.PoolName = poolNode.Keys[1]
+							rule.Then.PoolName = nodeVal(poolNode)
 						}
 					}
 				}
@@ -913,22 +918,17 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 	}
 
 	// Parse pools
-	for _, poolNode := range node.FindChildren("pool") {
-		if len(poolNode.Keys) < 2 {
-			continue
-		}
-		pool := &NATPool{Name: poolNode.Keys[1]}
+	for _, inst := range namedInstances(node.FindChildren("pool")) {
+		pool := &NATPool{Name: inst.name}
 
-		for _, prop := range poolNode.Children {
+		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "address":
-				if len(prop.Keys) >= 2 {
-					pool.Address = prop.Keys[1]
-				}
+				pool.Address = nodeVal(prop)
 			case "port":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						pool.Port = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						pool.Port = n
 					}
 				}
 			}
@@ -938,64 +938,59 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 	}
 
 	// Parse rule-sets
-	for _, rsNode := range node.FindChildren("rule-set") {
-		if len(rsNode.Keys) < 2 {
-			continue
+	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
+		rs := &NATRuleSet{Name: rsInst.name}
+
+		for _, child := range rsInst.node.Children {
+			if child.Name() == "from" {
+				if len(child.Keys) >= 3 && child.Keys[1] == "zone" {
+					rs.FromZone = child.Keys[2]
+				} else if zn := child.FindChild("zone"); zn != nil {
+					rs.FromZone = nodeVal(zn)
+				}
+			}
+			if child.Name() == "to" {
+				if len(child.Keys) >= 3 && child.Keys[1] == "zone" {
+					rs.ToZone = child.Keys[2]
+				} else if zn := child.FindChild("zone"); zn != nil {
+					rs.ToZone = nodeVal(zn)
+				}
+			}
 		}
-		rs := &NATRuleSet{Name: rsNode.Keys[1]}
 
-		for _, child := range rsNode.Children {
-			if child.Name() == "from" && len(child.Keys) >= 3 && child.Keys[1] == "zone" {
-				rs.FromZone = child.Keys[2]
-			}
-			if child.Name() == "to" && len(child.Keys) >= 3 && child.Keys[1] == "zone" {
-				rs.ToZone = child.Keys[2]
-			}
-		}
+		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
+			rule := &NATRule{Name: ruleInst.name}
 
-		for _, ruleNode := range rsNode.FindChildren("rule") {
-			if len(ruleNode.Keys) < 2 {
-				continue
-			}
-			rule := &NATRule{Name: ruleNode.Keys[1]}
-
-			matchNode := ruleNode.FindChild("match")
+			matchNode := ruleInst.node.FindChild("match")
 			if matchNode != nil {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "destination-address":
-						if len(m.Keys) >= 2 {
-							rule.Match.DestinationAddress = m.Keys[1]
-						}
+						rule.Match.DestinationAddress = nodeVal(m)
 					case "destination-port":
-						if len(m.Keys) >= 2 {
-							if v, err := strconv.Atoi(m.Keys[1]); err == nil {
-								rule.Match.DestinationPort = v
+						if v := nodeVal(m); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								rule.Match.DestinationPort = n
 							}
 						}
 					case "source-address":
-						if len(m.Keys) >= 2 {
-							rule.Match.SourceAddress = m.Keys[1]
-						}
+						rule.Match.SourceAddress = nodeVal(m)
 					case "protocol":
-						if len(m.Keys) >= 2 {
-							rule.Match.Protocol = m.Keys[1]
-						}
+						rule.Match.Protocol = nodeVal(m)
 					}
 				}
 			}
 
-			thenNode := ruleNode.FindChild("then")
+			thenNode := ruleInst.node.FindChild("then")
 			if thenNode != nil {
 				for _, t := range thenNode.Children {
 					if t.Name() == "destination-nat" {
 						if len(t.Keys) >= 3 && t.Keys[1] == "pool" {
 							rule.Then.Type = NATDestination
 							rule.Then.PoolName = t.Keys[2]
-						} else if poolNode := t.FindChild("pool"); poolNode != nil && len(poolNode.Keys) >= 2 {
-							// Hierarchical form: destination-nat { pool <name>; }
+						} else if poolNode := t.FindChild("pool"); poolNode != nil {
 							rule.Then.Type = NATDestination
-							rule.Then.PoolName = poolNode.Keys[1]
+							rule.Then.PoolName = nodeVal(poolNode)
 						}
 					}
 				}
@@ -1010,40 +1005,42 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 }
 
 func compileNATStatic(node *Node, sec *SecurityConfig) error {
-	for _, rsNode := range node.FindChildren("rule-set") {
-		if len(rsNode.Keys) < 2 {
-			continue
-		}
-		rs := &StaticNATRuleSet{Name: rsNode.Keys[1]}
+	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
+		rs := &StaticNATRuleSet{Name: rsInst.name}
 
 		// Parse from zone
-		for _, child := range rsNode.Children {
-			if child.Name() == "from" && len(child.Keys) >= 3 && child.Keys[1] == "zone" {
-				rs.FromZone = child.Keys[2]
+		for _, child := range rsInst.node.Children {
+			if child.Name() == "from" {
+				if len(child.Keys) >= 3 && child.Keys[1] == "zone" {
+					rs.FromZone = child.Keys[2]
+				} else if zn := child.FindChild("zone"); zn != nil {
+					rs.FromZone = nodeVal(zn)
+				}
 			}
 		}
 
 		// Parse rules
-		for _, ruleNode := range rsNode.FindChildren("rule") {
-			if len(ruleNode.Keys) < 2 {
-				continue
-			}
-			rule := &StaticNATRule{Name: ruleNode.Keys[1]}
+		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
+			rule := &StaticNATRule{Name: ruleInst.name}
 
-			matchNode := ruleNode.FindChild("match")
+			matchNode := ruleInst.node.FindChild("match")
 			if matchNode != nil {
 				for _, m := range matchNode.Children {
-					if m.Name() == "destination-address" && len(m.Keys) >= 2 {
-						rule.Match = m.Keys[1]
+					if m.Name() == "destination-address" {
+						rule.Match = nodeVal(m)
 					}
 				}
 			}
 
-			thenNode := ruleNode.FindChild("then")
+			thenNode := ruleInst.node.FindChild("then")
 			if thenNode != nil {
 				for _, t := range thenNode.Children {
-					if t.Name() == "static-nat" && len(t.Keys) >= 3 && t.Keys[1] == "prefix" {
-						rule.Then = t.Keys[2]
+					if t.Name() == "static-nat" {
+						if len(t.Keys) >= 3 && t.Keys[1] == "prefix" {
+							rule.Then = t.Keys[2]
+						} else if pn := t.FindChild("prefix"); pn != nil {
+							rule.Then = nodeVal(pn)
+						}
 					}
 				}
 			}
@@ -1056,38 +1053,47 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 	return nil
 }
 
+// parseMSSValue extracts MSS value from either "node { mss VALUE; }" or "node VALUE;" syntax.
+func parseMSSValue(node *Node) int {
+	// Hierarchical: ipsec-vpn { mss 1360; } or gre-in { mss 1360; }
+	mssChild := node.FindChild("mss")
+	if mssChild != nil && len(mssChild.Keys) >= 2 {
+		if v, err := strconv.Atoi(mssChild.Keys[1]); err == nil {
+			return v
+		}
+	}
+	// Flat: ipsec-vpn 1360; (set syntax)
+	if len(node.Keys) >= 2 {
+		if v, err := strconv.Atoi(node.Keys[1]); err == nil {
+			return v
+		}
+	}
+	return 0
+}
+
 func compileLog(node *Node, sec *SecurityConfig) error {
 	if sec.Log.Streams == nil {
 		sec.Log.Streams = make(map[string]*SyslogStream)
 	}
-	for _, streamNode := range node.FindChildren("stream") {
-		if len(streamNode.Keys) < 2 {
-			continue
-		}
+	for _, inst := range namedInstances(node.FindChildren("stream")) {
 		stream := &SyslogStream{
-			Name: streamNode.Keys[1],
+			Name: inst.name,
 			Port: 514, // default
 		}
-		for _, prop := range streamNode.Children {
+		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "host":
-				if len(prop.Keys) >= 2 {
-					stream.Host = prop.Keys[1]
-				}
+				stream.Host = nodeVal(prop)
 			case "port":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						stream.Port = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						stream.Port = n
 					}
 				}
 			case "severity":
-				if len(prop.Keys) >= 2 {
-					stream.Severity = prop.Keys[1]
-				}
+				stream.Severity = nodeVal(prop)
 			case "facility":
-				if len(prop.Keys) >= 2 {
-					stream.Facility = prop.Keys[1]
-				}
+				stream.Facility = nodeVal(prop)
 			}
 		}
 		if stream.Host != "" {
@@ -1150,25 +1156,17 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 		for _, opt := range mssNode.Children {
 			switch opt.Name() {
 			case "ipsec-vpn":
-				if len(opt.Keys) >= 2 {
-					if v, err := strconv.Atoi(opt.Keys[1]); err == nil {
-						sec.Flow.TCPMSSIPsecVPN = v
-					}
+				if v := parseMSSValue(opt); v > 0 {
+					sec.Flow.TCPMSSIPsecVPN = v
 				}
 			case "gre-in", "gre-out":
-				if len(opt.Keys) >= 2 {
-					if v, err := strconv.Atoi(opt.Keys[1]); err == nil {
-						sec.Flow.TCPMSSGre = v
-					}
+				if v := parseMSSValue(opt); v > 0 {
+					sec.Flow.TCPMSSGre = v
 				}
 			case "all-tcp":
-				// Junos "all-tcp { mss VALUE }" variant
-				mssChild := opt.FindChild("mss")
-				if mssChild != nil && len(mssChild.Keys) >= 2 {
-					if v, err := strconv.Atoi(mssChild.Keys[1]); err == nil {
-						sec.Flow.TCPMSSIPsecVPN = v
-						sec.Flow.TCPMSSGre = v
-					}
+				if v := parseMSSValue(opt); v > 0 {
+					sec.Flow.TCPMSSIPsecVPN = v
+					sec.Flow.TCPMSSGre = v
 				}
 			}
 		}
@@ -1212,42 +1210,29 @@ func compileALG(node *Node, sec *SecurityConfig) error {
 }
 
 func compileApplications(node *Node, apps *ApplicationsConfig) error {
-	for _, child := range node.FindChildren("application") {
-		if len(child.Keys) < 2 {
-			continue
-		}
-		appName := child.Keys[1]
+	for _, inst := range namedInstances(node.FindChildren("application")) {
+		appName := inst.name
 		app := &Application{Name: appName}
 
 		var terms []*Application
-		for _, prop := range child.Children {
+		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "protocol":
-				if len(prop.Keys) >= 2 {
-					app.Protocol = prop.Keys[1]
-				}
+				app.Protocol = nodeVal(prop)
 			case "destination-port":
-				if len(prop.Keys) >= 2 {
-					app.DestinationPort = prop.Keys[1]
-				}
+				app.DestinationPort = nodeVal(prop)
 			case "source-port":
-				if len(prop.Keys) >= 2 {
-					app.SourcePort = prop.Keys[1]
-				}
+				app.SourcePort = nodeVal(prop)
 			case "inactivity-timeout":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						app.InactivityTimeout = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						app.InactivityTimeout = n
 					}
 				}
 			case "alg":
-				if len(prop.Keys) >= 2 {
-					app.ALG = prop.Keys[1]
-				}
+				app.ALG = nodeVal(prop)
 			case "description":
-				if len(prop.Keys) >= 2 {
-					app.Description = prop.Keys[1]
-				}
+				app.Description = nodeVal(prop)
 			case "term":
 				// Inline term: "term <name> [alg <a>] protocol <p> [source-port <sp>]
 				//               [destination-port <dp>] [inactivity-timeout <t>];"
@@ -1268,8 +1253,6 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		}
 
 		if len(terms) > 0 {
-			// Multi-term application: each term becomes a separate Application,
-			// and the parent becomes an implicit ApplicationSet.
 			implicitSet := &ApplicationSet{Name: appName}
 			for _, t := range terms {
 				t.Description = app.Description
@@ -1282,15 +1265,15 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		}
 	}
 
-	for _, child := range node.FindChildren("application-set") {
-		if len(child.Keys) < 2 {
-			continue
-		}
-		as := &ApplicationSet{Name: child.Keys[1]}
+	for _, inst := range namedInstances(node.FindChildren("application-set")) {
+		as := &ApplicationSet{Name: inst.name}
 
-		for _, member := range child.Children {
-			if member.Name() == "application" && len(member.Keys) >= 2 {
-				as.Applications = append(as.Applications, member.Keys[1])
+		for _, member := range inst.node.Children {
+			if member.Name() == "application" {
+				v := nodeVal(member)
+				if v != "" {
+					as.Applications = append(as.Applications, v)
+				}
 			}
 		}
 
@@ -1354,47 +1337,44 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 	// Track destination→index so flat "set" duplicates merge into one route.
 	destIdx := make(map[string]int)
 
-	for _, routeNode := range staticNode.FindChildren("route") {
-		if len(routeNode.Keys) < 2 {
-			continue
-		}
+	for _, routeInst := range namedInstances(staticNode.FindChildren("route")) {
 		route := &StaticRoute{
-			Destination: routeNode.Keys[1],
+			Destination: routeInst.name,
 			Preference:  5, // default
 		}
 
-		for _, prop := range routeNode.Children {
+		for _, prop := range routeInst.node.Children {
 			switch prop.Name() {
 			case "next-hop":
 				nh := NextHopEntry{}
-				if len(prop.Keys) >= 2 {
-					nh.Address = prop.Keys[1]
-				}
+				nh.Address = nodeVal(prop)
 				// Check children for interface (needed for IPv6 link-local next-hops)
 				for _, child := range prop.Children {
-					if child.Name() == "interface" && len(child.Keys) >= 2 {
-						nh.Interface = child.Keys[1]
+					if child.Name() == "interface" {
+						nh.Interface = nodeVal(child)
 					}
 				}
 				route.NextHops = append(route.NextHops, nh)
 			case "discard":
 				route.Discard = true
 			case "preference":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						route.Preference = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						route.Preference = n
 					}
 				}
 			case "qualified-next-hop":
 				nh := NextHopEntry{}
-				if len(prop.Keys) >= 2 {
-					nh.Address = prop.Keys[1]
-				}
+				nh.Address = nodeVal(prop)
 				// Check for "interface <name>" among remaining keys
 				for j := 2; j < len(prop.Keys)-1; j++ {
 					if prop.Keys[j] == "interface" {
 						nh.Interface = prop.Keys[j+1]
 					}
+				}
+				// Also check children for flat set syntax
+				if ifNode := prop.FindChild("interface"); ifNode != nil {
+					nh.Interface = nodeVal(ifNode)
 				}
 				route.NextHops = append(route.NextHops, nh)
 			}
@@ -1419,60 +1399,61 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 }
 
 func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
-	for _, ifNode := range node.FindChildren("interface") {
-		if len(ifNode.Keys) < 2 {
-			continue
-		}
+	for _, inst := range namedInstances(node.FindChildren("interface")) {
 		ra := &RAInterfaceConfig{
-			Interface: ifNode.Keys[1],
+			Interface: inst.name,
 		}
 
-		for _, prop := range ifNode.Children {
+		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "managed-configuration":
 				ra.ManagedConfig = true
 			case "other-stateful-configuration":
 				ra.OtherStateful = true
 			case "default-lifetime":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						ra.DefaultLifetime = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						ra.DefaultLifetime = n
 					}
 				}
 			case "max-advertisement-interval":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						ra.MaxAdvInterval = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						ra.MaxAdvInterval = n
 					}
 				}
 			case "min-advertisement-interval":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						ra.MinAdvInterval = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						ra.MinAdvInterval = n
 					}
 				}
 			case "link-mtu":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						ra.LinkMTU = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						ra.LinkMTU = n
 					}
 				}
 			case "dns-server-address":
 				if len(prop.Keys) >= 2 {
-					ra.DNSServers = append(ra.DNSServers, prop.Keys[1])
+					ra.DNSServers = append(ra.DNSServers, nodeVal(prop))
 				}
 			case "nat64prefix":
-				if len(prop.Keys) >= 2 {
-					ra.NAT64Prefix = prop.Keys[1]
-				}
+				ra.NAT64Prefix = nodeVal(prop)
 			case "prefix":
-				if len(prop.Keys) >= 2 {
+				pfxName := nodeVal(prop)
+				if pfxName != "" {
 					pfx := &RAPrefix{
-						Prefix:     prop.Keys[1],
+						Prefix:     pfxName,
 						OnLink:     true, // defaults
 						Autonomous: true,
 					}
-					for _, child := range prop.Children {
+					// For flat set, prefix children may be under the named child
+					pfxChildren := prop.Children
+					if len(prop.Keys) < 2 && len(prop.Children) > 0 {
+						pfxChildren = prop.Children[0].Children
+					}
+					for _, child := range pfxChildren {
 						switch child.Name() {
 						case "on-link":
 							pfx.OnLink = true
@@ -1483,15 +1464,15 @@ func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
 						case "no-autonomous":
 							pfx.Autonomous = false
 						case "valid-lifetime":
-							if len(child.Keys) >= 2 {
-								if v, err := strconv.Atoi(child.Keys[1]); err == nil {
-									pfx.ValidLifetime = v
+							if v := nodeVal(child); v != "" {
+								if n, err := strconv.Atoi(v); err == nil {
+									pfx.ValidLifetime = n
 								}
 							}
 						case "preferred-lifetime":
-							if len(child.Keys) >= 2 {
-								if v, err := strconv.Atoi(child.Keys[1]); err == nil {
-									pfx.PreferredLife = v
+							if v := nodeVal(child); v != "" {
+								if n, err := strconv.Atoi(v); err == nil {
+									pfx.PreferredLife = n
 								}
 							}
 						}
@@ -1532,36 +1513,24 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			}
 		}
 
-		for _, areaNode := range ospfNode.FindChildren("area") {
-			if len(areaNode.Keys) < 2 {
-				continue
-			}
-			area := &OSPFArea{ID: areaNode.Keys[1]}
+		for _, areaInst := range namedInstances(ospfNode.FindChildren("area")) {
+			area := &OSPFArea{ID: areaInst.name}
 
-			for _, child := range areaNode.Children {
-				if child.Name() == "interface" && len(child.Keys) >= 2 {
-					iface := &OSPFInterface{Name: child.Keys[1]}
-					// Check for "passive" flag in remaining keys
-					for _, k := range child.Keys[2:] {
-						if k == "passive" {
-							iface.Passive = true
-						}
-					}
-					// Check children for cost etc.
-					for _, prop := range child.Children {
-						switch prop.Name() {
-						case "passive":
-							iface.Passive = true
-						case "cost":
-							if len(prop.Keys) >= 2 {
-								if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-									iface.Cost = v
-								}
+			for _, ifInst := range namedInstances(areaInst.node.FindChildren("interface")) {
+				iface := &OSPFInterface{Name: ifInst.name}
+				for _, prop := range ifInst.node.Children {
+					switch prop.Name() {
+					case "passive":
+						iface.Passive = true
+					case "cost":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								iface.Cost = n
 							}
 						}
 					}
-					area.Interfaces = append(area.Interfaces, iface)
 				}
+				area.Interfaces = append(area.Interfaces, iface)
 			}
 
 			proto.OSPF.Areas = append(proto.OSPF.Areas, area)
@@ -1591,56 +1560,81 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			}
 		}
 
-		for _, groupNode := range bgpNode.FindChildren("group") {
-			if len(groupNode.Keys) < 2 {
-				continue
-			}
+		for _, groupInst := range namedInstances(bgpNode.FindChildren("group")) {
 			var peerAS uint32
 			var groupDesc string
 			var groupMultihop int
-			for _, child := range groupNode.Children {
+			var groupExport []string
+			var familyInet, familyInet6 bool
+			for _, child := range groupInst.node.Children {
 				switch child.Name() {
 				case "peer-as":
-					if len(child.Keys) >= 2 {
-						if v, err := strconv.Atoi(child.Keys[1]); err == nil {
-							peerAS = uint32(v)
+					if v := nodeVal(child); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							peerAS = uint32(n)
 						}
 					}
 				case "description":
-					if len(child.Keys) >= 2 {
-						groupDesc = child.Keys[1]
-					}
+					groupDesc = nodeVal(child)
 				case "multihop":
+					if v := nodeVal(child); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							groupMultihop = n
+						}
+					}
+				case "export":
+					if v := nodeVal(child); v != "" {
+						groupExport = append(groupExport, v)
+					} else if len(child.Keys) >= 2 {
+						groupExport = append(groupExport, child.Keys[1:]...)
+					}
+				case "family":
+					// Hierarchical: family { inet { unicast; } inet6 { unicast; } }
+					// Flat (via schema): family node with children inet/inet6
 					if len(child.Keys) >= 2 {
-						if v, err := strconv.Atoi(child.Keys[1]); err == nil {
-							groupMultihop = v
+						switch child.Keys[1] {
+						case "inet":
+							familyInet = true
+						case "inet6":
+							familyInet6 = true
+						}
+					} else {
+						for _, fc := range child.Children {
+							switch fc.Name() {
+							case "inet":
+								familyInet = true
+							case "inet6":
+								familyInet6 = true
+							}
 						}
 					}
 				case "neighbor":
-					if len(child.Keys) >= 2 {
+					nAddr := nodeVal(child)
+					if nAddr != "" {
 						neighbor := &BGPNeighbor{
-							Address:     child.Keys[1],
+							Address:     nAddr,
 							PeerAS:      peerAS,
 							Description: groupDesc,
 							MultihopTTL: groupMultihop,
+							Export:      groupExport,
+							FamilyInet:  familyInet,
+							FamilyInet6: familyInet6,
 						}
 						// Per-neighbor overrides
 						for _, prop := range child.Children {
 							switch prop.Name() {
 							case "description":
-								if len(prop.Keys) >= 2 {
-									neighbor.Description = prop.Keys[1]
-								}
+								neighbor.Description = nodeVal(prop)
 							case "multihop":
-								if len(prop.Keys) >= 2 {
-									if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-										neighbor.MultihopTTL = v
+								if v := nodeVal(prop); v != "" {
+									if n, err := strconv.Atoi(v); err == nil {
+										neighbor.MultihopTTL = n
 									}
 								}
 							case "peer-as":
-								if len(prop.Keys) >= 2 {
-									if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-										neighbor.PeerAS = uint32(v)
+								if v := nodeVal(prop); v != "" {
+									if n, err := strconv.Atoi(v); err == nil {
+										neighbor.PeerAS = uint32(n)
 									}
 								}
 							}
@@ -2120,12 +2114,10 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 		for _, prop := range child.Children {
 			switch prop.Name() {
 			case "instance-type":
-				if len(prop.Keys) >= 2 {
-					ri.InstanceType = prop.Keys[1]
-				}
+				ri.InstanceType = nodeVal(prop)
 			case "interface":
-				if len(prop.Keys) >= 2 {
-					ri.Interfaces = append(ri.Interfaces, prop.Keys[1])
+				if v := nodeVal(prop); v != "" {
+					ri.Interfaces = append(ri.Interfaces, v)
 				}
 			case "routing-options":
 				var ro RoutingOptionsConfig
@@ -2187,28 +2179,22 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 				dest = fw.FiltersInet6
 			}
 
-			for _, filterNode := range afNode.FindChildren("filter") {
-				if len(filterNode.Keys) < 2 {
-					continue
-				}
-				filter := &FirewallFilter{Name: filterNode.Keys[1]}
+			for _, filterInst := range namedInstances(afNode.FindChildren("filter")) {
+				filter := &FirewallFilter{Name: filterInst.name}
 
-				for _, termNode := range filterNode.FindChildren("term") {
-					if len(termNode.Keys) < 2 {
-						continue
-					}
+				for _, termInst := range namedInstances(filterInst.node.FindChildren("term")) {
 					term := &FirewallFilterTerm{
-						Name:     termNode.Keys[1],
+						Name:     termInst.name,
 						ICMPType: -1,
 						ICMPCode: -1,
 					}
 
-					fromNode := termNode.FindChild("from")
+					fromNode := termInst.node.FindChild("from")
 					if fromNode != nil {
 						compileFilterFrom(fromNode, term)
 					}
 
-					thenNode := termNode.FindChild("then")
+					thenNode := termInst.node.FindChild("then")
 					if thenNode != nil {
 						compileFilterThen(thenNode, term)
 					}
@@ -2383,35 +2369,76 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			}
 		case "login":
 			sys.Login = &LoginConfig{}
-			for _, userNode := range child.FindChildren("user") {
-				if len(userNode.Keys) < 2 {
-					continue
-				}
-				user := &LoginUser{Name: userNode.Keys[1]}
-				for _, prop := range userNode.Children {
+			for _, userInst := range namedInstances(child.FindChildren("user")) {
+				user := &LoginUser{Name: userInst.name}
+				for _, prop := range userInst.node.Children {
 					switch prop.Name() {
 					case "uid":
-						if len(prop.Keys) >= 2 {
-							if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-								user.UID = v
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								user.UID = n
 							}
 						}
 					case "class":
-						if len(prop.Keys) >= 2 {
-							user.Class = prop.Keys[1]
-						}
+						user.Class = nodeVal(prop)
 					case "authentication":
 						for _, authChild := range prop.Children {
 							switch authChild.Name() {
 							case "ssh-ed25519", "ssh-rsa", "ssh-dsa":
-								if len(authChild.Keys) >= 2 {
-									user.SSHKeys = append(user.SSHKeys, authChild.Keys[1])
+								if v := nodeVal(authChild); v != "" {
+									user.SSHKeys = append(user.SSHKeys, v)
 								}
 							}
 						}
 					}
 				}
 				sys.Login.Users = append(sys.Login.Users, user)
+			}
+		case "backup-router":
+			if len(child.Keys) >= 2 {
+				sys.BackupRouter = child.Keys[1]
+			}
+			// destination keyword: backup-router 192.168.50.1 destination 192.168.0.0/16
+			for i, k := range child.Keys {
+				if k == "destination" && i+1 < len(child.Keys) {
+					sys.BackupRouterDst = child.Keys[i+1]
+				}
+			}
+			// Also check children for hierarchical format
+			if dstNode := child.FindChild("destination"); dstNode != nil && len(dstNode.Keys) >= 2 {
+				sys.BackupRouterDst = dstNode.Keys[1]
+			}
+		case "internet-options":
+			sys.InternetOptions = &InternetOptionsConfig{}
+			if child.FindChild("no-ipv6-reject-zero-hop-limit") != nil {
+				sys.InternetOptions.NoIPv6RejectZeroHopLimit = true
+			}
+		case "syslog":
+			sys.Syslog = &SystemSyslogConfig{}
+			for _, slInst := range namedInstances(child.FindChildren("host")) {
+				host := &SyslogHostConfig{Address: slInst.name}
+				for _, prop := range slInst.node.Children {
+					switch prop.Name() {
+					case "allow-duplicates":
+						host.AllowDuplicates = true
+					default:
+						if len(prop.Keys) >= 2 {
+							host.Facility = prop.Keys[0]
+							host.Severity = prop.Keys[1]
+						}
+					}
+				}
+				sys.Syslog.Hosts = append(sys.Syslog.Hosts, host)
+			}
+			for _, fileInst := range namedInstances(child.FindChildren("file")) {
+				file := &SyslogFileConfig{Name: fileInst.name}
+				for _, prop := range fileInst.node.Children {
+					if len(prop.Keys) >= 2 {
+						file.Facility = prop.Keys[0]
+						file.Severity = prop.Keys[1]
+					}
+				}
+				sys.Syslog.Files = append(sys.Syslog.Files, file)
 			}
 		}
 	}
@@ -2428,6 +2455,29 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 		if dhcp6Node != nil {
 			if err := compileDHCPLocalServer(dhcp6Node, &sys.DHCPServer, true); err != nil {
 				return err
+			}
+		}
+		// SSH service
+		if sshNode := svcNode.FindChild("ssh"); sshNode != nil {
+			if sys.Services == nil {
+				sys.Services = &SystemServicesConfig{}
+			}
+			sys.Services.SSH = &SSHServiceConfig{}
+			if rl := sshNode.FindChild("root-login"); rl != nil && len(rl.Keys) >= 2 {
+				sys.Services.SSH.RootLogin = rl.Keys[1]
+			}
+		}
+		// Web management
+		if wmNode := svcNode.FindChild("web-management"); wmNode != nil {
+			if sys.Services == nil {
+				sys.Services = &SystemServicesConfig{}
+			}
+			sys.Services.WebManagement = &WebManagementConfig{}
+			if wmNode.FindChild("http") != nil {
+				sys.Services.WebManagement.HTTP = true
+			}
+			if wmNode.FindChild("https") != nil {
+				sys.Services.WebManagement.HTTPS = true
 			}
 		}
 	}
@@ -2452,51 +2502,46 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 		dhcp.DHCPLocalServer = lsc
 	}
 
-	for _, groupNode := range node.FindChildren("group") {
-		if len(groupNode.Keys) < 2 {
-			continue
-		}
-		group := &DHCPServerGroup{Name: groupNode.Keys[1]}
+	for _, groupInst := range namedInstances(node.FindChildren("group")) {
+		group := &DHCPServerGroup{Name: groupInst.name}
 
-		for _, prop := range groupNode.Children {
+		for _, prop := range groupInst.node.Children {
 			switch prop.Name() {
 			case "interface":
-				if len(prop.Keys) >= 2 {
-					group.Interfaces = append(group.Interfaces, prop.Keys[1])
+				if v := nodeVal(prop); v != "" {
+					group.Interfaces = append(group.Interfaces, v)
 				}
 			case "pool":
-				if len(prop.Keys) >= 2 {
-					pool := &DHCPPool{Name: prop.Keys[1]}
-					for _, pp := range prop.Children {
+				poolName := nodeVal(prop)
+				if poolName != "" {
+					pool := &DHCPPool{Name: poolName}
+					poolChildren := prop.Children
+					if len(prop.Keys) < 2 && len(prop.Children) > 0 {
+						poolChildren = prop.Children[0].Children
+					}
+					for _, pp := range poolChildren {
 						switch pp.Name() {
 						case "address-range":
-							// address-range low X high Y
 							if len(pp.Keys) >= 5 && pp.Keys[1] == "low" && pp.Keys[3] == "high" {
 								pool.RangeLow = pp.Keys[2]
 								pool.RangeHigh = pp.Keys[4]
 							}
 						case "subnet":
-							if len(pp.Keys) >= 2 {
-								pool.Subnet = pp.Keys[1]
-							}
+							pool.Subnet = nodeVal(pp)
 						case "router":
-							if len(pp.Keys) >= 2 {
-								pool.Router = pp.Keys[1]
-							}
+							pool.Router = nodeVal(pp)
 						case "dns-server":
-							if len(pp.Keys) >= 2 {
-								pool.DNSServers = append(pool.DNSServers, pp.Keys[1])
+							if v := nodeVal(pp); v != "" {
+								pool.DNSServers = append(pool.DNSServers, v)
 							}
 						case "lease-time":
-							if len(pp.Keys) >= 2 {
-								if v, err := strconv.Atoi(pp.Keys[1]); err == nil {
-									pool.LeaseTime = v
+							if v := nodeVal(pp); v != "" {
+								if n, err := strconv.Atoi(v); err == nil {
+									pool.LeaseTime = n
 								}
 							}
 						case "domain-name":
-							if len(pp.Keys) >= 2 {
-								pool.Domain = pp.Keys[1]
-							}
+							pool.Domain = nodeVal(pp)
 						}
 					}
 					group.Pools = append(group.Pools, pool)
@@ -2514,34 +2559,27 @@ func compileDynamicAddress(node *Node, sec *SecurityConfig) error {
 		sec.DynamicAddress.FeedServers = make(map[string]*FeedServer)
 	}
 
-	for _, fsNode := range node.FindChildren("feed-server") {
-		if len(fsNode.Keys) < 2 {
-			continue
-		}
-		fs := &FeedServer{Name: fsNode.Keys[1]}
+	for _, inst := range namedInstances(node.FindChildren("feed-server")) {
+		fs := &FeedServer{Name: inst.name}
 
-		for _, prop := range fsNode.Children {
+		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "url":
-				if len(prop.Keys) >= 2 {
-					fs.URL = prop.Keys[1]
-				}
+				fs.URL = nodeVal(prop)
 			case "update-interval":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						fs.UpdateInterval = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						fs.UpdateInterval = n
 					}
 				}
 			case "hold-interval":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						fs.HoldInterval = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						fs.HoldInterval = n
 					}
 				}
 			case "feed-name":
-				if len(prop.Keys) >= 2 {
-					fs.FeedName = prop.Keys[1]
-				}
+				fs.FeedName = nodeVal(prop)
 			}
 		}
 
@@ -2567,69 +2605,57 @@ func compileServices(node *Node, svc *ServicesConfig) error {
 func compileRPM(node *Node, svc *ServicesConfig) error {
 	rpmCfg := &RPMConfig{Probes: make(map[string]*RPMProbe)}
 
-	for _, probeNode := range node.FindChildren("probe") {
-		if len(probeNode.Keys) < 2 {
-			continue
-		}
+	for _, probeInst := range namedInstances(node.FindChildren("probe")) {
 		probe := &RPMProbe{
-			Name:  probeNode.Keys[1],
+			Name:  probeInst.name,
 			Tests: make(map[string]*RPMTest),
 		}
 
-		for _, testNode := range probeNode.FindChildren("test") {
-			if len(testNode.Keys) < 2 {
-				continue
-			}
-			test := &RPMTest{Name: testNode.Keys[1]}
+		for _, testInst := range namedInstances(probeInst.node.FindChildren("test")) {
+			test := &RPMTest{Name: testInst.name}
 
-			for _, prop := range testNode.Children {
+			for _, prop := range testInst.node.Children {
 				switch prop.Name() {
 				case "probe-type":
-					if len(prop.Keys) >= 2 {
-						test.ProbeType = prop.Keys[1]
-					}
+					test.ProbeType = nodeVal(prop)
 				case "target":
-					if len(prop.Keys) >= 2 {
-						test.Target = prop.Keys[1]
-					}
+					test.Target = nodeVal(prop)
 				case "source-address":
-					if len(prop.Keys) >= 2 {
-						test.SourceAddress = prop.Keys[1]
-					}
+					test.SourceAddress = nodeVal(prop)
 				case "routing-instance":
-					if len(prop.Keys) >= 2 {
-						test.RoutingInstance = prop.Keys[1]
-					}
+					test.RoutingInstance = nodeVal(prop)
 				case "probe-interval":
-					if len(prop.Keys) >= 2 {
-						if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-							test.ProbeInterval = v
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							test.ProbeInterval = n
 						}
 					}
 				case "probe-count":
-					if len(prop.Keys) >= 2 {
-						if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-							test.ProbeCount = v
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							test.ProbeCount = n
 						}
 					}
 				case "test-interval":
-					if len(prop.Keys) >= 2 {
-						if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-							test.TestInterval = v
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							test.TestInterval = n
 						}
 					}
 				case "thresholds":
 					for _, th := range prop.Children {
-						if th.Name() == "successive-loss" && len(th.Keys) >= 2 {
-							if v, err := strconv.Atoi(th.Keys[1]); err == nil {
-								test.ThresholdSuccessive = v
+						if th.Name() == "successive-loss" {
+							if v := nodeVal(th); v != "" {
+								if n, err := strconv.Atoi(v); err == nil {
+									test.ThresholdSuccessive = n
+								}
 							}
 						}
 					}
 				case "destination-port":
-					if len(prop.Keys) >= 2 {
-						if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-							test.DestPort = v
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							test.DestPort = n
 						}
 					}
 				}
@@ -2655,38 +2681,34 @@ func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
 		Templates: make(map[string]*NetFlowV9Template),
 	}
 
-	for _, tmplNode := range v9Node.FindChildren("template") {
-		if len(tmplNode.Keys) < 2 {
-			continue
-		}
-		tmpl := &NetFlowV9Template{Name: tmplNode.Keys[1]}
+	for _, tmplInst := range namedInstances(v9Node.FindChildren("template")) {
+		tmpl := &NetFlowV9Template{Name: tmplInst.name}
 
-		for _, prop := range tmplNode.Children {
+		for _, prop := range tmplInst.node.Children {
 			switch prop.Name() {
 			case "flow-active-timeout":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						tmpl.FlowActiveTimeout = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						tmpl.FlowActiveTimeout = n
 					}
 				}
 			case "flow-inactive-timeout":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						tmpl.FlowInactiveTimeout = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						tmpl.FlowInactiveTimeout = n
 					}
 				}
 			case "template-refresh-rate":
-				// Two forms:
-				// "template-refresh-rate 60;" (flat) → prop.Keys = ["template-refresh-rate", "60"]
-				// "template-refresh-rate { seconds 60; }" (hierarchical)
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						tmpl.TemplateRefreshRate = v
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						tmpl.TemplateRefreshRate = n
 					}
 				}
-				if secNode := prop.FindChild("seconds"); secNode != nil && len(secNode.Keys) >= 2 {
-					if v, err := strconv.Atoi(secNode.Keys[1]); err == nil {
-						tmpl.TemplateRefreshRate = v
+				if secNode := prop.FindChild("seconds"); secNode != nil {
+					if v := nodeVal(secNode); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							tmpl.TemplateRefreshRate = n
+						}
 					}
 				}
 			}
@@ -2722,24 +2744,23 @@ func compileSampling(node *Node, fo *ForwardingOptionsConfig) error {
 		Instances: make(map[string]*SamplingInstance),
 	}
 
-	for _, instNode := range node.FindChildren("instance") {
-		if len(instNode.Keys) < 2 {
-			continue
-		}
-		inst := &SamplingInstance{Name: instNode.Keys[1]}
+	for _, sampInst := range namedInstances(node.FindChildren("instance")) {
+		inst := &SamplingInstance{Name: sampInst.name}
 
-		inputNode := instNode.FindChild("input")
+		inputNode := sampInst.node.FindChild("input")
 		if inputNode != nil {
 			for _, prop := range inputNode.Children {
-				if prop.Name() == "rate" && len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						inst.InputRate = v
+				if prop.Name() == "rate" {
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							inst.InputRate = n
+						}
 					}
 				}
 			}
 		}
 
-		for _, familyNode := range instNode.FindChildren("family") {
+		for _, familyNode := range sampInst.node.FindChildren("family") {
 			var afNodes []*Node
 			if len(familyNode.Keys) >= 2 {
 				afNodes = append(afNodes, familyNode)
@@ -2780,24 +2801,25 @@ func compileSamplingFamily(node *Node) *SamplingFamily {
 	for _, child := range outputNode.Children {
 		switch child.Name() {
 		case "flow-server":
-			if len(child.Keys) >= 2 {
-				fs := &FlowServer{Address: child.Keys[1]}
-				for _, prop := range child.Children {
+			fsAddr := nodeVal(child)
+			if fsAddr != "" {
+				fs := &FlowServer{Address: fsAddr}
+				fsChildren := child.Children
+				if len(child.Keys) < 2 && len(child.Children) > 0 {
+					fsChildren = child.Children[0].Children
+				}
+				for _, prop := range fsChildren {
 					switch prop.Name() {
 					case "port":
-						if len(prop.Keys) >= 2 {
-							if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-								fs.Port = v
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								fs.Port = n
 							}
 						}
 					case "version9-template":
-						if len(prop.Keys) >= 2 {
-							fs.Version9Template = prop.Keys[1]
-						}
+						fs.Version9Template = nodeVal(prop)
 					case "source-address":
-						if len(prop.Keys) >= 2 {
-							sf.SourceAddress = prop.Keys[1]
-						}
+						sf.SourceAddress = nodeVal(prop)
 					}
 				}
 				sf.FlowServers = append(sf.FlowServers, fs)
@@ -2816,16 +2838,9 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 		Groups:       make(map[string]*DHCPRelayGroup),
 	}
 
-	for _, sgNode := range node.FindChildren("server-group") {
-		if len(sgNode.Keys) < 2 {
-			continue
-		}
-		sg := &DHCPRelayServerGroup{Name: sgNode.Keys[1]}
-		// Servers can be in remaining keys or children
-		for _, k := range sgNode.Keys[2:] {
-			sg.Servers = append(sg.Servers, k)
-		}
-		for _, child := range sgNode.Children {
+	for _, sgInst := range namedInstances(node.FindChildren("server-group")) {
+		sg := &DHCPRelayServerGroup{Name: sgInst.name}
+		for _, child := range sgInst.node.Children {
 			if len(child.Keys) >= 1 {
 				sg.Servers = append(sg.Servers, child.Keys[0])
 			}
@@ -2833,21 +2848,16 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 		relay.ServerGroups[sg.Name] = sg
 	}
 
-	for _, gNode := range node.FindChildren("group") {
-		if len(gNode.Keys) < 2 {
-			continue
-		}
-		g := &DHCPRelayGroup{Name: gNode.Keys[1]}
-		for _, prop := range gNode.Children {
+	for _, gInst := range namedInstances(node.FindChildren("group")) {
+		g := &DHCPRelayGroup{Name: gInst.name}
+		for _, prop := range gInst.node.Children {
 			switch prop.Name() {
 			case "interface":
-				if len(prop.Keys) >= 2 {
-					g.Interfaces = append(g.Interfaces, prop.Keys[1])
+				if v := nodeVal(prop); v != "" {
+					g.Interfaces = append(g.Interfaces, v)
 				}
 			case "active-server-group":
-				if len(prop.Keys) >= 2 {
-					g.ActiveServerGroup = prop.Keys[1]
-				}
+				g.ActiveServerGroup = nodeVal(prop)
 			}
 		}
 		relay.Groups[g.Name] = g
@@ -2866,23 +2876,22 @@ func compileSNMP(node *Node, sys *SystemConfig) error {
 	for _, child := range node.Children {
 		switch child.Name() {
 		case "location":
-			if len(child.Keys) >= 2 {
-				snmp.Location = child.Keys[1]
-			}
+			snmp.Location = nodeVal(child)
 		case "contact":
-			if len(child.Keys) >= 2 {
-				snmp.Contact = child.Keys[1]
-			}
+			snmp.Contact = nodeVal(child)
 		case "description":
-			if len(child.Keys) >= 2 {
-				snmp.Description = child.Keys[1]
-			}
+			snmp.Description = nodeVal(child)
 		case "community":
-			if len(child.Keys) >= 2 {
-				comm := &SNMPCommunity{Name: child.Keys[1]}
-				for _, prop := range child.Children {
-					if prop.Name() == "authorization" && len(prop.Keys) >= 2 {
-						comm.Authorization = prop.Keys[1]
+			commName := nodeVal(child)
+			if commName != "" {
+				comm := &SNMPCommunity{Name: commName}
+				commChildren := child.Children
+				if len(child.Keys) < 2 && len(child.Children) > 0 {
+					commChildren = child.Children[0].Children
+				}
+				for _, prop := range commChildren {
+					if prop.Name() == "authorization" {
+						comm.Authorization = nodeVal(prop)
 					}
 				}
 				// Flat form: community public authorization read-only
@@ -2897,11 +2906,18 @@ func compileSNMP(node *Node, sys *SystemConfig) error {
 				snmp.Communities[comm.Name] = comm
 			}
 		case "trap-group":
-			if len(child.Keys) >= 2 {
-				tg := &SNMPTrapGroup{Name: child.Keys[1]}
-				for _, prop := range child.Children {
-					if prop.Name() == "targets" && len(prop.Keys) >= 2 {
-						tg.Targets = append(tg.Targets, prop.Keys[1])
+			tgName := nodeVal(child)
+			if tgName != "" {
+				tg := &SNMPTrapGroup{Name: tgName}
+				tgChildren := child.Children
+				if len(child.Keys) < 2 && len(child.Children) > 0 {
+					tgChildren = child.Children[0].Children
+				}
+				for _, prop := range tgChildren {
+					if prop.Name() == "targets" {
+						if v := nodeVal(prop); v != "" {
+							tg.Targets = append(tg.Targets, v)
+						}
 					}
 				}
 				snmp.TrapGroups[tg.Name] = tg
@@ -2918,36 +2934,25 @@ func compileSchedulers(node *Node, cfg *Config) error {
 		cfg.Schedulers = make(map[string]*SchedulerConfig)
 	}
 
-	for _, schedNode := range node.FindChildren("scheduler") {
-		if len(schedNode.Keys) < 2 {
-			continue
-		}
-		sched := &SchedulerConfig{Name: schedNode.Keys[1]}
+	for _, inst := range namedInstances(node.FindChildren("scheduler")) {
+		sched := &SchedulerConfig{Name: inst.name}
 
-		for _, prop := range schedNode.Children {
+		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "start-time":
-				if len(prop.Keys) >= 2 {
-					sched.StartTime = prop.Keys[1]
-				}
+				sched.StartTime = nodeVal(prop)
 			case "stop-time":
-				if len(prop.Keys) >= 2 {
-					sched.StopTime = prop.Keys[1]
-				}
+				sched.StopTime = nodeVal(prop)
 			case "start-date":
-				if len(prop.Keys) >= 2 {
-					sched.StartDate = prop.Keys[1]
-				}
+				sched.StartDate = nodeVal(prop)
 			case "stop-date":
-				if len(prop.Keys) >= 2 {
-					sched.StopDate = prop.Keys[1]
-				}
+				sched.StopDate = nodeVal(prop)
 			case "daily":
 				sched.Daily = true
 			}
 		}
 
-		cfg.Schedulers[sched.Name] = sched
+		cfg.Schedulers[inst.name] = sched
 	}
 	return nil
 }
@@ -2961,13 +2966,9 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 	}
 
 	// Parse prefix-lists
-	for _, child := range node.FindChildren("prefix-list") {
-		if len(child.Keys) < 2 {
-			continue
-		}
-		pl := &PrefixList{Name: child.Keys[1]}
-		for _, entry := range child.Children {
-			// Each child is a leaf with the prefix as its only key
+	for _, inst := range namedInstances(node.FindChildren("prefix-list")) {
+		pl := &PrefixList{Name: inst.name}
+		for _, entry := range inst.node.Children {
 			if len(entry.Keys) > 0 {
 				pl.Prefixes = append(pl.Prefixes, entry.Keys[0])
 			}
@@ -2976,14 +2977,11 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 	}
 
 	// Parse policy-statements
-	for _, child := range node.FindChildren("policy-statement") {
-		if len(child.Keys) < 2 {
-			continue
-		}
-		ps := &PolicyStatement{Name: child.Keys[1]}
+	for _, inst := range namedInstances(node.FindChildren("policy-statement")) {
+		ps := &PolicyStatement{Name: inst.name}
 		termsByName := make(map[string]*PolicyTerm)
 
-		for _, prop := range child.Children {
+		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "term":
 				if len(prop.Keys) < 2 {

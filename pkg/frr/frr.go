@@ -413,6 +413,38 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 		for _, export := range bgp.Export {
 			fmt.Fprintf(&b, " redistribute %s\n", export)
 		}
+
+		// Address-family blocks for neighbors with family declarations
+		var inet4Neighbors, inet6Neighbors []*config.BGPNeighbor
+		for _, n := range bgp.Neighbors {
+			if n.FamilyInet {
+				inet4Neighbors = append(inet4Neighbors, n)
+			}
+			if n.FamilyInet6 {
+				inet6Neighbors = append(inet6Neighbors, n)
+			}
+		}
+		if len(inet4Neighbors) > 0 {
+			b.WriteString(" !\n address-family ipv4 unicast\n")
+			for _, n := range inet4Neighbors {
+				fmt.Fprintf(&b, "  neighbor %s activate\n", n.Address)
+				for _, exp := range n.Export {
+					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, exp)
+				}
+			}
+			b.WriteString(" exit-address-family\n")
+		}
+		if len(inet6Neighbors) > 0 {
+			b.WriteString(" !\n address-family ipv6 unicast\n")
+			for _, n := range inet6Neighbors {
+				fmt.Fprintf(&b, "  neighbor %s activate\n", n.Address)
+				for _, exp := range n.Export {
+					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, exp)
+				}
+			}
+			b.WriteString(" exit-address-family\n")
+		}
+
 		b.WriteString("exit\n!\n")
 	}
 

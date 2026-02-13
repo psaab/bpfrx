@@ -4365,3 +4365,154 @@ func TestIPsecProposalSetSyntax(t *testing.T) {
 	}
 }
 
+func TestBGPGroupExportFamily(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set protocols bgp local-as 64701",
+		"set protocols bgp group ebgp-peer family inet unicast",
+		"set protocols bgp group ebgp-peer family inet6 unicast",
+		"set protocols bgp group ebgp-peer export my-export-policy",
+		"set protocols bgp group ebgp-peer peer-as 65002",
+		"set protocols bgp group ebgp-peer neighbor 10.1.0.1",
+		"set protocols bgp group ebgp-peer neighbor 10.2.0.1",
+	} {
+		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	bgp := cfg.Protocols.BGP
+	if bgp == nil {
+		t.Fatal("BGP config is nil")
+	}
+	if bgp.LocalAS != 64701 {
+		t.Errorf("LocalAS = %d, want 64701", bgp.LocalAS)
+	}
+	if len(bgp.Neighbors) != 2 {
+		t.Fatalf("got %d neighbors, want 2", len(bgp.Neighbors))
+	}
+	n := bgp.Neighbors[0]
+	if n.Address != "10.1.0.1" {
+		t.Errorf("neighbor 0 address = %q, want 10.1.0.1", n.Address)
+	}
+	if !n.FamilyInet {
+		t.Error("neighbor should have FamilyInet=true")
+	}
+	if !n.FamilyInet6 {
+		t.Error("neighbor should have FamilyInet6=true")
+	}
+	if len(n.Export) != 1 || n.Export[0] != "my-export-policy" {
+		t.Errorf("neighbor export = %v, want [my-export-policy]", n.Export)
+	}
+}
+
+func TestSystemConfigExtended(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set system host-name test-fw",
+		"set system backup-router 192.168.50.1 destination 192.168.0.0/16",
+		"set system internet-options no-ipv6-reject-zero-hop-limit",
+		"set system services ssh root-login allow",
+		"set system services web-management http",
+		"set system services web-management https",
+		"set system syslog host 192.168.99.3 daemon info",
+		"set system syslog file messages any any",
+	} {
+		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	sys := cfg.System
+	if sys.HostName != "test-fw" {
+		t.Errorf("HostName = %q, want test-fw", sys.HostName)
+	}
+	if sys.BackupRouter != "192.168.50.1" {
+		t.Errorf("BackupRouter = %q, want 192.168.50.1", sys.BackupRouter)
+	}
+	if sys.BackupRouterDst != "192.168.0.0/16" {
+		t.Errorf("BackupRouterDst = %q, want 192.168.0.0/16", sys.BackupRouterDst)
+	}
+	if sys.InternetOptions == nil {
+		t.Fatal("InternetOptions is nil")
+	}
+	if !sys.InternetOptions.NoIPv6RejectZeroHopLimit {
+		t.Error("NoIPv6RejectZeroHopLimit should be true")
+	}
+	if sys.Services == nil {
+		t.Fatal("Services is nil")
+	}
+	if sys.Services.SSH == nil || sys.Services.SSH.RootLogin != "allow" {
+		t.Errorf("SSH root-login = %v, want allow", sys.Services.SSH)
+	}
+	if sys.Services.WebManagement == nil {
+		t.Fatal("WebManagement is nil")
+	}
+	if !sys.Services.WebManagement.HTTP {
+		t.Error("HTTP should be true")
+	}
+	if !sys.Services.WebManagement.HTTPS {
+		t.Error("HTTPS should be true")
+	}
+	if sys.Syslog == nil {
+		t.Fatal("Syslog is nil")
+	}
+	if len(sys.Syslog.Hosts) != 1 {
+		t.Fatalf("got %d syslog hosts, want 1", len(sys.Syslog.Hosts))
+	}
+	if sys.Syslog.Hosts[0].Address != "192.168.99.3" {
+		t.Errorf("syslog host = %q, want 192.168.99.3", sys.Syslog.Hosts[0].Address)
+	}
+	if len(sys.Syslog.Files) != 1 {
+		t.Fatalf("got %d syslog files, want 1", len(sys.Syslog.Files))
+	}
+	if sys.Syslog.Files[0].Name != "messages" {
+		t.Errorf("syslog file = %q, want messages", sys.Syslog.Files[0].Name)
+	}
+}
+
+func TestTCPMSSHierarchical(t *testing.T) {
+	input := `
+security {
+    flow {
+        tcp-mss {
+            ipsec-vpn {
+                mss 1360;
+            }
+            gre-in {
+                mss 1360;
+            }
+            gre-out {
+                mss 1360;
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("Parse: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	if cfg.Security.Flow.TCPMSSIPsecVPN != 1360 {
+		t.Errorf("TCPMSSIPsecVPN = %d, want 1360", cfg.Security.Flow.TCPMSSIPsecVPN)
+	}
+	if cfg.Security.Flow.TCPMSSGre != 1360 {
+		t.Errorf("TCPMSSGre = %d, want 1360", cfg.Security.Flow.TCPMSSGre)
+	}
+}
+

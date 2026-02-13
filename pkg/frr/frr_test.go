@@ -440,3 +440,59 @@ func TestGeneratePolicyOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestBGPAddressFamily(t *testing.T) {
+	m := New()
+
+	bgp := &config.BGPConfig{
+		LocalAS: 64701,
+		Neighbors: []*config.BGPNeighbor{
+			{
+				Address:     "192.168.255.1",
+				PeerAS:      65909,
+				FamilyInet:  true,
+				FamilyInet6: true,
+				Export:       []string{"to_BV-FIREHOUSE"},
+			},
+			{
+				Address:    "10.0.0.2",
+				PeerAS:     65002,
+				FamilyInet: true,
+			},
+		},
+	}
+
+	got := m.generateProtocols(nil, bgp, nil, nil, "")
+
+	checks := []string{
+		"router bgp 64701",
+		"neighbor 192.168.255.1 remote-as 65909",
+		"neighbor 10.0.0.2 remote-as 65002",
+		"address-family ipv4 unicast",
+		"neighbor 192.168.255.1 activate",
+		"neighbor 192.168.255.1 route-map to_BV-FIREHOUSE out",
+		"neighbor 10.0.0.2 activate",
+		"exit-address-family",
+		"address-family ipv6 unicast",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+
+	// Neighbor 10.0.0.2 should NOT be in ipv6 address-family
+	lines := strings.Split(got, "\n")
+	inIPv6 := false
+	for _, line := range lines {
+		if strings.Contains(line, "address-family ipv6") {
+			inIPv6 = true
+		}
+		if strings.Contains(line, "exit-address-family") {
+			inIPv6 = false
+		}
+		if inIPv6 && strings.Contains(line, "10.0.0.2") {
+			t.Error("10.0.0.2 should not be in ipv6 address-family")
+		}
+	}
+}

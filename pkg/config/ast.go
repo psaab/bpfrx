@@ -332,13 +332,32 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"ospf": {children: map[string]*schemaNode{
 			"router-id": {args: 1, children: nil},
 			"export":    {args: 1, children: nil},
-			"area":      {args: 1, children: nil}, // area <id>
+			"area": {args: 1, children: map[string]*schemaNode{
+				"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
+					"passive": {children: nil},
+					"cost":    {args: 1, children: nil},
+				}},
+			}},
 		}},
 		"bgp": {children: map[string]*schemaNode{
 			"local-as":  {args: 1, children: nil},
 			"router-id": {args: 1, children: nil},
 			"export":    {args: 1, children: nil},
-			"group":     {args: 1, children: nil}, // group <name>
+			"group": {args: 1, children: map[string]*schemaNode{
+				"peer-as":     {args: 1, children: nil},
+				"description": {args: 1, children: nil},
+				"multihop":    {args: 1, children: nil},
+				"export":      {args: 1, children: nil},
+				"family": {children: map[string]*schemaNode{
+					"inet":  {children: nil},
+					"inet6": {children: nil},
+				}},
+				"neighbor": {args: 1, children: map[string]*schemaNode{
+					"description": {args: 1, children: nil},
+					"peer-as":     {args: 1, children: nil},
+					"multihop":    {args: 1, children: nil},
+				}},
+			}},
 		}},
 		"rip": {children: map[string]*schemaNode{
 			"group":             {args: 1, children: nil},
@@ -422,12 +441,22 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 	}},
 	"system": {children: map[string]*schemaNode{
-		"host-name":    {args: 1, children: nil},
-		"time-zone":    {args: 1, children: nil},
-		"no-redirects": {children: nil},
-		"name-server":  {children: nil},
+		"host-name":     {args: 1, children: nil},
+		"time-zone":     {args: 1, children: nil},
+		"no-redirects":  {children: nil},
+		"name-server":   {children: nil},
+		"backup-router": {args: 1, children: nil},
+		"internet-options": {children: map[string]*schemaNode{
+			"no-ipv6-reject-zero-hop-limit": {children: nil},
+		}},
 		"ntp": {children: map[string]*schemaNode{
-			"server": {args: 1, children: nil},
+			"server":    {args: 1, children: nil},
+			"threshold": {args: 1, children: nil},
+		}},
+		"syslog": {children: map[string]*schemaNode{
+			"user": {args: 1, children: nil},
+			"host": {args: 1, children: nil},
+			"file": {args: 1, children: nil},
 		}},
 		"login": {children: map[string]*schemaNode{
 			"user": {args: 1, children: map[string]*schemaNode{
@@ -437,6 +466,13 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"services": {children: map[string]*schemaNode{
+			"ssh": {children: map[string]*schemaNode{
+				"root-login": {args: 1, children: nil},
+			}},
+			"web-management": {children: map[string]*schemaNode{
+				"http":  {children: nil},
+				"https": {children: nil},
+			}},
 			"dhcp-local-server": {children: map[string]*schemaNode{
 				"group": {args: 1, children: map[string]*schemaNode{
 					"pool": {args: 1, children: nil},
@@ -496,7 +532,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"protocols": {children: map[string]*schemaNode{
 			"ospf": {children: map[string]*schemaNode{
-				"area": {args: 1, children: nil},
+				"area": {args: 1, children: map[string]*schemaNode{
+					"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
+						"passive": {children: nil},
+						"cost":    {args: 1, children: nil},
+					}},
+				}},
 			}},
 			"bgp": {children: map[string]*schemaNode{
 				"group": {args: 1, children: nil},

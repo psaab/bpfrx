@@ -63,14 +63,62 @@ type SchedulerConfig struct {
 
 // SystemConfig holds system-level configuration.
 type SystemConfig struct {
-	HostName    string
-	TimeZone    string
-	NameServers []string // DNS server addresses
-	NTPServers  []string // NTP server addresses
-	NoRedirects bool     // disable ICMP redirects
-	DHCPServer  DHCPServerConfig
-	SNMP        *SNMPConfig
-	Login       *LoginConfig
+	HostName        string
+	TimeZone        string
+	NameServers     []string // DNS server addresses
+	NTPServers      []string // NTP server addresses
+	NoRedirects     bool     // disable ICMP redirects
+	BackupRouter    string   // backup default gateway IP
+	BackupRouterDst string   // backup router destination prefix
+	InternetOptions *InternetOptionsConfig
+	Services        *SystemServicesConfig
+	Syslog          *SystemSyslogConfig
+	DHCPServer      DHCPServerConfig
+	SNMP            *SNMPConfig
+	Login           *LoginConfig
+}
+
+// InternetOptionsConfig holds internet-options settings.
+type InternetOptionsConfig struct {
+	NoIPv6RejectZeroHopLimit bool
+}
+
+// SystemServicesConfig holds system services (SSH, web-management).
+type SystemServicesConfig struct {
+	SSH           *SSHServiceConfig
+	WebManagement *WebManagementConfig
+}
+
+// SSHServiceConfig holds SSH service settings.
+type SSHServiceConfig struct {
+	RootLogin string // "allow", "deny", "deny-password"
+}
+
+// WebManagementConfig holds web management settings.
+type WebManagementConfig struct {
+	HTTP  bool
+	HTTPS bool
+}
+
+// SystemSyslogConfig holds traditional Junos system syslog config.
+type SystemSyslogConfig struct {
+	Hosts []*SyslogHostConfig
+	Files []*SyslogFileConfig
+}
+
+// SyslogHostConfig defines a syslog host destination.
+type SyslogHostConfig struct {
+	Address         string
+	Facility        string // "daemon", "change-log", "any", etc.
+	Severity        string // "info", "warning", "error", "emergency", "any"
+	AllowDuplicates bool
+}
+
+// SyslogFileConfig defines a syslog file destination.
+type SyslogFileConfig struct {
+	Name     string
+	Facility string
+	Severity string
 }
 
 // SNMPConfig holds SNMP agent configuration.
@@ -731,7 +779,10 @@ type BGPNeighbor struct {
 	Address     string // peer IP
 	PeerAS      uint32
 	Description string
-	MultihopTTL int // 0 = directly connected
+	MultihopTTL int      // 0 = directly connected
+	Export      []string // per-group export policies (route-map out)
+	FamilyInet  bool     // activate under address-family ipv4 unicast
+	FamilyInet6 bool     // activate under address-family ipv6 unicast
 }
 
 // TunnelConfig defines a GRE or other tunnel interface.
