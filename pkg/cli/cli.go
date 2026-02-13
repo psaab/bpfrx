@@ -1320,17 +1320,49 @@ func (c *CLI) showScreen() error {
 		fmt.Println()
 	}
 
-	// Show screen drop counter
+	// Show screen drop counters (total + per-type)
 	if c.dp != nil && c.dp.IsLoaded() {
 		ctrMap := c.dp.Map("global_counters")
 		if ctrMap != nil {
-			var perCPU []uint64
-			if err := ctrMap.Lookup(uint32(dataplane.GlobalCtrScreenDrops), &perCPU); err == nil {
-				var total uint64
-				for _, v := range perCPU {
-					total += v
+			readCtr := func(idx uint32) uint64 {
+				var perCPU []uint64
+				if err := ctrMap.Lookup(idx, &perCPU); err == nil {
+					var total uint64
+					for _, v := range perCPU {
+						total += v
+					}
+					return total
 				}
-				fmt.Printf("Total screen drops: %d\n", total)
+				return 0
+			}
+
+			totalDrops := readCtr(dataplane.GlobalCtrScreenDrops)
+			fmt.Printf("Total screen drops: %d\n", totalDrops)
+
+			if totalDrops > 0 {
+				screenCounters := []struct {
+					idx  uint32
+					name string
+				}{
+					{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
+					{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
+					{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
+					{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
+					{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
+					{dataplane.GlobalCtrScreenTearDrop, "Teardrop"},
+					{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
+					{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
+					{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
+					{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
+					{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
+					{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
+				}
+				for _, sc := range screenCounters {
+					v := readCtr(sc.idx)
+					if v > 0 {
+						fmt.Printf("  %-25s %d\n", sc.name+":", v)
+					}
+				}
 			}
 		}
 	}

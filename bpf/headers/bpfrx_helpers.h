@@ -683,6 +683,31 @@ inc_counter(__u32 ctr_idx)
 		__sync_fetch_and_add(ctr, 1);
 }
 
+/* Map a SCREEN_* flag bit to a per-screen-type counter index. */
+static __always_inline void
+inc_screen_counter(__u32 screen_flag)
+{
+	__u32 idx;
+	switch (screen_flag) {
+	case SCREEN_SYN_FLOOD:      idx = GLOBAL_CTR_SCREEN_SYN_FLOOD; break;
+	case SCREEN_ICMP_FLOOD:     idx = GLOBAL_CTR_SCREEN_ICMP_FLOOD; break;
+	case SCREEN_UDP_FLOOD:      idx = GLOBAL_CTR_SCREEN_UDP_FLOOD; break;
+	case SCREEN_PORT_SCAN:      idx = GLOBAL_CTR_SCREEN_PORT_SCAN; break;
+	case SCREEN_IP_SWEEP:       idx = GLOBAL_CTR_SCREEN_IP_SWEEP; break;
+	case SCREEN_LAND_ATTACK:    idx = GLOBAL_CTR_SCREEN_LAND_ATTACK; break;
+	case SCREEN_PING_OF_DEATH:  idx = GLOBAL_CTR_SCREEN_PING_OF_DEATH; break;
+	case SCREEN_TEAR_DROP:      idx = GLOBAL_CTR_SCREEN_TEAR_DROP; break;
+	case SCREEN_TCP_SYN_FIN:    idx = GLOBAL_CTR_SCREEN_TCP_SYN_FIN; break;
+	case SCREEN_TCP_NO_FLAG:    idx = GLOBAL_CTR_SCREEN_TCP_NO_FLAG; break;
+	case SCREEN_TCP_FIN_NO_ACK: idx = GLOBAL_CTR_SCREEN_TCP_FIN_NO_ACK; break;
+	case SCREEN_WINNUKE:        idx = GLOBAL_CTR_SCREEN_WINNUKE; break;
+	case SCREEN_IP_SOURCE_ROUTE:idx = GLOBAL_CTR_SCREEN_IP_SRC_ROUTE; break;
+	case SCREEN_SYN_FRAG:       idx = GLOBAL_CTR_SCREEN_SYN_FRAG; break;
+	default: return;
+	}
+	inc_counter(idx);
+}
+
 static __always_inline void
 inc_iface_rx(__u32 ifindex, __u32 pkt_len)
 {

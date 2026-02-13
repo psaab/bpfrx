@@ -203,7 +203,22 @@ const (
 	GlobalCtrTCEgressPackets = 9
 	GlobalCtrNAT64Xlate      = 10
 	GlobalCtrHostInbound     = 11
-	GlobalCtrMax             = 12
+	// Per-screen-type drop counters (12..25)
+	GlobalCtrScreenSynFlood     = 12
+	GlobalCtrScreenICMPFlood    = 13
+	GlobalCtrScreenUDPFlood     = 14
+	GlobalCtrScreenPortScan     = 15
+	GlobalCtrScreenIPSweep      = 16
+	GlobalCtrScreenLandAttack   = 17
+	GlobalCtrScreenPingOfDeath  = 18
+	GlobalCtrScreenTearDrop     = 19
+	GlobalCtrScreenTCPSynFin   = 20
+	GlobalCtrScreenTCPNoFlag   = 21
+	GlobalCtrScreenTCPFinNoAck = 22
+	GlobalCtrScreenWinNuke     = 23
+	GlobalCtrScreenIPSrcRoute  = 24
+	GlobalCtrScreenSynFrag     = 25
+	GlobalCtrMax               = 26
 )
 
 // Host-inbound-traffic service flags (bitmap in zone_config.host_inbound_flags).

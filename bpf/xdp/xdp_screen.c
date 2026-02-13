@@ -24,6 +24,7 @@ screen_drop(struct pkt_meta *meta, __u32 screen_flag)
 {
 	meta->policy_id = screen_flag;
 	inc_counter(GLOBAL_CTR_SCREEN_DROPS);
+	inc_screen_counter(screen_flag);
 	emit_event(meta, EVENT_TYPE_SCREEN_DROP, ACTION_DENY, 0, 0);
 	return XDP_DROP;
 }

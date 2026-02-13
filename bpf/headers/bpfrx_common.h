@@ -232,7 +232,22 @@ struct icmp6hdr {
 #define GLOBAL_CTR_TC_EGRESS_PACKETS   9
 #define GLOBAL_CTR_NAT64_XLATE        10
 #define GLOBAL_CTR_HOST_INBOUND       11
-#define GLOBAL_CTR_MAX                 12
+/* Per-screen-type drop counters (indices 12..25). */
+#define GLOBAL_CTR_SCREEN_SYN_FLOOD      12
+#define GLOBAL_CTR_SCREEN_ICMP_FLOOD     13
+#define GLOBAL_CTR_SCREEN_UDP_FLOOD      14
+#define GLOBAL_CTR_SCREEN_PORT_SCAN      15
+#define GLOBAL_CTR_SCREEN_IP_SWEEP       16
+#define GLOBAL_CTR_SCREEN_LAND_ATTACK    17
+#define GLOBAL_CTR_SCREEN_PING_OF_DEATH  18
+#define GLOBAL_CTR_SCREEN_TEAR_DROP      19
+#define GLOBAL_CTR_SCREEN_TCP_SYN_FIN    20
+#define GLOBAL_CTR_SCREEN_TCP_NO_FLAG    21
+#define GLOBAL_CTR_SCREEN_TCP_FIN_NO_ACK 22
+#define GLOBAL_CTR_SCREEN_WINNUKE        23
+#define GLOBAL_CTR_SCREEN_IP_SRC_ROUTE   24
+#define GLOBAL_CTR_SCREEN_SYN_FRAG       25
+#define GLOBAL_CTR_MAX                   26
 
 /* Flow timeout indices for flow_timeouts ARRAY map */
 #define FLOW_TIMEOUT_TCP_ESTABLISHED   0
