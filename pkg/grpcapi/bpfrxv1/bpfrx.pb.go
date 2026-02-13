@@ -2344,6 +2344,7 @@ type SessionEntry struct {
 	TimeoutSeconds  uint32                 `protobuf:"varint,16,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
 	IngressZoneName string                 `protobuf:"bytes,17,opt,name=ingress_zone_name,json=ingressZoneName,proto3" json:"ingress_zone_name,omitempty"`
 	EgressZoneName  string                 `protobuf:"bytes,18,opt,name=egress_zone_name,json=egressZoneName,proto3" json:"egress_zone_name,omitempty"`
+	IdleSeconds     int64                  `protobuf:"varint,19,opt,name=idle_seconds,json=idleSeconds,proto3" json:"idle_seconds,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -2502,6 +2503,13 @@ func (x *SessionEntry) GetEgressZoneName() string {
 		return x.EgressZoneName
 	}
 	return ""
+}
+
+func (x *SessionEntry) GetIdleSeconds() int64 {
+	if x != nil {
+		return x.IdleSeconds
+	}
+	return 0
 }
 
 type GetSessionSummaryRequest struct {
@@ -6195,7 +6203,7 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x05total\x18\x01 \x01(\x05R\x05total\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x05R\x06offset\x122\n" +
-	"\bsessions\x18\x04 \x03(\v2\x16.bpfrx.v1.SessionEntryR\bsessions\"\xbb\x04\n" +
+	"\bsessions\x18\x04 \x03(\v2\x16.bpfrx.v1.SessionEntryR\bsessions\"\xde\x04\n" +
 	"\fSessionEntry\x12\x19\n" +
 	"\bsrc_addr\x18\x01 \x01(\tR\asrcAddr\x12\x19\n" +
 	"\bdst_addr\x18\x02 \x01(\tR\adstAddr\x12\x19\n" +
@@ -6219,7 +6227,8 @@ const file_bpfrx_proto_rawDesc = "" +
 	"ageSeconds\x12'\n" +
 	"\x0ftimeout_seconds\x18\x10 \x01(\rR\x0etimeoutSeconds\x12*\n" +
 	"\x11ingress_zone_name\x18\x11 \x01(\tR\x0fingressZoneName\x12(\n" +
-	"\x10egress_zone_name\x18\x12 \x01(\tR\x0eegressZoneName\"\x1a\n" +
+	"\x10egress_zone_name\x18\x12 \x01(\tR\x0eegressZoneName\x12!\n" +
+	"\fidle_seconds\x18\x13 \x01(\x03R\vidleSeconds\"\x1a\n" +
 	"\x18GetSessionSummaryRequest\"\x99\x02\n" +
 	"\x19GetSessionSummaryResponse\x12#\n" +
 	"\rtotal_entries\x18\x01 \x01(\x05R\ftotalEntries\x12!\n" +

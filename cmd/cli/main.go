@@ -765,8 +765,8 @@ func (c *ctl) showFlowSession(args []string) error {
 	}
 
 	for i, se := range resp.Sessions {
-		fmt.Printf("Session ID: %d, Policy: %d, State: %s, Timeout: %ds\n",
-			i+1, se.PolicyId, se.State, se.TimeoutSeconds)
+		fmt.Printf("Session ID: %d, Policy: %d, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
+			i+1, se.PolicyId, se.State, se.TimeoutSeconds, se.AgeSeconds, se.IdleSeconds)
 		inZone := se.IngressZoneName
 		if inZone == "" {
 			inZone = fmt.Sprintf("%d", se.IngressZone)

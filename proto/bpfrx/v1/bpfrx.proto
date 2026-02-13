@@ -255,6 +255,7 @@ message SessionEntry {
   uint32 timeout_seconds = 16;
   string ingress_zone_name = 17;
   string egress_zone_name = 18;
+  int64 idle_seconds = 19;
 }
 
 message GetSessionSummaryRequest {}

@@ -2041,8 +2041,11 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 		RevBytes:       val.RevBytes,
 		TimeoutSeconds: val.Timeout,
 	}
+	if val.Created > 0 && now > val.Created {
+		se.AgeSeconds = int64(now - val.Created)
+	}
 	if val.LastSeen > 0 && now > val.LastSeen {
-		se.AgeSeconds = int64(now - val.LastSeen)
+		se.IdleSeconds = int64(now - val.LastSeen)
 	}
 	if val.Flags&dataplane.SessFlagSNAT != 0 {
 		se.Nat = fmt.Sprintf("SNAT %s:%d", uint32ToIP(val.NATSrcIP), ntohs(val.NATSrcPort))
@@ -2072,8 +2075,11 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 		RevBytes:       val.RevBytes,
 		TimeoutSeconds: val.Timeout,
 	}
+	if val.Created > 0 && now > val.Created {
+		se.AgeSeconds = int64(now - val.Created)
+	}
 	if val.LastSeen > 0 && now > val.LastSeen {
-		se.AgeSeconds = int64(now - val.LastSeen)
+		se.IdleSeconds = int64(now - val.LastSeen)
 	}
 	if val.Flags&dataplane.SessFlagSNAT != 0 {
 		se.Nat = fmt.Sprintf("SNAT [%s]:%d", net.IP(val.NATSrcIP[:]).String(), ntohs(val.NATSrcPort))
