@@ -1263,6 +1263,7 @@ func (c *ctl) handleShowSystem(args []string) error {
 		fmt.Println("  rollback         Show rollback history")
 		fmt.Println("  services         Show configured system services")
 		fmt.Println("  storage          Show filesystem usage")
+		fmt.Println("  syslog           Show system syslog configuration")
 		fmt.Println("  uptime           Show system uptime")
 		return nil
 	}
@@ -1367,6 +1368,9 @@ func (c *ctl) handleShowSystem(args []string) error {
 
 	case "ntp":
 		return c.showText("ntp")
+
+	case "syslog":
+		return c.showText("system-syslog")
 
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])

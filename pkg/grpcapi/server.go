@@ -2986,6 +2986,43 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			fmt.Fprintf(&buf, "\nNTP synchronized: %s\n", strings.TrimSpace(string(out)))
 		}
 
+	case "system-syslog":
+		cfg := s.store.ActiveConfig()
+		if cfg == nil {
+			fmt.Fprintln(&buf, "No active configuration")
+			break
+		}
+		if cfg.System.Syslog == nil {
+			fmt.Fprintln(&buf, "No system syslog configuration")
+			break
+		}
+		sys := cfg.System.Syslog
+		if len(sys.Hosts) > 0 {
+			fmt.Fprintln(&buf, "Syslog hosts:")
+			for _, h := range sys.Hosts {
+				fmt.Fprintf(&buf, "  %-20s", h.Address)
+				if h.AllowDuplicates {
+					fmt.Fprint(&buf, " allow-duplicates")
+				}
+				fmt.Fprintln(&buf)
+				for _, f := range h.Facilities {
+					fmt.Fprintf(&buf, "    %-20s %s\n", f.Facility, f.Severity)
+				}
+			}
+		}
+		if len(sys.Files) > 0 {
+			fmt.Fprintln(&buf, "Syslog files:")
+			for _, f := range sys.Files {
+				fmt.Fprintf(&buf, "  %-20s %s %s\n", f.Name, f.Facility, f.Severity)
+			}
+		}
+		if len(sys.Users) > 0 {
+			fmt.Fprintln(&buf, "Syslog users:")
+			for _, u := range sys.Users {
+				fmt.Fprintf(&buf, "  %-20s %s %s\n", u.User, u.Facility, u.Severity)
+			}
+		}
+
 	case "policy-options":
 		if cfg == nil {
 			buf.WriteString("No active configuration\n")

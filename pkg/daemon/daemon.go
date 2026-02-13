@@ -71,6 +71,7 @@ type Daemon struct {
 	dhcpRelay    *dhcprelay.Manager
 	snmpAgent    *snmp.Agent
 	scheduler    *scheduler.Scheduler
+	slogHandler  *logging.SyslogSlogHandler
 }
 
 // New creates a new Daemon.
@@ -87,6 +88,11 @@ func New(opts Options) *Daemon {
 
 // Run starts the daemon and blocks until shutdown.
 func (d *Daemon) Run(ctx context.Context) error {
+	// Wrap the default slog handler to support system syslog forwarding.
+	// Syslog clients are added later when config is applied.
+	d.slogHandler = logging.NewSyslogSlogHandler(slog.Default().Handler())
+	slog.SetDefault(slog.New(d.slogHandler))
+
 	slog.Info("starting bpfrx daemon",
 		"config", d.opts.ConfigFile,
 		"pid", os.Getpid())
@@ -588,6 +594,9 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// 9. Apply system DNS and NTP configuration
 	d.applySystemDNS(cfg)
 	d.applySystemNTP(cfg)
+
+	// 10. Apply system syslog forwarding
+	d.applySystemSyslog(cfg)
 }
 
 // startDHCPClients iterates the config and starts DHCP/DHCPv6 clients
@@ -1107,4 +1116,49 @@ func (d *Daemon) applySystemNTP(cfg *config.Config) {
 	// Restart timesyncd to pick up new servers
 	exec.Command("systemctl", "restart", "systemd-timesyncd").Run()
 	slog.Info("NTP config applied", "servers", cfg.System.NTPServers)
+}
+
+// applySystemSyslog configures system-level syslog forwarding from
+// system { syslog { host ... } } config. This forwards daemon log
+// messages (Go slog) to remote syslog servers.
+func (d *Daemon) applySystemSyslog(cfg *config.Config) {
+	if d.slogHandler == nil {
+		return
+	}
+
+	if cfg.System.Syslog == nil || len(cfg.System.Syslog.Hosts) == 0 {
+		d.slogHandler.SetClients(nil)
+		return
+	}
+
+	var clients []*logging.SyslogClient
+	for _, host := range cfg.System.Syslog.Hosts {
+		port := 514
+		c, err := logging.NewSyslogClient(host.Address, port)
+		if err != nil {
+			slog.Warn("failed to create system syslog client",
+				"host", host.Address, "err", err)
+			continue
+		}
+
+		// Apply facility from first facility entry, default to daemon
+		c.Facility = logging.FacilityDaemon
+		if len(host.Facilities) > 0 {
+			c.Facility = logging.ParseFacility(host.Facilities[0].Facility)
+			// Apply severity filter from the most restrictive facility entry
+			for _, f := range host.Facilities {
+				if sev := logging.ParseSeverity(f.Severity); sev > 0 {
+					if c.MinSeverity == 0 || sev < c.MinSeverity {
+						c.MinSeverity = sev
+					}
+				}
+			}
+		}
+
+		clients = append(clients, c)
+		slog.Info("system syslog forwarding configured",
+			"host", host.Address, "facility", c.Facility)
+	}
+
+	d.slogHandler.SetClients(clients)
 }

@@ -3796,6 +3796,9 @@ func (c *CLI) handleShowSystem(args []string) error {
 	case "services":
 		return c.showSystemServices()
 
+	case "syslog":
+		return c.showSystemSyslog()
+
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])
 	}
@@ -3918,6 +3921,52 @@ func (c *CLI) showSystemServices() error {
 			total += len(probe.Tests)
 		}
 		fmt.Printf("  RPM probes:     %d probe(s), %d test(s)\n", len(cfg.Services.RPM.Probes), total)
+	}
+
+	return nil
+}
+
+// showSystemSyslog displays system syslog configuration.
+func (c *CLI) showSystemSyslog() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	if cfg.System.Syslog == nil {
+		fmt.Println("No system syslog configuration")
+		return nil
+	}
+
+	sys := cfg.System.Syslog
+
+	if len(sys.Hosts) > 0 {
+		fmt.Println("Syslog hosts:")
+		for _, h := range sys.Hosts {
+			fmt.Printf("  %-20s", h.Address)
+			if h.AllowDuplicates {
+				fmt.Print(" allow-duplicates")
+			}
+			fmt.Println()
+			for _, f := range h.Facilities {
+				fmt.Printf("    %-20s %s\n", f.Facility, f.Severity)
+			}
+		}
+	}
+
+	if len(sys.Files) > 0 {
+		fmt.Println("Syslog files:")
+		for _, f := range sys.Files {
+			fmt.Printf("  %-20s %s %s\n", f.Name, f.Facility, f.Severity)
+		}
+	}
+
+	if len(sys.Users) > 0 {
+		fmt.Println("Syslog users:")
+		for _, u := range sys.Users {
+			fmt.Printf("  %-20s %s %s\n", u.User, u.Facility, u.Severity)
+		}
 	}
 
 	return nil
