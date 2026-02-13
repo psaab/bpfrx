@@ -4,9 +4,9 @@
  *
  * Runs before zone classification. Looks up the ingress zone's screen
  * profile and applies stateless anomaly checks (LAND, TCP SYN+FIN,
- * TCP no-flag, TCP FIN-no-ACK, WinNuke, IP source-route, Ping of Death)
- * and rate-based flood protection (SYN flood, ICMP flood, UDP flood).
- * Supports both IPv4 and IPv6.
+ * TCP no-flag, TCP FIN-no-ACK, WinNuke, tear-drop, IP source-route,
+ * Ping of Death) and rate-based flood protection (SYN flood, ICMP flood,
+ * UDP flood). Supports both IPv4 and IPv6.
  */
 
 #include "../headers/bpfrx_common.h"
@@ -167,6 +167,25 @@ int xdp_screen_prog(struct xdp_md *ctx)
 		if ((sc->flags & SCREEN_SYN_FRAG) &&
 		    (tf & 0x02) && meta->is_fragment)
 			return screen_drop(meta, SCREEN_SYN_FRAG);
+	}
+
+	/* Tear-drop attack: overlapping IP fragments (IPv4 only).
+	 * Detect fragments where the payload is too small (< 8 bytes)
+	 * for non-first fragments, indicating reassembly overlap. */
+	if ((sc->flags & SCREEN_TEAR_DROP) &&
+	    meta->addr_family == AF_INET &&
+	    meta->is_fragment &&
+	    meta->l3_offset < 64) {
+		struct iphdr *iph = data + meta->l3_offset;
+		if ((void *)(iph + 1) <= data_end) {
+			__u16 frag_off = bpf_ntohs(iph->frag_off);
+			/* Non-first fragment (offset > 0) with tiny payload */
+			if ((frag_off & 0x1FFF) > 0) {
+				__u16 payload = bpf_ntohs(iph->tot_len) - ((__u16)iph->ihl << 2);
+				if (payload < 8)
+					return screen_drop(meta, SCREEN_TEAR_DROP);
+			}
+		}
 	}
 
 	/* IP source-route option (IPv4 only) */

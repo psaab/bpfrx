@@ -374,7 +374,19 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 				}
 			}
 		}
+		for _, export := range ospf.Export {
+			fmt.Fprintf(&b, " redistribute %s\n", export)
+		}
 		b.WriteString("exit\n!\n")
+		// OSPF interface costs
+		for _, area := range ospf.Areas {
+			for _, iface := range area.Interfaces {
+				if iface.Cost > 0 {
+					fmt.Fprintf(&b, "interface %s\n ip ospf cost %d\n ip ospf area %s\nexit\n!\n",
+						iface.Name, iface.Cost, area.ID)
+				}
+			}
+		}
 	}
 
 	if bgp != nil && bgp.LocalAS > 0 {

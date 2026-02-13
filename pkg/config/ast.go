@@ -280,7 +280,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	}},
 	"protocols": {children: map[string]*schemaNode{
 		"ospf": {children: map[string]*schemaNode{
-			"area": {args: 1, children: nil}, // area <id>
+			"router-id": {args: 1, children: nil},
+			"export":    {args: 1, children: nil},
+			"area":      {args: 1, children: nil}, // area <id>
 		}},
 		"bgp": {children: map[string]*schemaNode{
 			"group": {args: 1, children: nil}, // group <name>

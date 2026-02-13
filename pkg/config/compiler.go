@@ -1316,10 +1316,17 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 	if ospfNode != nil {
 		proto.OSPF = &OSPFConfig{}
 
-		// Router ID at the ospf level
+		// Router ID and export policies at the ospf level
 		for _, child := range ospfNode.Children {
-			if child.Name() == "router-id" && len(child.Keys) >= 2 {
-				proto.OSPF.RouterID = child.Keys[1]
+			switch child.Name() {
+			case "router-id":
+				if len(child.Keys) >= 2 {
+					proto.OSPF.RouterID = child.Keys[1]
+				}
+			case "export":
+				if len(child.Keys) >= 2 {
+					proto.OSPF.Export = append(proto.OSPF.Export, child.Keys[1])
+				}
 			}
 		}
 

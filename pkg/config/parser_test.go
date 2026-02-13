@@ -3144,3 +3144,89 @@ security {
 		t.Errorf("zone interfaces: got %v, want [enp7s0]", zone.Interfaces)
 	}
 }
+
+func TestOSPFExportAndCost(t *testing.T) {
+	input := `
+protocols {
+    ospf {
+        router-id 10.0.0.1;
+        export connected;
+        export static;
+        area 0.0.0.0 {
+            interface trust0 {
+                cost 100;
+                passive;
+            }
+            interface dmz0;
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ospf := cfg.Protocols.OSPF
+	if ospf == nil {
+		t.Fatal("OSPF config is nil")
+	}
+	if ospf.RouterID != "10.0.0.1" {
+		t.Errorf("router-id: got %q, want %q", ospf.RouterID, "10.0.0.1")
+	}
+	if len(ospf.Export) != 2 {
+		t.Fatalf("export count: got %d, want 2", len(ospf.Export))
+	}
+	if ospf.Export[0] != "connected" || ospf.Export[1] != "static" {
+		t.Errorf("exports: got %v, want [connected static]", ospf.Export)
+	}
+	if len(ospf.Areas) != 1 {
+		t.Fatalf("area count: got %d, want 1", len(ospf.Areas))
+	}
+	area := ospf.Areas[0]
+	if len(area.Interfaces) != 2 {
+		t.Fatalf("interface count: got %d, want 2", len(area.Interfaces))
+	}
+	if area.Interfaces[0].Cost != 100 {
+		t.Errorf("trust0 cost: got %d, want 100", area.Interfaces[0].Cost)
+	}
+	if !area.Interfaces[0].Passive {
+		t.Error("trust0 should be passive")
+	}
+}
+
+func TestOSPFExportSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols ospf router-id 10.0.0.1",
+		"set protocols ospf export connected",
+		"set protocols ospf area 0.0.0.0 interface trust0 cost 100",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ospf := cfg.Protocols.OSPF
+	if ospf == nil {
+		t.Fatal("OSPF config is nil")
+	}
+	if ospf.RouterID != "10.0.0.1" {
+		t.Errorf("router-id: got %q, want %q", ospf.RouterID, "10.0.0.1")
+	}
+	if len(ospf.Export) != 1 || ospf.Export[0] != "connected" {
+		t.Errorf("exports: got %v, want [connected]", ospf.Export)
+	}
+}

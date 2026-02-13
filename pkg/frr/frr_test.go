@@ -138,6 +138,36 @@ func TestGenerateProtocols_OSPF(t *testing.T) {
 	}
 }
 
+func TestGenerateProtocols_OSPFExportAndCost(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		RouterID: "1.1.1.1",
+		Export:   []string{"connected", "static"},
+		Areas: []*config.OSPFArea{
+			{
+				ID: "0.0.0.0",
+				Interfaces: []*config.OSPFInterface{
+					{Name: "trust0", Cost: 100},
+					{Name: "dmz0", Cost: 0},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, "")
+	if !strings.Contains(got, "redistribute connected\n") {
+		t.Error("missing redistribute connected")
+	}
+	if !strings.Contains(got, "redistribute static\n") {
+		t.Error("missing redistribute static")
+	}
+	if !strings.Contains(got, "ip ospf cost 100\n") {
+		t.Errorf("missing ospf cost for trust0, got:\n%s", got)
+	}
+	if strings.Contains(got, "ip ospf cost 0") {
+		t.Error("should not emit cost 0")
+	}
+}
+
 func TestGenerateProtocols_BGP(t *testing.T) {
 	m := New()
 	bgp := &config.BGPConfig{

@@ -155,6 +155,22 @@ int tc_screen_egress_prog(struct __sk_buff *skb)
 			return screen_drop_tc(meta, SCREEN_SYN_FRAG);
 	}
 
+	/* Tear-drop attack: overlapping IP fragments (IPv4 only) */
+	if ((sc->flags & SCREEN_TEAR_DROP) &&
+	    meta->addr_family == AF_INET &&
+	    meta->is_fragment &&
+	    meta->l3_offset < 64) {
+		struct iphdr *iph = data + meta->l3_offset;
+		if ((void *)(iph + 1) <= data_end) {
+			__u16 frag_off = bpf_ntohs(iph->frag_off);
+			if ((frag_off & 0x1FFF) > 0) {
+				__u16 payload = bpf_ntohs(iph->tot_len) - ((__u16)iph->ihl << 2);
+				if (payload < 8)
+					return screen_drop_tc(meta, SCREEN_TEAR_DROP);
+			}
+		}
+	}
+
 	/* IP source-route option (IPv4 only) */
 	if ((sc->flags & SCREEN_IP_SOURCE_ROUTE) &&
 	    meta->addr_family == AF_INET &&
