@@ -1,20 +1,26 @@
 package api
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/logging"
+	"github.com/psaab/bpfrx/pkg/vrrp"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -803,4 +809,767 @@ func screenChecks(p *config.ScreenProfile) []string {
 		checks = append(checks, "tear-drop")
 	}
 	return checks
+}
+
+// --- Routing protocol handlers ---
+
+func (s *Server) ospfHandler(w http.ResponseWriter, r *http.Request) {
+	if s.frr == nil {
+		writeOK(w, TextResponse{Output: "FRR not available"})
+		return
+	}
+	typ := r.URL.Query().Get("type")
+	switch typ {
+	case "database":
+		output, err := s.frr.GetOSPFDatabase()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeOK(w, TextResponse{Output: output})
+	default:
+		neighbors, err := s.frr.GetOSPFNeighbors()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		var b strings.Builder
+		for _, n := range neighbors {
+			fmt.Fprintf(&b, "%-18s %-10s %-16s %-18s %s\n",
+				n.NeighborID, n.Priority, n.State, n.Address, n.Interface)
+		}
+		writeOK(w, TextResponse{Output: b.String()})
+	}
+}
+
+func (s *Server) bgpHandler(w http.ResponseWriter, r *http.Request) {
+	if s.frr == nil {
+		writeOK(w, TextResponse{Output: "FRR not available"})
+		return
+	}
+	typ := r.URL.Query().Get("type")
+	var b strings.Builder
+	switch typ {
+	case "routes":
+		routes, err := s.frr.GetBGPRoutes()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for _, route := range routes {
+			fmt.Fprintf(&b, "%-24s %-20s %s\n", route.Network, route.NextHop, route.Path)
+		}
+	default:
+		peers, err := s.frr.GetBGPSummary()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for _, p := range peers {
+			fmt.Fprintf(&b, "%-20s %-8s %-10s %-10s %-12s %s\n",
+				p.Neighbor, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State)
+		}
+	}
+	writeOK(w, TextResponse{Output: b.String()})
+}
+
+// --- IPsec handler ---
+
+func (s *Server) ipsecSAHandler(w http.ResponseWriter, _ *http.Request) {
+	if s.ipsec == nil {
+		writeOK(w, TextResponse{Output: "IPsec not available"})
+		return
+	}
+	sas, err := s.ipsec.GetSAStatus()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var b strings.Builder
+	for _, sa := range sas {
+		fmt.Fprintf(&b, "SA: %s  State: %s", sa.Name, sa.State)
+		if sa.LocalAddr != "" {
+			fmt.Fprintf(&b, "  Local: %s", sa.LocalAddr)
+		}
+		if sa.RemoteAddr != "" {
+			fmt.Fprintf(&b, "  Remote: %s", sa.RemoteAddr)
+		}
+		b.WriteString("\n")
+	}
+	writeOK(w, TextResponse{Output: b.String()})
+}
+
+// --- NAT pool/rule stats handlers ---
+
+func (s *Server) natPoolStatsHandler(w http.ResponseWriter, _ *http.Request) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		writeOK(w, []NATPoolStatsInfo{})
+		return
+	}
+
+	var result []NATPoolStatsInfo
+
+	// Named pools
+	for name, pool := range cfg.Security.NAT.SourcePools {
+		portLow, portHigh := pool.PortLow, pool.PortHigh
+		if portLow == 0 {
+			portLow = 1024
+		}
+		if portHigh == 0 {
+			portHigh = 65535
+		}
+		totalPorts := (portHigh - portLow + 1) * len(pool.Addresses)
+		used := 0
+
+		if s.dp != nil && s.dp.IsLoaded() {
+			if cr := s.dp.LastCompileResult(); cr != nil {
+				if id, ok := cr.PoolIDs[name]; ok {
+					cnt, err := s.dp.ReadNATPortCounter(uint32(id))
+					if err == nil {
+						used = int(cnt)
+					}
+				}
+			}
+		}
+
+		avail := totalPorts - used
+		if avail < 0 {
+			avail = 0
+		}
+		util := "0.0%"
+		if totalPorts > 0 {
+			util = fmt.Sprintf("%.1f%%", float64(used)/float64(totalPorts)*100)
+		}
+
+		result = append(result, NATPoolStatsInfo{
+			Name:           name,
+			Address:        strings.Join(pool.Addresses, ","),
+			TotalPorts:     totalPorts,
+			UsedPorts:      used,
+			AvailablePorts: avail,
+			Utilization:    util,
+		})
+	}
+
+	// Interface-mode pools
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			if rule.Then.Interface {
+				used := 0
+				if s.dp != nil && s.dp.IsLoaded() {
+					_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+						if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+							used++
+						}
+						return true
+					})
+				}
+				result = append(result, NATPoolStatsInfo{
+					Name:        fmt.Sprintf("%s->%s", rs.FromZone, rs.ToZone),
+					Address:     "interface",
+					UsedPorts:   used,
+					IsInterface: true,
+				})
+			}
+		}
+	}
+
+	if result == nil {
+		result = []NATPoolStatsInfo{}
+	}
+	writeOK(w, result)
+}
+
+func (s *Server) natRuleStatsHandler(w http.ResponseWriter, r *http.Request) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		writeOK(w, []NATRuleStatsInfo{})
+		return
+	}
+
+	ruleSetFilter := r.URL.Query().Get("rule_set")
+	var result []NATRuleStatsInfo
+
+	for _, rs := range cfg.Security.NAT.Source {
+		if ruleSetFilter != "" && rs.Name != ruleSetFilter {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			action := "interface"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			}
+			srcMatch := "0.0.0.0/0"
+			if rule.Match.SourceAddress != "" {
+				srcMatch = rule.Match.SourceAddress
+			}
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+
+			var hitPkts, hitBytes uint64
+			if s.dp != nil && s.dp.IsLoaded() {
+				if cr := s.dp.LastCompileResult(); cr != nil {
+					ruleKey := rs.Name + "/" + rule.Name
+					if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
+						cnt, err := s.dp.ReadNATRuleCounter(uint32(cid))
+						if err == nil {
+							hitPkts = cnt.Packets
+							hitBytes = cnt.Bytes
+						}
+					}
+				}
+			}
+
+			result = append(result, NATRuleStatsInfo{
+				RuleSet:    rs.Name,
+				RuleName:   rule.Name,
+				FromZone:   rs.FromZone,
+				ToZone:     rs.ToZone,
+				Action:     action,
+				SrcMatch:   srcMatch,
+				DstMatch:   dstMatch,
+				HitPackets: hitPkts,
+				HitBytes:   hitBytes,
+			})
+		}
+	}
+
+	if result == nil {
+		result = []NATRuleStatsInfo{}
+	}
+	writeOK(w, result)
+}
+
+// --- VRRP handler ---
+
+func (s *Server) vrrpHandler(w http.ResponseWriter, _ *http.Request) {
+	cfg := s.store.ActiveConfig()
+	resp := VRRPStatusResponse{
+		Instances: []VRRPInstanceInfo{},
+	}
+
+	if cfg != nil {
+		instances := vrrp.CollectInstances(cfg)
+		for _, inst := range instances {
+			addrs := inst.VirtualAddresses
+			if addrs == nil {
+				addrs = []string{}
+			}
+			resp.Instances = append(resp.Instances, VRRPInstanceInfo{
+				Interface:        inst.Interface,
+				GroupID:          inst.GroupID,
+				State:            "BACKUP",
+				Priority:         inst.Priority,
+				VirtualAddresses: addrs,
+				Preempt:          inst.Preempt,
+			})
+		}
+	}
+
+	svcStatus, _ := vrrp.Status()
+	resp.ServiceStatus = svcStatus
+	writeOK(w, resp)
+}
+
+// --- Policy match handler ---
+
+func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		writeOK(w, MatchPoliciesResult{Action: "deny (default)"})
+		return
+	}
+
+	fromZone := r.URL.Query().Get("from_zone")
+	toZone := r.URL.Query().Get("to_zone")
+	srcIP := net.ParseIP(r.URL.Query().Get("src_ip"))
+	dstIP := net.ParseIP(r.URL.Query().Get("dst_ip"))
+	dstPort := queryInt(r, "dst_port", 0)
+	proto := r.URL.Query().Get("protocol")
+
+	for _, zpp := range cfg.Security.Policies {
+		if zpp.FromZone != fromZone || zpp.ToZone != toZone {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if !matchPolicyAddr(pol.Match.SourceAddresses, srcIP, cfg) {
+				continue
+			}
+			if !matchPolicyAddr(pol.Match.DestinationAddresses, dstIP, cfg) {
+				continue
+			}
+			if !matchPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
+				continue
+			}
+
+			writeOK(w, MatchPoliciesResult{
+				Matched:      true,
+				PolicyName:   pol.Name,
+				Action:       policyActionStr(pol.Action),
+				SrcAddresses: pol.Match.SourceAddresses,
+				DstAddresses: pol.Match.DestinationAddresses,
+				Applications: pol.Match.Applications,
+			})
+			return
+		}
+	}
+
+	writeOK(w, MatchPoliciesResult{Action: "deny (default)"})
+}
+
+// matchPolicyAddr checks if an IP matches any address references.
+func matchPolicyAddr(addrs []string, ip net.IP, cfg *config.Config) bool {
+	if len(addrs) == 0 || ip == nil {
+		return true
+	}
+	for _, a := range addrs {
+		if a == "any" {
+			return true
+		}
+		if cfg.Security.AddressBook == nil {
+			continue
+		}
+		if addr, ok := cfg.Security.AddressBook.Addresses[a]; ok {
+			_, cidr, err := net.ParseCIDR(addr.Value)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		}
+		if matchPolicyAddrSet(a, ip, cfg, 0) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchPolicyAddrSet(setName string, ip net.IP, cfg *config.Config, depth int) bool {
+	if depth > 5 || cfg.Security.AddressBook == nil {
+		return false
+	}
+	as, ok := cfg.Security.AddressBook.AddressSets[setName]
+	if !ok {
+		return false
+	}
+	for _, addrName := range as.Addresses {
+		if addr, ok := cfg.Security.AddressBook.Addresses[addrName]; ok {
+			_, cidr, err := net.ParseCIDR(addr.Value)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		}
+	}
+	for _, nested := range as.AddressSets {
+		if matchPolicyAddrSet(nested, ip, cfg, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchPolicyApp checks if a protocol/port matches application references.
+func matchPolicyApp(apps []string, proto string, dstPort int, cfg *config.Config) bool {
+	if len(apps) == 0 || proto == "" {
+		return true
+	}
+	for _, a := range apps {
+		if a == "any" {
+			return true
+		}
+		if matchSingleApp(a, proto, dstPort, cfg) {
+			return true
+		}
+		if cfg.Applications.ApplicationSets != nil {
+			if as, ok := cfg.Applications.ApplicationSets[a]; ok {
+				for _, appRef := range as.Applications {
+					if matchSingleApp(appRef, proto, dstPort, cfg) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func matchSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool {
+	if cfg.Applications.Applications == nil {
+		return false
+	}
+	app, ok := cfg.Applications.Applications[appName]
+	if !ok {
+		return false
+	}
+	if app.Protocol != "" && !strings.EqualFold(app.Protocol, proto) {
+		return false
+	}
+	if app.DestinationPort != "" && dstPort > 0 {
+		if strings.Contains(app.DestinationPort, "-") {
+			parts := strings.SplitN(app.DestinationPort, "-", 2)
+			lo, _ := strconv.Atoi(parts[0])
+			hi, _ := strconv.Atoi(parts[1])
+			if dstPort < lo || dstPort > hi {
+				return false
+			}
+		} else {
+			p, _ := strconv.Atoi(app.DestinationPort)
+			if p != dstPort {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// --- Interfaces detail handler ---
+
+func (s *Server) interfacesDetailHandler(w http.ResponseWriter, r *http.Request) {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		writeOK(w, TextResponse{Output: "no active configuration\n"})
+		return
+	}
+
+	filterName := r.URL.Query().Get("filter")
+	terse := r.URL.Query().Get("terse") == "true"
+
+	if terse {
+		s.writeInterfacesTerse(w, cfg, filterName)
+		return
+	}
+
+	s.writeInterfacesDetail(w, cfg, filterName)
+}
+
+func (s *Server) writeInterfacesTerse(w http.ResponseWriter, cfg *config.Config, filterName string) {
+	ifaceZoneName := make(map[string]string)
+	for name, zone := range cfg.Security.Zones {
+		for _, ifName := range zone.Interfaces {
+			ifaceZoneName[ifName] = name
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%-20s %-10s %-10s %s\n", "Interface", "Admin", "Link", "Addresses")
+
+	var ifNames []string
+	for ifName := range allInterfaceNames(cfg) {
+		if filterName != "" && !strings.HasPrefix(ifName, filterName) {
+			continue
+		}
+		ifNames = append(ifNames, ifName)
+	}
+	sort.Strings(ifNames)
+
+	for _, ifName := range ifNames {
+		iface, err := net.InterfaceByName(ifName)
+		admin, link := "down", "down"
+		var addrs []string
+		if err == nil {
+			if iface.Flags&net.FlagUp != 0 {
+				admin = "up"
+			}
+			if data, err := os.ReadFile("/sys/class/net/" + ifName + "/operstate"); err == nil {
+				if strings.TrimSpace(string(data)) == "up" {
+					link = "up"
+				}
+			}
+			if ifAddrs, err := iface.Addrs(); err == nil {
+				for _, a := range ifAddrs {
+					addrs = append(addrs, a.String())
+				}
+			}
+		}
+		addrStr := strings.Join(addrs, ", ")
+		if addrStr == "" {
+			addrStr = "-"
+		}
+		fmt.Fprintf(&b, "%-20s %-10s %-10s %s\n", ifName, admin, link, addrStr)
+	}
+
+	writeOK(w, TextResponse{Output: b.String()})
+}
+
+func (s *Server) writeInterfacesDetail(w http.ResponseWriter, cfg *config.Config, filterName string) {
+	ifaceZoneName := make(map[string]string)
+	for name, zone := range cfg.Security.Zones {
+		for _, ifName := range zone.Interfaces {
+			ifaceZoneName[ifName] = name
+		}
+	}
+
+	var b strings.Builder
+	var ifNames []string
+	for ifName := range allInterfaceNames(cfg) {
+		if filterName != "" && !strings.HasPrefix(ifName, filterName) {
+			continue
+		}
+		ifNames = append(ifNames, ifName)
+	}
+	sort.Strings(ifNames)
+
+	for _, ifName := range ifNames {
+		iface, err := net.InterfaceByName(ifName)
+		if err != nil {
+			fmt.Fprintf(&b, "Interface: %s, Not present\n\n", ifName)
+			continue
+		}
+
+		linkUp := "Down"
+		if iface.Flags&net.FlagUp != 0 {
+			linkUp = "Up"
+		}
+		if data, err := os.ReadFile("/sys/class/net/" + ifName + "/operstate"); err == nil {
+			if strings.TrimSpace(string(data)) == "up" {
+				linkUp = "Up"
+			}
+		}
+
+		fmt.Fprintf(&b, "Interface: %s, Physical link is %s\n", ifName, linkUp)
+		fmt.Fprintf(&b, "  MTU: %d", iface.MTU)
+		if len(iface.HardwareAddr) > 0 {
+			fmt.Fprintf(&b, ", MAC: %s", iface.HardwareAddr)
+		}
+		b.WriteString("\n")
+
+		if zone, ok := ifaceZoneName[ifName]; ok {
+			fmt.Fprintf(&b, "  Zone: %s\n", zone)
+		}
+
+		if s.dp != nil && s.dp.IsLoaded() {
+			if ctrs, err := s.dp.ReadInterfaceCounters(iface.Index); err == nil && (ctrs.RxPackets > 0 || ctrs.TxPackets > 0) {
+				fmt.Fprintf(&b, "  BPF Input:  %d packets, %d bytes\n", ctrs.RxPackets, ctrs.RxBytes)
+				fmt.Fprintf(&b, "  BPF Output: %d packets, %d bytes\n", ctrs.TxPackets, ctrs.TxBytes)
+			}
+		}
+
+		if addrs, err := iface.Addrs(); err == nil && len(addrs) > 0 {
+			fmt.Fprintf(&b, "  Addresses:\n")
+			for _, a := range addrs {
+				fmt.Fprintf(&b, "    %s\n", a.String())
+			}
+		}
+
+		// DHCP annotations
+		if s.dhcp != nil {
+			if lease := s.dhcp.LeaseFor(ifName, dhcp.AFInet); lease != nil {
+				fmt.Fprintf(&b, "  DHCPv4: %s (gw %s)\n", lease.Address, lease.Gateway)
+			}
+			if lease := s.dhcp.LeaseFor(ifName, dhcp.AFInet6); lease != nil {
+				fmt.Fprintf(&b, "  DHCPv6: %s (gw %s)\n", lease.Address, lease.Gateway)
+			}
+		}
+
+		b.WriteString("\n")
+	}
+
+	writeOK(w, TextResponse{Output: b.String()})
+}
+
+// --- System info handler ---
+
+func (s *Server) systemInfoHandler(w http.ResponseWriter, r *http.Request) {
+	typ := r.URL.Query().Get("type")
+	var b strings.Builder
+
+	switch typ {
+	case "uptime":
+		data, err := os.ReadFile("/proc/uptime")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) < 1 {
+			writeError(w, http.StatusInternalServerError, "unexpected /proc/uptime format")
+			return
+		}
+		var upSec float64
+		fmt.Sscanf(fields[0], "%f", &upSec)
+
+		days := int(upSec) / 86400
+		hours := (int(upSec) % 86400) / 3600
+		mins := (int(upSec) % 3600) / 60
+		secs := int(upSec) % 60
+
+		now := time.Now()
+		fmt.Fprintf(&b, "Current time: %s\n", now.Format("2006-01-02 15:04:05 MST"))
+		fmt.Fprintf(&b, "System booted: %s\n", now.Add(-time.Duration(upSec)*time.Second).Format("2006-01-02 15:04:05 MST"))
+		fmt.Fprintf(&b, "Daemon uptime: %s\n", time.Since(s.startTime).Truncate(time.Second))
+		if days > 0 {
+			fmt.Fprintf(&b, "System uptime: %d days, %d hours, %d minutes, %d seconds\n", days, hours, mins, secs)
+		} else {
+			fmt.Fprintf(&b, "System uptime: %d hours, %d minutes, %d seconds\n", hours, mins, secs)
+		}
+
+	case "memory":
+		data, err := os.ReadFile("/proc/meminfo")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		info := make(map[string]uint64)
+		for _, line := range strings.Split(string(data), "\n") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				key := strings.TrimSuffix(parts[0], ":")
+				val, _ := strconv.ParseUint(parts[1], 10, 64)
+				info[key] = val
+			}
+		}
+		total := info["MemTotal"]
+		free := info["MemFree"]
+		buffers := info["Buffers"]
+		cached := info["Cached"]
+		available := info["MemAvailable"]
+		used := total - free - buffers - cached
+
+		fmt.Fprintf(&b, "%-20s %10s\n", "Type", "kB")
+		fmt.Fprintf(&b, "%-20s %10d\n", "Total memory", total)
+		fmt.Fprintf(&b, "%-20s %10d\n", "Used memory", used)
+		fmt.Fprintf(&b, "%-20s %10d\n", "Free memory", free)
+		fmt.Fprintf(&b, "%-20s %10d\n", "Buffers", buffers)
+		fmt.Fprintf(&b, "%-20s %10d\n", "Cached", cached)
+		fmt.Fprintf(&b, "%-20s %10d\n", "Available", available)
+		if total > 0 {
+			fmt.Fprintf(&b, "Utilization: %.1f%%\n", float64(used)/float64(total)*100)
+		}
+
+	default:
+		writeError(w, http.StatusBadRequest, "type parameter required (uptime, memory)")
+		return
+	}
+
+	writeOK(w, TextResponse{Output: b.String()})
+}
+
+// --- DHCP identifiers handler ---
+
+func (s *Server) dhcpIdentifiersHandler(w http.ResponseWriter, _ *http.Request) {
+	if s.dhcp == nil {
+		writeOK(w, []DHCPClientIdentifierInfo{})
+		return
+	}
+
+	duids := s.dhcp.DUIDs()
+	result := make([]DHCPClientIdentifierInfo, len(duids))
+	for i, d := range duids {
+		result[i] = DHCPClientIdentifierInfo{
+			Interface: d.Interface,
+			Type:      d.Type,
+			Display:   d.Display,
+			Hex:       d.HexBytes,
+		}
+	}
+	writeOK(w, result)
+}
+
+// --- Mutation handlers ---
+
+func (s *Server) clearSessionsHandler(w http.ResponseWriter, _ *http.Request) {
+	if s.dp == nil || !s.dp.IsLoaded() {
+		writeError(w, http.StatusServiceUnavailable, "dataplane not loaded")
+		return
+	}
+	v4, v6, err := s.dp.ClearAllSessions()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeOK(w, ClearSessionsResult{IPv4Cleared: v4, IPv6Cleared: v6})
+}
+
+func (s *Server) clearCountersHandler(w http.ResponseWriter, _ *http.Request) {
+	if s.dp == nil || !s.dp.IsLoaded() {
+		writeError(w, http.StatusServiceUnavailable, "dataplane not loaded")
+		return
+	}
+	if err := s.dp.ClearAllCounters(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeOK(w, map[string]string{"status": "ok"})
+}
+
+// --- Diagnostic handlers ---
+
+func (s *Server) pingHandler(w http.ResponseWriter, r *http.Request) {
+	var req PingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Target == "" {
+		writeError(w, http.StatusBadRequest, "target required")
+		return
+	}
+
+	count := req.Count
+	if count <= 0 {
+		count = 5
+	}
+	if count > 100 {
+		count = 100
+	}
+
+	args := []string{"-c", fmt.Sprintf("%d", count)}
+	if req.Source != "" {
+		args = append(args, "-I", req.Source)
+	}
+	if req.Size > 0 {
+		args = append(args, "-s", fmt.Sprintf("%d", req.Size))
+	}
+	args = append(args, req.Target)
+
+	var cmd []string
+	if req.RoutingInstance != "" {
+		cmd = append(cmd, "ip", "vrf", "exec", req.RoutingInstance)
+	}
+	cmd = append(cmd, "ping")
+	cmd = append(cmd, args...)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput()
+	output := string(out)
+	if err != nil {
+		output += "\n" + err.Error()
+	}
+	writeOK(w, TextResponse{Output: output})
+}
+
+func (s *Server) tracerouteHandler(w http.ResponseWriter, r *http.Request) {
+	var req TracerouteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Target == "" {
+		writeError(w, http.StatusBadRequest, "target required")
+		return
+	}
+
+	args := []string{}
+	if req.Source != "" {
+		args = append(args, "-s", req.Source)
+	}
+	args = append(args, req.Target)
+
+	var cmd []string
+	if req.RoutingInstance != "" {
+		cmd = append(cmd, "ip", "vrf", "exec", req.RoutingInstance)
+	}
+	cmd = append(cmd, "traceroute")
+	cmd = append(cmd, args...)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput()
+	output := string(out)
+	if err != nil {
+		output += "\n" + err.Error()
+	}
+	writeOK(w, TextResponse{Output: output})
 }

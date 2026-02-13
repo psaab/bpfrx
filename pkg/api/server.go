@@ -85,8 +85,40 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("GET /api/v1/security/events", s.eventsHandler)
 	mux.HandleFunc("GET /api/v1/interfaces", s.interfacesHandler)
 	mux.HandleFunc("GET /api/v1/dhcp/leases", s.dhcpLeasesHandler)
+	mux.HandleFunc("GET /api/v1/dhcp/identifiers", s.dhcpIdentifiersHandler)
 	mux.HandleFunc("GET /api/v1/routes", s.routesHandler)
 	mux.HandleFunc("GET /api/v1/config", s.configHandler)
+
+	// Routing protocols
+	mux.HandleFunc("GET /api/v1/routing/ospf", s.ospfHandler)
+	mux.HandleFunc("GET /api/v1/routing/bgp", s.bgpHandler)
+
+	// IPsec
+	mux.HandleFunc("GET /api/v1/security/ipsec/sa", s.ipsecSAHandler)
+
+	// NAT stats
+	mux.HandleFunc("GET /api/v1/security/nat/pools", s.natPoolStatsHandler)
+	mux.HandleFunc("GET /api/v1/security/nat/rules", s.natRuleStatsHandler)
+
+	// VRRP
+	mux.HandleFunc("GET /api/v1/security/vrrp", s.vrrpHandler)
+
+	// Policy match
+	mux.HandleFunc("GET /api/v1/security/match", s.matchPoliciesHandler)
+
+	// Interfaces detail
+	mux.HandleFunc("GET /api/v1/interfaces/detail", s.interfacesDetailHandler)
+
+	// System info
+	mux.HandleFunc("GET /api/v1/system/info", s.systemInfoHandler)
+
+	// Mutations
+	mux.HandleFunc("POST /api/v1/security/sessions/clear", s.clearSessionsHandler)
+	mux.HandleFunc("POST /api/v1/security/counters/clear", s.clearCountersHandler)
+
+	// Diagnostics
+	mux.HandleFunc("POST /api/v1/diagnostics/ping", s.pingHandler)
+	mux.HandleFunc("POST /api/v1/diagnostics/traceroute", s.tracerouteHandler)
 
 	s.httpServer = &http.Server{
 		Addr:    cfg.Addr,

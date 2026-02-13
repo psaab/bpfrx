@@ -168,6 +168,91 @@ type RouteInfo struct {
 
 // ScreenInfo holds screen profile information.
 type ScreenInfo struct {
-	Name    string   `json:"name"`
-	Checks  []string `json:"checks"`
+	Name   string   `json:"name"`
+	Checks []string `json:"checks"`
+}
+
+// TextResponse wraps text output from commands.
+type TextResponse struct {
+	Output string `json:"output"`
+}
+
+// NATPoolStatsInfo holds NAT pool statistics.
+type NATPoolStatsInfo struct {
+	Name           string `json:"name"`
+	Address        string `json:"address"`
+	TotalPorts     int    `json:"total_ports"`
+	UsedPorts      int    `json:"used_ports"`
+	AvailablePorts int    `json:"available_ports"`
+	Utilization    string `json:"utilization"`
+	IsInterface    bool   `json:"is_interface,omitempty"`
+}
+
+// NATRuleStatsInfo holds NAT rule counters.
+type NATRuleStatsInfo struct {
+	RuleSet     string `json:"rule_set"`
+	RuleName    string `json:"rule_name"`
+	FromZone    string `json:"from_zone"`
+	ToZone      string `json:"to_zone"`
+	Action      string `json:"action"`
+	SrcMatch    string `json:"source_match"`
+	DstMatch    string `json:"destination_match"`
+	HitPackets  uint64 `json:"hit_packets"`
+	HitBytes    uint64 `json:"hit_bytes"`
+}
+
+// VRRPInstanceInfo holds VRRP instance information.
+type VRRPInstanceInfo struct {
+	Interface        string   `json:"interface"`
+	GroupID          int      `json:"group_id"`
+	State            string   `json:"state"`
+	Priority         int      `json:"priority"`
+	VirtualAddresses []string `json:"virtual_addresses"`
+	Preempt          bool     `json:"preempt"`
+}
+
+// VRRPStatusResponse holds VRRP status.
+type VRRPStatusResponse struct {
+	Instances     []VRRPInstanceInfo `json:"instances"`
+	ServiceStatus string             `json:"service_status"`
+}
+
+// MatchPoliciesResult holds policy match results.
+type MatchPoliciesResult struct {
+	Matched      bool     `json:"matched"`
+	PolicyName   string   `json:"policy_name,omitempty"`
+	Action       string   `json:"action"`
+	SrcAddresses []string `json:"src_addresses,omitempty"`
+	DstAddresses []string `json:"dst_addresses,omitempty"`
+	Applications []string `json:"applications,omitempty"`
+}
+
+// ClearSessionsResult holds session clear results.
+type ClearSessionsResult struct {
+	IPv4Cleared int `json:"ipv4_cleared"`
+	IPv6Cleared int `json:"ipv6_cleared"`
+}
+
+// DHCPClientIdentifierInfo holds DHCP client identifier information.
+type DHCPClientIdentifierInfo struct {
+	Interface string `json:"interface"`
+	Type      string `json:"type"`
+	Display   string `json:"display"`
+	Hex       string `json:"hex"`
+}
+
+// PingRequest holds parameters for a ping request.
+type PingRequest struct {
+	Target          string `json:"target"`
+	Count           int    `json:"count,omitempty"`
+	Source          string `json:"source,omitempty"`
+	Size            int    `json:"size,omitempty"`
+	RoutingInstance string `json:"routing_instance,omitempty"`
+}
+
+// TracerouteRequest holds parameters for a traceroute request.
+type TracerouteRequest struct {
+	Target          string `json:"target"`
+	Source          string `json:"source,omitempty"`
+	RoutingInstance string `json:"routing_instance,omitempty"`
 }
