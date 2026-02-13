@@ -782,6 +782,23 @@ func compileNAT64(node *Node, sec *SecurityConfig) error {
 	return nil
 }
 
+// parseZoneList extracts zone names from a from/to node.
+// Handles bracket lists: Keys=["from","zone","A","B","C"] → ["A","B","C"]
+// Handles single: Keys=["from","zone","A"] → ["A"]
+// Handles hierarchical: child zone node with value → ["A"]
+func parseZoneList(node *Node) []string {
+	if len(node.Keys) >= 3 && node.Keys[1] == "zone" {
+		return node.Keys[2:]
+	}
+	if zn := node.FindChild("zone"); zn != nil {
+		v := nodeVal(zn)
+		if v != "" {
+			return []string{v}
+		}
+	}
+	return nil
+}
+
 func compileNATSource(node *Node, sec *SecurityConfig) error {
 	// Parse source NAT pools
 	for _, inst := range namedInstances(node.FindChildren("pool")) {
@@ -839,27 +856,25 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 
 	// Parse source NAT rule-sets
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
-		rs := &NATRuleSet{Name: rsInst.name}
-
-		// Parse from/to zone
+		// Parse from/to zones (bracket lists produce multiple keys)
+		var fromZones, toZones []string
 		for _, child := range rsInst.node.Children {
 			if child.Name() == "from" {
-				if len(child.Keys) >= 3 && child.Keys[1] == "zone" {
-					rs.FromZone = child.Keys[2]
-				} else if zn := child.FindChild("zone"); zn != nil {
-					rs.FromZone = nodeVal(zn)
-				}
+				fromZones = append(fromZones, parseZoneList(child)...)
 			}
 			if child.Name() == "to" {
-				if len(child.Keys) >= 3 && child.Keys[1] == "zone" {
-					rs.ToZone = child.Keys[2]
-				} else if zn := child.FindChild("zone"); zn != nil {
-					rs.ToZone = nodeVal(zn)
-				}
+				toZones = append(toZones, parseZoneList(child)...)
 			}
 		}
+		if len(fromZones) == 0 {
+			fromZones = []string{""}
+		}
+		if len(toZones) == 0 {
+			toZones = []string{""}
+		}
 
-		// Parse rules
+		// Parse rules (shared across all zone-pair expansions)
+		var rules []*NATRule
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 			rule := &NATRule{Name: ruleInst.name}
 
@@ -877,6 +892,8 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 								rule.Match.DestinationPort = n
 							}
 						}
+					case "application":
+						rule.Match.Application = nodeVal(m)
 					}
 				}
 			}
@@ -886,16 +903,25 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 				for _, t := range thenNode.Children {
 					if t.Name() == "source-nat" {
 						if len(t.Keys) >= 2 {
-							if t.Keys[1] == "interface" {
+							switch t.Keys[1] {
+							case "interface":
 								rule.Then.Type = NATSource
 								rule.Then.Interface = true
-							} else if t.Keys[1] == "pool" && len(t.Keys) >= 3 {
+							case "off":
 								rule.Then.Type = NATSource
-								rule.Then.PoolName = t.Keys[2]
+								rule.Then.Off = true
+							case "pool":
+								rule.Then.Type = NATSource
+								if len(t.Keys) >= 3 {
+									rule.Then.PoolName = t.Keys[2]
+								}
 							}
 						} else if t.FindChild("interface") != nil {
 							rule.Then.Type = NATSource
 							rule.Then.Interface = true
+						} else if t.FindChild("off") != nil {
+							rule.Then.Type = NATSource
+							rule.Then.Off = true
 						} else if poolNode := t.FindChild("pool"); poolNode != nil {
 							rule.Then.Type = NATSource
 							rule.Then.PoolName = nodeVal(poolNode)
@@ -904,10 +930,21 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 				}
 			}
 
-			rs.Rules = append(rs.Rules, rule)
+			rules = append(rules, rule)
 		}
 
-		sec.NAT.Source = append(sec.NAT.Source, rs)
+		// Expand Cartesian product of from-zones × to-zones
+		for _, fz := range fromZones {
+			for _, tz := range toZones {
+				rs := &NATRuleSet{
+					Name:     rsInst.name,
+					FromZone: fz,
+					ToZone:   tz,
+					Rules:    rules,
+				}
+				sec.NAT.Source = append(sec.NAT.Source, rs)
+			}
+		}
 	}
 	return nil
 }
@@ -941,25 +978,24 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 
 	// Parse rule-sets
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
-		rs := &NATRuleSet{Name: rsInst.name}
-
+		// Parse from/to zones (bracket lists produce multiple keys)
+		var fromZones, toZones []string
 		for _, child := range rsInst.node.Children {
 			if child.Name() == "from" {
-				if len(child.Keys) >= 3 && child.Keys[1] == "zone" {
-					rs.FromZone = child.Keys[2]
-				} else if zn := child.FindChild("zone"); zn != nil {
-					rs.FromZone = nodeVal(zn)
-				}
+				fromZones = append(fromZones, parseZoneList(child)...)
 			}
 			if child.Name() == "to" {
-				if len(child.Keys) >= 3 && child.Keys[1] == "zone" {
-					rs.ToZone = child.Keys[2]
-				} else if zn := child.FindChild("zone"); zn != nil {
-					rs.ToZone = nodeVal(zn)
-				}
+				toZones = append(toZones, parseZoneList(child)...)
 			}
 		}
+		if len(fromZones) == 0 {
+			fromZones = []string{""}
+		}
+		if len(toZones) == 0 {
+			toZones = []string{""}
+		}
 
+		var rules []*NATRule
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 			rule := &NATRule{Name: ruleInst.name}
 
@@ -979,6 +1015,8 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 						rule.Match.SourceAddress = nodeVal(m)
 					case "protocol":
 						rule.Match.Protocol = nodeVal(m)
+					case "application":
+						rule.Match.Application = nodeVal(m)
 					}
 				}
 			}
@@ -998,30 +1036,40 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 				}
 			}
 
-			rs.Rules = append(rs.Rules, rule)
+			rules = append(rules, rule)
 		}
 
-		sec.NAT.Destination.RuleSets = append(sec.NAT.Destination.RuleSets, rs)
+		// Expand Cartesian product of from-zones × to-zones
+		for _, fz := range fromZones {
+			for _, tz := range toZones {
+				rs := &NATRuleSet{
+					Name:     rsInst.name,
+					FromZone: fz,
+					ToZone:   tz,
+					Rules:    rules,
+				}
+				sec.NAT.Destination.RuleSets = append(sec.NAT.Destination.RuleSets, rs)
+			}
+		}
 	}
 	return nil
 }
 
 func compileNATStatic(node *Node, sec *SecurityConfig) error {
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
-		rs := &StaticNATRuleSet{Name: rsInst.name}
-
-		// Parse from zone
+		// Parse from zones (bracket lists produce multiple keys)
+		var fromZones []string
 		for _, child := range rsInst.node.Children {
 			if child.Name() == "from" {
-				if len(child.Keys) >= 3 && child.Keys[1] == "zone" {
-					rs.FromZone = child.Keys[2]
-				} else if zn := child.FindChild("zone"); zn != nil {
-					rs.FromZone = nodeVal(zn)
-				}
+				fromZones = append(fromZones, parseZoneList(child)...)
 			}
 		}
+		if len(fromZones) == 0 {
+			fromZones = []string{""}
+		}
 
-		// Parse rules
+		// Parse rules (shared across all zone expansions)
+		var rules []*StaticNATRule
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 			rule := &StaticNATRule{Name: ruleInst.name}
 
@@ -1047,10 +1095,18 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 				}
 			}
 
-			rs.Rules = append(rs.Rules, rule)
+			rules = append(rules, rule)
 		}
 
-		sec.NAT.Static = append(sec.NAT.Static, rs)
+		// Expand for each from-zone
+		for _, fz := range fromZones {
+			rs := &StaticNATRuleSet{
+				Name:     rsInst.name,
+				FromZone: fz,
+				Rules:    rules,
+			}
+			sec.NAT.Static = append(sec.NAT.Static, rs)
+		}
 	}
 	return nil
 }

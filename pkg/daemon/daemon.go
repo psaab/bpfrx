@@ -523,13 +523,15 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// 3. Apply all routes + dynamic protocols via FRR
 	if d.frr != nil {
 		fc := &frr.FullConfig{
-			OSPF:          cfg.Protocols.OSPF,
-			BGP:           cfg.Protocols.BGP,
-			RIP:           cfg.Protocols.RIP,
-			ISIS:          cfg.Protocols.ISIS,
-			StaticRoutes:  cfg.RoutingOptions.StaticRoutes,
-			DHCPRoutes:    d.collectDHCPRoutes(),
-			PolicyOptions: &cfg.PolicyOptions,
+			OSPF:            cfg.Protocols.OSPF,
+			BGP:             cfg.Protocols.BGP,
+			RIP:             cfg.Protocols.RIP,
+			ISIS:            cfg.Protocols.ISIS,
+			StaticRoutes:    cfg.RoutingOptions.StaticRoutes,
+			DHCPRoutes:      d.collectDHCPRoutes(),
+			PolicyOptions:   &cfg.PolicyOptions,
+			BackupRouter:    cfg.System.BackupRouter,
+			BackupRouterDst: cfg.System.BackupRouterDst,
 		}
 		for _, ri := range cfg.RoutingInstances {
 			fc.Instances = append(fc.Instances, frr.InstanceConfig{
@@ -736,7 +738,12 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 		}
 	}
 
-	// 3. DNAT pool addresses (destinations that will receive forwarded traffic)
+	// 3. Backup router next-hop
+	if cfg.System.BackupRouter != "" {
+		addByIP(cfg.System.BackupRouter)
+	}
+
+	// 4. DNAT pool addresses (destinations that will receive forwarded traffic)
 	if cfg.Security.NAT.Destination != nil {
 		for _, pool := range cfg.Security.NAT.Destination.Pools {
 			if pool.Address != "" {
@@ -745,7 +752,7 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 		}
 	}
 
-	// 4. Static NAT translated addresses (internal hosts receiving forwarded traffic)
+	// 5. Static NAT translated addresses (internal hosts receiving forwarded traffic)
 	for _, rs := range cfg.Security.NAT.Static {
 		for _, rule := range rs.Rules {
 			if rule.Then != "" {
@@ -754,7 +761,7 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 		}
 	}
 
-	// 5. Address-book host entries (known hosts referenced in policies).
+	// 6. Address-book host entries (known hosts referenced in policies).
 	// Only resolve host addresses (/32 for v4, /128 for v6) to avoid
 	// flooding entire subnets with ARP requests.
 	if cfg.Security.AddressBook != nil {

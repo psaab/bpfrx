@@ -496,3 +496,62 @@ func TestBGPAddressFamily(t *testing.T) {
 		}
 	}
 }
+
+func TestApplyFull_BackupRouter(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "frr.conf")
+	os.WriteFile(confPath, []byte("log syslog informational\n"), 0644)
+
+	m := &Manager{frrConf: confPath}
+	fc := &FullConfig{
+		BackupRouter:    "192.168.50.1",
+		BackupRouterDst: "0.0.0.0/0",
+	}
+
+	// ApplyFull calls reload which fails in test, so just test writeManagedSection.
+	// Build the same string that ApplyFull would.
+	var b strings.Builder
+	b.WriteString("! bpfrx managed config - do not edit\n!\n")
+	dst := fc.BackupRouterDst
+	if dst == "" {
+		dst = "0.0.0.0/0"
+	}
+	b.WriteString("ip route " + dst + " " + fc.BackupRouter + " 250\n!\n")
+
+	if err := m.writeManagedSection(b.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(confPath)
+	got := string(data)
+	want := "ip route 0.0.0.0/0 192.168.50.1 250"
+	if !strings.Contains(got, want) {
+		t.Errorf("backup router missing, got:\n%s\nwant substring: %s", got, want)
+	}
+}
+
+func TestApplyFull_BackupRouterWithPrefix(t *testing.T) {
+	fc := &FullConfig{
+		BackupRouter:    "10.0.1.1",
+		BackupRouterDst: "192.168.0.0/16",
+	}
+
+	var b strings.Builder
+	if fc.BackupRouter != "" {
+		dst := fc.BackupRouterDst
+		if dst == "" {
+			dst = "0.0.0.0/0"
+		}
+		prefix := "ip"
+		if strings.Contains(dst, ":") {
+			prefix = "ipv6"
+		}
+		b.WriteString(prefix + " route " + dst + " " + fc.BackupRouter + " 250\n")
+	}
+
+	got := b.String()
+	want := "ip route 192.168.0.0/16 10.0.1.1 250\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

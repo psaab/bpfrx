@@ -338,6 +338,7 @@ type NATPortCounter struct {
 
 const MaxNATPoolIPsPerPool = 8
 const MaxNATRuleCounters = 256
+const SNATModeOff = 0xFF // source-nat off: match but don't translate
 
 // Session flag constants.
 const (

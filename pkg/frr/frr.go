@@ -62,6 +62,11 @@ type FullConfig struct {
 	DHCPRoutes    []DHCPRoute
 	Instances     []InstanceConfig
 	PolicyOptions *config.PolicyOptionsConfig
+
+	// BackupRouter is the fallback default gateway (system backup-router).
+	// Installed with admin distance 250 so it's only used when all other defaults fail.
+	BackupRouter    string // next-hop IP (e.g. "192.168.50.1")
+	BackupRouterDst string // destination prefix (e.g. "192.168.0.0/16"), default "0.0.0.0/0"
 }
 
 // Apply generates an FRR config from OSPF/BGP settings and reloads FRR.
@@ -179,7 +184,7 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	}
 
 	hasContent := fc.OSPF != nil || fc.BGP != nil || fc.RIP != nil || fc.ISIS != nil ||
-		len(fc.StaticRoutes) > 0 || len(fc.DHCPRoutes) > 0
+		len(fc.StaticRoutes) > 0 || len(fc.DHCPRoutes) > 0 || fc.BackupRouter != ""
 	for _, inst := range fc.Instances {
 		if inst.OSPF != nil || inst.BGP != nil || inst.RIP != nil || inst.ISIS != nil || len(inst.StaticRoutes) > 0 {
 			hasContent = true
@@ -215,6 +220,20 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 				fmt.Fprintf(&b, "ip route 0.0.0.0/0 %s 200\n", dr.Gateway)
 			}
 		}
+		b.WriteString("!\n")
+	}
+
+	// Backup router: fallback default gateway with admin distance 250
+	if fc.BackupRouter != "" {
+		dst := fc.BackupRouterDst
+		if dst == "" {
+			dst = "0.0.0.0/0"
+		}
+		prefix := "ip"
+		if strings.Contains(dst, ":") {
+			prefix = "ipv6"
+		}
+		fmt.Fprintf(&b, "%s route %s %s 250\n", prefix, dst, fc.BackupRouter)
 		b.WriteString("!\n")
 	}
 

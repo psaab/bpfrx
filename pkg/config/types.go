@@ -504,6 +504,7 @@ type NATMatch struct {
 	DestinationAddress string
 	DestinationPort    int
 	Protocol           string // "tcp", "udp", or "" (auto)
+	Application        string // application name (e.g. "junos-http")
 }
 
 // NATThen defines the NAT translation action.
@@ -511,6 +512,7 @@ type NATThen struct {
 	Type        NATType
 	Interface   bool   // source-nat interface mode
 	PoolName    string // pool reference
+	Off         bool   // source-nat off (no-NAT exemption)
 }
 
 // NATType is the type of NAT.

@@ -436,10 +436,12 @@ struct snat_value {
 	__be32 snat_ip;
 	__u32  src_addr_id;  /* 0 = any */
 	__u32  dst_addr_id;  /* 0 = any */
-	__u8   mode;         /* pool ID */
+	__u8   mode;         /* pool ID, or SNAT_MODE_OFF (0xFF) for no-NAT exemption */
 	__u8   pad;
 	__u16  counter_id;   /* index into nat_rule_counters */
 };
+
+#define SNAT_MODE_OFF 0xFF  /* source-nat off: match but don't translate */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -480,7 +482,7 @@ struct snat_value_v6 {
 	__u8   snat_ip[16];
 	__u32  src_addr_id;  /* 0 = any */
 	__u32  dst_addr_id;  /* 0 = any */
-	__u8   mode;         /* pool ID */
+	__u8   mode;         /* pool ID, or SNAT_MODE_OFF for no-NAT exemption */
 	__u8   pad;
 	__u16  counter_id;   /* index into nat_rule_counters */
 };

@@ -1023,6 +1023,8 @@ int xdp_policy_prog(struct xdp_md *ctx)
 								&nat_rule_counters, &_cid);
 							if (_c) { _c->packets++; _c->bytes += meta->pkt_len; }
 						}
+
+						if (sv->mode != SNAT_MODE_OFF) {
 						/*
 						 * NAT port collision retry: try dnat_table
 						 * insertion first, retry with new allocation
@@ -1062,6 +1064,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 						sess_nat_flags |= SESS_FLAG_SNAT;
 						sess_nat_src_ip = alloc_ip;
 						sess_nat_src_port = alloc_port;
+						} /* !SNAT_MODE_OFF */
 					}
 				}
 
@@ -1225,6 +1228,8 @@ int xdp_policy_prog(struct xdp_md *ctx)
 								ncnt->bytes += meta->pkt_len;
 							}
 						}
+
+						if (sv6->mode != SNAT_MODE_OFF) {
 						/*
 						 * NAT port collision retry with
 						 * dnat_table_v6 insertion.
@@ -1263,6 +1268,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 						sess_nat_flags |= SESS_FLAG_SNAT;
 						sess_nat_src_port = alloc_port;
 						have_dynamic_snat = 1;
+						} /* !SNAT_MODE_OFF */
 					}
 				}
 
