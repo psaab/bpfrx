@@ -211,6 +211,59 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start SNMP agent if configured.
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.SNMP != nil && len(cfg.System.SNMP.Communities) > 0 {
 		d.snmpAgent = snmp.NewAgent(cfg.System.SNMP)
+		d.snmpAgent.SetIfDataFn(func() []snmp.IfData {
+			links, err := netlink.LinkList()
+			if err != nil {
+				return nil
+			}
+			var result []snmp.IfData
+			for _, link := range links {
+				attrs := link.Attrs()
+				if attrs.Name == "lo" {
+					continue
+				}
+				ifType := 6 // ethernetCsmacd
+				switch link.Type() {
+				case "vrf":
+					ifType = 53 // propVirtual
+				case "gre", "ip6tnl", "xfrm":
+					ifType = 131 // tunnel
+				case "veth":
+					ifType = 53
+				}
+				admin := 2 // down
+				if attrs.Flags&net.FlagUp != 0 {
+					admin = 1
+				}
+				oper := 2 // down
+				if attrs.OperState == netlink.OperUp || attrs.OperState == netlink.OperUnknown {
+					oper = 1
+				}
+				speed := uint32(0)
+				if attrs.TxQLen > 0 {
+					speed = 1000000000 // default 1Gbps
+				}
+				var stats *netlink.LinkStatistics
+				if attrs.Statistics != nil {
+					stats = attrs.Statistics
+				}
+				entry := snmp.IfData{
+					IfIndex:     attrs.Index,
+					IfDescr:     attrs.Name,
+					IfType:      ifType,
+					IfMtu:       attrs.MTU,
+					IfSpeed:     speed,
+					AdminStatus: admin,
+					OperStatus:  oper,
+				}
+				if stats != nil {
+					entry.InOctets = uint32(stats.RxBytes)
+					entry.OutOctets = uint32(stats.TxBytes)
+				}
+				result = append(result, entry)
+			}
+			return result
+		})
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -289,6 +342,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				return nil
 			},
 			ApplyFn: d.applyConfig,
+			Version: d.opts.Version,
 		})
 		wg.Add(1)
 		go func() {
@@ -304,6 +358,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	var runErr error
 	if isInteractive() {
 		shell := cli.New(d.store, d.dp, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp)
+		shell.SetVersion(d.opts.Version)
 		shell.SetRPMResultsFn(func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()

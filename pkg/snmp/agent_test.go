@@ -210,10 +210,16 @@ func TestFindNextOID(t *testing.T) {
 		t.Errorf("next after sysDescr should be sysObjectID, got %v", next)
 	}
 
-	// Asking for next after sysLocation (last in tree) should return nil
+	// Asking for next after sysLocation should return ifNumber
 	next = a.findNextOID(oidSysLocation)
+	if !oidEqual(next, oidIfNumber) {
+		t.Errorf("next after sysLocation should be ifNumber, got %v", next)
+	}
+
+	// With no ifDataFn, next after ifNumber should be nil (no ifTable entries)
+	next = a.findNextOID(oidIfNumber)
 	if next != nil {
-		t.Errorf("next after sysLocation should be nil, got %v", next)
+		t.Errorf("next after ifNumber with no interfaces should be nil, got %v", next)
 	}
 
 	// Asking for next with a prefix before all OIDs should return sysDescr
@@ -290,6 +296,83 @@ func TestGetOIDValue_Unknown(t *testing.T) {
 	val, _ := a.getOIDValue([]int{1, 3, 6, 1, 2, 1, 99, 0})
 	if val != nil {
 		t.Error("unknown OID should return nil")
+	}
+}
+
+func TestGetOIDValue_IfNumber(t *testing.T) {
+	a := NewAgent(&config.SNMPConfig{})
+	a.SetIfDataFn(func() []IfData {
+		return []IfData{
+			{IfIndex: 2, IfDescr: "trust0"},
+			{IfIndex: 3, IfDescr: "untrust0"},
+		}
+	})
+	val, tag := a.getOIDValue(oidIfNumber)
+	if tag != tagInteger {
+		t.Errorf("ifNumber tag = %d, want INTEGER", tag)
+	}
+	// Decode the integer value
+	encoded := berEncodeIntegerTLV(2)
+	decoded, _, _ := berDecodeInteger(encoded)
+	if decoded != 2 {
+		t.Errorf("ifNumber value decode check failed: got %d", decoded)
+	}
+	_ = val
+}
+
+func TestIfTableWalk(t *testing.T) {
+	a := NewAgent(&config.SNMPConfig{})
+	a.SetIfDataFn(func() []IfData {
+		return []IfData{
+			{IfIndex: 2, IfDescr: "trust0", IfType: 6, IfMtu: 1500, AdminStatus: 1, OperStatus: 1},
+			{IfIndex: 3, IfDescr: "untrust0", IfType: 6, IfMtu: 1500, AdminStatus: 1, OperStatus: 2},
+		}
+	})
+
+	// Walking from ifNumber should reach ifTable column 1, ifIndex 2
+	next := a.findNextOID(oidIfNumber)
+	// Should be 1.3.6.1.2.1.2.2.1.1.2 (ifIndex.2)
+	wantPrefix := append([]int{}, oidIfTablePrefix...)
+	wantFirst := append(wantPrefix, 1, 2)
+	if !oidEqual(next, wantFirst) {
+		t.Errorf("first ifTable entry should be ifIndex.2, got %v", next)
+	}
+
+	// Get value of ifDescr.2
+	ifDescrOID := append(append([]int{}, oidIfTablePrefix...), 2, 2)
+	val, tag := a.getOIDValue(ifDescrOID)
+	if tag != tagOctetString || string(val) != "trust0" {
+		t.Errorf("ifDescr.2 = %q (tag %d), want 'trust0'", val, tag)
+	}
+
+	// Get value of ifOperStatus.3 (untrust0 is down)
+	ifOperOID := append(append([]int{}, oidIfTablePrefix...), 8, 3)
+	val, tag = a.getOIDValue(ifOperOID)
+	if tag != tagInteger {
+		t.Errorf("ifOperStatus.3 tag = %d, want INTEGER", tag)
+	}
+	// Value 2 = down
+	decoded, _, _ := berDecodeInteger(berEncodeTLV(tagInteger, val))
+	if decoded != 2 {
+		t.Errorf("ifOperStatus.3 = %d, want 2 (down)", decoded)
+	}
+}
+
+func TestCounter32Encoding(t *testing.T) {
+	// 0 should encode to [0]
+	got := berEncodeCounter32(0)
+	if len(got) != 1 || got[0] != 0 {
+		t.Errorf("Counter32(0) = %v, want [0]", got)
+	}
+	// 255 should encode to [0, 255] (high bit set, needs leading zero)
+	got = berEncodeCounter32(255)
+	if len(got) != 2 || got[0] != 0 || got[1] != 255 {
+		t.Errorf("Counter32(255) = %v, want [0, 255]", got)
+	}
+	// 100 should encode to [100]
+	got = berEncodeCounter32(100)
+	if len(got) != 1 || got[0] != 100 {
+		t.Errorf("Counter32(100) = %v, want [100]", got)
 	}
 }
 

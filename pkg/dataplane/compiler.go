@@ -1610,6 +1610,9 @@ func (m *Manager) compileScreenProfiles(cfg *config.Config, result *CompileResul
 		if profile.TCP.SynFrag {
 			flags |= ScreenSynFrag
 		}
+		if profile.TCP.TearDrop {
+			flags |= ScreenTearDrop
+		}
 		if profile.TCP.SynFlood != nil && profile.TCP.SynFlood.AttackThreshold > 0 {
 			flags |= ScreenSynFlood
 			sc.SynFloodThresh = uint32(profile.TCP.SynFlood.AttackThreshold)

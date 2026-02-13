@@ -43,6 +43,7 @@ type CLI struct {
 	rpmResultsFn func() []*rpm.ProbeResult
 	hostname     string
 	username     string
+	version      string
 }
 
 // New creates a new CLI.
@@ -73,6 +74,11 @@ func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.Even
 // SetRPMResultsFn sets a callback for retrieving live RPM probe results.
 func (c *CLI) SetRPMResultsFn(fn func() []*rpm.ProbeResult) {
 	c.rpmResultsFn = fn
+}
+
+// SetVersion sets the software version string for show version.
+func (c *CLI) SetVersion(v string) {
+	c.version = v
 }
 
 // completionNode is a static command completion tree node.
@@ -756,10 +762,14 @@ func (c *CLI) handleShow(args []string) error {
 		fmt.Println("  interfaces       Show interface status")
 		fmt.Println("  protocols        Show protocol information")
 		fmt.Println("  system           Show system information")
+		fmt.Println("  version          Show software version")
 		return nil
 	}
 
 	switch args[0] {
+	case "version":
+		return c.showVersion()
+
 	case "chassis":
 		return c.showChassis(args[1:])
 
@@ -4506,6 +4516,25 @@ func fmtBytes(b uint64) string {
 	default:
 		return fmt.Sprintf("%dB", b)
 	}
+}
+
+// showVersion displays software version information.
+func (c *CLI) showVersion() error {
+	ver := c.version
+	if ver == "" {
+		ver = "dev"
+	}
+	fmt.Printf("bpfrx eBPF firewall %s\n", ver)
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err == nil {
+		sysname := strings.TrimRight(string(uts.Sysname[:]), "\x00")
+		release := strings.TrimRight(string(uts.Release[:]), "\x00")
+		machine := strings.TrimRight(string(uts.Machine[:]), "\x00")
+		nodename := strings.TrimRight(string(uts.Nodename[:]), "\x00")
+		fmt.Printf("Hostname: %s\n", nodename)
+		fmt.Printf("Kernel: %s %s (%s)\n", sysname, release, machine)
+	}
+	return nil
 }
 
 // showChassis shows hardware information (like Junos "show chassis hardware").

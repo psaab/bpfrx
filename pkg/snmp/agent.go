@@ -42,6 +42,12 @@ const (
 	maxPacketSize = 4096
 )
 
+// tagCounter32 is the ASN.1 application tag for Counter32.
+const tagCounter32 = 0x41
+
+// tagGauge32 is the ASN.1 application tag for Gauge32.
+const tagGauge32 = 0x42
+
 // OID constants for the system MIB group (1.3.6.1.2.1.1).
 var (
 	oidSysDescr    = []int{1, 3, 6, 1, 2, 1, 1, 1, 0}
@@ -51,25 +57,48 @@ var (
 	oidSysName     = []int{1, 3, 6, 1, 2, 1, 1, 5, 0}
 	oidSysLocation = []int{1, 3, 6, 1, 2, 1, 1, 6, 0}
 
-	// Ordered list of all OIDs we serve, for GETNEXT walking.
-	allOIDs = [][]int{
+	// ifNumber: 1.3.6.1.2.1.2.1.0
+	oidIfNumber = []int{1, 3, 6, 1, 2, 1, 2, 1, 0}
+
+	// ifTable column OIDs: 1.3.6.1.2.1.2.2.1.<col>.<ifIndex>
+	// Columns: 1=ifIndex, 2=ifDescr, 3=ifType, 4=ifMtu, 5=ifSpeed,
+	//          7=ifAdminStatus, 8=ifOperStatus, 10=ifInOctets, 16=ifOutOctets
+	oidIfTablePrefix = []int{1, 3, 6, 1, 2, 1, 2, 2, 1}
+
+	// Ordered list of static OIDs we serve, for GETNEXT walking.
+	staticOIDs = [][]int{
 		oidSysDescr,
 		oidSysObjectID,
 		oidSysUpTime,
 		oidSysContact,
 		oidSysName,
 		oidSysLocation,
+		oidIfNumber,
 	}
 
-	// The system MIB subtree root for walk boundary.
-	oidSystemPrefix = []int{1, 3, 6, 1, 2, 1, 1}
+	// ifTable columns we serve (sorted for GETNEXT).
+	ifTableColumns = []int{1, 2, 3, 4, 5, 7, 8, 10, 16}
 )
 
-// Agent is an SNMP v2c agent that serves the system MIB group.
+// IfData represents a single network interface for the SNMP ifTable.
+type IfData struct {
+	IfIndex     int
+	IfDescr     string
+	IfType      int // 6=ethernetCsmacd, 1=other, 131=tunnel, 53=propVirtual
+	IfMtu       int
+	IfSpeed     uint32 // bits per second
+	AdminStatus int    // 1=up, 2=down
+	OperStatus  int    // 1=up, 2=down
+	InOctets    uint32 // Counter32 (wraps at 2^32)
+	OutOctets   uint32 // Counter32 (wraps at 2^32)
+}
+
+// Agent is an SNMP v2c agent that serves the system MIB and ifTable.
 type Agent struct {
 	cfg       *config.SNMPConfig
 	conn      *net.UDPConn
 	startTime time.Time
+	ifDataFn  func() []IfData // callback for live interface data
 	mu        sync.Mutex
 	stopped   bool
 }
@@ -80,6 +109,21 @@ func NewAgent(cfg *config.SNMPConfig) *Agent {
 		cfg:       cfg,
 		startTime: time.Now(),
 	}
+}
+
+// SetIfDataFn sets the callback for retrieving interface data.
+func (a *Agent) SetIfDataFn(fn func() []IfData) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ifDataFn = fn
+}
+
+// getIfData returns sorted interface data from the callback, or nil.
+func (a *Agent) getIfData() []IfData {
+	if a.ifDataFn == nil {
+		return nil
+	}
+	return a.ifDataFn()
 }
 
 // Start begins listening for SNMP requests on UDP port 161.
@@ -303,6 +347,7 @@ func (a *Agent) isValidCommunity(community string) bool {
 
 // getOIDValue returns the encoded value and BER tag for a given OID.
 func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
+	// System MIB group
 	if oidEqual(oid, oidSysDescr) {
 		desc := "bpfrx eBPF firewall"
 		if a.cfg != nil && a.cfg.Description != "" {
@@ -311,7 +356,6 @@ func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
 		return []byte(desc), tagOctetString
 	}
 	if oidEqual(oid, oidSysObjectID) {
-		// Return a generic enterprise OID.
 		return berEncodeOID([]int{1, 3, 6, 1, 4, 1, 99999, 1}), tagObjectIdentifier
 	}
 	if oidEqual(oid, oidSysUpTime) {
@@ -340,17 +384,121 @@ func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
 		}
 		return []byte(location), tagOctetString
 	}
+
+	// interfaces.ifNumber
+	if oidEqual(oid, oidIfNumber) {
+		ifaces := a.getIfData()
+		return berEncodeIntegerValue(len(ifaces)), tagInteger
+	}
+
+	// ifTable: 1.3.6.1.2.1.2.2.1.<col>.<ifIndex>
+	if len(oid) == len(oidIfTablePrefix)+2 && oidHasPrefix(oid, oidIfTablePrefix) {
+		col := oid[len(oidIfTablePrefix)]
+		ifIdx := oid[len(oidIfTablePrefix)+1]
+		return a.getIfTableValue(col, ifIdx)
+	}
+
+	return nil, 0
+}
+
+// getIfTableValue returns the value for a specific ifTable column and ifIndex.
+func (a *Agent) getIfTableValue(col, ifIdx int) ([]byte, byte) {
+	ifaces := a.getIfData()
+	var iface *IfData
+	for i := range ifaces {
+		if ifaces[i].IfIndex == ifIdx {
+			iface = &ifaces[i]
+			break
+		}
+	}
+	if iface == nil {
+		return nil, 0
+	}
+
+	switch col {
+	case 1: // ifIndex
+		return berEncodeIntegerValue(iface.IfIndex), tagInteger
+	case 2: // ifDescr
+		return []byte(iface.IfDescr), tagOctetString
+	case 3: // ifType
+		return berEncodeIntegerValue(iface.IfType), tagInteger
+	case 4: // ifMtu
+		return berEncodeIntegerValue(iface.IfMtu), tagInteger
+	case 5: // ifSpeed
+		return berEncodeGauge32(iface.IfSpeed), tagGauge32
+	case 7: // ifAdminStatus
+		return berEncodeIntegerValue(iface.AdminStatus), tagInteger
+	case 8: // ifOperStatus
+		return berEncodeIntegerValue(iface.OperStatus), tagInteger
+	case 10: // ifInOctets
+		return berEncodeCounter32(iface.InOctets), tagCounter32
+	case 16: // ifOutOctets
+		return berEncodeCounter32(iface.OutOctets), tagCounter32
+	}
 	return nil, 0
 }
 
 // findNextOID returns the next OID in the tree after the given OID, or nil.
 func (a *Agent) findNextOID(oid []int) []int {
-	for _, candidate := range allOIDs {
+	// Check static OIDs first.
+	for _, candidate := range staticOIDs {
 		if oidCompare(candidate, oid) > 0 {
 			return candidate
 		}
 	}
+
+	// Walk ifTable OIDs: 1.3.6.1.2.1.2.2.1.<col>.<ifIndex>
+	ifaces := a.getIfData()
+	if len(ifaces) == 0 {
+		return nil
+	}
+
+	// Build sorted list of all ifTable OIDs.
+	for _, col := range ifTableColumns {
+		for _, iface := range ifaces {
+			candidate := make([]int, len(oidIfTablePrefix)+2)
+			copy(candidate, oidIfTablePrefix)
+			candidate[len(oidIfTablePrefix)] = col
+			candidate[len(oidIfTablePrefix)+1] = iface.IfIndex
+			if oidCompare(candidate, oid) > 0 {
+				return candidate
+			}
+		}
+	}
 	return nil
+}
+
+// oidHasPrefix checks if oid starts with prefix.
+func oidHasPrefix(oid, prefix []int) bool {
+	if len(oid) < len(prefix) {
+		return false
+	}
+	for i := range prefix {
+		if oid[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// berEncodeCounter32 encodes a Counter32 value (unsigned 32-bit).
+func berEncodeCounter32(val uint32) []byte {
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, val)
+	// Strip leading zeros but keep at least one byte.
+	// If high bit set, prepend zero for unsigned.
+	for len(buf) > 1 && buf[0] == 0 {
+		buf = buf[1:]
+	}
+	if buf[0]&0x80 != 0 {
+		buf = append([]byte{0}, buf...)
+	}
+	return buf
+}
+
+// berEncodeGauge32 encodes a Gauge32 value (unsigned 32-bit).
+func berEncodeGauge32(val uint32) []byte {
+	return berEncodeCounter32(val) // same encoding
 }
 
 // varbind holds a single OID-value binding.
