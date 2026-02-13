@@ -45,7 +45,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Full interface management**: bpfrxd owns ALL interfaces on the firewall — renames them via `.link` files, configures addresses/DHCP via `.network` files, and brings down unconfigured interfaces
 
 ### APIs
-- **gRPC** on 127.0.0.1:50051 — 42 RPCs (config, sessions, stats, routes, IPsec, DHCP)
+- **gRPC** on 127.0.0.1:50051 — 48 RPCs (config, sessions, stats, routes, IPsec, DHCP)
 - **HTTP REST** on 127.0.0.1:8080 — health, Prometheus metrics, config endpoints
 - **CLI** — Interactive Junos-style with tab completion, `?` help, `| match` pipe
 - **Remote CLI** — `cli` binary connects via gRPC
@@ -99,6 +99,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - Branch merges lose packet range — re-read `ctx->data`/`ctx->data_end` after branches
 - Combined stack limit is 512 bytes across call frames — use `__noinline` and scratch maps
 - Variable-offset pkt pointer: verifier refuses range tracking when `var_off` is wide (0xffff) — use constant-offset from validated pointer instead
+- **Narrowing meta offsets**: when using `meta->l3_offset` (u16) for packet pointer math, mask with `& 0x3F` to narrow var_off so verifier can track range (`66833c5`)
 - `__u16` type causes sign-extension (`smin=-32768`) — fails for pkt pointer math
 - `iter.Next(&key, nil)` crashes in cilium/ebpf v0.20 — always use `var val []byte`
 - xdp_zone fails verifier on kernel 6.12 (NAT64 complexity) — passes on 6.18+
@@ -134,18 +135,18 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - systemd unit has `TimeoutStopSec=20` as safety net
 
 ## Feature Coverage
-- **Firewall**: Stateful inspection, zone-based policies, address books, application matching, multi-term apps
-- **NAT**: SNAT (interface + pool), DNAT, static 1:1, NAT64 (native BPF)
+- **Firewall**: Stateful inspection, zone-based policies (including global policies), address books, application matching, multi-term apps, filtered session clearing
+- **NAT**: SNAT (interface + pool, address-persistent), DNAT (with hit counters), static 1:1, NAT64 (native BPF)
 - **IPv4 + IPv6**: Dual-stack, DHCPv4/v6 clients, Router Advertisements
 - **Screen/IDS**: 11 checks (land, syn-flood, ping-death, teardrop, rate-limiting)
-- **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, export/redistribute, ECMP multipath, next-table inter-VRF route leaking
+- **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, export/redistribute, ECMP multipath, next-table inter-VRF route leaking, route filtering by protocol/CIDR
 - **VLANs**: 802.1Q tagging in BPF, trunk ports
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces
-- **Observability**: Syslog (facility/severity/category filtering), NetFlow v9, Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB)
-- **Flow**: TCP MSS clamping, ALG control, allow-dns-reply, allow-embedded-icmp, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, forwarding-class DSCP rewrite)
+- **Observability**: Syslog (facility/severity/category filtering), NetFlow v9, Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB), BPF map utilization (`show system buffers`)
+- **Flow**: TCP MSS clamping, ALG control, allow-dns-reply (wired to BPF), allow-embedded-icmp, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, logging, forwarding-class DSCP rewrite, DSCP action)
 - **HA**: VRRP via keepalived (config generation, runtime state detection)
 - **DHCP**: Relay (Option 82), server (Kea integration with lease display)
-- **CLI**: Junos-style prefix matching, "Possible completions:" headers, zone names in session display, config validation warnings
+- **CLI**: Junos-style prefix matching, "Possible completions:" headers, zone/interface descriptions, session idle time, flow statistics, policy descriptions, config validation warnings
 
 ## Network Topology (Test VM)
 

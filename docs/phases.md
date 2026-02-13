@@ -258,3 +258,22 @@
 - Syslog stream category filtering (session/policy/screen/firewall) (`8902a47`)
 - Remote CLI policy zone filtering (`8902a47`)
 - allow-dns-reply wired to BPF conntrack for sessionless DNS pass-through (`1a8b873`)
+- BPF map utilization display (`show system buffers`) (`fc6ad37`)
+
+### BPF Struct Changes (Phase 46-48)
+- `filter_rule`: added `dst_port_hi`, `src_port_hi` (port range), `log_flag`, `dscp_val`; size now 84 bytes
+- `app_value`: `timeout` field wired for per-application inactivity timeout
+- New event type: `EVENT_TYPE_FILTER_LOG` (6) for firewall filter logging
+- `xdp_conntrack`: added `allow_dns_reply` sessionless pass-through (IPv4 + IPv6)
+- `xdp_policy`: global policy fallback via `{0,0}` zone-pair key
+- `tc_forward`: `l3_offset` narrowing fix (`& 0x3F`) for verifier
+
+### gRPC/Proto Changes (Phase 46-48)
+- `ShowTextRequest`: added `filter` field for topic-specific filters
+- `GetGlobalStatsResponse`: added `nat64_translations`, `host_inbound_allowed`, `screen_drop_details`
+- `SessionEntry`: added `IdleSeconds`
+- `PolicyRule`: added `description`
+- `ClearSessionsRequest`: filter fields (source/dest prefix, protocol, zone, ports)
+- `GetNATRuleStats`: `nat_type` field for source vs destination NAT
+- New `SystemAction` actions: `clear-firewall-counters`, `clear-persistent-nat`, `clear-policy-counters`
+- New `ShowText` topics: `flow-statistics`, `firewall` (with counters), `buffers`

@@ -306,6 +306,12 @@ incus exec bpfrx-fw -- vtysh -c 'show ipv6 route'
 # Kernel routes (should match FRR)
 incus exec bpfrx-fw -- ip route show
 incus exec bpfrx-fw -- ip -6 route show
+
+# Via CLI: all routes, by VRF, by protocol, by prefix
+printf 'show route\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show route table vrf-tunnel-vr\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show route protocol static\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show route 10.0.1.0/24\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
 ```
 
 ### XDP Mode Verification
@@ -324,6 +330,40 @@ incus exec bpfrx-fw -- curl -s http://127.0.0.1:8080/api/stats | jq .
 
 # Prometheus metrics
 incus exec bpfrx-fw -- curl -s http://127.0.0.1:8080/metrics | grep bpfrx
+
+# Flow statistics via CLI
+printf 'show security flow statistics\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+
+# Policy hit counts (with optional zone filter)
+printf 'show security policies hit-count\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show security policies hit-count from-zone trust to-zone untrust\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+
+# Firewall filter hit counters
+printf 'show firewall\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+
+# NAT statistics
+printf 'show security nat source summary\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show security nat destination summary\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+
+# BPF map utilization
+printf 'show system buffers\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+```
+
+### Session Management
+```bash
+# Clear all sessions
+printf 'clear security flow session\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+
+# Clear filtered sessions
+printf 'clear security flow session source-prefix 10.0.1.0/24\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'clear security flow session protocol tcp\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'clear security flow session destination-prefix 10.0.2.102/32 protocol udp\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+
+# Clear policy counters
+printf 'clear security policies hit-count\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+
+# Clear firewall filter counters
+printf 'clear firewall all\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
 ```
 
 ### Common Issues

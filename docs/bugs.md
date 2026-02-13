@@ -63,6 +63,33 @@ incus config device add VM internet pci address=$vf_pci
 ```
 VF appears as enp10s0 inside VM.
 
+## Phase 46-48 Bugs
+
+### tc_forward BPF verifier failure (l3_offset narrowing)
+- `l3_offset` variable had wide `var_off` (0xffff), causing verifier to refuse packet pointer range tracking
+- Same class of issue as xdp_zone variable-offset pkt pointer bug
+- **Fix:** Narrow `l3_offset` with `& 0x3F` to keep `var_off` within verifier tracking range
+- **File:** `bpf/tc/tc_forward.c`
+- **Commit:** `66833c5`
+
+### FilterRule Go/C struct size mismatch (82→84 bytes)
+- Go `FilterRule` struct was 82 bytes but C `filter_rule` had trailing padding to 84 bytes (for `__u32 routing_table` alignment)
+- Hit twice: once in the DSCP commit, fixed properly in address-persistent NAT commit
+- **Fix:** Adjusted Go struct to 84 bytes to match C `sizeof`
+- **Pattern:** C compiler inserts trailing padding to align the largest member; always verify `sizeof` in C matches Go struct total
+- **Commits:** `6634db7`, `66833c5`
+
+### Session age calculation (LastSeen vs Created)
+- `AgeSeconds` was calculated from `LastSeen` timestamp instead of `Created` timestamp
+- Made session age appear to reset on every packet
+- **Fix:** Use `Created` for age, added separate `IdleSeconds` field (`now - LastSeen`) for idle time
+- **Commit:** `7e4caa9`
+
+### Remote CLI flow statistics undefined method
+- `show security flow statistics` in remote CLI called undefined local method
+- **Fix:** Wire through gRPC `ShowText("flow-statistics")` topic
+- **Commit:** `dd40226`
+
 ## BPF Verifier Patterns
 
 ### Branch merge packet range loss
@@ -73,6 +100,13 @@ VF appears as enp10s0 inside VM.
 - xdp_zone fails verifier on kernel 6.12 due to NAT64 loop complexity
 - Passes on kernel 6.18+ with larger verifier limits
 - **Workaround:** Run on 6.18+ or disable NAT64 config
+
+### Variable-offset narrowing for packet pointer math
+- When `var_off` is wide (e.g. 0xffff from 16-bit field), verifier refuses to track pkt pointer range
+- Applies to both XDP and TC programs — `l3_offset`, `l4_offset`, computed offsets from header lengths
+- **Fix:** Narrow with bitmask before use: `offset &= 0x3F` (or `& 0xFF` depending on expected range)
+- **Commits:** `66833c5` (tc_forward), earlier xdp_zone fix
+- **Pattern:** Same root cause as `__u16` sign-extension issue — keep `var_off` tight
 
 ### TCP MSS clamping verifier
 - Cannot use loops or variable offsets from map-derived values (`l4_offset`)
@@ -168,6 +202,35 @@ VF appears as enp10s0 inside VM.
 - **Fix:** Sort map keys alphabetically before ID assignment → deterministic IDs across restarts
 - **File:** `pkg/dataplane/compiler.go`
 - **Commit:** `cec07ea`
+
+## Phase 46-48 Bugs
+
+### tc_forward verifier failure with l3_offset
+- `l3_offset` from meta had `var_off=(0x0; 0xffff)` — too wide for verifier range tracking
+- Packet pointer arithmetic with this offset caused `r=0` → all subsequent accesses fail
+- **Fix:** Narrow with `& 0x3F` to keep var_off within verifier tracking range
+- **File:** `bpf/tc/tc_forward.c`
+- **Commit:** `66833c5`
+
+### FilterRule Go struct size mismatch
+- Go FilterRule was 82 bytes, C struct was 84 bytes (trailing padding for `__u32` alignment)
+- cilium/ebpf size check would fail or produce corrupt map entries
+- **Fix:** Added padding to bring Go struct to 84 bytes
+- **Files:** `pkg/dataplane/types.go`, `bpf/headers/bpfrx_common.h`
+- **Commits:** `66833c5`, `6634db7`
+
+### Session age calculation using wrong timestamp
+- `AgeSeconds` was computed from `LastSeen` instead of `Created` timestamp
+- Made sessions appear much younger than their actual age
+- **Fix:** Use Created timestamp for age, added IdleSeconds (now - LastSeen) as separate field
+- **File:** `pkg/grpcapi/server.go`
+- **Commit:** `7e4caa9`
+
+### Route prefix matching false positive
+- `show route 10.0.1` matched `10.0.100.0/24` due to naive string prefix matching
+- **Fix:** Implemented CIDR-aware matching with `net.ParseCIDR` and bidirectional subnet containment
+- **Files:** `pkg/cli/cli.go`, `pkg/grpcapi/server.go`
+- **Commit:** `093016f`
 
 ## BPF Flow Config Gotchas
 

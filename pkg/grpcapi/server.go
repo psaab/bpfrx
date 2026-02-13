@@ -4324,6 +4324,30 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			}
 		}
 
+	case "buffers":
+		if s.dp != nil {
+			stats := s.dp.GetMapStats()
+			if len(stats) == 0 {
+				buf.WriteString("No BPF maps available\n")
+			} else {
+				fmt.Fprintf(&buf, "%-24s %-12s %10s %10s %8s\n", "Map", "Type", "Max", "Used", "Usage%")
+				buf.WriteString(strings.Repeat("-", 68) + "\n")
+				for _, st := range stats {
+					usage := "-"
+					used := "-"
+					if st.Type != "Array" {
+						used = fmt.Sprintf("%d", st.UsedCount)
+						if st.MaxEntries > 0 {
+							usage = fmt.Sprintf("%.1f%%", float64(st.UsedCount)/float64(st.MaxEntries)*100)
+						}
+					}
+					fmt.Fprintf(&buf, "%-24s %-12s %10d %10s %8s\n", st.Name, st.Type, st.MaxEntries, used, usage)
+				}
+			}
+		} else {
+			buf.WriteString("Dataplane not loaded\n")
+		}
+
 	default:
 		// Handle "log:<filename>[:<count>]" for syslog file destinations
 		if strings.HasPrefix(req.Topic, "log:") {
