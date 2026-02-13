@@ -2714,6 +2714,14 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		if !hasFilters {
 			buf.WriteString("No firewall filters configured\n")
 		} else {
+			// Resolve filter IDs for counter display
+			var filterIDs map[string]uint32
+			if s.dp != nil && s.dp.IsLoaded() {
+				if cr := s.dp.LastCompileResult(); cr != nil {
+					filterIDs = cr.FilterIDs
+				}
+			}
+
 			printFilters := func(family string, filters map[string]*config.FirewallFilter) {
 				names := make([]string, 0, len(filters))
 				for name := range filters {
@@ -2723,6 +2731,20 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 				for _, name := range names {
 					filter := filters[name]
 					fmt.Fprintf(&buf, "Filter: %s (family %s)\n", name, family)
+
+					// Get filter config for counter lookup
+					var ruleStart uint32
+					var hasCounters bool
+					if filterIDs != nil {
+						if fid, ok := filterIDs[family+":"+name]; ok {
+							if fcfg, err := s.dp.ReadFilterConfig(fid); err == nil {
+								ruleStart = fcfg.RuleStart
+								hasCounters = true
+							}
+						}
+					}
+					ruleOffset := ruleStart
+
 					for _, term := range filter.Terms {
 						fmt.Fprintf(&buf, "  Term: %s\n", term.Name)
 						if term.DSCP != "" {
@@ -2783,6 +2805,50 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 							action = "accept"
 						}
 						fmt.Fprintf(&buf, "    then %s\n", action)
+
+						// Sum counters across all expanded BPF rules for this term
+						if hasCounters {
+							nSrc := len(term.SourceAddresses)
+							for _, ref := range term.SourcePrefixLists {
+								if !ref.Except {
+									if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+										nSrc += len(pl.Prefixes)
+									}
+								}
+							}
+							if nSrc == 0 {
+								nSrc = 1
+							}
+							nDst := len(term.DestAddresses)
+							for _, ref := range term.DestPrefixLists {
+								if !ref.Except {
+									if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+										nDst += len(pl.Prefixes)
+									}
+								}
+							}
+							if nDst == 0 {
+								nDst = 1
+							}
+							nDstPorts := len(term.DestinationPorts)
+							if nDstPorts == 0 {
+								nDstPorts = 1
+							}
+							nSrcPorts := len(term.SourcePorts)
+							if nSrcPorts == 0 {
+								nSrcPorts = 1
+							}
+							numRules := uint32(nSrc * nDst * nDstPorts * nSrcPorts)
+							var totalPkts, totalBytes uint64
+							for i := uint32(0); i < numRules; i++ {
+								if ctrs, err := s.dp.ReadFilterCounters(ruleOffset + i); err == nil {
+									totalPkts += ctrs.Packets
+									totalBytes += ctrs.Bytes
+								}
+							}
+							fmt.Fprintf(&buf, "    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
+							ruleOffset += numRules
+						}
 					}
 					buf.WriteString("\n")
 				}
