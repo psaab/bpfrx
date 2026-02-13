@@ -2019,6 +2019,7 @@ type PolicyRule struct {
 	Count         bool                   `protobuf:"varint,7,opt,name=count,proto3" json:"count,omitempty"`
 	HitPackets    uint64                 `protobuf:"varint,8,opt,name=hit_packets,json=hitPackets,proto3" json:"hit_packets,omitempty"`
 	HitBytes      uint64                 `protobuf:"varint,9,opt,name=hit_bytes,json=hitBytes,proto3" json:"hit_bytes,omitempty"`
+	Description   string                 `protobuf:"bytes,10,opt,name=description,proto3" json:"description,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2114,6 +2115,13 @@ func (x *PolicyRule) GetHitBytes() uint64 {
 		return x.HitBytes
 	}
 	return 0
+}
+
+func (x *PolicyRule) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
 }
 
 type GetSessionsRequest struct {
@@ -6127,7 +6135,7 @@ const file_bpfrx_proto_rawDesc = "" +
 	"PolicyInfo\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12*\n" +
-	"\x05rules\x18\x03 \x03(\v2\x14.bpfrx.v1.PolicyRuleR\x05rules\"\x8c\x02\n" +
+	"\x05rules\x18\x03 \x03(\v2\x14.bpfrx.v1.PolicyRuleR\x05rules\"\xae\x02\n" +
 	"\n" +
 	"PolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
@@ -6139,7 +6147,9 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x05count\x18\a \x01(\bR\x05count\x12\x1f\n" +
 	"\vhit_packets\x18\b \x01(\x04R\n" +
 	"hitPackets\x12\x1b\n" +
-	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\"\xad\x02\n" +
+	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\x12 \n" +
+	"\vdescription\x18\n" +
+	" \x01(\tR\vdescription\"\xad\x02\n" +
 	"\x12GetSessionsRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x05R\x06offset\x12\x12\n" +

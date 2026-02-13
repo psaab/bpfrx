@@ -682,6 +682,9 @@ func (c *ctl) showPolicies() error {
 		fmt.Printf("From zone: %s, To zone: %s\n", pi.FromZone, pi.ToZone)
 		for _, rule := range pi.Rules {
 			fmt.Printf("  Rule: %s\n", rule.Name)
+			if rule.Description != "" {
+				fmt.Printf("    Description: %s\n", rule.Description)
+			}
 			fmt.Printf("    Match: src=%v dst=%v app=%v\n",
 				rule.SrcAddresses, rule.DstAddresses, rule.Applications)
 			fmt.Printf("    Action: %s\n", rule.Action)

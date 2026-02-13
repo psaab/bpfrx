@@ -152,7 +152,8 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"policies": {children: map[string]*schemaNode{
 			"from-zone": {args: 3, children: map[string]*schemaNode{ // from-zone X to-zone Y
 				"policy": {args: 1, children: map[string]*schemaNode{
-					"match": {children: nil}, // match children are all leaves
+					"description": {args: 1, children: nil},
+					"match":       {children: nil}, // match children are all leaves
 					"then": {children: map[string]*schemaNode{
 						"log": {children: nil},
 						// permit, deny, reject, count → leaf

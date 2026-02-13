@@ -141,7 +141,8 @@ var operationalTree = map[string]*completionNode{
 			"alg":             {desc: "Show ALG status"},
 			"dynamic-address": {desc: "Show dynamic address feeds"},
 			"flow": {desc: "Show flow information", children: map[string]*completionNode{
-				"session": {desc: "Show active sessions"},
+				"session":    {desc: "Show active sessions"},
+				"statistics": {desc: "Show flow statistics"},
 			}},
 			"nat": {desc: "Show NAT information", children: map[string]*completionNode{
 				"source":      {desc: "Show source NAT"},
@@ -1144,6 +1145,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 				}
 				ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 				fmt.Printf("  Rule: %s (id: %d)\n", pol.Name, ruleID)
+				if pol.Description != "" {
+					fmt.Printf("    Description: %s\n", pol.Description)
+				}
 				fmt.Printf("    Match: src=%v dst=%v app=%v\n",
 					pol.Match.SourceAddresses,
 					pol.Match.DestinationAddresses,
@@ -1170,6 +1174,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		}
 		if len(args) >= 2 && args[1] == "traceoptions" {
 			return c.showFlowTraceoptions()
+		}
+		if len(args) >= 2 && args[1] == "statistics" {
+			return c.showFlowStatistics()
 		}
 		if len(args) == 1 {
 			return c.showFlowTimeouts()
@@ -1413,6 +1420,7 @@ func (c *CLI) showStatistics() error {
 		{dataplane.GlobalCtrHostInboundDeny, "Host-inbound denies"},
 		{dataplane.GlobalCtrHostInbound, "Host-inbound allowed"},
 		{dataplane.GlobalCtrTCEgressPackets, "TC egress packets"},
+		{dataplane.GlobalCtrNAT64Xlate, "NAT64 translations"},
 	}
 
 	fmt.Println("Global statistics:")
@@ -1855,6 +1863,8 @@ func (c *CLI) showFlowSession(args []string) error {
 		}
 	}
 
+	now := monotonicSeconds()
+
 	// IPv4 sessions
 	err := c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
@@ -1890,8 +1900,15 @@ func (c *CLI) showFlowSession(args []string) error {
 		protoName := protoNameFromNum(key.Protocol)
 		stateName := sessionStateName(val.State)
 
-		fmt.Printf("Session ID: %d, Policy: %d, State: %s, Timeout: %ds\n",
-			count, val.PolicyID, stateName, val.Timeout)
+		var age, idle uint64
+		if now > val.Created {
+			age = now - val.Created
+		}
+		if now > val.LastSeen {
+			idle = now - val.LastSeen
+		}
+		fmt.Printf("Session ID: %d, Policy: %d, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
+			count, val.PolicyID, stateName, val.Timeout, age, idle)
 		fmt.Printf("  In: %s:%d --> %s:%d;%s,",
 			srcIP, srcPort, dstIP, dstPort, protoName)
 		inZone := zoneNames[val.IngressZone]
@@ -1960,8 +1977,15 @@ func (c *CLI) showFlowSession(args []string) error {
 		protoName := protoNameFromNum(key.Protocol)
 		stateName := sessionStateName(val.State)
 
-		fmt.Printf("Session ID: %d, Policy: %d, State: %s, Timeout: %ds\n",
-			count, val.PolicyID, stateName, val.Timeout)
+		var age, idle uint64
+		if now > val.Created {
+			age = now - val.Created
+		}
+		if now > val.LastSeen {
+			idle = now - val.LastSeen
+		}
+		fmt.Printf("Session ID: %d, Policy: %d, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
+			count, val.PolicyID, stateName, val.Timeout, age, idle)
 		fmt.Printf("  In: [%s]:%d --> [%s]:%d;%s,",
 			srcIP, srcPort, dstIP, dstPort, protoName)
 		inZone := zoneNames[val.IngressZone]
@@ -2099,6 +2123,96 @@ func (c *CLI) showFlowTimeouts() error {
 		}
 		if flow.PowerModeDisable {
 			fmt.Println("  power-mode-disable:            yes")
+		}
+	}
+
+	return nil
+}
+
+// showFlowStatistics displays flow statistics from BPF global counters.
+func (c *CLI) showFlowStatistics() error {
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("Flow statistics: dataplane not loaded")
+		return nil
+	}
+
+	ctrMap := c.dp.Map("global_counters")
+	if ctrMap == nil {
+		fmt.Println("Flow statistics: global_counters map not found")
+		return nil
+	}
+
+	readCounter := func(idx uint32) uint64 {
+		var perCPU []uint64
+		if err := ctrMap.Lookup(idx, &perCPU); err != nil {
+			return 0
+		}
+		var total uint64
+		for _, v := range perCPU {
+			total += v
+		}
+		return total
+	}
+
+	rxPkts := readCounter(dataplane.GlobalCtrRxPackets)
+	txPkts := readCounter(dataplane.GlobalCtrTxPackets)
+	drops := readCounter(dataplane.GlobalCtrDrops)
+	sessNew := readCounter(dataplane.GlobalCtrSessionsNew)
+	sessClosed := readCounter(dataplane.GlobalCtrSessionsClosed)
+	screenDrops := readCounter(dataplane.GlobalCtrScreenDrops)
+	policyDeny := readCounter(dataplane.GlobalCtrPolicyDeny)
+	natFail := readCounter(dataplane.GlobalCtrNATAllocFail)
+	hostDeny := readCounter(dataplane.GlobalCtrHostInboundDeny)
+	hostAllow := readCounter(dataplane.GlobalCtrHostInbound)
+	tcEgress := readCounter(dataplane.GlobalCtrTCEgressPackets)
+	nat64 := readCounter(dataplane.GlobalCtrNAT64Xlate)
+
+	fmt.Println("Flow statistics:")
+	fmt.Printf("  %-30s %d\n", "Current sessions:", sessNew-sessClosed)
+	fmt.Printf("  %-30s %d\n", "Sessions created:", sessNew)
+	fmt.Printf("  %-30s %d\n", "Sessions closed:", sessClosed)
+	fmt.Println()
+	fmt.Printf("  %-30s %d\n", "Packets received:", rxPkts)
+	fmt.Printf("  %-30s %d\n", "Packets transmitted:", txPkts)
+	fmt.Printf("  %-30s %d\n", "Packets dropped:", drops)
+	fmt.Printf("  %-30s %d\n", "TC egress packets:", tcEgress)
+	fmt.Println()
+	fmt.Printf("  %-30s %d\n", "Policy deny:", policyDeny)
+	fmt.Printf("  %-30s %d\n", "NAT allocation failures:", natFail)
+	fmt.Printf("  %-30s %d\n", "NAT64 translations:", nat64)
+	fmt.Println()
+	fmt.Printf("  %-30s %d\n", "Host-inbound allowed:", hostAllow)
+	fmt.Printf("  %-30s %d\n", "Host-inbound denied:", hostDeny)
+
+	// Screen drops breakdown
+	if screenDrops > 0 {
+		fmt.Println()
+		fmt.Printf("  %-30s %d\n", "Screen drops (total):", screenDrops)
+
+		screenCounters := []struct {
+			idx  uint32
+			name string
+		}{
+			{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
+			{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
+			{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
+			{dataplane.GlobalCtrScreenPortScan, "Port scan"},
+			{dataplane.GlobalCtrScreenIPSweep, "IP sweep"},
+			{dataplane.GlobalCtrScreenLandAttack, "Land attack"},
+			{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
+			{dataplane.GlobalCtrScreenTearDrop, "Tear drop"},
+			{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN-FIN"},
+			{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
+			{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
+			{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
+			{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
+			{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
+		}
+		for _, sc := range screenCounters {
+			v := readCounter(sc.idx)
+			if v > 0 {
+				fmt.Printf("    %-28s %d\n", sc.name+":", v)
+			}
 		}
 	}
 
@@ -4272,6 +4386,12 @@ func ntohs(v uint16) uint16 {
 	return binary.NativeEndian.Uint16(b[:])
 }
 
+func monotonicSeconds() uint64 {
+	var ts unix.Timespec
+	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	return uint64(ts.Sec)
+}
+
 func (c *CLI) showContextHelp(prefix string) {
 	prefix = strings.TrimSpace(prefix)
 	words := strings.Fields(prefix)
@@ -5476,6 +5596,9 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 			fmt.Printf("Matching policy:\n")
 			fmt.Printf("  From zone: %s, To zone: %s\n", fromZone, toZone)
 			fmt.Printf("  Policy: %s\n", pol.Name)
+			if pol.Description != "" {
+				fmt.Printf("    Description: %s\n", pol.Description)
+			}
 			fmt.Printf("    Source addresses: %v\n", pol.Match.SourceAddresses)
 			fmt.Printf("    Destination addresses: %v\n", pol.Match.DestinationAddresses)
 			fmt.Printf("    Applications: %v\n", pol.Match.Applications)

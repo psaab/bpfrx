@@ -564,6 +564,7 @@ type ZonePairPolicies struct {
 // Policy is a single security policy rule.
 type Policy struct {
 	Name          string
+	Description   string
 	Match         PolicyMatch
 	Action        PolicyAction
 	Log           *PolicyLog

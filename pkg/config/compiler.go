@@ -573,7 +573,12 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 						}
 					}
 
-					// scheduler-name at the policy level
+					// description
+					if descNode := polInst.node.FindChild("description"); descNode != nil {
+						pol.Description = nodeVal(descNode)
+					}
+
+				// scheduler-name at the policy level
 					if snNode := polInst.node.FindChild("scheduler-name"); snNode != nil {
 						pol.SchedulerName = nodeVal(snNode)
 					}

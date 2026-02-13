@@ -407,6 +407,7 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 		for _, rule := range zpp.Policies {
 			pr := &pb.PolicyRule{
 				Name:         rule.Name,
+				Description:  rule.Description,
 				Action:       policyActionStr(rule.Action),
 				SrcAddresses: rule.Match.SourceAddresses,
 				DstAddresses: rule.Match.DestinationAddresses,
