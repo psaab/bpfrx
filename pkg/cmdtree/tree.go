@@ -71,6 +71,7 @@ var OperationalTree = map[string]*Node{
 		"flow-monitoring": {Desc: "Show flow monitoring/NetFlow configuration"},
 		"log":             {Desc: "Show daemon log entries [N]"},
 		"route": {Desc: "Show routing table [instance <name>]", Children: map[string]*Node{
+			"terse":    {Desc: "Show terse routing table"},
 			"detail":   {Desc: "Show detailed route information"},
 			"summary":  {Desc: "Show route summary by protocol"},
 			"table":    {Desc: "Show routes for a VRF table"},
@@ -153,14 +154,20 @@ var OperationalTree = map[string]*Node{
 				"source": {Desc: "Show source NAT", Children: map[string]*Node{
 					"summary":              {Desc: "Show source NAT summary"},
 					"pool":                 {Desc: "Show source NAT pools"},
-					"persistent-nat-table": {Desc: "Show persistent NAT bindings"},
-					"rule":                 {Desc: "Show source NAT rules"},
+					"persistent-nat-table": {Desc: "Show persistent NAT bindings", Children: map[string]*Node{
+						"detail": {Desc: "Show detailed persistent NAT bindings"},
+					}},
+					"rule": {Desc: "Show source NAT rules", Children: map[string]*Node{
+						"detail": {Desc: "Show detailed source NAT rules"},
+					}},
 					"rule-set":             {Desc: "Show source NAT rule sets"},
 				}},
 				"destination": {Desc: "Show destination NAT", Children: map[string]*Node{
 					"summary":  {Desc: "Show destination NAT summary"},
 					"pool":     {Desc: "Show destination NAT pools"},
-					"rule":     {Desc: "Show destination NAT rules"},
+					"rule": {Desc: "Show destination NAT rules", Children: map[string]*Node{
+						"detail": {Desc: "Show detailed destination NAT rules"},
+					}},
 					"rule-set": {Desc: "Show destination NAT rule sets"},
 				}},
 				"static": {Desc: "Show static NAT"},
@@ -223,7 +230,9 @@ var OperationalTree = map[string]*Node{
 		}},
 		"schedulers":        {Desc: "Show policy schedulers"},
 		"dhcp-relay":        {Desc: "Show DHCP relay status"},
-		"dhcp-server":       {Desc: "Show DHCP server leases"},
+		"dhcp-server": {Desc: "Show DHCP server leases", Children: map[string]*Node{
+			"detail": {Desc: "Show detailed DHCP server information with pool utilization"},
+		}},
 		"snmp":              {Desc: "Show SNMP statistics"},
 		"system": {Desc: "Show system information", Children: map[string]*Node{
 			"alarms":        {Desc: "Show system alarms"},
@@ -250,7 +259,9 @@ var OperationalTree = map[string]*Node{
 			"users":              {Desc: "Show configured login users"},
 		}},
 		"routing-options":    {Desc: "Show routing options"},
-		"routing-instances":  {Desc: "Show routing instances"},
+		"routing-instances": {Desc: "Show routing instances", Children: map[string]*Node{
+			"detail": {Desc: "Show detailed routing instance information"},
+		}},
 		"policy-options":     {Desc: "Show policy options"},
 		"event-options":      {Desc: "Show event policies"},
 		"forwarding-options": {Desc: "Show forwarding options"},
@@ -262,6 +273,10 @@ var OperationalTree = map[string]*Node{
 		}},
 	}},
 	"clear": {Desc: "Clear information", Children: map[string]*Node{
+		"arp": {Desc: "Clear ARP table"},
+		"ipv6": {Desc: "Clear IPv6 information", Children: map[string]*Node{
+			"neighbors": {Desc: "Clear IPv6 neighbor cache"},
+		}},
 		"security": {Desc: "Clear security information", Children: map[string]*Node{
 			"flow": {Desc: "Clear flow information", Children: map[string]*Node{
 				"session": {Desc: "Clear sessions [source-prefix|destination-prefix|protocol|zone|application]"},

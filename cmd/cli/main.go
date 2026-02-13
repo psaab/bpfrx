@@ -461,6 +461,9 @@ func (c *ctl) handleShow(args []string) error {
 		return nil
 
 	case "route":
+		if len(args) >= 2 && args[1] == "terse" {
+			return c.showText("route-terse")
+		}
 		if len(args) >= 2 && args[1] == "detail" {
 			return c.showText("route-detail")
 		}
@@ -504,6 +507,9 @@ func (c *ctl) handleShow(args []string) error {
 		return c.showText("dhcp-relay")
 
 	case "dhcp-server":
+		if len(args) >= 2 && args[1] == "detail" {
+			return c.showText("dhcp-server-detail")
+		}
 		return c.showText("dhcp-server")
 
 	case "firewall":
@@ -545,6 +551,9 @@ func (c *ctl) handleShow(args []string) error {
 		return c.showText("routing-options")
 
 	case "routing-instances":
+		if len(args) >= 2 && args[1] == "detail" {
+			return c.showText("routing-instances-detail")
+		}
 		return c.showText("routing-instances")
 
 	case "forwarding-options":
@@ -878,8 +887,14 @@ func (c *ctl) handleShowNAT(args []string) error {
 		if len(args) >= 2 && args[1] == "pool" {
 			return c.showNATPoolStats()
 		}
+		if len(args) >= 3 && args[1] == "persistent-nat-table" && args[2] == "detail" {
+			return c.showText("persistent-nat-detail")
+		}
 		if len(args) >= 2 && args[1] == "persistent-nat-table" {
 			return c.showText("persistent-nat")
+		}
+		if len(args) >= 3 && args[1] == "rule" && args[2] == "detail" {
+			return c.showText("nat-source-rule-detail")
 		}
 		if len(args) >= 2 && args[1] == "rule" {
 			return c.showNATRuleStats("")
@@ -908,6 +923,9 @@ func (c *ctl) handleShowNAT(args []string) error {
 		}
 		if len(args) >= 2 && args[1] == "pool" {
 			return c.showNATDestinationPool()
+		}
+		if len(args) >= 3 && args[1] == "rule" && args[2] == "detail" {
+			return c.showText("nat-dest-rule-detail")
 		}
 		if len(args) >= 2 && args[1] == "rule" {
 			return c.showNATDNATRuleStats("")
@@ -1762,6 +1780,10 @@ func (c *ctl) handleClear(args []string) error {
 	}
 
 	switch args[0] {
+	case "arp":
+		return c.handleClearArp()
+	case "ipv6":
+		return c.handleClearIPv6(args[1:])
 	case "security":
 		return c.handleClearSecurity(args[1:])
 	case "firewall":
@@ -1772,6 +1794,32 @@ func (c *ctl) handleClear(args []string) error {
 		showHelp()
 		return nil
 	}
+}
+
+func (c *ctl) handleClearArp() error {
+	resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+		Action: "clear-arp",
+	})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Println(resp.Message)
+	return nil
+}
+
+func (c *ctl) handleClearIPv6(args []string) error {
+	if len(args) < 1 || args[0] != "neighbors" {
+		printRemoteTreeHelp("clear ipv6:", "clear", "ipv6")
+		return nil
+	}
+	resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+		Action: "clear-ipv6-neighbors",
+	})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Println(resp.Message)
+	return nil
 }
 
 func (c *ctl) handleClearSecurity(args []string) error {

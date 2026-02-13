@@ -765,7 +765,8 @@ func (c *CLI) handleShow(args []string) error {
 		return c.showDHCPRelay()
 
 	case "dhcp-server":
-		return c.showDHCPServer()
+		detail := len(args) >= 2 && args[1] == "detail"
+		return c.showDHCPServer(detail)
 
 	case "snmp":
 		return c.showSNMP()
@@ -786,7 +787,8 @@ func (c *CLI) handleShow(args []string) error {
 		return c.showRoutingOptions()
 
 	case "routing-instances":
-		return c.showRoutingInstances()
+		detail := len(args) >= 2 && args[1] == "detail"
+		return c.showRoutingInstances(detail)
 
 	case "forwarding-options":
 		return c.showForwardingOptions()
@@ -2500,6 +2502,10 @@ func (c *CLI) handleClear(args []string) error {
 	}
 
 	switch args[0] {
+	case "arp":
+		return c.handleClearArp()
+	case "ipv6":
+		return c.handleClearIPv6(args[1:])
 	case "security":
 		return c.handleClearSecurity(args[1:])
 	case "firewall":
@@ -2510,6 +2516,28 @@ func (c *CLI) handleClear(args []string) error {
 		showHelp()
 		return nil
 	}
+}
+
+func (c *CLI) handleClearArp() error {
+	out, err := exec.Command("ip", "-4", "neigh", "flush", "all").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("flush ARP: %s", strings.TrimSpace(string(out)))
+	}
+	fmt.Println("ARP cache cleared")
+	return nil
+}
+
+func (c *CLI) handleClearIPv6(args []string) error {
+	if len(args) < 1 || args[0] != "neighbors" {
+		cmdtree.PrintTreeHelp("clear ipv6:", operationalTree, "clear", "ipv6")
+		return nil
+	}
+	out, err := exec.Command("ip", "-6", "neigh", "flush", "all").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("flush IPv6 neighbors: %s", strings.TrimSpace(string(out)))
+	}
+	fmt.Println("IPv6 neighbor cache cleared")
+	return nil
 }
 
 func (c *CLI) handleClearSecurity(args []string) error {
@@ -2736,6 +2764,9 @@ func (c *CLI) handleShowNAT(args []string) error {
 	switch args[0] {
 	case "source":
 		if len(args) >= 2 && args[1] == "persistent-nat-table" {
+			if len(args) >= 3 && args[2] == "detail" {
+				return c.showPersistentNATDetail()
+			}
 			return c.showPersistentNAT()
 		}
 		return c.showNATSource(cfg, args[1:])
@@ -2763,7 +2794,9 @@ func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 			}
 			return c.showNATSourcePool(cfg, poolName)
 		case "rule":
-			// "rule all" — show all rules across all rule-sets
+			if len(args) > 1 && args[1] == "detail" {
+				return c.showNATSourceRuleDetail(cfg)
+			}
 			return c.showNATSourceRuleAll(cfg)
 		case "rule-set":
 			if len(args) > 1 {
@@ -3144,6 +3177,98 @@ func (c *CLI) showNATSourceRuleAll(cfg *config.Config) error {
 	return nil
 }
 
+// showNATSourceRuleDetail displays Junos-style detailed source NAT rules.
+func (c *CLI) showNATSourceRuleDetail(cfg *config.Config) error {
+	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
+		fmt.Println("No source NAT rules configured")
+		return nil
+	}
+
+	// Count active SNAT sessions per rule-set
+	type ruleSetKey struct{ from, to string }
+	rsSessions := make(map[ruleSetKey]int)
+	if c.dp != nil && c.dp.IsLoaded() && c.dp.LastCompileResult() != nil {
+		cr := c.dp.LastCompileResult()
+		zoneByID := make(map[uint16]string, len(cr.ZoneIDs))
+		for name, id := range cr.ZoneIDs {
+			zoneByID[id] = name
+		}
+		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		})
+	}
+
+	ruleIdx := 0
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			ruleIdx++
+			action := "interface"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			} else if rule.Then.Off {
+				action = "off"
+			}
+			srcMatch := "0.0.0.0/0"
+			if rule.Match.SourceAddress != "" {
+				srcMatch = rule.Match.SourceAddress
+			}
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+
+			fmt.Printf("source NAT rule: %s\n", rule.Name)
+			fmt.Printf("  Rule-set: %s                        ID: %d\n", rs.Name, ruleIdx)
+			fmt.Printf("    From zone: %s    To zone: %s\n", rs.FromZone, rs.ToZone)
+			fmt.Printf("    Match:\n")
+			fmt.Printf("      Source addresses:      %s\n", srcMatch)
+			fmt.Printf("      Destination addresses: %s\n", dstMatch)
+			if rule.Match.Protocol != "" {
+				fmt.Printf("      IP protocol:           %s\n", rule.Match.Protocol)
+			}
+			fmt.Printf("    Action:                  %s\n", action)
+
+			if rule.Then.PoolName != "" && cfg.Security.NAT.SourcePools != nil {
+				if pool, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]; ok {
+					if pool.PersistentNAT != nil {
+						fmt.Printf("    Persistent NAT:          enabled\n")
+					}
+					if len(pool.Addresses) > 0 {
+						fmt.Printf("    Pool addresses:          %s\n", strings.Join(pool.Addresses, ", "))
+					}
+					portLow, portHigh := pool.PortLow, pool.PortHigh
+					if portLow == 0 {
+						portLow = 1024
+					}
+					if portHigh == 0 {
+						portHigh = 65535
+					}
+					fmt.Printf("    Port range:              %d-%d\n", portLow, portHigh)
+				}
+			}
+
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("    Translation hits:        %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+
+			sessions := rsSessions[ruleSetKey{rs.FromZone, rs.ToZone}]
+			fmt.Printf("    Number of sessions:      %d\n", sessions)
+			fmt.Println()
+		}
+	}
+	return nil
+}
+
 func (c *CLI) showNATDestination(cfg *config.Config, args []string) error {
 	if cfg == nil || cfg.Security.NAT.Destination == nil {
 		fmt.Println("No destination NAT rules configured.")
@@ -3162,6 +3287,9 @@ func (c *CLI) showNATDestination(cfg *config.Config, args []string) error {
 			}
 			return c.showNATDestinationPool(cfg, poolName)
 		case "rule":
+			if len(args) > 1 && args[1] == "detail" {
+				return c.showNATDestinationRuleDetail(cfg)
+			}
 			return c.showNATDestinationRuleAll(cfg)
 		case "rule-set":
 			if len(args) > 1 {
@@ -3481,6 +3609,88 @@ func (c *CLI) showNATDestinationRuleAll(cfg *config.Config) error {
 	return nil
 }
 
+// showNATDestinationRuleDetail displays Junos-style detailed destination NAT rules.
+func (c *CLI) showNATDestinationRuleDetail(cfg *config.Config) error {
+	dnat := cfg.Security.NAT.Destination
+	if dnat == nil || len(dnat.RuleSets) == 0 {
+		fmt.Println("No destination NAT rules configured")
+		return nil
+	}
+
+	// Count active DNAT sessions per rule-set
+	type ruleSetKey struct{ from, to string }
+	rsSessions := make(map[ruleSetKey]int)
+	if c.dp != nil && c.dp.IsLoaded() && c.dp.LastCompileResult() != nil {
+		cr := c.dp.LastCompileResult()
+		zoneByID := make(map[uint16]string, len(cr.ZoneIDs))
+		for name, id := range cr.ZoneIDs {
+			zoneByID[id] = name
+		}
+		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
+				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		})
+	}
+
+	ruleIdx := 0
+	for _, rs := range dnat.RuleSets {
+		for _, rule := range rs.Rules {
+			ruleIdx++
+			action := "off"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			}
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+
+			fmt.Printf("destination NAT rule: %s\n", rule.Name)
+			fmt.Printf("  Rule-set: %s                        ID: %d\n", rs.Name, ruleIdx)
+			fmt.Printf("    From zone: %s    To zone: %s\n", rs.FromZone, rs.ToZone)
+			fmt.Printf("    Match:\n")
+			fmt.Printf("      Destination addresses: %s\n", dstMatch)
+			if rule.Match.DestinationPort != 0 {
+				fmt.Printf("      Destination port:      %d\n", rule.Match.DestinationPort)
+			}
+			if rule.Match.Protocol != "" {
+				fmt.Printf("      IP protocol:           %s\n", rule.Match.Protocol)
+			}
+			if rule.Match.Application != "" {
+				fmt.Printf("      Application:           %s\n", rule.Match.Application)
+			}
+			fmt.Printf("    Action:                  %s\n", action)
+
+			if rule.Then.PoolName != "" && dnat.Pools != nil {
+				if pool, ok := dnat.Pools[rule.Then.PoolName]; ok {
+					fmt.Printf("    Pool address:            %s\n", pool.Address)
+					if pool.Port != 0 {
+						fmt.Printf("    Pool port:               %d\n", pool.Port)
+					}
+				}
+			}
+
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("    Translation hits:        %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+
+			sessions := rsSessions[ruleSetKey{rs.FromZone, rs.ToZone}]
+			fmt.Printf("    Number of sessions:      %d\n", sessions)
+			fmt.Println()
+		}
+	}
+	return nil
+}
+
 func (c *CLI) showNATStatic(cfg *config.Config) error {
 	if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
 		fmt.Println("No static NAT rules configured.")
@@ -3721,6 +3931,9 @@ func (c *CLI) handleShowRoute(args []string) error {
 	if len(args) >= 2 && args[0] == "protocol" {
 		return c.showRoutesForProtocol(args[1])
 	}
+	if len(args) >= 1 && args[0] == "terse" {
+		return c.showRouteTerse()
+	}
 	if len(args) >= 1 && args[0] == "summary" {
 		return c.showRouteSummary()
 	}
@@ -3752,6 +3965,19 @@ func (c *CLI) showRoutes() error {
 		fmt.Printf("  %-24s %-20s %-14s %-12s %d\n",
 			e.Destination, e.NextHop, e.Interface, e.Protocol, e.Preference)
 	}
+	return nil
+}
+
+func (c *CLI) showRouteTerse() error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+	entries, err := c.routing.GetRoutes()
+	if err != nil {
+		return fmt.Errorf("get routes: %w", err)
+	}
+	fmt.Print(routing.FormatRouteTerse(entries))
 	return nil
 }
 
@@ -6621,11 +6847,62 @@ func (c *CLI) showDHCPRelay() error {
 	return nil
 }
 
-func (c *CLI) showDHCPServer() error {
+func (c *CLI) showDHCPServer(detail bool) error {
 	cfg := c.store.ActiveConfig()
 	if cfg == nil || (cfg.System.DHCPServer.DHCPLocalServer == nil && cfg.System.DHCPServer.DHCPv6LocalServer == nil) {
 		fmt.Println("No DHCP server configured")
 		return nil
+	}
+
+	// In detail mode, show pool configuration first
+	if detail {
+		if srv := cfg.System.DHCPServer.DHCPLocalServer; srv != nil && len(srv.Groups) > 0 {
+			fmt.Println("DHCPv4 Server Configuration:")
+			for name, group := range srv.Groups {
+				fmt.Printf("  Group: %s\n", name)
+				if len(group.Interfaces) > 0 {
+					fmt.Printf("    Interfaces: %s\n", strings.Join(group.Interfaces, ", "))
+				}
+				for _, pool := range group.Pools {
+					fmt.Printf("    Pool: %s\n", pool.Name)
+					if pool.Subnet != "" {
+						fmt.Printf("      Subnet: %s\n", pool.Subnet)
+					}
+					if pool.RangeLow != "" {
+						fmt.Printf("      Range: %s - %s\n", pool.RangeLow, pool.RangeHigh)
+					}
+					if pool.Router != "" {
+						fmt.Printf("      Router: %s\n", pool.Router)
+					}
+					if len(pool.DNSServers) > 0 {
+						fmt.Printf("      DNS: %s\n", strings.Join(pool.DNSServers, ", "))
+					}
+					if pool.LeaseTime > 0 {
+						fmt.Printf("      Lease time: %ds\n", pool.LeaseTime)
+					}
+				}
+			}
+			fmt.Println()
+		}
+		if srv := cfg.System.DHCPServer.DHCPv6LocalServer; srv != nil && len(srv.Groups) > 0 {
+			fmt.Println("DHCPv6 Server Configuration:")
+			for name, group := range srv.Groups {
+				fmt.Printf("  Group: %s\n", name)
+				if len(group.Interfaces) > 0 {
+					fmt.Printf("    Interfaces: %s\n", strings.Join(group.Interfaces, ", "))
+				}
+				for _, pool := range group.Pools {
+					fmt.Printf("    Pool: %s\n", pool.Name)
+					if pool.Subnet != "" {
+						fmt.Printf("      Subnet: %s\n", pool.Subnet)
+					}
+					if pool.RangeLow != "" {
+						fmt.Printf("      Range: %s - %s\n", pool.RangeLow, pool.RangeHigh)
+					}
+				}
+			}
+			fmt.Println()
+		}
 	}
 
 	// Read Kea lease files directly
@@ -6633,24 +6910,44 @@ func (c *CLI) showDHCPServer() error {
 	leases6, _ := dhcpserver.New().GetLeases6()
 
 	if len(leases4) == 0 && len(leases6) == 0 {
-		fmt.Println("No active leases")
+		if !detail {
+			fmt.Println("No active leases")
+		} else {
+			fmt.Println("Active leases: none")
+		}
 		return nil
 	}
 
 	if len(leases4) > 0 {
-		fmt.Println("DHCPv4 Leases:")
-		fmt.Printf("  %-18s %-20s %-15s %-12s %s\n", "Address", "MAC", "Hostname", "Lifetime", "Expires")
-		for _, l := range leases4 {
-			fmt.Printf("  %-18s %-20s %-15s %-12s %s\n",
-				l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+		fmt.Printf("DHCPv4 Leases (%d active):\n", len(leases4))
+		if detail {
+			fmt.Printf("  %-18s %-20s %-15s %-10s %-12s %s\n", "Address", "MAC", "Hostname", "Subnet", "Lifetime", "Expires")
+			for _, l := range leases4 {
+				fmt.Printf("  %-18s %-20s %-15s %-10s %-12s %s\n",
+					l.Address, l.HWAddress, l.Hostname, l.SubnetID, l.ValidLife, l.ExpireTime)
+			}
+		} else {
+			fmt.Printf("  %-18s %-20s %-15s %-12s %s\n", "Address", "MAC", "Hostname", "Lifetime", "Expires")
+			for _, l := range leases4 {
+				fmt.Printf("  %-18s %-20s %-15s %-12s %s\n",
+					l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+			}
 		}
 	}
 	if len(leases6) > 0 {
-		fmt.Println("DHCPv6 Leases:")
-		fmt.Printf("  %-40s %-20s %-15s %-12s %s\n", "Address", "DUID", "Hostname", "Lifetime", "Expires")
-		for _, l := range leases6 {
-			fmt.Printf("  %-40s %-20s %-15s %-12s %s\n",
-				l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+		fmt.Printf("DHCPv6 Leases (%d active):\n", len(leases6))
+		if detail {
+			fmt.Printf("  %-40s %-20s %-15s %-10s %-12s %s\n", "Address", "DUID", "Hostname", "Subnet", "Lifetime", "Expires")
+			for _, l := range leases6 {
+				fmt.Printf("  %-40s %-20s %-15s %-10s %-12s %s\n",
+					l.Address, l.HWAddress, l.Hostname, l.SubnetID, l.ValidLife, l.ExpireTime)
+			}
+		} else {
+			fmt.Printf("  %-40s %-20s %-15s %-12s %s\n", "Address", "DUID", "Hostname", "Lifetime", "Expires")
+			for _, l := range leases6 {
+				fmt.Printf("  %-40s %-20s %-15s %-12s %s\n",
+					l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+			}
 		}
 	}
 	return nil
@@ -6711,6 +7008,64 @@ func (c *CLI) showPersistentNAT() error {
 		fmt.Printf("%-20s %-8d %-20s %-8d %-15s %-10s\n",
 			b.SrcIP, b.SrcPort, b.NatIP, b.NatPort, b.PoolName,
 			remaining.Truncate(time.Second))
+	}
+	return nil
+}
+
+// showPersistentNATDetail displays detailed persistent NAT bindings with session counts and age.
+func (c *CLI) showPersistentNATDetail() error {
+	if c.dp == nil || c.dp.PersistentNAT == nil {
+		fmt.Println("Persistent NAT table not available")
+		return nil
+	}
+	bindings := c.dp.PersistentNAT.All()
+	if len(bindings) == 0 {
+		fmt.Println("No persistent NAT bindings")
+		return nil
+	}
+
+	// Count sessions per NAT IP:port pair
+	type natKey struct {
+		ip   uint32
+		port uint16
+	}
+	sessionCounts := make(map[natKey]int)
+	if c.dp.IsLoaded() {
+		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				sessionCounts[natKey{val.NATSrcIP, val.NATSrcPort}]++
+			}
+			return true
+		})
+	}
+
+	fmt.Printf("Total persistent NAT bindings: %d\n\n", len(bindings))
+	for i, b := range bindings {
+		if i > 0 {
+			fmt.Println()
+		}
+		remaining := time.Until(b.LastSeen.Add(b.Timeout))
+		if remaining < 0 {
+			remaining = 0
+		}
+
+		// Match sessions by NAT IP — use NativeEndian for BPF uint32
+		natIP := b.NatIP.As4()
+		nk := natKey{
+			ip:   binary.NativeEndian.Uint32(natIP[:]),
+			port: b.NatPort,
+		}
+		sessions := sessionCounts[nk]
+
+		fmt.Printf("Persistent NAT binding:\n")
+		fmt.Printf("  Internal IP:        %s\n", b.SrcIP)
+		fmt.Printf("  Internal port:      %d\n", b.SrcPort)
+		fmt.Printf("  Reflexive IP:       %s\n", b.NatIP)
+		fmt.Printf("  Reflexive port:     %d\n", b.NatPort)
+		fmt.Printf("  Pool:               %s\n", b.PoolName)
+		fmt.Printf("  Current sessions:   %d\n", sessions)
+		fmt.Printf("  Left time:          %s\n", remaining.Truncate(time.Second))
+		fmt.Printf("  Configured timeout: %ds\n", int(b.Timeout.Seconds()))
 	}
 	return nil
 }
@@ -7760,7 +8115,7 @@ func (c *CLI) showRoutingOptions() error {
 	return nil
 }
 
-func (c *CLI) showRoutingInstances() error {
+func (c *CLI) showRoutingInstances(detail bool) error {
 	cfg := c.store.ActiveConfig()
 	if cfg == nil {
 		fmt.Println("No active configuration")
@@ -7771,20 +8126,78 @@ func (c *CLI) showRoutingInstances() error {
 		return nil
 	}
 
-	fmt.Printf("%-20s %-16s %-6s %s\n", "Instance", "Type", "Table", "Interfaces")
+	if !detail {
+		fmt.Printf("%-20s %-16s %-6s %s\n", "Instance", "Type", "Table", "Interfaces")
+		for _, ri := range cfg.RoutingInstances {
+			tableID := "-"
+			if ri.TableID > 0 {
+				tableID = fmt.Sprintf("%d", ri.TableID)
+			}
+			ifaces := "-"
+			if len(ri.Interfaces) > 0 {
+				ifaces = strings.Join(ri.Interfaces, ", ")
+			}
+			fmt.Printf("%-20s %-16s %-6s %s\n", ri.Name, ri.InstanceType, tableID, ifaces)
+			if ri.Description != "" {
+				fmt.Printf("  Description: %s\n", ri.Description)
+			}
+		}
+		return nil
+	}
+
 	for _, ri := range cfg.RoutingInstances {
-		tableID := "-"
-		if ri.TableID > 0 {
-			tableID = fmt.Sprintf("%d", ri.TableID)
-		}
-		ifaces := "-"
-		if len(ri.Interfaces) > 0 {
-			ifaces = strings.Join(ri.Interfaces, ", ")
-		}
-		fmt.Printf("%-20s %-16s %-6s %s\n", ri.Name, ri.InstanceType, tableID, ifaces)
+		fmt.Printf("Instance: %s\n", ri.Name)
 		if ri.Description != "" {
 			fmt.Printf("  Description: %s\n", ri.Description)
 		}
+		fmt.Printf("  Type: %s\n", ri.InstanceType)
+		if ri.TableID > 0 {
+			fmt.Printf("  Table ID: %d\n", ri.TableID)
+		}
+		if len(ri.Interfaces) > 0 {
+			fmt.Printf("  Interfaces: %s\n", strings.Join(ri.Interfaces, ", "))
+		}
+		if ri.TableID > 0 && c.routing != nil {
+			if routes, err := c.routing.GetRoutesForTable(ri.TableID); err == nil {
+				fmt.Printf("  Route count: %d\n", len(routes))
+			}
+		}
+		var protos []string
+		if ri.OSPF != nil {
+			protos = append(protos, "OSPF")
+		}
+		if ri.BGP != nil {
+			protos = append(protos, "BGP")
+		}
+		if ri.RIP != nil {
+			protos = append(protos, "RIP")
+		}
+		if ri.ISIS != nil {
+			protos = append(protos, "IS-IS")
+		}
+		if len(protos) > 0 {
+			fmt.Printf("  Protocols: %s\n", strings.Join(protos, ", "))
+		}
+		if len(ri.StaticRoutes) > 0 {
+			fmt.Printf("  Static routes: %d\n", len(ri.StaticRoutes))
+			for _, sr := range ri.StaticRoutes {
+				if sr.Discard {
+					fmt.Printf("    %s -> discard\n", sr.Destination)
+					continue
+				}
+				for _, nh := range sr.NextHops {
+					nhStr := nh.Address
+					if nh.Interface != "" {
+						nhStr += " via " + nh.Interface
+					}
+					fmt.Printf("    %s -> %s\n", sr.Destination, nhStr)
+				}
+			}
+		}
+		if ri.InterfaceRoutesRibGroup != "" {
+			fmt.Printf("  Interface routes rib-group: %s\n", ri.InterfaceRoutesRibGroup)
+		}
+		fmt.Println()
 	}
 	return nil
 }

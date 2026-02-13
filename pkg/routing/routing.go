@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -444,6 +445,48 @@ func (m *Manager) GetRoutes() ([]RouteEntry, error) {
 	}
 
 	return entries, nil
+}
+
+// protoTag returns a single-letter Junos-style route protocol marker.
+func protoTag(proto string) string {
+	switch proto {
+	case "static":
+		return "S"
+	case "connected":
+		return "C"
+	case "bgp":
+		return "B"
+	case "ospf":
+		return "O"
+	case "isis":
+		return "I"
+	case "rip":
+		return "R"
+	case "dhcp":
+		return "D"
+	default:
+		return "?"
+	}
+}
+
+// FormatRouteTerse formats routes in Junos "show route terse" style.
+func FormatRouteTerse(entries []RouteEntry) string {
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Destination < entries[j].Destination
+	})
+
+	var buf strings.Builder
+	fmt.Fprintf(&buf, "%-3s %-40s %-4s %-20s %s\n", "A/S", "Destination", "P", "Next-hop", "Interface")
+	for _, e := range entries {
+		tag := protoTag(e.Protocol)
+		marker := "* "
+		nh := e.NextHop
+		if nh == "" {
+			nh = ">"
+		}
+		fmt.Fprintf(&buf, "%-3s %-40s %-4s %-20s %s\n", marker, e.Destination, tag, nh, e.Interface)
+	}
+	return buf.String()
 }
 
 // GetVRFRoutes reads routes from a VRF's routing table by VRF device name.
