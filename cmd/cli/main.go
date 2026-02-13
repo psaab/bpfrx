@@ -380,7 +380,7 @@ func (c *ctl) handleShow(args []string) error {
 
 	switch args[0] {
 	case "chassis":
-		return c.showSystemInfo("chassis")
+		return c.showText("chassis")
 
 	case "configuration":
 		format := pb.ConfigFormat_HIERARCHICAL
@@ -1170,7 +1170,7 @@ func (c *ctl) handleShowSystem(args []string) error {
 		return c.showSystemInfo("memory")
 
 	case "storage":
-		return c.showSystemInfo("storage")
+		return c.showText("storage")
 
 	case "license":
 		fmt.Println("License: open-source (no license required)")
