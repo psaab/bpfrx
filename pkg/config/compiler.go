@@ -971,6 +971,10 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 						stream.Port = v
 					}
 				}
+			case "severity":
+				if len(prop.Keys) >= 2 {
+					stream.Severity = prop.Keys[1]
+				}
 			}
 		}
 		if stream.Host != "" {
@@ -1141,6 +1145,9 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 		return nil
 	}
 
+	// Track destination→index so flat "set" duplicates merge into one route.
+	destIdx := make(map[string]int)
+
 	for _, routeNode := range staticNode.FindChildren("route") {
 		if len(routeNode.Keys) < 2 {
 			continue
@@ -1153,15 +1160,17 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 		for _, prop := range routeNode.Children {
 			switch prop.Name() {
 			case "next-hop":
+				nh := NextHopEntry{}
 				if len(prop.Keys) >= 2 {
-					route.NextHop = prop.Keys[1]
+					nh.Address = prop.Keys[1]
 				}
 				// Check children for interface (needed for IPv6 link-local next-hops)
 				for _, child := range prop.Children {
 					if child.Name() == "interface" && len(child.Keys) >= 2 {
-						route.Interface = child.Keys[1]
+						nh.Interface = child.Keys[1]
 					}
 				}
+				route.NextHops = append(route.NextHops, nh)
 			case "discard":
 				route.Discard = true
 			case "preference":
@@ -1171,19 +1180,34 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 					}
 				}
 			case "qualified-next-hop":
+				nh := NextHopEntry{}
 				if len(prop.Keys) >= 2 {
-					route.NextHop = prop.Keys[1]
+					nh.Address = prop.Keys[1]
 				}
 				// Check for "interface <name>" among remaining keys
 				for j := 2; j < len(prop.Keys)-1; j++ {
 					if prop.Keys[j] == "interface" {
-						route.Interface = prop.Keys[j+1]
+						nh.Interface = prop.Keys[j+1]
 					}
 				}
+				route.NextHops = append(route.NextHops, nh)
 			}
 		}
 
-		ro.StaticRoutes = append(ro.StaticRoutes, route)
+		// Merge routes with the same destination (flat "set" syntax creates duplicates).
+		if idx, exists := destIdx[route.Destination]; exists {
+			existing := ro.StaticRoutes[idx]
+			existing.NextHops = append(existing.NextHops, route.NextHops...)
+			if route.Discard {
+				existing.Discard = true
+			}
+			if route.Preference != 5 {
+				existing.Preference = route.Preference
+			}
+		} else {
+			destIdx[route.Destination] = len(ro.StaticRoutes)
+			ro.StaticRoutes = append(ro.StaticRoutes, route)
+		}
 	}
 	return nil
 }

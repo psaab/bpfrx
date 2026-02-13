@@ -554,13 +554,21 @@ func (s *Server) routesHandler(w http.ResponseWriter, _ *http.Request) {
 
 	var result []RouteInfo
 	for _, r := range cfg.RoutingOptions.StaticRoutes {
-		ri := RouteInfo{
-			Destination: r.Destination,
-			NextHop:     r.NextHop,
-			Interface:   r.Interface,
-			Preference:  r.Preference,
+		if r.Discard || len(r.NextHops) == 0 {
+			result = append(result, RouteInfo{
+				Destination: r.Destination,
+				Preference:  r.Preference,
+			})
+			continue
 		}
-		result = append(result, ri)
+		for _, nh := range r.NextHops {
+			result = append(result, RouteInfo{
+				Destination: r.Destination,
+				NextHop:     nh.Address,
+				Interface:   nh.Interface,
+				Preference:  r.Preference,
+			})
+		}
 	}
 	if result == nil {
 		result = []RouteInfo{}

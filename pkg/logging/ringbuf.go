@@ -222,8 +222,10 @@ func (er *EventReader) logEvent(data []byte) {
 		severity := eventSeverity(evt.EventType)
 		msg := formatSyslogMsg(rec)
 		for _, c := range clients {
-			if err := c.Send(severity, msg); err != nil {
-				slog.Debug("syslog send failed", "err", err)
+			if c.ShouldSend(severity) {
+				if err := c.Send(severity, msg); err != nil {
+					slog.Debug("syslog send failed", "err", err)
+				}
 			}
 		}
 	}

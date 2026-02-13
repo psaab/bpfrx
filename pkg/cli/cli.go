@@ -1189,6 +1189,9 @@ func (c *CLI) reloadSyslog(cfg *config.Config) {
 			fmt.Fprintf(os.Stderr, "warning: syslog stream %s: %v\n", name, err)
 			continue
 		}
+		if stream.Severity != "" {
+			client.MinSeverity = logging.ParseSeverity(stream.Severity)
+		}
 		clients = append(clients, client)
 	}
 	c.eventReader.ReplaceSyslogClients(clients)

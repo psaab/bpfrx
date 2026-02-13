@@ -255,7 +255,8 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	return nil
 }
 
-// generateStaticRoute produces a single FRR static route command.
+// generateStaticRoute produces FRR static route commands.
+// Multiple next-hops produce one line each (FRR creates ECMP).
 func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string) string {
 	isV6 := strings.Contains(sr.Destination, ":")
 	prefix := "ip"
@@ -268,25 +269,36 @@ func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string) st
 		vrfPart = " vrf " + vrfName
 	}
 
-	var nexthop string
-	switch {
-	case sr.Discard:
-		nexthop = "Null0"
-	case sr.NextHop != "" && sr.Interface != "":
-		// Gateway + interface (useful for IPv6 link-local next-hops)
-		nexthop = sr.NextHop + " " + sr.Interface
-	case sr.NextHop != "":
-		nexthop = sr.NextHop
-	case sr.Interface != "":
-		nexthop = sr.Interface
-	default:
-		nexthop = "Null0"
+	// Discard or no next-hops: single Null0 line.
+	if sr.Discard || len(sr.NextHops) == 0 {
+		nexthop := "Null0"
+		if sr.Preference > 0 {
+			return fmt.Sprintf("%s route %s %s %d%s\n", prefix, sr.Destination, nexthop, sr.Preference, vrfPart)
+		}
+		return fmt.Sprintf("%s route %s %s%s\n", prefix, sr.Destination, nexthop, vrfPart)
 	}
 
-	if sr.Preference > 0 {
-		return fmt.Sprintf("%s route %s %s %d%s\n", prefix, sr.Destination, nexthop, sr.Preference, vrfPart)
+	// One line per next-hop → FRR creates ECMP.
+	var b strings.Builder
+	for _, nh := range sr.NextHops {
+		var nexthop string
+		switch {
+		case nh.Address != "" && nh.Interface != "":
+			nexthop = nh.Address + " " + nh.Interface
+		case nh.Address != "":
+			nexthop = nh.Address
+		case nh.Interface != "":
+			nexthop = nh.Interface
+		default:
+			continue
+		}
+		if sr.Preference > 0 {
+			fmt.Fprintf(&b, "%s route %s %s %d%s\n", prefix, sr.Destination, nexthop, sr.Preference, vrfPart)
+		} else {
+			fmt.Fprintf(&b, "%s route %s %s%s\n", prefix, sr.Destination, nexthop, vrfPart)
+		}
 	}
-	return fmt.Sprintf("%s route %s %s%s\n", prefix, sr.Destination, nexthop, vrfPart)
+	return b.String()
 }
 
 // Clear removes the bpfrx managed section from frr.conf and reloads FRR.

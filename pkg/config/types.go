@@ -273,9 +273,10 @@ type LogConfig struct {
 
 // SyslogStream defines a syslog forwarding destination.
 type SyslogStream struct {
-	Name string
-	Host string
-	Port int // default 514
+	Name     string
+	Host     string
+	Port     int    // default 514
+	Severity string // "error", "warning", "info", or "" (no filter)
 }
 
 // ZoneConfig represents a security zone.
@@ -556,13 +557,18 @@ type RoutingOptionsConfig struct {
 	StaticRoutes []*StaticRoute
 }
 
+// NextHopEntry defines a single next-hop for a static route.
+type NextHopEntry struct {
+	Address   string // IP address (e.g. "10.0.1.1" or "fe80::1")
+	Interface string // outgoing interface (for IPv6 link-local)
+}
+
 // StaticRoute defines a single static route.
 type StaticRoute struct {
-	Destination string // CIDR: "10.0.0.0/8" or "::/0"
-	NextHop     string // IP or ""
-	Interface   string // outgoing interface or ""
-	Discard     bool   // null route (blackhole)
-	Preference  int    // route preference (admin distance), default 5
+	Destination string         // CIDR: "10.0.0.0/8" or "::/0"
+	NextHops    []NextHopEntry // multiple next-hops = ECMP
+	Discard     bool           // null route (blackhole)
+	Preference  int            // route preference (admin distance), default 5
 }
 
 // ProtocolsConfig holds dynamic routing protocol configuration.

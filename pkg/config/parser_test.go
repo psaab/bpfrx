@@ -698,8 +698,8 @@ func TestRoutingConfigParsing(t *testing.T) {
 
 	// Default route
 	r0 := cfg.RoutingOptions.StaticRoutes[0]
-	if r0.Destination != "0.0.0.0/0" || r0.NextHop != "192.168.1.1" {
-		t.Errorf("route 0: dest=%s nh=%s", r0.Destination, r0.NextHop)
+	if r0.Destination != "0.0.0.0/0" || len(r0.NextHops) != 1 || r0.NextHops[0].Address != "192.168.1.1" {
+		t.Errorf("route 0: dest=%s nhs=%v", r0.Destination, r0.NextHops)
 	}
 	if r0.Preference != 5 {
 		t.Errorf("route 0: expected default preference 5, got %d", r0.Preference)
@@ -711,10 +711,10 @@ func TestRoutingConfigParsing(t *testing.T) {
 		t.Errorf("route 2: dest=%s discard=%v", r2.Destination, r2.Discard)
 	}
 
-	// Route with custom preference
+	// Route with custom preference (merged from separate set lines)
 	r3 := cfg.RoutingOptions.StaticRoutes[3]
-	if r3.Destination != "172.16.0.0/12" || r3.NextHop != "10.0.0.3" {
-		t.Errorf("route 3: dest=%s nh=%s", r3.Destination, r3.NextHop)
+	if r3.Destination != "172.16.0.0/12" || len(r3.NextHops) != 1 || r3.NextHops[0].Address != "10.0.0.3" {
+		t.Errorf("route 3: dest=%s nhs=%v", r3.Destination, r3.NextHops)
 	}
 	if r3.Preference != 100 {
 		t.Errorf("route 3: expected preference 100, got %d", r3.Preference)
@@ -839,6 +839,120 @@ func TestRoutingConfigParsing(t *testing.T) {
 	}
 	if cfg2.Protocols.BGP == nil || cfg2.Protocols.BGP.LocalAS != cfg.Protocols.BGP.LocalAS {
 		t.Error("round-trip BGP mismatch")
+	}
+}
+
+func TestECMPStaticRoutes(t *testing.T) {
+	// Test flat set syntax with multiple next-hops for same destination
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set routing-options static route 10.0.0.0/8 next-hop 10.0.1.1",
+		"set routing-options static route 10.0.0.0/8 next-hop 10.0.2.1",
+		"set routing-options static route 192.168.0.0/16 next-hop 10.0.1.1",
+	}
+	for _, cmd := range setCommands {
+		fields := strings.Fields(cmd)
+		if err := tree.SetPath(fields[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	if len(cfg.RoutingOptions.StaticRoutes) != 2 {
+		t.Fatalf("expected 2 routes, got %d", len(cfg.RoutingOptions.StaticRoutes))
+	}
+
+	// ECMP route should have 2 next-hops
+	r0 := cfg.RoutingOptions.StaticRoutes[0]
+	if r0.Destination != "10.0.0.0/8" {
+		t.Errorf("route 0 dest: %s", r0.Destination)
+	}
+	if len(r0.NextHops) != 2 {
+		t.Fatalf("route 0: expected 2 next-hops, got %d", len(r0.NextHops))
+	}
+	if r0.NextHops[0].Address != "10.0.1.1" || r0.NextHops[1].Address != "10.0.2.1" {
+		t.Errorf("route 0 next-hops: %v", r0.NextHops)
+	}
+
+	// Single next-hop route
+	r1 := cfg.RoutingOptions.StaticRoutes[1]
+	if r1.Destination != "192.168.0.0/16" || len(r1.NextHops) != 1 {
+		t.Errorf("route 1: dest=%s nhs=%v", r1.Destination, r1.NextHops)
+	}
+
+	// Test hierarchical syntax with multiple next-hops
+	hierInput := `routing-options {
+    static {
+        route 10.0.0.0/8 {
+            next-hop 10.0.1.1;
+            next-hop 10.0.2.1;
+            next-hop 10.0.3.1;
+        }
+    }
+}`
+	parser := NewParser(hierInput)
+	hierTree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	hierCfg, err := CompileConfig(hierTree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	if len(hierCfg.RoutingOptions.StaticRoutes) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(hierCfg.RoutingOptions.StaticRoutes))
+	}
+	hr := hierCfg.RoutingOptions.StaticRoutes[0]
+	if len(hr.NextHops) != 3 {
+		t.Fatalf("expected 3 next-hops, got %d", len(hr.NextHops))
+	}
+	if hr.NextHops[0].Address != "10.0.1.1" || hr.NextHops[1].Address != "10.0.2.1" || hr.NextHops[2].Address != "10.0.3.1" {
+		t.Errorf("hierarchical next-hops: %v", hr.NextHops)
+	}
+}
+
+func TestSyslogSeverityParsing(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set security log stream security-events host 192.0.2.1",
+		"set security log stream security-events severity warning",
+		"set security log stream all-events host 192.0.2.2",
+	}
+	for _, cmd := range setCommands {
+		fields := strings.Fields(cmd)
+		if err := tree.SetPath(fields[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	if len(cfg.Security.Log.Streams) != 2 {
+		t.Fatalf("expected 2 streams, got %d", len(cfg.Security.Log.Streams))
+	}
+
+	secEvts := cfg.Security.Log.Streams["security-events"]
+	if secEvts == nil {
+		t.Fatal("missing security-events stream")
+	}
+	if secEvts.Host != "192.0.2.1" {
+		t.Errorf("security-events host: %s", secEvts.Host)
+	}
+	if secEvts.Severity != "warning" {
+		t.Errorf("security-events severity: %s", secEvts.Severity)
+	}
+
+	allEvts := cfg.Security.Log.Streams["all-events"]
+	if allEvts == nil {
+		t.Fatal("missing all-events stream")
+	}
+	if allEvts.Severity != "" {
+		t.Errorf("all-events severity should be empty, got %q", allEvts.Severity)
 	}
 }
 
@@ -1054,8 +1168,8 @@ func TestRoutingInstances(t *testing.T) {
 	if len(comcast.StaticRoutes) != 1 {
 		t.Fatalf("Comcast static routes: expected 1, got %d", len(comcast.StaticRoutes))
 	}
-	if comcast.StaticRoutes[0].NextHop != "74.93.96.1" {
-		t.Errorf("Comcast route next-hop: %s", comcast.StaticRoutes[0].NextHop)
+	if len(comcast.StaticRoutes[0].NextHops) != 1 || comcast.StaticRoutes[0].NextHops[0].Address != "74.93.96.1" {
+		t.Errorf("Comcast route next-hops: %v", comcast.StaticRoutes[0].NextHops)
 	}
 	if comcast.StaticRoutes[0].Preference != 10 {
 		t.Errorf("Comcast route preference: %d", comcast.StaticRoutes[0].Preference)
@@ -2860,8 +2974,8 @@ security {
 	if len(ri.StaticRoutes) != 1 {
 		t.Fatalf("expected 1 static route, got %d", len(ri.StaticRoutes))
 	}
-	if ri.StaticRoutes[0].NextHop != "10.0.2.1" {
-		t.Errorf("next-hop: got %q, want %q", ri.StaticRoutes[0].NextHop, "10.0.2.1")
+	if len(ri.StaticRoutes[0].NextHops) != 1 || ri.StaticRoutes[0].NextHops[0].Address != "10.0.2.1" {
+		t.Errorf("next-hops: got %v, want [{10.0.2.1 }]", ri.StaticRoutes[0].NextHops)
 	}
 
 	// Verify zone references the same interface

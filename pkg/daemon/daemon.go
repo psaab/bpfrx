@@ -619,24 +619,34 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 
 	// 1. Static route next-hops (resolve interface via FIB if not specified)
 	for _, sr := range cfg.RoutingOptions.StaticRoutes {
-		if sr.Discard || sr.NextHop == "" {
+		if sr.Discard {
 			continue
 		}
-		if sr.Interface != "" {
-			addByName(sr.NextHop, sr.Interface)
-		} else {
-			addByIP(sr.NextHop)
+		for _, nh := range sr.NextHops {
+			if nh.Address == "" {
+				continue
+			}
+			if nh.Interface != "" {
+				addByName(nh.Address, nh.Interface)
+			} else {
+				addByIP(nh.Address)
+			}
 		}
 	}
 	for _, ri := range cfg.RoutingInstances {
 		for _, sr := range ri.StaticRoutes {
-			if sr.Discard || sr.NextHop == "" {
+			if sr.Discard {
 				continue
 			}
-			if sr.Interface != "" {
-				addByName(sr.NextHop, sr.Interface)
-			} else {
-				addByIP(sr.NextHop)
+			for _, nh := range sr.NextHops {
+				if nh.Address == "" {
+					continue
+				}
+				if nh.Interface != "" {
+					addByName(nh.Address, nh.Interface)
+				} else {
+					addByIP(nh.Address)
+				}
 			}
 		}
 	}
@@ -935,8 +945,12 @@ func applySyslogConfig(er *logging.EventReader, cfg *config.Config) {
 				"stream", name, "host", stream.Host, "err", err)
 			continue
 		}
+		if stream.Severity != "" {
+			client.MinSeverity = logging.ParseSeverity(stream.Severity)
+		}
 		slog.Info("syslog stream configured",
-			"stream", name, "host", stream.Host, "port", stream.Port)
+			"stream", name, "host", stream.Host, "port", stream.Port,
+			"severity", stream.Severity)
 		clients = append(clients, client)
 	}
 	if len(clients) > 0 {
