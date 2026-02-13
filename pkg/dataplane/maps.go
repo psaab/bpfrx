@@ -702,7 +702,21 @@ func (m *Manager) ClearPolicyCounters() error {
 	return nil
 }
 
-// ClearAllCounters zeroes all counter maps (global, interface, zone, policy).
+// ClearFilterCounters zeroes all filter counter entries.
+func (m *Manager) ClearFilterCounters() error {
+	zm, ok := m.maps["filter_counters"]
+	if !ok {
+		return fmt.Errorf("filter_counters map not found")
+	}
+	numCPUs := ebpf.MustPossibleCPU()
+	zero := make([]CounterValue, numCPUs)
+	for i := uint32(0); i < MaxFilterRules; i++ {
+		zm.Update(i, zero, ebpf.UpdateAny)
+	}
+	return nil
+}
+
+// ClearAllCounters zeroes all counter maps (global, interface, zone, policy, filter).
 func (m *Manager) ClearAllCounters() error {
 	if err := m.ClearGlobalCounters(); err != nil {
 		return err
@@ -713,7 +727,10 @@ func (m *Manager) ClearAllCounters() error {
 	if err := m.ClearZoneCounters(); err != nil {
 		return err
 	}
-	return m.ClearPolicyCounters()
+	if err := m.ClearPolicyCounters(); err != nil {
+		return err
+	}
+	return m.ClearFilterCounters()
 }
 
 // htons converts a uint16 from host to network byte order.

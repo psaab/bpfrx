@@ -2,9 +2,11 @@ package api
 
 import (
 	"net"
+	"sort"
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/dataplane"
 )
 
@@ -33,6 +35,9 @@ type bpfrxCollector struct {
 
 	// Policy counters
 	policyHitsTotal *prometheus.Desc
+
+	// Filter counters
+	filterHitsTotal *prometheus.Desc
 
 	// Session gauges (from GC)
 	sessionsActive      *prometheus.Desc
@@ -125,6 +130,11 @@ func newCollector(srv *Server) *bpfrxCollector {
 			"Total policy rule hits.",
 			[]string{"from_zone", "to_zone", "rule"}, nil,
 		),
+		filterHitsTotal: prometheus.NewDesc(
+			"bpfrx_filter_hits_total",
+			"Total firewall filter term hits.",
+			[]string{"filter", "family", "term"}, nil,
+		),
 		sessionsActive: prometheus.NewDesc(
 			"bpfrx_sessions_active",
 			"Current number of active session entries.",
@@ -193,6 +203,7 @@ func (c *bpfrxCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.zonePacketsTotal
 	ch <- c.zoneBytesTotal
 	ch <- c.policyHitsTotal
+	ch <- c.filterHitsTotal
 	ch <- c.sessionsActive
 	ch <- c.sessionsEstablished
 	ch <- c.sessionsIPv4
@@ -215,6 +226,7 @@ func (c *bpfrxCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectInterfaceCounters(ch, dp)
 	c.collectZoneCounters(ch, dp)
 	c.collectPolicyCounters(ch, dp)
+	c.collectFilterCounters(ch, dp)
 	c.collectSessionGauges(ch, dp)
 	c.collectNATPoolMetrics(ch, dp)
 	c.collectDHCPMetrics(ch)
@@ -347,6 +359,60 @@ func (c *bpfrxCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp *
 			policyID++
 		}
 	}
+}
+
+func (c *bpfrxCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp *dataplane.Manager) {
+	cfg := c.srv.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	cr := dp.LastCompileResult()
+	if cr == nil || cr.FilterIDs == nil {
+		return
+	}
+
+	emitFilters := func(family string, filters map[string]*config.FirewallFilter) {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			fid, ok := cr.FilterIDs[family+":"+name]
+			if !ok {
+				continue
+			}
+			fcfg, err := dp.ReadFilterConfig(fid)
+			if err != nil {
+				continue
+			}
+			ruleOffset := fcfg.RuleStart
+			for _, term := range filter.Terms {
+				nSrc := len(term.SourceAddresses)
+				if nSrc == 0 {
+					nSrc = 1
+				}
+				nDst := len(term.DestAddresses)
+				if nDst == 0 {
+					nDst = 1
+				}
+				numRules := uint32(nSrc * nDst)
+				var totalPkts uint64
+				for i := uint32(0); i < numRules; i++ {
+					if ctrs, err := dp.ReadFilterCounters(ruleOffset + i); err == nil {
+						totalPkts += ctrs.Packets
+					}
+				}
+				ch <- prometheus.MustNewConstMetric(c.filterHitsTotal, prometheus.CounterValue,
+					float64(totalPkts), name, family, term.Name)
+				ruleOffset += numRules
+			}
+		}
+	}
+
+	emitFilters("inet", cfg.Firewall.FiltersInet)
+	emitFilters("inet6", cfg.Firewall.FiltersInet6)
 }
 
 func (c *bpfrxCollector) collectSessionGauges(ch chan<- prometheus.Metric, dp *dataplane.Manager) {
