@@ -968,6 +968,10 @@ evaluate_firewall_filter(struct pkt_meta *meta)
 			bpf_map_lookup_elem(&filter_counters, &idx);
 		if (fc) { fc->packets++; fc->bytes += meta->pkt_len; }
 
+		/* DSCP rewrite if configured */
+		if (rule->dscp_rewrite != 0xFF)
+			meta->dscp_rewrite = rule->dscp_rewrite;
+
 		/* Term matched — apply action */
 		switch (rule->action) {
 		case FILTER_ACTION_ACCEPT:
@@ -1090,6 +1094,9 @@ evaluate_firewall_filter_output(struct pkt_meta *meta, __u32 egress_ifindex)
 		struct counter_value *fc =
 			bpf_map_lookup_elem(&filter_counters, &idx);
 		if (fc) { fc->packets++; fc->bytes += meta->pkt_len; }
+
+		if (rule->dscp_rewrite != 0xFF)
+			meta->dscp_rewrite = rule->dscp_rewrite;
 
 		switch (rule->action) {
 		case FILTER_ACTION_ACCEPT:

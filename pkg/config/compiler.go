@@ -3069,6 +3069,8 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 			if len(child.Keys) >= 2 {
 				term.LossPriority = child.Keys[1]
 			}
+		case "dscp", "traffic-class":
+			term.DSCPRewrite = nodeVal(child)
 		}
 	}
 }

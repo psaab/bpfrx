@@ -38,6 +38,7 @@ int xdp_cpumap_prog(struct xdp_md *ctx)
 	meta->direction = 0; /* ingress */
 	meta->ingress_ifindex = ctx->ingress_ifindex;
 	meta->ingress_vlan_id = vlan_id;
+	meta->dscp_rewrite = 0xFF; /* no DSCP rewrite by default */
 
 	/* Strip VLAN tag if present so pipeline sees plain Ethernet */
 	if (vlan_id != 0) {
@@ -78,6 +79,41 @@ int xdp_cpumap_prog(struct xdp_md *ctx)
 	int filt_rc = evaluate_firewall_filter(meta);
 	if (filt_rc < 0)
 		return XDP_DROP;
+
+	/* Apply DSCP rewrite if filter term set one */
+	if (meta->dscp_rewrite != 0xFF) {
+		data     = (void *)(long)ctx->data;
+		data_end = (void *)(long)ctx->data_end;
+		struct ethhdr *rw_eth = data;
+		if ((void *)(rw_eth + 1) > data_end)
+			return XDP_DROP;
+		if (meta->addr_family == AF_INET) {
+			struct iphdr *iph = (void *)(rw_eth + 1);
+			if ((void *)(iph + 1) <= data_end) {
+				__u8 old_tos = iph->tos;
+				__u8 new_tos = (meta->dscp_rewrite << 2) | (old_tos & 0x03);
+				if (old_tos != new_tos) {
+					__be16 old_w = bpf_htons((__u16)old_tos);
+					__be16 new_w = bpf_htons((__u16)new_tos);
+					csum_update_2(&iph->check, old_w, new_w);
+					iph->tos = new_tos;
+					meta->dscp = meta->dscp_rewrite;
+				}
+			}
+		} else {
+			struct ipv6hdr *ip6 = (void *)(rw_eth + 1);
+			if ((void *)(ip6 + 1) <= data_end) {
+				__u8 *hdr = (__u8 *)ip6;
+				__u8 old_tc = ((hdr[0] & 0x0F) << 4) | ((hdr[1] & 0xF0) >> 4);
+				__u8 new_tc = (meta->dscp_rewrite << 2) | (old_tc & 0x03);
+				if (old_tc != new_tc) {
+					hdr[0] = (hdr[0] & 0xF0) | ((new_tc >> 4) & 0x0F);
+					hdr[1] = (new_tc << 4) | (hdr[1] & 0x0F);
+					meta->dscp = meta->dscp_rewrite;
+				}
+			}
+		}
+	}
 
 	/* Increment global RX counter and per-interface RX counter */
 	inc_counter(GLOBAL_CTR_RX_PACKETS);

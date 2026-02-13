@@ -110,10 +110,13 @@ type bpfrxXdpNat64FilterRule struct {
 	Family       uint8
 	DstPort      uint16
 	SrcPort      uint16
+	DscpRewrite  uint8
+	Pad          uint8
 	SrcAddr      [16]uint8
 	SrcMask      [16]uint8
 	DstAddr      [16]uint8
 	DstMask      [16]uint8
+	_            [2]byte
 	RoutingTable uint32
 }
 
@@ -209,11 +212,13 @@ type bpfrxXdpNat64Nat64StateValue struct {
 }
 
 type bpfrxXdpNat64NatPoolConfig struct {
-	_        structs.HostLayout
-	NumIps   uint16
-	NumIpsV6 uint16
-	PortLow  uint16
-	PortHigh uint16
+	_              structs.HostLayout
+	NumIps         uint16
+	NumIpsV6       uint16
+	PortLow        uint16
+	PortHigh       uint16
+	AddrPersistent uint8
+	Pad            [3]uint8
 }
 
 type bpfrxXdpNat64NatPoolIpV6 struct {
@@ -284,6 +289,8 @@ type bpfrxXdpNat64PktMeta struct {
 	FwdDmac      [6]uint8
 	FwdSmac      [6]uint8
 	RoutingTable uint32
+	DscpRewrite  uint8
+	PadMeta      [3]uint8
 }
 
 type bpfrxXdpNat64PolicyRule struct {
@@ -463,6 +470,8 @@ type bpfrxXdpNat64ZoneConfig struct {
 	ZoneId           uint16
 	ScreenProfileId  uint16
 	HostInboundFlags uint32
+	TcpRst           uint8
+	Pad              [3]uint8
 }
 
 type bpfrxXdpNat64ZonePairKey struct {

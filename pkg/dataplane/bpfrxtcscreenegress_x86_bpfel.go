@@ -110,10 +110,13 @@ type bpfrxTcScreenEgressFilterRule struct {
 	Family       uint8
 	DstPort      uint16
 	SrcPort      uint16
+	DscpRewrite  uint8
+	Pad          uint8
 	SrcAddr      [16]uint8
 	SrcMask      [16]uint8
 	DstAddr      [16]uint8
 	DstMask      [16]uint8
+	_            [2]byte
 	RoutingTable uint32
 }
 
@@ -266,6 +269,8 @@ type bpfrxTcScreenEgressPktMeta struct {
 	FwdDmac      [6]uint8
 	FwdSmac      [6]uint8
 	RoutingTable uint32
+	DscpRewrite  uint8
+	PadMeta      [3]uint8
 }
 
 type bpfrxTcScreenEgressPolicyRule struct {
@@ -445,6 +450,8 @@ type bpfrxTcScreenEgressZoneConfig struct {
 	ZoneId           uint16
 	ScreenProfileId  uint16
 	HostInboundFlags uint32
+	TcpRst           uint8
+	Pad              [3]uint8
 }
 
 type bpfrxTcScreenEgressZonePairKey struct {

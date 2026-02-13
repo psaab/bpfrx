@@ -1727,6 +1727,91 @@ func TestFirewallFilterSourcePort(t *testing.T) {
 	}
 }
 
+func TestFirewallFilterDSCPRewrite(t *testing.T) {
+	// Hierarchical format
+	input := `firewall {
+    family inet {
+        filter dscp-mark {
+            term mark-voice {
+                from {
+                    protocol udp;
+                    destination-port 5060;
+                }
+                then {
+                    dscp ef;
+                    accept;
+                }
+            }
+            term mark-bulk {
+                from {
+                    protocol tcp;
+                }
+                then {
+                    dscp af11;
+                    accept;
+                }
+            }
+            term default {
+                then accept;
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	f, ok := cfg.Firewall.FiltersInet["dscp-mark"]
+	if !ok {
+		t.Fatal("expected dscp-mark filter")
+	}
+	if len(f.Terms) != 3 {
+		t.Fatalf("expected 3 terms, got %d", len(f.Terms))
+	}
+	if f.Terms[0].DSCPRewrite != "ef" {
+		t.Errorf("expected DSCPRewrite ef, got %q", f.Terms[0].DSCPRewrite)
+	}
+	if f.Terms[1].DSCPRewrite != "af11" {
+		t.Errorf("expected DSCPRewrite af11, got %q", f.Terms[1].DSCPRewrite)
+	}
+	if f.Terms[2].DSCPRewrite != "" {
+		t.Errorf("expected no DSCPRewrite on default term, got %q", f.Terms[2].DSCPRewrite)
+	}
+
+	// Test set-command format
+	tree2 := &ConfigTree{}
+	cmds := []string{
+		"set firewall family inet filter dscp-set term t1 from protocol udp",
+		"set firewall family inet filter dscp-set term t1 then dscp ef",
+		"set firewall family inet filter dscp-set term t1 then accept",
+	}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree2.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg2, err := CompileConfig(tree2)
+	if err != nil {
+		t.Fatalf("set-command compile: %v", err)
+	}
+	f2, ok := cfg2.Firewall.FiltersInet["dscp-set"]
+	if !ok {
+		t.Fatal("expected dscp-set filter")
+	}
+	if f2.Terms[0].DSCPRewrite != "ef" {
+		t.Errorf("set-command: expected DSCPRewrite ef, got %q", f2.Terms[0].DSCPRewrite)
+	}
+}
+
 func TestFirewallPrefixList(t *testing.T) {
 	input := `policy-options {
     prefix-list management-hosts {

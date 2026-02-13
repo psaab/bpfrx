@@ -389,6 +389,7 @@ type FirewallFilterTerm struct {
 	Count              string              // counter name
 	ForwardingClass    string              // forwarding-class name
 	LossPriority       string              // loss-priority (low, medium-low, medium-high, high)
+	DSCPRewrite        string              // then dscp <value> — rewrite DSCP/traffic-class
 }
 
 // PrefixListRef references a named prefix-list with optional "except" modifier.

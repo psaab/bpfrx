@@ -612,6 +612,7 @@ type FilterRule struct {
 	SrcMask      [16]byte
 	DstAddr      [16]byte
 	DstMask      [16]byte
+	_            [2]byte // C struct padding for __u32 alignment
 	RoutingTable uint32
 }
 
