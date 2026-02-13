@@ -247,6 +247,65 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
+	// Validate SNAT pool references
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			if rule.Then.PoolName != "" {
+				if _, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]; !ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"source-nat %q rule %q: pool %q not defined",
+						rs.Name, rule.Name, rule.Then.PoolName))
+				}
+			}
+		}
+	}
+
+	// Validate zone interface references
+	configuredIfaces := make(map[string]bool)
+	for name := range cfg.Interfaces.Interfaces {
+		configuredIfaces[name] = true
+	}
+	for zoneName, zone := range cfg.Security.Zones {
+		for _, ifName := range zone.Interfaces {
+			// Strip unit suffix (e.g. "trust0.0" -> "trust0")
+			base := ifName
+			if idx := strings.Index(ifName, "."); idx > 0 {
+				base = ifName[:idx]
+			}
+			if !configuredIfaces[base] {
+				warnings = append(warnings, fmt.Sprintf(
+					"zone %q: interface %q not in interfaces config", zoneName, ifName))
+			}
+		}
+	}
+
+	// Validate scheduler references in policies
+	for _, zpp := range cfg.Security.Policies {
+		for _, p := range zpp.Policies {
+			if p.SchedulerName != "" {
+				if _, ok := cfg.Schedulers[p.SchedulerName]; !ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"policy %q: scheduler %q not defined", p.Name, p.SchedulerName))
+				}
+			}
+		}
+	}
+
+	// Validate routing-instance interface references
+	for _, ri := range cfg.RoutingInstances {
+		for _, ifName := range ri.Interfaces {
+			base := ifName
+			if idx := strings.Index(ifName, "."); idx > 0 {
+				base = ifName[:idx]
+			}
+			if !configuredIfaces[base] {
+				warnings = append(warnings, fmt.Sprintf(
+					"routing-instance %q: interface %q not in interfaces config",
+					ri.Name, ifName))
+			}
+		}
+	}
+
 	// Validate firewall filter references on interfaces
 	for ifName, ifc := range cfg.Interfaces.Interfaces {
 		for unitNum, unit := range ifc.Units {

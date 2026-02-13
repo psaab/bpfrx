@@ -602,6 +602,10 @@ func (c *ctl) showZones() error {
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
+
+	// Fetch policies for cross-reference
+	polResp, _ := c.client.GetPolicies(context.Background(), &pb.GetPoliciesRequest{})
+
 	for _, z := range resp.Zones {
 		if z.Id > 0 {
 			fmt.Printf("Zone: %s (id: %d)\n", z.Name, z.Id)
@@ -620,6 +624,26 @@ func (c *ctl) showZones() error {
 			fmt.Printf("    Input:  %d packets, %d bytes\n", z.IngressPackets, z.IngressBytes)
 			fmt.Printf("    Output: %d packets, %d bytes\n", z.EgressPackets, z.EgressBytes)
 		}
+
+		// Show policies referencing this zone
+		if polResp != nil {
+			var refs []string
+			for _, pi := range polResp.Policies {
+				if pi.FromZone == z.Name || pi.ToZone == z.Name {
+					dir := "from"
+					peer := pi.ToZone
+					if pi.ToZone == z.Name {
+						dir = "to"
+						peer = pi.FromZone
+					}
+					refs = append(refs, fmt.Sprintf("%s %s (%d rules)", dir, peer, len(pi.Rules)))
+				}
+			}
+			if len(refs) > 0 {
+				fmt.Printf("  Policies: %s\n", strings.Join(refs, ", "))
+			}
+		}
+
 		fmt.Println()
 	}
 	return nil
