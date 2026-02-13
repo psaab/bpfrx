@@ -1146,6 +1146,9 @@ func applySyslogConfig(er *logging.EventReader, cfg *config.Config) {
 		if stream.Facility != "" {
 			client.Facility = logging.ParseFacility(stream.Facility)
 		}
+		if stream.Category != "" {
+			client.Categories = logging.ParseCategory(stream.Category)
+		}
 		// Per-stream format overrides global log format
 		format := stream.Format
 		if format == "" {
@@ -1157,7 +1160,7 @@ func applySyslogConfig(er *logging.EventReader, cfg *config.Config) {
 		slog.Info("syslog stream configured",
 			"stream", name, "host", stream.Host, "port", stream.Port,
 			"severity", stream.Severity, "facility", stream.Facility,
-			"format", format)
+			"format", format, "category", stream.Category)
 		clients = append(clients, client)
 	}
 	if len(clients) > 0 {

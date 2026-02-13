@@ -588,7 +588,19 @@ func (c *ctl) handleShowSecurity(args []string) error {
 			}
 			return c.showTextFiltered("policies-hit-count", strings.Join(filterParts, " "))
 		}
-		return c.showPolicies()
+		// Parse from-zone/to-zone filter for regular policy display
+		var fromZone, toZone string
+		for i := 1; i+1 < len(args); i++ {
+			switch args[i] {
+			case "from-zone":
+				i++
+				fromZone = args[i]
+			case "to-zone":
+				i++
+				toZone = args[i]
+			}
+		}
+		return c.showPoliciesFiltered(fromZone, toZone)
 	case "screen":
 		return c.showScreen()
 	case "flow":
@@ -690,12 +702,18 @@ func (c *ctl) showZones() error {
 	return nil
 }
 
-func (c *ctl) showPolicies() error {
+func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
 	resp, err := c.client.GetPolicies(context.Background(), &pb.GetPoliciesRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
 	for _, pi := range resp.Policies {
+		if fromZone != "" && pi.FromZone != fromZone {
+			continue
+		}
+		if toZone != "" && pi.ToZone != toZone {
+			continue
+		}
 		fmt.Printf("From zone: %s, To zone: %s\n", pi.FromZone, pi.ToZone)
 		for _, rule := range pi.Rules {
 			fmt.Printf("  Rule: %s\n", rule.Name)

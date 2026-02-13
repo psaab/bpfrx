@@ -1743,6 +1743,9 @@ func (c *CLI) reloadSyslog(cfg *config.Config) {
 		if stream.Severity != "" {
 			client.MinSeverity = logging.ParseSeverity(stream.Severity)
 		}
+		if stream.Category != "" {
+			client.Categories = logging.ParseCategory(stream.Category)
+		}
 		clients = append(clients, client)
 	}
 	c.eventReader.ReplaceSyslogClients(clients)
@@ -4953,7 +4956,11 @@ func (c *CLI) showSystemServices() error {
 			if stream.Severity != "" {
 				sev = stream.Severity + "+"
 			}
-			fmt.Printf("    %-16s %s:%d (%s)\n", stream.Name, stream.Host, stream.Port, sev)
+			cat := "all"
+			if stream.Category != "" && stream.Category != "all" {
+				cat = stream.Category
+			}
+			fmt.Printf("    %-16s %s:%d (severity=%s, category=%s)\n", stream.Name, stream.Host, stream.Port, sev, cat)
 		}
 	}
 

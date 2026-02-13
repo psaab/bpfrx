@@ -138,11 +138,11 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **NAT**: SNAT (interface + pool), DNAT, static 1:1, NAT64 (native BPF)
 - **IPv4 + IPv6**: Dual-stack, DHCPv4/v6 clients, Router Advertisements
 - **Screen/IDS**: 11 checks (land, syn-flood, ping-death, teardrop, rate-limiting)
-- **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, export/redistribute
+- **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, export/redistribute, ECMP multipath, next-table inter-VRF route leaking
 - **VLANs**: 802.1Q tagging in BPF, trunk ports
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces
 - **Observability**: Syslog (with facility/severity filtering), NetFlow v9, Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB)
-- **Flow**: TCP MSS clamping, ALG control, configurable timeouts, firewall filters + DSCP
+- **Flow**: TCP MSS clamping, ALG control, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, forwarding-class DSCP rewrite)
 - **HA**: VRRP via keepalived (config generation, runtime state detection)
 - **DHCP**: Relay (Option 82), server (Kea integration with lease display)
 - **CLI**: Junos-style prefix matching, "Possible completions:" headers, zone names in session display, config validation warnings

@@ -220,14 +220,31 @@ func (er *EventReader) logEvent(data []byte) {
 
 	if len(clients) > 0 {
 		severity := eventSeverity(evt.EventType)
+		catBit := eventCategory(evt.EventType)
 		msg := formatSyslogMsg(rec)
 		for _, c := range clients {
-			if c.ShouldSend(severity) {
+			if c.ShouldSendEvent(severity, catBit) {
 				if err := c.Send(severity, msg); err != nil {
 					slog.Debug("syslog send failed", "err", err)
 				}
 			}
 		}
+	}
+}
+
+// eventCategory maps event types to category bitmask values.
+func eventCategory(eventType uint8) uint8 {
+	switch eventType {
+	case dataplane.EventTypeSessionOpen, dataplane.EventTypeSessionClose:
+		return CategorySession
+	case dataplane.EventTypePolicyDeny:
+		return CategoryPolicy
+	case dataplane.EventTypeScreenDrop:
+		return CategoryScreen
+	case dataplane.EventTypeFilterLog:
+		return CategoryFirewall
+	default:
+		return CategoryAll // unknown events pass all category filters
 	}
 }
 

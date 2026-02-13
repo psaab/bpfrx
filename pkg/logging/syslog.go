@@ -39,7 +39,17 @@ type SyslogClient struct {
 	Facility    int    // syslog facility code (default: FacilityLocal0)
 	MinSeverity int    // 0 = no filter, else SyslogError(3)/SyslogWarning(4)/SyslogInfo(6)
 	Format      string // "sd-syslog" for RFC 5424, "" for RFC 3164
+	Categories  uint8  // bitmask of allowed event categories (0 = all)
 }
+
+// Category bitmask constants for event filtering.
+const (
+	CategorySession  uint8 = 1 << 0 // SESSION_OPEN, SESSION_CLOSE
+	CategoryPolicy   uint8 = 1 << 1 // POLICY_DENY
+	CategoryScreen   uint8 = 1 << 2 // SCREEN_DROP
+	CategoryFirewall uint8 = 1 << 3 // FILTER_LOG
+	CategoryAll      uint8 = CategorySession | CategoryPolicy | CategoryScreen | CategoryFirewall
+)
 
 // NewSyslogClient creates a new UDP syslog client connected to host:port.
 func NewSyslogClient(host string, port int) (*SyslogClient, error) {
@@ -96,6 +106,33 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 // Lower severity number = higher priority (error=3 < warning=4 < info=6).
 func (s *SyslogClient) ShouldSend(severity int) bool {
 	return s.MinSeverity == 0 || severity <= s.MinSeverity
+}
+
+// ShouldSendEvent returns true if both severity and category filters pass.
+func (s *SyslogClient) ShouldSendEvent(severity int, categoryBit uint8) bool {
+	if !s.ShouldSend(severity) {
+		return false
+	}
+	return s.Categories == 0 || s.Categories&categoryBit != 0
+}
+
+// ParseCategory converts a Junos category name to a bitmask.
+// "all" or "" returns 0 (no filter = send everything).
+func ParseCategory(name string) uint8 {
+	switch name {
+	case "all", "":
+		return 0
+	case "session":
+		return CategorySession
+	case "policy":
+		return CategoryPolicy
+	case "screen":
+		return CategoryScreen
+	case "firewall":
+		return CategoryFirewall
+	default:
+		return 0
+	}
 }
 
 // ParseSeverity converts a severity name to its numeric value.
