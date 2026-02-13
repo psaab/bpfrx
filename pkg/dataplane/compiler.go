@@ -1399,69 +1399,80 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 					}
 				}
 
-				// Determine port (use pool port if set, else match port)
-				dstPort := uint16(rule.Match.DestinationPort)
-				poolPort := dstPort
-				if pool.Port != 0 {
-					poolPort = uint16(pool.Port)
-				}
-
-				// Determine protocol(s) to insert DNAT entries for.
-				// If protocol is explicitly set, use it.
-				// If protocol not set but port is set, default to TCP(6).
-				// If neither protocol nor port set, create entries for both TCP(6) and UDP(17)
-				// with port=0 (wildcard port, matched via BPF fallback lookup).
-				var protos []uint8
-				if rule.Match.Protocol != "" {
-					protos = []uint8{protocolNumber(rule.Match.Protocol)}
-				} else if dstPort != 0 {
-					protos = []uint8{6} // TCP default for port-based DNAT
+				// Build list of destination ports to create rules for.
+				// Multi-port DNAT creates one BPF rule per port.
+				var dstPorts []uint16
+				if len(rule.Match.DestinationPorts) > 0 {
+					for _, p := range rule.Match.DestinationPorts {
+						dstPorts = append(dstPorts, uint16(p))
+					}
 				} else {
-					protos = []uint8{6, 17} // both TCP and UDP for port-less DNAT
+					dstPorts = []uint16{uint16(rule.Match.DestinationPort)}
 				}
 
-				for _, proto := range protos {
-					// Route to v4 or v6 DNAT table based on match IP
-					if matchIP.To4() != nil {
-						dk := DNATKey{
-							Protocol: proto,
-							DstIP:    ipToUint32BE(matchIP),
-							DstPort:  htons(dstPort),
-						}
-						dv := DNATValue{
-							NewDstIP:   ipToUint32BE(poolIP),
-							NewDstPort: htons(poolPort),
-							Flags:      DNATFlagStatic,
-						}
-						if err := m.SetDNATEntry(dk, dv); err != nil {
-							return fmt.Errorf("set dnat entry %s/%s proto %d: %w",
-								rs.Name, rule.Name, proto, err)
-						}
-						writtenDNAT[dk] = true
-					} else {
-						dk := DNATKeyV6{
-							Protocol: proto,
-							DstIP:    ipTo16Bytes(matchIP),
-							DstPort:  htons(dstPort),
-						}
-						dv := DNATValueV6{
-							NewDstIP:   ipTo16Bytes(poolIP),
-							NewDstPort: htons(poolPort),
-							Flags:      DNATFlagStatic,
-						}
-						if err := m.SetDNATEntryV6(dk, dv); err != nil {
-							return fmt.Errorf("set dnat_v6 entry %s/%s proto %d: %w",
-								rs.Name, rule.Name, proto, err)
-						}
-						writtenDNATv6[dk] = true
+				for _, dstPort := range dstPorts {
+					poolPort := dstPort
+					if pool.Port != 0 {
+						poolPort = uint16(pool.Port)
 					}
 
-					slog.Info("destination NAT rule compiled",
-						"rule-set", rs.Name, "rule", rule.Name,
-						"match_ip", matchIP, "match_port", dstPort,
-						"proto", proto,
-						"pool", pool.Name, "pool_ip", poolIP,
-						"pool_port", poolPort)
+					// Determine protocol(s) to insert DNAT entries for.
+					// If protocol is explicitly set, use it.
+					// If protocol not set but port is set, default to TCP(6).
+					// If neither protocol nor port set, create entries for both TCP(6) and UDP(17)
+					// with port=0 (wildcard port, matched via BPF fallback lookup).
+					var protos []uint8
+					if rule.Match.Protocol != "" {
+						protos = []uint8{protocolNumber(rule.Match.Protocol)}
+					} else if dstPort != 0 {
+						protos = []uint8{6} // TCP default for port-based DNAT
+					} else {
+						protos = []uint8{6, 17} // both TCP and UDP for port-less DNAT
+					}
+
+					for _, proto := range protos {
+						// Route to v4 or v6 DNAT table based on match IP
+						if matchIP.To4() != nil {
+							dk := DNATKey{
+								Protocol: proto,
+								DstIP:    ipToUint32BE(matchIP),
+								DstPort:  htons(dstPort),
+							}
+							dv := DNATValue{
+								NewDstIP:   ipToUint32BE(poolIP),
+								NewDstPort: htons(poolPort),
+								Flags:      DNATFlagStatic,
+							}
+							if err := m.SetDNATEntry(dk, dv); err != nil {
+								return fmt.Errorf("set dnat entry %s/%s proto %d: %w",
+									rs.Name, rule.Name, proto, err)
+							}
+							writtenDNAT[dk] = true
+						} else {
+							dk := DNATKeyV6{
+								Protocol: proto,
+								DstIP:    ipTo16Bytes(matchIP),
+								DstPort:  htons(dstPort),
+							}
+							dv := DNATValueV6{
+								NewDstIP:   ipTo16Bytes(poolIP),
+								NewDstPort: htons(poolPort),
+								Flags:      DNATFlagStatic,
+							}
+							if err := m.SetDNATEntryV6(dk, dv); err != nil {
+								return fmt.Errorf("set dnat_v6 entry %s/%s proto %d: %w",
+									rs.Name, rule.Name, proto, err)
+							}
+							writtenDNATv6[dk] = true
+						}
+
+						slog.Info("destination NAT rule compiled",
+							"rule-set", rs.Name, "rule", rule.Name,
+							"match_ip", matchIP, "match_port", dstPort,
+							"proto", proto,
+							"pool", pool.Name, "pool_ip", poolIP,
+							"pool_port", poolPort)
+					}
 				}
 			}
 		}
