@@ -121,3 +121,79 @@ func TestExpandFilterTermNoNegateWithoutExcept(t *testing.T) {
 		t.Error("unexpected FilterMatchDstNegate")
 	}
 }
+
+func TestBuildScreenConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		sf     *config.SynFloodConfig
+		expect ScreenConfig
+	}{
+		{
+			name: "attack threshold only",
+			sf: &config.SynFloodConfig{
+				AttackThreshold: 1000,
+			},
+			expect: ScreenConfig{
+				Flags:          ScreenSynFlood,
+				SynFloodThresh: 1000,
+			},
+		},
+		{
+			name: "all thresholds and timeout",
+			sf: &config.SynFloodConfig{
+				AttackThreshold:      5000,
+				SourceThreshold:      100,
+				DestinationThreshold: 200,
+				Timeout:              10,
+			},
+			expect: ScreenConfig{
+				Flags:             ScreenSynFlood,
+				SynFloodThresh:    5000,
+				SynFloodSrcThresh: 100,
+				SynFloodDstThresh: 200,
+				SynFloodTimeout:   10,
+			},
+		},
+		{
+			name: "zero source/dest thresholds omitted",
+			sf: &config.SynFloodConfig{
+				AttackThreshold: 2000,
+				Timeout:         5,
+			},
+			expect: ScreenConfig{
+				Flags:           ScreenSynFlood,
+				SynFloodThresh:  2000,
+				SynFloodTimeout: 5,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			profile := &config.ScreenProfile{
+				TCP: config.TCPScreen{SynFlood: tt.sf},
+			}
+
+			var flags uint32
+			var sc ScreenConfig
+			if profile.TCP.SynFlood != nil && profile.TCP.SynFlood.AttackThreshold > 0 {
+				flags |= ScreenSynFlood
+				sc.SynFloodThresh = uint32(profile.TCP.SynFlood.AttackThreshold)
+				if profile.TCP.SynFlood.SourceThreshold > 0 {
+					sc.SynFloodSrcThresh = uint32(profile.TCP.SynFlood.SourceThreshold)
+				}
+				if profile.TCP.SynFlood.DestinationThreshold > 0 {
+					sc.SynFloodDstThresh = uint32(profile.TCP.SynFlood.DestinationThreshold)
+				}
+				if profile.TCP.SynFlood.Timeout > 0 {
+					sc.SynFloodTimeout = uint32(profile.TCP.SynFlood.Timeout)
+				}
+			}
+			sc.Flags = flags
+
+			if sc != tt.expect {
+				t.Errorf("got %+v, want %+v", sc, tt.expect)
+			}
+		})
+	}
+}

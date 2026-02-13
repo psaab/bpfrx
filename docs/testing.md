@@ -437,6 +437,6 @@ These config features are parsed in Go but never used at runtime:
 | Feature | Where Parsed | Status |
 |---------|-------------|--------|
 | `rib-groups` | compiler.go:1971-2011 | Parsed, not passed to FRR |
-| `SamplingInput/Output` | compiler.go:1028-1074 | Parsed, not wired to flow export |
+| `SamplingInput/Output` | compiler.go:1028-1074, exporter.go | Wired: per-zone sampling direction filters flow export |
 | `LogConfig.Mode` | compiler.go:1591 | Parsed, stream mode always used |
 | `WebMgmt interface binding` | compiler.go:3343-3360 | Parsed, servers always bind to localhost |

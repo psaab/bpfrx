@@ -801,7 +801,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 	args[0] = resolved
 
 	cfg := c.store.ActiveConfig()
-	if cfg == nil && args[0] != "statistics" && args[0] != "ipsec" {
+	if cfg == nil && args[0] != "statistics" && args[0] != "ipsec" && args[0] != "alarms" {
 		fmt.Println("no active configuration")
 		return nil
 	}
@@ -1044,7 +1044,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		return fmt.Errorf("unknown show security flow target")
 
 	case "screen":
-		return c.showScreen()
+		return c.handleShowScreen(args[1:])
 
 	case "nat":
 		return c.handleShowNAT(args[1:])
@@ -1066,6 +1066,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 
 	case "ike":
 		return c.showIKE(args[1:])
+
+	case "alarms":
+		return c.showSecurityAlarms(args[1:])
 
 	case "alg":
 		return c.showALG()
@@ -1292,6 +1295,149 @@ func (c *CLI) showScreen() error {
 		}
 	}
 
+	return nil
+}
+
+func (c *CLI) handleShowScreen(args []string) error {
+	if len(args) == 0 {
+		return c.showScreen()
+	}
+	switch args[0] {
+	case "ids-option":
+		if len(args) < 2 {
+			return c.showScreen()
+		}
+		return c.showScreenIdsOption(args[1])
+	case "statistics":
+		if len(args) >= 2 && args[1] == "zone" && len(args) >= 3 {
+			return c.showScreenStatistics(args[2])
+		}
+		return fmt.Errorf("usage: show security screen statistics zone <zone-name>")
+	default:
+		return c.showScreen()
+	}
+}
+
+func (c *CLI) showScreenIdsOption(name string) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+	profile, ok := cfg.Security.Screen[name]
+	if !ok {
+		fmt.Printf("Screen profile '%s' not found\n", name)
+		return nil
+	}
+
+	fmt.Printf("Screen object status:\n\n")
+	fmt.Printf("  %-45s %s\n", "Name", "Value")
+	if profile.TCP.Land {
+		fmt.Printf("  %-45s %s\n", "TCP land attack", "enabled")
+	}
+	if profile.TCP.SynFin {
+		fmt.Printf("  %-45s %s\n", "TCP SYN+FIN", "enabled")
+	}
+	if profile.TCP.NoFlag {
+		fmt.Printf("  %-45s %s\n", "TCP no-flag", "enabled")
+	}
+	if profile.TCP.FinNoAck {
+		fmt.Printf("  %-45s %s\n", "TCP FIN-no-ACK", "enabled")
+	}
+	if profile.TCP.WinNuke {
+		fmt.Printf("  %-45s %s\n", "TCP WinNuke", "enabled")
+	}
+	if profile.TCP.SynFrag {
+		fmt.Printf("  %-45s %s\n", "TCP SYN fragment", "enabled")
+	}
+	if profile.TCP.SynFlood != nil {
+		fmt.Printf("  %-45s %d\n", "TCP SYN flood attack threshold", profile.TCP.SynFlood.AttackThreshold)
+		if profile.TCP.SynFlood.SourceThreshold > 0 {
+			fmt.Printf("  %-45s %d\n", "TCP SYN flood source threshold", profile.TCP.SynFlood.SourceThreshold)
+		}
+		if profile.TCP.SynFlood.DestinationThreshold > 0 {
+			fmt.Printf("  %-45s %d\n", "TCP SYN flood destination threshold", profile.TCP.SynFlood.DestinationThreshold)
+		}
+		if profile.TCP.SynFlood.Timeout > 0 {
+			fmt.Printf("  %-45s %d\n", "TCP SYN flood timeout", profile.TCP.SynFlood.Timeout)
+		}
+	}
+	if profile.ICMP.PingDeath {
+		fmt.Printf("  %-45s %s\n", "ICMP ping of death", "enabled")
+	}
+	if profile.ICMP.FloodThreshold > 0 {
+		fmt.Printf("  %-45s %d\n", "ICMP flood threshold", profile.ICMP.FloodThreshold)
+	}
+	if profile.IP.SourceRouteOption {
+		fmt.Printf("  %-45s %s\n", "IP source route option", "enabled")
+	}
+	if profile.UDP.FloodThreshold > 0 {
+		fmt.Printf("  %-45s %d\n", "UDP flood threshold", profile.UDP.FloodThreshold)
+	}
+
+	// Show zones using this profile
+	var zones []string
+	for zname, zone := range cfg.Security.Zones {
+		if zone.ScreenProfile == name {
+			zones = append(zones, zname)
+		}
+	}
+	if len(zones) > 0 {
+		sort.Strings(zones)
+		fmt.Printf("\n  Bound to zones: %s\n", strings.Join(zones, ", "))
+	}
+	return nil
+}
+
+func (c *CLI) showScreenStatistics(zoneName string) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("dataplane not loaded")
+		return nil
+	}
+	cr := c.dp.LastCompileResult()
+	if cr == nil {
+		fmt.Println("no compile result available")
+		return nil
+	}
+	zoneID, ok := cr.ZoneIDs[zoneName]
+	if !ok {
+		fmt.Printf("Zone '%s' not found\n", zoneName)
+		return nil
+	}
+	floodMap := c.dp.Map("flood_counters")
+	if floodMap == nil {
+		fmt.Println("flood_counters map not available")
+		return nil
+	}
+	key := uint32(zoneID)
+	var perCPU []dataplane.FloodState
+	if err := floodMap.Lookup(key, &perCPU); err != nil {
+		fmt.Printf("Error reading flood counters: %v\n", err)
+		return nil
+	}
+	var totalSyn, totalICMP, totalUDP uint64
+	for _, fs := range perCPU {
+		totalSyn += fs.SynCount
+		totalICMP += fs.ICMPCount
+		totalUDP += fs.UDPCount
+	}
+	screenProfile := ""
+	if z, ok := cfg.Security.Zones[zoneName]; ok {
+		screenProfile = z.ScreenProfile
+	}
+	fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
+	if screenProfile != "" {
+		fmt.Printf("  Screen profile: %s\n", screenProfile)
+	}
+	fmt.Printf("  %-30s %s\n", "Counter", "Value")
+	fmt.Printf("  %-30s %d\n", "SYN flood events", totalSyn)
+	fmt.Printf("  %-30s %d\n", "ICMP flood events", totalICMP)
+	fmt.Printf("  %-30s %d\n", "UDP flood events", totalUDP)
 	return nil
 }
 
@@ -5493,6 +5639,77 @@ func (c *CLI) showDynamicAddress() error {
 		}
 		fmt.Printf("    Update interval: %d seconds\n", updateInt)
 		fmt.Printf("    Hold interval:   %d seconds\n", holdInt)
+	}
+
+	return nil
+}
+
+func (c *CLI) showSecurityAlarms(args []string) error {
+	detail := len(args) >= 1 && args[0] == "detail"
+
+	cfg := c.store.ActiveConfig()
+	var alarmCount int
+
+	// Config validation warnings
+	if cfg != nil {
+		warnings := config.ValidateConfig(cfg)
+		for _, w := range warnings {
+			alarmCount++
+			if detail {
+				fmt.Printf("Alarm %d:\n  Class: Configuration\n  Severity: Warning\n  Description: %s\n\n", alarmCount, w)
+			}
+		}
+	}
+
+	// Screen drop alarms — any non-zero screen counter indicates detected attacks
+	if c.dp != nil && c.dp.IsLoaded() {
+		ctrMap := c.dp.Map("global_counters")
+		if ctrMap != nil {
+			readCtr := func(idx uint32) uint64 {
+				var perCPU []uint64
+				if err := ctrMap.Lookup(idx, &perCPU); err != nil {
+					return 0
+				}
+				var total uint64
+				for _, v := range perCPU {
+					total += v
+				}
+				return total
+			}
+			screenNames := []struct {
+				idx  uint32
+				name string
+			}{
+				{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
+				{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
+				{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
+				{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
+				{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
+				{dataplane.GlobalCtrScreenTearDrop, "Tear-drop"},
+				{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
+				{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no-flag"},
+				{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN-no-ACK"},
+				{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
+				{dataplane.GlobalCtrScreenIPSrcRoute, "IP source-route"},
+				{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
+			}
+			for _, s := range screenNames {
+				val := readCtr(s.idx)
+				if val > 0 {
+					alarmCount++
+					if detail {
+						fmt.Printf("Alarm %d:\n  Class: IDS\n  Severity: Major\n  Description: %s attack detected (%d drops)\n\n", alarmCount, s.name, val)
+					}
+				}
+			}
+		}
+	}
+
+	if alarmCount == 0 {
+		fmt.Println("No security alarms currently active")
+	} else if !detail {
+		fmt.Printf("%d security alarm(s) currently active\n", alarmCount)
+		fmt.Println("  run 'show security alarms detail' for details")
 	}
 
 	return nil

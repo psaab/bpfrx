@@ -43,8 +43,12 @@ check_flood(struct pkt_meta *meta, struct screen_config *sc)
 
 	__u64 now_sec = bpf_ktime_get_ns() / 1000000000ULL;
 
-	/* Reset window if a new second started */
-	if (now_sec != fs->window_start) {
+	/* Reset window when duration expires.
+	 * syn_flood_timeout configures the window in seconds (0 = 1s default). */
+	__u32 window_dur = sc->syn_flood_timeout;
+	if (window_dur == 0)
+		window_dur = 1;
+	if (now_sec - fs->window_start >= window_dur) {
 		fs->syn_count = 0;
 		fs->icmp_count = 0;
 		fs->udp_count = 0;

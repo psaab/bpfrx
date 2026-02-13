@@ -91,11 +91,39 @@ var OperationalTree = map[string]*Node{
 				}},
 				"to-zone": {Desc: "Filter by destination zone"},
 			}},
-			"screen":          {Desc: "Show screen/IDS profiles"},
-			"alg":             {Desc: "Show ALG status"},
+			"screen": {Desc: "Show screen/IDS profiles", Children: map[string]*Node{
+				"ids-option": {Desc: "Show configured screen profile", DynamicFn: func(cfg *config.Config) []string {
+					if cfg == nil {
+						return nil
+					}
+					names := make([]string, 0, len(cfg.Security.Screen))
+					for name := range cfg.Security.Screen {
+						names = append(names, name)
+					}
+					return names
+				}},
+				"statistics": {Desc: "Show screen statistics", Children: map[string]*Node{
+					"zone": {Desc: "Show per-zone screen counters", DynamicFn: func(cfg *config.Config) []string {
+						if cfg == nil {
+							return nil
+						}
+						names := make([]string, 0, len(cfg.Security.Zones))
+						for name := range cfg.Security.Zones {
+							names = append(names, name)
+						}
+						return names
+					}},
+				}},
+			}},
+			"alarms": {Desc: "Show security alarms", Children: map[string]*Node{
+				"detail": {Desc: "Show detailed security alarm information"},
+			}},
+			"alg": {Desc: "Show ALG status"},
 			"dynamic-address": {Desc: "Show dynamic address feeds"},
 			"flow": {Desc: "Show flow information", Children: map[string]*Node{
-				"session":      {Desc: "Show active sessions"},
+				"session": {Desc: "Show active sessions", Children: map[string]*Node{
+					"summary": {Desc: "Show session count summary"},
+				}},
 				"statistics":   {Desc: "Show flow statistics"},
 				"traceoptions": {Desc: "Show flow trace configuration"},
 			}},

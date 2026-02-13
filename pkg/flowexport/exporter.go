@@ -13,12 +13,19 @@ import (
 	"github.com/psaab/bpfrx/pkg/logging"
 )
 
+// SamplingDir tracks per-zone sampling direction flags.
+type SamplingDir struct {
+	Input  bool
+	Output bool
+}
+
 // ExportConfig holds the resolved NetFlow export configuration.
 type ExportConfig struct {
 	Collectors          []CollectorConfig
 	FlowActiveTimeout   time.Duration
 	FlowInactiveTimeout time.Duration
 	TemplateRefreshRate time.Duration
+	SamplingZones       map[uint16]SamplingDir // zone ID -> sampling directions
 }
 
 // CollectorConfig defines a single NetFlow collector destination.
@@ -100,6 +107,74 @@ func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsC
 	ec.Collectors = deduped
 
 	return ec
+}
+
+// BuildSamplingZones builds a map of zone ID to sampling direction flags.
+// For each zone, it checks whether any interface in that zone has
+// sampling input or output enabled on its unit.
+func BuildSamplingZones(cfg *config.Config, zoneIDs map[string]uint16) map[uint16]SamplingDir {
+	result := make(map[uint16]SamplingDir)
+	for zoneName, zone := range cfg.Security.Zones {
+		zid, ok := zoneIDs[zoneName]
+		if !ok {
+			continue
+		}
+		var dir SamplingDir
+		for _, ifaceRef := range zone.Interfaces {
+			physName, unitNum := parseIfaceRef(ifaceRef)
+			ifCfg, ok := cfg.Interfaces.Interfaces[physName]
+			if !ok {
+				continue
+			}
+			unit, ok := ifCfg.Units[unitNum]
+			if !ok {
+				continue
+			}
+			if unit.SamplingInput {
+				dir.Input = true
+			}
+			if unit.SamplingOutput {
+				dir.Output = true
+			}
+		}
+		if dir.Input || dir.Output {
+			result[zid] = dir
+		}
+	}
+	return result
+}
+
+// ShouldExport checks whether a session close event should be exported based
+// on the ingress/egress zone sampling configuration. A session is exported if
+// the ingress zone has sampling input enabled OR the egress zone has sampling
+// output enabled. If no SamplingZones are configured, all sessions are exported.
+func (ec *ExportConfig) ShouldExport(inZone, outZone uint16) bool {
+	if len(ec.SamplingZones) == 0 {
+		return true // no per-zone filtering configured
+	}
+	if d, ok := ec.SamplingZones[inZone]; ok && d.Input {
+		return true
+	}
+	if d, ok := ec.SamplingZones[outZone]; ok && d.Output {
+		return true
+	}
+	return false
+}
+
+// parseIfaceRef splits "eth0.0" into ("eth0", 0).
+func parseIfaceRef(ref string) (string, int) {
+	for i := len(ref) - 1; i >= 0; i-- {
+		if ref[i] == '.' {
+			unitNum := 0
+			for _, c := range ref[i+1:] {
+				if c >= '0' && c <= '9' {
+					unitNum = unitNum*10 + int(c-'0')
+				}
+			}
+			return ref[:i], unitNum
+		}
+	}
+	return ref, 0
 }
 
 // Exporter sends NetFlow v9 packets to configured collectors.

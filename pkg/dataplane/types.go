@@ -462,10 +462,13 @@ type SNATValueV6 struct {
 
 // ScreenConfig mirrors the C struct screen_config.
 type ScreenConfig struct {
-	Flags          uint32
-	SynFloodThresh uint32
-	ICMPFloodThresh uint32
-	UDPFloodThresh uint32
+	Flags             uint32
+	SynFloodThresh    uint32
+	ICMPFloodThresh   uint32
+	UDPFloodThresh    uint32
+	SynFloodSrcThresh uint32
+	SynFloodDstThresh uint32
+	SynFloodTimeout   uint32
 }
 
 // FloodState mirrors the C struct flood_state.

@@ -596,6 +596,15 @@ func (c *ctl) handleShowSecurity(args []string) error {
 		}
 		return c.showPoliciesFiltered(fromZone, toZone)
 	case "screen":
+		if len(args) >= 2 && args[1] == "ids-option" && len(args) >= 3 {
+			return c.showText("screen-ids-option:" + args[2])
+		}
+		if len(args) >= 2 && args[1] == "statistics" {
+			if len(args) >= 4 && args[2] == "zone" {
+				return c.showText("screen-statistics:" + args[3])
+			}
+			return fmt.Errorf("usage: show security screen statistics zone <zone-name>")
+		}
 		return c.showScreen()
 	case "flow":
 		if len(args) >= 2 && args[1] == "session" {
@@ -625,6 +634,11 @@ func (c *ctl) handleShowSecurity(args []string) error {
 		return c.showMatchPolicies(args[1:])
 	case "vrrp":
 		return c.showVRRP()
+	case "alarms":
+		if len(args) >= 2 && args[1] == "detail" {
+			return c.showText("security-alarms-detail")
+		}
+		return c.showText("security-alarms")
 	case "alg":
 		return c.showText("alg")
 	case "dynamic-address":

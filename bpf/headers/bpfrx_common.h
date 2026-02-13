@@ -472,6 +472,9 @@ struct screen_config {
 	__u32 syn_flood_thresh;   /* SYN pkts/sec/zone, 0=disabled */
 	__u32 icmp_flood_thresh;
 	__u32 udp_flood_thresh;
+	__u32 syn_flood_src_thresh;  /* per-source-IP threshold (future) */
+	__u32 syn_flood_dst_thresh;  /* per-dest-IP threshold (future) */
+	__u32 syn_flood_timeout;     /* flood window duration in seconds (0=1s) */
 };
 
 struct flood_state {

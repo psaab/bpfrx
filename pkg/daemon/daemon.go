@@ -1071,6 +1071,11 @@ func (d *Daemon) startFlowExporter(ctx context.Context, cfg *config.Config, er *
 		return
 	}
 
+	// Build per-zone sampling direction flags using deterministic zone IDs
+	// (same sorted assignment as dataplane compiler).
+	zoneIDs := buildZoneIDs(cfg)
+	ec.SamplingZones = flowexport.BuildSamplingZones(cfg, zoneIDs)
+
 	exp, err := flowexport.NewExporter(*ec)
 	if err != nil {
 		slog.Warn("failed to create flow exporter", "err", err)
@@ -1084,6 +1089,10 @@ func (d *Daemon) startFlowExporter(ctx context.Context, cfg *config.Config, er *
 	// Register callback for session close events
 	er.AddCallback(func(rec logging.EventRecord, raw []byte) {
 		if rec.Type != "SESSION_CLOSE" {
+			return
+		}
+		// Check sampling direction: skip if zone has no sampling enabled
+		if !ec.ShouldExport(rec.InZone, rec.OutZone) {
 			return
 		}
 		sd := flowexport.SessionCloseData{
@@ -1104,7 +1113,8 @@ func (d *Daemon) startFlowExporter(ctx context.Context, cfg *config.Config, er *
 	slog.Info("NetFlow v9 exporter started",
 		"collectors", len(ec.Collectors),
 		"active_timeout", ec.FlowActiveTimeout,
-		"inactive_timeout", ec.FlowInactiveTimeout)
+		"inactive_timeout", ec.FlowInactiveTimeout,
+		"sampling_zones", len(ec.SamplingZones))
 }
 
 // stopFlowExporter stops the running flow exporter.
@@ -1117,6 +1127,21 @@ func (d *Daemon) stopFlowExporter() {
 		d.flowExporter.Close()
 		d.flowExporter = nil
 	}
+}
+
+// buildZoneIDs replicates the deterministic zone ID assignment from the
+// dataplane compiler (sorted zone names, 1-based sequential IDs).
+func buildZoneIDs(cfg *config.Config) map[string]uint16 {
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	ids := make(map[string]uint16, len(names))
+	for i, name := range names {
+		ids[name] = uint16(i + 1)
+	}
+	return ids
 }
 
 // parseAddrPair parses "ip:port" or "[ip]:port" into net.IPs and IPv6 flag.

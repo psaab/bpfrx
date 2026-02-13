@@ -324,11 +324,14 @@ type bpfrxXdpNat64PolicySet struct {
 }
 
 type bpfrxXdpNat64ScreenConfig struct {
-	_               structs.HostLayout
-	Flags           uint32
-	SynFloodThresh  uint32
-	IcmpFloodThresh uint32
-	UdpFloodThresh  uint32
+	_                 structs.HostLayout
+	Flags             uint32
+	SynFloodThresh    uint32
+	IcmpFloodThresh   uint32
+	UdpFloodThresh    uint32
+	SynFloodSrcThresh uint32
+	SynFloodDstThresh uint32
+	SynFloodTimeout   uint32
 }
 
 type bpfrxXdpNat64SessionKey struct {
