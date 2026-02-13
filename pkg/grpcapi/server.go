@@ -3191,6 +3191,13 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			}
 		}
 
+	case "log":
+		out, err := exec.Command("journalctl", "-u", "bpfrxd", "-n", "50", "--no-pager").CombinedOutput()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "journalctl: %v", err)
+		}
+		buf.Write(out)
+
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown topic: %s", req.Topic)
 	}

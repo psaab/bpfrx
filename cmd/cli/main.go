@@ -371,6 +371,7 @@ func (c *ctl) handleShow(args []string) error {
 		fmt.Println("  dhcp-server      Show DHCP server leases")
 		fmt.Println("  firewall         Show firewall filters")
 		fmt.Println("  flow-monitoring  Show flow monitoring/NetFlow configuration")
+		fmt.Println("  log              Show daemon log entries")
 		fmt.Println("  route            Show routing table")
 		fmt.Println("  schedulers       Show policy schedulers")
 		fmt.Println("  security         Show security information")
@@ -479,6 +480,9 @@ func (c *ctl) handleShow(args []string) error {
 
 	case "flow-monitoring":
 		return c.showText("flow-monitoring")
+
+	case "log":
+		return c.showText("log")
 
 	case "services":
 		return c.handleShowServices(args[1:])
