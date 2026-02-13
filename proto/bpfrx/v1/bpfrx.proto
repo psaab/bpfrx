@@ -55,6 +55,15 @@ service BpfrxService {
   rpc ClearCounters(ClearCountersRequest) returns (ClearCountersResponse);
   rpc ClearDHCPClientIdentifier(ClearDHCPClientIdentifierRequest) returns (ClearDHCPClientIdentifierResponse);
 
+  // Generic text show (schedulers, snmp, dhcp-relay, firewall, alg, etc.)
+  rpc ShowText(ShowTextRequest) returns (ShowTextResponse);
+
+  // System info (uptime, memory)
+  rpc GetSystemInfo(GetSystemInfoRequest) returns (GetSystemInfoResponse);
+
+  // System actions (reboot, halt)
+  rpc SystemAction(SystemActionRequest) returns (SystemActionResponse);
+
   // Tab completion
   rpc Complete(CompleteRequest) returns (CompleteResponse);
 }
@@ -474,3 +483,26 @@ message CompleteRequest {
 message CompleteResponse {
   repeated string candidates = 1;
 }
+
+// --- Generic text show ---
+
+message ShowTextRequest {
+  string topic = 1;  // "schedulers", "snmp", "dhcp-relay", "firewall", "alg",
+                      // "dynamic-address", "address-book", "applications",
+                      // "flow-timeouts", "flow-monitoring", "nat-static"
+}
+message ShowTextResponse { string output = 1; }
+
+// --- System info ---
+
+message GetSystemInfoRequest {
+  string type = 1;  // "uptime", "memory"
+}
+message GetSystemInfoResponse { string output = 1; }
+
+// --- System action ---
+
+message SystemActionRequest {
+  string action = 1;  // "reboot", "halt"
+}
+message SystemActionResponse { string message = 1; }

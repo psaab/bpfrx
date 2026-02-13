@@ -60,6 +60,9 @@ const (
 	BpfrxService_ClearSessions_FullMethodName             = "/bpfrx.v1.BpfrxService/ClearSessions"
 	BpfrxService_ClearCounters_FullMethodName             = "/bpfrx.v1.BpfrxService/ClearCounters"
 	BpfrxService_ClearDHCPClientIdentifier_FullMethodName = "/bpfrx.v1.BpfrxService/ClearDHCPClientIdentifier"
+	BpfrxService_ShowText_FullMethodName                  = "/bpfrx.v1.BpfrxService/ShowText"
+	BpfrxService_GetSystemInfo_FullMethodName             = "/bpfrx.v1.BpfrxService/GetSystemInfo"
+	BpfrxService_SystemAction_FullMethodName              = "/bpfrx.v1.BpfrxService/SystemAction"
 	BpfrxService_Complete_FullMethodName                  = "/bpfrx.v1.BpfrxService/Complete"
 )
 
@@ -114,6 +117,12 @@ type BpfrxServiceClient interface {
 	ClearSessions(ctx context.Context, in *ClearSessionsRequest, opts ...grpc.CallOption) (*ClearSessionsResponse, error)
 	ClearCounters(ctx context.Context, in *ClearCountersRequest, opts ...grpc.CallOption) (*ClearCountersResponse, error)
 	ClearDHCPClientIdentifier(ctx context.Context, in *ClearDHCPClientIdentifierRequest, opts ...grpc.CallOption) (*ClearDHCPClientIdentifierResponse, error)
+	// Generic text show (schedulers, snmp, dhcp-relay, firewall, alg, etc.)
+	ShowText(ctx context.Context, in *ShowTextRequest, opts ...grpc.CallOption) (*ShowTextResponse, error)
+	// System info (uptime, memory)
+	GetSystemInfo(ctx context.Context, in *GetSystemInfoRequest, opts ...grpc.CallOption) (*GetSystemInfoResponse, error)
+	// System actions (reboot, halt)
+	SystemAction(ctx context.Context, in *SystemActionRequest, opts ...grpc.CallOption) (*SystemActionResponse, error)
 	// Tab completion
 	Complete(ctx context.Context, in *CompleteRequest, opts ...grpc.CallOption) (*CompleteResponse, error)
 }
@@ -536,6 +545,36 @@ func (c *bpfrxServiceClient) ClearDHCPClientIdentifier(ctx context.Context, in *
 	return out, nil
 }
 
+func (c *bpfrxServiceClient) ShowText(ctx context.Context, in *ShowTextRequest, opts ...grpc.CallOption) (*ShowTextResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ShowTextResponse)
+	err := c.cc.Invoke(ctx, BpfrxService_ShowText_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *bpfrxServiceClient) GetSystemInfo(ctx context.Context, in *GetSystemInfoRequest, opts ...grpc.CallOption) (*GetSystemInfoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSystemInfoResponse)
+	err := c.cc.Invoke(ctx, BpfrxService_GetSystemInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *bpfrxServiceClient) SystemAction(ctx context.Context, in *SystemActionRequest, opts ...grpc.CallOption) (*SystemActionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SystemActionResponse)
+	err := c.cc.Invoke(ctx, BpfrxService_SystemAction_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *bpfrxServiceClient) Complete(ctx context.Context, in *CompleteRequest, opts ...grpc.CallOption) (*CompleteResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CompleteResponse)
@@ -597,6 +636,12 @@ type BpfrxServiceServer interface {
 	ClearSessions(context.Context, *ClearSessionsRequest) (*ClearSessionsResponse, error)
 	ClearCounters(context.Context, *ClearCountersRequest) (*ClearCountersResponse, error)
 	ClearDHCPClientIdentifier(context.Context, *ClearDHCPClientIdentifierRequest) (*ClearDHCPClientIdentifierResponse, error)
+	// Generic text show (schedulers, snmp, dhcp-relay, firewall, alg, etc.)
+	ShowText(context.Context, *ShowTextRequest) (*ShowTextResponse, error)
+	// System info (uptime, memory)
+	GetSystemInfo(context.Context, *GetSystemInfoRequest) (*GetSystemInfoResponse, error)
+	// System actions (reboot, halt)
+	SystemAction(context.Context, *SystemActionRequest) (*SystemActionResponse, error)
 	// Tab completion
 	Complete(context.Context, *CompleteRequest) (*CompleteResponse, error)
 	mustEmbedUnimplementedBpfrxServiceServer()
@@ -731,6 +776,15 @@ func (UnimplementedBpfrxServiceServer) ClearCounters(context.Context, *ClearCoun
 }
 func (UnimplementedBpfrxServiceServer) ClearDHCPClientIdentifier(context.Context, *ClearDHCPClientIdentifierRequest) (*ClearDHCPClientIdentifierResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ClearDHCPClientIdentifier not implemented")
+}
+func (UnimplementedBpfrxServiceServer) ShowText(context.Context, *ShowTextRequest) (*ShowTextResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ShowText not implemented")
+}
+func (UnimplementedBpfrxServiceServer) GetSystemInfo(context.Context, *GetSystemInfoRequest) (*GetSystemInfoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSystemInfo not implemented")
+}
+func (UnimplementedBpfrxServiceServer) SystemAction(context.Context, *SystemActionRequest) (*SystemActionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SystemAction not implemented")
 }
 func (UnimplementedBpfrxServiceServer) Complete(context.Context, *CompleteRequest) (*CompleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Complete not implemented")
@@ -1494,6 +1548,60 @@ func _BpfrxService_ClearDHCPClientIdentifier_Handler(srv interface{}, ctx contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _BpfrxService_ShowText_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ShowTextRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BpfrxServiceServer).ShowText(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BpfrxService_ShowText_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BpfrxServiceServer).ShowText(ctx, req.(*ShowTextRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BpfrxService_GetSystemInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSystemInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BpfrxServiceServer).GetSystemInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BpfrxService_GetSystemInfo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BpfrxServiceServer).GetSystemInfo(ctx, req.(*GetSystemInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BpfrxService_SystemAction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SystemActionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BpfrxServiceServer).SystemAction(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BpfrxService_SystemAction_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BpfrxServiceServer).SystemAction(ctx, req.(*SystemActionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _BpfrxService_Complete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CompleteRequest)
 	if err := dec(in); err != nil {
@@ -1682,6 +1790,18 @@ var BpfrxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ClearDHCPClientIdentifier",
 			Handler:    _BpfrxService_ClearDHCPClientIdentifier_Handler,
+		},
+		{
+			MethodName: "ShowText",
+			Handler:    _BpfrxService_ShowText_Handler,
+		},
+		{
+			MethodName: "GetSystemInfo",
+			Handler:    _BpfrxService_GetSystemInfo_Handler,
+		},
+		{
+			MethodName: "SystemAction",
+			Handler:    _BpfrxService_SystemAction_Handler,
 		},
 		{
 			MethodName: "Complete",

@@ -1546,8 +1546,10 @@ var operationalTree = map[string]*completionNode{
 				}
 				return names
 			}},
-			"policies": {desc: "Show security policies"},
-			"screen":   {desc: "Show screen/IDS profiles"},
+			"policies": {desc: "Show security policies", children: map[string]*completionNode{
+				"brief": {desc: "Show brief policy summary"},
+			}},
+			"screen": {desc: "Show screen/IDS profiles"},
 			"flow": {desc: "Show flow information", children: map[string]*completionNode{
 				"session": {desc: "Show active sessions"},
 			}},
@@ -1556,13 +1558,17 @@ var operationalTree = map[string]*completionNode{
 				"destination": {desc: "Show destination NAT"},
 				"static":      {desc: "Show static NAT"},
 			}},
-			"address-book": {desc: "Show address book entries"},
-			"applications": {desc: "Show application definitions"},
-			"log":          {desc: "Show recent security events"},
-			"statistics":   {desc: "Show global statistics"},
+			"address-book":   {desc: "Show address book entries"},
+			"applications":   {desc: "Show application definitions"},
+			"alg":            {desc: "Show ALG status"},
+			"dynamic-address": {desc: "Show dynamic address feeds"},
+			"log":            {desc: "Show recent security events"},
+			"statistics":     {desc: "Show global statistics"},
 			"ipsec": {desc: "Show IPsec status", children: map[string]*completionNode{
 				"security-associations": {desc: "Show IPsec SAs"},
 			}},
+			"vrrp":           {desc: "Show VRRP high availability status"},
+			"match-policies": {desc: "Match 5-tuple against policies"},
 		}},
 		"interfaces": {desc: "Show interface status", dynamicFn: func(cfg *config.Config) []string {
 			if cfg == nil || cfg.Interfaces.Interfaces == nil {
@@ -1591,8 +1597,21 @@ var operationalTree = map[string]*completionNode{
 				"routes":    {desc: "Show IS-IS routes"},
 			}},
 		}},
+		"flow-monitoring": {desc: "Show flow monitoring/NetFlow configuration"},
+		"firewall":        {desc: "Show firewall filters"},
+		"dhcp-relay":      {desc: "Show DHCP relay status"},
 		"system": {desc: "Show system information", children: map[string]*completionNode{
-			"rollback": {desc: "Show rollback history"},
+			"rollback":  {desc: "Show rollback history"},
+			"uptime":    {desc: "Show system uptime"},
+			"memory":    {desc: "Show memory usage"},
+			"processes": {desc: "Show running processes"},
+			"license":   {desc: "Show system license"},
+		}},
+	}},
+	"request": {desc: "Perform system operations", children: map[string]*completionNode{
+		"system": {desc: "System operations", children: map[string]*completionNode{
+			"reboot": {desc: "Reboot the system"},
+			"halt":   {desc: "Halt the system"},
 		}},
 	}},
 	"clear": {desc: "Clear information", children: map[string]*completionNode{
@@ -2064,6 +2083,351 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		Matched: false,
 		Action:  "deny (default)",
 	}, nil
+}
+
+// --- ShowText RPC ---
+
+func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowTextResponse, error) {
+	cfg := s.store.ActiveConfig()
+	var buf strings.Builder
+
+	switch req.Topic {
+	case "schedulers":
+		if cfg == nil || len(cfg.Schedulers) == 0 {
+			buf.WriteString("No schedulers configured\n")
+		} else {
+			for name, sched := range cfg.Schedulers {
+				fmt.Fprintf(&buf, "Scheduler: %s\n", name)
+				if sched.StartTime != "" {
+					fmt.Fprintf(&buf, "  Start time: %s\n", sched.StartTime)
+				}
+				if sched.StopTime != "" {
+					fmt.Fprintf(&buf, "  Stop time:  %s\n", sched.StopTime)
+				}
+				if sched.StartDate != "" {
+					fmt.Fprintf(&buf, "  Start date: %s\n", sched.StartDate)
+				}
+				if sched.StopDate != "" {
+					fmt.Fprintf(&buf, "  Stop date:  %s\n", sched.StopDate)
+				}
+				if sched.Daily {
+					buf.WriteString("  Recurrence: daily\n")
+				}
+				buf.WriteString("\n")
+			}
+		}
+
+	case "snmp":
+		if cfg == nil || cfg.System.SNMP == nil {
+			buf.WriteString("No SNMP configured\n")
+		} else {
+			snmpCfg := cfg.System.SNMP
+			if snmpCfg.Location != "" {
+				fmt.Fprintf(&buf, "Location:    %s\n", snmpCfg.Location)
+			}
+			if snmpCfg.Contact != "" {
+				fmt.Fprintf(&buf, "Contact:     %s\n", snmpCfg.Contact)
+			}
+			if snmpCfg.Description != "" {
+				fmt.Fprintf(&buf, "Description: %s\n", snmpCfg.Description)
+			}
+			if len(snmpCfg.Communities) > 0 {
+				buf.WriteString("Communities:\n")
+				for name, comm := range snmpCfg.Communities {
+					fmt.Fprintf(&buf, "  %s: %s\n", name, comm.Authorization)
+				}
+			}
+			if len(snmpCfg.TrapGroups) > 0 {
+				buf.WriteString("Trap groups:\n")
+				for name, tg := range snmpCfg.TrapGroups {
+					fmt.Fprintf(&buf, "  %s: %s\n", name, strings.Join(tg.Targets, ", "))
+				}
+			}
+		}
+
+	case "dhcp-relay":
+		if cfg == nil || cfg.ForwardingOptions.DHCPRelay == nil {
+			buf.WriteString("No DHCP relay configured\n")
+		} else {
+			relay := cfg.ForwardingOptions.DHCPRelay
+			if len(relay.ServerGroups) > 0 {
+				buf.WriteString("Server groups:\n")
+				for name, sg := range relay.ServerGroups {
+					fmt.Fprintf(&buf, "  %s: %s\n", name, strings.Join(sg.Servers, ", "))
+				}
+			}
+			if len(relay.Groups) > 0 {
+				buf.WriteString("Relay groups:\n")
+				for name, g := range relay.Groups {
+					fmt.Fprintf(&buf, "  %s:\n", name)
+					fmt.Fprintf(&buf, "    Interfaces: %s\n", strings.Join(g.Interfaces, ", "))
+					fmt.Fprintf(&buf, "    Active server group: %s\n", g.ActiveServerGroup)
+				}
+			}
+		}
+
+	case "firewall":
+		hasFilters := cfg != nil && (len(cfg.Firewall.FiltersInet) > 0 || len(cfg.Firewall.FiltersInet6) > 0)
+		if !hasFilters {
+			buf.WriteString("No firewall filters configured\n")
+		} else {
+			printFilters := func(family string, filters map[string]*config.FirewallFilter) {
+				for name, filter := range filters {
+					fmt.Fprintf(&buf, "Filter: %s (family: %s)\n", name, family)
+					for _, term := range filter.Terms {
+						fmt.Fprintf(&buf, "  Term: %s\n", term.Name)
+						if term.Protocol != "" {
+							fmt.Fprintf(&buf, "    From protocol: %s\n", term.Protocol)
+						}
+						if len(term.DestinationPorts) > 0 {
+							fmt.Fprintf(&buf, "    From destination-port: %s\n", strings.Join(term.DestinationPorts, ", "))
+						}
+						if len(term.SourceAddresses) > 0 {
+							fmt.Fprintf(&buf, "    From source-address: %s\n", strings.Join(term.SourceAddresses, ", "))
+						}
+						if term.DSCP != "" {
+							fmt.Fprintf(&buf, "    From dscp: %s\n", term.DSCP)
+						}
+						if term.Action != "" {
+							fmt.Fprintf(&buf, "    Then: %s\n", term.Action)
+						}
+					}
+					buf.WriteString("\n")
+				}
+			}
+			printFilters("inet", cfg.Firewall.FiltersInet)
+			printFilters("inet6", cfg.Firewall.FiltersInet6)
+		}
+
+	case "alg":
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else {
+			alg := cfg.Security.ALG
+			fmt.Fprintf(&buf, "SIP:  %s\n", boolStatus(!alg.SIPDisable))
+			fmt.Fprintf(&buf, "FTP:  %s\n", boolStatus(!alg.FTPDisable))
+			fmt.Fprintf(&buf, "TFTP: %s\n", boolStatus(!alg.TFTPDisable))
+			fmt.Fprintf(&buf, "DNS:  %s\n", boolStatus(!alg.DNSDisable))
+		}
+
+	case "dynamic-address":
+		if cfg == nil || len(cfg.Security.DynamicAddress.FeedServers) == 0 {
+			buf.WriteString("No dynamic address feeds configured\n")
+		} else {
+			for name, feed := range cfg.Security.DynamicAddress.FeedServers {
+				fmt.Fprintf(&buf, "Feed server: %s\n", name)
+				fmt.Fprintf(&buf, "  URL: %s\n", feed.URL)
+				if feed.FeedName != "" {
+					fmt.Fprintf(&buf, "  Feed name: %s\n", feed.FeedName)
+				}
+				if feed.UpdateInterval > 0 {
+					fmt.Fprintf(&buf, "  Update interval: %ds\n", feed.UpdateInterval)
+				}
+				if feed.HoldInterval > 0 {
+					fmt.Fprintf(&buf, "  Hold interval: %ds\n", feed.HoldInterval)
+				}
+				buf.WriteString("\n")
+			}
+		}
+
+	case "address-book":
+		if cfg == nil || cfg.Security.AddressBook == nil {
+			buf.WriteString("No address book configured\n")
+		} else {
+			ab := cfg.Security.AddressBook
+			if len(ab.Addresses) > 0 {
+				buf.WriteString("Addresses:\n")
+				for name, addr := range ab.Addresses {
+					fmt.Fprintf(&buf, "  %-20s %s\n", name, addr.Value)
+				}
+			}
+			if len(ab.AddressSets) > 0 {
+				buf.WriteString("Address sets:\n")
+				for name, as := range ab.AddressSets {
+					fmt.Fprintf(&buf, "  %-20s members: %s\n", name, strings.Join(as.Addresses, ", "))
+				}
+			}
+		}
+
+	case "applications":
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else {
+			if len(cfg.Applications.Applications) > 0 {
+				buf.WriteString("Applications:\n")
+				for name, app := range cfg.Applications.Applications {
+					fmt.Fprintf(&buf, "  %-20s proto=%-6s", name, app.Protocol)
+					if app.DestinationPort != "" {
+						fmt.Fprintf(&buf, " dst-port=%s", app.DestinationPort)
+					}
+					buf.WriteString("\n")
+				}
+			}
+			if len(cfg.Applications.ApplicationSets) > 0 {
+				buf.WriteString("Application sets:\n")
+				for name, as := range cfg.Applications.ApplicationSets {
+					fmt.Fprintf(&buf, "  %-20s members: %s\n", name, strings.Join(as.Applications, ", "))
+				}
+			}
+		}
+
+	case "flow-monitoring":
+		if cfg == nil || cfg.Services.FlowMonitoring == nil || cfg.Services.FlowMonitoring.Version9 == nil {
+			buf.WriteString("No flow monitoring configured\n")
+		} else {
+			v9 := cfg.Services.FlowMonitoring.Version9
+			buf.WriteString("Flow monitoring (NetFlow v9):\n")
+			for name, tmpl := range v9.Templates {
+				fmt.Fprintf(&buf, "  Template: %s\n", name)
+				if tmpl.FlowActiveTimeout > 0 {
+					fmt.Fprintf(&buf, "    Active timeout: %ds\n", tmpl.FlowActiveTimeout)
+				}
+				if tmpl.FlowInactiveTimeout > 0 {
+					fmt.Fprintf(&buf, "    Inactive timeout: %ds\n", tmpl.FlowInactiveTimeout)
+				}
+				if tmpl.TemplateRefreshRate > 0 {
+					fmt.Fprintf(&buf, "    Template refresh: %ds\n", tmpl.TemplateRefreshRate)
+				}
+			}
+		}
+
+	case "flow-timeouts":
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else {
+			flow := cfg.Security.Flow
+			buf.WriteString("Flow session timeouts:\n")
+			if flow.TCPSession != nil {
+				fmt.Fprintf(&buf, "  TCP established:      %ds\n", flow.TCPSession.EstablishedTimeout)
+				fmt.Fprintf(&buf, "  TCP initial:          %ds\n", flow.TCPSession.InitialTimeout)
+				fmt.Fprintf(&buf, "  TCP closing:          %ds\n", flow.TCPSession.ClosingTimeout)
+				fmt.Fprintf(&buf, "  TCP time-wait:        %ds\n", flow.TCPSession.TimeWaitTimeout)
+			}
+			fmt.Fprintf(&buf, "  UDP session:          %ds\n", flow.UDPSessionTimeout)
+			fmt.Fprintf(&buf, "  ICMP session:         %ds\n", flow.ICMPSessionTimeout)
+			if flow.TCPMSSIPsecVPN > 0 {
+				fmt.Fprintf(&buf, "  TCP MSS (IPsec VPN):  %d\n", flow.TCPMSSIPsecVPN)
+			}
+			if flow.TCPMSSGre > 0 {
+				fmt.Fprintf(&buf, "  TCP MSS (GRE):        %d\n", flow.TCPMSSGre)
+			}
+			if flow.AllowDNSReply {
+				buf.WriteString("  Allow DNS reply:      enabled\n")
+			}
+			if flow.AllowEmbeddedICMP {
+				buf.WriteString("  Allow embedded ICMP:  enabled\n")
+			}
+		}
+
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "unknown topic: %s", req.Topic)
+	}
+
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+func boolStatus(b bool) string {
+	if b {
+		return "enabled"
+	}
+	return "disabled"
+}
+
+// --- GetSystemInfo RPC ---
+
+func (s *Server) GetSystemInfo(_ context.Context, req *pb.GetSystemInfoRequest) (*pb.GetSystemInfoResponse, error) {
+	var buf strings.Builder
+
+	switch req.Type {
+	case "uptime":
+		data, err := os.ReadFile("/proc/uptime")
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "reading uptime: %v", err)
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) < 1 {
+			return nil, status.Error(codes.Internal, "unexpected /proc/uptime format")
+		}
+		var upSec float64
+		fmt.Sscanf(fields[0], "%f", &upSec)
+
+		days := int(upSec) / 86400
+		hours := (int(upSec) % 86400) / 3600
+		mins := (int(upSec) % 3600) / 60
+		secs := int(upSec) % 60
+
+		now := time.Now()
+		fmt.Fprintf(&buf, "Current time: %s\n", now.Format("2006-01-02 15:04:05 MST"))
+		fmt.Fprintf(&buf, "System booted: %s\n", now.Add(-time.Duration(upSec)*time.Second).Format("2006-01-02 15:04:05 MST"))
+		fmt.Fprintf(&buf, "Daemon uptime: %s\n", time.Since(s.startTime).Truncate(time.Second))
+		if days > 0 {
+			fmt.Fprintf(&buf, "System uptime: %d days, %d hours, %d minutes, %d seconds\n", days, hours, mins, secs)
+		} else {
+			fmt.Fprintf(&buf, "System uptime: %d hours, %d minutes, %d seconds\n", hours, mins, secs)
+		}
+
+	case "memory":
+		data, err := os.ReadFile("/proc/meminfo")
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "reading meminfo: %v", err)
+		}
+		info := make(map[string]uint64)
+		for _, line := range strings.Split(string(data), "\n") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				key := strings.TrimSuffix(parts[0], ":")
+				val, _ := strconv.ParseUint(parts[1], 10, 64)
+				info[key] = val
+			}
+		}
+		total := info["MemTotal"]
+		free := info["MemFree"]
+		buffers := info["Buffers"]
+		cached := info["Cached"]
+		available := info["MemAvailable"]
+		used := total - free - buffers - cached
+
+		fmt.Fprintf(&buf, "%-20s %10s\n", "Type", "kB")
+		fmt.Fprintf(&buf, "%-20s %10d\n", "Total memory", total)
+		fmt.Fprintf(&buf, "%-20s %10d\n", "Used memory", used)
+		fmt.Fprintf(&buf, "%-20s %10d\n", "Free memory", free)
+		fmt.Fprintf(&buf, "%-20s %10d\n", "Buffers", buffers)
+		fmt.Fprintf(&buf, "%-20s %10d\n", "Cached", cached)
+		fmt.Fprintf(&buf, "%-20s %10d\n", "Available", available)
+		if total > 0 {
+			fmt.Fprintf(&buf, "Utilization: %.1f%%\n", float64(used)/float64(total)*100)
+		}
+
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "unknown system info type: %s", req.Type)
+	}
+
+	return &pb.GetSystemInfoResponse{Output: buf.String()}, nil
+}
+
+// --- SystemAction RPC ---
+
+func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error) {
+	switch req.Action {
+	case "reboot":
+		slog.Warn("system reboot requested via gRPC")
+		go func() {
+			time.Sleep(1 * time.Second)
+			exec.Command("systemctl", "reboot").Run()
+		}()
+		return &pb.SystemActionResponse{Message: "System going down for reboot NOW!"}, nil
+
+	case "halt":
+		slog.Warn("system halt requested via gRPC")
+		go func() {
+			time.Sleep(1 * time.Second)
+			exec.Command("systemctl", "halt").Run()
+		}()
+		return &pb.SystemActionResponse{Message: "System halting NOW!"}, nil
+
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "unknown action: %s", req.Action)
+	}
 }
 
 // matchPolicyAddr checks if an IP matches a list of address-book references.

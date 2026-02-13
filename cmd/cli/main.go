@@ -267,6 +267,9 @@ func (c *ctl) dispatchOperational(line string) error {
 	case "traceroute":
 		return c.handleTraceroute(parts[1:])
 
+	case "request":
+		return c.handleRequest(parts[1:])
+
 	case "quit", "exit":
 		return errExit
 
@@ -357,8 +360,13 @@ func (c *ctl) handleShow(args []string) error {
 		fmt.Println("show: specify what to show")
 		fmt.Println("  configuration    Show active configuration")
 		fmt.Println("  dhcp             Show DHCP information")
+		fmt.Println("  dhcp-relay       Show DHCP relay status")
+		fmt.Println("  firewall         Show firewall filters")
+		fmt.Println("  flow-monitoring  Show flow monitoring/NetFlow configuration")
 		fmt.Println("  route            Show routing table")
+		fmt.Println("  schedulers       Show policy schedulers")
 		fmt.Println("  security         Show security information")
+		fmt.Println("  snmp             Show SNMP statistics")
 		fmt.Println("  interfaces       Show interface status")
 		fmt.Println("  protocols        Show protocol information")
 		fmt.Println("  system           Show system information")
@@ -389,15 +397,11 @@ func (c *ctl) handleShow(args []string) error {
 				return c.showDHCPLeases()
 			case "client-identifier":
 				return c.showDHCPClientIdentifier()
-			case "relay":
-				fmt.Println("show dhcp relay: not available via remote CLI (local only)")
-				return nil
 			}
 		}
 		fmt.Println("show dhcp:")
 		fmt.Println("  leases              Show DHCP leases")
 		fmt.Println("  client-identifier   Show DHCPv6 DUID(s)")
-		fmt.Println("  relay               Show DHCP relay status")
 		return nil
 
 	case "route":
@@ -416,12 +420,19 @@ func (c *ctl) handleShow(args []string) error {
 		return c.handleShowSystem(args[1:])
 
 	case "schedulers":
-		fmt.Println("show schedulers: not available via remote CLI (local only)")
-		return nil
+		return c.showText("schedulers")
 
 	case "snmp":
-		fmt.Println("show snmp: not available via remote CLI (local only)")
-		return nil
+		return c.showText("snmp")
+
+	case "dhcp-relay":
+		return c.showText("dhcp-relay")
+
+	case "firewall":
+		return c.showText("firewall")
+
+	case "flow-monitoring":
+		return c.showText("flow-monitoring")
 
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
@@ -433,12 +444,15 @@ func (c *ctl) handleShowSecurity(args []string) error {
 		fmt.Println("show security:")
 		fmt.Println("  zones            Show security zones")
 		fmt.Println("  policies         Show security policies")
+		fmt.Println("  policies brief   Show brief policy summary")
 		fmt.Println("  screen           Show screen/IDS profiles")
+		fmt.Println("  flow             Show flow timeouts")
 		fmt.Println("  flow session     Show active sessions")
 		fmt.Println("  nat              Show NAT information")
-		fmt.Println("  nat source summary    Show NAT pool utilization")
-		fmt.Println("  nat source pool       Show NAT pool details")
-		fmt.Println("  nat source rule-set   Show NAT rule hit counters")
+		fmt.Println("  address-book     Show address book entries")
+		fmt.Println("  applications     Show application definitions")
+		fmt.Println("  alg              Show ALG status")
+		fmt.Println("  dynamic-address  Show dynamic address feeds")
 		fmt.Println("  match-policies   Match 5-tuple against policies")
 		fmt.Println("  log              Show recent security events")
 		fmt.Println("  statistics       Show global statistics")
@@ -451,12 +465,18 @@ func (c *ctl) handleShowSecurity(args []string) error {
 	case "zones":
 		return c.showZones()
 	case "policies":
+		if len(args) >= 2 && args[1] == "brief" {
+			return c.showPoliciesBrief()
+		}
 		return c.showPolicies()
 	case "screen":
 		return c.showScreen()
 	case "flow":
 		if len(args) >= 2 && args[1] == "session" {
 			return c.showFlowSession(args[2:])
+		}
+		if len(args) == 1 {
+			return c.showText("flow-timeouts")
 		}
 		return fmt.Errorf("usage: show security flow session")
 	case "nat":
@@ -471,6 +491,14 @@ func (c *ctl) handleShowSecurity(args []string) error {
 		return c.showMatchPolicies(args[1:])
 	case "vrrp":
 		return c.showVRRP()
+	case "alg":
+		return c.showText("alg")
+	case "dynamic-address":
+		return c.showText("dynamic-address")
+	case "address-book":
+		return c.showText("address-book")
+	case "applications":
+		return c.showText("applications")
 	default:
 		return fmt.Errorf("unknown show security target: %s", args[0])
 	}
@@ -1029,45 +1057,64 @@ func (c *ctl) handleShowProtocols(args []string) error {
 }
 
 func (c *ctl) handleShowSystem(args []string) error {
-	if len(args) == 0 || args[0] != "rollback" {
+	if len(args) == 0 {
 		fmt.Println("show system:")
 		fmt.Println("  rollback         Show rollback history")
+		fmt.Println("  uptime           Show system uptime")
+		fmt.Println("  memory           Show memory usage")
+		fmt.Println("  license          Show system license")
 		return nil
 	}
 
-	if len(args) >= 2 {
-		n, err := strconv.Atoi(args[1])
-		if err != nil || n < 1 {
-			return fmt.Errorf("usage: show system rollback <N>")
+	switch args[0] {
+	case "rollback":
+		if len(args) >= 2 {
+			n, err := strconv.Atoi(args[1])
+			if err != nil || n < 1 {
+				return fmt.Errorf("usage: show system rollback <N>")
+			}
+			format := pb.ConfigFormat_HIERARCHICAL
+			rest := strings.Join(args[2:], " ")
+			if strings.Contains(rest, "| display set") {
+				format = pb.ConfigFormat_SET
+			}
+			resp, err := c.client.ShowRollback(context.Background(), &pb.ShowRollbackRequest{
+				N:      int32(n),
+				Format: format,
+			})
+			if err != nil {
+				return fmt.Errorf("%v", err)
+			}
+			fmt.Print(resp.Output)
+			return nil
 		}
-		format := pb.ConfigFormat_HIERARCHICAL
-		rest := strings.Join(args[2:], " ")
-		if strings.Contains(rest, "| display set") {
-			format = pb.ConfigFormat_SET
-		}
-		resp, err := c.client.ShowRollback(context.Background(), &pb.ShowRollbackRequest{
-			N:      int32(n),
-			Format: format,
-		})
+
+		resp, err := c.client.ListHistory(context.Background(), &pb.ListHistoryRequest{})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
-		fmt.Print(resp.Output)
+		if len(resp.Entries) == 0 {
+			fmt.Println("No rollback history available")
+			return nil
+		}
+		for _, e := range resp.Entries {
+			fmt.Printf("  rollback %d: %s\n", e.Index, e.Timestamp)
+		}
 		return nil
-	}
 
-	resp, err := c.client.ListHistory(context.Background(), &pb.ListHistoryRequest{})
-	if err != nil {
-		return fmt.Errorf("%v", err)
-	}
-	if len(resp.Entries) == 0 {
-		fmt.Println("No rollback history available")
+	case "uptime":
+		return c.showSystemInfo("uptime")
+
+	case "memory":
+		return c.showSystemInfo("memory")
+
+	case "license":
+		fmt.Println("License: open-source (no license required)")
 		return nil
+
+	default:
+		return fmt.Errorf("unknown show system target: %s", args[0])
 	}
-	for _, e := range resp.Entries {
-		fmt.Printf("  rollback %d: %s\n", e.Index, e.Timestamp)
-	}
-	return nil
 }
 
 func (c *ctl) handleConfigShow(args []string) error {
@@ -1222,6 +1269,86 @@ func (c *ctl) handleClearDHCP(args []string) error {
 	return nil
 }
 
+// --- Generic show helpers ---
+
+func (c *ctl) showText(topic string) error {
+	resp, err := c.client.ShowText(context.Background(), &pb.ShowTextRequest{Topic: topic})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Print(resp.Output)
+	return nil
+}
+
+func (c *ctl) showSystemInfo(typ string) error {
+	resp, err := c.client.GetSystemInfo(context.Background(), &pb.GetSystemInfoRequest{Type: typ})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Print(resp.Output)
+	return nil
+}
+
+func (c *ctl) showPoliciesBrief() error {
+	resp, err := c.client.GetPolicies(context.Background(), &pb.GetPoliciesRequest{})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
+		"From", "To", "Name", "Action", "Hits")
+	for _, pi := range resp.Policies {
+		for _, rule := range pi.Rules {
+			hits := "-"
+			if rule.HitPackets > 0 {
+				hits = fmt.Sprintf("%d", rule.HitPackets)
+			}
+			fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
+				pi.FromZone, pi.ToZone, rule.Name, rule.Action, hits)
+		}
+	}
+	return nil
+}
+
+func (c *ctl) handleRequest(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request:")
+		fmt.Println("  system reboot    Reboot the system")
+		fmt.Println("  system halt      Halt the system")
+		return nil
+	}
+	if args[0] != "system" {
+		return fmt.Errorf("unknown request target: %s", args[0])
+	}
+	if len(args) < 2 {
+		fmt.Println("request system:")
+		fmt.Println("  reboot    Reboot the system")
+		fmt.Println("  halt      Halt the system")
+		return nil
+	}
+
+	switch args[1] {
+	case "reboot", "halt":
+		fmt.Printf("%s the system? [yes,no] (no) ", strings.Title(args[1]))
+		c.rl.SetPrompt("")
+		line, err := c.rl.Readline()
+		c.rl.SetPrompt(c.operationalPrompt())
+		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+			fmt.Printf("%s cancelled\n", strings.Title(args[1]))
+			return nil
+		}
+		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+			Action: args[1],
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Message)
+		return nil
+	default:
+		return fmt.Errorf("unknown request system command: %s", args[1])
+	}
+}
+
 // --- Tab completion ---
 
 type remoteCompleter struct {
@@ -1303,17 +1430,27 @@ func (c *ctl) showOperationalHelp() {
 	fmt.Println("  show configuration | display set   Show as flat set commands")
 	fmt.Println("  show dhcp leases                   Show DHCP leases")
 	fmt.Println("  show dhcp client-identifier        Show DHCPv6 DUID(s)")
-	fmt.Println("  clear dhcp client-identifier       Clear DHCPv6 DUID(s)")
+	fmt.Println("  show dhcp-relay                    Show DHCP relay status")
+	fmt.Println("  show firewall                      Show firewall filters")
+	fmt.Println("  show flow-monitoring               Show NetFlow v9 configuration")
 	fmt.Println("  show route                         Show routing table")
+	fmt.Println("  show schedulers                    Show policy schedulers")
 	fmt.Println("  show security                      Show security information")
+	fmt.Println("  show security policies brief       Show brief policy summary")
 	fmt.Println("  show security ipsec                Show IPsec VPN status")
 	fmt.Println("  show security log [N]              Show recent security events")
+	fmt.Println("  show snmp                          Show SNMP configuration")
 	fmt.Println("  show interfaces                    Show interface status")
 	fmt.Println("  show protocols ospf neighbor       Show OSPF neighbors")
 	fmt.Println("  show protocols bgp summary         Show BGP peer summary")
 	fmt.Println("  show system rollback               Show rollback history")
+	fmt.Println("  show system uptime                 Show system uptime")
+	fmt.Println("  show system memory                 Show memory usage")
 	fmt.Println("  clear security flow session        Clear all sessions")
 	fmt.Println("  clear security counters            Clear all counters")
+	fmt.Println("  clear dhcp client-identifier       Clear DHCPv6 DUID(s)")
+	fmt.Println("  request system reboot              Reboot the system")
+	fmt.Println("  request system halt                Halt the system")
 	fmt.Println("  quit                               Exit CLI")
 }
 
