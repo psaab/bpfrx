@@ -2075,11 +2075,17 @@ func (s *Server) GetVRRPStatus(_ context.Context, _ *pb.GetVRRPStatusRequest) (*
 
 	if cfg != nil {
 		instances := vrrp.CollectInstances(cfg)
+		runtimeStates := vrrp.RuntimeStates(instances)
 		for _, inst := range instances {
+			key := fmt.Sprintf("VI_%s_%d", inst.Interface, inst.GroupID)
+			state := runtimeStates[key]
+			if state == "" {
+				state = "INIT"
+			}
 			resp.Instances = append(resp.Instances, &pb.VRRPInstanceInfo{
 				Interface:        inst.Interface,
 				GroupId:          int32(inst.GroupID),
-				State:            "BACKUP",
+				State:            state,
 				Priority:         int32(inst.Priority),
 				VirtualAddresses: inst.VirtualAddresses,
 				Preempt:          inst.Preempt,

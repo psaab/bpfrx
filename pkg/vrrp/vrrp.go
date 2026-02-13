@@ -4,9 +4,11 @@ package vrrp
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
@@ -145,6 +147,144 @@ func generateConfig(instances []*Instance) string {
 	}
 
 	return sb.String()
+}
+
+// InstanceState holds the runtime state of a VRRP instance.
+type InstanceState struct {
+	Interface string
+	GroupID   int
+	State     string // "MASTER", "BACKUP", "INIT", "FAULT"
+}
+
+// RuntimeStates determines the actual state of each VRRP instance by
+// checking whether keepalived is running, then signaling it to dump
+// state and parsing the data file. Falls back to checking virtual IP
+// presence on interfaces.
+func RuntimeStates(instances []*Instance) map[string]string {
+	states := make(map[string]string) // key: "VI_<iface>_<group>"
+	if len(instances) == 0 {
+		return states
+	}
+
+	// Check if keepalived is running
+	out, err := exec.Command("systemctl", "is-active", "keepalived").Output()
+	if err != nil || strings.TrimSpace(string(out)) != "active" {
+		for _, inst := range instances {
+			key := fmt.Sprintf("VI_%s_%d", inst.Interface, inst.GroupID)
+			states[key] = "INIT"
+		}
+		return states
+	}
+
+	// Signal keepalived to dump data, then parse it
+	if parsed := dumpAndParse(); len(parsed) > 0 {
+		// Fill in any missing instances with INIT
+		for _, inst := range instances {
+			key := fmt.Sprintf("VI_%s_%d", inst.Interface, inst.GroupID)
+			if st, ok := parsed[key]; ok {
+				states[key] = st
+			} else {
+				states[key] = "INIT"
+			}
+		}
+		return states
+	}
+
+	// Fallback: check if virtual IPs are assigned to determine MASTER vs BACKUP
+	for _, inst := range instances {
+		key := fmt.Sprintf("VI_%s_%d", inst.Interface, inst.GroupID)
+		if hasVirtualAddrs(inst) {
+			states[key] = "MASTER"
+		} else {
+			states[key] = "BACKUP"
+		}
+	}
+	return states
+}
+
+// dumpAndParse signals keepalived to dump state and parses the data file.
+func dumpAndParse() map[string]string {
+	// Send SIGUSR1 to keepalived to dump data to /tmp/keepalived.data
+	pidBytes, err := os.ReadFile("/run/keepalived.pid")
+	if err != nil {
+		return nil
+	}
+	pid := 0
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(pidBytes)), "%d", &pid); err != nil || pid <= 0 {
+		return nil
+	}
+	// Signal keepalived
+	if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil {
+		slog.Debug("failed to signal keepalived", "err", err)
+		return nil
+	}
+
+	// Give keepalived a moment to write the file
+	data, err := os.ReadFile("/tmp/keepalived.data")
+	if err != nil {
+		return nil
+	}
+
+	return parseDataFile(string(data))
+}
+
+// parseDataFile parses /tmp/keepalived.data to extract instance states.
+// Format:
+//
+//	VRRP Instance = VI_trust0_100
+//	  State               = MASTER
+func parseDataFile(content string) map[string]string {
+	states := make(map[string]string)
+	var currentInstance string
+
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "VRRP Instance = ") {
+			currentInstance = strings.TrimPrefix(trimmed, "VRRP Instance = ")
+		} else if currentInstance != "" && strings.HasPrefix(trimmed, "State") {
+			parts := strings.SplitN(trimmed, "=", 2)
+			if len(parts) == 2 {
+				st := strings.TrimSpace(parts[1])
+				states[currentInstance] = st
+				currentInstance = ""
+			}
+		}
+	}
+	return states
+}
+
+// hasVirtualAddrs checks if any of the instance's virtual addresses
+// are currently assigned to its interface.
+func hasVirtualAddrs(inst *Instance) bool {
+	iface, err := net.InterfaceByName(inst.Interface)
+	if err != nil {
+		return false
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return false
+	}
+
+	addrSet := make(map[string]bool)
+	for _, a := range addrs {
+		// a.String() returns "ip/prefix" CIDR
+		ip, _, err := net.ParseCIDR(a.String())
+		if err == nil {
+			addrSet[ip.String()] = true
+		}
+	}
+
+	for _, vip := range inst.VirtualAddresses {
+		// Virtual addresses may or may not have a CIDR suffix
+		addr := vip
+		if idx := strings.Index(addr, "/"); idx >= 0 {
+			addr = addr[:idx]
+		}
+		if addrSet[addr] {
+			return true
+		}
+	}
+	return false
 }
 
 // Status reads the keepalived status and returns a formatted string.
