@@ -330,7 +330,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start HTTP API server if configured.
 	if d.opts.APIAddr != "" {
-		srv := api.NewServer(api.Config{
+		apiCfg := api.Config{
 			Addr:     d.opts.APIAddr,
 			Store:    d.store,
 			DP:       d.dp,
@@ -341,7 +341,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 			IPsec:    d.ipsec,
 			DHCP:     d.dhcp,
 			ApplyFn:  d.applyConfig,
-		})
+		}
+		// Enable HTTPS if web-management https is configured
+		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Services != nil &&
+			cfg.System.Services.WebManagement != nil && cfg.System.Services.WebManagement.HTTPS {
+			apiCfg.TLS = true
+			apiCfg.HTTPSAddr = "127.0.0.1:8443"
+		}
+		srv := api.NewServer(apiCfg)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

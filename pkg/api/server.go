@@ -2,8 +2,17 @@ package api
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"log/slog"
+	"math/big"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -22,31 +31,34 @@ import (
 
 // Config configures the API server.
 type Config struct {
-	Addr     string
-	Store    *configstore.Store
-	DP       *dataplane.Manager
-	EventBuf *logging.EventBuffer
-	GC       *conntrack.GC
-	Routing  *routing.Manager
-	FRR      *frr.Manager
-	IPsec    *ipsec.Manager
-	DHCP     *dhcp.Manager
-	ApplyFn  func(*config.Config) // daemon's applyConfig callback
+	Addr      string
+	HTTPSAddr string // HTTPS listen address (empty = no HTTPS)
+	TLS       bool   // enable HTTPS with auto-generated certificate
+	Store     *configstore.Store
+	DP        *dataplane.Manager
+	EventBuf  *logging.EventBuffer
+	GC        *conntrack.GC
+	Routing   *routing.Manager
+	FRR       *frr.Manager
+	IPsec     *ipsec.Manager
+	DHCP      *dhcp.Manager
+	ApplyFn   func(*config.Config) // daemon's applyConfig callback
 }
 
 // Server is the HTTP API server.
 type Server struct {
-	httpServer *http.Server
-	store      *configstore.Store
-	dp         *dataplane.Manager
-	eventBuf   *logging.EventBuffer
-	gc         *conntrack.GC
-	routing    *routing.Manager
-	frr        *frr.Manager
-	ipsec      *ipsec.Manager
-	dhcp       *dhcp.Manager
-	applyFn    func(*config.Config)
-	startTime  time.Time
+	httpServer  *http.Server
+	httpsServer *http.Server
+	store       *configstore.Store
+	dp          *dataplane.Manager
+	eventBuf    *logging.EventBuffer
+	gc          *conntrack.GC
+	routing     *routing.Manager
+	frr         *frr.Manager
+	ipsec       *ipsec.Manager
+	dhcp        *dhcp.Manager
+	applyFn     func(*config.Config)
+	startTime   time.Time
 }
 
 // NewServer creates a new API server.
@@ -155,10 +167,27 @@ func NewServer(cfg Config) *Server {
 		Handler: mux,
 	}
 
+	// Set up HTTPS server with auto-generated self-signed certificate
+	if cfg.TLS && cfg.HTTPSAddr != "" {
+		tlsCert, err := generateSelfSignedCert()
+		if err != nil {
+			slog.Warn("failed to generate self-signed certificate", "err", err)
+		} else {
+			s.httpsServer = &http.Server{
+				Addr:    cfg.HTTPSAddr,
+				Handler: mux,
+				TLSConfig: &tls.Config{
+					Certificates: []tls.Certificate{tlsCert},
+					MinVersion:   tls.VersionTLS12,
+				},
+			}
+		}
+	}
+
 	return s
 }
 
-// Run starts the HTTP server and blocks until ctx is cancelled.
+// Run starts the HTTP (and optionally HTTPS) server and blocks until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
@@ -166,8 +195,17 @@ func (s *Server) Run(ctx context.Context) error {
 		if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
 			errCh <- err
 		}
-		close(errCh)
 	}()
+
+	// Start HTTPS server if configured
+	if s.httpsServer != nil {
+		go func() {
+			slog.Info("HTTPS API server listening", "addr", s.httpsServer.Addr)
+			if err := s.httpsServer.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+				errCh <- err
+			}
+		}()
+	}
 
 	select {
 	case err := <-errCh:
@@ -177,5 +215,62 @@ func (s *Server) Run(ctx context.Context) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if s.httpsServer != nil {
+		s.httpsServer.Shutdown(shutdownCtx)
+	}
 	return s.httpServer.Shutdown(shutdownCtx)
+}
+
+const (
+	certPath = "/etc/bpfrx/tls/cert.pem"
+	keyPath  = "/etc/bpfrx/tls/key.pem"
+)
+
+// generateSelfSignedCert creates or loads a self-signed TLS certificate.
+// If cert/key files exist on disk, they are loaded. Otherwise, a new
+// ECDSA P-256 certificate is generated and persisted for reuse across restarts.
+func generateSelfSignedCert() (tls.Certificate, error) {
+	// Try loading existing cert
+	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
+		return cert, nil
+	}
+
+	// Generate new ECDSA key
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "bpfrx"
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: hostname, Organization: []string{"bpfrx"}},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	// Persist for reuse across restarts
+	os.MkdirAll("/etc/bpfrx/tls", 0700)
+	os.WriteFile(certPath, certPEM, 0644)
+	os.WriteFile(keyPath, keyPEM, 0600)
+
+	return tls.X509KeyPair(certPEM, keyPEM)
 }
