@@ -2616,6 +2616,14 @@ func (s *Server) GetSystemInfo(_ context.Context, req *pb.GetSystemInfoRequest) 
 			fmt.Fprintf(&buf, "Utilization: %.1f%%\n", float64(used)/float64(total)*100)
 		}
 
+	case "processes":
+		cmd := exec.Command("ps", "aux", "--sort=-rss")
+		out, err := cmd.Output()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "running ps: %v", err)
+		}
+		buf.Write(out)
+
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown system info type: %s", req.Type)
 	}

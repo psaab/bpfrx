@@ -256,6 +256,9 @@ func (c *ctl) dispatchOperational(line string) error {
 		return nil
 
 	case "show":
+		if len(parts) >= 2 && parts[1] == "version" {
+			return c.showText("version")
+		}
 		return c.handleShow(parts[1:])
 
 	case "clear":
@@ -1123,6 +1126,7 @@ func (c *ctl) handleShowSystem(args []string) error {
 		fmt.Println("  storage          Show filesystem usage")
 		fmt.Println("  uptime           Show system uptime")
 		fmt.Println("  memory           Show memory usage")
+		fmt.Println("  processes        Show running processes")
 		fmt.Println("  license          Show system license")
 		return nil
 	}
@@ -1171,6 +1175,9 @@ func (c *ctl) handleShowSystem(args []string) error {
 
 	case "storage":
 		return c.showText("storage")
+
+	case "processes":
+		return c.showSystemInfo("processes")
 
 	case "license":
 		fmt.Println("License: open-source (no license required)")
@@ -1530,6 +1537,7 @@ func (c *ctl) showOperationalHelp() {
 	fmt.Println("  show system rollback               Show rollback history")
 	fmt.Println("  show system uptime                 Show system uptime")
 	fmt.Println("  show system memory                 Show memory usage")
+	fmt.Println("  show version                       Show software version")
 	fmt.Println("  clear security flow session        Clear all sessions")
 	fmt.Println("  clear security counters            Clear all counters")
 	fmt.Println("  clear dhcp client-identifier       Clear DHCPv6 DUID(s)")
