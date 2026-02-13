@@ -3895,6 +3895,14 @@ security {
 func TestConfigValidationClean(t *testing.T) {
 	// A valid config should have no warnings
 	input := `
+interfaces {
+    eth0 {
+        unit 0 { family inet { address 10.0.1.1/24; } }
+    }
+    eth1 {
+        unit 0 { family inet { address 10.0.2.1/24; } }
+    }
+}
 security {
     zones {
         security-zone trust {
@@ -3941,6 +3949,76 @@ security {
 
 	if len(cfg.Warnings) > 0 {
 		t.Errorf("expected no warnings, got: %v", cfg.Warnings)
+	}
+}
+
+func TestConfigValidationCrossRef(t *testing.T) {
+	input := `
+interfaces {
+    eth0 { unit 0 { family inet { address 10.0.1.1/24; } } }
+}
+security {
+    zones {
+        security-zone trust {
+            interfaces { eth0; }
+        }
+        security-zone untrust {
+            interfaces { missing-iface; }
+        }
+    }
+    nat {
+        source {
+            rule-set test {
+                from zone trust;
+                to zone untrust;
+                rule snat {
+                    match { source-address 0.0.0.0/0; }
+                    then { source-nat { pool { missing-pool; } } }
+                }
+            }
+        }
+    }
+    policies {
+        from-zone trust to-zone untrust {
+            policy sched-test {
+                match { source-address any; destination-address any; application any; }
+                then { permit; }
+                scheduler-name missing-sched;
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	var foundIfaceWarn, foundPoolWarn, foundSchedWarn bool
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "missing-iface") && strings.Contains(w, "not in interfaces") {
+			foundIfaceWarn = true
+		}
+		if strings.Contains(w, "missing-pool") && strings.Contains(w, "not defined") {
+			foundPoolWarn = true
+		}
+		if strings.Contains(w, "missing-sched") && strings.Contains(w, "not defined") {
+			foundSchedWarn = true
+		}
+	}
+	if !foundIfaceWarn {
+		t.Errorf("missing warning for zone referencing unconfigured interface, got: %v", cfg.Warnings)
+	}
+	if !foundPoolWarn {
+		t.Errorf("missing warning for SNAT referencing undefined pool, got: %v", cfg.Warnings)
+	}
+	if !foundSchedWarn {
+		t.Errorf("missing warning for policy referencing undefined scheduler, got: %v", cfg.Warnings)
 	}
 }
 
