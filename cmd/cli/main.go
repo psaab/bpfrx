@@ -69,6 +69,36 @@ func main() {
 		Stdin:           os.Stdin,
 		Stdout:          os.Stdout,
 		Stderr:          os.Stderr,
+		Listener: readline.FuncListener(func(line []rune, pos int, key rune) ([]rune, int, bool) {
+			if key != '?' || pos < 1 {
+				return line, pos, false
+			}
+			// Strip the '?' that readline already inserted.
+			cleanLine := make([]rune, 0, len(line)-1)
+			cleanLine = append(cleanLine, line[:pos-1]...)
+			cleanLine = append(cleanLine, line[pos:]...)
+			text := string(cleanLine[:pos-1])
+			// Use gRPC Complete to get candidates.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			resp, err := c.client.Complete(ctx, &pb.CompleteRequest{
+				Line:       text + " ",
+				Pos:        int32(len(text) + 1),
+				ConfigMode: c.configMode,
+			})
+			if err != nil || len(resp.Candidates) == 0 {
+				fmt.Fprintln(c.rl.Stdout(), "  (no help available)")
+				return cleanLine, pos - 1, true
+			}
+			sort.Strings(resp.Candidates)
+			words := strings.Fields(text)
+			candidates := make([]remoteCandidate, len(resp.Candidates))
+			for i, name := range resp.Candidates {
+				candidates[i] = remoteCandidate{name: name, desc: remoteLookupDesc(words, name, c.configMode)}
+			}
+			writeRemoteHelp(c.rl.Stdout(), candidates)
+			return cleanLine, pos - 1, true
+		}),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cli: readline: %v\n", err)
@@ -132,11 +162,6 @@ type ctl struct {
 }
 
 func (c *ctl) dispatch(line string) error {
-	if strings.HasSuffix(line, "?") {
-		c.showContextHelp(strings.TrimSuffix(line, "?"))
-		return nil
-	}
-
 	// Extract pipe filter (| match, | except, | count, | last, | no-more).
 	// Skip | display set and | compare.
 	if cmd, pipeType, pipeArg, ok := extractPipe(line); ok {
@@ -363,29 +388,7 @@ func (c *ctl) dispatchConfig(line string) error {
 
 func (c *ctl) handleShow(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("show: specify what to show")
-		fmt.Println("  chassis          Show hardware information")
-		fmt.Println("  configuration    Show active configuration")
-		fmt.Println("  dhcp             Show DHCP information")
-		fmt.Println("  dhcp-relay       Show DHCP relay status")
-		fmt.Println("  dhcp-server      Show DHCP server leases")
-		fmt.Println("  firewall         Show firewall filters")
-		fmt.Println("  flow-monitoring  Show flow monitoring/NetFlow configuration")
-		fmt.Println("  log              Show daemon log entries")
-		fmt.Println("  route            Show routing table")
-		fmt.Println("  schedulers       Show policy schedulers")
-		fmt.Println("  security         Show security information")
-		fmt.Println("  services         Show services information")
-		fmt.Println("  snmp             Show SNMP statistics")
-		fmt.Println("  interfaces       Show interface status")
-		fmt.Println("  protocols        Show protocol information")
-		fmt.Println("  system           Show system information")
-		fmt.Println("  policy-options   Show prefix-lists and policy-statements")
-		fmt.Println("  event-options    Show event-driven policies")
-		fmt.Println("  routing-instances Show VRF/virtual-router instances")
-		fmt.Println("  routing-options  Show static routes and routing config")
-		fmt.Println("  forwarding-options Show forwarding/sampling config")
-		fmt.Println("  version          Show software version")
+		printRemoteTreeHelp("show: specify what to show", "show")
 		return nil
 	}
 
@@ -541,8 +544,7 @@ func (c *ctl) handleShow(args []string) error {
 
 func (c *ctl) handleShowServices(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("show services:")
-		fmt.Println("  rpm              Show RPM probe results")
+		printRemoteTreeHelp("show services:", "show services")
 		return nil
 	}
 	switch args[0] {
@@ -555,25 +557,7 @@ func (c *ctl) handleShowServices(args []string) error {
 
 func (c *ctl) handleShowSecurity(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("show security:")
-		fmt.Println("  zones            Show security zones")
-		fmt.Println("  policies         Show security policies")
-		fmt.Println("  policies brief   Show brief policy summary")
-		fmt.Println("  policies hit-count  Show policy hit counters")
-		fmt.Println("  screen           Show screen/IDS profiles")
-		fmt.Println("  flow             Show flow timeouts")
-		fmt.Println("  flow session     Show active sessions")
-		fmt.Println("  flow traceoptions Show flow trace configuration")
-		fmt.Println("  nat              Show NAT information")
-		fmt.Println("  address-book     Show address book entries")
-		fmt.Println("  applications     Show application definitions")
-		fmt.Println("  alg              Show ALG status")
-		fmt.Println("  dynamic-address  Show dynamic address feeds")
-		fmt.Println("  match-policies   Match 5-tuple against policies")
-		fmt.Println("  log              Show recent security events")
-		fmt.Println("  statistics       Show global statistics")
-		fmt.Println("  ipsec            Show IPsec VPN status")
-		fmt.Println("  vrrp             Show VRRP status")
+		printRemoteTreeHelp("show security:", "show security")
 		return nil
 	}
 
@@ -845,14 +829,7 @@ func (c *ctl) showSessionSummary() error {
 
 func (c *ctl) handleShowNAT(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("show security nat:")
-		fmt.Println("  source           Show source NAT rules")
-		fmt.Println("  destination                  Show destination NAT rules")
-		fmt.Println("  destination summary          Show destination NAT pool summary")
-		fmt.Println("  destination pool <name|all>  Show destination NAT pool details")
-		fmt.Println("  destination rule-set <name>  Show destination NAT rule-set details")
-		fmt.Println("  static           Show static NAT rules")
-		fmt.Println("  nat64            Show NAT64 rule-sets")
+		printRemoteTreeHelp("show security nat:", "show security nat")
 		return nil
 	}
 	switch args[0] {
@@ -1432,11 +1409,7 @@ func (c *ctl) showRoutes() error {
 
 func (c *ctl) handleShowProtocols(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("show protocols:")
-		fmt.Println("  ospf             Show OSPF information")
-		fmt.Println("  bgp              Show BGP information")
-		fmt.Println("  rip              Show RIP routes")
-		fmt.Println("  isis             Show IS-IS information")
+		printRemoteTreeHelp("show protocols:", "show protocols")
 		return nil
 	}
 	switch args[0] {
@@ -1487,22 +1460,7 @@ func (c *ctl) handleShowProtocols(args []string) error {
 
 func (c *ctl) handleShowSystem(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("show system:")
-		fmt.Println("  alarms             Show system alarms")
-		fmt.Println("  backup-router      Show backup router configuration")
-		fmt.Println("  buffers            Show BPF map utilization")
-		fmt.Println("  internet-options   Show internet options")
-		fmt.Println("  license            Show system license")
-		fmt.Println("  login              Show configured login users")
-		fmt.Println("  memory             Show memory usage")
-		fmt.Println("  ntp                Show NTP server status")
-		fmt.Println("  processes          Show running processes")
-		fmt.Println("  rollback           Show rollback history")
-		fmt.Println("  root-authentication Show root authentication")
-		fmt.Println("  services           Show configured system services")
-		fmt.Println("  storage            Show filesystem usage")
-		fmt.Println("  syslog             Show system syslog configuration")
-		fmt.Println("  uptime             Show system uptime")
+		printRemoteTreeHelp("show system:", "show system")
 		return nil
 	}
 
@@ -1706,12 +1664,11 @@ func (c *ctl) handleCommit(args []string) error {
 }
 
 func (c *ctl) handleClear(args []string) error {
+	showHelp := func() {
+		printRemoteTreeHelp("clear:", "clear")
+	}
 	if len(args) < 1 {
-		fmt.Println("clear:")
-		fmt.Println("  security flow session          Clear all sessions")
-		fmt.Println("  security counters              Clear all counters")
-		fmt.Println("  firewall all                   Clear firewall filter counters")
-		fmt.Println("  dhcp client-identifier         Clear DHCPv6 DUID(s)")
+		showHelp()
 		return nil
 	}
 
@@ -1723,22 +1680,14 @@ func (c *ctl) handleClear(args []string) error {
 	case "dhcp":
 		return c.handleClearDHCP(args[1:])
 	default:
-		fmt.Println("clear:")
-		fmt.Println("  security flow session          Clear all sessions")
-		fmt.Println("  security counters              Clear all counters")
-		fmt.Println("  firewall all                   Clear firewall filter counters")
-		fmt.Println("  dhcp client-identifier         Clear DHCPv6 DUID(s)")
+		showHelp()
 		return nil
 	}
 }
 
 func (c *ctl) handleClearSecurity(args []string) error {
 	if len(args) < 1 {
-		fmt.Println("clear security:")
-		fmt.Println("  flow session                         Clear all sessions")
-		fmt.Println("  policies hit-count                   Clear policy hit counters")
-		fmt.Println("  counters                             Clear all counters")
-		fmt.Println("  nat source persistent-nat-table      Clear persistent NAT bindings")
+		printRemoteTreeHelp("clear security:", "clear security")
 		return nil
 	}
 
@@ -1830,8 +1779,7 @@ func (c *ctl) handleClearSecurity(args []string) error {
 
 func (c *ctl) handleClearFirewall(args []string) error {
 	if len(args) < 1 || args[0] != "all" {
-		fmt.Println("clear firewall:")
-		fmt.Println("  all    Clear all firewall filter counters")
+		printRemoteTreeHelp("clear firewall:", "clear firewall")
 		return nil
 	}
 	resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
@@ -1846,8 +1794,7 @@ func (c *ctl) handleClearFirewall(args []string) error {
 
 func (c *ctl) handleClearDHCP(args []string) error {
 	if len(args) < 1 || args[0] != "client-identifier" {
-		fmt.Println("clear dhcp:")
-		fmt.Println("  client-identifier [interface <name>]    Clear DHCPv6 DUID(s)")
+		printRemoteTreeHelp("clear dhcp:", "clear dhcp")
 		return nil
 	}
 
@@ -1913,11 +1860,7 @@ func (c *ctl) showPoliciesBrief() error {
 
 func (c *ctl) handleRequest(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("request:")
-		fmt.Println("  dhcp renew       Renew DHCP lease on an interface")
-		fmt.Println("  system reboot    Reboot the system")
-		fmt.Println("  system halt      Halt the system")
-		fmt.Println("  system zeroize   Factory reset (erase all config)")
+		printRemoteTreeHelp("request:", "request")
 		return nil
 	}
 	switch args[0] {
@@ -1929,10 +1872,7 @@ func (c *ctl) handleRequest(args []string) error {
 		return fmt.Errorf("unknown request target: %s", args[0])
 	}
 	if len(args) < 2 {
-		fmt.Println("request system:")
-		fmt.Println("  reboot    Reboot the system")
-		fmt.Println("  halt      Halt the system")
-		fmt.Println("  zeroize   Factory reset (erase all config)")
+		printRemoteTreeHelp("request system:", "request system")
 		return nil
 	}
 
@@ -1979,8 +1919,7 @@ func (c *ctl) handleRequest(args []string) error {
 
 func (c *ctl) handleRequestDHCP(args []string) error {
 	if len(args) == 0 || args[0] != "renew" {
-		fmt.Println("request dhcp:")
-		fmt.Println("  renew <interface>  Renew DHCP lease on an interface")
+		printRemoteTreeHelp("request dhcp:", "request dhcp")
 		return nil
 	}
 	if len(args) < 2 {
@@ -2018,7 +1957,6 @@ func (rc *remoteCompleter) Do(line []rune, pos int) ([][]rune, int) {
 		return nil, 0
 	}
 
-	// Determine partial word for replacement length
 	words := strings.Fields(text)
 	trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
 	var partial string
@@ -2026,38 +1964,26 @@ func (rc *remoteCompleter) Do(line []rune, pos int) ([][]rune, int) {
 		partial = words[len(words)-1]
 	}
 
-	var result [][]rune
-	for _, c := range resp.Candidates {
-		suffix := c[len(partial):]
-		result = append(result, []rune(suffix+" "))
-	}
-	return result, len(partial)
-}
-
-// --- Context help ---
-
-func (c *ctl) showContextHelp(prefix string) {
-	prefix = strings.TrimSpace(prefix)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Request completions for the prefix + trailing space (as if ready for next word)
-	resp, err := c.client.Complete(ctx, &pb.CompleteRequest{
-		Line:       prefix + " ",
-		Pos:        int32(len(prefix) + 1),
-		ConfigMode: c.configMode,
-	})
-	if err != nil || len(resp.Candidates) == 0 {
-		fmt.Println("  (no help available)")
-		return
-	}
-
 	sort.Strings(resp.Candidates)
-	fmt.Println("Possible completions:")
-	for _, cand := range resp.Candidates {
-		fmt.Printf("  %s\n", cand)
+
+	if len(resp.Candidates) == 1 {
+		suffix := resp.Candidates[0][len(partial):]
+		return [][]rune{[]rune(suffix + " ")}, len(partial)
 	}
+
+	// Multiple matches: show descriptions above prompt.
+	candidates := make([]remoteCandidate, len(resp.Candidates))
+	for i, name := range resp.Candidates {
+		candidates[i] = remoteCandidate{name: name, desc: remoteLookupDesc(words, name, rc.ctl.configMode)}
+	}
+	writeRemoteHelp(rc.ctl.rl.Stdout(), candidates)
+
+	cp := remoteCommonPrefix(resp.Candidates)
+	suffix := cp[len(partial):]
+	if suffix == "" {
+		return nil, 0
+	}
+	return [][]rune{[]rune(suffix)}, len(partial)
 }
 
 // --- Prompts ---
@@ -2182,11 +2108,7 @@ func (c *ctl) handleTraceroute(args []string) error {
 
 func (c *ctl) handleLoad(args []string) error {
 	if len(args) < 2 {
-		fmt.Println("load:")
-		fmt.Println("  override terminal    Replace candidate with pasted config")
-		fmt.Println("  merge terminal       Merge pasted config into candidate")
-		fmt.Println("  override <file>      Replace candidate with file contents")
-		fmt.Println("  merge <file>         Merge file contents into candidate")
+		printRemoteTreeHelp("load:", "config load")
 		return nil
 	}
 
@@ -2251,4 +2173,283 @@ func (c *ctl) showConfigHelp() {
 	fmt.Println("  rollback [n]                 Revert to previous configuration")
 	fmt.Println("  run <cmd>                    Run operational command")
 	fmt.Println("  exit                         Exit configuration mode")
+}
+
+// --- Completion helpers (local description tree for remote CLI) ---
+
+type remoteCandidate struct {
+	name string
+	desc string
+}
+
+// remoteDescTree maps command paths to child name→description.
+// This provides descriptions for tab/? help without importing pkg/cli.
+var remoteDescTree = map[string]map[string]string{
+	"": {
+		"configure":  "Enter configuration mode",
+		"show":       "Show information",
+		"clear":      "Clear information",
+		"request":    "Perform system operations",
+		"ping":       "Ping remote host",
+		"traceroute": "Trace route to remote host",
+		"quit":       "Exit CLI",
+		"exit":       "Exit CLI",
+	},
+	"show": {
+		"arp":                "Show ARP table",
+		"chassis":            "Show hardware information",
+		"configuration":      "Show active configuration",
+		"dhcp":               "Show DHCP information",
+		"dhcp-relay":         "Show DHCP relay status",
+		"dhcp-server":        "Show DHCP server leases",
+		"event-options":      "Show event policies",
+		"firewall":           "Show firewall filters",
+		"flow-monitoring":    "Show flow monitoring/NetFlow configuration",
+		"forwarding-options": "Show forwarding options",
+		"interfaces":         "Show interface status",
+		"ipv6":               "Show IPv6 information",
+		"log":                "Show daemon log entries",
+		"policy-options":     "Show policy options",
+		"protocols":          "Show protocol information",
+		"route":              "Show routing table",
+		"routing-instances":  "Show routing instances",
+		"routing-options":    "Show routing options",
+		"schedulers":         "Show policy schedulers",
+		"security":           "Show security information",
+		"services":           "Show services information",
+		"snmp":               "Show SNMP statistics",
+		"system":             "Show system information",
+		"version":            "Show software version",
+	},
+	"show security": {
+		"address-book":     "Show address book entries",
+		"alg":              "Show ALG status",
+		"applications":     "Show application definitions",
+		"dynamic-address":  "Show dynamic address feeds",
+		"flow":             "Show flow information",
+		"ike":              "Show IKE status",
+		"ipsec":            "Show IPsec status",
+		"log":              "Show recent security events",
+		"match-policies":   "Match 5-tuple against policies",
+		"nat":              "Show NAT information",
+		"policies":         "Show security policies",
+		"screen":           "Show screen/IDS profiles",
+		"statistics":       "Show global statistics",
+		"vrrp":             "Show VRRP high availability status",
+		"zones":            "Show security zones",
+	},
+	"show security flow": {
+		"session":      "Show active sessions",
+		"statistics":   "Show flow statistics",
+		"traceoptions": "Show flow trace configuration",
+	},
+	"show security ike": {
+		"security-associations": "Show IKE SAs",
+	},
+	"show security ipsec": {
+		"security-associations": "Show IPsec SAs",
+	},
+	"show security nat": {
+		"source":      "Show source NAT",
+		"destination": "Show destination NAT",
+		"static":      "Show static NAT",
+		"nat64":       "Show NAT64 rules",
+	},
+	"show security policies": {
+		"brief":     "Show brief policy summary",
+		"hit-count": "Show policy hit counters",
+		"from-zone": "Filter by source zone",
+		"to-zone":   "Filter by destination zone",
+	},
+	"show interfaces": {
+		"terse":     "Show interface summary",
+		"extensive": "Show detailed interface statistics",
+		"tunnel":    "Show tunnel interfaces",
+	},
+	"show route": {
+		"summary":  "Show route summary by protocol",
+		"table":    "Show routes for a VRF table",
+		"protocol": "Show routes by protocol",
+		"instance": "Show routes for a routing instance",
+	},
+	"show protocols": {
+		"ospf": "Show OSPF information",
+		"bgp":  "Show BGP information",
+		"rip":  "Show RIP information",
+		"isis": "Show IS-IS information",
+	},
+	"show protocols ospf": {
+		"neighbor": "Show OSPF neighbors",
+		"database": "Show OSPF database",
+	},
+	"show protocols bgp": {
+		"summary": "Show BGP peer summary",
+		"routes":  "Show BGP routes",
+	},
+	"show protocols isis": {
+		"adjacency": "Show IS-IS adjacencies",
+		"routes":    "Show IS-IS routes",
+	},
+	"show system": {
+		"alarms":        "Show system alarms",
+		"backup-router": "Show backup router configuration",
+		"buffers":       "Show BPF map utilization",
+		"connections":   "Show system TCP connections",
+		"license":       "Show system license",
+		"memory":        "Show memory usage",
+		"ntp":           "Show NTP server status",
+		"processes":     "Show running processes",
+		"rollback":      "Show rollback history",
+		"services":      "Show configured system services",
+		"storage":       "Show filesystem usage",
+		"syslog":        "Show system syslog configuration",
+		"uptime":        "Show system uptime",
+		"users":         "Show configured login users",
+	},
+	"show system rollback": {
+		"compare": "Compare rollback with active config",
+	},
+	"show chassis": {
+		"cluster":     "Show cluster/HA status",
+		"environment": "Show temperature and power",
+		"hardware":    "Show hardware details",
+	},
+	"show services": {
+		"rpm": "Show RPM probe results",
+	},
+	"show services rpm": {
+		"probe-results": "Show RPM probe results",
+	},
+	"show ipv6": {
+		"neighbors": "Show IPv6 neighbor cache",
+	},
+	"show dhcp": {
+		"leases":            "Show DHCP leases",
+		"client-identifier": "Show DHCPv6 DUID(s)",
+	},
+	"clear": {
+		"security": "Clear security information",
+		"firewall": "Clear firewall counters",
+		"dhcp":     "Clear DHCP information",
+	},
+	"clear security": {
+		"flow":     "Clear flow information",
+		"counters": "Clear all counters",
+		"policies": "Clear policy information",
+		"nat":      "Clear NAT information",
+	},
+	"clear security flow": {
+		"session": "Clear sessions",
+	},
+	"clear security policies": {
+		"hit-count": "Clear policy hit counters",
+	},
+	"clear security nat": {
+		"source": "Clear source NAT",
+	},
+	"clear firewall": {
+		"all": "Clear all firewall filter counters",
+	},
+	"clear dhcp": {
+		"client-identifier": "Clear DHCPv6 DUID(s)",
+	},
+	"request": {
+		"dhcp":   "DHCP operations",
+		"system": "System operations",
+	},
+	"request dhcp": {
+		"renew": "Renew DHCP lease on an interface",
+	},
+	"request system": {
+		"reboot":  "Reboot the system",
+		"halt":    "Halt the system",
+		"zeroize": "Factory reset (erase all config)",
+	},
+	// Config mode top-level
+	"config": {
+		"set":      "Set a configuration value",
+		"delete":   "Delete a configuration element",
+		"show":     "Show candidate configuration",
+		"commit":   "Commit configuration",
+		"load":     "Load configuration from file or terminal",
+		"rollback": "Revert to previous configuration",
+		"run":      "Run operational command",
+		"exit":     "Exit configuration mode",
+		"quit":     "Exit configuration mode",
+	},
+	"config commit": {
+		"check":     "Validate without applying",
+		"confirmed": "Auto-rollback if not confirmed [minutes]",
+	},
+	"config load": {
+		"override": "Replace candidate with file or terminal input",
+		"merge":    "Merge into candidate from file or terminal",
+	},
+}
+
+// remoteLookupDesc finds the description for a candidate name given a command path.
+func remoteLookupDesc(words []string, name string, configMode bool) string {
+	var key string
+	if configMode && len(words) == 0 {
+		key = "config"
+	} else if configMode && len(words) > 0 && words[0] == "run" {
+		// "run show ..." → look up in operational tree
+		key = strings.Join(words[1:], " ")
+	} else {
+		key = strings.Join(words, " ")
+	}
+	if descs, ok := remoteDescTree[key]; ok {
+		if desc, ok := descs[name]; ok {
+			return desc
+		}
+	}
+	return ""
+}
+
+func writeRemoteHelp(w io.Writer, candidates []remoteCandidate) {
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].name < candidates[j].name })
+	maxWidth := 20
+	for _, c := range candidates {
+		if len(c.name)+2 > maxWidth {
+			maxWidth = len(c.name) + 2
+		}
+	}
+	fmt.Fprintln(w, "Possible completions:")
+	for _, c := range candidates {
+		if c.desc != "" {
+			fmt.Fprintf(w, "  %-*s %s\n", maxWidth, c.name, c.desc)
+		} else {
+			fmt.Fprintf(w, "  %s\n", c.name)
+		}
+	}
+}
+
+func remoteCommonPrefix(items []string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	prefix := items[0]
+	for _, s := range items[1:] {
+		for !strings.HasPrefix(s, prefix) {
+			prefix = prefix[:len(prefix)-1]
+			if prefix == "" {
+				return ""
+			}
+		}
+	}
+	return prefix
+}
+
+// printRemoteTreeHelp prints self-generating help from remoteDescTree for a given key.
+func printRemoteTreeHelp(header, key string) {
+	fmt.Println(header)
+	descs, ok := remoteDescTree[key]
+	if !ok {
+		return
+	}
+	candidates := make([]remoteCandidate, 0, len(descs))
+	for name, desc := range descs {
+		candidates = append(candidates, remoteCandidate{name: name, desc: desc})
+	}
+	writeRemoteHelp(os.Stdout, candidates)
 }

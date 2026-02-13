@@ -154,18 +154,23 @@ var operationalTree = map[string]*completionNode{
 			"alg":             {desc: "Show ALG status"},
 			"dynamic-address": {desc: "Show dynamic address feeds"},
 			"flow": {desc: "Show flow information", children: map[string]*completionNode{
-				"session":    {desc: "Show active sessions"},
-				"statistics": {desc: "Show flow statistics"},
+				"session":      {desc: "Show active sessions"},
+				"statistics":   {desc: "Show flow statistics"},
+				"traceoptions": {desc: "Show flow trace configuration"},
 			}},
 			"nat": {desc: "Show NAT information", children: map[string]*completionNode{
 				"source":      {desc: "Show source NAT"},
 				"destination": {desc: "Show destination NAT"},
 				"static":      {desc: "Show static NAT"},
+				"nat64":       {desc: "Show NAT64 rules"},
 			}},
 			"address-book": {desc: "Show address book entries"},
 			"applications": {desc: "Show application definitions"},
 			"log":          {desc: "Show recent security events [N] [zone <z>] [protocol <p>] [action <a>]"},
 			"statistics":   {desc: "Show global statistics"},
+			"ike": {desc: "Show IKE status", children: map[string]*completionNode{
+				"security-associations": {desc: "Show IKE SAs"},
+			}},
 			"ipsec": {desc: "Show IPsec status", children: map[string]*completionNode{
 				"security-associations": {desc: "Show IPsec SAs"},
 			}},
@@ -220,15 +225,28 @@ var operationalTree = map[string]*completionNode{
 			"rollback": {desc: "Show rollback history", children: map[string]*completionNode{
 				"compare": {desc: "Compare rollback with active config"},
 			}},
-			"buffers":     {desc: "Show BPF map utilization"},
-			"license":     {desc: "Show system license"},
-			"memory":      {desc: "Show memory usage"},
-			"ntp":         {desc: "Show NTP server status"},
-			"processes":   {desc: "Show running processes"},
-			"services":    {desc: "Show configured system services"},
-			"storage":     {desc: "Show filesystem usage"},
-			"uptime":      {desc: "Show system uptime"},
-			"users":       {desc: "Show configured login users"},
+			"backup-router": {desc: "Show backup router configuration"},
+			"buffers":       {desc: "Show BPF map utilization"},
+			"license":       {desc: "Show system license"},
+			"memory":        {desc: "Show memory usage"},
+			"ntp":           {desc: "Show NTP server status"},
+			"processes":     {desc: "Show running processes"},
+			"services":      {desc: "Show configured system services"},
+			"storage":       {desc: "Show filesystem usage"},
+			"syslog":        {desc: "Show system syslog configuration"},
+			"uptime":        {desc: "Show system uptime"},
+			"users":         {desc: "Show configured login users"},
+		}},
+		"routing-options":    {desc: "Show routing options"},
+		"routing-instances":  {desc: "Show routing instances"},
+		"policy-options":     {desc: "Show policy options"},
+		"event-options":      {desc: "Show event policies"},
+		"forwarding-options": {desc: "Show forwarding options"},
+		"version":            {desc: "Show software version"},
+	}},
+	"monitor": {desc: "Capture traffic", children: map[string]*completionNode{
+		"traffic": {desc: "Capture traffic on interface", children: map[string]*completionNode{
+			"interface": {desc: "Interface name to capture on"},
 		}},
 	}},
 	"clear": {desc: "Clear information", children: map[string]*completionNode{
@@ -254,6 +272,9 @@ var operationalTree = map[string]*completionNode{
 		}},
 	}},
 	"request": {desc: "Perform system operations", children: map[string]*completionNode{
+		"dhcp": {desc: "DHCP operations", children: map[string]*completionNode{
+			"renew": {desc: "Renew DHCP lease on an interface"},
+		}},
 		"system": {desc: "System operations", children: map[string]*completionNode{
 			"reboot":  {desc: "Reboot the system"},
 			"halt":    {desc: "Halt the system"},
@@ -271,9 +292,13 @@ var configTopLevel = map[string]*completionNode{
 	"set":      {desc: "Set a configuration value"},
 	"delete":   {desc: "Delete a configuration element"},
 	"show":     {desc: "Show candidate configuration"},
-	"commit":   {desc: "Commit configuration", children: map[string]*completionNode{
+	"commit": {desc: "Commit configuration", children: map[string]*completionNode{
 		"check":     {desc: "Validate without applying"},
 		"confirmed": {desc: "Auto-rollback if not confirmed [minutes]"},
+	}},
+	"load": {desc: "Load configuration from file or terminal", children: map[string]*completionNode{
+		"override": {desc: "Replace candidate with file or terminal input"},
+		"merge":    {desc: "Merge into candidate from file or terminal"},
 	}},
 	"rollback": {desc: "Revert to previous configuration"},
 	"run":      {desc: "Run operational command"},
@@ -287,11 +312,8 @@ type cliCompleter struct {
 }
 
 func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
-	// Only complete up to cursor position.
 	text := string(line[:pos])
 	words := strings.Fields(text)
-
-	// Detect if cursor is at a space after the last word (ready for new word).
 	trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
 
 	var partial string
@@ -300,95 +322,86 @@ func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
 		words = words[:len(words)-1]
 	}
 
-	var candidates []string
-
+	var candidates []completionCandidate
 	if cc.cli.store.InConfigMode() {
-		candidates = cc.completeConfig(words, partial)
+		candidates = cc.cli.completeConfigWithDesc(words, partial)
 	} else {
-		candidates = cc.completeOperational(words, partial)
+		candidates = completeFromTreeWithDesc(operationalTree, words, partial, cc.cli.store.ActiveConfig())
 	}
-
 	if len(candidates) == 0 {
 		return nil, 0
 	}
 
-	sort.Strings(candidates)
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].name < candidates[j].name })
 
-	var result [][]rune
-	for _, c := range candidates {
-		suffix := c[len(partial):]
-		result = append(result, []rune(suffix+" "))
+	if len(candidates) == 1 {
+		suffix := candidates[0].name[len(partial):]
+		return [][]rune{[]rune(suffix + " ")}, len(partial)
 	}
-	return result, len(partial)
+
+	// Multiple matches: show descriptions above prompt.
+	writeCompletionHelp(cc.cli.rl.Stdout(), candidates)
+
+	// Complete common prefix.
+	names := make([]string, len(candidates))
+	for i, c := range candidates {
+		names[i] = c.name
+	}
+	cp := commonPrefix(names)
+	suffix := cp[len(partial):]
+	if suffix == "" {
+		return nil, 0
+	}
+	return [][]rune{[]rune(suffix)}, len(partial)
 }
 
-func (cc *cliCompleter) completeOperational(words []string, partial string) []string {
-	cfg := cc.cli.store.ActiveConfig()
-	return completeFromTree(operationalTree, words, partial, cfg)
-}
-
-func (cc *cliCompleter) completeConfig(words []string, partial string) []string {
+func (c *CLI) completeConfigWithDesc(words []string, partial string) []completionCandidate {
 	if len(words) == 0 {
-		// Complete top-level config commands.
-		return filterPrefix(keysOf(configTopLevel), partial)
+		var candidates []completionCandidate
+		for name, node := range configTopLevel {
+			if strings.HasPrefix(name, partial) {
+				candidates = append(candidates, completionCandidate{name: name, desc: node.desc})
+			}
+		}
+		return candidates
 	}
 
 	switch words[0] {
 	case "set", "delete":
-		// Use schema-driven completion for the path after set/delete.
-		schemaCompletions := config.CompleteSetPathWithValues(words[1:], cc.cli.valueProvider)
+		schemaCompletions := config.CompleteSetPathWithValues(words[1:], c.valueProvider)
 		if schemaCompletions == nil {
 			return nil
 		}
-		return filterPrefix(schemaCompletions, partial)
+		var candidates []completionCandidate
+		for _, name := range schemaCompletions {
+			if strings.HasPrefix(name, partial) {
+				candidates = append(candidates, completionCandidate{name: name})
+			}
+		}
+		return candidates
 
 	case "run":
-		// Delegate to operational completions for the rest.
-		cfg := cc.cli.store.ActiveConfig()
-		return completeFromTree(operationalTree, words[1:], partial, cfg)
+		return completeFromTreeWithDesc(operationalTree, words[1:], partial, c.store.ActiveConfig())
 
-	case "commit":
+	case "commit", "load":
 		if len(words) == 1 {
-			return filterPrefix([]string{"check", "confirmed"}, partial)
+			node := configTopLevel[words[0]]
+			if node == nil || node.children == nil {
+				return nil
+			}
+			var candidates []completionCandidate
+			for name, child := range node.children {
+				if strings.HasPrefix(name, partial) {
+					candidates = append(candidates, completionCandidate{name: name, desc: child.desc})
+				}
+			}
+			return candidates
 		}
 		return nil
 
 	default:
 		return nil
 	}
-}
-
-func completeFromTree(tree map[string]*completionNode, words []string, partial string, cfg *config.Config) []string {
-	current := tree
-	var currentNode *completionNode
-	for _, w := range words {
-		node, ok := current[w]
-		if !ok {
-			return nil // dynamic value typed — no further completions
-		}
-		currentNode = node
-		if node.children == nil {
-			// Leaf node — only offer dynamic values if present.
-			if node.dynamicFn != nil && cfg != nil {
-				return filterPrefix(node.dynamicFn(cfg), partial)
-			}
-			return nil
-		}
-		current = node.children
-	}
-	candidates := keysOf(current)
-	if currentNode != nil && currentNode.dynamicFn != nil && cfg != nil {
-		candidates = append(candidates, currentNode.dynamicFn(cfg)...)
-	}
-	return filterPrefix(candidates, partial)
-}
-
-func keysOf(m map[string]*completionNode) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
 }
 
 // resolveCommand performs Junos-style prefix matching.
@@ -439,19 +452,6 @@ func formatAmbiguousMatches(matches []string) string {
 	return sb.String()
 }
 
-func filterPrefix(items []string, prefix string) []string {
-	if prefix == "" {
-		return items
-	}
-	var result []string
-	for _, item := range items {
-		if strings.HasPrefix(item, prefix) {
-			result = append(result, item)
-		}
-	}
-	return result
-}
-
 // Run starts the interactive CLI loop.
 func (c *CLI) Run() error {
 	var err error
@@ -464,6 +464,34 @@ func (c *CLI) Run() error {
 		Stdin:           os.Stdin,
 		Stdout:          os.Stdout,
 		Stderr:          os.Stderr,
+		Listener: readline.FuncListener(func(line []rune, pos int, key rune) ([]rune, int, bool) {
+			if key != '?' || pos < 1 {
+				return line, pos, false
+			}
+			// Strip the '?' that readline already inserted.
+			cleanLine := make([]rune, 0, len(line)-1)
+			cleanLine = append(cleanLine, line[:pos-1]...)
+			cleanLine = append(cleanLine, line[pos:]...)
+			// Parse words from text before cursor.
+			text := string(cleanLine[:pos-1])
+			words := strings.Fields(text)
+			trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
+			var partial string
+			if !trailingSpace && len(words) > 0 {
+				partial = words[len(words)-1]
+				words = words[:len(words)-1]
+			}
+			var candidates []completionCandidate
+			if c.store.InConfigMode() {
+				candidates = c.completeConfigWithDesc(words, partial)
+			} else {
+				candidates = completeFromTreeWithDesc(operationalTree, words, partial, c.store.ActiveConfig())
+			}
+			if len(candidates) > 0 {
+				writeCompletionHelp(c.rl.Stdout(), candidates)
+			}
+			return cleanLine, pos - 1, true
+		}),
 	})
 	if err != nil {
 		return fmt.Errorf("readline init: %w", err)
@@ -518,12 +546,6 @@ func (c *CLI) Run() error {
 var errExit = fmt.Errorf("exit")
 
 func (c *CLI) dispatch(line string) error {
-	// Context-sensitive help: trailing ? shows available completions.
-	if strings.HasSuffix(line, "?") {
-		c.showContextHelp(strings.TrimSuffix(line, "?"))
-		return nil
-	}
-
 	// Extract pipe filter (| match, | except, | count, | last, | no-more).
 	// Skip | display set and | compare (handled separately).
 	if cmd, pipeType, pipeArg, ok := extractPipe(line); ok {
@@ -849,37 +871,15 @@ func (c *CLI) dispatchConfig(line string) error {
 	}
 }
 
-var showCommands = []string{
-	"chassis", "configuration", "dhcp", "dhcp-relay", "dhcp-server",
-	"firewall", "flow-monitoring", "log", "route", "schedulers", "security",
-	"services", "snmp", "interfaces", "protocols", "system", "version",
-}
-
 func (c *CLI) handleShow(args []string) error {
+	showTree := operationalTree["show"].children
 	if len(args) == 0 {
 		fmt.Println("show: specify what to show")
-		fmt.Println("Possible completions:")
-		fmt.Println("  chassis          Show hardware information")
-		fmt.Println("  configuration    Show active configuration")
-		fmt.Println("  dhcp             Show DHCP information")
-		fmt.Println("  dhcp-relay       Show DHCP relay status")
-		fmt.Println("  dhcp-server      Show DHCP server leases")
-		fmt.Println("  firewall         Show firewall filters")
-		fmt.Println("  flow-monitoring  Show flow monitoring/NetFlow configuration")
-		fmt.Println("  log              Show daemon log entries [N]")
-		fmt.Println("  route            Show routing table")
-		fmt.Println("  schedulers       Show policy schedulers")
-		fmt.Println("  security         Show security information")
-		fmt.Println("  services         Show services information")
-		fmt.Println("  snmp             Show SNMP statistics")
-		fmt.Println("  interfaces       Show interface status")
-		fmt.Println("  protocols        Show protocol information")
-		fmt.Println("  system           Show system information")
-		fmt.Println("  version          Show software version")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(showTree))
 		return nil
 	}
 
-	resolved, err := resolveCommand(args[0], showCommands)
+	resolved, err := resolveCommand(args[0], keysFromTree(showTree))
 	if err != nil {
 		return err
 	}
@@ -997,34 +997,15 @@ func (c *CLI) handleShow(args []string) error {
 	}
 }
 
-var showSecurityCommands = []string{
-	"zones", "policies", "screen", "flow", "nat",
-	"address-book", "applications", "alg", "ipsec",
-	"dynamic-address", "match-policies", "log", "statistics", "vrrp",
-}
-
 func (c *CLI) handleShowSecurity(args []string) error {
+	secTree := operationalTree["show"].children["security"].children
 	if len(args) == 0 {
 		fmt.Println("show security:")
-		fmt.Println("Possible completions:")
-		fmt.Println("  address-book     Show address book entries")
-		fmt.Println("  alg              Show ALG (Application Layer Gateway) status")
-		fmt.Println("  applications     Show application definitions")
-		fmt.Println("  dynamic-address  Show dynamic address feeds")
-		fmt.Println("  flow             Show flow timeouts / active sessions")
-		fmt.Println("  ipsec            Show IPsec VPN status")
-		fmt.Println("  log              Show recent security events")
-		fmt.Println("  match-policies   Match 5-tuple against policies")
-		fmt.Println("  nat              Show NAT information")
-		fmt.Println("  policies         Show security policies")
-		fmt.Println("  screen           Show screen/IDS profiles")
-		fmt.Println("  statistics       Show global statistics")
-		fmt.Println("  vrrp             Show VRRP high availability status")
-		fmt.Println("  zones            Show security zones")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(secTree))
 		return nil
 	}
 
-	resolved, err := resolveCommand(args[0], showSecurityCommands)
+	resolved, err := resolveCommand(args[0], keysFromTree(secTree))
 	if err != nil {
 		return err
 	}
@@ -2398,12 +2379,13 @@ func (c *CLI) showFlowTraceoptions() error {
 }
 
 func (c *CLI) handleClear(args []string) error {
-	if len(args) < 1 {
+	clearTree := operationalTree["clear"].children
+	showHelp := func() {
 		fmt.Println("clear:")
-		fmt.Println("  security flow session          Clear all sessions")
-		fmt.Println("  security counters              Clear all counters")
-		fmt.Println("  firewall all                   Clear firewall filter counters")
-		fmt.Println("  dhcp client-identifier         Clear DHCPv6 DUID(s)")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(clearTree))
+	}
+	if len(args) < 1 {
+		showHelp()
 		return nil
 	}
 
@@ -2415,11 +2397,7 @@ func (c *CLI) handleClear(args []string) error {
 	case "dhcp":
 		return c.handleClearDHCP(args[1:])
 	default:
-		fmt.Println("clear:")
-		fmt.Println("  security flow session          Clear all sessions")
-		fmt.Println("  security counters              Clear all counters")
-		fmt.Println("  firewall all                   Clear firewall filter counters")
-		fmt.Println("  dhcp client-identifier         Clear DHCPv6 DUID(s)")
+		showHelp()
 		return nil
 	}
 }
@@ -2427,10 +2405,7 @@ func (c *CLI) handleClear(args []string) error {
 func (c *CLI) handleClearSecurity(args []string) error {
 	if len(args) < 1 {
 		fmt.Println("clear security:")
-		fmt.Println("  flow session                         Clear all sessions")
-		fmt.Println("  counters                             Clear all counters")
-		fmt.Println("  policies hit-count                   Clear policy hit counters")
-		fmt.Println("  nat source persistent-nat-table      Clear persistent NAT bindings")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["clear"].children["security"].children))
 		return nil
 	}
 
@@ -2638,19 +2613,7 @@ func (c *CLI) handleShowNAT(args []string) error {
 
 	if len(args) == 0 {
 		fmt.Println("show security nat:")
-		fmt.Println("  source                       Show source NAT rules and sessions")
-		fmt.Println("  source summary               Show source NAT pool utilization summary")
-		fmt.Println("  source pool <name|all>       Show source NAT pool details")
-		fmt.Println("  source rule all              Show all source NAT rules with counters")
-		fmt.Println("  source rule-set <name>       Show source NAT rule-set details")
-		fmt.Println("  source persistent-nat-table  Show persistent NAT bindings")
-		fmt.Println("  destination                  Show destination NAT rules")
-		fmt.Println("  destination summary          Show destination NAT pool summary")
-		fmt.Println("  destination pool <name|all>  Show destination NAT pool details")
-		fmt.Println("  destination rule all         Show all destination NAT rules with counters")
-		fmt.Println("  destination rule-set <name>  Show destination NAT rule-set details")
-		fmt.Println("  static                       Show static 1:1 NAT rules")
-		fmt.Println("  nat64                        Show NAT64 rule-sets")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["show"].children["security"].children["nat"].children))
 		return nil
 	}
 
@@ -4806,19 +4769,10 @@ func formatSpeed(mbps int) string {
 }
 
 func (c *CLI) handleShowSystem(args []string) error {
+	sysTree := operationalTree["show"].children["system"].children
 	if len(args) == 0 {
 		fmt.Println("show system:")
-		fmt.Println("  buffers          Show BPF map utilization")
-		fmt.Println("  connections      Show TCP connections")
-		fmt.Println("  license          Show system license")
-		fmt.Println("  memory           Show memory usage")
-		fmt.Println("  ntp              Show NTP server status")
-		fmt.Println("  processes        Show running processes")
-		fmt.Println("  rollback         Show rollback history")
-		fmt.Println("  services         Show configured system services")
-		fmt.Println("  storage          Show filesystem usage")
-		fmt.Println("  uptime           Show system uptime")
-		fmt.Println("  users            Show configured login users")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(sysTree))
 		return nil
 	}
 
@@ -5225,113 +5179,6 @@ func monotonicSeconds() uint64 {
 	var ts unix.Timespec
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 	return uint64(ts.Sec)
-}
-
-func (c *CLI) showContextHelp(prefix string) {
-	prefix = strings.TrimSpace(prefix)
-	words := strings.Fields(prefix)
-
-	if c.store.InConfigMode() {
-		c.showConfigContextHelp(words)
-	} else {
-		c.showOperationalContextHelp(words)
-	}
-}
-
-func (c *CLI) showOperationalContextHelp(words []string) {
-	// Navigate to the appropriate tree level.
-	current := operationalTree
-	var currentNode *completionNode
-	for _, w := range words {
-		node, ok := current[w]
-		if !ok {
-			fmt.Println("  (no help available)")
-			return
-		}
-		if node.children == nil {
-			// Leaf node — show dynamic values if present.
-			if node.dynamicFn != nil {
-				cfg := c.store.ActiveConfig()
-				if cfg != nil {
-					dynItems := node.dynamicFn(cfg)
-					sort.Strings(dynItems)
-					fmt.Println("Possible completions:")
-					for _, name := range dynItems {
-						fmt.Printf("  %-20s (configured)\n", name)
-					}
-					return
-				}
-			}
-			fmt.Println("Possible completions:")
-			fmt.Printf("  %-20s %s\n", w, node.desc)
-			return
-		}
-		currentNode = node
-		current = node.children
-	}
-
-	// Show children with descriptions (Junos-style).
-	items := make([]string, 0, len(current))
-	for name := range current {
-		items = append(items, name)
-	}
-	// Add dynamic values from active config.
-	cfg := c.store.ActiveConfig()
-	if currentNode != nil && currentNode.dynamicFn != nil && cfg != nil {
-		items = append(items, currentNode.dynamicFn(cfg)...)
-	}
-	sort.Strings(items)
-	// Find the maximum name width for aligned formatting.
-	maxWidth := 20
-	for _, name := range items {
-		if len(name)+2 > maxWidth {
-			maxWidth = len(name) + 2
-		}
-	}
-	fmt.Println("Possible completions:")
-	for _, name := range items {
-		if node, ok := current[name]; ok {
-			fmt.Printf("  %-*s %s\n", maxWidth, name, node.desc)
-		} else {
-			fmt.Printf("  %-*s (configured)\n", maxWidth, name)
-		}
-	}
-}
-
-func (c *CLI) showConfigContextHelp(words []string) {
-	if len(words) == 0 {
-		// Show top-level config commands.
-		items := make([]string, 0, len(configTopLevel))
-		for name := range configTopLevel {
-			items = append(items, name)
-		}
-		sort.Strings(items)
-		fmt.Println("Possible completions:")
-		for _, name := range items {
-			fmt.Printf("  %-20s %s\n", name, configTopLevel[name].desc)
-		}
-		return
-	}
-
-	switch words[0] {
-	case "set", "delete":
-		completions := config.CompleteSetPathWithValues(words[1:], c.valueProvider)
-		if completions == nil {
-			fmt.Println("  (value expected)")
-			return
-		}
-		sort.Strings(completions)
-		fmt.Println("Possible completions:")
-		for _, name := range completions {
-			fmt.Printf("  %s\n", name)
-		}
-
-	case "run":
-		c.showOperationalContextHelp(words[1:])
-
-	default:
-		fmt.Println("  (no help available)")
-	}
 }
 
 func (c *CLI) valueProvider(hint config.ValueHint) []string {
@@ -6558,7 +6405,7 @@ func matchSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool
 func (c *CLI) handleMonitor(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("monitor:")
-		fmt.Println("  traffic interface <name> [matching <filter>] [count <N>]")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["monitor"].children))
 		return nil
 	}
 	if args[0] == "traffic" {
@@ -7355,10 +7202,7 @@ func (c *CLI) showForwardingOptions() error {
 func (c *CLI) handleRequest(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("request:")
-		fmt.Println("  dhcp renew       Renew DHCP lease on an interface")
-		fmt.Println("  system reboot    Reboot the system")
-		fmt.Println("  system halt      Halt the system")
-		fmt.Println("  system zeroize   Factory reset (erase all config)")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].children))
 		return nil
 	}
 
@@ -7375,7 +7219,7 @@ func (c *CLI) handleRequest(args []string) error {
 func (c *CLI) handleRequestDHCP(args []string) error {
 	if len(args) == 0 || args[0] != "renew" {
 		fmt.Println("request dhcp:")
-		fmt.Println("  renew <interface>  Renew DHCP lease on an interface")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].children["dhcp"].children))
 		return nil
 	}
 	if len(args) < 2 {
@@ -7394,9 +7238,7 @@ func (c *CLI) handleRequestDHCP(args []string) error {
 func (c *CLI) handleRequestSystem(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("request system:")
-		fmt.Println("  reboot    Reboot the system")
-		fmt.Println("  halt      Halt the system")
-		fmt.Println("  zeroize   Factory reset (erase all configuration)")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].children["system"].children))
 		return nil
 	}
 
