@@ -424,12 +424,36 @@ type RouteEntry struct {
 	Preference  int
 }
 
-// GetRoutes reads the kernel routing table.
+// GetRoutes reads the kernel routing table (main table).
 func (m *Manager) GetRoutes() ([]RouteEntry, error) {
+	return m.getRoutesFromTable(0)
+}
+
+// GetVRFRoutes reads routes from a VRF's routing table.
+// vrfName should be the Linux VRF device name (e.g. "vrf-tunnel-vr").
+func (m *Manager) GetVRFRoutes(vrfName string) ([]RouteEntry, error) {
+	link, err := m.nlHandle.LinkByName(vrfName)
+	if err != nil {
+		return nil, fmt.Errorf("VRF %q not found: %w", vrfName, err)
+	}
+	vrf, ok := link.(*netlink.Vrf)
+	if !ok {
+		return nil, fmt.Errorf("%q is not a VRF device", vrfName)
+	}
+	return m.getRoutesFromTable(int(vrf.Table))
+}
+
+func (m *Manager) getRoutesFromTable(tableID int) ([]RouteEntry, error) {
 	var entries []RouteEntry
 
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		routes, err := m.nlHandle.RouteList(nil, family)
+		var routes []netlink.Route
+		var err error
+		if tableID > 0 {
+			routes, err = m.nlHandle.RouteListFiltered(family, &netlink.Route{Table: tableID}, netlink.RT_FILTER_TABLE)
+		} else {
+			routes, err = m.nlHandle.RouteList(nil, family)
+		}
 		if err != nil {
 			continue
 		}
