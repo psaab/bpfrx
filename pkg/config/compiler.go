@@ -1706,14 +1706,19 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 				if v := parseMSSValue(opt); v > 0 {
 					sec.Flow.TCPMSSIPsecVPN = v
 				}
-			case "gre-in", "gre-out":
+			case "gre-in":
 				if v := parseMSSValue(opt); v > 0 {
-					sec.Flow.TCPMSSGre = v
+					sec.Flow.TCPMSSGreIn = v
+				}
+			case "gre-out":
+				if v := parseMSSValue(opt); v > 0 {
+					sec.Flow.TCPMSSGreOut = v
 				}
 			case "all-tcp":
 				if v := parseMSSValue(opt); v > 0 {
 					sec.Flow.TCPMSSIPsecVPN = v
-					sec.Flow.TCPMSSGre = v
+					sec.Flow.TCPMSSGreIn = v
+					sec.Flow.TCPMSSGreOut = v
 				}
 			}
 		}

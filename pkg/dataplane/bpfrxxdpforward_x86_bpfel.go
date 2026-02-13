@@ -134,7 +134,8 @@ type bpfrxXdpForwardFloodState struct {
 type bpfrxXdpForwardFlowConfig struct {
 	_                 structs.HostLayout
 	TcpMssIpsec       uint16
-	TcpMssGre         uint16
+	TcpMssGreIn       uint16
+	TcpMssGreOut      uint16
 	AllowDnsReply     uint8
 	AllowEmbeddedIcmp uint8
 	GreAccel          uint8

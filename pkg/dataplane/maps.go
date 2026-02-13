@@ -513,7 +513,8 @@ func (m *Manager) SetFlowTimeout(idx, seconds uint32) error {
 // FlowConfigValue mirrors struct flow_config in bpfrx_common.h.
 type FlowConfigValue struct {
 	TCPMSSIPsec       uint16
-	TCPMSSGre         uint16
+	TCPMSSGreIn       uint16
+	TCPMSSGreOut      uint16
 	AllowDNSReply     uint8
 	AllowEmbeddedICMP uint8
 	GREAccel          uint8

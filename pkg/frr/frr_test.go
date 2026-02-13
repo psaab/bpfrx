@@ -658,6 +658,45 @@ func TestFRRMultiVRF(t *testing.T) {
 	}
 }
 
+func TestFRRForwardingInstance(t *testing.T) {
+	m := &Manager{frrConf: filepath.Join(t.TempDir(), "frr.conf")}
+	os.WriteFile(m.frrConf, []byte("log syslog informational\n"), 0644)
+
+	fc := &FullConfig{
+		Instances: []InstanceConfig{
+			{
+				VRFName: "", // forwarding instance — no VRF, default table
+				StaticRoutes: []*config.StaticRoute{
+					{Destination: "10.99.0.0/16", NextHops: []config.NextHopEntry{{Address: "10.0.40.1"}}},
+				},
+			},
+			{
+				VRFName: "vrf-normal-vr",
+				StaticRoutes: []*config.StaticRoute{
+					{Destination: "192.168.0.0/16", NextHops: []config.NextHopEntry{{Address: "10.0.1.1"}}},
+				},
+			},
+		},
+	}
+
+	var b strings.Builder
+	for _, inst := range fc.Instances {
+		for _, sr := range inst.StaticRoutes {
+			b.WriteString(m.generateStaticRoute(sr, inst.VRFName))
+		}
+	}
+	got := b.String()
+
+	// Forwarding instance route should NOT have vrf suffix
+	if !strings.Contains(got, "ip route 10.99.0.0/16 10.0.40.1\n") {
+		t.Errorf("forwarding instance route should be in default table, got:\n%s", got)
+	}
+	// Normal VRF route should have vrf suffix
+	if !strings.Contains(got, "ip route 192.168.0.0/16 10.0.1.1 vrf vrf-normal-vr\n") {
+		t.Errorf("VRF route should have vrf suffix, got:\n%s", got)
+	}
+}
+
 func TestApplyFull_BackupRouterWithPrefix(t *testing.T) {
 	fc := &FullConfig{
 		BackupRouter:    "10.0.1.1",

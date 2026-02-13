@@ -1020,7 +1020,9 @@ func (c *ctl) showNATSourceSummary() error {
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
+	fmt.Printf("Total active translations: %d\n", resp.TotalActiveTranslations)
 	fmt.Printf("Total pools: %d\n", len(resp.Pools))
+	fmt.Println()
 	fmt.Printf("%-20s %-20s %-8s %-8s %-12s %-12s\n",
 		"Pool", "Address", "Ports", "Used", "Available", "Utilization")
 	for _, p := range resp.Pools {
@@ -1034,6 +1036,14 @@ func (c *ctl) showNATSourceSummary() error {
 		}
 		fmt.Printf("%-20s %-20s %-8s %-8d %-12s %-12s\n",
 			p.Name, p.Address, ports, p.UsedPorts, avail, util)
+	}
+	if len(resp.RuleSetSessions) > 0 {
+		fmt.Println()
+		fmt.Printf("%-30s %-12s\n", "Rule-set (from -> to)", "Sessions")
+		for _, rs := range resp.RuleSetSessions {
+			fmt.Printf("%-30s %-12d\n",
+				fmt.Sprintf("%s -> %s", rs.FromZone, rs.ToZone), rs.Sessions)
+		}
 	}
 	return nil
 }
@@ -1126,7 +1136,9 @@ func (c *ctl) showNATDestinationSummary() error {
 		}
 	}
 
+	fmt.Printf("Total active translations: %d\n", resp.TotalActiveTranslations)
 	fmt.Printf("Total pools: %d\n", len(pools))
+	fmt.Println()
 	fmt.Printf("%-20s %-20s %-8s %-12s\n", "Pool", "Address", "Port", "Hits")
 	for addr, p := range pools {
 		portStr := "-"
@@ -1134,6 +1146,14 @@ func (c *ctl) showNATDestinationSummary() error {
 			portStr = fmt.Sprintf("%d", p.port)
 		}
 		fmt.Printf("%-20s %-20s %-8s %-12d\n", addr, addr, portStr, poolHits["pool "+addr])
+	}
+	if len(resp.RuleSetSessions) > 0 {
+		fmt.Println()
+		fmt.Printf("%-30s %-12s\n", "Rule-set (from -> to)", "Sessions")
+		for _, rs := range resp.RuleSetSessions {
+			fmt.Printf("%-30s %-12d\n",
+				fmt.Sprintf("%s -> %s", rs.FromZone, rs.ToZone), rs.Sessions)
+		}
 	}
 	return nil
 }

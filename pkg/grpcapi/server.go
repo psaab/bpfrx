@@ -741,6 +741,50 @@ func (s *Server) GetNATDestination(_ context.Context, _ *pb.GetNATDestinationReq
 			resp.Rules = append(resp.Rules, info)
 		}
 	}
+
+	// Count active DNAT sessions and per-rule-set breakdown
+	if s.dp != nil && s.dp.IsLoaded() {
+		type rsKey struct{ from, to string }
+		rsSessions := make(map[rsKey]int32)
+		var zoneByID map[uint16]string
+		if cr := s.dp.LastCompileResult(); cr != nil {
+			zoneByID = make(map[uint16]string, len(cr.ZoneIDs))
+			for name, id := range cr.ZoneIDs {
+				zoneByID[id] = name
+			}
+		}
+		totalDNAT := int32(0)
+		_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
+				totalDNAT++
+				if zoneByID != nil {
+					rsSessions[rsKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+				}
+			}
+			return true
+		})
+		_ = s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
+				totalDNAT++
+				if zoneByID != nil {
+					rsSessions[rsKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+				}
+			}
+			return true
+		})
+		resp.TotalActiveTranslations = totalDNAT
+		for _, rs := range cfg.Security.NAT.Destination.RuleSets {
+			key := rsKey{rs.FromZone, rs.ToZone}
+			if cnt, ok := rsSessions[key]; ok {
+				resp.RuleSetSessions = append(resp.RuleSetSessions, &pb.NATRuleSetSessions{
+					FromZone: rs.FromZone,
+					ToZone:   rs.ToZone,
+					Sessions: cnt,
+				})
+			}
+		}
+	}
+
 	return resp, nil
 }
 
@@ -2207,26 +2251,62 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 		})
 	}
 
+	// Count active SNAT sessions and per-rule-set breakdown
+	totalSNAT := int32(0)
+	type rsKey struct{ from, to string }
+	rsSessions := make(map[rsKey]int32)
+	if s.dp != nil && s.dp.IsLoaded() {
+		var zoneByID map[uint16]string
+		if cr := s.dp.LastCompileResult(); cr != nil {
+			zoneByID = make(map[uint16]string, len(cr.ZoneIDs))
+			for name, id := range cr.ZoneIDs {
+				zoneByID[id] = name
+			}
+		}
+		_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				totalSNAT++
+				if zoneByID != nil {
+					rsSessions[rsKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+				}
+			}
+			return true
+		})
+		_ = s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				totalSNAT++
+				if zoneByID != nil {
+					rsSessions[rsKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+				}
+			}
+			return true
+		})
+	}
+	resp.TotalActiveTranslations = totalSNAT
+
 	// Interface-mode pools
 	for _, rs := range cfg.Security.NAT.Source {
 		for _, rule := range rs.Rules {
 			if rule.Then.Interface {
-				used := int32(0)
-				if s.dp != nil && s.dp.IsLoaded() {
-					_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
-						if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-							used++
-						}
-						return true
-					})
-				}
 				resp.Pools = append(resp.Pools, &pb.NATPoolStats{
 					Name:        fmt.Sprintf("%s->%s", rs.FromZone, rs.ToZone),
 					Address:     "interface",
-					UsedPorts:   used,
+					UsedPorts:   totalSNAT,
 					IsInterface: true,
 				})
 			}
+		}
+	}
+
+	// Per-rule-set session counts
+	for _, rs := range cfg.Security.NAT.Source {
+		key := rsKey{rs.FromZone, rs.ToZone}
+		if cnt, ok := rsSessions[key]; ok {
+			resp.RuleSetSessions = append(resp.RuleSetSessions, &pb.NATRuleSetSessions{
+				FromZone: rs.FromZone,
+				ToZone:   rs.ToZone,
+				Sessions: cnt,
+			})
 		}
 	}
 
@@ -3011,8 +3091,11 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			if flow.TCPMSSIPsecVPN > 0 {
 				fmt.Fprintf(&buf, "  TCP MSS (IPsec VPN):  %d\n", flow.TCPMSSIPsecVPN)
 			}
-			if flow.TCPMSSGre > 0 {
-				fmt.Fprintf(&buf, "  TCP MSS (GRE):        %d\n", flow.TCPMSSGre)
+			if flow.TCPMSSGreIn > 0 {
+				fmt.Fprintf(&buf, "  TCP MSS (GRE in):     %d\n", flow.TCPMSSGreIn)
+			}
+			if flow.TCPMSSGreOut > 0 {
+				fmt.Fprintf(&buf, "  TCP MSS (GRE out):    %d\n", flow.TCPMSSGreOut)
 			}
 			if flow.AllowDNSReply {
 				buf.WriteString("  Allow DNS reply:      enabled\n")
@@ -3495,6 +3578,14 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 				fmt.Fprintf(&buf, "  Output errors:\n")
 				fmt.Fprintf(&buf, "    Errors: %d, Drops: %d, Carrier: %d, Collisions: %d\n",
 					st.TxErrors, st.TxDropped, st.TxCarrierErrors, st.Collisions)
+			}
+			// BPF traffic counters (XDP/TC level)
+			if s.dp != nil && s.dp.IsLoaded() {
+				if ctrs, err := s.dp.ReadInterfaceCounters(attrs.Index); err == nil && (ctrs.RxPackets > 0 || ctrs.TxPackets > 0) {
+					fmt.Fprintf(&buf, "  BPF statistics:\n")
+					fmt.Fprintf(&buf, "    Input:  %d packets, %d bytes\n", ctrs.RxPackets, ctrs.RxBytes)
+					fmt.Fprintf(&buf, "    Output: %d packets, %d bytes\n", ctrs.TxPackets, ctrs.TxBytes)
+				}
 			}
 			addrs, _ := netlink.AddrList(link, netlink.FAMILY_ALL)
 			for _, a := range addrs {

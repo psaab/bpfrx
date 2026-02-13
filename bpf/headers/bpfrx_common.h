@@ -629,7 +629,8 @@ struct filter_rule {
 
 struct flow_config {
 	__u16 tcp_mss_ipsec;   /* TCP MSS clamp for IPsec VPN (0=disabled) */
-	__u16 tcp_mss_gre;     /* TCP MSS clamp for GRE tunnels (0=disabled) */
+	__u16 tcp_mss_gre_in;  /* TCP MSS clamp for GRE ingress (0=disabled) */
+	__u16 tcp_mss_gre_out; /* TCP MSS clamp for GRE egress (0=disabled) */
 	__u8  allow_dns_reply;
 	__u8  allow_embedded_icmp;
 	__u8  gre_accel;       /* GRE performance acceleration */

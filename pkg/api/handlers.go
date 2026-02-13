@@ -2062,8 +2062,11 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			if flow.TCPMSSIPsecVPN > 0 {
 				fmt.Fprintf(&buf, "  TCP MSS (IPsec VPN):  %d\n", flow.TCPMSSIPsecVPN)
 			}
-			if flow.TCPMSSGre > 0 {
-				fmt.Fprintf(&buf, "  TCP MSS (GRE):        %d\n", flow.TCPMSSGre)
+			if flow.TCPMSSGreIn > 0 {
+				fmt.Fprintf(&buf, "  TCP MSS (GRE in):     %d\n", flow.TCPMSSGreIn)
+			}
+			if flow.TCPMSSGreOut > 0 {
+				fmt.Fprintf(&buf, "  TCP MSS (GRE out):    %d\n", flow.TCPMSSGreOut)
 			}
 			if flow.AllowDNSReply {
 				buf.WriteString("  Allow DNS reply:      enabled\n")

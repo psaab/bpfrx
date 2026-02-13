@@ -540,12 +540,17 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		slog.Warn("config validation", "warning", w)
 	}
 
-	// 0. Create VRF devices for routing instances
+	// 0. Create VRF devices for routing instances (skip forwarding type)
 	if d.routing != nil && len(cfg.RoutingInstances) > 0 {
 		if err := d.routing.ClearVRFs(); err != nil {
 			slog.Warn("failed to clear previous VRFs", "err", err)
 		}
 		for _, ri := range cfg.RoutingInstances {
+			if ri.InstanceType == "forwarding" {
+				slog.Info("forwarding instance, skipping VRF creation",
+					"instance", ri.Name)
+				continue
+			}
 			if err := d.routing.CreateVRF(ri.Name, ri.TableID); err != nil {
 				slog.Warn("failed to create VRF",
 					"instance", ri.Name, "table", ri.TableID, "err", err)
@@ -616,8 +621,12 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			BackupRouterDst:       cfg.System.BackupRouterDst,
 		}
 		for _, ri := range cfg.RoutingInstances {
+			vrfName := "vrf-" + ri.Name
+			if ri.InstanceType == "forwarding" {
+				vrfName = "" // forwarding instances use the default table
+			}
 			fc.Instances = append(fc.Instances, frr.InstanceConfig{
-				VRFName:      "vrf-" + ri.Name,
+				VRFName:      vrfName,
 				OSPF:         ri.OSPF,
 				BGP:          ri.BGP,
 				RIP:          ri.RIP,

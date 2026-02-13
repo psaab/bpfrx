@@ -547,8 +547,8 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 		struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &zero);
 		if (fc) {
 			__u16 mss = fc->tcp_mss_ipsec;
-			if (fc->tcp_mss_gre > 0 && (fc->tcp_mss_gre < mss || mss == 0))
-				mss = fc->tcp_mss_gre;
+			if (fc->tcp_mss_gre_in > 0 && (fc->tcp_mss_gre_in < mss || mss == 0))
+				mss = fc->tcp_mss_gre_in;
 			if (mss > 0)
 				tcp_mss_clamp(ctx, meta->l4_offset, mss,
 					      meta->csum_partial);

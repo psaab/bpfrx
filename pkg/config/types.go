@@ -467,7 +467,8 @@ type FlowConfig struct {
 	UDPSessionTimeout          int // seconds, 0 = default (60s)
 	ICMPSessionTimeout         int // seconds, 0 = default (30s)
 	TCPMSSIPsecVPN             int // TCP MSS clamp for IPsec VPN traffic (0 = disabled)
-	TCPMSSGre                  int // TCP MSS clamp for GRE tunnel traffic (0 = disabled)
+	TCPMSSGreIn                int // TCP MSS clamp for GRE ingress traffic (0 = disabled)
+	TCPMSSGreOut               int // TCP MSS clamp for GRE egress traffic (0 = disabled)
 	AllowDNSReply              bool
 	AllowEmbeddedICMP          bool
 	GREPerformanceAcceleration bool

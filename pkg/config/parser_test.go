@@ -1458,6 +1458,107 @@ func TestRoutingInstances(t *testing.T) {
 	}
 }
 
+func TestForwardingInstanceType(t *testing.T) {
+	// Test hierarchical syntax
+	input := `routing-instances {
+    vpn-fwd {
+        instance-type forwarding;
+        routing-options {
+            static {
+                route 10.99.0.0/16 next-hop 10.0.40.1;
+            }
+        }
+    }
+    normal-vr {
+        instance-type virtual-router;
+        interface trust0;
+        routing-options {
+            static {
+                route 192.168.0.0/16 next-hop 10.0.1.1;
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	if len(cfg.RoutingInstances) != 2 {
+		t.Fatalf("expected 2 routing instances, got %d", len(cfg.RoutingInstances))
+	}
+
+	var fwd, vr *RoutingInstanceConfig
+	for _, ri := range cfg.RoutingInstances {
+		switch ri.Name {
+		case "vpn-fwd":
+			fwd = ri
+		case "normal-vr":
+			vr = ri
+		}
+	}
+
+	if fwd == nil {
+		t.Fatal("missing vpn-fwd instance")
+	}
+	if fwd.InstanceType != "forwarding" {
+		t.Errorf("vpn-fwd instance-type: got %q, want forwarding", fwd.InstanceType)
+	}
+	if len(fwd.StaticRoutes) != 1 {
+		t.Fatalf("vpn-fwd static routes: expected 1, got %d", len(fwd.StaticRoutes))
+	}
+	if len(fwd.Interfaces) != 0 {
+		t.Errorf("vpn-fwd interfaces: expected 0, got %d", len(fwd.Interfaces))
+	}
+
+	if vr == nil {
+		t.Fatal("missing normal-vr instance")
+	}
+	if vr.InstanceType != "virtual-router" {
+		t.Errorf("normal-vr instance-type: got %q, want virtual-router", vr.InstanceType)
+	}
+	if len(vr.Interfaces) != 1 {
+		t.Errorf("normal-vr interfaces: expected 1, got %d", len(vr.Interfaces))
+	}
+
+	// Test set-command syntax
+	tree2 := &ConfigTree{}
+	for _, cmd := range []string{
+		"set routing-instances vpn-fwd instance-type forwarding",
+		"set routing-instances vpn-fwd routing-options static route 10.99.0.0/16 next-hop 10.0.40.1",
+		"set routing-instances normal-vr instance-type virtual-router",
+		"set routing-instances normal-vr interface trust0",
+	} {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree2.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg2, err := CompileConfig(tree2)
+	if err != nil {
+		t.Fatalf("set-command compile error: %v", err)
+	}
+	var fwd2 *RoutingInstanceConfig
+	for _, ri := range cfg2.RoutingInstances {
+		if ri.Name == "vpn-fwd" {
+			fwd2 = ri
+		}
+	}
+	if fwd2 == nil {
+		t.Fatal("set syntax: missing vpn-fwd instance")
+	}
+	if fwd2.InstanceType != "forwarding" {
+		t.Errorf("set syntax: vpn-fwd instance-type: got %q, want forwarding", fwd2.InstanceType)
+	}
+}
+
 func TestRouterAdvertisement(t *testing.T) {
 	tree := &ConfigTree{}
 	setCommands := []string{
@@ -2392,6 +2493,7 @@ func TestALGAndFlowOptions(t *testing.T) {
         tcp-mss {
             ipsec-vpn 1350;
             gre-in 1400;
+            gre-out 1380;
         }
         allow-dns-reply;
         allow-embedded-icmp;
@@ -2416,8 +2518,11 @@ func TestALGAndFlowOptions(t *testing.T) {
 	if cfg.Security.Flow.TCPMSSIPsecVPN != 1350 {
 		t.Errorf("tcp-mss ipsec-vpn: got %d, want 1350", cfg.Security.Flow.TCPMSSIPsecVPN)
 	}
-	if cfg.Security.Flow.TCPMSSGre != 1400 {
-		t.Errorf("tcp-mss gre: got %d, want 1400", cfg.Security.Flow.TCPMSSGre)
+	if cfg.Security.Flow.TCPMSSGreIn != 1400 {
+		t.Errorf("tcp-mss gre-in: got %d, want 1400", cfg.Security.Flow.TCPMSSGreIn)
+	}
+	if cfg.Security.Flow.TCPMSSGreOut != 1380 {
+		t.Errorf("tcp-mss gre-out: got %d, want 1380", cfg.Security.Flow.TCPMSSGreOut)
 	}
 	if !cfg.Security.Flow.AllowDNSReply {
 		t.Error("expected allow-dns-reply to be true")
@@ -2437,6 +2542,7 @@ func TestALGAndFlowOptions(t *testing.T) {
 	setCommands := []string{
 		"set security flow tcp-mss ipsec-vpn 1350",
 		"set security flow tcp-mss gre-in 1400",
+		"set security flow tcp-mss gre-out 1380",
 		"set security flow allow-dns-reply",
 		"set security flow allow-embedded-icmp",
 		"set security alg dns disable",
@@ -2460,8 +2566,11 @@ func TestALGAndFlowOptions(t *testing.T) {
 	if cfg2.Security.Flow.TCPMSSIPsecVPN != 1350 {
 		t.Errorf("set syntax: tcp-mss ipsec-vpn: got %d, want 1350", cfg2.Security.Flow.TCPMSSIPsecVPN)
 	}
-	if cfg2.Security.Flow.TCPMSSGre != 1400 {
-		t.Errorf("set syntax: tcp-mss gre: got %d, want 1400", cfg2.Security.Flow.TCPMSSGre)
+	if cfg2.Security.Flow.TCPMSSGreIn != 1400 {
+		t.Errorf("set syntax: tcp-mss gre-in: got %d, want 1400", cfg2.Security.Flow.TCPMSSGreIn)
+	}
+	if cfg2.Security.Flow.TCPMSSGreOut != 1380 {
+		t.Errorf("set syntax: tcp-mss gre-out: got %d, want 1380", cfg2.Security.Flow.TCPMSSGreOut)
 	}
 	if !cfg2.Security.Flow.AllowDNSReply {
 		t.Error("set syntax: expected allow-dns-reply")
@@ -5041,8 +5150,11 @@ security {
 	if cfg.Security.Flow.TCPMSSIPsecVPN != 1360 {
 		t.Errorf("TCPMSSIPsecVPN = %d, want 1360", cfg.Security.Flow.TCPMSSIPsecVPN)
 	}
-	if cfg.Security.Flow.TCPMSSGre != 1360 {
-		t.Errorf("TCPMSSGre = %d, want 1360", cfg.Security.Flow.TCPMSSGre)
+	if cfg.Security.Flow.TCPMSSGreIn != 1360 {
+		t.Errorf("TCPMSSGreIn = %d, want 1360", cfg.Security.Flow.TCPMSSGreIn)
+	}
+	if cfg.Security.Flow.TCPMSSGreOut != 1360 {
+		t.Errorf("TCPMSSGreOut = %d, want 1360", cfg.Security.Flow.TCPMSSGreOut)
 	}
 }
 

@@ -370,9 +370,13 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 	writtenIfaceZone := make(map[IfaceZoneKey]bool)
 	writtenVlanIface := make(map[uint32]bool)
 
-	// Build interface -> routing table ID map from routing instances
+	// Build interface -> routing table ID map from routing instances.
+	// Forwarding instances use the default table (0), so skip them.
 	ifaceTableID := make(map[string]uint32)
 	for _, ri := range cfg.RoutingInstances {
+		if ri.InstanceType == "forwarding" {
+			continue
+		}
 		for _, ifaceName := range ri.Interfaces {
 			ifaceTableID[ifaceName] = uint32(ri.TableID)
 		}
@@ -702,7 +706,9 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 	// Skip interfaces created by the daemon itself (VRFs, tunnels).
 	daemonOwned := make(map[string]bool)
 	for _, ri := range cfg.RoutingInstances {
-		daemonOwned["vrf-"+ri.Name] = true
+		if ri.InstanceType != "forwarding" {
+			daemonOwned["vrf-"+ri.Name] = true
+		}
 	}
 	for _, ifc := range cfg.Interfaces.Interfaces {
 		if ifc.Tunnel != nil {
@@ -2005,7 +2011,8 @@ func (m *Manager) compileFlowConfig(cfg *config.Config) error {
 	flow := &cfg.Security.Flow
 	fc := FlowConfigValue{
 		TCPMSSIPsec: uint16(flow.TCPMSSIPsecVPN),
-		TCPMSSGre:   uint16(flow.TCPMSSGre),
+		TCPMSSGreIn:  uint16(flow.TCPMSSGreIn),
+		TCPMSSGreOut: uint16(flow.TCPMSSGreOut),
 	}
 	if flow.AllowDNSReply {
 		fc.AllowDNSReply = 1
@@ -2038,7 +2045,8 @@ func (m *Manager) compileFlowConfig(cfg *config.Config) error {
 
 	slog.Info("flow config compiled",
 		"tcp_mss_ipsec", fc.TCPMSSIPsec,
-		"tcp_mss_gre", fc.TCPMSSGre,
+		"tcp_mss_gre_in", fc.TCPMSSGreIn,
+		"tcp_mss_gre_out", fc.TCPMSSGreOut,
 		"allow_dns_reply", fc.AllowDNSReply,
 		"allow_embedded_icmp", fc.AllowEmbeddedICMP)
 
@@ -2146,10 +2154,12 @@ func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResu
 	// Track written keys for populate-before-clear.
 	writtenIfaceFilter := make(map[IfaceFilterKey]bool)
 
-	// Build routing instance name -> table ID map
+	// Build routing instance name -> table ID map (skip forwarding instances)
 	riTableIDs := make(map[string]uint32)
 	for _, ri := range cfg.RoutingInstances {
-		riTableIDs[ri.Name] = uint32(ri.TableID)
+		if ri.InstanceType != "forwarding" {
+			riTableIDs[ri.Name] = uint32(ri.TableID)
+		}
 	}
 
 	filterID := uint32(0)

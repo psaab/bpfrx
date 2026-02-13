@@ -283,6 +283,8 @@ message NATSourceInfo {
 message GetNATDestinationRequest {}
 message GetNATDestinationResponse {
   repeated NATDestInfo rules = 1;
+  int32 total_active_translations = 2;
+  repeated NATRuleSetSessions rule_set_sessions = 3;
 }
 message NATDestInfo {
   string name = 1;
@@ -447,6 +449,8 @@ message ClearCountersResponse {}
 message GetNATPoolStatsRequest {}
 message GetNATPoolStatsResponse {
   repeated NATPoolStats pools = 1;
+  int32 total_active_translations = 2;
+  repeated NATRuleSetSessions rule_set_sessions = 3;
 }
 message NATPoolStats {
   string name = 1;
@@ -456,6 +460,11 @@ message NATPoolStats {
   int32 available_ports = 5;
   string utilization = 6;
   bool is_interface = 7;
+}
+message NATRuleSetSessions {
+  string from_zone = 1;
+  string to_zone = 2;
+  int32 sessions = 3;
 }
 
 // --- VRRP status ---
