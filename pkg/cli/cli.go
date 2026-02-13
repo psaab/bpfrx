@@ -1690,6 +1690,15 @@ func (c *CLI) showFlowSession(args []string) error {
 	f := c.parseSessionFilter(args)
 	count := 0
 
+	// Summary counters for protocol/zone/NAT breakdown
+	var byProto map[uint8]int
+	var byZonePair map[string]int
+	var v4Count, v6Count, natCount int
+	if f.summary {
+		byProto = make(map[uint8]int)
+		byZonePair = make(map[string]int)
+	}
+
 	// Build reverse zone ID → name map
 	zoneNames := make(map[uint16]string)
 	if cr := c.dp.LastCompileResult(); cr != nil {
@@ -1709,6 +1718,20 @@ func (c *CLI) showFlowSession(args []string) error {
 		count++
 
 		if f.summary {
+			v4Count++
+			byProto[key.Protocol]++
+			inZ := zoneNames[val.IngressZone]
+			outZ := zoneNames[val.EgressZone]
+			if inZ == "" {
+				inZ = fmt.Sprintf("zone-%d", val.IngressZone)
+			}
+			if outZ == "" {
+				outZ = fmt.Sprintf("zone-%d", val.EgressZone)
+			}
+			byZonePair[inZ+"->"+outZ]++
+			if val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) != 0 {
+				natCount++
+			}
 			return true
 		}
 
@@ -1765,6 +1788,20 @@ func (c *CLI) showFlowSession(args []string) error {
 		count++
 
 		if f.summary {
+			v6Count++
+			byProto[key.Protocol]++
+			inZ := zoneNames[val.IngressZone]
+			outZ := zoneNames[val.EgressZone]
+			if inZ == "" {
+				inZ = fmt.Sprintf("zone-%d", val.IngressZone)
+			}
+			if outZ == "" {
+				outZ = fmt.Sprintf("zone-%d", val.EgressZone)
+			}
+			byZonePair[inZ+"->"+outZ]++
+			if val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) != 0 {
+				natCount++
+			}
 			return true
 		}
 
@@ -1810,6 +1847,33 @@ func (c *CLI) showFlowSession(args []string) error {
 		return fmt.Errorf("iterate sessions_v6: %w", err)
 	}
 
+	if f.summary && count > 0 {
+		fmt.Printf("Session summary:\n")
+		fmt.Printf("  IPv4 sessions: %d\n", v4Count)
+		fmt.Printf("  IPv6 sessions: %d\n", v6Count)
+		fmt.Printf("  NAT sessions:  %d\n\n", natCount)
+
+		fmt.Printf("  By protocol:\n")
+		protoKeys := make([]uint8, 0, len(byProto))
+		for k := range byProto {
+			protoKeys = append(protoKeys, k)
+		}
+		sort.Slice(protoKeys, func(i, j int) bool { return protoKeys[i] < protoKeys[j] })
+		for _, p := range protoKeys {
+			fmt.Printf("    %-8s %d\n", protoNameFromNum(p), byProto[p])
+		}
+
+		fmt.Printf("\n  By zone pair:\n")
+		zpKeys := make([]string, 0, len(byZonePair))
+		for k := range byZonePair {
+			zpKeys = append(zpKeys, k)
+		}
+		sort.Strings(zpKeys)
+		for _, zp := range zpKeys {
+			fmt.Printf("    %-30s %d\n", zp, byZonePair[zp])
+		}
+		fmt.Println()
+	}
 	fmt.Printf("Total sessions: %d\n", count)
 	return nil
 }
