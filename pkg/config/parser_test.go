@@ -1727,6 +1727,55 @@ func TestFirewallFilterSourcePort(t *testing.T) {
 	}
 }
 
+func TestFirewallFilterPortRange(t *testing.T) {
+	input := `firewall {
+    family inet {
+        filter port-range-test {
+            term block-range {
+                from {
+                    protocol tcp;
+                    destination-port 8000-9000;
+                    source-port 1024-65535;
+                }
+                then discard;
+            }
+            term default {
+                then accept;
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	f, ok := cfg.Firewall.FiltersInet["port-range-test"]
+	if !ok {
+		t.Fatal("expected port-range-test filter")
+	}
+	if len(f.Terms) != 2 {
+		t.Fatalf("expected 2 terms, got %d", len(f.Terms))
+	}
+	term := f.Terms[0]
+	if len(term.DestinationPorts) != 1 || term.DestinationPorts[0] != "8000-9000" {
+		t.Errorf("destination-port = %v, want [8000-9000]", term.DestinationPorts)
+	}
+	if len(term.SourcePorts) != 1 || term.SourcePorts[0] != "1024-65535" {
+		t.Errorf("source-port = %v, want [1024-65535]", term.SourcePorts)
+	}
+	if term.Protocol != "tcp" {
+		t.Errorf("protocol = %q, want tcp", term.Protocol)
+	}
+	if term.Action != "discard" {
+		t.Errorf("action = %q, want discard", term.Action)
+	}
+}
+
 func TestFirewallFilterDSCPRewrite(t *testing.T) {
 	// Hierarchical format
 	input := `firewall {
