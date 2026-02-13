@@ -1153,6 +1153,27 @@ func (c *CLI) handleShowSecurity(args []string) error {
 				}
 				policySetID++
 			}
+			// Global policies in brief view
+			if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
+				for i, pol := range cfg.Security.GlobalPolicies {
+					action := "permit"
+					switch pol.Action {
+					case 1:
+						action = "deny"
+					case 2:
+						action = "reject"
+					}
+					ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+					hits := "-"
+					if c.dp != nil && c.dp.IsLoaded() {
+						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+							hits = fmt.Sprintf("%d", counters.Packets)
+						}
+					}
+					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
+						"*", "*", pol.Name, action, hits)
+				}
+			}
 			return nil
 		}
 
@@ -1342,6 +1363,28 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 				zpp.FromZone, zpp.ToZone, pol.Name, action, pkts, bytes)
 		}
 		policySetID++
+	}
+	// Global policies
+	if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
+		for i, pol := range cfg.Security.GlobalPolicies {
+			action := "permit"
+			switch pol.Action {
+			case 1:
+				action = "deny"
+			case 2:
+				action = "reject"
+			}
+			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+			var pkts, bytes uint64
+			if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+				pkts = counters.Packets
+				bytes = counters.Bytes
+			}
+			totalPkts += pkts
+			totalBytes += bytes
+			fmt.Printf("%-12s %-12s %-24s %-8s %12d %16d\n",
+				"*", "*", pol.Name, action, pkts, bytes)
+		}
 	}
 	fmt.Println(strings.Repeat("-", 88))
 	fmt.Printf("%-48s %8s %12d %16d\n", "Total", "", totalPkts, totalBytes)
