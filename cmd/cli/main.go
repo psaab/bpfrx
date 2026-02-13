@@ -385,6 +385,14 @@ func (c *ctl) handleShow(args []string) error {
 
 	switch args[0] {
 	case "chassis":
+		if len(args) >= 2 {
+			switch args[1] {
+			case "cluster":
+				return c.showText("chassis-cluster")
+			case "environment":
+				return c.showText("chassis-environment")
+			}
+		}
 		return c.showText("chassis")
 
 	case "configuration":
@@ -510,6 +518,7 @@ func (c *ctl) handleShowSecurity(args []string) error {
 		fmt.Println("  zones            Show security zones")
 		fmt.Println("  policies         Show security policies")
 		fmt.Println("  policies brief   Show brief policy summary")
+		fmt.Println("  policies hit-count  Show policy hit counters")
 		fmt.Println("  screen           Show screen/IDS profiles")
 		fmt.Println("  flow             Show flow timeouts")
 		fmt.Println("  flow session     Show active sessions")
@@ -532,6 +541,9 @@ func (c *ctl) handleShowSecurity(args []string) error {
 	case "policies":
 		if len(args) >= 2 && args[1] == "brief" {
 			return c.showPoliciesBrief()
+		}
+		if len(args) >= 2 && args[1] == "hit-count" {
+			return c.showText("policies-hit-count")
 		}
 		return c.showPolicies()
 	case "screen":
@@ -1201,6 +1213,7 @@ func (c *ctl) handleShowSystem(args []string) error {
 		fmt.Println("show system:")
 		fmt.Println("  alarms           Show system alarms")
 		fmt.Println("  rollback         Show rollback history")
+		fmt.Println("  services         Show configured system services")
 		fmt.Println("  storage          Show filesystem usage")
 		fmt.Println("  uptime           Show system uptime")
 		fmt.Println("  memory           Show memory usage")
@@ -1303,6 +1316,9 @@ func (c *ctl) handleShowSystem(args []string) error {
 	case "license":
 		fmt.Println("License: open-source (no license required)")
 		return nil
+
+	case "services":
+		return c.showText("system-services")
 
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])
