@@ -1579,12 +1579,18 @@ func (c *ctl) showPoliciesBrief() error {
 func (c *ctl) handleRequest(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("request:")
+		fmt.Println("  dhcp renew       Renew DHCP lease on an interface")
 		fmt.Println("  system reboot    Reboot the system")
 		fmt.Println("  system halt      Halt the system")
 		fmt.Println("  system zeroize   Factory reset (erase all config)")
 		return nil
 	}
-	if args[0] != "system" {
+	switch args[0] {
+	case "dhcp":
+		return c.handleRequestDHCP(args[1:])
+	case "system":
+		// fall through to existing logic below
+	default:
 		return fmt.Errorf("unknown request target: %s", args[0])
 	}
 	if len(args) < 2 {
@@ -1634,6 +1640,26 @@ func (c *ctl) handleRequest(args []string) error {
 	default:
 		return fmt.Errorf("unknown request system command: %s", args[1])
 	}
+}
+
+func (c *ctl) handleRequestDHCP(args []string) error {
+	if len(args) == 0 || args[0] != "renew" {
+		fmt.Println("request dhcp:")
+		fmt.Println("  renew <interface>  Renew DHCP lease on an interface")
+		return nil
+	}
+	if len(args) < 2 {
+		return fmt.Errorf("usage: request dhcp renew <interface>")
+	}
+	resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+		Action: "dhcp-renew",
+		Target: args[1],
+	})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Println(resp.Message)
+	return nil
 }
 
 // --- Tab completion ---

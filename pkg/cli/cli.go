@@ -6135,6 +6135,7 @@ func (c *CLI) showForwardingOptions() error {
 func (c *CLI) handleRequest(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("request:")
+		fmt.Println("  dhcp renew       Renew DHCP lease on an interface")
 		fmt.Println("  system reboot    Reboot the system")
 		fmt.Println("  system halt      Halt the system")
 		fmt.Println("  system zeroize   Factory reset (erase all config)")
@@ -6142,11 +6143,32 @@ func (c *CLI) handleRequest(args []string) error {
 	}
 
 	switch args[0] {
+	case "dhcp":
+		return c.handleRequestDHCP(args[1:])
 	case "system":
 		return c.handleRequestSystem(args[1:])
 	default:
 		return fmt.Errorf("unknown request target: %s", args[0])
 	}
+}
+
+func (c *CLI) handleRequestDHCP(args []string) error {
+	if len(args) == 0 || args[0] != "renew" {
+		fmt.Println("request dhcp:")
+		fmt.Println("  renew <interface>  Renew DHCP lease on an interface")
+		return nil
+	}
+	if len(args) < 2 {
+		return fmt.Errorf("usage: request dhcp renew <interface>")
+	}
+	if c.dhcp == nil {
+		return fmt.Errorf("DHCP manager not available")
+	}
+	if err := c.dhcp.Renew(args[1]); err != nil {
+		return err
+	}
+	fmt.Printf("DHCP renewal initiated on %s\n", args[1])
+	return nil
 }
 
 func (c *CLI) handleRequestSystem(args []string) error {

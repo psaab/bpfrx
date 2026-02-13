@@ -5910,7 +5910,8 @@ func (x *GetSystemInfoResponse) GetOutput() string {
 
 type SystemActionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Action        string                 `protobuf:"bytes,1,opt,name=action,proto3" json:"action,omitempty"` // "reboot", "halt"
+	Action        string                 `protobuf:"bytes,1,opt,name=action,proto3" json:"action,omitempty"` // "reboot", "halt", "zeroize", "dhcp-renew"
+	Target        string                 `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"` // optional target (e.g. interface name for dhcp-renew)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5948,6 +5949,13 @@ func (*SystemActionRequest) Descriptor() ([]byte, []int) {
 func (x *SystemActionRequest) GetAction() string {
 	if x != nil {
 		return x.Action
+	}
+	return ""
+}
+
+func (x *SystemActionRequest) GetTarget() string {
+	if x != nil {
+		return x.Target
 	}
 	return ""
 }
@@ -6374,9 +6382,10 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x14GetSystemInfoRequest\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\"/\n" +
 	"\x15GetSystemInfoResponse\x12\x16\n" +
-	"\x06output\x18\x01 \x01(\tR\x06output\"-\n" +
+	"\x06output\x18\x01 \x01(\tR\x06output\"E\n" +
 	"\x13SystemActionRequest\x12\x16\n" +
-	"\x06action\x18\x01 \x01(\tR\x06action\"0\n" +
+	"\x06action\x18\x01 \x01(\tR\x06action\x12\x16\n" +
+	"\x06target\x18\x02 \x01(\tR\x06target\"0\n" +
 	"\x14SystemActionResponse\x12\x18\n" +
 	"\amessage\x18\x01 \x01(\tR\amessage*3\n" +
 	"\fConfigFormat\x12\x10\n" +

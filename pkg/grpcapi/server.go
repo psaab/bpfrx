@@ -3837,6 +3837,20 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 		}
 		return &pb.SystemActionResponse{Message: "System zeroized. Configuration erased. Reboot to complete factory reset."}, nil
 
+	case "dhcp-renew":
+		if s.dhcp == nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "DHCP manager not available")
+		}
+		if req.Target == "" {
+			return nil, status.Errorf(codes.InvalidArgument, "dhcp-renew requires target interface")
+		}
+		if err := s.dhcp.Renew(req.Target); err != nil {
+			return nil, status.Errorf(codes.NotFound, "%v", err)
+		}
+		return &pb.SystemActionResponse{
+			Message: fmt.Sprintf("DHCP renewal initiated on %s", req.Target),
+		}, nil
+
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown action: %s", req.Action)
 	}

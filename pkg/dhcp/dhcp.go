@@ -144,6 +144,40 @@ func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily)
 	}()
 }
 
+// Renew restarts the DHCP client for the specified interface and address
+// family, causing it to go through a fresh DISCOVER/REQUEST cycle.
+// Returns an error if no DHCP client is running for the interface.
+func (m *Manager) Renew(ifaceName string) error {
+	// Try both v4 and v6
+	renewed := false
+	for _, af := range []AddressFamily{AFInet, AFInet6} {
+		key := clientKey{iface: ifaceName, family: af}
+		m.mu.Lock()
+		dc, exists := m.clients[key]
+		if exists {
+			delete(m.clients, key)
+		}
+		m.mu.Unlock()
+
+		if !exists {
+			continue
+		}
+
+		// Stop existing client
+		dc.cancel()
+		<-dc.done
+		renewed = true
+
+		// Restart
+		m.Start(context.Background(), ifaceName, af)
+		slog.Info("DHCP client renewed", "interface", ifaceName, "family", af)
+	}
+	if !renewed {
+		return fmt.Errorf("no DHCP client running on interface %s", ifaceName)
+	}
+	return nil
+}
+
 // StopAll stops all running DHCP clients and releases leases.
 func (m *Manager) StopAll() {
 	m.mu.Lock()
