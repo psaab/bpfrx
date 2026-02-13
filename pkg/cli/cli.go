@@ -108,7 +108,9 @@ var operationalTree = map[string]*completionNode{
 				}
 				return names
 			}},
-			"policies":        {desc: "Show security policies"},
+			"policies": {desc: "Show security policies", children: map[string]*completionNode{
+				"brief": {desc: "Show brief policy summary"},
+			}},
 			"screen":          {desc: "Show screen/IDS profiles"},
 			"alg":             {desc: "Show ALG status"},
 			"dynamic-address": {desc: "Show dynamic address feeds"},
@@ -127,6 +129,8 @@ var operationalTree = map[string]*completionNode{
 			"ipsec": {desc: "Show IPsec status", children: map[string]*completionNode{
 				"security-associations": {desc: "Show IPsec SAs"},
 			}},
+			"vrrp":           {desc: "Show VRRP high availability status"},
+			"match-policies": {desc: "Match 5-tuple against policies"},
 		}},
 		"services": {desc: "Show services information", children: map[string]*completionNode{
 			"rpm": {desc: "Show RPM probe results", children: map[string]*completionNode{
@@ -165,7 +169,11 @@ var operationalTree = map[string]*completionNode{
 		"dhcp-relay":  {desc: "Show DHCP relay status"},
 		"snmp":        {desc: "Show SNMP statistics"},
 		"system": {desc: "Show system information", children: map[string]*completionNode{
-			"rollback": {desc: "Show rollback history"},
+			"rollback":  {desc: "Show rollback history"},
+			"uptime":    {desc: "Show system uptime"},
+			"memory":    {desc: "Show memory usage"},
+			"processes": {desc: "Show running processes"},
+			"license":   {desc: "Show system license"},
 		}},
 	}},
 	"clear": {desc: "Clear information", children: map[string]*completionNode{
@@ -174,9 +182,20 @@ var operationalTree = map[string]*completionNode{
 				"session": {desc: "Clear all sessions"},
 			}},
 			"counters": {desc: "Clear all counters"},
+			"nat": {desc: "Clear NAT information", children: map[string]*completionNode{
+				"source": {desc: "Clear source NAT", children: map[string]*completionNode{
+					"persistent-nat-table": {desc: "Clear persistent NAT bindings"},
+				}},
+			}},
 		}},
 		"dhcp": {desc: "Clear DHCP information", children: map[string]*completionNode{
 			"client-identifier": {desc: "Clear DHCPv6 DUID(s)"},
+		}},
+	}},
+	"request": {desc: "Perform system operations", children: map[string]*completionNode{
+		"system": {desc: "System operations", children: map[string]*completionNode{
+			"reboot": {desc: "Reboot the system"},
+			"halt":   {desc: "Halt the system"},
 		}},
 	}},
 	"ping":       {desc: "Ping remote host"},
@@ -630,6 +649,9 @@ func (c *CLI) dispatchOperational(line string) error {
 	case "monitor":
 		return c.handleMonitor(parts[1:])
 
+	case "request":
+		return c.handleRequest(parts[1:])
+
 	case "quit", "exit":
 		return errExit
 
@@ -803,6 +825,8 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		fmt.Println("  match-policies   Match 5-tuple against policies")
 		fmt.Println("  log [N] [zone <name>] [protocol <proto>] [action <act>]")
 		fmt.Println("  statistics       Show global statistics")
+		fmt.Println("  vrrp             Show VRRP high availability status")
+		fmt.Println("  match-policies   Match 5-tuple against policies")
 		return nil
 	}
 
@@ -861,6 +885,36 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		return nil
 
 	case "policies":
+		brief := len(args) >= 2 && args[1] == "brief"
+		if brief {
+			// Brief tabular summary
+			fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
+				"From", "To", "Name", "Action", "Hits")
+			policySetID := uint32(0)
+			for _, zpp := range cfg.Security.Policies {
+				for i, pol := range zpp.Policies {
+					action := "permit"
+					switch pol.Action {
+					case 1:
+						action = "deny"
+					case 2:
+						action = "reject"
+					}
+					ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+					hits := "-"
+					if c.dp != nil && c.dp.IsLoaded() {
+						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+							hits = fmt.Sprintf("%d", counters.Packets)
+						}
+					}
+					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
+						zpp.FromZone, zpp.ToZone, pol.Name, action, hits)
+				}
+				policySetID++
+			}
+			return nil
+		}
+
 		policySetID := uint32(0)
 		for _, zpp := range cfg.Security.Policies {
 			fmt.Printf("From zone: %s, To zone: %s\n", zpp.FromZone, zpp.ToZone)
@@ -2998,6 +3052,10 @@ func (c *CLI) handleShowSystem(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("show system:")
 		fmt.Println("  rollback         Show rollback history")
+		fmt.Println("  uptime           Show system uptime")
+		fmt.Println("  memory           Show memory usage")
+		fmt.Println("  processes        Show running processes")
+		fmt.Println("  license          Show system license")
 		return nil
 	}
 
@@ -3036,6 +3094,20 @@ func (c *CLI) handleShowSystem(args []string) error {
 			fmt.Printf("  rollback %d: %s\n", i+1, entry.Timestamp.Format("2006-01-02 15:04:05"))
 		}
 		return nil
+
+	case "uptime":
+		return c.showSystemUptime()
+
+	case "memory":
+		return c.showSystemMemory()
+
+	case "processes":
+		return c.showSystemProcesses()
+
+	case "license":
+		fmt.Println("License: open-source (no license required)")
+		return nil
+
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])
 	}
@@ -4221,4 +4293,135 @@ func (c *CLI) handleMonitorTraffic(args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// showSystemUptime shows system uptime (like Junos "show system uptime").
+func (c *CLI) showSystemUptime() error {
+	// Read /proc/uptime
+	data, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return fmt.Errorf("reading uptime: %w", err)
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 1 {
+		return fmt.Errorf("unexpected /proc/uptime format")
+	}
+	var upSec float64
+	fmt.Sscanf(fields[0], "%f", &upSec)
+
+	days := int(upSec) / 86400
+	hours := (int(upSec) % 86400) / 3600
+	mins := (int(upSec) % 3600) / 60
+	secs := int(upSec) % 60
+
+	fmt.Printf("Current time: %s\n", time.Now().Format("2006-01-02 15:04:05 MST"))
+	fmt.Printf("System booted: %s\n", time.Now().Add(-time.Duration(upSec)*time.Second).Format("2006-01-02 15:04:05 MST"))
+	if days > 0 {
+		fmt.Printf("Uptime: %d days, %d hours, %d minutes, %d seconds\n", days, hours, mins, secs)
+	} else {
+		fmt.Printf("Uptime: %d hours, %d minutes, %d seconds\n", hours, mins, secs)
+	}
+	return nil
+}
+
+// showSystemMemory shows memory usage (like Junos "show system memory").
+func (c *CLI) showSystemMemory() error {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return fmt.Errorf("reading meminfo: %w", err)
+	}
+
+	info := make(map[string]uint64)
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			key := strings.TrimSuffix(parts[0], ":")
+			val, _ := strconv.ParseUint(parts[1], 10, 64)
+			info[key] = val
+		}
+	}
+
+	total := info["MemTotal"]
+	free := info["MemFree"]
+	buffers := info["Buffers"]
+	cached := info["Cached"]
+	available := info["MemAvailable"]
+	used := total - free - buffers - cached
+
+	fmt.Printf("%-20s %10s\n", "Type", "kB")
+	fmt.Printf("%-20s %10d\n", "Total memory", total)
+	fmt.Printf("%-20s %10d\n", "Used memory", used)
+	fmt.Printf("%-20s %10d\n", "Free memory", free)
+	fmt.Printf("%-20s %10d\n", "Buffers", buffers)
+	fmt.Printf("%-20s %10d\n", "Cached", cached)
+	fmt.Printf("%-20s %10d\n", "Available", available)
+	if total > 0 {
+		fmt.Printf("Utilization: %.1f%%\n", float64(used)/float64(total)*100)
+	}
+	return nil
+}
+
+// showSystemProcesses shows top resource consumers.
+func (c *CLI) showSystemProcesses() error {
+	cmd := exec.Command("ps", "aux", "--sort=-rss")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// handleRequest dispatches request sub-commands (like Junos operational mode).
+func (c *CLI) handleRequest(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request:")
+		fmt.Println("  system reboot    Reboot the system")
+		fmt.Println("  system halt      Halt the system")
+		return nil
+	}
+
+	switch args[0] {
+	case "system":
+		return c.handleRequestSystem(args[1:])
+	default:
+		return fmt.Errorf("unknown request target: %s", args[0])
+	}
+}
+
+func (c *CLI) handleRequestSystem(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request system:")
+		fmt.Println("  reboot    Reboot the system")
+		fmt.Println("  halt      Halt the system")
+		return nil
+	}
+
+	switch args[0] {
+	case "reboot":
+		fmt.Print("Reboot the system? [yes,no] (no) ")
+		c.rl.SetPrompt("")
+		line, err := c.rl.Readline()
+		c.rl.SetPrompt(c.operationalPrompt())
+		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+			fmt.Println("Reboot cancelled")
+			return nil
+		}
+		fmt.Println("System going down for reboot NOW!")
+		cmd := exec.Command("systemctl", "reboot")
+		return cmd.Run()
+
+	case "halt":
+		fmt.Print("Halt the system? [yes,no] (no) ")
+		c.rl.SetPrompt("")
+		line, err := c.rl.Readline()
+		c.rl.SetPrompt(c.operationalPrompt())
+		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+			fmt.Println("Halt cancelled")
+			return nil
+		}
+		fmt.Println("System halting NOW!")
+		cmd := exec.Command("systemctl", "halt")
+		return cmd.Run()
+
+	default:
+		return fmt.Errorf("unknown request system command: %s", args[0])
+	}
 }
