@@ -403,6 +403,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 				fmt.Fprintf(&b, " neighbor %s ebgp-multihop %d\n", n.Address, n.MultihopTTL)
 			}
 		}
+		for _, export := range bgp.Export {
+			fmt.Fprintf(&b, " redistribute %s\n", export)
+		}
 		b.WriteString("exit\n!\n")
 	}
 
@@ -436,6 +439,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 			b.WriteString(" is-type level-2-only\n")
 		case "level-1-2":
 			b.WriteString(" is-type level-1-2\n")
+		}
+		for _, export := range isis.Export {
+			fmt.Fprintf(&b, " redistribute %s\n", export)
 		}
 		b.WriteString("exit\n!\n")
 		for _, iface := range isis.Interfaces {

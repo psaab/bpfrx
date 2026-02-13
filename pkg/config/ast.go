@@ -285,7 +285,23 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"area":      {args: 1, children: nil}, // area <id>
 		}},
 		"bgp": {children: map[string]*schemaNode{
-			"group": {args: 1, children: nil}, // group <name>
+			"local-as":  {args: 1, children: nil},
+			"router-id": {args: 1, children: nil},
+			"export":    {args: 1, children: nil},
+			"group":     {args: 1, children: nil}, // group <name>
+		}},
+		"rip": {children: map[string]*schemaNode{
+			"group":             {args: 1, children: nil},
+			"neighbor":          {args: 1, valueHint: ValueHintInterfaceName, children: nil},
+			"passive-interface": {args: 1, valueHint: ValueHintInterfaceName, children: nil},
+			"redistribute":      {args: 1, children: nil},
+		}},
+		"isis": {children: map[string]*schemaNode{
+			"net":       {args: 1, children: nil},
+			"level":     {args: 1, children: nil},
+			"is-type":   {args: 1, children: nil},
+			"export":    {args: 1, children: nil},
+			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: nil},
 		}},
 		"router-advertisement": {children: map[string]*schemaNode{
 			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{

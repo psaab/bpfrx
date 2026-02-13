@@ -246,6 +246,41 @@ func TestGenerateProtocols_ISIS(t *testing.T) {
 	}
 }
 
+func TestGenerateProtocols_BGPExport(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS:  65001,
+		RouterID: "1.1.1.1",
+		Export:   []string{"connected", "static"},
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.2.1", PeerAS: 65002},
+		},
+	}
+	got := m.generateProtocols(nil, bgp, nil, nil, "")
+	if !strings.Contains(got, "redistribute connected\n") {
+		t.Errorf("missing redistribute connected, got:\n%s", got)
+	}
+	if !strings.Contains(got, "redistribute static\n") {
+		t.Errorf("missing redistribute static, got:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_ISISExport(t *testing.T) {
+	m := New()
+	isis := &config.ISISConfig{
+		NET:    "49.0001.1921.6800.1001.00",
+		Level:  "level-2",
+		Export: []string{"connected"},
+		Interfaces: []*config.ISISInterface{
+			{Name: "trust0"},
+		},
+	}
+	got := m.generateProtocols(nil, nil, nil, isis, "")
+	if !strings.Contains(got, "redistribute connected\n") {
+		t.Errorf("missing redistribute connected, got:\n%s", got)
+	}
+}
+
 func TestGenerateProtocols_VRF(t *testing.T) {
 	m := New()
 	ospf := &config.OSPFConfig{
