@@ -220,6 +220,7 @@ var operationalTree = map[string]*completionNode{
 			"rollback": {desc: "Show rollback history", children: map[string]*completionNode{
 				"compare": {desc: "Compare rollback with active config"},
 			}},
+			"buffers":     {desc: "Show BPF map utilization"},
 			"license":     {desc: "Show system license"},
 			"memory":      {desc: "Show memory usage"},
 			"ntp":         {desc: "Show NTP server status"},
@@ -4807,6 +4808,7 @@ func formatSpeed(mbps int) string {
 func (c *CLI) handleShowSystem(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("show system:")
+		fmt.Println("  buffers          Show BPF map utilization")
 		fmt.Println("  connections      Show TCP connections")
 		fmt.Println("  license          Show system license")
 		fmt.Println("  memory           Show memory usage")
@@ -4938,9 +4940,41 @@ func (c *CLI) handleShowSystem(args []string) error {
 	case "syslog":
 		return c.showSystemSyslog()
 
+	case "buffers":
+		return c.showSystemBuffers()
+
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])
 	}
+}
+
+func (c *CLI) showSystemBuffers() error {
+	if c.dp == nil {
+		fmt.Println("Dataplane not loaded")
+		return nil
+	}
+	stats := c.dp.GetMapStats()
+	if len(stats) == 0 {
+		fmt.Println("No BPF maps available")
+		return nil
+	}
+	fmt.Printf("%-24s %-12s %10s %10s %8s\n", "Map", "Type", "Max", "Used", "Usage%")
+	fmt.Println(strings.Repeat("-", 68))
+	for _, s := range stats {
+		usage := ""
+		if s.MaxEntries > 0 && s.Type != "Array" {
+			pct := float64(s.UsedCount) / float64(s.MaxEntries) * 100
+			usage = fmt.Sprintf("%.1f%%", pct)
+		} else {
+			usage = "-"
+		}
+		used := fmt.Sprintf("%d", s.UsedCount)
+		if s.Type == "Array" {
+			used = "-"
+		}
+		fmt.Printf("%-24s %-12s %10d %10s %8s\n", s.Name, s.Type, s.MaxEntries, used, usage)
+	}
+	return nil
 }
 
 func (c *CLI) showBackupRouter() error {

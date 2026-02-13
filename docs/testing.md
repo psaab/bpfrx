@@ -5,7 +5,7 @@
 ### VM Setup (Incus)
 ```
 Host: Debian, kernel 6.18.5+deb14-amd64
-VM:   Debian 13, kernel 6.18 (from unstable repo)
+VM:   Debian 13, kernel 6.18.9 (from unstable repo)
       8 vCPU, 4 GB RAM
 ```
 
@@ -33,30 +33,33 @@ VM:   Debian 13, kernel 6.18 (from unstable repo)
 ```
 
 ### Interface Details
-| Interface | Driver | XDP Mode | Zone | Address |
-|-----------|--------|----------|------|---------|
-| enp5s0 | virtio_net | none (mgmt) | - | DHCP (UseRoutes=false) |
-| enp6s0 | virtio_net | native | trust | 10.0.1.10/24 |
-| enp7s0 | virtio_net | native | untrust | 10.0.2.10/24 |
-| enp8s0 | virtio_net | native | dmz | 10.0.30.10/24 |
-| enp9s0 | virtio_net | native | tunnel | DHCP |
-| enp10s0f0 | iavf (SR-IOV) | generic | wan | VLAN 100 + DHCP |
+| Interface | Renamed | Driver | XDP Mode | Zone | Address |
+|-----------|---------|--------|----------|------|---------|
+| enp5s0 | mgmt0 | virtio_net | native | mgmt | DHCP |
+| enp6s0 | trust0 | virtio_net | native | trust | 10.0.1.10/24 |
+| enp7s0 | untrust0 | virtio_net | native | untrust | 10.0.2.10/24 |
+| enp8s0 | dmz0 | virtio_net | native | dmz | 10.0.30.10/24 |
+| enp9s0 | tunnel0 | virtio_net | native | tunnel | 10.0.40.10/24 |
+| enp10s0f0np0 | wan0 | i40e (PF) | native | wan | VLAN 50, 172.16.50.5 + IPv6 |
+| enp101s0f1np1 | loss0 | i40e (PF) | native | loss | PCI passthrough |
 
-### SR-IOV WAN Interface
-- Intel X710 NIC with SR-IOV VFs (enp101s0f0np0 on host)
-- VFs have individual IOMMU groups — VFIO PCI passthrough works
-- Appears as `enp10s0f0` inside VM (NOT `enp10s0`)
+All interfaces renamed via `.link` files (MAC→name), configured via `.network` files by bpfrxd.
+
+### WAN Interface (PF Passthrough)
+- Intel X710 PF (enp10s0f0np0 on host) passed through via PCI/VFIO
+- i40e driver has **native XDP** — no generic mode overhead
+- Appears as `enp10s0f0np0` inside VM
 - PCI passthrough via: `incus config device add VM internet pci address=<BDF>`
-- iavf driver lacks native XDP support — uses generic mode
-- VLAN 100 tagging configured in Junos config, handled by BPF
+- VLAN 50 tagging configured in Junos config, handled by BPF
+- IPv6: 2001:559:8585:50::5/64
 
 ### Zone Policy Matrix
-| From \ To | trust | untrust | dmz | wan |
-|-----------|-------|---------|-----|-----|
-| trust | - | permit | permit | permit+SNAT |
-| untrust | DNAT web only | - | HTTP only | permit+SNAT |
-| dmz | - | - | - | permit+SNAT |
-| default | deny-all | deny-all | deny-all | deny-all |
+| From \ To | trust | untrust | dmz | wan | loss |
+|-----------|-------|---------|-----|-----|------|
+| trust | - | permit | permit | permit+SNAT | permit+SNAT |
+| untrust | DNAT web only | - | HTTP only | permit+SNAT | permit+SNAT |
+| dmz | - | - | - | permit+SNAT | permit+SNAT |
+| default | deny-all | deny-all | deny-all | deny-all | deny-all |
 
 ---
 
@@ -66,7 +69,7 @@ VM:   Debian 13, kernel 6.18 (from unstable repo)
 # Full build (BPF codegen + Go binary)
 make generate && make build
 
-# Run unit tests (18 parser tests)
+# Run unit tests (266 tests across 12 packages)
 make test
 
 # Deploy to Incus VM
@@ -119,6 +122,15 @@ iperf3 -c 10.0.30.100 -P 4 -R -t 30
 | bpf_printk enabled | ~3 Gbps | 55%+ CPU wasted on trace output |
 | Per-interface native XDP | ~25 Gbps | virtio native, iavf generic |
 | During hitless restart | ~25 Gbps | zero drop across 3 restarts |
+| Virtio-net 8xBBR (baseline) | ~12.1 Gbps | CUBIC congestion, no GRUB tuning |
+| Virtio-net 8xBBR (GRUB only) | ~14.7 Gbps | init_on_alloc=0 + hardened_usercopy=off |
+| Virtio-net 8xBBR (GRUB+tc) | ~15.6 Gbps | + tc bridge bypass on host |
+
+**Host GRUB tuning (applied to both host AND VM):**
+- `init_on_alloc=0` — disables Debian's `CONFIG_INIT_ON_ALLOC_DEFAULT_ON` (~20% CPU from `clear_page_erms`)
+- `hardened_usercopy=off` — disables `CONFIG_HARDENED_USERCOPY_DEFAULT_ON` (~18% host CPU from `__check_object_size`)
+- `mitigations=off` — disables Spectre/Meltdown mitigations (perf testing only)
+- **BBR congestion control:** 12.1 Gbps vs 6.4 Gbps with CUBIC through virtio-net firewall
 
 ### CPU Profiling
 
@@ -341,12 +353,50 @@ incus exec bpfrx-fw -- curl -s http://127.0.0.1:8080/metrics | grep bpfrx
 - STALE ARP entries work fine with `bpf_fib_lookup` — only truly absent entries fail
 
 ### VLAN Handling
-- WAN interface (enp10s0f0) uses VLAN 100 — tag pushed/popped in BPF
-- Configured via Junos `vlan-tagging` + `unit 100 { vlan-id 100; }`
+- WAN interface (wan0) uses VLAN 50 — tag pushed/popped in BPF
+- Configured via Junos `vlan-tagging` + `unit 50 { vlan-id 50; }`
 - `vlan_iface_map` BPF map tracks VLAN ID per logical interface
 
 ### IPv6
-- DHCPv6 on WAN gets global address (2001:559:.../128)
+- DHCPv6 on WAN gets global address (2001:559:8585:50::5/64)
 - IPv6 default route via link-local gateway
 - Router Advertisements managed via radvd on LAN interfaces
 - NAT64 translation native in BPF (no Tayga/Jool)
+
+---
+
+## cpumap (XDP Multi-CPU Distribution)
+
+Implemented but disabled by default (`Manager.EnableCPUMap`). Cross-CPU cache miss overhead makes it slower than single-CPU processing on virtio-net:
+
+| Configuration | Throughput | Notes |
+|--------------|-----------|-------|
+| No cpumap (default) | ~12.2 Gbps | Single CPU processes all 4 flows |
+| cpumap enabled | ~3.8 Gbps | Cross-CPU cache misses dominate |
+
+cpumap is only useful when a single CPU is genuinely saturated (40G/100G NICs).
+
+**Key gotchas:**
+- PROG_ARRAY owner incompatibility: separate array per attach type needed
+- Must store map+prog references in Go to prevent GC from closing FDs
+
+---
+
+## Known Unimplemented BPF Features
+
+These config fields are parsed and compiled to BPF maps but NOT checked in BPF programs:
+
+| Field | BPF Struct | Status |
+|-------|-----------|--------|
+| `power_mode_disable` | `flow_config` | Placeholder — no BPF logic |
+| `gre_accel` | `flow_config` | Placeholder — GRE acceleration not implemented |
+| `pre-id-default-policy` | Not in BPF | Requires application identification (not implemented) |
+
+These config features are parsed in Go but never used at runtime:
+
+| Feature | Where Parsed | Status |
+|---------|-------------|--------|
+| `rib-groups` | compiler.go:1971-2011 | Parsed, not passed to FRR |
+| `SamplingInput/Output` | compiler.go:1028-1074 | Parsed, not wired to flow export |
+| `LogConfig.Mode` | compiler.go:1591 | Parsed, stream mode always used |
+| `WebMgmt interface binding` | compiler.go:3343-3360 | Parsed, servers always bind to localhost |

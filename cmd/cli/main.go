@@ -1490,6 +1490,7 @@ func (c *ctl) handleShowSystem(args []string) error {
 		fmt.Println("show system:")
 		fmt.Println("  alarms             Show system alarms")
 		fmt.Println("  backup-router      Show backup router configuration")
+		fmt.Println("  buffers            Show BPF map utilization")
 		fmt.Println("  internet-options   Show internet options")
 		fmt.Println("  license            Show system license")
 		fmt.Println("  login              Show configured login users")
@@ -1620,6 +1621,9 @@ func (c *ctl) handleShowSystem(args []string) error {
 
 	case "backup-router":
 		return c.showText("backup-router")
+
+	case "buffers":
+		return c.showText("buffers")
 
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])

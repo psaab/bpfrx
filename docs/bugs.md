@@ -153,3 +153,32 @@ VF appears as enp10s0 inside VM.
 - Restarting daemon reuses stale generic links even though native is now supported
 - **Fix:** Run `bpfrxd cleanup` once after deploying the per-interface XDP code to create fresh native links
 - **Pattern:** Structural changes to XDP/TC attachment require one-time cleanup + fresh start
+
+### SNAT TCP sessions dying on daemon restart
+- SNAT sessions had forward + reverse entries pointing to pre-SNAT IPs
+- dnat_table entries (reverse SNAT mappings) were cleared before new entries written
+- During the window: return traffic lookup fails → session drops
+- **Fix:** Write new dnat_table entries BEFORE clearing stale ones (populate-before-clear)
+- **File:** `pkg/dataplane/compiler.go`
+- **Commit:** `a030446`
+
+### Non-deterministic map IDs breaking hitless restarts
+- Zone/screen/address/application IDs assigned in map iteration order (random)
+- After restart, same config could get different IDs → stale BPF map entries reference wrong IDs
+- **Fix:** Sort map keys alphabetically before ID assignment → deterministic IDs across restarts
+- **File:** `pkg/dataplane/compiler.go`
+- **Commit:** `cec07ea`
+
+## BPF Flow Config Gotchas
+
+### allow-dns-reply requires BPF check
+- `allow_dns_reply` field existed in `flow_config` BPF struct since initial implementation
+- Was compiled to BPF map correctly but never checked in any BPF program
+- DNS reply packets (UDP src port 53) without sessions were denied by policy
+- **Fix:** Added check in xdp_conntrack session-miss path (both IPv4 and IPv6)
+- **Commit:** `1a8b873`
+
+### Parsed but NOT used in BPF (known gaps)
+- `power_mode_disable` — in flow_config struct, never checked in BPF
+- `gre_accel` — in flow_config struct, never checked in BPF (GRE acceleration placeholder)
+- `pre-id-default-policy` — parsed in config, not compiled to BPF (requires app identification)

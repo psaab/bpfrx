@@ -8,7 +8,7 @@ An eBPF-based firewall that clones Juniper vSRX capabilities using native Junos 
 make generate        # Generate Go bindings from BPF C via bpf2go
 make build           # Build bpfrxd daemon
 make build-ctl       # Build remote CLI client
-make test            # Run Go tests (196 tests across 12 packages)
+make test            # Run Go tests (266 tests across 12 packages)
 ```
 
 ## Test Environment (Incus VM)
@@ -141,8 +141,8 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, export/redistribute, ECMP multipath, next-table inter-VRF route leaking
 - **VLANs**: 802.1Q tagging in BPF, trunk ports
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces
-- **Observability**: Syslog (with facility/severity filtering), NetFlow v9, Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB)
-- **Flow**: TCP MSS clamping, ALG control, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, forwarding-class DSCP rewrite)
+- **Observability**: Syslog (facility/severity/category filtering), NetFlow v9, Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB)
+- **Flow**: TCP MSS clamping, ALG control, allow-dns-reply, allow-embedded-icmp, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, forwarding-class DSCP rewrite)
 - **HA**: VRRP via keepalived (config generation, runtime state detection)
 - **DHCP**: Relay (Option 82), server (Kea integration with lease display)
 - **CLI**: Junos-style prefix matching, "Possible completions:" headers, zone names in session display, config validation warnings

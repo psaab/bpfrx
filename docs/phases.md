@@ -220,3 +220,41 @@
 - **Per-interface native/generic XDP:** Each interface independently tries native XDP first, falls back to generic. `redirect_capable` BPF array map tells `xdp_forward` whether to use `bpf_redirect_map` (native) or `XDP_PASS` (kernel forwarding)
 - **Results:** 4 virtio-net interfaces in native XDP, 1 iavf in generic mode. 25+ Gbps sustained throughput with zero packet loss during restarts
 - **Verification:** 3 consecutive daemon restarts during 40-second iperf3 — zero throughput disruption
+
+## Phase 45: Hitless Restart Hardening
+- Deterministic zone/screen/address/app ID assignment (sorted before numbering)
+- Populate-before-clear pattern: write new BPF map entries before deleting stale ones
+- FIB generation counter bump on recompile → forces FIB re-lookup on all sessions
+- Fix SNAT TCP sessions dying on restart (dnat_table race)
+- **Commits:** `cec07ea`, `a030446`
+
+## Phase 46: Security Features & CLI Enhancements
+- Zone-level TCP RST for denied non-SYN packets (`d539070`)
+- Address-persistent NAT, tc_forward verifier fix, FilterRule size fix (`66833c5`)
+- DSCP rewrite action in firewall filters (`6634db7`)
+- Zone and interface description display (`f50213c`)
+- Policy descriptions, session idle time, flow statistics (`a1a149e`)
+- NAT64/host-inbound/per-screen counters in gRPC (`2e6ede7`)
+- Session idle time in gRPC + age fix (`7e4caa9`)
+- Filtered session clearing with source/dest/zone/protocol filters (`4c6454e`, `af8a9f5`)
+- Remote CLI: IKE SA display, persistent NAT clear, policy zone filters (`b41e69d`)
+- Global security policies, zone-pair filtering, policy counter clear (`5cd12c0`, `5ef37f0`)
+- Destination NAT sub-commands with hit counters (`9df3740`, `9d3bf75`)
+- Firewall filter logging and NAT rule-all display (`8a69326`)
+- Enhanced gRPC application display with sorted output and details (`111131c`)
+
+## Phase 47: Firewall Filters & Flow Features
+- Firewall filter port range matching in BPF (`245f868`, `ab7c8e4`)
+- Per-application inactivity timeout in BPF sessions (`c30ef7b`)
+- Forwarding-table export policy wired to FRR ECMP multipath (`f52f59c`)
+- Firewall filter hit counters in remote CLI (`0687311`)
+- Forwarding-class to DSCP rewrite mapping (`6bfebbc`)
+- Clear firewall counters command (`9ff75e5`)
+
+## Phase 48: Routing & Syslog Enhancements
+- VRF-aware route display via `show route table` (`d0e6d4f`, `6e5db2a`)
+- Next-table inter-VRF route leaking for static routes via ip rule (`d746210`)
+- Route filtering by protocol and CIDR prefix (`093016f`)
+- Syslog stream category filtering (session/policy/screen/firewall) (`8902a47`)
+- Remote CLI policy zone filtering (`8902a47`)
+- allow-dns-reply wired to BPF conntrack for sessionless DNS pass-through (`1a8b873`)
