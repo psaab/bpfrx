@@ -3228,6 +3228,113 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			}
 		}
 
+	case "screen":
+		if cfg == nil || len(cfg.Security.Screen) == 0 {
+			buf.WriteString("No screen profiles configured\n")
+		} else {
+			// Build reverse map: profile name -> zones
+			zonesByProfile := make(map[string][]string)
+			for name, zone := range cfg.Security.Zones {
+				if zone.ScreenProfile != "" {
+					zonesByProfile[zone.ScreenProfile] = append(zonesByProfile[zone.ScreenProfile], name)
+				}
+			}
+			var names []string
+			for name := range cfg.Security.Screen {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				profile := cfg.Security.Screen[name]
+				fmt.Fprintf(&buf, "Screen profile: %s\n", name)
+				if profile.TCP.Land {
+					buf.WriteString("  TCP LAND attack detection: enabled\n")
+				}
+				if profile.TCP.SynFin {
+					buf.WriteString("  TCP SYN+FIN detection: enabled\n")
+				}
+				if profile.TCP.NoFlag {
+					buf.WriteString("  TCP no-flag detection: enabled\n")
+				}
+				if profile.TCP.FinNoAck {
+					buf.WriteString("  TCP FIN-no-ACK detection: enabled\n")
+				}
+				if profile.TCP.WinNuke {
+					buf.WriteString("  TCP WinNuke detection: enabled\n")
+				}
+				if profile.TCP.SynFrag {
+					buf.WriteString("  TCP SYN fragment detection: enabled\n")
+				}
+				if profile.TCP.SynFlood != nil {
+					fmt.Fprintf(&buf, "  TCP SYN flood protection: attack-threshold %d\n",
+						profile.TCP.SynFlood.AttackThreshold)
+				}
+				if profile.ICMP.PingDeath {
+					buf.WriteString("  ICMP ping-of-death detection: enabled\n")
+				}
+				if profile.ICMP.FloodThreshold > 0 {
+					fmt.Fprintf(&buf, "  ICMP flood protection: threshold %d\n",
+						profile.ICMP.FloodThreshold)
+				}
+				if profile.IP.SourceRouteOption {
+					buf.WriteString("  IP source-route option detection: enabled\n")
+				}
+				if profile.UDP.FloodThreshold > 0 {
+					fmt.Fprintf(&buf, "  UDP flood protection: threshold %d\n",
+						profile.UDP.FloodThreshold)
+				}
+				if zones, ok := zonesByProfile[name]; ok {
+					sort.Strings(zones)
+					fmt.Fprintf(&buf, "  Applied to zones: %s\n", strings.Join(zones, ", "))
+				}
+				buf.WriteString("\n")
+			}
+			// Per-type drop counters
+			if s.dp != nil && s.dp.IsLoaded() {
+				ctrMap := s.dp.Map("global_counters")
+				if ctrMap != nil {
+					readCtr := func(idx uint32) uint64 {
+						var perCPU []uint64
+						if err := ctrMap.Lookup(idx, &perCPU); err == nil {
+							var total uint64
+							for _, v := range perCPU {
+								total += v
+							}
+							return total
+						}
+						return 0
+					}
+					totalDrops := readCtr(dataplane.GlobalCtrScreenDrops)
+					fmt.Fprintf(&buf, "Total screen drops: %d\n", totalDrops)
+					if totalDrops > 0 {
+						screenCounters := []struct {
+							idx  uint32
+							name string
+						}{
+							{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
+							{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
+							{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
+							{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
+							{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
+							{dataplane.GlobalCtrScreenTearDrop, "Teardrop"},
+							{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
+							{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
+							{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
+							{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
+							{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
+							{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
+						}
+						for _, sc := range screenCounters {
+							v := readCtr(sc.idx)
+							if v > 0 {
+								fmt.Fprintf(&buf, "  %-25s %d\n", sc.name+":", v)
+							}
+						}
+					}
+				}
+			}
+		}
+
 	case "log":
 		out, err := exec.Command("journalctl", "-u", "bpfrxd", "-n", "50", "--no-pager").CombinedOutput()
 		if err != nil {

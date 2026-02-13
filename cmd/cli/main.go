@@ -675,22 +675,7 @@ func (c *ctl) showPolicies() error {
 }
 
 func (c *ctl) showScreen() error {
-	resp, err := c.client.GetScreen(context.Background(), &pb.GetScreenRequest{})
-	if err != nil {
-		return fmt.Errorf("%v", err)
-	}
-	if len(resp.Screens) == 0 {
-		fmt.Println("No screen profiles configured")
-		return nil
-	}
-	for _, si := range resp.Screens {
-		fmt.Printf("Screen profile: %s\n", si.Name)
-		for _, check := range si.Checks {
-			fmt.Printf("  %s\n", check)
-		}
-		fmt.Println()
-	}
-	return nil
+	return c.showText("screen")
 }
 
 func (c *ctl) showFlowSession(args []string) error {

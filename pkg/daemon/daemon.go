@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1204,6 +1205,84 @@ func (d *Daemon) applySSHKnownHosts(cfg *config.Config) {
 		return
 	}
 	slog.Info("SSH known hosts written", "hosts", len(cfg.Security.SSHKnownHosts))
+}
+
+// applyLoginUsers creates system users and installs SSH authorized keys
+// from system { login { user ... } } config.
+func (d *Daemon) applyLoginUsers(cfg *config.Config) {
+	if cfg.System.Login == nil || len(cfg.System.Login.Users) == 0 {
+		return
+	}
+
+	for _, user := range cfg.System.Login.Users {
+		if user.Name == "" {
+			continue
+		}
+		// Check if user exists
+		if _, err := exec.Command("id", user.Name).CombinedOutput(); err != nil {
+			// Create user
+			args := []string{"-m", "-s", "/bin/bash"}
+			if user.UID > 0 {
+				args = append(args, "-u", strconv.Itoa(user.UID))
+			}
+			args = append(args, user.Name)
+			if out, err := exec.Command("useradd", args...).CombinedOutput(); err != nil {
+				slog.Warn("failed to create user", "user", user.Name, "err", err, "output", string(out))
+				continue
+			}
+			slog.Info("user created", "user", user.Name)
+		}
+
+		// Install SSH authorized keys
+		if len(user.SSHKeys) > 0 {
+			homeDir := "/home/" + user.Name
+			if user.Name == "root" {
+				homeDir = "/root"
+			}
+			sshDir := filepath.Join(homeDir, ".ssh")
+			os.MkdirAll(sshDir, 0700)
+
+			var b strings.Builder
+			b.WriteString("# Managed by bpfrxd — do not edit\n")
+			for _, key := range user.SSHKeys {
+				fmt.Fprintf(&b, "%s\n", key)
+			}
+
+			authKeys := filepath.Join(sshDir, "authorized_keys")
+			current, _ := os.ReadFile(authKeys)
+			if string(current) != b.String() {
+				if err := os.WriteFile(authKeys, []byte(b.String()), 0600); err != nil {
+					slog.Warn("failed to write authorized_keys", "user", user.Name, "err", err)
+					continue
+				}
+				// Fix ownership
+				exec.Command("chown", "-R", user.Name+":"+user.Name, sshDir).Run()
+				slog.Info("SSH authorized keys written", "user", user.Name, "keys", len(user.SSHKeys))
+			}
+		}
+	}
+
+	// Apply root authentication
+	if cfg.System.RootAuthentication != nil && len(cfg.System.RootAuthentication.SSHKeys) > 0 {
+		sshDir := "/root/.ssh"
+		os.MkdirAll(sshDir, 0700)
+
+		var b strings.Builder
+		b.WriteString("# Managed by bpfrxd — do not edit\n")
+		for _, key := range cfg.System.RootAuthentication.SSHKeys {
+			fmt.Fprintf(&b, "%s\n", key)
+		}
+
+		authKeys := filepath.Join(sshDir, "authorized_keys")
+		current, _ := os.ReadFile(authKeys)
+		if string(current) != b.String() {
+			if err := os.WriteFile(authKeys, []byte(b.String()), 0600); err != nil {
+				slog.Warn("failed to write root authorized_keys", "err", err)
+			} else {
+				slog.Info("root SSH authorized keys written", "keys", len(cfg.System.RootAuthentication.SSHKeys))
+			}
+		}
+	}
 }
 
 // applySystemSyslog configures system-level syslog forwarding from
