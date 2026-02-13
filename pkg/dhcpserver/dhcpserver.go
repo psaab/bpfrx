@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
@@ -88,6 +89,78 @@ func (m *Manager) Clear() {
 // IsRunning returns true if any Kea server is running.
 func (m *Manager) IsRunning() bool {
 	return m.running4 || m.running6
+}
+
+// Lease represents a DHCP lease from Kea's lease database.
+type Lease struct {
+	Address    string
+	HWAddress  string
+	Hostname   string
+	ValidLife  string
+	ExpireTime string
+	SubnetID   string
+}
+
+// GetLeases4 reads Kea DHCPv4 lease file and returns active leases.
+func (m *Manager) GetLeases4() ([]Lease, error) {
+	return parseLeaseCSV("/var/lib/kea/kea-leases4.csv")
+}
+
+// GetLeases6 reads Kea DHCPv6 lease file and returns active leases.
+func (m *Manager) GetLeases6() ([]Lease, error) {
+	return parseLeaseCSV("/var/lib/kea/kea-leases6.csv")
+}
+
+func parseLeaseCSV(path string) ([]Lease, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) < 2 {
+		return nil, nil
+	}
+
+	// Parse CSV header to find column indices
+	header := strings.Split(lines[0], ",")
+	cols := make(map[string]int)
+	for i, h := range header {
+		cols[h] = i
+	}
+
+	var leases []Lease
+	for _, line := range lines[1:] {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ",")
+		l := Lease{}
+		if idx, ok := cols["address"]; ok && idx < len(fields) {
+			l.Address = fields[idx]
+		}
+		if idx, ok := cols["hwaddr"]; ok && idx < len(fields) {
+			l.HWAddress = fields[idx]
+		}
+		if idx, ok := cols["hostname"]; ok && idx < len(fields) {
+			l.Hostname = fields[idx]
+		}
+		if idx, ok := cols["valid_lifetime"]; ok && idx < len(fields) {
+			l.ValidLife = fields[idx]
+		}
+		if idx, ok := cols["expire"]; ok && idx < len(fields) {
+			l.ExpireTime = fields[idx]
+		}
+		if idx, ok := cols["subnet_id"]; ok && idx < len(fields) {
+			l.SubnetID = fields[idx]
+		}
+		if l.Address != "" {
+			leases = append(leases, l)
+		}
+	}
+	return leases, nil
 }
 
 func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {

@@ -334,7 +334,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			Routing:  d.routing,
 			FRR:      d.frr,
 			IPsec:    d.ipsec,
-			DHCP:     d.dhcp,
+			DHCP:       d.dhcp,
+			DHCPServer: d.dhcpServer,
 			RPMResultsFn: func() []*rpm.ProbeResult {
 				if d.rpm != nil {
 					return d.rpm.Results()

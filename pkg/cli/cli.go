@@ -20,6 +20,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/dataplane"
 	"github.com/psaab/bpfrx/pkg/dhcp"
+	"github.com/psaab/bpfrx/pkg/dhcpserver"
 	"github.com/psaab/bpfrx/pkg/frr"
 	"github.com/psaab/bpfrx/pkg/ipsec"
 	"github.com/psaab/bpfrx/pkg/logging"
@@ -182,7 +183,8 @@ var operationalTree = map[string]*completionNode{
 			}},
 		}},
 		"schedulers":  {desc: "Show policy schedulers"},
-		"dhcp-relay":  {desc: "Show DHCP relay status"},
+		"dhcp-relay":   {desc: "Show DHCP relay status"},
+		"dhcp-server": {desc: "Show DHCP server leases"},
 		"snmp":        {desc: "Show SNMP statistics"},
 		"system": {desc: "Show system information", children: map[string]*completionNode{
 			"rollback":  {desc: "Show rollback history"},
@@ -825,6 +827,9 @@ func (c *CLI) handleShow(args []string) error {
 
 	case "dhcp-relay":
 		return c.showDHCPRelay()
+
+	case "dhcp-server":
+		return c.showDHCPServer()
 
 	case "snmp":
 		return c.showSNMP()
@@ -4024,6 +4029,41 @@ func (c *CLI) showDHCPRelay() error {
 			fmt.Printf("  %s:\n", name)
 			fmt.Printf("    Interfaces: %s\n", strings.Join(g.Interfaces, ", "))
 			fmt.Printf("    Active server group: %s\n", g.ActiveServerGroup)
+		}
+	}
+	return nil
+}
+
+func (c *CLI) showDHCPServer() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || (cfg.System.DHCPServer.DHCPLocalServer == nil && cfg.System.DHCPServer.DHCPv6LocalServer == nil) {
+		fmt.Println("No DHCP server configured")
+		return nil
+	}
+
+	// Read Kea lease files directly
+	leases4, _ := dhcpserver.New().GetLeases4()
+	leases6, _ := dhcpserver.New().GetLeases6()
+
+	if len(leases4) == 0 && len(leases6) == 0 {
+		fmt.Println("No active leases")
+		return nil
+	}
+
+	if len(leases4) > 0 {
+		fmt.Println("DHCPv4 Leases:")
+		fmt.Printf("  %-18s %-20s %-15s %-12s %s\n", "Address", "MAC", "Hostname", "Lifetime", "Expires")
+		for _, l := range leases4 {
+			fmt.Printf("  %-18s %-20s %-15s %-12s %s\n",
+				l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+		}
+	}
+	if len(leases6) > 0 {
+		fmt.Println("DHCPv6 Leases:")
+		fmt.Printf("  %-40s %-20s %-15s %-12s %s\n", "Address", "DUID", "Hostname", "Lifetime", "Expires")
+		for _, l := range leases6 {
+			fmt.Printf("  %-40s %-20s %-15s %-12s %s\n",
+				l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
 		}
 	}
 	return nil

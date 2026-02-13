@@ -24,6 +24,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/conntrack"
 	"github.com/psaab/bpfrx/pkg/dataplane"
 	"github.com/psaab/bpfrx/pkg/dhcp"
+	"github.com/psaab/bpfrx/pkg/dhcpserver"
 	"github.com/psaab/bpfrx/pkg/frr"
 	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
 	"github.com/psaab/bpfrx/pkg/ipsec"
@@ -43,6 +44,7 @@ type Config struct {
 	FRR      *frr.Manager
 	IPsec    *ipsec.Manager
 	DHCP         *dhcp.Manager
+	DHCPServer   *dhcpserver.Manager
 	RPMResultsFn func() []*rpm.ProbeResult // returns live RPM results
 	ApplyFn      func(*config.Config)      // daemon's applyConfig callback
 	Version      string                    // software version string
@@ -59,6 +61,7 @@ type Server struct {
 	frr          *frr.Manager
 	ipsec        *ipsec.Manager
 	dhcp         *dhcp.Manager
+	dhcpServer   *dhcpserver.Manager
 	rpmResultsFn func() []*rpm.ProbeResult
 	applyFn      func(*config.Config)
 	startTime    time.Time
@@ -77,6 +80,7 @@ func NewServer(addr string, cfg Config) *Server {
 		frr:          cfg.FRR,
 		ipsec:        cfg.IPsec,
 		dhcp:         cfg.DHCP,
+		dhcpServer:   cfg.DHCPServer,
 		rpmResultsFn: cfg.RPMResultsFn,
 		applyFn:      cfg.ApplyFn,
 		startTime:    time.Now(),
@@ -2228,6 +2232,33 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 				buf.WriteString("Trap groups:\n")
 				for name, tg := range snmpCfg.TrapGroups {
 					fmt.Fprintf(&buf, "  %s: %s\n", name, strings.Join(tg.Targets, ", "))
+				}
+			}
+		}
+
+	case "dhcp-server":
+		if s.dhcpServer == nil || !s.dhcpServer.IsRunning() {
+			buf.WriteString("DHCP server not running\n")
+		} else {
+			leases4, _ := s.dhcpServer.GetLeases4()
+			leases6, _ := s.dhcpServer.GetLeases6()
+			if len(leases4) == 0 && len(leases6) == 0 {
+				buf.WriteString("No active leases\n")
+			}
+			if len(leases4) > 0 {
+				buf.WriteString("DHCPv4 Leases:\n")
+				fmt.Fprintf(&buf, "  %-18s %-20s %-15s %-12s %s\n", "Address", "MAC", "Hostname", "Lifetime", "Expires")
+				for _, l := range leases4 {
+					fmt.Fprintf(&buf, "  %-18s %-20s %-15s %-12s %s\n",
+						l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+				}
+			}
+			if len(leases6) > 0 {
+				buf.WriteString("DHCPv6 Leases:\n")
+				fmt.Fprintf(&buf, "  %-40s %-20s %-15s %-12s %s\n", "Address", "DUID", "Hostname", "Lifetime", "Expires")
+				for _, l := range leases6 {
+					fmt.Fprintf(&buf, "  %-40s %-20s %-15s %-12s %s\n",
+						l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
 				}
 			}
 		}

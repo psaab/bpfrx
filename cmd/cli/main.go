@@ -368,6 +368,7 @@ func (c *ctl) handleShow(args []string) error {
 		fmt.Println("  configuration    Show active configuration")
 		fmt.Println("  dhcp             Show DHCP information")
 		fmt.Println("  dhcp-relay       Show DHCP relay status")
+		fmt.Println("  dhcp-server      Show DHCP server leases")
 		fmt.Println("  firewall         Show firewall filters")
 		fmt.Println("  flow-monitoring  Show flow monitoring/NetFlow configuration")
 		fmt.Println("  route            Show routing table")
@@ -439,6 +440,9 @@ func (c *ctl) handleShow(args []string) error {
 
 	case "dhcp-relay":
 		return c.showText("dhcp-relay")
+
+	case "dhcp-server":
+		return c.showText("dhcp-server")
 
 	case "firewall":
 		return c.showText("firewall")
@@ -1526,6 +1530,7 @@ func (c *ctl) showOperationalHelp() {
 	fmt.Println("  show dhcp leases                   Show DHCP leases")
 	fmt.Println("  show dhcp client-identifier        Show DHCPv6 DUID(s)")
 	fmt.Println("  show dhcp-relay                    Show DHCP relay status")
+	fmt.Println("  show dhcp-server                   Show DHCP server leases")
 	fmt.Println("  show firewall                      Show firewall filters")
 	fmt.Println("  show flow-monitoring               Show NetFlow v9 configuration")
 	fmt.Println("  show route                         Show routing table")
