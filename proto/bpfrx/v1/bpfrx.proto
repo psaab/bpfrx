@@ -207,6 +207,11 @@ message GetSessionsRequest {
   int32 offset = 2;
   uint32 zone = 3;
   string protocol = 4;
+  string source_prefix = 5;       // CIDR prefix filter (e.g. "10.0.1.0/24")
+  string destination_prefix = 6;  // CIDR prefix filter
+  uint32 source_port = 7;
+  uint32 destination_port = 8;
+  bool nat_only = 9;              // show only NAT sessions
 }
 message GetSessionsResponse {
   int32 total = 1;

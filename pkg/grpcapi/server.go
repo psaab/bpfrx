@@ -415,6 +415,34 @@ func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb
 	offset := int(req.Offset)
 	zoneFilter := uint16(req.Zone)
 	protoFilter := req.Protocol
+	srcPort := uint16(req.SourcePort)
+	dstPort := uint16(req.DestinationPort)
+	natOnly := req.NatOnly
+
+	// Parse CIDR prefix filters
+	var srcNet, dstNet *net.IPNet
+	if req.SourcePrefix != "" {
+		cidr := req.SourcePrefix
+		if !strings.Contains(cidr, "/") {
+			if strings.Contains(cidr, ":") {
+				cidr += "/128"
+			} else {
+				cidr += "/32"
+			}
+		}
+		_, srcNet, _ = net.ParseCIDR(cidr)
+	}
+	if req.DestinationPrefix != "" {
+		cidr := req.DestinationPrefix
+		if !strings.Contains(cidr, "/") {
+			if strings.Contains(cidr, ":") {
+				cidr += "/128"
+			} else {
+				cidr += "/32"
+			}
+		}
+		_, dstNet, _ = net.ParseCIDR(cidr)
+	}
 
 	now := monotonicSeconds()
 	var all []*pb.SessionEntry
@@ -429,6 +457,21 @@ func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb
 		}
 		proto := protoName(key.Protocol)
 		if protoFilter != "" && proto != protoFilter {
+			return true
+		}
+		if srcNet != nil && !srcNet.Contains(net.IP(key.SrcIP[:])) {
+			return true
+		}
+		if dstNet != nil && !dstNet.Contains(net.IP(key.DstIP[:])) {
+			return true
+		}
+		if srcPort != 0 && ntohs(key.SrcPort) != srcPort {
+			return true
+		}
+		if dstPort != 0 && ntohs(key.DstPort) != dstPort {
+			return true
+		}
+		if natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
 			return true
 		}
 		if idx >= offset && len(all) < limit {
@@ -447,6 +490,21 @@ func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb
 		}
 		proto := protoName(key.Protocol)
 		if protoFilter != "" && proto != protoFilter {
+			return true
+		}
+		if srcNet != nil && !srcNet.Contains(net.IP(key.SrcIP[:])) {
+			return true
+		}
+		if dstNet != nil && !dstNet.Contains(net.IP(key.DstIP[:])) {
+			return true
+		}
+		if srcPort != 0 && ntohs(key.SrcPort) != srcPort {
+			return true
+		}
+		if dstPort != 0 && ntohs(key.DstPort) != dstPort {
+			return true
+		}
+		if natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
 			return true
 		}
 		if idx >= offset && len(all) < limit {

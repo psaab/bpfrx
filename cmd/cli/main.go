@@ -574,13 +574,12 @@ func (c *ctl) showScreen() error {
 
 func (c *ctl) showFlowSession(args []string) error {
 	req := &pb.GetSessionsRequest{Limit: 100}
-	// Parse simple filters from args
+	// Parse filter arguments (matches local CLI's session filter syntax)
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "zone":
 			if i+1 < len(args) {
 				i++
-				// Zone filter requires numeric ID; try to parse
 				if v, err := strconv.ParseUint(args[i], 10, 32); err == nil {
 					req.Zone = uint32(v)
 				}
@@ -588,7 +587,40 @@ func (c *ctl) showFlowSession(args []string) error {
 		case "protocol":
 			if i+1 < len(args) {
 				i++
-				req.Protocol = args[i]
+				req.Protocol = strings.ToUpper(args[i])
+			}
+		case "source-prefix":
+			if i+1 < len(args) {
+				i++
+				req.SourcePrefix = args[i]
+			}
+		case "destination-prefix":
+			if i+1 < len(args) {
+				i++
+				req.DestinationPrefix = args[i]
+			}
+		case "source-port":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.ParseUint(args[i], 10, 32); err == nil {
+					req.SourcePort = uint32(v)
+				}
+			}
+		case "destination-port":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.ParseUint(args[i], 10, 32); err == nil {
+					req.DestinationPort = uint32(v)
+				}
+			}
+		case "nat":
+			req.NatOnly = true
+		case "limit":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil {
+					req.Limit = int32(v)
+				}
 			}
 		case "summary":
 			return c.showSessionSummary()

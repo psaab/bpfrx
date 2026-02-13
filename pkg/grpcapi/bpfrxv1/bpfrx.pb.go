@@ -2002,13 +2002,18 @@ func (x *PolicyRule) GetHitBytes() uint64 {
 }
 
 type GetSessionsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Limit         int32                  `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
-	Offset        int32                  `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
-	Zone          uint32                 `protobuf:"varint,3,opt,name=zone,proto3" json:"zone,omitempty"`
-	Protocol      string                 `protobuf:"bytes,4,opt,name=protocol,proto3" json:"protocol,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Limit             int32                  `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
+	Offset            int32                  `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	Zone              uint32                 `protobuf:"varint,3,opt,name=zone,proto3" json:"zone,omitempty"`
+	Protocol          string                 `protobuf:"bytes,4,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	SourcePrefix      string                 `protobuf:"bytes,5,opt,name=source_prefix,json=sourcePrefix,proto3" json:"source_prefix,omitempty"`                // CIDR prefix filter (e.g. "10.0.1.0/24")
+	DestinationPrefix string                 `protobuf:"bytes,6,opt,name=destination_prefix,json=destinationPrefix,proto3" json:"destination_prefix,omitempty"` // CIDR prefix filter
+	SourcePort        uint32                 `protobuf:"varint,7,opt,name=source_port,json=sourcePort,proto3" json:"source_port,omitempty"`
+	DestinationPort   uint32                 `protobuf:"varint,8,opt,name=destination_port,json=destinationPort,proto3" json:"destination_port,omitempty"`
+	NatOnly           bool                   `protobuf:"varint,9,opt,name=nat_only,json=natOnly,proto3" json:"nat_only,omitempty"` // show only NAT sessions
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *GetSessionsRequest) Reset() {
@@ -2067,6 +2072,41 @@ func (x *GetSessionsRequest) GetProtocol() string {
 		return x.Protocol
 	}
 	return ""
+}
+
+func (x *GetSessionsRequest) GetSourcePrefix() string {
+	if x != nil {
+		return x.SourcePrefix
+	}
+	return ""
+}
+
+func (x *GetSessionsRequest) GetDestinationPrefix() string {
+	if x != nil {
+		return x.DestinationPrefix
+	}
+	return ""
+}
+
+func (x *GetSessionsRequest) GetSourcePort() uint32 {
+	if x != nil {
+		return x.SourcePort
+	}
+	return 0
+}
+
+func (x *GetSessionsRequest) GetDestinationPort() uint32 {
+	if x != nil {
+		return x.DestinationPort
+	}
+	return 0
+}
+
+func (x *GetSessionsRequest) GetNatOnly() bool {
+	if x != nil {
+		return x.NatOnly
+	}
+	return false
 }
 
 type GetSessionsResponse struct {
@@ -5768,12 +5808,18 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x05count\x18\a \x01(\bR\x05count\x12\x1f\n" +
 	"\vhit_packets\x18\b \x01(\x04R\n" +
 	"hitPackets\x12\x1b\n" +
-	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\"r\n" +
+	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\"\xad\x02\n" +
 	"\x12GetSessionsRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x05R\x06offset\x12\x12\n" +
 	"\x04zone\x18\x03 \x01(\rR\x04zone\x12\x1a\n" +
-	"\bprotocol\x18\x04 \x01(\tR\bprotocol\"\x8d\x01\n" +
+	"\bprotocol\x18\x04 \x01(\tR\bprotocol\x12#\n" +
+	"\rsource_prefix\x18\x05 \x01(\tR\fsourcePrefix\x12-\n" +
+	"\x12destination_prefix\x18\x06 \x01(\tR\x11destinationPrefix\x12\x1f\n" +
+	"\vsource_port\x18\a \x01(\rR\n" +
+	"sourcePort\x12)\n" +
+	"\x10destination_port\x18\b \x01(\rR\x0fdestinationPort\x12\x19\n" +
+	"\bnat_only\x18\t \x01(\bR\anatOnly\"\x8d\x01\n" +
 	"\x13GetSessionsResponse\x12\x14\n" +
 	"\x05total\x18\x01 \x01(\x05R\x05total\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x16\n" +
