@@ -503,6 +503,20 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					slog.Info("disabled VLAN RX offload for XDP", "interface", physName)
 				}
 
+				// Apply interface-level MTU from config
+				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg.MTU > 0 {
+					if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
+						if nl.Attrs().MTU != ifCfg.MTU {
+							if err := netlink.LinkSetMTU(nl, ifCfg.MTU); err != nil {
+								slog.Warn("failed to set MTU",
+									"name", physName, "mtu", ifCfg.MTU, "err", err)
+							} else {
+								slog.Info("set interface MTU", "name", physName, "mtu", ifCfg.MTU)
+							}
+						}
+					}
+				}
+
 				// Bring the interface UP so XDP can process traffic
 				if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
 					if err := netlink.LinkSetUp(nl); err != nil {

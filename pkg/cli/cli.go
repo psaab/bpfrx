@@ -205,13 +205,14 @@ var operationalTree = map[string]*completionNode{
 			"rollback": {desc: "Show rollback history", children: map[string]*completionNode{
 				"compare": {desc: "Compare rollback with active config"},
 			}},
+			"license":     {desc: "Show system license"},
+			"memory":      {desc: "Show memory usage"},
+			"ntp":         {desc: "Show NTP server status"},
+			"processes":   {desc: "Show running processes"},
 			"services":    {desc: "Show configured system services"},
 			"storage":     {desc: "Show filesystem usage"},
 			"uptime":      {desc: "Show system uptime"},
-			"memory":      {desc: "Show memory usage"},
-			"processes":   {desc: "Show running processes"},
 			"users":       {desc: "Show configured login users"},
-			"license":     {desc: "Show system license"},
 		}},
 	}},
 	"clear": {desc: "Clear information", children: map[string]*completionNode{
@@ -950,6 +951,18 @@ func (c *CLI) handleShow(args []string) error {
 	case "ipv6":
 		return c.handleShowIPv6(args[1:])
 
+	case "policy-options":
+		return c.showPolicyOptions()
+
+	case "event-options":
+		return c.showEventOptions()
+
+	case "routing-options":
+		return c.showRoutingOptions()
+
+	case "forwarding-options":
+		return c.showForwardingOptions()
+
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
 	}
@@ -1036,6 +1049,33 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					fmt.Printf("    Output: %d packets, %d bytes\n",
 						egress.Packets, egress.Bytes)
 				}
+			}
+
+			// Show policies that reference this zone
+			var policyRefs []string
+			for _, zpp := range cfg.Security.Policies {
+				if zpp.FromZone == name || zpp.ToZone == name {
+					dir := "from"
+					peer := zpp.ToZone
+					if zpp.ToZone == name {
+						dir = "to"
+						peer = zpp.FromZone
+					}
+					policyRefs = append(policyRefs, fmt.Sprintf("%s %s (%d rules)", dir, peer, len(zpp.Policies)))
+				}
+			}
+			if len(policyRefs) > 0 {
+				fmt.Printf("  Policies: %s\n", strings.Join(policyRefs, ", "))
+			}
+
+			// Show address book entries (global)
+			if ab := cfg.Security.AddressBook; ab != nil && len(ab.Addresses) > 0 {
+				addrNames := make([]string, 0, len(ab.Addresses))
+				for an := range ab.Addresses {
+					addrNames = append(addrNames, an)
+				}
+				sort.Strings(addrNames)
+				fmt.Printf("  Address book: %s\n", strings.Join(addrNames, ", "))
 			}
 
 			fmt.Println()
@@ -3591,6 +3631,7 @@ func (c *CLI) handleShowSystem(args []string) error {
 		fmt.Println("  connections      Show TCP connections")
 		fmt.Println("  license          Show system license")
 		fmt.Println("  memory           Show memory usage")
+		fmt.Println("  ntp              Show NTP server status")
 		fmt.Println("  processes        Show running processes")
 		fmt.Println("  rollback         Show rollback history")
 		fmt.Println("  services         Show configured system services")
@@ -3706,12 +3747,46 @@ func (c *CLI) handleShowSystem(args []string) error {
 		fmt.Println("License: open-source (no license required)")
 		return nil
 
+	case "ntp":
+		return c.showSystemNTP()
+
 	case "services":
 		return c.showSystemServices()
 
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])
 	}
+}
+
+// showSystemNTP displays NTP server configuration and sync status.
+func (c *CLI) showSystemNTP() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	if len(cfg.System.NTPServers) == 0 {
+		fmt.Println("No NTP servers configured")
+		return nil
+	}
+
+	fmt.Println("NTP servers:")
+	for _, server := range cfg.System.NTPServers {
+		fmt.Printf("  %s\n", server)
+	}
+
+	// Try to get chrony/ntpd status via chronyc or ntpq
+	if out, err := exec.Command("chronyc", "-n", "sources").CombinedOutput(); err == nil {
+		fmt.Printf("\nChrony sources:\n%s\n", string(out))
+	} else if out, err := exec.Command("ntpq", "-p").CombinedOutput(); err == nil {
+		fmt.Printf("\nNTP peers:\n%s\n", string(out))
+	} else if out, err := exec.Command("timedatectl", "show", "--property=NTPSynchronized", "--value").CombinedOutput(); err == nil {
+		synced := strings.TrimSpace(string(out))
+		fmt.Printf("\nNTP synchronized: %s\n", synced)
+	}
+
+	return nil
 }
 
 // showSystemServices displays configured system services.
@@ -5598,6 +5673,255 @@ func (c *CLI) showChassisHardware() error {
 			driver := link.Type()
 			fmt.Printf("  %-16s %-8s %-10s %s\n", attrs.Name, state, driver, attrs.HardwareAddr)
 		}
+	}
+	return nil
+}
+
+// showPolicyOptions displays prefix-lists and policy-statements.
+func (c *CLI) showPolicyOptions() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+	po := &cfg.PolicyOptions
+
+	if len(po.PrefixLists) > 0 {
+		fmt.Println("Prefix lists:")
+		for name, pl := range po.PrefixLists {
+			fmt.Printf("  %-30s %d prefixes\n", name, len(pl.Prefixes))
+			for _, p := range pl.Prefixes {
+				fmt.Printf("    %s\n", p)
+			}
+		}
+	}
+
+	if len(po.PolicyStatements) > 0 {
+		if len(po.PrefixLists) > 0 {
+			fmt.Println()
+		}
+		fmt.Println("Policy statements:")
+		for name, ps := range po.PolicyStatements {
+			fmt.Printf("  %s", name)
+			if ps.DefaultAction != "" {
+				fmt.Printf(" (default: %s)", ps.DefaultAction)
+			}
+			fmt.Println()
+			for _, t := range ps.Terms {
+				fmt.Printf("    term %s:", t.Name)
+				if t.FromProtocol != "" {
+					fmt.Printf(" from protocol %s", t.FromProtocol)
+				}
+				if t.PrefixList != "" {
+					fmt.Printf(" prefix-list %s", t.PrefixList)
+				}
+				if len(t.RouteFilters) > 0 {
+					fmt.Printf(" %d route-filter(s)", len(t.RouteFilters))
+				}
+				if t.Action != "" {
+					fmt.Printf(" then %s", t.Action)
+				}
+				if t.LoadBalance != "" {
+					fmt.Printf(" load-balance %s", t.LoadBalance)
+				}
+				fmt.Println()
+			}
+		}
+	}
+
+	if len(po.PrefixLists) == 0 && len(po.PolicyStatements) == 0 {
+		fmt.Println("No policy-options configured")
+	}
+	return nil
+}
+
+// showEventOptions displays event-driven policies.
+func (c *CLI) showEventOptions() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+	if len(cfg.EventOptions) == 0 {
+		fmt.Println("No event-options configured")
+		return nil
+	}
+
+	for _, ep := range cfg.EventOptions {
+		fmt.Printf("Policy: %s\n", ep.Name)
+		if len(ep.Events) > 0 {
+			fmt.Printf("  Events: %s\n", strings.Join(ep.Events, ", "))
+		}
+		for _, w := range ep.WithinClauses {
+			fmt.Printf("  Within: %d seconds", w.Seconds)
+			if w.TriggerOn > 0 {
+				fmt.Printf(", trigger on %d", w.TriggerOn)
+			}
+			if w.TriggerUntil > 0 {
+				fmt.Printf(", trigger until %d", w.TriggerUntil)
+			}
+			fmt.Println()
+		}
+		if len(ep.AttributesMatch) > 0 {
+			fmt.Println("  Attributes match:")
+			for _, am := range ep.AttributesMatch {
+				fmt.Printf("    %s\n", am)
+			}
+		}
+		if len(ep.ThenCommands) > 0 {
+			fmt.Println("  Then commands:")
+			for _, cmd := range ep.ThenCommands {
+				fmt.Printf("    %s\n", cmd)
+			}
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+// showRoutingOptions displays static routes and routing config.
+func (c *CLI) showRoutingOptions() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+	ro := &cfg.RoutingOptions
+	hasContent := false
+
+	if ro.AutonomousSystem > 0 {
+		fmt.Printf("Autonomous system: %d\n\n", ro.AutonomousSystem)
+		hasContent = true
+	}
+
+	if ro.ForwardingTableExport != "" {
+		fmt.Printf("Forwarding-table export: %s\n\n", ro.ForwardingTableExport)
+		hasContent = true
+	}
+
+	if len(ro.StaticRoutes) > 0 {
+		fmt.Println("Static routes (inet.0):")
+		fmt.Printf("  %-24s %-20s %-6s %s\n", "Destination", "Next-Hop", "Pref", "Flags")
+		for _, sr := range ro.StaticRoutes {
+			if sr.Discard {
+				fmt.Printf("  %-24s %-20s %-6s %s\n", sr.Destination, "discard", fmtPref(sr.Preference), "")
+				continue
+			}
+			for i, nh := range sr.NextHops {
+				dest := sr.Destination
+				if i > 0 {
+					dest = "" // don't repeat destination for ECMP entries
+				}
+				nhStr := nh.Address
+				if nh.Interface != "" {
+					nhStr += " via " + nh.Interface
+				}
+				fmt.Printf("  %-24s %-20s %-6s %s\n", dest, nhStr, fmtPref(sr.Preference), "")
+			}
+		}
+		fmt.Println()
+		hasContent = true
+	}
+
+	if len(ro.Inet6StaticRoutes) > 0 {
+		fmt.Println("Static routes (inet6.0):")
+		fmt.Printf("  %-40s %-30s %-6s\n", "Destination", "Next-Hop", "Pref")
+		for _, sr := range ro.Inet6StaticRoutes {
+			if sr.Discard {
+				fmt.Printf("  %-40s %-30s %-6s\n", sr.Destination, "discard", fmtPref(sr.Preference))
+				continue
+			}
+			for i, nh := range sr.NextHops {
+				dest := sr.Destination
+				if i > 0 {
+					dest = ""
+				}
+				nhStr := nh.Address
+				if nh.Interface != "" {
+					nhStr += " via " + nh.Interface
+				}
+				fmt.Printf("  %-40s %-30s %-6s\n", dest, nhStr, fmtPref(sr.Preference))
+			}
+		}
+		fmt.Println()
+		hasContent = true
+	}
+
+	if len(ro.RibGroups) > 0 {
+		fmt.Println("RIB groups:")
+		for name, rg := range ro.RibGroups {
+			fmt.Printf("  %-20s import-rib: %s\n", name, strings.Join(rg.ImportRibs, ", "))
+		}
+		fmt.Println()
+		hasContent = true
+	}
+
+	if !hasContent {
+		fmt.Println("No routing-options configured")
+	}
+	return nil
+}
+
+func fmtPref(p int) string {
+	if p == 0 {
+		return "-"
+	}
+	return strconv.Itoa(p)
+}
+
+// showForwardingOptions displays forwarding/sampling configuration.
+func (c *CLI) showForwardingOptions() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+	fo := &cfg.ForwardingOptions
+	hasContent := false
+
+	if fo.FamilyInet6Mode != "" {
+		fmt.Printf("Family inet6 mode: %s\n", fo.FamilyInet6Mode)
+		hasContent = true
+	}
+
+	if fo.Sampling != nil && len(fo.Sampling.Instances) > 0 {
+		fmt.Println("Sampling:")
+		for name, inst := range fo.Sampling.Instances {
+			fmt.Printf("  Instance: %s\n", name)
+			if inst.InputRate > 0 {
+				fmt.Printf("    Input rate: 1/%d\n", inst.InputRate)
+			}
+			for _, fam := range []*config.SamplingFamily{inst.FamilyInet, inst.FamilyInet6} {
+				if fam == nil {
+					continue
+				}
+				for _, fs := range fam.FlowServers {
+					fmt.Printf("    Flow server: %s:%d\n", fs.Address, fs.Port)
+					if fs.Version9Template != "" {
+						fmt.Printf("      Version 9 template: %s\n", fs.Version9Template)
+					}
+				}
+				if fam.SourceAddress != "" {
+					fmt.Printf("    Source address: %s\n", fam.SourceAddress)
+				}
+				if fam.InlineJflow {
+					fmt.Printf("    Inline jflow: enabled\n")
+				}
+				if fam.InlineJflowSourceAddress != "" {
+					fmt.Printf("    Inline jflow source: %s\n", fam.InlineJflowSourceAddress)
+				}
+			}
+		}
+		hasContent = true
+	}
+
+	if fo.DHCPRelay != nil {
+		fmt.Println("DHCP relay: (see 'show dhcp-relay' for details)")
+		hasContent = true
+	}
+
+	if !hasContent {
+		fmt.Println("No forwarding-options configured")
 	}
 	return nil
 }

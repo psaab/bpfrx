@@ -379,6 +379,10 @@ func (c *ctl) handleShow(args []string) error {
 		fmt.Println("  interfaces       Show interface status")
 		fmt.Println("  protocols        Show protocol information")
 		fmt.Println("  system           Show system information")
+		fmt.Println("  policy-options   Show prefix-lists and policy-statements")
+		fmt.Println("  event-options    Show event-driven policies")
+		fmt.Println("  routing-options  Show static routes and routing config")
+		fmt.Println("  forwarding-options Show forwarding/sampling config")
 		fmt.Println("  version          Show software version")
 		return nil
 	}
@@ -492,6 +496,18 @@ func (c *ctl) handleShow(args []string) error {
 		fmt.Println("show ipv6:")
 		fmt.Println("  neighbors        Show IPv6 neighbor cache")
 		return nil
+
+	case "policy-options":
+		return c.showText("policy-options")
+
+	case "event-options":
+		return c.showText("event-options")
+
+	case "routing-options":
+		return c.showText("routing-options")
+
+	case "forwarding-options":
+		return c.showText("forwarding-options")
 
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
@@ -1212,13 +1228,14 @@ func (c *ctl) handleShowSystem(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("show system:")
 		fmt.Println("  alarms           Show system alarms")
+		fmt.Println("  license          Show system license")
+		fmt.Println("  memory           Show memory usage")
+		fmt.Println("  ntp              Show NTP server status")
+		fmt.Println("  processes        Show running processes")
 		fmt.Println("  rollback         Show rollback history")
 		fmt.Println("  services         Show configured system services")
 		fmt.Println("  storage          Show filesystem usage")
 		fmt.Println("  uptime           Show system uptime")
-		fmt.Println("  memory           Show memory usage")
-		fmt.Println("  processes        Show running processes")
-		fmt.Println("  license          Show system license")
 		return nil
 	}
 
@@ -1319,6 +1336,9 @@ func (c *ctl) handleShowSystem(args []string) error {
 
 	case "services":
 		return c.showText("system-services")
+
+	case "ntp":
+		return c.showText("ntp")
 
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])

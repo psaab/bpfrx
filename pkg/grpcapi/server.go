@@ -2950,12 +2950,40 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.Version9 != nil {
 			fmt.Fprintf(&buf, "  NetFlow v9:     %d template(s)\n", len(cfg.Services.FlowMonitoring.Version9.Templates))
 		}
+		if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.VersionIPFIX != nil {
+			fmt.Fprintf(&buf, "  IPFIX:          %d template(s)\n", len(cfg.Services.FlowMonitoring.VersionIPFIX.Templates))
+		}
+		if cfg.Services.ApplicationIdentification {
+			fmt.Fprintln(&buf, "  AppID:          enabled")
+		}
 		if cfg.Services.RPM != nil && len(cfg.Services.RPM.Probes) > 0 {
 			total := 0
 			for _, probe := range cfg.Services.RPM.Probes {
 				total += len(probe.Tests)
 			}
 			fmt.Fprintf(&buf, "  RPM probes:     %d probe(s), %d test(s)\n", len(cfg.Services.RPM.Probes), total)
+		}
+
+	case "ntp":
+		cfg := s.store.ActiveConfig()
+		if cfg == nil {
+			fmt.Fprintln(&buf, "No active configuration")
+			break
+		}
+		if len(cfg.System.NTPServers) == 0 {
+			fmt.Fprintln(&buf, "No NTP servers configured")
+			break
+		}
+		fmt.Fprintln(&buf, "NTP servers:")
+		for _, server := range cfg.System.NTPServers {
+			fmt.Fprintf(&buf, "  %s\n", server)
+		}
+		if out, err := exec.Command("chronyc", "-n", "sources").CombinedOutput(); err == nil {
+			fmt.Fprintf(&buf, "\nChrony sources:\n%s\n", string(out))
+		} else if out, err := exec.Command("ntpq", "-p").CombinedOutput(); err == nil {
+			fmt.Fprintf(&buf, "\nNTP peers:\n%s\n", string(out))
+		} else if out, err := exec.Command("timedatectl", "show", "--property=NTPSynchronized", "--value").CombinedOutput(); err == nil {
+			fmt.Fprintf(&buf, "\nNTP synchronized: %s\n", strings.TrimSpace(string(out)))
 		}
 
 	default:
