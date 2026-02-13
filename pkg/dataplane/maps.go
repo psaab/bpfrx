@@ -512,11 +512,12 @@ func (m *Manager) SetFlowTimeout(idx, seconds uint32) error {
 
 // FlowConfigValue mirrors struct flow_config in bpfrx_common.h.
 type FlowConfigValue struct {
-	TCPMSSIPsec      uint16
-	TCPMSSGre        uint16
-	AllowDNSReply    uint8
+	TCPMSSIPsec       uint16
+	TCPMSSGre         uint16
+	AllowDNSReply     uint8
 	AllowEmbeddedICMP uint8
-	Pad              [2]uint8
+	GREAccel          uint8
+	ALGFlags          uint8 // bit 0: DNS disable, bit 1: FTP disable, bit 2: SIP disable, bit 3: TFTP disable
 }
 
 // SetFlowConfig writes the global flow configuration (TCP MSS clamp, etc.).
