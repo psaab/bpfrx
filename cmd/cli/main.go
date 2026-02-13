@@ -1246,6 +1246,7 @@ func (c *ctl) handleShowSystem(args []string) error {
 		fmt.Println("  ntp              Show NTP server status")
 		fmt.Println("  processes        Show running processes")
 		fmt.Println("  rollback         Show rollback history")
+		fmt.Println("  login            Show configured login users")
 		fmt.Println("  services         Show configured system services")
 		fmt.Println("  storage          Show filesystem usage")
 		fmt.Println("  syslog           Show system syslog configuration")
@@ -1353,6 +1354,9 @@ func (c *ctl) handleShowSystem(args []string) error {
 
 	case "ntp":
 		return c.showText("ntp")
+
+	case "login":
+		return c.showText("login")
 
 	case "syslog":
 		return c.showText("system-syslog")

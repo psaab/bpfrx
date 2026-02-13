@@ -596,9 +596,10 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	d.applySystemDNS(cfg)
 	d.applySystemNTP(cfg)
 
-	// 9.5. Apply system hostname and timezone
+	// 9.5. Apply system hostname, timezone, and kernel tuning
 	d.applyHostname(cfg)
 	d.applyTimezone(cfg)
+	d.applyKernelTuning(cfg)
 
 	// 9.6. Write SSH known hosts file
 	d.applySSHKnownHosts(cfg)
@@ -1156,6 +1157,41 @@ func (d *Daemon) applySystemNTP(cfg *config.Config) {
 	// Restart timesyncd to pick up new servers
 	exec.Command("systemctl", "restart", "systemd-timesyncd").Run()
 	slog.Info("NTP config applied", "servers", cfg.System.NTPServers)
+}
+
+// applyKernelTuning sets kernel sysctl parameters from config.
+// Handles system { no-redirects } and system { internet-options }.
+func (d *Daemon) applyKernelTuning(cfg *config.Config) {
+	// Disable ICMP redirects (send + accept) on all interfaces
+	// system { no-redirects; }
+	if cfg.System.NoRedirects {
+		sysctls := []string{
+			"/proc/sys/net/ipv4/conf/all/send_redirects",
+			"/proc/sys/net/ipv4/conf/all/accept_redirects",
+			"/proc/sys/net/ipv6/conf/all/accept_redirects",
+		}
+		for _, path := range sysctls {
+			current, _ := os.ReadFile(path)
+			if strings.TrimSpace(string(current)) != "0" {
+				if err := os.WriteFile(path, []byte("0\n"), 0644); err != nil {
+					slog.Warn("failed to set sysctl", "path", path, "err", err)
+				}
+			}
+		}
+	}
+
+	// Enable IP forwarding (required for firewall operation)
+	for _, path := range []string{
+		"/proc/sys/net/ipv4/ip_forward",
+		"/proc/sys/net/ipv6/conf/all/forwarding",
+	} {
+		current, _ := os.ReadFile(path)
+		if strings.TrimSpace(string(current)) != "1" {
+			if err := os.WriteFile(path, []byte("1\n"), 0644); err != nil {
+				slog.Warn("failed to enable forwarding", "path", path, "err", err)
+			}
+		}
+	}
 }
 
 // applySSHKnownHosts writes /etc/ssh/ssh_known_hosts from

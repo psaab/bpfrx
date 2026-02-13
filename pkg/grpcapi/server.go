@@ -3228,6 +3228,25 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			}
 		}
 
+	case "login":
+		if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Users) == 0 {
+			buf.WriteString("No login users configured\n")
+		} else {
+			fmt.Fprintf(&buf, "%-16s %-6s %-14s %s\n", "User", "UID", "Class", "SSH Keys")
+			for _, u := range cfg.System.Login.Users {
+				uid := "-"
+				if u.UID > 0 {
+					uid = strconv.Itoa(u.UID)
+				}
+				class := u.Class
+				if class == "" {
+					class = "-"
+				}
+				keys := strconv.Itoa(len(u.SSHKeys))
+				fmt.Fprintf(&buf, "%-16s %-6s %-14s %s\n", u.Name, uid, class, keys)
+			}
+		}
+
 	case "screen":
 		if cfg == nil || len(cfg.Security.Screen) == 0 {
 			buf.WriteString("No screen profiles configured\n")
