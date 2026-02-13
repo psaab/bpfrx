@@ -691,6 +691,23 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 			ifc.Description = nodeVal(descNode)
 		}
 
+		// Interface-level MTU
+		if mtuNode := child.FindChild("mtu"); mtuNode != nil {
+			if v := nodeVal(mtuNode); v != "" {
+				if n, err := strconv.Atoi(v); err == nil {
+					ifc.MTU = n
+				}
+			}
+		}
+
+		// Speed and duplex (ether-options or gigether-options)
+		if speedNode := child.FindChild("speed"); speedNode != nil {
+			ifc.Speed = nodeVal(speedNode)
+		}
+		if child.FindChild("disable") != nil {
+			ifc.Disable = true
+		}
+
 		// Check for vlan-tagging flag
 		if child.FindChild("vlan-tagging") != nil {
 			ifc.VlanTagging = true
@@ -3330,6 +3347,9 @@ func compileServices(node *Node, svc *ServicesConfig) error {
 			return err
 		}
 	}
+	if node.FindChild("application-identification") != nil {
+		svc.ApplicationIdentification = true
+	}
 	return nil
 }
 
@@ -3403,52 +3423,97 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 }
 
 func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
-	v9Node := node.FindChild("version9")
-	if v9Node == nil {
-		return nil
-	}
+	fm := &FlowMonitoringConfig{}
 
-	v9cfg := &NetFlowV9Config{
-		Templates: make(map[string]*NetFlowV9Template),
-	}
-
-	for _, tmplInst := range namedInstances(v9Node.FindChildren("template")) {
-		tmpl := &NetFlowV9Template{Name: tmplInst.name}
-
-		for _, prop := range tmplInst.node.Children {
-			switch prop.Name() {
-			case "flow-active-timeout":
-				if v := nodeVal(prop); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
-						tmpl.FlowActiveTimeout = n
+	if v9Node := node.FindChild("version9"); v9Node != nil {
+		v9cfg := &NetFlowV9Config{
+			Templates: make(map[string]*NetFlowV9Template),
+		}
+		for _, tmplInst := range namedInstances(v9Node.FindChildren("template")) {
+			tmpl := &NetFlowV9Template{Name: tmplInst.name}
+			for _, prop := range tmplInst.node.Children {
+				switch prop.Name() {
+				case "flow-active-timeout":
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							tmpl.FlowActiveTimeout = n
+						}
 					}
-				}
-			case "flow-inactive-timeout":
-				if v := nodeVal(prop); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
-						tmpl.FlowInactiveTimeout = n
+				case "flow-inactive-timeout":
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							tmpl.FlowInactiveTimeout = n
+						}
 					}
-				}
-			case "template-refresh-rate":
-				if v := nodeVal(prop); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
-						tmpl.TemplateRefreshRate = n
-					}
-				}
-				if secNode := prop.FindChild("seconds"); secNode != nil {
-					if v := nodeVal(secNode); v != "" {
+				case "template-refresh-rate":
+					if v := nodeVal(prop); v != "" {
 						if n, err := strconv.Atoi(v); err == nil {
 							tmpl.TemplateRefreshRate = n
 						}
 					}
+					if secNode := prop.FindChild("seconds"); secNode != nil {
+						if v := nodeVal(secNode); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								tmpl.TemplateRefreshRate = n
+							}
+						}
+					}
 				}
 			}
+			v9cfg.Templates[tmpl.Name] = tmpl
 		}
-
-		v9cfg.Templates[tmpl.Name] = tmpl
+		fm.Version9 = v9cfg
 	}
 
-	svc.FlowMonitoring = &FlowMonitoringConfig{Version9: v9cfg}
+	if ipfixNode := node.FindChild("version-ipfix"); ipfixNode != nil {
+		ipfixCfg := &NetFlowIPFIXConfig{
+			Templates: make(map[string]*NetFlowIPFIXTemplate),
+		}
+		for _, tmplInst := range namedInstances(ipfixNode.FindChildren("template")) {
+			tmpl := &NetFlowIPFIXTemplate{Name: tmplInst.name}
+			for _, prop := range tmplInst.node.Children {
+				switch prop.Name() {
+				case "flow-active-timeout":
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							tmpl.FlowActiveTimeout = n
+						}
+					}
+				case "flow-inactive-timeout":
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							tmpl.FlowInactiveTimeout = n
+						}
+					}
+				case "template-refresh-rate":
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							tmpl.TemplateRefreshRate = n
+						}
+					}
+					if secNode := prop.FindChild("seconds"); secNode != nil {
+						if v := nodeVal(secNode); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								tmpl.TemplateRefreshRate = n
+							}
+						}
+					}
+				case "ipv4-template", "ipv6-template":
+					for _, child := range prop.Children {
+						if child.Name() == "export-extension" {
+							if v := nodeVal(child); v != "" {
+								tmpl.ExportExtensions = append(tmpl.ExportExtensions, v)
+							}
+						}
+					}
+				}
+			}
+			ipfixCfg.Templates[tmpl.Name] = tmpl
+		}
+		fm.VersionIPFIX = ipfixCfg
+	}
+
+	svc.FlowMonitoring = fm
 	return nil
 }
 
@@ -3464,6 +3529,15 @@ func compileForwardingOptions(node *Node, fo *ForwardingOptionsConfig) error {
 	if relayNode != nil {
 		if err := compileDHCPRelay(relayNode, fo); err != nil {
 			return err
+		}
+	}
+
+	// Parse family { inet6 { mode <flow-based|packet-based> } }
+	if famNode := node.FindChild("family"); famNode != nil {
+		if inet6Node := famNode.FindChild("inet6"); inet6Node != nil {
+			if modeNode := inet6Node.FindChild("mode"); modeNode != nil {
+				fo.FamilyInet6Mode = nodeVal(modeNode)
+			}
 		}
 	}
 

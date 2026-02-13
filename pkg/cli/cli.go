@@ -3784,6 +3784,14 @@ func (c *CLI) showSystemServices() error {
 	if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.Version9 != nil {
 		fmt.Printf("  NetFlow v9:     %d template(s)\n", len(cfg.Services.FlowMonitoring.Version9.Templates))
 	}
+	if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.VersionIPFIX != nil {
+		fmt.Printf("  IPFIX:          %d template(s)\n", len(cfg.Services.FlowMonitoring.VersionIPFIX.Templates))
+	}
+
+	// Application identification
+	if cfg.Services.ApplicationIdentification {
+		fmt.Println("  AppID:          enabled")
+	}
 
 	// RPM probes
 	if cfg.Services.RPM != nil && len(cfg.Services.RPM.Probes) > 0 {
@@ -4302,6 +4310,36 @@ func (c *CLI) showFlowMonitoring() error {
 				fmt.Printf("    Flow active timeout:   %d seconds\n", activeTimeout)
 				fmt.Printf("    Flow inactive timeout: %d seconds\n", inactiveTimeout)
 				fmt.Printf("    Template refresh rate: %d seconds\n", refreshRate)
+			}
+			fmt.Println()
+		}
+	}
+
+	if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.VersionIPFIX != nil {
+		ipfix := cfg.Services.FlowMonitoring.VersionIPFIX
+		if len(ipfix.Templates) > 0 {
+			hasConfig = true
+			fmt.Println("Flow Monitoring IPFIX Templates:")
+			for name, tmpl := range ipfix.Templates {
+				activeTimeout := tmpl.FlowActiveTimeout
+				if activeTimeout == 0 {
+					activeTimeout = 60
+				}
+				inactiveTimeout := tmpl.FlowInactiveTimeout
+				if inactiveTimeout == 0 {
+					inactiveTimeout = 15
+				}
+				refreshRate := tmpl.TemplateRefreshRate
+				if refreshRate == 0 {
+					refreshRate = 60
+				}
+				fmt.Printf("  Template: %s\n", name)
+				fmt.Printf("    Flow active timeout:   %d seconds\n", activeTimeout)
+				fmt.Printf("    Flow inactive timeout: %d seconds\n", inactiveTimeout)
+				fmt.Printf("    Template refresh rate: %d seconds\n", refreshRate)
+				if len(tmpl.ExportExtensions) > 0 {
+					fmt.Printf("    Export extensions:     %s\n", strings.Join(tmpl.ExportExtensions, ", "))
+				}
 			}
 			fmt.Println()
 		}

@@ -354,6 +354,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	}},
 	"interfaces": {wildcard: &schemaNode{valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 		"description":  {args: 1, children: nil},
+		"mtu":          {args: 1, children: nil},
+		"speed":        {args: 1, children: nil},
+		"disable":      {children: nil},
 		"vlan-tagging": {children: nil},
 		"gigether-options": {children: map[string]*schemaNode{
 			"redundant-parent": {args: 1, children: nil},
@@ -727,14 +730,37 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"flow-monitoring": {children: map[string]*schemaNode{
 			"version9": {children: map[string]*schemaNode{
 				"template": {args: 1, children: map[string]*schemaNode{
+					"flow-active-timeout":  {args: 1, children: nil},
+					"flow-inactive-timeout": {args: 1, children: nil},
 					"template-refresh-rate": {children: map[string]*schemaNode{
 						"seconds": {args: 1, children: nil},
 					}},
 				}},
 			}},
+			"version-ipfix": {children: map[string]*schemaNode{
+				"template": {args: 1, children: map[string]*schemaNode{
+					"flow-active-timeout":  {args: 1, children: nil},
+					"flow-inactive-timeout": {args: 1, children: nil},
+					"template-refresh-rate": {children: map[string]*schemaNode{
+						"seconds": {args: 1, children: nil},
+					}},
+					"ipv4-template": {children: map[string]*schemaNode{
+						"export-extension": {args: 1, children: nil},
+					}},
+					"ipv6-template": {children: map[string]*schemaNode{
+						"export-extension": {args: 1, children: nil},
+					}},
+				}},
+			}},
 		}},
+		"application-identification": {children: nil},
 	}},
 	"forwarding-options": {children: map[string]*schemaNode{
+		"family": {children: map[string]*schemaNode{
+			"inet6": {children: map[string]*schemaNode{
+				"mode": {args: 1, children: nil},
+			}},
+		}},
 		"sampling": {children: map[string]*schemaNode{
 			"instance": {args: 1, children: map[string]*schemaNode{
 				"input": {children: nil},
