@@ -657,6 +657,7 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 				// Collect addresses from all units
 				var addrs []string
 				var dhcpv4, dhcpv6, dadDisable bool
+				unitMTU := 0
 				for _, unit := range ifCfg.Units {
 					addrs = append(addrs, unit.Addresses...)
 					if unit.DHCP {
@@ -668,6 +669,14 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					if unit.DADDisable {
 						dadDisable = true
 					}
+					if unit.MTU > 0 && (unitMTU == 0 || unit.MTU < unitMTU) {
+						unitMTU = unit.MTU
+					}
+				}
+				// Unit-level MTU (family inet/inet6) overrides interface-level MTU
+				mtu := ifCfg.MTU
+				if unitMTU > 0 && (mtu == 0 || unitMTU < mtu) {
+					mtu = unitMTU
 				}
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 					Name:        ifName,
@@ -679,7 +688,7 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					DADDisable:  dadDisable,
 					Speed:       ifCfg.Speed,
 					Duplex:      ifCfg.Duplex,
-					MTU:         ifCfg.MTU,
+					MTU:         mtu,
 					Description: ifCfg.Description,
 				})
 			}
@@ -2451,26 +2460,33 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		base.ICMPCode = uint8(term.ICMPCode)
 	}
 
-	// Expand prefix list references into address lists
+	// Expand prefix list references into address lists.
+	// "except" prefix lists require BPF-side FILTER_MATCH_SRC_NEGATE / DST_NEGATE
+	// support (not yet implemented in BPF C); for now they are skipped with a warning.
 	srcAddrs := append([]string{}, term.SourceAddresses...)
 	for _, ref := range term.SourcePrefixLists {
-		if !ref.Except {
-			if pl, ok := prefixLists[ref.Name]; ok {
-				srcAddrs = append(srcAddrs, pl.Prefixes...)
-			} else {
-				slog.Warn("prefix-list not found", "name", ref.Name, "term", term.Name)
-			}
+		if ref.Except {
+			slog.Warn("source-prefix-list except not yet supported in BPF, skipping",
+				"name", ref.Name, "term", term.Name)
+			continue
 		}
-		// "except" prefix lists are not supported in BPF (would need negative matching)
+		if pl, ok := prefixLists[ref.Name]; ok {
+			srcAddrs = append(srcAddrs, pl.Prefixes...)
+		} else {
+			slog.Warn("prefix-list not found", "name", ref.Name, "term", term.Name)
+		}
 	}
 	dstAddrs := append([]string{}, term.DestAddresses...)
 	for _, ref := range term.DestPrefixLists {
-		if !ref.Except {
-			if pl, ok := prefixLists[ref.Name]; ok {
-				dstAddrs = append(dstAddrs, pl.Prefixes...)
-			} else {
-				slog.Warn("prefix-list not found", "name", ref.Name, "term", term.Name)
-			}
+		if ref.Except {
+			slog.Warn("destination-prefix-list except not yet supported in BPF, skipping",
+				"name", ref.Name, "term", term.Name)
+			continue
+		}
+		if pl, ok := prefixLists[ref.Name]; ok {
+			dstAddrs = append(dstAddrs, pl.Prefixes...)
+		} else {
+			slog.Warn("prefix-list not found", "name", ref.Name, "term", term.Name)
 		}
 	}
 	if len(srcAddrs) == 0 {

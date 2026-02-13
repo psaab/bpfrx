@@ -622,14 +622,16 @@ type FilterRule struct {
 
 // Filter match flag constants.
 const (
-	FilterMatchDSCP     = 1 << 0
-	FilterMatchProtocol = 1 << 1
-	FilterMatchSrcAddr  = 1 << 2
-	FilterMatchDstAddr  = 1 << 3
-	FilterMatchDstPort  = 1 << 4
-	FilterMatchICMPType = 1 << 5
-	FilterMatchICMPCode = 1 << 6
-	FilterMatchSrcPort  = 1 << 7
+	FilterMatchDSCP       = 1 << 0
+	FilterMatchProtocol   = 1 << 1
+	FilterMatchSrcAddr    = 1 << 2
+	FilterMatchDstAddr    = 1 << 3
+	FilterMatchDstPort    = 1 << 4
+	FilterMatchICMPType   = 1 << 5
+	FilterMatchICMPCode   = 1 << 6
+	FilterMatchSrcPort    = 1 << 7
+	FilterMatchSrcNegate  = 1 << 8 // negate source address match (prefix-list except)
+	FilterMatchDstNegate  = 1 << 9 // negate destination address match (prefix-list except)
 )
 
 // Filter action constants.

@@ -72,9 +72,13 @@ func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsC
 				if fs.Port > 0 {
 					addr = fmt.Sprintf("%s:%d", fs.Address, fs.Port)
 				}
+				srcAddr := fam.SourceAddress
+				if srcAddr == "" {
+					srcAddr = fam.InlineJflowSourceAddress
+				}
 				ec.Collectors = append(ec.Collectors, CollectorConfig{
 					Address:       addr,
-					SourceAddress: fam.SourceAddress,
+					SourceAddress: srcAddr,
 				})
 			}
 		}

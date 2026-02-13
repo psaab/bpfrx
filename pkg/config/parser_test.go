@@ -678,6 +678,64 @@ security {
 	}
 }
 
+func TestNestedApplicationSet(t *testing.T) {
+	input := `applications {
+    application app-a {
+        protocol tcp;
+        destination-port 80;
+    }
+    application app-b {
+        protocol tcp;
+        destination-port 443;
+    }
+    application app-c {
+        protocol udp;
+        destination-port 53;
+    }
+    application-set inner-set {
+        application app-a;
+        application app-b;
+    }
+    application-set outer-set {
+        application inner-set;
+        application app-c;
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	// outer-set should expand to [app-a, app-b, app-c] (deduped, recursive)
+	expanded, err := ExpandApplicationSet("outer-set", &cfg.Applications)
+	if err != nil {
+		t.Fatalf("expand error: %v", err)
+	}
+	if len(expanded) != 3 {
+		t.Fatalf("expected 3 expanded apps, got %d: %v", len(expanded), expanded)
+	}
+	want := map[string]bool{"app-a": true, "app-b": true, "app-c": true}
+	for _, a := range expanded {
+		if !want[a] {
+			t.Errorf("unexpected expanded app: %q", a)
+		}
+	}
+
+	// inner-set should expand to just [app-a, app-b]
+	inner, err := ExpandApplicationSet("inner-set", &cfg.Applications)
+	if err != nil {
+		t.Fatalf("inner expand error: %v", err)
+	}
+	if len(inner) != 2 {
+		t.Fatalf("inner: expected 2 apps, got %d: %v", len(inner), inner)
+	}
+}
+
 func TestRoutingConfigParsing(t *testing.T) {
 	tree := &ConfigTree{}
 
@@ -2018,6 +2076,115 @@ firewall {
 	}
 	if !term.Log {
 		t.Error("log should be set")
+	}
+}
+
+func TestFirewallPrefixListSetSyntax(t *testing.T) {
+	tree := &ConfigTree{}
+	cmds := []string{
+		"set policy-options prefix-list mgmt-hosts 10.0.0.0/8",
+		"set policy-options prefix-list mgmt-hosts 172.16.0.0/12",
+		"set firewall family inet filter filter-mgmt term block from source-prefix-list mgmt-hosts except",
+		"set firewall family inet filter filter-mgmt term block from protocol tcp",
+		"set firewall family inet filter filter-mgmt term block from destination-port 22",
+		"set firewall family inet filter filter-mgmt term block then reject",
+		"set firewall family inet filter filter-mgmt term allow then accept",
+	}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	// Verify prefix-list
+	pl := cfg.PolicyOptions.PrefixLists["mgmt-hosts"]
+	if pl == nil {
+		t.Fatal("missing prefix-list mgmt-hosts")
+	}
+	if len(pl.Prefixes) != 2 {
+		t.Fatalf("expected 2 prefixes, got %d", len(pl.Prefixes))
+	}
+
+	// Verify filter term
+	f := cfg.Firewall.FiltersInet["filter-mgmt"]
+	if f == nil {
+		t.Fatal("missing filter filter-mgmt")
+	}
+	if len(f.Terms) != 2 {
+		t.Fatalf("expected 2 terms, got %d", len(f.Terms))
+	}
+	term := f.Terms[0]
+	if len(term.SourcePrefixLists) != 1 {
+		t.Fatalf("expected 1 source-prefix-list, got %d", len(term.SourcePrefixLists))
+	}
+	if term.SourcePrefixLists[0].Name != "mgmt-hosts" {
+		t.Errorf("prefix-list name = %q, want mgmt-hosts", term.SourcePrefixLists[0].Name)
+	}
+	if !term.SourcePrefixLists[0].Except {
+		t.Error("prefix-list should have except modifier")
+	}
+	if term.Protocol != "tcp" {
+		t.Errorf("protocol = %q, want tcp", term.Protocol)
+	}
+	if len(term.DestinationPorts) != 1 || term.DestinationPorts[0] != "22" {
+		t.Errorf("destination-port = %v, want [22]", term.DestinationPorts)
+	}
+	if term.Action != "reject" {
+		t.Errorf("action = %q, want reject", term.Action)
+	}
+}
+
+func TestFirewallDestPrefixListExcept(t *testing.T) {
+	input := `policy-options {
+    prefix-list blocked-nets {
+        192.168.0.0/16;
+    }
+}
+firewall {
+    family inet {
+        filter test-filter {
+            term deny-blocked {
+                from {
+                    destination-prefix-list {
+                        blocked-nets except;
+                    }
+                }
+                then accept;
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	f := cfg.Firewall.FiltersInet["test-filter"]
+	if f == nil {
+		t.Fatal("missing filter test-filter")
+	}
+	term := f.Terms[0]
+	if len(term.DestPrefixLists) != 1 {
+		t.Fatalf("expected 1 dest-prefix-list, got %d", len(term.DestPrefixLists))
+	}
+	if term.DestPrefixLists[0].Name != "blocked-nets" {
+		t.Errorf("dest prefix-list name = %q, want blocked-nets", term.DestPrefixLists[0].Name)
+	}
+	if !term.DestPrefixLists[0].Except {
+		t.Error("dest prefix-list should have except modifier")
 	}
 }
 

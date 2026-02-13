@@ -169,3 +169,23 @@ func TestWriteIfChanged(t *testing.T) {
 		t.Errorf("got %q, want %q", string(data), "content2")
 	}
 }
+
+func TestGenerateLink_MTU(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:       "trust0",
+		MACAddress: "52:54:00:aa:bb:cc",
+		MTU:        1400,
+	}
+	got := m.generateLink(ifc)
+	if !strings.Contains(got, "MTUBytes=1400\n") {
+		t.Error("missing MTUBytes=1400 in .link file")
+	}
+
+	// MTU=0 should not produce MTUBytes
+	ifc.MTU = 0
+	got = m.generateLink(ifc)
+	if strings.Contains(got, "MTUBytes") {
+		t.Error("MTU=0 should not produce MTUBytes line")
+	}
+}
