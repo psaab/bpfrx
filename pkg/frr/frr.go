@@ -348,10 +348,12 @@ func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string) st
 	// One line per next-hop → FRR creates ECMP.
 	var b strings.Builder
 	for _, nh := range sr.NextHops {
-		// Strip Junos unit suffix (e.g. "wan0.0" → "wan0") for FRR kernel names.
+		// Strip Junos default unit suffix ".0" (e.g. "wan0.0" → "wan0") for FRR
+		// kernel names. VLAN suffixes like ".50" in "wan0.50" are real kernel
+		// interface names and must NOT be stripped.
 		ifName := nh.Interface
-		if idx := strings.LastIndex(ifName, "."); idx > 0 {
-			ifName = ifName[:idx]
+		if strings.HasSuffix(ifName, ".0") {
+			ifName = ifName[:len(ifName)-2]
 		}
 
 		var nexthop string

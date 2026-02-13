@@ -725,6 +725,20 @@ func TestGenerateStaticRoute_NoUnitNoStrip(t *testing.T) {
 	}
 }
 
+func TestGenerateStaticRoute_VLANSuffixNotStripped(t *testing.T) {
+	m := New()
+	sr := &config.StaticRoute{
+		Destination: "::/0",
+		NextHops:    []config.NextHopEntry{{Address: "fe80::50", Interface: "wan0.50"}},
+	}
+	got := m.generateStaticRoute(sr, "")
+	// VLAN sub-interface "wan0.50" must NOT be stripped — it's a real kernel name
+	want := "ipv6 route ::/0 fe80::50 wan0.50\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestApplyFull_ConsistentHash(t *testing.T) {
 	m := New()
 	m.frrConf = filepath.Join(t.TempDir(), "frr.conf")
