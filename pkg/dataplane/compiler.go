@@ -2302,23 +2302,6 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		base.ICMPCode = uint8(term.ICMPCode)
 	}
 
-	// Destination port (first port only for now)
-	if len(term.DestinationPorts) > 0 {
-		base.MatchFlags |= FilterMatchDstPort
-		portStr := term.DestinationPorts[0]
-		// Resolve well-known port names
-		portNum := resolvePortName(portStr)
-		base.DstPort = htons(portNum)
-	}
-
-	// Source port (first port only for now)
-	if len(term.SourcePorts) > 0 {
-		base.MatchFlags |= FilterMatchSrcPort
-		portStr := term.SourcePorts[0]
-		portNum := resolvePortName(portStr)
-		base.SrcPort = htons(portNum)
-	}
-
 	// Expand prefix list references into address lists
 	srcAddrs := append([]string{}, term.SourceAddresses...)
 	for _, ref := range term.SourcePrefixLists {
@@ -2348,19 +2331,41 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		dstAddrs = []string{""} // "any"
 	}
 
+	// Port lists: expand multiple ports into separate rules
+	dstPorts := term.DestinationPorts
+	if len(dstPorts) == 0 {
+		dstPorts = []string{""} // "any"
+	}
+	srcPorts := term.SourcePorts
+	if len(srcPorts) == 0 {
+		srcPorts = []string{""} // "any"
+	}
+
 	var rules []FilterRule
 	for _, src := range srcAddrs {
 		for _, dst := range dstAddrs {
-			rule := base
-			if src != "" {
-				rule.MatchFlags |= FilterMatchSrcAddr
-				setFilterAddr(&rule.SrcAddr, &rule.SrcMask, src, family)
+			for _, dp := range dstPorts {
+				for _, sp := range srcPorts {
+					rule := base
+					if src != "" {
+						rule.MatchFlags |= FilterMatchSrcAddr
+						setFilterAddr(&rule.SrcAddr, &rule.SrcMask, src, family)
+					}
+					if dst != "" {
+						rule.MatchFlags |= FilterMatchDstAddr
+						setFilterAddr(&rule.DstAddr, &rule.DstMask, dst, family)
+					}
+					if dp != "" {
+						rule.MatchFlags |= FilterMatchDstPort
+						rule.DstPort = htons(resolvePortName(dp))
+					}
+					if sp != "" {
+						rule.MatchFlags |= FilterMatchSrcPort
+						rule.SrcPort = htons(resolvePortName(sp))
+					}
+					rules = append(rules, rule)
+				}
 			}
-			if dst != "" {
-				rule.MatchFlags |= FilterMatchDstAddr
-				setFilterAddr(&rule.DstAddr, &rule.DstMask, dst, family)
-			}
-			rules = append(rules, rule)
 		}
 	}
 
