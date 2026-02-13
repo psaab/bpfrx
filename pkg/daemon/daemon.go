@@ -596,7 +596,10 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	d.applySystemDNS(cfg)
 	d.applySystemNTP(cfg)
 
-	// 9.5. Write SSH known hosts file
+	// 9.5. Apply system hostname
+	d.applyHostname(cfg)
+
+	// 9.6. Write SSH known hosts file
 	d.applySSHKnownHosts(cfg)
 
 	// 10. Apply system syslog forwarding
@@ -607,6 +610,9 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 
 	// 12. Apply SSH service configuration (root-login)
 	d.applySSHConfig(cfg)
+
+	// 13. Archive config to remote sites if transfer-on-commit is enabled
+	d.archiveConfig(cfg)
 }
 
 // startDHCPClients iterates the config and starts DHCP/DHCPv6 clients
@@ -1080,6 +1086,29 @@ func applySyslogConfig(er *logging.EventReader, cfg *config.Config) {
 }
 
 // applySystemDNS writes /etc/resolv.conf from system { name-server } config.
+// applyHostname sets the system hostname from system { host-name } config.
+func (d *Daemon) applyHostname(cfg *config.Config) {
+	if cfg.System.HostName == "" {
+		return
+	}
+
+	current, _ := os.Hostname()
+	if current == cfg.System.HostName {
+		return
+	}
+
+	if err := syscall.Sethostname([]byte(cfg.System.HostName)); err != nil {
+		slog.Warn("failed to set hostname", "err", err)
+		return
+	}
+
+	// Persist to /etc/hostname
+	if err := os.WriteFile("/etc/hostname", []byte(cfg.System.HostName+"\n"), 0644); err != nil {
+		slog.Warn("failed to write /etc/hostname", "err", err)
+	}
+	slog.Info("hostname set", "hostname", cfg.System.HostName)
+}
+
 func (d *Daemon) applySystemDNS(cfg *config.Config) {
 	if len(cfg.System.NameServers) == 0 {
 		return
@@ -1329,4 +1358,35 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 	// Reload sshd to pick up changes
 	exec.Command("systemctl", "reload", "sshd").Run()
 	slog.Info("SSH config applied", "permit_root_login", permitRoot)
+}
+
+// archiveConfig transfers the active config to remote archive sites
+// when system { archival { configuration { transfer-on-commit; } } } is set.
+func (d *Daemon) archiveConfig(cfg *config.Config) {
+	if cfg.System.Archival == nil || !cfg.System.Archival.TransferOnCommit {
+		return
+	}
+	if len(cfg.System.Archival.ArchiveSites) == 0 {
+		return
+	}
+
+	configFile := d.opts.ConfigFile
+	for _, site := range cfg.System.Archival.ArchiveSites {
+		go func(dest string) {
+			slog.Info("archiving config", "destination", dest)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			out, err := exec.CommandContext(ctx, "scp",
+				"-o", "StrictHostKeyChecking=no",
+				"-o", "BatchMode=yes",
+				configFile, dest,
+			).CombinedOutput()
+			if err != nil {
+				slog.Warn("config archival failed",
+					"destination", dest, "err", err, "output", string(out))
+			} else {
+				slog.Info("config archived successfully", "destination", dest)
+			}
+		}(site)
+	}
 }
