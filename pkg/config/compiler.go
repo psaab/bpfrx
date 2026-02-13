@@ -77,6 +77,10 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 			if err := compileChassis(node, &cfg.Chassis); err != nil {
 				return nil, fmt.Errorf("chassis: %w", err)
 			}
+		case "event-options":
+			if err := compileEventOptions(node, &cfg.EventOptions); err != nil {
+				return nil, fmt.Errorf("event-options: %w", err)
+			}
 		case "snmp":
 			// Top-level snmp stanza (same format as system { snmp { ... } })
 			if err := compileSNMP(node, &cfg.System); err != nil {
@@ -3791,5 +3795,89 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 		ch.Cluster.RedundancyGroups = append(ch.Cluster.RedundancyGroups, rg)
 	}
 
+	return nil
+}
+
+func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
+	for _, pInst := range namedInstances(node.FindChildren("policy")) {
+		ep := &EventPolicy{
+			Name: pInst.name,
+		}
+
+		for _, child := range pInst.node.Children {
+			switch child.Name() {
+			case "events":
+				// events [ evt1 evt2 ] or events evt1;
+				if v := nodeVal(child); v != "" {
+					ep.Events = append(ep.Events, v)
+				}
+				// Check for bracket list in Keys
+				for i := 1; i < len(child.Keys); i++ {
+					if child.Keys[i] == "[" || child.Keys[i] == "]" {
+						continue
+					}
+					ep.Events = append(ep.Events, child.Keys[i])
+				}
+				// Also pick up children as individual events
+				for _, evtChild := range child.Children {
+					ep.Events = append(ep.Events, evtChild.Name())
+				}
+			case "within":
+				w := &EventWithin{}
+				if v := nodeVal(child); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						w.Seconds = n
+					}
+				}
+				if trigNode := child.FindChild("trigger"); trigNode != nil {
+					// trigger on N or trigger until N
+					for i := 1; i < len(trigNode.Keys)-1; i++ {
+						switch trigNode.Keys[i] {
+						case "on":
+							if n, err := strconv.Atoi(trigNode.Keys[i+1]); err == nil {
+								w.TriggerOn = n
+							}
+						case "until":
+							if n, err := strconv.Atoi(trigNode.Keys[i+1]); err == nil {
+								w.TriggerUntil = n
+							}
+						}
+					}
+					// Also check children
+					if onNode := trigNode.FindChild("on"); onNode != nil {
+						if v := nodeVal(onNode); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								w.TriggerOn = n
+							}
+						}
+					}
+					if untilNode := trigNode.FindChild("until"); untilNode != nil {
+						if v := nodeVal(untilNode); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								w.TriggerUntil = n
+							}
+						}
+					}
+				}
+				ep.WithinClauses = append(ep.WithinClauses, w)
+			case "attributes-match":
+				// Each child is a match line like "ping_test_failed.test-owner matches Comcast"
+				for _, amChild := range child.Children {
+					// Reconstruct the match expression from keys
+					ep.AttributesMatch = append(ep.AttributesMatch, strings.Join(amChild.Keys, " "))
+				}
+			case "then":
+				if ccNode := child.FindChild("change-configuration"); ccNode != nil {
+					if cmdsNode := ccNode.FindChild("commands"); cmdsNode != nil {
+						for _, cmdChild := range cmdsNode.Children {
+							ep.ThenCommands = append(ep.ThenCommands, cmdChild.Name())
+						}
+					}
+				}
+			}
+		}
+
+		*policies = append(*policies, ep)
+	}
 	return nil
 }

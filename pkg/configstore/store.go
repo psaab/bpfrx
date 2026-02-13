@@ -612,6 +612,23 @@ func (s *Store) ShowActiveSet() string {
 	return s.active.FormatSet()
 }
 
+// ShowActiveJSON returns the active configuration as JSON.
+func (s *Store) ShowActiveJSON() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.active.FormatJSON()
+}
+
+// ShowCandidateJSON returns the candidate configuration as JSON.
+func (s *Store) ShowCandidateJSON() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate != nil {
+		return s.candidate.FormatJSON()
+	}
+	return "{}\n"
+}
+
 // ShowRollback returns the content of rollback slot n (1-based) as hierarchical text.
 func (s *Store) ShowRollback(n int) (string, error) {
 	s.mu.RLock()

@@ -535,6 +535,20 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 	}},
+	"event-options": {children: map[string]*schemaNode{
+		"policy": {args: 1, children: map[string]*schemaNode{
+			"events": {children: nil},
+			"within": {args: 1, children: map[string]*schemaNode{
+				"trigger": {children: nil},
+			}},
+			"attributes-match": {children: nil},
+			"then": {children: map[string]*schemaNode{
+				"change-configuration": {children: map[string]*schemaNode{
+					"commands": {children: nil},
+				}},
+			}},
+		}},
+	}},
 	"chassis": {children: map[string]*schemaNode{
 		"cluster": {children: map[string]*schemaNode{
 			"reth-count": {args: 1, children: nil},

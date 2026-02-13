@@ -390,7 +390,9 @@ func (c *ctl) handleShow(args []string) error {
 	case "configuration":
 		format := pb.ConfigFormat_HIERARCHICAL
 		rest := strings.Join(args[1:], " ")
-		if strings.Contains(rest, "| display set") {
+		if strings.Contains(rest, "| display json") {
+			format = pb.ConfigFormat_JSON
+		} else if strings.Contains(rest, "| display set") {
 			format = pb.ConfigFormat_SET
 		}
 		// Extract path components (everything after "configuration" before "|")
@@ -1333,7 +1335,9 @@ func (c *ctl) handleConfigShow(args []string) error {
 	}
 
 	format := pb.ConfigFormat_HIERARCHICAL
-	if strings.Contains(line, "| display set") {
+	if strings.Contains(line, "| display json") {
+		format = pb.ConfigFormat_JSON
+	} else if strings.Contains(line, "| display set") {
 		format = pb.ConfigFormat_SET
 	}
 	resp, err := c.client.ShowConfig(context.Background(), &pb.ShowConfigRequest{
@@ -1639,6 +1643,7 @@ func (c *ctl) showOperationalHelp() {
 	fmt.Println("  configure                          Enter configuration mode")
 	fmt.Println("  show configuration                 Show running configuration")
 	fmt.Println("  show configuration | display set   Show as flat set commands")
+	fmt.Println("  show configuration | display json  Show as JSON")
 	fmt.Println("  show dhcp leases                   Show DHCP leases")
 	fmt.Println("  show dhcp client-identifier        Show DHCPv6 DUID(s)")
 	fmt.Println("  show dhcp-relay                    Show DHCP relay status")
@@ -1803,6 +1808,7 @@ func (c *ctl) showConfigHelp() {
 	fmt.Println("  show | compare               Show pending changes vs active")
 	fmt.Println("  show | compare rollback N    Show changes vs rollback N")
 	fmt.Println("  show | display set           Show as flat set commands")
+	fmt.Println("  show | display json          Show as JSON")
 	fmt.Println("  commit                       Validate and apply configuration")
 	fmt.Println("  commit check                 Validate without applying")
 	fmt.Println("  commit confirmed [minutes]   Auto-rollback unless confirmed")

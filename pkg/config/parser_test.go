@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -6388,6 +6389,134 @@ func TestChassisClusterSetSyntax(t *testing.T) {
 	}
 	if rg1.GratuitousARPCount != 16 {
 		t.Errorf("rg1 gratuitous-arp-count = %d, want 16", rg1.GratuitousARPCount)
+	}
+}
+
+func TestEventOptions(t *testing.T) {
+	input := `event-options {
+    policy disable-on-ping-failure {
+        events [ ping_test_failed ping_probe_failed ];
+        within 30 {
+            trigger until 4;
+        }
+        within 25 {
+            trigger on 3;
+        }
+        attributes-match {
+            ping_test_failed.test-owner matches Comcast-GigabitPro;
+            ping_test_failed.test-name matches one-one-one-one;
+        }
+        then {
+            change-configuration {
+                commands {
+                    "set routing-options static route 0.0.0.0/0 next-table ATT.inet.0";
+                }
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.EventOptions) != 1 {
+		t.Fatalf("EventOptions = %d, want 1", len(cfg.EventOptions))
+	}
+	ep := cfg.EventOptions[0]
+	if ep.Name != "disable-on-ping-failure" {
+		t.Errorf("Name = %q", ep.Name)
+	}
+	if len(ep.Events) < 2 {
+		t.Fatalf("Events = %d, want >= 2", len(ep.Events))
+	}
+	if len(ep.WithinClauses) != 2 {
+		t.Fatalf("WithinClauses = %d, want 2", len(ep.WithinClauses))
+	}
+	if ep.WithinClauses[0].Seconds != 30 {
+		t.Errorf("within[0].Seconds = %d, want 30", ep.WithinClauses[0].Seconds)
+	}
+	if ep.WithinClauses[0].TriggerUntil != 4 {
+		t.Errorf("within[0].TriggerUntil = %d, want 4", ep.WithinClauses[0].TriggerUntil)
+	}
+	if ep.WithinClauses[1].Seconds != 25 {
+		t.Errorf("within[1].Seconds = %d, want 25", ep.WithinClauses[1].Seconds)
+	}
+	if ep.WithinClauses[1].TriggerOn != 3 {
+		t.Errorf("within[1].TriggerOn = %d, want 3", ep.WithinClauses[1].TriggerOn)
+	}
+	if len(ep.AttributesMatch) != 2 {
+		t.Fatalf("AttributesMatch = %d, want 2", len(ep.AttributesMatch))
+	}
+	if len(ep.ThenCommands) != 1 {
+		t.Fatalf("ThenCommands = %d, want 1", len(ep.ThenCommands))
+	}
+}
+
+func TestFormatJSON(t *testing.T) {
+	input := `system {
+    host-name fw1;
+    name-server 8.8.8.8;
+}
+interfaces {
+    eth0 {
+        unit 0 {
+            family inet {
+                address 10.0.1.1/24;
+            }
+        }
+    }
+    eth1 {
+        unit 0 {
+            family inet {
+                dhcp;
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, err := parser.Parse()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	jsonOut := tree.FormatJSON()
+	if jsonOut == "" || jsonOut == "{}\n" {
+		t.Fatal("FormatJSON returned empty object")
+	}
+
+	// Verify it's valid JSON.
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonOut), &obj); err != nil {
+		t.Fatalf("FormatJSON output is not valid JSON: %v\n%s", err, jsonOut)
+	}
+
+	// Check structure.
+	sys, ok := obj["system"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected system object, got %T", obj["system"])
+	}
+	if sys["host-name"] != "fw1" {
+		t.Errorf("host-name = %v, want fw1", sys["host-name"])
+	}
+	if sys["name-server"] != "8.8.8.8" {
+		t.Errorf("name-server = %v, want 8.8.8.8", sys["name-server"])
+	}
+
+	ifaces, ok := obj["interfaces"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected interfaces object, got %T", obj["interfaces"])
+	}
+	// eth0 and eth1 should be separate keys under interfaces.
+	if _, ok := ifaces["eth0"]; !ok {
+		t.Error("interfaces missing eth0")
+	}
+	if _, ok := ifaces["eth1"]; !ok {
+		t.Error("interfaces missing eth1")
 	}
 }
 

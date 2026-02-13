@@ -116,6 +116,7 @@ message RollbackResponse {}
 enum ConfigFormat {
   HIERARCHICAL = 0;
   SET = 1;
+  JSON = 2;
 }
 
 enum ConfigTarget {

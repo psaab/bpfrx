@@ -26,6 +26,7 @@ type ConfigFormat int32
 const (
 	ConfigFormat_HIERARCHICAL ConfigFormat = 0
 	ConfigFormat_SET          ConfigFormat = 1
+	ConfigFormat_JSON         ConfigFormat = 2
 )
 
 // Enum value maps for ConfigFormat.
@@ -33,10 +34,12 @@ var (
 	ConfigFormat_name = map[int32]string{
 		0: "HIERARCHICAL",
 		1: "SET",
+		2: "JSON",
 	}
 	ConfigFormat_value = map[string]int32{
 		"HIERARCHICAL": 0,
 		"SET":          1,
+		"JSON":         2,
 	}
 )
 
@@ -6375,10 +6378,11 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x13SystemActionRequest\x12\x16\n" +
 	"\x06action\x18\x01 \x01(\tR\x06action\"0\n" +
 	"\x14SystemActionResponse\x12\x18\n" +
-	"\amessage\x18\x01 \x01(\tR\amessage*)\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage*3\n" +
 	"\fConfigFormat\x12\x10\n" +
 	"\fHIERARCHICAL\x10\x00\x12\a\n" +
-	"\x03SET\x10\x01*)\n" +
+	"\x03SET\x10\x01\x12\b\n" +
+	"\x04JSON\x10\x02*)\n" +
 	"\fConfigTarget\x12\r\n" +
 	"\tCANDIDATE\x10\x00\x12\n" +
 	"\n" +

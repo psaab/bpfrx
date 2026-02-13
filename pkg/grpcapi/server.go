@@ -226,6 +226,8 @@ func (s *Server) Rollback(_ context.Context, req *pb.RollbackRequest) (*pb.Rollb
 func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.ShowConfigResponse, error) {
 	var output string
 	switch {
+	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_JSON:
+		output = s.store.ShowActiveJSON()
 	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_SET:
 		output = s.store.ShowActiveSet()
 	case req.Target == pb.ConfigTarget_ACTIVE:
@@ -234,6 +236,8 @@ func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.S
 		} else {
 			output = s.store.ShowActive()
 		}
+	case req.Format == pb.ConfigFormat_JSON:
+		output = s.store.ShowCandidateJSON()
 	case req.Format == pb.ConfigFormat_SET:
 		output = s.store.ShowCandidateSet()
 	default:

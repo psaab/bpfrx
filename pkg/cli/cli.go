@@ -865,7 +865,9 @@ func (c *CLI) handleShow(args []string) error {
 
 	case "configuration":
 		rest := strings.Join(args[1:], " ")
-		if strings.Contains(rest, "| display set") {
+		if strings.Contains(rest, "| display json") {
+			fmt.Print(c.store.ShowActiveJSON())
+		} else if strings.Contains(rest, "| display set") {
 			fmt.Print(c.store.ShowActiveSet())
 		} else if len(args) > 1 {
 			// Filter out pipe commands from the path
@@ -1308,6 +1310,11 @@ func (c *CLI) handleConfigShow(args []string) error {
 			return nil
 		}
 		fmt.Print(c.store.ShowCompare())
+		return nil
+	}
+
+	if strings.Contains(line, "| display json") {
+		fmt.Print(c.store.ShowCandidateJSON())
 		return nil
 	}
 
@@ -3902,6 +3909,7 @@ func (c *CLI) showOperationalHelp() {
 	fmt.Println("  configure                          Enter configuration mode")
 	fmt.Println("  show configuration                 Show running configuration")
 	fmt.Println("  show configuration | display set   Show as flat set commands")
+	fmt.Println("  show configuration | display json  Show as JSON")
 	fmt.Println("  show dhcp leases                   Show DHCP leases")
 	fmt.Println("  show route                         Show routing table")
 	fmt.Println("  show security                      Show security information")
@@ -3999,6 +4007,7 @@ func (c *CLI) showConfigHelp() {
 	fmt.Println("  show | compare               Show pending changes vs active")
 	fmt.Println("  show | compare rollback N    Show changes vs rollback N")
 	fmt.Println("  show | display set           Show as flat set commands")
+	fmt.Println("  show | display json          Show as JSON")
 	fmt.Println("  commit                       Validate and apply configuration")
 	fmt.Println("  commit check                 Validate without applying")
 	fmt.Println("  commit confirmed [minutes]   Auto-rollback unless confirmed")

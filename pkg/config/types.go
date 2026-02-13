@@ -15,6 +15,7 @@ type Config struct {
 	PolicyOptions     PolicyOptionsConfig
 	Schedulers        map[string]*SchedulerConfig
 	Chassis           ChassisConfig
+	EventOptions      []*EventPolicy
 	Warnings          []string // non-fatal validation warnings
 }
 
@@ -41,6 +42,22 @@ type RedundancyGroup struct {
 type InterfaceMonitor struct {
 	Interface string
 	Weight    int
+}
+
+// EventPolicy defines an event-driven policy (event-options).
+type EventPolicy struct {
+	Name             string
+	Events           []string
+	WithinClauses    []*EventWithin
+	AttributesMatch  []string // raw "field matches pattern" strings
+	ThenCommands     []string // change-configuration commands
+}
+
+// EventWithin defines a temporal trigger clause.
+type EventWithin struct {
+	Seconds    int
+	TriggerOn  int // trigger on N
+	TriggerUntil int // trigger until N
 }
 
 // PolicyOptionsConfig holds prefix-lists and policy-statements for routing control.
