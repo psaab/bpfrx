@@ -10,14 +10,14 @@ Add a DPDK-based dataplane as an alternative to the current XDP/TC eBPF pipeline
 |---|---|---|
 | **Throughput** | 25+ Gbps native XDP | 40-100+ Gbps with DPDK PMDs |
 | **Latency** | ~1-5µs (kernel bypass at NIC driver) | ~0.5-2µs (full kernel bypass, polling) |
-| **CPU model** | Kernel interrupt-driven + XDP poll | Pure polling (dedicated cores) |
+| **CPU model** | Kernel interrupt-driven + XDP poll | Poll (dedicated cores) or interrupt-driven (power-aware) |
 | **NIC support** | Any NIC with XDP driver | NICs with DPDK PMD (Intel, Mellanox, etc.) |
 | **Kernel dependency** | Requires Linux 6.x+ for advanced features | Kernel-independent (hugepages + VFIO) |
 | **Debugging** | Limited (bpf_printk, verifier) | Full gdb, profiling, logging |
 | **Stack limit** | 512 bytes across call frames | No limit (userspace stack) |
 | **Deployment** | Zero-dependency (kernel built-in) | Requires hugepages, DPDK libs, dedicated cores |
 
-**Target use case:** High-throughput deployments (40G/100G NICs) where dedicating CPU cores to packet processing is acceptable.
+**Target use case:** High-throughput deployments (40G/100G NICs) where dedicating CPU cores to packet processing is acceptable. An interrupt-driven mode is also available for power-sensitive deployments.
 
 ## Architecture
 
@@ -554,6 +554,263 @@ void aggregate_counters(uint32_t policy_id, uint64_t *packets, uint64_t *bytes) 
 - Session iteration: C-side filtering, return matching subset
 - Config compilation: batch all writes, single CGo "apply" call
 
+## Power Management: Interrupt-Driven Mode
+
+Pure poll-mode DPDK burns 100% CPU on dedicated cores even with zero traffic. This is unacceptable for branch/edge deployments, VMs, or any environment where power efficiency matters. bpfrx supports three RX modes that trade latency for power.
+
+### Three RX Modes
+
+```
+system {
+    dataplane dpdk {
+        rx-mode polling;          /* Default: lowest latency, highest CPU */
+        /* rx-mode interrupt; */  /* Lowest power, higher latency */
+        /* rx-mode adaptive; */   /* Auto-switch between polling and interrupt */
+    }
+}
+```
+
+| Mode | CPU Usage (idle) | CPU Usage (line rate) | Added Latency | Use Case |
+|------|-----------------|----------------------|---------------|----------|
+| **polling** | 100% per core | 100% per core | 0 | Data center, 40G/100G |
+| **interrupt** | ~0% per core | Scales with load | 5-50µs (interrupt coalescing) | Edge, branch, VM |
+| **adaptive** | ~0% idle → 100% busy | 100% at threshold | 0-50µs (dynamic) | General purpose |
+
+### Interrupt-Driven Mode (`rx-mode interrupt`)
+
+Uses DPDK's `rte_eth_dev_rx_intr_*` API to sleep on an epoll fd until the NIC signals new packets.
+
+```c
+// dpdk_worker/rx_interrupt.c
+
+static void
+rx_loop_interrupt(uint16_t port_id, uint16_t queue_id, struct pipeline_ctx *ctx)
+{
+    struct rte_mbuf *pkts[BURST_SIZE];
+    uint16_t nb_rx;
+
+    for (;;) {
+        nb_rx = rte_eth_rx_burst(port_id, queue_id, pkts, BURST_SIZE);
+
+        if (nb_rx > 0) {
+            process_burst(pkts, nb_rx, ctx);
+            continue;  // Keep draining without sleeping
+        }
+
+        // No packets — arm interrupt and sleep
+        rte_eth_dev_rx_intr_enable(port_id, queue_id);
+
+        // epoll_wait on the interrupt fd (blocks until NIC signals)
+        struct rte_epoll_event ev;
+        rte_epoll_wait(rx_intr_fd, &ev, 1, INTR_TIMEOUT_MS);
+
+        // Disable interrupt before resuming poll (avoid spurious wakeups)
+        rte_eth_dev_rx_intr_disable(port_id, queue_id);
+    }
+}
+```
+
+**How it works:**
+1. Worker calls `rte_eth_rx_burst()` — if packets available, process them
+2. If no packets, enable NIC RX interrupt via `rte_eth_dev_rx_intr_enable()`
+3. Sleep on epoll fd — kernel puts core to sleep (C-state)
+4. NIC raises interrupt when packets arrive → epoll wakes up
+5. Disable interrupt, resume polling burst
+
+**NIC requirements:** The NIC PMD must support `RTE_ETH_DEV_INTR_RMV` / rx interrupt. Most modern NICs do: i40e, ice, ixgbe, mlx5, virtio, ena.
+
+**Interrupt coalescing:** NICs batch interrupts to avoid per-packet overhead. Configure via ethtool before DPDK binding or via PMD-specific devargs:
+```
+# Before DPDK binding
+ethtool -C enp3s0 rx-usecs 50 rx-frames 64
+
+# Or via DPDK devargs
+-a 0000:03:00.0,rx_intr_thresh=64
+```
+
+### Adaptive Mode (`rx-mode adaptive`)
+
+Dynamically switches between poll and interrupt based on traffic load. This gives poll-mode performance under load and interrupt-mode efficiency at idle.
+
+```c
+// dpdk_worker/rx_adaptive.c
+
+#define POLL_IDLE_THRESHOLD   256   // Empty polls before switching to interrupt
+#define POLL_RESUME_BURST     32    // Packets in interrupt wakeup to resume polling
+#define ADAPTIVE_CHECK_US     100   // Check interval for mode switch
+
+enum rx_state { RX_POLL, RX_INTERRUPT };
+
+static void
+rx_loop_adaptive(uint16_t port_id, uint16_t queue_id, struct pipeline_ctx *ctx)
+{
+    struct rte_mbuf *pkts[BURST_SIZE];
+    enum rx_state state = RX_POLL;
+    uint32_t idle_polls = 0;
+
+    for (;;) {
+        uint16_t nb_rx = rte_eth_rx_burst(port_id, queue_id, pkts, BURST_SIZE);
+
+        if (nb_rx > 0) {
+            process_burst(pkts, nb_rx, ctx);
+            idle_polls = 0;
+
+            // If we were in interrupt mode and got a big burst, switch to polling
+            if (state == RX_INTERRUPT && nb_rx >= POLL_RESUME_BURST) {
+                state = RX_POLL;
+                ctx->counters->mode_switches++;
+            }
+            continue;
+        }
+
+        // No packets
+        idle_polls++;
+
+        if (state == RX_POLL && idle_polls > POLL_IDLE_THRESHOLD) {
+            // Switch to interrupt mode — too many empty polls
+            state = RX_INTERRUPT;
+            ctx->counters->mode_switches++;
+        }
+
+        if (state == RX_INTERRUPT) {
+            rte_eth_dev_rx_intr_enable(port_id, queue_id);
+            struct rte_epoll_event ev;
+            rte_epoll_wait(rx_intr_fd, &ev, 1, ADAPTIVE_TIMEOUT_MS);
+            rte_eth_dev_rx_intr_disable(port_id, queue_id);
+            idle_polls = 0;  // Reset after wakeup
+        }
+    }
+}
+```
+
+**Tuning parameters (exposed in config):**
+
+```
+system {
+    dataplane dpdk {
+        rx-mode adaptive {
+            idle-threshold 256;     /* Empty polls before sleep (default 256) */
+            resume-threshold 32;    /* Burst size to resume polling (default 32) */
+            sleep-timeout 100;      /* Max sleep ms in interrupt mode (default 100) */
+        }
+    }
+}
+```
+
+### Power States and CPU Frequency
+
+In interrupt mode, the core genuinely sleeps (enters C-state). Combined with CPU frequency scaling:
+
+```c
+// dpdk_worker/power.c
+
+#include <rte_power.h>
+
+// Initialize per-lcore power management
+void power_init(unsigned lcore_id) {
+    rte_power_init(lcore_id);  // Enables freq scaling for this core
+}
+
+// Called from adaptive loop when switching to interrupt
+void power_scale_down(unsigned lcore_id) {
+    rte_power_freq_min(lcore_id);  // Drop to lowest P-state
+}
+
+// Called from adaptive loop when switching to polling
+void power_scale_up(unsigned lcore_id) {
+    rte_power_freq_max(lcore_id);  // Boost to max P-state
+}
+```
+
+DPDK's `rte_power` library integrates with Linux cpufreq governors (intel_pstate, acpi-cpufreq) to scale frequency per-core. In interrupt mode at idle:
+- CPU enters C6 sleep state (~0W per core)
+- Frequency drops to minimum P-state
+- Wake-up latency: 10-100µs depending on C-state depth
+
+### Hybrid Multi-Core: Mixed Modes
+
+For deployments with asymmetric traffic (e.g., WAN at 10G, LAN at 1G), different cores can run different modes:
+
+```
+system {
+    dataplane dpdk {
+        cores 2-5;
+        ports {
+            0000:03:00.0 {       /* WAN: 10G, high traffic */
+                interface wan0;
+                rx-mode polling;
+                cores 2-3;
+            }
+            0000:04:00.0 {       /* LAN: 1G, bursty */
+                interface trust0;
+                rx-mode adaptive;
+                cores 4-5;
+            }
+        }
+    }
+}
+```
+
+### Power Monitoring
+
+Expose power state in operational commands:
+
+```
+show system dataplane power
+  Core 2: polling    (freq 3600 MHz, 100% busy)
+  Core 3: polling    (freq 3600 MHz, 98% busy)
+  Core 4: interrupt  (freq 800 MHz, idle, last wakeup 1.2s ago)
+  Core 5: interrupt  (freq 800 MHz, idle, last wakeup 0.8s ago)
+  Mode switches (adaptive): 1,247 total
+  Average idle ratio: 62%
+  Estimated power savings vs pure poll: ~45%
+```
+
+### Implementation in Worker
+
+The RX mode is selected at startup and can be changed at runtime via shared memory flag:
+
+```c
+// dpdk_worker/main.c
+
+typedef void (*rx_loop_fn)(uint16_t port_id, uint16_t queue_id,
+                           struct pipeline_ctx *ctx);
+
+static rx_loop_fn rx_loops[] = {
+    [RX_MODE_POLL]      = rx_loop_poll,       // Existing pure poll
+    [RX_MODE_INTERRUPT] = rx_loop_interrupt,   // New interrupt-driven
+    [RX_MODE_ADAPTIVE]  = rx_loop_adaptive,    // New adaptive
+};
+
+// Per-lcore main function
+static int
+lcore_main(void *arg)
+{
+    struct lcore_conf *conf = arg;
+    rx_loop_fn loop = rx_loops[conf->rx_mode];
+
+    // Power management init (for adaptive/interrupt)
+    if (conf->rx_mode != RX_MODE_POLL)
+        power_init(rte_lcore_id());
+
+    loop(conf->port_id, conf->queue_id, conf->ctx);
+    return 0;
+}
+```
+
+### Comparison with XDP
+
+| | XDP (current) | DPDK Poll | DPDK Interrupt | DPDK Adaptive |
+|---|---|---|---|---|
+| **Idle CPU** | ~0% | 100% | ~0% | ~0% |
+| **Latency (idle→first pkt)** | ~2µs | 0 (always polling) | 10-50µs | 10-50µs |
+| **Latency (sustained)** | ~1-5µs | ~0.5-2µs | ~5-50µs | ~0.5-2µs |
+| **Throughput** | 25+ Gbps | 40-100+ Gbps | 10-40 Gbps | 40-100+ Gbps |
+| **Power** | Low | High | Very low | Low-medium |
+| **Dedicated cores** | No | Yes | Yes (but sleeping) | Yes |
+
+The interrupt and adaptive modes make DPDK viable for the same environments where XDP currently runs — without the 100% CPU penalty. Adaptive mode is the recommended default for most deployments.
+
 ## Estimated Timeline
 
 | Phase | Description | Effort | Dependencies |
@@ -607,6 +864,10 @@ dpdk_worker/
 ├── nat64.c              # NAT64 translation
 ├── forward.c            # Forwarding
 ├── filter.c             # Firewall filters
+├── rx_poll.c            # Pure poll-mode RX loop
+├── rx_interrupt.c       # Interrupt-driven RX loop (epoll + rte_eth_rx_intr)
+├── rx_adaptive.c        # Adaptive RX loop (auto-switch poll ↔ interrupt)
+├── power.c              # CPU frequency scaling via rte_power
 ├── tables.h             # Table declarations
 ├── shared_mem.h         # Shared memory layout
 ├── counters.h           # Per-lcore counters
@@ -629,3 +890,6 @@ dpdk_worker/
 
 5. **Kernel integration for host traffic:** KNI vs virtio-user vs TAP
    - **Recommendation:** virtio-user. KNI is being deprecated; virtio-user is the modern approach.
+
+6. **Default RX mode:** Polling vs interrupt vs adaptive
+   - **Recommendation:** Adaptive as default. Gives poll-mode throughput under load, interrupt-mode efficiency at idle. Pure polling available for latency-critical 100G deployments.
