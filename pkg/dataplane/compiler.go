@@ -517,8 +517,18 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					}
 				}
 
-				// Bring the interface UP so XDP can process traffic
-				if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
+				// Bring the interface UP so XDP can process traffic,
+				// unless the interface is administratively disabled.
+				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg.Disable {
+					if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
+						if err := netlink.LinkSetDown(nl); err != nil {
+							slog.Warn("failed to bring disabled interface down",
+								"name", physName, "err", err)
+						} else {
+							slog.Info("interface administratively disabled", "name", physName)
+						}
+					}
+				} else if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
 					if err := netlink.LinkSetUp(nl); err != nil {
 						slog.Warn("failed to bring interface up",
 							"name", physName, "err", err)

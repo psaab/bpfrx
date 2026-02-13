@@ -108,6 +108,7 @@ var operationalTree = map[string]*completionNode{
 			"client-identifier": {desc: "Show DHCPv6 DUID(s)"},
 		}},
 		"flow-monitoring": {desc: "Show flow monitoring/NetFlow configuration"},
+		"log":             {desc: "Show daemon log entries [N]"},
 		"route": {desc: "Show routing table [instance <name>]", children: map[string]*completionNode{
 			"summary": {desc: "Show route summary by protocol"},
 			"instance": {desc: "Show routes for a routing instance", dynamicFn: func(cfg *config.Config) []string {
@@ -829,7 +830,7 @@ func (c *CLI) dispatchConfig(line string) error {
 
 var showCommands = []string{
 	"chassis", "configuration", "dhcp", "dhcp-relay", "dhcp-server",
-	"firewall", "flow-monitoring", "route", "schedulers", "security",
+	"firewall", "flow-monitoring", "log", "route", "schedulers", "security",
 	"services", "snmp", "interfaces", "protocols", "system", "version",
 }
 
@@ -844,6 +845,7 @@ func (c *CLI) handleShow(args []string) error {
 		fmt.Println("  dhcp-server      Show DHCP server leases")
 		fmt.Println("  firewall         Show firewall filters")
 		fmt.Println("  flow-monitoring  Show flow monitoring/NetFlow configuration")
+		fmt.Println("  log              Show daemon log entries [N]")
 		fmt.Println("  route            Show routing table")
 		fmt.Println("  schedulers       Show policy schedulers")
 		fmt.Println("  security         Show security information")
@@ -914,6 +916,9 @@ func (c *CLI) handleShow(args []string) error {
 
 	case "flow-monitoring":
 		return c.showFlowMonitoring()
+
+	case "log":
+		return c.showDaemonLog(args[1:])
 
 	case "route":
 		return c.handleShowRoute(args[1:])
@@ -3407,13 +3412,19 @@ func (c *CLI) showInterfacesTerse() error {
 		if !printedPhys[u.physName] {
 			printedPhys[u.physName] = true
 			admin := "up"
+			// Check config-level disable flag
+			if ifCfg, ok := cfg.Interfaces.Interfaces[u.physName]; ok && ifCfg.Disable {
+				admin = "down"
+			}
 			link := "up"
 			iface, err := net.InterfaceByName(u.physName)
 			if err != nil {
 				link = "down"
 			} else {
 				if iface.Flags&net.FlagUp == 0 {
-					admin = "down"
+					if admin == "up" {
+						admin = "down" // kernel says down
+					}
 				}
 				data, err := os.ReadFile("/sys/class/net/" + u.physName + "/operstate")
 				if err == nil && strings.TrimSpace(string(data)) != "up" {
@@ -4460,6 +4471,23 @@ func (c *CLI) showFlowMonitoring() error {
 		fmt.Println("No flow monitoring configured")
 	}
 
+	return nil
+}
+
+// showDaemonLog displays recent daemon log entries from journald.
+func (c *CLI) showDaemonLog(args []string) error {
+	n := 50
+	if len(args) > 0 {
+		if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
+			n = v
+		}
+	}
+
+	out, err := exec.Command("journalctl", "-u", "bpfrxd", "-n", strconv.Itoa(n), "--no-pager").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("journalctl: %w", err)
+	}
+	fmt.Print(string(out))
 	return nil
 }
 
