@@ -1032,6 +1032,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 				fmt.Printf("Zone: %s\n", name)
 			}
 			fmt.Printf("  Interfaces: %s\n", strings.Join(zone.Interfaces, ", "))
+			if zone.TCPRst {
+				fmt.Println("  TCP RST: enabled")
+			}
 			if zone.ScreenProfile != "" {
 				fmt.Printf("  Screen: %s\n", zone.ScreenProfile)
 			}
@@ -4617,6 +4620,23 @@ func (c *CLI) showFirewallFilters() error {
 				for _, port := range term.DestinationPorts {
 					fmt.Printf("    from destination-port %s\n", port)
 				}
+				for _, port := range term.SourcePorts {
+					fmt.Printf("    from source-port %s\n", port)
+				}
+				for _, ref := range term.SourcePrefixLists {
+					mod := ""
+					if ref.Except {
+						mod = " except"
+					}
+					fmt.Printf("    from source-prefix-list %s%s\n", ref.Name, mod)
+				}
+				for _, ref := range term.DestPrefixLists {
+					mod := ""
+					if ref.Except {
+						mod = " except"
+					}
+					fmt.Printf("    from destination-prefix-list %s%s\n", ref.Name, mod)
+				}
 				if term.ICMPType >= 0 {
 					fmt.Printf("    from icmp-type %d\n", term.ICMPType)
 				}
@@ -4630,22 +4650,55 @@ func (c *CLI) showFirewallFilters() error {
 				if term.RoutingInstance != "" {
 					fmt.Printf("    then routing-instance %s\n", term.RoutingInstance)
 				}
+				if term.ForwardingClass != "" {
+					fmt.Printf("    then forwarding-class %s\n", term.ForwardingClass)
+				}
+				if term.LossPriority != "" {
+					fmt.Printf("    then loss-priority %s\n", term.LossPriority)
+				}
 				if term.Log {
 					fmt.Printf("    then log\n")
 				}
+				if term.Count != "" {
+					fmt.Printf("    then count %s\n", term.Count)
+				}
 				fmt.Printf("    then %s\n", action)
 
-				// Sum counters across all expanded BPF rules for this term
+				// Sum counters across all expanded BPF rules for this term.
+				// Must match the cross-product in expandFilterTerm:
+				// nSrc * nDst * nDstPorts * nSrcPorts
 				if hasCounters {
 					nSrc := len(term.SourceAddresses)
+					for _, ref := range term.SourcePrefixLists {
+						if !ref.Except {
+							if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+								nSrc += len(pl.Prefixes)
+							}
+						}
+					}
 					if nSrc == 0 {
 						nSrc = 1
 					}
 					nDst := len(term.DestAddresses)
+					for _, ref := range term.DestPrefixLists {
+						if !ref.Except {
+							if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+								nDst += len(pl.Prefixes)
+							}
+						}
+					}
 					if nDst == 0 {
 						nDst = 1
 					}
-					numRules := uint32(nSrc * nDst)
+					nDstPorts := len(term.DestinationPorts)
+					if nDstPorts == 0 {
+						nDstPorts = 1
+					}
+					nSrcPorts := len(term.SourcePorts)
+					if nSrcPorts == 0 {
+						nSrcPorts = 1
+					}
+					numRules := uint32(nSrc * nDst * nDstPorts * nSrcPorts)
 					var totalPkts, totalBytes uint64
 					for i := uint32(0); i < numRules; i++ {
 						if ctrs, err := c.dp.ReadFilterCounters(ruleOffset + i); err == nil {

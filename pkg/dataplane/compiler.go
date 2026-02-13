@@ -427,6 +427,10 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 				"zone", name, "flags", fmt.Sprintf("0x%x", flags))
 		}
 
+		if zone.TCPRst {
+			zc.TCPRst = 1
+		}
+
 		if err := m.SetZoneConfig(zid, zc); err != nil {
 			return fmt.Errorf("set zone config %s: %w", name, err)
 		}

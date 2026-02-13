@@ -105,6 +105,8 @@ type ZoneConfig struct {
 	ZoneID          uint16
 	ScreenProfileID uint16
 	HostInbound     uint32
+	TCPRst          uint8
+	Pad             [3]uint8
 }
 
 // ZonePairKey mirrors the C struct zone_pair_key.
@@ -602,6 +604,8 @@ type FilterRule struct {
 	Family       uint8
 	DstPort      uint16 // network byte order
 	SrcPort      uint16 // network byte order
+	DSCPRewrite  uint8  // DSCP rewrite value (0xFF = no rewrite)
+	Pad          uint8
 	SrcAddr      [16]byte
 	SrcMask      [16]byte
 	DstAddr      [16]byte

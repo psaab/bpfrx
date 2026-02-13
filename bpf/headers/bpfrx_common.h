@@ -404,6 +404,10 @@ struct pkt_meta {
 
 	/* Policy-based routing (set by firewall filter) */
 	__u32 routing_table;  /* VRF table ID, 0 = main table */
+
+	/* DSCP rewrite (set by firewall filter, 0xFF = no rewrite) */
+	__u8  dscp_rewrite;
+	__u8  pad_meta[3];
 };
 
 /* ============================================================
@@ -435,6 +439,8 @@ struct zone_config {
 	__u16 zone_id;
 	__u16 screen_profile_id;
 	__u32 host_inbound_flags;
+	__u8  tcp_rst;      /* send TCP RST for non-SYN without session */
+	__u8  pad[3];
 };
 
 /* ============================================================
@@ -595,6 +601,8 @@ struct filter_rule {
 	__u8   family;          /* AF_INET or AF_INET6 */
 	__be16 dst_port;        /* network byte order, 0=any */
 	__be16 src_port;        /* network byte order, 0=any */
+	__u8   dscp_rewrite;    /* DSCP rewrite value (0xFF = no rewrite) */
+	__u8   pad;
 	__u8   src_addr[16];    /* v4: first 4 bytes, v6: all 16 */
 	__u8   src_mask[16];    /* prefix mask */
 	__u8   dst_addr[16];

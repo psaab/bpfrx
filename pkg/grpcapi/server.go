@@ -353,6 +353,7 @@ func (s *Server) GetZones(_ context.Context, _ *pb.GetZonesRequest) (*pb.GetZone
 		zi := &pb.ZoneInfo{
 			Name:       zoneName,
 			Interfaces: zone.Interfaces,
+			TcpRst:     zone.TCPRst,
 		}
 		if zone.ScreenProfile != "" {
 			zi.ScreenProfile = zone.ScreenProfile

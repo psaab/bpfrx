@@ -1353,6 +1353,20 @@ int xdp_policy_prog(struct xdp_md *ctx)
 			else
 				return send_icmp_unreach_v6(ctx, meta);
 		}
+
+		/* Zone tcp-rst: send RST for non-SYN TCP without session */
+		if (meta->protocol == PROTO_TCP &&
+		    !(meta->tcp_flags & 0x02)) {
+			__u32 zk = meta->ingress_zone;
+			struct zone_config *zc =
+				bpf_map_lookup_elem(&zone_configs, &zk);
+			if (zc && zc->tcp_rst) {
+				if (meta->addr_family == AF_INET)
+					return send_tcp_rst_v4(ctx, meta);
+				else
+					return send_tcp_rst_v6(ctx, meta);
+			}
+		}
 		return XDP_DROP;
 	}
 
@@ -1376,6 +1390,20 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 	/* Default deny */
 	inc_counter(GLOBAL_CTR_POLICY_DENY);
+
+	/* Zone tcp-rst: send RST for non-SYN TCP without session */
+	if (meta->protocol == PROTO_TCP &&
+	    !(meta->tcp_flags & 0x02)) {
+		__u32 zk = meta->ingress_zone;
+		struct zone_config *zc =
+			bpf_map_lookup_elem(&zone_configs, &zk);
+		if (zc && zc->tcp_rst) {
+			if (meta->addr_family == AF_INET)
+				return send_tcp_rst_v4(ctx, meta);
+			else
+				return send_tcp_rst_v6(ctx, meta);
+		}
+	}
 	return XDP_DROP;
 }
 

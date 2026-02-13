@@ -631,6 +631,9 @@ func (c *ctl) showZones() error {
 			fmt.Printf("Zone: %s\n", z.Name)
 		}
 		fmt.Printf("  Interfaces: %s\n", strings.Join(z.Interfaces, ", "))
+		if z.TcpRst {
+			fmt.Println("  TCP RST: enabled")
+		}
 		if z.ScreenProfile != "" {
 			fmt.Printf("  Screen: %s\n", z.ScreenProfile)
 		}
