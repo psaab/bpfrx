@@ -377,17 +377,20 @@ type FeedServer struct {
 
 // SecurityConfig holds all security-related configuration.
 type SecurityConfig struct {
-	Zones          map[string]*ZoneConfig       // keyed by zone name
-	Policies       []*ZonePairPolicies          // ordered list of zone-pair policy sets
-	DefaultPolicy  PolicyAction                 // global fallback policy (permit-all or deny-all)
-	NAT            NATConfig
-	Screen         map[string]*ScreenProfile    // keyed by profile name
-	AddressBook    *AddressBook
-	Log            LogConfig
-	Flow           FlowConfig
-	ALG            ALGConfig
-	IPsec          IPsecConfig
-	DynamicAddress DynamicAddressConfig
+	Zones              map[string]*ZoneConfig       // keyed by zone name
+	Policies           []*ZonePairPolicies          // ordered list of zone-pair policy sets
+	DefaultPolicy      PolicyAction                 // global fallback policy (permit-all or deny-all)
+	NAT                NATConfig
+	Screen             map[string]*ScreenProfile    // keyed by profile name
+	AddressBook        *AddressBook
+	Log                LogConfig
+	Flow               FlowConfig
+	ALG                ALGConfig
+	IPsec              IPsecConfig
+	DynamicAddress     DynamicAddressConfig
+	SSHKnownHosts      map[string][]SSHKnownHostKey // host -> keys
+	PolicyStatsEnabled bool                         // policy-stats system-wide enable
+	PreIDDefaultPolicy *PreIDDefaultPolicy          // pre-id-default-policy
 }
 
 // FlowConfig holds flow/session timeout configuration.
@@ -437,12 +440,25 @@ type SyslogStream struct {
 	SourceAddress string // source IP for this stream
 }
 
+// SSHKnownHostKey represents a known SSH host key.
+type SSHKnownHostKey struct {
+	Type string // "ecdsa-sha2-nistp256-key", "ssh-rsa-key", etc.
+	Key  string
+}
+
+// PreIDDefaultPolicy defines a pre-identification default policy.
+type PreIDDefaultPolicy struct {
+	LogSessionInit  bool
+	LogSessionClose bool
+}
+
 // ZoneConfig represents a security zone.
 type ZoneConfig struct {
 	Name               string
 	Interfaces         []string
 	ScreenProfile      string // reference to screen profile name
 	HostInboundTraffic *HostInboundTraffic
+	TCPRst             bool // send TCP RST for non-SYN packets to closed ports
 }
 
 // HostInboundTraffic defines what services are permitted to the firewall itself.
@@ -660,24 +676,32 @@ type InterfaceConfig struct {
 	Description     string // free-text interface description
 	VlanTagging     bool   // 802.1Q trunk mode
 	RedundantParent string // gigether-options redundant-parent (HA)
+	RedundancyGroup int    // redundant-ether-options redundancy-group (0 = none)
+	FabricMembers   []string // fabric-options member-interfaces
 	Units           map[int]*InterfaceUnit
 	Tunnel          *TunnelConfig // non-nil for tunnel interfaces (gre0, etc.)
 }
 
 // InterfaceUnit represents a logical unit on an interface.
 type InterfaceUnit struct {
-	Number        int
-	Description   string   // free-text unit description
-	VlanID        int      // 0 = native/untagged, >0 = 802.1Q tagged
-	PointToPoint  bool     // point-to-point link (for tunnels)
-	Addresses     []string // CIDR notation
-	MTU           int      // family-level MTU (0 = default)
-	DHCP          bool     // family inet { dhcp; }
-	DHCPv6        bool     // family inet6 { dhcpv6; }
-	DHCPv6Client  *DHCPv6ClientConfig
-	FilterInputV4 string // family inet { filter { input NAME; } }
-	FilterInputV6 string // family inet6 { filter { input NAME; } }
-	VRRPGroups    map[string]*VRRPGroup // keyed by address (CIDR), each address can have VRRP groups
+	Number         int
+	Description    string   // free-text unit description
+	VlanID         int      // 0 = native/untagged, >0 = 802.1Q tagged
+	PointToPoint   bool     // point-to-point link (for tunnels)
+	Addresses      []string // CIDR notation
+	PrimaryAddress string   // address marked as primary
+	MTU            int      // family-level MTU (0 = default)
+	DHCP           bool     // family inet { dhcp; }
+	DHCPv6         bool     // family inet6 { dhcpv6; }
+	DHCPv6Client   *DHCPv6ClientConfig
+	DADDisable     bool   // family inet6 { dad-disable; }
+	SamplingInput  bool   // family inet/inet6 { sampling { input; } }
+	SamplingOutput bool   // family inet/inet6 { sampling { output; } }
+	FilterInputV4  string // family inet { filter { input NAME; } }
+	FilterOutputV4 string // family inet { filter { output NAME; } }
+	FilterInputV6  string // family inet6 { filter { input NAME; } }
+	FilterOutputV6 string // family inet6 { filter { output NAME; } }
+	VRRPGroups     map[string]*VRRPGroup // keyed by address (CIDR), each address can have VRRP groups
 }
 
 // VRRPGroup defines a VRRP (Virtual Router Redundancy Protocol) group.

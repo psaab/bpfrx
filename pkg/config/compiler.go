@@ -304,6 +304,34 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 			if err := compileALG(child, sec); err != nil {
 				return fmt.Errorf("alg: %w", err)
 			}
+		case "ssh-known-hosts":
+			sec.SSHKnownHosts = make(map[string][]SSHKnownHostKey)
+			for _, hostInst := range namedInstances(child.FindChildren("host")) {
+				var keys []SSHKnownHostKey
+				for _, kp := range hostInst.node.Children {
+					name := kp.Name()
+					if v := nodeVal(kp); v != "" {
+						keys = append(keys, SSHKnownHostKey{Type: name, Key: v})
+					}
+				}
+				sec.SSHKnownHosts[hostInst.name] = keys
+			}
+		case "policy-stats":
+			if sw := child.FindChild("system-wide"); sw != nil {
+				sec.PolicyStatsEnabled = nodeVal(sw) == "enable"
+			}
+		case "pre-id-default-policy":
+			sec.PreIDDefaultPolicy = &PreIDDefaultPolicy{}
+			if thenNode := child.FindChild("then"); thenNode != nil {
+				if logNode := thenNode.FindChild("log"); logNode != nil {
+					if logNode.FindChild("session-init") != nil {
+						sec.PreIDDefaultPolicy.LogSessionInit = true
+					}
+					if logNode.FindChild("session-close") != nil {
+						sec.PreIDDefaultPolicy.LogSessionClose = true
+					}
+				}
+			}
 		}
 	}
 	return nil
@@ -337,6 +365,8 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 						}
 					}
 				}
+			case "tcp-rst":
+				zone.TCPRst = true
 			}
 		}
 
@@ -643,6 +673,24 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 		if goNode := child.FindChild("gigether-options"); goNode != nil {
 			if rpNode := goNode.FindChild("redundant-parent"); rpNode != nil {
 				ifc.RedundantParent = nodeVal(rpNode)
+			}
+		}
+
+		// Check for redundant-ether-options redundancy-group
+		if reoNode := child.FindChild("redundant-ether-options"); reoNode != nil {
+			if rgNode := reoNode.FindChild("redundancy-group"); rgNode != nil {
+				if v, err := strconv.Atoi(nodeVal(rgNode)); err == nil {
+					ifc.RedundancyGroup = v
+				}
+			}
+		}
+
+		// Check for fabric-options member-interfaces
+		if foNode := child.FindChild("fabric-options"); foNode != nil {
+			if miNode := foNode.FindChild("member-interfaces"); miNode != nil {
+				for _, m := range miNode.Children {
+					ifc.FabricMembers = append(ifc.FabricMembers, m.Name())
+				}
 			}
 		}
 
