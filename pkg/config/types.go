@@ -66,19 +66,36 @@ type SchedulerConfig struct {
 
 // SystemConfig holds system-level configuration.
 type SystemConfig struct {
-	HostName        string
-	TimeZone        string
-	NameServers     []string // DNS server addresses
-	NTPServers      []string // NTP server addresses
-	NoRedirects     bool     // disable ICMP redirects
-	BackupRouter    string   // backup default gateway IP
-	BackupRouterDst string   // backup router destination prefix
-	InternetOptions *InternetOptionsConfig
-	Services        *SystemServicesConfig
-	Syslog          *SystemSyslogConfig
-	DHCPServer      DHCPServerConfig
-	SNMP            *SNMPConfig
-	Login           *LoginConfig
+	HostName           string
+	TimeZone           string
+	NameServers        []string // DNS server addresses
+	NTPServers         []string // NTP server addresses
+	NoRedirects        bool     // disable ICMP redirects
+	BackupRouter       string   // backup default gateway IP
+	BackupRouterDst    string   // backup router destination prefix
+	InternetOptions    *InternetOptionsConfig
+	Services           *SystemServicesConfig
+	Syslog             *SystemSyslogConfig
+	DHCPServer         DHCPServerConfig
+	SNMP               *SNMPConfig
+	Login              *LoginConfig
+	RootAuthentication *RootAuthConfig
+	Archival           *ArchivalConfig
+	MasterPassword     string // pseudorandom-function value
+	LicenseAutoUpdate  string // license autoupdate URL
+	DisabledProcesses  []string // processes marked "disable"
+}
+
+// RootAuthConfig holds root-authentication settings.
+type RootAuthConfig struct {
+	EncryptedPassword string
+	SSHKeys           []string
+}
+
+// ArchivalConfig holds configuration archival settings.
+type ArchivalConfig struct {
+	TransferOnCommit bool
+	ArchiveSites     []string
 }
 
 // InternetOptionsConfig holds internet-options settings.
@@ -99,22 +116,38 @@ type SSHServiceConfig struct {
 
 // WebManagementConfig holds web management settings.
 type WebManagementConfig struct {
-	HTTP  bool
-	HTTPS bool
+	HTTP                     bool
+	HTTPS                    bool
+	HTTPInterface            string // interface binding for HTTP
+	HTTPSInterface           string // interface binding for HTTPS
+	SystemGeneratedCert      bool   // auto-generated TLS certificate
 }
 
 // SystemSyslogConfig holds traditional Junos system syslog config.
 type SystemSyslogConfig struct {
 	Hosts []*SyslogHostConfig
 	Files []*SyslogFileConfig
+	Users []*SyslogUserConfig // user destinations (e.g. "user * { any emergency; }")
+}
+
+// SyslogUserConfig defines a syslog user destination.
+type SyslogUserConfig struct {
+	User     string // "*" = all users
+	Facility string
+	Severity string
 }
 
 // SyslogHostConfig defines a syslog host destination.
 type SyslogHostConfig struct {
 	Address         string
-	Facility        string // "daemon", "change-log", "any", etc.
-	Severity        string // "info", "warning", "error", "emergency", "any"
+	Facilities      []SyslogFacility // multiple facility/severity pairs
 	AllowDuplicates bool
+}
+
+// SyslogFacility represents a facility/severity pair in syslog config.
+type SyslogFacility struct {
+	Facility string // "daemon", "change-log", "any", etc.
+	Severity string // "info", "warning", "error", "emergency", "any"
 }
 
 // SyslogFileConfig defines a syslog file destination.

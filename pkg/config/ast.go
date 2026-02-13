@@ -526,7 +526,30 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"time-zone":     {args: 1, children: nil},
 		"no-redirects":  {children: nil},
 		"name-server":   {children: nil},
-		"backup-router": {args: 1, children: nil},
+		"backup-router": {args: 1, children: map[string]*schemaNode{
+			"destination": {args: 1, children: nil},
+		}},
+		"root-authentication": {children: map[string]*schemaNode{
+			"encrypted-password": {args: 1, children: nil},
+			"ssh-ed25519":        {args: 1, children: nil},
+			"ssh-rsa":            {args: 1, children: nil},
+			"ssh-dsa":            {args: 1, children: nil},
+		}},
+		"archival": {children: map[string]*schemaNode{
+			"configuration": {children: map[string]*schemaNode{
+				"transfer-on-commit": {children: nil},
+				"archive-sites":      {args: 1, children: nil},
+			}},
+		}},
+		"master-password": {children: map[string]*schemaNode{
+			"pseudorandom-function": {args: 1, children: nil},
+		}},
+		"license": {children: map[string]*schemaNode{
+			"autoupdate": {children: map[string]*schemaNode{
+				"url": {args: 1, children: nil},
+			}},
+		}},
+		"processes": {children: nil},
 		"internet-options": {children: map[string]*schemaNode{
 			"no-ipv6-reject-zero-hop-limit": {children: nil},
 		}},
@@ -551,8 +574,13 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"root-login": {args: 1, children: nil},
 			}},
 			"web-management": {children: map[string]*schemaNode{
-				"http":  {children: nil},
-				"https": {children: nil},
+				"http": {children: map[string]*schemaNode{
+					"interface": {args: 1, children: nil},
+				}},
+				"https": {children: map[string]*schemaNode{
+					"system-generated-certificate": {children: nil},
+					"interface":                    {args: 1, children: nil},
+				}},
 			}},
 			"dhcp-local-server": {children: map[string]*schemaNode{
 				"group": {args: 1, children: map[string]*schemaNode{

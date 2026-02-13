@@ -5443,3 +5443,283 @@ func TestInterfaceDescriptionSetSyntax(t *testing.T) {
 	}
 }
 
+func TestSystemConfigRootAuthAndArchival(t *testing.T) {
+	input := `
+system {
+    root-authentication {
+        encrypted-password "$6$abc123";
+        ssh-ed25519 "ssh-ed25519 AAAA... user@host";
+        ssh-rsa "ssh-rsa AAAA... user@host";
+    }
+    archival {
+        configuration {
+            transfer-on-commit;
+            archive-sites {
+                "scp://backup@10.0.0.1:/configs";
+            }
+        }
+    }
+    master-password {
+        pseudorandom-function juniper-prf1;
+    }
+    license {
+        autoupdate {
+            url https://ae1.juniper.net/junos/key_retrieval;
+        }
+    }
+    processes {
+        utmd disable;
+    }
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	// root-authentication
+	ra := cfg.System.RootAuthentication
+	if ra == nil {
+		t.Fatal("root-authentication is nil")
+	}
+	if ra.EncryptedPassword != "$6$abc123" {
+		t.Errorf("encrypted-password = %q, want %q", ra.EncryptedPassword, "$6$abc123")
+	}
+	if len(ra.SSHKeys) != 2 {
+		t.Fatalf("ssh keys count = %d, want 2", len(ra.SSHKeys))
+	}
+
+	// archival
+	arch := cfg.System.Archival
+	if arch == nil {
+		t.Fatal("archival is nil")
+	}
+	if !arch.TransferOnCommit {
+		t.Error("transfer-on-commit should be true")
+	}
+	if len(arch.ArchiveSites) != 1 {
+		t.Fatalf("archive-sites count = %d, want 1", len(arch.ArchiveSites))
+	}
+	if arch.ArchiveSites[0] != "scp://backup@10.0.0.1:/configs" {
+		t.Errorf("archive-site = %q", arch.ArchiveSites[0])
+	}
+
+	// master-password
+	if cfg.System.MasterPassword != "juniper-prf1" {
+		t.Errorf("master-password = %q, want %q", cfg.System.MasterPassword, "juniper-prf1")
+	}
+
+	// license
+	if cfg.System.LicenseAutoUpdate != "https://ae1.juniper.net/junos/key_retrieval" {
+		t.Errorf("license autoupdate url = %q", cfg.System.LicenseAutoUpdate)
+	}
+
+	// processes
+	if len(cfg.System.DisabledProcesses) != 1 || cfg.System.DisabledProcesses[0] != "utmd" {
+		t.Errorf("disabled processes = %v, want [utmd]", cfg.System.DisabledProcesses)
+	}
+}
+
+func TestSystemConfigWebManagementEnhanced(t *testing.T) {
+	input := `
+system {
+    services {
+        web-management {
+            http {
+                interface fxp0.0;
+            }
+            https {
+                system-generated-certificate;
+                interface fxp0.0;
+            }
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	wm := cfg.System.Services.WebManagement
+	if wm == nil {
+		t.Fatal("web-management is nil")
+	}
+	if !wm.HTTP {
+		t.Error("HTTP should be true")
+	}
+	if !wm.HTTPS {
+		t.Error("HTTPS should be true")
+	}
+	if wm.HTTPInterface != "fxp0.0" {
+		t.Errorf("HTTP interface = %q, want fxp0.0", wm.HTTPInterface)
+	}
+	if wm.HTTPSInterface != "fxp0.0" {
+		t.Errorf("HTTPS interface = %q, want fxp0.0", wm.HTTPSInterface)
+	}
+	if !wm.SystemGeneratedCert {
+		t.Error("system-generated-certificate should be true")
+	}
+}
+
+func TestSyslogMultiFacilityAndUser(t *testing.T) {
+	input := `
+system {
+    syslog {
+        user * {
+            any emergency;
+        }
+        host 192.168.1.1 {
+            any any;
+            daemon info;
+            change-log info;
+            allow-duplicates;
+        }
+        file messages {
+            any notice;
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	sl := cfg.System.Syslog
+	if sl == nil {
+		t.Fatal("syslog is nil")
+	}
+
+	// user destination
+	if len(sl.Users) != 1 {
+		t.Fatalf("users count = %d, want 1", len(sl.Users))
+	}
+	if sl.Users[0].User != "*" {
+		t.Errorf("user = %q, want *", sl.Users[0].User)
+	}
+	if sl.Users[0].Facility != "any" || sl.Users[0].Severity != "emergency" {
+		t.Errorf("user facility/severity = %q/%q, want any/emergency",
+			sl.Users[0].Facility, sl.Users[0].Severity)
+	}
+
+	// host with multiple facilities
+	if len(sl.Hosts) != 1 {
+		t.Fatalf("hosts count = %d, want 1", len(sl.Hosts))
+	}
+	host := sl.Hosts[0]
+	if host.Address != "192.168.1.1" {
+		t.Errorf("host address = %q", host.Address)
+	}
+	if !host.AllowDuplicates {
+		t.Error("allow-duplicates should be true")
+	}
+	if len(host.Facilities) != 3 {
+		t.Fatalf("host facilities count = %d, want 3", len(host.Facilities))
+	}
+	// Check each facility
+	expected := []SyslogFacility{
+		{Facility: "any", Severity: "any"},
+		{Facility: "daemon", Severity: "info"},
+		{Facility: "change-log", Severity: "info"},
+	}
+	for i, exp := range expected {
+		if host.Facilities[i] != exp {
+			t.Errorf("facility[%d] = %+v, want %+v", i, host.Facilities[i], exp)
+		}
+	}
+}
+
+func TestSystemConfigSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set system root-authentication encrypted-password \"$6$abc\"",
+		"set system root-authentication ssh-ed25519 \"ssh-ed25519 AAAA\"",
+		"set system master-password pseudorandom-function juniper-prf1",
+		"set system license autoupdate url https://example.com/keys",
+		"set system processes utmd disable",
+		"set system services web-management https system-generated-certificate",
+		"set system services web-management https interface fxp0.0",
+		"set system syslog user * any emergency",
+		"set system syslog host 10.0.0.1 any any",
+		"set system syslog host 10.0.0.1 daemon info",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	if cfg.System.RootAuthentication == nil {
+		t.Fatal("root-authentication is nil")
+	}
+	if cfg.System.RootAuthentication.EncryptedPassword != "$6$abc" {
+		t.Errorf("encrypted-password = %q", cfg.System.RootAuthentication.EncryptedPassword)
+	}
+	if len(cfg.System.RootAuthentication.SSHKeys) != 1 {
+		t.Errorf("ssh keys = %d, want 1", len(cfg.System.RootAuthentication.SSHKeys))
+	}
+	if cfg.System.MasterPassword != "juniper-prf1" {
+		t.Errorf("master-password = %q", cfg.System.MasterPassword)
+	}
+	if cfg.System.LicenseAutoUpdate != "https://example.com/keys" {
+		t.Errorf("license url = %q", cfg.System.LicenseAutoUpdate)
+	}
+	if len(cfg.System.DisabledProcesses) != 1 || cfg.System.DisabledProcesses[0] != "utmd" {
+		t.Errorf("disabled processes = %v", cfg.System.DisabledProcesses)
+	}
+
+	wm := cfg.System.Services.WebManagement
+	if wm == nil {
+		t.Fatal("web-management nil")
+	}
+	if !wm.HTTPS {
+		t.Error("HTTPS should be true")
+	}
+	if !wm.SystemGeneratedCert {
+		t.Error("system-generated-certificate should be true")
+	}
+	if wm.HTTPSInterface != "fxp0.0" {
+		t.Errorf("HTTPS interface = %q", wm.HTTPSInterface)
+	}
+
+	// Syslog user
+	if cfg.System.Syslog == nil || len(cfg.System.Syslog.Users) != 1 {
+		t.Fatal("syslog user not parsed")
+	}
+	if cfg.System.Syslog.Users[0].User != "*" {
+		t.Errorf("syslog user = %q", cfg.System.Syslog.Users[0].User)
+	}
+
+	// Syslog host with multiple facilities
+	if len(cfg.System.Syslog.Hosts) != 1 {
+		t.Fatalf("syslog hosts = %d", len(cfg.System.Syslog.Hosts))
+	}
+	if len(cfg.System.Syslog.Hosts[0].Facilities) != 2 {
+		t.Errorf("syslog host facilities = %d, want 2", len(cfg.System.Syslog.Hosts[0].Facilities))
+	}
+}
+
