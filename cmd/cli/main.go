@@ -1210,6 +1210,26 @@ func (c *ctl) handleShowSystem(args []string) error {
 	switch args[0] {
 	case "rollback":
 		if len(args) >= 2 {
+			// "show system rollback compare N"
+			if args[1] == "compare" && len(args) >= 3 {
+				n, err := strconv.Atoi(args[2])
+				if err != nil || n < 1 {
+					return fmt.Errorf("usage: show system rollback compare <N>")
+				}
+				resp, err := c.client.ShowCompare(context.Background(), &pb.ShowCompareRequest{
+					RollbackN: int32(n),
+				})
+				if err != nil {
+					return fmt.Errorf("%v", err)
+				}
+				if resp.Output == "" {
+					fmt.Println("No differences found")
+				} else {
+					fmt.Print(resp.Output)
+				}
+				return nil
+			}
+
 			n, err := strconv.Atoi(args[1])
 			if err != nil || n < 1 {
 				return fmt.Errorf("usage: show system rollback <N>")
@@ -1218,6 +1238,20 @@ func (c *ctl) handleShowSystem(args []string) error {
 			rest := strings.Join(args[2:], " ")
 			if strings.Contains(rest, "| display set") {
 				format = pb.ConfigFormat_SET
+			} else if strings.Contains(rest, "compare") {
+				// "show system rollback N compare"
+				resp, err := c.client.ShowCompare(context.Background(), &pb.ShowCompareRequest{
+					RollbackN: int32(n),
+				})
+				if err != nil {
+					return fmt.Errorf("%v", err)
+				}
+				if resp.Output == "" {
+					fmt.Println("No differences found")
+				} else {
+					fmt.Print(resp.Output)
+				}
+				return nil
 			}
 			resp, err := c.client.ShowRollback(context.Background(), &pb.ShowRollbackRequest{
 				N:      int32(n),

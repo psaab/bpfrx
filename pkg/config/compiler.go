@@ -1589,6 +1589,16 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 		sec.Flow.AllowEmbeddedICMP = true
 	}
 
+	// gre-performance-acceleration
+	if node.FindChild("gre-performance-acceleration") != nil {
+		sec.Flow.GREPerformanceAcceleration = true
+	}
+
+	// power-mode-disable
+	if node.FindChild("power-mode-disable") != nil {
+		sec.Flow.PowerModeDisable = true
+	}
+
 	return nil
 }
 
@@ -1906,8 +1916,18 @@ func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
 				if len(prop.Keys) >= 2 {
 					ra.DNSServers = append(ra.DNSServers, nodeVal(prop))
 				}
-			case "nat64prefix":
+			case "preference":
+				ra.Preference = nodeVal(prop)
+			case "nat64prefix", "nat-prefix":
 				ra.NAT64Prefix = nodeVal(prop)
+				// Check for lifetime sub-property
+				if ltNode := prop.FindChild("lifetime"); ltNode != nil {
+					if v := nodeVal(ltNode); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							ra.NAT64PrefixLife = n
+						}
+					}
+				}
 			case "prefix":
 				pfxName := nodeVal(prop)
 				if pfxName != "" {
@@ -2835,6 +2855,21 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 					sys.NTPServers = append(sys.NTPServers, ntpChild.Keys[1])
 				}
 			}
+			if thNode := child.FindChild("threshold"); thNode != nil {
+				if v := nodeVal(thNode); v != "" {
+					sys.NTPThreshold, _ = strconv.Atoi(v)
+				}
+				// Check for inline: threshold 400 action accept;
+				for i := 2; i < len(thNode.Keys)-1; i++ {
+					if thNode.Keys[i] == "action" {
+						sys.NTPThresholdAction = thNode.Keys[i+1]
+					}
+				}
+				// Check for hierarchical: action { accept; }
+				if actNode := thNode.FindChild("action"); actNode != nil {
+					sys.NTPThresholdAction = nodeVal(actNode)
+				}
+			}
 		case "login":
 			sys.Login = &LoginConfig{}
 			for _, userInst := range namedInstances(child.FindChildren("user")) {
@@ -2989,6 +3024,13 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			if rl := sshNode.FindChild("root-login"); rl != nil && len(rl.Keys) >= 2 {
 				sys.Services.SSH.RootLogin = rl.Keys[1]
 			}
+		}
+		// DNS service
+		if svcNode.FindChild("dns") != nil {
+			if sys.Services == nil {
+				sys.Services = &SystemServicesConfig{}
+			}
+			sys.Services.DNSEnabled = true
 		}
 		// Web management
 		if wmNode := svcNode.FindChild("web-management"); wmNode != nil {

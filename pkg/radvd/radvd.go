@@ -90,6 +90,9 @@ func (m *Manager) generateConfig(raConfigs []*config.RAInterfaceConfig) string {
 		if ra.LinkMTU > 0 {
 			fmt.Fprintf(&b, "    AdvLinkMTU %d;\n", ra.LinkMTU)
 		}
+		if ra.Preference != "" {
+			fmt.Fprintf(&b, "    AdvDefaultPreference %s;\n", ra.Preference)
+		}
 
 		b.WriteString("\n")
 
@@ -123,7 +126,11 @@ func (m *Manager) generateConfig(raConfigs []*config.RAInterfaceConfig) string {
 		}
 
 		if ra.NAT64Prefix != "" {
-			fmt.Fprintf(&b, "    PREF64 %s\n    {\n    };\n\n", ra.NAT64Prefix)
+			fmt.Fprintf(&b, "    PREF64 %s\n    {\n", ra.NAT64Prefix)
+			if ra.NAT64PrefixLife > 0 {
+				fmt.Fprintf(&b, "        AdvPREF64Lifetime %d;\n", ra.NAT64PrefixLife)
+			}
+			b.WriteString("    };\n\n")
 		}
 
 		b.WriteString("};\n\n")

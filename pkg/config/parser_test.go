@@ -6121,3 +6121,166 @@ interfaces {
 	}
 }
 
+func TestFlowFlagsAndPowerMode(t *testing.T) {
+	input := `security {
+    flow {
+        tcp-mss {
+            all-tcp {
+                mss 1400;
+            }
+        }
+        gre-performance-acceleration;
+        power-mode-disable;
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Security.Flow.GREPerformanceAcceleration {
+		t.Error("GREPerformanceAcceleration should be true")
+	}
+	if !cfg.Security.Flow.PowerModeDisable {
+		t.Error("PowerModeDisable should be true")
+	}
+}
+
+func TestFlowFlagsSetSyntax(t *testing.T) {
+	commands := []string{
+		"set security flow gre-performance-acceleration",
+		"set security flow power-mode-disable",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range commands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Security.Flow.GREPerformanceAcceleration {
+		t.Error("GREPerformanceAcceleration should be true")
+	}
+	if !cfg.Security.Flow.PowerModeDisable {
+		t.Error("PowerModeDisable should be true")
+	}
+}
+
+func TestNTPThreshold(t *testing.T) {
+	input := `system {
+    ntp {
+        server 10.0.0.1;
+        threshold 300 action accept;
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.System.NTPThreshold != 300 {
+		t.Errorf("NTPThreshold = %d, want 300", cfg.System.NTPThreshold)
+	}
+	if cfg.System.NTPThresholdAction != "accept" {
+		t.Errorf("NTPThresholdAction = %q, want accept", cfg.System.NTPThresholdAction)
+	}
+}
+
+func TestNTPThresholdHierarchical(t *testing.T) {
+	input := `system {
+    ntp {
+        server 10.0.0.1;
+        threshold 300 {
+            action accept;
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.System.NTPThreshold != 300 {
+		t.Errorf("NTPThreshold = %d, want 300", cfg.System.NTPThreshold)
+	}
+	if cfg.System.NTPThresholdAction != "accept" {
+		t.Errorf("NTPThresholdAction = %q, want accept", cfg.System.NTPThresholdAction)
+	}
+}
+
+func TestDNSServiceEnabled(t *testing.T) {
+	input := `system {
+    services {
+        dns;
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.System.Services == nil {
+		t.Fatal("Services is nil")
+	}
+	if !cfg.System.Services.DNSEnabled {
+		t.Error("DNSEnabled should be true")
+	}
+}
+
+func TestRAPreferenceAndNAT64Lifetime(t *testing.T) {
+	input := `protocols {
+    router-advertisement {
+        interface reth2.0 {
+            prefix 2001:db8::/64;
+            preference high;
+            nat64prefix 64:ff9b::/96 {
+                lifetime 600;
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Protocols.RouterAdvertisement) == 0 {
+		t.Fatal("no RA interfaces")
+	}
+	ra := cfg.Protocols.RouterAdvertisement[0]
+	if ra.Preference != "high" {
+		t.Errorf("Preference = %q, want high", ra.Preference)
+	}
+	if ra.NAT64Prefix != "64:ff9b::/96" {
+		t.Errorf("NAT64Prefix = %q, want 64:ff9b::/96", ra.NAT64Prefix)
+	}
+	if ra.NAT64PrefixLife != 600 {
+		t.Errorf("NAT64PrefixLife = %d, want 600", ra.NAT64PrefixLife)
+	}
+}
+

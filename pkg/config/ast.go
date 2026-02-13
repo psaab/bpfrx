@@ -262,12 +262,14 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"flow": {children: map[string]*schemaNode{
-			"tcp-session":        {children: nil},
-			"udp-session":        {children: nil},
-			"icmp-session":       {children: nil},
-			"tcp-mss":            {children: nil},
-			"allow-dns-reply":    {children: nil},
-			"allow-embedded-icmp": {children: nil},
+			"tcp-session":                  {children: nil},
+			"udp-session":                  {children: nil},
+			"icmp-session":                 {children: nil},
+			"tcp-mss":                      {children: nil},
+			"allow-dns-reply":              {children: nil},
+			"allow-embedded-icmp":          {children: nil},
+			"gre-performance-acceleration": {children: nil},
+			"power-mode-disable":           {children: nil},
 		}},
 		"alg": {children: map[string]*schemaNode{
 			"dns":  {children: nil},
@@ -521,7 +523,14 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"router-advertisement": {children: map[string]*schemaNode{
 			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
-				"prefix": {args: 1, children: nil}, // prefix <prefix/len>
+				"prefix":     {args: 1, children: nil}, // prefix <prefix/len>
+				"preference": {args: 1, children: nil},
+				"nat-prefix":   {args: 1, children: map[string]*schemaNode{
+					"lifetime": {args: 1, children: nil},
+				}},
+				"nat64prefix": {args: 1, children: map[string]*schemaNode{
+					"lifetime": {args: 1, children: nil},
+				}},
 			}},
 		}},
 	}},
@@ -620,8 +629,10 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"no-ipv6-reject-zero-hop-limit": {children: nil},
 		}},
 		"ntp": {children: map[string]*schemaNode{
-			"server":    {args: 1, children: nil},
-			"threshold": {args: 1, children: nil},
+			"server": {args: 1, children: nil},
+			"threshold": {args: 1, children: map[string]*schemaNode{
+				"action": {args: 1, children: nil},
+			}},
 		}},
 		"syslog": {children: map[string]*schemaNode{
 			"user": {args: 1, children: nil},
@@ -648,6 +659,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"interface":                    {args: 1, children: nil},
 				}},
 			}},
+			"dns":               {children: nil},
 			"dhcp-local-server": {children: map[string]*schemaNode{
 				"group": {args: 1, children: map[string]*schemaNode{
 					"pool": {args: 1, children: nil},

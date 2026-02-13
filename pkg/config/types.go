@@ -70,6 +70,8 @@ type SystemConfig struct {
 	TimeZone           string
 	NameServers        []string // DNS server addresses
 	NTPServers         []string // NTP server addresses
+	NTPThreshold       int      // NTP threshold in milliseconds (0 = default)
+	NTPThresholdAction string   // "accept" or "reject"
 	NoRedirects        bool     // disable ICMP redirects
 	BackupRouter       string   // backup default gateway IP
 	BackupRouterDst    string   // backup router destination prefix
@@ -107,6 +109,7 @@ type InternetOptionsConfig struct {
 type SystemServicesConfig struct {
 	SSH           *SSHServiceConfig
 	WebManagement *WebManagementConfig
+	DNSEnabled    bool // system services dns
 }
 
 // SSHServiceConfig holds SSH service settings.
@@ -395,13 +398,15 @@ type SecurityConfig struct {
 
 // FlowConfig holds flow/session timeout configuration.
 type FlowConfig struct {
-	TCPSession         *TCPSessionConfig
-	UDPSessionTimeout  int // seconds, 0 = default (60s)
-	ICMPSessionTimeout int // seconds, 0 = default (30s)
-	TCPMSSIPsecVPN     int // TCP MSS clamp for IPsec VPN traffic (0 = disabled)
-	TCPMSSGre          int // TCP MSS clamp for GRE tunnel traffic (0 = disabled)
-	AllowDNSReply      bool
-	AllowEmbeddedICMP  bool
+	TCPSession                 *TCPSessionConfig
+	UDPSessionTimeout          int // seconds, 0 = default (60s)
+	ICMPSessionTimeout         int // seconds, 0 = default (30s)
+	TCPMSSIPsecVPN             int // TCP MSS clamp for IPsec VPN traffic (0 = disabled)
+	TCPMSSGre                  int // TCP MSS clamp for GRE tunnel traffic (0 = disabled)
+	AllowDNSReply              bool
+	AllowEmbeddedICMP          bool
+	GREPerformanceAcceleration bool
+	PowerModeDisable           bool
 }
 
 // ALGConfig holds ALG (Application Layer Gateway) disable flags.
@@ -820,12 +825,14 @@ type RAInterfaceConfig struct {
 	Interface          string
 	ManagedConfig      bool     // managed-configuration (M flag)
 	OtherStateful      bool     // other-stateful-configuration (O flag)
+	Preference         string   // "high", "medium", "low" (default: medium)
 	DefaultLifetime    int      // seconds, 0 = default (1800)
 	MaxAdvInterval     int      // seconds, 0 = default (600)
 	MinAdvInterval     int      // seconds, 0 = default (200)
 	Prefixes           []*RAPrefix
 	DNSServers         []string // recursive DNS server addresses
 	NAT64Prefix        string   // PREF64 prefix (e.g. "64:ff9b::/96")
+	NAT64PrefixLife    int      // PREF64 lifetime in seconds (0 = default)
 	LinkMTU            int      // advertised link MTU, 0 = omit
 }
 
