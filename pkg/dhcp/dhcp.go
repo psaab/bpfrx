@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/nclient4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/insomniacslk/dhcp/dhcpv6/nclient6"
@@ -51,6 +52,14 @@ type dhcpClient struct {
 	done   chan struct{}
 }
 
+// DHCPv4Options holds client behavior options for DHCPv4.
+type DHCPv4Options struct {
+	LeaseTime              int  // requested lease time in seconds (0 = server default)
+	RetransmissionAttempt  int  // max retransmission attempts (0 = unlimited)
+	RetransmissionInterval int  // base interval in seconds between retransmissions (0 = 1s default)
+	ForceDiscover          bool // always start with DISCOVER (skip REQUEST for renewal)
+}
+
 // Manager manages DHCP clients for multiple interfaces.
 type Manager struct {
 	mu              sync.Mutex
@@ -58,6 +67,7 @@ type Manager struct {
 	leases          map[clientKey]*Lease
 	duids           map[string]dhcpv6.DUID // interface name -> cached DUID
 	duidTypes       map[string]string      // interface name -> "duid-ll" or "duid-llt"
+	v4opts          map[string]*DHCPv4Options // interface name -> DHCPv4 options
 	onAddressChange func()
 	nlHandle        *netlink.Handle
 	recompileTimer  *time.Timer
@@ -77,6 +87,7 @@ func New(stateDir string, onAddressChange func()) (*Manager, error) {
 		leases:          make(map[clientKey]*Lease),
 		duids:           make(map[string]dhcpv6.DUID),
 		duidTypes:       make(map[string]string),
+		v4opts:          make(map[string]*DHCPv4Options),
 		onAddressChange: onAddressChange,
 		nlHandle:        nlh,
 		stateDir:        stateDir,
@@ -89,6 +100,14 @@ func (m *Manager) SetDUIDType(ifaceName, duidType string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.duidTypes[ifaceName] = duidType
+}
+
+// SetDHCPv4Options configures DHCPv4 client behavior for an interface.
+// Must be called before Start().
+func (m *Manager) SetDHCPv4Options(ifaceName string, opts *DHCPv4Options) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.v4opts[ifaceName] = opts
 }
 
 // Start begins a DHCP client for the given interface and address family.
@@ -324,7 +343,22 @@ func (m *Manager) LeaseFor(ifaceName string, af AddressFamily) *Lease {
 // runDHCPv4 runs the DHCPv4 DORA cycle with retries and renewal.
 func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 	key := clientKey{iface: ifaceName, family: AFInet}
-	backoff := time.Second
+
+	m.mu.Lock()
+	opts := m.v4opts[ifaceName]
+	m.mu.Unlock()
+
+	baseBackoff := time.Second
+	if opts != nil && opts.RetransmissionInterval > 0 {
+		baseBackoff = time.Duration(opts.RetransmissionInterval) * time.Second
+	}
+	maxAttempts := 0 // unlimited
+	if opts != nil && opts.RetransmissionAttempt > 0 {
+		maxAttempts = opts.RetransmissionAttempt
+	}
+
+	backoff := baseBackoff
+	attempt := 0
 
 	for {
 		if ctx.Err() != nil {
@@ -338,8 +372,15 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 			if ctx.Err() != nil {
 				return
 			}
+			attempt++
+			if maxAttempts > 0 && attempt >= maxAttempts {
+				slog.Warn("DHCPv4: max retransmission attempts reached",
+					"interface", ifaceName, "attempts", attempt)
+				return
+			}
 			slog.Warn("DHCPv4: discovery failed, retrying",
-				"interface", ifaceName, "err", err, "backoff", backoff)
+				"interface", ifaceName, "err", err, "backoff", backoff,
+				"attempt", attempt)
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
@@ -349,7 +390,8 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 			continue
 		}
 
-		backoff = time.Second // reset on success
+		backoff = baseBackoff // reset on success
+		attempt = 0
 
 		// Apply address
 		if err := m.applyAddress(ifaceName, lease); err != nil {
@@ -402,7 +444,16 @@ func (m *Manager) doDHCPv4(ctx context.Context, ifaceName string) (*Lease, error
 	exCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	dhcpLease, err := client.Request(exCtx)
+	// Build modifiers from per-interface DHCPv4 options
+	var mods []dhcpv4.Modifier
+	m.mu.Lock()
+	opts := m.v4opts[ifaceName]
+	m.mu.Unlock()
+	if opts != nil && opts.LeaseTime > 0 {
+		mods = append(mods, dhcpv4.WithLeaseTime(uint32(opts.LeaseTime)))
+	}
+
+	dhcpLease, err := client.Request(exCtx, mods...)
 	if err != nil {
 		return nil, fmt.Errorf("DHCPv4 request: %w", err)
 	}

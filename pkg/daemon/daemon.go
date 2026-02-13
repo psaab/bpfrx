@@ -630,6 +630,14 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 				dhcpIface = fmt.Sprintf("%s.%d", ifName, unit.VlanID)
 			}
 			if unit.DHCP {
+				if unit.DHCPOptions != nil {
+					dm.SetDHCPv4Options(dhcpIface, &dhcp.DHCPv4Options{
+						LeaseTime:              unit.DHCPOptions.LeaseTime,
+						RetransmissionAttempt:   unit.DHCPOptions.RetransmissionAttempt,
+						RetransmissionInterval: unit.DHCPOptions.RetransmissionInterval,
+						ForceDiscover:          unit.DHCPOptions.ForceDiscover,
+					})
+				}
 				slog.Info("starting DHCPv4 client", "interface", dhcpIface)
 				dm.Start(ctx, dhcpIface, dhcp.AFInet)
 			}
