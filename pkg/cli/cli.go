@@ -3586,6 +3586,22 @@ func (c *CLI) showInterfacesExtensive() error {
 		return links[i].Attrs().Name < links[j].Attrs().Name
 	})
 
+	// Build zone lookup from active config
+	ifZoneMap := make(map[string]string)
+	ifDescMap := make(map[string]string)
+	if activeCfg := c.store.ActiveConfig(); activeCfg != nil {
+		for _, z := range activeCfg.Security.Zones {
+			for _, ifName := range z.Interfaces {
+				ifZoneMap[ifName] = z.Name
+			}
+		}
+		for _, ifc := range activeCfg.Interfaces.Interfaces {
+			if ifc.Description != "" {
+				ifDescMap[ifc.Name] = ifc.Description
+			}
+		}
+	}
+
 	for _, link := range links {
 		attrs := link.Attrs()
 		if attrs.Name == "lo" {
@@ -3604,6 +3620,12 @@ func (c *CLI) showInterfacesExtensive() error {
 			linkStr = "Up"
 		}
 		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n", attrs.Name, adminStr, linkStr)
+		if desc, ok := ifDescMap[attrs.Name]; ok {
+			fmt.Printf("  Description: %s\n", desc)
+		}
+		if zone, ok := ifZoneMap[attrs.Name]; ok {
+			fmt.Printf("  Security zone: %s\n", zone)
+		}
 
 		// Type + speed + MTU
 		linkType := "Ethernet"

@@ -1244,17 +1244,19 @@ func (c *ctl) handleShowProtocols(args []string) error {
 func (c *ctl) handleShowSystem(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("show system:")
-		fmt.Println("  alarms           Show system alarms")
-		fmt.Println("  license          Show system license")
-		fmt.Println("  memory           Show memory usage")
-		fmt.Println("  ntp              Show NTP server status")
-		fmt.Println("  processes        Show running processes")
-		fmt.Println("  rollback         Show rollback history")
-		fmt.Println("  login            Show configured login users")
-		fmt.Println("  services         Show configured system services")
-		fmt.Println("  storage          Show filesystem usage")
-		fmt.Println("  syslog           Show system syslog configuration")
-		fmt.Println("  uptime           Show system uptime")
+		fmt.Println("  alarms             Show system alarms")
+		fmt.Println("  internet-options   Show internet options")
+		fmt.Println("  license            Show system license")
+		fmt.Println("  login              Show configured login users")
+		fmt.Println("  memory             Show memory usage")
+		fmt.Println("  ntp                Show NTP server status")
+		fmt.Println("  processes          Show running processes")
+		fmt.Println("  rollback           Show rollback history")
+		fmt.Println("  root-authentication Show root authentication")
+		fmt.Println("  services           Show configured system services")
+		fmt.Println("  storage            Show filesystem usage")
+		fmt.Println("  syslog             Show system syslog configuration")
+		fmt.Println("  uptime             Show system uptime")
 		return nil
 	}
 
@@ -1364,6 +1366,12 @@ func (c *ctl) handleShowSystem(args []string) error {
 
 	case "syslog":
 		return c.showText("system-syslog")
+
+	case "internet-options":
+		return c.showText("internet-options")
+
+	case "root-authentication":
+		return c.showText("root-authentication")
 
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])

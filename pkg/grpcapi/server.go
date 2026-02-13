@@ -1766,12 +1766,19 @@ var operationalTree = map[string]*completionNode{
 		"firewall":        {desc: "Show firewall filters"},
 		"dhcp-relay":      {desc: "Show DHCP relay status"},
 		"system": {desc: "Show system information", children: map[string]*completionNode{
-			"alarms":    {desc: "Show system alarms"},
-			"rollback":  {desc: "Show rollback history"},
-			"uptime":    {desc: "Show system uptime"},
-			"memory":    {desc: "Show memory usage"},
-			"processes": {desc: "Show running processes"},
-			"license":   {desc: "Show system license"},
+			"alarms":              {desc: "Show system alarms"},
+			"internet-options":    {desc: "Show internet options"},
+			"login":              {desc: "Show configured login users"},
+			"ntp":                {desc: "Show NTP server status"},
+			"rollback":           {desc: "Show rollback history"},
+			"root-authentication": {desc: "Show root authentication"},
+			"services":           {desc: "Show system services"},
+			"storage":            {desc: "Show filesystem usage"},
+			"syslog":             {desc: "Show system syslog configuration"},
+			"uptime":             {desc: "Show system uptime"},
+			"memory":             {desc: "Show memory usage"},
+			"processes":          {desc: "Show running processes"},
+			"license":            {desc: "Show system license"},
 		}},
 	}},
 	"request": {desc: "Perform system operations", children: map[string]*completionNode{
@@ -2876,6 +2883,19 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		sort.Slice(linksList, func(i, j int) bool {
 			return linksList[i].Attrs().Name < linksList[j].Attrs().Name
 		})
+		// Build config lookup for description/speed/duplex/zone
+		ifCfgMap := make(map[string]*config.InterfaceConfig)
+		ifZoneMap := make(map[string]string)
+		if cfg != nil {
+			for _, ifc := range cfg.Interfaces.Interfaces {
+				ifCfgMap[ifc.Name] = ifc
+			}
+			for _, z := range cfg.Security.Zones {
+				for _, ifName := range z.Interfaces {
+					ifZoneMap[ifName] = z.Name
+				}
+			}
+		}
 		for _, link := range linksList {
 			attrs := link.Attrs()
 			if attrs.Name == "lo" {
@@ -2892,6 +2912,20 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 				linkStr = "Up"
 			}
 			fmt.Fprintf(&buf, "Physical interface: %s, %s, Physical link is %s\n", attrs.Name, adminStr, linkStr)
+			if ifCfg, ok := ifCfgMap[attrs.Name]; ok {
+				if ifCfg.Description != "" {
+					fmt.Fprintf(&buf, "  Description: %s\n", ifCfg.Description)
+				}
+				if ifCfg.Speed != "" {
+					fmt.Fprintf(&buf, "  Speed: %s\n", ifCfg.Speed)
+				}
+				if ifCfg.Duplex != "" {
+					fmt.Fprintf(&buf, "  Duplex: %s\n", ifCfg.Duplex)
+				}
+			}
+			if zone, ok := ifZoneMap[attrs.Name]; ok {
+				fmt.Fprintf(&buf, "  Security zone: %s\n", zone)
+			}
 			fmt.Fprintf(&buf, "  Link-level type: %s, MTU: %d\n", attrs.EncapType, attrs.MTU)
 			if len(attrs.HardwareAddr) > 0 {
 				fmt.Fprintf(&buf, "  Current address: %s\n", attrs.HardwareAddr)
@@ -3022,6 +3056,39 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		fmt.Fprintln(&buf, "System services:")
 		fmt.Fprintln(&buf, "  gRPC:           127.0.0.1:50051 (always on)")
 		fmt.Fprintln(&buf, "  HTTP REST:      127.0.0.1:8080 (always on)")
+		if cfg.System.Services != nil {
+			if cfg.System.Services.SSH != nil {
+				rootLogin := cfg.System.Services.SSH.RootLogin
+				if rootLogin == "" {
+					rootLogin = "deny"
+				}
+				fmt.Fprintf(&buf, "  SSH:            enabled (root-login: %s)\n", rootLogin)
+			}
+			if cfg.System.Services.WebManagement != nil {
+				wm := cfg.System.Services.WebManagement
+				if wm.HTTP {
+					iface := "all"
+					if wm.HTTPInterface != "" {
+						iface = wm.HTTPInterface
+					}
+					fmt.Fprintf(&buf, "  Web HTTP:       enabled (interface: %s)\n", iface)
+				}
+				if wm.HTTPS {
+					iface := "all"
+					if wm.HTTPSInterface != "" {
+						iface = wm.HTTPSInterface
+					}
+					cert := ""
+					if wm.SystemGeneratedCert {
+						cert = ", system-generated-certificate"
+					}
+					fmt.Fprintf(&buf, "  Web HTTPS:      enabled (interface: %s%s)\n", iface, cert)
+				}
+			}
+			if cfg.System.Services.DNSEnabled {
+				fmt.Fprintln(&buf, "  DNS:            enabled")
+			}
+		}
 		if len(cfg.System.NameServers) > 0 {
 			fmt.Fprintf(&buf, "  DNS servers:    %s\n", strings.Join(cfg.System.NameServers, ", "))
 		}
@@ -3444,6 +3511,39 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			return nil, status.Errorf(codes.Internal, "journalctl: %v", err)
 		}
 		buf.Write(out)
+
+	case "internet-options":
+		if cfg == nil || cfg.System.InternetOptions == nil {
+			buf.WriteString("No internet-options configured\n")
+		} else {
+			io := cfg.System.InternetOptions
+			buf.WriteString("Internet options:\n")
+			fmt.Fprintf(&buf, "  no-ipv6-reject-zero-hop-limit: %s\n", boolStatus(io.NoIPv6RejectZeroHopLimit))
+		}
+
+	case "root-authentication":
+		if cfg == nil || cfg.System.RootAuthentication == nil {
+			buf.WriteString("No root authentication configured\n")
+		} else {
+			ra := cfg.System.RootAuthentication
+			if ra.EncryptedPassword != "" {
+				buf.WriteString("Root password: configured (encrypted)\n")
+			}
+			if len(ra.SSHKeys) > 0 {
+				fmt.Fprintf(&buf, "Root SSH keys: %d\n", len(ra.SSHKeys))
+				for _, key := range ra.SSHKeys {
+					// Show key type and fingerprint prefix
+					parts := strings.Fields(key)
+					if len(parts) >= 2 {
+						comment := ""
+						if len(parts) >= 3 {
+							comment = " " + parts[2]
+						}
+						fmt.Fprintf(&buf, "  %s%s\n", parts[0], comment)
+					}
+				}
+			}
+		}
 
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown topic: %s", req.Topic)
