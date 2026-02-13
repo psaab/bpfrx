@@ -19,6 +19,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/vishvananda/netlink"
+
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/conntrack"
@@ -2831,11 +2833,105 @@ func (s *Server) GetSystemInfo(_ context.Context, req *pb.GetSystemInfoRequest) 
 		}
 		buf.Write(out)
 
+	case "storage":
+		cmd := exec.Command("df", "-h")
+		out, err := cmd.Output()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "running df: %v", err)
+		}
+		buf.Write(out)
+
+	case "arp":
+		neighbors, err := netlink.NeighList(0, netlink.FAMILY_V4)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "listing ARP entries: %v", err)
+		}
+		fmt.Fprintf(&buf, "%-18s %-20s %-12s %-10s\n", "MAC Address", "Address", "Interface", "State")
+		for _, n := range neighbors {
+			if n.IP == nil || n.HardwareAddr == nil {
+				continue
+			}
+			ifName := ""
+			if link, err := netlink.LinkByIndex(n.LinkIndex); err == nil {
+				ifName = link.Attrs().Name
+			}
+			fmt.Fprintf(&buf, "%-18s %-20s %-12s %-10s\n",
+				n.HardwareAddr, n.IP, ifName, neighStateStr(n.State))
+		}
+
+	case "ipv6-neighbors":
+		neighbors, err := netlink.NeighList(0, netlink.FAMILY_V6)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "listing IPv6 neighbors: %v", err)
+		}
+		fmt.Fprintf(&buf, "%-18s %-40s %-12s %-10s\n", "MAC Address", "IPv6 Address", "Interface", "State")
+		for _, n := range neighbors {
+			if n.IP == nil || n.HardwareAddr == nil {
+				continue
+			}
+			ifName := ""
+			if link, err := netlink.LinkByIndex(n.LinkIndex); err == nil {
+				ifName = link.Attrs().Name
+			}
+			fmt.Fprintf(&buf, "%-18s %-40s %-12s %-10s\n",
+				n.HardwareAddr, n.IP, ifName, neighStateStr(n.State))
+		}
+
+	case "connections":
+		cmd := exec.Command("ss", "-tnp")
+		out, err := cmd.Output()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "running ss: %v", err)
+		}
+		buf.Write(out)
+
+	case "users":
+		cfg := s.store.ActiveConfig()
+		if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Users) == 0 {
+			fmt.Fprintln(&buf, "No login users configured")
+		} else {
+			fmt.Fprintf(&buf, "%-20s %-8s %-20s %s\n", "Username", "UID", "Class", "SSH Keys")
+			for _, u := range cfg.System.Login.Users {
+				uid := "-"
+				if u.UID > 0 {
+					uid = strconv.Itoa(u.UID)
+				}
+				class := u.Class
+				if class == "" {
+					class = "-"
+				}
+				fmt.Fprintf(&buf, "%-20s %-8s %-20s %d\n", u.Name, uid, class, len(u.SSHKeys))
+			}
+		}
+
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown system info type: %s", req.Type)
 	}
 
 	return &pb.GetSystemInfoResponse{Output: buf.String()}, nil
+}
+
+func neighStateStr(state int) string {
+	switch state {
+	case netlink.NUD_REACHABLE:
+		return "reachable"
+	case netlink.NUD_STALE:
+		return "stale"
+	case netlink.NUD_DELAY:
+		return "delay"
+	case netlink.NUD_PROBE:
+		return "probe"
+	case netlink.NUD_FAILED:
+		return "failed"
+	case netlink.NUD_PERMANENT:
+		return "permanent"
+	case netlink.NUD_INCOMPLETE:
+		return "incomplete"
+	case netlink.NUD_NOARP:
+		return "noarp"
+	default:
+		return "unknown"
+	}
 }
 
 // --- SystemAction RPC ---

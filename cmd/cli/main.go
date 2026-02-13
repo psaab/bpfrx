@@ -469,6 +469,17 @@ func (c *ctl) handleShow(args []string) error {
 	case "version":
 		return c.showText("version")
 
+	case "arp":
+		return c.showSystemInfo("arp")
+
+	case "ipv6":
+		if len(args) >= 2 && args[1] == "neighbors" {
+			return c.showSystemInfo("ipv6-neighbors")
+		}
+		fmt.Println("show ipv6:")
+		fmt.Println("  neighbors        Show IPv6 neighbor cache")
+		return nil
+
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
 	}
@@ -1240,6 +1251,12 @@ func (c *ctl) handleShowSystem(args []string) error {
 
 	case "alarms":
 		return c.showText("alarms")
+
+	case "users":
+		return c.showSystemInfo("users")
+
+	case "connections":
+		return c.showSystemInfo("connections")
 
 	case "license":
 		fmt.Println("License: open-source (no license required)")
