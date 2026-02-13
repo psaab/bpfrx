@@ -303,6 +303,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	var runErr error
 	if isInteractive() {
 		shell := cli.New(d.store, d.dp, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp)
+		shell.SetRPMResultsFn(func() []*rpm.ProbeResult {
+			if d.rpm != nil {
+				return d.rpm.Results()
+			}
+			return nil
+		})
 
 		// Run CLI in a goroutine so we can still handle signals
 		errCh := make(chan error, 1)

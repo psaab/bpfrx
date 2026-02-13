@@ -24,6 +24,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/ipsec"
 	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/routing"
+	"github.com/psaab/bpfrx/pkg/rpm"
 	"github.com/psaab/bpfrx/pkg/vrrp"
 	"github.com/vishvananda/netlink"
 )
@@ -38,9 +39,10 @@ type CLI struct {
 	routing     *routing.Manager
 	frr         *frr.Manager
 	ipsec       *ipsec.Manager
-	dhcp        *dhcp.Manager
-	hostname    string
-	username    string
+	dhcp         *dhcp.Manager
+	rpmResultsFn func() []*rpm.ProbeResult
+	hostname     string
+	username     string
 }
 
 // New creates a new CLI.
@@ -66,6 +68,11 @@ func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.Even
 		hostname:    hostname,
 		username:    username,
 	}
+}
+
+// SetRPMResultsFn sets a callback for retrieving live RPM probe results.
+func (c *CLI) SetRPMResultsFn(fn func() []*rpm.ProbeResult) {
+	c.rpmResultsFn = fn
 }
 
 // completionNode is a static command completion tree node.
@@ -3737,27 +3744,45 @@ func (c *CLI) handleShowServices(args []string) error {
 }
 
 func (c *CLI) showRPMProbeResults() error {
+	// Show live results if RPM manager is available
+	if c.rpmResultsFn != nil {
+		results := c.rpmResultsFn()
+		if len(results) == 0 {
+			fmt.Println("No RPM probes configured")
+			return nil
+		}
+		fmt.Println("RPM Probe Results:")
+		for _, r := range results {
+			fmt.Printf("  Probe: %s, Test: %s\n", r.ProbeName, r.TestName)
+			fmt.Printf("    Type: %s, Target: %s\n", r.ProbeType, r.Target)
+			fmt.Printf("    Status: %s", r.LastStatus)
+			if r.LastRTT > 0 {
+				fmt.Printf(", RTT: %s", r.LastRTT)
+			}
+			fmt.Println()
+			fmt.Printf("    Sent: %d, Received: %d", r.TotalSent, r.TotalRecv)
+			if r.TotalSent > 0 {
+				loss := float64(r.TotalSent-r.TotalRecv) / float64(r.TotalSent) * 100
+				fmt.Printf(", Loss: %.1f%%", loss)
+			}
+			fmt.Println()
+			if !r.LastProbeAt.IsZero() {
+				fmt.Printf("    Last probe: %s\n", r.LastProbeAt.Format("2006-01-02 15:04:05"))
+			}
+		}
+		return nil
+	}
+
+	// Fallback: show config only
 	cfg := c.store.ActiveConfig()
 	if cfg == nil || cfg.Services.RPM == nil || len(cfg.Services.RPM.Probes) == 0 {
 		fmt.Println("No RPM probes configured")
 		return nil
 	}
 
-	fmt.Println("RPM Probe Results:")
+	fmt.Println("RPM Probe Configuration:")
 	for probeName, probe := range cfg.Services.RPM.Probes {
 		for testName, test := range probe.Tests {
-			probeInt := test.ProbeInterval
-			if probeInt == 0 {
-				probeInt = 5
-			}
-			testInt := test.TestInterval
-			if testInt == 0 {
-				testInt = 60
-			}
-			thresh := test.ThresholdSuccessive
-			if thresh == 0 {
-				thresh = 3
-			}
 			fmt.Printf("  Probe: %s, Test: %s\n", probeName, testName)
 			fmt.Printf("    Type: %s, Target: %s\n", test.ProbeType, test.Target)
 			if test.SourceAddress != "" {
@@ -3765,11 +3790,6 @@ func (c *CLI) showRPMProbeResults() error {
 			}
 			if test.RoutingInstance != "" {
 				fmt.Printf("    Routing instance: %s\n", test.RoutingInstance)
-			}
-			fmt.Printf("    Probe interval: %ds, Test interval: %ds\n", probeInt, testInt)
-			fmt.Printf("    Threshold successive-loss: %d\n", thresh)
-			if test.DestPort > 0 {
-				fmt.Printf("    Destination port: %d\n", test.DestPort)
 			}
 		}
 	}
