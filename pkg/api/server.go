@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/conntrack"
 	"github.com/psaab/bpfrx/pkg/dataplane"
@@ -30,6 +31,7 @@ type Config struct {
 	FRR      *frr.Manager
 	IPsec    *ipsec.Manager
 	DHCP     *dhcp.Manager
+	ApplyFn  func(*config.Config) // daemon's applyConfig callback
 }
 
 // Server is the HTTP API server.
@@ -43,6 +45,7 @@ type Server struct {
 	frr        *frr.Manager
 	ipsec      *ipsec.Manager
 	dhcp       *dhcp.Manager
+	applyFn    func(*config.Config)
 	startTime  time.Time
 }
 
@@ -57,6 +60,7 @@ func NewServer(cfg Config) *Server {
 		frr:       cfg.FRR,
 		ipsec:     cfg.IPsec,
 		dhcp:      cfg.DHCP,
+		applyFn:   cfg.ApplyFn,
 		startTime: time.Now(),
 	}
 
@@ -119,6 +123,19 @@ func NewServer(cfg Config) *Server {
 	// Diagnostics
 	mux.HandleFunc("POST /api/v1/diagnostics/ping", s.pingHandler)
 	mux.HandleFunc("POST /api/v1/diagnostics/traceroute", s.tracerouteHandler)
+
+	// Config management
+	mux.HandleFunc("POST /api/v1/config/enter", s.configEnterHandler)
+	mux.HandleFunc("POST /api/v1/config/exit", s.configExitHandler)
+	mux.HandleFunc("GET /api/v1/config/status", s.configStatusHandler)
+	mux.HandleFunc("POST /api/v1/config/set", s.configSetHandler)
+	mux.HandleFunc("POST /api/v1/config/delete", s.configDeleteHandler)
+	mux.HandleFunc("POST /api/v1/config/commit", s.configCommitHandler)
+	mux.HandleFunc("POST /api/v1/config/commit-check", s.configCommitCheckHandler)
+	mux.HandleFunc("POST /api/v1/config/rollback", s.configRollbackHandler)
+	mux.HandleFunc("GET /api/v1/config/show", s.configShowHandler)
+	mux.HandleFunc("GET /api/v1/config/compare", s.configCompareHandler)
+	mux.HandleFunc("GET /api/v1/config/history", s.configHistoryHandler)
 
 	s.httpServer = &http.Server{
 		Addr:    cfg.Addr,

@@ -1573,3 +1573,146 @@ func (s *Server) tracerouteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOK(w, TextResponse{Output: output})
 }
+
+// --- Config management handlers ---
+
+func (s *Server) configEnterHandler(w http.ResponseWriter, _ *http.Request) {
+	if err := s.store.EnterConfigure(); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeOK(w, map[string]string{"status": "ok"})
+}
+
+func (s *Server) configExitHandler(w http.ResponseWriter, _ *http.Request) {
+	s.store.ExitConfigure()
+	writeOK(w, map[string]string{"status": "ok"})
+}
+
+func (s *Server) configStatusHandler(w http.ResponseWriter, _ *http.Request) {
+	writeOK(w, ConfigModeStatus{
+		InConfigMode:   s.store.InConfigMode(),
+		Dirty:          s.store.IsDirty(),
+		ConfirmPending: s.store.IsConfirmPending(),
+	})
+}
+
+func (s *Server) configSetHandler(w http.ResponseWriter, r *http.Request) {
+	var req ConfigSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Input == "" {
+		writeError(w, http.StatusBadRequest, "input required")
+		return
+	}
+	if err := s.store.SetFromInput(req.Input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOK(w, map[string]string{"status": "ok"})
+}
+
+func (s *Server) configDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	var req ConfigSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Input == "" {
+		writeError(w, http.StatusBadRequest, "input required")
+		return
+	}
+	if err := s.store.DeleteFromInput(req.Input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOK(w, map[string]string{"status": "ok"})
+}
+
+func (s *Server) configCommitHandler(w http.ResponseWriter, _ *http.Request) {
+	if s.store.IsConfirmPending() {
+		if err := s.store.ConfirmCommit(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeOK(w, map[string]string{"status": "ok"})
+		return
+	}
+
+	compiled, err := s.store.Commit()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if s.applyFn != nil {
+		s.applyFn(compiled)
+	}
+	writeOK(w, map[string]string{"status": "ok"})
+}
+
+func (s *Server) configCommitCheckHandler(w http.ResponseWriter, _ *http.Request) {
+	if _, err := s.store.CommitCheck(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOK(w, map[string]string{"status": "ok"})
+}
+
+func (s *Server) configRollbackHandler(w http.ResponseWriter, r *http.Request) {
+	var req ConfigRollbackRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := s.store.Rollback(req.N); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOK(w, map[string]string{"status": "ok"})
+}
+
+func (s *Server) configShowHandler(w http.ResponseWriter, r *http.Request) {
+	format := r.URL.Query().Get("format")
+	target := r.URL.Query().Get("target")
+
+	var output string
+	switch {
+	case target == "active" && format == "set":
+		output = s.store.ShowActiveSet()
+	case target == "active":
+		output = s.store.ShowActive()
+	case format == "set":
+		output = s.store.ShowCandidateSet()
+	default:
+		output = s.store.ShowCandidate()
+	}
+	writeOK(w, TextResponse{Output: output})
+}
+
+func (s *Server) configCompareHandler(w http.ResponseWriter, r *http.Request) {
+	rollbackN := queryInt(r, "rollback", 0)
+	if rollbackN > 0 {
+		diff, err := s.store.ShowCompareRollback(rollbackN)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeOK(w, TextResponse{Output: diff})
+		return
+	}
+	writeOK(w, TextResponse{Output: s.store.ShowCompare()})
+}
+
+func (s *Server) configHistoryHandler(w http.ResponseWriter, _ *http.Request) {
+	entries := s.store.ListHistory()
+	result := make([]HistoryEntry, len(entries))
+	for i, e := range entries {
+		result[i] = HistoryEntry{
+			Index:     i + 1,
+			Timestamp: e.Timestamp.Format("2006-01-02 15:04:05"),
+		}
+	}
+	writeOK(w, result)
+}

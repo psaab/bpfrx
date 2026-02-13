@@ -256,3 +256,26 @@ type TracerouteRequest struct {
 	Source          string `json:"source,omitempty"`
 	RoutingInstance string `json:"routing_instance,omitempty"`
 }
+
+// ConfigModeStatus holds config mode status.
+type ConfigModeStatus struct {
+	InConfigMode   bool `json:"in_config_mode"`
+	Dirty          bool `json:"dirty"`
+	ConfirmPending bool `json:"confirm_pending"`
+}
+
+// ConfigSetRequest holds a config set/delete input.
+type ConfigSetRequest struct {
+	Input string `json:"input"`
+}
+
+// ConfigRollbackRequest holds a rollback index.
+type ConfigRollbackRequest struct {
+	N int `json:"n"`
+}
+
+// HistoryEntry holds a commit history entry.
+type HistoryEntry struct {
+	Index     int    `json:"index"`
+	Timestamp string `json:"timestamp"`
+}

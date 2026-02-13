@@ -258,6 +258,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			FRR:      d.frr,
 			IPsec:    d.ipsec,
 			DHCP:     d.dhcp,
+			ApplyFn:  d.applyConfig,
 		})
 		wg.Add(1)
 		go func() {
