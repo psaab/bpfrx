@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/psaab/bpfrx/pkg/cmdtree"
 	"github.com/psaab/bpfrx/pkg/config"
 )
 
@@ -25,10 +26,10 @@ func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, p
 			return nil
 		}
 		currentNode = node
-		if node.children == nil {
-			if node.dynamicFn != nil && cfg != nil {
+		if node.Children == nil {
+			if node.DynamicFn != nil && cfg != nil {
 				var candidates []completionCandidate
-				for _, name := range node.dynamicFn(cfg) {
+				for _, name := range node.DynamicFn(cfg) {
 					if strings.HasPrefix(name, partial) {
 						candidates = append(candidates, completionCandidate{name: name, desc: "(configured)"})
 					}
@@ -37,17 +38,17 @@ func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, p
 			}
 			return nil
 		}
-		current = node.children
+		current = node.Children
 	}
 
 	var candidates []completionCandidate
 	for name, node := range current {
 		if strings.HasPrefix(name, partial) {
-			candidates = append(candidates, completionCandidate{name: name, desc: node.desc})
+			candidates = append(candidates, completionCandidate{name: name, desc: node.Desc})
 		}
 	}
-	if currentNode != nil && currentNode.dynamicFn != nil && cfg != nil {
-		for _, name := range currentNode.dynamicFn(cfg) {
+	if currentNode != nil && currentNode.DynamicFn != nil && cfg != nil {
+		for _, name := range currentNode.DynamicFn(cfg) {
 			if strings.HasPrefix(name, partial) {
 				candidates = append(candidates, completionCandidate{name: name, desc: "(configured)"})
 			}
@@ -76,38 +77,21 @@ func writeCompletionHelp(w io.Writer, candidates []completionCandidate) {
 }
 
 // keysFromTree returns a sorted list of keys from a completionNode map.
-// Used to derive resolveCommand lists from operationalTree at runtime.
+// Delegates to cmdtree.KeysFromTree.
 func keysFromTree(tree map[string]*completionNode) []string {
-	keys := make([]string, 0, len(tree))
-	for k := range tree {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+	return cmdtree.KeysFromTree(tree)
 }
 
 // treeHelpCandidates returns completionCandidates from a tree's children.
 func treeHelpCandidates(tree map[string]*completionNode) []completionCandidate {
 	candidates := make([]completionCandidate, 0, len(tree))
 	for name, node := range tree {
-		candidates = append(candidates, completionCandidate{name: name, desc: node.desc})
+		candidates = append(candidates, completionCandidate{name: name, desc: node.Desc})
 	}
 	return candidates
 }
 
 // commonPrefix returns the longest shared prefix among the given strings.
 func commonPrefix(items []string) string {
-	if len(items) == 0 {
-		return ""
-	}
-	prefix := items[0]
-	for _, s := range items[1:] {
-		for !strings.HasPrefix(s, prefix) {
-			prefix = prefix[:len(prefix)-1]
-			if prefix == "" {
-				return ""
-			}
-		}
-	}
-	return prefix
+	return cmdtree.CommonPrefix(items)
 }

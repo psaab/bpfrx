@@ -22,6 +22,7 @@ import (
 
 	"github.com/vishvananda/netlink"
 
+	"github.com/psaab/bpfrx/pkg/cmdtree"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/conntrack"
@@ -1851,12 +1852,12 @@ func (s *Server) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Compl
 
 func (s *Server) completeOperational(words []string, partial string) []string {
 	cfg := s.store.ActiveConfig()
-	return completeFromTree(operationalTree, words, partial, cfg)
+	return cmdtree.CompleteFromTree(cmdtree.OperationalTree, words, partial, cfg)
 }
 
 func (s *Server) completeConfig(words []string, partial string) []string {
 	if len(words) == 0 {
-		return filterPrefix(keysOf(configTopLevel), partial)
+		return cmdtree.FilterPrefix(cmdtree.KeysOf(cmdtree.ConfigTopLevel), partial)
 	}
 
 	switch words[0] {
@@ -1865,13 +1866,18 @@ func (s *Server) completeConfig(words []string, partial string) []string {
 		if schemaCompletions == nil {
 			return nil
 		}
-		return filterPrefix(schemaCompletions, partial)
+		return cmdtree.FilterPrefix(schemaCompletions, partial)
 	case "run":
 		cfg := s.store.ActiveConfig()
-		return completeFromTree(operationalTree, words[1:], partial, cfg)
+		return cmdtree.CompleteFromTree(cmdtree.OperationalTree, words[1:], partial, cfg)
 	case "commit":
 		if len(words) == 1 {
-			return filterPrefix([]string{"check", "confirmed"}, partial)
+			return cmdtree.FilterPrefix([]string{"check", "confirmed"}, partial)
+		}
+		return nil
+	case "load":
+		if len(words) == 1 {
+			return cmdtree.FilterPrefix([]string{"override", "merge"}, partial)
 		}
 		return nil
 	default:
@@ -1953,205 +1959,8 @@ func (s *Server) valueProvider(hint config.ValueHint) []string {
 	return nil
 }
 
-// --- shared command trees (same as cli.go) ---
-
-type completionNode struct {
-	desc      string
-	children  map[string]*completionNode
-	dynamicFn func(cfg *config.Config) []string
-}
-
-var operationalTree = map[string]*completionNode{
-	"configure": {desc: "Enter configuration mode"},
-	"ping":       {desc: "Ping remote host"},
-	"traceroute": {desc: "Trace route to remote host"},
-	"show": {desc: "Show information", children: map[string]*completionNode{
-		"configuration": {desc: "Show active configuration"},
-		"dhcp": {desc: "Show DHCP information", children: map[string]*completionNode{
-			"leases":            {desc: "Show DHCP leases"},
-			"client-identifier": {desc: "Show DHCPv6 DUID(s)"},
-			"relay":             {desc: "Show DHCP relay status"},
-		}},
-		"route": {desc: "Show routing table", children: map[string]*completionNode{
-			"instance": {desc: "Show routes for a routing instance", dynamicFn: func(cfg *config.Config) []string {
-				if cfg == nil {
-					return nil
-				}
-				names := make([]string, 0, len(cfg.RoutingInstances))
-				for _, ri := range cfg.RoutingInstances {
-					names = append(names, ri.Name)
-				}
-				return names
-			}},
-		}},
-		"schedulers": {desc: "Show policy schedulers"},
-		"snmp":       {desc: "Show SNMP statistics"},
-		"security": {desc: "Show security information", children: map[string]*completionNode{
-			"zones": {desc: "Show security zones", dynamicFn: func(cfg *config.Config) []string {
-				if cfg == nil {
-					return nil
-				}
-				names := make([]string, 0, len(cfg.Security.Zones))
-				for name := range cfg.Security.Zones {
-					names = append(names, name)
-				}
-				return names
-			}},
-			"policies": {desc: "Show security policies", children: map[string]*completionNode{
-				"brief": {desc: "Show brief policy summary"},
-			}},
-			"screen": {desc: "Show screen/IDS profiles"},
-			"flow": {desc: "Show flow information", children: map[string]*completionNode{
-				"session": {desc: "Show active sessions"},
-			}},
-			"nat": {desc: "Show NAT information", children: map[string]*completionNode{
-				"source":      {desc: "Show source NAT"},
-				"destination": {desc: "Show destination NAT"},
-				"static":      {desc: "Show static NAT"},
-			}},
-			"address-book":   {desc: "Show address book entries"},
-			"applications":   {desc: "Show application definitions"},
-			"alg":            {desc: "Show ALG status"},
-			"dynamic-address": {desc: "Show dynamic address feeds"},
-			"log":            {desc: "Show recent security events"},
-			"statistics":     {desc: "Show global statistics"},
-			"ipsec": {desc: "Show IPsec status", children: map[string]*completionNode{
-				"security-associations": {desc: "Show IPsec SAs"},
-			}},
-			"vrrp":           {desc: "Show VRRP high availability status"},
-			"match-policies": {desc: "Match 5-tuple against policies"},
-		}},
-		"interfaces": {desc: "Show interface status", dynamicFn: func(cfg *config.Config) []string {
-			if cfg == nil || cfg.Interfaces.Interfaces == nil {
-				return nil
-			}
-			names := make([]string, 0, len(cfg.Interfaces.Interfaces))
-			for name := range cfg.Interfaces.Interfaces {
-				names = append(names, name)
-			}
-			return names
-		}, children: map[string]*completionNode{
-			"tunnel": {desc: "Show tunnel interfaces"},
-		}},
-		"protocols": {desc: "Show protocol information", children: map[string]*completionNode{
-			"ospf": {desc: "Show OSPF information", children: map[string]*completionNode{
-				"neighbor": {desc: "Show OSPF neighbors"},
-				"database": {desc: "Show OSPF database"},
-			}},
-			"bgp": {desc: "Show BGP information", children: map[string]*completionNode{
-				"summary": {desc: "Show BGP peer summary"},
-				"routes":  {desc: "Show BGP routes"},
-			}},
-			"rip":  {desc: "Show RIP routes"},
-			"isis": {desc: "Show IS-IS information", children: map[string]*completionNode{
-				"adjacency": {desc: "Show IS-IS adjacencies"},
-				"routes":    {desc: "Show IS-IS routes"},
-			}},
-		}},
-		"flow-monitoring": {desc: "Show flow monitoring/NetFlow configuration"},
-		"firewall":        {desc: "Show firewall filters"},
-		"dhcp-relay":      {desc: "Show DHCP relay status"},
-		"system": {desc: "Show system information", children: map[string]*completionNode{
-			"alarms":              {desc: "Show system alarms"},
-			"internet-options":    {desc: "Show internet options"},
-			"login":              {desc: "Show configured login users"},
-			"ntp":                {desc: "Show NTP server status"},
-			"rollback":           {desc: "Show rollback history"},
-			"root-authentication": {desc: "Show root authentication"},
-			"services":           {desc: "Show system services"},
-			"storage":            {desc: "Show filesystem usage"},
-			"syslog":             {desc: "Show system syslog configuration"},
-			"uptime":             {desc: "Show system uptime"},
-			"memory":             {desc: "Show memory usage"},
-			"processes":          {desc: "Show running processes"},
-			"license":            {desc: "Show system license"},
-		}},
-	}},
-	"request": {desc: "Perform system operations", children: map[string]*completionNode{
-		"system": {desc: "System operations", children: map[string]*completionNode{
-			"reboot": {desc: "Reboot the system"},
-			"halt":   {desc: "Halt the system"},
-		}},
-	}},
-	"clear": {desc: "Clear information", children: map[string]*completionNode{
-		"security": {desc: "Clear security information", children: map[string]*completionNode{
-			"flow": {desc: "Clear flow information", children: map[string]*completionNode{
-				"session": {desc: "Clear all sessions"},
-			}},
-			"counters": {desc: "Clear all counters"},
-			"nat": {desc: "Clear NAT information", children: map[string]*completionNode{
-				"source": {desc: "Clear source NAT", children: map[string]*completionNode{
-					"persistent-nat-table": {desc: "Clear persistent NAT bindings"},
-				}},
-			}},
-		}},
-		"dhcp": {desc: "Clear DHCP information", children: map[string]*completionNode{
-			"client-identifier": {desc: "Clear DHCPv6 DUID(s)"},
-		}},
-	}},
-	"quit": {desc: "Exit CLI"},
-	"exit": {desc: "Exit CLI"},
-}
-
-var configTopLevel = map[string]*completionNode{
-	"set":    {desc: "Set a configuration value"},
-	"delete": {desc: "Delete a configuration element"},
-	"show":   {desc: "Show candidate configuration"},
-	"commit": {desc: "Commit configuration", children: map[string]*completionNode{
-		"check":     {desc: "Validate without applying"},
-		"confirmed": {desc: "Auto-rollback if not confirmed"},
-	}},
-	"rollback": {desc: "Revert to previous configuration"},
-	"run":      {desc: "Run operational command"},
-	"exit":     {desc: "Exit configuration mode"},
-	"quit":     {desc: "Exit configuration mode"},
-}
-
-func completeFromTree(tree map[string]*completionNode, words []string, partial string, cfg *config.Config) []string {
-	current := tree
-	var currentNode *completionNode
-	for _, w := range words {
-		node, ok := current[w]
-		if !ok {
-			return nil // dynamic value typed — no further completions
-		}
-		currentNode = node
-		if node.children == nil {
-			// Leaf node — only offer dynamic values if present.
-			if node.dynamicFn != nil && cfg != nil {
-				return filterPrefix(node.dynamicFn(cfg), partial)
-			}
-			return nil
-		}
-		current = node.children
-	}
-	candidates := keysOf(current)
-	if currentNode != nil && currentNode.dynamicFn != nil && cfg != nil {
-		candidates = append(candidates, currentNode.dynamicFn(cfg)...)
-	}
-	return filterPrefix(candidates, partial)
-}
-
-func keysOf(m map[string]*completionNode) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-func filterPrefix(items []string, prefix string) []string {
-	if prefix == "" {
-		return items
-	}
-	var result []string
-	for _, item := range items {
-		if strings.HasPrefix(item, prefix) {
-			result = append(result, item)
-		}
-	}
-	return result
-}
+// Command trees are defined in pkg/cmdtree (single source of truth).
+// gRPC completion uses cmdtree.CompleteFromTree directly.
 
 // --- helpers ---
 
