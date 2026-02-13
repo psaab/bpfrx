@@ -65,6 +65,49 @@ security {
 	}
 }
 
+func TestBracketList(t *testing.T) {
+	input := `security {
+    policies {
+        from-zone trust to-zone untrust {
+            policy allow-all {
+                match {
+                    source-address any;
+                    destination-address [ server1 server2 server3 ];
+                    application [ junos-http junos-https ];
+                }
+                then {
+                    permit;
+                }
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	if len(cfg.Security.Policies) == 0 {
+		t.Fatal("no policies compiled")
+	}
+	pol := cfg.Security.Policies[0]
+	if len(pol.Policies) == 0 {
+		t.Fatal("no policies compiled")
+	}
+	rule := pol.Policies[0]
+	if len(rule.Match.DestinationAddresses) != 3 {
+		t.Errorf("expected 3 dst addresses, got %d: %v", len(rule.Match.DestinationAddresses), rule.Match.DestinationAddresses)
+	}
+	if len(rule.Match.Applications) != 2 {
+		t.Errorf("expected 2 applications, got %d: %v", len(rule.Match.Applications), rule.Match.Applications)
+	}
+}
+
 func TestParseHierarchical(t *testing.T) {
 	input := `security {
     zones {

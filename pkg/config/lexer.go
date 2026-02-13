@@ -100,6 +100,13 @@ func (l *Lexer) Next() Token {
 	case '|':
 		l.advance()
 		return Token{Type: TokenPipe, Value: "|", Line: line, Column: col}
+	case '[':
+		// Bracket list: [ a b c ] — skip brackets, treat contents as regular tokens
+		l.advance()
+		return l.Next()
+	case ']':
+		l.advance()
+		return l.Next()
 	case '"':
 		return l.readString(line, col)
 	default:

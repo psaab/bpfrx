@@ -235,24 +235,17 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 }
 
 func compileZones(node *Node, sec *SecurityConfig) error {
-	for _, child := range node.FindChildren("security-zone") {
-		if len(child.Keys) < 2 {
-			return fmt.Errorf("security-zone missing name at line %d", child.Line)
-		}
-		zoneName := child.Keys[1]
-		zone := &ZoneConfig{Name: zoneName}
+	for _, inst := range namedInstances(node.FindChildren("security-zone")) {
+		zone := &ZoneConfig{Name: inst.name}
 
-		for _, prop := range child.Children {
+		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "interfaces":
 				for _, iface := range prop.Children {
 					zone.Interfaces = append(zone.Interfaces, iface.Name())
 				}
 			case "screen":
-				// "screen untrust-screen;" or "screen ids-option name;"
-				if len(prop.Keys) >= 2 {
-					zone.ScreenProfile = prop.Keys[1]
-				}
+				zone.ScreenProfile = nodeVal(prop)
 			case "host-inbound-traffic":
 				zone.HostInboundTraffic = &HostInboundTraffic{}
 				for _, hit := range prop.Children {
@@ -272,7 +265,7 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 			}
 		}
 
-		sec.Zones[zoneName] = zone
+		sec.Zones[inst.name] = zone
 	}
 	return nil
 }
@@ -316,17 +309,11 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 					for _, m := range matchNode.Children {
 						switch m.Name() {
 						case "source-address":
-							if len(m.Keys) >= 2 {
-								pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, m.Keys[1])
-							}
+							pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, m.Keys[1:]...)
 						case "destination-address":
-							if len(m.Keys) >= 2 {
-								pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, m.Keys[1])
-							}
+							pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, m.Keys[1:]...)
 						case "application":
-							if len(m.Keys) >= 2 {
-								pol.Match.Applications = append(pol.Match.Applications, m.Keys[1])
-							}
+							pol.Match.Applications = append(pol.Match.Applications, m.Keys[1:]...)
 						}
 					}
 				}
@@ -372,13 +359,10 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 }
 
 func compileScreen(node *Node, sec *SecurityConfig) error {
-	for _, child := range node.FindChildren("ids-option") {
-		if len(child.Keys) < 2 {
-			continue
-		}
-		profile := &ScreenProfile{Name: child.Keys[1]}
+	for _, inst := range namedInstances(node.FindChildren("ids-option")) {
+		profile := &ScreenProfile{Name: inst.name}
 
-		icmpNode := child.FindChild("icmp")
+		icmpNode := inst.node.FindChild("icmp")
 		if icmpNode != nil {
 			for _, opt := range icmpNode.Children {
 				switch opt.Name() {
@@ -389,12 +373,16 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 						if v, err := strconv.Atoi(opt.Keys[2]); err == nil {
 							profile.ICMP.FloodThreshold = v
 						}
+					} else if v := nodeVal(opt); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							profile.ICMP.FloodThreshold = n
+						}
 					}
 				}
 			}
 		}
 
-		ipNode := child.FindChild("ip")
+		ipNode := inst.node.FindChild("ip")
 		if ipNode != nil {
 			for _, opt := range ipNode.Children {
 				switch opt.Name() {
@@ -406,7 +394,7 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			}
 		}
 
-		tcpNode := child.FindChild("tcp")
+		tcpNode := inst.node.FindChild("tcp")
 		if tcpNode != nil {
 			for _, opt := range tcpNode.Children {
 				switch opt.Name() {
@@ -425,17 +413,21 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				case "syn-flood":
 					sf := &SynFloodConfig{}
 					for _, sfOpt := range opt.Children {
-						if len(sfOpt.Keys) >= 2 {
-							val, _ := strconv.Atoi(sfOpt.Keys[1])
+						val := nodeVal(sfOpt)
+						if val == "" && len(sfOpt.Keys) >= 2 {
+							val = sfOpt.Keys[1]
+						}
+						if val != "" {
+							n, _ := strconv.Atoi(val)
 							switch sfOpt.Name() {
 							case "alarm-threshold":
-								sf.AlarmThreshold = val
+								sf.AlarmThreshold = n
 							case "attack-threshold":
-								sf.AttackThreshold = val
+								sf.AttackThreshold = n
 							case "source-threshold":
-								sf.SourceThreshold = val
+								sf.SourceThreshold = n
 							case "timeout":
-								sf.Timeout = val
+								sf.Timeout = n
 							}
 						}
 					}
@@ -444,7 +436,7 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			}
 		}
 
-		udpNode := child.FindChild("udp")
+		udpNode := inst.node.FindChild("udp")
 		if udpNode != nil {
 			for _, opt := range udpNode.Children {
 				switch opt.Name() {
@@ -452,6 +444,10 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					if len(opt.Keys) >= 3 {
 						if v, err := strconv.Atoi(opt.Keys[2]); err == nil {
 							profile.UDP.FloodThreshold = v
+						}
+					} else if v := nodeVal(opt); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							profile.UDP.FloodThreshold = n
 						}
 					}
 				}
