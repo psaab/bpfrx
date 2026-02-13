@@ -626,6 +626,21 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 					return XDP_PASS;
 				}
 
+				/* allow-dns-reply: permit unsolicited DNS
+				 * response packets (UDP src port 53) without
+				 * a matching session. */
+				if (meta->protocol == PROTO_UDP &&
+				    meta->src_port == __bpf_htons(53)) {
+					struct flow_config *fc =
+						bpf_map_lookup_elem(
+						&flow_config_map, &zero);
+					if (fc && fc->allow_dns_reply) {
+						bpf_tail_call(ctx, &xdp_progs,
+							XDP_PROG_FORWARD);
+						return XDP_PASS;
+					}
+				}
+
 				meta->ct_state = SESS_STATE_NEW;
 				meta->ct_direction = 0;
 				TRACE_CT_MISS(meta);
@@ -690,6 +705,21 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 					bpf_tail_call(ctx, &xdp_progs,
 						      XDP_PROG_FORWARD);
 					return XDP_PASS;
+				}
+
+				/* allow-dns-reply: permit unsolicited DNS
+				 * response packets (UDP src port 53) without
+				 * a matching session. */
+				if (meta->protocol == PROTO_UDP &&
+				    meta->src_port == __bpf_htons(53)) {
+					struct flow_config *fc =
+						bpf_map_lookup_elem(
+						&flow_config_map, &zero);
+					if (fc && fc->allow_dns_reply) {
+						bpf_tail_call(ctx, &xdp_progs,
+							XDP_PROG_FORWARD);
+						return XDP_PASS;
+					}
 				}
 
 				meta->ct_state = SESS_STATE_NEW;
