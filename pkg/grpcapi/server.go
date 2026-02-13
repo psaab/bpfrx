@@ -2986,11 +2986,223 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			fmt.Fprintf(&buf, "\nNTP synchronized: %s\n", strings.TrimSpace(string(out)))
 		}
 
+	case "policy-options":
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else {
+			po := &cfg.PolicyOptions
+			if len(po.PrefixLists) > 0 {
+				buf.WriteString("Prefix lists:\n")
+				for name, pl := range po.PrefixLists {
+					fmt.Fprintf(&buf, "  %-30s %d prefixes\n", name, len(pl.Prefixes))
+					for _, p := range pl.Prefixes {
+						fmt.Fprintf(&buf, "    %s\n", p)
+					}
+				}
+			}
+			if len(po.PolicyStatements) > 0 {
+				if len(po.PrefixLists) > 0 {
+					buf.WriteString("\n")
+				}
+				buf.WriteString("Policy statements:\n")
+				for name, ps := range po.PolicyStatements {
+					fmt.Fprintf(&buf, "  %s", name)
+					if ps.DefaultAction != "" {
+						fmt.Fprintf(&buf, " (default: %s)", ps.DefaultAction)
+					}
+					buf.WriteString("\n")
+					for _, t := range ps.Terms {
+						fmt.Fprintf(&buf, "    term %s:", t.Name)
+						if t.FromProtocol != "" {
+							fmt.Fprintf(&buf, " from %s", t.FromProtocol)
+						}
+						if t.PrefixList != "" {
+							fmt.Fprintf(&buf, " prefix-list %s", t.PrefixList)
+						}
+						if t.Action != "" {
+							fmt.Fprintf(&buf, " then %s", t.Action)
+						}
+						if t.LoadBalance != "" {
+							fmt.Fprintf(&buf, " load-balance %s", t.LoadBalance)
+						}
+						buf.WriteString("\n")
+					}
+				}
+			}
+			if len(po.PrefixLists) == 0 && len(po.PolicyStatements) == 0 {
+				buf.WriteString("No policy-options configured\n")
+			}
+		}
+
+	case "event-options":
+		if cfg == nil || len(cfg.EventOptions) == 0 {
+			buf.WriteString("No event-options configured\n")
+		} else {
+			for _, ep := range cfg.EventOptions {
+				fmt.Fprintf(&buf, "Policy: %s\n", ep.Name)
+				if len(ep.Events) > 0 {
+					fmt.Fprintf(&buf, "  Events: %s\n", strings.Join(ep.Events, ", "))
+				}
+				for _, w := range ep.WithinClauses {
+					fmt.Fprintf(&buf, "  Within: %d seconds", w.Seconds)
+					if w.TriggerOn > 0 {
+						fmt.Fprintf(&buf, ", trigger on %d", w.TriggerOn)
+					}
+					if w.TriggerUntil > 0 {
+						fmt.Fprintf(&buf, ", trigger until %d", w.TriggerUntil)
+					}
+					buf.WriteString("\n")
+				}
+				if len(ep.AttributesMatch) > 0 {
+					buf.WriteString("  Attributes match:\n")
+					for _, am := range ep.AttributesMatch {
+						fmt.Fprintf(&buf, "    %s\n", am)
+					}
+				}
+				if len(ep.ThenCommands) > 0 {
+					buf.WriteString("  Then commands:\n")
+					for _, cmd := range ep.ThenCommands {
+						fmt.Fprintf(&buf, "    %s\n", cmd)
+					}
+				}
+				buf.WriteString("\n")
+			}
+		}
+
+	case "routing-options":
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else {
+			ro := &cfg.RoutingOptions
+			hasContent := false
+			if ro.AutonomousSystem > 0 {
+				fmt.Fprintf(&buf, "Autonomous system: %d\n\n", ro.AutonomousSystem)
+				hasContent = true
+			}
+			if ro.ForwardingTableExport != "" {
+				fmt.Fprintf(&buf, "Forwarding-table export: %s\n\n", ro.ForwardingTableExport)
+				hasContent = true
+			}
+			if len(ro.StaticRoutes) > 0 {
+				buf.WriteString("Static routes (inet.0):\n")
+				fmt.Fprintf(&buf, "  %-24s %-20s %s\n", "Destination", "Next-Hop", "Pref")
+				for _, sr := range ro.StaticRoutes {
+					if sr.Discard {
+						fmt.Fprintf(&buf, "  %-24s %-20s %s\n", sr.Destination, "discard", fmtPref(sr.Preference))
+						continue
+					}
+					for i, nh := range sr.NextHops {
+						dest := sr.Destination
+						if i > 0 {
+							dest = ""
+						}
+						nhStr := nh.Address
+						if nh.Interface != "" {
+							nhStr += " via " + nh.Interface
+						}
+						fmt.Fprintf(&buf, "  %-24s %-20s %s\n", dest, nhStr, fmtPref(sr.Preference))
+					}
+				}
+				buf.WriteString("\n")
+				hasContent = true
+			}
+			if len(ro.Inet6StaticRoutes) > 0 {
+				buf.WriteString("Static routes (inet6.0):\n")
+				fmt.Fprintf(&buf, "  %-40s %-30s %s\n", "Destination", "Next-Hop", "Pref")
+				for _, sr := range ro.Inet6StaticRoutes {
+					if sr.Discard {
+						fmt.Fprintf(&buf, "  %-40s %-30s %s\n", sr.Destination, "discard", fmtPref(sr.Preference))
+						continue
+					}
+					for i, nh := range sr.NextHops {
+						dest := sr.Destination
+						if i > 0 {
+							dest = ""
+						}
+						nhStr := nh.Address
+						if nh.Interface != "" {
+							nhStr += " via " + nh.Interface
+						}
+						fmt.Fprintf(&buf, "  %-40s %-30s %s\n", dest, nhStr, fmtPref(sr.Preference))
+					}
+				}
+				buf.WriteString("\n")
+				hasContent = true
+			}
+			if len(ro.RibGroups) > 0 {
+				buf.WriteString("RIB groups:\n")
+				for name, rg := range ro.RibGroups {
+					fmt.Fprintf(&buf, "  %-20s import-rib: %s\n", name, strings.Join(rg.ImportRibs, ", "))
+				}
+				buf.WriteString("\n")
+				hasContent = true
+			}
+			if !hasContent {
+				buf.WriteString("No routing-options configured\n")
+			}
+		}
+
+	case "forwarding-options":
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else {
+			fo := &cfg.ForwardingOptions
+			hasContent := false
+			if fo.FamilyInet6Mode != "" {
+				fmt.Fprintf(&buf, "Family inet6 mode: %s\n", fo.FamilyInet6Mode)
+				hasContent = true
+			}
+			if fo.Sampling != nil && len(fo.Sampling.Instances) > 0 {
+				buf.WriteString("Sampling:\n")
+				for name, inst := range fo.Sampling.Instances {
+					fmt.Fprintf(&buf, "  Instance: %s\n", name)
+					if inst.InputRate > 0 {
+						fmt.Fprintf(&buf, "    Input rate: 1/%d\n", inst.InputRate)
+					}
+					for _, fam := range []*config.SamplingFamily{inst.FamilyInet, inst.FamilyInet6} {
+						if fam == nil {
+							continue
+						}
+						for _, fs := range fam.FlowServers {
+							fmt.Fprintf(&buf, "    Flow server: %s:%d\n", fs.Address, fs.Port)
+							if fs.Version9Template != "" {
+								fmt.Fprintf(&buf, "      Version 9 template: %s\n", fs.Version9Template)
+							}
+						}
+						if fam.SourceAddress != "" {
+							fmt.Fprintf(&buf, "    Source address: %s\n", fam.SourceAddress)
+						}
+						if fam.InlineJflow {
+							buf.WriteString("    Inline jflow: enabled\n")
+						}
+						if fam.InlineJflowSourceAddress != "" {
+							fmt.Fprintf(&buf, "    Inline jflow source: %s\n", fam.InlineJflowSourceAddress)
+						}
+					}
+				}
+				hasContent = true
+			}
+			if fo.DHCPRelay != nil {
+				buf.WriteString("DHCP relay: (see 'show dhcp-relay' for details)\n")
+				hasContent = true
+			}
+			if !hasContent {
+				buf.WriteString("No forwarding-options configured\n")
+			}
+		}
+
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown topic: %s", req.Topic)
 	}
 
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+func fmtPref(p int) string {
+	if p == 0 {
+		return "-"
+	}
+	return strconv.Itoa(p)
 }
 
 func boolStatus(b bool) string {
