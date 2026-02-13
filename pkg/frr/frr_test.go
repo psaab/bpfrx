@@ -683,3 +683,97 @@ func TestApplyFull_BackupRouterWithPrefix(t *testing.T) {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
+
+func TestGenerateStaticRoute_QualifiedNextHopLinkLocal(t *testing.T) {
+	m := New()
+	sr := &config.StaticRoute{
+		Destination: "::/0",
+		NextHops: []config.NextHopEntry{
+			{Address: "fe80::2d0:f6ff:feda:c180", Interface: "wan0.0"},
+		},
+	}
+	got := m.generateStaticRoute(sr, "ATT")
+	want := "ipv6 route ::/0 fe80::2d0:f6ff:feda:c180 wan0 vrf ATT\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestGenerateStaticRoute_UnitSuffixStripped(t *testing.T) {
+	m := New()
+	sr := &config.StaticRoute{
+		Destination: "10.0.0.0/8",
+		NextHops:    []config.NextHopEntry{{Interface: "tunnel0.0"}},
+	}
+	got := m.generateStaticRoute(sr, "")
+	want := "ip route 10.0.0.0/8 tunnel0\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestGenerateStaticRoute_NoUnitNoStrip(t *testing.T) {
+	m := New()
+	sr := &config.StaticRoute{
+		Destination: "2001:db8::/32",
+		NextHops:    []config.NextHopEntry{{Address: "fe80::1", Interface: "trust0"}},
+	}
+	got := m.generateStaticRoute(sr, "")
+	want := "ipv6 route 2001:db8::/32 fe80::1 trust0\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestApplyFull_ConsistentHash(t *testing.T) {
+	m := New()
+	m.frrConf = filepath.Join(t.TempDir(), "frr.conf")
+	os.WriteFile(m.frrConf, []byte(""), 0644)
+
+	fc := &FullConfig{
+		ForwardingTableExport: "lb-policy",
+		PolicyOptions: &config.PolicyOptionsConfig{
+			PolicyStatements: map[string]*config.PolicyStatement{
+				"lb-policy": {
+					Name: "lb-policy",
+					Terms: []*config.PolicyTerm{
+						{LoadBalance: "consistent-hash", Action: "accept"},
+					},
+				},
+			},
+		},
+		BGP: &config.BGPConfig{
+			LocalAS:  65001,
+			RouterID: "1.1.1.1",
+		},
+	}
+	// ApplyFull will fail (no FRR), but fc.ConsistentHash should be set.
+	_ = m.ApplyFull(fc)
+	if !fc.ConsistentHash {
+		t.Error("ConsistentHash should be true with load-balance consistent-hash")
+	}
+}
+
+func TestApplyFull_PerPacketNotConsistent(t *testing.T) {
+	m := New()
+	m.frrConf = filepath.Join(t.TempDir(), "frr.conf")
+	os.WriteFile(m.frrConf, []byte(""), 0644)
+
+	fc := &FullConfig{
+		ForwardingTableExport: "lb-policy",
+		PolicyOptions: &config.PolicyOptionsConfig{
+			PolicyStatements: map[string]*config.PolicyStatement{
+				"lb-policy": {
+					Name: "lb-policy",
+					Terms: []*config.PolicyTerm{
+						{LoadBalance: "per-packet", Action: "accept"},
+					},
+				},
+			},
+		},
+	}
+	_ = m.ApplyFull(fc)
+	if fc.ConsistentHash {
+		t.Error("ConsistentHash should be false with load-balance per-packet")
+	}
+}

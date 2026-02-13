@@ -628,6 +628,19 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		if err := d.frr.ApplyFull(fc); err != nil {
 			slog.Warn("failed to apply FRR config", "err", err)
 		}
+
+		// Set L4 ECMP hash when consistent-hash is configured.
+		if fc.ConsistentHash {
+			path := "/proc/sys/net/ipv4/fib_multipath_hash_policy"
+			current, _ := os.ReadFile(path)
+			if strings.TrimSpace(string(current)) != "1" {
+				if err := os.WriteFile(path, []byte("1\n"), 0644); err != nil {
+					slog.Warn("failed to set fib_multipath_hash_policy", "err", err)
+				} else {
+					slog.Info("enabled L4 ECMP hashing (consistent-hash)")
+				}
+			}
+		}
 	}
 
 	// 3b. Apply next-table policy routing rules (ip rule)
@@ -643,6 +656,14 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	if d.routing != nil && len(cfg.RoutingOptions.RibGroups) > 0 {
 		if err := d.routing.ApplyRibGroupRules(cfg.RoutingOptions.RibGroups, cfg.RoutingInstances); err != nil {
 			slog.Warn("failed to apply rib-group rules", "err", err)
+		}
+	}
+
+	// 3d. Apply policy-based routing rules (ip rule) for firewall filter routing-instance
+	if d.routing != nil {
+		pbrRules := routing.BuildPBRRules(&cfg.Firewall, cfg.RoutingInstances)
+		if err := d.routing.ApplyPBRRules(pbrRules); err != nil {
+			slog.Warn("failed to apply PBR rules", "err", err)
 		}
 	}
 

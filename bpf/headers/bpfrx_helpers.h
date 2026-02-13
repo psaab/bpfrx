@@ -937,41 +937,51 @@ evaluate_firewall_filter(struct pkt_meta *meta)
 
 		/* Check source address (v4 or v6 depending on family) */
 		if (match && (flags & FILTER_MATCH_SRC_ADDR)) {
+			int src_hit = 1;
 			if (meta->addr_family == AF_INET) {
 				__be32 masked = meta->src_ip.v4 &
 					*(__be32 *)rule->src_mask;
 				if (masked != *(__be32 *)rule->src_addr)
-					match = 0;
+					src_hit = 0;
 			} else {
 				/* IPv6: compare 4 x 32-bit words */
 				for (int j = 0; j < 16; j += 4) {
 					__u32 m = *(__u32 *)(meta->src_ip.v6 + j) &
 						  *(__u32 *)(rule->src_mask + j);
 					if (m != *(__u32 *)(rule->src_addr + j)) {
-						match = 0;
+						src_hit = 0;
 						break;
 					}
 				}
 			}
+			if (flags & FILTER_MATCH_SRC_NEGATE)
+				src_hit = !src_hit;
+			if (!src_hit)
+				match = 0;
 		}
 
 		/* Check destination address */
 		if (match && (flags & FILTER_MATCH_DST_ADDR)) {
+			int dst_hit = 1;
 			if (meta->addr_family == AF_INET) {
 				__be32 masked = meta->dst_ip.v4 &
 					*(__be32 *)rule->dst_mask;
 				if (masked != *(__be32 *)rule->dst_addr)
-					match = 0;
+					dst_hit = 0;
 			} else {
 				for (int j = 0; j < 16; j += 4) {
 					__u32 m = *(__u32 *)(meta->dst_ip.v6 + j) &
 						  *(__u32 *)(rule->dst_mask + j);
 					if (m != *(__u32 *)(rule->dst_addr + j)) {
-						match = 0;
+						dst_hit = 0;
 						break;
 					}
 				}
 			}
+			if (flags & FILTER_MATCH_DST_NEGATE)
+				dst_hit = !dst_hit;
+			if (!dst_hit)
+				match = 0;
 		}
 
 		if (!match)
@@ -1089,39 +1099,49 @@ evaluate_firewall_filter_output(struct pkt_meta *meta, __u32 egress_ifindex)
 			match = 0;
 
 		if (match && (flags & FILTER_MATCH_SRC_ADDR)) {
+			int src_hit = 1;
 			if (meta->addr_family == AF_INET) {
 				__be32 masked = meta->src_ip.v4 &
 					*(__be32 *)rule->src_mask;
 				if (masked != *(__be32 *)rule->src_addr)
-					match = 0;
+					src_hit = 0;
 			} else {
 				for (int j = 0; j < 16; j += 4) {
 					__u32 m = *(__u32 *)(meta->src_ip.v6 + j) &
 						  *(__u32 *)(rule->src_mask + j);
 					if (m != *(__u32 *)(rule->src_addr + j)) {
-						match = 0;
+						src_hit = 0;
 						break;
 					}
 				}
 			}
+			if (flags & FILTER_MATCH_SRC_NEGATE)
+				src_hit = !src_hit;
+			if (!src_hit)
+				match = 0;
 		}
 
 		if (match && (flags & FILTER_MATCH_DST_ADDR)) {
+			int dst_hit = 1;
 			if (meta->addr_family == AF_INET) {
 				__be32 masked = meta->dst_ip.v4 &
 					*(__be32 *)rule->dst_mask;
 				if (masked != *(__be32 *)rule->dst_addr)
-					match = 0;
+					dst_hit = 0;
 			} else {
 				for (int j = 0; j < 16; j += 4) {
 					__u32 m = *(__u32 *)(meta->dst_ip.v6 + j) &
 						  *(__u32 *)(rule->dst_mask + j);
 					if (m != *(__u32 *)(rule->dst_addr + j)) {
-						match = 0;
+						dst_hit = 0;
 						break;
 					}
 				}
 			}
+			if (flags & FILTER_MATCH_DST_NEGATE)
+				dst_hit = !dst_hit;
+			if (!dst_hit)
+				match = 0;
 		}
 
 		if (!match)

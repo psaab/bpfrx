@@ -72,6 +72,11 @@ type FullConfig struct {
 	// Installed with admin distance 250 so it's only used when all other defaults fail.
 	BackupRouter    string // next-hop IP (e.g. "192.168.50.1")
 	BackupRouterDst string // destination prefix (e.g. "192.168.0.0/16"), default "0.0.0.0/0"
+
+	// ConsistentHash is set when the forwarding-table export policy uses
+	// "load-balance consistent-hash". The daemon should set
+	// net.ipv4.fib_multipath_hash_policy=1 for L4 ECMP hashing.
+	ConsistentHash bool
 }
 
 // Apply generates an FRR config from OSPF/BGP settings and reloads FRR.
@@ -268,12 +273,17 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	// Resolve forwarding-table export policy for ECMP.
 	// If the referenced policy has "load-balance per-packet" or "consistent-hash",
 	// enable ECMP multipath (maximum-paths 64) in BGP/OSPF.
+	// "consistent-hash" additionally signals the daemon to set
+	// fib_multipath_hash_policy=1 for L4 hashing.
 	ecmpMaxPaths := 0
 	if fc.ForwardingTableExport != "" && fc.PolicyOptions != nil {
 		if ps, ok := fc.PolicyOptions.PolicyStatements[fc.ForwardingTableExport]; ok {
 			for _, term := range ps.Terms {
 				if term.LoadBalance != "" {
 					ecmpMaxPaths = 64
+				}
+				if term.LoadBalance == "consistent-hash" {
+					fc.ConsistentHash = true
 				}
 			}
 		}
@@ -338,14 +348,20 @@ func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string) st
 	// One line per next-hop → FRR creates ECMP.
 	var b strings.Builder
 	for _, nh := range sr.NextHops {
+		// Strip Junos unit suffix (e.g. "wan0.0" → "wan0") for FRR kernel names.
+		ifName := nh.Interface
+		if idx := strings.LastIndex(ifName, "."); idx > 0 {
+			ifName = ifName[:idx]
+		}
+
 		var nexthop string
 		switch {
-		case nh.Address != "" && nh.Interface != "":
-			nexthop = nh.Address + " " + nh.Interface
+		case nh.Address != "" && ifName != "":
+			nexthop = nh.Address + " " + ifName
 		case nh.Address != "":
 			nexthop = nh.Address
-		case nh.Interface != "":
-			nexthop = nh.Interface
+		case ifName != "":
+			nexthop = ifName
 		default:
 			continue
 		}

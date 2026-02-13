@@ -695,6 +695,208 @@ func (m *Manager) clearRibGroupRules() error {
 	return nil
 }
 
+// pbrRulePriority is the base priority for policy-based routing ip rules.
+// After rib-group rules (33000-33099), before the default table (32766 is main).
+// We use 34000-34999 range.
+const pbrRulePriority = 34000
+
+// PBRRule describes a single policy-based routing rule derived from a
+// firewall filter term with a routing-instance action.
+type PBRRule struct {
+	Family   int    // unix.AF_INET or unix.AF_INET6
+	TOS      uint8  // TOS byte (DSCP << 2), 0 = no TOS match
+	Src      string // source CIDR, "" = any
+	Dst      string // destination CIDR, "" = any
+	TableID  int    // target routing table
+	Instance string // routing instance name (for logging)
+}
+
+// ApplyPBRRules creates Linux policy routing rules (ip rule) for firewall
+// filter terms that use a routing-instance action. This implements
+// policy-based routing: traffic matching DSCP/source/destination criteria
+// is routed via the specified VRF's routing table.
+func (m *Manager) ApplyPBRRules(rules []PBRRule) error {
+	// Clean up old PBR rules first
+	if err := m.clearPBRRules(); err != nil {
+		slog.Warn("failed to clear old PBR rules", "err", err)
+	}
+
+	if len(rules) == 0 {
+		return nil
+	}
+
+	prio := pbrRulePriority
+	for _, pbr := range rules {
+		rule := netlink.NewRule()
+		rule.Table = pbr.TableID
+		rule.Priority = prio
+		rule.Family = pbr.Family
+
+		if pbr.TOS != 0 {
+			rule.Tos = uint(pbr.TOS)
+		}
+		if pbr.Src != "" {
+			_, src, err := net.ParseCIDR(pbr.Src)
+			if err != nil {
+				slog.Warn("invalid PBR source", "src", pbr.Src, "err", err)
+				continue
+			}
+			rule.Src = src
+		}
+		if pbr.Dst != "" {
+			_, dst, err := net.ParseCIDR(pbr.Dst)
+			if err != nil {
+				slog.Warn("invalid PBR destination", "dst", pbr.Dst, "err", err)
+				continue
+			}
+			rule.Dst = dst
+		}
+
+		if err := m.nlHandle.RuleAdd(rule); err != nil {
+			slog.Warn("failed to add PBR rule",
+				"instance", pbr.Instance, "tos", pbr.TOS,
+				"src", pbr.Src, "dst", pbr.Dst,
+				"table", pbr.TableID, "err", err)
+			continue
+		}
+		slog.Info("PBR rule added",
+			"instance", pbr.Instance, "tos", pbr.TOS,
+			"src", pbr.Src, "dst", pbr.Dst, "table", pbr.TableID)
+		prio++
+		if prio >= pbrRulePriority+1000 {
+			slog.Warn("PBR rule limit reached")
+			break
+		}
+	}
+	return nil
+}
+
+// clearPBRRules removes all ip rules in the PBR priority range.
+func (m *Manager) clearPBRRules() error {
+	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
+		rules, err := m.nlHandle.RuleList(family)
+		if err != nil {
+			continue
+		}
+		for _, r := range rules {
+			if r.Priority >= pbrRulePriority && r.Priority < pbrRulePriority+1000 {
+				if err := m.nlHandle.RuleDel(&r); err != nil {
+					slog.Debug("failed to delete stale PBR rule",
+						"priority", r.Priority, "err", err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// BuildPBRRules extracts policy-based routing rules from firewall filter
+// configuration. Each filter term with a routing-instance action produces
+// one or more PBR rules depending on the match criteria.
+func BuildPBRRules(fw *config.FirewallConfig, instances []*config.RoutingInstanceConfig) []PBRRule {
+	if fw == nil {
+		return nil
+	}
+
+	// Build instance name → table ID map
+	tableIDs := make(map[string]int)
+	for _, inst := range instances {
+		tableIDs[inst.Name] = inst.TableID
+	}
+
+	var rules []PBRRule
+	// Process inet filters
+	for _, filter := range fw.FiltersInet {
+		rules = append(rules, buildPBRFromFilter(filter, unix.AF_INET, tableIDs)...)
+	}
+	// Process inet6 filters
+	for _, filter := range fw.FiltersInet6 {
+		rules = append(rules, buildPBRFromFilter(filter, unix.AF_INET6, tableIDs)...)
+	}
+	return rules
+}
+
+// buildPBRFromFilter extracts PBR rules from a single firewall filter.
+func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[string]int) []PBRRule {
+	var rules []PBRRule
+	for _, term := range filter.Terms {
+		if term.RoutingInstance == "" {
+			continue
+		}
+		tableID, ok := tableIDs[term.RoutingInstance]
+		if !ok {
+			slog.Warn("PBR: routing-instance not found",
+				"filter", filter.Name, "term", term.Name,
+				"instance", term.RoutingInstance)
+			continue
+		}
+
+		// Determine TOS byte from DSCP value
+		var tos uint8
+		if term.DSCP != "" {
+			tos = dscpToTOS(term.DSCP)
+		}
+
+		// If the term has source/dest addresses, create a rule per address.
+		// If it has neither addresses nor DSCP, we can't express it as ip rule.
+		srcs := term.SourceAddresses
+		dsts := term.DestAddresses
+		if len(srcs) == 0 {
+			srcs = []string{""}
+		}
+		if len(dsts) == 0 {
+			dsts = []string{""}
+		}
+
+		// Check if we have anything ip rule can match on
+		hasCriteria := tos != 0 || term.SourceAddresses != nil || term.DestAddresses != nil
+		if !hasCriteria {
+			slog.Warn("PBR: filter term has routing-instance but no ip-rule-compatible criteria (dscp, source-address, destination-address)",
+				"filter", filter.Name, "term", term.Name)
+			continue
+		}
+
+		for _, src := range srcs {
+			for _, dst := range dsts {
+				rules = append(rules, PBRRule{
+					Family:   family,
+					TOS:      tos,
+					Src:      src,
+					Dst:      dst,
+					TableID:  tableID,
+					Instance: term.RoutingInstance,
+				})
+			}
+		}
+	}
+	return rules
+}
+
+// dscpToTOS converts a DSCP name or numeric value to a TOS byte.
+// TOS byte = DSCP value << 2 (DSCP occupies the upper 6 bits of the TOS byte).
+func dscpToTOS(dscp string) uint8 {
+	// DSCP name → numeric value mapping (same values as dataplane.DSCPValues)
+	dscpValues := map[string]uint8{
+		"ef":   46,
+		"af11": 10, "af12": 12, "af13": 14,
+		"af21": 18, "af22": 20, "af23": 22,
+		"af31": 26, "af32": 28, "af33": 30,
+		"af41": 34, "af42": 36, "af43": 38,
+		"cs0": 0, "cs1": 8, "cs2": 16, "cs3": 24,
+		"cs4": 32, "cs5": 40, "cs6": 48, "cs7": 56,
+		"be": 0,
+	}
+
+	name := strings.ToLower(dscp)
+	if val, ok := dscpValues[name]; ok {
+		return val << 2
+	}
+	if v, err := strconv.Atoi(dscp); err == nil && v >= 0 && v <= 63 {
+		return uint8(v) << 2
+	}
+	return 0
+}
+
 // resolveRibTable maps a Junos RIB name to a Linux routing table ID.
 // "inet.0" or "inet6.0" maps to main table (254).
 // "<instance>.inet.0" or "<instance>.inet6.0" maps to the instance's table.

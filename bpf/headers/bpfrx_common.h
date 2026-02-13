@@ -524,6 +524,8 @@ struct nat_port_counter {
 #define FILTER_MATCH_ICMP_TYPE (1 << 5)
 #define FILTER_MATCH_ICMP_CODE (1 << 6)
 #define FILTER_MATCH_SRC_PORT  (1 << 7)
+#define FILTER_MATCH_SRC_NEGATE (1 << 8)  /* negate source address match (prefix-list except) */
+#define FILTER_MATCH_DST_NEGATE (1 << 9)  /* negate destination address match (prefix-list except) */
 
 /* Filter actions */
 #define FILTER_ACTION_ACCEPT   0

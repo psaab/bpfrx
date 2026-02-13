@@ -85,6 +85,24 @@ func TestGenerateConfig_NAT64(t *testing.T) {
 	}
 }
 
+func TestGenerateConfig_NAT64WithLifetime(t *testing.T) {
+	m := New()
+	raConfigs := []*config.RAInterfaceConfig{
+		{
+			Interface:       "trust0",
+			NAT64Prefix:     "64:ff9b::/96",
+			NAT64PrefixLife: 1800,
+		},
+	}
+	got := m.generateConfig(raConfigs)
+	if !strings.Contains(got, "PREF64 64:ff9b::/96") {
+		t.Error("missing PREF64")
+	}
+	if !strings.Contains(got, "AdvPREF64Lifetime 1800;") {
+		t.Errorf("missing AdvPREF64Lifetime 1800 in:\n%s", got)
+	}
+}
+
 func TestGenerateConfig_LifetimeAndMTU(t *testing.T) {
 	m := New()
 	raConfigs := []*config.RAInterfaceConfig{

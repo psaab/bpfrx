@@ -2461,39 +2461,42 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 	}
 
 	// Expand prefix list references into address lists.
-	// "except" prefix lists require BPF-side FILTER_MATCH_SRC_NEGATE / DST_NEGATE
-	// support (not yet implemented in BPF C); for now they are skipped with a warning.
-	srcAddrs := append([]string{}, term.SourceAddresses...)
+	// Each address tracks whether it came from an "except" prefix-list reference.
+	type filterAddr struct {
+		cidr   string
+		negate bool
+	}
+	var srcAddrs []filterAddr
+	for _, a := range term.SourceAddresses {
+		srcAddrs = append(srcAddrs, filterAddr{cidr: a})
+	}
 	for _, ref := range term.SourcePrefixLists {
-		if ref.Except {
-			slog.Warn("source-prefix-list except not yet supported in BPF, skipping",
-				"name", ref.Name, "term", term.Name)
-			continue
-		}
 		if pl, ok := prefixLists[ref.Name]; ok {
-			srcAddrs = append(srcAddrs, pl.Prefixes...)
+			for _, p := range pl.Prefixes {
+				srcAddrs = append(srcAddrs, filterAddr{cidr: p, negate: ref.Except})
+			}
 		} else {
 			slog.Warn("prefix-list not found", "name", ref.Name, "term", term.Name)
 		}
 	}
-	dstAddrs := append([]string{}, term.DestAddresses...)
+	var dstAddrs []filterAddr
+	for _, a := range term.DestAddresses {
+		dstAddrs = append(dstAddrs, filterAddr{cidr: a})
+	}
 	for _, ref := range term.DestPrefixLists {
-		if ref.Except {
-			slog.Warn("destination-prefix-list except not yet supported in BPF, skipping",
-				"name", ref.Name, "term", term.Name)
-			continue
-		}
 		if pl, ok := prefixLists[ref.Name]; ok {
-			dstAddrs = append(dstAddrs, pl.Prefixes...)
+			for _, p := range pl.Prefixes {
+				dstAddrs = append(dstAddrs, filterAddr{cidr: p, negate: ref.Except})
+			}
 		} else {
 			slog.Warn("prefix-list not found", "name", ref.Name, "term", term.Name)
 		}
 	}
 	if len(srcAddrs) == 0 {
-		srcAddrs = []string{""} // "any"
+		srcAddrs = []filterAddr{{}} // "any"
 	}
 	if len(dstAddrs) == 0 {
-		dstAddrs = []string{""} // "any"
+		dstAddrs = []filterAddr{{}} // "any"
 	}
 
 	// Port lists: expand multiple ports into separate rules
@@ -2512,13 +2515,19 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 			for _, dp := range dstPorts {
 				for _, sp := range srcPorts {
 					rule := base
-					if src != "" {
+					if src.cidr != "" {
 						rule.MatchFlags |= FilterMatchSrcAddr
-						setFilterAddr(&rule.SrcAddr, &rule.SrcMask, src, family)
+						if src.negate {
+							rule.MatchFlags |= FilterMatchSrcNegate
+						}
+						setFilterAddr(&rule.SrcAddr, &rule.SrcMask, src.cidr, family)
 					}
-					if dst != "" {
+					if dst.cidr != "" {
 						rule.MatchFlags |= FilterMatchDstAddr
-						setFilterAddr(&rule.DstAddr, &rule.DstMask, dst, family)
+						if dst.negate {
+							rule.MatchFlags |= FilterMatchDstNegate
+						}
+						setFilterAddr(&rule.DstAddr, &rule.DstMask, dst.cidr, family)
 					}
 					if dp != "" {
 						rule.MatchFlags |= FilterMatchDstPort
@@ -2547,7 +2556,7 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 
 // setFilterAddr parses a CIDR string and populates addr/mask byte arrays.
 func setFilterAddr(addr, mask *[16]byte, cidr string, family uint8) {
-	// Strip "except" suffix (prefix-list negation — not supported yet, treat as positive match)
+	// Strip "except" suffix if present (defensive — negate is tracked via MatchFlags)
 	cidr = strings.TrimSuffix(cidr, " except")
 	cidr = strings.TrimSuffix(cidr, ";")
 
