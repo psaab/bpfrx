@@ -2364,6 +2364,11 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		DSCPRewrite: 0xFF, // no DSCP rewrite by default
 	}
 
+	// Set log flag
+	if term.Log {
+		base.LogFlag = 1
+	}
+
 	// Set action
 	if term.RoutingInstance != "" {
 		base.Action = FilterActionRoute

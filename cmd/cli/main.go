@@ -840,6 +840,9 @@ func (c *ctl) handleShowNAT(args []string) error {
 		if len(args) >= 2 && args[1] == "persistent-nat-table" {
 			return c.showText("persistent-nat")
 		}
+		if len(args) >= 2 && args[1] == "rule" {
+			return c.showNATRuleStats("")
+		}
 		if len(args) >= 3 && args[1] == "rule-set" {
 			return c.showNATRuleStats(args[2])
 		}
@@ -864,6 +867,9 @@ func (c *ctl) handleShowNAT(args []string) error {
 		}
 		if len(args) >= 2 && args[1] == "pool" {
 			return c.showNATDestinationPool()
+		}
+		if len(args) >= 2 && args[1] == "rule" {
+			return c.showNATDNATRuleStats("")
 		}
 		if len(args) >= 3 && args[1] == "rule-set" {
 			return c.showNATDNATRuleStats(args[2])

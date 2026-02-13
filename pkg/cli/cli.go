@@ -1274,10 +1274,10 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		return c.handleShowNAT(args[1:])
 
 	case "address-book":
-		return c.showAddressBook()
+		return c.showAddressBook(args[1:])
 
 	case "applications":
-		return c.showApplications()
+		return c.showApplications(args[1:])
 
 	case "log":
 		return c.showSecurityLog(args[1:])
@@ -2611,11 +2611,13 @@ func (c *CLI) handleShowNAT(args []string) error {
 		fmt.Println("  source                       Show source NAT rules and sessions")
 		fmt.Println("  source summary               Show source NAT pool utilization summary")
 		fmt.Println("  source pool <name|all>       Show source NAT pool details")
+		fmt.Println("  source rule all              Show all source NAT rules with counters")
 		fmt.Println("  source rule-set <name>       Show source NAT rule-set details")
 		fmt.Println("  source persistent-nat-table  Show persistent NAT bindings")
 		fmt.Println("  destination                  Show destination NAT rules")
 		fmt.Println("  destination summary          Show destination NAT pool summary")
 		fmt.Println("  destination pool <name|all>  Show destination NAT pool details")
+		fmt.Println("  destination rule all         Show all destination NAT rules with counters")
 		fmt.Println("  destination rule-set <name>  Show destination NAT rule-set details")
 		fmt.Println("  static                       Show static 1:1 NAT rules")
 		fmt.Println("  nat64                        Show NAT64 rule-sets")
@@ -2640,7 +2642,7 @@ func (c *CLI) handleShowNAT(args []string) error {
 }
 
 func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
-	// Sub-command dispatch: summary, pool <name>, rule-set <name>
+	// Sub-command dispatch: summary, pool <name>, rule-set <name>, rule all
 	if len(args) > 0 {
 		switch args[0] {
 		case "summary":
@@ -2651,6 +2653,9 @@ func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 				poolName = args[1]
 			}
 			return c.showNATSourcePool(cfg, poolName)
+		case "rule":
+			// "rule all" — show all rules across all rule-sets
+			return c.showNATSourceRuleAll(cfg)
 		case "rule-set":
 			if len(args) > 1 {
 				return c.showNATSourceRuleSet(cfg, args[1])
@@ -2949,13 +2954,57 @@ func (c *CLI) showNATSourceRuleSet(cfg *config.Config, rsName string) error {
 	return nil
 }
 
+// showNATSourceRuleAll displays all source NAT rules across all rule-sets with hit counters.
+func (c *CLI) showNATSourceRuleAll(cfg *config.Config) error {
+	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
+		fmt.Println("No source NAT rules configured")
+		return nil
+	}
+
+	totalRules := 0
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			totalRules++
+			action := "interface"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			}
+			srcMatch := "0.0.0.0/0"
+			if rule.Match.SourceAddress != "" {
+				srcMatch = rule.Match.SourceAddress
+			}
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+
+			fmt.Printf("Rule-set: %-20s Rule: %-12s %s -> %s  Action: %s\n",
+				rs.Name, rule.Name, rs.FromZone, rs.ToZone, action)
+			fmt.Printf("  Match: source %s destination %s\n", srcMatch, dstMatch)
+
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("  Translation hits: %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+		}
+	}
+	fmt.Printf("\nTotal source NAT rules: %d\n", totalRules)
+	return nil
+}
+
 func (c *CLI) showNATDestination(cfg *config.Config, args []string) error {
 	if cfg == nil || cfg.Security.NAT.Destination == nil {
 		fmt.Println("No destination NAT rules configured.")
 		return nil
 	}
 
-	// Sub-command dispatch: summary, pool <name>, rule-set <name>
+	// Sub-command dispatch: summary, pool <name>, rule-set <name>, rule all
 	if len(args) > 0 {
 		switch args[0] {
 		case "summary":
@@ -2966,6 +3015,8 @@ func (c *CLI) showNATDestination(cfg *config.Config, args []string) error {
 				poolName = args[1]
 			}
 			return c.showNATDestinationPool(cfg, poolName)
+		case "rule":
+			return c.showNATDestinationRuleAll(cfg)
 		case "rule-set":
 			if len(args) > 1 {
 				return c.showNATDestinationRuleSet(cfg, args[1])
@@ -3201,6 +3252,50 @@ func (c *CLI) showNATDestinationRuleSet(cfg *config.Config, rsName string) error
 	return nil
 }
 
+// showNATDestinationRuleAll displays all destination NAT rules with hit counters.
+func (c *CLI) showNATDestinationRuleAll(cfg *config.Config) error {
+	dnat := cfg.Security.NAT.Destination
+	if dnat == nil || len(dnat.RuleSets) == 0 {
+		fmt.Println("No destination NAT rules configured")
+		return nil
+	}
+
+	totalRules := 0
+	for _, rs := range dnat.RuleSets {
+		for _, rule := range rs.Rules {
+			totalRules++
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+			if rule.Match.DestinationPort != 0 {
+				dstMatch += fmt.Sprintf(":%d", rule.Match.DestinationPort)
+			}
+			action := "off"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			}
+
+			fmt.Printf("Rule-set: %-20s Rule: %-12s from %s  Action: %s\n",
+				rs.Name, rule.Name, rs.FromZone, action)
+			fmt.Printf("  Match: destination %s\n", dstMatch)
+
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("  Translation hits: %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+		}
+	}
+	fmt.Printf("\nTotal destination NAT rules: %d\n", totalRules)
+	return nil
+}
+
 func (c *CLI) showNATStatic(cfg *config.Config) error {
 	if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
 		fmt.Println("No static NAT rules configured.")
@@ -3241,7 +3336,7 @@ func (c *CLI) showNAT64(cfg *config.Config) error {
 	return nil
 }
 
-func (c *CLI) showAddressBook() error {
+func (c *CLI) showAddressBook(args []string) error {
 	cfg := c.store.ActiveConfig()
 	if cfg == nil || cfg.Security.AddressBook == nil {
 		fmt.Println("No address book configured")
@@ -3249,16 +3344,32 @@ func (c *CLI) showAddressBook() error {
 	}
 	ab := cfg.Security.AddressBook
 
+	// Optional filter by name
+	filterName := ""
+	if len(args) > 0 {
+		filterName = args[0]
+	}
+
 	if len(ab.Addresses) > 0 {
-		fmt.Println("Addresses:")
+		if filterName == "" {
+			fmt.Println("Addresses:")
+		}
 		for _, addr := range ab.Addresses {
+			if filterName != "" && addr.Name != filterName {
+				continue
+			}
 			fmt.Printf("  %-24s %s\n", addr.Name, addr.Value)
 		}
 	}
 
 	if len(ab.AddressSets) > 0 {
-		fmt.Println("Address sets:")
+		if filterName == "" {
+			fmt.Println("Address sets:")
+		}
 		for _, as := range ab.AddressSets {
+			if filterName != "" && as.Name != filterName {
+				continue
+			}
 			var parts []string
 			for _, a := range as.Addresses {
 				parts = append(parts, a)
@@ -3267,49 +3378,149 @@ func (c *CLI) showAddressBook() error {
 				parts = append(parts, "set:"+s)
 			}
 			fmt.Printf("  %-24s members: %s\n", as.Name, strings.Join(parts, ", "))
+			// If filtering by name, show member details
+			if filterName != "" {
+				for _, a := range as.Addresses {
+					for _, addr := range ab.Addresses {
+						if addr.Name == a {
+							fmt.Printf("    %-22s %s\n", addr.Name, addr.Value)
+						}
+					}
+				}
+			}
 		}
 	}
 
-	if len(ab.Addresses) == 0 && len(ab.AddressSets) == 0 {
+	if filterName == "" && len(ab.Addresses) == 0 && len(ab.AddressSets) == 0 {
 		fmt.Println("Address book is empty")
 	}
 
 	return nil
 }
 
-func (c *CLI) showApplications() error {
+func (c *CLI) showApplications(args []string) error {
 	cfg := c.store.ActiveConfig()
 
-	// User-defined applications
-	if cfg != nil && len(cfg.Applications.Applications) > 0 {
-		fmt.Println("User-defined applications:")
-		for _, app := range cfg.Applications.Applications {
+	// Parse sub-commands: detail, <name>
+	detail := false
+	filterName := ""
+	for _, a := range args {
+		switch a {
+		case "detail":
+			detail = true
+		default:
+			filterName = a
+		}
+	}
+
+	// Helper to print application detail
+	printApp := func(app *config.Application, indent string) {
+		if detail || filterName != "" {
+			fmt.Printf("%sApplication: %s\n", indent, app.Name)
+			if app.Description != "" {
+				fmt.Printf("%s  Description: %s\n", indent, app.Description)
+			}
+			if app.Protocol != "" {
+				fmt.Printf("%s  IP protocol: %s\n", indent, app.Protocol)
+			}
+			if app.DestinationPort != "" {
+				fmt.Printf("%s  Destination port: %s\n", indent, app.DestinationPort)
+			}
+			if app.SourcePort != "" {
+				fmt.Printf("%s  Source port: %s\n", indent, app.SourcePort)
+			}
+			if app.InactivityTimeout > 0 {
+				fmt.Printf("%s  Inactivity timeout: %ds\n", indent, app.InactivityTimeout)
+			}
+			if app.ALG != "" {
+				fmt.Printf("%s  ALG: %s\n", indent, app.ALG)
+			}
+		} else {
 			port := app.DestinationPort
 			if port == "" {
 				port = "-"
 			}
-			fmt.Printf("  %-24s protocol: %-6s port: %s\n", app.Name, app.Protocol, port)
+			fmt.Printf("%s%-24s protocol: %-6s port: %s\n", indent, app.Name, app.Protocol, port)
 		}
-		fmt.Println()
+	}
+
+	// User-defined applications
+	if cfg != nil && len(cfg.Applications.Applications) > 0 {
+		if filterName == "" {
+			fmt.Println("User-defined applications:")
+		}
+		names := make([]string, 0, len(cfg.Applications.Applications))
+		for name := range cfg.Applications.Applications {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			app := cfg.Applications.Applications[name]
+			if filterName != "" && app.Name != filterName {
+				continue
+			}
+			printApp(app, "  ")
+		}
+		if filterName == "" {
+			fmt.Println()
+		}
 	}
 
 	// User-defined application-sets
 	if cfg != nil && len(cfg.Applications.ApplicationSets) > 0 {
-		fmt.Println("Application sets:")
-		for _, as := range cfg.Applications.ApplicationSets {
-			fmt.Printf("  %-24s members: %s\n", as.Name, strings.Join(as.Applications, ", "))
+		names := make([]string, 0, len(cfg.Applications.ApplicationSets))
+		for name := range cfg.Applications.ApplicationSets {
+			names = append(names, name)
 		}
-		fmt.Println()
+		sort.Strings(names)
+
+		if filterName == "" {
+			fmt.Println("Application sets:")
+		}
+		for _, name := range names {
+			as := cfg.Applications.ApplicationSets[name]
+			if filterName != "" && as.Name != filterName {
+				continue
+			}
+			if detail || filterName != "" {
+				fmt.Printf("  Application set: %s\n", as.Name)
+				fmt.Printf("    Members:\n")
+				for _, member := range as.Applications {
+					fmt.Printf("      %s\n", member)
+					// Show member details if filtering by set name
+					if filterName != "" {
+						if cfg != nil {
+							if app, ok := cfg.Applications.Applications[member]; ok {
+								printApp(app, "        ")
+							}
+						}
+					}
+				}
+			} else {
+				fmt.Printf("  %-24s members: %s\n", as.Name, strings.Join(as.Applications, ", "))
+			}
+		}
+		if filterName == "" {
+			fmt.Println()
+		}
 	}
 
-	// Predefined applications
+	// Show matching predefined application if filtering by name
+	if filterName != "" {
+		for _, app := range config.PredefinedApplications {
+			if app.Name == filterName {
+				fmt.Println("Predefined application:")
+				printApp(app, "  ")
+				return nil
+			}
+		}
+		return nil
+	}
+
+	// Predefined applications (only in list mode)
 	fmt.Println("Predefined applications:")
 	for _, app := range config.PredefinedApplications {
-		port := app.DestinationPort
-		if port == "" {
-			port = "-"
-		}
-		fmt.Printf("  %-24s protocol: %-6s port: %s\n", app.Name, app.Protocol, port)
+		printApp(app, "  ")
 	}
 
 	return nil

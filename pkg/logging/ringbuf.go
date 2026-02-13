@@ -238,6 +238,8 @@ func eventSeverity(eventType uint8) int {
 		return SyslogError
 	case dataplane.EventTypePolicyDeny:
 		return SyslogWarning
+	case dataplane.EventTypeFilterLog:
+		return SyslogInfo
 	default:
 		return SyslogInfo
 	}
@@ -254,6 +256,10 @@ func formatSyslogMsg(rec EventRecord) string {
 			rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action,
 			rec.PolicyID, rec.InZone, rec.OutZone, rec.SessionPkts, rec.SessionBytes)
 	}
+	if rec.Type == "FILTER_LOG" {
+		return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s zone=%d",
+			rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action, rec.InZone)
+	}
 	return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s policy=%d zone=%d->%d",
 		rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action,
 		rec.PolicyID, rec.InZone, rec.OutZone)
@@ -269,6 +275,8 @@ func eventTypeName(t uint8) string {
 		return "POLICY_DENY"
 	case dataplane.EventTypeScreenDrop:
 		return "SCREEN_DROP"
+	case dataplane.EventTypeFilterLog:
+		return "FILTER_LOG"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", t)
 	}

@@ -111,7 +111,7 @@ type bpfrxXdpCpumapFilterRule struct {
 	DstPort      uint16
 	SrcPort      uint16
 	DscpRewrite  uint8
-	Pad          uint8
+	LogFlag      uint8
 	SrcAddr      [16]uint8
 	SrcMask      [16]uint8
 	DstAddr      [16]uint8

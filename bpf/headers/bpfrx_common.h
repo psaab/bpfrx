@@ -218,6 +218,7 @@ struct icmp6hdr {
 #define EVENT_TYPE_POLICY_DENY    3
 #define EVENT_TYPE_SCREEN_DROP    4
 #define EVENT_TYPE_ALG_REQUEST    5
+#define EVENT_TYPE_FILTER_LOG     6
 
 /* Global counter indices */
 #define GLOBAL_CTR_RX_PACKETS      0
@@ -604,7 +605,7 @@ struct filter_rule {
 	__be16 dst_port;        /* network byte order, 0=any */
 	__be16 src_port;        /* network byte order, 0=any */
 	__u8   dscp_rewrite;    /* DSCP rewrite value (0xFF = no rewrite) */
-	__u8   pad;
+	__u8   log_flag;        /* 1 = emit ring buffer event on match */
 	__u8   src_addr[16];    /* v4: first 4 bytes, v6: all 16 */
 	__u8   src_mask[16];    /* prefix mask */
 	__u8   dst_addr[16];

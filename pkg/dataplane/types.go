@@ -523,6 +523,7 @@ const (
 	EventTypeSessionClose = 2
 	EventTypePolicyDeny   = 3
 	EventTypeScreenDrop   = 4
+	EventTypeFilterLog    = 6
 )
 
 // Flow timeout indices -- must match C FLOW_TIMEOUT_* defines.
@@ -607,7 +608,7 @@ type FilterRule struct {
 	DstPort      uint16 // network byte order
 	SrcPort      uint16 // network byte order
 	DSCPRewrite  uint8  // DSCP rewrite value (0xFF = no rewrite)
-	Pad          uint8
+	LogFlag      uint8  // 1 = emit ring buffer event on match
 	SrcAddr      [16]byte
 	SrcMask      [16]byte
 	DstAddr      [16]byte

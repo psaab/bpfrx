@@ -968,6 +968,14 @@ evaluate_firewall_filter(struct pkt_meta *meta)
 			bpf_map_lookup_elem(&filter_counters, &idx);
 		if (fc) { fc->packets++; fc->bytes += meta->pkt_len; }
 
+		/* Emit log event if configured */
+		if (rule->log_flag) {
+			__u8 act = (rule->action == FILTER_ACTION_ACCEPT ||
+				    rule->action == FILTER_ACTION_ROUTE)
+				   ? ACTION_PERMIT : ACTION_DENY;
+			emit_event(meta, EVENT_TYPE_FILTER_LOG, act, 0, 0);
+		}
+
 		/* DSCP rewrite if configured */
 		if (rule->dscp_rewrite != 0xFF)
 			meta->dscp_rewrite = rule->dscp_rewrite;
@@ -1094,6 +1102,13 @@ evaluate_firewall_filter_output(struct pkt_meta *meta, __u32 egress_ifindex)
 		struct counter_value *fc =
 			bpf_map_lookup_elem(&filter_counters, &idx);
 		if (fc) { fc->packets++; fc->bytes += meta->pkt_len; }
+
+		if (rule->log_flag) {
+			__u8 act = (rule->action == FILTER_ACTION_ACCEPT ||
+				    rule->action == FILTER_ACTION_ROUTE)
+				   ? ACTION_PERMIT : ACTION_DENY;
+			emit_event(meta, EVENT_TYPE_FILTER_LOG, act, 0, 0);
+		}
 
 		if (rule->dscp_rewrite != 0xFF)
 			meta->dscp_rewrite = rule->dscp_rewrite;
