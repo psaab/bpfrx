@@ -220,7 +220,7 @@ var operationalTree = map[string]*completionNode{
 	"clear": {desc: "Clear information", children: map[string]*completionNode{
 		"security": {desc: "Clear security information", children: map[string]*completionNode{
 			"flow": {desc: "Clear flow information", children: map[string]*completionNode{
-				"session": {desc: "Clear all sessions"},
+				"session": {desc: "Clear sessions [source-prefix|destination-prefix|protocol|zone]"},
 			}},
 			"counters": {desc: "Clear all counters"},
 			"nat": {desc: "Clear NAT information", children: map[string]*completionNode{
@@ -2301,11 +2301,15 @@ func (c *CLI) handleClearSecurity(args []string) error {
 		return fmt.Errorf("usage: clear security nat source persistent-nat-table")
 	case "flow":
 		if len(args) < 2 || args[1] != "session" {
-			return fmt.Errorf("usage: clear security flow session")
+			return fmt.Errorf("usage: clear security flow session [filters...]")
 		}
 		if c.dp == nil || !c.dp.IsLoaded() {
 			fmt.Println("dataplane not loaded")
 			return nil
+		}
+		f := c.parseSessionFilter(args[2:])
+		if f.hasFilter() {
+			return c.clearFilteredSessions(f)
 		}
 		v4, v6, err := c.dp.ClearAllSessions()
 		if err != nil {
@@ -2331,6 +2335,101 @@ func (c *CLI) handleClearSecurity(args []string) error {
 		fmt.Println("  counters        Clear all counters")
 		return nil
 	}
+}
+
+// clearFilteredSessions deletes sessions matching the given filter.
+func (c *CLI) clearFilteredSessions(f sessionFilter) error {
+	v4Deleted := 0
+	v6Deleted := 0
+
+	// IPv4: collect matching forward keys and derive reverse keys
+	var v4Keys []dataplane.SessionKey
+	var v4RevKeys []dataplane.SessionKey
+	var snatDNATKeys []dataplane.DNATKey
+	_ = c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true // skip reverse entries; they'll be cleaned via forward
+		}
+		if !f.matchesV4(key, val) {
+			return true
+		}
+		v4Keys = append(v4Keys, key)
+		// Reverse key for cleanup
+		v4RevKeys = append(v4RevKeys, dataplane.SessionKey{
+			Protocol: key.Protocol,
+			SrcIP:    key.DstIP,
+			DstIP:    key.SrcIP,
+			SrcPort:  key.DstPort,
+			DstPort:  key.SrcPort,
+		})
+		// Track SNAT DNAT entries for cleanup
+		if val.Flags&dataplane.SessFlagSNAT != 0 &&
+			val.Flags&dataplane.SessFlagStaticNAT == 0 {
+			snatDNATKeys = append(snatDNATKeys, dataplane.DNATKey{
+				Protocol: key.Protocol,
+				DstIP:    val.NATSrcIP,
+				DstPort:  val.NATSrcPort,
+			})
+		}
+		return true
+	})
+
+	for _, key := range v4Keys {
+		if err := c.dp.DeleteSession(key); err == nil {
+			v4Deleted++
+		}
+	}
+	for _, key := range v4RevKeys {
+		c.dp.DeleteSession(key)
+	}
+	for _, dk := range snatDNATKeys {
+		c.dp.DeleteDNATEntry(dk)
+	}
+
+	// IPv6: collect matching forward keys
+	var v6Keys []dataplane.SessionKeyV6
+	var v6RevKeys []dataplane.SessionKeyV6
+	var snatDNATKeysV6 []dataplane.DNATKeyV6
+	_ = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if !f.matchesV6(key, val) {
+			return true
+		}
+		v6Keys = append(v6Keys, key)
+		v6RevKeys = append(v6RevKeys, dataplane.SessionKeyV6{
+			Protocol: key.Protocol,
+			SrcIP:    key.DstIP,
+			DstIP:    key.SrcIP,
+			SrcPort:  key.DstPort,
+			DstPort:  key.SrcPort,
+		})
+		if val.Flags&dataplane.SessFlagSNAT != 0 &&
+			val.Flags&dataplane.SessFlagStaticNAT == 0 {
+			snatDNATKeysV6 = append(snatDNATKeysV6, dataplane.DNATKeyV6{
+				Protocol: key.Protocol,
+				DstIP:    val.NATSrcIP,
+				DstPort:  val.NATSrcPort,
+			})
+		}
+		return true
+	})
+
+	for _, key := range v6Keys {
+		if err := c.dp.DeleteSessionV6(key); err == nil {
+			v6Deleted++
+		}
+	}
+	for _, key := range v6RevKeys {
+		c.dp.DeleteSessionV6(key)
+	}
+	for _, dk := range snatDNATKeysV6 {
+		c.dp.DeleteDNATEntryV6(dk)
+	}
+
+	fmt.Printf("%d IPv4 and %d IPv6 matching sessions cleared\n", v4Deleted, v6Deleted)
+	return nil
 }
 
 func (c *CLI) handleClearDHCP(args []string) error {
