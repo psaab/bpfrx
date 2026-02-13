@@ -549,9 +549,13 @@ type ApplicationSet struct {
 
 // Application defines a network application by protocol and port.
 type Application struct {
-	Name            string
-	Protocol        string // tcp, udp, icmp
-	DestinationPort string // "80", "8080-8090"
+	Name              string
+	Protocol          string // tcp, udp, icmp, or numeric ("47")
+	DestinationPort   string // "80", "8080-8090"
+	SourcePort        string // "1024-65535" (optional)
+	InactivityTimeout int    // seconds (0 = default)
+	ALG               string // "ssh", "ftp", etc. (informational)
+	Description       string
 }
 
 // RoutingOptionsConfig holds static routing configuration.

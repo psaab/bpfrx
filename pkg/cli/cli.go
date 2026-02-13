@@ -1656,6 +1656,14 @@ func (c *CLI) showFlowSession(args []string) error {
 	f := c.parseSessionFilter(args)
 	count := 0
 
+	// Build reverse zone ID → name map
+	zoneNames := make(map[uint16]string)
+	if cr := c.dp.LastCompileResult(); cr != nil {
+		for name, id := range cr.ZoneIDs {
+			zoneNames[id] = name
+		}
+	}
+
 	// IPv4 sessions
 	err := c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
@@ -1681,7 +1689,15 @@ func (c *CLI) showFlowSession(args []string) error {
 			count, val.PolicyID, stateName, val.Timeout)
 		fmt.Printf("  In: %s:%d --> %s:%d;%s,",
 			srcIP, srcPort, dstIP, dstPort, protoName)
-		fmt.Printf(" Zone: %d -> %d\n", val.IngressZone, val.EgressZone)
+		inZone := zoneNames[val.IngressZone]
+		outZone := zoneNames[val.EgressZone]
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", val.IngressZone)
+		}
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", val.EgressZone)
+		}
+		fmt.Printf(" Zone: %s -> %s\n", inZone, outZone)
 
 		if val.Flags&dataplane.SessFlagSNAT != 0 {
 			natIP := uint32ToIP(val.NATSrcIP)
@@ -1729,7 +1745,15 @@ func (c *CLI) showFlowSession(args []string) error {
 			count, val.PolicyID, stateName, val.Timeout)
 		fmt.Printf("  In: [%s]:%d --> [%s]:%d;%s,",
 			srcIP, srcPort, dstIP, dstPort, protoName)
-		fmt.Printf(" Zone: %d -> %d\n", val.IngressZone, val.EgressZone)
+		inZone := zoneNames[val.IngressZone]
+		outZone := zoneNames[val.EgressZone]
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", val.IngressZone)
+		}
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", val.EgressZone)
+		}
+		fmt.Printf(" Zone: %s -> %s\n", inZone, outZone)
 
 		if val.Flags&dataplane.SessFlagSNAT != 0 {
 			natIP := net.IP(val.NATSrcIP[:])
@@ -2767,19 +2791,35 @@ func (c *CLI) showSecurityLog(args []string) error {
 		return nil
 	}
 
+	// Build reverse zone ID → name map for event display
+	evZoneNames := make(map[uint16]string)
+	if c.dp != nil {
+		if cr := c.dp.LastCompileResult(); cr != nil {
+			for name, id := range cr.ZoneIDs {
+				evZoneNames[id] = name
+			}
+		}
+	}
+	zoneName := func(id uint16) string {
+		if n, ok := evZoneNames[id]; ok {
+			return n
+		}
+		return fmt.Sprintf("%d", id)
+	}
+
 	for _, e := range events {
 		ts := e.Time.Format("15:04:05")
 		if e.Type == "SCREEN_DROP" {
-			fmt.Printf("%s %-14s screen=%-16s %s -> %s %s action=%s zone=%d\n",
-				ts, e.Type, e.ScreenCheck, e.SrcAddr, e.DstAddr, e.Protocol, e.Action, e.InZone)
+			fmt.Printf("%s %-14s screen=%-16s %s -> %s %s action=%s zone=%s\n",
+				ts, e.Type, e.ScreenCheck, e.SrcAddr, e.DstAddr, e.Protocol, e.Action, zoneName(e.InZone))
 		} else if e.Type == "SESSION_CLOSE" {
-			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%d zone=%d->%d pkts=%d bytes=%d\n",
+			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%d zone=%s->%s pkts=%d bytes=%d\n",
 				ts, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
-				e.PolicyID, e.InZone, e.OutZone, e.SessionPkts, e.SessionBytes)
+				e.PolicyID, zoneName(e.InZone), zoneName(e.OutZone), e.SessionPkts, e.SessionBytes)
 		} else {
-			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%d zone=%d->%d\n",
+			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%d zone=%s->%s\n",
 				ts, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
-				e.PolicyID, e.InZone, e.OutZone)
+				e.PolicyID, zoneName(e.InZone), zoneName(e.OutZone))
 		}
 	}
 	fmt.Printf("(%d events shown)\n", len(events))

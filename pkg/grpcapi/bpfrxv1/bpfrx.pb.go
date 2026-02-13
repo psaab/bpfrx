@@ -2266,25 +2266,27 @@ func (x *GetSessionsResponse) GetSessions() []*SessionEntry {
 }
 
 type SessionEntry struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	SrcAddr        string                 `protobuf:"bytes,1,opt,name=src_addr,json=srcAddr,proto3" json:"src_addr,omitempty"`
-	DstAddr        string                 `protobuf:"bytes,2,opt,name=dst_addr,json=dstAddr,proto3" json:"dst_addr,omitempty"`
-	SrcPort        uint32                 `protobuf:"varint,3,opt,name=src_port,json=srcPort,proto3" json:"src_port,omitempty"`
-	DstPort        uint32                 `protobuf:"varint,4,opt,name=dst_port,json=dstPort,proto3" json:"dst_port,omitempty"`
-	Protocol       string                 `protobuf:"bytes,5,opt,name=protocol,proto3" json:"protocol,omitempty"`
-	State          string                 `protobuf:"bytes,6,opt,name=state,proto3" json:"state,omitempty"`
-	PolicyId       uint32                 `protobuf:"varint,7,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
-	IngressZone    uint32                 `protobuf:"varint,8,opt,name=ingress_zone,json=ingressZone,proto3" json:"ingress_zone,omitempty"`
-	EgressZone     uint32                 `protobuf:"varint,9,opt,name=egress_zone,json=egressZone,proto3" json:"egress_zone,omitempty"`
-	FwdPackets     uint64                 `protobuf:"varint,10,opt,name=fwd_packets,json=fwdPackets,proto3" json:"fwd_packets,omitempty"`
-	FwdBytes       uint64                 `protobuf:"varint,11,opt,name=fwd_bytes,json=fwdBytes,proto3" json:"fwd_bytes,omitempty"`
-	RevPackets     uint64                 `protobuf:"varint,12,opt,name=rev_packets,json=revPackets,proto3" json:"rev_packets,omitempty"`
-	RevBytes       uint64                 `protobuf:"varint,13,opt,name=rev_bytes,json=revBytes,proto3" json:"rev_bytes,omitempty"`
-	Nat            string                 `protobuf:"bytes,14,opt,name=nat,proto3" json:"nat,omitempty"`
-	AgeSeconds     int64                  `protobuf:"varint,15,opt,name=age_seconds,json=ageSeconds,proto3" json:"age_seconds,omitempty"`
-	TimeoutSeconds uint32                 `protobuf:"varint,16,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	SrcAddr         string                 `protobuf:"bytes,1,opt,name=src_addr,json=srcAddr,proto3" json:"src_addr,omitempty"`
+	DstAddr         string                 `protobuf:"bytes,2,opt,name=dst_addr,json=dstAddr,proto3" json:"dst_addr,omitempty"`
+	SrcPort         uint32                 `protobuf:"varint,3,opt,name=src_port,json=srcPort,proto3" json:"src_port,omitempty"`
+	DstPort         uint32                 `protobuf:"varint,4,opt,name=dst_port,json=dstPort,proto3" json:"dst_port,omitempty"`
+	Protocol        string                 `protobuf:"bytes,5,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	State           string                 `protobuf:"bytes,6,opt,name=state,proto3" json:"state,omitempty"`
+	PolicyId        uint32                 `protobuf:"varint,7,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
+	IngressZone     uint32                 `protobuf:"varint,8,opt,name=ingress_zone,json=ingressZone,proto3" json:"ingress_zone,omitempty"`
+	EgressZone      uint32                 `protobuf:"varint,9,opt,name=egress_zone,json=egressZone,proto3" json:"egress_zone,omitempty"`
+	FwdPackets      uint64                 `protobuf:"varint,10,opt,name=fwd_packets,json=fwdPackets,proto3" json:"fwd_packets,omitempty"`
+	FwdBytes        uint64                 `protobuf:"varint,11,opt,name=fwd_bytes,json=fwdBytes,proto3" json:"fwd_bytes,omitempty"`
+	RevPackets      uint64                 `protobuf:"varint,12,opt,name=rev_packets,json=revPackets,proto3" json:"rev_packets,omitempty"`
+	RevBytes        uint64                 `protobuf:"varint,13,opt,name=rev_bytes,json=revBytes,proto3" json:"rev_bytes,omitempty"`
+	Nat             string                 `protobuf:"bytes,14,opt,name=nat,proto3" json:"nat,omitempty"`
+	AgeSeconds      int64                  `protobuf:"varint,15,opt,name=age_seconds,json=ageSeconds,proto3" json:"age_seconds,omitempty"`
+	TimeoutSeconds  uint32                 `protobuf:"varint,16,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
+	IngressZoneName string                 `protobuf:"bytes,17,opt,name=ingress_zone_name,json=ingressZoneName,proto3" json:"ingress_zone_name,omitempty"`
+	EgressZoneName  string                 `protobuf:"bytes,18,opt,name=egress_zone_name,json=egressZoneName,proto3" json:"egress_zone_name,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *SessionEntry) Reset() {
@@ -2427,6 +2429,20 @@ func (x *SessionEntry) GetTimeoutSeconds() uint32 {
 		return x.TimeoutSeconds
 	}
 	return 0
+}
+
+func (x *SessionEntry) GetIngressZoneName() string {
+	if x != nil {
+		return x.IngressZoneName
+	}
+	return ""
+}
+
+func (x *SessionEntry) GetEgressZoneName() string {
+	if x != nil {
+		return x.EgressZoneName
+	}
+	return ""
 }
 
 type GetSessionSummaryRequest struct {
@@ -3106,21 +3122,23 @@ func (x *GetEventsResponse) GetEvents() []*EventEntry {
 }
 
 type EventEntry struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Time           string                 `protobuf:"bytes,1,opt,name=time,proto3" json:"time,omitempty"`
-	Type           string                 `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
-	SrcAddr        string                 `protobuf:"bytes,3,opt,name=src_addr,json=srcAddr,proto3" json:"src_addr,omitempty"`
-	DstAddr        string                 `protobuf:"bytes,4,opt,name=dst_addr,json=dstAddr,proto3" json:"dst_addr,omitempty"`
-	Protocol       string                 `protobuf:"bytes,5,opt,name=protocol,proto3" json:"protocol,omitempty"`
-	Action         string                 `protobuf:"bytes,6,opt,name=action,proto3" json:"action,omitempty"`
-	PolicyId       uint32                 `protobuf:"varint,7,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
-	IngressZone    uint32                 `protobuf:"varint,8,opt,name=ingress_zone,json=ingressZone,proto3" json:"ingress_zone,omitempty"`
-	EgressZone     uint32                 `protobuf:"varint,9,opt,name=egress_zone,json=egressZone,proto3" json:"egress_zone,omitempty"`
-	ScreenCheck    string                 `protobuf:"bytes,10,opt,name=screen_check,json=screenCheck,proto3" json:"screen_check,omitempty"`
-	SessionPackets uint64                 `protobuf:"varint,11,opt,name=session_packets,json=sessionPackets,proto3" json:"session_packets,omitempty"`
-	SessionBytes   uint64                 `protobuf:"varint,12,opt,name=session_bytes,json=sessionBytes,proto3" json:"session_bytes,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Time            string                 `protobuf:"bytes,1,opt,name=time,proto3" json:"time,omitempty"`
+	Type            string                 `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
+	SrcAddr         string                 `protobuf:"bytes,3,opt,name=src_addr,json=srcAddr,proto3" json:"src_addr,omitempty"`
+	DstAddr         string                 `protobuf:"bytes,4,opt,name=dst_addr,json=dstAddr,proto3" json:"dst_addr,omitempty"`
+	Protocol        string                 `protobuf:"bytes,5,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	Action          string                 `protobuf:"bytes,6,opt,name=action,proto3" json:"action,omitempty"`
+	PolicyId        uint32                 `protobuf:"varint,7,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
+	IngressZone     uint32                 `protobuf:"varint,8,opt,name=ingress_zone,json=ingressZone,proto3" json:"ingress_zone,omitempty"`
+	EgressZone      uint32                 `protobuf:"varint,9,opt,name=egress_zone,json=egressZone,proto3" json:"egress_zone,omitempty"`
+	ScreenCheck     string                 `protobuf:"bytes,10,opt,name=screen_check,json=screenCheck,proto3" json:"screen_check,omitempty"`
+	SessionPackets  uint64                 `protobuf:"varint,11,opt,name=session_packets,json=sessionPackets,proto3" json:"session_packets,omitempty"`
+	SessionBytes    uint64                 `protobuf:"varint,12,opt,name=session_bytes,json=sessionBytes,proto3" json:"session_bytes,omitempty"`
+	IngressZoneName string                 `protobuf:"bytes,13,opt,name=ingress_zone_name,json=ingressZoneName,proto3" json:"ingress_zone_name,omitempty"`
+	EgressZoneName  string                 `protobuf:"bytes,14,opt,name=egress_zone_name,json=egressZoneName,proto3" json:"egress_zone_name,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *EventEntry) Reset() {
@@ -3235,6 +3253,20 @@ func (x *EventEntry) GetSessionBytes() uint64 {
 		return x.SessionBytes
 	}
 	return 0
+}
+
+func (x *EventEntry) GetIngressZoneName() string {
+	if x != nil {
+		return x.IngressZoneName
+	}
+	return ""
+}
+
+func (x *EventEntry) GetEgressZoneName() string {
+	if x != nil {
+		return x.EgressZoneName
+	}
+	return ""
 }
 
 type GetInterfacesRequest struct {
@@ -5916,7 +5948,7 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x05total\x18\x01 \x01(\x05R\x05total\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x05R\x06offset\x122\n" +
-	"\bsessions\x18\x04 \x03(\v2\x16.bpfrx.v1.SessionEntryR\bsessions\"\xe5\x03\n" +
+	"\bsessions\x18\x04 \x03(\v2\x16.bpfrx.v1.SessionEntryR\bsessions\"\xbb\x04\n" +
 	"\fSessionEntry\x12\x19\n" +
 	"\bsrc_addr\x18\x01 \x01(\tR\asrcAddr\x12\x19\n" +
 	"\bdst_addr\x18\x02 \x01(\tR\adstAddr\x12\x19\n" +
@@ -5938,7 +5970,9 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x03nat\x18\x0e \x01(\tR\x03nat\x12\x1f\n" +
 	"\vage_seconds\x18\x0f \x01(\x03R\n" +
 	"ageSeconds\x12'\n" +
-	"\x0ftimeout_seconds\x18\x10 \x01(\rR\x0etimeoutSeconds\"\x1a\n" +
+	"\x0ftimeout_seconds\x18\x10 \x01(\rR\x0etimeoutSeconds\x12*\n" +
+	"\x11ingress_zone_name\x18\x11 \x01(\tR\x0fingressZoneName\x12(\n" +
+	"\x10egress_zone_name\x18\x12 \x01(\tR\x0eegressZoneName\"\x1a\n" +
 	"\x18GetSessionSummaryRequest\"\x99\x02\n" +
 	"\x19GetSessionSummaryResponse\x12#\n" +
 	"\rtotal_entries\x18\x01 \x01(\x05R\ftotalEntries\x12!\n" +
@@ -5978,7 +6012,7 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x06action\x18\x03 \x01(\tR\x06action\x12\x1a\n" +
 	"\bprotocol\x18\x04 \x01(\tR\bprotocol\"A\n" +
 	"\x11GetEventsResponse\x12,\n" +
-	"\x06events\x18\x01 \x03(\v2\x14.bpfrx.v1.EventEntryR\x06events\"\xf0\x02\n" +
+	"\x06events\x18\x01 \x03(\v2\x14.bpfrx.v1.EventEntryR\x06events\"\xc6\x03\n" +
 	"\n" +
 	"EventEntry\x12\x12\n" +
 	"\x04time\x18\x01 \x01(\tR\x04time\x12\x12\n" +
@@ -5994,7 +6028,9 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\fscreen_check\x18\n" +
 	" \x01(\tR\vscreenCheck\x12'\n" +
 	"\x0fsession_packets\x18\v \x01(\x04R\x0esessionPackets\x12#\n" +
-	"\rsession_bytes\x18\f \x01(\x04R\fsessionBytes\"\x16\n" +
+	"\rsession_bytes\x18\f \x01(\x04R\fsessionBytes\x12*\n" +
+	"\x11ingress_zone_name\x18\r \x01(\tR\x0fingressZoneName\x12(\n" +
+	"\x10egress_zone_name\x18\x0e \x01(\tR\x0eegressZoneName\"\x16\n" +
 	"\x14GetInterfacesRequest\"P\n" +
 	"\x15GetInterfacesResponse\x127\n" +
 	"\n" +

@@ -243,6 +243,8 @@ message SessionEntry {
   string nat = 14;
   int64 age_seconds = 15;
   uint32 timeout_seconds = 16;
+  string ingress_zone_name = 17;
+  string egress_zone_name = 18;
 }
 
 message GetSessionSummaryRequest {}
@@ -310,6 +312,8 @@ message EventEntry {
   string screen_check = 10;
   uint64 session_packets = 11;
   uint64 session_bytes = 12;
+  string ingress_zone_name = 13;
+  string egress_zone_name = 14;
 }
 
 message GetInterfacesRequest {}

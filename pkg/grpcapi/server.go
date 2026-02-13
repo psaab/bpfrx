@@ -475,6 +475,14 @@ func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb
 	var all []*pb.SessionEntry
 	idx := 0
 
+	// Build reverse zone ID → name map
+	zoneNames := make(map[uint16]string)
+	if cr := s.dp.LastCompileResult(); cr != nil {
+		for name, id := range cr.ZoneIDs {
+			zoneNames[id] = name
+		}
+	}
+
 	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
@@ -502,7 +510,7 @@ func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb
 			return true
 		}
 		if idx >= offset && len(all) < limit {
-			all = append(all, sessionEntryV4(key, val, now))
+			all = append(all, sessionEntryV4(key, val, now, zoneNames))
 		}
 		idx++
 		return true
@@ -535,7 +543,7 @@ func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb
 			return true
 		}
 		if idx >= offset && len(all) < limit {
-			all = append(all, sessionEntryV6(key, val, now))
+			all = append(all, sessionEntryV6(key, val, now, zoneNames))
 		}
 		idx++
 		return true
@@ -695,21 +703,31 @@ func (s *Server) GetEvents(_ context.Context, req *pb.GetEventsRequest) (*pb.Get
 		events = s.eventBuf.LatestFiltered(limit, filter)
 	}
 
+	// Build reverse zone ID → name map
+	evZoneNames := make(map[uint16]string)
+	if cr := s.dp.LastCompileResult(); cr != nil {
+		for name, id := range cr.ZoneIDs {
+			evZoneNames[id] = name
+		}
+	}
+
 	resp := &pb.GetEventsResponse{}
 	for _, ev := range events {
 		resp.Events = append(resp.Events, &pb.EventEntry{
-			Time:           ev.Time.Format(time.RFC3339),
-			Type:           ev.Type,
-			SrcAddr:        ev.SrcAddr,
-			DstAddr:        ev.DstAddr,
-			Protocol:       ev.Protocol,
-			Action:         ev.Action,
-			PolicyId:       ev.PolicyID,
-			IngressZone:    uint32(ev.InZone),
-			EgressZone:     uint32(ev.OutZone),
-			ScreenCheck:    ev.ScreenCheck,
-			SessionPackets: ev.SessionPkts,
-			SessionBytes:   ev.SessionBytes,
+			Time:            ev.Time.Format(time.RFC3339),
+			Type:            ev.Type,
+			SrcAddr:         ev.SrcAddr,
+			DstAddr:         ev.DstAddr,
+			Protocol:        ev.Protocol,
+			Action:          ev.Action,
+			PolicyId:        ev.PolicyID,
+			IngressZone:     uint32(ev.InZone),
+			EgressZone:      uint32(ev.OutZone),
+			IngressZoneName: evZoneNames[ev.InZone],
+			EgressZoneName:  evZoneNames[ev.OutZone],
+			ScreenCheck:     ev.ScreenCheck,
+			SessionPackets:  ev.SessionPkts,
+			SessionBytes:    ev.SessionBytes,
 		})
 	}
 	return resp, nil
@@ -1860,17 +1878,19 @@ func uint32ToIP(v uint32) net.IP {
 	return ip
 }
 
-func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64) *pb.SessionEntry {
+func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, zoneNames map[uint16]string) *pb.SessionEntry {
 	se := &pb.SessionEntry{
-		SrcAddr:        net.IP(key.SrcIP[:]).String(),
-		DstAddr:        net.IP(key.DstIP[:]).String(),
-		SrcPort:        uint32(ntohs(key.SrcPort)),
-		DstPort:        uint32(ntohs(key.DstPort)),
-		Protocol:       protoName(key.Protocol),
-		State:          sessionStateName(val.State),
-		PolicyId:       val.PolicyID,
-		IngressZone:    uint32(val.IngressZone),
-		EgressZone:     uint32(val.EgressZone),
+		SrcAddr:         net.IP(key.SrcIP[:]).String(),
+		DstAddr:         net.IP(key.DstIP[:]).String(),
+		SrcPort:         uint32(ntohs(key.SrcPort)),
+		DstPort:         uint32(ntohs(key.DstPort)),
+		Protocol:        protoName(key.Protocol),
+		State:           sessionStateName(val.State),
+		PolicyId:        val.PolicyID,
+		IngressZone:     uint32(val.IngressZone),
+		EgressZone:      uint32(val.EgressZone),
+		IngressZoneName: zoneNames[val.IngressZone],
+		EgressZoneName:  zoneNames[val.EgressZone],
 		FwdPackets:     val.FwdPackets,
 		FwdBytes:       val.FwdBytes,
 		RevPackets:     val.RevPackets,
@@ -1889,17 +1909,19 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 	return se
 }
 
-func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64) *pb.SessionEntry {
+func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, zoneNames map[uint16]string) *pb.SessionEntry {
 	se := &pb.SessionEntry{
-		SrcAddr:        net.IP(key.SrcIP[:]).String(),
-		DstAddr:        net.IP(key.DstIP[:]).String(),
-		SrcPort:        uint32(ntohs(key.SrcPort)),
-		DstPort:        uint32(ntohs(key.DstPort)),
-		Protocol:       protoName(key.Protocol),
-		State:          sessionStateName(val.State),
-		PolicyId:       val.PolicyID,
-		IngressZone:    uint32(val.IngressZone),
-		EgressZone:     uint32(val.EgressZone),
+		SrcAddr:         net.IP(key.SrcIP[:]).String(),
+		DstAddr:         net.IP(key.DstIP[:]).String(),
+		SrcPort:         uint32(ntohs(key.SrcPort)),
+		DstPort:         uint32(ntohs(key.DstPort)),
+		Protocol:        protoName(key.Protocol),
+		State:           sessionStateName(val.State),
+		PolicyId:        val.PolicyID,
+		IngressZone:     uint32(val.IngressZone),
+		EgressZone:      uint32(val.EgressZone),
+		IngressZoneName: zoneNames[val.IngressZone],
+		EgressZoneName:  zoneNames[val.EgressZone],
 		FwdPackets:     val.FwdPackets,
 		FwdBytes:       val.FwdBytes,
 		RevPackets:     val.RevPackets,

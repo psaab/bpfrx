@@ -671,9 +671,17 @@ func (c *ctl) showFlowSession(args []string) error {
 	for i, se := range resp.Sessions {
 		fmt.Printf("Session ID: %d, Policy: %d, State: %s, Timeout: %ds\n",
 			i+1, se.PolicyId, se.State, se.TimeoutSeconds)
-		fmt.Printf("  In: %s:%d --> %s:%d;%s, Zone: %d -> %d\n",
+		inZone := se.IngressZoneName
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", se.IngressZone)
+		}
+		outZone := se.EgressZoneName
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", se.EgressZone)
+		}
+		fmt.Printf("  In: %s:%d --> %s:%d;%s, Zone: %s -> %s\n",
 			se.SrcAddr, se.SrcPort, se.DstAddr, se.DstPort,
-			se.Protocol, se.IngressZone, se.EgressZone)
+			se.Protocol, inZone, outZone)
 		if se.Nat != "" {
 			fmt.Printf("  NAT: %s\n", se.Nat)
 		}
@@ -966,9 +974,17 @@ func (c *ctl) showEvents(args []string) error {
 		return nil
 	}
 	for _, e := range resp.Events {
-		fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%d zone=%d->%d\n",
+		inZone := e.IngressZoneName
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", e.IngressZone)
+		}
+		outZone := e.EgressZoneName
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", e.EgressZone)
+		}
+		fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%d zone=%s->%s\n",
 			e.Time, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
-			e.PolicyId, e.IngressZone, e.EgressZone)
+			e.PolicyId, inZone, outZone)
 	}
 	fmt.Printf("(%d events shown)\n", len(resp.Events))
 	return nil
