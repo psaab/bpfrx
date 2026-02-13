@@ -637,9 +637,12 @@ func (c *ctl) handleShowNAT(args []string) error {
 		fmt.Println("show security nat:")
 		fmt.Println("  source           Show source NAT rules")
 		fmt.Println("  destination      Show destination NAT rules")
+		fmt.Println("  static           Show static NAT rules")
 		return nil
 	}
 	switch args[0] {
+	case "static":
+		return c.showText("nat-static")
 	case "source":
 		if len(args) >= 2 && args[1] == "summary" {
 			return c.showNATSourceSummary()

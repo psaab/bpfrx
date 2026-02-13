@@ -2319,6 +2319,25 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			}
 		}
 
+	case "nat-static":
+		if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
+			buf.WriteString("No static NAT rules configured.\n")
+		} else {
+			for _, rs := range cfg.Security.NAT.Static {
+				fmt.Fprintf(&buf, "Static NAT rule-set: %s\n", rs.Name)
+				fmt.Fprintf(&buf, "  From zone: %s\n", rs.FromZone)
+				for _, rule := range rs.Rules {
+					fmt.Fprintf(&buf, "  Rule: %s\n", rule.Name)
+					fmt.Fprintf(&buf, "    Match destination-address: %s\n", rule.Match)
+					fmt.Fprintf(&buf, "    Then static-nat prefix:    %s\n", rule.Then)
+				}
+				buf.WriteString("\n")
+			}
+		}
+
+	case "persistent-nat":
+		buf.WriteString("Persistent NAT table (view via local CLI only)\n")
+
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown topic: %s", req.Topic)
 	}
