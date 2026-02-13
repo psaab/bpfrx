@@ -73,6 +73,10 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 			if err := compilePolicyOptions(node, &cfg.PolicyOptions); err != nil {
 				return nil, fmt.Errorf("policy-options: %w", err)
 			}
+		case "chassis":
+			if err := compileChassis(node, &cfg.Chassis); err != nil {
+				return nil, fmt.Errorf("chassis: %w", err)
+			}
 		case "snmp":
 			// Top-level snmp stanza (same format as system { snmp { ... } })
 			if err := compileSNMP(node, &cfg.System); err != nil {
@@ -3699,4 +3703,93 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 			term.Action = "reject"
 		}
 	}
+}
+
+func compileChassis(node *Node, ch *ChassisConfig) error {
+	clusterNode := node.FindChild("cluster")
+	if clusterNode == nil {
+		return nil
+	}
+
+	ch.Cluster = &ClusterConfig{}
+
+	if rcNode := clusterNode.FindChild("reth-count"); rcNode != nil {
+		if v := nodeVal(rcNode); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				ch.Cluster.RethCount = n
+			}
+		}
+	}
+
+	for _, rgInst := range namedInstances(clusterNode.FindChildren("redundancy-group")) {
+		rgID := 0
+		if n, err := strconv.Atoi(rgInst.name); err == nil {
+			rgID = n
+		}
+
+		rg := &RedundancyGroup{
+			ID:             rgID,
+			NodePriorities: make(map[int]int),
+		}
+
+		for _, child := range rgInst.node.Children {
+			switch child.Name() {
+			case "node":
+				// node <id> priority <value>
+				nodeID := 0
+				if v := nodeVal(child); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						nodeID = n
+					}
+				}
+				// Look for "priority" in inline keys or children
+				for i := 2; i < len(child.Keys)-1; i++ {
+					if child.Keys[i] == "priority" {
+						if n, err := strconv.Atoi(child.Keys[i+1]); err == nil {
+							rg.NodePriorities[nodeID] = n
+						}
+					}
+				}
+				if priNode := child.FindChild("priority"); priNode != nil {
+					if v := nodeVal(priNode); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							rg.NodePriorities[nodeID] = n
+						}
+					}
+				}
+			case "gratuitous-arp-count":
+				if v := nodeVal(child); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						rg.GratuitousARPCount = n
+					}
+				}
+			case "interface-monitor":
+				for _, ifChild := range child.Children {
+					im := &InterfaceMonitor{
+						Interface: ifChild.Name(),
+					}
+					// weight is typically inline: "ge-0/0/0 weight 255"
+					for i := 1; i < len(ifChild.Keys)-1; i++ {
+						if ifChild.Keys[i] == "weight" {
+							if n, err := strconv.Atoi(ifChild.Keys[i+1]); err == nil {
+								im.Weight = n
+							}
+						}
+					}
+					if wNode := ifChild.FindChild("weight"); wNode != nil {
+						if v := nodeVal(wNode); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								im.Weight = n
+							}
+						}
+					}
+					rg.InterfaceMonitors = append(rg.InterfaceMonitors, im)
+				}
+			}
+		}
+
+		ch.Cluster.RedundancyGroups = append(ch.Cluster.RedundancyGroups, rg)
+	}
+
+	return nil
 }

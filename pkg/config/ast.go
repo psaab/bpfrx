@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -531,6 +532,18 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"nat64prefix": {args: 1, children: map[string]*schemaNode{
 					"lifetime": {args: 1, children: nil},
 				}},
+			}},
+		}},
+	}},
+	"chassis": {children: map[string]*schemaNode{
+		"cluster": {children: map[string]*schemaNode{
+			"reth-count": {args: 1, children: nil},
+			"redundancy-group": {args: 1, children: map[string]*schemaNode{
+				"node": {args: 1, children: map[string]*schemaNode{
+					"priority": {args: 1, children: nil},
+				}},
+				"gratuitous-arp-count": {args: 1, children: nil},
+				"interface-monitor":    {children: nil},
 			}},
 		}},
 	}},
@@ -1074,4 +1087,54 @@ func formatSetNodes(b *strings.Builder, nodes []*Node, prefix []string) {
 			formatSetNodes(b, n.Children, path)
 		}
 	}
+}
+
+// FormatJSON renders the tree as a JSON object.
+func (t *ConfigTree) FormatJSON() string {
+	obj := nodesToJSON(t.Children)
+	data, err := json.MarshalIndent(obj, "", "  ")
+	if err != nil {
+		return "{}"
+	}
+	return string(data) + "\n"
+}
+
+// nodesToJSON converts a list of AST nodes to a nested map structure.
+func nodesToJSON(nodes []*Node) map[string]interface{} {
+	result := make(map[string]interface{})
+
+	for _, n := range nodes {
+		if n.IsLeaf {
+			// Leaf node: key is first key, value is remaining keys joined
+			if len(n.Keys) == 1 {
+				result[n.Keys[0]] = true
+			} else if len(n.Keys) == 2 {
+				result[n.Keys[0]] = n.Keys[1]
+			} else {
+				result[n.Keys[0]] = strings.Join(n.Keys[1:], " ")
+			}
+		} else {
+			name := n.Keys[0]
+			qualifier := ""
+			if len(n.Keys) > 1 {
+				qualifier = strings.Join(n.Keys[1:], " ")
+			}
+
+			children := nodesToJSON(n.Children)
+
+			if qualifier != "" {
+				// Named instance: e.g. "interface trust0" → {"interface": {"trust0": {...}}}
+				if existing, ok := result[name]; ok {
+					if m, ok := existing.(map[string]interface{}); ok {
+						m[qualifier] = children
+					}
+				} else {
+					result[name] = map[string]interface{}{qualifier: children}
+				}
+			} else {
+				result[name] = children
+			}
+		}
+	}
+	return result
 }

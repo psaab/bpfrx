@@ -6284,3 +6284,110 @@ func TestRAPreferenceAndNAT64Lifetime(t *testing.T) {
 	}
 }
 
+func TestChassisCluster(t *testing.T) {
+	input := `chassis {
+    cluster {
+        reth-count 5;
+        redundancy-group 0 {
+            node 0 priority 100;
+            node 1 priority 1;
+        }
+        redundancy-group 1 {
+            node 0 priority 100;
+            node 1 priority 1;
+            gratuitous-arp-count 8;
+            interface-monitor {
+                ge-0/0/0 weight 255;
+                ge-7/0/0 weight 255;
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	cl := cfg.Chassis.Cluster
+	if cl.RethCount != 5 {
+		t.Errorf("RethCount = %d, want 5", cl.RethCount)
+	}
+	if len(cl.RedundancyGroups) != 2 {
+		t.Fatalf("RedundancyGroups = %d, want 2", len(cl.RedundancyGroups))
+	}
+
+	rg0 := cl.RedundancyGroups[0]
+	if rg0.ID != 0 {
+		t.Errorf("rg0.ID = %d, want 0", rg0.ID)
+	}
+	if rg0.NodePriorities[0] != 100 {
+		t.Errorf("rg0 node 0 priority = %d, want 100", rg0.NodePriorities[0])
+	}
+	if rg0.NodePriorities[1] != 1 {
+		t.Errorf("rg0 node 1 priority = %d, want 1", rg0.NodePriorities[1])
+	}
+
+	rg1 := cl.RedundancyGroups[1]
+	if rg1.GratuitousARPCount != 8 {
+		t.Errorf("rg1 gratuitous-arp-count = %d, want 8", rg1.GratuitousARPCount)
+	}
+	if len(rg1.InterfaceMonitors) != 2 {
+		t.Fatalf("rg1 interface-monitors = %d, want 2", len(rg1.InterfaceMonitors))
+	}
+	if rg1.InterfaceMonitors[0].Interface != "ge-0/0/0" {
+		t.Errorf("monitor[0] = %q, want ge-0/0/0", rg1.InterfaceMonitors[0].Interface)
+	}
+	if rg1.InterfaceMonitors[0].Weight != 255 {
+		t.Errorf("monitor[0] weight = %d, want 255", rg1.InterfaceMonitors[0].Weight)
+	}
+}
+
+func TestChassisClusterSetSyntax(t *testing.T) {
+	commands := []string{
+		"set chassis cluster reth-count 3",
+		"set chassis cluster redundancy-group 0 node 0 priority 100",
+		"set chassis cluster redundancy-group 0 node 1 priority 50",
+		"set chassis cluster redundancy-group 1 node 0 priority 200",
+		"set chassis cluster redundancy-group 1 gratuitous-arp-count 16",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range commands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if cfg.Chassis.Cluster.RethCount != 3 {
+		t.Errorf("RethCount = %d, want 3", cfg.Chassis.Cluster.RethCount)
+	}
+	if len(cfg.Chassis.Cluster.RedundancyGroups) != 2 {
+		t.Fatalf("RedundancyGroups = %d, want 2", len(cfg.Chassis.Cluster.RedundancyGroups))
+	}
+	rg0 := cfg.Chassis.Cluster.RedundancyGroups[0]
+	if rg0.NodePriorities[0] != 100 || rg0.NodePriorities[1] != 50 {
+		t.Errorf("rg0 priorities: node0=%d, node1=%d", rg0.NodePriorities[0], rg0.NodePriorities[1])
+	}
+	rg1 := cfg.Chassis.Cluster.RedundancyGroups[1]
+	if rg1.NodePriorities[0] != 200 {
+		t.Errorf("rg1 node 0 priority = %d, want 200", rg1.NodePriorities[0])
+	}
+	if rg1.GratuitousARPCount != 16 {
+		t.Errorf("rg1 gratuitous-arp-count = %d, want 16", rg1.GratuitousARPCount)
+	}
+}
+

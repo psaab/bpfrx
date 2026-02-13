@@ -14,7 +14,33 @@ type Config struct {
 	System            SystemConfig
 	PolicyOptions     PolicyOptionsConfig
 	Schedulers        map[string]*SchedulerConfig
+	Chassis           ChassisConfig
 	Warnings          []string // non-fatal validation warnings
+}
+
+// ChassisConfig holds chassis-level configuration (clustering, etc).
+type ChassisConfig struct {
+	Cluster *ClusterConfig
+}
+
+// ClusterConfig defines chassis cluster settings for HA.
+type ClusterConfig struct {
+	RethCount        int
+	RedundancyGroups []*RedundancyGroup
+}
+
+// RedundancyGroup defines a cluster redundancy group.
+type RedundancyGroup struct {
+	ID                 int
+	NodePriorities     map[int]int        // node-id -> priority
+	GratuitousARPCount int
+	InterfaceMonitors  []*InterfaceMonitor
+}
+
+// InterfaceMonitor defines an interface health monitor within a redundancy group.
+type InterfaceMonitor struct {
+	Interface string
+	Weight    int
 }
 
 // PolicyOptionsConfig holds prefix-lists and policy-statements for routing control.
