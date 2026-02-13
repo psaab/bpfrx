@@ -2414,6 +2414,14 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		}
 	}
 
+	// Forwarding-class + loss-priority → DSCP rewrite.
+	// Only applies if no explicit dscp rewrite was set.
+	if term.ForwardingClass != "" && base.DSCPRewrite == 0xFF {
+		if val, ok := forwardingClassToDSCP(term.ForwardingClass, term.LossPriority); ok {
+			base.DSCPRewrite = val
+		}
+	}
+
 	// Protocol match
 	if term.Protocol != "" {
 		base.MatchFlags |= FilterMatchProtocol
@@ -2571,6 +2579,38 @@ func resolvePortRange(s string) (lo, hi uint16) {
 	}
 	p := resolvePortName(s)
 	return p, p
+}
+
+// forwardingClassToDSCP maps a Junos forwarding-class + loss-priority to a DSCP value.
+// Forwarding classes: best-effort, expedited-forwarding, assured-forwarding, network-control.
+// Loss priority selects the AF drop precedence (low=AFx1, medium-low=AFx2, medium-high/high=AFx3).
+func forwardingClassToDSCP(fc, lp string) (uint8, bool) {
+	fc = strings.ToLower(fc)
+	lp = strings.ToLower(lp)
+	switch fc {
+	case "best-effort":
+		return 0, true // CS0/BE
+	case "expedited-forwarding":
+		return 46, true // EF
+	case "network-control":
+		return 48, true // CS6
+	case "assured-forwarding":
+		// AF class 1 with drop precedence from loss-priority
+		switch lp {
+		case "high", "medium-high":
+			return 14, true // AF13
+		case "medium-low":
+			return 12, true // AF12
+		default:
+			return 10, true // AF11
+		}
+	default:
+		// Try as DSCP name directly
+		if val, ok := DSCPValues[fc]; ok {
+			return val, true
+		}
+		return 0, false
+	}
 }
 
 func resolvePortName(name string) uint16 {
