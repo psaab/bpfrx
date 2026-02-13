@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -595,8 +596,17 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	d.applySystemDNS(cfg)
 	d.applySystemNTP(cfg)
 
+	// 9.5. Write SSH known hosts file
+	d.applySSHKnownHosts(cfg)
+
 	// 10. Apply system syslog forwarding
 	d.applySystemSyslog(cfg)
+
+	// 11. Apply system login users (create OS accounts, SSH keys)
+	d.applySystemLogin(cfg)
+
+	// 12. Apply SSH service configuration (root-login)
+	d.applySSHConfig(cfg)
 }
 
 // startDHCPClients iterates the config and starts DHCP/DHCPv6 clients
@@ -1118,6 +1128,55 @@ func (d *Daemon) applySystemNTP(cfg *config.Config) {
 	slog.Info("NTP config applied", "servers", cfg.System.NTPServers)
 }
 
+// applySSHKnownHosts writes /etc/ssh/ssh_known_hosts from
+// security { ssh-known-hosts { host ... } } config.
+func (d *Daemon) applySSHKnownHosts(cfg *config.Config) {
+	const path = "/etc/ssh/ssh_known_hosts"
+	if len(cfg.Security.SSHKnownHosts) == 0 {
+		return
+	}
+
+	var buf strings.Builder
+	buf.WriteString("# Managed by bpfrxd — do not edit\n")
+	// Sort hosts for deterministic output
+	var hosts []string
+	for h := range cfg.Security.SSHKnownHosts {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+	for _, host := range hosts {
+		for _, key := range cfg.Security.SSHKnownHosts[host] {
+			// Map Junos key type names to OpenSSH types
+			sshType := key.Type
+			switch sshType {
+			case "ssh-rsa-key":
+				sshType = "ssh-rsa"
+			case "ecdsa-sha2-nistp256-key":
+				sshType = "ecdsa-sha2-nistp256"
+			case "ssh-ed25519-key":
+				sshType = "ssh-ed25519"
+			case "ecdsa-sha2-nistp384-key":
+				sshType = "ecdsa-sha2-nistp384"
+			case "ecdsa-sha2-nistp521-key":
+				sshType = "ecdsa-sha2-nistp521"
+			}
+			fmt.Fprintf(&buf, "%s %s %s\n", host, sshType, key.Key)
+		}
+	}
+
+	content := buf.String()
+	current, _ := os.ReadFile(path)
+	if string(current) == content {
+		return
+	}
+
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		slog.Warn("failed to write ssh known hosts", "err", err)
+		return
+	}
+	slog.Info("SSH known hosts written", "hosts", len(cfg.Security.SSHKnownHosts))
+}
+
 // applySystemSyslog configures system-level syslog forwarding from
 // system { syslog { host ... } } config. This forwards daemon log
 // messages (Go slog) to remote syslog servers.
@@ -1161,4 +1220,113 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 	}
 
 	d.slogHandler.SetClients(clients)
+}
+
+// applySystemLogin creates OS user accounts and SSH authorized_keys from
+// system { login { user ... } } configuration.
+func (d *Daemon) applySystemLogin(cfg *config.Config) {
+	if len(cfg.System.Login.Users) == 0 {
+		return
+	}
+
+	for _, user := range cfg.System.Login.Users {
+		if user.Name == "" || user.Name == "root" {
+			continue // never create/modify root via config
+		}
+
+		// Check if user already exists
+		_, err := exec.Command("id", user.Name).CombinedOutput()
+		if err != nil {
+			// User doesn't exist — create it
+			args := []string{"-m", "-s", "/bin/bash"}
+			if user.UID > 0 {
+				args = append(args, "-u", fmt.Sprintf("%d", user.UID))
+			}
+			args = append(args, user.Name)
+			if out, err := exec.Command("useradd", args...).CombinedOutput(); err != nil {
+				slog.Warn("failed to create user",
+					"user", user.Name, "err", err, "output", string(out))
+				continue
+			}
+			slog.Info("created system user", "user", user.Name, "uid", user.UID)
+		}
+
+		// Grant sudo for super-user class
+		if user.Class == "super-user" {
+			sudoFile := fmt.Sprintf("/etc/sudoers.d/bpfrx-%s", user.Name)
+			sudoLine := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", user.Name)
+			current, _ := os.ReadFile(sudoFile)
+			if string(current) != sudoLine {
+				if err := os.WriteFile(sudoFile, []byte(sudoLine), 0440); err != nil {
+					slog.Warn("failed to write sudoers file",
+						"user", user.Name, "err", err)
+				}
+			}
+		}
+
+		// Set SSH authorized keys
+		if len(user.SSHKeys) > 0 {
+			homeDir := fmt.Sprintf("/home/%s", user.Name)
+			sshDir := homeDir + "/.ssh"
+			os.MkdirAll(sshDir, 0700)
+
+			keysContent := strings.Join(user.SSHKeys, "\n") + "\n"
+			keysFile := sshDir + "/authorized_keys"
+			current, _ := os.ReadFile(keysFile)
+			if string(current) != keysContent {
+				if err := os.WriteFile(keysFile, []byte(keysContent), 0600); err != nil {
+					slog.Warn("failed to write authorized_keys",
+						"user", user.Name, "err", err)
+					continue
+				}
+				// Fix ownership
+				exec.Command("chown", "-R", user.Name+":"+user.Name, sshDir).Run()
+				slog.Info("SSH keys updated", "user", user.Name, "keys", len(user.SSHKeys))
+			}
+		}
+	}
+}
+
+// applySSHConfig configures sshd from system { services { ssh { ... } } }.
+// Uses a drop-in config file to avoid modifying the main sshd_config.
+func (d *Daemon) applySSHConfig(cfg *config.Config) {
+	if cfg.System.Services == nil || cfg.System.Services.SSH == nil {
+		return
+	}
+
+	ssh := cfg.System.Services.SSH
+	if ssh.RootLogin == "" {
+		return
+	}
+
+	// Map Junos values to sshd_config PermitRootLogin values
+	var permitRoot string
+	switch ssh.RootLogin {
+	case "allow":
+		permitRoot = "yes"
+	case "deny":
+		permitRoot = "no"
+	case "deny-password":
+		permitRoot = "prohibit-password"
+	default:
+		return
+	}
+
+	confPath := "/etc/ssh/sshd_config.d/bpfrx.conf"
+	content := fmt.Sprintf("# Managed by bpfrx — do not edit\nPermitRootLogin %s\n", permitRoot)
+
+	current, _ := os.ReadFile(confPath)
+	if string(current) == content {
+		return // no change
+	}
+
+	os.MkdirAll("/etc/ssh/sshd_config.d", 0755)
+	if err := os.WriteFile(confPath, []byte(content), 0644); err != nil {
+		slog.Warn("failed to write sshd config", "err", err)
+		return
+	}
+
+	// Reload sshd to pick up changes
+	exec.Command("systemctl", "reload", "sshd").Run()
+	slog.Info("SSH config applied", "permit_root_login", permitRoot)
 }
