@@ -1076,6 +1076,7 @@ type IPsecVPN struct {
 // RoutingInstanceConfig represents a VRF-based routing instance.
 type RoutingInstanceConfig struct {
 	Name                    string
+	Description             string
 	InstanceType            string              // "virtual-router" or "vrf"
 	Interfaces              []string            // interfaces belonging to this instance
 	StaticRoutes            []*StaticRoute      // per-instance static routes

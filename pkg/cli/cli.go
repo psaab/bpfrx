@@ -135,7 +135,18 @@ var operationalTree = map[string]*completionNode{
 			}},
 			"policies": {desc: "Show security policies", children: map[string]*completionNode{
 				"brief":     {desc: "Show brief policy summary"},
-				"hit-count": {desc: "Show policy hit counters"},
+				"hit-count": {desc: "Show policy hit counters [from-zone X to-zone Y]"},
+				"from-zone": {desc: "Filter by source zone", dynamicFn: func(cfg *config.Config) []string {
+					if cfg == nil {
+						return nil
+					}
+					names := make([]string, 0, len(cfg.Security.Zones))
+					for name := range cfg.Security.Zones {
+						names = append(names, name)
+					}
+					return names
+				}},
+				"to-zone": {desc: "Filter by destination zone"},
 			}},
 			"screen":          {desc: "Show screen/IDS profiles"},
 			"alg":             {desc: "Show ALG status"},
@@ -223,6 +234,9 @@ var operationalTree = map[string]*completionNode{
 				"session": {desc: "Clear sessions [source-prefix|destination-prefix|protocol|zone]"},
 			}},
 			"counters": {desc: "Clear all counters"},
+			"policies": {desc: "Clear policy information", children: map[string]*completionNode{
+				"hit-count": {desc: "Clear policy hit counters"},
+			}},
 			"nat": {desc: "Clear NAT information", children: map[string]*completionNode{
 				"source": {desc: "Clear source NAT", children: map[string]*completionNode{
 					"persistent-nat-table": {desc: "Clear persistent NAT bindings"},
@@ -1098,9 +1112,11 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		return nil
 
 	case "policies":
+		// Parse optional zone-pair filter: from-zone X to-zone Y
+		fromZone, toZone := parsePolicyZoneFilter(args[1:])
 		// "show security policies hit-count" — Junos-style hit count table
 		if len(args) >= 2 && args[1] == "hit-count" {
-			return c.showPoliciesHitCount(cfg)
+			return c.showPoliciesHitCount(cfg, fromZone, toZone)
 		}
 		brief := len(args) >= 2 && args[1] == "brief"
 		if brief {
@@ -1109,6 +1125,14 @@ func (c *CLI) handleShowSecurity(args []string) error {
 				"From", "To", "Name", "Action", "Hits")
 			policySetID := uint32(0)
 			for _, zpp := range cfg.Security.Policies {
+				if fromZone != "" && zpp.FromZone != fromZone {
+					policySetID++
+					continue
+				}
+				if toZone != "" && zpp.ToZone != toZone {
+					policySetID++
+					continue
+				}
 				for i, pol := range zpp.Policies {
 					action := "permit"
 					switch pol.Action {
@@ -1134,6 +1158,14 @@ func (c *CLI) handleShowSecurity(args []string) error {
 
 		policySetID := uint32(0)
 		for _, zpp := range cfg.Security.Policies {
+			if fromZone != "" && zpp.FromZone != fromZone {
+				policySetID++
+				continue
+			}
+			if toZone != "" && zpp.ToZone != toZone {
+				policySetID++
+				continue
+			}
 			fmt.Printf("From zone: %s, To zone: %s\n", zpp.FromZone, zpp.ToZone)
 			for i, pol := range zpp.Policies {
 				action := "permit"
@@ -1224,8 +1256,21 @@ func (c *CLI) handleShowSecurity(args []string) error {
 	}
 }
 
+// parsePolicyZoneFilter extracts from-zone/to-zone filters from args.
+func parsePolicyZoneFilter(args []string) (fromZone, toZone string) {
+	for i := 0; i < len(args)-1; i++ {
+		switch args[i] {
+		case "from-zone":
+			fromZone = args[i+1]
+		case "to-zone":
+			toZone = args[i+1]
+		}
+	}
+	return
+}
+
 // showPoliciesHitCount displays a Junos-style policy hit count table.
-func (c *CLI) showPoliciesHitCount(cfg *config.Config) error {
+func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) error {
 	if c.dp == nil || !c.dp.IsLoaded() {
 		fmt.Println("dataplane not loaded")
 		return nil
@@ -1238,6 +1283,14 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config) error {
 	policySetID := uint32(0)
 	var totalPkts, totalBytes uint64
 	for _, zpp := range cfg.Security.Policies {
+		if fromZone != "" && zpp.FromZone != fromZone {
+			policySetID++
+			continue
+		}
+		if toZone != "" && zpp.ToZone != toZone {
+			policySetID++
+			continue
+		}
 		for i, pol := range zpp.Policies {
 			action := "permit"
 			switch pol.Action {
@@ -2289,6 +2342,7 @@ func (c *CLI) handleClearSecurity(args []string) error {
 		fmt.Println("clear security:")
 		fmt.Println("  flow session                         Clear all sessions")
 		fmt.Println("  counters                             Clear all counters")
+		fmt.Println("  policies hit-count                   Clear policy hit counters")
 		fmt.Println("  nat source persistent-nat-table      Clear persistent NAT bindings")
 		return nil
 	}
@@ -2318,6 +2372,20 @@ func (c *CLI) handleClearSecurity(args []string) error {
 		fmt.Printf("%d IPv4 and %d IPv6 session entries cleared\n", v4, v6)
 		return nil
 
+	case "policies":
+		if len(args) >= 2 && args[1] == "hit-count" {
+			if c.dp == nil || !c.dp.IsLoaded() {
+				fmt.Println("dataplane not loaded")
+				return nil
+			}
+			if err := c.dp.ClearPolicyCounters(); err != nil {
+				return fmt.Errorf("clear policy counters: %w", err)
+			}
+			fmt.Println("policy hit counters cleared")
+			return nil
+		}
+		return fmt.Errorf("usage: clear security policies hit-count")
+
 	case "counters":
 		if c.dp == nil || !c.dp.IsLoaded() {
 			fmt.Println("dataplane not loaded")
@@ -2331,8 +2399,10 @@ func (c *CLI) handleClearSecurity(args []string) error {
 
 	default:
 		fmt.Println("clear security:")
-		fmt.Println("  flow session    Clear all sessions")
-		fmt.Println("  counters        Clear all counters")
+		fmt.Println("  flow session                         Clear all sessions")
+		fmt.Println("  counters                             Clear all counters")
+		fmt.Println("  policies hit-count                   Clear policy hit counters")
+		fmt.Println("  nat source persistent-nat-table      Clear persistent NAT bindings")
 		return nil
 	}
 }
@@ -6536,6 +6606,9 @@ func (c *CLI) showRoutingInstances() error {
 			ifaces = strings.Join(ri.Interfaces, ", ")
 		}
 		fmt.Printf("%-20s %-16s %-6s %s\n", ri.Name, ri.InstanceType, tableID, ifaces)
+		if ri.Description != "" {
+			fmt.Printf("  Description: %s\n", ri.Description)
+		}
 	}
 	return nil
 }

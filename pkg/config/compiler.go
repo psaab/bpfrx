@@ -770,6 +770,9 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 		if speedNode := child.FindChild("speed"); speedNode != nil {
 			ifc.Speed = nodeVal(speedNode)
 		}
+		if duplexNode := child.FindChild("duplex"); duplexNode != nil {
+			ifc.Duplex = nodeVal(duplexNode)
+		}
 		if child.FindChild("disable") != nil {
 			ifc.Disable = true
 		}
@@ -2820,6 +2823,8 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 
 		for _, prop := range child.Children {
 			switch prop.Name() {
+			case "description":
+				ri.Description = nodeVal(prop)
 			case "instance-type":
 				ri.InstanceType = nodeVal(prop)
 			case "interface":

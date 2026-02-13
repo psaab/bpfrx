@@ -600,7 +600,7 @@ func (c *ctl) handleShowSecurity(args []string) error {
 	case "ipsec":
 		return c.showIPsec(args[1:])
 	case "ike":
-		return c.showText("ike")
+		return c.showIKE(args[1:])
 	case "match-policies":
 		return c.showMatchPolicies(args[1:])
 	case "vrrp":
@@ -1147,6 +1147,23 @@ func (c *ctl) showFlowStatistics() error {
 	return nil
 }
 
+func (c *ctl) showIKE(args []string) error {
+	if len(args) > 0 && args[0] == "security-associations" {
+		resp, err := c.client.GetIPsecSA(context.Background(), &pb.GetIPsecSARequest{})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		if resp.Output == "" {
+			fmt.Println("No IKE security associations")
+		} else {
+			fmt.Print(resp.Output)
+		}
+		return nil
+	}
+	// Show IKE configuration
+	return c.showText("ike")
+}
+
 func (c *ctl) showIPsec(args []string) error {
 	if len(args) > 0 && args[0] == "security-associations" {
 		resp, err := c.client.GetIPsecSA(context.Background(), &pb.GetIPsecSARequest{})
@@ -1544,12 +1561,26 @@ func (c *ctl) handleClear(args []string) error {
 func (c *ctl) handleClearSecurity(args []string) error {
 	if len(args) < 1 {
 		fmt.Println("clear security:")
-		fmt.Println("  flow session    Clear all sessions")
-		fmt.Println("  counters        Clear all counters")
+		fmt.Println("  flow session                         Clear all sessions")
+		fmt.Println("  counters                             Clear all counters")
+		fmt.Println("  nat source persistent-nat-table      Clear persistent NAT bindings")
 		return nil
 	}
 
 	switch args[0] {
+	case "nat":
+		if len(args) >= 3 && args[1] == "source" && args[2] == "persistent-nat-table" {
+			resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+				Action: "clear-persistent-nat",
+			})
+			if err != nil {
+				return fmt.Errorf("%v", err)
+			}
+			fmt.Println(resp.Message)
+			return nil
+		}
+		return fmt.Errorf("usage: clear security nat source persistent-nat-table")
+
 	case "flow":
 		if len(args) < 2 || args[1] != "session" {
 			return fmt.Errorf("usage: clear security flow session [filters...]")
@@ -1601,8 +1632,9 @@ func (c *ctl) handleClearSecurity(args []string) error {
 
 	default:
 		fmt.Println("clear security:")
-		fmt.Println("  flow session    Clear all sessions")
-		fmt.Println("  counters        Clear all counters")
+		fmt.Println("  flow session                         Clear all sessions")
+		fmt.Println("  counters                             Clear all counters")
+		fmt.Println("  nat source persistent-nat-table      Clear persistent NAT bindings")
 		return nil
 	}
 }
@@ -1844,6 +1876,7 @@ func (c *ctl) showOperationalHelp() {
 	fmt.Println("  show schedulers                    Show policy schedulers")
 	fmt.Println("  show security                      Show security information")
 	fmt.Println("  show security policies brief       Show brief policy summary")
+	fmt.Println("  show security ike security-assoc.   Show IKE SAs (live)")
 	fmt.Println("  show security ipsec                Show IPsec VPN status")
 	fmt.Println("  show security log [N]              Show recent security events")
 	fmt.Println("  show snmp                          Show SNMP configuration")
@@ -1856,6 +1889,7 @@ func (c *ctl) showOperationalHelp() {
 	fmt.Println("  show version                       Show software version")
 	fmt.Println("  clear security flow session        Clear all sessions")
 	fmt.Println("  clear security counters            Clear all counters")
+	fmt.Println("  clear security nat source pers...  Clear persistent NAT bindings")
 	fmt.Println("  clear dhcp client-identifier       Clear DHCPv6 DUID(s)")
 	fmt.Println("  request system reboot              Reboot the system")
 	fmt.Println("  request system halt                Halt the system")

@@ -3792,6 +3792,9 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			// Per-instance details
 			for _, ri := range cfg.RoutingInstances {
 				fmt.Fprintf(&buf, "Instance: %s\n", ri.Name)
+				if ri.Description != "" {
+					fmt.Fprintf(&buf, "  Description: %s\n", ri.Description)
+				}
 				fmt.Fprintf(&buf, "  Type: %s\n", ri.InstanceType)
 				if ri.TableID > 0 {
 					fmt.Fprintf(&buf, "  Table ID: %d\n", ri.TableID)
@@ -4247,6 +4250,16 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 			}
 		}
 		return &pb.SystemActionResponse{Message: "System zeroized. Configuration erased. Reboot to complete factory reset."}, nil
+
+	case "clear-persistent-nat":
+		if s.dp == nil || s.dp.PersistentNAT == nil {
+			return &pb.SystemActionResponse{Message: "Persistent NAT table not available"}, nil
+		}
+		count := s.dp.PersistentNAT.Len()
+		s.dp.PersistentNAT.Clear()
+		return &pb.SystemActionResponse{
+			Message: fmt.Sprintf("Cleared %d persistent NAT bindings", count),
+		}, nil
 
 	case "dhcp-renew":
 		if s.dhcp == nil {
