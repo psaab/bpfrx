@@ -27,6 +27,8 @@ type InterfaceConfig struct {
 	DHCPv4       bool     // true = daemon runs DHCPv4 client (don't set static addr)
 	DHCPv6       bool     // true = daemon runs DHCPv6 client
 	Unmanaged    bool     // true = not in config; keep down with no addresses
+	Disable      bool     // true = administratively disabled (keep down)
+	DADDisable   bool     // true = disable IPv6 Duplicate Address Detection
 	Speed        string   // link speed: "10M", "100M", "1G", "10G", etc.
 	Duplex       string   // "full", "half"
 	MTU          int      // interface MTU (0 = default)
@@ -210,7 +212,7 @@ func (m *Manager) generateNetwork(ifc InterfaceConfig) string {
 	b.WriteString("[Match]\n")
 	fmt.Fprintf(&b, "Name=%s\n", ifc.Name)
 
-	if ifc.Unmanaged {
+	if ifc.Unmanaged || ifc.Disable {
 		b.WriteString("\n[Link]\n")
 		b.WriteString("ActivationPolicy=always-down\n")
 		b.WriteString("RequiredForOnline=no\n")
@@ -234,6 +236,11 @@ func (m *Manager) generateNetwork(ifc InterfaceConfig) string {
 	}
 
 	b.WriteString("LinkLocalAddressing=ipv6\n")
+
+	// Disable IPv6 Duplicate Address Detection if configured
+	if ifc.DADDisable {
+		b.WriteString("IPv6DuplicateAddressDetection=0\n")
+	}
 
 	// Only write Address= lines for static (non-DHCP, non-VLAN-parent) interfaces
 	if !ifc.IsVLANParent && !ifc.DHCPv4 && !ifc.DHCPv6 {

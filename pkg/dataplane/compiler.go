@@ -590,6 +590,7 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					Name:         ifName,
 					MACAddress:   mac,
 					IsVLANParent: true,
+					Disable:      ifCfg.Disable,
 					Speed:        ifCfg.Speed,
 					Duplex:       ifCfg.Duplex,
 					MTU:          ifCfg.MTU,
@@ -603,10 +604,11 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					if !seen[subName] {
 						seen[subName] = true
 						result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
-							Name:      subName,
-							Addresses: unit.Addresses,
-							DHCPv4:    unit.DHCP,
-							DHCPv6:    unit.DHCPv6,
+							Name:       subName,
+							Addresses:  unit.Addresses,
+							DHCPv4:     unit.DHCP,
+							DHCPv6:     unit.DHCPv6,
+							DADDisable: unit.DADDisable,
 						})
 					}
 				}
@@ -617,7 +619,7 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 				seen[ifName] = true
 				// Collect addresses from all units
 				var addrs []string
-				var dhcpv4, dhcpv6 bool
+				var dhcpv4, dhcpv6, dadDisable bool
 				for _, unit := range ifCfg.Units {
 					addrs = append(addrs, unit.Addresses...)
 					if unit.DHCP {
@@ -626,6 +628,9 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					if unit.DHCPv6 {
 						dhcpv6 = true
 					}
+					if unit.DADDisable {
+						dadDisable = true
+					}
 				}
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 					Name:        ifName,
@@ -633,6 +638,8 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					Addresses:   addrs,
 					DHCPv4:      dhcpv4,
 					DHCPv6:      dhcpv6,
+					Disable:     ifCfg.Disable,
+					DADDisable:  dadDisable,
 					Speed:       ifCfg.Speed,
 					Duplex:      ifCfg.Duplex,
 					MTU:         ifCfg.MTU,
