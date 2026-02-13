@@ -73,6 +73,8 @@ type Daemon struct {
 	snmpAgent    *snmp.Agent
 	scheduler    *scheduler.Scheduler
 	slogHandler  *logging.SyslogSlogHandler
+	traceWriter  *logging.TraceWriter
+	eventReader  *logging.EventReader
 }
 
 // New creates a new Daemon.
@@ -166,6 +168,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		eventsMap := d.dp.Map("events")
 		if eventsMap != nil {
 			er = logging.NewEventReader(eventsMap, eventBuf)
+			d.eventReader = er
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -180,6 +183,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// Start NetFlow exporter if configured
 			if cfg := d.store.ActiveConfig(); cfg != nil {
 				d.startFlowExporter(ctx, cfg, er)
+			}
+
+			// Set up flow traceoptions if configured
+			if cfg := d.store.ActiveConfig(); cfg != nil {
+				d.applyFlowTrace(cfg, er)
 			}
 		}
 	}
@@ -615,6 +623,9 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 
 	// 13. Archive config to remote sites if transfer-on-commit is enabled
 	d.archiveConfig(cfg)
+
+	// 14. Update flow traceoptions (trace file + filters)
+	d.updateFlowTrace(cfg)
 }
 
 // startDHCPClients iterates the config and starts DHCP/DHCPv6 clients
@@ -1457,4 +1468,49 @@ func (d *Daemon) archiveConfig(cfg *config.Config) {
 			}
 		}(site)
 	}
+}
+
+// applyFlowTrace sets up the initial flow trace writer from config.
+func (d *Daemon) applyFlowTrace(cfg *config.Config, er *logging.EventReader) {
+	if cfg.Security.Flow.Traceoptions == nil || cfg.Security.Flow.Traceoptions.File == "" {
+		return
+	}
+
+	tw, err := logging.NewTraceWriter(cfg.Security.Flow.Traceoptions)
+	if err != nil {
+		slog.Warn("failed to create trace writer", "err", err)
+		return
+	}
+	d.traceWriter = tw
+	er.AddCallback(tw.HandleEvent)
+	slog.Info("flow traceoptions enabled",
+		"file", cfg.Security.Flow.Traceoptions.File,
+		"filters", len(cfg.Security.Flow.Traceoptions.PacketFilters))
+}
+
+// updateFlowTrace updates the trace writer when config changes.
+func (d *Daemon) updateFlowTrace(cfg *config.Config) {
+	if d.traceWriter != nil {
+		d.traceWriter.Close()
+		d.traceWriter = nil
+	}
+
+	if d.eventReader == nil {
+		return
+	}
+
+	if cfg.Security.Flow.Traceoptions == nil || cfg.Security.Flow.Traceoptions.File == "" {
+		return
+	}
+
+	tw, err := logging.NewTraceWriter(cfg.Security.Flow.Traceoptions)
+	if err != nil {
+		slog.Warn("failed to create trace writer", "err", err)
+		return
+	}
+	d.traceWriter = tw
+	d.eventReader.AddCallback(tw.HandleEvent)
+	slog.Info("flow traceoptions updated",
+		"file", cfg.Security.Flow.Traceoptions.File,
+		"filters", len(cfg.Security.Flow.Traceoptions.PacketFilters))
 }

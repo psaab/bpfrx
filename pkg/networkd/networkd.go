@@ -27,6 +27,10 @@ type InterfaceConfig struct {
 	DHCPv4       bool     // true = daemon runs DHCPv4 client (don't set static addr)
 	DHCPv6       bool     // true = daemon runs DHCPv6 client
 	Unmanaged    bool     // true = not in config; keep down with no addresses
+	Speed        string   // link speed: "10M", "100M", "1G", "10G", etc.
+	Duplex       string   // "full", "half"
+	MTU          int      // interface MTU (0 = default)
+	Description  string   // interface description (maps to .network [Network] Description)
 }
 
 // Manager handles systemd-networkd .link and .network file generation.
@@ -185,6 +189,18 @@ func (m *Manager) generateLink(ifc InterfaceConfig) string {
 	fmt.Fprintf(&b, "MACAddress=%s\n", ifc.MACAddress)
 	b.WriteString("\n[Link]\n")
 	fmt.Fprintf(&b, "Name=%s\n", ifc.Name)
+	if ifc.MTU > 0 {
+		fmt.Fprintf(&b, "MTUBytes=%d\n", ifc.MTU)
+	}
+	if ifc.Speed != "" {
+		fmt.Fprintf(&b, "BitsPerSecond=%s\n", junosSpeedToNetworkd(ifc.Speed))
+	}
+	if ifc.Duplex != "" {
+		fmt.Fprintf(&b, "Duplex=%s\n", ifc.Duplex)
+	}
+	if ifc.Description != "" {
+		fmt.Fprintf(&b, "Description=%s\n", ifc.Description)
+	}
 	return b.String()
 }
 
@@ -227,6 +243,35 @@ func (m *Manager) generateNetwork(ifc InterfaceConfig) string {
 	}
 
 	return b.String()
+}
+
+// junosSpeedToNetworkd converts Junos speed notation to systemd-networkd BitsPerSecond.
+// Junos uses "10m", "100m", "1g", "10g", "25g", "40g", "100g", "auto".
+// networkd expects numeric bps value (e.g. "1000000000" for 1G).
+func junosSpeedToNetworkd(speed string) string {
+	s := strings.ToLower(strings.TrimSpace(speed))
+	switch s {
+	case "10m":
+		return "10000000"
+	case "100m":
+		return "100000000"
+	case "1g":
+		return "1000000000"
+	case "2.5g":
+		return "2500000000"
+	case "5g":
+		return "5000000000"
+	case "10g":
+		return "10000000000"
+	case "25g":
+		return "25000000000"
+	case "40g":
+		return "40000000000"
+	case "100g":
+		return "100000000000"
+	default:
+		return speed // pass through as-is
+	}
 }
 
 // writeIfChanged writes content to path only if the content differs from

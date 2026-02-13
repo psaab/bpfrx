@@ -1159,6 +1159,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		if len(args) >= 2 && args[1] == "session" {
 			return c.showFlowSession(args[2:])
 		}
+		if len(args) >= 2 && args[1] == "traceoptions" {
+			return c.showFlowTraceoptions()
+		}
 		if len(args) == 1 {
 			return c.showFlowTimeouts()
 		}
@@ -2078,6 +2081,48 @@ func (c *CLI) showFlowTimeouts() error {
 		}
 		if flow.AllowEmbeddedICMP {
 			fmt.Println("  allow-embedded-icmp:           enabled")
+		}
+	}
+
+	return nil
+}
+
+// showFlowTraceoptions displays flow traceoptions config.
+func (c *CLI) showFlowTraceoptions() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+
+	opts := cfg.Security.Flow.Traceoptions
+	if opts == nil || opts.File == "" {
+		fmt.Println("Flow traceoptions: not configured")
+		return nil
+	}
+
+	fmt.Println("Flow traceoptions:")
+	fmt.Printf("  File:           %s\n", opts.File)
+	if opts.FileSize > 0 {
+		fmt.Printf("  Max size:       %d bytes\n", opts.FileSize)
+	}
+	if opts.FileCount > 0 {
+		fmt.Printf("  File count:     %d\n", opts.FileCount)
+	}
+	if len(opts.Flags) > 0 {
+		fmt.Printf("  Flags:          %s\n", strings.Join(opts.Flags, ", "))
+	}
+	if len(opts.PacketFilters) > 0 {
+		fmt.Println("  Packet filters:")
+		for _, pf := range opts.PacketFilters {
+			fmt.Printf("    %s:", pf.Name)
+			if pf.SourcePrefix != "" {
+				fmt.Printf(" src=%s", pf.SourcePrefix)
+			}
+			if pf.DestinationPrefix != "" {
+				fmt.Printf(" dst=%s", pf.DestinationPrefix)
+			}
+			fmt.Println()
 		}
 	}
 

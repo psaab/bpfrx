@@ -542,6 +542,7 @@ func (c *ctl) handleShowSecurity(args []string) error {
 		fmt.Println("  screen           Show screen/IDS profiles")
 		fmt.Println("  flow             Show flow timeouts")
 		fmt.Println("  flow session     Show active sessions")
+		fmt.Println("  flow traceoptions Show flow trace configuration")
 		fmt.Println("  nat              Show NAT information")
 		fmt.Println("  address-book     Show address book entries")
 		fmt.Println("  applications     Show application definitions")
@@ -571,6 +572,9 @@ func (c *ctl) handleShowSecurity(args []string) error {
 	case "flow":
 		if len(args) >= 2 && args[1] == "session" {
 			return c.showFlowSession(args[2:])
+		}
+		if len(args) >= 2 && args[1] == "traceoptions" {
+			return c.showText("flow-traceoptions")
 		}
 		if len(args) == 1 {
 			return c.showText("flow-timeouts")

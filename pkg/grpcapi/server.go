@@ -2375,25 +2375,74 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			buf.WriteString("No firewall filters configured\n")
 		} else {
 			printFilters := func(family string, filters map[string]*config.FirewallFilter) {
-				for name, filter := range filters {
-					fmt.Fprintf(&buf, "Filter: %s (family: %s)\n", name, family)
+				names := make([]string, 0, len(filters))
+				for name := range filters {
+					names = append(names, name)
+				}
+				sort.Strings(names)
+				for _, name := range names {
+					filter := filters[name]
+					fmt.Fprintf(&buf, "Filter: %s (family %s)\n", name, family)
 					for _, term := range filter.Terms {
 						fmt.Fprintf(&buf, "  Term: %s\n", term.Name)
+						if term.DSCP != "" {
+							fmt.Fprintf(&buf, "    from dscp %s\n", term.DSCP)
+						}
 						if term.Protocol != "" {
-							fmt.Fprintf(&buf, "    From protocol: %s\n", term.Protocol)
+							fmt.Fprintf(&buf, "    from protocol %s\n", term.Protocol)
+						}
+						for _, addr := range term.SourceAddresses {
+							fmt.Fprintf(&buf, "    from source-address %s\n", addr)
+						}
+						for _, pl := range term.SourcePrefixLists {
+							if pl.Except {
+								fmt.Fprintf(&buf, "    from source-prefix-list %s except\n", pl.Name)
+							} else {
+								fmt.Fprintf(&buf, "    from source-prefix-list %s\n", pl.Name)
+							}
+						}
+						for _, addr := range term.DestAddresses {
+							fmt.Fprintf(&buf, "    from destination-address %s\n", addr)
+						}
+						for _, pl := range term.DestPrefixLists {
+							if pl.Except {
+								fmt.Fprintf(&buf, "    from destination-prefix-list %s except\n", pl.Name)
+							} else {
+								fmt.Fprintf(&buf, "    from destination-prefix-list %s\n", pl.Name)
+							}
+						}
+						if len(term.SourcePorts) > 0 {
+							fmt.Fprintf(&buf, "    from source-port %s\n", strings.Join(term.SourcePorts, ", "))
 						}
 						if len(term.DestinationPorts) > 0 {
-							fmt.Fprintf(&buf, "    From destination-port: %s\n", strings.Join(term.DestinationPorts, ", "))
+							fmt.Fprintf(&buf, "    from destination-port %s\n", strings.Join(term.DestinationPorts, ", "))
 						}
-						if len(term.SourceAddresses) > 0 {
-							fmt.Fprintf(&buf, "    From source-address: %s\n", strings.Join(term.SourceAddresses, ", "))
+						if term.ICMPType >= 0 {
+							fmt.Fprintf(&buf, "    from icmp-type %d\n", term.ICMPType)
 						}
-						if term.DSCP != "" {
-							fmt.Fprintf(&buf, "    From dscp: %s\n", term.DSCP)
+						if term.ICMPCode >= 0 {
+							fmt.Fprintf(&buf, "    from icmp-code %d\n", term.ICMPCode)
 						}
-						if term.Action != "" {
-							fmt.Fprintf(&buf, "    Then: %s\n", term.Action)
+						if term.RoutingInstance != "" {
+							fmt.Fprintf(&buf, "    then routing-instance %s\n", term.RoutingInstance)
 						}
+						if term.Log {
+							buf.WriteString("    then log\n")
+						}
+						if term.Count != "" {
+							fmt.Fprintf(&buf, "    then count %s\n", term.Count)
+						}
+						if term.ForwardingClass != "" {
+							fmt.Fprintf(&buf, "    then forwarding-class %s\n", term.ForwardingClass)
+						}
+						if term.LossPriority != "" {
+							fmt.Fprintf(&buf, "    then loss-priority %s\n", term.LossPriority)
+						}
+						action := term.Action
+						if action == "" {
+							action = "accept"
+						}
+						fmt.Fprintf(&buf, "    then %s\n", action)
 					}
 					buf.WriteString("\n")
 				}
@@ -2519,6 +2568,41 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			}
 			if flow.AllowEmbeddedICMP {
 				buf.WriteString("  Allow embedded ICMP:  enabled\n")
+			}
+		}
+
+	case "flow-traceoptions":
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else {
+			opts := cfg.Security.Flow.Traceoptions
+			if opts == nil || opts.File == "" {
+				buf.WriteString("Flow traceoptions: not configured\n")
+			} else {
+				buf.WriteString("Flow traceoptions:\n")
+				fmt.Fprintf(&buf, "  File:           %s\n", opts.File)
+				if opts.FileSize > 0 {
+					fmt.Fprintf(&buf, "  File size:      %d bytes\n", opts.FileSize)
+				}
+				if opts.FileCount > 0 {
+					fmt.Fprintf(&buf, "  File count:     %d\n", opts.FileCount)
+				}
+				if len(opts.Flags) > 0 {
+					fmt.Fprintf(&buf, "  Flags:          %s\n", strings.Join(opts.Flags, ", "))
+				}
+				if len(opts.PacketFilters) > 0 {
+					buf.WriteString("  Packet filters:\n")
+					for _, pf := range opts.PacketFilters {
+						fmt.Fprintf(&buf, "    %s:", pf.Name)
+						if pf.SourcePrefix != "" {
+							fmt.Fprintf(&buf, " src=%s", pf.SourcePrefix)
+						}
+						if pf.DestinationPrefix != "" {
+							fmt.Fprintf(&buf, " dst=%s", pf.DestinationPrefix)
+						}
+						buf.WriteString("\n")
+					}
+				}
 			}
 		}
 

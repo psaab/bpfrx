@@ -590,6 +590,10 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					Name:         ifName,
 					MACAddress:   mac,
 					IsVLANParent: true,
+					Speed:        ifCfg.Speed,
+					Duplex:       ifCfg.Duplex,
+					MTU:          ifCfg.MTU,
+					Description:  ifCfg.Description,
 				})
 			}
 			// VLAN sub-interfaces get their own .network file
@@ -624,11 +628,15 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					}
 				}
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
-					Name:       ifName,
-					MACAddress: mac,
-					Addresses:  addrs,
-					DHCPv4:     dhcpv4,
-					DHCPv6:     dhcpv6,
+					Name:        ifName,
+					MACAddress:  mac,
+					Addresses:   addrs,
+					DHCPv4:      dhcpv4,
+					DHCPv6:      dhcpv6,
+					Speed:       ifCfg.Speed,
+					Duplex:      ifCfg.Duplex,
+					MTU:         ifCfg.MTU,
+					Description: ifCfg.Description,
 				})
 			}
 		}
