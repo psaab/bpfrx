@@ -144,6 +144,21 @@ func ValidateConfig(cfg *Config) []string {
 		apps[b] = true
 	}
 
+	// Validate application port specs and protocols
+	for name, app := range cfg.Applications.Applications {
+		if err := validatePortSpec(app.DestinationPort); err != nil {
+			warnings = append(warnings, fmt.Sprintf("application %s: destination-port: %v", name, err))
+		}
+		if err := validatePortSpec(app.SourcePort); err != nil {
+			warnings = append(warnings, fmt.Sprintf("application %s: source-port: %v", name, err))
+		}
+		if app.Protocol != "" {
+			if err := validateProtocol(app.Protocol); err != nil {
+				warnings = append(warnings, fmt.Sprintf("application %s: %v", name, err))
+			}
+		}
+	}
+
 	// Validate policies
 	for _, zpp := range cfg.Security.Policies {
 		if zpp.FromZone != "any" && !zones[zpp.FromZone] {
@@ -1980,6 +1995,68 @@ func parseApplicationTerm(parentName string, keys []string) *Application {
 		}
 	}
 	return app
+}
+
+// validatePortSpec checks that a port specification is valid.
+// Valid formats: "80", "8080-8090", named ports like "http".
+func validatePortSpec(spec string) error {
+	if spec == "" {
+		return nil
+	}
+	namedPorts := map[string]bool{
+		"http": true, "https": true, "ssh": true, "telnet": true,
+		"ftp": true, "ftp-data": true, "smtp": true, "dns": true,
+		"pop3": true, "imap": true, "snmp": true, "ntp": true,
+		"bgp": true, "ldap": true, "syslog": true,
+	}
+	if namedPorts[strings.ToLower(spec)] {
+		return nil
+	}
+	if strings.Contains(spec, "-") {
+		parts := strings.SplitN(spec, "-", 2)
+		lo, err1 := strconv.Atoi(parts[0])
+		hi, err2 := strconv.Atoi(parts[1])
+		if err1 != nil || err2 != nil {
+			return fmt.Errorf("invalid port range %q: non-numeric", spec)
+		}
+		if lo < 1 || lo > 65535 {
+			return fmt.Errorf("invalid port %d: must be 1-65535", lo)
+		}
+		if hi < 1 || hi > 65535 {
+			return fmt.Errorf("invalid port %d: must be 1-65535", hi)
+		}
+		if lo > hi {
+			return fmt.Errorf("invalid port range %q: start > end", spec)
+		}
+		return nil
+	}
+	port, err := strconv.Atoi(spec)
+	if err != nil {
+		return fmt.Errorf("invalid port %q: not a number or known service", spec)
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("invalid port %d: must be 1-65535", port)
+	}
+	return nil
+}
+
+// validateProtocol checks that a protocol specification is valid.
+func validateProtocol(proto string) error {
+	validProtos := map[string]bool{
+		"tcp": true, "udp": true, "icmp": true, "icmp6": true,
+		"ospf": true, "gre": true, "ipip": true, "ah": true, "esp": true,
+	}
+	if validProtos[strings.ToLower(proto)] {
+		return nil
+	}
+	n, err := strconv.Atoi(proto)
+	if err != nil {
+		return fmt.Errorf("invalid protocol %q", proto)
+	}
+	if n < 0 || n > 255 {
+		return fmt.Errorf("invalid protocol number %d: must be 0-255", n)
+	}
+	return nil
 }
 
 func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {

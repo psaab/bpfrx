@@ -136,8 +136,14 @@ func (s *Server) Run(ctx context.Context) error {
 
 // --- Config lifecycle RPCs ---
 
-func (s *Server) EnterConfigure(_ context.Context, _ *pb.EnterConfigureRequest) (*pb.EnterConfigureResponse, error) {
-	if err := s.store.EnterConfigure(); err != nil {
+func (s *Server) EnterConfigure(_ context.Context, req *pb.EnterConfigureRequest) (*pb.EnterConfigureResponse, error) {
+	var err error
+	if req.Exclusive {
+		err = s.store.EnterConfigureExclusive("grpc")
+	} else {
+		err = s.store.EnterConfigure()
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
 	return &pb.EnterConfigureResponse{}, nil
@@ -6615,6 +6621,14 @@ func (s *Server) GetSystemInfo(_ context.Context, req *pb.GetSystemInfoRequest) 
 			fmt.Fprintf(&buf, "%-18s %-40s %-12s %-10s\n",
 				n.HardwareAddr, n.IP, ifName, neighStateStr(n.State))
 		}
+
+	case "boot-messages":
+		cmd := exec.Command("journalctl", "--boot", "-n", "100", "--no-pager")
+		out, err := cmd.Output()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "running journalctl: %v", err)
+		}
+		buf.Write(out)
 
 	case "connections":
 		cmd := exec.Command("ss", "-tnp")

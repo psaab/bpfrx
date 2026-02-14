@@ -35,7 +35,9 @@ type Candidate struct {
 // OperationalTree defines tab completion for operational mode.
 // This is the canonical source — all other trees derive from this.
 var OperationalTree = map[string]*Node{
-	"configure": {Desc: "Enter configuration mode"},
+	"configure": {Desc: "Enter configuration mode", Children: map[string]*Node{
+		"exclusive": {Desc: "Enter exclusive configuration mode"},
+	}},
 	"show": {Desc: "Show information", Children: map[string]*Node{
 		"chassis": {Desc: "Show hardware information", Children: map[string]*Node{
 			"cluster":     {Desc: "Show cluster/HA status"},
@@ -284,6 +286,7 @@ var OperationalTree = map[string]*Node{
 		}},
 		"system": {Desc: "Show system information", Children: map[string]*Node{
 			"alarms":        {Desc: "Show system alarms"},
+			"boot-messages": {Desc: "Show system boot messages"},
 			"commit": {Desc: "Show commit history", Children: map[string]*Node{
 				"history": {Desc: "Show recent commit log"},
 			}},
@@ -439,6 +442,7 @@ var ConfigTopLevel = map[string]*Node{
 	"load": {Desc: "Load configuration from file or terminal", Children: map[string]*Node{
 		"override": {Desc: "Replace candidate with file or terminal input"},
 		"merge":    {Desc: "Merge into candidate from file or terminal"},
+		"set":      {Desc: "Load set commands from terminal"},
 	}},
 	"rollback": {Desc: "Revert to previous configuration"},
 	"run":      {Desc: "Run operational command"},

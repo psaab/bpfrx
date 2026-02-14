@@ -37,6 +37,9 @@ type Store struct {
 	confirmPrevCfg  *config.Config     // compiled config before confirmed commit
 	centralRollbackFn func(*config.Config)   // callback for dataplane central-apply
 
+	// Exclusive configuration mode
+	exclusiveHolder string // who holds exclusive lock (empty = unlocked)
+
 	// Archival settings
 	archiveDir string // local archive directory (empty = disabled)
 	archiveMax int    // max archives to keep
@@ -107,6 +110,27 @@ func (s *Store) EnterConfigure() error {
 	return nil
 }
 
+// EnterConfigureExclusive enters exclusive configuration mode.
+func (s *Store) EnterConfigureExclusive(holder string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.configDir {
+		return fmt.Errorf("configuration is locked by another user")
+	}
+	s.candidate = s.active.Clone()
+	s.configDir = true
+	s.dirty = false
+	s.exclusiveHolder = holder
+	return nil
+}
+
+// IsExclusiveLocked returns true if exclusive mode is active.
+func (s *Store) IsExclusiveLocked() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.exclusiveHolder != ""
+}
+
 // ExitConfigure exits configuration mode, discarding the candidate.
 func (s *Store) ExitConfigure() {
 	s.mu.Lock()
@@ -114,6 +138,7 @@ func (s *Store) ExitConfigure() {
 	s.candidate = nil
 	s.configDir = false
 	s.dirty = false
+	s.exclusiveHolder = ""
 }
 
 // InConfigMode returns true if currently in configuration mode.
@@ -307,6 +332,36 @@ func (s *Store) LoadMerge(content string) error {
 
 	s.dirty = true
 	return nil
+}
+
+// LoadSet applies multiple set commands to the candidate config.
+// Each line starting with "set " is parsed and applied.
+func (s *Store) LoadSet(content string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.candidate == nil {
+		return 0, fmt.Errorf("not in configuration mode")
+	}
+	count := 0
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, "set ") {
+			continue
+		}
+		path, err := config.ParseSetCommand(line)
+		if err != nil {
+			return count, fmt.Errorf("line %q: %w", line, err)
+		}
+		if err := s.candidate.SetPath(path); err != nil {
+			return count, fmt.Errorf("line %q: %w", line, err)
+		}
+		count++
+	}
+	s.dirty = true
+	return count, nil
 }
 
 // CommitCheck validates the candidate configuration without applying it.

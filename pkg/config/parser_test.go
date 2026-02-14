@@ -10415,3 +10415,99 @@ func TestAnnotationClone(t *testing.T) {
 		t.Error("clone shares annotation with original")
 	}
 }
+
+func TestValidatePortSpec(t *testing.T) {
+	tests := []struct {
+		spec string
+		ok   bool
+	}{
+		{"80", true},
+		{"8080-8090", true},
+		{"1", true},
+		{"65535", true},
+		{"http", true},
+		{"HTTPS", true},
+		{"dns", true},
+		{"1024-65535", true},
+		{"0", false},
+		{"99999", false},
+		{"abc", false},
+		{"8090-8080", false},
+		{"", true},
+		{"foo-bar", false},
+	}
+	for _, tt := range tests {
+		err := validatePortSpec(tt.spec)
+		if (err == nil) != tt.ok {
+			t.Errorf("validatePortSpec(%q) = %v, want ok=%v", tt.spec, err, tt.ok)
+		}
+	}
+}
+
+func TestValidateProtocol(t *testing.T) {
+	tests := []struct {
+		proto string
+		ok    bool
+	}{
+		{"tcp", true},
+		{"udp", true},
+		{"icmp", true},
+		{"icmp6", true},
+		{"gre", true},
+		{"47", true},
+		{"0", true},
+		{"255", true},
+		{"256", false},
+		{"-1", false},
+		{"bogus", false},
+	}
+	for _, tt := range tests {
+		err := validateProtocol(tt.proto)
+		if (err == nil) != tt.ok {
+			t.Errorf("validateProtocol(%q) = %v, want ok=%v", tt.proto, err, tt.ok)
+		}
+	}
+}
+
+func TestValidateConfigApplicationPorts(t *testing.T) {
+	cfg := &Config{}
+	cfg.Applications.Applications = map[string]*Application{
+		"good-app": {
+			Name:            "good-app",
+			Protocol:        "tcp",
+			DestinationPort: "8080-8090",
+			SourcePort:      "1024-65535",
+		},
+		"bad-port": {
+			Name:            "bad-port",
+			Protocol:        "tcp",
+			DestinationPort: "99999",
+		},
+		"bad-proto": {
+			Name:     "bad-proto",
+			Protocol: "bogus",
+		},
+	}
+	cfg.Applications.ApplicationSets = map[string]*ApplicationSet{}
+	cfg.Security.Zones = map[string]*ZoneConfig{}
+	cfg.Security.NAT.Source = nil
+	cfg.Security.NAT.Destination = nil
+
+	warnings := ValidateConfig(cfg)
+
+	var foundPort, foundProto bool
+	for _, w := range warnings {
+		if strings.Contains(w, "bad-port") && strings.Contains(w, "99999") {
+			foundPort = true
+		}
+		if strings.Contains(w, "bad-proto") && strings.Contains(w, "bogus") {
+			foundProto = true
+		}
+	}
+	if !foundPort {
+		t.Error("expected warning about bad-port with invalid port 99999")
+	}
+	if !foundProto {
+		t.Error("expected warning about bad-proto with invalid protocol")
+	}
+}

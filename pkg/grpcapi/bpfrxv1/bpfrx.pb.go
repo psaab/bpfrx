@@ -121,6 +121,7 @@ func (ConfigTarget) EnumDescriptor() ([]byte, []int) {
 
 type EnterConfigureRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	Exclusive     bool                   `protobuf:"varint,1,opt,name=exclusive,proto3" json:"exclusive,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -153,6 +154,13 @@ func (x *EnterConfigureRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use EnterConfigureRequest.ProtoReflect.Descriptor instead.
 func (*EnterConfigureRequest) Descriptor() ([]byte, []int) {
 	return file_bpfrx_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *EnterConfigureRequest) GetExclusive() bool {
+	if x != nil {
+		return x.Exclusive
+	}
+	return false
 }
 
 type EnterConfigureResponse struct {
@@ -6341,8 +6349,9 @@ var File_bpfrx_proto protoreflect.FileDescriptor
 
 const file_bpfrx_proto_rawDesc = "" +
 	"\n" +
-	"\vbpfrx.proto\x12\bbpfrx.v1\"\x17\n" +
-	"\x15EnterConfigureRequest\"\x18\n" +
+	"\vbpfrx.proto\x12\bbpfrx.v1\"5\n" +
+	"\x15EnterConfigureRequest\x12\x1c\n" +
+	"\texclusive\x18\x01 \x01(\bR\texclusive\"\x18\n" +
 	"\x16EnterConfigureResponse\"\x16\n" +
 	"\x14ExitConfigureRequest\"\x17\n" +
 	"\x15ExitConfigureResponse\"\x1c\n" +

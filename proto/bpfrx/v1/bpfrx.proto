@@ -73,7 +73,9 @@ service BpfrxService {
 
 // --- Config lifecycle messages ---
 
-message EnterConfigureRequest {}
+message EnterConfigureRequest {
+  bool exclusive = 1;
+}
 message EnterConfigureResponse {}
 
 message ExitConfigureRequest {}

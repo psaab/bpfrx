@@ -984,3 +984,81 @@ func TestAnnotate(t *testing.T) {
 		t.Error("expected error annotating outside config mode")
 	}
 }
+
+func TestLoadSet(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	input := "set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24\nset security zones security-zone trust interfaces ge-0/0/0\nset system host-name test-fw"
+	count, err := s.LoadSet(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Errorf("expected 3 commands, got %d", count)
+	}
+	// Verify the config was applied
+	text := s.ShowCandidate()
+	if !strings.Contains(text, "ge-0/0/0") {
+		t.Error("expected interface in candidate config")
+	}
+
+	// Test with comments and blank lines
+	s.ExitConfigure()
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	input2 := "# comment line\nset system host-name fw2\n\nset system domain-name example.com\nnot-a-set-line"
+	count2, err := s.LoadSet(input2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count2 != 2 {
+		t.Errorf("expected 2 commands, got %d", count2)
+	}
+
+	// Test outside config mode
+	s.ExitConfigure()
+	_, err = s.LoadSet("set system host-name bad")
+	if err == nil {
+		t.Error("expected error outside config mode")
+	}
+}
+
+func TestConfigureExclusive(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.EnterConfigureExclusive("test"); err != nil {
+		t.Fatal(err)
+	}
+	if !s.IsExclusiveLocked() {
+		t.Error("expected exclusive lock")
+	}
+	if !s.InConfigMode() {
+		t.Error("expected config mode")
+	}
+
+	// Second enter should fail (config already locked)
+	if err := s.EnterConfigure(); err == nil {
+		t.Error("expected error on second EnterConfigure while exclusive")
+	}
+	if err := s.EnterConfigureExclusive("other"); err == nil {
+		t.Error("expected error on second EnterConfigureExclusive")
+	}
+
+	// Exit should release the exclusive lock
+	s.ExitConfigure()
+	if s.IsExclusiveLocked() {
+		t.Error("expected lock released after exit")
+	}
+	if s.InConfigMode() {
+		t.Error("expected not in config mode after exit")
+	}
+
+	// Should be able to enter again after exit
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("re-enter after exclusive exit: %v", err)
+	}
+	s.ExitConfigure()
+}

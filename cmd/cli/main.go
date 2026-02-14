@@ -271,13 +271,20 @@ func (c *ctl) dispatchOperational(line string) error {
 
 	switch parts[0] {
 	case "configure":
-		_, err := c.client.EnterConfigure(context.Background(), &pb.EnterConfigureRequest{})
+		exclusive := len(parts) >= 2 && parts[1] == "exclusive"
+		_, err := c.client.EnterConfigure(context.Background(), &pb.EnterConfigureRequest{
+			Exclusive: exclusive,
+		})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
 		c.configMode = true
 		c.rl.SetPrompt(c.configPrompt())
-		fmt.Println("Entering configuration mode")
+		if exclusive {
+			fmt.Println("Entering configuration mode (exclusive)")
+		} else {
+			fmt.Println("Entering configuration mode")
+		}
 		fmt.Println("[edit]")
 		return nil
 
@@ -1829,6 +1836,9 @@ func (c *ctl) handleShowSystem(args []string) error {
 
 	case "buffers":
 		return c.showText("buffers")
+
+	case "boot-messages":
+		return c.showSystemInfo("boot-messages")
 
 	case "core-dumps":
 		return c.showText("core-dumps")

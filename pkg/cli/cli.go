@@ -629,12 +629,21 @@ func (c *CLI) dispatchOperational(line string) error {
 
 	switch parts[0] {
 	case "configure":
-		if err := c.store.EnterConfigure(); err != nil {
-			return err
+		if len(parts) >= 2 && parts[1] == "exclusive" {
+			if err := c.store.EnterConfigureExclusive("cli"); err != nil {
+				return err
+			}
+			c.rl.SetPrompt(c.configPrompt())
+			fmt.Println("Entering configuration mode (exclusive)")
+			fmt.Println("[edit]")
+		} else {
+			if err := c.store.EnterConfigure(); err != nil {
+				return err
+			}
+			c.rl.SetPrompt(c.configPrompt())
+			fmt.Println("Entering configuration mode")
+			fmt.Println("[edit]")
 		}
-		c.rl.SetPrompt(c.configPrompt())
-		fmt.Println("Entering configuration mode")
-		fmt.Println("[edit]")
 		return nil
 
 	case "show":
@@ -2067,17 +2076,21 @@ func (c *CLI) handleLoad(args []string) error {
 		fmt.Println("load:")
 		fmt.Println("  override terminal    Replace candidate with pasted config")
 		fmt.Println("  merge terminal       Merge pasted config into candidate")
+		fmt.Println("  set terminal         Load set commands from terminal")
 		fmt.Println("  override <file>      Replace candidate with file contents")
 		fmt.Println("  merge <file>         Merge file contents into candidate")
 		return nil
 	}
 
-	mode := args[0] // "override" or "merge"
-	if mode != "override" && mode != "merge" {
-		return fmt.Errorf("load: unknown mode %q (use 'override' or 'merge')", mode)
+	mode := args[0] // "override", "merge", or "set"
+	if mode != "override" && mode != "merge" && mode != "set" {
+		return fmt.Errorf("load: unknown mode %q (use 'override', 'merge', or 'set')", mode)
 	}
 
 	source := args[1]
+	if mode == "set" && source != "terminal" {
+		return fmt.Errorf("load set: only 'terminal' source is supported")
+	}
 	var content string
 
 	if source == "terminal" {
@@ -2106,19 +2119,28 @@ func (c *CLI) handleLoad(args []string) error {
 		return fmt.Errorf("load: empty input")
 	}
 
-	var err error
 	switch mode {
-	case "override":
-		err = c.store.LoadOverride(content)
-	case "merge":
-		err = c.store.LoadMerge(content)
+	case "set":
+		count, err := c.store.LoadSet(content)
+		if err != nil {
+			return fmt.Errorf("load set: %w", err)
+		}
+		fmt.Printf("load set complete: %d commands applied\n", count)
+		return nil
+	default:
+		var err error
+		switch mode {
+		case "override":
+			err = c.store.LoadOverride(content)
+		case "merge":
+			err = c.store.LoadMerge(content)
+		}
+		if err != nil {
+			return fmt.Errorf("load %s: %w", mode, err)
+		}
+		fmt.Printf("load %s complete\n", mode)
+		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("load %s: %w", mode, err)
-	}
-
-	fmt.Printf("load %s complete\n", mode)
-	return nil
 }
 
 func (c *CLI) handleCommit(args []string) error {
@@ -6345,6 +6367,9 @@ func (c *CLI) handleShowSystem(args []string) error {
 	case "connections":
 		return c.showSystemConnections()
 
+	case "boot-messages":
+		return c.showSystemBootMessages()
+
 	case "core-dumps":
 		return c.showCoreDumps()
 
@@ -8992,6 +9017,14 @@ func (c *CLI) showSystemUptime() error {
 		fmt.Printf("System uptime: %d hours, %d minutes, %d seconds\n", hours, mins, secs)
 	}
 	return nil
+}
+
+// showSystemBootMessages shows recent boot messages via journalctl.
+func (c *CLI) showSystemBootMessages() error {
+	cmd := exec.Command("journalctl", "--boot", "-n", "100", "--no-pager")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // showSystemMemory shows memory usage (like Junos "show system memory").
