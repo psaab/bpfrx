@@ -9057,3 +9057,312 @@ func TestMetricTypeAndCommunityListSetSyntax(t *testing.T) {
 		t.Errorf("t2 action = %q, want reject", t2.Action)
 	}
 }
+
+func TestGRETunnelKeepaliveSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set interfaces gre0 tunnel source 10.0.0.1",
+		"set interfaces gre0 tunnel destination 10.0.0.2",
+		"set interfaces gre0 tunnel keepalive 10",
+		"set interfaces gre0 tunnel keepalive-retry 5",
+		"set interfaces gre0 tunnel key 100",
+		"set interfaces gre0 unit 0 family inet address 10.10.10.1/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ifc := cfg.Interfaces.Interfaces["gre0"]
+	if ifc == nil {
+		t.Fatal("gre0 interface not found")
+	}
+	tc := ifc.Tunnel
+	if tc == nil {
+		t.Fatal("tunnel config is nil")
+	}
+	if tc.Source != "10.0.0.1" {
+		t.Errorf("Source = %q, want 10.0.0.1", tc.Source)
+	}
+	if tc.Destination != "10.0.0.2" {
+		t.Errorf("Destination = %q, want 10.0.0.2", tc.Destination)
+	}
+	if tc.Keepalive != 10 {
+		t.Errorf("Keepalive = %d, want 10", tc.Keepalive)
+	}
+	if tc.KeepaliveRetry != 5 {
+		t.Errorf("KeepaliveRetry = %d, want 5", tc.KeepaliveRetry)
+	}
+	if tc.Key != 100 {
+		t.Errorf("Key = %d, want 100", tc.Key)
+	}
+}
+
+func TestBGPDampingSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp damping",
+		"set protocols bgp damping half-life 10",
+		"set protocols bgp damping reuse 500",
+		"set protocols bgp damping suppress 3000",
+		"set protocols bgp damping max-suppress 45",
+		"set protocols bgp group ext peer-as 65002",
+		"set protocols bgp group ext neighbor 10.0.2.1",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	bgp := cfg.Protocols.BGP
+	if bgp == nil {
+		t.Fatal("BGP config is nil")
+	}
+	if !bgp.Dampening {
+		t.Error("Dampening not enabled")
+	}
+	if bgp.DampeningHalfLife != 10 {
+		t.Errorf("DampeningHalfLife = %d, want 10", bgp.DampeningHalfLife)
+	}
+	if bgp.DampeningReuse != 500 {
+		t.Errorf("DampeningReuse = %d, want 500", bgp.DampeningReuse)
+	}
+	if bgp.DampeningSuppress != 3000 {
+		t.Errorf("DampeningSuppress = %d, want 3000", bgp.DampeningSuppress)
+	}
+	if bgp.DampeningMaxSuppress != 45 {
+		t.Errorf("DampeningMaxSuppress = %d, want 45", bgp.DampeningMaxSuppress)
+	}
+}
+
+func TestASPathSetSyntax(t *testing.T) {
+	cmds := []string{
+		`set policy-options as-path AS65000 "65000"`,
+		`set policy-options as-path TRANSIT "65[0-9]+"`,
+		"set policy-options policy-statement FILTER-AS term t1 from as-path AS65000",
+		"set policy-options policy-statement FILTER-AS term t1 then accept",
+		"set policy-options policy-statement FILTER-AS then reject",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	// Check AS-path definitions
+	if cfg.PolicyOptions.ASPaths == nil {
+		t.Fatal("ASPaths map is nil")
+	}
+	ap := cfg.PolicyOptions.ASPaths["AS65000"]
+	if ap == nil {
+		t.Fatal("AS65000 as-path not found")
+	}
+	if ap.Regex != "65000" {
+		t.Errorf("AS65000 regex = %q, want 65000", ap.Regex)
+	}
+	tr := cfg.PolicyOptions.ASPaths["TRANSIT"]
+	if tr == nil {
+		t.Fatal("TRANSIT as-path not found")
+	}
+	if tr.Regex != "65[0-9]+" {
+		t.Errorf("TRANSIT regex = %q, want 65[0-9]+", tr.Regex)
+	}
+
+	// Check policy term from as-path
+	ps := cfg.PolicyOptions.PolicyStatements["FILTER-AS"]
+	if ps == nil {
+		t.Fatal("FILTER-AS not found")
+	}
+	if len(ps.Terms) != 1 {
+		t.Fatalf("got %d terms, want 1", len(ps.Terms))
+	}
+	if ps.Terms[0].FromASPath != "AS65000" {
+		t.Errorf("from as-path = %q, want AS65000", ps.Terms[0].FromASPath)
+	}
+	if ps.Terms[0].Action != "accept" {
+		t.Errorf("action = %q, want accept", ps.Terms[0].Action)
+	}
+	if ps.DefaultAction != "reject" {
+		t.Errorf("default action = %q, want reject", ps.DefaultAction)
+	}
+}
+
+func TestBGPPrefixLimitSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group external peer-as 65002",
+		"set protocols bgp group external family inet unicast prefix-limit maximum 1000",
+		"set protocols bgp group external family inet6 unicast prefix-limit maximum 500",
+		"set protocols bgp group external neighbor 10.0.0.2",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	bgp := cfg.Protocols.BGP
+	if bgp == nil {
+		t.Fatal("BGP config is nil")
+	}
+	if len(bgp.Neighbors) != 1 {
+		t.Fatalf("expected 1 neighbor, got %d", len(bgp.Neighbors))
+	}
+	n := bgp.Neighbors[0]
+	if !n.FamilyInet {
+		t.Error("FamilyInet should be true")
+	}
+	if !n.FamilyInet6 {
+		t.Error("FamilyInet6 should be true")
+	}
+	if n.PrefixLimitInet != 1000 {
+		t.Errorf("PrefixLimitInet = %d, want 1000", n.PrefixLimitInet)
+	}
+	if n.PrefixLimitInet6 != 500 {
+		t.Errorf("PrefixLimitInet6 = %d, want 500", n.PrefixLimitInet6)
+	}
+}
+
+func TestBGPPrefixLimitPerNeighborSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group external peer-as 65002",
+		"set protocols bgp group external family inet unicast",
+		"set protocols bgp group external neighbor 10.0.0.2 family inet unicast prefix-limit maximum 2000",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	bgp := cfg.Protocols.BGP
+	if bgp == nil {
+		t.Fatal("BGP config is nil")
+	}
+	if len(bgp.Neighbors) != 1 {
+		t.Fatalf("expected 1 neighbor, got %d", len(bgp.Neighbors))
+	}
+	n := bgp.Neighbors[0]
+	if n.PrefixLimitInet != 2000 {
+		t.Errorf("PrefixLimitInet = %d, want 2000", n.PrefixLimitInet)
+	}
+}
+
+func TestOSPFVirtualLinkSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols ospf area 0.0.0.1 interface trust0",
+		"set protocols ospf area 0.0.0.1 virtual-link 10.0.0.2",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ospf := cfg.Protocols.OSPF
+	if ospf == nil {
+		t.Fatal("OSPF config is nil")
+	}
+	if len(ospf.Areas) != 1 {
+		t.Fatalf("expected 1 area, got %d", len(ospf.Areas))
+	}
+	area := ospf.Areas[0]
+	if len(area.VirtualLinks) != 1 {
+		t.Fatalf("expected 1 virtual-link, got %d", len(area.VirtualLinks))
+	}
+	vl := area.VirtualLinks[0]
+	if vl.NeighborID != "10.0.0.2" {
+		t.Errorf("NeighborID = %q, want 10.0.0.2", vl.NeighborID)
+	}
+	if vl.TransitArea != "0.0.0.1" {
+		t.Errorf("TransitArea = %q, want 0.0.0.1", vl.TransitArea)
+	}
+}
+
+func TestOSPFVirtualLinkWithTransitAreaSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols ospf area 0.0.0.1 interface trust0",
+		"set protocols ospf area 0.0.0.1 virtual-link 10.0.0.2 transit-area 0.0.0.3",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ospf := cfg.Protocols.OSPF
+	if ospf == nil {
+		t.Fatal("OSPF config is nil")
+	}
+	area := ospf.Areas[0]
+	if len(area.VirtualLinks) != 1 {
+		t.Fatalf("expected 1 virtual-link, got %d", len(area.VirtualLinks))
+	}
+	vl := area.VirtualLinks[0]
+	if vl.NeighborID != "10.0.0.2" {
+		t.Errorf("NeighborID = %q, want 10.0.0.2", vl.NeighborID)
+	}
+	if vl.TransitArea != "0.0.0.3" {
+		t.Errorf("TransitArea = %q, want 0.0.0.3", vl.TransitArea)
+	}
+}

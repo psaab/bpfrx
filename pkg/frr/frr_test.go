@@ -1751,3 +1751,161 @@ func TestGeneratePolicyOptionsCommunityListAndMetricType(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateProtocols_BGPDampening(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS:   65001,
+		RouterID:  "1.1.1.1",
+		Dampening: true,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.2.1", PeerAS: 65002},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil)
+	if !strings.Contains(got, "bgp dampening 15 750 2000 60\n") {
+		t.Errorf("missing default dampening, got:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_BGPDampeningCustom(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS:              65001,
+		RouterID:             "1.1.1.1",
+		Dampening:            true,
+		DampeningHalfLife:    10,
+		DampeningReuse:       500,
+		DampeningSuppress:    3000,
+		DampeningMaxSuppress: 45,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.2.1", PeerAS: 65002},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil)
+	if !strings.Contains(got, "bgp dampening 10 500 3000 45\n") {
+		t.Errorf("missing custom dampening, got:\n%s", got)
+	}
+}
+
+func TestGeneratePolicyOptionsASPath(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		ASPaths: map[string]*config.ASPathDef{
+			"AS65000": {Name: "AS65000", Regex: "65000"},
+			"TRANSIT": {Name: "TRANSIT", Regex: "65[0-9]+"},
+		},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"FILTER-AS": {
+				Name: "FILTER-AS",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:       "match-as",
+						FromASPath: "AS65000",
+						Action:     "accept",
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+
+	got := m.generatePolicyOptions(po)
+
+	checks := []string{
+		"bgp as-path access-list AS65000 permit 65000",
+		"bgp as-path access-list TRANSIT permit 65[0-9]+",
+		"route-map FILTER-AS permit 10",
+		"match as-path AS65000",
+		"route-map FILTER-AS deny 20",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestGenerateProtocols_BGPPrefixLimit(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS: 65001,
+		Neighbors: []*config.BGPNeighbor{
+			{
+				Address:         "10.0.0.2",
+				PeerAS:          65002,
+				FamilyInet:      true,
+				PrefixLimitInet: 1000,
+			},
+			{
+				Address:          "fd00::2",
+				PeerAS:           65003,
+				FamilyInet6:      true,
+				PrefixLimitInet6: 500,
+			},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 1, nil)
+	if !strings.Contains(got, "neighbor 10.0.0.2 maximum-prefix 1000\n") {
+		t.Errorf("missing IPv4 maximum-prefix in:\n%s", got)
+	}
+	if !strings.Contains(got, "neighbor fd00::2 maximum-prefix 500\n") {
+		t.Errorf("missing IPv6 maximum-prefix in:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_BGPPrefixLimitZeroOmitted(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS: 65001,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.0.2", PeerAS: 65002, FamilyInet: true},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 1, nil)
+	if strings.Contains(got, "maximum-prefix") {
+		t.Errorf("should not have maximum-prefix when limit is 0:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_OSPFVirtualLink(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		Areas: []*config.OSPFArea{
+			{
+				ID: "0.0.0.1",
+				Interfaces: []*config.OSPFInterface{
+					{Name: "trust0"},
+				},
+				VirtualLinks: []*config.OSPFVirtualLink{
+					{NeighborID: "10.0.0.2", TransitArea: "0.0.0.1"},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, nil, "", 0, nil)
+	if !strings.Contains(got, "area 0.0.0.1 virtual-link 10.0.0.2\n") {
+		t.Errorf("missing virtual-link in:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_OSPFVirtualLinkCustomTransitArea(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		Areas: []*config.OSPFArea{
+			{
+				ID: "0.0.0.1",
+				Interfaces: []*config.OSPFInterface{
+					{Name: "trust0"},
+				},
+				VirtualLinks: []*config.OSPFVirtualLink{
+					{NeighborID: "10.0.0.3", TransitArea: "0.0.0.2"},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, nil, "", 0, nil)
+	if !strings.Contains(got, "area 0.0.0.2 virtual-link 10.0.0.3\n") {
+		t.Errorf("missing virtual-link with custom transit area in:\n%s", got)
+	}
+}

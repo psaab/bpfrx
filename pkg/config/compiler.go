@@ -877,6 +877,18 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 							tc.TTL = v
 						}
 					}
+				case "keepalive":
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							tc.Keepalive = n
+						}
+					}
+				case "keepalive-retry":
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							tc.KeepaliveRetry = n
+						}
+					}
 				case "routing-instance":
 					// routing-instance { destination <name>; }
 					if destNode := prop.FindChild("destination"); destNode != nil {
@@ -2355,6 +2367,21 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				}
 			}
 
+			// Parse virtual-link entries
+			for _, vlInst := range namedInstances(areaInst.node.FindChildren("virtual-link")) {
+				vl := &OSPFVirtualLink{
+					NeighborID:  vlInst.name,
+					TransitArea: area.ID,
+				}
+				// Allow explicit transit-area override
+				if taNode := vlInst.node.FindChild("transit-area"); taNode != nil {
+					if v := nodeVal(taNode); v != "" {
+						vl.TransitArea = v
+					}
+				}
+				area.VirtualLinks = append(area.VirtualLinks, vl)
+			}
+
 			proto.OSPF.Areas = append(proto.OSPF.Areas, area)
 		}
 	}
@@ -2390,6 +2417,39 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 						proto.BGP.MultipathMultipleAS = true
 					}
 				}
+			case "damping":
+				proto.BGP.Dampening = true
+				for _, dc := range child.Children {
+					if v := nodeVal(dc); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							switch dc.Name() {
+							case "half-life":
+								proto.BGP.DampeningHalfLife = n
+							case "reuse":
+								proto.BGP.DampeningReuse = n
+							case "suppress":
+								proto.BGP.DampeningSuppress = n
+							case "max-suppress":
+								proto.BGP.DampeningMaxSuppress = n
+							}
+						}
+					}
+				}
+				// Handle inline keys (flat set syntax)
+				for i := 1; i < len(child.Keys)-1; i += 2 {
+					if n, err := strconv.Atoi(child.Keys[i+1]); err == nil {
+						switch child.Keys[i] {
+						case "half-life":
+							proto.BGP.DampeningHalfLife = n
+						case "reuse":
+							proto.BGP.DampeningReuse = n
+						case "suppress":
+							proto.BGP.DampeningSuppress = n
+						case "max-suppress":
+							proto.BGP.DampeningMaxSuppress = n
+						}
+					}
+				}
 			case "export":
 				if len(child.Keys) >= 2 {
 					proto.BGP.Export = append(proto.BGP.Export, child.Keys[1])
@@ -2403,6 +2463,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			var groupMultihop int
 			var groupExport []string
 			var familyInet, familyInet6 bool
+			var groupPrefixLimitInet, groupPrefixLimitInet6 int
 			var groupAuthKey string
 			var groupBFD bool
 			var groupBFDInterval int
@@ -2446,8 +2507,10 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							switch fc.Name() {
 							case "inet":
 								familyInet = true
+								groupPrefixLimitInet = parsePrefixLimit(fc)
 							case "inet6":
 								familyInet6 = true
+								groupPrefixLimitInet6 = parsePrefixLimit(fc)
 							}
 						}
 					}
@@ -2492,6 +2555,8 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							DefaultOriginate: groupDefaultOriginate,
 							AllowASIn:        groupAllowASIn,
 							RemovePrivateAS:  groupRemovePrivateAS,
+							PrefixLimitInet:  groupPrefixLimitInet,
+							PrefixLimitInet6: groupPrefixLimitInet6,
 						}
 						// Per-neighbor overrides
 						for _, prop := range child.Children {
@@ -2535,6 +2600,21 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								}
 							case "remove-private":
 								neighbor.RemovePrivateAS = true
+							case "family":
+								for _, fc := range prop.Children {
+									switch fc.Name() {
+									case "inet":
+										neighbor.FamilyInet = true
+										if pl := parsePrefixLimit(fc); pl > 0 {
+											neighbor.PrefixLimitInet = pl
+										}
+									case "inet6":
+										neighbor.FamilyInet6 = true
+										if pl := parsePrefixLimit(fc); pl > 0 {
+											neighbor.PrefixLimitInet6 = pl
+										}
+									}
+								}
 							}
 						}
 						proto.BGP.Neighbors = append(proto.BGP.Neighbors, neighbor)
@@ -2734,6 +2814,29 @@ func namedInstances(nodes []*Node) []struct {
 // nodeVal returns the value for a property node, handling both AST shapes.
 // Hierarchical: Keys: ["prop", "value"] → returns "value"
 // Flat set:     Keys: ["prop"], Children: [Node{Keys:["value"]}] → returns "value"
+// parsePrefixLimit extracts the maximum prefix count from a family inet/inet6 node.
+// Walks: inet -> unicast -> prefix-limit -> maximum -> value
+func parsePrefixLimit(famNode *Node) int {
+	unicast := famNode.FindChild("unicast")
+	if unicast == nil {
+		return 0
+	}
+	pl := unicast.FindChild("prefix-limit")
+	if pl == nil {
+		return 0
+	}
+	mx := pl.FindChild("maximum")
+	if mx == nil {
+		return 0
+	}
+	if v := nodeVal(mx); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
 func nodeVal(n *Node) string {
 	if len(n.Keys) >= 2 {
 		return n.Keys[1]
@@ -4261,6 +4364,31 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 		}
 	}
 
+	// Parse AS-path definitions
+	if po.ASPaths == nil {
+		po.ASPaths = make(map[string]*ASPathDef)
+	}
+	for _, child := range node.FindChildren("as-path") {
+		if len(child.Keys) >= 3 {
+			// Hierarchical: Keys=["as-path", "NAME", "REGEX"]
+			po.ASPaths[child.Keys[1]] = &ASPathDef{
+				Name:  child.Keys[1],
+				Regex: child.Keys[2],
+			}
+		} else if len(child.Keys) >= 2 {
+			// Flat set syntax may produce: Keys=["as-path","NAME"] with children
+			name := child.Keys[1]
+			ap := &ASPathDef{Name: name}
+			// Look for path child (regex value)
+			for _, entry := range child.Children {
+				if len(entry.Keys) > 0 {
+					ap.Regex = entry.Keys[0]
+				}
+			}
+			po.ASPaths[name] = ap
+		}
+	}
+
 	// Parse policy-statements
 	for _, inst := range namedInstances(node.FindChildren("policy-statement")) {
 		ps := &PolicyStatement{Name: inst.name}
@@ -4342,6 +4470,10 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 				case "community":
 					if v := nodeVal(fc); v != "" {
 						term.FromCommunity = v
+					}
+				case "as-path":
+					if v := nodeVal(fc); v != "" {
+						term.FromASPath = v
 					}
 				}
 			}
@@ -4462,6 +4594,11 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 				} else {
 					term.Community = keys[i]
 				}
+			}
+		case "as-path":
+			if i+1 < len(keys) {
+				i++
+				term.FromASPath = keys[i]
 			}
 		case "origin":
 			if i+1 < len(keys) {

@@ -389,6 +389,8 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"mode":        {args: 1, children: nil},
 			"key":         {args: 1, children: nil},
 			"ttl":         {args: 1, children: nil},
+			"keepalive":       {args: 1, children: nil},
+			"keepalive-retry": {args: 1, children: nil},
 			"routing-instance": {children: map[string]*schemaNode{
 				"destination": {args: 1, children: nil},
 			}},
@@ -500,6 +502,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"community": {args: 1, children: map[string]*schemaNode{
 			"members": {args: 1, children: nil},
 		}},
+		"as-path": {args: 2, children: nil},
 		"policy-statement": {args: 1, children: map[string]*schemaNode{
 			"term": {args: 1, children: map[string]*schemaNode{
 				"from": {children: map[string]*schemaNode{
@@ -507,6 +510,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"prefix-list":  {args: 1, children: nil},
 					"route-filter": {args: 2, children: nil},
 					"community":    {args: 1, children: nil},
+					"as-path":      {args: 1, children: nil},
 				}},
 				"then": {children: map[string]*schemaNode{
 					"accept":           {children: nil},
@@ -553,6 +557,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 						"no-summaries": {children: nil},
 					}},
 				}},
+				"virtual-link": {args: 1, children: map[string]*schemaNode{
+					"transit-area": {args: 1, children: nil},
+				}},
 			}},
 		}},
 		"ospf3": {children: map[string]*schemaNode{
@@ -574,6 +581,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"multipath": {children: map[string]*schemaNode{
 				"multiple-as": {children: nil},
 			}},
+			"damping": {children: map[string]*schemaNode{
+				"half-life":    {args: 1, children: nil},
+				"reuse":        {args: 1, children: nil},
+				"suppress":     {args: 1, children: nil},
+				"max-suppress": {args: 1, children: nil},
+			}},
 			"export":          {args: 1, children: nil},
 			"group": {args: 1, children: map[string]*schemaNode{
 				"peer-as":            {args: 1, children: nil},
@@ -585,8 +598,20 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"loops":              {args: 1, children: nil},
 				"remove-private":     {children: nil},
 				"family": {children: map[string]*schemaNode{
-					"inet":  {children: nil},
-					"inet6": {children: nil},
+					"inet": {children: map[string]*schemaNode{
+						"unicast": {children: map[string]*schemaNode{
+							"prefix-limit": {children: map[string]*schemaNode{
+								"maximum": {args: 1, children: nil},
+							}},
+						}},
+					}},
+					"inet6": {children: map[string]*schemaNode{
+						"unicast": {children: map[string]*schemaNode{
+							"prefix-limit": {children: map[string]*schemaNode{
+								"maximum": {args: 1, children: nil},
+							}},
+						}},
+					}},
 				}},
 				"bfd-liveness-detection": {children: map[string]*schemaNode{
 					"minimum-interval": {args: 1, children: nil},
@@ -600,6 +625,22 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"default-originate":      {children: nil},
 					"loops":                  {args: 1, children: nil},
 					"remove-private":         {children: nil},
+					"family": {children: map[string]*schemaNode{
+						"inet": {children: map[string]*schemaNode{
+							"unicast": {children: map[string]*schemaNode{
+								"prefix-limit": {children: map[string]*schemaNode{
+									"maximum": {args: 1, children: nil},
+								}},
+							}},
+						}},
+						"inet6": {children: map[string]*schemaNode{
+							"unicast": {children: map[string]*schemaNode{
+								"prefix-limit": {children: map[string]*schemaNode{
+									"maximum": {args: 1, children: nil},
+								}},
+							}},
+						}},
+					}},
 					"bfd-liveness-detection": {children: map[string]*schemaNode{
 						"minimum-interval": {args: 1, children: nil},
 					}},
@@ -936,6 +977,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"no-summaries": {children: nil},
 						}},
 					}},
+					"virtual-link": {args: 1, children: map[string]*schemaNode{
+						"transit-area": {args: 1, children: nil},
+					}},
 				}},
 			}},
 			"ospf3": {children: map[string]*schemaNode{
@@ -950,6 +994,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 			"bgp": {children: map[string]*schemaNode{
 				"graceful-restart": {children: nil},
+				"damping": {children: map[string]*schemaNode{
+					"half-life":    {args: 1, children: nil},
+					"reuse":        {args: 1, children: nil},
+					"suppress":     {args: 1, children: nil},
+					"max-suppress": {args: 1, children: nil},
+				}},
 				"group":            {args: 1, children: nil},
 			}},
 			"isis": {children: map[string]*schemaNode{

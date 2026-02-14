@@ -516,6 +516,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 					fmt.Fprintf(&b, " area %s %s\n", area.ID, area.AreaType)
 				}
 			}
+			for _, vl := range area.VirtualLinks {
+				fmt.Fprintf(&b, " area %s virtual-link %s\n", vl.TransitArea, vl.NeighborID)
+			}
 		}
 		if ecmpMaxPaths > 1 {
 			fmt.Fprintf(&b, " maximum-paths %d\n", ecmpMaxPaths)
@@ -603,6 +606,25 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		if bgp.MultipathMultipleAS {
 			b.WriteString(" bgp bestpath as-path multipath-relax\n")
 		}
+		if bgp.Dampening {
+			hl := bgp.DampeningHalfLife
+			if hl == 0 {
+				hl = 15
+			}
+			reuse := bgp.DampeningReuse
+			if reuse == 0 {
+				reuse = 750
+			}
+			suppress := bgp.DampeningSuppress
+			if suppress == 0 {
+				suppress = 2000
+			}
+			maxSup := bgp.DampeningMaxSuppress
+			if maxSup == 0 {
+				maxSup = 60
+			}
+			fmt.Fprintf(&b, " bgp dampening %d %d %d %d\n", hl, reuse, suppress, maxSup)
+		}
 		for _, n := range bgp.Neighbors {
 			fmt.Fprintf(&b, " neighbor %s remote-as %d\n", n.Address, n.PeerAS)
 			if n.Description != "" {
@@ -655,6 +677,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if n.DefaultOriginate {
 					fmt.Fprintf(&b, "  neighbor %s default-originate\n", n.Address)
 				}
+				if n.PrefixLimitInet > 0 {
+					fmt.Fprintf(&b, "  neighbor %s maximum-prefix %d\n", n.Address, n.PrefixLimitInet)
+				}
 				for _, exp := range n.Export {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, exp)
 				}
@@ -670,6 +695,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				fmt.Fprintf(&b, "  neighbor %s activate\n", n.Address)
 				if n.DefaultOriginate {
 					fmt.Fprintf(&b, "  neighbor %s default-originate\n", n.Address)
+				}
+				if n.PrefixLimitInet6 > 0 {
+					fmt.Fprintf(&b, "  neighbor %s maximum-prefix %d\n", n.Address, n.PrefixLimitInet6)
 				}
 				for _, exp := range n.Export {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, exp)
@@ -1006,6 +1034,20 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 		b.WriteString("!\n")
 	}
 
+	// Generate FRR as-path access-lists from Junos as-path definitions
+	if len(po.ASPaths) > 0 {
+		aspNames := make([]string, 0, len(po.ASPaths))
+		for name := range po.ASPaths {
+			aspNames = append(aspNames, name)
+		}
+		sort.Strings(aspNames)
+		for _, name := range aspNames {
+			ap := po.ASPaths[name]
+			fmt.Fprintf(&b, "bgp as-path access-list %s permit %s\n", name, ap.Regex)
+		}
+		b.WriteString("!\n")
+	}
+
 	// Generate FRR route-maps from Junos policy-statements
 	psNames := make([]string, 0, len(po.PolicyStatements))
 	for name := range po.PolicyStatements {
@@ -1079,6 +1121,10 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 
 			if term.FromCommunity != "" {
 				fmt.Fprintf(&b, " match community %s\n", term.FromCommunity)
+			}
+
+			if term.FromASPath != "" {
+				fmt.Fprintf(&b, " match as-path %s\n", term.FromASPath)
 			}
 
 			// then actions

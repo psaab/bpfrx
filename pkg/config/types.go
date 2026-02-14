@@ -60,11 +60,18 @@ type EventWithin struct {
 	TriggerUntil int // trigger until N
 }
 
-// PolicyOptionsConfig holds prefix-lists, communities, and policy-statements for routing control.
+// PolicyOptionsConfig holds prefix-lists, communities, as-paths, and policy-statements for routing control.
 type PolicyOptionsConfig struct {
 	PrefixLists      map[string]*PrefixList
 	Communities      map[string]*CommunityDef
+	ASPaths          map[string]*ASPathDef
 	PolicyStatements map[string]*PolicyStatement
+}
+
+// ASPathDef defines a named AS-path regular expression for route matching.
+type ASPathDef struct {
+	Name  string
+	Regex string // AS-path regex pattern (e.g. "65000", "65[0-9]+")
 }
 
 // CommunityDef defines a named BGP community with member values.
@@ -92,6 +99,7 @@ type PolicyTerm struct {
 	FromProtocol string         // "direct", "static", "bgp", "ospf"
 	PrefixList   string         // from prefix-list <name>
 	FromCommunity string        // from community <name> (match against community-list)
+	FromASPath    string        // from as-path <name> (match against as-path access-list)
 	RouteFilters []*RouteFilter // prefix matching
 	Action          string         // "accept", "reject"
 	NextHop         string         // then next-hop (e.g. "peer-address", "self", IP)
@@ -1029,10 +1037,17 @@ type OSPFConfig struct {
 
 // OSPFArea defines an OSPF area.
 type OSPFArea struct {
-	ID         string // "0.0.0.0" (backbone) or area number
-	AreaType   string // "stub", "nssa", "" (normal)
-	NoSummary  bool   // stub/nssa no-summary (totally stubby)
-	Interfaces []*OSPFInterface
+	ID           string // "0.0.0.0" (backbone) or area number
+	AreaType     string // "stub", "nssa", "" (normal)
+	NoSummary    bool   // stub/nssa no-summary (totally stubby)
+	Interfaces   []*OSPFInterface
+	VirtualLinks []*OSPFVirtualLink
+}
+
+// OSPFVirtualLink defines a virtual link to the backbone through a transit area.
+type OSPFVirtualLink struct {
+	NeighborID  string // router-id of ABR at the other end
+	TransitArea string // the area this virtual-link traverses (the area ID where it's configured)
 }
 
 // OSPFInterface defines an interface participating in OSPF.
@@ -1050,15 +1065,20 @@ type OSPFInterface struct {
 
 // BGPConfig holds BGP routing configuration.
 type BGPConfig struct {
-	LocalAS             uint32
-	RouterID            string
-	ClusterID           string // route reflector cluster ID
-	GracefulRestart     bool   // enable graceful restart
-	Multipath           int    // maximum equal-cost paths (0 = disabled)
-	MultipathMultipleAS bool   // allow multipath across different ASes
-	LogNeighborChanges  bool   // log neighbor state transitions
-	Neighbors           []*BGPNeighbor
-	Export              []string // "connected", "static", "ospf", etc.
+	LocalAS              uint32
+	RouterID             string
+	ClusterID            string // route reflector cluster ID
+	GracefulRestart      bool   // enable graceful restart
+	Multipath            int    // maximum equal-cost paths (0 = disabled)
+	MultipathMultipleAS  bool   // allow multipath across different ASes
+	LogNeighborChanges   bool   // log neighbor state transitions
+	Dampening            bool   // enable route flap dampening
+	DampeningHalfLife    int    // half-life in minutes (default 15)
+	DampeningReuse       int    // reuse threshold (default 750)
+	DampeningSuppress    int    // suppress threshold (default 2000)
+	DampeningMaxSuppress int    // max suppress time in minutes (default 60)
+	Neighbors            []*BGPNeighbor
+	Export               []string // "connected", "static", "ospf", etc.
 }
 
 // BGPNeighbor defines a BGP peer.
@@ -1078,6 +1098,8 @@ type BGPNeighbor struct {
 	DefaultOriginate     bool   // advertise default route to this neighbor
 	AllowASIn            int    // allow own AS in path N times (0 = disabled)
 	RemovePrivateAS      bool   // strip private AS numbers from updates
+	PrefixLimitInet      int    // max IPv4 prefixes (0 = unlimited)
+	PrefixLimitInet6     int    // max IPv6 prefixes (0 = unlimited)
 }
 
 // TunnelConfig defines a GRE or other tunnel interface.
@@ -1090,6 +1112,8 @@ type TunnelConfig struct {
 	TTL             int      // tunnel TTL, 0 = default 64
 	Addresses       []string // IPs to assign to tunnel interface (CIDR)
 	RoutingInstance string   // destination routing-instance (VRF)
+	Keepalive       int      // keepalive interval in seconds (0 = disabled)
+	KeepaliveRetry  int      // number of missed keepalives before declaring down (0 = default 3)
 }
 
 // IPsecConfig holds IPsec VPN configuration.
