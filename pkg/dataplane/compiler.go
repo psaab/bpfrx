@@ -543,6 +543,11 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					}
 				}
 
+				// Apply interface speed/duplex via ethtool if configured
+				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+					applyEthtool(physName, ifCfg)
+				}
+
 				// Bring the interface UP so XDP can process traffic,
 				// unless the interface is administratively disabled.
 				isDisabled := false
@@ -2745,5 +2750,77 @@ func resolvePortName(name string) uint16 {
 			return uint16(v)
 		}
 		return 0
+	}
+}
+
+// applyEthtool applies speed and duplex settings via ethtool if configured.
+// Errors are logged as warnings since virtual interfaces (virtio-net) don't
+// support ethtool speed/duplex changes.
+func applyEthtool(ifaceName string, ifCfg *config.InterfaceConfig) {
+	speed := parseSpeed(ifCfg.Speed)
+	duplex := parseDuplex(ifCfg.Duplex)
+	if speed == "" && duplex == "" {
+		return
+	}
+	args := []string{"-s", ifaceName}
+	if speed != "" {
+		args = append(args, "speed", speed)
+	}
+	if duplex != "" {
+		args = append(args, "duplex", duplex)
+	}
+	if out, err := exec.Command("ethtool", args...).CombinedOutput(); err != nil {
+		slog.Warn("failed to apply ethtool settings",
+			"name", ifaceName, "speed", ifCfg.Speed, "duplex", ifCfg.Duplex,
+			"err", fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))
+	} else {
+		slog.Info("applied ethtool settings", "name", ifaceName,
+			"speed", ifCfg.Speed, "duplex", ifCfg.Duplex)
+	}
+}
+
+// parseSpeed converts Junos speed values (e.g. "1g", "10g", "100m") to
+// ethtool speed in Mbps. Returns "" for unknown/auto/empty values.
+func parseSpeed(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "", "auto":
+		return ""
+	case "10m":
+		return "10"
+	case "100m":
+		return "100"
+	case "1g":
+		return "1000"
+	case "2.5g":
+		return "2500"
+	case "5g":
+		return "5000"
+	case "10g":
+		return "10000"
+	case "25g":
+		return "25000"
+	case "40g":
+		return "40000"
+	case "100g":
+		return "100000"
+	default:
+		// Try to parse as raw Mbps number
+		if _, err := strconv.Atoi(s); err == nil {
+			return s
+		}
+		return ""
+	}
+}
+
+// parseDuplex converts Junos duplex values to ethtool duplex values.
+func parseDuplex(d string) string {
+	switch strings.ToLower(strings.TrimSpace(d)) {
+	case "full":
+		return "full"
+	case "half":
+		return "half"
+	default:
+		return ""
 	}
 }

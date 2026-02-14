@@ -1023,19 +1023,41 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 
 		fmt.Fprintf(&buf, "Physical interface: %s, %s, Physical link is %s\n", physName, enabled, linkUp)
 
+		// Show configured speed/duplex from config
+		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+			if ifCfg.Speed != "" {
+				fmt.Fprintf(&buf, "  Configured speed: %s\n", ifCfg.Speed)
+			}
+			if ifCfg.Duplex != "" {
+				fmt.Fprintf(&buf, "  Configured duplex: %s\n", ifCfg.Duplex)
+			}
+		}
+
 		// Link-level details
 		mtu := iface.MTU
 		linkType := "Ethernet"
-		speedStr := ""
+		var linkExtras []string
 		if raw, err := os.ReadFile("/sys/class/net/" + physName + "/speed"); err == nil {
 			var mbps int
 			if _, err := fmt.Sscanf(strings.TrimSpace(string(raw)), "%d", &mbps); err == nil && mbps > 0 {
 				if mbps >= 1000 {
-					speedStr = fmt.Sprintf(", Speed: %dGbps", mbps/1000)
+					linkExtras = append(linkExtras, fmt.Sprintf("Speed: %dGbps", mbps/1000))
 				} else {
-					speedStr = fmt.Sprintf(", Speed: %dMbps", mbps)
+					linkExtras = append(linkExtras, fmt.Sprintf("Speed: %dMbps", mbps))
 				}
 			}
+		}
+		if raw, err := os.ReadFile("/sys/class/net/" + physName + "/duplex"); err == nil {
+			d := strings.TrimSpace(string(raw))
+			if d == "full" {
+				linkExtras = append(linkExtras, "Link-mode: Full-duplex")
+			} else if d == "half" {
+				linkExtras = append(linkExtras, "Link-mode: Half-duplex")
+			}
+		}
+		speedStr := ""
+		if len(linkExtras) > 0 {
+			speedStr = ", " + strings.Join(linkExtras, ", ")
 		}
 		fmt.Fprintf(&buf, "  Link-level type: %s, MTU: %d%s\n", linkType, mtu, speedStr)
 
@@ -1464,6 +1486,8 @@ func (s *Server) GetOSPFStatus(_ context.Context, req *pb.GetOSPFStatusRequest) 
 		output, err = s.frr.GetOSPFDatabase()
 	case "interface":
 		output, err = s.frr.GetOSPFInterface()
+	case "routes":
+		output, err = s.frr.GetOSPFRoutes()
 	default:
 		neighbors, nerr := s.frr.GetOSPFNeighbors()
 		if nerr != nil {
@@ -1538,6 +1562,24 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 			}
 		}
 	default:
+		// "received-routes:<ip>" for neighbor received routes
+		if strings.HasPrefix(req.Type, "received-routes:") {
+			ip := strings.TrimPrefix(req.Type, "received-routes:")
+			output, err := s.frr.GetBGPNeighborReceivedRoutes(ip)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "%v", err)
+			}
+			return &pb.GetBGPStatusResponse{Output: output}, nil
+		}
+		// "advertised-routes:<ip>" for neighbor advertised routes
+		if strings.HasPrefix(req.Type, "advertised-routes:") {
+			ip := strings.TrimPrefix(req.Type, "advertised-routes:")
+			output, err := s.frr.GetBGPNeighborAdvertisedRoutes(ip)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "%v", err)
+			}
+			return &pb.GetBGPStatusResponse{Output: output}, nil
+		}
 		// "neighbor" or "neighbor:<ip>" for detailed neighbor info
 		if req.Type == "neighbor" || strings.HasPrefix(req.Type, "neighbor:") {
 			ip := ""

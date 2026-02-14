@@ -1576,8 +1576,22 @@ func (c *ctl) handleShowProtocols(args []string) error {
 		if len(args) >= 2 {
 			typ = args[1]
 			// "show protocols bgp neighbor <ip>" → type "neighbor:<ip>"
+			// "show protocols bgp neighbor <ip> received-routes" → type "received-routes:<ip>"
+			// "show protocols bgp neighbor <ip> advertised-routes" → type "advertised-routes:<ip>"
 			if typ == "neighbor" && len(args) >= 3 {
-				typ = "neighbor:" + args[2]
+				ip := args[2]
+				if len(args) >= 4 {
+					switch args[3] {
+					case "received-routes":
+						typ = "received-routes:" + ip
+					case "advertised-routes":
+						typ = "advertised-routes:" + ip
+					default:
+						typ = "neighbor:" + ip
+					}
+				} else {
+					typ = "neighbor:" + ip
+				}
 			}
 		}
 		resp, err := c.client.GetBGPStatus(context.Background(), &pb.GetBGPStatusRequest{Type: typ})

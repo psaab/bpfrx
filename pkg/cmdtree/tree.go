@@ -219,11 +219,15 @@ var OperationalTree = map[string]*Node{
 				"neighbor":  {Desc: "Show OSPF neighbors"},
 				"database":  {Desc: "Show OSPF database"},
 				"interface": {Desc: "Show OSPF interface details"},
+				"routes":    {Desc: "Show OSPF routes"},
 			}},
 			"bgp": {Desc: "Show BGP information", Children: map[string]*Node{
 				"summary":  {Desc: "Show BGP peer summary"},
 				"routes":   {Desc: "Show BGP routes"},
-				"neighbor": {Desc: "Show BGP neighbor details"},
+				"neighbor": {Desc: "Show BGP neighbor details", Children: map[string]*Node{
+					"received-routes":  {Desc: "Show received routes from neighbor"},
+					"advertised-routes": {Desc: "Show advertised routes to neighbor"},
+				}},
 			}},
 			"bfd": {Desc: "Show BFD status", Children: map[string]*Node{
 				"peers": {Desc: "Show BFD peer status"},

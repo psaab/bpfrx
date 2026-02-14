@@ -905,6 +905,27 @@ func (m *Manager) GetOSPFInterface() (string, error) {
 	return vtyshCmd("show ip ospf interface")
 }
 
+// GetOSPFRoutes returns raw OSPF route output.
+func (m *Manager) GetOSPFRoutes() (string, error) {
+	return vtyshCmd("show ip ospf route")
+}
+
+// GetBGPNeighborReceivedRoutes returns received routes for a BGP neighbor.
+func (m *Manager) GetBGPNeighborReceivedRoutes(ip string) (string, error) {
+	if ip == "" {
+		return "", fmt.Errorf("neighbor IP required")
+	}
+	return vtyshCmd("show bgp neighbor " + ip + " received-routes")
+}
+
+// GetBGPNeighborAdvertisedRoutes returns advertised routes for a BGP neighbor.
+func (m *Manager) GetBGPNeighborAdvertisedRoutes(ip string) (string, error) {
+	if ip == "" {
+		return "", fmt.Errorf("neighbor IP required")
+	}
+	return vtyshCmd("show bgp neighbor " + ip + " advertised-routes")
+}
+
 // BGPPeerSummary represents a BGP peer in the summary.
 type BGPPeerSummary struct {
 	Neighbor string

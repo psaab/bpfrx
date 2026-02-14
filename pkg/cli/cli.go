@@ -4556,6 +4556,14 @@ func (c *CLI) showOSPF(args []string) error {
 		fmt.Print(output)
 		return nil
 
+	case "routes":
+		output, err := c.frr.GetOSPFRoutes()
+		if err != nil {
+			return fmt.Errorf("OSPF routes: %w", err)
+		}
+		fmt.Print(output)
+		return nil
+
 	default:
 		return fmt.Errorf("unknown show protocols ospf target: %s", args[0])
 	}
@@ -4609,6 +4617,25 @@ func (c *CLI) showBGP(args []string) error {
 		ip := ""
 		if len(args) >= 2 {
 			ip = args[1]
+		}
+		// Check for sub-commands: received-routes, advertised-routes
+		if len(args) >= 3 {
+			switch args[2] {
+			case "received-routes":
+				output, err := c.frr.GetBGPNeighborReceivedRoutes(ip)
+				if err != nil {
+					return fmt.Errorf("BGP received routes: %w", err)
+				}
+				fmt.Print(output)
+				return nil
+			case "advertised-routes":
+				output, err := c.frr.GetBGPNeighborAdvertisedRoutes(ip)
+				if err != nil {
+					return fmt.Errorf("BGP advertised routes: %w", err)
+				}
+				fmt.Print(output)
+				return nil
+			}
 		}
 		output, err := c.frr.GetBGPNeighborDetail(ip)
 		if err != nil {
@@ -5427,6 +5454,7 @@ func (c *CLI) showInterfacesExtensive() error {
 	// Build zone lookup from active config
 	ifZoneMap := make(map[string]string)
 	ifDescMap := make(map[string]string)
+	ifCfgMap := make(map[string]*config.InterfaceConfig)
 	if activeCfg := c.store.ActiveConfig(); activeCfg != nil {
 		for _, z := range activeCfg.Security.Zones {
 			for _, ifName := range z.Interfaces {
@@ -5434,6 +5462,7 @@ func (c *CLI) showInterfacesExtensive() error {
 			}
 		}
 		for _, ifc := range activeCfg.Interfaces.Interfaces {
+			ifCfgMap[ifc.Name] = ifc
 			if ifc.Description != "" {
 				ifDescMap[ifc.Name] = ifc.Description
 			}
@@ -5463,6 +5492,14 @@ func (c *CLI) showInterfacesExtensive() error {
 		}
 		if zone, ok := ifZoneMap[attrs.Name]; ok {
 			fmt.Printf("  Security zone: %s\n", zone)
+		}
+		if ifCfg, ok := ifCfgMap[attrs.Name]; ok {
+			if ifCfg.Speed != "" {
+				fmt.Printf("  Configured speed: %s\n", ifCfg.Speed)
+			}
+			if ifCfg.Duplex != "" {
+				fmt.Printf("  Configured duplex: %s\n", ifCfg.Duplex)
+			}
 		}
 
 		// Type + speed + MTU
