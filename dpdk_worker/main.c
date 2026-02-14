@@ -712,18 +712,21 @@ main(int argc, char **argv)
 	if (nb_workers == 0)
 		nb_workers = 1;
 
-	printf("Configuring %u TX queues per port (%u workers)\n",
+	printf("Configuring %u RX/TX queues per port (%u workers)\n",
 	       nb_workers, nb_workers);
 
-	/* Initialize ports with per-worker TX queues */
+	/* Initialize ports: each port gets nb_workers RX+TX queues.
+	 * Every worker polls ALL ports on its own queue index.
+	 * RSS distributes ingress traffic across queues automatically. */
 	RTE_ETH_FOREACH_DEV(port_id) {
-		ret = port_init(port_id, g_pktmbuf_pool, 1, nb_workers);
+		ret = port_init(port_id, g_pktmbuf_pool, nb_workers, nb_workers);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "Cannot init port %u\n", port_id);
-		printf("Port %u initialized\n", port_id);
+		printf("Port %u initialized (%u RX + %u TX queues)\n",
+		       port_id, nb_workers, nb_workers);
 	}
 
-	/* Assign ports round-robin to worker lcores */
+	/* Each worker polls ALL ports on its own queue index */
 	unsigned worker_idx = 0;
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
 		struct lcore_conf *conf = &g_lcore_conf[lcore_id];
@@ -763,12 +766,17 @@ main(int argc, char **argv)
 		conf->ctx = ctx;
 		conf->rx_mode = g_shm->rx_mode;
 
-		/* Assign port(s) to this lcore */
-		if (worker_idx < nb_ports) {
-			conf->ports[0].port_id = worker_idx;
-			conf->ports[0].queue_id = 0;
-			conf->n_ports = 1;
+		/* Assign ALL ports to this lcore, each on worker's queue */
+		uint16_t p = 0;
+		RTE_ETH_FOREACH_DEV(port_id) {
+			if (p >= MAX_PORTS)
+				break;
+			conf->ports[p].port_id = port_id;
+			conf->ports[p].queue_id = worker_idx;
+			p++;
 		}
+		conf->n_ports = p;
+
 		worker_idx++;
 	}
 

@@ -740,6 +740,9 @@ struct shared_memory {
 
 	/* Per-lcore counter pointers (for Go secondary process to aggregate) */
 	struct lcore_counters *counter_ptrs[64];  /* MAX_LCORES */
+
+	/* Worker health heartbeat (TSC timestamp, updated by each lcore) */
+	volatile uint64_t worker_heartbeat[64];  /* MAX_LCORES */
 };
 
 #endif /* DPDK_SHARED_MEM_H */

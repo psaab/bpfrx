@@ -12,6 +12,7 @@
 #include <rte_mbuf.h>
 #include <rte_lcore.h>
 #include <rte_epoll.h>
+#include <rte_cycles.h>
 
 #include "shared_mem.h"
 #include "tables.h"
@@ -49,6 +50,7 @@ rx_loop_adaptive(struct lcore_conf *conf)
 	struct rte_mbuf *pkts[BURST_SIZE];
 	enum rx_state state = RX_POLL;
 	uint32_t idle_polls = 0;
+	uint64_t next_heartbeat = rte_rdtsc() + rte_get_tsc_hz();
 
 	printf("lcore %u: entering adaptive RX loop (%u ports)\n",
 	       rte_lcore_id(), conf->n_ports);
@@ -79,6 +81,13 @@ rx_loop_adaptive(struct lcore_conf *conf)
 					power_scale_up(rte_lcore_id());
 				}
 			}
+		}
+
+		/* Periodic heartbeat update (~1/s) */
+		uint64_t now = rte_rdtsc();
+		if (now >= next_heartbeat) {
+			conf->ctx->shm->worker_heartbeat[conf->ctx->lcore_id] = now;
+			next_heartbeat = now + rte_get_tsc_hz();
 		}
 
 		if (had_packets)

@@ -1785,3 +1785,30 @@ func deleteStaleHash(hash *C.struct_rte_hash, isWritten func(key unsafe.Pointer)
 
 // DNATKey helper: the DstIP field in DNATKey is uint32 not [4]byte.
 // bytesToUint32 already handles this via the native endian field.
+
+// IsWorkerHealthy checks if DPDK worker lcores are alive by reading
+// their heartbeat timestamps from shared memory. Returns true if all
+// workers updated their heartbeat within the last maxAge duration.
+func (m *Manager) IsWorkerHealthy(maxAge time.Duration) bool {
+	shm := m.platform.shm
+	if shm == nil {
+		return false
+	}
+	now := uint64(C.rte_rdtsc())
+	hz := uint64(C.rte_get_tsc_hz())
+	if hz == 0 {
+		return false
+	}
+	maxTicks := uint64(maxAge.Seconds()) * hz
+
+	for i := 0; i < 64; i++ {
+		hb := uint64(shm.worker_heartbeat[i])
+		if hb == 0 {
+			continue // lcore not started
+		}
+		if now > hb && (now-hb) > maxTicks {
+			return false
+		}
+	}
+	return true
+}

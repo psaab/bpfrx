@@ -12,6 +12,7 @@
 #include <rte_mbuf.h>
 #include <rte_lcore.h>
 #include <rte_epoll.h>
+#include <rte_cycles.h>
 
 #include "shared_mem.h"
 #include "tables.h"
@@ -45,6 +46,7 @@ rx_loop_interrupt(struct lcore_conf *conf)
 {
 	struct rte_mbuf *pkts[BURST_SIZE];
 	uint16_t nb_rx;
+	uint64_t next_heartbeat = rte_rdtsc() + rte_get_tsc_hz();
 
 	printf("lcore %u: entering interrupt-mode RX loop (%u ports)\n",
 	       rte_lcore_id(), conf->n_ports);
@@ -65,6 +67,13 @@ rx_loop_interrupt(struct lcore_conf *conf)
 				process_burst(pkts, nb_rx, conf->ctx);
 				had_packets = 1;
 			}
+		}
+
+		/* Periodic heartbeat update (~1/s) */
+		uint64_t now = rte_rdtsc();
+		if (now >= next_heartbeat) {
+			conf->ctx->shm->worker_heartbeat[conf->ctx->lcore_id] = now;
+			next_heartbeat = now + rte_get_tsc_hz();
 		}
 
 		if (had_packets)

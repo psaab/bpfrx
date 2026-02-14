@@ -8,6 +8,7 @@
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 #include <rte_lcore.h>
+#include <rte_cycles.h>
 
 #include "shared_mem.h"
 #include "tables.h"
@@ -15,6 +16,9 @@
 /* Defined in pipeline.c */
 extern void process_burst(struct rte_mbuf **pkts, uint16_t nb_pkts,
                           struct pipeline_ctx *ctx);
+
+/* Heartbeat update interval (~1 second in TSC ticks) */
+#define HEARTBEAT_INTERVAL_TSC (rte_get_tsc_hz())
 
 /**
  * rx_loop_poll — Simple poll-mode RX loop.
@@ -30,6 +34,7 @@ rx_loop_poll(struct lcore_conf *conf)
 {
 	struct rte_mbuf *pkts[BURST_SIZE];
 	uint16_t nb_rx;
+	uint64_t next_heartbeat = rte_rdtsc() + HEARTBEAT_INTERVAL_TSC;
 
 	printf("lcore %u: entering poll-mode RX loop (%u ports)\n",
 	       rte_lcore_id(), conf->n_ports);
@@ -43,6 +48,13 @@ rx_loop_poll(struct lcore_conf *conf)
 			                         pkts, BURST_SIZE);
 			if (nb_rx > 0)
 				process_burst(pkts, nb_rx, conf->ctx);
+		}
+
+		/* Periodic heartbeat update (~1/s) */
+		uint64_t now = rte_rdtsc();
+		if (now >= next_heartbeat) {
+			conf->ctx->shm->worker_heartbeat[conf->ctx->lcore_id] = now;
+			next_heartbeat = now + HEARTBEAT_INTERVAL_TSC;
 		}
 	}
 
