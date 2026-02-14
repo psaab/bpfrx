@@ -5,6 +5,8 @@
  * TCP state tracking, and timeout management.
  */
 
+#include <string.h>
+
 #include <rte_mbuf.h>
 #include <rte_hash.h>
 #include <rte_cycles.h>
@@ -65,6 +67,30 @@ ct_tcp_update_state(uint8_t current_state, uint8_t tcp_flags, uint8_t direction)
 }
 
 /**
+ * ct_get_timeout — Get session timeout based on protocol and state.
+ */
+static inline uint32_t
+ct_get_timeout(struct pipeline_ctx *ctx, uint8_t protocol, uint8_t state)
+{
+	if (!ctx->shm->flow_timeouts)
+		return 1800;  /* Default 30 minutes */
+
+	switch (protocol) {
+	case PROTO_TCP:
+		if (state >= SESS_STATE_ESTABLISHED)
+			return ctx->shm->flow_timeouts[FLOW_TIMEOUT_TCP_ESTABLISHED];
+		return ctx->shm->flow_timeouts[FLOW_TIMEOUT_TCP_INITIAL];
+	case PROTO_UDP:
+		return ctx->shm->flow_timeouts[FLOW_TIMEOUT_UDP];
+	case PROTO_ICMP:
+	case PROTO_ICMPV6:
+		return ctx->shm->flow_timeouts[FLOW_TIMEOUT_ICMP];
+	default:
+		return ctx->shm->flow_timeouts[FLOW_TIMEOUT_OTHER];
+	}
+}
+
+/**
  * conntrack_lookup — Look up an existing session for this packet.
  *
  * @pkt:  Packet mbuf
@@ -85,41 +111,176 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 {
 	(void)pkt;
 
-	/* TODO: Implement session lookup:
-	 *
-	 * 1. Build session_key from meta (src_ip, dst_ip, src_port, dst_port, proto)
-	 *
-	 * 2. Look up in sessions hash:
-	 *    struct session_key sk = {
-	 *        .src_ip = meta->src_ip.v4,
-	 *        .dst_ip = meta->dst_ip.v4,
-	 *        .src_port = meta->src_port,
-	 *        .dst_port = meta->dst_port,
-	 *        .protocol = meta->protocol,
-	 *    };
-	 *    int pos = rte_hash_lookup(ctx->shm->sessions_v4, &sk);
-	 *
-	 * 3. If found:
-	 *    struct session_value *sv = &ctx->shm->session_values_v4[pos];
-	 *    - Update sv->last_seen to current time
-	 *    - Update TCP state via ct_tcp_update_state() if TCP
-	 *    - Update forward/reverse counters
-	 *    - Copy NAT info to meta (nat_src_ip, nat_dst_ip, nat_flags, etc.)
-	 *    - Set meta->ct_state, ct_direction, policy_id
-	 *    - Check FIB cache validity (sv->fib_gen == *ctx->shm->fib_gen)
-	 *    - If FIB cache valid, copy fib_ifindex/dmac/smac to meta
-	 *    - Return CT_ESTABLISHED
-	 *
-	 * 4. If not found, try reverse key (swap src/dst):
-	 *    - If reverse found: ct_direction = 1, same update logic
-	 *    - Return CT_ESTABLISHED
-	 *
-	 * 5. For IPv6: use sessions_v6 with session_key_v6
-	 *
-	 * 6. If neither found: return CT_NEW
-	 */
+	if (!ctx->shm->sessions_v4)
+		return CT_NEW;
 
-	(void)ctx;
+	uint64_t now = rte_rdtsc() / rte_get_tsc_hz();  /* seconds since boot */
+
+	if (meta->addr_family == AF_INET) {
+		struct session_key sk = {
+			.src_ip = meta->src_ip.v4,
+			.dst_ip = meta->dst_ip.v4,
+			.src_port = meta->src_port,
+			.dst_port = meta->dst_port,
+			.protocol = meta->protocol,
+		};
+
+		int pos = rte_hash_lookup(ctx->shm->sessions_v4, &sk);
+		if (pos >= 0) {
+			struct session_value *sv = &ctx->shm->session_values_v4[pos];
+			uint8_t dir = sv->is_reverse ? 1 : 0;
+
+			/* Update timestamps */
+			sv->last_seen = now;
+
+			/* TCP state transition */
+			if (meta->protocol == PROTO_TCP)
+				sv->state = ct_tcp_update_state(sv->state, meta->tcp_flags, dir);
+
+			/* Update counters */
+			if (dir == 0) {
+				sv->fwd_packets++;
+				sv->fwd_bytes += rte_pktmbuf_pkt_len(pkt);
+			} else {
+				sv->rev_packets++;
+				sv->rev_bytes += rte_pktmbuf_pkt_len(pkt);
+			}
+
+			/* Copy session info to meta */
+			meta->ct_state = sv->state;
+			meta->ct_direction = dir;
+			meta->policy_id = sv->policy_id;
+			meta->ingress_zone = sv->ingress_zone;
+			meta->egress_zone = sv->egress_zone;
+
+			/* NAT info */
+			meta->nat_flags = sv->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT | SESS_FLAG_STATIC_NAT | SESS_FLAG_NAT64);
+			meta->nat_src_ip.v4 = sv->nat_src_ip;
+			meta->nat_dst_ip.v4 = sv->nat_dst_ip;
+			meta->nat_src_port = sv->nat_src_port;
+			meta->nat_dst_port = sv->nat_dst_port;
+
+			/* FIB cache */
+			if (sv->fib_ifindex != 0 && ctx->shm->fib_gen &&
+			    sv->fib_gen == *ctx->shm->fib_gen) {
+				meta->fwd_ifindex = sv->fib_ifindex;
+				memcpy(meta->fwd_dmac, sv->fib_dmac, 6);
+				memcpy(meta->fwd_smac, sv->fib_smac, 6);
+			}
+
+			return CT_ESTABLISHED;
+		}
+
+		/* Try reverse key */
+		struct session_key rsk = {
+			.src_ip = meta->dst_ip.v4,
+			.dst_ip = meta->src_ip.v4,
+			.src_port = meta->dst_port,
+			.dst_port = meta->src_port,
+			.protocol = meta->protocol,
+		};
+
+		pos = rte_hash_lookup(ctx->shm->sessions_v4, &rsk);
+		if (pos >= 0) {
+			struct session_value *sv = &ctx->shm->session_values_v4[pos];
+
+			sv->last_seen = now;
+			if (meta->protocol == PROTO_TCP)
+				sv->state = ct_tcp_update_state(sv->state, meta->tcp_flags, 1);
+
+			sv->rev_packets++;
+			sv->rev_bytes += rte_pktmbuf_pkt_len(pkt);
+
+			meta->ct_state = sv->state;
+			meta->ct_direction = 1;
+			meta->policy_id = sv->policy_id;
+			meta->ingress_zone = sv->egress_zone;  /* Swap for reverse */
+			meta->egress_zone = sv->ingress_zone;
+
+			meta->nat_flags = sv->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT | SESS_FLAG_STATIC_NAT | SESS_FLAG_NAT64);
+			/* For reverse direction, swap NAT src/dst */
+			meta->nat_src_ip.v4 = sv->nat_dst_ip;
+			meta->nat_dst_ip.v4 = sv->nat_src_ip;
+			meta->nat_src_port = sv->nat_dst_port;
+			meta->nat_dst_port = sv->nat_src_port;
+
+			if (sv->fib_ifindex != 0 && ctx->shm->fib_gen &&
+			    sv->fib_gen == *ctx->shm->fib_gen) {
+				meta->fwd_ifindex = sv->fib_ifindex;
+				memcpy(meta->fwd_dmac, sv->fib_dmac, 6);
+				memcpy(meta->fwd_smac, sv->fib_smac, 6);
+			}
+
+			return CT_ESTABLISHED;
+		}
+	} else if (meta->addr_family == AF_INET6) {
+		/* Same logic but with session_key_v6 and sessions_v6 */
+		if (!ctx->shm->sessions_v6)
+			return CT_NEW;
+
+		struct session_key_v6 sk6;
+		memset(&sk6, 0, sizeof(sk6));
+		memcpy(sk6.src_ip, meta->src_ip.v6, 16);
+		memcpy(sk6.dst_ip, meta->dst_ip.v6, 16);
+		sk6.src_port = meta->src_port;
+		sk6.dst_port = meta->dst_port;
+		sk6.protocol = meta->protocol;
+
+		int pos = rte_hash_lookup(ctx->shm->sessions_v6, &sk6);
+		if (pos >= 0) {
+			struct session_value_v6 *sv = &ctx->shm->session_values_v6[pos];
+			sv->last_seen = now;
+			if (meta->protocol == PROTO_TCP)
+				sv->state = ct_tcp_update_state(sv->state, meta->tcp_flags, sv->is_reverse ? 1 : 0);
+
+			if (!sv->is_reverse) {
+				sv->fwd_packets++;
+				sv->fwd_bytes += rte_pktmbuf_pkt_len(pkt);
+			} else {
+				sv->rev_packets++;
+				sv->rev_bytes += rte_pktmbuf_pkt_len(pkt);
+			}
+
+			meta->ct_state = sv->state;
+			meta->ct_direction = sv->is_reverse ? 1 : 0;
+			meta->policy_id = sv->policy_id;
+			meta->nat_flags = sv->flags;
+
+			if (sv->fib_ifindex != 0 && ctx->shm->fib_gen &&
+			    sv->fib_gen == *ctx->shm->fib_gen) {
+				meta->fwd_ifindex = sv->fib_ifindex;
+				memcpy(meta->fwd_dmac, sv->fib_dmac, 6);
+				memcpy(meta->fwd_smac, sv->fib_smac, 6);
+			}
+
+			return CT_ESTABLISHED;
+		}
+
+		/* Try reverse v6 key */
+		struct session_key_v6 rsk6;
+		memset(&rsk6, 0, sizeof(rsk6));
+		memcpy(rsk6.src_ip, meta->dst_ip.v6, 16);
+		memcpy(rsk6.dst_ip, meta->src_ip.v6, 16);
+		rsk6.src_port = meta->dst_port;
+		rsk6.dst_port = meta->src_port;
+		rsk6.protocol = meta->protocol;
+
+		pos = rte_hash_lookup(ctx->shm->sessions_v6, &rsk6);
+		if (pos >= 0) {
+			struct session_value_v6 *sv = &ctx->shm->session_values_v6[pos];
+			sv->last_seen = now;
+			if (meta->protocol == PROTO_TCP)
+				sv->state = ct_tcp_update_state(sv->state, meta->tcp_flags, 1);
+			sv->rev_packets++;
+			sv->rev_bytes += rte_pktmbuf_pkt_len(pkt);
+			meta->ct_state = sv->state;
+			meta->ct_direction = 1;
+			meta->policy_id = sv->policy_id;
+			meta->nat_flags = sv->flags;
+			return CT_ESTABLISHED;
+		}
+	}
+
 	return CT_NEW;
 }
 
@@ -141,38 +302,115 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
                  struct pipeline_ctx *ctx)
 {
 	(void)pkt;
+	uint64_t now = rte_rdtsc() / rte_get_tsc_hz();
 
-	/* TODO: Implement session creation:
-	 *
-	 * 1. Build forward session_key from meta
-	 *
-	 * 2. Populate session_value:
-	 *    - state = SESS_STATE_NEW (or SYN_SENT for TCP SYN)
-	 *    - flags = meta->nat_flags
-	 *    - created = last_seen = current timestamp (seconds since boot)
-	 *    - timeout = ct_get_timeout_default(meta->protocol, state)
-	 *    - policy_id = meta->policy_id
-	 *    - ingress_zone = meta->ingress_zone
-	 *    - egress_zone = meta->egress_zone
-	 *    - NAT fields from meta
-	 *    - Build and store reverse_key
-	 *
-	 * 3. Insert forward entry:
-	 *    int pos = rte_hash_add_key(ctx->shm->sessions_v4, &fwd_key);
-	 *    ctx->shm->session_values_v4[pos] = fwd_val;
-	 *
-	 * 4. Build and insert reverse entry:
-	 *    reverse_key = {dst, src, dport, sport, proto}
-	 *    reverse_value = copy of fwd_val with is_reverse=1
-	 *    int rpos = rte_hash_add_key(ctx->shm->sessions_v4, &rev_key);
-	 *    ctx->shm->session_values_v4[rpos] = rev_val;
-	 *
-	 * 5. For IPv6: use sessions_v6
-	 *
-	 * 6. If DNAT/SNAT, create NAT return entries in dnat_table
-	 */
+	if (meta->addr_family == AF_INET) {
+		if (!ctx->shm->sessions_v4 || !ctx->shm->session_values_v4)
+			return -1;
 
-	(void)ctx;
-	(void)meta;
+		struct session_key fwd_key = {
+			.src_ip = meta->src_ip.v4,
+			.dst_ip = meta->dst_ip.v4,
+			.src_port = meta->src_port,
+			.dst_port = meta->dst_port,
+			.protocol = meta->protocol,
+		};
+
+		uint8_t init_state = SESS_STATE_NEW;
+		if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x02))
+			init_state = SESS_STATE_SYN_SENT;
+
+		struct session_value fwd_val;
+		memset(&fwd_val, 0, sizeof(fwd_val));
+		fwd_val.state = init_state;
+		fwd_val.flags = meta->nat_flags;
+		fwd_val.created = now;
+		fwd_val.last_seen = now;
+		fwd_val.timeout = ct_get_timeout(ctx, meta->protocol, init_state);
+		fwd_val.policy_id = meta->policy_id;
+		fwd_val.ingress_zone = meta->ingress_zone;
+		fwd_val.egress_zone = meta->egress_zone;
+		fwd_val.nat_src_ip = meta->nat_src_ip.v4;
+		fwd_val.nat_dst_ip = meta->nat_dst_ip.v4;
+		fwd_val.nat_src_port = meta->nat_src_port;
+		fwd_val.nat_dst_port = meta->nat_dst_port;
+		fwd_val.is_reverse = 0;
+
+		/* Build reverse key */
+		fwd_val.reverse_key.src_ip = meta->dst_ip.v4;
+		fwd_val.reverse_key.dst_ip = meta->src_ip.v4;
+		fwd_val.reverse_key.src_port = meta->dst_port;
+		fwd_val.reverse_key.dst_port = meta->src_port;
+		fwd_val.reverse_key.protocol = meta->protocol;
+
+		/* Insert forward entry */
+		int pos = rte_hash_add_key(ctx->shm->sessions_v4, &fwd_key);
+		if (pos < 0)
+			return -1;
+		ctx->shm->session_values_v4[pos] = fwd_val;
+
+		/* Insert reverse entry */
+		struct session_value rev_val = fwd_val;
+		rev_val.is_reverse = 1;
+		rev_val.reverse_key = fwd_key;
+
+		int rpos = rte_hash_add_key(ctx->shm->sessions_v4, &fwd_val.reverse_key);
+		if (rpos < 0) {
+			rte_hash_del_key(ctx->shm->sessions_v4, &fwd_key);
+			return -1;
+		}
+		ctx->shm->session_values_v4[rpos] = rev_val;
+
+	} else if (meta->addr_family == AF_INET6) {
+		if (!ctx->shm->sessions_v6 || !ctx->shm->session_values_v6)
+			return -1;
+
+		struct session_key_v6 fwd_key6;
+		memset(&fwd_key6, 0, sizeof(fwd_key6));
+		memcpy(fwd_key6.src_ip, meta->src_ip.v6, 16);
+		memcpy(fwd_key6.dst_ip, meta->dst_ip.v6, 16);
+		fwd_key6.src_port = meta->src_port;
+		fwd_key6.dst_port = meta->dst_port;
+		fwd_key6.protocol = meta->protocol;
+
+		uint8_t init_state = SESS_STATE_NEW;
+		if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x02))
+			init_state = SESS_STATE_SYN_SENT;
+
+		struct session_value_v6 fwd_val6;
+		memset(&fwd_val6, 0, sizeof(fwd_val6));
+		fwd_val6.state = init_state;
+		fwd_val6.flags = meta->nat_flags;
+		fwd_val6.created = now;
+		fwd_val6.last_seen = now;
+		fwd_val6.timeout = ct_get_timeout(ctx, meta->protocol, init_state);
+		fwd_val6.policy_id = meta->policy_id;
+		fwd_val6.ingress_zone = meta->ingress_zone;
+		fwd_val6.egress_zone = meta->egress_zone;
+		fwd_val6.is_reverse = 0;
+
+		fwd_val6.reverse_key.src_port = meta->dst_port;
+		fwd_val6.reverse_key.dst_port = meta->src_port;
+		fwd_val6.reverse_key.protocol = meta->protocol;
+		memcpy(fwd_val6.reverse_key.src_ip, meta->dst_ip.v6, 16);
+		memcpy(fwd_val6.reverse_key.dst_ip, meta->src_ip.v6, 16);
+
+		int pos = rte_hash_add_key(ctx->shm->sessions_v6, &fwd_key6);
+		if (pos < 0)
+			return -1;
+		ctx->shm->session_values_v6[pos] = fwd_val6;
+
+		struct session_value_v6 rev_val6 = fwd_val6;
+		rev_val6.is_reverse = 1;
+		rev_val6.reverse_key = fwd_key6;
+
+		int rpos = rte_hash_add_key(ctx->shm->sessions_v6, &fwd_val6.reverse_key);
+		if (rpos < 0) {
+			rte_hash_del_key(ctx->shm->sessions_v6, &fwd_key6);
+			return -1;
+		}
+		ctx->shm->session_values_v6[rpos] = rev_val6;
+	}
+
 	return 0;
 }

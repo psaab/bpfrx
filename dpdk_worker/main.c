@@ -185,23 +185,136 @@ shm_alloc(void)
 int
 tables_init(struct shared_memory *shm)
 {
-	/* TODO: Create rte_hash tables for sessions, zones, policies, etc.
-	 *
-	 * Example for sessions:
-	 *   struct rte_hash_parameters params = {
-	 *       .name = "sessions_v4",
-	 *       .entries = MAX_SESSIONS,
-	 *       .key_len = sizeof(struct session_key),
-	 *       .hash_func = rte_jhash,
-	 *       .socket_id = rte_socket_id(),
-	 *       .extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF,
-	 *   };
-	 *   shm->sessions_v4 = rte_hash_create(&params);
-	 *
-	 * TODO: Create rte_lpm for address book
-	 * TODO: Allocate array tables (zone_configs, policy_rules, etc.)
-	 * TODO: Create event ring
-	 */
+	int sid = rte_socket_id();
+
+	/* ---- Hash tables ---- */
+	struct rte_hash_parameters params = {
+		.hash_func = rte_jhash,
+		.socket_id = sid,
+		.extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF,
+	};
+
+	params.name    = "sessions_v4";
+	params.entries = MAX_SESSIONS;
+	params.key_len = sizeof(struct session_key);
+	shm->sessions_v4 = rte_hash_create(&params);
+
+	params.name    = "sessions_v6";
+	params.entries = MAX_SESSIONS;
+	params.key_len = sizeof(struct session_key_v6);
+	shm->sessions_v6 = rte_hash_create(&params);
+
+	params.name    = "iface_zone_map";
+	params.entries = MAX_LOGICAL_INTERFACES;
+	params.key_len = sizeof(struct iface_zone_key);
+	shm->iface_zone_map = rte_hash_create(&params);
+
+	params.name    = "zone_pair_policies";
+	params.entries = MAX_ZONES * MAX_ZONES;
+	params.key_len = sizeof(struct zone_pair_key);
+	shm->zone_pair_policies = rte_hash_create(&params);
+
+	params.name    = "applications";
+	params.entries = MAX_APPLICATIONS;
+	params.key_len = sizeof(struct app_key);
+	shm->applications = rte_hash_create(&params);
+
+	params.name    = "dnat_table";
+	params.entries = MAX_STATIC_NAT_ENTRIES;
+	params.key_len = sizeof(struct dnat_key);
+	shm->dnat_table = rte_hash_create(&params);
+
+	params.name    = "dnat_table_v6";
+	params.entries = MAX_STATIC_NAT_ENTRIES;
+	params.key_len = sizeof(struct dnat_key_v6);
+	shm->dnat_table_v6 = rte_hash_create(&params);
+
+	params.name    = "snat_rules";
+	params.entries = MAX_ZONES * MAX_ZONES * MAX_SNAT_RULES_PER_PAIR;
+	params.key_len = sizeof(struct snat_key);
+	shm->snat_rules = rte_hash_create(&params);
+
+	params.name    = "snat_rules_v6";
+	params.entries = MAX_ZONES * MAX_ZONES * MAX_SNAT_RULES_PER_PAIR;
+	params.key_len = sizeof(struct snat_key);
+	shm->snat_rules_v6 = rte_hash_create(&params);
+
+	params.name    = "static_nat_v4";
+	params.entries = MAX_STATIC_NAT_ENTRIES;
+	params.key_len = sizeof(struct static_nat_key_v4);
+	shm->static_nat_v4 = rte_hash_create(&params);
+
+	params.name    = "static_nat_v6";
+	params.entries = MAX_STATIC_NAT_ENTRIES;
+	params.key_len = sizeof(struct static_nat_key_v6);
+	shm->static_nat_v6 = rte_hash_create(&params);
+
+	params.name    = "address_membership";
+	params.entries = MAX_ADDRESSES;
+	params.key_len = sizeof(struct addr_membership_key);
+	shm->address_membership = rte_hash_create(&params);
+
+	params.name    = "iface_filter_map";
+	params.entries = MAX_LOGICAL_INTERFACES * 2;
+	params.key_len = sizeof(struct iface_filter_key);
+	shm->iface_filter_map = rte_hash_create(&params);
+
+	params.name    = "nat64_prefix_map";
+	params.entries = MAX_NAT64_PREFIXES;
+	params.key_len = sizeof(struct nat64_prefix_key);
+	shm->nat64_prefix_map = rte_hash_create(&params);
+
+	params.name    = "nat64_state";
+	params.entries = MAX_SESSIONS;
+	params.key_len = sizeof(struct nat64_state_key);
+	shm->nat64_state = rte_hash_create(&params);
+
+	/* ---- LPM tries ---- */
+	struct rte_lpm_config lpm_cfg = {
+		.max_rules   = MAX_ADDRESSES,
+		.number_tbl8s = 256,
+	};
+	shm->address_book_v4 = rte_lpm_create("addr_v4", sid, &lpm_cfg);
+
+	struct rte_lpm6_config lpm6_cfg = {
+		.max_rules    = MAX_ADDRESSES,
+		.number_tbl8s = 256,
+	};
+	shm->address_book_v6 = rte_lpm6_create("addr_v6", sid, &lpm6_cfg);
+
+	/* ---- Hash value arrays (indexed by rte_hash position) ---- */
+	shm->session_values_v4 = rte_zmalloc("session_values_v4",
+		sizeof(struct session_value) * MAX_SESSIONS, RTE_CACHE_LINE_SIZE);
+	shm->session_values_v6 = rte_zmalloc("session_values_v6",
+		sizeof(struct session_value_v6) * MAX_SESSIONS, RTE_CACHE_LINE_SIZE);
+	shm->iface_zone_values = rte_zmalloc("iface_zone_values",
+		sizeof(struct iface_zone_value) * MAX_LOGICAL_INTERFACES,
+		RTE_CACHE_LINE_SIZE);
+	shm->zone_pair_values = rte_zmalloc("zone_pair_values",
+		sizeof(struct policy_set) * MAX_ZONES * MAX_ZONES,
+		RTE_CACHE_LINE_SIZE);
+	shm->app_values = rte_zmalloc("app_values",
+		sizeof(struct app_value) * MAX_APPLICATIONS, RTE_CACHE_LINE_SIZE);
+	shm->dnat_values = rte_zmalloc("dnat_values",
+		sizeof(struct dnat_value) * MAX_STATIC_NAT_ENTRIES,
+		RTE_CACHE_LINE_SIZE);
+	shm->dnat_values_v6 = rte_zmalloc("dnat_values_v6",
+		sizeof(struct dnat_value_v6) * MAX_STATIC_NAT_ENTRIES,
+		RTE_CACHE_LINE_SIZE);
+	shm->snat_values_v4 = rte_zmalloc("snat_values_v4",
+		sizeof(struct snat_value) * MAX_ZONES * MAX_ZONES *
+		MAX_SNAT_RULES_PER_PAIR, RTE_CACHE_LINE_SIZE);
+	shm->snat_values_v6 = rte_zmalloc("snat_values_v6",
+		sizeof(struct snat_value_v6) * MAX_ZONES * MAX_ZONES *
+		MAX_SNAT_RULES_PER_PAIR, RTE_CACHE_LINE_SIZE);
+	shm->nat_pool_ips_v4 = rte_zmalloc("nat_pool_ips_v4",
+		sizeof(uint32_t) * MAX_NAT_POOL_IPS, RTE_CACHE_LINE_SIZE);
+	shm->nat_pool_ips_v6 = rte_zmalloc("nat_pool_ips_v6",
+		sizeof(struct nat_pool_ip_v6) * MAX_NAT_POOL_IPS,
+		RTE_CACHE_LINE_SIZE);
+	shm->flood_states = rte_zmalloc("flood_states",
+		sizeof(struct flood_state) * MAX_LCORES * MAX_ZONES,
+		RTE_CACHE_LINE_SIZE);
 
 	/* Allocate array tables */
 	shm->zone_configs = rte_zmalloc("zone_configs",
@@ -237,7 +350,23 @@ tables_init(struct shared_memory *shm)
 	shm->event_ring = rte_ring_create("events", EVENT_RING_SIZE,
 		rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
 
-	if (!shm->zone_configs || !shm->policy_rules || !shm->screen_configs ||
+	/* Validate all allocations */
+	if (!shm->sessions_v4 || !shm->sessions_v6 ||
+	    !shm->iface_zone_map || !shm->zone_pair_policies ||
+	    !shm->applications || !shm->dnat_table || !shm->dnat_table_v6 ||
+	    !shm->snat_rules || !shm->snat_rules_v6 ||
+	    !shm->static_nat_v4 || !shm->static_nat_v6 ||
+	    !shm->address_membership || !shm->iface_filter_map ||
+	    !shm->nat64_prefix_map || !shm->nat64_state ||
+	    !shm->address_book_v4 || !shm->address_book_v6 ||
+	    !shm->session_values_v4 || !shm->session_values_v6 ||
+	    !shm->iface_zone_values || !shm->zone_pair_values ||
+	    !shm->app_values || !shm->dnat_values || !shm->dnat_values_v6 ||
+	    !shm->snat_values_v4 || !shm->snat_values_v6 ||
+	    !shm->nat_pool_ips_v4 || !shm->nat_pool_ips_v6 ||
+	    !shm->flood_states ||
+	    !shm->zone_configs || !shm->policy_rules || !shm->screen_configs ||
+	    !shm->nat_pool_configs || !shm->nat64_configs ||
 	    !shm->filter_configs || !shm->filter_rules || !shm->flow_config ||
 	    !shm->flow_timeouts || !shm->default_policy || !shm->fib_gen ||
 	    !shm->event_ring) {

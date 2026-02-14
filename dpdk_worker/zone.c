@@ -31,37 +31,33 @@ zone_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 {
 	(void)pkt;
 
-	/* TODO: Implement zone lookup:
-	 *
-	 * 1. Build iface_zone_key from meta->ingress_ifindex + ingress_vlan_id
-	 *
-	 * 2. Look up in iface_zone_map hash table:
-	 *    struct iface_zone_key zk = {
-	 *        .ifindex = meta->ingress_ifindex,
-	 *        .vlan_id = meta->ingress_vlan_id,
-	 *    };
-	 *    int pos = rte_hash_lookup(ctx->shm->iface_zone_map, &zk);
-	 *    if (pos >= 0) {
-	 *        struct iface_zone_value *zv = &ctx->shm->iface_zone_values[pos];
-	 *        meta->ingress_zone = zv->zone_id;
-	 *        meta->routing_table = zv->routing_table;
-	 *    }
-	 *
-	 * 3. Load zone_config for ingress_zone:
-	 *    struct zone_config *zc = &ctx->shm->zone_configs[meta->ingress_zone];
-	 *
-	 * 4. Check host-inbound-traffic if packet is destined to firewall:
-	 *    - Compare dst_ip against configured interface addresses
-	 *    - If local-destined, check zc->host_inbound_flags against protocol/port
-	 *    - Drop if service not allowed
-	 *
-	 * 5. Pre-routing FIB lookup (optional, for egress zone determination):
-	 *    - Use routing_table to select VRF
-	 *    - Look up dst_ip in FIB for egress interface
-	 *    - Map egress interface to egress_zone
-	 */
+	if (!ctx->shm->iface_zone_map)
+		return;
 
-	/* Default: zone 0, main routing table */
-	meta->ingress_zone = 0;
-	meta->routing_table = 0;
+	/* Look up ingress zone by {ifindex, vlan_id} */
+	struct iface_zone_key zk = {
+		.ifindex = meta->ingress_ifindex,
+		.vlan_id = meta->ingress_vlan_id,
+		.pad = 0,
+	};
+
+	int pos = rte_hash_lookup(ctx->shm->iface_zone_map, &zk);
+	if (pos >= 0 && ctx->shm->iface_zone_values) {
+		struct iface_zone_value *zv = &ctx->shm->iface_zone_values[pos];
+		meta->ingress_zone = zv->zone_id;
+		meta->routing_table = zv->routing_table;
+	}
+
+	/* Load zone config for host-inbound checks */
+	if (meta->ingress_zone < MAX_ZONES && ctx->shm->zone_configs) {
+		struct zone_config *zc = &ctx->shm->zone_configs[meta->ingress_zone];
+		/* Host-inbound-traffic check would go here if we knew
+		 * the firewall's own interface IPs. For now, the pipeline
+		 * relies on policy check for access control. */
+		(void)zc;
+	}
+
+	/* Egress zone determination via FIB is deferred to forward stage.
+	 * For now, egress_zone is set by conntrack (from existing session)
+	 * or remains 0 for new sessions until policy_check sets it. */
 }
