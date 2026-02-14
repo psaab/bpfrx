@@ -1415,24 +1415,26 @@ func (m *Manager) GetMapStats() []dataplane.MapStats {
 		return nil
 	}
 	type hashInfo struct {
-		name string
-		hash *C.struct_rte_hash
+		name       string
+		hash       *C.struct_rte_hash
+		maxEntries uint32
 	}
+	snatMax := uint32(C.MAX_ZONES * C.MAX_ZONES * C.MAX_SNAT_RULES_PER_PAIR)
 	hashes := []hashInfo{
-		{"sessions_v4", shm.sessions_v4},
-		{"sessions_v6", shm.sessions_v6},
-		{"iface_zone_map", shm.iface_zone_map},
-		{"zone_pair_policies", shm.zone_pair_policies},
-		{"applications", shm.applications},
-		{"dnat_table", shm.dnat_table},
-		{"dnat_table_v6", shm.dnat_table_v6},
-		{"snat_rules", shm.snat_rules},
-		{"snat_rules_v6", shm.snat_rules_v6},
-		{"static_nat_v4", shm.static_nat_v4},
-		{"static_nat_v6", shm.static_nat_v6},
-		{"address_membership", shm.address_membership},
-		{"iface_filter_map", shm.iface_filter_map},
-		{"nat64_prefix_map", shm.nat64_prefix_map},
+		{"sessions_v4", shm.sessions_v4, C.MAX_SESSIONS},
+		{"sessions_v6", shm.sessions_v6, C.MAX_SESSIONS},
+		{"iface_zone_map", shm.iface_zone_map, C.MAX_LOGICAL_INTERFACES},
+		{"zone_pair_policies", shm.zone_pair_policies, C.MAX_ZONES * C.MAX_ZONES},
+		{"applications", shm.applications, C.MAX_APPLICATIONS},
+		{"dnat_table", shm.dnat_table, C.MAX_STATIC_NAT_ENTRIES},
+		{"dnat_table_v6", shm.dnat_table_v6, C.MAX_STATIC_NAT_ENTRIES},
+		{"snat_rules", shm.snat_rules, snatMax},
+		{"snat_rules_v6", shm.snat_rules_v6, snatMax},
+		{"static_nat_v4", shm.static_nat_v4, C.MAX_STATIC_NAT_ENTRIES},
+		{"static_nat_v6", shm.static_nat_v6, C.MAX_STATIC_NAT_ENTRIES},
+		{"address_membership", shm.address_membership, C.MAX_ADDRESSES},
+		{"iface_filter_map", shm.iface_filter_map, C.MAX_LOGICAL_INTERFACES * 2},
+		{"nat64_prefix_map", shm.nat64_prefix_map, C.MAX_NAT64_PREFIXES},
 	}
 
 	var stats []dataplane.MapStats
@@ -1442,9 +1444,10 @@ func (m *Manager) GetMapStats() []dataplane.MapStats {
 		}
 		count := C.rte_hash_count(h.hash)
 		stats = append(stats, dataplane.MapStats{
-			Name:      h.name,
-			Type:      "rte_hash",
-			UsedCount: uint32(count),
+			Name:       h.name,
+			Type:       "rte_hash",
+			MaxEntries: h.maxEntries,
+			UsedCount:  uint32(count),
 		})
 	}
 	return stats
