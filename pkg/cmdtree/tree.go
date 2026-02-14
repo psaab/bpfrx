@@ -67,7 +67,21 @@ var OperationalTree = map[string]*Node{
 			"leases":            {Desc: "Show DHCP leases"},
 			"client-identifier": {Desc: "Show DHCPv6 DUID(s)"},
 		}},
-		"firewall":        {Desc: "Show firewall filter configuration"},
+		"firewall": {Desc: "Show firewall filter configuration", Children: map[string]*Node{
+			"filter": {Desc: "Show specific filter by name", DynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.Firewall.FiltersInet)+len(cfg.Firewall.FiltersInet6))
+				for n := range cfg.Firewall.FiltersInet {
+					names = append(names, n)
+				}
+				for n := range cfg.Firewall.FiltersInet6 {
+					names = append(names, n)
+				}
+				return names
+			}},
+		}},
 		"flow-monitoring": {Desc: "Show flow monitoring/NetFlow configuration"},
 		"log":             {Desc: "Show daemon log entries [N]"},
 		"route": {Desc: "Show routing table [instance <name>]", Children: map[string]*Node{
@@ -102,6 +116,7 @@ var OperationalTree = map[string]*Node{
 			}},
 			"policies": {Desc: "Show security policies", Children: map[string]*Node{
 				"brief":     {Desc: "Show brief policy summary"},
+				"detail":    {Desc: "Show detailed policy information"},
 				"hit-count": {Desc: "Show policy hit counters [from-zone X to-zone Y]"},
 				"from-zone": {Desc: "Filter by source zone", DynamicFn: func(cfg *config.Config) []string {
 					if cfg == nil {
@@ -402,6 +417,7 @@ var OperationalTree = map[string]*Node{
 
 // ConfigTopLevel defines tab completion for config mode top-level commands.
 var ConfigTopLevel = map[string]*Node{
+	"annotate": {Desc: "Add comment to configuration node"},
 	"set":      {Desc: "Set a configuration value"},
 	"delete":   {Desc: "Delete a configuration element"},
 	"show":     {Desc: "Show candidate configuration"},

@@ -527,6 +527,9 @@ func (c *ctl) handleShow(args []string) error {
 		return c.showText("dhcp-server")
 
 	case "firewall":
+		if len(args) >= 3 && args[1] == "filter" {
+			return c.showText("firewall-filter:" + args[2])
+		}
 		return c.showText("firewall")
 
 	case "flow-monitoring":
@@ -615,6 +618,17 @@ func (c *ctl) handleShowSecurity(args []string) error {
 	case "policies":
 		if len(args) >= 2 && args[1] == "brief" {
 			return c.showPoliciesBrief()
+		}
+		if len(args) >= 2 && args[1] == "detail" {
+			// Parse optional from-zone/to-zone filters
+			var filterParts []string
+			for i := 2; i+1 < len(args); i++ {
+				if args[i] == "from-zone" || args[i] == "to-zone" {
+					filterParts = append(filterParts, args[i], args[i+1])
+					i++
+				}
+			}
+			return c.showTextFiltered("policies-detail", strings.Join(filterParts, " "))
 		}
 		if len(args) >= 2 && args[1] == "hit-count" {
 			// Parse optional from-zone/to-zone filters

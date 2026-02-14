@@ -10351,3 +10351,67 @@ func TestArchivalConfigSetSyntax(t *testing.T) {
 		t.Errorf("archive-sites = %v", arch.ArchiveSites)
 	}
 }
+
+func TestAnnotationFormatText(t *testing.T) {
+	tree := &ConfigTree{
+		Children: []*Node{
+			{
+				Keys: []string{"system"},
+				Children: []*Node{
+					{Keys: []string{"host-name", "fw1"}, IsLeaf: true, Annotation: "Primary firewall"},
+					{Keys: []string{"domain-name", "example.com"}, IsLeaf: true},
+				},
+			},
+			{
+				Keys:       []string{"security"},
+				Annotation: "Security configuration",
+				Children: []*Node{
+					{Keys: []string{"log"}, Children: []*Node{
+						{Keys: []string{"mode", "stream"}, IsLeaf: true},
+					}},
+				},
+			},
+		},
+	}
+
+	out := tree.Format()
+
+	// Check annotation before host-name
+	if !strings.Contains(out, "/* Primary firewall */") {
+		t.Errorf("missing host-name annotation in:\n%s", out)
+	}
+	// Check annotation before security block
+	if !strings.Contains(out, "/* Security configuration */") {
+		t.Errorf("missing security annotation in:\n%s", out)
+	}
+	// domain-name should NOT have an annotation
+	lines := strings.Split(out, "\n")
+	for i, line := range lines {
+		if strings.Contains(line, "domain-name") {
+			if i > 0 && strings.Contains(lines[i-1], "/*") {
+				t.Errorf("domain-name should not have annotation, but preceding line is: %s", lines[i-1])
+			}
+		}
+	}
+}
+
+func TestAnnotationClone(t *testing.T) {
+	tree := &ConfigTree{
+		Children: []*Node{
+			{Keys: []string{"system"}, Children: []*Node{
+				{Keys: []string{"host-name", "fw1"}, IsLeaf: true, Annotation: "Test comment"},
+			}},
+		},
+	}
+
+	cloned := tree.Clone()
+	if cloned.Children[0].Children[0].Annotation != "Test comment" {
+		t.Error("annotation not preserved in clone")
+	}
+
+	// Modify clone, original should be unchanged
+	cloned.Children[0].Children[0].Annotation = "Modified"
+	if tree.Children[0].Children[0].Annotation != "Test comment" {
+		t.Error("clone shares annotation with original")
+	}
+}

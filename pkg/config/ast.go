@@ -25,6 +25,9 @@ type Node struct {
 	// IsLeaf is true when the node is terminated by ; (no block body).
 	IsLeaf bool
 
+	// Annotation is a user comment set via the "annotate" command.
+	Annotation string
+
 	// Line/Column where this node starts (for error reporting).
 	Line   int
 	Column int
@@ -96,11 +99,12 @@ func cloneNodes(nodes []*Node) []*Node {
 	result := make([]*Node, len(nodes))
 	for i, n := range nodes {
 		result[i] = &Node{
-			Keys:     append([]string(nil), n.Keys...),
-			Children: cloneNodes(n.Children),
-			IsLeaf:   n.IsLeaf,
-			Line:     n.Line,
-			Column:   n.Column,
+			Keys:       append([]string(nil), n.Keys...),
+			Children:   cloneNodes(n.Children),
+			IsLeaf:     n.IsLeaf,
+			Annotation: n.Annotation,
+			Line:       n.Line,
+			Column:     n.Column,
 		}
 	}
 	return result
@@ -1476,6 +1480,9 @@ func (t *ConfigTree) Format() string {
 func formatNodes(b *strings.Builder, nodes []*Node, indent int) {
 	prefix := strings.Repeat("    ", indent)
 	for _, n := range nodes {
+		if n.Annotation != "" {
+			fmt.Fprintf(b, "%s/* %s */\n", prefix, n.Annotation)
+		}
 		if n.IsLeaf {
 			fmt.Fprintf(b, "%s%s;\n", prefix, n.KeyPath())
 		} else {

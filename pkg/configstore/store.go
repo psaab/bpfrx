@@ -180,6 +180,42 @@ func (s *Store) DeleteFromInput(input string) error {
 	return s.Delete(path)
 }
 
+// Annotate sets a comment on a configuration node in the candidate config.
+func (s *Store) Annotate(path []string, comment string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.candidate == nil {
+		return fmt.Errorf("not in configuration mode")
+	}
+
+	children := s.candidate.Children
+	var target *config.Node
+	for _, key := range path {
+		found := false
+		for _, child := range children {
+			for _, k := range child.Keys {
+				if k == key {
+					target = child
+					children = child.Children
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("path not found: %s", strings.Join(path, " "))
+		}
+	}
+
+	target.Annotation = comment
+	s.dirty = true
+	return nil
+}
+
 // LoadOverride replaces the entire candidate config with the parsed input.
 // The input can be hierarchical Junos config or flat "set" commands.
 func (s *Store) LoadOverride(content string) error {

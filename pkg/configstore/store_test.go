@@ -949,3 +949,38 @@ func TestAutoArchiveOnCommit(t *testing.T) {
 		t.Errorf("expected 1 auto-archive file, got %d", len(entries))
 	}
 }
+
+func TestAnnotate(t *testing.T) {
+	s := newTestStore(t)
+	s.EnterConfigure()
+
+	// Set up a config tree
+	if err := s.Set([]string{"system", "host-name", "fw1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set([]string{"system", "domain-name", "example.com"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Annotate the system node
+	if err := s.Annotate([]string{"system"}, "System settings"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Show the candidate and check annotation is present
+	text := s.ShowCandidate()
+	if !strings.Contains(text, "/* System settings */") {
+		t.Errorf("annotation not in show output:\n%s", text)
+	}
+
+	// Annotate a non-existent path
+	if err := s.Annotate([]string{"nonexistent"}, "bad"); err == nil {
+		t.Error("expected error annotating non-existent path")
+	}
+
+	// Annotate outside config mode
+	s.ExitConfigure()
+	if err := s.Annotate([]string{"system"}, "bad"); err == nil {
+		t.Error("expected error annotating outside config mode")
+	}
+}

@@ -3216,6 +3216,150 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		return &pb.ShowTextResponse{Output: buf.String()}, nil
 	}
 
+	if strings.HasPrefix(req.Topic, "firewall-filter:") {
+		filterName := strings.TrimPrefix(req.Topic, "firewall-filter:")
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else {
+			var filter *config.FirewallFilter
+			var family string
+			if f, ok := cfg.Firewall.FiltersInet[filterName]; ok {
+				filter = f
+				family = "inet"
+			} else if f, ok := cfg.Firewall.FiltersInet6[filterName]; ok {
+				filter = f
+				family = "inet6"
+			}
+			if filter == nil {
+				fmt.Fprintf(&buf, "Filter not found: %s\n", filterName)
+			} else {
+				var filterIDs map[string]uint32
+				if s.dp != nil && s.dp.IsLoaded() {
+					if cr := s.dp.LastCompileResult(); cr != nil {
+						filterIDs = cr.FilterIDs
+					}
+				}
+				var ruleStart uint32
+				var hasCounters bool
+				if filterIDs != nil {
+					if fid, ok := filterIDs[family+":"+filterName]; ok {
+						if fcfg, err := s.dp.ReadFilterConfig(fid); err == nil {
+							ruleStart = fcfg.RuleStart
+							hasCounters = true
+						}
+					}
+				}
+				fmt.Fprintf(&buf, "Filter: %s (family %s)\n", filterName, family)
+				ruleOffset := ruleStart
+				for _, term := range filter.Terms {
+					fmt.Fprintf(&buf, "\n  Term: %s\n", term.Name)
+					if term.DSCP != "" {
+						fmt.Fprintf(&buf, "    from dscp %s\n", term.DSCP)
+					}
+					if term.Protocol != "" {
+						fmt.Fprintf(&buf, "    from protocol %s\n", term.Protocol)
+					}
+					for _, addr := range term.SourceAddresses {
+						fmt.Fprintf(&buf, "    from source-address %s\n", addr)
+					}
+					for _, pl := range term.SourcePrefixLists {
+						if pl.Except {
+							fmt.Fprintf(&buf, "    from source-prefix-list %s except\n", pl.Name)
+						} else {
+							fmt.Fprintf(&buf, "    from source-prefix-list %s\n", pl.Name)
+						}
+					}
+					for _, addr := range term.DestAddresses {
+						fmt.Fprintf(&buf, "    from destination-address %s\n", addr)
+					}
+					for _, pl := range term.DestPrefixLists {
+						if pl.Except {
+							fmt.Fprintf(&buf, "    from destination-prefix-list %s except\n", pl.Name)
+						} else {
+							fmt.Fprintf(&buf, "    from destination-prefix-list %s\n", pl.Name)
+						}
+					}
+					if len(term.SourcePorts) > 0 {
+						fmt.Fprintf(&buf, "    from source-port %s\n", strings.Join(term.SourcePorts, ", "))
+					}
+					if len(term.DestinationPorts) > 0 {
+						fmt.Fprintf(&buf, "    from destination-port %s\n", strings.Join(term.DestinationPorts, ", "))
+					}
+					if term.ICMPType >= 0 {
+						fmt.Fprintf(&buf, "    from icmp-type %d\n", term.ICMPType)
+					}
+					if term.ICMPCode >= 0 {
+						fmt.Fprintf(&buf, "    from icmp-code %d\n", term.ICMPCode)
+					}
+					if term.RoutingInstance != "" {
+						fmt.Fprintf(&buf, "    then routing-instance %s\n", term.RoutingInstance)
+					}
+					if term.ForwardingClass != "" {
+						fmt.Fprintf(&buf, "    then forwarding-class %s\n", term.ForwardingClass)
+					}
+					if term.LossPriority != "" {
+						fmt.Fprintf(&buf, "    then loss-priority %s\n", term.LossPriority)
+					}
+					if term.Log {
+						buf.WriteString("    then log\n")
+					}
+					if term.Count != "" {
+						fmt.Fprintf(&buf, "    then count %s\n", term.Count)
+					}
+					action := term.Action
+					if action == "" {
+						action = "accept"
+					}
+					fmt.Fprintf(&buf, "    then %s\n", action)
+					if hasCounters {
+						nSrc := len(term.SourceAddresses)
+						for _, ref := range term.SourcePrefixLists {
+							if !ref.Except {
+								if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+									nSrc += len(pl.Prefixes)
+								}
+							}
+						}
+						if nSrc == 0 {
+							nSrc = 1
+						}
+						nDst := len(term.DestAddresses)
+						for _, ref := range term.DestPrefixLists {
+							if !ref.Except {
+								if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+									nDst += len(pl.Prefixes)
+								}
+							}
+						}
+						if nDst == 0 {
+							nDst = 1
+						}
+						nDstPorts := len(term.DestinationPorts)
+						if nDstPorts == 0 {
+							nDstPorts = 1
+						}
+						nSrcPorts := len(term.SourcePorts)
+						if nSrcPorts == 0 {
+							nSrcPorts = 1
+						}
+						numRules := uint32(nSrc * nDst * nDstPorts * nSrcPorts)
+						var totalPkts, totalBytes uint64
+						for i := uint32(0); i < numRules; i++ {
+							if ctrs, err := s.dp.ReadFilterCounters(ruleOffset + i); err == nil {
+								totalPkts += ctrs.Packets
+								totalBytes += ctrs.Bytes
+							}
+						}
+						fmt.Fprintf(&buf, "    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
+						ruleOffset += numRules
+					}
+				}
+				buf.WriteString("\n")
+			}
+		}
+		return &pb.ShowTextResponse{Output: buf.String()}, nil
+	}
+
 	switch req.Topic {
 	case "zones-detail":
 		if cfg == nil || len(cfg.Security.Zones) == 0 {
@@ -5116,6 +5260,133 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		fmt.Fprintln(&buf, strings.Repeat("-", 88))
 		fmt.Fprintf(&buf, "%-48s %8s %12d %16d\n", "Total", "", totalPkts, totalBytes)
 
+	case "policies-detail":
+		cfg := s.store.ActiveConfig()
+		if cfg == nil {
+			fmt.Fprintln(&buf, "No active configuration")
+			break
+		}
+		var filterFrom, filterTo string
+		if req.Filter != "" {
+			parts := strings.Fields(req.Filter)
+			for i := 0; i+1 < len(parts); i++ {
+				switch parts[i] {
+				case "from-zone":
+					filterFrom = parts[i+1]
+					i++
+				case "to-zone":
+					filterTo = parts[i+1]
+					i++
+				}
+			}
+		}
+		policySetID := uint32(0)
+		for _, zpp := range cfg.Security.Policies {
+			if (filterFrom != "" && zpp.FromZone != filterFrom) ||
+				(filterTo != "" && zpp.ToZone != filterTo) {
+				policySetID++
+				continue
+			}
+			fmt.Fprintf(&buf, "Policy: %s -> %s, State: enabled\n", zpp.FromZone, zpp.ToZone)
+			for i, pol := range zpp.Policies {
+				action := "permit"
+				switch pol.Action {
+				case 1:
+					action = "deny"
+				case 2:
+					action = "reject"
+				}
+				capAction := strings.ToUpper(action[:1]) + action[1:]
+				ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+				fmt.Fprintf(&buf, "\n  Policy: %s, action-type: %s\n", pol.Name, capAction)
+				if pol.Description != "" {
+					fmt.Fprintf(&buf, "    Description: %s\n", pol.Description)
+				}
+				fmt.Fprintf(&buf, "    Match:\n")
+				fmt.Fprintf(&buf, "      Source zone: %s\n", zpp.FromZone)
+				fmt.Fprintf(&buf, "      Destination zone: %s\n", zpp.ToZone)
+				fmt.Fprintf(&buf, "      Source addresses:\n")
+				for _, addr := range pol.Match.SourceAddresses {
+					resolved := grpcResolveAddress(cfg, addr)
+					fmt.Fprintf(&buf, "        %s%s\n", addr, resolved)
+				}
+				fmt.Fprintf(&buf, "      Destination addresses:\n")
+				for _, addr := range pol.Match.DestinationAddresses {
+					resolved := grpcResolveAddress(cfg, addr)
+					fmt.Fprintf(&buf, "        %s%s\n", addr, resolved)
+				}
+				fmt.Fprintf(&buf, "      Applications:\n")
+				for _, app := range pol.Match.Applications {
+					fmt.Fprintf(&buf, "        %s\n", app)
+				}
+				fmt.Fprintf(&buf, "    Then:\n")
+				fmt.Fprintf(&buf, "      %s\n", action)
+				if pol.Log != nil {
+					fmt.Fprintf(&buf, "      log\n")
+				}
+				if pol.Count {
+					fmt.Fprintf(&buf, "      count\n")
+				}
+				if s.dp != nil && s.dp.IsLoaded() {
+					if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
+						fmt.Fprintf(&buf, "    Session statistics:\n")
+						fmt.Fprintf(&buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
+					}
+				}
+			}
+			policySetID++
+			fmt.Fprintln(&buf)
+		}
+		// Global policies
+		if len(cfg.Security.GlobalPolicies) > 0 && filterFrom == "" && filterTo == "" {
+			fmt.Fprintf(&buf, "Global policies:\n")
+			for i, pol := range cfg.Security.GlobalPolicies {
+				action := "permit"
+				switch pol.Action {
+				case 1:
+					action = "deny"
+				case 2:
+					action = "reject"
+				}
+				capAction := strings.ToUpper(action[:1]) + action[1:]
+				ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+				fmt.Fprintf(&buf, "\n  Policy: %s, action-type: %s\n", pol.Name, capAction)
+				if pol.Description != "" {
+					fmt.Fprintf(&buf, "    Description: %s\n", pol.Description)
+				}
+				fmt.Fprintf(&buf, "    Match:\n")
+				fmt.Fprintf(&buf, "      Source addresses:\n")
+				for _, addr := range pol.Match.SourceAddresses {
+					resolved := grpcResolveAddress(cfg, addr)
+					fmt.Fprintf(&buf, "        %s%s\n", addr, resolved)
+				}
+				fmt.Fprintf(&buf, "      Destination addresses:\n")
+				for _, addr := range pol.Match.DestinationAddresses {
+					resolved := grpcResolveAddress(cfg, addr)
+					fmt.Fprintf(&buf, "        %s%s\n", addr, resolved)
+				}
+				fmt.Fprintf(&buf, "      Applications:\n")
+				for _, app := range pol.Match.Applications {
+					fmt.Fprintf(&buf, "        %s\n", app)
+				}
+				fmt.Fprintf(&buf, "    Then:\n")
+				fmt.Fprintf(&buf, "      %s\n", action)
+				if pol.Log != nil {
+					fmt.Fprintf(&buf, "      log\n")
+				}
+				if pol.Count {
+					fmt.Fprintf(&buf, "      count\n")
+				}
+				if s.dp != nil && s.dp.IsLoaded() {
+					if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
+						fmt.Fprintf(&buf, "    Session statistics:\n")
+						fmt.Fprintf(&buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
+					}
+				}
+			}
+			fmt.Fprintln(&buf)
+		}
+
 	case "chassis-hardware":
 		// Alias: same output as "chassis" (CPU, memory, NICs)
 		return s.ShowText(nil, &pb.ShowTextRequest{Topic: "chassis"})
@@ -6748,4 +7019,22 @@ func matchShowSingleApp(appName, proto string, dstPort int, cfg *config.Config) 
 		}
 	}
 	return true
+}
+
+// grpcResolveAddress looks up a named address in the global address book and returns its CIDR suffix.
+func grpcResolveAddress(cfg *config.Config, name string) string {
+	if name == "any" {
+		return ""
+	}
+	ab := cfg.Security.AddressBook
+	if ab == nil {
+		return ""
+	}
+	if addr, ok := ab.Addresses[name]; ok && addr.Value != "" {
+		return " (" + addr.Value + ")"
+	}
+	if _, ok := ab.AddressSets[name]; ok {
+		return " (address-set)"
+	}
+	return ""
 }
