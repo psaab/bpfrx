@@ -1875,10 +1875,11 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) {
 	rules = append(rules, "  chain input {")
 	rules = append(rules, "    type filter hook input priority 0; policy accept;")
 
+	prefixLists := cfg.PolicyOptions.PrefixLists
 	if filterV4 != "" {
 		if f, ok := cfg.Firewall.FiltersInet[filterV4]; ok {
 			for _, term := range f.Terms {
-				r := nftRuleFromTerm(term, "ip")
+				r := nftRuleFromTerm(term, "ip", prefixLists)
 				if r != "" {
 					rules = append(rules, "    "+r)
 				}
@@ -1888,7 +1889,7 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) {
 	if filterV6 != "" {
 		if f, ok := cfg.Firewall.FiltersInet6[filterV6]; ok {
 			for _, term := range f.Terms {
-				r := nftRuleFromTerm(term, "ip6")
+				r := nftRuleFromTerm(term, "ip6", prefixLists)
 				if r != "" {
 					rules = append(rules, "    "+r)
 				}
@@ -1911,18 +1912,55 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) {
 }
 
 // nftRuleFromTerm converts a firewall filter term to an nftables rule string.
-func nftRuleFromTerm(term *config.FirewallFilterTerm, family string) string {
+// prefixLists is used to expand source-prefix-list and destination-prefix-list references.
+func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists map[string]*config.PrefixList) string {
 	var parts []string
 
-	// Source address matching
-	for _, src := range term.SourceAddresses {
-		parts = append(parts, family+" saddr "+src)
+	// Collect all source CIDRs (direct addresses + expanded prefix-lists)
+	var srcCIDRs []string
+	srcCIDRs = append(srcCIDRs, term.SourceAddresses...)
+	var srcNegate bool
+	for _, pl := range term.SourcePrefixLists {
+		if resolved, ok := prefixLists[pl.Name]; ok {
+			srcCIDRs = append(srcCIDRs, resolved.Prefixes...)
+		}
+		if pl.Except {
+			srcNegate = true
+		}
+	}
+	if len(srcCIDRs) > 0 {
+		op := " saddr "
+		if srcNegate {
+			op = " saddr != "
+		}
+		if len(srcCIDRs) == 1 {
+			parts = append(parts, family+op+srcCIDRs[0])
+		} else {
+			parts = append(parts, family+op+"{ "+strings.Join(srcCIDRs, ", ")+" }")
+		}
 	}
 
-	// Source prefix-list except (negated match)
-	for _, pl := range term.SourcePrefixLists {
+	// Collect all destination CIDRs
+	var dstCIDRs []string
+	dstCIDRs = append(dstCIDRs, term.DestAddresses...)
+	var dstNegate bool
+	for _, pl := range term.DestPrefixLists {
+		if resolved, ok := prefixLists[pl.Name]; ok {
+			dstCIDRs = append(dstCIDRs, resolved.Prefixes...)
+		}
 		if pl.Except {
-			parts = append(parts, family+" saddr != { placeholder-"+pl.Name+" }")
+			dstNegate = true
+		}
+	}
+	if len(dstCIDRs) > 0 {
+		op := " daddr "
+		if dstNegate {
+			op = " daddr != "
+		}
+		if len(dstCIDRs) == 1 {
+			parts = append(parts, family+op+dstCIDRs[0])
+		} else {
+			parts = append(parts, family+op+"{ "+strings.Join(dstCIDRs, ", ")+" }")
 		}
 	}
 
@@ -1932,20 +1970,26 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string) string {
 	}
 
 	// Source port matching
-	for _, sp := range term.SourcePorts {
-		parts = append(parts, "th sport "+sp)
+	if len(term.SourcePorts) == 1 {
+		parts = append(parts, "th sport "+term.SourcePorts[0])
+	} else if len(term.SourcePorts) > 1 {
+		parts = append(parts, "th sport { "+strings.Join(term.SourcePorts, ", ")+" }")
 	}
 
 	// Destination port matching
-	for _, dp := range term.DestinationPorts {
-		parts = append(parts, "th dport "+dp)
+	if len(term.DestinationPorts) == 1 {
+		parts = append(parts, "th dport "+term.DestinationPorts[0])
+	} else if len(term.DestinationPorts) > 1 {
+		parts = append(parts, "th dport { "+strings.Join(term.DestinationPorts, ", ")+" }")
 	}
 
-	// Action
+	// Action: discard → drop (silent), reject → reject (ICMP unreachable), accept → accept
 	action := "accept"
 	switch term.Action {
-	case "discard", "reject":
+	case "discard":
 		action = "drop"
+	case "reject":
+		action = "reject"
 	case "accept", "":
 		action = "accept"
 	}

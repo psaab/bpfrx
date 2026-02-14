@@ -156,7 +156,7 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			struct app_value *av = &ctx->shm->app_values[apos];
 			/* Check source port range if specified */
 			if (av->src_port_low != 0 || av->src_port_high != 0) {
-				uint16_t sp = meta->src_port;
+				uint16_t sp = rte_be_to_cpu_16(meta->src_port);
 				if (sp < av->src_port_low || sp > av->src_port_high)
 					continue;
 			}
