@@ -10226,3 +10226,128 @@ func TestApplyGroupsFormatSet(t *testing.T) {
 		t.Errorf("FormatSet missing apply-groups line, got:\n%s", output)
 	}
 }
+
+func TestParseLoginClass(t *testing.T) {
+	input := `system {
+    login {
+        user admin {
+            class super-user;
+        }
+        user monitor {
+            class read-only;
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	if cfg.System.Login == nil {
+		t.Fatal("expected Login config")
+	}
+	if len(cfg.System.Login.Users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(cfg.System.Login.Users))
+	}
+
+	admin := cfg.System.Login.Users[0]
+	if admin.Name != "admin" || admin.Class != "super-user" {
+		t.Errorf("expected admin/super-user, got %s/%s", admin.Name, admin.Class)
+	}
+
+	monitor := cfg.System.Login.Users[1]
+	if monitor.Name != "monitor" || monitor.Class != "read-only" {
+		t.Errorf("expected monitor/read-only, got %s/%s", monitor.Name, monitor.Class)
+	}
+}
+
+func TestArchivalConfigWithTransferInterval(t *testing.T) {
+	input := `
+system {
+    archival {
+        configuration {
+            transfer-on-commit;
+            transfer-interval 30;
+            archive-sites {
+                "scp://backup@10.0.0.1:/configs";
+            }
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	arch := cfg.System.Archival
+	if arch == nil {
+		t.Fatal("archival is nil")
+	}
+	if !arch.TransferOnCommit {
+		t.Error("transfer-on-commit should be true")
+	}
+	if arch.TransferInterval != 30 {
+		t.Errorf("transfer-interval = %d, want 30", arch.TransferInterval)
+	}
+	if len(arch.ArchiveSites) != 1 {
+		t.Fatalf("archive-sites count = %d, want 1", len(arch.ArchiveSites))
+	}
+	if arch.ArchiveSites[0] != "scp://backup@10.0.0.1:/configs" {
+		t.Errorf("archive-site = %q", arch.ArchiveSites[0])
+	}
+	if arch.ArchiveDir != "/var/lib/bpfrx/archive" {
+		t.Errorf("archive-dir = %q, want /var/lib/bpfrx/archive", arch.ArchiveDir)
+	}
+	if arch.MaxArchives != 10 {
+		t.Errorf("max-archives = %d, want 10", arch.MaxArchives)
+	}
+}
+
+func TestArchivalConfigSetSyntax(t *testing.T) {
+	lines := []string{
+		"system archival configuration transfer-on-commit",
+		"system archival configuration transfer-interval 30",
+		"system archival configuration archive-sites /var/backup",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(cmd); err != nil {
+			t.Fatalf("SetPath(%v): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	arch := cfg.System.Archival
+	if arch == nil {
+		t.Fatal("archival is nil")
+	}
+	if !arch.TransferOnCommit {
+		t.Error("transfer-on-commit should be true")
+	}
+	if arch.TransferInterval != 30 {
+		t.Errorf("transfer-interval = %d, want 30", arch.TransferInterval)
+	}
+	if len(arch.ArchiveSites) != 1 || arch.ArchiveSites[0] != "/var/backup" {
+		t.Errorf("archive-sites = %v", arch.ArchiveSites)
+	}
+}

@@ -795,3 +795,157 @@ func TestListCommitHistory(t *testing.T) {
 		t.Errorf("expected action 'commit', got %q", entries[0].Action)
 	}
 }
+
+func TestRescueConfig(t *testing.T) {
+	s := newTestStore(t)
+
+	// Initially no rescue config
+	content, err := s.LoadRescueConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "" {
+		t.Errorf("expected empty rescue config, got %q", content)
+	}
+
+	// Delete non-existent should error
+	if err := s.DeleteRescueConfig(); err == nil {
+		t.Fatal("expected error deleting non-existent rescue config")
+	}
+
+	// Set some active config
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	s.SetFromInput("system host-name test-rescue")
+	if _, err := s.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save rescue
+	if err := s.SaveRescueConfig(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Load rescue — should contain host-name
+	content, err = s.LoadRescueConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(content, "host-name test-rescue") {
+		t.Errorf("rescue config missing host-name, got: %s", content)
+	}
+
+	// Delete rescue
+	if err := s.DeleteRescueConfig(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify deleted
+	content, err = s.LoadRescueConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "" {
+		t.Errorf("expected empty after delete, got %q", content)
+	}
+}
+
+func TestArchiveConfig(t *testing.T) {
+	s := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+
+	// Set some active config
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	s.SetFromInput("system host-name test-archive")
+	if _, err := s.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Archive
+	if err := s.ArchiveConfig(archiveDir, 10); err != nil {
+		t.Fatal(err)
+	}
+
+	// Check archive file exists
+	entries, err := os.ReadDir(archiveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 archive file, got %d", len(entries))
+	}
+	if !strings.HasPrefix(entries[0].Name(), "config-") || !strings.HasSuffix(entries[0].Name(), ".conf") {
+		t.Errorf("unexpected archive filename: %s", entries[0].Name())
+	}
+
+	// Verify content
+	data, err := os.ReadFile(filepath.Join(archiveDir, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "host-name test-archive") {
+		t.Errorf("archive missing host-name, got: %s", string(data))
+	}
+}
+
+func TestArchiveRotation(t *testing.T) {
+	s := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	s.SetFromInput("system host-name rotation-test")
+	if _, err := s.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create 5 archives with maxArchives=3
+	for i := 0; i < 5; i++ {
+		// Write with unique timestamps by using direct file creation
+		filename := filepath.Join(archiveDir, "config-20260101-00000"+string(rune('0'+i))+".conf")
+		os.MkdirAll(archiveDir, 0755)
+		os.WriteFile(filename, []byte("test"), 0644)
+	}
+
+	// Run rotation
+	rotateArchives(archiveDir, 3)
+
+	entries, err := os.ReadDir(archiveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Errorf("expected 3 archives after rotation, got %d", len(entries))
+	}
+}
+
+func TestAutoArchiveOnCommit(t *testing.T) {
+	s := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+
+	// Configure auto-archive
+	s.SetArchiveConfig(archiveDir, 10)
+
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	s.SetFromInput("system host-name auto-archive-test")
+	if _, err := s.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait briefly for the goroutine
+	time.Sleep(100 * time.Millisecond)
+
+	entries, err := os.ReadDir(archiveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("expected 1 auto-archive file, got %d", len(entries))
+	}
+}

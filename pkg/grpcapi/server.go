@@ -80,6 +80,9 @@ type Server struct {
 }
 
 // NewServer creates a new gRPC server.
+// NOTE: gRPC is local-only (127.0.0.1) so all RPCs are inherently trusted.
+// Login class RBAC enforcement could be added here via per-RPC interceptors if
+// gRPC is ever exposed on non-loopback addresses.
 func NewServer(addr string, cfg Config) *Server {
 	return &Server{
 		store:        cfg.Store,
@@ -4954,6 +4957,103 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			addrs, _ := netlink.AddrList(link, netlink.FAMILY_ALL)
 			for _, a := range addrs {
 				fmt.Fprintf(&buf, "  Address: %s\n", a.IPNet)
+			}
+			fmt.Fprintln(&buf)
+		}
+
+	case "interfaces-detail":
+		linksList, err := netlink.LinkList()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "listing interfaces: %v", err)
+		}
+		sort.Slice(linksList, func(i, j int) bool {
+			return linksList[i].Attrs().Name < linksList[j].Attrs().Name
+		})
+		ifZoneMap := make(map[string]string)
+		ifDescMap := make(map[string]string)
+		if cfg != nil {
+			for _, z := range cfg.Security.Zones {
+				for _, ifName := range z.Interfaces {
+					ifZoneMap[ifName] = z.Name
+				}
+			}
+			for _, ifc := range cfg.Interfaces.Interfaces {
+				if ifc.Description != "" {
+					ifDescMap[ifc.Name] = ifc.Description
+				}
+			}
+		}
+		for _, link := range linksList {
+			attrs := link.Attrs()
+			if attrs.Name == "lo" {
+				continue
+			}
+			if req.Filter != "" && attrs.Name != req.Filter {
+				continue
+			}
+			adminUp := attrs.Flags&net.FlagUp != 0
+			operUp := attrs.OperState == netlink.OperUp
+			adminStr := "Disabled"
+			if adminUp {
+				adminStr = "Enabled"
+			}
+			linkStr := "Down"
+			if operUp {
+				linkStr = "Up"
+			}
+			fmt.Fprintf(&buf, "Physical interface: %s, %s, Physical link is %s\n", attrs.Name, adminStr, linkStr)
+			if desc, ok := ifDescMap[attrs.Name]; ok {
+				fmt.Fprintf(&buf, "  Description: %s\n", desc)
+			}
+			fmt.Fprintf(&buf, "  Interface index: %d, SNMP ifIndex: %d\n", attrs.Index, attrs.Index)
+			// Speed/duplex from sysfs
+			linkType := attrs.EncapType
+			if linkType == "" {
+				linkType = "Ethernet"
+			}
+			speedStr := ""
+			if data, err := os.ReadFile("/sys/class/net/" + attrs.Name + "/speed"); err == nil {
+				if spd, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && spd > 0 {
+					if spd >= 1000 {
+						speedStr = fmt.Sprintf(", Speed: %dGbps", spd/1000)
+					} else {
+						speedStr = fmt.Sprintf(", Speed: %dMbps", spd)
+					}
+				}
+			}
+			duplexStr := ""
+			if data, err := os.ReadFile("/sys/class/net/" + attrs.Name + "/duplex"); err == nil {
+				d := strings.TrimSpace(string(data))
+				switch d {
+				case "full":
+					duplexStr = ", Duplex: Full-duplex"
+				case "half":
+					duplexStr = ", Duplex: Half-duplex"
+				}
+			}
+			fmt.Fprintf(&buf, "  Link-level type: %s, MTU: %d%s%s\n", linkType, attrs.MTU, speedStr, duplexStr)
+			if len(attrs.HardwareAddr) > 0 {
+				fmt.Fprintf(&buf, "  Current address: %s\n", attrs.HardwareAddr)
+			}
+			if zone, ok := ifZoneMap[attrs.Name]; ok {
+				fmt.Fprintf(&buf, "  Security zone: %s\n", zone)
+			}
+			fmt.Fprintf(&buf, "  Logical interface %s.0\n", attrs.Name)
+			addrs, _ := netlink.AddrList(link, netlink.FAMILY_ALL)
+			if len(addrs) > 0 {
+				fmt.Fprintf(&buf, "    Addresses:\n")
+				for _, a := range addrs {
+					fmt.Fprintf(&buf, "      %s\n", a.IPNet)
+				}
+			}
+			if st := attrs.Statistics; st != nil {
+				fmt.Fprintf(&buf, "  Traffic statistics:\n")
+				fmt.Fprintf(&buf, "    Input  packets:             %12d\n", st.RxPackets)
+				fmt.Fprintf(&buf, "    Output packets:             %12d\n", st.TxPackets)
+				fmt.Fprintf(&buf, "    Input  bytes:               %12d\n", st.RxBytes)
+				fmt.Fprintf(&buf, "    Output bytes:               %12d\n", st.TxBytes)
+				fmt.Fprintf(&buf, "    Input  errors:              %12d\n", st.RxErrors)
+				fmt.Fprintf(&buf, "    Output errors:              %12d\n", st.TxErrors)
 			}
 			fmt.Fprintln(&buf)
 		}

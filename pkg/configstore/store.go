@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,10 @@ type Store struct {
 	confirmPrevTree *config.ConfigTree // active tree before confirmed commit
 	confirmPrevCfg  *config.Config     // compiled config before confirmed commit
 	centralRollbackFn func(*config.Config)   // callback for dataplane central-apply
+
+	// Archival settings
+	archiveDir string // local archive directory (empty = disabled)
+	archiveMax int    // max archives to keep
 }
 
 // New creates a new config store.
@@ -326,6 +331,19 @@ func (s *Store) Commit() (*config.Config, error) {
 	})
 
 	s.saveRollbackFiles()
+
+	// Auto-archive if configured
+	if s.archiveDir != "" {
+		max := s.archiveMax
+		if max <= 0 {
+			max = 10
+		}
+		go func() {
+			if err := s.ArchiveConfig(s.archiveDir, max); err != nil {
+				slog.Warn("auto-archive failed", "err", err)
+			}
+		}()
+	}
 
 	return compiled, nil
 }
@@ -859,4 +877,112 @@ func splitLines(s string) []string {
 		}
 	}
 	return lines
+}
+
+// SetArchiveConfig configures automatic archival on commit.
+func (s *Store) SetArchiveConfig(dir string, max int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.archiveDir = dir
+	s.archiveMax = max
+}
+
+// ArchiveConfig saves a timestamped copy of the active config.
+func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
+	s.mu.RLock()
+	data := s.active.Format()
+	s.mu.RUnlock()
+
+	if err := os.MkdirAll(archiveDir, 0755); err != nil {
+		return fmt.Errorf("create archive dir: %w", err)
+	}
+
+	filename := fmt.Sprintf("config-%s.conf", time.Now().Format("20060102-150405"))
+	path := filepath.Join(archiveDir, filename)
+	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+		return fmt.Errorf("write archive: %w", err)
+	}
+
+	slog.Info("config archived", "path", path)
+
+	// Rotate old archives
+	if maxArchives > 0 {
+		rotateArchives(archiveDir, maxArchives)
+	}
+	return nil
+}
+
+// rotateArchives keeps only the most recent maxArchives files.
+func rotateArchives(dir string, maxArchives int) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	var archives []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), "config-") && strings.HasSuffix(e.Name(), ".conf") {
+			archives = append(archives, e.Name())
+		}
+	}
+
+	if len(archives) <= maxArchives {
+		return
+	}
+
+	// Sort alphabetically (timestamps sort naturally)
+	sort.Strings(archives)
+
+	// Remove oldest
+	for i := 0; i < len(archives)-maxArchives; i++ {
+		path := filepath.Join(dir, archives[i])
+		if err := os.Remove(path); err != nil {
+			slog.Warn("failed to remove old archive", "path", path, "err", err)
+		}
+	}
+}
+
+// rescuePath returns the path for the rescue configuration file.
+func (s *Store) rescuePath() string {
+	return filepath.Join(filepath.Dir(s.filePath), "rescue.conf")
+}
+
+// SaveRescueConfig saves the active config as rescue configuration.
+func (s *Store) SaveRescueConfig() error {
+	s.mu.RLock()
+	data := s.active.Format()
+	s.mu.RUnlock()
+
+	path := s.rescuePath()
+	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+		return fmt.Errorf("save rescue config: %w", err)
+	}
+	slog.Info("rescue configuration saved", "path", path)
+	return nil
+}
+
+// DeleteRescueConfig removes the rescue configuration.
+func (s *Store) DeleteRescueConfig() error {
+	path := s.rescuePath()
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("no rescue configuration exists")
+		}
+		return fmt.Errorf("delete rescue config: %w", err)
+	}
+	slog.Info("rescue configuration deleted", "path", path)
+	return nil
+}
+
+// LoadRescueConfig returns the rescue configuration text, or "" if none.
+func (s *Store) LoadRescueConfig() (string, error) {
+	path := s.rescuePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read rescue config: %w", err)
+	}
+	return string(data), nil
 }

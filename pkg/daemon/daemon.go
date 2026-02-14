@@ -521,6 +521,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return nil
 		})
 
+		// Set RBAC login class from config (default to super-user if user not found)
+		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Login != nil {
+			osUser := os.Getenv("USER")
+			found := false
+			for _, u := range cfg.System.Login.Users {
+				if u.Name == osUser {
+					shell.SetUserClass(u.Class)
+					found = true
+					break
+				}
+			}
+			if !found {
+				shell.SetUserClass("super-user")
+			}
+		}
+
 		// Run CLI in a goroutine so we can still handle signals
 		errCh := make(chan error, 1)
 		go func() {
@@ -935,6 +951,21 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 
 	// 15. Archive config to remote sites if transfer-on-commit is enabled
 	d.archiveConfig(cfg)
+
+	// 15b. Configure local archival settings for auto-archive on commit
+	if cfg.System.Archival != nil {
+		dir := cfg.System.Archival.ArchiveDir
+		if dir == "" {
+			dir = "/var/lib/bpfrx/archive"
+		}
+		max := cfg.System.Archival.MaxArchives
+		if max <= 0 {
+			max = 10
+		}
+		d.store.SetArchiveConfig(dir, max)
+	} else {
+		d.store.SetArchiveConfig("", 0)
+	}
 
 	// 16. Update flow traceoptions (trace file + filters)
 	d.updateFlowTrace(cfg)

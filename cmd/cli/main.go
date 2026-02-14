@@ -1500,6 +1500,13 @@ func (c *ctl) showInterfaces(args []string) error {
 	if len(args) > 0 && args[0] == "extensive" {
 		return c.showText("interfaces-extensive")
 	}
+	if len(args) > 0 && args[0] == "detail" {
+		return c.showText("interfaces-detail")
+	}
+	// Handle "show interfaces <name> detail"
+	if len(args) >= 2 && args[len(args)-1] == "detail" {
+		return c.showTextFiltered("interfaces-detail", args[0])
+	}
 	req := &pb.ShowInterfacesDetailRequest{}
 	for _, a := range args {
 		if a == "terse" {

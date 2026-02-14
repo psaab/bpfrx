@@ -52,6 +52,7 @@ type CLI struct {
 	lldpNeighborsFn  func() []*lldp.Neighbor
 	hostname     string
 	username     string
+	userClass    string
 	version      string
 	startTime    time.Time
 }
@@ -101,6 +102,47 @@ func (c *CLI) SetLLDPNeighborsFn(fn func() []*lldp.Neighbor) {
 // SetVersion sets the software version string for show version.
 func (c *CLI) SetVersion(v string) {
 	c.version = v
+}
+
+// SetUserClass sets the login class for RBAC permission checks.
+func (c *CLI) SetUserClass(class string) {
+	c.userClass = class
+}
+
+// checkPermission verifies the current user's login class permits the given action.
+// If userClass is empty (not set), all actions are allowed for backward compatibility.
+func (c *CLI) checkPermission(action string) error {
+	if c.userClass == "" {
+		return nil
+	}
+
+	perms, ok := config.LoginClassPermissions[c.userClass]
+	if !ok {
+		return fmt.Errorf("permission denied: unknown login class %q", c.userClass)
+	}
+
+	// Determine required permission for the action.
+	var required config.LoginClassPermission
+	switch action {
+	case "show", "ping", "traceroute", "monitor":
+		required = config.PermView
+	case "clear":
+		required = config.PermClear
+	case "request", "test":
+		required = config.PermControl
+	case "configure":
+		required = config.PermConfig
+	default:
+		required = config.PermAll
+	}
+
+	for _, p := range perms {
+		if p == config.PermAll || p == required {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("permission denied: %q requires class super-user or higher", action)
 }
 
 // completionNode is a static command completion tree node.
@@ -578,6 +620,11 @@ func (c *CLI) dispatchOperational(line string) error {
 		return err
 	}
 	parts[0] = resolved
+
+	// RBAC permission check
+	if err := c.checkPermission(parts[0]); err != nil {
+		return err
+	}
 
 	switch parts[0] {
 	case "configure":
@@ -5175,9 +5222,18 @@ func (c *CLI) showInterfaces(args []string) error {
 	if len(args) > 0 && args[0] == "terse" {
 		return c.showInterfacesTerse()
 	}
+	// Handle "show interfaces detail" sub-command
+	if len(args) > 0 && args[0] == "detail" {
+		return c.showInterfacesDetail("")
+	}
 	// Handle "show interfaces extensive" sub-command
 	if len(args) > 0 && args[0] == "extensive" {
 		return c.showInterfacesExtensive()
+	}
+
+	// Handle "show interfaces <name> detail"
+	if len(args) >= 2 && args[len(args)-1] == "detail" {
+		return c.showInterfacesDetail(args[0])
 	}
 
 	cfg := c.store.ActiveConfig()
@@ -5480,6 +5536,128 @@ func (c *CLI) dhcpLease(ifaceName string, af dhcp.AddressFamily) *dhcp.Lease {
 		return nil
 	}
 	return c.dhcp.LeaseFor(ifaceName, af)
+}
+
+// showInterfacesDetail shows per-interface info with key stats but less
+// verbose than extensive (omits per-error-type breakdowns and BPF counters).
+func (c *CLI) showInterfacesDetail(filterName string) error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("listing interfaces: %w", err)
+	}
+
+	sort.Slice(links, func(i, j int) bool {
+		return links[i].Attrs().Name < links[j].Attrs().Name
+	})
+
+	// Build zone + description lookup from active config
+	ifZoneMap := make(map[string]string)
+	ifDescMap := make(map[string]string)
+	if activeCfg := c.store.ActiveConfig(); activeCfg != nil {
+		for _, z := range activeCfg.Security.Zones {
+			for _, ifName := range z.Interfaces {
+				ifZoneMap[ifName] = z.Name
+			}
+		}
+		for _, ifc := range activeCfg.Interfaces.Interfaces {
+			if ifc.Description != "" {
+				ifDescMap[ifc.Name] = ifc.Description
+			}
+		}
+	}
+
+	found := false
+	for _, link := range links {
+		attrs := link.Attrs()
+		if attrs.Name == "lo" {
+			continue
+		}
+		if filterName != "" && attrs.Name != filterName {
+			continue
+		}
+		found = true
+
+		adminUp := attrs.Flags&net.FlagUp != 0
+		operUp := attrs.OperState == netlink.OperUp
+		adminStr := "Disabled"
+		if adminUp {
+			adminStr = "Enabled"
+		}
+		linkStr := "Down"
+		if operUp {
+			linkStr = "Up"
+		}
+		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n", attrs.Name, adminStr, linkStr)
+		if desc, ok := ifDescMap[attrs.Name]; ok {
+			fmt.Printf("  Description: %s\n", desc)
+		}
+		fmt.Printf("  Interface index: %d, SNMP ifIndex: %d\n", attrs.Index, attrs.Index)
+
+		// Link type, MTU, speed, duplex
+		linkType := "Ethernet"
+		if attrs.EncapType != "" {
+			linkType = attrs.EncapType
+		}
+		speedStr := ""
+		if speed := readLinkSpeed(attrs.Name); speed > 0 {
+			speedStr = ", Speed: " + formatSpeed(speed)
+		}
+		duplexStr := ""
+		if d := readLinkDuplex(attrs.Name); d != "" {
+			duplexStr = ", Duplex: " + formatDuplex(d)
+		}
+		fmt.Printf("  Link-level type: %s, MTU: %d%s%s\n", linkType, attrs.MTU, speedStr, duplexStr)
+
+		if len(attrs.HardwareAddr) > 0 {
+			fmt.Printf("  Current address: %s\n", attrs.HardwareAddr)
+		}
+		if zone, ok := ifZoneMap[attrs.Name]; ok {
+			fmt.Printf("  Security zone: %s\n", zone)
+		}
+
+		// Logical interface with flags and addresses
+		var flags []string
+		if adminUp {
+			flags = append(flags, "Up")
+		}
+		if attrs.RawFlags&0x2 != 0 { // IFF_BROADCAST
+			flags = append(flags, "BROADCAST")
+		}
+		if attrs.OperState == netlink.OperUp {
+			flags = append(flags, "RUNNING")
+		}
+		if attrs.RawFlags&0x1000 != 0 { // IFF_MULTICAST
+			flags = append(flags, "MULTICAST")
+		}
+		fmt.Printf("  Logical interface %s.0\n", attrs.Name)
+		if len(flags) > 0 {
+			fmt.Printf("    Flags: %s\n", strings.Join(flags, " "))
+		}
+
+		addrs, _ := netlink.AddrList(link, netlink.FAMILY_ALL)
+		if len(addrs) > 0 {
+			fmt.Println("    Addresses:")
+			for _, a := range addrs {
+				fmt.Printf("      %s\n", a.IPNet)
+			}
+		}
+
+		// Traffic statistics
+		if s := attrs.Statistics; s != nil {
+			fmt.Println("  Traffic statistics:")
+			fmt.Printf("    Input  packets:             %12d\n", s.RxPackets)
+			fmt.Printf("    Output packets:             %12d\n", s.TxPackets)
+			fmt.Printf("    Input  bytes:               %12d\n", s.RxBytes)
+			fmt.Printf("    Output bytes:               %12d\n", s.TxBytes)
+			fmt.Printf("    Input  errors:              %12d\n", s.RxErrors)
+			fmt.Printf("    Output errors:              %12d\n", s.TxErrors)
+		}
+		fmt.Println()
+	}
+	if filterName != "" && !found {
+		fmt.Printf("Interface %s not found\n", filterName)
+	}
+	return nil
 }
 
 func (c *CLI) showInterfacesTerse() error {
@@ -5979,6 +6157,23 @@ func (c *CLI) handleShowSystem(args []string) error {
 			return fmt.Errorf("no active configuration")
 		}
 		fmt.Print(c.store.ShowActivePath([]string{"system", "root-authentication"}))
+		return nil
+
+	case "configuration":
+		if len(args) >= 2 && args[1] == "rescue" {
+			content, err := c.store.LoadRescueConfig()
+			if err != nil {
+				return err
+			}
+			if content == "" {
+				fmt.Println("No rescue configuration saved")
+			} else {
+				fmt.Print(content)
+			}
+			return nil
+		}
+		fmt.Println("show system configuration:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["show"].Children["system"].Children["configuration"].Children))
 		return nil
 
 	default:
@@ -9513,8 +9708,48 @@ func (c *CLI) handleRequestSystem(args []string) error {
 		fmt.Println("Reboot to complete factory reset.")
 		return nil
 
+	case "configuration":
+		return c.handleRequestSystemConfiguration(args[1:])
+
 	default:
 		return fmt.Errorf("unknown request system command: %s", args[0])
+	}
+}
+
+func (c *CLI) handleRequestSystemConfiguration(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request system configuration:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["system"].Children["configuration"].Children))
+		return nil
+	}
+
+	if args[0] != "rescue" {
+		return fmt.Errorf("unknown request system configuration command: %s", args[0])
+	}
+
+	if len(args) < 2 {
+		fmt.Println("request system configuration rescue:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["system"].Children["configuration"].Children["rescue"].Children))
+		return nil
+	}
+
+	switch args[1] {
+	case "save":
+		if err := c.store.SaveRescueConfig(); err != nil {
+			return err
+		}
+		fmt.Println("Rescue configuration saved")
+		return nil
+
+	case "delete":
+		if err := c.store.DeleteRescueConfig(); err != nil {
+			return err
+		}
+		fmt.Println("Rescue configuration deleted")
+		return nil
+
+	default:
+		return fmt.Errorf("unknown request system configuration rescue command: %s", args[1])
 	}
 }
 

@@ -215,6 +215,7 @@ var OperationalTree = map[string]*Node{
 			return names
 		}, Children: map[string]*Node{
 			"terse":     {Desc: "Show interface summary"},
+			"detail":    {Desc: "Show interface detail"},
 			"extensive": {Desc: "Show detailed interface statistics"},
 			"tunnel":    {Desc: "Show tunnel interfaces"},
 		}},
@@ -279,6 +280,9 @@ var OperationalTree = map[string]*Node{
 			"ntp":                {Desc: "Show NTP server status"},
 			"processes":          {Desc: "Show running processes"},
 			"root-authentication": {Desc: "Show root authentication"},
+			"configuration": {Desc: "Show configuration info", Children: map[string]*Node{
+				"rescue": {Desc: "Show rescue configuration"},
+			}},
 			"services":           {Desc: "Show configured system services"},
 			"storage":            {Desc: "Show filesystem usage"},
 			"syslog":             {Desc: "Show system syslog configuration"},
@@ -353,6 +357,12 @@ var OperationalTree = map[string]*Node{
 			"reboot":  {Desc: "Reboot the system"},
 			"halt":    {Desc: "Halt the system"},
 			"zeroize": {Desc: "Factory reset (erase all config)"},
+			"configuration": {Desc: "Manage configuration", Children: map[string]*Node{
+				"rescue": {Desc: "Rescue configuration", Children: map[string]*Node{
+					"save":   {Desc: "Save rescue configuration"},
+					"delete": {Desc: "Delete rescue configuration"},
+				}},
+			}},
 		}},
 	}},
 	"test": {Desc: "Diagnostic test commands", Children: map[string]*Node{

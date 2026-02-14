@@ -3623,12 +3623,24 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 				}
 			}
 		case "archival":
-			sys.Archival = &ArchivalConfig{}
+			sys.Archival = &ArchivalConfig{
+				ArchiveDir:  "/var/lib/bpfrx/archive",
+				MaxArchives: 10,
+			}
 			if cfgNode := child.FindChild("configuration"); cfgNode != nil {
 				if cfgNode.FindChild("transfer-on-commit") != nil {
 					sys.Archival.TransferOnCommit = true
 				}
-				if asNode := cfgNode.FindChild("archive-sites"); asNode != nil {
+				if tiNode := cfgNode.FindChild("transfer-interval"); tiNode != nil {
+					if v := nodeVal(tiNode); v != "" {
+						sys.Archival.TransferInterval, _ = strconv.Atoi(v)
+					}
+				}
+				for _, asNode := range cfgNode.FindChildren("archive-sites") {
+					if asNode.IsLeaf && len(asNode.Keys) >= 2 {
+						// Flat set syntax: archive-sites <url>;
+						sys.Archival.ArchiveSites = append(sys.Archival.ArchiveSites, asNode.Keys[1])
+					}
 					for _, site := range asNode.Children {
 						if len(site.Keys) >= 1 {
 							sys.Archival.ArchiveSites = append(sys.Archival.ArchiveSites, site.Keys[0])

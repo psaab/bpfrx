@@ -190,7 +190,10 @@ type RootAuthConfig struct {
 // ArchivalConfig holds configuration archival settings.
 type ArchivalConfig struct {
 	TransferOnCommit bool
+	TransferInterval int      // minutes between auto-archives (0 = on commit only)
 	ArchiveSites     []string
+	ArchiveDir       string   // local directory for archives (default /var/lib/bpfrx/archive)
+	MaxArchives      int      // max number of archives to keep (default 10)
 }
 
 // InternetOptionsConfig holds internet-options settings.
@@ -295,6 +298,25 @@ type SNMPv3User struct {
 	AuthPassword string
 	PrivProtocol string // "des", "aes128"
 	PrivPassword string
+}
+
+// LoginClassPermission defines what a login class can do.
+type LoginClassPermission int
+
+const (
+	PermView    LoginClassPermission = iota // show commands
+	PermClear                               // clear commands
+	PermControl                             // restart/request commands
+	PermConfig                              // configure mode
+	PermAll                                 // super-user: everything
+)
+
+// LoginClassPermissions maps class names to their allowed permissions.
+var LoginClassPermissions = map[string][]LoginClassPermission{
+	"super-user":   {PermAll},
+	"operator":     {PermView, PermClear, PermControl},
+	"read-only":    {PermView},
+	"unauthorized": {},
 }
 
 // LoginConfig holds user account definitions.
