@@ -10,6 +10,7 @@
 #include <rte_mbuf.h>
 #include <rte_hash.h>
 #include <rte_cycles.h>
+#include <rte_byteorder.h>
 
 #include "shared_mem.h"
 #include "tables.h"
@@ -20,6 +21,7 @@
 #define CT_NEW         0
 #define CT_ESTABLISHED 1
 #define CT_INVALID     2
+#define CT_DNS_REPLY   3
 
 /**
  * ct_tcp_update_state — TCP state machine transition.
@@ -331,6 +333,15 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		}
 	}
 
+	/* allow-dns-reply: permit unsolicited DNS response packets
+	 * (UDP src port 53) without a matching session, bypassing policy. */
+	if (meta->protocol == PROTO_UDP &&
+	    meta->src_port == rte_cpu_to_be_16(53) &&
+	    ctx->shm->flow_config &&
+	    ctx->shm->flow_config->allow_dns_reply) {
+		return CT_DNS_REPLY;
+	}
+
 	return CT_NEW;
 }
 
@@ -376,7 +387,9 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		fwd_val.flags = meta->nat_flags;
 		fwd_val.created = now;
 		fwd_val.last_seen = now;
-		fwd_val.timeout = ct_get_timeout(ctx, meta->protocol, init_state);
+		fwd_val.timeout = (meta->app_timeout > 0) ?
+			meta->app_timeout :
+			ct_get_timeout(ctx, meta->protocol, init_state);
 		fwd_val.policy_id = meta->policy_id;
 		fwd_val.ingress_zone = meta->ingress_zone;
 		fwd_val.egress_zone = meta->egress_zone;
@@ -435,7 +448,9 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		fwd_val6.flags = meta->nat_flags;
 		fwd_val6.created = now;
 		fwd_val6.last_seen = now;
-		fwd_val6.timeout = ct_get_timeout(ctx, meta->protocol, init_state);
+		fwd_val6.timeout = (meta->app_timeout > 0) ?
+			meta->app_timeout :
+			ct_get_timeout(ctx, meta->protocol, init_state);
 		fwd_val6.policy_id = meta->policy_id;
 		fwd_val6.ingress_zone = meta->ingress_zone;
 		fwd_val6.egress_zone = meta->egress_zone;

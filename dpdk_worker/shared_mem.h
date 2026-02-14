@@ -645,7 +645,7 @@ struct pkt_meta {
 	uint32_t routing_table;
 
 	uint8_t  dscp_rewrite;
-	uint8_t  pad_meta;
+	uint8_t  ip_ihl;
 
 	uint16_t app_timeout;
 };

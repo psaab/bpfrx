@@ -121,6 +121,15 @@ screen_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		/* For now, just flag as checked — real detection needs state */
 	}
 
+	/* 9. IP source route options (IHL > 5 means options present) */
+	if ((sc->flags & SCREEN_IP_SOURCE_ROUTE) && meta->addr_family == AF_INET) {
+		if (meta->ip_ihl > 5) {
+			ctr_global_inc(ctx, GLOBAL_CTR_SCREEN_IP_SRC_ROUTE);
+			emit_event(ctx, meta, EVENT_TYPE_SCREEN_DROP, ACTION_DENY);
+			return -1;
+		}
+	}
+
 	/* Rate-based checks */
 	uint64_t now_tsc = rte_rdtsc();
 	uint64_t hz = rte_get_tsc_hz();

@@ -16,6 +16,7 @@
 #include "shared_mem.h"
 #include "tables.h"
 #include "counters.h"
+#include "events.h"
 
 /**
  * csum_update_u32 — Incremental checksum update for a 32-bit field change.
@@ -56,13 +57,23 @@ csum_update_u16(uint16_t *csum, uint16_t old_val, uint16_t new_val)
  *
  * Rewrites source and/or destination IP and port based on meta->nat_flags.
  * Updates L3 and L4 checksums incrementally.
+ *
+ * Returns 0 on success, -1 if packet was dropped (TTL expired).
  */
-void
+int
 nat_rewrite(struct rte_mbuf *pkt, struct pkt_meta *meta,
             struct pipeline_ctx *ctx)
 {
-	(void)ctx;
 	uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *);
+
+	/* TTL check before NAT rewrite — preserves original IPs
+	 * for ICMP Time Exceeded generation. */
+	if (meta->ip_ttl <= 1) {
+		emit_event(ctx, meta, EVENT_TYPE_SCREEN_DROP, ACTION_DENY);
+		ctr_global_inc(ctx, GLOBAL_CTR_DROPS);
+		rte_pktmbuf_free(pkt);
+		return -1;
+	}
 
 	if (meta->addr_family == AF_INET) {
 		struct rte_ipv4_hdr *ip4 = (struct rte_ipv4_hdr *)(data + meta->l3_offset);
@@ -182,4 +193,6 @@ nat_rewrite(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			}
 		}
 	}
+
+	return 0;
 }

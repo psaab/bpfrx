@@ -59,9 +59,11 @@ parse_packet(struct rte_mbuf *pkt, struct pkt_meta *meta)
 			return -1;
 
 		struct rte_ipv4_hdr *ip4 = (struct rte_ipv4_hdr *)(data + offset);
-		uint8_t ihl = (ip4->version_ihl & 0x0F) * 4;
+		uint8_t ihl_words = ip4->version_ihl & 0x0F;
+		uint8_t ihl = ihl_words * 4;
 
 		meta->addr_family = AF_INET;
+		meta->ip_ihl = ihl_words;
 		meta->src_ip.v4 = ip4->src_addr;
 		meta->dst_ip.v4 = ip4->dst_addr;
 		meta->protocol = ip4->next_proto_id;
@@ -94,9 +96,42 @@ parse_packet(struct rte_mbuf *pkt, struct pkt_meta *meta)
 
 		offset += sizeof(struct rte_ipv6_hdr);
 
-		/* TODO: Skip IPv6 extension headers (hop-by-hop, routing,
-		 * fragment, auth, destination). Track next_header through
-		 * the chain, up to MAX_EXT_HDRS. */
+		/* Skip IPv6 extension headers (hop-by-hop, routing,
+		 * fragment, auth, destination). Follow next-header chain
+		 * until we reach a known transport protocol. */
+		#define MAX_EXT_HDRS 6
+		for (int i = 0; i < MAX_EXT_HDRS; i++) {
+			switch (meta->protocol) {
+			case 0:   /* Hop-by-Hop */
+			case 43:  /* Routing */
+			case 51:  /* Authentication Header */
+			case 60:  /* Destination Options */
+			{
+				if (data_len < offset + 2)
+					return -1;
+				uint8_t next_hdr = data[offset];
+				uint8_t ext_len = data[offset + 1];
+				meta->protocol = next_hdr;
+				offset += (ext_len + 1) * 8;
+				if (offset > data_len)
+					return -1;
+				continue;
+			}
+			case 44:  /* Fragment Header (fixed 8 bytes) */
+			{
+				if (data_len < offset + 8)
+					return -1;
+				uint8_t next_hdr = data[offset];
+				meta->protocol = next_hdr;
+				meta->is_fragment = 1;
+				offset += 8;
+				continue;
+			}
+			default:
+				goto ext_done;
+			}
+		}
+		ext_done:
 
 		meta->l4_offset = offset;
 

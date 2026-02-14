@@ -17,6 +17,62 @@
 #include "shared_mem.h"
 #include "tables.h"
 #include "counters.h"
+#include "events.h"
+
+/**
+ * host_inbound_flag — Map packet protocol/port to HOST_INBOUND_* flag.
+ * Returns 0 for unrecognized services (allowed by default).
+ */
+static inline uint32_t
+host_inbound_flag(struct pkt_meta *meta)
+{
+	uint8_t proto = meta->protocol;
+
+	/* ICMP/ICMPv6 echo request */
+	if (proto == PROTO_ICMP || proto == PROTO_ICMPV6) {
+		if (meta->icmp_type == 8 || meta->icmp_type == 128)
+			return HOST_INBOUND_PING;
+		return 0;  /* other ICMP always allowed */
+	}
+
+	/* OSPF is IP protocol 89, not port-based */
+	if (proto == 89)
+		return HOST_INBOUND_OSPF;
+
+	/* ESP (protocol 50) */
+	if (proto == PROTO_ESP)
+		return HOST_INBOUND_ESP;
+
+	/* VRRP (protocol 112) */
+	if (proto == PROTO_VRRP)
+		return HOST_INBOUND_VRRP;
+
+	/* TCP/UDP port-based services */
+	uint16_t port = rte_be_to_cpu_16(meta->dst_port);
+	switch (port) {
+	case 22:            return HOST_INBOUND_SSH;
+	case 53:            return HOST_INBOUND_DNS;
+	case 80:            return HOST_INBOUND_HTTP;
+	case 443:           return HOST_INBOUND_HTTPS;
+	case 67: case 68:   return HOST_INBOUND_DHCP;
+	case 546: case 547: return HOST_INBOUND_DHCPV6;
+	case 123:           return HOST_INBOUND_NTP;
+	case 161:           return HOST_INBOUND_SNMP;
+	case 179:           return HOST_INBOUND_BGP;
+	case 23:            return HOST_INBOUND_TELNET;
+	case 21:            return HOST_INBOUND_FTP;
+	case 830:           return HOST_INBOUND_NETCONF;
+	case 514:           return HOST_INBOUND_SYSLOG;
+	case 1812: case 1813: return HOST_INBOUND_RADIUS;
+	case 500: case 4500:  return HOST_INBOUND_IKE;
+	}
+
+	/* Traceroute: UDP ports 33434-33523 */
+	if (proto == PROTO_UDP && port >= 33434 && port <= 33523)
+		return HOST_INBOUND_TRACEROUTE;
+
+	return 0;  /* unknown service → allow by default */
+}
 
 /**
  * forward_packet — Forward the packet to the output port.
@@ -33,6 +89,29 @@ forward_packet(struct rte_mbuf *pkt, struct pkt_meta *meta,
                struct pipeline_ctx *ctx)
 {
 	uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *);
+
+	/* 0. Host-inbound-traffic check: if no egress interface was
+	 * resolved, the packet is locally destined. Check host-inbound
+	 * policy before passing to the kernel stack. */
+	if (meta->fwd_ifindex == 0) {
+		if (meta->ingress_zone < MAX_ZONES && ctx->shm->zone_configs) {
+			struct zone_config *zc = &ctx->shm->zone_configs[meta->ingress_zone];
+			if (zc->host_inbound_flags != 0) {
+				uint32_t flag = host_inbound_flag(meta);
+				if (flag != 0 && !(zc->host_inbound_flags & flag)) {
+					ctr_global_inc(ctx, GLOBAL_CTR_HOST_INBOUND_DENY);
+					emit_event(ctx, meta, EVENT_TYPE_POLICY_DENY, ACTION_DENY);
+					rte_pktmbuf_free(pkt);
+					return;
+				}
+			}
+		}
+		/* Host-bound: pass to kernel (DPDK can't deliver locally,
+		 * so for now count and drop — requires KNI or exception path) */
+		ctr_global_inc(ctx, GLOBAL_CTR_HOST_INBOUND);
+		rte_pktmbuf_free(pkt);
+		return;
+	}
 
 	/* 1. TTL check and decrement */
 	if (meta->ip_ttl <= 1) {

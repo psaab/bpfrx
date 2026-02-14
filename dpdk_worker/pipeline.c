@@ -27,7 +27,7 @@ extern int  conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
                              struct pipeline_ctx *ctx);
 extern int  policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
                          struct pipeline_ctx *ctx);
-extern void nat_rewrite(struct rte_mbuf *pkt, struct pkt_meta *meta,
+extern int  nat_rewrite(struct rte_mbuf *pkt, struct pkt_meta *meta,
                         struct pipeline_ctx *ctx);
 extern void nat64_translate(struct rte_mbuf *pkt, struct pkt_meta *meta,
                             struct pipeline_ctx *ctx);
@@ -38,6 +38,7 @@ extern void forward_packet(struct rte_mbuf *pkt, struct pkt_meta *meta,
 #define CT_NEW         0
 #define CT_ESTABLISHED 1
 #define CT_INVALID     2
+#define CT_DNS_REPLY   3
 
 /**
  * process_packet — Main per-packet processing function.
@@ -82,6 +83,10 @@ process_packet(struct rte_mbuf *pkt, struct pipeline_ctx *ctx)
 	    !(meta.nat_flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT)))
 		goto forward;  /* Fast path: established, no NAT */
 
+	/* allow-dns-reply: bypass policy for unsolicited DNS responses */
+	if (ct_result == CT_DNS_REPLY)
+		goto forward;
+
 	/* 6. Policy (replaces xdp_policy, only for new sessions) */
 	if (ct_result == CT_NEW) {
 		if (policy_check(pkt, &meta, ctx) != ACTION_PERMIT)
@@ -91,8 +96,10 @@ process_packet(struct rte_mbuf *pkt, struct pipeline_ctx *ctx)
 	}
 
 	/* 7. NAT (replaces xdp_nat) */
-	if (meta.nat_flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT))
-		nat_rewrite(pkt, &meta, ctx);
+	if (meta.nat_flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT)) {
+		if (nat_rewrite(pkt, &meta, ctx) < 0)
+			return;  /* TTL expired — already freed */
+	}
 
 	/* 8. NAT64 (replaces xdp_nat64) */
 	if (meta.nat_flags & SESS_FLAG_NAT64) {
