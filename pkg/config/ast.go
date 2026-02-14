@@ -1628,21 +1628,28 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []string
 	i := 0
 
 	for i < len(tokens) {
-		if schema == nil || schema.children == nil {
-			return nil // at a leaf or no more schema
+		if schema == nil {
+			return nil
+		}
+		if schema.children == nil && schema.wildcard == nil {
+			return nil // at a leaf with no further options
 		}
 
 		keyword := tokens[i]
 
 		// Look up keyword in current schema level.
 		var childSchema *schemaNode
-		if s, ok := schema.children[keyword]; ok {
-			childSchema = s
-		} else if schema.wildcard != nil {
+		if schema.children != nil {
+			if s, ok := schema.children[keyword]; ok {
+				childSchema = s
+			}
+		}
+		if childSchema == nil && schema.wildcard != nil {
 			childSchema = schema.wildcard
-		} else {
+		}
+		if childSchema == nil {
 			// Last token might be a partial prefix — return matching keywords.
-			if i == len(tokens)-1 {
+			if i == len(tokens)-1 && schema.children != nil {
 				var matches []string
 				for name := range schema.children {
 					if strings.HasPrefix(name, keyword) {

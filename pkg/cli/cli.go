@@ -440,8 +440,18 @@ func (c *CLI) Run() error {
 		}
 		line, err := c.rl.Readline()
 		if err != nil {
-			if err == readline.ErrInterrupt || err == io.EOF {
+			if err == readline.ErrInterrupt {
 				continue
+			}
+			if err == io.EOF {
+				// Ctrl-D: exit config mode, or exit CLI if already in operational mode.
+				if c.store.InConfigMode() {
+					c.store.ExitConfigure()
+					c.rl.SetPrompt(c.operationalPrompt())
+					fmt.Println("\nExiting configuration mode")
+					continue
+				}
+				return nil
 			}
 			return err
 		}

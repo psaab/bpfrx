@@ -161,8 +161,20 @@ func main() {
 
 		line, err := rl.Readline()
 		if err != nil {
-			if err == readline.ErrInterrupt || err == io.EOF {
+			if err == readline.ErrInterrupt {
 				continue
+			}
+			if err == io.EOF {
+				// Ctrl-D: exit config mode, or exit CLI if in operational mode.
+				if c.configMode {
+					c.configMode = false
+					c.editPath = nil
+					_, _ = client.ExitConfigure(context.Background(), &pb.ExitConfigureRequest{})
+					rl.SetPrompt(c.operationalPrompt())
+					fmt.Println("\nExiting configuration mode")
+					continue
+				}
+				break
 			}
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			break

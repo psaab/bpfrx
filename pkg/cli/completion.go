@@ -23,6 +23,11 @@ func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, p
 	for _, w := range words {
 		node, ok := current[w]
 		if !ok {
+			// Word not in static children — if parent has DynamicFn,
+			// treat as a dynamic value and stay at same children level.
+			if currentNode != nil && currentNode.DynamicFn != nil {
+				continue
+			}
 			return nil
 		}
 		currentNode = node
