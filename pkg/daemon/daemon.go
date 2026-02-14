@@ -57,7 +57,7 @@ type Options struct {
 type Daemon struct {
 	opts         Options
 	store        *configstore.Store
-	dp           *dataplane.Manager
+	dp           dataplane.DataPlane
 	networkd     *networkd.Manager
 	routing      *routing.Manager
 	frr          *frr.Manager
@@ -1047,7 +1047,7 @@ func (d *Daemon) collectDHCPRoutes() []frr.DHCPRoute {
 }
 
 // logFinalStats reads and logs global counter summary before shutdown.
-func logFinalStats(dp *dataplane.Manager) {
+func logFinalStats(dp dataplane.DataPlane) {
 	if !dp.IsLoaded() {
 		return
 	}

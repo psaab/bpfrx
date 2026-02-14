@@ -291,6 +291,11 @@ func (m *Manager) DetachTC(ifindex int) error {
 	return nil
 }
 
+// GetPersistentNAT returns the persistent NAT table.
+func (m *Manager) GetPersistentNAT() *PersistentNATTable {
+	return m.PersistentNAT
+}
+
 // Map returns a named eBPF map, or nil if not found.
 func (m *Manager) Map(name string) *ebpf.Map {
 	return m.maps[name]

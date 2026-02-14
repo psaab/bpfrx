@@ -42,7 +42,7 @@ import (
 // Config configures the gRPC server.
 type Config struct {
 	Store    *configstore.Store
-	DP       *dataplane.Manager
+	DP       dataplane.DataPlane
 	EventBuf *logging.EventBuffer
 	GC       *conntrack.GC
 	Routing  *routing.Manager
@@ -60,7 +60,7 @@ type Config struct {
 type Server struct {
 	pb.UnimplementedBpfrxServiceServer
 	store        *configstore.Store
-	dp           *dataplane.Manager
+	dp           dataplane.DataPlane
 	eventBuf     *logging.EventBuffer
 	gc           *conntrack.GC
 	routing      *routing.Manager
@@ -3822,10 +3822,10 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 
 	case "persistent-nat":
-		if s.dp == nil || s.dp.PersistentNAT == nil {
+		if s.dp == nil || s.dp.GetPersistentNAT() == nil {
 			buf.WriteString("Persistent NAT table not available\n")
 		} else {
-			bindings := s.dp.PersistentNAT.All()
+			bindings := s.dp.GetPersistentNAT().All()
 			if len(bindings) == 0 {
 				buf.WriteString("No persistent NAT bindings\n")
 			} else {
@@ -4006,10 +4006,10 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 
 	case "persistent-nat-detail":
-		if s.dp == nil || s.dp.PersistentNAT == nil {
+		if s.dp == nil || s.dp.GetPersistentNAT() == nil {
 			buf.WriteString("Persistent NAT table not available\n")
 		} else {
-			bindings := s.dp.PersistentNAT.All()
+			bindings := s.dp.GetPersistentNAT().All()
 			if len(bindings) == 0 {
 				buf.WriteString("No persistent NAT bindings\n")
 			} else {
@@ -5775,11 +5775,11 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 		return &pb.SystemActionResponse{Message: "NAT translation statistics cleared"}, nil
 
 	case "clear-persistent-nat":
-		if s.dp == nil || s.dp.PersistentNAT == nil {
+		if s.dp == nil || s.dp.GetPersistentNAT() == nil {
 			return &pb.SystemActionResponse{Message: "Persistent NAT table not available"}, nil
 		}
-		count := s.dp.PersistentNAT.Len()
-		s.dp.PersistentNAT.Clear()
+		count := s.dp.GetPersistentNAT().Len()
+		s.dp.GetPersistentNAT().Clear()
 		return &pb.SystemActionResponse{
 			Message: fmt.Sprintf("Cleared %d persistent NAT bindings", count),
 		}, nil

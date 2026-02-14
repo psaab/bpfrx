@@ -35,7 +35,7 @@ type Config struct {
 	HTTPSAddr string // HTTPS listen address (empty = no HTTPS)
 	TLS       bool   // enable HTTPS with auto-generated certificate
 	Store     *configstore.Store
-	DP        *dataplane.Manager
+	DP        dataplane.DataPlane
 	EventBuf  *logging.EventBuffer
 	GC        *conntrack.GC
 	Routing   *routing.Manager
@@ -50,7 +50,7 @@ type Server struct {
 	httpServer  *http.Server
 	httpsServer *http.Server
 	store       *configstore.Store
-	dp          *dataplane.Manager
+	dp          dataplane.DataPlane
 	eventBuf    *logging.EventBuffer
 	gc          *conntrack.GC
 	routing     *routing.Manager

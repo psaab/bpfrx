@@ -38,7 +38,7 @@ import (
 type CLI struct {
 	rl          *readline.Instance
 	store       *configstore.Store
-	dp          *dataplane.Manager
+	dp          dataplane.DataPlane
 	eventBuf    *logging.EventBuffer
 	eventReader *logging.EventReader
 	routing     *routing.Manager
@@ -54,7 +54,7 @@ type CLI struct {
 }
 
 // New creates a new CLI.
-func New(store *configstore.Store, dp *dataplane.Manager, eventBuf *logging.EventBuffer, eventReader *logging.EventReader, rm *routing.Manager, fm *frr.Manager, im *ipsec.Manager, dm *dhcp.Manager, dr *dhcprelay.Manager) *CLI {
+func New(store *configstore.Store, dp dataplane.DataPlane, eventBuf *logging.EventBuffer, eventReader *logging.EventReader, rm *routing.Manager, fm *frr.Manager, im *ipsec.Manager, dm *dhcp.Manager, dr *dhcprelay.Manager) *CLI {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "bpfrx"
@@ -7278,11 +7278,11 @@ func (c *CLI) showSNMP() error {
 }
 
 func (c *CLI) showPersistentNAT() error {
-	if c.dp == nil || c.dp.PersistentNAT == nil {
+	if c.dp == nil || c.dp.GetPersistentNAT() == nil {
 		fmt.Println("Persistent NAT table not available")
 		return nil
 	}
-	bindings := c.dp.PersistentNAT.All()
+	bindings := c.dp.GetPersistentNAT().All()
 	if len(bindings) == 0 {
 		fmt.Println("No persistent NAT bindings")
 		return nil
@@ -7304,11 +7304,11 @@ func (c *CLI) showPersistentNAT() error {
 
 // showPersistentNATDetail displays detailed persistent NAT bindings with session counts and age.
 func (c *CLI) showPersistentNATDetail() error {
-	if c.dp == nil || c.dp.PersistentNAT == nil {
+	if c.dp == nil || c.dp.GetPersistentNAT() == nil {
 		fmt.Println("Persistent NAT table not available")
 		return nil
 	}
-	bindings := c.dp.PersistentNAT.All()
+	bindings := c.dp.GetPersistentNAT().All()
 	if len(bindings) == 0 {
 		fmt.Println("No persistent NAT bindings")
 		return nil
@@ -7361,12 +7361,12 @@ func (c *CLI) showPersistentNATDetail() error {
 }
 
 func (c *CLI) clearPersistentNAT() error {
-	if c.dp == nil || c.dp.PersistentNAT == nil {
+	if c.dp == nil || c.dp.GetPersistentNAT() == nil {
 		fmt.Println("Persistent NAT table not available")
 		return nil
 	}
-	count := c.dp.PersistentNAT.Len()
-	c.dp.PersistentNAT.Clear()
+	count := c.dp.GetPersistentNAT().Len()
+	c.dp.GetPersistentNAT().Clear()
 	fmt.Printf("Cleared %d persistent NAT bindings\n", count)
 	return nil
 }

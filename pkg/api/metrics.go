@@ -232,7 +232,7 @@ func (c *bpfrxCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectDHCPMetrics(ch)
 }
 
-func (c *bpfrxCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp *dataplane.Manager) {
+func (c *bpfrxCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	ctrMap := dp.Map("global_counters")
 	if ctrMap == nil {
 		return
@@ -272,7 +272,7 @@ func (c *bpfrxCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp *
 		readCounter(dataplane.GlobalCtrTCEgressPackets))
 }
 
-func (c *bpfrxCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp *dataplane.Manager) {
+func (c *bpfrxCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -298,7 +298,7 @@ func (c *bpfrxCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, d
 	}
 }
 
-func (c *bpfrxCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp *dataplane.Manager) {
+func (c *bpfrxCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -328,7 +328,7 @@ func (c *bpfrxCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp *da
 	}
 }
 
-func (c *bpfrxCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp *dataplane.Manager) {
+func (c *bpfrxCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -361,7 +361,7 @@ func (c *bpfrxCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp *
 	}
 }
 
-func (c *bpfrxCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp *dataplane.Manager) {
+func (c *bpfrxCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -415,7 +415,7 @@ func (c *bpfrxCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp *
 	emitFilters("inet6", cfg.Firewall.FiltersInet6)
 }
 
-func (c *bpfrxCollector) collectSessionGauges(ch chan<- prometheus.Metric, dp *dataplane.Manager) {
+func (c *bpfrxCollector) collectSessionGauges(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	if c.srv.gc == nil {
 		return
 	}
@@ -459,7 +459,7 @@ func (c *bpfrxCollector) collectSessionGauges(ch chan<- prometheus.Metric, dp *d
 	ch <- prometheus.MustNewConstMetric(c.sessionsDNAT, prometheus.GaugeValue, float64(dnat))
 }
 
-func (c *bpfrxCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp *dataplane.Manager) {
+func (c *bpfrxCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return

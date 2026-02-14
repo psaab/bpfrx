@@ -22,14 +22,14 @@ type GCStats struct {
 
 // GC performs periodic garbage collection on the session table.
 type GC struct {
-	dp       *dataplane.Manager
+	dp       dataplane.DataPlane
 	interval time.Duration
 	mu       sync.RWMutex
 	stats    GCStats
 }
 
 // NewGC creates a new session garbage collector.
-func NewGC(dp *dataplane.Manager, interval time.Duration) *GC {
+func NewGC(dp dataplane.DataPlane, interval time.Duration) *GC {
 	return &GC{dp: dp, interval: interval}
 }
 
