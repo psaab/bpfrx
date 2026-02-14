@@ -1783,6 +1783,16 @@ func deleteStaleHash(hash *C.struct_rte_hash, isWritten func(key unsafe.Pointer)
 	}
 }
 
+// GCStats returns session garbage collection statistics from the C worker.
+// Reads directly from shared memory (no CGo function call needed).
+func (m *Manager) GCStats() (expired, scanned uint64) {
+	shm := m.platform.shm
+	if shm == nil {
+		return 0, 0
+	}
+	return uint64(shm.gc_sessions_expired), uint64(shm.gc_sessions_scanned)
+}
+
 // DNATKey helper: the DstIP field in DNATKey is uint32 not [4]byte.
 // bytesToUint32 already handles this via the native endian field.
 

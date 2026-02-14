@@ -743,6 +743,10 @@ struct shared_memory {
 
 	/* Worker health heartbeat (TSC timestamp, updated by each lcore) */
 	volatile uint64_t worker_heartbeat[64];  /* MAX_LCORES */
+
+	/* Session GC statistics (updated by main lcore gc_sweep) */
+	volatile uint64_t gc_sessions_expired;
+	volatile uint64_t gc_sessions_scanned;
 };
 
 #endif /* DPDK_SHARED_MEM_H */

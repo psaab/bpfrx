@@ -17,6 +17,7 @@ sources = files(
     'forward.c',
     'filter.c',
     'reject.c',
+    'gc.c',
     'rx_poll.c',
     'rx_interrupt.c',
     'rx_adaptive.c',

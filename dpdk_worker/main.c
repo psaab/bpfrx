@@ -31,6 +31,10 @@ extern void rx_loop_poll(struct lcore_conf *conf);
 extern void rx_loop_interrupt(struct lcore_conf *conf);
 extern void rx_loop_adaptive(struct lcore_conf *conf);
 
+/* Session GC (gc.c) */
+extern int gc_sweep(struct shared_memory *shm);
+extern void gc_stats(struct shared_memory *shm, uint64_t *expired, uint64_t *scanned);
+
 /* RX loop dispatch table */
 typedef void (*rx_loop_fn)(struct lcore_conf *conf);
 
@@ -789,11 +793,28 @@ main(int argc, char **argv)
 		}
 	}
 
-	printf("DPDK worker started, waiting for shutdown signal...\n");
+	printf("DPDK worker started (session GC active on main lcore)\n");
 
-	/* Main lcore waits for all workers */
+	/* Main lcore: run session GC while workers process packets */
+	while (!g_force_quit) {
+		int deleted = gc_sweep(g_shm);
+		if (deleted == 0) {
+			/* No work — sleep briefly to avoid busy-wait */
+			rte_delay_us_sleep(10000);  /* 10ms */
+		}
+	}
+
+	/* Wait for all workers to finish */
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
 		rte_eal_wait_lcore(lcore_id);
+	}
+
+	/* Print GC stats */
+	{
+		uint64_t gc_expired, gc_scanned;
+		gc_stats(g_shm, &gc_expired, &gc_scanned);
+		printf("Session GC: %lu expired, %lu scanned\n",
+		       gc_expired, gc_scanned);
 	}
 
 	/* Cleanup */
