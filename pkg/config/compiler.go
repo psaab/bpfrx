@@ -3131,6 +3131,10 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			if len(child.Keys) >= 2 {
 				sys.HostName = child.Keys[1]
 			}
+		case "dataplane-type":
+			if len(child.Keys) >= 2 {
+				sys.DataplaneType = child.Keys[1]
+			}
 		case "domain-name":
 			if len(child.Keys) >= 2 {
 				sys.DomainName = child.Keys[1]

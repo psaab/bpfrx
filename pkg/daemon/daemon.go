@@ -136,11 +136,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 		enableForwarding()
 	}
 
-	// Load eBPF programs (unless in config-only mode)
+	// Create dataplane backend (unless in config-only mode)
 	if !d.opts.NoDataplane {
-		d.dp = dataplane.New()
+		dpType := ""
+		if cfg := d.store.ActiveConfig(); cfg != nil {
+			dpType = cfg.System.DataplaneType
+		}
+		dp, err := dataplane.NewDataPlane(dpType)
+		if err != nil {
+			slog.Error("failed to create dataplane", "type", dpType, "err", err)
+			return fmt.Errorf("create dataplane: %w", err)
+		}
+		d.dp = dp
 		if err := d.dp.Load(); err != nil {
-			slog.Warn("failed to load eBPF programs, running in config-only mode",
+			slog.Warn("failed to load dataplane programs, running in config-only mode",
 				"err", err)
 			d.dp = nil
 		} else {

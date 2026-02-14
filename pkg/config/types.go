@@ -120,6 +120,7 @@ type SystemConfig struct {
 	NoRedirects        bool     // disable ICMP redirects
 	BackupRouter       string   // backup default gateway IP
 	BackupRouterDst    string   // backup router destination prefix
+	DataplaneType      string   // "ebpf" (default) or "dpdk"
 	InternetOptions    *InternetOptionsConfig
 	Services           *SystemServicesConfig
 	Syslog             *SystemSyslogConfig

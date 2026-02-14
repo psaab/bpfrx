@@ -324,6 +324,13 @@ func (m *Manager) Close() error {
 	return nil
 }
 
+// Teardown performs a full teardown: closes handles then removes all
+// pinned BPF state. Use when switching dataplanes or decommissioning.
+func (m *Manager) Teardown() error {
+	m.Close()
+	return Cleanup()
+}
+
 // Cleanup removes all pinned BPF maps and links. This fully tears down
 // the dataplane — use when decommissioning, not during normal restarts.
 func Cleanup() error {

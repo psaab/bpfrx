@@ -1,12 +1,33 @@
 package dataplane
 
 import (
+	"fmt"
+
 	"github.com/cilium/ebpf"
 	"github.com/psaab/bpfrx/pkg/config"
 )
 
 // Compile-time assertion that Manager implements DataPlane.
 var _ DataPlane = (*Manager)(nil)
+
+// Dataplane type constants used in system { dataplane-type <type>; }.
+const (
+	TypeEBPF = "ebpf" // default
+	TypeDPDK = "dpdk"
+)
+
+// NewDataPlane creates a DataPlane backend based on the given type string.
+// An empty string defaults to eBPF.
+func NewDataPlane(dpType string) (DataPlane, error) {
+	switch dpType {
+	case "", TypeEBPF:
+		return New(), nil
+	case TypeDPDK:
+		return nil, fmt.Errorf("DPDK dataplane not yet implemented")
+	default:
+		return nil, fmt.Errorf("unknown dataplane type %q (valid: ebpf, dpdk)", dpType)
+	}
+}
 
 // DataPlane defines the abstract interface for a packet-processing dataplane.
 // The eBPF Manager is the primary implementation; a DPDK implementation can
@@ -16,6 +37,7 @@ type DataPlane interface {
 	Load() error
 	IsLoaded() bool
 	Close() error
+	Teardown() error // full teardown: detach programs, unpin maps, remove all BPF state
 
 	// Program attachment
 	AttachXDP(ifindex int, forceGeneric bool) error
