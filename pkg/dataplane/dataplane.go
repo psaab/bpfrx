@@ -140,6 +140,7 @@ type DataPlane interface {
 
 	// Counters
 	ReadGlobalCounter(index uint32) (uint64, error)
+	ReadFloodCounters(zoneID uint16) (FloodState, error)
 	ReadInterfaceCounters(ifindex int) (InterfaceCounterValue, error)
 	ReadZoneCounters(zoneID uint16, direction int) (CounterValue, error)
 	ReadPolicyCounters(policyID uint32) (CounterValue, error)

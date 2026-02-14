@@ -460,6 +460,25 @@ func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) {
 	return total, nil
 }
 
+// ReadFloodCounters reads the per-CPU flood state for a zone and sums them.
+func (m *Manager) ReadFloodCounters(zoneID uint16) (FloodState, error) {
+	zm, ok := m.maps["flood_counters"]
+	if !ok {
+		return FloodState{}, fmt.Errorf("flood_counters map not found")
+	}
+	var perCPU []FloodState
+	if err := zm.Lookup(uint32(zoneID), &perCPU); err != nil {
+		return FloodState{}, err
+	}
+	var total FloodState
+	for _, fs := range perCPU {
+		total.SynCount += fs.SynCount
+		total.ICMPCount += fs.ICMPCount
+		total.UDPCount += fs.UDPCount
+	}
+	return total, nil
+}
+
 // ReadInterfaceCounters reads the per-CPU interface counter values and sums them.
 func (m *Manager) ReadInterfaceCounters(ifindex int) (InterfaceCounterValue, error) {
 	zm, ok := m.maps["interface_counters"]

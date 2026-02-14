@@ -1652,23 +1652,12 @@ func (c *CLI) showScreenStatistics(zoneName string) error {
 		fmt.Printf("Zone '%s' not found\n", zoneName)
 		return nil
 	}
-	floodMap := c.dp.Map("flood_counters")
-	if floodMap == nil {
-		fmt.Println("flood_counters map not available")
-		return nil
-	}
-	key := uint32(zoneID)
-	var perCPU []dataplane.FloodState
-	if err := floodMap.Lookup(key, &perCPU); err != nil {
+	fs, err := c.dp.ReadFloodCounters(zoneID)
+	if err != nil {
 		fmt.Printf("Error reading flood counters: %v\n", err)
 		return nil
 	}
-	var totalSyn, totalICMP, totalUDP uint64
-	for _, fs := range perCPU {
-		totalSyn += fs.SynCount
-		totalICMP += fs.ICMPCount
-		totalUDP += fs.UDPCount
-	}
+	totalSyn, totalICMP, totalUDP := fs.SynCount, fs.ICMPCount, fs.UDPCount
 	screenProfile := ""
 	if z, ok := cfg.Security.Zones[zoneName]; ok {
 		screenProfile = z.ScreenProfile

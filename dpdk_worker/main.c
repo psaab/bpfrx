@@ -666,6 +666,24 @@ counters_clear_latency(void)
 	}
 }
 
+void
+counters_aggregate_flood(uint32_t zone_id,
+                         uint64_t *syn, uint64_t *icmp, uint64_t *udp)
+{
+	*syn = *icmp = *udp = 0;
+
+	if (zone_id >= MAX_ZONES)
+		return;
+
+	for (unsigned i = 0; i < MAX_LCORES; i++) {
+		if (!lcore_counter_array[i])
+			continue;
+		*syn  += lcore_counter_array[i]->flood_states[zone_id].syn_count;
+		*icmp += lcore_counter_array[i]->flood_states[zone_id].icmp_count;
+		*udp  += lcore_counter_array[i]->flood_states[zone_id].udp_count;
+	}
+}
+
 /* ============================================================
  * Per-lcore main function
  * ============================================================ */

@@ -208,6 +208,10 @@ func (m *Manager) ClearFilterConfigs() error                                  { 
 
 func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) { return 0, nil }
 
+func (m *Manager) ReadFloodCounters(zoneID uint16) (dataplane.FloodState, error) {
+	return dataplane.FloodState{}, nil
+}
+
 func (m *Manager) ReadInterfaceCounters(ifindex int) (dataplane.InterfaceCounterValue, error) {
 	return dataplane.InterfaceCounterValue{}, nil
 }

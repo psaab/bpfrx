@@ -2814,35 +2814,22 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 				if !ok {
 					fmt.Fprintf(&buf, "Zone '%s' not found\n", zoneName)
 				} else {
-					floodMap := s.dp.Map("flood_counters")
-					if floodMap == nil {
-						buf.WriteString("flood_counters map not available\n")
+					fs, err := s.dp.ReadFloodCounters(zoneID)
+					if err != nil {
+						fmt.Fprintf(&buf, "Error reading flood counters: %v\n", err)
 					} else {
-						key := uint32(zoneID)
-						var perCPU []dataplane.FloodState
-						if err := floodMap.Lookup(key, &perCPU); err != nil {
-							fmt.Fprintf(&buf, "Error reading flood counters: %v\n", err)
-						} else {
-							var totalSyn, totalICMP, totalUDP uint64
-							for _, fs := range perCPU {
-								totalSyn += fs.SynCount
-								totalICMP += fs.ICMPCount
-								totalUDP += fs.UDPCount
-							}
-							// Get screen profile name for this zone
-							screenProfile := ""
-							if z, ok := cfg.Security.Zones[zoneName]; ok {
-								screenProfile = z.ScreenProfile
-							}
-							fmt.Fprintf(&buf, "Screen statistics for zone '%s':\n", zoneName)
-							if screenProfile != "" {
-								fmt.Fprintf(&buf, "  Screen profile: %s\n", screenProfile)
-							}
-							fmt.Fprintf(&buf, "  %-30s %s\n", "Counter", "Value")
-							fmt.Fprintf(&buf, "  %-30s %d\n", "SYN flood events", totalSyn)
-							fmt.Fprintf(&buf, "  %-30s %d\n", "ICMP flood events", totalICMP)
-							fmt.Fprintf(&buf, "  %-30s %d\n", "UDP flood events", totalUDP)
+						screenProfile := ""
+						if z, ok := cfg.Security.Zones[zoneName]; ok {
+							screenProfile = z.ScreenProfile
 						}
+						fmt.Fprintf(&buf, "Screen statistics for zone '%s':\n", zoneName)
+						if screenProfile != "" {
+							fmt.Fprintf(&buf, "  Screen profile: %s\n", screenProfile)
+						}
+						fmt.Fprintf(&buf, "  %-30s %s\n", "Counter", "Value")
+						fmt.Fprintf(&buf, "  %-30s %d\n", "SYN flood events", fs.SynCount)
+						fmt.Fprintf(&buf, "  %-30s %d\n", "ICMP flood events", fs.ICMPCount)
+						fmt.Fprintf(&buf, "  %-30s %d\n", "UDP flood events", fs.UDPCount)
 					}
 				}
 			}

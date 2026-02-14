@@ -221,4 +221,10 @@ void counters_aggregate_latency(uint64_t *out);
  */
 void counters_clear_latency(void);
 
+/**
+ * Aggregate flood counters for a zone across all lcores.
+ */
+void counters_aggregate_flood(uint32_t zone_id,
+                              uint64_t *syn, uint64_t *icmp, uint64_t *udp);
+
 #endif /* DPDK_COUNTERS_H */

@@ -1117,6 +1117,19 @@ func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) {
 	return uint64(C.counters_aggregate_global(C.uint32_t(index))), nil
 }
 
+func (m *Manager) ReadFloodCounters(zoneID uint16) (dataplane.FloodState, error) {
+	if m.platform.shm == nil {
+		return dataplane.FloodState{}, fmt.Errorf("DPDK not initialized")
+	}
+	var syn, icmp, udp C.uint64_t
+	C.counters_aggregate_flood(C.uint32_t(zoneID), &syn, &icmp, &udp)
+	return dataplane.FloodState{
+		SynCount:  uint64(syn),
+		ICMPCount: uint64(icmp),
+		UDPCount:  uint64(udp),
+	}, nil
+}
+
 func (m *Manager) ReadInterfaceCounters(ifindex int) (dataplane.InterfaceCounterValue, error) {
 	shm := m.platform.shm
 	if shm == nil {
