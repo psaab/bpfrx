@@ -4649,7 +4649,22 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 		cluster := cfg.Chassis.Cluster
 		fmt.Fprintf(&buf, "Chassis cluster status:\n")
-		fmt.Fprintf(&buf, "  RETH count: %d\n\n", cluster.RethCount)
+		fmt.Fprintf(&buf, "  RETH count: %d\n", cluster.RethCount)
+		// Show RETH interface names
+		if s.routing != nil {
+			rethNames := s.routing.RethNames()
+			if len(rethNames) > 0 {
+				fmt.Fprintf(&buf, "  RETH interfaces: %s\n", strings.Join(rethNames, ", "))
+			}
+		}
+		fmt.Fprintln(&buf)
+
+		// Get live monitor statuses
+		var monStatuses map[int][]routing.InterfaceMonitorStatus
+		if s.routing != nil {
+			monStatuses = s.routing.InterfaceMonitorStatuses()
+		}
+
 		for _, rg := range cluster.RedundancyGroups {
 			fmt.Fprintf(&buf, "Redundancy group: %d\n", rg.ID)
 			for nodeID, priority := range rg.NodePriorities {
@@ -4658,7 +4673,17 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			if rg.GratuitousARPCount > 0 {
 				fmt.Fprintf(&buf, "  Gratuitous ARP count: %d\n", rg.GratuitousARPCount)
 			}
-			if len(rg.InterfaceMonitors) > 0 {
+			if statuses, ok := monStatuses[rg.ID]; ok && len(statuses) > 0 {
+				fmt.Fprintln(&buf, "  Interface monitors:")
+				for _, st := range statuses {
+					state := "Up"
+					if !st.Up {
+						state = "Down"
+					}
+					fmt.Fprintf(&buf, "    %-20s weight %-4d status %s\n",
+						st.Interface, st.Weight, state)
+				}
+			} else if len(rg.InterfaceMonitors) > 0 {
 				fmt.Fprintln(&buf, "  Interface monitors:")
 				for _, mon := range rg.InterfaceMonitors {
 					fmt.Fprintf(&buf, "    %-20s weight %d\n", mon.Interface, mon.Weight)
@@ -4748,6 +4773,9 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 		if len(cfg.System.NTPServers) > 0 {
 			fmt.Fprintf(&buf, "  NTP servers:    %s\n", strings.Join(cfg.System.NTPServers, ", "))
+		}
+		if cfg.Security.Log.Mode != "" {
+			fmt.Fprintf(&buf, "  Security log:   mode %s\n", cfg.Security.Log.Mode)
 		}
 		if len(cfg.Security.Log.Streams) > 0 {
 			fmt.Fprintf(&buf, "  Syslog:         %d stream(s)\n", len(cfg.Security.Log.Streams))

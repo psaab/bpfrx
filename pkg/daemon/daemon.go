@@ -707,6 +707,22 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
+	// 1.8. Create RETH (redundant ethernet) interfaces for chassis cluster.
+	if d.routing != nil {
+		hasReth := false
+		for _, ifc := range cfg.Interfaces.Interfaces {
+			if ifc.RedundantParent != "" {
+				hasReth = true
+				break
+			}
+		}
+		if hasReth {
+			if err := d.routing.ApplyRethInterfaces(cfg.Interfaces.Interfaces); err != nil {
+				slog.Warn("failed to apply RETH interfaces", "err", err)
+			}
+		}
+	}
+
 	// 2. Compile eBPF dataplane
 	var compileResult *dataplane.CompileResult
 	if d.dp != nil {
@@ -840,6 +856,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// 9. Apply system DNS and NTP configuration
 	d.applySystemDNS(cfg)
 	d.applySystemNTP(cfg)
+	d.applyDNSService(cfg)
 
 	// 9.5. Apply system hostname, timezone, and kernel tuning
 	d.applyHostname(cfg)
@@ -873,6 +890,12 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// 17. Update event-options policies (RPM-driven failover)
 	if d.eventEngine != nil {
 		d.eventEngine.Apply(cfg.EventOptions)
+	}
+
+	// 18. Update chassis cluster interface monitors
+	if d.routing != nil && cfg.Chassis.Cluster != nil &&
+		len(cfg.Chassis.Cluster.RedundancyGroups) > 0 {
+		d.routing.ApplyInterfaceMonitors(cfg.Chassis.Cluster.RedundancyGroups)
 	}
 }
 
@@ -1600,6 +1623,10 @@ func (d *Daemon) applySystemNTP(cfg *config.Config) {
 	if cfg.System.NTPThreshold > 0 {
 		fmt.Fprintf(&b, "RootDistanceMaxUSec=%dms\n", cfg.System.NTPThreshold)
 	}
+	// NTP threshold action: "reject" disables fallback NTP sources
+	if cfg.System.NTPThresholdAction == "reject" {
+		fmt.Fprintf(&b, "FallbackNTP=\n")
+	}
 	content := b.String()
 	confPath := "/etc/systemd/timesyncd.conf.d/bpfrx.conf"
 
@@ -1617,6 +1644,18 @@ func (d *Daemon) applySystemNTP(cfg *config.Config) {
 	// Restart timesyncd to pick up new servers
 	exec.Command("systemctl", "restart", "systemd-timesyncd").Run()
 	slog.Info("NTP config applied", "servers", cfg.System.NTPServers)
+}
+
+// applyDNSService manages systemd-resolved based on system { services { dns } }.
+func (d *Daemon) applyDNSService(cfg *config.Config) {
+	if cfg.System.Services == nil {
+		return
+	}
+	if cfg.System.Services.DNSEnabled {
+		exec.Command("systemctl", "enable", "--now", "systemd-resolved").Run()
+	} else {
+		exec.Command("systemctl", "disable", "--now", "systemd-resolved").Run()
+	}
 }
 
 // applyKernelTuning sets kernel sysctl parameters from config.
@@ -1822,6 +1861,25 @@ func (d *Daemon) applySyslogFiles(cfg *config.Config) {
 
 			content := fmt.Sprintf("# Managed by bpfrx — do not edit\n%s\t%s\n", selector, logPath)
 			confFile := prefix + f.Name + ".conf"
+			desired[confFile] = content
+		}
+		// Syslog user destinations: forward to logged-in users via rsyslog omusrmsg
+		for _, u := range cfg.System.Syslog.Users {
+			if u.User == "" {
+				continue
+			}
+			facility := u.Facility
+			if facility == "" || facility == "any" {
+				facility = "*"
+			}
+			severity := u.Severity
+			if severity == "" || severity == "any" {
+				severity = "*"
+			}
+			selector := fmt.Sprintf("%s.%s", facility, severity)
+			target := u.User // "*" means all logged-in users
+			content := fmt.Sprintf("# Managed by bpfrx — do not edit\n%s\t:omusrmsg:%s\n", selector, target)
+			confFile := prefix + "user-" + target + ".conf"
 			desired[confFile] = content
 		}
 	}

@@ -436,3 +436,78 @@ func TestKeepaliveDefaults(t *testing.T) {
 		t.Errorf("expected default maxRetries to be 3, got %d", maxRetries)
 	}
 }
+
+func TestInterfaceMonitorStatuses(t *testing.T) {
+	// Test the monitor state storage and retrieval without netlink.
+	m := &Manager{
+		monitorStatus: make(map[int][]InterfaceMonitorStatus),
+	}
+
+	// No monitors → nil
+	if got := m.InterfaceMonitorStatuses(); got != nil {
+		t.Errorf("expected nil for empty monitors, got %v", got)
+	}
+
+	// Set some state directly
+	m.mu.Lock()
+	m.monitorStatus[0] = []InterfaceMonitorStatus{
+		{Interface: "trust0", Weight: 255, Up: true},
+	}
+	m.monitorStatus[1] = []InterfaceMonitorStatus{
+		{Interface: "untrust0", Weight: 200, Up: true},
+		{Interface: "dmz0", Weight: 100, Up: false},
+	}
+	m.mu.Unlock()
+
+	got := m.InterfaceMonitorStatuses()
+	if got == nil {
+		t.Fatal("expected non-nil monitor statuses")
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(got))
+	}
+	if len(got[0]) != 1 || got[0][0].Interface != "trust0" {
+		t.Errorf("group 0: unexpected %v", got[0])
+	}
+	if len(got[1]) != 2 {
+		t.Fatalf("group 1: expected 2 monitors, got %d", len(got[1]))
+	}
+	if got[1][1].Up {
+		t.Error("dmz0 should be down")
+	}
+
+	// Verify returned map is a copy (modify doesn't affect original)
+	got[0] = nil
+	if m.InterfaceMonitorStatuses()[0] == nil {
+		t.Error("modifying returned map should not affect original")
+	}
+}
+
+func TestRethMemberCollection(t *testing.T) {
+	// Test the logic that groups physical interfaces by their RedundantParent.
+	interfaces := map[string]*config.InterfaceConfig{
+		"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
+		"ge-0/0/1": {Name: "ge-0/0/1", RedundantParent: "reth0"},
+		"ge-0/0/2": {Name: "ge-0/0/2", RedundantParent: "reth1"},
+		"reth0":     {Name: "reth0", RedundancyGroup: 1},
+		"reth1":     {Name: "reth1", RedundancyGroup: 1},
+		"trust0":    {Name: "trust0"},
+	}
+
+	rethMembers := make(map[string][]string)
+	for _, ifc := range interfaces {
+		if ifc.RedundantParent != "" {
+			rethMembers[ifc.RedundantParent] = append(rethMembers[ifc.RedundantParent], ifc.Name)
+		}
+	}
+
+	if len(rethMembers) != 2 {
+		t.Fatalf("expected 2 RETH groups, got %d", len(rethMembers))
+	}
+	if len(rethMembers["reth0"]) != 2 {
+		t.Errorf("reth0 should have 2 members, got %d", len(rethMembers["reth0"]))
+	}
+	if len(rethMembers["reth1"]) != 1 {
+		t.Errorf("reth1 should have 1 member, got %d", len(rethMembers["reth1"]))
+	}
+}

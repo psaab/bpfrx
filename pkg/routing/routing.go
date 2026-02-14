@@ -29,6 +29,13 @@ type KeepaliveState struct {
 	MaxRetries   int    // failures before declaring down
 }
 
+// InterfaceMonitorStatus tracks the link state of a monitored interface.
+type InterfaceMonitorStatus struct {
+	Interface string
+	Weight    int
+	Up        bool // true if link is operationally up
+}
+
 // Manager handles tunnel and VRF lifecycle.
 type Manager struct {
 	nlHandle   *netlink.Handle
@@ -36,7 +43,11 @@ type Manager struct {
 	vrfs       []string // currently created VRF device names
 	xfrmis     []string // currently created xfrmi interface names
 	bonds      []string // currently created bond interface names
+	reths      []string // currently created RETH interface names
 	keepalives map[string]*keepaliveRunner // tunnel name -> runner
+
+	mu             sync.Mutex
+	monitorStatus  map[int][]InterfaceMonitorStatus // redundancy-group ID -> monitor states
 }
 
 // keepaliveRunner manages the goroutine for a single tunnel's keepalive.
@@ -1208,4 +1219,156 @@ func (m *Manager) ClearBonds() error {
 	}
 	m.bonds = nil
 	return nil
+}
+
+// ApplyRethInterfaces creates Linux bond devices for RETH (Redundant Ethernet)
+// interfaces in a chassis cluster configuration. Physical interfaces with a
+// RedundantParent are enslaved to the named RETH bond.
+func (m *Manager) ApplyRethInterfaces(interfaces map[string]*config.InterfaceConfig) error {
+	// Clear previous RETH bonds first
+	if err := m.ClearRethInterfaces(); err != nil {
+		slog.Warn("failed to clear previous RETH interfaces", "err", err)
+	}
+
+	// Collect RETH names and their member physical interfaces.
+	// reth0 is a bond; ge-0/0/0 with redundant-parent reth0 becomes a member.
+	rethMembers := make(map[string][]string) // reth name -> member interface names
+	rethConfigs := make(map[string]*config.InterfaceConfig)
+	for _, ifc := range interfaces {
+		if ifc.RedundantParent != "" {
+			rethMembers[ifc.RedundantParent] = append(rethMembers[ifc.RedundantParent], ifc.Name)
+		}
+	}
+	for _, ifc := range interfaces {
+		if strings.HasPrefix(ifc.Name, "reth") {
+			rethConfigs[ifc.Name] = ifc
+		}
+	}
+
+	// Create each RETH bond device and enslave members
+	for rethName, members := range rethMembers {
+		// Check if bond already exists
+		if existing, err := m.nlHandle.LinkByName(rethName); err == nil {
+			m.nlHandle.LinkSetUp(existing)
+			m.reths = append(m.reths, rethName)
+			slog.Debug("RETH already exists", "name", rethName)
+			continue
+		}
+
+		bond := netlink.NewLinkBond(netlink.LinkAttrs{Name: rethName})
+		bond.Mode = netlink.BOND_MODE_ACTIVE_BACKUP // active-backup for HA
+		if rc, ok := rethConfigs[rethName]; ok && rc.MTU > 0 {
+			bond.LinkAttrs.MTU = rc.MTU
+		}
+		if err := m.nlHandle.LinkAdd(bond); err != nil {
+			slog.Warn("failed to create RETH", "name", rethName, "err", err)
+			continue
+		}
+
+		bondLink, err := m.nlHandle.LinkByName(rethName)
+		if err != nil {
+			slog.Warn("failed to find created RETH", "name", rethName, "err", err)
+			continue
+		}
+
+		sort.Strings(members) // deterministic order
+		for _, member := range members {
+			memberLink, err := m.nlHandle.LinkByName(member)
+			if err != nil {
+				slog.Warn("RETH member not found",
+					"reth", rethName, "member", member, "err", err)
+				continue
+			}
+			m.nlHandle.LinkSetDown(memberLink)
+			if err := m.nlHandle.LinkSetMaster(memberLink, bondLink); err != nil {
+				slog.Warn("failed to enslave RETH member",
+					"reth", rethName, "member", member, "err", err)
+				continue
+			}
+			m.nlHandle.LinkSetUp(memberLink)
+			slog.Info("RETH member added", "reth", rethName, "member", member)
+		}
+
+		if err := m.nlHandle.LinkSetUp(bondLink); err != nil {
+			slog.Warn("failed to bring up RETH", "name", rethName, "err", err)
+		}
+		m.reths = append(m.reths, rethName)
+		slog.Info("RETH created", "name", rethName,
+			"mode", "active-backup", "members", members)
+	}
+	return nil
+}
+
+// ClearRethInterfaces removes all previously created RETH bond devices.
+func (m *Manager) ClearRethInterfaces() error {
+	for _, name := range m.reths {
+		link, err := m.nlHandle.LinkByName(name)
+		if err != nil {
+			continue // already gone
+		}
+		if err := m.nlHandle.LinkDel(link); err != nil {
+			slog.Warn("failed to delete RETH", "name", name, "err", err)
+		} else {
+			slog.Info("RETH removed", "name", name)
+		}
+	}
+	m.reths = nil
+	return nil
+}
+
+// RethNames returns the names of currently managed RETH interfaces.
+func (m *Manager) RethNames() []string {
+	return m.reths
+}
+
+// ApplyInterfaceMonitors checks link state for monitored interfaces in each
+// redundancy group and stores the results for display.
+func (m *Manager) ApplyInterfaceMonitors(groups []*config.RedundancyGroup) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.monitorStatus = make(map[int][]InterfaceMonitorStatus)
+	for _, rg := range groups {
+		var statuses []InterfaceMonitorStatus
+		for _, mon := range rg.InterfaceMonitors {
+			up := false
+			link, err := m.nlHandle.LinkByName(mon.Interface)
+			if err == nil {
+				up = link.Attrs().OperState == netlink.OperUp ||
+					link.Attrs().Flags&net.FlagUp != 0
+			}
+			statuses = append(statuses, InterfaceMonitorStatus{
+				Interface: mon.Interface,
+				Weight:    mon.Weight,
+				Up:        up,
+			})
+			if !up {
+				slog.Warn("interface monitor: link down",
+					"redundancy_group", rg.ID,
+					"interface", mon.Interface,
+					"weight", mon.Weight)
+			}
+		}
+		if len(statuses) > 0 {
+			m.monitorStatus[rg.ID] = statuses
+		}
+	}
+}
+
+// InterfaceMonitorStatuses returns the current monitor state for all
+// redundancy groups. Returns nil if no monitors are configured.
+func (m *Manager) InterfaceMonitorStatuses() map[int][]InterfaceMonitorStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.monitorStatus) == 0 {
+		return nil
+	}
+	// Return a copy
+	result := make(map[int][]InterfaceMonitorStatus, len(m.monitorStatus))
+	for k, v := range m.monitorStatus {
+		cp := make([]InterfaceMonitorStatus, len(v))
+		copy(cp, v)
+		result[k] = cp
+	}
+	return result
 }

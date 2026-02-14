@@ -750,6 +750,10 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 		if len(ifc.FabricMembers) > 0 {
 			daemonOwned[name] = true
 		}
+		// RETH bond devices are created by the daemon
+		if strings.HasPrefix(name, "reth") {
+			daemonOwned[name] = true
+		}
 	}
 
 	allIfaces, _ := net.Interfaces()
