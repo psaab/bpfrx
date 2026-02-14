@@ -445,11 +445,18 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 		if ospf.ReferenceBandwidth > 0 {
 			fmt.Fprintf(&b, " auto-cost reference-bandwidth %d\n", ospf.ReferenceBandwidth)
 		}
+		if ospf.PassiveDefault {
+			b.WriteString(" passive-interface default\n")
+		}
 		for _, area := range ospf.Areas {
 			for _, iface := range area.Interfaces {
 				fmt.Fprintf(&b, " network %s area %s\n",
 					ifaceNetwork(iface.Name), area.ID)
-				if iface.Passive {
+				if ospf.PassiveDefault {
+					if iface.NoPassive {
+						fmt.Fprintf(&b, " no passive-interface %s\n", iface.Name)
+					}
+				} else if iface.Passive {
 					fmt.Fprintf(&b, " passive-interface %s\n", iface.Name)
 				}
 			}
@@ -471,10 +478,13 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 		// OSPF interface settings (cost, authentication, BFD)
 		for _, area := range ospf.Areas {
 			for _, iface := range area.Interfaces {
-				if iface.Cost > 0 || iface.AuthType != "" || iface.BFD {
+				if iface.Cost > 0 || iface.NetworkType != "" || iface.AuthType != "" || iface.BFD {
 					fmt.Fprintf(&b, "interface %s\n", iface.Name)
 					if iface.Cost > 0 {
 						fmt.Fprintf(&b, " ip ospf cost %d\n", iface.Cost)
+					}
+					if iface.NetworkType != "" {
+						fmt.Fprintf(&b, " ip ospf network %s\n", iface.NetworkType)
 					}
 					if iface.AuthType == "md5" {
 						b.WriteString(" ip ospf authentication message-digest\n")

@@ -1303,6 +1303,61 @@ func TestGenerateProtocols_OSPFReferenceBandwidth(t *testing.T) {
 	}
 }
 
+func TestGenerateProtocols_OSPFPassiveDefault(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		RouterID:       "1.1.1.1",
+		PassiveDefault: true,
+		Areas: []*config.OSPFArea{
+			{
+				ID: "0.0.0.0",
+				Interfaces: []*config.OSPFInterface{
+					{Name: "trust0", NoPassive: true},
+					{Name: "dmz0"},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, "", 0)
+	if !strings.Contains(got, "passive-interface default\n") {
+		t.Errorf("missing passive-interface default in:\n%s", got)
+	}
+	if !strings.Contains(got, "no passive-interface trust0\n") {
+		t.Errorf("missing 'no passive-interface trust0' in:\n%s", got)
+	}
+	// dmz0 should NOT have "no passive-interface" since it stays passive
+	if strings.Contains(got, "no passive-interface dmz0") {
+		t.Errorf("dmz0 should stay passive (no 'no passive-interface') in:\n%s", got)
+	}
+	// Should NOT have old-style "passive-interface dmz0" either
+	if strings.Contains(got, "passive-interface dmz0") {
+		t.Errorf("should not have per-interface passive when passive-default is set:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_OSPFNetworkType(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		Areas: []*config.OSPFArea{
+			{
+				ID: "0.0.0.0",
+				Interfaces: []*config.OSPFInterface{
+					{Name: "trust0", NetworkType: "point-to-point"},
+					{Name: "dmz0"},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, "", 0)
+	if !strings.Contains(got, "ip ospf network point-to-point\n") {
+		t.Errorf("missing 'ip ospf network point-to-point' in:\n%s", got)
+	}
+	// dmz0 should not have network type set
+	if strings.Contains(got, "ip ospf network broadcast") {
+		t.Errorf("dmz0 should not have network type set:\n%s", got)
+	}
+}
+
 func TestGenerateProtocols_BGPGracefulRestart(t *testing.T) {
 	m := New()
 	bgp := &config.BGPConfig{

@@ -8345,6 +8345,99 @@ func TestOSPFReferenceBandwidthSetSyntax(t *testing.T) {
 	}
 }
 
+func TestOSPFPassiveDefaultSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols ospf passive",
+		"set protocols ospf area 0.0.0.0 interface trust0 no-passive",
+		"set protocols ospf area 0.0.0.0 interface dmz0",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ospf := cfg.Protocols.OSPF
+	if ospf == nil {
+		t.Fatal("OSPF config is nil")
+	}
+	if !ospf.PassiveDefault {
+		t.Error("PassiveDefault should be true")
+	}
+	if len(ospf.Areas) != 1 {
+		t.Fatalf("expected 1 area, got %d", len(ospf.Areas))
+	}
+	area := ospf.Areas[0]
+	if len(area.Interfaces) != 2 {
+		t.Fatalf("expected 2 interfaces, got %d", len(area.Interfaces))
+	}
+	// trust0 should have NoPassive=true
+	var trust, dmz *OSPFInterface
+	for _, iface := range area.Interfaces {
+		switch iface.Name {
+		case "trust0":
+			trust = iface
+		case "dmz0":
+			dmz = iface
+		}
+	}
+	if trust == nil || !trust.NoPassive {
+		t.Error("trust0 should have NoPassive=true")
+	}
+	if dmz == nil || dmz.NoPassive {
+		t.Error("dmz0 should NOT have NoPassive set")
+	}
+}
+
+func TestOSPFNetworkTypeSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols ospf area 0.0.0.0 interface trust0 interface-type point-to-point",
+		"set protocols ospf area 0.0.0.0 interface dmz0",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ospf := cfg.Protocols.OSPF
+	if ospf == nil {
+		t.Fatal("OSPF config is nil")
+	}
+	area := ospf.Areas[0]
+	var trust, dmz *OSPFInterface
+	for _, iface := range area.Interfaces {
+		switch iface.Name {
+		case "trust0":
+			trust = iface
+		case "dmz0":
+			dmz = iface
+		}
+	}
+	if trust == nil || trust.NetworkType != "point-to-point" {
+		t.Errorf("trust0 NetworkType: got %q, want \"point-to-point\"", trust.NetworkType)
+	}
+	if dmz == nil || dmz.NetworkType != "" {
+		t.Errorf("dmz0 NetworkType: got %q, want \"\"", dmz.NetworkType)
+	}
+}
+
 func TestBGPGracefulRestartSetSyntax(t *testing.T) {
 	cmds := []string{
 		"set protocols bgp local-as 65001",

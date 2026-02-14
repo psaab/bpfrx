@@ -517,11 +517,14 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"ospf": {children: map[string]*schemaNode{
 			"router-id":           {args: 1, children: nil},
 			"reference-bandwidth": {args: 1, children: nil},
+			"passive":             {children: nil},
 			"export":              {args: 1, children: nil},
 			"area": {args: 1, children: map[string]*schemaNode{
 				"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
-					"passive": {children: nil},
-					"cost":    {args: 1, children: nil},
+					"passive":        {children: nil},
+					"no-passive":     {children: nil},
+					"interface-type": {args: 1, children: nil},
+					"cost":           {args: 1, children: nil},
 					"authentication": {children: map[string]*schemaNode{
 						"md5": {args: 1, children: map[string]*schemaNode{
 							"key": {args: 1, children: nil},
@@ -880,10 +883,13 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"protocols": {children: map[string]*schemaNode{
 			"ospf": {children: map[string]*schemaNode{
 				"reference-bandwidth": {args: 1, children: nil},
+				"passive":             {children: nil},
 				"area": {args: 1, children: map[string]*schemaNode{
 					"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
-						"passive": {children: nil},
-						"cost":    {args: 1, children: nil},
+						"passive":        {children: nil},
+						"no-passive":     {children: nil},
+						"interface-type": {args: 1, children: nil},
+						"cost":           {args: 1, children: nil},
 						"authentication": {children: map[string]*schemaNode{
 							"md5": {args: 1, children: map[string]*schemaNode{
 								"key": {args: 1, children: nil},

@@ -986,6 +986,7 @@ type RAPrefix struct {
 type OSPFConfig struct {
 	RouterID           string // e.g. "10.0.0.1"
 	ReferenceBandwidth int    // Mbps for auto-cost calculation (0 = FRR default 100)
+	PassiveDefault     bool   // all interfaces passive by default
 	Areas              []*OSPFArea
 	Export             []string // export policy names (future)
 }
@@ -1000,13 +1001,15 @@ type OSPFArea struct {
 
 // OSPFInterface defines an interface participating in OSPF.
 type OSPFInterface struct {
-	Name      string
-	Passive   bool   // passive interface (no hello)
-	Cost      int    // OSPF cost, 0 = default
-	AuthType  string // "md5", "simple", "" (none)
-	AuthKey   string // authentication key/password
-	AuthKeyID int    // key-id for MD5 (1-255)
-	BFD       bool   // enable BFD on this interface
+	Name        string
+	Passive     bool   // passive interface (no hello)
+	NoPassive   bool   // override passive-default (explicitly active)
+	Cost        int    // OSPF cost, 0 = default
+	NetworkType string // "point-to-point", "broadcast", "" (default)
+	AuthType    string // "md5", "simple", "" (none)
+	AuthKey     string // authentication key/password
+	AuthKeyID   int    // key-id for MD5 (1-255)
+	BFD         bool   // enable BFD on this interface
 }
 
 // BGPConfig holds BGP routing configuration.

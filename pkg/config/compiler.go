@@ -2269,7 +2269,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 	if ospfNode != nil {
 		proto.OSPF = &OSPFConfig{}
 
-		// Router ID and export policies at the ospf level
+		// Router ID, passive-default, and export policies at the ospf level
 		for _, child := range ospfNode.Children {
 			switch child.Name() {
 			case "router-id":
@@ -2282,6 +2282,8 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 						proto.OSPF.ReferenceBandwidth = n
 					}
 				}
+			case "passive":
+				proto.OSPF.PassiveDefault = true
 			case "export":
 				if len(child.Keys) >= 2 {
 					proto.OSPF.Export = append(proto.OSPF.Export, child.Keys[1])
@@ -2298,6 +2300,10 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 					switch prop.Name() {
 					case "passive":
 						iface.Passive = true
+					case "no-passive":
+						iface.NoPassive = true
+					case "interface-type":
+						iface.NetworkType = nodeVal(prop)
 					case "cost":
 						if v := nodeVal(prop); v != "" {
 							if n, err := strconv.Atoi(v); err == nil {
