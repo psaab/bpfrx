@@ -94,10 +94,18 @@ func main() {
 				return cleanLine, pos - 1, true
 			}
 			sort.Strings(resp.Candidates)
+			// Check if we're completing pipe filters
+			isPipe := strings.Contains(text, "|")
 			words := strings.Fields(text)
 			candidates := make([]cmdtree.Candidate, len(resp.Candidates))
 			for i, name := range resp.Candidates {
-				candidates[i] = cmdtree.Candidate{Name: name, Desc: remoteLookupDesc(words, name, c.configMode)}
+				desc := ""
+				if isPipe {
+					desc = pipeFilterDescs[name]
+				} else {
+					desc = remoteLookupDesc(words, name, c.configMode)
+				}
+				candidates[i] = cmdtree.Candidate{Name: name, Desc: desc}
 			}
 			cmdtree.WriteHelp(c.rl.Stdout(), candidates)
 			return cleanLine, pos - 1, true
@@ -2564,6 +2572,18 @@ func (c *ctl) handleRequestSecurity(args []string) error {
 
 // --- Tab completion ---
 
+// pipeFilterDescs maps pipe filter names to descriptions for ? help.
+var pipeFilterDescs = map[string]string{
+	"count":   "Count occurrences",
+	"display": "Show additional kinds of information",
+	"except":  "Show only text that does not match a pattern",
+	"find":    "Search for first occurrence of pattern",
+	"grep":    "Show only text that matches a pattern",
+	"last":    "Display end of output only",
+	"match":   "Show only text that matches a pattern",
+	"no-more": "Don't paginate output",
+}
+
 type remoteCompleter struct {
 	ctl *ctl
 }
@@ -2583,11 +2603,22 @@ func (rc *remoteCompleter) Do(line []rune, pos int) ([][]rune, int) {
 		return nil, 0
 	}
 
-	words := strings.Fields(text)
-	trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
+	// Determine partial: for pipe filters, partial is text after "| "
+	isPipe := strings.Contains(text, "|")
 	var partial string
-	if !trailingSpace && len(words) > 0 {
-		partial = words[len(words)-1]
+	if isPipe {
+		idx := strings.LastIndex(text, "|")
+		after := strings.TrimLeft(text[idx+1:], " ")
+		trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
+		if !trailingSpace && after != "" {
+			partial = after
+		}
+	} else {
+		words := strings.Fields(text)
+		trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
+		if !trailingSpace && len(words) > 0 {
+			partial = words[len(words)-1]
+		}
 	}
 
 	sort.Strings(resp.Candidates)
@@ -2598,9 +2629,16 @@ func (rc *remoteCompleter) Do(line []rune, pos int) ([][]rune, int) {
 	}
 
 	// Multiple matches: show descriptions above prompt.
+	words := strings.Fields(text)
 	candidates := make([]cmdtree.Candidate, len(resp.Candidates))
 	for i, name := range resp.Candidates {
-		candidates[i] = cmdtree.Candidate{Name: name, Desc: remoteLookupDesc(words, name, rc.ctl.configMode)}
+		desc := ""
+		if isPipe {
+			desc = pipeFilterDescs[name]
+		} else {
+			desc = remoteLookupDesc(words, name, rc.ctl.configMode)
+		}
+		candidates[i] = cmdtree.Candidate{Name: name, Desc: desc}
 	}
 	cmdtree.WriteHelp(rc.ctl.rl.Stdout(), candidates)
 

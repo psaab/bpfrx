@@ -95,3 +95,45 @@ func treeHelpCandidates(tree map[string]*completionNode) []completionCandidate {
 func commonPrefix(items []string) string {
 	return cmdtree.CommonPrefix(items)
 }
+
+// pipeFilters defines the available pipe filter names and descriptions.
+var pipeFilters = []completionCandidate{
+	{name: "count", desc: "Count occurrences"},
+	{name: "display", desc: "Show additional kinds of information"},
+	{name: "except", desc: "Show only text that does not match a pattern"},
+	{name: "find", desc: "Search for first occurrence of pattern"},
+	{name: "grep", desc: "Show only text that matches a pattern"},
+	{name: "last", desc: "Display end of output only"},
+	{name: "match", desc: "Show only text that matches a pattern"},
+	{name: "no-more", desc: "Don't paginate output"},
+}
+
+// completePipeFilter returns pipe filter candidates matching the partial prefix.
+// Returns nil if the line doesn't contain a pipe.
+func completePipeFilter(text string) (candidates []completionCandidate, handled bool) {
+	idx := strings.LastIndex(text, "|")
+	if idx < 0 {
+		return nil, false
+	}
+	after := strings.TrimSpace(text[idx+1:])
+	trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
+
+	// Right after "|" or "| " — show all filters
+	if after == "" || (trailingSpace && after == "") {
+		return pipeFilters, true
+	}
+
+	// If trailing space, user has already typed a complete filter name —
+	// no more completion (the filter argument is freeform text).
+	if trailingSpace {
+		return nil, true
+	}
+
+	// Partial filter name typed
+	for _, f := range pipeFilters {
+		if strings.HasPrefix(f.name, after) {
+			candidates = append(candidates, f)
+		}
+	}
+	return candidates, true
+}

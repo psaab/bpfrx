@@ -2105,6 +2105,12 @@ func (s *Server) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Compl
 		text = text[:req.Pos]
 	}
 
+	// Pipe filter completion: "show ... | <tab>"
+	if candidates := s.completePipeFilter(text); candidates != nil {
+		sort.Strings(candidates)
+		return &pb.CompleteResponse{Candidates: candidates}, nil
+	}
+
 	words := strings.Fields(text)
 	trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
 
@@ -2123,6 +2129,39 @@ func (s *Server) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Compl
 
 	sort.Strings(candidates)
 	return &pb.CompleteResponse{Candidates: candidates}, nil
+}
+
+// pipeFilterNames lists available pipe filters for completion.
+var pipeFilterNames = []string{"count", "display", "except", "find", "grep", "last", "match", "no-more"}
+
+// completePipeFilter returns pipe filter candidates if the text contains "|".
+// Returns nil if no pipe is present (caller should proceed with normal completion).
+func (s *Server) completePipeFilter(text string) []string {
+	idx := strings.LastIndex(text, "|")
+	if idx < 0 {
+		return nil
+	}
+	after := strings.TrimSpace(text[idx+1:])
+	trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
+
+	// Right after "|" or "| " — all filters
+	if after == "" || (trailingSpace && after == "") {
+		return pipeFilterNames
+	}
+
+	// User has typed a complete filter + space — no more completions (freeform arg)
+	if trailingSpace {
+		return []string{}
+	}
+
+	// Partial filter name
+	var candidates []string
+	for _, f := range pipeFilterNames {
+		if strings.HasPrefix(f, after) {
+			candidates = append(candidates, f)
+		}
+	}
+	return candidates
 }
 
 func (s *Server) completeOperational(words []string, partial string) []string {

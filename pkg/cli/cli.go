@@ -167,6 +167,35 @@ type cliCompleter struct {
 
 func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
 	text := string(line[:pos])
+
+	// Pipe filter completion: "show ... | <tab>"
+	if pipeCandidates, handled := completePipeFilter(text); handled {
+		if len(pipeCandidates) == 0 {
+			return nil, 0
+		}
+		// Determine partial (text after "| ")
+		idx := strings.LastIndex(text, "|")
+		after := strings.TrimLeft(text[idx+1:], " ")
+		partial := after
+
+		sort.Slice(pipeCandidates, func(i, j int) bool { return pipeCandidates[i].name < pipeCandidates[j].name })
+		if len(pipeCandidates) == 1 {
+			suffix := pipeCandidates[0].name[len(partial):]
+			return [][]rune{[]rune(suffix + " ")}, len(partial)
+		}
+		writeCompletionHelp(cc.cli.rl.Stdout(), pipeCandidates)
+		names := make([]string, len(pipeCandidates))
+		for i, c := range pipeCandidates {
+			names[i] = c.name
+		}
+		cp := commonPrefix(names)
+		suffix := cp[len(partial):]
+		if suffix == "" {
+			return nil, 0
+		}
+		return [][]rune{[]rune(suffix)}, len(partial)
+	}
+
 	words := strings.Fields(text)
 	trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
 
@@ -328,6 +357,15 @@ func (c *CLI) Run() error {
 			cleanLine = append(cleanLine, line[pos:]...)
 			// Parse words from text before cursor.
 			text := string(cleanLine[:pos-1])
+
+			// Pipe filter help: "show ... | ?"
+			if pipeCandidates, handled := completePipeFilter(text + " "); handled {
+				if len(pipeCandidates) > 0 {
+					writeCompletionHelp(c.rl.Stdout(), pipeCandidates)
+				}
+				return cleanLine, pos - 1, true
+			}
+
 			words := strings.Fields(text)
 			trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
 			var partial string
