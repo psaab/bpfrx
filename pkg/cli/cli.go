@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -894,6 +895,9 @@ func (c *CLI) handleShow(args []string) error {
 
 	case "vlans":
 		return c.showVlans()
+
+	case "task":
+		return c.showTask()
 
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
@@ -3167,10 +3171,22 @@ func (c *CLI) handleClear(args []string) error {
 		return c.handleClearFirewall(args[1:])
 	case "dhcp":
 		return c.handleClearDHCP(args[1:])
+	case "interfaces":
+		return c.handleClearInterfaces(args[1:])
 	default:
 		showHelp()
 		return nil
 	}
+}
+
+func (c *CLI) handleClearInterfaces(args []string) error {
+	if len(args) >= 1 && args[0] == "statistics" {
+		fmt.Println("Interface statistics counters noted")
+		fmt.Println("(kernel counters are cumulative and cannot be reset)")
+		return nil
+	}
+	cmdtree.PrintTreeHelp("clear interfaces:", operationalTree, "clear", "interfaces")
+	return nil
 }
 
 func (c *CLI) handleClearArp() error {
@@ -4905,6 +4921,14 @@ func (c *CLI) showOSPF(args []string) error {
 
 	switch args[0] {
 	case "neighbor":
+		if len(args) >= 2 && args[1] == "detail" {
+			output, err := c.frr.GetOSPFNeighborDetail()
+			if err != nil {
+				return fmt.Errorf("OSPF neighbor detail: %w", err)
+			}
+			fmt.Print(output)
+			return nil
+		}
 		neighbors, err := c.frr.GetOSPFNeighbors()
 		if err != nil {
 			return fmt.Errorf("OSPF neighbors: %w", err)
@@ -5400,6 +5424,10 @@ func (c *CLI) showInterfaces(args []string) error {
 	// Handle "show interfaces extensive" sub-command
 	if len(args) > 0 && args[0] == "extensive" {
 		return c.showInterfacesExtensive()
+	}
+	// Handle "show interfaces statistics" sub-command
+	if len(args) > 0 && args[0] == "statistics" {
+		return c.showInterfacesStatistics()
 	}
 
 	// Handle "show interfaces <name> detail"
@@ -6115,6 +6143,36 @@ func (c *CLI) showInterfacesExtensive() error {
 	return nil
 }
 
+func (c *CLI) showInterfacesStatistics() error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("listing links: %w", err)
+	}
+
+	sort.Slice(links, func(i, j int) bool {
+		return links[i].Attrs().Name < links[j].Attrs().Name
+	})
+
+	fmt.Printf("%-16s %15s %15s %15s %15s %10s %10s\n",
+		"Interface", "Input packets", "Input bytes", "Output packets", "Output bytes", "In errors", "Out errors")
+
+	for _, l := range links {
+		name := l.Attrs().Name
+		if name == "lo" || strings.HasPrefix(name, "vrf-") ||
+			strings.HasPrefix(name, "xfrm") || strings.HasPrefix(name, "gre-") {
+			continue
+		}
+		stats := l.Attrs().Statistics
+		if stats == nil {
+			continue
+		}
+		fmt.Printf("%-16s %15d %15d %15d %15d %10d %10d\n",
+			name, stats.RxPackets, stats.RxBytes, stats.TxPackets, stats.TxBytes,
+			stats.RxErrors, stats.TxErrors)
+	}
+	return nil
+}
+
 // readLinkSpeed reads the link speed in Mbps from sysfs. Returns 0 on error.
 func readLinkSpeed(ifaceName string) int {
 	data, err := os.ReadFile("/sys/class/net/" + ifaceName + "/speed")
@@ -6287,6 +6345,9 @@ func (c *CLI) handleShowSystem(args []string) error {
 	case "connections":
 		return c.showSystemConnections()
 
+	case "core-dumps":
+		return c.showCoreDumps()
+
 	case "license":
 		fmt.Println("License: open-source (no license required)")
 		return nil
@@ -6396,6 +6457,45 @@ func (c *CLI) showSystemBuffers() error {
 	if v4 > 0 || v6 > 0 {
 		fmt.Printf("\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
 	}
+	return nil
+}
+
+func (c *CLI) showCoreDumps() error {
+	dirs := []string{"/var/crash", "/var/lib/systemd/coredump"}
+	var found bool
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if !found {
+				fmt.Printf("%-40s %-20s %10s\n", "Name", "Date", "Size")
+				found = true
+			}
+			fmt.Printf("%-40s %-20s %10d\n", e.Name(), info.ModTime().Format("2006-01-02 15:04:05"), info.Size())
+		}
+	}
+	if !found {
+		fmt.Println("No core dumps found")
+	}
+	return nil
+}
+
+func (c *CLI) showTask() error {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	uptime := time.Since(c.startTime).Truncate(time.Second)
+	fmt.Println("Task: bpfrxd daemon")
+	fmt.Printf("  Goroutines: %d\n", runtime.NumGoroutine())
+	fmt.Printf("  Memory allocated: %.1f MB\n", float64(m.Alloc)/1024/1024)
+	fmt.Printf("  System memory: %.1f MB\n", float64(m.Sys)/1024/1024)
+	fmt.Printf("  GC cycles: %d\n", m.NumGC)
+	fmt.Printf("  Uptime: %s\n", uptime)
 	return nil
 }
 
@@ -7807,6 +7907,14 @@ func (c *CLI) showISIS(args []string) error {
 
 	switch args[0] {
 	case "adjacency":
+		if len(args) >= 2 && args[1] == "detail" {
+			output, err := c.frr.GetISISAdjacencyDetail()
+			if err != nil {
+				return fmt.Errorf("IS-IS adjacency detail: %w", err)
+			}
+			fmt.Print(output)
+			return nil
+		}
 		adjs, err := c.frr.GetISISAdjacency()
 		if err != nil {
 			return fmt.Errorf("IS-IS adjacency: %w", err)
@@ -9990,6 +10098,19 @@ func (c *CLI) handleRequestSystem(args []string) error {
 		}
 		fmt.Println("System halting NOW!")
 		cmd := exec.Command("systemctl", "halt")
+		return cmd.Run()
+
+	case "power-off":
+		fmt.Print("Power off the system? [yes,no] (no) ")
+		c.rl.SetPrompt("")
+		line, err := c.rl.Readline()
+		c.rl.SetPrompt(c.operationalPrompt())
+		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+			fmt.Println("Power-off cancelled")
+			return nil
+		}
+		fmt.Println("System powering off NOW!")
+		cmd := exec.Command("systemctl", "poweroff")
 		return cmd.Run()
 
 	case "zeroize":

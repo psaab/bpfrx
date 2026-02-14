@@ -184,6 +184,11 @@ func (m *Manager) GetISISAdjacency() ([]ISISAdjacency, error) {
 	return adjs, nil
 }
 
+// GetISISAdjacencyDetail returns detailed IS-IS adjacency output.
+func (m *Manager) GetISISAdjacencyDetail() (string, error) {
+	return vtyshCmd("show isis neighbor detail")
+}
+
 // GetISISDatabase returns raw IS-IS link-state database output.
 func (m *Manager) GetISISDatabase() (string, error) {
 	return vtyshCmd("show isis database detail")
@@ -893,6 +898,11 @@ func (m *Manager) GetOSPFNeighbors() ([]OSPFNeighbor, error) {
 		neighbors = append(neighbors, n)
 	}
 	return neighbors, nil
+}
+
+// GetOSPFNeighborDetail returns detailed OSPF neighbor output.
+func (m *Manager) GetOSPFNeighborDetail() (string, error) {
+	return vtyshCmd("show ip ospf neighbor detail")
 }
 
 // GetOSPFDatabase returns raw OSPF database output.

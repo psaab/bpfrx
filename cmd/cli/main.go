@@ -585,6 +585,9 @@ func (c *ctl) handleShow(args []string) error {
 	case "vlans":
 		return c.showText("vlans")
 
+	case "task":
+		return c.showText("task")
+
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
 	}
@@ -1514,6 +1517,9 @@ func (c *ctl) showInterfaces(args []string) error {
 	if len(args) > 0 && args[0] == "extensive" {
 		return c.showText("interfaces-extensive")
 	}
+	if len(args) > 0 && args[0] == "statistics" {
+		return c.showText("interfaces-statistics")
+	}
 	if len(args) > 0 && args[0] == "detail" {
 		return c.showText("interfaces-detail")
 	}
@@ -1618,6 +1624,9 @@ func (c *ctl) handleShowProtocols(args []string) error {
 		typ := "neighbor"
 		if len(args) >= 2 {
 			typ = args[1]
+			if typ == "neighbor" && len(args) >= 3 && args[2] == "detail" {
+				typ = "neighbor-detail"
+			}
 		}
 		resp, err := c.client.GetOSPFStatus(context.Background(), &pb.GetOSPFStatusRequest{Type: typ})
 		if err != nil {
@@ -1671,6 +1680,9 @@ func (c *ctl) handleShowProtocols(args []string) error {
 		typ := "adjacency"
 		if len(args) >= 2 {
 			typ = args[1]
+			if typ == "adjacency" && len(args) >= 3 && args[2] == "detail" {
+				typ = "adjacency-detail"
+			}
 		}
 		resp, err := c.client.GetISISStatus(context.Background(), &pb.GetISISStatusRequest{Type: typ})
 		if err != nil {
@@ -1818,6 +1830,9 @@ func (c *ctl) handleShowSystem(args []string) error {
 	case "buffers":
 		return c.showText("buffers")
 
+	case "core-dumps":
+		return c.showText("core-dumps")
+
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])
 	}
@@ -1924,10 +1939,27 @@ func (c *ctl) handleClear(args []string) error {
 		return c.handleClearFirewall(args[1:])
 	case "dhcp":
 		return c.handleClearDHCP(args[1:])
+	case "interfaces":
+		return c.handleClearInterfaces(args[1:])
 	default:
 		showHelp()
 		return nil
 	}
+}
+
+func (c *ctl) handleClearInterfaces(args []string) error {
+	if len(args) >= 1 && args[0] == "statistics" {
+		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+			Action: "clear-interfaces-statistics",
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Message)
+		return nil
+	}
+	printRemoteTreeHelp("clear interfaces:", "clear", "interfaces")
+	return nil
 }
 
 func (c *ctl) handleClearArp() error {
@@ -2162,7 +2194,7 @@ func (c *ctl) handleRequest(args []string) error {
 	}
 
 	switch args[1] {
-	case "reboot", "halt":
+	case "reboot", "halt", "power-off":
 		fmt.Printf("%s the system? [yes,no] (no) ", strings.Title(args[1]))
 		c.rl.SetPrompt("")
 		line, err := c.rl.Readline()

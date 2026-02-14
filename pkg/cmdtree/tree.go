@@ -231,12 +231,15 @@ var OperationalTree = map[string]*Node{
 		}, Children: map[string]*Node{
 			"terse":     {Desc: "Show interface summary"},
 			"detail":    {Desc: "Show interface detail"},
-			"extensive": {Desc: "Show detailed interface statistics"},
-			"tunnel":    {Desc: "Show tunnel interfaces"},
+			"extensive":  {Desc: "Show detailed interface statistics"},
+			"statistics": {Desc: "Show interface traffic statistics"},
+			"tunnel":     {Desc: "Show tunnel interfaces"},
 		}},
 		"protocols": {Desc: "Show protocol information", Children: map[string]*Node{
 			"ospf": {Desc: "Show OSPF information", Children: map[string]*Node{
-				"neighbor":  {Desc: "Show OSPF neighbors"},
+				"neighbor": {Desc: "Show OSPF neighbors", Children: map[string]*Node{
+					"detail": {Desc: "Show detailed OSPF neighbor information"},
+				}},
 				"database":  {Desc: "Show OSPF database"},
 				"interface": {Desc: "Show OSPF interface details"},
 				"routes":    {Desc: "Show OSPF routes"},
@@ -254,9 +257,11 @@ var OperationalTree = map[string]*Node{
 			}},
 			"rip":  {Desc: "Show RIP information"},
 			"isis": {Desc: "Show IS-IS information", Children: map[string]*Node{
-				"adjacency": {Desc: "Show IS-IS adjacencies"},
-				"database":  {Desc: "Show IS-IS link-state database"},
-				"routes":    {Desc: "Show IS-IS routes"},
+				"adjacency": {Desc: "Show IS-IS adjacencies", Children: map[string]*Node{
+					"detail": {Desc: "Show detailed IS-IS adjacency information"},
+				}},
+				"database": {Desc: "Show IS-IS link-state database"},
+				"routes":   {Desc: "Show IS-IS routes"},
 			}},
 			"lldp": {Desc: "Show LLDP protocol status", Children: map[string]*Node{
 				"neighbors": {Desc: "Show LLDP neighbors"},
@@ -283,6 +288,7 @@ var OperationalTree = map[string]*Node{
 				"history": {Desc: "Show recent commit log"},
 			}},
 			"connections":   {Desc: "Show system TCP connections"},
+			"core-dumps":    {Desc: "Show system core dumps"},
 			"rollback": {Desc: "Show rollback history", Children: map[string]*Node{
 				"compare": {Desc: "Compare rollback with active config"},
 			}},
@@ -304,6 +310,7 @@ var OperationalTree = map[string]*Node{
 			"uptime":             {Desc: "Show system uptime"},
 			"users":              {Desc: "Show configured login users"},
 		}},
+		"task": {Desc: "Show daemon task/runtime information"},
 		"route-map":          {Desc: "Show route-map information"},
 		"routing-options":    {Desc: "Show routing options"},
 		"routing-instances": {Desc: "Show routing instances", Children: map[string]*Node{
@@ -324,6 +331,9 @@ var OperationalTree = map[string]*Node{
 	}},
 	"clear": {Desc: "Clear information", Children: map[string]*Node{
 		"arp": {Desc: "Clear ARP table"},
+		"interfaces": {Desc: "Clear interface information", Children: map[string]*Node{
+			"statistics": {Desc: "Clear interface statistics counters"},
+		}},
 		"ipv6": {Desc: "Clear IPv6 information", Children: map[string]*Node{
 			"neighbors": {Desc: "Clear IPv6 neighbor cache"},
 		}},
@@ -369,9 +379,10 @@ var OperationalTree = map[string]*Node{
 			}},
 		}},
 		"system": {Desc: "System operations", Children: map[string]*Node{
-			"reboot":  {Desc: "Reboot the system"},
-			"halt":    {Desc: "Halt the system"},
-			"zeroize": {Desc: "Factory reset (erase all config)"},
+			"reboot":    {Desc: "Reboot the system"},
+			"halt":      {Desc: "Halt the system"},
+			"power-off": {Desc: "Power off the system"},
+			"zeroize":   {Desc: "Factory reset (erase all config)"},
 			"configuration": {Desc: "Manage configuration", Children: map[string]*Node{
 				"rescue": {Desc: "Rescue configuration", Children: map[string]*Node{
 					"save":   {Desc: "Save rescue configuration"},

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -1523,6 +1524,8 @@ func (s *Server) GetOSPFStatus(_ context.Context, req *pb.GetOSPFStatusRequest) 
 	var output string
 	var err error
 	switch req.Type {
+	case "neighbor-detail":
+		output, err = s.frr.GetOSPFNeighborDetail()
 	case "database":
 		output, err = s.frr.GetOSPFDatabase()
 	case "interface":
@@ -1671,6 +1674,12 @@ func (s *Server) GetISISStatus(_ context.Context, req *pb.GetISISStatusRequest) 
 	}
 	var b strings.Builder
 	switch req.Type {
+	case "adjacency-detail":
+		output, err := s.frr.GetISISAdjacencyDetail()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
+		b.WriteString(output)
 	case "routes":
 		output, err := s.frr.GetISISRoutes()
 		if err != nil {
@@ -5202,6 +5211,31 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			fmt.Fprintln(&buf)
 		}
 
+	case "interfaces-statistics":
+		linksList, err := netlink.LinkList()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "listing interfaces: %v", err)
+		}
+		sort.Slice(linksList, func(i, j int) bool {
+			return linksList[i].Attrs().Name < linksList[j].Attrs().Name
+		})
+		fmt.Fprintf(&buf, "%-16s %15s %15s %15s %15s %10s %10s\n",
+			"Interface", "Input packets", "Input bytes", "Output packets", "Output bytes", "In errors", "Out errors")
+		for _, link := range linksList {
+			name := link.Attrs().Name
+			if name == "lo" || strings.HasPrefix(name, "vrf-") ||
+				strings.HasPrefix(name, "xfrm") || strings.HasPrefix(name, "gre-") {
+				continue
+			}
+			st := link.Attrs().Statistics
+			if st == nil {
+				continue
+			}
+			fmt.Fprintf(&buf, "%-16s %15d %15d %15d %15d %10d %10d\n",
+				name, st.RxPackets, st.RxBytes, st.TxPackets, st.TxBytes,
+				st.RxErrors, st.TxErrors)
+		}
+
 	case "policies-hit-count":
 		cfg := s.store.ActiveConfig()
 		if cfg == nil {
@@ -6358,6 +6392,41 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			}
 		}
 
+	case "core-dumps":
+		dirs := []string{"/var/crash", "/var/lib/systemd/coredump"}
+		var found bool
+		for _, dir := range dirs {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				continue
+			}
+			for _, e := range entries {
+				info, err := e.Info()
+				if err != nil {
+					continue
+				}
+				if !found {
+					fmt.Fprintf(&buf, "%-40s %-20s %10s\n", "Name", "Date", "Size")
+					found = true
+				}
+				fmt.Fprintf(&buf, "%-40s %-20s %10d\n", e.Name(), info.ModTime().Format("2006-01-02 15:04:05"), info.Size())
+			}
+		}
+		if !found {
+			buf.WriteString("No core dumps found\n")
+		}
+
+	case "task":
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		uptime := time.Since(s.startTime).Truncate(time.Second)
+		buf.WriteString("Task: bpfrxd daemon\n")
+		fmt.Fprintf(&buf, "  Goroutines: %d\n", runtime.NumGoroutine())
+		fmt.Fprintf(&buf, "  Memory allocated: %.1f MB\n", float64(m.Alloc)/1024/1024)
+		fmt.Fprintf(&buf, "  System memory: %.1f MB\n", float64(m.Sys)/1024/1024)
+		fmt.Fprintf(&buf, "  GC cycles: %d\n", m.NumGC)
+		fmt.Fprintf(&buf, "  Uptime: %s\n", uptime)
+
 	default:
 		// Handle "log:<filename>[:<count>]" for syslog file destinations
 		if strings.HasPrefix(req.Topic, "log:") {
@@ -6665,6 +6734,14 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 		}()
 		return &pb.SystemActionResponse{Message: "System halting NOW!"}, nil
 
+	case "power-off":
+		slog.Warn("system power-off requested via gRPC")
+		go func() {
+			time.Sleep(1 * time.Second)
+			exec.Command("systemctl", "poweroff").Run()
+		}()
+		return &pb.SystemActionResponse{Message: "System powering off NOW!"}, nil
+
 	case "zeroize":
 		slog.Warn("system zeroize requested via gRPC")
 		// Remove configs
@@ -6692,6 +6769,11 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 			return nil, status.Errorf(codes.Internal, "flush ARP: %s", strings.TrimSpace(string(out)))
 		}
 		return &pb.SystemActionResponse{Message: "ARP cache cleared"}, nil
+
+	case "clear-interfaces-statistics":
+		return &pb.SystemActionResponse{
+			Message: "Interface statistics counters noted\n(kernel counters are cumulative and cannot be reset)",
+		}, nil
 
 	case "clear-ipv6-neighbors":
 		out, err := exec.Command("ip", "-6", "neigh", "flush", "all").CombinedOutput()
