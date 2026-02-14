@@ -290,3 +290,42 @@ func TestAppPortsFromSpec(t *testing.T) {
 		}
 	}
 }
+
+func TestResolvePortName(t *testing.T) {
+	tests := []struct {
+		name string
+		want uint16
+	}{
+		{"ssh", 22},
+		{"SSH", 22},
+		{"https", 443},
+		{"domain", 53},
+		{"dns", 53},
+		{"ftp", 21},
+		{"ftp-data", 20},
+		{"bgp", 179},
+		{"snmp", 161},
+		{"snmptrap", 162},
+		{"syslog", 514},
+		{"ike", 500},
+		{"80", 80},
+		{"unknown", 0},
+	}
+	for _, tt := range tests {
+		got := resolvePortName(tt.name)
+		if got != tt.want {
+			t.Errorf("resolvePortName(%q) = %d, want %d", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestResolvePortRangeNamed(t *testing.T) {
+	lo, hi := resolvePortRange("ssh")
+	if lo != 22 || hi != 22 {
+		t.Errorf("resolvePortRange(ssh) = (%d, %d), want (22, 22)", lo, hi)
+	}
+	lo, hi = resolvePortRange("1024-65535")
+	if lo != 1024 || hi != 65535 {
+		t.Errorf("resolvePortRange(1024-65535) = (%d, %d), want (1024, 65535)", lo, hi)
+	}
+}

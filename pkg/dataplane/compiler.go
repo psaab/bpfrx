@@ -2958,20 +2958,38 @@ func resolvePortName(name string) uint16 {
 		return 80
 	case "https":
 		return 443
-	case "dns":
+	case "dns", "domain":
 		return 53
 	case "ftp":
 		return 21
+	case "ftp-data":
+		return 20
 	case "smtp":
 		return 25
 	case "snmp":
 		return 161
+	case "snmptrap":
+		return 162
 	case "bgp":
 		return 179
 	case "ntp":
 		return 123
 	case "telnet":
 		return 23
+	case "pop3":
+		return 110
+	case "imap":
+		return 143
+	case "ldap":
+		return 389
+	case "syslog":
+		return 514
+	case "radacct":
+		return 1813
+	case "radius":
+		return 1812
+	case "ike":
+		return 500
 	default:
 		if v, err := strconv.ParseUint(name, 10, 16); err == nil {
 			return uint16(v)
