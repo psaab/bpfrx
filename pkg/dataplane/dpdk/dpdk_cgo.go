@@ -124,18 +124,13 @@ func (m *Manager) AddTxPort(ifindex int) error {
 
 // --- Compilation ---
 
-func (m *Manager) Compile(_ *config.Config) (*dataplane.CompileResult, error) {
-	cr := &dataplane.CompileResult{
-		ZoneIDs:       make(map[string]uint16),
-		ScreenIDs:     make(map[string]uint16),
-		AddrIDs:       make(map[string]uint32),
-		AppIDs:        make(map[string]uint32),
-		PoolIDs:       make(map[string]uint8),
-		FilterIDs:     make(map[string]uint32),
-		NATCounterIDs: make(map[string]uint16),
+func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
+	result, err := dataplane.CompileConfig(m, cfg, m.lastCompile != nil)
+	if err != nil {
+		return nil, err
 	}
-	m.lastCompile = cr
-	return cr, nil
+	m.lastCompile = result
+	return result, nil
 }
 
 // --- Zone / interface mapping ---

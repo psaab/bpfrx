@@ -43,13 +43,15 @@ type CompileResult struct {
 	ManagedInterfaces []networkd.InterfaceConfig
 }
 
-// Compile translates a typed Config into eBPF map entries.
-func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
+// CompileConfig translates a typed Config into dataplane table entries.
+// It works with any DataPlane backend (eBPF or DPDK) via the interface.
+// The isRecompile flag triggers FIB generation bump for hitless restarts.
+func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*CompileResult, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("nil config")
 	}
-	if !m.loaded {
-		return nil, fmt.Errorf("eBPF programs not loaded")
+	if !dp.IsLoaded() {
+		return nil, fmt.Errorf("dataplane not loaded")
 	}
 
 	result := &CompileResult{
@@ -91,69 +93,91 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 	}
 
 	// Phase 2: Compile zones
-	if err := m.compileZones(cfg, result); err != nil {
+	if err := compileZones(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile zones: %w", err)
 	}
 
 	// Phase 3: Compile address book
-	if err := m.compileAddressBook(cfg, result); err != nil {
+	if err := compileAddressBook(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile address book: %w", err)
 	}
 
 	// Phase 4: Compile applications
-	if err := m.compileApplications(cfg, result); err != nil {
+	if err := compileApplications(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile applications: %w", err)
 	}
 
 	// Phase 5: Compile policies
-	if err := m.compilePolicies(cfg, result); err != nil {
+	if err := compilePolicies(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile policies: %w", err)
 	}
 
 	// Phase 6: Compile NAT
-	if err := m.compileNAT(cfg, result); err != nil {
+	if err := compileNAT(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile nat: %w", err)
 	}
 
 	// Phase 6.5: Compile static NAT
-	if err := m.compileStaticNAT(cfg, result); err != nil {
+	if err := compileStaticNAT(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile static nat: %w", err)
 	}
 
 	// Phase 6.6: Compile NAT64 prefixes
-	if err := m.compileNAT64(cfg, result); err != nil {
+	if err := compileNAT64(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile nat64: %w", err)
 	}
 
 	// Phase 7: Compile screen profiles
-	if err := m.compileScreenProfiles(cfg, result); err != nil {
+	if err := compileScreenProfiles(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile screen profiles: %w", err)
 	}
 
 	// Phase 8: Compile default policy
-	if err := m.compileDefaultPolicy(cfg); err != nil {
+	if err := compileDefaultPolicy(dp, cfg); err != nil {
 		return nil, fmt.Errorf("compile default policy: %w", err)
 	}
 
 	// Phase 9: Compile flow timeouts
-	if err := m.compileFlowTimeouts(cfg); err != nil {
+	if err := compileFlowTimeouts(dp, cfg); err != nil {
 		return nil, fmt.Errorf("compile flow timeouts: %w", err)
 	}
 
 	// Phase 9b: Compile flow config (TCP MSS clamp, etc.)
-	if err := m.compileFlowConfig(cfg); err != nil {
+	if err := compileFlowConfig(dp, cfg); err != nil {
 		return nil, fmt.Errorf("compile flow config: %w", err)
 	}
 
 	// Phase 10: Compile firewall filters
-	if err := m.compileFirewallFilters(cfg, result); err != nil {
+	if err := compileFirewallFilters(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile firewall filters: %w", err)
 	}
 
-	// All maps are now fully populated. Attach XDP/TC programs last so that
+	// Bump FIB generation counter on recompile so sessions re-run
+	// bpf_fib_lookup with potentially changed interface indices or MAC
+	// addresses. BPF checks session.fib_gen != fib_gen_map[0] and
+	// treats cached entries as stale — no session write-back needed.
+	if isRecompile {
+		dp.BumpFIBGeneration()
+	}
+
+	slog.Info("config compiled to dataplane",
+		"zones", len(result.ZoneIDs),
+		"addresses", len(result.AddrIDs),
+		"applications", len(result.AppIDs),
+		"policy_sets", result.PolicySets)
+
+	return result, nil
+}
+
+// Compile translates a typed Config into eBPF map entries and attaches programs.
+func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
+	result, err := CompileConfig(m, cfg, m.lastCompile != nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// eBPF-specific: attach XDP/TC programs AFTER all maps are populated.
 	// link.Update() atomically switches to programs with complete config.
-	// This eliminates the brief window where new programs run with empty
-	// policy/NAT maps — critical for hitless restarts.
 	for _, ifidx := range result.pendingTC {
 		if err := m.AttachTC(ifidx); err != nil {
 			if !strings.Contains(err.Error(), "already attached") {
@@ -166,21 +190,14 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		rcMap := m.maps["redirect_capable"]
 
 		// Populate redirect_capable BEFORE link.Update() swaps programs.
-		// When the new XDP programs start running after link.Update(),
-		// xdp_forward checks redirect_capable to decide between
-		// bpf_redirect_map (fast path) and XDP_PASS (kernel forwarding).
-		// If redirect_capable is empty, XDP_PASS sends NAT'd packets
-		// through the kernel — TC drops them because session keys use
-		// pre-NAT addresses, permanently killing SNAT TCP connections.
 		if rcMap != nil {
 			for _, ifidx := range result.pendingXDP {
 				rcMap.Update(uint32(ifidx), uint8(1), ebpf.UpdateAny)
 			}
 		}
 
-		// Try native XDP on all interfaces first. If any interface lacks
-		// native support, ALL must use generic mode because bpf_redirect_map
-		// from native XDP cannot target non-ndo_xdp_xmit interfaces.
+		// Try native XDP first. If any interface lacks native support,
+		// ALL must use generic mode for bpf_redirect_map compatibility.
 		needGeneric := false
 		for _, ifidx := range result.pendingXDP {
 			if err := m.AttachXDP(ifidx, false); err != nil {
@@ -195,7 +212,6 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		}
 
 		if needGeneric {
-			// Detach any native links we just created, then attach all as generic.
 			for _, ifidx := range result.pendingXDP {
 				m.DetachXDP(ifidx)
 			}
@@ -208,20 +224,6 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 			}
 		}
 	}
-
-	// Bump FIB generation counter on recompile so sessions re-run
-	// bpf_fib_lookup with potentially changed interface indices or MAC
-	// addresses. BPF checks session.fib_gen != fib_gen_map[0] and
-	// treats cached entries as stale — no session write-back needed.
-	if m.lastCompile != nil {
-		m.BumpFIBGeneration()
-	}
-
-	slog.Info("config compiled to dataplane",
-		"zones", len(result.ZoneIDs),
-		"addresses", len(result.AddrIDs),
-		"applications", len(result.AppIDs),
-		"policy_sets", result.PolicySets)
 
 	m.lastCompile = result
 	return result, nil
@@ -364,7 +366,7 @@ func reconcileInterfaceAddresses(ifaceName string, desired []string) {
 	}
 }
 
-func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error {
+func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear: write new entries first,
 	// then delete stale ones that are no longer in the config.
 	writtenIfaceZone := make(map[IfaceZoneKey]bool)
@@ -435,7 +437,7 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 			zc.TCPRst = 1
 		}
 
-		if err := m.SetZoneConfig(zid, zc); err != nil {
+		if err := dp.SetZoneConfig(zid, zc); err != nil {
 			return fmt.Errorf("set zone config %s: %w", name, err)
 		}
 
@@ -460,7 +462,7 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 					continue
 				}
 
-				if err := m.SetVlanIfaceInfo(subIfindex, physIface.Index, uint16(vlanID)); err != nil {
+				if err := dp.SetVlanIfaceInfo(subIfindex, physIface.Index, uint16(vlanID)); err != nil {
 					return fmt.Errorf("set vlan_iface_info %s.%d: %w",
 						physName, vlanID, err)
 				}
@@ -504,7 +506,7 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 
 			// Set zone mapping using composite key {physIfindex, vlanID}
 			tableID := ifaceTableID[ifaceRef] // 0 if not in any routing instance
-			if err := m.SetZone(physIface.Index, uint16(vlanID), zid, tableID); err != nil {
+			if err := dp.SetZone(physIface.Index, uint16(vlanID), zid, tableID); err != nil {
 				return fmt.Errorf("set zone for %s vlan %d (ifindex %d): %w",
 					physName, vlanID, physIface.Index, err)
 			}
@@ -514,7 +516,7 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 			// XDP attachment is deferred to after the loop so we can ensure
 			// all interfaces use the same XDP mode (native vs generic).
 			if !attached[physIface.Index] {
-				if err := m.AddTxPort(physIface.Index); err != nil {
+				if err := dp.AddTxPort(physIface.Index); err != nil {
 					return fmt.Errorf("add tx port %s: %w", physName, err)
 				}
 
@@ -764,13 +766,13 @@ func (m *Manager) compileZones(cfg *config.Config, result *CompileResult) error 
 	}
 
 	// Delete stale zone/VLAN map entries no longer in the config.
-	m.DeleteStaleIfaceZone(writtenIfaceZone)
-	m.DeleteStaleVlanIface(writtenVlanIface)
+	dp.DeleteStaleIfaceZone(writtenIfaceZone)
+	dp.DeleteStaleVlanIface(writtenVlanIface)
 
 	return nil
 }
 
-func (m *Manager) compileAddressBook(cfg *config.Config, result *CompileResult) error {
+func compileAddressBook(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	ab := cfg.Security.AddressBook
 	if ab == nil {
 		result.nextAddrID = 1 // start from 1 for implicit entries
@@ -800,12 +802,12 @@ func (m *Manager) compileAddressBook(cfg *config.Config, result *CompileResult) 
 			}
 		}
 
-		if err := m.SetAddressBookEntry(cidr, addrID); err != nil {
+		if err := dp.SetAddressBookEntry(cidr, addrID); err != nil {
 			return fmt.Errorf("set address %s (%s): %w", name, cidr, err)
 		}
 
 		// Write self-membership: (addrID, addrID) -> 1
-		if err := m.SetAddressMembership(addrID, addrID); err != nil {
+		if err := dp.SetAddressMembership(addrID, addrID); err != nil {
 			return fmt.Errorf("set self-membership for %s: %w", name, err)
 		}
 
@@ -837,7 +839,7 @@ func (m *Manager) compileAddressBook(cfg *config.Config, result *CompileResult) 
 				return fmt.Errorf("address set %q: member %q not found",
 					setName, memberName)
 			}
-			if err := m.SetAddressMembership(memberID, setID); err != nil {
+			if err := dp.SetAddressMembership(memberID, setID); err != nil {
 				return fmt.Errorf("set membership %s in %s: %w",
 					memberName, setName, err)
 			}
@@ -851,7 +853,7 @@ func (m *Manager) compileAddressBook(cfg *config.Config, result *CompileResult) 
 	return nil
 }
 
-func (m *Manager) compileApplications(cfg *config.Config, result *CompileResult) error {
+func compileApplications(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenApps := make(map[AppKey]bool)
 
@@ -918,7 +920,7 @@ func (m *Manager) compileApplications(cfg *config.Config, result *CompileResult)
 		}
 
 		for _, port := range ports {
-			if err := m.SetApplication(proto, port, appID, appTimeout); err != nil {
+			if err := dp.SetApplication(proto, port, appID, appTimeout); err != nil {
 				return fmt.Errorf("set application %s port %d: %w",
 					appName, port, err)
 			}
@@ -931,7 +933,7 @@ func (m *Manager) compileApplications(cfg *config.Config, result *CompileResult)
 	}
 
 	// Delete stale application entries no longer referenced.
-	m.DeleteStaleApplications(writtenApps)
+	dp.DeleteStaleApplications(writtenApps)
 
 	return nil
 }
@@ -940,7 +942,7 @@ func (m *Manager) compileApplications(cfg *config.Config, result *CompileResult)
 // If the list has one entry, returns that entry's ID directly.
 // If the list has multiple entries, creates an implicit address-set containing
 // all referenced addresses and returns the set's ID.
-func (m *Manager) resolveAddrList(names []string, result *CompileResult) (uint32, error) {
+func resolveAddrList(dp DataPlane,names []string, result *CompileResult) (uint32, error) {
 	if len(names) == 0 {
 		return 0, nil
 	}
@@ -983,7 +985,7 @@ func (m *Manager) resolveAddrList(names []string, result *CompileResult) (uint32
 		if !ok {
 			return 0, fmt.Errorf("address %q not found", name)
 		}
-		if err := m.SetAddressMembership(memberID, setID); err != nil {
+		if err := dp.SetAddressMembership(memberID, setID); err != nil {
 			return 0, fmt.Errorf("set implicit membership %s in set %d: %w", name, setID, err)
 		}
 	}
@@ -997,7 +999,7 @@ func (m *Manager) resolveAddrList(names []string, result *CompileResult) (uint32
 // If the CIDR already exists as an address-book entry, reuses that ID.
 // Otherwise, creates an implicit address-book entry with a synthetic name.
 // Returns 0 (any) if the CIDR is empty.
-func (m *Manager) resolveSNATMatchAddr(cidr string, result *CompileResult) (uint32, error) {
+func resolveSNATMatchAddr(dp DataPlane,cidr string, result *CompileResult) (uint32, error) {
 	if cidr == "" {
 		return 0, nil
 	}
@@ -1021,10 +1023,10 @@ func (m *Manager) resolveSNATMatchAddr(cidr string, result *CompileResult) (uint
 	result.nextAddrID++
 	result.AddrIDs[synthName] = addrID
 
-	if err := m.SetAddressBookEntry(cidr, addrID); err != nil {
+	if err := dp.SetAddressBookEntry(cidr, addrID); err != nil {
 		return 0, fmt.Errorf("set implicit address %s: %w", cidr, err)
 	}
-	if err := m.SetAddressMembership(addrID, addrID); err != nil {
+	if err := dp.SetAddressMembership(addrID, addrID); err != nil {
 		return 0, fmt.Errorf("set self-membership for implicit %s: %w", cidr, err)
 	}
 
@@ -1032,7 +1034,7 @@ func (m *Manager) resolveSNATMatchAddr(cidr string, result *CompileResult) (uint
 	return addrID, nil
 }
 
-func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) error {
+func compilePolicies(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenPolicySets := make(map[ZonePairKey]bool)
 
@@ -1104,7 +1106,7 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 			DefaultAction: ActionDeny,
 		}
 		zpKey := ZonePairKey{FromZone: fromZone, ToZone: toZone}
-		if err := m.SetZonePairPolicy(fromZone, toZone, ps); err != nil {
+		if err := dp.SetZonePairPolicy(fromZone, toZone, ps); err != nil {
 			return fmt.Errorf("set zone pair policy %s->%s: %w",
 				zpp.FromZone, zpp.ToZone, err)
 		}
@@ -1141,20 +1143,20 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 			}
 
 			// Source address (supports multiple via implicit address-set)
-			srcID, err := m.resolveAddrList(pol.Match.SourceAddresses, result)
+			srcID, err := resolveAddrList(dp,pol.Match.SourceAddresses, result)
 			if err != nil {
 				return fmt.Errorf("policy %s source address: %w", pol.Name, err)
 			}
 			rule.SrcAddrID = srcID
 
 			// Destination address (supports multiple via implicit address-set)
-			dstID, err := m.resolveAddrList(pol.Match.DestinationAddresses, result)
+			dstID, err := resolveAddrList(dp,pol.Match.DestinationAddresses, result)
 			if err != nil {
 				return fmt.Errorf("policy %s destination address: %w", pol.Name, err)
 			}
 			rule.DstAddrID = dstID
 
-			if err := m.SetPolicyRule(policySetID, uint32(i), rule); err != nil {
+			if err := dp.SetPolicyRule(policySetID, uint32(i), rule); err != nil {
 				return fmt.Errorf("set policy rule %s[%d]: %w",
 					pol.Name, i, err)
 			}
@@ -1224,7 +1226,7 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 			DefaultAction: ActionDeny,
 		}
 		// Global policy key: from_zone=0, to_zone=0
-		if err := m.SetZonePairPolicy(0, 0, ps); err != nil {
+		if err := dp.SetZonePairPolicy(0, 0, ps); err != nil {
 			return fmt.Errorf("set global policy: %w", err)
 		}
 		writtenPolicySets[ZonePairKey{FromZone: 0, ToZone: 0}] = true
@@ -1257,19 +1259,19 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 				}
 			}
 
-			srcID, err := m.resolveAddrList(pol.Match.SourceAddresses, result)
+			srcID, err := resolveAddrList(dp,pol.Match.SourceAddresses, result)
 			if err != nil {
 				return fmt.Errorf("global policy %s source address: %w", pol.Name, err)
 			}
 			rule.SrcAddrID = srcID
 
-			dstID, err := m.resolveAddrList(pol.Match.DestinationAddresses, result)
+			dstID, err := resolveAddrList(dp,pol.Match.DestinationAddresses, result)
 			if err != nil {
 				return fmt.Errorf("global policy %s destination address: %w", pol.Name, err)
 			}
 			rule.DstAddrID = dstID
 
-			if err := m.SetPolicyRule(policySetID, uint32(i), rule); err != nil {
+			if err := dp.SetPolicyRule(policySetID, uint32(i), rule); err != nil {
 				return fmt.Errorf("set global policy rule %s[%d]: %w", pol.Name, i, err)
 			}
 
@@ -1283,12 +1285,12 @@ func (m *Manager) compilePolicies(cfg *config.Config, result *CompileResult) err
 	}
 
 	// Delete stale zone-pair policy entries no longer in the config.
-	m.DeleteStaleZonePairPolicies(writtenPolicySets)
+	dp.DeleteStaleZonePairPolicies(writtenPolicySets)
 
 	return nil
 }
 
-func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
+func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenSNAT := make(map[SNATKey]bool)
 	writtenSNATv6 := make(map[SNATKey]bool)
@@ -1324,12 +1326,12 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 
 			// source-nat off: write exemption rule (no pool allocation)
 			if rule.Then.Off {
-				srcAddrID, err := m.resolveSNATMatchAddr(rule.Match.SourceAddress, result)
+				srcAddrID, err := resolveSNATMatchAddr(dp,rule.Match.SourceAddress, result)
 				if err != nil {
 					return fmt.Errorf("snat rule %s/%s source match: %w",
 						rs.Name, rule.Name, err)
 				}
-				dstAddrID, err := m.resolveSNATMatchAddr(rule.Match.DestinationAddress, result)
+				dstAddrID, err := resolveSNATMatchAddr(dp,rule.Match.DestinationAddress, result)
 				if err != nil {
 					return fmt.Errorf("snat rule %s/%s dest match: %w",
 						rs.Name, rule.Name, err)
@@ -1349,7 +1351,7 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 					CounterID: counterID,
 				}
 				ri := v4RuleIdx[zp]
-				if err := m.SetSNATRule(fromZone, toZone, ri, val); err != nil {
+				if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
 					return fmt.Errorf("set snat off rule %s/%s: %w",
 						rs.Name, rule.Name, err)
 				}
@@ -1364,7 +1366,7 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 					CounterID: counterID,
 				}
 				ri6 := v6RuleIdx[zp]
-				if err := m.SetSNATRuleV6(fromZone, toZone, ri6, val6); err != nil {
+				if err := dp.SetSNATRuleV6(fromZone, toZone, ri6, val6); err != nil {
 					return fmt.Errorf("set snat_v6 off rule %s/%s: %w",
 						rs.Name, rule.Name, err)
 				}
@@ -1477,7 +1479,7 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 				if i >= int(MaxNATPoolIPsPerPool) {
 					break
 				}
-				if err := m.SetNATPoolIPV4(uint32(curPoolID), uint32(i), ipToUint32BE(ip)); err != nil {
+				if err := dp.SetNATPoolIPV4(uint32(curPoolID), uint32(i), ipToUint32BE(ip)); err != nil {
 					return fmt.Errorf("set pool ip v4 %d/%d: %w", curPoolID, i, err)
 				}
 			}
@@ -1485,7 +1487,7 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 				if i >= int(MaxNATPoolIPsPerPool) {
 					break
 				}
-				if err := m.SetNATPoolIPV6(uint32(curPoolID), uint32(i), ipTo16Bytes(ip)); err != nil {
+				if err := dp.SetNATPoolIPV6(uint32(curPoolID), uint32(i), ipTo16Bytes(ip)); err != nil {
 					return fmt.Errorf("set pool ip v6 %d/%d: %w", curPoolID, i, err)
 				}
 			}
@@ -1494,17 +1496,17 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 				poolCfg.AddrPersistent = 1
 			}
 
-			if err := m.SetNATPoolConfig(uint32(curPoolID), poolCfg); err != nil {
+			if err := dp.SetNATPoolConfig(uint32(curPoolID), poolCfg); err != nil {
 				return fmt.Errorf("set pool config %d: %w", curPoolID, err)
 			}
 
 			// Resolve SNAT match criteria to address IDs
-			srcAddrID, err := m.resolveSNATMatchAddr(rule.Match.SourceAddress, result)
+			srcAddrID, err := resolveSNATMatchAddr(dp,rule.Match.SourceAddress, result)
 			if err != nil {
 				return fmt.Errorf("snat rule %s/%s source match: %w",
 					rs.Name, rule.Name, err)
 			}
-			dstAddrID, err := m.resolveSNATMatchAddr(rule.Match.DestinationAddress, result)
+			dstAddrID, err := resolveSNATMatchAddr(dp,rule.Match.DestinationAddress, result)
 			if err != nil {
 				return fmt.Errorf("snat rule %s/%s dest match: %w",
 					rs.Name, rule.Name, err)
@@ -1527,7 +1529,7 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 					CounterID: counterID,
 				}
 				ri := v4RuleIdx[zp]
-				if err := m.SetSNATRule(fromZone, toZone, ri, val); err != nil {
+				if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
 					return fmt.Errorf("set snat rule %s/%s: %w",
 						rs.Name, rule.Name, err)
 				}
@@ -1552,7 +1554,7 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 					CounterID: counterID,
 				}
 				ri := v6RuleIdx[zp]
-				if err := m.SetSNATRuleV6(fromZone, toZone, ri, val); err != nil {
+				if err := dp.SetSNATRuleV6(fromZone, toZone, ri, val); err != nil {
 					return fmt.Errorf("set snat_v6 rule %s/%s: %w",
 						rs.Name, rule.Name, err)
 				}
@@ -1656,7 +1658,7 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 								NewDstPort: htons(poolPort),
 								Flags:      DNATFlagStatic,
 							}
-							if err := m.SetDNATEntry(dk, dv); err != nil {
+							if err := dp.SetDNATEntry(dk, dv); err != nil {
 								return fmt.Errorf("set dnat entry %s/%s proto %d: %w",
 									rs.Name, rule.Name, proto, err)
 							}
@@ -1672,7 +1674,7 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 								NewDstPort: htons(poolPort),
 								Flags:      DNATFlagStatic,
 							}
-							if err := m.SetDNATEntryV6(dk, dv); err != nil {
+							if err := dp.SetDNATEntryV6(dk, dv); err != nil {
 								return fmt.Errorf("set dnat_v6 entry %s/%s proto %d: %w",
 									rs.Name, rule.Name, proto, err)
 							}
@@ -1692,16 +1694,16 @@ func (m *Manager) compileNAT(cfg *config.Config, result *CompileResult) error {
 	}
 
 	// Delete stale NAT entries and zero unused pool slots.
-	m.DeleteStaleSNATRules(writtenSNAT)
-	m.DeleteStaleSNATRulesV6(writtenSNATv6)
-	m.DeleteStaleDNATStatic(writtenDNAT)
-	m.DeleteStaleDNATStaticV6(writtenDNATv6)
-	m.ZeroStaleNATPoolConfigs(uint32(poolID))
+	dp.DeleteStaleSNATRules(writtenSNAT)
+	dp.DeleteStaleSNATRulesV6(writtenSNATv6)
+	dp.DeleteStaleDNATStatic(writtenDNAT)
+	dp.DeleteStaleDNATStaticV6(writtenDNATv6)
+	dp.ZeroStaleNATPoolConfigs(uint32(poolID))
 
 	return nil
 }
 
-func (m *Manager) compileStaticNAT(cfg *config.Config, result *CompileResult) error {
+func compileStaticNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenV4 := make(map[StaticNATKeyV4]bool)
 	writtenV6 := make(map[StaticNATKeyV6]bool)
@@ -1752,11 +1754,11 @@ func (m *Manager) compileStaticNAT(cfg *config.Config, result *CompileResult) er
 				extU32 := ipToUint32BE(extIP)
 				intU32 := ipToUint32BE(intIP)
 
-				if err := m.SetStaticNATEntryV4(extU32, StaticNATDNAT, intU32); err != nil {
+				if err := dp.SetStaticNATEntryV4(extU32, StaticNATDNAT, intU32); err != nil {
 					return fmt.Errorf("set static nat dnat v4 %s: %w", rule.Name, err)
 				}
 				writtenV4[StaticNATKeyV4{IP: extU32, Direction: StaticNATDNAT}] = true
-				if err := m.SetStaticNATEntryV4(intU32, StaticNATSNAT, extU32); err != nil {
+				if err := dp.SetStaticNATEntryV4(intU32, StaticNATSNAT, extU32); err != nil {
 					return fmt.Errorf("set static nat snat v4 %s: %w", rule.Name, err)
 				}
 				writtenV4[StaticNATKeyV4{IP: intU32, Direction: StaticNATSNAT}] = true
@@ -1764,11 +1766,11 @@ func (m *Manager) compileStaticNAT(cfg *config.Config, result *CompileResult) er
 				extBytes := ipTo16Bytes(extIP)
 				intBytes := ipTo16Bytes(intIP)
 
-				if err := m.SetStaticNATEntryV6(extBytes, StaticNATDNAT, intBytes); err != nil {
+				if err := dp.SetStaticNATEntryV6(extBytes, StaticNATDNAT, intBytes); err != nil {
 					return fmt.Errorf("set static nat dnat v6 %s: %w", rule.Name, err)
 				}
 				writtenV6[StaticNATKeyV6{IP: extBytes, Direction: StaticNATDNAT}] = true
-				if err := m.SetStaticNATEntryV6(intBytes, StaticNATSNAT, extBytes); err != nil {
+				if err := dp.SetStaticNATEntryV6(intBytes, StaticNATSNAT, extBytes); err != nil {
 					return fmt.Errorf("set static nat snat v6 %s: %w", rule.Name, err)
 				}
 				writtenV6[StaticNATKeyV6{IP: intBytes, Direction: StaticNATSNAT}] = true
@@ -1786,12 +1788,12 @@ func (m *Manager) compileStaticNAT(cfg *config.Config, result *CompileResult) er
 	}
 
 	// Delete stale static NAT entries.
-	m.DeleteStaleStaticNAT(writtenV4, writtenV6)
+	dp.DeleteStaleStaticNAT(writtenV4, writtenV6)
 
 	return nil
 }
 
-func (m *Manager) compileNAT64(cfg *config.Config, result *CompileResult) error {
+func compileNAT64(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	// Track written prefixes for populate-before-clear.
 	writtenPrefixes := make(map[NAT64PrefixKey]bool)
 
@@ -1840,7 +1842,7 @@ func (m *Manager) compileNAT64(cfg *config.Config, result *CompileResult) error 
 			Prefix:     prefix,
 			SNATPoolID: poolID,
 		}
-		if err := m.SetNAT64Config(count, nat64Cfg); err != nil {
+		if err := dp.SetNAT64Config(count, nat64Cfg); err != nil {
 			return fmt.Errorf("NAT64 rule-set %q: set config: %w", rs.Name, err)
 		}
 		writtenPrefixes[NAT64PrefixKey{Prefix: nat64Cfg.Prefix}] = true
@@ -1851,18 +1853,18 @@ func (m *Manager) compileNAT64(cfg *config.Config, result *CompileResult) error 
 		count++
 	}
 
-	if err := m.SetNAT64Count(count); err != nil {
+	if err := dp.SetNAT64Count(count); err != nil {
 		return fmt.Errorf("set NAT64 count: %w", err)
 	}
 
 	// Delete stale NAT64 entries.
-	m.DeleteStaleNAT64(count, writtenPrefixes)
+	dp.DeleteStaleNAT64(count, writtenPrefixes)
 
 	slog.Info("NAT64 compilation complete", "prefixes", count)
 	return nil
 }
 
-func (m *Manager) compileScreenProfiles(cfg *config.Config, result *CompileResult) error {
+func compileScreenProfiles(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	var maxScreenID uint32
 	for name, profile := range cfg.Security.Screen {
 		sid, ok := result.ScreenIDs[name]
@@ -1932,7 +1934,7 @@ func (m *Manager) compileScreenProfiles(cfg *config.Config, result *CompileResul
 
 		sc.Flags = flags
 
-		if err := m.SetScreenConfig(uint32(sid), sc); err != nil {
+		if err := dp.SetScreenConfig(uint32(sid), sc); err != nil {
 			return fmt.Errorf("set screen config %s (id=%d): %w", name, sid, err)
 		}
 		if uint32(sid) > maxScreenID {
@@ -1948,17 +1950,17 @@ func (m *Manager) compileScreenProfiles(cfg *config.Config, result *CompileResul
 	}
 
 	// Zero screen config entries above the highest used ID.
-	m.ZeroStaleScreenConfigs(maxScreenID)
+	dp.ZeroStaleScreenConfigs(maxScreenID)
 
 	return nil
 }
 
-func (m *Manager) compileDefaultPolicy(cfg *config.Config) error {
+func compileDefaultPolicy(dp DataPlane,cfg *config.Config) error {
 	action := uint8(ActionDeny) // default deny
 	if cfg.Security.DefaultPolicy == config.PolicyPermit {
 		action = ActionPermit
 	}
-	if err := m.SetDefaultPolicy(action); err != nil {
+	if err := dp.SetDefaultPolicy(action); err != nil {
 		return fmt.Errorf("set default policy: %w", err)
 	}
 	if action == ActionPermit {
@@ -1969,7 +1971,7 @@ func (m *Manager) compileDefaultPolicy(cfg *config.Config) error {
 	return nil
 }
 
-func (m *Manager) compileFlowTimeouts(cfg *config.Config) error {
+func compileFlowTimeouts(dp DataPlane,cfg *config.Config) error {
 	flow := &cfg.Security.Flow
 
 	// Write all timeout slots; 0 means "use BPF default".
@@ -1985,7 +1987,7 @@ func (m *Manager) compileFlowTimeouts(cfg *config.Config) error {
 	timeouts[FlowTimeoutICMP] = uint32(flow.ICMPSessionTimeout)
 
 	for idx := uint32(0); idx < FlowTimeoutMax; idx++ {
-		if err := m.SetFlowTimeout(idx, timeouts[idx]); err != nil {
+		if err := dp.SetFlowTimeout(idx, timeouts[idx]); err != nil {
 			return fmt.Errorf("set flow timeout %d: %w", idx, err)
 		}
 	}
@@ -2007,7 +2009,7 @@ func (m *Manager) compileFlowTimeouts(cfg *config.Config) error {
 	return nil
 }
 
-func (m *Manager) compileFlowConfig(cfg *config.Config) error {
+func compileFlowConfig(dp DataPlane,cfg *config.Config) error {
 	flow := &cfg.Security.Flow
 	fc := FlowConfigValue{
 		TCPMSSIPsec: uint16(flow.TCPMSSIPsecVPN),
@@ -2039,7 +2041,7 @@ func (m *Manager) compileFlowConfig(cfg *config.Config) error {
 		fc.ALGFlags |= 0x08
 	}
 
-	if err := m.SetFlowConfig(fc); err != nil {
+	if err := dp.SetFlowConfig(fc); err != nil {
 		return err
 	}
 
@@ -2150,7 +2152,7 @@ func parsePorts(spec string) ([]uint16, error) {
 
 // compileFirewallFilters compiles firewall filter config into BPF maps.
 // It creates filter_rules, filter_configs, and iface_filter_map entries.
-func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResult) error {
+func compileFirewallFilters(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenIfaceFilter := make(map[IfaceFilterKey]bool)
 
@@ -2186,14 +2188,14 @@ func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResu
 					slog.Warn("filter rule limit reached", "filter", name, "term", term.Name)
 					break
 				}
-				if err := m.SetFilterRule(ruleIdx, rule); err != nil {
+				if err := dp.SetFilterRule(ruleIdx, rule); err != nil {
 					return fmt.Errorf("set filter rule %d: %w", ruleIdx, err)
 				}
 				ruleIdx++
 			}
 		}
 		numRules := ruleIdx - startIdx
-		if err := m.SetFilterConfig(filterID, FilterConfig{
+		if err := dp.SetFilterConfig(filterID, FilterConfig{
 			NumRules:  numRules,
 			RuleStart: startIdx,
 		}); err != nil {
@@ -2226,14 +2228,14 @@ func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResu
 					slog.Warn("filter rule limit reached", "filter", name, "term", term.Name)
 					break
 				}
-				if err := m.SetFilterRule(ruleIdx, rule); err != nil {
+				if err := dp.SetFilterRule(ruleIdx, rule); err != nil {
 					return fmt.Errorf("set filter rule %d: %w", ruleIdx, err)
 				}
 				ruleIdx++
 			}
 		}
 		numRules := ruleIdx - startIdx
-		if err := m.SetFilterConfig(filterID, FilterConfig{
+		if err := dp.SetFilterConfig(filterID, FilterConfig{
 			NumRules:  numRules,
 			RuleStart: startIdx,
 		}); err != nil {
@@ -2292,7 +2294,7 @@ func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResu
 						VlanID:  vlanID,
 						Family:  AFInet,
 					}
-					if err := m.SetIfaceFilter(key, fid); err != nil {
+					if err := dp.SetIfaceFilter(key, fid); err != nil {
 						return fmt.Errorf("set iface filter %s inet: %w", physName, err)
 					}
 					writtenIfaceFilter[key] = true
@@ -2313,7 +2315,7 @@ func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResu
 						VlanID:  vlanID,
 						Family:  AFInet6,
 					}
-					if err := m.SetIfaceFilter(key, fid); err != nil {
+					if err := dp.SetIfaceFilter(key, fid); err != nil {
 						return fmt.Errorf("set iface filter %s inet6: %w", physName, err)
 					}
 					writtenIfaceFilter[key] = true
@@ -2346,7 +2348,7 @@ func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResu
 						Family:    AFInet,
 						Direction: 1,
 					}
-					if err := m.SetIfaceFilter(key, fid); err != nil {
+					if err := dp.SetIfaceFilter(key, fid); err != nil {
 						return fmt.Errorf("set output filter %s inet: %w", physName, err)
 					}
 					writtenIfaceFilter[key] = true
@@ -2368,7 +2370,7 @@ func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResu
 						Family:    AFInet6,
 						Direction: 1,
 					}
-					if err := m.SetIfaceFilter(key, fid); err != nil {
+					if err := dp.SetIfaceFilter(key, fid); err != nil {
 						return fmt.Errorf("set output filter %s inet6: %w", physName, err)
 					}
 					writtenIfaceFilter[key] = true
@@ -2381,8 +2383,8 @@ func (m *Manager) compileFirewallFilters(cfg *config.Config, result *CompileResu
 	}
 
 	// Delete stale filter entries and zero unused filter config/rule slots.
-	m.DeleteStaleIfaceFilter(writtenIfaceFilter)
-	m.ZeroStaleFilterConfigs(filterID)
+	dp.DeleteStaleIfaceFilter(writtenIfaceFilter)
+	dp.ZeroStaleFilterConfigs(filterID)
 
 	result.FilterIDs = filterIDs
 	return nil
