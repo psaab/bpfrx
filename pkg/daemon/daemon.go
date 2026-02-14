@@ -1141,7 +1141,8 @@ func (d *Daemon) startFlowExporter(ctx context.Context, cfg *config.Config, er *
 		"collectors", len(ec.Collectors),
 		"active_timeout", ec.FlowActiveTimeout,
 		"inactive_timeout", ec.FlowInactiveTimeout,
-		"sampling_zones", len(ec.SamplingZones))
+		"sampling_zones", len(ec.SamplingZones),
+		"sampling_rate", ec.SamplingRate)
 }
 
 // stopFlowExporter stops the running flow exporter.

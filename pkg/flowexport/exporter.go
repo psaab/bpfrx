@@ -26,6 +26,8 @@ type ExportConfig struct {
 	FlowInactiveTimeout time.Duration
 	TemplateRefreshRate time.Duration
 	SamplingZones       map[uint16]SamplingDir // zone ID -> sampling directions
+	SamplingRate        int                    // 1-in-N sampling (0 = export all)
+	sampleCounter       atomic.Uint64          // monotonic counter for 1-in-N
 }
 
 // CollectorConfig defines a single NetFlow collector destination.
@@ -65,6 +67,14 @@ func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsC
 		FlowActiveTimeout:   activeTimeout,
 		FlowInactiveTimeout: inactiveTimeout,
 		TemplateRefreshRate: refreshRate,
+	}
+
+	// Use the first sampling instance's input rate as the global sampling rate
+	for _, inst := range fo.Sampling.Instances {
+		if inst.InputRate > 0 {
+			ec.SamplingRate = inst.InputRate
+			break
+		}
 	}
 
 	// Collect flow servers from all sampling instances
@@ -145,20 +155,30 @@ func BuildSamplingZones(cfg *config.Config, zoneIDs map[string]uint16) map[uint1
 }
 
 // ShouldExport checks whether a session close event should be exported based
-// on the ingress/egress zone sampling configuration. A session is exported if
-// the ingress zone has sampling input enabled OR the egress zone has sampling
-// output enabled. If no SamplingZones are configured, all sessions are exported.
+// on the ingress/egress zone sampling configuration and sampling rate.
+// A session is exported if the ingress zone has sampling input enabled OR
+// the egress zone has sampling output enabled. If no SamplingZones are
+// configured, all sessions are eligible. When SamplingRate > 0, only
+// 1-in-N eligible sessions are actually exported.
 func (ec *ExportConfig) ShouldExport(inZone, outZone uint16) bool {
-	if len(ec.SamplingZones) == 0 {
-		return true // no per-zone filtering configured
+	if len(ec.SamplingZones) > 0 {
+		eligible := false
+		if d, ok := ec.SamplingZones[inZone]; ok && d.Input {
+			eligible = true
+		}
+		if d, ok := ec.SamplingZones[outZone]; ok && d.Output {
+			eligible = true
+		}
+		if !eligible {
+			return false
+		}
 	}
-	if d, ok := ec.SamplingZones[inZone]; ok && d.Input {
-		return true
+	// Apply 1-in-N sampling rate
+	if ec.SamplingRate > 1 {
+		n := ec.sampleCounter.Add(1)
+		return n%uint64(ec.SamplingRate) == 0
 	}
-	if d, ok := ec.SamplingZones[outZone]; ok && d.Output {
-		return true
-	}
-	return false
+	return true
 }
 
 // parseIfaceRef splits "eth0.0" into ("eth0", 0).
