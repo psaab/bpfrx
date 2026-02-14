@@ -93,20 +93,20 @@ func main() {
 				fmt.Fprintln(c.rl.Stdout(), "  (no help available)")
 				return cleanLine, pos - 1, true
 			}
-			sort.Strings(resp.Candidates)
-			// Check if we're completing pipe filters
-			isPipe := strings.Contains(text, "|")
-			words := strings.Fields(text)
 			candidates := make([]cmdtree.Candidate, len(resp.Candidates))
 			for i, name := range resp.Candidates {
 				desc := ""
-				if isPipe {
+				// Use server-provided descriptions if available.
+				if i < len(resp.Descriptions) && resp.Descriptions[i] != "" {
+					desc = resp.Descriptions[i]
+				} else if strings.Contains(text, "|") {
 					desc = pipeFilterDescs[name]
 				} else {
-					desc = remoteLookupDesc(words, name, c.configMode)
+					desc = remoteLookupDesc(strings.Fields(text), name, c.configMode)
 				}
 				candidates[i] = cmdtree.Candidate{Name: name, Desc: desc}
 			}
+			sort.Slice(candidates, func(i, j int) bool { return candidates[i].Name < candidates[j].Name })
 			cmdtree.WriteHelp(c.rl.Stdout(), candidates)
 			return cleanLine, pos - 1, true
 		}),
@@ -2659,7 +2659,9 @@ func (rc *remoteCompleter) Do(line []rune, pos int) ([][]rune, int) {
 	candidates := make([]cmdtree.Candidate, len(resp.Candidates))
 	for i, name := range resp.Candidates {
 		desc := ""
-		if isPipe {
+		if i < len(resp.Descriptions) && resp.Descriptions[i] != "" {
+			desc = resp.Descriptions[i]
+		} else if isPipe {
 			desc = pipeFilterDescs[name]
 		} else {
 			desc = remoteLookupDesc(words, name, rc.ctl.configMode)

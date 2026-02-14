@@ -455,18 +455,28 @@ const (
 	ValueHintScreenProfile           // ids-option <name>
 	ValueHintStreamName              // stream <name>
 	ValueHintAppSetName              // application-set <name>
+	ValueHintUnitNumber              // unit <number>
 )
 
+// SchemaCompletion is a completion candidate from the config schema.
+type SchemaCompletion struct {
+	Name string
+	Desc string
+}
+
 // ValueProvider returns possible values for a given hint.
-type ValueProvider func(hint ValueHint) []string
+// The path parameter provides consumed tokens for context (e.g., interface name for unit completion).
+type ValueProvider func(hint ValueHint, path []string) []SchemaCompletion
 
 // schemaNode defines a container keyword in the Junos config hierarchy.
 // It tells SetPath how to group flat path tokens into the correct tree structure.
 type schemaNode struct {
-	args      int                    // extra tokens consumed as part of this node's key
-	children  map[string]*schemaNode // known container children
-	wildcard  *schemaNode            // matches any keyword not in children (for dynamic names)
-	valueHint ValueHint              // hint for dynamic value completion (when args > 0)
+	args        int                    // extra tokens consumed as part of this node's key
+	children    map[string]*schemaNode // known container children
+	wildcard    *schemaNode            // matches any keyword not in children (for dynamic names)
+	valueHint   ValueHint              // hint for dynamic value completion (when args > 0)
+	desc        string                 // description shown in completion help
+	placeholder string                 // Junos-style placeholder (e.g., "<interface-name>")
 }
 
 // setSchema defines the Junos configuration tree structure.
@@ -708,35 +718,35 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 	}},
-	"interfaces": {wildcard: &schemaNode{valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
-		"description":  {args: 1, children: nil},
-		"mtu":          {args: 1, children: nil},
-		"speed":        {args: 1, children: nil},
-		"duplex":       {args: 1, children: nil},
-		"disable":      {children: nil},
-		"vlan-tagging": {children: nil},
-		"gigether-options": {children: map[string]*schemaNode{
-			"redundant-parent": {args: 1, children: nil},
+	"interfaces": {desc: "Interface configuration", wildcard: &schemaNode{valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
+		"description":  {desc: "Text description of interface", args: 1, children: nil},
+		"mtu":          {desc: "Maximum transmit packet size", args: 1, children: nil},
+		"speed":        {desc: "Link speed", args: 1, children: nil},
+		"duplex":       {desc: "Link duplex mode", args: 1, children: nil},
+		"disable":      {desc: "Disable this interface", children: nil},
+		"vlan-tagging": {desc: "Enable 802.1Q VLAN tagging", children: nil},
+		"gigether-options": {desc: "Gigabit Ethernet interface options", children: map[string]*schemaNode{
+			"redundant-parent": {desc: "Parent of this redundant interface", args: 1, children: nil},
 		}},
-		"redundant-ether-options": {children: map[string]*schemaNode{
-			"redundancy-group": {args: 1, children: nil},
+		"redundant-ether-options": {desc: "Redundant Ethernet interface options", children: map[string]*schemaNode{
+			"redundancy-group": {desc: "Redundancy group for this RETH", args: 1, children: nil},
 		}},
-		"fabric-options": {children: map[string]*schemaNode{
-			"member-interfaces": {children: nil},
+		"fabric-options": {desc: "Fabric interface options", children: map[string]*schemaNode{
+			"member-interfaces": {desc: "Member interfaces", children: nil},
 		}},
-		"tunnel": {children: map[string]*schemaNode{
-			"source":      {args: 1, children: nil},
-			"destination": {args: 1, children: nil},
-			"mode":        {args: 1, children: nil},
-			"key":         {args: 1, children: nil},
-			"ttl":         {args: 1, children: nil},
-			"keepalive":       {args: 1, children: nil},
-			"keepalive-retry": {args: 1, children: nil},
-			"routing-instance": {children: map[string]*schemaNode{
-				"destination": {args: 1, children: nil},
+		"tunnel": {desc: "Tunnel parameters", children: map[string]*schemaNode{
+			"source":      {desc: "Tunnel source address", args: 1, children: nil},
+			"destination": {desc: "Tunnel destination address", args: 1, children: nil},
+			"mode":        {desc: "Tunnel mode", args: 1, children: nil},
+			"key":         {desc: "Tunnel key", args: 1, children: nil},
+			"ttl":         {desc: "Time to live", args: 1, children: nil},
+			"keepalive":       {desc: "Keepalive interval", args: 1, children: nil},
+			"keepalive-retry": {desc: "Keepalive retry count", args: 1, children: nil},
+			"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
+				"destination": {desc: "Destination routing instance", args: 1, children: nil},
 			}},
 		}},
-		"unit": {args: 1, children: map[string]*schemaNode{
+		"unit": {desc: "Logical unit number", args: 1, valueHint: ValueHintUnitNumber, placeholder: "<unit-number>", children: map[string]*schemaNode{
 			"description":    {args: 1, children: nil},
 			"point-to-point": {children: nil},
 			"vlan-id":        {args: 1, children: nil},
@@ -1618,14 +1628,24 @@ func keysEqual(a, b []string) bool {
 // child keyword names. If the current position expects a dynamic argument
 // (wildcard or args > 0), it returns nil (user must type a name).
 func CompleteSetPath(tokens []string) []string {
-	return CompleteSetPathWithValues(tokens, nil)
+	results := CompleteSetPathWithValues(tokens, nil)
+	if results == nil {
+		return nil
+	}
+	names := make([]string, len(results))
+	for i, r := range results {
+		names[i] = r.Name
+	}
+	return names
 }
 
 // CompleteSetPathWithValues is like CompleteSetPath but uses a ValueProvider
 // to suggest dynamic values at positions where schema expects a name argument.
-func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []string {
+// Returns SchemaCompletion pairs with names and descriptions.
+func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []SchemaCompletion {
 	schema := setSchema
 	i := 0
+	var path []string // consumed tokens for context
 
 	for i < len(tokens) {
 		if schema == nil {
@@ -1650,10 +1670,10 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []string
 		if childSchema == nil {
 			// Last token might be a partial prefix — return matching keywords.
 			if i == len(tokens)-1 && schema.children != nil {
-				var matches []string
-				for name := range schema.children {
+				var matches []SchemaCompletion
+				for name, node := range schema.children {
 					if strings.HasPrefix(name, keyword) {
-						matches = append(matches, name)
+						matches = append(matches, SchemaCompletion{Name: name, Desc: node.desc})
 					}
 				}
 				if len(matches) > 0 {
@@ -1665,13 +1685,27 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []string
 
 		// Consume keyword + extra args.
 		nodeKeyCount := 1 + childSchema.args
+		end := i + nodeKeyCount
+		if end > len(tokens) {
+			end = len(tokens)
+		}
+		path = append(path, tokens[i:end]...)
 		i += nodeKeyCount
 
 		if i > len(tokens) {
 			// Still consuming args for this node — user needs to type a value.
 			// Try to provide dynamic values via the provider.
 			if provider != nil && childSchema.valueHint != ValueHintNone {
-				return provider(childSchema.valueHint)
+				results := provider(childSchema.valueHint, path)
+				// Add placeholder if available.
+				if childSchema.placeholder != "" {
+					results = append([]SchemaCompletion{{Name: childSchema.placeholder, Desc: childSchema.desc}}, results...)
+				}
+				return results
+			}
+			// No provider but have a placeholder — show it.
+			if childSchema.placeholder != "" {
+				return []SchemaCompletion{{Name: childSchema.placeholder, Desc: childSchema.desc}}
 			}
 			return nil
 		}
@@ -1684,15 +1718,21 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []string
 		return nil
 	}
 
-	var completions []string
+	var completions []SchemaCompletion
 	if schema.children != nil {
-		for name := range schema.children {
-			completions = append(completions, name)
+		for name, node := range schema.children {
+			completions = append(completions, SchemaCompletion{Name: name, Desc: node.desc})
 		}
 	}
 	// If this level accepts a wildcard name, provide dynamic values too.
-	if schema.wildcard != nil && provider != nil && schema.wildcard.valueHint != ValueHintNone {
-		completions = append(completions, provider(schema.wildcard.valueHint)...)
+	if schema.wildcard != nil {
+		if provider != nil && schema.wildcard.valueHint != ValueHintNone {
+			completions = append(completions, provider(schema.wildcard.valueHint, path)...)
+		}
+		// Add placeholder.
+		if schema.wildcard.placeholder != "" {
+			completions = append(completions, SchemaCompletion{Name: schema.wildcard.placeholder, Desc: schema.wildcard.desc})
+		}
 	}
 	if len(completions) == 0 {
 		return nil

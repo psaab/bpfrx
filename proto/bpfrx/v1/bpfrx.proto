@@ -550,6 +550,7 @@ message CompleteRequest {
 }
 message CompleteResponse {
   repeated string candidates = 1;
+  repeated string descriptions = 2;  // parallel to candidates: desc[i] for candidates[i]
 }
 
 // --- Generic text show ---

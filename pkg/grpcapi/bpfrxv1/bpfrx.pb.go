@@ -6030,6 +6030,7 @@ func (x *CompleteRequest) GetConfigMode() bool {
 type CompleteResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Candidates    []string               `protobuf:"bytes,1,rep,name=candidates,proto3" json:"candidates,omitempty"`
+	Descriptions  []string               `protobuf:"bytes,2,rep,name=descriptions,proto3" json:"descriptions,omitempty"` // parallel to candidates: desc[i] for candidates[i]
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6067,6 +6068,13 @@ func (*CompleteResponse) Descriptor() ([]byte, []int) {
 func (x *CompleteResponse) GetCandidates() []string {
 	if x != nil {
 		return x.Candidates
+	}
+	return nil
+}
+
+func (x *CompleteResponse) GetDescriptions() []string {
+	if x != nil {
+		return x.Descriptions
 	}
 	return nil
 }
@@ -6761,11 +6769,12 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x04line\x18\x01 \x01(\tR\x04line\x12\x10\n" +
 	"\x03pos\x18\x02 \x01(\x05R\x03pos\x12\x1f\n" +
 	"\vconfig_mode\x18\x03 \x01(\bR\n" +
-	"configMode\"2\n" +
+	"configMode\"V\n" +
 	"\x10CompleteResponse\x12\x1e\n" +
 	"\n" +
 	"candidates\x18\x01 \x03(\tR\n" +
-	"candidates\"?\n" +
+	"candidates\x12\"\n" +
+	"\fdescriptions\x18\x02 \x03(\tR\fdescriptions\"?\n" +
 	"\x0fShowTextRequest\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x16\n" +
 	"\x06filter\x18\x02 \x01(\tR\x06filter\"*\n" +

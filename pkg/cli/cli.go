@@ -256,9 +256,9 @@ func (c *CLI) completeConfigWithDesc(words []string, partial string) []completio
 			return nil
 		}
 		var candidates []completionCandidate
-		for _, name := range schemaCompletions {
-			if strings.HasPrefix(name, partial) {
-				candidates = append(candidates, completionCandidate{name: name})
+		for _, sc := range schemaCompletions {
+			if strings.HasPrefix(sc.Name, partial) {
+				candidates = append(candidates, completionCandidate{name: sc.Name, desc: sc.Desc})
 			}
 		}
 		return candidates
@@ -7119,76 +7119,109 @@ func monotonicSeconds() uint64 {
 	return uint64(ts.Sec)
 }
 
-func (c *CLI) valueProvider(hint config.ValueHint) []string {
+func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.SchemaCompletion {
 	cfg := c.store.ActiveConfig()
 	if cfg == nil {
 		return nil
 	}
 	switch hint {
 	case config.ValueHintZoneName:
-		names := make([]string, 0, len(cfg.Security.Zones))
-		for name := range cfg.Security.Zones {
-			names = append(names, name)
+		var out []config.SchemaCompletion
+		for name, zone := range cfg.Security.Zones {
+			desc := zone.Description
+			if desc == "" {
+				desc = "(configured)"
+			}
+			out = append(out, config.SchemaCompletion{Name: name, Desc: desc})
 		}
-		return names
+		return out
 	case config.ValueHintAddressName:
-		var names []string
+		var out []config.SchemaCompletion
 		if cfg.Security.AddressBook != nil {
 			for _, addr := range cfg.Security.AddressBook.Addresses {
-				names = append(names, addr.Name)
+				out = append(out, config.SchemaCompletion{Name: addr.Name, Desc: addr.Value})
 			}
 			for _, as := range cfg.Security.AddressBook.AddressSets {
-				names = append(names, as.Name)
+				out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "address-set"})
 			}
 		}
-		return names
+		return out
 	case config.ValueHintAppName:
-		var names []string
+		var out []config.SchemaCompletion
 		for _, app := range cfg.Applications.Applications {
-			names = append(names, app.Name)
+			out = append(out, config.SchemaCompletion{Name: app.Name, Desc: app.Description})
 		}
 		for _, as := range cfg.Applications.ApplicationSets {
-			names = append(names, as.Name)
+			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
 		}
 		for name := range config.PredefinedApplications {
-			names = append(names, name)
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
 		}
-		return names
+		return out
 	case config.ValueHintAppSetName:
-		var names []string
+		var out []config.SchemaCompletion
 		for _, as := range cfg.Applications.ApplicationSets {
-			names = append(names, as.Name)
+			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
 		}
-		return names
+		return out
 	case config.ValueHintPoolName:
-		var names []string
+		var out []config.SchemaCompletion
 		for name := range cfg.Security.NAT.SourcePools {
-			names = append(names, name)
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "source pool"})
 		}
 		if cfg.Security.NAT.Destination != nil {
 			for name := range cfg.Security.NAT.Destination.Pools {
-				names = append(names, name)
+				out = append(out, config.SchemaCompletion{Name: name, Desc: "destination pool"})
 			}
 		}
-		return names
+		return out
 	case config.ValueHintScreenProfile:
-		names := make([]string, 0, len(cfg.Security.Screen))
+		var out []config.SchemaCompletion
 		for name := range cfg.Security.Screen {
-			names = append(names, name)
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "screen profile"})
 		}
-		return names
+		return out
 	case config.ValueHintStreamName:
-		names := make([]string, 0, len(cfg.Security.Log.Streams))
+		var out []config.SchemaCompletion
 		for name := range cfg.Security.Log.Streams {
-			names = append(names, name)
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "log stream"})
 		}
-		return names
+		return out
 	case config.ValueHintInterfaceName:
-		var names []string
-		for _, zone := range cfg.Security.Zones {
-			names = append(names, zone.Interfaces...)
+		var out []config.SchemaCompletion
+		for name, iface := range cfg.Interfaces.Interfaces {
+			desc := iface.Description
+			if desc == "" {
+				desc = "(configured)"
+			}
+			out = append(out, config.SchemaCompletion{Name: name, Desc: desc})
 		}
-		return names
+		return out
+	case config.ValueHintUnitNumber:
+		// Find the interface name from the path context.
+		var ifaceName string
+		for i, tok := range path {
+			if tok == "interfaces" && i+1 < len(path) {
+				ifaceName = path[i+1]
+				break
+			}
+		}
+		if ifaceName == "" {
+			return nil
+		}
+		iface := cfg.Interfaces.Interfaces[ifaceName]
+		if iface == nil {
+			return nil
+		}
+		var out []config.SchemaCompletion
+		for num, unit := range iface.Units {
+			desc := unit.Description
+			if desc == "" {
+				desc = "(configured)"
+			}
+			out = append(out, config.SchemaCompletion{Name: fmt.Sprintf("%d", num), Desc: desc})
+		}
+		return out
 	}
 	return nil
 }

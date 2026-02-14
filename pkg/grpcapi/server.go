@@ -2099,6 +2099,12 @@ func (s *Server) ClearCounters(_ context.Context, _ *pb.ClearCountersRequest) (*
 
 // --- Completion RPC ---
 
+// completionPair holds a candidate name and optional description.
+type completionPair struct {
+	name string
+	desc string
+}
+
 func (s *Server) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteResponse, error) {
 	text := req.Line
 	if int(req.Pos) < len(text) {
@@ -2120,15 +2126,25 @@ func (s *Server) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Compl
 		words = words[:len(words)-1]
 	}
 
-	var candidates []string
+	var pairs []completionPair
 	if req.ConfigMode {
-		candidates = s.completeConfig(words, partial)
+		pairs = s.completeConfigPairs(words, partial)
 	} else {
-		candidates = s.completeOperational(words, partial)
+		for _, name := range s.completeOperational(words, partial) {
+			pairs = append(pairs, completionPair{name: name})
+		}
 	}
 
-	sort.Strings(candidates)
-	return &pb.CompleteResponse{Candidates: candidates}, nil
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].name < pairs[j].name })
+	resp := &pb.CompleteResponse{
+		Candidates:   make([]string, len(pairs)),
+		Descriptions: make([]string, len(pairs)),
+	}
+	for i, p := range pairs {
+		resp.Candidates[i] = p.name
+		resp.Descriptions[i] = p.desc
+	}
+	return resp, nil
 }
 
 // pipeFilterNames lists available pipe filters for completion.
@@ -2169,9 +2185,15 @@ func (s *Server) completeOperational(words []string, partial string) []string {
 	return cmdtree.CompleteFromTree(cmdtree.OperationalTree, words, partial, cfg)
 }
 
-func (s *Server) completeConfig(words []string, partial string) []string {
+func (s *Server) completeConfigPairs(words []string, partial string) []completionPair {
 	if len(words) == 0 {
-		return cmdtree.FilterPrefix(cmdtree.KeysOf(cmdtree.ConfigTopLevel), partial)
+		var pairs []completionPair
+		for name, node := range cmdtree.ConfigTopLevel {
+			if strings.HasPrefix(name, partial) {
+				pairs = append(pairs, completionPair{name: name, desc: node.Desc})
+			}
+		}
+		return pairs
 	}
 
 	switch words[0] {
@@ -2180,18 +2202,33 @@ func (s *Server) completeConfig(words []string, partial string) []string {
 		if schemaCompletions == nil {
 			return nil
 		}
-		return cmdtree.FilterPrefix(schemaCompletions, partial)
+		var pairs []completionPair
+		for _, sc := range schemaCompletions {
+			if strings.HasPrefix(sc.Name, partial) {
+				pairs = append(pairs, completionPair{name: sc.Name, desc: sc.Desc})
+			}
+		}
+		return pairs
 	case "run":
 		cfg := s.store.ActiveConfig()
-		return cmdtree.CompleteFromTree(cmdtree.OperationalTree, words[1:], partial, cfg)
+		names := cmdtree.CompleteFromTree(cmdtree.OperationalTree, words[1:], partial, cfg)
+		var pairs []completionPair
+		for _, name := range names {
+			pairs = append(pairs, completionPair{name: name})
+		}
+		return pairs
 	case "commit":
 		if len(words) == 1 {
-			return cmdtree.FilterPrefix([]string{"check", "confirmed"}, partial)
+			for _, name := range cmdtree.FilterPrefix([]string{"check", "confirmed"}, partial) {
+				return []completionPair{{name: name}}
+			}
 		}
 		return nil
 	case "load":
 		if len(words) == 1 {
-			return cmdtree.FilterPrefix([]string{"override", "merge"}, partial)
+			for _, name := range cmdtree.FilterPrefix([]string{"override", "merge"}, partial) {
+				return []completionPair{{name: name}}
+			}
 		}
 		return nil
 	default:
@@ -2199,76 +2236,108 @@ func (s *Server) completeConfig(words []string, partial string) []string {
 	}
 }
 
-func (s *Server) valueProvider(hint config.ValueHint) []string {
+func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.SchemaCompletion {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
 		return nil
 	}
 	switch hint {
 	case config.ValueHintZoneName:
-		names := make([]string, 0, len(cfg.Security.Zones))
-		for name := range cfg.Security.Zones {
-			names = append(names, name)
+		var out []config.SchemaCompletion
+		for name, zone := range cfg.Security.Zones {
+			desc := zone.Description
+			if desc == "" {
+				desc = "(configured)"
+			}
+			out = append(out, config.SchemaCompletion{Name: name, Desc: desc})
 		}
-		return names
+		return out
 	case config.ValueHintAddressName:
-		var names []string
+		var out []config.SchemaCompletion
 		if cfg.Security.AddressBook != nil {
 			for _, addr := range cfg.Security.AddressBook.Addresses {
-				names = append(names, addr.Name)
+				out = append(out, config.SchemaCompletion{Name: addr.Name, Desc: addr.Value})
 			}
 			for _, as := range cfg.Security.AddressBook.AddressSets {
-				names = append(names, as.Name)
+				out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "address-set"})
 			}
 		}
-		return names
+		return out
 	case config.ValueHintAppName:
-		var names []string
+		var out []config.SchemaCompletion
 		for _, app := range cfg.Applications.Applications {
-			names = append(names, app.Name)
+			out = append(out, config.SchemaCompletion{Name: app.Name, Desc: app.Description})
 		}
 		for _, as := range cfg.Applications.ApplicationSets {
-			names = append(names, as.Name)
+			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
 		}
 		for name := range config.PredefinedApplications {
-			names = append(names, name)
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
 		}
-		return names
+		return out
 	case config.ValueHintAppSetName:
-		var names []string
+		var out []config.SchemaCompletion
 		for _, as := range cfg.Applications.ApplicationSets {
-			names = append(names, as.Name)
+			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
 		}
-		return names
+		return out
 	case config.ValueHintPoolName:
-		var names []string
+		var out []config.SchemaCompletion
 		for name := range cfg.Security.NAT.SourcePools {
-			names = append(names, name)
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "source pool"})
 		}
 		if cfg.Security.NAT.Destination != nil {
 			for name := range cfg.Security.NAT.Destination.Pools {
-				names = append(names, name)
+				out = append(out, config.SchemaCompletion{Name: name, Desc: "destination pool"})
 			}
 		}
-		return names
+		return out
 	case config.ValueHintScreenProfile:
-		names := make([]string, 0, len(cfg.Security.Screen))
+		var out []config.SchemaCompletion
 		for name := range cfg.Security.Screen {
-			names = append(names, name)
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "screen profile"})
 		}
-		return names
+		return out
 	case config.ValueHintStreamName:
-		names := make([]string, 0, len(cfg.Security.Log.Streams))
+		var out []config.SchemaCompletion
 		for name := range cfg.Security.Log.Streams {
-			names = append(names, name)
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "log stream"})
 		}
-		return names
+		return out
 	case config.ValueHintInterfaceName:
-		var names []string
-		for _, zone := range cfg.Security.Zones {
-			names = append(names, zone.Interfaces...)
+		var out []config.SchemaCompletion
+		for name, iface := range cfg.Interfaces.Interfaces {
+			desc := iface.Description
+			if desc == "" {
+				desc = "(configured)"
+			}
+			out = append(out, config.SchemaCompletion{Name: name, Desc: desc})
 		}
-		return names
+		return out
+	case config.ValueHintUnitNumber:
+		var ifaceName string
+		for i, tok := range path {
+			if tok == "interfaces" && i+1 < len(path) {
+				ifaceName = path[i+1]
+				break
+			}
+		}
+		if ifaceName == "" {
+			return nil
+		}
+		iface := cfg.Interfaces.Interfaces[ifaceName]
+		if iface == nil {
+			return nil
+		}
+		var out []config.SchemaCompletion
+		for num, unit := range iface.Units {
+			desc := unit.Description
+			if desc == "" {
+				desc = "(configured)"
+			}
+			out = append(out, config.SchemaCompletion{Name: fmt.Sprintf("%d", num), Desc: desc})
+		}
+		return out
 	}
 	return nil
 }
