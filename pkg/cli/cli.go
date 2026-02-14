@@ -4877,6 +4877,9 @@ func (c *CLI) showTunnelInterfaces() error {
 		for _, addr := range t.Addresses {
 			fmt.Printf("  Address: %s\n", addr)
 		}
+		if t.KeepaliveInfo != "" {
+			fmt.Printf("  Keepalive: %s\n", t.KeepaliveInfo)
+		}
 		fmt.Println()
 	}
 	return nil
@@ -7073,6 +7076,14 @@ func (c *CLI) showISIS(args []string) error {
 			fmt.Printf("  %-20s %-14s %-10s %-10s %s\n",
 				a.SystemID, a.Interface, a.Level, a.State, a.HoldTime)
 		}
+		return nil
+
+	case "database":
+		output, err := c.frr.GetISISDatabase()
+		if err != nil {
+			return fmt.Errorf("IS-IS database: %w", err)
+		}
+		fmt.Print(output)
 		return nil
 
 	case "routes":

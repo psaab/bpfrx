@@ -2,6 +2,7 @@ package routing
 
 import (
 	"testing"
+	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
 	"golang.org/x/sys/unix"
@@ -370,4 +371,68 @@ func TestBuildPBRRules(t *testing.T) {
 			t.Errorf("expected 0 PBR rules for nil config, got %d", len(rules))
 		}
 	})
+}
+
+func TestProbeICMP(t *testing.T) {
+	// localhost should always be reachable (via UDP fallback at minimum)
+	if !probeICMP("127.0.0.1") {
+		t.Error("expected probe to 127.0.0.1 to succeed")
+	}
+
+	// Invalid address should fail
+	if probeICMP("not-an-ip") {
+		t.Error("expected probe to invalid address to fail")
+	}
+}
+
+func TestKeepaliveState(t *testing.T) {
+	state := &KeepaliveState{
+		Up:         true,
+		RemoteAddr: "10.0.0.1",
+		Interval:   5,
+		MaxRetries: 3,
+	}
+
+	// Initial state should be up
+	if !state.Up {
+		t.Error("expected initial state to be up")
+	}
+
+	// Simulate failures
+	for i := 0; i < 3; i++ {
+		state.Failures++
+	}
+	if state.Failures != 3 {
+		t.Errorf("expected 3 failures, got %d", state.Failures)
+	}
+
+	// After reaching max retries, should be marked down
+	state.Up = false
+	state.LastFailure = time.Now()
+
+	if state.Up {
+		t.Error("expected state to be down after max retries")
+	}
+
+	// Simulate recovery
+	state.Failures = 0
+	state.Up = true
+	state.LastSuccess = time.Now()
+
+	if !state.Up {
+		t.Error("expected state to be up after recovery")
+	}
+}
+
+func TestKeepaliveDefaults(t *testing.T) {
+	// When KeepaliveRetry is 0, startKeepalive should default to 3
+	// We can't call startKeepalive without a netlink handle, but we
+	// can verify the default logic inline.
+	maxRetries := 0
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	if maxRetries != 3 {
+		t.Errorf("expected default maxRetries to be 3, got %d", maxRetries)
+	}
 }

@@ -184,6 +184,11 @@ func (m *Manager) GetISISAdjacency() ([]ISISAdjacency, error) {
 	return adjs, nil
 }
 
+// GetISISDatabase returns raw IS-IS link-state database output.
+func (m *Manager) GetISISDatabase() (string, error) {
+	return vtyshCmd("show isis database detail")
+}
+
 // GetISISRoutes returns raw IS-IS route output.
 func (m *Manager) GetISISRoutes() (string, error) {
 	return vtyshCmd("show isis route")

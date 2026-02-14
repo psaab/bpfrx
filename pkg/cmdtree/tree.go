@@ -231,6 +231,7 @@ var OperationalTree = map[string]*Node{
 			"rip":  {Desc: "Show RIP information"},
 			"isis": {Desc: "Show IS-IS information", Children: map[string]*Node{
 				"adjacency": {Desc: "Show IS-IS adjacencies"},
+				"database":  {Desc: "Show IS-IS link-state database"},
 				"routes":    {Desc: "Show IS-IS routes"},
 			}},
 		}},

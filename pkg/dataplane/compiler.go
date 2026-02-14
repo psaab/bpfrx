@@ -545,7 +545,9 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 
 				// Bring the interface UP so XDP can process traffic,
 				// unless the interface is administratively disabled.
+				isDisabled := false
 				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg.Disable {
+					isDisabled = true
 					if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
 						if err := netlink.LinkSetDown(nl); err != nil {
 							slog.Warn("failed to bring disabled interface down",
@@ -561,10 +563,17 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					}
 				}
 
-				// Defer actual XDP/TC attachment to after all compile phases
-				// so link.Update() switches to programs with fully-populated maps.
-				xdpIfindexes = append(xdpIfindexes, physIface.Index)
-				result.pendingTC = append(result.pendingTC, physIface.Index)
+				// Skip XDP/TC attachment for disabled interfaces — they are
+				// administratively down and should not process traffic.
+				if isDisabled {
+					slog.Info("skipping XDP/TC attachment for disabled interface",
+						"name", physName, "ifindex", physIface.Index)
+				} else {
+					// Defer actual XDP/TC attachment to after all compile phases
+					// so link.Update() switches to programs with fully-populated maps.
+					xdpIfindexes = append(xdpIfindexes, physIface.Index)
+					result.pendingTC = append(result.pendingTC, physIface.Index)
+				}
 				attached[physIface.Index] = true
 			}
 

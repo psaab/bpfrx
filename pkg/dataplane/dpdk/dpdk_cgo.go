@@ -16,8 +16,14 @@ package dpdk
 #include <rte_malloc.h>
 #include <rte_memzone.h>
 #include <rte_cycles.h>
+#include <rte_ip6.h>
 #include <stdlib.h>
 #include <string.h>
+
+// memzone_addr extracts addr from anonymous union (CGo can't access anonymous union fields).
+static inline void *memzone_addr(const struct rte_memzone *mz) {
+	return mz->addr;
+}
 */
 import "C"
 
@@ -92,7 +98,7 @@ func (m *Manager) Load() error {
 	if mz == nil {
 		return fmt.Errorf("rte_memzone_lookup(bpfrx_shm) failed: primary not running?")
 	}
-	m.platform.shm = (*C.struct_shared_memory)(mz.addr)
+	m.platform.shm = (*C.struct_shared_memory)(C.memzone_addr(mz))
 
 	if m.platform.shm.magic != C.SHM_MAGIC {
 		return fmt.Errorf("shared memory magic mismatch: got 0x%x, want 0x%x",
@@ -395,11 +401,11 @@ func (m *Manager) SetAddressBookEntry(cidr string, addressID uint32) error {
 		}
 	} else {
 		ip6 := ip.To16()
-		var addr [16]C.uint8_t
+		var addr C.struct_rte_ipv6_addr
 		for i := 0; i < 16; i++ {
-			addr[i] = C.uint8_t(ip6[i])
+			addr.a[i] = C.uint8_t(ip6[i])
 		}
-		rc := C.rte_lpm6_add(shm.address_book_v6, &addr[0],
+		rc := C.rte_lpm6_add(shm.address_book_v6, &addr,
 			C.uint8_t(ones), C.uint32_t(addressID))
 		if rc < 0 {
 			return fmt.Errorf("rte_lpm6_add(%s): %d", cidr, rc)
@@ -966,6 +972,8 @@ func (m *Manager) SetScreenConfig(profileID uint32, cfg dataplane.ScreenConfig) 
 	ptr.syn_flood_src_thresh = C.uint32_t(cfg.SynFloodSrcThresh)
 	ptr.syn_flood_dst_thresh = C.uint32_t(cfg.SynFloodDstThresh)
 	ptr.syn_flood_timeout = C.uint32_t(cfg.SynFloodTimeout)
+	ptr.port_scan_thresh = C.uint32_t(cfg.PortScanThresh)
+	ptr.ip_sweep_thresh = C.uint32_t(cfg.IPSweepThresh)
 	return nil
 }
 
@@ -1352,9 +1360,12 @@ func (m *Manager) SetFIBRoute(family uint8, dst net.IP, prefixLen int, nexthopID
 		if shm.fib_v6 == nil {
 			return fmt.Errorf("fib_v6 not allocated")
 		}
-		var ip6 [16]C.uint8_t
-		copy((*[16]byte)(unsafe.Pointer(&ip6[0]))[:], dst.To16())
-		rc := C.rte_lpm6_add(shm.fib_v6, &ip6[0], C.uint8_t(prefixLen),
+		var ip6 C.struct_rte_ipv6_addr
+		ip6bytes := dst.To16()
+		for i := 0; i < 16; i++ {
+			ip6.a[i] = C.uint8_t(ip6bytes[i])
+		}
+		rc := C.rte_lpm6_add(shm.fib_v6, &ip6, C.uint8_t(prefixLen),
 			C.uint32_t(nexthopID))
 		if rc < 0 {
 			return fmt.Errorf("rte_lpm6_add: %d", rc)

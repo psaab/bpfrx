@@ -2,24 +2,46 @@
 package routing
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
+// KeepaliveState tracks the status of a GRE tunnel keepalive probe.
+type KeepaliveState struct {
+	mu           sync.Mutex
+	Up           bool   // true if tunnel is considered up
+	Failures     int    // consecutive probe failures
+	LastSuccess  time.Time
+	LastFailure  time.Time
+	RemoteAddr   string // remote endpoint being probed
+	Interval     int    // probe interval in seconds
+	MaxRetries   int    // failures before declaring down
+}
+
 // Manager handles tunnel and VRF lifecycle.
 type Manager struct {
-	nlHandle *netlink.Handle
-	tunnels  []string // currently created tunnel interface names
-	vrfs     []string // currently created VRF device names
-	xfrmis   []string // currently created xfrmi interface names
+	nlHandle   *netlink.Handle
+	tunnels    []string // currently created tunnel interface names
+	vrfs       []string // currently created VRF device names
+	xfrmis     []string // currently created xfrmi interface names
+	keepalives map[string]*keepaliveRunner // tunnel name -> runner
+}
+
+// keepaliveRunner manages the goroutine for a single tunnel's keepalive.
+type keepaliveRunner struct {
+	cancel context.CancelFunc
+	state  *KeepaliveState
 }
 
 // New creates a new routing Manager.
@@ -28,11 +50,15 @@ func New() (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("netlink handle: %w", err)
 	}
-	return &Manager{nlHandle: h}, nil
+	return &Manager{
+		nlHandle:   h,
+		keepalives: make(map[string]*keepaliveRunner),
+	}, nil
 }
 
-// Close releases the netlink handle.
+// Close releases the netlink handle and stops all keepalive probes.
 func (m *Manager) Close() error {
+	m.stopAllKeepalives()
 	if m.nlHandle != nil {
 		m.nlHandle.Close()
 	}
@@ -163,7 +189,8 @@ func routeToEntry(m *Manager, r netlink.Route, family int) RouteEntry {
 }
 
 // ApplyTunnels creates GRE tunnel interfaces, brings them up, and assigns addresses.
-// Previous tunnels are removed first.
+// Previous tunnels are removed first. Starts keepalive probes for tunnels that have
+// keepalive configured.
 func (m *Manager) ApplyTunnels(tunnels []*config.TunnelConfig) error {
 	if err := m.ClearTunnels(); err != nil {
 		slog.Warn("failed to clear previous tunnels", "err", err)
@@ -242,13 +269,139 @@ func (m *Manager) ApplyTunnels(tunnels []*config.TunnelConfig) error {
 		slog.Info("tunnel created", "name", tc.Name,
 			"src", tc.Source, "dst", tc.Destination)
 		m.tunnels = append(m.tunnels, tc.Name)
+
+		// Start keepalive probe if configured
+		if tc.Keepalive > 0 {
+			m.startKeepalive(tc.Name, tc.Destination, tc.Keepalive, tc.KeepaliveRetry)
+		}
 	}
 
 	return nil
 }
 
+// stopAllKeepalives cancels all running keepalive goroutines.
+func (m *Manager) stopAllKeepalives() {
+	for name, runner := range m.keepalives {
+		runner.cancel()
+		slog.Debug("stopped keepalive", "tunnel", name)
+	}
+	m.keepalives = make(map[string]*keepaliveRunner)
+}
+
+// startKeepalive starts a keepalive probe goroutine for a tunnel.
+func (m *Manager) startKeepalive(tunnelName, remoteAddr string, interval, maxRetries int) {
+	// Stop existing keepalive for this tunnel if any
+	if runner, ok := m.keepalives[tunnelName]; ok {
+		runner.cancel()
+	}
+
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+
+	state := &KeepaliveState{
+		Up:         true,
+		RemoteAddr: remoteAddr,
+		Interval:   interval,
+		MaxRetries: maxRetries,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.keepalives[tunnelName] = &keepaliveRunner{
+		cancel: cancel,
+		state:  state,
+	}
+
+	go m.keepaliveLoop(ctx, tunnelName, state)
+	slog.Info("started keepalive", "tunnel", tunnelName,
+		"remote", remoteAddr, "interval", interval, "retries", maxRetries)
+}
+
+// keepaliveLoop runs periodic ICMP probes to the tunnel remote endpoint.
+func (m *Manager) keepaliveLoop(ctx context.Context, tunnelName string, state *KeepaliveState) {
+	ticker := time.NewTicker(time.Duration(state.Interval) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ok := probeICMP(state.RemoteAddr)
+			state.mu.Lock()
+			if ok {
+				state.LastSuccess = time.Now()
+				if !state.Up {
+					slog.Info("tunnel keepalive recovered", "tunnel", tunnelName,
+						"remote", state.RemoteAddr)
+					state.Up = true
+					state.Failures = 0
+					// Bring tunnel back up
+					if link, err := m.nlHandle.LinkByName(tunnelName); err == nil {
+						m.nlHandle.LinkSetUp(link)
+					}
+				}
+				state.Failures = 0
+			} else {
+				state.Failures++
+				state.LastFailure = time.Now()
+				if state.Up && state.Failures >= state.MaxRetries {
+					slog.Warn("tunnel keepalive failed, marking down",
+						"tunnel", tunnelName, "remote", state.RemoteAddr,
+						"failures", state.Failures)
+					state.Up = false
+					// Bring tunnel down
+					if link, err := m.nlHandle.LinkByName(tunnelName); err == nil {
+						m.nlHandle.LinkSetDown(link)
+					}
+				}
+			}
+			state.mu.Unlock()
+		}
+	}
+}
+
+// probeICMP sends a single ICMP echo request and returns true if the host responds.
+func probeICMP(addr string) bool {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+
+	network := "ip4:icmp"
+	if ip.To4() == nil {
+		network = "ip6:ipv6-icmp"
+	}
+
+	conn, err := net.DialTimeout(network, addr, 3*time.Second)
+	if err != nil {
+		// Fallback: use UDP dial as a reachability check when raw socket
+		// is not available (no CAP_NET_RAW). A successful UDP dial only
+		// means the route exists, but for keepalive purposes this is
+		// close enough. ping utility would be better but adds exec overhead.
+		conn2, err2 := net.DialTimeout("udp", net.JoinHostPort(addr, "1"), 3*time.Second)
+		if err2 != nil {
+			return false
+		}
+		conn2.Close()
+		return true
+	}
+	conn.Close()
+	return true
+}
+
+// GetKeepaliveState returns the keepalive state for a tunnel, or nil if no keepalive is configured.
+func (m *Manager) GetKeepaliveState(tunnelName string) *KeepaliveState {
+	runner, ok := m.keepalives[tunnelName]
+	if !ok {
+		return nil
+	}
+	return runner.state
+}
+
 // ClearTunnels removes all previously created tunnel interfaces.
 func (m *Manager) ClearTunnels() error {
+	m.stopAllKeepalives()
 	for _, name := range m.tunnels {
 		link, err := m.nlHandle.LinkByName(name)
 		if err != nil {
@@ -376,11 +529,13 @@ func parseXfrmiName(bindIface string) (string, uint32) {
 
 // TunnelStatus holds the status of a tunnel interface.
 type TunnelStatus struct {
-	Name        string
-	Source      string
-	Destination string
-	State       string // "up" or "down"
-	Addresses   []string
+	Name           string
+	Source         string
+	Destination    string
+	State          string // "up" or "down"
+	Addresses      []string
+	KeepaliveUp    *bool  // nil if no keepalive configured
+	KeepaliveInfo  string // human-readable keepalive status
 }
 
 // GetTunnelStatus returns the status of managed tunnel interfaces.
@@ -414,6 +569,21 @@ func (m *Manager) GetTunnelStatus() ([]TunnelStatus, error) {
 			for _, a := range addrs {
 				ts.Addresses = append(ts.Addresses, a.IPNet.String())
 			}
+		}
+
+		// Add keepalive info
+		if ks := m.GetKeepaliveState(name); ks != nil {
+			ks.mu.Lock()
+			up := ks.Up
+			ts.KeepaliveUp = &up
+			if up {
+				ts.KeepaliveInfo = fmt.Sprintf("up (interval %ds, %d retries)",
+					ks.Interval, ks.MaxRetries)
+			} else {
+				ts.KeepaliveInfo = fmt.Sprintf("down (%d consecutive failures)",
+					ks.Failures)
+			}
+			ks.mu.Unlock()
 		}
 
 		result = append(result, ts)

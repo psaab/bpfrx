@@ -1594,6 +1594,12 @@ func (s *Server) GetISISStatus(_ context.Context, req *pb.GetISISStatusRequest) 
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
 		b.WriteString(output)
+	case "database":
+		output, err := s.frr.GetISISDatabase()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
+		b.WriteString(output)
 	default:
 		adjs, err := s.frr.GetISISAdjacency()
 		if err != nil {
@@ -4036,6 +4042,9 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 					fmt.Fprintf(&buf, "  Destination: %s\n", t.Destination)
 					for _, addr := range t.Addresses {
 						fmt.Fprintf(&buf, "  Address:     %s\n", addr)
+					}
+					if t.KeepaliveInfo != "" {
+						fmt.Fprintf(&buf, "  Keepalive:   %s\n", t.KeepaliveInfo)
 					}
 					buf.WriteString("\n")
 				}
