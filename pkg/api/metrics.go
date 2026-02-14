@@ -233,21 +233,9 @@ func (c *bpfrxCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (c *bpfrxCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
-	ctrMap := dp.Map("global_counters")
-	if ctrMap == nil {
-		return
-	}
-
 	readCounter := func(idx uint32) float64 {
-		var perCPU []uint64
-		if err := ctrMap.Lookup(idx, &perCPU); err != nil {
-			return 0
-		}
-		var total uint64
-		for _, v := range perCPU {
-			total += v
-		}
-		return float64(total)
+		v, _ := dp.ReadGlobalCounter(idx)
+		return float64(v)
 	}
 
 	ch <- prometheus.MustNewConstMetric(c.packetsTotal, prometheus.CounterValue,

@@ -1066,11 +1066,6 @@ func logFinalStats(dp dataplane.DataPlane) {
 	if !dp.IsLoaded() {
 		return
 	}
-	ctrMap := dp.Map("global_counters")
-	if ctrMap == nil {
-		return
-	}
-
 	indices := []struct {
 		idx  uint32
 		name string
@@ -1086,15 +1081,11 @@ func logFinalStats(dp dataplane.DataPlane) {
 
 	attrs := make([]any, 0, len(indices)*2)
 	for _, n := range indices {
-		var perCPU []uint64
-		if err := ctrMap.Lookup(n.idx, &perCPU); err != nil {
+		v, err := dp.ReadGlobalCounter(n.idx)
+		if err != nil {
 			continue
 		}
-		var total uint64
-		for _, v := range perCPU {
-			total += v
-		}
-		attrs = append(attrs, n.name, total)
+		attrs = append(attrs, n.name, v)
 	}
 
 	slog.Info("final statistics", attrs...)

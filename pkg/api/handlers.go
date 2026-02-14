@@ -63,22 +63,9 @@ func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
-	ctrMap := s.dp.Map("global_counters")
-	if ctrMap == nil {
-		writeError(w, http.StatusInternalServerError, "global_counters map not found")
-		return
-	}
-
 	readCounter := func(idx uint32) uint64 {
-		var perCPU []uint64
-		if err := ctrMap.Lookup(idx, &perCPU); err != nil {
-			return 0
-		}
-		var total uint64
-		for _, v := range perCPU {
-			total += v
-		}
-		return total
+		v, _ := s.dp.ReadGlobalCounter(idx)
+		return v
 	}
 
 	stats := GlobalStats{

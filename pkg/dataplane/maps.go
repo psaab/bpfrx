@@ -443,6 +443,23 @@ func (m *Manager) ClearScreenConfigs() error {
 	return nil
 }
 
+// ReadGlobalCounter reads a per-CPU global counter and returns the sum across all CPUs.
+func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) {
+	zm, ok := m.maps["global_counters"]
+	if !ok {
+		return 0, fmt.Errorf("global_counters map not found")
+	}
+	var perCPU []uint64
+	if err := zm.Lookup(index, &perCPU); err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, v := range perCPU {
+		total += v
+	}
+	return total, nil
+}
+
 // ReadInterfaceCounters reads the per-CPU interface counter values and sums them.
 func (m *Manager) ReadInterfaceCounters(ifindex int) (InterfaceCounterValue, error) {
 	zm, ok := m.maps["interface_counters"]

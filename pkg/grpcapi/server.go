@@ -314,21 +314,9 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
-	ctrMap := s.dp.Map("global_counters")
-	if ctrMap == nil {
-		return nil, status.Error(codes.Internal, "global_counters map not found")
-	}
-
 	readCounter := func(idx uint32) uint64 {
-		var perCPU []uint64
-		if err := ctrMap.Lookup(idx, &perCPU); err != nil {
-			return 0
-		}
-		var total uint64
-		for _, v := range perCPU {
-			total += v
-		}
-		return total
+		v, _ := s.dp.ReadGlobalCounter(idx)
+		return v
 	}
 
 	// Collect per-screen-type drop counters
@@ -3734,40 +3722,28 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		if s.dp == nil || !s.dp.IsLoaded() {
 			buf.WriteString("Flow statistics: dataplane not loaded\n")
 		} else {
-			ctrMap := s.dp.Map("global_counters")
-			if ctrMap == nil {
-				buf.WriteString("Flow statistics: global_counters map not found\n")
-			} else {
-				readCtr := func(idx uint32) uint64 {
-					var perCPU []uint64
-					if err := ctrMap.Lookup(idx, &perCPU); err != nil {
-						return 0
-					}
-					var total uint64
-					for _, v := range perCPU {
-						total += v
-					}
-					return total
-				}
-				sessNew := readCtr(dataplane.GlobalCtrSessionsNew)
-				sessClosed := readCtr(dataplane.GlobalCtrSessionsClosed)
-				buf.WriteString("Flow statistics:\n")
-				fmt.Fprintf(&buf, "  %-30s %d\n", "Current sessions:", sessNew-sessClosed)
-				fmt.Fprintf(&buf, "  %-30s %d\n", "Sessions created:", sessNew)
-				fmt.Fprintf(&buf, "  %-30s %d\n", "Sessions closed:", sessClosed)
-				buf.WriteString("\n")
-				fmt.Fprintf(&buf, "  %-30s %d\n", "Packets received:", readCtr(dataplane.GlobalCtrRxPackets))
-				fmt.Fprintf(&buf, "  %-30s %d\n", "Packets transmitted:", readCtr(dataplane.GlobalCtrTxPackets))
-				fmt.Fprintf(&buf, "  %-30s %d\n", "Packets dropped:", readCtr(dataplane.GlobalCtrDrops))
-				fmt.Fprintf(&buf, "  %-30s %d\n", "TC egress packets:", readCtr(dataplane.GlobalCtrTCEgressPackets))
-				buf.WriteString("\n")
-				fmt.Fprintf(&buf, "  %-30s %d\n", "Policy deny:", readCtr(dataplane.GlobalCtrPolicyDeny))
-				fmt.Fprintf(&buf, "  %-30s %d\n", "NAT allocation failures:", readCtr(dataplane.GlobalCtrNATAllocFail))
-				fmt.Fprintf(&buf, "  %-30s %d\n", "Screen drops:", readCtr(dataplane.GlobalCtrScreenDrops))
-				fmt.Fprintf(&buf, "  %-30s %d\n", "Host-inbound denies:", readCtr(dataplane.GlobalCtrHostInboundDeny))
-				fmt.Fprintf(&buf, "  %-30s %d\n", "Host-inbound allowed:", readCtr(dataplane.GlobalCtrHostInbound))
-				fmt.Fprintf(&buf, "  %-30s %d\n", "NAT64 translations:", readCtr(dataplane.GlobalCtrNAT64Xlate))
+			readCtr := func(idx uint32) uint64 {
+				v, _ := s.dp.ReadGlobalCounter(idx)
+				return v
 			}
+			sessNew := readCtr(dataplane.GlobalCtrSessionsNew)
+			sessClosed := readCtr(dataplane.GlobalCtrSessionsClosed)
+			buf.WriteString("Flow statistics:\n")
+			fmt.Fprintf(&buf, "  %-30s %d\n", "Current sessions:", sessNew-sessClosed)
+			fmt.Fprintf(&buf, "  %-30s %d\n", "Sessions created:", sessNew)
+			fmt.Fprintf(&buf, "  %-30s %d\n", "Sessions closed:", sessClosed)
+			buf.WriteString("\n")
+			fmt.Fprintf(&buf, "  %-30s %d\n", "Packets received:", readCtr(dataplane.GlobalCtrRxPackets))
+			fmt.Fprintf(&buf, "  %-30s %d\n", "Packets transmitted:", readCtr(dataplane.GlobalCtrTxPackets))
+			fmt.Fprintf(&buf, "  %-30s %d\n", "Packets dropped:", readCtr(dataplane.GlobalCtrDrops))
+			fmt.Fprintf(&buf, "  %-30s %d\n", "TC egress packets:", readCtr(dataplane.GlobalCtrTCEgressPackets))
+			buf.WriteString("\n")
+			fmt.Fprintf(&buf, "  %-30s %d\n", "Policy deny:", readCtr(dataplane.GlobalCtrPolicyDeny))
+			fmt.Fprintf(&buf, "  %-30s %d\n", "NAT allocation failures:", readCtr(dataplane.GlobalCtrNATAllocFail))
+			fmt.Fprintf(&buf, "  %-30s %d\n", "Screen drops:", readCtr(dataplane.GlobalCtrScreenDrops))
+			fmt.Fprintf(&buf, "  %-30s %d\n", "Host-inbound denies:", readCtr(dataplane.GlobalCtrHostInboundDeny))
+			fmt.Fprintf(&buf, "  %-30s %d\n", "Host-inbound allowed:", readCtr(dataplane.GlobalCtrHostInbound))
+			fmt.Fprintf(&buf, "  %-30s %d\n", "NAT64 translations:", readCtr(dataplane.GlobalCtrNAT64Xlate))
 		}
 
 	case "flow-traceoptions":
@@ -4278,43 +4254,33 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 
 		if s.dp != nil && s.dp.IsLoaded() {
-			ctrMap := s.dp.Map("global_counters")
-			if ctrMap != nil {
-				readCtr := func(idx uint32) uint64 {
-					var perCPU []uint64
-					if err := ctrMap.Lookup(idx, &perCPU); err != nil {
-						return 0
-					}
-					var total uint64
-					for _, v := range perCPU {
-						total += v
-					}
-					return total
-				}
-				screenNames := []struct {
-					idx  uint32
-					name string
-				}{
-					{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
-					{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
-					{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
-					{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
-					{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
-					{dataplane.GlobalCtrScreenTearDrop, "Tear-drop"},
-					{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
-					{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no-flag"},
-					{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN-no-ACK"},
-					{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
-					{dataplane.GlobalCtrScreenIPSrcRoute, "IP source-route"},
-					{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
-				}
-				for _, sc := range screenNames {
-					val := readCtr(sc.idx)
-					if val > 0 {
-						alarmCount++
-						if detail {
-							fmt.Fprintf(&buf, "Alarm %d:\n  Class: IDS\n  Severity: Major\n  Description: %s attack detected (%d drops)\n\n", alarmCount, sc.name, val)
-						}
+			readCtr := func(idx uint32) uint64 {
+				v, _ := s.dp.ReadGlobalCounter(idx)
+				return v
+			}
+			screenNames := []struct {
+				idx  uint32
+				name string
+			}{
+				{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
+				{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
+				{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
+				{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
+				{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
+				{dataplane.GlobalCtrScreenTearDrop, "Tear-drop"},
+				{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
+				{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no-flag"},
+				{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN-no-ACK"},
+				{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
+				{dataplane.GlobalCtrScreenIPSrcRoute, "IP source-route"},
+				{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
+			}
+			for _, sc := range screenNames {
+				val := readCtr(sc.idx)
+				if val > 0 {
+					alarmCount++
+					if detail {
+						fmt.Fprintf(&buf, "Alarm %d:\n  Class: IDS\n  Severity: Major\n  Description: %s attack detected (%d drops)\n\n", alarmCount, sc.name, val)
 					}
 				}
 			}
@@ -5280,44 +5246,34 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			}
 			// Per-type drop counters
 			if s.dp != nil && s.dp.IsLoaded() {
-				ctrMap := s.dp.Map("global_counters")
-				if ctrMap != nil {
-					readCtr := func(idx uint32) uint64 {
-						var perCPU []uint64
-						if err := ctrMap.Lookup(idx, &perCPU); err == nil {
-							var total uint64
-							for _, v := range perCPU {
-								total += v
-							}
-							return total
-						}
-						return 0
+				readCtr := func(idx uint32) uint64 {
+					v, _ := s.dp.ReadGlobalCounter(idx)
+					return v
+				}
+				totalDrops := readCtr(dataplane.GlobalCtrScreenDrops)
+				fmt.Fprintf(&buf, "Total screen drops: %d\n", totalDrops)
+				if totalDrops > 0 {
+					screenCounters := []struct {
+						idx  uint32
+						name string
+					}{
+						{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
+						{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
+						{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
+						{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
+						{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
+						{dataplane.GlobalCtrScreenTearDrop, "Teardrop"},
+						{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
+						{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
+						{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
+						{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
+						{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
+						{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
 					}
-					totalDrops := readCtr(dataplane.GlobalCtrScreenDrops)
-					fmt.Fprintf(&buf, "Total screen drops: %d\n", totalDrops)
-					if totalDrops > 0 {
-						screenCounters := []struct {
-							idx  uint32
-							name string
-						}{
-							{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
-							{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
-							{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
-							{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
-							{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
-							{dataplane.GlobalCtrScreenTearDrop, "Teardrop"},
-							{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
-							{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
-							{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
-							{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
-							{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
-							{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
-						}
-						for _, sc := range screenCounters {
-							v := readCtr(sc.idx)
-							if v > 0 {
-								fmt.Fprintf(&buf, "  %-25s %d\n", sc.name+":", v)
-							}
+					for _, sc := range screenCounters {
+						v := readCtr(sc.idx)
+						if v > 0 {
+							fmt.Fprintf(&buf, "  %-25s %d\n", sc.name+":", v)
 						}
 					}
 				}

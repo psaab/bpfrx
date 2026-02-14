@@ -206,6 +206,8 @@ func (m *Manager) ClearFilterConfigs() error                                  { 
 
 // --- Counters ---
 
+func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) { return 0, nil }
+
 func (m *Manager) ReadInterfaceCounters(ifindex int) (dataplane.InterfaceCounterValue, error) {
 	return dataplane.InterfaceCounterValue{}, nil
 }

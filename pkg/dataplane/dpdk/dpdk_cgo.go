@@ -1110,6 +1110,13 @@ func (m *Manager) ClearFilterConfigs() error {
 
 // --- Counters ---
 
+func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) {
+	if m.platform.shm == nil {
+		return 0, fmt.Errorf("DPDK not initialized")
+	}
+	return uint64(C.counters_aggregate_global(C.uint32_t(index))), nil
+}
+
 func (m *Manager) ReadInterfaceCounters(ifindex int) (dataplane.InterfaceCounterValue, error) {
 	shm := m.platform.shm
 	if shm == nil {
