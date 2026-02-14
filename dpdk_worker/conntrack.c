@@ -462,6 +462,7 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			meta->policy_id = sv->policy_id;
 			meta->ingress_zone = sv->ingress_zone;
 			meta->egress_zone = sv->egress_zone;
+			meta->log_flags = sv->log_flags;
 
 			/* NAT info */
 			meta->nat_flags = sv->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT | SESS_FLAG_STATIC_NAT | SESS_FLAG_NAT64);
@@ -530,6 +531,7 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			meta->policy_id = sv->policy_id;
 			meta->ingress_zone = sv->egress_zone;  /* Swap for reverse */
 			meta->egress_zone = sv->ingress_zone;
+			meta->log_flags = sv->log_flags;
 
 			meta->nat_flags = sv->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT | SESS_FLAG_STATIC_NAT | SESS_FLAG_NAT64);
 			/* For reverse direction, swap NAT src/dst */
@@ -604,6 +606,7 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			meta->policy_id = sv->policy_id;
 			meta->ingress_zone = sv->ingress_zone;
 			meta->egress_zone = sv->egress_zone;
+			meta->log_flags = sv->log_flags;
 
 			meta->nat_flags = sv->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT | SESS_FLAG_STATIC_NAT | SESS_FLAG_NAT64);
 			memcpy(meta->nat_src_ip.v6, sv->nat_src_ip, 16);
@@ -666,6 +669,7 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			meta->policy_id = sv->policy_id;
 			meta->ingress_zone = sv->egress_zone;  /* Swap for reverse */
 			meta->egress_zone = sv->ingress_zone;
+			meta->log_flags = sv->log_flags;
 
 			meta->nat_flags = sv->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT | SESS_FLAG_STATIC_NAT | SESS_FLAG_NAT64);
 			/* For reverse direction, swap NAT src/dst */

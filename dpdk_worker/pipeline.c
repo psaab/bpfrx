@@ -130,6 +130,16 @@ process_packet(struct rte_mbuf *pkt, struct pipeline_ctx *ctx)
 	if (meta.protocol == PROTO_TCP && (meta.tcp_flags & 0x02))
 		tcp_mss_clamp(pkt, &meta, ctx);
 
+	/* CLOSED state enforcement: forward the RST that closed the
+	 * session so the peer receives it; drop any subsequent non-RST
+	 * packets on dead TCP connections. Matches eBPF xdp_conntrack. */
+	if (ct_result == CT_ESTABLISHED &&
+	    meta.ct_state == SESS_STATE_CLOSED) {
+		if (meta.tcp_flags & 0x04)
+			goto forward;  /* Let final RST through */
+		goto drop;             /* Drop non-RST on closed session */
+	}
+
 	if (ct_result == CT_ESTABLISHED &&
 	    !(meta.nat_flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT)))
 		goto forward;  /* Fast path: established, no NAT */
