@@ -727,6 +727,9 @@ struct shared_memory {
 	struct snat_value       *snat_values_v4;
 	struct snat_value_v6    *snat_values_v6;
 
+	/* NAT64 state value array (indexed by rte_hash position) */
+	struct nat64_state_value *nat64_state_values;
+
 	/* Event ring (DPDK worker -> Go) */
 	struct rte_ring *event_ring;
 

@@ -16,6 +16,7 @@ sources = files(
     'nat64.c',
     'forward.c',
     'filter.c',
+    'reject.c',
     'rx_poll.c',
     'rx_interrupt.c',
     'rx_adaptive.c',

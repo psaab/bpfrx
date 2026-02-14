@@ -133,6 +133,9 @@ struct pipeline_ctx {
 
 	/* Mode-switch counter (adaptive mode) */
 	uint64_t mode_switches;
+
+	/* Per-lcore SNAT port allocation counter */
+	uint64_t snat_port_counter;
 };
 
 /* ============================================================

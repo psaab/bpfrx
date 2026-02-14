@@ -172,9 +172,103 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		if (rule->action != ACTION_PERMIT) {
 			ctr_global_inc(ctx, GLOBAL_CTR_POLICY_DENY);
 			emit_event(ctx, meta, EVENT_TYPE_POLICY_DENY, rule->action);
+			return rule->action;
 		}
 
-		return rule->action;
+		/* ---- SNAT for PERMIT actions ---- */
+
+		/* Static 1:1 NAT SNAT check (highest priority) */
+		if (meta->addr_family == AF_INET && ctx->shm->static_nat_v4) {
+			struct static_nat_key_v4 snk = {
+				.ip = meta->src_ip.v4,
+				.direction = STATIC_NAT_SNAT,
+			};
+			void *sn_data = NULL;
+			if (rte_hash_lookup_data(ctx->shm->static_nat_v4,
+			                         &snk, &sn_data) >= 0) {
+				meta->nat_src_ip.v4 = (uint32_t)(uintptr_t)sn_data;
+				meta->nat_src_port = meta->src_port;
+				meta->nat_flags |= SESS_FLAG_SNAT | SESS_FLAG_STATIC_NAT;
+			}
+		}
+
+		/* Dynamic SNAT pool allocation (skip if static already matched) */
+		if (!(meta->nat_flags & SESS_FLAG_STATIC_NAT) &&
+		    meta->addr_family == AF_INET &&
+		    ctx->shm->snat_rules && ctx->shm->snat_values_v4) {
+			struct snat_key sk = {
+				.from_zone = meta->ingress_zone,
+				.to_zone = meta->egress_zone,
+			};
+
+			for (uint16_t ri = 0; ri < MAX_SNAT_RULES_PER_PAIR; ri++) {
+				sk.rule_idx = ri;
+				int spos = rte_hash_lookup(ctx->shm->snat_rules, &sk);
+				if (spos < 0)
+					break;
+
+				struct snat_value *sv = &ctx->shm->snat_values_v4[spos];
+
+				/* Source address match */
+				if (sv->src_addr_id != 0 &&
+				    lpm_lookup_addr_id(ctx, meta, 1, sv->src_addr_id) == 0)
+					continue;
+
+				/* Destination address match */
+				if (sv->dst_addr_id != 0 &&
+				    lpm_lookup_addr_id(ctx, meta, 0, sv->dst_addr_id) == 0)
+					continue;
+
+				/* NAT rule counter */
+				if (sv->counter_id > 0)
+					ctr_nat_rule_add(ctx, sv->counter_id,
+					                 rte_pktmbuf_pkt_len(pkt));
+
+				if (sv->mode != SNAT_MODE_OFF &&
+				    ctx->shm->nat_pool_configs &&
+				    ctx->shm->nat_pool_ips_v4) {
+					uint32_t pool_id = sv->mode;
+					if (pool_id < MAX_NAT_POOLS) {
+						struct nat_pool_config *cfg =
+							&ctx->shm->nat_pool_configs[pool_id];
+						if (cfg->num_ips > 0) {
+							uint32_t port_range =
+								cfg->port_high - cfg->port_low + 1;
+							if (port_range == 0)
+								port_range = 1;
+
+							uint64_t val = ctx->snat_port_counter++
+								* MAX_LCORES + ctx->lcore_id;
+							uint16_t port = cfg->port_low +
+								(uint16_t)(val % port_range);
+
+							uint32_t ip_idx;
+							if (cfg->addr_persistent)
+								ip_idx = meta->src_ip.v4 % cfg->num_ips;
+							else
+								ip_idx = (uint32_t)(
+									(val / port_range) % cfg->num_ips);
+
+							uint32_t map_idx =
+								pool_id * MAX_NAT_POOL_IPS_PER_POOL + ip_idx;
+							if (map_idx < MAX_NAT_POOL_IPS) {
+								uint32_t alloc_ip =
+									ctx->shm->nat_pool_ips_v4[map_idx];
+								if (alloc_ip != 0) {
+									meta->nat_src_ip.v4 = alloc_ip;
+									meta->nat_src_port =
+										rte_cpu_to_be_16(port);
+									meta->nat_flags |= SESS_FLAG_SNAT;
+								}
+							}
+						}
+					}
+				}
+				break;  /* First matching SNAT rule wins */
+			}
+		}
+
+		return ACTION_PERMIT;
 	}
 
 	/* No rule matched — default action from policy set */

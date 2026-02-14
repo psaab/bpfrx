@@ -9,6 +9,7 @@
 
 #include <rte_mbuf.h>
 #include <rte_hash.h>
+#include <rte_tcp.h>
 #include <rte_cycles.h>
 #include <rte_byteorder.h>
 
@@ -16,6 +17,114 @@
 #include "tables.h"
 #include "counters.h"
 #include "events.h"
+
+/* TCP option kinds */
+#define TCPOPT_NOP     1
+#define TCPOPT_MSS     2
+#define TCPOPT_MSS_LEN 4
+
+/* Incremental checksum update for 16-bit field (from nat.c) */
+static inline void
+ct_csum_update_u16(uint16_t *csum, uint16_t old_val, uint16_t new_val)
+{
+	uint32_t c = (~ntohs(*csum)) & 0xFFFF;
+	c += (~ntohs(old_val) & 0xFFFF) + ntohs(new_val);
+	c = (c >> 16) + (c & 0xFFFF);
+	c += c >> 16;
+	*csum = htons(~c & 0xFFFF);
+}
+
+/**
+ * tcp_mss_clamp — Clamp TCP MSS option on SYN packets.
+ *
+ * Scans TCP options for MSS (kind=2, length=4). If the current MSS
+ * exceeds the configured maximum, overwrites it and updates the TCP
+ * checksum incrementally.
+ *
+ * Reference: bpf/headers/bpfrx_helpers.h tcp_mss_clamp().
+ */
+void
+tcp_mss_clamp(struct rte_mbuf *pkt, struct pkt_meta *meta,
+              struct pipeline_ctx *ctx)
+{
+	if (!ctx->shm->flow_config)
+		return;
+
+	struct flow_config *fc = ctx->shm->flow_config;
+	uint16_t max_mss = fc->tcp_mss_ipsec;
+	if (fc->tcp_mss_gre_in > 0 && (fc->tcp_mss_gre_in < max_mss || max_mss == 0))
+		max_mss = fc->tcp_mss_gre_in;
+
+	if (max_mss == 0)
+		return;
+
+	uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *);
+	uint32_t data_len = rte_pktmbuf_data_len(pkt);
+
+	/* Ensure at least TCP header + some options are accessible */
+	if (data_len < meta->l4_offset + 60)
+		return;
+
+	struct rte_tcp_hdr *tcp = (struct rte_tcp_hdr *)(data + meta->l4_offset);
+	uint8_t tcp_hdr_len = (tcp->data_off >> 4) * 4;
+
+	/* No options if header length is minimum (20 bytes) */
+	if (tcp_hdr_len <= 20)
+		return;
+
+	uint16_t opts_len = tcp_hdr_len - 20;
+	uint8_t *opt_base = data + meta->l4_offset + 20;
+
+	/* Ensure all options bytes are within packet */
+	if (data_len < (uint32_t)(meta->l4_offset + 20 + opts_len))
+		return;
+
+	uint16_t *mss_ptr = NULL;
+
+	/* Scan for MSS option (kind=2, length=4) at common positions.
+	 * Match the BPF approach: check a few common layouts. */
+
+	/* Position 0: MSS at start of options (most common) */
+	if (opts_len >= 4 &&
+	    opt_base[0] == TCPOPT_MSS && opt_base[1] == TCPOPT_MSS_LEN) {
+		mss_ptr = (uint16_t *)(opt_base + 2);
+	}
+	/* Position 1: NOP + MSS */
+	else if (opts_len >= 5 &&
+	         opt_base[0] == TCPOPT_NOP &&
+	         opt_base[1] == TCPOPT_MSS && opt_base[2] == TCPOPT_MSS_LEN) {
+		mss_ptr = (uint16_t *)(opt_base + 3);
+	}
+	/* Position 2: NOP + NOP + MSS */
+	else if (opts_len >= 6 &&
+	         opt_base[0] == TCPOPT_NOP && opt_base[1] == TCPOPT_NOP &&
+	         opt_base[2] == TCPOPT_MSS && opt_base[3] == TCPOPT_MSS_LEN) {
+		mss_ptr = (uint16_t *)(opt_base + 4);
+	}
+	/* Position: after SACK_PERM (kind=4, len=2) + MSS */
+	else if (opts_len >= 6 &&
+	         opt_base[0] == 4 && opt_base[1] == 2 &&
+	         opt_base[2] == TCPOPT_MSS && opt_base[3] == TCPOPT_MSS_LEN) {
+		mss_ptr = (uint16_t *)(opt_base + 4);
+	}
+
+	if (!mss_ptr)
+		return;
+
+	/* Ensure mss_ptr + 2 is within packet */
+	if ((uint8_t *)(mss_ptr + 1) > data + data_len)
+		return;
+
+	uint16_t cur_mss = rte_be_to_cpu_16(*mss_ptr);
+	if (cur_mss > max_mss) {
+		uint16_t old_mss_be = *mss_ptr;
+		uint16_t new_mss_be = rte_cpu_to_be_16(max_mss);
+		*mss_ptr = new_mss_be;
+
+		/* Update TCP checksum incrementally */
+		ct_csum_update_u16(&tcp->cksum, old_mss_be, new_mss_be);
+	}
+}
 
 /* Conntrack result codes */
 #define CT_NEW         0

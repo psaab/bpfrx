@@ -336,6 +336,9 @@ tables_init(struct shared_memory *shm)
 	shm->nat_pool_ips_v6 = rte_zmalloc("nat_pool_ips_v6",
 		sizeof(struct nat_pool_ip_v6) * MAX_NAT_POOL_IPS,
 		RTE_CACHE_LINE_SIZE);
+	shm->nat64_state_values = rte_zmalloc("nat64_state_values",
+		sizeof(struct nat64_state_value) * MAX_SESSIONS,
+		RTE_CACHE_LINE_SIZE);
 	shm->flood_states = rte_zmalloc("flood_states",
 		sizeof(struct flood_state) * MAX_LCORES * MAX_ZONES,
 		RTE_CACHE_LINE_SIZE);
@@ -389,7 +392,7 @@ tables_init(struct shared_memory *shm)
 	    !shm->app_values || !shm->dnat_values || !shm->dnat_values_v6 ||
 	    !shm->snat_values_v4 || !shm->snat_values_v6 ||
 	    !shm->nat_pool_ips_v4 || !shm->nat_pool_ips_v6 ||
-	    !shm->flood_states ||
+	    !shm->nat64_state_values || !shm->flood_states ||
 	    !shm->zone_configs || !shm->policy_rules || !shm->screen_configs ||
 	    !shm->nat_pool_configs || !shm->nat64_configs ||
 	    !shm->filter_configs || !shm->filter_rules || !shm->flow_config ||

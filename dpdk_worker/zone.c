@@ -51,6 +51,22 @@ zone_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		meta->routing_table = zv->routing_table;
 	}
 
+	/* ---- Static 1:1 NAT DNAT lookup (before FIB) ---- */
+	if (meta->addr_family == AF_INET && ctx->shm->static_nat_v4) {
+		struct static_nat_key_v4 snk = {
+			.ip = meta->dst_ip.v4,
+			.direction = STATIC_NAT_DNAT,
+		};
+		void *sn_data = NULL;
+		if (rte_hash_lookup_data(ctx->shm->static_nat_v4,
+		                         &snk, &sn_data) >= 0) {
+			meta->nat_dst_ip.v4 = meta->dst_ip.v4;
+			meta->nat_dst_port = meta->dst_port;
+			meta->dst_ip.v4 = (uint32_t)(uintptr_t)sn_data;
+			meta->nat_flags |= SESS_FLAG_DNAT | SESS_FLAG_STATIC_NAT;
+		}
+	}
+
 	/* ---- FIB lookup for egress determination ---- */
 	uint32_t nexthop_id = 0;
 	int fib_rc = -1;

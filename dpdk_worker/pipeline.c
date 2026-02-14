@@ -23,6 +23,8 @@ extern void zone_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
                         struct pipeline_ctx *ctx);
 extern int  conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
                              struct pipeline_ctx *ctx);
+extern void tcp_mss_clamp(struct rte_mbuf *pkt, struct pkt_meta *meta,
+                           struct pipeline_ctx *ctx);
 extern int  conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
                              struct pipeline_ctx *ctx);
 extern int  policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
@@ -33,6 +35,16 @@ extern void nat64_translate(struct rte_mbuf *pkt, struct pkt_meta *meta,
                             struct pipeline_ctx *ctx);
 extern void forward_packet(struct rte_mbuf *pkt, struct pkt_meta *meta,
                            struct pipeline_ctx *ctx);
+
+/* Rejection forward declarations (reject.c) */
+extern void send_tcp_rst_v4(struct rte_mbuf *pkt, struct pkt_meta *meta,
+                            struct pipeline_ctx *ctx);
+extern void send_tcp_rst_v6(struct rte_mbuf *pkt, struct pkt_meta *meta,
+                            struct pipeline_ctx *ctx);
+extern void send_icmp_unreach_v4(struct rte_mbuf *pkt, struct pkt_meta *meta,
+                                 struct pipeline_ctx *ctx);
+extern void send_icmp_unreach_v6(struct rte_mbuf *pkt, struct pkt_meta *meta,
+                                 struct pipeline_ctx *ctx);
 
 /* Conntrack result codes */
 #define CT_NEW         0
@@ -79,6 +91,11 @@ process_packet(struct rte_mbuf *pkt, struct pipeline_ctx *ctx)
 
 	/* 5. Conntrack (replaces xdp_conntrack) */
 	ct_result = conntrack_lookup(pkt, &meta, ctx);
+
+	/* TCP MSS clamping on SYN packets (before session creation) */
+	if (meta.protocol == PROTO_TCP && (meta.tcp_flags & 0x02))
+		tcp_mss_clamp(pkt, &meta, ctx);
+
 	if (ct_result == CT_ESTABLISHED &&
 	    !(meta.nat_flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT)))
 		goto forward;  /* Fast path: established, no NAT */
@@ -89,7 +106,24 @@ process_packet(struct rte_mbuf *pkt, struct pipeline_ctx *ctx)
 
 	/* 6. Policy (replaces xdp_policy, only for new sessions) */
 	if (ct_result == CT_NEW) {
-		if (policy_check(pkt, &meta, ctx) != ACTION_PERMIT)
+		int action = policy_check(pkt, &meta, ctx);
+		if (action == ACTION_REJECT) {
+			if (meta.protocol == PROTO_TCP) {
+				if (meta.addr_family == AF_INET)
+					send_tcp_rst_v4(pkt, &meta, ctx);
+				else
+					send_tcp_rst_v6(pkt, &meta, ctx);
+			} else {
+				if (meta.addr_family == AF_INET)
+					send_icmp_unreach_v4(pkt, &meta, ctx);
+				else
+					send_icmp_unreach_v6(pkt, &meta, ctx);
+			}
+			rte_pktmbuf_free(pkt);
+			ctr_global_inc(ctx, GLOBAL_CTR_DROPS);
+			return;
+		}
+		if (action != ACTION_PERMIT)
 			goto drop;
 		conntrack_create(pkt, &meta, ctx);
 		ctr_global_inc(ctx, GLOBAL_CTR_SESSIONS_NEW);
