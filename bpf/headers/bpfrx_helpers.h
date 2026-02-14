@@ -1276,4 +1276,69 @@ tcp_mss_clamp(struct xdp_md *ctx, __u16 l4_offset, __u16 max_mss,
 	return 0;
 }
 
+/*
+ * TC egress variant of tcp_mss_clamp.
+ * Identical logic but takes struct __sk_buff * context.
+ */
+static __always_inline int
+tc_tcp_mss_clamp(struct __sk_buff *skb, __u16 l4_offset, __u16 max_mss,
+		 int csum_partial)
+{
+	void *data     = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+
+	if (l4_offset > 200)
+		return -1;
+
+	if (data + l4_offset + 60 > data_end)
+		return 0;
+
+	__u8 *opt_base = (__u8 *)data + l4_offset + 20;
+	__be16 *mss_ptr = 0;
+	struct tcphdr *tcp = data + l4_offset;
+
+	/* Position 0: MSS at start of options (most common) */
+	if (opt_base[0] == TCPOPT_MSS && opt_base[1] == TCPOPT_MSS_LEN) {
+		mss_ptr = (__be16 *)(opt_base + 2);
+	}
+	/* Position 1: NOP + MSS */
+	else if (opt_base[0] == TCPOPT_NOP &&
+		 opt_base[1] == TCPOPT_MSS && opt_base[2] == TCPOPT_MSS_LEN) {
+		mss_ptr = (__be16 *)(opt_base + 3);
+	}
+	/* Position 2: NOP + NOP + MSS */
+	else if (opt_base[0] == TCPOPT_NOP && opt_base[1] == TCPOPT_NOP &&
+		 opt_base[2] == TCPOPT_MSS && opt_base[3] == TCPOPT_MSS_LEN) {
+		mss_ptr = (__be16 *)(opt_base + 4);
+	}
+	/* Position: after SACK_PERM (kind=4,len=2) + MSS */
+	else if (opt_base[0] == 4 && opt_base[1] == 2 &&
+		 opt_base[2] == TCPOPT_MSS && opt_base[3] == TCPOPT_MSS_LEN) {
+		mss_ptr = (__be16 *)(opt_base + 4);
+	}
+
+	if (!mss_ptr)
+		return 0;
+	if ((void *)(mss_ptr + 1) > data_end)
+		return 0;
+
+	__u16 cur_mss = bpf_ntohs(*mss_ptr);
+	if (cur_mss > max_mss) {
+		__be16 old_mss = *mss_ptr;
+		__be16 new_mss = bpf_htons(max_mss);
+		*mss_ptr = new_mss;
+
+		if (!csum_partial) {
+			data = (void *)(long)skb->data;
+			data_end = (void *)(long)skb->data_end;
+			if (data + l4_offset + 20 > data_end)
+				return 0;
+			tcp = data + l4_offset;
+			csum_update_2(&tcp->check, old_mss, new_mss);
+		}
+	}
+
+	return 0;
+}
+
 #endif /* __BPFRX_HELPERS_H__ */

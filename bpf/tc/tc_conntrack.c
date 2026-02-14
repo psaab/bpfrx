@@ -105,6 +105,19 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 	if (!meta)
 		return TC_ACT_SHOT;
 
+	/* TCP MSS clamping on egress SYN packets (gre-out / ipsec-vpn). */
+	if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x02)) {
+		struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &zero);
+		if (fc) {
+			__u16 mss = fc->tcp_mss_gre_out;
+			if (fc->tcp_mss_ipsec > 0 && (fc->tcp_mss_ipsec < mss || mss == 0))
+				mss = fc->tcp_mss_ipsec;
+			if (mss > 0)
+				tc_tcp_mss_clamp(skb, meta->l4_offset, mss,
+						 meta->csum_partial);
+		}
+	}
+
 	if (meta->addr_family == AF_INET) {
 		/* Build session key from egress packet */
 		struct session_key fwd_key = {};
