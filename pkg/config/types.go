@@ -736,6 +736,12 @@ type NATConfig struct {
 	Destination       *DestinationNATConfig
 	Static            []*StaticNATRuleSet
 	NAT64             []*NAT64RuleSet
+	NATv6v4           *NATv6v4Config         // natv6v4 options
+}
+
+// NATv6v4Config holds NAT64 v6-to-v4 translation options.
+type NATv6v4Config struct {
+	NoV6FragHeader bool // no-v6-frag-header: omit IPv6 fragment header in translated packets
 }
 
 // NAT64RuleSet defines NAT64 translation rules.
@@ -822,9 +828,10 @@ type PersistentNATConfig struct {
 
 // StaticNATRule is a 1:1 bidirectional NAT rule.
 type StaticNATRule struct {
-	Name    string
-	Match   string // destination-address (external/public IP)
-	Then    string // static-nat prefix (internal/private IP)
+	Name          string
+	Match         string // destination-address (external/public IP)
+	SourceAddress string // source-address match (optional, e.g. "::/0" for NAT64)
+	Then          string // static-nat prefix (internal/private IP), or "inet" for NAT64
 }
 
 // ScreenProfile defines IDS screening options.

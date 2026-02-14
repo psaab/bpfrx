@@ -1983,6 +1983,38 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		parts = append(parts, "th dport { "+strings.Join(term.DestinationPorts, ", ")+" }")
 	}
 
+	// DSCP / traffic-class matching
+	if term.DSCP != "" {
+		dscp := nftDSCPValue(term.DSCP)
+		if family == "ip6" {
+			parts = append(parts, "ip6 dscp "+dscp)
+		} else {
+			parts = append(parts, "ip dscp "+dscp)
+		}
+	}
+
+	// ICMP type/code matching
+	if term.ICMPType >= 0 {
+		icmpFamily := "icmp"
+		if family == "ip6" {
+			icmpFamily = "icmpv6"
+		}
+		parts = append(parts, fmt.Sprintf("%s type %d", icmpFamily, term.ICMPType))
+		if term.ICMPCode >= 0 {
+			parts = append(parts, fmt.Sprintf("%s code %d", icmpFamily, term.ICMPCode))
+		}
+	}
+
+	// TCP flags matching
+	if len(term.TCPFlags) > 0 {
+		parts = append(parts, "tcp flags "+strings.Join(term.TCPFlags, ","))
+	}
+
+	// IP fragment matching
+	if term.IsFragment {
+		parts = append(parts, "ip frag-off & 0x1fff != 0")
+	}
+
 	// Action: discard → drop (silent), reject → reject (ICMP unreachable), accept → accept
 	action := "accept"
 	switch term.Action {
@@ -1998,6 +2030,15 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		return action
 	}
 	return strings.Join(parts, " ") + " " + action
+}
+
+// nftDSCPValue converts a Junos DSCP name to the nftables symbolic name.
+// nftables accepts: cs0-cs7, af11-af43, ef, or numeric values.
+func nftDSCPValue(name string) string {
+	// Junos and nftables use the same naming for standard DSCP values.
+	// Just pass through — nftables accepts ef, af11, af12, af13, af21,
+	// af22, af23, af31, af32, af33, af41, af42, af43, cs0-cs7.
+	return name
 }
 
 // applySSHKnownHosts writes /etc/ssh/ssh_known_hosts from

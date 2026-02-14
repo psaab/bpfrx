@@ -1247,6 +1247,15 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 		}
 	}
 
+	// natv6v4 { no-v6-frag-header; }
+	v6v4Node := node.FindChild("natv6v4")
+	if v6v4Node != nil {
+		sec.NAT.NATv6v4 = &NATv6v4Config{}
+		if v6v4Node.FindChild("no-v6-frag-header") != nil {
+			sec.NAT.NATv6v4.NoV6FragHeader = true
+		}
+	}
+
 	return nil
 }
 
@@ -1697,8 +1706,11 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 			matchNode := ruleInst.node.FindChild("match")
 			if matchNode != nil {
 				for _, m := range matchNode.Children {
-					if m.Name() == "destination-address" {
+					switch m.Name() {
+					case "destination-address":
 						rule.Match = nodeVal(m)
+					case "source-address":
+						rule.SourceAddress = nodeVal(m)
 					}
 				}
 			}
@@ -1711,6 +1723,9 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							rule.Then = t.Keys[2]
 						} else if pn := t.FindChild("prefix"); pn != nil {
 							rule.Then = nodeVal(pn)
+						} else if t.FindChild("inet") != nil || (len(t.Keys) >= 2 && t.Keys[1] == "inet") {
+							// static-nat { inet; } — NAT64 translation
+							rule.Then = "inet"
 						}
 					}
 				}

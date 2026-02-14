@@ -604,6 +604,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"source-pool": {args: 1, children: nil},
 				}},
 			}},
+			"natv6v4": {children: map[string]*schemaNode{
+				"no-v6-frag-header": {children: nil},
+			}},
 		}},
 		"address-book": {children: map[string]*schemaNode{
 			"global": {children: map[string]*schemaNode{

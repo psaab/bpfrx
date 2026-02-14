@@ -11904,3 +11904,139 @@ func TestSNATMultipleAddressPairsSetSyntax(t *testing.T) {
 		t.Error("expected Then.Off = true")
 	}
 }
+
+func TestStaticNATInet(t *testing.T) {
+	input := `
+security {
+    nat {
+        static {
+            rule-set nat64-test {
+                from zone lan;
+                rule ipv6-clients {
+                    match {
+                        source-address ::/0;
+                        destination-address 64:ff9b::/96;
+                    }
+                    then {
+                        static-nat {
+                            inet;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Security.NAT.Static) != 1 {
+		t.Fatalf("expected 1 static rule-set, got %d", len(cfg.Security.NAT.Static))
+	}
+	rs := cfg.Security.NAT.Static[0]
+	if rs.FromZone != "lan" {
+		t.Errorf("from-zone = %q, want lan", rs.FromZone)
+	}
+	if len(rs.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rs.Rules))
+	}
+	rule := rs.Rules[0]
+	if rule.Match != "64:ff9b::/96" {
+		t.Errorf("match = %q, want 64:ff9b::/96", rule.Match)
+	}
+	if rule.SourceAddress != "::/0" {
+		t.Errorf("source-address = %q, want ::/0", rule.SourceAddress)
+	}
+	if rule.Then != "inet" {
+		t.Errorf("then = %q, want inet", rule.Then)
+	}
+}
+
+func TestStaticNATInetSetSyntax(t *testing.T) {
+	lines := []string{
+		"set security nat static rule-set nat64 from zone lan",
+		"set security nat static rule-set nat64 rule r1 match source-address ::/0",
+		"set security nat static rule-set nat64 rule r1 match destination-address 64:ff9b::/96",
+		"set security nat static rule-set nat64 rule r1 then static-nat inet",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Security.NAT.Static) != 1 {
+		t.Fatalf("expected 1 static rule-set, got %d", len(cfg.Security.NAT.Static))
+	}
+	rule := cfg.Security.NAT.Static[0].Rules[0]
+	if rule.Then != "inet" {
+		t.Errorf("then = %q, want inet", rule.Then)
+	}
+	if rule.SourceAddress != "::/0" {
+		t.Errorf("source-address = %q, want ::/0", rule.SourceAddress)
+	}
+}
+
+func TestNATv6v4NoFragHeader(t *testing.T) {
+	input := `
+security {
+    nat {
+        natv6v4 {
+            no-v6-frag-header;
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Security.NAT.NATv6v4 == nil {
+		t.Fatal("NATv6v4 is nil")
+	}
+	if !cfg.Security.NAT.NATv6v4.NoV6FragHeader {
+		t.Error("NoV6FragHeader should be true")
+	}
+}
+
+func TestNATv6v4SetSyntax(t *testing.T) {
+	lines := []string{
+		"set security nat natv6v4 no-v6-frag-header",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Security.NAT.NATv6v4 == nil {
+		t.Fatal("NATv6v4 is nil")
+	}
+	if !cfg.Security.NAT.NATv6v4.NoV6FragHeader {
+		t.Error("NoV6FragHeader should be true")
+	}
+}
