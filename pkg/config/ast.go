@@ -1641,6 +1641,18 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []string
 		} else if schema.wildcard != nil {
 			childSchema = schema.wildcard
 		} else {
+			// Last token might be a partial prefix — return matching keywords.
+			if i == len(tokens)-1 {
+				var matches []string
+				for name := range schema.children {
+					if strings.HasPrefix(name, keyword) {
+						matches = append(matches, name)
+					}
+				}
+				if len(matches) > 0 {
+					return matches
+				}
+			}
 			return nil // unknown keyword, no completions
 		}
 

@@ -161,11 +161,8 @@ func main() {
 
 		line, err := rl.Readline()
 		if err != nil {
-			if err == readline.ErrInterrupt {
+			if err == readline.ErrInterrupt || err == io.EOF {
 				continue
-			}
-			if err == io.EOF {
-				break
 			}
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			break
@@ -2096,6 +2093,7 @@ func (c *ctl) handleCommit(args []string) error {
 		if err != nil {
 			return fmt.Errorf("commit failed: %v", err)
 		}
+		c.refreshPrompt()
 		if resp.Summary != "" {
 			fmt.Printf("commit complete: %s\n", resp.Summary)
 		} else {
@@ -2115,6 +2113,7 @@ func (c *ctl) handleCommit(args []string) error {
 		if err != nil {
 			return fmt.Errorf("commit confirmed failed: %v", err)
 		}
+		c.refreshPrompt()
 		fmt.Printf("commit confirmed will be automatically rolled back in %d minutes unless confirmed\n", minutes)
 		return nil
 	}
@@ -2123,12 +2122,27 @@ func (c *ctl) handleCommit(args []string) error {
 	if err != nil {
 		return fmt.Errorf("commit failed: %v", err)
 	}
+	c.refreshPrompt()
 	if resp.Summary != "" {
 		fmt.Printf("commit complete: %s\n", resp.Summary)
 	} else {
 		fmt.Println("commit complete")
 	}
 	return nil
+}
+
+// refreshPrompt re-reads the system hostname and updates the readline prompt.
+func (c *ctl) refreshPrompt() {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		c.hostname = h
+	}
+	if c.rl != nil {
+		if c.configMode {
+			c.rl.SetPrompt(c.configPrompt())
+		} else {
+			c.rl.SetPrompt(c.operationalPrompt())
+		}
+	}
 }
 
 func (c *ctl) handleClear(args []string) error {

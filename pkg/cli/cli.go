@@ -250,7 +250,7 @@ func (c *CLI) completeConfigWithDesc(words []string, partial string) []completio
 	}
 
 	switch words[0] {
-	case "set", "delete":
+	case "set", "delete", "show", "edit":
 		schemaCompletions := config.CompleteSetPathWithValues(words[1:], c.valueProvider)
 		if schemaCompletions == nil {
 			return nil
@@ -440,11 +440,8 @@ func (c *CLI) Run() error {
 		}
 		line, err := c.rl.Readline()
 		if err != nil {
-			if err == readline.ErrInterrupt {
+			if err == readline.ErrInterrupt || err == io.EOF {
 				continue
-			}
-			if err == io.EOF {
-				break
 			}
 			return err
 		}
@@ -2334,6 +2331,7 @@ func (c *CLI) handleCommit(args []string) error {
 			}
 		}
 		c.reloadSyslog(compiled)
+		c.refreshPrompt()
 
 		if diffSummary != "" {
 			fmt.Printf("commit complete: %s\n", diffSummary)
@@ -2363,6 +2361,7 @@ func (c *CLI) handleCommit(args []string) error {
 			}
 		}
 		c.reloadSyslog(compiled)
+		c.refreshPrompt()
 
 		fmt.Printf("commit confirmed will be automatically rolled back in %d minutes unless confirmed\n", minutes)
 		return nil
@@ -2394,6 +2393,7 @@ func (c *CLI) handleCommit(args []string) error {
 
 	// Hot-reload syslog clients
 	c.reloadSyslog(compiled)
+	c.refreshPrompt()
 
 	if diffSummary != "" {
 		fmt.Printf("commit complete: %s\n", diffSummary)
@@ -2401,6 +2401,20 @@ func (c *CLI) handleCommit(args []string) error {
 		fmt.Println("commit complete")
 	}
 	return nil
+}
+
+// refreshPrompt re-reads the system hostname and updates the readline prompt.
+func (c *CLI) refreshPrompt() {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		c.hostname = h
+	}
+	if c.rl != nil {
+		if c.store.InConfigMode() {
+			c.rl.SetPrompt(c.configPrompt())
+		} else {
+			c.rl.SetPrompt(c.operationalPrompt())
+		}
+	}
 }
 
 func (c *CLI) reloadSyslog(cfg *config.Config) {

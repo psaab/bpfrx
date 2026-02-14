@@ -2175,7 +2175,7 @@ func (s *Server) completeConfig(words []string, partial string) []string {
 	}
 
 	switch words[0] {
-	case "set", "delete":
+	case "set", "delete", "show", "edit":
 		schemaCompletions := config.CompleteSetPathWithValues(words[1:], s.valueProvider)
 		if schemaCompletions == nil {
 			return nil
