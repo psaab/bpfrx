@@ -20,19 +20,21 @@ const (
 
 // InterfaceConfig describes a single interface for networkd generation.
 type InterfaceConfig struct {
-	Name         string   // interface name (trust0, untrust0, wan0, etc.)
-	MACAddress   string   // hardware MAC address (from kernel)
-	Addresses    []string // CIDR addresses (10.0.1.10/24, 2001:db8::1/64, etc.)
-	IsVLANParent bool     // true = don't assign addresses (they go on sub-interface)
-	DHCPv4       bool     // true = daemon runs DHCPv4 client (don't set static addr)
-	DHCPv6       bool     // true = daemon runs DHCPv6 client
-	Unmanaged    bool     // true = not in config; keep down with no addresses
-	Disable      bool     // true = administratively disabled (keep down)
-	DADDisable   bool     // true = disable IPv6 Duplicate Address Detection
-	Speed        string   // link speed: "10M", "100M", "1G", "10G", etc.
-	Duplex       string   // "full", "half"
-	MTU          int      // interface MTU (0 = default)
-	Description  string   // interface description (maps to .network [Network] Description)
+	Name             string   // interface name (trust0, untrust0, wan0, etc.)
+	MACAddress       string   // hardware MAC address (from kernel)
+	Addresses        []string // CIDR addresses (10.0.1.10/24, 2001:db8::1/64, etc.)
+	PrimaryAddress   string   // address marked as primary (listed first for source selection)
+	PreferredAddress string   // address marked as preferred (gets PreferredLifetime=forever)
+	IsVLANParent     bool     // true = don't assign addresses (they go on sub-interface)
+	DHCPv4           bool     // true = daemon runs DHCPv4 client (don't set static addr)
+	DHCPv6           bool     // true = daemon runs DHCPv6 client
+	Unmanaged        bool     // true = not in config; keep down with no addresses
+	Disable          bool     // true = administratively disabled (keep down)
+	DADDisable       bool     // true = disable IPv6 Duplicate Address Detection
+	Speed            string   // link speed: "10M", "100M", "1G", "10G", etc.
+	Duplex           string   // "full", "half"
+	MTU              int      // interface MTU (0 = default)
+	Description      string   // interface description (maps to .network [Network] Description)
 }
 
 // Manager handles systemd-networkd .link and .network file generation.
@@ -244,8 +246,20 @@ func (m *Manager) generateNetwork(ifc InterfaceConfig) string {
 
 	// Only write Address= lines for static (non-DHCP, non-VLAN-parent) interfaces
 	if !ifc.IsVLANParent && !ifc.DHCPv4 && !ifc.DHCPv6 {
-		for _, addr := range ifc.Addresses {
-			fmt.Fprintf(&b, "Address=%s\n", addr)
+		addrs := orderAddresses(ifc.Addresses, ifc.PrimaryAddress)
+		if ifc.PreferredAddress != "" {
+			// Use [Address] sections so we can set PreferredLifetime
+			for _, addr := range addrs {
+				b.WriteString("\n[Address]\n")
+				fmt.Fprintf(&b, "Address=%s\n", addr)
+				if addr == ifc.PreferredAddress {
+					b.WriteString("PreferredLifetime=forever\n")
+				}
+			}
+		} else {
+			for _, addr := range addrs {
+				fmt.Fprintf(&b, "Address=%s\n", addr)
+			}
 		}
 	}
 
@@ -279,6 +293,26 @@ func junosSpeedToNetworkd(speed string) string {
 	default:
 		return speed // pass through as-is
 	}
+}
+
+// orderAddresses returns a copy of addrs with primaryAddr first (if set and present).
+func orderAddresses(addrs []string, primaryAddr string) []string {
+	if primaryAddr == "" || len(addrs) <= 1 {
+		return addrs
+	}
+	ordered := make([]string, 0, len(addrs))
+	found := false
+	for _, a := range addrs {
+		if a == primaryAddr {
+			found = true
+		} else {
+			ordered = append(ordered, a)
+		}
+	}
+	if found {
+		ordered = append([]string{primaryAddr}, ordered...)
+	}
+	return ordered
 }
 
 // writeIfChanged writes content to path only if the content differs from

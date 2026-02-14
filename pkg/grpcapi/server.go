@@ -5030,6 +5030,61 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			}
 		}
 
+	case "vlans":
+		if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
+			buf.WriteString("No VLANs configured\n")
+		} else {
+			ifZone := make(map[string]string)
+			for zoneName, zone := range cfg.Security.Zones {
+				for _, iface := range zone.Interfaces {
+					ifZone[iface] = zoneName
+				}
+			}
+			type vlanEntry struct {
+				iface  string
+				unit   int
+				vlanID int
+				zone   string
+				trunk  bool
+			}
+			var entries []vlanEntry
+			for _, ifc := range cfg.Interfaces.Interfaces {
+				for unitNum, unit := range ifc.Units {
+					if unit.VlanID > 0 || ifc.VlanTagging {
+						entries = append(entries, vlanEntry{
+							iface:  ifc.Name,
+							unit:   unitNum,
+							vlanID: unit.VlanID,
+							zone:   ifZone[ifc.Name],
+							trunk:  ifc.VlanTagging,
+						})
+					}
+				}
+			}
+			if len(entries) == 0 {
+				buf.WriteString("No VLANs configured\n")
+			} else {
+				sort.Slice(entries, func(i, j int) bool {
+					if entries[i].iface != entries[j].iface {
+						return entries[i].iface < entries[j].iface
+					}
+					return entries[i].unit < entries[j].unit
+				})
+				fmt.Fprintf(&buf, "%-16s %-6s %-8s %-12s %s\n", "Interface", "Unit", "VLAN ID", "Zone", "Mode")
+				for _, e := range entries {
+					mode := "access"
+					if e.trunk {
+						mode = "trunk"
+					}
+					vid := fmt.Sprintf("%d", e.vlanID)
+					if e.vlanID == 0 {
+						vid = "native"
+					}
+					fmt.Fprintf(&buf, "%-16s %-6d %-8s %-12s %s\n", e.iface, e.unit, vid, e.zone, mode)
+				}
+			}
+		}
+
 	case "routing-instances":
 		if cfg == nil || len(cfg.RoutingInstances) == 0 {
 			buf.WriteString("No routing instances configured\n")

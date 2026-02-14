@@ -51,6 +51,7 @@ type CLI struct {
 	hostname     string
 	username     string
 	version      string
+	startTime    time.Time
 }
 
 // New creates a new CLI.
@@ -70,6 +71,7 @@ func New(store *configstore.Store, dp dataplane.DataPlane, eventBuf *logging.Eve
 		eventBuf:    eventBuf,
 		eventReader: eventReader,
 		routing:     rm,
+		startTime:   time.Now(),
 		frr:         fm,
 		ipsec:       im,
 		dhcp:        dm,
@@ -792,6 +794,9 @@ func (c *CLI) handleShow(args []string) error {
 
 	case "forwarding-options":
 		return c.showForwardingOptions()
+
+	case "vlans":
+		return c.showVlans()
 
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
@@ -7703,12 +7708,14 @@ func (c *CLI) showSystemUptime() error {
 	mins := (int(upSec) % 3600) / 60
 	secs := int(upSec) % 60
 
-	fmt.Printf("Current time: %s\n", time.Now().Format("2006-01-02 15:04:05 MST"))
-	fmt.Printf("System booted: %s\n", time.Now().Add(-time.Duration(upSec)*time.Second).Format("2006-01-02 15:04:05 MST"))
+	now := time.Now()
+	fmt.Printf("Current time: %s\n", now.Format("2006-01-02 15:04:05 MST"))
+	fmt.Printf("System booted: %s\n", now.Add(-time.Duration(upSec)*time.Second).Format("2006-01-02 15:04:05 MST"))
+	fmt.Printf("Daemon uptime: %s\n", time.Since(c.startTime).Truncate(time.Second))
 	if days > 0 {
-		fmt.Printf("Uptime: %d days, %d hours, %d minutes, %d seconds\n", days, hours, mins, secs)
+		fmt.Printf("System uptime: %d days, %d hours, %d minutes, %d seconds\n", days, hours, mins, secs)
 	} else {
-		fmt.Printf("Uptime: %d hours, %d minutes, %d seconds\n", hours, mins, secs)
+		fmt.Printf("System uptime: %d hours, %d minutes, %d seconds\n", hours, mins, secs)
 	}
 	return nil
 }
@@ -8561,6 +8568,73 @@ func (c *CLI) showForwardingOptions() error {
 
 	if !hasContent {
 		fmt.Println("No forwarding-options configured")
+	}
+	return nil
+}
+
+// showVlans displays VLAN assignments per interface (like Junos "show vlans").
+func (c *CLI) showVlans() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	// Build zone lookup: interface name → zone name
+	ifZone := make(map[string]string)
+	for zoneName, zone := range cfg.Security.Zones {
+		for _, iface := range zone.Interfaces {
+			ifZone[iface] = zoneName
+		}
+	}
+
+	// Collect VLAN entries
+	type vlanEntry struct {
+		iface  string
+		unit   int
+		vlanID int
+		zone   string
+		trunk  bool
+	}
+	var entries []vlanEntry
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		for unitNum, unit := range ifc.Units {
+			if unit.VlanID > 0 || ifc.VlanTagging {
+				zone := ifZone[ifc.Name]
+				entries = append(entries, vlanEntry{
+					iface:  ifc.Name,
+					unit:   unitNum,
+					vlanID: unit.VlanID,
+					zone:   zone,
+					trunk:  ifc.VlanTagging,
+				})
+			}
+		}
+	}
+
+	if len(entries) == 0 {
+		fmt.Println("No VLANs configured")
+		return nil
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].iface != entries[j].iface {
+			return entries[i].iface < entries[j].iface
+		}
+		return entries[i].unit < entries[j].unit
+	})
+
+	fmt.Printf("%-16s %-6s %-8s %-12s %s\n", "Interface", "Unit", "VLAN ID", "Zone", "Mode")
+	for _, e := range entries {
+		mode := "access"
+		if e.trunk {
+			mode = "trunk"
+		}
+		vid := fmt.Sprintf("%d", e.vlanID)
+		if e.vlanID == 0 {
+			vid = "native"
+		}
+		fmt.Printf("%-16s %-6d %-8s %-12s %s\n", e.iface, e.unit, vid, e.zone, mode)
 	}
 	return nil
 }

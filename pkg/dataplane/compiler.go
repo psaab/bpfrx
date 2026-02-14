@@ -645,13 +645,15 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					if !seen[subName] {
 						seen[subName] = true
 						result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
-							Name:        subName,
-							Addresses:   unit.Addresses,
-							DHCPv4:      unit.DHCP,
-							DHCPv6:      unit.DHCPv6,
-							DADDisable:  unit.DADDisable,
-							MTU:         unit.MTU,
-							Description: unit.Description,
+							Name:             subName,
+							Addresses:        unit.Addresses,
+							PrimaryAddress:   unit.PrimaryAddress,
+							PreferredAddress: unit.PreferredAddress,
+							DHCPv4:           unit.DHCP,
+							DHCPv6:           unit.DHCPv6,
+							DADDisable:       unit.DADDisable,
+							MTU:              unit.MTU,
+							Description:      unit.Description,
 						})
 					}
 				}
@@ -663,6 +665,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				// Collect addresses from all units
 				var addrs []string
 				var dhcpv4, dhcpv6, dadDisable bool
+				var primaryAddr, preferredAddr string
 				unitMTU := 0
 				for _, unit := range ifCfg.Units {
 					addrs = append(addrs, unit.Addresses...)
@@ -678,6 +681,12 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					if unit.MTU > 0 && (unitMTU == 0 || unit.MTU < unitMTU) {
 						unitMTU = unit.MTU
 					}
+					if unit.PrimaryAddress != "" && primaryAddr == "" {
+						primaryAddr = unit.PrimaryAddress
+					}
+					if unit.PreferredAddress != "" && preferredAddr == "" {
+						preferredAddr = unit.PreferredAddress
+					}
 				}
 				// Unit-level MTU (family inet/inet6) overrides interface-level MTU
 				mtu := ifCfg.MTU
@@ -685,17 +694,19 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					mtu = unitMTU
 				}
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
-					Name:        ifName,
-					MACAddress:  mac,
-					Addresses:   addrs,
-					DHCPv4:      dhcpv4,
-					DHCPv6:      dhcpv6,
-					Disable:     ifCfg.Disable,
-					DADDisable:  dadDisable,
-					Speed:       ifCfg.Speed,
-					Duplex:      ifCfg.Duplex,
-					MTU:         mtu,
-					Description: ifCfg.Description,
+					Name:             ifName,
+					MACAddress:       mac,
+					Addresses:        addrs,
+					PrimaryAddress:   primaryAddr,
+					PreferredAddress: preferredAddr,
+					DHCPv4:           dhcpv4,
+					DHCPv6:           dhcpv6,
+					Disable:          ifCfg.Disable,
+					DADDisable:       dadDisable,
+					Speed:            ifCfg.Speed,
+					Duplex:           ifCfg.Duplex,
+					MTU:              mtu,
+					Description:      ifCfg.Description,
 				})
 			}
 		}

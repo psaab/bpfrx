@@ -559,6 +559,9 @@ func (c *ctl) handleShow(args []string) error {
 	case "forwarding-options":
 		return c.showText("forwarding-options")
 
+	case "vlans":
+		return c.showText("vlans")
+
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
 	}

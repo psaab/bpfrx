@@ -272,6 +272,7 @@ var OperationalTree = map[string]*Node{
 		"policy-options":     {Desc: "Show policy options"},
 		"event-options":      {Desc: "Show event policies"},
 		"forwarding-options": {Desc: "Show forwarding options"},
+		"vlans":              {Desc: "Show VLAN configuration"},
 		"version":            {Desc: "Show software version"},
 	}},
 	"monitor": {Desc: "Capture traffic", Children: map[string]*Node{

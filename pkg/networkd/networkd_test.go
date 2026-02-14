@@ -189,3 +189,96 @@ func TestGenerateLink_MTU(t *testing.T) {
 		t.Error("MTU=0 should not produce MTUBytes line")
 	}
 }
+
+func TestGenerateNetwork_PrimaryAddress(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:           "trust0",
+		Addresses:      []string{"10.0.1.10/24", "10.0.1.20/24", "10.0.1.30/24"},
+		PrimaryAddress: "10.0.1.20/24",
+	}
+	got := m.generateNetwork(ifc)
+	// Primary address should appear first
+	idx1 := strings.Index(got, "Address=10.0.1.20/24")
+	idx2 := strings.Index(got, "Address=10.0.1.10/24")
+	idx3 := strings.Index(got, "Address=10.0.1.30/24")
+	if idx1 < 0 || idx2 < 0 || idx3 < 0 {
+		t.Fatalf("missing addresses in output:\n%s", got)
+	}
+	if idx1 > idx2 || idx1 > idx3 {
+		t.Errorf("primary address should be first, got:\n%s", got)
+	}
+}
+
+func TestGenerateNetwork_PreferredAddress(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:             "trust0",
+		Addresses:        []string{"10.0.1.10/24", "10.0.1.20/24"},
+		PreferredAddress: "10.0.1.20/24",
+	}
+	got := m.generateNetwork(ifc)
+	// Should use [Address] sections
+	if !strings.Contains(got, "[Address]\n") {
+		t.Fatalf("expected [Address] sections, got:\n%s", got)
+	}
+	// Preferred address should have PreferredLifetime=forever
+	if !strings.Contains(got, "Address=10.0.1.20/24\nPreferredLifetime=forever\n") {
+		t.Errorf("preferred address should have PreferredLifetime=forever, got:\n%s", got)
+	}
+	// Non-preferred address should NOT have PreferredLifetime
+	// Find the [Address] section for 10.0.1.10
+	sections := strings.Split(got, "[Address]\n")
+	for _, sec := range sections {
+		if strings.HasPrefix(sec, "Address=10.0.1.10/24\n") {
+			if strings.Contains(sec, "PreferredLifetime") {
+				t.Errorf("non-preferred address should not have PreferredLifetime")
+			}
+		}
+	}
+}
+
+func TestGenerateNetwork_PrimaryAndPreferred(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:             "trust0",
+		Addresses:        []string{"10.0.1.10/24", "10.0.1.20/24", "2001:db8::1/64"},
+		PrimaryAddress:   "10.0.1.20/24",
+		PreferredAddress: "10.0.1.20/24",
+	}
+	got := m.generateNetwork(ifc)
+	// Primary should be first [Address] section
+	sections := strings.Split(got, "[Address]\n")
+	if len(sections) < 2 {
+		t.Fatalf("expected [Address] sections, got:\n%s", got)
+	}
+	// First [Address] section should be the primary+preferred
+	if !strings.HasPrefix(sections[1], "Address=10.0.1.20/24\nPreferredLifetime=forever\n") {
+		t.Errorf("first address section should be primary+preferred, got:\n%s", got)
+	}
+}
+
+func TestOrderAddresses(t *testing.T) {
+	addrs := []string{"10.0.1.10/24", "10.0.1.20/24", "10.0.1.30/24"}
+
+	// Primary reorders
+	got := orderAddresses(addrs, "10.0.1.20/24")
+	if got[0] != "10.0.1.20/24" {
+		t.Errorf("expected primary first, got %v", got)
+	}
+	if len(got) != 3 {
+		t.Errorf("expected 3 addresses, got %d", len(got))
+	}
+
+	// No primary = no change
+	got = orderAddresses(addrs, "")
+	if got[0] != "10.0.1.10/24" {
+		t.Errorf("expected original order, got %v", got)
+	}
+
+	// Primary not in list = no change
+	got = orderAddresses(addrs, "192.168.1.1/24")
+	if got[0] != "10.0.1.10/24" {
+		t.Errorf("expected original order for missing primary, got %v", got)
+	}
+}

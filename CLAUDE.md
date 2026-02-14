@@ -80,6 +80,8 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 | `proto/bpfrx/v1/` | Protobuf service definition |
 | `cmd/bpfrxd/` | Daemon main binary |
 | `cmd/cli/` | Remote CLI client binary |
+| `dpdk_worker/` | DPDK C pipeline (single-pass packet processing, CGo bridge) |
+| `pkg/dataplane/dpdk/` | DPDK Go manager (CGo shared memory, FIB sync, port stats) |
 | `test/incus/` | Test environment (setup.sh, config, systemd unit) |
 
 ## Critical Patterns to Know
@@ -145,11 +147,11 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, export/redistribute, ECMP multipath, next-table + rib-group inter-VRF route leaking, route filtering by protocol/CIDR
 - **VLANs**: 802.1Q tagging in BPF, trunk ports
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces
-- **Observability**: Syslog (facility/severity/category filtering), NetFlow v9, Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB), BPF map utilization (`show system buffers`)
-- **Flow**: TCP MSS clamping, ALG control, allow-dns-reply (wired to BPF), allow-embedded-icmp, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, logging, forwarding-class DSCP rewrite, DSCP action)
+- **Observability**: Syslog (facility/severity/category filtering), NetFlow v9 (1-in-N sampling), Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB), BPF map utilization (`show system buffers`)
+- **Flow**: TCP MSS clamping (ingress XDP + egress TC, including GRE-specific gre-in/gre-out), ALG control, allow-dns-reply (wired to BPF), allow-embedded-icmp, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, logging, forwarding-class DSCP rewrite, DSCP action)
 - **HA**: VRRP via keepalived (config generation, runtime state detection)
 - **DHCP**: Relay (Option 82), server (Kea integration with lease display)
-- **CLI**: Junos-style prefix matching, "Possible completions:" headers, zone/interface descriptions, session idle time, flow statistics, policy descriptions, config validation warnings
+- **CLI**: Junos-style prefix matching, "Possible completions:" headers, zone/interface descriptions, session idle time, session brief tabular view, flow statistics, policy descriptions, config validation warnings
 
 ## Network Topology (Test VM)
 
