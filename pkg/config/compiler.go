@@ -2262,6 +2262,36 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 		}
 	}
 
+	// Parse generate routes (aggregate routes)
+	if genNode := node.FindChild("generate"); genNode != nil {
+		for _, routeNode := range genNode.FindChildren("route") {
+			prefix := nodeVal(routeNode)
+			if prefix == "" {
+				continue
+			}
+			gr := &GenerateRoute{Prefix: prefix}
+			if policyNode := routeNode.FindChild("policy"); policyNode != nil {
+				gr.Policy = nodeVal(policyNode)
+			}
+			if routeNode.FindChild("discard") != nil {
+				gr.Discard = true
+			}
+			// Also handle inline keys: "route X/Y discard" or "route X/Y policy Z"
+			for i := 2; i < len(routeNode.Keys); i++ {
+				switch routeNode.Keys[i] {
+				case "discard":
+					gr.Discard = true
+				case "policy":
+					if i+1 < len(routeNode.Keys) {
+						gr.Policy = routeNode.Keys[i+1]
+						i++
+					}
+				}
+			}
+			ro.GenerateRoutes = append(ro.GenerateRoutes, gr)
+		}
+	}
+
 	// Parse global interface-routes { rib-group { inet X; inet6 Y; } }
 	if irNode := node.FindChild("interface-routes"); irNode != nil {
 		if rgNode := irNode.FindChild("rib-group"); rgNode != nil {
@@ -2517,7 +2547,11 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			switch child.Name() {
 			case "interface":
 				if v := nodeVal(child); v != "" {
-					proto.LLDP.Interfaces = append(proto.LLDP.Interfaces, v)
+					iface := LLDPInterface{Name: v}
+					if child.FindChild("disable") != nil {
+						iface.Disable = true
+					}
+					proto.LLDP.Interfaces = append(proto.LLDP.Interfaces, iface)
 				}
 			case "transmit-interval":
 				if v := nodeVal(child); v != "" {

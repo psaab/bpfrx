@@ -64,14 +64,20 @@ type Neighbor struct {
 	Interface   string // local interface where neighbor was seen
 }
 
+// LLDPInterface holds per-interface LLDP configuration.
+type LLDPInterface struct {
+	Name    string
+	Disable bool // per-interface disable
+}
+
 // LLDPConfig holds LLDP protocol configuration.
 type LLDPConfig struct {
-	Interfaces     []string // interfaces to enable LLDP on
-	Interval       int      // transmit interval in seconds (0 = default 30)
-	HoldMultiplier int      // hold multiplier (0 = default 4)
-	SystemName     string   // system name TLV (defaults to hostname)
-	SystemDesc     string   // system description TLV
-	Disable        bool     // globally disable LLDP
+	Interfaces     []LLDPInterface // interfaces to enable LLDP on
+	Interval       int             // transmit interval in seconds (0 = default 30)
+	HoldMultiplier int             // hold multiplier (0 = default 4)
+	SystemName     string          // system name TLV (defaults to hostname)
+	SystemDesc     string          // system description TLV
+	Disable        bool            // globally disable LLDP
 }
 
 // Manager runs LLDP transmit/receive goroutines and maintains the neighbor table.
@@ -114,10 +120,13 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
 		sysName = "bpfrx"
 	}
 
-	for _, ifname := range cfg.Interfaces {
-		iface, err := net.InterfaceByName(ifname)
+	for _, lldpIf := range cfg.Interfaces {
+		if lldpIf.Disable {
+			continue
+		}
+		iface, err := net.InterfaceByName(lldpIf.Name)
 		if err != nil {
-			slog.Warn("LLDP: interface not found", "interface", ifname, "err", err)
+			slog.Warn("LLDP: interface not found", "interface", lldpIf.Name, "err", err)
 			continue
 		}
 
@@ -135,7 +144,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
 			m.rxLoop(lldpCtx, iface)
 		}(iface)
 
-		slog.Info("LLDP started", "interface", ifname, "interval", interval)
+		slog.Info("LLDP started", "interface", lldpIf.Name, "interval", interval)
 	}
 
 	// Start neighbor expiry goroutine.

@@ -845,6 +845,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"inet6": {args: 1, children: nil},
 			}},
 		}},
+		"generate": {children: map[string]*schemaNode{
+			"route": {args: 1, children: map[string]*schemaNode{
+				"policy":  {args: 1, children: nil},
+				"discard": {children: nil},
+			}},
+		}},
 	}},
 	"snmp": {children: map[string]*schemaNode{
 		"community": {args: 1, children: map[string]*schemaNode{
@@ -1053,7 +1059,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"lldp": {children: map[string]*schemaNode{
-			"interface":       {args: 1, valueHint: ValueHintInterfaceName, children: nil},
+			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
+				"disable": {children: nil},
+			}},
 			"transmit-interval": {args: 1, children: nil},
 			"hold-multiplier":   {args: 1, children: nil},
 			"disable":           {children: nil},

@@ -3126,6 +3126,43 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		return &pb.ShowTextResponse{Output: buf.String()}, nil
 	}
 
+	if req.Topic == "screen-statistics-all" {
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else if s.dp == nil || !s.dp.IsLoaded() {
+			buf.WriteString("Dataplane not loaded\n")
+		} else if cr := s.dp.LastCompileResult(); cr == nil {
+			buf.WriteString("No compile result available\n")
+		} else {
+			var zones []string
+			for name := range cr.ZoneIDs {
+				zones = append(zones, name)
+			}
+			sort.Strings(zones)
+			for _, zoneName := range zones {
+				zoneID := cr.ZoneIDs[zoneName]
+				fs, err := s.dp.ReadFloodCounters(zoneID)
+				if err != nil {
+					continue
+				}
+				screenProfile := ""
+				if z, ok := cfg.Security.Zones[zoneName]; ok {
+					screenProfile = z.ScreenProfile
+				}
+				fmt.Fprintf(&buf, "Screen statistics for zone '%s':\n", zoneName)
+				if screenProfile != "" {
+					fmt.Fprintf(&buf, "  Screen profile: %s\n", screenProfile)
+				}
+				fmt.Fprintf(&buf, "  %-30s %s\n", "Counter", "Value")
+				fmt.Fprintf(&buf, "  %-30s %d\n", "SYN flood events", fs.SynCount)
+				fmt.Fprintf(&buf, "  %-30s %d\n", "ICMP flood events", fs.ICMPCount)
+				fmt.Fprintf(&buf, "  %-30s %d\n", "UDP flood events", fs.UDPCount)
+				buf.WriteString("\n")
+			}
+		}
+		return &pb.ShowTextResponse{Output: buf.String()}, nil
+	}
+
 	if strings.HasPrefix(req.Topic, "screen-ids-option-detail:") {
 		profileName := strings.TrimPrefix(req.Topic, "screen-ids-option-detail:")
 		if cfg == nil || len(cfg.Security.Screen) == 0 {
@@ -4089,7 +4126,15 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 				fmt.Fprintf(&buf, "  Hold multiplier:   %d\n", holdMult)
 				fmt.Fprintf(&buf, "  Hold time:         %ds\n", interval*holdMult)
 				if len(lldpCfg.Interfaces) > 0 {
-					fmt.Fprintf(&buf, "  Interfaces:        %s\n", strings.Join(lldpCfg.Interfaces, ", "))
+					var ifNames []string
+					for _, iface := range lldpCfg.Interfaces {
+						if iface.Disable {
+							ifNames = append(ifNames, iface.Name+" (disabled)")
+						} else {
+							ifNames = append(ifNames, iface.Name)
+						}
+					}
+					fmt.Fprintf(&buf, "  Interfaces:        %s\n", strings.Join(ifNames, ", "))
 				}
 				if s.lldpNeighborsFn != nil {
 					neighbors := s.lldpNeighborsFn()

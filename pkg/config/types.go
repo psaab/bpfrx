@@ -1006,11 +1006,20 @@ type Application struct {
 type RoutingOptionsConfig struct {
 	StaticRoutes              []*StaticRoute
 	Inet6StaticRoutes         []*StaticRoute // rib inet6.0 static routes
-	ForwardingTableExport     string         // forwarding-table { export <policy>; }
-	AutonomousSystem          uint32         // autonomous-system <number>
+	GenerateRoutes            []*GenerateRoute
+	ForwardingTableExport     string // forwarding-table { export <policy>; }
+	AutonomousSystem          uint32 // autonomous-system <number>
 	RibGroups                 map[string]*RibGroup
 	InterfaceRoutesRibGroup   string // global interface-routes { rib-group inet <name>; }
 	InterfaceRoutesRibGroupV6 string // global interface-routes { rib-group inet6 <name>; }
+}
+
+// GenerateRoute defines a Junos generate (aggregate) route.
+// In FRR, these become blackhole/reject static routes or BGP aggregate-address.
+type GenerateRoute struct {
+	Prefix  string // route prefix (e.g. "192.168.0.0/16")
+	Policy  string // contributing route policy (optional)
+	Discard bool   // discard traffic to this route (blackhole)
 }
 
 // RibGroup defines a RIB group for route sharing between routing instances.
@@ -1047,11 +1056,18 @@ type ProtocolsConfig struct {
 
 // LLDPConfig holds LLDP (Link Layer Discovery Protocol) configuration.
 type LLDPConfig struct {
-	Interfaces     []string // interfaces to enable LLDP on
-	Interval       int      // transmit interval in seconds (0 = default 30)
-	HoldMultiplier int      // hold multiplier (0 = default 4)
-	Disable        bool     // globally disable LLDP
+	Interfaces     []LLDPInterface // interfaces to enable LLDP on
+	Interval       int             // transmit interval in seconds (0 = default 30)
+	HoldMultiplier int             // hold multiplier (0 = default 4)
+	Disable        bool            // globally disable LLDP
 }
+
+// LLDPInterface holds per-interface LLDP configuration.
+type LLDPInterface struct {
+	Name    string
+	Disable bool // per-interface disable
+}
+
 
 // OSPFv3Config holds OSPFv3 (IPv6 OSPF) routing configuration.
 type OSPFv3Config struct {

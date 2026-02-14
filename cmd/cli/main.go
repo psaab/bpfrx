@@ -853,7 +853,7 @@ func (c *ctl) handleShowSecurity(args []string) error {
 			if len(args) >= 4 && args[2] == "zone" {
 				return c.showText("screen-statistics:" + args[3])
 			}
-			return fmt.Errorf("usage: show security screen statistics zone <zone-name>")
+			return c.showText("screen-statistics-all")
 		}
 		return c.showScreen()
 	case "flow":

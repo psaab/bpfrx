@@ -64,6 +64,7 @@ type FullConfig struct {
 	ISIS          *config.ISISConfig
 	StaticRoutes      []*config.StaticRoute
 	Inet6StaticRoutes []*config.StaticRoute // rib inet6.0 static routes
+	GenerateRoutes    []*config.GenerateRoute
 	DHCPRoutes        []DHCPRoute
 	Instances         []InstanceConfig
 	PolicyOptions     *config.PolicyOptionsConfig
@@ -207,7 +208,7 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	}
 
 	hasContent := fc.OSPF != nil || fc.OSPFv3 != nil || fc.BGP != nil || fc.RIP != nil || fc.ISIS != nil ||
-		len(fc.StaticRoutes) > 0 || len(fc.Inet6StaticRoutes) > 0 || len(fc.DHCPRoutes) > 0 || fc.BackupRouter != ""
+		len(fc.StaticRoutes) > 0 || len(fc.Inet6StaticRoutes) > 0 || len(fc.GenerateRoutes) > 0 || len(fc.DHCPRoutes) > 0 || fc.BackupRouter != ""
 	for _, inst := range fc.Instances {
 		if inst.OSPF != nil || inst.OSPFv3 != nil || inst.BGP != nil || inst.RIP != nil || inst.ISIS != nil || len(inst.StaticRoutes) > 0 {
 			hasContent = true
@@ -226,6 +227,18 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	if len(fc.StaticRoutes) > 0 {
 		for _, sr := range fc.StaticRoutes {
 			b.WriteString(m.generateStaticRoute(sr, ""))
+		}
+		b.WriteString("!\n")
+	}
+
+	// Generate (aggregate) routes — rendered as blackhole static routes
+	if len(fc.GenerateRoutes) > 0 {
+		for _, gr := range fc.GenerateRoutes {
+			if strings.Contains(gr.Prefix, ":") {
+				fmt.Fprintf(&b, "ipv6 route %s blackhole\n", gr.Prefix)
+			} else {
+				fmt.Fprintf(&b, "ip route %s blackhole\n", gr.Prefix)
+			}
 		}
 		b.WriteString("!\n")
 	}

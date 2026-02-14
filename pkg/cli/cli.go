@@ -1839,7 +1839,7 @@ func (c *CLI) handleShowScreen(args []string) error {
 		if len(args) >= 2 && args[1] == "zone" && len(args) >= 3 {
 			return c.showScreenStatistics(args[2])
 		}
-		return fmt.Errorf("usage: show security screen statistics zone <zone-name>")
+		return c.showScreenStatisticsAll()
 	default:
 		return c.showScreen()
 	}
@@ -2055,6 +2055,51 @@ func (c *CLI) showScreenStatistics(zoneName string) error {
 	fmt.Printf("  %-30s %d\n", "SYN flood events", totalSyn)
 	fmt.Printf("  %-30s %d\n", "ICMP flood events", totalICMP)
 	fmt.Printf("  %-30s %d\n", "UDP flood events", totalUDP)
+	return nil
+}
+
+func (c *CLI) showScreenStatisticsAll() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("dataplane not loaded")
+		return nil
+	}
+	cr := c.dp.LastCompileResult()
+	if cr == nil {
+		fmt.Println("no compile result available")
+		return nil
+	}
+	// Collect zone names and sort for deterministic output
+	var zones []string
+	for name := range cr.ZoneIDs {
+		zones = append(zones, name)
+	}
+	sort.Strings(zones)
+
+	for _, zoneName := range zones {
+		zoneID := cr.ZoneIDs[zoneName]
+		fs, err := c.dp.ReadFloodCounters(zoneID)
+		if err != nil {
+			continue
+		}
+		screenProfile := ""
+		if z, ok := cfg.Security.Zones[zoneName]; ok {
+			screenProfile = z.ScreenProfile
+		}
+		fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
+		if screenProfile != "" {
+			fmt.Printf("  Screen profile: %s\n", screenProfile)
+		}
+		fmt.Printf("  %-30s %s\n", "Counter", "Value")
+		fmt.Printf("  %-30s %d\n", "SYN flood events", fs.SynCount)
+		fmt.Printf("  %-30s %d\n", "ICMP flood events", fs.ICMPCount)
+		fmt.Printf("  %-30s %d\n", "UDP flood events", fs.UDPCount)
+		fmt.Println()
+	}
 	return nil
 }
 
@@ -8592,7 +8637,15 @@ func (c *CLI) showLLDP() error {
 	fmt.Printf("  Hold multiplier:   %d\n", holdMult)
 	fmt.Printf("  Hold time:         %ds\n", interval*holdMult)
 	if len(lldpCfg.Interfaces) > 0 {
-		fmt.Printf("  Interfaces:        %s\n", strings.Join(lldpCfg.Interfaces, ", "))
+		var ifNames []string
+		for _, iface := range lldpCfg.Interfaces {
+			if iface.Disable {
+				ifNames = append(ifNames, iface.Name+" (disabled)")
+			} else {
+				ifNames = append(ifNames, iface.Name)
+			}
+		}
+		fmt.Printf("  Interfaces:        %s\n", strings.Join(ifNames, ", "))
 	}
 	if c.lldpNeighborsFn != nil {
 		neighbors := c.lldpNeighborsFn()

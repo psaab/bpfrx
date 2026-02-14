@@ -2020,3 +2020,26 @@ func TestRouteFilterExactFRR(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateRoutesBlackhole(t *testing.T) {
+	m := New()
+	tmpDir := t.TempDir()
+	m.frrConf = filepath.Join(tmpDir, "frr.conf")
+	os.WriteFile(m.frrConf, []byte(""), 0644)
+
+	fc := &FullConfig{
+		GenerateRoutes: []*config.GenerateRoute{
+			{Prefix: "192.168.0.0/16", Discard: true},
+			{Prefix: "2001:db8::/32"},
+		},
+	}
+	_ = m.ApplyFull(fc) // reload may fail without vtysh
+	data, _ := os.ReadFile(m.frrConf)
+	got := string(data)
+	if !strings.Contains(got, "ip route 192.168.0.0/16 blackhole") {
+		t.Errorf("missing IPv4 blackhole route in:\n%s", got)
+	}
+	if !strings.Contains(got, "ipv6 route 2001:db8::/32 blackhole") {
+		t.Errorf("missing IPv6 blackhole route in:\n%s", got)
+	}
+}

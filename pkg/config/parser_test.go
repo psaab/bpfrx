@@ -10036,7 +10036,7 @@ func TestLLDPSetSyntax(t *testing.T) {
 	if len(lldpCfg.Interfaces) != 2 {
 		t.Fatalf("interfaces: got %d, want 2", len(lldpCfg.Interfaces))
 	}
-	if lldpCfg.Interfaces[0] != "trust0" || lldpCfg.Interfaces[1] != "untrust0" {
+	if lldpCfg.Interfaces[0].Name != "trust0" || lldpCfg.Interfaces[1].Name != "untrust0" {
 		t.Errorf("interfaces: got %v, want [trust0 untrust0]", lldpCfg.Interfaces)
 	}
 	if lldpCfg.Interval != 15 {
@@ -12038,5 +12038,159 @@ func TestNATv6v4SetSyntax(t *testing.T) {
 	}
 	if !cfg.Security.NAT.NATv6v4.NoV6FragHeader {
 		t.Error("NoV6FragHeader should be true")
+	}
+}
+
+func TestLLDPPerInterfaceDisable(t *testing.T) {
+	input := `
+protocols {
+    lldp {
+        interface eth0;
+        interface eth1 {
+            disable;
+        }
+        transmit-interval 60;
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Protocols.LLDP == nil {
+		t.Fatal("LLDP is nil")
+	}
+	if len(cfg.Protocols.LLDP.Interfaces) != 2 {
+		t.Fatalf("expected 2 interfaces, got %d", len(cfg.Protocols.LLDP.Interfaces))
+	}
+	if cfg.Protocols.LLDP.Interfaces[0].Name != "eth0" {
+		t.Errorf("interface[0] name = %q, want eth0", cfg.Protocols.LLDP.Interfaces[0].Name)
+	}
+	if cfg.Protocols.LLDP.Interfaces[0].Disable {
+		t.Error("eth0 should not be disabled")
+	}
+	if cfg.Protocols.LLDP.Interfaces[1].Name != "eth1" {
+		t.Errorf("interface[1] name = %q, want eth1", cfg.Protocols.LLDP.Interfaces[1].Name)
+	}
+	if !cfg.Protocols.LLDP.Interfaces[1].Disable {
+		t.Error("eth1 should be disabled")
+	}
+	if cfg.Protocols.LLDP.Interval != 60 {
+		t.Errorf("interval = %d, want 60", cfg.Protocols.LLDP.Interval)
+	}
+}
+
+func TestLLDPPerInterfaceDisableSetSyntax(t *testing.T) {
+	lines := []string{
+		"set protocols lldp interface eth0",
+		"set protocols lldp interface eth1 disable",
+		"set protocols lldp transmit-interval 60",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Protocols.LLDP == nil {
+		t.Fatal("LLDP is nil")
+	}
+	if len(cfg.Protocols.LLDP.Interfaces) != 2 {
+		t.Fatalf("expected 2 interfaces, got %d", len(cfg.Protocols.LLDP.Interfaces))
+	}
+	found := false
+	for _, iface := range cfg.Protocols.LLDP.Interfaces {
+		if iface.Name == "eth1" {
+			found = true
+			if !iface.Disable {
+				t.Error("eth1 should be disabled")
+			}
+		}
+	}
+	if !found {
+		t.Error("eth1 not found in interfaces")
+	}
+}
+
+func TestGenerateRoutes(t *testing.T) {
+	input := `
+routing-options {
+    generate {
+        route 192.168.0.0/16 {
+            policy export-to-isp;
+        }
+        route 10.0.0.0/8 {
+            discard;
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.RoutingOptions.GenerateRoutes) != 2 {
+		t.Fatalf("expected 2 generate routes, got %d", len(cfg.RoutingOptions.GenerateRoutes))
+	}
+	gr0 := cfg.RoutingOptions.GenerateRoutes[0]
+	if gr0.Prefix != "192.168.0.0/16" {
+		t.Errorf("route[0] prefix = %q, want 192.168.0.0/16", gr0.Prefix)
+	}
+	if gr0.Policy != "export-to-isp" {
+		t.Errorf("route[0] policy = %q, want export-to-isp", gr0.Policy)
+	}
+	gr1 := cfg.RoutingOptions.GenerateRoutes[1]
+	if gr1.Prefix != "10.0.0.0/8" {
+		t.Errorf("route[1] prefix = %q, want 10.0.0.0/8", gr1.Prefix)
+	}
+	if !gr1.Discard {
+		t.Error("route[1] should have discard=true")
+	}
+}
+
+func TestGenerateRoutesSetSyntax(t *testing.T) {
+	lines := []string{
+		"set routing-options generate route 192.168.0.0/16 policy export-to-isp",
+		"set routing-options generate route 10.0.0.0/8 discard",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.RoutingOptions.GenerateRoutes) != 2 {
+		t.Fatalf("expected 2 generate routes, got %d", len(cfg.RoutingOptions.GenerateRoutes))
+	}
+	found := false
+	for _, gr := range cfg.RoutingOptions.GenerateRoutes {
+		if gr.Prefix == "10.0.0.0/8" && gr.Discard {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("10.0.0.0/8 discard route not found")
 	}
 }

@@ -274,8 +274,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start LLDP if configured.
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Protocols.LLDP != nil && !cfg.Protocols.LLDP.Disable && len(cfg.Protocols.LLDP.Interfaces) > 0 {
 		d.lldpMgr = lldp.New()
+		var lldpIfaces []lldp.LLDPInterface
+		for _, iface := range cfg.Protocols.LLDP.Interfaces {
+			lldpIfaces = append(lldpIfaces, lldp.LLDPInterface{
+				Name:    iface.Name,
+				Disable: iface.Disable,
+			})
+		}
 		d.lldpMgr.Apply(ctx, &lldp.LLDPConfig{
-			Interfaces:     cfg.Protocols.LLDP.Interfaces,
+			Interfaces:     lldpIfaces,
 			Interval:       cfg.Protocols.LLDP.Interval,
 			HoldMultiplier: cfg.Protocols.LLDP.HoldMultiplier,
 			SystemName:     cfg.System.HostName,
@@ -843,6 +850,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			ISIS:                  cfg.Protocols.ISIS,
 			StaticRoutes:          cfg.RoutingOptions.StaticRoutes,
 			Inet6StaticRoutes:     cfg.RoutingOptions.Inet6StaticRoutes,
+			GenerateRoutes:        cfg.RoutingOptions.GenerateRoutes,
 			DHCPRoutes:            d.collectDHCPRoutes(),
 			PolicyOptions:         &cfg.PolicyOptions,
 			ForwardingTableExport: cfg.RoutingOptions.ForwardingTableExport,
