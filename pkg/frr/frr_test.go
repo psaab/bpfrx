@@ -1057,3 +1057,180 @@ func TestGenerateProtocols_BGPBFD(t *testing.T) {
 		t.Error("neighbor without BFD should not have bfd line")
 	}
 }
+
+func TestGenerateProtocols_OSPFStubArea(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		Areas: []*config.OSPFArea{
+			{
+				ID:       "0.0.0.1",
+				AreaType: "stub",
+				Interfaces: []*config.OSPFInterface{
+					{Name: "trust0"},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, "", 0)
+	if !strings.Contains(got, "area 0.0.0.1 stub\n") {
+		t.Errorf("missing stub area, got:\n%s", got)
+	}
+	if strings.Contains(got, "no-summary") {
+		t.Error("should not have no-summary without NoSummary flag")
+	}
+}
+
+func TestGenerateProtocols_OSPFStubNoSummary(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		Areas: []*config.OSPFArea{
+			{
+				ID:        "0.0.0.1",
+				AreaType:  "stub",
+				NoSummary: true,
+				Interfaces: []*config.OSPFInterface{
+					{Name: "trust0"},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, "", 0)
+	if !strings.Contains(got, "area 0.0.0.1 stub no-summary\n") {
+		t.Errorf("missing stub no-summary, got:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_OSPFNSSAArea(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		Areas: []*config.OSPFArea{
+			{
+				ID:       "0.0.0.2",
+				AreaType: "nssa",
+				Interfaces: []*config.OSPFInterface{
+					{Name: "dmz0"},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, "", 0)
+	if !strings.Contains(got, "area 0.0.0.2 nssa\n") {
+		t.Errorf("missing nssa area, got:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_BGPRouteReflector(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS:   65001,
+		ClusterID: "10.0.0.1",
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.0.2", PeerAS: 65001, RouteReflectorClient: true},
+			{Address: "10.0.0.3", PeerAS: 65001},
+		},
+	}
+	got := m.generateProtocols(nil, bgp, nil, nil, "", 0)
+
+	checks := []string{
+		"bgp cluster-id 10.0.0.1\n",
+		"neighbor 10.0.0.2 route-reflector-client\n",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "neighbor 10.0.0.3 route-reflector-client") {
+		t.Error("non-RR neighbor should not have route-reflector-client")
+	}
+}
+
+func TestGenerateProtocols_ISISAuth(t *testing.T) {
+	m := New()
+	isis := &config.ISISConfig{
+		NET:      "49.0001.0100.0000.0001.00",
+		Level:    "level-2",
+		AuthType: "md5",
+		AuthKey:  "isisSecret",
+		Interfaces: []*config.ISISInterface{
+			{Name: "trust0"},
+		},
+	}
+	got := m.generateProtocols(nil, nil, nil, isis, "", 0)
+
+	checks := []string{
+		"area-password md5 isisSecret\n",
+		"domain-password md5 isisSecret\n",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestGenerateProtocols_ISISAuthClear(t *testing.T) {
+	m := New()
+	isis := &config.ISISConfig{
+		NET:      "49.0001.0100.0000.0001.00",
+		Level:    "level-2",
+		AuthType: "simple",
+		AuthKey:  "plainpw",
+		Interfaces: []*config.ISISInterface{
+			{Name: "trust0"},
+		},
+	}
+	got := m.generateProtocols(nil, nil, nil, isis, "", 0)
+
+	checks := []string{
+		"area-password clear plainpw\n",
+		"domain-password clear plainpw\n",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestGenerateProtocols_RIPAuth(t *testing.T) {
+	m := New()
+	rip := &config.RIPConfig{
+		Interfaces: []string{"trust0", "dmz0"},
+		AuthType:   "md5",
+		AuthKey:    "ripSecret",
+	}
+	got := m.generateProtocols(nil, nil, rip, nil, "", 0)
+
+	checks := []string{
+		"interface trust0\n",
+		"interface dmz0\n",
+		"ip rip authentication mode md5\n",
+		"ip rip authentication string ripSecret\n",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestGenerateProtocols_RIPAuthText(t *testing.T) {
+	m := New()
+	rip := &config.RIPConfig{
+		Interfaces: []string{"trust0"},
+		AuthType:   "simple",
+		AuthKey:    "plainpw",
+	}
+	got := m.generateProtocols(nil, nil, rip, nil, "", 0)
+
+	checks := []string{
+		"ip rip authentication mode text\n",
+		"ip rip authentication string plainpw\n",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}

@@ -225,6 +225,9 @@ var OperationalTree = map[string]*Node{
 				"routes":   {Desc: "Show BGP routes"},
 				"neighbor": {Desc: "Show BGP neighbor details"},
 			}},
+			"bfd": {Desc: "Show BFD status", Children: map[string]*Node{
+				"peers": {Desc: "Show BFD peer status"},
+			}},
 			"rip":  {Desc: "Show RIP information"},
 			"isis": {Desc: "Show IS-IS information", Children: map[string]*Node{
 				"adjacency": {Desc: "Show IS-IS adjacencies"},
@@ -310,6 +313,14 @@ var OperationalTree = map[string]*Node{
 	"request": {Desc: "Perform system operations", Children: map[string]*Node{
 		"dhcp": {Desc: "DHCP operations", Children: map[string]*Node{
 			"renew": {Desc: "Renew DHCP lease on an interface"},
+		}},
+		"protocols": {Desc: "Protocol operations", Children: map[string]*Node{
+			"ospf": {Desc: "OSPF operations", Children: map[string]*Node{
+				"clear": {Desc: "Clear OSPF process"},
+			}},
+			"bgp": {Desc: "BGP operations", Children: map[string]*Node{
+				"clear": {Desc: "Clear BGP sessions"},
+			}},
 		}},
 		"security": {Desc: "Security operations", Children: map[string]*Node{
 			"ipsec": {Desc: "IPsec operations", Children: map[string]*Node{

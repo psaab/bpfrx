@@ -931,6 +931,8 @@ type RIPConfig struct {
 	Interfaces   []string // interfaces participating in RIP
 	Passive      []string // passive interfaces (receive only)
 	Redistribute []string // "connected", "static", "ospf"
+	AuthKey      string   // authentication key/password
+	AuthType     string   // "md5" or "simple"
 }
 
 // ISISConfig holds IS-IS routing configuration.
@@ -939,6 +941,8 @@ type ISISConfig struct {
 	Level      string // "level-1", "level-2", "level-1-2" (default "level-2")
 	Interfaces []*ISISInterface
 	Export     []string // "connected", "static", etc.
+	AuthKey    string   // area-level authentication key
+	AuthType   string   // "md5" or "simple" (plaintext)
 }
 
 // ISISInterface defines an interface participating in IS-IS.
@@ -984,6 +988,8 @@ type OSPFConfig struct {
 // OSPFArea defines an OSPF area.
 type OSPFArea struct {
 	ID         string // "0.0.0.0" (backbone) or area number
+	AreaType   string // "stub", "nssa", "" (normal)
+	NoSummary  bool   // stub/nssa no-summary (totally stubby)
 	Interfaces []*OSPFInterface
 }
 
@@ -1002,6 +1008,7 @@ type OSPFInterface struct {
 type BGPConfig struct {
 	LocalAS      uint32
 	RouterID     string
+	ClusterID    string // route reflector cluster ID
 	Neighbors    []*BGPNeighbor
 	Export       []string // "connected", "static", "ospf", etc.
 }
@@ -1016,9 +1023,10 @@ type BGPNeighbor struct {
 	FamilyInet   bool     // activate under address-family ipv4 unicast
 	FamilyInet6  bool     // activate under address-family ipv6 unicast
 	GroupName    string   // BGP group name (for display)
-	AuthPassword string   // TCP MD5 password for BGP session
-	BFD          bool     // enable BFD for this neighbor
-	BFDInterval  int      // BFD minimum interval in ms (0 = default 300)
+	AuthPassword         string // TCP MD5 password for BGP session
+	BFD                  bool   // enable BFD for this neighbor
+	BFDInterval          int    // BFD minimum interval in ms (0 = default 300)
+	RouteReflectorClient bool   // mark as route-reflector client
 }
 
 // TunnelConfig defines a GRE or other tunnel interface.

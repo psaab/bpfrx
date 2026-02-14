@@ -1586,6 +1586,12 @@ func (c *ctl) handleShowProtocols(args []string) error {
 		}
 		fmt.Print(resp.Output)
 		return nil
+	case "bfd":
+		if len(args) >= 2 && args[1] == "peers" {
+			return c.showText("bfd-peers")
+		}
+		printRemoteTreeHelp("show protocols bfd:", "show", "protocols", "bfd")
+		return nil
 	case "rip":
 		resp, err := c.client.GetRIPStatus(context.Background(), &pb.GetRIPStatusRequest{})
 		if err != nil {
@@ -2069,6 +2075,8 @@ func (c *ctl) handleRequest(args []string) error {
 	switch args[0] {
 	case "dhcp":
 		return c.handleRequestDHCP(args[1:])
+	case "protocols":
+		return c.handleRequestProtocols(args[1:])
 	case "security":
 		return c.handleRequestSecurity(args[1:])
 	case "system":
@@ -2139,6 +2147,43 @@ func (c *ctl) handleRequestDHCP(args []string) error {
 	}
 	fmt.Println(resp.Message)
 	return nil
+}
+
+func (c *ctl) handleRequestProtocols(args []string) error {
+	if len(args) == 0 {
+		printRemoteTreeHelp("request protocols:", "request", "protocols")
+		return nil
+	}
+	switch args[0] {
+	case "ospf":
+		if len(args) < 2 || args[1] != "clear" {
+			printRemoteTreeHelp("request protocols ospf:", "request", "protocols", "ospf")
+			return nil
+		}
+		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+			Action: "ospf-clear",
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Message)
+		return nil
+	case "bgp":
+		if len(args) < 2 || args[1] != "clear" {
+			printRemoteTreeHelp("request protocols bgp:", "request", "protocols", "bgp")
+			return nil
+		}
+		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+			Action: "bgp-clear",
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Message)
+		return nil
+	default:
+		return fmt.Errorf("unknown request protocols target: %s", args[0])
+	}
 }
 
 func (c *ctl) handleRequestSecurity(args []string) error {

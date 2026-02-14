@@ -450,6 +450,13 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 					fmt.Fprintf(&b, " passive-interface %s\n", iface.Name)
 				}
 			}
+			if area.AreaType != "" {
+				if area.NoSummary {
+					fmt.Fprintf(&b, " area %s %s no-summary\n", area.ID, area.AreaType)
+				} else {
+					fmt.Fprintf(&b, " area %s %s\n", area.ID, area.AreaType)
+				}
+			}
 		}
 		if ecmpMaxPaths > 1 {
 			fmt.Fprintf(&b, " maximum-paths %d\n", ecmpMaxPaths)
@@ -492,6 +499,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 		if bgp.RouterID != "" {
 			fmt.Fprintf(&b, " bgp router-id %s\n", bgp.RouterID)
 		}
+		if bgp.ClusterID != "" {
+			fmt.Fprintf(&b, " bgp cluster-id %s\n", bgp.ClusterID)
+		}
 		for _, n := range bgp.Neighbors {
 			fmt.Fprintf(&b, " neighbor %s remote-as %d\n", n.Address, n.PeerAS)
 			if n.Description != "" {
@@ -505,6 +515,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 			}
 			if n.BFD {
 				fmt.Fprintf(&b, " neighbor %s bfd\n", n.Address)
+			}
+			if n.RouteReflectorClient {
+				fmt.Fprintf(&b, " neighbor %s route-reflector-client\n", n.Address)
 			}
 		}
 		for _, export := range bgp.Export {
@@ -563,6 +576,19 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 			fmt.Fprintf(&b, " redistribute %s\n", r)
 		}
 		b.WriteString("exit\n!\n")
+		// RIP per-interface authentication
+		if rip.AuthKey != "" {
+			for _, iface := range rip.Interfaces {
+				fmt.Fprintf(&b, "interface %s\n", iface)
+				if rip.AuthType == "md5" {
+					b.WriteString(" ip rip authentication mode md5\n")
+				} else {
+					b.WriteString(" ip rip authentication mode text\n")
+				}
+				fmt.Fprintf(&b, " ip rip authentication string %s\n", rip.AuthKey)
+				b.WriteString("exit\n!\n")
+			}
+		}
 	}
 
 	if isis != nil {
@@ -584,6 +610,15 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 		}
 		for _, export := range isis.Export {
 			fmt.Fprintf(&b, " redistribute %s\n", export)
+		}
+		if isis.AuthKey != "" {
+			if isis.AuthType == "md5" {
+				fmt.Fprintf(&b, " area-password md5 %s\n", isis.AuthKey)
+				fmt.Fprintf(&b, " domain-password md5 %s\n", isis.AuthKey)
+			} else {
+				fmt.Fprintf(&b, " area-password clear %s\n", isis.AuthKey)
+				fmt.Fprintf(&b, " domain-password clear %s\n", isis.AuthKey)
+			}
 		}
 		b.WriteString("exit\n!\n")
 		for _, iface := range isis.Interfaces {
@@ -1071,6 +1106,16 @@ func FormatRouteDetail(routes []FRRRouteDetail) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// ExecVtysh runs an arbitrary vtysh command and returns the output.
+func (m *Manager) ExecVtysh(command string) (string, error) {
+	return vtyshCmd(command)
+}
+
+// GetBFDPeers returns BFD peer status from FRR.
+func (m *Manager) GetBFDPeers() (string, error) {
+	return vtyshCmd("show bfd peers")
 }
 
 func vtyshCmd(command string) (string, error) {

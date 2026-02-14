@@ -4498,6 +4498,8 @@ func (c *CLI) handleShowProtocols(args []string) error {
 		return c.showOSPF(args[1:])
 	case "bgp":
 		return c.showBGP(args[1:])
+	case "bfd":
+		return c.showBFD(args[1:])
 	case "rip":
 		return c.showRIP()
 	case "isis":
@@ -7084,6 +7086,30 @@ func (c *CLI) showISIS(args []string) error {
 	}
 }
 
+func (c *CLI) showBFD(args []string) error {
+	if c.frr == nil {
+		fmt.Println("FRR manager not available")
+		return nil
+	}
+	if len(args) == 0 {
+		cmdtree.PrintTreeHelp("show protocols bfd:", operationalTree, "show", "protocols", "bfd")
+		return nil
+	}
+	if args[0] == "peers" {
+		output, err := c.frr.GetBFDPeers()
+		if err != nil {
+			return fmt.Errorf("BFD peers: %w", err)
+		}
+		if output == "" {
+			fmt.Println("No BFD peers")
+			return nil
+		}
+		fmt.Print(output)
+		return nil
+	}
+	return fmt.Errorf("unknown show protocols bfd target: %s", args[0])
+}
+
 func (c *CLI) showSchedulers() error {
 	cfg := c.store.ActiveConfig()
 	if cfg == nil || len(cfg.Schedulers) == 0 {
@@ -8650,6 +8676,8 @@ func (c *CLI) handleRequest(args []string) error {
 	switch args[0] {
 	case "dhcp":
 		return c.handleRequestDHCP(args[1:])
+	case "protocols":
+		return c.handleRequestProtocols(args[1:])
 	case "security":
 		return c.handleRequestSecurity(args[1:])
 	case "system":
@@ -8676,6 +8704,51 @@ func (c *CLI) handleRequestDHCP(args []string) error {
 	}
 	fmt.Printf("DHCP renewal initiated on %s\n", args[1])
 	return nil
+}
+
+func (c *CLI) handleRequestProtocols(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request protocols:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["protocols"].Children))
+		return nil
+	}
+	if c.frr == nil {
+		return fmt.Errorf("FRR manager not available")
+	}
+	switch args[0] {
+	case "ospf":
+		if len(args) < 2 || args[1] != "clear" {
+			fmt.Println("request protocols ospf:")
+			writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["protocols"].Children["ospf"].Children))
+			return nil
+		}
+		output, err := c.frr.ExecVtysh("clear ip ospf process")
+		if err != nil {
+			return fmt.Errorf("clear OSPF: %w", err)
+		}
+		if output != "" {
+			fmt.Print(output)
+		}
+		fmt.Println("OSPF process cleared")
+		return nil
+	case "bgp":
+		if len(args) < 2 || args[1] != "clear" {
+			fmt.Println("request protocols bgp:")
+			writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["protocols"].Children["bgp"].Children))
+			return nil
+		}
+		output, err := c.frr.ExecVtysh("clear bgp * soft")
+		if err != nil {
+			return fmt.Errorf("clear BGP: %w", err)
+		}
+		if output != "" {
+			fmt.Print(output)
+		}
+		fmt.Println("BGP sessions cleared (soft reset)")
+		return nil
+	default:
+		return fmt.Errorf("unknown request protocols target: %s", args[0])
+	}
 }
 
 func (c *CLI) handleRequestSystem(args []string) error {

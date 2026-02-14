@@ -2325,6 +2325,24 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				area.Interfaces = append(area.Interfaces, iface)
 			}
 
+			// Parse area-type (stub/nssa)
+			if atNode := areaInst.node.FindChild("area-type"); atNode != nil {
+				for _, atChild := range atNode.Children {
+					switch atChild.Name() {
+					case "stub":
+						area.AreaType = "stub"
+						if atChild.FindChild("no-summaries") != nil {
+							area.NoSummary = true
+						}
+					case "nssa":
+						area.AreaType = "nssa"
+						if atChild.FindChild("no-summaries") != nil {
+							area.NoSummary = true
+						}
+					}
+				}
+			}
+
 			proto.OSPF.Areas = append(proto.OSPF.Areas, area)
 		}
 	}
@@ -2344,6 +2362,10 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			case "router-id":
 				if len(child.Keys) >= 2 {
 					proto.BGP.RouterID = child.Keys[1]
+				}
+			case "cluster-id":
+				if len(child.Keys) >= 2 {
+					proto.BGP.ClusterID = child.Keys[1]
 				}
 			case "export":
 				if len(child.Keys) >= 2 {
@@ -2451,6 +2473,8 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								}
 							case "authentication-key":
 								neighbor.AuthPassword = nodeVal(prop)
+							case "route-reflector-client":
+								neighbor.RouteReflectorClient = true
 							case "bfd-liveness-detection":
 								neighbor.BFD = true
 								for _, bc := range prop.Children {
@@ -2501,6 +2525,14 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				if len(child.Keys) >= 2 {
 					proto.RIP.Redistribute = append(proto.RIP.Redistribute, child.Keys[1])
 				}
+			case "authentication-key":
+				if v := nodeVal(child); v != "" {
+					proto.RIP.AuthKey = v
+				}
+			case "authentication-type":
+				if v := nodeVal(child); v != "" {
+					proto.RIP.AuthType = v
+				}
 			}
 		}
 	}
@@ -2525,6 +2557,14 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			case "export":
 				if len(child.Keys) >= 2 {
 					proto.ISIS.Export = append(proto.ISIS.Export, child.Keys[1])
+				}
+			case "authentication-key":
+				if v := nodeVal(child); v != "" {
+					proto.ISIS.AuthKey = v
+				}
+			case "authentication-type":
+				if v := nodeVal(child); v != "" {
+					proto.ISIS.AuthType = v
 				}
 			case "interface":
 				if len(child.Keys) >= 2 {

@@ -8055,3 +8055,163 @@ func TestBGPBFDSetSyntax(t *testing.T) {
 	}
 }
 
+func TestOSPFAreaTypeSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols ospf area 0.0.0.0 interface trust0",
+		"set protocols ospf area 0.0.0.1 interface dmz0",
+		"set protocols ospf area 0.0.0.1 area-type stub",
+		"set protocols ospf area 0.0.0.2 interface untrust0",
+		"set protocols ospf area 0.0.0.2 area-type nssa",
+		"set protocols ospf area 0.0.0.3 interface tunnel0",
+		"set protocols ospf area 0.0.0.3 area-type stub no-summaries",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ospf := cfg.Protocols.OSPF
+	if ospf == nil {
+		t.Fatal("OSPF config is nil")
+	}
+	if len(ospf.Areas) != 4 {
+		t.Fatalf("area count: got %d, want 4", len(ospf.Areas))
+	}
+	// Area 0 (backbone) - no area type
+	if ospf.Areas[0].AreaType != "" {
+		t.Errorf("area 0 should have no type, got %q", ospf.Areas[0].AreaType)
+	}
+	// Area 1 - stub
+	if ospf.Areas[1].AreaType != "stub" {
+		t.Errorf("area 1 AreaType: got %q, want stub", ospf.Areas[1].AreaType)
+	}
+	if ospf.Areas[1].NoSummary {
+		t.Error("area 1 should not have NoSummary")
+	}
+	// Area 2 - nssa
+	if ospf.Areas[2].AreaType != "nssa" {
+		t.Errorf("area 2 AreaType: got %q, want nssa", ospf.Areas[2].AreaType)
+	}
+	// Area 3 - stub no-summary (totally stubby)
+	if ospf.Areas[3].AreaType != "stub" {
+		t.Errorf("area 3 AreaType: got %q, want stub", ospf.Areas[3].AreaType)
+	}
+	if !ospf.Areas[3].NoSummary {
+		t.Error("area 3 should have NoSummary")
+	}
+}
+
+func TestBGPRouteReflectorSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp cluster-id 10.0.0.1",
+		"set protocols bgp group ibgp peer-as 65001",
+		"set protocols bgp group ibgp neighbor 10.0.0.2 route-reflector-client",
+		"set protocols bgp group ibgp neighbor 10.0.0.3",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	bgp := cfg.Protocols.BGP
+	if bgp == nil {
+		t.Fatal("BGP config is nil")
+	}
+	if bgp.ClusterID != "10.0.0.1" {
+		t.Errorf("ClusterID: got %q, want 10.0.0.1", bgp.ClusterID)
+	}
+	if len(bgp.Neighbors) != 2 {
+		t.Fatalf("neighbor count: got %d, want 2", len(bgp.Neighbors))
+	}
+	if !bgp.Neighbors[0].RouteReflectorClient {
+		t.Error("neighbor 10.0.0.2 should be route-reflector-client")
+	}
+	if bgp.Neighbors[1].RouteReflectorClient {
+		t.Error("neighbor 10.0.0.3 should not be route-reflector-client")
+	}
+}
+
+func TestISISAuthSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols isis net 49.0001.0100.0000.0001.00",
+		"set protocols isis authentication-type md5",
+		"set protocols isis authentication-key isisSecret",
+		"set protocols isis interface trust0",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	isis := cfg.Protocols.ISIS
+	if isis == nil {
+		t.Fatal("ISIS config is nil")
+	}
+	if isis.AuthType != "md5" {
+		t.Errorf("AuthType: got %q, want md5", isis.AuthType)
+	}
+	if isis.AuthKey != "isisSecret" {
+		t.Errorf("AuthKey: got %q, want isisSecret", isis.AuthKey)
+	}
+}
+
+func TestRIPAuthSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols rip neighbor trust0",
+		"set protocols rip authentication-type md5",
+		"set protocols rip authentication-key ripSecret",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	rip := cfg.Protocols.RIP
+	if rip == nil {
+		t.Fatal("RIP config is nil")
+	}
+	if rip.AuthType != "md5" {
+		t.Errorf("AuthType: got %q, want md5", rip.AuthType)
+	}
+	if rip.AuthKey != "ripSecret" {
+		t.Errorf("AuthKey: got %q, want ripSecret", rip.AuthKey)
+	}
+}
+

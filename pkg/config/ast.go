@@ -531,12 +531,21 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 						"minimum-interval": {args: 1, children: nil},
 					}},
 				}},
+				"area-type": {children: map[string]*schemaNode{
+					"stub": {children: map[string]*schemaNode{
+						"no-summaries": {children: nil},
+					}},
+					"nssa": {children: map[string]*schemaNode{
+						"no-summaries": {children: nil},
+					}},
+				}},
 			}},
 		}},
 		"bgp": {children: map[string]*schemaNode{
-			"local-as":  {args: 1, children: nil},
-			"router-id": {args: 1, children: nil},
-			"export":    {args: 1, children: nil},
+			"local-as":   {args: 1, children: nil},
+			"router-id":  {args: 1, children: nil},
+			"cluster-id": {args: 1, children: nil},
+			"export":     {args: 1, children: nil},
 			"group": {args: 1, children: map[string]*schemaNode{
 				"peer-as":            {args: 1, children: nil},
 				"description":        {args: 1, children: nil},
@@ -551,10 +560,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"minimum-interval": {args: 1, children: nil},
 				}},
 				"neighbor": {args: 1, children: map[string]*schemaNode{
-					"description":        {args: 1, children: nil},
-					"peer-as":            {args: 1, children: nil},
-					"multihop":           {args: 1, children: nil},
-					"authentication-key": {args: 1, children: nil},
+					"description":            {args: 1, children: nil},
+					"peer-as":               {args: 1, children: nil},
+					"multihop":              {args: 1, children: nil},
+					"authentication-key":    {args: 1, children: nil},
+					"route-reflector-client": {children: nil},
 					"bfd-liveness-detection": {children: map[string]*schemaNode{
 						"minimum-interval": {args: 1, children: nil},
 					}},
@@ -562,17 +572,21 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"rip": {children: map[string]*schemaNode{
-			"group":             {args: 1, children: nil},
-			"neighbor":          {args: 1, valueHint: ValueHintInterfaceName, children: nil},
-			"passive-interface": {args: 1, valueHint: ValueHintInterfaceName, children: nil},
-			"redistribute":      {args: 1, children: nil},
+			"group":               {args: 1, children: nil},
+			"neighbor":            {args: 1, valueHint: ValueHintInterfaceName, children: nil},
+			"passive-interface":   {args: 1, valueHint: ValueHintInterfaceName, children: nil},
+			"redistribute":        {args: 1, children: nil},
+			"authentication-key":  {args: 1, children: nil},
+			"authentication-type": {args: 1, children: nil},
 		}},
 		"isis": {children: map[string]*schemaNode{
-			"net":       {args: 1, children: nil},
-			"level":     {args: 1, children: nil},
-			"is-type":   {args: 1, children: nil},
-			"export":    {args: 1, children: nil},
-			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: nil},
+			"net":                 {args: 1, children: nil},
+			"level":              {args: 1, children: nil},
+			"is-type":            {args: 1, children: nil},
+			"export":             {args: 1, children: nil},
+			"interface":          {args: 1, valueHint: ValueHintInterfaceName, children: nil},
+			"authentication-key":  {args: 1, children: nil},
+			"authentication-type": {args: 1, children: nil},
 		}},
 		"router-advertisement": {children: map[string]*schemaNode{
 			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
@@ -861,6 +875,14 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 						}},
 						"bfd-liveness-detection": {children: map[string]*schemaNode{
 							"minimum-interval": {args: 1, children: nil},
+						}},
+					}},
+					"area-type": {children: map[string]*schemaNode{
+						"stub": {children: map[string]*schemaNode{
+							"no-summaries": {children: nil},
+						}},
+						"nssa": {children: map[string]*schemaNode{
+							"no-summaries": {children: nil},
 						}},
 					}},
 				}},

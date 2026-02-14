@@ -5403,6 +5403,21 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			buf.WriteString("Dataplane not loaded\n")
 		}
 
+	case "bfd-peers":
+		if s.frr == nil {
+			buf.WriteString("FRR not available\n")
+		} else {
+			output, err := s.frr.GetBFDPeers()
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "BFD peers: %v", err)
+			}
+			if output == "" {
+				buf.WriteString("No BFD peers\n")
+			} else {
+				buf.WriteString(output)
+			}
+		}
+
 	default:
 		// Handle "log:<filename>[:<count>]" for syslog file destinations
 		if strings.HasPrefix(req.Topic, "log:") {
@@ -5781,6 +5796,24 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 		return &pb.SystemActionResponse{
 			Message: fmt.Sprintf("Cleared %d persistent NAT bindings", count),
 		}, nil
+
+	case "ospf-clear":
+		if s.frr == nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "FRR manager not available")
+		}
+		if _, err := s.frr.ExecVtysh("clear ip ospf process"); err != nil {
+			return nil, status.Errorf(codes.Internal, "clear OSPF: %v", err)
+		}
+		return &pb.SystemActionResponse{Message: "OSPF process cleared"}, nil
+
+	case "bgp-clear":
+		if s.frr == nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "FRR manager not available")
+		}
+		if _, err := s.frr.ExecVtysh("clear bgp * soft"); err != nil {
+			return nil, status.Errorf(codes.Internal, "clear BGP: %v", err)
+		}
+		return &pb.SystemActionResponse{Message: "BGP sessions cleared (soft reset)"}, nil
 
 	case "ipsec-sa-clear":
 		if s.ipsec == nil {
