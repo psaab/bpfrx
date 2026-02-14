@@ -570,10 +570,51 @@ func (m *Manager) ClearAllSessions() (int, int, error) {
 	if shm == nil {
 		return 0, 0, fmt.Errorf("DPDK not initialized")
 	}
+
+	// Collect SNAT return-path DNAT keys before clearing sessions.
+	// Dynamic SNAT sessions create return-path DNAT entries that must
+	// be cleaned up to avoid dnat_table filling with stale entries.
+	var snatDNATKeys []dataplane.DNATKey
+	m.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse == 0 &&
+			val.Flags&dataplane.SessFlagSNAT != 0 &&
+			val.Flags&dataplane.SessFlagStaticNAT == 0 {
+			snatDNATKeys = append(snatDNATKeys, dataplane.DNATKey{
+				Protocol: key.Protocol,
+				DstIP:    val.NATSrcIP,
+				DstPort:  val.NATSrcPort,
+			})
+		}
+		return true
+	})
+
+	var snatDNATKeysV6 []dataplane.DNATKeyV6
+	m.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse == 0 &&
+			val.Flags&dataplane.SessFlagSNAT != 0 &&
+			val.Flags&dataplane.SessFlagStaticNAT == 0 {
+			snatDNATKeysV6 = append(snatDNATKeysV6, dataplane.DNATKeyV6{
+				Protocol: key.Protocol,
+				DstIP:    val.NATSrcIP,
+				DstPort:  val.NATSrcPort,
+			})
+		}
+		return true
+	})
+
 	v4 := int(C.rte_hash_count(shm.sessions_v4))
 	v6 := int(C.rte_hash_count(shm.sessions_v6))
 	C.rte_hash_reset(shm.sessions_v4)
 	C.rte_hash_reset(shm.sessions_v6)
+
+	// Clean up return-path DNAT entries.
+	for _, dk := range snatDNATKeys {
+		m.DeleteDNATEntry(dk)
+	}
+	for _, dk := range snatDNATKeysV6 {
+		m.DeleteDNATEntryV6(dk)
+	}
+
 	return v4, v6, nil
 }
 
@@ -1137,11 +1178,55 @@ func (m *Manager) ReadNATRuleCounter(counterID uint32) (dataplane.CounterValue, 
 }
 
 func (m *Manager) ReadNATPortCounter(poolID uint32) (uint64, error) {
-	// NAT port allocation tracking not yet implemented for DPDK.
-	return 0, nil
+	if m.platform.shm == nil {
+		return 0, fmt.Errorf("DPDK not initialized")
+	}
+	var allocs C.uint64_t
+	C.counters_aggregate_nat_port(C.uint32_t(poolID), &allocs)
+	return uint64(allocs), nil
 }
 
 func (m *Manager) ClearGlobalCounters() error {
+	if m.platform.shm == nil {
+		return fmt.Errorf("DPDK not initialized")
+	}
+	C.counters_clear_global()
+	return nil
+}
+
+func (m *Manager) ClearInterfaceCounters() error {
+	if m.platform.shm == nil {
+		return fmt.Errorf("DPDK not initialized")
+	}
+	C.counters_clear_interface()
+	return nil
+}
+
+func (m *Manager) ClearZoneCounters() error {
+	if m.platform.shm == nil {
+		return fmt.Errorf("DPDK not initialized")
+	}
+	C.counters_clear_zone()
+	return nil
+}
+
+func (m *Manager) ClearPolicyCounters() error {
+	if m.platform.shm == nil {
+		return fmt.Errorf("DPDK not initialized")
+	}
+	C.counters_clear_policy()
+	return nil
+}
+
+func (m *Manager) ClearFilterCounters() error {
+	if m.platform.shm == nil {
+		return fmt.Errorf("DPDK not initialized")
+	}
+	C.counters_clear_filter()
+	return nil
+}
+
+func (m *Manager) ClearAllCounters() error {
 	if m.platform.shm == nil {
 		return fmt.Errorf("DPDK not initialized")
 	}
@@ -1149,28 +1234,12 @@ func (m *Manager) ClearGlobalCounters() error {
 	return nil
 }
 
-func (m *Manager) ClearInterfaceCounters() error {
-	return m.ClearGlobalCounters()
-}
-
-func (m *Manager) ClearZoneCounters() error {
-	return m.ClearGlobalCounters()
-}
-
-func (m *Manager) ClearPolicyCounters() error {
-	return m.ClearGlobalCounters()
-}
-
-func (m *Manager) ClearFilterCounters() error {
-	return m.ClearGlobalCounters()
-}
-
-func (m *Manager) ClearAllCounters() error {
-	return m.ClearGlobalCounters()
-}
-
 func (m *Manager) ClearNATRuleCounters() error {
-	return m.ClearGlobalCounters()
+	if m.platform.shm == nil {
+		return fmt.Errorf("DPDK not initialized")
+	}
+	C.counters_clear_nat_rule()
+	return nil
 }
 
 // --- Events ---

@@ -130,6 +130,7 @@ struct pipeline_ctx {
 	struct counter_value       *filter_counters;      /* [MAX_FILTER_RULES] */
 	struct counter_value       *nat_rule_counters;    /* [MAX_NAT_RULE_COUNTERS] */
 	struct flood_state         *flood_states;         /* [MAX_ZONES] */
+	uint64_t                   *nat_port_allocs;      /* [MAX_NAT_POOLS] */
 
 	/* Mode-switch counter (adaptive mode) */
 	uint64_t mode_switches;

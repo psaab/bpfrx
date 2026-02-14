@@ -188,10 +188,9 @@ drop:
  * process_burst — Process a burst of packets.
  *
  * Called from the RX loop after rte_eth_rx_burst(). Processes each
- * packet through the full pipeline sequentially.
- *
- * TODO: Consider prefetching next packet headers while processing
- * current packet for better cache behavior.
+ * packet through the full pipeline sequentially. Prefetches the next
+ * packet's header data while processing the current one for better
+ * cache behavior.
  */
 void
 process_burst(struct rte_mbuf **pkts, uint16_t nb_pkts,

@@ -427,6 +427,7 @@ counters_alloc(struct pipeline_ctx *ctx)
 	ctx->filter_counters    = lc->filter_counters;
 	ctx->nat_rule_counters  = lc->nat_rule_counters;
 	ctx->flood_states       = lc->flood_states;
+	ctx->nat_port_allocs    = lc->nat_port_allocs;
 
 	lcore_counter_array[ctx->lcore_id] = lc;
 	ctx->shm->counter_ptrs[ctx->lcore_id] = lc;
@@ -543,6 +544,95 @@ counters_clear_all(void)
 	for (unsigned i = 0; i < MAX_LCORES; i++) {
 		if (lcore_counter_array[i])
 			memset(lcore_counter_array[i], 0, sizeof(struct lcore_counters));
+	}
+}
+
+void
+counters_clear_global(void)
+{
+	for (unsigned i = 0; i < MAX_LCORES; i++) {
+		if (lcore_counter_array[i])
+			memset(lcore_counter_array[i]->global_counters, 0,
+			       sizeof(lcore_counter_array[i]->global_counters));
+	}
+}
+
+void
+counters_clear_interface(void)
+{
+	for (unsigned i = 0; i < MAX_LCORES; i++) {
+		if (lcore_counter_array[i])
+			memset(lcore_counter_array[i]->interface_counters, 0,
+			       sizeof(lcore_counter_array[i]->interface_counters));
+	}
+}
+
+void
+counters_clear_zone(void)
+{
+	for (unsigned i = 0; i < MAX_LCORES; i++) {
+		if (lcore_counter_array[i])
+			memset(lcore_counter_array[i]->zone_counters, 0,
+			       sizeof(lcore_counter_array[i]->zone_counters));
+	}
+}
+
+void
+counters_clear_policy(void)
+{
+	for (unsigned i = 0; i < MAX_LCORES; i++) {
+		if (lcore_counter_array[i])
+			memset(lcore_counter_array[i]->policy_counters, 0,
+			       sizeof(lcore_counter_array[i]->policy_counters));
+	}
+}
+
+void
+counters_clear_filter(void)
+{
+	for (unsigned i = 0; i < MAX_LCORES; i++) {
+		if (lcore_counter_array[i])
+			memset(lcore_counter_array[i]->filter_counters, 0,
+			       sizeof(lcore_counter_array[i]->filter_counters));
+	}
+}
+
+void
+counters_clear_nat_rule(void)
+{
+	for (unsigned i = 0; i < MAX_LCORES; i++) {
+		if (lcore_counter_array[i])
+			memset(lcore_counter_array[i]->nat_rule_counters, 0,
+			       sizeof(lcore_counter_array[i]->nat_rule_counters));
+	}
+}
+
+uint64_t
+counters_aggregate_snat_port(void)
+{
+	uint64_t total = 0;
+
+	for (unsigned i = 0; i < MAX_LCORES; i++) {
+		if (!lcore_counter_array[i])
+			continue;
+		for (unsigned p = 0; p < MAX_NAT_POOLS; p++)
+			total += lcore_counter_array[i]->nat_port_allocs[p];
+	}
+	return total;
+}
+
+void
+counters_aggregate_nat_port(uint32_t pool_id,
+                            uint64_t *allocs)
+{
+	*allocs = 0;
+	if (pool_id >= MAX_NAT_POOLS)
+		return;
+
+	for (unsigned i = 0; i < MAX_LCORES; i++) {
+		if (!lcore_counter_array[i])
+			continue;
+		*allocs += lcore_counter_array[i]->nat_port_allocs[pool_id];
 	}
 }
 

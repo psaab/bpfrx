@@ -34,6 +34,8 @@ struct lcore_counters {
 		__attribute__((aligned(64)));
 	struct flood_state         flood_states[MAX_ZONES]
 		__attribute__((aligned(64)));
+	uint64_t                   nat_port_allocs[MAX_NAT_POOLS]
+		__attribute__((aligned(64)));
 };
 
 /* Global array of per-lcore counters (indexed by lcore_id) */
@@ -110,6 +112,13 @@ ctr_nat_rule_add(struct pipeline_ctx *ctx, uint32_t counter_id,
 	}
 }
 
+static inline void
+ctr_nat_port_alloc(struct pipeline_ctx *ctx, uint32_t pool_id)
+{
+	if (pool_id < MAX_NAT_POOLS)
+		ctx->nat_port_allocs[pool_id]++;
+}
+
 /* ============================================================
  * Aggregation functions (called from Go via CGo)
  *
@@ -157,5 +166,26 @@ void counters_aggregate_nat_rule(uint32_t counter_id,
  * Clear all counters on all lcores.
  */
 void counters_clear_all(void);
+
+/**
+ * Selective counter clearing functions.
+ * Each clears only the specified counter category across all lcores.
+ */
+void counters_clear_global(void);
+void counters_clear_interface(void);
+void counters_clear_zone(void);
+void counters_clear_policy(void);
+void counters_clear_filter(void);
+void counters_clear_nat_rule(void);
+
+/**
+ * Aggregate SNAT port allocation counter across all lcores (all pools).
+ */
+uint64_t counters_aggregate_snat_port(void);
+
+/**
+ * Aggregate SNAT port allocation counter for a specific pool.
+ */
+void counters_aggregate_nat_port(uint32_t pool_id, uint64_t *allocs);
 
 #endif /* DPDK_COUNTERS_H */

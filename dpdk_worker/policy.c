@@ -257,6 +257,7 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 										meta->nat_src_port =
 											rte_cpu_to_be_16(port);
 										meta->nat_flags |= SESS_FLAG_SNAT;
+										ctr_nat_port_alloc(ctx, pool_id);
 
 										/* Insert return-path DNAT entry so
 										 * zone_lookup translates return packets
@@ -352,6 +353,7 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 										meta->nat_src_port =
 											rte_cpu_to_be_16(port);
 										meta->nat_flags |= SESS_FLAG_SNAT;
+										ctr_nat_port_alloc(ctx, pool_id);
 
 										/* Insert return-path DNAT v6 entry */
 										if (ctx->shm->dnat_table_v6 &&
