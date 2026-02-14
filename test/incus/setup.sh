@@ -328,7 +328,7 @@ EOF'
 	incus exec "$INSTANCE_NAME" -- sysctl --system
 
 	info "Installing packages (this may take a few minutes)..."
-	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server radvd'
+	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server radvd chrony'
 
 	# Upgrade kernel to latest from Debian unstable for full BPF verifier support
 	info "Adding Debian unstable repo for kernel upgrade..."

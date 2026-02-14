@@ -1770,39 +1770,40 @@ func (d *Daemon) applySystemDNS(cfg *config.Config) {
 		"search", cfg.System.DomainSearch, "servers", cfg.System.NameServers)
 }
 
-// applySystemNTP configures systemd-timesyncd from system { ntp } config.
+// applySystemNTP configures chrony from system { ntp } config.
+// Writes per-server source lines to /etc/chrony/sources.d/bpfrx.sources
+// and reloads chrony to pick up changes.
 func (d *Daemon) applySystemNTP(cfg *config.Config) {
 	if len(cfg.System.NTPServers) == 0 || isProcessDisabled(cfg, "ntp") {
 		return
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "[Time]\nNTP=%s\n", strings.Join(cfg.System.NTPServers, " "))
-	// Junos ntp boot-server threshold maps to timesyncd RootDistanceMaxUSec
-	if cfg.System.NTPThreshold > 0 {
-		fmt.Fprintf(&b, "RootDistanceMaxUSec=%dms\n", cfg.System.NTPThreshold)
-	}
-	// NTP threshold action: "reject" disables fallback NTP sources
-	if cfg.System.NTPThresholdAction == "reject" {
-		fmt.Fprintf(&b, "FallbackNTP=\n")
+	for _, server := range cfg.System.NTPServers {
+		// Use "pool" directive for hostnames (multiple IPs), "server" for explicit IPs
+		directive := "pool"
+		if net.ParseIP(server) != nil {
+			directive = "server"
+		}
+		fmt.Fprintf(&b, "%s %s iburst\n", directive, server)
 	}
 	content := b.String()
-	confPath := "/etc/systemd/timesyncd.conf.d/bpfrx.conf"
+	confPath := "/etc/chrony/sources.d/bpfrx.sources"
 
 	current, _ := os.ReadFile(confPath)
 	if string(current) == content {
 		return // no change
 	}
 
-	os.MkdirAll("/etc/systemd/timesyncd.conf.d", 0755)
+	os.MkdirAll("/etc/chrony/sources.d", 0755)
 	if err := os.WriteFile(confPath, []byte(content), 0644); err != nil {
-		slog.Warn("failed to write timesyncd config", "err", err)
+		slog.Warn("failed to write chrony sources", "err", err)
 		return
 	}
 
-	// Restart timesyncd to pick up new servers
-	exec.Command("systemctl", "restart", "systemd-timesyncd").Run()
-	slog.Info("NTP config applied", "servers", cfg.System.NTPServers)
+	// Reload chrony to pick up new sources
+	exec.Command("chronyc", "reload", "sources").Run()
+	slog.Info("NTP config applied via chrony", "servers", cfg.System.NTPServers)
 }
 
 // applyDNSService manages systemd-resolved based on system { services { dns } }.

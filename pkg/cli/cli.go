@@ -6898,6 +6898,10 @@ func (c *CLI) showSystemNTP() error {
 	if out, err := exec.Command("chronyc", "tracking").CombinedOutput(); err == nil {
 		fmt.Println()
 		printChronyTracking(string(out))
+		// Also show source list
+		if src, err := exec.Command("chronyc", "-n", "sources").CombinedOutput(); err == nil {
+			fmt.Printf("\nNTP sources:\n%s", string(src))
+		}
 	} else if out, err := exec.Command("ntpq", "-pn").CombinedOutput(); err == nil {
 		fmt.Printf("\nNTP peers:\n%s\n", string(out))
 	} else if out, err := exec.Command("timedatectl", "show", "--property=NTPSynchronized", "--value").CombinedOutput(); err == nil {
