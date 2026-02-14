@@ -143,6 +143,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		cc := cfg.Chassis.Cluster
 		d.cluster = cluster.NewManager(cc.NodeID, cc.ClusterID)
 		d.cluster.UpdateConfig(cc)
+		d.cluster.Start(ctx)
 		slog.Info("cluster manager initialized",
 			"node", cc.NodeID, "cluster", cc.ClusterID)
 	}
@@ -592,6 +593,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.lldpMgr.Stop()
 	}
 
+	// Stop cluster monitor.
+	if d.cluster != nil {
+		d.cluster.Stop()
+	}
+
 	// For hitless restarts, preserve all control-plane state so the next
 	// daemon inherits working routes, DHCP leases, VRFs, and tunnels.
 	// BPF programs keep running via pinned links; leaving FRR routes and
@@ -1004,6 +1010,33 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 					d.cluster.SetMonitorWeight(rgID, st.Interface, !st.Up, st.Weight)
 				}
 			}
+		}
+
+		// Register RETH interface→IP mappings for GARP on primary transition.
+		var rethMappings []cluster.RethIPMapping
+		for _, ifc := range cfg.Interfaces.Interfaces {
+			if ifc.RedundancyGroup <= 0 {
+				continue
+			}
+			for _, unit := range ifc.Units {
+				var ips []net.IP
+				for _, addr := range unit.Addresses {
+					ip, _, err := net.ParseCIDR(addr)
+					if err == nil && ip.To4() != nil {
+						ips = append(ips, ip)
+					}
+				}
+				if len(ips) > 0 {
+					rethMappings = append(rethMappings, cluster.RethIPMapping{
+						Interface: ifc.Name,
+						IPs:       ips,
+						RG:        ifc.RedundancyGroup,
+					})
+				}
+			}
+		}
+		if len(rethMappings) > 0 {
+			d.cluster.RegisterRethIPs(rethMappings)
 		}
 	}
 }

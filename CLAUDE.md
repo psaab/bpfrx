@@ -62,6 +62,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 | `pkg/configstore/` | Candidate/active/commit/rollback, atomic DB persistence, JSONL audit journal |
 | `pkg/dataplane/` | eBPF loader, map management, bpf2go bindings |
 | `pkg/daemon/` | Daemon lifecycle (TTY detection, signal handling) |
+| `pkg/cluster/` | Chassis cluster HA state machine, weight scoring, failover |
 | `pkg/cli/` | Interactive Junos-style CLI |
 | `pkg/conntrack/` | Session garbage collection |
 | `pkg/logging/` | Ring buffer reader, event buffer, syslog client |
@@ -149,7 +150,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces
 - **Observability**: Syslog (facility/severity/category filtering), NetFlow v9 (1-in-N sampling), Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB), BPF map utilization (`show system buffers`)
 - **Flow**: TCP MSS clamping (ingress XDP + egress TC, including GRE-specific gre-in/gre-out), ALG control, allow-dns-reply (wired to BPF), allow-embedded-icmp, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, logging, forwarding-class DSCP rewrite, DSCP action)
-- **HA**: VRRP via keepalived (config generation, runtime state detection)
+- **HA**: Chassis cluster state machine (weight-based failover, manual failover/reset, Junos-style show/request commands), VRRP via keepalived (config generation, runtime state detection), RETH bond interfaces
 - **DHCP**: Relay (Option 82), server (Kea integration with lease display)
 - **CLI**: Junos-style prefix matching, "Possible completions:" headers, zone/interface descriptions, session idle time, session brief tabular view, flow statistics, policy descriptions, config validation warnings
 

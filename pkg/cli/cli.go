@@ -9644,6 +9644,10 @@ func (c *CLI) showChassisClusterInterfaces() error {
 }
 
 func (c *CLI) showChassisClusterInformation() error {
+	if c.cluster != nil {
+		fmt.Print(c.cluster.FormatInformation())
+		return nil
+	}
 	cfg := c.store.ActiveConfig()
 	if cfg == nil || cfg.Chassis.Cluster == nil {
 		fmt.Println("Cluster not configured")

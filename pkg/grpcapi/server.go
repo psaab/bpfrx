@@ -5532,26 +5532,30 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 
 	case "chassis-cluster-information":
-		cfg := s.store.ActiveConfig()
-		if cfg == nil || cfg.Chassis.Cluster == nil {
-			fmt.Fprintln(&buf, "Cluster not configured")
-			break
+		if s.cluster != nil {
+			buf.WriteString(s.cluster.FormatInformation())
+		} else {
+			cfg := s.store.ActiveConfig()
+			if cfg == nil || cfg.Chassis.Cluster == nil {
+				fmt.Fprintln(&buf, "Cluster not configured")
+				break
+			}
+			cc := cfg.Chassis.Cluster
+			hbInterval := cc.HeartbeatInterval
+			if hbInterval == 0 {
+				hbInterval = 1000
+			}
+			hbThreshold := cc.HeartbeatThreshold
+			if hbThreshold == 0 {
+				hbThreshold = 3
+			}
+			fmt.Fprintf(&buf, "Cluster ID: %d\n", cc.ClusterID)
+			fmt.Fprintf(&buf, "Node ID: %d\n", cc.NodeID)
+			fmt.Fprintf(&buf, "RETH count: %d\n", cc.RethCount)
+			fmt.Fprintf(&buf, "Heartbeat interval: %d ms\n", hbInterval)
+			fmt.Fprintf(&buf, "Heartbeat threshold: %d\n", hbThreshold)
+			fmt.Fprintf(&buf, "Redundancy groups: %d\n", len(cc.RedundancyGroups))
 		}
-		cc := cfg.Chassis.Cluster
-		hbInterval := cc.HeartbeatInterval
-		if hbInterval == 0 {
-			hbInterval = 1000
-		}
-		hbThreshold := cc.HeartbeatThreshold
-		if hbThreshold == 0 {
-			hbThreshold = 3
-		}
-		fmt.Fprintf(&buf, "Cluster ID: %d\n", cc.ClusterID)
-		fmt.Fprintf(&buf, "Node ID: %d\n", cc.NodeID)
-		fmt.Fprintf(&buf, "RETH count: %d\n", cc.RethCount)
-		fmt.Fprintf(&buf, "Heartbeat interval: %d ms\n", hbInterval)
-		fmt.Fprintf(&buf, "Heartbeat threshold: %d\n", hbThreshold)
-		fmt.Fprintf(&buf, "Redundancy groups: %d\n", len(cc.RedundancyGroups))
 
 	case "chassis-cluster-statistics":
 		if s.cluster == nil {

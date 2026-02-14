@@ -1061,11 +1061,18 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	}},
 	"chassis": {children: map[string]*schemaNode{
 		"cluster": {children: map[string]*schemaNode{
-			"cluster-id":          {args: 1, children: nil},
-			"node":                {args: 1, children: nil},
-			"reth-count":          {args: 1, children: nil},
-			"heartbeat-interval":  {args: 1, children: nil},
-			"heartbeat-threshold": {args: 1, children: nil},
+			"cluster-id":           {args: 1, children: nil},
+			"node":                 {args: 1, children: nil},
+			"reth-count":           {args: 1, children: nil},
+			"heartbeat-interval":   {args: 1, children: nil},
+			"heartbeat-threshold":  {args: 1, children: nil},
+			"control-link-recovery": {children: nil},
+			"control-ports": {children: map[string]*schemaNode{
+				"fpc": {args: 1, children: map[string]*schemaNode{
+					"port": {args: 1, children: nil},
+				}},
+			}},
+			"control-interface": {args: 1, children: nil},
 			"redundancy-group": {args: 1, children: map[string]*schemaNode{
 				"node": {args: 1, children: map[string]*schemaNode{
 					"priority": {args: 1, children: nil},
@@ -1073,6 +1080,15 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"gratuitous-arp-count": {args: 1, children: nil},
 				"preempt":              {children: nil},
 				"interface-monitor":    {children: nil},
+				"ip-monitoring": {children: map[string]*schemaNode{
+					"global-weight":    {args: 1, children: nil},
+					"global-threshold": {args: 1, children: nil},
+					"family": {children: map[string]*schemaNode{
+						"inet": {wildcard: &schemaNode{children: map[string]*schemaNode{
+							"weight": {args: 1, children: nil},
+						}}},
+					}},
+				}},
 			}},
 		}},
 	}},

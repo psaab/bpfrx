@@ -7709,6 +7709,117 @@ func TestChassisClusterExtendedFieldsSet(t *testing.T) {
 	}
 }
 
+func TestChassisClusterIPMonitoring(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+        node 0;
+        redundancy-group 0 {
+            node 0 priority 200;
+            ip-monitoring {
+                global-weight 255;
+                global-threshold 200;
+                family {
+                    inet {
+                        10.0.1.1 weight 100;
+                        10.0.2.1 weight 80;
+                    }
+                }
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	rg := cfg.Chassis.Cluster.RedundancyGroups[0]
+	if rg.IPMonitoring == nil {
+		t.Fatal("IPMonitoring is nil")
+	}
+	if rg.IPMonitoring.GlobalWeight != 255 {
+		t.Errorf("GlobalWeight = %d, want 255", rg.IPMonitoring.GlobalWeight)
+	}
+	if rg.IPMonitoring.GlobalThreshold != 200 {
+		t.Errorf("GlobalThreshold = %d, want 200", rg.IPMonitoring.GlobalThreshold)
+	}
+	if len(rg.IPMonitoring.Targets) != 2 {
+		t.Fatalf("Targets = %d, want 2", len(rg.IPMonitoring.Targets))
+	}
+	if rg.IPMonitoring.Targets[0].Address != "10.0.1.1" {
+		t.Errorf("target[0].Address = %q, want 10.0.1.1", rg.IPMonitoring.Targets[0].Address)
+	}
+	if rg.IPMonitoring.Targets[0].Weight != 100 {
+		t.Errorf("target[0].Weight = %d, want 100", rg.IPMonitoring.Targets[0].Weight)
+	}
+	if rg.IPMonitoring.Targets[1].Address != "10.0.2.1" {
+		t.Errorf("target[1].Address = %q, want 10.0.2.1", rg.IPMonitoring.Targets[1].Address)
+	}
+	if rg.IPMonitoring.Targets[1].Weight != 80 {
+		t.Errorf("target[1].Weight = %d, want 80", rg.IPMonitoring.Targets[1].Weight)
+	}
+}
+
+func TestChassisClusterIPMonitoringSetSyntax(t *testing.T) {
+	commands := []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster node 0",
+		"set chassis cluster redundancy-group 0 node 0 priority 200",
+		"set chassis cluster redundancy-group 0 ip-monitoring global-weight 255",
+		"set chassis cluster redundancy-group 0 ip-monitoring global-threshold 200",
+		"set chassis cluster redundancy-group 0 ip-monitoring family inet 10.0.1.1 weight 100",
+		"set chassis cluster redundancy-group 0 ip-monitoring family inet 10.0.2.1 weight 80",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range commands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	rg := cfg.Chassis.Cluster.RedundancyGroups[0]
+	if rg.IPMonitoring == nil {
+		t.Fatal("IPMonitoring is nil")
+	}
+	if rg.IPMonitoring.GlobalWeight != 255 {
+		t.Errorf("GlobalWeight = %d, want 255", rg.IPMonitoring.GlobalWeight)
+	}
+	if rg.IPMonitoring.GlobalThreshold != 200 {
+		t.Errorf("GlobalThreshold = %d, want 200", rg.IPMonitoring.GlobalThreshold)
+	}
+	if len(rg.IPMonitoring.Targets) != 2 {
+		t.Fatalf("Targets = %d, want 2", len(rg.IPMonitoring.Targets))
+	}
+	if rg.IPMonitoring.Targets[0].Address != "10.0.1.1" {
+		t.Errorf("target[0].Address = %q, want 10.0.1.1", rg.IPMonitoring.Targets[0].Address)
+	}
+	if rg.IPMonitoring.Targets[0].Weight != 100 {
+		t.Errorf("target[0].Weight = %d, want 100", rg.IPMonitoring.Targets[0].Weight)
+	}
+	if rg.IPMonitoring.Targets[1].Address != "10.0.2.1" {
+		t.Errorf("target[1].Address = %q, want 10.0.2.1", rg.IPMonitoring.Targets[1].Address)
+	}
+	if rg.IPMonitoring.Targets[1].Weight != 80 {
+		t.Errorf("target[1].Weight = %d, want 80", rg.IPMonitoring.Targets[1].Weight)
+	}
+}
+
 func TestEventOptions(t *testing.T) {
 	input := `event-options {
     policy disable-on-ping-failure {

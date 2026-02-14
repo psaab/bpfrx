@@ -29,8 +29,10 @@ type ClusterConfig struct {
 	ClusterID          int
 	NodeID             int
 	RethCount          int
-	HeartbeatInterval  int // milliseconds, 0=default(1000)
-	HeartbeatThreshold int // missed heartbeats before lost, 0=default(3)
+	HeartbeatInterval  int    // milliseconds, 0=default(1000)
+	HeartbeatThreshold int    // missed heartbeats before lost, 0=default(3)
+	ControlInterface   string // interface for heartbeat traffic (e.g. "fab0")
+	ControlLinkRecovery bool  // enable control-link-recovery
 	RedundancyGroups   []*RedundancyGroup
 }
 
@@ -41,12 +43,26 @@ type RedundancyGroup struct {
 	GratuitousARPCount int
 	Preempt            bool
 	InterfaceMonitors  []*InterfaceMonitor
+	IPMonitoring       *IPMonitoring
 }
 
 // InterfaceMonitor defines an interface health monitor within a redundancy group.
 type InterfaceMonitor struct {
 	Interface string
 	Weight    int
+}
+
+// IPMonitoring defines IP reachability monitoring for a redundancy group.
+type IPMonitoring struct {
+	GlobalWeight    int
+	GlobalThreshold int
+	Targets         []*IPMonitorTarget
+}
+
+// IPMonitorTarget defines a single IP address to probe for reachability.
+type IPMonitorTarget struct {
+	Address string
+	Weight  int
 }
 
 // EventPolicy defines an event-driven policy (event-options).

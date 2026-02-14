@@ -1,11 +1,14 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
@@ -64,6 +67,13 @@ type monitorKey struct {
 	iface string
 }
 
+// RethIPMapping maps a RETH interface to its IP addresses (for GARP).
+type RethIPMapping struct {
+	Interface string
+	IPs       []net.IP
+	RG        int // redundancy group ID
+}
+
 // Manager manages cluster redundancy group states.
 type Manager struct {
 	nodeID         int
@@ -72,6 +82,23 @@ type Manager struct {
 	monitorWeights map[monitorKey]int // per-RG per-interface monitor weights
 	mu             sync.RWMutex
 	eventCh        chan ClusterEvent
+	monitor        *Monitor
+	rethIPs        []RethIPMapping
+	garpCounts     map[int]int // rgID -> gratuitous ARP count from config
+
+	// Peer state tracking (heartbeat).
+	peerAlive    bool
+	peerNodeID   int
+	peerGroups   map[int]PeerGroupState
+
+	// Heartbeat goroutines (nil when not started).
+	hbSender   *heartbeatSender
+	hbReceiver *heartbeatReceiver
+
+	// Heartbeat config.
+	controlInterface string
+	hbInterval       time.Duration
+	hbThreshold      int
 }
 
 // NewManager creates a new cluster manager.
@@ -82,6 +109,10 @@ func NewManager(nodeID, clusterID int) *Manager {
 		groups:         make(map[int]*RedundancyGroupState),
 		monitorWeights: make(map[monitorKey]int),
 		eventCh:        make(chan ClusterEvent, 64),
+		garpCounts:     make(map[int]int),
+		peerGroups:     make(map[int]PeerGroupState),
+		hbInterval:     DefaultHeartbeatInterval,
+		hbThreshold:    DefaultHeartbeatThreshold,
 	}
 }
 
@@ -93,6 +124,31 @@ func (m *Manager) ClusterID() int { return m.clusterID }
 
 // Events returns the event channel for state change notifications.
 func (m *Manager) Events() <-chan ClusterEvent { return m.eventCh }
+
+// PeerAlive returns whether the peer node is reachable.
+func (m *Manager) PeerAlive() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.peerAlive
+}
+
+// PeerNodeID returns the peer's node ID (valid only when PeerAlive is true).
+func (m *Manager) PeerNodeID() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.peerNodeID
+}
+
+// PeerGroupStates returns a snapshot of the peer's RG states.
+func (m *Manager) PeerGroupStates() map[int]PeerGroupState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cp := make(map[int]PeerGroupState, len(m.peerGroups))
+	for k, v := range m.peerGroups {
+		cp[k] = v
+	}
+	return cp
+}
 
 // UpdateConfig synchronizes redundancy group definitions from config.
 // Called during config apply. Preserves runtime state for existing groups.
@@ -137,8 +193,33 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 		}
 	}
 
-	// Single-node election: if no peer, highest priority node is primary.
-	m.electSingleNode()
+	// Update heartbeat parameters.
+	if cfg.HeartbeatInterval > 0 {
+		m.hbInterval = time.Duration(cfg.HeartbeatInterval) * time.Millisecond
+	}
+	if cfg.HeartbeatThreshold > 0 {
+		m.hbThreshold = cfg.HeartbeatThreshold
+	}
+	if cfg.ControlInterface != "" {
+		m.controlInterface = cfg.ControlInterface
+	}
+
+	// Store GARP counts and update monitor groups.
+	for _, rg := range cfg.RedundancyGroups {
+		if rg.GratuitousARPCount > 0 {
+			m.garpCounts[rg.ID] = rg.GratuitousARPCount
+		}
+	}
+	if m.monitor != nil {
+		m.monitor.UpdateGroups(cfg.RedundancyGroups)
+	}
+
+	// Election: use peer-aware if peer is alive, otherwise single-node.
+	if m.peerAlive {
+		m.runElection()
+	} else {
+		m.electSingleNode()
+	}
 }
 
 // electSingleNode performs election when no heartbeat peer is present.
@@ -222,7 +303,11 @@ func (m *Manager) recalcWeight(rg *RedundancyGroupState) {
 		slog.Info("cluster: weight changed",
 			"rg", rg.GroupID, "old", oldWeight, "new", rg.Weight)
 	}
-	m.electSingleNode()
+	if m.peerAlive {
+		m.runElection()
+	} else {
+		m.electSingleNode()
+	}
 }
 
 // GroupStates returns a snapshot of all redundancy group states.
@@ -299,7 +384,11 @@ func (m *Manager) ResetFailover(rgID int) error {
 		return fmt.Errorf("redundancy group %d not found", rgID)
 	}
 	rg.ManualFailover = false
-	m.electSingleNode()
+	if m.peerAlive {
+		m.runElection()
+	} else {
+		m.electSingleNode()
+	}
 	slog.Info("cluster: failover reset", "rg", rgID)
 	return nil
 }
@@ -311,11 +400,225 @@ func (m *Manager) sendEvent(groupID int, oldState, newState NodeState) {
 		slog.Warn("cluster: event channel full, dropping event",
 			"rg", groupID, "old", oldState, "new", newState)
 	}
+
+	// Trigger GARP on transition to primary.
+	if newState == StatePrimary && oldState != StatePrimary {
+		m.triggerGARP(groupID)
+	}
+}
+
+// Start begins periodic interface/IP monitoring.
+func (m *Manager) Start(ctx context.Context) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.monitor != nil {
+		m.monitor.Stop()
+	}
+	m.monitor = NewMonitor(m, nil) // groups set via UpdateConfig
+	m.monitor.Start(ctx)
+}
+
+// Stop halts monitoring and heartbeat goroutines.
+func (m *Manager) Stop() {
+	m.mu.Lock()
+	mon := m.monitor
+	sender := m.hbSender
+	receiver := m.hbReceiver
+	m.hbSender = nil
+	m.hbReceiver = nil
+	m.mu.Unlock()
+
+	if mon != nil {
+		mon.Stop()
+	}
+	if sender != nil {
+		sender.stop()
+	}
+	if receiver != nil {
+		receiver.stop()
+	}
+}
+
+// StartHeartbeat launches heartbeat sender and receiver goroutines.
+// localAddr is the local control link IP, peerAddr is the peer control link IP.
+func (m *Manager) StartHeartbeat(localAddr, peerAddr string) error {
+	m.mu.Lock()
+	interval := m.hbInterval
+	threshold := m.hbThreshold
+	m.mu.Unlock()
+
+	// Resolve peer address.
+	peer, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", peerAddr, HeartbeatPort))
+	if err != nil {
+		return fmt.Errorf("resolve peer addr: %w", err)
+	}
+
+	// Bind receiver to local address.
+	local, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", localAddr, HeartbeatPort))
+	if err != nil {
+		return fmt.Errorf("resolve local addr: %w", err)
+	}
+
+	recvConn, err := net.ListenUDP("udp4", local)
+	if err != nil {
+		return fmt.Errorf("listen heartbeat: %w", err)
+	}
+
+	// Create sender socket (bound to local address).
+	sendConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(localAddr)})
+	if err != nil {
+		recvConn.Close()
+		return fmt.Errorf("sender socket: %w", err)
+	}
+
+	m.mu.Lock()
+	m.hbSender = newHeartbeatSender(m, sendConn, peer, interval)
+	m.hbReceiver = newHeartbeatReceiver(m, recvConn, threshold, interval)
+	m.mu.Unlock()
+
+	m.hbReceiver.start()
+	m.hbSender.start()
+
+	slog.Info("cluster: heartbeat started",
+		"local", localAddr, "peer", peerAddr,
+		"interval", interval, "threshold", threshold)
+	return nil
+}
+
+// StopHeartbeat halts heartbeat sender and receiver goroutines.
+func (m *Manager) StopHeartbeat() {
+	m.mu.Lock()
+	sender := m.hbSender
+	receiver := m.hbReceiver
+	m.hbSender = nil
+	m.hbReceiver = nil
+	m.mu.Unlock()
+
+	if sender != nil {
+		sender.stop()
+	}
+	if receiver != nil {
+		receiver.stop()
+	}
+}
+
+// buildHeartbeat creates a heartbeat packet from current state.
+func (m *Manager) buildHeartbeat() *HeartbeatPacket {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	pkt := &HeartbeatPacket{
+		NodeID:    uint8(m.nodeID),
+		ClusterID: uint16(m.clusterID),
+	}
+	for _, rg := range m.groups {
+		pkt.Groups = append(pkt.Groups, HeartbeatGroup{
+			GroupID:  uint8(rg.GroupID),
+			Priority: uint16(rg.LocalPriority),
+			Weight:   uint8(rg.Weight),
+			State:    uint8(rg.State),
+		})
+	}
+	return pkt
+}
+
+// handlePeerHeartbeat processes an incoming peer heartbeat.
+func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	wasAlive := m.peerAlive
+	m.peerAlive = true
+	m.peerNodeID = int(pkt.NodeID)
+
+	// Update peer group states.
+	for _, g := range pkt.Groups {
+		m.peerGroups[int(g.GroupID)] = PeerGroupState{
+			GroupID:  int(g.GroupID),
+			Priority: int(g.Priority),
+			Weight:   int(g.Weight),
+			State:    NodeState(g.State),
+		}
+	}
+
+	// Update PeerPriority on local RG state for display.
+	for _, rg := range m.groups {
+		if pg, ok := m.peerGroups[rg.GroupID]; ok {
+			rg.PeerPriority = pg.Priority
+		}
+	}
+
+	if !wasAlive {
+		slog.Info("cluster: peer heartbeat received",
+			"peer_node", pkt.NodeID, "groups", len(pkt.Groups))
+	}
+
+	m.runElection()
+}
+
+// handlePeerTimeout is called when the peer heartbeat timeout expires.
+func (m *Manager) handlePeerTimeout() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.peerAlive {
+		return // already marked lost
+	}
+
+	m.peerAlive = false
+	m.peerGroups = make(map[int]PeerGroupState)
+	slog.Warn("cluster: peer heartbeat timeout, marking peer lost")
+
+	// Peer lost: re-run single-node election.
+	m.electSingleNode()
+}
+
+// RegisterRethIPs stores RETH interface→IP mappings for GARP on primary transition.
+func (m *Manager) RegisterRethIPs(mappings []RethIPMapping) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rethIPs = mappings
+}
+
+// triggerGARP sends gratuitous ARPs for all RETH interfaces in the given RG.
+// Called internally when a transition to primary is detected (holds m.mu).
+func (m *Manager) triggerGARP(rgID int) {
+	// Snapshot under lock (called with lock held, so read fields directly).
+	rethIPs := m.rethIPs
+	count := m.garpCounts[rgID]
+	if count <= 0 {
+		count = 4
+	}
+
+	// Send GARP in a goroutine to avoid holding the lock during I/O.
+	go func() {
+		for _, mapping := range rethIPs {
+			if mapping.RG != rgID {
+				continue
+			}
+			for _, ip := range mapping.IPs {
+				if err := SendGratuitousARP(mapping.Interface, ip, count); err != nil {
+					slog.Warn("cluster: failed to send GARP",
+						"interface", mapping.Interface, "ip", ip, "err", err)
+				}
+			}
+		}
+	}()
 }
 
 // FormatStatus returns a Junos-style status string for all RGs.
 func (m *Manager) FormatStatus() string {
 	states := m.GroupStates()
+	m.mu.RLock()
+	peerAlive := m.peerAlive
+	peerNodeID := m.peerNodeID
+	peerGroups := make(map[int]PeerGroupState, len(m.peerGroups))
+	for k, v := range m.peerGroups {
+		peerGroups[k] = v
+	}
+	m.mu.RUnlock()
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "Cluster ID: %d\n", m.clusterID)
 	fmt.Fprintf(&b, "Node name: node%d\n\n", m.nodeID)
@@ -338,9 +641,67 @@ func (m *Manager) FormatStatus() string {
 		if len(rg.MonitorFails) > 0 {
 			monFails = strings.Join(rg.MonitorFails, ", ")
 		}
+		// Local node line.
 		fmt.Fprintf(&b, "%-6s %-8d %-14s %-8s %-8s %s\n",
 			fmt.Sprintf("node%d", m.nodeID),
 			rg.LocalPriority, rg.State, preempt, manual, monFails)
+		// Peer node line (if alive).
+		if peerAlive {
+			if pg, ok := peerGroups[rg.GroupID]; ok {
+				fmt.Fprintf(&b, "%-6s %-8d %-14s %-8s %-8s %s\n",
+					fmt.Sprintf("node%d", peerNodeID),
+					pg.Priority, pg.State, preempt, "no", "None")
+			}
+		}
+		fmt.Fprintln(&b)
+	}
+	return b.String()
+}
+
+// FormatInformation returns detailed cluster information.
+func (m *Manager) FormatInformation() string {
+	m.mu.RLock()
+	peerAlive := m.peerAlive
+	peerNodeID := m.peerNodeID
+	interval := m.hbInterval
+	threshold := m.hbThreshold
+	controlIface := m.controlInterface
+	m.mu.RUnlock()
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Cluster ID: %d\n", m.clusterID)
+	fmt.Fprintf(&b, "Node ID: %d\n", m.nodeID)
+	fmt.Fprintf(&b, "Heartbeat interval: %d ms\n", interval.Milliseconds())
+	fmt.Fprintf(&b, "Heartbeat threshold: %d\n", threshold)
+	if controlIface != "" {
+		fmt.Fprintf(&b, "Control interface: %s\n", controlIface)
+	}
+
+	peerStatus := "lost"
+	if peerAlive {
+		peerStatus = fmt.Sprintf("alive (node%d)", peerNodeID)
+	}
+	fmt.Fprintf(&b, "Peer status: %s\n", peerStatus)
+
+	states := m.GroupStates()
+	fmt.Fprintf(&b, "Redundancy groups: %d\n\n", len(states))
+
+	for _, rg := range states {
+		fmt.Fprintf(&b, "Redundancy group %d:\n", rg.GroupID)
+		fmt.Fprintf(&b, "  Local priority: %d\n", rg.LocalPriority)
+		fmt.Fprintf(&b, "  Peer priority: %d\n", rg.PeerPriority)
+		fmt.Fprintf(&b, "  Local state: %s\n", rg.State)
+		fmt.Fprintf(&b, "  Weight: %d\n", rg.Weight)
+		fmt.Fprintf(&b, "  Effective priority: %d\n", EffectivePriority(rg.LocalPriority, rg.Weight))
+		preempt := "no"
+		if rg.Preempt {
+			preempt = "yes"
+		}
+		fmt.Fprintf(&b, "  Preempt: %s\n", preempt)
+		fmt.Fprintf(&b, "  Failover count: %d\n", rg.FailoverCount)
+		if len(rg.MonitorFails) > 0 {
+			fmt.Fprintf(&b, "  Monitor failures: %s\n", strings.Join(rg.MonitorFails, ", "))
+		}
 		fmt.Fprintln(&b)
 	}
 	return b.String()

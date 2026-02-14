@@ -4965,6 +4965,14 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 			}
 		}
 	}
+	if clusterNode.FindChild("control-link-recovery") != nil {
+		ch.Cluster.ControlLinkRecovery = true
+	}
+	if n := clusterNode.FindChild("control-interface"); n != nil {
+		if v := nodeVal(n); v != "" {
+			ch.Cluster.ControlInterface = v
+		}
+	}
 
 	for _, rgInst := range namedInstances(clusterNode.FindChildren("redundancy-group")) {
 		rgID := 0
@@ -5032,6 +5040,48 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 					}
 					rg.InterfaceMonitors = append(rg.InterfaceMonitors, im)
 				}
+			case "ip-monitoring":
+				ipm := &IPMonitoring{}
+				if gwNode := child.FindChild("global-weight"); gwNode != nil {
+					if v := nodeVal(gwNode); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							ipm.GlobalWeight = n
+						}
+					}
+				}
+				if gtNode := child.FindChild("global-threshold"); gtNode != nil {
+					if v := nodeVal(gtNode); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							ipm.GlobalThreshold = n
+						}
+					}
+				}
+				if familyNode := child.FindChild("family"); familyNode != nil {
+					if inetNode := familyNode.FindChild("inet"); inetNode != nil {
+						for _, addrChild := range inetNode.Children {
+							target := &IPMonitorTarget{
+								Address: addrChild.Name(),
+							}
+							// weight inline: "10.0.1.1 weight 100"
+							for i := 1; i < len(addrChild.Keys)-1; i++ {
+								if addrChild.Keys[i] == "weight" {
+									if n, err := strconv.Atoi(addrChild.Keys[i+1]); err == nil {
+										target.Weight = n
+									}
+								}
+							}
+							if wNode := addrChild.FindChild("weight"); wNode != nil {
+								if v := nodeVal(wNode); v != "" {
+									if n, err := strconv.Atoi(v); err == nil {
+										target.Weight = n
+									}
+								}
+							}
+							ipm.Targets = append(ipm.Targets, target)
+						}
+					}
+				}
+				rg.IPMonitoring = ipm
 			}
 		}
 
