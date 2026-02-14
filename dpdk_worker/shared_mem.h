@@ -749,6 +749,23 @@ struct shared_memory {
 	volatile uint64_t gc_sessions_expired;
 	volatile uint64_t gc_sessions_scanned;
 
+	/* Per-port link state (updated by main lcore) */
+	volatile uint8_t port_link_state[MAX_PORT_MAP];  /* 1 = up, 0 = down */
+	volatile uint32_t port_link_speed[MAX_PORT_MAP]; /* Mbps */
+	volatile uint16_t nb_ports;                       /* actual port count */
+	uint16_t link_pad;
+
+	/* Per-port hardware statistics (updated by main lcore) */
+	struct {
+		volatile uint64_t rx_packets;
+		volatile uint64_t rx_bytes;
+		volatile uint64_t tx_packets;
+		volatile uint64_t tx_bytes;
+		volatile uint64_t rx_errors;
+		volatile uint64_t tx_errors;
+		volatile uint64_t rx_missed;
+	} port_stats[MAX_PORT_MAP];
+
 	/* Packet trace filter (set by Go, read by workers).
 	 * When trace_enabled is non-zero, packets matching the filter
 	 * emit EVENT_TYPE_PACKET_TRACE events with full metadata. */

@@ -21,6 +21,7 @@
 #include <rte_lpm.h>
 #include <rte_lpm6.h>
 #include <rte_memzone.h>
+#include <rte_cycles.h>
 
 #include "shared_mem.h"
 #include "tables.h"
@@ -818,11 +819,54 @@ main(int argc, char **argv)
 		}
 	}
 
+	/* Record port count and initial link state */
+	g_shm->nb_ports = nb_ports;
+	RTE_ETH_FOREACH_DEV(port_id) {
+		if (port_id >= MAX_PORT_MAP)
+			break;
+		struct rte_eth_link link;
+		rte_eth_link_get_nowait(port_id, &link);
+		g_shm->port_link_state[port_id] = link.link_status;
+		g_shm->port_link_speed[port_id] = link.link_speed;
+	}
+
 	printf("DPDK worker started (session GC active on main lcore)\n");
 
-	/* Main lcore: run session GC while workers process packets */
+	/* Main lcore: run session GC + poll link/stats while workers process packets */
+	uint64_t stats_tsc = rte_rdtsc();
+	uint64_t stats_interval = rte_get_tsc_hz();  /* 1 second */
+
 	while (!g_force_quit) {
 		int deleted = gc_sweep(g_shm);
+
+		/* Periodic link state + port stats poll (~1s) */
+		uint64_t now_tsc = rte_rdtsc();
+		if (now_tsc - stats_tsc >= stats_interval) {
+			stats_tsc = now_tsc;
+			RTE_ETH_FOREACH_DEV(port_id) {
+				if (port_id >= MAX_PORT_MAP)
+					break;
+
+				/* Link state */
+				struct rte_eth_link link;
+				rte_eth_link_get_nowait(port_id, &link);
+				g_shm->port_link_state[port_id] = link.link_status;
+				g_shm->port_link_speed[port_id] = link.link_speed;
+
+				/* Hardware statistics */
+				struct rte_eth_stats stats;
+				if (rte_eth_stats_get(port_id, &stats) == 0) {
+					g_shm->port_stats[port_id].rx_packets = stats.ipackets;
+					g_shm->port_stats[port_id].rx_bytes   = stats.ibytes;
+					g_shm->port_stats[port_id].tx_packets = stats.opackets;
+					g_shm->port_stats[port_id].tx_bytes   = stats.obytes;
+					g_shm->port_stats[port_id].rx_errors  = stats.ierrors;
+					g_shm->port_stats[port_id].tx_errors  = stats.oerrors;
+					g_shm->port_stats[port_id].rx_missed  = stats.imissed;
+				}
+			}
+		}
+
 		if (deleted == 0) {
 			/* No work — sleep briefly to avoid busy-wait */
 			rte_delay_us_sleep(10000);  /* 10ms */

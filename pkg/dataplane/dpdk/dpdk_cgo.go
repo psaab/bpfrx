@@ -1858,6 +1858,61 @@ func (m *Manager) ClearLatencyHistogram() {
 	C.counters_clear_latency()
 }
 
+// PortStats holds hardware-level statistics for a single DPDK port.
+type PortStats struct {
+	RxPackets uint64
+	RxBytes   uint64
+	TxPackets uint64
+	TxBytes   uint64
+	RxErrors  uint64
+	TxErrors  uint64
+	RxMissed  uint64
+}
+
+// PortCount returns the number of DPDK ports available.
+func (m *Manager) PortCount() int {
+	shm := m.platform.shm
+	if shm == nil {
+		return 0
+	}
+	return int(shm.nb_ports)
+}
+
+// ReadPortLinkState returns (linkUp, speedMbps) for a given DPDK port ID.
+func (m *Manager) ReadPortLinkState(portID int) (bool, uint32) {
+	shm := m.platform.shm
+	if shm == nil {
+		return false, 0
+	}
+	if portID < 0 || portID >= C.MAX_PORT_MAP {
+		return false, 0
+	}
+	up := shm.port_link_state[portID] != 0
+	speed := uint32(shm.port_link_speed[portID])
+	return up, speed
+}
+
+// ReadPortStats returns hardware-level statistics for a given DPDK port ID.
+func (m *Manager) ReadPortStats(portID int) PortStats {
+	shm := m.platform.shm
+	if shm == nil {
+		return PortStats{}
+	}
+	if portID < 0 || portID >= C.MAX_PORT_MAP {
+		return PortStats{}
+	}
+	ps := &shm.port_stats[portID]
+	return PortStats{
+		RxPackets: uint64(ps.rx_packets),
+		RxBytes:   uint64(ps.rx_bytes),
+		TxPackets: uint64(ps.tx_packets),
+		TxBytes:   uint64(ps.tx_bytes),
+		RxErrors:  uint64(ps.rx_errors),
+		TxErrors:  uint64(ps.tx_errors),
+		RxMissed:  uint64(ps.rx_missed),
+	}
+}
+
 // IsWorkerHealthy checks if DPDK worker lcores are alive by reading
 // their heartbeat timestamps from shared memory. Returns true if all
 // workers updated their heartbeat within the last maxAge duration.
