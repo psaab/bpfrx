@@ -508,6 +508,12 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 		if bgp.GracefulRestart {
 			b.WriteString(" bgp graceful-restart\n")
 		}
+		if bgp.LogNeighborChanges {
+			b.WriteString(" bgp log-neighbor-changes\n")
+		}
+		if bgp.MultipathMultipleAS {
+			b.WriteString(" bgp bestpath as-path multipath-relax\n")
+		}
 		for _, n := range bgp.Neighbors {
 			fmt.Fprintf(&b, " neighbor %s remote-as %d\n", n.Address, n.PeerAS)
 			if n.Description != "" {
@@ -540,26 +546,36 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 				inet6Neighbors = append(inet6Neighbors, n)
 			}
 		}
-		if len(inet4Neighbors) > 0 || ecmpMaxPaths > 1 {
+		bgpMaxPaths := ecmpMaxPaths
+		if bgp.Multipath > 0 && bgpMaxPaths < bgp.Multipath {
+			bgpMaxPaths = bgp.Multipath
+		}
+		if len(inet4Neighbors) > 0 || bgpMaxPaths > 1 {
 			b.WriteString(" !\n address-family ipv4 unicast\n")
-			if ecmpMaxPaths > 1 {
-				fmt.Fprintf(&b, "  maximum-paths %d\n", ecmpMaxPaths)
+			if bgpMaxPaths > 1 {
+				fmt.Fprintf(&b, "  maximum-paths %d\n", bgpMaxPaths)
 			}
 			for _, n := range inet4Neighbors {
 				fmt.Fprintf(&b, "  neighbor %s activate\n", n.Address)
+				if n.DefaultOriginate {
+					fmt.Fprintf(&b, "  neighbor %s default-originate\n", n.Address)
+				}
 				for _, exp := range n.Export {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, exp)
 				}
 			}
 			b.WriteString(" exit-address-family\n")
 		}
-		if len(inet6Neighbors) > 0 || ecmpMaxPaths > 1 {
+		if len(inet6Neighbors) > 0 || bgpMaxPaths > 1 {
 			b.WriteString(" !\n address-family ipv6 unicast\n")
-			if ecmpMaxPaths > 1 {
-				fmt.Fprintf(&b, "  maximum-paths %d\n", ecmpMaxPaths)
+			if bgpMaxPaths > 1 {
+				fmt.Fprintf(&b, "  maximum-paths %d\n", bgpMaxPaths)
 			}
 			for _, n := range inet6Neighbors {
 				fmt.Fprintf(&b, "  neighbor %s activate\n", n.Address)
+				if n.DefaultOriginate {
+					fmt.Fprintf(&b, "  neighbor %s default-originate\n", n.Address)
+				}
 				for _, exp := range n.Export {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, exp)
 				}
@@ -617,6 +633,12 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 		for _, export := range isis.Export {
 			fmt.Fprintf(&b, " redistribute %s\n", export)
 		}
+		if isis.WideMetricsOnly {
+			b.WriteString(" metric-style wide\n")
+		}
+		if isis.Overload {
+			b.WriteString(" set-overload-bit\n")
+		}
 		if isis.AuthKey != "" {
 			if isis.AuthType == "md5" {
 				fmt.Fprintf(&b, " area-password md5 %s\n", isis.AuthKey)
@@ -635,6 +657,13 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 			}
 			if iface.Metric > 0 {
 				fmt.Fprintf(&b, " isis metric %d\n", iface.Metric)
+			}
+			if iface.AuthKey != "" {
+				if iface.AuthType == "md5" {
+					fmt.Fprintf(&b, " isis password md5 %s\n", iface.AuthKey)
+				} else {
+					fmt.Fprintf(&b, " isis password clear %s\n", iface.AuthKey)
+				}
 			}
 			b.WriteString("exit\n!\n")
 		}

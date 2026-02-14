@@ -1193,6 +1193,60 @@ func TestGenerateProtocols_ISISAuthClear(t *testing.T) {
 	}
 }
 
+func TestGenerateProtocols_ISISWideMetrics(t *testing.T) {
+	m := New()
+	isis := &config.ISISConfig{
+		NET:             "49.0001.0100.0000.0001.00",
+		Level:           "level-2",
+		WideMetricsOnly: true,
+		Interfaces: []*config.ISISInterface{
+			{Name: "trust0"},
+		},
+	}
+	got := m.generateProtocols(nil, nil, nil, isis, "", 0)
+	if !strings.Contains(got, " metric-style wide\n") {
+		t.Errorf("missing metric-style wide in:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_ISISOverload(t *testing.T) {
+	m := New()
+	isis := &config.ISISConfig{
+		NET:      "49.0001.0100.0000.0001.00",
+		Level:    "level-2",
+		Overload: true,
+		Interfaces: []*config.ISISInterface{
+			{Name: "trust0"},
+		},
+	}
+	got := m.generateProtocols(nil, nil, nil, isis, "", 0)
+	if !strings.Contains(got, " set-overload-bit\n") {
+		t.Errorf("missing set-overload-bit in:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_ISISInterfaceAuth(t *testing.T) {
+	m := New()
+	isis := &config.ISISConfig{
+		NET:   "49.0001.0100.0000.0001.00",
+		Level: "level-2",
+		Interfaces: []*config.ISISInterface{
+			{Name: "trust0", AuthType: "md5", AuthKey: "ifaceSecret"},
+			{Name: "dmz0", AuthType: "simple", AuthKey: "plainpw"},
+		},
+	}
+	got := m.generateProtocols(nil, nil, nil, isis, "", 0)
+	checks := []string{
+		"isis password md5 ifaceSecret\n",
+		"isis password clear plainpw\n",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
 func TestGenerateProtocols_RIPAuth(t *testing.T) {
 	m := New()
 	rip := &config.RIPConfig{
@@ -1261,5 +1315,53 @@ func TestGenerateProtocols_BGPGracefulRestart(t *testing.T) {
 	got := m.generateProtocols(nil, bgp, nil, nil, "", 1)
 	if !strings.Contains(got, "bgp graceful-restart\n") {
 		t.Errorf("missing graceful-restart in:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_BGPMultipath(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS:             65001,
+		Multipath:           64,
+		MultipathMultipleAS: true,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.0.2", PeerAS: 65002},
+		},
+	}
+	got := m.generateProtocols(nil, bgp, nil, nil, "", 1)
+	if !strings.Contains(got, "bgp bestpath as-path multipath-relax\n") {
+		t.Errorf("missing multipath-relax in:\n%s", got)
+	}
+	if !strings.Contains(got, "maximum-paths 64\n") {
+		t.Errorf("missing maximum-paths in:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_BGPDefaultOriginate(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS: 65001,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.0.2", PeerAS: 65002, FamilyInet: true, DefaultOriginate: true},
+		},
+	}
+	got := m.generateProtocols(nil, bgp, nil, nil, "", 1)
+	if !strings.Contains(got, "neighbor 10.0.0.2 default-originate\n") {
+		t.Errorf("missing default-originate in:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_BGPLogNeighborChanges(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS:            65001,
+		LogNeighborChanges: true,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.0.2", PeerAS: 65002},
+		},
+	}
+	got := m.generateProtocols(nil, bgp, nil, nil, "", 1)
+	if !strings.Contains(got, "bgp log-neighbor-changes\n") {
+		t.Errorf("missing log-neighbor-changes in:\n%s", got)
 	}
 }

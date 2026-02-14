@@ -937,20 +937,24 @@ type RIPConfig struct {
 
 // ISISConfig holds IS-IS routing configuration.
 type ISISConfig struct {
-	NET        string // ISO NET address (e.g. "49.0001.0100.0000.0001.00")
-	Level      string // "level-1", "level-2", "level-1-2" (default "level-2")
-	Interfaces []*ISISInterface
-	Export     []string // "connected", "static", etc.
-	AuthKey    string   // area-level authentication key
-	AuthType   string   // "md5" or "simple" (plaintext)
+	NET             string // ISO NET address (e.g. "49.0001.0100.0000.0001.00")
+	Level           string // "level-1", "level-2", "level-1-2" (default "level-2")
+	Interfaces      []*ISISInterface
+	Export          []string // "connected", "static", etc.
+	AuthKey         string   // area-level authentication key
+	AuthType        string   // "md5" or "simple" (plaintext)
+	WideMetricsOnly bool     // use wide (32-bit) metrics
+	Overload        bool     // set overload bit
 }
 
 // ISISInterface defines an interface participating in IS-IS.
 type ISISInterface struct {
-	Name    string
-	Level   string // override per-interface
-	Passive bool
-	Metric  int // 0 = default
+	Name     string
+	Level    string // override per-interface
+	Passive  bool
+	Metric   int    // 0 = default
+	AuthKey  string // per-interface authentication key
+	AuthType string // "md5" or "simple"
 }
 
 // RAInterfaceConfig configures Router Advertisement on an interface.
@@ -1007,12 +1011,15 @@ type OSPFInterface struct {
 
 // BGPConfig holds BGP routing configuration.
 type BGPConfig struct {
-	LocalAS         uint32
-	RouterID        string
-	ClusterID       string // route reflector cluster ID
-	GracefulRestart bool   // enable graceful restart
-	Neighbors       []*BGPNeighbor
-	Export          []string // "connected", "static", "ospf", etc.
+	LocalAS             uint32
+	RouterID            string
+	ClusterID           string // route reflector cluster ID
+	GracefulRestart     bool   // enable graceful restart
+	Multipath           int    // maximum equal-cost paths (0 = disabled)
+	MultipathMultipleAS bool   // allow multipath across different ASes
+	LogNeighborChanges  bool   // log neighbor state transitions
+	Neighbors           []*BGPNeighbor
+	Export              []string // "connected", "static", "ospf", etc.
 }
 
 // BGPNeighbor defines a BGP peer.
@@ -1029,6 +1036,7 @@ type BGPNeighbor struct {
 	BFD                  bool   // enable BFD for this neighbor
 	BFDInterval          int    // BFD minimum interval in ms (0 = default 300)
 	RouteReflectorClient bool   // mark as route-reflector client
+	DefaultOriginate     bool   // advertise default route to this neighbor
 }
 
 // TunnelConfig defines a GRE or other tunnel interface.

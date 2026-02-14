@@ -8183,6 +8183,88 @@ func TestISISAuthSetSyntax(t *testing.T) {
 	}
 }
 
+func TestISISInterfaceAuthSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols isis net 49.0001.0100.0000.0001.00",
+		"set protocols isis interface trust0 authentication-type md5",
+		"set protocols isis interface trust0 authentication-key ifaceSecret",
+		"set protocols isis interface trust0 metric 100",
+		"set protocols isis interface dmz0 authentication-type simple",
+		"set protocols isis interface dmz0 authentication-key plainpw",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	isis := cfg.Protocols.ISIS
+	if isis == nil {
+		t.Fatal("ISIS config is nil")
+	}
+	if len(isis.Interfaces) != 2 {
+		t.Fatalf("interfaces: got %d, want 2", len(isis.Interfaces))
+	}
+	trust := isis.Interfaces[0]
+	if trust.AuthType != "md5" {
+		t.Errorf("trust0 AuthType: got %q, want md5", trust.AuthType)
+	}
+	if trust.AuthKey != "ifaceSecret" {
+		t.Errorf("trust0 AuthKey: got %q, want ifaceSecret", trust.AuthKey)
+	}
+	if trust.Metric != 100 {
+		t.Errorf("trust0 Metric: got %d, want 100", trust.Metric)
+	}
+	dmz := isis.Interfaces[1]
+	if dmz.AuthType != "simple" {
+		t.Errorf("dmz0 AuthType: got %q, want simple", dmz.AuthType)
+	}
+	if dmz.AuthKey != "plainpw" {
+		t.Errorf("dmz0 AuthKey: got %q, want plainpw", dmz.AuthKey)
+	}
+}
+
+func TestISISWideMetricsOverloadSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols isis net 49.0001.0100.0000.0001.00",
+		"set protocols isis wide-metrics-only",
+		"set protocols isis overload",
+		"set protocols isis interface trust0",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	isis := cfg.Protocols.ISIS
+	if isis == nil {
+		t.Fatal("ISIS config is nil")
+	}
+	if !isis.WideMetricsOnly {
+		t.Error("WideMetricsOnly: got false, want true")
+	}
+	if !isis.Overload {
+		t.Error("Overload: got false, want true")
+	}
+}
+
 func TestRIPAuthSetSyntax(t *testing.T) {
 	cmds := []string{
 		"set protocols rip neighbor trust0",
@@ -8290,6 +8372,137 @@ func TestBGPGracefulRestartSetSyntax(t *testing.T) {
 	}
 	if !bgp.GracefulRestart {
 		t.Error("GracefulRestart should be true")
+	}
+}
+
+func TestBGPMultipathSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp multipath",
+		"set protocols bgp multipath multiple-as",
+		"set protocols bgp group external peer-as 65002",
+		"set protocols bgp group external neighbor 10.0.0.2",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	bgp := cfg.Protocols.BGP
+	if bgp == nil {
+		t.Fatal("BGP config is nil")
+	}
+	if bgp.Multipath != 64 {
+		t.Errorf("Multipath = %d, want 64", bgp.Multipath)
+	}
+	if !bgp.MultipathMultipleAS {
+		t.Error("MultipathMultipleAS should be true")
+	}
+}
+
+func TestBGPDefaultOriginateSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group external peer-as 65002",
+		"set protocols bgp group external default-originate",
+		"set protocols bgp group external family inet",
+		"set protocols bgp group external neighbor 10.0.0.2",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	bgp := cfg.Protocols.BGP
+	if bgp == nil {
+		t.Fatal("BGP config is nil")
+	}
+	if len(bgp.Neighbors) != 1 {
+		t.Fatalf("expected 1 neighbor, got %d", len(bgp.Neighbors))
+	}
+	if !bgp.Neighbors[0].DefaultOriginate {
+		t.Error("DefaultOriginate should be true (inherited from group)")
+	}
+}
+
+func TestBGPDefaultOriginatePerNeighborSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group external peer-as 65002",
+		"set protocols bgp group external family inet",
+		"set protocols bgp group external neighbor 10.0.0.2 default-originate",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	bgp := cfg.Protocols.BGP
+	if bgp == nil {
+		t.Fatal("BGP config is nil")
+	}
+	if len(bgp.Neighbors) != 1 {
+		t.Fatalf("expected 1 neighbor, got %d", len(bgp.Neighbors))
+	}
+	if !bgp.Neighbors[0].DefaultOriginate {
+		t.Error("DefaultOriginate should be true (per-neighbor override)")
+	}
+}
+
+func TestBGPLogUpdownSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp log-updown",
+		"set protocols bgp group external peer-as 65002",
+		"set protocols bgp group external neighbor 10.0.0.2",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	bgp := cfg.Protocols.BGP
+	if bgp == nil {
+		t.Fatal("BGP config is nil")
+	}
+	if !bgp.LogNeighborChanges {
+		t.Error("LogNeighborChanges should be true")
 	}
 }
 

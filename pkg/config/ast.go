@@ -547,6 +547,10 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"router-id":       {args: 1, children: nil},
 			"cluster-id":      {args: 1, children: nil},
 			"graceful-restart": {children: nil},
+			"log-updown":      {children: nil},
+			"multipath": {children: map[string]*schemaNode{
+				"multiple-as": {children: nil},
+			}},
 			"export":          {args: 1, children: nil},
 			"group": {args: 1, children: map[string]*schemaNode{
 				"peer-as":            {args: 1, children: nil},
@@ -554,6 +558,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"multihop":           {args: 1, children: nil},
 				"export":             {args: 1, children: nil},
 				"authentication-key": {args: 1, children: nil},
+				"default-originate":  {children: nil},
 				"family": {children: map[string]*schemaNode{
 					"inet":  {children: nil},
 					"inet6": {children: nil},
@@ -567,6 +572,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"multihop":              {args: 1, children: nil},
 					"authentication-key":    {args: 1, children: nil},
 					"route-reflector-client": {children: nil},
+					"default-originate":      {children: nil},
 					"bfd-liveness-detection": {children: map[string]*schemaNode{
 						"minimum-interval": {args: 1, children: nil},
 					}},
@@ -586,9 +592,17 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"level":              {args: 1, children: nil},
 			"is-type":            {args: 1, children: nil},
 			"export":             {args: 1, children: nil},
-			"interface":          {args: 1, valueHint: ValueHintInterfaceName, children: nil},
+			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
+				"level":               {args: 1, children: nil},
+				"passive":             {children: nil},
+				"metric":              {args: 1, children: nil},
+				"authentication-key":  {args: 1, children: nil},
+				"authentication-type": {args: 1, children: nil},
+			}},
 			"authentication-key":  {args: 1, children: nil},
 			"authentication-type": {args: 1, children: nil},
+			"wide-metrics-only":   {children: nil},
+			"overload":            {children: nil},
 		}},
 		"router-advertisement": {children: map[string]*schemaNode{
 			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
@@ -893,6 +907,23 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"bgp": {children: map[string]*schemaNode{
 				"graceful-restart": {children: nil},
 				"group":            {args: 1, children: nil},
+			}},
+			"isis": {children: map[string]*schemaNode{
+				"net":                 {args: 1, children: nil},
+				"level":              {args: 1, children: nil},
+				"is-type":            {args: 1, children: nil},
+				"export":             {args: 1, children: nil},
+				"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
+					"level":               {args: 1, children: nil},
+					"passive":             {children: nil},
+					"metric":              {args: 1, children: nil},
+					"authentication-key":  {args: 1, children: nil},
+					"authentication-type": {args: 1, children: nil},
+				}},
+				"authentication-key":  {args: 1, children: nil},
+				"authentication-type": {args: 1, children: nil},
+				"wide-metrics-only":   {children: nil},
+				"overload":            {children: nil},
 			}},
 		}},
 	}}},

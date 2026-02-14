@@ -2375,6 +2375,15 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				}
 			case "graceful-restart":
 				proto.BGP.GracefulRestart = true
+			case "log-updown":
+				proto.BGP.LogNeighborChanges = true
+			case "multipath":
+				proto.BGP.Multipath = 64 // default to 64 when enabled
+				for _, mc := range child.Children {
+					if mc.Name() == "multiple-as" {
+						proto.BGP.MultipathMultipleAS = true
+					}
+				}
 			case "export":
 				if len(child.Keys) >= 2 {
 					proto.BGP.Export = append(proto.BGP.Export, child.Keys[1])
@@ -2391,6 +2400,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			var groupAuthKey string
 			var groupBFD bool
 			var groupBFDInterval int
+			var groupDefaultOriginate bool
 			for _, child := range groupInst.node.Children {
 				switch child.Name() {
 				case "peer-as":
@@ -2433,6 +2443,8 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							}
 						}
 					}
+				case "default-originate":
+					groupDefaultOriginate = true
 				case "authentication-key":
 					groupAuthKey = nodeVal(child)
 				case "bfd-liveness-detection":
@@ -2450,17 +2462,18 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 					nAddr := nodeVal(child)
 					if nAddr != "" {
 						neighbor := &BGPNeighbor{
-							Address:      nAddr,
-							PeerAS:       peerAS,
-							Description:  groupDesc,
-							MultihopTTL:  groupMultihop,
-							Export:       groupExport,
-							FamilyInet:   familyInet,
-							FamilyInet6:  familyInet6,
-							GroupName:    groupInst.name,
-							AuthPassword: groupAuthKey,
-							BFD:          groupBFD,
-							BFDInterval:  groupBFDInterval,
+							Address:          nAddr,
+							PeerAS:           peerAS,
+							Description:      groupDesc,
+							MultihopTTL:      groupMultihop,
+							Export:           groupExport,
+							FamilyInet:       familyInet,
+							FamilyInet6:      familyInet6,
+							GroupName:        groupInst.name,
+							AuthPassword:     groupAuthKey,
+							BFD:              groupBFD,
+							BFDInterval:      groupBFDInterval,
+							DefaultOriginate: groupDefaultOriginate,
 						}
 						// Per-neighbor overrides
 						for _, prop := range child.Children {
@@ -2483,6 +2496,8 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								neighbor.AuthPassword = nodeVal(prop)
 							case "route-reflector-client":
 								neighbor.RouteReflectorClient = true
+							case "default-originate":
+								neighbor.DefaultOriginate = true
 							case "bfd-liveness-detection":
 								neighbor.BFD = true
 								for _, bc := range prop.Children {
@@ -2574,6 +2589,10 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				if v := nodeVal(child); v != "" {
 					proto.ISIS.AuthType = v
 				}
+			case "wide-metrics-only":
+				proto.ISIS.WideMetricsOnly = true
+			case "overload":
+				proto.ISIS.Overload = true
 			case "interface":
 				if len(child.Keys) >= 2 {
 					iface := &ISISInterface{Name: child.Keys[1]}
@@ -2591,6 +2610,10 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 									iface.Metric = v
 								}
 							}
+						case "authentication-key":
+							iface.AuthKey = nodeVal(prop)
+						case "authentication-type":
+							iface.AuthType = nodeVal(prop)
 						}
 					}
 					// Check keys for "level N" and "passive" shorthand
