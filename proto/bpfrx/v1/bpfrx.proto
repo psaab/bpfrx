@@ -119,6 +119,7 @@ enum ConfigFormat {
   HIERARCHICAL = 0;
   SET = 1;
   JSON = 2;
+  XML = 3;
 }
 
 enum ConfigTarget {

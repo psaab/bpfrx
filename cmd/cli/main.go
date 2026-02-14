@@ -417,6 +417,8 @@ func (c *ctl) handleShow(args []string) error {
 			format = pb.ConfigFormat_JSON
 		} else if strings.Contains(rest, "| display set") {
 			format = pb.ConfigFormat_SET
+		} else if strings.Contains(rest, "| display xml") {
+			format = pb.ConfigFormat_XML
 		}
 		// Extract path components (everything after "configuration" before "|")
 		var path []string
@@ -851,6 +853,11 @@ func (c *ctl) showFlowSession(args []string) error {
 		case "interface":
 			if i+1 < len(args) {
 				i++ // consume value; interface filter handled locally only
+			}
+		case "sort-by":
+			if i+1 < len(args) {
+				i++
+				return c.showText("sessions-top:" + args[i])
 			}
 		}
 	}
@@ -1697,6 +1704,8 @@ func (c *ctl) handleShowSystem(args []string) error {
 			rest := strings.Join(args[2:], " ")
 			if strings.Contains(rest, "| display set") {
 				format = pb.ConfigFormat_SET
+			} else if strings.Contains(rest, "| display xml") {
+				format = pb.ConfigFormat_XML
 			} else if strings.Contains(rest, "compare") {
 				// "show system rollback N compare"
 				resp, err := c.client.ShowCompare(context.Background(), &pb.ShowCompareRequest{
@@ -1820,6 +1829,8 @@ func (c *ctl) handleConfigShow(args []string) error {
 		format = pb.ConfigFormat_JSON
 	} else if strings.Contains(line, "| display set") {
 		format = pb.ConfigFormat_SET
+	} else if strings.Contains(line, "| display xml") {
+		format = pb.ConfigFormat_XML
 	}
 	resp, err := c.client.ShowConfig(context.Background(), &pb.ShowConfigRequest{
 		Format: format,

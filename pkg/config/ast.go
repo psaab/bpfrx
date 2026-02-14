@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"strings"
 )
@@ -1409,6 +1410,68 @@ func (t *ConfigTree) FormatJSON() string {
 		return "{}"
 	}
 	return string(data) + "\n"
+}
+
+// FormatXML renders the tree as Junos-style XML configuration.
+func (t *ConfigTree) FormatXML() string {
+	var b strings.Builder
+	b.WriteString(xml.Header)
+	b.WriteString("<configuration>\n")
+	formatXMLNodes(&b, t.Children, 1)
+	b.WriteString("</configuration>\n")
+	return b.String()
+}
+
+func formatXMLNodes(b *strings.Builder, nodes []*Node, indent int) {
+	prefix := strings.Repeat("    ", indent)
+	for _, n := range nodes {
+		if n.IsLeaf {
+			formatXMLLeaf(b, n, prefix)
+		} else {
+			tag := xmlTag(n.Keys[0])
+			fmt.Fprintf(b, "%s<%s>\n", prefix, tag)
+			// Extra keys become <name> elements.
+			for _, k := range n.Keys[1:] {
+				fmt.Fprintf(b, "%s    <name>%s</name>\n", prefix, xmlEscape(k))
+			}
+			formatXMLNodes(b, n.Children, indent+1)
+			fmt.Fprintf(b, "%s</%s>\n", prefix, tag)
+		}
+	}
+}
+
+func formatXMLLeaf(b *strings.Builder, n *Node, prefix string) {
+	if len(n.Keys) == 1 {
+		// Boolean leaf: <keyword/>
+		fmt.Fprintf(b, "%s<%s/>\n", prefix, xmlTag(n.Keys[0]))
+		return
+	}
+	// Leaf with value: <keyword>value</keyword>
+	// For multi-key leaves like "address 10.0.1.0/24", emit
+	// <keyword><name>val1</name></keyword>
+	tag := xmlTag(n.Keys[0])
+	if len(n.Keys) == 2 {
+		fmt.Fprintf(b, "%s<%s>%s</%s>\n", prefix, tag, xmlEscape(n.Keys[1]), tag)
+	} else {
+		fmt.Fprintf(b, "%s<%s>\n", prefix, tag)
+		for _, k := range n.Keys[1:] {
+			fmt.Fprintf(b, "%s    <name>%s</name>\n", prefix, xmlEscape(k))
+		}
+		fmt.Fprintf(b, "%s</%s>\n", prefix, tag)
+	}
+}
+
+// xmlTag sanitizes a Junos keyword into a valid XML element name.
+func xmlTag(s string) string {
+	// Junos keywords already use valid XML chars (letters, digits, hyphens).
+	return s
+}
+
+// xmlEscape escapes special XML characters in text content.
+func xmlEscape(s string) string {
+	var b strings.Builder
+	xml.EscapeText(&b, []byte(s))
+	return b.String()
 }
 
 // nodesToJSON converts a list of AST nodes to a nested map structure.

@@ -2,9 +2,14 @@ package api
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/psaab/bpfrx/pkg/configstore"
 )
 
 func basicAuth(user, pass string) string {
@@ -116,6 +121,68 @@ func TestAuthMiddleware(t *testing.T) {
 				if wa := w.Header().Get("WWW-Authenticate"); wa == "" {
 					t.Error("expected WWW-Authenticate header on 401")
 				}
+			}
+		})
+	}
+}
+
+func TestConfigExportHandler(t *testing.T) {
+	store := configstore.New(filepath.Join(t.TempDir(), "config"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LoadOverride(`interfaces { ge-0/0/0 { unit 0 { family inet { address 10.0.0.1/24; } } } }`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{store: store}
+
+	tests := []struct {
+		format     string
+		wantStatus int
+		contains   string
+	}{
+		{"set", 200, "set interfaces"},
+		{"text", 200, "interfaces"},
+		{"json", 200, "{"},
+		{"xml", 200, "<configuration>"},
+		{"", 200, "set interfaces"}, // default is set
+		{"yaml", 400, "unsupported format"},
+	}
+
+	for _, tt := range tests {
+		t.Run("format="+tt.format, func(t *testing.T) {
+			path := "/api/v1/config/export"
+			if tt.format != "" {
+				path += "?format=" + tt.format
+			}
+			req := httptest.NewRequest("GET", path, nil)
+			w := httptest.NewRecorder()
+			s.configExportHandler(w, req)
+
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+
+			// Decode JSON response and check output field for success, raw body for errors
+			var resp struct {
+				Success bool `json:"success"`
+				Data    struct {
+					Output string `json:"output"`
+				} `json:"data"`
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			checkStr := resp.Data.Output
+			if tt.wantStatus != 200 {
+				checkStr = resp.Error
+			}
+			if !strings.Contains(checkStr, tt.contains) {
+				t.Errorf("response %q does not contain %q", checkStr, tt.contains)
 			}
 		})
 	}

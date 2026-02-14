@@ -243,6 +243,8 @@ func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.S
 		output = s.store.ShowActiveJSON()
 	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_SET:
 		output = s.store.ShowActiveSet()
+	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_XML:
+		output = s.store.ShowActiveXML()
 	case req.Target == pb.ConfigTarget_ACTIVE:
 		if len(req.Path) > 0 {
 			output = s.store.ShowActivePath(req.Path)
@@ -253,6 +255,8 @@ func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.S
 		output = s.store.ShowCandidateJSON()
 	case req.Format == pb.ConfigFormat_SET:
 		output = s.store.ShowCandidateSet()
+	case req.Format == pb.ConfigFormat_XML:
+		output = s.store.ShowCandidateXML()
 	default:
 		output = s.store.ShowCandidate()
 	}
@@ -3894,6 +3898,118 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			fmt.Fprintf(&buf, "  %-30s %d\n", "Host-inbound denies:", readCtr(dataplane.GlobalCtrHostInboundDeny))
 			fmt.Fprintf(&buf, "  %-30s %d\n", "Host-inbound allowed:", readCtr(dataplane.GlobalCtrHostInbound))
 			fmt.Fprintf(&buf, "  %-30s %d\n", "NAT64 translations:", readCtr(dataplane.GlobalCtrNAT64Xlate))
+		}
+
+	case "sessions-top:bytes", "sessions-top:packets":
+		if s.dp == nil || !s.dp.IsLoaded() {
+			buf.WriteString("Dataplane not loaded\n")
+		} else {
+			sortByBytes := req.Topic == "sessions-top:bytes"
+			sortLabel := "bytes"
+			if !sortByBytes {
+				sortLabel = "packets"
+			}
+
+			type topEntry struct {
+				src, dst, proto, zone, app string
+				fwdPkts, revPkts           uint64
+				fwdBytes, revBytes         uint64
+				age                        int64
+			}
+			now := monotonicSeconds()
+			zoneNames := make(map[uint16]string)
+			if cr := s.dp.LastCompileResult(); cr != nil {
+				for name, id := range cr.ZoneIDs {
+					zoneNames[id] = name
+				}
+			}
+			var entries []topEntry
+
+			_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+				if val.IsReverse != 0 {
+					return true
+				}
+				inZ := zoneNames[val.IngressZone]
+				outZ := zoneNames[val.EgressZone]
+				if inZ == "" {
+					inZ = fmt.Sprintf("%d", val.IngressZone)
+				}
+				if outZ == "" {
+					outZ = fmt.Sprintf("%d", val.EgressZone)
+				}
+				var age int64
+				if now > val.Created {
+					age = int64(now - val.Created)
+				}
+				entries = append(entries, topEntry{
+					src:      fmt.Sprintf("%s:%d", net.IP(key.SrcIP[:]), ntohs(key.SrcPort)),
+					dst:      fmt.Sprintf("%s:%d", net.IP(key.DstIP[:]), ntohs(key.DstPort)),
+					proto:    protoName(key.Protocol),
+					zone:     inZ + "->" + outZ,
+					app:      resolveAppName(key.Protocol, ntohs(key.DstPort), cfg),
+					fwdPkts:  val.FwdPackets,
+					revPkts:  val.RevPackets,
+					fwdBytes: val.FwdBytes,
+					revBytes: val.RevBytes,
+					age:      age,
+				})
+				return true
+			})
+
+			_ = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+				if val.IsReverse != 0 {
+					return true
+				}
+				inZ := zoneNames[val.IngressZone]
+				outZ := zoneNames[val.EgressZone]
+				if inZ == "" {
+					inZ = fmt.Sprintf("%d", val.IngressZone)
+				}
+				if outZ == "" {
+					outZ = fmt.Sprintf("%d", val.EgressZone)
+				}
+				var age int64
+				if now > val.Created {
+					age = int64(now - val.Created)
+				}
+				entries = append(entries, topEntry{
+					src:      fmt.Sprintf("[%s]:%d", net.IP(key.SrcIP[:]), ntohs(key.SrcPort)),
+					dst:      fmt.Sprintf("[%s]:%d", net.IP(key.DstIP[:]), ntohs(key.DstPort)),
+					proto:    protoName(key.Protocol),
+					zone:     inZ + "->" + outZ,
+					app:      resolveAppName(key.Protocol, ntohs(key.DstPort), cfg),
+					fwdPkts:  val.FwdPackets,
+					revPkts:  val.RevPackets,
+					fwdBytes: val.FwdBytes,
+					revBytes: val.RevBytes,
+					age:      age,
+				})
+				return true
+			})
+
+			if sortByBytes {
+				sort.Slice(entries, func(i, j int) bool {
+					return (entries[i].fwdBytes + entries[i].revBytes) > (entries[j].fwdBytes + entries[j].revBytes)
+				})
+			} else {
+				sort.Slice(entries, func(i, j int) bool {
+					return (entries[i].fwdPkts + entries[i].revPkts) > (entries[j].fwdPkts + entries[j].revPkts)
+				})
+			}
+
+			limit := 20
+			if limit > len(entries) {
+				limit = len(entries)
+			}
+			fmt.Fprintf(&buf, "Top %d sessions by %s (of %d total):\n", limit, sortLabel, len(entries))
+			fmt.Fprintf(&buf, "%-5s %-22s %-22s %-5s %-20s %12s %12s %5s %s\n",
+				"#", "Source", "Destination", "Proto", "Zone", "Bytes(f/r)", "Pkts(f/r)", "Age", "App")
+			for i := 0; i < limit; i++ {
+				e := entries[i]
+				fmt.Fprintf(&buf, "%-5d %-22s %-22s %-5s %-20s %5d/%-6d %5d/%-6d %5d %s\n",
+					i+1, e.src, e.dst, e.proto, e.zone,
+					e.fwdBytes, e.revBytes, e.fwdPkts, e.revPkts, e.age, e.app)
+			}
 		}
 
 	case "flow-traceoptions":

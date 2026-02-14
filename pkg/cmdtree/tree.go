@@ -152,6 +152,10 @@ var OperationalTree = map[string]*Node{
 					"brief":       {Desc: "Show sessions in compact table"},
 					"application": {Desc: "Filter sessions by application name"},
 					"interface":   {Desc: "Filter sessions by interface"},
+					"sort-by": {Desc: "Sort sessions for top-talkers", Children: map[string]*Node{
+						"bytes":   {Desc: "Sort by total bytes (descending)"},
+						"packets": {Desc: "Sort by total packets (descending)"},
+					}},
 				}},
 				"statistics":   {Desc: "Show flow statistics"},
 				"traceoptions": {Desc: "Show flow trace configuration"},

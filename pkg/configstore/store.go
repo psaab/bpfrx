@@ -712,6 +712,23 @@ func (s *Store) ShowCandidateJSON() string {
 	return "{}\n"
 }
 
+// ShowActiveXML returns the active configuration as XML.
+func (s *Store) ShowActiveXML() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.active.FormatXML()
+}
+
+// ShowCandidateXML returns the candidate configuration as XML.
+func (s *Store) ShowCandidateXML() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate != nil {
+		return s.candidate.FormatXML()
+	}
+	return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<configuration>\n</configuration>\n"
+}
+
 // ShowRollback returns the content of rollback slot n (1-based) as hierarchical text.
 func (s *Store) ShowRollback(n int) (string, error) {
 	s.mu.RLock()

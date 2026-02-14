@@ -122,6 +122,60 @@ func TestExpandFilterTermNoNegateWithoutExcept(t *testing.T) {
 	}
 }
 
+func TestParseSpeed(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"auto", ""},
+		{"Auto", ""},
+		{"10m", "10"},
+		{"100m", "100"},
+		{"1g", "1000"},
+		{"1G", "1000"},
+		{"2.5g", "2500"},
+		{"5g", "5000"},
+		{"10g", "10000"},
+		{"25g", "25000"},
+		{"40g", "40000"},
+		{"100g", "100000"},
+		{"1000", "1000"},   // raw Mbps
+		{"10000", "10000"}, // raw Mbps
+		{"bogus", ""},
+		{"  1g  ", "1000"}, // whitespace trimmed
+	}
+	for _, tt := range tests {
+		got := parseSpeed(tt.input)
+		if got != tt.want {
+			t.Errorf("parseSpeed(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestParseDuplex(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"full", "full"},
+		{"Full", "full"},
+		{"FULL", "full"},
+		{"half", "half"},
+		{"Half", "half"},
+		{"", ""},
+		{"auto", ""},
+		{"bogus", ""},
+		{"  full  ", "full"}, // whitespace trimmed
+	}
+	for _, tt := range tests {
+		got := parseDuplex(tt.input)
+		if got != tt.want {
+			t.Errorf("parseDuplex(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 func TestBuildScreenConfig(t *testing.T) {
 	tests := []struct {
 		name   string

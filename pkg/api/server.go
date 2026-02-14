@@ -150,6 +150,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("POST /api/v1/config/confirm", s.configConfirmHandler)
 	mux.HandleFunc("POST /api/v1/config/rollback", s.configRollbackHandler)
 	mux.HandleFunc("GET /api/v1/config/show", s.configShowHandler)
+	mux.HandleFunc("GET /api/v1/config/export", s.configExportHandler)
 	mux.HandleFunc("GET /api/v1/config/show-rollback", s.configShowRollbackHandler)
 	mux.HandleFunc("GET /api/v1/config/compare", s.configCompareHandler)
 	mux.HandleFunc("GET /api/v1/config/history", s.configHistoryHandler)

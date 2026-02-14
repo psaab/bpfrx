@@ -705,6 +705,8 @@ func (c *CLI) handleShow(args []string) error {
 			fmt.Print(c.store.ShowActiveJSON())
 		} else if strings.Contains(rest, "| display set") {
 			fmt.Print(c.store.ShowActiveSet())
+		} else if strings.Contains(rest, "| display xml") {
+			fmt.Print(c.store.ShowActiveXML())
 		} else if len(args) > 1 {
 			// Filter out pipe commands from the path
 			var path []string
@@ -1826,6 +1828,11 @@ func (c *CLI) handleConfigShow(args []string) error {
 		return nil
 	}
 
+	if strings.Contains(line, "| display xml") {
+		fmt.Print(c.store.ShowCandidateXML())
+		return nil
+	}
+
 	fmt.Print(c.store.ShowCandidate())
 	return nil
 }
@@ -2132,6 +2139,7 @@ type sessionFilter struct {
 	summary bool           // only show count
 	brief   bool           // compact tabular view
 	appName string         // application name filter
+	sortBy  string         // "bytes" or "packets" for top-talkers
 	cfg     *config.Config // for application resolution
 }
 
@@ -2239,6 +2247,11 @@ func (c *CLI) parseSessionFilter(args []string) sessionFilter {
 			f.summary = true
 		case "brief":
 			f.brief = true
+		case "sort-by":
+			if i+1 < len(args) {
+				i++
+				f.sortBy = args[i] // "bytes" or "packets"
+			}
 		}
 	}
 	return f
@@ -2316,6 +2329,12 @@ func (c *CLI) showFlowSession(args []string) error {
 	}
 
 	f := c.parseSessionFilter(args)
+
+	// Top-talkers mode: collect, sort, display top 20
+	if f.sortBy == "bytes" || f.sortBy == "packets" {
+		return c.showTopTalkers(f)
+	}
+
 	count := 0
 
 	// Summary counters for protocol/zone/NAT breakdown
@@ -2582,6 +2601,125 @@ func (c *CLI) showFlowSession(args []string) error {
 		fmt.Println()
 	}
 	fmt.Printf("Total sessions: %d\n", count)
+	return nil
+}
+
+// topTalkerEntry holds a session's display info for sorting.
+type topTalkerEntry struct {
+	src, dst, proto, zone, state, app string
+	fwdPkts, revPkts                  uint64
+	fwdBytes, revBytes                uint64
+	age                               uint64
+}
+
+func (c *CLI) showTopTalkers(f sessionFilter) error {
+	zoneNames := make(map[uint16]string)
+	if cr := c.dp.LastCompileResult(); cr != nil {
+		for name, id := range cr.ZoneIDs {
+			zoneNames[id] = name
+		}
+	}
+	now := monotonicSeconds()
+	var entries []topTalkerEntry
+
+	_ = c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if f.hasFilter() && !f.matchesV4(key, val) {
+			return true
+		}
+		srcIP := net.IP(key.SrcIP[:])
+		dstIP := net.IP(key.DstIP[:])
+		inZone := zoneNames[val.IngressZone]
+		outZone := zoneNames[val.EgressZone]
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", val.IngressZone)
+		}
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", val.EgressZone)
+		}
+		var age uint64
+		if now > val.Created {
+			age = now - val.Created
+		}
+		entries = append(entries, topTalkerEntry{
+			src:      fmt.Sprintf("%s:%d", srcIP, ntohs(key.SrcPort)),
+			dst:      fmt.Sprintf("%s:%d", dstIP, ntohs(key.DstPort)),
+			proto:    protoNameFromNum(key.Protocol),
+			zone:     inZone + "->" + outZone,
+			state:    sessionStateName(val.State),
+			app:      resolveAppName(key.Protocol, ntohs(key.DstPort), f.cfg),
+			fwdPkts:  val.FwdPackets,
+			revPkts:  val.RevPackets,
+			fwdBytes: val.FwdBytes,
+			revBytes: val.RevBytes,
+			age:      age,
+		})
+		return true
+	})
+
+	_ = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if f.hasFilter() && !f.matchesV6(key, val) {
+			return true
+		}
+		srcIP := net.IP(key.SrcIP[:])
+		dstIP := net.IP(key.DstIP[:])
+		inZone := zoneNames[val.IngressZone]
+		outZone := zoneNames[val.EgressZone]
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", val.IngressZone)
+		}
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", val.EgressZone)
+		}
+		var age uint64
+		if now > val.Created {
+			age = now - val.Created
+		}
+		entries = append(entries, topTalkerEntry{
+			src:      fmt.Sprintf("[%s]:%d", srcIP, ntohs(key.SrcPort)),
+			dst:      fmt.Sprintf("[%s]:%d", dstIP, ntohs(key.DstPort)),
+			proto:    protoNameFromNum(key.Protocol),
+			zone:     inZone + "->" + outZone,
+			state:    sessionStateName(val.State),
+			app:      resolveAppName(key.Protocol, ntohs(key.DstPort), f.cfg),
+			fwdPkts:  val.FwdPackets,
+			revPkts:  val.RevPackets,
+			fwdBytes: val.FwdBytes,
+			revBytes: val.RevBytes,
+			age:      age,
+		})
+		return true
+	})
+
+	if f.sortBy == "bytes" {
+		sort.Slice(entries, func(i, j int) bool {
+			return (entries[i].fwdBytes + entries[i].revBytes) > (entries[j].fwdBytes + entries[j].revBytes)
+		})
+	} else {
+		sort.Slice(entries, func(i, j int) bool {
+			return (entries[i].fwdPkts + entries[i].revPkts) > (entries[j].fwdPkts + entries[j].revPkts)
+		})
+	}
+
+	limit := 20
+	if limit > len(entries) {
+		limit = len(entries)
+	}
+
+	fmt.Printf("Top %d sessions by %s (of %d total):\n", limit, f.sortBy, len(entries))
+	fmt.Printf("%-5s %-22s %-22s %-5s %-20s %12s %12s %5s %s\n",
+		"#", "Source", "Destination", "Proto", "Zone", "Bytes(f/r)", "Pkts(f/r)", "Age", "App")
+	for i := 0; i < limit; i++ {
+		e := entries[i]
+		fmt.Printf("%-5d %-22s %-22s %-5s %-20s %5d/%-6d %5d/%-6d %5d %s\n",
+			i+1, e.src, e.dst, e.proto, e.zone,
+			e.fwdBytes, e.revBytes, e.fwdPkts, e.revPkts, e.age, e.app)
+	}
 	return nil
 }
 

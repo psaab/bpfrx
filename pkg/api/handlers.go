@@ -1676,12 +1676,42 @@ func (s *Server) configShowHandler(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case target == "active" && format == "set":
 		output = s.store.ShowActiveSet()
+	case target == "active" && format == "json":
+		output = s.store.ShowActiveJSON()
+	case target == "active" && format == "xml":
+		output = s.store.ShowActiveXML()
 	case target == "active":
 		output = s.store.ShowActive()
 	case format == "set":
 		output = s.store.ShowCandidateSet()
+	case format == "json":
+		output = s.store.ShowCandidateJSON()
+	case format == "xml":
+		output = s.store.ShowCandidateXML()
 	default:
 		output = s.store.ShowCandidate()
+	}
+	writeOK(w, TextResponse{Output: output})
+}
+
+func (s *Server) configExportHandler(w http.ResponseWriter, r *http.Request) {
+	format := r.URL.Query().Get("format")
+	if format == "" {
+		format = "set"
+	}
+	var output string
+	switch format {
+	case "set":
+		output = s.store.ShowActiveSet()
+	case "text":
+		output = s.store.ShowActive()
+	case "json":
+		output = s.store.ShowActiveJSON()
+	case "xml":
+		output = s.store.ShowActiveXML()
+	default:
+		writeError(w, http.StatusBadRequest, "unsupported format: "+format+"; use set, text, json, or xml")
+		return
 	}
 	writeOK(w, TextResponse{Output: output})
 }

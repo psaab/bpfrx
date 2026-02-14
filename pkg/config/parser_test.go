@@ -8156,6 +8156,69 @@ interfaces {
 	}
 }
 
+func TestFormatXML(t *testing.T) {
+	input := `system {
+    host-name fw1;
+    name-server 8.8.8.8;
+}
+security {
+    zones {
+        security-zone trust {
+            interfaces {
+                eth0;
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, err := parser.Parse()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	xmlOut := tree.FormatXML()
+	if xmlOut == "" {
+		t.Fatal("FormatXML returned empty string")
+	}
+
+	// Verify it starts with XML header.
+	if !strings.Contains(xmlOut, "<?xml") {
+		t.Error("FormatXML missing XML declaration")
+	}
+
+	// Verify root element.
+	if !strings.Contains(xmlOut, "<configuration>") {
+		t.Error("FormatXML missing <configuration> root")
+	}
+	if !strings.Contains(xmlOut, "</configuration>") {
+		t.Error("FormatXML missing </configuration> closing")
+	}
+
+	// Verify nested elements.
+	if !strings.Contains(xmlOut, "<system>") {
+		t.Error("FormatXML missing <system>")
+	}
+	if !strings.Contains(xmlOut, "<host-name>fw1</host-name>") {
+		t.Error("FormatXML missing <host-name>fw1</host-name>")
+	}
+	if !strings.Contains(xmlOut, "<name-server>8.8.8.8</name-server>") {
+		t.Error("FormatXML missing <name-server>8.8.8.8</name-server>")
+	}
+
+	// Verify security zone structure.
+	if !strings.Contains(xmlOut, "<security-zone>") {
+		t.Error("FormatXML missing <security-zone>")
+	}
+	if !strings.Contains(xmlOut, "<name>trust</name>") {
+		t.Error("FormatXML missing <name>trust</name>")
+	}
+
+	// Boolean leaf should be self-closing.
+	if !strings.Contains(xmlOut, "<eth0/>") {
+		t.Error("FormatXML missing <eth0/> self-closing tag")
+	}
+}
+
 func TestDomainNameAndSearch(t *testing.T) {
 	// Hierarchical form
 	input := `system {
