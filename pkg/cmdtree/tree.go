@@ -501,6 +501,13 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 	for _, w := range words {
 		node, ok := current[w]
 		if !ok {
+			// Word not in static children — if parent has DynamicFn,
+			// treat as a dynamic value and stay at same children level.
+			if currentNode != nil && currentNode.DynamicFn != nil {
+				// Don't advance current — dynamic value consumed,
+				// next completion should offer same static children.
+				continue
+			}
 			return nil
 		}
 		currentNode = node
@@ -526,6 +533,11 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 	for _, w := range words {
 		node, ok := current[w]
 		if !ok {
+			// Word not in static children — if parent has DynamicFn,
+			// treat as a dynamic value and stay at same children level.
+			if currentNode != nil && currentNode.DynamicFn != nil {
+				continue
+			}
 			return nil
 		}
 		currentNode = node
@@ -602,11 +614,17 @@ func LookupDesc(words []string, name string, configMode bool) string {
 
 	// Walk operational tree
 	current := tree
+	var currentNode *Node
 	for _, w := range words {
 		node, ok := current[w]
 		if !ok {
+			// Dynamic value — skip but stay at same children level.
+			if currentNode != nil && currentNode.DynamicFn != nil {
+				continue
+			}
 			return ""
 		}
+		currentNode = node
 		if node.Children == nil {
 			return ""
 		}
