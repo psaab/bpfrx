@@ -434,6 +434,8 @@ var OperationalTree = map[string]*Node{
 // ConfigTopLevel defines tab completion for config mode top-level commands.
 var ConfigTopLevel = map[string]*Node{
 	"annotate": {Desc: "Add comment to configuration node"},
+	"copy":     {Desc: "Copy a configuration element"},
+	"rename":   {Desc: "Rename a configuration element"},
 	"set":      {Desc: "Set a configuration value"},
 	"delete":   {Desc: "Delete a configuration element"},
 	"show":     {Desc: "Show candidate configuration"},
@@ -447,6 +449,9 @@ var ConfigTopLevel = map[string]*Node{
 		"merge":    {Desc: "Merge into candidate from file or terminal"},
 		"set":      {Desc: "Load set commands from terminal"},
 	}},
+	"edit":     {Desc: "Edit a configuration hierarchy level"},
+	"top":      {Desc: "Exit to top of configuration hierarchy"},
+	"up":       {Desc: "Exit one level of configuration hierarchy"},
 	"rollback": {Desc: "Revert to previous configuration"},
 	"run":      {Desc: "Run operational command"},
 	"exit":     {Desc: "Exit configuration mode"},

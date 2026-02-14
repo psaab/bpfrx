@@ -40,6 +40,9 @@ type Store struct {
 	// Exclusive configuration mode
 	exclusiveHolder string // who holds exclusive lock (empty = unlocked)
 
+	// Edit path for hierarchical navigation (edit/top/up)
+	editPath []string
+
 	// Archival settings
 	archiveDir string // local archive directory (empty = disabled)
 	archiveMax int    // max archives to keep
@@ -139,6 +142,37 @@ func (s *Store) ExitConfigure() {
 	s.configDir = false
 	s.dirty = false
 	s.exclusiveHolder = ""
+	s.editPath = nil
+}
+
+// SetEditPath sets the edit path for hierarchical navigation.
+func (s *Store) SetEditPath(path []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.editPath = path
+}
+
+// GetEditPath returns a copy of the current edit path.
+func (s *Store) GetEditPath() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]string{}, s.editPath...)
+}
+
+// NavigateUp moves the edit path up one level.
+func (s *Store) NavigateUp() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.editPath) > 0 {
+		s.editPath = s.editPath[:len(s.editPath)-1]
+	}
+}
+
+// NavigateTop resets the edit path to the root.
+func (s *Store) NavigateTop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.editPath = nil
 }
 
 // InConfigMode returns true if currently in configuration mode.
@@ -203,6 +237,34 @@ func (s *Store) DeleteFromInput(input string) error {
 		return err
 	}
 	return s.Delete(path)
+}
+
+// Copy duplicates a config subtree from srcPath to dstPath.
+func (s *Store) Copy(srcPath, dstPath []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.candidate == nil {
+		return fmt.Errorf("not in configuration mode")
+	}
+	if err := s.candidate.CopyPath(srcPath, dstPath); err != nil {
+		return err
+	}
+	s.dirty = true
+	return nil
+}
+
+// Rename moves a config subtree from srcPath to dstPath.
+func (s *Store) Rename(srcPath, dstPath []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.candidate == nil {
+		return fmt.Errorf("not in configuration mode")
+	}
+	if err := s.candidate.RenamePath(srcPath, dstPath); err != nil {
+		return err
+	}
+	s.dirty = true
+	return nil
 }
 
 // Annotate sets a comment on a configuration node in the candidate config.
@@ -670,6 +732,16 @@ func (s *Store) ShowCandidate() string {
 	defer s.mu.RUnlock()
 	if s.candidate != nil {
 		return s.candidate.Format()
+	}
+	return ""
+}
+
+// ShowCandidatePath returns the candidate configuration subtree at the given path.
+func (s *Store) ShowCandidatePath(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate != nil {
+		return s.candidate.FormatPath(path)
 	}
 	return ""
 }

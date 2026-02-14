@@ -1127,3 +1127,142 @@ func TestCommitWithDescription(t *testing.T) {
 		t.Errorf("expected empty detail for second commit, got %q", entries[1].Detail)
 	}
 }
+
+func TestEditPath(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initially empty
+	if len(s.GetEditPath()) != 0 {
+		t.Error("edit path should be empty initially")
+	}
+
+	// Set edit path
+	s.SetEditPath([]string{"security", "zones"})
+	ep := s.GetEditPath()
+	if len(ep) != 2 || ep[0] != "security" || ep[1] != "zones" {
+		t.Errorf("expected [security zones], got %v", ep)
+	}
+
+	// Navigate up
+	s.NavigateUp()
+	ep = s.GetEditPath()
+	if len(ep) != 1 || ep[0] != "security" {
+		t.Errorf("expected [security], got %v", ep)
+	}
+
+	// Navigate up from single element
+	s.NavigateUp()
+	if len(s.GetEditPath()) != 0 {
+		t.Error("edit path should be empty after navigating up from single element")
+	}
+
+	// Navigate up from empty (no-op)
+	s.NavigateUp()
+	if len(s.GetEditPath()) != 0 {
+		t.Error("edit path should remain empty")
+	}
+
+	// Navigate top
+	s.SetEditPath([]string{"security", "zones", "trust"})
+	s.NavigateTop()
+	if len(s.GetEditPath()) != 0 {
+		t.Error("edit path should be empty after top")
+	}
+
+	// Exit configure resets edit path
+	s.SetEditPath([]string{"security"})
+	s.ExitConfigure()
+	if len(s.GetEditPath()) != 0 {
+		t.Error("edit path should be empty after exit configure")
+	}
+}
+
+func TestCopyConfig(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	cmds := []string{
+		"security zones security-zone trust interfaces eth0.0",
+		"security zones security-zone trust host-inbound-traffic system-services ping",
+	}
+	for _, cmd := range cmds {
+		if err := s.SetFromInput(cmd); err != nil {
+			t.Fatalf("set %q: %v", cmd, err)
+		}
+	}
+	if err := s.Copy(
+		[]string{"security", "zones", "security-zone", "trust"},
+		[]string{"security", "zones", "security-zone", "trust2"},
+	); err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	if !s.IsDirty() {
+		t.Error("should be dirty after copy")
+	}
+	_, err := s.Commit()
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	cfg := s.ActiveConfig()
+	if cfg == nil {
+		t.Fatal("compiled config is nil")
+	}
+	if _, ok := cfg.Security.Zones["trust"]; !ok {
+		t.Error("trust zone should still exist")
+	}
+	if _, ok := cfg.Security.Zones["trust2"]; !ok {
+		t.Error("trust2 zone should exist after copy")
+	}
+}
+
+func TestRenameConfig(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	cmds := []string{
+		"security zones security-zone oldname interfaces eth0.0",
+	}
+	for _, cmd := range cmds {
+		if err := s.SetFromInput(cmd); err != nil {
+			t.Fatalf("set %q: %v", cmd, err)
+		}
+	}
+	if err := s.Rename(
+		[]string{"security", "zones", "security-zone", "oldname"},
+		[]string{"security", "zones", "security-zone", "newname"},
+	); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	_, err := s.Commit()
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	cfg := s.ActiveConfig()
+	if _, ok := cfg.Security.Zones["oldname"]; ok {
+		t.Error("oldname should not exist after rename")
+	}
+	if _, ok := cfg.Security.Zones["newname"]; !ok {
+		t.Error("newname should exist after rename")
+	}
+}
+
+func TestCopyNotInConfigMode(t *testing.T) {
+	s := newTestStore(t)
+	err := s.Copy([]string{"a"}, []string{"b"})
+	if err == nil || !strings.Contains(err.Error(), "not in configuration mode") {
+		t.Errorf("expected config mode error, got: %v", err)
+	}
+}
+
+func TestRenameNotInConfigMode(t *testing.T) {
+	s := newTestStore(t)
+	err := s.Rename([]string{"a"}, []string{"b"})
+	if err == nil || !strings.Contains(err.Error(), "not in configuration mode") {
+		t.Errorf("expected config mode error, got: %v", err)
+	}
+}

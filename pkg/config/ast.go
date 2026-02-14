@@ -261,6 +261,187 @@ func hasMatchingLeaf(nodes []*Node, keys []string) bool {
 	return false
 }
 
+// matchNodeKeys checks if a node's Keys match path elements starting at pos.
+// Returns the number of path elements consumed (len(node.Keys)) on match, 0 otherwise.
+func matchNodeKeys(n *Node, path []string, pos int) int {
+	if len(n.Keys) == 0 || pos >= len(path) {
+		return 0
+	}
+	if n.Keys[0] != path[pos] {
+		return 0
+	}
+	// First key matches; check remaining keys fit within path
+	nk := len(n.Keys)
+	if pos+nk > len(path) {
+		// Partial match: node has more keys than remaining path.
+		// Accept if we're at the last path segment (allows matching by first key only).
+		return 1
+	}
+	for j := 1; j < nk; j++ {
+		if n.Keys[j] != path[pos+j] {
+			return 1 // first key matched but subsequent didn't; still a 1-key match
+		}
+	}
+	return nk
+}
+
+// navigateToNode walks the tree following path, returning the target node.
+// Multi-key nodes consume multiple path elements at once.
+func navigateToNode(children []*Node, path []string) (*Node, error) {
+	var current *Node
+	pos := 0
+	for pos < len(path) {
+		found := false
+		for _, child := range children {
+			consumed := matchNodeKeys(child, path, pos)
+			if consumed > 0 {
+				current = child
+				children = child.Children
+				pos += consumed
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("path element %q not found", path[pos])
+		}
+	}
+	return current, nil
+}
+
+// findNode navigates the tree to find a node at the given path.
+// Handles multi-key nodes by consuming multiple path elements per node.
+func (t *ConfigTree) findNode(path []string) (*Node, error) {
+	return navigateToNode(t.Children, path)
+}
+
+// removeNode removes and returns a node at the given path.
+func (t *ConfigTree) removeNode(path []string) (*Node, error) {
+	if len(path) == 0 {
+		return nil, fmt.Errorf("empty path")
+	}
+	// Navigate to the parent, then find and remove the target child.
+	parentChildren := &t.Children
+	pos := 0
+	// We need to find where the last node starts.
+	// Walk until we can identify the target node at the end.
+	for pos < len(path) {
+		// Try to match a child and see if it's the final node.
+		var bestChild *Node
+		bestConsumed := 0
+		bestIdx := -1
+		for i, child := range *parentChildren {
+			consumed := matchNodeKeys(child, path, pos)
+			if consumed > 0 {
+				bestChild = child
+				bestConsumed = consumed
+				bestIdx = i
+				break
+			}
+		}
+		if bestChild == nil {
+			return nil, fmt.Errorf("path element %q not found", path[pos])
+		}
+		if pos+bestConsumed >= len(path) {
+			// This is the target node — remove it.
+			*parentChildren = append((*parentChildren)[:bestIdx], (*parentChildren)[bestIdx+1:]...)
+			return bestChild, nil
+		}
+		// Descend into this child's children.
+		parentChildren = &bestChild.Children
+		pos += bestConsumed
+	}
+	return nil, fmt.Errorf("path not found")
+}
+
+// insertNode inserts a node as a child at the given parent path.
+func (t *ConfigTree) insertNode(parentPath []string, node *Node) error {
+	children := &t.Children
+	pos := 0
+	for pos < len(parentPath) {
+		found := false
+		for _, child := range *children {
+			consumed := matchNodeKeys(child, parentPath, pos)
+			if consumed > 0 {
+				children = &child.Children
+				pos += consumed
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("destination parent path element %q not found", parentPath[pos])
+		}
+	}
+	*children = append(*children, node)
+	return nil
+}
+
+// findNodeWithParent navigates the tree and returns the target node
+// plus the parent's children slice (for insertion/removal at the correct level).
+func (t *ConfigTree) findNodeWithParent(path []string) (*Node, *[]*Node, error) {
+	parentChildren := &t.Children
+	pos := 0
+	for pos < len(path) {
+		found := false
+		for _, child := range *parentChildren {
+			consumed := matchNodeKeys(child, path, pos)
+			if consumed > 0 {
+				if pos+consumed >= len(path) {
+					return child, parentChildren, nil
+				}
+				parentChildren = &child.Children
+				pos += consumed
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, nil, fmt.Errorf("path element %q not found", path[pos])
+		}
+	}
+	return nil, nil, fmt.Errorf("path not found")
+}
+
+// CopyPath copies a subtree from src to dst path.
+// The destination's last N keys (where N = len(sourceNode.Keys)) replace the source keys.
+func (t *ConfigTree) CopyPath(src, dst []string) error {
+	if len(src) == 0 || len(dst) == 0 {
+		return fmt.Errorf("empty path")
+	}
+	srcNode, _, err := t.findNodeWithParent(src)
+	if err != nil {
+		return fmt.Errorf("source not found: %s", strings.Join(src, " "))
+	}
+	cloned := cloneNodes([]*Node{srcNode})[0]
+	nk := len(srcNode.Keys)
+	if len(dst) < nk {
+		return fmt.Errorf("destination path too short")
+	}
+	cloned.Keys = append([]string(nil), dst[len(dst)-nk:]...)
+	// Find the parent for the destination
+	dstParentPath := dst[:len(dst)-nk]
+	return t.insertNode(dstParentPath, cloned)
+}
+
+// RenamePath moves a subtree from src to dst path.
+func (t *ConfigTree) RenamePath(src, dst []string) error {
+	if len(src) == 0 || len(dst) == 0 {
+		return fmt.Errorf("empty path")
+	}
+	srcNode, err := t.removeNode(src)
+	if err != nil {
+		return fmt.Errorf("source not found: %s", strings.Join(src, " "))
+	}
+	nk := len(srcNode.Keys)
+	if len(dst) < nk {
+		return fmt.Errorf("destination path too short")
+	}
+	srcNode.Keys = append([]string(nil), dst[len(dst)-nk:]...)
+	dstParentPath := dst[:len(dst)-nk]
+	return t.insertNode(dstParentPath, srcNode)
+}
+
 // ValueHint identifies what kind of dynamic value is expected at a schema position.
 type ValueHint int
 

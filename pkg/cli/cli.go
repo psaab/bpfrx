@@ -693,17 +693,50 @@ func (c *CLI) dispatchConfig(line string) error {
 	}
 
 	switch parts[0] {
+	case "edit":
+		if len(parts) < 2 {
+			fmt.Println("edit: missing path")
+			return nil
+		}
+		newPath := append(c.store.GetEditPath(), parts[1:]...)
+		c.store.SetEditPath(newPath)
+		c.rl.SetPrompt(c.configPrompt())
+		fmt.Printf("[edit %s]\n", strings.Join(newPath, " "))
+		return nil
+
+	case "top":
+		c.store.NavigateTop()
+		c.rl.SetPrompt(c.configPrompt())
+		fmt.Println("[edit]")
+		return nil
+
+	case "up":
+		c.store.NavigateUp()
+		c.rl.SetPrompt(c.configPrompt())
+		editPath := c.store.GetEditPath()
+		if len(editPath) > 0 {
+			fmt.Printf("[edit %s]\n", strings.Join(editPath, " "))
+		} else {
+			fmt.Println("[edit]")
+		}
+		return nil
+
 	case "set":
 		if len(parts) < 2 {
 			return fmt.Errorf("set: missing path")
 		}
-		return c.store.SetFromInput(strings.Join(parts[1:], " "))
+		fullPath := append(c.store.GetEditPath(), parts[1:]...)
+		return c.store.SetFromInput(strings.Join(fullPath, " "))
 
 	case "delete":
 		if len(parts) < 2 {
 			return fmt.Errorf("delete: missing path")
 		}
-		return c.store.DeleteFromInput(strings.Join(parts[1:], " "))
+		fullPath := append(c.store.GetEditPath(), parts[1:]...)
+		return c.store.DeleteFromInput(strings.Join(fullPath, " "))
+
+	case "copy", "rename":
+		return c.handleCopyRename(parts)
 
 	case "show":
 		return c.handleConfigShow(parts[1:])
@@ -744,7 +777,7 @@ func (c *CLI) dispatchConfig(line string) error {
 		}
 		pathStr := strings.TrimSpace(line[:quoteIdx])
 		comment := strings.Trim(line[quoteIdx:], "\"")
-		pathParts := strings.Fields(pathStr)
+		pathParts := append(c.store.GetEditPath(), strings.Fields(pathStr)...)
 		if err := c.store.Annotate(pathParts, comment); err != nil {
 			return err
 		}
@@ -2078,8 +2111,54 @@ func (c *CLI) handleConfigShow(args []string) error {
 		return nil
 	}
 
+	// Show scoped to edit path
+	editPath := c.store.GetEditPath()
+	if len(editPath) > 0 {
+		// Build full path: editPath + any extra args (excluding pipe)
+		fullPath := append([]string{}, editPath...)
+		for _, a := range args {
+			if a == "|" {
+				break
+			}
+			fullPath = append(fullPath, a)
+		}
+		output := c.store.ShowCandidatePath(fullPath)
+		if output == "" {
+			fmt.Printf("configuration path not found: %s\n", strings.Join(fullPath, " "))
+		} else {
+			fmt.Print(output)
+		}
+		return nil
+	}
+
 	fmt.Print(c.store.ShowCandidate())
 	return nil
+}
+
+func (c *CLI) handleCopyRename(parts []string) error {
+	cmd := parts[0]
+	toIdx := -1
+	for i, p := range parts {
+		if p == "to" {
+			toIdx = i
+			break
+		}
+	}
+	if toIdx < 2 || toIdx >= len(parts)-1 {
+		fmt.Printf("usage: %s <src-path> to <dst-path>\n", cmd)
+		return nil
+	}
+	srcPath := parts[1:toIdx]
+	dstPath := parts[toIdx+1:]
+	editPath := c.store.GetEditPath()
+	if len(editPath) > 0 {
+		srcPath = append(append([]string{}, editPath...), srcPath...)
+		dstPath = append(append([]string{}, editPath...), dstPath...)
+	}
+	if cmd == "rename" {
+		return c.store.Rename(srcPath, dstPath)
+	}
+	return c.store.Copy(srcPath, dstPath)
 }
 
 func (c *CLI) handleLoad(args []string) error {

@@ -163,7 +163,38 @@ func (s *Server) GetConfigModeStatus(_ context.Context, _ *pb.GetConfigModeStatu
 }
 
 func (s *Server) Set(_ context.Context, req *pb.SetRequest) (*pb.SetResponse, error) {
-	if err := s.store.SetFromInput(req.Input); err != nil {
+	input := req.Input
+	if strings.HasPrefix(input, "copy ") || strings.HasPrefix(input, "rename ") {
+		return s.handleCopyRename(input)
+	}
+	if err := s.store.SetFromInput(input); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	return &pb.SetResponse{}, nil
+}
+
+func (s *Server) handleCopyRename(input string) (*pb.SetResponse, error) {
+	parts := strings.Fields(input)
+	isRename := parts[0] == "rename"
+	toIdx := -1
+	for i, p := range parts {
+		if p == "to" {
+			toIdx = i
+			break
+		}
+	}
+	if toIdx < 2 || toIdx >= len(parts)-1 {
+		return nil, status.Errorf(codes.InvalidArgument, "usage: %s <src> to <dst>", parts[0])
+	}
+	srcPath := parts[1:toIdx]
+	dstPath := parts[toIdx+1:]
+	var err error
+	if isRename {
+		err = s.store.Rename(srcPath, dstPath)
+	} else {
+		err = s.store.Copy(srcPath, dstPath)
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	return &pb.SetResponse{}, nil
@@ -274,7 +305,11 @@ func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.S
 	case req.Format == pb.ConfigFormat_XML:
 		output = s.store.ShowCandidateXML()
 	default:
-		output = s.store.ShowCandidate()
+		if len(req.Path) > 0 {
+			output = s.store.ShowCandidatePath(req.Path)
+		} else {
+			output = s.store.ShowCandidate()
+		}
 	}
 	return &pb.ShowConfigResponse{Output: output}, nil
 }

@@ -333,3 +333,9 @@ type ConfigSearchResult struct {
 	LineNumber int    `json:"line_number"`
 	Line       string `json:"line"`
 }
+
+// AnnotateRequest holds a config annotation request.
+type AnnotateRequest struct {
+	Path    string `json:"path"`    // space-separated config path
+	Comment string `json:"comment"` // annotation text
+}

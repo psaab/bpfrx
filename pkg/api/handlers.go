@@ -2133,6 +2133,26 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, TextResponse{Output: buf.String()})
 }
 
+// --- Config annotate handler ---
+
+func (s *Server) configAnnotateHandler(w http.ResponseWriter, r *http.Request) {
+	var req AnnotateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, Response{Error: err.Error()})
+		return
+	}
+	if req.Path == "" || req.Comment == "" {
+		writeJSON(w, http.StatusBadRequest, Response{Error: "path and comment are required"})
+		return
+	}
+	pathParts := strings.Fields(req.Path)
+	if err := s.store.Annotate(pathParts, req.Comment); err != nil {
+		writeJSON(w, http.StatusBadRequest, Response{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, Response{Success: true})
+}
+
 // --- Session zone-pair summary handler ---
 
 func (s *Server) sessionZonePairHandler(w http.ResponseWriter, _ *http.Request) {

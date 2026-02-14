@@ -160,6 +160,7 @@ type ctl struct {
 	hostname   string
 	username   string
 	configMode bool
+	editPath   []string
 }
 
 func (c *ctl) dispatch(line string) error {
@@ -342,12 +343,41 @@ func (c *ctl) dispatchConfig(line string) error {
 	}
 
 	switch parts[0] {
+	case "edit":
+		if len(parts) < 2 {
+			fmt.Println("edit: missing path")
+			return nil
+		}
+		c.editPath = append(c.editPath, parts[1:]...)
+		c.rl.SetPrompt(c.configPrompt())
+		fmt.Printf("[edit %s]\n", strings.Join(c.editPath, " "))
+		return nil
+
+	case "top":
+		c.editPath = nil
+		c.rl.SetPrompt(c.configPrompt())
+		fmt.Println("[edit]")
+		return nil
+
+	case "up":
+		if len(c.editPath) > 0 {
+			c.editPath = c.editPath[:len(c.editPath)-1]
+		}
+		c.rl.SetPrompt(c.configPrompt())
+		if len(c.editPath) > 0 {
+			fmt.Printf("[edit %s]\n", strings.Join(c.editPath, " "))
+		} else {
+			fmt.Println("[edit]")
+		}
+		return nil
+
 	case "set":
 		if len(parts) < 2 {
 			return fmt.Errorf("set: missing path")
 		}
+		fullPath := append(append([]string{}, c.editPath...), parts[1:]...)
 		_, err := c.client.Set(context.Background(), &pb.SetRequest{
-			Input: strings.Join(parts[1:], " "),
+			Input: strings.Join(fullPath, " "),
 		})
 		if err != nil {
 			return fmt.Errorf("%v", err)
@@ -358,9 +388,35 @@ func (c *ctl) dispatchConfig(line string) error {
 		if len(parts) < 2 {
 			return fmt.Errorf("delete: missing path")
 		}
+		fullPath := append(append([]string{}, c.editPath...), parts[1:]...)
 		_, err := c.client.Delete(context.Background(), &pb.DeleteRequest{
-			Input: strings.Join(parts[1:], " "),
+			Input: strings.Join(fullPath, " "),
 		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		return nil
+
+	case "copy", "rename":
+		toIdx := -1
+		for i, p := range parts {
+			if p == "to" {
+				toIdx = i
+				break
+			}
+		}
+		if toIdx < 2 || toIdx >= len(parts)-1 {
+			fmt.Printf("usage: %s <src-path> to <dst-path>\n", parts[0])
+			return nil
+		}
+		srcParts := parts[1:toIdx]
+		dstParts := parts[toIdx+1:]
+		if len(c.editPath) > 0 {
+			srcParts = append(append([]string{}, c.editPath...), srcParts...)
+			dstParts = append(append([]string{}, c.editPath...), dstParts...)
+		}
+		fullInput := parts[0] + " " + strings.Join(srcParts, " ") + " to " + strings.Join(dstParts, " ")
+		_, err := c.client.Set(context.Background(), &pb.SetRequest{Input: fullInput})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -398,6 +454,7 @@ func (c *ctl) dispatchConfig(line string) error {
 	case "exit", "quit":
 		_, _ = c.client.ExitConfigure(context.Background(), &pb.ExitConfigureRequest{})
 		c.configMode = false
+		c.editPath = nil
 		c.rl.SetPrompt(c.operationalPrompt())
 		fmt.Println("Exiting configuration mode")
 		return nil
@@ -1895,9 +1952,21 @@ func (c *ctl) handleConfigShow(args []string) error {
 	} else if strings.Contains(line, "| display xml") {
 		format = pb.ConfigFormat_XML
 	}
+	// Build path from editPath + any explicit path args (before pipe)
+	var path []string
+	if len(c.editPath) > 0 {
+		path = append(path, c.editPath...)
+	}
+	for _, a := range args {
+		if a == "|" {
+			break
+		}
+		path = append(path, a)
+	}
 	resp, err := c.client.ShowConfig(context.Background(), &pb.ShowConfigRequest{
 		Format: format,
 		Target: pb.ConfigTarget_CANDIDATE,
+		Path:   path,
 	})
 	if err != nil {
 		return fmt.Errorf("%v", err)

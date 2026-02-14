@@ -159,6 +159,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("GET /api/v1/config/compare", s.configCompareHandler)
 	mux.HandleFunc("GET /api/v1/config/history", s.configHistoryHandler)
 	mux.HandleFunc("GET /api/v1/config/search", s.configSearchHandler)
+	mux.HandleFunc("POST /api/v1/config/annotate", s.configAnnotateHandler)
 
 	// DHCP mutations
 	mux.HandleFunc("POST /api/v1/dhcp/identifiers/clear", s.clearDHCPIdentifiersHandler)
