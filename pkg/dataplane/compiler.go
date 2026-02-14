@@ -2504,6 +2504,33 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		base.ICMPCode = uint8(term.ICMPCode)
 	}
 
+	// TCP flags match
+	if len(term.TCPFlags) > 0 {
+		base.MatchFlags |= FilterMatchTCPFlags
+		for _, flag := range term.TCPFlags {
+			switch strings.ToLower(flag) {
+			case "syn":
+				base.TCPFlags |= 0x02
+			case "ack":
+				base.TCPFlags |= 0x10
+			case "fin":
+				base.TCPFlags |= 0x01
+			case "rst":
+				base.TCPFlags |= 0x04
+			case "psh":
+				base.TCPFlags |= 0x08
+			case "urg":
+				base.TCPFlags |= 0x20
+			}
+		}
+	}
+
+	// Fragment match
+	if term.IsFragment {
+		base.MatchFlags |= FilterMatchFragment
+		base.IsFragment = 1
+	}
+
 	// Expand prefix list references into address lists.
 	// Each address tracks whether it came from an "except" prefix-list reference.
 	type filterAddr struct {

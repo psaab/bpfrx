@@ -617,11 +617,12 @@ type FilterRule struct {
 	SrcPortHi    uint16 // range upper bound (network byte order), 0=exact match
 	DSCPRewrite  uint8  // DSCP rewrite value (0xFF = no rewrite)
 	LogFlag      uint8  // 1 = emit ring buffer event on match
+	TCPFlags     uint8  // TCP flags bitmask to match
+	IsFragment   uint8  // 1 = match IP fragments
 	SrcAddr      [16]byte
 	SrcMask      [16]byte
 	DstAddr      [16]byte
 	DstMask      [16]byte
-	_            [2]byte // C struct padding for __u32 alignment
 	RoutingTable uint32
 }
 
@@ -637,6 +638,8 @@ const (
 	FilterMatchSrcPort    = 1 << 7
 	FilterMatchSrcNegate  = 1 << 8 // negate source address match (prefix-list except)
 	FilterMatchDstNegate  = 1 << 9 // negate destination address match (prefix-list except)
+	FilterMatchTCPFlags   = 1 << 10 // match TCP flags bitmask
+	FilterMatchFragment   = 1 << 11 // match IP fragments
 )
 
 // Filter action constants.

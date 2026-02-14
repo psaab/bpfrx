@@ -371,6 +371,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"description":  {args: 1, children: nil},
 		"mtu":          {args: 1, children: nil},
 		"speed":        {args: 1, children: nil},
+		"duplex":       {args: 1, children: nil},
 		"disable":      {children: nil},
 		"vlan-tagging": {children: nil},
 		"gigether-options": {children: map[string]*schemaNode{
@@ -496,12 +497,16 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	}},
 	"policy-options": {children: map[string]*schemaNode{
 		"prefix-list": {args: 1, children: nil},
+		"community": {args: 1, children: map[string]*schemaNode{
+			"members": {args: 1, children: nil},
+		}},
 		"policy-statement": {args: 1, children: map[string]*schemaNode{
 			"term": {args: 1, children: map[string]*schemaNode{
 				"from": {children: map[string]*schemaNode{
 					"protocol":     {args: 1, children: nil},
 					"prefix-list":  {args: 1, children: nil},
 					"route-filter": {args: 2, children: nil},
+					"community":    {args: 1, children: nil},
 				}},
 				"then": {children: map[string]*schemaNode{
 					"accept":           {children: nil},
@@ -510,6 +515,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"load-balance":     {args: 1, children: nil},
 					"local-preference": {args: 1, children: nil},
 					"metric":           {args: 1, children: nil},
+					"metric-type":      {args: 1, children: nil},
 					"community":        {args: 1, children: nil},
 					"origin":           {args: 1, children: nil},
 				}},
@@ -680,6 +686,8 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"source-port":             {children: nil},
 							"icmp-type":               {args: 1, children: nil},
 							"icmp-code":               {args: 1, children: nil},
+							"tcp-flags":               {children: nil},
+							"is-fragment":             {children: nil},
 						}},
 						"then": {children: map[string]*schemaNode{
 							"accept":           {children: nil},
@@ -711,6 +719,8 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"source-port":             {children: nil},
 							"icmp-type":               {args: 1, children: nil},
 							"icmp-code":               {args: 1, children: nil},
+							"tcp-flags":               {children: nil},
+							"is-fragment":             {children: nil},
 						}},
 						"then": {children: map[string]*schemaNode{
 							"accept":           {children: nil},

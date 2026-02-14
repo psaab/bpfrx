@@ -60,10 +60,17 @@ type EventWithin struct {
 	TriggerUntil int // trigger until N
 }
 
-// PolicyOptionsConfig holds prefix-lists and policy-statements for routing control.
+// PolicyOptionsConfig holds prefix-lists, communities, and policy-statements for routing control.
 type PolicyOptionsConfig struct {
 	PrefixLists      map[string]*PrefixList
+	Communities      map[string]*CommunityDef
 	PolicyStatements map[string]*PolicyStatement
+}
+
+// CommunityDef defines a named BGP community with member values.
+type CommunityDef struct {
+	Name    string
+	Members []string // e.g. "65000:100", "no-export", "no-advertise"
 }
 
 // PrefixList defines a named list of IP prefixes.
@@ -84,12 +91,14 @@ type PolicyTerm struct {
 	Name         string
 	FromProtocol string         // "direct", "static", "bgp", "ospf"
 	PrefixList   string         // from prefix-list <name>
+	FromCommunity string        // from community <name> (match against community-list)
 	RouteFilters []*RouteFilter // prefix matching
 	Action          string         // "accept", "reject"
 	NextHop         string         // then next-hop (e.g. "peer-address", "self", IP)
 	LoadBalance     string         // then load-balance (e.g. "consistent-hash", "per-packet")
 	LocalPreference int            // BGP local-preference (0 = not set)
 	Metric          int            // BGP MED/metric (0 = not set)
+	MetricType      int            // OSPF metric type (1 or 2, 0 = not set)
 	Community       string         // BGP community to set (e.g. "65000:100")
 	Origin          string         // BGP origin: "igp", "egp", "incomplete"
 }
@@ -414,6 +423,8 @@ type FirewallFilterTerm struct {
 	SourcePorts        []string            // source port numbers or ranges
 	ICMPType           int                 // -1 = not set
 	ICMPCode           int                 // -1 = not set
+	TCPFlags           []string            // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
+	IsFragment         bool                // match IP fragments
 	Action             string              // "accept", "reject", "discard", ""
 	RoutingInstance    string              // routing-instance name (policy-based routing)
 	Log                bool

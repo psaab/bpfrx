@@ -544,6 +544,8 @@ struct nat_port_counter {
 #define FILTER_MATCH_SRC_PORT  (1 << 7)
 #define FILTER_MATCH_SRC_NEGATE (1 << 8)  /* negate source address match (prefix-list except) */
 #define FILTER_MATCH_DST_NEGATE (1 << 9)  /* negate destination address match (prefix-list except) */
+#define FILTER_MATCH_TCP_FLAGS  (1 << 10) /* match TCP flags bitmask */
+#define FILTER_MATCH_FRAGMENT   (1 << 11) /* match IP fragments */
 
 /* Filter actions */
 #define FILTER_ACTION_ACCEPT   0
@@ -631,6 +633,8 @@ struct filter_rule {
 	__be16 src_port_hi;     /* range upper bound, 0=exact match */
 	__u8   dscp_rewrite;    /* DSCP rewrite value (0xFF = no rewrite) */
 	__u8   log_flag;        /* 1 = emit ring buffer event on match */
+	__u8   tcp_flags;       /* TCP flags bitmask to match (SYN=0x02, ACK=0x10, etc.) */
+	__u8   is_fragment;     /* 1 = match IP fragments */
 	__u8   src_addr[16];    /* v4: first 4 bytes, v6: all 16 */
 	__u8   src_mask[16];    /* prefix mask */
 	__u8   dst_addr[16];

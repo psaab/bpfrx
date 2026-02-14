@@ -1698,3 +1698,56 @@ func TestGenerateProtocols_OSPFv3VRF(t *testing.T) {
 		t.Errorf("missing router-id in:\n%s", got)
 	}
 }
+
+func TestGeneratePolicyOptionsCommunityListAndMetricType(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		Communities: map[string]*config.CommunityDef{
+			"MY-COMM": {
+				Name:    "MY-COMM",
+				Members: []string{"65000:100", "65000:200"},
+			},
+		},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"OSPF-EXPORT": {
+				Name: "OSPF-EXPORT",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:          "t1",
+						FromProtocol:  "direct",
+						FromCommunity: "MY-COMM",
+						Action:        "accept",
+						MetricType:    1,
+						Metric:        100,
+					},
+					{
+						Name:       "t2",
+						Action:     "accept",
+						MetricType: 2,
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+
+	got := m.generatePolicyOptions(po)
+
+	checks := []string{
+		"bgp community-list standard MY-COMM permit 65000:100",
+		"bgp community-list standard MY-COMM permit 65000:200",
+		"route-map OSPF-EXPORT permit 10",
+		"match source-protocol connected",
+		"match community MY-COMM",
+		"set metric 100",
+		"set metric-type type-1",
+		"route-map OSPF-EXPORT permit 20",
+		"set metric-type type-2",
+		"route-map OSPF-EXPORT deny 30",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}

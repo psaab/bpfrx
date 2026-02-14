@@ -493,6 +493,8 @@ struct nat64_state_value {
 #define FILTER_MATCH_SRC_PORT   (1 << 7)
 #define FILTER_MATCH_SRC_NEGATE (1 << 8)
 #define FILTER_MATCH_DST_NEGATE (1 << 9)
+#define FILTER_MATCH_TCP_FLAGS  (1 << 10)
+#define FILTER_MATCH_FRAGMENT   (1 << 11)
 
 /* Filter actions */
 #define FILTER_ACTION_ACCEPT  0
@@ -526,6 +528,8 @@ struct filter_rule {
 	uint16_t src_port_hi;
 	uint8_t  dscp_rewrite;
 	uint8_t  log_flag;
+	uint8_t  tcp_flags;
+	uint8_t  is_fragment;
 	uint8_t  src_addr[16];
 	uint8_t  src_mask[16];
 	uint8_t  dst_addr[16];

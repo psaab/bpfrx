@@ -2101,6 +2101,90 @@ func TestFirewallFilterDSCPRewrite(t *testing.T) {
 	}
 }
 
+func TestFirewallFilterTCPFlags(t *testing.T) {
+	// Test set-command format (must use ParseSetCommand, not NewParser)
+	tree := &ConfigTree{}
+	cmds := []string{
+		"set firewall family inet filter tcp-flag-test term syn-only from protocol tcp",
+		"set firewall family inet filter tcp-flag-test term syn-only from tcp-flags syn",
+		"set firewall family inet filter tcp-flag-test term syn-only then discard",
+		"set firewall family inet filter tcp-flag-test term syn-ack from protocol tcp",
+		"set firewall family inet filter tcp-flag-test term syn-ack from tcp-flags syn",
+		"set firewall family inet filter tcp-flag-test term syn-ack from tcp-flags ack",
+		"set firewall family inet filter tcp-flag-test term syn-ack then accept",
+		"set firewall family inet filter tcp-flag-test term default then accept",
+	}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	f, ok := cfg.Firewall.FiltersInet["tcp-flag-test"]
+	if !ok {
+		t.Fatal("expected tcp-flag-test filter")
+	}
+	if len(f.Terms) != 3 {
+		t.Fatalf("expected 3 terms, got %d", len(f.Terms))
+	}
+	// First term: syn only
+	if len(f.Terms[0].TCPFlags) != 1 || f.Terms[0].TCPFlags[0] != "syn" {
+		t.Errorf("term syn-only: expected TCPFlags [syn], got %v", f.Terms[0].TCPFlags)
+	}
+	if f.Terms[0].Action != "discard" {
+		t.Errorf("term syn-only: expected action discard, got %q", f.Terms[0].Action)
+	}
+	// Second term: syn + ack
+	if len(f.Terms[1].TCPFlags) != 2 {
+		t.Errorf("term syn-ack: expected 2 TCPFlags, got %v", f.Terms[1].TCPFlags)
+	}
+}
+
+func TestFirewallFilterIsFragment(t *testing.T) {
+	tree := &ConfigTree{}
+	cmds := []string{
+		"set firewall family inet filter frag-test term drop-frags from is-fragment",
+		"set firewall family inet filter frag-test term drop-frags then discard",
+		"set firewall family inet filter frag-test term allow-rest then accept",
+	}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	f, ok := cfg.Firewall.FiltersInet["frag-test"]
+	if !ok {
+		t.Fatal("expected frag-test filter")
+	}
+	if len(f.Terms) != 2 {
+		t.Fatalf("expected 2 terms, got %d", len(f.Terms))
+	}
+	if !f.Terms[0].IsFragment {
+		t.Error("expected IsFragment=true for drop-frags term")
+	}
+	if f.Terms[0].Action != "discard" {
+		t.Errorf("expected action discard, got %q", f.Terms[0].Action)
+	}
+	if f.Terms[1].IsFragment {
+		t.Error("expected IsFragment=false for allow-rest term")
+	}
+}
+
 func TestFirewallPrefixList(t *testing.T) {
 	input := `policy-options {
     prefix-list management-hosts {
@@ -8847,5 +8931,129 @@ func TestOSPFv3SetSyntax(t *testing.T) {
 	}
 	if len(ospfv3.Export) != 1 || ospfv3.Export[0] != "connected" {
 		t.Errorf("Export = %v, want [connected]", ospfv3.Export)
+	}
+}
+
+func TestInterfaceDuplexSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set interfaces trust0 speed 1g",
+		"set interfaces trust0 duplex full",
+		"set interfaces trust0 mtu 9000",
+		"set interfaces trust0 description \"LAN interface\"",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ifc := cfg.Interfaces.Interfaces["trust0"]
+	if ifc == nil {
+		t.Fatal("trust0 interface not found")
+	}
+	if ifc.Speed != "1g" {
+		t.Errorf("Speed = %q, want \"1g\"", ifc.Speed)
+	}
+	if ifc.Duplex != "full" {
+		t.Errorf("Duplex = %q, want \"full\"", ifc.Duplex)
+	}
+	if ifc.MTU != 9000 {
+		t.Errorf("MTU = %d, want 9000", ifc.MTU)
+	}
+	if ifc.Description != "LAN interface" {
+		t.Errorf("Description = %q, want \"LAN interface\"", ifc.Description)
+	}
+}
+
+func TestMetricTypeAndCommunityListSetSyntax(t *testing.T) {
+	cmds := []string{
+		// Community definitions
+		"set policy-options community MY-COMM members 65000:100",
+		"set policy-options community MY-COMM members 65000:200",
+		"set policy-options community NO-EXPORT members no-export",
+		// Policy with metric-type and from community
+		"set policy-options policy-statement OSPF-EXPORT term t1 from protocol direct",
+		"set policy-options policy-statement OSPF-EXPORT term t1 from community MY-COMM",
+		"set policy-options policy-statement OSPF-EXPORT term t1 then metric-type 1",
+		"set policy-options policy-statement OSPF-EXPORT term t1 then metric 100",
+		"set policy-options policy-statement OSPF-EXPORT term t1 then accept",
+		"set policy-options policy-statement OSPF-EXPORT term t2 then metric-type 2",
+		"set policy-options policy-statement OSPF-EXPORT term t2 then reject",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	// Check community definitions
+	comm := cfg.PolicyOptions.Communities["MY-COMM"]
+	if comm == nil {
+		t.Fatal("MY-COMM community not found")
+	}
+	if len(comm.Members) != 2 {
+		t.Fatalf("MY-COMM members = %d, want 2", len(comm.Members))
+	}
+	if comm.Members[0] != "65000:100" || comm.Members[1] != "65000:200" {
+		t.Errorf("MY-COMM members = %v, want [65000:100, 65000:200]", comm.Members)
+	}
+
+	noExp := cfg.PolicyOptions.Communities["NO-EXPORT"]
+	if noExp == nil {
+		t.Fatal("NO-EXPORT community not found")
+	}
+	if len(noExp.Members) != 1 || noExp.Members[0] != "no-export" {
+		t.Errorf("NO-EXPORT members = %v, want [no-export]", noExp.Members)
+	}
+
+	// Check policy statement
+	ps := cfg.PolicyOptions.PolicyStatements["OSPF-EXPORT"]
+	if ps == nil {
+		t.Fatal("OSPF-EXPORT not found")
+	}
+	if len(ps.Terms) != 2 {
+		t.Fatalf("got %d terms, want 2", len(ps.Terms))
+	}
+
+	t1 := ps.Terms[0]
+	if t1.FromProtocol != "direct" {
+		t.Errorf("t1 from protocol = %q, want direct", t1.FromProtocol)
+	}
+	if t1.FromCommunity != "MY-COMM" {
+		t.Errorf("t1 from community = %q, want MY-COMM", t1.FromCommunity)
+	}
+	if t1.MetricType != 1 {
+		t.Errorf("t1 metric-type = %d, want 1", t1.MetricType)
+	}
+	if t1.Metric != 100 {
+		t.Errorf("t1 metric = %d, want 100", t1.Metric)
+	}
+	if t1.Action != "accept" {
+		t.Errorf("t1 action = %q, want accept", t1.Action)
+	}
+
+	t2 := ps.Terms[1]
+	if t2.MetricType != 2 {
+		t.Errorf("t2 metric-type = %d, want 2", t2.MetricType)
+	}
+	if t2.Action != "reject" {
+		t.Errorf("t2 action = %q, want reject", t2.Action)
 	}
 }

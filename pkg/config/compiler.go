@@ -3283,6 +3283,20 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 					term.ICMPCode = n
 				}
 			}
+		case "tcp-flags":
+			// Can be bracket list or single value: tcp-flags "syn ack" or [ syn ack ]
+			if len(child.Keys) >= 2 {
+				for _, k := range child.Keys[1:] {
+					term.TCPFlags = append(term.TCPFlags, k)
+				}
+			}
+			for _, flagNode := range child.Children {
+				if len(flagNode.Keys) >= 1 {
+					term.TCPFlags = append(term.TCPFlags, flagNode.Keys[0])
+				}
+			}
+		case "is-fragment":
+			term.IsFragment = true
 		}
 	}
 }
@@ -4209,6 +4223,9 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 	if po.PrefixLists == nil {
 		po.PrefixLists = make(map[string]*PrefixList)
 	}
+	if po.Communities == nil {
+		po.Communities = make(map[string]*CommunityDef)
+	}
 	if po.PolicyStatements == nil {
 		po.PolicyStatements = make(map[string]*PolicyStatement)
 	}
@@ -4222,6 +4239,26 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 			}
 		}
 		po.PrefixLists[pl.Name] = pl
+	}
+
+	// Parse community definitions
+	for _, inst := range namedInstances(node.FindChildren("community")) {
+		cd := po.Communities[inst.name]
+		if cd == nil {
+			cd = &CommunityDef{Name: inst.name}
+			po.Communities[inst.name] = cd
+		}
+		for _, entry := range inst.node.Children {
+			if entry.Name() == "members" {
+				if v := nodeVal(entry); v != "" {
+					cd.Members = append(cd.Members, v)
+				}
+			}
+		}
+		// Handle flat set syntax: keys like ["members", "65000:100"]
+		if len(inst.node.Keys) > 1 && inst.node.Keys[0] == "members" {
+			cd.Members = append(cd.Members, inst.node.Keys[1])
+		}
 	}
 
 	// Parse policy-statements
@@ -4302,6 +4339,10 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 						}
 						term.RouteFilters = append(term.RouteFilters, rf)
 					}
+				case "community":
+					if v := nodeVal(fc); v != "" {
+						term.FromCommunity = v
+					}
 				}
 			}
 		case "then":
@@ -4327,6 +4368,12 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 							term.Metric = n
 						}
 					}
+				case "metric-type":
+					if v := nodeVal(ac); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							term.MetricType = n
+						}
+					}
 				case "community":
 					term.Community = nodeVal(ac)
 				case "origin":
@@ -4345,11 +4392,14 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 // "from", "protocol", "direct" or "from", "route-filter", "10.0.0.0/8", "exact"
 // or "then", "accept"
 func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
+	inFrom := false
 	for i := 0; i < len(keys); i++ {
 		switch keys[i] {
 		case "from":
+			inFrom = true
 			continue
 		case "then":
+			inFrom = false
 			if i+1 < len(keys) {
 				i++
 				term.Action = keys[i]
@@ -4397,10 +4447,21 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 					term.Metric = n
 				}
 			}
+		case "metric-type":
+			if i+1 < len(keys) {
+				i++
+				if n, err := strconv.Atoi(keys[i]); err == nil {
+					term.MetricType = n
+				}
+			}
 		case "community":
 			if i+1 < len(keys) {
 				i++
-				term.Community = keys[i]
+				if inFrom {
+					term.FromCommunity = keys[i]
+				} else {
+					term.Community = keys[i]
+				}
 			}
 		case "origin":
 			if i+1 < len(keys) {

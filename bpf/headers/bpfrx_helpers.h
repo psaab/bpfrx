@@ -935,6 +935,16 @@ evaluate_firewall_filter(struct pkt_meta *meta)
 		    rule->icmp_code != meta->icmp_code)
 			match = 0;
 
+		/* Check TCP flags (all specified flags must be set) */
+		if (match && (flags & FILTER_MATCH_TCP_FLAGS) &&
+		    (meta->tcp_flags & rule->tcp_flags) != rule->tcp_flags)
+			match = 0;
+
+		/* Check IP fragment */
+		if (match && (flags & FILTER_MATCH_FRAGMENT) &&
+		    !meta->is_fragment)
+			match = 0;
+
 		/* Check source address (v4 or v6 depending on family) */
 		if (match && (flags & FILTER_MATCH_SRC_ADDR)) {
 			int src_hit = 1;
@@ -1096,6 +1106,16 @@ evaluate_firewall_filter_output(struct pkt_meta *meta, __u32 egress_ifindex)
 			match = 0;
 		if (match && (flags & FILTER_MATCH_ICMP_CODE) &&
 		    rule->icmp_code != meta->icmp_code)
+			match = 0;
+
+		/* Check TCP flags (all specified flags must be set) */
+		if (match && (flags & FILTER_MATCH_TCP_FLAGS) &&
+		    (meta->tcp_flags & rule->tcp_flags) != rule->tcp_flags)
+			match = 0;
+
+		/* Check IP fragment */
+		if (match && (flags & FILTER_MATCH_FRAGMENT) &&
+		    !meta->is_fragment)
 			match = 0;
 
 		if (match && (flags & FILTER_MATCH_SRC_ADDR)) {

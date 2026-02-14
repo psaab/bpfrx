@@ -990,6 +990,22 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 		b.WriteString("!\n")
 	}
 
+	// Generate FRR community-lists from Junos community definitions
+	commNames := make([]string, 0, len(po.Communities))
+	for name := range po.Communities {
+		commNames = append(commNames, name)
+	}
+	sort.Strings(commNames)
+	for _, name := range commNames {
+		cd := po.Communities[name]
+		for _, member := range cd.Members {
+			fmt.Fprintf(&b, "bgp community-list standard %s permit %s\n", name, member)
+		}
+	}
+	if len(po.Communities) > 0 {
+		b.WriteString("!\n")
+	}
+
 	// Generate FRR route-maps from Junos policy-statements
 	psNames := make([]string, 0, len(po.PolicyStatements))
 	for name := range po.PolicyStatements {
@@ -1061,6 +1077,10 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 				fmt.Fprintf(&b, " match source-protocol %s\n", proto)
 			}
 
+			if term.FromCommunity != "" {
+				fmt.Fprintf(&b, " match community %s\n", term.FromCommunity)
+			}
+
 			// then actions
 			if term.NextHop != "" {
 				if term.NextHop == "peer-address" {
@@ -1082,6 +1102,9 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			}
 			if term.Metric > 0 {
 				fmt.Fprintf(&b, " set metric %d\n", term.Metric)
+			}
+			if term.MetricType == 1 || term.MetricType == 2 {
+				fmt.Fprintf(&b, " set metric-type type-%d\n", term.MetricType)
 			}
 			if term.Community != "" {
 				fmt.Fprintf(&b, " set community %s\n", term.Community)

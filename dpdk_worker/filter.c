@@ -148,6 +148,16 @@ evaluate_filter(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		    r->icmp_code != meta->icmp_code)
 			continue;
 
+		/* Match TCP flags (all specified flags must be set) */
+		if ((r->match_flags & FILTER_MATCH_TCP_FLAGS) &&
+		    (meta->tcp_flags & r->tcp_flags) != r->tcp_flags)
+			continue;
+
+		/* Match IP fragment */
+		if ((r->match_flags & FILTER_MATCH_FRAGMENT) &&
+		    !meta->is_fragment)
+			continue;
+
 		/* Rule matched */
 		ctr_filter_add(ctx, ridx, rte_pktmbuf_pkt_len(pkt));
 

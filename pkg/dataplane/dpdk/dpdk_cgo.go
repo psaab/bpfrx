@@ -1088,6 +1088,8 @@ func (m *Manager) SetFilterRule(index uint32, rule dataplane.FilterRule) error {
 	ptr.src_port_hi = C.uint16_t(rule.SrcPortHi)
 	ptr.dscp_rewrite = C.uint8_t(rule.DSCPRewrite)
 	ptr.log_flag = C.uint8_t(rule.LogFlag)
+	ptr.tcp_flags = C.uint8_t(rule.TCPFlags)
+	ptr.is_fragment = C.uint8_t(rule.IsFragment)
 	copyCBytes(ptr.src_addr[:], rule.SrcAddr[:])
 	copyCBytes(ptr.src_mask[:], rule.SrcMask[:])
 	copyCBytes(ptr.dst_addr[:], rule.DstAddr[:])
