@@ -4299,8 +4299,20 @@ func compileSNMP(node *Node, sys *SystemConfig) error {
 
 // compileSNMPv3 parses the v3 { usm { local-engine { user <name> { ... } } } } hierarchy.
 func compileSNMPv3(node *Node, snmp *SNMPConfig) {
-	// Navigate: v3 -> usm -> local-engine -> user <name> { ... }
-	// Handle both hierarchical and flat forms.
+	// Flat form: Keys = ["v3", "usm", "local-engine", "user", "<name>", "authentication-sha", "authentication-password", "<pass>"]
+	// Index:       0      1         2              3       4                5                         6                       7
+	if len(node.Keys) >= 8 && node.Keys[1] == "usm" && node.Keys[2] == "local-engine" && node.Keys[3] == "user" {
+		userName := node.Keys[4]
+		user := snmp.V3Users[userName]
+		if user == nil {
+			user = &SNMPv3User{Name: userName}
+		}
+		parseSNMPv3UserKeys(node.Keys[5:], user)
+		snmp.V3Users[userName] = user
+		return
+	}
+
+	// Hierarchical form: v3 -> usm -> local-engine -> user <name> { ... }
 	usmNode := node.FindChild("usm")
 	if usmNode == nil {
 		return
@@ -4317,7 +4329,10 @@ func compileSNMPv3(node *Node, snmp *SNMPConfig) {
 		if userName == "" {
 			continue
 		}
-		user := &SNMPv3User{Name: userName}
+		user := snmp.V3Users[userName]
+		if user == nil {
+			user = &SNMPv3User{Name: userName}
+		}
 		userChildren := child.Children
 		if len(child.Keys) < 2 && len(child.Children) > 0 {
 			userChildren = child.Children[0].Children
@@ -4351,7 +4366,42 @@ func compileSNMPv3(node *Node, snmp *SNMPConfig) {
 				}
 			}
 		}
-		snmp.V3Users[user.Name] = user
+		snmp.V3Users[userName] = user
+	}
+}
+
+// parseSNMPv3UserKeys parses flat-form keys after the user name.
+// Keys like: ["authentication-sha256", "authentication-password", "adminpass"]
+func parseSNMPv3UserKeys(keys []string, user *SNMPv3User) {
+	if len(keys) == 0 {
+		return
+	}
+	switch keys[0] {
+	case "authentication-md5":
+		user.AuthProtocol = "md5"
+		if len(keys) >= 3 && keys[1] == "authentication-password" {
+			user.AuthPassword = keys[2]
+		}
+	case "authentication-sha":
+		user.AuthProtocol = "sha"
+		if len(keys) >= 3 && keys[1] == "authentication-password" {
+			user.AuthPassword = keys[2]
+		}
+	case "authentication-sha256":
+		user.AuthProtocol = "sha256"
+		if len(keys) >= 3 && keys[1] == "authentication-password" {
+			user.AuthPassword = keys[2]
+		}
+	case "privacy-des":
+		user.PrivProtocol = "des"
+		if len(keys) >= 3 && keys[1] == "privacy-password" {
+			user.PrivPassword = keys[2]
+		}
+	case "privacy-aes128":
+		user.PrivProtocol = "aes128"
+		if len(keys) >= 3 && keys[1] == "privacy-password" {
+			user.PrivPassword = keys[2]
+		}
 	}
 }
 

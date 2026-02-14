@@ -1,9 +1,18 @@
 package snmp
 
 import (
+	"crypto/md5"
+	"crypto/sha1"
 	"testing"
 
 	"github.com/psaab/bpfrx/pkg/config"
+)
+
+var (
+	md5New  = md5.New
+	md5Size = md5.Size
+	sha1New = sha1.New
+	sha1Size = sha1.Size
 )
 
 // --- BER encoding tests ---
@@ -446,4 +455,154 @@ func intsEqual(a, b []int) bool {
 		}
 	}
 	return true
+}
+
+// --- SNMPv3 USM tests ---
+
+func TestPasswordToKey_MD5(t *testing.T) {
+	engineID := []byte{0x80, 0x00, 0x01, 0x86, 0xa3, 0x04, 't', 'e', 's', 't'}
+	key := passwordToKey("maplesyrup", engineID, md5New, md5Size)
+	if key == nil {
+		t.Fatal("passwordToKey returned nil")
+	}
+	if len(key) != md5Size {
+		t.Errorf("key length = %d, want %d", len(key), md5Size)
+	}
+}
+
+func TestPasswordToKey_SHA(t *testing.T) {
+	engineID := []byte{0x80, 0x00, 0x01, 0x86, 0xa3, 0x04, 't', 'e', 's', 't'}
+	key := passwordToKey("testpassword", engineID, sha1New, sha1Size)
+	if key == nil {
+		t.Fatal("passwordToKey returned nil")
+	}
+	if len(key) != sha1Size {
+		t.Errorf("key length = %d, want %d", len(key), sha1Size)
+	}
+}
+
+func TestPasswordToKey_EmptyPassword(t *testing.T) {
+	engineID := []byte{0x80, 0x00, 0x01, 0x86, 0xa3}
+	key := passwordToKey("", engineID, md5New, md5Size)
+	if key != nil {
+		t.Error("empty password should return nil")
+	}
+}
+
+func TestInitV3Users(t *testing.T) {
+	a := NewAgent(&config.SNMPConfig{
+		V3Users: map[string]*config.SNMPv3User{
+			"admin": {
+				Name:         "admin",
+				AuthProtocol: "sha",
+				AuthPassword: "authpass123",
+				PrivProtocol: "aes128",
+				PrivPassword: "privpass456",
+			},
+		},
+	})
+	if len(a.v3Users) != 1 {
+		t.Fatalf("v3Users count = %d, want 1", len(a.v3Users))
+	}
+	u := a.v3Users["admin"]
+	if u == nil {
+		t.Fatal("admin user not found")
+	}
+	if u.authProto != "sha" {
+		t.Errorf("authProto = %q, want sha", u.authProto)
+	}
+	if u.authKey == nil {
+		t.Error("authKey is nil")
+	}
+	if u.privProto != "aes128" {
+		t.Errorf("privProto = %q, want aes128", u.privProto)
+	}
+	if u.privKey == nil {
+		t.Error("privKey is nil")
+	}
+}
+
+func TestInitV3Users_NilConfig(t *testing.T) {
+	a := NewAgent(nil)
+	if a.v3Users != nil {
+		t.Error("nil config should leave v3Users nil")
+	}
+}
+
+func TestV3Discovery(t *testing.T) {
+	a := NewAgent(&config.SNMPConfig{
+		V3Users: map[string]*config.SNMPv3User{
+			"test": {Name: "test", AuthProtocol: "sha", AuthPassword: "testpass"},
+		},
+	})
+	resp := a.buildV3Discovery(42)
+	if resp == nil {
+		t.Fatal("discovery response is nil")
+	}
+	// Should be a valid BER SEQUENCE.
+	tag, _, err := berDecodeHeader(resp)
+	if err != nil || tag != tagSequence {
+		t.Errorf("discovery response: tag=%d, err=%v", tag, err)
+	}
+}
+
+func TestV3UserDisplay(t *testing.T) {
+	users := map[string]*config.SNMPv3User{
+		"admin": {Name: "admin", AuthProtocol: "sha256", PrivProtocol: "aes128"},
+		"guest": {Name: "guest", AuthProtocol: "md5"},
+	}
+	info := V3UserInfo(users)
+	if len(info) != 2 {
+		t.Fatalf("V3UserInfo count = %d, want 2", len(info))
+	}
+}
+
+func TestEngineIDGeneration(t *testing.T) {
+	a := NewAgent(&config.SNMPConfig{})
+	if a.engineID == nil {
+		t.Fatal("engineID is nil")
+	}
+	if len(a.engineID) < 6 {
+		t.Errorf("engineID too short: %d bytes", len(a.engineID))
+	}
+	// First 5 bytes should be fixed prefix, 6th byte should be 0x04 (text format).
+	if a.engineID[5] != 0x04 {
+		t.Errorf("engineID format byte = %d, want 4", a.engineID[5])
+	}
+}
+
+func TestDESEncryptDecrypt(t *testing.T) {
+	// Need a 16-byte key (8 for DES + 8 for preIV).
+	key := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	plaintext := []byte("hello world test") // 16 bytes (multiple of 8)
+	enc, pp := encryptDES(key, plaintext)
+	if enc == nil {
+		t.Fatal("encryptDES returned nil")
+	}
+	dec := decryptDES(key, pp, enc)
+	if dec == nil {
+		t.Fatal("decryptDES returned nil")
+	}
+	if !bytesEqual(dec, plaintext) {
+		t.Errorf("DES roundtrip failed: got %v, want %v", dec, plaintext)
+	}
+}
+
+func TestAES128EncryptDecrypt(t *testing.T) {
+	key := make([]byte, 16)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	plaintext := []byte("test data for aes encryption roundtrip")
+	enc, pp := encryptAES128(key, plaintext, 1, 100)
+	if enc == nil {
+		t.Fatal("encryptAES128 returned nil")
+	}
+	dec := decryptAES128(key, pp, enc, 1, 100)
+	if dec == nil {
+		t.Fatal("decryptAES128 returned nil")
+	}
+	if !bytesEqual(dec, plaintext) {
+		t.Errorf("AES128 roundtrip failed: got %v, want %v", dec, plaintext)
+	}
 }
