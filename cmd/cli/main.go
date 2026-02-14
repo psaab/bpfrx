@@ -479,6 +479,18 @@ func (c *ctl) handleShow(args []string) error {
 		if len(args) >= 2 {
 			switch args[1] {
 			case "cluster":
+				if len(args) >= 3 {
+					switch args[2] {
+					case "status":
+						return c.showText("chassis-cluster-status")
+					case "interfaces":
+						return c.showText("chassis-cluster-interfaces")
+					case "information":
+						return c.showText("chassis-cluster-information")
+					case "statistics":
+						return c.showText("chassis-cluster-statistics")
+					}
+				}
 				return c.showText("chassis-cluster")
 			case "environment":
 				return c.showText("chassis-environment")
@@ -2288,6 +2300,8 @@ func (c *ctl) handleRequest(args []string) error {
 		return nil
 	}
 	switch args[0] {
+	case "chassis":
+		return c.handleRequestChassis(args[1:])
 	case "dhcp":
 		return c.handleRequestDHCP(args[1:])
 	case "protocols":
@@ -2343,6 +2357,50 @@ func (c *ctl) handleRequest(args []string) error {
 	default:
 		return fmt.Errorf("unknown request system command: %s", args[1])
 	}
+}
+
+func (c *ctl) handleRequestChassis(args []string) error {
+	if len(args) == 0 || args[0] != "cluster" {
+		printRemoteTreeHelp("request chassis:", "request", "chassis")
+		return nil
+	}
+	args = args[1:] // consume "cluster"
+	if len(args) == 0 || args[0] != "failover" {
+		printRemoteTreeHelp("request chassis cluster:", "request", "chassis", "cluster")
+		return nil
+	}
+	args = args[1:] // consume "failover"
+
+	// "request chassis cluster failover reset redundancy-group <N>"
+	if len(args) >= 1 && args[0] == "reset" {
+		if len(args) < 3 || args[1] != "redundancy-group" {
+			return fmt.Errorf("usage: request chassis cluster failover reset redundancy-group <N>")
+		}
+		action := "cluster-failover-reset:" + args[2]
+		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+			Action: action,
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Message)
+		return nil
+	}
+
+	// "request chassis cluster failover redundancy-group <N>"
+	if len(args) >= 2 && args[0] == "redundancy-group" {
+		action := "cluster-failover:" + args[1]
+		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+			Action: action,
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Message)
+		return nil
+	}
+
+	return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N>")
 }
 
 func (c *ctl) handleRequestDHCP(args []string) error {

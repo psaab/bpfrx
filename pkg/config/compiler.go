@@ -4930,10 +4930,38 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 
 	ch.Cluster = &ClusterConfig{}
 
+	if n := clusterNode.FindChild("cluster-id"); n != nil {
+		if v := nodeVal(n); v != "" {
+			if id, err := strconv.Atoi(v); err == nil {
+				ch.Cluster.ClusterID = id
+			}
+		}
+	}
+	if n := clusterNode.FindChild("node"); n != nil {
+		if v := nodeVal(n); v != "" {
+			if id, err := strconv.Atoi(v); err == nil {
+				ch.Cluster.NodeID = id
+			}
+		}
+	}
 	if rcNode := clusterNode.FindChild("reth-count"); rcNode != nil {
 		if v := nodeVal(rcNode); v != "" {
 			if n, err := strconv.Atoi(v); err == nil {
 				ch.Cluster.RethCount = n
+			}
+		}
+	}
+	if n := clusterNode.FindChild("heartbeat-interval"); n != nil {
+		if v := nodeVal(n); v != "" {
+			if ms, err := strconv.Atoi(v); err == nil {
+				ch.Cluster.HeartbeatInterval = ms
+			}
+		}
+	}
+	if n := clusterNode.FindChild("heartbeat-threshold"); n != nil {
+		if v := nodeVal(n); v != "" {
+			if cnt, err := strconv.Atoi(v); err == nil {
+				ch.Cluster.HeartbeatThreshold = cnt
 			}
 		}
 	}
@@ -4980,6 +5008,8 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 						rg.GratuitousARPCount = n
 					}
 				}
+			case "preempt":
+				rg.Preempt = true
 			case "interface-monitor":
 				for _, ifChild := range child.Children {
 					im := &InterfaceMonitor{

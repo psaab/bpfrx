@@ -23,6 +23,7 @@ import (
 
 	"github.com/vishvananda/netlink"
 
+	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/psaab/bpfrx/pkg/cmdtree"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
@@ -50,6 +51,7 @@ type Config struct {
 	Routing  *routing.Manager
 	FRR      *frr.Manager
 	IPsec    *ipsec.Manager
+	Cluster  *cluster.Manager
 	DHCP         *dhcp.Manager
 	DHCPServer   *dhcpserver.Manager
 	RPMResultsFn    func() []*rpm.ProbeResult      // returns live RPM results
@@ -69,6 +71,7 @@ type Server struct {
 	routing      *routing.Manager
 	frr          *frr.Manager
 	ipsec        *ipsec.Manager
+	cluster      *cluster.Manager
 	dhcp         *dhcp.Manager
 	dhcpServer   *dhcpserver.Manager
 	rpmResultsFn    func() []*rpm.ProbeResult
@@ -93,6 +96,7 @@ func NewServer(addr string, cfg Config) *Server {
 		routing:      cfg.Routing,
 		frr:          cfg.FRR,
 		ipsec:        cfg.IPsec,
+		cluster:      cfg.Cluster,
 		dhcp:         cfg.DHCP,
 		dhcpServer:   cfg.DHCPServer,
 		rpmResultsFn:    cfg.RPMResultsFn,
@@ -5476,55 +5480,89 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		// Alias: same output as "chassis" (CPU, memory, NICs)
 		return s.ShowText(nil, &pb.ShowTextRequest{Topic: "chassis"})
 
-	case "chassis-cluster":
+	case "chassis-cluster", "chassis-cluster-status":
+		if s.cluster != nil {
+			buf.WriteString(s.cluster.FormatStatus())
+		} else {
+			fmt.Fprintln(&buf, "Cluster not configured")
+		}
+
+	case "chassis-cluster-interfaces":
 		cfg := s.store.ActiveConfig()
 		if cfg == nil || cfg.Chassis.Cluster == nil {
 			fmt.Fprintln(&buf, "Cluster not configured")
 			break
 		}
-		cluster := cfg.Chassis.Cluster
-		fmt.Fprintf(&buf, "Chassis cluster status:\n")
-		fmt.Fprintf(&buf, "  RETH count: %d\n", cluster.RethCount)
-		// Show RETH interface names
+		cc := cfg.Chassis.Cluster
+		fmt.Fprintf(&buf, "Control link status: Up\n\n")
+		// RETH interfaces
+		fmt.Fprintf(&buf, "RETH count: %d\n", cc.RethCount)
 		if s.routing != nil {
 			rethNames := s.routing.RethNames()
 			if len(rethNames) > 0 {
-				fmt.Fprintf(&buf, "  RETH interfaces: %s\n", strings.Join(rethNames, ", "))
+				fmt.Fprintf(&buf, "RETH interfaces: %s\n", strings.Join(rethNames, ", "))
 			}
 		}
 		fmt.Fprintln(&buf)
-
-		// Get live monitor statuses
+		// Interface monitoring
 		var monStatuses map[int][]routing.InterfaceMonitorStatus
 		if s.routing != nil {
 			monStatuses = s.routing.InterfaceMonitorStatuses()
 		}
-
-		for _, rg := range cluster.RedundancyGroups {
-			fmt.Fprintf(&buf, "Redundancy group: %d\n", rg.ID)
-			for nodeID, priority := range rg.NodePriorities {
-				fmt.Fprintf(&buf, "  Node %d priority: %d\n", nodeID, priority)
+		for _, rg := range cc.RedundancyGroups {
+			if len(rg.InterfaceMonitors) == 0 {
+				continue
 			}
-			if rg.GratuitousARPCount > 0 {
-				fmt.Fprintf(&buf, "  Gratuitous ARP count: %d\n", rg.GratuitousARPCount)
-			}
-			if statuses, ok := monStatuses[rg.ID]; ok && len(statuses) > 0 {
-				fmt.Fprintln(&buf, "  Interface monitors:")
+			fmt.Fprintf(&buf, "Interface monitoring for redundancy group %d:\n", rg.ID)
+			fmt.Fprintf(&buf, "  %-20s %-8s %s\n", "Interface", "Weight", "Status")
+			if statuses, ok := monStatuses[rg.ID]; ok {
 				for _, st := range statuses {
 					state := "Up"
 					if !st.Up {
 						state = "Down"
 					}
-					fmt.Fprintf(&buf, "    %-20s weight %-4d status %s\n",
-						st.Interface, st.Weight, state)
+					fmt.Fprintf(&buf, "  %-20s %-8d %s\n", st.Interface, st.Weight, state)
 				}
-			} else if len(rg.InterfaceMonitors) > 0 {
-				fmt.Fprintln(&buf, "  Interface monitors:")
+			} else {
 				for _, mon := range rg.InterfaceMonitors {
-					fmt.Fprintf(&buf, "    %-20s weight %d\n", mon.Interface, mon.Weight)
+					fmt.Fprintf(&buf, "  %-20s %-8d %s\n", mon.Interface, mon.Weight, "Unknown")
 				}
 			}
 			fmt.Fprintln(&buf)
+		}
+
+	case "chassis-cluster-information":
+		cfg := s.store.ActiveConfig()
+		if cfg == nil || cfg.Chassis.Cluster == nil {
+			fmt.Fprintln(&buf, "Cluster not configured")
+			break
+		}
+		cc := cfg.Chassis.Cluster
+		hbInterval := cc.HeartbeatInterval
+		if hbInterval == 0 {
+			hbInterval = 1000
+		}
+		hbThreshold := cc.HeartbeatThreshold
+		if hbThreshold == 0 {
+			hbThreshold = 3
+		}
+		fmt.Fprintf(&buf, "Cluster ID: %d\n", cc.ClusterID)
+		fmt.Fprintf(&buf, "Node ID: %d\n", cc.NodeID)
+		fmt.Fprintf(&buf, "RETH count: %d\n", cc.RethCount)
+		fmt.Fprintf(&buf, "Heartbeat interval: %d ms\n", hbInterval)
+		fmt.Fprintf(&buf, "Heartbeat threshold: %d\n", hbThreshold)
+		fmt.Fprintf(&buf, "Redundancy groups: %d\n", len(cc.RedundancyGroups))
+
+	case "chassis-cluster-statistics":
+		if s.cluster == nil {
+			fmt.Fprintln(&buf, "Cluster not configured")
+			break
+		}
+		states := s.cluster.GroupStates()
+		fmt.Fprintln(&buf, "Cluster statistics:")
+		for _, rg := range states {
+			fmt.Fprintf(&buf, "  Redundancy group %d: failover count %d, weight %d\n",
+				rg.GroupID, rg.FailoverCount, rg.Weight)
 		}
 
 	case "chassis-environment":
@@ -6977,6 +7015,39 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 		}, nil
 
 	default:
+		// Handle cluster failover actions: "cluster-failover:<rgID>" and "cluster-failover-reset:<rgID>"
+		if strings.HasPrefix(req.Action, "cluster-failover-reset:") {
+			if s.cluster == nil {
+				return nil, status.Error(codes.Unavailable, "cluster not configured")
+			}
+			rgStr := strings.TrimPrefix(req.Action, "cluster-failover-reset:")
+			rgID, err := strconv.Atoi(rgStr)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid redundancy-group ID: %s", rgStr)
+			}
+			if err := s.cluster.ResetFailover(rgID); err != nil {
+				return nil, status.Errorf(codes.NotFound, "%v", err)
+			}
+			return &pb.SystemActionResponse{
+				Message: fmt.Sprintf("Failover reset for redundancy group %d", rgID),
+			}, nil
+		}
+		if strings.HasPrefix(req.Action, "cluster-failover:") {
+			if s.cluster == nil {
+				return nil, status.Error(codes.Unavailable, "cluster not configured")
+			}
+			rgStr := strings.TrimPrefix(req.Action, "cluster-failover:")
+			rgID, err := strconv.Atoi(rgStr)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid redundancy-group ID: %s", rgStr)
+			}
+			if err := s.cluster.ManualFailover(rgID); err != nil {
+				return nil, status.Errorf(codes.NotFound, "%v", err)
+			}
+			return &pb.SystemActionResponse{
+				Message: fmt.Sprintf("Manual failover triggered for redundancy group %d", rgID),
+			}, nil
+		}
 		return nil, status.Errorf(codes.InvalidArgument, "unknown action: %s", req.Action)
 	}
 }

@@ -7576,6 +7576,139 @@ func TestChassisClusterSetSyntax(t *testing.T) {
 	}
 }
 
+func TestChassisClusterExtendedFields(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+        node 0;
+        heartbeat-interval 500;
+        heartbeat-threshold 5;
+        reth-count 2;
+        redundancy-group 0 {
+            node 0 priority 200;
+            node 1 priority 100;
+            preempt;
+        }
+        redundancy-group 1 {
+            node 0 priority 200;
+            node 1 priority 100;
+            preempt;
+            gratuitous-arp-count 4;
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	cl := cfg.Chassis.Cluster
+	if cl.ClusterID != 1 {
+		t.Errorf("ClusterID = %d, want 1", cl.ClusterID)
+	}
+	if cl.NodeID != 0 {
+		t.Errorf("NodeID = %d, want 0", cl.NodeID)
+	}
+	if cl.HeartbeatInterval != 500 {
+		t.Errorf("HeartbeatInterval = %d, want 500", cl.HeartbeatInterval)
+	}
+	if cl.HeartbeatThreshold != 5 {
+		t.Errorf("HeartbeatThreshold = %d, want 5", cl.HeartbeatThreshold)
+	}
+	if cl.RethCount != 2 {
+		t.Errorf("RethCount = %d, want 2", cl.RethCount)
+	}
+	if len(cl.RedundancyGroups) != 2 {
+		t.Fatalf("RedundancyGroups = %d, want 2", len(cl.RedundancyGroups))
+	}
+	for i, rg := range cl.RedundancyGroups {
+		if !rg.Preempt {
+			t.Errorf("rg%d.Preempt = false, want true", i)
+		}
+		if rg.NodePriorities[0] != 200 {
+			t.Errorf("rg%d node 0 priority = %d, want 200", i, rg.NodePriorities[0])
+		}
+		if rg.NodePriorities[1] != 100 {
+			t.Errorf("rg%d node 1 priority = %d, want 100", i, rg.NodePriorities[1])
+		}
+	}
+	if cl.RedundancyGroups[1].GratuitousARPCount != 4 {
+		t.Errorf("rg1 gratuitous-arp-count = %d, want 4", cl.RedundancyGroups[1].GratuitousARPCount)
+	}
+}
+
+func TestChassisClusterExtendedFieldsSet(t *testing.T) {
+	commands := []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster node 0",
+		"set chassis cluster heartbeat-interval 500",
+		"set chassis cluster heartbeat-threshold 5",
+		"set chassis cluster reth-count 2",
+		"set chassis cluster redundancy-group 0 node 0 priority 200",
+		"set chassis cluster redundancy-group 0 node 1 priority 100",
+		"set chassis cluster redundancy-group 0 preempt",
+		"set chassis cluster redundancy-group 1 node 0 priority 200",
+		"set chassis cluster redundancy-group 1 node 1 priority 100",
+		"set chassis cluster redundancy-group 1 preempt",
+		"set chassis cluster redundancy-group 1 gratuitous-arp-count 4",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range commands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	cl := cfg.Chassis.Cluster
+	if cl.ClusterID != 1 {
+		t.Errorf("ClusterID = %d, want 1", cl.ClusterID)
+	}
+	if cl.NodeID != 0 {
+		t.Errorf("NodeID = %d, want 0", cl.NodeID)
+	}
+	if cl.HeartbeatInterval != 500 {
+		t.Errorf("HeartbeatInterval = %d, want 500", cl.HeartbeatInterval)
+	}
+	if cl.HeartbeatThreshold != 5 {
+		t.Errorf("HeartbeatThreshold = %d, want 5", cl.HeartbeatThreshold)
+	}
+	if cl.RethCount != 2 {
+		t.Errorf("RethCount = %d, want 2", cl.RethCount)
+	}
+	if len(cl.RedundancyGroups) != 2 {
+		t.Fatalf("RedundancyGroups = %d, want 2", len(cl.RedundancyGroups))
+	}
+	for i, rg := range cl.RedundancyGroups {
+		if !rg.Preempt {
+			t.Errorf("rg%d.Preempt = false, want true", i)
+		}
+		if rg.NodePriorities[0] != 200 {
+			t.Errorf("rg%d node 0 priority = %d, want 200", i, rg.NodePriorities[0])
+		}
+		if rg.NodePriorities[1] != 100 {
+			t.Errorf("rg%d node 1 priority = %d, want 100", i, rg.NodePriorities[1])
+		}
+	}
+	if cl.RedundancyGroups[1].GratuitousARPCount != 4 {
+		t.Errorf("rg1 gratuitous-arp-count = %d, want 4", cl.RedundancyGroups[1].GratuitousARPCount)
+	}
+}
+
 func TestEventOptions(t *testing.T) {
 	input := `event-options {
     policy disable-on-ping-failure {

@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/chzyer/readline"
+	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/psaab/bpfrx/pkg/cmdtree"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
@@ -48,6 +49,7 @@ type CLI struct {
 	ipsec       *ipsec.Manager
 	dhcp         *dhcp.Manager
 	dhcpRelay    *dhcprelay.Manager
+	cluster      *cluster.Manager
 	rpmResultsFn     func() []*rpm.ProbeResult
 	feedsFn          func() map[string]feeds.FeedInfo
 	lldpNeighborsFn  func() []*lldp.Neighbor
@@ -59,7 +61,7 @@ type CLI struct {
 }
 
 // New creates a new CLI.
-func New(store *configstore.Store, dp dataplane.DataPlane, eventBuf *logging.EventBuffer, eventReader *logging.EventReader, rm *routing.Manager, fm *frr.Manager, im *ipsec.Manager, dm *dhcp.Manager, dr *dhcprelay.Manager) *CLI {
+func New(store *configstore.Store, dp dataplane.DataPlane, eventBuf *logging.EventBuffer, eventReader *logging.EventReader, rm *routing.Manager, fm *frr.Manager, im *ipsec.Manager, dm *dhcp.Manager, dr *dhcprelay.Manager, cm *cluster.Manager) *CLI {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "bpfrx"
@@ -80,6 +82,7 @@ func New(store *configstore.Store, dp dataplane.DataPlane, eventBuf *logging.Eve
 		ipsec:       im,
 		dhcp:        dm,
 		dhcpRelay:   dr,
+		cluster:     cm,
 		hostname:    hostname,
 		username:    username,
 	}
@@ -9550,36 +9553,32 @@ func (c *CLI) showChassis(args []string) error {
 
 // showChassisCluster shows cluster/HA configuration and status.
 func (c *CLI) showChassisCluster(args []string) error {
-	cfg := c.store.ActiveConfig()
-	if cfg == nil || cfg.Chassis.Cluster == nil {
-		fmt.Println("Cluster not configured")
-		return nil
+	if len(args) > 0 {
+		switch args[0] {
+		case "status":
+			return c.showChassisClusterStatus()
+		case "interfaces":
+			return c.showChassisClusterInterfaces()
+		case "information":
+			return c.showChassisClusterInformation()
+		case "statistics":
+			return c.showChassisClusterStatistics()
+		}
 	}
-	cluster := cfg.Chassis.Cluster
+	// Default: show status
+	return c.showChassisClusterStatus()
+}
 
-	fmt.Println("Chassis cluster status:")
-	fmt.Printf("  RETH count: %d\n", cluster.RethCount)
-	fmt.Println()
-
-	for _, rg := range cluster.RedundancyGroups {
-		fmt.Printf("Redundancy group: %d\n", rg.ID)
-		for nodeID, priority := range rg.NodePriorities {
-			fmt.Printf("  Node %d priority: %d\n", nodeID, priority)
-		}
-		if rg.GratuitousARPCount > 0 {
-			fmt.Printf("  Gratuitous ARP count: %d\n", rg.GratuitousARPCount)
-		}
-		if len(rg.InterfaceMonitors) > 0 {
-			fmt.Println("  Interface monitors:")
-			for _, mon := range rg.InterfaceMonitors {
-				fmt.Printf("    %-20s weight %d\n", mon.Interface, mon.Weight)
-			}
-		}
-		fmt.Println()
+func (c *CLI) showChassisClusterStatus() error {
+	if c.cluster != nil {
+		fmt.Print(c.cluster.FormatStatus())
+	} else {
+		fmt.Println("Cluster not configured")
 	}
 
 	// Show VRRP status if any
-	if cfg.Security.Zones != nil {
+	cfg := c.store.ActiveConfig()
+	if cfg != nil && cfg.Security.Zones != nil {
 		for _, zone := range cfg.Security.Zones {
 			for _, iface := range zone.Interfaces {
 				ifCfg, ok := cfg.Interfaces.Interfaces[iface]
@@ -9596,7 +9595,89 @@ func (c *CLI) showChassisCluster(args []string) error {
 			}
 		}
 	}
+	return nil
+}
 
+func (c *CLI) showChassisClusterInterfaces() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	cc := cfg.Chassis.Cluster
+	fmt.Println("Control link status: Up")
+	fmt.Println()
+	fmt.Printf("RETH count: %d\n", cc.RethCount)
+	if c.routing != nil {
+		rethNames := c.routing.RethNames()
+		if len(rethNames) > 0 {
+			fmt.Printf("RETH interfaces: %s\n", strings.Join(rethNames, ", "))
+		}
+	}
+	fmt.Println()
+	monStatuses := make(map[int][]routing.InterfaceMonitorStatus)
+	if c.routing != nil {
+		monStatuses = c.routing.InterfaceMonitorStatuses()
+	}
+	for _, rg := range cc.RedundancyGroups {
+		if len(rg.InterfaceMonitors) == 0 {
+			continue
+		}
+		fmt.Printf("Interface monitoring for redundancy group %d:\n", rg.ID)
+		fmt.Printf("  %-20s %-8s %s\n", "Interface", "Weight", "Status")
+		if statuses, ok := monStatuses[rg.ID]; ok {
+			for _, st := range statuses {
+				state := "Up"
+				if !st.Up {
+					state = "Down"
+				}
+				fmt.Printf("  %-20s %-8d %s\n", st.Interface, st.Weight, state)
+			}
+		} else {
+			for _, mon := range rg.InterfaceMonitors {
+				fmt.Printf("  %-20s %-8d %s\n", mon.Interface, mon.Weight, "Unknown")
+			}
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *CLI) showChassisClusterInformation() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	cc := cfg.Chassis.Cluster
+	hbInterval := cc.HeartbeatInterval
+	if hbInterval == 0 {
+		hbInterval = 1000
+	}
+	hbThreshold := cc.HeartbeatThreshold
+	if hbThreshold == 0 {
+		hbThreshold = 3
+	}
+	fmt.Printf("Cluster ID: %d\n", cc.ClusterID)
+	fmt.Printf("Node ID: %d\n", cc.NodeID)
+	fmt.Printf("RETH count: %d\n", cc.RethCount)
+	fmt.Printf("Heartbeat interval: %d ms\n", hbInterval)
+	fmt.Printf("Heartbeat threshold: %d\n", hbThreshold)
+	fmt.Printf("Redundancy groups: %d\n", len(cc.RedundancyGroups))
+	return nil
+}
+
+func (c *CLI) showChassisClusterStatistics() error {
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	states := c.cluster.GroupStates()
+	fmt.Println("Cluster statistics:")
+	for _, rg := range states {
+		fmt.Printf("  Redundancy group %d: failover count %d, weight %d\n",
+			rg.GroupID, rg.FailoverCount, rg.Weight)
+	}
 	return nil
 }
 
@@ -10217,6 +10298,8 @@ func (c *CLI) handleRequest(args []string) error {
 	}
 
 	switch args[0] {
+	case "chassis":
+		return c.handleRequestChassis(args[1:])
 	case "dhcp":
 		return c.handleRequestDHCP(args[1:])
 	case "protocols":
@@ -10228,6 +10311,56 @@ func (c *CLI) handleRequest(args []string) error {
 	default:
 		return fmt.Errorf("unknown request target: %s", args[0])
 	}
+}
+
+func (c *CLI) handleRequestChassis(args []string) error {
+	if len(args) == 0 || args[0] != "cluster" {
+		fmt.Println("request chassis:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children))
+		return nil
+	}
+	args = args[1:] // consume "cluster"
+	if len(args) == 0 || args[0] != "failover" {
+		fmt.Println("request chassis cluster:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children["cluster"].Children))
+		return nil
+	}
+	args = args[1:] // consume "failover"
+
+	if c.cluster == nil {
+		return fmt.Errorf("cluster not configured")
+	}
+
+	// "request chassis cluster failover reset redundancy-group <N>"
+	if len(args) >= 1 && args[0] == "reset" {
+		if len(args) < 3 || args[1] != "redundancy-group" {
+			return fmt.Errorf("usage: request chassis cluster failover reset redundancy-group <N>")
+		}
+		rgID, err := strconv.Atoi(args[2])
+		if err != nil {
+			return fmt.Errorf("invalid redundancy-group ID: %s", args[2])
+		}
+		if err := c.cluster.ResetFailover(rgID); err != nil {
+			return err
+		}
+		fmt.Printf("Failover reset for redundancy group %d\n", rgID)
+		return nil
+	}
+
+	// "request chassis cluster failover redundancy-group <N>"
+	if len(args) >= 2 && args[0] == "redundancy-group" {
+		rgID, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("invalid redundancy-group ID: %s", args[1])
+		}
+		if err := c.cluster.ManualFailover(rgID); err != nil {
+			return err
+		}
+		fmt.Printf("Manual failover triggered for redundancy group %d\n", rgID)
+		return nil
+	}
+
+	return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N>")
 }
 
 func (c *CLI) handleRequestDHCP(args []string) error {

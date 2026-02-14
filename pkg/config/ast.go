@@ -1061,12 +1061,17 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	}},
 	"chassis": {children: map[string]*schemaNode{
 		"cluster": {children: map[string]*schemaNode{
-			"reth-count": {args: 1, children: nil},
+			"cluster-id":          {args: 1, children: nil},
+			"node":                {args: 1, children: nil},
+			"reth-count":          {args: 1, children: nil},
+			"heartbeat-interval":  {args: 1, children: nil},
+			"heartbeat-threshold": {args: 1, children: nil},
 			"redundancy-group": {args: 1, children: map[string]*schemaNode{
 				"node": {args: 1, children: map[string]*schemaNode{
 					"priority": {args: 1, children: nil},
 				}},
 				"gratuitous-arp-count": {args: 1, children: nil},
+				"preempt":              {children: nil},
 				"interface-monitor":    {children: nil},
 			}},
 		}},

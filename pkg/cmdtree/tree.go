@@ -40,7 +40,12 @@ var OperationalTree = map[string]*Node{
 	}},
 	"show": {Desc: "Show information", Children: map[string]*Node{
 		"chassis": {Desc: "Show hardware information", Children: map[string]*Node{
-			"cluster":     {Desc: "Show cluster/HA status"},
+			"cluster": {Desc: "Show cluster/HA status", Children: map[string]*Node{
+			"status":      {Desc: "Show cluster node status"},
+			"interfaces":  {Desc: "Show cluster interfaces"},
+			"information": {Desc: "Show cluster configuration details"},
+			"statistics":  {Desc: "Show cluster statistics"},
+		}},
 			"environment": {Desc: "Show temperature and power"},
 			"hardware":    {Desc: "Show hardware details"},
 		}},
@@ -365,6 +370,16 @@ var OperationalTree = map[string]*Node{
 		}},
 	}},
 	"request": {Desc: "Perform system operations", Children: map[string]*Node{
+		"chassis": {Desc: "Chassis operations", Children: map[string]*Node{
+			"cluster": {Desc: "Cluster operations", Children: map[string]*Node{
+				"failover": {Desc: "Trigger cluster failover", Children: map[string]*Node{
+					"redundancy-group": {Desc: "Failover a specific redundancy group"},
+					"reset":            {Desc: "Reset manual failover", Children: map[string]*Node{
+						"redundancy-group": {Desc: "Reset failover for a redundancy group"},
+					}},
+				}},
+			}},
+		}},
 		"dhcp": {Desc: "DHCP operations", Children: map[string]*Node{
 			"renew": {Desc: "Renew DHCP lease on an interface"},
 		}},

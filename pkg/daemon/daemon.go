@@ -21,6 +21,7 @@ import (
 
 	"github.com/psaab/bpfrx/pkg/api"
 	"github.com/psaab/bpfrx/pkg/cli"
+	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/eventengine"
@@ -78,6 +79,7 @@ type Daemon struct {
 	snmpAgent    *snmp.Agent
 	lldpMgr      *lldp.Manager
 	scheduler    *scheduler.Scheduler
+	cluster      *cluster.Manager
 	slogHandler  *logging.SyslogSlogHandler
 	traceWriter   *logging.TraceWriter
 	eventReader   *logging.EventReader
@@ -134,6 +136,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.radvd = radvd.New()
 		d.networkd = networkd.New()
 		d.dhcpServer = dhcpserver.New()
+	}
+
+	// Initialize cluster manager if configured.
+	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
+		cc := cfg.Chassis.Cluster
+		d.cluster = cluster.NewManager(cc.NodeID, cc.ClusterID)
+		d.cluster.UpdateConfig(cc)
+		slog.Info("cluster manager initialized",
+			"node", cc.NodeID, "cluster", cc.ClusterID)
 	}
 
 	// Enable IP forwarding — required for the firewall to route packets.
@@ -464,6 +475,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			Routing:  d.routing,
 			FRR:      d.frr,
 			IPsec:    d.ipsec,
+			Cluster:    d.cluster,
 			DHCP:       d.dhcp,
 			DHCPServer: d.dhcpServer,
 			RPMResultsFn: func() []*rpm.ProbeResult {
@@ -500,7 +512,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start interactive CLI or block in daemon mode
 	var runErr error
 	if isInteractive() {
-		shell := cli.New(d.store, d.dp, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay)
+		shell := cli.New(d.store, d.dp, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
 		shell.SetVersion(d.opts.Version)
 		shell.SetRPMResultsFn(func() []*rpm.ProbeResult {
 			if d.rpm != nil {
@@ -979,6 +991,20 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	if d.routing != nil && cfg.Chassis.Cluster != nil &&
 		len(cfg.Chassis.Cluster.RedundancyGroups) > 0 {
 		d.routing.ApplyInterfaceMonitors(cfg.Chassis.Cluster.RedundancyGroups)
+	}
+
+	// 19. Update chassis cluster state machine
+	if d.cluster != nil && cfg.Chassis.Cluster != nil {
+		d.cluster.UpdateConfig(cfg.Chassis.Cluster)
+		// Feed interface monitor statuses into cluster weight calculation
+		if d.routing != nil {
+			monStatuses := d.routing.InterfaceMonitorStatuses()
+			for rgID, statuses := range monStatuses {
+				for _, st := range statuses {
+					d.cluster.SetMonitorWeight(rgID, st.Interface, !st.Up, st.Weight)
+				}
+			}
+		}
 	}
 }
 

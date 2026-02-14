@@ -26,15 +26,20 @@ type ChassisConfig struct {
 
 // ClusterConfig defines chassis cluster settings for HA.
 type ClusterConfig struct {
-	RethCount        int
-	RedundancyGroups []*RedundancyGroup
+	ClusterID          int
+	NodeID             int
+	RethCount          int
+	HeartbeatInterval  int // milliseconds, 0=default(1000)
+	HeartbeatThreshold int // missed heartbeats before lost, 0=default(3)
+	RedundancyGroups   []*RedundancyGroup
 }
 
 // RedundancyGroup defines a cluster redundancy group.
 type RedundancyGroup struct {
 	ID                 int
-	NodePriorities     map[int]int        // node-id -> priority
+	NodePriorities     map[int]int // node-id -> priority
 	GratuitousARPCount int
+	Preempt            bool
 	InterfaceMonitors  []*InterfaceMonitor
 }
 
