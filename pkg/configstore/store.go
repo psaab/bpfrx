@@ -40,6 +40,10 @@ type Store struct {
 	// Exclusive configuration mode
 	exclusiveHolder string // who holds exclusive lock (empty = unlocked)
 
+	// Config lock tracking: session ID of the holder (for auto-release on disconnect)
+	configHolder string    // unique session ID of the config lock holder
+	configLockAt time.Time // when the lock was acquired
+
 	// Edit path for hierarchical navigation (edit/top/up)
 	editPath []string
 
@@ -102,14 +106,26 @@ func (s *Store) Save() error {
 // EnterConfigure enters configuration mode by cloning the active config.
 // Returns an error if another session is already in config mode.
 func (s *Store) EnterConfigure() error {
+	return s.EnterConfigureSession("")
+}
+
+// EnterConfigureSession enters configuration mode with a session identifier.
+// If the same session already holds the lock, it's a no-op.
+func (s *Store) EnterConfigureSession(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.configDir {
+		// Allow re-entry by same session.
+		if sessionID != "" && s.configHolder == sessionID {
+			return nil
+		}
 		return fmt.Errorf("configuration is locked by another user")
 	}
 	s.candidate = s.active.Clone()
 	s.configDir = true
 	s.dirty = false
+	s.configHolder = sessionID
+	s.configLockAt = time.Now()
 	return nil
 }
 
@@ -124,7 +140,54 @@ func (s *Store) EnterConfigureExclusive(holder string) error {
 	s.configDir = true
 	s.dirty = false
 	s.exclusiveHolder = holder
+	s.configLockAt = time.Now()
 	return nil
+}
+
+// ExitConfigureSession exits configuration mode only if the given session holds
+// the lock. Returns true if the lock was released.
+func (s *Store) ExitConfigureSession(sessionID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.configDir {
+		return false
+	}
+	if sessionID != "" && s.configHolder != sessionID {
+		return false
+	}
+	s.candidate = nil
+	s.configDir = false
+	s.dirty = false
+	s.exclusiveHolder = ""
+	s.configHolder = ""
+	s.editPath = nil
+	return true
+}
+
+// ForceExitConfigure exits configuration mode regardless of who holds the lock.
+// Used for stale lock cleanup.
+func (s *Store) ForceExitConfigure() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.configDir {
+		return
+	}
+	slog.Warn("force-releasing stale config lock", "holder", s.configHolder,
+		"held_for", time.Since(s.configLockAt).Round(time.Second))
+	s.candidate = nil
+	s.configDir = false
+	s.dirty = false
+	s.exclusiveHolder = ""
+	s.configHolder = ""
+	s.editPath = nil
+}
+
+// ConfigHolder returns the session ID of the current config lock holder
+// and whether the lock is held.
+func (s *Store) ConfigHolder() (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.configHolder, s.configDir
 }
 
 // IsExclusiveLocked returns true if exclusive mode is active.

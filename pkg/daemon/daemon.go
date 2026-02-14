@@ -178,8 +178,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
-	// Handle signals for clean shutdown
-	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
+	// Handle signals for clean shutdown.
+	// In interactive mode, only SIGTERM triggers shutdown — SIGINT is handled
+	// by the CLI for command cancellation (Ctrl-C).
+	// In daemon mode, both SIGTERM and SIGINT trigger shutdown.
+	var stop context.CancelFunc
+	if isInteractive() {
+		ctx, stop = signal.NotifyContext(ctx, syscall.SIGTERM)
+	} else {
+		ctx, stop = signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
+	}
 	defer stop()
 
 	// Create event buffer (shared between event reader and CLI)

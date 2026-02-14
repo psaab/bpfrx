@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -366,7 +367,36 @@ func (c *CLI) Run() error {
 	fmt.Println("Type '?' for help")
 	fmt.Println()
 
+	// Catch SIGINT to prevent process termination.
+	// readline handles ^C during input (returns ErrInterrupt).
+	// During dispatch, this absorbs the signal so it doesn't kill the daemon.
+	// Double Ctrl-C within 2s exits the CLI.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+
+	exitCh := make(chan struct{})
+	go func() {
+		var lastInterrupt time.Time
+		for range sigCh {
+			now := time.Now()
+			if now.Sub(lastInterrupt) < 2*time.Second {
+				if c.store.InConfigMode() {
+					c.store.ExitConfigure()
+				}
+				close(exitCh)
+				return
+			}
+			lastInterrupt = now
+		}
+	}()
+
 	for {
+		select {
+		case <-exitCh:
+			return nil
+		default:
+		}
 		if c.store.IsConfirmPending() {
 			fmt.Println("[commit confirmed pending - issue 'commit' to confirm]")
 		}

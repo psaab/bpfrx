@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	"github.com/vishvananda/netlink"
@@ -116,7 +117,9 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("gRPC listen: %w", err)
 	}
 
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(
+		grpc.UnaryInterceptor(s.configLockInterceptor),
+	)
 	pb.RegisterBpfrxServiceServer(srv, s)
 
 	errCh := make(chan error, 1)
@@ -138,14 +141,42 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
+// configLockInterceptor auto-releases stale config locks when a gRPC client
+// disconnects (context cancelled) without calling ExitConfigure.
+func (s *Server) configLockInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	resp, err := handler(ctx, req)
+
+	// If the client's context was cancelled (disconnect, Ctrl-C), release any
+	// config lock held by this connection.
+	if ctx.Err() != nil {
+		sessionID := peerSessionID(ctx)
+		if sessionID != "" {
+			if s.store.ExitConfigureSession(sessionID) {
+				slog.Info("auto-released config lock on client disconnect", "session", sessionID)
+			}
+		}
+	}
+	return resp, err
+}
+
+// peerSessionID derives a stable session identifier from the gRPC peer address.
+func peerSessionID(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return ""
+	}
+	return p.Addr.String()
+}
+
 // --- Config lifecycle RPCs ---
 
-func (s *Server) EnterConfigure(_ context.Context, req *pb.EnterConfigureRequest) (*pb.EnterConfigureResponse, error) {
+func (s *Server) EnterConfigure(ctx context.Context, req *pb.EnterConfigureRequest) (*pb.EnterConfigureResponse, error) {
+	sessionID := peerSessionID(ctx)
 	var err error
 	if req.Exclusive {
-		err = s.store.EnterConfigureExclusive("grpc")
+		err = s.store.EnterConfigureExclusive(sessionID)
 	} else {
-		err = s.store.EnterConfigure()
+		err = s.store.EnterConfigureSession(sessionID)
 	}
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
@@ -153,8 +184,9 @@ func (s *Server) EnterConfigure(_ context.Context, req *pb.EnterConfigureRequest
 	return &pb.EnterConfigureResponse{}, nil
 }
 
-func (s *Server) ExitConfigure(_ context.Context, _ *pb.ExitConfigureRequest) (*pb.ExitConfigureResponse, error) {
-	s.store.ExitConfigure()
+func (s *Server) ExitConfigure(ctx context.Context, _ *pb.ExitConfigureRequest) (*pb.ExitConfigureResponse, error) {
+	sessionID := peerSessionID(ctx)
+	s.store.ExitConfigureSession(sessionID)
 	return &pb.ExitConfigureResponse{}, nil
 }
 

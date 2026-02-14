@@ -55,9 +55,20 @@ func (e *Engine) Apply(policies []*config.EventPolicy) {
 
 // HandleEvent is the callback for RPM events.
 func (e *Engine) HandleEvent(ev rpm.Event) {
+	// Evaluate under lock, but execute commands without lock to avoid
+	// deadlock: executeCommands → applyFn → applyConfig → Apply() → e.mu.Lock.
+	triggered := e.evaluateEvent(ev)
+	for _, pol := range triggered {
+		e.executeCommands(pol)
+	}
+}
+
+// evaluateEvent checks policies under lock and returns any that should trigger.
+func (e *Engine) evaluateEvent(ev rpm.Event) []*config.EventPolicy {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	var triggered []*config.EventPolicy
 	for _, pol := range e.policies {
 		if !e.eventMatches(pol, ev) {
 			continue
@@ -84,15 +95,15 @@ func (e *Engine) HandleEvent(ev rpm.Event) {
 		}
 		e.lastTrigger[pol.Name] = now
 
-		// Policy triggered — execute config changes
 		slog.Info("event-options policy triggered",
 			"policy", pol.Name,
 			"event", ev.Name,
 			"test-owner", ev.TestOwner,
 			"test-name", ev.TestName)
 
-		e.executeCommands(pol)
+		triggered = append(triggered, pol)
 	}
+	return triggered
 }
 
 // eventMatches checks if the event name is in the policy's event list.

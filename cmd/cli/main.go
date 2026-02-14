@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chzyer/readline"
@@ -112,6 +114,34 @@ func main() {
 	fmt.Println("Type '?' for help")
 	fmt.Println()
 
+	// Handle SIGINT: first press cancels running command, second exits CLI.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	var lastInterrupt time.Time
+	go func() {
+		for range sigCh {
+			// If a command is running, cancel it.
+			if c.cancelCmd() {
+				fmt.Fprintln(os.Stderr, "\n^C (command cancelled)")
+				continue
+			}
+			// No command running — double Ctrl-C within 2s exits.
+			now := time.Now()
+			if now.Sub(lastInterrupt) < 2*time.Second {
+				// Clean exit: leave config mode if active.
+				if c.configMode {
+					_, _ = client.ExitConfigure(context.Background(), &pb.ExitConfigureRequest{})
+				}
+				os.Exit(0)
+			}
+			lastInterrupt = now
+			fmt.Fprintln(os.Stderr, "\n^C (press again within 2s to exit)")
+			// Refresh prompt.
+			rl.Refresh()
+		}
+	}()
+	defer signal.Stop(sigCh)
+
 	for {
 		// Show commit confirmed reminder
 		if c.configMode {
@@ -138,9 +168,15 @@ func main() {
 			continue
 		}
 
-		if err := c.dispatch(line); err != nil {
+		c.startCmd()
+		err = c.dispatch(line)
+		c.endCmd()
+		if err != nil {
 			if err == errExit {
 				break
+			}
+			if err == context.Canceled {
+				continue // command was cancelled by Ctrl-C
 			}
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		}
@@ -161,6 +197,51 @@ type ctl struct {
 	username   string
 	configMode bool
 	editPath   []string
+
+	// Command cancellation: Ctrl-C during a running command cancels it.
+	cmdMu     sync.Mutex
+	cmdCtx    context.Context    // per-command context, cancelled by Ctrl-C
+	cmdCancel context.CancelFunc // non-nil while a command is executing
+}
+
+// startCmd creates a cancellable context for the current command.
+// Must call endCmd() when the command finishes.
+func (c *ctl) startCmd() {
+	c.cmdMu.Lock()
+	c.cmdCtx, c.cmdCancel = context.WithCancel(context.Background())
+	c.cmdMu.Unlock()
+}
+
+// endCmd clears the per-command context.
+func (c *ctl) endCmd() {
+	c.cmdMu.Lock()
+	if c.cmdCancel != nil {
+		c.cmdCancel()
+	}
+	c.cmdCtx = nil
+	c.cmdCancel = nil
+	c.cmdMu.Unlock()
+}
+
+// ctx returns the current command context, or background if none.
+func (c *ctl) ctx() context.Context {
+	c.cmdMu.Lock()
+	defer c.cmdMu.Unlock()
+	if c.cmdCtx != nil {
+		return c.cmdCtx
+	}
+	return context.Background()
+}
+
+// cancelCmd cancels any running command. Returns true if a command was cancelled.
+func (c *ctl) cancelCmd() bool {
+	c.cmdMu.Lock()
+	defer c.cmdMu.Unlock()
+	if c.cmdCancel != nil {
+		c.cmdCancel()
+		return true
+	}
+	return false
 }
 
 func (c *ctl) dispatch(line string) error {
@@ -284,7 +365,7 @@ func (c *ctl) dispatchOperational(line string) error {
 	switch parts[0] {
 	case "configure":
 		exclusive := len(parts) >= 2 && parts[1] == "exclusive"
-		_, err := c.client.EnterConfigure(context.Background(), &pb.EnterConfigureRequest{
+		_, err := c.client.EnterConfigure(c.ctx(), &pb.EnterConfigureRequest{
 			Exclusive: exclusive,
 		})
 		if err != nil {
@@ -376,7 +457,7 @@ func (c *ctl) dispatchConfig(line string) error {
 			return fmt.Errorf("set: missing path")
 		}
 		fullPath := append(append([]string{}, c.editPath...), parts[1:]...)
-		_, err := c.client.Set(context.Background(), &pb.SetRequest{
+		_, err := c.client.Set(c.ctx(), &pb.SetRequest{
 			Input: strings.Join(fullPath, " "),
 		})
 		if err != nil {
@@ -389,7 +470,7 @@ func (c *ctl) dispatchConfig(line string) error {
 			return fmt.Errorf("delete: missing path")
 		}
 		fullPath := append(append([]string{}, c.editPath...), parts[1:]...)
-		_, err := c.client.Delete(context.Background(), &pb.DeleteRequest{
+		_, err := c.client.Delete(c.ctx(), &pb.DeleteRequest{
 			Input: strings.Join(fullPath, " "),
 		})
 		if err != nil {
@@ -416,7 +497,7 @@ func (c *ctl) dispatchConfig(line string) error {
 			dstParts = append(append([]string{}, c.editPath...), dstParts...)
 		}
 		fullInput := parts[0] + " " + strings.Join(srcParts, " ") + " to " + strings.Join(dstParts, " ")
-		_, err := c.client.Set(context.Background(), &pb.SetRequest{Input: fullInput})
+		_, err := c.client.Set(c.ctx(), &pb.SetRequest{Input: fullInput})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -435,7 +516,7 @@ func (c *ctl) dispatchConfig(line string) error {
 				n = int32(v)
 			}
 		}
-		_, err := c.client.Rollback(context.Background(), &pb.RollbackRequest{N: n})
+		_, err := c.client.Rollback(c.ctx(), &pb.RollbackRequest{N: n})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -452,7 +533,7 @@ func (c *ctl) dispatchConfig(line string) error {
 		return c.dispatchOperational(strings.Join(parts[1:], " "))
 
 	case "exit", "quit":
-		_, _ = c.client.ExitConfigure(context.Background(), &pb.ExitConfigureRequest{})
+		_, _ = c.client.ExitConfigure(c.ctx(), &pb.ExitConfigureRequest{})
 		c.configMode = false
 		c.editPath = nil
 		c.rl.SetPrompt(c.operationalPrompt())
@@ -518,7 +599,7 @@ func (c *ctl) handleShow(args []string) error {
 			}
 			path = append(path, a)
 		}
-		resp, err := c.client.ShowConfig(context.Background(), &pb.ShowConfigRequest{
+		resp, err := c.client.ShowConfig(c.ctx(), &pb.ShowConfigRequest{
 			Format: format,
 			Target: pb.ConfigTarget_ACTIVE,
 			Path:   path,
@@ -806,13 +887,13 @@ func (c *ctl) handleShowSecurity(args []string) error {
 }
 
 func (c *ctl) showZones() error {
-	resp, err := c.client.GetZones(context.Background(), &pb.GetZonesRequest{})
+	resp, err := c.client.GetZones(c.ctx(), &pb.GetZonesRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
 
 	// Fetch policies for cross-reference
-	polResp, _ := c.client.GetPolicies(context.Background(), &pb.GetPoliciesRequest{})
+	polResp, _ := c.client.GetPolicies(c.ctx(), &pb.GetPoliciesRequest{})
 
 	for _, z := range resp.Zones {
 		if z.Id > 0 {
@@ -864,7 +945,7 @@ func (c *ctl) showZones() error {
 }
 
 func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
-	resp, err := c.client.GetPolicies(context.Background(), &pb.GetPoliciesRequest{})
+	resp, err := c.client.GetPolicies(c.ctx(), &pb.GetPoliciesRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -969,7 +1050,7 @@ func (c *ctl) showFlowSession(args []string) error {
 		}
 	}
 
-	resp, err := c.client.GetSessions(context.Background(), req)
+	resp, err := c.client.GetSessions(c.ctx(), req)
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1039,7 +1120,7 @@ func (c *ctl) showFlowSession(args []string) error {
 }
 
 func (c *ctl) showSessionSummary() error {
-	resp, err := c.client.GetSessionSummary(context.Background(), &pb.GetSessionSummaryRequest{})
+	resp, err := c.client.GetSessionSummary(c.ctx(), &pb.GetSessionSummaryRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1087,7 +1168,7 @@ func (c *ctl) handleShowNAT(args []string) error {
 		if len(args) >= 2 && args[1] == "rule-set" {
 			return c.showNATRuleStats("")
 		}
-		resp, err := c.client.GetNATSource(context.Background(), &pb.GetNATSourceRequest{})
+		resp, err := c.client.GetNATSource(c.ctx(), &pb.GetNATSourceRequest{})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -1118,7 +1199,7 @@ func (c *ctl) handleShowNAT(args []string) error {
 		if len(args) >= 2 && args[1] == "rule-set" {
 			return c.showNATDNATRuleStats("")
 		}
-		resp, err := c.client.GetNATDestination(context.Background(), &pb.GetNATDestinationRequest{})
+		resp, err := c.client.GetNATDestination(c.ctx(), &pb.GetNATDestinationRequest{})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -1186,7 +1267,7 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		return nil
 	}
 
-	resp, err := c.client.MatchPolicies(context.Background(), req)
+	resp, err := c.client.MatchPolicies(c.ctx(), req)
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1206,7 +1287,7 @@ func (c *ctl) showMatchPolicies(args []string) error {
 }
 
 func (c *ctl) showVRRP() error {
-	resp, err := c.client.GetVRRPStatus(context.Background(), &pb.GetVRRPStatusRequest{})
+	resp, err := c.client.GetVRRPStatus(c.ctx(), &pb.GetVRRPStatusRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1235,7 +1316,7 @@ func (c *ctl) showVRRP() error {
 }
 
 func (c *ctl) showNATSourceSummary() error {
-	resp, err := c.client.GetNATPoolStats(context.Background(), &pb.GetNATPoolStatsRequest{})
+	resp, err := c.client.GetNATPoolStats(c.ctx(), &pb.GetNATPoolStatsRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1268,7 +1349,7 @@ func (c *ctl) showNATSourceSummary() error {
 }
 
 func (c *ctl) showNATPoolStats() error {
-	resp, err := c.client.GetNATPoolStats(context.Background(), &pb.GetNATPoolStatsRequest{})
+	resp, err := c.client.GetNATPoolStats(c.ctx(), &pb.GetNATPoolStatsRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1288,7 +1369,7 @@ func (c *ctl) showNATPoolStats() error {
 }
 
 func (c *ctl) showNATRuleStats(ruleSet string) error {
-	resp, err := c.client.GetNATRuleStats(context.Background(), &pb.GetNATRuleStatsRequest{
+	resp, err := c.client.GetNATRuleStats(c.ctx(), &pb.GetNATRuleStatsRequest{
 		RuleSet: ruleSet,
 	})
 	if err != nil {
@@ -1323,7 +1404,7 @@ func (c *ctl) showNATRuleStats(ruleSet string) error {
 }
 
 func (c *ctl) showNATDestinationSummary() error {
-	resp, err := c.client.GetNATDestination(context.Background(), &pb.GetNATDestinationRequest{})
+	resp, err := c.client.GetNATDestination(c.ctx(), &pb.GetNATDestinationRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1345,7 +1426,7 @@ func (c *ctl) showNATDestinationSummary() error {
 	}
 
 	// Get hit counters via rule stats
-	statsResp, err := c.client.GetNATRuleStats(context.Background(), &pb.GetNATRuleStatsRequest{
+	statsResp, err := c.client.GetNATRuleStats(c.ctx(), &pb.GetNATRuleStatsRequest{
 		NatType: "destination",
 	})
 	poolHits := make(map[string]uint64)
@@ -1378,7 +1459,7 @@ func (c *ctl) showNATDestinationSummary() error {
 }
 
 func (c *ctl) showNATDestinationPool() error {
-	resp, err := c.client.GetNATDestination(context.Background(), &pb.GetNATDestinationRequest{})
+	resp, err := c.client.GetNATDestination(c.ctx(), &pb.GetNATDestinationRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1403,7 +1484,7 @@ func (c *ctl) showNATDestinationPool() error {
 }
 
 func (c *ctl) showNATDNATRuleStats(ruleSet string) error {
-	resp, err := c.client.GetNATRuleStats(context.Background(), &pb.GetNATRuleStatsRequest{
+	resp, err := c.client.GetNATRuleStats(c.ctx(), &pb.GetNATRuleStatsRequest{
 		RuleSet: ruleSet,
 		NatType: "destination",
 	})
@@ -1466,7 +1547,7 @@ func (c *ctl) showEvents(args []string) error {
 		}
 	}
 
-	resp, err := c.client.GetEvents(context.Background(), req)
+	resp, err := c.client.GetEvents(c.ctx(), req)
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1492,7 +1573,7 @@ func (c *ctl) showEvents(args []string) error {
 }
 
 func (c *ctl) showStatistics(detail bool) error {
-	resp, err := c.client.GetGlobalStats(context.Background(), &pb.GetGlobalStatsRequest{})
+	resp, err := c.client.GetGlobalStats(c.ctx(), &pb.GetGlobalStatsRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1523,7 +1604,7 @@ func (c *ctl) showStatistics(detail bool) error {
 	}
 
 	// Buffers/map utilization via text topic
-	text, err := c.client.ShowText(context.Background(), &pb.ShowTextRequest{Topic: "buffers"})
+	text, err := c.client.ShowText(c.ctx(), &pb.ShowTextRequest{Topic: "buffers"})
 	if err == nil && text.Output != "" {
 		fmt.Printf("\n%s", text.Output)
 	}
@@ -1531,7 +1612,7 @@ func (c *ctl) showStatistics(detail bool) error {
 }
 
 func (c *ctl) showFlowStatistics() error {
-	resp, err := c.client.GetGlobalStats(context.Background(), &pb.GetGlobalStatsRequest{})
+	resp, err := c.client.GetGlobalStats(c.ctx(), &pb.GetGlobalStatsRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1566,7 +1647,7 @@ func (c *ctl) showFlowStatistics() error {
 
 func (c *ctl) showIKE(args []string) error {
 	if len(args) > 0 && args[0] == "security-associations" {
-		resp, err := c.client.GetIPsecSA(context.Background(), &pb.GetIPsecSARequest{})
+		resp, err := c.client.GetIPsecSA(c.ctx(), &pb.GetIPsecSARequest{})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -1583,7 +1664,7 @@ func (c *ctl) showIKE(args []string) error {
 
 func (c *ctl) showIPsec(args []string) error {
 	if len(args) > 0 && args[0] == "security-associations" {
-		resp, err := c.client.GetIPsecSA(context.Background(), &pb.GetIPsecSARequest{})
+		resp, err := c.client.GetIPsecSA(c.ctx(), &pb.GetIPsecSARequest{})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -1622,7 +1703,7 @@ func (c *ctl) showInterfaces(args []string) error {
 			req.Filter = a
 		}
 	}
-	resp, err := c.client.ShowInterfacesDetail(context.Background(), req)
+	resp, err := c.client.ShowInterfacesDetail(c.ctx(), req)
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1631,7 +1712,7 @@ func (c *ctl) showInterfaces(args []string) error {
 }
 
 func (c *ctl) showDHCPLeases() error {
-	resp, err := c.client.GetDHCPLeases(context.Background(), &pb.GetDHCPLeasesRequest{})
+	resp, err := c.client.GetDHCPLeases(c.ctx(), &pb.GetDHCPLeasesRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1665,7 +1746,7 @@ func (c *ctl) showDHCPLeases() error {
 }
 
 func (c *ctl) showDHCPClientIdentifier() error {
-	resp, err := c.client.GetDHCPClientIdentifiers(context.Background(), &pb.GetDHCPClientIdentifiersRequest{})
+	resp, err := c.client.GetDHCPClientIdentifiers(c.ctx(), &pb.GetDHCPClientIdentifiersRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1685,7 +1766,7 @@ func (c *ctl) showDHCPClientIdentifier() error {
 }
 
 func (c *ctl) showRoutes() error {
-	resp, err := c.client.GetRoutes(context.Background(), &pb.GetRoutesRequest{})
+	resp, err := c.client.GetRoutes(c.ctx(), &pb.GetRoutesRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -1715,7 +1796,7 @@ func (c *ctl) handleShowProtocols(args []string) error {
 				typ = "neighbor-detail"
 			}
 		}
-		resp, err := c.client.GetOSPFStatus(context.Background(), &pb.GetOSPFStatusRequest{Type: typ})
+		resp, err := c.client.GetOSPFStatus(c.ctx(), &pb.GetOSPFStatusRequest{Type: typ})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -1744,7 +1825,7 @@ func (c *ctl) handleShowProtocols(args []string) error {
 				}
 			}
 		}
-		resp, err := c.client.GetBGPStatus(context.Background(), &pb.GetBGPStatusRequest{Type: typ})
+		resp, err := c.client.GetBGPStatus(c.ctx(), &pb.GetBGPStatusRequest{Type: typ})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -1757,7 +1838,7 @@ func (c *ctl) handleShowProtocols(args []string) error {
 		printRemoteTreeHelp("show protocols bfd:", "show", "protocols", "bfd")
 		return nil
 	case "rip":
-		resp, err := c.client.GetRIPStatus(context.Background(), &pb.GetRIPStatusRequest{})
+		resp, err := c.client.GetRIPStatus(c.ctx(), &pb.GetRIPStatusRequest{})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -1771,7 +1852,7 @@ func (c *ctl) handleShowProtocols(args []string) error {
 				typ = "adjacency-detail"
 			}
 		}
-		resp, err := c.client.GetISISStatus(context.Background(), &pb.GetISISStatusRequest{Type: typ})
+		resp, err := c.client.GetISISStatus(c.ctx(), &pb.GetISISStatusRequest{Type: typ})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -1805,7 +1886,7 @@ func (c *ctl) handleShowSystem(args []string) error {
 				if err != nil || n < 1 {
 					return fmt.Errorf("usage: show system rollback compare <N>")
 				}
-				resp, err := c.client.ShowCompare(context.Background(), &pb.ShowCompareRequest{
+				resp, err := c.client.ShowCompare(c.ctx(), &pb.ShowCompareRequest{
 					RollbackN: int32(n),
 				})
 				if err != nil {
@@ -1831,7 +1912,7 @@ func (c *ctl) handleShowSystem(args []string) error {
 				format = pb.ConfigFormat_XML
 			} else if strings.Contains(rest, "compare") {
 				// "show system rollback N compare"
-				resp, err := c.client.ShowCompare(context.Background(), &pb.ShowCompareRequest{
+				resp, err := c.client.ShowCompare(c.ctx(), &pb.ShowCompareRequest{
 					RollbackN: int32(n),
 				})
 				if err != nil {
@@ -1844,7 +1925,7 @@ func (c *ctl) handleShowSystem(args []string) error {
 				}
 				return nil
 			}
-			resp, err := c.client.ShowRollback(context.Background(), &pb.ShowRollbackRequest{
+			resp, err := c.client.ShowRollback(c.ctx(), &pb.ShowRollbackRequest{
 				N:      int32(n),
 				Format: format,
 			})
@@ -1855,7 +1936,7 @@ func (c *ctl) handleShowSystem(args []string) error {
 			return nil
 		}
 
-		resp, err := c.client.ListHistory(context.Background(), &pb.ListHistoryRequest{})
+		resp, err := c.client.ListHistory(c.ctx(), &pb.ListHistoryRequest{})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -1941,14 +2022,14 @@ func (c *ctl) handleConfigShow(args []string) error {
 			if err != nil || n < 1 {
 				return fmt.Errorf("usage: show | compare rollback <N>")
 			}
-			resp, err := c.client.ShowCompare(context.Background(), &pb.ShowCompareRequest{RollbackN: int32(n)})
+			resp, err := c.client.ShowCompare(c.ctx(), &pb.ShowCompareRequest{RollbackN: int32(n)})
 			if err != nil {
 				return fmt.Errorf("%v", err)
 			}
 			fmt.Print(resp.Output)
 			return nil
 		}
-		resp, err := c.client.ShowCompare(context.Background(), &pb.ShowCompareRequest{})
+		resp, err := c.client.ShowCompare(c.ctx(), &pb.ShowCompareRequest{})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -1975,7 +2056,7 @@ func (c *ctl) handleConfigShow(args []string) error {
 		}
 		path = append(path, a)
 	}
-	resp, err := c.client.ShowConfig(context.Background(), &pb.ShowConfigRequest{
+	resp, err := c.client.ShowConfig(c.ctx(), &pb.ShowConfigRequest{
 		Format: format,
 		Target: pb.ConfigTarget_CANDIDATE,
 		Path:   path,
@@ -1989,7 +2070,7 @@ func (c *ctl) handleConfigShow(args []string) error {
 
 func (c *ctl) handleCommit(args []string) error {
 	if len(args) > 0 && args[0] == "check" {
-		_, err := c.client.CommitCheck(context.Background(), &pb.CommitCheckRequest{})
+		_, err := c.client.CommitCheck(c.ctx(), &pb.CommitCheckRequest{})
 		if err != nil {
 			return fmt.Errorf("commit check failed: %v", err)
 		}
@@ -2003,7 +2084,7 @@ func (c *ctl) handleCommit(args []string) error {
 		}
 		desc := strings.Join(args[1:], " ")
 		desc = strings.Trim(desc, "\"'")
-		resp, err := c.client.Commit(context.Background(), &pb.CommitRequest{Comment: desc})
+		resp, err := c.client.Commit(c.ctx(), &pb.CommitRequest{Comment: desc})
 		if err != nil {
 			return fmt.Errorf("commit failed: %v", err)
 		}
@@ -2022,7 +2103,7 @@ func (c *ctl) handleCommit(args []string) error {
 				minutes = int32(v)
 			}
 		}
-		_, err := c.client.CommitConfirmed(context.Background(), &pb.CommitConfirmedRequest{Minutes: minutes})
+		_, err := c.client.CommitConfirmed(c.ctx(), &pb.CommitConfirmedRequest{Minutes: minutes})
 		if err != nil {
 			return fmt.Errorf("commit confirmed failed: %v", err)
 		}
@@ -2030,7 +2111,7 @@ func (c *ctl) handleCommit(args []string) error {
 		return nil
 	}
 
-	resp, err := c.client.Commit(context.Background(), &pb.CommitRequest{})
+	resp, err := c.client.Commit(c.ctx(), &pb.CommitRequest{})
 	if err != nil {
 		return fmt.Errorf("commit failed: %v", err)
 	}
@@ -2072,7 +2153,7 @@ func (c *ctl) handleClear(args []string) error {
 
 func (c *ctl) handleClearInterfaces(args []string) error {
 	if len(args) >= 1 && args[0] == "statistics" {
-		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: "clear-interfaces-statistics",
 		})
 		if err != nil {
@@ -2086,7 +2167,7 @@ func (c *ctl) handleClearInterfaces(args []string) error {
 }
 
 func (c *ctl) handleClearArp() error {
-	resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 		Action: "clear-arp",
 	})
 	if err != nil {
@@ -2101,7 +2182,7 @@ func (c *ctl) handleClearIPv6(args []string) error {
 		printRemoteTreeHelp("clear ipv6:", "clear", "ipv6")
 		return nil
 	}
-	resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 		Action: "clear-ipv6-neighbors",
 	})
 	if err != nil {
@@ -2120,7 +2201,7 @@ func (c *ctl) handleClearSecurity(args []string) error {
 	switch args[0] {
 	case "nat":
 		if len(args) >= 3 && args[1] == "source" && args[2] == "persistent-nat-table" {
-			resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+			resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 				Action: "clear-persistent-nat",
 			})
 			if err != nil {
@@ -2130,7 +2211,7 @@ func (c *ctl) handleClearSecurity(args []string) error {
 			return nil
 		}
 		if len(args) >= 2 && args[1] == "statistics" {
-			resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+			resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 				Action: "clear-nat-counters",
 			})
 			if err != nil {
@@ -2179,7 +2260,7 @@ func (c *ctl) handleClearSecurity(args []string) error {
 				req.Application = args[i]
 			}
 		}
-		resp, err := c.client.ClearSessions(context.Background(), req)
+		resp, err := c.client.ClearSessions(c.ctx(), req)
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -2188,7 +2269,7 @@ func (c *ctl) handleClearSecurity(args []string) error {
 
 	case "policies":
 		if len(args) >= 2 && args[1] == "hit-count" {
-			resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+			resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 				Action: "clear-policy-counters",
 			})
 			if err != nil {
@@ -2200,7 +2281,7 @@ func (c *ctl) handleClearSecurity(args []string) error {
 		return fmt.Errorf("usage: clear security policies hit-count")
 
 	case "counters":
-		_, err := c.client.ClearCounters(context.Background(), &pb.ClearCountersRequest{})
+		_, err := c.client.ClearCounters(c.ctx(), &pb.ClearCountersRequest{})
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
@@ -2218,7 +2299,7 @@ func (c *ctl) handleClearFirewall(args []string) error {
 		printRemoteTreeHelp("clear firewall:", "clear", "firewall")
 		return nil
 	}
-	resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 		Action: "clear-firewall-counters",
 	})
 	if err != nil {
@@ -2239,7 +2320,7 @@ func (c *ctl) handleClearDHCP(args []string) error {
 		req.Interface = args[2]
 	}
 
-	resp, err := c.client.ClearDHCPClientIdentifier(context.Background(), req)
+	resp, err := c.client.ClearDHCPClientIdentifier(c.ctx(), req)
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -2254,7 +2335,7 @@ func (c *ctl) showText(topic string) error {
 }
 
 func (c *ctl) showTextFiltered(topic, filter string) error {
-	resp, err := c.client.ShowText(context.Background(), &pb.ShowTextRequest{
+	resp, err := c.client.ShowText(c.ctx(), &pb.ShowTextRequest{
 		Topic:  topic,
 		Filter: filter,
 	})
@@ -2266,7 +2347,7 @@ func (c *ctl) showTextFiltered(topic, filter string) error {
 }
 
 func (c *ctl) showSystemInfo(typ string) error {
-	resp, err := c.client.GetSystemInfo(context.Background(), &pb.GetSystemInfoRequest{Type: typ})
+	resp, err := c.client.GetSystemInfo(c.ctx(), &pb.GetSystemInfoRequest{Type: typ})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -2275,7 +2356,7 @@ func (c *ctl) showSystemInfo(typ string) error {
 }
 
 func (c *ctl) showPoliciesBrief() error {
-	resp, err := c.client.GetPolicies(context.Background(), &pb.GetPoliciesRequest{})
+	resp, err := c.client.GetPolicies(c.ctx(), &pb.GetPoliciesRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -2328,7 +2409,7 @@ func (c *ctl) handleRequest(args []string) error {
 			fmt.Printf("%s cancelled\n", strings.Title(args[1]))
 			return nil
 		}
-		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: args[1],
 		})
 		if err != nil {
@@ -2346,7 +2427,7 @@ func (c *ctl) handleRequest(args []string) error {
 			fmt.Println("Zeroize cancelled")
 			return nil
 		}
-		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: "zeroize",
 		})
 		if err != nil {
@@ -2377,7 +2458,7 @@ func (c *ctl) handleRequestChassis(args []string) error {
 			return fmt.Errorf("usage: request chassis cluster failover reset redundancy-group <N>")
 		}
 		action := "cluster-failover-reset:" + args[2]
-		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: action,
 		})
 		if err != nil {
@@ -2390,7 +2471,7 @@ func (c *ctl) handleRequestChassis(args []string) error {
 	// "request chassis cluster failover redundancy-group <N>"
 	if len(args) >= 2 && args[0] == "redundancy-group" {
 		action := "cluster-failover:" + args[1]
-		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: action,
 		})
 		if err != nil {
@@ -2411,7 +2492,7 @@ func (c *ctl) handleRequestDHCP(args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: request dhcp renew <interface>")
 	}
-	resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 		Action: "dhcp-renew",
 		Target: args[1],
 	})
@@ -2433,7 +2514,7 @@ func (c *ctl) handleRequestProtocols(args []string) error {
 			printRemoteTreeHelp("request protocols ospf:", "request", "protocols", "ospf")
 			return nil
 		}
-		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: "ospf-clear",
 		})
 		if err != nil {
@@ -2446,7 +2527,7 @@ func (c *ctl) handleRequestProtocols(args []string) error {
 			printRemoteTreeHelp("request protocols bgp:", "request", "protocols", "bgp")
 			return nil
 		}
-		resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: "bgp-clear",
 		})
 		if err != nil {
@@ -2471,7 +2552,7 @@ func (c *ctl) handleRequestSecurity(args []string) error {
 		printRemoteTreeHelp("request security ipsec sa:", "request", "security", "ipsec", "sa")
 		return nil
 	}
-	resp, err := c.client.SystemAction(context.Background(), &pb.SystemActionRequest{
+	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 		Action: "ipsec-sa-clear",
 	})
 	if err != nil {
@@ -2656,7 +2737,7 @@ func (c *ctl) handleLoad(args []string) error {
 		return fmt.Errorf("load: empty input")
 	}
 
-	_, err := c.client.Load(context.Background(), &pb.LoadRequest{
+	_, err := c.client.Load(c.ctx(), &pb.LoadRequest{
 		Mode:    mode,
 		Content: content,
 	})
