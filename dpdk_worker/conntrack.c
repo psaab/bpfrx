@@ -203,6 +203,171 @@ ct_get_timeout(struct pipeline_ctx *ctx, uint8_t protocol, uint8_t state)
 }
 
 /**
+ * is_icmp_error — Check if the packet is an ICMP error type.
+ * ICMPv4: type 3 (dest unreach), 11 (time exceeded), 12 (param problem)
+ * ICMPv6: type 1 (dest unreach), 3 (time exceeded), 4 (param problem)
+ */
+static inline int
+is_icmp_error(struct pkt_meta *meta)
+{
+	if (meta->protocol == PROTO_ICMP)
+		return (meta->icmp_type == 3 || meta->icmp_type == 11 ||
+		        meta->icmp_type == 12);
+	if (meta->protocol == PROTO_ICMPV6)
+		return (meta->icmp_type == 1 || meta->icmp_type == 3 ||
+		        meta->icmp_type == 4);
+	return 0;
+}
+
+/**
+ * handle_embedded_icmp — Extract the embedded original 5-tuple from an
+ * ICMP error packet and look up the corresponding session.
+ *
+ * ICMP error packets contain the original IP header + first 8 bytes of
+ * the original L4 header, starting 8 bytes into the ICMP data.
+ *
+ * Returns CT_ESTABLISHED if a matching session is found, CT_NEW otherwise.
+ */
+static inline int
+handle_embedded_icmp(struct rte_mbuf *pkt, struct pkt_meta *meta,
+                     struct pipeline_ctx *ctx)
+{
+	uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *);
+	uint32_t data_len = rte_pktmbuf_data_len(pkt);
+	uint64_t now = rte_rdtsc() / rte_get_tsc_hz();
+
+	/* Embedded IP header starts 8 bytes after the ICMP/ICMPv6 header */
+	uint16_t emb_ip_off = meta->l4_offset + 8;
+
+	if (meta->addr_family == AF_INET) {
+		/* Need at least: embedded IPv4 header (20) + L4 ports (8) */
+		if (data_len < (uint32_t)(emb_ip_off + 28))
+			return CT_NEW;
+
+		struct rte_ipv4_hdr *emb_ip =
+			(struct rte_ipv4_hdr *)(data + emb_ip_off);
+		uint8_t emb_proto = emb_ip->next_proto_id;
+		uint8_t emb_ihl = (emb_ip->version_ihl & 0x0F);
+		if (emb_ihl < 5 || emb_ihl > 15)
+			return CT_NEW;
+
+		uint32_t emb_src = emb_ip->src_addr;
+		uint32_t emb_dst = emb_ip->dst_addr;
+
+		/* Embedded L4 ports */
+		uint16_t emb_l4_off = emb_ip_off + emb_ihl * 4;
+		if (data_len < (uint32_t)(emb_l4_off + 4))
+			return CT_NEW;
+
+		uint16_t emb_src_port = 0, emb_dst_port = 0;
+		if (emb_proto == PROTO_TCP || emb_proto == PROTO_UDP) {
+			emb_src_port = *(uint16_t *)(data + emb_l4_off);
+			emb_dst_port = *(uint16_t *)(data + emb_l4_off + 2);
+		} else if (emb_proto == PROTO_ICMP) {
+			if (data_len < (uint32_t)(emb_l4_off + 6))
+				return CT_NEW;
+			emb_src_port = *(uint16_t *)(data + emb_l4_off + 4);
+			emb_dst_port = emb_src_port;
+		}
+
+		/* Look up the embedded 5-tuple in the session table */
+		struct session_key sk = {
+			.src_ip = emb_src,
+			.dst_ip = emb_dst,
+			.src_port = emb_src_port,
+			.dst_port = emb_dst_port,
+			.protocol = emb_proto,
+		};
+
+		int pos = rte_hash_lookup(ctx->shm->sessions_v4, &sk);
+		if (pos < 0) {
+			/* Try reverse */
+			struct session_key rsk = {
+				.src_ip = emb_dst,
+				.dst_ip = emb_src,
+				.src_port = emb_dst_port,
+				.dst_port = emb_src_port,
+				.protocol = emb_proto,
+			};
+			pos = rte_hash_lookup(ctx->shm->sessions_v4, &rsk);
+		}
+		if (pos < 0)
+			return CT_NEW;
+
+		/* Touch session to prevent GC expiry */
+		ctx->shm->session_values_v4[pos].last_seen = now;
+		return CT_ESTABLISHED;
+
+	} else if (meta->addr_family == AF_INET6) {
+		/* Need at least: embedded IPv6 header (40) + L4 ports (8) */
+		if (data_len < (uint32_t)(emb_ip_off + 48))
+			return CT_NEW;
+
+		struct rte_ipv6_hdr *emb_ip6 =
+			(struct rte_ipv6_hdr *)(data + emb_ip_off);
+		uint8_t emb_proto = emb_ip6->proto;
+
+		/* Only handle direct L4 protocols (no ext header walking) */
+		if (emb_proto != PROTO_TCP && emb_proto != PROTO_UDP &&
+		    emb_proto != PROTO_ICMPV6)
+			return CT_NEW;
+
+		uint8_t emb_src[16], emb_dst[16];
+		memcpy(emb_src, &emb_ip6->src_addr, 16);
+		memcpy(emb_dst, &emb_ip6->dst_addr, 16);
+
+		/* Embedded L4 ports (40 bytes after embedded IPv6 header) */
+		uint16_t emb_l4_off = emb_ip_off + 40;
+		if (data_len < (uint32_t)(emb_l4_off + 4))
+			return CT_NEW;
+
+		uint16_t emb_src_port = 0, emb_dst_port = 0;
+		if (emb_proto == PROTO_TCP || emb_proto == PROTO_UDP) {
+			emb_src_port = *(uint16_t *)(data + emb_l4_off);
+			emb_dst_port = *(uint16_t *)(data + emb_l4_off + 2);
+		} else if (emb_proto == PROTO_ICMPV6) {
+			if (data_len < (uint32_t)(emb_l4_off + 6))
+				return CT_NEW;
+			emb_src_port = *(uint16_t *)(data + emb_l4_off + 4);
+			emb_dst_port = emb_src_port;
+		}
+
+		if (!ctx->shm->sessions_v6)
+			return CT_NEW;
+
+		/* Look up the embedded 5-tuple in the v6 session table */
+		struct session_key_v6 sk6;
+		memset(&sk6, 0, sizeof(sk6));
+		memcpy(sk6.src_ip, emb_src, 16);
+		memcpy(sk6.dst_ip, emb_dst, 16);
+		sk6.src_port = emb_src_port;
+		sk6.dst_port = emb_dst_port;
+		sk6.protocol = emb_proto;
+
+		int pos = rte_hash_lookup(ctx->shm->sessions_v6, &sk6);
+		if (pos < 0) {
+			/* Try reverse */
+			struct session_key_v6 rsk6;
+			memset(&rsk6, 0, sizeof(rsk6));
+			memcpy(rsk6.src_ip, emb_dst, 16);
+			memcpy(rsk6.dst_ip, emb_src, 16);
+			rsk6.src_port = emb_dst_port;
+			rsk6.dst_port = emb_src_port;
+			rsk6.protocol = emb_proto;
+			pos = rte_hash_lookup(ctx->shm->sessions_v6, &rsk6);
+		}
+		if (pos < 0)
+			return CT_NEW;
+
+		/* Touch session to prevent GC expiry */
+		ctx->shm->session_values_v6[pos].last_seen = now;
+		return CT_ESTABLISHED;
+	}
+
+	return CT_NEW;
+}
+
+/**
  * conntrack_lookup — Look up an existing session for this packet.
  *
  * @pkt:  Packet mbuf
@@ -221,10 +386,19 @@ int
 conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
                  struct pipeline_ctx *ctx)
 {
-	(void)pkt;
-
 	if (!ctx->shm->sessions_v4)
 		return CT_NEW;
+
+	/* allow-embedded-icmp: if this is an ICMP error packet and the
+	 * flow config enables embedded ICMP matching, extract the
+	 * original 5-tuple and look it up in the session table. */
+	if (is_icmp_error(meta) &&
+	    ctx->shm->flow_config &&
+	    ctx->shm->flow_config->allow_embedded_icmp) {
+		int emb_result = handle_embedded_icmp(pkt, meta, ctx);
+		if (emb_result == CT_ESTABLISHED)
+			return CT_ESTABLISHED;
+	}
 
 	uint64_t now = rte_rdtsc() / rte_get_tsc_hz();  /* seconds since boot */
 

@@ -148,7 +148,7 @@ forward_packet(struct rte_mbuf *pkt, struct pkt_meta *meta,
 	}
 
 	/* 3. DSCP rewrite (if set by firewall filter) */
-	if (meta->dscp_rewrite != 0) {
+	if (meta->dscp_rewrite != 0xFF) {
 		if (meta->addr_family == AF_INET) {
 			struct rte_ipv4_hdr *ip4 = (struct rte_ipv4_hdr *)(data + meta->l3_offset);
 			uint8_t old_tos = ip4->type_of_service;

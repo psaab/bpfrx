@@ -67,6 +67,7 @@ process_packet(struct rte_mbuf *pkt, struct pipeline_ctx *ctx)
 	int ct_result;
 
 	memset(&meta, 0, sizeof(meta));
+	meta.dscp_rewrite = 0xFF;  /* sentinel: no DSCP rewrite */
 
 	ctr_global_inc(ctx, GLOBAL_CTR_RX_PACKETS);
 
@@ -123,8 +124,27 @@ process_packet(struct rte_mbuf *pkt, struct pipeline_ctx *ctx)
 			ctr_global_inc(ctx, GLOBAL_CTR_DROPS);
 			return;
 		}
-		if (action != ACTION_PERMIT)
+		if (action != ACTION_PERMIT) {
+			/* Zone tcp-rst: send RST for denied TCP packets
+			 * when the ingress zone has tcp_rst enabled */
+			if (action == ACTION_DENY &&
+			    meta.protocol == PROTO_TCP &&
+			    meta.ingress_zone < MAX_ZONES &&
+			    ctx->shm->zone_configs) {
+				struct zone_config *zc =
+					&ctx->shm->zone_configs[meta.ingress_zone];
+				if (zc->tcp_rst) {
+					if (meta.addr_family == AF_INET)
+						send_tcp_rst_v4(pkt, &meta, ctx);
+					else
+						send_tcp_rst_v6(pkt, &meta, ctx);
+					rte_pktmbuf_free(pkt);
+					ctr_global_inc(ctx, GLOBAL_CTR_DROPS);
+					return;
+				}
+			}
 			goto drop;
+		}
 		conntrack_create(pkt, &meta, ctx);
 		ctr_global_inc(ctx, GLOBAL_CTR_SESSIONS_NEW);
 	}
