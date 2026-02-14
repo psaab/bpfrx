@@ -192,7 +192,7 @@ func (s *Server) Load(_ context.Context, req *pb.LoadRequest) (*pb.LoadResponse,
 	return &pb.LoadResponse{}, nil
 }
 
-func (s *Server) Commit(_ context.Context, _ *pb.CommitRequest) (*pb.CommitResponse, error) {
+func (s *Server) Commit(_ context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
 	// If a confirmed commit is pending, confirm it
 	if s.store.IsConfirmPending() {
 		if err := s.store.ConfirmCommit(); err != nil {
@@ -204,7 +204,13 @@ func (s *Server) Commit(_ context.Context, _ *pb.CommitRequest) (*pb.CommitRespo
 	// Capture diff summary before commit (active will change)
 	summary := s.store.CommitDiffSummary()
 
-	compiled, err := s.store.Commit()
+	var compiled *config.Config
+	var err error
+	if req.Comment != "" {
+		compiled, err = s.store.CommitWithDescription(req.Comment)
+	} else {
+		compiled, err = s.store.Commit()
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
@@ -4863,7 +4869,11 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			buf.WriteString("No commit history available\n")
 		} else {
 			for i, e := range entries {
-				fmt.Fprintf(&buf, "  %d  %s  %s\n", i, e.Timestamp.Format("2006-01-02 15:04:05"), e.Action)
+				detail := ""
+				if e.Detail != "" {
+					detail = "  " + e.Detail
+				}
+				fmt.Fprintf(&buf, "  %d  %s  %s%s\n", i, e.Timestamp.Format("2006-01-02 15:04:05"), e.Action, detail)
 			}
 		}
 
@@ -6363,6 +6373,60 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			v4, v6 := s.dp.SessionCount()
 			if v4 > 0 || v6 > 0 {
 				fmt.Fprintf(&buf, "\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
+			}
+		} else {
+			buf.WriteString("Dataplane not loaded\n")
+		}
+
+	case "buffers-detail":
+		if s.dp != nil {
+			stats := s.dp.GetMapStats()
+			if len(stats) == 0 {
+				buf.WriteString("No BPF maps available\n")
+			} else {
+				type mapDetail struct {
+					name      string
+					mapType   string
+					max       uint32
+					used      uint32
+					keySize   uint32
+					valueSize uint32
+					pct       float64
+				}
+				var details []mapDetail
+				for _, st := range stats {
+					if st.Type == "Array" || st.Type == "PerCPUArray" {
+						continue
+					}
+					pct := float64(0)
+					if st.MaxEntries > 0 {
+						pct = float64(st.UsedCount) / float64(st.MaxEntries) * 100
+					}
+					details = append(details, mapDetail{
+						name: st.Name, mapType: st.Type, max: st.MaxEntries,
+						used: st.UsedCount, keySize: st.KeySize, valueSize: st.ValueSize, pct: pct,
+					})
+				}
+				sort.Slice(details, func(i, j int) bool {
+					return details[i].pct > details[j].pct
+				})
+				buf.WriteString("BPF Map Details (sorted by utilization):\n\n")
+				for _, d := range details {
+					sts := "OK"
+					if d.pct >= 90 {
+						sts = "CRITICAL"
+					} else if d.pct >= 80 {
+						sts = "WARNING"
+					}
+					fmt.Fprintf(&buf, "Map: %s\n", d.name)
+					fmt.Fprintf(&buf, "  Type: %s, Max: %d, Used: %d, Usage: %.1f%%\n", d.mapType, d.max, d.used, d.pct)
+					fmt.Fprintf(&buf, "  Key size: %d bytes, Value size: %d bytes\n", d.keySize, d.valueSize)
+					fmt.Fprintf(&buf, "  Status: %s\n\n", sts)
+				}
+			}
+			v4, v6 := s.dp.SessionCount()
+			if v4 > 0 || v6 > 0 {
+				fmt.Fprintf(&buf, "Active sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
 			}
 		} else {
 			buf.WriteString("Dataplane not loaded\n")

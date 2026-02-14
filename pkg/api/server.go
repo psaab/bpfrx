@@ -126,8 +126,12 @@ func NewServer(cfg Config) *Server {
 	// Interfaces detail
 	mux.HandleFunc("GET /api/v1/interfaces/detail", s.interfacesDetailHandler)
 
+	// Session zone-pair summary
+	mux.HandleFunc("GET /api/v1/security/sessions/summary/zone-pairs", s.sessionZonePairHandler)
+
 	// System info
 	mux.HandleFunc("GET /api/v1/system/info", s.systemInfoHandler)
+	mux.HandleFunc("GET /api/v1/system/buffers", s.systemBuffersHandler)
 
 	// Mutations
 	mux.HandleFunc("POST /api/v1/security/sessions/clear", s.clearSessionsHandler)
@@ -154,6 +158,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("GET /api/v1/config/show-rollback", s.configShowRollbackHandler)
 	mux.HandleFunc("GET /api/v1/config/compare", s.configCompareHandler)
 	mux.HandleFunc("GET /api/v1/config/history", s.configHistoryHandler)
+	mux.HandleFunc("GET /api/v1/config/search", s.configSearchHandler)
 
 	// DHCP mutations
 	mux.HandleFunc("POST /api/v1/dhcp/identifiers/clear", s.clearDHCPIdentifiersHandler)

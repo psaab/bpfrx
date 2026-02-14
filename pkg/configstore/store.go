@@ -439,6 +439,65 @@ func (s *Store) Commit() (*config.Config, error) {
 	return compiled, nil
 }
 
+// CommitWithDescription validates, compiles, and applies the candidate configuration
+// with an optional comment/description attached to the history and journal entries.
+func (s *Store) CommitWithDescription(description string) (*config.Config, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.candidate == nil {
+		return nil, fmt.Errorf("not in configuration mode")
+	}
+
+	compiled, err := config.CompileConfig(s.candidate)
+	if err != nil {
+		return nil, fmt.Errorf("commit check failed: %w", err)
+	}
+
+	// Push current active to history with description
+	s.history.Push(&HistoryEntry{
+		Config:    s.active.Clone(),
+		Timestamp: time.Now(),
+		Comment:   description,
+	})
+
+	// Promote candidate to active
+	s.active = s.candidate
+	s.candidate = s.active.Clone()
+	s.compiled = compiled
+	s.dirty = false
+
+	// Persist to disk
+	if err := s.db.WriteActive(s.active); err != nil {
+		slog.Warn("failed to save config", "err", err)
+	}
+
+	// Log to journal with description
+	s.journal.Log(&JournalEntry{
+		Timestamp: time.Now(),
+		Action:    "commit",
+		Detail:    description,
+		After:     compiled,
+	})
+
+	s.saveRollbackFiles()
+
+	// Auto-archive if configured
+	if s.archiveDir != "" {
+		max := s.archiveMax
+		if max <= 0 {
+			max = 10
+		}
+		go func() {
+			if err := s.ArchiveConfig(s.archiveDir, max); err != nil {
+				slog.Warn("auto-archive failed", "err", err)
+			}
+		}()
+	}
+
+	return compiled, nil
+}
+
 // SetCentralRollbackHandler registers a callback for central-rollback dataplane re-apply.
 func (s *Store) SetCentralRollbackHandler(fn func(*config.Config)) {
 	s.mu.Lock()

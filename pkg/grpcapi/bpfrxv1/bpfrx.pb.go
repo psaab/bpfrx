@@ -617,6 +617,7 @@ func (*LoadResponse) Descriptor() ([]byte, []int) {
 
 type CommitRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	Comment       string                 `protobuf:"bytes,1,opt,name=comment,proto3" json:"comment,omitempty"` // optional commit comment/description
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -649,6 +650,13 @@ func (x *CommitRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use CommitRequest.ProtoReflect.Descriptor instead.
 func (*CommitRequest) Descriptor() ([]byte, []int) {
 	return file_bpfrx_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *CommitRequest) GetComment() string {
+	if x != nil {
+		return x.Comment
+	}
+	return ""
 }
 
 type CommitResponse struct {
@@ -6370,8 +6378,9 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\vLoadRequest\x12\x12\n" +
 	"\x04mode\x18\x01 \x01(\tR\x04mode\x12\x18\n" +
 	"\acontent\x18\x02 \x01(\tR\acontent\"\x0e\n" +
-	"\fLoadResponse\"\x0f\n" +
-	"\rCommitRequest\"*\n" +
+	"\fLoadResponse\")\n" +
+	"\rCommitRequest\x12\x18\n" +
+	"\acomment\x18\x01 \x01(\tR\acomment\"*\n" +
 	"\x0eCommitResponse\x12\x18\n" +
 	"\asummary\x18\x01 \x01(\tR\asummary\"\x14\n" +
 	"\x12CommitCheckRequest\"\x15\n" +

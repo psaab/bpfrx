@@ -163,7 +163,7 @@ type ctl struct {
 }
 
 func (c *ctl) dispatch(line string) error {
-	// Extract pipe filter (| match, | except, | count, | last, | no-more).
+	// Extract pipe filter (| match, | except, | find, | count, | last, | no-more).
 	// Skip | display set and | compare.
 	if cmd, pipeType, pipeArg, ok := extractPipe(line); ok {
 		return c.dispatchWithPipe(cmd, pipeType, pipeArg)
@@ -190,7 +190,7 @@ func extractPipe(line string) (string, string, string, bool) {
 		pipeArg = parts[1]
 	}
 	switch pipeType {
-	case "match", "grep", "except", "count", "last", "no-more":
+	case "match", "grep", "except", "find", "count", "last", "no-more":
 		return cmd, pipeType, pipeArg, true
 	default:
 		return line, "", "", false
@@ -236,6 +236,17 @@ func (c *ctl) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 		lp := strings.ToLower(pipeArg)
 		for _, line := range lines {
 			if !strings.Contains(strings.ToLower(line), lp) {
+				fmt.Fprintln(origStdout, line)
+			}
+		}
+	case "find":
+		lp := strings.ToLower(pipeArg)
+		found := false
+		for _, line := range lines {
+			if !found && strings.Contains(strings.ToLower(line), lp) {
+				found = true
+			}
+			if found {
 				fmt.Fprintln(origStdout, line)
 			}
 		}
@@ -1835,6 +1846,9 @@ func (c *ctl) handleShowSystem(args []string) error {
 		return c.showText("backup-router")
 
 	case "buffers":
+		if len(args) >= 2 && args[1] == "detail" {
+			return c.showText("buffers-detail")
+		}
 		return c.showText("buffers")
 
 	case "boot-messages":
@@ -1899,6 +1913,24 @@ func (c *ctl) handleCommit(args []string) error {
 			return fmt.Errorf("commit check failed: %v", err)
 		}
 		fmt.Println("configuration check succeeds")
+		return nil
+	}
+
+	if len(args) > 0 && args[0] == "comment" {
+		if len(args) < 2 {
+			return fmt.Errorf("usage: commit comment \"description\"")
+		}
+		desc := strings.Join(args[1:], " ")
+		desc = strings.Trim(desc, "\"'")
+		resp, err := c.client.Commit(context.Background(), &pb.CommitRequest{Comment: desc})
+		if err != nil {
+			return fmt.Errorf("commit failed: %v", err)
+		}
+		if resp.Summary != "" {
+			fmt.Printf("commit complete: %s\n", resp.Summary)
+		} else {
+			fmt.Println("commit complete")
+		}
 		return nil
 	}
 

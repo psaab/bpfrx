@@ -1742,6 +1742,22 @@ func (s *Server) configHistoryHandler(w http.ResponseWriter, _ *http.Request) {
 	writeOK(w, result)
 }
 
+func (s *Server) configSearchHandler(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		writeError(w, http.StatusBadRequest, "missing q parameter")
+		return
+	}
+	text := s.store.ShowActive()
+	var results []ConfigSearchResult
+	for i, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, query) {
+			results = append(results, ConfigSearchResult{LineNumber: i + 1, Line: line})
+		}
+	}
+	writeOK(w, results)
+}
+
 func (s *Server) configLoadHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigLoadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -2115,6 +2131,113 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeOK(w, TextResponse{Output: buf.String()})
+}
+
+// --- Session zone-pair summary handler ---
+
+func (s *Server) sessionZonePairHandler(w http.ResponseWriter, _ *http.Request) {
+	if s.dp == nil || !s.dp.IsLoaded() {
+		writeOK(w, []ZonePairSessionSummary{})
+		return
+	}
+
+	// Build zone ID -> name reverse map
+	zoneNames := make(map[uint16]string)
+	if cr := s.compileResult(); cr != nil {
+		for name, id := range cr.ZoneIDs {
+			zoneNames[id] = name
+		}
+	}
+
+	type zpKey struct{ from, to uint16 }
+	counts := make(map[zpKey]*ZonePairSessionSummary)
+
+	countSession := func(inZone, outZone uint16, proto uint8) {
+		k := zpKey{inZone, outZone}
+		zp, ok := counts[k]
+		if !ok {
+			zp = &ZonePairSessionSummary{
+				FromZone: zoneNames[inZone],
+				ToZone:   zoneNames[outZone],
+			}
+			if zp.FromZone == "" {
+				zp.FromZone = fmt.Sprintf("zone-%d", inZone)
+			}
+			if zp.ToZone == "" {
+				zp.ToZone = fmt.Sprintf("zone-%d", outZone)
+			}
+			counts[k] = zp
+		}
+		switch proto {
+		case 6:
+			zp.TCP++
+		case 17:
+			zp.UDP++
+		case 1, dataplane.ProtoICMPv6:
+			zp.ICMP++
+		default:
+			zp.Other++
+		}
+		zp.Total++
+	}
+
+	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse == 0 {
+			countSession(val.IngressZone, val.EgressZone, key.Protocol)
+		}
+		return true
+	})
+	_ = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse == 0 {
+			countSession(val.IngressZone, val.EgressZone, key.Protocol)
+		}
+		return true
+	})
+
+	result := make([]ZonePairSessionSummary, 0, len(counts))
+	for _, zp := range counts {
+		result = append(result, *zp)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].FromZone != result[j].FromZone {
+			return result[i].FromZone < result[j].FromZone
+		}
+		return result[i].ToZone < result[j].ToZone
+	})
+	writeOK(w, result)
+}
+
+// --- System buffers handler ---
+
+func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {
+	if s.dp == nil || !s.dp.IsLoaded() {
+		writeOK(w, []BufferInfo{})
+		return
+	}
+
+	stats := s.dp.GetMapStats()
+	buffers := make([]BufferInfo, 0, len(stats))
+	for _, st := range stats {
+		usage := 0.0
+		status := "OK"
+		if st.MaxEntries > 0 && st.Type != "Array" && st.Type != "PerCPUArray" {
+			usage = float64(st.UsedCount) / float64(st.MaxEntries) * 100
+			if usage >= 90 {
+				status = "CRITICAL"
+			} else if usage >= 80 {
+				status = "WARNING"
+			}
+		}
+		buffers = append(buffers, BufferInfo{
+			Name:         st.Name,
+			Type:         st.Type,
+			MaxEntries:   int(st.MaxEntries),
+			UsedCount:    int(st.UsedCount),
+			UsagePercent: usage,
+			Status:       status,
+		})
+	}
+	writeOK(w, buffers)
 }
 
 // --- System action handler ---

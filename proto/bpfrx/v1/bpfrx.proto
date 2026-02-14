@@ -100,7 +100,9 @@ message LoadRequest {
 }
 message LoadResponse {}
 
-message CommitRequest {}
+message CommitRequest {
+  string comment = 1; // optional commit comment/description
+}
 message CommitResponse {
   string summary = 1; // human-readable diff summary (e.g. "3 statement(s) changed (2 added, 1 removed)")
 }

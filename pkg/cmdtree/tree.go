@@ -296,7 +296,9 @@ var OperationalTree = map[string]*Node{
 				"compare": {Desc: "Compare rollback with active config"},
 			}},
 			"backup-router":      {Desc: "Show backup router configuration"},
-			"buffers":            {Desc: "Show BPF map utilization"},
+			"buffers": {Desc: "Show BPF map utilization", Children: map[string]*Node{
+				"detail": {Desc: "Show detailed per-map statistics"},
+			}},
 			"internet-options":   {Desc: "Show internet options"},
 			"license":            {Desc: "Show system license"},
 			"login":              {Desc: "Show login configuration"},
@@ -437,6 +439,7 @@ var ConfigTopLevel = map[string]*Node{
 	"show":     {Desc: "Show candidate configuration"},
 	"commit": {Desc: "Commit configuration", Children: map[string]*Node{
 		"check":     {Desc: "Validate without applying"},
+		"comment":   {Desc: "Add comment to commit"},
 		"confirmed": {Desc: "Auto-rollback if not confirmed [minutes]"},
 	}},
 	"load": {Desc: "Load configuration from file or terminal", Children: map[string]*Node{

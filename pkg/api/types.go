@@ -306,3 +306,30 @@ type SystemActionRequest struct {
 type ShowTextRequest struct {
 	Topic string `json:"topic"`
 }
+
+// ZonePairSessionSummary holds session counts aggregated by zone pair.
+type ZonePairSessionSummary struct {
+	FromZone string `json:"from_zone"`
+	ToZone   string `json:"to_zone"`
+	TCP      int    `json:"tcp"`
+	UDP      int    `json:"udp"`
+	ICMP     int    `json:"icmp"`
+	Other    int    `json:"other"`
+	Total    int    `json:"total"`
+}
+
+// BufferInfo holds BPF map utilization information.
+type BufferInfo struct {
+	Name         string  `json:"name"`
+	Type         string  `json:"type"`
+	MaxEntries   int     `json:"max_entries"`
+	UsedCount    int     `json:"used_count"`
+	UsagePercent float64 `json:"usage_percent"`
+	Status       string  `json:"status"`
+}
+
+// ConfigSearchResult holds a single config search match.
+type ConfigSearchResult struct {
+	LineNumber int    `json:"line_number"`
+	Line       string `json:"line"`
+}

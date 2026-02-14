@@ -396,7 +396,7 @@ func (c *CLI) Run() error {
 var errExit = fmt.Errorf("exit")
 
 func (c *CLI) dispatch(line string) error {
-	// Extract pipe filter (| match, | except, | count, | last, | no-more).
+	// Extract pipe filter (| match, | except, | find, | count, | last, | no-more).
 	// Skip | display set and | compare (handled separately).
 	if cmd, pipeType, pipeArg, ok := extractPipe(line); ok {
 		return c.dispatchWithPipe(cmd, pipeType, pipeArg)
@@ -415,7 +415,7 @@ func (c *CLI) dispatch(line string) error {
 }
 
 // extractPipe splits a line at the last "| <filter>" expression.
-// Recognized filters: match, except, count, last, no-more.
+// Recognized filters: match, except, find, count, last, no-more.
 // Returns the command part, pipe type, pipe argument, and whether a pipe was found.
 // Skips "| display set" and "| compare" which are handled separately.
 func extractPipe(line string) (string, string, string, bool) {
@@ -433,7 +433,7 @@ func extractPipe(line string) (string, string, string, bool) {
 	}
 
 	switch pipeType {
-	case "match", "grep", "except", "count", "last", "no-more":
+	case "match", "grep", "except", "find", "count", "last", "no-more":
 		return cmd, pipeType, pipeArg, true
 	default:
 		// Not a recognized pipe filter (e.g. "| display set", "| compare")
@@ -484,6 +484,17 @@ func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 		lowerPattern := strings.ToLower(pipeArg)
 		for _, line := range lines {
 			if !strings.Contains(strings.ToLower(line), lowerPattern) {
+				fmt.Fprintln(origStdout, line)
+			}
+		}
+	case "find":
+		lowerPattern := strings.ToLower(pipeArg)
+		found := false
+		for _, line := range lines {
+			if !found && strings.Contains(strings.ToLower(line), lowerPattern) {
+				found = true
+			}
+			if found {
 				fmt.Fprintln(origStdout, line)
 			}
 		}
@@ -2150,6 +2161,35 @@ func (c *CLI) handleCommit(args []string) error {
 			return fmt.Errorf("commit check failed: %w", err)
 		}
 		fmt.Println("configuration check succeeds")
+		return nil
+	}
+
+	if len(args) > 0 && args[0] == "comment" {
+		if len(args) < 2 {
+			return fmt.Errorf("usage: commit comment \"description\"")
+		}
+		desc := strings.Join(args[1:], " ")
+		desc = strings.Trim(desc, "\"'")
+
+		diffSummary := c.store.CommitDiffSummary()
+
+		compiled, err := c.store.CommitWithDescription(desc)
+		if err != nil {
+			return fmt.Errorf("commit failed: %w", err)
+		}
+
+		if c.dp != nil {
+			if err := c.applyToDataplane(compiled); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: dataplane apply failed: %v\n", err)
+			}
+		}
+		c.reloadSyslog(compiled)
+
+		if diffSummary != "" {
+			fmt.Printf("commit complete: %s\n", diffSummary)
+		} else {
+			fmt.Println("commit complete")
+		}
 		return nil
 	}
 
@@ -6258,7 +6298,11 @@ func (c *CLI) handleShowSystem(args []string) error {
 				return nil
 			}
 			for i, e := range entries {
-				fmt.Printf("  %d  %s  %s\n", i, e.Timestamp.Format("2006-01-02 15:04:05"), e.Action)
+				detail := ""
+				if e.Detail != "" {
+					detail = "  " + e.Detail
+				}
+				fmt.Printf("  %d  %s  %s%s\n", i, e.Timestamp.Format("2006-01-02 15:04:05"), e.Action, detail)
 			}
 			return nil
 		}
@@ -6390,6 +6434,9 @@ func (c *CLI) handleShowSystem(args []string) error {
 		return c.showSystemSyslog()
 
 	case "buffers":
+		if len(args) >= 2 && args[1] == "detail" {
+			return c.showSystemBuffersDetail()
+		}
 		return c.showSystemBuffers()
 
 	case "login":
@@ -6481,6 +6528,74 @@ func (c *CLI) showSystemBuffers() error {
 	v4, v6 := c.dp.SessionCount()
 	if v4 > 0 || v6 > 0 {
 		fmt.Printf("\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
+	}
+	return nil
+}
+
+func (c *CLI) showSystemBuffersDetail() error {
+	if c.dp == nil {
+		fmt.Println("Dataplane not loaded")
+		return nil
+	}
+	stats := c.dp.GetMapStats()
+	if len(stats) == 0 {
+		fmt.Println("No BPF maps available")
+		return nil
+	}
+
+	// Filter out Array/PerCPUArray types (always "full") and compute usage
+	type mapDetail struct {
+		name       string
+		mapType    string
+		maxEntries uint32
+		usedCount  uint32
+		keySize    uint32
+		valueSize  uint32
+		pct        float64
+	}
+	var details []mapDetail
+	for _, s := range stats {
+		if s.Type == "Array" || s.Type == "PerCPUArray" {
+			continue
+		}
+		pct := float64(0)
+		if s.MaxEntries > 0 {
+			pct = float64(s.UsedCount) / float64(s.MaxEntries) * 100
+		}
+		details = append(details, mapDetail{
+			name:       s.Name,
+			mapType:    s.Type,
+			maxEntries: s.MaxEntries,
+			usedCount:  s.UsedCount,
+			keySize:    s.KeySize,
+			valueSize:  s.ValueSize,
+			pct:        pct,
+		})
+	}
+
+	// Sort by usage percentage descending
+	sort.Slice(details, func(i, j int) bool {
+		return details[i].pct > details[j].pct
+	})
+
+	fmt.Printf("BPF Map Details (sorted by utilization):\n\n")
+	for _, d := range details {
+		status := "OK"
+		if d.pct >= 90 {
+			status = "CRITICAL"
+		} else if d.pct >= 80 {
+			status = "WARNING"
+		}
+		fmt.Printf("Map: %s\n", d.name)
+		fmt.Printf("  Type: %s, Max: %d, Used: %d, Usage: %.1f%%\n", d.mapType, d.maxEntries, d.usedCount, d.pct)
+		fmt.Printf("  Key size: %d bytes, Value size: %d bytes\n", d.keySize, d.valueSize)
+		fmt.Printf("  Status: %s\n\n", status)
+	}
+
+	// Session counts
+	v4, v6 := c.dp.SessionCount()
+	if v4 > 0 || v6 > 0 {
+		fmt.Printf("Active sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
 	}
 	return nil
 }
@@ -6917,6 +7032,7 @@ func (c *CLI) showOperationalHelp() {
 	fmt.Println()
 	fmt.Println("  <command> | match/grep <pattern>    Filter output by pattern")
 	fmt.Println("  <command> | except <pattern>        Exclude lines matching pattern")
+	fmt.Println("  <command> | find <pattern>          Show from first match to end")
 	fmt.Println("  <command> | count                   Count output lines")
 	fmt.Println("  <command> | last [N]                Show last N lines (default 10)")
 	fmt.Println("  <command> | no-more                 Disable paging")

@@ -1062,3 +1062,68 @@ func TestConfigureExclusive(t *testing.T) {
 	}
 	s.ExitConfigure()
 }
+
+func TestCommitWithDescription(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+
+	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
+	cfg, err := s.CommitWithDescription("initial trust zone setup")
+	if err != nil {
+		t.Fatalf("CommitWithDescription: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if len(cfg.Security.Zones) != 1 {
+		t.Errorf("expected 1 zone, got %d", len(cfg.Security.Zones))
+	}
+
+	// Verify journal has the description
+	entries, err := s.ListCommitHistory(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 commit entry, got %d", len(entries))
+	}
+	if entries[0].Detail != "initial trust zone setup" {
+		t.Errorf("expected detail 'initial trust zone setup', got %q", entries[0].Detail)
+	}
+	if entries[0].Action != "commit" {
+		t.Errorf("expected action 'commit', got %q", entries[0].Action)
+	}
+
+	// Verify history entry has comment
+	histEntries := s.ListHistory()
+	if len(histEntries) != 1 {
+		t.Fatalf("expected 1 history entry, got %d", len(histEntries))
+	}
+	if histEntries[0].Comment != "initial trust zone setup" {
+		t.Errorf("expected comment 'initial trust zone setup', got %q", histEntries[0].Comment)
+	}
+
+	// Second commit without description should still work
+	s.SetFromInput("security zones security-zone untrust interfaces eth1.0")
+	cfg2, err := s.Commit()
+	if err != nil {
+		t.Fatalf("Commit (no desc): %v", err)
+	}
+	if len(cfg2.Security.Zones) != 2 {
+		t.Errorf("expected 2 zones, got %d", len(cfg2.Security.Zones))
+	}
+
+	entries, err = s.ListCommitHistory(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 commit entries, got %d", len(entries))
+	}
+	// Second entry should have no detail
+	if entries[1].Detail != "" {
+		t.Errorf("expected empty detail for second commit, got %q", entries[1].Detail)
+	}
+}
