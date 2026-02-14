@@ -5403,6 +5403,45 @@ func TestZoneSetSyntax(t *testing.T) {
 	}
 }
 
+func TestRouterDiscoveryProtocolSetSyntax(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set security zones security-zone trust interfaces trust0",
+		"set security zones security-zone trust host-inbound-traffic protocols router-discovery",
+		"set security zones security-zone trust host-inbound-traffic protocols ospf",
+	} {
+		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	trust := cfg.Security.Zones["trust"]
+	if trust == nil {
+		t.Fatal("trust zone not found")
+	}
+	if trust.HostInboundTraffic == nil {
+		t.Fatal("host-inbound-traffic is nil")
+	}
+	protos := trust.HostInboundTraffic.Protocols
+	if len(protos) != 2 {
+		t.Fatalf("protocols = %v, want [router-discovery ospf]", protos)
+	}
+	found := false
+	for _, p := range protos {
+		if p == "router-discovery" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("router-discovery not in protocols: %v", protos)
+	}
+}
+
 func TestScreenSetSyntax(t *testing.T) {
 	tree := &ConfigTree{}
 	for _, cmd := range []string{
@@ -10753,5 +10792,1115 @@ func TestValidateConfigApplicationPorts(t *testing.T) {
 	}
 	if !foundProto {
 		t.Error("expected warning about bad-proto with invalid protocol")
+	}
+}
+
+func TestIPIPTunnelSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set interfaces ip-0/0/0 tunnel source 10.0.0.1",
+		"set interfaces ip-0/0/0 tunnel destination 10.0.0.2",
+		"set interfaces ip-0/0/0 tunnel ttl 128",
+		"set interfaces ip-0/0/0 unit 0 family inet address 10.10.10.1/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ifc := cfg.Interfaces.Interfaces["ip-0/0/0"]
+	if ifc == nil {
+		t.Fatal("ip-0/0/0 interface not found")
+	}
+	tc := ifc.Tunnel
+	if tc == nil {
+		t.Fatal("tunnel config is nil")
+	}
+	if tc.Mode != "ipip" {
+		t.Errorf("Mode = %q, want %q (auto-detected from ip- prefix)", tc.Mode, "ipip")
+	}
+	if tc.Source != "10.0.0.1" {
+		t.Errorf("Source = %q, want 10.0.0.1", tc.Source)
+	}
+	if tc.Destination != "10.0.0.2" {
+		t.Errorf("Destination = %q, want 10.0.0.2", tc.Destination)
+	}
+	if tc.TTL != 128 {
+		t.Errorf("TTL = %d, want 128", tc.TTL)
+	}
+}
+
+func TestIPIPTunnelExplicitMode(t *testing.T) {
+	// Test that explicit mode=ipip is also honored (for gr- prefix with explicit mode override)
+	cmds := []string{
+		"set interfaces gr-0/0/0 tunnel source 10.0.0.1",
+		"set interfaces gr-0/0/0 tunnel destination 10.0.0.2",
+		"set interfaces gr-0/0/0 tunnel mode ipip",
+		"set interfaces gr-0/0/0 unit 0 family inet address 10.10.10.1/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ifc := cfg.Interfaces.Interfaces["gr-0/0/0"]
+	if ifc == nil {
+		t.Fatal("gr-0/0/0 interface not found")
+	}
+	tc := ifc.Tunnel
+	if tc == nil {
+		t.Fatal("tunnel config is nil")
+	}
+	if tc.Mode != "ipip" {
+		t.Errorf("Mode = %q, want %q (explicitly set)", tc.Mode, "ipip")
+	}
+}
+
+func TestGRETunnelRoutingInstanceDestination(t *testing.T) {
+	cmds := []string{
+		"set interfaces gr-0/0/0 tunnel source 10.0.0.1",
+		"set interfaces gr-0/0/0 tunnel destination 10.0.0.2",
+		"set interfaces gr-0/0/0 tunnel routing-instance destination dmz-vr",
+		"set interfaces gr-0/0/0 unit 0 family inet address 10.10.10.1/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ifc := cfg.Interfaces.Interfaces["gr-0/0/0"]
+	if ifc == nil {
+		t.Fatal("gr-0/0/0 interface not found")
+	}
+	tc := ifc.Tunnel
+	if tc == nil {
+		t.Fatal("tunnel config is nil")
+	}
+	if tc.RoutingInstance != "dmz-vr" {
+		t.Errorf("RoutingInstance = %q, want %q", tc.RoutingInstance, "dmz-vr")
+	}
+}
+
+func TestPointToPointFlag(t *testing.T) {
+	cmds := []string{
+		"set interfaces gr-0/0/0 tunnel source 10.0.0.1",
+		"set interfaces gr-0/0/0 tunnel destination 10.0.0.2",
+		"set interfaces gr-0/0/0 unit 0 point-to-point",
+		"set interfaces gr-0/0/0 unit 0 family inet address 10.10.10.1/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ifc := cfg.Interfaces.Interfaces["gr-0/0/0"]
+	if ifc == nil {
+		t.Fatal("gr-0/0/0 interface not found")
+	}
+	unit := ifc.Units[0]
+	if unit == nil {
+		t.Fatal("unit 0 not found")
+	}
+	if !unit.PointToPoint {
+		t.Error("PointToPoint should be true")
+	}
+}
+
+func TestIPsecAggressiveModeSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set security ike proposal ike-phase1 authentication-method pre-shared-keys",
+		"set security ike proposal ike-phase1 encryption-algorithm aes-256-cbc",
+		"set security ike proposal ike-phase1 authentication-algorithm sha-256",
+		"set security ike proposal ike-phase1 dh-group group14",
+		"set security ike policy ike-pol mode aggressive",
+		"set security ike policy ike-pol proposals ike-phase1",
+		"set security ike policy ike-pol pre-shared-key ascii-text secret123",
+		"set security ike gateway gw1 address 203.0.113.1",
+		"set security ike gateway gw1 local-address 198.51.100.1",
+		"set security ike gateway gw1 ike-policy ike-pol",
+		"set security ike gateway gw1 external-interface wan0",
+		"set security ike gateway gw1 version v1-only",
+		"set security ike gateway gw1 dynamic hostname peer.example.com",
+		"set security ipsec vpn site-a ike gateway gw1",
+		"set security ipsec vpn site-a df-bit copy",
+		"set security ipsec vpn site-a establish-tunnels immediately",
+		"set security ipsec vpn site-a bind-interface st0.0",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	// Check IKE policy aggressive mode
+	ikePol := cfg.Security.IPsec.IKEPolicies["ike-pol"]
+	if ikePol == nil {
+		t.Fatal("IKE policy ike-pol not found")
+	}
+	if ikePol.Mode != "aggressive" {
+		t.Errorf("IKE policy mode = %q, want %q", ikePol.Mode, "aggressive")
+	}
+	if ikePol.PSK != "secret123" {
+		t.Errorf("IKE policy PSK = %q, want %q", ikePol.PSK, "secret123")
+	}
+
+	// Check gateway
+	gw := cfg.Security.IPsec.Gateways["gw1"]
+	if gw == nil {
+		t.Fatal("gateway gw1 not found")
+	}
+	if gw.LocalAddress != "198.51.100.1" {
+		t.Errorf("gateway local-address = %q, want %q", gw.LocalAddress, "198.51.100.1")
+	}
+	if gw.DynamicHostname != "peer.example.com" {
+		t.Errorf("gateway dynamic hostname = %q, want %q", gw.DynamicHostname, "peer.example.com")
+	}
+	if gw.Version != "v1-only" {
+		t.Errorf("gateway version = %q, want %q", gw.Version, "v1-only")
+	}
+
+	// Check VPN
+	vpn := cfg.Security.IPsec.VPNs["site-a"]
+	if vpn == nil {
+		t.Fatal("VPN site-a not found")
+	}
+	if vpn.DFBit != "copy" {
+		t.Errorf("VPN df-bit = %q, want %q", vpn.DFBit, "copy")
+	}
+	if vpn.EstablishTunnels != "immediately" {
+		t.Errorf("VPN establish-tunnels = %q, want %q", vpn.EstablishTunnels, "immediately")
+	}
+	if vpn.BindInterface != "st0.0" {
+		t.Errorf("VPN bind-interface = %q, want %q", vpn.BindInterface, "st0.0")
+	}
+	if vpn.Gateway != "gw1" {
+		t.Errorf("VPN gateway = %q, want %q", vpn.Gateway, "gw1")
+	}
+}
+
+func TestGlobalInterfaceRoutesRibGroup(t *testing.T) {
+	input := `routing-options {
+    interface-routes {
+        rib-group {
+            inet Other-ISPS;
+            inet6 Other-ISP6;
+        }
+    }
+    rib-groups {
+        Other-ISPS {
+            import-rib [ Comcast-BCI.inet.0 inet.0 ATT.inet.0 Atherton-Fiber.inet.0 sfmix.inet.0 ];
+        }
+        Other-ISP6 {
+            import-rib [ Comcast-BCI.inet6.0 inet6.0 ATT.inet6.0 Atherton-Fiber.inet6.0 ];
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify global interface-routes rib-group references
+	if cfg.RoutingOptions.InterfaceRoutesRibGroup != "Other-ISPS" {
+		t.Errorf("InterfaceRoutesRibGroup = %q, want Other-ISPS",
+			cfg.RoutingOptions.InterfaceRoutesRibGroup)
+	}
+	if cfg.RoutingOptions.InterfaceRoutesRibGroupV6 != "Other-ISP6" {
+		t.Errorf("InterfaceRoutesRibGroupV6 = %q, want Other-ISP6",
+			cfg.RoutingOptions.InterfaceRoutesRibGroupV6)
+	}
+
+	// Verify rib-groups with many import-ribs
+	rg, ok := cfg.RoutingOptions.RibGroups["Other-ISPS"]
+	if !ok {
+		t.Fatal("rib-group Other-ISPS not found")
+	}
+	if len(rg.ImportRibs) != 5 {
+		t.Fatalf("Other-ISPS ImportRibs = %d, want 5", len(rg.ImportRibs))
+	}
+
+	rg6, ok := cfg.RoutingOptions.RibGroups["Other-ISP6"]
+	if !ok {
+		t.Fatal("rib-group Other-ISP6 not found")
+	}
+	if len(rg6.ImportRibs) != 4 {
+		t.Fatalf("Other-ISP6 ImportRibs = %d, want 4", len(rg6.ImportRibs))
+	}
+}
+
+func TestGlobalInterfaceRoutesRibGroupSetSyntax(t *testing.T) {
+	lines := []string{
+		"set routing-options interface-routes rib-group inet Other-ISPS",
+		"set routing-options interface-routes rib-group inet6 Other-ISP6",
+		"set routing-options rib-groups Other-ISPS import-rib Comcast-BCI.inet.0",
+		"set routing-options rib-groups Other-ISPS import-rib inet.0",
+		"set routing-options rib-groups Other-ISPS import-rib Other-GigabitPro.inet.0",
+		"set routing-options rib-groups Other-ISPS import-rib bv-firehouse-vpn.inet.0",
+		"set routing-options rib-groups Other-ISPS import-rib Comcast-GigabitPro.inet.0",
+		"set routing-options rib-groups Other-ISPS import-rib ATT.inet.0",
+		"set routing-options rib-groups Other-ISPS import-rib Atherton-Fiber.inet.0",
+		"set routing-options rib-groups Other-ISPS import-rib sfmix.inet.0",
+		"set routing-options rib-groups Other-ISP6 import-rib Comcast-BCI.inet6.0",
+		"set routing-options rib-groups Other-ISP6 import-rib inet6.0",
+		"set routing-options rib-groups Other-ISP6 import-rib Comcast-GigabitPro.inet6.0",
+		"set routing-options rib-groups Other-ISP6 import-rib ATT.inet6.0",
+		"set routing-options rib-groups Other-ISP6 import-rib Atherton-Fiber.inet6.0",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		tree.SetPath(cmd)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.RoutingOptions.InterfaceRoutesRibGroup != "Other-ISPS" {
+		t.Errorf("InterfaceRoutesRibGroup = %q, want Other-ISPS",
+			cfg.RoutingOptions.InterfaceRoutesRibGroup)
+	}
+	if cfg.RoutingOptions.InterfaceRoutesRibGroupV6 != "Other-ISP6" {
+		t.Errorf("InterfaceRoutesRibGroupV6 = %q, want Other-ISP6",
+			cfg.RoutingOptions.InterfaceRoutesRibGroupV6)
+	}
+
+	// Verify 8 import-ribs for Other-ISPS
+	rg := cfg.RoutingOptions.RibGroups["Other-ISPS"]
+	if rg == nil {
+		t.Fatal("rib-group Other-ISPS not found")
+	}
+	if len(rg.ImportRibs) != 8 {
+		t.Fatalf("Other-ISPS ImportRibs = %d, want 8: %v", len(rg.ImportRibs), rg.ImportRibs)
+	}
+
+	// Verify 5 import-ribs for Other-ISP6
+	rg6 := cfg.RoutingOptions.RibGroups["Other-ISP6"]
+	if rg6 == nil {
+		t.Fatal("rib-group Other-ISP6 not found")
+	}
+	if len(rg6.ImportRibs) != 5 {
+		t.Fatalf("Other-ISP6 ImportRibs = %d, want 5: %v", len(rg6.ImportRibs), rg6.ImportRibs)
+	}
+}
+
+func TestIPv6NextTableStaticRoutes(t *testing.T) {
+	// Test IPv6 rib inet6.0 static route with next-table (flat set syntax)
+	lines := []string{
+		"set routing-options rib inet6.0 static route ::/0 next-table Comcast-GigabitPro.inet6.0",
+		"set routing-options rib inet6.0 static route 2001:db8::/32 next-table ATT.inet6.0",
+		"set routing-options static route 0.0.0.0/0 next-table Comcast-GigabitPro.inet.0",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		tree.SetPath(cmd)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// IPv6 routes
+	if len(cfg.RoutingOptions.Inet6StaticRoutes) != 2 {
+		t.Fatalf("Inet6StaticRoutes = %d, want 2", len(cfg.RoutingOptions.Inet6StaticRoutes))
+	}
+	r0 := cfg.RoutingOptions.Inet6StaticRoutes[0]
+	if r0.Destination != "::/0" {
+		t.Errorf("v6 route 0 dest = %q, want ::/0", r0.Destination)
+	}
+	if r0.NextTable != "Comcast-GigabitPro" {
+		t.Errorf("v6 route 0 next-table = %q, want Comcast-GigabitPro", r0.NextTable)
+	}
+	r1 := cfg.RoutingOptions.Inet6StaticRoutes[1]
+	if r1.NextTable != "ATT" {
+		t.Errorf("v6 route 1 next-table = %q, want ATT", r1.NextTable)
+	}
+
+	// IPv4 route
+	if len(cfg.RoutingOptions.StaticRoutes) != 1 {
+		t.Fatalf("StaticRoutes = %d, want 1", len(cfg.RoutingOptions.StaticRoutes))
+	}
+	if cfg.RoutingOptions.StaticRoutes[0].NextTable != "Comcast-GigabitPro" {
+		t.Errorf("v4 route next-table = %q", cfg.RoutingOptions.StaticRoutes[0].NextTable)
+	}
+}
+
+func TestDNATSourceAddressName(t *testing.T) {
+	input := `security {
+    address-book {
+        global {
+            address srv1 10.0.1.100/32;
+            address-set net_todd_control4 {
+                address srv1;
+            }
+        }
+    }
+    nat {
+        destination {
+            pool host_control4 {
+                address 10.0.30.100;
+            }
+            rule-set wan-dnat {
+                from zone untrust;
+                rule todd-control4 {
+                    match {
+                        source-address-name net_todd_control4;
+                        destination-address 50.220.171.30/32;
+                        destination-port 80;
+                    }
+                    then {
+                        destination-nat pool host_control4;
+                    }
+                }
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dnat := cfg.Security.NAT.Destination
+	if dnat == nil {
+		t.Fatal("DNAT config nil")
+	}
+	if len(dnat.RuleSets) != 1 {
+		t.Fatalf("want 1 rule-set, got %d", len(dnat.RuleSets))
+	}
+	rule := dnat.RuleSets[0].Rules[0]
+	if rule.Match.SourceAddressName != "net_todd_control4" {
+		t.Errorf("SourceAddressName = %q, want net_todd_control4", rule.Match.SourceAddressName)
+	}
+	if rule.Match.DestinationAddress != "50.220.171.30/32" {
+		t.Errorf("DestinationAddress = %q, want 50.220.171.30/32", rule.Match.DestinationAddress)
+	}
+	if rule.Match.DestinationPort != 80 {
+		t.Errorf("DestinationPort = %d, want 80", rule.Match.DestinationPort)
+	}
+}
+
+func TestDNATSourceAddressNameSetSyntax(t *testing.T) {
+	lines := []string{
+		"set security nat destination pool web1 address 10.0.30.100",
+		"set security nat destination rule-set wan-dnat from zone untrust",
+		"set security nat destination rule-set wan-dnat rule r1 match source-address-name mynet",
+		"set security nat destination rule-set wan-dnat rule r1 match destination-address 50.0.0.1/32",
+		"set security nat destination rule-set wan-dnat rule r1 match destination-port 443",
+		"set security nat destination rule-set wan-dnat rule r1 then destination-nat pool web1",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(cmd); err != nil {
+			t.Fatalf("SetPath(%v): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dnat := cfg.Security.NAT.Destination
+	if dnat == nil {
+		t.Fatal("DNAT config nil")
+	}
+	rule := dnat.RuleSets[0].Rules[0]
+	if rule.Match.SourceAddressName != "mynet" {
+		t.Errorf("SourceAddressName = %q, want mynet", rule.Match.SourceAddressName)
+	}
+}
+
+func TestDNATPortRange(t *testing.T) {
+	input := `security {
+    nat {
+        destination {
+            pool host1 {
+                address 10.0.30.100;
+            }
+            rule-set wan-dnat {
+                from zone untrust;
+                rule port-range {
+                    match {
+                        destination-address 50.220.171.30/32;
+                        destination-port {
+                            80;
+                            443;
+                            20000 to 20005;
+                        }
+                    }
+                    then {
+                        destination-nat pool host1;
+                    }
+                }
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := cfg.Security.NAT.Destination.RuleSets[0].Rules[0]
+	// Expect: 80, 443, 20000, 20001, 20002, 20003, 20004, 20005 = 8 ports
+	if len(rule.Match.DestinationPorts) != 8 {
+		t.Fatalf("DestinationPorts = %v (len %d), want 8", rule.Match.DestinationPorts, len(rule.Match.DestinationPorts))
+	}
+	if rule.Match.DestinationPort != 80 {
+		t.Errorf("DestinationPort = %d, want 80", rule.Match.DestinationPort)
+	}
+	if rule.Match.DestinationPorts[2] != 20000 {
+		t.Errorf("port[2] = %d, want 20000", rule.Match.DestinationPorts[2])
+	}
+	if rule.Match.DestinationPorts[7] != 20005 {
+		t.Errorf("port[7] = %d, want 20005", rule.Match.DestinationPorts[7])
+	}
+}
+
+func TestDNATPortRangeSetSyntax(t *testing.T) {
+	lines := []string{
+		"set security nat destination pool web1 address 10.0.30.100",
+		"set security nat destination rule-set wan-dnat from zone untrust",
+		"set security nat destination rule-set wan-dnat rule r1 match destination-address 50.0.0.1/32",
+		"set security nat destination rule-set wan-dnat rule r1 match destination-port 80",
+		"set security nat destination rule-set wan-dnat rule r1 match destination-port 443",
+		"set security nat destination rule-set wan-dnat rule r1 match destination-port 20000 to 20003",
+		"set security nat destination rule-set wan-dnat rule r1 then destination-nat pool web1",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(cmd); err != nil {
+			t.Fatalf("SetPath(%v): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := cfg.Security.NAT.Destination.RuleSets[0].Rules[0]
+	// Expect: 80, 443, 20000, 20001, 20002, 20003 = 6 ports
+	if len(rule.Match.DestinationPorts) != 6 {
+		t.Fatalf("DestinationPorts = %v (len %d), want 6", rule.Match.DestinationPorts, len(rule.Match.DestinationPorts))
+	}
+}
+
+func TestDNATProtocolGRE(t *testing.T) {
+	input := `security {
+    nat {
+        destination {
+            pool gre-host {
+                address 10.0.30.50;
+            }
+            rule-set wan-dnat {
+                from zone untrust;
+                rule gre-dnat {
+                    match {
+                        destination-address 209.237.133.188/32;
+                        protocol gre;
+                    }
+                    then {
+                        destination-nat pool gre-host;
+                    }
+                }
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := cfg.Security.NAT.Destination.RuleSets[0].Rules[0]
+	if rule.Match.Protocol != "gre" {
+		t.Errorf("Protocol = %q, want gre", rule.Match.Protocol)
+	}
+}
+
+func TestDNATProtocolICMP6(t *testing.T) {
+	input := `security {
+    nat {
+        destination {
+            pool icmp-host {
+                address 2001:db8::100;
+            }
+            rule-set wan-dnat {
+                from zone untrust;
+                rule icmp6-dnat {
+                    match {
+                        destination-address 2001:db8::1/128;
+                        protocol icmp6;
+                    }
+                    then {
+                        destination-nat pool icmp-host;
+                    }
+                }
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := cfg.Security.NAT.Destination.RuleSets[0].Rules[0]
+	if rule.Match.Protocol != "icmp6" {
+		t.Errorf("Protocol = %q, want icmp6", rule.Match.Protocol)
+	}
+}
+
+func TestLo0FilterExtraction(t *testing.T) {
+	input := `interfaces {
+    lo0 {
+        unit 0 {
+            family inet {
+                filter {
+                    input filter-management;
+                }
+            }
+            family inet6 {
+                filter {
+                    input filter-management6;
+                }
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.System.Lo0FilterInputV4 != "filter-management" {
+		t.Errorf("Lo0FilterInputV4 = %q, want filter-management", cfg.System.Lo0FilterInputV4)
+	}
+	if cfg.System.Lo0FilterInputV6 != "filter-management6" {
+		t.Errorf("Lo0FilterInputV6 = %q, want filter-management6", cfg.System.Lo0FilterInputV6)
+	}
+}
+
+func TestLo0FilterExtractionSet(t *testing.T) {
+	lines := []string{
+		"set interfaces lo0 unit 0 family inet filter input mgmt-v4",
+		"set interfaces lo0 unit 0 family inet6 filter input mgmt-v6",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(cmd)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.System.Lo0FilterInputV4 != "mgmt-v4" {
+		t.Errorf("Lo0FilterInputV4 = %q, want mgmt-v4", cfg.System.Lo0FilterInputV4)
+	}
+	if cfg.System.Lo0FilterInputV6 != "mgmt-v6" {
+		t.Errorf("Lo0FilterInputV6 = %q, want mgmt-v6", cfg.System.Lo0FilterInputV6)
+	}
+}
+
+func TestHostInboundRouterDiscovery(t *testing.T) {
+	lines := []string{
+		"set security zones security-zone trust host-inbound-traffic system-services ping",
+		"set security zones security-zone trust host-inbound-traffic protocols bgp",
+		"set security zones security-zone trust host-inbound-traffic protocols router-discovery",
+		"set security zones security-zone trust interfaces trust0",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(cmd)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trust := cfg.Security.Zones["trust"]
+	if trust == nil {
+		t.Fatal("trust zone is nil")
+	}
+	if trust.HostInboundTraffic == nil {
+		t.Fatal("host-inbound-traffic is nil")
+	}
+	protos := trust.HostInboundTraffic.Protocols
+	found := map[string]bool{}
+	for _, p := range protos {
+		found[p] = true
+	}
+	if !found["bgp"] {
+		t.Error("missing protocol bgp")
+	}
+	if !found["router-discovery"] {
+		t.Error("missing protocol router-discovery")
+	}
+}
+
+func TestNat66SourceRules(t *testing.T) {
+	input := `security {
+    nat {
+        source {
+            rule-set internal-to-internet {
+                from zone trust;
+                to zone untrust;
+                rule nat66-iface {
+                    match {
+                        source-address ::/0;
+                    }
+                    then {
+                        source-nat {
+                            interface;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    zones {
+        security-zone trust {
+            interfaces trust0;
+        }
+        security-zone untrust {
+            interfaces untrust0;
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := cfg.Security.NAT.Source
+	if len(rs) != 1 {
+		t.Fatalf("expected 1 SNAT rule-set, got %d", len(rs))
+	}
+	rules := rs[0].Rules
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+	if rules[0].Name != "nat66-iface" {
+		t.Errorf("rule name = %q, want nat66-iface", rules[0].Name)
+	}
+	if rules[0].Match.SourceAddress != "::/0" {
+		t.Errorf("source-address = %q, want ::/0", rules[0].Match.SourceAddress)
+	}
+	if !rules[0].Then.Interface {
+		t.Error("expected interface SNAT")
+	}
+}
+
+func TestSNATMultipleSourceAddressBracketList(t *testing.T) {
+	input := `
+security {
+    nat {
+        source {
+            rule-set rs1 {
+                from zone trust;
+                to zone untrust;
+                rule r1 {
+                    match {
+                        source-address [ 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 ];
+                    }
+                    then {
+                        source-nat interface;
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if len(cfg.Security.NAT.Source) != 1 {
+		t.Fatalf("expected 1 rule-set, got %d", len(cfg.Security.NAT.Source))
+	}
+	rules := cfg.Security.NAT.Source[0].Rules
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+	// SourceAddress should be first element for backward compat
+	if rules[0].Match.SourceAddress != "10.0.0.0/8" {
+		t.Errorf("SourceAddress = %q, want 10.0.0.0/8", rules[0].Match.SourceAddress)
+	}
+	// SourceAddresses should have all three
+	want := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+	if len(rules[0].Match.SourceAddresses) != len(want) {
+		t.Fatalf("SourceAddresses len = %d, want %d", len(rules[0].Match.SourceAddresses), len(want))
+	}
+	for i, w := range want {
+		if rules[0].Match.SourceAddresses[i] != w {
+			t.Errorf("SourceAddresses[%d] = %q, want %q", i, rules[0].Match.SourceAddresses[i], w)
+		}
+	}
+}
+
+func TestSNATMultipleSourceAddressSetSyntax(t *testing.T) {
+	lines := []string{
+		"set security nat source rule-set rs1 from zone trust",
+		"set security nat source rule-set rs1 to zone untrust",
+		"set security nat source rule-set rs1 rule r1 match source-address 10.0.0.0/8",
+		"set security nat source rule-set rs1 rule r1 match source-address 172.16.0.0/12",
+		"set security nat source rule-set rs1 rule r1 match source-address 192.168.0.0/16",
+		"set security nat source rule-set rs1 rule r1 then source-nat interface",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if len(cfg.Security.NAT.Source) == 0 {
+		t.Fatal("NAT source config is empty")
+	}
+	rules := cfg.Security.NAT.Source[0].Rules
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+	want := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+	if len(rules[0].Match.SourceAddresses) != len(want) {
+		t.Fatalf("SourceAddresses len = %d, want %d", len(rules[0].Match.SourceAddresses), len(want))
+	}
+	for i, w := range want {
+		if rules[0].Match.SourceAddresses[i] != w {
+			t.Errorf("SourceAddresses[%d] = %q, want %q", i, rules[0].Match.SourceAddresses[i], w)
+		}
+	}
+}
+
+func TestDNATApplicationMatching(t *testing.T) {
+	// Verify that DNAT rule with application match parses correctly
+	input := `
+security {
+    nat {
+        destination {
+            pool web-pool {
+                address 10.0.1.100/32;
+            }
+            rule-set rs1 {
+                from zone untrust;
+                rule web-dnat {
+                    match {
+                        destination-address 203.0.113.1/32;
+                        application junos-http;
+                    }
+                    then {
+                        destination-nat pool web-pool;
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if cfg.Security.NAT.Destination == nil {
+		t.Fatal("NAT destination config is nil")
+	}
+	rules := cfg.Security.NAT.Destination.RuleSets[0].Rules
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+	if rules[0].Match.Application != "junos-http" {
+		t.Errorf("Application = %q, want junos-http", rules[0].Match.Application)
+	}
+	if rules[0].Match.DestinationAddress != "203.0.113.1/32" {
+		t.Errorf("DestinationAddress = %q, want 203.0.113.1/32", rules[0].Match.DestinationAddress)
+	}
+}
+
+func TestDNATApplicationSet(t *testing.T) {
+	// Verify that DNAT rule with application-set (multi-term app) parses correctly
+	input := `
+applications {
+    application unifi-tcp-8080 {
+        protocol tcp;
+        destination-port 8080;
+    }
+    application unifi-udp-3478 {
+        protocol udp;
+        destination-port 3478;
+    }
+    application-set unifi-controller {
+        application unifi-tcp-8080;
+        application unifi-udp-3478;
+    }
+}
+security {
+    nat {
+        destination {
+            pool unifi-pool {
+                address 10.0.1.50/32;
+            }
+            rule-set rs1 {
+                from zone untrust;
+                rule unifi-dnat {
+                    match {
+                        destination-address 203.0.113.10/32;
+                        application unifi-controller;
+                    }
+                    then {
+                        destination-nat pool unifi-pool;
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	// Verify DNAT rule has application-set reference
+	rules := cfg.Security.NAT.Destination.RuleSets[0].Rules
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+	if rules[0].Match.Application != "unifi-controller" {
+		t.Errorf("Application = %q, want unifi-controller", rules[0].Match.Application)
+	}
+	// Verify application-set was compiled with both members
+	as, ok := cfg.Applications.ApplicationSets["unifi-controller"]
+	if !ok {
+		t.Fatal("application-set unifi-controller not found")
+	}
+	if len(as.Applications) != 2 {
+		t.Errorf("application-set has %d members, want 2", len(as.Applications))
+	}
+	// Verify individual apps are resolvable
+	expanded, err := ExpandApplicationSet("unifi-controller", &cfg.Applications)
+	if err != nil {
+		t.Fatalf("expand application-set: %v", err)
+	}
+	if len(expanded) != 2 {
+		t.Errorf("expanded to %d apps, want 2", len(expanded))
+	}
+}
+
+func TestSNATDestinationAddressBracketList(t *testing.T) {
+	input := `
+security {
+    nat {
+        source {
+            rule-set rs1 {
+                from zone trust;
+                to zone untrust;
+                rule r1 {
+                    match {
+                        source-address 10.0.0.0/8;
+                        destination-address [ 203.0.113.0/24 198.51.100.0/24 ];
+                    }
+                    then {
+                        source-nat interface;
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	rules := cfg.Security.NAT.Source[0].Rules
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+	// DestinationAddress backward compat
+	if rules[0].Match.DestinationAddress != "203.0.113.0/24" {
+		t.Errorf("DestinationAddress = %q, want 203.0.113.0/24", rules[0].Match.DestinationAddress)
+	}
+	// DestinationAddresses should have both
+	want := []string{"203.0.113.0/24", "198.51.100.0/24"}
+	if len(rules[0].Match.DestinationAddresses) != len(want) {
+		t.Fatalf("DestinationAddresses len = %d, want %d", len(rules[0].Match.DestinationAddresses), len(want))
+	}
+	for i, w := range want {
+		if rules[0].Match.DestinationAddresses[i] != w {
+			t.Errorf("DestinationAddresses[%d] = %q, want %q", i, rules[0].Match.DestinationAddresses[i], w)
+		}
+	}
+}
+
+func TestSNATMultipleAddressPairsSetSyntax(t *testing.T) {
+	lines := []string{
+		"set security nat source rule-set rs1 from zone trust",
+		"set security nat source rule-set rs1 to zone untrust",
+		"set security nat source rule-set rs1 rule r1 match source-address 10.0.0.0/8",
+		"set security nat source rule-set rs1 rule r1 match source-address 172.16.0.0/12",
+		"set security nat source rule-set rs1 rule r1 match destination-address 203.0.113.0/24",
+		"set security nat source rule-set rs1 rule r1 match destination-address 198.51.100.0/24",
+		"set security nat source rule-set rs1 rule r1 then source-nat off",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	rules := cfg.Security.NAT.Source[0].Rules
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+	// Both source and destination bracket lists
+	wantSrc := []string{"10.0.0.0/8", "172.16.0.0/12"}
+	if len(rules[0].Match.SourceAddresses) != len(wantSrc) {
+		t.Fatalf("SourceAddresses len = %d, want %d", len(rules[0].Match.SourceAddresses), len(wantSrc))
+	}
+	for i, w := range wantSrc {
+		if rules[0].Match.SourceAddresses[i] != w {
+			t.Errorf("SourceAddresses[%d] = %q, want %q", i, rules[0].Match.SourceAddresses[i], w)
+		}
+	}
+	wantDst := []string{"203.0.113.0/24", "198.51.100.0/24"}
+	if len(rules[0].Match.DestinationAddresses) != len(wantDst) {
+		t.Fatalf("DestinationAddresses len = %d, want %d", len(rules[0].Match.DestinationAddresses), len(wantDst))
+	}
+	for i, w := range wantDst {
+		if rules[0].Match.DestinationAddresses[i] != w {
+			t.Errorf("DestinationAddresses[%d] = %q, want %q", i, rules[0].Match.DestinationAddresses[i], w)
+		}
+	}
+	// source-nat off
+	if !rules[0].Then.Off {
+		t.Error("expected Then.Off = true")
 	}
 }

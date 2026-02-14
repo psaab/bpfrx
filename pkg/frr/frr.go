@@ -1166,9 +1166,10 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			// then actions
 			if term.NextHop != "" {
 				if term.NextHop == "peer-address" {
-					// peer-address is handled by BGP neighbor config
-				} else if term.NextHop == "self" {
+					// Junos "next-hop peer-address" → FRR "set ip next-hop peer-address"
 					fmt.Fprintf(&b, " set ip next-hop peer-address\n")
+				} else if term.NextHop == "self" {
+					// Junos "next-hop self" → FRR "set ip next-hop self" (eBGP default)
 				} else {
 					fmt.Fprintf(&b, " set ip next-hop %s\n", term.NextHop)
 				}

@@ -94,6 +94,14 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 		}
 	}
 
+	// Extract lo0 filter input from parsed interfaces into SystemConfig.
+	if lo0 := cfg.Interfaces.Interfaces["lo0"]; lo0 != nil {
+		if u0 := lo0.Units[0]; u0 != nil {
+			cfg.System.Lo0FilterInputV4 = u0.FilterInputV4
+			cfg.System.Lo0FilterInputV6 = u0.FilterInputV6
+		}
+	}
+
 	if warnings := ValidateConfig(cfg); len(warnings) > 0 {
 		for _, w := range warnings {
 			cfg.Warnings = append(cfg.Warnings, w)
@@ -867,9 +875,14 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 		// Check for tunnel configuration
 		tunnelNode := child.FindChild("tunnel")
 		if tunnelNode != nil {
+			// Default mode based on interface name prefix: ip-X/X/X → ipip, gr-X/X/X → gre
+			defaultMode := "gre"
+			if strings.HasPrefix(ifName, "ip-") {
+				defaultMode = "ipip"
+			}
 			tc := &TunnelConfig{
 				Name: ifName,
-				Mode: "gre", // default
+				Mode: defaultMode,
 			}
 			for _, prop := range tunnelNode.Children {
 				switch prop.Name() {
@@ -942,7 +955,11 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 			if tunnelNode := unitInst.node.FindChild("tunnel"); tunnelNode != nil {
 				tc := ifc.Tunnel
 				if tc == nil {
-					tc = &TunnelConfig{Name: ifName, Mode: "gre"}
+					defaultMode := "gre"
+					if strings.HasPrefix(ifName, "ip-") {
+						defaultMode = "ipip"
+					}
+					tc = &TunnelConfig{Name: ifName, Mode: defaultMode}
 					ifc.Tunnel = tc
 				}
 				for _, prop := range tunnelNode.Children {
@@ -1369,9 +1386,31 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "source-address":
-						rule.Match.SourceAddress = nodeVal(m)
+						// Support bracket lists: source-address [ addr1 addr2 ... ]
+						if len(m.Keys) >= 2 {
+							rule.Match.SourceAddresses = append(rule.Match.SourceAddresses, m.Keys[1:]...)
+						} else if len(m.Children) > 0 {
+							for _, child := range m.Children {
+								rule.Match.SourceAddresses = append(rule.Match.SourceAddresses, child.Name())
+							}
+						}
+						if len(rule.Match.SourceAddresses) > 0 {
+							rule.Match.SourceAddress = rule.Match.SourceAddresses[0]
+						}
 					case "destination-address":
-						rule.Match.DestinationAddress = nodeVal(m)
+						// Support bracket lists: destination-address [ addr1 addr2 ... ]
+						if len(m.Keys) >= 2 {
+							rule.Match.DestinationAddresses = append(rule.Match.DestinationAddresses, m.Keys[1:]...)
+						} else if len(m.Children) > 0 {
+							for _, child := range m.Children {
+								rule.Match.DestinationAddresses = append(rule.Match.DestinationAddresses, child.Name())
+							}
+						}
+						if len(rule.Match.DestinationAddresses) > 0 {
+							rule.Match.DestinationAddress = rule.Match.DestinationAddresses[0]
+						} else {
+							rule.Match.DestinationAddress = nodeVal(m)
+						}
 					case "destination-port":
 						if len(m.Children) > 0 {
 							for _, child := range m.Children {
@@ -1500,27 +1539,38 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "destination-address":
-						rule.Match.DestinationAddress = nodeVal(m)
-					case "destination-port":
-						if len(m.Children) > 0 {
-							// Multiple ports as children: destination-port { 32400; 443; }
+						// Support bracket lists: destination-address [ addr1 addr2 ... ]
+						if len(m.Keys) >= 2 {
+							rule.Match.DestinationAddresses = append(rule.Match.DestinationAddresses, m.Keys[1:]...)
+						} else if len(m.Children) > 0 {
 							for _, child := range m.Children {
-								if n, err := strconv.Atoi(child.Name()); err == nil {
-									rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, n)
-									if rule.Match.DestinationPort == 0 {
-										rule.Match.DestinationPort = n
-									}
-								}
-							}
-						} else if v := nodeVal(m); v != "" {
-							// Single port: destination-port 8080;
-							if n, err := strconv.Atoi(v); err == nil {
-								rule.Match.DestinationPort = n
-								rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, n)
+								rule.Match.DestinationAddresses = append(rule.Match.DestinationAddresses, child.Name())
 							}
 						}
+						if len(rule.Match.DestinationAddresses) > 0 {
+							rule.Match.DestinationAddress = rule.Match.DestinationAddresses[0]
+						} else {
+							rule.Match.DestinationAddress = nodeVal(m)
+						}
+					case "destination-port":
+						rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, parseDNATPortList(m)...)
+						if rule.Match.DestinationPort == 0 && len(rule.Match.DestinationPorts) > 0 {
+							rule.Match.DestinationPort = rule.Match.DestinationPorts[0]
+						}
 					case "source-address":
-						rule.Match.SourceAddress = nodeVal(m)
+						// Support bracket lists: source-address [ addr1 addr2 ... ]
+						if len(m.Keys) >= 2 {
+							rule.Match.SourceAddresses = append(rule.Match.SourceAddresses, m.Keys[1:]...)
+						} else if len(m.Children) > 0 {
+							for _, child := range m.Children {
+								rule.Match.SourceAddresses = append(rule.Match.SourceAddresses, child.Name())
+							}
+						}
+						if len(rule.Match.SourceAddresses) > 0 {
+							rule.Match.SourceAddress = rule.Match.SourceAddresses[0]
+						}
+					case "source-address-name":
+						rule.Match.SourceAddressName = nodeVal(m)
 					case "protocol":
 						rule.Match.Protocol = nodeVal(m)
 					case "application":
@@ -1561,6 +1611,69 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 		}
 	}
 	return nil
+}
+
+// parseDNATPortList extracts destination ports from a destination-port node.
+// Handles single port, multiple ports as children, and port ranges ("20000 to 30000").
+// AST shapes handled:
+//   - Hierarchical multi-port: destination-port { 80; 443; 20000 to 30000; }
+//   - Single port leaf: destination-port 8080;
+//   - Set syntax range: destination-port 20000 { to 30000; } (args=1 consumes low, "to N" is child)
+func parseDNATPortList(m *Node) []int {
+	var ports []int
+	if len(m.Children) > 0 {
+		// Check for set-syntax port range: Keys=["destination-port","20000"] + child "to 30000"
+		if len(m.Keys) >= 2 {
+			if low, err := strconv.Atoi(m.Keys[1]); err == nil {
+				// Look for "to" child indicating a range
+				toChild := m.FindChild("to")
+				if toChild != nil {
+					if high, err2 := strconv.Atoi(nodeVal(toChild)); err2 == nil && high >= low {
+						for p := low; p <= high; p++ {
+							ports = append(ports, p)
+						}
+						return ports
+					}
+				}
+				// No range — just a port with non-range children (shouldn't happen, but be safe)
+				ports = append(ports, low)
+			}
+		}
+		// Multiple ports/ranges as children: destination-port { 80; 443; 20000 to 30000; }
+		for i := 0; i < len(m.Children); i++ {
+			child := m.Children[i]
+			low, err := strconv.Atoi(child.Name())
+			if err != nil {
+				continue
+			}
+			// Hierarchical range: "20000 to 30000" → leaf Keys=["20000", "to", "30000"]
+			if len(child.Keys) >= 3 && child.Keys[1] == "to" {
+				if high, err2 := strconv.Atoi(child.Keys[2]); err2 == nil && high >= low {
+					for p := low; p <= high; p++ {
+						ports = append(ports, p)
+					}
+					continue
+				}
+			}
+			// Sibling-node range: child[i]="20000", child[i+1]="to", child[i+2]="30000"
+			if i+2 < len(m.Children) && m.Children[i+1].Name() == "to" {
+				if high, err2 := strconv.Atoi(m.Children[i+2].Name()); err2 == nil && high >= low {
+					for p := low; p <= high; p++ {
+						ports = append(ports, p)
+					}
+					i += 2
+					continue
+				}
+			}
+			ports = append(ports, low)
+		}
+	} else if v := nodeVal(m); v != "" {
+		// Single port: destination-port 8080;
+		if n, err := strconv.Atoi(v); err == nil {
+			ports = append(ports, n)
+		}
+	}
+	return ports
 }
 
 func compileNATStatic(node *Node, sec *SecurityConfig) error {
@@ -2131,6 +2244,29 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 				}
 			}
 			ro.RibGroups[rg.Name] = rg
+		}
+	}
+
+	// Parse global interface-routes { rib-group { inet X; inet6 Y; } }
+	if irNode := node.FindChild("interface-routes"); irNode != nil {
+		if rgNode := irNode.FindChild("rib-group"); rgNode != nil {
+			for _, rgChild := range rgNode.Children {
+				switch rgChild.Name() {
+				case "inet":
+					ro.InterfaceRoutesRibGroup = nodeVal(rgChild)
+				case "inet6":
+					ro.InterfaceRoutesRibGroupV6 = nodeVal(rgChild)
+				}
+			}
+			// Also handle inline: "rib-group inet NAME" or "rib-group inet6 NAME"
+			for i := 1; i < len(rgNode.Keys)-1; i++ {
+				switch rgNode.Keys[i] {
+				case "inet":
+					ro.InterfaceRoutesRibGroup = rgNode.Keys[i+1]
+				case "inet6":
+					ro.InterfaceRoutesRibGroupV6 = rgNode.Keys[i+1]
+				}
+			}
 		}
 	}
 

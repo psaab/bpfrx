@@ -85,7 +85,8 @@ int tc_forward_prog(struct __sk_buff *skb)
 			__u32 mirror_ctr_key = 0;
 			__u64 *cnt = bpf_map_lookup_elem(&mirror_counter, &mirror_ctr_key);
 			if (cnt) {
-				__u64 cur = __sync_fetch_and_add(cnt, 1);
+				__u64 cur = *cnt;
+				__sync_fetch_and_add(cnt, 1);
 				if (cur % rate != 0)
 					do_mirror = 0;
 			}

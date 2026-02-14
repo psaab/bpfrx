@@ -32,11 +32,13 @@ type bpfrxTcConntrackAppKey struct {
 }
 
 type bpfrxTcConntrackAppValue struct {
-	_       structs.HostLayout
-	AppId   uint32
-	AlgType uint8
-	Pad     uint8
-	Timeout uint16
+	_           structs.HostLayout
+	AppId       uint32
+	AlgType     uint8
+	Pad         uint8
+	Timeout     uint16
+	SrcPortLow  uint16
+	SrcPortHigh uint16
 }
 
 type bpfrxTcConntrackBpfDevmapVal struct {
@@ -115,11 +117,12 @@ type bpfrxTcConntrackFilterRule struct {
 	SrcPortHi    uint16
 	DscpRewrite  uint8
 	LogFlag      uint8
+	TcpFlags     uint8
+	IsFragment   uint8
 	SrcAddr      [16]uint8
 	SrcMask      [16]uint8
 	DstAddr      [16]uint8
 	DstMask      [16]uint8
-	_            [2]byte
 	RoutingTable uint32
 }
 
@@ -182,6 +185,12 @@ type bpfrxTcConntrackLpmKeyV6 struct {
 	_         structs.HostLayout
 	Prefixlen uint32
 	Addr      [16]uint8
+}
+
+type bpfrxTcConntrackMirrorConfig struct {
+	_             structs.HostLayout
+	MirrorIfindex uint32
+	Rate          uint32
 }
 
 type bpfrxTcConntrackNat64Config struct {
@@ -266,16 +275,18 @@ type bpfrxTcConntrackPktMeta struct {
 		V4 uint32
 		_  [12]byte
 	}
-	NatSrcPort   uint16
-	NatDstPort   uint16
-	NatFlags     uint32
-	FwdIfindex   uint32
-	FwdDmac      [6]uint8
-	FwdSmac      [6]uint8
-	RoutingTable uint32
-	DscpRewrite  uint8
-	PadMeta      uint8
-	AppTimeout   uint16
+	NatSrcPort    uint16
+	NatDstPort    uint16
+	NatFlags      uint32
+	FwdIfindex    uint32
+	FwdDmac       [6]uint8
+	FwdSmac       [6]uint8
+	RoutingTable  uint32
+	DscpRewrite   uint8
+	PadMeta       uint8
+	AppTimeout    uint16
+	MirrorIfindex uint32
+	MirrorRate    uint32
 }
 
 type bpfrxTcConntrackPolicyRule struct {
@@ -554,6 +565,8 @@ type bpfrxTcConntrackMapSpecs struct {
 	IfaceZoneMap      *ebpf.MapSpec `ebpf:"iface_zone_map"`
 	InterfaceCounters *ebpf.MapSpec `ebpf:"interface_counters"`
 	IpSweepTrack      *ebpf.MapSpec `ebpf:"ip_sweep_track"`
+	MirrorConfig      *ebpf.MapSpec `ebpf:"mirror_config"`
+	MirrorCounter     *ebpf.MapSpec `ebpf:"mirror_counter"`
 	Nat64Configs      *ebpf.MapSpec `ebpf:"nat64_configs"`
 	Nat64Count        *ebpf.MapSpec `ebpf:"nat64_count"`
 	Nat64PrefixMap    *ebpf.MapSpec `ebpf:"nat64_prefix_map"`
@@ -629,6 +642,8 @@ type bpfrxTcConntrackMaps struct {
 	IfaceZoneMap      *ebpf.Map `ebpf:"iface_zone_map"`
 	InterfaceCounters *ebpf.Map `ebpf:"interface_counters"`
 	IpSweepTrack      *ebpf.Map `ebpf:"ip_sweep_track"`
+	MirrorConfig      *ebpf.Map `ebpf:"mirror_config"`
+	MirrorCounter     *ebpf.Map `ebpf:"mirror_counter"`
 	Nat64Configs      *ebpf.Map `ebpf:"nat64_configs"`
 	Nat64Count        *ebpf.Map `ebpf:"nat64_count"`
 	Nat64PrefixMap    *ebpf.Map `ebpf:"nat64_prefix_map"`
@@ -680,6 +695,8 @@ func (m *bpfrxTcConntrackMaps) Close() error {
 		m.IfaceZoneMap,
 		m.InterfaceCounters,
 		m.IpSweepTrack,
+		m.MirrorConfig,
+		m.MirrorCounter,
 		m.Nat64Configs,
 		m.Nat64Count,
 		m.Nat64PrefixMap,

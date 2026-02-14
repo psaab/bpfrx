@@ -151,13 +151,21 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 				.dst_port = meta->dst_port,
 			};
 			int apos = rte_hash_lookup(ctx->shm->applications, &ak);
-			if (apos < 0 || !ctx->shm->app_values ||
-			    ctx->shm->app_values[apos].app_id != rule->app_id)
+			if (apos < 0 || !ctx->shm->app_values)
+				continue;
+			struct app_value *av = &ctx->shm->app_values[apos];
+			/* Check source port range if specified */
+			if (av->src_port_low != 0 || av->src_port_high != 0) {
+				uint16_t sp = meta->src_port;
+				if (sp < av->src_port_low || sp > av->src_port_high)
+					continue;
+			}
+			if (av->app_id != rule->app_id)
 				continue;
 
 			/* Store app timeout if set */
-			if (ctx->shm->app_values[apos].timeout > 0)
-				meta->app_timeout = ctx->shm->app_values[apos].timeout;
+			if (av->timeout > 0)
+				meta->app_timeout = av->timeout;
 		}
 
 		/* Match found */

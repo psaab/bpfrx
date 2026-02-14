@@ -956,6 +956,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	d.applyHostname(cfg)
 	d.applyTimezone(cfg)
 	d.applyKernelTuning(cfg)
+	d.applyLo0Filter(cfg)
 
 	// 9.6. Write SSH known hosts file
 	d.applySSHKnownHosts(cfg)
@@ -1855,6 +1856,104 @@ func (d *Daemon) applyKernelTuning(cfg *config.Config) {
 			}
 		}
 	}
+}
+
+// applyLo0Filter applies loopback filter rules for host-bound traffic.
+// Implements "interfaces lo0 unit 0 family inet filter input <name>" by
+// generating nftables rules from the named firewall filter.
+func (d *Daemon) applyLo0Filter(cfg *config.Config) {
+	filterV4 := cfg.System.Lo0FilterInputV4
+	filterV6 := cfg.System.Lo0FilterInputV6
+	if filterV4 == "" && filterV6 == "" {
+		// No lo0 filter configured — clean up any stale nftables rules
+		_ = exec.Command("nft", "delete", "table", "inet", "bpfrx_lo0").Run()
+		return
+	}
+
+	var rules []string
+	rules = append(rules, "table inet bpfrx_lo0 {")
+	rules = append(rules, "  chain input {")
+	rules = append(rules, "    type filter hook input priority 0; policy accept;")
+
+	if filterV4 != "" {
+		if f, ok := cfg.Firewall.FiltersInet[filterV4]; ok {
+			for _, term := range f.Terms {
+				r := nftRuleFromTerm(term, "ip")
+				if r != "" {
+					rules = append(rules, "    "+r)
+				}
+			}
+		}
+	}
+	if filterV6 != "" {
+		if f, ok := cfg.Firewall.FiltersInet6[filterV6]; ok {
+			for _, term := range f.Terms {
+				r := nftRuleFromTerm(term, "ip6")
+				if r != "" {
+					rules = append(rules, "    "+r)
+				}
+			}
+		}
+	}
+	rules = append(rules, "  }")
+	rules = append(rules, "}")
+
+	nftConf := strings.Join(rules, "\n") + "\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
+	cmd.Stdin = strings.NewReader("flush ruleset inet bpfrx_lo0\n" + nftConf)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		slog.Warn("failed to apply lo0 filter", "err", err, "output", string(out))
+	} else {
+		slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6)
+	}
+}
+
+// nftRuleFromTerm converts a firewall filter term to an nftables rule string.
+func nftRuleFromTerm(term *config.FirewallFilterTerm, family string) string {
+	var parts []string
+
+	// Source address matching
+	for _, src := range term.SourceAddresses {
+		parts = append(parts, family+" saddr "+src)
+	}
+
+	// Source prefix-list except (negated match)
+	for _, pl := range term.SourcePrefixLists {
+		if pl.Except {
+			parts = append(parts, family+" saddr != { placeholder-"+pl.Name+" }")
+		}
+	}
+
+	// Protocol matching
+	if term.Protocol != "" {
+		parts = append(parts, "meta l4proto "+term.Protocol)
+	}
+
+	// Source port matching
+	for _, sp := range term.SourcePorts {
+		parts = append(parts, "th sport "+sp)
+	}
+
+	// Destination port matching
+	for _, dp := range term.DestinationPorts {
+		parts = append(parts, "th dport "+dp)
+	}
+
+	// Action
+	action := "accept"
+	switch term.Action {
+	case "discard", "reject":
+		action = "drop"
+	case "accept", "":
+		action = "accept"
+	}
+
+	if len(parts) == 0 {
+		return action
+	}
+	return strings.Join(parts, " ") + " " + action
 }
 
 // applySSHKnownHosts writes /etc/ssh/ssh_known_hosts from

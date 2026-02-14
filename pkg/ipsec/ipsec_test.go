@@ -558,3 +558,117 @@ func TestGenerateConfig_NoNATTraversal_Legacy(t *testing.T) {
 		t.Errorf("legacy NoNATTraversal should produce 'encap = no': %s", got)
 	}
 }
+
+func TestGenerateConfig_AggressiveMode(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	cfg := &config.IPsecConfig{
+		IKEPolicies: map[string]*config.IKEPolicy{
+			"aggr-pol": {
+				Name:      "aggr-pol",
+				Mode:      "aggressive",
+				Proposals: "ike-p1",
+				PSK:       "secret",
+			},
+		},
+		Gateways: map[string]*config.IPsecGateway{
+			"gw": {
+				Name:      "gw",
+				Address:   "10.0.0.1",
+				IKEPolicy: "aggr-pol",
+				Version:   "v1-only",
+			},
+		},
+		Proposals: map[string]*config.IPsecProposal{},
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {Gateway: "gw"},
+		},
+	}
+	got := m.generateConfig(cfg)
+	if !strings.Contains(got, "aggressive = yes") {
+		t.Errorf("aggressive mode not set: %s", got)
+	}
+	if !strings.Contains(got, "version = 1") {
+		t.Errorf("IKEv1 not set for aggressive mode: %s", got)
+	}
+}
+
+func TestGenerateConfig_AggressiveMode_NotSet(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	cfg := &config.IPsecConfig{
+		IKEPolicies: map[string]*config.IKEPolicy{
+			"main-pol": {
+				Name: "main-pol",
+				Mode: "main",
+				PSK:  "secret",
+			},
+		},
+		Gateways: map[string]*config.IPsecGateway{
+			"gw": {
+				Name:      "gw",
+				Address:   "10.0.0.1",
+				IKEPolicy: "main-pol",
+			},
+		},
+		Proposals: map[string]*config.IPsecProposal{},
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {Gateway: "gw"},
+		},
+	}
+	got := m.generateConfig(cfg)
+	if strings.Contains(got, "aggressive") {
+		t.Errorf("main mode should not have aggressive: %s", got)
+	}
+}
+
+func TestGenerateConfig_DFBit(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	tests := []struct {
+		name  string
+		dfbit string
+		want  string
+		notWant string
+	}{
+		{"copy", "copy", "copy_df = yes", "copy_df = no"},
+		{"set", "set", "copy_df = no", "copy_df = yes"},
+		{"clear", "clear", "", "copy_df"},
+		{"empty", "", "", "copy_df"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.IPsecConfig{
+				Proposals: map[string]*config.IPsecProposal{},
+				VPNs: map[string]*config.IPsecVPN{
+					"tun": {Gateway: "10.0.0.1", DFBit: tt.dfbit},
+				},
+			}
+			got := m.generateConfig(cfg)
+			if tt.want != "" && !strings.Contains(got, tt.want) {
+				t.Errorf("df-bit %q: missing %q in:\n%s", tt.dfbit, tt.want, got)
+			}
+			if tt.notWant != "" && strings.Contains(got, tt.notWant) {
+				t.Errorf("df-bit %q: unexpected %q in:\n%s", tt.dfbit, tt.notWant, got)
+			}
+		})
+	}
+}
+
+func TestGenerateConfig_EstablishTunnels(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	cfg := &config.IPsecConfig{
+		Proposals: map[string]*config.IPsecProposal{},
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {Gateway: "10.0.0.1", EstablishTunnels: "immediately"},
+		},
+	}
+	got := m.generateConfig(cfg)
+	if !strings.Contains(got, "start_action = start") {
+		t.Errorf("establish-tunnels immediately should produce start_action: %s", got)
+	}
+
+	// on-traffic should NOT produce start_action
+	cfg.VPNs["tun"].EstablishTunnels = "on-traffic"
+	got = m.generateConfig(cfg)
+	if strings.Contains(got, "start_action") {
+		t.Errorf("on-traffic should not produce start_action: %s", got)
+	}
+}

@@ -968,6 +968,16 @@ func compileApplications(dp DataPlane,cfg *config.Config, result *CompileResult)
 			continue
 		}
 
+		// Parse source port range (stored in BPF app_value, not expanded)
+		var srcLow, srcHigh uint16
+		if app.SourcePort != "" {
+			srcLow, srcHigh, err = parsePortRange(app.SourcePort)
+			if err != nil {
+				slog.Warn("bad source-port for application",
+					"name", appName, "port", app.SourcePort, "err", err)
+			}
+		}
+
 		var appTimeout uint16
 		if app.InactivityTimeout > 0 && app.InactivityTimeout <= 65535 {
 			appTimeout = uint16(app.InactivityTimeout)
@@ -976,7 +986,7 @@ func compileApplications(dp DataPlane,cfg *config.Config, result *CompileResult)
 		algType := algTypeFromString(app.ALG)
 
 		for _, port := range ports {
-			if err := dp.SetApplication(proto, port, appID, appTimeout, algType); err != nil {
+			if err := dp.SetApplication(proto, port, appID, appTimeout, algType, srcLow, srcHigh); err != nil {
 				return fmt.Errorf("set application %s port %d: %w",
 					appName, port, err)
 			}
@@ -984,7 +994,7 @@ func compileApplications(dp DataPlane,cfg *config.Config, result *CompileResult)
 		}
 
 		slog.Debug("application compiled", "name", appName, "id", appID,
-			"proto", proto, "ports", ports, "timeout", appTimeout)
+			"proto", proto, "ports", ports, "srcPort", app.SourcePort, "timeout", appTimeout)
 		appID++
 	}
 
@@ -1387,15 +1397,16 @@ func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 
 			// source-nat off: write exemption rule (no pool allocation)
 			if rule.Then.Off {
-				srcAddrID, err := resolveSNATMatchAddr(dp,rule.Match.SourceAddress, result)
-				if err != nil {
-					return fmt.Errorf("snat rule %s/%s source match: %w",
-						rs.Name, rule.Name, err)
+				// Resolve source addresses (supports bracket lists)
+				srcAddrs := rule.Match.SourceAddresses
+				if len(srcAddrs) == 0 {
+					srcAddrs = []string{rule.Match.SourceAddress}
 				}
-				dstAddrID, err := resolveSNATMatchAddr(dp,rule.Match.DestinationAddress, result)
-				if err != nil {
-					return fmt.Errorf("snat rule %s/%s dest match: %w",
-						rs.Name, rule.Name, err)
+
+				// Resolve destination addresses (supports bracket lists)
+				dstAddrs := rule.Match.DestinationAddresses
+				if len(dstAddrs) == 0 {
+					dstAddrs = []string{rule.Match.DestinationAddress}
 				}
 
 				zp := zonePairIdx{fromZone, toZone}
@@ -1404,41 +1415,57 @@ func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 				result.NATCounterIDs[ruleKey] = counterID
 				result.nextNATCounterID++
 
-				// Write v4 rule
-				val := SNATValue{
-					Mode:      SNATModeOff,
-					SrcAddrID: srcAddrID,
-					DstAddrID: dstAddrID,
-					CounterID: counterID,
-				}
-				ri := v4RuleIdx[zp]
-				if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
-					return fmt.Errorf("set snat off rule %s/%s: %w",
-						rs.Name, rule.Name, err)
-				}
-				writtenSNAT[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
-				v4RuleIdx[zp] = ri + 1
+				for _, srcAddr := range srcAddrs {
+					srcAddrID, err := resolveSNATMatchAddr(dp, srcAddr, result)
+					if err != nil {
+						return fmt.Errorf("snat rule %s/%s source match %q: %w",
+							rs.Name, rule.Name, srcAddr, err)
+					}
+					for _, dstAddr := range dstAddrs {
+						dstAddrID, err := resolveSNATMatchAddr(dp, dstAddr, result)
+						if err != nil {
+							return fmt.Errorf("snat rule %s/%s dest match %q: %w",
+								rs.Name, rule.Name, dstAddr, err)
+						}
 
-				// Write v6 rule
-				val6 := SNATValueV6{
-					Mode:      SNATModeOff,
-					SrcAddrID: srcAddrID,
-					DstAddrID: dstAddrID,
-					CounterID: counterID,
-				}
-				ri6 := v6RuleIdx[zp]
-				if err := dp.SetSNATRuleV6(fromZone, toZone, ri6, val6); err != nil {
-					return fmt.Errorf("set snat_v6 off rule %s/%s: %w",
-						rs.Name, rule.Name, err)
-				}
-				writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri6}] = true
-				v6RuleIdx[zp] = ri6 + 1
+						// Write v4 rule
+						val := SNATValue{
+							Mode:      SNATModeOff,
+							SrcAddrID: srcAddrID,
+							DstAddrID: dstAddrID,
+							CounterID: counterID,
+						}
+						ri := v4RuleIdx[zp]
+						if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
+							return fmt.Errorf("set snat off rule %s/%s: %w",
+								rs.Name, rule.Name, err)
+						}
+						writtenSNAT[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
+						v4RuleIdx[zp] = ri + 1
 
-				slog.Info("source NAT off rule compiled",
-					"rule-set", rs.Name, "rule", rule.Name,
-					"from", rs.FromZone, "to", rs.ToZone,
-					"counter_id", counterID,
-					"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID)
+						// Write v6 rule
+						val6 := SNATValueV6{
+							Mode:      SNATModeOff,
+							SrcAddrID: srcAddrID,
+							DstAddrID: dstAddrID,
+							CounterID: counterID,
+						}
+						ri6 := v6RuleIdx[zp]
+						if err := dp.SetSNATRuleV6(fromZone, toZone, ri6, val6); err != nil {
+							return fmt.Errorf("set snat_v6 off rule %s/%s: %w",
+								rs.Name, rule.Name, err)
+						}
+						writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri6}] = true
+						v6RuleIdx[zp] = ri6 + 1
+
+						slog.Info("source NAT off rule compiled",
+							"rule-set", rs.Name, "rule", rule.Name,
+							"from", rs.FromZone, "to", rs.ToZone,
+							"counter_id", counterID,
+							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+							"src_addr", srcAddr, "dst_addr", dstAddr)
+					}
+				}
 				continue
 			}
 
@@ -1595,74 +1622,90 @@ func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 				}
 			}
 
-			// Resolve SNAT match criteria to address IDs
-			srcAddrID, err := resolveSNATMatchAddr(dp,rule.Match.SourceAddress, result)
-			if err != nil {
-				return fmt.Errorf("snat rule %s/%s source match: %w",
-					rs.Name, rule.Name, err)
+			// Resolve SNAT match addresses (supports bracket lists).
+			// Creates one BPF rule per (src, dst) address pair (Cartesian product).
+			srcAddrs := rule.Match.SourceAddresses
+			if len(srcAddrs) == 0 {
+				srcAddrs = []string{rule.Match.SourceAddress}
 			}
-			dstAddrID, err := resolveSNATMatchAddr(dp,rule.Match.DestinationAddress, result)
-			if err != nil {
-				return fmt.Errorf("snat rule %s/%s dest match: %w",
-					rs.Name, rule.Name, err)
+			dstAddrs := rule.Match.DestinationAddresses
+			if len(dstAddrs) == 0 {
+				dstAddrs = []string{rule.Match.DestinationAddress}
 			}
 
 			zp := zonePairIdx{fromZone, toZone}
 
-			// Assign NAT rule counter ID
+			// Assign NAT rule counter ID (shared across expanded address pairs)
 			ruleKey := rs.Name + "/" + rule.Name
 			counterID := result.nextNATCounterID
 			result.NATCounterIDs[ruleKey] = counterID
 			result.nextNATCounterID++
 
-			// Write SNAT rule (v4)
-			if len(v4IPs) > 0 {
-				val := SNATValue{
-					Mode:      curPoolID,
-					SrcAddrID: srcAddrID,
-					DstAddrID: dstAddrID,
-					CounterID: counterID,
+			for _, srcAddr := range srcAddrs {
+				srcAddrID, err := resolveSNATMatchAddr(dp, srcAddr, result)
+				if err != nil {
+					return fmt.Errorf("snat rule %s/%s source match %q: %w",
+						rs.Name, rule.Name, srcAddr, err)
 				}
-				ri := v4RuleIdx[zp]
-				if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
-					return fmt.Errorf("set snat rule %s/%s: %w",
-						rs.Name, rule.Name, err)
-				}
-				writtenSNAT[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
-				v4RuleIdx[zp] = ri + 1
-				slog.Info("source NAT rule compiled",
-					"rule-set", rs.Name, "rule", rule.Name,
-					"from", rs.FromZone, "to", rs.ToZone,
-					"pool_id", curPoolID, "rule_idx", ri,
-					"counter_id", counterID,
-					"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-					"v4_ips", len(v4IPs),
-					"ports", fmt.Sprintf("%d-%d", poolCfg.PortLow, poolCfg.PortHigh))
-			}
+				for _, dstAddr := range dstAddrs {
+					dstAddrID, err := resolveSNATMatchAddr(dp, dstAddr, result)
+					if err != nil {
+						return fmt.Errorf("snat rule %s/%s dest match %q: %w",
+							rs.Name, rule.Name, dstAddr, err)
+					}
 
-			// Write SNAT rule (v6)
-			if len(v6IPs) > 0 {
-				val := SNATValueV6{
-					Mode:      curPoolID,
-					SrcAddrID: srcAddrID,
-					DstAddrID: dstAddrID,
-					CounterID: counterID,
+				// Write SNAT rule (v4)
+				if len(v4IPs) > 0 {
+					val := SNATValue{
+						Mode:      curPoolID,
+						SrcAddrID: srcAddrID,
+						DstAddrID: dstAddrID,
+						CounterID: counterID,
+					}
+					ri := v4RuleIdx[zp]
+					if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
+						return fmt.Errorf("set snat rule %s/%s: %w",
+							rs.Name, rule.Name, err)
+					}
+					writtenSNAT[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
+					v4RuleIdx[zp] = ri + 1
+					slog.Info("source NAT rule compiled",
+						"rule-set", rs.Name, "rule", rule.Name,
+						"from", rs.FromZone, "to", rs.ToZone,
+						"pool_id", curPoolID, "rule_idx", ri,
+						"counter_id", counterID,
+						"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+						"src_addr", srcAddr, "dst_addr", dstAddr,
+						"v4_ips", len(v4IPs),
+						"ports", fmt.Sprintf("%d-%d", poolCfg.PortLow, poolCfg.PortHigh))
 				}
-				ri := v6RuleIdx[zp]
-				if err := dp.SetSNATRuleV6(fromZone, toZone, ri, val); err != nil {
-					return fmt.Errorf("set snat_v6 rule %s/%s: %w",
-						rs.Name, rule.Name, err)
+
+				// Write SNAT rule (v6)
+				if len(v6IPs) > 0 {
+					val := SNATValueV6{
+						Mode:      curPoolID,
+						SrcAddrID: srcAddrID,
+						DstAddrID: dstAddrID,
+						CounterID: counterID,
+					}
+					ri := v6RuleIdx[zp]
+					if err := dp.SetSNATRuleV6(fromZone, toZone, ri, val); err != nil {
+						return fmt.Errorf("set snat_v6 rule %s/%s: %w",
+							rs.Name, rule.Name, err)
+					}
+					writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
+					v6RuleIdx[zp] = ri + 1
+					slog.Info("source NAT v6 rule compiled",
+						"rule-set", rs.Name, "rule", rule.Name,
+						"from", rs.FromZone, "to", rs.ToZone,
+						"pool_id", curPoolID, "rule_idx", ri,
+						"counter_id", counterID,
+						"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+						"src_addr", srcAddr, "dst_addr", dstAddr,
+						"v6_ips", len(v6IPs))
 				}
-				writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
-				v6RuleIdx[zp] = ri + 1
-				slog.Info("source NAT v6 rule compiled",
-					"rule-set", rs.Name, "rule", rule.Name,
-					"from", rs.FromZone, "to", rs.ToZone,
-					"pool_id", curPoolID, "rule_idx", ri,
-					"counter_id", counterID,
-					"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-					"v6_ips", len(v6IPs))
-			}
+				} // end dstAddr loop
+			} // end srcAddr loop
 		}
 	}
 
@@ -1678,6 +1721,14 @@ func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 				if !ok {
 					return fmt.Errorf("DNAT pool %q not found (rule %q)",
 						rule.Then.PoolName, rule.Name)
+				}
+
+				// Validate source-address-name if present (config compatibility)
+				if rule.Match.SourceAddressName != "" {
+					if _, ok := result.AddrIDs[rule.Match.SourceAddressName]; !ok {
+						slog.Warn("DNAT source-address-name not found in address-book",
+							"rule", rule.Name, "name", rule.Match.SourceAddressName)
+					}
 				}
 
 				// Parse match destination address
@@ -1709,79 +1760,120 @@ func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 					}
 				}
 
-				// Build list of destination ports to create rules for.
-				// Multi-port DNAT creates one BPF rule per port.
-				var dstPorts []uint16
-				if len(rule.Match.DestinationPorts) > 0 {
-					for _, p := range rule.Match.DestinationPorts {
-						dstPorts = append(dstPorts, uint16(p))
+				// Resolve application match to protocol+ports if specified.
+				// Supports single apps and multi-term application-sets.
+				type dnatAppTerm struct {
+					proto string
+					ports []int
+				}
+				var appTerms []dnatAppTerm
+
+				if rule.Match.Application != "" {
+					userApps := cfg.Applications.Applications
+					// Try single application first
+					app, found := config.ResolveApplication(rule.Match.Application, userApps)
+					if found {
+						appTerms = append(appTerms, dnatAppTerm{proto: app.Protocol, ports: appPortsFromSpec(app.DestinationPort)})
+					} else if _, isSet := cfg.Applications.ApplicationSets[rule.Match.Application]; isSet {
+						// Expand application-set to individual terms
+						expanded, eerr := config.ExpandApplicationSet(rule.Match.Application, &cfg.Applications)
+						if eerr != nil {
+							slog.Warn("DNAT expand application-set failed",
+								"rule", rule.Name, "application", rule.Match.Application, "err", eerr)
+						} else {
+							for _, termName := range expanded {
+								tApp, ok := config.ResolveApplication(termName, userApps)
+								if !ok {
+									slog.Warn("DNAT application-set term not found",
+										"rule", rule.Name, "term", termName)
+									continue
+								}
+								appTerms = append(appTerms, dnatAppTerm{proto: tApp.Protocol, ports: appPortsFromSpec(tApp.DestinationPort)})
+							}
+						}
+					} else {
+						slog.Warn("DNAT application not found, ignoring",
+							"rule", rule.Name, "application", rule.Match.Application)
 					}
-				} else {
-					dstPorts = []uint16{uint16(rule.Match.DestinationPort)}
 				}
 
-				for _, dstPort := range dstPorts {
-					poolPort := dstPort
-					if pool.Port != 0 {
-						poolPort = uint16(pool.Port)
-					}
+				// If no application terms resolved, use explicit match values
+				if len(appTerms) == 0 {
+					appTerms = []dnatAppTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
+				}
 
-					// Determine protocol(s) to insert DNAT entries for.
-					// If protocol is explicitly set, use it.
-					// If protocol not set but port is set, default to TCP(6).
-					// If neither protocol nor port set, create entries for both TCP(6) and UDP(17)
-					// with port=0 (wildcard port, matched via BPF fallback lookup).
-					var protos []uint8
-					if rule.Match.Protocol != "" {
-						protos = []uint8{protocolNumber(rule.Match.Protocol)}
-					} else if dstPort != 0 {
-						protos = []uint8{6} // TCP default for port-based DNAT
+				for _, term := range appTerms {
+					// Build list of destination ports for this term
+					var dstPorts []uint16
+					if len(term.ports) > 0 {
+						for _, p := range term.ports {
+							dstPorts = append(dstPorts, uint16(p))
+						}
+					} else if rule.Match.DestinationPort != 0 {
+						dstPorts = []uint16{uint16(rule.Match.DestinationPort)}
 					} else {
-						protos = []uint8{6, 17} // both TCP and UDP for port-less DNAT
+						dstPorts = []uint16{0}
 					}
 
-					for _, proto := range protos {
-						// Route to v4 or v6 DNAT table based on match IP
-						if matchIP.To4() != nil {
-							dk := DNATKey{
-								Protocol: proto,
-								DstIP:    ipToUint32BE(matchIP),
-								DstPort:  htons(dstPort),
-							}
-							dv := DNATValue{
-								NewDstIP:   ipToUint32BE(poolIP),
-								NewDstPort: htons(poolPort),
-								Flags:      DNATFlagStatic,
-							}
-							if err := dp.SetDNATEntry(dk, dv); err != nil {
-								return fmt.Errorf("set dnat entry %s/%s proto %d: %w",
-									rs.Name, rule.Name, proto, err)
-							}
-							writtenDNAT[dk] = true
-						} else {
-							dk := DNATKeyV6{
-								Protocol: proto,
-								DstIP:    ipTo16Bytes(matchIP),
-								DstPort:  htons(dstPort),
-							}
-							dv := DNATValueV6{
-								NewDstIP:   ipTo16Bytes(poolIP),
-								NewDstPort: htons(poolPort),
-								Flags:      DNATFlagStatic,
-							}
-							if err := dp.SetDNATEntryV6(dk, dv); err != nil {
-								return fmt.Errorf("set dnat_v6 entry %s/%s proto %d: %w",
-									rs.Name, rule.Name, proto, err)
-							}
-							writtenDNATv6[dk] = true
+					for _, dstPort := range dstPorts {
+						poolPort := dstPort
+						if pool.Port != 0 {
+							poolPort = uint16(pool.Port)
 						}
 
-						slog.Info("destination NAT rule compiled",
-							"rule-set", rs.Name, "rule", rule.Name,
-							"match_ip", matchIP, "match_port", dstPort,
-							"proto", proto,
-							"pool", pool.Name, "pool_ip", poolIP,
-							"pool_port", poolPort)
+						// Determine protocol(s) to insert DNAT entries for.
+						var protos []uint8
+						if term.proto != "" {
+							protos = []uint8{protocolNumber(term.proto)}
+						} else if dstPort != 0 {
+							protos = []uint8{6} // TCP default for port-based DNAT
+						} else {
+							protos = []uint8{6, 17} // both TCP and UDP for port-less DNAT
+						}
+
+						for _, proto := range protos {
+							// Route to v4 or v6 DNAT table based on match IP
+							if matchIP.To4() != nil {
+								dk := DNATKey{
+									Protocol: proto,
+									DstIP:    ipToUint32BE(matchIP),
+									DstPort:  htons(dstPort),
+								}
+								dv := DNATValue{
+									NewDstIP:   ipToUint32BE(poolIP),
+									NewDstPort: htons(poolPort),
+									Flags:      DNATFlagStatic,
+								}
+								if err := dp.SetDNATEntry(dk, dv); err != nil {
+									return fmt.Errorf("set dnat entry %s/%s proto %d: %w",
+										rs.Name, rule.Name, proto, err)
+								}
+								writtenDNAT[dk] = true
+							} else {
+								dk := DNATKeyV6{
+									Protocol: proto,
+									DstIP:    ipTo16Bytes(matchIP),
+									DstPort:  htons(dstPort),
+								}
+								dv := DNATValueV6{
+									NewDstIP:   ipTo16Bytes(poolIP),
+									NewDstPort: htons(poolPort),
+									Flags:      DNATFlagStatic,
+								}
+								if err := dp.SetDNATEntryV6(dk, dv); err != nil {
+									return fmt.Errorf("set dnat_v6 entry %s/%s proto %d: %w",
+										rs.Name, rule.Name, proto, err)
+								}
+								writtenDNATv6[dk] = true
+							}
+
+							slog.Info("destination NAT rule compiled",
+								"rule-set", rs.Name, "rule", rule.Name,
+								"match_ip", matchIP, "match_port", dstPort,
+								"proto", proto,
+								"pool", pool.Name, "pool_ip", poolIP,
+								"pool_port", poolPort)
+						}
 					}
 				}
 			}
@@ -2221,7 +2313,13 @@ func protocolNumber(name string) uint8 {
 		return 1
 	case "icmpv6", "icmp6":
 		return 58
+	case "gre":
+		return 47
 	default:
+		// Try numeric protocol number
+		if n, err := strconv.Atoi(name); err == nil && n > 0 && n < 256 {
+			return uint8(n)
+		}
 		return 0
 	}
 }
@@ -2269,6 +2367,51 @@ func parsePorts(spec string) ([]uint16, error) {
 		return nil, err
 	}
 	return []uint16{uint16(port)}, nil
+}
+
+// appPortsFromSpec parses an application's DestinationPort spec (e.g. "80", "8080-8090")
+// into a slice of individual port ints. Returns nil for empty spec.
+func appPortsFromSpec(spec string) []int {
+	if spec == "" {
+		return nil
+	}
+	lo, hi, err := parsePortRange(spec)
+	if err != nil {
+		return nil
+	}
+	if hi > lo {
+		var ports []int
+		for p := lo; p <= hi; p++ {
+			ports = append(ports, int(p))
+		}
+		return ports
+	}
+	return []int{int(lo)}
+}
+
+// parsePortRange parses a port spec like "80", "1024-65535", or "" into (low, high).
+// Unlike parsePorts, it does NOT expand ranges — returns the range boundaries.
+func parsePortRange(spec string) (uint16, uint16, error) {
+	if spec == "" {
+		return 0, 0, nil
+	}
+	if strings.Contains(spec, "-") {
+		parts := strings.SplitN(spec, "-", 2)
+		low, err := strconv.ParseUint(parts[0], 10, 16)
+		if err != nil {
+			return 0, 0, err
+		}
+		high, err := strconv.ParseUint(parts[1], 10, 16)
+		if err != nil {
+			return 0, 0, err
+		}
+		return uint16(low), uint16(high), nil
+	}
+	port, err := strconv.ParseUint(spec, 10, 16)
+	if err != nil {
+		return 0, 0, err
+	}
+	return uint16(port), uint16(port), nil
 }
 
 // compileFirewallFilters compiles firewall filter config into BPF maps.

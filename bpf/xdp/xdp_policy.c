@@ -933,9 +933,19 @@ int xdp_policy_prog(struct xdp_md *ctx)
 	};
 	struct app_value *av = bpf_map_lookup_elem(&applications, &ak);
 	if (av) {
-		pkt_app_id = av->app_id;
-		if (av->timeout > 0)
-			meta->app_timeout = av->timeout;
+		/* Check source port range if specified (stored in host byte order) */
+		if (av->src_port_low != 0 || av->src_port_high != 0) {
+			__u16 sp = bpf_ntohs(meta->src_port);
+			if (sp >= av->src_port_low && sp <= av->src_port_high) {
+				pkt_app_id = av->app_id;
+				if (av->timeout > 0)
+					meta->app_timeout = av->timeout;
+			}
+		} else {
+			pkt_app_id = av->app_id;
+			if (av->timeout > 0)
+				meta->app_timeout = av->timeout;
+		}
 	}
 
 	/* Iterate policy rules */

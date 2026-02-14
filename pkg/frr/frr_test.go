@@ -1909,3 +1909,114 @@ func TestGenerateProtocols_OSPFVirtualLinkCustomTransitArea(t *testing.T) {
 		t.Errorf("missing virtual-link with custom transit area in:\n%s", got)
 	}
 }
+
+func TestNextHopPeerAddress(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PrefixLists:      make(map[string]*config.PrefixList),
+		Communities:      make(map[string]*config.CommunityDef),
+		ASPaths:          make(map[string]*config.ASPathDef),
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"to-vpn-mesh": {
+				Name: "to-vpn-mesh",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:         "v6",
+						FromProtocol: "direct",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "2001:559:8585::/48", MatchType: "exact"},
+						},
+						NextHop: "peer-address",
+						Action:  "accept",
+					},
+					{
+						Name:         "v4",
+						FromProtocol: "direct",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "172.16.0.0/20", MatchType: "exact"},
+						},
+						Action: "accept",
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+	got := m.generatePolicyOptions(po)
+
+	// "next-hop peer-address" in Junos should map to "set ip next-hop peer-address" in FRR
+	if !strings.Contains(got, "set ip next-hop peer-address") {
+		t.Errorf("missing 'set ip next-hop peer-address' in:\n%s", got)
+	}
+
+	// Verify route-filter exact generates proper prefix-list
+	if !strings.Contains(got, "permit 2001:559:8585::/48\n") {
+		t.Errorf("missing exact prefix-list entry for 2001:559:8585::/48 in:\n%s", got)
+	}
+
+	// Verify "next-hop self" does NOT generate "set ip next-hop peer-address"
+	po2 := &config.PolicyOptionsConfig{
+		PrefixLists:      make(map[string]*config.PrefixList),
+		Communities:      make(map[string]*config.CommunityDef),
+		ASPaths:          make(map[string]*config.ASPathDef),
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"self-policy": {
+				Name: "self-policy",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:    "t1",
+						NextHop: "self",
+						Action:  "accept",
+					},
+				},
+			},
+		},
+	}
+	got2 := m.generatePolicyOptions(po2)
+	if strings.Contains(got2, "set ip next-hop") {
+		t.Errorf("next-hop self should NOT generate set ip next-hop, got:\n%s", got2)
+	}
+}
+
+func TestRouteFilterExactFRR(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PrefixLists:      make(map[string]*config.PrefixList),
+		Communities:      make(map[string]*config.CommunityDef),
+		ASPaths:          make(map[string]*config.ASPathDef),
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"to-firewall": {
+				Name: "to-firewall",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:         "default_v4",
+						FromProtocol: "direct",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "192.168.50.0/24", MatchType: "exact"},
+							{Prefix: "192.168.99.0/24", MatchType: "exact"},
+							{Prefix: "172.16.100.0/22", MatchType: "exact"},
+						},
+						Action: "accept",
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+	got := m.generatePolicyOptions(po)
+
+	// Each exact route-filter should generate a prefix-list entry without ge/le
+	checks := []string{
+		"ip prefix-list to-firewall-default_v4 seq 5 permit 192.168.50.0/24\n",
+		"ip prefix-list to-firewall-default_v4 seq 10 permit 192.168.99.0/24\n",
+		"ip prefix-list to-firewall-default_v4 seq 15 permit 172.16.100.0/22\n",
+		"match ip address prefix-list to-firewall-default_v4",
+		"route-map to-firewall permit 10",
+		"route-map to-firewall deny 20",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}

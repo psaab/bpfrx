@@ -38,6 +38,10 @@ host_inbound_flag(struct pkt_meta *meta)
 	if (proto == PROTO_ICMP || proto == PROTO_ICMPV6) {
 		if (meta->icmp_type == 8 || meta->icmp_type == 128)
 			return HOST_INBOUND_PING;
+		/* IRDP: Router Advertisement (9) / Router Solicitation (10) */
+		if (proto == PROTO_ICMP &&
+		    (meta->icmp_type == 9 || meta->icmp_type == 10))
+			return HOST_INBOUND_ROUTER_DISCOVERY;
 		return 0;  /* other ICMP always allowed */
 	}
 

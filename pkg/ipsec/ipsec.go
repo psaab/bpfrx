@@ -104,6 +104,15 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 			b.WriteString("    version = 1\n")
 		}
 
+		// Aggressive mode: resolve IKE policy mode through gateway -> ike-policy chain
+		if gw != nil && gw.IKEPolicy != "" {
+			if ikePol, ok := ipsecCfg.IKEPolicies[gw.IKEPolicy]; ok {
+				if ikePol.Mode == "aggressive" {
+					b.WriteString("    aggressive = yes\n")
+				}
+			}
+		}
+
 		if localAddr != "" {
 			fmt.Fprintf(&b, "    local_addrs = %s\n", localAddr)
 		}

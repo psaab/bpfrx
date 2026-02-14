@@ -114,7 +114,7 @@ func (m *Manager) ClearAddressMembership() error { return nil }
 
 // --- Application ---
 
-func (m *Manager) SetApplication(protocol uint8, dstPort uint16, appID uint32, timeout uint16, algType uint8) error {
+func (m *Manager) SetApplication(protocol uint8, dstPort uint16, appID uint32, timeout uint16, algType uint8, srcPortLow, srcPortHigh uint16) error {
 	return nil
 }
 

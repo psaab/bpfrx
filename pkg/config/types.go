@@ -162,6 +162,8 @@ type SystemConfig struct {
 	NoRedirects        bool     // disable ICMP redirects
 	BackupRouter       string   // backup default gateway IP
 	BackupRouterDst    string   // backup router destination prefix
+	Lo0FilterInputV4   string   // lo0 unit 0 family inet filter input (host-bound filtering)
+	Lo0FilterInputV6   string   // lo0 unit 0 family inet6 filter input (host-bound filtering)
 	DataplaneType      string   // "ebpf" (default) or "dpdk"
 	DPDKDataplane      *DPDKConfig
 	InternetOptions    *InternetOptionsConfig
@@ -773,11 +775,14 @@ type NATRule struct {
 
 // NATMatch defines what traffic a NAT rule matches.
 type NATMatch struct {
-	SourceAddress      string // CIDR
-	DestinationAddress string
-	DestinationPort    int    // primary port (first port for BPF rule)
+	SourceAddress      string   // CIDR (first address, for backward compat)
+	SourceAddresses    []string // all matched source CIDRs (bracket list support)
+	SourceAddressName  string   // address-book name (resolved during compilation)
+	DestinationAddress   string   // CIDR (first address, for backward compat)
+	DestinationAddresses []string // all matched destination CIDRs (bracket list support)
+	DestinationPort      int      // primary port (first port for BPF rule)
 	DestinationPorts   []int  // all matched ports (for multi-port DNAT rules)
-	Protocol           string // "tcp", "udp", or "" (auto)
+	Protocol           string // "tcp", "udp", "icmp6", "gre", or "" (auto)
 	Application        string // application name (e.g. "junos-http")
 }
 
@@ -992,11 +997,13 @@ type Application struct {
 
 // RoutingOptionsConfig holds static routing configuration.
 type RoutingOptionsConfig struct {
-	StaticRoutes          []*StaticRoute
-	Inet6StaticRoutes     []*StaticRoute // rib inet6.0 static routes
-	ForwardingTableExport string         // forwarding-table { export <policy>; }
-	AutonomousSystem      uint32         // autonomous-system <number>
-	RibGroups             map[string]*RibGroup
+	StaticRoutes              []*StaticRoute
+	Inet6StaticRoutes         []*StaticRoute // rib inet6.0 static routes
+	ForwardingTableExport     string         // forwarding-table { export <policy>; }
+	AutonomousSystem          uint32         // autonomous-system <number>
+	RibGroups                 map[string]*RibGroup
+	InterfaceRoutesRibGroup   string // global interface-routes { rib-group inet <name>; }
+	InterfaceRoutesRibGroupV6 string // global interface-routes { rib-group inet6 <name>; }
 }
 
 // RibGroup defines a RIB group for route sharing between routing instances.

@@ -459,7 +459,7 @@ func (m *Manager) ClearAddressMembership() error {
 
 // --- Application ---
 
-func (m *Manager) SetApplication(protocol uint8, dstPort uint16, appID uint32, timeout uint16, algType uint8) error {
+func (m *Manager) SetApplication(protocol uint8, dstPort uint16, appID uint32, timeout uint16, algType uint8, srcPortLow, srcPortHigh uint16) error {
 	shm := m.platform.shm
 	if shm == nil {
 		return fmt.Errorf("DPDK not initialized")
@@ -478,6 +478,8 @@ func (m *Manager) SetApplication(protocol uint8, dstPort uint16, appID uint32, t
 	valPtr.app_id = C.uint32_t(appID)
 	valPtr.alg_type = C.uint8_t(algType)
 	valPtr.timeout = C.uint16_t(timeout)
+	valPtr.src_port_low = C.uint16_t(srcPortLow)
+	valPtr.src_port_high = C.uint16_t(srcPortHigh)
 	return nil
 }
 

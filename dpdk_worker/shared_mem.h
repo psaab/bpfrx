@@ -105,8 +105,9 @@ struct zone_config {
 #define HOST_INBOUND_IKE         (1 << 16)
 #define HOST_INBOUND_DHCPV6      (1 << 17)
 #define HOST_INBOUND_VRRP        (1 << 18)
-#define HOST_INBOUND_ESP         (1 << 19)
-#define HOST_INBOUND_ALL         0xFFFFFFFF
+#define HOST_INBOUND_ESP              (1 << 19)
+#define HOST_INBOUND_ROUTER_DISCOVERY (1 << 20)
+#define HOST_INBOUND_ALL              0xFFFFFFFF
 
 /* ============================================================
  * Session / conntrack (matches bpfrx_conntrack.h)
@@ -297,6 +298,8 @@ struct app_value {
 	uint8_t  alg_type;
 	uint8_t  pad;
 	uint16_t timeout;
+	uint16_t src_port_low;  /* source port range low (0=any) */
+	uint16_t src_port_high; /* source port range high (0=any) */
 };
 
 /* ============================================================

@@ -296,8 +296,9 @@ struct icmp6hdr {
 #define HOST_INBOUND_IKE         (1 << 16)
 #define HOST_INBOUND_DHCPV6      (1 << 17)
 #define HOST_INBOUND_VRRP        (1 << 18)
-#define HOST_INBOUND_ESP         (1 << 19)
-#define HOST_INBOUND_ALL         0xFFFFFFFF  /* permit all services */
+#define HOST_INBOUND_ESP              (1 << 19)
+#define HOST_INBOUND_ROUTER_DISCOVERY (1 << 20)
+#define HOST_INBOUND_ALL              0xFFFFFFFF  /* permit all services */
 
 /* ============================================================
  * Address family agnostic IP address.

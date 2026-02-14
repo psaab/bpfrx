@@ -251,3 +251,42 @@ func TestBuildScreenConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestHostInboundRouterDiscoveryFlag(t *testing.T) {
+	// Verify router-discovery maps to the correct flag bit.
+	flag, ok := HostInboundProtocolFlags["router-discovery"]
+	if !ok {
+		t.Fatal("router-discovery not in HostInboundProtocolFlags")
+	}
+	if flag != HostInboundRouterDiscovery {
+		t.Errorf("flag = 0x%x, want 0x%x", flag, HostInboundRouterDiscovery)
+	}
+	// Verify it's bit 20.
+	if flag != (1 << 20) {
+		t.Errorf("flag = 0x%x, want 1<<20 = 0x%x", flag, uint32(1<<20))
+	}
+}
+
+func TestAppPortsFromSpec(t *testing.T) {
+	tests := []struct {
+		spec string
+		want []int
+	}{
+		{"", nil},
+		{"80", []int{80}},
+		{"8080-8083", []int{8080, 8081, 8082, 8083}},
+		{"443-443", []int{443}},
+	}
+	for _, tt := range tests {
+		got := appPortsFromSpec(tt.spec)
+		if len(got) != len(tt.want) {
+			t.Errorf("appPortsFromSpec(%q) len = %d, want %d", tt.spec, len(got), len(tt.want))
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("appPortsFromSpec(%q)[%d] = %d, want %d", tt.spec, i, got[i], tt.want[i])
+			}
+		}
+	}
+}

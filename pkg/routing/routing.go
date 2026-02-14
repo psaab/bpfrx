@@ -805,11 +805,15 @@ func (m *Manager) clearNextTableRules() error {
 // with a rib-group reference, the instance's routes are leaked to other
 // tables listed in the rib-group's import-rib list.
 //
+// Both IPv4 (InterfaceRoutesRibGroup) and IPv6 (InterfaceRoutesRibGroupV6)
+// rib-groups are handled. For each source table that needs leaking, both
+// IPv4 and IPv6 ip rules are created.
+//
 // For example, if dmz-vr (table 101) has interface-routes rib-group "dmz-leak",
 // and dmz-leak has import-rib [ dmz-vr.inet.0 inet.0 ], then an ip rule is
 // created to make table 101 visible to main table lookups:
 //
-//	ip rule add from all lookup 101 pref 200
+//	ip rule add from all lookup 101 pref 33000
 func (m *Manager) ApplyRibGroupRules(ribGroups map[string]*config.RibGroup, instances []*config.RoutingInstanceConfig) error {
 	// Clean up old rib-group rules
 	if err := m.clearRibGroupRules(); err != nil {
@@ -832,25 +836,29 @@ func (m *Manager) ApplyRibGroupRules(ribGroups map[string]*config.RibGroup, inst
 
 	prio := ribGroupRulePriority
 	for _, inst := range instances {
-		rgName := inst.InterfaceRoutesRibGroup
-		if rgName == "" {
-			continue
-		}
-		rg, ok := ribGroups[rgName]
-		if !ok {
-			slog.Warn("interface-routes references unknown rib-group",
-				"instance", inst.Name, "rib-group", rgName)
-			continue
-		}
+		// Collect all rib-group names referenced by this instance (inet + inet6)
+		rgNames := []string{inst.InterfaceRoutesRibGroup, inst.InterfaceRoutesRibGroupV6}
 
 		sourceTable := inst.TableID
-
-		// Check if any import-rib entry targets a different table (i.e., route leaking needed)
 		needsLeak := false
-		for _, ribName := range rg.ImportRibs {
-			targetTable := resolveRibTable(ribName, tableIDs)
-			if targetTable != sourceTable {
-				needsLeak = true
+		for _, rgName := range rgNames {
+			if rgName == "" {
+				continue
+			}
+			rg, ok := ribGroups[rgName]
+			if !ok {
+				slog.Warn("interface-routes references unknown rib-group",
+					"instance", inst.Name, "rib-group", rgName)
+				continue
+			}
+			for _, ribName := range rg.ImportRibs {
+				targetTable := resolveRibTable(ribName, tableIDs)
+				if targetTable != sourceTable {
+					needsLeak = true
+					break
+				}
+			}
+			if needsLeak {
 				break
 			}
 		}
@@ -874,8 +882,8 @@ func (m *Manager) ApplyRibGroupRules(ribGroups map[string]*config.RibGroup, inst
 				"instance", inst.Name, "table", sourceTable, "err", err)
 		} else {
 			slog.Info("rib-group rule added",
-				"instance", inst.Name, "rib-group", rg.Name,
-				"table", sourceTable, "family", "inet", "pref", prio)
+				"instance", inst.Name, "table", sourceTable,
+				"family", "inet", "pref", prio)
 		}
 		prio++
 
@@ -890,8 +898,8 @@ func (m *Manager) ApplyRibGroupRules(ribGroups map[string]*config.RibGroup, inst
 				"instance", inst.Name, "table", sourceTable, "err", err)
 		} else {
 			slog.Info("rib-group rule added",
-				"instance", inst.Name, "rib-group", rg.Name,
-				"table", sourceTable, "family", "inet6", "pref", prio)
+				"instance", inst.Name, "table", sourceTable,
+				"family", "inet6", "pref", prio)
 		}
 		prio++
 	}

@@ -511,3 +511,90 @@ func TestRethMemberCollection(t *testing.T) {
 		t.Errorf("reth1 should have 1 member, got %d", len(rethMembers["reth1"]))
 	}
 }
+
+func TestMultiVRFRibGroupLeaking(t *testing.T) {
+	// Test that rib-groups with 8+ import-ribs correctly identify leaking needs
+	// for multiple VRFs.
+	ribGroups := map[string]*config.RibGroup{
+		"Other-ISPS": {
+			Name: "Other-ISPS",
+			ImportRibs: []string{
+				"Comcast-BCI.inet.0", "inet.0",
+				"Other-GigabitPro.inet.0", "bv-firehouse-vpn.inet.0",
+				"Comcast-GigabitPro.inet.0", "ATT.inet.0",
+				"Atherton-Fiber.inet.0", "sfmix.inet.0",
+			},
+		},
+		"Other-ISP6": {
+			Name: "Other-ISP6",
+			ImportRibs: []string{
+				"Comcast-BCI.inet6.0", "inet6.0",
+				"Other-GigabitPro.inet6.0",
+				"Comcast-GigabitPro.inet6.0", "ATT.inet6.0",
+				"Atherton-Fiber.inet6.0",
+			},
+		},
+	}
+
+	instances := []*config.RoutingInstanceConfig{
+		{Name: "Comcast-BCI", TableID: 100, InterfaceRoutesRibGroup: "Other-ISPS"},
+		{Name: "ATT", TableID: 101, InterfaceRoutesRibGroup: "Other-ISPS"},
+		{Name: "Atherton-Fiber", TableID: 102, InterfaceRoutesRibGroup: "Other-ISPS"},
+		{Name: "Other-GigabitPro", TableID: 103, InterfaceRoutesRibGroup: "Other-ISPS"},
+		{Name: "bv-firehouse-vpn", TableID: 104, InterfaceRoutesRibGroup: "Other-ISPS"},
+		{Name: "Comcast-GigabitPro", TableID: 105, InterfaceRoutesRibGroup: "Other-ISPS"},
+		{Name: "sfmix", TableID: 106, InterfaceRoutesRibGroup: "Other-ISPS"},
+	}
+
+	tableIDs := make(map[string]int)
+	for _, inst := range instances {
+		tableIDs[inst.Name] = inst.TableID
+	}
+
+	// Every instance with Other-ISPS should need leaking because
+	// inet.0 (254) is a different table from any instance table
+	for _, inst := range instances {
+		rg := ribGroups[inst.InterfaceRoutesRibGroup]
+		needsLeak := false
+		for _, ribName := range rg.ImportRibs {
+			if resolveRibTable(ribName, tableIDs) != inst.TableID {
+				needsLeak = true
+				break
+			}
+		}
+		if !needsLeak {
+			t.Errorf("instance %s with rib-group Other-ISPS should need leaking", inst.Name)
+		}
+	}
+}
+
+func TestIPv6OnlyRibGroupLeaking(t *testing.T) {
+	// Test that instances with only InterfaceRoutesRibGroupV6 are also detected
+	ribGroups := map[string]*config.RibGroup{
+		"v6-leak": {
+			Name:       "v6-leak",
+			ImportRibs: []string{"vpn-vr.inet6.0", "inet6.0"},
+		},
+	}
+
+	instances := []*config.RoutingInstanceConfig{
+		{Name: "vpn-vr", TableID: 100, InterfaceRoutesRibGroupV6: "v6-leak"},
+	}
+
+	tableIDs := map[string]int{"vpn-vr": 100}
+
+	// vpn-vr has only V6 rib-group but should still need leaking
+	inst := instances[0]
+	rgName := inst.InterfaceRoutesRibGroupV6
+	rg := ribGroups[rgName]
+	needsLeak := false
+	for _, ribName := range rg.ImportRibs {
+		if resolveRibTable(ribName, tableIDs) != inst.TableID {
+			needsLeak = true
+			break
+		}
+	}
+	if !needsLeak {
+		t.Error("vpn-vr with IPv6-only rib-group should need leaking")
+	}
+}

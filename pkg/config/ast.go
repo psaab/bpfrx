@@ -574,6 +574,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"rule": {args: 1, children: map[string]*schemaNode{
 						"match": {children: map[string]*schemaNode{
 							"source-address":       {args: 1, children: nil},
+							"source-address-name":  {args: 1, children: nil},
 							"destination-address":  {args: 1, children: nil},
 							"destination-port":     {args: 1, children: nil},
 							"protocol":             {args: 1, children: nil},

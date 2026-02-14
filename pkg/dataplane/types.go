@@ -243,9 +243,10 @@ const (
 	HostInboundRadius     = 1 << 15
 	HostInboundIKE        = 1 << 16
 	HostInboundDHCPv6     = 1 << 17
-	HostInboundVRRP       = 1 << 18
-	HostInboundESP        = 1 << 19
-	HostInboundAll        = 0xFFFFFFFF
+	HostInboundVRRP            = 1 << 18
+	HostInboundESP             = 1 << 19
+	HostInboundRouterDiscovery = 1 << 20
+	HostInboundAll             = 0xFFFFFFFF
 )
 
 // HostInboundServiceFlags maps system-service names to flag bits.
@@ -272,9 +273,11 @@ var HostInboundServiceFlags = map[string]uint32{
 
 // HostInboundProtocolFlags maps protocol names to flag bits.
 var HostInboundProtocolFlags = map[string]uint32{
-	"ospf": HostInboundOSPF,
-	"bgp":  HostInboundBGP,
-	"all":  HostInboundAll,
+	"ospf":             HostInboundOSPF,
+	"bgp":              HostInboundBGP,
+	"router-discovery": HostInboundRouterDiscovery,
+	"vrrp":             HostInboundVRRP,
+	"all":              HostInboundAll,
 }
 
 // Session state constants.
@@ -332,10 +335,12 @@ type AppKey struct {
 
 // AppValue mirrors the C struct app_value.
 type AppValue struct {
-	AppID   uint32
-	ALGType uint8
-	Pad     uint8
-	Timeout uint16 // inactivity timeout override (seconds), 0=default
+	AppID       uint32
+	ALGType     uint8
+	Pad         uint8
+	Timeout     uint16 // inactivity timeout override (seconds), 0=default
+	SrcPortLow  uint16 // source port range low (host byte order), 0=any
+	SrcPortHigh uint16 // source port range high (host byte order), 0=any
 }
 
 // NAT pool types.
