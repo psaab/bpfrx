@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/cilium/ebpf"
@@ -154,6 +155,7 @@ type DataPlane interface {
 
 	// FIB
 	BumpFIBGeneration()
+	StartFIBSync(ctx context.Context) // DPDK: background route sync; eBPF: no-op
 
 	// Map statistics
 	GetMapStats() []MapStats

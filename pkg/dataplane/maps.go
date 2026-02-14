@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -1344,6 +1345,9 @@ func (m *Manager) ZeroStaleFilterConfigs(startID uint32) {
 // entries — BPF programs holding pointers from bpf_map_lookup_elem would write
 // to the OLD (about-to-be-freed) entry, losing counter/last_seen updates and
 // causing sessions to expire prematurely.
+// StartFIBSync is a no-op for eBPF — bpf_fib_lookup handles FIB queries in-kernel.
+func (m *Manager) StartFIBSync(_ context.Context) {}
+
 func (m *Manager) BumpFIBGeneration() {
 	zm, ok := m.maps["fib_gen_map"]
 	if !ok {

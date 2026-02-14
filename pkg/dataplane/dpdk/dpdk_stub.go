@@ -3,6 +3,7 @@
 package dpdk
 
 import (
+	"context"
 	"log/slog"
 
 	"github.com/psaab/bpfrx/pkg/config"
@@ -241,6 +242,7 @@ func (m *Manager) NewEventSource() (dataplane.EventSource, error) { return nil, 
 
 // --- FIB ---
 
+func (m *Manager) StartFIBSync(_ context.Context) {}
 func (m *Manager) BumpFIBGeneration() {}
 
 // --- Map statistics ---

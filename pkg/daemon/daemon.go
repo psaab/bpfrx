@@ -175,6 +175,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	var er *logging.EventReader
 	var gc *conntrack.GC
 	if d.dp != nil {
+		// Start FIB sync (DPDK: background route populator; eBPF: no-op)
+		d.dp.StartFIBSync(ctx)
+
 		gc = conntrack.NewGC(d.dp, 10*time.Second)
 		wg.Add(1)
 		go func() {

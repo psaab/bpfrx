@@ -682,6 +682,15 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		fwd_val.nat_dst_port = meta->nat_dst_port;
 		fwd_val.is_reverse = 0;
 
+		/* FIB cache: store forwarding result from zone_lookup */
+		if (meta->fwd_ifindex != 0 && ctx->shm->fib_gen) {
+			fwd_val.fib_ifindex = meta->fwd_ifindex;
+			fwd_val.fib_vlan_id = meta->egress_vlan_id;
+			memcpy(fwd_val.fib_dmac, meta->fwd_dmac, 6);
+			memcpy(fwd_val.fib_smac, meta->fwd_smac, 6);
+			fwd_val.fib_gen = (uint16_t)*ctx->shm->fib_gen;
+		}
+
 		/* Build reverse key */
 		fwd_val.reverse_key.src_ip = meta->dst_ip.v4;
 		fwd_val.reverse_key.dst_ip = meta->src_ip.v4;
@@ -738,6 +747,15 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		fwd_val6.ingress_zone = meta->ingress_zone;
 		fwd_val6.egress_zone = meta->egress_zone;
 		fwd_val6.is_reverse = 0;
+
+		/* FIB cache: store forwarding result from zone_lookup */
+		if (meta->fwd_ifindex != 0 && ctx->shm->fib_gen) {
+			fwd_val6.fib_ifindex = meta->fwd_ifindex;
+			fwd_val6.fib_vlan_id = meta->egress_vlan_id;
+			memcpy(fwd_val6.fib_dmac, meta->fwd_dmac, 6);
+			memcpy(fwd_val6.fib_smac, meta->fwd_smac, 6);
+			fwd_val6.fib_gen = (uint16_t)*ctx->shm->fib_gen;
+		}
 
 		fwd_val6.reverse_key.src_port = meta->dst_port;
 		fwd_val6.reverse_key.dst_port = meta->src_port;
