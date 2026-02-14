@@ -152,6 +152,37 @@ func (m *Manager) DelegatedPrefixes() []DelegatedPrefix {
 	return result
 }
 
+// PDRAMapping holds a delegated prefix and the downstream interface
+// where it should be advertised via Router Advertisement.
+type PDRAMapping struct {
+	DelegatedPrefix
+	RAIface    string // downstream interface for RA
+	SubPrefLen int    // sub-prefix length (0 = use delegated prefix as-is)
+}
+
+// DelegatedPrefixesForRA returns delegated prefixes that have an RA target
+// interface configured, along with the target interface and sub-prefix length.
+func (m *Manager) DelegatedPrefixesForRA() []PDRAMapping {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var result []PDRAMapping
+	for ifName, pds := range m.delegatedPDs {
+		opts := m.v6opts[ifName]
+		if opts == nil || opts.RAIface == "" {
+			continue
+		}
+		for _, dp := range pds {
+			result = append(result, PDRAMapping{
+				DelegatedPrefix: dp,
+				RAIface:         opts.RAIface,
+				SubPrefLen:      opts.PDSubLen,
+			})
+		}
+	}
+	return result
+}
+
 // Start begins a DHCP client for the given interface and address family.
 func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily) {
 	key := clientKey{iface: ifaceName, family: af}
@@ -991,6 +1022,25 @@ func (m *Manager) scheduleRecompile() {
 			m.onAddressChange()
 		}
 	})
+}
+
+// DeriveSubPrefix derives a sub-prefix from a delegated prefix for RA advertisement.
+// If subPrefLen is 0 or equal to the delegated prefix length, the prefix is returned as-is.
+// Otherwise, the first sub-prefix of the requested length is derived (e.g., /48 → first /64).
+// Returns an invalid prefix if the sub-prefix length is shorter than the delegated prefix.
+func DeriveSubPrefix(delegated netip.Prefix, subPrefLen int) netip.Prefix {
+	bits := delegated.Bits()
+	if subPrefLen == 0 || subPrefLen == bits {
+		return delegated
+	}
+	if subPrefLen < bits {
+		// Can't derive a shorter prefix from a longer one
+		return netip.Prefix{}
+	}
+	// Mask the address to the delegated prefix boundary, then re-prefix at subPrefLen.
+	// This gives us the first sub-prefix (e.g., 2001:db8:1000::/48 → 2001:db8:1000::/64).
+	masked := delegated.Masked()
+	return netip.PrefixFrom(masked.Addr(), subPrefLen)
 }
 
 // prefixToIPNet converts netip.Prefix to *net.IPNet.

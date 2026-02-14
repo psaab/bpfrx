@@ -251,6 +251,100 @@ func TestBuildDHCPv6Modifiers(t *testing.T) {
 	})
 }
 
+func TestDeriveSubPrefix(t *testing.T) {
+	tests := []struct {
+		name       string
+		delegated  string
+		subPrefLen int
+		want       string // empty = invalid
+	}{
+		{
+			name:       "48 to 64",
+			delegated:  "2001:db8:1000::/48",
+			subPrefLen: 64,
+			want:       "2001:db8:1000::/64",
+		},
+		{
+			name:       "56 to 64",
+			delegated:  "2001:db8:1000::/56",
+			subPrefLen: 64,
+			want:       "2001:db8:1000::/64",
+		},
+		{
+			name:       "sub_len 0 returns delegated as-is",
+			delegated:  "2001:db8:1000::/48",
+			subPrefLen: 0,
+			want:       "2001:db8:1000::/48",
+		},
+		{
+			name:       "same length returns as-is",
+			delegated:  "2001:db8:1000::/64",
+			subPrefLen: 64,
+			want:       "2001:db8:1000::/64",
+		},
+		{
+			name:       "already 64 with sub_len 0",
+			delegated:  "2001:db8:abcd:ef00::/64",
+			subPrefLen: 0,
+			want:       "2001:db8:abcd:ef00::/64",
+		},
+		{
+			name:       "shorter sub_len invalid",
+			delegated:  "2001:db8:1000::/64",
+			subPrefLen: 48,
+			want:       "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			delegated := netip.MustParsePrefix(tt.delegated)
+			got := DeriveSubPrefix(delegated, tt.subPrefLen)
+			if tt.want == "" {
+				if got.IsValid() {
+					t.Errorf("DeriveSubPrefix(%s, %d) = %s, want invalid", tt.delegated, tt.subPrefLen, got)
+				}
+				return
+			}
+			want := netip.MustParsePrefix(tt.want)
+			if got != want {
+				t.Errorf("DeriveSubPrefix(%s, %d) = %s, want %s", tt.delegated, tt.subPrefLen, got, want)
+			}
+		})
+	}
+}
+
+func TestDelegatedPrefixesForRA(t *testing.T) {
+	m := &Manager{
+		delegatedPDs: map[string][]DelegatedPrefix{
+			"wan0": {
+				{Interface: "wan0", Prefix: netip.MustParsePrefix("2001:db8::/48")},
+			},
+			"wan1": {
+				{Interface: "wan1", Prefix: netip.MustParsePrefix("2001:db8:1::/48")},
+			},
+		},
+		v6opts: map[string]*DHCPv6Options{
+			"wan0": {RAIface: "trust0", PDSubLen: 64},
+			"wan1": {RAIface: ""},       // no RA interface
+		},
+	}
+
+	mappings := m.DelegatedPrefixesForRA()
+	if len(mappings) != 1 {
+		t.Fatalf("got %d mappings, want 1", len(mappings))
+	}
+	if mappings[0].RAIface != "trust0" {
+		t.Errorf("RAIface = %q, want trust0", mappings[0].RAIface)
+	}
+	if mappings[0].SubPrefLen != 64 {
+		t.Errorf("SubPrefLen = %d, want 64", mappings[0].SubPrefLen)
+	}
+	if mappings[0].Interface != "wan0" {
+		t.Errorf("Interface = %q, want wan0", mappings[0].Interface)
+	}
+}
+
 func TestDHCPv6OptionsSetGet(t *testing.T) {
 	m := &Manager{
 		v6opts: make(map[string]*DHCPv6Options),

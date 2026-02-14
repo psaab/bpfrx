@@ -711,9 +711,16 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	d.resolveNeighbors(cfg)
 
 	// 5. Apply radvd config (Router Advertisements)
-	if d.radvd != nil && len(cfg.Protocols.RouterAdvertisement) > 0 {
-		if err := d.radvd.Apply(cfg.Protocols.RouterAdvertisement); err != nil {
+	// Merge static RA configs with PD-derived prefixes from DHCPv6.
+	raConfigs := d.buildRAConfigs(cfg)
+	if d.radvd != nil && len(raConfigs) > 0 {
+		if err := d.radvd.Apply(raConfigs); err != nil {
 			slog.Warn("failed to apply radvd config", "err", err)
+		}
+	} else if d.radvd != nil {
+		// No RA configs — clear any previous radvd config.
+		if err := d.radvd.Clear(); err != nil {
+			slog.Warn("failed to clear radvd config", "err", err)
 		}
 	}
 
@@ -776,6 +783,64 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	if d.eventEngine != nil {
 		d.eventEngine.Apply(cfg.EventOptions)
 	}
+}
+
+// buildRAConfigs merges static RA configs from the Junos config with
+// PD-derived prefixes from DHCPv6 prefix delegation.
+func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig {
+	// Start with static RA configs from the configuration.
+	raByIface := make(map[string]*config.RAInterfaceConfig)
+	var result []*config.RAInterfaceConfig
+	for _, ra := range cfg.Protocols.RouterAdvertisement {
+		raByIface[ra.Interface] = ra
+		result = append(result, ra)
+	}
+
+	// If no DHCP manager, return static only.
+	if d.dhcp == nil {
+		return result
+	}
+
+	// Merge PD-derived prefixes from DHCPv6 clients.
+	for _, mapping := range d.dhcp.DelegatedPrefixesForRA() {
+		subPrefix := dhcp.DeriveSubPrefix(mapping.Prefix, mapping.SubPrefLen)
+		if !subPrefix.IsValid() {
+			slog.Warn("DHCPv6 PD: invalid sub-prefix derivation",
+				"delegated", mapping.Prefix, "sub_len", mapping.SubPrefLen)
+			continue
+		}
+
+		pfx := &config.RAPrefix{
+			Prefix:     subPrefix.String(),
+			OnLink:     true,
+			Autonomous: true,
+		}
+		if mapping.ValidLifetime > 0 {
+			pfx.ValidLifetime = int(mapping.ValidLifetime.Seconds())
+		}
+		if mapping.PreferredLifetime > 0 {
+			pfx.PreferredLife = int(mapping.PreferredLifetime.Seconds())
+		}
+
+		if existing, ok := raByIface[mapping.RAIface]; ok {
+			// Append prefix to existing RA interface config.
+			existing.Prefixes = append(existing.Prefixes, pfx)
+		} else {
+			// Create a new RA interface config for this downstream interface.
+			ra := &config.RAInterfaceConfig{
+				Interface: mapping.RAIface,
+				Prefixes:  []*config.RAPrefix{pfx},
+			}
+			raByIface[mapping.RAIface] = ra
+			result = append(result, ra)
+		}
+
+		slog.Info("DHCPv6 PD: advertising prefix via RA",
+			"prefix", subPrefix, "interface", mapping.RAIface,
+			"delegated_from", mapping.Interface)
+	}
+
+	return result
 }
 
 // startDHCPClients iterates the config and starts DHCP/DHCPv6 clients
