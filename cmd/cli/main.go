@@ -506,6 +506,12 @@ func (c *ctl) handleShow(args []string) error {
 		}
 		return c.showText("snmp")
 
+	case "lldp":
+		if len(args) >= 2 && args[1] == "neighbors" {
+			return c.showText("lldp-neighbors")
+		}
+		return c.showText("lldp")
+
 	case "dhcp-relay":
 		return c.showText("dhcp-relay")
 
@@ -563,6 +569,9 @@ func (c *ctl) handleShow(args []string) error {
 		return c.showText("routing-instances")
 
 	case "forwarding-options":
+		if len(args) >= 2 && args[1] == "port-mirroring" {
+			return c.showText("forwarding-options-port-mirroring")
+		}
 		return c.showText("forwarding-options")
 
 	case "vlans":

@@ -35,6 +35,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/ipsec"
 	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/routing"
+	"github.com/psaab/bpfrx/pkg/lldp"
 	"github.com/psaab/bpfrx/pkg/rpm"
 	"github.com/psaab/bpfrx/pkg/vrrp"
 )
@@ -50,9 +51,10 @@ type Config struct {
 	IPsec    *ipsec.Manager
 	DHCP         *dhcp.Manager
 	DHCPServer   *dhcpserver.Manager
-	RPMResultsFn func() []*rpm.ProbeResult      // returns live RPM results
-	FeedsFn      func() map[string]feeds.FeedInfo // returns live feed status
-	ApplyFn      func(*config.Config)             // daemon's applyConfig callback
+	RPMResultsFn    func() []*rpm.ProbeResult      // returns live RPM results
+	FeedsFn         func() map[string]feeds.FeedInfo // returns live feed status
+	LLDPNeighborsFn func() []*lldp.Neighbor         // returns live LLDP neighbors
+	ApplyFn         func(*config.Config)             // daemon's applyConfig callback
 	Version      string                    // software version string
 }
 
@@ -68,9 +70,10 @@ type Server struct {
 	ipsec        *ipsec.Manager
 	dhcp         *dhcp.Manager
 	dhcpServer   *dhcpserver.Manager
-	rpmResultsFn func() []*rpm.ProbeResult
-	feedsFn      func() map[string]feeds.FeedInfo
-	applyFn      func(*config.Config)
+	rpmResultsFn    func() []*rpm.ProbeResult
+	feedsFn         func() map[string]feeds.FeedInfo
+	lldpNeighborsFn func() []*lldp.Neighbor
+	applyFn         func(*config.Config)
 	startTime    time.Time
 	addr         string
 	version      string
@@ -88,9 +91,10 @@ func NewServer(addr string, cfg Config) *Server {
 		ipsec:        cfg.IPsec,
 		dhcp:         cfg.DHCP,
 		dhcpServer:   cfg.DHCPServer,
-		rpmResultsFn: cfg.RPMResultsFn,
-		feedsFn:      cfg.FeedsFn,
-		applyFn:      cfg.ApplyFn,
+		rpmResultsFn:    cfg.RPMResultsFn,
+		feedsFn:         cfg.FeedsFn,
+		lldpNeighborsFn: cfg.LLDPNeighborsFn,
+		applyFn:         cfg.ApplyFn,
 		startTime:    time.Now(),
 		addr:         addr,
 		version:      cfg.Version,
@@ -3502,6 +3506,54 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			}
 		}
 
+	case "lldp":
+		if cfg == nil || cfg.Protocols.LLDP == nil {
+			buf.WriteString("LLDP not configured\n")
+		} else {
+			lldpCfg := cfg.Protocols.LLDP
+			if lldpCfg.Disable {
+				buf.WriteString("LLDP: disabled\n")
+			} else {
+				interval := lldpCfg.Interval
+				if interval <= 0 {
+					interval = 30
+				}
+				holdMult := lldpCfg.HoldMultiplier
+				if holdMult <= 0 {
+					holdMult = 4
+				}
+				buf.WriteString("LLDP:\n")
+				fmt.Fprintf(&buf, "  Transmit interval: %ds\n", interval)
+				fmt.Fprintf(&buf, "  Hold multiplier:   %d\n", holdMult)
+				fmt.Fprintf(&buf, "  Hold time:         %ds\n", interval*holdMult)
+				if len(lldpCfg.Interfaces) > 0 {
+					fmt.Fprintf(&buf, "  Interfaces:        %s\n", strings.Join(lldpCfg.Interfaces, ", "))
+				}
+				if s.lldpNeighborsFn != nil {
+					neighbors := s.lldpNeighborsFn()
+					fmt.Fprintf(&buf, "  Neighbors:         %d\n", len(neighbors))
+				}
+			}
+		}
+
+	case "lldp-neighbors":
+		if s.lldpNeighborsFn == nil {
+			buf.WriteString("LLDP not running\n")
+		} else {
+			neighbors := s.lldpNeighborsFn()
+			if len(neighbors) == 0 {
+				buf.WriteString("No LLDP neighbors discovered\n")
+			} else {
+				fmt.Fprintf(&buf, "%-12s %-20s %-16s %-20s %-6s %s\n",
+					"Interface", "Chassis ID", "Port ID", "System Name", "TTL", "Age")
+				for _, n := range neighbors {
+					age := time.Since(n.LastSeen).Truncate(time.Second)
+					fmt.Fprintf(&buf, "%-12s %-20s %-16s %-20s %-6d %s\n",
+						n.Interface, n.ChassisID, n.PortID, n.SystemName, n.TTL, age)
+				}
+			}
+		}
+
 	case "firewall":
 		hasFilters := cfg != nil && (len(cfg.Firewall.FiltersInet) > 0 || len(cfg.Firewall.FiltersInet6) > 0)
 		if !hasFilters {
@@ -5170,8 +5222,38 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 				buf.WriteString("DHCP relay: (see 'show dhcp-relay' for details)\n")
 				hasContent = true
 			}
+			if fo.PortMirroring != nil && len(fo.PortMirroring.Instances) > 0 {
+				buf.WriteString("Port mirroring: (see 'show forwarding-options port-mirroring' for details)\n")
+				hasContent = true
+			}
 			if !hasContent {
 				buf.WriteString("No forwarding-options configured\n")
+			}
+		}
+
+	case "forwarding-options-port-mirroring":
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else {
+			pm := cfg.ForwardingOptions.PortMirroring
+			if pm == nil || len(pm.Instances) == 0 {
+				buf.WriteString("No port-mirroring instances configured\n")
+			} else {
+				for name, inst := range pm.Instances {
+					fmt.Fprintf(&buf, "Instance: %s\n", name)
+					if inst.InputRate > 0 {
+						fmt.Fprintf(&buf, "  Input rate: 1/%d\n", inst.InputRate)
+					} else {
+						buf.WriteString("  Input rate: all packets\n")
+					}
+					if len(inst.Input) > 0 {
+						fmt.Fprintf(&buf, "  Input interfaces: %s\n", strings.Join(inst.Input, ", "))
+					}
+					if inst.Output != "" {
+						fmt.Fprintf(&buf, "  Output interface: %s\n", inst.Output)
+					}
+					buf.WriteString("\n")
+				}
 			}
 		}
 

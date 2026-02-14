@@ -129,6 +129,10 @@ type DataPlane interface {
 	SetScreenConfig(profileID uint32, cfg ScreenConfig) error
 	ClearScreenConfigs() error
 
+	// Port mirroring
+	SetMirrorConfig(ifindex int, mirrorIfindex int, rate uint32) error
+	ClearMirrorConfigs() error
+
 	// Flow
 	SetFlowTimeout(idx, seconds uint32) error
 	SetFlowConfig(cfg FlowConfigValue) error

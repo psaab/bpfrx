@@ -217,6 +217,19 @@ type WebManagementConfig struct {
 	HTTPInterface            string // interface binding for HTTP
 	HTTPSInterface           string // interface binding for HTTPS
 	SystemGeneratedCert      bool   // auto-generated TLS certificate
+	APIAuth                  *APIAuthConfig // REST API authentication
+}
+
+// APIAuthConfig holds REST API authentication settings.
+type APIAuthConfig struct {
+	Users   []*APIAuthUser // basic auth users
+	APIKeys []string       // bearer/X-API-Key tokens
+}
+
+// APIAuthUser defines a basic auth user for the REST API.
+type APIAuthUser struct {
+	Username string
+	Password string
 }
 
 // SystemSyslogConfig holds traditional Junos system syslog config.
@@ -364,9 +377,23 @@ type NetFlowV9Template struct {
 
 // ForwardingOptionsConfig holds forwarding/sampling configuration.
 type ForwardingOptionsConfig struct {
-	Sampling       *SamplingConfig
-	DHCPRelay      *DHCPRelayConfig
+	Sampling        *SamplingConfig
+	DHCPRelay       *DHCPRelayConfig
 	FamilyInet6Mode string // "flow-based" or "packet-based" (default "flow-based")
+	PortMirroring   *PortMirroringConfig
+}
+
+// PortMirroringConfig holds port mirroring (SPAN) configuration.
+type PortMirroringConfig struct {
+	Instances map[string]*PortMirrorInstance
+}
+
+// PortMirrorInstance defines a named port mirroring instance.
+type PortMirrorInstance struct {
+	Name      string
+	InputRate int      // 1-in-N sampling rate (0 = mirror all)
+	Input     []string // ingress interfaces to mirror
+	Output    string   // egress mirror destination interface
 }
 
 // DHCPRelayConfig holds DHCP relay agent configuration.
@@ -958,6 +985,15 @@ type ProtocolsConfig struct {
 	RIP                 *RIPConfig
 	ISIS                *ISISConfig
 	RouterAdvertisement []*RAInterfaceConfig
+	LLDP                *LLDPConfig
+}
+
+// LLDPConfig holds LLDP (Link Layer Discovery Protocol) configuration.
+type LLDPConfig struct {
+	Interfaces     []string // interfaces to enable LLDP on
+	Interval       int      // transmit interval in seconds (0 = default 30)
+	HoldMultiplier int      // hold multiplier (0 = default 4)
+	Disable        bool     // globally disable LLDP
 }
 
 // OSPFv3Config holds OSPFv3 (IPv6 OSPF) routing configuration.

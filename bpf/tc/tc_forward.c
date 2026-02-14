@@ -69,6 +69,35 @@ int tc_forward_prog(struct __sk_buff *skb)
 	if (meta->egress_zone > 0)
 		inc_zone_egress((__u32)meta->egress_zone, meta->pkt_len);
 
+	/*
+	 * Port mirroring: if xdp_forward set mirror_ifindex (because
+	 * the ingress interface has mirroring configured), clone the
+	 * packet to the mirror destination interface.
+	 * bpf_clone_redirect is available in TC but not XDP, which is
+	 * why mirrored traffic falls back to XDP_PASS → kernel fwd → TC.
+	 */
+	if (meta->mirror_ifindex != 0) {
+		__u32 rate = meta->mirror_rate;
+		int do_mirror = 1;
+
+		if (rate > 1) {
+			/* Simple 1-in-N sampling using a per-CPU counter */
+			__u32 mirror_ctr_key = 0;
+			__u64 *cnt = bpf_map_lookup_elem(&mirror_counter, &mirror_ctr_key);
+			if (cnt) {
+				__u64 cur = __sync_fetch_and_add(cnt, 1);
+				if (cur % rate != 0)
+					do_mirror = 0;
+			}
+		}
+
+		if (do_mirror)
+			bpf_clone_redirect(skb, meta->mirror_ifindex, 0);
+
+		/* Reset so subsequent packets don't inherit stale state */
+		meta->mirror_ifindex = 0;
+	}
+
 	return TC_ACT_OK;
 }
 

@@ -460,6 +460,13 @@ type SNATValueV6 struct {
 	CounterID uint16 // index into nat_rule_counters
 }
 
+// MirrorConfig mirrors the C struct mirror_config for port mirroring.
+// Key is the ingress ifindex; value tells XDP where to clone-redirect.
+type MirrorConfig struct {
+	MirrorIfindex uint32 // destination interface ifindex
+	Rate          uint32 // 1-in-N sampling rate (0 = mirror all)
+}
+
 // ScreenConfig mirrors the C struct screen_config.
 type ScreenConfig struct {
 	Flags             uint32

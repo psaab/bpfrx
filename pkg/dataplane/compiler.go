@@ -154,6 +154,11 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		return nil, fmt.Errorf("compile firewall filters: %w", err)
 	}
 
+	// Phase 11: Compile port mirroring
+	if err := compilePortMirroring(dp, cfg); err != nil {
+		return nil, fmt.Errorf("compile port mirroring: %w", err)
+	}
+
 	// Bump FIB generation counter on recompile so sessions re-run
 	// bpf_fib_lookup with potentially changed interface indices or MAC
 	// addresses. BPF checks session.fib_gen != fib_gen_map[0] and
@@ -2902,4 +2907,52 @@ func parseDuplex(d string) string {
 	default:
 		return ""
 	}
+}
+
+// compilePortMirroring populates the mirror_config BPF map from
+// forwarding-options { port-mirroring { instance ... } }.
+func compilePortMirroring(dp DataPlane, cfg *config.Config) error {
+	dp.ClearMirrorConfigs()
+
+	pm := cfg.ForwardingOptions.PortMirroring
+	if pm == nil || len(pm.Instances) == 0 {
+		return nil
+	}
+
+	for name, inst := range pm.Instances {
+		if inst.Output == "" {
+			slog.Warn("port-mirroring instance has no output interface", "name", name)
+			continue
+		}
+
+		outIface, err := net.InterfaceByName(inst.Output)
+		if err != nil {
+			slog.Warn("port-mirroring output interface not found",
+				"name", name, "interface", inst.Output, "err", err)
+			continue
+		}
+
+		rate := uint32(inst.InputRate)
+
+		for _, inputIface := range inst.Input {
+			inIface, err := net.InterfaceByName(inputIface)
+			if err != nil {
+				slog.Warn("port-mirroring input interface not found",
+					"name", name, "interface", inputIface, "err", err)
+				continue
+			}
+
+			if err := dp.SetMirrorConfig(inIface.Index, outIface.Index, rate); err != nil {
+				return fmt.Errorf("set mirror config for %s: %w", inputIface, err)
+			}
+
+			slog.Info("port-mirroring compiled",
+				"instance", name,
+				"input", inputIface,
+				"output", inst.Output,
+				"rate", rate)
+		}
+	}
+
+	return nil
 }

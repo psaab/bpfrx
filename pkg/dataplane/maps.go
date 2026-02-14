@@ -500,6 +500,32 @@ func (m *Manager) ClearScreenConfigs() error {
 	return nil
 }
 
+// SetMirrorConfig writes a port-mirroring entry for the given ingress ifindex.
+func (m *Manager) SetMirrorConfig(ifindex int, mirrorIfindex int, rate uint32) error {
+	zm, ok := m.maps["mirror_config"]
+	if !ok {
+		return fmt.Errorf("mirror_config map not found")
+	}
+	val := MirrorConfig{
+		MirrorIfindex: uint32(mirrorIfindex),
+		Rate:          rate,
+	}
+	return zm.Update(uint32(ifindex), val, ebpf.UpdateAny)
+}
+
+// ClearMirrorConfigs zeroes all mirror_config entries.
+func (m *Manager) ClearMirrorConfigs() error {
+	zm, ok := m.maps["mirror_config"]
+	if !ok {
+		return fmt.Errorf("mirror_config map not found")
+	}
+	empty := MirrorConfig{}
+	for i := uint32(0); i < 256; i++ {
+		zm.Update(i, empty, ebpf.UpdateAny)
+	}
+	return nil
+}
+
 // ReadGlobalCounter reads a per-CPU global counter and returns the sum across all CPUs.
 func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) {
 	zm, ok := m.maps["global_counters"]

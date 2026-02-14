@@ -238,6 +238,9 @@ var OperationalTree = map[string]*Node{
 				"database":  {Desc: "Show IS-IS link-state database"},
 				"routes":    {Desc: "Show IS-IS routes"},
 			}},
+			"lldp": {Desc: "Show LLDP protocol status", Children: map[string]*Node{
+				"neighbors": {Desc: "Show LLDP neighbors"},
+			}},
 		}},
 		"arp":         {Desc: "Show ARP table"},
 		"ipv6": {Desc: "Show IPv6 information", Children: map[string]*Node{
@@ -250,6 +253,9 @@ var OperationalTree = map[string]*Node{
 		}},
 		"snmp": {Desc: "Show SNMP statistics", Children: map[string]*Node{
 			"v3": {Desc: "Show SNMPv3 USM user information"},
+		}},
+		"lldp": {Desc: "Show LLDP information", Children: map[string]*Node{
+			"neighbors": {Desc: "Show LLDP neighbor table"},
 		}},
 		"system": {Desc: "Show system information", Children: map[string]*Node{
 			"alarms":        {Desc: "Show system alarms"},
@@ -282,7 +288,9 @@ var OperationalTree = map[string]*Node{
 		}},
 		"policy-options":     {Desc: "Show policy options"},
 		"event-options":      {Desc: "Show event policies"},
-		"forwarding-options": {Desc: "Show forwarding options"},
+		"forwarding-options": {Desc: "Show forwarding options", Children: map[string]*Node{
+			"port-mirroring": {Desc: "Show port mirroring instances"},
+		}},
 		"vlans":              {Desc: "Show VLAN configuration"},
 		"version":            {Desc: "Show software version"},
 	}},

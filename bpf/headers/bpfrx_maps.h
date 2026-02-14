@@ -659,4 +659,24 @@ struct {
 	__type(value, struct counter_value);
 } filter_counters SEC(".maps");
 
+/* ============================================================
+ * Port mirroring (SPAN) -- per-interface mirror config
+ * Key: ingress ifindex, Value: mirror destination + rate
+ * ============================================================ */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_INTERFACES);
+	__type(key, __u32);
+	__type(value, struct mirror_config);
+} mirror_config SEC(".maps");
+
+/* Per-CPU counter for 1-in-N mirror sampling */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} mirror_counter SEC(".maps");
+
 #endif /* __BPFRX_MAPS_H__ */

@@ -1015,6 +1015,11 @@ func (m *Manager) ClearScreenConfigs() error {
 	return nil
 }
 
+// --- Port mirroring ---
+
+func (m *Manager) SetMirrorConfig(ifindex int, mirrorIfindex int, rate uint32) error { return nil }
+func (m *Manager) ClearMirrorConfigs() error                                         { return nil }
+
 // --- Flow ---
 
 func (m *Manager) SetFlowTimeout(idx, seconds uint32) error {

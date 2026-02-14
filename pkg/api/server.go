@@ -34,6 +34,7 @@ type Config struct {
 	Addr      string
 	HTTPSAddr string // HTTPS listen address (empty = no HTTPS)
 	TLS       bool   // enable HTTPS with auto-generated certificate
+	Auth      *AuthConfig // nil = no authentication
 	Store     *configstore.Store
 	DP        dataplane.DataPlane
 	EventBuf  *logging.EventBuffer
@@ -162,9 +163,14 @@ func NewServer(cfg Config) *Server {
 	// System actions
 	mux.HandleFunc("POST /api/v1/system/action", s.systemActionHandler)
 
+	var handler http.Handler = mux
+	if cfg.Auth != nil {
+		handler = authMiddleware(*cfg.Auth, mux)
+	}
+
 	s.httpServer = &http.Server{
 		Addr:    cfg.Addr,
-		Handler: mux,
+		Handler: handler,
 	}
 
 	// Set up HTTPS server with auto-generated self-signed certificate
@@ -175,7 +181,7 @@ func NewServer(cfg Config) *Server {
 		} else {
 			s.httpsServer = &http.Server{
 				Addr:    cfg.HTTPSAddr,
-				Handler: mux,
+				Handler: handler,
 				TLSConfig: &tls.Config{
 					Certificates: []tls.Certificate{tlsCert},
 					MinVersion:   tls.VersionTLS12,

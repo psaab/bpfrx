@@ -699,6 +699,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				}},
 			}},
 		}},
+		"lldp": {children: map[string]*schemaNode{
+			"interface":       {args: 1, valueHint: ValueHintInterfaceName, children: nil},
+			"transmit-interval": {args: 1, children: nil},
+			"hold-multiplier":   {args: 1, children: nil},
+			"disable":           {children: nil},
+		}},
 	}},
 	"event-options": {children: map[string]*schemaNode{
 		"policy": {args: 1, children: map[string]*schemaNode{
@@ -876,6 +882,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"system-generated-certificate": {children: nil},
 					"interface":                    {args: 1, children: nil},
 				}},
+				"api-auth": {children: map[string]*schemaNode{
+					"user": {wildcard: &schemaNode{children: map[string]*schemaNode{
+						"password": {args: 1, children: nil},
+					}}},
+					"api-key": {args: 1, children: nil},
+				}},
 			}},
 			"dns":               {children: nil},
 			"dhcp-local-server": {children: map[string]*schemaNode{
@@ -947,6 +959,14 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 						}},
 					}},
 				}},
+			}},
+		}},
+		"port-mirroring": {children: map[string]*schemaNode{
+			"instance": {args: 1, children: map[string]*schemaNode{
+				"input": {children: map[string]*schemaNode{
+					"ingress": {children: nil},
+				}},
+				"output": {children: nil},
 			}},
 		}},
 	}},

@@ -34,6 +34,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/frr"
 	"github.com/psaab/bpfrx/pkg/grpcapi"
 	"github.com/psaab/bpfrx/pkg/ipsec"
+	"github.com/psaab/bpfrx/pkg/lldp"
 	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/networkd"
 	"github.com/psaab/bpfrx/pkg/radvd"
@@ -75,6 +76,7 @@ type Daemon struct {
 	ipfixWg       sync.WaitGroup
 	dhcpRelay     *dhcprelay.Manager
 	snmpAgent    *snmp.Agent
+	lldpMgr      *lldp.Manager
 	scheduler    *scheduler.Scheduler
 	slogHandler  *logging.SyslogSlogHandler
 	traceWriter   *logging.TraceWriter
@@ -249,6 +251,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.rpm.Apply(ctx, cfg.Services.RPM)
 	}
 
+	// Start LLDP if configured.
+	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Protocols.LLDP != nil && !cfg.Protocols.LLDP.Disable && len(cfg.Protocols.LLDP.Interfaces) > 0 {
+		d.lldpMgr = lldp.New()
+		d.lldpMgr.Apply(ctx, &lldp.LLDPConfig{
+			Interfaces:     cfg.Protocols.LLDP.Interfaces,
+			Interval:       cfg.Protocols.LLDP.Interval,
+			HoldMultiplier: cfg.Protocols.LLDP.HoldMultiplier,
+			SystemName:     cfg.System.HostName,
+		})
+	}
+
 	// Start event-options engine if configured.
 	if cfg := d.store.ActiveConfig(); cfg != nil && len(cfg.EventOptions) > 0 {
 		d.eventEngine = eventengine.New(d.store, d.applyConfig)
@@ -263,6 +276,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.ForwardingOptions.DHCPRelay != nil {
 		d.dhcpRelay = dhcprelay.NewManager()
 		d.dhcpRelay.Apply(ctx, cfg.ForwardingOptions.DHCPRelay)
+	}
+
+	// Port mirroring
+	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.ForwardingOptions.PortMirroring != nil {
+		for name, inst := range cfg.ForwardingOptions.PortMirroring.Instances {
+			slog.Info("Port mirroring configured", "instance", name, "input", inst.Input, "output", inst.Output)
+		}
 	}
 
 	// Start SNMP agent if configured (unless system processes snmp disable).
@@ -407,6 +427,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 				apiCfg.TLS = true
 				apiCfg.HTTPSAddr = httpsBindIP + ":8443"
 			}
+			// API authentication
+			if wm.APIAuth != nil && (len(wm.APIAuth.Users) > 0 || len(wm.APIAuth.APIKeys) > 0) {
+				authCfg := &api.AuthConfig{
+					Users:   make(map[string]string),
+					APIKeys: make(map[string]bool),
+				}
+				for _, u := range wm.APIAuth.Users {
+					authCfg.Users[u.Username] = u.Password
+				}
+				for _, k := range wm.APIAuth.APIKeys {
+					authCfg.APIKeys[k] = true
+				}
+				apiCfg.Auth = authCfg
+				slog.Info("HTTP API authentication enabled", "users", len(wm.APIAuth.Users), "api_keys", len(wm.APIAuth.APIKeys))
+			}
 		}
 		srv := api.NewServer(apiCfg)
 		wg.Add(1)
@@ -443,6 +478,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
+			LLDPNeighborsFn: func() []*lldp.Neighbor {
+				if d.lldpMgr != nil {
+					return d.lldpMgr.Neighbors()
+				}
+				return nil
+			},
 			ApplyFn: d.applyConfig,
 			Version: d.opts.Version,
 		})
@@ -470,6 +511,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		shell.SetFeedsFn(func() map[string]feeds.FeedInfo {
 			if d.feeds != nil {
 				return d.feeds.AllFeeds()
+			}
+			return nil
+		})
+		shell.SetLLDPNeighborsFn(func() []*lldp.Neighbor {
+			if d.lldpMgr != nil {
+				return d.lldpMgr.Neighbors()
 			}
 			return nil
 		})
@@ -510,6 +557,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Clean up RPM probes.
 	if d.rpm != nil {
 		d.rpm.StopAll()
+	}
+
+	// Clean up LLDP.
+	if d.lldpMgr != nil {
+		d.lldpMgr.Stop()
 	}
 
 	// For hitless restarts, preserve all control-plane state so the next

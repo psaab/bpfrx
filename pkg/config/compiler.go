@@ -2277,6 +2277,33 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 		}
 	}
 
+	lldpNode := node.FindChild("lldp")
+	if lldpNode != nil {
+		proto.LLDP = &LLDPConfig{}
+		for _, child := range lldpNode.Children {
+			switch child.Name() {
+			case "interface":
+				if v := nodeVal(child); v != "" {
+					proto.LLDP.Interfaces = append(proto.LLDP.Interfaces, v)
+				}
+			case "transmit-interval":
+				if v := nodeVal(child); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						proto.LLDP.Interval = n
+					}
+				}
+			case "hold-multiplier":
+				if v := nodeVal(child); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						proto.LLDP.HoldMultiplier = n
+					}
+				}
+			case "disable":
+				proto.LLDP.Disable = true
+			}
+		}
+	}
+
 	ospfNode := node.FindChild("ospf")
 	if ospfNode != nil {
 		proto.OSPF = &OSPFConfig{}
@@ -3725,6 +3752,21 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 					sys.Services.WebManagement.HTTPSInterface = nodeVal(ifNode)
 				}
 			}
+			if authNode := wmNode.FindChild("api-auth"); authNode != nil {
+				auth := &APIAuthConfig{}
+				for _, inst := range namedInstances(authNode.FindChildren("user")) {
+					if pwNode := inst.node.FindChild("password"); pwNode != nil {
+						auth.Users = append(auth.Users, &APIAuthUser{
+							Username: inst.name,
+							Password: nodeVal(pwNode),
+						})
+					}
+				}
+				for _, ch := range authNode.FindChildren("api-key") {
+					auth.APIKeys = append(auth.APIKeys, nodeVal(ch))
+				}
+				sys.Services.WebManagement.APIAuth = auth
+			}
 		}
 	}
 
@@ -4098,6 +4140,52 @@ func compileForwardingOptions(node *Node, fo *ForwardingOptionsConfig) error {
 		}
 	}
 
+	if pmNode := node.FindChild("port-mirroring"); pmNode != nil {
+		if err := compilePortMirroring(pmNode, fo); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func compilePortMirroring(node *Node, fo *ForwardingOptionsConfig) error {
+	pm := &PortMirroringConfig{
+		Instances: make(map[string]*PortMirrorInstance),
+	}
+
+	for _, inst := range namedInstances(node.FindChildren("instance")) {
+		mi := &PortMirrorInstance{Name: inst.name}
+
+		if inputNode := inst.node.FindChild("input"); inputNode != nil {
+			if rateNode := inputNode.FindChild("rate"); rateNode != nil {
+				if v := nodeVal(rateNode); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						mi.InputRate = n
+					}
+				}
+			}
+			if ingressNode := inputNode.FindChild("ingress"); ingressNode != nil {
+				for _, child := range ingressNode.Children {
+					if child.Name() == "interface" {
+						if v := nodeVal(child); v != "" {
+							mi.Input = append(mi.Input, v)
+						}
+					}
+				}
+			}
+		}
+
+		if outputNode := inst.node.FindChild("output"); outputNode != nil {
+			if ifNode := outputNode.FindChild("interface"); ifNode != nil {
+				mi.Output = nodeVal(ifNode)
+			}
+		}
+
+		pm.Instances[mi.Name] = mi
+	}
+
+	fo.PortMirroring = pm
 	return nil
 }
 

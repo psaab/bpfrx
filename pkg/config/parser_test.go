@@ -6561,6 +6561,98 @@ system {
 	}
 }
 
+func TestAPIAuthConfig(t *testing.T) {
+	input := `
+system {
+    services {
+        web-management {
+            http;
+            api-auth {
+                user admin {
+                    password secret123;
+                }
+                user readonly {
+                    password view456;
+                }
+                api-key tok-abc-123;
+                api-key tok-xyz-789;
+            }
+        }
+    }
+}
+`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("Parse: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	wm := cfg.System.Services.WebManagement
+	if wm == nil {
+		t.Fatal("web-management is nil")
+	}
+	if wm.APIAuth == nil {
+		t.Fatal("api-auth is nil")
+	}
+	if len(wm.APIAuth.Users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(wm.APIAuth.Users))
+	}
+	if len(wm.APIAuth.APIKeys) != 2 {
+		t.Fatalf("expected 2 api-keys, got %d", len(wm.APIAuth.APIKeys))
+	}
+	// Check users (order may vary)
+	foundAdmin := false
+	for _, u := range wm.APIAuth.Users {
+		if u.Username == "admin" && u.Password == "secret123" {
+			foundAdmin = true
+		}
+	}
+	if !foundAdmin {
+		t.Error("admin user not found with correct password")
+	}
+}
+
+func TestAPIAuthFlatSet(t *testing.T) {
+	cmds := []string{
+		"set system services web-management http",
+		"set system services web-management api-auth user admin password secret123",
+		"set system services web-management api-auth api-key tok-abc-123",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	wm := cfg.System.Services.WebManagement
+	if wm == nil {
+		t.Fatal("web-management is nil")
+	}
+	if wm.APIAuth == nil {
+		t.Fatal("api-auth is nil")
+	}
+	if len(wm.APIAuth.Users) != 1 {
+		t.Fatalf("expected 1 user, got %d", len(wm.APIAuth.Users))
+	}
+	if wm.APIAuth.Users[0].Username != "admin" || wm.APIAuth.Users[0].Password != "secret123" {
+		t.Errorf("user = %+v, want admin/secret123", wm.APIAuth.Users[0])
+	}
+	if len(wm.APIAuth.APIKeys) != 1 {
+		t.Fatalf("expected 1 api-key, got %d", len(wm.APIAuth.APIKeys))
+	}
+	if wm.APIAuth.APIKeys[0] != "tok-abc-123" {
+		t.Errorf("api-key = %q, want tok-abc-123", wm.APIAuth.APIKeys[0])
+	}
+}
+
 func TestSyslogMultiFacilityAndUser(t *testing.T) {
 	input := `
 system {
@@ -9567,5 +9659,273 @@ func TestOSPFVirtualLinkWithTransitAreaSetSyntax(t *testing.T) {
 	}
 	if vl.TransitArea != "0.0.0.3" {
 		t.Errorf("TransitArea = %q, want 0.0.0.3", vl.TransitArea)
+	}
+}
+
+func TestLLDPSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols lldp interface trust0",
+		"set protocols lldp interface untrust0",
+		"set protocols lldp transmit-interval 15",
+		"set protocols lldp hold-multiplier 5",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	lldpCfg := cfg.Protocols.LLDP
+	if lldpCfg == nil {
+		t.Fatal("LLDP config is nil")
+	}
+	if len(lldpCfg.Interfaces) != 2 {
+		t.Fatalf("interfaces: got %d, want 2", len(lldpCfg.Interfaces))
+	}
+	if lldpCfg.Interfaces[0] != "trust0" || lldpCfg.Interfaces[1] != "untrust0" {
+		t.Errorf("interfaces: got %v, want [trust0 untrust0]", lldpCfg.Interfaces)
+	}
+	if lldpCfg.Interval != 15 {
+		t.Errorf("interval: got %d, want 15", lldpCfg.Interval)
+	}
+	if lldpCfg.HoldMultiplier != 5 {
+		t.Errorf("hold-multiplier: got %d, want 5", lldpCfg.HoldMultiplier)
+	}
+}
+
+func TestLLDPHierarchicalSyntax(t *testing.T) {
+	input := `protocols {
+    lldp {
+        interface trust0;
+        interface dmz0;
+        transmit-interval 10;
+        hold-multiplier 3;
+        disable;
+    }
+}`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("Parse: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	lldpCfg := cfg.Protocols.LLDP
+	if lldpCfg == nil {
+		t.Fatal("LLDP config is nil")
+	}
+	if len(lldpCfg.Interfaces) != 2 {
+		t.Fatalf("interfaces: got %d, want 2", len(lldpCfg.Interfaces))
+	}
+	if lldpCfg.Interval != 10 {
+		t.Errorf("interval: got %d, want 10", lldpCfg.Interval)
+	}
+	if lldpCfg.HoldMultiplier != 3 {
+		t.Errorf("hold-multiplier: got %d, want 3", lldpCfg.HoldMultiplier)
+	}
+	if !lldpCfg.Disable {
+		t.Error("expected Disable=true")
+	}
+}
+
+func TestLLDPDisableSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols lldp disable",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	lldpCfg := cfg.Protocols.LLDP
+	if lldpCfg == nil {
+		t.Fatal("LLDP config is nil")
+	}
+	if !lldpCfg.Disable {
+		t.Error("expected Disable=true")
+	}
+}
+
+func TestPortMirroringHierarchical(t *testing.T) {
+	input := `forwarding-options {
+    port-mirroring {
+        instance mirror1 {
+            input {
+                rate 100;
+                ingress {
+                    interface trust0;
+                    interface dmz0;
+                }
+            }
+            output {
+                interface monitor0;
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm := cfg.ForwardingOptions.PortMirroring
+	if pm == nil {
+		t.Fatal("PortMirroring is nil")
+	}
+	inst, ok := pm.Instances["mirror1"]
+	if !ok {
+		t.Fatal("instance mirror1 not found")
+	}
+	if inst.InputRate != 100 {
+		t.Errorf("InputRate = %d, want 100", inst.InputRate)
+	}
+	if len(inst.Input) != 2 {
+		t.Fatalf("len(Input) = %d, want 2", len(inst.Input))
+	}
+	if inst.Input[0] != "trust0" || inst.Input[1] != "dmz0" {
+		t.Errorf("Input = %v, want [trust0 dmz0]", inst.Input)
+	}
+	if inst.Output != "monitor0" {
+		t.Errorf("Output = %q, want monitor0", inst.Output)
+	}
+}
+
+func TestPortMirroringFlatSet(t *testing.T) {
+	tree := &ConfigTree{}
+	cmds := []string{
+		"set forwarding-options port-mirroring instance span1 input rate 50",
+		"set forwarding-options port-mirroring instance span1 input ingress interface wan0",
+		"set forwarding-options port-mirroring instance span1 output interface monitor0",
+	}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	pm := cfg.ForwardingOptions.PortMirroring
+	if pm == nil {
+		t.Fatal("PortMirroring is nil")
+	}
+	inst, ok := pm.Instances["span1"]
+	if !ok {
+		t.Fatal("instance span1 not found")
+	}
+	if inst.InputRate != 50 {
+		t.Errorf("InputRate = %d, want 50", inst.InputRate)
+	}
+	if len(inst.Input) != 1 || inst.Input[0] != "wan0" {
+		t.Errorf("Input = %v, want [wan0]", inst.Input)
+	}
+	if inst.Output != "monitor0" {
+		t.Errorf("Output = %q, want monitor0", inst.Output)
+	}
+}
+
+func TestPortMirroringSetSyntaxMultiInput(t *testing.T) {
+	cmds := []string{
+		"set forwarding-options port-mirroring instance span1 input ingress interface trust0",
+		"set forwarding-options port-mirroring instance span1 input ingress interface untrust0",
+		"set forwarding-options port-mirroring instance span1 input rate 10",
+		"set forwarding-options port-mirroring instance span1 output interface monitor0",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		tokens, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand failed for %q: %v", cmd, err)
+		}
+		if err := tree.SetPath(tokens); err != nil {
+			t.Fatalf("SetPath failed for %q: %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if cfg.ForwardingOptions.PortMirroring == nil {
+		t.Fatal("expected PortMirroring")
+	}
+	inst, ok := cfg.ForwardingOptions.PortMirroring.Instances["span1"]
+	if !ok {
+		t.Fatal("expected span1 instance")
+	}
+	if inst.InputRate != 10 {
+		t.Errorf("rate = %d, want 10", inst.InputRate)
+	}
+	if len(inst.Input) != 2 {
+		t.Errorf("input count = %d, want 2", len(inst.Input))
+	}
+	if inst.Output != "monitor0" {
+		t.Errorf("output = %q, want monitor0", inst.Output)
+	}
+}
+
+func TestPortMirroringHierarchicalSimple(t *testing.T) {
+	input := `forwarding-options {
+    port-mirroring {
+        instance span1 {
+            input {
+                rate 5;
+                ingress {
+                    interface trust0;
+                }
+            }
+            output {
+                interface monitor0;
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if cfg.ForwardingOptions.PortMirroring == nil {
+		t.Fatal("expected PortMirroring")
+	}
+	inst := cfg.ForwardingOptions.PortMirroring.Instances["span1"]
+	if inst == nil {
+		t.Fatal("expected span1")
+	}
+	if inst.InputRate != 5 {
+		t.Errorf("rate = %d, want 5", inst.InputRate)
+	}
+	if inst.Output != "monitor0" {
+		t.Errorf("output = %q, want monitor0", inst.Output)
 	}
 }

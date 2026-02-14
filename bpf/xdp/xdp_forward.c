@@ -164,6 +164,21 @@ int xdp_forward_prog(struct xdp_md *ctx)
 	}
 #endif
 
+	/*
+	 * Port mirroring: if the ingress interface has mirroring configured,
+	 * fall back to XDP_PASS so the kernel forwards the packet and TC
+	 * egress can use bpf_clone_redirect() to send a copy to the mirror
+	 * port. bpf_clone_redirect is not available in XDP context.
+	 */
+	__u32 ingress_key = ctx->ingress_ifindex;
+	struct mirror_config *mcfg = bpf_map_lookup_elem(&mirror_config, &ingress_key);
+	if (mcfg && mcfg->mirror_ifindex != 0) {
+		/* Store mirror info in meta for TC egress to pick up */
+		meta->mirror_ifindex = mcfg->mirror_ifindex;
+		meta->mirror_rate = mcfg->rate;
+		return XDP_PASS;
+	}
+
 	/* Redirect via devmap to egress interface */
 	return bpf_redirect_map(&tx_ports, meta->fwd_ifindex, 0);
 }

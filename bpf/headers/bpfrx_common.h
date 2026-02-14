@@ -412,6 +412,10 @@ struct pkt_meta {
 
 	/* Per-application inactivity timeout override (seconds, 0 = use default) */
 	__u16 app_timeout;
+
+	/* Port mirroring (set by xdp_forward for TC egress to clone) */
+	__u32 mirror_ifindex;  /* 0 = no mirroring */
+	__u32 mirror_rate;     /* 1-in-N rate (0 = mirror all) */
 };
 
 /* ============================================================
@@ -655,6 +659,15 @@ struct flow_config {
 	__u8  gre_accel;       /* GRE performance acceleration */
 	__u8  alg_flags;       /* bit 0: DNS disable, bit 1: FTP disable,
 	                          bit 2: SIP disable, bit 3: TFTP disable */
+};
+
+/* ============================================================
+ * Port mirroring (SPAN) configuration
+ * ============================================================ */
+
+struct mirror_config {
+	__u32 mirror_ifindex;  /* destination interface ifindex */
+	__u32 rate;            /* 1-in-N sampling rate (0 = mirror all) */
 };
 
 #endif /* __BPFRX_COMMON_H__ */

@@ -27,6 +27,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/feeds"
 	"github.com/psaab/bpfrx/pkg/frr"
 	"github.com/psaab/bpfrx/pkg/ipsec"
+	"github.com/psaab/bpfrx/pkg/lldp"
 	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/routing"
 	"github.com/psaab/bpfrx/pkg/rpm"
@@ -46,8 +47,9 @@ type CLI struct {
 	ipsec       *ipsec.Manager
 	dhcp         *dhcp.Manager
 	dhcpRelay    *dhcprelay.Manager
-	rpmResultsFn func() []*rpm.ProbeResult
-	feedsFn      func() map[string]feeds.FeedInfo
+	rpmResultsFn     func() []*rpm.ProbeResult
+	feedsFn          func() map[string]feeds.FeedInfo
+	lldpNeighborsFn  func() []*lldp.Neighbor
 	hostname     string
 	username     string
 	version      string
@@ -89,6 +91,11 @@ func (c *CLI) SetRPMResultsFn(fn func() []*rpm.ProbeResult) {
 // SetFeedsFn sets a callback for retrieving live dynamic address feed status.
 func (c *CLI) SetFeedsFn(fn func() map[string]feeds.FeedInfo) {
 	c.feedsFn = fn
+}
+
+// SetLLDPNeighborsFn sets a callback for retrieving live LLDP neighbor data.
+func (c *CLI) SetLLDPNeighborsFn(fn func() []*lldp.Neighbor) {
+	c.lldpNeighborsFn = fn
 }
 
 // SetVersion sets the software version string for show version.
@@ -776,6 +783,12 @@ func (c *CLI) handleShow(args []string) error {
 		}
 		return c.showSNMP()
 
+	case "lldp":
+		if len(args) >= 2 && args[1] == "neighbors" {
+			return c.showLLDPNeighbors()
+		}
+		return c.showLLDP()
+
 	case "arp":
 		return c.showARP()
 
@@ -799,6 +812,9 @@ func (c *CLI) handleShow(args []string) error {
 		return c.showRoutingInstances(detail)
 
 	case "forwarding-options":
+		if len(args) >= 2 && args[1] == "port-mirroring" {
+			return c.showPortMirroring()
+		}
 		return c.showForwardingOptions()
 
 	case "vlans":
@@ -6009,6 +6025,14 @@ func (c *CLI) showSystemServices() error {
 		}
 	}
 
+	// Web management / API auth
+	if cfg.System.Services != nil && cfg.System.Services.WebManagement != nil {
+		wm := cfg.System.Services.WebManagement
+		if wm.APIAuth != nil && (len(wm.APIAuth.Users) > 0 || len(wm.APIAuth.APIKeys) > 0) {
+			fmt.Printf("  API auth:       %d user(s), %d API key(s)\n", len(wm.APIAuth.Users), len(wm.APIAuth.APIKeys))
+		}
+	}
+
 	// DHCP server
 	if cfg.System.DHCPServer.DHCPLocalServer != nil && len(cfg.System.DHCPServer.DHCPLocalServer.Groups) > 0 {
 		fmt.Printf("  DHCP server:    %d group(s)\n", len(cfg.System.DHCPServer.DHCPLocalServer.Groups))
@@ -7430,6 +7454,59 @@ func (c *CLI) showSNMPv3() error {
 	return nil
 }
 
+func (c *CLI) showLLDP() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.Protocols.LLDP == nil {
+		fmt.Println("LLDP not configured")
+		return nil
+	}
+	lldpCfg := cfg.Protocols.LLDP
+	if lldpCfg.Disable {
+		fmt.Println("LLDP: disabled")
+		return nil
+	}
+	fmt.Println("LLDP:")
+	interval := lldpCfg.Interval
+	if interval <= 0 {
+		interval = 30
+	}
+	holdMult := lldpCfg.HoldMultiplier
+	if holdMult <= 0 {
+		holdMult = 4
+	}
+	fmt.Printf("  Transmit interval: %ds\n", interval)
+	fmt.Printf("  Hold multiplier:   %d\n", holdMult)
+	fmt.Printf("  Hold time:         %ds\n", interval*holdMult)
+	if len(lldpCfg.Interfaces) > 0 {
+		fmt.Printf("  Interfaces:        %s\n", strings.Join(lldpCfg.Interfaces, ", "))
+	}
+	if c.lldpNeighborsFn != nil {
+		neighbors := c.lldpNeighborsFn()
+		fmt.Printf("  Neighbors:         %d\n", len(neighbors))
+	}
+	return nil
+}
+
+func (c *CLI) showLLDPNeighbors() error {
+	if c.lldpNeighborsFn == nil {
+		fmt.Println("LLDP not running")
+		return nil
+	}
+	neighbors := c.lldpNeighborsFn()
+	if len(neighbors) == 0 {
+		fmt.Println("No LLDP neighbors discovered")
+		return nil
+	}
+	fmt.Printf("%-12s %-20s %-16s %-20s %-6s %s\n",
+		"Interface", "Chassis ID", "Port ID", "System Name", "TTL", "Age")
+	for _, n := range neighbors {
+		age := time.Since(n.LastSeen).Truncate(time.Second)
+		fmt.Printf("%-12s %-20s %-16s %-20s %-6d %s\n",
+			n.Interface, n.ChassisID, n.PortID, n.SystemName, n.TTL, age)
+	}
+	return nil
+}
+
 func (c *CLI) showPersistentNAT() error {
 	if c.dp == nil || c.dp.GetPersistentNAT() == nil {
 		fmt.Println("Persistent NAT table not available")
@@ -8726,8 +8803,57 @@ func (c *CLI) showForwardingOptions() error {
 		hasContent = true
 	}
 
+	if fo.PortMirroring != nil && len(fo.PortMirroring.Instances) > 0 {
+		fmt.Println("Port mirroring:")
+		for name, inst := range fo.PortMirroring.Instances {
+			fmt.Printf("  Instance: %s\n", name)
+			if inst.InputRate > 0 {
+				fmt.Printf("    Sampling rate: 1/%d\n", inst.InputRate)
+			}
+			if len(inst.Input) > 0 {
+				fmt.Printf("    Input interfaces:  %s\n", strings.Join(inst.Input, ", "))
+			}
+			if inst.Output != "" {
+				fmt.Printf("    Output interface:  %s\n", inst.Output)
+			}
+		}
+		hasContent = true
+	}
+
 	if !hasContent {
 		fmt.Println("No forwarding-options configured")
+	}
+	return nil
+}
+
+// showPortMirroring displays port mirroring (SPAN) configuration.
+func (c *CLI) showPortMirroring() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	pm := cfg.ForwardingOptions.PortMirroring
+	if pm == nil || len(pm.Instances) == 0 {
+		fmt.Println("No port-mirroring instances configured")
+		return nil
+	}
+
+	for name, inst := range pm.Instances {
+		fmt.Printf("Instance: %s\n", name)
+		if inst.InputRate > 0 {
+			fmt.Printf("  Input rate: 1/%d\n", inst.InputRate)
+		} else {
+			fmt.Printf("  Input rate: all packets\n")
+		}
+		if len(inst.Input) > 0 {
+			fmt.Printf("  Input interfaces: %s\n", strings.Join(inst.Input, ", "))
+		}
+		if inst.Output != "" {
+			fmt.Printf("  Output interface: %s\n", inst.Output)
+		}
+		fmt.Println()
 	}
 	return nil
 }
