@@ -489,7 +489,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"policies": {children: map[string]*schemaNode{
-			"from-zone": {args: 3, children: map[string]*schemaNode{ // from-zone X to-zone Y
+			"from-zone": {args: 3, valueHint: ValueHintZoneName, children: map[string]*schemaNode{ // from-zone X to-zone Y
 				"policy": {args: 1, children: map[string]*schemaNode{
 					"description": {args: 1, children: nil},
 					"match":       {children: nil}, // match children are all leaves
@@ -1673,13 +1673,22 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []string
 	}
 
 	// We've consumed all tokens. Return child keywords at this schema level.
-	if schema == nil || schema.children == nil {
+	if schema == nil {
 		return nil
 	}
 
 	var completions []string
-	for name := range schema.children {
-		completions = append(completions, name)
+	if schema.children != nil {
+		for name := range schema.children {
+			completions = append(completions, name)
+		}
+	}
+	// If this level accepts a wildcard name, provide dynamic values too.
+	if schema.wildcard != nil && provider != nil && schema.wildcard.valueHint != ValueHintNone {
+		completions = append(completions, provider(schema.wildcard.valueHint)...)
+	}
+	if len(completions) == 0 {
+		return nil
 	}
 	return completions
 }
