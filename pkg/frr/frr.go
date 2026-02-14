@@ -458,12 +458,30 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 			fmt.Fprintf(&b, " redistribute %s\n", export)
 		}
 		b.WriteString("exit\n!\n")
-		// OSPF interface costs
+		// OSPF interface settings (cost, authentication, BFD)
 		for _, area := range ospf.Areas {
 			for _, iface := range area.Interfaces {
-				if iface.Cost > 0 {
-					fmt.Fprintf(&b, "interface %s\n ip ospf cost %d\n ip ospf area %s\nexit\n!\n",
-						iface.Name, iface.Cost, area.ID)
+				if iface.Cost > 0 || iface.AuthType != "" || iface.BFD {
+					fmt.Fprintf(&b, "interface %s\n", iface.Name)
+					if iface.Cost > 0 {
+						fmt.Fprintf(&b, " ip ospf cost %d\n", iface.Cost)
+					}
+					if iface.AuthType == "md5" {
+						b.WriteString(" ip ospf authentication message-digest\n")
+						keyID := iface.AuthKeyID
+						if keyID == 0 {
+							keyID = 1
+						}
+						fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", keyID, iface.AuthKey)
+					} else if iface.AuthType == "simple" {
+						b.WriteString(" ip ospf authentication\n")
+						fmt.Fprintf(&b, " ip ospf authentication-key %s\n", iface.AuthKey)
+					}
+					if iface.BFD {
+						b.WriteString(" ip ospf bfd\n")
+					}
+					fmt.Fprintf(&b, " ip ospf area %s\n", area.ID)
+					b.WriteString("exit\n!\n")
 				}
 			}
 		}
@@ -481,6 +499,12 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 			}
 			if n.MultihopTTL > 0 {
 				fmt.Fprintf(&b, " neighbor %s ebgp-multihop %d\n", n.Address, n.MultihopTTL)
+			}
+			if n.AuthPassword != "" {
+				fmt.Fprintf(&b, " neighbor %s password %s\n", n.Address, n.AuthPassword)
+			}
+			if n.BFD {
+				fmt.Fprintf(&b, " neighbor %s bfd\n", n.Address)
 			}
 		}
 		for _, export := range bgp.Export {
@@ -570,6 +594,32 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, bgp *config.BGPConf
 			}
 			if iface.Metric > 0 {
 				fmt.Fprintf(&b, " isis metric %d\n", iface.Metric)
+			}
+			b.WriteString("exit\n!\n")
+		}
+	}
+
+	// BFD peer blocks for BGP neighbors with BFD enabled
+	if bgp != nil {
+		var bfdPeers []*config.BGPNeighbor
+		for _, n := range bgp.Neighbors {
+			if n.BFD {
+				bfdPeers = append(bfdPeers, n)
+			}
+		}
+		if len(bfdPeers) > 0 {
+			b.WriteString("bfd\n")
+			for _, n := range bfdPeers {
+				fmt.Fprintf(&b, " peer %s\n", n.Address)
+				multiplier := 3
+				interval := n.BFDInterval
+				if interval == 0 {
+					interval = 300
+				}
+				fmt.Fprintf(&b, "  detect-multiplier %d\n", multiplier)
+				fmt.Fprintf(&b, "  receive-interval %d\n", interval)
+				fmt.Fprintf(&b, "  transmit-interval %d\n", interval)
+				b.WriteString(" exit\n")
 			}
 			b.WriteString("exit\n!\n")
 		}

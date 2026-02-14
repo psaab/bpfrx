@@ -942,3 +942,118 @@ func TestFormatRouteDetail(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateProtocols_OSPFMD5Auth(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		RouterID: "1.1.1.1",
+		Areas: []*config.OSPFArea{
+			{
+				ID: "0.0.0.0",
+				Interfaces: []*config.OSPFInterface{
+					{Name: "trust0", AuthType: "md5", AuthKey: "secret123", AuthKeyID: 5},
+					{Name: "dmz0", AuthType: "simple", AuthKey: "plainpw"},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, "", 0)
+
+	checks := []string{
+		"interface trust0\n",
+		"ip ospf authentication message-digest\n",
+		"ip ospf message-digest-key 5 md5 secret123\n",
+		"interface dmz0\n",
+		"ip ospf authentication\n",
+		"ip ospf authentication-key plainpw\n",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestGenerateProtocols_OSPFMD5AuthDefaultKeyID(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		Areas: []*config.OSPFArea{
+			{
+				ID: "0.0.0.0",
+				Interfaces: []*config.OSPFInterface{
+					{Name: "trust0", AuthType: "md5", AuthKey: "key1"},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, "", 0)
+	if !strings.Contains(got, "message-digest-key 1 md5 key1") {
+		t.Errorf("default key-id should be 1, got:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_BGPPassword(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS: 65001,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.2.1", PeerAS: 65002, AuthPassword: "bgpSecret"},
+			{Address: "10.0.3.1", PeerAS: 65003},
+		},
+	}
+	got := m.generateProtocols(nil, bgp, nil, nil, "", 0)
+	if !strings.Contains(got, "neighbor 10.0.2.1 password bgpSecret\n") {
+		t.Errorf("missing BGP password, got:\n%s", got)
+	}
+	if strings.Contains(got, "neighbor 10.0.3.1 password") {
+		t.Error("neighbor without auth should not have password line")
+	}
+}
+
+func TestGenerateProtocols_OSPFBFD(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		Areas: []*config.OSPFArea{
+			{
+				ID: "0.0.0.0",
+				Interfaces: []*config.OSPFInterface{
+					{Name: "trust0", BFD: true},
+					{Name: "dmz0"},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, "", 0)
+	if !strings.Contains(got, "ip ospf bfd\n") {
+		t.Errorf("missing OSPF BFD, got:\n%s", got)
+	}
+}
+
+func TestGenerateProtocols_BGPBFD(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS: 65001,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.2.1", PeerAS: 65002, BFD: true, BFDInterval: 100},
+			{Address: "10.0.3.1", PeerAS: 65003},
+		},
+	}
+	got := m.generateProtocols(nil, bgp, nil, nil, "", 0)
+
+	checks := []string{
+		"neighbor 10.0.2.1 bfd\n",
+		"bfd\n",
+		"peer 10.0.2.1\n",
+		"detect-multiplier 3\n",
+		"receive-interval 100\n",
+		"transmit-interval 100\n",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "neighbor 10.0.3.1 bfd") {
+		t.Error("neighbor without BFD should not have bfd line")
+	}
+}
