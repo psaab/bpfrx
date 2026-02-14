@@ -29,6 +29,21 @@ type EventBuffer struct {
 	size  int
 	head  int // next write position
 	count int // number of events stored
+	seq   uint64 // monotonically increasing sequence number
+
+	subMu sync.RWMutex
+	subs  map[*Subscription]struct{}
+}
+
+// Subscription receives new events from an EventBuffer.
+type Subscription struct {
+	C  chan EventRecord
+	eb *EventBuffer
+}
+
+// Close unsubscribes and closes the channel.
+func (s *Subscription) Close() {
+	s.eb.unsubscribe(s)
 }
 
 // NewEventBuffer creates a new event buffer with the given capacity.
@@ -36,10 +51,12 @@ func NewEventBuffer(size int) *EventBuffer {
 	return &EventBuffer{
 		buf:  make([]EventRecord, size),
 		size: size,
+		subs: make(map[*Subscription]struct{}),
 	}
 }
 
 // Add appends an event to the buffer, overwriting the oldest if full.
+// Subscribers are notified non-blocking.
 func (eb *EventBuffer) Add(rec EventRecord) {
 	eb.mu.Lock()
 	eb.buf[eb.head] = rec
@@ -47,7 +64,39 @@ func (eb *EventBuffer) Add(rec EventRecord) {
 	if eb.count < eb.size {
 		eb.count++
 	}
+	eb.seq++
 	eb.mu.Unlock()
+
+	eb.subMu.RLock()
+	for sub := range eb.subs {
+		select {
+		case sub.C <- rec:
+		default: // drop if subscriber is slow
+		}
+	}
+	eb.subMu.RUnlock()
+}
+
+// Subscribe returns a Subscription that receives new events.
+// Call Close() on the subscription when done.
+func (eb *EventBuffer) Subscribe(bufSize int) *Subscription {
+	if bufSize < 1 {
+		bufSize = 64
+	}
+	sub := &Subscription{
+		C:  make(chan EventRecord, bufSize),
+		eb: eb,
+	}
+	eb.subMu.Lock()
+	eb.subs[sub] = struct{}{}
+	eb.subMu.Unlock()
+	return sub
+}
+
+func (eb *EventBuffer) unsubscribe(sub *Subscription) {
+	eb.subMu.Lock()
+	delete(eb.subs, sub)
+	eb.subMu.Unlock()
 }
 
 // EventFilter specifies criteria for filtering events.

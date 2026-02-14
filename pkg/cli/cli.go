@@ -558,7 +558,7 @@ func (c *CLI) dispatchWithPager(line string) error {
 }
 
 var operationalCommands = []string{
-	"configure", "show", "clear", "ping", "traceroute",
+	"configure", "show", "clear", "ping", "test", "traceroute",
 	"monitor", "request", "quit", "exit",
 }
 
@@ -606,6 +606,9 @@ func (c *CLI) dispatchOperational(line string) error {
 
 	case "request":
 		return c.handleRequest(parts[1:])
+
+	case "test":
+		return c.handleTest(parts[1:])
 
 	case "quit", "exit":
 		return errExit
@@ -7986,6 +7989,295 @@ func matchSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool
 		}
 	}
 	return true
+}
+
+// handleTest dispatches test sub-commands (policy, routing, security-zone).
+func (c *CLI) handleTest(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("test: specify a test command")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["test"].Children))
+		return nil
+	}
+
+	resolved, err := resolveCommand(args[0], keysFromTree(operationalTree["test"].Children))
+	if err != nil {
+		return err
+	}
+
+	switch resolved {
+	case "policy":
+		return c.testPolicy(args[1:])
+	case "routing":
+		return c.testRouting(args[1:])
+	case "security-zone":
+		return c.testSecurityZone(args[1:])
+	default:
+		return fmt.Errorf("unknown test command: %s", resolved)
+	}
+}
+
+// testPolicy performs a 5-tuple policy lookup similar to Junos "test policy".
+func (c *CLI) testPolicy(args []string) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	var fromZone, toZone, srcIP, dstIP, proto string
+	var dstPort int
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "from-zone":
+			if i+1 < len(args) {
+				i++
+				fromZone = args[i]
+			}
+		case "to-zone":
+			if i+1 < len(args) {
+				i++
+				toZone = args[i]
+			}
+		case "source-ip":
+			if i+1 < len(args) {
+				i++
+				srcIP = args[i]
+			}
+		case "destination-ip":
+			if i+1 < len(args) {
+				i++
+				dstIP = args[i]
+			}
+		case "destination-port":
+			if i+1 < len(args) {
+				i++
+				dstPort, _ = strconv.Atoi(args[i])
+			}
+		case "protocol":
+			if i+1 < len(args) {
+				i++
+				proto = args[i]
+			}
+		}
+	}
+
+	if fromZone == "" || toZone == "" {
+		fmt.Println("usage: test policy from-zone <zone> to-zone <zone>")
+		fmt.Println("       source-ip <ip> destination-ip <ip> destination-port <port> protocol <tcp|udp>")
+		return nil
+	}
+
+	parsedSrc := net.ParseIP(srcIP)
+	parsedDst := net.ParseIP(dstIP)
+
+	// Check zone-pair policies
+	for _, zpp := range cfg.Security.Policies {
+		if zpp.FromZone != fromZone || zpp.ToZone != toZone {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if !matchPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
+				continue
+			}
+			if !matchPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
+				continue
+			}
+			if !matchPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
+				continue
+			}
+			action := "permit"
+			switch pol.Action {
+			case 1:
+				action = "deny"
+			case 2:
+				action = "reject"
+			}
+			fmt.Printf("Policy match:\n")
+			fmt.Printf("  From zone: %s\n  To zone:   %s\n", fromZone, toZone)
+			fmt.Printf("  Policy:    %s\n", pol.Name)
+			fmt.Printf("  Action:    %s\n", action)
+			if srcIP != "" {
+				fmt.Printf("  Source:    %s -> ", srcIP)
+			} else {
+				fmt.Printf("  Source:    any -> ")
+			}
+			if dstIP != "" {
+				fmt.Printf("%s", dstIP)
+			} else {
+				fmt.Printf("any")
+			}
+			if dstPort > 0 {
+				fmt.Printf(":%d", dstPort)
+			}
+			if proto != "" {
+				fmt.Printf(" [%s]", proto)
+			}
+			fmt.Println()
+			return nil
+		}
+	}
+
+	// Check global policies
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if !matchPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
+			continue
+		}
+		if !matchPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
+			continue
+		}
+		if !matchPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
+			continue
+		}
+		action := "permit"
+		switch pol.Action {
+		case 1:
+			action = "deny"
+		case 2:
+			action = "reject"
+		}
+		fmt.Printf("Policy match (global):\n")
+		fmt.Printf("  Policy:    %s\n", pol.Name)
+		fmt.Printf("  Action:    %s\n", action)
+		return nil
+	}
+
+	fmt.Printf("Default deny (no matching policy for %s -> %s)\n", fromZone, toZone)
+	return nil
+}
+
+// testRouting looks up a destination in the routing table.
+func (c *CLI) testRouting(args []string) error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+
+	var dest, instance string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "destination":
+			if i+1 < len(args) {
+				i++
+				dest = args[i]
+			}
+		case "instance":
+			if i+1 < len(args) {
+				i++
+				instance = args[i]
+			}
+		}
+	}
+
+	if dest == "" {
+		fmt.Println("usage: test routing destination <ip-or-prefix> [instance <name>]")
+		return nil
+	}
+
+	var entries []routing.RouteEntry
+	var err error
+	if instance != "" {
+		entries, err = c.routing.GetVRFRoutes(instance)
+	} else {
+		entries, err = c.routing.GetRoutes()
+	}
+	if err != nil {
+		return fmt.Errorf("get routes: %w", err)
+	}
+
+	// Normalize dest to CIDR for matching
+	filterCIDR := dest
+	if !strings.Contains(filterCIDR, "/") {
+		if strings.Contains(filterCIDR, ":") {
+			filterCIDR += "/128"
+		} else {
+			filterCIDR += "/32"
+		}
+	}
+	filterIP, _, filterErr := net.ParseCIDR(filterCIDR)
+	if filterErr != nil {
+		filterIP = net.ParseIP(dest)
+	}
+
+	// Find the best (longest prefix) match
+	var best *routing.RouteEntry
+	bestLen := -1
+	for i := range entries {
+		_, rNet, err := net.ParseCIDR(entries[i].Destination)
+		if err != nil {
+			continue
+		}
+		if filterIP != nil && rNet.Contains(filterIP) {
+			ones, _ := rNet.Mask.Size()
+			if ones > bestLen {
+				bestLen = ones
+				best = &entries[i]
+			}
+		}
+	}
+
+	if instance != "" {
+		fmt.Printf("Routing lookup in instance %s for %s:\n", instance, dest)
+	} else {
+		fmt.Printf("Routing lookup for %s:\n", dest)
+	}
+	if best == nil {
+		fmt.Println("  No matching route found")
+	} else {
+		fmt.Printf("  Destination: %s\n", best.Destination)
+		fmt.Printf("  Next-hop:    %s\n", best.NextHop)
+		fmt.Printf("  Interface:   %s\n", best.Interface)
+		fmt.Printf("  Protocol:    %s\n", best.Protocol)
+		fmt.Printf("  Preference:  %d\n", best.Preference)
+	}
+	return nil
+}
+
+// testSecurityZone looks up which zone an interface belongs to.
+func (c *CLI) testSecurityZone(args []string) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	var ifName string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "interface" && i+1 < len(args) {
+			i++
+			ifName = args[i]
+		}
+	}
+
+	if ifName == "" {
+		fmt.Println("usage: test security-zone interface <name>")
+		return nil
+	}
+
+	for zoneName, zone := range cfg.Security.Zones {
+		for _, iface := range zone.Interfaces {
+			if iface == ifName {
+				fmt.Printf("Interface %s belongs to zone: %s\n", ifName, zoneName)
+				if zone.Description != "" {
+					fmt.Printf("  Description: %s\n", zone.Description)
+				}
+				if zone.ScreenProfile != "" {
+					fmt.Printf("  Screen:      %s\n", zone.ScreenProfile)
+				}
+				if zone.HostInboundTraffic != nil {
+					if len(zone.HostInboundTraffic.SystemServices) > 0 {
+						fmt.Printf("  Host-inbound services: %s\n", strings.Join(zone.HostInboundTraffic.SystemServices, ", "))
+					}
+					if len(zone.HostInboundTraffic.Protocols) > 0 {
+						fmt.Printf("  Host-inbound protocols: %s\n", strings.Join(zone.HostInboundTraffic.Protocols, ", "))
+					}
+				}
+				return nil
+			}
+		}
+	}
+
+	fmt.Printf("Interface %s is not assigned to any security zone\n", ifName)
+	return nil
 }
 
 // handleMonitor dispatches monitor sub-commands.

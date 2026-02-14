@@ -106,6 +106,157 @@ func cloneNodes(nodes []*Node) []*Node {
 	return result
 }
 
+// ExpandGroups resolves all "apply-groups" references in the tree.
+// It collects group definitions from the "groups" stanza, then for each
+// "apply-groups <name>" node, clones the referenced group's children and
+// merges them into the parent. After expansion, both "groups" and
+// "apply-groups" nodes are removed from the tree.
+func (t *ConfigTree) ExpandGroups() error {
+	// Collect group definitions: groups { <name> { ... } }
+	groups := make(map[string]*Node)
+	for _, child := range t.Children {
+		if child.Name() == "groups" {
+			for _, g := range child.Children {
+				if len(g.Keys) < 1 {
+					continue
+				}
+				name := g.Keys[0]
+				if len(g.Keys) > 1 {
+					name = g.Keys[1]
+				}
+				groups[name] = g
+			}
+		}
+	}
+
+	// If no groups defined, just strip any stale apply-groups references.
+	if len(groups) == 0 {
+		return t.stripApplyGroups()
+	}
+
+	// Resolve apply-groups at top level.
+	if err := expandGroupsInNodes(&t.Children, groups, nil); err != nil {
+		return err
+	}
+
+	// Remove the "groups" stanza itself.
+	filtered := make([]*Node, 0, len(t.Children))
+	for _, child := range t.Children {
+		if child.Name() != "groups" {
+			filtered = append(filtered, child)
+		}
+	}
+	t.Children = filtered
+
+	return nil
+}
+
+// stripApplyGroups removes apply-groups nodes and returns error if they
+// reference undefined groups.
+func (t *ConfigTree) stripApplyGroups() error {
+	for _, child := range t.Children {
+		if child.Name() == "apply-groups" {
+			name := ""
+			if len(child.Keys) > 1 {
+				name = child.Keys[1]
+			}
+			return fmt.Errorf("apply-groups references undefined group %q", name)
+		}
+	}
+	return nil
+}
+
+// expandGroupsInNodes processes apply-groups nodes within a node list.
+// It merges referenced group children into the list, then removes apply-groups.
+// seen tracks group names being expanded to detect circular references.
+func expandGroupsInNodes(nodes *[]*Node, groups map[string]*Node, seen map[string]bool) error {
+	// First, collect apply-groups references at this level.
+	var applyNames []string
+	for _, n := range *nodes {
+		if n.Name() == "apply-groups" && len(n.Keys) > 1 {
+			applyNames = append(applyNames, n.Keys[1])
+		}
+	}
+
+	// Expand each referenced group.
+	for _, name := range applyNames {
+		g, ok := groups[name]
+		if !ok {
+			return fmt.Errorf("apply-groups references undefined group %q", name)
+		}
+
+		if seen == nil {
+			seen = make(map[string]bool)
+		}
+		if seen[name] {
+			return fmt.Errorf("apply-groups circular reference: group %q", name)
+		}
+		seen[name] = true
+
+		// Clone group children and merge into current node list.
+		cloned := cloneNodes(g.Children)
+		mergeNodes(nodes, cloned)
+
+		delete(seen, name)
+	}
+
+	// Remove apply-groups nodes.
+	filtered := make([]*Node, 0, len(*nodes))
+	for _, n := range *nodes {
+		if n.Name() != "apply-groups" {
+			filtered = append(filtered, n)
+		}
+	}
+	*nodes = filtered
+
+	return nil
+}
+
+// mergeNodes merges src nodes into dst. For container nodes with matching keys,
+// children are merged recursively. For leaf nodes or new containers, they are
+// appended (group values don't override existing explicit config — existing
+// config takes precedence via ordering, since the compiler uses first-match).
+func mergeNodes(dst *[]*Node, src []*Node) {
+	for _, s := range src {
+		if s.IsLeaf {
+			// Only add leaf if no matching leaf exists.
+			if !hasMatchingLeaf(*dst, s.Keys) {
+				*dst = append(*dst, s)
+			}
+			continue
+		}
+
+		// Container node: find matching container in dst.
+		found := false
+		for _, d := range *dst {
+			if !d.IsLeaf && keysEqual(d.Keys, s.Keys) {
+				// Merge children recursively.
+				mergeNodes(&d.Children, s.Children)
+				found = true
+				break
+			}
+		}
+		if !found {
+			*dst = append(*dst, s)
+		}
+	}
+}
+
+// hasMatchingLeaf returns true if nodes contains a leaf whose first key
+// matches. This prevents group values from overriding explicit config
+// (e.g., if "host-name explicit" already exists, "host-name group" is skipped).
+func hasMatchingLeaf(nodes []*Node, keys []string) bool {
+	if len(keys) == 0 {
+		return false
+	}
+	for _, n := range nodes {
+		if n.IsLeaf && len(n.Keys) > 0 && n.Keys[0] == keys[0] {
+			return true
+		}
+	}
+	return false
+}
+
 // ValueHint identifies what kind of dynamic value is expected at a schema position.
 type ValueHint int
 
@@ -137,6 +288,8 @@ type schemaNode struct {
 // Keywords present in the schema at a given depth are treated as containers.
 // Keywords NOT in the schema become leaf nodes (all remaining tokens form the leaf's Keys).
 var setSchema = &schemaNode{children: map[string]*schemaNode{
+	"groups":       {wildcard: &schemaNode{}}, // children set in init()
+	"apply-groups": {args: 1, children: nil},
 	"security": {children: map[string]*schemaNode{
 		"zones": {children: map[string]*schemaNode{
 			"security-zone": {args: 1, valueHint: ValueHintZoneName, children: map[string]*schemaNode{
@@ -1058,6 +1211,19 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 	}}},
 }}
+
+func init() {
+	// Wire groups wildcard to mirror top-level schema children.
+	// This allows "set groups <name> security ..." etc. to parse correctly.
+	groupWild := setSchema.children["groups"].wildcard
+	groupWild.children = make(map[string]*schemaNode)
+	for k, v := range setSchema.children {
+		if k == "groups" || k == "apply-groups" {
+			continue
+		}
+		groupWild.children[k] = v
+	}
+}
 
 // SetPath inserts a leaf node at the given path in the tree.
 // Intermediate block nodes are created as needed. The schema determines

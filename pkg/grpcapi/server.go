@@ -3002,6 +3002,217 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		return &pb.ShowTextResponse{Output: buf.String()}, nil
 	}
 
+	// test policy: "test-policy:from=X,to=Y,src=A,dst=B,port=P,proto=TCP"
+	if strings.HasPrefix(req.Topic, "test-policy:") {
+		params := strings.TrimPrefix(req.Topic, "test-policy:")
+		var fromZone, toZone, srcIP, dstIP, proto string
+		var dstPort int
+		for _, kv := range strings.Split(params, ",") {
+			parts := strings.SplitN(kv, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			switch parts[0] {
+			case "from":
+				fromZone = parts[1]
+			case "to":
+				toZone = parts[1]
+			case "src":
+				srcIP = parts[1]
+			case "dst":
+				dstIP = parts[1]
+			case "port":
+				dstPort, _ = strconv.Atoi(parts[1])
+			case "proto":
+				proto = parts[1]
+			}
+		}
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else if fromZone == "" || toZone == "" {
+			buf.WriteString("Missing from/to zone parameters\n")
+		} else {
+			parsedSrc := net.ParseIP(srcIP)
+			parsedDst := net.ParseIP(dstIP)
+			found := false
+			for _, zpp := range cfg.Security.Policies {
+				if zpp.FromZone != fromZone || zpp.ToZone != toZone {
+					continue
+				}
+				for _, pol := range zpp.Policies {
+					if !matchShowPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
+						continue
+					}
+					if !matchShowPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
+						continue
+					}
+					if !matchShowPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
+						continue
+					}
+					action := policyActionName(pol.Action)
+					fmt.Fprintf(&buf, "Policy match:\n")
+					fmt.Fprintf(&buf, "  From zone: %s\n  To zone:   %s\n", fromZone, toZone)
+					fmt.Fprintf(&buf, "  Policy:    %s\n", pol.Name)
+					fmt.Fprintf(&buf, "  Action:    %s\n", action)
+					found = true
+					break
+				}
+				if found {
+					break
+				}
+			}
+			if !found {
+				// Check global policies
+				for _, pol := range cfg.Security.GlobalPolicies {
+					if !matchShowPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
+						continue
+					}
+					if !matchShowPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
+						continue
+					}
+					if !matchShowPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
+						continue
+					}
+					action := policyActionName(pol.Action)
+					fmt.Fprintf(&buf, "Policy match (global):\n")
+					fmt.Fprintf(&buf, "  Policy:    %s\n", pol.Name)
+					fmt.Fprintf(&buf, "  Action:    %s\n", action)
+					found = true
+					break
+				}
+			}
+			if !found {
+				fmt.Fprintf(&buf, "Default deny (no matching policy for %s -> %s)\n", fromZone, toZone)
+			}
+		}
+		return &pb.ShowTextResponse{Output: buf.String()}, nil
+	}
+
+	// test routing: "test-routing:dest=10.0.0.0/24" or "test-routing:dest=10.0.0.0/24,instance=dmz-vr"
+	if strings.HasPrefix(req.Topic, "test-routing:") {
+		params := strings.TrimPrefix(req.Topic, "test-routing:")
+		var dest, instance string
+		for _, kv := range strings.Split(params, ",") {
+			parts := strings.SplitN(kv, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			switch parts[0] {
+			case "dest":
+				dest = parts[1]
+			case "instance":
+				instance = parts[1]
+			}
+		}
+		if s.routing == nil {
+			buf.WriteString("Routing manager not available\n")
+		} else if dest == "" {
+			buf.WriteString("Missing dest parameter\n")
+		} else {
+			var entries []routing.RouteEntry
+			var err error
+			if instance != "" {
+				entries, err = s.routing.GetVRFRoutes(instance)
+			} else {
+				entries, err = s.routing.GetRoutes()
+			}
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "get routes: %v", err)
+			}
+			filterCIDR := dest
+			if !strings.Contains(filterCIDR, "/") {
+				if strings.Contains(filterCIDR, ":") {
+					filterCIDR += "/128"
+				} else {
+					filterCIDR += "/32"
+				}
+			}
+			filterIP, _, filterErr := net.ParseCIDR(filterCIDR)
+			if filterErr != nil {
+				filterIP = net.ParseIP(dest)
+			}
+			var best *routing.RouteEntry
+			bestLen := -1
+			for i := range entries {
+				_, rNet, err := net.ParseCIDR(entries[i].Destination)
+				if err != nil {
+					continue
+				}
+				if filterIP != nil && rNet.Contains(filterIP) {
+					ones, _ := rNet.Mask.Size()
+					if ones > bestLen {
+						bestLen = ones
+						best = &entries[i]
+					}
+				}
+			}
+			if instance != "" {
+				fmt.Fprintf(&buf, "Routing lookup in instance %s for %s:\n", instance, dest)
+			} else {
+				fmt.Fprintf(&buf, "Routing lookup for %s:\n", dest)
+			}
+			if best == nil {
+				buf.WriteString("  No matching route found\n")
+			} else {
+				fmt.Fprintf(&buf, "  Destination: %s\n", best.Destination)
+				fmt.Fprintf(&buf, "  Next-hop:    %s\n", best.NextHop)
+				fmt.Fprintf(&buf, "  Interface:   %s\n", best.Interface)
+				fmt.Fprintf(&buf, "  Protocol:    %s\n", best.Protocol)
+				fmt.Fprintf(&buf, "  Preference:  %d\n", best.Preference)
+			}
+		}
+		return &pb.ShowTextResponse{Output: buf.String()}, nil
+	}
+
+	// test security-zone: "test-zone:interface=trust0"
+	if strings.HasPrefix(req.Topic, "test-zone:") {
+		params := strings.TrimPrefix(req.Topic, "test-zone:")
+		var ifName string
+		for _, kv := range strings.Split(params, ",") {
+			parts := strings.SplitN(kv, "=", 2)
+			if len(parts) == 2 && parts[0] == "interface" {
+				ifName = parts[1]
+			}
+		}
+		if cfg == nil {
+			buf.WriteString("No active configuration\n")
+		} else if ifName == "" {
+			buf.WriteString("Missing interface parameter\n")
+		} else {
+			found := false
+			for zoneName, zone := range cfg.Security.Zones {
+				for _, iface := range zone.Interfaces {
+					if iface == ifName {
+						fmt.Fprintf(&buf, "Interface %s belongs to zone: %s\n", ifName, zoneName)
+						if zone.Description != "" {
+							fmt.Fprintf(&buf, "  Description: %s\n", zone.Description)
+						}
+						if zone.ScreenProfile != "" {
+							fmt.Fprintf(&buf, "  Screen:      %s\n", zone.ScreenProfile)
+						}
+						if zone.HostInboundTraffic != nil {
+							if len(zone.HostInboundTraffic.SystemServices) > 0 {
+								fmt.Fprintf(&buf, "  Host-inbound services: %s\n", strings.Join(zone.HostInboundTraffic.SystemServices, ", "))
+							}
+							if len(zone.HostInboundTraffic.Protocols) > 0 {
+								fmt.Fprintf(&buf, "  Host-inbound protocols: %s\n", strings.Join(zone.HostInboundTraffic.Protocols, ", "))
+							}
+						}
+						found = true
+						break
+					}
+				}
+				if found {
+					break
+				}
+			}
+			if !found {
+				fmt.Fprintf(&buf, "Interface %s is not assigned to any security zone\n", ifName)
+			}
+		}
+		return &pb.ShowTextResponse{Output: buf.String()}, nil
+	}
+
 	switch req.Topic {
 	case "zones-detail":
 		if cfg == nil || len(cfg.Security.Zones) == 0 {
@@ -6322,4 +6533,119 @@ func routePrefixMatch(routeDst string, filterNet *net.IPNet, filterErr error) bo
 		return filterNet.Contains(routeNet.IP)
 	}
 	return routeNet.Contains(filterNet.IP)
+}
+
+// policyActionName returns a human-readable policy action name.
+func policyActionName(a config.PolicyAction) string {
+	switch a {
+	case 1:
+		return "deny"
+	case 2:
+		return "reject"
+	default:
+		return "permit"
+	}
+}
+
+// matchShowPolicyAddr checks if an IP matches a list of address-book references.
+func matchShowPolicyAddr(addrs []string, ip net.IP, cfg *config.Config) bool {
+	if len(addrs) == 0 || ip == nil {
+		return true
+	}
+	for _, a := range addrs {
+		if a == "any" {
+			return true
+		}
+		if cfg.Security.AddressBook == nil {
+			continue
+		}
+		if addr, ok := cfg.Security.AddressBook.Addresses[a]; ok {
+			_, cidr, err := net.ParseCIDR(addr.Value)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		}
+		if matchShowPolicyAddrSet(a, ip, cfg, 0) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchShowPolicyAddrSet(setName string, ip net.IP, cfg *config.Config, depth int) bool {
+	if depth > 5 || cfg.Security.AddressBook == nil {
+		return false
+	}
+	as, ok := cfg.Security.AddressBook.AddressSets[setName]
+	if !ok {
+		return false
+	}
+	for _, addrName := range as.Addresses {
+		if addr, ok := cfg.Security.AddressBook.Addresses[addrName]; ok {
+			_, cidr, err := net.ParseCIDR(addr.Value)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		}
+	}
+	for _, nested := range as.AddressSets {
+		if matchShowPolicyAddrSet(nested, ip, cfg, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchShowPolicyApp checks if a protocol/port matches a list of application references.
+func matchShowPolicyApp(apps []string, proto string, dstPort int, cfg *config.Config) bool {
+	if len(apps) == 0 || proto == "" {
+		return true
+	}
+	for _, a := range apps {
+		if a == "any" {
+			return true
+		}
+		if matchShowSingleApp(a, proto, dstPort, cfg) {
+			return true
+		}
+		if cfg.Applications.ApplicationSets != nil {
+			if as, ok := cfg.Applications.ApplicationSets[a]; ok {
+				for _, appRef := range as.Applications {
+					if matchShowSingleApp(appRef, proto, dstPort, cfg) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func matchShowSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool {
+	if cfg.Applications.Applications == nil {
+		return false
+	}
+	app, ok := cfg.Applications.Applications[appName]
+	if !ok {
+		return false
+	}
+	if app.Protocol != "" && !strings.EqualFold(app.Protocol, proto) {
+		return false
+	}
+	if app.DestinationPort != "" && dstPort > 0 {
+		if strings.Contains(app.DestinationPort, "-") {
+			parts := strings.SplitN(app.DestinationPort, "-", 2)
+			lo, _ := strconv.Atoi(parts[0])
+			hi, _ := strconv.Atoi(parts[1])
+			if dstPort < lo || dstPort > hi {
+				return false
+			}
+		} else {
+			p, _ := strconv.Atoi(app.DestinationPort)
+			if p != dstPort {
+				return false
+			}
+		}
+	}
+	return true
 }

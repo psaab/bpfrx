@@ -158,6 +158,10 @@ func NewServer(cfg Config) *Server {
 	// DHCP mutations
 	mux.HandleFunc("POST /api/v1/dhcp/identifiers/clear", s.clearDHCPIdentifiersHandler)
 
+	// SSE streaming
+	mux.HandleFunc("GET /api/v1/events/stream", s.eventStreamHandler)
+	mux.HandleFunc("GET /api/v1/logs/stream", s.logStreamHandler)
+
 	// Generic text show
 	mux.HandleFunc("GET /api/v1/show-text", s.showTextHandler)
 

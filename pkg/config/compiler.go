@@ -9,6 +9,11 @@ import (
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
 func CompileConfig(tree *ConfigTree) (*Config, error) {
+	// Expand groups before compilation — resolve all apply-groups references.
+	if err := tree.ExpandGroups(); err != nil {
+		return nil, fmt.Errorf("apply-groups: %w", err)
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),

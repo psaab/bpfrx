@@ -9992,3 +9992,237 @@ func TestPortMirroringHierarchicalSimple(t *testing.T) {
 		t.Errorf("output = %q, want monitor0", inst.Output)
 	}
 }
+
+func TestApplyGroupsHierarchical(t *testing.T) {
+	input := `
+groups {
+    common {
+        system {
+            host-name my-firewall;
+        }
+        security {
+            zones {
+                security-zone trust {
+                    interfaces {
+                        eth0.0;
+                    }
+                }
+            }
+        }
+    }
+}
+apply-groups common;
+interfaces {
+    eth0 {
+        unit 0 {
+            family inet {
+                address 10.0.1.1/24;
+            }
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	if cfg.System.HostName != "my-firewall" {
+		t.Errorf("hostname = %q, want my-firewall", cfg.System.HostName)
+	}
+	// Group should have expanded zone config.
+	trustZone := cfg.Security.Zones["trust"]
+	if trustZone == nil {
+		t.Fatal("expected trust zone from group")
+	}
+	if len(trustZone.Interfaces) != 1 || trustZone.Interfaces[0] != "eth0.0" {
+		t.Errorf("trust zone interfaces: %v", trustZone.Interfaces)
+	}
+	// Explicit interface config should still be present.
+	iface := cfg.Interfaces.Interfaces["eth0"]
+	if iface == nil {
+		t.Fatal("expected eth0 interface")
+	}
+}
+
+func TestApplyGroupsSetSyntax(t *testing.T) {
+	setCommands := []string{
+		"set groups common system host-name fw1",
+		"set groups common security screen ids-option myscreen tcp land",
+		"set apply-groups common",
+		"set interfaces eth0 unit 0 family inet address 10.0.1.1/24",
+	}
+
+	tree := &ConfigTree{}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	if cfg.System.HostName != "fw1" {
+		t.Errorf("hostname = %q, want fw1", cfg.System.HostName)
+	}
+	sp := cfg.Security.Screen["myscreen"]
+	if sp == nil {
+		t.Fatal("expected myscreen profile")
+	}
+	if !sp.TCP.Land {
+		t.Error("expected land screen")
+	}
+}
+
+func TestApplyGroupsMergeDoesNotOverride(t *testing.T) {
+	input := `
+groups {
+    defaults {
+        system {
+            host-name group-name;
+        }
+    }
+}
+apply-groups defaults;
+system {
+    host-name explicit-name;
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	if cfg.System.HostName != "explicit-name" {
+		t.Errorf("hostname = %q, want explicit-name", cfg.System.HostName)
+	}
+}
+
+func TestApplyGroupsMissingReference(t *testing.T) {
+	input := `
+apply-groups nonexistent;
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected error for undefined group reference")
+	}
+	if !strings.Contains(err.Error(), "nonexistent") {
+		t.Errorf("error should mention group name: %v", err)
+	}
+}
+
+func TestApplyGroupsCircularReference(t *testing.T) {
+	input := `
+groups {
+    grp-a {
+        system {
+            host-name from-a;
+        }
+    }
+}
+apply-groups grp-a;
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if cfg.System.HostName != "from-a" {
+		t.Errorf("hostname = %q, want from-a", cfg.System.HostName)
+	}
+}
+
+func TestApplyGroupsMultiple(t *testing.T) {
+	// Use set syntax for screen (hierarchical format doesn't match compiler expectations).
+	setCommands := []string{
+		"set groups net-settings interfaces eth0 unit 0 family inet address 10.0.1.1/24",
+		"set groups sec-settings security screen ids-option basic tcp land",
+		"set apply-groups net-settings",
+		"set apply-groups sec-settings",
+		"set system host-name test-fw",
+	}
+
+	tree := &ConfigTree{}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	if cfg.System.HostName != "test-fw" {
+		t.Errorf("hostname = %q, want test-fw", cfg.System.HostName)
+	}
+	iface := cfg.Interfaces.Interfaces["eth0"]
+	if iface == nil {
+		t.Fatal("expected eth0 from net-settings group")
+	}
+	sp := cfg.Security.Screen["basic"]
+	if sp == nil {
+		t.Fatal("expected basic screen from sec-settings group")
+	}
+}
+
+func TestApplyGroupsFormatSet(t *testing.T) {
+	setCommands := []string{
+		"set groups common system host-name fw1",
+		"set apply-groups common",
+	}
+
+	tree := &ConfigTree{}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	output := tree.FormatSet()
+	if !strings.Contains(output, "set groups common system host-name fw1") {
+		t.Errorf("FormatSet missing groups line, got:\n%s", output)
+	}
+	if !strings.Contains(output, "set apply-groups common") {
+		t.Errorf("FormatSet missing apply-groups line, got:\n%s", output)
+	}
+}

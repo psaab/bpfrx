@@ -355,6 +355,35 @@ var OperationalTree = map[string]*Node{
 			"zeroize": {Desc: "Factory reset (erase all config)"},
 		}},
 	}},
+	"test": {Desc: "Diagnostic test commands", Children: map[string]*Node{
+		"policy": {Desc: "Test security policy lookup", Children: map[string]*Node{
+			"from-zone": {Desc: "Source zone", DynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.Security.Zones))
+				for name := range cfg.Security.Zones {
+					names = append(names, name)
+				}
+				return names
+			}},
+		}},
+		"routing": {Desc: "Test route lookup", Children: map[string]*Node{
+			"destination": {Desc: "Destination IP or prefix to look up"},
+		}},
+		"security-zone": {Desc: "Show zone for interface", Children: map[string]*Node{
+			"interface": {Desc: "Interface name", DynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil || cfg.Interfaces.Interfaces == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+				for name := range cfg.Interfaces.Interfaces {
+					names = append(names, name)
+				}
+				return names
+			}},
+		}},
+	}},
 	"ping":       {Desc: "Ping remote host"},
 	"traceroute": {Desc: "Trace route to remote host"},
 	"quit":       {Desc: "Exit CLI"},

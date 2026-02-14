@@ -299,6 +299,9 @@ func (c *ctl) dispatchOperational(line string) error {
 	case "request":
 		return c.handleRequest(parts[1:])
 
+	case "test":
+		return c.handleTest(parts[1:])
+
 	case "monitor":
 		return fmt.Errorf("monitor traffic is only available on the local CLI")
 
@@ -2449,6 +2452,130 @@ func (c *ctl) showConfigHelp() {
 // --- Completion helpers (descriptions from canonical cmdtree) ---
 
 // remoteLookupDesc finds the description for a candidate name by walking
+func (c *ctl) handleTest(args []string) error {
+	if len(args) == 0 {
+		printRemoteTreeHelp("test: specify a test command", "test")
+		return nil
+	}
+
+	switch args[0] {
+	case "policy":
+		return c.testPolicy(args[1:])
+	case "routing":
+		return c.testRouting(args[1:])
+	case "security-zone":
+		return c.testSecurityZone(args[1:])
+	default:
+		return fmt.Errorf("unknown test command: %s", args[0])
+	}
+}
+
+func (c *ctl) testPolicy(args []string) error {
+	var fromZone, toZone, srcIP, dstIP, proto string
+	var dstPort int
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "from-zone":
+			if i+1 < len(args) {
+				i++
+				fromZone = args[i]
+			}
+		case "to-zone":
+			if i+1 < len(args) {
+				i++
+				toZone = args[i]
+			}
+		case "source-ip":
+			if i+1 < len(args) {
+				i++
+				srcIP = args[i]
+			}
+		case "destination-ip":
+			if i+1 < len(args) {
+				i++
+				dstIP = args[i]
+			}
+		case "destination-port":
+			if i+1 < len(args) {
+				i++
+				dstPort, _ = strconv.Atoi(args[i])
+			}
+		case "protocol":
+			if i+1 < len(args) {
+				i++
+				proto = args[i]
+			}
+		}
+	}
+
+	if fromZone == "" || toZone == "" {
+		fmt.Println("usage: test policy from-zone <zone> to-zone <zone>")
+		fmt.Println("       source-ip <ip> destination-ip <ip> destination-port <port> protocol <tcp|udp>")
+		return nil
+	}
+
+	topic := fmt.Sprintf("test-policy:from=%s,to=%s", fromZone, toZone)
+	if srcIP != "" {
+		topic += ",src=" + srcIP
+	}
+	if dstIP != "" {
+		topic += ",dst=" + dstIP
+	}
+	if dstPort > 0 {
+		topic += ",port=" + strconv.Itoa(dstPort)
+	}
+	if proto != "" {
+		topic += ",proto=" + proto
+	}
+	return c.showText(topic)
+}
+
+func (c *ctl) testRouting(args []string) error {
+	var dest, instance string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "destination":
+			if i+1 < len(args) {
+				i++
+				dest = args[i]
+			}
+		case "instance":
+			if i+1 < len(args) {
+				i++
+				instance = args[i]
+			}
+		}
+	}
+
+	if dest == "" {
+		fmt.Println("usage: test routing destination <ip-or-prefix> [instance <name>]")
+		return nil
+	}
+
+	topic := "test-routing:dest=" + dest
+	if instance != "" {
+		topic += ",instance=" + instance
+	}
+	return c.showText(topic)
+}
+
+func (c *ctl) testSecurityZone(args []string) error {
+	var ifName string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "interface" && i+1 < len(args) {
+			i++
+			ifName = args[i]
+		}
+	}
+
+	if ifName == "" {
+		fmt.Println("usage: test security-zone interface <name>")
+		return nil
+	}
+
+	return c.showText("test-zone:interface=" + ifName)
+}
+
 // the canonical command tree in pkg/cmdtree. No manual desc map needed.
 func remoteLookupDesc(words []string, name string, configMode bool) string {
 	return cmdtree.LookupDesc(words, name, configMode)
