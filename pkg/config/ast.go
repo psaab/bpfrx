@@ -474,6 +474,7 @@ type schemaNode struct {
 	args        int                    // extra tokens consumed as part of this node's key
 	children    map[string]*schemaNode // known container children
 	wildcard    *schemaNode            // matches any keyword not in children (for dynamic names)
+	multi       bool                   // true = multiple leaf values allowed (e.g. source-address); false = replace on set
 	valueHint   ValueHint              // hint for dynamic value completion (when args > 0)
 	desc        string                 // description shown in completion help
 	placeholder string                 // Junos-style placeholder (e.g., "<interface-name>")
@@ -484,7 +485,7 @@ type schemaNode struct {
 // Keywords NOT in the schema become leaf nodes (all remaining tokens form the leaf's Keys).
 var setSchema = &schemaNode{children: map[string]*schemaNode{
 	"groups":       {wildcard: &schemaNode{}}, // children set in init()
-	"apply-groups": {args: 1, children: nil},
+	"apply-groups": {args: 1, multi: true, children: nil},
 	"security": {children: map[string]*schemaNode{
 		"zones": {children: map[string]*schemaNode{
 			"security-zone": {args: 1, valueHint: ValueHintZoneName, children: map[string]*schemaNode{
@@ -502,7 +503,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"from-zone": {args: 3, valueHint: ValueHintZoneName, children: map[string]*schemaNode{ // from-zone X to-zone Y
 				"policy": {args: 1, children: map[string]*schemaNode{
 					"description": {args: 1, children: nil},
-					"match":       {children: nil}, // match children are all leaves
+					"match": {children: map[string]*schemaNode{
+						"source-address":      {args: 1, multi: true, children: nil},
+						"destination-address":  {args: 1, multi: true, children: nil},
+						"application":          {args: 1, multi: true, children: nil},
+					}},
 					"then": {children: map[string]*schemaNode{
 						"log": {children: nil},
 						// permit, deny, reject, count → leaf
@@ -512,7 +517,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"global": {children: map[string]*schemaNode{
 				"policy": {args: 1, children: map[string]*schemaNode{
 					"description": {args: 1, children: nil},
-					"match":       {children: nil},
+					"match": {children: map[string]*schemaNode{
+						"source-address":      {args: 1, multi: true, children: nil},
+						"destination-address":  {args: 1, multi: true, children: nil},
+						"application":          {args: 1, multi: true, children: nil},
+					}},
 					"then": {children: map[string]*schemaNode{
 						"log": {children: nil},
 					}},
@@ -547,10 +556,10 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					}},
 					"rule": {args: 1, children: map[string]*schemaNode{
 						"match": {children: map[string]*schemaNode{
-							"source-address":      {args: 1, children: nil},
-							"destination-address":  {args: 1, children: nil},
-							"destination-port":     {args: 1, children: nil},
-							"application":          {args: 1, children: nil},
+							"source-address":      {args: 1, multi: true, children: nil},
+							"destination-address":  {args: 1, multi: true, children: nil},
+							"destination-port":     {args: 1, multi: true, children: nil},
+							"application":          {args: 1, multi: true, children: nil},
 						}},
 						"then": {children: map[string]*schemaNode{
 							"source-nat": {children: map[string]*schemaNode{
@@ -573,12 +582,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					}},
 					"rule": {args: 1, children: map[string]*schemaNode{
 						"match": {children: map[string]*schemaNode{
-							"source-address":       {args: 1, children: nil},
-							"source-address-name":  {args: 1, children: nil},
-							"destination-address":  {args: 1, children: nil},
-							"destination-port":     {args: 1, children: nil},
-							"protocol":             {args: 1, children: nil},
-							"application":          {args: 1, children: nil},
+							"source-address":       {args: 1, multi: true, children: nil},
+							"source-address-name":  {args: 1, multi: true, children: nil},
+							"destination-address":  {args: 1, multi: true, children: nil},
+							"destination-port":     {args: 1, multi: true, children: nil},
+							"protocol":             {args: 1, multi: true, children: nil},
+							"application":          {args: 1, multi: true, children: nil},
 						}},
 						"then": {children: map[string]*schemaNode{
 							"destination-nat": {children: map[string]*schemaNode{
@@ -834,7 +843,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"autonomous-system": {args: 1, children: nil},
 		"forwarding-table": {children: map[string]*schemaNode{
-			"export": {args: 1, children: nil},
+			"export": {args: 1, multi: true, children: nil},
 		}},
 		"rib-groups": {wildcard: &schemaNode{children: map[string]*schemaNode{
 			"import-rib": {children: nil},
@@ -874,9 +883,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	"policy-options": {children: map[string]*schemaNode{
 		"prefix-list": {args: 1, children: nil},
 		"community": {args: 1, children: map[string]*schemaNode{
-			"members": {args: 1, children: nil},
+			"members": {args: 1, multi: true, children: nil},
 		}},
-		"as-path": {args: 2, children: nil},
+		"as-path": {args: 2, multi: true, children: nil},
 		"policy-statement": {args: 1, children: map[string]*schemaNode{
 			"term": {args: 1, children: map[string]*schemaNode{
 				"from": {children: map[string]*schemaNode{
@@ -906,7 +915,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"router-id":           {args: 1, children: nil},
 			"reference-bandwidth": {args: 1, children: nil},
 			"passive":             {children: nil},
-			"export":              {args: 1, children: nil},
+			"export":              {args: 1, multi: true, children: nil},
 			"area": {args: 1, children: map[string]*schemaNode{
 				"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 					"passive":        {children: nil},
@@ -938,7 +947,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"ospf3": {children: map[string]*schemaNode{
 			"router-id": {args: 1, children: nil},
-			"export":    {args: 1, children: nil},
+			"export":    {args: 1, multi: true, children: nil},
 			"area": {args: 1, children: map[string]*schemaNode{
 				"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 					"passive": {children: nil},
@@ -961,12 +970,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"suppress":     {args: 1, children: nil},
 				"max-suppress": {args: 1, children: nil},
 			}},
-			"export":          {args: 1, children: nil},
+			"export":          {args: 1, multi: true, children: nil},
 			"group": {args: 1, children: map[string]*schemaNode{
 				"peer-as":            {args: 1, children: nil},
 				"description":        {args: 1, children: nil},
 				"multihop":           {args: 1, children: nil},
-				"export":             {args: 1, children: nil},
+				"export":             {args: 1, multi: true, children: nil},
 				"authentication-key": {args: 1, children: nil},
 				"default-originate":  {children: nil},
 				"loops":              {args: 1, children: nil},
@@ -1033,7 +1042,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"net":                 {args: 1, children: nil},
 			"level":              {args: 1, children: nil},
 			"is-type":            {args: 1, children: nil},
-			"export":             {args: 1, children: nil},
+			"export":             {args: 1, multi: true, children: nil},
 			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 				"level":               {args: 1, children: nil},
 				"passive":             {children: nil},
@@ -1191,7 +1200,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	"system": {children: map[string]*schemaNode{
 		"host-name":     {args: 1, children: nil},
 		"domain-name":   {args: 1, children: nil},
-		"domain-search": {args: 1, children: nil},
+		"domain-search": {args: 1, multi: true, children: nil},
 		"time-zone":     {args: 1, children: nil},
 		"no-redirects":  {children: nil},
 		"name-server":   {children: nil},
@@ -1405,7 +1414,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 			"ospf3": {children: map[string]*schemaNode{
 				"router-id": {args: 1, children: nil},
-				"export":    {args: 1, children: nil},
+				"export":    {args: 1, multi: true, children: nil},
 				"area": {args: 1, children: map[string]*schemaNode{
 					"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 						"passive": {children: nil},
@@ -1427,7 +1436,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"net":                 {args: 1, children: nil},
 				"level":              {args: 1, children: nil},
 				"is-type":            {args: 1, children: nil},
-				"export":             {args: 1, children: nil},
+				"export":             {args: 1, multi: true, children: nil},
 				"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 					"level":               {args: 1, children: nil},
 					"passive":             {children: nil},
@@ -1485,8 +1494,15 @@ func (t *ConfigTree) SetPath(path []string) error {
 
 		if childSchema == nil {
 			// No schema match: all remaining tokens form a leaf node.
+			// Skip if exact duplicate already exists.
+			remaining := path[i:]
+			for _, n := range *current {
+				if n.IsLeaf && keysEqual(n.Keys, remaining) {
+					return nil
+				}
+			}
 			leaf := &Node{
-				Keys:   append([]string(nil), path[i:]...),
+				Keys:   append([]string(nil), remaining...),
 				IsLeaf: true,
 			}
 			*current = append(*current, leaf)
@@ -1510,6 +1526,27 @@ func (t *ConfigTree) SetPath(path []string) error {
 
 		if i >= len(path) {
 			// No more tokens after this node: it's a leaf.
+			if childSchema.args > 0 && !childSchema.multi && childSchema.children == nil {
+				// Single-value leaf with no sub-structure (e.g. host-name, description): replace existing.
+				// Nodes with children are named containers that may appear as terminal leaves
+				// with different values (e.g. "interface eth0", "interface eth1").
+				for idx, n := range *current {
+					if n.IsLeaf && len(n.Keys) > 0 && n.Keys[0] == nodeKeys[0] {
+						(*current)[idx] = &Node{
+							Keys:   append([]string(nil), nodeKeys...),
+							IsLeaf: true,
+						}
+						return nil
+					}
+				}
+			} else {
+				// Flag leaf (args == 0) or multi-value leaf: skip if exact duplicate.
+				for _, n := range *current {
+					if n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+						return nil
+					}
+				}
+			}
 			leaf := &Node{
 				Keys:   append([]string(nil), nodeKeys...),
 				IsLeaf: true,
