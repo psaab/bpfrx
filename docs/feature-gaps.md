@@ -21,15 +21,15 @@ Last updated: 2026-02-14
 | PKI / Certificates | 4 | 0 | 0 | 4 |
 | Routing Enhancements | 11 | 3 | 0 | 14 |
 | VPN Enhancements | 8 | 1 | 0 | 9 |
-| HA Enhancements | 3 | 2 | 2 | 7 |
+| HA Enhancements | 3 | 2 | 1 | 6 |
 | Firewall Filter Enhancements | 0 | 0 | 0 | 0 |
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
 | Management & Automation | 10 | 2 | 0 | 12 |
-| Interface Enhancements | 5 | 1 | 2 | 8 |
+| Interface Enhancements | 2 | 0 | 0 | 2 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **144** | **19** | **9** | **172** |
+| **TOTAL** | **141** | **18** | **6** | **165** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -298,7 +298,7 @@ bpfrx has a chassis cluster implementation with redundancy groups, RETH, heartbe
 | **IPsec SA Synchronization** | `chassis cluster ... ipsec-session-synchronization` | Sync IPsec Security Associations between nodes. Avoids tunnel re-establishment after failover. | Medium | Missing |
 | **Active/Active Mode** | `chassis cluster redundancy-group N node 0 priority N node 1 priority N` (both nonzero) | Both nodes forward traffic simultaneously for different RGs. bpfrx currently supports active/passive primarily. | Medium | Partial (election logic exists but active/active forwarding path may be incomplete) |
 | **Redundant Ethernet (reth) Runtime** | `interfaces reth0 redundant-ether-options ...` | While reth is parsed, full bond failover with MAC migration, fabric link forwarding, and ARP notifications needs verification | Medium | Partial (reth.go exists but needs end-to-end validation) |
-| **Primary/Preferred Address per Interface** | `interfaces ... unit ... family inet address ... primary/preferred` | Select which address is used as source for traffic originated by the device | Low | Parse-Only |
+| **Primary/Preferred Address per Interface** | `interfaces ... unit ... family inet address ... primary/preferred` | Select which address is used as source for traffic originated by the device. Primary ordered first in networkd, preferred gets PreferredLifetime=forever. | Low | Implemented (Sprint IF-1) |
 | **Fabric Link Redundancy** | `chassis cluster ... fabric-options member-interfaces` | Multiple fabric links between cluster nodes for data forwarding resilience | Low | Parse-Only |
 
 ---
@@ -374,14 +374,14 @@ bpfrx manages all interfaces with .link/.network files, supports VLANs, tunnel i
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Link Aggregation (LAG/ae)** | `interfaces ae0 ...; interfaces ge-0/0/0 gigether-options 802.3ad ae0` | Bundle physical links into aggregate ethernet for bandwidth and redundancy. Different from reth. | Medium | Missing |
+| **Link Aggregation (LAG/ae)** | `interfaces ae0 ...; interfaces ge-0/0/0 gigether-options 802.3ad ae0` | Bundle physical links into aggregate ethernet for bandwidth and redundancy. Different from reth. Bond .netdev/.network generation via networkd, LACP active/passive, periodic rate, minimum-links, link-speed. | Medium | Implemented (Sprint IF-1) |
 | **Transparent Mode (L2 Bridging)** | `interfaces ... family ethernet-switching; bridge-domains ...` | Layer 2 bridge mode where firewall acts as transparent inline device. Zone-based policies still apply. MAC learning table. | Medium | Missing |
-| **Flexible VLAN Tagging** | `interfaces ... flexible-vlan-tagging; encapsulation flexible-ethernet-services` | Q-in-Q (802.1ad), flexible VLAN push/pop/swap operations. bpfrx has basic 802.1Q single-tag. | Low | Missing |
-| **Interface Bandwidth** | `interfaces ... bandwidth ...` | Set logical interface bandwidth for OSPF cost calculation and traffic-engineering | Low | Missing |
+| **Flexible VLAN Tagging** | `interfaces ... flexible-vlan-tagging; encapsulation flexible-ethernet-services` | Q-in-Q (802.1ad), flexible VLAN push/pop/swap operations. FlexibleVlanTagging flag, inner-vlan-id on units, encapsulation type parsing. | Low | Implemented (Sprint IF-1) |
+| **Interface Bandwidth** | `interfaces ... bandwidth ...` | Set logical interface bandwidth for OSPF cost calculation and traffic-engineering. Parsed as bps, emitted as FRR `bandwidth <kbps>` in interface stanza. | Low | Implemented (Sprint IF-1) |
 | **IRB Interfaces** | `interfaces irb unit N family inet address ...` | Integrated Routing and Bridging: L3 interface in bridge domain for inter-VLAN routing | Medium | Missing |
-| **Point-to-Point** | `interfaces ... unit ... point-to-point` | Mark interface as point-to-point (affects OSPF network type, ND behavior) | Low | Parse-Only |
-| **Primary/Preferred Address** | `interfaces ... unit ... family inet address ... primary/preferred` | Control which address is used for sourced traffic | Low | Parse-Only |
-| **Interface Description** | `interfaces ... description "..."` | bpfrx parses descriptions. Verify they appear in `show interfaces` output. | Low | Partial (parsed, display may need verification) |
+| **Point-to-Point** | `interfaces ... unit ... point-to-point` | Mark interface as point-to-point. Wired to FRR `ip ospf network point-to-point` when no explicit OSPF network-type set. | Low | Implemented (Sprint IF-1) |
+| **Primary/Preferred Address** | `interfaces ... unit ... family inet address ... primary/preferred` | Control which address is used for sourced traffic. Primary address ordered first in networkd; preferred address gets PreferredLifetime=forever. | Low | Implemented (Sprint IF-1) |
+| **Interface Description** | `interfaces ... description "..."` | Interface descriptions displayed in `show interfaces detail/terse` via gRPC. Passed to systemd-networkd Description field. | Low | Implemented (Sprint IF-1) |
 
 ---
 
@@ -472,10 +472,7 @@ These features have config parsing in bpfrx but NO runtime effect:
 | 3 | `system master-password` | SystemConfig.MasterPassword | No encrypted storage |
 | 4 | `system license autoupdate url` | SystemConfig.LicenseAutoUpdate | No licensing system |
 | 5 | `system ntp threshold action` | SystemConfig.NTPThresholdAction | Not wired to NTP config |
-| 6 | `interfaces ... address primary` | InterfaceUnit.PrimaryAddress | Not used for source selection |
-| 7 | `interfaces ... address preferred` | InterfaceUnit.PreferredAddress | Not used for source selection |
-| 8 | `interfaces ... point-to-point` | InterfaceUnit.PointToPoint | Not passed to networkd |
-| 9 | `services application-identification` | ServicesConfig.ApplicationIdentification | Bool flag only, no DPI |
+| 6 | `services application-identification` | ServicesConfig.ApplicationIdentification | Bool flag only, no DPI |
 
 ---
 
