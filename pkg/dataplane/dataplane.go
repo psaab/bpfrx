@@ -83,7 +83,7 @@ type DataPlane interface {
 	ClearAddressMembership() error
 
 	// Application
-	SetApplication(protocol uint8, dstPort uint16, appID uint32, timeout uint16, algType uint8, srcPortLow, srcPortHigh uint16) error
+	SetApplication(protocol uint8, dstPort uint16, appID uint32, timeout uint32, algType uint8, srcPortLow, srcPortHigh uint16) error
 	ClearApplications() error
 
 	// Sessions

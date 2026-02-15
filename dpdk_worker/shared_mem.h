@@ -152,6 +152,7 @@ struct session_value {
 	uint8_t  flags;
 	uint8_t  tcp_state;
 	uint8_t  is_reverse;
+	uint32_t app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
 
 	uint64_t created;
 	uint64_t last_seen;
@@ -175,7 +176,7 @@ struct session_value {
 
 	uint8_t  alg_type;
 	uint8_t  log_flags;
-	uint16_t app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
+	uint16_t pad_sv;
 
 	uint32_t fib_ifindex;
 	uint16_t fib_vlan_id;
@@ -198,6 +199,7 @@ struct session_value_v6 {
 	uint8_t  flags;
 	uint8_t  tcp_state;
 	uint8_t  is_reverse;
+	uint32_t app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
 
 	uint64_t created;
 	uint64_t last_seen;
@@ -221,7 +223,7 @@ struct session_value_v6 {
 
 	uint8_t  alg_type;
 	uint8_t  log_flags;
-	uint16_t app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
+	uint16_t pad_sv6;
 
 	uint32_t fib_ifindex;
 	uint16_t fib_vlan_id;
@@ -297,7 +299,8 @@ struct app_value {
 	uint32_t app_id;
 	uint8_t  alg_type;
 	uint8_t  pad;
-	uint16_t timeout;
+	uint16_t pad2;
+	uint32_t timeout;       /* inactivity timeout override (seconds), 0=default */
 	uint16_t src_port_low;  /* source port range low (0=any) */
 	uint16_t src_port_high; /* source port range high (0=any) */
 };
@@ -718,7 +721,8 @@ struct pkt_meta {
 	uint8_t  dscp_rewrite;
 	uint8_t  ip_ihl;
 
-	uint16_t app_timeout;
+	uint16_t pad_at;
+	uint32_t app_timeout;
 	uint8_t  log_flags;
 	uint8_t  meta_pad[3];
 };

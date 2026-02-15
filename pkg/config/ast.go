@@ -1121,6 +1121,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"destination-port":   {args: 1, children: nil},
 			"source-port":        {args: 1, children: nil},
 			"inactivity-timeout": {args: 1, children: nil},
+			"timeout":            {args: 1, children: nil},
 			"alg":                {args: 1, children: nil},
 			"description":        {args: 1, children: nil},
 			"term":               {args: 1, children: nil},

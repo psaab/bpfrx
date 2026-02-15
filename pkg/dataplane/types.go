@@ -14,11 +14,11 @@ type SessionKey struct {
 
 // SessionValue mirrors the C struct session_value.
 type SessionValue struct {
-	State     uint8
-	Flags     uint8
-	TCPState  uint8
-	IsReverse uint8
-	Pad0      [4]byte // alignment padding for Created (8-byte aligned)
+	State      uint8
+	Flags      uint8
+	TCPState   uint8
+	IsReverse  uint8
+	AppTimeout uint32 // per-application inactivity timeout (seconds), 0=use default
 
 	Created  uint64
 	LastSeen uint64
@@ -40,9 +40,9 @@ type SessionValue struct {
 
 	ReverseKey SessionKey
 
-	ALGType    uint8
-	LogFlags   uint8
-	AppTimeout uint16 // per-application inactivity timeout (seconds), 0=use default
+	ALGType  uint8
+	LogFlags uint8
+	PadSV    uint16
 
 	FibIfindex uint32
 	FibVlanID  uint16
@@ -63,11 +63,11 @@ type SessionKeyV6 struct {
 
 // SessionValueV6 mirrors the C struct session_value_v6.
 type SessionValueV6 struct {
-	State     uint8
-	Flags     uint8
-	TCPState  uint8
-	IsReverse uint8
-	Pad0      [4]byte // alignment padding for Created (8-byte aligned)
+	State      uint8
+	Flags      uint8
+	TCPState   uint8
+	IsReverse  uint8
+	AppTimeout uint32 // per-application inactivity timeout (seconds), 0=use default
 
 	Created  uint64
 	LastSeen uint64
@@ -89,9 +89,9 @@ type SessionValueV6 struct {
 
 	ReverseKey SessionKeyV6
 
-	ALGType    uint8
-	LogFlags   uint8
-	AppTimeout uint16 // per-application inactivity timeout (seconds), 0=use default
+	ALGType  uint8
+	LogFlags uint8
+	PadSV6   uint16
 
 	FibIfindex uint32
 	FibVlanID  uint16
@@ -343,7 +343,8 @@ type AppValue struct {
 	AppID       uint32
 	ALGType     uint8
 	Pad         uint8
-	Timeout     uint16 // inactivity timeout override (seconds), 0=default
+	Pad2        uint16
+	Timeout     uint32 // inactivity timeout override (seconds), 0=default
 	SrcPortLow  uint16 // source port range low (host byte order), 0=any
 	SrcPortHigh uint16 // source port range high (host byte order), 0=any
 }

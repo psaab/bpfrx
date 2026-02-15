@@ -412,7 +412,8 @@ struct pkt_meta {
 	__u8  pad_meta;
 
 	/* Per-application inactivity timeout override (seconds, 0 = use default) */
-	__u16 app_timeout;
+	__u16 pad_at;
+	__u32 app_timeout;
 
 	/* Port mirroring (set by xdp_forward for TC egress to clone) */
 	__u32 mirror_ifindex;  /* 0 = no mirroring */

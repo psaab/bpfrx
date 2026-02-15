@@ -2091,7 +2091,7 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				app.DestinationPort = nodeVal(prop)
 			case "source-port":
 				app.SourcePort = nodeVal(prop)
-			case "inactivity-timeout":
+			case "inactivity-timeout", "timeout":
 				if v := nodeVal(prop); v != "" {
 					if n, err := strconv.Atoi(v); err == nil {
 						app.InactivityTimeout = n
@@ -2179,7 +2179,7 @@ func parseApplicationTerm(parentName string, keys []string) *Application {
 				i++
 				app.SourcePort = keys[i]
 			}
-		case "inactivity-timeout":
+		case "inactivity-timeout", "timeout":
 			if i+1 < len(keys) {
 				i++
 				if v, err := strconv.Atoi(keys[i]); err == nil {

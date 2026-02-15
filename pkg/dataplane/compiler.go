@@ -990,9 +990,9 @@ func compileApplications(dp DataPlane,cfg *config.Config, result *CompileResult)
 			}
 		}
 
-		var appTimeout uint16
-		if app.InactivityTimeout > 0 && app.InactivityTimeout <= 65535 {
-			appTimeout = uint16(app.InactivityTimeout)
+		var appTimeout uint32
+		if app.InactivityTimeout > 0 {
+			appTimeout = uint32(app.InactivityTimeout)
 		}
 
 		algType := algTypeFromString(app.ALG)

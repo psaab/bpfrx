@@ -241,7 +241,8 @@ struct app_value {
 	__u32 app_id;
 	__u8  alg_type;  /* 0=none */
 	__u8  pad;
-	__u16 timeout;   /* inactivity timeout override (seconds), 0=default */
+	__u16 pad2;
+	__u32 timeout;   /* inactivity timeout override (seconds), 0=default */
 	__u16 src_port_low;  /* source port range low, host byte order (0=any) */
 	__u16 src_port_high; /* source port range high, host byte order (0=any) */
 };

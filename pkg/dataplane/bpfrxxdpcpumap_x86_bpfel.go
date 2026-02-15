@@ -36,7 +36,8 @@ type bpfrxXdpCpumapAppValue struct {
 	AppId       uint32
 	AlgType     uint8
 	Pad         uint8
-	Timeout     uint16
+	Pad2        uint16
+	Timeout     uint32
 	SrcPortLow  uint16
 	SrcPortHigh uint16
 }
@@ -292,7 +293,8 @@ type bpfrxXdpCpumapPktMeta struct {
 	RoutingTable  uint32
 	DscpRewrite   uint8
 	PadMeta       uint8
-	AppTimeout    uint16
+	PadAt         uint16
+	AppTimeout    uint32
 	MirrorIfindex uint32
 	MirrorRate    uint32
 }
@@ -394,7 +396,7 @@ type bpfrxXdpCpumapSessionValue struct {
 	Flags       uint8
 	TcpState    uint8
 	IsReverse   uint8
-	_           [4]byte
+	AppTimeout  uint32
 	Created     uint64
 	LastSeen    uint64
 	Timeout     uint32
@@ -412,7 +414,7 @@ type bpfrxXdpCpumapSessionValue struct {
 	ReverseKey  bpfrxXdpCpumapSessionKey
 	AlgType     uint8
 	LogFlags    uint8
-	AppTimeout  uint16
+	PadSv       uint16
 	FibIfindex  uint32
 	FibVlanId   uint16
 	FibDmac     [6]uint8
@@ -426,7 +428,7 @@ type bpfrxXdpCpumapSessionValueV6 struct {
 	Flags       uint8
 	TcpState    uint8
 	IsReverse   uint8
-	_           [4]byte
+	AppTimeout  uint32
 	Created     uint64
 	LastSeen    uint64
 	Timeout     uint32
@@ -444,7 +446,7 @@ type bpfrxXdpCpumapSessionValueV6 struct {
 	ReverseKey  bpfrxXdpCpumapSessionKeyV6
 	AlgType     uint8
 	LogFlags    uint8
-	AppTimeout  uint16
+	PadSv6      uint16
 	FibIfindex  uint32
 	FibVlanId   uint16
 	FibDmac     [6]uint8

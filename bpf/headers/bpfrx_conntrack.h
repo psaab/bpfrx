@@ -20,6 +20,7 @@ struct session_value {
 	__u8  flags;           /* SESS_FLAG_* */
 	__u8  tcp_state;       /* TCP-specific sub-state */
 	__u8  is_reverse;      /* 1 if this is the reverse direction entry */
+	__u32 app_timeout;     /* per-application inactivity timeout (seconds), 0=use default */
 
 	/* Timestamps (seconds since boot) */
 	__u64 created;
@@ -51,7 +52,7 @@ struct session_value {
 	/* ALG tracking */
 	__u8  alg_type;    /* 0=none, 1=FTP, 2=SIP, 3=DNS */
 	__u8  log_flags;
-	__u16 app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
+	__u16 pad_sv;
 
 	/* Cached FIB result (set by xdp_zone, 0 = not cached) */
 	__u32 fib_ifindex;
@@ -78,6 +79,7 @@ struct session_value_v6 {
 	__u8  flags;           /* SESS_FLAG_* */
 	__u8  tcp_state;       /* TCP-specific sub-state */
 	__u8  is_reverse;      /* 1 if this is the reverse direction entry */
+	__u32 app_timeout;     /* per-application inactivity timeout (seconds), 0=use default */
 
 	/* Timestamps (seconds since boot) */
 	__u64 created;
@@ -109,7 +111,7 @@ struct session_value_v6 {
 	/* ALG tracking */
 	__u8  alg_type;    /* 0=none, 1=FTP, 2=SIP, 3=DNS */
 	__u8  log_flags;
-	__u16 app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
+	__u16 pad_sv6;
 
 	/* Cached FIB result (set by xdp_zone, 0 = not cached) */
 	__u32 fib_ifindex;

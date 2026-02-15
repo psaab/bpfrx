@@ -147,7 +147,7 @@ func (m *Manager) ClearAddressMembership() error {
 }
 
 // SetApplication writes an application map entry.
-func (m *Manager) SetApplication(protocol uint8, dstPort uint16, appID uint32, timeout uint16, algType uint8, srcPortLow, srcPortHigh uint16) error {
+func (m *Manager) SetApplication(protocol uint8, dstPort uint16, appID uint32, timeout uint32, algType uint8, srcPortLow, srcPortHigh uint16) error {
 	zm, ok := m.maps["applications"]
 	if !ok {
 		return fmt.Errorf("applications map not found")
