@@ -91,12 +91,13 @@ var OperationalTree = map[string]*Node{
 		}},
 		"flow-monitoring": {Desc: "Show flow monitoring/NetFlow configuration"},
 		"log":             {Desc: "Show daemon log entries [N]"},
-		"route": {Desc: "Show routing table [instance <name>]", Children: map[string]*Node{
-			"terse":    {Desc: "Show terse routing table"},
-			"detail":   {Desc: "Show detailed route information"},
-			"summary":  {Desc: "Show route summary by protocol"},
-			"table":    {Desc: "Show routes for a VRF table"},
-			"protocol": {Desc: "Show routes by protocol (static, connected, bgp, ospf, dhcp)"},
+		"route": {Desc: "Show routing table", Children: map[string]*Node{
+			"<destination>": {Desc: "IP address or prefix to look up"},
+			"terse":         {Desc: "Show terse routing table"},
+			"detail":        {Desc: "Show detailed route information"},
+			"summary":       {Desc: "Show route summary by protocol"},
+			"table":         {Desc: "Show routes for a VRF table"},
+			"protocol":      {Desc: "Show routes by protocol (static, connected, bgp, ospf, dhcp)"},
 			"instance": {Desc: "Show routes for a routing instance", DynamicFn: func(cfg *config.Config) []string {
 				if cfg == nil {
 					return nil
