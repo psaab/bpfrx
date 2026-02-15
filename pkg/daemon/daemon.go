@@ -918,6 +918,8 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	}
 
 	// 1.7. Create bond (LAG) interfaces for fabric-options member-interfaces.
+	// Always call ApplyBonds (even with empty list) so stale bonds from
+	// previous configs get cleaned up via ClearBonds().
 	if d.routing != nil {
 		var bondIfaces []*config.InterfaceConfig
 		for _, ifc := range cfg.Interfaces.Interfaces {
@@ -925,10 +927,8 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				bondIfaces = append(bondIfaces, ifc)
 			}
 		}
-		if len(bondIfaces) > 0 {
-			if err := d.routing.ApplyBonds(bondIfaces); err != nil {
-				slog.Warn("failed to apply bonds", "err", err)
-			}
+		if err := d.routing.ApplyBonds(bondIfaces); err != nil {
+			slog.Warn("failed to apply bonds", "err", err)
 		}
 	}
 

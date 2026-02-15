@@ -785,6 +785,21 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 			continue
 		}
 
+		// If this is a daemon-created bond/RETH that's no longer in config,
+		// delete the device entirely rather than marking it unmanaged.
+		nl, err := netlink.LinkByIndex(iface.Index)
+		if err != nil {
+			continue
+		}
+		if _, isBond := nl.(*netlink.Bond); isBond {
+			if err := netlink.LinkDel(nl); err == nil {
+				slog.Info("deleted stale bond device", "name", name)
+			} else {
+				slog.Warn("failed to delete stale bond", "name", name, "err", err)
+			}
+			continue
+		}
+
 		seen[name] = true
 		result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 			Name:       name,
@@ -795,10 +810,6 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 		// Bring down and remove all non-link-local addresses immediately.
 		// The networkd .network file with ActivationPolicy=always-down
 		// ensures it stays down across reboots.
-		nl, err := netlink.LinkByIndex(iface.Index)
-		if err != nil {
-			continue
-		}
 		addrs, _ := netlink.AddrList(nl, netlink.FAMILY_ALL)
 		for i := range addrs {
 			if addrs[i].IP.IsLinkLocalUnicast() || addrs[i].IP.IsLinkLocalMulticast() {
