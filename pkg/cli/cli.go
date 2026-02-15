@@ -212,9 +212,6 @@ func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
 		// "show configuration <path>" — delegate sub-path to config schema
 		if len(words) >= 2 && words[0] == "show" && words[1] == "configuration" {
 			subPath := words[2:]
-			if partial != "" {
-				subPath = append(subPath, partial)
-			}
 			schemaCompletions := config.CompleteSetPathWithValues(subPath, cc.cli.valueProvider)
 			if schemaCompletions != nil {
 				for _, sc := range schemaCompletions {
@@ -397,9 +394,6 @@ func (c *CLI) Run() error {
 				// "show configuration <path>" — delegate sub-path to config schema
 				if len(words) >= 2 && words[0] == "show" && words[1] == "configuration" {
 					subPath := words[2:]
-					if partial != "" {
-						subPath = append(subPath, partial)
-					}
 					schemaCompletions := config.CompleteSetPathWithValues(subPath, c.valueProvider)
 					if schemaCompletions != nil {
 						for _, sc := range schemaCompletions {

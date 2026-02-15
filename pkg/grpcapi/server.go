@@ -2240,9 +2240,6 @@ func (s *Server) completeOperationalPairs(words []string, partial string) []comp
 	// "show configuration <path>" — delegate sub-path to config schema
 	if len(words) >= 2 && words[0] == "show" && words[1] == "configuration" {
 		subPath := words[2:]
-		if partial != "" {
-			subPath = append(subPath, partial)
-		}
 		schemaCompletions := config.CompleteSetPathWithValues(subPath, s.valueProvider)
 		if schemaCompletions != nil {
 			var pairs []completionPair
