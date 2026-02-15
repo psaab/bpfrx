@@ -8,7 +8,12 @@ import (
 )
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
+// It clones the tree before expansion so the original tree is not mutated.
 func CompileConfig(tree *ConfigTree) (*Config, error) {
+	// Clone the tree before expanding groups — the caller's tree must retain
+	// groups and apply-groups nodes for display (show configuration groups).
+	tree = tree.Clone()
+
 	// Expand groups before compilation — resolve all apply-groups references.
 	if err := tree.ExpandGroups(); err != nil {
 		return nil, fmt.Errorf("apply-groups: %w", err)

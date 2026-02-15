@@ -10868,6 +10868,37 @@ func TestApplyGroupsWildcard(t *testing.T) {
 	}
 }
 
+func TestCompilePreservesGroups(t *testing.T) {
+	// CompileConfig must not strip groups/apply-groups from the original tree.
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set groups my-group system host-name test",
+		"set apply-groups my-group",
+	}
+	for _, cmd := range setCommands {
+		parts, _ := ParseSetCommand(cmd)
+		tree.SetPath(parts)
+	}
+
+	// Verify groups present before compile
+	if tree.FindChild("groups") == nil {
+		t.Fatal("groups node missing before compile")
+	}
+
+	_, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	// groups and apply-groups must still be in the original tree
+	if tree.FindChild("groups") == nil {
+		t.Error("groups node stripped by CompileConfig")
+	}
+	if tree.FindChild("apply-groups") == nil {
+		t.Error("apply-groups node stripped by CompileConfig")
+	}
+}
+
 func TestParseLoginClass(t *testing.T) {
 	input := `system {
     login {
