@@ -183,56 +183,74 @@ func (t *ConfigTree) FormatInheritance() string {
 	return b.String()
 }
 
+// navigatePath walks the tree following path components and returns matching nodes.
+// When multiple sibling nodes share the same key prefix (e.g., path ["from-zone","untrust"]
+// matching both ["from-zone","untrust","to-zone","trust"] and
+// ["from-zone","untrust","to-zone","dmz"]), all matches are returned.
+func navigatePath(nodes []*Node, path []string) []*Node {
+	current := nodes
+	i := 0
+	for i < len(path) {
+		keyword := path[i]
+		// Try 2-key match first (keyword + argument).
+		if i+1 < len(path) {
+			var matched []*Node
+			for _, n := range current {
+				if len(n.Keys) >= 2 && n.Keys[0] == keyword && n.Keys[1] == path[i+1] {
+					matched = append(matched, n)
+				}
+			}
+			if len(matched) > 0 {
+				i += 2
+				if i >= len(path) {
+					return matched
+				}
+				current = matched[0].Children
+				continue
+			}
+		}
+		// Single-key match.
+		found := false
+		for _, n := range current {
+			if len(n.Keys) > 0 && n.Keys[0] == keyword {
+				i++
+				if i >= len(path) {
+					return []*Node{n}
+				}
+				current = n.Children
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+	}
+	return nil
+}
+
 // FormatPathInheritance is like FormatPath but with inheritance annotations.
 func (t *ConfigTree) FormatPathInheritance(path []string) string {
 	clone := t.Clone()
 	if err := clone.ExpandGroupsTagged(); err != nil {
 		return t.FormatPath(path)
 	}
-	// Navigate to the path, then format with inheritance annotations.
 	if len(path) == 0 {
 		return clone.FormatInheritance()
 	}
-	current := clone.Children
-	var lastNode *Node
-	i := 0
-	for i < len(path) {
-		keyword := path[i]
-		found := false
-		for _, n := range current {
-			if len(n.Keys) == 0 {
-				continue
-			}
-			if n.Keys[0] != keyword {
-				continue
-			}
-			if i+1 < len(path) && len(n.Keys) >= 2 && n.Keys[1] == path[i+1] {
-				lastNode = n
-				current = n.Children
-				i += 2
-				found = true
-				break
-			}
-			lastNode = n
-			current = n.Children
-			i++
-			found = true
-			break
-		}
-		if !found {
-			return ""
-		}
-	}
-	if lastNode == nil {
+	matches := navigatePath(clone.Children, path)
+	if len(matches) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	if lastNode.IsLeaf {
-		fmt.Fprintf(&b, "%s;\n", lastNode.KeyPath())
-	} else {
-		fmt.Fprintf(&b, "%s {\n", lastNode.KeyPath())
-		formatNodesInheritance(&b, lastNode.Children, 1)
-		fmt.Fprintf(&b, "}\n")
+	for _, n := range matches {
+		if n.IsLeaf {
+			fmt.Fprintf(&b, "%s;\n", n.KeyPath())
+		} else {
+			fmt.Fprintf(&b, "%s {\n", n.KeyPath())
+			formatNodesInheritance(&b, n.Children, 1)
+			fmt.Fprintf(&b, "}\n")
+		}
 	}
 	return b.String()
 }
@@ -2096,58 +2114,19 @@ func (t *ConfigTree) FormatPath(path []string) string {
 	if len(path) == 0 {
 		return t.Format()
 	}
-
-	// Navigate through the tree following path components.
-	current := t.Children
-	var lastNode *Node
-	i := 0
-	for i < len(path) {
-		keyword := path[i]
-		found := false
-		for _, n := range current {
-			if len(n.Keys) == 0 {
-				continue
-			}
-			// Match first key (keyword)
-			if n.Keys[0] != keyword {
-				continue
-			}
-			// If path has more components and this node takes arguments,
-			// try to match the argument too (e.g., "interfaces" "wan0" matches
-			// a node with Keys=["interfaces","wan0"]).
-			if i+1 < len(path) && len(n.Keys) >= 2 {
-				if n.Keys[1] == path[i+1] {
-					lastNode = n
-					current = n.Children
-					i += 2
-					found = true
-					break
-				}
-				continue
-			}
-			lastNode = n
-			current = n.Children
-			i++
-			found = true
-			break
-		}
-		if !found {
-			return ""
-		}
-	}
-
-	if lastNode == nil {
+	matches := navigatePath(t.Children, path)
+	if len(matches) == 0 {
 		return ""
 	}
-
-	// Format the found subtree.
 	var b strings.Builder
-	if lastNode.IsLeaf {
-		fmt.Fprintf(&b, "%s;\n", lastNode.KeyPath())
-	} else {
-		fmt.Fprintf(&b, "%s {\n", lastNode.KeyPath())
-		formatNodes(&b, lastNode.Children, 1)
-		fmt.Fprintf(&b, "}\n")
+	for _, n := range matches {
+		if n.IsLeaf {
+			fmt.Fprintf(&b, "%s;\n", n.KeyPath())
+		} else {
+			fmt.Fprintf(&b, "%s {\n", n.KeyPath())
+			formatNodes(&b, n.Children, 1)
+			fmt.Fprintf(&b, "}\n")
+		}
 	}
 	return b.String()
 }
