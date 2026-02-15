@@ -25,9 +25,7 @@ func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, p
 		dynamicConsumed = false
 		node, ok := current[w]
 		if !ok {
-			// Word not in static children — if parent has DynamicFn,
-			// treat as a dynamic value and stay at same children level.
-			if currentNode != nil && currentNode.DynamicFn != nil {
+			if currentNode != nil && currentNode.HasDynamic() {
 				dynamicConsumed = true
 				continue
 			}
@@ -35,15 +33,13 @@ func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, p
 		}
 		currentNode = node
 		if node.Children == nil {
-			// Leaf with DynamicFn: if more words remain, treat as a
-			// dynamic-value leaf and let the loop consume remaining words.
-			if node.DynamicFn != nil && wi < len(words)-1 {
+			if node.HasDynamic() && wi < len(words)-1 {
 				dynamicConsumed = true
 				continue
 			}
-			if node.DynamicFn != nil && cfg != nil {
+			if node.HasDynamic() && cfg != nil {
 				var candidates []completionCandidate
-				for _, name := range node.DynamicFn(cfg) {
+				for _, name := range node.DynamicValues(cfg, words) {
 					if strings.HasPrefix(name, partial) {
 						candidates = append(candidates, completionCandidate{name: name, desc: "(configured)"})
 					}
@@ -61,10 +57,8 @@ func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, p
 			candidates = append(candidates, completionCandidate{name: name, desc: node.Desc})
 		}
 	}
-	// Only add dynamic values if we haven't just consumed one (avoids showing
-	// zone names again after "from-zone trust" when "to-zone" is the next keyword).
-	if !dynamicConsumed && currentNode != nil && currentNode.DynamicFn != nil && cfg != nil {
-		for _, name := range currentNode.DynamicFn(cfg) {
+	if !dynamicConsumed && currentNode != nil && currentNode.HasDynamic() && cfg != nil {
+		for _, name := range currentNode.DynamicValues(cfg, words) {
 			if strings.HasPrefix(name, partial) {
 				candidates = append(candidates, completionCandidate{name: name, desc: "(configured)"})
 			}
