@@ -927,6 +927,13 @@ func (c *CLI) handleShow(args []string) error {
 			} else {
 				fmt.Print(c.store.ShowActiveInheritance())
 			}
+		} else if idx := strings.Index(rest, "| "); idx >= 0 {
+			pipeParts := strings.Fields(strings.TrimSpace(rest[idx+2:]))
+			if len(pipeParts) >= 2 && pipeParts[0] == "display" {
+				fmt.Printf("syntax error: unknown display option '%s'\n", pipeParts[1])
+			} else if len(pipeParts) > 0 {
+				fmt.Printf("syntax error: unknown pipe command '%s'\n", pipeParts[0])
+			}
 		} else if len(args) > 1 {
 			// Filter out pipe commands from the path
 			var path []string
@@ -2276,27 +2283,35 @@ func (c *CLI) handleConfigShow(args []string) error {
 		return nil
 	}
 
-	// Show scoped to edit path
-	editPath := c.store.GetEditPath()
-	if len(editPath) > 0 {
-		// Build full path: editPath + any extra args (excluding pipe)
-		fullPath := append([]string{}, editPath...)
-		for _, a := range args {
-			if a == "|" {
-				break
-			}
-			fullPath = append(fullPath, a)
+	// Unknown pipe command
+	if idx := strings.Index(line, "| "); idx >= 0 {
+		pipeParts := strings.Fields(strings.TrimSpace(line[idx+2:]))
+		if len(pipeParts) >= 2 && pipeParts[0] == "display" {
+			fmt.Printf("syntax error: unknown display option '%s'\n", pipeParts[1])
+		} else if len(pipeParts) > 0 {
+			fmt.Printf("syntax error: unknown pipe command '%s'\n", pipeParts[0])
 		}
+		return nil
+	}
+
+	// Show scoped to path (editPath + args)
+	fullPath := append([]string{}, c.store.GetEditPath()...)
+	for _, a := range args {
+		if a == "|" {
+			break
+		}
+		fullPath = append(fullPath, a)
+	}
+	if len(fullPath) > 0 {
 		output := c.store.ShowCandidatePath(fullPath)
 		if output == "" {
 			fmt.Printf("configuration path not found: %s\n", strings.Join(fullPath, " "))
 		} else {
 			fmt.Print(output)
 		}
-		return nil
+	} else {
+		fmt.Print(c.store.ShowCandidate())
 	}
-
-	fmt.Print(c.store.ShowCandidate())
 	return nil
 }
 

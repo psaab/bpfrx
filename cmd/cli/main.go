@@ -609,6 +609,14 @@ func (c *ctl) handleShow(args []string) error {
 			format = pb.ConfigFormat_XML
 		} else if strings.Contains(rest, "| display inheritance") {
 			format = pb.ConfigFormat_INHERITANCE
+		} else if idx := strings.Index(rest, "| "); idx >= 0 {
+			pipeParts := strings.Fields(strings.TrimSpace(rest[idx+2:]))
+			if len(pipeParts) >= 2 && pipeParts[0] == "display" {
+				fmt.Printf("syntax error: unknown display option '%s'\n", pipeParts[1])
+			} else if len(pipeParts) > 0 {
+				fmt.Printf("syntax error: unknown pipe command '%s'\n", pipeParts[0])
+			}
+			return nil
 		}
 		// Extract path components (everything after "configuration" before "|")
 		var path []string
@@ -2065,6 +2073,14 @@ func (c *ctl) handleConfigShow(args []string) error {
 		format = pb.ConfigFormat_XML
 	} else if strings.Contains(line, "| display inheritance") {
 		format = pb.ConfigFormat_INHERITANCE
+	} else if idx := strings.Index(line, "| "); idx >= 0 {
+		pipeParts := strings.Fields(strings.TrimSpace(line[idx+2:]))
+		if len(pipeParts) >= 2 && pipeParts[0] == "display" {
+			fmt.Printf("syntax error: unknown display option '%s'\n", pipeParts[1])
+		} else if len(pipeParts) > 0 {
+			fmt.Printf("syntax error: unknown pipe command '%s'\n", pipeParts[0])
+		}
+		return nil
 	}
 	// Build path from editPath + any explicit path args (before pipe)
 	var path []string
