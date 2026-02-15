@@ -86,8 +86,8 @@ func main() {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			resp, err := c.client.Complete(ctx, &pb.CompleteRequest{
-				Line:       text + " ",
-				Pos:        int32(len(text) + 1),
+				Line:       text,
+				Pos:        int32(len(text)),
 				ConfigMode: c.configMode,
 			})
 			if err != nil || len(resp.Candidates) == 0 {
