@@ -5208,59 +5208,19 @@ func (c *CLI) showRoutesForPrefix(prefix string) error {
 		return nil
 	}
 
-	entries, err := c.routing.GetRoutes()
+	cfg := c.store.ActiveConfig()
+	var instances []*config.RoutingInstanceConfig
+	if cfg != nil {
+		instances = cfg.RoutingInstances
+	}
+
+	allTables, err := c.routing.GetAllTableRoutes(instances)
 	if err != nil {
 		return fmt.Errorf("get routes: %w", err)
 	}
 
-	// Parse the filter as a CIDR prefix for subnet matching.
-	// If no mask given, auto-add /32 or /128.
-	filterPrefix := prefix
-	if !strings.Contains(filterPrefix, "/") {
-		if strings.Contains(filterPrefix, ":") {
-			filterPrefix += "/128"
-		} else {
-			filterPrefix += "/32"
-		}
-	}
-
-	fmt.Printf("Routes matching %s:\n", prefix)
-	fmt.Printf("  %-24s %-20s %-14s %-12s %s\n",
-		"Destination", "Next-hop", "Interface", "Proto", "Pref")
-	count := 0
-	for _, e := range entries {
-		if routePrefixMatches(e.Destination, filterPrefix) {
-			fmt.Printf("  %-24s %-20s %-14s %-12s %d\n",
-				e.Destination, e.NextHop, e.Interface, e.Protocol, e.Preference)
-			count++
-		}
-	}
-	if count == 0 {
-		fmt.Printf("  (no matching routes)\n")
-	}
+	fmt.Print(routing.FormatRouteDestination(allTables, prefix))
 	return nil
-}
-
-// routePrefixMatches returns true if the route destination is within or equal to the filter prefix.
-func routePrefixMatches(routeDst, filterCIDR string) bool {
-	_, filterNet, err := net.ParseCIDR(filterCIDR)
-	if err != nil {
-		// Fallback to exact match
-		return routeDst == filterCIDR
-	}
-	_, routeNet, err := net.ParseCIDR(routeDst)
-	if err != nil {
-		return false
-	}
-	// Route matches if the filter contains the route network, or the route contains the filter
-	filterOnes, _ := filterNet.Mask.Size()
-	routeOnes, _ := routeNet.Mask.Size()
-	if filterOnes <= routeOnes {
-		// Filter is broader or equal: route must be within filter
-		return filterNet.Contains(routeNet.IP)
-	}
-	// Filter is more specific: check if route contains the filter address
-	return routeNet.Contains(filterNet.IP)
 }
 
 func (c *CLI) showRouteSummary() error {

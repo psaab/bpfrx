@@ -684,6 +684,140 @@ func (m *Manager) GetVRFRoutes(vrfName string) ([]RouteEntry, error) {
 	return m.GetRoutesForTable(int(vrf.Table))
 }
 
+// TableRoutes groups routes by their routing table name.
+type TableRoutes struct {
+	Name    string       // "inet.0", "VRF-name.inet.0", etc.
+	Entries []RouteEntry // routes in this table
+}
+
+// GetAllTableRoutes returns routes from the main table and all configured VRFs.
+func (m *Manager) GetAllTableRoutes(instances []*config.RoutingInstanceConfig) ([]TableRoutes, error) {
+	var tables []TableRoutes
+
+	// Main table (inet.0)
+	mainEntries, err := m.GetRoutes()
+	if err != nil {
+		return nil, err
+	}
+	if len(mainEntries) > 0 {
+		tables = append(tables, TableRoutes{Name: "inet.0", Entries: mainEntries})
+	}
+
+	// Per-VRF tables
+	for _, ri := range instances {
+		if ri.TableID == 0 {
+			continue
+		}
+		entries, err := m.GetRoutesForTable(ri.TableID)
+		if err != nil {
+			continue
+		}
+		if len(entries) > 0 {
+			tables = append(tables, TableRoutes{Name: ri.Name + ".inet.0", Entries: entries})
+		}
+	}
+	return tables, nil
+}
+
+// FormatRouteDestination formats matching routes across all tables in Junos style.
+// The destination is an IP address (or CIDR prefix). For each table that has a
+// matching route, it prints a Junos-style header and route entries.
+func FormatRouteDestination(allTables []TableRoutes, destination string) string {
+	// Parse the destination for LPM matching.
+	destIP := net.ParseIP(destination)
+	var destNet *net.IPNet
+	if strings.Contains(destination, "/") {
+		_, destNet, _ = net.ParseCIDR(destination)
+	} else if destIP != nil {
+		if destIP.To4() != nil {
+			destNet = &net.IPNet{IP: destIP, Mask: net.CIDRMask(32, 32)}
+		} else {
+			destNet = &net.IPNet{IP: destIP, Mask: net.CIDRMask(128, 128)}
+		}
+	}
+	if destNet == nil {
+		return fmt.Sprintf("invalid destination: %s\n", destination)
+	}
+
+	var buf strings.Builder
+	for _, table := range allTables {
+		// Find matching routes: route.Dst must contain the destination IP.
+		var matches []RouteEntry
+		for _, e := range table.Entries {
+			_, routeNet, err := net.ParseCIDR(e.Destination)
+			if err != nil {
+				continue
+			}
+			if routeNet.Contains(destNet.IP) {
+				matches = append(matches, e)
+			}
+		}
+		if len(matches) == 0 {
+			continue
+		}
+
+		// Sort by prefix length (longest first), then by preference.
+		sort.Slice(matches, func(i, j int) bool {
+			_, ni, _ := net.ParseCIDR(matches[i].Destination)
+			_, nj, _ := net.ParseCIDR(matches[j].Destination)
+			oi, _ := ni.Mask.Size()
+			oj, _ := nj.Mask.Size()
+			if oi != oj {
+				return oi > oj
+			}
+			return matches[i].Preference < matches[j].Preference
+		})
+
+		fmt.Fprintf(&buf, "\n%s: %d destinations, %d routes (%d active, 0 holddown, 0 hidden)\n",
+			table.Name, len(table.Entries), len(table.Entries), len(table.Entries))
+		buf.WriteString("+ = Active Route, - = Last Active, * = Both\n\n")
+
+		for _, e := range matches {
+			proto := junosProtoName(e.Protocol)
+			nh := e.NextHop
+			iface := e.Interface
+			if nh == "" {
+				nh = ""
+			}
+			fmt.Fprintf(&buf, "%-19s*[%s/%d] \n", e.Destination, proto, e.Preference)
+			if nh != "" {
+				fmt.Fprintf(&buf, "                    >  to %s via %s\n", nh, iface)
+			} else if iface != "" {
+				fmt.Fprintf(&buf, "                    >  via %s\n", iface)
+			}
+		}
+	}
+
+	if buf.Len() == 0 {
+		return fmt.Sprintf("no routes matching %s\n", destination)
+	}
+	return buf.String()
+}
+
+// junosProtoName maps protocol names to Junos-style names.
+func junosProtoName(proto string) string {
+	switch proto {
+	case "static":
+		return "Static"
+	case "connected":
+		return "Direct"
+	case "bgp":
+		return "BGP"
+	case "ospf":
+		return "OSPF"
+	case "isis":
+		return "IS-IS"
+	case "rip":
+		return "RIP"
+	case "dhcp":
+		return "Access-internal"
+	case "redirect":
+		return "Redirect"
+	default:
+		return proto
+	}
+}
+
 func rtProtoName(p netlink.RouteProtocol) string {
 	pi := int(p)
 	switch pi {

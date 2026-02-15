@@ -3090,33 +3090,15 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		if s.routing == nil {
 			buf.WriteString("Routing manager not available\n")
 		} else {
-			entries, err := s.routing.GetRoutes()
+			var instances []*config.RoutingInstanceConfig
+			if cfg != nil {
+				instances = cfg.RoutingInstances
+			}
+			allTables, err := s.routing.GetAllTableRoutes(instances)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "get routes: %v", err)
 			}
-			// Parse as CIDR for subnet matching
-			filterCIDR := prefix
-			if !strings.Contains(filterCIDR, "/") {
-				if strings.Contains(filterCIDR, ":") {
-					filterCIDR += "/128"
-				} else {
-					filterCIDR += "/32"
-				}
-			}
-			_, filterNet, filterErr := net.ParseCIDR(filterCIDR)
-			fmt.Fprintf(&buf, "Routes matching %s:\n", prefix)
-			fmt.Fprintf(&buf, "  %-24s %-20s %-14s %-12s %s\n", "Destination", "Next-hop", "Interface", "Proto", "Pref")
-			count := 0
-			for _, e := range entries {
-				if routePrefixMatch(e.Destination, filterNet, filterErr) {
-					fmt.Fprintf(&buf, "  %-24s %-20s %-14s %-12s %d\n",
-						e.Destination, e.NextHop, e.Interface, e.Protocol, e.Preference)
-					count++
-				}
-			}
-			if count == 0 {
-				buf.WriteString("  (no matching routes)\n")
-			}
+			buf.WriteString(routing.FormatRouteDestination(allTables, prefix))
 		}
 		return &pb.ShowTextResponse{Output: buf.String()}, nil
 	}
@@ -7467,23 +7449,6 @@ func matchSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool
 		}
 	}
 	return true
-}
-
-// routePrefixMatch checks if a route destination matches a filter prefix.
-func routePrefixMatch(routeDst string, filterNet *net.IPNet, filterErr error) bool {
-	if filterErr != nil {
-		return routeDst == filterNet.String()
-	}
-	_, routeNet, err := net.ParseCIDR(routeDst)
-	if err != nil {
-		return false
-	}
-	filterOnes, _ := filterNet.Mask.Size()
-	routeOnes, _ := routeNet.Mask.Size()
-	if filterOnes <= routeOnes {
-		return filterNet.Contains(routeNet.IP)
-	}
-	return routeNet.Contains(filterNet.IP)
 }
 
 // policyActionName returns a human-readable policy action name.
