@@ -733,6 +733,7 @@ const (
 	ValueHintUnitNumber              // unit <number>
 	ValueHintPolicyAddress           // policy match source/destination-address
 	ValueHintPolicyApp               // policy match application (any + apps)
+	ValueHintPolicyName              // policy <name> (from path context)
 )
 
 // SchemaCompletion is a completion candidate from the config schema.
@@ -780,7 +781,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"policies": {children: map[string]*schemaNode{
 			"from-zone": {args: 3, valueHint: ValueHintZoneName, midKeyword: "to-zone", midKeywordAt: 2, children: map[string]*schemaNode{
-				"policy": {args: 1, children: map[string]*schemaNode{
+				"policy": {args: 1, valueHint: ValueHintPolicyName, children: map[string]*schemaNode{
 					"description": {args: 1, children: nil},
 					"match": {children: map[string]*schemaNode{
 						"source-address":      {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},
@@ -794,7 +795,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				}},
 			}},
 			"global": {children: map[string]*schemaNode{
-				"policy": {args: 1, children: map[string]*schemaNode{
+				"policy": {args: 1, valueHint: ValueHintPolicyName, children: map[string]*schemaNode{
 					"description": {args: 1, children: nil},
 					"match": {children: map[string]*schemaNode{
 						"source-address":      {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},

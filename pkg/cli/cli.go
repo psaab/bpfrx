@@ -7432,6 +7432,36 @@ func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.Schem
 			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
 		}
 		return out
+	case config.ValueHintPolicyName:
+		// Extract zone pair from path: ["security","policies","from-zone","X","to-zone","Y","policy"]
+		// or global: ["security","policies","global","policy"]
+		var policies []*config.Policy
+		for i, tok := range path {
+			if tok == "from-zone" && i+3 < len(path) && path[i+2] == "to-zone" {
+				fromZone := path[i+1]
+				toZone := path[i+3]
+				for _, zpp := range cfg.Security.Policies {
+					if zpp.FromZone == fromZone && zpp.ToZone == toZone {
+						policies = zpp.Policies
+						break
+					}
+				}
+				break
+			}
+			if tok == "global" {
+				policies = cfg.Security.GlobalPolicies
+				break
+			}
+		}
+		var out []config.SchemaCompletion
+		for _, pol := range policies {
+			desc := pol.Description
+			if desc == "" {
+				desc = "(configured)"
+			}
+			out = append(out, config.SchemaCompletion{Name: pol.Name, Desc: desc})
+		}
+		return out
 	case config.ValueHintUnitNumber:
 		// Find the interface name from the path context.
 		var ifaceName string
