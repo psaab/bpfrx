@@ -80,6 +80,7 @@ type Daemon struct {
 	lldpMgr      *lldp.Manager
 	scheduler    *scheduler.Scheduler
 	cluster      *cluster.Manager
+	sessionSync  *cluster.SessionSync
 	slogHandler  *logging.SyslogSlogHandler
 	traceWriter   *logging.TraceWriter
 	eventReader   *logging.EventReader
@@ -159,6 +160,34 @@ func (d *Daemon) Run(ctx context.Context) error {
 					"interface", cc.ControlInterface)
 			}
 		}
+
+		// Start session/config sync on fabric interface.
+		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
+			fabIP := resolveInterfaceAddr(cc.FabricInterface, "")
+			if fabIP != "" {
+				syncLocal := fmt.Sprintf("%s:4785", fabIP)
+				syncPeer := fmt.Sprintf("%s:4785", cc.FabricPeerAddress)
+				d.sessionSync = cluster.NewSessionSync(syncLocal, syncPeer, nil)
+
+				// Wire config sync callback: when secondary receives config from primary.
+				d.sessionSync.OnConfigReceived = func(configText string) {
+					d.handleConfigSync(configText)
+				}
+
+				if err := d.sessionSync.Start(ctx); err != nil {
+					slog.Warn("failed to start session sync", "err", err)
+				} else {
+					slog.Info("cluster session sync started",
+						"local", syncLocal, "peer", syncPeer)
+				}
+			} else {
+				slog.Warn("cluster: fabric interface has no IPv4 address",
+					"interface", cc.FabricInterface)
+			}
+		}
+
+		// Watch cluster events for state transitions (primary/secondary).
+		go d.watchClusterEvents(ctx)
 	}
 
 	// Enable IP forwarding — required for the firewall to route packets.
@@ -496,6 +525,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start gRPC API server.
 	{
+		// Wrap applyConfig to also sync config to cluster peer after commit.
+		applyAndSync := func(cfg *config.Config) {
+			d.applyConfig(cfg)
+			d.syncConfigToPeer()
+		}
 		grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
 			Store:    d.store,
 			DP:       d.dp,
@@ -525,7 +559,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
-			ApplyFn: d.applyConfig,
+			ApplyFn: applyAndSync,
 			Version: d.opts.Version,
 		})
 		wg.Add(1)
@@ -619,6 +653,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Clean up LLDP.
 	if d.lldpMgr != nil {
 		d.lldpMgr.Stop()
+	}
+
+	// Stop session sync.
+	if d.sessionSync != nil {
+		d.sessionSync.Stop()
 	}
 
 	// Stop cluster monitor.
@@ -2545,6 +2584,95 @@ func (d *Daemon) monitorLinkState(ctx context.Context) {
 				d.snmpAgent.NotifyLinkUp(attrs.Index, attrs.Name)
 			} else {
 				d.snmpAgent.NotifyLinkDown(attrs.Index, attrs.Name)
+			}
+		}
+	}
+}
+
+// syncConfigToPeer sends the active config to the cluster peer if this node
+// is primary and config sync is enabled.
+func (d *Daemon) syncConfigToPeer() {
+	if d.cluster == nil || d.sessionSync == nil {
+		return
+	}
+	// Only sync if this node is primary for RG0 (config ownership group).
+	if !d.cluster.IsLocalPrimary(0) {
+		return
+	}
+	// Check if config sync is enabled.
+	cfg := d.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil || !cfg.Chassis.Cluster.ConfigSync {
+		return
+	}
+	// Get the active config tree as text.
+	configText := d.store.ShowActive()
+	if configText == "" {
+		return
+	}
+	d.sessionSync.QueueConfig(configText)
+}
+
+// handleConfigSync processes a config received from the cluster primary.
+// It preserves the local chassis cluster settings (node ID, peer addresses)
+// and applies the rest of the config.
+func (d *Daemon) handleConfigSync(configText string) {
+	slog.Info("cluster: applying synced config from primary")
+
+	// Get local chassis cluster settings before overwrite.
+	localCfg := d.store.ActiveConfig()
+	var localChassisNode *config.Node
+	if localCfg != nil {
+		localTree := d.store.ActiveTree()
+		if localTree != nil {
+			localChassisNode = localTree.FindChild("chassis")
+		}
+	}
+
+	compiled, err := d.store.SyncApply(configText, func(tree *config.ConfigTree) {
+		// Preserve local chassis cluster settings.
+		if localChassisNode != nil {
+			// Replace the received chassis node with local one.
+			for i, child := range tree.Children {
+				if len(child.Keys) > 0 && child.Keys[0] == "chassis" {
+					tree.Children[i] = localChassisNode
+					return
+				}
+			}
+			// No chassis node in received config — add local one.
+			tree.Children = append(tree.Children, localChassisNode)
+		}
+	})
+	if err != nil {
+		slog.Error("cluster: config sync apply failed", "err", err)
+		return
+	}
+
+	// Apply the compiled config to the dataplane.
+	if compiled != nil {
+		d.applyConfig(compiled)
+	}
+	slog.Info("cluster: config sync applied successfully")
+}
+
+// watchClusterEvents monitors cluster state transitions and toggles
+// config store read-only mode based on primary/secondary state.
+func (d *Daemon) watchClusterEvents(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-d.cluster.Events():
+			// Only track RG0 transitions for config ownership.
+			if ev.GroupID != 0 {
+				continue
+			}
+			switch ev.NewState {
+			case cluster.StatePrimary:
+				slog.Info("cluster: became primary for RG0, enabling config writes")
+				d.store.SetClusterReadOnly(false)
+			case cluster.StateSecondary, cluster.StateSecondaryHold:
+				slog.Info("cluster: became secondary for RG0, disabling config writes")
+				d.store.SetClusterReadOnly(true)
 			}
 		}
 	}

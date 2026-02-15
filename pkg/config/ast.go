@@ -1094,8 +1094,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"port": {args: 1, children: nil},
 				}},
 			}},
-			"control-interface": {args: 1, children: nil},
-			"peer-address":     {args: 1, children: nil},
+			"control-interface":          {args: 1, children: nil},
+			"peer-address":              {args: 1, children: nil},
+			"fabric-interface":          {args: 1, children: nil},
+			"fabric-peer-address":       {args: 1, children: nil},
+			"configuration-synchronize": {children: nil},
 			"redundancy-group": {args: 1, children: map[string]*schemaNode{
 				"node": {args: 1, children: map[string]*schemaNode{
 					"priority": {args: 1, children: nil},

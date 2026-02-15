@@ -28,6 +28,7 @@ const (
 	syncMsgBulkStart    = 5
 	syncMsgBulkEnd      = 6
 	syncMsgHeartbeat    = 7
+	syncMsgConfig       = 8 // full config text sync from primary to secondary
 )
 
 // syncHeader is the wire header for each sync message.
@@ -47,6 +48,8 @@ type SyncStats struct {
 	DeletesSent      atomic.Uint64
 	DeletesReceived  atomic.Uint64
 	BulkSyncs        atomic.Uint64
+	ConfigsSent      atomic.Uint64
+	ConfigsReceived  atomic.Uint64
 	Errors           atomic.Uint64
 	Connected        atomic.Bool
 }
@@ -63,6 +66,10 @@ type SessionSync struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	sendCh     chan []byte // buffered channel for outgoing messages
+
+	// OnConfigReceived is called when a config sync message arrives from peer.
+	// The callback receives the full config text. Set by the daemon before Start().
+	OnConfigReceived func(configText string)
 }
 
 // NewSessionSync creates a new session synchronization manager.
@@ -186,6 +193,27 @@ func (s *SessionSync) QueueDeleteV6(key dataplane.SessionKeyV6) {
 	default:
 		s.stats.Errors.Add(1)
 	}
+}
+
+// QueueConfig sends the full config text to the peer for config synchronization.
+// Called by the primary node after a successful commit.
+func (s *SessionSync) QueueConfig(configText string) {
+	s.mu.Lock()
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		return
+	}
+
+	payload := []byte(configText)
+	if err := writeMsg(conn, syncMsgConfig, payload); err != nil {
+		slog.Warn("cluster sync: config send error", "err", err)
+		s.stats.Errors.Add(1)
+		s.handleDisconnect()
+		return
+	}
+	s.stats.ConfigsSent.Add(1)
+	slog.Info("cluster sync: config sent to peer", "size", len(payload))
 }
 
 // BulkSync sends the entire session table to the connected peer.
@@ -375,7 +403,7 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 
 		var payload []byte
 		if hdr.Length > 0 {
-			if hdr.Length > 1024*1024 { // 1MB sanity limit
+			if hdr.Length > 16*1024*1024 { // 16MB sanity limit (config can be large)
 				slog.Warn("cluster sync: payload too large", "len", hdr.Length)
 				return
 			}
@@ -437,6 +465,14 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 
 	case syncMsgHeartbeat:
 		// keepalive, no action needed
+
+	case syncMsgConfig:
+		s.stats.ConfigsReceived.Add(1)
+		if s.OnConfigReceived != nil {
+			configText := string(payload)
+			slog.Info("cluster sync: config received from peer", "size", len(payload))
+			go s.OnConfigReceived(configText)
+		}
 	}
 }
 
@@ -461,6 +497,8 @@ func (s *SessionSync) FormatStats() string {
 			"  Deletes sent:       %d\n"+
 			"  Deletes received:   %d\n"+
 			"  Bulk syncs:         %d\n"+
+			"  Configs sent:       %d\n"+
+			"  Configs received:   %d\n"+
 			"  Errors:             %d\n",
 		s.stats.Connected.Load(),
 		s.stats.SessionsSent.Load(),
@@ -468,6 +506,8 @@ func (s *SessionSync) FormatStats() string {
 		s.stats.DeletesSent.Load(),
 		s.stats.DeletesReceived.Load(),
 		s.stats.BulkSyncs.Load(),
+		s.stats.ConfigsSent.Load(),
+		s.stats.ConfigsReceived.Load(),
 		s.stats.Errors.Load(),
 	)
 }

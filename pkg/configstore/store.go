@@ -44,6 +44,9 @@ type Store struct {
 	configHolder string    // unique session ID of the config lock holder
 	configLockAt time.Time // when the lock was acquired
 
+	// Cluster read-only mode: secondary nodes reject config mutations
+	clusterReadOnly bool
+
 	// Edit path for hierarchical navigation (edit/top/up)
 	editPath []string
 
@@ -103,6 +106,74 @@ func (s *Store) Save() error {
 	return s.db.WriteActive(s.active)
 }
 
+// SetClusterReadOnly toggles cluster read-only mode. When enabled, config
+// mutations (EnterConfigure, Commit, Load, Set, Delete) are rejected.
+// Used to prevent config changes on secondary cluster nodes.
+func (s *Store) SetClusterReadOnly(ro bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clusterReadOnly = ro
+}
+
+// ClusterReadOnly returns whether the store is in cluster read-only mode.
+func (s *Store) ClusterReadOnly() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.clusterReadOnly
+}
+
+// SyncApply applies a config received from the cluster primary.
+// Bypasses cluster read-only checks. The chassisPreserve function, if set,
+// lets the caller patch the parsed tree before compiling (e.g. to preserve
+// local chassis cluster settings).
+func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTree)) (*config.Config, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tree, errs := config.NewParser(content).Parse()
+	if len(errs) > 0 {
+		return nil, fmt.Errorf("sync config parse error: %v", errs[0])
+	}
+
+	// Let caller patch the tree (e.g. preserve local chassis cluster settings).
+	if chassisPreserve != nil {
+		chassisPreserve(tree)
+	}
+
+	compiled, err := config.CompileConfig(tree)
+	if err != nil {
+		return nil, fmt.Errorf("sync config compile error: %w", err)
+	}
+
+	// Push current active to history.
+	s.history.Push(&HistoryEntry{
+		Config:    s.active.Clone(),
+		Timestamp: time.Now(),
+	})
+
+	s.active = tree
+	s.compiled = compiled
+	s.dirty = false
+
+	// If in config mode, update candidate too.
+	if s.configDir {
+		s.candidate = s.active.Clone()
+	}
+
+	if err := s.db.WriteActive(s.active); err != nil {
+		slog.Warn("failed to save synced config", "err", err)
+	}
+
+	s.journal.Log(&JournalEntry{
+		Timestamp: time.Now(),
+		Action:    "config_sync",
+		After:     compiled,
+	})
+
+	s.saveRollbackFiles()
+	return compiled, nil
+}
+
 // EnterConfigure enters configuration mode by cloning the active config.
 // Returns an error if another session is already in config mode.
 func (s *Store) EnterConfigure() error {
@@ -114,6 +185,9 @@ func (s *Store) EnterConfigure() error {
 func (s *Store) EnterConfigureSession(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.clusterReadOnly {
+		return fmt.Errorf("configuration database is not writable (secondary node)")
+	}
 	if s.configDir {
 		// Allow re-entry by same session.
 		if sessionID != "" && s.configHolder == sessionID {
@@ -133,6 +207,9 @@ func (s *Store) EnterConfigureSession(sessionID string) error {
 func (s *Store) EnterConfigureExclusive(holder string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.clusterReadOnly {
+		return fmt.Errorf("configuration database is not writable (secondary node)")
+	}
 	if s.configDir {
 		return fmt.Errorf("configuration is locked by another user")
 	}
@@ -838,6 +915,16 @@ func (s *Store) ActiveConfig() *config.Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.compiled
+}
+
+// ActiveTree returns a deep copy of the active configuration tree.
+func (s *Store) ActiveTree() *config.ConfigTree {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.active == nil {
+		return nil
+	}
+	return s.active.Clone()
 }
 
 // ExportJSON exports the active config as JSON (for debugging).

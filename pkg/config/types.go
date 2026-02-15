@@ -33,6 +33,9 @@ type ClusterConfig struct {
 	HeartbeatThreshold int    // missed heartbeats before lost, 0=default(3)
 	ControlInterface   string // interface for heartbeat traffic (e.g. "hb0")
 	PeerAddress        string // peer node's control link IP (e.g. "10.99.0.2")
+	FabricInterface    string // interface for session/config sync (e.g. "fab0")
+	FabricPeerAddress  string // peer's fabric link IP (e.g. "10.99.1.2")
+	ConfigSync         bool   // enable config synchronization to peer on commit
 	ControlLinkRecovery bool  // enable control-link-recovery
 	RedundancyGroups   []*RedundancyGroup
 }
