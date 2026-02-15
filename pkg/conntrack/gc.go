@@ -28,6 +28,9 @@ type GC struct {
 	interval time.Duration
 	mu       sync.RWMutex
 	stats    GCStats
+
+	OnDeleteV4 func(key dataplane.SessionKey)
+	OnDeleteV6 func(key dataplane.SessionKeyV6)
 }
 
 // NewGC creates a new session garbage collector.
@@ -113,9 +116,12 @@ func (gc *GC) sweep() {
 		return
 	}
 
-	for _, key := range toDelete {
+	for i, key := range toDelete {
 		if err := gc.dp.DeleteSession(key); err != nil {
 			slog.Debug("conntrack GC delete failed", "err", err)
+		} else if i%2 == 0 && gc.OnDeleteV4 != nil {
+			// Only forward entries (even indices: forward at 0,2,4...; reverse at 1,3,5...)
+			gc.OnDeleteV4(key)
 		}
 	}
 
@@ -185,9 +191,11 @@ func (gc *GC) sweep() {
 		slog.Error("conntrack GC v6 iteration failed", "err", err)
 	}
 
-	for _, key := range toDeleteV6 {
+	for i, key := range toDeleteV6 {
 		if err := gc.dp.DeleteSessionV6(key); err != nil {
 			slog.Debug("conntrack GC v6 delete failed", "err", err)
+		} else if i%2 == 0 && gc.OnDeleteV6 != nil {
+			gc.OnDeleteV6(key)
 		}
 	}
 

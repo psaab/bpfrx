@@ -390,3 +390,141 @@ func TestHandleMessageDeleteV4(t *testing.T) {
 		t.Fatal("should count delete received")
 	}
 }
+
+// --- Sync sweep tests ---
+
+// mockSweepDP is a minimal mock for testing sync sweep.
+// Embeds DataPlane interface; only IterateSessions/V6 are implemented.
+type mockSweepDP struct {
+	dataplane.DataPlane
+	v4sessions map[dataplane.SessionKey]dataplane.SessionValue
+	v6sessions map[dataplane.SessionKeyV6]dataplane.SessionValueV6
+}
+
+func (m *mockSweepDP) IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	for k, v := range m.v4sessions {
+		if !fn(k, v) {
+			break
+		}
+	}
+	return nil
+}
+
+func (m *mockSweepDP) IterateSessionsV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	for k, v := range m.v6sessions {
+		if !fn(k, v) {
+			break
+		}
+	}
+	return nil
+}
+
+func TestSyncSweepNewSessions(t *testing.T) {
+	now := monotonicSeconds()
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 1, 1}, DstIP: [4]byte{10, 0, 2, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}: {
+				State: dataplane.SessStateEstablished, Created: now, IsReverse: 0,
+			},
+			{SrcIP: [4]byte{10, 0, 1, 2}, DstIP: [4]byte{10, 0, 2, 2}, Protocol: 6, SrcPort: 2000, DstPort: 443}: {
+				State: dataplane.SessStateEstablished, Created: now - 100, IsReverse: 0, // old session
+			},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.stats.Connected.Store(true)
+	ss.IsPrimaryFn = func() bool { return true }
+	ss.lastSweepTime = now // only sessions created at or after 'now' should sync
+
+	ss.syncSweep()
+
+	// Should have synced exactly 1 session (the one with Created == now)
+	if ss.stats.SessionsSent.Load() != 1 {
+		t.Fatalf("expected 1 session sent, got %d", ss.stats.SessionsSent.Load())
+	}
+}
+
+func TestSyncSweepSkipsReverse(t *testing.T) {
+	now := monotonicSeconds()
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6}: {
+				Created: now, IsReverse: 1, // reverse entry
+			},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.stats.Connected.Store(true)
+	ss.IsPrimaryFn = func() bool { return true }
+	ss.lastSweepTime = now
+
+	ss.syncSweep()
+
+	if ss.stats.SessionsSent.Load() != 0 {
+		t.Fatal("should not sync reverse entries")
+	}
+}
+
+func TestSyncSweepSkipsWhenNotPrimary(t *testing.T) {
+	now := monotonicSeconds()
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{Protocol: 6}: {Created: now, IsReverse: 0},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.stats.Connected.Store(true)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.lastSweepTime = now
+
+	ss.syncSweep()
+
+	if ss.stats.SessionsSent.Load() != 0 {
+		t.Fatal("should not sync when not primary")
+	}
+}
+
+func TestSyncSweepSkipsWhenDisconnected(t *testing.T) {
+	now := monotonicSeconds()
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{Protocol: 6}: {Created: now, IsReverse: 0},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.stats.Connected.Store(false)
+	ss.IsPrimaryFn = func() bool { return true }
+	ss.lastSweepTime = now
+
+	ss.syncSweep()
+
+	if ss.stats.SessionsSent.Load() != 0 {
+		t.Fatal("should not sync when disconnected")
+	}
+}
+
+func TestSyncSweepV6(t *testing.T) {
+	now := monotonicSeconds()
+	dp := &mockSweepDP{
+		v6sessions: map[dataplane.SessionKeyV6]dataplane.SessionValueV6{
+			{SrcIP: [16]byte{0x20, 0x01}, Protocol: 6}: {
+				Created: now, IsReverse: 0,
+			},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.stats.Connected.Store(true)
+	ss.IsPrimaryFn = func() bool { return true }
+	ss.lastSweepTime = now
+
+	ss.syncSweep()
+
+	if ss.stats.SessionsSent.Load() != 1 {
+		t.Fatalf("expected 1 v6 session sent, got %d", ss.stats.SessionsSent.Load())
+	}
+}

@@ -203,6 +203,32 @@ func (m *Manager) SetSessionV4(key SessionKey, val SessionValue) error {
 	return sm.Update(key, val, ebpf.UpdateAny)
 }
 
+// GetSessionV4 looks up a single v4 session entry by key.
+func (m *Manager) GetSessionV4(key SessionKey) (SessionValue, error) {
+	sm, ok := m.maps["sessions"]
+	if !ok {
+		return SessionValue{}, fmt.Errorf("sessions map not found")
+	}
+	var val SessionValue
+	if err := sm.Lookup(key, &val); err != nil {
+		return SessionValue{}, err
+	}
+	return val, nil
+}
+
+// GetSessionV6 looks up a single v6 session entry by key.
+func (m *Manager) GetSessionV6(key SessionKeyV6) (SessionValueV6, error) {
+	sm, ok := m.maps["sessions_v6"]
+	if !ok {
+		return SessionValueV6{}, fmt.Errorf("sessions_v6 map not found")
+	}
+	var val SessionValueV6
+	if err := sm.Lookup(key, &val); err != nil {
+		return SessionValueV6{}, err
+	}
+	return val, nil
+}
+
 // ClearZonePairPolicies deletes all zone-pair policy entries.
 func (m *Manager) ClearZonePairPolicies() error {
 	zm, ok := m.maps["zone_pair_policies"]

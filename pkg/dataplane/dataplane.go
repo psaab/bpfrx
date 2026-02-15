@@ -93,6 +93,8 @@ type DataPlane interface {
 	IterateSessionsV6(fn func(SessionKeyV6, SessionValueV6) bool) error
 	DeleteSessionV6(key SessionKeyV6) error
 	SetSessionV6(key SessionKeyV6, val SessionValueV6) error
+	GetSessionV4(key SessionKey) (SessionValue, error)
+	GetSessionV6(key SessionKeyV6) (SessionValueV6, error)
 	SessionCount() (v4, v6 int)
 	ClearAllSessions() (int, int, error)
 

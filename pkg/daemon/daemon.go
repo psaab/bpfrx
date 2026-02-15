@@ -3,6 +3,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -246,6 +247,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire dataplane into session sync (dp is loaded after cluster init).
 	if d.sessionSync != nil && d.dp != nil {
 		d.sessionSync.SetDataPlane(d.dp)
+		d.sessionSync.IsPrimaryFn = func() bool {
+			return d.cluster != nil && d.cluster.IsLocalPrimary(0)
+		}
+		d.sessionSync.StartSyncSweep(ctx)
 	}
 
 	// Start background services if dataplane is loaded
@@ -256,6 +261,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.dp.StartFIBSync(ctx)
 
 		gc = conntrack.NewGC(d.dp, 10*time.Second)
+
+		// Wire GC delete callbacks for incremental session sync.
+		gc.OnDeleteV4 = func(key dataplane.SessionKey) {
+			if d.cluster != nil && d.cluster.IsLocalPrimary(0) && d.sessionSync != nil {
+				d.sessionSync.QueueDeleteV4(key)
+			}
+		}
+		gc.OnDeleteV6 = func(key dataplane.SessionKeyV6) {
+			if d.cluster != nil && d.cluster.IsLocalPrimary(0) && d.sessionSync != nil {
+				d.sessionSync.QueueDeleteV6(key)
+			}
+		}
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -274,6 +292,48 @@ func (d *Daemon) Run(ctx context.Context) error {
 				defer wg.Done()
 				er.Run(ctx)
 			}()
+
+			// Wire ring buffer callback for near-real-time session sync.
+			if d.sessionSync != nil {
+				er.AddCallback(func(rec logging.EventRecord, raw []byte) {
+					if rec.Type != "SESSION_OPEN" {
+						return
+					}
+					if d.cluster == nil || !d.cluster.IsLocalPrimary(0) {
+						return
+					}
+					if !d.sessionSync.IsConnected() {
+						return
+					}
+					if len(raw) < 56 {
+						return
+					}
+					proto := raw[53]
+					af := raw[55]
+
+					if af == dataplane.AFInet6 {
+						var key dataplane.SessionKeyV6
+						copy(key.SrcIP[:], raw[8:24])
+						copy(key.DstIP[:], raw[24:40])
+						key.SrcPort = binary.BigEndian.Uint16(raw[40:42])
+						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
+						key.Protocol = proto
+						if val, err := d.dp.GetSessionV6(key); err == nil && val.IsReverse == 0 {
+							d.sessionSync.QueueSessionV6(key, val)
+						}
+					} else {
+						var key dataplane.SessionKey
+						copy(key.SrcIP[:], raw[8:12])
+						copy(key.DstIP[:], raw[24:28])
+						key.SrcPort = binary.BigEndian.Uint16(raw[40:42])
+						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
+						key.Protocol = proto
+						if val, err := d.dp.GetSessionV4(key); err == nil && val.IsReverse == 0 {
+							d.sessionSync.QueueSessionV4(key, val)
+						}
+					}
+				})
+			}
 
 			// Set up syslog clients from active config
 			if cfg := d.store.ActiveConfig(); cfg != nil {

@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/psaab/bpfrx/pkg/dataplane"
 )
 
@@ -83,6 +85,9 @@ type SessionSync struct {
 	// peerIPsecSAs holds the latest IPsec connection names received from the peer.
 	peerIPsecSAs   []string
 	peerIPsecSAsMu sync.Mutex
+
+	IsPrimaryFn   func() bool // returns true if local node is primary for RG 0
+	lastSweepTime uint64      // monotonic seconds of last sync sweep
 }
 
 // NewSessionSync creates a new session synchronization manager.
@@ -104,6 +109,11 @@ func (s *SessionSync) SetDataPlane(dp dataplane.DataPlane) {
 // Stats returns current sync statistics.
 func (s *SessionSync) Stats() SyncStats {
 	return s.stats
+}
+
+// IsConnected returns true if the peer connection is established.
+func (s *SessionSync) IsConnected() bool {
+	return s.stats.Connected.Load()
 }
 
 // Start begins the sync protocol (listener + connector).
@@ -156,6 +166,71 @@ func (s *SessionSync) Stop() {
 	}
 	s.mu.Unlock()
 	s.wg.Wait()
+}
+
+// StartSyncSweep starts a goroutine that periodically syncs new sessions to the peer.
+// Sessions with Created >= lastSweepTime are considered new and queued for sync.
+func (s *SessionSync) StartSyncSweep(ctx context.Context) {
+	s.lastSweepTime = monotonicSeconds()
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.syncSweep()
+			}
+		}
+	}()
+	slog.Info("cluster sync: sweep started")
+}
+
+func (s *SessionSync) syncSweep() {
+	if s.IsPrimaryFn == nil || !s.IsPrimaryFn() {
+		return
+	}
+	if !s.stats.Connected.Load() {
+		return
+	}
+	if s.dp == nil {
+		return
+	}
+
+	threshold := s.lastSweepTime
+	now := monotonicSeconds()
+	var count int
+
+	s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if val.Created >= threshold {
+			s.QueueSessionV4(key, val)
+			count++
+		}
+		return true
+	})
+
+	s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if val.Created >= threshold {
+			s.QueueSessionV6(key, val)
+			count++
+		}
+		return true
+	})
+
+	s.lastSweepTime = now
+	if count > 0 {
+		slog.Info("cluster sync: sweep synced sessions", "count", count)
+	}
 }
 
 // QueueSessionV4 queues a v4 session for sync to peer.
@@ -581,6 +656,13 @@ func (s *SessionSync) QueueIPsecSA(connectionNames []string) {
 	}
 	s.stats.IPsecSASent.Add(1)
 	slog.Debug("cluster sync: IPsec SA list sent", "count", len(connectionNames))
+}
+
+// monotonicSeconds returns monotonic clock in seconds.
+func monotonicSeconds() uint64 {
+	var ts unix.Timespec
+	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	return uint64(ts.Sec)
 }
 
 // --- Wire encoding helpers ---

@@ -601,6 +601,13 @@ func (m *Manager) SetSessionV6(_ dataplane.SessionKeyV6, _ dataplane.SessionValu
 	return nil
 }
 
+func (m *Manager) GetSessionV4(_ dataplane.SessionKey) (dataplane.SessionValue, error) {
+	return dataplane.SessionValue{}, nil
+}
+func (m *Manager) GetSessionV6(_ dataplane.SessionKeyV6) (dataplane.SessionValueV6, error) {
+	return dataplane.SessionValueV6{}, nil
+}
+
 func (m *Manager) SessionCount() (int, int) {
 	shm := m.platform.shm
 	if shm == nil {
