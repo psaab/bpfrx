@@ -12625,3 +12625,427 @@ func TestFlexibleMatchRangeSetSyntax(t *testing.T) {
 		t.Errorf("Mask = 0x%x, want 0xff000000", fm.Mask)
 	}
 }
+
+func TestLAGInterfaceHierarchical(t *testing.T) {
+	input := `
+interfaces {
+    ae0 {
+        description "LAG to switch";
+        aggregated-ether-options {
+            lacp {
+                active;
+                periodic fast;
+            }
+            link-speed 10g;
+            minimum-links 1;
+        }
+        unit 0 {
+            family inet {
+                address 10.0.1.1/24;
+            }
+        }
+    }
+    ge-0/0/0 {
+        gigether-options {
+            802.3ad ae0;
+        }
+    }
+    ge-0/0/1 {
+        gigether-options {
+            802.3ad ae0;
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	// Check ae0 interface
+	ae0 := cfg.Interfaces.Interfaces["ae0"]
+	if ae0 == nil {
+		t.Fatal("missing ae0 interface")
+	}
+	if ae0.Description != "LAG to switch" {
+		t.Errorf("ae0 description: got %q", ae0.Description)
+	}
+	if ae0.AggregatedEtherOpts == nil {
+		t.Fatal("ae0 aggregated-ether-options is nil")
+	}
+	if !ae0.AggregatedEtherOpts.LACPActive {
+		t.Error("expected LACP active")
+	}
+	if ae0.AggregatedEtherOpts.LACPPeriodic != "fast" {
+		t.Errorf("LACP periodic: got %q, want fast", ae0.AggregatedEtherOpts.LACPPeriodic)
+	}
+	if ae0.AggregatedEtherOpts.LinkSpeed != "10g" {
+		t.Errorf("link-speed: got %q, want 10g", ae0.AggregatedEtherOpts.LinkSpeed)
+	}
+	if ae0.AggregatedEtherOpts.MinimumLinks != 1 {
+		t.Errorf("minimum-links: got %d, want 1", ae0.AggregatedEtherOpts.MinimumLinks)
+	}
+
+	// Check unit 0
+	u0 := ae0.Units[0]
+	if u0 == nil {
+		t.Fatal("ae0 missing unit 0")
+	}
+	if len(u0.Addresses) != 1 || u0.Addresses[0] != "10.0.1.1/24" {
+		t.Errorf("ae0 unit 0 addresses: %v", u0.Addresses)
+	}
+
+	// Check member bindings
+	ge0 := cfg.Interfaces.Interfaces["ge-0/0/0"]
+	if ge0 == nil {
+		t.Fatal("missing ge-0/0/0")
+	}
+	if ge0.LAGParent != "ae0" {
+		t.Errorf("ge-0/0/0 LAGParent: got %q, want ae0", ge0.LAGParent)
+	}
+
+	ge1 := cfg.Interfaces.Interfaces["ge-0/0/1"]
+	if ge1 == nil {
+		t.Fatal("missing ge-0/0/1")
+	}
+	if ge1.LAGParent != "ae0" {
+		t.Errorf("ge-0/0/1 LAGParent: got %q, want ae0", ge1.LAGParent)
+	}
+}
+
+func TestLAGInterfaceSetSyntax(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set interfaces ae0 description \"LAG bundle\"",
+		"set interfaces ae0 aggregated-ether-options lacp active",
+		"set interfaces ae0 aggregated-ether-options lacp periodic fast",
+		"set interfaces ae0 aggregated-ether-options link-speed 10g",
+		"set interfaces ae0 aggregated-ether-options minimum-links 2",
+		"set interfaces ae0 unit 0 family inet address 10.0.5.1/24",
+		"set interfaces ge-0/0/0 gigether-options 802.3ad ae0",
+		"set interfaces ge-0/0/1 gigether-options 802.3ad ae0",
+	}
+
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	ae0 := cfg.Interfaces.Interfaces["ae0"]
+	if ae0 == nil {
+		t.Fatal("missing ae0")
+	}
+	if ae0.AggregatedEtherOpts == nil {
+		t.Fatal("aggregated-ether-options is nil")
+	}
+	if !ae0.AggregatedEtherOpts.LACPActive {
+		t.Error("expected LACP active")
+	}
+	if ae0.AggregatedEtherOpts.LACPPeriodic != "fast" {
+		t.Errorf("periodic: got %q, want fast", ae0.AggregatedEtherOpts.LACPPeriodic)
+	}
+	if ae0.AggregatedEtherOpts.LinkSpeed != "10g" {
+		t.Errorf("link-speed: got %q", ae0.AggregatedEtherOpts.LinkSpeed)
+	}
+	if ae0.AggregatedEtherOpts.MinimumLinks != 2 {
+		t.Errorf("minimum-links: got %d, want 2", ae0.AggregatedEtherOpts.MinimumLinks)
+	}
+
+	ge0 := cfg.Interfaces.Interfaces["ge-0/0/0"]
+	if ge0 == nil {
+		t.Fatal("missing ge-0/0/0")
+	}
+	if ge0.LAGParent != "ae0" {
+		t.Errorf("ge-0/0/0 LAGParent: got %q", ge0.LAGParent)
+	}
+
+	ge1 := cfg.Interfaces.Interfaces["ge-0/0/1"]
+	if ge1 == nil {
+		t.Fatal("missing ge-0/0/1")
+	}
+	if ge1.LAGParent != "ae0" {
+		t.Errorf("ge-0/0/1 LAGParent: got %q", ge1.LAGParent)
+	}
+}
+
+func TestFlexibleVlanTaggingHierarchical(t *testing.T) {
+	input := `
+interfaces {
+    ge-0/0/0 {
+        flexible-vlan-tagging;
+        encapsulation flexible-ethernet-services;
+        unit 100 {
+            vlan-id 100;
+            inner-vlan-id 200;
+            family inet {
+                address 10.0.100.1/24;
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	ifc := cfg.Interfaces.Interfaces["ge-0/0/0"]
+	if ifc == nil {
+		t.Fatal("missing ge-0/0/0")
+	}
+	if !ifc.FlexibleVlanTagging {
+		t.Error("expected flexible-vlan-tagging to be true")
+	}
+	if ifc.Encapsulation != "flexible-ethernet-services" {
+		t.Errorf("encapsulation: got %q, want flexible-ethernet-services", ifc.Encapsulation)
+	}
+
+	u100 := ifc.Units[100]
+	if u100 == nil {
+		t.Fatal("missing unit 100")
+	}
+	if u100.VlanID != 100 {
+		t.Errorf("vlan-id: got %d, want 100", u100.VlanID)
+	}
+	if u100.InnerVlanID != 200 {
+		t.Errorf("inner-vlan-id: got %d, want 200", u100.InnerVlanID)
+	}
+	if len(u100.Addresses) != 1 || u100.Addresses[0] != "10.0.100.1/24" {
+		t.Errorf("addresses: %v", u100.Addresses)
+	}
+}
+
+func TestFlexibleVlanTaggingSetSyntax(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set interfaces ge-0/0/0 flexible-vlan-tagging",
+		"set interfaces ge-0/0/0 encapsulation flexible-ethernet-services",
+		"set interfaces ge-0/0/0 unit 100 vlan-id 100",
+		"set interfaces ge-0/0/0 unit 100 inner-vlan-id 200",
+		"set interfaces ge-0/0/0 unit 100 family inet address 10.0.100.1/24",
+		"set interfaces ge-0/0/0 unit 200 vlan-id 300",
+		"set interfaces ge-0/0/0 unit 200 inner-vlan-id 400",
+	}
+
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	ifc := cfg.Interfaces.Interfaces["ge-0/0/0"]
+	if ifc == nil {
+		t.Fatal("missing ge-0/0/0")
+	}
+	if !ifc.FlexibleVlanTagging {
+		t.Error("expected flexible-vlan-tagging")
+	}
+	if ifc.Encapsulation != "flexible-ethernet-services" {
+		t.Errorf("encapsulation: got %q", ifc.Encapsulation)
+	}
+
+	u100 := ifc.Units[100]
+	if u100 == nil {
+		t.Fatal("missing unit 100")
+	}
+	if u100.VlanID != 100 {
+		t.Errorf("unit 100 vlan-id: got %d", u100.VlanID)
+	}
+	if u100.InnerVlanID != 200 {
+		t.Errorf("unit 100 inner-vlan-id: got %d", u100.InnerVlanID)
+	}
+
+	u200 := ifc.Units[200]
+	if u200 == nil {
+		t.Fatal("missing unit 200")
+	}
+	if u200.VlanID != 300 {
+		t.Errorf("unit 200 vlan-id: got %d", u200.VlanID)
+	}
+	if u200.InnerVlanID != 400 {
+		t.Errorf("unit 200 inner-vlan-id: got %d", u200.InnerVlanID)
+	}
+}
+
+func TestLACPPassiveMode(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set interfaces ae0 aggregated-ether-options lacp passive",
+		"set interfaces ae0 unit 0 family inet address 10.0.1.1/24",
+	}
+
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	ae0 := cfg.Interfaces.Interfaces["ae0"]
+	if ae0 == nil {
+		t.Fatal("missing ae0")
+	}
+	if ae0.AggregatedEtherOpts == nil {
+		t.Fatal("aggregated-ether-options is nil")
+	}
+	if ae0.AggregatedEtherOpts.LACPActive {
+		t.Error("expected LACP not active")
+	}
+	if !ae0.AggregatedEtherOpts.LACPPassive {
+		t.Error("expected LACP passive")
+	}
+}
+
+func TestInterfaceBandwidth(t *testing.T) {
+	// Test hierarchical config
+	input := `interfaces {
+    wan0 {
+        bandwidth 1g;
+        unit 0 {
+            family inet {
+                address 172.16.50.5/24;
+            }
+        }
+    }
+    trust0 {
+        bandwidth 100m;
+        unit 0 {
+            family inet {
+                address 10.0.1.10/24;
+            }
+        }
+    }
+}`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse error: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	wan0 := cfg.Interfaces.Interfaces["wan0"]
+	if wan0 == nil {
+		t.Fatal("wan0 not found")
+	}
+	if wan0.Bandwidth != 1000000000 {
+		t.Errorf("wan0 bandwidth = %d, want 1000000000", wan0.Bandwidth)
+	}
+
+	trust0 := cfg.Interfaces.Interfaces["trust0"]
+	if trust0 == nil {
+		t.Fatal("trust0 not found")
+	}
+	if trust0.Bandwidth != 100000000 {
+		t.Errorf("trust0 bandwidth = %d, want 100000000", trust0.Bandwidth)
+	}
+}
+
+func TestInterfaceBandwidthSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set interfaces wan0 bandwidth 1g",
+		"set interfaces wan0 unit 0 family inet address 172.16.50.5/24",
+		"set interfaces trust0 bandwidth 100m",
+		"set interfaces trust0 unit 0 family inet address 10.0.1.10/24",
+		"set interfaces lo0 bandwidth 10000",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	wan0 := cfg.Interfaces.Interfaces["wan0"]
+	if wan0 == nil {
+		t.Fatal("wan0 not found")
+	}
+	if wan0.Bandwidth != 1000000000 {
+		t.Errorf("wan0 bandwidth = %d, want 1000000000", wan0.Bandwidth)
+	}
+
+	trust0 := cfg.Interfaces.Interfaces["trust0"]
+	if trust0 == nil {
+		t.Fatal("trust0 not found")
+	}
+	if trust0.Bandwidth != 100000000 {
+		t.Errorf("trust0 bandwidth = %d, want 100000000", trust0.Bandwidth)
+	}
+
+	lo0 := cfg.Interfaces.Interfaces["lo0"]
+	if lo0 == nil {
+		t.Fatal("lo0 not found")
+	}
+	if lo0.Bandwidth != 10000 {
+		t.Errorf("lo0 bandwidth = %d, want 10000", lo0.Bandwidth)
+	}
+}
+
+func TestParseBandwidthBps(t *testing.T) {
+	tests := []struct {
+		input string
+		want  uint64
+	}{
+		{"1g", 1000000000},
+		{"10G", 10000000000},
+		{"100m", 100000000},
+		{"500k", 500000},
+		{"10000", 10000},
+		{"", 0},
+		{"abc", 0},
+	}
+	for _, tc := range tests {
+		got := parseBandwidthBps(tc.input)
+		if got != tc.want {
+			t.Errorf("parseBandwidthBps(%q) = %d, want %d", tc.input, got, tc.want)
+		}
+	}
+}

@@ -1118,8 +1118,11 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 
 		fmt.Fprintf(&buf, "Physical interface: %s, %s, Physical link is %s\n", physName, enabled, linkUp)
 
-		// Show configured speed/duplex from config
+		// Show interface description and configured speed/duplex from config
 		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+			if ifCfg.Description != "" {
+				fmt.Fprintf(&buf, "  Description: %s\n", ifCfg.Description)
+			}
 			if ifCfg.Speed != "" {
 				fmt.Fprintf(&buf, "  Configured speed: %s\n", ifCfg.Speed)
 			}
@@ -1200,6 +1203,13 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 				fmt.Fprintf(&buf, " VLAN-Tag [ 0x8100.%d ]", li.vlanID)
 			}
 			fmt.Fprintln(&buf)
+
+			// Show unit description
+			if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+				if u, ok := ifCfg.Units[li.unitNum]; ok && u.Description != "" {
+					fmt.Fprintf(&buf, "    Description: %s\n", u.Description)
+				}
+			}
 
 			fmt.Fprintf(&buf, "    Security: Zone: %s\n", li.zoneName)
 
@@ -1372,7 +1382,16 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 					}
 				}
 			}
-			fmt.Fprintf(&buf, "%-24s%-6s%-6s\n", u.physName, admin, link)
+			// Show description if configured
+			desc := ""
+			if ifCfg, ok := cfg.Interfaces.Interfaces[u.physName]; ok && ifCfg.Description != "" {
+				desc = ifCfg.Description
+			}
+			if desc != "" {
+				fmt.Fprintf(&buf, "%-24s%-6s%-6s%s\n", u.physName, admin, link, desc)
+			} else {
+				fmt.Fprintf(&buf, "%-24s%-6s%-6s\n", u.physName, admin, link)
+			}
 		}
 
 		// Determine the logical interface name

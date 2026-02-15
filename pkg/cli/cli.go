@@ -2519,11 +2519,27 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 
 	// 3. Apply all routes + dynamic protocols via FRR
 	if c.frr != nil {
+		// Collect interface bandwidths and point-to-point flags for FRR.
+		ifaceBandwidths := make(map[string]uint64)
+		ifaceP2P := make(map[string]bool)
+		for name, ifc := range cfg.Interfaces.Interfaces {
+			if ifc.Bandwidth > 0 {
+				ifaceBandwidths[name] = ifc.Bandwidth
+			}
+			for _, unit := range ifc.Units {
+				if unit.PointToPoint {
+					ifaceP2P[name] = true
+				}
+			}
+		}
+
 		fc := &frr.FullConfig{
-			OSPF:         cfg.Protocols.OSPF,
-			OSPFv3:       cfg.Protocols.OSPFv3,
-			BGP:          cfg.Protocols.BGP,
-			StaticRoutes: cfg.RoutingOptions.StaticRoutes,
+			OSPF:                  cfg.Protocols.OSPF,
+			OSPFv3:                cfg.Protocols.OSPFv3,
+			BGP:                   cfg.Protocols.BGP,
+			StaticRoutes:          cfg.RoutingOptions.StaticRoutes,
+			InterfaceBandwidths:   ifaceBandwidths,
+			InterfacePointToPoint: ifaceP2P,
 		}
 		if c.dhcp != nil {
 			for _, lease := range c.dhcp.Leases() {

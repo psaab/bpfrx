@@ -282,3 +282,92 @@ func TestOrderAddresses(t *testing.T) {
 		t.Errorf("expected original order for missing primary, got %v", got)
 	}
 }
+
+func TestGenerateNetdev_Bond(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:        "ae0",
+		IsBond:      true,
+		BondMode:    "802.3ad",
+		LACPRate:    "fast",
+		MinLinks:    2,
+		Description: "LAG to switch",
+		MTU:         9000,
+	}
+	got := m.generateNetdev(ifc)
+	if !strings.Contains(got, "[NetDev]\n") {
+		t.Error("missing [NetDev] section")
+	}
+	if !strings.Contains(got, "Name=ae0\n") {
+		t.Error("missing Name=ae0")
+	}
+	if !strings.Contains(got, "Kind=bond\n") {
+		t.Error("missing Kind=bond")
+	}
+	if !strings.Contains(got, "Description=LAG to switch\n") {
+		t.Error("missing Description")
+	}
+	if !strings.Contains(got, "MTUBytes=9000\n") {
+		t.Error("missing MTUBytes")
+	}
+	if !strings.Contains(got, "[Bond]\n") {
+		t.Error("missing [Bond] section")
+	}
+	if !strings.Contains(got, "Mode=802.3ad\n") {
+		t.Error("missing Mode=802.3ad")
+	}
+	if !strings.Contains(got, "LACPTransmitRate=fast\n") {
+		t.Error("missing LACPTransmitRate=fast")
+	}
+	if !strings.Contains(got, "MinLinks=2\n") {
+		t.Error("missing MinLinks=2")
+	}
+	if !strings.Contains(got, "TransmitHashPolicy=layer3+4\n") {
+		t.Error("missing TransmitHashPolicy")
+	}
+}
+
+func TestGenerateNetdev_BondDefaults(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:   "ae0",
+		IsBond: true,
+	}
+	got := m.generateNetdev(ifc)
+	// Default mode should be 802.3ad
+	if !strings.Contains(got, "Mode=802.3ad\n") {
+		t.Error("default mode should be 802.3ad")
+	}
+	// Default LACP rate should be fast
+	if !strings.Contains(got, "LACPTransmitRate=fast\n") {
+		t.Error("default LACP rate should be fast")
+	}
+	// No MinLinks when 0
+	if strings.Contains(got, "MinLinks=") {
+		t.Error("MinLinks=0 should not produce MinLinks line")
+	}
+	// No Description when empty
+	if strings.Contains(got, "Description=") {
+		t.Error("empty description should not produce Description line")
+	}
+	// No MTUBytes when 0
+	if strings.Contains(got, "MTUBytes=") {
+		t.Error("MTU=0 should not produce MTUBytes line")
+	}
+}
+
+func TestGenerateNetwork_BondMember(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:       "ge-0/0/0",
+		BondMaster: "ae0",
+	}
+	got := m.generateNetwork(ifc)
+	if !strings.Contains(got, "Bond=ae0\n") {
+		t.Errorf("missing Bond=ae0 in output:\n%s", got)
+	}
+	// Bond member should still have basic network settings
+	if !strings.Contains(got, "IPv6AcceptRA=no\n") {
+		t.Error("missing RA disable for bond member")
+	}
+}

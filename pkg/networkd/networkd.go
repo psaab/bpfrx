@@ -35,6 +35,11 @@ type InterfaceConfig struct {
 	Duplex           string   // "full", "half"
 	MTU              int      // interface MTU (0 = default)
 	Description      string   // interface description (maps to .network [Network] Description)
+	BondMaster       string   // LAG parent: bind this interface to a bond master (ae0, etc.)
+	IsBond           bool     // true = this is a bond/LAG device (needs .netdev file)
+	BondMode         string   // bond mode: "802.3ad" (default for ae interfaces)
+	LACPRate         string   // LACP transmit rate: "fast" or "slow" (default)
+	MinLinks         int      // minimum active member links (0 = no minimum)
 }
 
 // Manager handles systemd-networkd .link and .network file generation.
@@ -76,11 +81,15 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 
 	// Build set of expected filenames.
 	// .link files are only for physical interfaces (have MAC address).
+	// .netdev files are for bond (LAG) devices.
 	// VLAN sub-interfaces (wan0.50) only get .network files.
 	expected := make(map[string]bool)
 	for _, ifc := range interfaces {
 		if ifc.MACAddress != "" {
 			expected[filePrefix+ifc.Name+".link"] = true
+		}
+		if ifc.IsBond {
+			expected[filePrefix+ifc.Name+".netdev"] = true
 		}
 		expected[filePrefix+ifc.Name+".network"] = true
 	}
@@ -101,8 +110,17 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		}
 	}
 
-	// Write .link and .network files
+	// Write .netdev, .link, and .network files
 	for _, ifc := range interfaces {
+		// .netdev file: for bond/LAG devices
+		if ifc.IsBond {
+			netdevPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".netdev")
+			netdevContent := m.generateNetdev(ifc)
+			if writeIfChanged(netdevPath, netdevContent) {
+				changed = true
+			}
+		}
+
 		// .link file: only for physical interfaces with a MAC address
 		if ifc.MACAddress != "" {
 			linkPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".link")
@@ -186,6 +204,36 @@ func (m *Manager) findExternallyManaged() map[string]bool {
 	return FindExternallyManaged(m.networkDir)
 }
 
+func (m *Manager) generateNetdev(ifc InterfaceConfig) string {
+	var b strings.Builder
+	b.WriteString("# Managed by bpfrxd — do not edit\n")
+	b.WriteString("[NetDev]\n")
+	fmt.Fprintf(&b, "Name=%s\n", ifc.Name)
+	b.WriteString("Kind=bond\n")
+	if ifc.Description != "" {
+		fmt.Fprintf(&b, "Description=%s\n", ifc.Description)
+	}
+	if ifc.MTU > 0 {
+		fmt.Fprintf(&b, "MTUBytes=%d\n", ifc.MTU)
+	}
+	b.WriteString("\n[Bond]\n")
+	mode := ifc.BondMode
+	if mode == "" {
+		mode = "802.3ad"
+	}
+	fmt.Fprintf(&b, "Mode=%s\n", mode)
+	rate := ifc.LACPRate
+	if rate == "" {
+		rate = "fast"
+	}
+	fmt.Fprintf(&b, "LACPTransmitRate=%s\n", rate)
+	if ifc.MinLinks > 0 {
+		fmt.Fprintf(&b, "MinLinks=%d\n", ifc.MinLinks)
+	}
+	b.WriteString("TransmitHashPolicy=layer3+4\n")
+	return b.String()
+}
+
 func (m *Manager) generateLink(ifc InterfaceConfig) string {
 	var b strings.Builder
 	b.WriteString("# Managed by bpfrxd — do not edit\n")
@@ -238,6 +286,11 @@ func (m *Manager) generateNetwork(ifc InterfaceConfig) string {
 	}
 
 	b.WriteString("LinkLocalAddressing=ipv6\n")
+
+	// Bond member: bind to bond master
+	if ifc.BondMaster != "" {
+		fmt.Fprintf(&b, "Bond=%s\n", ifc.BondMaster)
+	}
 
 	// Disable IPv6 Duplicate Address Detection if configured
 	if ifc.DADDisable {

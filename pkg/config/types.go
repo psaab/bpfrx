@@ -946,18 +946,32 @@ type InterfacesConfig struct {
 
 // InterfaceConfig represents a network interface.
 type InterfaceConfig struct {
-	Name            string
-	Description     string // free-text interface description
-	MTU             int    // interface-level MTU (overridden by unit MTU)
-	Speed           string // interface speed (e.g. "1g", "10g", "auto")
-	Duplex          string // "full", "half", "auto"
-	VlanTagging     bool   // 802.1Q trunk mode
-	Disable         bool   // administratively disabled
-	RedundantParent string // gigether-options redundant-parent (HA)
-	RedundancyGroup int    // redundant-ether-options redundancy-group (0 = none)
-	FabricMembers   []string // fabric-options member-interfaces
-	Units           map[int]*InterfaceUnit
-	Tunnel          *TunnelConfig // non-nil for tunnel interfaces (gre0, etc.)
+	Name                  string
+	Description           string // free-text interface description
+	MTU                   int    // interface-level MTU (overridden by unit MTU)
+	Speed                 string // interface speed (e.g. "1g", "10g", "auto")
+	Duplex                string // "full", "half", "auto"
+	VlanTagging           bool   // 802.1Q trunk mode
+	FlexibleVlanTagging   bool   // flexible 802.1Q VLAN tagging (QinQ)
+	Encapsulation         string // physical link-layer encapsulation (e.g. "flexible-ethernet-services")
+	Bandwidth             uint64 // interface bandwidth in bits per second
+	Disable               bool   // administratively disabled
+	RedundantParent       string // gigether-options redundant-parent (HA)
+	LAGParent             string // gigether-options 802.3ad <ae-name> (LAG member binding)
+	RedundancyGroup       int    // redundant-ether-options redundancy-group (0 = none)
+	FabricMembers         []string // fabric-options member-interfaces
+	AggregatedEtherOpts   *AggregatedEtherOptions // ae interface options (LACP, etc.)
+	Units                 map[int]*InterfaceUnit
+	Tunnel                *TunnelConfig // non-nil for tunnel interfaces (gre0, etc.)
+}
+
+// AggregatedEtherOptions defines LAG/ae interface parameters.
+type AggregatedEtherOptions struct {
+	LACPActive   bool   // LACP active mode
+	LACPPassive  bool   // LACP passive mode
+	LACPPeriodic string // LACP periodic timer: "fast" or "slow"
+	LinkSpeed    string // required member link speed (e.g. "1g", "10g")
+	MinimumLinks int    // minimum active member links before bundle goes down
 }
 
 // InterfaceUnit represents a logical unit on an interface.
@@ -965,6 +979,7 @@ type InterfaceUnit struct {
 	Number         int
 	Description    string   // free-text unit description
 	VlanID         int      // 0 = native/untagged, >0 = 802.1Q tagged
+	InnerVlanID    int      // inner VLAN tag for QinQ (flexible-vlan-tagging)
 	PointToPoint   bool     // point-to-point link (for tunnels)
 	Addresses      []string // CIDR notation
 	PrimaryAddress   string // address marked as primary

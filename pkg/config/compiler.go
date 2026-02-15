@@ -842,16 +842,61 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 			ifc.Disable = true
 		}
 
+		// Interface bandwidth (bits per second)
+		if bwNode := child.FindChild("bandwidth"); bwNode != nil {
+			if v := nodeVal(bwNode); v != "" {
+				ifc.Bandwidth = parseBandwidthBps(v)
+			}
+		}
+
 		// Check for vlan-tagging flag
 		if child.FindChild("vlan-tagging") != nil {
 			ifc.VlanTagging = true
 		}
 
-		// Check for gigether-options redundant-parent
+		// Check for flexible-vlan-tagging flag (QinQ)
+		if child.FindChild("flexible-vlan-tagging") != nil {
+			ifc.FlexibleVlanTagging = true
+		}
+
+		// Check for encapsulation
+		if encapNode := child.FindChild("encapsulation"); encapNode != nil {
+			ifc.Encapsulation = nodeVal(encapNode)
+		}
+
+		// Check for gigether-options redundant-parent and 802.3ad LAG member
 		if goNode := child.FindChild("gigether-options"); goNode != nil {
 			if rpNode := goNode.FindChild("redundant-parent"); rpNode != nil {
 				ifc.RedundantParent = nodeVal(rpNode)
 			}
+			if adNode := goNode.FindChild("802.3ad"); adNode != nil {
+				ifc.LAGParent = nodeVal(adNode)
+			}
+		}
+
+		// Check for aggregated-ether-options (LAG/ae interface)
+		if aeoNode := child.FindChild("aggregated-ether-options"); aeoNode != nil {
+			opts := &AggregatedEtherOptions{}
+			if lacpNode := aeoNode.FindChild("lacp"); lacpNode != nil {
+				if lacpNode.FindChild("active") != nil {
+					opts.LACPActive = true
+				}
+				if lacpNode.FindChild("passive") != nil {
+					opts.LACPPassive = true
+				}
+				if periodicNode := lacpNode.FindChild("periodic"); periodicNode != nil {
+					opts.LACPPeriodic = nodeVal(periodicNode)
+				}
+			}
+			if lsNode := aeoNode.FindChild("link-speed"); lsNode != nil {
+				opts.LinkSpeed = nodeVal(lsNode)
+			}
+			if mlNode := aeoNode.FindChild("minimum-links"); mlNode != nil {
+				if v := nodeVal(mlNode); v != "" {
+					opts.MinimumLinks, _ = strconv.Atoi(v)
+				}
+			}
+			ifc.AggregatedEtherOpts = opts
 		}
 
 		// Check for redundant-ether-options redundancy-group
@@ -987,6 +1032,15 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 				if v := nodeVal(vlanNode); v != "" {
 					if n, err := strconv.Atoi(v); err == nil {
 						unit.VlanID = n
+					}
+				}
+			}
+
+			// Parse inner-vlan-id on unit (QinQ inner tag)
+			if ivNode := unitInst.node.FindChild("inner-vlan-id"); ivNode != nil {
+				if v := nodeVal(ivNode); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						unit.InnerVlanID = n
 					}
 				}
 			}
@@ -3139,6 +3193,31 @@ func nodeVal(n *Node) string {
 		return n.Children[0].Name()
 	}
 	return ""
+}
+
+// parseBandwidthBps parses a Junos bandwidth value and returns bits per second.
+// "1g" = 1,000,000,000; "100m" = 100,000,000; "500k" = 500,000; plain number = bps.
+func parseBandwidthBps(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	multiplier := uint64(1)
+	if strings.HasSuffix(s, "g") || strings.HasSuffix(s, "G") {
+		multiplier = 1000000000
+		s = s[:len(s)-1]
+	} else if strings.HasSuffix(s, "m") || strings.HasSuffix(s, "M") {
+		multiplier = 1000000
+		s = s[:len(s)-1]
+	} else if strings.HasSuffix(s, "k") || strings.HasSuffix(s, "K") {
+		multiplier = 1000
+		s = s[:len(s)-1]
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v * multiplier
 }
 
 // parseBandwidthLimit parses a Junos bandwidth-limit value (in bits/sec) to bytes/sec.

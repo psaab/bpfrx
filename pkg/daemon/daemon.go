@@ -894,6 +894,20 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 
 	// 3. Apply all routes + dynamic protocols via FRR
 	if d.frr != nil {
+		// Collect interface bandwidths and point-to-point flags for FRR.
+		ifaceBandwidths := make(map[string]uint64)
+		ifaceP2P := make(map[string]bool)
+		for name, ifc := range cfg.Interfaces.Interfaces {
+			if ifc.Bandwidth > 0 {
+				ifaceBandwidths[name] = ifc.Bandwidth
+			}
+			for _, unit := range ifc.Units {
+				if unit.PointToPoint {
+					ifaceP2P[name] = true
+				}
+			}
+		}
+
 		fc := &frr.FullConfig{
 			OSPF:                  cfg.Protocols.OSPF,
 			OSPFv3:                cfg.Protocols.OSPFv3,
@@ -908,6 +922,8 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			ForwardingTableExport: cfg.RoutingOptions.ForwardingTableExport,
 			BackupRouter:          cfg.System.BackupRouter,
 			BackupRouterDst:       cfg.System.BackupRouterDst,
+			InterfaceBandwidths:   ifaceBandwidths,
+			InterfacePointToPoint: ifaceP2P,
 		}
 		for _, ri := range cfg.RoutingInstances {
 			vrfName := "vrf-" + ri.Name

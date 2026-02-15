@@ -734,14 +734,27 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 	}},
 	"interfaces": {desc: "Interface configuration", wildcard: &schemaNode{valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-		"description":  {desc: "Text description of interface", args: 1, children: nil},
-		"mtu":          {desc: "Maximum transmit packet size", args: 1, children: nil},
-		"speed":        {desc: "Link speed", args: 1, children: nil},
-		"duplex":       {desc: "Link duplex mode", args: 1, children: nil},
-		"disable":      {desc: "Disable this interface", children: nil},
-		"vlan-tagging": {desc: "Enable 802.1Q VLAN tagging", children: nil},
+		"description":            {desc: "Text description of interface", args: 1, children: nil},
+		"mtu":                    {desc: "Maximum transmit packet size", args: 1, children: nil},
+		"speed":                  {desc: "Link speed", args: 1, children: nil},
+		"duplex":                 {desc: "Link duplex mode", args: 1, children: nil},
+		"bandwidth":              {desc: "Interface bandwidth", args: 1, children: nil},
+		"disable":                {desc: "Disable this interface", children: nil},
+		"vlan-tagging":           {desc: "Enable 802.1Q VLAN tagging", children: nil},
+		"flexible-vlan-tagging":  {desc: "Enable flexible 802.1Q VLAN tagging (QinQ)", children: nil},
+		"encapsulation":          {desc: "Physical link-layer encapsulation", args: 1, children: nil},
 		"gigether-options": {desc: "Gigabit Ethernet interface options", children: map[string]*schemaNode{
 			"redundant-parent": {desc: "Parent of this redundant interface", args: 1, children: nil},
+			"802.3ad":          {desc: "Link aggregation group", args: 1, children: nil},
+		}},
+		"aggregated-ether-options": {desc: "Aggregated Ethernet interface options", children: map[string]*schemaNode{
+			"lacp": {desc: "LACP parameters", children: map[string]*schemaNode{
+				"active":  {desc: "Active LACP mode", children: nil},
+				"passive": {desc: "Passive LACP mode", children: nil},
+				"periodic": {desc: "LACP timer period", args: 1, children: nil},
+			}},
+			"link-speed":    {desc: "Member link speed", args: 1, children: nil},
+			"minimum-links": {desc: "Minimum active member links", args: 1, children: nil},
 		}},
 		"redundant-ether-options": {desc: "Redundant Ethernet interface options", children: map[string]*schemaNode{
 			"redundancy-group": {desc: "Redundancy group for this RETH", args: 1, children: nil},
@@ -765,6 +778,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"description":    {args: 1, children: nil},
 			"point-to-point": {children: nil},
 			"vlan-id":        {args: 1, children: nil},
+			"inner-vlan-id":  {args: 1, children: nil},
 			"tunnel":         {children: nil},
 			"family": {children: map[string]*schemaNode{
 				"inet": {children: map[string]*schemaNode{

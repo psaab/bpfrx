@@ -2043,3 +2043,93 @@ func TestGenerateRoutesBlackhole(t *testing.T) {
 		t.Errorf("missing IPv6 blackhole route in:\n%s", got)
 	}
 }
+
+func TestInterfaceBandwidthFRR(t *testing.T) {
+	m := &Manager{frrConf: filepath.Join(t.TempDir(), "frr.conf")}
+	os.WriteFile(m.frrConf, []byte("log syslog informational\n"), 0644)
+
+	fc := &FullConfig{
+		InterfaceBandwidths: map[string]uint64{
+			"wan0":   1000000000, // 1Gbps
+			"trust0": 100000000,  // 100Mbps
+		},
+	}
+
+	got := m.generateInterfaceSettings(fc)
+	// Should contain bandwidth in kbps
+	if !strings.Contains(got, "interface trust0\n bandwidth 100000\n") {
+		t.Errorf("missing trust0 bandwidth, got:\n%s", got)
+	}
+	if !strings.Contains(got, "interface wan0\n bandwidth 1000000\n") {
+		t.Errorf("missing wan0 bandwidth, got:\n%s", got)
+	}
+}
+
+func TestPointToPointFRR(t *testing.T) {
+	m := &Manager{frrConf: filepath.Join(t.TempDir(), "frr.conf")}
+	os.WriteFile(m.frrConf, []byte("log syslog informational\n"), 0644)
+
+	fc := &FullConfig{
+		InterfacePointToPoint: map[string]bool{
+			"gr-0/0/0": true,
+		},
+	}
+
+	got := m.generateInterfaceSettings(fc)
+	if !strings.Contains(got, "interface gr-0/0/0\n ip ospf network point-to-point\n") {
+		t.Errorf("missing point-to-point, got:\n%s", got)
+	}
+}
+
+func TestPointToPointSkipWithExplicitOSPFType(t *testing.T) {
+	m := &Manager{frrConf: filepath.Join(t.TempDir(), "frr.conf")}
+	os.WriteFile(m.frrConf, []byte("log syslog informational\n"), 0644)
+
+	// If OSPF has an explicit network-type for the interface, skip p2p from interface settings
+	fc := &FullConfig{
+		OSPF: &config.OSPFConfig{
+			Areas: []*config.OSPFArea{
+				{
+					ID: "0.0.0.0",
+					Interfaces: []*config.OSPFInterface{
+						{Name: "gr-0/0/0", NetworkType: "broadcast"},
+					},
+				},
+			},
+		},
+		InterfacePointToPoint: map[string]bool{
+			"gr-0/0/0": true,
+		},
+	}
+
+	got := m.generateInterfaceSettings(fc)
+	// Should NOT contain point-to-point since OSPF has explicit broadcast type
+	if strings.Contains(got, "ip ospf network point-to-point") {
+		t.Errorf("should not emit p2p when OSPF has explicit network-type, got:\n%s", got)
+	}
+}
+
+func TestBandwidthAndPointToPointCombined(t *testing.T) {
+	m := &Manager{frrConf: filepath.Join(t.TempDir(), "frr.conf")}
+	os.WriteFile(m.frrConf, []byte("log syslog informational\n"), 0644)
+
+	fc := &FullConfig{
+		InterfaceBandwidths: map[string]uint64{
+			"gr-0/0/0": 10000000, // 10Mbps
+		},
+		InterfacePointToPoint: map[string]bool{
+			"gr-0/0/0": true,
+		},
+	}
+
+	got := m.generateInterfaceSettings(fc)
+	if !strings.Contains(got, "interface gr-0/0/0\n") {
+		t.Errorf("missing interface block, got:\n%s", got)
+	}
+	if !strings.Contains(got, " bandwidth 10000\n") {
+		t.Errorf("missing bandwidth 10000, got:\n%s", got)
+	}
+	if !strings.Contains(got, " ip ospf network point-to-point\n") {
+		t.Errorf("missing point-to-point, got:\n%s", got)
+	}
+}

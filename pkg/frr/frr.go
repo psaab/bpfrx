@@ -77,6 +77,14 @@ type FullConfig struct {
 	BackupRouter    string // next-hop IP (e.g. "192.168.50.1")
 	BackupRouterDst string // destination prefix (e.g. "192.168.0.0/16"), default "0.0.0.0/0"
 
+	// InterfaceBandwidths maps interface names to bandwidth in bits per second.
+	// FRR emits "bandwidth <kbps>" in interface blocks (used by OSPF auto-cost).
+	InterfaceBandwidths map[string]uint64
+
+	// InterfacePointToPoint maps interface names to point-to-point flag.
+	// When true and no explicit OSPF network-type is set, emits "ip ospf network point-to-point".
+	InterfacePointToPoint map[string]bool
+
 	// ConsistentHash is set when the forwarding-table export policy uses
 	// "load-balance consistent-hash". The daemon should set
 	// net.ipv4.fib_multipath_hash_policy=1 for L4 ECMP hashing.
@@ -315,6 +323,9 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 		}
 	}
 
+	// Interface-level settings (bandwidth, point-to-point)
+	b.WriteString(m.generateInterfaceSettings(fc))
+
 	// Global dynamic protocols
 	if fc.OSPF != nil || fc.OSPFv3 != nil || fc.BGP != nil || fc.RIP != nil || fc.ISIS != nil {
 		b.WriteString(m.generateProtocols(fc.OSPF, fc.OSPFv3, fc.BGP, fc.RIP, fc.ISIS, "", ecmpMaxPaths, fc.PolicyOptions))
@@ -342,6 +353,63 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	}
 
 	return nil
+}
+
+// generateInterfaceSettings emits FRR interface blocks for bandwidth and
+// point-to-point network type. These are emitted before protocol config so
+// OSPF auto-cost picks up the correct bandwidth.
+func (m *Manager) generateInterfaceSettings(fc *FullConfig) string {
+	if len(fc.InterfaceBandwidths) == 0 && len(fc.InterfacePointToPoint) == 0 {
+		return ""
+	}
+
+	// Build set of interfaces that have explicit OSPF NetworkType so we don't override.
+	ospfNetworkType := make(map[string]bool)
+	if fc.OSPF != nil {
+		for _, area := range fc.OSPF.Areas {
+			for _, iface := range area.Interfaces {
+				if iface.NetworkType != "" {
+					ospfNetworkType[iface.Name] = true
+				}
+			}
+		}
+	}
+
+	// Collect all interface names that need settings.
+	ifaces := make(map[string]bool)
+	for name := range fc.InterfaceBandwidths {
+		ifaces[name] = true
+	}
+	for name := range fc.InterfacePointToPoint {
+		if fc.InterfacePointToPoint[name] && !ospfNetworkType[name] {
+			ifaces[name] = true
+		}
+	}
+
+	// Sort for deterministic output.
+	names := make([]string, 0, len(ifaces))
+	for name := range ifaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	for _, name := range names {
+		fmt.Fprintf(&b, "interface %s\n", name)
+		if bw, ok := fc.InterfaceBandwidths[name]; ok && bw > 0 {
+			// FRR bandwidth command takes kbps
+			kbps := bw / 1000
+			if kbps == 0 {
+				kbps = 1
+			}
+			fmt.Fprintf(&b, " bandwidth %d\n", kbps)
+		}
+		if fc.InterfacePointToPoint[name] && !ospfNetworkType[name] {
+			b.WriteString(" ip ospf network point-to-point\n")
+		}
+		b.WriteString("exit\n!\n")
+	}
+	return b.String()
 }
 
 // generateStaticRoute produces FRR static route commands.

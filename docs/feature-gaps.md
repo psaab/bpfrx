@@ -491,10 +491,9 @@ These features have config parsing in bpfrx but NO runtime effect:
 - Implement per-source-IP and per-dest-IP session counting in BPF conntrack
 - Use per-CPU hash map for session counts, check in xdp_conntrack before creating new session
 
-### Firewall Filter Policers (Tier 1)
-- Add `PolicerConfig` to config types
-- Implement token-bucket in BPF using per-CPU maps for token state
-- Apply at XDP/TC attachment points based on interface filter binding
+### Firewall Filter Policers (Tier 1) — IMPLEMENTED (Sprint FF-1)
+- Single-rate two-color + three-color (RFC 2697/2698) policers in BPF
+- Token-bucket with per-CPU state maps; flexible match conditions; lo0 filter wiring
 
 ### BFD (Tier 1)
 - FRR already has `bfdd` daemon
