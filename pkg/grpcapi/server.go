@@ -3037,23 +3037,18 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 
 	// Handle parameterized topics (prefix:value format)
 	if strings.HasPrefix(req.Topic, "route-table:") {
-		vrfName := strings.TrimPrefix(req.Topic, "route-table:")
+		tableName := strings.TrimPrefix(req.Topic, "route-table:")
 		if s.routing == nil {
 			buf.WriteString("Routing manager not available\n")
 		} else {
-			entries, err := s.routing.GetVRFRoutes(vrfName)
+			entries, err := s.routing.GetTableRoutes(tableName)
 			if err != nil {
-				return nil, status.Errorf(codes.Internal, "get VRF routes: %v", err)
+				return nil, status.Errorf(codes.Internal, "get table routes: %v", err)
 			}
 			if len(entries) == 0 {
-				fmt.Fprintf(&buf, "No routes in table %s\n", vrfName)
+				fmt.Fprintf(&buf, "No routes in table %s\n", tableName)
 			} else {
-				fmt.Fprintf(&buf, "Routing table: %s\n", vrfName)
-				fmt.Fprintf(&buf, "  %-24s %-20s %-14s %-12s %s\n", "Destination", "Next-hop", "Interface", "Proto", "Pref")
-				for _, e := range entries {
-					fmt.Fprintf(&buf, "  %-24s %-20s %-14s %-12s %d\n",
-						e.Destination, e.NextHop, e.Interface, e.Protocol, e.Preference)
-				}
+				buf.WriteString(routing.FormatAllRoutes([]routing.TableRoutes{{Name: tableName, Entries: entries}}))
 			}
 		}
 		return &pb.ShowTextResponse{Output: buf.String()}, nil

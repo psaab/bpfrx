@@ -5147,29 +5147,23 @@ func (c *CLI) showRoutesForInstance(instanceName string) error {
 	return nil
 }
 
-func (c *CLI) showRoutesForVRF(vrfName string) error {
+func (c *CLI) showRoutesForVRF(tableName string) error {
 	if c.routing == nil {
 		fmt.Println("Routing manager not available")
 		return nil
 	}
 
-	entries, err := c.routing.GetVRFRoutes(vrfName)
+	entries, err := c.routing.GetTableRoutes(tableName)
 	if err != nil {
-		return fmt.Errorf("get VRF routes: %w", err)
+		return fmt.Errorf("get table routes: %w", err)
 	}
 
 	if len(entries) == 0 {
-		fmt.Printf("No routes in table %s\n", vrfName)
+		fmt.Printf("No routes in table %s\n", tableName)
 		return nil
 	}
 
-	fmt.Printf("Routing table: %s\n", vrfName)
-	fmt.Printf("  %-24s %-20s %-14s %-12s %s\n",
-		"Destination", "Next-hop", "Interface", "Proto", "Pref")
-	for _, e := range entries {
-		fmt.Printf("  %-24s %-20s %-14s %-12s %d\n",
-			e.Destination, e.NextHop, e.Interface, e.Protocol, e.Preference)
-	}
+	fmt.Print(routing.FormatAllRoutes([]routing.TableRoutes{{Name: tableName, Entries: entries}}))
 	return nil
 }
 

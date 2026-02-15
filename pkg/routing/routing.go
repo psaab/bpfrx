@@ -684,6 +684,50 @@ func (m *Manager) GetVRFRoutes(vrfName string) ([]RouteEntry, error) {
 	return m.GetRoutesForTable(int(vrf.Table))
 }
 
+// GetTableRoutes returns routes for a Junos-style table name (e.g. "inet.0",
+// "inet6.0", "dmz-vr.inet.0", "dmz-vr.inet6.0"). It resolves the VRF and
+// filters by address family.
+func (m *Manager) GetTableRoutes(tableName string) ([]RouteEntry, error) {
+	// Determine VRF name and address family from Junos table name.
+	vrfName := ""
+	isV6 := false
+	switch {
+	case tableName == "inet.0":
+		// main table, IPv4
+	case tableName == "inet6.0":
+		isV6 = true
+	case strings.HasSuffix(tableName, ".inet6.0"):
+		vrfName = strings.TrimSuffix(tableName, ".inet6.0")
+		isV6 = true
+	case strings.HasSuffix(tableName, ".inet.0"):
+		vrfName = strings.TrimSuffix(tableName, ".inet.0")
+	default:
+		// Treat as VRF name directly (backwards compat).
+		vrfName = tableName
+	}
+
+	var entries []RouteEntry
+	var err error
+	if vrfName == "" {
+		entries, err = m.GetRoutes()
+	} else {
+		entries, err = m.GetVRFRoutes(vrfName)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter by address family.
+	var filtered []RouteEntry
+	for _, e := range entries {
+		entryIsV6 := strings.Contains(e.Destination, ":")
+		if entryIsV6 == isV6 {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered, nil
+}
+
 // TableRoutes groups routes by their routing table name.
 type TableRoutes struct {
 	Name    string       // "inet.0", "VRF-name.inet.0", etc.
@@ -691,17 +735,16 @@ type TableRoutes struct {
 }
 
 // GetAllTableRoutes returns routes from the main table and all configured VRFs.
+// IPv4 and IPv6 routes are split into separate inet.0/inet6.0 tables.
 func (m *Manager) GetAllTableRoutes(instances []*config.RoutingInstanceConfig) ([]TableRoutes, error) {
 	var tables []TableRoutes
 
-	// Main table (inet.0)
+	// Main table
 	mainEntries, err := m.GetRoutes()
 	if err != nil {
 		return nil, err
 	}
-	if len(mainEntries) > 0 {
-		tables = append(tables, TableRoutes{Name: "inet.0", Entries: mainEntries})
-	}
+	tables = appendSplitAF(tables, "", mainEntries)
 
 	// Per-VRF tables
 	for _, ri := range instances {
@@ -712,11 +755,34 @@ func (m *Manager) GetAllTableRoutes(instances []*config.RoutingInstanceConfig) (
 		if err != nil {
 			continue
 		}
-		if len(entries) > 0 {
-			tables = append(tables, TableRoutes{Name: ri.Name + ".inet.0", Entries: entries})
-		}
+		tables = appendSplitAF(tables, ri.Name, entries)
 	}
 	return tables, nil
+}
+
+// appendSplitAF splits routes into inet.0 and inet6.0 tables and appends them.
+func appendSplitAF(tables []TableRoutes, prefix string, entries []RouteEntry) []TableRoutes {
+	var v4, v6 []RouteEntry
+	for _, e := range entries {
+		if strings.Contains(e.Destination, ":") {
+			v6 = append(v6, e)
+		} else {
+			v4 = append(v4, e)
+		}
+	}
+	inetName := "inet.0"
+	inet6Name := "inet6.0"
+	if prefix != "" {
+		inetName = prefix + "." + inetName
+		inet6Name = prefix + "." + inet6Name
+	}
+	if len(v4) > 0 {
+		tables = append(tables, TableRoutes{Name: inetName, Entries: v4})
+	}
+	if len(v6) > 0 {
+		tables = append(tables, TableRoutes{Name: inet6Name, Entries: v6})
+	}
+	return tables
 }
 
 // FormatRouteDestination formats matching routes across all tables in Junos style.
@@ -790,50 +856,13 @@ func FormatRouteSummary(allTables []TableRoutes, routerID string) string {
 		if len(table.Entries) == 0 {
 			continue
 		}
-
-		// Split entries by address family.
-		v4ByProto := make(map[string]int)
-		v6ByProto := make(map[string]int)
+		byProto := make(map[string]int)
 		for _, e := range table.Entries {
-			proto := junosProtoName(e.Protocol)
-			if strings.Contains(e.Destination, ":") {
-				v6ByProto[proto]++
-			} else {
-				v4ByProto[proto]++
-			}
+			byProto[junosProtoName(e.Protocol)]++
 		}
-
-		// Determine table name prefix for VRFs.
-		prefix := ""
-		if table.Name != "inet.0" {
-			prefix = strings.TrimSuffix(table.Name, ".inet.0")
-			if prefix == table.Name {
-				prefix = ""
-			} else {
-				prefix += "."
-			}
-		}
-
-		if len(v4ByProto) > 0 {
-			v4Total := 0
-			for _, n := range v4ByProto {
-				v4Total += n
-			}
-			tableName := prefix + "inet.0"
-			fmt.Fprintf(&buf, "\n%s: %d destinations, %d routes (%d active, 0 holddown, 0 hidden)\n",
-				tableName, v4Total, v4Total, v4Total)
-			formatSummaryProtos(&buf, v4ByProto)
-		}
-		if len(v6ByProto) > 0 {
-			v6Total := 0
-			for _, n := range v6ByProto {
-				v6Total += n
-			}
-			tableName := prefix + "inet6.0"
-			fmt.Fprintf(&buf, "\n%s: %d destinations, %d routes (%d active, 0 holddown, 0 hidden)\n",
-				tableName, v6Total, v6Total, v6Total)
-			formatSummaryProtos(&buf, v6ByProto)
-		}
+		fmt.Fprintf(&buf, "\n%s: %d destinations, %d routes (%d active, 0 holddown, 0 hidden)\n",
+			table.Name, len(table.Entries), len(table.Entries), len(table.Entries))
+		formatSummaryProtos(&buf, byProto)
 	}
 	return buf.String()
 }
