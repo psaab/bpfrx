@@ -321,39 +321,64 @@ func (s *Server) Rollback(_ context.Context, req *pb.RollbackRequest) (*pb.Rollb
 
 func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.ShowConfigResponse, error) {
 	var output string
+	hasPath := len(req.Path) > 0
 	switch {
 	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_JSON:
-		output = s.store.ShowActiveJSON()
+		if hasPath {
+			output = s.store.ShowActivePathJSON(req.Path)
+		} else {
+			output = s.store.ShowActiveJSON()
+		}
 	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_SET:
-		output = s.store.ShowActiveSet()
+		if hasPath {
+			output = s.store.ShowActivePathSet(req.Path)
+		} else {
+			output = s.store.ShowActiveSet()
+		}
 	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_XML:
-		output = s.store.ShowActiveXML()
+		if hasPath {
+			output = s.store.ShowActivePathXML(req.Path)
+		} else {
+			output = s.store.ShowActiveXML()
+		}
 	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_INHERITANCE:
-		if len(req.Path) > 0 {
+		if hasPath {
 			output = s.store.ShowActivePathInheritance(req.Path)
 		} else {
 			output = s.store.ShowActiveInheritance()
 		}
 	case req.Target == pb.ConfigTarget_ACTIVE:
-		if len(req.Path) > 0 {
+		if hasPath {
 			output = s.store.ShowActivePath(req.Path)
 		} else {
 			output = s.store.ShowActive()
 		}
 	case req.Format == pb.ConfigFormat_JSON:
-		output = s.store.ShowCandidateJSON()
+		if hasPath {
+			output = s.store.ShowCandidatePathJSON(req.Path)
+		} else {
+			output = s.store.ShowCandidateJSON()
+		}
 	case req.Format == pb.ConfigFormat_SET:
-		output = s.store.ShowCandidateSet()
+		if hasPath {
+			output = s.store.ShowCandidatePathSet(req.Path)
+		} else {
+			output = s.store.ShowCandidateSet()
+		}
 	case req.Format == pb.ConfigFormat_XML:
-		output = s.store.ShowCandidateXML()
+		if hasPath {
+			output = s.store.ShowCandidatePathXML(req.Path)
+		} else {
+			output = s.store.ShowCandidateXML()
+		}
 	case req.Format == pb.ConfigFormat_INHERITANCE:
-		if len(req.Path) > 0 {
+		if hasPath {
 			output = s.store.ShowCandidatePathInheritance(req.Path)
 		} else {
 			output = s.store.ShowCandidateInheritance()
 		}
 	default:
-		if len(req.Path) > 0 {
+		if hasPath {
 			output = s.store.ShowCandidatePath(req.Path)
 		} else {
 			output = s.store.ShowCandidate()

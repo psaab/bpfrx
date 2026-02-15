@@ -903,24 +903,52 @@ func (c *CLI) handleShow(args []string) error {
 
 	case "configuration":
 		rest := strings.Join(args[1:], " ")
-		if strings.Contains(rest, "| display json") {
-			fmt.Print(c.store.ShowActiveJSON())
-		} else if strings.Contains(rest, "| display set") {
-			fmt.Print(c.store.ShowActiveSet())
-		} else if strings.Contains(rest, "| display xml") {
-			fmt.Print(c.store.ShowActiveXML())
-		} else if strings.Contains(rest, "| display inheritance") {
-			var path []string
-			for _, a := range args[1:] {
-				if a == "|" {
-					break
-				}
-				path = append(path, a)
+		// Build path (everything after "configuration" before "|")
+		var cfgPath []string
+		for _, a := range args[1:] {
+			if a == "|" {
+				break
 			}
-			if len(path) > 0 {
-				output := c.store.ShowActivePathInheritance(path)
+			cfgPath = append(cfgPath, a)
+		}
+		if strings.Contains(rest, "| display json") {
+			if len(cfgPath) > 0 {
+				output := c.store.ShowActivePathJSON(cfgPath)
 				if output == "" {
-					fmt.Printf("configuration path not found: %s\n", strings.Join(path, " "))
+					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
+				} else {
+					fmt.Print(output)
+				}
+			} else {
+				fmt.Print(c.store.ShowActiveJSON())
+			}
+		} else if strings.Contains(rest, "| display set") {
+			if len(cfgPath) > 0 {
+				output := c.store.ShowActivePathSet(cfgPath)
+				if output == "" {
+					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
+				} else {
+					fmt.Print(output)
+				}
+			} else {
+				fmt.Print(c.store.ShowActiveSet())
+			}
+		} else if strings.Contains(rest, "| display xml") {
+			if len(cfgPath) > 0 {
+				output := c.store.ShowActivePathXML(cfgPath)
+				if output == "" {
+					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
+				} else {
+					fmt.Print(output)
+				}
+			} else {
+				fmt.Print(c.store.ShowActiveXML())
+			}
+		} else if strings.Contains(rest, "| display inheritance") {
+			if len(cfgPath) > 0 {
+				output := c.store.ShowActivePathInheritance(cfgPath)
+				if output == "" {
+					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
 				} else {
 					fmt.Print(output)
 				}
@@ -934,18 +962,10 @@ func (c *CLI) handleShow(args []string) error {
 			} else if len(pipeParts) > 0 {
 				fmt.Printf("syntax error: unknown pipe command '%s'\n", pipeParts[0])
 			}
-		} else if len(args) > 1 {
-			// Filter out pipe commands from the path
-			var path []string
-			for _, a := range args[1:] {
-				if a == "|" {
-					break
-				}
-				path = append(path, a)
-			}
-			output := c.store.ShowActivePath(path)
+		} else if len(cfgPath) > 0 {
+			output := c.store.ShowActivePath(cfgPath)
 			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(path, " "))
+				fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
 			} else {
 				fmt.Print(output)
 			}
@@ -2244,36 +2264,66 @@ func (c *CLI) handleConfigShow(args []string) error {
 		return nil
 	}
 
-	if strings.Contains(line, "| display json") {
-		fmt.Print(c.store.ShowCandidateJSON())
-		return nil
-	}
-
-	if strings.Contains(line, "| display set") {
-		fmt.Print(c.store.ShowCandidateSet())
-		return nil
-	}
-
-	if strings.Contains(line, "| display xml") {
-		fmt.Print(c.store.ShowCandidateXML())
-		return nil
-	}
-
-	if strings.Contains(line, "| display inheritance") {
-		// Build path from args before the pipe
-		var pathArgs []string
+	// Build path from editPath + args before the pipe (used by all display formats).
+	var displayPath []string
+	{
+		editPath := c.store.GetEditPath()
+		displayPath = append(displayPath, editPath...)
 		for _, a := range args {
 			if a == "|" {
 				break
 			}
-			pathArgs = append(pathArgs, a)
+			displayPath = append(displayPath, a)
 		}
-		editPath := c.store.GetEditPath()
-		fullPath := append(append([]string{}, editPath...), pathArgs...)
-		if len(fullPath) > 0 {
-			output := c.store.ShowCandidatePathInheritance(fullPath)
+	}
+
+	if strings.Contains(line, "| display json") {
+		if len(displayPath) > 0 {
+			output := c.store.ShowCandidatePathJSON(displayPath)
 			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(fullPath, " "))
+				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
+			} else {
+				fmt.Print(output)
+			}
+		} else {
+			fmt.Print(c.store.ShowCandidateJSON())
+		}
+		return nil
+	}
+
+	if strings.Contains(line, "| display set") {
+		if len(displayPath) > 0 {
+			output := c.store.ShowCandidatePathSet(displayPath)
+			if output == "" {
+				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
+			} else {
+				fmt.Print(output)
+			}
+		} else {
+			fmt.Print(c.store.ShowCandidateSet())
+		}
+		return nil
+	}
+
+	if strings.Contains(line, "| display xml") {
+		if len(displayPath) > 0 {
+			output := c.store.ShowCandidatePathXML(displayPath)
+			if output == "" {
+				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
+			} else {
+				fmt.Print(output)
+			}
+		} else {
+			fmt.Print(c.store.ShowCandidateXML())
+		}
+		return nil
+	}
+
+	if strings.Contains(line, "| display inheritance") {
+		if len(displayPath) > 0 {
+			output := c.store.ShowCandidatePathInheritance(displayPath)
+			if output == "" {
+				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
 			} else {
 				fmt.Print(output)
 			}

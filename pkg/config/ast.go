@@ -2158,6 +2158,37 @@ func (t *ConfigTree) FormatSet() string {
 	return b.String()
 }
 
+// FormatPathSet renders a subtree as flat "set" commands.
+// The full path prefix (including parent keys) is included in each set line.
+func (t *ConfigTree) FormatPathSet(path []string) string {
+	if len(path) == 0 {
+		return t.FormatSet()
+	}
+	matches := navigatePath(t.Children, path)
+	if len(matches) == 0 {
+		return ""
+	}
+	// Compute parent prefix: path elements before the matched node's first key.
+	var parentPrefix []string
+	firstKey := matches[0].Keys[0]
+	for _, p := range path {
+		if p == firstKey {
+			break
+		}
+		parentPrefix = append(parentPrefix, p)
+	}
+	var b strings.Builder
+	for _, n := range matches {
+		prefix := append(append([]string{}, parentPrefix...), n.Keys...)
+		if n.IsLeaf {
+			fmt.Fprintf(&b, "set %s\n", strings.Join(prefix, " "))
+		} else {
+			formatSetNodes(&b, n.Children, prefix)
+		}
+	}
+	return b.String()
+}
+
 func formatSetNodes(b *strings.Builder, nodes []*Node, prefix []string) {
 	for _, n := range canonicalOrder(nodes) {
 		path := append(prefix, n.Keys...)
@@ -2179,12 +2210,46 @@ func (t *ConfigTree) FormatJSON() string {
 	return string(data) + "\n"
 }
 
+// FormatPathJSON renders a subtree as a JSON object.
+func (t *ConfigTree) FormatPathJSON(path []string) string {
+	if len(path) == 0 {
+		return t.FormatJSON()
+	}
+	matches := navigatePath(t.Children, path)
+	if len(matches) == 0 {
+		return ""
+	}
+	obj := nodesToJSON(matches)
+	data, err := json.MarshalIndent(obj, "", "  ")
+	if err != nil {
+		return "{}"
+	}
+	return string(data) + "\n"
+}
+
 // FormatXML renders the tree as Junos-style XML configuration.
 func (t *ConfigTree) FormatXML() string {
 	var b strings.Builder
 	b.WriteString(xml.Header)
 	b.WriteString("<configuration>\n")
 	formatXMLNodes(&b, t.Children, 1)
+	b.WriteString("</configuration>\n")
+	return b.String()
+}
+
+// FormatPathXML renders a subtree as Junos-style XML.
+func (t *ConfigTree) FormatPathXML(path []string) string {
+	if len(path) == 0 {
+		return t.FormatXML()
+	}
+	matches := navigatePath(t.Children, path)
+	if len(matches) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(xml.Header)
+	b.WriteString("<configuration>\n")
+	formatXMLNodes(&b, matches, 1)
 	b.WriteString("</configuration>\n")
 	return b.String()
 }

@@ -1085,11 +1085,35 @@ func (s *Store) ShowActiveSet() string {
 	return s.active.FormatSet()
 }
 
+// ShowActivePathSet returns an active config subtree as flat set commands.
+func (s *Store) ShowActivePathSet(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.active.FormatPathSet(path)
+}
+
+// ShowCandidatePathSet returns a candidate config subtree as flat set commands.
+func (s *Store) ShowCandidatePathSet(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate != nil {
+		return s.candidate.FormatPathSet(path)
+	}
+	return ""
+}
+
 // ShowActiveJSON returns the active configuration as JSON.
 func (s *Store) ShowActiveJSON() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.active.FormatJSON()
+}
+
+// ShowActivePathJSON returns an active config subtree as JSON.
+func (s *Store) ShowActivePathJSON(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.active.FormatPathJSON(path)
 }
 
 // ShowCandidateJSON returns the candidate configuration as JSON.
@@ -1102,11 +1126,28 @@ func (s *Store) ShowCandidateJSON() string {
 	return "{}\n"
 }
 
+// ShowCandidatePathJSON returns a candidate config subtree as JSON.
+func (s *Store) ShowCandidatePathJSON(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate != nil {
+		return s.candidate.FormatPathJSON(path)
+	}
+	return ""
+}
+
 // ShowActiveXML returns the active configuration as XML.
 func (s *Store) ShowActiveXML() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.active.FormatXML()
+}
+
+// ShowActivePathXML returns an active config subtree as XML.
+func (s *Store) ShowActivePathXML(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.active.FormatPathXML(path)
 }
 
 // ShowCandidateXML returns the candidate configuration as XML.
@@ -1117,6 +1158,16 @@ func (s *Store) ShowCandidateXML() string {
 		return s.candidate.FormatXML()
 	}
 	return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<configuration>\n</configuration>\n"
+}
+
+// ShowCandidatePathXML returns a candidate config subtree as XML.
+func (s *Store) ShowCandidatePathXML(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate != nil {
+		return s.candidate.FormatPathXML(path)
+	}
+	return ""
 }
 
 // ShowCandidateInheritance returns the candidate with groups expanded and
