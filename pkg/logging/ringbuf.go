@@ -257,7 +257,15 @@ func (er *EventReader) logEvent(data []byte) {
 		cb(rec, data)
 	}
 
-	// Log to slog (existing behavior)
+	// Log to slog (existing behavior) — use resolved zone names
+	inZone := rec.InZoneName
+	if inZone == "" {
+		inZone = fmt.Sprintf("%d", evt.IngressZone)
+	}
+	outZone := rec.OutZoneName
+	if outZone == "" {
+		outZone = fmt.Sprintf("%d", evt.EgressZone)
+	}
 	if evt.EventType == dataplane.EventTypeSessionClose {
 		slog.Info("firewall event",
 			"type", eventName,
@@ -266,8 +274,8 @@ func (er *EventReader) logEvent(data []byte) {
 			"proto", protoStr,
 			"action", actionStr,
 			"policy_id", evt.PolicyID,
-			"ingress_zone", evt.IngressZone,
-			"egress_zone", evt.EgressZone,
+			"ingress_zone", inZone,
+			"egress_zone", outZone,
 			"session_packets", rec.SessionPkts,
 			"session_bytes", rec.SessionBytes)
 	} else if evt.EventType == dataplane.EventTypeScreenDrop {
@@ -278,7 +286,7 @@ func (er *EventReader) logEvent(data []byte) {
 			"dst", dstStr,
 			"proto", protoStr,
 			"action", actionStr,
-			"ingress_zone", evt.IngressZone)
+			"ingress_zone", inZone)
 	} else {
 		slog.Info("firewall event",
 			"type", eventName,
@@ -287,8 +295,8 @@ func (er *EventReader) logEvent(data []byte) {
 			"proto", protoStr,
 			"action", actionStr,
 			"policy_id", evt.PolicyID,
-			"ingress_zone", evt.IngressZone,
-			"egress_zone", evt.EgressZone)
+			"ingress_zone", inZone,
+			"egress_zone", outZone)
 	}
 
 	// Forward to syslog clients
@@ -378,22 +386,30 @@ func eventSeverity(eventType uint8) int {
 
 // formatSyslogMsg formats an EventRecord as a syslog message body.
 func formatSyslogMsg(rec EventRecord) string {
+	inZone := rec.InZoneName
+	if inZone == "" {
+		inZone = fmt.Sprintf("%d", rec.InZone)
+	}
+	outZone := rec.OutZoneName
+	if outZone == "" {
+		outZone = fmt.Sprintf("%d", rec.OutZone)
+	}
 	if rec.Type == "SCREEN_DROP" {
-		return fmt.Sprintf("RT_FLOW %s screen=%s src=%s dst=%s proto=%s action=%s zone=%d",
-			rec.Type, rec.ScreenCheck, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action, rec.InZone)
+		return fmt.Sprintf("RT_FLOW %s screen=%s src=%s dst=%s proto=%s action=%s zone=%s",
+			rec.Type, rec.ScreenCheck, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action, inZone)
 	}
 	if rec.Type == "SESSION_CLOSE" {
-		return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s policy=%d zone=%d->%d pkts=%d bytes=%d",
+		return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s policy=%d zone=%s->%s pkts=%d bytes=%d",
 			rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action,
-			rec.PolicyID, rec.InZone, rec.OutZone, rec.SessionPkts, rec.SessionBytes)
+			rec.PolicyID, inZone, outZone, rec.SessionPkts, rec.SessionBytes)
 	}
 	if rec.Type == "FILTER_LOG" {
-		return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s zone=%d",
-			rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action, rec.InZone)
+		return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s zone=%s",
+			rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action, inZone)
 	}
-	return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s policy=%d zone=%d->%d",
+	return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s policy=%d zone=%s->%s",
 		rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action,
-		rec.PolicyID, rec.InZone, rec.OutZone)
+		rec.PolicyID, inZone, outZone)
 }
 
 // formatStructuredMsg formats an EventRecord as a Junos-compatible structured
