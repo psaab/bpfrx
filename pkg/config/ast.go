@@ -1095,6 +1095,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				}},
 			}},
 			"control-interface": {args: 1, children: nil},
+			"peer-address":     {args: 1, children: nil},
 			"redundancy-group": {args: 1, children: map[string]*schemaNode{
 				"node": {args: 1, children: map[string]*schemaNode{
 					"priority": {args: 1, children: nil},

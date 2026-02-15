@@ -146,6 +146,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cluster.Start(ctx)
 		slog.Info("cluster manager initialized",
 			"node", cc.NodeID, "cluster", cc.ClusterID)
+
+		// Start heartbeat if control-interface and peer-address are configured.
+		if cc.ControlInterface != "" && cc.PeerAddress != "" {
+			localIP := resolveInterfaceAddr(cc.ControlInterface, "")
+			if localIP != "" {
+				if err := d.cluster.StartHeartbeat(localIP, cc.PeerAddress); err != nil {
+					slog.Warn("failed to start cluster heartbeat", "err", err)
+				}
+			} else {
+				slog.Warn("cluster: control interface has no IPv4 address, heartbeat deferred",
+					"interface", cc.ControlInterface)
+			}
+		}
 	}
 
 	// Enable IP forwarding — required for the firewall to route packets.

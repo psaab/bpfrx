@@ -31,7 +31,8 @@ type ClusterConfig struct {
 	RethCount          int
 	HeartbeatInterval  int    // milliseconds, 0=default(1000)
 	HeartbeatThreshold int    // missed heartbeats before lost, 0=default(3)
-	ControlInterface   string // interface for heartbeat traffic (e.g. "fab0")
+	ControlInterface   string // interface for heartbeat traffic (e.g. "hb0")
+	PeerAddress        string // peer node's control link IP (e.g. "10.99.0.2")
 	ControlLinkRecovery bool  // enable control-link-recovery
 	RedundancyGroups   []*RedundancyGroup
 }

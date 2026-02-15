@@ -86,6 +86,40 @@ test-logs:
 test-journal:
 	./test/incus/setup.sh journal
 
+# Cluster HA test environment (two-VM chassis cluster)
+NODE ?= all
+.PHONY: cluster-init cluster-create cluster-deploy cluster-destroy cluster-status cluster-ssh cluster-logs cluster-start cluster-stop cluster-restart
+
+cluster-init:
+	./test/incus/cluster-setup.sh init
+
+cluster-create:
+	./test/incus/cluster-setup.sh create
+
+cluster-deploy: build build-ctl
+	./test/incus/cluster-setup.sh deploy $(NODE)
+
+cluster-destroy:
+	./test/incus/cluster-setup.sh destroy
+
+cluster-status:
+	./test/incus/cluster-setup.sh status
+
+cluster-ssh:
+	./test/incus/cluster-setup.sh ssh $(NODE)
+
+cluster-logs:
+	./test/incus/cluster-setup.sh logs $(NODE)
+
+cluster-start:
+	./test/incus/cluster-setup.sh start $(NODE)
+
+cluster-stop:
+	./test/incus/cluster-setup.sh stop $(NODE)
+
+cluster-restart:
+	./test/incus/cluster-setup.sh restart $(NODE)
+
 # --- DPDK targets (require dpdk-dev, meson, ninja) ---
 
 build-dpdk-worker:
