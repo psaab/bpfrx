@@ -266,6 +266,7 @@ message SessionEntry {
   string egress_zone_name = 18;
   int64 idle_seconds = 19;
   string application = 20;        // resolved application name
+  string policy_name = 21;        // resolved policy name
 }
 
 message GetSessionSummaryRequest {}

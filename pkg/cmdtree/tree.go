@@ -134,8 +134,18 @@ var OperationalTree = map[string]*Node{
 						names = append(names, name)
 					}
 					return names
+				}, Children: map[string]*Node{
+					"to-zone": {Desc: "Filter by destination zone", DynamicFn: func(cfg *config.Config) []string {
+						if cfg == nil {
+							return nil
+						}
+						names := make([]string, 0, len(cfg.Security.Zones))
+						for name := range cfg.Security.Zones {
+							names = append(names, name)
+						}
+						return names
+					}},
 				}},
-				"to-zone": {Desc: "Filter by destination zone"},
 			}},
 			"screen": {Desc: "Show screen/IDS profiles", Children: map[string]*Node{
 				"ids-option": {Desc: "Show configured screen profile", DynamicFn: func(cfg *config.Config) []string {
@@ -501,14 +511,15 @@ func HelpCandidates(tree map[string]*Node) []Candidate {
 func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg *config.Config) []string {
 	current := tree
 	var currentNode *Node
+	dynamicConsumed := false
 	for _, w := range words {
+		dynamicConsumed = false
 		node, ok := current[w]
 		if !ok {
 			// Word not in static children — if parent has DynamicFn,
 			// treat as a dynamic value and stay at same children level.
 			if currentNode != nil && currentNode.DynamicFn != nil {
-				// Don't advance current — dynamic value consumed,
-				// next completion should offer same static children.
+				dynamicConsumed = true
 				continue
 			}
 			return nil
@@ -523,7 +534,7 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 		current = node.Children
 	}
 	candidates := KeysOf(current)
-	if currentNode != nil && currentNode.DynamicFn != nil && cfg != nil {
+	if !dynamicConsumed && currentNode != nil && currentNode.DynamicFn != nil && cfg != nil {
 		candidates = append(candidates, currentNode.DynamicFn(cfg)...)
 	}
 	return FilterPrefix(candidates, partial)
@@ -533,12 +544,15 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial string, cfg *config.Config) []Candidate {
 	current := tree
 	var currentNode *Node
+	dynamicConsumed := false
 	for _, w := range words {
+		dynamicConsumed = false
 		node, ok := current[w]
 		if !ok {
 			// Word not in static children — if parent has DynamicFn,
 			// treat as a dynamic value and stay at same children level.
 			if currentNode != nil && currentNode.DynamicFn != nil {
+				dynamicConsumed = true
 				continue
 			}
 			return nil
@@ -565,7 +579,7 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 			candidates = append(candidates, Candidate{Name: name, Desc: node.Desc})
 		}
 	}
-	if currentNode != nil && currentNode.DynamicFn != nil && cfg != nil {
+	if !dynamicConsumed && currentNode != nil && currentNode.DynamicFn != nil && cfg != nil {
 		for _, name := range currentNode.DynamicFn(cfg) {
 			if strings.HasPrefix(name, partial) {
 				candidates = append(candidates, Candidate{Name: name, Desc: "(configured)"})

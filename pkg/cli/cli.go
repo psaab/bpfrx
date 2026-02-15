@@ -209,7 +209,24 @@ func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
 	if cc.cli.store.InConfigMode() {
 		candidates = cc.cli.completeConfigWithDesc(words, partial)
 	} else {
-		candidates = completeFromTreeWithDesc(operationalTree, words, partial, cc.cli.store.ActiveConfig())
+		// "show configuration <path>" — delegate sub-path to config schema
+		if len(words) >= 2 && words[0] == "show" && words[1] == "configuration" {
+			subPath := words[2:]
+			if partial != "" {
+				subPath = append(subPath, partial)
+			}
+			schemaCompletions := config.CompleteSetPathWithValues(subPath, cc.cli.valueProvider)
+			if schemaCompletions != nil {
+				for _, sc := range schemaCompletions {
+					if partial == "" || strings.HasPrefix(sc.Name, partial) {
+						candidates = append(candidates, completionCandidate{name: sc.Name, desc: sc.Desc})
+					}
+				}
+			}
+		}
+		if len(candidates) == 0 {
+			candidates = completeFromTreeWithDesc(operationalTree, words, partial, cc.cli.store.ActiveConfig())
+		}
 	}
 	if len(candidates) == 0 {
 		return nil, 0
@@ -377,7 +394,24 @@ func (c *CLI) Run() error {
 			if c.store.InConfigMode() {
 				candidates = c.completeConfigWithDesc(words, partial)
 			} else {
-				candidates = completeFromTreeWithDesc(operationalTree, words, partial, c.store.ActiveConfig())
+				// "show configuration <path>" — delegate sub-path to config schema
+				if len(words) >= 2 && words[0] == "show" && words[1] == "configuration" {
+					subPath := words[2:]
+					if partial != "" {
+						subPath = append(subPath, partial)
+					}
+					schemaCompletions := config.CompleteSetPathWithValues(subPath, c.valueProvider)
+					if schemaCompletions != nil {
+						for _, sc := range schemaCompletions {
+							if partial == "" || strings.HasPrefix(sc.Name, partial) {
+								candidates = append(candidates, completionCandidate{name: sc.Name, desc: sc.Desc})
+							}
+						}
+					}
+				}
+				if len(candidates) == 0 {
+					candidates = completeFromTreeWithDesc(operationalTree, words, partial, c.store.ActiveConfig())
+				}
 			}
 			if len(candidates) > 0 {
 				writeCompletionHelp(c.rl.Stdout(), candidates)
@@ -3001,12 +3035,14 @@ func (c *CLI) showFlowSession(args []string) error {
 			"ID", "Source", "Destination", "Proto", "Zone", "NAT", "State", "Age", "Pkts(f/r)")
 	}
 
-	// Build reverse zone ID → name map
+	// Build reverse zone ID → name map and policy name map
 	zoneNames := make(map[uint16]string)
+	var policyNames map[uint32]string
 	if cr := c.dp.LastCompileResult(); cr != nil {
 		for name, id := range cr.ZoneIDs {
 			zoneNames[id] = name
 		}
+		policyNames = cr.PolicyNames
 	}
 
 	now := monotonicSeconds()
@@ -3087,8 +3123,12 @@ func (c *CLI) showFlowSession(args []string) error {
 		if now > val.LastSeen {
 			idle = now - val.LastSeen
 		}
-		fmt.Printf("Session ID: %d, Policy: %d, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
-			count, val.PolicyID, stateName, val.Timeout, age, idle)
+		polName := policyNames[val.PolicyID]
+		if polName == "" {
+			polName = fmt.Sprintf("%d", val.PolicyID)
+		}
+		fmt.Printf("Session ID: %d, Policy: %s, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
+			count, polName, stateName, val.Timeout, age, idle)
 		fmt.Printf("  In: %s:%d --> %s:%d;%s,",
 			srcIP, srcPort, dstIP, dstPort, protoName)
 		fmt.Printf(" Zone: %s -> %s\n", inZone, outZone)
@@ -3193,8 +3233,12 @@ func (c *CLI) showFlowSession(args []string) error {
 		if now > val.LastSeen {
 			idle = now - val.LastSeen
 		}
-		fmt.Printf("Session ID: %d, Policy: %d, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
-			count, val.PolicyID, stateName, val.Timeout, age, idle)
+		polName := policyNames[val.PolicyID]
+		if polName == "" {
+			polName = fmt.Sprintf("%d", val.PolicyID)
+		}
+		fmt.Printf("Session ID: %d, Policy: %s, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
+			count, polName, stateName, val.Timeout, age, idle)
 		fmt.Printf("  In: [%s]:%d --> [%s]:%d;%s,",
 			srcIP, srcPort, dstIP, dstPort, protoName)
 		fmt.Printf(" Zone: %s -> %s\n", inZone, outZone)

@@ -2383,7 +2383,8 @@ type SessionEntry struct {
 	IngressZoneName string                 `protobuf:"bytes,17,opt,name=ingress_zone_name,json=ingressZoneName,proto3" json:"ingress_zone_name,omitempty"`
 	EgressZoneName  string                 `protobuf:"bytes,18,opt,name=egress_zone_name,json=egressZoneName,proto3" json:"egress_zone_name,omitempty"`
 	IdleSeconds     int64                  `protobuf:"varint,19,opt,name=idle_seconds,json=idleSeconds,proto3" json:"idle_seconds,omitempty"`
-	Application     string                 `protobuf:"bytes,20,opt,name=application,proto3" json:"application,omitempty"` // resolved application name
+	Application     string                 `protobuf:"bytes,20,opt,name=application,proto3" json:"application,omitempty"`                 // resolved application name
+	PolicyName      string                 `protobuf:"bytes,21,opt,name=policy_name,json=policyName,proto3" json:"policy_name,omitempty"` // resolved policy name
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -2554,6 +2555,13 @@ func (x *SessionEntry) GetIdleSeconds() int64 {
 func (x *SessionEntry) GetApplication() string {
 	if x != nil {
 		return x.Application
+	}
+	return ""
+}
+
+func (x *SessionEntry) GetPolicyName() string {
+	if x != nil {
+		return x.PolicyName
 	}
 	return ""
 }
@@ -6512,7 +6520,7 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x05total\x18\x01 \x01(\x05R\x05total\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x05R\x06offset\x122\n" +
-	"\bsessions\x18\x04 \x03(\v2\x16.bpfrx.v1.SessionEntryR\bsessions\"\x80\x05\n" +
+	"\bsessions\x18\x04 \x03(\v2\x16.bpfrx.v1.SessionEntryR\bsessions\"\xa1\x05\n" +
 	"\fSessionEntry\x12\x19\n" +
 	"\bsrc_addr\x18\x01 \x01(\tR\asrcAddr\x12\x19\n" +
 	"\bdst_addr\x18\x02 \x01(\tR\adstAddr\x12\x19\n" +
@@ -6538,7 +6546,9 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x11ingress_zone_name\x18\x11 \x01(\tR\x0fingressZoneName\x12(\n" +
 	"\x10egress_zone_name\x18\x12 \x01(\tR\x0eegressZoneName\x12!\n" +
 	"\fidle_seconds\x18\x13 \x01(\x03R\vidleSeconds\x12 \n" +
-	"\vapplication\x18\x14 \x01(\tR\vapplication\"\x1a\n" +
+	"\vapplication\x18\x14 \x01(\tR\vapplication\x12\x1f\n" +
+	"\vpolicy_name\x18\x15 \x01(\tR\n" +
+	"policyName\"\x1a\n" +
 	"\x18GetSessionSummaryRequest\"\x99\x02\n" +
 	"\x19GetSessionSummaryResponse\x12#\n" +
 	"\rtotal_entries\x18\x01 \x01(\x05R\ftotalEntries\x12!\n" +
@@ -6791,12 +6801,13 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x06action\x18\x01 \x01(\tR\x06action\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\"0\n" +
 	"\x14SystemActionResponse\x12\x18\n" +
-	"\amessage\x18\x01 \x01(\tR\amessage*<\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage*M\n" +
 	"\fConfigFormat\x12\x10\n" +
 	"\fHIERARCHICAL\x10\x00\x12\a\n" +
 	"\x03SET\x10\x01\x12\b\n" +
 	"\x04JSON\x10\x02\x12\a\n" +
-	"\x03XML\x10\x03*)\n" +
+	"\x03XML\x10\x03\x12\x0f\n" +
+	"\vINHERITANCE\x10\x04*)\n" +
 	"\fConfigTarget\x12\r\n" +
 	"\tCANDIDATE\x10\x00\x12\n" +
 	"\n" +

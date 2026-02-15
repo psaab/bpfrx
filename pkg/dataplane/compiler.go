@@ -21,12 +21,13 @@ import (
 
 // CompileResult holds the result of a config compilation for reference.
 type CompileResult struct {
-	ZoneIDs    map[string]uint16 // zone name -> zone ID
-	ScreenIDs  map[string]uint16 // screen profile name -> profile ID (1-based)
-	AddrIDs    map[string]uint32 // address name -> address ID
-	AppIDs     map[string]uint32 // application name -> app ID
-	PoolIDs    map[string]uint8  // NAT pool name -> pool ID (0-based)
-	PolicySets int               // number of policy sets created
+	ZoneIDs     map[string]uint16  // zone name -> zone ID
+	ScreenIDs   map[string]uint16  // screen profile name -> profile ID (1-based)
+	AddrIDs     map[string]uint32  // address name -> address ID
+	AppIDs      map[string]uint32  // application name -> app ID
+	PoolIDs     map[string]uint8   // NAT pool name -> pool ID (0-based)
+	PolicyNames map[uint32]string  // rule_id -> "from-zone/to-zone/policy-name" (or "global/policy-name")
+	PolicySets  int                // number of policy sets created
 	FilterIDs  map[string]uint32 // "inet:name" or "inet6:name" -> filter_id
 
 	Lo0FilterV4 uint32 // lo0 inet filter ID (0=none), set by compileFirewallFilters
@@ -1108,6 +1109,7 @@ func resolveSNATMatchAddr(dp DataPlane,cidr string, result *CompileResult) (uint
 func compilePolicies(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenPolicySets := make(map[ZonePairKey]bool)
+	result.PolicyNames = make(map[uint32]string)
 
 	policySetID := uint32(0)
 
@@ -1232,6 +1234,8 @@ func compilePolicies(dp DataPlane,cfg *config.Config, result *CompileResult) err
 					pol.Name, i, err)
 			}
 
+			result.PolicyNames[rule.RuleID] = pol.Name
+
 			slog.Debug("policy rule compiled",
 				"from", zpp.FromZone, "to", zpp.ToZone,
 				"policy", pol.Name, "action", rule.Action,
@@ -1345,6 +1349,8 @@ func compilePolicies(dp DataPlane,cfg *config.Config, result *CompileResult) err
 			if err := dp.SetPolicyRule(policySetID, uint32(i), rule); err != nil {
 				return fmt.Errorf("set global policy rule %s[%d]: %w", pol.Name, i, err)
 			}
+
+			result.PolicyNames[rule.RuleID] = pol.Name
 
 			slog.Debug("global policy rule compiled",
 				"policy", pol.Name, "action", rule.Action,

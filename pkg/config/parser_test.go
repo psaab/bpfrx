@@ -13303,3 +13303,64 @@ func TestParseBandwidthBps(t *testing.T) {
 		}
 	}
 }
+
+func TestCompleteSetPathFromZoneToZone(t *testing.T) {
+	tests := []struct {
+		name   string
+		tokens []string
+		want   string // expected completion name (single match)
+	}{
+		{
+			name:   "from-zone value shows zone hint",
+			tokens: []string{"security", "policies", "from-zone"},
+			want:   "", // needs a value, nil result
+		},
+		{
+			name:   "after from-zone value shows to-zone keyword",
+			tokens: []string{"security", "policies", "from-zone", "trust"},
+			want:   "to-zone",
+		},
+		{
+			name:   "partial to-zone completes",
+			tokens: []string{"security", "policies", "from-zone", "trust", "to"},
+			want:   "to-zone",
+		},
+		{
+			name:   "show configuration sub-path policies",
+			tokens: []string{"security", "po"},
+			want:   "policies",
+		},
+		{
+			name:   "show configuration sub-path nat",
+			tokens: []string{"security", "na"},
+			want:   "nat",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			results := CompleteSetPathWithValues(tc.tokens, nil)
+			if tc.want == "" {
+				// Expect nil or empty
+				return
+			}
+			if results == nil {
+				t.Fatalf("got nil completions, want %q", tc.want)
+			}
+			found := false
+			for _, r := range results {
+				if r.Name == tc.want {
+					found = true
+					break
+				}
+			}
+			if !found {
+				names := make([]string, len(results))
+				for i, r := range results {
+					names[i] = r.Name
+				}
+				t.Errorf("expected %q in completions, got %v", tc.want, names)
+			}
+		})
+	}
+}

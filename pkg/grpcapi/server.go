@@ -703,12 +703,14 @@ func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb
 	var all []*pb.SessionEntry
 	idx := 0
 
-	// Build reverse zone ID → name map
+	// Build reverse zone ID → name map and policy name map
 	zoneNames := make(map[uint16]string)
+	var policyNames map[uint32]string
 	if cr := s.dp.LastCompileResult(); cr != nil {
 		for name, id := range cr.ZoneIDs {
 			zoneNames[id] = name
 		}
+		policyNames = cr.PolicyNames
 	}
 
 	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
@@ -741,7 +743,7 @@ func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb
 			return true
 		}
 		if idx >= offset && len(all) < limit {
-			se := sessionEntryV4(key, val, now, zoneNames)
+			se := sessionEntryV4(key, val, now, zoneNames, policyNames)
 			se.Application = resolveAppName(key.Protocol, ntohs(key.DstPort), cfg)
 			all = append(all, se)
 		}
@@ -779,7 +781,7 @@ func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb
 			return true
 		}
 		if idx >= offset && len(all) < limit {
-			se := sessionEntryV6(key, val, now, zoneNames)
+			se := sessionEntryV6(key, val, now, zoneNames, policyNames)
 			se.Application = resolveAppName(key.Protocol, ntohs(key.DstPort), cfg)
 			all = append(all, se)
 		}
@@ -2186,9 +2188,7 @@ func (s *Server) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Compl
 	if req.ConfigMode {
 		pairs = s.completeConfigPairs(words, partial)
 	} else {
-		for _, name := range s.completeOperational(words, partial) {
-			pairs = append(pairs, completionPair{name: name})
-		}
+		pairs = s.completeOperationalPairs(words, partial)
 	}
 
 	sort.Slice(pairs, func(i, j int) bool { return pairs[i].name < pairs[j].name })
@@ -2236,9 +2236,33 @@ func (s *Server) completePipeFilter(text string) []string {
 	return candidates
 }
 
-func (s *Server) completeOperational(words []string, partial string) []string {
+func (s *Server) completeOperationalPairs(words []string, partial string) []completionPair {
+	// "show configuration <path>" — delegate sub-path to config schema
+	if len(words) >= 2 && words[0] == "show" && words[1] == "configuration" {
+		subPath := words[2:]
+		if partial != "" {
+			subPath = append(subPath, partial)
+		}
+		schemaCompletions := config.CompleteSetPathWithValues(subPath, s.valueProvider)
+		if schemaCompletions != nil {
+			var pairs []completionPair
+			for _, sc := range schemaCompletions {
+				if partial == "" || strings.HasPrefix(sc.Name, partial) {
+					pairs = append(pairs, completionPair{name: sc.Name, desc: sc.Desc})
+				}
+			}
+			if len(pairs) > 0 {
+				return pairs
+			}
+		}
+	}
 	cfg := s.store.ActiveConfig()
-	return cmdtree.CompleteFromTree(cmdtree.OperationalTree, words, partial, cfg)
+	candidates := cmdtree.CompleteFromTreeWithDesc(cmdtree.OperationalTree, words, partial, cfg)
+	pairs := make([]completionPair, len(candidates))
+	for i, c := range candidates {
+		pairs[i] = completionPair{name: c.Name, desc: c.Desc}
+	}
+	return pairs
 }
 
 func (s *Server) completeConfigPairs(words []string, partial string) []completionPair {
@@ -2481,7 +2505,7 @@ func uint32ToIP(v uint32) net.IP {
 	return ip
 }
 
-func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, zoneNames map[uint16]string) *pb.SessionEntry {
+func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string) *pb.SessionEntry {
 	se := &pb.SessionEntry{
 		SrcAddr:         net.IP(key.SrcIP[:]).String(),
 		DstAddr:         net.IP(key.DstIP[:]).String(),
@@ -2490,6 +2514,7 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 		Protocol:        protoName(key.Protocol),
 		State:           sessionStateName(val.State),
 		PolicyId:        val.PolicyID,
+		PolicyName:      policyNames[val.PolicyID],
 		IngressZone:     uint32(val.IngressZone),
 		EgressZone:      uint32(val.EgressZone),
 		IngressZoneName: zoneNames[val.IngressZone],
@@ -2515,7 +2540,7 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 	return se
 }
 
-func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, zoneNames map[uint16]string) *pb.SessionEntry {
+func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string) *pb.SessionEntry {
 	se := &pb.SessionEntry{
 		SrcAddr:         net.IP(key.SrcIP[:]).String(),
 		DstAddr:         net.IP(key.DstIP[:]).String(),
@@ -2524,6 +2549,7 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 		Protocol:        protoName(key.Protocol),
 		State:           sessionStateName(val.State),
 		PolicyId:        val.PolicyID,
+		PolicyName:      policyNames[val.PolicyID],
 		IngressZone:     uint32(val.IngressZone),
 		EgressZone:      uint32(val.EgressZone),
 		IngressZoneName: zoneNames[val.IngressZone],

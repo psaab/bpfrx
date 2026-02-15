@@ -20,12 +20,15 @@ type completionCandidate struct {
 func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, partial string, cfg *config.Config) []completionCandidate {
 	current := tree
 	var currentNode *completionNode
+	dynamicConsumed := false // true when last word was a dynamic value
 	for _, w := range words {
+		dynamicConsumed = false
 		node, ok := current[w]
 		if !ok {
 			// Word not in static children — if parent has DynamicFn,
 			// treat as a dynamic value and stay at same children level.
 			if currentNode != nil && currentNode.DynamicFn != nil {
+				dynamicConsumed = true
 				continue
 			}
 			return nil
@@ -52,7 +55,9 @@ func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, p
 			candidates = append(candidates, completionCandidate{name: name, desc: node.Desc})
 		}
 	}
-	if currentNode != nil && currentNode.DynamicFn != nil && cfg != nil {
+	// Only add dynamic values if we haven't just consumed one (avoids showing
+	// zone names again after "from-zone trust" when "to-zone" is the next keyword).
+	if !dynamicConsumed && currentNode != nil && currentNode.DynamicFn != nil && cfg != nil {
 		for _, name := range currentNode.DynamicFn(cfg) {
 			if strings.HasPrefix(name, partial) {
 				candidates = append(candidates, completionCandidate{name: name, desc: "(configured)"})

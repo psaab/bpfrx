@@ -664,13 +664,15 @@ type ValueProvider func(hint ValueHint, path []string) []SchemaCompletion
 // schemaNode defines a container keyword in the Junos config hierarchy.
 // It tells SetPath how to group flat path tokens into the correct tree structure.
 type schemaNode struct {
-	args        int                    // extra tokens consumed as part of this node's key
-	children    map[string]*schemaNode // known container children
-	wildcard    *schemaNode            // matches any keyword not in children (for dynamic names)
-	multi       bool                   // true = multiple leaf values allowed (e.g. source-address); false = replace on set
-	valueHint   ValueHint              // hint for dynamic value completion (when args > 0)
-	desc        string                 // description shown in completion help
-	placeholder string                 // Junos-style placeholder (e.g., "<interface-name>")
+	args         int                    // extra tokens consumed as part of this node's key
+	children     map[string]*schemaNode // known container children
+	wildcard     *schemaNode            // matches any keyword not in children (for dynamic names)
+	multi        bool                   // true = multiple leaf values allowed (e.g. source-address); false = replace on set
+	valueHint    ValueHint              // hint for dynamic value completion (when args > 0)
+	desc         string                 // description shown in completion help
+	placeholder  string                 // Junos-style placeholder (e.g., "<interface-name>")
+	midKeyword   string                 // fixed keyword in the middle of args (e.g., "to-zone")
+	midKeywordAt int                    // 1-based arg position where midKeyword appears (e.g., 2 for "from-zone X to-zone Y")
 }
 
 // setSchema defines the Junos configuration tree structure.
@@ -693,7 +695,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"policies": {children: map[string]*schemaNode{
-			"from-zone": {args: 3, valueHint: ValueHintZoneName, children: map[string]*schemaNode{ // from-zone X to-zone Y
+			"from-zone": {args: 3, valueHint: ValueHintZoneName, midKeyword: "to-zone", midKeywordAt: 2, children: map[string]*schemaNode{
 				"policy": {args: 1, children: map[string]*schemaNode{
 					"description": {args: 1, children: nil},
 					"match": {children: map[string]*schemaNode{
@@ -2024,6 +2026,25 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []Schema
 
 		if i > len(tokens) {
 			// Still consuming args for this node — user needs to type a value.
+			startIdx := i - nodeKeyCount
+			consumed := end - startIdx // tokens consumed for this node (including keyword)
+
+			// Check for fixed keyword in the middle of args (e.g., "to-zone" in "from-zone X to-zone Y").
+			if childSchema.midKeyword != "" && childSchema.midKeywordAt > 0 {
+				nextPos := consumed // 0-indexed position to complete next (0=keyword, 1=arg1, ...)
+				// If the last consumed token is a partial match for the midKeyword, suggest it.
+				if nextPos == childSchema.midKeywordAt+1 && consumed > 1 {
+					lastToken := tokens[end-1]
+					if lastToken != childSchema.midKeyword && strings.HasPrefix(childSchema.midKeyword, lastToken) {
+						return []SchemaCompletion{{Name: childSchema.midKeyword, Desc: "Destination zone"}}
+					}
+				}
+				// If we need to complete the midKeyword position, suggest it.
+				if nextPos == childSchema.midKeywordAt {
+					return []SchemaCompletion{{Name: childSchema.midKeyword, Desc: "Destination zone"}}
+				}
+			}
+
 			// Try to provide dynamic values via the provider.
 			if provider != nil && childSchema.valueHint != ValueHintNone {
 				results := provider(childSchema.valueHint, path)

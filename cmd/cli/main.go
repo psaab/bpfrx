@@ -1120,8 +1120,12 @@ func (c *ctl) showFlowSession(args []string) error {
 	}
 
 	for i, se := range resp.Sessions {
-		fmt.Printf("Session ID: %d, Policy: %d, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
-			i+1, se.PolicyId, se.State, se.TimeoutSeconds, se.AgeSeconds, se.IdleSeconds)
+		polDisplay := se.PolicyName
+		if polDisplay == "" {
+			polDisplay = fmt.Sprintf("%d", se.PolicyId)
+		}
+		fmt.Printf("Session ID: %d, Policy: %s, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
+			i+1, polDisplay, se.State, se.TimeoutSeconds, se.AgeSeconds, se.IdleSeconds)
 		inZone := se.IngressZoneName
 		if inZone == "" {
 			inZone = fmt.Sprintf("%d", se.IngressZone)
