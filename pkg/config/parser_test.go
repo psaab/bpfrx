@@ -10764,6 +10764,84 @@ func TestApplyGroupsFormatSet(t *testing.T) {
 	}
 }
 
+func TestApplyGroupsWildcard(t *testing.T) {
+	setCommands := []string{
+		// Define two zone pairs with policies
+		"set security policies from-zone trust to-zone untrust policy allow-all match source-address any",
+		"set security policies from-zone trust to-zone untrust policy allow-all match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy allow-all match application any",
+		"set security policies from-zone trust to-zone untrust policy allow-all then permit",
+		"set security policies from-zone dmz to-zone untrust policy dmz-out match source-address any",
+		"set security policies from-zone dmz to-zone untrust policy dmz-out match destination-address any",
+		"set security policies from-zone dmz to-zone untrust policy dmz-out match application any",
+		"set security policies from-zone dmz to-zone untrust policy dmz-out then permit",
+		// Group with <*> wildcard to add logging to all zone pairs
+		"set groups default-deny-template security policies from-zone <*> to-zone <*> policy default-deny then log session-init",
+		"set apply-groups default-deny-template",
+	}
+
+	tree := &ConfigTree{}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	if err := tree.ExpandGroups(); err != nil {
+		t.Fatalf("ExpandGroups: %v", err)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	// The wildcard group should have merged "default-deny" policy into both zone pairs.
+	findPolicies := func(from, to string) *ZonePairPolicies {
+		for _, zp := range cfg.Security.Policies {
+			if zp.FromZone == from && zp.ToZone == to {
+				return zp
+			}
+		}
+		return nil
+	}
+
+	trustUntrust := findPolicies("trust", "untrust")
+	if trustUntrust == nil {
+		t.Fatal("expected trust->untrust policies")
+	}
+	foundDeny := false
+	for _, p := range trustUntrust.Policies {
+		if p.Name == "default-deny" {
+			foundDeny = true
+			if p.Log == nil || !p.Log.SessionInit {
+				t.Error("default-deny policy missing session-init log")
+			}
+		}
+	}
+	if !foundDeny {
+		t.Error("wildcard group did not merge default-deny into trust->untrust")
+	}
+
+	dmzUntrust := findPolicies("dmz", "untrust")
+	if dmzUntrust == nil {
+		t.Fatal("expected dmz->untrust policies")
+	}
+	foundDeny = false
+	for _, p := range dmzUntrust.Policies {
+		if p.Name == "default-deny" {
+			foundDeny = true
+		}
+	}
+	if !foundDeny {
+		t.Error("wildcard group did not merge default-deny into dmz->untrust")
+	}
+}
+
 func TestParseLoginClass(t *testing.T) {
 	input := `system {
     login {

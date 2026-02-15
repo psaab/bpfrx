@@ -230,6 +230,18 @@ func mergeNodes(dst *[]*Node, src []*Node) {
 			continue
 		}
 
+		// Check if source keys contain wildcards (<*>).
+		if keysContainWildcard(s.Keys) {
+			// Wildcard merge: apply to all matching containers in dst.
+			for _, d := range *dst {
+				if !d.IsLeaf && keysMatchWildcard(d.Keys, s.Keys) {
+					cloned := cloneNodes(s.Children)
+					mergeNodes(&d.Children, cloned)
+				}
+			}
+			continue
+		}
+
 		// Container node: find matching container in dst.
 		found := false
 		for _, d := range *dst {
@@ -244,6 +256,30 @@ func mergeNodes(dst *[]*Node, src []*Node) {
 			*dst = append(*dst, s)
 		}
 	}
+}
+
+// keysContainWildcard returns true if any key is the Junos wildcard "<*>".
+func keysContainWildcard(keys []string) bool {
+	for _, k := range keys {
+		if k == "<*>" {
+			return true
+		}
+	}
+	return false
+}
+
+// keysMatchWildcard checks if dst keys match src keys where "<*>" matches
+// any value. Both slices must have the same length.
+func keysMatchWildcard(dst, src []string) bool {
+	if len(dst) != len(src) {
+		return false
+	}
+	for i := range src {
+		if src[i] != "<*>" && src[i] != dst[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // hasMatchingLeaf returns true if nodes contains a leaf whose first key
