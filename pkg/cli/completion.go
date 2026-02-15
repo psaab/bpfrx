@@ -68,6 +68,9 @@ func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, p
 }
 
 // writeCompletionHelp prints aligned completion candidates to w.
+// The entire output is built as a single string and written in one call
+// so that the readline wrapWriter triggers only one Refresh cycle,
+// cleanly re-drawing the prompt+line below.
 func writeCompletionHelp(w io.Writer, candidates []completionCandidate) {
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].name < candidates[j].name })
 	maxWidth := 20
@@ -76,14 +79,16 @@ func writeCompletionHelp(w io.Writer, candidates []completionCandidate) {
 			maxWidth = len(c.name) + 2
 		}
 	}
-	fmt.Fprintln(w, "Possible completions:")
+	var sb strings.Builder
+	sb.WriteString("Possible completions:\n")
 	for _, c := range candidates {
 		if c.desc != "" {
-			fmt.Fprintf(w, "  %-*s %s\n", maxWidth, c.name, c.desc)
+			fmt.Fprintf(&sb, "  %-*s %s\n", maxWidth, c.name, c.desc)
 		} else {
-			fmt.Fprintf(w, "  %s\n", c.name)
+			fmt.Fprintf(&sb, "  %s\n", c.name)
 		}
 	}
+	io.WriteString(w, sb.String())
 }
 
 // keysFromTree returns a sorted list of keys from a completionNode map.

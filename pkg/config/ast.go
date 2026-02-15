@@ -2146,12 +2146,21 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []Schema
 			return nil
 		}
 
-		schema = childSchema
+		if childSchema.multi && childSchema.children == nil {
+			// Stay at current schema level so sibling keywords are offered.
+		} else {
+			schema = childSchema
+		}
 	}
 
 	// We've consumed all tokens. Return child keywords at this schema level.
 	if schema == nil {
 		return nil
+	}
+
+	// If we're at a leaf with no children/wildcard, hint that Enter completes.
+	if schema.children == nil && schema.wildcard == nil {
+		return []SchemaCompletion{{Name: "<[Enter]>", Desc: "Execute this command"}}
 	}
 
 	var completions []SchemaCompletion
