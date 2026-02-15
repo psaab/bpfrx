@@ -5281,55 +5281,23 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		if s.routing == nil {
 			fmt.Fprintln(&buf, "Routing manager not available")
 		} else {
-			entries, err := s.routing.GetRoutes()
+			var instances []*config.RoutingInstanceConfig
+			if cfg != nil {
+				instances = cfg.RoutingInstances
+			}
+			allTables, err := s.routing.GetAllTableRoutes(instances)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "get routes: %v", err)
 			}
-			// Determine router ID from config
+			routerID := ""
 			if cfg != nil {
-				routerID := ""
 				if cfg.Protocols.OSPF != nil && cfg.Protocols.OSPF.RouterID != "" {
 					routerID = cfg.Protocols.OSPF.RouterID
 				} else if cfg.Protocols.BGP != nil && cfg.Protocols.BGP.RouterID != "" {
 					routerID = cfg.Protocols.BGP.RouterID
 				}
-				if routerID != "" {
-					fmt.Fprintf(&buf, "Router ID: %s\n\n", routerID)
-				}
 			}
-			v4ByProto := make(map[string]int)
-			v6ByProto := make(map[string]int)
-			var v4Count, v6Count int
-			for _, e := range entries {
-				if strings.Contains(e.Destination, ":") {
-					v6Count++
-					v6ByProto[e.Protocol]++
-				} else {
-					v4Count++
-					v4ByProto[e.Protocol]++
-				}
-			}
-			fmt.Fprintf(&buf, "inet.0: %d destinations, %d routes (%d active)\n", v4Count, v4Count, v4Count)
-			v4Protos := make([]string, 0, len(v4ByProto))
-			for p := range v4ByProto {
-				v4Protos = append(v4Protos, p)
-			}
-			sort.Strings(v4Protos)
-			for _, p := range v4Protos {
-				fmt.Fprintf(&buf, "  %-14s %d routes, %d active\n", p+":", v4ByProto[p], v4ByProto[p])
-			}
-			if v6Count > 0 {
-				fmt.Fprintln(&buf)
-				fmt.Fprintf(&buf, "inet6.0: %d destinations, %d routes (%d active)\n", v6Count, v6Count, v6Count)
-				v6Protos := make([]string, 0, len(v6ByProto))
-				for p := range v6ByProto {
-					v6Protos = append(v6Protos, p)
-				}
-				sort.Strings(v6Protos)
-				for _, p := range v6Protos {
-					fmt.Fprintf(&buf, "  %-14s %d routes, %d active\n", p+":", v6ByProto[p], v6ByProto[p])
-				}
-			}
+			buf.WriteString(routing.FormatRouteSummary(allTables, routerID))
 		}
 
 	case "route-terse":

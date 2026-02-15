@@ -5229,14 +5229,17 @@ func (c *CLI) showRouteSummary() error {
 		return nil
 	}
 
-	entries, err := c.routing.GetRoutes()
+	cfg := c.store.ActiveConfig()
+	var instances []*config.RoutingInstanceConfig
+	if cfg != nil {
+		instances = cfg.RoutingInstances
+	}
+	allTables, err := c.routing.GetAllTableRoutes(instances)
 	if err != nil {
 		return fmt.Errorf("get routes: %w", err)
 	}
 
-	// Determine router ID from config (OSPF or BGP)
 	routerID := ""
-	cfg := c.store.ActiveConfig()
 	if cfg != nil {
 		if cfg.Protocols.OSPF != nil && cfg.Protocols.OSPF.RouterID != "" {
 			routerID = cfg.Protocols.OSPF.RouterID
@@ -5244,48 +5247,8 @@ func (c *CLI) showRouteSummary() error {
 			routerID = cfg.Protocols.BGP.RouterID
 		}
 	}
-	if routerID != "" {
-		fmt.Printf("Router ID: %s\n\n", routerID)
-	}
 
-	// Count by protocol and address family
-	v4ByProto := make(map[string]int)
-	v6ByProto := make(map[string]int)
-	var v4Count, v6Count int
-	for _, e := range entries {
-		if strings.Contains(e.Destination, ":") {
-			v6Count++
-			v6ByProto[e.Protocol]++
-		} else {
-			v4Count++
-			v4ByProto[e.Protocol]++
-		}
-	}
-
-	// Print inet.0 summary
-	fmt.Printf("inet.0: %d destinations, %d routes (%d active)\n", v4Count, v4Count, v4Count)
-	v4Protos := make([]string, 0, len(v4ByProto))
-	for p := range v4ByProto {
-		v4Protos = append(v4Protos, p)
-	}
-	sort.Strings(v4Protos)
-	for _, p := range v4Protos {
-		fmt.Printf("  %-14s %d routes, %d active\n", p+":", v4ByProto[p], v4ByProto[p])
-	}
-
-	if v6Count > 0 {
-		fmt.Println()
-		fmt.Printf("inet6.0: %d destinations, %d routes (%d active)\n", v6Count, v6Count, v6Count)
-		v6Protos := make([]string, 0, len(v6ByProto))
-		for p := range v6ByProto {
-			v6Protos = append(v6Protos, p)
-		}
-		sort.Strings(v6Protos)
-		for _, p := range v6Protos {
-			fmt.Printf("  %-14s %d routes, %d active\n", p+":", v6ByProto[p], v6ByProto[p])
-		}
-	}
-
+	fmt.Print(routing.FormatRouteSummary(allTables, routerID))
 	return nil
 }
 

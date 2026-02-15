@@ -37,12 +37,13 @@ Junos output formatting in bpfrx.
 25. [System: Version](#system-version)
 26. [Chassis Cluster: Status](#chassis-cluster-status)
 27. [Chassis Cluster: Interfaces](#chassis-cluster-interfaces)
-28. [Routing: Route Table](#routing-route-table)
-29. [Routing: Route Summary](#routing-route-summary)
-30. [Routing: BGP Summary](#routing-bgp-summary)
-31. [Routing: ARP](#routing-arp)
-32. [Pipe Filters](#pipe-filters)
-33. [Configuration Display](#configuration-display)
+28. [Routing: Route Table (Brief)](#routing-route-table-brief)
+29. [Routing: Route Destination Lookup](#routing-route-destination-lookup)
+30. [Routing: Route Summary](#routing-route-summary)
+31. [Routing: BGP Summary](#routing-bgp-summary)
+32. [Routing: ARP](#routing-arp)
+33. [Pipe Filters](#pipe-filters)
+34. [Configuration Display](#configuration-display)
 
 ---
 
@@ -1007,9 +1008,11 @@ Interface Monitoring:
 
 ---
 
-## Routing: Route Table
+## Routing: Route Table (Brief)
 
-**Command:** `show route table inet.0`
+**Command:** `show route` / `show route table inet.0`
+
+The default display format. Shows all active routes across all routing tables.
 
 ```
 inet.0: 72 destinations, 78 routes (72 active, 0 holddown, 0 hidden)
@@ -1033,19 +1036,83 @@ inet.0: 72 destinations, 78 routes (72 active, 0 holddown, 0 hidden)
 ### Format Details
 
 - **Table header:** `<table>: <N> destinations, <N> routes (<N> active, <N> holddown, <N> hidden)`.
-- **Legend:** `+ = Active Route, - = Last Active, * = Both`.
-- **Route format:**
-  - Prefix: left-aligned, padded to ~19 chars.
-  - Active marker: `*` (both active + last active), `+` (active only), `-` (last active only), or blank.
-  - Protocol/preference in brackets: `[Static/5]`, `[BGP/170]`, `[Direct/0]`, `[Local/0]`.
-  - Age: `4d 07:44:55` or `1d 11:31:02` or `02:27:21`.
-  - BGP attributes: `, MED 0, localpref 100` and `AS path: 65500 I, validation-state: unverified`.
+- **Legend:** `+ = Active Route, - = Last Active, * = Both` — always printed after header, blank line follows.
+- **Destination column:** Left-aligned, padded to ~19 chars. Long prefixes (IPv6) flow naturally.
+- **Route markers:**
+  - `*` = Both active and last active (most common).
+  - `+` = Active only (another protocol was previously active).
+  - `-` = Last active (now replaced by a better route).
+- **Protocol/preference in brackets:** `[Static/5]`, `[BGP/170]`, `[Direct/0]`, `[Local/0]`.
+- **Age:** Follows brackets. Format varies by duration:
+  - `< 1h` → `MM:SS` (e.g. `05:32`)
+  - `< 1d` → `HH:MM:SS` (e.g. `16:40:36`)
+  - `1-6d` → `Nd HH:MM:SS` (e.g. `4d 16:40:36`)
+  - `7d+` → `NwNd HH:MM:SS` (e.g. `2w4d 14:37:16`)
+- **BGP attributes on same line:** `, MED 0, localpref 100`.
+  - Separate line: `AS path: 65500 I, validation-state: unverified`.
+- **OSPF attributes:** `, metric <N>` after age.
 - **Next-hop lines:** Indented ~20 chars.
-  - `>  to <nexthop> via <interface>` (best next-hop, `>` marker).
-  - `   to table <table>` (route leak/table reference).
-  - `   Local via <interface>` (local route).
-- **Multiple routes** for same prefix: continuation with different protocol block.
-- Blank line after table header legend.
+  - `>  to <nexthop> via <interface>` — best next-hop, `>` marker.
+  - `   to table <table>` — route leak / next-table reference.
+  - `   Local via <interface>` — local route (no `>` marker).
+  - `   Reject` or `   Discard` — reject/discard route (no `>` marker).
+- **Multiple routes** for same destination: first gets prefix, subsequent indented to bracket column.
+- **ECMP:** Multiple `>` next-hop lines for the same route.
+
+### Protocol Names and Default Preferences
+
+| Source | Display Name | Default Preference |
+|--------|-------------|-------------------|
+| Directly connected | `Direct` | 0 |
+| Local addresses (/32 or /128) | `Local` | 0 |
+| Static routes | `Static` | 5 |
+| OSPF internal | `OSPF` | 10 |
+| DHCP/PPP learned | `Access-internal` | 12 |
+| IS-IS L1 internal | `IS-IS` | 15 |
+| IS-IS L2 internal | `IS-IS` | 18 |
+| RIP/RIPng | `RIP` | 100 |
+| Aggregate | `Aggregate` | 130 |
+| OSPF AS external | `OSPF` | 150 |
+| BGP | `BGP` | 170 |
+
+### Table Naming Convention
+
+| Table Name | Description |
+|------------|-------------|
+| `inet.0` | Default IPv4 unicast |
+| `inet6.0` | Default IPv6 unicast |
+| `<instance>.inet.0` | IPv4 unicast for routing instance |
+| `<instance>.inet6.0` | IPv6 unicast for routing instance |
+
+---
+
+## Routing: Route Destination Lookup
+
+**Command:** `show route <destination>`
+
+Performs longest-prefix-match against ALL routing tables. Shows every route whose prefix contains the specified IP.
+
+```
+inet.0: 8 destinations, 8 routes (8 active, 0 holddown, 0 hidden)
+
+10.0.1.0/24        *[Direct/0]
+                    >  via trust0
+
+ATT.inet.0: 4 destinations, 4 routes (4 active, 0 holddown, 0 hidden)
+
+10.0.1.0/24        *[Direct/0]
+                    >  via trust0
+```
+
+### Modifiers
+
+| Modifier | Behavior |
+|----------|----------|
+| `show route 10.1.2.3` | LPM: all routes containing this IP (default /32 for IPv4, /128 for IPv6) |
+| `show route 10.0.0.0/8` | All routes contained within or equal to 10.0.0.0/8 |
+| `show route 10.0.0.0/24 exact` | Only routes exactly matching /24 |
+| `show route 10.0.0.0/16 longer` | Only routes with prefix length strictly longer than /16 |
+| `show route 10.0.0.0/16 orlonger` | Equal to or longer than /16 |
 
 ---
 
@@ -1077,10 +1144,11 @@ ATT.inet.0: 62 destinations, 68 routes (62 active, 0 holddown, 0 hidden)
 ### Format Details
 
 - **Router ID line.**
-- **Highwater marks:** 4-space indent, label padded to ~35 chars, `: <N> at <timestamp> / <N>`.
-- **Per-table summary:** Table header same as route table.
-  - Protocol lines: right-aligned protocol name (~21 chars), `: <N> routes, <N> active`.
-  - Numbers right-aligned within ~6 chars.
+- **Highwater marks:** 4-space indent, label padded to ~35 chars, `: <N> at <timestamp> / <N>`. (bpfrx omits this section.)
+- **Per-table summary:** Table header same as route table. IPv4 and IPv6 in separate sections (`inet.0` / `inet6.0`).
+  - Protocol lines: right-aligned protocol name to 21 chars including colon, `: %7d routes, %7d active`.
+  - Numbers right-aligned within 7 chars.
+- **VRF tables** listed after main tables as `<instance>.inet.0` and `<instance>.inet6.0`.
 
 ---
 

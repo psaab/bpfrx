@@ -777,6 +777,79 @@ func FormatRouteDestination(allTables []TableRoutes, destination string) string 
 	return buf.String()
 }
 
+// FormatRouteSummary formats a Junos-style route summary across all tables.
+// Output matches Junos: right-aligned protocol names, right-aligned counts,
+// separate inet.0/inet6.0 sections per table.
+func FormatRouteSummary(allTables []TableRoutes, routerID string) string {
+	var buf strings.Builder
+	if routerID != "" {
+		fmt.Fprintf(&buf, "Router ID: %s\n", routerID)
+	}
+
+	for _, table := range allTables {
+		if len(table.Entries) == 0 {
+			continue
+		}
+
+		// Split entries by address family.
+		v4ByProto := make(map[string]int)
+		v6ByProto := make(map[string]int)
+		for _, e := range table.Entries {
+			proto := junosProtoName(e.Protocol)
+			if strings.Contains(e.Destination, ":") {
+				v6ByProto[proto]++
+			} else {
+				v4ByProto[proto]++
+			}
+		}
+
+		// Determine table name prefix for VRFs.
+		prefix := ""
+		if table.Name != "inet.0" {
+			prefix = strings.TrimSuffix(table.Name, ".inet.0")
+			if prefix == table.Name {
+				prefix = ""
+			} else {
+				prefix += "."
+			}
+		}
+
+		if len(v4ByProto) > 0 {
+			v4Total := 0
+			for _, n := range v4ByProto {
+				v4Total += n
+			}
+			tableName := prefix + "inet.0"
+			fmt.Fprintf(&buf, "\n%s: %d destinations, %d routes (%d active, 0 holddown, 0 hidden)\n",
+				tableName, v4Total, v4Total, v4Total)
+			formatSummaryProtos(&buf, v4ByProto)
+		}
+		if len(v6ByProto) > 0 {
+			v6Total := 0
+			for _, n := range v6ByProto {
+				v6Total += n
+			}
+			tableName := prefix + "inet6.0"
+			fmt.Fprintf(&buf, "\n%s: %d destinations, %d routes (%d active, 0 holddown, 0 hidden)\n",
+				tableName, v6Total, v6Total, v6Total)
+			formatSummaryProtos(&buf, v6ByProto)
+		}
+	}
+	return buf.String()
+}
+
+// formatSummaryProtos writes sorted protocol summary lines in Junos format.
+func formatSummaryProtos(buf *strings.Builder, byProto map[string]int) {
+	protos := make([]string, 0, len(byProto))
+	for p := range byProto {
+		protos = append(protos, p)
+	}
+	sort.Strings(protos)
+	for _, p := range protos {
+		fmt.Fprintf(buf, "%21s%7d routes,%7d active\n", p+":", byProto[p], byProto[p])
+	}
+}
+
 // FormatAllRoutes formats all routes across all tables in Junos style.
 func FormatAllRoutes(allTables []TableRoutes) string {
 	var buf strings.Builder
