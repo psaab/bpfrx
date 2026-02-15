@@ -846,6 +846,107 @@ host_inbound_flag(struct pkt_meta *meta)
 }
 
 /* ============================================================
+ * Policer evaluation (single-rate two-color + three-color)
+ *
+ * Returns:
+ *   0 = conforming (green)
+ *   1 = exceed (yellow — exceeds committed but within peak/excess)
+ *   2 = violate (red — exceeds peak rate)
+ * For single-rate two-color: only returns 0 or 1.
+ * Uses per-CPU state for lock-free operation.
+ * ============================================================ */
+static __always_inline int
+evaluate_policer(__u32 policer_id, __u32 pkt_len)
+{
+	struct policer_config *cfg =
+		bpf_map_lookup_elem(&policer_configs, &policer_id);
+	if (!cfg || cfg->rate_bytes_sec == 0)
+		return 0; /* no policer or unconfigured, pass */
+
+	struct policer_state *state =
+		bpf_map_lookup_elem(&policer_states, &policer_id);
+	if (!state)
+		return 0;
+
+	__u64 now = bpf_ktime_get_ns();
+	__u64 elapsed = now - state->last_refill_ns;
+
+	/* Refill committed tokens: elapsed_ns * rate_bytes_sec / 1e9 */
+	__u64 c_tokens = state->tokens +
+		(elapsed / 1000) * cfg->rate_bytes_sec / 1000000;
+	if (c_tokens > cfg->burst_bytes)
+		c_tokens = cfg->burst_bytes;
+
+	if (cfg->color_mode == POLICER_MODE_SINGLE_RATE) {
+		/* Single-rate two-color (original behavior) */
+		if (c_tokens < pkt_len) {
+			state->last_refill_ns = now;
+			state->tokens = c_tokens;
+			return 1; /* exceeded */
+		}
+		state->tokens = c_tokens - pkt_len;
+		state->last_refill_ns = now;
+		return 0; /* conforming */
+	}
+
+	if (cfg->color_mode == POLICER_MODE_TWO_RATE) {
+		/* Two-rate three-color (RFC 2698) */
+		__u64 p_tokens = state->peak_tokens +
+			(elapsed / 1000) * cfg->peak_rate / 1000000;
+		if (p_tokens > cfg->peak_burst)
+			p_tokens = cfg->peak_burst;
+
+		state->last_refill_ns = now;
+
+		if (p_tokens < pkt_len) {
+			/* Red: exceeds peak rate */
+			state->tokens = c_tokens;
+			state->peak_tokens = p_tokens;
+			return 2; /* violate */
+		}
+		if (c_tokens < pkt_len) {
+			/* Yellow: within peak but exceeds committed */
+			state->tokens = c_tokens;
+			state->peak_tokens = p_tokens - pkt_len;
+			return 1; /* exceed */
+		}
+		/* Green: within both rates */
+		state->tokens = c_tokens - pkt_len;
+		state->peak_tokens = p_tokens - pkt_len;
+		return 0; /* conform */
+	}
+
+	/* Single-rate three-color (RFC 2697): CIR fills C, C overflow fills E */
+	__u64 e_tokens = state->peak_tokens;
+	if (c_tokens > cfg->burst_bytes) {
+		__u64 overflow = c_tokens - cfg->burst_bytes;
+		e_tokens += overflow;
+		c_tokens = cfg->burst_bytes;
+		if (e_tokens > cfg->peak_burst)
+			e_tokens = cfg->peak_burst;
+	}
+
+	state->last_refill_ns = now;
+
+	if (c_tokens >= pkt_len) {
+		/* Green: fits in committed bucket */
+		state->tokens = c_tokens - pkt_len;
+		state->peak_tokens = e_tokens;
+		return 0;
+	}
+	if (e_tokens >= pkt_len) {
+		/* Yellow: fits in excess bucket */
+		state->tokens = c_tokens;
+		state->peak_tokens = e_tokens - pkt_len;
+		return 1;
+	}
+	/* Red: exceeds both */
+	state->tokens = c_tokens;
+	state->peak_tokens = e_tokens;
+	return 2;
+}
+
+/* ============================================================
  * Firewall filter evaluation
  *
  * Called from xdp_main after header parsing.
@@ -949,6 +1050,28 @@ evaluate_firewall_filter(struct pkt_meta *meta)
 		    !meta->is_fragment)
 			match = 0;
 
+		/* Check flexible byte-offset match */
+		if (match && (flags & FILTER_MATCH_FLEX) &&
+		    rule->flex_length > 0) {
+			/* Read bytes at L3 offset + flex_offset from meta.
+			 * We compare against the pre-extracted value stored
+			 * in the rule (not reading packet data to avoid
+			 * verifier complexity). The flex_value in the rule
+			 * is already masked. We use meta fields as proxy:
+			 * flex_offset 9=TTL/proto, 12=src_ip, 16=dst_ip. */
+			__u32 pkt_val = 0;
+			__u8 off = rule->flex_offset;
+			if (off == 9 && meta->addr_family == AF_INET)
+				pkt_val = meta->protocol;
+			else if (off == 12 && meta->addr_family == AF_INET)
+				pkt_val = meta->src_ip.v4;
+			else if (off == 16 && meta->addr_family == AF_INET)
+				pkt_val = meta->dst_ip.v4;
+			/* Apply mask and compare */
+			if ((pkt_val & rule->flex_mask) != rule->flex_value)
+				match = 0;
+		}
+
 		/* Check source address (v4 or v6 depending on family) */
 		if (match && (flags & FILTER_MATCH_SRC_ADDR)) {
 			int src_hit = 1;
@@ -1005,6 +1128,14 @@ evaluate_firewall_filter(struct pkt_meta *meta)
 		struct counter_value *fc =
 			bpf_map_lookup_elem(&filter_counters, &idx);
 		if (fc) { fc->packets++; fc->bytes += meta->pkt_len; }
+
+		/* Policer: if rule has a policer, evaluate token bucket.
+		 * If exceeded, apply policer action (discard). */
+		if (rule->policer_id) {
+			__u32 pid = rule->policer_id;
+			if (evaluate_policer(pid, meta->pkt_len))
+				return -1; /* policer exceeded → discard */
+		}
 
 		/* Emit log event if configured */
 		if (rule->log_flag) {
@@ -1122,6 +1253,21 @@ evaluate_firewall_filter_output(struct pkt_meta *meta, __u32 egress_ifindex)
 		    !meta->is_fragment)
 			match = 0;
 
+		/* Flexible byte-offset match */
+		if (match && (flags & FILTER_MATCH_FLEX) &&
+		    rule->flex_length > 0) {
+			__u32 pkt_val = 0;
+			__u8 off = rule->flex_offset;
+			if (off == 9 && meta->addr_family == AF_INET)
+				pkt_val = meta->protocol;
+			else if (off == 12 && meta->addr_family == AF_INET)
+				pkt_val = meta->src_ip.v4;
+			else if (off == 16 && meta->addr_family == AF_INET)
+				pkt_val = meta->dst_ip.v4;
+			if ((pkt_val & rule->flex_mask) != rule->flex_value)
+				match = 0;
+		}
+
 		if (match && (flags & FILTER_MATCH_SRC_ADDR)) {
 			int src_hit = 1;
 			if (meta->addr_family == AF_INET) {
@@ -1175,6 +1321,13 @@ evaluate_firewall_filter_output(struct pkt_meta *meta, __u32 egress_ifindex)
 			bpf_map_lookup_elem(&filter_counters, &idx);
 		if (fc) { fc->packets++; fc->bytes += meta->pkt_len; }
 
+		/* Policer: if rule has a policer, evaluate token bucket. */
+		if (rule->policer_id) {
+			__u32 pid = rule->policer_id;
+			if (evaluate_policer(pid, meta->pkt_len))
+				return -1; /* policer exceeded → discard */
+		}
+
 		if (rule->log_flag) {
 			__u8 act = (rule->action == FILTER_ACTION_ACCEPT ||
 				    rule->action == FILTER_ACTION_ROUTE)
@@ -1195,6 +1348,180 @@ evaluate_firewall_filter_output(struct pkt_meta *meta, __u32 egress_ifindex)
 	}
 
 	return 0;
+}
+
+/* ============================================================
+ * Lo0 (loopback) firewall filter evaluation by filter ID
+ *
+ * Used for host-bound traffic filtering (lo0 input filter).
+ * Takes a filter ID directly (from flow_config_map) rather than
+ * looking it up from iface_filter_map.
+ * Returns:
+ *   0  = no filter or "accept"
+ *   -1 = "discard" / "reject" / policer exceeded
+ * ============================================================ */
+static __always_inline int
+evaluate_filter_by_id(__u32 fid, struct pkt_meta *meta)
+{
+	if (fid == 0xFFFF)
+		return 0;
+
+	struct filter_config *fcfg = bpf_map_lookup_elem(&filter_configs, &fid);
+	if (!fcfg || fcfg->num_rules == 0)
+		return 0;
+
+	__u32 start = fcfg->rule_start;
+	__u32 count = fcfg->num_rules;
+	if (count > MAX_FILTER_RULES_PER_FILTER)
+		count = MAX_FILTER_RULES_PER_FILTER;
+
+	#pragma unroll
+	for (__u32 i = 0; i < MAX_FILTER_RULES_PER_FILTER; i++) {
+		if (i >= count)
+			break;
+
+		__u32 idx = start + i;
+		if (idx >= MAX_FILTER_RULES)
+			break;
+
+		struct filter_rule *rule = bpf_map_lookup_elem(&filter_rules, &idx);
+		if (!rule)
+			break;
+
+		__u16 flags = rule->match_flags;
+		int match = 1;
+
+		if ((flags & FILTER_MATCH_DSCP) && rule->dscp != meta->dscp)
+			match = 0;
+		if (match && (flags & FILTER_MATCH_PROTOCOL) &&
+		    rule->protocol != meta->protocol)
+			match = 0;
+		if (match && (flags & FILTER_MATCH_DST_PORT)) {
+			if (rule->dst_port_hi) {
+				__u16 p = bpf_ntohs(meta->dst_port);
+				if (p < bpf_ntohs(rule->dst_port) ||
+				    p > bpf_ntohs(rule->dst_port_hi))
+					match = 0;
+			} else if (rule->dst_port != meta->dst_port) {
+				match = 0;
+			}
+		}
+		if (match && (flags & FILTER_MATCH_SRC_PORT)) {
+			if (rule->src_port_hi) {
+				__u16 p = bpf_ntohs(meta->src_port);
+				if (p < bpf_ntohs(rule->src_port) ||
+				    p > bpf_ntohs(rule->src_port_hi))
+					match = 0;
+			} else if (rule->src_port != meta->src_port) {
+				match = 0;
+			}
+		}
+		if (match && (flags & FILTER_MATCH_ICMP_TYPE) &&
+		    rule->icmp_type != meta->icmp_type)
+			match = 0;
+		if (match && (flags & FILTER_MATCH_ICMP_CODE) &&
+		    rule->icmp_code != meta->icmp_code)
+			match = 0;
+		if (match && (flags & FILTER_MATCH_TCP_FLAGS) &&
+		    (meta->tcp_flags & rule->tcp_flags) != rule->tcp_flags)
+			match = 0;
+		if (match && (flags & FILTER_MATCH_FRAGMENT) &&
+		    !meta->is_fragment)
+			match = 0;
+
+		/* Flexible byte-offset match */
+		if (match && (flags & FILTER_MATCH_FLEX) &&
+		    rule->flex_length > 0) {
+			__u32 pkt_val = 0;
+			__u8 off = rule->flex_offset;
+			if (off == 9 && meta->addr_family == AF_INET)
+				pkt_val = meta->protocol;
+			else if (off == 12 && meta->addr_family == AF_INET)
+				pkt_val = meta->src_ip.v4;
+			else if (off == 16 && meta->addr_family == AF_INET)
+				pkt_val = meta->dst_ip.v4;
+			if ((pkt_val & rule->flex_mask) != rule->flex_value)
+				match = 0;
+		}
+
+		if (match && (flags & FILTER_MATCH_SRC_ADDR)) {
+			int src_hit = 1;
+			if (meta->addr_family == AF_INET) {
+				__be32 masked = meta->src_ip.v4 &
+					*(__be32 *)rule->src_mask;
+				if (masked != *(__be32 *)rule->src_addr)
+					src_hit = 0;
+			} else {
+				for (int j = 0; j < 16; j += 4) {
+					__u32 m = *(__u32 *)(meta->src_ip.v6 + j) &
+						  *(__u32 *)(rule->src_mask + j);
+					if (m != *(__u32 *)(rule->src_addr + j)) {
+						src_hit = 0;
+						break;
+					}
+				}
+			}
+			if (flags & FILTER_MATCH_SRC_NEGATE)
+				src_hit = !src_hit;
+			if (!src_hit)
+				match = 0;
+		}
+
+		if (match && (flags & FILTER_MATCH_DST_ADDR)) {
+			int dst_hit = 1;
+			if (meta->addr_family == AF_INET) {
+				__be32 masked = meta->dst_ip.v4 &
+					*(__be32 *)rule->dst_mask;
+				if (masked != *(__be32 *)rule->dst_addr)
+					dst_hit = 0;
+			} else {
+				for (int j = 0; j < 16; j += 4) {
+					__u32 m = *(__u32 *)(meta->dst_ip.v6 + j) &
+						  *(__u32 *)(rule->dst_mask + j);
+					if (m != *(__u32 *)(rule->dst_addr + j)) {
+						dst_hit = 0;
+						break;
+					}
+				}
+			}
+			if (flags & FILTER_MATCH_DST_NEGATE)
+				dst_hit = !dst_hit;
+			if (!dst_hit)
+				match = 0;
+		}
+
+		if (!match)
+			continue;
+
+		struct counter_value *fc =
+			bpf_map_lookup_elem(&filter_counters, &idx);
+		if (fc) { fc->packets++; fc->bytes += meta->pkt_len; }
+
+		if (rule->policer_id) {
+			__u32 pid = rule->policer_id;
+			if (evaluate_policer(pid, meta->pkt_len))
+				return -1;
+		}
+
+		if (rule->log_flag) {
+			__u8 act = (rule->action == FILTER_ACTION_ACCEPT)
+				   ? ACTION_PERMIT : ACTION_DENY;
+			emit_event(meta, EVENT_TYPE_FILTER_LOG, act, 0, 0);
+		}
+
+		if (rule->dscp_rewrite != 0xFF)
+			meta->dscp_rewrite = rule->dscp_rewrite;
+
+		switch (rule->action) {
+		case FILTER_ACTION_ACCEPT:
+			return 0;
+		case FILTER_ACTION_DISCARD:
+		case FILTER_ACTION_REJECT:
+			return -1;
+		}
+	}
+
+	return 0; /* no term matched — implicit accept */
 }
 
 /* ============================================================

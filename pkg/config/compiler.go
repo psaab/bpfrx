@@ -3141,6 +3141,58 @@ func nodeVal(n *Node) string {
 	return ""
 }
 
+// parseBandwidthLimit parses a Junos bandwidth-limit value (in bits/sec) to bytes/sec.
+// "1m" = 1,000,000 bps = 125,000 bytes/s; "10g" = 10 Gbps; "500k" = 500,000 bps; plain number = bps.
+func parseBandwidthLimit(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	multiplier := uint64(1)
+	if strings.HasSuffix(s, "g") || strings.HasSuffix(s, "G") {
+		multiplier = 1000000000
+		s = s[:len(s)-1]
+	} else if strings.HasSuffix(s, "m") || strings.HasSuffix(s, "M") {
+		multiplier = 1000000
+		s = s[:len(s)-1]
+	} else if strings.HasSuffix(s, "k") || strings.HasSuffix(s, "K") {
+		multiplier = 1000
+		s = s[:len(s)-1]
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	// Junos bandwidth-limit is in bits/sec; convert to bytes/sec
+	return (v * multiplier) / 8
+}
+
+// parseBurstSizeLimit parses a Junos burst-size-limit value (in bytes).
+// "15k" = 15,000 bytes; "1m" = 1,000,000 bytes; plain number = bytes.
+func parseBurstSizeLimit(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	multiplier := uint64(1)
+	if strings.HasSuffix(s, "g") || strings.HasSuffix(s, "G") {
+		multiplier = 1000000000
+		s = s[:len(s)-1]
+	} else if strings.HasSuffix(s, "m") || strings.HasSuffix(s, "M") {
+		multiplier = 1000000
+		s = s[:len(s)-1]
+	} else if strings.HasSuffix(s, "k") || strings.HasSuffix(s, "K") {
+		multiplier = 1000
+		s = s[:len(s)-1]
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	// burst-size-limit is already in bytes
+	return v * multiplier
+}
+
 func compileIKE(node *Node, sec *SecurityConfig) error {
 	if sec.IPsec.IKEProposals == nil {
 		sec.IPsec.IKEProposals = make(map[string]*IKEProposal)
@@ -3551,6 +3603,130 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 	if fw.FiltersInet6 == nil {
 		fw.FiltersInet6 = make(map[string]*FirewallFilter)
 	}
+	if fw.Policers == nil {
+		fw.Policers = make(map[string]*PolicerConfig)
+	}
+
+	// Compile policer definitions
+	for _, polInst := range namedInstances(node.FindChildren("policer")) {
+		pol := &PolicerConfig{
+			Name:       polInst.name,
+			ThenAction: "discard", // default action
+		}
+
+		ifExceeding := polInst.node.FindChild("if-exceeding")
+		if ifExceeding != nil {
+			for _, child := range ifExceeding.Children {
+				switch child.Name() {
+				case "bandwidth-limit":
+					if v := nodeVal(child); v != "" {
+						pol.BandwidthLimit = parseBandwidthLimit(v)
+					}
+				case "burst-size-limit":
+					if v := nodeVal(child); v != "" {
+						pol.BurstSizeLimit = parseBurstSizeLimit(v)
+					}
+				}
+			}
+		}
+
+		thenNode := polInst.node.FindChild("then")
+		if thenNode != nil {
+			for _, child := range thenNode.Children {
+				switch child.Name() {
+				case "discard":
+					pol.ThenAction = "discard"
+				case "loss-priority":
+					if v := nodeVal(child); v != "" {
+						pol.ThenAction = "loss-priority " + v
+					}
+				}
+			}
+		}
+
+		// Check for logical-interface-policer flag
+		if polInst.node.FindChild("logical-interface-policer") != nil {
+			pol.LogicalInterfacePolicer = true
+		}
+
+		fw.Policers[pol.Name] = pol
+	}
+
+	// Compile three-color policer definitions
+	if fw.ThreeColorPolicers == nil {
+		fw.ThreeColorPolicers = make(map[string]*ThreeColorPolicerConfig)
+	}
+	for _, tcpInst := range namedInstances(node.FindChildren("three-color-policer")) {
+		tcp := &ThreeColorPolicerConfig{
+			Name:       tcpInst.name,
+			ThenAction: "discard",
+		}
+
+		if sr := tcpInst.node.FindChild("single-rate"); sr != nil {
+			tcp.TwoRate = false
+			if sr.FindChild("color-blind") != nil {
+				tcp.ColorBlind = true
+			}
+			for _, child := range sr.Children {
+				switch child.Name() {
+				case "committed-information-rate":
+					if v := nodeVal(child); v != "" {
+						tcp.CIR = parseBandwidthLimit(v)
+					}
+				case "committed-burst-size":
+					if v := nodeVal(child); v != "" {
+						tcp.CBS = parseBurstSizeLimit(v)
+					}
+				case "excess-burst-size":
+					if v := nodeVal(child); v != "" {
+						tcp.PBS = parseBurstSizeLimit(v)
+					}
+				}
+			}
+		}
+
+		if tr := tcpInst.node.FindChild("two-rate"); tr != nil {
+			tcp.TwoRate = true
+			if tr.FindChild("color-blind") != nil {
+				tcp.ColorBlind = true
+			}
+			for _, child := range tr.Children {
+				switch child.Name() {
+				case "committed-information-rate":
+					if v := nodeVal(child); v != "" {
+						tcp.CIR = parseBandwidthLimit(v)
+					}
+				case "committed-burst-size":
+					if v := nodeVal(child); v != "" {
+						tcp.CBS = parseBurstSizeLimit(v)
+					}
+				case "peak-information-rate":
+					if v := nodeVal(child); v != "" {
+						tcp.PIR = parseBandwidthLimit(v)
+					}
+				case "peak-burst-size":
+					if v := nodeVal(child); v != "" {
+						tcp.PBS = parseBurstSizeLimit(v)
+					}
+				}
+			}
+		}
+
+		if thenNode := tcpInst.node.FindChild("then"); thenNode != nil {
+			for _, child := range thenNode.Children {
+				switch child.Name() {
+				case "discard":
+					tcp.ThenAction = "discard"
+				case "loss-priority":
+					if v := nodeVal(child); v != "" {
+						tcp.ThenAction = "loss-priority " + v
+					}
+				}
+			}
+		}
+
+		fw.ThreeColorPolicers[tcp.Name] = tcp
+	}
 
 	for _, familyNode := range node.FindChildren("family") {
 		var afNodes []*Node
@@ -3710,6 +3886,68 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 			}
 		case "is-fragment":
 			term.IsFragment = true
+		case "flexible-match-range":
+			for _, rangeInst := range namedInstances(child.FindChildren("range")) {
+				fm := &FlexMatchConfig{MatchStart: "layer-3"}
+				for _, rc := range rangeInst.node.Children {
+					switch rc.Name() {
+					case "match-start":
+						if v := nodeVal(rc); v != "" {
+							fm.MatchStart = v
+						}
+					case "byte-offset":
+						if v := nodeVal(rc); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								fm.ByteOffset = uint8(n)
+							}
+						}
+					case "bit-length":
+						if v := nodeVal(rc); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								fm.BitLength = uint8(n)
+							}
+						}
+					case "range", "match-value":
+						if v := nodeVal(rc); v != "" {
+							// Format: "0xVALUE/0xMASK" or just "0xVALUE"
+							parts := strings.SplitN(v, "/", 2)
+							val, err := strconv.ParseUint(strings.TrimPrefix(parts[0], "0x"), 16, 32)
+							if err == nil {
+								fm.Value = uint32(val)
+							}
+							if len(parts) == 2 {
+								mask, err := strconv.ParseUint(strings.TrimPrefix(parts[1], "0x"), 16, 32)
+								if err == nil {
+									fm.Mask = uint32(mask)
+								}
+							}
+						}
+					case "match-mask":
+						if v := nodeVal(rc); v != "" {
+							mask, err := strconv.ParseUint(strings.TrimPrefix(v, "0x"), 16, 32)
+							if err == nil {
+								fm.Mask = uint32(mask)
+							}
+						}
+					}
+				}
+				if fm.BitLength == 0 {
+					fm.BitLength = 32 // default to 32-bit match
+				}
+				if fm.Mask == 0 {
+					// Default mask based on bit-length
+					switch fm.BitLength {
+					case 8:
+						fm.Mask = 0xFF
+					case 16:
+						fm.Mask = 0xFFFF
+					default:
+						fm.Mask = 0xFFFFFFFF
+					}
+				}
+				term.FlexMatch = fm
+				break // only first range supported per term
+			}
 		}
 	}
 }
@@ -3765,6 +4003,10 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 			}
 		case "dscp", "traffic-class":
 			term.DSCPRewrite = nodeVal(child)
+		case "policer":
+			if len(child.Keys) >= 2 {
+				term.Policer = child.Keys[1]
+			}
 		}
 	}
 }

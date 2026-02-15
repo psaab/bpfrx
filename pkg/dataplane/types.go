@@ -636,6 +636,23 @@ type FilterRule struct {
 	DstAddr      [16]byte
 	DstMask      [16]byte
 	RoutingTable uint32
+	PolicerID    uint8  // policer index (0=none, 1-based)
+	FlexOffset   uint8  // flexible match: byte offset from L3 header start
+	FlexLength   uint8  // flexible match: match length in bytes (1,2,4)
+	PadRule      byte
+	FlexValue    uint32 // flexible match: expected value (host byte order, masked)
+	FlexMask     uint32 // flexible match: mask to apply before comparison
+}
+
+// PolicerConfig mirrors the C struct policer_config.
+type PolicerConfig struct {
+	RateBytesSec uint64  // CIR: token refill rate (bytes per second)
+	BurstBytes   uint64  // CBS: max committed bucket capacity (bytes)
+	Action       uint8   // POLICER_ACTION_DISCARD=0
+	ColorMode    uint8   // 0=single-rate, 1=two-rate, 2=single-rate-3c
+	Pad          [6]byte
+	PeakRate     uint64  // PIR: peak refill rate (two-rate only)
+	PeakBurst    uint64  // PBS/EBS: peak/excess burst size
 }
 
 // Filter match flag constants.
@@ -652,6 +669,14 @@ const (
 	FilterMatchDstNegate  = 1 << 9 // negate destination address match (prefix-list except)
 	FilterMatchTCPFlags   = 1 << 10 // match TCP flags bitmask
 	FilterMatchFragment   = 1 << 11 // match IP fragments
+	FilterMatchFlex       = 1 << 12 // flexible byte-offset match
+)
+
+// Policer color mode constants.
+const (
+	PolicerModeSingleRate = 0 // single-rate two-color (default)
+	PolicerModeTwoRate    = 1 // two-rate three-color (RFC 2698)
+	PolicerModeSR3C       = 2 // single-rate three-color (RFC 2697)
 )
 
 // Filter action constants.
@@ -679,3 +704,6 @@ const MaxFilterRules = 512
 
 // MaxFilterConfigs is the maximum number of filter configs.
 const MaxFilterConfigs = 64
+
+// MaxPolicers is the maximum number of policer configurations.
+const MaxPolicers = 64

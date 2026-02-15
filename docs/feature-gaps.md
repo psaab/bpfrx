@@ -22,14 +22,14 @@ Last updated: 2026-02-14
 | Routing Enhancements | 11 | 3 | 0 | 14 |
 | VPN Enhancements | 8 | 1 | 0 | 9 |
 | HA Enhancements | 3 | 2 | 2 | 7 |
-| Firewall Filter Enhancements | 4 | 1 | 0 | 5 |
+| Firewall Filter Enhancements | 0 | 0 | 0 | 0 |
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
 | Management & Automation | 10 | 2 | 0 | 12 |
 | Interface Enhancements | 5 | 1 | 2 | 8 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **148** | **20** | **9** | **177** |
+| **TOTAL** | **144** | **19** | **9** | **172** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -309,11 +309,11 @@ bpfrx has firewall filters with source/dest addresses, prefix-lists (with except
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Missing |
-| **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR | Medium | Missing |
-| **Interface Policer** | `firewall policer ... logical-interface-policer` | Aggregate rate limiting across all protocol families on a logical interface | Low | Missing |
-| **Flexible Match Conditions** | `firewall filter ... term ... from flexible-match-range ...` | Match on arbitrary byte offsets within packet header for custom protocol matching | Low | Missing |
-| **Firewall Filter on lo0** | `interfaces lo0 unit 0 family inet filter input ...` | Host-bound traffic filtering. bpfrx parses Lo0FilterInputV4/V6 but may not fully apply in BPF. | Medium | Partial (parsed and partially wired but needs verification) |
+| **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color policer with BPF per-CPU token bucket. | High | Implemented (Sprint FF-1) |
+| **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR. Single-rate (RFC 2697) and two-rate (RFC 2698) modes with color-blind/color-aware support. | Medium | Implemented (Sprint FF-1) |
+| **Interface Policer** | `firewall policer ... logical-interface-policer` | Aggregate rate limiting across all protocol families on a logical interface. Parsed as `LogicalInterfacePolicer` flag on policer config. | Low | Implemented (Sprint FF-1) |
+| **Flexible Match Conditions** | `firewall filter ... term ... from flexible-match-range ...` | Match on arbitrary byte offsets within packet header for custom protocol matching. BPF evaluates via meta fields (protocol, src/dst IP). | Low | Implemented (Sprint FF-1) |
+| **Firewall Filter on lo0** | `interfaces lo0 unit 0 family inet filter input ...` | Host-bound traffic filtering via native BPF evaluation in xdp_forward. lo0 filter IDs stored in flow_config_map, evaluated on host-inbound packets. | Medium | Implemented (Sprint FF-1) |
 
 ---
 

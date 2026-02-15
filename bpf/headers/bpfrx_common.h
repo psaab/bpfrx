@@ -538,6 +538,12 @@ struct nat_port_counter {
 #define MAX_FILTER_RULES   512
 #define MAX_FILTER_RULES_PER_FILTER 32
 
+/* Policer limits */
+#define MAX_POLICERS 64
+
+/* Policer action when rate exceeded */
+#define POLICER_ACTION_DISCARD 0
+
 /* Filter match flags */
 #define FILTER_MATCH_DSCP      (1 << 0)
 #define FILTER_MATCH_PROTOCOL  (1 << 1)
@@ -551,6 +557,7 @@ struct nat_port_counter {
 #define FILTER_MATCH_DST_NEGATE (1 << 9)  /* negate destination address match (prefix-list except) */
 #define FILTER_MATCH_TCP_FLAGS  (1 << 10) /* match TCP flags bitmask */
 #define FILTER_MATCH_FRAGMENT   (1 << 11) /* match IP fragments */
+#define FILTER_MATCH_FLEX       (1 << 12) /* flexible byte-offset match */
 
 /* Filter actions */
 #define FILTER_ACTION_ACCEPT   0
@@ -645,6 +652,38 @@ struct filter_rule {
 	__u8   dst_addr[16];
 	__u8   dst_mask[16];
 	__u32  routing_table;   /* VRF table ID (for FILTER_ACTION_ROUTE) */
+	__u8   policer_id;      /* policer index (0=none, 1-based) */
+	__u8   flex_offset;     /* flexible match: byte offset from L3 header start */
+	__u8   flex_length;     /* flexible match: match length in bytes (1,2,4) */
+	__u8   pad_rule;
+	__u32  flex_value;      /* flexible match: expected value (host byte order, masked) */
+	__u32  flex_mask;       /* flexible match: mask to apply before comparison */
+};
+
+/* ============================================================
+ * Policer configuration (supports single-rate and two-rate three-color)
+ * ============================================================ */
+
+/* color_mode values */
+#define POLICER_MODE_SINGLE_RATE  0  /* single-rate two-color (default) */
+#define POLICER_MODE_TWO_RATE     1  /* two-rate three-color (RFC 2698) */
+#define POLICER_MODE_SR3C         2  /* single-rate three-color (RFC 2697) */
+
+struct policer_config {
+	__u64 rate_bytes_sec;   /* CIR: token refill rate (bytes per second) */
+	__u64 burst_bytes;      /* CBS: max committed bucket capacity (bytes) */
+	__u8  action;           /* POLICER_ACTION_DISCARD=0 */
+	__u8  color_mode;       /* POLICER_MODE_* */
+	__u8  pad[6];
+	__u64 peak_rate;        /* PIR: peak refill rate (two-rate only, 0=unused) */
+	__u64 peak_burst;       /* PBS/EBS: peak/excess burst size (0=unused) */
+};
+
+struct policer_state {
+	__u64 tokens;           /* committed token count (bytes) */
+	__u64 last_refill_ns;   /* last refill timestamp (bpf_ktime_get_ns) */
+	__u64 peak_tokens;      /* peak/excess token count (three-color only) */
+	__u64 pad_state;        /* alignment */
 };
 
 /* ============================================================
@@ -660,6 +699,8 @@ struct flow_config {
 	__u8  gre_accel;       /* GRE performance acceleration */
 	__u8  alg_flags;       /* bit 0: DNS disable, bit 1: FTP disable,
 	                          bit 2: SIP disable, bit 3: TFTP disable */
+	__u16 lo0_filter_v4;   /* filter ID for lo0 inet input (0xFFFF=none) */
+	__u16 lo0_filter_v6;   /* filter ID for lo0 inet6 input (0xFFFF=none) */
 };
 
 /* ============================================================

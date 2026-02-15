@@ -145,6 +145,10 @@ type DataPlane interface {
 	SetFilterRule(index uint32, rule FilterRule) error
 	ClearFilterConfigs() error
 
+	// Policers
+	SetPolicerConfig(id uint32, cfg PolicerConfig) error
+	ClearPolicerConfigs() error
+
 	// Counters
 	ReadGlobalCounter(index uint32) (uint64, error)
 	ReadFloodCounters(zoneID uint16) (FloodState, error)

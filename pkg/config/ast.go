@@ -1130,6 +1130,38 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 	}},
 	"firewall": {children: map[string]*schemaNode{
+		"policer": {args: 1, multi: true, children: map[string]*schemaNode{
+			"if-exceeding": {children: map[string]*schemaNode{
+				"bandwidth-limit":   {args: 1, children: nil},
+				"burst-size-limit":  {args: 1, children: nil},
+			}},
+			"logical-interface-policer": {children: nil},
+			"then": {children: map[string]*schemaNode{
+				"discard":       {children: nil},
+				"loss-priority": {args: 1, children: nil},
+			}},
+		}},
+		"three-color-policer": {args: 1, multi: true, children: map[string]*schemaNode{
+			"single-rate": {children: map[string]*schemaNode{
+				"color-blind":                  {children: nil},
+				"color-aware":                  {children: nil},
+				"committed-information-rate":    {args: 1, children: nil},
+				"committed-burst-size":          {args: 1, children: nil},
+				"excess-burst-size":             {args: 1, children: nil},
+			}},
+			"two-rate": {children: map[string]*schemaNode{
+				"color-blind":                  {children: nil},
+				"color-aware":                  {children: nil},
+				"committed-information-rate":    {args: 1, children: nil},
+				"committed-burst-size":          {args: 1, children: nil},
+				"peak-information-rate":         {args: 1, children: nil},
+				"peak-burst-size":               {args: 1, children: nil},
+			}},
+			"then": {children: map[string]*schemaNode{
+				"discard":       {children: nil},
+				"loss-priority": {args: 1, children: nil},
+			}},
+		}},
 		"family": {children: map[string]*schemaNode{
 			"inet": {children: map[string]*schemaNode{
 				"filter": {args: 1, children: map[string]*schemaNode{
@@ -1147,6 +1179,16 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"icmp-code":               {args: 1, children: nil},
 							"tcp-flags":               {children: nil},
 							"is-fragment":             {children: nil},
+							"flexible-match-range": {children: map[string]*schemaNode{
+								"range": {args: 1, children: map[string]*schemaNode{
+									"match-start":  {args: 1, children: nil},
+									"byte-offset":  {args: 1, children: nil},
+									"bit-length":   {args: 1, children: nil},
+									"range":        {args: 1, children: nil},
+									"match-value":  {args: 1, children: nil},
+									"match-mask":   {args: 1, children: nil},
+								}},
+							}},
 						}},
 						"then": {children: map[string]*schemaNode{
 							"accept":           {children: nil},
@@ -1160,6 +1202,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"loss-priority":    {args: 1, children: nil},
 							"dscp":             {args: 1, children: nil},
 							"traffic-class":    {args: 1, children: nil},
+							"policer":          {args: 1, children: nil},
 						}},
 					}},
 				}},
@@ -1180,6 +1223,16 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"icmp-code":               {args: 1, children: nil},
 							"tcp-flags":               {children: nil},
 							"is-fragment":             {children: nil},
+							"flexible-match-range": {children: map[string]*schemaNode{
+								"range": {args: 1, children: map[string]*schemaNode{
+									"match-start":  {args: 1, children: nil},
+									"byte-offset":  {args: 1, children: nil},
+									"bit-length":   {args: 1, children: nil},
+									"range":        {args: 1, children: nil},
+									"match-value":  {args: 1, children: nil},
+									"match-mask":   {args: 1, children: nil},
+								}},
+							}},
 						}},
 						"then": {children: map[string]*schemaNode{
 							"accept":           {children: nil},
@@ -1193,6 +1246,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"loss-priority":    {args: 1, children: nil},
 							"dscp":             {args: 1, children: nil},
 							"traffic-class":    {args: 1, children: nil},
+							"policer":          {args: 1, children: nil},
 						}},
 					}},
 				}},

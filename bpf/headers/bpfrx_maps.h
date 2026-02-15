@@ -681,4 +681,24 @@ struct {
 	__type(value, __u64);
 } mirror_counter SEC(".maps");
 
+/* ============================================================
+ * Policer maps (single-rate two-color token bucket)
+ * ============================================================ */
+
+/* Policer configuration: policer_id -> config (written by userspace) */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_POLICERS);
+	__type(key, __u32);
+	__type(value, struct policer_config);
+} policer_configs SEC(".maps");
+
+/* Policer runtime state: per-CPU for lock-free token bucket */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, MAX_POLICERS);
+	__type(key, __u32);
+	__type(value, struct policer_state);
+} policer_states SEC(".maps");
+
 #endif /* __BPFRX_MAPS_H__ */

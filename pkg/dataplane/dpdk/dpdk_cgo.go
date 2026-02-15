@@ -1048,6 +1048,8 @@ func (m *Manager) SetFlowConfig(cfg dataplane.FlowConfigValue) error {
 	shm.flow_config.allow_embedded_icmp = C.uint8_t(cfg.AllowEmbeddedICMP)
 	shm.flow_config.gre_accel = C.uint8_t(cfg.GREAccel)
 	shm.flow_config.alg_flags = C.uint8_t(cfg.ALGFlags)
+	shm.flow_config.lo0_filter_v4 = C.uint16_t(cfg.Lo0FilterV4)
+	shm.flow_config.lo0_filter_v6 = C.uint16_t(cfg.Lo0FilterV6)
 	return nil
 }
 
@@ -1138,6 +1140,11 @@ func (m *Manager) SetFilterRule(index uint32, rule dataplane.FilterRule) error {
 	copyCBytes(ptr.dst_addr[:], rule.DstAddr[:])
 	copyCBytes(ptr.dst_mask[:], rule.DstMask[:])
 	ptr.routing_table = C.uint32_t(rule.RoutingTable)
+	ptr.policer_id = C.uint8_t(rule.PolicerID)
+	ptr.flex_offset = C.uint8_t(rule.FlexOffset)
+	ptr.flex_length = C.uint8_t(rule.FlexLength)
+	ptr.flex_value = C.uint32_t(rule.FlexValue)
+	ptr.flex_mask = C.uint32_t(rule.FlexMask)
 	return nil
 }
 
@@ -1152,6 +1159,11 @@ func (m *Manager) ClearFilterConfigs() error {
 		C.size_t(C.MAX_FILTER_RULES)*C.size_t(unsafe.Sizeof(C.struct_filter_rule{})))
 	return nil
 }
+
+// --- Policers ---
+
+func (m *Manager) SetPolicerConfig(id uint32, cfg dataplane.PolicerConfig) error { return nil }
+func (m *Manager) ClearPolicerConfigs() error                                    { return nil }
 
 // --- Counters ---
 

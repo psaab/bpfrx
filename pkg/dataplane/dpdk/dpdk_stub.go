@@ -215,6 +215,11 @@ func (m *Manager) ReadFilterConfig(filterID uint32) (dataplane.FilterConfig, err
 func (m *Manager) SetFilterRule(index uint32, rule dataplane.FilterRule) error { return nil }
 func (m *Manager) ClearFilterConfigs() error                                  { return nil }
 
+// --- Policers ---
+
+func (m *Manager) SetPolicerConfig(id uint32, cfg dataplane.PolicerConfig) error { return nil }
+func (m *Manager) ClearPolicerConfigs() error                                    { return nil }
+
 // --- Counters ---
 
 func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) { return 0, nil }

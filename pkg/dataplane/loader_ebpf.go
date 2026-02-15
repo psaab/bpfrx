@@ -31,6 +31,7 @@ var pinnedMaps = map[string]bool{
 	"nat_port_counters": true,
 	"xdp_progs":         true,
 	"tc_progs":          true,
+	"policer_states":    true, // per-CPU token bucket state survives restart
 }
 
 // loadAllObjects loads all eBPF programs and populates the Manager's
@@ -125,6 +126,8 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["redirect_capable"] = mainObjs.RedirectCapable
 	m.maps["cpu_map"] = mainObjs.CpuMap
 	m.maps["cpumap_available"] = mainObjs.CpumapAvailable
+	m.maps["policer_configs"] = mainObjs.PolicerConfigs
+	m.maps["policer_states"] = mainObjs.PolicerStates
 
 	// Store main program.
 	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
@@ -174,6 +177,8 @@ func (m *Manager) loadAllObjects() error {
 			"redirect_capable":   mainObjs.RedirectCapable,
 			"cpu_map":            mainObjs.CpuMap,
 			"cpumap_available":   mainObjs.CpumapAvailable,
+			"policer_configs":    mainObjs.PolicerConfigs,
+			"policer_states":     mainObjs.PolicerStates,
 		},
 	}
 

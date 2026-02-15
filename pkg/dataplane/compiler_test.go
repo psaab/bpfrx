@@ -29,7 +29,7 @@ func TestExpandFilterTermNegateFlags(t *testing.T) {
 		},
 	}
 
-	rules := expandFilterTerm(term, AFInet, nil, prefixLists)
+	rules := expandFilterTerm(term, AFInet, nil, prefixLists, nil)
 	// Source: 2 prefixes (except) × Dest: 1 prefix (normal) = 2 rules
 	if len(rules) != 2 {
 		t.Fatalf("expected 2 rules, got %d", len(rules))
@@ -69,7 +69,7 @@ func TestExpandFilterTermDstNegate(t *testing.T) {
 		},
 	}
 
-	rules := expandFilterTerm(term, AFInet, nil, prefixLists)
+	rules := expandFilterTerm(term, AFInet, nil, prefixLists, nil)
 	if len(rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(rules))
 	}
@@ -105,7 +105,7 @@ func TestExpandFilterTermNoNegateWithoutExcept(t *testing.T) {
 		},
 	}
 
-	rules := expandFilterTerm(term, AFInet, nil, prefixLists)
+	rules := expandFilterTerm(term, AFInet, nil, prefixLists, nil)
 	if len(rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(rules))
 	}
@@ -119,6 +119,77 @@ func TestExpandFilterTermNoNegateWithoutExcept(t *testing.T) {
 	}
 	if r.MatchFlags&FilterMatchDstNegate != 0 {
 		t.Error("unexpected FilterMatchDstNegate")
+	}
+}
+
+func TestExpandFilterTermFlexMatch(t *testing.T) {
+	term := &config.FirewallFilterTerm{
+		Name:   "flex-test",
+		Action: "discard",
+		FlexMatch: &config.FlexMatchConfig{
+			MatchStart: "layer-3",
+			ByteOffset: 9,
+			BitLength:  8,
+			Value:      0x11,
+			Mask:       0xFF,
+		},
+	}
+
+	rules := expandFilterTerm(term, AFInet, nil, nil, nil)
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+
+	r := rules[0]
+	if r.MatchFlags&FilterMatchFlex == 0 {
+		t.Error("missing FilterMatchFlex flag")
+	}
+	if r.FlexOffset != 9 {
+		t.Errorf("FlexOffset = %d, want 9", r.FlexOffset)
+	}
+	if r.FlexLength != 1 { // 8 bits / 8 = 1 byte
+		t.Errorf("FlexLength = %d, want 1", r.FlexLength)
+	}
+	if r.FlexValue != 0x11 {
+		t.Errorf("FlexValue = 0x%x, want 0x11", r.FlexValue)
+	}
+	if r.FlexMask != 0xFF {
+		t.Errorf("FlexMask = 0x%x, want 0xFF", r.FlexMask)
+	}
+	if r.Action != FilterActionDiscard {
+		t.Errorf("Action = %d, want discard", r.Action)
+	}
+}
+
+func TestExpandFilterTermPolicerAndFlex(t *testing.T) {
+	policerIDs := map[string]uint32{"my-pol": 1}
+	term := &config.FirewallFilterTerm{
+		Name:    "combo",
+		Action:  "accept",
+		Policer: "my-pol",
+		FlexMatch: &config.FlexMatchConfig{
+			MatchStart: "layer-3",
+			ByteOffset: 12,
+			BitLength:  32,
+			Value:      0x0a000000,
+			Mask:       0xff000000,
+		},
+	}
+
+	rules := expandFilterTerm(term, AFInet, nil, nil, policerIDs)
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+
+	r := rules[0]
+	if r.PolicerID != 1 {
+		t.Errorf("PolicerID = %d, want 1", r.PolicerID)
+	}
+	if r.MatchFlags&FilterMatchFlex == 0 {
+		t.Error("missing FilterMatchFlex flag")
+	}
+	if r.FlexOffset != 12 {
+		t.Errorf("FlexOffset = %d, want 12", r.FlexOffset)
 	}
 }
 

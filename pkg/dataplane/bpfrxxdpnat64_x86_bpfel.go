@@ -124,6 +124,12 @@ type bpfrxXdpNat64FilterRule struct {
 	DstAddr      [16]uint8
 	DstMask      [16]uint8
 	RoutingTable uint32
+	PolicerId    uint8
+	FlexOffset   uint8
+	FlexLength   uint8
+	PadRule      uint8
+	FlexValue    uint32
+	FlexMask     uint32
 }
 
 type bpfrxXdpNat64FloodState struct {
@@ -143,6 +149,8 @@ type bpfrxXdpNat64FlowConfig struct {
 	AllowEmbeddedIcmp uint8
 	GreAccel          uint8
 	AlgFlags          uint8
+	Lo0FilterV4       uint16
+	Lo0FilterV6       uint16
 }
 
 type bpfrxXdpNat64IfaceCounterValue struct {
@@ -307,6 +315,25 @@ type bpfrxXdpNat64PktMeta struct {
 	AppTimeout    uint16
 	MirrorIfindex uint32
 	MirrorRate    uint32
+}
+
+type bpfrxXdpNat64PolicerConfig struct {
+	_            structs.HostLayout
+	RateBytesSec uint64
+	BurstBytes   uint64
+	Action       uint8
+	ColorMode    uint8
+	Pad          [6]uint8
+	PeakRate     uint64
+	PeakBurst    uint64
+}
+
+type bpfrxXdpNat64PolicerState struct {
+	_            structs.HostLayout
+	Tokens       uint64
+	LastRefillNs uint64
+	PeakTokens   uint64
+	PadState     uint64
 }
 
 type bpfrxXdpNat64PolicyRule struct {
@@ -597,6 +624,8 @@ type bpfrxXdpNat64MapSpecs struct {
 	NatPortCounters   *ebpf.MapSpec `ebpf:"nat_port_counters"`
 	NatRuleCounters   *ebpf.MapSpec `ebpf:"nat_rule_counters"`
 	PktMetaScratch    *ebpf.MapSpec `ebpf:"pkt_meta_scratch"`
+	PolicerConfigs    *ebpf.MapSpec `ebpf:"policer_configs"`
+	PolicerStates     *ebpf.MapSpec `ebpf:"policer_states"`
 	PolicyCounters    *ebpf.MapSpec `ebpf:"policy_counters"`
 	PolicyRules       *ebpf.MapSpec `ebpf:"policy_rules"`
 	PortScanTrack     *ebpf.MapSpec `ebpf:"port_scan_track"`
@@ -679,6 +708,8 @@ type bpfrxXdpNat64Maps struct {
 	NatPortCounters   *ebpf.Map `ebpf:"nat_port_counters"`
 	NatRuleCounters   *ebpf.Map `ebpf:"nat_rule_counters"`
 	PktMetaScratch    *ebpf.Map `ebpf:"pkt_meta_scratch"`
+	PolicerConfigs    *ebpf.Map `ebpf:"policer_configs"`
+	PolicerStates     *ebpf.Map `ebpf:"policer_states"`
 	PolicyCounters    *ebpf.Map `ebpf:"policy_counters"`
 	PolicyRules       *ebpf.Map `ebpf:"policy_rules"`
 	PortScanTrack     *ebpf.Map `ebpf:"port_scan_track"`
@@ -737,6 +768,8 @@ func (m *bpfrxXdpNat64Maps) Close() error {
 		m.NatPortCounters,
 		m.NatRuleCounters,
 		m.PktMetaScratch,
+		m.PolicerConfigs,
+		m.PolicerStates,
 		m.PolicyCounters,
 		m.PolicyRules,
 		m.PortScanTrack,

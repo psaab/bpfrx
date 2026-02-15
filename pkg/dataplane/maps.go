@@ -670,8 +670,13 @@ type FlowConfigValue struct {
 	AllowDNSReply     uint8
 	AllowEmbeddedICMP uint8
 	GREAccel          uint8
-	ALGFlags          uint8 // bit 0: DNS disable, bit 1: FTP disable, bit 2: SIP disable, bit 3: TFTP disable
+	ALGFlags          uint8  // bit 0: DNS disable, bit 1: FTP disable, bit 2: SIP disable, bit 3: TFTP disable
+	Lo0FilterV4       uint16 // filter ID for lo0 inet input (0xFFFF=none)
+	Lo0FilterV6       uint16 // filter ID for lo0 inet6 input (0xFFFF=none)
 }
+
+// Lo0FilterNone is the sentinel value meaning no lo0 filter configured.
+const Lo0FilterNone = uint16(0xFFFF)
 
 // SetFlowConfig writes the global flow configuration (TCP MSS clamp, etc.).
 func (m *Manager) SetFlowConfig(cfg FlowConfigValue) error {
@@ -1025,6 +1030,28 @@ func (m *Manager) SetFilterRule(index uint32, rule FilterRule) error {
 		return fmt.Errorf("filter_rules not found")
 	}
 	return zm.Update(index, rule, ebpf.UpdateAny)
+}
+
+// SetPolicerConfig writes a policer configuration entry.
+func (m *Manager) SetPolicerConfig(id uint32, cfg PolicerConfig) error {
+	zm, ok := m.maps["policer_configs"]
+	if !ok {
+		return fmt.Errorf("policer_configs map not found")
+	}
+	return zm.Update(id, cfg, ebpf.UpdateAny)
+}
+
+// ClearPolicerConfigs zeroes all policer_configs entries.
+func (m *Manager) ClearPolicerConfigs() error {
+	zm, ok := m.maps["policer_configs"]
+	if !ok {
+		return fmt.Errorf("policer_configs map not found")
+	}
+	empty := PolicerConfig{}
+	for i := uint32(0); i < MaxPolicers; i++ {
+		zm.Update(i, empty, ebpf.UpdateAny)
+	}
+	return nil
 }
 
 // ClearFilterConfigs clears all filter config and rule entries.

@@ -538,6 +538,30 @@ struct filter_rule {
 	uint8_t  dst_addr[16];
 	uint8_t  dst_mask[16];
 	uint32_t routing_table;
+	uint8_t  policer_id;
+	uint8_t  flex_offset;
+	uint8_t  flex_length;
+	uint8_t  pad_rule;
+	uint32_t flex_value;
+	uint32_t flex_mask;
+};
+
+/* Policer configuration (supports single-rate and two-rate three-color) */
+struct policer_config {
+	uint64_t rate_bytes_sec;
+	uint64_t burst_bytes;
+	uint8_t  action;
+	uint8_t  color_mode;
+	uint8_t  pad[6];
+	uint64_t peak_rate;
+	uint64_t peak_burst;
+};
+
+struct policer_state {
+	uint64_t tokens;
+	uint64_t last_refill_ns;
+	uint64_t peak_tokens;
+	uint64_t pad_state;
 };
 
 /* ============================================================
@@ -576,6 +600,8 @@ struct flow_config {
 	uint8_t  allow_embedded_icmp;
 	uint8_t  gre_accel;
 	uint8_t  alg_flags;
+	uint16_t lo0_filter_v4;
+	uint16_t lo0_filter_v6;
 };
 
 /* ============================================================
@@ -750,6 +776,8 @@ struct shared_memory {
 	struct nat64_config     *nat64_configs;
 	struct filter_config    *filter_configs;
 	struct filter_rule      *filter_rules;
+	struct policer_config   *policer_configs;
+	struct policer_state    *policer_states;
 	struct flow_config      *flow_config;
 	uint32_t                *flow_timeouts;
 	uint8_t                 *default_policy;

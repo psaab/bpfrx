@@ -2237,6 +2237,139 @@ func TestFirewallFilterIsFragment(t *testing.T) {
 	}
 }
 
+func TestFirewallPolicer(t *testing.T) {
+	input := `firewall {
+    policer rate-limit-1m {
+        if-exceeding {
+            bandwidth-limit 1m;
+            burst-size-limit 15k;
+        }
+        then discard;
+    }
+    policer rate-limit-10g {
+        if-exceeding {
+            bandwidth-limit 10g;
+            burst-size-limit 1m;
+        }
+        then discard;
+    }
+    family inet {
+        filter with-policer {
+            term rate-limited {
+                from {
+                    protocol tcp;
+                }
+                then {
+                    policer rate-limit-1m;
+                    accept;
+                }
+            }
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, err := p.Parse()
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	cfg, cerr := CompileConfig(tree)
+	if cerr != nil {
+		t.Fatalf("compile error: %v", cerr)
+	}
+
+	// Check policer definitions
+	if len(cfg.Firewall.Policers) != 2 {
+		t.Fatalf("expected 2 policers, got %d", len(cfg.Firewall.Policers))
+	}
+
+	pol1m := cfg.Firewall.Policers["rate-limit-1m"]
+	if pol1m == nil {
+		t.Fatal("rate-limit-1m policer not found")
+	}
+	// 1m = 1,000,000 bits/sec = 125,000 bytes/sec
+	if pol1m.BandwidthLimit != 125000 {
+		t.Errorf("expected bandwidth 125000 bytes/sec, got %d", pol1m.BandwidthLimit)
+	}
+	// 15k = 15,000 bytes
+	if pol1m.BurstSizeLimit != 15000 {
+		t.Errorf("expected burst 15000 bytes, got %d", pol1m.BurstSizeLimit)
+	}
+	if pol1m.ThenAction != "discard" {
+		t.Errorf("expected action discard, got %q", pol1m.ThenAction)
+	}
+
+	pol10g := cfg.Firewall.Policers["rate-limit-10g"]
+	if pol10g == nil {
+		t.Fatal("rate-limit-10g policer not found")
+	}
+	// 10g = 10,000,000,000 bits/sec = 1,250,000,000 bytes/sec
+	if pol10g.BandwidthLimit != 1250000000 {
+		t.Errorf("expected bandwidth 1250000000 bytes/sec, got %d", pol10g.BandwidthLimit)
+	}
+	// 1m = 1,000,000 bytes
+	if pol10g.BurstSizeLimit != 1000000 {
+		t.Errorf("expected burst 1000000 bytes, got %d", pol10g.BurstSizeLimit)
+	}
+
+	// Check filter term has policer reference
+	f := cfg.Firewall.FiltersInet["with-policer"]
+	if f == nil {
+		t.Fatal("with-policer filter not found")
+	}
+	if len(f.Terms) != 1 {
+		t.Fatalf("expected 1 term, got %d", len(f.Terms))
+	}
+	if f.Terms[0].Policer != "rate-limit-1m" {
+		t.Errorf("expected policer rate-limit-1m, got %q", f.Terms[0].Policer)
+	}
+}
+
+func TestFirewallPolicerSetSyntax(t *testing.T) {
+	lines := []string{
+		"set firewall policer my-policer if-exceeding bandwidth-limit 500k",
+		"set firewall policer my-policer if-exceeding burst-size-limit 10k",
+		"set firewall policer my-policer then discard",
+		"set firewall family inet filter test-filter term t1 then policer my-policer",
+		"set firewall family inet filter test-filter term t1 then accept",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("parse set %q: %v", line, err)
+		}
+		tree.SetPath(cmd)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	// Check policer
+	pol := cfg.Firewall.Policers["my-policer"]
+	if pol == nil {
+		t.Fatal("my-policer not found")
+	}
+	// 500k = 500,000 bps = 62,500 bytes/sec
+	if pol.BandwidthLimit != 62500 {
+		t.Errorf("expected bandwidth 62500 bytes/sec, got %d", pol.BandwidthLimit)
+	}
+	// 10k = 10,000 bytes
+	if pol.BurstSizeLimit != 10000 {
+		t.Errorf("expected burst 10000 bytes, got %d", pol.BurstSizeLimit)
+	}
+
+	// Check filter reference
+	f := cfg.Firewall.FiltersInet["test-filter"]
+	if f == nil {
+		t.Fatal("test-filter not found")
+	}
+	if f.Terms[0].Policer != "my-policer" {
+		t.Errorf("expected policer my-policer, got %q", f.Terms[0].Policer)
+	}
+}
+
 func TestFirewallPrefixList(t *testing.T) {
 	input := `policy-options {
     prefix-list management-hosts {
@@ -12244,5 +12377,251 @@ func TestGenerateRoutesSetSyntax(t *testing.T) {
 	}
 	if !found {
 		t.Error("10.0.0.0/8 discard route not found")
+	}
+}
+
+func TestThreeColorPolicer(t *testing.T) {
+	input := `firewall {
+    three-color-policer tcp-3color {
+        two-rate {
+            color-blind;
+            committed-information-rate 10m;
+            committed-burst-size 100k;
+            peak-information-rate 50m;
+            peak-burst-size 500k;
+        }
+    }
+    three-color-policer sr-3color {
+        single-rate {
+            committed-information-rate 5m;
+            committed-burst-size 50k;
+            excess-burst-size 200k;
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, err := p.Parse()
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	cfg, cerr := CompileConfig(tree)
+	if cerr != nil {
+		t.Fatalf("compile error: %v", cerr)
+	}
+
+	if len(cfg.Firewall.ThreeColorPolicers) != 2 {
+		t.Fatalf("expected 2 three-color policers, got %d", len(cfg.Firewall.ThreeColorPolicers))
+	}
+
+	tcp := cfg.Firewall.ThreeColorPolicers["tcp-3color"]
+	if tcp == nil {
+		t.Fatal("tcp-3color policer not found")
+	}
+	if !tcp.TwoRate {
+		t.Error("expected TwoRate=true")
+	}
+	if !tcp.ColorBlind {
+		t.Error("expected ColorBlind=true")
+	}
+	// 10m = 10,000,000 bits/sec = 1,250,000 bytes/sec
+	if tcp.CIR != 1250000 {
+		t.Errorf("CIR = %d, want 1250000", tcp.CIR)
+	}
+	if tcp.CBS != 100000 {
+		t.Errorf("CBS = %d, want 100000", tcp.CBS)
+	}
+	// 50m = 50,000,000 bits/sec = 6,250,000 bytes/sec
+	if tcp.PIR != 6250000 {
+		t.Errorf("PIR = %d, want 6250000", tcp.PIR)
+	}
+	if tcp.PBS != 500000 {
+		t.Errorf("PBS = %d, want 500000", tcp.PBS)
+	}
+
+	sr := cfg.Firewall.ThreeColorPolicers["sr-3color"]
+	if sr == nil {
+		t.Fatal("sr-3color policer not found")
+	}
+	if sr.TwoRate {
+		t.Error("expected TwoRate=false for single-rate")
+	}
+	if sr.CIR != 625000 {
+		t.Errorf("CIR = %d, want 625000", sr.CIR)
+	}
+	if sr.CBS != 50000 {
+		t.Errorf("CBS = %d, want 50000", sr.CBS)
+	}
+	if sr.PBS != 200000 {
+		t.Errorf("PBS = %d, want 200000", sr.PBS)
+	}
+}
+
+func TestThreeColorPolicerSetSyntax(t *testing.T) {
+	lines := []string{
+		"set firewall three-color-policer my-3c two-rate color-blind",
+		"set firewall three-color-policer my-3c two-rate committed-information-rate 10m",
+		"set firewall three-color-policer my-3c two-rate committed-burst-size 100k",
+		"set firewall three-color-policer my-3c two-rate peak-information-rate 50m",
+		"set firewall three-color-policer my-3c two-rate peak-burst-size 500k",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(cmd)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	tcp := cfg.Firewall.ThreeColorPolicers["my-3c"]
+	if tcp == nil {
+		t.Fatal("my-3c policer not found")
+	}
+	if !tcp.TwoRate {
+		t.Error("expected TwoRate=true")
+	}
+	if !tcp.ColorBlind {
+		t.Error("expected ColorBlind=true")
+	}
+	if tcp.CIR != 1250000 {
+		t.Errorf("CIR = %d, want 1250000", tcp.CIR)
+	}
+	if tcp.PIR != 6250000 {
+		t.Errorf("PIR = %d, want 6250000", tcp.PIR)
+	}
+}
+
+func TestLogicalInterfacePolicer(t *testing.T) {
+	input := `firewall {
+    policer shared-rate {
+        logical-interface-policer;
+        if-exceeding {
+            bandwidth-limit 1m;
+            burst-size-limit 15k;
+        }
+        then discard;
+    }
+}
+`
+	p := NewParser(input)
+	tree, err := p.Parse()
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	cfg, cerr := CompileConfig(tree)
+	if cerr != nil {
+		t.Fatalf("compile error: %v", cerr)
+	}
+	pol := cfg.Firewall.Policers["shared-rate"]
+	if pol == nil {
+		t.Fatal("shared-rate policer not found")
+	}
+	if !pol.LogicalInterfacePolicer {
+		t.Error("expected LogicalInterfacePolicer=true")
+	}
+}
+
+func TestFlexibleMatchRange(t *testing.T) {
+	input := `firewall {
+    family inet {
+        filter flex-test {
+            term t1 {
+                from {
+                    flexible-match-range {
+                        range proto-check {
+                            match-start layer-3;
+                            byte-offset 9;
+                            bit-length 8;
+                            match-value 0x11;
+                            match-mask 0xFF;
+                        }
+                    }
+                }
+                then accept;
+            }
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, err := p.Parse()
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	cfg, cerr := CompileConfig(tree)
+	if cerr != nil {
+		t.Fatalf("compile error: %v", cerr)
+	}
+	f := cfg.Firewall.FiltersInet["flex-test"]
+	if f == nil {
+		t.Fatal("flex-test filter not found")
+	}
+	if len(f.Terms) != 1 {
+		t.Fatalf("expected 1 term, got %d", len(f.Terms))
+	}
+	fm := f.Terms[0].FlexMatch
+	if fm == nil {
+		t.Fatal("FlexMatch is nil")
+	}
+	if fm.MatchStart != "layer-3" {
+		t.Errorf("MatchStart = %q, want layer-3", fm.MatchStart)
+	}
+	if fm.ByteOffset != 9 {
+		t.Errorf("ByteOffset = %d, want 9", fm.ByteOffset)
+	}
+	if fm.BitLength != 8 {
+		t.Errorf("BitLength = %d, want 8", fm.BitLength)
+	}
+	if fm.Value != 0x11 {
+		t.Errorf("Value = 0x%x, want 0x11", fm.Value)
+	}
+	if fm.Mask != 0xFF {
+		t.Errorf("Mask = 0x%x, want 0xFF", fm.Mask)
+	}
+}
+
+func TestFlexibleMatchRangeSetSyntax(t *testing.T) {
+	lines := []string{
+		"set firewall family inet filter flex-set term t1 from flexible-match-range range r1 match-start layer-3",
+		"set firewall family inet filter flex-set term t1 from flexible-match-range range r1 byte-offset 12",
+		"set firewall family inet filter flex-set term t1 from flexible-match-range range r1 bit-length 32",
+		"set firewall family inet filter flex-set term t1 from flexible-match-range range r1 range 0x0a000000/0xff000000",
+		"set firewall family inet filter flex-set term t1 then discard",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(cmd)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	f := cfg.Firewall.FiltersInet["flex-set"]
+	if f == nil {
+		t.Fatal("flex-set filter not found")
+	}
+	fm := f.Terms[0].FlexMatch
+	if fm == nil {
+		t.Fatal("FlexMatch is nil")
+	}
+	if fm.ByteOffset != 12 {
+		t.Errorf("ByteOffset = %d, want 12", fm.ByteOffset)
+	}
+	if fm.BitLength != 32 {
+		t.Errorf("BitLength = %d, want 32", fm.BitLength)
+	}
+	if fm.Value != 0x0a000000 {
+		t.Errorf("Value = 0x%x, want 0x0a000000", fm.Value)
+	}
+	if fm.Mask != 0xff000000 {
+		t.Errorf("Mask = 0x%x, want 0xff000000", fm.Mask)
 	}
 }

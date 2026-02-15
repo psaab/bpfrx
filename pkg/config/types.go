@@ -494,8 +494,31 @@ type FlowServer struct {
 
 // FirewallConfig holds firewall filter definitions.
 type FirewallConfig struct {
-	FiltersInet  map[string]*FirewallFilter // family inet filters
-	FiltersInet6 map[string]*FirewallFilter // family inet6 filters
+	FiltersInet        map[string]*FirewallFilter        // family inet filters
+	FiltersInet6       map[string]*FirewallFilter        // family inet6 filters
+	Policers           map[string]*PolicerConfig         // named policer definitions
+	ThreeColorPolicers map[string]*ThreeColorPolicerConfig // named three-color policers
+}
+
+// PolicerConfig defines a single-rate two-color policer (token bucket).
+type PolicerConfig struct {
+	Name                   string
+	BandwidthLimit         uint64 // bytes per second (converted from Junos bits/sec)
+	BurstSizeLimit         uint64 // burst bucket size in bytes
+	ThenAction             string // "discard" or "loss-priority high/medium-high/medium-low/low"
+	LogicalInterfacePolicer bool  // shared across protocol families on the interface
+}
+
+// ThreeColorPolicerConfig defines a three-color policer (RFC 2697/2698).
+type ThreeColorPolicerConfig struct {
+	Name       string
+	TwoRate    bool   // true=two-rate (RFC 2698), false=single-rate (RFC 2697)
+	ColorBlind bool   // color-blind mode (default: color-aware)
+	CIR        uint64 // committed information rate (bytes/sec)
+	CBS        uint64 // committed burst size (bytes)
+	PIR        uint64 // peak information rate (bytes/sec, two-rate only)
+	PBS        uint64 // peak/excess burst size (bytes)
+	ThenAction string // action on exceed/violate: "discard" or "loss-priority"
 }
 
 // FirewallFilter defines a named firewall filter with ordered terms.
@@ -526,6 +549,17 @@ type FirewallFilterTerm struct {
 	ForwardingClass    string              // forwarding-class name
 	LossPriority       string              // loss-priority (low, medium-low, medium-high, high)
 	DSCPRewrite        string              // then dscp <value> — rewrite DSCP/traffic-class
+	Policer            string              // then policer <name> — reference to policer definition
+	FlexMatch          *FlexMatchConfig    // flexible-match-range configuration
+}
+
+// FlexMatchConfig defines a flexible byte-offset match condition.
+type FlexMatchConfig struct {
+	MatchStart string // "layer-3" (only supported start point)
+	ByteOffset uint8  // byte offset from match start
+	BitLength  uint8  // match length in bits (8, 16, 32)
+	Value      uint32 // expected value (after mask)
+	Mask       uint32 // mask to apply before comparison
 }
 
 // PrefixListRef references a named prefix-list with optional "except" modifier.

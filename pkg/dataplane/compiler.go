@@ -29,6 +29,9 @@ type CompileResult struct {
 	PolicySets int               // number of policy sets created
 	FilterIDs  map[string]uint32 // "inet:name" or "inet6:name" -> filter_id
 
+	Lo0FilterV4 uint32 // lo0 inet filter ID (0=none), set by compileFirewallFilters
+	Lo0FilterV6 uint32 // lo0 inet6 filter ID (0=none), set by compileFirewallFilters
+
 	nextAddrID       uint32            // next available address ID (after address book)
 	implicitSets     map[string]uint32 // cache of implicit set key -> set ID
 	nextNATCounterID uint16            // next available NAT rule counter ID (1-based, 0 = no counter)
@@ -65,6 +68,8 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		implicitSets:     make(map[string]uint32),
 		nextNATCounterID: 1, // 0 = no counter
 		NATCounterIDs:    make(map[string]uint16),
+		Lo0FilterV4:      0xFFFFFFFF, // sentinel: no lo0 filter
+		Lo0FilterV6:      0xFFFFFFFF,
 	}
 
 	// Phase 1: Assign zone IDs (1-based; 0 = unassigned).
@@ -144,14 +149,14 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		return nil, fmt.Errorf("compile flow timeouts: %w", err)
 	}
 
-	// Phase 9b: Compile flow config (TCP MSS clamp, etc.)
-	if err := compileFlowConfig(dp, cfg); err != nil {
-		return nil, fmt.Errorf("compile flow config: %w", err)
-	}
-
-	// Phase 10: Compile firewall filters
+	// Phase 10: Compile firewall filters (before flow config so lo0 IDs are available)
 	if err := compileFirewallFilters(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile firewall filters: %w", err)
+	}
+
+	// Phase 10b: Compile flow config (TCP MSS clamp, lo0 filter IDs, etc.)
+	if err := compileFlowConfig(dp, cfg, result); err != nil {
+		return nil, fmt.Errorf("compile flow config: %w", err)
 	}
 
 	// Phase 11: Compile port mirroring
@@ -2208,7 +2213,7 @@ func compileFlowTimeouts(dp DataPlane,cfg *config.Config) error {
 	return nil
 }
 
-func compileFlowConfig(dp DataPlane,cfg *config.Config) error {
+func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	flow := &cfg.Security.Flow
 	fc := FlowConfigValue{
 		TCPMSSIPsec: uint16(flow.TCPMSSIPsecVPN),
@@ -2240,6 +2245,18 @@ func compileFlowConfig(dp DataPlane,cfg *config.Config) error {
 		fc.ALGFlags |= 0x08
 	}
 
+	// Lo0 filter IDs for host-bound traffic filtering (0xFFFF = none)
+	if result.Lo0FilterV4 != 0xFFFFFFFF {
+		fc.Lo0FilterV4 = uint16(result.Lo0FilterV4)
+	} else {
+		fc.Lo0FilterV4 = Lo0FilterNone
+	}
+	if result.Lo0FilterV6 != 0xFFFFFFFF {
+		fc.Lo0FilterV6 = uint16(result.Lo0FilterV6)
+	} else {
+		fc.Lo0FilterV6 = Lo0FilterNone
+	}
+
 	if err := dp.SetFlowConfig(fc); err != nil {
 		return err
 	}
@@ -2249,7 +2266,9 @@ func compileFlowConfig(dp DataPlane,cfg *config.Config) error {
 		"tcp_mss_gre_in", fc.TCPMSSGreIn,
 		"tcp_mss_gre_out", fc.TCPMSSGreOut,
 		"allow_dns_reply", fc.AllowDNSReply,
-		"allow_embedded_icmp", fc.AllowEmbeddedICMP)
+		"allow_embedded_icmp", fc.AllowEmbeddedICMP,
+		"lo0_filter_v4", fc.Lo0FilterV4,
+		"lo0_filter_v6", fc.Lo0FilterV6)
 
 	return nil
 }
@@ -2415,7 +2434,7 @@ func parsePortRange(spec string) (uint16, uint16, error) {
 }
 
 // compileFirewallFilters compiles firewall filter config into BPF maps.
-// It creates filter_rules, filter_configs, and iface_filter_map entries.
+// It creates filter_rules, filter_configs, iface_filter_map, and policer_configs entries.
 func compileFirewallFilters(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenIfaceFilter := make(map[IfaceFilterKey]bool)
@@ -2425,6 +2444,73 @@ func compileFirewallFilters(dp DataPlane,cfg *config.Config, result *CompileResu
 	for _, ri := range cfg.RoutingInstances {
 		if ri.InstanceType != "forwarding" {
 			riTableIDs[ri.Name] = uint32(ri.TableID)
+		}
+	}
+
+	// Compile policer definitions (sorted for deterministic IDs, 1-based)
+	policerIDs := make(map[string]uint32) // policer name -> ID (1-based)
+	if len(cfg.Firewall.Policers) > 0 {
+		polNames := make([]string, 0, len(cfg.Firewall.Policers))
+		for name := range cfg.Firewall.Policers {
+			polNames = append(polNames, name)
+		}
+		sort.Strings(polNames)
+		for i, name := range polNames {
+			polID := uint32(i + 1) // 1-based (0 = no policer)
+			if polID >= MaxPolicers {
+				slog.Warn("policer limit reached", "policer", name)
+				break
+			}
+			pol := cfg.Firewall.Policers[name]
+			bpfCfg := PolicerConfig{
+				RateBytesSec: pol.BandwidthLimit,
+				BurstBytes:   pol.BurstSizeLimit,
+			}
+			if err := dp.SetPolicerConfig(polID, bpfCfg); err != nil {
+				return fmt.Errorf("set policer config %s: %w", name, err)
+			}
+			policerIDs[name] = polID
+			slog.Info("compiled policer",
+				"name", name, "rate_bps", pol.BandwidthLimit,
+				"burst", pol.BurstSizeLimit, "id", polID)
+		}
+	}
+
+	// Compile three-color policer definitions (continue IDs after single-rate)
+	if len(cfg.Firewall.ThreeColorPolicers) > 0 {
+		nextPolID := uint32(len(policerIDs) + 1) // continue after single-rate IDs
+		tcpNames := make([]string, 0, len(cfg.Firewall.ThreeColorPolicers))
+		for name := range cfg.Firewall.ThreeColorPolicers {
+			tcpNames = append(tcpNames, name)
+		}
+		sort.Strings(tcpNames)
+		for _, name := range tcpNames {
+			polID := nextPolID
+			if polID >= MaxPolicers {
+				slog.Warn("three-color policer limit reached", "policer", name)
+				break
+			}
+			tcp := cfg.Firewall.ThreeColorPolicers[name]
+			bpfCfg := PolicerConfig{
+				RateBytesSec: tcp.CIR,
+				BurstBytes:   tcp.CBS,
+				PeakRate:     tcp.PIR,
+				PeakBurst:    tcp.PBS,
+			}
+			if tcp.TwoRate {
+				bpfCfg.ColorMode = PolicerModeTwoRate
+			} else {
+				bpfCfg.ColorMode = PolicerModeSR3C
+			}
+			if err := dp.SetPolicerConfig(polID, bpfCfg); err != nil {
+				return fmt.Errorf("set three-color policer %s: %w", name, err)
+			}
+			policerIDs[name] = polID
+			slog.Info("compiled three-color policer",
+				"name", name, "mode", bpfCfg.ColorMode,
+				"cir", tcp.CIR, "cbs", tcp.CBS,
+				"pir", tcp.PIR, "pbs", tcp.PBS, "id", polID)
+			nextPolID++
 		}
 	}
 
@@ -2446,7 +2532,7 @@ func compileFirewallFilters(dp DataPlane,cfg *config.Config, result *CompileResu
 		}
 		startIdx := ruleIdx
 		for _, term := range filter.Terms {
-			rules := expandFilterTerm(term, AFInet, riTableIDs, cfg.PolicyOptions.PrefixLists)
+			rules := expandFilterTerm(term, AFInet, riTableIDs, cfg.PolicyOptions.PrefixLists, policerIDs)
 			for _, rule := range rules {
 				if ruleIdx >= MaxFilterRules {
 					slog.Warn("filter rule limit reached", "filter", name, "term", term.Name)
@@ -2486,7 +2572,7 @@ func compileFirewallFilters(dp DataPlane,cfg *config.Config, result *CompileResu
 		}
 		startIdx := ruleIdx
 		for _, term := range filter.Terms {
-			rules := expandFilterTerm(term, AFInet6, riTableIDs, cfg.PolicyOptions.PrefixLists)
+			rules := expandFilterTerm(term, AFInet6, riTableIDs, cfg.PolicyOptions.PrefixLists, policerIDs)
 			for _, rule := range rules {
 				if ruleIdx >= MaxFilterRules {
 					slog.Warn("filter rule limit reached", "filter", name, "term", term.Name)
@@ -2651,12 +2737,31 @@ func compileFirewallFilters(dp DataPlane,cfg *config.Config, result *CompileResu
 	dp.ZeroStaleFilterConfigs(filterID)
 
 	result.FilterIDs = filterIDs
+
+	// Resolve lo0 filter IDs for host-bound traffic filtering
+	if cfg.System.Lo0FilterInputV4 != "" {
+		if fid, ok := filterIDs["inet:"+cfg.System.Lo0FilterInputV4]; ok {
+			result.Lo0FilterV4 = fid
+			slog.Info("lo0 inet filter assigned", "filter", cfg.System.Lo0FilterInputV4, "id", fid)
+		} else {
+			slog.Warn("lo0 inet filter not found", "filter", cfg.System.Lo0FilterInputV4)
+		}
+	}
+	if cfg.System.Lo0FilterInputV6 != "" {
+		if fid, ok := filterIDs["inet6:"+cfg.System.Lo0FilterInputV6]; ok {
+			result.Lo0FilterV6 = fid
+			slog.Info("lo0 inet6 filter assigned", "filter", cfg.System.Lo0FilterInputV6, "id", fid)
+		} else {
+			slog.Warn("lo0 inet6 filter not found", "filter", cfg.System.Lo0FilterInputV6)
+		}
+	}
+
 	return nil
 }
 
 // expandFilterTerm expands a single filter term into one or more BPF filter rules.
 // Terms with multiple source/destination addresses generate the cross product of rules.
-func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs map[string]uint32, prefixLists map[string]*config.PrefixList) []FilterRule {
+func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs map[string]uint32, prefixLists map[string]*config.PrefixList, policerIDs map[string]uint32) []FilterRule {
 	// Base rule with common fields
 	base := FilterRule{
 		Family:      family,
@@ -2716,6 +2821,16 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		}
 	}
 
+	// Policer reference
+	if term.Policer != "" {
+		if polID, ok := policerIDs[term.Policer]; ok {
+			base.PolicerID = uint8(polID)
+		} else {
+			slog.Warn("policer not found for filter term",
+				"term", term.Name, "policer", term.Policer)
+		}
+	}
+
 	// Protocol match
 	if term.Protocol != "" {
 		base.MatchFlags |= FilterMatchProtocol
@@ -2770,6 +2885,18 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 	if term.IsFragment {
 		base.MatchFlags |= FilterMatchFragment
 		base.IsFragment = 1
+	}
+
+	// Flexible match
+	if term.FlexMatch != nil {
+		base.MatchFlags |= FilterMatchFlex
+		base.FlexOffset = term.FlexMatch.ByteOffset
+		base.FlexLength = term.FlexMatch.BitLength / 8
+		if base.FlexLength == 0 {
+			base.FlexLength = 4 // default 32-bit
+		}
+		base.FlexValue = term.FlexMatch.Value & term.FlexMatch.Mask
+		base.FlexMask = term.FlexMatch.Mask
 	}
 
 	// Expand prefix list references into address lists.

@@ -41,6 +41,22 @@ int xdp_forward_prog(struct xdp_md *ctx)
 				return XDP_DROP;
 			}
 		}
+		/* Evaluate lo0 input filter for host-bound traffic */
+		{
+			__u32 fc_key = 0;
+			struct flow_config *fcfg =
+				bpf_map_lookup_elem(&flow_config_map, &fc_key);
+			if (fcfg) {
+				__u16 lo0_fid = (meta->addr_family == AF_INET)
+					? fcfg->lo0_filter_v4
+					: fcfg->lo0_filter_v6;
+				if (lo0_fid != 0xFFFF &&
+				    evaluate_filter_by_id((__u32)lo0_fid, meta) < 0) {
+					inc_counter(GLOBAL_CTR_HOST_INBOUND_DENY);
+					return XDP_DROP;
+				}
+			}
+		}
 		/* Push VLAN tag back so kernel delivers to sub-interface
 		 * (e.g. DHCP on enp10s0f0.100 needs tagged frames). */
 		if (meta->ingress_vlan_id != 0) {
