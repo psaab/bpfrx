@@ -63,12 +63,13 @@ func main() {
 		configMode: false,
 	}
 
+	rc := &remoteCompleter{ctl: c}
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          c.operationalPrompt(),
 		HistoryFile:     "/tmp/cli_history",
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
-		AutoComplete:    &remoteCompleter{ctl: c},
+		AutoComplete:    rc,
 		Stdin:           os.Stdin,
 		Stdout:          os.Stdout,
 		Stderr:          os.Stderr,
@@ -91,6 +92,7 @@ func main() {
 			})
 			if err != nil || len(resp.Candidates) == 0 {
 				fmt.Fprintln(c.rl.Stdout(), "  (no help available)")
+				rc.helpWritten = true
 				return cleanLine, pos - 1, true
 			}
 			candidates := make([]cmdtree.Candidate, len(resp.Candidates))
@@ -108,6 +110,8 @@ func main() {
 			}
 			sort.Slice(candidates, func(i, j int) bool { return candidates[i].Name < candidates[j].Name })
 			cmdtree.WriteHelp(c.rl.Stdout(), candidates)
+			// Suppress duplicate help if readline calls Do() for this key.
+			rc.helpWritten = true
 			return cleanLine, pos - 1, true
 		}),
 	})
@@ -2672,10 +2676,17 @@ var pipeFilterDescs = map[string]string{
 }
 
 type remoteCompleter struct {
-	ctl *ctl
+	ctl         *ctl
+	helpWritten bool // set by ? Listener to suppress duplicate help from Do()
 }
 
 func (rc *remoteCompleter) Do(line []rune, pos int) ([][]rune, int) {
+	// If the ? Listener already wrote help, suppress duplicate output.
+	if rc.helpWritten {
+		rc.helpWritten = false
+		return nil, 0
+	}
+
 	text := string(line[:pos])
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

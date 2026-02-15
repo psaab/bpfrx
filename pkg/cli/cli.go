@@ -162,10 +162,17 @@ var configTopLevel = cmdtree.ConfigTopLevel
 
 // cliCompleter implements readline.AutoCompleter.
 type cliCompleter struct {
-	cli *CLI
+	cli          *CLI
+	helpWritten  bool // set by ? Listener to suppress duplicate help from Do()
 }
 
 func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
+	// If the ? Listener already wrote help, suppress duplicate output.
+	if cc.helpWritten {
+		cc.helpWritten = false
+		return nil, 0
+	}
+
 	text := string(line[:pos])
 
 	// Pipe filter completion: "show ... | <tab>"
@@ -352,12 +359,13 @@ func formatAmbiguousMatches(matches []string) string {
 // Run starts the interactive CLI loop.
 func (c *CLI) Run() error {
 	var err error
+	completer := &cliCompleter{cli: c}
 	c.rl, err = readline.NewEx(&readline.Config{
 		Prompt:          c.operationalPrompt(),
 		HistoryFile:     "/tmp/bpfrx_history",
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
-		AutoComplete:    &cliCompleter{cli: c},
+		AutoComplete:    completer,
 		Stdin:           os.Stdin,
 		Stdout:          os.Stdout,
 		Stderr:          os.Stderr,
@@ -377,6 +385,8 @@ func (c *CLI) Run() error {
 				if len(pipeCandidates) > 0 {
 					writeCompletionHelp(c.rl.Stdout(), pipeCandidates)
 				}
+				// Suppress duplicate help if readline calls Do() for this key.
+				completer.helpWritten = true
 				return cleanLine, pos - 1, true
 			}
 
@@ -410,6 +420,8 @@ func (c *CLI) Run() error {
 			if len(candidates) > 0 {
 				writeCompletionHelp(c.rl.Stdout(), candidates)
 			}
+			// Suppress duplicate help if readline calls Do() for this key.
+			completer.helpWritten = true
 			return cleanLine, pos - 1, true
 		}),
 	})

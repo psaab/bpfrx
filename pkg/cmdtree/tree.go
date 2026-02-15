@@ -656,6 +656,8 @@ func LookupDesc(words []string, name string, configMode bool) string {
 }
 
 // WriteHelp prints aligned completion candidates to w.
+// The entire output is built as a single string and written in one call
+// so that readline's wrapWriter triggers only one Refresh cycle.
 func WriteHelp(w io.Writer, candidates []Candidate) {
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Name < candidates[j].Name })
 	maxWidth := 20
@@ -664,14 +666,16 @@ func WriteHelp(w io.Writer, candidates []Candidate) {
 			maxWidth = len(c.Name) + 2
 		}
 	}
-	fmt.Fprintln(w, "Possible completions:")
+	var sb strings.Builder
+	sb.WriteString("Possible completions:\n")
 	for _, c := range candidates {
 		if c.Desc != "" {
-			fmt.Fprintf(w, "  %-*s %s\n", maxWidth, c.Name, c.Desc)
+			fmt.Fprintf(&sb, "  %-*s %s\n", maxWidth, c.Name, c.Desc)
 		} else {
-			fmt.Fprintf(w, "  %s\n", c.Name)
+			fmt.Fprintf(&sb, "  %s\n", c.Name)
 		}
 	}
+	io.WriteString(w, sb.String())
 }
 
 // PrintTreeHelp prints self-generating help from a tree path.
