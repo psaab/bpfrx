@@ -2391,6 +2391,21 @@ func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.Sc
 			out = append(out, config.SchemaCompletion{Name: name, Desc: desc})
 		}
 		return out
+	case config.ValueHintPolicyAddress:
+		out := []config.SchemaCompletion{
+			{Name: "any", Desc: "Any IPv4 or IPv6 address"},
+			{Name: "any-ipv4", Desc: "Any IPv4 address"},
+			{Name: "any-ipv6", Desc: "Any IPv6 address"},
+		}
+		if cfg.Security.AddressBook != nil {
+			for _, addr := range cfg.Security.AddressBook.Addresses {
+				out = append(out, config.SchemaCompletion{Name: addr.Name, Desc: addr.Value})
+			}
+			for _, as := range cfg.Security.AddressBook.AddressSets {
+				out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "address-set"})
+			}
+		}
+		return out
 	case config.ValueHintUnitNumber:
 		var ifaceName string
 		for i, tok := range path {

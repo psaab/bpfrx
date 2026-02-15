@@ -649,6 +649,7 @@ const (
 	ValueHintStreamName              // stream <name>
 	ValueHintAppSetName              // application-set <name>
 	ValueHintUnitNumber              // unit <number>
+	ValueHintPolicyAddress           // policy match source/destination-address
 )
 
 // SchemaCompletion is a completion candidate from the config schema.
@@ -699,9 +700,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"policy": {args: 1, children: map[string]*schemaNode{
 					"description": {args: 1, children: nil},
 					"match": {children: map[string]*schemaNode{
-						"source-address":      {args: 1, multi: true, children: nil},
-						"destination-address":  {args: 1, multi: true, children: nil},
-						"application":          {args: 1, multi: true, children: nil},
+						"source-address":      {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},
+						"destination-address":  {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},
+						"application":          {args: 1, multi: true, valueHint: ValueHintAppName, children: nil},
 					}},
 					"then": {children: map[string]*schemaNode{
 						"log": {children: nil},
@@ -713,9 +714,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"policy": {args: 1, children: map[string]*schemaNode{
 					"description": {args: 1, children: nil},
 					"match": {children: map[string]*schemaNode{
-						"source-address":      {args: 1, multi: true, children: nil},
-						"destination-address":  {args: 1, multi: true, children: nil},
-						"application":          {args: 1, multi: true, children: nil},
+						"source-address":      {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},
+						"destination-address":  {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},
+						"application":          {args: 1, multi: true, valueHint: ValueHintAppName, children: nil},
 					}},
 					"then": {children: map[string]*schemaNode{
 						"log": {children: nil},
@@ -2218,6 +2219,177 @@ func formatSetNodes(b *strings.Builder, nodes []*Node, prefix []string) {
 		} else {
 			formatSetNodes(b, n.Children, path)
 		}
+	}
+}
+
+// FormatCompare produces a Junos-style hierarchical diff between two trees.
+// It shows [edit <path>] context headers and +/- prefixed lines for added/removed content.
+// Unchanged sibling nodes within changed containers are shown collapsed as "name { ... }".
+func FormatCompare(oldTree, newTree *ConfigTree) string {
+	var b strings.Builder
+	diffNodes(&b, oldTree.Children, newTree.Children, nil)
+	return b.String()
+}
+
+// diffNodes compares two sets of children at the same tree level.
+// It recurses into modified containers to find the deepest [edit] context,
+// only showing siblings at the level where actual leaf changes occur.
+func diffNodes(b *strings.Builder, oldNodes, newNodes []*Node, editPath []string) {
+	oldByKey := make(map[string]*Node, len(oldNodes))
+	for _, n := range oldNodes {
+		oldByKey[n.KeyPath()] = n
+	}
+	newByKey := make(map[string]*Node, len(newNodes))
+	for _, n := range newNodes {
+		newByKey[n.KeyPath()] = n
+	}
+
+	// Collect changed entries at this level.
+	type diffEntry struct {
+		oldNode *Node
+		newNode *Node
+	}
+
+	// Use canonical ordering from new tree, then appended removed-only entries.
+	seen := make(map[string]bool)
+	var entries []diffEntry
+	for _, n := range canonicalOrder(newNodes) {
+		kp := n.KeyPath()
+		seen[kp] = true
+		old := oldByKey[kp]
+		if old == nil || !nodesEqual(old, n) {
+			entries = append(entries, diffEntry{oldNode: old, newNode: n})
+		}
+	}
+	for _, n := range canonicalOrder(oldNodes) {
+		kp := n.KeyPath()
+		if !seen[kp] {
+			entries = append(entries, diffEntry{oldNode: n, newNode: nil})
+		}
+	}
+
+	if len(entries) == 0 {
+		return
+	}
+
+	// Check if all changes can be recursed into (both old and new are blocks).
+	// If so, recurse without printing siblings at this level.
+	allRecursable := true
+	for _, e := range entries {
+		if e.oldNode == nil || e.newNode == nil {
+			allRecursable = false
+			break
+		}
+		if e.oldNode.IsLeaf || e.newNode.IsLeaf {
+			allRecursable = false
+			break
+		}
+	}
+
+	if allRecursable {
+		// All changes are in modified sub-containers — recurse deeper without showing this level.
+		for _, e := range entries {
+			childPath := append(append([]string{}, editPath...), strings.Fields(e.oldNode.KeyPath())...)
+			diffNodes(b, e.oldNode.Children, e.newNode.Children, childPath)
+		}
+		return
+	}
+
+	// Print [edit <path>] header — this is the level where leaf changes exist.
+	if len(editPath) > 0 {
+		fmt.Fprintf(b, "[edit %s]\n", strings.Join(editPath, " "))
+	}
+
+	// Show all children at this level: unchanged as collapsed, added/removed with prefix.
+	// Merge all nodes from both old and new in canonical order (new first, then old-only).
+	seen2 := make(map[string]bool)
+	var allEntries []diffEntry
+	for _, n := range canonicalOrder(newNodes) {
+		kp := n.KeyPath()
+		seen2[kp] = true
+		allEntries = append(allEntries, diffEntry{oldNode: oldByKey[kp], newNode: n})
+	}
+	for _, n := range canonicalOrder(oldNodes) {
+		if !seen2[n.KeyPath()] {
+			allEntries = append(allEntries, diffEntry{oldNode: n, newNode: nil})
+		}
+	}
+
+	indent := "    "
+	for _, e := range allEntries {
+		switch {
+		case e.oldNode == nil:
+			// Added
+			formatPrefixed(b, "+", indent, e.newNode)
+		case e.newNode == nil:
+			// Removed
+			formatPrefixed(b, "-", indent, e.oldNode)
+		case nodesEqual(e.oldNode, e.newNode):
+			// Unchanged — show collapsed
+			if e.oldNode.IsLeaf {
+				fmt.Fprintf(b, " %s%s;\n", indent, e.oldNode.KeyPath())
+			} else {
+				fmt.Fprintf(b, " %s%s { ... }\n", indent, e.oldNode.KeyPath())
+			}
+		default:
+			// Modified
+			if !e.oldNode.IsLeaf && !e.newNode.IsLeaf {
+				// Both are blocks — show [edit] context for sub-container
+				childPath := append(append([]string{}, editPath...), strings.Fields(e.oldNode.KeyPath())...)
+				diffNodes(b, e.oldNode.Children, e.newNode.Children, childPath)
+			} else {
+				formatPrefixed(b, "-", indent, e.oldNode)
+				formatPrefixed(b, "+", indent, e.newNode)
+			}
+		}
+	}
+}
+
+// nodesEqual returns true if two nodes have identical content (deep comparison).
+func nodesEqual(a, b *Node) bool {
+	if a.KeyPath() != b.KeyPath() {
+		return false
+	}
+	if a.IsLeaf != b.IsLeaf {
+		return false
+	}
+	if a.IsLeaf {
+		return true
+	}
+	if len(a.Children) != len(b.Children) {
+		return false
+	}
+	bByKey := make(map[string]*Node, len(b.Children))
+	for _, n := range b.Children {
+		bByKey[n.KeyPath()] = n
+	}
+	for _, ac := range a.Children {
+		bc, ok := bByKey[ac.KeyPath()]
+		if !ok {
+			return false
+		}
+		if !nodesEqual(ac, bc) {
+			return false
+		}
+	}
+	return true
+}
+
+// formatPrefixed writes a node with +/- prefix at the given indent.
+func formatPrefixed(b *strings.Builder, prefix, indent string, n *Node) {
+	if n.IsLeaf {
+		fmt.Fprintf(b, "%s%s%s;\n", prefix, indent, n.KeyPath())
+	} else {
+		fmt.Fprintf(b, "%s%s%s {\n", prefix, indent, n.KeyPath())
+		formatPrefixedChildren(b, prefix, indent+"    ", n.Children)
+		fmt.Fprintf(b, "%s%s}\n", prefix, indent)
+	}
+}
+
+// formatPrefixedChildren writes all children with the same +/- prefix.
+func formatPrefixedChildren(b *strings.Builder, prefix, indent string, nodes []*Node) {
+	for _, n := range canonicalOrder(nodes) {
+		formatPrefixed(b, prefix, indent, n)
 	}
 }
 

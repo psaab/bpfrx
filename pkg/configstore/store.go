@@ -1243,42 +1243,15 @@ func (s *Store) ShowCompareRollback(n int) (string, error) {
 		return "", err
 	}
 
-	rollbackSet := entry.Config.FormatSet()
-	candidateSet := s.candidate.FormatSet()
-
-	rollbackLines := splitLines(rollbackSet)
-	candidateLines := splitLines(candidateSet)
-
-	rollbackMap := make(map[string]bool, len(rollbackLines))
-	for _, line := range rollbackLines {
-		rollbackMap[line] = true
-	}
-	candidateMap := make(map[string]bool, len(candidateLines))
-	for _, line := range candidateLines {
-		candidateMap[line] = true
-	}
-
-	var b strings.Builder
-
-	for _, line := range rollbackLines {
-		if !candidateMap[line] {
-			fmt.Fprintf(&b, "- %s\n", line)
-		}
-	}
-	for _, line := range candidateLines {
-		if !rollbackMap[line] {
-			fmt.Fprintf(&b, "+ %s\n", line)
-		}
-	}
-
-	if b.Len() == 0 {
+	diff := config.FormatCompare(entry.Config, s.candidate)
+	if diff == "" {
 		return "[no changes]\n", nil
 	}
-	return b.String(), nil
+	return diff, nil
 }
 
-// ShowCompare returns a diff between the active and candidate configurations
-// as set commands, with "-" for removed lines and "+" for added lines.
+// ShowCompare returns a hierarchical diff between the active and candidate
+// configurations in Junos [edit] context format.
 func (s *Store) ShowCompare() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1287,42 +1260,11 @@ func (s *Store) ShowCompare() string {
 		return ""
 	}
 
-	activeSet := s.active.FormatSet()
-	candidateSet := s.candidate.FormatSet()
-
-	activeLines := splitLines(activeSet)
-	candidateLines := splitLines(candidateSet)
-
-	// Build sets for O(n) diff
-	activeMap := make(map[string]bool, len(activeLines))
-	for _, line := range activeLines {
-		activeMap[line] = true
-	}
-	candidateMap := make(map[string]bool, len(candidateLines))
-	for _, line := range candidateLines {
-		candidateMap[line] = true
-	}
-
-	var b strings.Builder
-
-	// Removed lines (in active but not candidate)
-	for _, line := range activeLines {
-		if !candidateMap[line] {
-			fmt.Fprintf(&b, "- %s\n", line)
-		}
-	}
-
-	// Added lines (in candidate but not active)
-	for _, line := range candidateLines {
-		if !activeMap[line] {
-			fmt.Fprintf(&b, "+ %s\n", line)
-		}
-	}
-
-	if b.Len() == 0 {
+	diff := config.FormatCompare(s.active, s.candidate)
+	if diff == "" {
 		return "[no changes]\n"
 	}
-	return b.String()
+	return diff
 }
 
 // splitLines splits a string into non-empty lines.
