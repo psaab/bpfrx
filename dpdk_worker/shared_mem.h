@@ -647,6 +647,12 @@ struct event {
 	uint8_t  addr_family;
 	uint64_t session_packets;
 	uint64_t session_bytes;
+	/* NAT translation addresses (post-NAT) */
+	uint8_t  nat_src_ip[16];
+	uint8_t  nat_dst_ip[16];
+	uint16_t nat_src_port;
+	uint16_t nat_dst_port;
+	uint32_t created;      /* session creation time (seconds since boot) */
 };
 
 /* ============================================================

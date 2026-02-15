@@ -149,7 +149,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, export/redistribute, ECMP multipath, next-table + rib-group inter-VRF route leaking, route filtering by protocol/CIDR
 - **VLANs**: 802.1Q tagging in BPF, trunk ports
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces
-- **Observability**: Syslog (facility/severity/category filtering), NetFlow v9 (1-in-N sampling), Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB), BPF map utilization (`show system buffers`)
+- **Observability**: Syslog (facility/severity/category filtering, structured RT_FLOW format, TCP/TLS transport, event mode local file), NetFlow v9 (1-in-N sampling), Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB), BPF map utilization (`show system buffers`), session aggregation reporting
 - **Flow**: TCP MSS clamping (ingress XDP + egress TC, including GRE-specific gre-in/gre-out), ALG control, allow-dns-reply (wired to BPF), allow-embedded-icmp, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, logging, forwarding-class DSCP rewrite, DSCP action)
 - **HA**: Chassis cluster state machine (weight-based failover, manual failover/reset, Junos-style show/request commands), VRRP via keepalived (config generation, runtime state detection), RETH bond interfaces, incremental session sync (1s sweep + ring buffer + GC delete callbacks), config sync, IPsec SA sync, ISSU
 - **DHCP**: Relay (Option 82), server (Kea integration with lease display)

@@ -1834,6 +1834,9 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 	if srcNode := node.FindChild("source-interface"); srcNode != nil {
 		sec.Log.SourceInterface = nodeVal(srcNode)
 	}
+	if node.FindChild("report") != nil {
+		sec.Log.Report = true
+	}
 
 	for _, inst := range namedInstances(node.FindChildren("stream")) {
 		stream := &SyslogStream{
@@ -1879,6 +1882,15 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 				stream.Category = nodeVal(prop)
 			case "source-address":
 				stream.SourceAddress = nodeVal(prop)
+			case "transport":
+				for _, tc := range prop.Children {
+					switch tc.Name() {
+					case "protocol":
+						stream.Transport.Protocol = nodeVal(tc)
+					case "tls-profile":
+						stream.Transport.TLSProfile = nodeVal(tc)
+					}
+				}
 			}
 		}
 		if stream.Host != "" {

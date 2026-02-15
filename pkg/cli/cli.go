@@ -2476,6 +2476,19 @@ func (c *CLI) reloadSyslog(cfg *config.Config) {
 	if c.eventReader == nil {
 		return
 	}
+	// Update zone name mapping for structured log format
+	// Uses sorted zone names → sequential IDs (matches compiler order)
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	znMap := make(map[uint16]string, len(names))
+	for i, name := range names {
+		znMap[uint16(i+1)] = name
+	}
+	c.eventReader.SetZoneNames(znMap)
+
 	var clients []*logging.SyslogClient
 	for name, stream := range cfg.Security.Log.Streams {
 		client, err := logging.NewSyslogClient(stream.Host, stream.Port)
@@ -2488,6 +2501,14 @@ func (c *CLI) reloadSyslog(cfg *config.Config) {
 		}
 		if stream.Category != "" {
 			client.Categories = logging.ParseCategory(stream.Category)
+		}
+		// Per-stream format overrides global log format
+		format := stream.Format
+		if format == "" {
+			format = cfg.Security.Log.Format
+		}
+		if format != "" {
+			client.Format = format
 		}
 		clients = append(clients, client)
 	}

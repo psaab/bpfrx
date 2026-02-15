@@ -173,6 +173,11 @@ type Event struct {
 	AddrFamily     uint8
 	SessionPackets uint64
 	SessionBytes   uint64
+	NATSrcIP       [16]byte
+	NATDstIP       [16]byte
+	NATSrcPort     uint16
+	NATDstPort     uint16
+	Created        uint32
 }
 
 // Tail call program indices -- must match C constants.

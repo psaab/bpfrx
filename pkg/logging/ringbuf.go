@@ -23,8 +23,12 @@ type EventReader struct {
 	buffer        *EventBuffer
 	syslogMu      sync.RWMutex
 	syslogClients []*SyslogClient
+	localMu       sync.RWMutex
+	localWriters  []*LocalLogWriter
 	callbackMu    sync.RWMutex
 	callbacks     []EventCallback
+	zoneNamesMu   sync.RWMutex
+	zoneNames     map[uint16]string // zone ID -> zone name
 }
 
 // NewEventReader creates a new event reader for the given event source.
@@ -33,6 +37,23 @@ func NewEventReader(source dataplane.EventSource, buffer *EventBuffer) *EventRea
 		source: source,
 		buffer: buffer,
 	}
+}
+
+// SetZoneNames updates the zone ID to name mapping (goroutine-safe).
+func (er *EventReader) SetZoneNames(names map[uint16]string) {
+	er.zoneNamesMu.Lock()
+	er.zoneNames = names
+	er.zoneNamesMu.Unlock()
+}
+
+func (er *EventReader) resolveZoneName(id uint16) string {
+	er.zoneNamesMu.RLock()
+	name := er.zoneNames[id]
+	er.zoneNamesMu.RUnlock()
+	if name != "" {
+		return name
+	}
+	return fmt.Sprintf("%d", id)
 }
 
 // AddCallback registers a callback that will be invoked for every event.
@@ -57,6 +78,24 @@ func (er *EventReader) SetSyslogClients(clients []*SyslogClient) {
 	er.syslogMu.Unlock()
 }
 
+// SetLocalWriters replaces the set of local log writers (goroutine-safe).
+func (er *EventReader) SetLocalWriters(writers []*LocalLogWriter) {
+	er.localMu.Lock()
+	er.localWriters = writers
+	er.localMu.Unlock()
+}
+
+// ReplaceLocalWriters atomically swaps local writers and closes old ones.
+func (er *EventReader) ReplaceLocalWriters(writers []*LocalLogWriter) {
+	er.localMu.Lock()
+	old := er.localWriters
+	er.localWriters = writers
+	er.localMu.Unlock()
+	for _, w := range old {
+		w.Close()
+	}
+}
+
 // ReplaceSyslogClients atomically swaps syslog clients and closes old ones.
 func (er *EventReader) ReplaceSyslogClients(clients []*SyslogClient) {
 	er.syslogMu.Lock()
@@ -65,6 +104,26 @@ func (er *EventReader) ReplaceSyslogClients(clients []*SyslogClient) {
 	er.syslogMu.Unlock()
 	for _, c := range old {
 		c.Close()
+	}
+}
+
+// ForwardLogMsg sends a pre-formatted message to all configured syslog clients
+// and local log writers. Used by the aggregation reporter.
+func (er *EventReader) ForwardLogMsg(severity int, msg string) {
+	er.syslogMu.RLock()
+	clients := er.syslogClients
+	er.syslogMu.RUnlock()
+	for _, c := range clients {
+		if c.ShouldSend(severity) {
+			_ = c.Send(severity, msg)
+		}
+	}
+
+	er.localMu.RLock()
+	writers := er.localWriters
+	er.localMu.RUnlock()
+	for _, lw := range writers {
+		_ = lw.Send(severity, msg)
 	}
 }
 
@@ -119,17 +178,34 @@ func (er *EventReader) logEvent(data []byte) {
 	evt.Action = data[54]
 	evt.AddrFamily = data[55]
 
-	var srcStr, dstStr string
+	// Parse NAT fields (offsets 72..112) if data is long enough
+	if len(data) >= 112 {
+		copy(evt.NATSrcIP[:], data[72:88])
+		copy(evt.NATDstIP[:], data[88:104])
+		evt.NATSrcPort = binary.BigEndian.Uint16(data[104:106])
+		evt.NATDstPort = binary.BigEndian.Uint16(data[106:108])
+		evt.Created = binary.LittleEndian.Uint32(data[108:112])
+	}
+
+	var srcStr, dstStr, natSrcStr, natDstStr string
 	if evt.AddrFamily == dataplane.AFInet6 {
 		srcIP := net.IP(evt.SrcIP[:])
 		dstIP := net.IP(evt.DstIP[:])
 		srcStr = fmt.Sprintf("[%s]:%d", srcIP, evt.SrcPort)
 		dstStr = fmt.Sprintf("[%s]:%d", dstIP, evt.DstPort)
+		natSrcIP := net.IP(evt.NATSrcIP[:])
+		natDstIP := net.IP(evt.NATDstIP[:])
+		natSrcStr = fmt.Sprintf("[%s]:%d", natSrcIP, evt.NATSrcPort)
+		natDstStr = fmt.Sprintf("[%s]:%d", natDstIP, evt.NATDstPort)
 	} else {
 		srcIP := net.IP(evt.SrcIP[:4])
 		dstIP := net.IP(evt.DstIP[:4])
 		srcStr = fmt.Sprintf("%s:%d", srcIP, evt.SrcPort)
 		dstStr = fmt.Sprintf("%s:%d", dstIP, evt.DstPort)
+		natSrcIP := net.IP(evt.NATSrcIP[:4])
+		natDstIP := net.IP(evt.NATDstIP[:4])
+		natSrcStr = fmt.Sprintf("%s:%d", natSrcIP, evt.NATSrcPort)
+		natDstStr = fmt.Sprintf("%s:%d", natDstIP, evt.NATDstPort)
 	}
 
 	eventName := eventTypeName(evt.EventType)
@@ -138,20 +214,31 @@ func (er *EventReader) logEvent(data []byte) {
 
 	// Build EventRecord
 	rec := EventRecord{
-		Time:     time.Now(),
-		Type:     eventName,
-		SrcAddr:  srcStr,
-		DstAddr:  dstStr,
-		Protocol: protoStr,
-		Action:   actionStr,
-		PolicyID: evt.PolicyID,
-		InZone:   evt.IngressZone,
-		OutZone:  evt.EgressZone,
+		Time:        time.Now(),
+		Type:        eventName,
+		SrcAddr:     srcStr,
+		DstAddr:     dstStr,
+		Protocol:    protoStr,
+		Action:      actionStr,
+		PolicyID:    evt.PolicyID,
+		InZone:      evt.IngressZone,
+		OutZone:     evt.EgressZone,
+		NATSrcAddr:  natSrcStr,
+		NATDstAddr:  natDstStr,
+		InZoneName:  er.resolveZoneName(evt.IngressZone),
+		OutZoneName: er.resolveZoneName(evt.EgressZone),
 	}
 
 	if evt.EventType == dataplane.EventTypeSessionClose {
 		rec.SessionPkts = binary.LittleEndian.Uint64(data[56:64])
 		rec.SessionBytes = binary.LittleEndian.Uint64(data[64:72])
+		// Compute elapsed time from session creation
+		if evt.Created > 0 {
+			nowSec := uint32(evt.Timestamp / 1000000000)
+			if nowSec > evt.Created {
+				rec.ElapsedTime = nowSec - evt.Created
+			}
+		}
 	}
 	if evt.EventType == dataplane.EventTypeScreenDrop {
 		rec.ScreenCheck = screenFlagName(evt.PolicyID)
@@ -212,12 +299,48 @@ func (er *EventReader) logEvent(data []byte) {
 	if len(clients) > 0 {
 		severity := eventSeverity(evt.EventType)
 		catBit := eventCategory(evt.EventType)
-		msg := formatSyslogMsg(rec)
+		// Cache formatted messages lazily per format type
+		var stdMsg, structMsg string
 		for _, c := range clients {
-			if c.ShouldSendEvent(severity, catBit) {
-				if err := c.Send(severity, msg); err != nil {
-					slog.Debug("syslog send failed", "err", err)
+			if !c.ShouldSendEvent(severity, catBit) {
+				continue
+			}
+			var msg string
+			if c.Format == "structured" {
+				if structMsg == "" {
+					structMsg = formatStructuredMsg(rec, evt.Protocol)
 				}
+				msg = structMsg
+			} else {
+				if stdMsg == "" {
+					stdMsg = formatSyslogMsg(rec)
+				}
+				msg = stdMsg
+			}
+			if err := c.Send(severity, msg); err != nil {
+				slog.Debug("syslog send failed", "err", err)
+			}
+		}
+	}
+
+	// Forward to local log writers (event mode)
+	er.localMu.RLock()
+	localWriters := er.localWriters
+	er.localMu.RUnlock()
+
+	if len(localWriters) > 0 {
+		severity := eventSeverity(evt.EventType)
+		catBit := eventCategory(evt.EventType)
+		var stdMsg string
+		for _, lw := range localWriters {
+			if !lw.ShouldSendEvent(severity, catBit) {
+				continue
+			}
+			if stdMsg == "" {
+				stdMsg = formatSyslogMsg(rec)
+			}
+			if err := lw.Send(severity, stdMsg); err != nil {
+				slog.Debug("local log write failed", "err", err)
 			}
 		}
 	}
@@ -271,6 +394,73 @@ func formatSyslogMsg(rec EventRecord) string {
 	return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s policy=%d zone=%d->%d",
 		rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action,
 		rec.PolicyID, rec.InZone, rec.OutZone)
+}
+
+// formatStructuredMsg formats an EventRecord as a Junos-compatible structured
+// syslog message with RT_FLOW_SESSION_CREATE/CLOSE/DENY event tags.
+func formatStructuredMsg(rec EventRecord, protoNum uint8) string {
+	// Split addr:port pairs
+	srcIP, srcPort := splitAddrPort(rec.SrcAddr)
+	dstIP, dstPort := splitAddrPort(rec.DstAddr)
+	natSrcIP, natSrcPort := splitAddrPort(rec.NATSrcAddr)
+	natDstIP, natDstPort := splitAddrPort(rec.NATDstAddr)
+
+	switch rec.Type {
+	case "SESSION_OPEN":
+		return fmt.Sprintf("RT_FLOW_SESSION_CREATE "+
+			"source-address=\"%s\" source-port=\"%s\" "+
+			"destination-address=\"%s\" destination-port=\"%s\" "+
+			"nat-source-address=\"%s\" nat-source-port=\"%s\" "+
+			"nat-destination-address=\"%s\" nat-destination-port=\"%s\" "+
+			"protocol-id=\"%d\" policy-name=\"%d\" "+
+			"source-zone-name=\"%s\" destination-zone-name=\"%s\"",
+			srcIP, srcPort, dstIP, dstPort,
+			natSrcIP, natSrcPort, natDstIP, natDstPort,
+			protoNum, rec.PolicyID,
+			rec.InZoneName, rec.OutZoneName)
+
+	case "SESSION_CLOSE":
+		return fmt.Sprintf("RT_FLOW_SESSION_CLOSE "+
+			"source-address=\"%s\" source-port=\"%s\" "+
+			"destination-address=\"%s\" destination-port=\"%s\" "+
+			"nat-source-address=\"%s\" nat-source-port=\"%s\" "+
+			"nat-destination-address=\"%s\" nat-destination-port=\"%s\" "+
+			"protocol-id=\"%d\" policy-name=\"%d\" "+
+			"source-zone-name=\"%s\" destination-zone-name=\"%s\" "+
+			"packets-from-client=\"%d\" bytes-from-client=\"%d\" "+
+			"elapsed-time=\"%d\"",
+			srcIP, srcPort, dstIP, dstPort,
+			natSrcIP, natSrcPort, natDstIP, natDstPort,
+			protoNum, rec.PolicyID,
+			rec.InZoneName, rec.OutZoneName,
+			rec.SessionPkts, rec.SessionBytes,
+			rec.ElapsedTime)
+
+	case "POLICY_DENY":
+		return fmt.Sprintf("RT_FLOW_SESSION_DENY "+
+			"source-address=\"%s\" source-port=\"%s\" "+
+			"destination-address=\"%s\" destination-port=\"%s\" "+
+			"protocol-id=\"%d\" policy-name=\"%d\" "+
+			"source-zone-name=\"%s\" destination-zone-name=\"%s\"",
+			srcIP, srcPort, dstIP, dstPort,
+			protoNum, rec.PolicyID,
+			rec.InZoneName, rec.OutZoneName)
+
+	default:
+		return formatSyslogMsg(rec)
+	}
+}
+
+// splitAddrPort splits "10.0.1.5:443" or "[::1]:443" into IP and port strings.
+func splitAddrPort(addr string) (string, string) {
+	if addr == "" {
+		return "0.0.0.0", "0"
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, "0"
+	}
+	return host, port
 }
 
 func eventTypeName(t uint8) string {

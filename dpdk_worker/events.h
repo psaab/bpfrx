@@ -58,6 +58,13 @@ emit_event(struct pipeline_ctx *ctx, struct pkt_meta *meta,
 	memcpy(ev->src_ip, meta->src_ip.v6, 16);
 	memcpy(ev->dst_ip, meta->dst_ip.v6, 16);
 
+	/* Zero NAT fields for non-session events */
+	memset(ev->nat_src_ip, 0, 16);
+	memset(ev->nat_dst_ip, 0, 16);
+	ev->nat_src_port = 0;
+	ev->nat_dst_port = 0;
+	ev->created = 0;
+
 	if (rte_ring_enqueue(ctx->shm->event_ring, ev) != 0)
 		rte_free(ev);  /* Ring full — drop silently */
 }
@@ -94,6 +101,13 @@ emit_event_with_stats(struct pipeline_ctx *ctx, struct pkt_meta *meta,
 
 	memcpy(ev->src_ip, meta->src_ip.v6, 16);
 	memcpy(ev->dst_ip, meta->dst_ip.v6, 16);
+
+	/* Zero NAT fields — DPDK pipeline doesn't have session NAT info here */
+	memset(ev->nat_src_ip, 0, 16);
+	memset(ev->nat_dst_ip, 0, 16);
+	ev->nat_src_port = 0;
+	ev->nat_dst_port = 0;
+	ev->created = 0;
 
 	if (rte_ring_enqueue(ctx->shm->event_ring, ev) != 0)
 		rte_free(ev);

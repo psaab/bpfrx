@@ -683,9 +683,16 @@ type TCPSessionConfig struct {
 // LogConfig holds logging/syslog configuration.
 type LogConfig struct {
 	Mode            string // "stream" or "event"
-	Format          string // "sd-syslog", "syslog", "binary"
+	Format          string // "sd-syslog", "syslog", "binary", "structured"
 	SourceInterface string // interface for source address
 	Streams         map[string]*SyslogStream
+	Report          bool // enable session aggregation reporting (security log report)
+}
+
+// SyslogTransport defines the transport protocol for a syslog stream.
+type SyslogTransport struct {
+	Protocol   string // "udp" (default), "tcp", "tls"
+	TLSProfile string // TLS profile name (for protocol=tls)
 }
 
 // SyslogStream defines a syslog forwarding destination.
@@ -698,6 +705,7 @@ type SyslogStream struct {
 	Format        string // per-stream format override
 	Category      string // "all", or specific category
 	SourceAddress string // source IP for this stream
+	Transport     SyslogTransport
 }
 
 // SSHKnownHostKey represents a known SSH host key.

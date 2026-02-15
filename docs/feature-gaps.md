@@ -17,7 +17,7 @@ Last updated: 2026-02-14
 | Screen/IDS Enhancements | 6 | 2 | 0 | 8 |
 | Security Flow Enhancements | 9 | 2 | 0 | 11 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
-| Security Logging Enhancements | 4 | 1 | 1 | 6 |
+| Security Logging Enhancements | 0 | 0 | 0 | 0 |
 | PKI / Certificates | 4 | 0 | 0 | 4 |
 | Routing Enhancements | 11 | 3 | 0 | 14 |
 | VPN Enhancements | 8 | 1 | 0 | 9 |
@@ -29,7 +29,7 @@ Last updated: 2026-02-14
 | Interface Enhancements | 2 | 0 | 0 | 2 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **138** | **16** | **5** | **159** |
+| **TOTAL** | **134** | **15** | **4** | **153** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -220,16 +220,16 @@ bpfrx has ALG disable flags for DNS, FTP, SIP, TFTP. The vSRX supports many more
 
 ## 12. Security Logging Enhancements
 
-bpfrx has security logging with mode (stream/event), format, streams with host/port/severity/facility/category/source-address. These are additional features.
+bpfrx has full security logging: stream mode (UDP/TCP/TLS), event mode (local file), structured syslog (RT_FLOW with NAT fields), per-policy session-init/close with full NAT translation, and session aggregation reporting. All vSRX security logging features are implemented (except binary format which requires a Juniper-specific receiver).
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Structured Syslog Format** | `security log format structured` | Machine-parseable key-value syslog format (RT_FLOW_SESSION_CREATE, etc.) with standardized field names | Medium | Missing |
-| **Binary Log Format** | `security log format binary` | High-performance binary log format for off-box collector (requires Juniper log receiver) | Low | Missing |
-| **Transport Protocol Selection** | `security log stream ... transport protocol tcp/tls` | Send security logs over TCP or TLS instead of UDP for reliable delivery | Medium | Missing |
-| **Per-Policy Logging** | `security policies ... then log session-init session-close` | bpfrx has this but may not fully support all log fields (app-name, nat-*, nested-app, etc.) | Medium | Partial (basic session-init/close logging works) |
-| **Log Event Mode** | `security log mode event` | Route security logs through eventd (control plane) for on-box processing, slower but allows local processing | Low | Parse-Only (parsed but always uses stream) |
-| **Session Aggregation Logs** | `security log ... report` | Aggregate session logs for top-N reporting (top talkers, top applications) | Low | Missing |
+| **Structured Syslog Format** | `security log format structured` | Machine-parseable key-value syslog format (RT_FLOW_SESSION_CREATE/CLOSE/DENY) with NAT fields, zone names, elapsed time | Medium | Implemented (Sprint SEC-LOG) |
+| **Binary Log Format** | `security log format binary` | High-performance binary log format for off-box collector (requires Juniper log receiver) | Low | N/A (requires Juniper-specific receiver) |
+| **Transport Protocol Selection** | `security log stream ... transport protocol tcp/tls` | Send security logs over TCP or TLS instead of UDP for reliable delivery. RFC 6587 octet-counting framing, auto-reconnect. | Medium | Implemented (Sprint SEC-LOG) |
+| **Per-Policy Logging** | `security policies ... then log session-init session-close` | Full NAT translation fields (nat-source-address, nat-destination-address, nat-source-port, nat-destination-port), zone names, elapsed time, session bytes/packets in log events | Medium | Implemented (Sprint SEC-LOG) |
+| **Log Event Mode** | `security log mode event` | Route security logs to local file (/var/log/bpfrx/security.log) with rotation instead of remote syslog. Configured via `security log mode event`. | Low | Implemented (Sprint SEC-LOG) |
+| **Session Aggregation Logs** | `security log ... report` | Periodic top-N source/destination reports by bytes (5-min intervals, RT_FLOW_SESSION_AGGREGATE). Enabled via `security log report`. | Low | Implemented (Sprint SEC-LOG) |
 
 ---
 
@@ -437,27 +437,26 @@ Features commonly requested in enterprise deployments:
 11. **Aggressive Session Aging** - Session table management under load
 12. **Graceful Restart** - Non-stop routing (FRR already supports)
 13. **Twice NAT** - Complex NAT scenarios
-14. **Structured Syslog** - Machine-parseable security logs
-15. **Transparent Mode (L2)** - Inline transparent firewall deployment
-16. **Link Aggregation (LAG)** - Bandwidth aggregation and link redundancy
-17. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication
-18. **SecIntel / GeoIP** - Threat intelligence integration
-19. **Captive Portal / User Firewall** - User-based access control
-20. **Logical Systems (LSYS)** - Multi-tenancy
+14. **Transparent Mode (L2)** - Inline transparent firewall deployment
+15. **Link Aggregation (LAG)** - Bandwidth aggregation and link redundancy
+16. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication
+17. **SecIntel / GeoIP** - Threat intelligence integration
+18. **Captive Portal / User Firewall** - User-based access control
+19. **Logical Systems (LSYS)** - Multi-tenancy
 
 ### Tier 3 - Low Priority (Specialized / Niche)
 Features for specific use cases or carrier deployments:
 
-21. Content Security (UTM) - AV/web-filtering (consider ClamAV/rspamd)
-22. SSL Proxy - TLS inspection (consider mitmproxy integration)
-23. Multicast (PIM/IGMP)
-24. MPLS/LDP
-25. EVPN/VXLAN
-26. DS-Lite/6rd/MAP-E
-27. GTP Firewall
-28. SD-WAN
-29. PowerMode IPsec
-30. Class of Service (not supported on vSRX anyway)
+20. Content Security (UTM) - AV/web-filtering (consider ClamAV/rspamd)
+21. SSL Proxy - TLS inspection (consider mitmproxy integration)
+22. Multicast (PIM/IGMP)
+23. MPLS/LDP
+24. EVPN/VXLAN
+25. DS-Lite/6rd/MAP-E
+26. GTP Firewall
+27. SD-WAN
+28. PowerMode IPsec
+29. Class of Service (not supported on vSRX anyway)
 
 ---
 
@@ -467,12 +466,11 @@ These features have config parsing in bpfrx but NO runtime effect:
 
 | # | Config Path | Type | Notes |
 |---|------------|------|-------|
-| 1 | `security log mode` | LogConfig.Mode | Always uses stream mode |
-| 2 | `security pre-id-default-policy` | PreIDDefaultPolicy | Requires AppID engine |
-| 3 | `system master-password` | SystemConfig.MasterPassword | No encrypted storage |
-| 4 | `system license autoupdate url` | SystemConfig.LicenseAutoUpdate | No licensing system |
-| 5 | `system ntp threshold action` | SystemConfig.NTPThresholdAction | Not wired to NTP config |
-| 6 | `services application-identification` | ServicesConfig.ApplicationIdentification | Bool flag only, no DPI |
+| 1 | `security pre-id-default-policy` | PreIDDefaultPolicy | Requires AppID engine |
+| 2 | `system master-password` | SystemConfig.MasterPassword | No encrypted storage |
+| 3 | `system license autoupdate url` | SystemConfig.LicenseAutoUpdate | No licensing system |
+| 4 | `system ntp threshold action` | SystemConfig.NTPThresholdAction | Not wired to NTP config |
+| 5 | `services application-identification` | ServicesConfig.ApplicationIdentification | Bool flag only, no DPI |
 
 ---
 

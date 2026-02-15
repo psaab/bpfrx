@@ -83,9 +83,13 @@ zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 			return XDP_PASS;
 		}
 		if (sess->log_flags & LOG_FLAG_SESSION_CLOSE)
-			emit_event(meta, EVENT_TYPE_SESSION_CLOSE, ACTION_DENY,
-				   sess->fwd_packets + sess->rev_packets,
-				   sess->fwd_bytes + sess->rev_bytes);
+			emit_event_nat4(meta, EVENT_TYPE_SESSION_CLOSE,
+					ACTION_DENY,
+					sess->fwd_packets + sess->rev_packets,
+					sess->fwd_bytes + sess->rev_bytes,
+					sess->nat_src_ip, sess->nat_dst_ip,
+					sess->nat_src_port, sess->nat_dst_port,
+					(__u32)(sess->created & 0xFFFFFFFF));
 		inc_counter(GLOBAL_CTR_DROPS);
 		return XDP_DROP;
 	}
@@ -163,9 +167,13 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 			return XDP_PASS;
 		}
 		if (sess->log_flags & LOG_FLAG_SESSION_CLOSE)
-			emit_event(meta, EVENT_TYPE_SESSION_CLOSE, ACTION_DENY,
-				   sess->fwd_packets + sess->rev_packets,
-				   sess->fwd_bytes + sess->rev_bytes);
+			emit_event_nat6(meta, EVENT_TYPE_SESSION_CLOSE,
+					ACTION_DENY,
+					sess->fwd_packets + sess->rev_packets,
+					sess->fwd_bytes + sess->rev_bytes,
+					sess->nat_src_ip, sess->nat_dst_ip,
+					sess->nat_src_port, sess->nat_dst_port,
+					(__u32)(sess->created & 0xFFFFFFFF));
 		inc_counter(GLOBAL_CTR_DROPS);
 		return XDP_DROP;
 	}

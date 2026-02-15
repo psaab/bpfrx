@@ -20,6 +20,11 @@ type EventRecord struct {
 	ScreenCheck  string // for SCREEN_DROP
 	SessionPkts  uint64 // for SESSION_CLOSE
 	SessionBytes uint64
+	NATSrcAddr   string // "172.16.1.1:12345" (post-NAT source)
+	NATDstAddr   string // "10.0.2.1:80" (post-NAT destination)
+	InZoneName   string // resolved zone name
+	OutZoneName  string // resolved zone name
+	ElapsedTime  uint32 // seconds since session creation (for CLOSE)
 }
 
 // EventBuffer is a thread-safe circular buffer for recent events.

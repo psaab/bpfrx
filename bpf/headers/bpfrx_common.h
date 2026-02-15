@@ -438,6 +438,12 @@ struct event {
 	__u8   addr_family;  /* AF_INET=2, AF_INET6=10 */
 	__u64  session_packets;
 	__u64  session_bytes;
+	/* NAT translation addresses (post-NAT) */
+	__u8   nat_src_ip[16];
+	__u8   nat_dst_ip[16];
+	__be16 nat_src_port;
+	__be16 nat_dst_port;
+	__u32  created;      /* session creation time (seconds since boot) */
 };
 
 /* ============================================================

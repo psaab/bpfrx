@@ -86,6 +86,8 @@ type Daemon struct {
 	traceWriter   *logging.TraceWriter
 	eventReader   *logging.EventReader
 	eventEngine   *eventengine.Engine
+	aggregator    *logging.SessionAggregator
+	aggCancel     context.CancelFunc
 }
 
 // New creates a new Daemon.
@@ -337,7 +339,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 			// Set up syslog clients from active config
 			if cfg := d.store.ActiveConfig(); cfg != nil {
-				applySyslogConfig(er, cfg)
+				d.applySyslogConfig(er, cfg)
 			}
 
 			// Start NetFlow exporter if configured
@@ -1122,6 +1124,11 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// 14. Apply syslog file destinations (rsyslog configs)
 	d.applySyslogFiles(cfg)
 
+	// 14b. Update security log syslog clients + zone name mapping
+	if d.eventReader != nil {
+		d.applySyslogConfig(d.eventReader, cfg)
+	}
+
 	// 15. Archive config to remote sites if transfer-on-commit is enabled
 	d.archiveConfig(cfg)
 
@@ -1783,10 +1790,41 @@ func parseProtocol(proto string) uint8 {
 	return 0
 }
 
-// applySyslogConfig constructs syslog clients from the config and applies them
-// to the event reader.
-func applySyslogConfig(er *logging.EventReader, cfg *config.Config) {
-	if er == nil || len(cfg.Security.Log.Streams) == 0 {
+// applySyslogConfig constructs syslog clients or local log writers from the
+// config and applies them to the event reader. When mode is "event", events
+// are written to a local file; when "stream" (default), events are forwarded
+// to remote syslog servers. Also updates zone name resolution for structured logging.
+func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) {
+	if er == nil {
+		return
+	}
+	// Update zone name map for structured syslog formatting
+	zoneNames := make(map[uint16]string)
+	zoneIDs := buildZoneIDs(cfg)
+	for name, id := range zoneIDs {
+		zoneNames[id] = name
+	}
+	er.SetZoneNames(zoneNames)
+
+	// Event mode: write to local file instead of remote syslog
+	if cfg.Security.Log.Mode == "event" {
+		er.SetSyslogClients(nil) // clear any remote clients
+		lw, err := logging.NewLocalLogWriter(logging.LocalLogConfig{})
+		if err != nil {
+			slog.Warn("failed to create local log writer", "err", err)
+		} else {
+			er.ReplaceLocalWriters([]*logging.LocalLogWriter{lw})
+			slog.Info("security log event mode: writing to /var/log/bpfrx/security.log")
+		}
+		d.applyAggregator(er, cfg)
+		return
+	}
+
+	// Stream mode (default): clear local writers, set up remote syslog
+	er.ReplaceLocalWriters(nil)
+
+	if len(cfg.Security.Log.Streams) == 0 {
+		d.applyAggregator(er, cfg)
 		return
 	}
 	// Resolve global source-interface to IP (fallback for streams without source-address)
@@ -1810,10 +1848,14 @@ func applySyslogConfig(er *logging.EventReader, cfg *config.Config) {
 		if srcAddr == "" {
 			srcAddr = globalSourceAddr
 		}
-		client, err := logging.NewSyslogClientWithSource(stream.Host, stream.Port, srcAddr)
+		protocol := stream.Transport.Protocol
+		if protocol == "" {
+			protocol = "udp"
+		}
+		client, err := logging.NewSyslogClientTransport(stream.Host, stream.Port, srcAddr, protocol, nil)
 		if err != nil {
 			slog.Warn("failed to create syslog client",
-				"stream", name, "host", stream.Host, "err", err)
+				"stream", name, "host", stream.Host, "protocol", protocol, "err", err)
 			continue
 		}
 		if stream.Severity != "" {
@@ -1835,13 +1877,44 @@ func applySyslogConfig(er *logging.EventReader, cfg *config.Config) {
 		}
 		slog.Info("syslog stream configured",
 			"stream", name, "host", stream.Host, "port", stream.Port,
-			"severity", stream.Severity, "facility", stream.Facility,
-			"format", format, "category", stream.Category)
+			"protocol", protocol, "severity", stream.Severity,
+			"facility", stream.Facility, "format", format,
+			"category", stream.Category)
 		clients = append(clients, client)
 	}
 	if len(clients) > 0 {
 		er.SetSyslogClients(clients)
 	}
+	d.applyAggregator(er, cfg)
+}
+
+// applyAggregator starts or stops the session aggregation reporter.
+func (d *Daemon) applyAggregator(er *logging.EventReader, cfg *config.Config) {
+	// Stop existing aggregator
+	if d.aggCancel != nil {
+		d.aggCancel()
+		d.aggCancel = nil
+	}
+	d.aggregator = nil
+
+	if !cfg.Security.Log.Report {
+		return
+	}
+
+	agg := logging.NewSessionAggregator(0, 0) // defaults: 5min, top-10
+
+	// Wire aggregator log output to the first available syslog client or local writer
+	agg.SetLogFunc(func(severity int, msg string) {
+		er.ForwardLogMsg(severity, msg)
+	})
+
+	er.AddCallback(agg.HandleEvent)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d.aggCancel = cancel
+	d.aggregator = agg
+	go agg.Run(ctx)
+	slog.Info("session aggregation reporting enabled (5 min interval)")
 }
 
 // applySystemDNS writes /etc/resolv.conf from system { name-server } config.

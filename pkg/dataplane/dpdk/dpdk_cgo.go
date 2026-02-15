@@ -1388,6 +1388,11 @@ func (s *dpdkEventSource) ReadEvent() ([]byte, error) {
 		data[55] = uint8(evt.addr_family)
 		binary.LittleEndian.PutUint64(data[56:64], uint64(evt.session_packets))
 		binary.LittleEndian.PutUint64(data[64:72], uint64(evt.session_bytes))
+		copy(data[72:88], C.GoBytes(unsafe.Pointer(&evt.nat_src_ip[0]), 16))
+		copy(data[88:104], C.GoBytes(unsafe.Pointer(&evt.nat_dst_ip[0]), 16))
+		binary.BigEndian.PutUint16(data[104:106], uint16(evt.nat_src_port))
+		binary.BigEndian.PutUint16(data[106:108], uint16(evt.nat_dst_port))
+		binary.LittleEndian.PutUint32(data[108:112], uint32(evt.created))
 
 		// Free the event allocated by the worker
 		C.rte_free(unsafe.Pointer(evt))
