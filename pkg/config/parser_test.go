@@ -310,6 +310,32 @@ func TestSetCommand(t *testing.T) {
 	}
 }
 
+func TestFormatCanonicalOrder(t *testing.T) {
+	// When "then" is entered before "match" (e.g., via set commands),
+	// Format() should still display "match" before "then" (Junos canonical order).
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set security policies from-zone trust to-zone untrust policy p1 then reject",
+		"set security policies from-zone trust to-zone untrust policy p1 then log session-init",
+		"set security policies from-zone trust to-zone untrust policy p1 match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p1 match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p1 match application any",
+	}
+	for _, cmd := range setCommands {
+		parts, _ := ParseSetCommand(cmd)
+		tree.SetPath(parts)
+	}
+	output := tree.Format()
+	matchPos := strings.Index(output, "match {")
+	thenPos := strings.Index(output, "then {")
+	if matchPos < 0 || thenPos < 0 {
+		t.Fatalf("expected both match and then in output:\n%s", output)
+	}
+	if matchPos > thenPos {
+		t.Errorf("match should come before then in canonical output:\n%s", output)
+	}
+}
+
 func TestFormatRoundTrip(t *testing.T) {
 	input := `security {
     zones {

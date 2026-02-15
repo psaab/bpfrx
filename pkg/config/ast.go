@@ -1920,7 +1920,40 @@ func (t *ConfigTree) Format() string {
 	return b.String()
 }
 
+// canonicalOrder reorders children so "match"/"from" comes before "then",
+// matching Junos canonical display order for policies, NAT rules, and
+// firewall filter terms.
+func canonicalOrder(nodes []*Node) []*Node {
+	matchIdx, thenIdx := -1, -1
+	for i, n := range nodes {
+		if len(n.Keys) > 0 {
+			switch n.Keys[0] {
+			case "match", "from":
+				matchIdx = i
+			case "then":
+				thenIdx = i
+			}
+		}
+	}
+	if matchIdx < 0 || thenIdx < 0 || matchIdx < thenIdx {
+		return nodes // already correct or doesn't apply
+	}
+	// match/from is after then — move it to just before then
+	result := make([]*Node, 0, len(nodes))
+	for i, n := range nodes {
+		if i == matchIdx {
+			continue
+		}
+		if i == thenIdx {
+			result = append(result, nodes[matchIdx])
+		}
+		result = append(result, n)
+	}
+	return result
+}
+
 func formatNodes(b *strings.Builder, nodes []*Node, indent int) {
+	nodes = canonicalOrder(nodes)
 	prefix := strings.Repeat("    ", indent)
 	for _, n := range nodes {
 		if n.Annotation != "" {
@@ -2008,7 +2041,7 @@ func (t *ConfigTree) FormatSet() string {
 }
 
 func formatSetNodes(b *strings.Builder, nodes []*Node, prefix []string) {
-	for _, n := range nodes {
+	for _, n := range canonicalOrder(nodes) {
 		path := append(prefix, n.Keys...)
 		if n.IsLeaf {
 			fmt.Fprintf(b, "set %s\n", strings.Join(path, " "))
