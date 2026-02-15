@@ -10899,6 +10899,56 @@ func TestCompilePreservesGroups(t *testing.T) {
 	}
 }
 
+func TestFormatInheritance(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set security policies from-zone trust to-zone untrust policy allow-all match source-address any",
+		"set security policies from-zone trust to-zone untrust policy allow-all match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy allow-all match application any",
+		"set security policies from-zone trust to-zone untrust policy allow-all then permit",
+		"set groups default-deny-template security policies from-zone <*> to-zone <*> policy default-deny match source-address any",
+		"set groups default-deny-template security policies from-zone <*> to-zone <*> policy default-deny match destination-address any",
+		"set groups default-deny-template security policies from-zone <*> to-zone <*> policy default-deny match application any",
+		"set groups default-deny-template security policies from-zone <*> to-zone <*> policy default-deny then reject",
+		"set groups default-deny-template security policies from-zone <*> to-zone <*> policy default-deny then log session-init",
+		"set groups default-deny-template security policies from-zone <*> to-zone <*> policy default-deny then log session-close",
+		"set apply-groups default-deny-template",
+	}
+	for _, cmd := range setCommands {
+		parts, _ := ParseSetCommand(cmd)
+		tree.SetPath(parts)
+	}
+
+	output := tree.FormatInheritance()
+
+	// Should contain the inherited annotation
+	if !strings.Contains(output, "## 'default-deny' was inherited from group 'default-deny-template'") {
+		t.Errorf("expected inheritance annotation in output:\n%s", output)
+	}
+
+	// Should contain the explicit policy without annotation
+	if !strings.Contains(output, "policy allow-all") {
+		t.Error("expected explicit policy allow-all in output")
+	}
+
+	// Explicit nodes should NOT have inheritance annotations
+	allowAllIdx := strings.Index(output, "policy allow-all")
+	precedingLines := output[:allowAllIdx]
+	lastNewline := strings.LastIndex(precedingLines, "\n")
+	lineBeforeAllowAll := ""
+	if lastNewline >= 0 {
+		lineBeforeAllowAll = precedingLines[lastNewline:]
+	}
+	if strings.Contains(lineBeforeAllowAll, "inherited") {
+		t.Error("explicit policy allow-all should not have inheritance annotation")
+	}
+
+	// Original tree should still have groups (FormatInheritance clones)
+	if tree.FindChild("groups") == nil {
+		t.Error("groups node should not be removed from original tree")
+	}
+}
+
 func TestParseLoginClass(t *testing.T) {
 	input := `system {
     login {

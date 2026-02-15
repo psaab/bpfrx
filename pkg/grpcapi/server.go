@@ -328,6 +328,12 @@ func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.S
 		output = s.store.ShowActiveSet()
 	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_XML:
 		output = s.store.ShowActiveXML()
+	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_INHERITANCE:
+		if len(req.Path) > 0 {
+			output = s.store.ShowActivePathInheritance(req.Path)
+		} else {
+			output = s.store.ShowActiveInheritance()
+		}
 	case req.Target == pb.ConfigTarget_ACTIVE:
 		if len(req.Path) > 0 {
 			output = s.store.ShowActivePath(req.Path)
@@ -340,6 +346,12 @@ func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.S
 		output = s.store.ShowCandidateSet()
 	case req.Format == pb.ConfigFormat_XML:
 		output = s.store.ShowCandidateXML()
+	case req.Format == pb.ConfigFormat_INHERITANCE:
+		if len(req.Path) > 0 {
+			output = s.store.ShowCandidatePathInheritance(req.Path)
+		} else {
+			output = s.store.ShowCandidateInheritance()
+		}
 	default:
 		if len(req.Path) > 0 {
 			output = s.store.ShowCandidatePath(req.Path)

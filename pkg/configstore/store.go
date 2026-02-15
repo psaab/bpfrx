@@ -1119,6 +1119,41 @@ func (s *Store) ShowCandidateXML() string {
 	return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<configuration>\n</configuration>\n"
 }
 
+// ShowCandidateInheritance returns the candidate with groups expanded and
+// annotated with "## inherited from" comments.
+func (s *Store) ShowCandidateInheritance() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate != nil {
+		return s.candidate.FormatInheritance()
+	}
+	return ""
+}
+
+// ShowCandidatePathInheritance returns a subtree with inheritance annotations.
+func (s *Store) ShowCandidatePathInheritance(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate != nil {
+		return s.candidate.FormatPathInheritance(path)
+	}
+	return ""
+}
+
+// ShowActiveInheritance returns the active config with inheritance annotations.
+func (s *Store) ShowActiveInheritance() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.active.FormatInheritance()
+}
+
+// ShowActivePathInheritance returns an active config subtree with inheritance annotations.
+func (s *Store) ShowActivePathInheritance(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.active.FormatPathInheritance(path)
+}
+
 // ShowRollback returns the content of rollback slot n (1-based) as hierarchical text.
 func (s *Store) ShowRollback(n int) (string, error) {
 	s.mu.RLock()

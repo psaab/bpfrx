@@ -124,6 +124,7 @@ enum ConfigFormat {
   SET = 1;
   JSON = 2;
   XML = 3;
+  INHERITANCE = 4;
 }
 
 enum ConfigTarget {

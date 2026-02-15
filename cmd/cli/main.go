@@ -607,6 +607,8 @@ func (c *ctl) handleShow(args []string) error {
 			format = pb.ConfigFormat_SET
 		} else if strings.Contains(rest, "| display xml") {
 			format = pb.ConfigFormat_XML
+		} else if strings.Contains(rest, "| display inheritance") {
+			format = pb.ConfigFormat_INHERITANCE
 		}
 		// Extract path components (everything after "configuration" before "|")
 		var path []string
@@ -2061,6 +2063,8 @@ func (c *ctl) handleConfigShow(args []string) error {
 		format = pb.ConfigFormat_SET
 	} else if strings.Contains(line, "| display xml") {
 		format = pb.ConfigFormat_XML
+	} else if strings.Contains(line, "| display inheritance") {
+		format = pb.ConfigFormat_INHERITANCE
 	}
 	// Build path from editPath + any explicit path args (before pipe)
 	var path []string

@@ -909,6 +909,24 @@ func (c *CLI) handleShow(args []string) error {
 			fmt.Print(c.store.ShowActiveSet())
 		} else if strings.Contains(rest, "| display xml") {
 			fmt.Print(c.store.ShowActiveXML())
+		} else if strings.Contains(rest, "| display inheritance") {
+			var path []string
+			for _, a := range args[1:] {
+				if a == "|" {
+					break
+				}
+				path = append(path, a)
+			}
+			if len(path) > 0 {
+				output := c.store.ShowActivePathInheritance(path)
+				if output == "" {
+					fmt.Printf("configuration path not found: %s\n", strings.Join(path, " "))
+				} else {
+					fmt.Print(output)
+				}
+			} else {
+				fmt.Print(c.store.ShowActiveInheritance())
+			}
 		} else if len(args) > 1 {
 			// Filter out pipe commands from the path
 			var path []string
@@ -2231,6 +2249,30 @@ func (c *CLI) handleConfigShow(args []string) error {
 
 	if strings.Contains(line, "| display xml") {
 		fmt.Print(c.store.ShowCandidateXML())
+		return nil
+	}
+
+	if strings.Contains(line, "| display inheritance") {
+		// Build path from args before the pipe
+		var pathArgs []string
+		for _, a := range args {
+			if a == "|" {
+				break
+			}
+			pathArgs = append(pathArgs, a)
+		}
+		editPath := c.store.GetEditPath()
+		fullPath := append(append([]string{}, editPath...), pathArgs...)
+		if len(fullPath) > 0 {
+			output := c.store.ShowCandidatePathInheritance(fullPath)
+			if output == "" {
+				fmt.Printf("configuration path not found: %s\n", strings.Join(fullPath, " "))
+			} else {
+				fmt.Print(output)
+			}
+		} else {
+			fmt.Print(c.store.ShowCandidateInheritance())
+		}
 		return nil
 	}
 

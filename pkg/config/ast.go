@@ -28,6 +28,10 @@ type Node struct {
 	// Annotation is a user comment set via the "annotate" command.
 	Annotation string
 
+	// InheritedFrom is the group name this node was inherited from.
+	// Set during ExpandGroups when tagInherited is true.
+	InheritedFrom string
+
 	// Line/Column where this node starts (for error reporting).
 	Line   int
 	Column int
@@ -99,12 +103,13 @@ func cloneNodes(nodes []*Node) []*Node {
 	result := make([]*Node, len(nodes))
 	for i, n := range nodes {
 		result[i] = &Node{
-			Keys:       append([]string(nil), n.Keys...),
-			Children:   cloneNodes(n.Children),
-			IsLeaf:     n.IsLeaf,
-			Annotation: n.Annotation,
-			Line:       n.Line,
-			Column:     n.Column,
+			Keys:          append([]string(nil), n.Keys...),
+			Children:      cloneNodes(n.Children),
+			IsLeaf:        n.IsLeaf,
+			Annotation:    n.Annotation,
+			InheritedFrom: n.InheritedFrom,
+			Line:          n.Line,
+			Column:        n.Column,
 		}
 	}
 	return result
@@ -116,6 +121,16 @@ func cloneNodes(nodes []*Node) []*Node {
 // merges them into the parent. After expansion, both "groups" and
 // "apply-groups" nodes are removed from the tree.
 func (t *ConfigTree) ExpandGroups() error {
+	return t.expandGroups(false)
+}
+
+// ExpandGroupsTagged is like ExpandGroups but tags each inherited node
+// with InheritedFrom set to the group name, for "| display inheritance".
+func (t *ConfigTree) ExpandGroupsTagged() error {
+	return t.expandGroups(true)
+}
+
+func (t *ConfigTree) expandGroups(tagInherited bool) error {
 	// Collect group definitions: groups { <name> { ... } }
 	groups := make(map[string]*Node)
 	for _, child := range t.Children {
@@ -139,7 +154,7 @@ func (t *ConfigTree) ExpandGroups() error {
 	}
 
 	// Resolve apply-groups at top level.
-	if err := expandGroupsInNodes(&t.Children, groups, nil); err != nil {
+	if err := expandGroupsInNodes(&t.Children, groups, nil, tagInherited); err != nil {
 		return err
 	}
 
@@ -153,6 +168,106 @@ func (t *ConfigTree) ExpandGroups() error {
 	t.Children = filtered
 
 	return nil
+}
+
+// FormatInheritance returns the config with inherited groups expanded and
+// annotated with "## 'X' was inherited from group 'Y'" comments, matching
+// Junos "show configuration | display inheritance" output.
+func (t *ConfigTree) FormatInheritance() string {
+	clone := t.Clone()
+	if err := clone.ExpandGroupsTagged(); err != nil {
+		return t.Format() // fallback to plain format on error
+	}
+	var b strings.Builder
+	formatNodesInheritance(&b, clone.Children, 0)
+	return b.String()
+}
+
+// FormatPathInheritance is like FormatPath but with inheritance annotations.
+func (t *ConfigTree) FormatPathInheritance(path []string) string {
+	clone := t.Clone()
+	if err := clone.ExpandGroupsTagged(); err != nil {
+		return t.FormatPath(path)
+	}
+	// Navigate to the path, then format with inheritance annotations.
+	if len(path) == 0 {
+		return clone.FormatInheritance()
+	}
+	current := clone.Children
+	var lastNode *Node
+	i := 0
+	for i < len(path) {
+		keyword := path[i]
+		found := false
+		for _, n := range current {
+			if len(n.Keys) == 0 {
+				continue
+			}
+			if n.Keys[0] != keyword {
+				continue
+			}
+			if i+1 < len(path) && len(n.Keys) >= 2 && n.Keys[1] == path[i+1] {
+				lastNode = n
+				current = n.Children
+				i += 2
+				found = true
+				break
+			}
+			lastNode = n
+			current = n.Children
+			i++
+			found = true
+			break
+		}
+		if !found {
+			return ""
+		}
+	}
+	if lastNode == nil {
+		return ""
+	}
+	var b strings.Builder
+	if lastNode.IsLeaf {
+		fmt.Fprintf(&b, "%s;\n", lastNode.KeyPath())
+	} else {
+		fmt.Fprintf(&b, "%s {\n", lastNode.KeyPath())
+		formatNodesInheritance(&b, lastNode.Children, 1)
+		fmt.Fprintf(&b, "}\n")
+	}
+	return b.String()
+}
+
+func formatNodesInheritance(b *strings.Builder, nodes []*Node, indent int) {
+	nodes = canonicalOrder(nodes)
+	prefix := strings.Repeat("    ", indent)
+	for _, n := range nodes {
+		if n.Annotation != "" {
+			fmt.Fprintf(b, "%s/* %s */\n", prefix, n.Annotation)
+		}
+		if n.InheritedFrom != "" {
+			// Determine the display name for the annotation.
+			// Junos uses the last key for leaf values ("## 'any' was inherited")
+			// and the first non-keyword key for containers ("## 'default-deny' was inherited").
+			displayKey := n.Keys[len(n.Keys)-1]
+			fmt.Fprintf(b, "%s##\n%s## '%s' was inherited from group '%s'\n%s##\n",
+				prefix, prefix, displayKey, n.InheritedFrom, prefix)
+		}
+		if n.IsLeaf {
+			fmt.Fprintf(b, "%s%s;\n", prefix, n.KeyPath())
+		} else {
+			fmt.Fprintf(b, "%s%s {\n", prefix, n.KeyPath())
+			formatNodesInheritance(b, n.Children, indent+1)
+			fmt.Fprintf(b, "%s}\n", prefix)
+		}
+	}
+}
+
+// tagNodesInherited recursively sets InheritedFrom on all nodes.
+func tagNodesInherited(nodes []*Node, groupName string) {
+	for _, n := range nodes {
+		n.InheritedFrom = groupName
+		tagNodesInherited(n.Children, groupName)
+	}
 }
 
 // stripApplyGroups removes apply-groups nodes and returns error if they
@@ -173,7 +288,8 @@ func (t *ConfigTree) stripApplyGroups() error {
 // expandGroupsInNodes processes apply-groups nodes within a node list.
 // It merges referenced group children into the list, then removes apply-groups.
 // seen tracks group names being expanded to detect circular references.
-func expandGroupsInNodes(nodes *[]*Node, groups map[string]*Node, seen map[string]bool) error {
+// If tagInherited is true, merged nodes get InheritedFrom set to the group name.
+func expandGroupsInNodes(nodes *[]*Node, groups map[string]*Node, seen map[string]bool, tagInherited bool) error {
 	// First, collect apply-groups references at this level.
 	var applyNames []string
 	for _, n := range *nodes {
@@ -199,6 +315,9 @@ func expandGroupsInNodes(nodes *[]*Node, groups map[string]*Node, seen map[strin
 
 		// Clone group children and merge into current node list.
 		cloned := cloneNodes(g.Children)
+		if tagInherited {
+			tagNodesInherited(cloned, name)
+		}
 		mergeNodes(nodes, cloned)
 
 		delete(seen, name)

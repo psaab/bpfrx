@@ -28,6 +28,7 @@ const (
 	ConfigFormat_SET          ConfigFormat = 1
 	ConfigFormat_JSON         ConfigFormat = 2
 	ConfigFormat_XML          ConfigFormat = 3
+	ConfigFormat_INHERITANCE  ConfigFormat = 4
 )
 
 // Enum value maps for ConfigFormat.
@@ -37,12 +38,14 @@ var (
 		1: "SET",
 		2: "JSON",
 		3: "XML",
+		4: "INHERITANCE",
 	}
 	ConfigFormat_value = map[string]int32{
 		"HIERARCHICAL": 0,
 		"SET":          1,
 		"JSON":         2,
 		"XML":          3,
+		"INHERITANCE":  4,
 	}
 )
 
