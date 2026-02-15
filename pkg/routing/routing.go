@@ -768,30 +768,59 @@ func FormatRouteDestination(allTables []TableRoutes, destination string) string 
 			return matches[i].Preference < matches[j].Preference
 		})
 
-		fmt.Fprintf(&buf, "\n%s: %d destinations, %d routes (%d active, 0 holddown, 0 hidden)\n",
-			table.Name, len(table.Entries), len(table.Entries), len(table.Entries))
-		buf.WriteString("+ = Active Route, - = Last Active, * = Both\n\n")
-
-		for _, e := range matches {
-			proto := junosProtoName(e.Protocol)
-			nh := e.NextHop
-			iface := e.Interface
-			if nh == "" {
-				nh = ""
-			}
-			fmt.Fprintf(&buf, "%-19s*[%s/%d] \n", e.Destination, proto, e.Preference)
-			if nh != "" {
-				fmt.Fprintf(&buf, "                    >  to %s via %s\n", nh, iface)
-			} else if iface != "" {
-				fmt.Fprintf(&buf, "                    >  via %s\n", iface)
-			}
-		}
+		formatTableJunos(&buf, table.Name, len(table.Entries), matches)
 	}
 
 	if buf.Len() == 0 {
 		return fmt.Sprintf("no routes matching %s\n", destination)
 	}
 	return buf.String()
+}
+
+// FormatAllRoutes formats all routes across all tables in Junos style.
+func FormatAllRoutes(allTables []TableRoutes) string {
+	var buf strings.Builder
+	for _, table := range allTables {
+		if len(table.Entries) == 0 {
+			continue
+		}
+		// Sort: by destination prefix, then preference.
+		sorted := make([]RouteEntry, len(table.Entries))
+		copy(sorted, table.Entries)
+		sort.Slice(sorted, func(i, j int) bool {
+			if sorted[i].Destination != sorted[j].Destination {
+				return sorted[i].Destination < sorted[j].Destination
+			}
+			return sorted[i].Preference < sorted[j].Preference
+		})
+		formatTableJunos(&buf, table.Name, len(table.Entries), sorted)
+	}
+	if buf.Len() == 0 {
+		return "no routes\n"
+	}
+	return buf.String()
+}
+
+// formatTableJunos writes a Junos-style routing table section.
+func formatTableJunos(buf *strings.Builder, tableName string, totalDests int, entries []RouteEntry) {
+	fmt.Fprintf(buf, "\n%s: %d destinations, %d routes (%d active, 0 holddown, 0 hidden)\n",
+		tableName, totalDests, totalDests, totalDests)
+	buf.WriteString("+ = Active Route, - = Last Active, * = Both\n\n")
+
+	for _, e := range entries {
+		proto := junosProtoName(e.Protocol)
+		dest := e.Destination
+		// Pad short destinations, let long ones flow naturally.
+		if len(dest) < 19 {
+			dest = fmt.Sprintf("%-19s", dest)
+		}
+		fmt.Fprintf(buf, "%s *[%s/%d]\n", dest, proto, e.Preference)
+		if e.NextHop != "" && e.NextHop != "direct" {
+			fmt.Fprintf(buf, "                    >  to %s via %s\n", e.NextHop, e.Interface)
+		} else if e.Interface != "" {
+			fmt.Fprintf(buf, "                    >  via %s\n", e.Interface)
+		}
+	}
 }
 
 // junosProtoName maps protocol names to Junos-style names.

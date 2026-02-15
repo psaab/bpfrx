@@ -5262,6 +5262,21 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			buf.WriteString("  run 'show security alarms detail' for details\n")
 		}
 
+	case "route-all":
+		if s.routing == nil {
+			fmt.Fprintln(&buf, "Routing manager not available")
+		} else {
+			var instances []*config.RoutingInstanceConfig
+			if cfg != nil {
+				instances = cfg.RoutingInstances
+			}
+			allTables, err := s.routing.GetAllTableRoutes(instances)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "get routes: %v", err)
+			}
+			buf.WriteString(routing.FormatAllRoutes(allTables))
+		}
+
 	case "route-summary":
 		if s.routing == nil {
 			fmt.Fprintln(&buf, "Routing manager not available")

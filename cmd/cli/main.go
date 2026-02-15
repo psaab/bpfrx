@@ -1797,20 +1797,7 @@ func (c *ctl) showDHCPClientIdentifier() error {
 }
 
 func (c *ctl) showRoutes() error {
-	resp, err := c.client.GetRoutes(c.ctx(), &pb.GetRoutesRequest{})
-	if err != nil {
-		return fmt.Errorf("%v", err)
-	}
-	if len(resp.Routes) == 0 {
-		fmt.Println("No routes")
-		return nil
-	}
-	fmt.Println("Routing table:")
-	fmt.Printf("  %-24s %-20s %-14s %-12s %s\n", "Destination", "Next-hop", "Interface", "Proto", "Pref")
-	for _, r := range resp.Routes {
-		fmt.Printf("  %-24s %-20s %-14s %-12s %d\n", r.Destination, r.NextHop, r.Interface, r.Protocol, r.Preference)
-	}
-	return nil
+	return c.showText("route-all")
 }
 
 func (c *ctl) handleShowProtocols(args []string) error {

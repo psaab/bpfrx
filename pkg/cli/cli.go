@@ -5079,18 +5079,18 @@ func (c *CLI) showRoutes() error {
 		return nil
 	}
 
-	entries, err := c.routing.GetRoutes()
+	cfg := c.store.ActiveConfig()
+	var instances []*config.RoutingInstanceConfig
+	if cfg != nil {
+		instances = cfg.RoutingInstances
+	}
+
+	allTables, err := c.routing.GetAllTableRoutes(instances)
 	if err != nil {
 		return fmt.Errorf("get routes: %w", err)
 	}
 
-	fmt.Println("Routing table:")
-	fmt.Printf("  %-24s %-20s %-14s %-12s %s\n",
-		"Destination", "Next-hop", "Interface", "Proto", "Pref")
-	for _, e := range entries {
-		fmt.Printf("  %-24s %-20s %-14s %-12s %d\n",
-			e.Destination, e.NextHop, e.Interface, e.Protocol, e.Preference)
-	}
+	fmt.Print(routing.FormatAllRoutes(allTables))
 	return nil
 }
 
