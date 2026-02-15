@@ -673,7 +673,12 @@ func FormatRouteTerse(entries []RouteEntry) string {
 
 // GetVRFRoutes reads routes from a VRF's routing table by VRF device name.
 func (m *Manager) GetVRFRoutes(vrfName string) ([]RouteEntry, error) {
-	link, err := m.nlHandle.LinkByName(vrfName)
+	// VRF devices are created with "vrf-" prefix (see EnsureVRF).
+	devName := vrfName
+	if !strings.HasPrefix(devName, "vrf-") {
+		devName = "vrf-" + devName
+	}
+	link, err := m.nlHandle.LinkByName(devName)
 	if err != nil {
 		return nil, fmt.Errorf("VRF %q not found: %w", vrfName, err)
 	}
