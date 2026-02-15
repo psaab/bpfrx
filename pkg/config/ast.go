@@ -192,7 +192,7 @@ func navigatePath(nodes []*Node, path []string) []*Node {
 	i := 0
 	for i < len(path) {
 		keyword := path[i]
-		// Try 2-key match first (keyword + argument).
+		// Try multi-key match (keyword + argument pairs).
 		if i+1 < len(path) {
 			var matched []*Node
 			for _, n := range current {
@@ -201,7 +201,27 @@ func navigatePath(nodes []*Node, path []string) []*Node {
 				}
 			}
 			if len(matched) > 0 {
-				i += 2
+				consumed := 2
+				// Continue consuming additional key-value pairs from the path
+				// that match the node's remaining keys. E.g., path
+				// ["from-zone","untrust","to-zone","trust"] consumes all 4 keys
+				// of node Keys=["from-zone","untrust","to-zone","trust"].
+				for consumed < len(matched[0].Keys) && i+consumed+1 < len(path) {
+					nextKey := path[i+consumed]
+					nextVal := path[i+consumed+1]
+					var filtered []*Node
+					for _, n := range matched {
+						if len(n.Keys) > consumed+1 && n.Keys[consumed] == nextKey && n.Keys[consumed+1] == nextVal {
+							filtered = append(filtered, n)
+						}
+					}
+					if len(filtered) == 0 {
+						break
+					}
+					matched = filtered
+					consumed += 2
+				}
+				i += consumed
 				if i >= len(path) {
 					return matched
 				}
