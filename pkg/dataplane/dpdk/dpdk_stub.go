@@ -128,11 +128,17 @@ func (m *Manager) IterateSessions(_ func(dataplane.SessionKey, dataplane.Session
 
 func (m *Manager) DeleteSession(_ dataplane.SessionKey) error { return nil }
 
+func (m *Manager) SetSessionV4(_ dataplane.SessionKey, _ dataplane.SessionValue) error { return nil }
+
 func (m *Manager) IterateSessionsV6(_ func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
 	return nil
 }
 
 func (m *Manager) DeleteSessionV6(_ dataplane.SessionKeyV6) error { return nil }
+
+func (m *Manager) SetSessionV6(_ dataplane.SessionKeyV6, _ dataplane.SessionValueV6) error {
+	return nil
+}
 
 func (m *Manager) SessionCount() (int, int) { return 0, 0 }
 

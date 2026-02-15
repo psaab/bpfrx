@@ -2469,6 +2469,28 @@ func (c *ctl) handleRequest(args []string) error {
 		}
 		fmt.Println(resp.Message)
 		return nil
+	case "software":
+		if len(args) < 3 || args[2] != "in-service-upgrade" {
+			printRemoteTreeHelp("request system software:", "request", "system", "software")
+			return nil
+		}
+		fmt.Println("WARNING: This will force this node to secondary for all redundancy groups.")
+		fmt.Print("Proceed with in-service upgrade? [yes,no] (no) ")
+		c.rl.SetPrompt("")
+		line, err := c.rl.Readline()
+		c.rl.SetPrompt(c.operationalPrompt())
+		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+			fmt.Println("ISSU cancelled")
+			return nil
+		}
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
+			Action: "in-service-upgrade",
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Message)
+		return nil
 	default:
 		return fmt.Errorf("unknown request system command: %s", args[1])
 	}

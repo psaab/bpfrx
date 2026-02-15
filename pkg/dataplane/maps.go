@@ -194,6 +194,15 @@ func (m *Manager) DeleteSession(key SessionKey) error {
 	return sm.Delete(key)
 }
 
+// SetSessionV4 writes a v4 session entry (used by cluster sync to install sessions from peer).
+func (m *Manager) SetSessionV4(key SessionKey, val SessionValue) error {
+	sm, ok := m.maps["sessions"]
+	if !ok {
+		return fmt.Errorf("sessions map not found")
+	}
+	return sm.Update(key, val, ebpf.UpdateAny)
+}
+
 // ClearZonePairPolicies deletes all zone-pair policy entries.
 func (m *Manager) ClearZonePairPolicies() error {
 	zm, ok := m.maps["zone_pair_policies"]
@@ -325,6 +334,15 @@ func (m *Manager) DeleteSessionV6(key SessionKeyV6) error {
 		return fmt.Errorf("sessions_v6 map not found")
 	}
 	return sm.Delete(key)
+}
+
+// SetSessionV6 writes a v6 session entry (used by cluster sync to install sessions from peer).
+func (m *Manager) SetSessionV6(key SessionKeyV6, val SessionValueV6) error {
+	sm, ok := m.maps["sessions_v6"]
+	if !ok {
+		return fmt.Errorf("sessions_v6 map not found")
+	}
+	return sm.Update(key, val, ebpf.UpdateAny)
 }
 
 // SessionCount returns the number of active IPv4 and IPv6 sessions.

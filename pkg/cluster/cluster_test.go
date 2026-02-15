@@ -533,6 +533,147 @@ func TestElectionSkipsDisabled(t *testing.T) {
 	}
 }
 
+func TestActiveActive_DifferentPrimariesPerRG(t *testing.T) {
+	// Active/Active: RG 0 primary on node0, RG 1 primary on node1.
+	// This validates that different RGs can have different primaries,
+	// which is the core requirement for active/active mode.
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, true, map[int]int{0: 200, 1: 100}), // node0 higher for RG0
+		makeRG(1, true, map[int]int{0: 100, 1: 200}), // node1 higher for RG1
+	)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 2)
+
+	// Peer heartbeat: node1 has RG0=secondary, RG1=primary.
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
+			{GroupID: 1, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	// Verify active/active: RG 0 primary here, RG 1 secondary here.
+	if !m.IsLocalPrimary(0) {
+		t.Error("RG 0: should be primary on node0 (active/active)")
+	}
+	if m.IsLocalPrimary(1) {
+		t.Error("RG 1: should be secondary on node0 (active/active)")
+	}
+
+	// Verify peer states reflect the complementary configuration.
+	peerStates := m.PeerGroupStates()
+	if pg, ok := peerStates[0]; !ok || pg.State != StateSecondary {
+		t.Errorf("peer RG 0: expected secondary, got %v", peerStates[0])
+	}
+	if pg, ok := peerStates[1]; !ok || pg.State != StatePrimary {
+		t.Errorf("peer RG 1: expected primary, got %v", peerStates[1])
+	}
+}
+
+func TestForceSecondary(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200}),
+		makeRG(1, false, map[int]int{0: 150}),
+	)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 2)
+
+	// Simulate peer alive.
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
+			{GroupID: 1, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	// Both RGs should be primary.
+	if !m.IsLocalPrimary(0) || !m.IsLocalPrimary(1) {
+		t.Fatal("both RGs should be primary before ForceSecondary")
+	}
+
+	// ForceSecondary.
+	if err := m.ForceSecondary(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both should now be secondary.
+	states := m.GroupStates()
+	for _, rg := range states {
+		if rg.State != StateSecondary {
+			t.Errorf("RG %d: state = %s, want secondary after ForceSecondary", rg.GroupID, rg.State)
+		}
+		if rg.Weight != 0 {
+			t.Errorf("RG %d: weight = %d, want 0 after ForceSecondary", rg.GroupID, rg.Weight)
+		}
+		if !rg.ManualFailover {
+			t.Errorf("RG %d: ManualFailover should be true after ForceSecondary", rg.GroupID)
+		}
+	}
+
+	// Drain the failover events.
+	drainEvents(m, 2)
+}
+
+func TestForceSecondary_NoPeer(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	// No peer — should fail.
+	if err := m.ForceSecondary(); err == nil {
+		t.Error("ForceSecondary should fail without active peer")
+	}
+}
+
+func TestForceSecondary_SkipsDisabled(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200}),
+		makeRG(1, false, map[int]int{0: 150}),
+	)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 2)
+
+	// Simulate peer alive.
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
+			{GroupID: 1, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	// Disable RG 1.
+	m.mu.Lock()
+	m.groups[1].State = StateDisabled
+	m.mu.Unlock()
+
+	if err := m.ForceSecondary(); err != nil {
+		t.Fatal(err)
+	}
+
+	states := m.GroupStates()
+	// RG 0: should be secondary.
+	if states[0].State != StateSecondary {
+		t.Errorf("RG 0: state = %s, want secondary", states[0].State)
+	}
+	// RG 1: should remain disabled.
+	if states[1].State != StateDisabled {
+		t.Errorf("RG 1: state = %s, want disabled (should be preserved)", states[1].State)
+	}
+}
+
 func TestEventsChannel(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(

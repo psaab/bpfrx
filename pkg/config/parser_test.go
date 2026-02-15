@@ -7933,6 +7933,75 @@ func TestChassisClusterExtendedFieldsSet(t *testing.T) {
 	}
 }
 
+func TestChassisClusterSyncOptions(t *testing.T) {
+	commands := []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster node 0",
+		"set chassis cluster configuration-synchronize",
+		"set chassis cluster nat-state-synchronization",
+		"set chassis cluster ipsec-session-synchronization",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range commands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	cl := cfg.Chassis.Cluster
+	if !cl.ConfigSync {
+		t.Error("ConfigSync should be true")
+	}
+	if !cl.NATStateSync {
+		t.Error("NATStateSync should be true")
+	}
+	if !cl.IPsecSASync {
+		t.Error("IPsecSASync should be true")
+	}
+}
+
+func TestChassisClusterSyncOptionsHierarchical(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+        node 0;
+        configuration-synchronize;
+        nat-state-synchronization;
+        ipsec-session-synchronization;
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	cl := cfg.Chassis.Cluster
+	if !cl.ConfigSync {
+		t.Error("ConfigSync should be true")
+	}
+	if !cl.NATStateSync {
+		t.Error("NATStateSync should be true")
+	}
+	if !cl.IPsecSASync {
+		t.Error("IPsecSASync should be true")
+	}
+}
+
 func TestChassisClusterIPMonitoring(t *testing.T) {
 	input := `chassis {
     cluster {

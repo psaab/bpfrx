@@ -543,6 +543,11 @@ func (m *Manager) DeleteSession(key dataplane.SessionKey) error {
 	return nil
 }
 
+func (m *Manager) SetSessionV4(_ dataplane.SessionKey, _ dataplane.SessionValue) error {
+	// TODO: DPDK session write via rte_hash_add_key_data
+	return nil
+}
+
 func (m *Manager) IterateSessionsV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
 	shm := m.platform.shm
 	if shm == nil {
@@ -588,6 +593,11 @@ func (m *Manager) DeleteSessionV6(key dataplane.SessionKeyV6) error {
 	ck.dst_port = C.uint16_t(key.DstPort)
 	ck.protocol = C.uint8_t(key.Protocol)
 	C.rte_hash_del_key(shm.sessions_v6, unsafe.Pointer(&ck))
+	return nil
+}
+
+func (m *Manager) SetSessionV6(_ dataplane.SessionKeyV6, _ dataplane.SessionValueV6) error {
+	// TODO: DPDK session write via rte_hash_add_key_data
 	return nil
 }
 

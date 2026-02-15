@@ -5497,6 +5497,12 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 	if clusterNode.FindChild("configuration-synchronize") != nil {
 		ch.Cluster.ConfigSync = true
 	}
+	if clusterNode.FindChild("nat-state-synchronization") != nil {
+		ch.Cluster.NATStateSync = true
+	}
+	if clusterNode.FindChild("ipsec-session-synchronization") != nil {
+		ch.Cluster.IPsecSASync = true
+	}
 
 	for _, rgInst := range namedInstances(clusterNode.FindChildren("redundancy-group")) {
 		rgID := 0

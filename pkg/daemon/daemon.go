@@ -180,6 +180,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 					slog.Info("cluster session sync started",
 						"local", syncLocal, "peer", syncPeer)
 				}
+
+				// Start periodic IPsec SA sync if enabled.
+				if cc.IPsecSASync && d.ipsec != nil {
+					go d.syncIPsecSAPeriodic(ctx)
+				}
 			} else {
 				slog.Warn("cluster: fabric interface has no IPv4 address",
 					"interface", cc.FabricInterface)
@@ -237,6 +242,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// WaitGroup for coordinated shutdown of background goroutines
 	var wg sync.WaitGroup
+
+	// Wire dataplane into session sync (dp is loaded after cluster init).
+	if d.sessionSync != nil && d.dp != nil {
+		d.sessionSync.SetDataPlane(d.dp)
+	}
 
 	// Start background services if dataplane is loaded
 	var er *logging.EventReader
@@ -2686,10 +2696,71 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			case cluster.StatePrimary:
 				slog.Info("cluster: became primary for RG0, enabling config writes")
 				d.store.SetClusterReadOnly(false)
+
+				// On failover to primary: re-initiate synced IPsec SAs.
+				if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync && d.ipsec != nil && d.sessionSync != nil {
+					go d.reinitiateIPsecSAs()
+				}
+
 			case cluster.StateSecondary, cluster.StateSecondaryHold:
 				slog.Info("cluster: became secondary for RG0, disabling config writes")
 				d.store.SetClusterReadOnly(true)
 			}
+		}
+	}
+}
+
+// clusterConfig returns the current cluster config or nil.
+func (d *Daemon) clusterConfig() *config.ClusterConfig {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return nil
+	}
+	return cfg.Chassis.Cluster
+}
+
+// syncIPsecSAPeriodic runs on the primary node, periodically syncing active IPsec
+// connection names to the secondary via the session sync channel.
+func (d *Daemon) syncIPsecSAPeriodic(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if d.cluster == nil || !d.cluster.IsLocalPrimary(0) {
+				continue
+			}
+			cc := d.clusterConfig()
+			if cc == nil || !cc.IPsecSASync {
+				continue
+			}
+			names, err := d.ipsec.ActiveConnectionNames()
+			if err != nil {
+				slog.Debug("cluster: failed to get IPsec connection names", "err", err)
+				continue
+			}
+			if len(names) > 0 && d.sessionSync != nil {
+				d.sessionSync.QueueIPsecSA(names)
+			}
+		}
+	}
+}
+
+// reinitiateIPsecSAs re-initiates all IPsec connections that were synced from the
+// previous primary. Called when this node becomes primary after failover.
+func (d *Daemon) reinitiateIPsecSAs() {
+	names := d.sessionSync.PeerIPsecSAs()
+	if len(names) == 0 {
+		return
+	}
+	slog.Info("cluster: re-initiating IPsec SAs after failover", "count", len(names))
+	for _, name := range names {
+		if err := d.ipsec.InitiateConnection(name); err != nil {
+			slog.Warn("cluster: failed to initiate IPsec SA", "name", name, "err", err)
+		} else {
+			slog.Info("cluster: IPsec SA initiated", "name", name)
 		}
 	}
 }

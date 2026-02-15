@@ -120,20 +120,24 @@ func (rc *RethController) deactivateReth(m RethMapping) {
 }
 
 // RethIPs returns the IP addresses configured on a RETH interface.
-// Used for gratuitous ARP after failover.
+// Returns both IPv4 and IPv6 addresses. Used for gratuitous ARP/NA after failover.
 func (rc *RethController) RethIPs(rethName string) ([]net.IP, error) {
 	link, err := rc.nlHandle.LinkByName(rethName)
 	if err != nil {
 		return nil, fmt.Errorf("reth %s not found: %w", rethName, err)
 	}
 
-	addrs, err := rc.nlHandle.AddrList(link, netlink.FAMILY_V4)
+	addrs, err := rc.nlHandle.AddrList(link, netlink.FAMILY_ALL)
 	if err != nil {
 		return nil, fmt.Errorf("reth %s addrs: %w", rethName, err)
 	}
 
 	var ips []net.IP
 	for _, addr := range addrs {
+		// Skip link-local IPv6 (fe80::) — not useful for GARP/NA.
+		if addr.IP.To4() == nil && addr.IP.IsLinkLocalUnicast() {
+			continue
+		}
 		ips = append(ips, addr.IP)
 	}
 	return ips, nil

@@ -26,18 +26,20 @@ type ChassisConfig struct {
 
 // ClusterConfig defines chassis cluster settings for HA.
 type ClusterConfig struct {
-	ClusterID          int
-	NodeID             int
-	RethCount          int
-	HeartbeatInterval  int    // milliseconds, 0=default(1000)
-	HeartbeatThreshold int    // missed heartbeats before lost, 0=default(3)
-	ControlInterface   string // interface for heartbeat traffic (e.g. "hb0")
-	PeerAddress        string // peer node's control link IP (e.g. "10.99.0.2")
-	FabricInterface    string // interface for session/config sync (e.g. "fab0")
-	FabricPeerAddress  string // peer's fabric link IP (e.g. "10.99.1.2")
-	ConfigSync         bool   // enable config synchronization to peer on commit
-	ControlLinkRecovery bool  // enable control-link-recovery
-	RedundancyGroups   []*RedundancyGroup
+	ClusterID              int
+	NodeID                 int
+	RethCount              int
+	HeartbeatInterval      int    // milliseconds, 0=default(1000)
+	HeartbeatThreshold     int    // missed heartbeats before lost, 0=default(3)
+	ControlInterface       string // interface for heartbeat traffic (e.g. "hb0")
+	PeerAddress            string // peer node's control link IP (e.g. "10.99.0.2")
+	FabricInterface        string // interface for session/config sync (e.g. "fab0")
+	FabricPeerAddress      string // peer's fabric link IP (e.g. "10.99.1.2")
+	ConfigSync             bool   // enable config synchronization to peer on commit
+	ControlLinkRecovery    bool   // enable control-link-recovery
+	NATStateSync           bool   // enable NAT state synchronization (session sync with NAT fields)
+	IPsecSASync            bool   // enable IPsec SA synchronization (connection name sync for failover re-initiation)
+	RedundancyGroups       []*RedundancyGroup
 }
 
 // RedundancyGroup defines a cluster redundancy group.

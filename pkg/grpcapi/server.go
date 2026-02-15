@@ -7225,6 +7225,20 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 			Message: fmt.Sprintf("DHCP renewal initiated on %s", req.Target),
 		}, nil
 
+	case "in-service-upgrade":
+		if s.cluster == nil {
+			return nil, status.Error(codes.Unavailable, "cluster not configured")
+		}
+		if err := s.cluster.ForceSecondary(); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "ISSU: %v", err)
+		}
+		return &pb.SystemActionResponse{
+			Message: "Node is now secondary for all redundancy groups.\n" +
+				"Traffic has been drained to peer.\n" +
+				"You may now replace the binary and restart the service:\n" +
+				"  systemctl stop bpfrxd && <replace binary> && systemctl start bpfrxd",
+		}, nil
+
 	default:
 		// Handle cluster failover actions: "cluster-failover:<rgID>" and "cluster-failover-reset:<rgID>"
 		if strings.HasPrefix(req.Action, "cluster-failover-reset:") {

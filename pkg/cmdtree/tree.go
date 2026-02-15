@@ -409,6 +409,9 @@ var OperationalTree = map[string]*Node{
 					"delete": {Desc: "Delete rescue configuration"},
 				}},
 			}},
+			"software": {Desc: "Software management", Children: map[string]*Node{
+				"in-service-upgrade": {Desc: "Prepare node for in-service software upgrade (ISSU)"},
+			}},
 		}},
 	}},
 	"test": {Desc: "Diagnostic test commands", Children: map[string]*Node{

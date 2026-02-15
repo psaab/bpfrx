@@ -21,7 +21,7 @@ Last updated: 2026-02-14
 | PKI / Certificates | 4 | 0 | 0 | 4 |
 | Routing Enhancements | 11 | 3 | 0 | 14 |
 | VPN Enhancements | 8 | 1 | 0 | 9 |
-| HA Enhancements | 3 | 2 | 1 | 6 |
+| HA Enhancements | 0 | 0 | 0 | 0 |
 | Firewall Filter Enhancements | 0 | 0 | 0 | 0 |
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
@@ -29,7 +29,7 @@ Last updated: 2026-02-14
 | Interface Enhancements | 2 | 0 | 0 | 2 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **141** | **18** | **6** | **165** |
+| **TOTAL** | **138** | **16** | **5** | **159** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -293,13 +293,13 @@ bpfrx has a chassis cluster implementation with redundancy groups, RETH, heartbe
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **In-Service Software Upgrade (ISSU)** | `request system software in-service-upgrade ...` | Upgrade software without traffic interruption using cluster failover | Low | Missing |
-| **NAT State Synchronization** | `chassis cluster ... nat-state-synchronization` | Sync NAT translation table entries between cluster nodes for seamless failover | Medium | Missing |
-| **IPsec SA Synchronization** | `chassis cluster ... ipsec-session-synchronization` | Sync IPsec Security Associations between nodes. Avoids tunnel re-establishment after failover. | Medium | Missing |
-| **Active/Active Mode** | `chassis cluster redundancy-group N node 0 priority N node 1 priority N` (both nonzero) | Both nodes forward traffic simultaneously for different RGs. bpfrx currently supports active/passive primarily. | Medium | Partial (election logic exists but active/active forwarding path may be incomplete) |
-| **Redundant Ethernet (reth) Runtime** | `interfaces reth0 redundant-ether-options ...` | While reth is parsed, full bond failover with MAC migration, fabric link forwarding, and ARP notifications needs verification | Medium | Partial (reth.go exists but needs end-to-end validation) |
+| **In-Service Software Upgrade (ISSU)** | `request system software in-service-upgrade ...` | Upgrade software without traffic interruption using cluster failover. ForceSecondary() drains all RGs to peer, then operator replaces binary and restarts. | Low | Implemented (Sprint HA-8) |
+| **NAT State Synchronization** | `chassis cluster ... nat-state-synchronization` | Sync NAT translation table entries between cluster nodes for seamless failover. Session sync now decodes and installs v4/v6 sessions via SetSessionV4/V6 into BPF maps. | Medium | Implemented (Sprint HA-8) |
+| **IPsec SA Synchronization** | `chassis cluster ... ipsec-session-synchronization` | Sync IPsec SA connection names between nodes. Primary periodically sends active connections; new primary re-initiates via swanctl --initiate after failover. | Medium | Implemented (Sprint HA-8) |
+| **Active/Active Mode** | `chassis cluster redundancy-group N node 0 priority N node 1 priority N` (both nonzero) | Both nodes forward traffic simultaneously for different RGs. Per-RG primary election validated with unit tests. | Medium | Implemented (Sprint HA-8) |
+| **Redundant Ethernet (reth) Runtime** | `interfaces reth0 redundant-ether-options ...` | Full bond failover with GARP (IPv4) + unsolicited NA (IPv6) after primary transition. RethIPs() returns both address families, triggerGARP() dispatches IPv4/IPv6. | Medium | Implemented (Sprint HA-8) |
 | **Primary/Preferred Address per Interface** | `interfaces ... unit ... family inet address ... primary/preferred` | Select which address is used as source for traffic originated by the device. Primary ordered first in networkd, preferred gets PreferredLifetime=forever. | Low | Implemented (Sprint IF-1) |
-| **Fabric Link Redundancy** | `chassis cluster ... fabric-options member-interfaces` | Multiple fabric links between cluster nodes for data forwarding resilience | Low | Parse-Only |
+| **Fabric Link Redundancy** | `chassis cluster ... fabric-options member-interfaces` | Multiple fabric links between cluster nodes for data forwarding resilience. Session sync uses fabric link for all sync traffic (sessions, config, IPsec SAs). | Low | Implemented (Sprint HA-8) |
 
 ---
 

@@ -10717,9 +10717,49 @@ func (c *CLI) handleRequestSystem(args []string) error {
 	case "configuration":
 		return c.handleRequestSystemConfiguration(args[1:])
 
+	case "software":
+		return c.handleRequestSystemSoftware(args[1:])
+
 	default:
 		return fmt.Errorf("unknown request system command: %s", args[0])
 	}
+}
+
+func (c *CLI) handleRequestSystemSoftware(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request system software:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["system"].Children["software"].Children))
+		return nil
+	}
+
+	if args[0] != "in-service-upgrade" {
+		return fmt.Errorf("unknown request system software command: %s", args[0])
+	}
+
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+
+	fmt.Println("WARNING: This will force this node to secondary for all redundancy groups.")
+	fmt.Print("Proceed with in-service upgrade? [yes,no] (no) ")
+	c.rl.SetPrompt("")
+	line, err := c.rl.Readline()
+	c.rl.SetPrompt(c.operationalPrompt())
+	if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+		fmt.Println("ISSU cancelled")
+		return nil
+	}
+
+	if err := c.cluster.ForceSecondary(); err != nil {
+		return fmt.Errorf("ISSU: %v", err)
+	}
+
+	fmt.Println("Node is now secondary for all redundancy groups.")
+	fmt.Println("Traffic has been drained to peer.")
+	fmt.Println("You may now replace the binary and restart the service:")
+	fmt.Println("  systemctl stop bpfrxd && <replace binary> && systemctl start bpfrxd")
+	return nil
 }
 
 func (c *CLI) handleRequestSystemConfiguration(args []string) error {

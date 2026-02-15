@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,6 +30,7 @@ const (
 	syncMsgBulkEnd      = 6
 	syncMsgHeartbeat    = 7
 	syncMsgConfig       = 8 // full config text sync from primary to secondary
+	syncMsgIPsecSA      = 9 // IPsec SA connection names sync
 )
 
 // syncHeader is the wire header for each sync message.
@@ -45,11 +47,14 @@ const syncHeaderSize = 12
 type SyncStats struct {
 	SessionsSent     atomic.Uint64
 	SessionsReceived atomic.Uint64
+	SessionsInstalled atomic.Uint64
 	DeletesSent      atomic.Uint64
 	DeletesReceived  atomic.Uint64
 	BulkSyncs        atomic.Uint64
 	ConfigsSent      atomic.Uint64
 	ConfigsReceived  atomic.Uint64
+	IPsecSASent      atomic.Uint64
+	IPsecSAReceived  atomic.Uint64
 	Errors           atomic.Uint64
 	Connected        atomic.Bool
 }
@@ -70,6 +75,14 @@ type SessionSync struct {
 	// OnConfigReceived is called when a config sync message arrives from peer.
 	// The callback receives the full config text. Set by the daemon before Start().
 	OnConfigReceived func(configText string)
+
+	// OnIPsecSAReceived is called when an IPsec SA list arrives from the peer.
+	// On failover, the new primary calls swanctl --initiate for each connection name.
+	OnIPsecSAReceived func(connectionNames []string)
+
+	// peerIPsecSAs holds the latest IPsec connection names received from the peer.
+	peerIPsecSAs   []string
+	peerIPsecSAsMu sync.Mutex
 }
 
 // NewSessionSync creates a new session synchronization manager.
@@ -80,6 +93,12 @@ func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *Session
 		dp:        dp,
 		sendCh:    make(chan []byte, 4096),
 	}
+}
+
+// SetDataPlane sets the dataplane used for installing received sessions.
+// Called by the daemon after the dataplane is loaded (which happens after sync init).
+func (s *SessionSync) SetDataPlane(dp dataplane.DataPlane) {
+	s.dp = dp
 }
 
 // Stats returns current sync statistics.
@@ -418,24 +437,30 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 }
 
 func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
-	if s.dp == nil {
-		return
-	}
-
 	switch msgType {
 	case syncMsgSessionV4:
 		s.stats.SessionsReceived.Add(1)
-		// Decode and install session - for now just count.
-		// Full implementation would call dp.SetSession() (needs interface extension).
-		slog.Debug("cluster sync: received v4 session")
+		if s.dp != nil {
+			if key, val, ok := decodeSessionV4Payload(payload); ok {
+				if err := s.dp.SetSessionV4(key, val); err == nil {
+					s.stats.SessionsInstalled.Add(1)
+				}
+			}
+		}
 
 	case syncMsgSessionV6:
 		s.stats.SessionsReceived.Add(1)
-		slog.Debug("cluster sync: received v6 session")
+		if s.dp != nil {
+			if key, val, ok := decodeSessionV6Payload(payload); ok {
+				if err := s.dp.SetSessionV6(key, val); err == nil {
+					s.stats.SessionsInstalled.Add(1)
+				}
+			}
+		}
 
 	case syncMsgDeleteV4:
 		s.stats.DeletesReceived.Add(1)
-		if len(payload) >= 16 {
+		if s.dp != nil && len(payload) >= 16 {
 			var key dataplane.SessionKey
 			copy(key.SrcIP[:], payload[0:4])
 			copy(key.DstIP[:], payload[4:8])
@@ -447,7 +472,7 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 
 	case syncMsgDeleteV6:
 		s.stats.DeletesReceived.Add(1)
-		if len(payload) >= 40 {
+		if s.dp != nil && len(payload) >= 40 {
 			var key dataplane.SessionKeyV6
 			copy(key.SrcIP[:], payload[0:16])
 			copy(key.DstIP[:], payload[16:32])
@@ -473,6 +498,17 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 			slog.Info("cluster sync: config received from peer", "size", len(payload))
 			go s.OnConfigReceived(configText)
 		}
+
+	case syncMsgIPsecSA:
+		s.stats.IPsecSAReceived.Add(1)
+		names := decodeIPsecSAPayload(payload)
+		s.peerIPsecSAsMu.Lock()
+		s.peerIPsecSAs = names
+		s.peerIPsecSAsMu.Unlock()
+		slog.Debug("cluster sync: received IPsec SA list", "count", len(names))
+		if s.OnIPsecSAReceived != nil {
+			s.OnIPsecSAReceived(names)
+		}
 	}
 }
 
@@ -494,22 +530,57 @@ func (s *SessionSync) FormatStats() string {
 			"  Connected:          %v\n"+
 			"  Sessions sent:      %d\n"+
 			"  Sessions received:  %d\n"+
+			"  Sessions installed: %d\n"+
 			"  Deletes sent:       %d\n"+
 			"  Deletes received:   %d\n"+
 			"  Bulk syncs:         %d\n"+
 			"  Configs sent:       %d\n"+
 			"  Configs received:   %d\n"+
+			"  IPsec SAs sent:     %d\n"+
+			"  IPsec SAs received: %d\n"+
 			"  Errors:             %d\n",
 		s.stats.Connected.Load(),
 		s.stats.SessionsSent.Load(),
 		s.stats.SessionsReceived.Load(),
+		s.stats.SessionsInstalled.Load(),
 		s.stats.DeletesSent.Load(),
 		s.stats.DeletesReceived.Load(),
 		s.stats.BulkSyncs.Load(),
 		s.stats.ConfigsSent.Load(),
 		s.stats.ConfigsReceived.Load(),
+		s.stats.IPsecSASent.Load(),
+		s.stats.IPsecSAReceived.Load(),
 		s.stats.Errors.Load(),
 	)
+}
+
+// PeerIPsecSAs returns the latest IPsec connection names received from the peer.
+func (s *SessionSync) PeerIPsecSAs() []string {
+	s.peerIPsecSAsMu.Lock()
+	defer s.peerIPsecSAsMu.Unlock()
+	cp := make([]string, len(s.peerIPsecSAs))
+	copy(cp, s.peerIPsecSAs)
+	return cp
+}
+
+// QueueIPsecSA sends the list of active IPsec connection names to the peer.
+func (s *SessionSync) QueueIPsecSA(connectionNames []string) {
+	s.mu.Lock()
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		return
+	}
+
+	payload := encodeIPsecSAPayload(connectionNames)
+	if err := writeMsg(conn, syncMsgIPsecSA, payload); err != nil {
+		slog.Warn("cluster sync: IPsec SA send error", "err", err)
+		s.stats.Errors.Add(1)
+		s.handleDisconnect()
+		return
+	}
+	s.stats.IPsecSASent.Add(1)
+	slog.Debug("cluster sync: IPsec SA list sent", "count", len(connectionNames))
 }
 
 // --- Wire encoding helpers ---
@@ -741,4 +812,233 @@ func encodeDeleteV6(key dataplane.SessionKeyV6) []byte {
 	off += 2
 	hdr[off] = key.Protocol
 	return hdr
+}
+
+// --- Session decode helpers ---
+
+// decodeSessionV4Payload decodes a v4 session from wire format.
+// Returns key, value, and ok flag. Must match encodeSessionV4Payload layout.
+func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.SessionValue, bool) {
+	var key dataplane.SessionKey
+	var val dataplane.SessionValue
+	if len(payload) < 16 { // minimum key size
+		return key, val, false
+	}
+
+	off := 0
+	copy(key.SrcIP[:], payload[off:off+4])
+	off += 4
+	copy(key.DstIP[:], payload[off:off+4])
+	off += 4
+	key.SrcPort = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+	key.DstPort = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+	key.Protocol = payload[off]
+	off += 4 // include pad
+
+	if off+8 > len(payload) {
+		return key, val, false
+	}
+
+	val.State = payload[off]
+	off++
+	val.Flags = payload[off]
+	off++
+	val.TCPState = payload[off]
+	off++
+	val.IsReverse = payload[off]
+	off += 5 // include pad0
+
+	if off+40 > len(payload) {
+		return key, val, true // partial value is OK for key-only
+	}
+
+	val.Created = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+	val.LastSeen = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+	val.Timeout = binary.LittleEndian.Uint32(payload[off:])
+	off += 4
+	val.PolicyID = binary.LittleEndian.Uint32(payload[off:])
+	off += 4
+
+	val.IngressZone = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+	val.EgressZone = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+
+	val.NATSrcIP = binary.LittleEndian.Uint32(payload[off:])
+	off += 4
+	val.NATDstIP = binary.LittleEndian.Uint32(payload[off:])
+	off += 4
+	val.NATSrcPort = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+	val.NATDstPort = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+
+	if off+32 > len(payload) {
+		return key, val, true
+	}
+
+	val.FwdPackets = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+	val.FwdBytes = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+	val.RevPackets = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+	val.RevBytes = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+
+	if off+16 <= len(payload) {
+		copy(val.ReverseKey.SrcIP[:], payload[off:off+4])
+		off += 4
+		copy(val.ReverseKey.DstIP[:], payload[off:off+4])
+		off += 4
+		val.ReverseKey.SrcPort = binary.LittleEndian.Uint16(payload[off:])
+		off += 2
+		val.ReverseKey.DstPort = binary.LittleEndian.Uint16(payload[off:])
+		off += 2
+		val.ReverseKey.Protocol = payload[off]
+		off += 4 // include pad
+	}
+
+	if off+2 <= len(payload) {
+		val.ALGType = payload[off]
+		off++
+		val.LogFlags = payload[off]
+	}
+
+	return key, val, true
+}
+
+// decodeSessionV6Payload decodes a v6 session from wire format.
+func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.SessionValueV6, bool) {
+	var key dataplane.SessionKeyV6
+	var val dataplane.SessionValueV6
+	if len(payload) < 40 { // minimum key size
+		return key, val, false
+	}
+
+	off := 0
+	copy(key.SrcIP[:], payload[off:off+16])
+	off += 16
+	copy(key.DstIP[:], payload[off:off+16])
+	off += 16
+	key.SrcPort = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+	key.DstPort = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+	key.Protocol = payload[off]
+	off += 4 // include pad
+
+	if off+8 > len(payload) {
+		return key, val, false
+	}
+
+	val.State = payload[off]
+	off++
+	val.Flags = payload[off]
+	off++
+	val.TCPState = payload[off]
+	off++
+	val.IsReverse = payload[off]
+	off += 5 // include pad0
+
+	if off+40 > len(payload) {
+		return key, val, true
+	}
+
+	val.Created = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+	val.LastSeen = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+	val.Timeout = binary.LittleEndian.Uint32(payload[off:])
+	off += 4
+	val.PolicyID = binary.LittleEndian.Uint32(payload[off:])
+	off += 4
+
+	val.IngressZone = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+	val.EgressZone = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+
+	if off+36 > len(payload) {
+		return key, val, true
+	}
+
+	copy(val.NATSrcIP[:], payload[off:off+16])
+	off += 16
+	copy(val.NATDstIP[:], payload[off:off+16])
+	off += 16
+	val.NATSrcPort = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+	val.NATDstPort = binary.LittleEndian.Uint16(payload[off:])
+	off += 2
+
+	if off+32 > len(payload) {
+		return key, val, true
+	}
+
+	val.FwdPackets = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+	val.FwdBytes = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+	val.RevPackets = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+	val.RevBytes = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
+
+	if off+40 <= len(payload) {
+		copy(val.ReverseKey.SrcIP[:], payload[off:off+16])
+		off += 16
+		copy(val.ReverseKey.DstIP[:], payload[off:off+16])
+		off += 16
+		val.ReverseKey.SrcPort = binary.LittleEndian.Uint16(payload[off:])
+		off += 2
+		val.ReverseKey.DstPort = binary.LittleEndian.Uint16(payload[off:])
+		off += 2
+		val.ReverseKey.Protocol = payload[off]
+		off += 4
+	}
+
+	if off+2 <= len(payload) {
+		val.ALGType = payload[off]
+		off++
+		val.LogFlags = payload[off]
+	}
+
+	return key, val, true
+}
+
+// --- IPsec SA encode/decode ---
+
+// encodeIPsecSAPayload encodes a list of IPsec connection names as newline-separated bytes.
+func encodeIPsecSAPayload(names []string) []byte {
+	if len(names) == 0 {
+		return nil
+	}
+	joined := ""
+	for i, name := range names {
+		if i > 0 {
+			joined += "\n"
+		}
+		joined += name
+	}
+	return []byte(joined)
+}
+
+// decodeIPsecSAPayload decodes a newline-separated list of IPsec connection names.
+func decodeIPsecSAPayload(payload []byte) []string {
+	if len(payload) == 0 {
+		return nil
+	}
+	parts := strings.Split(string(payload), "\n")
+	var names []string
+	for _, p := range parts {
+		if p != "" {
+			names = append(names, p)
+		}
+	}
+	return names
 }

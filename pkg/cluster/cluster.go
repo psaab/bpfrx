@@ -375,6 +375,35 @@ func (m *Manager) ManualFailover(rgID int) error {
 	return nil
 }
 
+// ForceSecondary sets weight to 0 for all redundancy groups, forcing this node
+// to become secondary. Used by ISSU to drain traffic to the peer before upgrade.
+// Returns an error if the peer is not alive (no peer to take over).
+func (m *Manager) ForceSecondary() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.peerAlive {
+		return fmt.Errorf("peer not alive — cannot force secondary without active peer")
+	}
+
+	for _, rg := range m.groups {
+		if rg.State == StateDisabled {
+			continue
+		}
+		oldState := rg.State
+		rg.Weight = 0
+		rg.ManualFailover = true
+		rg.State = StateSecondary
+		if oldState != rg.State {
+			rg.FailoverCount++
+			m.sendEvent(rg.GroupID, oldState, rg.State)
+		}
+	}
+
+	slog.Info("cluster: forced secondary for all RGs (ISSU)")
+	return nil
+}
+
 // ResetFailover clears manual failover and resumes normal election.
 func (m *Manager) ResetFailover(rgID int) error {
 	m.mu.Lock()
@@ -581,7 +610,8 @@ func (m *Manager) RegisterRethIPs(mappings []RethIPMapping) {
 	m.rethIPs = mappings
 }
 
-// triggerGARP sends gratuitous ARPs for all RETH interfaces in the given RG.
+// triggerGARP sends gratuitous ARPs (IPv4) and unsolicited Neighbor
+// Advertisements (IPv6) for all RETH interfaces in the given RG.
 // Called internally when a transition to primary is detected (holds m.mu).
 func (m *Manager) triggerGARP(rgID int) {
 	// Snapshot under lock (called with lock held, so read fields directly).
@@ -591,16 +621,23 @@ func (m *Manager) triggerGARP(rgID int) {
 		count = 4
 	}
 
-	// Send GARP in a goroutine to avoid holding the lock during I/O.
+	// Send GARP/NA in a goroutine to avoid holding the lock during I/O.
 	go func() {
 		for _, mapping := range rethIPs {
 			if mapping.RG != rgID {
 				continue
 			}
 			for _, ip := range mapping.IPs {
-				if err := SendGratuitousARP(mapping.Interface, ip, count); err != nil {
-					slog.Warn("cluster: failed to send GARP",
-						"interface", mapping.Interface, "ip", ip, "err", err)
+				if ip.To4() != nil {
+					if err := SendGratuitousARP(mapping.Interface, ip, count); err != nil {
+						slog.Warn("cluster: failed to send GARP",
+							"interface", mapping.Interface, "ip", ip, "err", err)
+					}
+				} else {
+					if err := SendGratuitousIPv6(mapping.Interface, ip, count); err != nil {
+						slog.Warn("cluster: failed to send IPv6 NA",
+							"interface", mapping.Interface, "ip", ip, "err", err)
+					}
 				}
 			}
 		}

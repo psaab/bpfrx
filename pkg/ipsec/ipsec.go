@@ -444,6 +444,30 @@ func (m *Manager) TerminateAllSAs() (int, error) {
 	return count, nil
 }
 
+// ActiveConnectionNames returns the names of all active/established IKE SAs.
+func (m *Manager) ActiveConnectionNames() ([]string, error) {
+	sas, err := m.GetSAStatus()
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(sas))
+	for _, sa := range sas {
+		if sa.Name != "" {
+			names = append(names, sa.Name)
+		}
+	}
+	return names, nil
+}
+
+// InitiateConnection initiates a single IPsec connection by name.
+func (m *Manager) InitiateConnection(name string) error {
+	cmd := exec.Command("swanctl", "--initiate", "--child", name)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("swanctl --initiate %s: %w: %s", name, err, string(out))
+	}
+	return nil
+}
+
 // GetSAStatus queries strongSwan for active SAs.
 func (m *Manager) GetSAStatus() ([]SAStatus, error) {
 	cmd := exec.Command("swanctl", "--list-sas")
