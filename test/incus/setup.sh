@@ -367,6 +367,12 @@ EOF'
 	incus exec "$INSTANCE_NAME" -- uname -r
 
 	incus exec "$INSTANCE_NAME" -- systemctl enable frr
+
+	# Chrony: enable service and clear default pool sources so only
+	# bpfrxd-managed servers (via sources.d/bpfrx.sources) are used.
+	incus exec "$INSTANCE_NAME" -- systemctl enable chrony
+	incus exec "$INSTANCE_NAME" -- bash -c 'sed -i "s/^pool /#pool /" /etc/chrony/chrony.conf; sed -i "s/^server /#server /" /etc/chrony/chrony.conf'
+	incus exec "$INSTANCE_NAME" -- mkdir -p /etc/chrony/sources.d
 }
 
 cmd_create_ct() {
