@@ -2406,6 +2406,20 @@ func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.Sc
 			}
 		}
 		return out
+	case config.ValueHintPolicyApp:
+		out := []config.SchemaCompletion{
+			{Name: "any", Desc: "Any application"},
+		}
+		for _, app := range cfg.Applications.Applications {
+			out = append(out, config.SchemaCompletion{Name: app.Name, Desc: app.Description})
+		}
+		for _, as := range cfg.Applications.ApplicationSets {
+			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
+		}
+		for name := range config.PredefinedApplications {
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
+		}
+		return out
 	case config.ValueHintUnitNumber:
 		var ifaceName string
 		for i, tok := range path {
