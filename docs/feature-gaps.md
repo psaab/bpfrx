@@ -1,0 +1,508 @@
+# bpfrx vs Juniper vSRX Feature Gap Analysis
+
+Last updated: 2026-02-14
+
+## Summary
+
+| Category | Fully Missing | Partially Implemented | Parse-Only | Total Gaps |
+|----------|--------------|----------------------|------------|------------|
+| Security Policies (Unified/Advanced) | 7 | 0 | 1 | 8 |
+| Application Security (AppSecure) | 7 | 0 | 1 | 8 |
+| IDP/IPS | 8 | 0 | 0 | 8 |
+| Content Security (UTM) | 6 | 0 | 0 | 6 |
+| SSL/TLS Inspection | 4 | 0 | 0 | 4 |
+| Advanced Threat Prevention | 5 | 1 | 0 | 6 |
+| User/Identity Firewall | 5 | 0 | 0 | 5 |
+| NAT Enhancements | 7 | 1 | 0 | 8 |
+| Screen/IDS Enhancements | 6 | 2 | 0 | 8 |
+| Security Flow Enhancements | 9 | 2 | 0 | 11 |
+| ALG Enhancements | 9 | 0 | 0 | 9 |
+| Security Logging Enhancements | 4 | 1 | 1 | 6 |
+| PKI / Certificates | 4 | 0 | 0 | 4 |
+| Routing Enhancements | 11 | 3 | 0 | 14 |
+| VPN Enhancements | 8 | 1 | 0 | 9 |
+| HA Enhancements | 3 | 2 | 2 | 7 |
+| Firewall Filter Enhancements | 4 | 1 | 0 | 5 |
+| QoS / Class of Service | 7 | 1 | 0 | 8 |
+| Multi-Tenancy | 4 | 0 | 0 | 4 |
+| Management & Automation | 10 | 2 | 0 | 12 |
+| Interface Enhancements | 5 | 1 | 2 | 8 |
+| System Enhancements | 5 | 1 | 2 | 8 |
+| Miscellaneous | 6 | 0 | 0 | 6 |
+| **TOTAL** | **148** | **20** | **9** | **177** |
+
+**Implementation status key:**
+- **Fully Missing**: No config parsing or runtime support
+- **Partially Implemented**: Some aspects work but incomplete
+- **Parse-Only**: Config is parsed into AST/types but has no runtime effect
+
+---
+
+## 1. Security Policies (Unified/Advanced)
+
+bpfrx has zone-based policies with source/dest address, application match, permit/deny/reject actions, logging, counting, and schedulers. These gaps represent vSRX-specific advanced policy features.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **Unified Policies** | `security policies ... match dynamic-application` | Single policy combining L3/L4 + L7 app + URL category + user identity match conditions. Foundation for modern SRX policy management. | High | Missing (requires AppID) |
+| **Dynamic Application Match** | `security policies ... match dynamic-application junos:FTP` | Match on L7-detected application identity within security policy | High | Missing (requires AppID) |
+| **URL Category Match** | `security policies ... match url-category ...` | Match web traffic by URL category (shopping, social-media, etc.) | Medium | Missing |
+| **Source Identity Match** | `security policies ... match source-identity ...` | Match on authenticated user identity (AD user/group) in policy | Medium | Missing (requires user-id) |
+| **Application Services in Policy** | `security policies ... then permit application-services` | Attach UTM, IDP, SSL-proxy, AppFW, ICAP redirect, SecIntel to policy action | High | Missing |
+| **Policy Rematch** | `security policies policy-rematch` | Re-evaluate existing sessions when policy changes | Medium | Missing |
+| **Policy Scheduling (time ranges)** | `schedulers scheduler ...` | Time-based policy activation/deactivation with start/stop dates | Low | Parse-Only (SchedulerConfig parsed, not runtime-wired) |
+| **Reject Action with Profile** | `security policies ... then reject profile ...` | Custom ICMP/TCP-RST reject messages, redirect URLs for blocked content | Low | Missing |
+
+---
+
+## 2. Application Security (AppSecure)
+
+The AppSecure suite is a major differentiator for the vSRX as an NGFW. bpfrx currently has `services application-identification` parsed as a boolean but no DPI engine.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **Application Identification (AppID)** | `services application-identification` | L7 DPI engine using signatures, heuristics, pattern matching. Identifies 4000+ apps regardless of port/protocol. Foundation for all AppSecure features. | High | Parse-Only (bool flag, no DPI engine) |
+| **Application Tracking (AppTrack)** | `security application-tracking` | Log and report on applications traversing the device. Generates AppTrack log messages per session with app name, bytes, duration. | Medium | Missing |
+| **Application Firewall (AppFW)** | `security application-firewall ...` | (Legacy, replaced by unified policies) Policy enforcement based on detected app identity | Medium | Missing |
+| **Application QoS (AppQoS)** | `class-of-service application-traffic-control` | QoS rate-limiting and marking based on detected application | Medium | Missing |
+| **Advanced Policy-Based Routing (APBR)** | `security advance-policy-based-routing profile ...` | Route traffic to different routing instances based on L7 application identity. Profile with rules matching apps/groups to routing-instance. Applied per-zone. | Medium | Missing (bpfrx has filter-based PBR but not L7-aware) |
+| **Application Signature Package** | `request services application-identification download` | Downloadable/updatable signature database, predefined app groups (junos:social-networking, junos:web:streaming, etc.) | Medium | Missing |
+| **Application System Cache** | `services application-identification application-system-cache` | Cache app identification results for faster classification of subsequent connections from same source | Low | Missing |
+| **Custom Application Signatures** | `services application-identification application ... signature ...` | User-defined L7 signatures with byte patterns for custom/proprietary applications | Low | Missing |
+
+---
+
+## 3. Intrusion Detection & Prevention (IDP/IPS)
+
+IDP is a core NGFW feature supported on vSRX with subscription license. bpfrx has no IDP engine.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **IDP Policy** | `security idp idp-policy ...` | Policy with rulebases (IPS, exempt) containing match conditions and actions (close-client, close-server, drop, notify, ignore) | High | Missing |
+| **Signature Database** | `security idp security-package` | 15,000+ predefined attack signatures, automatic updates from Juniper | High | Missing |
+| **Protocol Anomaly Detection** | `security idp idp-policy ... rulebase ips rule ... match attacks predefined-attack-groups` | Detect non-RFC-compliant protocol behavior (65+ protocol decoders, 500+ contexts) | High | Missing |
+| **Custom Attack Objects** | `security idp custom-attack ...` | User-defined signatures with regex patterns, protocol contexts, severity levels | Medium | Missing |
+| **Dynamic Attack Groups** | `security idp dynamic-attack-group ...` | Auto-grouping based on severity, category, application, CVSS score filters | Medium | Missing |
+| **IDP Sensor Configuration** | `security idp sensor-configuration ...` | Tuning parameters: flow-level vs packet-level, performance vs accuracy | Low | Missing |
+| **Recommended Policy** | `security idp active-policy recommended` | Pre-built policy curated by Juniper Security Team | Low | Missing |
+| **IDP SSL Inspection** | (deprecated in favor of SSL proxy) | Inspect encrypted traffic using loaded RSA private keys | Low | Missing |
+
+---
+
+## 4. Content Security (UTM)
+
+UTM features require subscription license on vSRX. bpfrx has no content inspection engine.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **Antivirus** | `security utm feature-profile anti-virus ...` | Signature-based AV scanning (Avira engine on vSRX 3.0). File-based and express modes for HTTP, FTP, SMTP, POP3, IMAP. | Medium | Missing |
+| **Web Filtering (EWF)** | `security utm feature-profile web-filtering juniper-enhanced ...` | Enhanced Web Filtering: 90+ URL categories, cloud-based categorization, safe search enforcement | Medium | Missing |
+| **Anti-Spam** | `security utm feature-profile anti-spam ...` | SMTP spam filtering using Sophos/SBL block lists, real-time blocklist checks | Low | Missing |
+| **Content Filtering** | `security utm feature-profile content-filtering ...` | Block/permit by MIME type, file extension, protocol command, embedded object type | Low | Missing |
+| **UTM Custom Objects** | `security utm custom-objects ...` | MIME patterns, filename extensions, URL patterns, URL categories for UTM matching | Low | Missing |
+| **UTM Policies** | `security utm utm-policy ...` | Named UTM profiles that aggregate AV, web-filter, anti-spam, content-filter and attach to security policies via `application-services utm-policy` | Medium | Missing |
+
+---
+
+## 5. SSL/TLS Inspection
+
+SSL proxy is supported on vSRX 3.0 and enables inspection of encrypted traffic for IDP, AppFW, UTM, etc.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **SSL Forward Proxy** | `services ssl proxy profile ... actions ...` | MITM decryption of outbound TLS: terminate client session, establish new session to server, inspect cleartext. Applied via security policy `application-services ssl-proxy`. | Medium | Missing |
+| **SSL Reverse Proxy** | `services ssl proxy profile ... protect-server ...` | Decrypt inbound TLS for server protection. Load server's private key to terminate sessions. | Low | Missing |
+| **SSL Decryption Mirroring** | `services ssl proxy ... decryption-mirror ...` | Mirror decrypted traffic to analysis tool/SPAN port | Low | Missing |
+| **Certificate Management for SSL** | `security pki ... ; services ssl proxy root-ca ...` | Root CA generation, trusted CA stores, certificate exemptions per URL category, allowlisting by domain | Medium | Missing |
+
+---
+
+## 6. Advanced Threat Prevention (ATP)
+
+ATP Cloud integration provides cloud-based threat analysis. bpfrx has dynamic address feeds which partially overlap with SecIntel.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **SecIntel Threat Feeds** | `services security-intelligence profile ...` | Cloud-curated threat intelligence feeds: C&C servers, attacker IPs, malicious URLs, infected hosts. Applied via security policy. | Medium | Partial (bpfrx has dynamic address feeds but not SecIntel-format integration) |
+| **Malware Sandboxing** | `services advanced-anti-malware policy ...` | Cloud-based sandbox analysis of unknown files (ATP Cloud). File submission, verdict caching. | Low | Missing |
+| **Encrypted Traffic Insights** | `services ssl ... encrypted-traffic-insights ...` | Detect malware in encrypted traffic without decryption using TLS metadata analysis (JA3 fingerprints, certificate characteristics) | Low | Missing |
+| **GeoIP Filtering** | `security intelligence ... geoip ...` | Block/allow traffic by geographic location of source/destination IP | Medium | Missing |
+| **DNS Security** | `services security-intelligence profile ... category dns ...` | DNS request inspection, domain sinkholing, DNS tunneling detection | Medium | Missing |
+| **Adaptive Threat Profiling** | `services security-intelligence profile ... adaptive-threat-profiling ...` | Automated threat intelligence generation from local traffic patterns | Low | Missing |
+
+---
+
+## 7. User/Identity Firewall
+
+User-based policy enforcement integrating with directory services. Not implemented in bpfrx.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **Integrated User Firewall** | `services user-identification active-directory-access ...` | Policy enforcement based on user identity. Reads AD event logs, LDAP queries for user-IP mapping. | Medium | Missing |
+| **Captive Portal** | `services user-identification ... ; security policies ... then permit firewall-authentication web-redirect` | Web-based authentication portal for unauthenticated users. Redirect HTTP to login page. | Medium | Missing |
+| **Pass-Through Authentication** | `security policies ... then permit firewall-authentication pass-through` | Transparent auth: prompt for credentials via FTP/Telnet/HTTP without redirect | Low | Missing |
+| **User Role-Based Policies** | `security policies ... match source-identity role-name` | Security policies matching on user roles/groups from AD/LDAP directory | Medium | Missing |
+| **JIMS Integration** | `services user-identification identity-management ...` | Juniper Identity Management Service for user-IP mapping from multiple auth sources | Low | Missing |
+
+---
+
+## 8. NAT Enhancements
+
+bpfrx has SNAT (interface + pool, address-persistent), DNAT (with pools, hit counters), static 1:1, NAT64, and exemption rules. These are additional NAT features from the vSRX.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **Proxy ARP for NAT** | `security nat proxy-arp interface ... address ...` | Auto-reply ARP for NAT pool addresses on same subnet as ingress interface. Required when SNAT pool or DNAT addresses are on same L2 segment. | High | Missing |
+| **Proxy NDP for NAT** | `security nat proxy-ndp interface ... address ...` | IPv6 equivalent of proxy ARP for NAT64/static NAT addresses | Medium | Missing |
+| **Twice NAT** | Combination of SNAT + DNAT rule-sets matching same traffic | Simultaneous source and destination translation in single flow. bpfrx handles SNAT and DNAT independently but may not combine in same session correctly. | Medium | Partial (separate SNAT/DNAT rules exist but not tested as combined twice-NAT) |
+| **DNS ALG with NAT** | `security alg dns enable` | DNS payload rewriting when NAT changes embedded IP addresses (A/AAAA record doctoring) | Medium | Missing |
+| **Overflow Pool** | `security nat source pool ... overflow-pool ...` | Fallback to interface NAT or another pool when primary SNAT pool is exhausted | Low | Missing |
+| **Address Pooling (paired/no-paired)** | `security nat source pool ... address-pooling paired` | Per-pool override of global address-persistent: paired ensures same source always maps to same pool address; no-paired allows round-robin | Low | Missing |
+| **Port Randomization Control** | `security nat source pool ... port-randomization disable` | Disable random port selection in SNAT (use sequential instead). Enabled by default. | Low | Missing |
+| **Deterministic NAT (Port Block Allocation)** | `security nat source pool ... port-deterministic ...` | Predictable port mapping for logging compliance. Each source gets fixed port block. | Low | Missing |
+
+---
+
+## 9. Screen/IDS Enhancements
+
+bpfrx implements 11 screen checks (land, syn-flood, ping-death, teardrop, rate-limiting, ip-sweep, winnuke, syn-frag, syn-fin, no-flag, fin-no-ack). These are additional vSRX screen options.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **Session Limiting (source-ip)** | `security screen ids-option ... limit-session source-ip-based N` | Limit max concurrent sessions from single source IP (1-8M). Prevents session table exhaustion. | High | Missing |
+| **Session Limiting (dest-ip)** | `security screen ids-option ... limit-session destination-ip-based N` | Limit max concurrent sessions to single destination IP | High | Missing |
+| **TCP Port Scan Detection** | `security screen ids-option ... tcp port-scan threshold N` | Detect TCP port scanning by counting unique destination ports per source within time window | Medium | Partial (threshold parsed but detection algorithm may be incomplete) |
+| **UDP Port Scan Detection** | `security screen ids-option ... udp port-scan threshold N` | Same as TCP port scan but for UDP | Medium | Missing |
+| **UDP Sweep Detection** | `security screen ids-option ... udp udp-sweep threshold N` | Detect UDP sweeps (same port, many destinations) | Low | Missing |
+| **TCP Sweep Detection** | `security screen ids-option ... tcp tcp-sweep threshold N` | Detect TCP sweeps (same port, many destinations) | Low | Missing |
+| **IP Block Fragment** | `security screen ids-option ... ip block-frag` | Block all IP fragments unconditionally | Low | Partial (fragment checks exist but not unconditional block option) |
+| **IPv6 Extension Header Filtering** | `security screen ids-option ... ip ipv6-extension-header ...` | Filter/block specific IPv6 extension headers (hop-by-hop, routing, destination, fragment, mobility, no-next) | Medium | Missing |
+
+---
+
+## 10. Security Flow Enhancements
+
+bpfrx has TCP session timeouts (established, initial, closing, time-wait), UDP/ICMP timeouts, TCP MSS clamping (IPsec, GRE in/out), allow-dns-reply, allow-embedded-icmp, GRE performance acceleration, and flow traceoptions.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **SYN Flood Protection Mode** | `security flow syn-flood-protection-mode syn-cookie` | Global SYN flood protection mode: syn-cookie (stateless) or syn-proxy (stateful). Different from per-screen syn-flood thresholds. | Medium | Missing |
+| **TCP Strict SYN Check** | `security flow tcp-session strict-syn-check` | Require SYN as first packet for TCP session creation (drop mid-stream pickup) | Medium | Partial (bpfrx conntrack requires SYN for new sessions but this isn't configurable) |
+| **TCP No-SYN-Check** | `security flow tcp-session no-syn-check` | Allow mid-stream TCP session pickup (useful after failover or asymmetric routing) | Medium | Missing (bpfrx always requires SYN) |
+| **TCP No-SYN-Check in Tunnel** | `security flow tcp-session no-syn-check-in-tunnel` | Allow mid-stream pickup specifically for tunneled traffic (IPsec, GRE) | Low | Missing |
+| **TCP RST Invalidate Session** | `security flow tcp-session rst-invalidate-session` | Immediately invalidate session on TCP RST instead of waiting for timeout | Medium | Partial (bpfrx handles RST but may not have configurable invalidation) |
+| **Force IP Reassembly** | `security flow force-ip-reassembly` | Force reassembly of all IP fragments before processing (protects against fragment-based evasion) | Medium | Missing |
+| **Route Change Timeout** | `security flow route-change-timeout N` | Session timeout (6-1800s) applied when route changes to nonexistent route. Prevents sessions hanging on dead routes. | Low | Missing |
+| **Aggressive Session Aging** | `security flow aging early-ageout N; high-watermark N; low-watermark N` | Accelerate session timeout when session table exceeds watermark threshold | Medium | Missing |
+| **ICMP Session Sync** | `security flow sync-icmp-session` | Synchronize ICMP sessions between HA cluster nodes | Low | Missing |
+| **Multicast Session Timeout** | `security flow multicast-session ...` | Custom timeout values for multicast flow sessions | Low | Missing |
+| **Preserve Incoming Fragment Size** | `security flow preserve-incoming-fragment-size` | Maintain original fragment sizes through the device instead of reassemble-and-re-fragment | Low | Missing |
+
+---
+
+## 11. ALG Enhancements
+
+bpfrx has ALG disable flags for DNS, FTP, SIP, TFTP. The vSRX supports many more ALGs.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **H.323 ALG** | `security alg h323 ...` | VoIP: H.323 session tracking, media pinhole management, NAT for H.245/RAS | Low | Missing |
+| **MGCP ALG** | `security alg mgcp ...` | VoIP: Media Gateway Control Protocol session awareness | Low | Missing |
+| **SCCP ALG** | `security alg sccp ...` | VoIP: Skinny Client Control Protocol (Cisco) session tracking | Low | Missing |
+| **MSRPC ALG** | `security alg msrpc ...` | Microsoft RPC dynamic port tracking (Active Directory, Exchange) | Medium | Missing |
+| **SunRPC ALG** | `security alg sunrpc ...` | Sun/ONC RPC dynamic port tracking (NFS, NIS) | Low | Missing |
+| **PPTP ALG** | `security alg pptp ...` | Point-to-Point Tunneling Protocol GRE call tracking | Low | Missing |
+| **RTSP ALG** | `security alg rtsp ...` | Real-Time Streaming Protocol media pinhole management | Low | Missing |
+| **RSH ALG** | `security alg rsh ...` | Remote Shell protocol dynamic port tracking | Low | Missing |
+| **IKE-ESP NAT** | `security alg ike-esp-nat enable` | IKE/ESP NAT traversal assistance (non-standard NAT-T) | Low | Missing |
+
+---
+
+## 12. Security Logging Enhancements
+
+bpfrx has security logging with mode (stream/event), format, streams with host/port/severity/facility/category/source-address. These are additional features.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **Structured Syslog Format** | `security log format structured` | Machine-parseable key-value syslog format (RT_FLOW_SESSION_CREATE, etc.) with standardized field names | Medium | Missing |
+| **Binary Log Format** | `security log format binary` | High-performance binary log format for off-box collector (requires Juniper log receiver) | Low | Missing |
+| **Transport Protocol Selection** | `security log stream ... transport protocol tcp/tls` | Send security logs over TCP or TLS instead of UDP for reliable delivery | Medium | Missing |
+| **Per-Policy Logging** | `security policies ... then log session-init session-close` | bpfrx has this but may not fully support all log fields (app-name, nat-*, nested-app, etc.) | Medium | Partial (basic session-init/close logging works) |
+| **Log Event Mode** | `security log mode event` | Route security logs through eventd (control plane) for on-box processing, slower but allows local processing | Low | Parse-Only (parsed but always uses stream) |
+| **Session Aggregation Logs** | `security log ... report` | Aggregate session logs for top-N reporting (top talkers, top applications) | Low | Missing |
+
+---
+
+## 13. PKI / Certificates
+
+bpfrx uses strongSwan for IPsec which has its own certificate handling, but Junos PKI management is not implemented.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **CA Profile Management** | `security pki ca-profile ... ca-identity ... enrollment url ...` | CA certificate profiles with SCEP/CMPv2 enrollment, revocation checking (CRL/OCSP) | Medium | Missing |
+| **Local Certificate Management** | `security pki local-certificate ...` | Generate CSRs, load certificates, auto-enrollment, renewal tracking | Medium | Missing |
+| **CRL Management** | `security pki ca-profile ... revocation-check crl ...` | Certificate revocation list download, caching, periodic refresh | Low | Missing |
+| **Certificate-Based IPsec** | `security ike gateway ... local-certificate ...` | IPsec authentication using X.509 certificates instead of PSK | Medium | Missing (strongSwan supports this but bpfrx doesn't configure it) |
+
+---
+
+## 14. Routing Enhancements
+
+bpfrx has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, rib-groups, next-table route leaking, PBR, and FRR integration (OSPF, BGP, IS-IS, RIP, LLDP). These are additional routing features.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **BFD** | `protocols ospf area ... interface ... bfd-liveness-detection ...` | Bidirectional Forwarding Detection for sub-second failure detection on routing adjacencies. FRR supports BFD natively. | High | Missing (FRR has BFD daemon but bpfrx doesn't configure it) |
+| **Graceful Restart** | `routing-options graceful-restart` | Non-stop routing during control plane restart. Keep forwarding while protocols reconverge. FRR supports GR. | Medium | Missing (FRR has GR but bpfrx doesn't configure it) |
+| **Aggregate Routes** | `routing-options aggregate route ...` | Aggregate (summary) routes with policy control, different from generate routes in contributing route behavior | Medium | Partial (generate routes implemented but aggregate semantics differ) |
+| **Martian Addresses** | `routing-options martians ... allow/exact/orlonger` | Configure additional martian (reserved) address filtering or allow specific martians | Low | Missing |
+| **Forwarding Table Export** | `routing-options forwarding-table export ...` | Apply routing policy to routes exported from routing table to forwarding table. Used for ECMP load-balancing policy. | Medium | Partial (parsed but not fully wired to FRR) |
+| **Multipath** | `routing-options multipath` | Protocol-independent load balancing for L3 VPN next-hops | Low | Missing |
+| **Maximum ECMP Paths** | `routing-options maximum-ecmp N` | Limit number of ECMP paths installed in forwarding table | Low | Missing |
+| **Nonstop Routing** | `routing-options nonstop-routing` | Maintain routing state during Routing Engine switchover | Low | Missing |
+| **Multicast (PIM/IGMP)** | `protocols pim ...; protocols igmp ...` | PIM-SM/SSM/DM multicast routing, IGMP group management. vSRX supports multicast. | Medium | Missing |
+| **L2 Learning** | `protocols l2-learning ...` | MAC learning and forwarding for transparent/bridge mode | Low | Missing |
+| **Source Routing / SRv6** | `source-routing ...` | Segment Routing v6 for traffic engineering | Low | Missing |
+| **MPLS / LDP** | `protocols mpls ...; protocols ldp ...` | MPLS label switching. Note: disables flow-based security on SRX. | Low | Missing |
+| **Dynamic Tunnels** | `routing-options dynamic-tunnels ...` | Auto-created GRE tunnels for MPLS-over-GRE | Low | Missing |
+| **Routing Policy Enhancements** | `policy-options policy-statement ... from protocol bgp ... then metric-type 2` | bpfrx has basic policy-statements. Missing: `from route-filter-list`, `from interface`, `from neighbor`, `then tag`, `then as-path-prepend`, `then community add/delete/set` | Medium | Partial (basic from/then exists, several match/action types missing) |
+
+---
+
+## 15. VPN Enhancements
+
+bpfrx has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfaces, NAT-T, DPD modes, local/remote identity, DF-bit, establish-tunnels. These are additional VPN features.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **SSL VPN / Juniper Secure Connect** | `security remote-access ...` | Client-based SSL VPN for remote access (Windows, Mac, Android, iOS). Web portal login. | Medium | Missing |
+| **Dynamic VPN** | `security dynamic-vpn ...` | Simplified IPsec remote access with web-based client provisioning and access profiles | Medium | Missing |
+| **AutoVPN** | `security ike gateway ... dynamic ...` | Auto-provisioned hub-and-spoke IPsec VPN. Hub accepts dynamic spoke connections using DNS names or any. | Medium | Missing |
+| **ADVPN** | `security ipsec vpn ... advpn ...` | Auto Discovery VPN: dynamic spoke-to-spoke tunnels created on demand in hub-and-spoke topology | Low | Missing |
+| **Group VPN (GVPNv2)** | `security group-vpn ...` | Group key management for multipoint VPNs with single SA for multiple endpoints | Low | Missing |
+| **IPsec Traffic Selectors** | `security ipsec vpn ... traffic-selector ...` | Per-tunnel traffic selectors (proxy-IDs) defining which traffic enters the tunnel | Medium | Partial (basic local-id/remote-id exists but not full traffic-selector syntax) |
+| **PowerMode IPsec** | `security flow power-mode-ipsec` | VPP + Intel AES-NI acceleration for IPsec throughput. vSRX 3.0 feature. | Low | Missing |
+| **IPsec SA Lifetime (kilobytes)** | `security ipsec proposal ... lifetime-kilobytes N` | Rekey based on data volume in addition to time-based lifetime | Low | Missing |
+| **Dual-Stack IPsec Tunnels** | Multiple st0 units with inet+inet6 families | Parallel IPv4+IPv6 tunnels over single XFRM interface | Low | Missing |
+
+---
+
+## 16. HA Enhancements
+
+bpfrx has a chassis cluster implementation with redundancy groups, RETH, heartbeat, GARP, weight-based failover, session sync (RTO), config sync, IP monitoring, election logic, and VRRP. These are additional/missing HA features.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **In-Service Software Upgrade (ISSU)** | `request system software in-service-upgrade ...` | Upgrade software without traffic interruption using cluster failover | Low | Missing |
+| **NAT State Synchronization** | `chassis cluster ... nat-state-synchronization` | Sync NAT translation table entries between cluster nodes for seamless failover | Medium | Missing |
+| **IPsec SA Synchronization** | `chassis cluster ... ipsec-session-synchronization` | Sync IPsec Security Associations between nodes. Avoids tunnel re-establishment after failover. | Medium | Missing |
+| **Active/Active Mode** | `chassis cluster redundancy-group N node 0 priority N node 1 priority N` (both nonzero) | Both nodes forward traffic simultaneously for different RGs. bpfrx currently supports active/passive primarily. | Medium | Partial (election logic exists but active/active forwarding path may be incomplete) |
+| **Redundant Ethernet (reth) Runtime** | `interfaces reth0 redundant-ether-options ...` | While reth is parsed, full bond failover with MAC migration, fabric link forwarding, and ARP notifications needs verification | Medium | Partial (reth.go exists but needs end-to-end validation) |
+| **Primary/Preferred Address per Interface** | `interfaces ... unit ... family inet address ... primary/preferred` | Select which address is used as source for traffic originated by the device | Low | Parse-Only |
+| **Fabric Link Redundancy** | `chassis cluster ... fabric-options member-interfaces` | Multiple fabric links between cluster nodes for data forwarding resilience | Low | Parse-Only |
+
+---
+
+## 17. Firewall Filter Enhancements
+
+bpfrx has firewall filters with source/dest addresses, prefix-lists (with except), DSCP, protocol, dest/source ports, ICMP type/code, TCP flags, fragment match, actions (accept/reject/discard), routing-instance, log, count, forwarding-class, loss-priority, DSCP rewrite.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Missing |
+| **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR | Medium | Missing |
+| **Interface Policer** | `firewall policer ... logical-interface-policer` | Aggregate rate limiting across all protocol families on a logical interface | Low | Missing |
+| **Flexible Match Conditions** | `firewall filter ... term ... from flexible-match-range ...` | Match on arbitrary byte offsets within packet header for custom protocol matching | Low | Missing |
+| **Firewall Filter on lo0** | `interfaces lo0 unit 0 family inet filter input ...` | Host-bound traffic filtering. bpfrx parses Lo0FilterInputV4/V6 but may not fully apply in BPF. | Medium | Partial (parsed and partially wired but needs verification) |
+
+---
+
+## 18. QoS / Class of Service
+
+Note: Class of Service is NOT supported on vSRX according to Juniper documentation. However, some CoS-related features work through firewall filters and forwarding-classes. bpfrx has DSCP matching and rewrite via firewall filters.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **Forwarding Classes** | `class-of-service forwarding-classes class ...` | Define custom forwarding class names mapped to queue numbers | Low | Missing (N/A on vSRX) |
+| **Scheduler Maps** | `class-of-service scheduler-maps ...` | Associate forwarding classes with schedulers (bandwidth %, priority, buffer) | Low | Missing (N/A on vSRX) |
+| **Schedulers** | `class-of-service schedulers ...` | Define per-queue scheduling parameters (transmit rate, priority, drop profile) | Low | Missing (N/A on vSRX) |
+| **BA Classifiers** | `class-of-service classifiers dscp ...` | Classify incoming traffic by DSCP/802.1p into forwarding classes and loss priorities | Low | Missing (N/A on vSRX) |
+| **Rewrite Rules** | `class-of-service rewrite-rules dscp ...` | Rewrite outgoing DSCP/802.1p values. bpfrx has filter-based DSCP rewrite. | Low | Partial (via firewall filter forwarding-class action) |
+| **WRED Drop Profiles** | `class-of-service drop-profiles ...` | Weighted Random Early Detection congestion avoidance per queue | Low | Missing (N/A on vSRX) |
+| **Traffic Shaping** | `class-of-service interfaces ... shaping-rate ...` | Per-interface output rate shaping | Low | Missing (N/A on vSRX) |
+| **Interface CoS Binding** | `class-of-service interfaces ... scheduler-map ...` | Bind scheduler-map and classifiers to specific interfaces | Low | Missing (N/A on vSRX) |
+
+---
+
+## 19. Multi-Tenancy
+
+Logical systems and tenant systems are supported on vSRX starting from Junos 20.1R1.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **Logical Systems (LSYS)** | `logical-systems ...` | Partition device into independent virtual firewalls. Each LSYS has own zones, policies, routing instances, NAT, address books. | Medium | Missing |
+| **Tenant Systems (TSYS)** | `tenants ...` | Lightweight multi-tenancy. Single routing instance per tenant but supports higher tenant count. | Medium | Missing |
+| **Security Profiles** | `system security-profile ...` | Resource limits per LSYS/TSYS: max sessions, NAT rules, policies, zones, VPNs | Low | Missing |
+| **Inter-LSYS Traffic** | `logical-systems ... security policies from-zone ... to-zone ...` | Security policies between logical systems via logical tunnel (lt) interfaces | Low | Missing |
+
+---
+
+## 20. Management & Automation
+
+bpfrx has gRPC (48+ RPCs), REST API, Junos-style CLI (local + remote), Prometheus metrics, config commit/rollback, and event-options. These are additional management features.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **NETCONF/YANG** | `system services netconf ...` | Standards-based config management (RFC 6241). Enables Ansible, Salt, Terraform, ncclient integration. XML-based RPC. | High | Missing |
+| **Configuration Groups** | `groups { name { ... } }; apply-groups name` | Template inheritance for config reuse. Apply common settings to multiple stanzas without duplication. | Medium | Missing |
+| **Commit Scripts** | `system scripts commit ...` | Pre-commit validation scripts (SLAX/Python) that enforce config standards and generate warnings/errors | Low | Missing |
+| **Op Scripts** | `system scripts op ...` | Custom operational commands via SLAX/Python scripts | Low | Missing |
+| **RADIUS Authentication** | `system radius-server ...; system authentication-order radius` | External RADIUS authentication for management access (SSH, CLI, web) | Medium | Missing |
+| **TACACS+ Authentication** | `system tacplus-server ...; system authentication-order tacplus` | External TACACS+ authentication with per-command authorization | Medium | Missing |
+| **SNMP v3 USM** | `snmp v3 usm local-engine user ...` | Full SNMPv3 with authentication (SHA/MD5) and privacy (AES/DES). bpfrx parses v3 users but runtime may be incomplete. | Medium | Partial (parsed, needs runtime verification) |
+| **SNMP Traps/Notifications** | `snmp trap-group ... targets ...` | SNMP trap generation on events (link up/down, auth failure, etc.). bpfrx parses trap-groups but sending is not implemented. | Medium | Partial (parsed, trap sending not implemented) |
+| **J-Web / Full Web GUI** | `system services web-management ...` | Full web-based management UI with dashboard, wizards, monitoring, policy editor. bpfrx has basic REST API. | Low | Missing |
+| **XML/JSON Config Export** | `show configuration | display xml/json` | Export configuration in XML or JSON format for automation tooling | Low | Missing |
+| **Junos Space / Security Director** | N/A (external management platform) | Centralized multi-device policy management. Not applicable as a feature of bpfrx itself. | Low | Missing (N/A) |
+| **Rescue Configuration** | `request system configuration rescue save` | Saved fallback configuration that can be loaded on boot if active config fails | Low | Missing |
+
+---
+
+## 21. Interface Enhancements
+
+bpfrx manages all interfaces with .link/.network files, supports VLANs, tunnel interfaces (GRE, IP-IP, XFRM), DHCP, VRRP, MTU, speed/duplex, disable, sampling, and per-interface firewall filters.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **Link Aggregation (LAG/ae)** | `interfaces ae0 ...; interfaces ge-0/0/0 gigether-options 802.3ad ae0` | Bundle physical links into aggregate ethernet for bandwidth and redundancy. Different from reth. | Medium | Missing |
+| **Transparent Mode (L2 Bridging)** | `interfaces ... family ethernet-switching; bridge-domains ...` | Layer 2 bridge mode where firewall acts as transparent inline device. Zone-based policies still apply. MAC learning table. | Medium | Missing |
+| **Flexible VLAN Tagging** | `interfaces ... flexible-vlan-tagging; encapsulation flexible-ethernet-services` | Q-in-Q (802.1ad), flexible VLAN push/pop/swap operations. bpfrx has basic 802.1Q single-tag. | Low | Missing |
+| **Interface Bandwidth** | `interfaces ... bandwidth ...` | Set logical interface bandwidth for OSPF cost calculation and traffic-engineering | Low | Missing |
+| **IRB Interfaces** | `interfaces irb unit N family inet address ...` | Integrated Routing and Bridging: L3 interface in bridge domain for inter-VLAN routing | Medium | Missing |
+| **Point-to-Point** | `interfaces ... unit ... point-to-point` | Mark interface as point-to-point (affects OSPF network type, ND behavior) | Low | Parse-Only |
+| **Primary/Preferred Address** | `interfaces ... unit ... family inet address ... primary/preferred` | Control which address is used for sourced traffic | Low | Parse-Only |
+| **Interface Description** | `interfaces ... description "..."` | bpfrx parses descriptions. Verify they appear in `show interfaces` output. | Low | Partial (parsed, display may need verification) |
+
+---
+
+## 22. System Enhancements
+
+bpfrx has hostname, domain-name, domain-search, timezone, name-servers, NTP, services (SSH, web-management, DNS), syslog, SNMP, login users/classes, root-authentication, archival, internet-options, backup-router, DHCP server (Kea), and DPDK config.
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **RADIUS Server Config** | `system radius-server ... port ... secret ...` | RADIUS server definitions for AAA (authentication, authorization, accounting) | Medium | Missing |
+| **TACACS+ Server Config** | `system tacplus-server ... port ... secret ...` | TACACS+ server definitions for per-command authorization | Medium | Missing |
+| **Authentication Order** | `system authentication-order [radius tacplus password]` | Control order of authentication methods for management access | Medium | Missing |
+| **Auto-Image Upgrade** | `system autoinstallation ...` | Zero-touch provisioning for initial deployment | Low | Missing |
+| **Time Zone (wired)** | `system time-zone ...` | bpfrx parses timezone but verify it's applied to the system | Low | Partial (parsed, needs runtime verification) |
+| **NTP Threshold Action** | `system ntp threshold ... action ...` | Action when NTP offset exceeds threshold (accept or reject large time jumps) | Low | Parse-Only |
+| **Master Password** | `system master-password ...` | Encrypted password storage with master key for config secrets | Low | Parse-Only |
+| **DNS Proxy** | `system services dns dns-proxy ...` | DNS proxy/caching server on firewall for client DNS resolution | Low | Missing |
+
+---
+
+## 23. Miscellaneous Features
+
+| Feature | Junos Config Path | Description | Priority | Status |
+|---------|-------------------|-------------|----------|--------|
+| **802.1X Network Access Control** | `protocols dot1x ...` | Port-based network authentication on access ports | Low | Missing |
+| **SCTP Protocol Support** | `security policies ... match application junos-sctp` | SCTP-aware firewall with multi-homing and stream tracking | Low | Missing |
+| **Geneve Tunnel Inspection** | `security tunnel-inspection ... profile ... geneve ...` | Inspect traffic inside Geneve tunnels (cloud overlay) | Low | Missing |
+| **VPLS** | `routing-instances ... instance-type vpls` | Virtual Private LAN Service for L2 VPN | Low | Missing |
+| **Storm Control** | `forwarding-options storm-control ...` | Broadcast/multicast storm protection | Low | Missing |
+| **TAP Mode** | `security forwarding-options ... tap-mode` | Passive monitoring mode (copy of traffic, no inline blocking) | Low | Missing |
+
+---
+
+## Priority Tiers
+
+### Tier 1 - High Priority (Core NGFW / Common vSRX Features)
+Features most commonly used in production vSRX deployments:
+
+1. **Proxy ARP/NDP for NAT** - Required for any pool-based NAT on same subnet
+2. **Session Limiting (source/dest-ip)** - Critical DoS protection, very common screen config
+3. **Firewall Filter Policers** - Interface-level rate limiting, standard in any enterprise deployment
+4. **BFD** - Sub-second failure detection, FRR already has BFD daemon
+5. **NETCONF/YANG** - Industry-standard management, enables automation tooling
+6. **Unified Policies / AppID** - Foundation of modern NGFW (long-term, high complexity)
+7. **IDP/IPS** - Core NGFW feature differentiator (consider Suricata/Snort integration)
+
+### Tier 2 - Medium Priority (Enterprise Features)
+Features commonly requested in enterprise deployments:
+
+8. **Configuration Groups (apply-groups)** - Major usability improvement for large configs
+9. **RADIUS/TACACS+ Authentication** - Enterprise AAA integration
+10. **SSL VPN / Remote Access VPN** - Remote worker connectivity
+11. **Aggressive Session Aging** - Session table management under load
+12. **Graceful Restart** - Non-stop routing (FRR already supports)
+13. **Twice NAT** - Complex NAT scenarios
+14. **Structured Syslog** - Machine-parseable security logs
+15. **Transparent Mode (L2)** - Inline transparent firewall deployment
+16. **Link Aggregation (LAG)** - Bandwidth aggregation and link redundancy
+17. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication
+18. **SecIntel / GeoIP** - Threat intelligence integration
+19. **Captive Portal / User Firewall** - User-based access control
+20. **Logical Systems (LSYS)** - Multi-tenancy
+
+### Tier 3 - Low Priority (Specialized / Niche)
+Features for specific use cases or carrier deployments:
+
+21. Content Security (UTM) - AV/web-filtering (consider ClamAV/rspamd)
+22. SSL Proxy - TLS inspection (consider mitmproxy integration)
+23. Multicast (PIM/IGMP)
+24. MPLS/LDP
+25. EVPN/VXLAN
+26. DS-Lite/6rd/MAP-E
+27. GTP Firewall
+28. SD-WAN
+29. PowerMode IPsec
+30. Class of Service (not supported on vSRX anyway)
+
+---
+
+## Parse-Only Features Summary
+
+These features have config parsing in bpfrx but NO runtime effect:
+
+| # | Config Path | Type | Notes |
+|---|------------|------|-------|
+| 1 | `security log mode` | LogConfig.Mode | Always uses stream mode |
+| 2 | `security pre-id-default-policy` | PreIDDefaultPolicy | Requires AppID engine |
+| 3 | `system master-password` | SystemConfig.MasterPassword | No encrypted storage |
+| 4 | `system license autoupdate url` | SystemConfig.LicenseAutoUpdate | No licensing system |
+| 5 | `system ntp threshold action` | SystemConfig.NTPThresholdAction | Not wired to NTP config |
+| 6 | `interfaces ... address primary` | InterfaceUnit.PrimaryAddress | Not used for source selection |
+| 7 | `interfaces ... address preferred` | InterfaceUnit.PreferredAddress | Not used for source selection |
+| 8 | `interfaces ... point-to-point` | InterfaceUnit.PointToPoint | Not passed to networkd |
+| 9 | `services application-identification` | ServicesConfig.ApplicationIdentification | Bool flag only, no DPI |
+
+---
+
+## Implementation Suggestions for Top Gaps
+
+### Proxy ARP for NAT (Tier 1)
+- Implement in `pkg/dataplane/` or `pkg/networkd/`
+- When SNAT pool or DNAT address is on same subnet as ingress interface, auto-respond to ARP/NDP
+- Can use raw socket AF_PACKET (like GARP in cluster.go) or `ip neigh add proxy`
+
+### Session Limiting (Tier 1)
+- Add `limit-session` to ScreenProfile struct and compiler
+- Implement per-source-IP and per-dest-IP session counting in BPF conntrack
+- Use per-CPU hash map for session counts, check in xdp_conntrack before creating new session
+
+### Firewall Filter Policers (Tier 1)
+- Add `PolicerConfig` to config types
+- Implement token-bucket in BPF using per-CPU maps for token state
+- Apply at XDP/TC attachment points based on interface filter binding
+
+### BFD (Tier 1)
+- FRR already has `bfdd` daemon
+- Add BFD config to OSPFInterface, BGPNeighbor types
+- Generate BFD peer config in FRR frr.conf
+- Minimal bpfrx code change - mostly FRR config generation
+
+### NETCONF (Tier 1)
+- Consider using `openconfig/gnmic` or `netopeer2` for NETCONF server
+- Map to existing gRPC RPCs for config get/set
+- YANG models can be generated from existing config types

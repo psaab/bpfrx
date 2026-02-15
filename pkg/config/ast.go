@@ -619,10 +619,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"address-book": {children: map[string]*schemaNode{
 			"global": {children: map[string]*schemaNode{
+				"address": {args: 2, multi: true, children: nil},
 				"address-set": {args: 1, valueHint: ValueHintAddressName, children: map[string]*schemaNode{
-					"address-set": {args: 1, valueHint: ValueHintAddressName, children: nil},
+					"address":     {args: 1, multi: true, children: nil},
+					"address-set": {args: 1, multi: true, valueHint: ValueHintAddressName, children: nil},
+					"description": {args: 1, children: nil},
 				}},
-				// "address <name> <cidr>" not listed → leaf
 			}},
 		}},
 		"log": {children: map[string]*schemaNode{
@@ -1530,14 +1532,26 @@ func (t *ConfigTree) SetPath(path []string) error {
 				// Single-value leaf with no sub-structure (e.g. host-name, description): replace existing.
 				// Nodes with children are named containers that may appear as terminal leaves
 				// with different values (e.g. "interface eth0", "interface eth1").
-				for idx, n := range *current {
+				// Replace the first match and remove all subsequent duplicates.
+				replaced := false
+				filtered := (*current)[:0] // reuse backing array
+				for _, n := range *current {
 					if n.IsLeaf && len(n.Keys) > 0 && n.Keys[0] == nodeKeys[0] {
-						(*current)[idx] = &Node{
-							Keys:   append([]string(nil), nodeKeys...),
-							IsLeaf: true,
+						if !replaced {
+							filtered = append(filtered, &Node{
+								Keys:   append([]string(nil), nodeKeys...),
+								IsLeaf: true,
+							})
+							replaced = true
 						}
-						return nil
+						// skip all duplicate entries
+						continue
 					}
+					filtered = append(filtered, n)
+				}
+				if replaced {
+					*current = filtered
+					return nil
 				}
 			} else {
 				// Flag leaf (args == 0) or multi-value leaf: skip if exact duplicate.

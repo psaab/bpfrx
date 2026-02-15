@@ -481,6 +481,58 @@ func TestSetPathSchema(t *testing.T) {
 	}
 }
 
+func TestSetPathSingleValueDedup(t *testing.T) {
+	// Simulate pre-existing duplicate host-name leaves (from before dedup fix).
+	// SetPath should replace the first and remove all subsequent duplicates.
+	tree := &ConfigTree{}
+
+	// Manually inject three duplicate host-name leaves into the system block.
+	sysNode := &Node{
+		Keys: []string{"system"},
+		Children: []*Node{
+			{Keys: []string{"host-name", "old-fw1"}, IsLeaf: true},
+			{Keys: []string{"host-name", "old-fw2"}, IsLeaf: true},
+			{Keys: []string{"host-name", "old-fw3"}, IsLeaf: true},
+			{Keys: []string{"domain-name", "example.com"}, IsLeaf: true},
+		},
+	}
+	tree.Children = append(tree.Children, sysNode)
+
+	// Now set a new host-name via SetPath.
+	path, err := ParseSetCommand("set system host-name new-fw")
+	if err != nil {
+		t.Fatalf("ParseSetCommand: %v", err)
+	}
+	if err := tree.SetPath(path); err != nil {
+		t.Fatalf("SetPath: %v", err)
+	}
+
+	// Count host-name entries in the system node.
+	var hostNames []string
+	for _, child := range sysNode.Children {
+		if child.IsLeaf && len(child.Keys) > 0 && child.Keys[0] == "host-name" {
+			hostNames = append(hostNames, child.Keys[1])
+		}
+	}
+	if len(hostNames) != 1 {
+		t.Fatalf("expected 1 host-name entry, got %d: %v", len(hostNames), hostNames)
+	}
+	if hostNames[0] != "new-fw" {
+		t.Errorf("expected host-name new-fw, got %s", hostNames[0])
+	}
+
+	// Verify domain-name is preserved.
+	var hasDomain bool
+	for _, child := range sysNode.Children {
+		if child.IsLeaf && len(child.Keys) > 0 && child.Keys[0] == "domain-name" {
+			hasDomain = true
+		}
+	}
+	if !hasDomain {
+		t.Error("domain-name entry was incorrectly removed")
+	}
+}
+
 func TestDeletePath(t *testing.T) {
 	// Build a tree via set commands.
 	tree := &ConfigTree{}
