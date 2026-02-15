@@ -407,6 +407,27 @@ func (s *Store) Rename(srcPath, dstPath []string) error {
 	return nil
 }
 
+// Insert moves an element before or after a reference element within the
+// same parent's ordered children list.
+func (s *Store) Insert(elementPath, refPath []string, before bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.candidate == nil {
+		return fmt.Errorf("not in configuration mode")
+	}
+	var err error
+	if before {
+		err = s.candidate.InsertBefore(elementPath, refPath)
+	} else {
+		err = s.candidate.InsertAfter(elementPath, refPath)
+	}
+	if err != nil {
+		return err
+	}
+	s.dirty = true
+	return nil
+}
+
 // Annotate sets a comment on a configuration node in the candidate config.
 func (s *Store) Annotate(path []string, comment string) error {
 	s.mu.Lock()

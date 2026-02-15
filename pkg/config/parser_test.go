@@ -647,6 +647,170 @@ func TestDeletePath(t *testing.T) {
 	}
 }
 
+func TestInsertBeforeAfter(t *testing.T) {
+	// Build a tree with ordered policies.
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set security policies from-zone trust to-zone untrust policy first match source-address any",
+		"set security policies from-zone trust to-zone untrust policy first then permit",
+		"set security policies from-zone trust to-zone untrust policy second match source-address any",
+		"set security policies from-zone trust to-zone untrust policy second then permit",
+		"set security policies from-zone trust to-zone untrust policy third match source-address any",
+		"set security policies from-zone trust to-zone untrust policy third then permit",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath: %v", err)
+		}
+	}
+
+	// Helper to get policy order from the AST.
+	getPolicyOrder := func() []string {
+		// Navigate to from-zone trust to-zone untrust
+		var policies *[]*Node
+		for _, c := range tree.Children {
+			if len(c.Keys) > 0 && c.Keys[0] == "security" {
+				for _, c2 := range c.Children {
+					if len(c2.Keys) > 0 && c2.Keys[0] == "policies" {
+						for _, c3 := range c2.Children {
+							if len(c3.Keys) >= 4 && c3.Keys[1] == "trust" && c3.Keys[3] == "untrust" {
+								policies = &c3.Children
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+		if policies == nil {
+			t.Fatal("could not find policies node")
+		}
+		var names []string
+		for _, p := range *policies {
+			if len(p.Keys) >= 2 {
+				names = append(names, p.Keys[1])
+			}
+		}
+		return names
+	}
+
+	// Verify initial order: first, second, third.
+	order := getPolicyOrder()
+	if len(order) != 3 || order[0] != "first" || order[1] != "second" || order[2] != "third" {
+		t.Fatalf("initial order wrong: %v", order)
+	}
+
+	// Test 1: Insert "third" before "first".
+	elemPath := []string{"security", "policies", "from-zone", "trust", "to-zone", "untrust", "policy", "third"}
+	refPath := []string{"security", "policies", "from-zone", "trust", "to-zone", "untrust", "policy", "first"}
+	if err := tree.InsertBefore(elemPath, refPath); err != nil {
+		t.Fatalf("InsertBefore: %v", err)
+	}
+	order = getPolicyOrder()
+	if len(order) != 3 || order[0] != "third" || order[1] != "first" || order[2] != "second" {
+		t.Fatalf("after InsertBefore: expected [third first second], got %v", order)
+	}
+
+	// Test 2: Insert "first" after "second".
+	elemPath = []string{"security", "policies", "from-zone", "trust", "to-zone", "untrust", "policy", "first"}
+	refPath = []string{"security", "policies", "from-zone", "trust", "to-zone", "untrust", "policy", "second"}
+	if err := tree.InsertAfter(elemPath, refPath); err != nil {
+		t.Fatalf("InsertAfter: %v", err)
+	}
+	order = getPolicyOrder()
+	if len(order) != 3 || order[0] != "third" || order[1] != "second" || order[2] != "first" {
+		t.Fatalf("after InsertAfter: expected [third second first], got %v", order)
+	}
+
+	// Test 3: Insert nonexistent element returns error.
+	elemPath = []string{"security", "policies", "from-zone", "trust", "to-zone", "untrust", "policy", "nonexistent"}
+	refPath = []string{"security", "policies", "from-zone", "trust", "to-zone", "untrust", "policy", "first"}
+	if err := tree.InsertBefore(elemPath, refPath); err == nil {
+		t.Error("inserting nonexistent element should return error")
+	}
+
+	// Test 4: Insert before nonexistent reference returns error.
+	elemPath = []string{"security", "policies", "from-zone", "trust", "to-zone", "untrust", "policy", "first"}
+	refPath = []string{"security", "policies", "from-zone", "trust", "to-zone", "untrust", "policy", "nonexistent"}
+	if err := tree.InsertBefore(elemPath, refPath); err == nil {
+		t.Error("inserting before nonexistent reference should return error")
+	}
+
+	// Test 5: Compile still works after reordering.
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig after inserts: %v", err)
+	}
+	var zonePair *ZonePairPolicies
+	for _, zp := range cfg.Security.Policies {
+		if zp.FromZone == "trust" && zp.ToZone == "untrust" {
+			zonePair = zp
+			break
+		}
+	}
+	if zonePair == nil {
+		t.Fatal("zone pair trust->untrust not found after insert")
+	}
+	if len(zonePair.Policies) != 3 {
+		t.Fatalf("expected 3 policies, got %d", len(zonePair.Policies))
+	}
+	// Verify compiled order matches AST order.
+	if zonePair.Policies[0].Name != "third" ||
+		zonePair.Policies[1].Name != "second" ||
+		zonePair.Policies[2].Name != "first" {
+		t.Errorf("compiled policy order wrong: %s, %s, %s",
+			zonePair.Policies[0].Name, zonePair.Policies[1].Name, zonePair.Policies[2].Name)
+	}
+}
+
+func TestInsertFirewallFilterTerms(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set firewall family inet filter my-filter term allow-ssh from protocol tcp",
+		"set firewall family inet filter my-filter term allow-ssh from destination-port 22",
+		"set firewall family inet filter my-filter term allow-ssh then accept",
+		"set firewall family inet filter my-filter term allow-http from protocol tcp",
+		"set firewall family inet filter my-filter term allow-http from destination-port 80",
+		"set firewall family inet filter my-filter term allow-http then accept",
+		"set firewall family inet filter my-filter term deny-all then discard",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath: %v", err)
+		}
+	}
+
+	// Move deny-all before allow-ssh.
+	elemPath := []string{"firewall", "family", "inet", "filter", "my-filter", "term", "deny-all"}
+	refPath := []string{"firewall", "family", "inet", "filter", "my-filter", "term", "allow-ssh"}
+	if err := tree.InsertBefore(elemPath, refPath); err != nil {
+		t.Fatalf("InsertBefore: %v", err)
+	}
+
+	// Verify order in formatted output.
+	out := tree.FormatSet()
+	denyIdx := strings.Index(out, "term deny-all")
+	sshIdx := strings.Index(out, "term allow-ssh")
+	httpIdx := strings.Index(out, "term allow-http")
+	if denyIdx < 0 || sshIdx < 0 || httpIdx < 0 {
+		t.Fatalf("missing terms in output:\n%s", out)
+	}
+	if denyIdx >= sshIdx {
+		t.Errorf("deny-all should be before allow-ssh")
+	}
+	if sshIdx >= httpIdx {
+		t.Errorf("allow-ssh should be before allow-http")
+	}
+}
+
 func TestApplicationSet(t *testing.T) {
 	// Test hierarchical syntax
 	input := `applications {

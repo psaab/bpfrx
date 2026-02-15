@@ -844,6 +844,9 @@ func (c *CLI) dispatchConfig(line string) error {
 	case "copy", "rename":
 		return c.handleCopyRename(parts)
 
+	case "insert":
+		return c.handleInsert(parts)
+
 	case "show":
 		return c.handleConfigShow(parts[1:])
 
@@ -2417,6 +2420,49 @@ func (c *CLI) handleCopyRename(parts []string) error {
 		return c.store.Rename(srcPath, dstPath)
 	}
 	return c.store.Copy(srcPath, dstPath)
+}
+
+// handleInsert handles:
+//
+//	insert <element-path> before|after <ref-identifier>
+//
+// The ref-identifier (e.g., "policy allow-all") is relative to the same parent
+// as the element. The full reference path is constructed by replacing the
+// element's trailing identifier tokens with the ref-identifier tokens.
+func (c *CLI) handleInsert(parts []string) error {
+	// Find "before" or "after" keyword.
+	kwIdx := -1
+	isBefore := false
+	for i, p := range parts {
+		if p == "before" {
+			kwIdx = i
+			isBefore = true
+			break
+		}
+		if p == "after" {
+			kwIdx = i
+			break
+		}
+	}
+	if kwIdx < 2 || kwIdx >= len(parts)-1 {
+		fmt.Println("usage: insert <element-path> before|after <ref-identifier>")
+		return nil
+	}
+	elemPath := parts[1:kwIdx]
+	refTokens := parts[kwIdx+1:]
+	editPath := c.store.GetEditPath()
+	if len(editPath) > 0 {
+		elemPath = append(append([]string{}, editPath...), elemPath...)
+	}
+	// Construct the full reference path: element's parent path + ref tokens.
+	// The ref tokens replace the element's trailing identifier (same keyword + name).
+	if len(refTokens) > len(elemPath) {
+		fmt.Println("error: reference identifier is longer than element path")
+		return nil
+	}
+	parentPath := elemPath[:len(elemPath)-len(refTokens)]
+	refPath := append(append([]string{}, parentPath...), refTokens...)
+	return c.store.Insert(elemPath, refPath, isBefore)
 }
 
 func (c *CLI) handleLoad(args []string) error {

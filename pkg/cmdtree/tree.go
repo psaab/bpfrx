@@ -464,6 +464,7 @@ var OperationalTree = map[string]*Node{
 var ConfigTopLevel = map[string]*Node{
 	"annotate": {Desc: "Add comment to configuration node"},
 	"copy":     {Desc: "Copy a configuration element"},
+	"insert":   {Desc: "Insert a configuration element before or after another"},
 	"rename":   {Desc: "Rename a configuration element"},
 	"set":      {Desc: "Set a configuration value"},
 	"delete":   {Desc: "Delete a configuration element"},

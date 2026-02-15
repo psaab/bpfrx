@@ -520,6 +520,34 @@ func (c *ctl) dispatchConfig(line string) error {
 		}
 		return nil
 
+	case "insert":
+		// Find "before" or "after" keyword.
+		kwIdx := -1
+		for i, p := range parts {
+			if p == "before" || p == "after" {
+				kwIdx = i
+				break
+			}
+		}
+		if kwIdx < 2 || kwIdx >= len(parts)-1 {
+			fmt.Println("usage: insert <element-path> before|after <ref-identifier>")
+			return nil
+		}
+		elemParts := parts[1:kwIdx]
+		kw := parts[kwIdx]
+		refTokens := parts[kwIdx+1:]
+		if len(c.editPath) > 0 {
+			elemParts = append(append([]string{}, c.editPath...), elemParts...)
+		}
+		// Send: insert <full-elem-path> before|after <ref-tokens>
+		// Server constructs full ref path from element's parent.
+		fullInput := "insert " + strings.Join(elemParts, " ") + " " + kw + " " + strings.Join(refTokens, " ")
+		_, err := c.client.Set(c.ctx(), &pb.SetRequest{Input: fullInput})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		return nil
+
 	case "show":
 		return c.handleConfigShow(parts[1:])
 

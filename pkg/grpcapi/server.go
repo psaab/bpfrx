@@ -203,6 +203,9 @@ func (s *Server) Set(_ context.Context, req *pb.SetRequest) (*pb.SetResponse, er
 	if strings.HasPrefix(input, "copy ") || strings.HasPrefix(input, "rename ") {
 		return s.handleCopyRename(input)
 	}
+	if strings.HasPrefix(input, "insert ") {
+		return s.handleInsert(input)
+	}
 	if err := s.store.SetFromInput(input); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
@@ -231,6 +234,37 @@ func (s *Server) handleCopyRename(input string) (*pb.SetResponse, error) {
 		err = s.store.Copy(srcPath, dstPath)
 	}
 	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	return &pb.SetResponse{}, nil
+}
+
+func (s *Server) handleInsert(input string) (*pb.SetResponse, error) {
+	parts := strings.Fields(input)
+	kwIdx := -1
+	isBefore := false
+	for i, p := range parts {
+		if p == "before" {
+			kwIdx = i
+			isBefore = true
+			break
+		}
+		if p == "after" {
+			kwIdx = i
+			break
+		}
+	}
+	if kwIdx < 2 || kwIdx >= len(parts)-1 {
+		return nil, status.Errorf(codes.InvalidArgument, "usage: insert <element-path> before|after <ref-identifier>")
+	}
+	elemPath := parts[1:kwIdx]
+	refTokens := parts[kwIdx+1:]
+	if len(refTokens) > len(elemPath) {
+		return nil, status.Errorf(codes.InvalidArgument, "reference identifier is longer than element path")
+	}
+	parentPath := elemPath[:len(elemPath)-len(refTokens)]
+	refPath := append(append([]string{}, parentPath...), refTokens...)
+	if err := s.store.Insert(elemPath, refPath, isBefore); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	return &pb.SetResponse{}, nil

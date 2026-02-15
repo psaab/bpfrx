@@ -576,22 +576,26 @@ func (t *ConfigTree) findNodeWithParent(path []string) (*Node, *[]*Node, error) 
 	parentChildren := &t.Children
 	pos := 0
 	for pos < len(path) {
-		found := false
+		// Try all children; prefer full-key matches over partial ones.
+		// This handles siblings like [policy first], [policy second], [policy third]
+		// where the first key "policy" matches all but we need the full key match.
+		var bestChild *Node
+		bestConsumed := 0
 		for _, child := range *parentChildren {
 			consumed := matchNodeKeys(child, path, pos)
-			if consumed > 0 {
-				if pos+consumed >= len(path) {
-					return child, parentChildren, nil
-				}
-				parentChildren = &child.Children
-				pos += consumed
-				found = true
-				break
+			if consumed > bestConsumed {
+				bestChild = child
+				bestConsumed = consumed
 			}
 		}
-		if !found {
+		if bestChild == nil {
 			return nil, nil, fmt.Errorf("path element %q not found", path[pos])
 		}
+		if pos+bestConsumed >= len(path) {
+			return bestChild, parentChildren, nil
+		}
+		parentChildren = &bestChild.Children
+		pos += bestConsumed
 	}
 	return nil, nil, fmt.Errorf("path not found")
 }
@@ -633,6 +637,84 @@ func (t *ConfigTree) RenamePath(src, dst []string) error {
 	srcNode.Keys = append([]string(nil), dst[len(dst)-nk:]...)
 	dstParentPath := dst[:len(dst)-nk]
 	return t.insertNode(dstParentPath, srcNode)
+}
+
+// InsertBefore moves an existing element before another element in the same
+// parent's children list. Both elements must exist under the same parent.
+// elementPath is the full path to the element to move.
+// refPath is the full path to the reference element.
+func (t *ConfigTree) InsertBefore(elementPath, refPath []string) error {
+	return t.insertRelative(elementPath, refPath, false)
+}
+
+// InsertAfter moves an existing element after another element in the same
+// parent's children list.
+func (t *ConfigTree) InsertAfter(elementPath, refPath []string) error {
+	return t.insertRelative(elementPath, refPath, true)
+}
+
+func (t *ConfigTree) insertRelative(elementPath, refPath []string, after bool) error {
+	if len(elementPath) == 0 || len(refPath) == 0 {
+		return fmt.Errorf("empty path")
+	}
+
+	// Find the element and its parent children slice.
+	elem, parentChildren, err := t.findNodeWithParent(elementPath)
+	if err != nil {
+		return fmt.Errorf("element not found: %s", strings.Join(elementPath, " "))
+	}
+
+	// Find the reference element — must be in the same parent.
+	refNode, refParent, err := t.findNodeWithParent(refPath)
+	if err != nil {
+		return fmt.Errorf("reference not found: %s", strings.Join(refPath, " "))
+	}
+
+	// Both must share the same parent (same children slice).
+	if parentChildren != refParent {
+		return fmt.Errorf("elements must be siblings (same parent)")
+	}
+
+	if elem == refNode {
+		return nil // already in position
+	}
+
+	// Find and remove the element from the children slice.
+	elemIdx := -1
+	for i, c := range *parentChildren {
+		if c == elem {
+			elemIdx = i
+			break
+		}
+	}
+	if elemIdx < 0 {
+		return fmt.Errorf("element not found in parent")
+	}
+	*parentChildren = append((*parentChildren)[:elemIdx], (*parentChildren)[elemIdx+1:]...)
+
+	// Find the reference's new index (may have shifted after removal).
+	refIdx := -1
+	for i, c := range *parentChildren {
+		if c == refNode {
+			refIdx = i
+			break
+		}
+	}
+	if refIdx < 0 {
+		return fmt.Errorf("reference not found in parent")
+	}
+
+	// Insert before or after the reference.
+	insertAt := refIdx
+	if after {
+		insertAt = refIdx + 1
+	}
+
+	// Grow and shift.
+	*parentChildren = append(*parentChildren, nil)
+	copy((*parentChildren)[insertAt+1:], (*parentChildren)[insertAt:])
+	(*parentChildren)[insertAt] = elem
+	return nil
 }
 
 // ValueHint identifies what kind of dynamic value is expected at a schema position.
