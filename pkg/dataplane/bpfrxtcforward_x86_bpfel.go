@@ -412,7 +412,7 @@ type bpfrxTcForwardSessionValue struct {
 	ReverseKey  bpfrxTcForwardSessionKey
 	AlgType     uint8
 	LogFlags    uint8
-	Pad         [2]uint8
+	AppTimeout  uint16
 	FibIfindex  uint32
 	FibVlanId   uint16
 	FibDmac     [6]uint8
@@ -444,7 +444,7 @@ type bpfrxTcForwardSessionValueV6 struct {
 	ReverseKey  bpfrxTcForwardSessionKeyV6
 	AlgType     uint8
 	LogFlags    uint8
-	Pad         [2]uint8
+	AppTimeout  uint16
 	FibIfindex  uint32
 	FibVlanId   uint16
 	FibDmac     [6]uint8

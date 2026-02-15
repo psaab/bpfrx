@@ -51,7 +51,7 @@ struct session_value {
 	/* ALG tracking */
 	__u8  alg_type;    /* 0=none, 1=FTP, 2=SIP, 3=DNS */
 	__u8  log_flags;
-	__u8  pad[2];
+	__u16 app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
 
 	/* Cached FIB result (set by xdp_zone, 0 = not cached) */
 	__u32 fib_ifindex;
@@ -109,7 +109,7 @@ struct session_value_v6 {
 	/* ALG tracking */
 	__u8  alg_type;    /* 0=none, 1=FTP, 2=SIP, 3=DNS */
 	__u8  log_flags;
-	__u8  pad[2];
+	__u16 app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
 
 	/* Cached FIB result (set by xdp_zone, 0 = not cached) */
 	__u32 fib_ifindex;

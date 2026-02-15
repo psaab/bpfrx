@@ -46,7 +46,14 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 			sess->state, meta->tcp_flags, pkt_dir);
 		if (new_state != sess->state) {
 			sess->state = new_state;
-			sess->timeout = ct_get_timeout(PROTO_TCP, new_state);
+			__u32 new_timeout = ct_get_timeout(PROTO_TCP, new_state);
+			/* Per-app timeout overrides default for
+			 * non-closing states (ESTABLISHED, SYN_RECV). */
+			if (sess->app_timeout > 0 &&
+			    new_state != SESS_STATE_CLOSED &&
+			    new_state != SESS_STATE_FIN_WAIT)
+				new_timeout = (__u32)sess->app_timeout;
+			sess->timeout = new_timeout;
 			/* Sync state to paired entry so both entries
 			 * share the same TCP state and timeout. */
 			struct session_value *paired =
@@ -54,7 +61,7 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 						    &sess->reverse_key);
 			if (paired) {
 				paired->state = new_state;
-				paired->timeout = sess->timeout;
+				paired->timeout = new_timeout;
 				paired->last_seen = now;
 			}
 		}
@@ -137,7 +144,12 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 			sess->state, meta->tcp_flags, pkt_dir);
 		if (new_state != sess->state) {
 			sess->state = new_state;
-			sess->timeout = ct_get_timeout(PROTO_TCP, new_state);
+			__u32 new_timeout = ct_get_timeout(PROTO_TCP, new_state);
+			if (sess->app_timeout > 0 &&
+			    new_state != SESS_STATE_CLOSED &&
+			    new_state != SESS_STATE_FIN_WAIT)
+				new_timeout = (__u32)sess->app_timeout;
+			sess->timeout = new_timeout;
 			/* Sync state to paired entry so both entries
 			 * share the same TCP state and timeout. */
 			struct session_value_v6 *paired =
@@ -145,7 +157,7 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 						    &sess->reverse_key);
 			if (paired) {
 				paired->state = new_state;
-				paired->timeout = sess->timeout;
+				paired->timeout = new_timeout;
 				paired->last_seen = now;
 			}
 		}

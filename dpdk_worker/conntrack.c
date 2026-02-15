@@ -429,6 +429,11 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 				if (sv->state != old_state) {
 					/* Sync state/timeout to paired entry */
 					uint32_t new_timeout = ct_get_timeout(ctx, PROTO_TCP, sv->state);
+					/* Per-app timeout overrides default for non-closing states */
+					if (sv->app_timeout > 0 &&
+					    sv->state != SESS_STATE_CLOSED &&
+					    sv->state != SESS_STATE_FIN_WAIT)
+						new_timeout = (uint32_t)sv->app_timeout;
 					sv->timeout = new_timeout;
 					int rpos = rte_hash_lookup(ctx->shm->sessions_v4, &sv->reverse_key);
 					if (rpos >= 0) {
@@ -505,6 +510,11 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 				if (sv->state != old_state) {
 					/* Sync state/timeout to paired entry */
 					uint32_t new_timeout = ct_get_timeout(ctx, PROTO_TCP, sv->state);
+					/* Per-app timeout overrides default for non-closing states */
+					if (sv->app_timeout > 0 &&
+					    sv->state != SESS_STATE_CLOSED &&
+					    sv->state != SESS_STATE_FIN_WAIT)
+						new_timeout = (uint32_t)sv->app_timeout;
 					sv->timeout = new_timeout;
 					int fpos = rte_hash_lookup(ctx->shm->sessions_v4, &sv->reverse_key);
 					if (fpos >= 0) {
@@ -575,6 +585,11 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 				sv->state = ct_tcp_update_state(old_state, meta->tcp_flags, dir);
 				if (sv->state != old_state) {
 					uint32_t new_timeout = ct_get_timeout(ctx, PROTO_TCP, sv->state);
+					/* Per-app timeout overrides default for non-closing states */
+					if (sv->app_timeout > 0 &&
+					    sv->state != SESS_STATE_CLOSED &&
+					    sv->state != SESS_STATE_FIN_WAIT)
+						new_timeout = (uint32_t)sv->app_timeout;
 					sv->timeout = new_timeout;
 					int rpos = rte_hash_lookup(ctx->shm->sessions_v6, &sv->reverse_key);
 					if (rpos >= 0) {
@@ -645,6 +660,11 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 				sv->state = ct_tcp_update_state(old_state, meta->tcp_flags, 1);
 				if (sv->state != old_state) {
 					uint32_t new_timeout = ct_get_timeout(ctx, PROTO_TCP, sv->state);
+					/* Per-app timeout overrides default for non-closing states */
+					if (sv->app_timeout > 0 &&
+					    sv->state != SESS_STATE_CLOSED &&
+					    sv->state != SESS_STATE_FIN_WAIT)
+						new_timeout = (uint32_t)sv->app_timeout;
 					sv->timeout = new_timeout;
 					int fpos = rte_hash_lookup(ctx->shm->sessions_v6, &sv->reverse_key);
 					if (fpos >= 0) {
@@ -749,6 +769,7 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		fwd_val.nat_src_port = meta->nat_src_port;
 		fwd_val.nat_dst_port = meta->nat_dst_port;
 		fwd_val.log_flags = meta->log_flags;
+		fwd_val.app_timeout = meta->app_timeout;
 		fwd_val.is_reverse = 0;
 
 		/* FIB cache: store forwarding result from zone_lookup */
@@ -829,6 +850,7 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		fwd_val6.nat_src_port = meta->nat_src_port;
 		fwd_val6.nat_dst_port = meta->nat_dst_port;
 		fwd_val6.log_flags = meta->log_flags;
+		fwd_val6.app_timeout = meta->app_timeout;
 		fwd_val6.is_reverse = 0;
 
 		/* FIB cache: store forwarding result from zone_lookup */

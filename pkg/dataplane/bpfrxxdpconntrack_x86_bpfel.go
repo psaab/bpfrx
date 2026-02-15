@@ -412,7 +412,7 @@ type bpfrxXdpConntrackSessionValue struct {
 	ReverseKey  bpfrxXdpConntrackSessionKey
 	AlgType     uint8
 	LogFlags    uint8
-	Pad         [2]uint8
+	AppTimeout  uint16
 	FibIfindex  uint32
 	FibVlanId   uint16
 	FibDmac     [6]uint8
@@ -444,7 +444,7 @@ type bpfrxXdpConntrackSessionValueV6 struct {
 	ReverseKey  bpfrxXdpConntrackSessionKeyV6
 	AlgType     uint8
 	LogFlags    uint8
-	Pad         [2]uint8
+	AppTimeout  uint16
 	FibIfindex  uint32
 	FibVlanId   uint16
 	FibDmac     [6]uint8

@@ -124,6 +124,7 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	fwd_val->fwd_packets  = 1;
 	fwd_val->fwd_bytes    = meta->pkt_len;
 	fwd_val->log_flags    = log;
+	fwd_val->app_timeout  = meta->app_timeout;
 	fwd_val->reverse_key  = rev_key;
 	fwd_val->nat_src_ip   = nat_src_ip;
 	fwd_val->nat_src_port = nat_src_port;
@@ -158,6 +159,7 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	rev_val->ingress_zone = meta->egress_zone;
 	rev_val->egress_zone  = meta->ingress_zone;
 	rev_val->log_flags    = log;
+	rev_val->app_timeout  = meta->app_timeout;
 	rev_val->reverse_key  = fwd_key;
 	rev_val->nat_src_ip   = nat_src_ip;
 	rev_val->nat_src_port = nat_src_port;
@@ -226,6 +228,7 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	fwd_val->fwd_packets  = 1;
 	fwd_val->fwd_bytes    = meta->pkt_len;
 	fwd_val->log_flags    = log;
+	fwd_val->app_timeout  = meta->app_timeout;
 	fwd_val->reverse_key  = rev_key;
 	fwd_val->nat_src_port = nat_src_port;
 	fwd_val->nat_dst_port = nat_dst_port;
@@ -263,6 +266,7 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	rev_val->ingress_zone = meta->egress_zone;
 	rev_val->egress_zone  = meta->ingress_zone;
 	rev_val->log_flags    = log;
+	rev_val->app_timeout  = meta->app_timeout;
 	rev_val->reverse_key  = fwd_key;
 	rev_val->nat_src_port = nat_src_port;
 	rev_val->nat_dst_port = nat_dst_port;

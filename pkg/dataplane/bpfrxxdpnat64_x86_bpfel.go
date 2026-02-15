@@ -432,7 +432,7 @@ type bpfrxXdpNat64SessionValue struct {
 	ReverseKey  bpfrxXdpNat64SessionKey
 	AlgType     uint8
 	LogFlags    uint8
-	Pad         [2]uint8
+	AppTimeout  uint16
 	FibIfindex  uint32
 	FibVlanId   uint16
 	FibDmac     [6]uint8
@@ -464,7 +464,7 @@ type bpfrxXdpNat64SessionValueV6 struct {
 	ReverseKey  bpfrxXdpNat64SessionKeyV6
 	AlgType     uint8
 	LogFlags    uint8
-	Pad         [2]uint8
+	AppTimeout  uint16
 	FibIfindex  uint32
 	FibVlanId   uint16
 	FibDmac     [6]uint8

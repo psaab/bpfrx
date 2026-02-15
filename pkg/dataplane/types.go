@@ -40,9 +40,9 @@ type SessionValue struct {
 
 	ReverseKey SessionKey
 
-	ALGType  uint8
-	LogFlags uint8
-	Pad1     [2]byte
+	ALGType    uint8
+	LogFlags   uint8
+	AppTimeout uint16 // per-application inactivity timeout (seconds), 0=use default
 
 	FibIfindex uint32
 	FibVlanID  uint16
@@ -89,9 +89,9 @@ type SessionValueV6 struct {
 
 	ReverseKey SessionKeyV6
 
-	ALGType  uint8
-	LogFlags uint8
-	Pad1     [2]byte
+	ALGType    uint8
+	LogFlags   uint8
+	AppTimeout uint16 // per-application inactivity timeout (seconds), 0=use default
 
 	FibIfindex uint32
 	FibVlanID  uint16

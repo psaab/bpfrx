@@ -969,11 +969,6 @@ func compileApplications(dp DataPlane,cfg *config.Config, result *CompileResult)
 		}
 
 		proto := protocolNumber(app.Protocol)
-		if proto == 0 && app.Protocol != "icmp" {
-			slog.Warn("unknown protocol for application",
-				"name", appName, "protocol", app.Protocol)
-			continue
-		}
 
 		result.AppIDs[appName] = appID
 
@@ -1002,12 +997,21 @@ func compileApplications(dp DataPlane,cfg *config.Config, result *CompileResult)
 
 		algType := algTypeFromString(app.ALG)
 
-		for _, port := range ports {
-			if err := dp.SetApplication(proto, port, appID, appTimeout, algType, srcLow, srcHigh); err != nil {
-				return fmt.Errorf("set application %s port %d: %w",
-					appName, port, err)
+		// When no protocol is specified, install entries for both TCP and UDP
+		// (matching Junos behavior where omitted protocol means any L4).
+		protos := []uint8{proto}
+		if proto == 0 && app.Protocol != "icmp" {
+			protos = []uint8{6, 17} // TCP + UDP
+		}
+
+		for _, p := range protos {
+			for _, port := range ports {
+				if err := dp.SetApplication(p, port, appID, appTimeout, algType, srcLow, srcHigh); err != nil {
+					return fmt.Errorf("set application %s port %d: %w",
+						appName, port, err)
+				}
+				writtenApps[AppKey{Protocol: p, DstPort: htons(port)}] = true
 			}
-			writtenApps[AppKey{Protocol: proto, DstPort: htons(port)}] = true
 		}
 
 		slog.Debug("application compiled", "name", appName, "id", appID,

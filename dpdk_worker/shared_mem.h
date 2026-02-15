@@ -175,7 +175,7 @@ struct session_value {
 
 	uint8_t  alg_type;
 	uint8_t  log_flags;
-	uint8_t  pad[2];
+	uint16_t app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
 
 	uint32_t fib_ifindex;
 	uint16_t fib_vlan_id;
@@ -221,7 +221,7 @@ struct session_value_v6 {
 
 	uint8_t  alg_type;
 	uint8_t  log_flags;
-	uint8_t  pad[2];
+	uint16_t app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
 
 	uint32_t fib_ifindex;
 	uint16_t fib_vlan_id;
