@@ -21,7 +21,7 @@ func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, p
 	current := tree
 	var currentNode *completionNode
 	dynamicConsumed := false // true when last word was a dynamic value
-	for _, w := range words {
+	for wi, w := range words {
 		dynamicConsumed = false
 		node, ok := current[w]
 		if !ok {
@@ -35,6 +35,12 @@ func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, p
 		}
 		currentNode = node
 		if node.Children == nil {
+			// Leaf with DynamicFn: if more words remain, treat as a
+			// dynamic-value leaf and let the loop consume remaining words.
+			if node.DynamicFn != nil && wi < len(words)-1 {
+				dynamicConsumed = true
+				continue
+			}
 			if node.DynamicFn != nil && cfg != nil {
 				var candidates []completionCandidate
 				for _, name := range node.DynamicFn(cfg) {

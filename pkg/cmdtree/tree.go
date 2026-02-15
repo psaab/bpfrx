@@ -145,6 +145,29 @@ var OperationalTree = map[string]*Node{
 							names = append(names, name)
 						}
 						return names
+					}, Children: map[string]*Node{
+						"policy": {Desc: "Filter by policy name", DynamicFn: func(cfg *config.Config) []string {
+							if cfg == nil {
+								return nil
+							}
+							seen := make(map[string]bool)
+							var names []string
+							for _, zpp := range cfg.Security.Policies {
+								for _, p := range zpp.Policies {
+									if !seen[p.Name] {
+										seen[p.Name] = true
+										names = append(names, p.Name)
+									}
+								}
+							}
+							for _, p := range cfg.Security.GlobalPolicies {
+								if !seen[p.Name] {
+									seen[p.Name] = true
+									names = append(names, p.Name)
+								}
+							}
+							return names
+						}},
 					}},
 				}},
 			}},
@@ -514,7 +537,7 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 	current := tree
 	var currentNode *Node
 	dynamicConsumed := false
-	for _, w := range words {
+	for wi, w := range words {
 		dynamicConsumed = false
 		node, ok := current[w]
 		if !ok {
@@ -528,6 +551,12 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 		}
 		currentNode = node
 		if node.Children == nil {
+			// Leaf with DynamicFn: if more words remain, treat as a
+			// dynamic-value leaf and let the loop consume remaining words.
+			if node.DynamicFn != nil && wi < len(words)-1 {
+				dynamicConsumed = true
+				continue
+			}
 			if node.DynamicFn != nil && cfg != nil {
 				return FilterPrefix(node.DynamicFn(cfg), partial)
 			}
@@ -547,7 +576,7 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 	current := tree
 	var currentNode *Node
 	dynamicConsumed := false
-	for _, w := range words {
+	for wi, w := range words {
 		dynamicConsumed = false
 		node, ok := current[w]
 		if !ok {
@@ -561,6 +590,12 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 		}
 		currentNode = node
 		if node.Children == nil {
+			// Leaf with DynamicFn: if more words remain, treat as a
+			// dynamic-value leaf and let the loop consume remaining words.
+			if node.DynamicFn != nil && wi < len(words)-1 {
+				dynamicConsumed = true
+				continue
+			}
 			if node.DynamicFn != nil && cfg != nil {
 				var candidates []Candidate
 				for _, name := range node.DynamicFn(cfg) {
