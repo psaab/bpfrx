@@ -8,7 +8,7 @@ An eBPF-based firewall that clones Juniper vSRX capabilities using native Junos 
 make generate        # Generate Go bindings from BPF C via bpf2go
 make build           # Build bpfrxd daemon
 make build-ctl       # Build remote CLI client
-make test            # Run Go tests (266 tests across 12 packages)
+make test            # Run Go tests (630+ tests across 20 packages)
 ```
 
 ## Test Environment (Incus VM)
@@ -45,7 +45,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Full interface management**: bpfrxd owns ALL interfaces on the firewall — renames them via `.link` files, configures addresses/DHCP via `.network` files, and brings down unconfigured interfaces
 
 ### APIs
-- **gRPC** on 127.0.0.1:50051 — 48 RPCs (config, sessions, stats, routes, IPsec, DHCP)
+- **gRPC** on 127.0.0.1:50051 — 48+ RPCs (config, sessions, stats, routes, IPsec, DHCP, cluster)
 - **HTTP REST** on 127.0.0.1:8080 — health, Prometheus metrics, config endpoints
 - **CLI** — Interactive Junos-style with tab completion, `?` help, `| match` pipe
 - **Remote CLI** — `cli` binary connects via gRPC
@@ -62,9 +62,9 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 | `pkg/configstore/` | Candidate/active/commit/rollback, atomic DB persistence, JSONL audit journal |
 | `pkg/dataplane/` | eBPF loader, map management, bpf2go bindings |
 | `pkg/daemon/` | Daemon lifecycle (TTY detection, signal handling) |
-| `pkg/cluster/` | Chassis cluster HA state machine, weight scoring, failover |
+| `pkg/cluster/` | Chassis cluster HA (state machine, session sync, config sync, IPsec SA sync) |
 | `pkg/cli/` | Interactive Junos-style CLI |
-| `pkg/conntrack/` | Session garbage collection |
+| `pkg/conntrack/` | Session garbage collection (with HA delete sync callbacks) |
 | `pkg/logging/` | Ring buffer reader, event buffer, syslog client |
 | `pkg/dhcp/` | DHCPv4/DHCPv6 clients |
 | `pkg/frr/` | FRR config generation + managed section in frr.conf |
@@ -83,6 +83,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 | `cmd/cli/` | Remote CLI client binary |
 | `dpdk_worker/` | DPDK C pipeline (single-pass packet processing, CGo bridge) |
 | `pkg/dataplane/dpdk/` | DPDK Go manager (CGo shared memory, FIB sync, port stats) |
+| `docs/` | Protocol docs (sync-protocol.md), feature gaps, phase notes |
 | `test/incus/` | Test environment (setup.sh, config, systemd unit) |
 
 ## Critical Patterns to Know
@@ -150,7 +151,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces
 - **Observability**: Syslog (facility/severity/category filtering), NetFlow v9 (1-in-N sampling), Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB), BPF map utilization (`show system buffers`)
 - **Flow**: TCP MSS clamping (ingress XDP + egress TC, including GRE-specific gre-in/gre-out), ALG control, allow-dns-reply (wired to BPF), allow-embedded-icmp, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, logging, forwarding-class DSCP rewrite, DSCP action)
-- **HA**: Chassis cluster state machine (weight-based failover, manual failover/reset, Junos-style show/request commands), VRRP via keepalived (config generation, runtime state detection), RETH bond interfaces
+- **HA**: Chassis cluster state machine (weight-based failover, manual failover/reset, Junos-style show/request commands), VRRP via keepalived (config generation, runtime state detection), RETH bond interfaces, incremental session sync (1s sweep + ring buffer + GC delete callbacks), config sync, IPsec SA sync, ISSU
 - **DHCP**: Relay (Option 82), server (Kea integration with lease display)
 - **CLI**: Junos-style prefix matching, "Possible completions:" headers, zone/interface descriptions, session idle time, session brief tabular view, flow statistics, policy descriptions, config validation warnings
 

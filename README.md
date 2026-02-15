@@ -21,10 +21,13 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Zone-based policies** with stateful inspection, address books, and application matching
 - **NAT**: source (interface + pool), destination, static 1:1, NAT64
 - **Dual-stack**: IPv4 + IPv6, DHCPv4/v6 clients, Router Advertisements (radvd)
-- **Screen/IDS**: land attack, SYN flood, ping of death, teardrop, and more
-- **Routing**: FRR integration (static, OSPF, BGP), VRFs, GRE tunnels, ECMP
+- **Screen/IDS**: land attack, SYN flood, ping of death, teardrop, rate-limiting
+- **Firewall filters**: policer (token bucket + three-color), lo0 filter, flexible match
+- **Flow**: TCP MSS clamping, ALG control, configurable timeouts, DSCP rewrite
+- **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, ECMP, inter-VRF route leaking
 - **VLANs**: 802.1Q tagging in BPF, trunk ports
-- **IPsec**: strongSwan config generation
+- **IPsec**: strongSwan config generation, IKE proposals, XFRM interfaces
+- **HA**: Chassis cluster with stateful failover, incremental session sync, config sync, IPsec SA sync, RETH interfaces, ISSU
 - **Observability**: syslog, NetFlow v9, Prometheus metrics, SNMP (system + ifTable MIB)
 - **Management**: interactive CLI, remote CLI (gRPC), REST API, commit/rollback model
 - **Performance**: 25+ Gbps with native XDP, hitless restarts with zero packet loss
@@ -94,7 +97,7 @@ set security zones security-zone trust interfaces trust0
 
 - **Local CLI**: run `bpfrxd` in a TTY for interactive Junos-style shell
 - **Remote CLI**: `cli -addr <host>:50051` connects via gRPC
-- **gRPC API**: 42 RPCs on port 50051 (config, sessions, stats, routes, IPsec, DHCP)
+- **gRPC API**: 48+ RPCs on port 50051 (config, sessions, stats, routes, IPsec, DHCP, cluster)
 - **REST API**: HTTP on port 8080 (health, Prometheus `/metrics`, config endpoints)
 
 ## Test Environment
@@ -107,6 +110,13 @@ make test-vm         # Create VM
 make test-deploy     # Build + deploy + restart service
 make test-logs       # View daemon logs
 ```
+
+## Documentation
+
+See `docs/` for detailed design documents:
+- `sync-protocol.md` — Cluster session sync wire protocol and algorithms
+- `feature-gaps.md` — vSRX feature parity tracking
+- `phases.md` — Development phase history
 
 ## Requirements
 
