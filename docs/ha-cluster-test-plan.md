@@ -9,6 +9,39 @@ Two VMs running bpfrxd in chassis cluster (active/passive) mode with:
 - **Fabric**: Dedicated link between VMs for session sync, config sync, IPsec SA sync (TCP)
 - **Test host**: Container on LAN for end-to-end traffic validation
 
+## Single-Config Model
+
+Both nodes share **one configuration file** (`docs/ha-cluster.conf`) using the Junos
+`groups` / `apply-groups` pattern. Node-specific settings (hostname, cluster node ID,
+peer addresses, interface-to-RETH mappings) live inside `groups { node0 { ... } }` and
+`groups { node1 { ... } }`. The shared sections (chassis cluster, RETH, security, NAT,
+routing) appear at the top level.
+
+At load time, the daemon resolves `apply-groups "${node}"` by substituting the
+`${node}` variable with the group name matching the configured `chassis cluster node`
+value (node 0 → `node0`, node 1 → `node1`). This merges the node-specific group into
+the active config, producing a complete per-node configuration from a single source file.
+
+### Interface Naming Convention
+
+bpfrx uses vSRX-style interface names:
+
+| vSRX Name | Linux Name | Role |
+|-----------|-----------|------|
+| `fxp0` | `fxp0` | Management (out-of-band) |
+| `fxp1` | `fxp1` | Cluster control (heartbeat) |
+| `fab0` | `fab0` | Fabric sync link |
+| `ge-0/0/0` | `ge-0-0-0` | Node 0 data interface (LAN, reth1 member) |
+| `ge-0/0/1` | `ge-0-0-1` | Node 0 data interface (WAN, reth0 member) |
+| `ge-7/0/0` | `ge-7-0-0` | Node 1 data interface (LAN, reth1 member) |
+| `ge-7/0/1` | `ge-7-0-1` | Node 1 data interface (WAN, reth0 member) |
+| `reth0` | `reth0` | Redundant Ethernet — WAN |
+| `reth1` | `reth1` | Redundant Ethernet — LAN |
+
+**Name translation**: Junos `ge-X/Y/Z` uses slashes, but Linux interface names cannot
+contain slashes. The daemon translates slashes to hyphens: `ge-0/0/0` → `ge-0-0-0`.
+Config files use the Junos form; `.link` files rename kernel interfaces to the Linux form.
+
 ## Physical Host
 
 ```
@@ -28,23 +61,23 @@ Host NIC: eno6np1 (i40e, Intel X710)
                     |   32 SR-IOV VFs   |
                     +----+--------+-----+
                          |        |
-                      VF0(wan)  VF1(wan)
+                    VF0(wan)   VF1(wan)
                          |        |
               +----------+--+  +--+----------+
               |  bpfrx-fw0  |  |  bpfrx-fw1  |
               |  (node 0)   |  |  (node 1)   |
               |  pri: 200   |  |  pri: 100   |
-              +--+--+--+--+--+  +--+--+--+--+--+
-                 |  |  |  |       |  |  |  |
-  mgmt0 --------+  |  |  |       |--|---------  mgmt0
-  hb0   -----------+  |  |       +--|------  hb0
-  fab0   -------------+  |       |  +-----  fab0
-  lan0  -----------------+       +---------  lan0
-                 |                  |
-                 +------+  +-------+
-                        |  |
-           incusbr0              (mgmt0, DHCP)
-           bpfrx-ha-heartbeat   (hb0, 10.99.0.0/30)
+              +--+--+--+--+-+  +-+--+--+--+--+
+                 |  |  |  |      |  |  |  |
+  fxp0 ---------+  |  |  |      +--|--------  fxp0
+  fxp1 ------------+  |  |      +--|---------  fxp1
+  fab0 ----------------+  |      |  +--------  fab0
+  ge-0/0/0 ---------------+      +-----------  ge-7/0/0
+                 |                   |
+                 +------+   +-------+
+                        |   |
+           incusbr0              (fxp0, DHCP)
+           bpfrx-ha-heartbeat   (fxp1, 10.99.0.0/30)
            bpfrx-ha-fabric      (fab0, 10.99.1.0/30)
            bpfrx-ha-lan         (reth1: 10.0.60.0/24)
 
@@ -77,17 +110,19 @@ Memory: 4 GB
 Disk:   20 GB (pool: default)
 ```
 
-| Device | VM Interface | Network | Purpose |
-|--------|-------------|---------|---------|
-| `eth0` | enp5s0 | incusbr0 | Management (DHCP) |
-| `eth1` | enp6s0 | bpfrx-ha-heartbeat | Heartbeat |
-| `eth2` | enp7s0 | bpfrx-ha-fabric | Fabric sync |
-| `eth3` | enp8s0 | bpfrx-ha-lan | LAN (reth1 member) |
+| Device | VM Interface | Renamed To | Network | Purpose |
+|--------|-------------|-----------|---------|---------|
+| `eth0` | enp5s0 | fxp0 | incusbr0 | Management (DHCP) |
+| `eth1` | enp6s0 | fxp1 | bpfrx-ha-heartbeat | Heartbeat / control |
+| `eth2` | enp7s0 | fab0 | bpfrx-ha-fabric | Fabric sync |
+| `eth3` | enp8s0 | ge-X-0-0 | bpfrx-ha-lan | LAN (reth1 member) |
 
-SR-IOV WAN device added per-VM after launch:
+SR-IOV WAN device added per-VM after launch (becomes `ge-X-0-1`):
 ```bash
 incus config device add $vm wan-vf nic nictype=sriov parent=eno6np1
 ```
+
+Where X = 0 for node 0 (`ge-0-0-0`, `ge-0-0-1`) and X = 7 for node 1 (`ge-7-0-0`, `ge-7-0-1`).
 
 ### Instances
 
@@ -101,20 +136,32 @@ incus config device add $vm wan-vf nic nictype=sriov parent=eno6np1
 
 ### Per-VM Interfaces
 
-| Kernel Name | Renamed To | Driver | XDP Mode | Role |
-|-------------|-----------|--------|----------|------|
-| enp5s0 | mgmt0 | virtio_net | native | Management (DHCP) |
-| enp6s0 | hb0 | virtio_net | native | Heartbeat |
-| enp7s0 | fab0 | virtio_net | native | Fabric sync |
-| enp8s0 | lan0 | virtio_net | native | LAN (reth1 member) |
-| enp*s* (VF) | wan-vf | iavf | generic | WAN (reth0 member) |
+**Node 0 (bpfrx-fw0):**
+
+| Kernel Name | Renamed To | Config Name | Driver | XDP Mode | Role |
+|-------------|-----------|-------------|--------|----------|------|
+| enp5s0 | fxp0 | fxp0 | virtio_net | native | Management (DHCP) |
+| enp6s0 | fxp1 | fxp1 | virtio_net | native | Heartbeat / control |
+| enp7s0 | fab0 | fab0 | virtio_net | native | Fabric sync |
+| enp8s0 | ge-0-0-0 | ge-0/0/0 | virtio_net | native | LAN (reth1 member) |
+| enp*s* (VF) | ge-0-0-1 | ge-0/0/1 | iavf | generic | WAN (reth0 member) |
+
+**Node 1 (bpfrx-fw1):**
+
+| Kernel Name | Renamed To | Config Name | Driver | XDP Mode | Role |
+|-------------|-----------|-------------|--------|----------|------|
+| enp5s0 | fxp0 | fxp0 | virtio_net | native | Management (DHCP) |
+| enp6s0 | fxp1 | fxp1 | virtio_net | native | Heartbeat / control |
+| enp7s0 | fab0 | fab0 | virtio_net | native | Fabric sync |
+| enp8s0 | ge-7-0-0 | ge-7/0/0 | virtio_net | native | LAN (reth1 member) |
+| enp*s* (VF) | ge-7-0-1 | ge-7/0/1 | iavf | generic | WAN (reth0 member) |
 
 ### RETH Bonds
 
-| RETH | Members | VIP | Zone | Purpose |
-|------|---------|-----|------|---------|
-| reth0 | wan-vf (per-VM) | 172.16.50.10/24 | wan | WAN uplink |
-| reth1 | lan0 (per-VM) | 10.0.60.1/24 | lan | LAN |
+| RETH | Node 0 Member | Node 1 Member | VIP | Zone | Purpose |
+|------|--------------|--------------|-----|------|---------|
+| reth0 | ge-0/0/1 | ge-7/0/1 | 172.16.50.10/24 | wan | WAN uplink |
+| reth1 | ge-0/0/0 | ge-7/0/0 | 10.0.60.1/24 | lan | LAN |
 
 ## IP Addressing
 
@@ -122,7 +169,7 @@ incus config device add $vm wan-vf nic nictype=sriov parent=eno6np1
 
 | Link | fw0 | fw1 | Subnet |
 |------|-----|-----|--------|
-| Heartbeat (hb0) | 10.99.0.1/30 | 10.99.0.2/30 | 10.99.0.0/30 |
+| Heartbeat (fxp1) | 10.99.0.1/30 | 10.99.0.2/30 | 10.99.0.0/30 |
 | Fabric (fab0) | 10.99.1.1/30 | 10.99.1.2/30 | 10.99.1.0/30 |
 
 ### RETH VIPs (float to primary)
@@ -140,7 +187,23 @@ incus config device add $vm wan-vf nic nictype=sriov parent=eno6np1
 
 ## Cluster Configuration
 
-### Chassis Cluster (both nodes)
+A single config file (`docs/ha-cluster.conf`) is loaded on both nodes. The
+`apply-groups "${node}"` directive selects node-specific overrides at commit time.
+
+### Node-Specific Settings (via groups)
+
+| Setting | node0 (fw0) | node1 (fw1) |
+|---------|------------|------------|
+| host-name | bpfrx-fw0 | bpfrx-fw1 |
+| cluster node | 0 | 1 |
+| peer-address | 10.99.0.2 | 10.99.0.1 |
+| fabric-peer-address | 10.99.1.2 | 10.99.1.1 |
+| fxp1 address | 10.99.0.1/30 | 10.99.0.2/30 |
+| fab0 address | 10.99.1.1/30 | 10.99.1.2/30 |
+| WAN RETH member | ge-0/0/1 | ge-7/0/1 |
+| LAN RETH member | ge-0/0/0 | ge-7/0/0 |
+
+### Shared Cluster Settings
 
 ```
 chassis {
@@ -149,6 +212,9 @@ chassis {
         reth-count 2;
         heartbeat-interval 1000;
         heartbeat-threshold 3;
+        control-interface fxp1;
+        fabric-interface fab0;
+        configuration-synchronize;
         redundancy-group 0 {
             node 0 priority 200;
             node 1 priority 100;
@@ -162,32 +228,12 @@ chassis {
 }
 ```
 
-### Node-Specific Config
-
-**fw0 (node 0):**
-```
-control-interface hb0;
-peer-address 10.99.0.2;
-fabric-interface fab0;
-fabric-peer-address 10.99.1.2;
-configuration-synchronize;
-```
-
-**fw1 (node 1):**
-```
-control-interface hb0;
-peer-address 10.99.0.1;
-fabric-interface fab0;
-fabric-peer-address 10.99.1.1;
-configuration-synchronize;
-```
-
 ### Security Zones
 
 | Zone | Interfaces | Allowed Services |
 |------|-----------|-----------------|
-| mgmt | mgmt0 | ssh, ping, dhcp |
-| control | hb0, fab0 | ping |
+| mgmt | fxp0 | ssh, ping, dhcp |
+| control | fxp1, fab0 | ping |
 | wan | reth0 | ping |
 | lan | reth1 | ssh, ping, dhcp |
 
@@ -208,9 +254,9 @@ security {
             rule-set lan-to-wan {
                 from zone lan;
                 to zone wan;
-                rule snat-masq {
+                rule snat {
                     match { source-address 0.0.0.0/0; }
-                    then { source-nat interface; }
+                    then { source-nat { interface; } }
                 }
             }
         }
@@ -223,7 +269,7 @@ security {
 ```
 routing-options {
     static {
-        route 0.0.0.0/0 next-hop 172.16.50.1;
+        route 0.0.0.0/0 { next-hop 172.16.50.1; }
     }
 }
 ```
@@ -236,21 +282,11 @@ system {
         dhcp-local-server {
             group lan-pool {
                 interface reth1;
-            }
-        }
-    }
-}
-access {
-    address-assignment {
-        pool lan-pool {
-            family inet {
-                network 10.0.60.0/24;
-                range clients {
-                    low 10.0.60.100;
-                    high 10.0.60.199;
-                }
-                dhcp-attributes {
+                pool lan-range {
+                    subnet 10.0.60.0/24;
+                    address-range low 10.0.60.100 high 10.0.60.199;
                     router 10.0.60.1;
+                    dns-server 8.8.8.8;
                 }
             }
         }
@@ -299,7 +335,7 @@ On each VM:
 - Install: frr, strongswan, iproute2, tcpdump, iperf3, bpftool, radvd
 - Set GRUB: `init_on_alloc=0`
 - Enable: `net.core.bpf_jit_enable=1`, `net.ipv4.ip_forward=1`, IPv6 forwarding
-- Write `.link` files for interface renaming (MAC-based)
+- Write `.link` files for interface renaming (MAC-based, using vSRX names)
 - Write `setup.sh` bootstrap for first-boot interface rename
 
 ### 5. Launch Test Container
@@ -325,7 +361,10 @@ for vm in bpfrx-fw0 bpfrx-fw1; do
     incus file push bpfrxd "$vm/usr/local/sbin/bpfrxd"
     incus file push cli "$vm/usr/local/sbin/cli"
 done
-# Push per-node configs, enable service, start
+# Push the single config file to both VMs, enable service, start
+for vm in bpfrx-fw0 bpfrx-fw1; do
+    incus file push docs/ha-cluster.conf "$vm/etc/bpfrx/bpfrx.conf"
+done
 ```
 
 ## Test Cases

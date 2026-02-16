@@ -121,16 +121,34 @@ func cloneNodes(nodes []*Node) []*Node {
 // merges them into the parent. After expansion, both "groups" and
 // "apply-groups" nodes are removed from the tree.
 func (t *ConfigTree) ExpandGroups() error {
-	return t.expandGroups(false)
+	return t.expandGroups(false, nil)
 }
 
 // ExpandGroupsTagged is like ExpandGroups but tags each inherited node
 // with InheritedFrom set to the group name, for "| display inheritance".
 func (t *ConfigTree) ExpandGroupsTagged() error {
-	return t.expandGroups(true)
+	return t.expandGroups(true, nil)
 }
 
-func (t *ConfigTree) expandGroups(tagInherited bool) error {
+// ExpandGroupsWithVars is like ExpandGroups but resolves ${var} references
+// in apply-groups names before lookup. This supports Junos-style per-node
+// group selection, e.g. apply-groups "${node}" with vars {"node": "node0"}.
+func (t *ConfigTree) ExpandGroupsWithVars(vars map[string]string) error {
+	return t.expandGroups(false, vars)
+}
+
+// resolveVars replaces ${key} placeholders in s with values from vars.
+func resolveVars(s string, vars map[string]string) string {
+	if vars == nil {
+		return s
+	}
+	for k, v := range vars {
+		s = strings.ReplaceAll(s, "${"+k+"}", v)
+	}
+	return s
+}
+
+func (t *ConfigTree) expandGroups(tagInherited bool, vars map[string]string) error {
 	// Collect group definitions: groups { <name> { ... } }
 	groups := make(map[string]*Node)
 	for _, child := range t.Children {
@@ -150,11 +168,11 @@ func (t *ConfigTree) expandGroups(tagInherited bool) error {
 
 	// If no groups defined, just strip any stale apply-groups references.
 	if len(groups) == 0 {
-		return t.stripApplyGroups()
+		return t.stripApplyGroups(vars)
 	}
 
 	// Resolve apply-groups at top level.
-	if err := expandGroupsInNodes(&t.Children, groups, nil, tagInherited); err != nil {
+	if err := expandGroupsInNodes(&t.Children, groups, nil, tagInherited, vars); err != nil {
 		return err
 	}
 
@@ -309,13 +327,14 @@ func tagNodesInherited(nodes []*Node, groupName string) {
 }
 
 // stripApplyGroups removes apply-groups nodes and returns error if they
-// reference undefined groups.
-func (t *ConfigTree) stripApplyGroups() error {
+// reference undefined groups. vars is used to resolve ${var} placeholders
+// in group names for error messages.
+func (t *ConfigTree) stripApplyGroups(vars map[string]string) error {
 	for _, child := range t.Children {
 		if child.Name() == "apply-groups" {
 			name := ""
 			if len(child.Keys) > 1 {
-				name = child.Keys[1]
+				name = resolveVars(child.Keys[1], vars)
 			}
 			return fmt.Errorf("apply-groups references undefined group %q", name)
 		}
@@ -327,12 +346,13 @@ func (t *ConfigTree) stripApplyGroups() error {
 // It merges referenced group children into the list, then removes apply-groups.
 // seen tracks group names being expanded to detect circular references.
 // If tagInherited is true, merged nodes get InheritedFrom set to the group name.
-func expandGroupsInNodes(nodes *[]*Node, groups map[string]*Node, seen map[string]bool, tagInherited bool) error {
+// vars provides ${var} replacements for group names (may be nil).
+func expandGroupsInNodes(nodes *[]*Node, groups map[string]*Node, seen map[string]bool, tagInherited bool, vars map[string]string) error {
 	// First, collect apply-groups references at this level.
 	var applyNames []string
 	for _, n := range *nodes {
 		if n.Name() == "apply-groups" && len(n.Keys) > 1 {
-			applyNames = append(applyNames, n.Keys[1])
+			applyNames = append(applyNames, resolveVars(n.Keys[1], vars))
 		}
 	}
 

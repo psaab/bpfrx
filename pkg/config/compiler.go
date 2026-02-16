@@ -19,6 +19,28 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 		return nil, fmt.Errorf("apply-groups: %w", err)
 	}
 
+	return compileExpanded(tree)
+}
+
+// CompileConfigForNode is like CompileConfig but resolves ${node} variables
+// in apply-groups names before lookup. nodeID selects which per-node group
+// to apply (e.g. nodeID=0 maps "node" -> "node0", so apply-groups "${node}"
+// resolves to group "node0"). This supports a single shared config for both
+// nodes in a chassis cluster.
+func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
+	tree = tree.Clone()
+
+	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
+	if err := tree.ExpandGroupsWithVars(vars); err != nil {
+		return nil, fmt.Errorf("apply-groups: %w", err)
+	}
+
+	return compileExpanded(tree)
+}
+
+// compileExpanded compiles an already-expanded (groups resolved) ConfigTree
+// into a typed Config. Shared by CompileConfig and CompileConfigForNode.
+func compileExpanded(tree *ConfigTree) (*Config, error) {
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),

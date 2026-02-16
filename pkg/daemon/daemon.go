@@ -56,6 +56,12 @@ type Options struct {
 	Version     string // software version string
 }
 
+// nodeIDFile is the path to the cluster node ID file.
+// If this file exists and contains a valid integer (0 or 1), the daemon
+// runs in cluster mode with ${node} variable expansion. If the file does
+// not exist, the daemon runs in standalone mode.
+const nodeIDFile = "/etc/bpfrx/node-id"
+
 // Daemon is the main bpfrx daemon.
 type Daemon struct {
 	opts         Options
@@ -96,9 +102,23 @@ func New(opts Options) *Daemon {
 		opts.ConfigFile = "/etc/bpfrx/bpfrx.conf"
 	}
 
+	store := configstore.New(opts.ConfigFile)
+
+	// Read cluster node ID from file. If the file exists and contains a
+	// valid integer, the daemon runs in cluster mode with ${node} variable
+	// expansion in apply-groups. If the file does not exist, standalone mode.
+	if data, err := os.ReadFile(nodeIDFile); err == nil {
+		s := strings.TrimSpace(string(data))
+		var nodeID int
+		if _, err := fmt.Sscanf(s, "%d", &nodeID); err == nil {
+			store.SetNodeID(nodeID)
+			slog.Info("cluster node ID loaded from file", "node", nodeID, "file", nodeIDFile)
+		}
+	}
+
 	return &Daemon{
 		opts:  opts,
-		store: configstore.New(opts.ConfigFile),
+		store: store,
 	}
 }
 
@@ -827,18 +847,9 @@ func (d *Daemon) bootstrapFromFile() error {
 		return fmt.Errorf("read config file: %w", err)
 	}
 
-	parser := config.NewParser(string(data))
-	tree, errs := parser.Parse()
-	if len(errs) > 0 {
-		return fmt.Errorf("parse config file: %v", errs[0])
-	}
-
-	compiled, err := config.CompileConfig(tree)
-	if err != nil {
-		return fmt.Errorf("compile config: %w", err)
-	}
-
-	// Import into the store: enter config mode, load, commit
+	// Import into the store: enter config mode, load, commit.
+	// Commit() handles compilation (including ${node} variable expansion
+	// when nodeID is set on the store for cluster mode).
 	if err := d.store.EnterConfigure(); err != nil {
 		return fmt.Errorf("enter configure: %w", err)
 	}
@@ -851,8 +862,6 @@ func (d *Daemon) bootstrapFromFile() error {
 		return fmt.Errorf("commit: %w", err)
 	}
 	d.store.ExitConfigure()
-
-	_ = compiled // store.Commit() recompiles; ActiveConfig() will return it
 	slog.Info("configuration bootstrapped from file", "file", d.opts.ConfigFile)
 	return nil
 }

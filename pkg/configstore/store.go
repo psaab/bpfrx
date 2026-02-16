@@ -47,6 +47,10 @@ type Store struct {
 	// Cluster read-only mode: secondary nodes reject config mutations
 	clusterReadOnly bool
 
+	// Cluster node ID for ${node} variable expansion in apply-groups.
+	// -1 means non-cluster (use CompileConfig), >= 0 means use CompileConfigForNode.
+	nodeID int
+
 	// Edit path for hierarchical navigation (edit/top/up)
 	editPath []string
 
@@ -71,6 +75,7 @@ func New(filePath string) *Store {
 		filePath: filePath,
 		db:       db,
 		journal:  NewJournal(journalPath),
+		nodeID:   -1,
 	}
 }
 
@@ -87,7 +92,7 @@ func (s *Store) Load() error {
 		return nil // start fresh with empty config
 	}
 
-	compiled, err := config.CompileConfig(tree)
+	compiled, err := s.compileTree(tree)
 	if err != nil {
 		return fmt.Errorf("compile config: %w", err)
 	}
@@ -122,6 +127,23 @@ func (s *Store) ClusterReadOnly() bool {
 	return s.clusterReadOnly
 }
 
+// SetNodeID sets the cluster node ID for ${node} variable expansion in
+// apply-groups. Use -1 (default) for non-cluster mode.
+func (s *Store) SetNodeID(id int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nodeID = id
+}
+
+// compileTree compiles a config tree using the appropriate method based on
+// whether the store is in cluster mode (nodeID >= 0) or standalone.
+func (s *Store) compileTree(tree *config.ConfigTree) (*config.Config, error) {
+	if s.nodeID >= 0 {
+		return config.CompileConfigForNode(tree, s.nodeID)
+	}
+	return config.CompileConfig(tree)
+}
+
 // SyncApply applies a config received from the cluster primary.
 // Bypasses cluster read-only checks. The chassisPreserve function, if set,
 // lets the caller patch the parsed tree before compiling (e.g. to preserve
@@ -140,7 +162,7 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 		chassisPreserve(tree)
 	}
 
-	compiled, err := config.CompileConfig(tree)
+	compiled, err := s.compileTree(tree)
 	if err != nil {
 		return nil, fmt.Errorf("sync config compile error: %w", err)
 	}
@@ -596,7 +618,7 @@ func (s *Store) CommitCheck() (*config.Config, error) {
 		return nil, fmt.Errorf("not in configuration mode")
 	}
 
-	compiled, err := config.CompileConfig(s.candidate)
+	compiled, err := s.compileTree(s.candidate)
 	if err != nil {
 		return nil, err
 	}
@@ -614,7 +636,7 @@ func (s *Store) Commit() (*config.Config, error) {
 		return nil, fmt.Errorf("not in configuration mode")
 	}
 
-	compiled, err := config.CompileConfig(s.candidate)
+	compiled, err := s.compileTree(s.candidate)
 	if err != nil {
 		return nil, fmt.Errorf("commit check failed: %w", err)
 	}
@@ -672,7 +694,7 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 		return nil, fmt.Errorf("not in configuration mode")
 	}
 
-	compiled, err := config.CompileConfig(s.candidate)
+	compiled, err := s.compileTree(s.candidate)
 	if err != nil {
 		return nil, fmt.Errorf("commit check failed: %w", err)
 	}
@@ -739,7 +761,7 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 		return nil, fmt.Errorf("not in configuration mode")
 	}
 
-	compiled, err := config.CompileConfig(s.candidate)
+	compiled, err := s.compileTree(s.candidate)
 	if err != nil {
 		return nil, fmt.Errorf("commit check failed: %w", err)
 	}

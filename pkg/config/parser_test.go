@@ -11063,6 +11063,158 @@ func TestCompilePreservesGroups(t *testing.T) {
 	}
 }
 
+func TestExpandGroupsWithNodeVar(t *testing.T) {
+	// Simulate a chassis cluster config where each node has its own group
+	// with node-specific settings, selected via apply-groups "${node}".
+	tree := &ConfigTree{}
+	setCommands := []string{
+		`set groups node0 system host-name fw0`,
+		`set groups node0 chassis cluster node 0`,
+		`set groups node0 interfaces hb0 unit 0 family inet address 10.99.0.1/30`,
+		`set groups node1 system host-name fw1`,
+		`set groups node1 chassis cluster node 1`,
+		`set groups node1 interfaces hb0 unit 0 family inet address 10.99.0.2/30`,
+		`set apply-groups "${node}"`,
+		// Shared config outside groups
+		`set security zones security-zone trust interfaces trust0.0`,
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	// Expand for node 0
+	clone0 := tree.Clone()
+	vars0 := map[string]string{"node": "node0"}
+	if err := clone0.ExpandGroupsWithVars(vars0); err != nil {
+		t.Fatalf("ExpandGroupsWithVars node0: %v", err)
+	}
+	out0 := clone0.Format()
+	if !strings.Contains(out0, "host-name fw0") {
+		t.Errorf("node0 expansion should contain fw0 hostname:\n%s", out0)
+	}
+	if strings.Contains(out0, "host-name fw1") {
+		t.Errorf("node0 expansion should NOT contain fw1 hostname:\n%s", out0)
+	}
+
+	// Expand for node 1
+	clone1 := tree.Clone()
+	vars1 := map[string]string{"node": "node1"}
+	if err := clone1.ExpandGroupsWithVars(vars1); err != nil {
+		t.Fatalf("ExpandGroupsWithVars node1: %v", err)
+	}
+	out1 := clone1.Format()
+	if !strings.Contains(out1, "host-name fw1") {
+		t.Errorf("node1 expansion should contain fw1 hostname:\n%s", out1)
+	}
+	if strings.Contains(out1, "host-name fw0") {
+		t.Errorf("node1 expansion should NOT contain fw0 hostname:\n%s", out1)
+	}
+}
+
+func TestCompileConfigForNode(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		`set groups node0 system host-name fw0`,
+		`set groups node0 chassis cluster node 0`,
+		`set groups node0 interfaces hb0 unit 0 family inet address 10.99.0.1/30`,
+		`set groups node1 system host-name fw1`,
+		`set groups node1 chassis cluster node 1`,
+		`set groups node1 interfaces hb0 unit 0 family inet address 10.99.0.2/30`,
+		`set apply-groups "${node}"`,
+		`set chassis cluster cluster-id 1`,
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	// Compile for node 0
+	cfg0, err := CompileConfigForNode(tree, 0)
+	if err != nil {
+		t.Fatalf("CompileConfigForNode(0): %v", err)
+	}
+	if cfg0.System.HostName != "fw0" {
+		t.Errorf("node0 hostname = %q, want fw0", cfg0.System.HostName)
+	}
+	if cfg0.Chassis.Cluster == nil || cfg0.Chassis.Cluster.NodeID != 0 {
+		t.Errorf("node0 NodeID = %v, want 0", cfg0.Chassis.Cluster)
+	}
+
+	// Compile for node 1
+	cfg1, err := CompileConfigForNode(tree, 1)
+	if err != nil {
+		t.Fatalf("CompileConfigForNode(1): %v", err)
+	}
+	if cfg1.System.HostName != "fw1" {
+		t.Errorf("node1 hostname = %q, want fw1", cfg1.System.HostName)
+	}
+	if cfg1.Chassis.Cluster == nil || cfg1.Chassis.Cluster.NodeID != 1 {
+		t.Errorf("node1 NodeID = %v, want 1", cfg1.Chassis.Cluster)
+	}
+
+	// Original tree must not be mutated
+	if tree.FindChild("groups") == nil {
+		t.Error("groups node stripped from original tree")
+	}
+	if tree.FindChild("apply-groups") == nil {
+		t.Error("apply-groups node stripped from original tree")
+	}
+}
+
+func TestCompileConfigForNodeBackwardCompat(t *testing.T) {
+	// CompileConfig (without node vars) should still work and should error
+	// on unresolvable ${node} references (since it expands literally).
+	tree := &ConfigTree{}
+	setCommands := []string{
+		`set groups node0 system host-name fw0`,
+		`set apply-groups "${node}"`,
+	}
+	for _, cmd := range setCommands {
+		path, _ := ParseSetCommand(cmd)
+		tree.SetPath(path)
+	}
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected error from CompileConfig with ${node} reference")
+	}
+	if !strings.Contains(err.Error(), `"${node}"`) {
+		t.Errorf("error should mention ${node}, got: %v", err)
+	}
+}
+
+func TestExpandGroupsWithVarsNilPreservesBackwardCompat(t *testing.T) {
+	// ExpandGroupsWithVars(nil) should behave identically to ExpandGroups()
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set groups common system host-name test-fw",
+		"set apply-groups common",
+	}
+	for _, cmd := range setCommands {
+		path, _ := ParseSetCommand(cmd)
+		tree.SetPath(path)
+	}
+
+	if err := tree.ExpandGroupsWithVars(nil); err != nil {
+		t.Fatalf("ExpandGroupsWithVars(nil): %v", err)
+	}
+	out := tree.Format()
+	if !strings.Contains(out, "host-name test-fw") {
+		t.Errorf("nil vars should still expand literal group names:\n%s", out)
+	}
+}
+
 func TestFormatInheritance(t *testing.T) {
 	tree := &ConfigTree{}
 	setCommands := []string{
