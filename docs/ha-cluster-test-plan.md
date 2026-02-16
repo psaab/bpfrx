@@ -4,10 +4,10 @@
 
 Two VMs running bpfrxd in chassis cluster (active/passive) mode with:
 - **WAN**: SR-IOV VFs from `eno6np1` (i40e, one VF per VM, bonded into reth0)
-- **LAN**: Two bridged networks (`lan1`, `lan2`), each bonded into a RETH
+- **LAN**: One bridged network with two interfaces per VM (bonded into reth1 for link redundancy)
 - **Heartbeat**: Dedicated bridge for cluster health monitoring (UDP:4784)
 - **Fabric**: Dedicated bridge for session sync, config sync, IPsec SA sync (TCP)
-- **Test host**: Container on `lan1` for end-to-end traffic validation
+- **Test host**: Container on LAN for end-to-end traffic validation
 
 ## Physical Host
 
@@ -35,27 +35,28 @@ Host NIC: eno6np1 (i40e, Intel X710)
               |  (node 0)   |  |  (node 1)   |
               |  pri: 200   |  |  pri: 100   |
               +--+--+--+--+-+  +-+--+--+--+--+
-                 |  |  |  |      |  |  |  |
-  mgmt0 --------+  |  |  |      +--|---------  mgmt0
-  hb0   -----------+  |  |      |  +--|------  hb0
-  fab0   -------------+  |      |  |  +-----  fab0
-  lan1  -----------------+      +--|--------  lan1
-  lan2  ---------(below)-----------|--------  lan2
+                 |  |  |  ||     ||  |  |  |
+  mgmt0 --------+  |  |  ||     ||--|---------  mgmt0
+  hb0   -----------+  |  ||     |+--|------  hb0
+  fab0   -------------+  ||     |   +-----  fab0
+  lan0  -----------------+|     +--|-------  lan0
+  lan1  ------------------+     +--+------  lan1
                  |                  |
                  +------+  +-------+
                         |  |
            bpfrx-ha-heartbeat  (10.99.0.0/30)
            bpfrx-ha-fabric     (10.99.1.0/30)
-           bpfrx-ha-lan1       (reth1: 10.0.60.0/24)
-           bpfrx-ha-lan2       (reth2: 10.0.70.0/24)
+           bpfrx-ha-lan        (reth1: 10.0.60.0/24)
 
               +------------------+
               |  ha-lan-host     |
               |  (container)     |
-              |  eth1: lan1      |  10.0.60.102/24
-              |  eth2: lan2      |  10.0.70.102/24
+              |  eth1: lan       |  10.0.60.102/24
               +------------------+
 ```
+
+Two interfaces per VM on the same LAN bridge provides link redundancy for reth1.
+If one member link fails, the bond keeps forwarding on the surviving link.
 
 ## Incus Resources
 
@@ -65,8 +66,7 @@ Host NIC: eno6np1 (i40e, Intel X710)
 |---------|---------|-------------|
 | `bpfrx-ha-heartbeat` | Cluster heartbeat (UDP:4784) | ipv4.address=none, ipv6.address=none |
 | `bpfrx-ha-fabric` | Session/config/IPsec sync (TCP) | ipv4.address=none, ipv6.address=none |
-| `bpfrx-ha-lan1` | LAN segment 1 (reth1 members) | ipv4.address=none, ipv6.address=none |
-| `bpfrx-ha-lan2` | LAN segment 2 (reth2 members) | ipv4.address=none, ipv6.address=none |
+| `bpfrx-ha-lan` | LAN segment (reth1 members, 2 per VM) | ipv4.address=none, ipv6.address=none |
 | `incusbr0` | Management (existing, DHCP) | default |
 
 ### Profile: `bpfrx-ha-cluster`
@@ -82,8 +82,8 @@ Disk:   20 GB (pool: default)
 | `eth0` | enp5s0 | incusbr0 | Management (DHCP) |
 | `eth1` | enp6s0 | bpfrx-ha-heartbeat | Heartbeat |
 | `eth2` | enp7s0 | bpfrx-ha-fabric | Fabric |
-| `eth3` | enp8s0 | bpfrx-ha-lan1 | LAN1 (reth1 member) |
-| `eth4` | enp9s0 | bpfrx-ha-lan2 | LAN2 (reth2 member) |
+| `eth3` | enp8s0 | bpfrx-ha-lan | LAN (reth1 member 0) |
+| `eth4` | enp9s0 | bpfrx-ha-lan | LAN (reth1 member 1) |
 
 SR-IOV WAN device added per-VM after launch:
 ```bash
@@ -96,7 +96,7 @@ incus config device add $vm wan-vf nic nictype=sriov parent=eno6np1
 |----------|------|------|
 | `bpfrx-fw0` | VM | Firewall node 0 (primary, priority 200) |
 | `bpfrx-fw1` | VM | Firewall node 1 (secondary, priority 100) |
-| `ha-lan-host` | Container | Test traffic source/sink on LAN1 + LAN2 |
+| `ha-lan-host` | Container | Test traffic source/sink on LAN |
 
 ## Interface Mapping
 
@@ -107,8 +107,8 @@ incus config device add $vm wan-vf nic nictype=sriov parent=eno6np1
 | enp5s0 | mgmt0 | virtio_net | native | Management (DHCP) |
 | enp6s0 | hb0 | virtio_net | native | Heartbeat |
 | enp7s0 | fab0 | virtio_net | native | Fabric sync |
-| enp8s0 | lan1 | virtio_net | native | LAN1 (reth1 member) |
-| enp9s0 | lan2 | virtio_net | native | LAN2 (reth2 member) |
+| enp8s0 | lan0 | virtio_net | native | LAN (reth1 member 0) |
+| enp9s0 | lan1 | virtio_net | native | LAN (reth1 member 1) |
 | enp*s* (VF) | wan-vf | iavf | generic | WAN (reth0 member) |
 
 ### RETH Bonds
@@ -116,8 +116,7 @@ incus config device add $vm wan-vf nic nictype=sriov parent=eno6np1
 | RETH | Members | VIP | Zone | Purpose |
 |------|---------|-----|------|---------|
 | reth0 | wan-vf (per-VM) | 172.16.50.10/24 | wan | WAN uplink |
-| reth1 | lan1 (per-VM) | 10.0.60.1/24 | lan1 | LAN segment 1 |
-| reth2 | lan2 (per-VM) | 10.0.70.1/24 | lan2 | LAN segment 2 |
+| reth1 | lan0, lan1 (per-VM) | 10.0.60.1/24 | lan | LAN (link-redundant) |
 
 ## IP Addressing
 
@@ -133,15 +132,13 @@ incus config device add $vm wan-vf nic nictype=sriov parent=eno6np1
 | RETH | VIP | Gateway for |
 |------|-----|-------------|
 | reth0 | 172.16.50.10/24 | WAN uplink |
-| reth1 | 10.0.60.1/24 | ha-lan-host (LAN1) |
-| reth2 | 10.0.70.1/24 | ha-lan-host (LAN2) |
+| reth1 | 10.0.60.1/24 | ha-lan-host |
 
 ### Test Container
 
 | Interface | Network | Address | Gateway |
 |-----------|---------|---------|---------|
-| eth1 | bpfrx-ha-lan1 | 10.0.60.102/24 | 10.0.60.1 (reth1) |
-| eth2 | bpfrx-ha-lan2 | 10.0.70.102/24 | 10.0.70.1 (reth2) |
+| eth1 | bpfrx-ha-lan | 10.0.60.102/24 | 10.0.60.1 (reth1) |
 
 ## Cluster Configuration
 
@@ -151,7 +148,7 @@ incus config device add $vm wan-vf nic nictype=sriov parent=eno6np1
 chassis {
     cluster {
         cluster-id 1;
-        reth-count 3;
+        reth-count 2;
         heartbeat-interval 1000;
         heartbeat-threshold 3;
         redundancy-group 0 {
@@ -161,7 +158,6 @@ chassis {
             interface-monitor {
                 reth0 weight 255;
                 reth1 weight 128;
-                reth2 weight 128;
             }
         }
     }
@@ -195,19 +191,14 @@ configuration-synchronize;
 | mgmt | mgmt0 | ssh, ping, dhcp |
 | control | hb0, fab0 | ping |
 | wan | reth0 | ping |
-| lan1 | reth1 | ssh, ping, dhcp |
-| lan2 | reth2 | ssh, ping |
+| lan | reth1 | ssh, ping, dhcp |
 
 ### Policies
 
 | From | To | Action | Notes |
 |------|----|--------|-------|
-| lan1 | wan | permit + SNAT | Internet access from LAN1 |
-| lan2 | wan | permit + SNAT | Internet access from LAN2 |
-| lan1 | lan2 | permit | Inter-LAN |
-| lan2 | lan1 | permit | Inter-LAN |
-| wan | lan1 | deny | Default deny inbound |
-| wan | lan2 | deny | Default deny inbound |
+| lan | wan | permit + SNAT | Internet access from LAN |
+| wan | lan | deny | Default deny inbound |
 | default | * | deny-all | Global default |
 
 ### NAT
@@ -216,16 +207,8 @@ configuration-synchronize;
 security {
     nat {
         source {
-            rule-set lan1-to-wan {
-                from zone lan1;
-                to zone wan;
-                rule snat-masq {
-                    match { source-address 0.0.0.0/0; }
-                    then { source-nat interface; }
-                }
-            }
-            rule-set lan2-to-wan {
-                from zone lan2;
+            rule-set lan-to-wan {
+                from zone lan;
                 to zone wan;
                 rule snat-masq {
                     match { source-address 0.0.0.0/0; }
@@ -253,7 +236,7 @@ routing-options {
 system {
     services {
         dhcp-local-server {
-            group lan1-pool {
+            group lan-pool {
                 interface reth1;
             }
         }
@@ -261,7 +244,7 @@ system {
 }
 access {
     address-assignment {
-        pool lan1-pool {
+        pool lan-pool {
             family inet {
                 network 10.0.60.0/24;
                 range clients {
@@ -282,7 +265,7 @@ access {
 ### 1. Create Networks
 
 ```bash
-for net in bpfrx-ha-heartbeat bpfrx-ha-fabric bpfrx-ha-lan1 bpfrx-ha-lan2; do
+for net in bpfrx-ha-heartbeat bpfrx-ha-fabric bpfrx-ha-lan; do
     incus network create "$net" \
         ipv4.address=none ipv4.nat=false \
         ipv6.address=none ipv6.nat=false
@@ -299,8 +282,8 @@ incus profile device add bpfrx-ha-cluster root disk pool=default path=/ size=20G
 incus profile device add bpfrx-ha-cluster eth0 nic network=incusbr0 name=enp5s0
 incus profile device add bpfrx-ha-cluster eth1 nic network=bpfrx-ha-heartbeat name=enp6s0
 incus profile device add bpfrx-ha-cluster eth2 nic network=bpfrx-ha-fabric name=enp7s0
-incus profile device add bpfrx-ha-cluster eth3 nic network=bpfrx-ha-lan1 name=enp8s0
-incus profile device add bpfrx-ha-cluster eth4 nic network=bpfrx-ha-lan2 name=enp9s0
+incus profile device add bpfrx-ha-cluster eth3 nic network=bpfrx-ha-lan name=enp8s0
+incus profile device add bpfrx-ha-cluster eth4 nic network=bpfrx-ha-lan name=enp9s0
 ```
 
 ### 3. Launch VMs
@@ -326,21 +309,14 @@ On each VM:
 
 ```bash
 incus launch images:debian/13 ha-lan-host
-incus network attach bpfrx-ha-lan1 ha-lan-host eth1
-incus network attach bpfrx-ha-lan2 ha-lan-host eth2
+incus network attach bpfrx-ha-lan ha-lan-host eth1
 ```
 
 Configure inside container:
 ```bash
-# LAN1 interface
 ip addr add 10.0.60.102/24 dev eth1
 ip link set eth1 up
 ip route add default via 10.0.60.1
-
-# LAN2 interface
-ip addr add 10.0.70.102/24 dev eth2
-ip link set eth2 up
-ip route add 10.0.70.0/24 dev eth2
 ```
 
 ### 6. Deploy bpfrxd
@@ -376,9 +352,9 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw0 -- cli
 - Heartbeat state: "up"
 - Both RETH interfaces active on fw0
 
-### TC-2: LAN1 Connectivity Through Cluster
+### TC-2: LAN Connectivity Through Cluster
 
-**Objective:** Verify traffic flows from LAN1 container through the primary firewall to WAN.
+**Objective:** Verify traffic flows from LAN container through the primary firewall to WAN.
 
 ```bash
 # From ha-lan-host:
@@ -395,34 +371,33 @@ printf 'show security flow session\nexit\n' | incus exec bpfrx-fw0 -- cli
 - Sessions visible on fw0 (primary)
 - SNAT applied for WAN-bound traffic
 
-### TC-3: LAN2 Connectivity Through Cluster
+### TC-3: RETH1 Link Redundancy
 
-**Objective:** Verify LAN2 segment independently routes through the cluster.
+**Objective:** Verify reth1 survives loss of one LAN member link.
 
 ```bash
-# From ha-lan-host via LAN2:
-ping -I 10.0.70.102 -c 5 10.0.70.1    # reth2 VIP
+# 1. Start continuous ping from ha-lan-host
+incus exec ha-lan-host -- ping 10.0.60.1 &
+
+# 2. Detach one LAN interface from fw0 (simulate link failure)
+incus config device remove bpfrx-fw0 eth4
+
+# 3. Verify ping continues (reth1 bond uses surviving lan0)
+sleep 5
+
+# 4. Check RETH status
+printf 'show chassis cluster interfaces\nexit\n' | incus exec bpfrx-fw0 -- cli
+
+# 5. Restore link
+incus config device add bpfrx-fw0 eth4 nic network=bpfrx-ha-lan name=enp9s0
 ```
 
 **Pass criteria:**
-- reth2 VIP reachable from ha-lan-host
-- Traffic uses LAN2 path (reth2)
+- Ping continues without interruption when one member is removed
+- reth1 stays up with degraded member count
+- Traffic resumes on both members after restoration
 
-### TC-4: Inter-LAN Traffic
-
-**Objective:** Verify LAN1 <-> LAN2 traffic flows through the firewall.
-
-```bash
-# From ha-lan-host, test reaching LAN2 gateway from LAN1 source
-# (Since ha-lan-host has both interfaces, use routing to verify)
-ping -I 10.0.60.102 -c 5 10.0.70.1
-```
-
-**Pass criteria:**
-- Traffic crosses firewall between LAN zones
-- Policy permits inter-LAN traffic
-
-### TC-5: Failover — Primary Failure
+### TC-4: Failover — Primary Failure
 
 **Objective:** Verify secondary takes over when primary fails.
 
@@ -444,11 +419,11 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
 
 **Pass criteria:**
 - fw1 becomes primary within ~5 seconds
-- GARP sent for reth0, reth1, reth2 VIPs
+- GARP sent for reth0, reth1 VIPs
 - ha-lan-host traffic resumes after brief interruption
 - Sessions synced from fw0 survive on fw1
 
-### TC-6: Failover — Recovery and Preemption
+### TC-5: Failover — Recovery and Preemption
 
 **Objective:** Verify original primary reclaims after recovery (preempt enabled).
 
@@ -468,23 +443,23 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw0 -- cli
 - Traffic continues without prolonged outage
 - Session state synced back
 
-### TC-7: Config Synchronization
+### TC-6: Config Synchronization
 
 **Objective:** Verify config changes on primary replicate to secondary.
 
 ```bash
 # 1. On fw0 (primary), add a policy:
-printf 'configure\nset security policies from-zone lan1 to-zone wan policy test-sync match source-address any destination-address any application any then permit\ncommit\nexit\nexit\n' | incus exec bpfrx-fw0 -- cli
+printf 'configure\nset security policies from-zone lan to-zone wan policy test-sync match source-address any destination-address any application any then permit\ncommit\nexit\nexit\n' | incus exec bpfrx-fw0 -- cli
 
 # 2. On fw1, verify config arrived:
-printf 'show configuration security policies from-zone lan1 to-zone wan | display set\nexit\n' | incus exec bpfrx-fw1 -- cli
+printf 'show configuration security policies from-zone lan to-zone wan | display set\nexit\n' | incus exec bpfrx-fw1 -- cli
 ```
 
 **Pass criteria:**
 - Policy `test-sync` appears on fw1 within seconds
 - fw1 shows config as read-only (secondary cannot modify)
 
-### TC-8: Session Synchronization
+### TC-7: Session Synchronization
 
 **Objective:** Verify active sessions are synced to secondary for hitless failover.
 
@@ -503,7 +478,7 @@ printf 'show security flow session\nexit\n' | incus exec bpfrx-fw1 -- cli
 - Session appears on both fw0 and fw1
 - Session on fw1 matches fw0 (IPs, ports, NAT state)
 
-### TC-9: RETH Interface Monitor Failover
+### TC-8: RETH Interface Monitor Failover
 
 **Objective:** Verify failover when a monitored RETH member loses link.
 
@@ -520,7 +495,7 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
 - fw1 becomes primary if fw0 weight falls below fw1
 - Traffic fails over to fw1's WAN VF
 
-### TC-10: Throughput Under HA
+### TC-9: Throughput Under HA
 
 **Objective:** Measure forwarding throughput through the HA cluster.
 
@@ -535,7 +510,7 @@ incus exec ha-lan-host -- iperf3 -c <target> -P 4 -t 30 -C bbr
 - No packet loss during steady state
 - Compare with/without HA overhead
 
-### TC-11: DHCP Server on reth1
+### TC-10: DHCP Server on reth1
 
 **Objective:** Verify ha-lan-host can obtain an address via DHCP from the primary.
 
@@ -548,7 +523,7 @@ incus exec ha-lan-host -- ip addr show eth1
 - Lease obtained from 10.0.60.100-199 range
 - Gateway set to 10.0.60.1 (reth1 VIP)
 
-### TC-12: Split-Brain Prevention
+### TC-11: Split-Brain Prevention
 
 **Objective:** Verify cluster handles heartbeat network failure gracefully.
 
