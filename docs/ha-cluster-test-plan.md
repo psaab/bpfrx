@@ -6,7 +6,7 @@ Two VMs running bpfrxd in chassis cluster (active/passive) mode with:
 - **WAN**: SR-IOV VFs from `eno6np1` (i40e, one VF per VM, bonded into reth0)
 - **LAN**: One bridged network (one interface per VM, bonded into reth1)
 - **Heartbeat**: Dedicated bridge for cluster health monitoring (UDP:4784)
-- **Fabric**: Dedicated bridge for session sync, config sync, IPsec SA sync (TCP)
+- **Fabric**: Dedicated link between VMs for session sync, config sync, IPsec SA sync (TCP)
 - **Test host**: Container on LAN for end-to-end traffic validation
 
 ## Physical Host
@@ -43,9 +43,10 @@ Host NIC: eno6np1 (i40e, Intel X710)
                  |                  |
                  +------+  +-------+
                         |  |
-           bpfrx-ha-heartbeat  (10.99.0.0/30)
-           bpfrx-ha-fabric     (10.99.1.0/30)
-           bpfrx-ha-lan        (reth1: 10.0.60.0/24)
+           incusbr0              (mgmt0, DHCP)
+           bpfrx-ha-heartbeat   (hb0, 10.99.0.0/30)
+           bpfrx-ha-fabric      (fab0, 10.99.1.0/30)
+           bpfrx-ha-lan         (reth1: 10.0.60.0/24)
 
               +------------------+
               |  ha-lan-host     |
@@ -63,10 +64,10 @@ whichever VM is primary, same as reth0 for WAN.
 
 | Network | Purpose | Incus Config |
 |---------|---------|-------------|
+| `incusbr0` | Management (existing, DHCP) | default |
 | `bpfrx-ha-heartbeat` | Cluster heartbeat (UDP:4784) | ipv4.address=none, ipv6.address=none |
 | `bpfrx-ha-fabric` | Session/config/IPsec sync (TCP) | ipv4.address=none, ipv6.address=none |
 | `bpfrx-ha-lan` | LAN segment (reth1 member per VM) | ipv4.address=none, ipv6.address=none |
-| `incusbr0` | Management (existing, DHCP) | default |
 
 ### Profile: `bpfrx-ha-cluster`
 
@@ -80,7 +81,7 @@ Disk:   20 GB (pool: default)
 |--------|-------------|---------|---------|
 | `eth0` | enp5s0 | incusbr0 | Management (DHCP) |
 | `eth1` | enp6s0 | bpfrx-ha-heartbeat | Heartbeat |
-| `eth2` | enp7s0 | bpfrx-ha-fabric | Fabric |
+| `eth2` | enp7s0 | bpfrx-ha-fabric | Fabric sync |
 | `eth3` | enp8s0 | bpfrx-ha-lan | LAN (reth1 member) |
 
 SR-IOV WAN device added per-VM after launch:
