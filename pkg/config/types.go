@@ -915,6 +915,7 @@ type StaticNATRule struct {
 	Match         string // destination-address (external/public IP)
 	SourceAddress string // source-address match (optional, e.g. "::/0" for NAT64)
 	Then          string // static-nat prefix (internal/private IP), or "inet" for NAT64
+	IsNPTv6       bool   // true if this is an nptv6-prefix rule (RFC 6296)
 }
 
 // ScreenProfile defines IDS screening options.

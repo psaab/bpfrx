@@ -4818,9 +4818,37 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 				for _, rule := range rs.Rules {
 					fmt.Fprintf(&buf, "  Rule: %s\n", rule.Name)
 					fmt.Fprintf(&buf, "    Match destination-address: %s\n", rule.Match)
-					fmt.Fprintf(&buf, "    Then static-nat prefix:    %s\n", rule.Then)
+					if rule.IsNPTv6 {
+						fmt.Fprintf(&buf, "    Then nptv6-prefix:         %s\n", rule.Then)
+					} else {
+						fmt.Fprintf(&buf, "    Then static-nat prefix:    %s\n", rule.Then)
+					}
 				}
 				buf.WriteString("\n")
+			}
+		}
+
+	case "nat-nptv6":
+		if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
+			buf.WriteString("No NPTv6 rules configured.\n")
+		} else {
+			found := false
+			for _, rs := range cfg.Security.NAT.Static {
+				for _, rule := range rs.Rules {
+					if !rule.IsNPTv6 {
+						continue
+					}
+					if !found {
+						fmt.Fprintf(&buf, "%-20s %-20s %-50s %-50s\n",
+							"Rule-set", "Rule", "External prefix", "Internal prefix")
+						found = true
+					}
+					fmt.Fprintf(&buf, "%-20s %-20s %-50s %-50s\n",
+						rs.Name, rule.Name, rule.Match, rule.Then)
+				}
+			}
+			if !found {
+				buf.WriteString("No NPTv6 rules configured.\n")
 			}
 		}
 

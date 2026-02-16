@@ -253,6 +253,19 @@ type bpfrxXdpNat64NatPortCounter struct {
 	Counter uint64
 }
 
+type bpfrxXdpNat64Nptv6Key struct {
+	_         structs.HostLayout
+	Prefix    [6]uint8
+	Direction uint8
+	Pad       uint8
+}
+
+type bpfrxXdpNat64Nptv6Value struct {
+	_          structs.HostLayout
+	XlatPrefix [6]uint8
+	Adjustment uint16
+}
+
 type bpfrxXdpNat64PktMeta struct {
 	_     structs.HostLayout
 	SrcIp struct {
@@ -625,6 +638,7 @@ type bpfrxXdpNat64MapSpecs struct {
 	NatPoolIpsV6      *ebpf.MapSpec `ebpf:"nat_pool_ips_v6"`
 	NatPortCounters   *ebpf.MapSpec `ebpf:"nat_port_counters"`
 	NatRuleCounters   *ebpf.MapSpec `ebpf:"nat_rule_counters"`
+	Nptv6Rules        *ebpf.MapSpec `ebpf:"nptv6_rules"`
 	PktMetaScratch    *ebpf.MapSpec `ebpf:"pkt_meta_scratch"`
 	PolicerConfigs    *ebpf.MapSpec `ebpf:"policer_configs"`
 	PolicerStates     *ebpf.MapSpec `ebpf:"policer_states"`
@@ -709,6 +723,7 @@ type bpfrxXdpNat64Maps struct {
 	NatPoolIpsV6      *ebpf.Map `ebpf:"nat_pool_ips_v6"`
 	NatPortCounters   *ebpf.Map `ebpf:"nat_port_counters"`
 	NatRuleCounters   *ebpf.Map `ebpf:"nat_rule_counters"`
+	Nptv6Rules        *ebpf.Map `ebpf:"nptv6_rules"`
 	PktMetaScratch    *ebpf.Map `ebpf:"pkt_meta_scratch"`
 	PolicerConfigs    *ebpf.Map `ebpf:"policer_configs"`
 	PolicerStates     *ebpf.Map `ebpf:"policer_states"`
@@ -769,6 +784,7 @@ func (m *bpfrxXdpNat64Maps) Close() error {
 		m.NatPoolIpsV6,
 		m.NatPortCounters,
 		m.NatRuleCounters,
+		m.Nptv6Rules,
 		m.PktMetaScratch,
 		m.PolicerConfigs,
 		m.PolicerStates,

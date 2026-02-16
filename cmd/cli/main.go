@@ -1210,6 +1210,8 @@ func (c *ctl) handleShowNAT(args []string) error {
 	switch args[0] {
 	case "static":
 		return c.showText("nat-static")
+	case "nptv6":
+		return c.showText("nat-nptv6")
 	case "source":
 		if len(args) >= 2 && args[1] == "summary" {
 			return c.showNATSourceSummary()

@@ -1671,6 +1671,13 @@ func (m *Manager) DeleteStaleStaticNAT(writtenV4 map[dataplane.StaticNATKeyV4]bo
 	})
 }
 
+func (m *Manager) SetNPTv6Rule(key dataplane.NPTv6Key, val dataplane.NPTv6Value) error {
+	// TODO: implement DPDK NPTv6 support when needed
+	return nil
+}
+
+func (m *Manager) DeleteStaleNPTv6(_ map[dataplane.NPTv6Key]bool) {}
+
 func (m *Manager) DeleteStaleNAT64(count uint32, writtenPrefixes map[dataplane.NAT64PrefixKey]bool) {
 	shm := m.platform.shm
 	if shm == nil {

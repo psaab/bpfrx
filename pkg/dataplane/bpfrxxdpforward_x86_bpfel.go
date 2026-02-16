@@ -233,6 +233,19 @@ type bpfrxXdpForwardNat64StateValue struct {
 	Nat64Idx    uint32
 }
 
+type bpfrxXdpForwardNptv6Key struct {
+	_         structs.HostLayout
+	Prefix    [6]uint8
+	Direction uint8
+	Pad       uint8
+}
+
+type bpfrxXdpForwardNptv6Value struct {
+	_          structs.HostLayout
+	XlatPrefix [6]uint8
+	Adjustment uint16
+}
+
 type bpfrxXdpForwardPktMeta struct {
 	_     structs.HostLayout
 	SrcIp struct {
@@ -600,6 +613,7 @@ type bpfrxXdpForwardMapSpecs struct {
 	Nat64Count        *ebpf.MapSpec `ebpf:"nat64_count"`
 	Nat64PrefixMap    *ebpf.MapSpec `ebpf:"nat64_prefix_map"`
 	Nat64State        *ebpf.MapSpec `ebpf:"nat64_state"`
+	Nptv6Rules        *ebpf.MapSpec `ebpf:"nptv6_rules"`
 	PktMetaScratch    *ebpf.MapSpec `ebpf:"pkt_meta_scratch"`
 	PolicerConfigs    *ebpf.MapSpec `ebpf:"policer_configs"`
 	PolicerStates     *ebpf.MapSpec `ebpf:"policer_states"`
@@ -679,6 +693,7 @@ type bpfrxXdpForwardMaps struct {
 	Nat64Count        *ebpf.Map `ebpf:"nat64_count"`
 	Nat64PrefixMap    *ebpf.Map `ebpf:"nat64_prefix_map"`
 	Nat64State        *ebpf.Map `ebpf:"nat64_state"`
+	Nptv6Rules        *ebpf.Map `ebpf:"nptv6_rules"`
 	PktMetaScratch    *ebpf.Map `ebpf:"pkt_meta_scratch"`
 	PolicerConfigs    *ebpf.Map `ebpf:"policer_configs"`
 	PolicerStates     *ebpf.Map `ebpf:"policer_states"`
@@ -734,6 +749,7 @@ func (m *bpfrxXdpForwardMaps) Close() error {
 		m.Nat64Count,
 		m.Nat64PrefixMap,
 		m.Nat64State,
+		m.Nptv6Rules,
 		m.PktMetaScratch,
 		m.PolicerConfigs,
 		m.PolicerStates,

@@ -3968,6 +3968,8 @@ func (c *CLI) handleShowNAT(args []string) error {
 		return c.showNATStatic(cfg)
 	case "nat64":
 		return c.showNAT64(cfg)
+	case "nptv6":
+		return c.showNPTv6(cfg)
 	default:
 		return fmt.Errorf("unknown show security nat target: %s", args[0])
 	}
@@ -4887,7 +4889,11 @@ func (c *CLI) showNATStatic(cfg *config.Config) error {
 		for _, rule := range rs.Rules {
 			fmt.Printf("  Rule: %s\n", rule.Name)
 			fmt.Printf("    Match destination-address: %s\n", rule.Match)
-			fmt.Printf("    Then static-nat prefix:    %s\n", rule.Then)
+			if rule.IsNPTv6 {
+				fmt.Printf("    Then nptv6-prefix:         %s\n", rule.Then)
+			} else {
+				fmt.Printf("    Then static-nat prefix:    %s\n", rule.Then)
+			}
 		}
 		fmt.Println()
 	}
@@ -4912,6 +4918,33 @@ func (c *CLI) showNAT64(cfg *config.Config) error {
 		fmt.Println()
 	}
 
+	return nil
+}
+
+func (c *CLI) showNPTv6(cfg *config.Config) error {
+	if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
+		fmt.Println("No NPTv6 rules configured.")
+		return nil
+	}
+
+	found := false
+	for _, rs := range cfg.Security.NAT.Static {
+		for _, rule := range rs.Rules {
+			if !rule.IsNPTv6 {
+				continue
+			}
+			if !found {
+				fmt.Printf("%-20s %-20s %-50s %-50s\n",
+					"Rule-set", "Rule", "External prefix", "Internal prefix")
+				found = true
+			}
+			fmt.Printf("%-20s %-20s %-50s %-50s\n",
+				rs.Name, rule.Name, rule.Match, rule.Then)
+		}
+	}
+	if !found {
+		fmt.Println("No NPTv6 rules configured.")
+	}
 	return nil
 }
 

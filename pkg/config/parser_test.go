@@ -12745,6 +12745,93 @@ func TestStaticNATInetSetSyntax(t *testing.T) {
 	}
 }
 
+func TestNPTv6HierarchicalSyntax(t *testing.T) {
+	input := `
+security {
+    nat {
+        static {
+            rule-set nptv6-test {
+                from zone wan;
+                rule r1 {
+                    match {
+                        destination-address 2001:db8:100::/48;
+                    }
+                    then {
+                        static-nat {
+                            nptv6-prefix {
+                                fd01:0203:0405::/48;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	tree, errs := NewParser(input).Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Security.NAT.Static) != 1 {
+		t.Fatalf("expected 1 static rule-set, got %d", len(cfg.Security.NAT.Static))
+	}
+	rs := cfg.Security.NAT.Static[0]
+	if rs.FromZone != "wan" {
+		t.Errorf("from-zone = %q, want wan", rs.FromZone)
+	}
+	if len(rs.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rs.Rules))
+	}
+	rule := rs.Rules[0]
+	if !rule.IsNPTv6 {
+		t.Error("expected IsNPTv6 = true")
+	}
+	if rule.Match != "2001:db8:100::/48" {
+		t.Errorf("match = %q, want 2001:db8:100::/48", rule.Match)
+	}
+	if rule.Then != "fd01:0203:0405::/48" {
+		t.Errorf("then = %q, want fd01:0203:0405::/48", rule.Then)
+	}
+}
+
+func TestNPTv6SetSyntax(t *testing.T) {
+	lines := []string{
+		"set security nat static rule-set nptv6-rs from zone untrust",
+		"set security nat static rule-set nptv6-rs rule r1 match destination-address 2602:fd41:0070::/48",
+		"set security nat static rule-set nptv6-rs rule r1 then static-nat nptv6-prefix fd35:1940:0027::/48",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Security.NAT.Static) != 1 {
+		t.Fatalf("expected 1 static rule-set, got %d", len(cfg.Security.NAT.Static))
+	}
+	rule := cfg.Security.NAT.Static[0].Rules[0]
+	if !rule.IsNPTv6 {
+		t.Error("expected IsNPTv6 = true")
+	}
+	if rule.Match != "2602:fd41:0070::/48" {
+		t.Errorf("match = %q, want 2602:fd41:0070::/48", rule.Match)
+	}
+	if rule.Then != "fd35:1940:0027::/48" {
+		t.Errorf("then = %q, want fd35:1940:0027::/48", rule.Then)
+	}
+}
+
 func TestNATv6v4NoFragHeader(t *testing.T) {
 	input := `
 security {

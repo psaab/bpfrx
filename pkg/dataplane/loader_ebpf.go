@@ -128,6 +128,7 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["cpumap_available"] = mainObjs.CpumapAvailable
 	m.maps["policer_configs"] = mainObjs.PolicerConfigs
 	m.maps["policer_states"] = mainObjs.PolicerStates
+	m.maps["nptv6_rules"] = mainObjs.Nptv6Rules
 
 	// Store main program.
 	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
@@ -179,6 +180,7 @@ func (m *Manager) loadAllObjects() error {
 			"cpumap_available":   mainObjs.CpumapAvailable,
 			"policer_configs":    mainObjs.PolicerConfigs,
 			"policer_states":     mainObjs.PolicerStates,
+			"nptv6_rules":        mainObjs.Nptv6Rules,
 		},
 	}
 

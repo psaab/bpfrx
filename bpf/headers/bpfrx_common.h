@@ -191,6 +191,7 @@ struct icmp6hdr {
 #define SESS_FLAG_PREDICTED    (1 << 5)
 #define SESS_FLAG_STATIC_NAT   (1 << 6)
 #define SESS_FLAG_NAT64        (1 << 7)
+#define SESS_FLAG_NPTV6        (1 << 8)
 
 /* pkt_meta.meta_flags bits */
 #define META_FLAG_EMBEDDED_ICMP  (1 << 0)

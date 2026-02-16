@@ -556,6 +556,39 @@ struct {
 } static_nat_v6 SEC(".maps");
 
 /* ============================================================
+ * NPTv6 prefix translation (RFC 6296)
+ * ============================================================ */
+
+#define MAX_NPTV6_RULES 128
+
+/* Direction constants for NPTv6 */
+#define NPTV6_INBOUND  0  /* external → internal (rewrite dst) */
+#define NPTV6_OUTBOUND 1  /* internal → external (rewrite src) */
+
+/* Key: 48-bit prefix (3 x 16-bit words) + direction.
+ * For /48 prefixes (the common case), we store the first 6 bytes. */
+struct nptv6_key {
+	__u8 prefix[6];    /* first 48 bits of the IPv6 address */
+	__u8 direction;    /* NPTV6_INBOUND or NPTV6_OUTBOUND */
+	__u8 pad;
+};
+
+/* Value: translation prefix + precomputed adjustment for word[3].
+ * The adjustment is computed at config time per RFC 6296. */
+struct nptv6_value {
+	__u8  xlat_prefix[6]; /* replacement prefix (first 48 bits) */
+	__u16 adjustment;     /* ones'-complement adjustment (network byte order) */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_NPTV6_RULES);
+	__type(key, struct nptv6_key);
+	__type(value, struct nptv6_value);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} nptv6_rules SEC(".maps");
+
+/* ============================================================
  * Default policy (global fallback when no zone-pair policy exists)
  * ============================================================ */
 

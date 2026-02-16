@@ -10,6 +10,7 @@
 #include "../headers/bpfrx_common.h"
 #include "../headers/bpfrx_maps.h"
 #include "../headers/bpfrx_helpers.h"
+#include "../headers/bpfrx_nat.h"
 #include "../headers/bpfrx_trace.h"
 
 /*
@@ -288,6 +289,18 @@ int xdp_zone_prog(struct xdp_md *ctx)
 				meta->nat_dst_port = meta->dst_port;
 				__builtin_memcpy(meta->dst_ip.v6, sn_dst6->ip, 16);
 				meta->nat_flags |= SESS_FLAG_DNAT;
+			} else {
+				/* NPTv6 (RFC 6296) inbound: external → internal prefix translation.
+				 * Stateless: rewrite dst prefix + adjust word[3], no checksum update. */
+				struct nptv6_key nk = { .direction = NPTV6_INBOUND };
+				__builtin_memcpy(nk.prefix, meta->dst_ip.v6, 6);
+				struct nptv6_value *nv = bpf_map_lookup_elem(&nptv6_rules, &nk);
+				if (nv) {
+					__builtin_memcpy(meta->nat_dst_ip.v6, meta->dst_ip.v6, 16);
+					meta->nat_dst_port = meta->dst_port;
+					nptv6_translate(meta->dst_ip.v6, nv, NPTV6_INBOUND);
+					meta->nat_flags |= SESS_FLAG_DNAT | SESS_FLAG_NPTV6;
+				}
 			}
 		}
 	}

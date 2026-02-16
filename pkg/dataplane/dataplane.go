@@ -124,6 +124,10 @@ type DataPlane interface {
 	SetStaticNATEntryV6(ip [16]byte, direction uint8, translated [16]byte) error
 	ClearStaticNATEntries() error
 
+	// NPTv6 (RFC 6296)
+	SetNPTv6Rule(key NPTv6Key, val NPTv6Value) error
+	DeleteStaleNPTv6(written map[NPTv6Key]bool)
+
 	// NAT64
 	SetNAT64Config(index uint32, cfg NAT64Config) error
 	SetNAT64Count(count uint32) error

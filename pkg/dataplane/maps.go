@@ -1433,6 +1433,38 @@ func (m *Manager) DeleteStaleStaticNAT(writtenV4 map[StaticNATKeyV4]bool, writte
 	}
 }
 
+// SetNPTv6Rule writes an NPTv6 prefix translation rule.
+func (m *Manager) SetNPTv6Rule(key NPTv6Key, val NPTv6Value) error {
+	zm, ok := m.maps["nptv6_rules"]
+	if !ok {
+		return fmt.Errorf("nptv6_rules map not found")
+	}
+	return zm.Update(key, val, ebpf.UpdateAny)
+}
+
+// DeleteStaleNPTv6 removes nptv6_rules entries not in the written set.
+func (m *Manager) DeleteStaleNPTv6(written map[NPTv6Key]bool) {
+	zm, ok := m.maps["nptv6_rules"]
+	if !ok {
+		return
+	}
+	var key NPTv6Key
+	var val []byte
+	iter := zm.Iterate()
+	var stale []NPTv6Key
+	for iter.Next(&key, &val) {
+		if !written[key] {
+			stale = append(stale, key)
+		}
+	}
+	for _, k := range stale {
+		zm.Delete(k)
+	}
+	if len(stale) > 0 {
+		slog.Info("deleted stale nptv6_rules entries", "count", len(stale))
+	}
+}
+
 // DeleteStaleNAT64 zeroes stale nat64_configs entries and removes stale prefix map entries.
 func (m *Manager) DeleteStaleNAT64(count uint32, writtenPrefixes map[NAT64PrefixKey]bool) {
 	if zm, ok := m.maps["nat64_configs"]; ok {

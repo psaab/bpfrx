@@ -1800,7 +1800,15 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 			if thenNode != nil {
 				for _, t := range thenNode.Children {
 					if t.Name() == "static-nat" {
-						if len(t.Keys) >= 3 && t.Keys[1] == "prefix" {
+						if len(t.Keys) >= 3 && t.Keys[1] == "nptv6-prefix" {
+							// set ... then static-nat nptv6-prefix PREFIX
+							rule.Then = t.Keys[2]
+							rule.IsNPTv6 = true
+						} else if np := t.FindChild("nptv6-prefix"); np != nil {
+							// static-nat { nptv6-prefix { PREFIX; } }
+							rule.Then = nodeVal(np)
+							rule.IsNPTv6 = true
+						} else if len(t.Keys) >= 3 && t.Keys[1] == "prefix" {
 							rule.Then = t.Keys[2]
 						} else if pn := t.FindChild("prefix"); pn != nil {
 							rule.Then = nodeVal(pn)

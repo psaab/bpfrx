@@ -262,6 +262,7 @@ var OperationalTree = map[string]*Node{
 					"rule-set": {Desc: "Show destination NAT rule sets"},
 				}},
 				"static": {Desc: "Show static NAT"},
+				"nptv6":  {Desc: "Show NPTv6 prefix translation rules"},
 				"nat64":  {Desc: "Show NAT64 rules"},
 			}},
 			"address-book": {Desc: "Show address book entries"},

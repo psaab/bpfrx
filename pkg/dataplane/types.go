@@ -403,6 +403,25 @@ const (
 	StaticNATSNAT = 1
 )
 
+// NPTv6 direction constants (RFC 6296).
+const (
+	NPTv6Inbound  = 0 // external → internal (rewrite dst)
+	NPTv6Outbound = 1 // internal → external (rewrite src)
+)
+
+// NPTv6Key mirrors the C struct nptv6_key.
+type NPTv6Key struct {
+	Prefix    [6]byte // first 48 bits of IPv6 address
+	Direction uint8   // NPTv6Inbound or NPTv6Outbound
+	Pad       uint8
+}
+
+// NPTv6Value mirrors the C struct nptv6_value.
+type NPTv6Value struct {
+	XlatPrefix [6]byte // replacement prefix (first 48 bits)
+	Adjustment uint16  // ones'-complement adjustment (network byte order)
+}
+
 // DNAT table flags.
 const (
 	DNATFlagDynamic = 0 // dynamic/SNAT-return entry

@@ -135,6 +135,11 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		return nil, fmt.Errorf("compile nat64: %w", err)
 	}
 
+	// Phase 6.7: Compile NPTv6 (RFC 6296) prefix translation rules
+	if err := compileNPTv6(dp, cfg); err != nil {
+		return nil, fmt.Errorf("compile nptv6: %w", err)
+	}
+
 	// Phase 7: Compile screen profiles
 	if err := compileScreenProfiles(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile screen profiles: %w", err)
@@ -2068,6 +2073,125 @@ func compileStaticNAT(dp DataPlane,cfg *config.Config, result *CompileResult) er
 	// Delete stale static NAT entries.
 	dp.DeleteStaleStaticNAT(writtenV4, writtenV6)
 
+	return nil
+}
+
+// nptv6Adjustment computes the RFC 6296 ones'-complement adjustment
+// from two /48 prefixes. The adjustment is stored in native byte order
+// to match how BPF reads 16-bit words from memory via pointer cast.
+//
+// Ones'-complement arithmetic is endian-independent, so the computation
+// can use either byte order as long as it's consistent. We use native
+// (little-endian on x86) since BPF reads `__u16 *w = (__u16 *)addr`
+// in native order.
+func nptv6Adjustment(internal, external [6]byte) uint16 {
+	// Read prefix words in native byte order (same as BPF __u16* cast).
+	// On little-endian: bytes [0,1] → w[0] = byte[1]<<8 | byte[0]
+	readWord := func(b []byte) uint16 {
+		return uint16(b[1])<<8 | uint16(b[0])
+	}
+
+	var sumInt uint32
+	sumInt += uint32(readWord(internal[0:2]))
+	sumInt += uint32(readWord(internal[2:4]))
+	sumInt += uint32(readWord(internal[4:6]))
+	sumInt = (sumInt & 0xFFFF) + (sumInt >> 16)
+	sumInt = (sumInt & 0xFFFF) + (sumInt >> 16)
+
+	var sumExt uint32
+	sumExt += uint32(readWord(external[0:2]))
+	sumExt += uint32(readWord(external[2:4]))
+	sumExt += uint32(readWord(external[4:6]))
+	sumExt = (sumExt & 0xFFFF) + (sumExt >> 16)
+	sumExt = (sumExt & 0xFFFF) + (sumExt >> 16)
+
+	// For outbound (internal→external), prefix sum changes by (S_ext - S_int).
+	// To maintain checksum neutrality, subtract that from word[3]:
+	//   w3_new = w3 - (S_ext - S_int) = w3 + (S_int - S_ext)
+	// So: adjustment = S_int - S_ext = ~S_ext +' S_int
+	adj := uint32(^uint16(sumExt)) + uint32(uint16(sumInt))
+	adj = (adj & 0xFFFF) + (adj >> 16)
+	adj = (adj & 0xFFFF) + (adj >> 16)
+
+	return uint16(adj)
+}
+
+func compileNPTv6(dp DataPlane, cfg *config.Config) error {
+	written := make(map[NPTv6Key]bool)
+	count := 0
+
+	for _, rs := range cfg.Security.NAT.Static {
+		for _, rule := range rs.Rules {
+			if !rule.IsNPTv6 || rule.Match == "" || rule.Then == "" {
+				continue
+			}
+
+			// Parse external prefix (match destination-address)
+			extIP, extNet, err := net.ParseCIDR(rule.Match)
+			if err != nil {
+				slog.Warn("nptv6: invalid match prefix", "addr", rule.Match, "err", err)
+				continue
+			}
+			extOnes, _ := extNet.Mask.Size()
+
+			// Parse internal prefix (nptv6-prefix)
+			intIP, intNet, err := net.ParseCIDR(rule.Then)
+			if err != nil {
+				slog.Warn("nptv6: invalid nptv6-prefix", "addr", rule.Then, "err", err)
+				continue
+			}
+			intOnes, _ := intNet.Mask.Size()
+
+			// Validate: both must be /48 IPv6
+			if extOnes != 48 || intOnes != 48 {
+				slog.Warn("nptv6: only /48 prefix length supported",
+					"external", rule.Match, "internal", rule.Then)
+				continue
+			}
+			ext16 := extIP.To16()
+			int16 := intIP.To16()
+			if ext16 == nil || int16 == nil {
+				slog.Warn("nptv6: prefixes must be IPv6",
+					"external", rule.Match, "internal", rule.Then)
+				continue
+			}
+
+			// Extract first 6 bytes (48 bits)
+			var extPrefix, intPrefix [6]byte
+			copy(extPrefix[:], ext16[:6])
+			copy(intPrefix[:], int16[:6])
+
+			// Compute adjustment
+			adj := nptv6Adjustment(intPrefix, extPrefix)
+
+			// Inbound entry: external prefix → internal prefix (rewrite dst)
+			inKey := NPTv6Key{Prefix: extPrefix, Direction: NPTv6Inbound}
+			inVal := NPTv6Value{XlatPrefix: intPrefix, Adjustment: adj}
+			if err := dp.SetNPTv6Rule(inKey, inVal); err != nil {
+				return fmt.Errorf("set nptv6 inbound %s: %w", rule.Name, err)
+			}
+			written[inKey] = true
+
+			// Outbound entry: internal prefix → external prefix (rewrite src)
+			outKey := NPTv6Key{Prefix: intPrefix, Direction: NPTv6Outbound}
+			outVal := NPTv6Value{XlatPrefix: extPrefix, Adjustment: adj}
+			if err := dp.SetNPTv6Rule(outKey, outVal); err != nil {
+				return fmt.Errorf("set nptv6 outbound %s: %w", rule.Name, err)
+			}
+			written[outKey] = true
+
+			count++
+			slog.Info("nptv6 rule compiled",
+				"rule-set", rs.Name, "rule", rule.Name,
+				"external", rule.Match, "internal", rule.Then)
+		}
+	}
+
+	if count > 0 {
+		slog.Info("nptv6 compilation complete", "rules", count)
+	}
+
+	dp.DeleteStaleNPTv6(written)
 	return nil
 }
 

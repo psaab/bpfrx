@@ -194,6 +194,11 @@ func (m *Manager) SetStaticNATEntryV6(ip [16]byte, direction uint8, translated [
 
 func (m *Manager) ClearStaticNATEntries() error { return nil }
 
+// --- NPTv6 ---
+
+func (m *Manager) SetNPTv6Rule(key dataplane.NPTv6Key, val dataplane.NPTv6Value) error { return nil }
+func (m *Manager) DeleteStaleNPTv6(_ map[dataplane.NPTv6Key]bool)                      {}
+
 // --- NAT64 ---
 
 func (m *Manager) SetNAT64Config(index uint32, cfg dataplane.NAT64Config) error { return nil }
