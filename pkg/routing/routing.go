@@ -1506,20 +1506,32 @@ func (m *Manager) ApplyRethInterfaces(interfaces map[string]*config.InterfaceCon
 	return nil
 }
 
-// ClearRethInterfaces removes all previously created RETH bond devices.
+// ClearRethInterfaces removes all RETH bond devices from the system.
+// It scans for any existing reth* bond devices (including stale ones from
+// previous binary versions) and deletes them.
 func (m *Manager) ClearRethInterfaces() error {
-	for _, name := range m.reths {
-		link, err := m.nlHandle.LinkByName(name)
-		if err != nil {
-			continue // already gone
+	// First, clear any tracked names from this session.
+	m.reths = nil
+
+	// Scan all links for reth* bond devices left from previous deploys.
+	links, err := m.nlHandle.LinkList()
+	if err != nil {
+		return fmt.Errorf("listing links: %w", err)
+	}
+	for _, link := range links {
+		name := link.Attrs().Name
+		if !strings.HasPrefix(name, "reth") {
+			continue
+		}
+		if _, ok := link.(*netlink.Bond); !ok {
+			continue // not a bond device
 		}
 		if err := m.nlHandle.LinkDel(link); err != nil {
-			slog.Warn("failed to delete RETH", "name", name, "err", err)
+			slog.Warn("failed to delete RETH bond", "name", name, "err", err)
 		} else {
-			slog.Info("RETH removed", "name", name)
+			slog.Info("RETH bond removed", "name", name)
 		}
 	}
-	m.reths = nil
 	return nil
 }
 
