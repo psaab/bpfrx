@@ -1,5 +1,14 @@
 package config
 
+import "strings"
+
+// LinuxIfName translates a Junos-style interface name (e.g. "ge-0/0/0")
+// to a valid Linux interface name (e.g. "ge-0-0-0"). Linux IFNAMSIZ
+// forbids "/" so we replace with "-".
+func LinuxIfName(name string) string {
+	return strings.ReplaceAll(name, "/", "-")
+}
+
 // Config is the top-level typed configuration, compiled from the AST.
 type Config struct {
 	Security          SecurityConfig

@@ -244,15 +244,16 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 
 // resolveInterfaceRef parses an interface reference like "enp6s0" or "enp6s0.100"
 // and returns the physical interface name, unit number, and VLAN ID from config.
-func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, unitNum int, vlanID int) {
+func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, configName string, unitNum int, vlanID int) {
 	parts := strings.SplitN(ref, ".", 2)
-	physName = parts[0]
+	configName = parts[0]
+	physName = config.LinuxIfName(configName)
 	if len(parts) == 2 {
 		unitNum, _ = strconv.Atoi(parts[1])
 	}
 
-	// Look up VLAN ID from interface config
-	if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+	// Look up VLAN ID from interface config (keyed by Junos name)
+	if ifCfg, ok := cfg.Interfaces.Interfaces[configName]; ok {
 		if unit, ok := ifCfg.Units[unitNum]; ok {
 			vlanID = unit.VlanID
 		}
@@ -456,7 +457,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 
 		// Map interfaces to zone
 		for _, ifaceRef := range zone.Interfaces {
-			physName, unitNum, vlanID := resolveInterfaceRef(ifaceRef, cfg)
+			physName, cfgName, unitNum, vlanID := resolveInterfaceRef(ifaceRef, cfg)
 
 			// Get the physical interface
 			physIface, err := net.InterfaceByName(physName)
@@ -486,7 +487,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				subName := fmt.Sprintf("%s.%d", physName, vlanID)
 				var addrs []string
 				isDHCPSub := false
-				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
 					if unit, ok := ifCfg.Units[unitNum]; ok {
 						addrs = unit.Addresses
 						isDHCPSub = unit.DHCP || unit.DHCPv6
@@ -497,7 +498,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				}
 
 				// Apply unit-level MTU to VLAN sub-interface
-				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
 					if unit, ok := ifCfg.Units[unitNum]; ok && unit.MTU > 0 {
 						if nl, err := netlink.LinkByName(subName); err == nil {
 							if nl.Attrs().MTU != unit.MTU {
@@ -543,7 +544,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				}
 
 				// Apply interface-level MTU from config
-				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg.MTU > 0 {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg.MTU > 0 {
 					if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
 						if nl.Attrs().MTU != ifCfg.MTU {
 							if err := netlink.LinkSetMTU(nl, ifCfg.MTU); err != nil {
@@ -557,7 +558,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				}
 
 				// Apply interface speed/duplex via ethtool if configured
-				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
 					applyEthtool(physName, ifCfg)
 				}
 
@@ -568,7 +569,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				// driver. DPDK ports are disabled by not including them in the
 				// worker's poll set (the zone map lookup will miss, causing drop).
 				isDisabled := false
-				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg.Disable {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg.Disable {
 					isDisabled = true
 					if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
 						if err := netlink.LinkSetDown(nl); err != nil {
@@ -605,7 +606,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				var addrs []string
 				isDHCP := false
 				var unitMTU int
-				if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
 					if unit, ok := ifCfg.Units[unitNum]; ok {
 						addrs = unit.Addresses
 						isDHCP = unit.DHCP || unit.DHCPv6
@@ -645,7 +646,8 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 	// per-interface view including VLAN parent and sub-interface entries.
 	seen := make(map[string]bool)
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
-		physIface, err := net.InterfaceByName(ifName)
+		linuxName := config.LinuxIfName(ifName)
+		physIface, err := net.InterfaceByName(linuxName)
 		if err != nil {
 			continue
 		}
@@ -656,10 +658,10 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 
 		if ifCfg.VlanTagging {
 			// VLAN parent: no addresses, just rename
-			if !seen[ifName] {
-				seen[ifName] = true
+			if !seen[linuxName] {
+				seen[linuxName] = true
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
-					Name:         ifName,
+					Name:         linuxName,
 					MACAddress:   mac,
 					IsVLANParent: true,
 					Disable:      ifCfg.Disable,
@@ -672,7 +674,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 			// VLAN sub-interfaces get their own .network file
 			for _, unit := range ifCfg.Units {
 				if unit.VlanID > 0 {
-					subName := fmt.Sprintf("%s.%d", ifName, unit.VlanID)
+					subName := fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
 					if !seen[subName] {
 						seen[subName] = true
 						result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
@@ -691,8 +693,8 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 			}
 		} else {
 			// Regular interface (non-VLAN)
-			if !seen[ifName] {
-				seen[ifName] = true
+			if !seen[linuxName] {
+				seen[linuxName] = true
 				// Collect addresses from all units
 				var addrs []string
 				var dhcpv4, dhcpv6, dadDisable bool
@@ -725,7 +727,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					mtu = unitMTU
 				}
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
-					Name:             ifName,
+					Name:             linuxName,
 					MACAddress:       mac,
 					Addresses:        addrs,
 					PrimaryAddress:   primaryAddr,
@@ -2296,8 +2298,9 @@ func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) 
 }
 
 // getInterfaceIP returns the first IPv4 address of a network interface.
+// Accepts Junos-style names (ge-0/0/0) and translates to Linux names.
 func getInterfaceIP(ifaceName string) (net.IP, error) {
-	iface, err := net.InterfaceByName(ifaceName)
+	iface, err := net.InterfaceByName(config.LinuxIfName(ifaceName))
 	if err != nil {
 		return nil, fmt.Errorf("interface %s: %w", ifaceName, err)
 	}
@@ -2319,8 +2322,9 @@ func getInterfaceIP(ifaceName string) (net.IP, error) {
 }
 
 // getInterfaceIPv6 returns the first global unicast IPv6 address of a network interface.
+// Accepts Junos-style names (ge-0/0/0) and translates to Linux names.
 func getInterfaceIPv6(ifaceName string) (net.IP, error) {
-	iface, err := net.InterfaceByName(ifaceName)
+	iface, err := net.InterfaceByName(config.LinuxIfName(ifaceName))
 	if err != nil {
 		return nil, fmt.Errorf("interface %s: %w", ifaceName, err)
 	}
@@ -2628,7 +2632,7 @@ func compileFirewallFilters(dp DataPlane,cfg *config.Config, result *CompileResu
 				continue
 			}
 
-			physName := ifCfg.Name
+			physName := config.LinuxIfName(ifCfg.Name)
 			vlanID := uint16(unit.VlanID)
 
 			// Resolve ifindex

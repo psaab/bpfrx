@@ -166,7 +166,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.dhcpServer = dhcpserver.New()
 	}
 
-	// Initialize cluster manager if configured.
+	// Initialize cluster manager if configured (heartbeat/sync started after applyConfig).
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
 		cc := cfg.Chassis.Cluster
 		d.cluster = cluster.NewManager(cc.NodeID, cc.ClusterID)
@@ -174,49 +174,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cluster.Start(ctx)
 		slog.Info("cluster manager initialized",
 			"node", cc.NodeID, "cluster", cc.ClusterID)
-
-		// Start heartbeat if control-interface and peer-address are configured.
-		if cc.ControlInterface != "" && cc.PeerAddress != "" {
-			localIP := resolveInterfaceAddr(cc.ControlInterface, "")
-			if localIP != "" {
-				if err := d.cluster.StartHeartbeat(localIP, cc.PeerAddress); err != nil {
-					slog.Warn("failed to start cluster heartbeat", "err", err)
-				}
-			} else {
-				slog.Warn("cluster: control interface has no IPv4 address, heartbeat deferred",
-					"interface", cc.ControlInterface)
-			}
-		}
-
-		// Start session/config sync on fabric interface.
-		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
-			fabIP := resolveInterfaceAddr(cc.FabricInterface, "")
-			if fabIP != "" {
-				syncLocal := fmt.Sprintf("%s:4785", fabIP)
-				syncPeer := fmt.Sprintf("%s:4785", cc.FabricPeerAddress)
-				d.sessionSync = cluster.NewSessionSync(syncLocal, syncPeer, nil)
-
-				// Wire config sync callback: when secondary receives config from primary.
-				d.sessionSync.OnConfigReceived = func(configText string) {
-					d.handleConfigSync(configText)
-				}
-
-				if err := d.sessionSync.Start(ctx); err != nil {
-					slog.Warn("failed to start session sync", "err", err)
-				} else {
-					slog.Info("cluster session sync started",
-						"local", syncLocal, "peer", syncPeer)
-				}
-
-				// Start periodic IPsec SA sync if enabled.
-				if cc.IPsecSASync && d.ipsec != nil {
-					go d.syncIPsecSAPeriodic(ctx)
-				}
-			} else {
-				slog.Warn("cluster: fabric interface has no IPv4 address",
-					"interface", cc.FabricInterface)
-			}
-		}
 
 		// Watch cluster events for state transitions (primary/secondary).
 		go d.watchClusterEvents(ctx)
@@ -250,6 +207,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.applyConfig(cfg)
 			}
 		}
+	}
+
+	// Start cluster heartbeat + sync after applyConfig (needs VRF to exist).
+	if d.cluster != nil {
+		d.startClusterComms(ctx)
 	}
 
 	// Handle signals for clean shutdown.
@@ -919,7 +881,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		mgmtIfaces := make(map[string]bool)
 		for name := range cfg.Interfaces.Interfaces {
 			if strings.HasPrefix(name, "fxp") || strings.HasPrefix(name, "fab") {
-				mgmtIfaces[name] = true
+				mgmtIfaces[config.LinuxIfName(name)] = true
 			}
 		}
 		if len(mgmtIfaces) > 0 {
@@ -1019,12 +981,13 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		ifaceBandwidths := make(map[string]uint64)
 		ifaceP2P := make(map[string]bool)
 		for name, ifc := range cfg.Interfaces.Interfaces {
+			linuxName := config.LinuxIfName(name)
 			if ifc.Bandwidth > 0 {
-				ifaceBandwidths[name] = ifc.Bandwidth
+				ifaceBandwidths[linuxName] = ifc.Bandwidth
 			}
 			for _, unit := range ifc.Units {
 				if unit.PointToPoint {
-					ifaceP2P[name] = true
+					ifaceP2P[linuxName] = true
 				}
 			}
 		}
@@ -1345,9 +1308,9 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 	for ifName, ifc := range cfg.Interfaces.Interfaces {
 		for _, unit := range ifc.Units {
 			// Use VLAN sub-interface name when unit has a VLAN ID
-			dhcpIface := ifName
+			dhcpIface := config.LinuxIfName(ifName)
 			if unit.VlanID > 0 {
-				dhcpIface = fmt.Sprintf("%s.%d", ifName, unit.VlanID)
+				dhcpIface = fmt.Sprintf("%s.%d", dhcpIface, unit.VlanID)
 			}
 			if unit.DHCP {
 				if unit.DHCPOptions != nil {
@@ -2917,6 +2880,67 @@ func (d *Daemon) handleConfigSync(configText string) {
 
 // watchClusterEvents monitors cluster state transitions and toggles
 // config store read-only mode based on primary/secondary state.
+// startClusterComms starts heartbeat and session sync after VRFs are created.
+// Called after applyConfig so that control/fabric interfaces are already in
+// the management VRF (if configured).
+func (d *Daemon) startClusterComms(ctx context.Context) {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return
+	}
+	cc := cfg.Chassis.Cluster
+
+	// Determine VRF device if control/fabric interfaces are in mgmt VRF.
+	vrfDevice := ""
+	if len(d.mgmtVRFInterfaces) > 0 {
+		vrfDevice = "vrf-mgmt"
+	}
+
+	// Start heartbeat if control-interface and peer-address are configured.
+	if cc.ControlInterface != "" && cc.PeerAddress != "" {
+		localIP := resolveInterfaceAddr(cc.ControlInterface, "")
+		if localIP != "" {
+			if err := d.cluster.StartHeartbeat(localIP, cc.PeerAddress, vrfDevice); err != nil {
+				slog.Warn("failed to start cluster heartbeat", "err", err)
+			}
+		} else {
+			slog.Warn("cluster: control interface has no IPv4 address, heartbeat deferred",
+				"interface", cc.ControlInterface)
+		}
+	}
+
+	// Start session/config sync on fabric interface.
+	if cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
+		fabIP := resolveInterfaceAddr(cc.FabricInterface, "")
+		if fabIP != "" {
+			syncLocal := fmt.Sprintf("%s:4785", fabIP)
+			syncPeer := fmt.Sprintf("%s:4785", cc.FabricPeerAddress)
+			d.sessionSync = cluster.NewSessionSync(syncLocal, syncPeer, nil)
+
+			// Wire config sync callback: when secondary receives config from primary.
+			d.sessionSync.OnConfigReceived = func(configText string) {
+				d.handleConfigSync(configText)
+			}
+
+			d.sessionSync.SetVRFDevice(vrfDevice)
+			if err := d.sessionSync.Start(ctx); err != nil {
+				slog.Warn("failed to start session sync", "err", err)
+			} else {
+				slog.Info("cluster session sync started",
+					"local", syncLocal, "peer", syncPeer, "vrf", vrfDevice)
+			}
+
+			// Start periodic IPsec SA sync if enabled.
+			if cc.IPsecSASync && d.ipsec != nil {
+				go d.syncIPsecSAPeriodic(ctx)
+			}
+		} else {
+			slog.Warn("cluster: fabric interface has no IPv4 address",
+				"interface", cc.FabricInterface)
+		}
+	}
+}
+
 func (d *Daemon) watchClusterEvents(ctx context.Context) {
 	for {
 		select {

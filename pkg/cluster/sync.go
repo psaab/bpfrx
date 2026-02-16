@@ -88,6 +88,7 @@ type SessionSync struct {
 
 	IsPrimaryFn   func() bool // returns true if local node is primary for RG 0
 	lastSweepTime uint64      // monotonic seconds of last sync sweep
+	vrfDevice     string      // VRF device for SO_BINDTODEVICE (empty = default VRF)
 }
 
 // NewSessionSync creates a new session synchronization manager.
@@ -98,6 +99,11 @@ func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *Session
 		dp:        dp,
 		sendCh:    make(chan []byte, 4096),
 	}
+}
+
+// SetVRFDevice sets the VRF device for SO_BINDTODEVICE on sync sockets.
+func (s *SessionSync) SetVRFDevice(dev string) {
+	s.vrfDevice = dev
 }
 
 // SetDataPlane sets the dataplane used for installing received sessions.
@@ -121,7 +127,8 @@ func (s *SessionSync) Start(ctx context.Context) error {
 	ctx, s.cancel = context.WithCancel(ctx)
 
 	// Start listener for incoming peer connections.
-	ln, err := net.Listen("tcp", s.localAddr)
+	lc := vrfListenConfig(s.vrfDevice)
+	ln, err := lc.Listen(ctx, "tcp", s.localAddr)
 	if err != nil {
 		return fmt.Errorf("sync listen: %w", err)
 	}
@@ -406,7 +413,11 @@ func (s *SessionSync) connectLoop(ctx context.Context) {
 			continue
 		}
 
-		conn, err := net.DialTimeout("tcp", s.peerAddr, 3*time.Second)
+		dialer := net.Dialer{Timeout: 3 * time.Second}
+		if s.vrfDevice != "" {
+			dialer.Control = vrfListenConfig(s.vrfDevice).Control
+		}
+		conn, err := dialer.DialContext(ctx, "tcp", s.peerAddr)
 		if err != nil {
 			continue // peer not available yet
 		}

@@ -1455,10 +1455,11 @@ func (m *Manager) ApplyBonds(interfaces []*config.InterfaceConfig) error {
 			continue
 		}
 		for _, member := range ifc.FabricMembers {
-			memberLink, err := m.nlHandle.LinkByName(member)
+			linuxName := config.LinuxIfName(member)
+			memberLink, err := m.nlHandle.LinkByName(linuxName)
 			if err != nil {
 				slog.Warn("bond member not found",
-					"bond", bondName, "member", member, "err", err)
+					"bond", bondName, "member", member, "linux", linuxName, "err", err)
 				continue
 			}
 			// Member must be down before enslaving
@@ -1551,10 +1552,11 @@ func (m *Manager) ApplyRethInterfaces(interfaces map[string]*config.InterfaceCon
 
 		sort.Strings(members) // deterministic order
 		for _, member := range members {
-			memberLink, err := m.nlHandle.LinkByName(member)
+			linuxName := config.LinuxIfName(member)
+			memberLink, err := m.nlHandle.LinkByName(linuxName)
 			if err != nil {
 				slog.Warn("RETH member not found",
-					"reth", rethName, "member", member, "err", err)
+					"reth", rethName, "member", member, "linux", linuxName, "err", err)
 				continue
 			}
 			m.nlHandle.LinkSetDown(memberLink)
@@ -1609,12 +1611,15 @@ func (m *Manager) ApplyInterfaceMonitors(groups []*config.RedundancyGroup) {
 	for _, rg := range groups {
 		var statuses []InterfaceMonitorStatus
 		for _, mon := range rg.InterfaceMonitors {
-			up := false
-			link, err := m.nlHandle.LinkByName(mon.Interface)
-			if err == nil {
-				up = link.Attrs().OperState == netlink.OperUp ||
-					link.Attrs().Flags&net.FlagUp != 0
+			// Translate Junos name (ge-0/0/0) to Linux name (ge-0-0-0).
+			linuxName := config.LinuxIfName(mon.Interface)
+			link, err := m.nlHandle.LinkByName(linuxName)
+			if err != nil {
+				// Interface doesn't exist — belongs to peer node. Skip.
+				continue
 			}
+			up := link.Attrs().OperState == netlink.OperUp ||
+				link.Attrs().Flags&net.FlagUp != 0
 			statuses = append(statuses, InterfaceMonitorStatus{
 				Interface: mon.Interface,
 				Weight:    mon.Weight,

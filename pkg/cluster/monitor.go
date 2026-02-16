@@ -132,13 +132,18 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup) {
 
 	for _, im := range rg.InterfaceMonitors {
 		key := monitorKey{rgID: rg.ID, iface: im.Interface}
-		up := false
 
-		link, err := nlh.LinkByName(im.Interface)
-		if err == nil {
-			up = link.Attrs().OperState == netlink.OperUp ||
-				link.Attrs().Flags&net.FlagUp != 0
+		// Translate Junos name (ge-0/0/0) to Linux name (ge-0-0-0).
+		linuxName := config.LinuxIfName(im.Interface)
+		link, err := nlh.LinkByName(linuxName)
+		if err != nil {
+			// Interface doesn't exist on this node — belongs to peer
+			// (e.g. ge-7/0/x on node 0). Skip without counting as down.
+			continue
 		}
+
+		up := link.Attrs().OperState == netlink.OperUp ||
+			link.Attrs().Flags&net.FlagUp != 0
 
 		wasDown := mon.ifaceDown[key]
 		isDown := !up

@@ -8,9 +8,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
+	"golang.org/x/sys/unix"
 )
 
 // NodeState represents the HA state of a node for a redundancy group.
@@ -471,7 +473,9 @@ func (m *Manager) Stop() {
 
 // StartHeartbeat launches heartbeat sender and receiver goroutines.
 // localAddr is the local control link IP, peerAddr is the peer control link IP.
-func (m *Manager) StartHeartbeat(localAddr, peerAddr string) error {
+// vrfDevice is optional — if non-empty, sockets bind to that VRF device so
+// packets route through the correct table.
+func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
 	m.mu.Lock()
 	interval := m.hbInterval
 	threshold := m.hbThreshold
@@ -489,17 +493,22 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr string) error {
 		return fmt.Errorf("resolve local addr: %w", err)
 	}
 
-	recvConn, err := net.ListenUDP("udp4", local)
+	lc := vrfListenConfig(vrfDevice)
+
+	recvPkt, err := lc.ListenPacket(context.Background(), "udp4", local.String())
 	if err != nil {
 		return fmt.Errorf("listen heartbeat: %w", err)
 	}
+	recvConn := recvPkt.(*net.UDPConn)
 
 	// Create sender socket (bound to local address).
-	sendConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(localAddr)})
+	sendAddr := fmt.Sprintf("%s:0", localAddr)
+	sendPkt, err := lc.ListenPacket(context.Background(), "udp4", sendAddr)
 	if err != nil {
 		recvConn.Close()
 		return fmt.Errorf("sender socket: %w", err)
 	}
+	sendConn := sendPkt.(*net.UDPConn)
 
 	m.mu.Lock()
 	m.hbSender = newHeartbeatSender(m, sendConn, peer, interval)
@@ -513,6 +522,24 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr string) error {
 		"local", localAddr, "peer", peerAddr,
 		"interval", interval, "threshold", threshold)
 	return nil
+}
+
+// vrfListenConfig returns a net.ListenConfig that binds sockets to a VRF device
+// via SO_BINDTODEVICE. If vrfDevice is empty, returns a default ListenConfig.
+func vrfListenConfig(vrfDevice string) net.ListenConfig {
+	if vrfDevice == "" {
+		return net.ListenConfig{}
+	}
+	return net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var err error
+			c.Control(func(fd uintptr) {
+				err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET,
+					syscall.SO_BINDTODEVICE, vrfDevice)
+			})
+			return err
+		},
+	}
 }
 
 // StopHeartbeat halts heartbeat sender and receiver goroutines.
