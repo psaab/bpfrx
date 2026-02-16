@@ -943,20 +943,10 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
-	// 1.8. Create RETH (redundant ethernet) interfaces for chassis cluster.
+	// 1.8. Clean up legacy RETH bond devices from previous binary versions.
+	// VRRP now runs directly on physical member interfaces — no bonds needed.
 	if d.routing != nil {
-		hasReth := false
-		for _, ifc := range cfg.Interfaces.Interfaces {
-			if ifc.RedundantParent != "" {
-				hasReth = true
-				break
-			}
-		}
-		if hasReth {
-			if err := d.routing.ApplyRethInterfaces(cfg.Interfaces.Interfaces); err != nil {
-				slog.Warn("failed to apply RETH interfaces", "err", err)
-			}
-		}
+		d.routing.ClearRethInterfaces()
 	}
 
 	// 2. Compile eBPF dataplane
@@ -1094,6 +1084,8 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 
 	// 7. Apply DHCP server config (Kea DHCPv4 + DHCPv6)
 	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
+		// Resolve RETH interface names for Kea (needs real Linux names)
+		resolveDHCPRethInterfaces(&cfg.System.DHCPServer, cfg)
 		if err := d.dhcpServer.Apply(&cfg.System.DHCPServer); err != nil {
 			slog.Warn("failed to apply DHCP server config", "err", err)
 		}
@@ -3023,5 +3015,23 @@ func (d *Daemon) reinitiateIPsecSAs() {
 		} else {
 			slog.Info("cluster: IPsec SA initiated", "name", name)
 		}
+	}
+}
+
+// resolveDHCPRethInterfaces translates RETH interface names in DHCP server
+// groups to their physical member Linux names (Kea needs real device names).
+func resolveDHCPRethInterfaces(dhcpCfg *config.DHCPServerConfig, cfg *config.Config) {
+	resolve := func(groups map[string]*config.DHCPServerGroup) {
+		for _, group := range groups {
+			for i, iface := range group.Interfaces {
+				group.Interfaces[i] = config.LinuxIfName(cfg.ResolveReth(iface))
+			}
+		}
+	}
+	if dhcpCfg.DHCPLocalServer != nil {
+		resolve(dhcpCfg.DHCPLocalServer.Groups)
+	}
+	if dhcpCfg.DHCPv6LocalServer != nil {
+		resolve(dhcpCfg.DHCPv6LocalServer.Groups)
 	}
 }

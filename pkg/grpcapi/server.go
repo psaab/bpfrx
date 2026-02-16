@@ -5823,11 +5823,16 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		fmt.Fprintf(&buf, "Control link status: Up\n\n")
 		// RETH interfaces
 		fmt.Fprintf(&buf, "RETH count: %d\n", cc.RethCount)
-		if s.routing != nil {
-			rethNames := s.routing.RethNames()
-			if len(rethNames) > 0 {
-				fmt.Fprintf(&buf, "RETH interfaces: %s\n", strings.Join(rethNames, ", "))
+		// Show configured RETH names from config (bonds no longer created)
+		var rethNames []string
+		for name, ifc := range cfg.Interfaces.Interfaces {
+			if ifc.RedundancyGroup > 0 && strings.HasPrefix(name, "reth") {
+				rethNames = append(rethNames, name)
 			}
+		}
+		sort.Strings(rethNames)
+		if len(rethNames) > 0 {
+			fmt.Fprintf(&buf, "RETH interfaces: %s\n", strings.Join(rethNames, ", "))
 		}
 		fmt.Fprintln(&buf)
 		// Interface monitoring

@@ -244,15 +244,25 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 
 // resolveInterfaceRef parses an interface reference like "enp6s0" or "enp6s0.100"
 // and returns the physical interface name, unit number, and VLAN ID from config.
+// For RETH interfaces, configName stays as "reth0" (for config lookups) while
+// physName resolves to the local physical member's Linux name.
 func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, configName string, unitNum int, vlanID int) {
 	parts := strings.SplitN(ref, ".", 2)
 	configName = parts[0]
-	physName = config.LinuxIfName(configName)
+
+	// Resolve RETH to local physical member
+	rethToPhys := cfg.RethToPhysical()
+	physBase := configName
+	if phys, ok := rethToPhys[configName]; ok {
+		physBase = phys
+	}
+	physName = config.LinuxIfName(physBase)
+
 	if len(parts) == 2 {
 		unitNum, _ = strconv.Atoi(parts[1])
 	}
 
-	// Look up VLAN ID from interface config (keyed by Junos name)
+	// Look up VLAN ID from interface config (keyed by original config name)
 	if ifCfg, ok := cfg.Interfaces.Interfaces[configName]; ok {
 		if unit, ok := ifCfg.Units[unitNum]; ok {
 			vlanID = unit.VlanID
@@ -645,18 +655,39 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 	// Iterate over configured interfaces (not zones) to get a clean
 	// per-interface view including VLAN parent and sub-interface entries.
 	//
-	// For RETH interfaces with a redundancy group, VIP addresses are managed
-	// by keepalived (VRRP). The networkd .network file gets a link-local base
-	// address (169.254.RG.NODE/32) instead — keepalived requires at least one
-	// IPv4 on the interface for VRRP advertisements. Putting the VIP in both
-	// networkd AND keepalived causes conflicts: keepalived removes the address
-	// when entering FAULT/BACKUP state.
+	// RETH interfaces (reth0, reth1) are config-only — no bond devices are
+	// created. Physical member interfaces (with RedundantParent) inherit the
+	// reth's addresses, VLANs, and redundancy group settings.
+	//
+	// For VRRP-backed RETH, VIP addresses are managed by keepalived. The
+	// networkd .network file gets a link-local base address (169.254.RG.NODE/32)
+	// instead — keepalived requires at least one IPv4 for VRRP advertisements.
 	clusterNodeID := -1
 	if cfg.Chassis.Cluster != nil {
 		clusterNodeID = cfg.Chassis.Cluster.NodeID
 	}
+	rethToPhys := cfg.RethToPhysical()
 	seen := make(map[string]bool)
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
+		// Skip reth interfaces — no physical device exists; the physical
+		// member interface inherits the reth's config below.
+		if _, isReth := rethToPhys[ifName]; isReth {
+			continue
+		}
+
+		// For physical members with a RedundantParent, merge the parent
+		// reth's config (addresses, VLANs, redundancy group).
+		effectiveCfg := ifCfg
+		isVRRPReth := false
+		if ifCfg.RedundantParent != "" {
+			if rethCfg, ok := cfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok {
+				effectiveCfg = rethCfg
+				isVRRPReth = rethCfg.RedundancyGroup > 0 && clusterNodeID >= 0
+			}
+		} else {
+			isVRRPReth = ifCfg.RedundancyGroup > 0 && clusterNodeID >= 0
+		}
+
 		linuxName := config.LinuxIfName(ifName)
 		physIface, err := net.InterfaceByName(linuxName)
 		if err != nil {
@@ -667,10 +698,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 			continue
 		}
 
-		// isVRRPReth: true when keepalived manages this interface's VIPs.
-		isVRRPReth := ifCfg.RedundancyGroup > 0 && clusterNodeID >= 0
-
-		if ifCfg.VlanTagging {
+		if effectiveCfg.VlanTagging {
 			// VLAN parent: no addresses, just rename
 			if !seen[linuxName] {
 				seen[linuxName] = true
@@ -686,7 +714,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				})
 			}
 			// VLAN sub-interfaces get their own .network file
-			for _, unit := range ifCfg.Units {
+			for _, unit := range effectiveCfg.Units {
 				if unit.VlanID > 0 {
 					subName := fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
 					if !seen[subName] {
@@ -694,7 +722,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 						addrs := unit.Addresses
 						if isVRRPReth {
 							// Replace VIP addresses with a link-local base for VRRP.
-							addrs = []string{fmt.Sprintf("169.254.%d.%d/32", ifCfg.RedundancyGroup, clusterNodeID+1)}
+							addrs = []string{fmt.Sprintf("169.254.%d.%d/32", effectiveCfg.RedundancyGroup, clusterNodeID+1)}
 						}
 						result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 							Name:             subName,
@@ -714,12 +742,12 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 			// Regular interface (non-VLAN)
 			if !seen[linuxName] {
 				seen[linuxName] = true
-				// Collect addresses from all units
+				// Collect addresses from all units (using effective config for RETH members)
 				var addrs []string
 				var dhcpv4, dhcpv6, dadDisable bool
 				var primaryAddr, preferredAddr string
 				unitMTU := 0
-				for _, unit := range ifCfg.Units {
+				for _, unit := range effectiveCfg.Units {
 					addrs = append(addrs, unit.Addresses...)
 					if unit.DHCP {
 						dhcpv4 = true
@@ -745,18 +773,12 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				if unitMTU > 0 && (mtu == 0 || unitMTU < mtu) {
 					mtu = unitMTU
 				}
-				// RETH with redundancy group: replace VIP addresses with a
+				// VRRP-backed RETH: replace VIP addresses with a
 				// link-local base; keepalived manages the actual VIPs.
 				if isVRRPReth {
-					addrs = []string{fmt.Sprintf("169.254.%d.%d/32", ifCfg.RedundancyGroup, clusterNodeID+1)}
+					addrs = []string{fmt.Sprintf("169.254.%d.%d/32", effectiveCfg.RedundancyGroup, clusterNodeID+1)}
 					primaryAddr = ""
 					preferredAddr = ""
-				}
-				// RETH members: set BondMaster so networkd keeps them enslaved
-				// after reload/reconfigure.
-				var bondMaster string
-				if ifCfg.RedundantParent != "" {
-					bondMaster = config.LinuxIfName(ifCfg.RedundantParent)
 				}
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 					Name:             linuxName,
@@ -772,7 +794,6 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					Duplex:           ifCfg.Duplex,
 					MTU:              mtu,
 					Description:      ifCfg.Description,
-					BondMaster:       bondMaster,
 				})
 			}
 		}
@@ -795,10 +816,6 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 			daemonOwned[ifc.Tunnel.Name] = true
 		}
 		if len(ifc.FabricMembers) > 0 {
-			daemonOwned[name] = true
-		}
-		// RETH bond devices are created by the daemon
-		if strings.HasPrefix(name, "reth") {
 			daemonOwned[name] = true
 		}
 	}
@@ -1546,9 +1563,15 @@ func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 				}
 				ifaceName := toZoneCfg.Interfaces[0]
 
+				// Strip unit suffix for config lookup (e.g. reth0.50 → reth0)
+				cfgKey := ifaceName
+				if idx := strings.IndexByte(cfgKey, '.'); idx >= 0 {
+					cfgKey = cfgKey[:idx]
+				}
+
 				// RETH interfaces backed by VRRP: read addresses from config
 				// instead of live interface query (VIPs may not be on this node).
-				if ifCfg, ok := cfg.Interfaces.Interfaces[ifaceName]; ok && ifCfg.RedundancyGroup > 0 {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgKey]; ok && ifCfg.RedundancyGroup > 0 {
 					v4IPs, v6IPs = rethConfigAddrs(ifCfg)
 				} else {
 					snatIP, err := getInterfaceIP(ifaceName)

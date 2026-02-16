@@ -485,6 +485,7 @@ func TestInterfaceMonitorStatuses(t *testing.T) {
 
 func TestRethMemberCollection(t *testing.T) {
 	// Test the logic that groups physical interfaces by their RedundantParent.
+	// Bonds are no longer created — this validates the config-level mapping only.
 	interfaces := map[string]*config.InterfaceConfig{
 		"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
 		"ge-0/0/1": {Name: "ge-0/0/1", RedundantParent: "reth0"},

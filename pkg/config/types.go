@@ -9,6 +9,32 @@ func LinuxIfName(name string) string {
 	return strings.ReplaceAll(name, "/", "-")
 }
 
+// RethToPhysical returns a map of reth name → local physical member name.
+// Built from interfaces that have RedundantParent set.
+func (c *Config) RethToPhysical() map[string]string {
+	m := make(map[string]string)
+	for _, ifc := range c.Interfaces.Interfaces {
+		if ifc.RedundantParent != "" {
+			m[ifc.RedundantParent] = ifc.Name
+		}
+	}
+	return m
+}
+
+// ResolveReth resolves "reth0" or "reth0.50" to the physical member equivalent.
+// Returns input unchanged if not a RETH name.
+func (c *Config) ResolveReth(ref string) string {
+	rethMap := c.RethToPhysical()
+	parts := strings.SplitN(ref, ".", 2)
+	if phys, ok := rethMap[parts[0]]; ok {
+		if len(parts) == 2 {
+			return phys + "." + parts[1]
+		}
+		return phys
+	}
+	return ref
+}
+
 // Config is the top-level typed configuration, compiled from the AST.
 type Config struct {
 	Security          SecurityConfig

@@ -69,13 +69,6 @@ type monitorKey struct {
 	iface string
 }
 
-// RethIPMapping maps a RETH interface to its IP addresses (for GARP).
-type RethIPMapping struct {
-	Interface string
-	IPs       []net.IP
-	RG        int // redundancy group ID
-}
-
 // Manager manages cluster redundancy group states.
 type Manager struct {
 	nodeID         int
@@ -85,7 +78,6 @@ type Manager struct {
 	mu             sync.RWMutex
 	eventCh        chan ClusterEvent
 	monitor        *Monitor
-	rethIPs        []RethIPMapping
 	garpCounts     map[int]int // rgID -> gratuitous ARP count from config
 
 	// Peer state tracking (heartbeat).
@@ -630,45 +622,10 @@ func (m *Manager) handlePeerTimeout() {
 	m.electSingleNode()
 }
 
-// RegisterRethIPs stores RETH interface→IP mappings for GARP on primary transition.
-func (m *Manager) RegisterRethIPs(mappings []RethIPMapping) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.rethIPs = mappings
-}
-
-// triggerGARP sends gratuitous ARPs (IPv4) and unsolicited Neighbor
-// Advertisements (IPv6) for all RETH interfaces in the given RG.
-// Called internally when a transition to primary is detected (holds m.mu).
+// triggerGARP is called on transition to primary. Keepalived handles
+// GARP for VRRP-backed RETH interfaces, so this is a no-op.
 func (m *Manager) triggerGARP(rgID int) {
-	// Snapshot under lock (called with lock held, so read fields directly).
-	rethIPs := m.rethIPs
-	count := m.garpCounts[rgID]
-	if count <= 0 {
-		count = 4
-	}
-
-	// Send GARP/NA in a goroutine to avoid holding the lock during I/O.
-	go func() {
-		for _, mapping := range rethIPs {
-			if mapping.RG != rgID {
-				continue
-			}
-			for _, ip := range mapping.IPs {
-				if ip.To4() != nil {
-					if err := SendGratuitousARP(mapping.Interface, ip, count); err != nil {
-						slog.Warn("cluster: failed to send GARP",
-							"interface", mapping.Interface, "ip", ip, "err", err)
-					}
-				} else {
-					if err := SendGratuitousIPv6(mapping.Interface, ip, count); err != nil {
-						slog.Warn("cluster: failed to send IPv6 NA",
-							"interface", mapping.Interface, "ip", ip, "err", err)
-					}
-				}
-			}
-		}
-	}()
+	slog.Info("cluster: primary transition", "rg", rgID)
 }
 
 // LocalPriorities returns a map of redundancy group ID to VRRP priority.

@@ -50,8 +50,8 @@ func (rc *RethController) SetMappings(mappings []RethMapping) {
 }
 
 // HandleStateChange processes a cluster state change event.
-// Bonds are always kept UP on both nodes so that VRRP can send
-// advertisements on both primary and secondary. VRRP handles VIP placement.
+// Physical member interfaces are kept UP on both nodes so VRRP can
+// send advertisements. No bond devices — VRRP runs directly on physical.
 func (rc *RethController) HandleStateChange(event ClusterEvent) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
@@ -60,82 +60,47 @@ func (rc *RethController) HandleStateChange(event ClusterEvent) {
 		if m.RedundancyGrp != event.GroupID {
 			continue
 		}
-		rc.activateReth(m)
-	}
-}
-
-// activateReth brings up the RETH bond and its members,
-// making this node the active forwarder for this RG.
-func (rc *RethController) activateReth(m RethMapping) {
-	if rc.nlHandle == nil {
-		return
-	}
-	bond, err := rc.nlHandle.LinkByName(m.RethName)
-	if err != nil {
-		slog.Warn("reth activate: bond not found", "name", m.RethName, "err", err)
-		return
-	}
-
-	// Bring up bond and all members.
-	if err := rc.nlHandle.LinkSetUp(bond); err != nil {
-		slog.Warn("reth activate: failed to bring up bond", "name", m.RethName, "err", err)
-	}
-
-	for _, member := range m.Members {
-		link, err := rc.nlHandle.LinkByName(member)
-		if err != nil {
+		if rc.nlHandle == nil {
 			continue
 		}
-		rc.nlHandle.LinkSetUp(link)
+		// Bring up physical member interfaces (VRRP needs them UP on both nodes)
+		for _, member := range m.Members {
+			link, err := rc.nlHandle.LinkByName(member)
+			if err != nil {
+				continue
+			}
+			rc.nlHandle.LinkSetUp(link)
+		}
+		slog.Info("reth physical members UP", "reth", m.RethName, "rg", m.RedundancyGrp)
 	}
-
-	slog.Info("reth bond UP", "name", m.RethName, "rg", m.RedundancyGrp)
 }
 
-// deactivateReth brings down the RETH bond members on this node,
-// causing the active-backup bond to fail over to the peer.
-func (rc *RethController) deactivateReth(m RethMapping) {
-	if rc.nlHandle == nil {
-		return
-	}
-	// In active-backup mode, bringing down the local member interfaces
-	// causes the bond to switch to the peer's member (if available).
-	for _, member := range m.Members {
-		link, err := rc.nlHandle.LinkByName(member)
-		if err != nil {
-			continue
-		}
-		if err := rc.nlHandle.LinkSetDown(link); err != nil {
-			slog.Warn("reth deactivate: failed to bring down member",
-				"reth", m.RethName, "member", member, "err", err)
-		}
-	}
-
-	slog.Info("reth deactivated (secondary)", "name", m.RethName, "rg", m.RedundancyGrp)
-}
-
-// RethIPs returns the IP addresses configured on a RETH interface.
-// Returns both IPv4 and IPv6 addresses. Used for gratuitous ARP/NA after failover.
+// RethIPs returns the IP addresses on a RETH's physical member interface.
 func (rc *RethController) RethIPs(rethName string) ([]net.IP, error) {
-	link, err := rc.nlHandle.LinkByName(rethName)
-	if err != nil {
-		return nil, fmt.Errorf("reth %s not found: %w", rethName, err)
-	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
 
-	addrs, err := rc.nlHandle.AddrList(link, netlink.FAMILY_ALL)
-	if err != nil {
-		return nil, fmt.Errorf("reth %s addrs: %w", rethName, err)
-	}
-
-	var ips []net.IP
-	for _, addr := range addrs {
-		// Skip link-local IPv6 (fe80::) — not useful for GARP/NA.
-		if addr.IP.To4() == nil && addr.IP.IsLinkLocalUnicast() {
-			continue
+	for _, m := range rc.mappings {
+		if m.RethName == rethName && len(m.Members) > 0 {
+			link, err := rc.nlHandle.LinkByName(m.Members[0])
+			if err != nil {
+				return nil, fmt.Errorf("physical member %s for reth %s not found: %w", m.Members[0], rethName, err)
+			}
+			addrs, err := rc.nlHandle.AddrList(link, netlink.FAMILY_ALL)
+			if err != nil {
+				return nil, fmt.Errorf("addrs on %s: %w", m.Members[0], err)
+			}
+			var ips []net.IP
+			for _, addr := range addrs {
+				if addr.IP.To4() == nil && addr.IP.IsLinkLocalUnicast() {
+					continue
+				}
+				ips = append(ips, addr.IP)
+			}
+			return ips, nil
 		}
-		ips = append(ips, addr.IP)
 	}
-	return ips, nil
+	return nil, fmt.Errorf("reth %s not found", rethName)
 }
 
 // FormatStatus returns RETH interface status for display.
@@ -148,11 +113,11 @@ func (rc *RethController) FormatStatus() string {
 	}
 
 	var result string
-	result += fmt.Sprintf("%-12s %-8s %-10s %s\n", "Interface", "RG", "Status", "Members")
+	result += fmt.Sprintf("%-12s %-8s %-10s %s\n", "Interface", "RG", "Status", "Physical")
 	for _, m := range rc.mappings {
 		status := "unknown"
-		if rc.nlHandle != nil {
-			link, err := rc.nlHandle.LinkByName(m.RethName)
+		if rc.nlHandle != nil && len(m.Members) > 0 {
+			link, err := rc.nlHandle.LinkByName(m.Members[0])
 			if err == nil {
 				if link.Attrs().OperState == netlink.OperUp ||
 					link.Attrs().Flags&net.FlagUp != 0 {

@@ -10021,11 +10021,16 @@ func (c *CLI) showChassisClusterInterfaces() error {
 	fmt.Println("Control link status: Up")
 	fmt.Println()
 	fmt.Printf("RETH count: %d\n", cc.RethCount)
-	if c.routing != nil {
-		rethNames := c.routing.RethNames()
-		if len(rethNames) > 0 {
-			fmt.Printf("RETH interfaces: %s\n", strings.Join(rethNames, ", "))
+	// Show configured RETH names from config (bonds no longer created)
+	var rethNames []string
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc.RedundancyGroup > 0 && strings.HasPrefix(name, "reth") {
+			rethNames = append(rethNames, name)
 		}
+	}
+	sort.Strings(rethNames)
+	if len(rethNames) > 0 {
+		fmt.Printf("RETH interfaces: %s\n", strings.Join(rethNames, ", "))
 	}
 	fmt.Println()
 	monStatuses := make(map[int][]routing.InterfaceMonitorStatus)

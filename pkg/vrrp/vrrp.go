@@ -68,6 +68,8 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 	if cfg == nil {
 		return nil
 	}
+	rethToPhys := cfg.RethToPhysical()
+
 	// Sort interface names for deterministic output.
 	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
 	for name := range cfg.Interfaces.Interfaces {
@@ -88,7 +90,12 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 			pri = 100 // default to secondary priority
 		}
 
-		linuxName := config.LinuxIfName(ifc.Name)
+		// Resolve reth → physical member for keepalived (no bond device)
+		physName := ifc.Name
+		if phys, ok := rethToPhys[ifc.Name]; ok {
+			physName = phys
+		}
+		linuxName := config.LinuxIfName(physName)
 
 		// For VLAN-tagged interfaces, create one VRRP instance per
 		// sub-interface (e.g. reth0.50) since the parent bond has no

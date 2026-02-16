@@ -1500,110 +1500,9 @@ func (m *Manager) ClearBonds() error {
 	return nil
 }
 
-// ApplyRethInterfaces creates Linux bond devices for RETH (Redundant Ethernet)
-// interfaces in a chassis cluster configuration. Physical interfaces with a
-// RedundantParent are enslaved to the named RETH bond.
+// ApplyRethInterfaces is a no-op. RETH bonds are no longer created;
+// VRRP runs directly on physical member interfaces.
 func (m *Manager) ApplyRethInterfaces(interfaces map[string]*config.InterfaceConfig) error {
-	// Collect RETH names and their member physical interfaces.
-	// reth0 is a bond; ge-0/0/0 with redundant-parent reth0 becomes a member.
-	rethMembers := make(map[string][]string) // reth name -> member interface names
-	rethConfigs := make(map[string]*config.InterfaceConfig)
-	for _, ifc := range interfaces {
-		if ifc.RedundantParent != "" {
-			rethMembers[ifc.RedundantParent] = append(rethMembers[ifc.RedundantParent], ifc.Name)
-		}
-	}
-	for _, ifc := range interfaces {
-		if strings.HasPrefix(ifc.Name, "reth") {
-			rethConfigs[ifc.Name] = ifc
-		}
-	}
-
-	// Remove stale RETH bonds that are no longer in config.
-	wanted := make(map[string]bool)
-	for name := range rethMembers {
-		wanted[name] = true
-	}
-	var kept []string
-	for _, name := range m.reths {
-		if wanted[name] {
-			kept = append(kept, name)
-			continue
-		}
-		link, err := m.nlHandle.LinkByName(name)
-		if err != nil {
-			continue
-		}
-		if err := m.nlHandle.LinkDel(link); err != nil {
-			slog.Warn("failed to delete stale RETH", "name", name, "err", err)
-		} else {
-			slog.Info("RETH removed (stale)", "name", name)
-		}
-	}
-	m.reths = kept
-
-	// Create or reconcile each RETH bond device and ensure members are enslaved.
-	for rethName, members := range rethMembers {
-		sort.Strings(members)
-
-		bondLink, err := m.nlHandle.LinkByName(rethName)
-		if err != nil {
-			// Bond doesn't exist — create it.
-			bond := netlink.NewLinkBond(netlink.LinkAttrs{Name: rethName})
-			bond.Mode = netlink.BOND_MODE_ACTIVE_BACKUP
-			if rc, ok := rethConfigs[rethName]; ok && rc.MTU > 0 {
-				bond.LinkAttrs.MTU = rc.MTU
-			}
-			if err := m.nlHandle.LinkAdd(bond); err != nil {
-				slog.Warn("failed to create RETH", "name", rethName, "err", err)
-				continue
-			}
-			bondLink, err = m.nlHandle.LinkByName(rethName)
-			if err != nil {
-				slog.Warn("failed to find created RETH", "name", rethName, "err", err)
-				continue
-			}
-			slog.Info("RETH created", "name", rethName, "mode", "active-backup")
-		}
-
-		// Ensure all members are enslaved (idempotent — safe to call on every compile).
-		for _, member := range members {
-			linuxName := config.LinuxIfName(member)
-			memberLink, err := m.nlHandle.LinkByName(linuxName)
-			if err != nil {
-				slog.Warn("RETH member not found",
-					"reth", rethName, "member", member, "linux", linuxName, "err", err)
-				continue
-			}
-			// Check if already enslaved to this bond.
-			if memberLink.Attrs().MasterIndex == bondLink.Attrs().Index {
-				m.nlHandle.LinkSetUp(memberLink)
-				continue
-			}
-			m.nlHandle.LinkSetDown(memberLink)
-			if err := m.nlHandle.LinkSetMaster(memberLink, bondLink); err != nil {
-				slog.Warn("failed to enslave RETH member",
-					"reth", rethName, "member", member, "err", err)
-				continue
-			}
-			m.nlHandle.LinkSetUp(memberLink)
-			slog.Info("RETH member added", "reth", rethName, "member", member)
-		}
-
-		m.nlHandle.LinkSetUp(bondLink)
-
-		// Track this RETH (deduplicate).
-		found := false
-		for _, r := range m.reths {
-			if r == rethName {
-				found = true
-				break
-			}
-		}
-		if !found {
-			m.reths = append(m.reths, rethName)
-		}
-	}
 	return nil
 }
 
@@ -1625,8 +1524,9 @@ func (m *Manager) ClearRethInterfaces() error {
 }
 
 // RethNames returns the names of currently managed RETH interfaces.
+// Returns empty since RETH bonds are no longer created.
 func (m *Manager) RethNames() []string {
-	return m.reths
+	return nil
 }
 
 // ApplyInterfaceMonitors checks link state for monitored interfaces in each

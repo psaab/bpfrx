@@ -197,6 +197,8 @@ func TestCollectRethInstances(t *testing.T) {
 						0: {Addresses: []string{"172.16.0.1/24"}},
 					},
 				},
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
+				"ge-0/0/1": {Name: "ge-0/0/1", RedundantParent: "reth1"},
 				// No RedundancyGroup — should be excluded.
 				"trust0": {
 					Name:            "trust0",
@@ -215,10 +217,10 @@ func TestCollectRethInstances(t *testing.T) {
 		t.Fatalf("expected 2 instances, got %d", len(instances))
 	}
 
-	// Sorted by name: reth0 before reth1.
+	// Sorted by name: reth0 before reth1 → resolved to ge-0-0-0 / ge-0-0-1.
 	inst0 := instances[0]
-	if inst0.Interface != "reth0" {
-		t.Errorf("inst0.Interface = %q, want reth0", inst0.Interface)
+	if inst0.Interface != "ge-0-0-0" {
+		t.Errorf("inst0.Interface = %q, want ge-0-0-0", inst0.Interface)
 	}
 	if inst0.GroupID != 101 {
 		t.Errorf("inst0.GroupID = %d, want 101", inst0.GroupID)
@@ -247,8 +249,8 @@ func TestCollectRethInstances(t *testing.T) {
 	}
 
 	inst1 := instances[1]
-	if inst1.Interface != "reth1" {
-		t.Errorf("inst1.Interface = %q, want reth1", inst1.Interface)
+	if inst1.Interface != "ge-0-0-1" {
+		t.Errorf("inst1.Interface = %q, want ge-0-0-1", inst1.Interface)
 	}
 	if inst1.GroupID != 102 {
 		t.Errorf("inst1.GroupID = %d, want 102", inst1.GroupID)
@@ -269,6 +271,7 @@ func TestCollectRethInstances_NoAddresses(t *testing.T) {
 						0: {Addresses: nil},
 					},
 				},
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
 			},
 		},
 	}
@@ -296,6 +299,7 @@ func TestCollectRethInstances_DefaultPriority(t *testing.T) {
 						0: {Addresses: []string{"10.0.0.1/24"}},
 					},
 				},
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
 			},
 		},
 	}
@@ -320,6 +324,7 @@ func TestCollectRethInstances_LinuxIfName(t *testing.T) {
 						0: {Addresses: []string{"10.0.0.1/24"}},
 					},
 				},
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0/1"},
 			},
 		},
 	}
@@ -327,8 +332,8 @@ func TestCollectRethInstances_LinuxIfName(t *testing.T) {
 	if len(instances) != 1 {
 		t.Fatalf("expected 1 instance, got %d", len(instances))
 	}
-	if instances[0].Interface != "reth0-1" {
-		t.Errorf("Interface = %q, want reth0-1 (slash replaced)", instances[0].Interface)
+	if instances[0].Interface != "ge-0-0-0" {
+		t.Errorf("Interface = %q, want ge-0-0-0 (resolved to physical member)", instances[0].Interface)
 	}
 }
 
@@ -351,6 +356,8 @@ func TestCollectRethInstances_VlanTagging(t *testing.T) {
 						0: {Addresses: []string{"10.0.60.1/24"}},
 					},
 				},
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
+				"ge-0/0/1": {Name: "ge-0/0/1", RedundantParent: "reth1"},
 			},
 		},
 	}
@@ -361,10 +368,10 @@ func TestCollectRethInstances_VlanTagging(t *testing.T) {
 		t.Fatalf("expected 2 instances, got %d", len(instances))
 	}
 
-	// reth0 is VLAN-tagged → VRRP on reth0.50
+	// reth0 is VLAN-tagged → VRRP on ge-0-0-0.50 (physical member)
 	inst0 := instances[0]
-	if inst0.Interface != "reth0.50" {
-		t.Errorf("inst0.Interface = %q, want reth0.50", inst0.Interface)
+	if inst0.Interface != "ge-0-0-0.50" {
+		t.Errorf("inst0.Interface = %q, want ge-0-0-0.50", inst0.Interface)
 	}
 	if inst0.GroupID != 101 {
 		t.Errorf("inst0.GroupID = %d, want 101", inst0.GroupID)
@@ -377,10 +384,10 @@ func TestCollectRethInstances_VlanTagging(t *testing.T) {
 		t.Errorf("inst0.VirtualAddresses = %v, want %v", inst0.VirtualAddresses, wantVIPs)
 	}
 
-	// reth1 is non-VLAN → VRRP on reth1
+	// reth1 is non-VLAN → VRRP on ge-0-0-1 (physical member)
 	inst1 := instances[1]
-	if inst1.Interface != "reth1" {
-		t.Errorf("inst1.Interface = %q, want reth1", inst1.Interface)
+	if inst1.Interface != "ge-0-0-1" {
+		t.Errorf("inst1.Interface = %q, want ge-0-0-1", inst1.Interface)
 	}
 	if inst1.GroupID != 102 {
 		t.Errorf("inst1.GroupID = %d, want 102", inst1.GroupID)

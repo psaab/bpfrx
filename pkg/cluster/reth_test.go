@@ -36,6 +36,9 @@ func TestRethMappingWithEntries(t *testing.T) {
 	if !strings.Contains(out, "ge-0/0/0") {
 		t.Fatalf("expected member ge-0/0/0 in output, got: %s", out)
 	}
+	if !strings.Contains(out, "Physical") {
+		t.Fatalf("expected 'Physical' header in output, got: %s", out)
+	}
 }
 
 func TestHandleStateChangeFiltersbyRG(t *testing.T) {
@@ -64,8 +67,8 @@ func TestHandleStateChangeFiltersbyRG(t *testing.T) {
 }
 
 func TestHandleStateChange_AlwaysActivates(t *testing.T) {
-	// Verify HandleStateChange calls activateReth for all states (not just primary).
-	// Bonds must stay UP on both nodes for VRRP to work.
+	// Verify HandleStateChange brings up physical members for all states (not just primary).
+	// Physical interfaces must stay UP on both nodes for VRRP to work.
 	rc := &RethController{
 		mappings: []RethMapping{
 			{RethName: "reth0", RedundancyGrp: 1, Members: []string{"eth0"}},
