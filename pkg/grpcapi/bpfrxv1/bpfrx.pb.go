@@ -1473,8 +1473,11 @@ type GetStatusResponse struct {
 	ConfigLoaded    bool                   `protobuf:"varint,3,opt,name=config_loaded,json=configLoaded,proto3" json:"config_loaded,omitempty"`
 	ZoneCount       int32                  `protobuf:"varint,4,opt,name=zone_count,json=zoneCount,proto3" json:"zone_count,omitempty"`
 	SessionCount    int32                  `protobuf:"varint,5,opt,name=session_count,json=sessionCount,proto3" json:"session_count,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Cluster status (empty string if not in a cluster)
+	ClusterRole   string `protobuf:"bytes,6,opt,name=cluster_role,json=clusterRole,proto3" json:"cluster_role,omitempty"`          // "primary" or "secondary"
+	ClusterNodeId int32  `protobuf:"varint,7,opt,name=cluster_node_id,json=clusterNodeId,proto3" json:"cluster_node_id,omitempty"` // node ID (0, 1, ...)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetStatusResponse) Reset() {
@@ -1538,6 +1541,20 @@ func (x *GetStatusResponse) GetZoneCount() int32 {
 func (x *GetStatusResponse) GetSessionCount() int32 {
 	if x != nil {
 		return x.SessionCount
+	}
+	return 0
+}
+
+func (x *GetStatusResponse) GetClusterRole() string {
+	if x != nil {
+		return x.ClusterRole
+	}
+	return ""
+}
+
+func (x *GetStatusResponse) GetClusterNodeId() int32 {
+	if x != nil {
+		return x.ClusterNodeId
 	}
 	return 0
 }
@@ -6434,14 +6451,16 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\fHistoryEntry\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\x05R\x05index\x12\x1c\n" +
 	"\ttimestamp\x18\x02 \x01(\tR\ttimestamp\"\x12\n" +
-	"\x10GetStatusRequest\"\xbf\x01\n" +
+	"\x10GetStatusRequest\"\x8a\x02\n" +
 	"\x11GetStatusResponse\x12\x16\n" +
 	"\x06uptime\x18\x01 \x01(\tR\x06uptime\x12)\n" +
 	"\x10dataplane_loaded\x18\x02 \x01(\bR\x0fdataplaneLoaded\x12#\n" +
 	"\rconfig_loaded\x18\x03 \x01(\bR\fconfigLoaded\x12\x1d\n" +
 	"\n" +
 	"zone_count\x18\x04 \x01(\x05R\tzoneCount\x12#\n" +
-	"\rsession_count\x18\x05 \x01(\x05R\fsessionCount\"\x17\n" +
+	"\rsession_count\x18\x05 \x01(\x05R\fsessionCount\x12!\n" +
+	"\fcluster_role\x18\x06 \x01(\tR\vclusterRole\x12&\n" +
+	"\x0fcluster_node_id\x18\a \x01(\x05R\rclusterNodeId\"\x17\n" +
 	"\x15GetGlobalStatsRequest\"\xa2\x05\n" +
 	"\x16GetGlobalStatsResponse\x12\x1d\n" +
 	"\n" +

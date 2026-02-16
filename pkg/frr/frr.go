@@ -259,9 +259,32 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 		b.WriteString("!\n")
 	}
 
-	// DHCP-learned default routes (admin distance 200)
+	// DHCP-learned default routes (admin distance 200).
+	// Suppress when an explicit static default route exists for the same address family,
+	// so the management interface's DHCP gateway doesn't compete with configured routes.
 	if len(fc.DHCPRoutes) > 0 {
+		hasV4Default := false
+		for _, sr := range fc.StaticRoutes {
+			if sr.Destination == "0.0.0.0/0" {
+				hasV4Default = true
+				break
+			}
+		}
+		hasV6Default := false
+		for _, sr := range fc.Inet6StaticRoutes {
+			if sr.Destination == "::/0" {
+				hasV6Default = true
+				break
+			}
+		}
+		wrote := false
 		for _, dr := range fc.DHCPRoutes {
+			if dr.IsIPv6 && hasV6Default {
+				continue
+			}
+			if !dr.IsIPv6 && hasV4Default {
+				continue
+			}
 			if dr.IsIPv6 {
 				if dr.Interface != "" {
 					fmt.Fprintf(&b, "ipv6 route ::/0 %s %s 200\n", dr.Gateway, dr.Interface)
@@ -271,8 +294,11 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 			} else {
 				fmt.Fprintf(&b, "ip route 0.0.0.0/0 %s 200\n", dr.Gateway)
 			}
+			wrote = true
 		}
-		b.WriteString("!\n")
+		if wrote {
+			b.WriteString("!\n")
+		}
 	}
 
 	// Backup router: fallback default gateway with admin distance 250

@@ -473,6 +473,17 @@ func (s *Server) GetStatus(_ context.Context, _ *pb.GetStatusRequest) (*pb.GetSt
 		stats := s.gc.Stats()
 		resp.SessionCount = int32(stats.TotalEntries)
 	}
+	if s.cluster != nil {
+		rg0 := s.cluster.GroupState(0)
+		if rg0 != nil {
+			if rg0.State == cluster.StatePrimary {
+				resp.ClusterRole = "primary"
+			} else {
+				resp.ClusterRole = "secondary"
+			}
+		}
+		resp.ClusterNodeId = int32(s.cluster.NodeID())
+	}
 	return resp, nil
 }
 

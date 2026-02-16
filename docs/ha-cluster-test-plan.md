@@ -3,7 +3,7 @@
 ## Overview
 
 Two VMs running bpfrxd in chassis cluster (active/passive) mode with:
-- **WAN**: SR-IOV VFs from `eno6np1` (i40e, one VF per VM, bonded into reth0)
+- **WAN**: SR-IOV VFs from `eno6np1` (i40e, one VF per VM via PCI passthrough, bonded into reth0)
 - **LAN**: One bridged network (one interface per VM, bonded into reth1)
 - **Heartbeat**: Dedicated bridge for cluster health monitoring (UDP:4784)
 - **Fabric**: Dedicated link between VMs for session sync, config sync, IPsec SA sync (TCP)
@@ -17,10 +17,13 @@ peer addresses, interface-to-RETH mappings) live inside `groups { node0 { ... } 
 `groups { node1 { ... } }`. The shared sections (chassis cluster, RETH, security, NAT,
 routing) appear at the top level.
 
-At load time, the daemon resolves `apply-groups "${node}"` by substituting the
-`${node}` variable with the group name matching the configured `chassis cluster node`
-value (node 0 → `node0`, node 1 → `node1`). This merges the node-specific group into
-the active config, producing a complete per-node configuration from a single source file.
+At load time, the daemon reads `/etc/bpfrx/node-id` (a plain integer: 0 or 1) and
+resolves `apply-groups "${node}"` by substituting `${node}` with `node0` or `node1`.
+This merges the node-specific group into the active config, producing a complete
+per-node configuration from a single source file.
+
+Config sync "just works" — the primary sends the **unexpanded** config text (with groups
+intact) to the secondary. Each node compiles it with its own `${node}` expansion.
 
 ### Interface Naming Convention
 
@@ -45,10 +48,12 @@ Config files use the Junos form; `.link` files rename kernel interfaces to the L
 ## Physical Host
 
 ```
-Host NIC: eno6np1 (i40e, Intel X710)
+Host NIC: eno6np1 (i40e, Intel X710/X722)
   - 32 SR-IOV VFs available (sriov_numvfs=32)
+  - VFs passed through as PCI devices (type=pci) to each VM
+  - VF0 (0000:b7:06.0) → bpfrx-fw0
+  - VF1 (0000:b7:06.1) → bpfrx-fw1
   - VFs use iavf driver inside VMs (generic XDP only)
-  - Incus nictype=sriov auto-selects free VFs
 ```
 
 ## Network Topology
@@ -61,7 +66,7 @@ Host NIC: eno6np1 (i40e, Intel X710)
                     |   32 SR-IOV VFs   |
                     +----+--------+-----+
                          |        |
-                    VF0(wan)   VF1(wan)
+                   VF0 (PCI)  VF1 (PCI)
                          |        |
               +----------+--+  +--+----------+
               |  bpfrx-fw0  |  |  bpfrx-fw1  |
@@ -76,15 +81,15 @@ Host NIC: eno6np1 (i40e, Intel X710)
                  |                   |
                  +------+   +-------+
                         |   |
-           incusbr0              (fxp0, DHCP)
-           bpfrx-ha-heartbeat   (fxp1, 10.99.0.0/30)
-           bpfrx-ha-fabric      (fab0, 10.99.1.0/30)
-           bpfrx-ha-lan         (reth1: 10.0.60.0/24)
+           incusbr0             (fxp0, DHCP)
+           bpfrx-heartbeat      (fxp1, 10.99.0.0/30)
+           bpfrx-fabric         (fab0, 10.99.1.0/30)
+           bpfrx-clan           (reth1: 10.0.60.0/24)
 
               +------------------+
-              |  ha-lan-host     |
-              |  (container)     |
-              |  eth1: lan       |  10.0.60.102/24
+              |  cluster-lan-    |
+              |  host            |
+              |  eth0: clan      |  10.0.60.102/24
               +------------------+
 ```
 
@@ -98,11 +103,11 @@ whichever VM is primary, same as reth0 for WAN.
 | Network | Purpose | Incus Config |
 |---------|---------|-------------|
 | `incusbr0` | Management (existing, DHCP) | default |
-| `bpfrx-ha-heartbeat` | Cluster heartbeat (UDP:4784) | ipv4.address=none, ipv6.address=none |
-| `bpfrx-ha-fabric` | Session/config/IPsec sync (TCP) | ipv4.address=none, ipv6.address=none |
-| `bpfrx-ha-lan` | LAN segment (reth1 member per VM) | ipv4.address=none, ipv6.address=none |
+| `bpfrx-heartbeat` | Cluster heartbeat (UDP:4784) | ipv4.address=none, ipv6.address=none |
+| `bpfrx-fabric` | Session/config/IPsec sync (TCP) | ipv4.address=none, ipv6.address=none |
+| `bpfrx-clan` | LAN segment (reth1 member per VM) | ipv4.address=none, ipv6.address=none |
 
-### Profile: `bpfrx-ha-cluster`
+### Profile: `bpfrx-cluster`
 
 ```
 CPU:    4 vCPU
@@ -113,13 +118,14 @@ Disk:   20 GB (pool: default)
 | Device | VM Interface | Renamed To | Network | Purpose |
 |--------|-------------|-----------|---------|---------|
 | `eth0` | enp5s0 | fxp0 | incusbr0 | Management (DHCP) |
-| `eth1` | enp6s0 | fxp1 | bpfrx-ha-heartbeat | Heartbeat / control |
-| `eth2` | enp7s0 | fab0 | bpfrx-ha-fabric | Fabric sync |
-| `eth3` | enp8s0 | ge-X-0-0 | bpfrx-ha-lan | LAN (reth1 member) |
+| `eth1` | enp6s0 | fxp1 | bpfrx-heartbeat | Heartbeat / control |
+| `eth2` | enp7s0 | fab0 | bpfrx-fabric | Fabric sync |
+| `eth3` | enp8s0 | ge-X-0-0 | bpfrx-clan | LAN (reth1 member) |
 
-SR-IOV WAN device added per-VM after launch (becomes `ge-X-0-1`):
+SR-IOV WAN VF added per-VM as PCI passthrough (becomes `ge-X-0-1`):
 ```bash
-incus config device add $vm wan-vf nic nictype=sriov parent=eno6np1
+incus config device add $vm wan-vf pci address=0000:b7:06.0  # VF0 for fw0
+incus config device add $vm wan-vf pci address=0000:b7:06.1  # VF1 for fw1
 ```
 
 Where X = 0 for node 0 (`ge-0-0-0`, `ge-0-0-1`) and X = 7 for node 1 (`ge-7-0-0`, `ge-7-0-1`).
@@ -130,7 +136,7 @@ Where X = 0 for node 0 (`ge-0-0-0`, `ge-0-0-1`) and X = 7 for node 1 (`ge-7-0-0`
 |----------|------|------|
 | `bpfrx-fw0` | VM | Firewall node 0 (primary, priority 200) |
 | `bpfrx-fw1` | VM | Firewall node 1 (secondary, priority 100) |
-| `ha-lan-host` | Container | Test traffic source/sink on LAN |
+| `cluster-lan-host` | Container | Test traffic source/sink on LAN (eth0 only) |
 
 ## Interface Mapping
 
@@ -144,7 +150,7 @@ Where X = 0 for node 0 (`ge-0-0-0`, `ge-0-0-1`) and X = 7 for node 1 (`ge-7-0-0`
 | enp6s0 | fxp1 | fxp1 | virtio_net | native | Heartbeat / control |
 | enp7s0 | fab0 | fab0 | virtio_net | native | Fabric sync |
 | enp8s0 | ge-0-0-0 | ge-0/0/0 | virtio_net | native | LAN (reth1 member) |
-| enp*s* (VF) | ge-0-0-1 | ge-0/0/1 | iavf | generic | WAN (reth0 member) |
+| enp9s0f0 (VF) | ge-0-0-1 | ge-0/0/1 | iavf | generic | WAN (reth0 member) |
 
 **Node 1 (bpfrx-fw1):**
 
@@ -154,13 +160,13 @@ Where X = 0 for node 0 (`ge-0-0-0`, `ge-0-0-1`) and X = 7 for node 1 (`ge-7-0-0`
 | enp6s0 | fxp1 | fxp1 | virtio_net | native | Heartbeat / control |
 | enp7s0 | fab0 | fab0 | virtio_net | native | Fabric sync |
 | enp8s0 | ge-7-0-0 | ge-7/0/0 | virtio_net | native | LAN (reth1 member) |
-| enp*s* (VF) | ge-7-0-1 | ge-7/0/1 | iavf | generic | WAN (reth0 member) |
+| enp9s0f0 (VF) | ge-7-0-1 | ge-7/0/1 | iavf | generic | WAN (reth0 member) |
 
 ### RETH Bonds
 
 | RETH | Node 0 Member | Node 1 Member | VIP | Zone | Purpose |
 |------|--------------|--------------|-----|------|---------|
-| reth0 | ge-0/0/1 | ge-7/0/1 | 172.16.50.10/24 | wan | WAN uplink |
+| reth0 | ge-0/0/1 | ge-7/0/1 | 172.16.50.6/24 (VLAN 50) | wan | WAN uplink |
 | reth1 | ge-0/0/0 | ge-7/0/0 | 10.0.60.1/24 | lan | LAN |
 
 ## IP Addressing
@@ -176,19 +182,22 @@ Where X = 0 for node 0 (`ge-0-0-0`, `ge-0-0-1`) and X = 7 for node 1 (`ge-7-0-0`
 
 | RETH | VIP | Gateway for |
 |------|-----|-------------|
-| reth0 | 172.16.50.10/24 | WAN uplink |
-| reth1 | 10.0.60.1/24 | ha-lan-host |
+| reth0 | 172.16.50.6/24 | WAN uplink |
+| reth1 | 10.0.60.1/24 | cluster-lan-host |
 
 ### Test Container
 
 | Interface | Network | Address | Gateway |
 |-----------|---------|---------|---------|
-| eth1 | bpfrx-ha-lan | 10.0.60.102/24 | 10.0.60.1 (reth1) |
+| eth0 | bpfrx-clan | 10.0.60.102/24 | 10.0.60.1 (reth1) |
 
 ## Cluster Configuration
 
 A single config file (`docs/ha-cluster.conf`) is loaded on both nodes. The
 `apply-groups "${node}"` directive selects node-specific overrides at commit time.
+
+Node ID is read from `/etc/bpfrx/node-id` (plain integer: 0 or 1). If this file
+does not exist, the daemon runs in standalone (non-cluster) mode.
 
 ### Node-Specific Settings (via groups)
 
@@ -219,14 +228,34 @@ chassis {
             node 0 priority 200;
             node 1 priority 100;
             preempt;
+        }
+        redundancy-group 1 {
+            node 0 priority 200;
+            node 1 priority 100;
+            preempt;
+            gratuitous-arp-count 8;
             interface-monitor {
-                reth0 weight 255;
-                reth1 weight 128;
+                ge-0/0/1 weight 255;
+                ge-7/0/1 weight 255;
+            }
+        }
+        redundancy-group 2 {
+            node 0 priority 200;
+            node 1 priority 100;
+            preempt;
+            gratuitous-arp-count 8;
+            interface-monitor {
+                ge-0/0/0 weight 255;
+                ge-7/0/0 weight 255;
             }
         }
     }
 }
 ```
+
+- **RG0**: Control plane (cluster management, no interface-monitor)
+- **RG1**: reth0/WAN — monitors both nodes' WAN physical interfaces
+- **RG2**: reth1/LAN — monitors both nodes' LAN physical interfaces
 
 ### Security Zones
 
@@ -296,76 +325,45 @@ system {
 
 ## Setup Procedure
 
-### 1. Create Networks
+All setup is automated via `test/incus/cluster-setup.sh`:
 
 ```bash
-for net in bpfrx-ha-heartbeat bpfrx-ha-fabric bpfrx-ha-lan; do
-    incus network create "$net" \
-        ipv4.address=none ipv4.nat=false \
-        ipv6.address=none ipv6.nat=false
-done
+./test/incus/cluster-setup.sh init       # Create networks + profile
+./test/incus/cluster-setup.sh create     # Launch both VMs + test container
+./test/incus/cluster-setup.sh deploy all # Build bpfrxd, push to both VMs
 ```
 
-### 2. Create Profile
-
+Or via Makefile targets:
 ```bash
-incus profile create bpfrx-ha-cluster
-incus profile set bpfrx-ha-cluster limits.cpu=4
-incus profile set bpfrx-ha-cluster limits.memory=4GB
-incus profile device add bpfrx-ha-cluster root disk pool=default path=/ size=20GB
-incus profile device add bpfrx-ha-cluster eth0 nic network=incusbr0 name=enp5s0
-incus profile device add bpfrx-ha-cluster eth1 nic network=bpfrx-ha-heartbeat name=enp6s0
-incus profile device add bpfrx-ha-cluster eth2 nic network=bpfrx-ha-fabric name=enp7s0
-incus profile device add bpfrx-ha-cluster eth3 nic network=bpfrx-ha-lan name=enp8s0
+make cluster-init     # Create networks + profile
+make cluster-create   # Launch both VMs + test container
+make cluster-deploy   # Build + push to both VMs (NODE=0|1 for single)
+make cluster-destroy  # Tear down
+make cluster-status   # Show status
+make cluster-ssh NODE=0|1  # Shell into VM
+make cluster-logs NODE=0|1 # Show logs
+make cluster-start/stop/restart  # Service lifecycle (NODE=0|1|all)
 ```
 
-### 3. Launch VMs
+### What `create` does per VM
 
-```bash
-for vm in bpfrx-fw0 bpfrx-fw1; do
-    incus launch images:debian/13 "$vm" --vm --profile bpfrx-ha-cluster
-    incus config device add "$vm" wan-vf nic nictype=sriov parent=eno6np1
-done
-```
+1. Launch Debian 13 VM with `bpfrx-cluster` profile (4 virtio NICs)
+2. Add SR-IOV VF via PCI passthrough (stop VM → add device → restart)
+3. Write `.link` files for vSRX-style interface renaming (MAC-based)
+4. Install packages: FRR, strongSwan, tcpdump, iperf3, bpftool, ethtool, etc.
+5. Upgrade kernel to 6.18+ from Debian unstable
+6. Set GRUB: `init_on_alloc=0` for XDP performance
+7. Configure sysctl: BPF JIT, IP forwarding, RA disable
+8. Write `/etc/bpfrx/node-id` (0 or 1)
+9. Reboot for new kernel
 
-### 4. Provision VMs
+### What `deploy` does per VM
 
-On each VM:
-- Upgrade kernel to 6.18+ from Debian unstable
-- Install: frr, strongswan, iproute2, tcpdump, iperf3, bpftool, radvd
-- Set GRUB: `init_on_alloc=0`
-- Enable: `net.core.bpf_jit_enable=1`, `net.ipv4.ip_forward=1`, IPv6 forwarding
-- Write `.link` files for interface renaming (MAC-based, using vSRX names)
-- Write `setup.sh` bootstrap for first-boot interface rename
-
-### 5. Launch Test Container
-
-```bash
-incus launch images:debian/13 ha-lan-host
-incus network attach bpfrx-ha-lan ha-lan-host eth1
-```
-
-Configure inside container:
-```bash
-ip addr add 10.0.60.102/24 dev eth1
-ip link set eth1 up
-ip route add default via 10.0.60.1
-```
-
-### 6. Deploy bpfrxd
-
-```bash
-make build && make build-ctl
-# Push to each VM:
-for vm in bpfrx-fw0 bpfrx-fw1; do
-    incus file push bpfrxd "$vm/usr/local/sbin/bpfrxd"
-    incus file push cli "$vm/usr/local/sbin/cli"
-done
-# Push the single config file to both VMs, enable service, start
-for vm in bpfrx-fw0 bpfrx-fw1; do
-    incus file push docs/ha-cluster.conf "$vm/etc/bpfrx/bpfrx.conf"
-done
-```
+1. Build `bpfrxd` and `cli` binaries
+2. Stop running service, push binaries to `/usr/local/sbin/`
+3. Push unified `docs/ha-cluster.conf` to `/etc/bpfrx/bpfrx.conf`
+4. Ensure `/etc/bpfrx/node-id` exists
+5. Install and enable systemd service
 
 ## Test Cases
 
@@ -393,10 +391,10 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw0 -- cli
 **Objective:** Verify traffic flows from LAN container through the primary firewall to WAN.
 
 ```bash
-# From ha-lan-host:
-ping -c 5 172.16.50.1      # WAN gateway (via reth0)
-ping -c 5 8.8.8.8          # Internet (SNAT via reth0)
-ping -c 5 10.0.60.1        # reth1 VIP
+# From cluster-lan-host:
+incus exec cluster-lan-host -- ping -c 5 172.16.50.1   # WAN gateway (via reth0)
+incus exec cluster-lan-host -- ping -c 5 8.8.8.8       # Internet (SNAT via reth0)
+incus exec cluster-lan-host -- ping -c 5 10.0.60.1     # reth1 VIP
 
 # Verify session on primary:
 printf 'show security flow session\nexit\n' | incus exec bpfrx-fw0 -- cli
@@ -412,8 +410,8 @@ printf 'show security flow session\nexit\n' | incus exec bpfrx-fw0 -- cli
 **Objective:** Verify secondary takes over when primary fails.
 
 ```bash
-# 1. Start continuous ping from ha-lan-host
-incus exec ha-lan-host -- ping 8.8.8.8 &
+# 1. Start continuous ping from cluster-lan-host
+incus exec cluster-lan-host -- ping 8.8.8.8 &
 
 # 2. Stop primary
 incus exec bpfrx-fw0 -- systemctl stop bpfrxd
@@ -430,7 +428,7 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
 **Pass criteria:**
 - fw1 becomes primary within ~5 seconds
 - GARP sent for reth0, reth1 VIPs
-- ha-lan-host traffic resumes after brief interruption
+- cluster-lan-host traffic resumes after brief interruption
 - Sessions synced from fw0 survive on fw1
 
 ### TC-4: Failover — Recovery and Preemption
@@ -474,8 +472,8 @@ printf 'show configuration security policies from-zone lan to-zone wan | display
 **Objective:** Verify active sessions are synced to secondary for hitless failover.
 
 ```bash
-# 1. Create a long-lived session from ha-lan-host
-incus exec ha-lan-host -- iperf3 -c <wan-target> -t 60 &
+# 1. Create a long-lived session from cluster-lan-host
+incus exec cluster-lan-host -- iperf3 -c <wan-target> -t 60 &
 
 # 2. Verify session on fw0
 printf 'show security flow session\nexit\n' | incus exec bpfrx-fw0 -- cli
@@ -493,7 +491,7 @@ printf 'show security flow session\nexit\n' | incus exec bpfrx-fw1 -- cli
 **Objective:** Verify failover when a monitored RETH member loses link.
 
 ```bash
-# Simulate WAN VF failure by detaching the SR-IOV device:
+# Simulate WAN VF failure by detaching the PCI device:
 incus config device remove bpfrx-fw0 wan-vf
 
 # Monitor cluster status (reth0 weight should drop to 0):
@@ -511,8 +509,8 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
 
 ```bash
 # Server on WAN side (or use external target)
-# Client on ha-lan-host:
-incus exec ha-lan-host -- iperf3 -c <target> -P 4 -t 30 -C bbr
+# Client on cluster-lan-host:
+incus exec cluster-lan-host -- iperf3 -c <target> -P 4 -t 30 -C bbr
 ```
 
 **Pass criteria:**
@@ -522,11 +520,11 @@ incus exec ha-lan-host -- iperf3 -c <target> -P 4 -t 30 -C bbr
 
 ### TC-9: DHCP Server on reth1
 
-**Objective:** Verify ha-lan-host can obtain an address via DHCP from the primary.
+**Objective:** Verify cluster-lan-host can obtain an address via DHCP from the primary.
 
 ```bash
-incus exec ha-lan-host -- dhclient eth1
-incus exec ha-lan-host -- ip addr show eth1
+incus exec cluster-lan-host -- dhclient eth0
+incus exec cluster-lan-host -- ip addr show eth0
 ```
 
 **Pass criteria:**
@@ -538,8 +536,8 @@ incus exec ha-lan-host -- ip addr show eth1
 **Objective:** Verify cluster handles heartbeat network failure gracefully.
 
 ```bash
-# Disconnect heartbeat bridge (simulates network partition)
-incus network detach bpfrx-ha-heartbeat bpfrx-fw1 eth1
+# Disconnect heartbeat by removing device from fw1
+incus config device remove bpfrx-fw1 eth1
 
 # Both nodes should detect heartbeat loss
 # Node 1 (lower priority) should go secondary-hold
@@ -565,7 +563,8 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
 
 ## SR-IOV Notes
 
-- `eno6np1` (i40e) has 32 VFs; this setup uses 2, leaving 30 for other uses
+- `eno6np1` (i40e) has 32 VFs; this setup uses 2 (VF0+VF1), leaving 30 for other uses
+- VFs are passed through as PCI devices (`type=pci`), not `nictype=sriov` (which has hotplug issues)
 - VFs use `iavf` driver inside VMs — **no native XDP**, only generic/SKB mode
 - `redirect_capable` map in BPF marks VF interfaces as non-redirectable
 - VF interfaces fall back to `XDP_PASS` (kernel forwarding) instead of `bpf_redirect_map`

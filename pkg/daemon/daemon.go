@@ -94,6 +94,10 @@ type Daemon struct {
 	eventEngine   *eventengine.Engine
 	aggregator    *logging.SessionAggregator
 	aggCancel     context.CancelFunc
+
+	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
+	// Used by collectDHCPRoutes to exclude management routes from FRR.
+	mgmtVRFInterfaces map[string]bool
 }
 
 // New creates a new Daemon.
@@ -786,6 +790,10 @@ func enableForwarding() {
 		"/proc/sys/net/ipv6/conf/all/forwarding":    "1",
 		"/proc/sys/net/ipv6/conf/all/accept_ra":     "0",
 		"/proc/sys/net/ipv6/conf/default/accept_ra": "0",
+		// l3mdev_accept: allow accepting TCP/UDP connections on management VRF
+		// interfaces from sockets not bound to the VRF (needed for SSH).
+		"/proc/sys/net/ipv4/tcp_l3mdev_accept": "1",
+		"/proc/sys/net/ipv4/udp_l3mdev_accept": "1",
 	}
 	for path, val := range sysctls {
 		if err := os.WriteFile(path, []byte(val), 0644); err != nil {
@@ -901,6 +909,38 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			}
 		}
 	}
+
+	// 0.5. Create management VRF for fxp* interfaces.
+	// Management/control interfaces (fxp0, fxp1, fab0) are placed in a separate
+	// routing instance so their DHCP/static routes don't pollute the data-plane
+	// routing table. This mirrors Junos __juniper_private1/2__ instances.
+	d.mgmtVRFInterfaces = nil
+	if d.routing != nil {
+		mgmtIfaces := make(map[string]bool)
+		for name := range cfg.Interfaces.Interfaces {
+			if strings.HasPrefix(name, "fxp") || strings.HasPrefix(name, "fab") {
+				mgmtIfaces[name] = true
+			}
+		}
+		if len(mgmtIfaces) > 0 {
+			const mgmtVRFName = "mgmt"
+			const mgmtTableID = 999
+			if err := d.routing.CreateVRF(mgmtVRFName, mgmtTableID); err != nil {
+				slog.Warn("failed to create management VRF", "err", err)
+			} else {
+				d.mgmtVRFInterfaces = mgmtIfaces
+				for ifName := range mgmtIfaces {
+					if err := d.routing.BindInterfaceToVRF(ifName, mgmtVRFName); err != nil {
+						slog.Warn("failed to bind interface to management VRF",
+							"interface", ifName, "err", err)
+					}
+				}
+			}
+		}
+	}
+
+	// 0.6. Program default routes in the management VRF for DHCP leases.
+	d.applyMgmtVRFRoutes()
 
 	// 1. Create tunnel interfaces
 	if d.routing != nil {
@@ -1546,6 +1586,8 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context, cfg *config.
 }
 
 // collectDHCPRoutes builds FRR DHCPRoute entries from active DHCP leases.
+// Interfaces bound to the management VRF are excluded — their routes are
+// programmed directly via netlink into the VRF table by applyMgmtVRFRoutes.
 func (d *Daemon) collectDHCPRoutes() []frr.DHCPRoute {
 	if d.dhcp == nil {
 		return nil
@@ -1553,6 +1595,9 @@ func (d *Daemon) collectDHCPRoutes() []frr.DHCPRoute {
 	var routes []frr.DHCPRoute
 	for _, lease := range d.dhcp.Leases() {
 		if !lease.Gateway.IsValid() {
+			continue
+		}
+		if d.mgmtVRFInterfaces[lease.Interface] {
 			continue
 		}
 		dr := frr.DHCPRoute{
@@ -1563,6 +1608,54 @@ func (d *Daemon) collectDHCPRoutes() []frr.DHCPRoute {
 		routes = append(routes, dr)
 	}
 	return routes
+}
+
+// applyMgmtVRFRoutes programs default routes in the management VRF table
+// for DHCP leases on management interfaces (fxp*, fab*). These routes are
+// managed via netlink (not FRR) because FRR doesn't own the management VRF.
+func (d *Daemon) applyMgmtVRFRoutes() {
+	if d.dhcp == nil || len(d.mgmtVRFInterfaces) == 0 {
+		return
+	}
+	const mgmtTableID = 999
+	nlh, err := netlink.NewHandle()
+	if err != nil {
+		slog.Warn("mgmt VRF routes: failed to get netlink handle", "err", err)
+		return
+	}
+	defer nlh.Close()
+
+	for _, lease := range d.dhcp.Leases() {
+		if !lease.Gateway.IsValid() || !d.mgmtVRFInterfaces[lease.Interface] {
+			continue
+		}
+		link, err := nlh.LinkByName(lease.Interface)
+		if err != nil {
+			slog.Warn("mgmt VRF route: interface not found",
+				"interface", lease.Interface, "err", err)
+			continue
+		}
+		var dst *net.IPNet
+		if lease.Family == dhcp.AFInet6 {
+			dst = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
+		} else {
+			dst = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
+		}
+		gwSlice := lease.Gateway.AsSlice()
+		route := &netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Dst:       dst,
+			Gw:        net.IP(gwSlice),
+			Table:     mgmtTableID,
+		}
+		if err := nlh.RouteReplace(route); err != nil {
+			slog.Warn("mgmt VRF route: failed to add default route",
+				"interface", lease.Interface, "gw", lease.Gateway, "table", mgmtTableID, "err", err)
+		} else {
+			slog.Info("mgmt VRF default route installed",
+				"interface", lease.Interface, "gw", lease.Gateway, "table", mgmtTableID)
+		}
+	}
 }
 
 // logFinalStats reads and logs global counter summary before shutdown.

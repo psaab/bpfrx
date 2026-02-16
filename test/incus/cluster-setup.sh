@@ -4,6 +4,10 @@
 # Creates a two-VM HA cluster with heartbeat, fabric, and shared LAN
 # networks, plus a test container on the cluster LAN.
 #
+# Single-config model: both nodes share docs/ha-cluster.conf with
+# apply-groups "${node}" expansion. Node ID comes from /etc/bpfrx/node-id.
+# Interface names follow vSRX conventions: fxp0, fxp1, fab0, ge-X/Y/Z.
+#
 # Usage:
 #   ./test/incus/cluster-setup.sh init              # Create networks + profile
 #   ./test/incus/cluster-setup.sh create             # Launch both VMs + test container
@@ -32,6 +36,8 @@ PROFILE="bpfrx-cluster"
 IMAGE_VM="images:debian/13"
 IMAGE_CT="images:debian/13"
 SRIOV_PARENT="eno6np1"
+# PCI addresses for SR-IOV VFs (one per VM, from $SRIOV_PARENT)
+VF_PCI=("0000:b7:06.0" "0000:b7:06.1")
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -39,7 +45,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 NETWORKS=(
 	"bpfrx-heartbeat:none:false"
 	"bpfrx-fabric:none:false"
-	"bpfrx-cluster-lan:none:false"
+	"bpfrx-clan:none:false"
 )
 
 info()  { echo "==> $*"; }
@@ -53,6 +59,20 @@ vm_name() {
 		1) echo "$VM1" ;;
 		*) die "Invalid node index: $1 (must be 0 or 1)" ;;
 	esac
+}
+
+# vSRX LAN interface name for a given node index
+# Node 0: ge-0-0-0, Node 1: ge-7-0-0
+lan_ifname() {
+	local idx="$1"
+	if [[ "$idx" == "0" ]]; then echo "ge-0-0-0"; else echo "ge-7-0-0"; fi
+}
+
+# vSRX WAN interface name for a given node index
+# Node 0: ge-0-0-1, Node 1: ge-7-0-1
+wan_ifname() {
+	local idx="$1"
+	if [[ "$idx" == "0" ]]; then echo "ge-0-0-1"; else echo "ge-7-0-1"; fi
 }
 
 # ── Init ─────────────────────────────────────────────────────────────
@@ -109,7 +129,7 @@ devices:
     type: nic
   eth3:
     name: enp8s0
-    network: bpfrx-cluster-lan
+    network: bpfrx-clan
     type: nic
 YAML
 }
@@ -150,16 +170,35 @@ create_vm() {
 		fi
 	done
 
-	# Add SR-IOV VF from parent NIC
-	info "Adding SR-IOV VF from $SRIOV_PARENT to $vm..."
-	incus config device add "$vm" wan-vf nic nictype=sriov parent="$SRIOV_PARENT"
+	# Stop VM to add SR-IOV VF via PCI passthrough (hotplug doesn't work)
+	info "Stopping VM to add SR-IOV VF..."
+	incus stop "$vm" --force
+	sleep 2
 
-	provision_vm "$vm"
+	local pci="${VF_PCI[$idx]}"
+	info "Adding SR-IOV VF PCI $pci to $vm..."
+	incus config device add "$vm" wan-vf pci address="$pci"
+
+	info "Starting VM with VF..."
+	incus start "$vm"
+
+	# Wait for agent again after restart
+	tries=0
+	while ! incus exec "$vm" -- true &>/dev/null; do
+		sleep 2
+		tries=$((tries + 1))
+		if [[ $tries -ge 30 ]]; then
+			die "VM agent for $vm did not become ready after 60 seconds"
+		fi
+	done
+
+	provision_vm "$vm" "$idx"
 	info "VM $vm ready."
 }
 
 provision_vm() {
 	local vm="$1"
+	local idx="$2"
 
 	# Wait for systemd to be ready
 	info "Waiting for system to be ready ($vm)..."
@@ -174,11 +213,13 @@ provision_vm() {
 	done
 
 	# Bootstrap systemd-networkd .link files for interface renaming
-	info "Writing bootstrap networkd .link files ($vm)..."
-	local mac_mgmt mac_hb mac_fab mac_lan
-	mac_mgmt=$(incus exec "$vm" -- cat /sys/class/net/enp5s0/address 2>/dev/null || true)
-	mac_hb=$(incus exec "$vm" -- cat /sys/class/net/enp6s0/address 2>/dev/null || true)
-	mac_fab=$(incus exec "$vm" -- cat /sys/class/net/enp7s0/address 2>/dev/null || true)
+	# Uses vSRX naming: fxp0 (mgmt), fxp1 (heartbeat), fab0 (fabric),
+	# ge-X-0-0 (LAN), ge-X-0-1 (WAN/SR-IOV)
+	info "Writing bootstrap networkd .link files ($vm, node $idx)..."
+	local mac_fxp0 mac_fxp1 mac_fab0 mac_lan
+	mac_fxp0=$(incus exec "$vm" -- cat /sys/class/net/enp5s0/address 2>/dev/null || true)
+	mac_fxp1=$(incus exec "$vm" -- cat /sys/class/net/enp6s0/address 2>/dev/null || true)
+	mac_fab0=$(incus exec "$vm" -- cat /sys/class/net/enp7s0/address 2>/dev/null || true)
 	mac_lan=$(incus exec "$vm" -- cat /sys/class/net/enp8s0/address 2>/dev/null || true)
 
 	# SR-IOV VF interface name varies — find it by exclusion
@@ -193,7 +234,11 @@ provision_vm() {
 		done
 	' 2>/dev/null || true)
 
-	for pair in "mgmt0:$mac_mgmt" "hb0:$mac_hb" "fab0:$mac_fab" "lan-vf:$mac_lan" "wan-vf:$mac_wan"; do
+	local lan_name wan_name
+	lan_name=$(lan_ifname "$idx")
+	wan_name=$(wan_ifname "$idx")
+
+	for pair in "fxp0:$mac_fxp0" "fxp1:$mac_fxp1" "fab0:$mac_fab0" "${lan_name}:$mac_lan" "${wan_name}:$mac_wan"; do
 		local name="${pair%%:*}" mac="${pair#*:}"
 		if [[ -n "$mac" ]]; then
 			incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-${name}.link << LINKEOF
@@ -212,7 +257,7 @@ LINKEOF"
 
 	# Bring up interfaces
 	info "Bringing up interfaces ($vm)..."
-	for iface in mgmt0 hb0 fab0 lan-vf wan-vf; do
+	for iface in fxp0 fxp1 fab0 "$lan_name" "$wan_name"; do
 		incus exec "$vm" -- ip link set "$iface" up 2>/dev/null || true
 	done
 
@@ -227,7 +272,7 @@ EOF'
 	incus exec "$vm" -- sysctl --system
 
 	info "Installing packages ($vm, this may take a few minutes)..."
-	incus exec "$vm" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server radvd chrony'
+	incus exec "$vm" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server radvd chrony ethtool'
 
 	# Upgrade kernel to latest from Debian unstable
 	info "Adding Debian unstable repo for kernel upgrade ($vm)..."
@@ -270,6 +315,11 @@ EOF'
 	incus exec "$vm" -- systemctl enable chrony
 	incus exec "$vm" -- bash -c 'sed -i "s/^pool /#pool /" /etc/chrony/chrony.conf; sed -i "s/^server /#server /" /etc/chrony/chrony.conf'
 	incus exec "$vm" -- mkdir -p /etc/chrony/sources.d
+
+	# Write cluster node ID file for ${node} variable expansion
+	info "Writing node-id file ($vm, node $idx)..."
+	incus exec "$vm" -- mkdir -p /etc/bpfrx
+	incus exec "$vm" -- bash -c "echo $idx > /etc/bpfrx/node-id"
 }
 
 create_lan_host() {
@@ -279,19 +329,20 @@ create_lan_host() {
 	fi
 
 	info "Launching test container $LAN_HOST..."
-	incus launch "$IMAGE_CT" "$LAN_HOST"
+	incus launch "$IMAGE_CT" "$LAN_HOST" -s default
+
+	# Attach only the cluster LAN network
+	incus config device add "$LAN_HOST" eth0 nic network=bpfrx-clan
+	incus restart "$LAN_HOST"
 
 	info "Waiting for container to start..."
 	sleep 3
-
-	# Attach to cluster LAN network
-	incus config device add "$LAN_HOST" eth1 nic network=bpfrx-cluster-lan
 
 	# Configure static IP
 	info "Configuring static IP on $LAN_HOST..."
 	incus exec "$LAN_HOST" -- bash -c 'cat > /etc/systemd/network/10-cluster-lan.network <<EOF
 [Match]
-Name=eth1
+Name=eth0
 
 [Network]
 Address=10.0.60.102/24
@@ -355,7 +406,6 @@ deploy_vm() {
 	local idx="$1"
 	local vm
 	vm=$(vm_name "$idx")
-	local conf="bpfrx-cluster-fw${idx}.conf"
 
 	if ! incus info "$vm" &>/dev/null 2>&1; then
 		die "Instance $vm does not exist. Run '$0 create' first."
@@ -373,14 +423,18 @@ deploy_vm() {
 	info "Pushing cli to $vm..."
 	incus file push "$PROJECT_ROOT/cli" "$vm/usr/local/sbin/cli" --mode 0755
 
-	# Push per-node config
-	if [[ -f "${SCRIPT_DIR}/${conf}" ]]; then
-		info "Pushing config ${conf} to $vm..."
+	# Push the single unified HA config (same file for both nodes)
+	local conf="${PROJECT_ROOT}/docs/ha-cluster.conf"
+	if [[ -f "$conf" ]]; then
+		info "Pushing unified HA config to $vm..."
 		incus exec "$vm" -- mkdir -p /etc/bpfrx
-		incus file push "${SCRIPT_DIR}/${conf}" "$vm/etc/bpfrx/bpfrx.conf"
+		incus file push "$conf" "$vm/etc/bpfrx/bpfrx.conf"
 	else
-		warn "Config file ${conf} not found in ${SCRIPT_DIR}"
+		warn "Config file $conf not found"
 	fi
+
+	# Ensure node-id file exists
+	incus exec "$vm" -- bash -c "echo $idx > /etc/bpfrx/node-id"
 
 	# Install systemd unit
 	info "Installing systemd service on $vm..."

@@ -7491,12 +7491,27 @@ func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.Schem
 	return nil
 }
 
+func (c *CLI) clusterPrefix() string {
+	if c.cluster == nil {
+		return ""
+	}
+	rg0 := c.cluster.GroupState(0)
+	if rg0 == nil {
+		return ""
+	}
+	role := "secondary"
+	if rg0.State == cluster.StatePrimary {
+		role = "primary"
+	}
+	return fmt.Sprintf("{%s:node%d}", role, c.cluster.NodeID())
+}
+
 func (c *CLI) operationalPrompt() string {
-	return fmt.Sprintf("%s@%s> ", c.username, c.hostname)
+	return fmt.Sprintf("%s%s@%s> ", c.clusterPrefix(), c.username, c.hostname)
 }
 
 func (c *CLI) configPrompt() string {
-	return fmt.Sprintf("%s@%s# ", c.username, c.hostname)
+	return fmt.Sprintf("%s%s@%s# ", c.clusterPrefix(), c.username, c.hostname)
 }
 
 func (c *CLI) showOperationalHelp() {

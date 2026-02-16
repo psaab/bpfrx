@@ -168,6 +168,9 @@ message GetStatusResponse {
   bool config_loaded = 3;
   int32 zone_count = 4;
   int32 session_count = 5;
+  // Cluster status (empty string if not in a cluster)
+  string cluster_role = 6;  // "primary" or "secondary"
+  int32 cluster_node_id = 7; // node ID (0, 1, ...)
 }
 
 message GetGlobalStatsRequest {}

@@ -57,10 +57,12 @@ func main() {
 	}
 
 	c := &ctl{
-		client:     client,
-		hostname:   hostname,
-		username:   username,
-		configMode: false,
+		client:        client,
+		hostname:      hostname,
+		username:      username,
+		configMode:    false,
+		clusterRole:   resp.ClusterRole,
+		clusterNodeID: resp.ClusterNodeId,
 	}
 
 	rc := &remoteCompleter{ctl: c}
@@ -218,6 +220,8 @@ type ctl struct {
 	username   string
 	configMode bool
 	editPath   []string
+	clusterRole   string // "primary", "secondary", or "" (not clustered)
+	clusterNodeID int32
 
 	// Command cancellation: Ctrl-C during a running command cancels it.
 	cmdMu     sync.Mutex
@@ -2186,11 +2190,18 @@ func (c *ctl) handleCommit(args []string) error {
 	return nil
 }
 
-// refreshPrompt re-reads the system hostname and updates the readline prompt.
+// refreshPrompt re-reads the system hostname and cluster status, and updates the readline prompt.
 func (c *ctl) refreshPrompt() {
 	if h, err := os.Hostname(); err == nil && h != "" {
 		c.hostname = h
 	}
+	// Refresh cluster status from server.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if resp, err := c.client.GetStatus(ctx, &pb.GetStatusRequest{}); err == nil {
+		c.clusterRole = resp.ClusterRole
+		c.clusterNodeID = resp.ClusterNodeId
+	}
+	cancel()
 	if c.rl != nil {
 		if c.configMode {
 			c.rl.SetPrompt(c.configPrompt())
@@ -2752,12 +2763,19 @@ func (rc *remoteCompleter) Do(line []rune, pos int) ([][]rune, int) {
 
 // --- Prompts ---
 
+func (c *ctl) clusterPrefix() string {
+	if c.clusterRole == "" {
+		return ""
+	}
+	return fmt.Sprintf("{%s:node%d}", c.clusterRole, c.clusterNodeID)
+}
+
 func (c *ctl) operationalPrompt() string {
-	return fmt.Sprintf("%s@%s> ", c.username, c.hostname)
+	return fmt.Sprintf("%s%s@%s> ", c.clusterPrefix(), c.username, c.hostname)
 }
 
 func (c *ctl) configPrompt() string {
-	return fmt.Sprintf("%s@%s# ", c.username, c.hostname)
+	return fmt.Sprintf("%s%s@%s# ", c.clusterPrefix(), c.username, c.hostname)
 }
 
 // --- Help ---

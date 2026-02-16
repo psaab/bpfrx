@@ -2133,3 +2133,79 @@ func TestBandwidthAndPointToPointCombined(t *testing.T) {
 		t.Errorf("missing point-to-point, got:\n%s", got)
 	}
 }
+
+func TestDHCPRoutesSuppressedByStaticDefault(t *testing.T) {
+	m := New()
+	m.frrConf = filepath.Join(t.TempDir(), "frr.conf")
+	os.WriteFile(m.frrConf, []byte(""), 0644)
+
+	// With a static default route, DHCP IPv4 default should be suppressed
+	fc := &FullConfig{
+		StaticRoutes: []*config.StaticRoute{
+			{Destination: "0.0.0.0/0", NextHops: []config.NextHopEntry{{Address: "172.16.50.1"}}},
+		},
+		DHCPRoutes: []DHCPRoute{
+			{Gateway: "10.0.100.1"},
+		},
+	}
+	_ = m.ApplyFull(fc)
+	data, _ := os.ReadFile(m.frrConf)
+	got := string(data)
+
+	if !strings.Contains(got, "ip route 0.0.0.0/0 172.16.50.1") {
+		t.Errorf("missing static default route in:\n%s", got)
+	}
+	if strings.Contains(got, "10.0.100.1") {
+		t.Errorf("DHCP default route should be suppressed when static default exists, got:\n%s", got)
+	}
+}
+
+func TestDHCPRoutesNotSuppressedWithoutStaticDefault(t *testing.T) {
+	m := New()
+	m.frrConf = filepath.Join(t.TempDir(), "frr.conf")
+	os.WriteFile(m.frrConf, []byte(""), 0644)
+
+	// Without a static default route, DHCP default should be emitted
+	fc := &FullConfig{
+		StaticRoutes: []*config.StaticRoute{
+			{Destination: "10.0.0.0/8", NextHops: []config.NextHopEntry{{Address: "192.168.1.1"}}},
+		},
+		DHCPRoutes: []DHCPRoute{
+			{Gateway: "10.0.100.1"},
+		},
+	}
+	_ = m.ApplyFull(fc)
+	data, _ := os.ReadFile(m.frrConf)
+	got := string(data)
+
+	if !strings.Contains(got, "ip route 0.0.0.0/0 10.0.100.1 200") {
+		t.Errorf("DHCP default should be present without static default, got:\n%s", got)
+	}
+}
+
+func TestDHCPRoutesIPv6SuppressedByStaticDefault(t *testing.T) {
+	m := New()
+	m.frrConf = filepath.Join(t.TempDir(), "frr.conf")
+	os.WriteFile(m.frrConf, []byte(""), 0644)
+
+	// IPv6 static default suppresses IPv6 DHCP, but IPv4 DHCP remains
+	fc := &FullConfig{
+		Inet6StaticRoutes: []*config.StaticRoute{
+			{Destination: "::/0", NextHops: []config.NextHopEntry{{Address: "fe80::1", Interface: "wan0"}}},
+		},
+		DHCPRoutes: []DHCPRoute{
+			{Gateway: "10.0.100.1"},                              // IPv4 — should remain
+			{Gateway: "fe80::gw", Interface: "eth0", IsIPv6: true}, // IPv6 — should be suppressed
+		},
+	}
+	_ = m.ApplyFull(fc)
+	data, _ := os.ReadFile(m.frrConf)
+	got := string(data)
+
+	if !strings.Contains(got, "ip route 0.0.0.0/0 10.0.100.1 200") {
+		t.Errorf("IPv4 DHCP route should remain when only IPv6 default exists, got:\n%s", got)
+	}
+	if strings.Contains(got, "fe80::gw") {
+		t.Errorf("IPv6 DHCP route should be suppressed when IPv6 static default exists, got:\n%s", got)
+	}
+}

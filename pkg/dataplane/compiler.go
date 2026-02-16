@@ -749,6 +749,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 	//
 	// Skip interfaces created by the daemon itself (VRFs, tunnels).
 	daemonOwned := make(map[string]bool)
+	daemonOwned["vrf-mgmt"] = true // implicit management VRF for fxp*/fab*
 	for _, ri := range cfg.RoutingInstances {
 		if ri.InstanceType != "forwarding" {
 			daemonOwned["vrf-"+ri.Name] = true
