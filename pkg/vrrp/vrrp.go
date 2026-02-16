@@ -83,36 +83,61 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 		}
 		rgID := ifc.RedundancyGroup
 
-		// Collect all addresses from all units as virtual addresses.
-		var vips []string
-		// Sort unit numbers for deterministic order.
-		unitNums := make([]int, 0, len(ifc.Units))
-		for n := range ifc.Units {
-			unitNums = append(unitNums, n)
-		}
-		sort.Ints(unitNums)
-		for _, n := range unitNums {
-			unit := ifc.Units[n]
-			vips = append(vips, unit.Addresses...)
-		}
-		if len(vips) == 0 {
-			continue
-		}
-
 		pri := localPriority[rgID]
 		if pri == 0 {
 			pri = 100 // default to secondary priority
 		}
 
-		instances = append(instances, &Instance{
-			Interface:         config.LinuxIfName(ifc.Name),
-			GroupID:           100 + rgID,
-			Priority:          pri,
-			Preempt:           true,
-			AcceptData:        true,
-			AdvertiseInterval: 1,
-			VirtualAddresses:  vips,
-		})
+		linuxName := config.LinuxIfName(ifc.Name)
+
+		// For VLAN-tagged interfaces, create one VRRP instance per
+		// sub-interface (e.g. reth0.50) since the parent bond has no
+		// IPv4 and keepalived requires one for VRRP advertisements.
+		// For non-VLAN interfaces, use the base interface.
+		unitNums := make([]int, 0, len(ifc.Units))
+		for n := range ifc.Units {
+			unitNums = append(unitNums, n)
+		}
+		sort.Ints(unitNums)
+
+		if ifc.VlanTagging {
+			for _, n := range unitNums {
+				unit := ifc.Units[n]
+				if len(unit.Addresses) == 0 {
+					continue
+				}
+				subIface := linuxName
+				if unit.VlanID > 0 {
+					subIface = fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
+				}
+				instances = append(instances, &Instance{
+					Interface:         subIface,
+					GroupID:           100 + rgID,
+					Priority:          pri,
+					Preempt:           true,
+					AcceptData:        true,
+					AdvertiseInterval: 1,
+					VirtualAddresses:  unit.Addresses,
+				})
+			}
+		} else {
+			var vips []string
+			for _, n := range unitNums {
+				vips = append(vips, ifc.Units[n].Addresses...)
+			}
+			if len(vips) == 0 {
+				continue
+			}
+			instances = append(instances, &Instance{
+				Interface:         linuxName,
+				GroupID:           100 + rgID,
+				Priority:          pri,
+				Preempt:           true,
+				AcceptData:        true,
+				AdvertiseInterval: 1,
+				VirtualAddresses:  vips,
+			})
+		}
 	}
 	return instances
 }
@@ -130,6 +155,9 @@ func UpdatePriority(cfg *config.Config, localPriority map[int]int) error {
 const keepalivedConf = "/etc/keepalived/keepalived.conf"
 
 // Apply generates the keepalived config and manages the service.
+// If keepalived is already running, it reloads (SIGHUP) to pick up config
+// changes without cycling through FAULT state. A full restart is only done
+// when keepalived is not yet running.
 func Apply(instances []*Instance) error {
 	if len(instances) == 0 {
 		// No VRRP configured — stop keepalived if running
@@ -149,10 +177,27 @@ func Apply(instances []*Instance) error {
 	}
 	slog.Info("keepalived config written", "instances", len(instances))
 
-	// Enable and start/reload keepalived
 	_ = exec.Command("systemctl", "enable", "keepalived").Run()
-	if err := exec.Command("systemctl", "reload-or-restart", "keepalived").Run(); err != nil {
-		return fmt.Errorf("reload keepalived: %w", err)
+
+	// If keepalived is already running, reload config via SIGHUP.
+	// This avoids cycling through FAULT state on every priority update.
+	// keepalived recovers from FAULT automatically via netlink events
+	// when interfaces get their addresses.
+	out, _ := exec.Command("systemctl", "is-active", "keepalived").Output()
+	if strings.TrimSpace(string(out)) == "active" {
+		if err := exec.Command("systemctl", "reload", "keepalived").Run(); err != nil {
+			slog.Warn("keepalived reload failed, falling back to restart", "err", err)
+			if err := exec.Command("systemctl", "restart", "keepalived").Run(); err != nil {
+				return fmt.Errorf("restart keepalived: %w", err)
+			}
+		}
+		return nil
+	}
+
+	// Not running — start it. May enter FAULT initially if interfaces
+	// lack IPv4, but will recover via netlink when addresses appear.
+	if err := exec.Command("systemctl", "start", "keepalived").Run(); err != nil {
+		return fmt.Errorf("start keepalived: %w", err)
 	}
 	return nil
 }

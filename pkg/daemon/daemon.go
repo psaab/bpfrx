@@ -2922,18 +2922,33 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 }
 
 func (d *Daemon) watchClusterEvents(ctx context.Context) {
+	// Debounce VRRP updates: coalesce rapid cluster events into a single
+	// keepalived reload. Without this, every heartbeat-driven state change
+	// triggers a separate reload, flooding keepalived before it can settle.
+	var vrrpTimer *time.Timer
+	defer func() {
+		if vrrpTimer != nil {
+			vrrpTimer.Stop()
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case ev := <-d.cluster.Events():
-			// Update VRRP priority for RETH interfaces on any RG state change.
-			if cfg := d.store.ActiveConfig(); cfg != nil {
-				localPri := d.cluster.LocalPriorities()
-				if err := vrrp.UpdatePriority(cfg, localPri); err != nil {
-					slog.Warn("cluster: failed to update VRRP priority", "rg", ev.GroupID, "err", err)
-				}
+			// Debounced VRRP priority update — 2s coalesce window.
+			if vrrpTimer != nil {
+				vrrpTimer.Stop()
 			}
+			vrrpTimer = time.AfterFunc(2*time.Second, func() {
+				if cfg := d.store.ActiveConfig(); cfg != nil {
+					localPri := d.cluster.LocalPriorities()
+					if err := vrrp.UpdatePriority(cfg, localPri); err != nil {
+						slog.Warn("cluster: failed to update VRRP priority", "err", err)
+					}
+				}
+			})
 
 			// RG0-specific: config ownership and IPsec SA re-initiation.
 			if ev.GroupID == 0 {

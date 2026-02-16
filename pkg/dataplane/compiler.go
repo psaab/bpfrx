@@ -644,6 +644,17 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 	// Collect managed interface info for networkd config generation.
 	// Iterate over configured interfaces (not zones) to get a clean
 	// per-interface view including VLAN parent and sub-interface entries.
+	//
+	// For RETH interfaces with a redundancy group, VIP addresses are managed
+	// by keepalived (VRRP). The networkd .network file gets a link-local base
+	// address (169.254.RG.NODE/32) instead — keepalived requires at least one
+	// IPv4 on the interface for VRRP advertisements. Putting the VIP in both
+	// networkd AND keepalived causes conflicts: keepalived removes the address
+	// when entering FAULT/BACKUP state.
+	clusterNodeID := -1
+	if cfg.Chassis.Cluster != nil {
+		clusterNodeID = cfg.Chassis.Cluster.NodeID
+	}
 	seen := make(map[string]bool)
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
 		linuxName := config.LinuxIfName(ifName)
@@ -655,6 +666,9 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 		if mac == "" {
 			continue
 		}
+
+		// isVRRPReth: true when keepalived manages this interface's VIPs.
+		isVRRPReth := ifCfg.RedundancyGroup > 0 && clusterNodeID >= 0
 
 		if ifCfg.VlanTagging {
 			// VLAN parent: no addresses, just rename
@@ -677,9 +691,14 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					subName := fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
 					if !seen[subName] {
 						seen[subName] = true
+						addrs := unit.Addresses
+						if isVRRPReth {
+							// Replace VIP addresses with a link-local base for VRRP.
+							addrs = []string{fmt.Sprintf("169.254.%d.%d/32", ifCfg.RedundancyGroup, clusterNodeID+1)}
+						}
 						result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 							Name:             subName,
-							Addresses:        unit.Addresses,
+							Addresses:        addrs,
 							PrimaryAddress:   unit.PrimaryAddress,
 							PreferredAddress: unit.PreferredAddress,
 							DHCPv4:           unit.DHCP,
@@ -726,12 +745,18 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				if unitMTU > 0 && (mtu == 0 || unitMTU < mtu) {
 					mtu = unitMTU
 				}
-				// RETH interfaces backed by VRRP: keepalived manages VIPs,
-				// so omit static addresses from networkd config.
-				if ifCfg.RedundancyGroup > 0 {
-					addrs = nil
+				// RETH with redundancy group: replace VIP addresses with a
+				// link-local base; keepalived manages the actual VIPs.
+				if isVRRPReth {
+					addrs = []string{fmt.Sprintf("169.254.%d.%d/32", ifCfg.RedundancyGroup, clusterNodeID+1)}
 					primaryAddr = ""
 					preferredAddr = ""
+				}
+				// RETH members: set BondMaster so networkd keeps them enslaved
+				// after reload/reconfigure.
+				var bondMaster string
+				if ifCfg.RedundantParent != "" {
+					bondMaster = config.LinuxIfName(ifCfg.RedundantParent)
 				}
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 					Name:             linuxName,
@@ -747,6 +772,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					Duplex:           ifCfg.Duplex,
 					MTU:              mtu,
 					Description:      ifCfg.Description,
+					BondMaster:       bondMaster,
 				})
 			}
 		}

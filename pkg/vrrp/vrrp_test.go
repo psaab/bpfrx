@@ -331,3 +331,61 @@ func TestCollectRethInstances_LinuxIfName(t *testing.T) {
 		t.Errorf("Interface = %q, want reth0-1 (slash replaced)", instances[0].Interface)
 	}
 }
+
+func TestCollectRethInstances_VlanTagging(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name:            "reth0",
+					RedundancyGroup: 1,
+					VlanTagging:     true,
+					Units: map[int]*config.InterfaceUnit{
+						50: {VlanID: 50, Addresses: []string{"172.16.50.6/24"}},
+					},
+				},
+				"reth1": {
+					Name:            "reth1",
+					RedundancyGroup: 2,
+					Units: map[int]*config.InterfaceUnit{
+						0: {Addresses: []string{"10.0.60.1/24"}},
+					},
+				},
+			},
+		},
+	}
+	pri := map[int]int{1: 200, 2: 100}
+	instances := CollectRethInstances(cfg, pri)
+
+	if len(instances) != 2 {
+		t.Fatalf("expected 2 instances, got %d", len(instances))
+	}
+
+	// reth0 is VLAN-tagged → VRRP on reth0.50
+	inst0 := instances[0]
+	if inst0.Interface != "reth0.50" {
+		t.Errorf("inst0.Interface = %q, want reth0.50", inst0.Interface)
+	}
+	if inst0.GroupID != 101 {
+		t.Errorf("inst0.GroupID = %d, want 101", inst0.GroupID)
+	}
+	if inst0.Priority != 200 {
+		t.Errorf("inst0.Priority = %d, want 200", inst0.Priority)
+	}
+	wantVIPs := []string{"172.16.50.6/24"}
+	if len(inst0.VirtualAddresses) != 1 || inst0.VirtualAddresses[0] != wantVIPs[0] {
+		t.Errorf("inst0.VirtualAddresses = %v, want %v", inst0.VirtualAddresses, wantVIPs)
+	}
+
+	// reth1 is non-VLAN → VRRP on reth1
+	inst1 := instances[1]
+	if inst1.Interface != "reth1" {
+		t.Errorf("inst1.Interface = %q, want reth1", inst1.Interface)
+	}
+	if inst1.GroupID != 102 {
+		t.Errorf("inst1.GroupID = %d, want 102", inst1.GroupID)
+	}
+	if inst1.Priority != 100 {
+		t.Errorf("inst1.Priority = %d, want 100", inst1.Priority)
+	}
+}

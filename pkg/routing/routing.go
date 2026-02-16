@@ -1504,11 +1504,6 @@ func (m *Manager) ClearBonds() error {
 // interfaces in a chassis cluster configuration. Physical interfaces with a
 // RedundantParent are enslaved to the named RETH bond.
 func (m *Manager) ApplyRethInterfaces(interfaces map[string]*config.InterfaceConfig) error {
-	// Clear previous RETH bonds first
-	if err := m.ClearRethInterfaces(); err != nil {
-		slog.Warn("failed to clear previous RETH interfaces", "err", err)
-	}
-
 	// Collect RETH names and their member physical interfaces.
 	// reth0 is a bond; ge-0/0/0 with redundant-parent reth0 becomes a member.
 	rethMembers := make(map[string][]string) // reth name -> member interface names
@@ -1524,39 +1519,65 @@ func (m *Manager) ApplyRethInterfaces(interfaces map[string]*config.InterfaceCon
 		}
 	}
 
-	// Create each RETH bond device and enslave members
-	for rethName, members := range rethMembers {
-		// Check if bond already exists
-		if existing, err := m.nlHandle.LinkByName(rethName); err == nil {
-			m.nlHandle.LinkSetUp(existing)
-			m.reths = append(m.reths, rethName)
-			slog.Debug("RETH already exists", "name", rethName)
+	// Remove stale RETH bonds that are no longer in config.
+	wanted := make(map[string]bool)
+	for name := range rethMembers {
+		wanted[name] = true
+	}
+	var kept []string
+	for _, name := range m.reths {
+		if wanted[name] {
+			kept = append(kept, name)
 			continue
 		}
+		link, err := m.nlHandle.LinkByName(name)
+		if err != nil {
+			continue
+		}
+		if err := m.nlHandle.LinkDel(link); err != nil {
+			slog.Warn("failed to delete stale RETH", "name", name, "err", err)
+		} else {
+			slog.Info("RETH removed (stale)", "name", name)
+		}
+	}
+	m.reths = kept
 
-		bond := netlink.NewLinkBond(netlink.LinkAttrs{Name: rethName})
-		bond.Mode = netlink.BOND_MODE_ACTIVE_BACKUP // active-backup for HA
-		if rc, ok := rethConfigs[rethName]; ok && rc.MTU > 0 {
-			bond.LinkAttrs.MTU = rc.MTU
-		}
-		if err := m.nlHandle.LinkAdd(bond); err != nil {
-			slog.Warn("failed to create RETH", "name", rethName, "err", err)
-			continue
-		}
+	// Create or reconcile each RETH bond device and ensure members are enslaved.
+	for rethName, members := range rethMembers {
+		sort.Strings(members)
 
 		bondLink, err := m.nlHandle.LinkByName(rethName)
 		if err != nil {
-			slog.Warn("failed to find created RETH", "name", rethName, "err", err)
-			continue
+			// Bond doesn't exist — create it.
+			bond := netlink.NewLinkBond(netlink.LinkAttrs{Name: rethName})
+			bond.Mode = netlink.BOND_MODE_ACTIVE_BACKUP
+			if rc, ok := rethConfigs[rethName]; ok && rc.MTU > 0 {
+				bond.LinkAttrs.MTU = rc.MTU
+			}
+			if err := m.nlHandle.LinkAdd(bond); err != nil {
+				slog.Warn("failed to create RETH", "name", rethName, "err", err)
+				continue
+			}
+			bondLink, err = m.nlHandle.LinkByName(rethName)
+			if err != nil {
+				slog.Warn("failed to find created RETH", "name", rethName, "err", err)
+				continue
+			}
+			slog.Info("RETH created", "name", rethName, "mode", "active-backup")
 		}
 
-		sort.Strings(members) // deterministic order
+		// Ensure all members are enslaved (idempotent — safe to call on every compile).
 		for _, member := range members {
 			linuxName := config.LinuxIfName(member)
 			memberLink, err := m.nlHandle.LinkByName(linuxName)
 			if err != nil {
 				slog.Warn("RETH member not found",
 					"reth", rethName, "member", member, "linux", linuxName, "err", err)
+				continue
+			}
+			// Check if already enslaved to this bond.
+			if memberLink.Attrs().MasterIndex == bondLink.Attrs().Index {
+				m.nlHandle.LinkSetUp(memberLink)
 				continue
 			}
 			m.nlHandle.LinkSetDown(memberLink)
@@ -1569,12 +1590,19 @@ func (m *Manager) ApplyRethInterfaces(interfaces map[string]*config.InterfaceCon
 			slog.Info("RETH member added", "reth", rethName, "member", member)
 		}
 
-		if err := m.nlHandle.LinkSetUp(bondLink); err != nil {
-			slog.Warn("failed to bring up RETH", "name", rethName, "err", err)
+		m.nlHandle.LinkSetUp(bondLink)
+
+		// Track this RETH (deduplicate).
+		found := false
+		for _, r := range m.reths {
+			if r == rethName {
+				found = true
+				break
+			}
 		}
-		m.reths = append(m.reths, rethName)
-		slog.Info("RETH created", "name", rethName,
-			"mode", "active-backup", "members", members)
+		if !found {
+			m.reths = append(m.reths, rethName)
+		}
 	}
 	return nil
 }

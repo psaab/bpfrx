@@ -143,6 +143,21 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		if err := exec.Command("networkctl", "reload").Run(); err != nil {
 			return fmt.Errorf("networkctl reload: %w", err)
 		}
+		// Dynamically created interfaces (bonds, VLANs) may not get their
+		// addresses applied by reload alone. Reconfigure all managed
+		// interfaces to ensure addresses are applied.
+		// Skip bond member interfaces — reconfigure can eject them from
+		// their bond. Their Bond= directive is picked up by reload.
+		var reconf []string
+		for _, ifc := range interfaces {
+			if !ifc.Unmanaged && !ifc.Disable && ifc.BondMaster == "" {
+				reconf = append(reconf, ifc.Name)
+			}
+		}
+		if len(reconf) > 0 {
+			args := append([]string{"reconfigure"}, reconf...)
+			_ = exec.Command("networkctl", args...).Run()
+		}
 	}
 
 	return nil
