@@ -671,6 +671,22 @@ func (m *Manager) triggerGARP(rgID int) {
 	}()
 }
 
+// LocalPriorities returns a map of redundancy group ID to VRRP priority.
+// Primary RGs get priority 200, all others get 100.
+func (m *Manager) LocalPriorities() map[int]int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	result := make(map[int]int, len(m.groups))
+	for _, rg := range m.groups {
+		if rg.State == StatePrimary {
+			result[rg.GroupID] = 200
+		} else {
+			result[rg.GroupID] = 100
+		}
+	}
+	return result
+}
+
 // FormatStatus returns a Junos-style status string for all RGs.
 func (m *Manager) FormatStatus() string {
 	states := m.GroupStates()

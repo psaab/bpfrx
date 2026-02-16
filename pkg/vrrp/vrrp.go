@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -58,6 +59,72 @@ func CollectInstances(cfg *config.Config) []*Instance {
 		}
 	}
 	return instances
+}
+
+// CollectRethInstances generates VRRP instances for RETH interfaces that have
+// a RedundancyGroup > 0. These provide keepalived-backed failover for HA
+// cluster RETH interfaces. VRID = 100 + redundancyGroupID.
+func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Instance {
+	if cfg == nil {
+		return nil
+	}
+	// Sort interface names for deterministic output.
+	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var instances []*Instance
+	for _, name := range names {
+		ifc := cfg.Interfaces.Interfaces[name]
+		if ifc.RedundancyGroup <= 0 {
+			continue
+		}
+		rgID := ifc.RedundancyGroup
+
+		// Collect all addresses from all units as virtual addresses.
+		var vips []string
+		// Sort unit numbers for deterministic order.
+		unitNums := make([]int, 0, len(ifc.Units))
+		for n := range ifc.Units {
+			unitNums = append(unitNums, n)
+		}
+		sort.Ints(unitNums)
+		for _, n := range unitNums {
+			unit := ifc.Units[n]
+			vips = append(vips, unit.Addresses...)
+		}
+		if len(vips) == 0 {
+			continue
+		}
+
+		pri := localPriority[rgID]
+		if pri == 0 {
+			pri = 100 // default to secondary priority
+		}
+
+		instances = append(instances, &Instance{
+			Interface:         config.LinuxIfName(ifc.Name),
+			GroupID:           100 + rgID,
+			Priority:          pri,
+			Preempt:           true,
+			AcceptData:        true,
+			AdvertiseInterval: 1,
+			VirtualAddresses:  vips,
+		})
+	}
+	return instances
+}
+
+// UpdatePriority regenerates RETH VRRP instances with the given priorities,
+// merges them with user-configured VRRP instances, and applies the combined
+// config. Called on cluster state changes to update keepalived priorities.
+func UpdatePriority(cfg *config.Config, localPriority map[int]int) error {
+	var all []*Instance
+	all = append(all, CollectInstances(cfg)...)
+	all = append(all, CollectRethInstances(cfg, localPriority)...)
+	return Apply(all)
 }
 
 const keepalivedConf = "/etc/keepalived/keepalived.conf"

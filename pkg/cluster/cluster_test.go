@@ -674,6 +674,87 @@ func TestForceSecondary_SkipsDisabled(t *testing.T) {
 	}
 }
 
+func TestLocalPriorities_Empty(t *testing.T) {
+	m := NewManager(0, 1)
+	prios := m.LocalPriorities()
+	if len(prios) != 0 {
+		t.Fatalf("expected empty map, got %v", prios)
+	}
+}
+
+func TestLocalPriorities_PrimaryGets200(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200}),
+		makeRG(1, false, map[int]int{0: 150}),
+	)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 2)
+
+	// Both primary in single-node mode.
+	prios := m.LocalPriorities()
+	if len(prios) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(prios))
+	}
+	if prios[0] != 200 {
+		t.Errorf("RG 0 priority = %d, want 200 (primary)", prios[0])
+	}
+	if prios[1] != 200 {
+		t.Errorf("RG 1 priority = %d, want 200 (primary)", prios[1])
+	}
+}
+
+func TestLocalPriorities_SecondaryGets100(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200}),
+		makeRG(1, false, map[int]int{0: 150}),
+	)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 2)
+
+	// Manually failover RG 1 → secondary.
+	m.ManualFailover(1)
+	drainEvents(m, 1)
+
+	prios := m.LocalPriorities()
+	if prios[0] != 200 {
+		t.Errorf("RG 0 priority = %d, want 200 (still primary)", prios[0])
+	}
+	if prios[1] != 100 {
+		t.Errorf("RG 1 priority = %d, want 100 (secondary after failover)", prios[1])
+	}
+}
+
+func TestLocalPriorities_ActiveActive(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, true, map[int]int{0: 200, 1: 100}),
+		makeRG(1, true, map[int]int{0: 100, 1: 200}),
+	)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 2)
+
+	// Peer heartbeat: node1 primary for RG1, secondary for RG0.
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
+			{GroupID: 1, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	prios := m.LocalPriorities()
+	if prios[0] != 200 {
+		t.Errorf("RG 0 priority = %d, want 200 (primary on node0)", prios[0])
+	}
+	if prios[1] != 100 {
+		t.Errorf("RG 1 priority = %d, want 100 (secondary on node0)", prios[1])
+	}
+}
+
 func TestEventsChannel(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(

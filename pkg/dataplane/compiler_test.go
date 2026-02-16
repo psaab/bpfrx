@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"net"
 	"testing"
 
 	"github.com/psaab/bpfrx/pkg/config"
@@ -398,5 +399,64 @@ func TestResolvePortRangeNamed(t *testing.T) {
 	lo, hi = resolvePortRange("1024-65535")
 	if lo != 1024 || hi != 65535 {
 		t.Errorf("resolvePortRange(1024-65535) = (%d, %d), want (1024, 65535)", lo, hi)
+	}
+}
+
+func TestRethConfigAddrs(t *testing.T) {
+	ifCfg := &config.InterfaceConfig{
+		RedundancyGroup: 1,
+		Units: map[int]*config.InterfaceUnit{
+			0: {
+				Addresses: []string{
+					"172.16.50.10/24",
+					"2001:db8::10/64",
+				},
+			},
+		},
+	}
+
+	v4, v6 := rethConfigAddrs(ifCfg)
+	if len(v4) != 1 {
+		t.Fatalf("v4 count = %d, want 1", len(v4))
+	}
+	if !v4[0].Equal(net.ParseIP("172.16.50.10").To4()) {
+		t.Errorf("v4[0] = %s, want 172.16.50.10", v4[0])
+	}
+	if len(v6) != 1 {
+		t.Fatalf("v6 count = %d, want 1", len(v6))
+	}
+	if !v6[0].Equal(net.ParseIP("2001:db8::10")) {
+		t.Errorf("v6[0] = %s, want 2001:db8::10", v6[0])
+	}
+}
+
+func TestRethConfigAddrsMultiUnit(t *testing.T) {
+	ifCfg := &config.InterfaceConfig{
+		RedundancyGroup: 2,
+		Units: map[int]*config.InterfaceUnit{
+			0: {Addresses: []string{"10.0.1.1/24"}},
+			1: {Addresses: []string{"10.0.2.1/24", "fe80::1/64"}}, // link-local, not global
+		},
+	}
+
+	v4, v6 := rethConfigAddrs(ifCfg)
+	if len(v4) != 2 {
+		t.Fatalf("v4 count = %d, want 2", len(v4))
+	}
+	// fe80::1 is link-local, should be skipped
+	if len(v6) != 0 {
+		t.Errorf("v6 count = %d, want 0 (link-local skipped)", len(v6))
+	}
+}
+
+func TestRethConfigAddrsEmpty(t *testing.T) {
+	ifCfg := &config.InterfaceConfig{
+		RedundancyGroup: 1,
+		Units:           map[int]*config.InterfaceUnit{},
+	}
+
+	v4, v6 := rethConfigAddrs(ifCfg)
+	if len(v4) != 0 || len(v6) != 0 {
+		t.Errorf("expected no addresses, got v4=%d v6=%d", len(v4), len(v6))
 	}
 }

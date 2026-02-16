@@ -1099,10 +1099,14 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
-	// 8. Apply VRRP config (keepalived)
-	instances := vrrp.CollectInstances(cfg)
-	if len(instances) > 0 {
-		if err := vrrp.Apply(instances); err != nil {
+	// 8. Apply VRRP config (keepalived) — merge user VRRP + RETH VRRP instances
+	vrrpInstances := vrrp.CollectInstances(cfg)
+	if d.cluster != nil {
+		localPri := d.cluster.LocalPriorities()
+		vrrpInstances = append(vrrpInstances, vrrp.CollectRethInstances(cfg, localPri)...)
+	}
+	if len(vrrpInstances) > 0 {
+		if err := vrrp.Apply(vrrpInstances); err != nil {
 			slog.Warn("failed to apply VRRP config", "err", err)
 		}
 	}
@@ -1186,32 +1190,8 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			}
 		}
 
-		// Register RETH interface→IP mappings for GARP on primary transition.
-		var rethMappings []cluster.RethIPMapping
-		for _, ifc := range cfg.Interfaces.Interfaces {
-			if ifc.RedundancyGroup <= 0 {
-				continue
-			}
-			for _, unit := range ifc.Units {
-				var ips []net.IP
-				for _, addr := range unit.Addresses {
-					ip, _, err := net.ParseCIDR(addr)
-					if err == nil && ip.To4() != nil {
-						ips = append(ips, ip)
-					}
-				}
-				if len(ips) > 0 {
-					rethMappings = append(rethMappings, cluster.RethIPMapping{
-						Interface: ifc.Name,
-						IPs:       ips,
-						RG:        ifc.RedundancyGroup,
-					})
-				}
-			}
-		}
-		if len(rethMappings) > 0 {
-			d.cluster.RegisterRethIPs(rethMappings)
-		}
+		// RETH GARP is handled by keepalived (VRRP-backed RETH).
+		// No manual GARP registration needed.
 	}
 }
 
@@ -2947,23 +2927,30 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case ev := <-d.cluster.Events():
-			// Only track RG0 transitions for config ownership.
-			if ev.GroupID != 0 {
-				continue
-			}
-			switch ev.NewState {
-			case cluster.StatePrimary:
-				slog.Info("cluster: became primary for RG0, enabling config writes")
-				d.store.SetClusterReadOnly(false)
-
-				// On failover to primary: re-initiate synced IPsec SAs.
-				if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync && d.ipsec != nil && d.sessionSync != nil {
-					go d.reinitiateIPsecSAs()
+			// Update VRRP priority for RETH interfaces on any RG state change.
+			if cfg := d.store.ActiveConfig(); cfg != nil {
+				localPri := d.cluster.LocalPriorities()
+				if err := vrrp.UpdatePriority(cfg, localPri); err != nil {
+					slog.Warn("cluster: failed to update VRRP priority", "rg", ev.GroupID, "err", err)
 				}
+			}
 
-			case cluster.StateSecondary, cluster.StateSecondaryHold:
-				slog.Info("cluster: became secondary for RG0, disabling config writes")
-				d.store.SetClusterReadOnly(true)
+			// RG0-specific: config ownership and IPsec SA re-initiation.
+			if ev.GroupID == 0 {
+				switch ev.NewState {
+				case cluster.StatePrimary:
+					slog.Info("cluster: became primary for RG0, enabling config writes")
+					d.store.SetClusterReadOnly(false)
+
+					// On failover to primary: re-initiate synced IPsec SAs.
+					if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync && d.ipsec != nil && d.sessionSync != nil {
+						go d.reinitiateIPsecSAs()
+					}
+
+				case cluster.StateSecondary, cluster.StateSecondaryHold:
+					slog.Info("cluster: became secondary for RG0, disabling config writes")
+					d.store.SetClusterReadOnly(true)
+				}
 			}
 		}
 	}

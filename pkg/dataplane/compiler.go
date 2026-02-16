@@ -726,6 +726,13 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				if unitMTU > 0 && (mtu == 0 || unitMTU < mtu) {
 					mtu = unitMTU
 				}
+				// RETH interfaces backed by VRRP: keepalived manages VIPs,
+				// so omit static addresses from networkd config.
+				if ifCfg.RedundancyGroup > 0 {
+					addrs = nil
+					primaryAddr = ""
+					preferredAddr = ""
+				}
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 					Name:             linuxName,
 					MACAddress:       mac,
@@ -1513,20 +1520,26 @@ func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 				}
 				ifaceName := toZoneCfg.Interfaces[0]
 
-				snatIP, err := getInterfaceIP(ifaceName)
-				if err != nil {
-					slog.Warn("cannot get interface IPv4 for SNAT",
-						"interface", ifaceName, "err", err)
+				// RETH interfaces backed by VRRP: read addresses from config
+				// instead of live interface query (VIPs may not be on this node).
+				if ifCfg, ok := cfg.Interfaces.Interfaces[ifaceName]; ok && ifCfg.RedundancyGroup > 0 {
+					v4IPs, v6IPs = rethConfigAddrs(ifCfg)
 				} else {
-					v4IPs = append(v4IPs, snatIP)
-				}
+					snatIP, err := getInterfaceIP(ifaceName)
+					if err != nil {
+						slog.Warn("cannot get interface IPv4 for SNAT",
+							"interface", ifaceName, "err", err)
+					} else {
+						v4IPs = append(v4IPs, snatIP)
+					}
 
-				snatIPv6, err := getInterfaceIPv6(ifaceName)
-				if err != nil {
-					slog.Debug("no IPv6 address for SNAT",
-						"interface", ifaceName, "err", err)
-				} else {
-					v6IPs = append(v6IPs, snatIPv6)
+					snatIPv6, err := getInterfaceIPv6(ifaceName)
+					if err != nil {
+						slog.Debug("no IPv6 address for SNAT",
+							"interface", ifaceName, "err", err)
+					} else {
+						v6IPs = append(v6IPs, snatIPv6)
+					}
 				}
 
 				if len(v4IPs) == 0 && len(v6IPs) == 0 {
@@ -2345,6 +2358,25 @@ func getInterfaceIPv6(ifaceName string) (net.IP, error) {
 		}
 	}
 	return nil, fmt.Errorf("no global unicast IPv6 address on interface %s", ifaceName)
+}
+
+// rethConfigAddrs extracts IPv4 and IPv6 addresses from a RETH interface's config
+// units. Used for interface-mode SNAT when the VIP may not be on this node.
+func rethConfigAddrs(ifCfg *config.InterfaceConfig) (v4, v6 []net.IP) {
+	for _, unit := range ifCfg.Units {
+		for _, addr := range unit.Addresses {
+			ip, _, err := net.ParseCIDR(addr)
+			if err != nil {
+				continue
+			}
+			if ip4 := ip.To4(); ip4 != nil {
+				v4 = append(v4, ip4)
+			} else if ip.IsGlobalUnicast() {
+				v6 = append(v6, ip)
+			}
+		}
+	}
+	return
 }
 
 // protocolNumber converts a protocol name to its IANA number.

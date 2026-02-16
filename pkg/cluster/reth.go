@@ -49,8 +49,9 @@ func (rc *RethController) SetMappings(mappings []RethMapping) {
 	rc.mappings = mappings
 }
 
-// HandleStateChange processes a cluster state change event and
-// activates/deactivates RETH bond members accordingly.
+// HandleStateChange processes a cluster state change event.
+// Bonds are always kept UP on both nodes so that VRRP can send
+// advertisements on both primary and secondary. VRRP handles VIP placement.
 func (rc *RethController) HandleStateChange(event ClusterEvent) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
@@ -59,13 +60,7 @@ func (rc *RethController) HandleStateChange(event ClusterEvent) {
 		if m.RedundancyGrp != event.GroupID {
 			continue
 		}
-
-		switch event.NewState {
-		case StatePrimary:
-			rc.activateReth(m)
-		case StateSecondary, StateLost:
-			rc.deactivateReth(m)
-		}
+		rc.activateReth(m)
 	}
 }
 
@@ -94,7 +89,7 @@ func (rc *RethController) activateReth(m RethMapping) {
 		rc.nlHandle.LinkSetUp(link)
 	}
 
-	slog.Info("reth activated (primary)", "name", m.RethName, "rg", m.RedundancyGrp)
+	slog.Info("reth bond UP", "name", m.RethName, "rg", m.RedundancyGrp)
 }
 
 // deactivateReth brings down the RETH bond members on this node,

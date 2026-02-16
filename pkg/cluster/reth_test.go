@@ -62,3 +62,24 @@ func TestHandleStateChangeFiltersbyRG(t *testing.T) {
 	}
 	rc.HandleStateChange(event2) // should not panic
 }
+
+func TestHandleStateChange_AlwaysActivates(t *testing.T) {
+	// Verify HandleStateChange calls activateReth for all states (not just primary).
+	// Bonds must stay UP on both nodes for VRRP to work.
+	rc := &RethController{
+		mappings: []RethMapping{
+			{RethName: "reth0", RedundancyGrp: 1, Members: []string{"eth0"}},
+		},
+	}
+
+	// All state transitions should not panic and should attempt activation.
+	states := []NodeState{StatePrimary, StateSecondary, StateLost, StateSecondaryHold}
+	for _, s := range states {
+		event := ClusterEvent{
+			GroupID:  1,
+			OldState: StatePrimary,
+			NewState: s,
+		}
+		rc.HandleStateChange(event) // should not panic, always activates
+	}
+}
