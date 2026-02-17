@@ -2553,18 +2553,42 @@ func rethConfigAddrs(ifCfg *config.InterfaceConfig) (v4, v6 []net.IP) {
 }
 
 // protocolNumber converts a protocol name to its IANA number.
+// Handles standard names (tcp, udp, icmp), Junos predefined protocol
+// aliases (junos-icmp-all, junos-tcp-any, etc.), and numeric values.
 func protocolNumber(name string) uint8 {
 	switch strings.ToLower(name) {
 	case "tcp":
 		return 6
 	case "udp":
 		return 17
-	case "icmp":
+	case "icmp", "junos-icmp-all", "junos-ping":
 		return 1
-	case "icmpv6", "icmp6":
+	case "icmpv6", "icmp6", "junos-icmp6-all", "junos-pingv6":
 		return 58
-	case "gre":
+	case "gre", "junos-gre":
 		return 47
+	case "ospf", "junos-ospf":
+		return 89
+	case "junos-tcp-any":
+		return 6
+	case "junos-udp-any":
+		return 17
+	case "junos-ip-in-ip", "junos-ipip", "ipip":
+		return 4
+	case "egp":
+		return 8
+	case "igmp":
+		return 2
+	case "pim":
+		return 103
+	case "ah":
+		return 51
+	case "esp":
+		return 50
+	case "sctp":
+		return 132
+	case "vrrp":
+		return 112
 	default:
 		// Try numeric protocol number
 		if n, err := strconv.Atoi(name); err == nil && n > 0 && n < 256 {
