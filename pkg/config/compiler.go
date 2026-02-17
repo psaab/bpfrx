@@ -2143,10 +2143,8 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				for _, c := range prop.Children {
 					allKeys = append(allKeys, c.Keys...)
 				}
-				termApp := parseApplicationTerm(appName, allKeys)
-				if termApp != nil {
-					terms = append(terms, termApp)
-				}
+				termApps := parseApplicationTerms(appName, allKeys)
+				terms = append(terms, termApps...)
 			}
 		}
 
@@ -2181,49 +2179,108 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 	return nil
 }
 
-// parseApplicationTerm parses an inline term like:
+// parseApplicationTerms parses an inline term like:
 // "term-name [alg ssh] protocol tcp [source-port 22] [destination-port 22] [inactivity-timeout 86400]"
-// and returns a named Application.
-func parseApplicationTerm(parentName string, keys []string) *Application {
+// When multiple protocol values are present, returns one Application per
+// unique protocol (each sharing the same ports/timeout/alg).
+func parseApplicationTerms(parentName string, keys []string) []*Application {
 	if len(keys) == 0 {
 		return nil
 	}
 	termName := keys[0]
-	app := &Application{
-		Name: parentName + "-" + termName,
-	}
+
+	var protocols []string
+	var dstPort, srcPort, alg string
+	var timeout int
+
 	for i := 1; i < len(keys); i++ {
 		switch keys[i] {
 		case "protocol":
 			if i+1 < len(keys) {
 				i++
-				app.Protocol = keys[i]
+				protocols = append(protocols, normalizeProtocol(keys[i]))
 			}
 		case "destination-port":
 			if i+1 < len(keys) {
 				i++
-				app.DestinationPort = keys[i]
+				dstPort = keys[i]
 			}
 		case "source-port":
 			if i+1 < len(keys) {
 				i++
-				app.SourcePort = keys[i]
+				srcPort = keys[i]
 			}
 		case "inactivity-timeout", "timeout":
 			if i+1 < len(keys) {
 				i++
 				if v, err := strconv.Atoi(keys[i]); err == nil {
-					app.InactivityTimeout = v
+					timeout = v
 				}
 			}
 		case "alg":
 			if i+1 < len(keys) {
 				i++
-				app.ALG = keys[i]
+				alg = keys[i]
 			}
 		}
 	}
-	return app
+
+	// Deduplicate protocols (e.g. "junos-icmp-all" and "icmp" both normalize to "icmp")
+	if len(protocols) == 0 {
+		protocols = []string{""}
+	}
+	seen := make(map[string]bool)
+	var unique []string
+	for _, p := range protocols {
+		if !seen[p] {
+			seen[p] = true
+			unique = append(unique, p)
+		}
+	}
+
+	var result []*Application
+	for _, proto := range unique {
+		name := parentName + "-" + termName
+		if len(unique) > 1 {
+			suffix := proto
+			if suffix == "" {
+				suffix = "any"
+			}
+			name = parentName + "-" + termName + "-" + suffix
+		}
+		result = append(result, &Application{
+			Name:              name,
+			Protocol:          proto,
+			DestinationPort:   dstPort,
+			SourcePort:        srcPort,
+			InactivityTimeout: timeout,
+			ALG:               alg,
+		})
+	}
+	return result
+}
+
+// normalizeProtocol maps Junos protocol aliases to canonical names
+// so that "junos-icmp-all" and "icmp" deduplicate correctly.
+func normalizeProtocol(name string) string {
+	switch strings.ToLower(name) {
+	case "junos-icmp-all", "junos-ping":
+		return "icmp"
+	case "junos-icmp6-all", "junos-pingv6", "icmp6":
+		return "icmpv6"
+	case "junos-gre":
+		return "gre"
+	case "junos-ospf":
+		return "89"
+	case "junos-tcp-any":
+		return "tcp"
+	case "junos-udp-any":
+		return "udp"
+	case "junos-ip-in-ip", "junos-ipip":
+		return "4"
+	default:
+		return name
+	}
 }
 
 // validatePortSpec checks that a port specification is valid.
@@ -2272,10 +2329,15 @@ func validatePortSpec(spec string) error {
 // validateProtocol checks that a protocol specification is valid.
 func validateProtocol(proto string) error {
 	validProtos := map[string]bool{
-		"tcp": true, "udp": true, "icmp": true, "icmp6": true,
+		"tcp": true, "udp": true, "icmp": true, "icmp6": true, "icmpv6": true,
 		"ospf": true, "gre": true, "ipip": true, "ah": true, "esp": true,
+		"igmp": true, "pim": true, "sctp": true, "vrrp": true, "egp": true,
 	}
 	if validProtos[strings.ToLower(proto)] {
+		return nil
+	}
+	// Accept junos-* protocol aliases
+	if strings.HasPrefix(strings.ToLower(proto), "junos-") {
 		return nil
 	}
 	n, err := strconv.Atoi(proto)

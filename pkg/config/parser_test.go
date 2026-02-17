@@ -5231,6 +5231,98 @@ func TestMultiTermApplication(t *testing.T) {
 	}
 }
 
+func TestMultiProtocolTerm(t *testing.T) {
+	// A single term with multiple protocol statements should create
+	// one sub-term per unique protocol, all sharing the same timeout.
+	input := `applications {
+    application myicmp {
+        term 26619 {
+            timeout 1800;
+            protocol junos-icmp-all;
+            protocol icmp;
+            protocol icmp6;
+            inactivity-timeout 1800;
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	// myicmp should become an application-set with 2 members
+	// (junos-icmp-all and icmp both normalize to "icmp", so dedup → icmp + icmpv6)
+	as, ok := cfg.Applications.ApplicationSets["myicmp"]
+	if !ok {
+		t.Fatal("multi-protocol term should create an implicit application-set")
+	}
+	if len(as.Applications) != 2 {
+		t.Fatalf("expected 2 members (icmp, icmpv6), got %d: %v",
+			len(as.Applications), as.Applications)
+	}
+
+	// Both sub-terms should have timeout 1800
+	for _, name := range as.Applications {
+		app := cfg.Applications.Applications[name]
+		if app == nil {
+			t.Fatalf("missing sub-term %q", name)
+		}
+		if app.InactivityTimeout != 1800 {
+			t.Errorf("%s timeout: got %d, want 1800", name, app.InactivityTimeout)
+		}
+		if app.Protocol != "icmp" && app.Protocol != "icmpv6" {
+			t.Errorf("%s protocol: got %q, want icmp or icmpv6", name, app.Protocol)
+		}
+	}
+}
+
+func TestMultiProtocolTermSetSyntax(t *testing.T) {
+	// Flat set syntax version of the same test.
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set applications application myicmp term 26619 timeout 1800",
+		"set applications application myicmp term 26619 protocol junos-icmp-all",
+		"set applications application myicmp term 26619 protocol icmp",
+		"set applications application myicmp term 26619 protocol icmp6",
+		"set applications application myicmp term 26619 inactivity-timeout 1800",
+	}
+	for _, cmd := range setCommands {
+		parts, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("parse set %q: %v", cmd, err)
+		}
+		tree.SetPath(parts)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	as, ok := cfg.Applications.ApplicationSets["myicmp"]
+	if !ok {
+		t.Fatal("should create implicit application-set")
+	}
+	if len(as.Applications) != 2 {
+		t.Fatalf("expected 2 members, got %d: %v", len(as.Applications), as.Applications)
+	}
+
+	for _, name := range as.Applications {
+		app := cfg.Applications.Applications[name]
+		if app == nil {
+			t.Fatalf("missing sub-term %q", name)
+		}
+		if app.InactivityTimeout != 1800 {
+			t.Errorf("%s timeout: got %d, want 1800", name, app.InactivityTimeout)
+		}
+	}
+}
+
 func TestMultiTermApplicationSetSyntax(t *testing.T) {
 	// Test flat set syntax for multi-term apps
 	tree := &ConfigTree{}

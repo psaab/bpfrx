@@ -937,6 +937,13 @@ int xdp_policy_prog(struct xdp_md *ctx)
 		.dst_port = meta->dst_port,
 	};
 	struct app_value *av = bpf_map_lookup_elem(&applications, &ak);
+	/* For ICMP/ICMPv6 echo, dst_port is the echo ID — fall back to
+	 * port-0 lookup for wildcard ICMP apps (e.g. junos-icmp-all). */
+	if (!av && meta->dst_port != 0 &&
+	    (meta->protocol == PROTO_ICMP || meta->protocol == PROTO_ICMPV6)) {
+		ak.dst_port = 0;
+		av = bpf_map_lookup_elem(&applications, &ak);
+	}
 	if (av) {
 		/* Check source port range if specified (stored in host byte order) */
 		if (av->src_port_low != 0 || av->src_port_high != 0) {
