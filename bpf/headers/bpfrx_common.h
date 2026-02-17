@@ -144,7 +144,7 @@ struct icmp6hdr {
 #define MAX_LOGICAL_INTERFACES 512
 #define MAX_POLICIES           4096
 #define MAX_RULES_PER_POLICY   256
-#define MAX_SESSIONS           1048576  /* 1M sessions */
+#define MAX_SESSIONS           10000000 /* 10M sessions */
 #define MAX_NAT_POOLS          32
 #define MAX_NAT_POOL_IPS       256
 #define MAX_NAT_RULE_COUNTERS  256
