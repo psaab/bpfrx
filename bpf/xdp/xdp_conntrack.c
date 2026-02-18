@@ -245,7 +245,6 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 	__u8  emb_ihl   = emb_ip->ihl;
 	__be32 emb_saddr = emb_ip->saddr;
 	__be32 emb_daddr = emb_ip->daddr;
-
 	if (emb_ihl < 5 || emb_ihl > 15)
 		return -1;
 
@@ -292,6 +291,40 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 		orig_src_port = dv->new_dst_port;
 		needs_nat = 1;
 	} else {
+		/* Check for NAT64: the embedded packet was IPv4 after
+		 * 6→4 translation.  Look up nat64_state with the REVERSE
+		 * of the embedded tuple (how the reply would arrive).
+		 * For ICMP: protocol is ICMP in IPv4 space. */
+		__u8 n64_proto = emb_proto;
+		struct nat64_state_key n64k = {
+			.src_ip   = emb_daddr,
+			.dst_ip   = emb_saddr,
+			.src_port = emb_dst_port,
+			.dst_port = emb_src_port,
+			.protocol = n64_proto,
+		};
+		struct nat64_state_value *n64v =
+			bpf_map_lookup_elem(&nat64_state, &n64k);
+		if (n64v) {
+			/* NAT64 ICMP error: pass original v6 addrs
+			 * via meta and tail-call to NAT64 for full
+			 * IPv4 ICMP error → IPv6 ICMPv6 translation.
+			 * nat_src = original client v6 (outer dst)
+			 * nat_dst = original server v6 (embedded dst) */
+			__builtin_memcpy(meta->nat_src_ip.v6,
+					 n64v->orig_src_v6, 16);
+			__builtin_memcpy(meta->nat_dst_ip.v6,
+					 n64v->orig_dst_v6, 16);
+			meta->nat_src_port = n64v->orig_src_port;
+			meta->dst_port = n64v->orig_dst_port;
+			meta->embedded_proto = emb_proto;
+			meta->nat_flags = SESS_FLAG_NAT64;
+			meta->meta_flags = META_FLAG_NAT64_ICMP_ERR;
+			bpf_tail_call(ctx, &xdp_progs,
+				      XDP_PROG_NAT64);
+			return XDP_PASS;
+		}
+
 		/* Non-SNAT flow: use embedded addresses directly */
 		orig_src_ip = emb_saddr;
 		orig_src_port = emb_src_port;

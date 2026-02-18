@@ -25,6 +25,7 @@
 #define BPFRX_NAT_POOLS
 #include "../headers/bpfrx_maps.h"
 #include "../headers/bpfrx_helpers.h"
+#include "../headers/bpfrx_nat.h"
 
 /*
  * Compute IPv4 header checksum from scratch (10 x 16-bit words).
@@ -278,8 +279,12 @@ nat64_xlate_6to4(struct xdp_md *ctx, struct pkt_meta *meta)
 			return XDP_DROP;
 		orig_l4_csum = udp->check;
 		old_sport = udp->source;
+	} else if (orig_proto == PROTO_ICMPV6) {
+		/* For ICMP echo, meta->src_port was replaced with the
+		 * SNAT'd port by policy, but we need the original echo
+		 * ID for nat64_state.  meta->dst_port retains it. */
+		old_sport = meta->dst_port;
 	}
-	/* ICMP: will be handled specially below */
 
 	/* Shrink head by 20 bytes (IPv6→IPv4 header size difference).
 	 * MACs are not saved — bpf_fib_lookup below will provide correct ones. */
@@ -649,6 +654,310 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 	return XDP_PASS;
 }
 
+/*
+ * NAT64 ICMP error translation: IPv4 ICMP error → IPv6 ICMPv6 error.
+ *
+ * Called when an intermediate IPv4 router sends an ICMP error (e.g.
+ * Time Exceeded) for a packet that was NAT64-translated.  We must
+ * translate the entire error packet from IPv4 to IPv6 so the original
+ * IPv6 client receives a proper ICMPv6 error.
+ *
+ * Meta fields set by conntrack embedded handler:
+ *   nat_src_ip.v6 = original client IPv6 (outer dst + embedded src)
+ *   nat_dst_ip.v6 = original server IPv6 (embedded dst)
+ *   nat_src_port  = original client port
+ *   dst_port      = original server port
+ *   embedded_proto = embedded L4 protocol (TCP/UDP/ICMP→ICMPv6)
+ *
+ * Packet layout before:
+ *   [Eth(14)][IPv4(20)][ICMP(8)][EmbIPv4(20)][EmbL4...]
+ * After bpf_xdp_adjust_head(-40):
+ *   [+40 new][Eth(14)][IPv4(20)][ICMP(8)][EmbIPv4(20)][EmbL4...]
+ * We write:
+ *   [Eth(14)][IPv6(40)][ICMPv6(8)][EmbIPv6(40)][EmbL4...]
+ * EmbL4 is at offset 102 in both layouts — no copy needed.
+ */
+static __always_inline int
+nat64_icmp_error_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	void *data     = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+
+	/* Read outer IPv4 source (intermediate router) and ICMP type/code
+	 * BEFORE adjust_head invalidates all pointers. */
+	struct ethhdr *orig_eth = data;
+	if ((void *)(orig_eth + 1) > data_end)
+		return XDP_DROP;
+	__u8 saved_dmac[ETH_ALEN];
+	__builtin_memcpy(saved_dmac, orig_eth->h_dest, ETH_ALEN);
+
+	struct iphdr *outer_ip = (void *)(orig_eth + 1);
+	if ((void *)(outer_ip + 1) > data_end)
+		return XDP_DROP;
+	__be32 router_v4 = outer_ip->saddr;
+	__u8 outer_ttl = outer_ip->ttl;
+
+	/* ICMP header follows IPv4 (we know IHL=5 for simple packets) */
+	struct icmphdr *outer_icmp = (void *)(outer_ip + 1);
+	if ((void *)(outer_icmp + 1) > data_end)
+		return XDP_DROP;
+	__u8 icmp4_type = outer_icmp->type;
+	__u8 icmp4_code = outer_icmp->code;
+
+	/* Map ICMPv4 error types to ICMPv6 (RFC 7915) */
+	__u8 icmp6_type, icmp6_code;
+	if (icmp4_type == 11) {
+		/* Time Exceeded → Time Exceeded */
+		icmp6_type = 3;
+		icmp6_code = icmp4_code;
+	} else if (icmp4_type == 3) {
+		/* Dest Unreachable → Dest Unreachable */
+		icmp6_type = 1;
+		/* Map codes per RFC 7915 */
+		switch (icmp4_code) {
+		case 0: case 1: case 5: case 6: case 7:
+		case 8: case 11: case 12:
+			icmp6_code = 0; /* No route */
+			break;
+		case 2:
+			icmp6_code = 4; /* Port unreachable */
+			break;
+		case 3:
+			icmp6_code = 4; /* Port unreachable */
+			break;
+		case 4:
+			/* Frag needed → Packet Too Big (type 2) */
+			icmp6_type = 2;
+			icmp6_code = 0;
+			break;
+		case 9: case 10: case 13:
+			icmp6_code = 1; /* Comm prohibited */
+			break;
+		default:
+			icmp6_code = 0;
+			break;
+		}
+	} else if (icmp4_type == 12) {
+		/* Param Problem → Param Problem */
+		icmp6_type = 4;
+		icmp6_code = 0;
+	} else {
+		return XDP_DROP; /* Not a translatable error */
+	}
+
+	/* Read embedded L4 ports from packet before adjust_head.
+	 * Embedded IP header starts at offset 42 (14+20+8), L4 at 62. */
+	struct iphdr *emb_ip = (void *)(outer_icmp + 1);
+	if ((void *)(emb_ip + 1) > data_end)
+		return XDP_DROP;
+	__u16 emb_tot_len = bpf_ntohs(emb_ip->tot_len);
+
+	/* Grow packet by 40 bytes for IPv4→IPv6 outer + embedded headers */
+	if (bpf_xdp_adjust_head(ctx, -40))
+		return XDP_DROP;
+
+	data     = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+
+	/* Write Ethernet header */
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return XDP_DROP;
+	__builtin_memcpy(eth->h_dest, saved_dmac, ETH_ALEN);
+	eth->h_proto = bpf_htons(ETH_P_IPV6);
+
+	/* Write outer IPv6 header */
+	struct ipv6hdr *ip6h = (void *)(eth + 1);
+	if ((void *)(ip6h + 1) > data_end)
+		return XDP_DROP;
+
+	/* Build router IPv6 src: NAT64 prefix + router IPv4.
+	 * Extract prefix from nat_dst_ip.v6 (first 12 bytes). */
+	__u8 router_v6[16];
+	__builtin_memcpy(router_v6, meta->nat_dst_ip.v6, 12);
+	__builtin_memcpy(router_v6 + 12, &router_v4, 4);
+
+	/* Payload = ICMPv6(8) + EmbIPv6(40) + embedded L4 data.
+	 * Embedded L4 len = original IPv4 tot_len - IPv4 hdr(20). */
+	__u16 emb_l4_len = 0;
+	if (emb_tot_len > 20)
+		emb_l4_len = emb_tot_len - 20;
+	/* Cap to avoid oversized payload claims */
+	if (emb_l4_len > 1200)
+		emb_l4_len = 1200;
+	__u16 payload_len = 8 + 40 + emb_l4_len;
+
+	ip6h->version     = 6;
+	ip6h->priority    = 0;
+	ip6h->flow_lbl[0] = 0;
+	ip6h->flow_lbl[1] = 0;
+	ip6h->flow_lbl[2] = 0;
+	ip6h->payload_len = bpf_htons(payload_len);
+	ip6h->nexthdr     = PROTO_ICMPV6;
+	ip6h->hop_limit   = outer_ttl > 0 ? outer_ttl : 64;
+	__builtin_memcpy(&ip6h->saddr, router_v6, 16);
+	__builtin_memcpy(&ip6h->daddr, meta->nat_src_ip.v6, 16);
+
+	/* Write ICMPv6 header at offset 54 */
+	struct icmp6hdr *icmp6 = (void *)(ip6h + 1);
+	if ((void *)(icmp6 + 1) > data_end)
+		return XDP_DROP;
+	icmp6->icmp6_type = icmp6_type;
+	icmp6->icmp6_code = icmp6_code;
+	icmp6->icmp6_cksum = 0;
+	/* Unused field (or MTU for Packet Too Big) — zero it */
+	icmp6->un.data32[0] = 0;
+
+	/* Write embedded IPv6 header at offset 62.
+	 * src = original client v6, dst = original server v6 */
+	struct ipv6hdr *emb_ip6 = (void *)(icmp6 + 1);
+	if ((void *)(emb_ip6 + 1) > data_end)
+		return XDP_DROP;
+
+	__u8 emb_v6_proto = meta->embedded_proto;
+	if (emb_v6_proto == PROTO_ICMP)
+		emb_v6_proto = PROTO_ICMPV6;
+
+	emb_ip6->version     = 6;
+	emb_ip6->priority    = 0;
+	emb_ip6->flow_lbl[0] = 0;
+	emb_ip6->flow_lbl[1] = 0;
+	emb_ip6->flow_lbl[2] = 0;
+	emb_ip6->payload_len = bpf_htons(emb_l4_len);
+	emb_ip6->nexthdr     = emb_v6_proto;
+	emb_ip6->hop_limit   = 1; /* was 0 when error was generated */
+	__builtin_memcpy(&emb_ip6->saddr, meta->nat_src_ip.v6, 16);
+	__builtin_memcpy(&emb_ip6->daddr, meta->nat_dst_ip.v6, 16);
+
+	/* Embedded L4 ports at offset 102 (=14+40+8+40) are already
+	 * in the packet from the original IPv4 embedded data — they
+	 * didn't move because the growth exactly fills the gap. But
+	 * we need to restore the original (pre-SNAT) ports.
+	 * For ICMP echo, restore the echo ID. */
+	void *emb_l4 = (void *)(emb_ip6 + 1);
+	if (emb_l4 + 4 <= data_end) {
+		if (meta->embedded_proto == PROTO_TCP ||
+		    meta->embedded_proto == PROTO_UDP) {
+			__be16 *ports = (__be16 *)emb_l4;
+			ports[0] = meta->nat_src_port; /* src port */
+			ports[1] = meta->dst_port;     /* dst port */
+		} else if (meta->embedded_proto == PROTO_ICMP) {
+			/* ICMP echo embedded: type(1)+code(1)+csum(2)+id(2)
+			 * Map type/code to ICMPv6 and restore echo ID */
+			__u8 *tc = (__u8 *)emb_l4;
+			if (emb_l4 + 6 <= data_end) {
+				/* Map echo request type 8→128 */
+				tc[0] = 128;
+				tc[1] = 0;
+				/* Echo ID at offset 4 */
+				__be16 *eid = (__be16 *)(emb_l4 + 4);
+				*eid = meta->nat_src_port;
+			}
+		}
+	}
+
+	/* NPTv6 reverse: if the original client address was NPTv6-
+	 * translated (external prefix), reverse it back to the internal
+	 * prefix.  This must happen BEFORE checksum computation since
+	 * the ICMPv6 checksum covers the IPv6 pseudo-header. */
+	__u8 client_v6[16];
+	__builtin_memcpy(client_v6, meta->nat_src_ip.v6, 16);
+	/* debug prints merged into existing ones */
+	{
+		struct nptv6_key nk = {};
+		nk.direction = NPTV6_INBOUND;
+		nk.prefix_len = 64;
+		__builtin_memcpy(nk.prefix, client_v6, 8);
+		struct nptv6_value *nv = bpf_map_lookup_elem(
+			&nptv6_rules, &nk);
+		if (!nv) {
+			__builtin_memset(&nk, 0, sizeof(nk));
+			nk.direction = NPTV6_INBOUND;
+			nk.prefix_len = 48;
+			__builtin_memcpy(nk.prefix, client_v6, 6);
+			nv = bpf_map_lookup_elem(&nptv6_rules, &nk);
+		}
+		if (nv) {
+			nptv6_translate(client_v6, nv, NPTV6_INBOUND);
+			/* Update outer dst and embedded src */
+			__builtin_memcpy(&ip6h->daddr, client_v6, 16);
+			__builtin_memcpy(&emb_ip6->saddr, client_v6,
+					 16);
+		}
+	}
+
+	/* Compute ICMPv6 checksum from scratch: pseudo-header + payload.
+	 * ICMPv6 checksum covers: IPv6 pseudo-hdr + ICMPv6 hdr + body.
+	 * Uses client_v6 (post-NPTv6-reverse) for correct pseudo-hdr. */
+	{
+		__u32 csum = 0;
+		/* IPv6 pseudo-header */
+		csum += csum_bytes16(router_v6);
+		csum += csum_bytes16(client_v6);
+		csum += bpf_htons(payload_len);
+		csum += bpf_htons((__u16)PROTO_ICMPV6);
+
+		/* Sum ICMPv6 header + embedded IPv6 header + embedded L4.
+		 * Everything from icmp6 to end of payload. */
+		__u16 *w = (__u16 *)icmp6;
+		#pragma unroll
+		for (int i = 0; i < 64; i++) {
+			if ((void *)(&w[i] + 1) <= data_end)
+				csum += w[i];
+		}
+		icmp6->icmp6_cksum = (__sum16)~csum_fold(csum);
+	}
+
+	/* FIB lookup to route toward the original IPv6 client */
+	struct bpf_fib_lookup fib = {};
+	fib.family      = AF_INET6;
+	fib.l4_protocol = PROTO_ICMPV6;
+	fib.tot_len     = payload_len + 40;
+	fib.ifindex     = meta->ingress_ifindex;
+	fib.tbid        = meta->routing_table;
+	__builtin_memcpy(fib.ipv6_src, router_v6, 16);
+	__builtin_memcpy(fib.ipv6_dst, client_v6, 16);
+
+	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
+	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
+	if (rc != BPF_FIB_LKUP_RET_SUCCESS &&
+	    rc != BPF_FIB_LKUP_RET_NO_NEIGH)
+		return XDP_PASS;
+
+	meta->addr_family = AF_INET6;
+	meta->pkt_len = payload_len + 40;
+
+	if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+		if (meta->ingress_vlan_id != 0) {
+			if (xdp_vlan_tag_push(ctx,
+					      meta->ingress_vlan_id) < 0)
+				return XDP_DROP;
+		}
+		return XDP_PASS;
+	}
+
+	/* Resolve VLAN sub-interface */
+	__u32 egress_if = fib.ifindex;
+	struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map,
+							 &egress_if);
+	if (vi) {
+		meta->fwd_ifindex = vi->parent_ifindex;
+		meta->egress_vlan_id = vi->vlan_id;
+	} else {
+		meta->fwd_ifindex = egress_if;
+		meta->egress_vlan_id = 0;
+	}
+	__builtin_memcpy(meta->fwd_dmac, fib.dmac, ETH_ALEN);
+	__builtin_memcpy(meta->fwd_smac, fib.smac, ETH_ALEN);
+
+	/* Clear NAT flags — the packet is fully translated, just forward */
+	meta->nat_flags = 0;
+	meta->meta_flags = 0;
+
+	bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+	return XDP_PASS;
+}
+
 SEC("xdp")
 int xdp_nat64_prog(struct xdp_md *ctx)
 {
@@ -656,6 +965,10 @@ int xdp_nat64_prog(struct xdp_md *ctx)
 	struct pkt_meta *meta = bpf_map_lookup_elem(&pkt_meta_scratch, &zero);
 	if (!meta)
 		return XDP_DROP;
+
+	/* NAT64 ICMP error: translate IPv4 ICMP error → IPv6 ICMPv6 */
+	if (meta->meta_flags & META_FLAG_NAT64_ICMP_ERR)
+		return nat64_icmp_error_4to6(ctx, meta);
 
 	/*
 	 * Direction is determined by the original address family:
