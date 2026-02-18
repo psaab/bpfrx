@@ -600,7 +600,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 					.dst_port = meta->dst_port,
 					.protocol = meta->protocol,
 				};
-				struct nat64_state_value *n64v =
+					struct nat64_state_value *n64v =
 					bpf_map_lookup_elem(&nat64_state, &n64k);
 				if (n64v) {
 					/*

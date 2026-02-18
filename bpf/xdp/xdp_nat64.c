@@ -350,38 +350,35 @@ nat64_xlate_6to4(struct xdp_md *ctx, struct pkt_meta *meta)
 		if (icmpv6_to_icmpv4(meta->icmp_type, meta->icmp_code,
 				     &v4_type, &v4_code) < 0)
 			return XDP_DROP;
-		__u8 old_type = icmp->type;
-		__u8 old_code = icmp->code;
 		icmp->type = v4_type;
 		icmp->code = v4_code;
-		/* ICMP checksum: no pseudo-header, just update type/code diff */
-		__u16 old_tc = ((__u16)old_type << 8) | old_code;
-		__u16 new_tc = ((__u16)v4_type << 8) | v4_code;
-		/* ICMPv6 checksum included pseudo-header, ICMPv4 doesn't.
-		 * Recompute: subtract IPv6 pseudo-header, subtract old type/code,
-		 * add new type/code. */
-		__u32 csum = (__u16)~icmp->checksum;
 
-		/* Remove IPv6 pseudo-header from ICMPv6 checksum */
-		__u32 v6ph = csum_bytes16(orig_src_v6) + csum_bytes16(orig_dst_v6);
-		v6ph += bpf_htons(l4_len);
-		v6ph += bpf_htons((__u16)PROTO_ICMPV6);
-		v6ph = csum_fold(v6ph);
-		csum += (__u16)~v6ph;
-
-		/* Adjust type/code */
-		csum += (__u16)~old_tc;
-		csum += new_tc;
-
-		icmp->checksum = (__sum16)~csum_fold(csum);
+		/* Recompute ICMP checksum from scratch (no pseudo-header).
+		 * Zero the field, sum the entire ICMP message with per-access
+		 * bounds checks for the verifier. */
+		icmp->checksum = 0;
+		__u32 icmp_csum = 0;
+		__u16 *icmp_w = (__u16 *)icmp;
+		/* Sum up to 64 x 16-bit words (128 bytes).  Each access is
+		 * individually bounds-checked so the verifier is happy. */
+		#pragma unroll
+		for (int i = 0; i < 64; i++) {
+			if ((void *)(&icmp_w[i] + 1) <= data_end)
+				icmp_csum += icmp_w[i];
+		}
+		icmp->checksum = (__sum16)~csum_fold(icmp_csum);
 	}
 
-	/* Insert nat64_state entry for reverse translation */
+	/* Insert nat64_state entry for reverse translation.
+	 * For ICMP, the echo_id is never rewritten (unlike TCP/UDP ports),
+	 * so the reply will carry the original echo_id in both "port" fields.
+	 * Use meta->dst_port (= echo_id) for both src/dst port. */
 	struct nat64_state_key rkey = {
 		.src_ip   = v4_dst,
 		.dst_ip   = v4_src,
 		.src_port = meta->dst_port,
-		.dst_port = new_sport,
+		.dst_port = (ip4_proto == PROTO_ICMP) ?
+			    meta->dst_port : new_sport,
 		.protocol = ip4_proto,
 	};
 	struct nat64_state_value rval = {};
@@ -409,27 +406,28 @@ nat64_xlate_6to4(struct xdp_md *ctx, struct pkt_meta *meta)
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
 		return XDP_PASS; /* let kernel handle */
 
-	/* Rewrite MACs and redirect */
-	eth = data;
-	if ((void *)(eth + 1) > data_end)
-		return XDP_DROP;
-	__builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
-	__builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
+	/* Resolve VLAN sub-interface and store in meta for xdp_forward */
+	__u32 egress_if = fib.ifindex;
+	struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map,
+							 &egress_if);
+	if (vi) {
+		meta->fwd_ifindex = vi->parent_ifindex;
+		meta->egress_vlan_id = vi->vlan_id;
+	} else {
+		meta->fwd_ifindex = egress_if;
+		meta->egress_vlan_id = 0;
+	}
 
-	/* Decrement TTL */
-	iph = (void *)(eth + 1);
-	if ((void *)(iph + 1) > data_end)
-		return XDP_DROP;
-	if (iph->ttl <= 1)
-		return XDP_PASS;
-	__u16 old_ttl_w = *(__u16 *)&iph->ttl;
-	iph->ttl--;
-	__u16 new_ttl_w = *(__u16 *)&iph->ttl;
-	csum_update_2(&iph->check, old_ttl_w, new_ttl_w);
+	__builtin_memcpy(meta->fwd_dmac, fib.dmac, ETH_ALEN);
+	__builtin_memcpy(meta->fwd_smac, fib.smac, ETH_ALEN);
 
-	inc_counter(GLOBAL_CTR_TX_PACKETS);
+	/* Update addr_family so xdp_forward does IPv4 TTL handling */
+	meta->addr_family = AF_INET;
 
-	return bpf_redirect_map(&tx_ports, fib.ifindex, 0);
+	/* Tail-call to xdp_forward for MAC rewrite + redirect */
+	bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+	/* If we get here, tail-call failed */
+	return XDP_PASS;
 }
 
 /*
@@ -446,6 +444,14 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 {
 	void *data     = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
+
+	/* Save ingress dst MAC before adjust_head overwrites it.
+	 * Needed for NO_NEIGH fallback (XDP_PASS). */
+	__u8 saved_dmac[ETH_ALEN];
+	struct ethhdr *orig_eth = data;
+	if ((void *)(orig_eth + 1) > data_end)
+		return XDP_DROP;
+	__builtin_memcpy(saved_dmac, orig_eth->h_dest, ETH_ALEN);
 
 	if (meta->l3_offset >= 64)
 		return XDP_DROP;
@@ -498,8 +504,7 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 		old_dport = udp->dest;
 	}
 
-	/* Grow head by 20 bytes (IPv4→IPv6 header size difference).
-	 * MACs not saved — bpf_fib_lookup below provides correct ones. */
+	/* Grow head by 20 bytes (IPv4→IPv6 header size difference). */
 	if (bpf_xdp_adjust_head(ctx, -20))
 		return XDP_DROP;
 
@@ -507,11 +512,13 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 	data     = (void *)(long)ctx->data;
 	data_end = (void *)(long)ctx->data_end;
 
-	/* Write new Ethernet header (MACs overwritten by FIB result) */
+	/* Write new Ethernet header. Set saved ingress MAC as dst so
+	 * XDP_PASS is accepted by kernel. FIB overwrites on SUCCESS. */
 	struct ethhdr *eth = data;
 	if ((void *)(eth + 1) > data_end)
 		return XDP_DROP;
 
+	__builtin_memcpy(eth->h_dest, saved_dmac, ETH_ALEN);
 	eth->h_proto = bpf_htons(ETH_P_IPV6);
 
 	/* Write IPv6 header */
@@ -563,26 +570,27 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 		if (icmpv4_to_icmpv6(icmp6->icmp6_type, icmp6->icmp6_code,
 				     &v6_type, &v6_code) < 0)
 			return XDP_DROP;
-		__u8 old_type = icmp6->icmp6_type;
-		__u8 old_code = icmp6->icmp6_code;
 		icmp6->icmp6_type = v6_type;
 		icmp6->icmp6_code = v6_code;
-		/* ICMPv4 has no pseudo-header, ICMPv6 does.
-		 * Add IPv6 pseudo-header + adjust type/code. */
-		__u32 csum = (__u16)~icmp6->icmp6_cksum;
 
-		/* Add IPv6 pseudo-header */
-		__u32 v6ph = csum_bytes16(v6_src) + csum_bytes16(v6_dst);
-		v6ph += bpf_htons(l4_len);
-		v6ph += bpf_htons((__u16)PROTO_ICMPV6);
-		v6ph = csum_fold(v6ph);
-		csum += v6ph;
+		/* Compute ICMPv6 checksum from scratch.
+		 * ICMPv6 checksum covers IPv6 pseudo-header + full
+		 * ICMPv6 message (unlike ICMPv4 which has no pseudo-hdr).
+		 */
+		icmp6->icmp6_cksum = 0;
 
-		/* Adjust type/code */
-		__u16 old_tc = ((__u16)old_type << 8) | old_code;
-		__u16 new_tc = ((__u16)v6_type << 8) | v6_code;
-		csum += (__u16)~old_tc;
-		csum += new_tc;
+		/* IPv6 pseudo-header sum */
+		__u32 csum = csum_bytes16(v6_src) + csum_bytes16(v6_dst);
+		csum += bpf_htons(l4_len);
+		csum += bpf_htons((__u16)PROTO_ICMPV6);
+
+		/* Sum all ICMPv6 16-bit words */
+		__u16 *icmp_w = (__u16 *)icmp6;
+		#pragma unroll
+		for (int i = 0; i < 64; i++) {
+			if ((void *)(&icmp_w[i] + 1) <= data_end)
+				csum += icmp_w[i];
+		}
 
 		icmp6->icmp6_cksum = (__sum16)~csum_fold(csum);
 	}
@@ -601,27 +609,44 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
-	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
+	if (rc != BPF_FIB_LKUP_RET_SUCCESS &&
+	    rc != BPF_FIB_LKUP_RET_NO_NEIGH)
 		return XDP_PASS;
 
-	/* Rewrite MACs and redirect */
-	eth = data;
-	if ((void *)(eth + 1) > data_end)
-		return XDP_DROP;
-	__builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
-	__builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
+	/* Update addr_family so xdp_forward does IPv6 hop_limit handling */
+	meta->addr_family = AF_INET6;
 
-	/* Decrement hop limit */
-	ip6h = (void *)(eth + 1);
-	if ((void *)(ip6h + 1) > data_end)
-		return XDP_DROP;
-	if (ip6h->hop_limit <= 1)
+	if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+		/* Route exists but no NDP neighbor entry.
+		 * XDP_PASS the translated IPv6 packet so the kernel
+		 * resolves NDP and forwards. Push ingress VLAN tag
+		 * back for kernel delivery. */
+		if (meta->ingress_vlan_id != 0) {
+			if (xdp_vlan_tag_push(ctx,
+					      meta->ingress_vlan_id) < 0)
+				return XDP_DROP;
+		}
 		return XDP_PASS;
-	ip6h->hop_limit--;
+	}
 
-	inc_counter(GLOBAL_CTR_TX_PACKETS);
+	/* Resolve VLAN sub-interface and store in meta for xdp_forward */
+	__u32 egress_if = fib.ifindex;
+	struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map,
+							 &egress_if);
+	if (vi) {
+		meta->fwd_ifindex = vi->parent_ifindex;
+		meta->egress_vlan_id = vi->vlan_id;
+	} else {
+		meta->fwd_ifindex = egress_if;
+		meta->egress_vlan_id = 0;
+	}
 
-	return bpf_redirect_map(&tx_ports, fib.ifindex, 0);
+	__builtin_memcpy(meta->fwd_dmac, fib.dmac, ETH_ALEN);
+	__builtin_memcpy(meta->fwd_smac, fib.smac, ETH_ALEN);
+
+	/* Tail-call to xdp_forward */
+	bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+	return XDP_PASS;
 }
 
 SEC("xdp")

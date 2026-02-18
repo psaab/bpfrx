@@ -551,6 +551,96 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		/*
 		 * No route or packet is destined locally.
 		 *
+		 * NAT64 reverse: IPv4 return traffic destined to the
+		 * firewall's SNAT pool address (a local IP).  Check
+		 * nat64_state before treating as host-inbound.
+		 */
+		if (meta->addr_family == AF_INET) {
+			struct nat64_state_key n64k = {
+				.src_ip   = meta->src_ip.v4,
+				.dst_ip   = meta->dst_ip.v4,
+				.src_port = meta->src_port,
+				.dst_port = meta->dst_port,
+				.protocol = meta->protocol,
+			};
+			if (bpf_map_lookup_elem(&nat64_state, &n64k)) {
+				/* Route through conntrack which sets up
+				 * meta for nat64 4→6 translation. */
+				bpf_tail_call(ctx, &xdp_progs,
+					      XDP_PROG_CONNTRACK);
+				return XDP_PASS;
+			}
+		}
+
+		/*
+		 * NAT64 forward: IPv6 packet whose destination matches
+		 * a configured NAT64 prefix (e.g. 64:ff9b::/96).
+		 * No IPv6 route exists for the prefix so FIB failed.
+		 * Do an IPv4 FIB lookup for the embedded v4 address
+		 * to resolve the egress interface and zone, then
+		 * continue to conntrack (which sets SESS_FLAG_NAT64).
+		 */
+		if (meta->addr_family == AF_INET6) {
+			struct nat64_config *n64 =
+				bpf_map_lookup_elem(
+					&nat64_prefix_map,
+					meta->dst_ip.v6);
+			if (n64) {
+				/* Extract embedded IPv4 dst from
+				 * last 32 bits of the v6 address */
+				__be32 *dst32 =
+					(__be32 *)meta->dst_ip.v6;
+				__be32 v4_dst = dst32[3];
+
+				/* IPv4 FIB lookup for egress zone */
+				__builtin_memset(&fib, 0, sizeof(fib));
+				fib.family      = AF_INET;
+				fib.l4_protocol = meta->protocol;
+				fib.tot_len     = meta->pkt_len;
+				fib.ifindex     = meta->ingress_ifindex;
+				fib.ipv4_dst    = v4_dst;
+
+				rc = bpf_fib_lookup(ctx, &fib,
+						    sizeof(fib), 0);
+				if (rc == BPF_FIB_LKUP_RET_SUCCESS ||
+				    rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+					__u32 eg_if = fib.ifindex;
+					__u16 eg_vlan = 0;
+					struct vlan_iface_info *vi2 =
+						bpf_map_lookup_elem(
+							&vlan_iface_map,
+							&eg_if);
+					if (vi2) {
+						eg_if = vi2->parent_ifindex;
+						eg_vlan = vi2->vlan_id;
+					}
+					meta->fwd_ifindex = eg_if;
+					meta->egress_vlan_id = eg_vlan;
+					__builtin_memcpy(meta->fwd_dmac,
+						fib.dmac, ETH_ALEN);
+					__builtin_memcpy(meta->fwd_smac,
+						fib.smac, ETH_ALEN);
+
+					struct iface_zone_key ezk = {
+						.ifindex = eg_if,
+						.vlan_id = eg_vlan,
+					};
+					struct iface_zone_value *ezv =
+						bpf_map_lookup_elem(
+							&iface_zone_map,
+							&ezk);
+					if (ezv)
+						meta->egress_zone =
+							ezv->zone_id;
+
+					bpf_tail_call(ctx, &xdp_progs,
+						XDP_PROG_CONNTRACK);
+					return XDP_PASS;
+				}
+			}
+		}
+
+		/*
 		 * ICMP error packets (Dest Unreachable, Time Exceeded,
 		 * Param Problem) with a locally-destined outer IP may
 		 * relate to a forwarded session whose original packet
