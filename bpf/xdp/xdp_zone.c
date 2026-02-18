@@ -291,10 +291,19 @@ int xdp_zone_prog(struct xdp_md *ctx)
 				meta->nat_flags |= SESS_FLAG_DNAT;
 			} else {
 				/* NPTv6 (RFC 6296) inbound: external → internal prefix translation.
-				 * Stateless: rewrite dst prefix + adjust word[3], no checksum update. */
-				struct nptv6_key nk = { .direction = NPTV6_INBOUND };
-				__builtin_memcpy(nk.prefix, meta->dst_ip.v6, 6);
+				 * Stateless, no L4 checksum update.  Try /64 then /48. */
+				struct nptv6_key nk = {};
+				nk.direction = NPTV6_INBOUND;
+				nk.prefix_len = 64;
+				__builtin_memcpy(nk.prefix, meta->dst_ip.v6, 8);
 				struct nptv6_value *nv = bpf_map_lookup_elem(&nptv6_rules, &nk);
+				if (!nv) {
+					__builtin_memset(&nk, 0, sizeof(nk));
+					nk.direction = NPTV6_INBOUND;
+					nk.prefix_len = 48;
+					__builtin_memcpy(nk.prefix, meta->dst_ip.v6, 6);
+					nv = bpf_map_lookup_elem(&nptv6_rules, &nk);
+				}
 				if (nv) {
 					__builtin_memcpy(meta->nat_dst_ip.v6, meta->dst_ip.v6, 16);
 					meta->nat_dst_port = meta->dst_port;

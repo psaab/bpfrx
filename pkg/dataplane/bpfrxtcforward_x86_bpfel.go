@@ -235,15 +235,18 @@ type bpfrxTcForwardNat64StateValue struct {
 
 type bpfrxTcForwardNptv6Key struct {
 	_         structs.HostLayout
-	Prefix    [6]uint8
+	Prefix    [8]uint8
 	Direction uint8
-	Pad       uint8
+	PrefixLen uint8
+	Pad       [6]uint8
 }
 
 type bpfrxTcForwardNptv6Value struct {
-	_          structs.HostLayout
-	XlatPrefix [6]uint8
-	Adjustment uint16
+	_           structs.HostLayout
+	XlatPrefix  [8]uint8
+	Adjustment  uint16
+	PrefixWords uint8
+	Pad         [5]uint8
 }
 
 type bpfrxTcForwardPktMeta struct {

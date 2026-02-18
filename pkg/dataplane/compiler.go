@@ -1994,6 +1994,9 @@ func compileStaticNAT(dp DataPlane,cfg *config.Config, result *CompileResult) er
 	count := 0
 	for _, rs := range cfg.Security.NAT.Static {
 		for _, rule := range rs.Rules {
+			if rule.IsNPTv6 {
+				continue // handled by compileNPTv6
+			}
 			if rule.Match == "" || rule.Then == "" {
 				slog.Warn("static NAT rule missing match or then",
 					"rule-set", rs.Name, "rule", rule.Name)
@@ -2084,31 +2087,31 @@ func compileStaticNAT(dp DataPlane,cfg *config.Config, result *CompileResult) er
 // can use either byte order as long as it's consistent. We use native
 // (little-endian on x86) since BPF reads `__u16 *w = (__u16 *)addr`
 // in native order.
-func nptv6Adjustment(internal, external [6]byte) uint16 {
+// nptv6Adjustment computes the ones'-complement adjustment for NPTv6
+// prefix translation.  prefixBytes is 6 for /48 or 8 for /64.
+func nptv6Adjustment(internal, external []byte) uint16 {
 	// Read prefix words in native byte order (same as BPF __u16* cast).
-	// On little-endian: bytes [0,1] → w[0] = byte[1]<<8 | byte[0]
 	readWord := func(b []byte) uint16 {
 		return uint16(b[1])<<8 | uint16(b[0])
 	}
 
+	words := len(internal) / 2
+
 	var sumInt uint32
-	sumInt += uint32(readWord(internal[0:2]))
-	sumInt += uint32(readWord(internal[2:4]))
-	sumInt += uint32(readWord(internal[4:6]))
+	for i := 0; i < words; i++ {
+		sumInt += uint32(readWord(internal[i*2 : i*2+2]))
+	}
 	sumInt = (sumInt & 0xFFFF) + (sumInt >> 16)
 	sumInt = (sumInt & 0xFFFF) + (sumInt >> 16)
 
 	var sumExt uint32
-	sumExt += uint32(readWord(external[0:2]))
-	sumExt += uint32(readWord(external[2:4]))
-	sumExt += uint32(readWord(external[4:6]))
+	for i := 0; i < words; i++ {
+		sumExt += uint32(readWord(external[i*2 : i*2+2]))
+	}
 	sumExt = (sumExt & 0xFFFF) + (sumExt >> 16)
 	sumExt = (sumExt & 0xFFFF) + (sumExt >> 16)
 
-	// For outbound (internal→external), prefix sum changes by (S_ext - S_int).
-	// To maintain checksum neutrality, subtract that from word[3]:
-	//   w3_new = w3 - (S_ext - S_int) = w3 + (S_int - S_ext)
-	// So: adjustment = S_int - S_ext = ~S_ext +' S_int
+	// adjustment = S_int - S_ext = ~S_ext +' S_int
 	adj := uint32(^uint16(sumExt)) + uint32(uint16(sumInt))
 	adj = (adj & 0xFFFF) + (adj >> 16)
 	adj = (adj & 0xFFFF) + (adj >> 16)
@@ -2142,9 +2145,14 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 			}
 			intOnes, _ := intNet.Mask.Size()
 
-			// Validate: both must be /48 IPv6
-			if extOnes != 48 || intOnes != 48 {
-				slog.Warn("nptv6: only /48 prefix length supported",
+			// Validate: both must be same length, /48 or /64 IPv6
+			if extOnes != intOnes {
+				slog.Warn("nptv6: prefix lengths must match",
+					"external", rule.Match, "internal", rule.Then)
+				continue
+			}
+			if extOnes != 48 && extOnes != 64 {
+				slog.Warn("nptv6: only /48 and /64 prefix lengths supported",
 					"external", rule.Match, "internal", rule.Then)
 				continue
 			}
@@ -2156,25 +2164,31 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 				continue
 			}
 
-			// Extract first 6 bytes (48 bits)
-			var extPrefix, intPrefix [6]byte
-			copy(extPrefix[:], ext16[:6])
-			copy(intPrefix[:], int16[:6])
+			// Prefix byte count: 6 for /48, 8 for /64
+			prefixBytes := extOnes / 8 // 6 or 8
+			prefixWords := uint8(extOnes / 16) // 3 or 4
 
-			// Compute adjustment
-			adj := nptv6Adjustment(intPrefix, extPrefix)
+			// Extract prefix bytes and compute adjustment
+			extSlice := ext16[:prefixBytes]
+			intSlice := int16[:prefixBytes]
+			adj := nptv6Adjustment(intSlice, extSlice)
+
+			// Build keys/values with zero-padded [8]byte prefix
+			var extPrefix, intPrefix [8]byte
+			copy(extPrefix[:], extSlice)
+			copy(intPrefix[:], intSlice)
 
 			// Inbound entry: external prefix → internal prefix (rewrite dst)
-			inKey := NPTv6Key{Prefix: extPrefix, Direction: NPTv6Inbound}
-			inVal := NPTv6Value{XlatPrefix: intPrefix, Adjustment: adj}
+			inKey := NPTv6Key{Prefix: extPrefix, Direction: NPTv6Inbound, PrefixLen: uint8(extOnes)}
+			inVal := NPTv6Value{XlatPrefix: intPrefix, Adjustment: adj, PrefixWords: prefixWords}
 			if err := dp.SetNPTv6Rule(inKey, inVal); err != nil {
 				return fmt.Errorf("set nptv6 inbound %s: %w", rule.Name, err)
 			}
 			written[inKey] = true
 
 			// Outbound entry: internal prefix → external prefix (rewrite src)
-			outKey := NPTv6Key{Prefix: intPrefix, Direction: NPTv6Outbound}
-			outVal := NPTv6Value{XlatPrefix: extPrefix, Adjustment: adj}
+			outKey := NPTv6Key{Prefix: intPrefix, Direction: NPTv6Outbound, PrefixLen: uint8(extOnes)}
+			outVal := NPTv6Value{XlatPrefix: extPrefix, Adjustment: adj, PrefixWords: prefixWords}
 			if err := dp.SetNPTv6Rule(outKey, outVal); err != nil {
 				return fmt.Errorf("set nptv6 outbound %s: %w", rule.Name, err)
 			}
@@ -2183,7 +2197,8 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 			count++
 			slog.Info("nptv6 rule compiled",
 				"rule-set", rs.Name, "rule", rule.Name,
-				"external", rule.Match, "internal", rule.Then)
+				"external", rule.Match, "internal", rule.Then,
+				"prefix_len", extOnes)
 		}
 	}
 

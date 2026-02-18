@@ -1241,11 +1241,20 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				}
 
 				/* NPTv6 (RFC 6296) outbound: internal → external prefix translation.
-				 * Stateless: rewrite src prefix, no checksum update needed. */
+				 * Stateless, no L4 checksum update.  Try /64 then /48. */
 				if (!(sess_nat_flags & SESS_FLAG_STATIC_NAT)) {
-					struct nptv6_key nk = { .direction = NPTV6_OUTBOUND };
-					__builtin_memcpy(nk.prefix, meta->src_ip.v6, 6);
+					struct nptv6_key nk = {};
+					nk.direction = NPTV6_OUTBOUND;
+					nk.prefix_len = 64;
+					__builtin_memcpy(nk.prefix, meta->src_ip.v6, 8);
 					struct nptv6_value *nv = bpf_map_lookup_elem(&nptv6_rules, &nk);
+					if (!nv) {
+						__builtin_memset(&nk, 0, sizeof(nk));
+						nk.direction = NPTV6_OUTBOUND;
+						nk.prefix_len = 48;
+						__builtin_memcpy(nk.prefix, meta->src_ip.v6, 6);
+						nv = bpf_map_lookup_elem(&nptv6_rules, &nk);
+					}
 					if (nv) {
 						sess_nat_flags |= SESS_FLAG_SNAT | SESS_FLAG_STATIC_NAT | SESS_FLAG_NPTV6;
 						__builtin_memcpy(meta->nat_src_ip.v6, meta->src_ip.v6, 16);

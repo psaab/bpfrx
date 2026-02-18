@@ -471,41 +471,48 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 /*
  * NPTv6 (RFC 6296) stateless prefix translation.
  *
- * Rewrites the first 48 bits (3 words) of an IPv6 address and applies
- * a precomputed ones'-complement adjustment to word[3] (bits 48-63)
- * to maintain checksum neutrality.  No L4 checksum update is needed.
+ * Supports /48 (rewrite words 0-2, adjust word 3) and /64 (rewrite
+ * words 0-3, adjust word 4).  No L4 checksum update needed.
  *
  * Parameters:
  *   addr      - pointer to the 16-byte IPv6 address to rewrite in-place
- *   nv        - nptv6_value with xlat_prefix[6] and adjustment
+ *   nv        - nptv6_value with xlat_prefix, adjustment, and prefix_words
  *   direction - NPTV6_INBOUND (add ~adjustment) or NPTV6_OUTBOUND (add adjustment)
  */
 static __always_inline void
 nptv6_translate(void *addr, const struct nptv6_value *nv, __u8 direction)
 {
 	__u16 *w = (__u16 *)addr;
-
-	/* Step 1: Rewrite prefix (words 0-2, i.e. first 48 bits) */
 	const __u16 *pfx = (const __u16 *)nv->xlat_prefix;
+
+	/* Rewrite prefix words (always at least 3) */
 	w[0] = pfx[0];
 	w[1] = pfx[1];
 	w[2] = pfx[2];
 
-	/* Step 2: Apply adjustment to word[3] for checksum neutrality.
-	 * For outbound (internal→external): add adjustment.
-	 * For inbound (external→internal):  add ~adjustment (ones'-complement negate). */
 	__u16 adj = nv->adjustment;
 	if (direction == NPTV6_INBOUND)
 		adj = ~adj;
 
-	__u32 sum = (__u32)w[3] + (__u32)adj;
-	sum = (sum & 0xFFFF) + (sum >> 16);
-	sum = (sum & 0xFFFF) + (sum >> 16);
-	w[3] = (__u16)sum;
+	if (nv->prefix_words >= 4) {
+		/* /64: rewrite word[3], adjust word[4] */
+		w[3] = pfx[3];
 
-	/* RFC 6296: 0xFFFF (negative zero) → 0x0000 (positive zero) */
-	if (w[3] == 0xFFFF)
-		w[3] = 0x0000;
+		__u32 sum = (__u32)w[4] + (__u32)adj;
+		sum = (sum & 0xFFFF) + (sum >> 16);
+		sum = (sum & 0xFFFF) + (sum >> 16);
+		w[4] = (__u16)sum;
+		if (w[4] == 0xFFFF)
+			w[4] = 0x0000;
+	} else {
+		/* /48: adjust word[3] */
+		__u32 sum = (__u32)w[3] + (__u32)adj;
+		sum = (sum & 0xFFFF) + (sum >> 16);
+		sum = (sum & 0xFFFF) + (sum >> 16);
+		w[3] = (__u16)sum;
+		if (w[3] == 0xFFFF)
+			w[3] = 0x0000;
+	}
 }
 
 #endif /* __BPFRX_NAT_H__ */

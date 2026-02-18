@@ -411,15 +411,18 @@ const (
 
 // NPTv6Key mirrors the C struct nptv6_key.
 type NPTv6Key struct {
-	Prefix    [6]byte // first 48 bits of IPv6 address
+	Prefix    [8]byte // first 48 or 64 bits of IPv6 address (zero-padded for /48)
 	Direction uint8   // NPTv6Inbound or NPTv6Outbound
-	Pad       uint8
+	PrefixLen uint8   // 48 or 64
+	Pad       [6]byte
 }
 
 // NPTv6Value mirrors the C struct nptv6_value.
 type NPTv6Value struct {
-	XlatPrefix [6]byte // replacement prefix (first 48 bits)
-	Adjustment uint16  // ones'-complement adjustment (network byte order)
+	XlatPrefix  [8]byte // replacement prefix (first 48 or 64 bits)
+	Adjustment  uint16  // ones'-complement adjustment (native byte order)
+	PrefixWords uint8   // 3 for /48, 4 for /64
+	Pad         [5]byte
 }
 
 // DNAT table flags.

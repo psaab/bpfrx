@@ -568,16 +568,20 @@ struct {
 /* Key: 48-bit prefix (3 x 16-bit words) + direction.
  * For /48 prefixes (the common case), we store the first 6 bytes. */
 struct nptv6_key {
-	__u8 prefix[6];    /* first 48 bits of the IPv6 address */
+	__u8 prefix[8];    /* first 48 or 64 bits of IPv6 address (zero-padded for /48) */
 	__u8 direction;    /* NPTV6_INBOUND or NPTV6_OUTBOUND */
-	__u8 pad;
+	__u8 prefix_len;   /* 48 or 64 (bits) */
+	__u8 pad[6];
 };
 
-/* Value: translation prefix + precomputed adjustment for word[3].
- * The adjustment is computed at config time per RFC 6296. */
+/* Value: translation prefix + precomputed adjustment.
+ * The adjustment is computed at config time per RFC 6296.
+ * For /48: adjusts word[3].  For /64: adjusts word[4]. */
 struct nptv6_value {
-	__u8  xlat_prefix[6]; /* replacement prefix (first 48 bits) */
-	__u16 adjustment;     /* ones'-complement adjustment (network byte order) */
+	__u8  xlat_prefix[8]; /* replacement prefix (first 48 or 64 bits) */
+	__u16 adjustment;     /* ones'-complement adjustment (native byte order) */
+	__u8  prefix_words;   /* 3 for /48, 4 for /64 — number of prefix words */
+	__u8  pad[5];
 };
 
 struct {
