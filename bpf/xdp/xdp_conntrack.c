@@ -12,6 +12,7 @@
 #include "../headers/bpfrx_common.h"
 #include "../headers/bpfrx_maps.h"
 #include "../headers/bpfrx_helpers.h"
+#include "../headers/bpfrx_nat.h"
 #include "../headers/bpfrx_trace.h"
 
 /*
@@ -443,6 +444,30 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	/* All packet data is now on the stack -- use stack copies. */
 
+	/* NPTv6 reverse: if embedded source matches an NPTv6 external
+	 * prefix, translate it back to the internal prefix.  The session
+	 * was created with the internal (pre-NPTv6) address, so the
+	 * dnat_table and session lookups need the internal form. */
+	int nptv6_hit = 0;
+	{
+		struct nptv6_key nk = {};
+		nk.direction = NPTV6_INBOUND;
+		nk.prefix_len = 64;
+		__builtin_memcpy(nk.prefix, emb_saddr, 8);
+		struct nptv6_value *nv = bpf_map_lookup_elem(&nptv6_rules, &nk);
+		if (!nv) {
+			__builtin_memset(&nk, 0, sizeof(nk));
+			nk.direction = NPTV6_INBOUND;
+			nk.prefix_len = 48;
+			__builtin_memcpy(nk.prefix, emb_saddr, 6);
+			nv = bpf_map_lookup_elem(&nptv6_rules, &nk);
+		}
+		if (nv) {
+			nptv6_translate(emb_saddr, nv, NPTV6_INBOUND);
+			nptv6_hit = 1;
+		}
+	}
+
 	/* Reverse SNAT via dnat_table_v6: embedded src is the SNAT'd address */
 	struct dnat_key_v6 dk6 = { .protocol = emb_proto };
 	__builtin_memcpy(dk6.dst_ip, emb_saddr, 16);
@@ -528,11 +553,11 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 	if (ez)
 		meta->egress_zone = *ez;
 
-	if (needs_nat) {
-		/* Outer dst rewrite: WAN IP -> original client */
+	if (needs_nat || nptv6_hit) {
+		/* Outer dst rewrite: WAN IP / NPTv6 external -> original client */
 		__builtin_memcpy(meta->dst_ip.v6, orig_src_ip, 16);
 		meta->nat_flags = SESS_FLAG_DNAT;
-		/* Embedded rewrite info */
+		/* Embedded rewrite info: restore embedded src to pre-NAT/NPTv6 */
 		__builtin_memcpy(meta->nat_src_ip.v6, orig_src_ip, 16);
 		meta->nat_src_port = orig_src_port;
 		meta->meta_flags = META_FLAG_EMBEDDED_ICMP;
