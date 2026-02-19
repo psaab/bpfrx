@@ -696,6 +696,7 @@ nat64_icmp_error_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 		return XDP_DROP;
 	__be32 router_v4 = outer_ip->saddr;
 	__u8 outer_ttl = outer_ip->ttl;
+	__u16 outer_tot_len = bpf_ntohs(outer_ip->tot_len);
 
 	/* ICMP header follows IPv4 (we know IHL=5 for simple packets) */
 	struct icmphdr *outer_icmp = (void *)(outer_ip + 1);
@@ -778,10 +779,18 @@ nat64_icmp_error_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 	__builtin_memcpy(router_v6 + 12, &router_v4, 4);
 
 	/* Payload = ICMPv6(8) + EmbIPv6(40) + embedded L4 data.
-	 * Embedded L4 len = original IPv4 tot_len - IPv4 hdr(20). */
+	 * Embedded L4 len = original IPv4 tot_len - IPv4 hdr(20).
+	 * But ICMP errors may truncate the embedded packet, so cap
+	 * by the actual data present: outer_tot_len - 48
+	 * (outer IPv4 hdr 20 + ICMP err hdr 8 + embedded IPv4 hdr 20). */
 	__u16 emb_l4_len = 0;
 	if (emb_tot_len > 20)
 		emb_l4_len = emb_tot_len - 20;
+	__u16 actual_emb_l4 = 0;
+	if (outer_tot_len > 48)
+		actual_emb_l4 = outer_tot_len - 48;
+	if (emb_l4_len > actual_emb_l4)
+		emb_l4_len = actual_emb_l4;
 	/* Cap to avoid oversized payload claims */
 	if (emb_l4_len > 1200)
 		emb_l4_len = 1200;
