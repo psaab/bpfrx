@@ -54,19 +54,21 @@ type Candidate struct {
 // OperationalTree defines tab completion for operational mode.
 // This is the canonical source — all other trees derive from this.
 var OperationalTree = map[string]*Node{
-	"configure": {Desc: "Enter configuration mode", Children: map[string]*Node{
+	"configure": {Desc: "Manipulate software configuration information", Children: map[string]*Node{
 		"exclusive": {Desc: "Enter exclusive configuration mode"},
 	}},
-	"show": {Desc: "Show information", Children: map[string]*Node{
-		"chassis": {Desc: "Show hardware information", Children: map[string]*Node{
+	"show": {Desc: "Show system information", Children: map[string]*Node{
+		"chassis": {Desc: "Show chassis information", Children: map[string]*Node{
 			"cluster": {Desc: "Show cluster/HA status", Children: map[string]*Node{
 			"status":      {Desc: "Show cluster node status"},
 			"interfaces":  {Desc: "Show cluster interfaces"},
 			"information": {Desc: "Show cluster configuration details"},
 			"statistics":  {Desc: "Show cluster statistics"},
 		}},
-			"environment": {Desc: "Show temperature and power"},
-			"hardware":    {Desc: "Show hardware details"},
+			"alarms":         {Desc: "Show chassis alarm status"},
+			"environment":    {Desc: "Show chassis environment"},
+			"hardware":       {Desc: "Show installed hardware components"},
+			"routing-engine": {Desc: "Show Routing Engine status"},
 		}},
 		"class-of-service": {Desc: "Show class-of-service information", Children: map[string]*Node{
 			"interface": {Desc: "Show per-interface CoS configuration"},
@@ -110,13 +112,13 @@ var OperationalTree = map[string]*Node{
 		}},
 		"flow-monitoring": {Desc: "Show flow monitoring/NetFlow configuration"},
 		"log":             {Desc: "Show daemon log entries [N]"},
-		"route": {Desc: "Show routing table", Children: map[string]*Node{
+		"route": {Desc: "Show routing table information", Children: map[string]*Node{
 			"<destination>": {Desc: "IP address or prefix to look up"},
-			"terse":         {Desc: "Show terse routing table"},
-			"detail":        {Desc: "Show detailed route information"},
-			"summary":       {Desc: "Show route summary by protocol"},
-			"table":         {Desc: "Show routes for a VRF table"},
-			"protocol":      {Desc: "Show routes by protocol (static, connected, bgp, ospf, dhcp)"},
+			"terse":         {Desc: "Display terse output"},
+			"detail":        {Desc: "Display detailed output"},
+			"summary":       {Desc: "Show routing table statistics"},
+			"table":         {Desc: "Show routes in named routing table"},
+			"protocol":      {Desc: "Show routes learned from named protocol"},
 			"instance": {Desc: "Show routes for a routing instance", DynamicFn: func(cfg *config.Config) []string {
 				if cfg == nil {
 					return nil
@@ -129,7 +131,7 @@ var OperationalTree = map[string]*Node{
 			}},
 		}},
 		"security": {Desc: "Show security information", Children: map[string]*Node{
-			"zones": {Desc: "Show security zones", DynamicFn: func(cfg *config.Config) []string {
+			"zones": {Desc: "Show security zone information", DynamicFn: func(cfg *config.Config) []string {
 				if cfg == nil {
 					return nil
 				}
@@ -140,8 +142,11 @@ var OperationalTree = map[string]*Node{
 				return names
 			}, Children: map[string]*Node{
 				"detail": {Desc: "Show detailed zone information"},
+				"terse":  {Desc: "Display terse output"},
 			}},
-			"policies": {Desc: "Show security policies", Children: map[string]*Node{
+			"policies": {Desc: "Show security firewall policies", Children: map[string]*Node{
+				"global":      {Desc: "Show global security policy information"},
+				"policy-name": {Desc: "Show policy matching a specific name"},
 				"brief":     {Desc: "Show brief policy summary"},
 				"detail":    {Desc: "Show detailed policy information"},
 				"hit-count": {Desc: "Show policy hit counters [from-zone X to-zone Y]"},
@@ -196,7 +201,7 @@ var OperationalTree = map[string]*Node{
 					}},
 				}},
 			}},
-			"screen": {Desc: "Show screen/IDS profiles", Children: map[string]*Node{
+			"screen": {Desc: "Show screen service information", Children: map[string]*Node{
 				"ids-option": {Desc: "Show configured screen profile", DynamicFn: func(cfg *config.Config) []string {
 					if cfg == nil {
 						return nil
@@ -222,26 +227,42 @@ var OperationalTree = map[string]*Node{
 					}},
 				}},
 			}},
-			"alarms": {Desc: "Show security alarms", Children: map[string]*Node{
+			"alarms": {Desc: "Show active security alarm information", Children: map[string]*Node{
 				"detail": {Desc: "Show detailed security alarm information"},
 			}},
 			"alg": {Desc: "Show ALG status"},
 			"dynamic-address": {Desc: "Show dynamic address feeds"},
-			"flow": {Desc: "Show flow information", Children: map[string]*Node{
-				"session": {Desc: "Show active sessions", Children: map[string]*Node{
-					"summary":     {Desc: "Show session count summary"},
-					"brief":       {Desc: "Show sessions in compact table"},
-					"application": {Desc: "Filter sessions by application name"},
-					"interface":   {Desc: "Filter sessions by interface"},
+			"flow": {Desc: "Show security flow information", Children: map[string]*Node{
+				"session": {Desc: "Show session table", Children: map[string]*Node{
+					"summary":            {Desc: "Show session count summary"},
+					"brief":              {Desc: "Show sessions in compact table"},
+					"application":        {Desc: "Filter sessions by application name"},
+					"interface":          {Desc: "Filter sessions by interface"},
+					"source-prefix":      {Desc: "Filter by source IP prefix"},
+					"destination-prefix": {Desc: "Filter by destination IP prefix"},
+					"source-port":        {Desc: "Filter by source port"},
+					"destination-port":   {Desc: "Filter by destination port"},
+					"protocol":           {Desc: "Filter by IP protocol"},
+					"zone": {Desc: "Filter by security zone", DynamicFn: func(cfg *config.Config) []string {
+						if cfg == nil {
+							return nil
+						}
+						names := make([]string, 0, len(cfg.Security.Zones))
+						for name := range cfg.Security.Zones {
+							names = append(names, name)
+						}
+						return names
+					}},
+					"nat-only": {Desc: "Show only sessions with NAT translation"},
 					"sort-by": {Desc: "Sort sessions for top-talkers", Children: map[string]*Node{
 						"bytes":   {Desc: "Sort by total bytes (descending)"},
 						"packets": {Desc: "Sort by total packets (descending)"},
 					}},
 				}},
-				"statistics":   {Desc: "Show flow statistics"},
+				"statistics":   {Desc: "Show security flow statistics"},
 				"traceoptions": {Desc: "Show flow trace configuration"},
 			}},
-			"nat": {Desc: "Show NAT information", Children: map[string]*Node{
+			"nat": {Desc: "Show Network Address Translation information", Children: map[string]*Node{
 				"source": {Desc: "Show source NAT", Children: map[string]*Node{
 					"summary":              {Desc: "Show source NAT summary"},
 					"pool":                 {Desc: "Show source NAT pools"},
@@ -267,14 +288,27 @@ var OperationalTree = map[string]*Node{
 			}},
 			"address-book": {Desc: "Show address book entries"},
 			"applications": {Desc: "Show application definitions"},
-			"log":          {Desc: "Show recent security events [N] [zone <z>] [protocol <p>] [action <a>]"},
+			"log": {Desc: "Show recent security events", Children: map[string]*Node{
+				"zone": {Desc: "Filter by security zone", DynamicFn: func(cfg *config.Config) []string {
+					if cfg == nil {
+						return nil
+					}
+					names := make([]string, 0, len(cfg.Security.Zones))
+					for name := range cfg.Security.Zones {
+						names = append(names, name)
+					}
+					return names
+				}},
+				"protocol": {Desc: "Filter by IP protocol"},
+				"action":   {Desc: "Filter by action (permit, deny, reject)"},
+			}},
 			"statistics": {Desc: "Show global statistics", Children: map[string]*Node{
 				"detail": {Desc: "Show detailed statistics with screen and session breakdown"},
 			}},
-			"ike": {Desc: "Show IKE status", Children: map[string]*Node{
+			"ike": {Desc: "Show Internet Key Exchange information", Children: map[string]*Node{
 				"security-associations": {Desc: "Show IKE SAs"},
 			}},
-			"ipsec": {Desc: "Show IPsec status", Children: map[string]*Node{
+			"ipsec": {Desc: "Show IP Security information", Children: map[string]*Node{
 				"security-associations": {Desc: "Show IPsec SAs"},
 				"statistics":            {Desc: "Show IPsec statistics"},
 			}},
@@ -286,7 +320,7 @@ var OperationalTree = map[string]*Node{
 				"probe-results": {Desc: "Show RPM probe results"},
 			}},
 		}},
-		"interfaces": {Desc: "Show interface status", DynamicFn: func(cfg *config.Config) []string {
+		"interfaces": {Desc: "Show interface information", DynamicFn: func(cfg *config.Config) []string {
 			if cfg == nil || cfg.Interfaces.Interfaces == nil {
 				return nil
 			}
@@ -296,10 +330,10 @@ var OperationalTree = map[string]*Node{
 			}
 			return names
 		}, Children: map[string]*Node{
-			"terse":     {Desc: "Show interface summary"},
-			"detail":    {Desc: "Show interface detail"},
-			"extensive":  {Desc: "Show detailed interface statistics"},
-			"statistics": {Desc: "Show interface traffic statistics"},
+			"terse":      {Desc: "Display terse output"},
+			"detail":     {Desc: "Display detailed output"},
+			"extensive":  {Desc: "Display extensive output"},
+			"statistics": {Desc: "Display statistics and detailed output"},
 			"tunnel":     {Desc: "Show tunnel interfaces"},
 		}},
 		"protocols": {Desc: "Show protocol information", Children: map[string]*Node{
@@ -334,7 +368,7 @@ var OperationalTree = map[string]*Node{
 				"neighbors": {Desc: "Show LLDP neighbors"},
 			}},
 		}},
-		"arp":         {Desc: "Show ARP table"},
+		"arp":         {Desc: "Show system ARP table entries"},
 		"ipv6": {Desc: "Show IPv6 information", Children: map[string]*Node{
 			"neighbors": {Desc: "Show IPv6 neighbor cache"},
 		}},
@@ -350,34 +384,34 @@ var OperationalTree = map[string]*Node{
 			"neighbors": {Desc: "Show LLDP neighbor table"},
 		}},
 		"system": {Desc: "Show system information", Children: map[string]*Node{
-			"alarms":        {Desc: "Show system alarms"},
-			"boot-messages": {Desc: "Show system boot messages"},
-			"commit": {Desc: "Show commit history", Children: map[string]*Node{
+			"alarms":        {Desc: "Show system alarm status"},
+			"boot-messages": {Desc: "Show boot time messages"},
+			"commit": {Desc: "Show pending and historical commit information", Children: map[string]*Node{
 				"history": {Desc: "Show recent commit log"},
 			}},
-			"connections":   {Desc: "Show system TCP connections"},
+			"connections":   {Desc: "Show system connection activity"},
 			"core-dumps":    {Desc: "Show system core dumps"},
-			"rollback": {Desc: "Show rollback history", Children: map[string]*Node{
+			"rollback": {Desc: "Show rolled back configuration", Children: map[string]*Node{
 				"compare": {Desc: "Compare rollback with active config"},
 			}},
 			"backup-router":      {Desc: "Show backup router configuration"},
-			"buffers": {Desc: "Show BPF map utilization", Children: map[string]*Node{
+			"buffers": {Desc: "Show buffer utilization", Children: map[string]*Node{
 				"detail": {Desc: "Show detailed per-map statistics"},
 			}},
 			"internet-options":   {Desc: "Show internet options"},
 			"license":            {Desc: "Show system license"},
 			"login":              {Desc: "Show login configuration"},
-			"memory":             {Desc: "Show memory usage"},
-			"ntp":                {Desc: "Show NTP server status"},
-			"processes":          {Desc: "Show running processes"},
+			"memory":             {Desc: "Show system memory usage"},
+			"ntp":                {Desc: "Show NTP status"},
+			"processes":          {Desc: "Show system process table"},
 			"root-authentication": {Desc: "Show root authentication"},
 			"configuration": {Desc: "Show configuration info", Children: map[string]*Node{
 				"rescue": {Desc: "Show rescue configuration"},
 			}},
 			"services":           {Desc: "Show configured system services"},
-			"storage":            {Desc: "Show filesystem usage"},
+			"storage":            {Desc: "Show local filesystem usage"},
 			"syslog":             {Desc: "Show system syslog configuration"},
-			"uptime":             {Desc: "Show system uptime"},
+			"uptime":             {Desc: "Show time since last reboot"},
 			"users":              {Desc: "Show configured login users"},
 		}},
 		"task": {Desc: "Show daemon task/runtime information"},
@@ -392,14 +426,25 @@ var OperationalTree = map[string]*Node{
 			"port-mirroring": {Desc: "Show port mirroring instances"},
 		}},
 		"vlans":              {Desc: "Show VLAN configuration"},
-		"version":            {Desc: "Show software version"},
+		"version":            {Desc: "Show software process revision levels"},
 	}},
-	"monitor": {Desc: "Capture traffic", Children: map[string]*Node{
+	"monitor": {Desc: "Show real-time debugging information", Children: map[string]*Node{
 		"traffic": {Desc: "Capture traffic on interface", Children: map[string]*Node{
-			"interface": {Desc: "Interface name to capture on"},
+			"interface": {Desc: "Interface name to capture on", DynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil || cfg.Interfaces.Interfaces == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+				for name := range cfg.Interfaces.Interfaces {
+					names = append(names, name)
+				}
+				return names
+			}},
+			"matching": {Desc: "Filter expression (tcpdump syntax)"},
+			"count":    {Desc: "Number of packets to capture"},
 		}},
 	}},
-	"clear": {Desc: "Clear information", Children: map[string]*Node{
+	"clear": {Desc: "Clear statistics and protocol information", Children: map[string]*Node{
 		"arp": {Desc: "Clear ARP table"},
 		"interfaces": {Desc: "Clear interface information", Children: map[string]*Node{
 			"statistics": {Desc: "Clear interface statistics counters"},
@@ -407,11 +452,39 @@ var OperationalTree = map[string]*Node{
 		"ipv6": {Desc: "Clear IPv6 information", Children: map[string]*Node{
 			"neighbors": {Desc: "Clear IPv6 neighbor cache"},
 		}},
-		"security": {Desc: "Clear security information", Children: map[string]*Node{
+		"security": {Desc: "Clear security statistics and tables", Children: map[string]*Node{
 			"flow": {Desc: "Clear flow information", Children: map[string]*Node{
-				"session": {Desc: "Clear sessions [source-prefix|destination-prefix|protocol|zone|application]"},
+				"session": {Desc: "Clear session table entries", Children: map[string]*Node{
+					"source-prefix":      {Desc: "Filter sessions by source IP prefix"},
+					"destination-prefix": {Desc: "Filter sessions by destination IP prefix"},
+					"source-port":        {Desc: "Filter sessions by source port"},
+					"destination-port":   {Desc: "Filter sessions by destination port"},
+					"protocol":           {Desc: "Filter sessions by IP protocol"},
+					"zone": {Desc: "Filter sessions by security zone", DynamicFn: func(cfg *config.Config) []string {
+						if cfg == nil {
+							return nil
+						}
+						names := make([]string, 0, len(cfg.Security.Zones))
+						for name := range cfg.Security.Zones {
+							names = append(names, name)
+						}
+						return names
+					}},
+					"interface": {Desc: "Filter sessions by interface", DynamicFn: func(cfg *config.Config) []string {
+						if cfg == nil || cfg.Interfaces.Interfaces == nil {
+							return nil
+						}
+						names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+						for name := range cfg.Interfaces.Interfaces {
+							names = append(names, name)
+						}
+						return names
+					}},
+					"application": {Desc: "Filter sessions by application name"},
+					"nat-only":    {Desc: "Clear only sessions with NAT translation"},
+				}},
 			}},
-			"counters": {Desc: "Clear all counters"},
+			"counters": {Desc: "Clear all security counters"},
 			"policies": {Desc: "Clear policy information", Children: map[string]*Node{
 				"hit-count": {Desc: "Clear policy hit counters"},
 			}},
@@ -429,8 +502,8 @@ var OperationalTree = map[string]*Node{
 			"client-identifier": {Desc: "Clear DHCPv6 DUID(s)"},
 		}},
 	}},
-	"request": {Desc: "Perform system operations", Children: map[string]*Node{
-		"chassis": {Desc: "Chassis operations", Children: map[string]*Node{
+	"request": {Desc: "Make system-level requests", Children: map[string]*Node{
+		"chassis": {Desc: "Perform chassis-specific operations", Children: map[string]*Node{
 			"cluster": {Desc: "Cluster operations", Children: map[string]*Node{
 				"failover": {Desc: "Trigger cluster failover", Children: map[string]*Node{
 					"redundancy-group": {Desc: "Failover a specific redundancy group"},
@@ -440,7 +513,7 @@ var OperationalTree = map[string]*Node{
 				}},
 			}},
 		}},
-		"dhcp": {Desc: "DHCP operations", Children: map[string]*Node{
+		"dhcp": {Desc: "Perform DHCP operations", Children: map[string]*Node{
 			"renew": {Desc: "Renew DHCP lease on an interface"},
 		}},
 		"protocols": {Desc: "Protocol operations", Children: map[string]*Node{
@@ -451,14 +524,14 @@ var OperationalTree = map[string]*Node{
 				"clear": {Desc: "Clear BGP sessions"},
 			}},
 		}},
-		"security": {Desc: "Security operations", Children: map[string]*Node{
+		"security": {Desc: "Request security operations", Children: map[string]*Node{
 			"ipsec": {Desc: "IPsec operations", Children: map[string]*Node{
 				"sa": {Desc: "IPsec SA operations", Children: map[string]*Node{
 					"clear": {Desc: "Clear all IPsec SAs"},
 				}},
 			}},
 		}},
-		"system": {Desc: "System operations", Children: map[string]*Node{
+		"system": {Desc: "Perform system-level operations", Children: map[string]*Node{
 			"reboot":    {Desc: "Reboot the system"},
 			"halt":      {Desc: "Halt the system"},
 			"power-off": {Desc: "Power off the system"},
@@ -474,7 +547,7 @@ var OperationalTree = map[string]*Node{
 			}},
 		}},
 	}},
-	"test": {Desc: "Diagnostic test commands", Children: map[string]*Node{
+	"test": {Desc: "Perform diagnostic testing", Children: map[string]*Node{
 		"policy": {Desc: "Test security policy lookup", Children: map[string]*Node{
 			"from-zone": {Desc: "Source zone", DynamicFn: func(cfg *config.Config) []string {
 				if cfg == nil {
@@ -485,10 +558,39 @@ var OperationalTree = map[string]*Node{
 					names = append(names, name)
 				}
 				return names
+			}, Children: map[string]*Node{
+				"to-zone": {Desc: "Destination zone", DynamicFn: func(cfg *config.Config) []string {
+					if cfg == nil {
+						return nil
+					}
+					names := make([]string, 0, len(cfg.Security.Zones))
+					for name := range cfg.Security.Zones {
+						names = append(names, name)
+					}
+					return names
+				}, Children: map[string]*Node{
+					"source-ip": {Desc: "Source IP address", Children: map[string]*Node{
+						"destination-ip": {Desc: "Destination IP address", Children: map[string]*Node{
+							"destination-port": {Desc: "Destination port number", Children: map[string]*Node{
+								"protocol": {Desc: "IP protocol (tcp, udp)"},
+							}},
+						}},
+					}},
+				}},
 			}},
 		}},
 		"routing": {Desc: "Test route lookup", Children: map[string]*Node{
 			"destination": {Desc: "Destination IP or prefix to look up"},
+			"instance": {Desc: "Routing instance for route lookup", DynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.RoutingInstances))
+				for _, ri := range cfg.RoutingInstances {
+					names = append(names, ri.Name)
+				}
+				return names
+			}},
 		}},
 		"security-zone": {Desc: "Show zone for interface", Children: map[string]*Node{
 			"interface": {Desc: "Interface name", DynamicFn: func(cfg *config.Config) []string {
@@ -503,36 +605,64 @@ var OperationalTree = map[string]*Node{
 			}},
 		}},
 	}},
-	"ping":       {Desc: "Ping remote host"},
-	"traceroute": {Desc: "Trace route to remote host"},
+	"ping": {Desc: "Ping remote host", Children: map[string]*Node{
+		"<host>":  {Desc: "Hostname or IP address of remote host"},
+		"count":   {Desc: "Number of ping requests to send"},
+		"source":  {Desc: "Source address to use"},
+		"size":    {Desc: "Request data size in bytes"},
+		"routing-instance": {Desc: "Routing instance for route lookup", DynamicFn: func(cfg *config.Config) []string {
+			if cfg == nil {
+				return nil
+			}
+			names := make([]string, 0, len(cfg.RoutingInstances))
+			for _, ri := range cfg.RoutingInstances {
+				names = append(names, ri.Name)
+			}
+			return names
+		}},
+	}},
+	"traceroute": {Desc: "Trace route to remote host", Children: map[string]*Node{
+		"<host>": {Desc: "Hostname or IP address of remote host"},
+		"source": {Desc: "Source address to use"},
+		"routing-instance": {Desc: "Routing instance for route lookup", DynamicFn: func(cfg *config.Config) []string {
+			if cfg == nil {
+				return nil
+			}
+			names := make([]string, 0, len(cfg.RoutingInstances))
+			for _, ri := range cfg.RoutingInstances {
+				names = append(names, ri.Name)
+			}
+			return names
+		}},
+	}},
 	"quit":       {Desc: "Exit CLI"},
 	"exit":       {Desc: "Exit CLI"},
 }
 
 // ConfigTopLevel defines tab completion for config mode top-level commands.
 var ConfigTopLevel = map[string]*Node{
-	"annotate": {Desc: "Add comment to configuration node"},
-	"copy":     {Desc: "Copy a configuration element"},
-	"insert":   {Desc: "Insert a configuration element before or after another"},
-	"rename":   {Desc: "Rename a configuration element"},
-	"set":      {Desc: "Set a configuration value"},
-	"delete":   {Desc: "Delete a configuration element"},
-	"show":     {Desc: "Show candidate configuration"},
-	"commit": {Desc: "Commit configuration", Children: map[string]*Node{
-		"check":     {Desc: "Validate without applying"},
+	"annotate": {Desc: "Annotate the configuration statement"},
+	"copy":     {Desc: "Copy a configuration statement"},
+	"insert":   {Desc: "Insert a new ordered configuration statement"},
+	"rename":   {Desc: "Rename a configuration statement"},
+	"set":      {Desc: "Set a configuration parameter"},
+	"delete":   {Desc: "Delete a configuration statement"},
+	"show":     {Desc: "Show configuration"},
+	"commit": {Desc: "Commit current set of changes", Children: map[string]*Node{
+		"check":     {Desc: "Check correctness of syntax; do not apply changes"},
 		"comment":   {Desc: "Add comment to commit"},
-		"confirmed": {Desc: "Auto-rollback if not confirmed [minutes]"},
+		"confirmed": {Desc: "Automatically rollback if not confirmed"},
 	}},
-	"load": {Desc: "Load configuration from file or terminal", Children: map[string]*Node{
-		"override": {Desc: "Replace candidate with file or terminal input"},
-		"merge":    {Desc: "Merge into candidate from file or terminal"},
-		"set":      {Desc: "Load set commands from terminal"},
+	"load": {Desc: "Load configuration from ASCII file", Children: map[string]*Node{
+		"override": {Desc: "Override existing configuration"},
+		"merge":    {Desc: "Merge contents with existing configuration"},
+		"set":      {Desc: "Execute set commands from terminal"},
 	}},
-	"edit":     {Desc: "Edit a configuration hierarchy level"},
-	"top":      {Desc: "Exit to top of configuration hierarchy"},
-	"up":       {Desc: "Exit one level of configuration hierarchy"},
-	"rollback": {Desc: "Revert to previous configuration"},
-	"run":      {Desc: "Run operational command"},
+	"edit":     {Desc: "Edit a sub-level of configuration"},
+	"top":      {Desc: "Exit to top level of configuration"},
+	"up":       {Desc: "Exit one level of configuration"},
+	"rollback": {Desc: "Roll back to a previous committed configuration"},
+	"run":      {Desc: "Run an operational-mode command"},
 	"exit":     {Desc: "Exit configuration mode"},
 	"quit":     {Desc: "Exit configuration mode"},
 }
