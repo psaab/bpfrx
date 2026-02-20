@@ -1091,6 +1091,260 @@ If VPP is adopted, the migration path is:
 
 ---
 
+## 14. VPP Linux Control Plane: Pseudo-Interfaces for FRR Integration
+
+### 14.1 The Problem: VPP Owns the NIC, Linux Can't See It
+
+When VPP takes over a physical NIC (via DPDK or AF_XDP), the interface disappears from
+the Linux kernel. FRR, SSH, SNMP, DHCP clients, and any management service that relies
+on kernel interfaces cannot see or interact with VPP-managed interfaces. This is the
+fundamental tension between kernel-bypass performance and control-plane integration.
+
+VPP's **Linux Control Plane (Linux CP / LCP) plugin** solves this by creating **TAP mirror
+interfaces** in the kernel — one shadow TAP per VPP interface. These TAP devices appear
+as normal Linux network interfaces, enabling FRR, management services, and monitoring
+tools to operate without modification.
+
+### 14.2 Architecture: TAP Mirrors and Interface Pairs
+
+```
+                     VPP Dataplane (userspace)
+                    ┌─────────────────────────────────────────┐
+                    │                                         │
+Physical NIC ───────┤  phy_sw_if_index ←── x-connect ──→ TAP sw_if_index
+(DPDK/AF_XDP)       │  (fast-path forwarding)       (punt/inject path)
+                    └─────────────────────────────────────────┘
+                                                          │
+                                                    virtio rings
+                                                          │
+                    ┌─────────────────────────────────────────┐
+                    │  Linux Kernel                           │
+                    │                                         │
+                    │  TAP device (e.g., "e0")                │
+                    │    - Same MAC, MTU, link state          │
+                    │    - Visible to ip/ethtool/FRR          │
+                    │    - Can be in dedicated namespace      │
+                    └─────────────────────────────────────────┘
+```
+
+Each pairing is an **`lcp_itf_pair`** — a three-way mapping:
+
+| Field               | Description                        | Example                    |
+|----------------------|------------------------------------|----------------------------|
+| `phy_sw_if_index`    | VPP's index for the physical NIC   | TenGigE3/0/0 = sw_if 1    |
+| `host_sw_if_index`   | VPP's index for the TAP device     | tap0 = sw_if 5             |
+| `vif_index`          | Linux kernel's ifindex for the TAP | e0 = ifindex 3             |
+
+**Creation:**
+```
+lcp create TenGigabitEthernet3/0/0 host-if e0
+lcp create TenGigabitEthernet3/0/1 host-if e1
+lcp create loop0 host-if lo0
+```
+
+After creation, `e0` and `e1` appear as normal Linux interfaces with the same MAC, MTU,
+and link state as the VPP physical interfaces. FRR, SSH, and SNMP see them as real NICs.
+
+### 14.3 Traffic Split: Fast Path vs Punt Path
+
+The critical performance insight: **transit traffic never touches the TAP**. Only
+control-plane and management packets are punted through the TAP mirror:
+
+| Traffic Type              | Path                                      | Performance     |
+|---------------------------|-------------------------------------------|-----------------|
+| **Transit (forwarded)**   | VPP fast path only — never touches kernel | 100+ Mpps       |
+| **Local (to router)**     | VPP punt → TAP → kernel TCP/UDP stack     | TAP throughput  |
+| **ARP / ND**              | x-connected bidirectionally via TAP       | Negligible load |
+| **OSPF / BGP hellos**     | Punted to TAP → FRR in kernel             | Negligible load |
+| **Host-originated**       | kernel → TAP → VPP → physical NIC         | TAP throughput  |
+
+This is architecturally identical to bpfrx's current model where `XDP_PASS` punts
+control-plane packets to the kernel while transit traffic stays in the XDP fast path.
+
+### 14.4 Bidirectional Synchronization
+
+Linux CP has two sub-plugins providing bidirectional state sync:
+
+#### VPP → Linux (`lcp-sync`)
+
+Changes made in VPP are propagated to the TAP mirrors:
+- **Link state:** `set interface state <if> up/down` → TAP goes up/down
+- **MTU:** `set interface mtu packet N <if>` → TAP MTU updates
+- **IP addresses:** `set interface ip address <if> <addr>` → address added to TAP
+- **MAC addresses:** Copied at creation time (runtime changes not synced — recreate LIP)
+
+#### Linux → VPP (`linux-nl` netlink listener)
+
+The netlink listener captures kernel events and applies them to VPP:
+- **`RTM_NEWROUTE`/`RTM_DELROUTE`:** FRR route installations → VPP FIB entries
+- **`RTM_NEWADDR`/`RTM_DELADDR`:** IP address changes → VPP interface addresses
+- **`RTM_NEWLINK`/`RTM_DELLINK`:** Link state, MTU, MAC changes → VPP interfaces
+- **`RTM_NEWNEIGH`/`RTM_DELNEIGH`:** ARP/ND entries → VPP neighbor tables
+
+**Route sync performance:** ~175,000 routes/sec. Full DFZ (870K IPv4 + 133K IPv6)
+programs into VPP's FIB in approximately 6 seconds.
+
+**Feedback loop prevention:** When processing a batch of netlink messages, the listener
+temporarily disables `lcp-sync` to prevent VPP→Linux→VPP infinite loops.
+
+**Cooperative batching:** Up to 40ms or 8000 messages per batch (configurable), preventing
+VPP's main thread from stalling during BGP convergence events.
+
+### 14.5 FRR Integration: The Route Flow
+
+```
+FRR (BGPd/OSPFd)                     kernel netlink
+    │                                     │
+    ├─ learns route from peer             │
+    ├─ installs in Zebra RIB              │
+    ├─ Zebra programs kernel FIB ────────→│ RTM_NEWROUTE
+    │                                     │
+    │                              linux-nl listener
+    │                                     │
+    │                              translates to VPP FIB entry
+    │                                     │
+    │                              VPP forwards at line rate
+```
+
+FRR runs on the TAP interfaces (optionally in a `dataplane` network namespace for
+isolation). It sees normal Linux network interfaces and operates without modification.
+Routes flow: **FRR → kernel → netlink → VPP FIB**.
+
+**Namespace modes:**
+- **Default namespace:** TAPs in the same namespace as the host. Simple but no isolation.
+- **Dedicated `dataplane` namespace (production recommended):** TAPs isolated from host
+  networking. FRR runs inside the namespace. Management SSH may need a separate daemon
+  instance in the namespace.
+
+```
+linux-cp {
+  default netns dataplane
+  lcp-sync
+  lcp-auto-subint
+}
+```
+
+**One-way FIB limitation:** Routes programmed directly in VPP's FIB (via API, not through
+Linux) do NOT appear in the kernel routing table. All routing state must flow through Linux.
+
+### 14.6 Sub-Interfaces, VLANs, and Tunnels
+
+#### VLAN Sub-Interfaces
+
+With `lcp-auto-subint` enabled, VPP VLAN sub-interfaces automatically get TAP mirrors:
+
+```
+# VPP side
+create sub-interfaces TenGigabitEthernet3/0/0 100 dot1q 100 exact-match
+# → Automatically creates Linux VLAN device e0.100 under parent TAP e0
+```
+
+Also works in reverse — creating a VLAN in Linux triggers VPP sub-interface creation:
+```bash
+ip link add link e0 name e0.100 type vlan id 100
+# → Automatically creates VPP sub-interface with dot1q 100
+```
+
+Supports 802.1q, 802.1ad, Q-in-Q, and Q-in-AD. All sub-interfaces require `exact-match`.
+
+#### Tunnel Interfaces
+
+- **GRE/IPIP:** VPP-native tunnel interfaces can be mirrored with `lcp create`
+- **IPsec/XFRM:** The `linux-xfrm-nl` plugin monitors kernel XFRM netlink messages and
+  mirrors SA/SPD configurations into VPP's IPsec subsystem, enabling strongSwan to manage
+  IKE while VPP handles ESP in the fast path
+
+#### Bond/LAG
+
+Bond interfaces get TAP mirrors. Physical members should be added before creating the
+LIP (LACP temporarily assigns MAC addresses during member join).
+
+### 14.7 Management Traffic
+
+Packets destined to the router itself (SSH, gRPC, HTTP, SNMP) follow the punt path:
+
+1. Packet arrives on VPP physical interface
+2. VPP L3 lookup determines destination is a **local address**
+3. Packet punted through TAP to kernel
+4. Kernel TCP/UDP stack delivers to application (sshd, bpfrxd, snmpd)
+5. Response exits through TAP → VPP → physical NIC
+
+For the `dataplane` namespace model, services must run inside the namespace:
+```ini
+# /etc/systemd/system/sshd-dataplane.service
+[Service]
+NetworkNamespacePath=/var/run/netns/dataplane
+ExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config_dataplane
+```
+
+**Statistics caveat:** Linux interface counters on the TAP only show punted/host-originated
+traffic, not transit traffic. Actual interface statistics require querying VPP directly
+(CLI, stats segment, or custom SNMP agent).
+
+### 14.8 Known Limitations and Caveats
+
+| Issue                         | Impact                                        | Workaround                          |
+|-------------------------------|-----------------------------------------------|-------------------------------------|
+| Plugin labeled "experimental" | No formal API stability guarantees            | Used in production (TNSR, IPng)     |
+| Multithreaded crash           | `lcp_arp_phy_node()` NULL buffer              | Fixed in recent VPP; test version   |
+| No runtime MAC change sync    | Stale MAC on TAP after VPP MAC change         | Recreate LIP                        |
+| No VPP→Linux route sync       | VPP-only routes invisible to kernel           | All routes flow through Linux/FRR   |
+| Route delete/add race         | ~225μs window during BGP reconvergence        | Transient; no fix yet               |
+| IS-IS punt                    | Ethertype 0x83FE not punted by default        | `lcp ethertype enable 0x83FE`       |
+| Netlink buffer overflow       | Silent route sync failures under BGP load     | sysctl rmem_max=67108864            |
+| Sub-if MTU clamping           | Cannot exceed parent MTU in Linux             | Expected Linux behavior             |
+
+### 14.9 Production Deployments Using Linux CP + FRR
+
+| Deployer         | Stack                    | Scale                    | Uptime / Status                |
+|------------------|--------------------------|--------------------------|-------------------------------|
+| **IPng Networks**| VPP + Bird2 + Linux CP   | 13 routers, full DFZ     | Zero LCP crashes since 2021  |
+| **Netgate TNSR** | VPP + FRR + Linux CP     | 1-1000 Gbps commercial   | Production (v25.10)           |
+| **Coloclue**     | VPP + Bird2 + Linux CP   | Amsterdam IX, eBGP/iBGP  | 0.0% packet loss (was 6.6%)  |
+| **VyOS**         | VPP + FRR + Linux CP     | Software router          | Rolling release (2025)        |
+
+IPng Networks achieves ~35 Mpps on a Xeon D-1518 (4 cores), sustaining 18 Gbps over
+17 days with zero crashes. Full DFZ (870K+133K routes) installs in ~6 seconds.
+
+### 14.10 Relevance to bpfrx
+
+| Aspect                    | bpfrx (Current)                      | VPP + Linux CP                       |
+|---------------------------|--------------------------------------|---------------------------------------|
+| **Interface ownership**   | bpfrxd manages real kernel interfaces| VPP owns NICs, TAPs shadow to kernel  |
+| **FRR integration**       | Generate `frr.conf`, `systemctl reload`| FRR sees TAP interfaces natively    |
+| **Route sync**            | bpfrx writes FRR config → FRR installs| FRR → kernel → netlink → VPP FIB   |
+| **Control-plane punt**    | `XDP_PASS` for local packets         | Punt to TAP for local packets         |
+| **Address management**    | `.network` files via networkd         | `lcp-sync` copies to TAP             |
+| **ARP/ND**                | Kernel handles (XDP_PASS)            | Kernel handles (TAP x-connect)        |
+| **DHCP**                  | bpfrx's own DHCP client              | Standard dhclient on TAP              |
+| **Management (SSH/gRPC)** | Kernel interfaces directly           | TAP interfaces (maybe in namespace)   |
+| **Interface rename**      | `.link` files (MAC→name)             | `host-if` parameter names TAP         |
+
+**Key insight:** If VPP is adopted, the Linux CP plugin replaces bpfrx's current interface
+management model (`.link`/`.network` files, networkd). FRR integration becomes simpler
+(FRR sees TAPs natively instead of needing managed `frr.conf` generation), but the
+operational model shifts to managing a VPP startup config + LIP pairs instead of networkd
+files. The `dataplane` namespace model adds complexity for management services but
+provides clean isolation.
+
+**For bpfrx's GoVPP integration**, the LIP lifecycle would be managed via:
+```go
+lcpClient := lcp.NewServiceClient(conn)
+// Create interface pair
+lcpClient.LcpItfPairAddDelV3(ctx, &lcp.LcpItfPairAddDelV3{
+    SwIfIndex:   physicalIfIndex,
+    HostIfName:  "trust0",
+    HostIfType:  lcp.LCP_API_ITF_HOST_TAP,
+    Namespace:   "dataplane",
+    IsAdd:       true,
+})
+```
+
+This is analogous to bpfrx's current `writeNetworkdFiles()` but operates at runtime via
+API calls rather than file generation + networkctl reload.
+
+---
+
 ## Appendix A: VPP Production Deployments
 
 | Deployer        | Product                  | Scale              | Status              |
@@ -1140,6 +1394,23 @@ If VPP is adopted, the migration path is:
 - [SRv6 BPF Implementation](https://segment-routing.org/index.php/Implementation/BPF)
 - [XDP-MPTM Tunnel Multiplexer](https://github.com/ebpf-networking/xdp-mptm)
 - [VPP-SSwan 1.89 Tbps Technology Guide](https://builders.intel.com/solutionslibrary/fd-io-vpp-sswan-and-linux-cp-integrate-strongswan-with-world-s-first-open-sourced-1-89-tb-ipsec-solution-technology-guide)
+
+### Linux CP (Pseudo-Interface) References
+
+- [VPP Linux CP Plugin Documentation (v25.10)](https://s3-docs.fd.io/vpp/25.10/developer/plugins/lcp.html)
+- [IPng Networks - VPP Linux CP Part 1 (Interface Pairs)](https://ipng.ch/s/articles/2021/08/12/vpp-linux-cp-part1/)
+- [IPng Networks - VPP Linux CP Part 2 (Addresses)](https://ipng.ch/s/articles/2021/08/13/vpp-linux-cp-part2/)
+- [IPng Networks - VPP Linux CP Part 3 (VLANs)](https://ipng.ch/s/articles/2021/08/15/vpp-linux-cp-part3/)
+- [IPng Networks - VPP Linux CP Part 4 (Netlink Listener)](https://ipng.ch/s/articles/2021/08/25/vpp-linux-cp-part4/)
+- [IPng Networks - VPP Linux CP Part 5 (Route Sync)](https://ipng.ch/s/articles/2021/09/02/vpp-linux-cp-part5/)
+- [IPng Networks - VPP Linux CP Part 6 (SNMP)](https://ipng.ch/s/articles/2021/09/10/vpp-linux-cp-part6/)
+- [IPng Networks - VPP Linux CP Part 7 (Production)](https://ipng.ch/s/articles/2021/09/21/vpp-linux-cp-part7/)
+- [Case Study: IPng at Coloclue (Full DFZ, Zero Packet Loss)](https://ipng.ch/s/articles/2024/06/29/case-study-ipng-at-coloclue/)
+- [TNSR Linux-cp Configuration Guide](https://docs.netgate.com/tnsr/en/latest/advanced/dataplane-linux-cp.html)
+- [VyOS VPP LCP Configuration](https://docs.vyos.io/en/latest/vpp/configuration/dataplane/lcp.html)
+- [FRR Wiki - Alternate Forwarding Planes: VPP](https://github.com/FRRouting/frr/wiki/Alternate-forwarding-planes:-VPP)
+- [Netgate Blog - Linux CP at LF Networking](https://www.netgate.com/blog/linux-cp-at-lf-networkings-one-summit-in-seattle-washington)
+- [VPP XFRM Plugin (IPsec Kernel Integration)](https://haryachyy.wordpress.com/2025/08/28/learning-vpp-xfrm-plugin/)
 
 ### VRRP References
 
