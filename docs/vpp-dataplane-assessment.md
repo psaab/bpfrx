@@ -7,7 +7,8 @@
 This document assesses the viability of using fd.io VPP (Vector Packet Processing) as
 a dataplane for bpfrx, either as a replacement for or complement to the existing XDP
 and custom DPDK pipelines. The analysis covers VPP's architecture, feature set,
-performance characteristics, integration strategies, and trade-offs.
+performance characteristics, integration strategies, VPN/tunnel compatibility, HA
+(VRRP), and Linux kernel integration via pseudo-interfaces.
 
 **Conclusion:** VPP is a viable high-performance dataplane but imposes significant
 architectural constraints. The most practical path is a **hybrid XDP + VPP** model
@@ -24,6 +25,35 @@ its IPsec reaches 1.89 Tbps on 40 cores (vs strongSwan's ~1 Gbps/core). XDP
 **cannot** inspect decrypted WireGuard or IPsec traffic -- only TC BPF hooks see the
 inner packet after kernel crypto. For plaintext tunnels (GRE, VXLAN, Geneve), XDP
 handles everything natively at near line-rate with no VPP needed.
+
+**VRRP/HA finding:** VPP includes a production-grade VRRPv3 plugin (RFC 5798, used by
+Netgate TNSR) with real-time async state events via GoVPP API -- eliminating
+keepalived's fragile SIGUSR1 polling. However, VPP VRRP only makes sense if VPP is
+already the dataplane; it lacks sync groups (bpfrx's cluster election handles
+coordinated failover instead), and VIPs live on VPP interfaces requiring explicit
+kernel mirroring for FRR and management services.
+
+**Linux integration finding:** VPP's Linux Control Plane (LCP) plugin creates TAP
+mirror interfaces in the kernel for each VPP-owned NIC, enabling FRR, SSH, SNMP, and
+management services to operate without modification. Bidirectional netlink
+synchronization keeps routes, addresses, and neighbor tables consistent between VPP
+and the kernel. This is proven in production (IPng Networks: 13 routers, zero LCP
+crashes since 2021; Netgate TNSR; Coloclue: 0% packet loss). LCP replaces bpfrx's
+current networkd-based interface management but introduces namespace complexity and
+a dependency on VPP's "experimental" plugin label.
+
+### Document Sections
+
+| Section | Topic |
+|---------|-------|
+| 1-3     | VPP architecture, feature gaps, performance comparison |
+| 4       | Four integration strategies (full replacement, hybrid, selective, DPDK worker) |
+| 5-6     | Go control plane (GoVPP), operational considerations |
+| 7-8     | Risk assessment and recommendation |
+| 9-10    | WireGuard/VPN performance, tunnel/XDP compatibility matrix |
+| 11-12   | WireGuard integration options (A-E), impact on VPP decision |
+| 13      | VRRP implementation with VPP (vs keepalived) |
+| 14      | Linux CP pseudo-interfaces for FRR/kernel integration |
 
 ---
 
