@@ -2819,7 +2819,7 @@ func (c *ctl) handlePing(args []string) error {
 			}
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(c.ctx(), 60*time.Second)
 	defer cancel()
 	stream, err := c.client.Ping(ctx, req)
 	if err != nil {
@@ -2857,7 +2857,7 @@ func (c *ctl) handleTraceroute(args []string) error {
 			}
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(c.ctx(), 60*time.Second)
 	defer cancel()
 	stream, err := c.client.Traceroute(ctx, req)
 	if err != nil {

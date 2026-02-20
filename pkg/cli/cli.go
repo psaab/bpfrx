@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -59,6 +61,10 @@ type CLI struct {
 	userClass    string
 	version      string
 	startTime    time.Time
+
+	// Command cancellation: Ctrl-C during a running external command cancels it.
+	cmdMu     sync.Mutex
+	cmdCancel context.CancelFunc
 }
 
 // New creates a new CLI.
@@ -457,6 +463,14 @@ func (c *CLI) Run() error {
 	go func() {
 		var lastInterrupt time.Time
 		for range sigCh {
+			// If an external command is running, cancel it.
+			c.cmdMu.Lock()
+			cancel := c.cmdCancel
+			c.cmdMu.Unlock()
+			if cancel != nil {
+				cancel()
+				continue
+			}
 			now := time.Now()
 			if now.Sub(lastInterrupt) < 2*time.Second {
 				if c.store.InConfigMode() {
@@ -8489,10 +8503,25 @@ func (c *CLI) handlePing(args []string) error {
 	}
 	cmdArgs = append(cmdArgs, target)
 
-	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	c.cmdMu.Lock()
+	c.cmdCancel = cancel
+	c.cmdMu.Unlock()
+	defer func() {
+		c.cmdMu.Lock()
+		c.cmdCancel = nil
+		c.cmdMu.Unlock()
+	}()
+
+	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return nil // cancelled by Ctrl-C or timeout
+	}
+	return err
 }
 
 func (c *CLI) handleTraceroute(args []string) error {
@@ -8528,10 +8557,25 @@ func (c *CLI) handleTraceroute(args []string) error {
 	}
 	cmdArgs = append(cmdArgs, target)
 
-	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	c.cmdMu.Lock()
+	c.cmdCancel = cancel
+	c.cmdMu.Unlock()
+	defer func() {
+		c.cmdMu.Lock()
+		c.cmdCancel = nil
+		c.cmdMu.Unlock()
+	}()
+
+	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return nil // cancelled by Ctrl-C or timeout
+	}
+	return err
 }
 
 func (c *CLI) showRIP() error {
@@ -9626,10 +9670,27 @@ func (c *CLI) handleMonitorTraffic(args []string) error {
 	}
 
 	fmt.Printf("Monitoring traffic on %s (Ctrl+C to stop)...\n", iface)
-	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.cmdMu.Lock()
+	c.cmdCancel = cancel
+	c.cmdMu.Unlock()
+	defer func() {
+		c.cmdMu.Lock()
+		c.cmdCancel = nil
+		c.cmdMu.Unlock()
+	}()
+
+	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		fmt.Println() // newline after ^C
+		return nil
+	}
+	return err
 }
 
 // showSystemUptime shows system uptime (like Junos "show system uptime").
