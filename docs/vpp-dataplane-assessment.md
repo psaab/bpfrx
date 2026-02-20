@@ -18,6 +18,13 @@ hitless restart capability. For bpfrx's current scale (25 Gbps XDP, 15.6 Gbps
 virtio-net), the existing architecture is adequate; VPP becomes compelling at 40-100+
 Gbps where its vector processing model dominates.
 
+**VPN/Tunnel finding:** The strongest case for VPP is encrypted tunnel acceleration.
+VPP's WireGuard plugin achieves 34-204 Gbps (vs kernel's 3-5 Gbps per tunnel) and
+its IPsec reaches 1.89 Tbps on 40 cores (vs strongSwan's ~1 Gbps/core). XDP
+**cannot** inspect decrypted WireGuard or IPsec traffic -- only TC BPF hooks see the
+inner packet after kernel crypto. For plaintext tunnels (GRE, VXLAN, Geneve), XDP
+handles everything natively at near line-rate with no VPP needed.
+
 ---
 
 ## 1. VPP Architecture Overview
@@ -473,6 +480,333 @@ custom plugins would be amortized across multiple services that VPP provides nat
 
 ---
 
+## 9. WireGuard and VPN Technologies
+
+### 9.1 VPP WireGuard Plugin
+
+VPP's WireGuard plugin was introduced in VPP 20.09 and has been maintained for ~5.5
+years. It is based on wireguard-openbsd and uses VPP's IPIP tunnel infrastructure.
+
+**Features:** Multiple peers per interface, persistent keepalive, endpoint roaming,
+integration with VPP's async crypto API (software and hardware engines).
+
+**Production use:** Netgate TNSR terminates thousands of WireGuard VPNs on a single
+platform. TNSR 25.10 added FQDN-based peer configuration.
+
+**Known issues:** A February 2025 CSIT bug report describes crashes in hardware
+WireGuard tests with "Peer error" on the main thread and "Keypair error" on workers,
+suggesting memory corruption in certain configurations with hardware crypto offload.
+
+#### WireGuard Performance: VPP vs Kernel vs Userspace
+
+| Implementation                        | Packet Size | Throughput         |
+|---------------------------------------|-------------|--------------------|
+| VPP WireGuard + Intel QAT Gen 3       | 1420B       | **204 Gbps**       |
+| VPP WireGuard + software (AVX-512)    | 1420B       | **34 Gbps**        |
+| VPP WireGuard + QAT (Xeon D-2700)     | --          | **46 Gbps** bidir  |
+| VPP WireGuard + software (Xeon D-2700)| --          | **8 Gbps** bidir   |
+| VPP WireGuard + software (66B pkts)   | 66B         | **1,799 Mbps**     |
+| wireguard-go + GSO/GRO (Tailscale)    | --          | **13 Gbps**        |
+| Linux kernel WireGuard (multi-stream)  | --          | **7.89 Gbps**      |
+| Linux kernel WireGuard (single stream)| --          | **3-5 Gbps**       |
+| Linux kernel WireGuard (66B pkts)     | 66B         | **250 Mbps**       |
+| boringtun (Cloudflare, Rust)          | --          | ~kernel parity     |
+
+VPP with QAT offload provides a 5.9x improvement over software-only for large packets.
+For small packets (66B), VPP is 7.2x faster than the kernel.
+
+**Tailscale's surprising result:** wireguard-go (Go userspace) beat the kernel on bare
+metal by leveraging UDP GSO (kernel v4.18+), TUN GRO (kernel v6.2+), and checksum
+offload. No kernel bypass -- just smarter syscall batching. This achieved 13 Gbps.
+
+### 9.2 VPP IPsec vs strongSwan / Kernel XFRM
+
+| Implementation                   | Crypto        | Per-Core Throughput  |
+|----------------------------------|---------------|----------------------|
+| VPP IPsec (4th Gen Xeon)         | AES-GCM-128   | **~50 Gbps/core**    |
+| VPP IPsec (single SA)            | AES-GCM-128   | **31 Gbps**          |
+| VPP IPsec (Icelake)              | AES-NI vector | **16 Gbps/core**     |
+| Linux kernel XFRM (4th Gen Xeon) | AES-GCM       | **~6 Gbps/core**     |
+| Linux kernel XFRM (general)      | AES-GCM-128   | **4.8-5 Gbps/core**  |
+| strongSwan (research, 2 cores)   | AES128GCM     | **~2.4 Gbps/core**   |
+| strongSwan (commodity)           | AES-GCM+AESNI | **~1 Gbps/core**     |
+
+**VPP-SSwan integration:** strongSwan handles IKE/control plane; VPP handles the data
+plane via a plugin that offloads ESP processing. This achieved **1.89 Tbps NDR** on a
+single 4th Gen Xeon socket (40 cores) -- the first open-sourced Tbps IPsec solution.
+
+**Kernel XFRM bottleneck:** Decapsulation for a single IPsec SA is always limited to a
+single CPU. Multiple CHILD_SAs are needed to utilize multiple cores. This is a
+fundamental architectural limit that VPP bypasses entirely.
+
+### 9.3 Other VPN/Tunnel Technologies in VPP
+
+| Technology  | VPP Status         | Performance                                      |
+|-------------|--------------------|--------------------------------------------------|
+| IPsec       | Mature, production | 1.89 Tbps (40 cores)                             |
+| VXLAN       | Mature, production | 47 Gbps NDR (4 cores, 1518B, 1-40K tunnels)      |
+| Geneve      | Mature             | Similar to VXLAN                                 |
+| SRv6        | Mature, production | CSIT benchmarked, telco-scale deployments        |
+| MPLS        | Mature             | Core VPP feature                                 |
+| GTP-U       | Production (5G)    | 1.3 Tbps containerized demo (Cisco/Intel)        |
+| GRE         | Mature             | Core feature, baseline tunnel performance        |
+
+---
+
+## 10. Tunnel Technologies and XDP Compatibility
+
+### 10.1 The Encryption Boundary: Where XDP Stops
+
+XDP fires at the earliest point in the packet path -- before any kernel crypto
+processing. This creates a hard architectural boundary:
+
+| Tunnel Type     | XDP Sees on Physical NIC          | Can XDP Inspect Inner Packet? | Best Hook for Inner Packet                      |
+|-----------------|-----------------------------------|-------------------------------|-------------------------------------------------|
+| **WireGuard**   | Encrypted UDP payload             | **NO**                        | TC BPF on wg0                                   |
+| **IPsec/XFRM**  | Encrypted ESP payload             | **NO**                        | TC BPF after XFRM recirculation, or TC on xfrmi |
+| **GRE**         | Full GRE packet (plaintext)       | **YES** (inline parsing)      | XDP on physical NIC                             |
+| **VXLAN**       | Full VXLAN packet (plaintext)     | **YES** (inline parsing)      | XDP on physical NIC                             |
+| **Geneve**      | Full Geneve packet (plaintext)    | **YES** (inline parsing)      | XDP on physical NIC                             |
+| **IPIP/IP6IP6** | Outer IP + inner IP               | **YES** (trivial parsing)     | XDP on physical NIC                             |
+| **SRv6**        | IPv6 + SRH + inner                | YES (but wrong hook)          | seg6local End.BPF (separate program type)       |
+
+**Key insight:** Plaintext tunnels (GRE, VXLAN, Geneve, IPIP) can be fully parsed and
+firewalled inline in XDP at near line-rate. Encrypted tunnels (WireGuard, IPsec)
+require kernel crypto processing, forcing inner-packet inspection into TC BPF hooks
+which run after SKB allocation -- losing XDP's performance advantage.
+
+### 10.2 WireGuard + XDP: Fundamental Incompatibility
+
+**XDP cannot natively attach to WireGuard interfaces.** This is an architectural
+limitation, not a missing feature:
+
+1. **No link-layer headers:** WireGuard's `wg0` is a Layer 3 (tun-type) interface
+   without Ethernet headers. XDP expects Layer 2 frames.
+2. **No `ndo_bpf` implementation:** The WireGuard kernel module does not implement
+   the netdev operation for native XDP.
+3. **`XDP_PASS` breaks things:** Due to the header mismatch, passing packets through
+   XDP on wg0 jams the socket code.
+4. **Rejected upstream:** Jason Donenfeld (WireGuard author) wrote a patch to add XDP
+   support; XDP maintainers rejected it as violating XDP's design assumptions about
+   operating on raw frames before SKB allocation.
+5. **Cilium explicitly rejects** WireGuard + XDP combinations after discovering
+   fundamental incompatibilities.
+
+**What works instead:**
+- **TC BPF on wg0:** `BPF_PROG_TYPE_SCHED_CLS` on TC ingress sees fully decrypted
+  plaintext packets. This is Fly.io's and Cilium's production approach.
+- **XDP on physical NIC (pre-decryption):** Sees encrypted WireGuard UDP packets.
+  Useful for rate-limiting and DDoS mitigation on port 51820, but cannot inspect
+  inner packet content for firewall policy.
+
+### 10.3 IPsec/XFRM + XDP
+
+On ingress, XDP sees raw ESP packets (protocol 50) before XFRM processing. After
+kernel XFRM decryption, the decrypted packet is **recirculated** through TC ingress
+on the same interface:
+
+```
+Physical NIC → XDP (encrypted ESP) → SKB → TC ingress (1st pass: encrypted)
+                                              ↓
+                                        XFRM decrypt
+                                              ↓
+                                        TC ingress (2nd pass: decrypted, recirculated)
+```
+
+The TC BPF helper `bpf_skb_get_xfrm_state()` (TC-only, not available in XDP) returns
+the SA's reqid, SPI, and remote address, enabling policy decisions based on which
+IPsec tunnel a packet arrived through.
+
+**xfrmi interfaces** (XFRM interface, `ip link add ipsec0 type xfrm`) also lack
+native XDP support and `ndo_xdp_xmit`. TC BPF on xfrmi is the correct hook point
+for inner-packet policy after decryption.
+
+### 10.4 Plaintext Tunnels: XDP-Native at Full Speed
+
+**GRE:** XDP can parse through outer IP + GRE header (4-16 bytes) to access inner
+packet headers. Encap/decap via `bpf_xdp_adjust_head()` is a pointer operation (no
+memcpy). bpfrx already has `gre_accel` infrastructure and GRE-specific TCP MSS
+clamping (`tcp_mss_gre_in`/`tcp_mss_gre_out`).
+
+**VXLAN/Geneve:** XDP can parse through outer Ethernet + IP + UDP + VXLAN/Geneve
+header (~50 bytes) to the inner Ethernet frame. Manual byte-level encap/decap works
+but the kernel helpers `bpf_skb_set_tunnel_key()` / `bpf_skb_get_tunnel_key()` are
+**TC-only, not available in XDP**.
+
+**IPIP:** Trivial -- just an extra IP header. XDP parses through with minimal overhead.
+
+**SRv6:** Has first-class kernel support via `seg6local` End.BPF action
+(`BPF_PROG_TYPE_LWT_SEG6LOCAL`), but this is a separate BPF program type from XDP --
+not part of the XDP pipeline. Production-ready since kernel 4.18.
+
+**Note:** Linux GRE, VXLAN, and Geneve tunnel devices all lack native XDP support
+(`ndo_bpf` and `ndo_xdp_xmit`). The XDP-native approach means parsing these tunnels
+**inline on the physical NIC** rather than using kernel tunnel devices.
+
+### 10.5 Performance Hierarchy for XDP-Based Firewalling
+
+**Tier 1 -- XDP-Native, Full Fast Path (inline parsing on physical NIC):**
+1. IPIP/IP6IP6 -- simplest encap, trivial parsing, minimal overhead
+2. GRE -- slightly more complex header, still fixed-format parsing
+3. VXLAN/Geneve -- UDP encap adds one more layer, fully parseable
+
+*Expected: 20-25+ Gbps on native XDP hardware.*
+
+**Tier 2 -- Kernel Tunnel Device + TC BPF (two-stage):**
+4. Kernel GRE/VXLAN device + TC BPF on tunnel interface for inner policy
+
+*Expected: 10-15 Gbps (post-SKB allocation).*
+
+**Tier 3 -- Encrypted Tunnels (kernel crypto required):**
+5. IPsec with hardware offload (Intel QAT, NIC xfrm_device) + TC BPF
+6. IPsec software (AES-NI) + TC BPF recirculation
+7. WireGuard (ChaCha20-Poly1305 software) + TC BPF on wg0
+
+*Expected: crypto-bound. WireGuard 3-5 Gbps/core, IPsec software 1-5 Gbps/core,
+IPsec hardware offload 10-25+ Gbps.*
+
+**Tier 4 -- Separate BPF Hook:**
+8. SRv6 (seg6local End.BPF) -- different program type, ~8% overhead from BPF
+   execution in the LWT path
+
+---
+
+## 11. WireGuard Integration Options for bpfrx
+
+### Option A: Kernel WireGuard + TC BPF on wg0 (Recommended Short-Term)
+
+```
+Physical NIC (XDP) → encrypted UDP → kernel WireGuard → wg0 (TC BPF) → routing
+```
+
+- bpfrxd generates WireGuard configs (same pattern as strongSwan config generation)
+- Kernel handles ChaCha20-Poly1305 crypto
+- TC BPF program on wg0 applies zone-based firewall policy on decrypted traffic
+- XDP on physical NIC handles DDoS/screen on encrypted WireGuard UDP traffic
+
+**Pros:** Simplest integration, production-grade kernel WireGuard, battle-tested.
+**Cons:** TC hooks slower than XDP (post-SKB). Two processing paths: XDP on physical,
+TC on wg0. Single-core bottleneck per tunnel (~3-5 Gbps).
+**Effort:** 4-6 weeks (TC BPF firewall program + wg config generator + zone binding).
+
+### Option B: Kernel WireGuard + XDP on veth Peer
+
+```
+Physical NIC (XDP) → kernel WireGuard → wg0 → ip route via veth →
+  XDP on veth peer → full firewall pipeline → forward
+```
+
+- Kernel WireGuard decrypts; wg0 routes to a veth pair
+- XDP pipeline runs on the veth peer interface (native XDP supported since kernel 5.9)
+- Full XDP firewall pipeline (screen, zone, conntrack, policy, NAT) on decrypted traffic
+- Clean separation: WireGuard handles crypto, bpfrx handles policy
+
+**Pros:** Full XDP pipeline on decrypted traffic. Reuses all existing BPF code.
+**Cons:** Extra veth hop adds ~1-2 us latency. Routing rules to steer wg0 through veth.
+Still limited by kernel WireGuard throughput.
+**Effort:** 3-4 weeks (veth plumbing + routing rules + wg config generator).
+
+### Option C: Userspace WireGuard (boringtun/CNDP) + AF_XDP
+
+```
+Physical NIC (XDP) → encrypted UDP → XDP_REDIRECT to AF_XDP socket →
+  userspace WireGuard decrypt → inject decrypted packet back via tun/veth →
+  XDP firewall pipeline on inner interface
+```
+
+- AF_XDP provides kernel-bypass I/O for encrypted packets
+- boringtun/GotaTun (Rust) or CNDP (Intel, Rust + AF_XDP) handles crypto in userspace
+- Decrypted packets re-enter XDP via a veth pair for full pipeline processing
+
+**Pros:** Keeps XDP pipeline intact. CNDP's AF_XDP WireGuard uses Intel AVX-512.
+Higher throughput potential than kernel WireGuard.
+**Cons:** Extra packet copy (userspace decrypt → re-inject). More complex architecture.
+boringtun/GotaTun less battle-tested. Latency from userspace round-trip.
+**Effort:** 6-8 weeks (AF_XDP steering + userspace WG integration + re-injection).
+
+### Option D: VPP WireGuard Plugin (Performance Ceiling)
+
+```
+Physical NIC (DPDK) → VPP WireGuard decrypt → VPP forwarding graph → VPP WireGuard encrypt
+```
+
+- VPP owns the entire data plane (DPDK or AF_XDP NIC binding)
+- WireGuard + NAT + routing + ACL all in VPP's vector processing graph
+- Intel QAT offload for ChaCha20-Poly1305 (204 Gbps)
+
+**Pros:** Highest raw performance (34-204 Gbps). Vector processing for multi-tunnel.
+**Cons:** Replaces bpfrx's entire BPF pipeline. Requires zone-policy VPP plugin.
+VPP WireGuard has known stability issues (CSIT crashes). Loss of hitless restart.
+**Effort:** 12-16 weeks (VPP zone-policy plugin + GoVPP integration + WireGuard config).
+
+### Option E: Integrate WireGuard into bpfrx DPDK Worker
+
+```
+Physical NIC (DPDK PMD) → dpdk_worker (parse → WG decrypt → screen → zone →
+  conntrack → policy → NAT → WG encrypt → forward)
+```
+
+- Add ChaCha20-Poly1305 to the existing single-pass DPDK pipeline
+- Use DPDK's cryptodev API for hardware offload (QAT, AESNI-MB)
+- Full bpfrx feature parity on decrypted traffic within a single pipeline pass
+
+**Pros:** Single-pass processing (lowest latency). Full feature parity. No external
+dependencies. Tight Go integration via existing shared memory.
+**Cons:** Must implement WireGuard protocol (handshake, key rotation, keepalive) in C.
+Crypto library integration. Significant development effort.
+**Effort:** 8-12 weeks (WireGuard protocol + cryptodev integration + session management).
+
+### WireGuard Integration Recommendation
+
+| Timeframe   | Recommended Option | Rationale                                            |
+|-------------|-------------------|------------------------------------------------------|
+| Short-term  | **B** (kernel WG + veth + XDP) | Full XDP pipeline, minimal changes, battle-tested crypto |
+| Medium-term | **C** (userspace WG + AF_XDP) | Higher throughput when kernel WG bottlenecks          |
+| Long-term   | **E** (DPDK worker integration) | Highest performance under full project control       |
+| If VPP adopted | **D** (VPP WireGuard plugin) | Only if VPP is already the primary dataplane        |
+
+---
+
+## 12. Impact on VPP Adoption Decision
+
+### Does VPP Change the Calculus for Encrypted Tunnels?
+
+The tunnel analysis strengthens VPP's case in one specific dimension:
+
+**VPP's strongest advantage is encrypted tunnel throughput.** The gap between kernel
+crypto and VPP+QAT is enormous:
+
+| Tunnel Type | Kernel/strongSwan  | VPP (software)   | VPP (QAT)       | Speedup   |
+|-------------|--------------------|-------------------|-----------------|-----------|
+| WireGuard   | 3-5 Gbps/core      | 8-34 Gbps         | 204 Gbps        | 40-60x    |
+| IPsec       | 1-5 Gbps/core      | 16-50 Gbps/core   | 50 Gbps/core    | 10-50x    |
+
+If bpfrx's deployment targets include high-throughput VPN concentration (site-to-site
+at 40+ Gbps, or hundreds of remote peers), VPP becomes significantly more attractive.
+
+**However**, for deployments where VPN is one feature among many (the typical firewall
+use case), the kernel WireGuard + TC/veth approach at 3-7 Gbps per tunnel is adequate
+for the vast majority of site-to-site and remote access scenarios.
+
+### For Plaintext Tunnels, VPP Adds Nothing
+
+GRE, VXLAN, Geneve, and IPIP are all fully handled by XDP inline parsing at near
+line-rate. There is no performance reason to adopt VPP for these tunnel types.
+
+### Updated Recommendation
+
+The original recommendation stands with one refinement:
+
+- **Current path (XDP + DPDK worker)** remains optimal for the general firewall case.
+- **VPP becomes compelling** specifically when the deployment requires **high-throughput
+  VPN concentration** (40+ Gbps encrypted tunnels) or **native IPsec acceleration**
+  beyond what kernel XFRM provides.
+- **For WireGuard support**, Option B (kernel WG + veth + XDP pipeline) is the pragmatic
+  first step. VPP or DPDK integration is only warranted when tunnel throughput exceeds
+  kernel WireGuard's ~5 Gbps per-core limit.
+
+---
+
 ## Appendix A: VPP Production Deployments
 
 | Deployer        | Product                  | Scale              | Status              |
@@ -497,3 +831,28 @@ custom plugins would be amortized across multiple services that VPP provides nat
 - [40G Encrypted with Calico/VPP](https://medium.com/fd-io-vpp/getting-to-40g-encrypted-container-networking-with-calico-vpp-on-commodity-hardware-d7144e52659a)
 - [Intel IPsec with VPP (1.89 Tbps)](https://builders.intel.com/docs/networkbuilders/fd-io-vpp-sswan-and-linux-cp-integrate-strongswan-with-world-s-first-open-sourced-1-89-tb-ipsec-solution-technology-guide-1686047475.pdf)
 - [Netgate TNSR](https://www.netgate.com/tnsr)
+
+### WireGuard and VPN References
+
+- [VPP WireGuard Plugin (v26.02)](https://s3-docs.fd.io/vpp/26.02/developer/plugins/wireguard.html)
+- [Intel QAT WireGuard (4th Gen Xeon)](https://builders.intel.com/solutionslibrary/intel-qat-accelerate-wireguard-processing-with-4th-gen-intel-xeon-scalable-processor-technology-guide)
+- [Intel AVX-512/QAT WireGuard (Xeon D-2700)](https://builders.intel.com/docs/networkbuilders/intel-avx-512-and-intel-qat-accelerate-wireguard-processing-with-intel-xeon-d-2700-processor-technology-guide-1647024663.pdf)
+- [CSIT WireGuard Hardware Test Crashes](https://github.com/FDio/csit/issues/4045)
+- [Tailscale 10+ Gbps wireguard-go](https://tailscale.com/blog/more-throughput)
+- [Cloudflare boringtun](https://github.com/cloudflare/boringtun)
+- [Mullvad GotaTun](https://mullvad.net/en/blog/announcing-gotatun-the-future-of-wireguard-at-mullvad-vpn)
+- [Intel CNDP WireGuard (AF_XDP)](https://cndp.io/guide/sample_app_ug/WireGuard.html)
+- [LPC 2024: WireGuard Performance](https://lpc.events/event/18/contributions/1968/attachments/1534/3213/LPC24_%20WireGuard_perf.pdf)
+- [netdevconf 2024: WireGuard Multi-Tunnel Scaling](https://netdevconf.info/0x18/sessions/talk/achieving-linear-cpu-scaling-in-wireguard-with-an-efficient-multi-tunnel-architecture.html)
+
+### XDP + Tunnel Compatibility References
+
+- [Fly.io: BPF, XDP, Packet Filters and UDP](https://fly.io/blog/bpf-xdp-packet-filters-and-udp/)
+- [Cilium WireGuard + XDP Incompatibility](https://github.com/cilium/cilium/issues/25354)
+- [Cilium XFRM Reference Guide](https://docs.cilium.io/en/latest/reference-guides/xfrm/index.html)
+- [Linux XFRM IPsec Reference Guide (pchaigno)](https://pchaigno.github.io/xfrm/2024/10/30/linux-xfrm-ipsec-reference-guide.html)
+- [RHEL 9 IPsec AES-GCM Performance](https://www.redhat.com/en/blog/ipsec-performance-red-hat-enterprise-linux-9-performance-analysis-aes-gcm)
+- [strongSwan Multi-Core SA Discussion](https://github.com/strongswan/strongswan/discussions/1089)
+- [SRv6 BPF Implementation](https://segment-routing.org/index.php/Implementation/BPF)
+- [XDP-MPTM Tunnel Multiplexer](https://github.com/ebpf-networking/xdp-mptm)
+- [VPP-SSwan 1.89 Tbps Technology Guide](https://builders.intel.com/solutionslibrary/fd-io-vpp-sswan-and-linux-cp-integrate-strongswan-with-world-s-first-open-sourced-1-89-tb-ipsec-solution-technology-guide)
