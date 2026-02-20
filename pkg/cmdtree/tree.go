@@ -688,6 +688,22 @@ func HelpCandidates(tree map[string]*Node) []Candidate {
 	return candidates
 }
 
+// isPlaceholder returns true for angle-bracket nodes like "<host>" that act as
+// positional argument wildcards in the tree.
+func isPlaceholder(name string) bool {
+	return len(name) > 2 && name[0] == '<' && name[len(name)-1] == '>'
+}
+
+// findPlaceholder returns the placeholder node in a tree level, if any.
+func findPlaceholder(tree map[string]*Node) *Node {
+	for name, node := range tree {
+		if isPlaceholder(name) {
+			return node
+		}
+	}
+	return nil
+}
+
 // CompleteFromTree walks the tree to find completion candidates for the given words and partial.
 func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg *config.Config) []string {
 	current := tree
@@ -698,6 +714,13 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 		node, ok := current[w]
 		if !ok {
 			if currentNode != nil && currentNode.HasDynamic() {
+				dynamicConsumed = true
+				continue
+			}
+			// Check for placeholder node that consumes any value
+			if ph := findPlaceholder(current); ph != nil {
+				// Placeholder consumed this word; stay at same tree level
+				// so sibling options remain available for completion
 				dynamicConsumed = true
 				continue
 			}
@@ -733,6 +756,11 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 		node, ok := current[w]
 		if !ok {
 			if currentNode != nil && currentNode.HasDynamic() {
+				dynamicConsumed = true
+				continue
+			}
+			// Check for placeholder node that consumes any value
+			if ph := findPlaceholder(current); ph != nil {
 				dynamicConsumed = true
 				continue
 			}
@@ -822,6 +850,10 @@ func LookupDesc(words []string, name string, configMode bool) string {
 		if !ok {
 			// Dynamic value — skip but stay at same children level.
 			if currentNode != nil && currentNode.DynamicFn != nil {
+				continue
+			}
+			// Placeholder node consumes any value.
+			if findPlaceholder(current) != nil {
 				continue
 			}
 			return ""

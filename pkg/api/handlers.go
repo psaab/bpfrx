@@ -1520,7 +1520,11 @@ func (s *Server) pingHandler(w http.ResponseWriter, r *http.Request) {
 
 	var cmd []string
 	if req.RoutingInstance != "" {
-		cmd = append(cmd, "ip", "vrf", "exec", req.RoutingInstance)
+		vrfDev := req.RoutingInstance
+		if !strings.HasPrefix(vrfDev, "vrf-") {
+			vrfDev = "vrf-" + vrfDev
+		}
+		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
 	}
 	cmd = append(cmd, "ping")
 	cmd = append(cmd, args...)
@@ -1554,7 +1558,11 @@ func (s *Server) tracerouteHandler(w http.ResponseWriter, r *http.Request) {
 
 	var cmd []string
 	if req.RoutingInstance != "" {
-		cmd = append(cmd, "ip", "vrf", "exec", req.RoutingInstance)
+		vrfDev := req.RoutingInstance
+		if !strings.HasPrefix(vrfDev, "vrf-") {
+			vrfDev = "vrf-" + vrfDev
+		}
+		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
 	}
 	cmd = append(cmd, "traceroute")
 	cmd = append(cmd, args...)

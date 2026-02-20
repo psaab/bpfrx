@@ -1945,7 +1945,11 @@ func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.
 
 	var cmd []string
 	if req.RoutingInstance != "" {
-		cmd = append(cmd, "ip", "vrf", "exec", req.RoutingInstance)
+		vrfDev := req.RoutingInstance
+		if !strings.HasPrefix(vrfDev, "vrf-") {
+			vrfDev = "vrf-" + vrfDev
+		}
+		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
 	}
 	cmd = append(cmd, "ping")
 	cmd = append(cmd, args...)
@@ -1967,7 +1971,11 @@ func (s *Server) Traceroute(req *pb.TracerouteRequest, stream grpc.ServerStreami
 
 	var cmd []string
 	if req.RoutingInstance != "" {
-		cmd = append(cmd, "ip", "vrf", "exec", req.RoutingInstance)
+		vrfDev := req.RoutingInstance
+		if !strings.HasPrefix(vrfDev, "vrf-") {
+			vrfDev = "vrf-" + vrfDev
+		}
+		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
 	}
 	cmd = append(cmd, "traceroute")
 	cmd = append(cmd, args...)
