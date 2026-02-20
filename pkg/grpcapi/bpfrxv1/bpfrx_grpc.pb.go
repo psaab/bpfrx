@@ -116,9 +116,9 @@ type BpfrxServiceClient interface {
 	GetNATRuleStats(ctx context.Context, in *GetNATRuleStatsRequest, opts ...grpc.CallOption) (*GetNATRuleStatsResponse, error)
 	GetVRRPStatus(ctx context.Context, in *GetVRRPStatusRequest, opts ...grpc.CallOption) (*GetVRRPStatusResponse, error)
 	MatchPolicies(ctx context.Context, in *MatchPoliciesRequest, opts ...grpc.CallOption) (*MatchPoliciesResponse, error)
-	// Diagnostics
-	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
-	Traceroute(ctx context.Context, in *TracerouteRequest, opts ...grpc.CallOption) (*TracerouteResponse, error)
+	// Diagnostics (server-streaming for real-time output)
+	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PingResponse], error)
+	Traceroute(ctx context.Context, in *TracerouteRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TracerouteResponse], error)
 	// Mutations
 	ClearSessions(ctx context.Context, in *ClearSessionsRequest, opts ...grpc.CallOption) (*ClearSessionsResponse, error)
 	ClearCounters(ctx context.Context, in *ClearCountersRequest, opts ...grpc.CallOption) (*ClearCountersResponse, error)
@@ -531,25 +531,43 @@ func (c *bpfrxServiceClient) MatchPolicies(ctx context.Context, in *MatchPolicie
 	return out, nil
 }
 
-func (c *bpfrxServiceClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error) {
+func (c *bpfrxServiceClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PingResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(PingResponse)
-	err := c.cc.Invoke(ctx, BpfrxService_Ping_FullMethodName, in, out, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &BpfrxService_ServiceDesc.Streams[0], BpfrxService_Ping_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	x := &grpc.GenericClientStream[PingRequest, PingResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
 }
 
-func (c *bpfrxServiceClient) Traceroute(ctx context.Context, in *TracerouteRequest, opts ...grpc.CallOption) (*TracerouteResponse, error) {
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type BpfrxService_PingClient = grpc.ServerStreamingClient[PingResponse]
+
+func (c *bpfrxServiceClient) Traceroute(ctx context.Context, in *TracerouteRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TracerouteResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(TracerouteResponse)
-	err := c.cc.Invoke(ctx, BpfrxService_Traceroute_FullMethodName, in, out, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &BpfrxService_ServiceDesc.Streams[1], BpfrxService_Traceroute_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	x := &grpc.GenericClientStream[TracerouteRequest, TracerouteResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
 }
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type BpfrxService_TracerouteClient = grpc.ServerStreamingClient[TracerouteResponse]
 
 func (c *bpfrxServiceClient) ClearSessions(ctx context.Context, in *ClearSessionsRequest, opts ...grpc.CallOption) (*ClearSessionsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -668,9 +686,9 @@ type BpfrxServiceServer interface {
 	GetNATRuleStats(context.Context, *GetNATRuleStatsRequest) (*GetNATRuleStatsResponse, error)
 	GetVRRPStatus(context.Context, *GetVRRPStatusRequest) (*GetVRRPStatusResponse, error)
 	MatchPolicies(context.Context, *MatchPoliciesRequest) (*MatchPoliciesResponse, error)
-	// Diagnostics
-	Ping(context.Context, *PingRequest) (*PingResponse, error)
-	Traceroute(context.Context, *TracerouteRequest) (*TracerouteResponse, error)
+	// Diagnostics (server-streaming for real-time output)
+	Ping(*PingRequest, grpc.ServerStreamingServer[PingResponse]) error
+	Traceroute(*TracerouteRequest, grpc.ServerStreamingServer[TracerouteResponse]) error
 	// Mutations
 	ClearSessions(context.Context, *ClearSessionsRequest) (*ClearSessionsResponse, error)
 	ClearCounters(context.Context, *ClearCountersRequest) (*ClearCountersResponse, error)
@@ -810,11 +828,11 @@ func (UnimplementedBpfrxServiceServer) GetVRRPStatus(context.Context, *GetVRRPSt
 func (UnimplementedBpfrxServiceServer) MatchPolicies(context.Context, *MatchPoliciesRequest) (*MatchPoliciesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MatchPolicies not implemented")
 }
-func (UnimplementedBpfrxServiceServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
+func (UnimplementedBpfrxServiceServer) Ping(*PingRequest, grpc.ServerStreamingServer[PingResponse]) error {
+	return status.Error(codes.Unimplemented, "method Ping not implemented")
 }
-func (UnimplementedBpfrxServiceServer) Traceroute(context.Context, *TracerouteRequest) (*TracerouteResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Traceroute not implemented")
+func (UnimplementedBpfrxServiceServer) Traceroute(*TracerouteRequest, grpc.ServerStreamingServer[TracerouteResponse]) error {
+	return status.Error(codes.Unimplemented, "method Traceroute not implemented")
 }
 func (UnimplementedBpfrxServiceServer) ClearSessions(context.Context, *ClearSessionsRequest) (*ClearSessionsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ClearSessions not implemented")
@@ -1560,41 +1578,27 @@ func _BpfrxService_MatchPolicies_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _BpfrxService_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(PingRequest)
-	if err := dec(in); err != nil {
-		return nil, err
+func _BpfrxService_Ping_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(PingRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
 	}
-	if interceptor == nil {
-		return srv.(BpfrxServiceServer).Ping(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: BpfrxService_Ping_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(BpfrxServiceServer).Ping(ctx, req.(*PingRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+	return srv.(BpfrxServiceServer).Ping(m, &grpc.GenericServerStream[PingRequest, PingResponse]{ServerStream: stream})
 }
 
-func _BpfrxService_Traceroute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(TracerouteRequest)
-	if err := dec(in); err != nil {
-		return nil, err
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type BpfrxService_PingServer = grpc.ServerStreamingServer[PingResponse]
+
+func _BpfrxService_Traceroute_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(TracerouteRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
 	}
-	if interceptor == nil {
-		return srv.(BpfrxServiceServer).Traceroute(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: BpfrxService_Traceroute_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(BpfrxServiceServer).Traceroute(ctx, req.(*TracerouteRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+	return srv.(BpfrxServiceServer).Traceroute(m, &grpc.GenericServerStream[TracerouteRequest, TracerouteResponse]{ServerStream: stream})
 }
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type BpfrxService_TracerouteServer = grpc.ServerStreamingServer[TracerouteResponse]
 
 func _BpfrxService_ClearSessions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ClearSessionsRequest)
@@ -1886,14 +1890,6 @@ var BpfrxService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _BpfrxService_MatchPolicies_Handler,
 		},
 		{
-			MethodName: "Ping",
-			Handler:    _BpfrxService_Ping_Handler,
-		},
-		{
-			MethodName: "Traceroute",
-			Handler:    _BpfrxService_Traceroute_Handler,
-		},
-		{
 			MethodName: "ClearSessions",
 			Handler:    _BpfrxService_ClearSessions_Handler,
 		},
@@ -1922,6 +1918,17 @@ var BpfrxService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _BpfrxService_Complete_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Ping",
+			Handler:       _BpfrxService_Ping_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "Traceroute",
+			Handler:       _BpfrxService_Traceroute_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "bpfrx.proto",
 }

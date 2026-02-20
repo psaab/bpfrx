@@ -2821,11 +2821,20 @@ func (c *ctl) handlePing(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	resp, err := c.client.Ping(ctx, req)
+	stream, err := c.client.Ping(ctx, req)
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
-	fmt.Print(resp.Output)
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Output)
+	}
 	return nil
 }
 
@@ -2850,11 +2859,20 @@ func (c *ctl) handleTraceroute(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	resp, err := c.client.Traceroute(ctx, req)
+	stream, err := c.client.Traceroute(ctx, req)
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
-	fmt.Print(resp.Output)
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Output)
+	}
 	return nil
 }
 

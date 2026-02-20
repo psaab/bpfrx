@@ -6830,7 +6830,7 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\fConfigTarget\x12\r\n" +
 	"\tCANDIDATE\x10\x00\x12\n" +
 	"\n" +
-	"\x06ACTIVE\x10\x012\xd8\x1d\n" +
+	"\x06ACTIVE\x10\x012\xdc\x1d\n" +
 	"\fBpfrxService\x12S\n" +
 	"\x0eEnterConfigure\x12\x1f.bpfrx.v1.EnterConfigureRequest\x1a .bpfrx.v1.EnterConfigureResponse\x12P\n" +
 	"\rExitConfigure\x12\x1e.bpfrx.v1.ExitConfigureRequest\x1a\x1f.bpfrx.v1.ExitConfigureResponse\x12b\n" +
@@ -6872,10 +6872,10 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x0fGetNATPoolStats\x12 .bpfrx.v1.GetNATPoolStatsRequest\x1a!.bpfrx.v1.GetNATPoolStatsResponse\x12V\n" +
 	"\x0fGetNATRuleStats\x12 .bpfrx.v1.GetNATRuleStatsRequest\x1a!.bpfrx.v1.GetNATRuleStatsResponse\x12P\n" +
 	"\rGetVRRPStatus\x12\x1e.bpfrx.v1.GetVRRPStatusRequest\x1a\x1f.bpfrx.v1.GetVRRPStatusResponse\x12P\n" +
-	"\rMatchPolicies\x12\x1e.bpfrx.v1.MatchPoliciesRequest\x1a\x1f.bpfrx.v1.MatchPoliciesResponse\x125\n" +
-	"\x04Ping\x12\x15.bpfrx.v1.PingRequest\x1a\x16.bpfrx.v1.PingResponse\x12G\n" +
+	"\rMatchPolicies\x12\x1e.bpfrx.v1.MatchPoliciesRequest\x1a\x1f.bpfrx.v1.MatchPoliciesResponse\x127\n" +
+	"\x04Ping\x12\x15.bpfrx.v1.PingRequest\x1a\x16.bpfrx.v1.PingResponse0\x01\x12I\n" +
 	"\n" +
-	"Traceroute\x12\x1b.bpfrx.v1.TracerouteRequest\x1a\x1c.bpfrx.v1.TracerouteResponse\x12P\n" +
+	"Traceroute\x12\x1b.bpfrx.v1.TracerouteRequest\x1a\x1c.bpfrx.v1.TracerouteResponse0\x01\x12P\n" +
 	"\rClearSessions\x12\x1e.bpfrx.v1.ClearSessionsRequest\x1a\x1f.bpfrx.v1.ClearSessionsResponse\x12P\n" +
 	"\rClearCounters\x12\x1e.bpfrx.v1.ClearCountersRequest\x1a\x1f.bpfrx.v1.ClearCountersResponse\x12t\n" +
 	"\x19ClearDHCPClientIdentifier\x12*.bpfrx.v1.ClearDHCPClientIdentifierRequest\x1a+.bpfrx.v1.ClearDHCPClientIdentifierResponse\x12A\n" +

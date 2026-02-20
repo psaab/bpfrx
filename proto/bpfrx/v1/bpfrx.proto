@@ -49,9 +49,9 @@ service BpfrxService {
   rpc GetVRRPStatus(GetVRRPStatusRequest) returns (GetVRRPStatusResponse);
   rpc MatchPolicies(MatchPoliciesRequest) returns (MatchPoliciesResponse);
 
-  // Diagnostics
-  rpc Ping(PingRequest) returns (PingResponse);
-  rpc Traceroute(TracerouteRequest) returns (TracerouteResponse);
+  // Diagnostics (server-streaming for real-time output)
+  rpc Ping(PingRequest) returns (stream PingResponse);
+  rpc Traceroute(TracerouteRequest) returns (stream TracerouteResponse);
 
   // Mutations
   rpc ClearSessions(ClearSessionsRequest) returns (ClearSessionsResponse);

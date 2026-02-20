@@ -2,9 +2,11 @@
 package grpcapi
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -1921,9 +1923,9 @@ func (s *Server) GetIPsecSA(_ context.Context, _ *pb.GetIPsecSARequest) (*pb.Get
 
 // --- Diagnostic RPCs ---
 
-func (s *Server) Ping(ctx context.Context, req *pb.PingRequest) (*pb.PingResponse, error) {
+func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.PingResponse]) error {
 	if req.Target == "" {
-		return nil, status.Error(codes.InvalidArgument, "target required")
+		return status.Error(codes.InvalidArgument, "target required")
 	}
 	count := int(req.Count)
 	if count <= 0 {
@@ -1948,16 +1950,14 @@ func (s *Server) Ping(ctx context.Context, req *pb.PingRequest) (*pb.PingRespons
 	cmd = append(cmd, "ping")
 	cmd = append(cmd, args...)
 
-	out, err := execDiagCmd(ctx, cmd)
-	if err != nil {
-		return &pb.PingResponse{Output: out + "\n" + err.Error()}, nil
-	}
-	return &pb.PingResponse{Output: out}, nil
+	return streamDiagCmd(stream.Context(), cmd, func(line string) error {
+		return stream.Send(&pb.PingResponse{Output: line})
+	})
 }
 
-func (s *Server) Traceroute(ctx context.Context, req *pb.TracerouteRequest) (*pb.TracerouteResponse, error) {
+func (s *Server) Traceroute(req *pb.TracerouteRequest, stream grpc.ServerStreamingServer[pb.TracerouteResponse]) error {
 	if req.Target == "" {
-		return nil, status.Error(codes.InvalidArgument, "target required")
+		return status.Error(codes.InvalidArgument, "target required")
 	}
 	args := []string{}
 	if req.Source != "" {
@@ -1972,19 +1972,53 @@ func (s *Server) Traceroute(ctx context.Context, req *pb.TracerouteRequest) (*pb
 	cmd = append(cmd, "traceroute")
 	cmd = append(cmd, args...)
 
-	out, err := execDiagCmd(ctx, cmd)
-	if err != nil {
-		return &pb.TracerouteResponse{Output: out + "\n" + err.Error()}, nil
-	}
-	return &pb.TracerouteResponse{Output: out}, nil
+	return streamDiagCmd(stream.Context(), cmd, func(line string) error {
+		return stream.Send(&pb.TracerouteResponse{Output: line})
+	})
 }
 
-func execDiagCmd(ctx context.Context, cmd []string) (string, error) {
+// streamDiagCmd runs a command and streams each line of combined output via sendFn.
+func streamDiagCmd(ctx context.Context, cmd []string, sendFn func(string) error) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
-	out, err := c.CombinedOutput()
-	return string(out), err
+
+	// Merge stdout and stderr into a single pipe.
+	pr, pw := io.Pipe()
+	c.Stdout = pw
+	c.Stderr = pw
+
+	if err := c.Start(); err != nil {
+		return status.Errorf(codes.Internal, "exec: %v", err)
+	}
+
+	// Scan lines and stream each one.
+	scanner := bufio.NewScanner(pr)
+	scanDone := make(chan error, 1)
+	go func() {
+		for scanner.Scan() {
+			if err := sendFn(scanner.Text()); err != nil {
+				scanDone <- err
+				return
+			}
+		}
+		scanDone <- scanner.Err()
+	}()
+
+	// Wait for the command to finish, then close the write end so scanner terminates.
+	cmdErr := c.Wait()
+	pw.Close()
+	scanErr := <-scanDone
+
+	if scanErr != nil {
+		return scanErr
+	}
+	if cmdErr != nil {
+		// Send the exit error as a final line rather than failing the RPC,
+		// so the client still sees partial output (e.g. "ping: unknown host").
+		_ = sendFn(cmdErr.Error())
+	}
+	return nil
 }
 
 // --- Mutation RPCs ---
