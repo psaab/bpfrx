@@ -807,6 +807,290 @@ The original recommendation stands with one refinement:
 
 ---
 
+## 13. VRRP Implementation with VPP
+
+### 13.1 VPP VRRP Plugin Overview
+
+VPP includes a production-grade **VRRPv3 plugin** (RFC 5798) that has been part of VPP
+since release 20.05 (~6 years). It is maintained by Netgate and used in their TNSR
+commercial router/firewall platform.
+
+**Features:**
+
+| Feature                     | VPP VRRP Plugin      | keepalived (bpfrx current)  |
+|-----------------------------|----------------------|-----------------------------|
+| VRRPv3 (RFC 5798)           | Yes                  | Yes                         |
+| VRRPv2 (RFC 3768)           | No                   | Yes                         |
+| IPv4 VIPs                   | Yes                  | Yes                         |
+| IPv6 VIPs                   | Yes (link-local src) | Partial (bpfrx doesn't use) |
+| Multiple VIPs per instance  | Yes                  | Yes                         |
+| Priority / Preemption       | Yes                  | Yes                         |
+| Accept mode                 | Yes                  | Yes                         |
+| Unicast peers               | Yes                  | Yes                         |
+| Interface tracking          | Yes (built-in)       | Yes (script-based)          |
+| Virtual MAC (00:00:5e:...)  | Yes                  | Yes                         |
+| GARP / Unsolicited NA       | Yes (on transition)  | Yes                         |
+| Async state events via API  | Yes (WANT_VRRP_EVENTS) | No (SIGUSR1 dump parse)  |
+| Sync groups                 | No                   | Yes                         |
+| Notify scripts              | No                   | Yes                         |
+| Runtime state query         | API (binary/stats)   | SIGUSR1 → file parse        |
+
+### 13.2 Current bpfrx VRRP Architecture (keepalived)
+
+bpfrx uses keepalived as an external VRRP daemon with a config-generation model:
+
+```
+bpfrx config (cluster/reth) → pkg/vrrp/vrrp.go → keepalived.conf → keepalived daemon
+                                                                          ↓
+                                                                    VRRP advertisements
+                                                                    GARP/NA on failover
+                                                                    VIP address management
+```
+
+**Key design choices:**
+- **Bondless RETH:** No bond devices. VRRP runs directly on physical member interfaces
+  via `RethToPhysical()` resolution (reth0 → trust0, reth1 → wan0, etc.)
+- **VRID = 100 + rgID:** Deterministic VRID assignment per redundancy group.
+- **Priority 200 (primary) / 100 (secondary):** Mapped from cluster election state.
+- **169.254.RG.NODE/32 base address:** Link-local base on physical members for VRRP.
+- **State detection:** SIGUSR1 → keepalived dumps to `/tmp/keepalived.data` → parse
+  output for MASTER/BACKUP strings. Fragile and adds ~100ms latency.
+- **Config apply:** Write `keepalived.conf`, SIGHUP for reload or fresh start.
+
+**Pain points:**
+1. External daemon dependency (separate process, separate lifecycle).
+2. State detection is fragile (SIGUSR1 file dump parsing, race conditions).
+3. No native event stream — cannot react to VRRP transitions in real-time.
+4. Dual heartbeat systems: cluster heartbeat (UDP:4784) + VRRP multicast (224.0.0.18).
+5. No IPv6 VRRP currently utilized (keepalived supports it, but bpfrx doesn't generate IPv6 instances).
+6. Config apply latency from SIGHUP + file write.
+
+### 13.3 VPP VRRP API (GoVPP Integration)
+
+VPP's VRRP plugin exposes a clean binary API accessible via GoVPP:
+
+```go
+// Create a VRRP VR (Virtual Router)
+vrrpClient := vrrp.NewServiceClient(conn)
+reply, err := vrrpClient.VrrpVrAddDel(ctx, &vrrp.VrrpVrAddDel{
+    SwIfIndex: interfaceIndex,  // VPP interface (physical member)
+    VrID:      100 + rgID,      // VRID = 100 + redundancy group ID
+    Priority:  200,             // 200=primary, 100=secondary
+    Interval:  100,             // centiseconds (100 = 1 second)
+    IsIPv6:    false,
+    NAddrs:    uint8(len(vips)),
+    Addrs:     vipAddresses,    // VIP addresses for this VR
+    IsAdd:     true,
+})
+
+// Start the VR
+vrrpClient.VrrpVrStartStop(ctx, &vrrp.VrrpVrStartStop{
+    SwIfIndex:  interfaceIndex,
+    VrID:       100 + rgID,
+    IsIPv6:     false,
+    IsStart:    true,
+})
+
+// Subscribe to state change events
+vrrpClient.WantVrrpVrrpEvents(ctx, &vrrp.WantVrrpVrrpEvents{
+    Enable: true,
+    PID:    uint32(os.Getpid()),
+})
+// Events delivered asynchronously via VPP notification channel:
+// VrrpVrEvent{SwIfIndex, VrID, NewState: INIT/BACKUP/MASTER}
+```
+
+**Key API methods:**
+- `VrrpVrAddDel` — create/delete VR instances
+- `VrrpVrStartStop` — start/stop VRRP on a VR
+- `VrrpVrSetPeers` — configure unicast peers
+- `VrrpVrTrackIfAddDel` — add interface tracking (weight-based priority reduction)
+- `WantVrrpVrrpEvents` — subscribe to state change notifications
+- `VrrpVrDump` — query current VR state
+
+### 13.4 Implementation Approach: VPP VRRP for bpfrx
+
+If VPP is adopted as a dataplane (Strategy B or C), VRRP can be migrated from keepalived
+to VPP's native plugin. Here is the implementation approach:
+
+#### Architecture
+
+```
+bpfrx config (cluster/reth)
+    ↓
+pkg/vrrp/vpp.go (new VPP VRRP backend)
+    ↓
+GoVPP binary API → VPP VRRP plugin
+    ↓
+VRRP advertisements on physical member interfaces
+GARP/NA on MASTER transition
+VIP address on VPP interface (not kernel)
+    ↓
+VrrpVrEvent (async) → bpfrx cluster state machine
+```
+
+#### Step 1: VRRP Backend Interface
+
+Abstract the VRRP implementation behind an interface so both keepalived and VPP backends
+can coexist:
+
+```go
+// pkg/vrrp/backend.go
+type Backend interface {
+    // Apply creates/updates all VRRP instances from compiled config
+    Apply(instances []VRRPInstance) error
+    // Stop shuts down all VRRP instances
+    Stop() error
+    // RuntimeStates returns current MASTER/BACKUP state per instance
+    RuntimeStates() (map[string]string, error)
+    // Events returns a channel of state change events (nil if unsupported)
+    Events() <-chan StateEvent
+}
+
+type StateEvent struct {
+    VRID      uint8
+    Interface string
+    NewState  string  // "MASTER", "BACKUP", "INIT"
+}
+```
+
+The existing keepalived code (`pkg/vrrp/vrrp.go`) becomes `KeepalivedBackend` implementing
+this interface. A new `VPPBackend` handles the VPP VRRP API.
+
+#### Step 2: VPP VRRP Instance Mapping
+
+Map bpfrx's RETH/RG model to VPP VR instances:
+
+| bpfrx Concept               | VPP VRRP Mapping                         |
+|------------------------------|------------------------------------------|
+| Redundancy Group (RG)        | One VR per physical member per RG        |
+| RETH interface (reth0)       | VIPs on physical member's VR             |
+| VRID = 100 + rgID            | Same (VR ID = 100 + rgID)                |
+| Priority 200/100             | Same (mapped from cluster election)      |
+| RethToPhysical() resolution  | VPP interface index lookup               |
+| 169.254.RG.NODE/32 base addr | VPP interface primary address             |
+| Cluster weight → priority    | VrrpVrTrackIfAddDel for interface tracking|
+
+#### Step 3: Event-Driven Failover
+
+Replace the fragile SIGUSR1 polling with VPP's async event stream:
+
+```go
+func (v *VPPBackend) watchEvents(ctx context.Context) {
+    sub, _ := v.conn.WatchEvent(ctx, (*vrrp.VrrpVrEvent)(nil))
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case ev := <-sub.Events():
+            vrrpEv := ev.(*vrrp.VrrpVrEvent)
+            v.eventCh <- StateEvent{
+                VRID:     uint8(vrrpEv.VrID),
+                NewState: stateToString(vrrpEv.NewState),
+            }
+        }
+    }
+}
+```
+
+This eliminates the polling latency and race conditions of SIGUSR1 file parsing,
+enabling sub-millisecond VRRP state detection.
+
+#### Step 4: VIP Kernel Mirroring (Required)
+
+**Critical limitation:** VPP's VRRP assigns VIPs to VPP interfaces, NOT kernel
+interfaces. This means:
+
+- The kernel routing table won't know about VIPs (FRR can't see them).
+- Management traffic (SSH, SNMP) to VIPs won't reach the kernel.
+- bpfrx's gRPC/HTTP APIs bound to VIP addresses won't work.
+
+**Solution:** Mirror VIP addresses to kernel interfaces on MASTER transition:
+
+```go
+func (v *VPPBackend) onMasterTransition(vrid uint8, iface string, vips []net.IP) {
+    link, _ := netlink.LinkByName(iface)
+    for _, vip := range vips {
+        addr := &netlink.Addr{IPNet: &net.IPNet{IP: vip, Mask: mask}}
+        netlink.AddrAdd(link, addr)
+    }
+}
+
+func (v *VPPBackend) onBackupTransition(vrid uint8, iface string, vips []net.IP) {
+    link, _ := netlink.LinkByName(iface)
+    for _, vip := range vips {
+        addr := &netlink.Addr{IPNet: &net.IPNet{IP: vip, Mask: mask}}
+        netlink.AddrDel(link, addr)
+    }
+}
+```
+
+This is similar to what keepalived does natively but must be handled explicitly with VPP.
+
+### 13.5 VPP VRRP vs keepalived: Trade-offs
+
+| Dimension                   | VPP VRRP                              | keepalived                            |
+|-----------------------------|---------------------------------------|---------------------------------------|
+| **State detection**         | Async API events (sub-ms)             | SIGUSR1 file dump (~100ms, fragile)   |
+| **Config application**      | GoVPP API call (instant)              | File write + SIGHUP (10-50ms)         |
+| **Process management**      | Built into VPP (no extra process)     | Separate daemon lifecycle             |
+| **IPv6 VRRP**               | Native VRRPv3 with link-local src     | Supported but unused by bpfrx         |
+| **Interface tracking**      | Native API (weight-based)             | Script-based (exec overhead)          |
+| **Sync groups**             | Not supported                         | Supported (failover all RGs together) |
+| **Notify scripts**          | Not supported                         | Supported (exec on transition)        |
+| **VIP ownership**           | VPP interface (needs kernel mirror)   | Kernel interface (native)             |
+| **GARP/NA**                 | Built-in on transition                | Built-in on transition                |
+| **Virtual MAC**             | 00:00:5e:00:01:XX (standard)          | 00:00:5e:00:01:XX (standard)          |
+| **Maturity**                | Production (Netgate TNSR, ~6 years)   | Production (~20 years)                |
+| **Dependency**              | Requires VPP dataplane                | Standalone daemon                     |
+| **Standalone operation**    | Only with VPP running                 | Works without any dataplane           |
+
+### 13.6 Sync Group Limitation
+
+VPP's VRRP plugin does **not** support sync groups (coordinated failover of multiple VR
+instances). In bpfrx's model, when one redundancy group fails over, all RGs on the same
+node should fail over together.
+
+**Workarounds:**
+1. **Application-level sync:** On receiving a VPP VRRP event for any VR transitioning to
+   BACKUP, programmatically force all other VRs on the same node to BACKUP priority via
+   `VrrpVrAddDel` with priority 0. This is the GoVPP equivalent of keepalived's sync groups.
+2. **Use bpfrx's existing cluster election:** The cluster state machine already handles
+   coordinated failover via heartbeat loss detection. VPP VRRP would only handle the VIP
+   advertisement layer, not the election logic. When the cluster decides to fail over,
+   it adjusts VPP VRRP priorities accordingly.
+
+Option 2 is the correct approach — bpfrx's cluster election is more sophisticated than
+VRRP sync groups (weight-based scoring, IP monitors, manual failover commands), and VPP
+VRRP simply becomes the mechanism for advertising VIPs and sending GARP/NA.
+
+### 13.7 VRRP Recommendation
+
+| Scenario                             | Recommended Approach                    |
+|--------------------------------------|------------------------------------------|
+| **Current (XDP dataplane)**          | Stay with keepalived                     |
+| **VPP adopted as dataplane**         | Migrate to VPP VRRP plugin               |
+| **Hybrid XDP + VPP**                 | Either — VPP VRRP if VPP owns interfaces |
+| **DPDK worker path**                 | Stay with keepalived                     |
+
+**Key insight:** VPP VRRP is only worth adopting **if VPP is already the dataplane**.
+The primary benefit is eliminating the external keepalived dependency and gaining
+real-time event-driven state detection via GoVPP. If bpfrx stays on XDP or the custom
+DPDK worker, keepalived remains the better choice — it's battle-tested, requires no VPP
+dependency, and manages VIPs natively in the kernel where FRR and management services
+need them.
+
+If VPP is adopted, the migration path is:
+1. Implement `VPPBackend` behind the `Backend` interface (~400 lines Go).
+2. Map existing RETH/RG instances to VPP VR configurations.
+3. Subscribe to `VrrpVrEvent` for real-time state transitions.
+4. Add kernel VIP mirroring for FRR and management traffic.
+5. Test coordinated failover via cluster election → VPP priority adjustment.
+
+**Effort estimate:** 2-3 weeks (assuming VPP dataplane is already integrated).
+
+---
+
 ## Appendix A: VPP Production Deployments
 
 | Deployer        | Product                  | Scale              | Status              |
@@ -856,3 +1140,12 @@ The original recommendation stands with one refinement:
 - [SRv6 BPF Implementation](https://segment-routing.org/index.php/Implementation/BPF)
 - [XDP-MPTM Tunnel Multiplexer](https://github.com/ebpf-networking/xdp-mptm)
 - [VPP-SSwan 1.89 Tbps Technology Guide](https://builders.intel.com/solutionslibrary/fd-io-vpp-sswan-and-linux-cp-integrate-strongswan-with-world-s-first-open-sourced-1-89-tb-ipsec-solution-technology-guide)
+
+### VRRP References
+
+- [VPP VRRP Plugin Source](https://github.com/FDio/vpp/tree/master/src/plugins/vrrp)
+- [VPP VRRP API Definition](https://github.com/FDio/vpp/blob/master/src/plugins/vrrp/vrrp.api)
+- [VPP VRRP CLI Reference](https://s3-docs.fd.io/vpp/26.02/cli-reference/clis/clicmd_src_plugins_vrrp.html)
+- [Netgate TNSR VRRP Documentation](https://docs.netgate.com/tnsr/en/latest/config/ha/vrrp.html)
+- [RFC 5798 — VRRPv3](https://datatracker.ietf.org/doc/html/rfc5798)
+- [keepalived Documentation](https://keepalived.readthedocs.io/en/latest/)
