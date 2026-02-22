@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 
 	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/vishvananda/netlink"
@@ -56,6 +57,13 @@ type vrrpInstance struct {
 	// Per-instance raw socket and receiver.
 	conn    net.PacketConn
 	rawConn *ipv4.RawConn
+
+	// AF_PACKET socket for receiving on VLAN sub-interfaces.
+	// Raw IP sockets don't reliably receive multicast on VLAN
+	// sub-interfaces (kernel limitation). AF_PACKET captures at
+	// the link layer and works correctly. -1 means not used.
+	afPacketFD int
+
 	rxCh    chan *VRRPPacket
 	stopCh  chan struct{}
 	stopped chan struct{}
@@ -63,34 +71,67 @@ type vrrpInstance struct {
 
 func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent) *vrrpInstance {
 	return &vrrpInstance{
-		cfg:     cfg,
-		state:   StateInitialize,
-		iface:   iface,
-		eventCh: eventCh,
-		rxCh:    make(chan *VRRPPacket, 16),
-		stopCh:  make(chan struct{}),
-		stopped: make(chan struct{}),
+		cfg:        cfg,
+		state:      StateInitialize,
+		iface:      iface,
+		eventCh:    eventCh,
+		afPacketFD: -1,
+		rxCh:       make(chan *VRRPPacket, 16),
+		stopCh:     make(chan struct{}),
+		stopped:    make(chan struct{}),
 	}
 }
 
 // openSocket creates the per-instance raw socket bound to the interface.
 func (vi *vrrpInstance) openSocket() error {
-	rawConn, conn, err := openPerInterfaceSocket(vi.cfg.Interface, vi.iface)
+	isVLAN := strings.Contains(vi.cfg.Interface, ".")
+
+	rawConn, conn, err := openPerInterfaceSocket(vi.cfg.Interface, vi.iface, isVLAN)
 	if err != nil {
 		return err
 	}
 	vi.conn = conn
 	vi.rawConn = rawConn
 
-	// Resolve our local IPv4 address for filtering self-sent packets.
+	// For VLAN sub-interfaces, open an AF_PACKET socket for receiving.
+	// Raw IP sockets don't reliably receive multicast on VLAN sub-
+	// interfaces (kernel limitation — IpInDelivers counts the packet
+	// but recvmsg on the raw socket never returns it). AF_PACKET
+	// captures at the link layer and works correctly (tcpdump proves
+	// it). The raw IP socket is kept for sending advertisements.
+	if isVLAN {
+		fd, err := openAfPacketReceiver(vi.iface.Index)
+		if err != nil {
+			slog.Warn("vrrp: af_packet open failed, raw socket only",
+				"key", vi.key(), "err", err)
+		} else {
+			vi.afPacketFD = fd
+		}
+	}
+
+	// Resolve our local IPv4 address (primary IP, not a VIP) for:
+	// 1. Source address in VRRP advertisements
+	// 2. Filtering self-sent packets
+	// We must skip VIP addresses because during split-brain both nodes
+	// have the VIP — using it as source would cause the peer to filter
+	// our adverts as "self-sent" (matching its own VIP).
+	vipSet := make(map[string]bool, len(vi.cfg.VirtualAddresses))
+	for _, vip := range vi.cfg.VirtualAddresses {
+		addr := vip
+		if idx := strings.Index(addr, "/"); idx >= 0 {
+			addr = addr[:idx]
+		}
+		vipSet[addr] = true
+	}
 	addrs, _ := vi.iface.Addrs()
 	for _, a := range addrs {
 		ipNet, ok := a.(*net.IPNet)
 		if !ok {
 			continue
 		}
-		if ipNet.IP.To4() != nil {
-			vi.localIP = ipNet.IP.To4()
+		ip4 := ipNet.IP.To4()
+		if ip4 != nil && !vipSet[ip4.String()] {
+			vi.localIP = ip4
 			break
 		}
 	}
@@ -99,6 +140,26 @@ func (vi *vrrpInstance) openSocket() error {
 
 func (vi *vrrpInstance) key() string {
 	return fmt.Sprintf("VI_%s_%d", vi.cfg.Interface, vi.cfg.GroupID)
+}
+
+// updateConfig updates priority and preempt in-place without restarting.
+func (vi *vrrpInstance) updateConfig(cfg Instance) {
+	vi.mu.Lock()
+	vi.cfg.Priority = cfg.Priority
+	vi.cfg.Preempt = cfg.Preempt
+	vi.mu.Unlock()
+}
+
+func (vi *vrrpInstance) getPriority() int {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	return vi.cfg.Priority
+}
+
+func (vi *vrrpInstance) getPreempt() bool {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	return vi.cfg.Preempt
 }
 
 func (vi *vrrpInstance) getState() VRRPState {
@@ -127,7 +188,7 @@ func (vi *vrrpInstance) advertInterval() time.Duration {
 // Skew_Time = ((256 - priority) * Master_Advert_Interval) / 256
 func (vi *vrrpInstance) masterDownInterval() time.Duration {
 	advert := vi.advertInterval()
-	skew := time.Duration(256-vi.cfg.Priority) * advert / 256
+	skew := time.Duration(256-vi.getPriority()) * advert / 256
 	return 3*advert + skew
 }
 
@@ -143,7 +204,13 @@ func (vi *vrrpInstance) run() {
 		"preempt", vi.cfg.Preempt)
 
 	// Start per-instance receiver goroutine.
-	go vi.receiver()
+	// VLAN sub-interfaces use AF_PACKET because raw IP sockets
+	// don't receive multicast on VLAN sub-interfaces.
+	if vi.afPacketFD >= 0 {
+		go vi.receiverAfPacket()
+	} else {
+		go vi.receiver()
+	}
 
 	// Transition to Backup state.
 	vi.setState(StateBackup)
@@ -183,7 +250,7 @@ func (vi *vrrpInstance) run() {
 			case pkt := <-vi.rxCh:
 				vi.handleMasterRx(pkt, masterDownTimer, advertTimer)
 			case <-advertTimer.C:
-				vi.sendAdvert(vi.cfg.Priority)
+				vi.sendAdvert(vi.getPriority())
 				advertTimer.Reset(vi.advertInterval())
 			}
 		}
@@ -263,17 +330,99 @@ func (vi *vrrpInstance) receiver() {
 	}
 }
 
+// receiverAfPacket reads VRRP packets via AF_PACKET on VLAN sub-interfaces.
+// Uses SOCK_RAW + ETH_P_ALL (same as tcpdump) — receives full Ethernet frames.
+// We skip the 14-byte Ethernet header, then parse IP header + VRRP payload.
+func (vi *vrrpInstance) receiverAfPacket() {
+	const ethHeaderLen = 14
+	buf := make([]byte, 1500)
+	for {
+		select {
+		case <-vi.stopCh:
+			return
+		default:
+		}
+
+		n, _, err := unix.Recvfrom(vi.afPacketFD, buf, 0)
+		if err != nil {
+			select {
+			case <-vi.stopCh:
+				return
+			default:
+				// EAGAIN/EWOULDBLOCK from SO_RCVTIMEO — expected.
+				if err != unix.EAGAIN && err != unix.EWOULDBLOCK {
+					slog.Debug("vrrp: af_packet read error", "key", vi.key(), "err", err)
+				}
+				continue
+			}
+		}
+
+		// Minimum: 14-byte Ethernet + 20-byte IP + 8-byte VRRP.
+		if n < ethHeaderLen+20+vrrpHeaderLen {
+			continue
+		}
+
+		// Skip Ethernet header.
+		ip := buf[ethHeaderLen:]
+		ipLen := n - ethHeaderLen
+
+		// Parse IP header.
+		ihl := int(ip[0]&0x0F) * 4
+		if ihl < 20 || ipLen < ihl+vrrpHeaderLen {
+			continue
+		}
+
+		ttl := int(ip[8])
+
+		// Verify TTL == 255 (RFC 5798 §5.1.1.3).
+		if ttl != 255 {
+			continue
+		}
+
+		srcIP := make(net.IP, 4)
+		copy(srcIP, ip[12:16])
+
+		// Filter self-sent packets (RFC 5798 §6.4.2/6.4.3).
+		if vi.localIP != nil && srcIP.Equal(vi.localIP) {
+			continue
+		}
+
+		payload := ip[ihl:ipLen]
+
+		// Only accept packets matching our VRID.
+		if payload[1] != uint8(vi.cfg.GroupID) {
+			continue
+		}
+
+		dstIP := make(net.IP, 4)
+		copy(dstIP, ip[16:20])
+
+		pkt, err := ParseVRRPPacket(payload, false, srcIP, dstIP)
+		if err != nil {
+			slog.Debug("vrrp: parse error", "key", vi.key(), "err", err)
+			continue
+		}
+
+		select {
+		case vi.rxCh <- pkt:
+		default:
+			// Drop if channel full.
+		}
+	}
+}
+
 // handleBackupRx processes a received advertisement while in Backup state.
 func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer *time.Timer) {
+	pri := vi.getPriority()
 	if pkt.Priority == 0 {
 		// Master is resigning — use short timer.
-		skew := time.Duration(256-vi.cfg.Priority) * vi.advertInterval() / 256
+		skew := time.Duration(256-pri) * vi.advertInterval() / 256
 		masterDownTimer.Reset(skew)
 		return
 	}
 
 	// If we don't preempt, or the incoming priority is >= ours, accept it.
-	if !vi.cfg.Preempt || int(pkt.Priority) >= vi.cfg.Priority {
+	if !vi.getPreempt() || int(pkt.Priority) >= pri {
 		masterDownTimer.Reset(vi.masterDownInterval())
 	}
 	// If preempt is true and incoming priority < ours, ignore — let timer expire.
@@ -281,15 +430,16 @@ func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer *time.Ti
 
 // handleMasterRx processes a received advertisement while in Master state.
 func (vi *vrrpInstance) handleMasterRx(pkt *VRRPPacket, masterDownTimer, advertTimer *time.Timer) {
+	pri := vi.getPriority()
 	if pkt.Priority == 0 {
 		// Peer resigning — send immediate advert and stay Master.
-		vi.sendAdvert(vi.cfg.Priority)
+		vi.sendAdvert(pri)
 		advertTimer.Reset(vi.advertInterval())
 		return
 	}
 
 	// If incoming priority is higher, step down.
-	if int(pkt.Priority) > vi.cfg.Priority {
+	if int(pkt.Priority) > pri {
 		vi.becomeBackup(masterDownTimer, advertTimer)
 	}
 	// Equal or lower priority: ignore (we stay Master).
@@ -297,12 +447,13 @@ func (vi *vrrpInstance) handleMasterRx(pkt *VRRPPacket, masterDownTimer, advertT
 
 // becomeMaster transitions to Master state: add VIPs, send GARP/NA, send advert.
 func (vi *vrrpInstance) becomeMaster() {
+	pri := vi.getPriority()
 	slog.Info("vrrp: transitioning to MASTER",
-		"key", vi.key(), "priority", vi.cfg.Priority)
+		"key", vi.key(), "priority", pri)
 	vi.setState(StateMaster)
 	vi.addVIPs()
 	vi.sendGARP()
-	vi.sendAdvert(vi.cfg.Priority)
+	vi.sendAdvert(pri)
 	vi.emitEvent()
 }
 
@@ -390,12 +541,23 @@ func (vi *vrrpInstance) sendPacket(pkt *VRRPPacket, isIPv6 bool) error {
 	srcIP := vi.localIP
 	if srcIP == nil {
 		// Lazy resolve: interface may not have had an address at socket open time.
+		// Skip VIPs — must send from primary/base address.
+		vipSet := make(map[string]bool, len(vi.cfg.VirtualAddresses))
+		for _, vip := range vi.cfg.VirtualAddresses {
+			addr := vip
+			if idx := strings.Index(addr, "/"); idx >= 0 {
+				addr = addr[:idx]
+			}
+			vipSet[addr] = true
+		}
 		if addrs, err := vi.iface.Addrs(); err == nil {
 			for _, a := range addrs {
 				if ipNet, ok := a.(*net.IPNet); ok && ipNet.IP.To4() != nil {
-					vi.localIP = ipNet.IP.To4()
-					srcIP = vi.localIP
-					break
+					if !vipSet[ipNet.IP.To4().String()] {
+						vi.localIP = ipNet.IP.To4()
+						srcIP = vi.localIP
+						break
+					}
 				}
 			}
 		}
@@ -514,11 +676,13 @@ func (vi *vrrpInstance) sendGARP() {
 func (vi *vrrpInstance) stop() {
 	close(vi.stopCh)
 
-	// Close the socket FIRST to unblock any blocking recvmsg in receiver().
-	// FD.Close waits for active RawRead to release the read lock, and
-	// our read deadline (1s) ensures the read returns promptly.
+	// Close sockets to unblock any blocking recvmsg in receiver().
 	if vi.conn != nil {
 		vi.conn.Close()
+	}
+	if vi.afPacketFD >= 0 {
+		unix.Close(vi.afPacketFD)
+		vi.afPacketFD = -1
 	}
 
 	<-vi.stopped

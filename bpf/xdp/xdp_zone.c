@@ -191,6 +191,20 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	if (!meta)
 		return XDP_DROP;
 
+	/*
+	 * VRRP multicast (224.0.0.18, proto 112) — pass to host before zone
+	 * lookup.  xdp_main already stripped the VLAN tag for pipeline use;
+	 * push it back so the kernel delivers the frame on the correct VLAN
+	 * sub-interface (the parent may lack IPv4 config and would silently
+	 * drop the multicast).
+	 */
+	if (meta->addr_family == AF_INET && meta->protocol == PROTO_VRRP &&
+	    meta->dst_ip.v4 == bpf_htonl(0xE0000012)) {
+		if (meta->ingress_vlan_id != 0)
+			xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
+		return XDP_PASS;
+	}
+
 	/* Look up ingress zone from {ifindex, vlan_id} composite key */
 	struct iface_zone_key izk = {
 		.ifindex = meta->ingress_ifindex,
@@ -312,18 +326,6 @@ int xdp_zone_prog(struct xdp_md *ctx)
 				}
 			}
 		}
-	}
-
-	/*
-	 * VRRP multicast (224.0.0.18, proto 112) — allow to host for native VRRP daemon.
-	 * Must be checked before the generic multicast pass-through so it
-	 * reaches the host even with zone-pair deny-all.
-	 */
-	if (meta->addr_family == AF_INET && meta->protocol == PROTO_VRRP &&
-	    meta->dst_ip.v4 == bpf_htonl(0xE0000012)) {
-		meta->fwd_ifindex = 0;
-		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
-		return XDP_PASS;
 	}
 
 	/*

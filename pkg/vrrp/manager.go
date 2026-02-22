@@ -2,6 +2,7 @@ package vrrp
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -94,14 +95,23 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 	for key, inst := range desiredMap {
 		existing, ok := m.instances[key]
 		if ok {
-			// Check if config changed (priority or VIPs).
+			// Check if config changed.
 			if existing.cfg.Priority == inst.Priority &&
 				existing.cfg.Preempt == inst.Preempt &&
 				vipsEqual(existing.cfg.VirtualAddresses, inst.VirtualAddresses) {
 				continue // No change.
 			}
-			// Config changed — restart instance.
-			slog.Info("vrrp: updating instance", "key", existing.key(),
+			// If only priority/preempt changed, update in-place without
+			// stopping. Restarting would cause a 3s master-down gap where
+			// the node falsely becomes MASTER before hearing the peer.
+			if vipsEqual(existing.cfg.VirtualAddresses, inst.VirtualAddresses) {
+				slog.Info("vrrp: priority update", "key", existing.key(),
+					"old_pri", existing.cfg.Priority, "new_pri", inst.Priority)
+				existing.updateConfig(*inst)
+				continue
+			}
+			// VIPs changed — must restart instance.
+			slog.Info("vrrp: restarting instance", "key", existing.key(),
 				"old_pri", existing.cfg.Priority, "new_pri", inst.Priority)
 			existing.stop()
 			delete(m.instances, key)
@@ -179,34 +189,39 @@ func (m *Manager) Status() string {
 	return sb.String()
 }
 
-// openPerInterfaceSocket creates a raw IP socket (proto 112) bound to
-// the specified interface using SO_BINDTODEVICE, and joins the VRRP
-// multicast group (224.0.0.18) on that interface.
-// Returns the ipv4.RawConn and the underlying net.PacketConn.
-func openPerInterfaceSocket(ifName string, iface *net.Interface) (*ipv4.RawConn, net.PacketConn, error) {
+// openPerInterfaceSocket creates a raw IP socket (proto 112) and joins the
+// VRRP multicast group (224.0.0.18) on the given interface.
+// For non-VLAN interfaces, SO_BINDTODEVICE is used for isolation.
+// For VLAN sub-interfaces, SO_BINDTODEVICE is skipped because generic XDP
+// VLAN handling makes the kernel's interface association unpredictable —
+// the packet may be delivered on the parent or sub-interface depending on
+// when VLAN stripping occurs. The VRID filter in receiver() provides demuxing.
+func openPerInterfaceSocket(ifName string, iface *net.Interface, isVLAN bool) (*ipv4.RawConn, net.PacketConn, error) {
 	// Open raw socket for VRRP (protocol 112).
 	conn, err := net.ListenPacket("ip4:112", "0.0.0.0")
 	if err != nil {
 		return nil, nil, fmt.Errorf("listen ip4:112: %w", err)
 	}
 
-	// Bind to the interface via SyscallConn (avoids File() which sets
-	// blocking mode and removes the fd from Go's poller).
-	sc, err := conn.(*net.IPConn).SyscallConn()
-	if err != nil {
-		conn.Close()
-		return nil, nil, fmt.Errorf("syscall conn: %w", err)
-	}
-	var bindErr error
-	if err := sc.Control(func(fd uintptr) {
-		bindErr = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, ifName)
-	}); err != nil {
-		conn.Close()
-		return nil, nil, fmt.Errorf("control: %w", err)
-	}
-	if bindErr != nil {
-		conn.Close()
-		return nil, nil, fmt.Errorf("SO_BINDTODEVICE %s: %w", ifName, bindErr)
+	// For plain (non-VLAN) interfaces, bind to the interface via SyscallConn
+	// (avoids File() which sets blocking mode and removes the fd from Go's poller).
+	if !isVLAN {
+		sc, err := conn.(*net.IPConn).SyscallConn()
+		if err != nil {
+			conn.Close()
+			return nil, nil, fmt.Errorf("syscall conn: %w", err)
+		}
+		var bindErr error
+		if err := sc.Control(func(fd uintptr) {
+			bindErr = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, ifName)
+		}); err != nil {
+			conn.Close()
+			return nil, nil, fmt.Errorf("control: %w", err)
+		}
+		if bindErr != nil {
+			conn.Close()
+			return nil, nil, fmt.Errorf("SO_BINDTODEVICE %s: %w", ifName, bindErr)
+		}
 	}
 
 	rawConn, err := ipv4.NewRawConn(conn)
@@ -222,6 +237,76 @@ func openPerInterfaceSocket(ifName string, iface *net.Interface) (*ipv4.RawConn,
 	}
 
 	return rawConn, conn, nil
+}
+
+// openAfPacketReceiver opens an AF_PACKET SOCK_DGRAM socket bound to the
+// given interface for receiving VRRP packets. This is used on VLAN sub-
+// interfaces where raw IP sockets don't reliably receive multicast.
+// SOCK_DGRAM strips the Ethernet header — received data starts at the IP header.
+func openAfPacketReceiver(ifIndex int) (int, error) {
+	// Use ETH_P_ALL (same as tcpdump) — VLAN sub-interface + multicast
+	// delivery is unreliable with ETH_P_IP protocol filtering.
+	proto := htons(unix.ETH_P_ALL)
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(proto))
+	if err != nil {
+		return -1, fmt.Errorf("af_packet socket: %w", err)
+	}
+
+	// Bind to specific interface.
+	if err := unix.Bind(fd, &unix.SockaddrLinklayer{
+		Protocol: proto,
+		Ifindex:  ifIndex,
+	}); err != nil {
+		unix.Close(fd)
+		return -1, fmt.Errorf("bind af_packet to ifindex %d: %w", ifIndex, err)
+	}
+
+	// Receive timeout so the receiver goroutine can check stopCh.
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &unix.Timeval{Sec: 1}); err != nil {
+		unix.Close(fd)
+		return -1, fmt.Errorf("set rcvtimeo: %w", err)
+	}
+
+	// Promiscuous mode is required to receive multicast frames from
+	// remote peers on VLAN sub-interfaces. Without it, only locally-
+	// generated multicast (IP-layer loopback) is delivered. This matches
+	// tcpdump's behavior, which also sets PACKET_MR_PROMISC.
+	mreq := &unix.PacketMreq{
+		Ifindex: int32(ifIndex),
+		Type:    unix.PACKET_MR_PROMISC,
+	}
+	if err := unix.SetsockoptPacketMreq(fd, unix.SOL_PACKET, unix.PACKET_ADD_MEMBERSHIP, mreq); err != nil {
+		slog.Debug("vrrp: failed to set promisc", "err", err)
+	}
+
+	// BPF filter: accept only IPv4 VRRP (ethertype 0x0800, proto 112).
+	// SOCK_RAW includes the Ethernet header, so offsets are:
+	//   12-13: ethertype
+	//   23: IP protocol (14 + 9)
+	filter := []unix.SockFilter{
+		{Code: 0x28, K: 12},                    // ldh [12] — ethertype
+		{Code: 0x15, Jt: 0, Jf: 3, K: 0x0800}, // jeq #0x0800, check proto; else reject
+		{Code: 0x30, K: 23},                     // ldb [23] — IP protocol
+		{Code: 0x15, Jt: 0, Jf: 1, K: 112},     // jeq #112 → accept; else reject
+		{Code: 0x06, K: 0xFFFFFFFF},             // ret accept
+		{Code: 0x06, K: 0},                      // ret reject
+	}
+	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &unix.SockFprog{
+		Len:    uint16(len(filter)),
+		Filter: &filter[0],
+	}); err != nil {
+		unix.Close(fd)
+		return -1, fmt.Errorf("attach bpf filter: %w", err)
+	}
+
+	return fd, nil
+}
+
+// htons converts a uint16 from host to network byte order.
+func htons(v uint16) uint16 {
+	b := [2]byte{}
+	binary.BigEndian.PutUint16(b[:], v)
+	return binary.NativeEndian.Uint16(b[:])
 }
 
 // vipsEqual compares two VIP slices for equality.
