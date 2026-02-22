@@ -33,6 +33,13 @@ already the dataplane; it lacks sync groups (bpfrx's cluster election handles
 coordinated failover instead), and VIPs live on VPP interfaces requiring explicit
 kernel mirroring for FRR and management services.
 
+**Hybrid VPP VRRP + XDP finding:** VPP **cannot** serve as a VRRP-only frontend for
+XDP-processed NICs. DPDK removes the NIC from the kernel; AF_XDP replaces the existing
+XDP program; virtual interfaces cannot program VRRP's virtual MAC. The recommended path
+is **native Go VRRP** — implementing VRRPv3 directly in bpfrxd using proven Go libraries
+(govrrp, vrrp-go), eliminating both VPP and keepalived dependencies. Estimated effort:
+3 days, leveraging bpfrx's existing GARP/NA, BPF map update, and FRR reload infrastructure.
+
 **Linux integration finding:** VPP's Linux Control Plane (LCP) plugin creates TAP
 mirror interfaces in the kernel for each VPP-owned NIC, enabling FRR, SSH, SNMP, and
 management services to operate without modification. Bidirectional netlink
@@ -54,6 +61,7 @@ a dependency on VPP's "experimental" plugin label.
 | 11-12   | WireGuard integration options (A-E), impact on VPP decision |
 | 13      | VRRP implementation with VPP (vs keepalived) |
 | 14      | Linux CP pseudo-interfaces for FRR/kernel integration |
+| 15      | Hybrid VPP VRRP + XDP feasibility (native Go VRRP recommendation) |
 
 ---
 
@@ -1375,6 +1383,186 @@ API calls rather than file generation + networkctl reload.
 
 ---
 
+## 15. Hybrid VPP VRRP + XDP: Feasibility Analysis
+
+*Can VPP handle ONLY VRRP (fronting two NICs, one per server) while XDP does all
+packet processing?*
+
+### 15.1 The Question
+
+bpfrx's current HA uses keepalived for VRRP with several pain points (Section 13.2):
+fragile SIGUSR1 state detection, external daemon lifecycle, no native event stream.
+VPP's VRRP plugin solves these with async GoVPP events. The question is whether VPP
+can run **solely for VRRP** on the same NICs that XDP programs are processing packets on.
+
+### 15.2 VPP DPDK Mode + XDP: Fundamentally Incompatible
+
+When VPP takes over a NIC via DPDK, the interface is **removed from the kernel entirely**
+(bound to `vfio-pci` or `uio_pci_generic`). XDP programs require kernel-managed interfaces
+to attach. These are mutually exclusive:
+
+```
+VPP DPDK mode:  NIC → vfio-pci → VPP userspace (NIC invisible to kernel)
+XDP mode:       NIC → kernel driver → XDP hook → bpfrx programs
+```
+
+**Verdict: Not possible.** DPDK and XDP compete for the same hardware resource.
+
+### 15.3 VPP AF_XDP Mode + XDP: Theoretically Possible, Practically Broken
+
+VPP can use AF_XDP instead of DPDK, which keeps the NIC in the kernel. However:
+
+1. **AF_XDP replaces existing XDP programs.** VPP's AF_XDP driver loads its own XDP program
+   (a redirect-to-socket stub) which **overwrites** any XDP program already attached to the
+   interface. bpfrx's firewall pipeline would be destroyed.
+
+2. **XSKMAP conflict.** AF_XDP uses `BPF_MAP_TYPE_XSKMAP` to redirect packets to userspace
+   sockets. A single XDP program controls this map — it cannot be shared between VPP's
+   AF_XDP redirect and bpfrx's firewall logic without merging them into one program.
+
+3. **libxdp dispatcher workaround.** libxdp can chain up to 10 XDP programs on one interface
+   using `freplace` function-level replacement. This could theoretically run bpfrx's firewall
+   XDP first, then VPP's AF_XDP redirect. But:
+   - VPP does not natively support libxdp dispatcher — requires forking VPP
+   - Priority ordering between programs is fragile
+   - Per-CPU map conflicts between bpfrx and VPP would need careful resolution
+   - Maintenance burden of a VPP fork is prohibitive
+
+**Verdict: Not viable.** Engineering effort is enormous, and the result is fragile.
+
+### 15.4 VPP on Virtual Interface (macvlan/macvtap): Not Viable
+
+Could VPP run on a virtual interface seeing only VRRP traffic (IP proto 112, dst 224.0.0.18)?
+
+**No.** VRRP requires programming a virtual MAC address (`00:00:5E:00:01:XX`) on the
+**physical NIC**. Virtual interfaces (macvlan, macvtap, veth) cannot program the real NIC's
+MAC filter. TNSR explicitly documents: *"VRRP requires network interface hardware on which
+DPDK PMDs support programming an additional MAC address."*
+
+Even promiscuous mode workarounds fail because VPP on a virtual interface cannot send GARP
+packets that egress on the physical wire with the correct virtual MAC.
+
+**Verdict: Not possible.** VRRP's virtual MAC requirement demands physical NIC control.
+
+### 15.5 The Better Path: Native Go VRRP (Eliminate Both VPP and keepalived)
+
+Research reveals multiple production-quality Go VRRP libraries:
+
+| Library | Protocol | Features |
+|---------|----------|----------|
+| [go.linka.cloud/vrrp-go](https://pkg.go.dev/go.linka.cloud/vrrp-go) | VRRPv3 | Linux-only, full state machine |
+| [Trisia/govrrp](https://pkg.go.dev/github.com/Trisia/govrrp) | VRRPv3 | Multicast heartbeats, GARP, event callbacks |
+| [napw/VRRP-go](https://pkg.go.dev/github.com/napw/VRRP-go/VRRP) | VRRPv3 | IPv4/IPv6 connections, virtual router |
+| [gonotes/l3/vrrp](https://pkg.go.dev/github.com/gonotes/l3/vrrp) | VRRPv3 | RFC 5798 §5.2 config, timer management |
+| [google/gopacket](https://github.com/google/gopacket/blob/master/layers/vrrp.go) | VRRP | Packet parsing (layers only) |
+
+VRRPv3 (RFC 5798, updated by RFC 9568) is a simple protocol:
+- **1 packet type:** VRRP Advertisement
+- **3 states:** Initialize, Backup, Master
+- **1 multicast address:** 224.0.0.18 (IPv4), ff02::12 (IPv6)
+- **IP protocol 112**
+
+The entire state machine fits in ~500 lines of Go. Integration code using an existing
+library is ~100 lines.
+
+#### Notable precedent: acassen/xdp-fw
+
+The **keepalived author** (Alexandre Cassen) created
+[xdp-fw](https://github.com/acassen/xdp-fw), an XDP firewall that extends the
+keepalived/VRRP framework. This demonstrates that VRRP and XDP integrate naturally
+when VRRP runs in userspace alongside XDP programs on the same kernel interfaces.
+
+### 15.6 Architecture: Native Go VRRP in bpfrxd
+
+```
+Server A (bpfrx-fw0)                    Server B (bpfrx-fw1)
+┌──────────────────────┐                ┌──────────────────────┐
+│  bpfrxd               │                │  bpfrxd               │
+│  ┌──────────────────┐ │                │  ┌──────────────────┐ │
+│  │ Go VRRP Manager  │ │   VRRP Advert  │  │ Go VRRP Manager  │ │
+│  │  (govrrp lib)    │←├───────────────→┤→│  (govrrp lib)    │ │
+│  │  Master (pri=200)│ │  224.0.0.18    │  │  Backup (pri=100)│ │
+│  └────────┬─────────┘ │                │  └────────┬─────────┘ │
+│           │ state      │                │           │ state      │
+│           │ change     │                │           │ change     │
+│           ▼            │                │           ▼            │
+│  ┌──────────────────┐ │                │  ┌──────────────────┐ │
+│  │ Cluster Manager  │ │                │  │ Cluster Manager  │ │
+│  │ • GARP/NA send   │ │                │  │ • Stop forwarding│ │
+│  │ • BPF map update │ │                │  │ • BPF map update │ │
+│  │ • FRR reload     │ │                │  │ • FRR reload     │ │
+│  └──────────────────┘ │                │  └──────────────────┘ │
+│                        │                │                        │
+│  XDP pipeline runs     │                │  XDP pipeline runs     │
+│  on kernel interfaces  │                │  on kernel interfaces  │
+│  (trust0, wan0, etc.)  │                │  (trust0, wan0, etc.)  │
+└──────────────────────┘                └──────────────────────┘
+```
+
+**Key design:**
+- VRRP runs inside bpfrxd as a goroutine — no external daemon
+- VRRP sends/receives advertisements via raw IP socket (proto 112) on kernel interfaces
+- XDP programs remain attached to the same interfaces — no conflict
+- On Master transition: send GARP/NA (already implemented in `pkg/cluster/garp.go`),
+  update BPF maps, reload FRR
+- On Backup transition: disable forwarding via BPF map flags
+
+### 15.7 XDP-Assisted VRRP Packet Steering (Optional Optimization)
+
+For maximum performance, bpfrx's XDP pipeline can identify VRRP packets early and
+`XDP_PASS` them to the kernel stack (where the Go VRRP daemon listens), avoiding
+unnecessary processing through the firewall pipeline:
+
+```c
+// In xdp_main.c or xdp_zone.c — early VRRP bypass
+if (iph->protocol == 112 &&
+    iph->daddr == __constant_htonl(0xE0000012)) {  // 224.0.0.18
+    return XDP_PASS;  // Punt to kernel → Go VRRP daemon
+}
+```
+
+This is already implicitly handled by bpfrx's zone policy (VRRP multicast would be
+host-bound traffic that gets `XDP_PASS`), but an explicit early check avoids processing
+VRRP packets through conntrack/policy/NAT stages unnecessarily.
+
+### 15.8 Implementation Plan
+
+| Step | Description | Effort |
+|------|-------------|--------|
+| 1 | Add `pkg/vrrp/native.go` — Go VRRP backend using govrrp library | 1 day |
+| 2 | Implement `Backend` interface (same as Section 13.4 Step 1) | ~200 LOC |
+| 3 | Wire state-change events to `pkg/cluster/` failover handlers | 0.5 day |
+| 4 | Add VRRP config section to Junos parser (`set interfaces X vrrp-group`) | Already exists |
+| 5 | Remove keepalived dependency from daemon lifecycle | 0.5 day |
+| 6 | Add explicit VRRP XDP bypass in `xdp_main.c` (optional) | 0.5 day |
+| 7 | Test with two-VM cluster env (`test/incus/cluster-setup.sh`) | 1 day |
+| **Total** | | **~3 days** |
+
+### 15.9 Comparison: All VRRP Approaches
+
+| Approach | Feasibility | Complexity | Dependencies | Event Model | Recommendation |
+|----------|------------|------------|--------------|-------------|----------------|
+| **keepalived (current)** | Working | Low | External daemon | SIGUSR1 polling (fragile) | Baseline |
+| **VPP VRRP + VPP dataplane** | Yes | High | Full VPP stack | GoVPP async events | Only if VPP adopted |
+| **VPP VRRP-only + XDP** | **No** | N/A | Impossible | N/A | **Rejected** |
+| **Native Go VRRP** | **Yes** | Low | govrrp library | Native Go channels | **Recommended** |
+
+### 15.10 Conclusion
+
+**VPP cannot serve as a VRRP-only frontend for XDP-processed NICs.** DPDK removes the NIC
+from the kernel; AF_XDP replaces the XDP program; virtual interfaces cannot program the
+VRRP virtual MAC. No hybrid model is viable.
+
+**The recommended path is native Go VRRP** — implementing VRRPv3 directly in bpfrxd using
+existing Go libraries. This eliminates both VPP *and* keepalived, gives bpfrx full control
+over failover timing, integrates with the existing cluster state machine, and requires
+approximately 3 days of implementation. bpfrx already has the supporting infrastructure:
+GARP/NA transmission (`pkg/cluster/garp.go`), BPF map updates on failover, and FRR reload
+on state transitions. The only missing piece is the VRRP state machine itself, which proven
+Go libraries provide.
+
+---
+
 ## Appendix A: VPP Production Deployments
 
 | Deployer        | Product                  | Scale              | Status              |
@@ -1448,5 +1636,22 @@ API calls rather than file generation + networkctl reload.
 - [VPP VRRP API Definition](https://github.com/FDio/vpp/blob/master/src/plugins/vrrp/vrrp.api)
 - [VPP VRRP CLI Reference](https://s3-docs.fd.io/vpp/26.02/cli-reference/clis/clicmd_src_plugins_vrrp.html)
 - [Netgate TNSR VRRP Documentation](https://docs.netgate.com/tnsr/en/latest/config/ha/vrrp.html)
+- [Netgate TNSR VRRP Compatibility](https://docs.netgate.com/tnsr/en/latest/vrrp/compatibility.html)
 - [RFC 5798 — VRRPv3](https://datatracker.ietf.org/doc/html/rfc5798)
+- [RFC 9568 — VRRPv3 (Updated 2024)](https://datatracker.ietf.org/doc/rfc9568/)
 - [keepalived Documentation](https://keepalived.readthedocs.io/en/latest/)
+
+### Go VRRP Libraries and Native VRRP References
+
+- [go.linka.cloud/vrrp-go — VRRPv3 for Linux](https://pkg.go.dev/go.linka.cloud/vrrp-go)
+- [Trisia/govrrp — VRRPv3 with GARP](https://pkg.go.dev/github.com/Trisia/govrrp)
+- [napw/VRRP-go — IPv4/IPv6 VRRP](https://pkg.go.dev/github.com/napw/VRRP-go/VRRP)
+- [gonotes/l3/vrrp — RFC 5798 §5.2](https://pkg.go.dev/github.com/gonotes/l3/vrrp)
+- [30070/VRRP-go — VRRPv3 in Go](https://github.com/30070/VRRP-go)
+- [bot11/vrrp_go — VRRP in Go](https://github.com/bot11/vrrp_go)
+- [google/gopacket VRRP Layer](https://github.com/google/gopacket/blob/master/layers/vrrp.go)
+- [google/seesaw — VRRPv3 HA (production)](https://github.com/google/seesaw/blob/master/ha/core.go)
+- [acassen/xdp-fw — XDP Firewall + VRRP (keepalived author)](https://github.com/acassen/xdp-fw)
+- [jedisct1/UCarp — Userspace CARP](https://github.com/jedisct1/UCarp)
+- [AF_XDP — Linux Kernel Documentation](https://docs.kernel.org/networking/af_xdp.html)
+- [libxdp — Multiple XDP Programs on Same Interface](https://manpages.debian.org/bookworm/libxdp-dev/libxdp.3.en.html)
