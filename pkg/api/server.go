@@ -27,6 +27,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/ipsec"
 	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/routing"
+	"github.com/psaab/bpfrx/pkg/vrrp"
 )
 
 // Config configures the API server.
@@ -43,6 +44,7 @@ type Config struct {
 	FRR       *frr.Manager
 	IPsec     *ipsec.Manager
 	DHCP      *dhcp.Manager
+	VRRPMgr   *vrrp.Manager       // native VRRP manager
 	ApplyFn   func(*config.Config) // daemon's applyConfig callback
 }
 
@@ -58,6 +60,7 @@ type Server struct {
 	frr         *frr.Manager
 	ipsec       *ipsec.Manager
 	dhcp        *dhcp.Manager
+	vrrpMgr     *vrrp.Manager
 	applyFn     func(*config.Config)
 	startTime   time.Time
 }
@@ -73,6 +76,7 @@ func NewServer(cfg Config) *Server {
 		frr:       cfg.FRR,
 		ipsec:     cfg.IPsec,
 		dhcp:      cfg.DHCP,
+		vrrpMgr:   cfg.VRRPMgr,
 		applyFn:   cfg.ApplyFn,
 		startTime: time.Now(),
 	}

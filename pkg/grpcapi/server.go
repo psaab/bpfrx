@@ -61,6 +61,7 @@ type Config struct {
 	FeedsFn         func() map[string]feeds.FeedInfo // returns live feed status
 	LLDPNeighborsFn func() []*lldp.Neighbor         // returns live LLDP neighbors
 	ApplyFn         func(*config.Config)             // daemon's applyConfig callback
+	VRRPMgr         *vrrp.Manager                    // native VRRP manager
 	Version      string                    // software version string
 }
 
@@ -81,6 +82,7 @@ type Server struct {
 	feedsFn         func() map[string]feeds.FeedInfo
 	lldpNeighborsFn func() []*lldp.Neighbor
 	applyFn         func(*config.Config)
+	vrrpMgr         *vrrp.Manager
 	startTime    time.Time
 	addr         string
 	version      string
@@ -106,6 +108,7 @@ func NewServer(addr string, cfg Config) *Server {
 		feedsFn:         cfg.FeedsFn,
 		lldpNeighborsFn: cfg.LLDPNeighborsFn,
 		applyFn:         cfg.ApplyFn,
+		vrrpMgr:         cfg.VRRPMgr,
 		startTime:    time.Now(),
 		addr:         addr,
 		version:      cfg.Version,
@@ -3070,12 +3073,15 @@ func (s *Server) GetVRRPStatus(_ context.Context, _ *pb.GetVRRPStatusRequest) (*
 
 	if cfg != nil {
 		instances := vrrp.CollectInstances(cfg)
-		runtimeStates := vrrp.RuntimeStates(instances)
+		var runtimeStates map[string]string
+		if s.vrrpMgr != nil {
+			runtimeStates = s.vrrpMgr.States()
+		}
 		for _, inst := range instances {
 			key := fmt.Sprintf("VI_%s_%d", inst.Interface, inst.GroupID)
-			state := runtimeStates[key]
-			if state == "" {
-				state = "INIT"
+			state := "INIT"
+			if s, ok := runtimeStates[key]; ok {
+				state = s
 			}
 			resp.Instances = append(resp.Instances, &pb.VRRPInstanceInfo{
 				Interface:        inst.Interface,
@@ -3088,8 +3094,11 @@ func (s *Server) GetVRRPStatus(_ context.Context, _ *pb.GetVRRPStatusRequest) (*
 		}
 	}
 
-	status, _ := vrrp.Status()
-	resp.ServiceStatus = status
+	if s.vrrpMgr != nil {
+		resp.ServiceStatus = s.vrrpMgr.Status()
+	} else {
+		resp.ServiceStatus = "VRRP: not running\n"
+	}
 
 	return resp, nil
 }

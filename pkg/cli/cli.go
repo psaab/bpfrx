@@ -62,6 +62,8 @@ type CLI struct {
 	version      string
 	startTime    time.Time
 
+	vrrpMgr      *vrrp.Manager
+
 	// Command cancellation: Ctrl-C during a running external command cancels it.
 	cmdMu     sync.Mutex
 	cmdCancel context.CancelFunc
@@ -118,6 +120,11 @@ func (c *CLI) SetVersion(v string) {
 // SetUserClass sets the login class for RBAC permission checks.
 func (c *CLI) SetUserClass(class string) {
 	c.userClass = class
+}
+
+// SetVRRPManager sets the VRRP manager for runtime state queries.
+func (c *CLI) SetVRRPManager(m *vrrp.Manager) {
+	c.vrrpMgr = m
 }
 
 // checkPermission verifies the current user's login class permits the given action.
@@ -9083,7 +9090,7 @@ func (c *CLI) clearPersistentNAT() error {
 	return nil
 }
 
-// showVRRP displays VRRP/keepalived status.
+// showVRRP displays VRRP status.
 func (c *CLI) showVRRP() error {
 	cfg := c.store.ActiveConfig()
 	if cfg == nil {
@@ -9091,24 +9098,27 @@ func (c *CLI) showVRRP() error {
 		return nil
 	}
 
-	// Collect VRRP instances from config
 	instances := vrrp.CollectInstances(cfg)
 	if len(instances) == 0 {
 		fmt.Println("No VRRP groups configured")
 		return nil
 	}
 
-	// Try to read runtime state
-	status, _ := vrrp.Status()
-	if status != "" {
-		fmt.Println(status)
+	// Get runtime states from VRRP manager.
+	var states map[string]string
+	if c.vrrpMgr != nil {
+		states = c.vrrpMgr.States()
+		fmt.Println(c.vrrpMgr.Status())
 	}
 
-	// Show configured instances
 	fmt.Printf("%-14s %-6s %-8s %-10s %-16s %-8s\n",
 		"Interface", "Group", "State", "Priority", "VIP", "Preempt")
 	for _, inst := range instances {
-		state := "BACKUP"
+		key := fmt.Sprintf("VI_%s_%d", inst.Interface, inst.GroupID)
+		state := "INIT"
+		if s, ok := states[key]; ok {
+			state = s
+		}
 		preempt := "no"
 		if inst.Preempt {
 			preempt = "yes"

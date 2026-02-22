@@ -664,9 +664,9 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 	// created. Physical member interfaces (with RedundantParent) inherit the
 	// reth's addresses, VLANs, and redundancy group settings.
 	//
-	// For VRRP-backed RETH, VIP addresses are managed by keepalived. The
+	// For VRRP-backed RETH, VIP addresses are managed by native VRRP. The
 	// networkd .network file gets a link-local base address (169.254.RG.NODE/32)
-	// instead — keepalived requires at least one IPv4 for VRRP advertisements.
+	// instead — VRRP requires at least one IPv4 for advertisements.
 	clusterNodeID := -1
 	if cfg.Chassis.Cluster != nil {
 		clusterNodeID = cfg.Chassis.Cluster.NodeID
@@ -779,7 +779,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					mtu = unitMTU
 				}
 				// VRRP-backed RETH: replace VIP addresses with a
-				// link-local base; keepalived manages the actual VIPs.
+				// link-local base; native VRRP manages the actual VIPs.
 				if isVRRPReth {
 					addrs = []string{fmt.Sprintf("169.254.%d.%d/32", effectiveCfg.RedundancyGroup, clusterNodeID+1)}
 					primaryAddr = ""

@@ -94,6 +94,7 @@ type Daemon struct {
 	eventEngine   *eventengine.Engine
 	aggregator    *logging.SessionAggregator
 	aggCancel     context.CancelFunc
+	vrrpMgr       *vrrp.Manager
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
@@ -532,6 +533,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			FRR:      d.frr,
 			IPsec:    d.ipsec,
 			DHCP:     d.dhcp,
+			VRRPMgr:  d.vrrpMgr,
 			ApplyFn:  d.applyConfig,
 		}
 		// Resolve interface bindings from web-management config
@@ -618,6 +620,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				return nil
 			},
 			ApplyFn: applyAndSync,
+			VRRPMgr: d.vrrpMgr,
 			Version: d.opts.Version,
 		})
 		wg.Add(1)
@@ -653,6 +656,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			return nil
 		})
+		shell.SetVRRPManager(d.vrrpMgr)
 
 		// Set RBAC login class from config (default to super-user if user not found)
 		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Login != nil {
@@ -711,6 +715,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Clean up LLDP.
 	if d.lldpMgr != nil {
 		d.lldpMgr.Stop()
+	}
+
+	// Stop VRRP manager (removes VIPs, sends priority-0).
+	if d.vrrpMgr != nil {
+		d.vrrpMgr.Stop()
 	}
 
 	// Stop session sync.
@@ -1091,16 +1100,29 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
-	// 8. Apply VRRP config (keepalived) — merge user VRRP + RETH VRRP instances
+	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	vrrpInstances := vrrp.CollectInstances(cfg)
 	if d.cluster != nil {
 		localPri := d.cluster.LocalPriorities()
 		vrrpInstances = append(vrrpInstances, vrrp.CollectRethInstances(cfg, localPri)...)
 	}
 	if len(vrrpInstances) > 0 {
-		if err := vrrp.Apply(vrrpInstances); err != nil {
-			slog.Warn("failed to apply VRRP config", "err", err)
+		if d.vrrpMgr == nil {
+			d.vrrpMgr = vrrp.NewManager()
+			if err := d.vrrpMgr.Start(context.Background()); err != nil {
+				slog.Warn("failed to start VRRP manager", "err", err)
+			} else {
+				go d.watchVRRPEvents(context.Background())
+			}
 		}
+		if d.vrrpMgr != nil {
+			if err := d.vrrpMgr.UpdateInstances(vrrpInstances); err != nil {
+				slog.Warn("failed to update VRRP instances", "err", err)
+			}
+		}
+	} else if d.vrrpMgr != nil {
+		// No VRRP instances — clear all.
+		d.vrrpMgr.UpdateInstances(nil)
 	}
 
 	// 9. Apply system DNS and NTP configuration
@@ -1182,7 +1204,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			}
 		}
 
-		// RETH GARP is handled by keepalived (VRRP-backed RETH).
+		// RETH GARP is handled by native VRRP (VRRP-backed RETH).
 		// No manual GARP registration needed.
 	}
 }
@@ -2915,8 +2937,8 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 func (d *Daemon) watchClusterEvents(ctx context.Context) {
 	// Debounce VRRP updates: coalesce rapid cluster events into a single
-	// keepalived reload. Without this, every heartbeat-driven state change
-	// triggers a separate reload, flooding keepalived before it can settle.
+	// UpdateInstances call. Without this, every heartbeat-driven state change
+	// triggers a separate update before priorities settle.
 	var vrrpTimer *time.Timer
 	defer func() {
 		if vrrpTimer != nil {
@@ -2934,10 +2956,16 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				vrrpTimer.Stop()
 			}
 			vrrpTimer = time.AfterFunc(2*time.Second, func() {
+				if d.vrrpMgr == nil {
+					return
+				}
 				if cfg := d.store.ActiveConfig(); cfg != nil {
 					localPri := d.cluster.LocalPriorities()
-					if err := vrrp.UpdatePriority(cfg, localPri); err != nil {
-						slog.Warn("cluster: failed to update VRRP priority", "err", err)
+					var all []*vrrp.Instance
+					all = append(all, vrrp.CollectInstances(cfg)...)
+					all = append(all, vrrp.CollectRethInstances(cfg, localPri)...)
+					if err := d.vrrpMgr.UpdateInstances(all); err != nil {
+						slog.Warn("cluster: failed to update VRRP instances", "err", err)
 					}
 				}
 			})
@@ -2959,6 +2987,24 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 					d.store.SetClusterReadOnly(true)
 				}
 			}
+		}
+	}
+}
+
+// watchVRRPEvents monitors VRRP state changes and logs transitions.
+func (d *Daemon) watchVRRPEvents(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-d.vrrpMgr.Events():
+			if !ok {
+				return
+			}
+			slog.Info("vrrp: state change",
+				"interface", ev.Interface,
+				"group", ev.GroupID,
+				"state", ev.State.String())
 		}
 	}
 }

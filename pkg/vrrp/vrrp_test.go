@@ -1,175 +1,13 @@
 package vrrp
 
 import (
-	"strings"
+	"net"
 	"testing"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
 
-func TestGenerateConfig_Basic(t *testing.T) {
-	instances := []*Instance{
-		{
-			Interface:         "trust0",
-			GroupID:           100,
-			Priority:          200,
-			Preempt:           true,
-			AdvertiseInterval: 1,
-			VirtualAddresses:  []string{"10.0.1.1/24"},
-		},
-	}
-	got := generateConfig(instances)
-
-	checks := []string{
-		"vrrp_instance VI_trust0_100",
-		"state BACKUP",
-		"interface trust0",
-		"virtual_router_id 100",
-		"priority 200",
-		"advert_int 1",
-		"10.0.1.1/24 dev trust0",
-	}
-	for _, want := range checks {
-		if !strings.Contains(got, want) {
-			t.Errorf("missing %q in:\n%s", want, got)
-		}
-	}
-	// With preempt=true, should NOT have "nopreempt"
-	if strings.Contains(got, "nopreempt") {
-		t.Error("unexpected nopreempt with Preempt=true")
-	}
-}
-
-func TestGenerateConfig_NoPreempt(t *testing.T) {
-	instances := []*Instance{
-		{
-			Interface:         "trust0",
-			GroupID:           100,
-			Priority:          100,
-			Preempt:           false,
-			AdvertiseInterval: 2,
-			VirtualAddresses:  []string{"10.0.1.1"},
-		},
-	}
-	got := generateConfig(instances)
-	if !strings.Contains(got, "nopreempt") {
-		t.Error("missing nopreempt")
-	}
-	if !strings.Contains(got, "advert_int 2") {
-		t.Error("missing advert_int 2")
-	}
-	// VIP without CIDR should get /32
-	if !strings.Contains(got, "10.0.1.1/32 dev trust0") {
-		t.Errorf("expected /32 suffix for VIP without CIDR, got:\n%s", got)
-	}
-}
-
-func TestGenerateConfig_Auth(t *testing.T) {
-	instances := []*Instance{
-		{
-			Interface:         "trust0",
-			GroupID:           100,
-			Priority:          100,
-			Preempt:           true,
-			AdvertiseInterval: 1,
-			AuthType:          "md5",
-			AuthKey:           "secret123",
-			VirtualAddresses:  []string{"10.0.1.1/24"},
-		},
-	}
-	got := generateConfig(instances)
-	if !strings.Contains(got, "auth_type AH") {
-		t.Error("missing auth_type AH for md5")
-	}
-	if !strings.Contains(got, "auth_pass secret123") {
-		t.Error("missing auth_pass")
-	}
-}
-
-func TestGenerateConfig_AuthPass(t *testing.T) {
-	instances := []*Instance{
-		{
-			Interface:         "trust0",
-			GroupID:           100,
-			Priority:          100,
-			Preempt:           true,
-			AdvertiseInterval: 1,
-			AuthType:          "",
-			AuthKey:           "mykey",
-			VirtualAddresses:  []string{"10.0.1.1/24"},
-		},
-	}
-	got := generateConfig(instances)
-	if !strings.Contains(got, "auth_type PASS") {
-		t.Error("missing auth_type PASS for non-md5")
-	}
-}
-
-func TestGenerateConfig_TrackInterface(t *testing.T) {
-	instances := []*Instance{
-		{
-			Interface:         "trust0",
-			GroupID:           100,
-			Priority:          200,
-			Preempt:           true,
-			AdvertiseInterval: 1,
-			VirtualAddresses:  []string{"10.0.1.1/24"},
-			TrackInterface:    "untrust0",
-			TrackPriorityCost: 100,
-		},
-	}
-	got := generateConfig(instances)
-	if !strings.Contains(got, "track_interface") {
-		t.Error("missing track_interface section")
-	}
-	if !strings.Contains(got, "untrust0 weight -100") {
-		t.Errorf("missing track weight, got:\n%s", got)
-	}
-}
-
-func TestGenerateConfig_AcceptData(t *testing.T) {
-	instances := []*Instance{
-		{
-			Interface:         "trust0",
-			GroupID:           100,
-			Priority:          100,
-			AcceptData:        true,
-			AdvertiseInterval: 1,
-			VirtualAddresses:  []string{"10.0.1.1/24"},
-		},
-	}
-	got := generateConfig(instances)
-	if !strings.Contains(got, "accept") {
-		t.Error("missing accept")
-	}
-}
-
-func TestParseDataFile(t *testing.T) {
-	data := `------< VRRP Topology >------
- VRRP Instance = VI_trust0_100
-   State               = MASTER
-   Last transition      = 1707868800
-   Listening device     = trust0
-
- VRRP Instance = VI_untrust0_200
-   State               = BACKUP
-   Last transition      = 1707868801
-`
-	got := parseDataFile(data)
-	if got["VI_trust0_100"] != "MASTER" {
-		t.Errorf("VI_trust0_100: got %q, want MASTER", got["VI_trust0_100"])
-	}
-	if got["VI_untrust0_200"] != "BACKUP" {
-		t.Errorf("VI_untrust0_200: got %q, want BACKUP", got["VI_untrust0_200"])
-	}
-}
-
-func TestParseDataFile_Empty(t *testing.T) {
-	got := parseDataFile("")
-	if len(got) != 0 {
-		t.Errorf("expected empty map, got %v", got)
-	}
-}
+// --- Collection tests (kept from keepalived era) ---
 
 func TestCollectInstances_Nil(t *testing.T) {
 	instances := CollectInstances(nil)
@@ -394,5 +232,208 @@ func TestCollectRethInstances_VlanTagging(t *testing.T) {
 	}
 	if inst1.Priority != 100 {
 		t.Errorf("inst1.Priority = %d, want 100", inst1.Priority)
+	}
+}
+
+// --- Packet codec tests ---
+
+func TestPacketMarshalParseRoundTrip_IPv4(t *testing.T) {
+	pkt := &VRRPPacket{
+		VRID:         42,
+		Priority:     200,
+		MaxAdvertInt: 100, // 1 second
+		IPAddresses:  []net.IP{net.IPv4(10, 0, 1, 1), net.IPv4(10, 0, 1, 2)},
+	}
+
+	srcIP := net.IPv4(192, 168, 1, 1)
+	dstIP := net.IPv4(224, 0, 0, 18)
+
+	data, err := pkt.Marshal(false, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Header (8) + 2 IPv4 addrs (8) = 16 bytes
+	if len(data) != 16 {
+		t.Fatalf("expected 16 bytes, got %d", len(data))
+	}
+
+	// Parse back
+	parsed, err := ParseVRRPPacket(data, false, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if parsed.VRID != 42 {
+		t.Errorf("VRID = %d, want 42", parsed.VRID)
+	}
+	if parsed.Priority != 200 {
+		t.Errorf("Priority = %d, want 200", parsed.Priority)
+	}
+	if parsed.MaxAdvertInt != 100 {
+		t.Errorf("MaxAdvertInt = %d, want 100", parsed.MaxAdvertInt)
+	}
+	if len(parsed.IPAddresses) != 2 {
+		t.Fatalf("expected 2 addresses, got %d", len(parsed.IPAddresses))
+	}
+	if !parsed.IPAddresses[0].Equal(net.IPv4(10, 0, 1, 1)) {
+		t.Errorf("addr[0] = %s, want 10.0.1.1", parsed.IPAddresses[0])
+	}
+	if !parsed.IPAddresses[1].Equal(net.IPv4(10, 0, 1, 2)) {
+		t.Errorf("addr[1] = %s, want 10.0.1.2", parsed.IPAddresses[1])
+	}
+}
+
+func TestPacketMarshalParseRoundTrip_IPv6(t *testing.T) {
+	ip1 := net.ParseIP("2001:db8::1")
+	ip2 := net.ParseIP("2001:db8::2")
+	pkt := &VRRPPacket{
+		VRID:         10,
+		Priority:     100,
+		MaxAdvertInt: 200,
+		IPAddresses:  []net.IP{ip1, ip2},
+	}
+
+	srcIP := net.ParseIP("fe80::1")
+	dstIP := net.ParseIP("ff02::12")
+
+	data, err := pkt.Marshal(true, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Header (8) + 2 IPv6 addrs (32) = 40 bytes
+	if len(data) != 40 {
+		t.Fatalf("expected 40 bytes, got %d", len(data))
+	}
+
+	parsed, err := ParseVRRPPacket(data, true, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if parsed.VRID != 10 {
+		t.Errorf("VRID = %d, want 10", parsed.VRID)
+	}
+	if parsed.Priority != 100 {
+		t.Errorf("Priority = %d, want 100", parsed.Priority)
+	}
+	if len(parsed.IPAddresses) != 2 {
+		t.Fatalf("expected 2 addresses, got %d", len(parsed.IPAddresses))
+	}
+}
+
+func TestPacketParse_BadVersion(t *testing.T) {
+	data := make([]byte, 12)
+	data[0] = (2 << 4) | 1 // version 2
+	_, err := ParseVRRPPacket(data, false, nil, nil)
+	if err == nil {
+		t.Error("expected error for version 2")
+	}
+}
+
+func TestPacketParse_TooShort(t *testing.T) {
+	_, err := ParseVRRPPacket([]byte{1, 2, 3}, false, nil, nil)
+	if err == nil {
+		t.Error("expected error for short packet")
+	}
+}
+
+func TestPacketParse_BadChecksum(t *testing.T) {
+	pkt := &VRRPPacket{
+		VRID:         1,
+		Priority:     100,
+		MaxAdvertInt: 100,
+		IPAddresses:  []net.IP{net.IPv4(10, 0, 0, 1)},
+	}
+	srcIP := net.IPv4(192, 168, 1, 1)
+	dstIP := net.IPv4(224, 0, 0, 18)
+	data, _ := pkt.Marshal(false, srcIP, dstIP)
+
+	// Corrupt checksum
+	data[6] ^= 0xFF
+
+	_, err := ParseVRRPPacket(data, false, srcIP, dstIP)
+	if err == nil {
+		t.Error("expected checksum error")
+	}
+}
+
+func TestPacketPriority0(t *testing.T) {
+	pkt := &VRRPPacket{
+		VRID:         1,
+		Priority:     0,
+		MaxAdvertInt: 100,
+		IPAddresses:  []net.IP{net.IPv4(10, 0, 0, 1)},
+	}
+	srcIP := net.IPv4(192, 168, 1, 1)
+	dstIP := net.IPv4(224, 0, 0, 18)
+	data, err := pkt.Marshal(false, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parsed, err := ParseVRRPPacket(data, false, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Priority != 0 {
+		t.Errorf("Priority = %d, want 0", parsed.Priority)
+	}
+}
+
+// --- State machine tests ---
+
+func TestVRRPState_String(t *testing.T) {
+	tests := []struct {
+		state VRRPState
+		want  string
+	}{
+		{StateInitialize, "INIT"},
+		{StateBackup, "BACKUP"},
+		{StateMaster, "MASTER"},
+	}
+	for _, tt := range tests {
+		if got := tt.state.String(); got != tt.want {
+			t.Errorf("VRRPState(%d).String() = %q, want %q", tt.state, got, tt.want)
+		}
+	}
+}
+
+func TestVipsEqual(t *testing.T) {
+	tests := []struct {
+		a, b []string
+		want bool
+	}{
+		{nil, nil, true},
+		{[]string{"10.0.0.1/24"}, []string{"10.0.0.1/24"}, true},
+		{[]string{"10.0.0.1/24"}, []string{"10.0.0.2/24"}, false},
+		{[]string{"10.0.0.1/24"}, []string{"10.0.0.1/24", "10.0.0.2/24"}, false},
+	}
+	for _, tt := range tests {
+		if got := vipsEqual(tt.a, tt.b); got != tt.want {
+			t.Errorf("vipsEqual(%v, %v) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+func TestManagerNewAndStates(t *testing.T) {
+	m := NewManager()
+	states := m.States()
+	if len(states) != 0 {
+		t.Errorf("expected empty states, got %v", states)
+	}
+	status := m.Status()
+	if status == "" {
+		t.Error("expected non-empty status string")
+	}
+}
+
+func TestOnesComplementChecksum(t *testing.T) {
+	// All zeros should checksum to 0xFFFF
+	data := make([]byte, 8)
+	csum := onesComplementChecksum(data)
+	if csum != 0xFFFF {
+		t.Errorf("checksum of zeros = 0x%04X, want 0xFFFF", csum)
 	}
 }

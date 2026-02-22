@@ -154,7 +154,7 @@ zone_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		}
 	}
 
-	/* ---- VRRP multicast (224.0.0.18, proto 112) — host-bound for keepalived ---- */
+	/* ---- VRRP multicast (224.0.0.18, proto 112) — host-bound for native VRRP daemon ---- */
 	if (meta->addr_family == AF_INET && meta->protocol == PROTO_VRRP &&
 	    meta->dst_ip.v4 == rte_cpu_to_be_32(0xE0000012)) {
 		meta->fwd_ifindex = 0;

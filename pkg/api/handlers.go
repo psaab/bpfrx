@@ -1048,15 +1048,24 @@ func (s *Server) vrrpHandler(w http.ResponseWriter, _ *http.Request) {
 
 	if cfg != nil {
 		instances := vrrp.CollectInstances(cfg)
+		var states map[string]string
+		if s.vrrpMgr != nil {
+			states = s.vrrpMgr.States()
+		}
 		for _, inst := range instances {
 			addrs := inst.VirtualAddresses
 			if addrs == nil {
 				addrs = []string{}
 			}
+			key := fmt.Sprintf("VI_%s_%d", inst.Interface, inst.GroupID)
+			state := "INIT"
+			if st, ok := states[key]; ok {
+				state = st
+			}
 			resp.Instances = append(resp.Instances, VRRPInstanceInfo{
 				Interface:        inst.Interface,
 				GroupID:          inst.GroupID,
-				State:            "BACKUP",
+				State:            state,
 				Priority:         inst.Priority,
 				VirtualAddresses: addrs,
 				Preempt:          inst.Preempt,
@@ -1064,8 +1073,11 @@ func (s *Server) vrrpHandler(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 
-	svcStatus, _ := vrrp.Status()
-	resp.ServiceStatus = svcStatus
+	if s.vrrpMgr != nil {
+		resp.ServiceStatus = s.vrrpMgr.Status()
+	} else {
+		resp.ServiceStatus = "VRRP: not running\n"
+	}
 	writeOK(w, resp)
 }
 

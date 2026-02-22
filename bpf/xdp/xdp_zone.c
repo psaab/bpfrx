@@ -315,7 +315,7 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	}
 
 	/*
-	 * VRRP multicast (224.0.0.18, proto 112) — allow to host for keepalived.
+	 * VRRP multicast (224.0.0.18, proto 112) — allow to host for native VRRP daemon.
 	 * Must be checked before the generic multicast pass-through so it
 	 * reaches the host even with zone-pair deny-all.
 	 */
