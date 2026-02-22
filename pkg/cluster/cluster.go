@@ -622,7 +622,7 @@ func (m *Manager) handlePeerTimeout() {
 	m.electSingleNode()
 }
 
-// triggerGARP is called on transition to primary. Keepalived handles
+// triggerGARP is called on transition to primary. Native VRRP handles
 // GARP for VRRP-backed RETH interfaces, so this is a no-op.
 func (m *Manager) triggerGARP(rgID int) {
 	slog.Info("cluster: primary transition", "rg", rgID)

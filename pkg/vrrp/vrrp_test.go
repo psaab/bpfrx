@@ -7,7 +7,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/config"
 )
 
-// --- Collection tests (kept from keepalived era) ---
+// --- Collection tests ---
 
 func TestCollectInstances_Nil(t *testing.T) {
 	instances := CollectInstances(nil)

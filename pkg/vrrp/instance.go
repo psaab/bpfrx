@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/ipv4"
+
 	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/vishvananda/netlink"
 )
@@ -44,29 +46,55 @@ type VRRPEvent struct {
 
 // vrrpInstance is a per-VRRP-group state machine goroutine.
 type vrrpInstance struct {
-	mu           sync.RWMutex
-	cfg          Instance
-	state        VRRPState
-	iface        *net.Interface
-	eventCh      chan<- VRRPEvent
-	sendFn       func(ifName string, pkt *VRRPPacket, isIPv6 bool) error
-	rxCh         chan *VRRPPacket
-	stopCh       chan struct{}
-	stopped      chan struct{}
+	mu      sync.RWMutex
+	cfg     Instance
+	state   VRRPState
+	iface   *net.Interface
+	eventCh chan<- VRRPEvent
+	localIP net.IP // our IPv4 address on this interface (for filtering self-sent)
+
+	// Per-instance raw socket and receiver.
+	conn    net.PacketConn
+	rawConn *ipv4.RawConn
+	rxCh    chan *VRRPPacket
+	stopCh  chan struct{}
+	stopped chan struct{}
 }
 
-func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent,
-	sendFn func(string, *VRRPPacket, bool) error) *vrrpInstance {
+func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent) *vrrpInstance {
 	return &vrrpInstance{
 		cfg:     cfg,
 		state:   StateInitialize,
 		iface:   iface,
 		eventCh: eventCh,
-		sendFn:  sendFn,
 		rxCh:    make(chan *VRRPPacket, 16),
 		stopCh:  make(chan struct{}),
 		stopped: make(chan struct{}),
 	}
+}
+
+// openSocket creates the per-instance raw socket bound to the interface.
+func (vi *vrrpInstance) openSocket() error {
+	rawConn, conn, err := openPerInterfaceSocket(vi.cfg.Interface, vi.iface)
+	if err != nil {
+		return err
+	}
+	vi.conn = conn
+	vi.rawConn = rawConn
+
+	// Resolve our local IPv4 address for filtering self-sent packets.
+	addrs, _ := vi.iface.Addrs()
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ipNet.IP.To4() != nil {
+			vi.localIP = ipNet.IP.To4()
+			break
+		}
+	}
+	return nil
 }
 
 func (vi *vrrpInstance) key() string {
@@ -114,6 +142,9 @@ func (vi *vrrpInstance) run() {
 		"priority", vi.cfg.Priority,
 		"preempt", vi.cfg.Preempt)
 
+	// Start per-instance receiver goroutine.
+	go vi.receiver()
+
 	// Transition to Backup state.
 	vi.setState(StateBackup)
 	vi.emitEvent()
@@ -155,6 +186,63 @@ func (vi *vrrpInstance) run() {
 				vi.sendAdvert(vi.cfg.Priority)
 				advertTimer.Reset(vi.advertInterval())
 			}
+		}
+	}
+}
+
+// receiver reads VRRP packets from the per-instance raw socket.
+func (vi *vrrpInstance) receiver() {
+	buf := make([]byte, 1500)
+	for {
+		select {
+		case <-vi.stopCh:
+			return
+		default:
+		}
+
+		hdr, payload, _, err := vi.rawConn.ReadFrom(buf)
+		if err != nil {
+			select {
+			case <-vi.stopCh:
+				return
+			default:
+				slog.Debug("vrrp: read error", "key", vi.key(), "err", err)
+				continue
+			}
+		}
+
+		// Verify TTL == 255 (RFC 5798 §5.1.1.3).
+		if hdr.TTL != 255 {
+			continue
+		}
+
+		// Filter self-sent packets (RFC 5798 §6.4.2/6.4.3).
+		if vi.localIP != nil && hdr.Src.Equal(vi.localIP) {
+			continue
+		}
+
+		if len(payload) < vrrpHeaderLen {
+			continue
+		}
+
+		// Only accept packets matching our VRID.
+		if payload[1] != uint8(vi.cfg.GroupID) {
+			continue
+		}
+
+		srcIP := hdr.Src
+		dstIP := hdr.Dst
+
+		pkt, err := ParseVRRPPacket(payload, false, srcIP, dstIP)
+		if err != nil {
+			slog.Debug("vrrp: parse error", "key", vi.key(), "err", err)
+			continue
+		}
+
+		select {
+		case vi.rxCh <- pkt:
+		default:
+			// Drop if channel full.
 		}
 	}
 }
@@ -257,7 +345,7 @@ func (vi *vrrpInstance) sendAdvert(priority int) {
 			MaxAdvertInt: maxAdvert,
 			IPAddresses:  v4Addrs,
 		}
-		if err := vi.sendFn(vi.cfg.Interface, pkt, false); err != nil {
+		if err := vi.sendPacket(pkt, false); err != nil {
 			slog.Debug("vrrp: failed to send IPv4 advert",
 				"key", vi.key(), "err", err)
 		}
@@ -272,11 +360,52 @@ func (vi *vrrpInstance) sendAdvert(priority int) {
 			MaxAdvertInt: maxAdvert,
 			IPAddresses:  v6Addrs,
 		}
-		if err := vi.sendFn(vi.cfg.Interface, pkt, true); err != nil {
-			slog.Debug("vrrp: failed to send IPv6 advert",
-				"key", vi.key(), "err", err)
-		}
+		// IPv6 VRRP not yet implemented (would need ip6:112 socket).
+		_ = pkt
 	}
+}
+
+// sendPacket sends a VRRP advertisement via the per-instance raw socket.
+func (vi *vrrpInstance) sendPacket(pkt *VRRPPacket, isIPv6 bool) error {
+	if isIPv6 || vi.rawConn == nil {
+		return nil
+	}
+
+	srcIP := vi.localIP
+	if srcIP == nil {
+		return fmt.Errorf("no IPv4 address on %s", vi.cfg.Interface)
+	}
+
+	dstIP := net.IPv4(224, 0, 0, 18)
+
+	data, err := pkt.Marshal(false, srcIP, dstIP)
+	if err != nil {
+		return err
+	}
+
+	hdr := &ipv4.Header{
+		Version:  4,
+		Len:      20,
+		TotalLen: 20 + len(data),
+		TTL:      255,
+		Protocol: vrrpProto,
+		Src:      srcIP,
+		Dst:      dstIP,
+	}
+
+	if err := vi.rawConn.SetMulticastInterface(vi.iface); err != nil {
+		return fmt.Errorf("set multicast interface: %w", err)
+	}
+
+	cm := &ipv4.ControlMessage{
+		IfIndex: vi.iface.Index,
+	}
+
+	if err := vi.rawConn.WriteTo(hdr, data, cm); err != nil {
+		return fmt.Errorf("writeto: %w", err)
+	}
+
+	return nil
 }
 
 // addVIPs adds virtual IP addresses to the interface via netlink.
@@ -357,4 +486,9 @@ func (vi *vrrpInstance) sendGARP() {
 func (vi *vrrpInstance) stop() {
 	close(vi.stopCh)
 	<-vi.stopped
+
+	// Close per-instance socket.
+	if vi.conn != nil {
+		vi.conn.Close()
+	}
 }

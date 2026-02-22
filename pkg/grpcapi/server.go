@@ -3073,6 +3073,9 @@ func (s *Server) GetVRRPStatus(_ context.Context, _ *pb.GetVRRPStatusRequest) (*
 
 	if cfg != nil {
 		instances := vrrp.CollectInstances(cfg)
+		if s.cluster != nil {
+			instances = append(instances, vrrp.CollectRethInstances(cfg, s.cluster.LocalPriorities())...)
+		}
 		var runtimeStates map[string]string
 		if s.vrrpMgr != nil {
 			runtimeStates = s.vrrpMgr.States()
