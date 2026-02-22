@@ -190,19 +190,24 @@ func openPerInterfaceSocket(ifName string, iface *net.Interface) (*ipv4.RawConn,
 		return nil, nil, fmt.Errorf("listen ip4:112: %w", err)
 	}
 
-	// Get the underlying fd and bind to the interface.
-	rawFile, err := conn.(*net.IPConn).File()
+	// Bind to the interface via SyscallConn (avoids File() which sets
+	// blocking mode and removes the fd from Go's poller).
+	sc, err := conn.(*net.IPConn).SyscallConn()
 	if err != nil {
 		conn.Close()
-		return nil, nil, fmt.Errorf("get fd: %w", err)
+		return nil, nil, fmt.Errorf("syscall conn: %w", err)
 	}
-	fd := rawFile.Fd()
-	if err := unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, ifName); err != nil {
-		rawFile.Close()
+	var bindErr error
+	if err := sc.Control(func(fd uintptr) {
+		bindErr = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, ifName)
+	}); err != nil {
 		conn.Close()
-		return nil, nil, fmt.Errorf("SO_BINDTODEVICE %s: %w", ifName, err)
+		return nil, nil, fmt.Errorf("control: %w", err)
 	}
-	rawFile.Close()
+	if bindErr != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("SO_BINDTODEVICE %s: %w", ifName, bindErr)
+	}
 
 	rawConn, err := ipv4.NewRawConn(conn)
 	if err != nil {

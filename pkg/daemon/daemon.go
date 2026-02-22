@@ -185,6 +185,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		enableForwarding()
 	}
 
+	// Create VRRP manager eagerly — must exist before applyConfig runs.
+	d.vrrpMgr = vrrp.NewManager()
+	if err := d.vrrpMgr.Start(context.Background()); err != nil {
+		slog.Warn("failed to start VRRP manager", "err", err)
+	}
+
 	// Create dataplane backend (unless in config-only mode)
 	if !d.opts.NoDataplane {
 		dpType := ""
@@ -520,6 +526,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}()
 		}
 	}
+
+	// Start VRRP event watcher (manager was created earlier, before applyConfig).
+	go d.watchVRRPEvents(context.Background())
 
 	// Start HTTP API server if configured.
 	if d.opts.APIAddr != "" {
@@ -1106,23 +1115,8 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		localPri := d.cluster.LocalPriorities()
 		vrrpInstances = append(vrrpInstances, vrrp.CollectRethInstances(cfg, localPri)...)
 	}
-	if len(vrrpInstances) > 0 {
-		if d.vrrpMgr == nil {
-			d.vrrpMgr = vrrp.NewManager()
-			if err := d.vrrpMgr.Start(context.Background()); err != nil {
-				slog.Warn("failed to start VRRP manager", "err", err)
-			} else {
-				go d.watchVRRPEvents(context.Background())
-			}
-		}
-		if d.vrrpMgr != nil {
-			if err := d.vrrpMgr.UpdateInstances(vrrpInstances); err != nil {
-				slog.Warn("failed to update VRRP instances", "err", err)
-			}
-		}
-	} else if d.vrrpMgr != nil {
-		// No VRRP instances — clear all.
-		d.vrrpMgr.UpdateInstances(nil)
+	if err := d.vrrpMgr.UpdateInstances(vrrpInstances); err != nil {
+		slog.Warn("failed to update VRRP instances", "err", err)
 	}
 
 	// 9. Apply system DNS and NTP configuration
@@ -2956,9 +2950,6 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				vrrpTimer.Stop()
 			}
 			vrrpTimer = time.AfterFunc(2*time.Second, func() {
-				if d.vrrpMgr == nil {
-					return
-				}
 				if cfg := d.store.ActiveConfig(); cfg != nil {
 					localPri := d.cluster.LocalPriorities()
 					var all []*vrrp.Instance

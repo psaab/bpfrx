@@ -190,6 +190,14 @@ func (vi *vrrpInstance) run() {
 	}
 }
 
+// isTimeoutError returns true if the error is a network timeout.
+func isTimeoutError(err error) bool {
+	if ne, ok := err.(net.Error); ok {
+		return ne.Timeout()
+	}
+	return false
+}
+
 // receiver reads VRRP packets from the per-instance raw socket.
 func (vi *vrrpInstance) receiver() {
 	buf := make([]byte, 1500)
@@ -200,13 +208,21 @@ func (vi *vrrpInstance) receiver() {
 		default:
 		}
 
+		// Set a read deadline so ReadFrom doesn't block forever.
+		// ipv4.RawConn.ReadFrom uses RawRead which can get stuck in a
+		// blocking recvmsg syscall; the deadline ensures we periodically
+		// check stopCh even if the socket is unexpectedly in blocking mode.
+		vi.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 		hdr, payload, _, err := vi.rawConn.ReadFrom(buf)
 		if err != nil {
 			select {
 			case <-vi.stopCh:
 				return
 			default:
-				slog.Debug("vrrp: read error", "key", vi.key(), "err", err)
+				// Ignore timeout errors — they're expected from our deadline.
+				if !isTimeoutError(err) {
+					slog.Debug("vrrp: read error", "key", vi.key(), "err", err)
+				}
 				continue
 			}
 		}
@@ -373,7 +389,19 @@ func (vi *vrrpInstance) sendPacket(pkt *VRRPPacket, isIPv6 bool) error {
 
 	srcIP := vi.localIP
 	if srcIP == nil {
-		return fmt.Errorf("no IPv4 address on %s", vi.cfg.Interface)
+		// Lazy resolve: interface may not have had an address at socket open time.
+		if addrs, err := vi.iface.Addrs(); err == nil {
+			for _, a := range addrs {
+				if ipNet, ok := a.(*net.IPNet); ok && ipNet.IP.To4() != nil {
+					vi.localIP = ipNet.IP.To4()
+					srcIP = vi.localIP
+					break
+				}
+			}
+		}
+		if srcIP == nil {
+			return fmt.Errorf("no IPv4 address on %s", vi.cfg.Interface)
+		}
 	}
 
 	dstIP := net.IPv4(224, 0, 0, 18)
@@ -485,10 +513,13 @@ func (vi *vrrpInstance) sendGARP() {
 // stop signals the instance goroutine to stop and waits for it to finish.
 func (vi *vrrpInstance) stop() {
 	close(vi.stopCh)
-	<-vi.stopped
 
-	// Close per-instance socket.
+	// Close the socket FIRST to unblock any blocking recvmsg in receiver().
+	// FD.Close waits for active RawRead to release the read lock, and
+	// our read deadline (1s) ensures the read returns promptly.
 	if vi.conn != nil {
 		vi.conn.Close()
 	}
+
+	<-vi.stopped
 }
