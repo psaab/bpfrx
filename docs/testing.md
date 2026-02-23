@@ -507,10 +507,76 @@ printf 'configure\ndelete routing-options static route 10.77.77.0/24\ndelete rou
   sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
 ```
 
-### LAN RETH Connectivity
+### LAN RETH Connectivity (IPv4 + IPv6)
 ```bash
+# IPv4
 sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'
 # Expected: 3/3, <1ms RTT
+
+# IPv6 (requires radvd + DHCPv6 running on primary)
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 2001:559:8585:cf01::1'
+# Expected: 3/3, <1ms RTT
+
+# Verify container got IPv6 via SLAAC/DHCPv6
+sg incus-admin -c 'incus exec cluster-lan-host -- ip -6 addr show eth0'
+# Expected: global address in 2001:559:8585:cf01::/64
+```
+
+### Hitless Forwarding Through Restart (IPv4 + IPv6)
+
+Tests that transit traffic (SNAT'd through firewall) survives daemon restart with
+minimal disruption. This validates the `META_FLAG_KERNEL_ROUTE` BPF fallback path.
+
+**Background:** After restart, FIB cache in session entries is stale. `bpf_fib_lookup`
+returns LOCAL/NOT_FWDED until FRR reconverges. The BPF fix (`b0e7e33`) detects existing
+sessions with failed FIB and routes them through conntrack → NAT → kernel forwarding
+instead of dropping them or sending un-NAT'd packets to the kernel.
+
+```bash
+# IPv4: ping through SNAT from LAN to external host
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 30 -i 0.5 172.16.100.247' &
+
+# After 5 seconds, restart primary
+sleep 5
+sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl restart bpfrxd'
+
+# Wait for completion — expect 28-29/30 received (1-2 lost, ~1s disruption)
+
+# IPv6: ping gateway through restart
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 30 -i 0.5 2001:559:8585:cf01::1' &
+sleep 5
+sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl restart bpfrxd'
+# Same expectation: 1-2 packets lost during ARP/NDP warmup
+```
+
+**Why only 1-2 packets lost:**
+1. BPF programs are pinned — they keep processing packets during restart
+2. Existing sessions in pinned maps are preserved
+3. META_FLAG_KERNEL_ROUTE lets stale-FIB packets use kernel routing
+4. ARP/NDP warmup on VRRP MASTER transition resolves neighbors in ~50ms
+5. FRR reconverges routes in ~1-2s, then XDP direct forwarding resumes
+
+**Full failover test (stop primary, secondary takes over):**
+```bash
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 60 -i 0.5 10.0.60.1' &
+sleep 5
+sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
+# Expected: 3-5 packets lost during VRRP Master-down timer (~3.5s)
+sleep 15
+sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
+# Expected: 3-5 more packets lost during preemption back
+```
+
+### ConfigDB Bootstrap After Config Changes
+
+The daemon loads from `.configdb/active.json`, NOT from the text `.conf` file.
+If you modify `ha-cluster.conf` and redeploy, the daemon ignores the new text
+because the DB already exists. Force re-bootstrap:
+
+```bash
+sg incus-admin -c 'incus exec bpfrx-fw0 -- rm /etc/bpfrx/.configdb/active.json'
+sg incus-admin -c 'incus exec bpfrx-fw1 -- rm /etc/bpfrx/.configdb/active.json'
+sg incus-admin -c 'make cluster-deploy'
 ```
 
 ### Full Cluster Validation Sequence
@@ -518,12 +584,20 @@ Run after any VRRP/cluster/config-sync changes:
 ```bash
 sg incus-admin -c 'make cluster-deploy' && sleep 10
 printf 'show chassis cluster status\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
-ping -c 3 172.16.50.6 && ping -c 3 2001:559:8585:50::6
+
+# IPv4 VIPs
+ping -c 3 172.16.50.6
 sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'
+
+# IPv6 VIPs
+ping -c 3 2001:559:8585:50::6
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 2001:559:8585:cf01::1'
+
+# Failover + recovery
 sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
-sleep 5 && ping -c 3 172.16.50.6
+sleep 5 && ping -c 3 172.16.50.6 && ping -c 3 2001:559:8585:50::6
 sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
-sleep 5 && ping -c 3 172.16.50.6
+sleep 5 && ping -c 3 172.16.50.6 && ping -c 3 2001:559:8585:50::6
 ```
 
 ---

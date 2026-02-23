@@ -164,10 +164,10 @@ Where X = 0 for node 0 (`ge-0-0-0`, `ge-0-0-1`) and X = 7 for node 1 (`ge-7-0-0`
 
 ### RETH Bonds
 
-| RETH | Node 0 Member | Node 1 Member | VIP | Zone | Purpose |
-|------|--------------|--------------|-----|------|---------|
-| reth0 | ge-0/0/1 | ge-7/0/1 | 172.16.50.6/24 (VLAN 50) | wan | WAN uplink |
-| reth1 | ge-0/0/0 | ge-7/0/0 | 10.0.60.1/24 | lan | LAN |
+| RETH | Node 0 Member | Node 1 Member | IPv4 VIP | IPv6 VIP | Zone | Purpose |
+|------|--------------|--------------|----------|----------|------|---------|
+| reth0 | ge-0/0/1 | ge-7/0/1 | 172.16.50.6/24 (VLAN 50) | 2001:559:8585:50::6/64 | wan | WAN uplink |
+| reth1 | ge-0/0/0 | ge-7/0/0 | 10.0.60.1/24 | 2001:559:8585:cf01::1/64 | lan | LAN |
 
 ## IP Addressing
 
@@ -180,16 +180,16 @@ Where X = 0 for node 0 (`ge-0-0-0`, `ge-0-0-1`) and X = 7 for node 1 (`ge-7-0-0`
 
 ### RETH VIPs (float to primary)
 
-| RETH | VIP | Gateway for |
-|------|-----|-------------|
-| reth0 | 172.16.50.6/24 | WAN uplink |
-| reth1 | 10.0.60.1/24 | cluster-lan-host |
+| RETH | IPv4 VIP | IPv6 VIP | Gateway for |
+|------|----------|----------|-------------|
+| reth0 | 172.16.50.6/24 | 2001:559:8585:50::6/64 | WAN uplink |
+| reth1 | 10.0.60.1/24 | 2001:559:8585:cf01::1/64 | cluster-lan-host |
 
 ### Test Container
 
-| Interface | Network | Address | Gateway |
-|-----------|---------|---------|---------|
-| eth0 | bpfrx-clan | 10.0.60.102/24 | 10.0.60.1 (reth1) |
+| Interface | Network | IPv4 Address | IPv6 | Gateway |
+|-----------|---------|-------------|------|---------|
+| eth0 | bpfrx-clan | 10.0.60.102/24 | SLAAC + DHCPv6 | 10.0.60.1 / fe80::... (RA) |
 
 ## Cluster Configuration
 
@@ -259,12 +259,12 @@ chassis {
 
 ### Security Zones
 
-| Zone | Interfaces | Allowed Services |
-|------|-----------|-----------------|
-| mgmt | fxp0 | ssh, ping, dhcp |
-| control | fxp1, fab0 | ping |
-| wan | reth0 | ping |
-| lan | reth1 | ssh, ping, dhcp |
+| Zone | Interfaces | Allowed Services | Allowed Protocols |
+|------|-----------|-----------------|------------------|
+| mgmt | fxp0 | ssh, ping, dhcp | — |
+| control | fxp1, fab0 | ping | — |
+| wan | reth0 | ping | — |
+| lan | reth1 | ssh, ping, dhcp, dhcpv6 | router-discovery |
 
 ### Policies
 
@@ -299,9 +299,29 @@ security {
 routing-options {
     static {
         route 0.0.0.0/0 { next-hop 172.16.50.1; }
+        route ::/0 { next-hop 2001:559:8585:50::1; }
     }
 }
 ```
+
+### Router Advertisements (reth1)
+
+```
+protocols {
+    router-advertisement {
+        interface reth1 {
+            managed-configuration;
+            other-stateful-configuration;
+            prefix 2001:559:8585:cf01::/64 { on-link; autonomous; }
+            dns-server-address 2001:4860:4860::8888;
+        }
+    }
+}
+```
+
+Flags: M (managed) tells clients to use DHCPv6 for address, O (other) for DNS/domain,
+A (autonomous) allows SLAAC as well. radvd resolves RETH names to physical member
+interfaces via `ResolveReth()` + `LinuxIfName()`.
 
 ### DHCP Server (on reth1)
 
@@ -316,6 +336,25 @@ system {
                     address-range low 10.0.60.100 high 10.0.60.199;
                     router 10.0.60.1;
                     dns-server 8.8.8.8;
+                }
+            }
+        }
+    }
+}
+```
+
+### DHCPv6 Server (on reth1)
+
+```
+system {
+    services {
+        dhcpv6-local-server {
+            group lan6-pool {
+                interface reth1;
+                pool lan6-range {
+                    subnet 2001:559:8585:cf01::/64;
+                    address-range low 2001:559:8585:cf01::100 high 2001:559:8585:cf01::1ff;
+                    dns-server 2001:4860:4860::8888;
                 }
             }
         }
@@ -386,22 +425,27 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw0 -- cli
 - Heartbeat state: "up"
 - Both RETH interfaces active on fw0
 
-### TC-2: LAN Connectivity Through Cluster
+### TC-2: LAN Connectivity Through Cluster (IPv4 + IPv6)
 
 **Objective:** Verify traffic flows from LAN container through the primary firewall to WAN.
 
 ```bash
-# From cluster-lan-host:
+# IPv4 from cluster-lan-host:
 incus exec cluster-lan-host -- ping -c 5 172.16.50.1   # WAN gateway (via reth0)
 incus exec cluster-lan-host -- ping -c 5 8.8.8.8       # Internet (SNAT via reth0)
 incus exec cluster-lan-host -- ping -c 5 10.0.60.1     # reth1 VIP
 
-# Verify session on primary:
+# IPv6 from cluster-lan-host:
+incus exec cluster-lan-host -- ping -c 5 2001:559:8585:cf01::1  # reth1 IPv6 VIP
+incus exec cluster-lan-host -- ping -c 5 2001:559:8585:50::6    # reth0 IPv6 VIP (WAN)
+
+# Verify sessions on primary:
 printf 'show security flow session\nexit\n' | incus exec bpfrx-fw0 -- cli
 ```
 
 **Pass criteria:**
-- All pings succeed
+- All IPv4 pings succeed
+- IPv6 gateway ping (reth1) succeeds
 - Sessions visible on fw0 (primary)
 - SNAT applied for WAN-bound traffic
 
@@ -551,6 +595,91 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
 - Higher-priority node retains primary
 - Lower-priority node enters secondary-hold or lost state
 
+### TC-11: IPv6 Router Advertisements and DHCPv6
+
+**Objective:** Verify LAN hosts receive IPv6 configuration via SLAAC and DHCPv6.
+
+```bash
+# Verify radvd is running on primary with correct interface name
+incus exec bpfrx-fw0 -- systemctl status radvd
+incus exec bpfrx-fw0 -- cat /etc/radvd.conf
+# Expected: interface name is physical member (ge-0-0-0), NOT "reth1"
+
+# Verify kea-dhcp6 is running on primary
+incus exec bpfrx-fw0 -- systemctl status kea-dhcp6-server
+
+# Verify cluster-lan-host got IPv6 via SLAAC/DHCPv6
+incus exec cluster-lan-host -- ip -6 addr show eth0
+# Expected: global address in 2001:559:8585:cf01::/64
+
+# Verify RA from cluster-lan-host (needs ndisc6 package)
+incus exec cluster-lan-host -- rdisc6 eth0
+# Expected: Router Advertisement from fe80::... with prefix 2001:559:8585:cf01::/64
+
+# Ping IPv6 gateway
+incus exec cluster-lan-host -- ping -c 3 2001:559:8585:cf01::1
+```
+
+**Pass criteria:**
+- radvd running with physical interface name (not reth1)
+- kea-dhcp6-server running
+- cluster-lan-host has global IPv6 address
+- IPv6 gateway reachable
+
+### TC-12: Hitless Forwarding Failover (IPv4 + IPv6)
+
+**Objective:** Verify transit traffic survives primary restart with minimal disruption.
+
+This tests the `META_FLAG_KERNEL_ROUTE` BPF fallback path: when
+`bpf_fib_lookup` returns LOCAL/NOT_FWDED for packets matching existing sessions
+(stale FIB cache after restart), the packet routes through conntrack for NAT
+reversal and then XDP_PASSes for kernel routing.
+
+```bash
+# IPv4 forwarding test through SNAT:
+# 1. Start a long ping from LAN to an external host
+incus exec cluster-lan-host -- ping -c 30 -i 0.5 172.16.100.247 &
+
+# 2. After ~5 seconds, restart the primary
+sleep 5
+incus exec bpfrx-fw0 -- systemctl restart bpfrxd
+
+# 3. Wait for ping to complete, check results
+# Expected: 28-29/30 received (1-2 packets lost during restart, ~1s disruption)
+
+# IPv6 forwarding test:
+incus exec cluster-lan-host -- ping -c 30 -i 0.5 2001:559:8585:cf01::1 &
+sleep 5
+incus exec bpfrx-fw0 -- systemctl restart bpfrxd
+# Expected: similar 1-2 packet loss
+
+# Full failover test (stop primary, secondary takes over):
+incus exec cluster-lan-host -- ping -c 60 -i 0.5 10.0.60.1 &
+sleep 5
+incus exec bpfrx-fw0 -- systemctl stop bpfrxd
+# Expected: 3-5 packets lost during VRRP failover (~3.5s)
+sleep 15
+incus exec bpfrx-fw0 -- systemctl start bpfrxd
+# Expected: 3-5 more packets lost during preemption back
+```
+
+**Pass criteria:**
+- Hitless restart (systemctl restart): <= 2 packets lost
+- Full failover (stop primary): <= 5 packets lost
+- Traffic auto-recovers after all transitions
+- No permanent traffic blackhole
+
+**How it works:**
+1. BPF programs pinned at `/sys/fs/bpf/bpfrx/` survive daemon restart
+2. Existing sessions preserved in pinned conntrack maps
+3. After restart, FIB cache in session entries is stale (`fib_gen` mismatch)
+4. `bpf_fib_lookup` may return LOCAL/NOT_FWDED (routes not yet in kernel)
+5. `xdp_zone` detects existing session + failed FIB → sets `META_FLAG_KERNEL_ROUTE`
+6. `xdp_conntrack` processes session normally (NAT reversal via meta fields)
+7. `xdp_forward` sees `META_FLAG_KERNEL_ROUTE` → `XDP_PASS` for kernel routing
+8. Kernel forwards the NAT'd packet via its own routing table
+9. Once FRR converges (~1-2s), fresh FIB lookups succeed and XDP resumes direct forwarding
+
 ## Performance Expectations
 
 | Metric | Expected | Notes |
@@ -564,6 +693,43 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
 | IPv6 VIP recovery | < 1 second | Unsolicited NA + NODAD flag |
 
 ## Known Issues & Fixes (Post-Implementation)
+
+### ConfigDB Bootstrap Caveat
+
+The daemon stores compiled config in `.configdb/active.json`. On startup it loads
+from this DB, NOT from the text `.conf` file. The text config is only read when the
+DB is empty (first boot or after deletion).
+
+**If you change `ha-cluster.conf` and redeploy**, the daemon will ignore the new
+text file because `active.json` already exists. To force re-bootstrap:
+
+```bash
+incus exec bpfrx-fw0 -- rm /etc/bpfrx/.configdb/active.json
+incus exec bpfrx-fw1 -- rm /etc/bpfrx/.configdb/active.json
+make cluster-deploy  # re-push config + restart
+```
+
+Alternatively, use `load override` via CLI to load the new config interactively.
+
+### BPF FIB LOCAL/NOT_FWDED Fix (`b0e7e33`)
+
+**Problem:** After daemon restart or VRRP failover, existing sessions had stale FIB
+cache entries. `bpf_fib_lookup` returned LOCAL or NOT_FWDED because FRR routes hadn't
+converged yet. These packets fell into the host-inbound path in `xdp_forward` and
+were either dropped (by host-inbound policy) or delivered to the kernel stack without
+NAT reversal, causing RSTs.
+
+**Fix:** Three-part change:
+1. `bpfrx_common.h`: Added `META_FLAG_KERNEL_ROUTE` (1 << 2)
+2. `xdp_zone.c`: In the FIB failure else-branch, check if packet matches an existing
+   session (sv4/sv6 != NULL). If so, set `META_FLAG_KERNEL_ROUTE` and tail-call to
+   conntrack for normal session processing and NAT reversal.
+3. `xdp_forward.c`: When `fwd_ifindex == 0` and `META_FLAG_KERNEL_ROUTE` is set,
+   bypass host-inbound policy and `XDP_PASS` for kernel routing. This is transit
+   traffic that needs kernel forwarding, not host-bound traffic.
+
+**Result:** Hitless restart loses only 1-2 packets (ARP/NDP warmup delay) instead of
+permanent traffic blackhole for all existing sessions.
 
 ### VRRP Implementation History
 1. **Deadlock (`58ad85b`):** Manager write lock held during `stop()` which waited for blocking `recvmsg`. Fix: `SyscallConn().Control()`, `SetReadDeadline(1s)`, close-before-wait
