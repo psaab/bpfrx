@@ -557,9 +557,22 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
 |--------|----------|-------|
 | WAN throughput (per VF) | ~6-8 Gbps | iavf generic XDP, single direction |
 | LAN throughput (virtio) | ~12-15 Gbps | virtio_net native XDP |
-| Failover time | < 5 seconds | 3 missed heartbeats @ 1s interval |
+| Failover time | ~3.5 seconds | Master-down timer (3×advert + skew) |
 | Session sync latency | < 2 seconds | Ring buffer real-time + 1s sweep |
 | Config sync latency | < 1 second | TCP immediate push on commit |
+| IPv4 VIP recovery | < 1 second | Dual GARP + gateway ARP probe |
+| IPv6 VIP recovery | < 1 second | Unsolicited NA + NODAD flag |
+
+## Known Issues & Fixes (Post-Implementation)
+
+### VRRP Implementation History
+1. **Deadlock (`58ad85b`):** Manager write lock held during `stop()` which waited for blocking `recvmsg`. Fix: `SyscallConn().Control()`, `SetReadDeadline(1s)`, close-before-wait
+2. **VLAN split-brain (`e018918`):** XDP strips VLAN tags; VRRP bypass didn't restore. Fix: push tag back, use AF_PACKET for VLAN sub-interfaces
+3. **Per-interface sockets (`70b107c`):** Shared socket missed VLAN multicast. Fix: per-instance `SO_BINDTODEVICE` + self-sent filtering
+4. **AF_PACKET for all (`d951626`):** Raw IP unreliable with generic XDP. Fix: AF_PACKET receiver for ALL instances; skip RETH VIP reconciliation
+5. **Upstream GARP (`7bcaee9`):** Some routers ignore gratuitous ARP Reply. Fix: dual ARP format + gateway probe
+6. **IPv6 VIP (`d03b29e`):** DAD failure + missing FRR interface + RETH name. Fix: NODAD flag + inline key extraction + RethMap translation
+7. **Config sync (`64bc9d5`):** `${node}` unquoted in Format + no reverse-sync. Fix: `QuotedKeyPath()` + `OnPeerConnected` with startup guard
 
 ## SR-IOV Notes
 

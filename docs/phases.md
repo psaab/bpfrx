@@ -277,3 +277,26 @@
 - `GetNATRuleStats`: `nat_type` field for source vs destination NAT
 - New `SystemAction` actions: `clear-firewall-counters`, `clear-persistent-nat`, `clear-policy-counters`
 - New `ShowText` topics: `flow-statistics`, `firewall` (with counters), `buffers`
+
+## Sprint VRRP-NATIVE: Native Go VRRPv3
+Replaced keepalived with native Go VRRPv3 implementation (RFC 5798).
+
+- **Core implementation (`8e964ec`):** `pkg/vrrp/{packet,instance,manager}.go` — VRRPv3 packet codec, per-group state machine goroutines, Manager lifecycle with `UpdateInstances()` diff/reconcile
+- **Per-interface sockets (`70b107c`):** Each instance opens `ip4:112` + `SO_BINDTODEVICE`; self-sent packet filtering by localIP; RETH status in CLI via `CollectRethInstances()`
+- **Deadlock fix (`58ad85b`):** `SyscallConn().Control()` for SO_BINDTODEVICE, `SetReadDeadline(1s)`, close socket before waiting for goroutine
+- **VLAN split-brain fix (`e018918`):** XDP pushes VLAN tag back before XDP_PASS; AF_PACKET receiver for VLAN sub-interfaces
+- **AF_PACKET for all (`d951626`):** Raw IP sockets unreliable with generic XDP; ALL instances use AF_PACKET for receiving; skip RETH VIP reconciliation
+- **Failover GARP fix (`7bcaee9`):** Dual ARP format (Request+Reply); subnet gateway ARP probe after VIP add
+- **IPv6 VIP fix (`d03b29e`):** `IFA_F_NODAD` for IPv6 VIPs; inline `interface` keyword extraction in compiler; RETH→physical name translation in FRR via `RethMap` + `LinuxIfName()`
+
+### Key Architecture Decisions
+- No external dependency (keepalived removed from cluster VMs)
+- AF_PACKET (SOCK_RAW + ETH_P_ALL + PACKET_MR_PROMISC + BPF filter) for receiving on ALL interfaces
+- Raw IP socket for sending only (multicast group join + TTL=255)
+- Bondless RETH: VRRP runs directly on physical member interfaces via `RethToPhysical()` resolution
+- VRID=100+rgID; priority 200(primary)/100(secondary); preempt enabled
+
+## Sprint HA-CONFIG: Single-Config Cluster + Config Sync Fixes
+- **Single shared config (`HA-CONFIG sprint`):** `${node}` variable expansion in apply-groups, `CompileConfigForNode(tree, nodeID)`, node ID from `/etc/bpfrx/node-id`
+- **Config sync fix (`64bc9d5`):** `QuotedKeyPath()` re-quotes `${node}` in Format output; `OnPeerConnected` callback for reverse-sync on reconnect with 30s startup guard
+- **Reverse-sync:** Stable node (>30s) pushes config unconditionally to returning peer; fresh node (<30s) skips to avoid overwriting newer config

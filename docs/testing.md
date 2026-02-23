@@ -422,6 +422,112 @@ cpumap is only useful when a single CPU is genuinely saturated (40G/100G NICs).
 
 ---
 
+## Chassis Cluster HA Testing
+
+### Prerequisites
+```bash
+# Cluster environment must be set up:
+make cluster-init    # one-time: networks + profile
+make cluster-create  # launch bpfrx-fw0, bpfrx-fw1, cluster-lan-host
+make cluster-deploy  # build + push to both VMs
+```
+
+### VRRP State Verification
+```bash
+# Both nodes should agree: fw0=MASTER, fw1=BACKUP for all groups
+printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw1 -- cli' 2>/dev/null
+
+# Verify VIPs only on primary (fw0)
+sg incus-admin -c 'incus exec bpfrx-fw0 -- ip addr show ge-0-0-1.50' | grep '172.16.50.6'
+sg incus-admin -c 'incus exec bpfrx-fw1 -- ip addr show ge-7-0-1.50' | grep '172.16.50.6'
+# Expected: VIP only on fw0
+```
+
+### IPv6 VIP Reachability (`d03b29e`)
+```bash
+# Both VIPs must be reachable from host
+ping -c 3 172.16.50.6           # IPv4 WAN VIP
+ping -c 3 2001:559:8585:50::6   # IPv6 WAN VIP
+
+# Verify no DAD issues
+sg incus-admin -c 'incus exec bpfrx-fw0 -- ip -6 addr show ge-0-0-1.50' | grep 2001:559:8585:50::6
+# Expected: "nodad" flag, NOT "dadfailed tentative"
+
+# Verify FRR IPv6 route on correct sub-interface
+sg incus-admin -c 'incus exec bpfrx-fw0 -- grep "ipv6 route" /etc/frr/frr.conf'
+# Expected: "ipv6 route ::/0 fe80::50 ge-0-0-1.50 5"
+sg incus-admin -c 'incus exec bpfrx-fw0 -- ip -6 route show default'
+# Expected: "via fe80::50 dev ge-0-0-1.50" (NOT dev ge-0-0-1)
+```
+
+### Failover + Preemption Test
+```bash
+# Start continuous ping to VIP
+ping 172.16.50.6 &
+
+# Stop fw0 → fw1 should become MASTER within ~3.5s
+sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
+# Expected: 3-4 lost pings, then recovery
+
+# Verify fw1 is MASTER
+sleep 5
+printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw1 -- cli' 2>/dev/null
+
+# Restart fw0 → preemption reclaims primary
+sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
+sleep 5
+printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+# Expected: fw0=MASTER again
+```
+
+### Config Sync Test (`64bc9d5`)
+```bash
+# Forward: commit on primary → secondary receives
+printf 'configure\nset routing-options static route 10.77.77.0/24 discard\ncommit\nexit\nexit\n' | \
+  sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+sleep 3
+printf 'show configuration routing-options | match 77\nexit\n' | \
+  sg incus-admin -c 'incus exec bpfrx-fw1 -- cli' 2>/dev/null
+# Expected: "route 10.77.77.0/24 discard;"
+
+# Reverse: returning primary gets config from current primary
+sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
+sleep 2
+printf 'configure\nset routing-options static route 10.88.88.0/24 discard\ncommit\nexit\nexit\n' | \
+  sg incus-admin -c 'incus exec bpfrx-fw1 -- cli' 2>/dev/null
+sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
+sleep 10
+printf 'show configuration routing-options | match 88\nexit\n' | \
+  sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+# Expected: "route 10.88.88.0/24 discard;" (synced from fw1)
+
+# Cleanup
+printf 'configure\ndelete routing-options static route 10.77.77.0/24\ndelete routing-options static route 10.88.88.0/24\ncommit\nexit\nexit\n' | \
+  sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+```
+
+### LAN RETH Connectivity
+```bash
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'
+# Expected: 3/3, <1ms RTT
+```
+
+### Full Cluster Validation Sequence
+Run after any VRRP/cluster/config-sync changes:
+```bash
+sg incus-admin -c 'make cluster-deploy' && sleep 10
+printf 'show chassis cluster status\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+ping -c 3 172.16.50.6 && ping -c 3 2001:559:8585:50::6
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'
+sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
+sleep 5 && ping -c 3 172.16.50.6
+sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
+sleep 5 && ping -c 3 172.16.50.6
+```
+
+---
+
 ## Known Unimplemented BPF Features
 
 These config fields are parsed and compiled to BPF maps but NOT checked in BPF programs:

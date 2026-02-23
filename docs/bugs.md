@@ -232,6 +232,47 @@ VF appears as enp10s0 inside VM.
 - **Files:** `pkg/cli/cli.go`, `pkg/grpcapi/server.go`
 - **Commit:** `093016f`
 
+## Sprint VRRP-NATIVE Bugs
+
+### VRRP manager deadlock on cluster secondary node (`58ad85b`)
+- **Symptom:** `show security vrrp` hangs indefinitely on fw1 (cluster secondary)
+- **Root cause:** `File()` puts socket in blocking mode, `stop()` calls `conn.Close()` after `<-vi.stopped`, `UpdateInstances()` holds write lock during `stop()`
+- **Fix:** `SyscallConn().Control()` for SO_BINDTODEVICE, `SetReadDeadline(1s)` in receiver, close socket BEFORE waiting for goroutine exit
+
+### VRRP shared socket misses multicast on VLAN sub-interfaces (`70b107c`)
+- **Symptom:** Both cluster nodes became MASTER for VRID 101 (WAN VLAN)
+- **Root cause:** Shared `ip4:112` raw socket doesn't receive VRRP multicast on VLAN sub-interfaces
+- **Fix:** Per-instance sockets with `SO_BINDTODEVICE` + per-interface `JoinGroup(224.0.0.18)`
+
+### VRRP self-sent packets not filtered (`70b107c`)
+- RFC 5798 §6.4.2/6.4.3 requires filtering advertisements from own source IP
+- **Fix:** `localIP` field resolved from interface addresses; receiver skips `hdr.Src.Equal(vi.localIP)`
+
+### VRRP split-brain on VLAN sub-interfaces (`e018918`)
+- **Symptom:** Both nodes MASTER for VRID 101 on ge-*-0-1.50
+- **Root cause:** XDP strips VLAN tags; VRRP bypass XDP_PASS'd without restoring tag; raw IP sockets don't receive multicast on VLAN sub-interfaces
+- **Fix:** Push VLAN tag back via `xdp_vlan_tag_push()` before XDP_PASS; VLAN sub-interfaces use AF_PACKET for receiving
+
+### VRRP failover failure on non-VLAN interfaces (`d951626`)
+- **Symptom:** fw1 didn't serve traffic for ~28s after fw0 reboot; LAN RETH stuck in split-brain
+- **Root cause:** Raw IP sockets unreliable with generic XDP; `reconcileInterfaceAddresses()` added RETH VIPs to BACKUP
+- **Fix:** AF_PACKET for ALL interfaces; skip address reconciliation for RETH (RedundancyGroup > 0); `removeVIPs()` in INIT→BACKUP
+
+### VRRP failover: upstream router ignores gratuitous ARP (`7bcaee9`)
+- **Symptom:** External pings fail ~30s after failover despite GARP sent
+- **Root cause:** Some routers ignore gratuitous ARP Reply (opcode 2)
+- **Fix:** Send GARP as both Request+Reply; ARP probe to subnet gateway (.1 address) after VIP add
+
+### IPv6 VIP unreachable: DAD + missing interface + RETH name (`d03b29e`)
+- **Symptom:** `ping 2001:559:8585:50::6` returns "Address unreachable"
+- **Root cause:** Three bugs — DAD failure on IPv6 VIP; `compileStaticRoutes()` missed inline `interface` keyword; FRR got `reth0.50` instead of `ge-0-0-1.50`
+- **Fix:** `IFA_F_NODAD` for IPv6 VIPs; inline keys scan in compiler; `RethMap` + `LinuxIfName()` in FRR route generation
+
+### Cluster config sync: ${node} parse error + no reverse-sync (`64bc9d5`)
+- **Symptom:** Config changes never synced to secondary; `"unexpected character: $"` in fw1 logs
+- **Root cause:** `Format()` output unquoted `${node}` (parser strips quotes, `KeyPath()` doesn't re-quote); no mechanism for returning primary to get config from current primary
+- **Fix:** `QuotedKeyPath()` re-quotes keys with special chars; `OnPeerConnected` callback with 30s startup guard — stable node pushes config, fresh node skips
+
 ## BPF Flow Config Gotchas
 
 ### allow-dns-reply requires BPF check
