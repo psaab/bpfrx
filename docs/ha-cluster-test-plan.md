@@ -714,6 +714,21 @@ incus exec bpfrx-fw0 -- systemctl start bpfrxd
 - No permanent traffic blackhole or cwnd collapse
 - Traffic auto-recovers after all transitions
 
+**Verified results (2026-02-23):**
+
+| Test | Steady | Failover dip | Recovery | Preemption dip | Result |
+|------|--------|-------------|----------|----------------|--------|
+| IPv4 SNAT iperf3 | 4.75 Gbps | ~4.2 Gbps (~2s) | 4.65 Gbps | ~4.1 Gbps (~2s) | PASS |
+| IPv6 routed iperf3 | 4.80 Gbps | 0 Gbps (~6s) | 4.80 Gbps | seamless | PASS |
+
+- **IPv4 SNAT:** Connection survived both failover and preemption with no cwnd collapse.
+  cwnd briefly dipped to ~5.6 KB during the exact transition moment then immediately
+  recovered. Throughput never dropped below 3.6 Gbps. Session sync + dnat_table
+  replication ensured hitless SNAT continuation on the new primary.
+- **IPv6 routed:** Connection survived with ~6s disruption during failover (longer than
+  IPv4 because IPv6 has no dnat_table pre-population — relies entirely on session sync +
+  VRRP MASTER transition + neighbor discovery). Preemption back to fw0 was seamless.
+
 **How it works:**
 1. BPF programs pinned at `/sys/fs/bpf/bpfrx/` survive daemon restart
 2. Existing sessions preserved in pinned conntrack maps
@@ -729,15 +744,19 @@ incus exec bpfrx-fw0 -- systemctl start bpfrxd
 
 ## Performance Expectations
 
-| Metric | Expected | Notes |
-|--------|----------|-------|
-| WAN throughput (per VF) | ~6-8 Gbps | iavf generic XDP, single direction |
-| LAN throughput (virtio) | ~12-15 Gbps | virtio_net native XDP |
-| Failover time | ~3.5 seconds | Master-down timer (3×advert + skew) |
-| Session sync latency | < 2 seconds | Ring buffer real-time + 1s sweep |
-| Config sync latency | < 1 second | TCP immediate push on commit |
-| IPv4 VIP recovery | < 1 second | Dual GARP + gateway ARP probe |
-| IPv6 VIP recovery | < 1 second | Unsolicited NA + NODAD flag |
+| Metric | Expected | Verified | Notes |
+|--------|----------|----------|-------|
+| WAN throughput (per VF) | ~6-8 Gbps | — | iavf generic XDP, single direction |
+| LAN throughput (virtio) | ~12-15 Gbps | — | virtio_net native XDP |
+| HA throughput (IPv4 SNAT) | ~4-5 Gbps | 4.75 Gbps | LAN→WAN through SNAT |
+| HA throughput (IPv6 routed) | ~4-5 Gbps | 4.80 Gbps | LAN→WAN, no NAT |
+| IPv4 failover disruption | < 5 seconds | ~2 seconds | cwnd dip, no collapse |
+| IPv6 failover disruption | < 10 seconds | ~6 seconds | session sync + ND |
+| Failover time | ~3.5 seconds | ~3-4 seconds | Master-down timer (3×advert + skew) |
+| Session sync latency | < 2 seconds | < 1 second | Ring buffer real-time + 1s sweep |
+| Config sync latency | < 1 second | — | TCP immediate push on commit |
+| IPv4 VIP recovery | < 1 second | — | Dual GARP + gateway ARP probe |
+| IPv6 VIP recovery | < 1 second | — | Unsolicited NA + NODAD flag |
 
 ## Known Issues & Fixes (Post-Implementation)
 
@@ -806,9 +825,11 @@ resolves ARP/NDP inline (queues packet, sends ARP/NS, forwards on reply).
 - MASTER transition → `applyRethServices()` starts radvd + Kea
 - BACKUP transition → `clearRethServices()` stops radvd + Kea
 
-**Caveat:** After initial deployment or failover, stale RA routes on LAN hosts
-persist until the RA lifetime expires (default 1800s / 30 min). A future
-improvement could send a goodbye RA (lifetime=0) on BACKUP transition.
+**Goodbye RA (`2d9ba6a`):** On BACKUP transition, `clearRethServices()` calls
+`radvd.Withdraw()` which rewrites radvd.conf with `AdvDefaultLifetime 0`, reloads
+(triggers an immediate RA with lifetime=0), waits 500ms, then stops radvd. This
+tells LAN hosts to immediately remove the departing router as a default gateway,
+preventing stale RA routes from persisting for up to 1800s.
 
 ### VRRP Implementation History
 1. **Deadlock (`58ad85b`):** Manager write lock held during `stop()` which waited for blocking `recvmsg`. Fix: `SyscallConn().Control()`, `SetReadDeadline(1s)`, close-before-wait
