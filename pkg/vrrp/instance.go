@@ -613,6 +613,11 @@ func (vi *vrrpInstance) addVIPs() {
 				"key", vi.key(), "vip", vip, "err", err)
 			continue
 		}
+		// Skip DAD for IPv6 VIPs — VRRP handles ownership; DAD would
+		// fail because the secondary may still have the address briefly.
+		if addr.IP.To4() == nil {
+			addr.Flags |= unix.IFA_F_NODAD
+		}
 		if err := netlink.AddrAdd(link, addr); err != nil {
 			// EEXIST is fine — address already present.
 			if !strings.Contains(err.Error(), "exists") {

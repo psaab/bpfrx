@@ -1018,6 +1018,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			BackupRouterDst:       cfg.System.BackupRouterDst,
 			InterfaceBandwidths:   ifaceBandwidths,
 			InterfacePointToPoint: ifaceP2P,
+			RethMap:               cfg.RethToPhysical(),
 		}
 		for _, ri := range cfg.RoutingInstances {
 			vrfName := "vrf-" + ri.Name

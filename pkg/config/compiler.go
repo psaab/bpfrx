@@ -2535,6 +2535,13 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 						nh.Interface = nodeVal(child)
 					}
 				}
+				// Also check inline keys: "next-hop fe80::50 interface reth0.50"
+				// has all in Keys rather than Children.
+				for j := 2; j < len(prop.Keys)-1; j++ {
+					if prop.Keys[j] == "interface" {
+						nh.Interface = prop.Keys[j+1]
+					}
+				}
 				route.NextHops = append(route.NextHops, nh)
 			case "discard":
 				route.Discard = true

@@ -85,6 +85,10 @@ type FullConfig struct {
 	// When true and no explicit OSPF network-type is set, emits "ip ospf network point-to-point".
 	InterfacePointToPoint map[string]bool
 
+	// RethMap maps reth name → physical member name (e.g. "reth0" → "ge-0-0-1").
+	// Used to translate RETH interface names in static routes to kernel names.
+	RethMap map[string]string
+
 	// ConsistentHash is set when the forwarding-table export policy uses
 	// "load-balance consistent-hash". The daemon should set
 	// net.ipv4.fib_multipath_hash_policy=1 for L4 ECMP hashing.
@@ -234,7 +238,7 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	// Global static routes
 	if len(fc.StaticRoutes) > 0 {
 		for _, sr := range fc.StaticRoutes {
-			b.WriteString(m.generateStaticRoute(sr, ""))
+			b.WriteString(m.generateStaticRoute(sr, "", fc.RethMap))
 		}
 		b.WriteString("!\n")
 	}
@@ -254,7 +258,7 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	// IPv6 RIB static routes (rib inet6.0)
 	if len(fc.Inet6StaticRoutes) > 0 {
 		for _, sr := range fc.Inet6StaticRoutes {
-			b.WriteString(m.generateStaticRoute(sr, ""))
+			b.WriteString(m.generateStaticRoute(sr, "", fc.RethMap))
 		}
 		b.WriteString("!\n")
 	}
@@ -319,7 +323,7 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	for _, inst := range fc.Instances {
 		if len(inst.StaticRoutes) > 0 {
 			for _, sr := range inst.StaticRoutes {
-				b.WriteString(m.generateStaticRoute(sr, inst.VRFName))
+				b.WriteString(m.generateStaticRoute(sr, inst.VRFName, fc.RethMap))
 			}
 			b.WriteString("!\n")
 		}
@@ -441,7 +445,7 @@ func (m *Manager) generateInterfaceSettings(fc *FullConfig) string {
 // generateStaticRoute produces FRR static route commands.
 // Multiple next-hops produce one line each (FRR creates ECMP).
 // Routes with NextTable are handled via ip rule (policy routing), not FRR.
-func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string) string {
+func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string, rethMap map[string]string) string {
 	if sr.NextTable != "" {
 		return "" // handled via ip rule in routing package
 	}
@@ -474,6 +478,19 @@ func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string) st
 		ifName := nh.Interface
 		if strings.HasSuffix(ifName, ".0") {
 			ifName = ifName[:len(ifName)-2]
+		}
+		// Resolve RETH names to physical member names (e.g. "reth0.50" → "ge-0-0-1.50").
+		// FRR needs kernel interface names, not Junos RETH names.
+		if len(rethMap) > 0 && ifName != "" {
+			parts := strings.SplitN(ifName, ".", 2)
+			if phys, ok := rethMap[parts[0]]; ok {
+				phys = config.LinuxIfName(phys)
+				if len(parts) == 2 {
+					ifName = phys + "." + parts[1]
+				} else {
+					ifName = phys
+				}
+			}
 		}
 
 		var nexthop string
