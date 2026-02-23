@@ -3,6 +3,7 @@ package vrrp
 import (
 	"net"
 	"testing"
+	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
@@ -435,5 +436,131 @@ func TestOnesComplementChecksum(t *testing.T) {
 	csum := onesComplementChecksum(data)
 	if csum != 0xFFFF {
 		t.Errorf("checksum of zeros = 0x%04X, want 0xFFFF", csum)
+	}
+}
+
+// --- Sync hold tests ---
+
+func TestSyncHold_SuppressesPreempt(t *testing.T) {
+	m := NewManager()
+	m.SetSyncHold(5 * time.Second)
+
+	// Create an instance — desiredPreempt should be true, but active preempt false.
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, m.eventCh)
+
+	// Simulate what UpdateInstances does during sync hold.
+	if m.syncHold {
+		vi.cfg.Preempt = false
+	}
+	vi.desiredPreempt = true
+
+	if vi.cfg.Preempt {
+		t.Error("expected preempt to be suppressed during sync hold")
+	}
+	if !vi.desiredPreempt {
+		t.Error("desiredPreempt should remain true")
+	}
+
+	// Release — should restore preempt.
+	m.mu.Lock()
+	m.instances = map[instanceKey]*vrrpInstance{
+		{iface: "eth0", groupID: 101}: vi,
+	}
+	m.mu.Unlock()
+
+	m.ReleaseSyncHold()
+
+	if !vi.getPreempt() {
+		t.Error("expected preempt to be restored after sync hold release")
+	}
+}
+
+func TestSyncHold_ReleaseTwiceIsNoop(t *testing.T) {
+	m := NewManager()
+	m.SetSyncHold(5 * time.Second)
+	m.ReleaseSyncHold()
+	// Second call should be a no-op, not panic.
+	m.ReleaseSyncHold()
+}
+
+func TestSyncHold_TimeoutReleasesAutomatically(t *testing.T) {
+	m := NewManager()
+
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, m.eventCh)
+
+	m.mu.Lock()
+	m.instances = map[instanceKey]*vrrpInstance{
+		{iface: "eth0", groupID: 101}: vi,
+	}
+	m.mu.Unlock()
+
+	// Set a very short timeout.
+	m.SetSyncHold(50 * time.Millisecond)
+
+	// Force preempt off to simulate sync hold.
+	vi.mu.Lock()
+	vi.cfg.Preempt = false
+	vi.mu.Unlock()
+
+	// Wait for timeout.
+	time.Sleep(200 * time.Millisecond)
+
+	if !vi.getPreempt() {
+		t.Error("expected preempt to be restored after sync hold timeout")
+	}
+}
+
+func TestInstanceRestorePreempt(t *testing.T) {
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+
+	// Simulate sync hold: override preempt=false but keep desiredPreempt=true.
+	vi.mu.Lock()
+	vi.cfg.Preempt = false
+	vi.mu.Unlock()
+
+	if vi.getPreempt() {
+		t.Error("preempt should be false during hold")
+	}
+
+	vi.restorePreempt()
+	if !vi.getPreempt() {
+		t.Error("preempt should be true after restore")
+	}
+}
+
+func TestUpdateConfig_PreservesDesiredPreempt(t *testing.T) {
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+
+	// updateConfig should update both cfg.Preempt and desiredPreempt.
+	vi.updateConfig(Instance{Priority: 150, Preempt: false})
+
+	if vi.getPreempt() {
+		t.Error("preempt should be false after updateConfig")
+	}
+	vi.mu.RLock()
+	dp := vi.desiredPreempt
+	vi.mu.RUnlock()
+	if dp {
+		t.Error("desiredPreempt should be false after updateConfig")
 	}
 }

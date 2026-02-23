@@ -82,6 +82,11 @@ type SessionSync struct {
 	// On failover, the new primary calls swanctl --initiate for each connection name.
 	OnIPsecSAReceived func(connectionNames []string)
 
+	// OnBulkSyncReceived is called when a bulk sync transfer completes
+	// (syncMsgBulkEnd received). The secondary uses this to release VRRP
+	// sync hold after session state has been installed.
+	OnBulkSyncReceived func()
+
 	// OnPeerConnected is called when a peer sync connection is established
 	// (either inbound accept or outbound connect). The primary uses this to
 	// push config to a returning secondary.
@@ -586,6 +591,9 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 
 	case syncMsgBulkEnd:
 		slog.Info("cluster sync: bulk transfer complete")
+		if s.OnBulkSyncReceived != nil {
+			go s.OnBulkSyncReceived()
+		}
 
 	case syncMsgHeartbeat:
 		// keepalive, no action needed

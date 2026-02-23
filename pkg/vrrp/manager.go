@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
@@ -22,10 +23,12 @@ type instanceKey struct {
 
 // Manager manages all VRRP instances.
 type Manager struct {
-	mu        sync.RWMutex
-	instances map[instanceKey]*vrrpInstance
-	eventCh   chan VRRPEvent
-	cancel    context.CancelFunc
+	mu            sync.RWMutex
+	instances     map[instanceKey]*vrrpInstance
+	eventCh       chan VRRPEvent
+	cancel        context.CancelFunc
+	syncHold      bool        // suppress preemption until session sync completes
+	syncHoldTimer *time.Timer // safety timeout to release hold
 }
 
 // NewManager creates a new VRRP manager.
@@ -46,6 +49,9 @@ func (m *Manager) Start(ctx context.Context) error {
 // Stop stops all instances, removes VIPs, and cancels the context.
 func (m *Manager) Stop() {
 	m.mu.Lock()
+	if m.syncHoldTimer != nil {
+		m.syncHoldTimer.Stop()
+	}
 	instances := make(map[instanceKey]*vrrpInstance, len(m.instances))
 	for k, v := range m.instances {
 		instances[k] = v
@@ -62,6 +68,38 @@ func (m *Manager) Stop() {
 		m.cancel()
 	}
 	slog.Info("vrrp: manager stopped")
+}
+
+// SetSyncHold enables sync hold mode — all VRRP instances start with
+// preempt=false regardless of config, suppressing preemption until session
+// sync completes. A safety timeout releases the hold if sync never arrives.
+func (m *Manager) SetSyncHold(timeout time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.syncHold = true
+	m.syncHoldTimer = time.AfterFunc(timeout, func() {
+		slog.Warn("vrrp: sync hold timeout expired, releasing")
+		m.ReleaseSyncHold()
+	})
+	slog.Info("vrrp: sync hold active, preemption disabled", "timeout", timeout)
+}
+
+// ReleaseSyncHold restores configured preempt values on all instances,
+// allowing normal VRRP preemption to proceed.
+func (m *Manager) ReleaseSyncHold() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.syncHold {
+		return
+	}
+	m.syncHold = false
+	if m.syncHoldTimer != nil {
+		m.syncHoldTimer.Stop()
+	}
+	for _, vi := range m.instances {
+		vi.restorePreempt()
+	}
+	slog.Info("vrrp: sync hold released, preemption enabled")
 }
 
 // Events returns the event channel for state change notifications.
@@ -125,7 +163,13 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 			continue
 		}
 
-		vi := newInstance(*inst, iface, m.eventCh)
+		instCfg := *inst
+		if m.syncHold {
+			instCfg.Preempt = false
+		}
+		vi := newInstance(instCfg, iface, m.eventCh)
+		// Store the real configured preempt value for when sync hold releases.
+		vi.desiredPreempt = inst.Preempt
 		if err := vi.openSocket(); err != nil {
 			slog.Warn("vrrp: failed to open socket",
 				"interface", inst.Interface, "err", err)

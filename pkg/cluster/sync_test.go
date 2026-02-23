@@ -3,6 +3,7 @@ package cluster
 import (
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/psaab/bpfrx/pkg/dataplane"
 )
@@ -505,6 +506,31 @@ func TestSyncSweepSkipsWhenDisconnected(t *testing.T) {
 	if ss.stats.SessionsSent.Load() != 0 {
 		t.Fatal("should not sync when disconnected")
 	}
+}
+
+func TestBulkEndTriggersCallback(t *testing.T) {
+	ss := NewSessionSync(":4785", "10.0.0.2:4785", nil)
+
+	called := make(chan struct{}, 1)
+	ss.OnBulkSyncReceived = func() {
+		called <- struct{}{}
+	}
+
+	// Simulate receiving BulkEnd message.
+	ss.handleMessage(syncMsgBulkEnd, nil)
+
+	select {
+	case <-called:
+		// OK
+	case <-time.After(time.Second):
+		t.Fatal("OnBulkSyncReceived callback not called within 1s")
+	}
+}
+
+func TestBulkEndWithoutCallback(t *testing.T) {
+	ss := NewSessionSync(":4785", "10.0.0.2:4785", nil)
+	// Should not panic when callback is nil.
+	ss.handleMessage(syncMsgBulkEnd, nil)
 }
 
 func TestSyncSweepV6(t *testing.T) {

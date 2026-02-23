@@ -47,12 +47,13 @@ type VRRPEvent struct {
 
 // vrrpInstance is a per-VRRP-group state machine goroutine.
 type vrrpInstance struct {
-	mu      sync.RWMutex
-	cfg     Instance
-	state   VRRPState
-	iface   *net.Interface
-	eventCh chan<- VRRPEvent
-	localIP net.IP // our IPv4 address on this interface (for filtering self-sent)
+	mu             sync.RWMutex
+	cfg            Instance
+	desiredPreempt bool // configured preempt value (may differ from cfg.Preempt during sync hold)
+	state          VRRPState
+	iface          *net.Interface
+	eventCh        chan<- VRRPEvent
+	localIP        net.IP // our IPv4 address on this interface (for filtering self-sent)
 
 	// Per-instance raw socket and receiver.
 	conn    net.PacketConn
@@ -71,14 +72,15 @@ type vrrpInstance struct {
 
 func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent) *vrrpInstance {
 	return &vrrpInstance{
-		cfg:        cfg,
-		state:      StateInitialize,
-		iface:      iface,
-		eventCh:    eventCh,
-		afPacketFD: -1,
-		rxCh:       make(chan *VRRPPacket, 16),
-		stopCh:     make(chan struct{}),
-		stopped:    make(chan struct{}),
+		cfg:            cfg,
+		desiredPreempt: cfg.Preempt,
+		state:          StateInitialize,
+		iface:          iface,
+		eventCh:        eventCh,
+		afPacketFD:     -1,
+		rxCh:           make(chan *VRRPPacket, 16),
+		stopCh:         make(chan struct{}),
+		stopped:        make(chan struct{}),
 	}
 }
 
@@ -144,6 +146,15 @@ func (vi *vrrpInstance) updateConfig(cfg Instance) {
 	vi.mu.Lock()
 	vi.cfg.Priority = cfg.Priority
 	vi.cfg.Preempt = cfg.Preempt
+	vi.desiredPreempt = cfg.Preempt
+	vi.mu.Unlock()
+}
+
+// restorePreempt sets cfg.Preempt to the configured (desired) value.
+// Called when sync hold is released to re-enable preemption.
+func (vi *vrrpInstance) restorePreempt() {
+	vi.mu.Lock()
+	vi.cfg.Preempt = vi.desiredPreempt
 	vi.mu.Unlock()
 }
 

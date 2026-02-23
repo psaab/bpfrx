@@ -2939,6 +2939,19 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				d.pushConfigToPeer()
 			}
 
+			// Enable VRRP sync hold on fresh daemon start: suppress preemption
+			// until bulk session sync completes from the peer. This prevents
+			// the returning high-priority node from preempting before it has
+			// session state, which would break all existing connections.
+			if time.Since(d.startTime) < 30*time.Second {
+				d.vrrpMgr.SetSyncHold(30 * time.Second)
+			}
+
+			d.sessionSync.OnBulkSyncReceived = func() {
+				slog.Info("cluster: session sync complete, releasing VRRP hold")
+				d.vrrpMgr.ReleaseSyncHold()
+			}
+
 			d.sessionSync.SetVRFDevice(vrfDevice)
 			if err := d.sessionSync.Start(ctx); err != nil {
 				slog.Warn("failed to start session sync", "err", err)
