@@ -347,6 +347,7 @@ Name=eth0
 [Network]
 Address=10.0.60.102/24
 Gateway=10.0.60.1
+IPv6AcceptRA=true
 
 [Link]
 RequiredForOnline=no

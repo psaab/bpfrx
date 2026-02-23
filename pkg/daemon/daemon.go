@@ -1262,6 +1262,11 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 			"delegated_from", mapping.Interface)
 	}
 
+	// Resolve RETH interface names for radvd (needs real Linux names).
+	for _, ra := range result {
+		ra.Interface = config.LinuxIfName(cfg.ResolveReth(ra.Interface))
+	}
+
 	return result
 }
 
