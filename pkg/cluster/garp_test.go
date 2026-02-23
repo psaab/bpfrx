@@ -8,11 +8,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestBuildGratuitousARP(t *testing.T) {
+func TestBuildGratuitousARP_Reply(t *testing.T) {
 	mac, _ := net.ParseMAC("de:ad:be:ef:00:01")
 	ip := net.ParseIP("10.0.1.10").To4()
 
-	pkt := buildGratuitousARP(mac, ip)
+	pkt := buildGratuitousARP(mac, ip, 2) // ARP Reply
 
 	if len(pkt) != 42 {
 		t.Fatalf("packet length = %d, want 42", len(pkt))
@@ -78,10 +78,41 @@ func TestBuildGratuitousARP(t *testing.T) {
 		}
 	}
 
-	// Target hardware address: broadcast.
+	// Target hardware address: broadcast (for GARP Reply).
 	for i := 0; i < 6; i++ {
 		if pkt[32+i] != 0xff {
 			t.Errorf("target MAC[%d] = 0x%02x, want 0xff", i, pkt[32+i])
+		}
+	}
+
+	// Target protocol address = our IP (GARP).
+	for i := 0; i < 4; i++ {
+		if pkt[38+i] != ip[i] {
+			t.Errorf("target IP[%d] = %d, want %d", i, pkt[38+i], ip[i])
+		}
+	}
+}
+
+func TestBuildGratuitousARP_Request(t *testing.T) {
+	mac, _ := net.ParseMAC("de:ad:be:ef:00:01")
+	ip := net.ParseIP("10.0.1.10").To4()
+
+	pkt := buildGratuitousARP(mac, ip, 1) // ARP Request
+
+	if len(pkt) != 42 {
+		t.Fatalf("packet length = %d, want 42", len(pkt))
+	}
+
+	// Opcode: ARP request (1).
+	opcode := binary.BigEndian.Uint16(pkt[20:22])
+	if opcode != 1 {
+		t.Errorf("opcode = %d, want 1 (request)", opcode)
+	}
+
+	// Target hardware address: zero (for GARP Request).
+	for i := 0; i < 6; i++ {
+		if pkt[32+i] != 0x00 {
+			t.Errorf("target MAC[%d] = 0x%02x, want 0x00", i, pkt[32+i])
 		}
 	}
 

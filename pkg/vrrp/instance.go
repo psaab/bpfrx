@@ -650,23 +650,38 @@ func (vi *vrrpInstance) removeVIPs() {
 }
 
 // sendGARP sends gratuitous ARP (IPv4) and unsolicited NA (IPv6) for all VIPs.
+// After each IPv4 GARP, also sends a standard ARP probe to the subnet's
+// gateway (.1) address. Some routers ignore gratuitous ARP but always update
+// their ARP cache when they receive a standard ARP Request with the VIP as
+// the source address.
 func (vi *vrrpInstance) sendGARP() {
 	for _, vip := range vi.cfg.VirtualAddresses {
-		addr := vip
-		if idx := strings.Index(addr, "/"); idx >= 0 {
-			addr = addr[:idx]
-		}
-		ip := net.ParseIP(addr)
-		if ip == nil {
+		ip, ipNet, err := net.ParseCIDR(vip)
+		if err != nil {
 			continue
 		}
 		if ip.To4() != nil {
 			if err := cluster.SendGratuitousARP(vi.cfg.Interface, ip, 3); err != nil {
-				slog.Debug("vrrp: GARP failed", "key", vi.key(), "vip", addr, "err", err)
+				slog.Warn("vrrp: GARP failed", "key", vi.key(), "vip", ip, "err", err)
+			}
+			// Probe the .1 address of the VIP subnet — this is the most
+			// common gateway address. The ARP Request's source IP/MAC
+			// forces the gateway to update its ARP cache for our VIP.
+			gwIP := make(net.IP, 4)
+			copy(gwIP, ipNet.IP.To4())
+			gwIP[3] = 1
+			if !gwIP.Equal(ip.To4()) {
+				if err := cluster.SendARPProbe(vi.cfg.Interface, gwIP); err != nil {
+					slog.Warn("vrrp: gateway ARP probe failed",
+						"key", vi.key(), "gw", gwIP, "err", err)
+				} else {
+					slog.Info("vrrp: probed subnet gateway",
+						"key", vi.key(), "gw", gwIP, "interface", vi.cfg.Interface)
+				}
 			}
 		} else {
 			if err := cluster.SendGratuitousIPv6(vi.cfg.Interface, ip, 3); err != nil {
-				slog.Debug("vrrp: NA failed", "key", vi.key(), "vip", addr, "err", err)
+				slog.Warn("vrrp: NA failed", "key", vi.key(), "vip", ip, "err", err)
 			}
 		}
 	}
