@@ -363,6 +363,57 @@ func TestFormatRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFormatRoundTripQuotedKeys(t *testing.T) {
+	// Config with ${node} variable — must survive Format → Parse round-trip.
+	input := `groups {
+    node0 {
+        interfaces {
+            ge-0-0-0 {
+                unit 0 {
+                    family inet {
+                        address 10.0.1.10/24;
+                    }
+                }
+            }
+        }
+    }
+}
+apply-groups "${node}";
+`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("initial parse errors: %v", errs)
+	}
+
+	// Format and re-parse — must not fail.
+	output := tree.Format()
+	tree2, errs2 := NewParser(output).Parse()
+	if len(errs2) > 0 {
+		t.Fatalf("re-parse errors after Format: %v\nformatted output:\n%s", errs2, output)
+	}
+
+	// The re-formatted output should match.
+	output2 := tree2.Format()
+	if output != output2 {
+		t.Errorf("double round-trip mismatch:\n--- first ---\n%s\n--- second ---\n%s", output, output2)
+	}
+}
+
+func TestFormatSetQuotedKeys(t *testing.T) {
+	// FormatSet with ${node} variable.
+	input := `apply-groups "${node}";
+`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	setOutput := tree.FormatSet()
+	if !strings.Contains(setOutput, `"${node}"`) {
+		t.Errorf("FormatSet missing quoted ${node}:\n%s", setOutput)
+	}
+}
+
 func TestSetPathSchema(t *testing.T) {
 	// Build a tree from set commands and verify it compiles correctly.
 	tree := &ConfigTree{}

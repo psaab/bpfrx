@@ -95,6 +95,7 @@ type Daemon struct {
 	aggregator    *logging.SessionAggregator
 	aggCancel     context.CancelFunc
 	vrrpMgr       *vrrp.Manager
+	startTime     time.Time // daemon start time; used to suppress stale config sync
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
@@ -122,7 +123,8 @@ func New(opts Options) *Daemon {
 	}
 
 	return &Daemon{
-		opts:  opts,
+		opts:      opts,
+		startTime: time.Now(),
 		store: store,
 	}
 }
@@ -2811,6 +2813,17 @@ func (d *Daemon) syncConfigToPeer() {
 	if !d.cluster.IsLocalPrimary(0) {
 		return
 	}
+	d.pushConfigToPeer()
+}
+
+// pushConfigToPeer sends the active config to the cluster peer unconditionally
+// (does not check primary/secondary status). Used both by normal commit sync
+// and by the peer-reconnect path where the stable node pushes its config
+// regardless of whether it was preempted.
+func (d *Daemon) pushConfigToPeer() {
+	if d.sessionSync == nil {
+		return
+	}
 	// Check if config sync is enabled.
 	cfg := d.store.ActiveConfig()
 	if cfg == nil || cfg.Chassis.Cluster == nil || !cfg.Chassis.Cluster.ConfigSync {
@@ -2908,6 +2921,21 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Wire config sync callback: when secondary receives config from primary.
 			d.sessionSync.OnConfigReceived = func(configText string) {
 				d.handleConfigSync(configText)
+			}
+
+			// Wire peer connected callback: push config to returning peer.
+			// Only push if this node has been running >30s (stable node).
+			// A freshly started node must NOT push stale config from disk.
+			// Uses pushConfigToPeer (not syncConfigToPeer) to bypass the
+			// primary check — the stable node may have been preempted by
+			// the time the TCP sync connection is established.
+			d.sessionSync.OnPeerConnected = func() {
+				if time.Since(d.startTime) < 30*time.Second {
+					slog.Info("cluster: skipping config push (daemon just started)")
+					return
+				}
+				slog.Info("cluster: pushing config to reconnected peer")
+				d.pushConfigToPeer()
 			}
 
 			d.sessionSync.SetVRFDevice(vrfDevice)

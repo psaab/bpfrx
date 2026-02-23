@@ -82,6 +82,11 @@ type SessionSync struct {
 	// On failover, the new primary calls swanctl --initiate for each connection name.
 	OnIPsecSAReceived func(connectionNames []string)
 
+	// OnPeerConnected is called when a peer sync connection is established
+	// (either inbound accept or outbound connect). The primary uses this to
+	// push config to a returning secondary.
+	OnPeerConnected func()
+
 	// peerIPsecSAs holds the latest IPsec connection names received from the peer.
 	peerIPsecSAs   []string
 	peerIPsecSAsMu sync.Mutex
@@ -398,6 +403,10 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener) {
 			defer s.wg.Done()
 			s.receiveLoop(ctx, conn)
 		}()
+
+		if s.OnPeerConnected != nil {
+			go s.OnPeerConnected()
+		}
 	}
 }
 
@@ -437,6 +446,10 @@ func (s *SessionSync) connectLoop(ctx context.Context) {
 			defer s.wg.Done()
 			s.receiveLoop(ctx, conn)
 		}()
+
+		if s.OnPeerConnected != nil {
+			go s.OnPeerConnected()
+		}
 
 		// Perform initial bulk sync after connecting.
 		if err := s.BulkSync(); err != nil {

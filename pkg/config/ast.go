@@ -45,9 +45,35 @@ func (n *Node) Name() string {
 	return n.Keys[0]
 }
 
-// KeyPath returns the full key path as a single string.
+// KeyPath returns the full key path as a single string (unquoted).
+// Used for map lookups and comparison. For display/format output, use QuotedKeyPath.
 func (n *Node) KeyPath() string {
 	return strings.Join(n.Keys, " ")
+}
+
+// QuotedKeyPath returns the key path with keys quoted if they contain
+// characters that aren't valid bare identifiers (e.g. ${node}).
+func (n *Node) QuotedKeyPath() string {
+	parts := make([]string, len(n.Keys))
+	for i, k := range n.Keys {
+		parts[i] = quoteKey(k)
+	}
+	return strings.Join(parts, " ")
+}
+
+// quoteKey wraps a key in double quotes if it contains characters that
+// are not valid in bare Junos identifiers.
+func quoteKey(s string) string {
+	if s == "" {
+		return `""`
+	}
+	for i := 0; i < len(s); i++ {
+		if !isIdentChar(s[i]) {
+			// Escape any internal quotes.
+			return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+		}
+	}
+	return s
 }
 
 // FindChild returns the first child whose first key matches name.
@@ -283,9 +309,9 @@ func (t *ConfigTree) FormatPathInheritance(path []string) string {
 	var b strings.Builder
 	for _, n := range matches {
 		if n.IsLeaf {
-			fmt.Fprintf(&b, "%s;\n", n.KeyPath())
+			fmt.Fprintf(&b, "%s;\n", n.QuotedKeyPath())
 		} else {
-			fmt.Fprintf(&b, "%s {\n", n.KeyPath())
+			fmt.Fprintf(&b, "%s {\n", n.QuotedKeyPath())
 			formatNodesInheritance(&b, n.Children, 1)
 			fmt.Fprintf(&b, "}\n")
 		}
@@ -309,9 +335,9 @@ func formatNodesInheritance(b *strings.Builder, nodes []*Node, indent int) {
 				prefix, prefix, displayKey, n.InheritedFrom, prefix)
 		}
 		if n.IsLeaf {
-			fmt.Fprintf(b, "%s%s;\n", prefix, n.KeyPath())
+			fmt.Fprintf(b, "%s%s;\n", prefix, n.QuotedKeyPath())
 		} else {
-			fmt.Fprintf(b, "%s%s {\n", prefix, n.KeyPath())
+			fmt.Fprintf(b, "%s%s {\n", prefix, n.QuotedKeyPath())
 			formatNodesInheritance(b, n.Children, indent+1)
 			fmt.Fprintf(b, "%s}\n", prefix)
 		}
@@ -2253,9 +2279,9 @@ func formatNodes(b *strings.Builder, nodes []*Node, indent int) {
 			fmt.Fprintf(b, "%s/* %s */\n", prefix, n.Annotation)
 		}
 		if n.IsLeaf {
-			fmt.Fprintf(b, "%s%s;\n", prefix, n.KeyPath())
+			fmt.Fprintf(b, "%s%s;\n", prefix, n.QuotedKeyPath())
 		} else {
-			fmt.Fprintf(b, "%s%s {\n", prefix, n.KeyPath())
+			fmt.Fprintf(b, "%s%s {\n", prefix, n.QuotedKeyPath())
 			formatNodes(b, n.Children, indent+1)
 			fmt.Fprintf(b, "%s}\n", prefix)
 		}
@@ -2277,9 +2303,9 @@ func (t *ConfigTree) FormatPath(path []string) string {
 	var b strings.Builder
 	for _, n := range matches {
 		if n.IsLeaf {
-			fmt.Fprintf(&b, "%s;\n", n.KeyPath())
+			fmt.Fprintf(&b, "%s;\n", n.QuotedKeyPath())
 		} else {
-			fmt.Fprintf(&b, "%s {\n", n.KeyPath())
+			fmt.Fprintf(&b, "%s {\n", n.QuotedKeyPath())
 			formatNodes(&b, n.Children, 1)
 			fmt.Fprintf(&b, "}\n")
 		}
@@ -2317,7 +2343,7 @@ func (t *ConfigTree) FormatPathSet(path []string) string {
 	for _, n := range matches {
 		prefix := append(append([]string{}, parentPrefix...), n.Keys...)
 		if n.IsLeaf {
-			fmt.Fprintf(&b, "set %s\n", strings.Join(prefix, " "))
+			fmt.Fprintf(&b, "set %s\n", joinQuotedKeys(prefix))
 		} else {
 			formatSetNodes(&b, n.Children, prefix)
 		}
@@ -2329,11 +2355,20 @@ func formatSetNodes(b *strings.Builder, nodes []*Node, prefix []string) {
 	for _, n := range canonicalOrder(nodes) {
 		path := append(prefix, n.Keys...)
 		if n.IsLeaf {
-			fmt.Fprintf(b, "set %s\n", strings.Join(path, " "))
+			fmt.Fprintf(b, "set %s\n", joinQuotedKeys(path))
 		} else {
 			formatSetNodes(b, n.Children, path)
 		}
 	}
+}
+
+// joinQuotedKeys joins keys with spaces, quoting any that contain special characters.
+func joinQuotedKeys(keys []string) string {
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = quoteKey(k)
+	}
+	return strings.Join(parts, " ")
 }
 
 // FormatCompare produces a Junos-style hierarchical diff between two trees.
@@ -2441,9 +2476,9 @@ func diffNodes(b *strings.Builder, oldNodes, newNodes []*Node, editPath []string
 		case nodesEqual(e.oldNode, e.newNode):
 			// Unchanged — show collapsed
 			if e.oldNode.IsLeaf {
-				fmt.Fprintf(b, " %s%s;\n", indent, e.oldNode.KeyPath())
+				fmt.Fprintf(b, " %s%s;\n", indent, e.oldNode.QuotedKeyPath())
 			} else {
-				fmt.Fprintf(b, " %s%s { ... }\n", indent, e.oldNode.KeyPath())
+				fmt.Fprintf(b, " %s%s { ... }\n", indent, e.oldNode.QuotedKeyPath())
 			}
 		default:
 			// Modified
@@ -2492,9 +2527,9 @@ func nodesEqual(a, b *Node) bool {
 // formatPrefixed writes a node with +/- prefix at the given indent.
 func formatPrefixed(b *strings.Builder, prefix, indent string, n *Node) {
 	if n.IsLeaf {
-		fmt.Fprintf(b, "%s%s%s;\n", prefix, indent, n.KeyPath())
+		fmt.Fprintf(b, "%s%s%s;\n", prefix, indent, n.QuotedKeyPath())
 	} else {
-		fmt.Fprintf(b, "%s%s%s {\n", prefix, indent, n.KeyPath())
+		fmt.Fprintf(b, "%s%s%s {\n", prefix, indent, n.QuotedKeyPath())
 		formatPrefixedChildren(b, prefix, indent+"    ", n.Children)
 		fmt.Fprintf(b, "%s%s}\n", prefix, indent)
 	}
