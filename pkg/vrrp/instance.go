@@ -93,20 +93,17 @@ func (vi *vrrpInstance) openSocket() error {
 	vi.conn = conn
 	vi.rawConn = rawConn
 
-	// For VLAN sub-interfaces, open an AF_PACKET socket for receiving.
-	// Raw IP sockets don't reliably receive multicast on VLAN sub-
-	// interfaces (kernel limitation — IpInDelivers counts the packet
-	// but recvmsg on the raw socket never returns it). AF_PACKET
-	// captures at the link layer and works correctly (tcpdump proves
-	// it). The raw IP socket is kept for sending advertisements.
-	if isVLAN {
-		fd, err := openAfPacketReceiver(vi.iface.Index)
-		if err != nil {
-			slog.Warn("vrrp: af_packet open failed, raw socket only",
-				"key", vi.key(), "err", err)
-		} else {
-			vi.afPacketFD = fd
-		}
+	// Open AF_PACKET socket for receiving VRRP packets.
+	// Raw IP sockets (proto 112) don't reliably receive multicast in
+	// generic XDP mode — AF_PACKET taps fire before generic XDP in the
+	// kernel's receive path, so they always see the packet regardless
+	// of XDP processing. The raw IP socket is kept for sending only.
+	fd, err := openAfPacketReceiver(vi.iface.Index)
+	if err != nil {
+		slog.Warn("vrrp: af_packet open failed, raw socket only",
+			"key", vi.key(), "err", err)
+	} else {
+		vi.afPacketFD = fd
 	}
 
 	// Resolve our local IPv4 address (primary IP, not a VIP) for:
@@ -204,8 +201,8 @@ func (vi *vrrpInstance) run() {
 		"preempt", vi.cfg.Preempt)
 
 	// Start per-instance receiver goroutine.
-	// VLAN sub-interfaces use AF_PACKET because raw IP sockets
-	// don't receive multicast on VLAN sub-interfaces.
+	// AF_PACKET captures at the link layer before generic XDP, ensuring
+	// reliable multicast reception on all interface types.
 	if vi.afPacketFD >= 0 {
 		go vi.receiverAfPacket()
 	} else {
@@ -213,6 +210,9 @@ func (vi *vrrpInstance) run() {
 	}
 
 	// Transition to Backup state.
+	// Remove any stale VIPs that may be on the interface from a previous
+	// daemon run or config apply. This ensures BACKUP nodes don't have VIPs.
+	vi.removeVIPs()
 	vi.setState(StateBackup)
 	vi.emitEvent()
 

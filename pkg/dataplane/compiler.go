@@ -498,17 +498,22 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				writtenVlanIface[uint32(subIfindex)] = true
 
 				// Reconcile addresses on sub-interface (removes stale, adds missing).
-				// DHCP-managed sub-interfaces are skipped.
+				// DHCP-managed and RETH sub-interfaces are skipped — DHCP client
+				// manages DHCP addresses, VRRP manages RETH VIP addresses.
 				subName := fmt.Sprintf("%s.%d", physName, vlanID)
 				var addrs []string
 				isDHCPSub := false
+				isReth := false
 				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
 					if unit, ok := ifCfg.Units[unitNum]; ok {
 						addrs = unit.Addresses
 						isDHCPSub = unit.DHCP || unit.DHCPv6
 					}
+					if ifCfg.RedundancyGroup > 0 {
+						isReth = true
+					}
 				}
-				if !isDHCPSub {
+				if !isDHCPSub && !isReth {
 					reconcileInterfaceAddresses(subName, addrs)
 				}
 
@@ -615,11 +620,13 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				attached[physIface.Index] = true
 			}
 
-			// Reconcile addresses for non-VLAN, non-DHCP interfaces (removes stale, adds missing).
+			// Reconcile addresses for non-VLAN, non-DHCP, non-RETH interfaces.
 			// DHCP-managed interfaces are skipped — the DHCP client manages their addresses.
+			// RETH interfaces are skipped — VRRP manages their VIP addresses.
 			if vlanID == 0 {
 				var addrs []string
 				isDHCP := false
+				isReth := false
 				var unitMTU int
 				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
 					if unit, ok := ifCfg.Units[unitNum]; ok {
@@ -627,8 +634,11 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 						isDHCP = unit.DHCP || unit.DHCPv6
 						unitMTU = unit.MTU
 					}
+					if ifCfg.RedundancyGroup > 0 {
+						isReth = true
+					}
 				}
-				if !isDHCP {
+				if !isDHCP && !isReth {
 					reconcileInterfaceAddresses(physName, addrs)
 				}
 				// Apply unit-level MTU (overrides interface-level MTU)
