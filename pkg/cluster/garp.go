@@ -312,6 +312,88 @@ func icmpv6Checksum(src, dst, payload []byte) uint16 {
 	return ^uint16(sum)
 }
 
+// SendNDSolicitation sends an ICMPv6 Neighbor Solicitation to resolve
+// the link-layer address of targetIP on the given interface. This is
+// the IPv6 equivalent of an ARP request.
+func SendNDSolicitation(iface string, sourceIP, targetIP net.IP) error {
+	target6 := targetIP.To16()
+	if target6 == nil || target6.To4() != nil {
+		return fmt.Errorf("not an IPv6 address: %s", targetIP)
+	}
+	src6 := sourceIP.To16()
+	if src6 == nil {
+		return fmt.Errorf("not an IPv6 address: %s", sourceIP)
+	}
+
+	ifi, err := net.InterfaceByName(iface)
+	if err != nil {
+		return fmt.Errorf("interface %s: %w", iface, err)
+	}
+
+	pkt := buildNDSolicitation(ifi.HardwareAddr, src6, target6)
+
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_IPV6)))
+	if err != nil {
+		return fmt.Errorf("raw socket: %w", err)
+	}
+	defer unix.Close(fd)
+
+	// Solicited-node multicast MAC: 33:33:ff:XX:XX:XX (last 3 bytes of target)
+	addr := unix.SockaddrLinklayer{
+		Protocol: htons(unix.ETH_P_IPV6),
+		Ifindex:  ifi.Index,
+		Halen:    6,
+	}
+	copy(addr.Addr[:], []byte{0x33, 0x33, 0xff, target6[13], target6[14], target6[15]})
+
+	return unix.Sendto(fd, pkt, 0, &addr)
+}
+
+// buildNDSolicitation constructs a raw Ethernet + IPv6 + ICMPv6 Neighbor
+// Solicitation packet per RFC 4861 §4.3.
+func buildNDSolicitation(mac net.HardwareAddr, srcIP, targetIP net.IP) []byte {
+	// 14 Ethernet + 40 IPv6 + 24 ICMPv6 NS (8 hdr + 16 target) + 8 SLLA option = 86
+	pkt := make([]byte, 86)
+
+	// --- Ethernet header (14 bytes) ---
+	// Dst: solicited-node multicast 33:33:ff:XX:XX:XX
+	copy(pkt[0:6], []byte{0x33, 0x33, 0xff, targetIP[13], targetIP[14], targetIP[15]})
+	copy(pkt[6:12], mac)
+	binary.BigEndian.PutUint16(pkt[12:14], unix.ETH_P_IPV6)
+
+	// --- IPv6 header (40 bytes) ---
+	pkt[14] = 0x60 // Version 6, TC=0
+	binary.BigEndian.PutUint16(pkt[18:20], 32) // Payload Length: NS(24) + SLLA(8)
+	pkt[20] = 58                                // Next Header: ICMPv6
+	pkt[21] = 255                               // Hop Limit
+	copy(pkt[22:38], srcIP.To16())
+	// Destination: solicited-node multicast ff02::1:ffXX:XXXX
+	pkt[38] = 0xff
+	pkt[39] = 0x02
+	// pkt[40:48] = 0
+	pkt[49] = 0x01
+	pkt[50] = 0xff
+	copy(pkt[51:54], targetIP[13:16])
+
+	// --- ICMPv6 Neighbor Solicitation (32 bytes) ---
+	pkt[54] = 135 // Type: Neighbor Solicitation
+	pkt[55] = 0   // Code: 0
+	// pkt[56:58] = checksum (filled below)
+	// pkt[58:62] = 0 (reserved)
+	copy(pkt[62:78], targetIP.To16())
+
+	// --- Source Link-Layer Address option (8 bytes) ---
+	pkt[78] = 1 // Type: Source Link-Layer Address
+	pkt[79] = 1 // Length: 1 (in units of 8 bytes)
+	copy(pkt[80:86], mac)
+
+	// Compute ICMPv6 checksum
+	csum := icmpv6Checksum(pkt[22:38], pkt[38:54], pkt[54:86])
+	binary.BigEndian.PutUint16(pkt[56:58], csum)
+
+	return pkt
+}
+
 func htons(v uint16) uint16 {
 	b := make([]byte, 2)
 	binary.BigEndian.PutUint16(b, v)

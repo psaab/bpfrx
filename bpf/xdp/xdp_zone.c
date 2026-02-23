@@ -529,18 +529,32 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
 		/*
 		 * Route exists but no ARP/NDP entry for the next hop.
-		 * We cannot proceed through the NAT pipeline because:
-		 *   - SNAT would rewrite the source IP to a local address
-		 *   - XDP_PASS with a local source IP gets dropped by the kernel
-		 *     (kernel rejects forwarding packets with its own source IP)
 		 *
-		 * Instead, pass the ORIGINAL un-modified packet to the kernel.
-		 * The kernel will do its own FIB lookup, trigger ARP/NDP neighbor
-		 * resolution, and forward the packet. This first packet goes
-		 * through un-NAT'd, but TCP retransmits (arriving ~1s later)
-		 * will find ARP resolved and go through the full BPF pipeline
-		 * with proper NAT and session tracking.
+		 * For EXISTING sessions (cluster-synced), DROP instead of
+		 * XDP_PASS.  XDP_PASS would hand the un-NAT'd packet to the
+		 * kernel, which either delivers it locally (return SNAT
+		 * traffic has dst = local VIP → kernel sends RST) or
+		 * forwards it with the wrong source IP (forward SNAT has
+		 * private src → server sends RST).  Either way, the TCP
+		 * connection is killed permanently.
+		 *
+		 * Dropping is safe: userspace ARP warmup resolves neighbors
+		 * within ~50 ms after VRRP MASTER transition.  TCP
+		 * retransmits at ~200 ms recover the connection with only a
+		 * brief throughput dip instead of a permanent failure.
+		 *
+		 * For NEW connections (no session), XDP_PASS the original
+		 * un-NAT'd packet as before so the kernel resolves ARP/NDP
+		 * and the TCP SYN retransmit goes through the full pipeline.
 		 */
+		if (sv4 != NULL) {
+			inc_counter(GLOBAL_CTR_DROPS);
+			return XDP_DROP;
+		}
+		if (sv6 != NULL) {
+			inc_counter(GLOBAL_CTR_DROPS);
+			return XDP_DROP;
+		}
 		TRACE_ZONE(meta);
 		inc_counter(GLOBAL_CTR_HOST_INBOUND);
 		if (meta->ingress_vlan_id != 0) {

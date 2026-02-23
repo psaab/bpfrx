@@ -546,8 +546,46 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 		s.stats.SessionsReceived.Add(1)
 		if s.dp != nil {
 			if key, val, ok := decodeSessionV4Payload(payload); ok {
+				// Rebase timestamps to local monotonic clock so the
+				// local GC doesn't expire sessions due to clock skew
+				// between cluster nodes (different boot times).
+				localNow := monotonicSeconds()
+				val.LastSeen = localNow
+				if val.Created > localNow {
+					val.Created = localNow
+				}
+
 				if err := s.dp.SetSessionV4(key, val); err == nil {
 					s.stats.SessionsInstalled.Add(1)
+				}
+				// Create reverse session entry from forward entries so return
+				// traffic matches conntrack on the takeover node.
+				if val.IsReverse == 0 && val.ReverseKey.Protocol != 0 {
+					revVal := val
+					revVal.IsReverse = 1
+					revVal.ReverseKey = key
+					if err := s.dp.SetSessionV4(val.ReverseKey, revVal); err != nil {
+						slog.Warn("cluster sync: failed to create reverse session", "err", err)
+					}
+				}
+				// Create dnat_table entry for SNAT reverse pre-routing.
+				// xdp_zone uses dnat_table to rewrite dst back to the real
+				// client before conntrack lookup on return traffic.
+				if val.IsReverse == 0 &&
+					val.Flags&dataplane.SessFlagSNAT != 0 &&
+					val.Flags&dataplane.SessFlagStaticNAT == 0 {
+					dnatKey := dataplane.DNATKey{
+						Protocol: key.Protocol,
+						DstIP:    val.NATSrcIP,
+						DstPort:  val.NATSrcPort,
+					}
+					dnatVal := dataplane.DNATValue{
+						NewDstIP:   binary.NativeEndian.Uint32(key.SrcIP[:]),
+						NewDstPort: key.SrcPort,
+					}
+					if err := s.dp.SetDNATEntry(dnatKey, dnatVal); err != nil {
+						slog.Warn("cluster sync: failed to create dnat_table entry", "err", err)
+					}
 				}
 			}
 		}
@@ -556,8 +594,35 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 		s.stats.SessionsReceived.Add(1)
 		if s.dp != nil {
 			if key, val, ok := decodeSessionV6Payload(payload); ok {
+				// Rebase timestamps to local monotonic clock (same as V4).
+				localNow := monotonicSeconds()
+				val.LastSeen = localNow
+				if val.Created > localNow {
+					val.Created = localNow
+				}
+
 				if err := s.dp.SetSessionV6(key, val); err == nil {
 					s.stats.SessionsInstalled.Add(1)
+				}
+				if val.IsReverse == 0 && val.ReverseKey.Protocol != 0 {
+					revVal := val
+					revVal.IsReverse = 1
+					revVal.ReverseKey = key
+					s.dp.SetSessionV6(val.ReverseKey, revVal)
+				}
+				if val.IsReverse == 0 &&
+					val.Flags&dataplane.SessFlagSNAT != 0 &&
+					val.Flags&dataplane.SessFlagStaticNAT == 0 {
+					dnatKey := dataplane.DNATKeyV6{
+						Protocol: key.Protocol,
+						DstIP:    val.NATSrcIP,
+						DstPort:  val.NATSrcPort,
+					}
+					dnatVal := dataplane.DNATValueV6{
+						NewDstIP:   key.SrcIP,
+						NewDstPort: key.SrcPort,
+					}
+					s.dp.SetDNATEntryV6(dnatKey, dnatVal)
 				}
 			}
 		}
@@ -571,6 +636,22 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 			key.SrcPort = binary.LittleEndian.Uint16(payload[8:10])
 			key.DstPort = binary.LittleEndian.Uint16(payload[10:12])
 			key.Protocol = payload[12]
+			// Look up session before deleting to clean up reverse entry
+			// and SNAT dnat_table entry.
+			if val, err := s.dp.GetSessionV4(key); err == nil {
+				if val.ReverseKey.Protocol != 0 {
+					s.dp.DeleteSession(val.ReverseKey)
+				}
+				if val.IsReverse == 0 &&
+					val.Flags&dataplane.SessFlagSNAT != 0 &&
+					val.Flags&dataplane.SessFlagStaticNAT == 0 {
+					s.dp.DeleteDNATEntry(dataplane.DNATKey{
+						Protocol: key.Protocol,
+						DstIP:    val.NATSrcIP,
+						DstPort:  val.NATSrcPort,
+					})
+				}
+			}
 			s.dp.DeleteSession(key)
 		}
 
@@ -583,6 +664,20 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 			key.SrcPort = binary.LittleEndian.Uint16(payload[32:34])
 			key.DstPort = binary.LittleEndian.Uint16(payload[34:36])
 			key.Protocol = payload[36]
+			if val, err := s.dp.GetSessionV6(key); err == nil {
+				if val.ReverseKey.Protocol != 0 {
+					s.dp.DeleteSessionV6(val.ReverseKey)
+				}
+				if val.IsReverse == 0 &&
+					val.Flags&dataplane.SessFlagSNAT != 0 &&
+					val.Flags&dataplane.SessFlagStaticNAT == 0 {
+					s.dp.DeleteDNATEntryV6(dataplane.DNATKeyV6{
+						Protocol: key.Protocol,
+						DstIP:    val.NATSrcIP,
+						DstPort:  val.NATSrcPort,
+					})
+				}
+			}
 			s.dp.DeleteSessionV6(key)
 		}
 

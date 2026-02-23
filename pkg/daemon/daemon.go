@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -2953,12 +2954,27 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			}
 
 			d.sessionSync.SetVRFDevice(vrfDevice)
-			if err := d.sessionSync.Start(ctx); err != nil {
-				slog.Warn("failed to start session sync", "err", err)
-			} else {
-				slog.Info("cluster session sync started",
-					"local", syncLocal, "peer", syncPeer, "vrf", vrfDevice)
-			}
+			// Retry sync start: the VRF device may not be created yet
+			// when this runs during daemon startup. The VRF is created
+			// during config compilation which happens shortly after.
+			go func() {
+				for i := 0; i < 30; i++ {
+					if err := d.sessionSync.Start(ctx); err != nil {
+						slog.Warn("failed to start session sync, retrying",
+							"err", err, "attempt", i+1)
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(2 * time.Second):
+						}
+						continue
+					}
+					slog.Info("cluster session sync started",
+						"local", syncLocal, "peer", syncPeer, "vrf", vrfDevice)
+					return
+				}
+				slog.Error("cluster session sync failed after retries")
+			}()
 
 			// Start periodic IPsec SA sync if enabled.
 			if cc.IPsecSASync && d.ipsec != nil {
@@ -3025,6 +3041,8 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 }
 
 // watchVRRPEvents monitors VRRP state changes and logs transitions.
+// On MASTER transition, triggers ARP/ND warmup for synced session
+// next-hops so that bpf_fib_lookup finds neighbor entries immediately.
 func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 	for {
 		select {
@@ -3038,7 +3056,87 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				"interface", ev.Interface,
 				"group", ev.GroupID,
 				"state", ev.State.String())
+			if ev.State == vrrp.StateMaster && d.dp != nil {
+				go d.warmNeighborCache()
+			}
 		}
+	}
+}
+
+// warmNeighborCache iterates synced sessions and sends ARP requests /
+// ICMPv6 Neighbor Solicitations for unique destination IPs. This
+// pre-populates the kernel neighbor cache so that bpf_fib_lookup
+// returns SUCCESS (not NO_NEIGH) for the first packet after failover.
+func (d *Daemon) warmNeighborCache() {
+	if d.dp == nil {
+		return
+	}
+
+	seen := make(map[[4]byte]bool)
+	seenV6 := make(map[[16]byte]bool)
+
+	// Iterate IPv4 sessions: collect unique dst IPs (forward entries
+	// need ARP for the next-hop toward the destination) and unique src IPs
+	// (return entries need ARP for the on-link client).
+	_ = d.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if !seen[key.DstIP] {
+			seen[key.DstIP] = true
+		}
+		if !seen[key.SrcIP] {
+			seen[key.SrcIP] = true
+		}
+		return true
+	})
+
+	// Iterate IPv6 sessions.
+	_ = d.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if !seenV6[key.DstIP] {
+			seenV6[key.DstIP] = true
+		}
+		if !seenV6[key.SrcIP] {
+			seenV6[key.SrcIP] = true
+		}
+		return true
+	})
+
+	// Resolve IPv4 neighbors by sending a UDP connect (triggers kernel ARP).
+	count := 0
+	for ip4 := range seen {
+		addr := netip.AddrFrom4(ip4)
+		if !addr.IsGlobalUnicast() || addr.IsPrivate() && addr.IsLoopback() {
+			continue
+		}
+		// net.Dial triggers kernel routing + ARP resolution.
+		conn, err := net.DialTimeout("udp4", netip.AddrPortFrom(addr, 1).String(), 50*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			count++
+		}
+	}
+
+	// Resolve IPv6 neighbors.
+	countV6 := 0
+	for ip6 := range seenV6 {
+		addr := netip.AddrFrom16(ip6)
+		if !addr.IsGlobalUnicast() {
+			continue
+		}
+		conn, err := net.DialTimeout("udp6", netip.AddrPortFrom(addr, 1).String(), 50*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			countV6++
+		}
+	}
+
+	if count > 0 || countV6 > 0 {
+		slog.Info("vrrp: neighbor cache warmup complete",
+			"ipv4_hosts", count, "ipv6_hosts", countV6)
 	}
 }
 
