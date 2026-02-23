@@ -530,30 +530,37 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		/*
 		 * Route exists but no ARP/NDP entry for the next hop.
 		 *
-		 * For EXISTING sessions (cluster-synced), DROP instead of
-		 * XDP_PASS.  XDP_PASS would hand the un-NAT'd packet to the
-		 * kernel, which either delivers it locally (return SNAT
-		 * traffic has dst = local VIP → kernel sends RST) or
-		 * forwards it with the wrong source IP (forward SNAT has
-		 * private src → server sends RST).  Either way, the TCP
-		 * connection is killed permanently.
+		 * For EXISTING sessions, route through conntrack for NAT
+		 * reversal, then let the kernel forward the post-NAT
+		 * packet.  The kernel resolves ARP/NDP inline (queues the
+		 * packet, sends ARP/NS, forwards on reply).  This is
+		 * better than XDP_DROP because:
+		 *  - No dependency on userspace ARP warmup timing
+		 *  - First packet triggers neighbor resolution; subsequent
+		 *    packets flow once bpf_fib_lookup sees the new entry
+		 *  - Works for IPv6 GUA addresses that warmup may miss
 		 *
-		 * Dropping is safe: userspace ARP warmup resolves neighbors
-		 * within ~50 ms after VRRP MASTER transition.  TCP
-		 * retransmits at ~200 ms recover the connection with only a
-		 * brief throughput dip instead of a permanent failure.
+		 * Cannot XDP_PASS the raw (un-NAT'd) packet — that would
+		 * hand the kernel a packet with private src (forward SNAT)
+		 * or local VIP dst (return SNAT), causing RSTs.
+		 * META_FLAG_KERNEL_ROUTE + conntrack ensures NAT is
+		 * reversed before the kernel sees the packet.
 		 *
 		 * For NEW connections (no session), XDP_PASS the original
-		 * un-NAT'd packet as before so the kernel resolves ARP/NDP
-		 * and the TCP SYN retransmit goes through the full pipeline.
+		 * un-NAT'd packet so the kernel resolves ARP/NDP and the
+		 * TCP SYN retransmit goes through the full pipeline.
 		 */
 		if (sv4 != NULL) {
-			inc_counter(GLOBAL_CTR_DROPS);
-			return XDP_DROP;
+			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
+			bpf_tail_call(ctx, &xdp_progs,
+				      XDP_PROG_CONNTRACK);
+			return XDP_PASS;
 		}
 		if (sv6 != NULL) {
-			inc_counter(GLOBAL_CTR_DROPS);
-			return XDP_DROP;
+			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
+			bpf_tail_call(ctx, &xdp_progs,
+				      XDP_PROG_CONNTRACK);
+			return XDP_PASS;
 		}
 		TRACE_ZONE(meta);
 		inc_counter(GLOBAL_CTR_HOST_INBOUND);

@@ -1084,16 +1084,21 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	d.resolveNeighbors(cfg)
 
 	// 5. Apply radvd config (Router Advertisements)
-	// Merge static RA configs with PD-derived prefixes from DHCPv6.
+	// In cluster mode, radvd/kea are managed by watchVRRPEvents — only
+	// the MASTER runs these services to prevent dual-RA / dual-DHCP.
+	// The VRRP event fires shortly after startup and calls applyRethServices().
+	isCluster := cfg.Chassis.Cluster != nil
 	raConfigs := d.buildRAConfigs(cfg)
-	if d.radvd != nil && len(raConfigs) > 0 {
-		if err := d.radvd.Apply(raConfigs); err != nil {
-			slog.Warn("failed to apply radvd config", "err", err)
-		}
-	} else if d.radvd != nil {
-		// No RA configs — clear any previous radvd config.
-		if err := d.radvd.Clear(); err != nil {
-			slog.Warn("failed to clear radvd config", "err", err)
+	if !isCluster {
+		if d.radvd != nil && len(raConfigs) > 0 {
+			if err := d.radvd.Apply(raConfigs); err != nil {
+				slog.Warn("failed to apply radvd config", "err", err)
+			}
+		} else if d.radvd != nil {
+			// No RA configs — clear any previous radvd config.
+			if err := d.radvd.Clear(); err != nil {
+				slog.Warn("failed to clear radvd config", "err", err)
+			}
 		}
 	}
 
@@ -1105,7 +1110,8 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	}
 
 	// 7. Apply DHCP server config (Kea DHCPv4 + DHCPv6)
-	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
+	// In cluster mode, deferred to VRRP MASTER transition.
+	if !isCluster && d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
 		// Resolve RETH interface names for Kea (needs real Linux names)
 		resolveDHCPRethInterfaces(&cfg.System.DHCPServer, cfg)
 		if err := d.dhcpServer.Apply(&cfg.System.DHCPServer); err != nil {
@@ -3048,6 +3054,8 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 // watchVRRPEvents monitors VRRP state changes and logs transitions.
 // On MASTER transition, triggers ARP/ND warmup for synced session
 // next-hops so that bpf_fib_lookup finds neighbor entries immediately.
+// Also starts/stops radvd and Kea DHCP server — these services must
+// only run on the primary to avoid dual-router / dual-DHCP issues.
 func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 	for {
 		select {
@@ -3063,8 +3071,58 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				"state", ev.State.String())
 			if ev.State == vrrp.StateMaster && d.dp != nil {
 				go d.warmNeighborCache()
+				d.applyRethServices()
+			}
+			if ev.State == vrrp.StateBackup {
+				d.clearRethServices()
 			}
 		}
+	}
+}
+
+// applyRethServices starts radvd and Kea DHCP server. Called on VRRP
+// MASTER transition — these services bind to RETH member interfaces
+// and must only run on the primary node to avoid dual-RA / dual-DHCP.
+func (d *Daemon) applyRethServices() {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	if d.radvd != nil {
+		raConfigs := d.buildRAConfigs(cfg)
+		if len(raConfigs) > 0 {
+			if err := d.radvd.Apply(raConfigs); err != nil {
+				slog.Warn("vrrp: failed to apply radvd on MASTER", "err", err)
+			} else {
+				slog.Info("vrrp: radvd started (MASTER)")
+			}
+		}
+	}
+	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
+		dhcpCfg := cfg.System.DHCPServer
+		resolveDHCPRethInterfaces(&dhcpCfg, cfg)
+		if err := d.dhcpServer.Apply(&dhcpCfg); err != nil {
+			slog.Warn("vrrp: failed to apply DHCP server on MASTER", "err", err)
+		} else {
+			slog.Info("vrrp: DHCP server started (MASTER)")
+		}
+	}
+}
+
+// clearRethServices stops radvd and Kea DHCP server. Called on VRRP
+// BACKUP transition to prevent the secondary from advertising RAs or
+// serving DHCP leases.
+func (d *Daemon) clearRethServices() {
+	if d.radvd != nil {
+		if err := d.radvd.Clear(); err != nil {
+			slog.Warn("vrrp: failed to clear radvd on BACKUP", "err", err)
+		} else {
+			slog.Info("vrrp: radvd stopped (BACKUP)")
+		}
+	}
+	if d.dhcpServer != nil {
+		d.dhcpServer.Clear()
+		slog.Info("vrrp: DHCP server stopped (BACKUP)")
 	}
 }
 
