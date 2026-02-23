@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
@@ -52,6 +53,75 @@ func (m *Manager) Apply(raConfigs []*config.RAInterfaceConfig) error {
 	}
 
 	return nil
+}
+
+// Withdraw sends a goodbye RA (router-lifetime=0) on all configured
+// interfaces so hosts immediately remove this router as a default
+// gateway, then stops radvd and removes the config. This prevents
+// stale RA routes lingering for up to 1800s after VRRP BACKUP transition.
+func (m *Manager) Withdraw() error {
+	// Read existing config to extract interface names for the goodbye RA.
+	existing, err := os.ReadFile(m.configPath)
+	if err != nil {
+		// No config — nothing to withdraw, just clean up.
+		return m.Clear()
+	}
+
+	// Build a goodbye config: same interfaces but AdvDefaultLifetime 0.
+	// This tells hosts to immediately remove us as a default router.
+	goodbye := m.rewriteLifetimeZero(string(existing))
+	if goodbye == "" {
+		return m.Clear()
+	}
+
+	if err := os.WriteFile(m.configPath, []byte(goodbye), 0644); err != nil {
+		slog.Warn("radvd: failed to write goodbye config, falling back to stop", "err", err)
+		return m.Clear()
+	}
+
+	// Reload triggers an immediate RA with the new (zero-lifetime) config.
+	if err := m.reload(); err != nil {
+		slog.Warn("radvd: reload for goodbye RA failed, falling back to stop", "err", err)
+		return m.Clear()
+	}
+
+	slog.Info("radvd: goodbye RA sent (lifetime=0)")
+
+	// Brief wait for the RA to be transmitted before stopping.
+	time.Sleep(500 * time.Millisecond)
+
+	return m.Clear()
+}
+
+// rewriteLifetimeZero rewrites an existing radvd config to set
+// AdvDefaultLifetime 0 on all interfaces for a goodbye RA.
+func (m *Manager) rewriteLifetimeZero(existing string) string {
+	// Parse interface names from existing config.
+	var ifaces []string
+	for _, line := range strings.Split(existing, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "interface ") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				ifaces = append(ifaces, parts[1])
+			}
+		}
+	}
+	if len(ifaces) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("# bpfrx goodbye RA (lifetime=0)\n\n")
+	for _, iface := range ifaces {
+		fmt.Fprintf(&b, "interface %s\n{\n", iface)
+		b.WriteString("    AdvSendAdvert on;\n")
+		b.WriteString("    AdvDefaultLifetime 0;\n")
+		b.WriteString("    MinRtrAdvInterval 3;\n")
+		b.WriteString("    MaxRtrAdvInterval 4;\n")
+		b.WriteString("};\n\n")
+	}
+	return b.String()
 }
 
 // Clear stops radvd and removes the config.

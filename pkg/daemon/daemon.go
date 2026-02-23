@@ -3109,15 +3109,17 @@ func (d *Daemon) applyRethServices() {
 	}
 }
 
-// clearRethServices stops radvd and Kea DHCP server. Called on VRRP
-// BACKUP transition to prevent the secondary from advertising RAs or
-// serving DHCP leases.
+// clearRethServices withdraws radvd (goodbye RA with lifetime=0) and
+// stops Kea DHCP server. Called on VRRP BACKUP transition to prevent
+// the secondary from advertising RAs or serving DHCP leases.
+// The goodbye RA tells hosts to immediately remove this router as a
+// default gateway, avoiding stale RA routes during failover.
 func (d *Daemon) clearRethServices() {
 	if d.radvd != nil {
-		if err := d.radvd.Clear(); err != nil {
-			slog.Warn("vrrp: failed to clear radvd on BACKUP", "err", err)
+		if err := d.radvd.Withdraw(); err != nil {
+			slog.Warn("vrrp: failed to withdraw radvd on BACKUP", "err", err)
 		} else {
-			slog.Info("vrrp: radvd stopped (BACKUP)")
+			slog.Info("vrrp: radvd withdrawn (BACKUP, goodbye RA sent)")
 		}
 	}
 	if d.dhcpServer != nil {

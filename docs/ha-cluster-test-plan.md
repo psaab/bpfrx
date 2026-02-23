@@ -628,27 +628,29 @@ incus exec cluster-lan-host -- ping -c 3 2001:559:8585:cf01::1
 
 ### TC-12: Hitless Forwarding Failover (IPv4 + IPv6)
 
-**Objective:** Verify transit traffic survives primary restart with minimal disruption.
+**Objective:** Verify transit traffic survives primary restart and full failover
+with minimal disruption, for both IPv4 (with SNAT) and IPv6.
 
-This tests the `META_FLAG_KERNEL_ROUTE` BPF fallback path: when
-`bpf_fib_lookup` returns LOCAL/NOT_FWDED for packets matching existing sessions
-(stale FIB cache after restart), the packet routes through conntrack for NAT
-reversal and then XDP_PASSes for kernel routing.
+This tests two `META_FLAG_KERNEL_ROUTE` BPF fallback paths:
+- **LOCAL/NOT_FWDED:** After daemon restart, existing sessions have stale FIB
+  cache (`fib_gen` mismatch). `bpf_fib_lookup` returns LOCAL/NOT_FWDED because
+  FRR routes haven't converged. The packet routes through conntrack for NAT
+  reversal and XDP_PASSes for kernel routing.
+- **NO_NEIGH:** After VRRP failover, the new MASTER has no ARP/NDP entry for
+  the next hop or the LAN client. `bpf_fib_lookup` returns NO_NEIGH. Same
+  path: conntrack for NAT reversal, then kernel resolves ARP/NDP inline.
+
+#### Ping-based tests
 
 ```bash
 # IPv4 forwarding test through SNAT:
-# 1. Start a long ping from LAN to an external host
 incus exec cluster-lan-host -- ping -c 30 -i 0.5 172.16.100.247 &
-
-# 2. After ~5 seconds, restart the primary
 sleep 5
 incus exec bpfrx-fw0 -- systemctl restart bpfrxd
+# Expected: 28-29/30 received (1-2 packets lost during restart)
 
-# 3. Wait for ping to complete, check results
-# Expected: 28-29/30 received (1-2 packets lost during restart, ~1s disruption)
-
-# IPv6 forwarding test:
-incus exec cluster-lan-host -- ping -c 30 -i 0.5 2001:559:8585:cf01::1 &
+# IPv6 forwarding test (no SNAT, routed):
+incus exec cluster-lan-host -- ping -c 30 -i 0.5 2607:f8b0:400f:806::200e &
 sleep 5
 incus exec bpfrx-fw0 -- systemctl restart bpfrxd
 # Expected: similar 1-2 packet loss
@@ -663,22 +665,67 @@ incus exec bpfrx-fw0 -- systemctl start bpfrxd
 # Expected: 3-5 more packets lost during preemption back
 ```
 
+#### iperf3 failover tests (throughput under failover)
+
+These verify that bulk TCP transfers survive VRRP failover without permanent
+connection death. The TCP cwnd should recover after a brief dip, not collapse.
+
+```bash
+# Requires an iperf3 server reachable from WAN (e.g. casper at 172.16.100.247
+# for IPv4 or 2001:559:8585:100::247 for IPv6).
+
+# --- IPv4 iperf3 failover ---
+# 1. Start iperf3 on LAN host (60s, BBR for fast recovery)
+incus exec cluster-lan-host -- iperf3 -c 172.16.100.247 -t 60 -C bbr &
+
+# 2. After 15s of steady state, stop primary (full VRRP failover)
+sleep 15
+incus exec bpfrx-fw0 -- systemctl stop bpfrxd
+
+# 3. Wait for secondary to take over, verify throughput resumes
+sleep 20
+
+# 4. Bring primary back (VRRP preemption)
+incus exec bpfrx-fw0 -- systemctl start bpfrxd
+
+# 5. Wait for iperf3 to finish, check results
+# Expected: throughput dips to ~0 for ~2s during each transition,
+# then recovers to multi-Gbps. Connection survives both transitions.
+
+# --- IPv6 iperf3 failover ---
+# 1. Start IPv6 iperf3 (routed, no SNAT)
+incus exec cluster-lan-host -- iperf3 -c 2001:559:8585:100::247 -t 60 -C bbr &
+
+# 2. Same failover sequence
+sleep 15
+incus exec bpfrx-fw0 -- systemctl stop bpfrxd
+sleep 20
+incus exec bpfrx-fw0 -- systemctl start bpfrxd
+
+# Expected: same behavior — brief throughput dip, full recovery,
+# connection survives. No cwnd collapse to 0.
+```
+
 **Pass criteria:**
-- Hitless restart (systemctl restart): <= 2 packets lost
-- Full failover (stop primary): <= 5 packets lost
+- Hitless restart (systemctl restart): <= 2 packets lost (ping)
+- Full failover (stop primary): <= 5 packets lost (ping)
+- iperf3 IPv4: TCP connection survives failover + preemption, throughput recovers
+- iperf3 IPv6: TCP connection survives failover + preemption, throughput recovers
+- No permanent traffic blackhole or cwnd collapse
 - Traffic auto-recovers after all transitions
-- No permanent traffic blackhole
 
 **How it works:**
 1. BPF programs pinned at `/sys/fs/bpf/bpfrx/` survive daemon restart
 2. Existing sessions preserved in pinned conntrack maps
 3. After restart, FIB cache in session entries is stale (`fib_gen` mismatch)
 4. `bpf_fib_lookup` may return LOCAL/NOT_FWDED (routes not yet in kernel)
+   or NO_NEIGH (ARP/NDP not yet resolved on new MASTER)
 5. `xdp_zone` detects existing session + failed FIB → sets `META_FLAG_KERNEL_ROUTE`
 6. `xdp_conntrack` processes session normally (NAT reversal via meta fields)
 7. `xdp_forward` sees `META_FLAG_KERNEL_ROUTE` → `XDP_PASS` for kernel routing
-8. Kernel forwards the NAT'd packet via its own routing table
-9. Once FRR converges (~1-2s), fresh FIB lookups succeed and XDP resumes direct forwarding
+8. Kernel forwards the NAT'd packet via its own routing table, resolving ARP/NDP inline
+9. Once FRR converges (~1-2s) and ARP/NDP resolves, fresh FIB lookups succeed
+   and XDP resumes direct forwarding
 
 ## Performance Expectations
 
@@ -730,6 +777,38 @@ NAT reversal, causing RSTs.
 
 **Result:** Hitless restart loses only 1-2 packets (ARP/NDP warmup delay) instead of
 permanent traffic blackhole for all existing sessions.
+
+### BPF FIB NO_NEIGH Fix (`d95a84e`)
+
+**Problem:** After VRRP failover, the new MASTER had no ARP/NDP entries for LAN
+clients or WAN next-hops. `bpf_fib_lookup` returned NO_NEIGH for synced sessions.
+The original fix (`0080cbc`) used XDP_DROP for existing sessions, relying on
+userspace ARP warmup (~50ms). This worked for IPv4 but failed for IPv6 GUA
+addresses that warmup didn't cover — return traffic was permanently dropped.
+
+**Fix:** Changed NO_NEIGH handling for existing sessions from XDP_DROP to
+`META_FLAG_KERNEL_ROUTE` + conntrack tail-call (same pattern as LOCAL/NOT_FWDED
+fix). Packets route through NAT reversal first, then the kernel forwards and
+resolves ARP/NDP inline (queues packet, sends ARP/NS, forwards on reply).
+
+**Result:** IPv6 iperf3 at ~4.5 Gbps survives full VRRP failover with only a
+~2s throughput dip. No dependency on userspace ARP warmup timing.
+
+### MASTER-Only radvd and Kea DHCP (`d95a84e`)
+
+**Problem:** Both cluster nodes ran radvd and Kea DHCP server, causing:
+- LAN hosts received Router Advertisements from both nodes, creating two IPv6
+  default routes (ECMP). Traffic hitting the BACKUP's link-local was blackholed.
+- Dual DHCP servers could cause lease conflicts.
+
+**Fix:** In cluster mode, `applyConfig()` skips radvd/kea startup. Instead,
+`watchVRRPEvents()` manages them based on VRRP state:
+- MASTER transition → `applyRethServices()` starts radvd + Kea
+- BACKUP transition → `clearRethServices()` stops radvd + Kea
+
+**Caveat:** After initial deployment or failover, stale RA routes on LAN hosts
+persist until the RA lifetime expires (default 1800s / 30 min). A future
+improvement could send a goodbye RA (lifetime=0) on BACKUP transition.
 
 ### VRRP Implementation History
 1. **Deadlock (`58ad85b`):** Manager write lock held during `stop()` which waited for blocking `recvmsg`. Fix: `SyscallConn().Control()`, `SetReadDeadline(1s)`, close-before-wait
