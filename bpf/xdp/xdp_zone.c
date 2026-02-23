@@ -567,6 +567,32 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		/*
 		 * No route or packet is destined locally.
 		 *
+		 * Existing session with failed FIB: route through conntrack
+		 * for NAT reversal, then let the kernel route the post-NAT
+		 * packet.  This covers:
+		 *  - Return SNAT traffic to local VIP after pre-routing DNAT
+		 *    rewrote dst to client IP, but FRR routes haven't
+		 *    converged yet after VRRP MASTER transition.
+		 *  - Any transient routing gap where connected routes exist
+		 *    in the kernel but bpf_fib_lookup returns NOT_FWDED.
+		 *
+		 * META_FLAG_KERNEL_ROUTE tells xdp_forward to skip
+		 * host-inbound filtering and XDP_PASS for kernel routing.
+		 */
+		if (sv4 != NULL) {
+			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
+			bpf_tail_call(ctx, &xdp_progs,
+				      XDP_PROG_CONNTRACK);
+			return XDP_PASS;
+		}
+		if (sv6 != NULL) {
+			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
+			bpf_tail_call(ctx, &xdp_progs,
+				      XDP_PROG_CONNTRACK);
+			return XDP_PASS;
+		}
+
+		/*
 		 * NAT64 reverse: IPv4 return traffic destined to the
 		 * firewall's SNAT pool address (a local IP).  Check
 		 * nat64_state before treating as host-inbound.

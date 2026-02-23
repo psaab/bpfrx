@@ -32,6 +32,22 @@ int xdp_forward_prog(struct xdp_md *ctx)
 	 * to the kernel stack.
 	 */
 	if (meta->fwd_ifindex == 0) {
+		/*
+		 * Kernel routing fallback: session traffic where BPF FIB
+		 * lookup failed (e.g. FRR routes not yet converged after
+		 * VRRP MASTER transition) but NAT has been reversed by
+		 * conntrack/nat stages.  Skip host-inbound policy — this
+		 * is transit traffic, not host-bound.
+		 */
+		if (meta->meta_flags & META_FLAG_KERNEL_ROUTE) {
+			if (meta->ingress_vlan_id != 0) {
+				if (xdp_vlan_tag_push(ctx,
+						meta->ingress_vlan_id) < 0)
+					return XDP_DROP;
+			}
+			inc_counter(GLOBAL_CTR_HOST_INBOUND);
+			return XDP_PASS;
+		}
 		__u32 zone_key = (__u32)meta->ingress_zone;
 		struct zone_config *zcfg = bpf_map_lookup_elem(&zone_configs, &zone_key);
 		if (zcfg && zcfg->host_inbound_flags != 0) {

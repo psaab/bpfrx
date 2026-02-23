@@ -196,6 +196,7 @@ struct icmp6hdr {
 /* pkt_meta.meta_flags bits */
 #define META_FLAG_EMBEDDED_ICMP      (1 << 0)
 #define META_FLAG_NAT64_ICMP_ERR     (1 << 1)
+#define META_FLAG_KERNEL_ROUTE       (1 << 2)
 
 /* Per-rule logging flags (policy_rule.log and session_value.log_flags) */
 #define LOG_FLAG_SESSION_INIT  (1 << 0)
