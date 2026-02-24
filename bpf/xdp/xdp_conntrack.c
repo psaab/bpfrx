@@ -386,8 +386,14 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS &&
-	    rc != BPF_FIB_LKUP_RET_NO_NEIGH)
+	    rc != BPF_FIB_LKUP_RET_NO_NEIGH) {
+		/* No route — cluster secondary may lack routes.
+		 * Try fabric redirect to primary. */
+		int fab_rc = try_fabric_redirect(ctx, meta);
+		if (fab_rc >= 0)
+			return fab_rc;
 		return -1;
+	}
 
 	if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
 		/*
@@ -586,8 +592,14 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 	__u32 fib_flags6 = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags6);
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS &&
-	    rc != BPF_FIB_LKUP_RET_NO_NEIGH)
+	    rc != BPF_FIB_LKUP_RET_NO_NEIGH) {
+		/* No route — cluster secondary may lack routes.
+		 * Try fabric redirect to primary. */
+		int fab_rc = try_fabric_redirect(ctx, meta);
+		if (fab_rc >= 0)
+			return fab_rc;
 		return -1;
+	}
 
 	if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
 		/*
