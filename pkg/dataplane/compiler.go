@@ -847,6 +847,12 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					primaryAddr = ""
 					preferredAddr = ""
 				}
+				// Management interfaces (fxp*, fab*) are bound to vrf-mgmt.
+				// Include VRF= in .network so networkctl reconfigure preserves binding.
+				vrfName := ""
+				if strings.HasPrefix(ifName, "fxp") || strings.HasPrefix(ifName, "fab") {
+					vrfName = "vrf-mgmt"
+				}
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 					Name:             linuxName,
 					MACAddress:       mac,
@@ -863,6 +869,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					MTU:              mtu,
 					Description:      ifCfg.Description,
 					KeepAddresses:    isVRRPReth,
+					VRFName:          vrfName,
 				})
 			}
 		}

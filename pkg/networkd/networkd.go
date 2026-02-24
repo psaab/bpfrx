@@ -42,6 +42,7 @@ type InterfaceConfig struct {
 	LACPRate         string   // LACP transmit rate: "fast" or "slow" (default)
 	MinLinks         int      // minimum active member links (0 = no minimum)
 	KeepAddresses    bool     // true = KeepConfiguration=static (preserve external addresses across reload)
+	VRFName          string   // VRF device name (e.g. "vrf-mgmt") — emits [Network] VRF= so networkctl reconfigure preserves binding
 }
 
 // Manager handles systemd-networkd .link and .network file generation.
@@ -314,6 +315,11 @@ func (m *Manager) generateNetwork(ifc InterfaceConfig) string {
 	}
 
 	b.WriteString("LinkLocalAddressing=ipv6\n")
+
+	// VRF membership — ensures networkctl reconfigure preserves the binding
+	if ifc.VRFName != "" {
+		fmt.Fprintf(&b, "VRF=%s\n", ifc.VRFName)
+	}
 
 	// Bond member: bind to bond master
 	if ifc.BondMaster != "" {
