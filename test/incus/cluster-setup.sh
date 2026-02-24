@@ -95,6 +95,16 @@ create_networks() {
 			ipv4.address="$subnet" \
 			ipv4.nat="$nat" \
 			ipv6.address=none
+		# Enable IPv6 on cluster LAN bridge so incus doesn't strip IPv6
+		# routes from containers. ra-param=*,0,0 suppresses default
+		# router advertisements so only the firewall's radvd is used.
+		if [[ "$name" == "bpfrx-clan" ]]; then
+			incus network set "$name" \
+				ipv6.address=fd42:cafe::1/64 \
+				ipv6.nat=false \
+				ipv6.dhcp=false \
+				raw.dnsmasq=ra-param=*,0,0
+		fi
 	done
 }
 
