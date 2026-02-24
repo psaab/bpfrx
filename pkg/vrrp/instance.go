@@ -65,6 +65,8 @@ type vrrpInstance struct {
 	// the link layer and works correctly. -1 means not used.
 	afPacketFD int
 
+	preemptNowCh chan struct{} // signals coordinated preemption from ReleaseSyncHold
+
 	rxCh    chan *VRRPPacket
 	stopCh  chan struct{}
 	stopped chan struct{}
@@ -78,6 +80,7 @@ func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent) *
 		iface:          iface,
 		eventCh:        eventCh,
 		afPacketFD:     -1,
+		preemptNowCh:   make(chan struct{}, 1),
 		rxCh:           make(chan *VRRPPacket, 16),
 		stopCh:         make(chan struct{}),
 		stopped:        make(chan struct{}),
@@ -156,6 +159,15 @@ func (vi *vrrpInstance) restorePreempt() {
 	vi.mu.Lock()
 	vi.cfg.Preempt = vi.desiredPreempt
 	vi.mu.Unlock()
+}
+
+// triggerPreemptNow signals the run loop to attempt immediate preemption.
+// Non-blocking: if a signal is already pending it is silently dropped.
+func (vi *vrrpInstance) triggerPreemptNow() {
+	select {
+	case vi.preemptNowCh <- struct{}{}:
+	default:
+	}
 }
 
 func (vi *vrrpInstance) getPriority() int {
@@ -249,6 +261,15 @@ func (vi *vrrpInstance) run() {
 				// Master timed out — become Master.
 				vi.becomeMaster()
 				advertTimer.Reset(vi.advertInterval())
+			case <-vi.preemptNowCh:
+				// Coordinated preemption from ReleaseSyncHold — all
+				// instances preempt simultaneously to minimize the
+				// asymmetric routing window during failback.
+				if vi.getPreempt() {
+					vi.becomeMaster()
+					advertTimer.Reset(vi.advertInterval())
+					masterDownTimer.Stop()
+				}
 			}
 
 		case StateMaster:

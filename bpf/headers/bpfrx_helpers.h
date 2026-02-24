@@ -1789,4 +1789,40 @@ tc_tcp_mss_clamp(struct __sk_buff *skb, __u16 l4_offset, __u16 max_mss,
 	return 0;
 }
 
+/* ============================================================
+ * Fabric cross-chassis redirect for cluster failback.
+ *
+ * When bpf_fib_lookup fails for an existing session (NO_NEIGH or
+ * NOT_FWDED during asymmetric routing window), redirect the ORIGINAL
+ * (pre-NAT) packet to the peer via the fabric link.  The peer processes
+ * it through its full pipeline.
+ *
+ * Returns >= 0 (XDP_REDIRECT) on success, -1 on failure (caller falls
+ * back to META_FLAG_KERNEL_ROUTE).
+ * ============================================================ */
+static __always_inline int
+try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	__u32 zero = 0;
+	struct fabric_fwd_info *ff = bpf_map_lookup_elem(&fabric_fwd, &zero);
+	if (!ff || ff->ifindex == 0)
+		return -1;
+
+	/* Anti-loop: don't redirect if packet arrived on fabric */
+	if (ctx->ingress_ifindex == ff->ifindex)
+		return -1;
+
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return -1;
+
+	__builtin_memcpy(eth->h_dest, ff->peer_mac, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, ff->local_mac, ETH_ALEN);
+
+	inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+	return bpf_redirect_map(&tx_ports, ff->ifindex, 0);
+}
+
 #endif /* __BPFRX_HELPERS_H__ */

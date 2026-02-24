@@ -1070,6 +1070,13 @@ func (m *Manager) SetFlowConfig(cfg dataplane.FlowConfigValue) error {
 	return nil
 }
 
+// --- Fabric cross-chassis forwarding ---
+
+func (m *Manager) UpdateFabricFwd(info dataplane.FabricFwdInfo) error {
+	// DPDK fabric redirect not implemented — cluster uses eBPF path.
+	return nil
+}
+
 // --- Firewall filters ---
 
 func (m *Manager) SetIfaceFilter(key dataplane.IfaceFilterKey, filterID uint32) error {

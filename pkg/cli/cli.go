@@ -3596,6 +3596,7 @@ func (c *CLI) showFlowStatistics() error {
 	hostAllow := readCounter(dataplane.GlobalCtrHostInbound)
 	tcEgress := readCounter(dataplane.GlobalCtrTCEgressPackets)
 	nat64 := readCounter(dataplane.GlobalCtrNAT64Xlate)
+	fabricRedir := readCounter(dataplane.GlobalCtrFabricRedirect)
 
 	fmt.Println("Flow statistics:")
 	fmt.Printf("  %-30s %d\n", "Current sessions:", sessNew-sessClosed)
@@ -3610,6 +3611,7 @@ func (c *CLI) showFlowStatistics() error {
 	fmt.Printf("  %-30s %d\n", "Policy deny:", policyDeny)
 	fmt.Printf("  %-30s %d\n", "NAT allocation failures:", natFail)
 	fmt.Printf("  %-30s %d\n", "NAT64 translations:", nat64)
+	fmt.Printf("  %-30s %d\n", "Fabric redirects:", fabricRedir)
 	fmt.Println()
 	fmt.Printf("  %-30s %d\n", "Host-inbound allowed:", hostAllow)
 	fmt.Printf("  %-30s %d\n", "Host-inbound denied:", hostDeny)

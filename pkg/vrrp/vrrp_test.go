@@ -543,6 +543,93 @@ func TestInstanceRestorePreempt(t *testing.T) {
 	}
 }
 
+func TestPreemptNowCh_Initialized(t *testing.T) {
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+
+	if vi.preemptNowCh == nil {
+		t.Fatal("preemptNowCh should be initialized")
+	}
+	if cap(vi.preemptNowCh) != 1 {
+		t.Errorf("preemptNowCh capacity = %d, want 1", cap(vi.preemptNowCh))
+	}
+}
+
+func TestTriggerPreemptNow_NonBlocking(t *testing.T) {
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+
+	// First call should succeed (buffer of 1).
+	vi.triggerPreemptNow()
+	if len(vi.preemptNowCh) != 1 {
+		t.Error("expected 1 pending signal after first trigger")
+	}
+
+	// Second call should NOT block (buffer full, silently dropped).
+	done := make(chan struct{})
+	go func() {
+		vi.triggerPreemptNow()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// ok — did not block
+	case <-time.After(1 * time.Second):
+		t.Fatal("triggerPreemptNow blocked on full channel")
+	}
+
+	// Still exactly 1 pending signal.
+	if len(vi.preemptNowCh) != 1 {
+		t.Errorf("expected 1 pending signal, got %d", len(vi.preemptNowCh))
+	}
+}
+
+func TestReleaseSyncHold_TriggersPreemptNow(t *testing.T) {
+	m := NewManager()
+
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, m.eventCh)
+
+	// Simulate sync hold: preempt suppressed.
+	vi.mu.Lock()
+	vi.cfg.Preempt = false
+	vi.mu.Unlock()
+
+	m.mu.Lock()
+	m.syncHold = true
+	m.instances = map[instanceKey]*vrrpInstance{
+		{iface: "eth0", groupID: 101}: vi,
+	}
+	m.mu.Unlock()
+
+	m.ReleaseSyncHold()
+
+	// Preempt should be restored.
+	if !vi.getPreempt() {
+		t.Error("expected preempt restored after ReleaseSyncHold")
+	}
+
+	// preemptNowCh should have a pending signal.
+	select {
+	case <-vi.preemptNowCh:
+		// ok — signal was sent
+	default:
+		t.Error("expected preemptNowCh signal after ReleaseSyncHold")
+	}
+}
+
 func TestUpdateConfig_PreservesDesiredPreempt(t *testing.T) {
 	vi := newInstance(Instance{
 		Interface: "eth0",

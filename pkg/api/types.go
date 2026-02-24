@@ -27,8 +27,9 @@ type GlobalStats struct {
 	ScreenDrops     uint64 `json:"screen_drops"`
 	PolicyDenies    uint64 `json:"policy_denies"`
 	NATAllocFails   uint64 `json:"nat_alloc_failures"`
-	HostInboundDeny uint64 `json:"host_inbound_denies"`
-	TCEgressPackets uint64 `json:"tc_egress_packets"`
+	HostInboundDeny  uint64 `json:"host_inbound_denies"`
+	TCEgressPackets  uint64 `json:"tc_egress_packets"`
+	FabricRedirects  uint64 `json:"fabric_redirects"`
 }
 
 // InterfaceStats holds per-interface counter values.

@@ -3185,11 +3185,85 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			if cc.IPsecSASync && d.ipsec != nil {
 				go d.syncIPsecSAPeriodic(ctx)
 			}
+
+			// Populate fabric_fwd BPF map for cross-chassis redirect.
+			// Retry: the peer ARP entry may not exist yet (heartbeat
+			// hasn't exchanged packets). Once populated, the BPF
+			// program can redirect packets to the peer during VRRP
+			// failback asymmetric routing windows.
+			go d.populateFabricFwd(ctx, cc.FabricInterface, cc.FabricPeerAddress)
 		} else {
 			slog.Warn("cluster: fabric interface has no IPv4 address",
 				"interface", cc.FabricInterface)
 		}
 	}
+}
+
+// populateFabricFwd resolves the fabric interface MACs and populates the
+// fabric_fwd BPF map for cross-chassis packet redirect during failback.
+func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr string) {
+	peerIP := net.ParseIP(peerAddr)
+	if peerIP == nil {
+		slog.Warn("cluster: invalid fabric peer address", "addr", peerAddr)
+		return
+	}
+
+	for i := 0; i < 30; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+
+		link, err := netlink.LinkByName(fabIface)
+		if err != nil {
+			slog.Debug("cluster: fabric link not found, retrying",
+				"interface", fabIface, "err", err)
+			continue
+		}
+		localMAC := link.Attrs().HardwareAddr
+		if len(localMAC) != 6 {
+			continue
+		}
+
+		// Resolve peer MAC from ARP/NDP table.
+		neighs, err := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
+		if err != nil {
+			slog.Debug("cluster: neigh list failed", "err", err)
+			continue
+		}
+		var peerMAC net.HardwareAddr
+		for _, n := range neighs {
+			if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
+				(n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT|netlink.NUD_DELAY|netlink.NUD_PROBE)) != 0 {
+				peerMAC = n.HardwareAddr
+				break
+			}
+		}
+		if peerMAC == nil {
+			if i == 0 {
+				slog.Info("cluster: waiting for fabric peer ARP entry",
+					"peer", peerAddr)
+			}
+			continue
+		}
+
+		info := dataplane.FabricFwdInfo{
+			Ifindex: uint32(link.Attrs().Index),
+		}
+		copy(info.PeerMAC[:], peerMAC)
+		copy(info.LocalMAC[:], localMAC)
+
+		if err := d.dp.UpdateFabricFwd(info); err != nil {
+			slog.Warn("cluster: failed to update fabric_fwd map", "err", err)
+			continue
+		}
+		slog.Info("cluster: fabric cross-chassis redirect enabled",
+			"interface", fabIface, "ifindex", info.Ifindex,
+			"local_mac", localMAC, "peer_mac", peerMAC)
+		return
+	}
+	slog.Warn("cluster: fabric_fwd map population failed after retries")
 }
 
 func (d *Daemon) watchClusterEvents(ctx context.Context) {

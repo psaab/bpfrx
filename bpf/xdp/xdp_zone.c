@@ -530,33 +530,33 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		/*
 		 * Route exists but no ARP/NDP entry for the next hop.
 		 *
-		 * For EXISTING sessions, route through conntrack for NAT
-		 * reversal, then let the kernel forward the post-NAT
-		 * packet.  The kernel resolves ARP/NDP inline (queues the
-		 * packet, sends ARP/NS, forwards on reply).  This is
-		 * better than XDP_DROP because:
-		 *  - No dependency on userspace ARP warmup timing
-		 *  - First packet triggers neighbor resolution; subsequent
-		 *    packets flow once bpf_fib_lookup sees the new entry
-		 *  - Works for IPv6 GUA addresses that warmup may miss
+		 * For EXISTING sessions in cluster mode, try fabric
+		 * cross-chassis redirect first — send the ORIGINAL
+		 * (pre-NAT) packet to the peer which has the working
+		 * route.  Falls back to kernel-route if fabric is
+		 * unavailable.
 		 *
-		 * Cannot XDP_PASS the raw (un-NAT'd) packet — that would
-		 * hand the kernel a packet with private src (forward SNAT)
-		 * or local VIP dst (return SNAT), causing RSTs.
-		 * META_FLAG_KERNEL_ROUTE + conntrack ensures NAT is
-		 * reversed before the kernel sees the packet.
+		 * For EXISTING sessions without fabric, route through
+		 * conntrack for NAT reversal, then let the kernel
+		 * forward the post-NAT packet.
 		 *
 		 * For NEW connections (no session), XDP_PASS the original
 		 * un-NAT'd packet so the kernel resolves ARP/NDP and the
 		 * TCP SYN retransmit goes through the full pipeline.
 		 */
 		if (sv4 != NULL) {
+			int fab_rc = try_fabric_redirect(ctx, meta);
+			if (fab_rc >= 0)
+				return fab_rc;
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
 		if (sv6 != NULL) {
+			int fab_rc = try_fabric_redirect(ctx, meta);
+			if (fab_rc >= 0)
+				return fab_rc;
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
@@ -574,25 +574,26 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		/*
 		 * No route or packet is destined locally.
 		 *
-		 * Existing session with failed FIB: route through conntrack
-		 * for NAT reversal, then let the kernel route the post-NAT
-		 * packet.  This covers:
-		 *  - Return SNAT traffic to local VIP after pre-routing DNAT
-		 *    rewrote dst to client IP, but FRR routes haven't
-		 *    converged yet after VRRP MASTER transition.
-		 *  - Any transient routing gap where connected routes exist
-		 *    in the kernel but bpf_fib_lookup returns NOT_FWDED.
+		 * Existing session with failed FIB: try fabric cross-chassis
+		 * redirect first (cluster failback), then fall back to
+		 * conntrack + kernel routing.
 		 *
 		 * META_FLAG_KERNEL_ROUTE tells xdp_forward to skip
 		 * host-inbound filtering and XDP_PASS for kernel routing.
 		 */
 		if (sv4 != NULL) {
+			int fab_rc = try_fabric_redirect(ctx, meta);
+			if (fab_rc >= 0)
+				return fab_rc;
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
 		if (sv6 != NULL) {
+			int fab_rc = try_fabric_redirect(ctx, meta);
+			if (fab_rc >= 0)
+				return fab_rc;
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);

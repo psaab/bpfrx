@@ -76,7 +76,8 @@
 #define GLOBAL_CTR_SCREEN_WINNUKE     23
 #define GLOBAL_CTR_SCREEN_IP_SRC_ROUTE 24
 #define GLOBAL_CTR_SCREEN_SYN_FRAG    25
-#define GLOBAL_CTR_MAX                26
+#define GLOBAL_CTR_FABRIC_REDIRECT    26
+#define GLOBAL_CTR_MAX                27
 
 /* ============================================================
  * RX mode constants

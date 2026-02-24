@@ -197,6 +197,9 @@ type DataPlane interface {
 	DeleteStaleIfaceFilter(written map[IfaceFilterKey]bool)
 	ZeroStaleFilterConfigs(startID uint32)
 
+	// Fabric cross-chassis forwarding
+	UpdateFabricFwd(info FabricFwdInfo) error
+
 	// Persistent NAT table
 	GetPersistentNAT() *PersistentNATTable
 

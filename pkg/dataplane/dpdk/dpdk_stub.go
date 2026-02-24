@@ -220,6 +220,10 @@ func (m *Manager) ClearMirrorConfigs() error                                    
 func (m *Manager) SetFlowTimeout(idx, seconds uint32) error          { return nil }
 func (m *Manager) SetFlowConfig(cfg dataplane.FlowConfigValue) error { return nil }
 
+// --- Fabric cross-chassis forwarding ---
+
+func (m *Manager) UpdateFabricFwd(info dataplane.FabricFwdInfo) error { return nil }
+
 // --- Firewall filters ---
 
 func (m *Manager) SetIfaceFilter(key dataplane.IfaceFilterKey, filterID uint32) error { return nil }

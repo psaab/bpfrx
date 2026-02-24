@@ -97,6 +97,13 @@ type bpfrxXdpNat64DnatValueV6 struct {
 	Pad        uint8
 }
 
+type bpfrxXdpNat64FabricFwdInfo struct {
+	_        structs.HostLayout
+	Ifindex  uint32
+	PeerMac  [6]uint8
+	LocalMac [6]uint8
+}
+
 type bpfrxXdpNat64FilterConfig struct {
 	_         structs.HostLayout
 	NumRules  uint32
@@ -618,6 +625,7 @@ type bpfrxXdpNat64MapSpecs struct {
 	DnatTable         *ebpf.MapSpec `ebpf:"dnat_table"`
 	DnatTableV6       *ebpf.MapSpec `ebpf:"dnat_table_v6"`
 	Events            *ebpf.MapSpec `ebpf:"events"`
+	FabricFwd         *ebpf.MapSpec `ebpf:"fabric_fwd"`
 	FibGenMap         *ebpf.MapSpec `ebpf:"fib_gen_map"`
 	FilterConfigs     *ebpf.MapSpec `ebpf:"filter_configs"`
 	FilterCounters    *ebpf.MapSpec `ebpf:"filter_counters"`
@@ -703,6 +711,7 @@ type bpfrxXdpNat64Maps struct {
 	DnatTable         *ebpf.Map `ebpf:"dnat_table"`
 	DnatTableV6       *ebpf.Map `ebpf:"dnat_table_v6"`
 	Events            *ebpf.Map `ebpf:"events"`
+	FabricFwd         *ebpf.Map `ebpf:"fabric_fwd"`
 	FibGenMap         *ebpf.Map `ebpf:"fib_gen_map"`
 	FilterConfigs     *ebpf.Map `ebpf:"filter_configs"`
 	FilterCounters    *ebpf.Map `ebpf:"filter_counters"`
@@ -764,6 +773,7 @@ func (m *bpfrxXdpNat64Maps) Close() error {
 		m.DnatTable,
 		m.DnatTableV6,
 		m.Events,
+		m.FabricFwd,
 		m.FibGenMap,
 		m.FilterConfigs,
 		m.FilterCounters,

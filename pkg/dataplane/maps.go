@@ -731,6 +731,16 @@ func (m *Manager) SetFlowConfig(cfg FlowConfigValue) error {
 	return zm.Update(uint32(0), cfg, ebpf.UpdateAny)
 }
 
+// UpdateFabricFwd writes the fabric cross-chassis forwarding config.
+// Pass a zero FabricFwdInfo (Ifindex=0) to disable fabric redirect.
+func (m *Manager) UpdateFabricFwd(info FabricFwdInfo) error {
+	zm, ok := m.maps["fabric_fwd"]
+	if !ok {
+		return fmt.Errorf("fabric_fwd map not found")
+	}
+	return zm.Update(uint32(0), info, ebpf.UpdateAny)
+}
+
 // SetStaticNATEntryV4 writes a static NAT v4 entry.
 func (m *Manager) SetStaticNATEntryV4(ip uint32, direction uint8, translated uint32) error {
 	zm, ok := m.maps["static_nat_v4"]

@@ -98,6 +98,7 @@ func (m *Manager) ReleaseSyncHold() {
 	}
 	for _, vi := range m.instances {
 		vi.restorePreempt()
+		vi.triggerPreemptNow()
 	}
 	slog.Info("vrrp: sync hold released, preemption enabled")
 }

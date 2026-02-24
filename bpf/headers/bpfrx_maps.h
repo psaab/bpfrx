@@ -720,6 +720,23 @@ struct {
 } mirror_counter SEC(".maps");
 
 /* ============================================================
+ * Fabric cross-chassis forwarding (cluster failback)
+ * ============================================================ */
+
+struct fabric_fwd_info {
+	__u32 ifindex;       /* fabric interface ifindex, 0 = disabled */
+	__u8  peer_mac[6];   /* peer's fabric MAC */
+	__u8  local_mac[6];  /* our fabric MAC */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct fabric_fwd_info);
+} fabric_fwd SEC(".maps");
+
+/* ============================================================
  * Policer maps (single-rate two-color token bucket)
  * ============================================================ */
 

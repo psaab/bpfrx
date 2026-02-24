@@ -77,8 +77,9 @@ func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		ScreenDrops:     readCounter(dataplane.GlobalCtrScreenDrops),
 		PolicyDenies:    readCounter(dataplane.GlobalCtrPolicyDeny),
 		NATAllocFails:   readCounter(dataplane.GlobalCtrNATAllocFail),
-		HostInboundDeny: readCounter(dataplane.GlobalCtrHostInboundDeny),
-		TCEgressPackets: readCounter(dataplane.GlobalCtrTCEgressPackets),
+		HostInboundDeny:  readCounter(dataplane.GlobalCtrHostInboundDeny),
+		TCEgressPackets:  readCounter(dataplane.GlobalCtrTCEgressPackets),
+		FabricRedirects:  readCounter(dataplane.GlobalCtrFabricRedirect),
 	}
 	writeOK(w, stats)
 }

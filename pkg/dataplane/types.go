@@ -225,7 +225,8 @@ const (
 	GlobalCtrScreenWinNuke     = 23
 	GlobalCtrScreenIPSrcRoute  = 24
 	GlobalCtrScreenSynFrag     = 25
-	GlobalCtrMax               = 26
+	GlobalCtrFabricRedirect    = 26
+	GlobalCtrMax               = 27
 )
 
 // Host-inbound-traffic service flags (bitmap in zone_config.host_inbound_flags).
@@ -491,6 +492,14 @@ type SNATValueV6 struct {
 	Mode      uint8
 	Pad       uint8
 	CounterID uint16 // index into nat_rule_counters
+}
+
+// FabricFwdInfo mirrors the C struct fabric_fwd_info for cluster
+// cross-chassis forwarding via the fabric link.
+type FabricFwdInfo struct {
+	Ifindex  uint32   // fabric interface ifindex, 0 = disabled
+	PeerMAC  [6]byte  // peer's fabric MAC
+	LocalMAC [6]byte  // our fabric MAC
 }
 
 // MirrorConfig mirrors the C struct mirror_config for port mirroring.

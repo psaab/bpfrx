@@ -45,6 +45,13 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 	if (meta->protocol == PROTO_TCP) {
 		__u8 new_state = ct_tcp_update_state(
 			sess->state, meta->tcp_flags, pkt_dir);
+		/* Suppress RST→CLOSED when packet will be kernel-routed.
+		 * The kernel may drop the packet (no route during failback),
+		 * so the RST never actually reaches the peer — don't poison
+		 * session state based on a potentially-dropped RST. */
+		if (new_state == SESS_STATE_CLOSED &&
+		    (meta->meta_flags & META_FLAG_KERNEL_ROUTE))
+			new_state = sess->state;
 		if (new_state != sess->state) {
 			sess->state = new_state;
 			__u32 new_timeout = ct_get_timeout(PROTO_TCP, new_state);
@@ -143,6 +150,13 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 	if (meta->protocol == PROTO_TCP) {
 		__u8 new_state = ct_tcp_update_state(
 			sess->state, meta->tcp_flags, pkt_dir);
+		/* Suppress RST→CLOSED when packet will be kernel-routed.
+		 * The kernel may drop the packet (no route during failback),
+		 * so the RST never actually reaches the peer — don't poison
+		 * session state based on a potentially-dropped RST. */
+		if (new_state == SESS_STATE_CLOSED &&
+		    (meta->meta_flags & META_FLAG_KERNEL_ROUTE))
+			new_state = sess->state;
 		if (new_state != sess->state) {
 			sess->state = new_state;
 			__u32 new_timeout = ct_get_timeout(PROTO_TCP, new_state);
