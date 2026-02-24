@@ -7,7 +7,7 @@ import (
 )
 
 func TestRethMAC(t *testing.T) {
-	mac := RethMAC(1, 1)
+	mac := RethMAC(1, 1, 0)
 	// Verify locally-administered unicast: bit 1 of first octet set, bit 0 clear.
 	if mac[0]&0x02 == 0 {
 		t.Error("expected locally-administered bit set")
@@ -15,24 +15,24 @@ func TestRethMAC(t *testing.T) {
 	if mac[0]&0x01 != 0 {
 		t.Error("expected unicast (multicast bit clear)")
 	}
-	// Verify format: 02:bf:72:CC:RR:00
+	// Verify format: 02:bf:72:CC:RR:NN
 	expected := net.HardwareAddr{0x02, 0xbf, 0x72, 0x01, 0x01, 0x00}
 	if mac.String() != expected.String() {
-		t.Errorf("RethMAC(1,1) = %s, want %s", mac, expected)
+		t.Errorf("RethMAC(1,1,0) = %s, want %s", mac, expected)
 	}
 }
 
 func TestRethMAC_Deterministic(t *testing.T) {
-	a := RethMAC(1, 2)
-	b := RethMAC(1, 2)
+	a := RethMAC(1, 2, 0)
+	b := RethMAC(1, 2, 0)
 	if a.String() != b.String() {
 		t.Errorf("same inputs produced different MACs: %s vs %s", a, b)
 	}
 }
 
 func TestRethMAC_DifferentRGs(t *testing.T) {
-	mac1 := RethMAC(1, 1)
-	mac2 := RethMAC(1, 2)
+	mac1 := RethMAC(1, 1, 0)
+	mac2 := RethMAC(1, 2, 0)
 	if mac1.String() == mac2.String() {
 		t.Errorf("different RGs should have different MACs: %s == %s", mac1, mac2)
 	}
@@ -43,10 +43,29 @@ func TestRethMAC_DifferentRGs(t *testing.T) {
 }
 
 func TestRethMAC_DifferentClusters(t *testing.T) {
-	mac1 := RethMAC(1, 1)
-	mac2 := RethMAC(2, 1)
+	mac1 := RethMAC(1, 1, 0)
+	mac2 := RethMAC(2, 1, 0)
 	if mac1.String() == mac2.String() {
 		t.Errorf("different cluster IDs should have different MACs: %s == %s", mac1, mac2)
+	}
+}
+
+func TestRethMAC_DifferentNodes(t *testing.T) {
+	mac0 := RethMAC(1, 1, 0)
+	mac1 := RethMAC(1, 1, 1)
+	if mac0.String() == mac1.String() {
+		t.Errorf("different nodes should have different MACs: %s == %s", mac0, mac1)
+	}
+	// Verify node byte differs
+	if mac0[5] == mac1[5] {
+		t.Errorf("node byte should differ: %02x vs %02x", mac0[5], mac1[5])
+	}
+	// Verify expected values
+	if mac0[5] != 0x00 {
+		t.Errorf("node 0 should have last byte 0x00, got 0x%02x", mac0[5])
+	}
+	if mac1[5] != 0x01 {
+		t.Errorf("node 1 should have last byte 0x01, got 0x%02x", mac1[5])
 	}
 }
 
@@ -56,7 +75,8 @@ func TestIsVirtualRethMAC(t *testing.T) {
 		mac  net.HardwareAddr
 		want bool
 	}{
-		{"virtual reth mac", net.HardwareAddr{0x02, 0xbf, 0x72, 0x01, 0x01, 0x00}, true},
+		{"virtual reth mac node0", net.HardwareAddr{0x02, 0xbf, 0x72, 0x01, 0x01, 0x00}, true},
+		{"virtual reth mac node1", net.HardwareAddr{0x02, 0xbf, 0x72, 0x01, 0x01, 0x01}, true},
 		{"virtual reth mac rg2", net.HardwareAddr{0x02, 0xbf, 0x72, 0x01, 0x02, 0x00}, true},
 		{"physical mac", net.HardwareAddr{0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc}, false},
 		{"wrong prefix", net.HardwareAddr{0x02, 0xbf, 0x73, 0x01, 0x01, 0x00}, false},

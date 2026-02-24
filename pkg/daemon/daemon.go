@@ -1082,11 +1082,12 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	}
 
 	// 2.6. Program deterministic virtual MACs on RETH member interfaces.
-	// Both cluster nodes get the same MAC per RETH, ensuring identical IPv6
-	// link-local addresses and seamless failover without neighbor cache issues.
+	// Each node gets a per-node MAC (02:bf:72:CC:RR:NN) to avoid FDB conflicts
+	// when both nodes' members are on the same L2 domain. VRRP + gratuitous NA
+	// handle failover; RA goodbye packets handle IPv6 default gateway transitions.
 	// Must run AFTER networkd.Apply() so .link renames are applied first.
 	if d.cluster != nil && cfg.Chassis.Cluster != nil {
-		clusterID := cfg.Chassis.Cluster.ClusterID
+		cc := cfg.Chassis.Cluster
 		rethToPhys := cfg.RethToPhysical()
 		for rethName, physName := range rethToPhys {
 			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
@@ -1097,7 +1098,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			// If the interface doesn't exist under its config name,
 			// find it by RETH virtual MAC and rename it.
 			if _, err := netlink.LinkByName(linuxName); err != nil {
-				mac := cluster.RethMAC(clusterID, rethCfg.RedundancyGroup)
+				mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
 				if oldName := renameRethMember(linuxName, mac); oldName != "" {
 					slog.Info("renamed RETH member interface",
 						"from", oldName, "to", linuxName)
@@ -1106,10 +1107,11 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 					fixRethLinkFile(linuxName, oldName)
 				}
 			}
-			// Disable DAD — both nodes share the same link-local address.
+			// Disable DAD — virtual MAC may still collide with peer on
+			// some deployments; disable to avoid DAD failures.
 			dadPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", linuxName)
 			os.WriteFile(dadPath, []byte("0"), 0644)
-			mac := cluster.RethMAC(clusterID, rethCfg.RedundancyGroup)
+			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
 			if err := programRethMAC(linuxName, mac); err != nil {
 				slog.Warn("failed to set RETH MAC", "iface", linuxName, "mac", mac, "err", err)
 			}

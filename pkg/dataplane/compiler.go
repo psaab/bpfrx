@@ -713,7 +713,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 			// by the expected RETH virtual MAC.
 			rgID := effectiveCfg.RedundancyGroup
 			expectedMAC := net.HardwareAddr{0x02, 0xbf, 0x72,
-				byte(cfg.Chassis.Cluster.ClusterID), byte(rgID), 0x00}
+				byte(cfg.Chassis.Cluster.ClusterID), byte(rgID), byte(clusterNodeID)}
 			physIface = findInterfaceByMAC(expectedMAC)
 			if physIface != nil {
 				slog.Info("found RETH member under kernel name",
