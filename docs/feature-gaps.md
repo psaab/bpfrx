@@ -1,6 +1,6 @@
 # bpfrx vs Juniper vSRX Feature Gap Analysis
 
-Last updated: 2026-02-14
+Last updated: 2026-02-24
 
 ## Summary
 
@@ -21,15 +21,15 @@ Last updated: 2026-02-14
 | PKI / Certificates | 4 | 0 | 0 | 4 |
 | Routing Enhancements | 11 | 3 | 0 | 14 |
 | VPN Enhancements | 8 | 1 | 0 | 9 |
-| HA Enhancements | 3 | 2 | 2 | 7 |
+| HA Enhancements | 0 | 0 | 0 | 0 |
 | Firewall Filter Enhancements | 4 | 1 | 0 | 5 |
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
-| Management & Automation | 10 | 2 | 0 | 12 |
-| Interface Enhancements | 5 | 1 | 2 | 8 |
+| Management & Automation | 9 | 2 | 0 | 11 |
+| Interface Enhancements | 4 | 2 | 1 | 7 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **148** | **20** | **9** | **177** |
+| **TOTAL** | **143** | **19** | **6** | **168** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -289,17 +289,17 @@ bpfrx has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfac
 
 ## 16. HA Enhancements
 
-bpfrx has a chassis cluster implementation with redundancy groups, RETH, heartbeat, GARP, weight-based failover, session sync (RTO), config sync, IP monitoring, election logic, and VRRP. These are additional/missing HA features.
+bpfrx has a full chassis cluster implementation with redundancy groups, RETH (VRRP-backed, virtual MAC), heartbeat, GARP, weight-based failover, session sync (RTO, per-RG aware), config sync, IP monitoring, election logic, VRRP, active/active per-RG service management, fabric bond redundancy, and ISSU. All HA features are now implemented.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **In-Service Software Upgrade (ISSU)** | `request system software in-service-upgrade ...` | Upgrade software without traffic interruption using cluster failover | Low | Missing |
-| **NAT State Synchronization** | `chassis cluster ... nat-state-synchronization` | Sync NAT translation table entries between cluster nodes for seamless failover | Medium | Missing |
-| **IPsec SA Synchronization** | `chassis cluster ... ipsec-session-synchronization` | Sync IPsec Security Associations between nodes. Avoids tunnel re-establishment after failover. | Medium | Missing |
-| **Active/Active Mode** | `chassis cluster redundancy-group N node 0 priority N node 1 priority N` (both nonzero) | Both nodes forward traffic simultaneously for different RGs. bpfrx currently supports active/passive primarily. | Medium | Partial (election logic exists but active/active forwarding path may be incomplete) |
-| **Redundant Ethernet (reth) Runtime** | `interfaces reth0 redundant-ether-options ...` | While reth is parsed, full bond failover with MAC migration, fabric link forwarding, and ARP notifications needs verification | Medium | Partial (reth.go exists but needs end-to-end validation) |
-| **Primary/Preferred Address per Interface** | `interfaces ... unit ... family inet address ... primary/preferred` | Select which address is used as source for traffic originated by the device | Low | Parse-Only |
-| **Fabric Link Redundancy** | `chassis cluster ... fabric-options member-interfaces` | Multiple fabric links between cluster nodes for data forwarding resilience | Low | Parse-Only |
+| **In-Service Software Upgrade (ISSU)** | `request system software in-service-upgrade ...` | Upgrade software without traffic interruption using cluster failover | Low | Done (`ForceSecondary()` drains all RGs to peer, operator replaces binary + restarts) |
+| **NAT State Synchronization** | `chassis cluster ... nat-state-synchronization` | Sync NAT translation table entries between cluster nodes for seamless failover | Medium | Done (session sync via RTO protocol includes SNAT/DNAT flags and NAT addresses in session_value struct) |
+| **IPsec SA Synchronization** | `chassis cluster ... ipsec-session-synchronization` | Sync IPsec Security Associations between nodes. Avoids tunnel re-establishment after failover. | Medium | Done (primary sends active connection names every 30s; new primary re-initiates via `swanctl --initiate`) |
+| **Active/Active Mode** | `chassis cluster redundancy-group N node 0 priority N node 1 priority N` (both nonzero) | Both nodes forward traffic simultaneously for different RGs. Per-RG VRRP service management, per-RG session sync with zone→RG mapping. | Medium | Done (per-RG service mgmt, per-RG session sync, per-RG election all implemented and tested) |
+| **Redundant Ethernet (reth) Runtime** | `interfaces reth0 redundant-ether-options ...` | Bondless RETH via VRRP on physical member interfaces, virtual MAC per node (`02:bf:72:CC:RR:NN`), programRethMAC, VIP reconciliation, fabric forwarding, `.link` files with OriginalName matching, session sync across nodes | Medium | Done (fully implemented and validated in cluster testing) |
+| **Primary/Preferred Address per Interface** | `interfaces ... unit ... family inet address ... primary/preferred` | Select which address is used as source for traffic originated by the device. Syslog source address prefers PrimaryAddress, networkd orders primary first. | Low | Done (syslog source address + networkd ordering) |
+| **Fabric Link Redundancy** | `chassis cluster ... fabric-options member-interfaces` | Multiple fabric links between cluster nodes for data forwarding resilience. Linux bond (active-backup) with MII monitoring. | Low | Done (systemd-networkd bond generation with active-backup mode, transparent to BPF/sync) |
 
 ---
 
@@ -354,7 +354,7 @@ bpfrx has gRPC (48+ RPCs), REST API, Junos-style CLI (local + remote), Prometheu
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **NETCONF/YANG** | `system services netconf ...` | Standards-based config management (RFC 6241). Enables Ansible, Salt, Terraform, ncclient integration. XML-based RPC. | High | Missing |
-| **Configuration Groups** | `groups { name { ... } }; apply-groups name` | Template inheritance for config reuse. Apply common settings to multiple stanzas without duplication. | Medium | Missing |
+| **Configuration Groups** | `groups { name { ... } }; apply-groups name` | Template inheritance for config reuse. Apply common settings to multiple stanzas without duplication. | Medium | Done (`ExpandGroupsWithVars()` resolves apply-groups with `${node}` variable support; `CompileConfigForNode()` for HA per-node config) |
 | **Commit Scripts** | `system scripts commit ...` | Pre-commit validation scripts (SLAX/Python) that enforce config standards and generate warnings/errors | Low | Missing |
 | **Op Scripts** | `system scripts op ...` | Custom operational commands via SLAX/Python scripts | Low | Missing |
 | **RADIUS Authentication** | `system radius-server ...; system authentication-order radius` | External RADIUS authentication for management access (SSH, CLI, web) | Medium | Missing |
@@ -378,9 +378,9 @@ bpfrx manages all interfaces with .link/.network files, supports VLANs, tunnel i
 | **Transparent Mode (L2 Bridging)** | `interfaces ... family ethernet-switching; bridge-domains ...` | Layer 2 bridge mode where firewall acts as transparent inline device. Zone-based policies still apply. MAC learning table. | Medium | Missing |
 | **Flexible VLAN Tagging** | `interfaces ... flexible-vlan-tagging; encapsulation flexible-ethernet-services` | Q-in-Q (802.1ad), flexible VLAN push/pop/swap operations. bpfrx has basic 802.1Q single-tag. | Low | Missing |
 | **Interface Bandwidth** | `interfaces ... bandwidth ...` | Set logical interface bandwidth for OSPF cost calculation and traffic-engineering | Low | Missing |
-| **IRB Interfaces** | `interfaces irb unit N family inet address ...` | Integrated Routing and Bridging: L3 interface in bridge domain for inter-VLAN routing | Medium | Missing |
+| **IRB Interfaces** | `interfaces irb unit N family inet address ...; bridge-domains bd0 { vlan-id-list ...; routing-interface irb.0; }` | Integrated Routing and Bridging: kernel Linux bridge per bridge-domain, IRB addresses on bridge device, zone assignment, .netdev/.network generation | Medium | Done (config parsing, compiler, networkd bridge/member/IRB generation, zone resolution) |
 | **Point-to-Point** | `interfaces ... unit ... point-to-point` | Mark interface as point-to-point (affects OSPF network type, ND behavior) | Low | Parse-Only |
-| **Primary/Preferred Address** | `interfaces ... unit ... family inet address ... primary/preferred` | Control which address is used for sourced traffic | Low | Parse-Only |
+| **Primary/Preferred Address** | `interfaces ... unit ... family inet address ... primary/preferred` | Control which address is used for sourced traffic. Syslog source and networkd ordering implemented; not yet used for all device-originated traffic. | Low | Partial (syslog source + networkd ordering, not all traffic) |
 | **Interface Description** | `interfaces ... description "..."` | bpfrx parses descriptions. Verify they appear in `show interfaces` output. | Low | Partial (parsed, display may need verification) |
 
 ---
@@ -431,33 +431,31 @@ Features most commonly used in production vSRX deployments:
 ### Tier 2 - Medium Priority (Enterprise Features)
 Features commonly requested in enterprise deployments:
 
-8. **Configuration Groups (apply-groups)** - Major usability improvement for large configs
-9. **RADIUS/TACACS+ Authentication** - Enterprise AAA integration
-10. **SSL VPN / Remote Access VPN** - Remote worker connectivity
-11. **Aggressive Session Aging** - Session table management under load
-12. **Graceful Restart** - Non-stop routing (FRR already supports)
-13. **Twice NAT** - Complex NAT scenarios
-14. **Structured Syslog** - Machine-parseable security logs
-15. **Transparent Mode (L2)** - Inline transparent firewall deployment
-16. **Link Aggregation (LAG)** - Bandwidth aggregation and link redundancy
-17. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication
-18. **SecIntel / GeoIP** - Threat intelligence integration
-19. **Captive Portal / User Firewall** - User-based access control
-20. **Logical Systems (LSYS)** - Multi-tenancy
+8. **RADIUS/TACACS+ Authentication** - Enterprise AAA integration
+9. **SSL VPN / Remote Access VPN** - Remote worker connectivity
+10. **Aggressive Session Aging** - Session table management under load
+11. **Graceful Restart** - Non-stop routing (FRR already supports)
+12. **Twice NAT** - Complex NAT scenarios
+13. **Transparent Mode (L2)** - Inline transparent firewall deployment
+14. **Link Aggregation (LAG)** - Bandwidth aggregation and link redundancy
+15. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication
+16. **SecIntel / GeoIP** - Threat intelligence integration
+17. **Captive Portal / User Firewall** - User-based access control
+18. **Logical Systems (LSYS)** - Multi-tenancy
 
 ### Tier 3 - Low Priority (Specialized / Niche)
 Features for specific use cases or carrier deployments:
 
-21. Content Security (UTM) - AV/web-filtering (consider ClamAV/rspamd)
-22. SSL Proxy - TLS inspection (consider mitmproxy integration)
-23. Multicast (PIM/IGMP)
-24. MPLS/LDP
-25. EVPN/VXLAN
-26. DS-Lite/6rd/MAP-E
-27. GTP Firewall
-28. SD-WAN
-29. PowerMode IPsec
-30. Class of Service (not supported on vSRX anyway)
+19. Content Security (UTM) - AV/web-filtering (consider ClamAV/rspamd)
+20. SSL Proxy - TLS inspection (consider mitmproxy integration)
+21. Multicast (PIM/IGMP)
+22. MPLS/LDP
+23. EVPN/VXLAN
+24. DS-Lite/6rd/MAP-E
+25. GTP Firewall
+26. SD-WAN
+27. PowerMode IPsec
+28. Class of Service (not supported on vSRX anyway)
 
 ---
 
@@ -467,15 +465,12 @@ These features have config parsing in bpfrx but NO runtime effect:
 
 | # | Config Path | Type | Notes |
 |---|------------|------|-------|
-| 1 | `security log mode` | LogConfig.Mode | Always uses stream mode |
-| 2 | `security pre-id-default-policy` | PreIDDefaultPolicy | Requires AppID engine |
-| 3 | `system master-password` | SystemConfig.MasterPassword | No encrypted storage |
-| 4 | `system license autoupdate url` | SystemConfig.LicenseAutoUpdate | No licensing system |
-| 5 | `system ntp threshold action` | SystemConfig.NTPThresholdAction | Not wired to NTP config |
-| 6 | `interfaces ... address primary` | InterfaceUnit.PrimaryAddress | Not used for source selection |
-| 7 | `interfaces ... address preferred` | InterfaceUnit.PreferredAddress | Not used for source selection |
-| 8 | `interfaces ... point-to-point` | InterfaceUnit.PointToPoint | Not passed to networkd |
-| 9 | `services application-identification` | ServicesConfig.ApplicationIdentification | Bool flag only, no DPI |
+| 1 | `security pre-id-default-policy` | PreIDDefaultPolicy | Requires AppID engine |
+| 2 | `system master-password` | SystemConfig.MasterPassword | No encrypted storage |
+| 3 | `system license autoupdate url` | SystemConfig.LicenseAutoUpdate | No licensing system |
+| 4 | `system ntp threshold action` | SystemConfig.NTPThresholdAction | Not wired to NTP config |
+| 5 | `interfaces ... point-to-point` | InterfaceUnit.PointToPoint | Not passed to networkd |
+| 6 | `services application-identification` | ServicesConfig.ApplicationIdentification | Bool flag only, no DPI |
 
 ---
 

@@ -111,6 +111,22 @@ func (m *Manager) Withdraw() error {
 	return nil
 }
 
+// WithdrawInterfaces sends goodbye RAs and stops senders only for the
+// named interfaces. Other senders are left running.
+func (m *Manager) WithdrawInterfaces(names []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, name := range names {
+		if s, ok := m.senders[name]; ok {
+			slog.Info("ra: sending goodbye RA (per-RG)", "interface", name)
+			s.sendGoodbyeRA()
+			s.stop()
+			delete(m.senders, name)
+		}
+	}
+}
+
 // Clear stops all senders without sending goodbye RAs.
 func (m *Manager) Clear() error {
 	m.mu.Lock()

@@ -355,6 +355,18 @@ func (m *Manager) IsLocalPrimary(rgID int) bool {
 	return false
 }
 
+// IsLocalPrimaryAny returns true if this node is primary for any RG.
+func (m *Manager) IsLocalPrimaryAny() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, rg := range m.groups {
+		if rg.State == StatePrimary {
+			return true
+		}
+	}
+	return false
+}
+
 // ManualFailover forces a redundancy group to failover.
 func (m *Manager) ManualFailover(rgID int) error {
 	m.mu.Lock()

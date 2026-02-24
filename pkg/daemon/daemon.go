@@ -103,6 +103,10 @@ type Daemon struct {
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
 	mgmtVRFInterfaces map[string]bool
+
+	// rethMasterState tracks per-RG VRRP master state. In active/active HA,
+	// a node can be MASTER for one RG and BACKUP for another simultaneously.
+	rethMasterState map[int]bool
 }
 
 // New creates a new Daemon.
@@ -250,6 +254,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.sessionSync.IsPrimaryFn = func() bool {
 			return d.cluster != nil && d.cluster.IsLocalPrimary(0)
 		}
+		d.sessionSync.IsPrimaryForRGFn = func(rgID int) bool {
+			return d.cluster != nil && d.cluster.IsLocalPrimary(rgID)
+		}
 		d.sessionSync.StartSyncSweep(ctx)
 	}
 
@@ -263,13 +270,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		gc = conntrack.NewGC(d.dp, 10*time.Second)
 
 		// Wire GC delete callbacks for incremental session sync.
+		// Deletes are synced if this node is primary for any RG — the peer
+		// ignores deletes for sessions it doesn't have.
 		gc.OnDeleteV4 = func(key dataplane.SessionKey) {
-			if d.cluster != nil && d.cluster.IsLocalPrimary(0) && d.sessionSync != nil {
+			if d.cluster != nil && d.cluster.IsLocalPrimaryAny() && d.sessionSync != nil {
 				d.sessionSync.QueueDeleteV4(key)
 			}
 		}
 		gc.OnDeleteV6 = func(key dataplane.SessionKeyV6) {
-			if d.cluster != nil && d.cluster.IsLocalPrimary(0) && d.sessionSync != nil {
+			if d.cluster != nil && d.cluster.IsLocalPrimaryAny() && d.sessionSync != nil {
 				d.sessionSync.QueueDeleteV6(key)
 			}
 		}
@@ -299,7 +308,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 					if rec.Type != "SESSION_OPEN" {
 						return
 					}
-					if d.cluster == nil || !d.cluster.IsLocalPrimary(0) {
+					if d.cluster == nil || !d.cluster.IsLocalPrimaryAny() {
 						return
 					}
 					if !d.sessionSync.IsConnected() {
@@ -319,7 +328,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
 						key.Protocol = proto
 						if val, err := d.dp.GetSessionV6(key); err == nil && val.IsReverse == 0 {
-							d.sessionSync.QueueSessionV6(key, val)
+							if d.sessionSync.ShouldSyncZone(val.IngressZone) {
+								d.sessionSync.QueueSessionV6(key, val)
+							}
 						}
 					} else {
 						var key dataplane.SessionKey
@@ -329,7 +340,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
 						key.Protocol = proto
 						if val, err := d.dp.GetSessionV4(key); err == nil && val.IsReverse == 0 {
-							d.sessionSync.QueueSessionV4(key, val)
+							if d.sessionSync.ShouldSyncZone(val.IngressZone) {
+								d.sessionSync.QueueSessionV4(key, val)
+							}
 						}
 					}
 				})
@@ -1177,6 +1190,11 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		if compileResult, err = d.dp.Compile(cfg); err != nil {
 			slog.Warn("failed to compile dataplane", "err", err)
 		}
+	}
+
+	// 2.1. Build zone→RG map for per-RG session sync.
+	if d.sessionSync != nil && compileResult != nil {
+		d.sessionSync.SetZoneRGMap(buildZoneRGMap(cfg, compileResult.ZoneIDs))
 	}
 
 	// 2.5. Write systemd-networkd config for managed interfaces
@@ -2093,6 +2111,32 @@ func buildZoneIDs(cfg *config.Config) map[string]uint16 {
 	return ids
 }
 
+// buildZoneRGMap builds a zone_id→RG mapping by looking up which interfaces
+// belong to each zone, then checking those interfaces' RedundancyGroup.
+// Zones with RETH interfaces inherit the RETH's RG; non-RETH zones are not
+// included (they fall back to global IsPrimaryFn in session sync).
+func buildZoneRGMap(cfg *config.Config, zoneIDs map[string]uint16) map[uint16]int {
+	result := make(map[uint16]int)
+	for zoneName, zone := range cfg.Security.Zones {
+		zid, ok := zoneIDs[zoneName]
+		if !ok {
+			continue
+		}
+		for _, ifName := range zone.Interfaces {
+			// Strip unit suffix (e.g. "reth0.0" → "reth0") for config lookup.
+			baseName := ifName
+			if idx := strings.IndexByte(ifName, '.'); idx >= 0 {
+				baseName = ifName[:idx]
+			}
+			if ifc, ok := cfg.Interfaces.Interfaces[baseName]; ok && ifc.RedundancyGroup > 0 {
+				result[zid] = ifc.RedundancyGroup
+				break // one RETH per zone is enough to determine the RG
+			}
+		}
+	}
+	return result
+}
+
 // parseAddrPair parses "ip:port" or "[ip]:port" into net.IPs and IPv6 flag.
 func parseAddrPair(src, dst string) (srcIP, dstIP net.IP, isV6 bool) {
 	srcIP = parseHost(src)
@@ -2214,19 +2258,11 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 		d.applyAggregator(er, cfg)
 		return
 	}
-	// Resolve global source-interface to IP (fallback for streams without source-address)
+	// Resolve global source-interface to IP (fallback for streams without source-address).
+	// Prefer PrimaryAddress from config if set on the source interface unit.
 	var globalSourceAddr string
 	if cfg.Security.Log.SourceInterface != "" {
-		if iface, err := net.InterfaceByName(cfg.Security.Log.SourceInterface); err == nil {
-			if addrs, err := iface.Addrs(); err == nil {
-				for _, a := range addrs {
-					if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
-						globalSourceAddr = ipn.IP.String()
-						break
-					}
-				}
-			}
-		}
+		globalSourceAddr = resolveSourceAddr(cfg, cfg.Security.Log.SourceInterface)
 	}
 
 	var clients []*logging.SyslogClient
@@ -2273,6 +2309,39 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 		er.SetSyslogClients(clients)
 	}
 	d.applyAggregator(er, cfg)
+}
+
+// resolveSourceAddr returns the source IP for syslog from the given interface.
+// It prefers PrimaryAddress from config (stripped to bare IP); falls back to
+// the first IPv4 address on the kernel interface.
+func resolveSourceAddr(cfg *config.Config, srcIface string) string {
+	// Parse "iface.unit" — e.g. "reth1.100" → base="reth1", unit=100
+	base, unitStr, hasUnit := strings.Cut(srcIface, ".")
+	unitNum := 0
+	if hasUnit {
+		if n, err := strconv.Atoi(unitStr); err == nil {
+			unitNum = n
+		}
+	}
+	if ifc, ok := cfg.Interfaces.Interfaces[base]; ok {
+		if unit, ok := ifc.Units[unitNum]; ok && unit.PrimaryAddress != "" {
+			// PrimaryAddress is CIDR — strip the prefix length
+			if ip, _, err := net.ParseCIDR(unit.PrimaryAddress); err == nil {
+				return ip.String()
+			}
+		}
+	}
+	// Fallback: first IPv4 from kernel
+	if iface, err := net.InterfaceByName(srcIface); err == nil {
+		if addrs, err := iface.Addrs(); err == nil {
+			for _, a := range addrs {
+				if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
+					return ipn.IP.String()
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // applyAggregator starts or stops the session aggregation reporter.
@@ -3464,12 +3533,22 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 	}
 }
 
+// rgIDFromVRID extracts the redundancy group ID from a VRRP group ID.
+// VRID = 100 + RG ID (set in pkg/vrrp/vrrp.go).
+func rgIDFromVRID(vrid int) int {
+	return vrid - 100
+}
+
 // watchVRRPEvents monitors VRRP state changes and logs transitions.
 // On MASTER transition, triggers ARP/ND warmup for synced session
 // next-hops so that bpf_fib_lookup finds neighbor entries immediately.
-// Also starts/stops RA senders and Kea DHCP server — these services must
-// only run on the primary to avoid dual-router / dual-DHCP issues.
+// Also starts/stops RA senders and Kea DHCP server per-RG — in
+// active/active mode, a BACKUP event for RG1 must not clear services
+// started for RG0.
 func (d *Daemon) watchVRRPEvents(ctx context.Context) {
+	if d.rethMasterState == nil {
+		d.rethMasterState = make(map[int]bool)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -3478,24 +3557,218 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 			if !ok {
 				return
 			}
+			rgID := rgIDFromVRID(ev.GroupID)
 			slog.Info("vrrp: state change",
 				"interface", ev.Interface,
 				"group", ev.GroupID,
+				"rg", rgID,
 				"state", ev.State.String())
-			if ev.State == vrrp.StateMaster && d.dp != nil {
-				go d.warmNeighborCache()
-				d.applyRethServices()
+			if ev.State == vrrp.StateMaster {
+				d.rethMasterState[rgID] = true
+				if d.dp != nil {
+					go d.warmNeighborCache()
+				}
+				d.applyRethServicesForRG(rgID)
 			}
 			if ev.State == vrrp.StateBackup {
-				d.clearRethServices()
+				d.rethMasterState[rgID] = false
+				d.clearRethServicesForRG(rgID)
 			}
 		}
 	}
 }
 
+// rethInterfacesForRG returns the Linux interface names of RETH interfaces
+// belonging to the given redundancy group.
+func rethInterfacesForRG(cfg *config.Config, rgID int) []string {
+	var names []string
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc.RedundancyGroup == rgID && strings.HasPrefix(name, "reth") {
+			// Resolve RETH to physical member for Linux-level operations.
+			resolved := config.LinuxIfName(cfg.ResolveReth(name))
+			for _, unit := range ifc.Units {
+				if unit.VlanID > 0 {
+					names = append(names, resolved+"."+fmt.Sprintf("%d", unit.VlanID))
+				} else {
+					names = append(names, resolved)
+				}
+			}
+		}
+	}
+	return names
+}
+
+// applyRethServicesForRG starts RA senders and Kea DHCP server only for
+// RETH interfaces belonging to the given RG. Called on VRRP MASTER
+// transition — these services must only run on the primary to avoid
+// dual-router / dual-DHCP issues.
+func (d *Daemon) applyRethServicesForRG(rgID int) {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	rgIfaces := rethInterfacesForRG(cfg, rgID)
+	rgIfaceSet := make(map[string]bool, len(rgIfaces))
+	for _, n := range rgIfaces {
+		rgIfaceSet[n] = true
+	}
+
+	if d.ra != nil {
+		allRA := d.buildRAConfigs(cfg)
+		var rgRA []*config.RAInterfaceConfig
+		for _, ra := range allRA {
+			if rgIfaceSet[ra.Interface] {
+				rgRA = append(rgRA, ra)
+			}
+		}
+		// Collect RA configs from ALL master RGs (not just this one).
+		for otherRG, isMaster := range d.rethMasterState {
+			if !isMaster || otherRG == rgID {
+				continue
+			}
+			otherIfaces := rethInterfacesForRG(cfg, otherRG)
+			otherSet := make(map[string]bool, len(otherIfaces))
+			for _, n := range otherIfaces {
+				otherSet[n] = true
+			}
+			for _, ra := range allRA {
+				if otherSet[ra.Interface] {
+					rgRA = append(rgRA, ra)
+				}
+			}
+		}
+		if len(rgRA) > 0 {
+			if err := d.ra.Apply(rgRA); err != nil {
+				slog.Warn("vrrp: failed to apply RA on MASTER", "rg", rgID, "err", err)
+			} else {
+				slog.Info("vrrp: RA senders started (MASTER)", "rg", rgID)
+			}
+		}
+	}
+	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
+		dhcpCfg := d.filterDHCPConfigForMasterRGs(cfg)
+		if dhcpCfg != nil {
+			if err := d.dhcpServer.Apply(dhcpCfg); err != nil {
+				slog.Warn("vrrp: failed to apply DHCP server on MASTER", "rg", rgID, "err", err)
+			} else {
+				slog.Info("vrrp: DHCP server started (MASTER)", "rg", rgID)
+			}
+		}
+	}
+}
+
+// clearRethServicesForRG withdraws RA senders and stops DHCP server only
+// for RETH interfaces belonging to the given RG. Called on VRRP BACKUP
+// transition. If other RGs are still MASTER, their services remain active.
+func (d *Daemon) clearRethServicesForRG(rgID int) {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+
+	// Check if any other RG is still master — if so, reapply services for
+	// those RGs only; otherwise clear everything.
+	anyOtherMaster := false
+	for otherRG, isMaster := range d.rethMasterState {
+		if otherRG != rgID && isMaster {
+			anyOtherMaster = true
+			break
+		}
+	}
+
+	if d.ra != nil {
+		if anyOtherMaster {
+			// Withdraw only this RG's interfaces; reapply others.
+			rgIfaces := rethInterfacesForRG(cfg, rgID)
+			d.ra.WithdrawInterfaces(rgIfaces)
+		} else {
+			if err := d.ra.Withdraw(); err != nil {
+				slog.Warn("vrrp: failed to withdraw RA on BACKUP", "rg", rgID, "err", err)
+			} else {
+				slog.Info("vrrp: RA withdrawn (BACKUP, goodbye RA sent)", "rg", rgID)
+			}
+		}
+	}
+	if d.dhcpServer != nil {
+		if anyOtherMaster {
+			// Reapply DHCP with only the remaining master RGs' interfaces.
+			dhcpCfg := d.filterDHCPConfigForMasterRGs(cfg)
+			if dhcpCfg != nil {
+				if err := d.dhcpServer.Apply(dhcpCfg); err != nil {
+					slog.Warn("vrrp: failed to reapply DHCP after RG BACKUP", "rg", rgID, "err", err)
+				}
+			} else {
+				d.dhcpServer.Clear()
+			}
+		} else {
+			d.dhcpServer.Clear()
+			slog.Info("vrrp: DHCP server stopped (BACKUP)", "rg", rgID)
+		}
+	}
+}
+
+// filterDHCPConfigForMasterRGs returns a DHCP config containing only groups
+// whose interfaces belong to RGs that are currently MASTER. Returns nil if
+// no groups match.
+func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPServerConfig {
+	// Collect all interfaces belonging to master RGs.
+	masterIfaces := make(map[string]bool)
+	for rgID, isMaster := range d.rethMasterState {
+		if !isMaster {
+			continue
+		}
+		for _, n := range rethInterfacesForRG(cfg, rgID) {
+			masterIfaces[n] = true
+		}
+	}
+
+	dhcpCfg := cfg.System.DHCPServer
+	resolveDHCPRethInterfaces(&dhcpCfg, cfg)
+
+	filterGroups := func(groups map[string]*config.DHCPServerGroup) map[string]*config.DHCPServerGroup {
+		if groups == nil {
+			return nil
+		}
+		result := make(map[string]*config.DHCPServerGroup)
+		for name, group := range groups {
+			var kept []string
+			for _, iface := range group.Interfaces {
+				if masterIfaces[iface] {
+					kept = append(kept, iface)
+				}
+			}
+			if len(kept) > 0 {
+				cp := *group
+				cp.Interfaces = kept
+				result[name] = &cp
+			}
+		}
+		return result
+	}
+
+	var result config.DHCPServerConfig
+	if dhcpCfg.DHCPLocalServer != nil {
+		filtered := filterGroups(dhcpCfg.DHCPLocalServer.Groups)
+		if len(filtered) > 0 {
+			result.DHCPLocalServer = &config.DHCPLocalServerConfig{Groups: filtered}
+		}
+	}
+	if dhcpCfg.DHCPv6LocalServer != nil {
+		filtered := filterGroups(dhcpCfg.DHCPv6LocalServer.Groups)
+		if len(filtered) > 0 {
+			result.DHCPv6LocalServer = &config.DHCPLocalServerConfig{Groups: filtered}
+		}
+	}
+	if result.DHCPLocalServer == nil && result.DHCPv6LocalServer == nil {
+		return nil
+	}
+	return &result
+}
+
 // applyRethServices starts RA senders and Kea DHCP server. Called on VRRP
 // MASTER transition — these services bind to RETH member interfaces
 // and must only run on the primary node to avoid dual-RA / dual-DHCP.
+// Deprecated: use applyRethServicesForRG for per-RG management.
 func (d *Daemon) applyRethServices() {
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
@@ -3526,6 +3799,7 @@ func (d *Daemon) applyRethServices() {
 // server. Called on VRRP BACKUP transition to prevent the secondary from
 // advertising RAs or serving DHCP leases. The goodbye RA tells hosts to
 // immediately remove this router as a default gateway.
+// Deprecated: use clearRethServicesForRG for per-RG management.
 func (d *Daemon) clearRethServices() {
 	if d.ra != nil {
 		if err := d.ra.Withdraw(); err != nil {

@@ -118,6 +118,10 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 			if err := compileSNMP(node, &cfg.System); err != nil {
 				return nil, fmt.Errorf("snmp: %w", err)
 			}
+		case "bridge-domains":
+			if err := compileBridgeDomains(node, &cfg.BridgeDomains); err != nil {
+				return nil, fmt.Errorf("bridge-domains: %w", err)
+			}
 		}
 	}
 
@@ -5812,6 +5816,48 @@ func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
 		}
 
 		*policies = append(*policies, ep)
+	}
+	return nil
+}
+
+// compileBridgeDomains parses the bridge-domains AST section into typed BridgeDomainConfig structs.
+func compileBridgeDomains(node *Node, bds *[]*BridgeDomainConfig) error {
+	for _, child := range node.Children {
+		if child.IsLeaf {
+			continue
+		}
+		bdName := child.Name()
+		bd := &BridgeDomainConfig{
+			Name: bdName,
+		}
+
+		// Collect VLAN IDs — multi-value leaf: each "vlan-id-list" child is a separate leaf
+		for _, vlanNode := range child.FindChildren("vlan-id-list") {
+			valStr := nodeVal(vlanNode)
+			if valStr == "" {
+				continue
+			}
+			v, err := strconv.Atoi(valStr)
+			if err != nil {
+				return fmt.Errorf("bridge-domain %s: invalid vlan-id-list value %q: %w", bdName, valStr, err)
+			}
+			if v < 1 || v > 4094 {
+				return fmt.Errorf("bridge-domain %s: vlan-id %d out of range (1-4094)", bdName, v)
+			}
+			bd.VlanIDs = append(bd.VlanIDs, v)
+		}
+
+		// Routing interface (e.g. "irb.0")
+		if riNode := child.FindChild("routing-interface"); riNode != nil {
+			bd.RoutingInterface = nodeVal(riNode)
+		}
+
+		// Domain type
+		if dtNode := child.FindChild("domain-type"); dtNode != nil {
+			bd.DomainType = nodeVal(dtNode)
+		}
+
+		*bds = append(*bds, bd)
 	}
 	return nil
 }

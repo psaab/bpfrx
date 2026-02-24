@@ -371,3 +371,189 @@ func TestGenerateNetwork_BondMember(t *testing.T) {
 		t.Error("missing RA disable for bond member")
 	}
 }
+
+func TestFabricBondNetdev(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:        "fab0",
+		IsBond:      true,
+		BondMode:    "active-backup",
+		Description: "Fabric HA link",
+		MTU:         9000,
+	}
+	got := m.generateNetdev(ifc)
+	if !strings.Contains(got, "Name=fab0\n") {
+		t.Error("missing Name=fab0")
+	}
+	if !strings.Contains(got, "Kind=bond\n") {
+		t.Error("missing Kind=bond")
+	}
+	if !strings.Contains(got, "Mode=active-backup\n") {
+		t.Error("missing Mode=active-backup")
+	}
+	if !strings.Contains(got, "MIIMonitorSec=100ms\n") {
+		t.Error("missing MIIMonitorSec=100ms for active-backup mode")
+	}
+	if !strings.Contains(got, "Description=Fabric HA link\n") {
+		t.Error("missing Description")
+	}
+	if !strings.Contains(got, "MTUBytes=9000\n") {
+		t.Error("missing MTUBytes")
+	}
+	// Active-backup should NOT have LACP settings
+	if strings.Contains(got, "LACPTransmitRate") {
+		t.Error("active-backup should not have LACPTransmitRate")
+	}
+	if strings.Contains(got, "TransmitHashPolicy") {
+		t.Error("active-backup should not have TransmitHashPolicy")
+	}
+}
+
+func TestFabricBondMembers(t *testing.T) {
+	m := New()
+
+	// Member interface should reference bond master
+	member := InterfaceConfig{
+		Name:       "enp6s0",
+		MACAddress: "52:54:00:fa:b0:01",
+		BondMaster: "fab0",
+	}
+	got := m.generateNetwork(member)
+	if !strings.Contains(got, "Bond=fab0\n") {
+		t.Errorf("missing Bond=fab0 in member .network:\n%s", got)
+	}
+	// Member should still have basic settings
+	if !strings.Contains(got, "IPv6AcceptRA=no\n") {
+		t.Error("missing RA disable for fabric member")
+	}
+	if !strings.Contains(got, "LinkLocalAddressing=ipv6\n") {
+		t.Error("missing LinkLocalAddressing for fabric member")
+	}
+
+	// Member .link should rename by MAC
+	link := m.generateLink(member)
+	if !strings.Contains(link, "MACAddress=52:54:00:fa:b0:01\n") {
+		t.Errorf("missing MAC in member .link:\n%s", link)
+	}
+	if !strings.Contains(link, "Name=enp6s0\n") {
+		t.Errorf("missing Name in member .link:\n%s", link)
+	}
+}
+
+func TestFabricBondNetworkAddresses(t *testing.T) {
+	m := New()
+	// Bond device itself should get fabric addresses
+	bond := InterfaceConfig{
+		Name:      "fab0",
+		IsBond:    true,
+		BondMode:  "active-backup",
+		Addresses: []string{"10.99.1.1/30"},
+		VRFName:   "vrf-mgmt",
+	}
+	got := m.generateNetwork(bond)
+	if !strings.Contains(got, "Address=10.99.1.1/30\n") {
+		t.Errorf("missing fabric address in bond .network:\n%s", got)
+	}
+	if !strings.Contains(got, "VRF=vrf-mgmt\n") {
+		t.Errorf("missing VRF=vrf-mgmt in bond .network:\n%s", got)
+	}
+}
+
+func TestGenerateBridgeNetdev(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:     "br-bd0",
+		IsBridge: true,
+	}
+	got := m.generateBridgeNetdev(ifc)
+	if !strings.Contains(got, "[NetDev]\n") {
+		t.Error("missing [NetDev] section")
+	}
+	if !strings.Contains(got, "Name=br-bd0\n") {
+		t.Error("missing Name=br-bd0")
+	}
+	if !strings.Contains(got, "Kind=bridge\n") {
+		t.Error("missing Kind=bridge")
+	}
+}
+
+func TestGenerateBridgeNetdev_WithMTU(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:        "br-bd0",
+		IsBridge:    true,
+		MTU:         9000,
+		Description: "VLAN 100+200 bridge",
+	}
+	got := m.generateBridgeNetdev(ifc)
+	if !strings.Contains(got, "MTUBytes=9000\n") {
+		t.Error("missing MTU")
+	}
+	if !strings.Contains(got, "Description=VLAN 100+200 bridge\n") {
+		t.Error("missing Description")
+	}
+}
+
+func TestGenerateNetwork_BridgeMaster(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:         "trust0.100",
+		BridgeMaster: "br-bd0",
+	}
+	got := m.generateNetwork(ifc)
+	if !strings.Contains(got, "Bridge=br-bd0\n") {
+		t.Errorf("missing Bridge=br-bd0:\n%s", got)
+	}
+}
+
+func TestGenerateNetwork_BridgeDevice(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:      "br-bd0",
+		IsBridge:  true,
+		Addresses: []string{"10.0.100.1/24", "2001:db8:100::1/64"},
+	}
+	got := m.generateNetwork(ifc)
+	if !strings.Contains(got, "Name=br-bd0\n") {
+		t.Error("missing bridge device Name match")
+	}
+	if !strings.Contains(got, "Address=10.0.100.1/24\n") {
+		t.Error("missing IPv4 address on bridge device")
+	}
+	if !strings.Contains(got, "Address=2001:db8:100::1/64\n") {
+		t.Error("missing IPv6 address on bridge device")
+	}
+}
+
+func TestApply_BridgeExpectedFiles(t *testing.T) {
+	dir := t.TempDir()
+	m := &Manager{networkDir: dir}
+
+	interfaces := []InterfaceConfig{
+		{
+			Name:     "br-bd0",
+			IsBridge: true,
+		},
+		{
+			Name:         "trust0.100",
+			BridgeMaster: "br-bd0",
+		},
+	}
+
+	// Apply should not fail (networkctl won't work in test, but file generation should)
+	_ = m.Apply(interfaces)
+
+	// Verify expected files exist
+	netdevPath := filepath.Join(dir, filePrefix+"br-bd0.netdev")
+	if _, err := os.Stat(netdevPath); os.IsNotExist(err) {
+		t.Error("missing bridge .netdev file")
+	}
+	networkPath := filepath.Join(dir, filePrefix+"br-bd0.network")
+	if _, err := os.Stat(networkPath); os.IsNotExist(err) {
+		t.Error("missing bridge .network file")
+	}
+	memberPath := filepath.Join(dir, filePrefix+"trust0.100.network")
+	if _, err := os.Stat(memberPath); os.IsNotExist(err) {
+		t.Error("missing bridge member .network file")
+	}
+}

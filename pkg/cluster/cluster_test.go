@@ -782,3 +782,75 @@ func TestEventsChannel(t *testing.T) {
 	default:
 	}
 }
+
+func TestIsLocalPrimaryAny(t *testing.T) {
+	m := NewManager(0, 1)
+
+	// No groups configured yet — should return false.
+	if m.IsLocalPrimaryAny() {
+		t.Fatal("should not be primary with no groups")
+	}
+
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200, 1: 100}),
+		makeRG(1, false, map[int]int{0: 100, 1: 200}),
+	)
+	m.UpdateConfig(cfg)
+
+	// After UpdateConfig with single-node election, all groups become primary.
+	if !m.IsLocalPrimaryAny() {
+		t.Fatal("should be primary for at least one RG after single-node election")
+	}
+
+	// Manually set both to secondary
+	m.mu.Lock()
+	m.groups[0].State = StateSecondary
+	m.groups[1].State = StateSecondary
+	m.mu.Unlock()
+
+	if m.IsLocalPrimaryAny() {
+		t.Fatal("should not be primary when all RGs are secondary")
+	}
+
+	// Make only RG 0 primary
+	m.mu.Lock()
+	m.groups[0].State = StatePrimary
+	m.mu.Unlock()
+
+	if !m.IsLocalPrimaryAny() {
+		t.Fatal("should be primary for at least one RG")
+	}
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("should be primary for RG 0")
+	}
+	if m.IsLocalPrimary(1) {
+		t.Fatal("should not be primary for RG 1")
+	}
+}
+
+func TestActiveActiveElection(t *testing.T) {
+	// Simulate active/active: node 0 has higher priority for RG 0,
+	// node 1 has higher priority for RG 1.
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, true, map[int]int{0: 200, 1: 100}),
+		makeRG(1, true, map[int]int{0: 100, 1: 200}),
+	)
+	m.UpdateConfig(cfg)
+
+	// Manually set states to simulate election result.
+	m.mu.Lock()
+	m.groups[0].State = StatePrimary   // node 0 wins RG 0
+	m.groups[1].State = StateSecondary // node 1 wins RG 1
+	m.mu.Unlock()
+
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("node 0 should be primary for RG 0")
+	}
+	if m.IsLocalPrimary(1) {
+		t.Fatal("node 0 should be secondary for RG 1")
+	}
+	if !m.IsLocalPrimaryAny() {
+		t.Fatal("node 0 is primary for RG 0 — IsLocalPrimaryAny should be true")
+	}
+}

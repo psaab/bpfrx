@@ -554,3 +554,137 @@ func TestSyncSweepV6(t *testing.T) {
 		t.Fatalf("expected 1 v6 session sent, got %d", ss.stats.SessionsSent.Load())
 	}
 }
+
+func TestShouldSyncZoneFallback(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.IsPrimaryFn = func() bool { return true }
+
+	// No IsPrimaryForRGFn or zoneRGMap — should fall back to IsPrimaryFn.
+	if !ss.ShouldSyncZone(1) {
+		t.Fatal("expected ShouldSyncZone to return true via fallback")
+	}
+
+	ss.IsPrimaryFn = func() bool { return false }
+	if ss.ShouldSyncZone(1) {
+		t.Fatal("expected ShouldSyncZone to return false via fallback")
+	}
+}
+
+func TestShouldSyncZonePerRG(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.IsPrimaryFn = func() bool { return false } // not primary for RG 0
+	ss.IsPrimaryForRGFn = func(rgID int) bool {
+		return rgID == 1 // primary for RG 1 only
+	}
+	ss.SetZoneRGMap(map[uint16]int{
+		1: 1, // zone 1 → RG 1
+		2: 2, // zone 2 → RG 2
+	})
+
+	// Zone 1 → RG 1 (primary) → should sync
+	if !ss.ShouldSyncZone(1) {
+		t.Fatal("zone 1 should sync (RG 1 is primary)")
+	}
+
+	// Zone 2 → RG 2 (not primary) → should not sync
+	if ss.ShouldSyncZone(2) {
+		t.Fatal("zone 2 should not sync (RG 2 is not primary)")
+	}
+
+	// Zone 3 → not in map → falls back to IsPrimaryFn (false)
+	if ss.ShouldSyncZone(3) {
+		t.Fatal("zone 3 should not sync (fallback to IsPrimaryFn=false)")
+	}
+}
+
+func TestSyncSweepPerRG(t *testing.T) {
+	now := monotonicSeconds()
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			// Session in zone 1 (RG 1 — primary)
+			{SrcIP: [4]byte{10, 0, 1, 1}, DstIP: [4]byte{10, 0, 2, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}: {
+				State: dataplane.SessStateEstablished, Created: now, IsReverse: 0, IngressZone: 1,
+			},
+			// Session in zone 2 (RG 2 — not primary)
+			{SrcIP: [4]byte{10, 0, 3, 1}, DstIP: [4]byte{10, 0, 4, 1}, Protocol: 6, SrcPort: 2000, DstPort: 443}: {
+				State: dataplane.SessStateEstablished, Created: now, IsReverse: 0, IngressZone: 2,
+			},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.stats.Connected.Store(true)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.IsPrimaryForRGFn = func(rgID int) bool {
+		return rgID == 1 // primary for RG 1 only
+	}
+	ss.SetZoneRGMap(map[uint16]int{
+		1: 1, // zone 1 → RG 1
+		2: 2, // zone 2 → RG 2
+	})
+	ss.lastSweepTime = now
+
+	ss.syncSweep()
+
+	// Only the session in zone 1 (RG 1) should be synced
+	if ss.stats.SessionsSent.Load() != 1 {
+		t.Fatalf("expected 1 session synced (zone 1/RG 1), got %d", ss.stats.SessionsSent.Load())
+	}
+}
+
+func TestSyncSweepPerRGV6(t *testing.T) {
+	now := monotonicSeconds()
+	dp := &mockSweepDP{
+		v6sessions: map[dataplane.SessionKeyV6]dataplane.SessionValueV6{
+			// Session in zone 1 (RG 1 — primary)
+			{SrcIP: [16]byte{0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, Protocol: 6}: {
+				Created: now, IsReverse: 0, IngressZone: 1,
+			},
+			// Session in zone 2 (RG 2 — not primary)
+			{SrcIP: [16]byte{0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}, Protocol: 6}: {
+				Created: now, IsReverse: 0, IngressZone: 2,
+			},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.stats.Connected.Store(true)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.IsPrimaryForRGFn = func(rgID int) bool {
+		return rgID == 1
+	}
+	ss.SetZoneRGMap(map[uint16]int{1: 1, 2: 2})
+	ss.lastSweepTime = now
+
+	ss.syncSweep()
+
+	if ss.stats.SessionsSent.Load() != 1 {
+		t.Fatalf("expected 1 v6 session synced, got %d", ss.stats.SessionsSent.Load())
+	}
+}
+
+func TestSetZoneRGMap(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+
+	// Set map
+	m := map[uint16]int{1: 1, 2: 2, 3: 0}
+	ss.SetZoneRGMap(m)
+
+	// Verify internal state
+	ss.zoneRGMu.RLock()
+	if len(ss.zoneRGMap) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(ss.zoneRGMap))
+	}
+	if ss.zoneRGMap[1] != 1 {
+		t.Fatalf("zone 1 should map to RG 1")
+	}
+	ss.zoneRGMu.RUnlock()
+
+	// Replace map
+	ss.SetZoneRGMap(map[uint16]int{5: 3})
+	ss.zoneRGMu.RLock()
+	if len(ss.zoneRGMap) != 1 {
+		t.Fatalf("expected 1 entry after replace, got %d", len(ss.zoneRGMap))
+	}
+	ss.zoneRGMu.RUnlock()
+}

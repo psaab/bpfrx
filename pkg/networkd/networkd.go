@@ -43,6 +43,8 @@ type InterfaceConfig struct {
 	MinLinks         int      // minimum active member links (0 = no minimum)
 	KeepAddresses    bool     // true = KeepConfiguration=static (preserve external addresses across reload)
 	VRFName          string   // VRF device name (e.g. "vrf-mgmt") — emits [Network] VRF= so networkctl reconfigure preserves binding
+	BridgeMaster     string   // bridge device name to join (e.g. "br-bd0")
+	IsBridge         bool     // true = this is a bridge device (needs .netdev file)
 }
 
 // Manager handles systemd-networkd .link and .network file generation.
@@ -84,14 +86,14 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 
 	// Build set of expected filenames.
 	// .link files are only for physical interfaces (have MAC address).
-	// .netdev files are for bond (LAG) devices.
+	// .netdev files are for bond (LAG) and bridge devices.
 	// VLAN sub-interfaces (wan0.50) only get .network files.
 	expected := make(map[string]bool)
 	for _, ifc := range interfaces {
 		if ifc.MACAddress != "" {
 			expected[filePrefix+ifc.Name+".link"] = true
 		}
-		if ifc.IsBond {
+		if ifc.IsBond || ifc.IsBridge {
 			expected[filePrefix+ifc.Name+".netdev"] = true
 		}
 		expected[filePrefix+ifc.Name+".network"] = true
@@ -115,10 +117,17 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 
 	// Write .netdev, .link, and .network files
 	for _, ifc := range interfaces {
-		// .netdev file: for bond/LAG devices
+		// .netdev file: for bond/LAG devices and bridge devices
 		if ifc.IsBond {
 			netdevPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".netdev")
 			netdevContent := m.generateNetdev(ifc)
+			if writeIfChanged(netdevPath, netdevContent) {
+				changed = true
+			}
+		}
+		if ifc.IsBridge {
+			netdevPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".netdev")
+			netdevContent := m.generateBridgeNetdev(ifc)
 			if writeIfChanged(netdevPath, netdevContent) {
 				changed = true
 			}
@@ -240,15 +249,36 @@ func (m *Manager) generateNetdev(ifc InterfaceConfig) string {
 		mode = "802.3ad"
 	}
 	fmt.Fprintf(&b, "Mode=%s\n", mode)
-	rate := ifc.LACPRate
-	if rate == "" {
-		rate = "fast"
+	if mode == "active-backup" {
+		// Active-backup uses MII monitoring, no LACP
+		b.WriteString("MIIMonitorSec=100ms\n")
+	} else {
+		// LACP modes (802.3ad, balance-xor, etc.)
+		rate := ifc.LACPRate
+		if rate == "" {
+			rate = "fast"
+		}
+		fmt.Fprintf(&b, "LACPTransmitRate=%s\n", rate)
+		b.WriteString("TransmitHashPolicy=layer3+4\n")
 	}
-	fmt.Fprintf(&b, "LACPTransmitRate=%s\n", rate)
 	if ifc.MinLinks > 0 {
 		fmt.Fprintf(&b, "MinLinks=%d\n", ifc.MinLinks)
 	}
-	b.WriteString("TransmitHashPolicy=layer3+4\n")
+	return b.String()
+}
+
+func (m *Manager) generateBridgeNetdev(ifc InterfaceConfig) string {
+	var b strings.Builder
+	b.WriteString("# Managed by bpfrxd — do not edit\n")
+	b.WriteString("[NetDev]\n")
+	fmt.Fprintf(&b, "Name=%s\n", ifc.Name)
+	b.WriteString("Kind=bridge\n")
+	if ifc.Description != "" {
+		fmt.Fprintf(&b, "Description=%s\n", ifc.Description)
+	}
+	if ifc.MTU > 0 {
+		fmt.Fprintf(&b, "MTUBytes=%d\n", ifc.MTU)
+	}
 	return b.String()
 }
 
@@ -324,6 +354,11 @@ func (m *Manager) generateNetwork(ifc InterfaceConfig) string {
 	// Bond member: bind to bond master
 	if ifc.BondMaster != "" {
 		fmt.Fprintf(&b, "Bond=%s\n", ifc.BondMaster)
+	}
+
+	// Bridge member: bind to bridge device
+	if ifc.BridgeMaster != "" {
+		fmt.Fprintf(&b, "Bridge=%s\n", ifc.BridgeMaster)
 	}
 
 	// Disable IPv6 Duplicate Address Detection if configured

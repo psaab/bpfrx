@@ -257,6 +257,19 @@ func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, confi
 	parts := strings.SplitN(ref, ".", 2)
 	configName = parts[0]
 
+	// Resolve IRB interfaces to their bridge device name.
+	// "irb.0" → bridge device "br-bd0" (looked up via bridge-domains config).
+	if configName == "irb" {
+		irbMap := config.IRBToBridge(cfg.BridgeDomains)
+		if bridge, ok := irbMap[ref]; ok {
+			physName = bridge
+			if len(parts) == 2 {
+				unitNum, _ = strconv.Atoi(parts[1])
+			}
+			return
+		}
+	}
+
 	// Resolve RETH to local physical member
 	rethToPhys := cfg.RethToPhysical()
 	physBase := configName
@@ -876,11 +889,109 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 		}
 	}
 
+	// Generate networkd .netdev + .network files for fabric bonds with multiple
+	// members. This makes the bond persistent across reboots via systemd-networkd
+	// (the routing package also creates the bond via netlink at runtime).
+	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
+		if len(ifCfg.FabricMembers) <= 1 {
+			continue
+		}
+		bondName := ifName
+		if !seen[bondName] {
+			seen[bondName] = true
+			// Collect addresses from fabric interface units
+			var addrs []string
+			for _, unit := range ifCfg.Units {
+				addrs = append(addrs, unit.Addresses...)
+			}
+			result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
+				Name:        bondName,
+				IsBond:      true,
+				BondMode:    "active-backup",
+				Addresses:   addrs,
+				Description: ifCfg.Description,
+				MTU:         ifCfg.MTU,
+				VRFName:     "vrf-mgmt",
+			})
+		}
+		// Member interfaces: .network with Bond= referencing the bond
+		for _, member := range ifCfg.FabricMembers {
+			memberName := config.LinuxIfName(member)
+			if seen[memberName] {
+				continue
+			}
+			seen[memberName] = true
+			var mac string
+			if iface, err := net.InterfaceByName(memberName); err == nil {
+				mac = iface.HardwareAddr.String()
+			}
+			result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
+				Name:       memberName,
+				MACAddress: mac,
+				BondMaster: bondName,
+			})
+		}
+	}
+
+	// Bridge domains: generate bridge .netdev + .network entries and set
+	// BridgeMaster on VLAN sub-interfaces that belong to a bridge domain.
+	// Build vlanID → bridge device name map for bridge member assignment.
+	vlanToBridge := make(map[int]string)
+	for _, bd := range cfg.BridgeDomains {
+		bridgeName := "br-" + bd.Name
+		for _, vid := range bd.VlanIDs {
+			vlanToBridge[vid] = bridgeName
+		}
+	}
+
+	for _, bd := range cfg.BridgeDomains {
+		bridgeName := "br-" + bd.Name
+		if seen[bridgeName] {
+			continue
+		}
+		seen[bridgeName] = true
+
+		// Collect IRB addresses from the referenced interface unit
+		var addrs []string
+		if bd.RoutingInterface != "" {
+			// Parse "irb.N" to get unit number
+			parts := strings.SplitN(bd.RoutingInterface, ".", 2)
+			if len(parts) == 2 {
+				irbName := parts[0] // "irb"
+				unitNum, _ := strconv.Atoi(parts[1])
+				if irbCfg, ok := cfg.Interfaces.Interfaces[irbName]; ok {
+					if unit, ok := irbCfg.Units[unitNum]; ok {
+						addrs = unit.Addresses
+					}
+				}
+			}
+		}
+
+		result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
+			Name:      bridgeName,
+			IsBridge:  true,
+			Addresses: addrs,
+		})
+	}
+
+	// Set BridgeMaster on VLAN sub-interfaces that are bridge domain members.
+	for i, mi := range result.ManagedInterfaces {
+		// VLAN sub-interfaces have names like "trust0.100"
+		if idx := strings.IndexByte(mi.Name, '.'); idx >= 0 {
+			suffix := mi.Name[idx+1:]
+			if vid, err := strconv.Atoi(suffix); err == nil {
+				if bridge, ok := vlanToBridge[vid]; ok {
+					result.ManagedInterfaces[i].BridgeMaster = bridge
+				}
+			}
+		}
+	}
+
 	// Discover all system interfaces and mark unconfigured ones as unmanaged.
 	// Unmanaged interfaces are brought down and have addresses removed to
 	// prevent traffic leaking through unconfigured paths.
 	//
-	// Skip interfaces created by the daemon itself (VRFs, tunnels).
+	// Skip interfaces created by the daemon itself (VRFs, tunnels, bridges).
 	daemonOwned := make(map[string]bool)
 	daemonOwned["vrf-mgmt"] = true // implicit management VRF for fxp*/fab*
 	for _, ri := range cfg.RoutingInstances {
@@ -895,6 +1006,9 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 		if len(ifc.FabricMembers) > 0 {
 			daemonOwned[name] = true
 		}
+	}
+	for _, bd := range cfg.BridgeDomains {
+		daemonOwned["br-"+bd.Name] = true
 	}
 
 	allIfaces, _ := net.Interfaces()

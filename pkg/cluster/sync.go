@@ -105,9 +105,13 @@ type SessionSync struct {
 	peerIPsecSAs   []string
 	peerIPsecSAsMu sync.Mutex
 
-	IsPrimaryFn   func() bool // returns true if local node is primary for RG 0
-	lastSweepTime uint64      // monotonic seconds of last sync sweep
-	vrfDevice     string      // VRF device for SO_BINDTODEVICE (empty = default VRF)
+	IsPrimaryFn      func() bool        // returns true if local node is primary for RG 0
+	IsPrimaryForRGFn func(rgID int) bool // returns true if local is primary for given RG
+	lastSweepTime    uint64             // monotonic seconds of last sync sweep
+	vrfDevice        string             // VRF device for SO_BINDTODEVICE (empty = default VRF)
+
+	zoneRGMu  sync.RWMutex
+	zoneRGMap map[uint16]int // zone_id -> RG_id (for per-RG session sync)
 }
 
 // NewSessionSync creates a new session synchronization manager.
@@ -123,6 +127,15 @@ func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *Session
 // SetVRFDevice sets the VRF device for SO_BINDTODEVICE on sync sockets.
 func (s *SessionSync) SetVRFDevice(dev string) {
 	s.vrfDevice = dev
+}
+
+// SetZoneRGMap sets the zone ID → redundancy group mapping for per-RG
+// session sync. Sessions are synced only when the local node is primary
+// for the RG that owns the session's ingress zone.
+func (s *SessionSync) SetZoneRGMap(m map[uint16]int) {
+	s.zoneRGMu.Lock()
+	s.zoneRGMap = m
+	s.zoneRGMu.Unlock()
 }
 
 // SetDataPlane sets the dataplane used for installing received sessions.
@@ -216,8 +229,30 @@ func (s *SessionSync) StartSyncSweep(ctx context.Context) {
 	slog.Info("cluster sync: sweep started")
 }
 
+// ShouldSyncZone returns true if the local node should sync sessions for
+// the given zone. When IsPrimaryForRGFn is set and a zone→RG mapping
+// exists, only sessions whose ingress zone belongs to a locally-primary
+// RG are synced. Falls back to the global IsPrimaryFn otherwise.
+func (s *SessionSync) ShouldSyncZone(zoneID uint16) bool {
+	if s.IsPrimaryForRGFn != nil {
+		s.zoneRGMu.RLock()
+		rgID, ok := s.zoneRGMap[zoneID]
+		s.zoneRGMu.RUnlock()
+		if ok {
+			return s.IsPrimaryForRGFn(rgID)
+		}
+	}
+	// Fallback: use global primary check (backward compat, or zone not
+	// mapped to an RG — e.g. non-RETH interfaces always use RG 0).
+	if s.IsPrimaryFn != nil {
+		return s.IsPrimaryFn()
+	}
+	return false
+}
+
 func (s *SessionSync) syncSweep() {
-	if s.IsPrimaryFn == nil || !s.IsPrimaryFn() {
+	// At least one primary check must be wired.
+	if s.IsPrimaryFn == nil && s.IsPrimaryForRGFn == nil {
 		return
 	}
 	if !s.stats.Connected.Load() {
@@ -235,7 +270,7 @@ func (s *SessionSync) syncSweep() {
 		if val.IsReverse != 0 {
 			return true
 		}
-		if val.Created >= threshold {
+		if val.Created >= threshold && s.ShouldSyncZone(val.IngressZone) {
 			s.QueueSessionV4(key, val)
 			count++
 		}
@@ -246,7 +281,7 @@ func (s *SessionSync) syncSweep() {
 		if val.IsReverse != 0 {
 			return true
 		}
-		if val.Created >= threshold {
+		if val.Created >= threshold && s.ShouldSyncZone(val.IngressZone) {
 			s.QueueSessionV6(key, val)
 			count++
 		}

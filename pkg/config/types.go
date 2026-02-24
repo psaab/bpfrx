@@ -51,6 +51,7 @@ type Config struct {
 	Schedulers        map[string]*SchedulerConfig
 	Chassis           ChassisConfig
 	EventOptions      []*EventPolicy
+	BridgeDomains     []*BridgeDomainConfig
 	Warnings          []string // non-fatal validation warnings
 }
 
@@ -120,6 +121,26 @@ type EventWithin struct {
 	Seconds    int
 	TriggerOn  int // trigger on N
 	TriggerUntil int // trigger until N
+}
+
+// BridgeDomainConfig defines a bridge domain with VLAN membership and optional IRB interface.
+type BridgeDomainConfig struct {
+	Name             string   // bridge domain name (e.g. "bd0")
+	VlanIDs          []int    // member VLAN IDs
+	RoutingInterface string   // IRB routing interface reference (e.g. "irb.0")
+	DomainType       string   // bridge domain type (optional)
+}
+
+// IRBToBridge returns a mapping of IRB interface reference (e.g. "irb.0") to
+// bridge device name (e.g. "br-bd0") for all bridge domains with a routing-interface.
+func IRBToBridge(bds []*BridgeDomainConfig) map[string]string {
+	m := make(map[string]string)
+	for _, bd := range bds {
+		if bd.RoutingInterface != "" {
+			m[bd.RoutingInterface] = "br-" + bd.Name
+		}
+	}
+	return m
 }
 
 // PolicyOptionsConfig holds prefix-lists, communities, as-paths, and policy-statements for routing control.

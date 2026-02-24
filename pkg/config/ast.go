@@ -1764,6 +1764,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 	}},
+	"bridge-domains": {wildcard: &schemaNode{desc: "Bridge domain name", children: map[string]*schemaNode{
+		"vlan-id-list":      {args: 1, multi: true, desc: "VLAN IDs in this bridge domain", children: nil},
+		"routing-interface": {args: 1, desc: "IRB routing interface (e.g. irb.0)", children: nil},
+		"domain-type":       {args: 1, desc: "Bridge domain type", children: nil},
+	}}},
 	"routing-instances": {wildcard: &schemaNode{children: map[string]*schemaNode{
 		// instance-type and interface are NOT listed here → they become leaf nodes
 		// e.g. "instance-type virtual-router;" and "interface enp7s0;"

@@ -13910,3 +13910,231 @@ func TestCompleteSetPathFromZoneToZone(t *testing.T) {
 		})
 	}
 }
+
+func TestBridgeDomains_Hierarchical(t *testing.T) {
+	input := `bridge-domains {
+    bd0 {
+        vlan-id-list 100;
+        vlan-id-list 200;
+        routing-interface irb.0;
+    }
+    bd1 {
+        vlan-id-list 300;
+        domain-type bridge;
+    }
+}
+interfaces {
+    irb {
+        unit 0 {
+            family inet {
+                address 10.0.100.1/24;
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	if len(cfg.BridgeDomains) != 2 {
+		t.Fatalf("expected 2 bridge domains, got %d", len(cfg.BridgeDomains))
+	}
+
+	// Find bd0
+	var bd0, bd1 *BridgeDomainConfig
+	for _, bd := range cfg.BridgeDomains {
+		switch bd.Name {
+		case "bd0":
+			bd0 = bd
+		case "bd1":
+			bd1 = bd
+		}
+	}
+
+	if bd0 == nil {
+		t.Fatal("missing bridge domain bd0")
+	}
+	if len(bd0.VlanIDs) != 2 || bd0.VlanIDs[0] != 100 || bd0.VlanIDs[1] != 200 {
+		t.Errorf("bd0 vlan IDs: %v", bd0.VlanIDs)
+	}
+	if bd0.RoutingInterface != "irb.0" {
+		t.Errorf("bd0 routing-interface: %q", bd0.RoutingInterface)
+	}
+
+	if bd1 == nil {
+		t.Fatal("missing bridge domain bd1")
+	}
+	if len(bd1.VlanIDs) != 1 || bd1.VlanIDs[0] != 300 {
+		t.Errorf("bd1 vlan IDs: %v", bd1.VlanIDs)
+	}
+	if bd1.DomainType != "bridge" {
+		t.Errorf("bd1 domain-type: %q", bd1.DomainType)
+	}
+	if bd1.RoutingInterface != "" {
+		t.Errorf("bd1 routing-interface should be empty: %q", bd1.RoutingInterface)
+	}
+}
+
+func TestBridgeDomains_FlatSet(t *testing.T) {
+	// Flat set syntax: must use ParseSetCommand + tree.SetPath
+	cmds := []string{
+		"set bridge-domains bd0 vlan-id-list 100",
+		"set bridge-domains bd0 vlan-id-list 200",
+		"set bridge-domains bd0 routing-interface irb.0",
+		"set bridge-domains bd1 vlan-id-list 300",
+		"set bridge-domains bd1 domain-type bridge",
+		"set interfaces irb unit 0 family inet address 10.0.100.1/24",
+	}
+
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	if len(cfg.BridgeDomains) != 2 {
+		t.Fatalf("expected 2 bridge domains, got %d", len(cfg.BridgeDomains))
+	}
+
+	var bd0 *BridgeDomainConfig
+	for _, bd := range cfg.BridgeDomains {
+		if bd.Name == "bd0" {
+			bd0 = bd
+			break
+		}
+	}
+	if bd0 == nil {
+		t.Fatal("missing bridge domain bd0")
+	}
+	if len(bd0.VlanIDs) != 2 {
+		t.Fatalf("bd0 expected 2 vlan IDs, got %d: %v", len(bd0.VlanIDs), bd0.VlanIDs)
+	}
+	if bd0.VlanIDs[0] != 100 || bd0.VlanIDs[1] != 200 {
+		t.Errorf("bd0 vlan IDs: %v", bd0.VlanIDs)
+	}
+	if bd0.RoutingInterface != "irb.0" {
+		t.Errorf("bd0 routing-interface: %q", bd0.RoutingInterface)
+	}
+
+	// Verify IRB interface was compiled
+	irbIfc := cfg.Interfaces.Interfaces["irb"]
+	if irbIfc == nil {
+		t.Fatal("missing irb interface config")
+	}
+	u0 := irbIfc.Units[0]
+	if u0 == nil {
+		t.Fatal("missing irb unit 0")
+	}
+	if len(u0.Addresses) != 1 || u0.Addresses[0] != "10.0.100.1/24" {
+		t.Errorf("irb.0 addresses: %v", u0.Addresses)
+	}
+}
+
+func TestBridgeDomains_FormatRoundTrip(t *testing.T) {
+	// Build tree via set commands, format, re-parse, and verify
+	cmds := []string{
+		"set bridge-domains bd0 vlan-id-list 100",
+		"set bridge-domains bd0 vlan-id-list 200",
+		"set bridge-domains bd0 routing-interface irb.0",
+	}
+
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	// Format and re-parse
+	output := tree.Format()
+	t.Logf("Formatted:\n%s", output)
+
+	parser := NewParser(output)
+	tree2, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("re-parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree2)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	if len(cfg.BridgeDomains) != 1 {
+		t.Fatalf("expected 1 bridge domain, got %d", len(cfg.BridgeDomains))
+	}
+	bd := cfg.BridgeDomains[0]
+	if bd.Name != "bd0" {
+		t.Errorf("expected bd0, got %q", bd.Name)
+	}
+	if len(bd.VlanIDs) != 2 {
+		t.Errorf("expected 2 vlans, got %d", len(bd.VlanIDs))
+	}
+	if bd.RoutingInterface != "irb.0" {
+		t.Errorf("routing-interface: %q", bd.RoutingInterface)
+	}
+}
+
+func TestBridgeDomains_InvalidVlanID(t *testing.T) {
+	input := `bridge-domains {
+    bd0 {
+        vlan-id-list 5000;
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected error for invalid vlan ID 5000")
+	}
+	if !strings.Contains(err.Error(), "out of range") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestIRBToBridge(t *testing.T) {
+	bds := []*BridgeDomainConfig{
+		{Name: "bd0", VlanIDs: []int{100, 200}, RoutingInterface: "irb.0"},
+		{Name: "bd1", VlanIDs: []int{300}},
+		{Name: "bd2", VlanIDs: []int{400}, RoutingInterface: "irb.2"},
+	}
+
+	m := IRBToBridge(bds)
+
+	if m["irb.0"] != "br-bd0" {
+		t.Errorf("irb.0 -> %q, expected br-bd0", m["irb.0"])
+	}
+	if m["irb.2"] != "br-bd2" {
+		t.Errorf("irb.2 -> %q, expected br-bd2", m["irb.2"])
+	}
+	if _, ok := m["irb.1"]; ok {
+		t.Error("irb.1 should not be in map (bd1 has no routing-interface)")
+	}
+}
