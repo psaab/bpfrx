@@ -8,7 +8,7 @@ An eBPF-based firewall that clones Juniper vSRX capabilities using native Junos 
 make generate        # Generate Go bindings from BPF C via bpf2go
 make build           # Build bpfrxd daemon
 make build-ctl       # Build remote CLI client
-make test            # Run Go tests (630+ tests across 20 packages)
+make test            # Run Go tests (640+ tests across 20 packages)
 ```
 
 ## Test Environment (Incus VM)
@@ -27,6 +27,16 @@ make test-destroy    # Tear down VM
 ```
 
 If `incus` commands fail with permission errors, use `sg incus-admin -c "make ..."`.
+
+## Cluster Test Environment (Two-VM HA)
+```bash
+make cluster-init    # Create networks + profile for HA cluster
+make cluster-create  # Launch bpfrx-fw0, bpfrx-fw1, cluster-lan-host
+make cluster-deploy  # Build + push to both VMs + restart
+make cluster-destroy # Tear down cluster VMs
+```
+
+Or use `test/incus/cluster-setup.sh` directly: `init`, `create`, `deploy all`, `destroy`, `ssh 0|1`, `status`, `logs 0|1`.
 
 ## Architecture
 
@@ -83,7 +93,9 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 | `cmd/cli/` | Remote CLI client binary |
 | `dpdk_worker/` | DPDK C pipeline (single-pass packet processing, CGo bridge) |
 | `pkg/dataplane/dpdk/` | DPDK Go manager (CGo shared memory, FIB sync, port stats) |
-| `docs/` | Protocol docs (sync-protocol.md), feature gaps, phase notes |
+| `pkg/vrrp/` | Native VRRPv3 state machine (250ms advertisements, AF_PACKET, IPv6 NODAD) |
+| `pkg/ra/` | Embedded RA sender (replaces radvd) |
+| `docs/` | Protocol docs, feature gaps, phase notes, test plans, memory backups |
 | `test/incus/` | Test environment (setup.sh, config, systemd unit) |
 
 ## Critical Patterns to Know
@@ -119,12 +131,15 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - Every interface must be defined in the firewall config and assigned to a security zone
 - Interfaces not in the config are brought down and marked `ActivationPolicy=always-down` in networkd
 - VRF devices and tunnel interfaces created by the daemon are excluded from unmanaged detection
-- **`.link` files**: written per-interface, match by MAC address, rename kernel names (enp6s0→trust0)
+- **`.link` files**: written per-interface, prefix `10-bpfrx-`, rename kernel names (enp6s0→trust0)
+  - Non-RETH interfaces: match by `MACAddress=` (MAC is stable)
+  - RETH member interfaces: match by `OriginalName=` (PCI kernel name) — MAC alternates between physical (boot) and virtual (daemon), so `MACAddress=` is unreliable
+  - `ensureRethLinkOriginalName()` auto-fixes stale `.link` files that use `MACAddress=` for RETH members
 - **`.network` files**: configure addresses (static), DHCP avoidance, RA disable, VLAN parent flags
-- File prefix `10-bpfrx-` distinguishes daemon-managed files; stale files are auto-removed
-- `networkctl reload` is called only when files actually change
+  - `KeepConfiguration=static` on RETH interfaces preserves VRRP VIPs across `networkctl reload`
+- Stale files are auto-removed; `networkctl reload` called only when files actually change
 - **DHCP interfaces**: daemon's DHCP client manages the address; address reconciliation is skipped
-- **Bootstrap**: `setup.sh` writes initial `.link` files for first boot (before daemon has run)
+- **Bootstrap**: `cluster-setup.sh` writes initial `.link` files for first boot (before daemon has run)
 - DHCP-learned default routes get admin distance 200 in FRR (lower priority than static routes)
 
 ### XDP on SR-IOV Interfaces
@@ -137,9 +152,21 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Why not VF passthrough** — VFs use the iavf driver which forces generic mode. Even with the `redirect_capable` workaround, the WAN interface itself runs in generic XDP which is slower for ingress processing. PF passthrough avoids this entirely
 - **Gotcha: PF passthrough claims the whole NIC** — no VFs can be used by other VMs when the PF is passed through. For multi-VM setups, VF passthrough with generic XDP + `redirect_capable` fallback is the only option (at a performance cost)
 
+### Chassis Cluster (HA)
+- **Failover timing**: <1s with 250ms VRRP intervals (masterDownInterval ~805ms)
+- **Failback timing**: ~2-3s (immediate sync connect + 500ms debounce + instant preemption)
+- **VRRP advertisement**: RETH instances use 250ms; `AdvertiseInterval` is milliseconds internally, centiseconds on wire per RFC 5798
+- **Fabric forwarding**: `try_fabric_redirect()` in xdp_zone redirects to fabric peer when `bpf_fib_lookup` fails for synced sessions — prevents TCP death on VRRP failback
+- **RETH virtual MAC**: per-node `02:bf:72:CC:RR:NN`; `programRethMAC()` does link DOWN→set MAC→link UP
+- **VIP reconciliation**: `ReconcileVIPs()` re-adds VRRP VIPs after `programRethMAC` link DOWN/UP (which removes all kernel addresses)
+- **Sync hold**: VRRP starts with `preempt=false`; released after bulk session sync (or 10s timeout); `preemptNowCh` triggers instant preemption
+- **Heartbeat**: 200ms interval, threshold 5 (1s detection); bind retry loop for simultaneous boot
+- **Session sync connect**: immediate first attempt, 1s retry (was 5s)
+- **Event debounce**: 500ms for cluster state → VRRP priority updates
+
 ### Shutdown
 - FRR reload commands use 15s context timeout to prevent hanging on `systemctl reload frr`
-- systemd unit has `TimeoutStopSec=20` as safety net
+- systemd unit has `TimeoutStopSec=20` as safety net, `RestartSec=1`
 
 ## Feature Coverage
 - **Firewall**: Stateful inspection, zone-based policies (including global policies), address books, application matching, multi-term apps, filtered session clearing
@@ -151,7 +178,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces
 - **Observability**: Syslog (facility/severity/category filtering, structured RT_FLOW format, TCP/TLS transport, event mode local file), NetFlow v9 (1-in-N sampling), Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB), BPF map utilization (`show system buffers`), session aggregation reporting
 - **Flow**: TCP MSS clamping (ingress XDP + egress TC, including GRE-specific gre-in/gre-out), ALG control, allow-dns-reply (wired to BPF), allow-embedded-icmp, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, logging, forwarding-class DSCP rewrite, DSCP action)
-- **HA**: Chassis cluster state machine (weight-based failover, manual failover/reset, Junos-style show/request commands), native VRRPv3 (Go state machine, AF_PACKET receiver, per-instance sockets, IPv6 NODAD), bondless RETH (VRRP on physical member interfaces, RethToPhysical resolution), incremental session sync (1s sweep + ring buffer + GC delete callbacks), config sync (forward + reverse-sync on reconnect, ${node} variable quoting), IPsec SA sync, ISSU
+- **HA**: Chassis cluster state machine (weight-based failover, manual failover/reset, Junos-style show/request commands), native VRRPv3 (Go state machine, AF_PACKET receiver, per-instance sockets, IPv6 NODAD, sub-second 250ms advertisements), bondless RETH (VRRP on physical member interfaces, RethToPhysical resolution, per-node virtual MAC), incremental session sync (1s sweep + ring buffer + GC delete callbacks), config sync (forward + reverse-sync on reconnect, ${node} variable quoting), IPsec SA sync, fabric cross-chassis forwarding, ISSU
 - **DHCP**: Relay (Option 82), server (Kea integration with lease display)
 - **CLI**: Junos-style prefix matching, "Possible completions:" headers, zone/interface descriptions, session idle time, session brief tabular view, flow statistics, policy descriptions, config validation warnings
 
