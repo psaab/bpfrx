@@ -796,6 +796,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 							DADDisable:       unit.DADDisable,
 							MTU:              unit.MTU,
 							Description:      unit.Description,
+							KeepAddresses:    isVRRPReth,
 						})
 					}
 				}
@@ -857,6 +858,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 					Duplex:           ifCfg.Duplex,
 					MTU:              mtu,
 					Description:      ifCfg.Description,
+					KeepAddresses:    isVRRPReth,
 				})
 			}
 		}

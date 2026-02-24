@@ -41,6 +41,7 @@ type InterfaceConfig struct {
 	BondMode         string   // bond mode: "802.3ad" (default for ae interfaces)
 	LACPRate         string   // LACP transmit rate: "fast" or "slow" (default)
 	MinLinks         int      // minimum active member links (0 = no minimum)
+	KeepAddresses    bool     // true = KeepConfiguration=static (preserve external addresses across reload)
 }
 
 // Manager handles systemd-networkd .link and .network file generation.
@@ -305,6 +306,11 @@ func (m *Manager) generateNetwork(ifc InterfaceConfig) string {
 
 	if ifc.IsVLANParent {
 		b.WriteString("DHCP=no\n")
+	}
+
+	// Preserve externally-added addresses (e.g. VRRP VIPs) across networkctl reload.
+	if ifc.KeepAddresses {
+		b.WriteString("KeepConfiguration=static\n")
 	}
 
 	b.WriteString("LinkLocalAddressing=ipv6\n")

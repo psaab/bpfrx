@@ -3044,16 +3044,30 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	}
 
 	// Start heartbeat if control-interface and peer-address are configured.
+	// Retry on bind failure: the control interface address may not yet be
+	// assigned by networkd during daemon startup (VRF race).
 	if cc.ControlInterface != "" && cc.PeerAddress != "" {
-		localIP := resolveInterfaceAddr(cc.ControlInterface, "")
-		if localIP != "" {
-			if err := d.cluster.StartHeartbeat(localIP, cc.PeerAddress, vrfDevice); err != nil {
-				slog.Warn("failed to start cluster heartbeat", "err", err)
+		go func() {
+			for i := 0; i < 30; i++ {
+				localIP := resolveInterfaceAddr(cc.ControlInterface, "")
+				if localIP == "" {
+					if i == 0 {
+						slog.Warn("cluster: control interface has no IPv4 address, retrying",
+							"interface", cc.ControlInterface)
+					}
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				if err := d.cluster.StartHeartbeat(localIP, cc.PeerAddress, vrfDevice); err != nil {
+					slog.Warn("failed to start cluster heartbeat, retrying",
+						"err", err, "attempt", i+1)
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				return
 			}
-		} else {
-			slog.Warn("cluster: control interface has no IPv4 address, heartbeat deferred",
-				"interface", cc.ControlInterface)
-		}
+			slog.Error("cluster heartbeat failed after retries")
+		}()
 	}
 
 	// Start session/config sync on fabric interface.
