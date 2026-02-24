@@ -786,6 +786,9 @@ func (c *ctl) handleShow(args []string) error {
 		if len(args) >= 2 && args[1] == "neighbors" {
 			return c.showSystemInfo("ipv6-neighbors")
 		}
+		if len(args) >= 2 && args[1] == "router-advertisement" {
+			return c.showText("ipv6-router-advertisement")
+		}
 		printRemoteTreeHelp("show ipv6:", "show", "ipv6")
 		return nil
 

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
@@ -123,6 +124,68 @@ func (m *Manager) clearLocked() error {
 	}
 	m.senders = make(map[string]*sender)
 	return nil
+}
+
+// SenderInfo holds per-interface RA sender status for display.
+type SenderInfo struct {
+	Interface   string
+	SrcAddr     string
+	Prefixes    []string
+	DNSServers  []string
+	NAT64Prefix string
+	Preference  string
+	Lifetime    int // router lifetime in seconds
+	MaxInterval int
+	MinInterval int
+	LinkMTU     int
+	Managed     bool
+	Other       bool
+	LastRA      string // time since last RA
+}
+
+// Status returns information about all active RA senders.
+func (m *Manager) Status() []SenderInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var result []SenderInfo
+	for _, s := range m.senders {
+		info := SenderInfo{
+			Interface:   s.cfg.Interface,
+			SrcAddr:     s.srcAddr.String(),
+			Lifetime:    s.cfg.DefaultLifetime,
+			MaxInterval: s.cfg.MaxAdvInterval,
+			MinInterval: s.cfg.MinAdvInterval,
+			LinkMTU:     s.cfg.LinkMTU,
+			Managed:     s.cfg.ManagedConfig,
+			Other:       s.cfg.OtherStateful,
+			Preference:  s.cfg.Preference,
+			NAT64Prefix: s.cfg.NAT64Prefix,
+		}
+		if info.Lifetime <= 0 {
+			info.Lifetime = defaultRouterLifetime
+		}
+		if info.MaxInterval <= 0 {
+			info.MaxInterval = defaultMaxAdvInterval
+		}
+		if info.MinInterval <= 0 {
+			info.MinInterval = info.MaxInterval / 3
+		}
+		if info.Preference == "" {
+			info.Preference = "medium"
+		}
+		for _, pfx := range s.cfg.Prefixes {
+			info.Prefixes = append(info.Prefixes, pfx.Prefix)
+		}
+		info.DNSServers = s.cfg.DNSServers
+		if !s.lastRA.IsZero() {
+			info.LastRA = fmt.Sprintf("%.0fs ago", time.Since(s.lastRA).Seconds())
+		} else {
+			info.LastRA = "never"
+		}
+		result = append(result, info)
+	}
+	return result
 }
 
 // configEqual compares two RA configs for equality.

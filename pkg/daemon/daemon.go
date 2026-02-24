@@ -634,6 +634,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			},
 			ApplyFn: applyAndSync,
 			VRRPMgr: d.vrrpMgr,
+			RAMgr:   d.ra,
 			Version: d.opts.Version,
 		})
 		wg.Add(1)

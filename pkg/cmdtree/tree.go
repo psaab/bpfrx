@@ -370,7 +370,8 @@ var OperationalTree = map[string]*Node{
 		}},
 		"arp":         {Desc: "Show system ARP table entries"},
 		"ipv6": {Desc: "Show IPv6 information", Children: map[string]*Node{
-			"neighbors": {Desc: "Show IPv6 neighbor cache"},
+			"neighbors":            {Desc: "Show IPv6 neighbor cache"},
+			"router-advertisement": {Desc: "Show Router Advertisement status"},
 		}},
 		"schedulers":        {Desc: "Show policy schedulers"},
 		"dhcp-relay":        {Desc: "Show DHCP relay status"},

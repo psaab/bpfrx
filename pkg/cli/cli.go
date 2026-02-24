@@ -9904,6 +9904,8 @@ func (c *CLI) handleShowIPv6(args []string) error {
 	switch args[0] {
 	case "neighbors":
 		return c.showIPv6Neighbors()
+	case "router-advertisement":
+		return c.showIPv6RouterAdvertisement()
 	default:
 		return fmt.Errorf("unknown show ipv6 target: %s", args[0])
 	}
@@ -9999,6 +10001,75 @@ func neighState(state int) string {
 	default:
 		return "unknown"
 	}
+}
+
+// showIPv6RouterAdvertisement shows RA configuration from the active config.
+func (c *CLI) showIPv6RouterAdvertisement() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || len(cfg.Protocols.RouterAdvertisement) == 0 {
+		fmt.Println("Router Advertisements: not configured")
+		return nil
+	}
+
+	fmt.Printf("Router Advertisement: %d interface(s) configured\n\n", len(cfg.Protocols.RouterAdvertisement))
+
+	for _, ra := range cfg.Protocols.RouterAdvertisement {
+		fmt.Printf("Interface: %s\n", ra.Interface)
+
+		lifetime := ra.DefaultLifetime
+		if lifetime <= 0 {
+			lifetime = 1800
+		}
+		fmt.Printf("  Router lifetime:    %ds\n", lifetime)
+
+		pref := ra.Preference
+		if pref == "" {
+			pref = "medium"
+		}
+		fmt.Printf("  Preference:         %s\n", pref)
+
+		maxAdv := ra.MaxAdvInterval
+		if maxAdv <= 0 {
+			maxAdv = 600
+		}
+		minAdv := ra.MinAdvInterval
+		if minAdv <= 0 {
+			minAdv = maxAdv / 3
+		}
+		fmt.Printf("  Max RA interval:    %ds\n", maxAdv)
+		fmt.Printf("  Min RA interval:    %ds\n", minAdv)
+
+		if ra.ManagedConfig {
+			fmt.Println("  Managed flag:       on")
+		}
+		if ra.OtherStateful {
+			fmt.Println("  Other config flag:  on")
+		}
+		if ra.LinkMTU > 0 {
+			fmt.Printf("  Link MTU:           %d\n", ra.LinkMTU)
+		}
+
+		for _, pfx := range ra.Prefixes {
+			fmt.Printf("  Prefix: %s\n", pfx.Prefix)
+			fmt.Printf("    On-link:          %t\n", pfx.OnLink)
+			fmt.Printf("    Autonomous:       %t\n", pfx.Autonomous)
+			if pfx.ValidLifetime > 0 {
+				fmt.Printf("    Valid lifetime:   %ds\n", pfx.ValidLifetime)
+			}
+			if pfx.PreferredLife > 0 {
+				fmt.Printf("    Preferred life:   %ds\n", pfx.PreferredLife)
+			}
+		}
+
+		if len(ra.DNSServers) > 0 {
+			fmt.Printf("  DNS servers:        %s\n", strings.Join(ra.DNSServers, ", "))
+		}
+		if ra.NAT64Prefix != "" {
+			fmt.Printf("  PREF64:             %s\n", ra.NAT64Prefix)
+		}
+		fmt.Println()
+	}
+	return nil
 }
 
 // showSystemUsers shows configured login users from the active config.
