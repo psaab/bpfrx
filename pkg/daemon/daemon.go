@@ -1119,6 +1119,19 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
+	// 2.7. Re-bind management VRF interfaces after networkd.Apply().
+	// networkctl reconfigure strips VRF master bindings because networkd
+	// considers the daemon-created vrf-mgmt device "unmanaged" and ignores
+	// the VRF= directive. Re-bind here to restore VRF membership.
+	if d.routing != nil && d.mgmtVRFInterfaces != nil {
+		for ifName := range d.mgmtVRFInterfaces {
+			if err := d.routing.BindInterfaceToVRF(ifName, "mgmt"); err != nil {
+				slog.Warn("failed to re-bind interface to management VRF",
+					"interface", ifName, "err", err)
+			}
+		}
+	}
+
 	// 3. Apply all routes + dynamic protocols via FRR
 	if d.frr != nil {
 		// Collect interface bandwidths and point-to-point flags for FRR.
