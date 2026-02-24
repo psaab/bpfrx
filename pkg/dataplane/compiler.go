@@ -556,12 +556,16 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				}
 
 				// Disable VLAN RX offload so XDP sees VLAN tags in packet data
-				// (otherwise NIC strips them into skb->vlan_tci which XDP can't read)
-				if out, err := exec.Command("ethtool", "-K", physName, "rxvlan", "off").CombinedOutput(); err != nil {
-					slog.Warn("failed to disable rxvlan offload (VLAN parsing may fail)",
-						"interface", physName, "err", err, "output", strings.TrimSpace(string(out)))
-				} else {
-					slog.Info("disabled VLAN RX offload for XDP", "interface", physName)
+				// (otherwise NIC strips them into skb->vlan_tci which XDP can't read).
+				// Check current state first — toggling rxvlan on iavf VFs causes a
+				// driver reset that drops in-flight packets (kills active TCP sessions).
+				if !isRxVlanOff(physName) {
+					if out, err := exec.Command("ethtool", "-K", physName, "rxvlan", "off").CombinedOutput(); err != nil {
+						slog.Warn("failed to disable rxvlan offload (VLAN parsing may fail)",
+							"interface", physName, "err", err, "output", strings.TrimSpace(string(out)))
+					} else {
+						slog.Info("disabled VLAN RX offload for XDP", "interface", physName)
+					}
 				}
 
 				// Apply interface-level MTU from config
@@ -3453,6 +3457,22 @@ func resolvePortName(name string) uint16 {
 		}
 		return 0
 	}
+}
+
+// isRxVlanOff returns true if rx-vlan-offload is already disabled on iface.
+// Used to avoid redundant ethtool -K rxvlan off calls, which cause iavf VF
+// driver resets that drop in-flight packets.
+func isRxVlanOff(iface string) bool {
+	out, err := exec.Command("ethtool", "-k", iface).CombinedOutput()
+	if err != nil {
+		return false // assume it's on; the set call will report the real error
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "rx-vlan-offload:") {
+			return strings.Contains(line, "off")
+		}
+	}
+	return false
 }
 
 // applyEthtool applies speed and duplex settings via ethtool if configured.
