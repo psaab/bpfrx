@@ -184,6 +184,20 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 	return nil
 }
 
+// ReconcileVIPs re-adds VIPs on any MASTER instances. Call this after
+// operations that may remove addresses (e.g. programRethMAC link down/up).
+func (m *Manager) ReconcileVIPs() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, vi := range m.instances {
+		if vi.getState() == StateMaster {
+			vi.addVIPs()
+			vi.sendGARP()
+		}
+	}
+}
+
 // States returns the current state of all instances.
 // Key format: "VI_<iface>_<group>" → "MASTER", "BACKUP", "INIT".
 func (m *Manager) States() map[string]string {

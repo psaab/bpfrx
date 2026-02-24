@@ -1262,6 +1262,13 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
+	// 2.6b. Reconcile VRRP VIPs after RETH MAC programming.
+	// programRethMAC brings the interface DOWN/UP which removes all
+	// addresses including VRRP VIPs. Re-add them on MASTER instances.
+	if d.vrrpMgr != nil {
+		d.vrrpMgr.ReconcileVIPs()
+	}
+
 	// 2.7. Re-bind management VRF interfaces after networkd.Apply().
 	// networkctl reconfigure strips VRF master bindings because networkd
 	// considers the daemon-created vrf-mgmt device "unmanaged" and ignores
