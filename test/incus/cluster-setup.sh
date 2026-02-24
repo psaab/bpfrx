@@ -97,7 +97,7 @@ create_networks() {
 			ipv6.address=none
 		# Enable IPv6 on cluster LAN bridge so incus doesn't strip IPv6
 		# routes from containers. ra-param=*,0,0 suppresses default
-		# router advertisements so only the firewall's radvd is used.
+		# router advertisements so only the firewall's embedded RA sender is used.
 		if [[ "$name" == "bpfrx-clan" ]]; then
 			incus network set "$name" \
 				ipv6.address=fd42:cafe::1/64 \
@@ -474,6 +474,9 @@ deploy_vm() {
 
 	# Ensure node-id file exists
 	incus exec "$vm" -- bash -c "echo $idx > /etc/bpfrx/node-id"
+
+	# Disable radvd — embedded RA sender in bpfrxd replaces it
+	incus exec "$vm" -- systemctl disable --now radvd 2>/dev/null || true
 
 	# Install systemd unit
 	info "Installing systemd service on $vm..."

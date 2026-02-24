@@ -542,3 +542,96 @@ func TestBuildRA_MarshalRoundtrip(t *testing.T) {
 		t.Errorf("parsed Preference = %v, want High", parsed.RouterSelectionPreference)
 	}
 }
+
+// TestBuildRA_PREF64MarshalRoundtrip verifies that the PREF64 option
+// survives marshal+parse roundtrip and appears in the raw bytes.
+func TestBuildRA_PREF64MarshalRoundtrip(t *testing.T) {
+	s := &sender{
+		cfg: &config.RAInterfaceConfig{
+			Interface:       "trust0",
+			NAT64Prefix:     "64:ff9b::/96",
+			NAT64PrefixLife: 1800,
+			Prefixes: []*config.RAPrefix{
+				{
+					Prefix:     "2001:db8::/64",
+					OnLink:     true,
+					Autonomous: true,
+				},
+			},
+			DNSServers: []string{"2001:4860:4860::8888"},
+		},
+		iface: &net.Interface{
+			Name:         "trust0",
+			HardwareAddr: net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
+		},
+	}
+
+	ra := s.buildRA()
+
+	// Verify PREF64 option is in the RA struct.
+	var foundInStruct bool
+	for _, opt := range ra.Options {
+		if _, ok := opt.(*ndp.PREF64); ok {
+			foundInStruct = true
+		}
+	}
+	if !foundInStruct {
+		t.Fatal("PREF64 option not in RA struct before marshal")
+	}
+
+	// Marshal to binary.
+	b, err := ndp.MarshalMessage(ra)
+	if err != nil {
+		t.Fatalf("MarshalMessage: %v", err)
+	}
+
+	// Scan raw bytes for option type 38 (PREF64).
+	// RA header is 4 (ICMPv6) + 12 (RA body) = 16 bytes.
+	// Options start at offset 16.
+	var foundRaw bool
+	off := 16
+	for off+2 <= len(b) {
+		optType := b[off]
+		optLen := int(b[off+1]) * 8
+		if optLen == 0 {
+			break
+		}
+		t.Logf("raw option: type=%d len=%d at offset %d", optType, optLen, off)
+		if optType == 38 {
+			foundRaw = true
+		}
+		off += optLen
+	}
+	if !foundRaw {
+		t.Fatalf("PREF64 (type 38) not found in raw marshaled bytes (len=%d): %x", len(b), b)
+	}
+
+	// Parse back.
+	msg, err := ndp.ParseMessage(b)
+	if err != nil {
+		t.Fatalf("ParseMessage: %v", err)
+	}
+
+	parsed, ok := msg.(*ndp.RouterAdvertisement)
+	if !ok {
+		t.Fatal("parsed message is not RouterAdvertisement")
+	}
+
+	var foundParsed bool
+	for _, opt := range parsed.Options {
+		if pref64, ok := opt.(*ndp.PREF64); ok {
+			foundParsed = true
+			wantPrefix := netip.MustParsePrefix("64:ff9b::/96")
+			if pref64.Prefix != wantPrefix {
+				t.Errorf("parsed PREF64 prefix = %s, want %s", pref64.Prefix, wantPrefix)
+			}
+			// 1800s / 8 = 225, so roundtrip should be 225*8 = 1800s
+			if pref64.Lifetime != 1800*time.Second {
+				t.Errorf("parsed PREF64 lifetime = %v, want 1800s", pref64.Lifetime)
+			}
+		}
+	}
+	if !foundParsed {
+		t.Error("PREF64 option not found after parse roundtrip")
+	}
+}
