@@ -41,7 +41,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/lldp"
 	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/networkd"
-	"github.com/psaab/bpfrx/pkg/radvd"
+	"github.com/psaab/bpfrx/pkg/ra"
 	"github.com/psaab/bpfrx/pkg/routing"
 	"github.com/psaab/bpfrx/pkg/rpm"
 	"github.com/psaab/bpfrx/pkg/scheduler"
@@ -73,7 +73,7 @@ type Daemon struct {
 	routing      *routing.Manager
 	frr          *frr.Manager
 	ipsec        *ipsec.Manager
-	radvd        *radvd.Manager
+	ra           *ra.Manager
 	dhcp         *dhcp.Manager
 	dhcpServer   *dhcpserver.Manager
 	feeds        *feeds.Manager
@@ -166,7 +166,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		d.frr = frr.New()
 		d.ipsec = ipsec.New()
-		d.radvd = radvd.New()
+		d.ra = ra.New()
 		d.networkd = networkd.New()
 		d.dhcpServer = dhcpserver.New()
 	}
@@ -1162,21 +1162,21 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// instead of NO_NEIGH for the first forwarded packet.
 	d.resolveNeighbors(cfg)
 
-	// 5. Apply radvd config (Router Advertisements)
-	// In cluster mode, radvd/kea are managed by watchVRRPEvents — only
+	// 5. Apply RA config (Router Advertisements)
+	// In cluster mode, RA/kea are managed by watchVRRPEvents — only
 	// the MASTER runs these services to prevent dual-RA / dual-DHCP.
 	// The VRRP event fires shortly after startup and calls applyRethServices().
 	isCluster := cfg.Chassis.Cluster != nil
 	raConfigs := d.buildRAConfigs(cfg)
 	if !isCluster {
-		if d.radvd != nil && len(raConfigs) > 0 {
-			if err := d.radvd.Apply(raConfigs); err != nil {
-				slog.Warn("failed to apply radvd config", "err", err)
+		if d.ra != nil && len(raConfigs) > 0 {
+			if err := d.ra.Apply(raConfigs); err != nil {
+				slog.Warn("failed to apply RA config", "err", err)
 			}
-		} else if d.radvd != nil {
-			// No RA configs — clear any previous radvd config.
-			if err := d.radvd.Clear(); err != nil {
-				slog.Warn("failed to clear radvd config", "err", err)
+		} else if d.ra != nil {
+			// No RA configs — clear any previous RA senders.
+			if err := d.ra.Clear(); err != nil {
+				slog.Warn("failed to clear RA config", "err", err)
 			}
 		}
 	}
@@ -1347,7 +1347,7 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 			"delegated_from", mapping.Interface)
 	}
 
-	// Resolve RETH interface names for radvd (needs real Linux names).
+	// Resolve RETH interface names for RA senders (needs real Linux names).
 	for _, ra := range result {
 		ra.Interface = config.LinuxIfName(cfg.ResolveReth(ra.Interface))
 	}
@@ -3133,7 +3133,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 // watchVRRPEvents monitors VRRP state changes and logs transitions.
 // On MASTER transition, triggers ARP/ND warmup for synced session
 // next-hops so that bpf_fib_lookup finds neighbor entries immediately.
-// Also starts/stops radvd and Kea DHCP server — these services must
+// Also starts/stops RA senders and Kea DHCP server — these services must
 // only run on the primary to avoid dual-router / dual-DHCP issues.
 func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 	for {
@@ -3159,7 +3159,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 	}
 }
 
-// applyRethServices starts radvd and Kea DHCP server. Called on VRRP
+// applyRethServices starts RA senders and Kea DHCP server. Called on VRRP
 // MASTER transition — these services bind to RETH member interfaces
 // and must only run on the primary node to avoid dual-RA / dual-DHCP.
 func (d *Daemon) applyRethServices() {
@@ -3167,13 +3167,13 @@ func (d *Daemon) applyRethServices() {
 	if cfg == nil {
 		return
 	}
-	if d.radvd != nil {
+	if d.ra != nil {
 		raConfigs := d.buildRAConfigs(cfg)
 		if len(raConfigs) > 0 {
-			if err := d.radvd.Apply(raConfigs); err != nil {
-				slog.Warn("vrrp: failed to apply radvd on MASTER", "err", err)
+			if err := d.ra.Apply(raConfigs); err != nil {
+				slog.Warn("vrrp: failed to apply RA on MASTER", "err", err)
 			} else {
-				slog.Info("vrrp: radvd started (MASTER)")
+				slog.Info("vrrp: RA senders started (MASTER)")
 			}
 		}
 	}
@@ -3188,17 +3188,16 @@ func (d *Daemon) applyRethServices() {
 	}
 }
 
-// clearRethServices withdraws radvd (goodbye RA with lifetime=0) and
-// stops Kea DHCP server. Called on VRRP BACKUP transition to prevent
-// the secondary from advertising RAs or serving DHCP leases.
-// The goodbye RA tells hosts to immediately remove this router as a
-// default gateway, avoiding stale RA routes during failover.
+// clearRethServices sends goodbye RAs (lifetime=0) and stops Kea DHCP
+// server. Called on VRRP BACKUP transition to prevent the secondary from
+// advertising RAs or serving DHCP leases. The goodbye RA tells hosts to
+// immediately remove this router as a default gateway.
 func (d *Daemon) clearRethServices() {
-	if d.radvd != nil {
-		if err := d.radvd.Withdraw(); err != nil {
-			slog.Warn("vrrp: failed to withdraw radvd on BACKUP", "err", err)
+	if d.ra != nil {
+		if err := d.ra.Withdraw(); err != nil {
+			slog.Warn("vrrp: failed to withdraw RA on BACKUP", "err", err)
 		} else {
-			slog.Info("vrrp: radvd withdrawn (BACKUP, goodbye RA sent)")
+			slog.Info("vrrp: RA withdrawn (BACKUP, goodbye RA sent)")
 		}
 	}
 	if d.dhcpServer != nil {
