@@ -103,6 +103,19 @@ func (rc *RethController) RethIPs(rethName string) ([]net.IP, error) {
 	return nil, fmt.Errorf("reth %s not found", rethName)
 }
 
+// RethMAC returns the deterministic virtual MAC for a RETH interface.
+// Format: 02:bf:72:CC:RR:00 (locally-administered, cluster_id, rg_id).
+// Both cluster nodes program the same MAC on their RETH member interfaces,
+// ensuring identical IPv6 link-local addresses and seamless failover.
+func RethMAC(clusterID, rgID int) net.HardwareAddr {
+	return net.HardwareAddr{0x02, 0xbf, 0x72, byte(clusterID), byte(rgID), 0x00}
+}
+
+// IsVirtualRethMAC returns true if the MAC matches the virtual RETH pattern (02:bf:72:...).
+func IsVirtualRethMAC(mac net.HardwareAddr) bool {
+	return len(mac) == 6 && mac[0] == 0x02 && mac[1] == 0xbf && mac[2] == 0x72
+}
+
 // FormatStatus returns RETH interface status for display.
 func (rc *RethController) FormatStatus() string {
 	rc.mu.Lock()

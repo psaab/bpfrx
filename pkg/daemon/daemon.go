@@ -2,6 +2,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -786,6 +787,21 @@ func enableForwarding() {
 	slog.Info("IP forwarding enabled, RA acceptance disabled")
 }
 
+// programRethMAC sets a deterministic virtual MAC on a RETH member interface.
+// Skips if the interface already has the correct MAC.
+func programRethMAC(ifName string, mac net.HardwareAddr) error {
+	link, err := netlink.LinkByName(ifName)
+	if err != nil {
+		return fmt.Errorf("interface %s: %w", ifName, err)
+	}
+	current := link.Attrs().HardwareAddr
+	if bytes.Equal(current, mac) {
+		return nil
+	}
+	slog.Info("setting RETH virtual MAC", "iface", ifName, "mac", mac)
+	return netlink.LinkSetHardwareAddr(link, mac)
+}
+
 func isInteractive() bool {
 	_, err := unix.IoctlGetTermios(int(os.Stdin.Fd()), unix.TCGETS)
 	return err == nil
@@ -983,6 +999,26 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	if d.networkd != nil && compileResult != nil && len(compileResult.ManagedInterfaces) > 0 {
 		if err := d.networkd.Apply(compileResult.ManagedInterfaces); err != nil {
 			slog.Warn("failed to apply networkd config", "err", err)
+		}
+	}
+
+	// 2.6. Program deterministic virtual MACs on RETH member interfaces.
+	// Both cluster nodes get the same MAC per RETH, ensuring identical IPv6
+	// link-local addresses and seamless failover without neighbor cache issues.
+	// Must run AFTER networkd.Apply() so .link renames are applied first.
+	if d.cluster != nil && cfg.Chassis.Cluster != nil {
+		clusterID := cfg.Chassis.Cluster.ClusterID
+		rethToPhys := cfg.RethToPhysical()
+		for rethName, physName := range rethToPhys {
+			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
+			if !ok || rethCfg.RedundancyGroup <= 0 {
+				continue
+			}
+			linuxName := config.LinuxIfName(physName)
+			mac := cluster.RethMAC(clusterID, rethCfg.RedundancyGroup)
+			if err := programRethMAC(linuxName, mac); err != nil {
+				slog.Warn("failed to set RETH MAC", "iface", linuxName, "mac", mac, "err", err)
+			}
 		}
 	}
 

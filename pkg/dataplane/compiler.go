@@ -712,6 +712,12 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 		if mac == "" {
 			continue
 		}
+		// If this is a RETH member with a virtual MAC already programmed
+		// (02:bf:72:...), skip writing the .link file — the bootstrap .link
+		// file (from setup.sh) uses the physical MAC for udev rename.
+		if isVRRPReth && isVirtualRethMAC(physIface.HardwareAddr) {
+			mac = ""
+		}
 
 		if effectiveCfg.VlanTagging {
 			// VLAN parent: no addresses, just rename
@@ -3523,4 +3529,9 @@ func compilePortMirroring(dp DataPlane, cfg *config.Config) error {
 	}
 
 	return nil
+}
+
+// isVirtualRethMAC returns true if the MAC matches the virtual RETH pattern (02:bf:72:...).
+func isVirtualRethMAC(mac net.HardwareAddr) bool {
+	return len(mac) == 6 && mac[0] == 0x02 && mac[1] == 0xbf && mac[2] == 0x72
 }
