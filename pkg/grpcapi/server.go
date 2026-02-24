@@ -5979,12 +5979,35 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			fmt.Fprintln(&buf, "Cluster not configured")
 			break
 		}
-		states := s.cluster.GroupStates()
-		fmt.Fprintln(&buf, "Cluster statistics:")
-		for _, rg := range states {
-			fmt.Fprintf(&buf, "  Redundancy group %d: failover count %d, weight %d\n",
-				rg.GroupID, rg.FailoverCount, rg.Weight)
+		buf.WriteString(s.cluster.FormatStatistics())
+
+	case "chassis-cluster-control-plane-statistics":
+		if s.cluster == nil {
+			fmt.Fprintln(&buf, "Cluster not configured")
+			break
 		}
+		buf.WriteString(s.cluster.FormatControlPlaneStatistics())
+
+	case "chassis-cluster-data-plane-statistics":
+		if s.cluster == nil {
+			fmt.Fprintln(&buf, "Cluster not configured")
+			break
+		}
+		buf.WriteString(s.cluster.FormatDataPlaneStatistics())
+
+	case "chassis-cluster-data-plane-interfaces":
+		if s.cluster == nil {
+			fmt.Fprintln(&buf, "Cluster not configured")
+			break
+		}
+		buf.WriteString(s.cluster.FormatDataPlaneInterfaces())
+
+	case "chassis-cluster-ip-monitoring-status":
+		if s.cluster == nil {
+			fmt.Fprintln(&buf, "Cluster not configured")
+			break
+		}
+		buf.WriteString(s.cluster.FormatIPMonitoringStatus())
 
 	case "chassis-environment":
 		thermalZones, _ := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")

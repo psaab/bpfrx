@@ -64,6 +64,16 @@ var OperationalTree = map[string]*Node{
 			"interfaces":  {Desc: "Show cluster interfaces"},
 			"information": {Desc: "Show cluster configuration details"},
 			"statistics":  {Desc: "Show cluster statistics"},
+			"control-plane": {Desc: "Show control-plane information", Children: map[string]*Node{
+				"statistics": {Desc: "Show control-plane statistics"},
+			}},
+			"data-plane": {Desc: "Show data-plane information", Children: map[string]*Node{
+				"statistics": {Desc: "Show data-plane statistics"},
+				"interfaces": {Desc: "Show data-plane interfaces"},
+			}},
+			"ip-monitoring": {Desc: "Show IP monitoring information", Children: map[string]*Node{
+				"status": {Desc: "Show IP monitoring status"},
+			}},
 		}},
 			"alarms":         {Desc: "Show chassis alarm status"},
 			"environment":    {Desc: "Show chassis environment"},

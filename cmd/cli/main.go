@@ -623,6 +623,26 @@ func (c *ctl) handleShow(args []string) error {
 						return c.showText("chassis-cluster-information")
 					case "statistics":
 						return c.showText("chassis-cluster-statistics")
+					case "control-plane":
+						if len(args) >= 4 && args[3] == "statistics" {
+							return c.showText("chassis-cluster-control-plane-statistics")
+						}
+						return c.showText("chassis-cluster-control-plane-statistics")
+					case "data-plane":
+						if len(args) >= 4 {
+							switch args[3] {
+							case "statistics":
+								return c.showText("chassis-cluster-data-plane-statistics")
+							case "interfaces":
+								return c.showText("chassis-cluster-data-plane-interfaces")
+							}
+						}
+						return c.showText("chassis-cluster-data-plane-statistics")
+					case "ip-monitoring":
+						if len(args) >= 4 && args[3] == "status" {
+							return c.showText("chassis-cluster-ip-monitoring-status")
+						}
+						return c.showText("chassis-cluster-ip-monitoring-status")
 					}
 				}
 				return c.showText("chassis-cluster")

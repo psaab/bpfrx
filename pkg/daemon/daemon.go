@@ -3241,8 +3241,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			syncPeer := fmt.Sprintf("%s:4785", cc.FabricPeerAddress)
 			d.sessionSync = cluster.NewSessionSync(syncLocal, syncPeer, nil)
 
+			// Wire sync stats into cluster manager for CLI display.
+			d.cluster.SetSyncStats(d.sessionSync)
+
 			// Wire config sync callback: when secondary receives config from primary.
 			d.sessionSync.OnConfigReceived = func(configText string) {
+				d.cluster.RecordEvent(cluster.EventConfigSync, -1, fmt.Sprintf("Config received (%d bytes)", len(configText)))
 				d.handleConfigSync(configText)
 			}
 
@@ -3253,6 +3257,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// primary check — the stable node may have been preempted by
 			// the time the TCP sync connection is established.
 			d.sessionSync.OnPeerConnected = func() {
+				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer connected")
 				if time.Since(d.startTime) < 30*time.Second {
 					slog.Info("cluster: skipping config push (daemon just started)")
 					return
@@ -3270,6 +3275,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			}
 
 			d.sessionSync.OnBulkSyncReceived = func() {
+				d.cluster.RecordEvent(cluster.EventColdSync, -1, "Bulk sync completed")
 				slog.Info("cluster: session sync complete, releasing VRRP hold")
 				d.vrrpMgr.ReleaseSyncHold()
 			}

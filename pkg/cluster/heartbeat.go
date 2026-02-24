@@ -132,23 +132,27 @@ type PeerGroupState struct {
 
 // heartbeatSender sends periodic heartbeat packets.
 type heartbeatSender struct {
-	mgr      *Manager
-	conn     *net.UDPConn
-	peerAddr *net.UDPAddr
-	interval time.Duration
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
+	mgr        *Manager
+	conn       *net.UDPConn
+	peerAddr   *net.UDPAddr
+	interval   time.Duration
+	stopCh     chan struct{}
+	wg         sync.WaitGroup
+	sent       atomic.Uint64
+	sendErrors atomic.Uint64
 }
 
 // heartbeatReceiver listens for peer heartbeat packets.
 type heartbeatReceiver struct {
-	mgr       *Manager
-	conn      *net.UDPConn
-	threshold int
-	interval  time.Duration
-	stopCh    chan struct{}
-	wg        sync.WaitGroup
-	lastSeen  atomic.Int64 // unix nano of last heartbeat
+	mgr        *Manager
+	conn       *net.UDPConn
+	threshold  int
+	interval   time.Duration
+	stopCh     chan struct{}
+	wg         sync.WaitGroup
+	lastSeen   atomic.Int64 // unix nano of last heartbeat
+	received   atomic.Uint64
+	recvErrors atomic.Uint64
 }
 
 func newHeartbeatSender(mgr *Manager, conn *net.UDPConn, peerAddr *net.UDPAddr, interval time.Duration) *heartbeatSender {
@@ -185,7 +189,10 @@ func (s *heartbeatSender) send() {
 	pkt := s.mgr.buildHeartbeat()
 	data := MarshalHeartbeat(pkt)
 	if _, err := s.conn.WriteToUDP(data, s.peerAddr); err != nil {
+		s.sendErrors.Add(1)
 		slog.Debug("cluster: heartbeat send failed", "err", err)
+	} else {
+		s.sent.Add(1)
 	}
 }
 
@@ -239,12 +246,14 @@ func (r *heartbeatReceiver) readLoop() {
 
 		pkt, err := UnmarshalHeartbeat(buf[:n])
 		if err != nil {
+			r.recvErrors.Add(1)
 			slog.Warn("cluster: invalid heartbeat", "err", err)
 			continue
 		}
 
 		// Validate cluster ID.
 		if int(pkt.ClusterID) != r.mgr.ClusterID() {
+			r.recvErrors.Add(1)
 			slog.Warn("cluster: heartbeat from wrong cluster",
 				"got", pkt.ClusterID, "want", r.mgr.ClusterID())
 			continue
@@ -255,6 +264,7 @@ func (r *heartbeatReceiver) readLoop() {
 			continue
 		}
 
+		r.received.Add(1)
 		r.lastSeen.Store(time.Now().UnixNano())
 		r.mgr.handlePeerHeartbeat(pkt)
 	}

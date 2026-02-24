@@ -79,6 +79,7 @@ type Manager struct {
 	eventCh        chan ClusterEvent
 	monitor        *Monitor
 	garpCounts     map[int]int // rgID -> gratuitous ARP count from config
+	history        *EventHistory
 
 	// Peer state tracking (heartbeat).
 	peerAlive    bool
@@ -93,6 +94,9 @@ type Manager struct {
 	controlInterface string
 	hbInterval       time.Duration
 	hbThreshold      int
+
+	// Sync stats provider (set by daemon after sessionSync creation).
+	syncStats SyncStatsProvider
 }
 
 // NewManager creates a new cluster manager.
@@ -107,6 +111,7 @@ func NewManager(nodeID, clusterID int) *Manager {
 		peerGroups:     make(map[int]PeerGroupState),
 		hbInterval:     DefaultHeartbeatInterval,
 		hbThreshold:    DefaultHeartbeatThreshold,
+		history:        NewEventHistory(64),
 	}
 }
 
@@ -230,7 +235,7 @@ func (m *Manager) electSingleNode() {
 			rg.State = StateSecondary
 		}
 		if oldState != rg.State {
-			m.sendEvent(rg.GroupID, oldState, rg.State)
+			m.sendEvent(rg.GroupID, oldState, rg.State, "Only node present")
 		}
 	}
 }
@@ -363,7 +368,7 @@ func (m *Manager) ManualFailover(rgID int) error {
 	rg.State = StateSecondary
 	rg.FailoverCount++
 	if oldState != rg.State {
-		m.sendEvent(rg.GroupID, oldState, rg.State)
+		m.sendEvent(rg.GroupID, oldState, rg.State, "Manual failover")
 	}
 	slog.Info("cluster: manual failover", "rg", rgID)
 	return nil
@@ -390,7 +395,7 @@ func (m *Manager) ForceSecondary() error {
 		rg.State = StateSecondary
 		if oldState != rg.State {
 			rg.FailoverCount++
-			m.sendEvent(rg.GroupID, oldState, rg.State)
+			m.sendEvent(rg.GroupID, oldState, rg.State, "Forced secondary (ISSU)")
 		}
 	}
 
@@ -416,13 +421,15 @@ func (m *Manager) ResetFailover(rgID int) error {
 	return nil
 }
 
-func (m *Manager) sendEvent(groupID int, oldState, newState NodeState) {
+func (m *Manager) sendEvent(groupID int, oldState, newState NodeState, reason string) {
 	select {
 	case m.eventCh <- ClusterEvent{GroupID: groupID, OldState: oldState, NewState: newState}:
 	default:
 		slog.Warn("cluster: event channel full, dropping event",
 			"rg", groupID, "old", oldState, "new", newState)
 	}
+
+	m.history.Record(EventRG, groupID, fmt.Sprintf("%s->%s, reason: %s", oldState, newState, reason))
 
 	// Trigger GARP on transition to primary.
 	if newState == StatePrimary && oldState != StatePrimary {
@@ -600,6 +607,7 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 	if !wasAlive {
 		slog.Info("cluster: peer heartbeat received",
 			"peer_node", pkt.NodeID, "groups", len(pkt.Groups))
+		m.history.Record(EventHeartbeat, -1, fmt.Sprintf("Peer alive (node%d)", pkt.NodeID))
 	}
 
 	m.runElection()
@@ -617,6 +625,7 @@ func (m *Manager) handlePeerTimeout() {
 	m.peerAlive = false
 	m.peerGroups = make(map[int]PeerGroupState)
 	slog.Warn("cluster: peer heartbeat timeout, marking peer lost")
+	m.history.Record(EventHeartbeat, -1, "Peer heartbeat timeout")
 
 	// Peer lost: re-run single-node election.
 	m.electSingleNode()
@@ -626,6 +635,79 @@ func (m *Manager) handlePeerTimeout() {
 // GARP for VRRP-backed RETH interfaces, so this is a no-op.
 func (m *Manager) triggerGARP(rgID int) {
 	slog.Info("cluster: primary transition", "rg", rgID)
+}
+
+// RecordEvent records a cluster event to the history ring buffer.
+func (m *Manager) RecordEvent(cat EventCategory, rgID int, msg string) {
+	m.history.Record(cat, rgID, msg)
+}
+
+// EventHistoryFor returns the event history for a given category.
+func (m *Manager) EventHistoryFor(cat EventCategory) []HistoryEvent {
+	return m.history.Events(cat)
+}
+
+// HeartbeatStats holds heartbeat send/receive counters.
+type HeartbeatStats struct {
+	Sent       uint64
+	Received   uint64
+	SendErrors uint64
+	RecvErrors uint64
+}
+
+// HeartbeatStats returns current heartbeat counters.
+func (m *Manager) HeartbeatStats() HeartbeatStats {
+	m.mu.RLock()
+	sender := m.hbSender
+	receiver := m.hbReceiver
+	m.mu.RUnlock()
+
+	var s HeartbeatStats
+	if sender != nil {
+		s.Sent = sender.sent.Load()
+		s.SendErrors = sender.sendErrors.Load()
+	}
+	if receiver != nil {
+		s.Received = receiver.received.Load()
+		s.RecvErrors = receiver.recvErrors.Load()
+	}
+	return s
+}
+
+// SyncStatsProvider abstracts access to session sync statistics.
+type SyncStatsProvider interface {
+	Stats() SyncStats
+	IsConnected() bool
+}
+
+// SetSyncStats sets the sync stats provider (called by daemon after sessionSync creation).
+func (m *Manager) SetSyncStats(p SyncStatsProvider) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.syncStats = p
+}
+
+// GetSyncStats returns sync stats, or nil if no provider is set.
+func (m *Manager) GetSyncStats() *SyncStats {
+	m.mu.RLock()
+	p := m.syncStats
+	m.mu.RUnlock()
+	if p == nil {
+		return nil
+	}
+	stats := p.Stats()
+	return &stats
+}
+
+// IsSyncConnected returns true if the sync peer is connected.
+func (m *Manager) IsSyncConnected() bool {
+	m.mu.RLock()
+	p := m.syncStats
+	m.mu.RUnlock()
+	if p == nil {
+		return false
+	}
+	return p.IsConnected()
 }
 
 // LocalPriorities returns a map of redundancy group ID to VRRP priority.
@@ -657,6 +739,11 @@ func (m *Manager) FormatStatus() string {
 	m.mu.RUnlock()
 
 	var b strings.Builder
+	fmt.Fprintln(&b, "Monitor Failure codes:")
+	fmt.Fprintln(&b, "    CS  Cold Sync monitoring        FL  Fabric Connection monitoring")
+	fmt.Fprintln(&b, "    IF  Interface monitoring        IP  IP monitoring")
+	fmt.Fprintln(&b, "    CF  Config Sync monitoring")
+	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "Cluster ID: %d\n", m.clusterID)
 	fmt.Fprintf(&b, "Node name: node%d\n\n", m.nodeID)
 	fmt.Fprintf(&b, "%-6s %-8s %-14s %-8s %-8s %s\n",
@@ -695,7 +782,7 @@ func (m *Manager) FormatStatus() string {
 	return b.String()
 }
 
-// FormatInformation returns detailed cluster information.
+// FormatInformation returns detailed cluster information matching vSRX output.
 func (m *Manager) FormatInformation() string {
 	m.mu.RLock()
 	peerAlive := m.peerAlive
@@ -705,30 +792,64 @@ func (m *Manager) FormatInformation() string {
 	controlIface := m.controlInterface
 	m.mu.RUnlock()
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "Cluster ID: %d\n", m.clusterID)
-	fmt.Fprintf(&b, "Node ID: %d\n", m.nodeID)
-	fmt.Fprintf(&b, "Heartbeat interval: %d ms\n", interval.Milliseconds())
-	fmt.Fprintf(&b, "Heartbeat threshold: %d\n", threshold)
-	if controlIface != "" {
-		fmt.Fprintf(&b, "Control interface: %s\n", controlIface)
-	}
-
-	peerStatus := "lost"
-	if peerAlive {
-		peerStatus = fmt.Sprintf("alive (node%d)", peerNodeID)
-	}
-	fmt.Fprintf(&b, "Peer status: %s\n", peerStatus)
-
 	states := m.GroupStates()
-	fmt.Fprintf(&b, "Redundancy groups: %d\n\n", len(states))
 
+	var b strings.Builder
+
+	// Redundancy mode.
+	mode := "active-passive"
+	if len(states) > 1 {
+		// If different RGs have different primaries, it's active-active.
+		primary0 := false
+		secondary0 := false
+		for _, rg := range states {
+			if rg.State == StatePrimary {
+				primary0 = true
+			} else {
+				secondary0 = true
+			}
+		}
+		if primary0 && secondary0 {
+			mode = "active-active"
+		}
+	}
+	fmt.Fprintf(&b, "Redundancy mode: %s\n\n", mode)
+
+	// Cluster configuration.
+	fmt.Fprintln(&b, "Cluster configuration:")
+	fmt.Fprintf(&b, "  Cluster ID: %d\n", m.clusterID)
+	fmt.Fprintf(&b, "  Node ID: %d\n", m.nodeID)
+	fmt.Fprintf(&b, "  Heartbeat interval: %d ms\n", interval.Milliseconds())
+	fmt.Fprintf(&b, "  Heartbeat threshold: %d\n", threshold)
+	if controlIface != "" {
+		fmt.Fprintf(&b, "  Control interface: %s\n", controlIface)
+	}
+	fmt.Fprintln(&b)
+
+	// Node health.
+	localHealth := "healthy"
+	for _, rg := range states {
+		if len(rg.MonitorFails) > 0 || rg.Weight < 255 {
+			localHealth = "degraded"
+			break
+		}
+	}
+	remoteHealth := "lost"
+	if peerAlive {
+		remoteHealth = fmt.Sprintf("healthy (node%d)", peerNodeID)
+	}
+	fmt.Fprintln(&b, "Node health:")
+	fmt.Fprintf(&b, "  Local node: %s\n", localHealth)
+	fmt.Fprintf(&b, "  Remote node: %s\n", remoteHealth)
+	fmt.Fprintln(&b)
+
+	// Per-RG details with event history.
 	for _, rg := range states {
 		fmt.Fprintf(&b, "Redundancy group %d:\n", rg.GroupID)
 		fmt.Fprintf(&b, "  Local priority: %d\n", rg.LocalPriority)
 		fmt.Fprintf(&b, "  Peer priority: %d\n", rg.PeerPriority)
 		fmt.Fprintf(&b, "  Local state: %s\n", rg.State)
-		fmt.Fprintf(&b, "  Weight: %d\n", rg.Weight)
+		fmt.Fprintf(&b, "  Weight: %d/255 (threshold: 0)\n", rg.Weight)
 		fmt.Fprintf(&b, "  Effective priority: %d\n", EffectivePriority(rg.LocalPriority, rg.Weight))
 		preempt := "no"
 		if rg.Preempt {
@@ -739,7 +860,348 @@ func (m *Manager) FormatInformation() string {
 		if len(rg.MonitorFails) > 0 {
 			fmt.Fprintf(&b, "  Monitor failures: %s\n", strings.Join(rg.MonitorFails, ", "))
 		}
+
+		// RG event history.
+		rgEvents := m.history.Events(EventRG)
+		var rgFiltered []HistoryEvent
+		for _, ev := range rgEvents {
+			if ev.GroupID == rg.GroupID {
+				rgFiltered = append(rgFiltered, ev)
+			}
+		}
+		if len(rgFiltered) > 0 {
+			fmt.Fprintln(&b, "  Event history:")
+			for _, ev := range rgFiltered {
+				fmt.Fprintf(&b, "    %s  %s\n", ev.Time.Format("Jan 02 15:04:05"), ev.Message)
+			}
+		}
 		fmt.Fprintln(&b)
 	}
+
+	// Control link statistics.
+	hbStats := m.HeartbeatStats()
+	fmt.Fprintln(&b, "Control link statistics:")
+	fmt.Fprintf(&b, "  Heartbeat packets sent:     %d\n", hbStats.Sent)
+	fmt.Fprintf(&b, "  Heartbeat packets received: %d\n", hbStats.Received)
+	fmt.Fprintf(&b, "  Heartbeat packet errors:    %d\n", hbStats.SendErrors+hbStats.RecvErrors)
+	fmt.Fprintln(&b)
+
+	// Fabric link statistics.
+	fmt.Fprintln(&b, "Fabric link statistics:")
+	syncStats := m.GetSyncStats()
+	if syncStats != nil {
+		connected := "Down"
+		if m.IsSyncConnected() {
+			connected = "Up"
+		}
+		fmt.Fprintf(&b, "  Status: %s\n", connected)
+		fmt.Fprintf(&b, "  Errors: %d\n", syncStats.Errors.Load())
+	} else {
+		fmt.Fprintln(&b, "  Not configured")
+	}
+	fabEvents := m.history.Events(EventFabric)
+	if len(fabEvents) > 0 {
+		fmt.Fprintln(&b, "  Events:")
+		for _, ev := range fabEvents {
+			fmt.Fprintf(&b, "    %s  %s\n", ev.Time.Format("Jan 02 15:04:05"), ev.Message)
+		}
+	}
+	fmt.Fprintln(&b)
+
+	// Cold synchronization.
+	fmt.Fprintln(&b, "Cold synchronization:")
+	if syncStats != nil {
+		startNano := syncStats.BulkSyncStartTime.Load()
+		endNano := syncStats.BulkSyncEndTime.Load()
+		bulkCount := syncStats.BulkSyncs.Load()
+		if startNano > 0 {
+			startTime := time.Unix(0, startNano)
+			if endNano > 0 {
+				endTime := time.Unix(0, endNano)
+				dur := endTime.Sub(startTime)
+				fmt.Fprintf(&b, "  Last bulk sync: %s (duration: %s, sessions: %d)\n",
+					endTime.Format("Jan 02 15:04:05"), dur.Round(time.Millisecond), syncStats.BulkSyncSessions.Load())
+			} else {
+				fmt.Fprintf(&b, "  Bulk sync in progress since %s (sessions: %d)\n",
+					startTime.Format("Jan 02 15:04:05"), syncStats.BulkSyncSessions.Load())
+			}
+		}
+		fmt.Fprintf(&b, "  Bulk syncs completed: %d\n", bulkCount)
+	} else {
+		fmt.Fprintln(&b, "  Not configured")
+	}
+	coldEvents := m.history.Events(EventColdSync)
+	if len(coldEvents) > 0 {
+		fmt.Fprintln(&b, "  Events:")
+		for _, ev := range coldEvents {
+			fmt.Fprintf(&b, "    %s  %s\n", ev.Time.Format("Jan 02 15:04:05"), ev.Message)
+		}
+	}
+	fmt.Fprintln(&b)
+
+	// Interface monitoring events.
+	monEvents := m.history.Events(EventMonitor)
+	if len(monEvents) > 0 {
+		fmt.Fprintln(&b, "Interface monitoring events:")
+		for _, ev := range monEvents {
+			rgStr := ""
+			if ev.GroupID >= 0 {
+				rgStr = fmt.Sprintf(" (rg%d)", ev.GroupID)
+			}
+			fmt.Fprintf(&b, "  %s%s  %s\n", ev.Time.Format("Jan 02 15:04:05"), rgStr, ev.Message)
+		}
+		fmt.Fprintln(&b)
+	}
+
+	// Configuration synchronization.
+	fmt.Fprintln(&b, "Configuration synchronization:")
+	if syncStats != nil {
+		configNano := syncStats.LastConfigSyncTime.Load()
+		if configNano > 0 {
+			configTime := time.Unix(0, configNano)
+			fmt.Fprintf(&b, "  Last config sync: %s (size: %d bytes)\n",
+				configTime.Format("Jan 02 15:04:05"), syncStats.LastConfigSyncSize.Load())
+		}
+		fmt.Fprintf(&b, "  Configs sent:     %d\n", syncStats.ConfigsSent.Load())
+		fmt.Fprintf(&b, "  Configs received: %d\n", syncStats.ConfigsReceived.Load())
+	} else {
+		fmt.Fprintln(&b, "  Not configured")
+	}
+	cfgEvents := m.history.Events(EventConfigSync)
+	if len(cfgEvents) > 0 {
+		fmt.Fprintln(&b, "  Events:")
+		for _, ev := range cfgEvents {
+			fmt.Fprintf(&b, "    %s  %s\n", ev.Time.Format("Jan 02 15:04:05"), ev.Message)
+		}
+	}
+
+	// Heartbeat event history.
+	hbEvents := m.history.Events(EventHeartbeat)
+	if len(hbEvents) > 0 {
+		fmt.Fprintln(&b)
+		fmt.Fprintln(&b, "Heartbeat events:")
+		for _, ev := range hbEvents {
+			fmt.Fprintf(&b, "  %s  %s\n", ev.Time.Format("Jan 02 15:04:05"), ev.Message)
+		}
+	}
+
+	return b.String()
+}
+
+// FormatStatistics returns cluster statistics matching vSRX output.
+func (m *Manager) FormatStatistics() string {
+	var b strings.Builder
+
+	// Control link statistics.
+	hbStats := m.HeartbeatStats()
+	fmt.Fprintln(&b, "Control link statistics:")
+	fmt.Fprintf(&b, "    Heartbeat packets sent:     %d\n", hbStats.Sent)
+	fmt.Fprintf(&b, "    Heartbeat packets received: %d\n", hbStats.Received)
+	fmt.Fprintf(&b, "    Heartbeat packet errors:    %d\n", hbStats.SendErrors+hbStats.RecvErrors)
+	fmt.Fprintln(&b)
+
+	// Services synchronized table.
+	syncStats := m.GetSyncStats()
+	if syncStats != nil {
+		fmt.Fprintln(&b, "Services Synchronized:")
+		fmt.Fprintf(&b, "    %-32s %-12s %s\n", "Service name", "Sent", "Received")
+		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session create",
+			syncStats.SessionsSent.Load(), syncStats.SessionsReceived.Load())
+		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session close",
+			syncStats.DeletesSent.Load(), syncStats.DeletesReceived.Load())
+		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Config",
+			syncStats.ConfigsSent.Load(), syncStats.ConfigsReceived.Load())
+		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "IPsec SA",
+			syncStats.IPsecSASent.Load(), syncStats.IPsecSAReceived.Load())
+		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Bulk syncs",
+			syncStats.BulkSyncs.Load(), syncStats.BulkSyncs.Load())
+		fmt.Fprintf(&b, "    %-32s %-12s %d\n", "Sessions installed",
+			"", syncStats.SessionsInstalled.Load())
+		fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Errors",
+			syncStats.Errors.Load(), "")
+	} else {
+		fmt.Fprintln(&b, "Session sync not configured")
+	}
+
+	return b.String()
+}
+
+// FormatControlPlaneStatistics returns control-plane (heartbeat) statistics.
+func (m *Manager) FormatControlPlaneStatistics() string {
+	var b strings.Builder
+	hbStats := m.HeartbeatStats()
+	fmt.Fprintln(&b, "Control link statistics:")
+	fmt.Fprintf(&b, "    Heartbeat packets sent:     %d\n", hbStats.Sent)
+	fmt.Fprintf(&b, "    Heartbeat packets received: %d\n", hbStats.Received)
+	fmt.Fprintf(&b, "    Heartbeat send errors:      %d\n", hbStats.SendErrors)
+	fmt.Fprintf(&b, "    Heartbeat receive errors:   %d\n", hbStats.RecvErrors)
+	return b.String()
+}
+
+// FormatDataPlaneStatistics returns data-plane (session sync) statistics.
+func (m *Manager) FormatDataPlaneStatistics() string {
+	var b strings.Builder
+	syncStats := m.GetSyncStats()
+	if syncStats == nil {
+		fmt.Fprintln(&b, "Session sync not configured")
+		return b.String()
+	}
+
+	fmt.Fprintln(&b, "Services Synchronized:")
+	fmt.Fprintf(&b, "    %-32s %-12s %s\n", "Service name", "Sent", "Received")
+	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session create",
+		syncStats.SessionsSent.Load(), syncStats.SessionsReceived.Load())
+	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session close",
+		syncStats.DeletesSent.Load(), syncStats.DeletesReceived.Load())
+	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Config",
+		syncStats.ConfigsSent.Load(), syncStats.ConfigsReceived.Load())
+	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "IPsec SA",
+		syncStats.IPsecSASent.Load(), syncStats.IPsecSAReceived.Load())
+	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Bulk syncs",
+		syncStats.BulkSyncs.Load(), syncStats.BulkSyncs.Load())
+	fmt.Fprintf(&b, "    %-32s %-12s %d\n", "Sessions installed",
+		"", syncStats.SessionsInstalled.Load())
+	fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Errors",
+		syncStats.Errors.Load(), "")
+	return b.String()
+}
+
+// FormatDataPlaneInterfaces returns fabric interface status.
+func (m *Manager) FormatDataPlaneInterfaces() string {
+	var b strings.Builder
+	fmt.Fprintln(&b, "Fabric link:")
+	if m.IsSyncConnected() {
+		fmt.Fprintln(&b, "  Status: Up")
+	} else {
+		fmt.Fprintln(&b, "  Status: Down")
+	}
+	syncStats := m.GetSyncStats()
+	if syncStats != nil {
+		fmt.Fprintf(&b, "  Errors: %d\n", syncStats.Errors.Load())
+	}
+	fabEvents := m.history.Events(EventFabric)
+	if len(fabEvents) > 0 {
+		fmt.Fprintln(&b, "  Events:")
+		for _, ev := range fabEvents {
+			fmt.Fprintf(&b, "    %s  %s\n", ev.Time.Format("Jan 02 15:04:05"), ev.Message)
+		}
+	}
+	return b.String()
+}
+
+// FormatIPMonitoringStatus returns per-RG IP monitoring probe status.
+func (m *Manager) FormatIPMonitoringStatus() string {
+	m.mu.RLock()
+	mon := m.monitor
+	m.mu.RUnlock()
+
+	states := m.GroupStates()
+	var b strings.Builder
+	fmt.Fprintln(&b, "IP monitoring status:")
+	fmt.Fprintln(&b)
+
+	hasIP := false
+	for _, rg := range states {
+		// Check for IP monitor failures (prefixed with "ip:").
+		var ipFails []string
+		for _, f := range rg.MonitorFails {
+			if strings.HasPrefix(f, "ip:") {
+				ipFails = append(ipFails, f)
+			}
+		}
+		// Show IP monitor section regardless (config-driven).
+		_ = mon // monitor has the config but we show from state
+		if len(ipFails) > 0 || true {
+			// We always show the section for each RG if any monitors are configured.
+			fmt.Fprintf(&b, "Redundancy group %d:\n", rg.GroupID)
+			if len(ipFails) > 0 {
+				for _, f := range ipFails {
+					addr := strings.TrimPrefix(f, "ip:")
+					fmt.Fprintf(&b, "  %-20s Status: unreachable\n", addr)
+				}
+			} else {
+				fmt.Fprintln(&b, "  No IP monitoring failures")
+			}
+			fmt.Fprintln(&b)
+			hasIP = true
+		}
+	}
+
+	if !hasIP {
+		fmt.Fprintln(&b, "No IP monitoring configured")
+	}
+
+	// Events.
+	monEvents := m.history.Events(EventMonitor)
+	var ipEvents []HistoryEvent
+	for _, ev := range monEvents {
+		if strings.HasPrefix(ev.Message, "IP ") {
+			ipEvents = append(ipEvents, ev)
+		}
+	}
+	if len(ipEvents) > 0 {
+		fmt.Fprintln(&b, "IP monitoring events:")
+		for _, ev := range ipEvents {
+			fmt.Fprintf(&b, "  %s  %s\n", ev.Time.Format("Jan 02 15:04:05"), ev.Message)
+		}
+	}
+
+	return b.String()
+}
+
+// FormatInterfaces returns cluster interface information matching vSRX output.
+func (m *Manager) FormatInterfaces() string {
+	var b strings.Builder
+
+	// Control link.
+	m.mu.RLock()
+	controlIface := m.controlInterface
+	peerAlive := m.peerAlive
+	m.mu.RUnlock()
+
+	fmt.Fprintln(&b, "Control link:")
+	if controlIface != "" {
+		status := "Up"
+		if !peerAlive {
+			status = "Down"
+		}
+		fmt.Fprintf(&b, "  Interface: %s, Status: %s\n", controlIface, status)
+	} else {
+		fmt.Fprintln(&b, "  Not configured")
+	}
+	fmt.Fprintln(&b)
+
+	// Fabric link.
+	fmt.Fprintln(&b, "Fabric link:")
+	if m.IsSyncConnected() {
+		fmt.Fprintln(&b, "  Status: Up")
+	} else {
+		fmt.Fprintln(&b, "  Status: Down")
+	}
+	fmt.Fprintln(&b)
+
+	// Interface monitoring.
+	states := m.GroupStates()
+	for _, rg := range states {
+		if len(rg.MonitorFails) == 0 {
+			continue
+		}
+		ifFails := 0
+		for _, f := range rg.MonitorFails {
+			if !strings.HasPrefix(f, "ip:") {
+				ifFails++
+			}
+		}
+		if ifFails > 0 {
+			fmt.Fprintf(&b, "Interface monitoring for redundancy group %d:\n", rg.GroupID)
+			for _, f := range rg.MonitorFails {
+				if !strings.HasPrefix(f, "ip:") {
+					fmt.Fprintf(&b, "  %s: Down\n", f)
+				}
+			}
+			fmt.Fprintln(&b)
+		}
+	}
+
 	return b.String()
 }

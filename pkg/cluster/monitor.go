@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -151,6 +152,13 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup) {
 		if isDown != wasDown {
 			mon.ifaceDown[key] = isDown
 			mon.mgr.SetMonitorWeight(rg.ID, im.Interface, isDown, im.Weight)
+			if isDown {
+				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
+					"Interface %s state changed to down, weight %d", im.Interface, im.Weight))
+			} else {
+				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
+					"Interface %s state changed to up", im.Interface))
+			}
 			slog.Info("cluster monitor: interface state changed",
 				"rg", rg.ID, "interface", im.Interface,
 				"up", up, "weight", im.Weight)
@@ -182,6 +190,13 @@ func (mon *Monitor) pollIPMonitors(rg *config.RedundancyGroup) {
 		if isDown != wasDown {
 			mon.ipDown[key] = isDown
 			mon.mgr.SetMonitorWeight(rg.ID, monName, isDown, weight)
+			if isDown {
+				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
+					"IP %s unreachable, weight %d", target.Address, weight))
+			} else {
+				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
+					"IP %s reachable", target.Address))
+			}
 			slog.Info("cluster monitor: IP probe state changed",
 				"rg", rg.ID, "address", target.Address,
 				"reachable", reachable, "weight", weight)

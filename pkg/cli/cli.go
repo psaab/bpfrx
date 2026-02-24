@@ -10153,6 +10153,29 @@ func (c *CLI) showChassisCluster(args []string) error {
 			return c.showChassisClusterInformation()
 		case "statistics":
 			return c.showChassisClusterStatistics()
+		case "control-plane":
+			if len(args) > 1 && args[1] == "statistics" {
+				return c.showChassisClusterControlPlaneStats()
+			}
+			cmdtree.PrintTreeHelp("show chassis cluster control-plane:", operationalTree, "show", "chassis", "cluster", "control-plane")
+			return nil
+		case "data-plane":
+			if len(args) > 1 {
+				switch args[1] {
+				case "statistics":
+					return c.showChassisClusterDataPlaneStats()
+				case "interfaces":
+					return c.showChassisClusterDataPlaneInterfaces()
+				}
+			}
+			cmdtree.PrintTreeHelp("show chassis cluster data-plane:", operationalTree, "show", "chassis", "cluster", "data-plane")
+			return nil
+		case "ip-monitoring":
+			if len(args) > 1 && args[1] == "status" {
+				return c.showChassisClusterIPMonitoringStatus()
+			}
+			cmdtree.PrintTreeHelp("show chassis cluster ip-monitoring:", operationalTree, "show", "chassis", "cluster", "ip-monitoring")
+			return nil
 		}
 	}
 	// Default: show status
@@ -10271,12 +10294,43 @@ func (c *CLI) showChassisClusterStatistics() error {
 		fmt.Println("Cluster not configured")
 		return nil
 	}
-	states := c.cluster.GroupStates()
-	fmt.Println("Cluster statistics:")
-	for _, rg := range states {
-		fmt.Printf("  Redundancy group %d: failover count %d, weight %d\n",
-			rg.GroupID, rg.FailoverCount, rg.Weight)
+	fmt.Print(c.cluster.FormatStatistics())
+	return nil
+}
+
+func (c *CLI) showChassisClusterControlPlaneStats() error {
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
 	}
+	fmt.Print(c.cluster.FormatControlPlaneStatistics())
+	return nil
+}
+
+func (c *CLI) showChassisClusterDataPlaneStats() error {
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	fmt.Print(c.cluster.FormatDataPlaneStatistics())
+	return nil
+}
+
+func (c *CLI) showChassisClusterDataPlaneInterfaces() error {
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	fmt.Print(c.cluster.FormatDataPlaneInterfaces())
+	return nil
+}
+
+func (c *CLI) showChassisClusterIPMonitoringStatus() error {
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	fmt.Print(c.cluster.FormatIPMonitoringStatus())
 	return nil
 }
 

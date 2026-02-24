@@ -27,10 +27,10 @@ const (
 //   - Preempt: higher effective priority wins immediately
 //   - Non-preempt: incumbent stays unless weight drops to 0
 //   - Split-brain (both primary): lower node ID wins
-func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) electionResult {
+func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (electionResult, string) {
 	// Skip disabled or manually failed-over groups.
 	if rg.State == StateDisabled || rg.ManualFailover {
-		return electNoChange
+		return electNoChange, ""
 	}
 
 	localWeight := rg.Weight
@@ -41,18 +41,18 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) e
 		if !m.peerAlive {
 			// Peer lost or never seen.
 			if localWeight > 0 && rg.State != StatePrimary {
-				return electLocalPrimary
+				return electLocalPrimary, "Peer lost"
 			}
 			if localWeight <= 0 && rg.State != StateSecondary {
-				return electLocalSecondary
+				return electLocalSecondary, "Local weight 0"
 			}
-			return electNoChange
+			return electNoChange, ""
 		}
 		// Peer alive but no group info for this RG — we take primary.
 		if localWeight > 0 && rg.State != StatePrimary {
-			return electLocalPrimary
+			return electLocalPrimary, "Peer has no RG info"
 		}
-		return electNoChange
+		return electNoChange, ""
 	}
 
 	peerWeight := peerGroup.Weight
@@ -64,17 +64,17 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) e
 	// Weight 0 → always secondary.
 	if localWeight <= 0 {
 		if rg.State != StateSecondary {
-			return electLocalSecondary
+			return electLocalSecondary, "Local weight 0"
 		}
-		return electNoChange
+		return electNoChange, ""
 	}
 
 	// Peer weight 0 → we should be primary.
 	if peerWeight <= 0 {
 		if rg.State != StatePrimary {
-			return electLocalPrimary
+			return electLocalPrimary, "Peer weight 0"
 		}
-		return electNoChange
+		return electNoChange, ""
 	}
 
 	// Preempt enabled: higher effective priority wins.
@@ -83,26 +83,26 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) e
 	if rg.Preempt {
 		if localEff > peerEff {
 			if rg.State != StatePrimary {
-				return electLocalPrimary
+				return electLocalPrimary, "Preempt: higher priority"
 			}
 		} else if localEff < peerEff {
 			if rg.State != StateSecondary {
-				return electLocalSecondary
+				return electLocalSecondary, "Preempt: lower priority"
 			}
 		} else {
 			// Tie: lower node ID wins.
 			if m.nodeID < m.peerNodeID {
 				if rg.State != StatePrimary {
-					return electLocalPrimary
+					return electLocalPrimary, "Lower node ID wins tie"
 				}
 			} else if m.nodeID > m.peerNodeID {
 				if rg.State != StateSecondary {
-					return electLocalSecondary
+					return electLocalSecondary, "Higher node ID loses tie"
 				}
 			}
 			// Same node ID (shouldn't happen) — no change.
 		}
-		return electNoChange
+		return electNoChange, ""
 	}
 
 	// Non-preempt: incumbent stays unless weight drops to 0.
@@ -110,34 +110,34 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) e
 	// If we are currently primary, we stay primary (peer can't preempt us).
 	// If neither is primary (both secondary, e.g. initial state), use priority.
 	if rg.State == StatePrimary {
-		return electNoChange // non-preempt: incumbent stays
+		return electNoChange, "" // non-preempt: incumbent stays
 	}
 
 	if peerGroup.State == StatePrimary {
 		// Peer is primary and we're not — stay secondary.
 		if rg.State != StateSecondary {
-			return electLocalSecondary
+			return electLocalSecondary, "Peer is primary"
 		}
-		return electNoChange
+		return electNoChange, ""
 	}
 
 	// Neither is primary (initial state) — use effective priority to decide.
 	if localEff > peerEff {
-		return electLocalPrimary
+		return electLocalPrimary, "Higher priority"
 	} else if localEff < peerEff {
 		if rg.State != StateSecondary {
-			return electLocalSecondary
+			return electLocalSecondary, "Lower priority"
 		}
 	} else {
 		// Tie: lower node ID wins.
 		if m.nodeID < m.peerNodeID {
-			return electLocalPrimary
+			return electLocalPrimary, "Lower node ID wins tie"
 		}
 		if rg.State != StateSecondary {
-			return electLocalSecondary
+			return electLocalSecondary, "Higher node ID loses tie"
 		}
 	}
-	return electNoChange
+	return electNoChange, ""
 }
 
 // runElection evaluates all RGs using current peer state and applies transitions.
@@ -149,7 +149,7 @@ func (m *Manager) runElection() {
 			peerGroup = &pg
 		}
 
-		result := m.electRG(rg, peerGroup)
+		result, reason := m.electRG(rg, peerGroup)
 		oldState := rg.State
 
 		switch result {
@@ -162,7 +162,11 @@ func (m *Manager) runElection() {
 		}
 
 		if oldState != rg.State {
-			m.sendEvent(rg.GroupID, oldState, rg.State)
+			// Track failover count for primary→non-primary transitions.
+			if oldState == StatePrimary {
+				rg.FailoverCount++
+			}
+			m.sendEvent(rg.GroupID, oldState, rg.State, reason)
 		}
 	}
 }

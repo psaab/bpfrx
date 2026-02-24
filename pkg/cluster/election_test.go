@@ -300,11 +300,11 @@ func TestElection_MultipleRGs(t *testing.T) {
 func TestFormatInformation(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := &config.ClusterConfig{
-		ClusterID:         1,
-		NodeID:            0,
-		HeartbeatInterval: 500,
+		ClusterID:          1,
+		NodeID:             0,
+		HeartbeatInterval:  500,
 		HeartbeatThreshold: 5,
-		ControlInterface:  "fab0",
+		ControlInterface:   "fab0",
 		RedundancyGroups: []*config.RedundancyGroup{
 			makeRG(0, true, map[int]int{0: 200}),
 		},
@@ -327,14 +327,20 @@ func TestFormatInformation(t *testing.T) {
 	if !strings.Contains(out, "Control interface: fab0") {
 		t.Error("missing control interface")
 	}
-	if !strings.Contains(out, "Peer status: lost") {
-		t.Error("missing peer status")
+	if !strings.Contains(out, "Remote node: lost") {
+		t.Error("missing remote node status")
 	}
 	if !strings.Contains(out, "Redundancy group 0:") {
 		t.Error("missing RG 0 details")
 	}
 	if !strings.Contains(out, "Effective priority: 200") {
 		t.Error("missing effective priority")
+	}
+	if !strings.Contains(out, "Redundancy mode:") {
+		t.Error("missing redundancy mode")
+	}
+	if !strings.Contains(out, "Control link statistics:") {
+		t.Error("missing control link statistics")
 	}
 }
 
@@ -354,8 +360,8 @@ func TestFormatInformation_WithPeer(t *testing.T) {
 	m.handlePeerHeartbeat(pkt)
 
 	out := m.FormatInformation()
-	if !strings.Contains(out, "alive (node1)") {
-		t.Error("peer should show as alive")
+	if !strings.Contains(out, "healthy (node1)") {
+		t.Error("peer should show as healthy")
 	}
 	if !strings.Contains(out, "Peer priority: 150") {
 		t.Error("missing peer priority")

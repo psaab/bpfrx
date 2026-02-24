@@ -47,18 +47,27 @@ const syncHeaderSize = 12
 
 // SyncStats tracks session synchronization statistics.
 type SyncStats struct {
-	SessionsSent     atomic.Uint64
-	SessionsReceived atomic.Uint64
+	SessionsSent      atomic.Uint64
+	SessionsReceived  atomic.Uint64
 	SessionsInstalled atomic.Uint64
-	DeletesSent      atomic.Uint64
-	DeletesReceived  atomic.Uint64
-	BulkSyncs        atomic.Uint64
-	ConfigsSent      atomic.Uint64
-	ConfigsReceived  atomic.Uint64
-	IPsecSASent      atomic.Uint64
-	IPsecSAReceived  atomic.Uint64
-	Errors           atomic.Uint64
-	Connected        atomic.Bool
+	DeletesSent       atomic.Uint64
+	DeletesReceived   atomic.Uint64
+	BulkSyncs         atomic.Uint64
+	ConfigsSent       atomic.Uint64
+	ConfigsReceived   atomic.Uint64
+	IPsecSASent       atomic.Uint64
+	IPsecSAReceived   atomic.Uint64
+	Errors            atomic.Uint64
+	Connected         atomic.Bool
+
+	// Cold sync timing.
+	BulkSyncStartTime atomic.Int64  // UnixNano (0 = never)
+	BulkSyncEndTime   atomic.Int64  // UnixNano (0 = in progress or never)
+	BulkSyncSessions  atomic.Uint64 // sessions in current/last bulk
+
+	// Config sync timing.
+	LastConfigSyncTime atomic.Int64  // UnixNano
+	LastConfigSyncSize atomic.Uint64 // bytes
 }
 
 // SessionSync manages TCP-based session state replication between cluster peers.
@@ -560,6 +569,9 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 	switch msgType {
 	case syncMsgSessionV4:
 		s.stats.SessionsReceived.Add(1)
+		if s.stats.BulkSyncStartTime.Load() > 0 && s.stats.BulkSyncEndTime.Load() == 0 {
+			s.stats.BulkSyncSessions.Add(1)
+		}
 		if s.dp != nil {
 			if key, val, ok := decodeSessionV4Payload(payload); ok {
 				// Rebase timestamps to local monotonic clock so the
@@ -608,6 +620,9 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 
 	case syncMsgSessionV6:
 		s.stats.SessionsReceived.Add(1)
+		if s.stats.BulkSyncStartTime.Load() > 0 && s.stats.BulkSyncEndTime.Load() == 0 {
+			s.stats.BulkSyncSessions.Add(1)
+		}
 		if s.dp != nil {
 			if key, val, ok := decodeSessionV6Payload(payload); ok {
 				// Rebase timestamps to local monotonic clock (same as V4).
@@ -698,9 +713,13 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 		}
 
 	case syncMsgBulkStart:
+		s.stats.BulkSyncStartTime.Store(time.Now().UnixNano())
+		s.stats.BulkSyncEndTime.Store(0)
+		s.stats.BulkSyncSessions.Store(0)
 		slog.Info("cluster sync: bulk transfer starting")
 
 	case syncMsgBulkEnd:
+		s.stats.BulkSyncEndTime.Store(time.Now().UnixNano())
 		slog.Info("cluster sync: bulk transfer complete")
 		if s.OnBulkSyncReceived != nil {
 			go s.OnBulkSyncReceived()
@@ -711,6 +730,8 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 
 	case syncMsgConfig:
 		s.stats.ConfigsReceived.Add(1)
+		s.stats.LastConfigSyncTime.Store(time.Now().UnixNano())
+		s.stats.LastConfigSyncSize.Store(uint64(len(payload)))
 		if s.OnConfigReceived != nil {
 			configText := string(payload)
 			slog.Info("cluster sync: config received from peer", "size", len(payload))
