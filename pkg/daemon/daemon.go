@@ -789,6 +789,7 @@ func enableForwarding() {
 
 // programRethMAC sets a deterministic virtual MAC on a RETH member interface.
 // Skips if the interface already has the correct MAC.
+// The interface must be brought DOWN to change its MAC, then back UP.
 func programRethMAC(ifName string, mac net.HardwareAddr) error {
 	link, err := netlink.LinkByName(ifName)
 	if err != nil {
@@ -799,7 +800,45 @@ func programRethMAC(ifName string, mac net.HardwareAddr) error {
 		return nil
 	}
 	slog.Info("setting RETH virtual MAC", "iface", ifName, "mac", mac)
-	return netlink.LinkSetHardwareAddr(link, mac)
+	// Must bring link down to change MAC (EAGAIN if UP).
+	if err := netlink.LinkSetDown(link); err != nil {
+		return fmt.Errorf("link down %s: %w", ifName, err)
+	}
+	if err := netlink.LinkSetHardwareAddr(link, mac); err != nil {
+		netlink.LinkSetUp(link) // best-effort restore
+		return fmt.Errorf("set mac %s: %w", ifName, err)
+	}
+	return netlink.LinkSetUp(link)
+}
+
+// clearDadFailed removes any dadfailed link-local IPv6 addresses and re-adds
+// them with IFA_F_NODAD so they become usable. This handles the case where the
+// virtual MAC was already set but accept_dad wasn't disabled at that time.
+func clearDadFailed(ifName string) {
+	link, err := netlink.LinkByName(ifName)
+	if err != nil {
+		return
+	}
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
+	if err != nil {
+		return
+	}
+	for _, addr := range addrs {
+		if !addr.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		if addr.Flags&unix.IFA_F_DADFAILED == 0 {
+			continue
+		}
+		// Remove the dadfailed address and re-add with NODAD.
+		netlink.AddrDel(link, &addr)
+		addr.Flags = unix.IFA_F_NODAD
+		if err := netlink.AddrAdd(link, &addr); err != nil {
+			slog.Warn("failed to re-add link-local with NODAD", "iface", ifName, "err", err)
+		} else {
+			slog.Info("cleared dadfailed link-local", "iface", ifName, "addr", addr.IP)
+		}
+	}
 }
 
 func isInteractive() bool {
@@ -1015,10 +1054,14 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				continue
 			}
 			linuxName := config.LinuxIfName(physName)
+			// Disable DAD — both nodes share the same link-local address.
+			dadPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", linuxName)
+			os.WriteFile(dadPath, []byte("0"), 0644)
 			mac := cluster.RethMAC(clusterID, rethCfg.RedundancyGroup)
 			if err := programRethMAC(linuxName, mac); err != nil {
 				slog.Warn("failed to set RETH MAC", "iface", linuxName, "mac", mac, "err", err)
 			}
+			clearDadFailed(linuxName)
 		}
 	}
 
