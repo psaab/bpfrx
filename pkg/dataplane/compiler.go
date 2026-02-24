@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -704,8 +705,29 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 		}
 
 		linuxName := config.LinuxIfName(ifName)
+		originalName := "" // kernel name before .link rename (for RETH recovery)
 		physIface, err := net.InterfaceByName(linuxName)
-		if err != nil {
+		if err != nil && isVRRPReth && cfg.Chassis.Cluster != nil {
+			// Interface not found under its config name — it may exist
+			// under its kernel name if the .link rename was lost. Search
+			// by the expected RETH virtual MAC.
+			rgID := effectiveCfg.RedundancyGroup
+			expectedMAC := net.HardwareAddr{0x02, 0xbf, 0x72,
+				byte(cfg.Chassis.Cluster.ClusterID), byte(rgID), 0x00}
+			physIface = findInterfaceByMAC(expectedMAC)
+			if physIface != nil {
+				slog.Info("found RETH member under kernel name",
+					"config", linuxName, "actual", physIface.Name,
+					"mac", expectedMAC)
+				// Mark kernel name as seen so unmanaged detection skips it.
+				seen[physIface.Name] = true
+				// Use OriginalName= in .link for stable matching across
+				// reboots (PCI name is stable, MAC alternates between
+				// physical and virtual).
+				originalName = physIface.Name
+			}
+		}
+		if physIface == nil {
 			continue
 		}
 		mac := physIface.HardwareAddr.String()
@@ -713,10 +735,28 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 			continue
 		}
 		// If this is a RETH member with a virtual MAC already programmed
-		// (02:bf:72:...), skip writing the .link file — the bootstrap .link
-		// file (from setup.sh) uses the physical MAC for udev rename.
+		// (02:bf:72:...), use the permanent (factory) MAC for the .link
+		// file so it matches on reboot before the daemon sets the virtual MAC.
 		if isVRRPReth && isVirtualRethMAC(physIface.HardwareAddr) {
-			mac = ""
+			// Recover original kernel name for stable .link OriginalName=
+			// matching. More reliable than MACAddress= because the MAC
+			// alternates between physical (boot) and virtual (daemon sets it).
+			if originalName == "" {
+				originalName = getOriginalKernelName(physIface.Name)
+				if originalName == "" {
+					originalName = readOriginalNameFromLink(linuxName)
+				}
+				if originalName != "" {
+					slog.Info("recovered RETH original kernel name",
+						"iface", linuxName, "originalName", originalName)
+				}
+			}
+			// Use permanent MAC when available to avoid writing the virtual
+			// MAC to the .link MACAddress field. If OriginalName is set,
+			// generateLink uses it instead of MACAddress anyway.
+			if permMAC := getPermAddr(physIface.Name); permMAC != "" {
+				mac = permMAC
+			}
 		}
 
 		if effectiveCfg.VlanTagging {
@@ -726,6 +766,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 					Name:         linuxName,
 					MACAddress:   mac,
+					OriginalName: originalName,
 					IsVLANParent: true,
 					Disable:      ifCfg.Disable,
 					Speed:        ifCfg.Speed,
@@ -804,6 +845,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 					Name:             linuxName,
 					MACAddress:       mac,
+					OriginalName:     originalName,
 					Addresses:        addrs,
 					PrimaryAddress:   primaryAddr,
 					PreferredAddress: preferredAddr,
@@ -3534,4 +3576,94 @@ func compilePortMirroring(dp DataPlane, cfg *config.Config) error {
 // isVirtualRethMAC returns true if the MAC matches the virtual RETH pattern (02:bf:72:...).
 func isVirtualRethMAC(mac net.HardwareAddr) bool {
 	return len(mac) == 6 && mac[0] == 0x02 && mac[1] == 0xbf && mac[2] == 0x72
+}
+
+// getPermAddr returns the permanent (factory) MAC address for an interface
+// via netlink IFLA_PERM_ADDRESS. Returns "" if not available.
+func getPermAddr(ifName string) string {
+	link, err := netlink.LinkByName(ifName)
+	if err != nil {
+		return ""
+	}
+	perm := link.Attrs().PermHWAddr
+	if len(perm) == 0 {
+		return ""
+	}
+	return perm.String()
+}
+
+// findInterfaceByMAC searches all system interfaces for one matching the
+// given MAC address. Used to locate RETH members that weren't renamed.
+func findInterfaceByMAC(mac net.HardwareAddr) *net.Interface {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for i := range ifaces {
+		if bytes.Equal(ifaces[i].HardwareAddr, mac) {
+			return &ifaces[i]
+		}
+	}
+	return nil
+}
+
+// readOriginalNameFromLink reads the OriginalName= value from an existing
+// .link file for the given interface. Preserves previously-written kernel
+// names across DHCP recompiles.
+func readOriginalNameFromLink(ifName string) string {
+	path := fmt.Sprintf("/etc/systemd/network/10-bpfrx-%s.link", ifName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "OriginalName=") {
+			return strings.TrimPrefix(line, "OriginalName=")
+		}
+	}
+	return ""
+}
+
+// getOriginalKernelName returns the predictable kernel name (e.g. enp9s0f0)
+// for a renamed interface. Tries altnames first, then derives from PCI sysfs.
+func getOriginalKernelName(ifName string) string {
+	link, err := netlink.LinkByName(ifName)
+	if err != nil {
+		return ""
+	}
+	for _, alt := range link.Attrs().AltNames {
+		if strings.HasPrefix(alt, "enp") || strings.HasPrefix(alt, "eno") ||
+			strings.HasPrefix(alt, "ens") || strings.HasPrefix(alt, "eth") {
+			return alt
+		}
+	}
+	// Derive from PCI device path via sysfs.
+	// /sys/class/net/<name>/device -> .../0000:09:00.0
+	devPath, err := os.Readlink(fmt.Sprintf("/sys/class/net/%s/device", ifName))
+	if err != nil {
+		return ""
+	}
+	pciAddr := devPath[strings.LastIndex(devPath, "/")+1:]
+	// Parse "domain:bus:slot.function" e.g. "0000:09:00.0"
+	parts := strings.SplitN(pciAddr, ":", 3)
+	if len(parts) != 3 {
+		return ""
+	}
+	bus, err := strconv.ParseUint(parts[1], 16, 16)
+	if err != nil {
+		return ""
+	}
+	sf := strings.SplitN(parts[2], ".", 2)
+	if len(sf) != 2 {
+		return ""
+	}
+	slot, err := strconv.ParseUint(sf[0], 16, 16)
+	if err != nil {
+		return ""
+	}
+	fn, err := strconv.ParseUint(sf[1], 10, 8)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("enp%ds%df%d", bus, slot, fn)
 }

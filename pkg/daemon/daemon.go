@@ -788,6 +788,45 @@ func enableForwarding() {
 	slog.Info("IP forwarding enabled, RA acceptance disabled")
 }
 
+// fixRethLinkFile rewrites the .link file for a RETH member to use
+// OriginalName= (the kernel name) instead of MACAddress= for matching.
+// This ensures the .link works on reboot when the MAC reverts to physical.
+func fixRethLinkFile(ifName, kernelName string) {
+	path := fmt.Sprintf("/etc/systemd/network/10-bpfrx-%s.link", ifName)
+	content := fmt.Sprintf("# Managed by bpfrxd — do not edit\n[Match]\nOriginalName=%s\n\n[Link]\nName=%s\n", kernelName, ifName)
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		slog.Warn("failed to fix RETH .link file", "path", path, "err", err)
+	}
+}
+
+// renameRethMember finds an interface by its RETH virtual MAC and renames it
+// to the expected config name. Returns the old kernel name if renamed, or "".
+// The interface must be DOWN for the rename to succeed.
+func renameRethMember(targetName string, expectedMAC net.HardwareAddr) string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if !bytes.Equal(iface.HardwareAddr, expectedMAC) || iface.Name == targetName {
+			continue
+		}
+		link, err := netlink.LinkByIndex(iface.Index)
+		if err != nil {
+			return ""
+		}
+		// Ensure interface is DOWN for rename.
+		netlink.LinkSetDown(link)
+		if err := netlink.LinkSetName(link, targetName); err != nil {
+			slog.Warn("failed to rename RETH member",
+				"from", iface.Name, "to", targetName, "err", err)
+			return ""
+		}
+		return iface.Name
+	}
+	return ""
+}
+
 // programRethMAC sets a deterministic virtual MAC on a RETH member interface.
 // Skips if the interface already has the correct MAC.
 // The interface must be brought DOWN to change its MAC, then back UP.
@@ -1055,6 +1094,18 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				continue
 			}
 			linuxName := config.LinuxIfName(physName)
+			// If the interface doesn't exist under its config name,
+			// find it by RETH virtual MAC and rename it.
+			if _, err := netlink.LinkByName(linuxName); err != nil {
+				mac := cluster.RethMAC(clusterID, rethCfg.RedundancyGroup)
+				if oldName := renameRethMember(linuxName, mac); oldName != "" {
+					slog.Info("renamed RETH member interface",
+						"from", oldName, "to", linuxName)
+					// Fix the .link file to use OriginalName (kernel name)
+					// for stable matching across reboots.
+					fixRethLinkFile(linuxName, oldName)
+				}
+			}
 			// Disable DAD — both nodes share the same link-local address.
 			dadPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", linuxName)
 			os.WriteFile(dadPath, []byte("0"), 0644)

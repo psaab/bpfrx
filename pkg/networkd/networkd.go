@@ -22,6 +22,7 @@ const (
 type InterfaceConfig struct {
 	Name             string   // interface name (trust0, untrust0, wan0, etc.)
 	MACAddress       string   // hardware MAC address (from kernel)
+	OriginalName     string   // kernel name before rename (for .link OriginalName= match)
 	Addresses        []string // CIDR addresses (10.0.1.10/24, 2001:db8::1/64, etc.)
 	PrimaryAddress   string   // address marked as primary (listed first for source selection)
 	PreferredAddress string   // address marked as preferred (gets PreferredLifetime=forever)
@@ -253,7 +254,13 @@ func (m *Manager) generateLink(ifc InterfaceConfig) string {
 	var b strings.Builder
 	b.WriteString("# Managed by bpfrxd — do not edit\n")
 	b.WriteString("[Match]\n")
-	fmt.Fprintf(&b, "MACAddress=%s\n", ifc.MACAddress)
+	if ifc.OriginalName != "" {
+		// RETH members: match by kernel name (PCI-based, stable across
+		// reboots) because the MAC alternates between physical and virtual.
+		fmt.Fprintf(&b, "OriginalName=%s\n", ifc.OriginalName)
+	} else {
+		fmt.Fprintf(&b, "MACAddress=%s\n", ifc.MACAddress)
+	}
 	b.WriteString("\n[Link]\n")
 	fmt.Fprintf(&b, "Name=%s\n", ifc.Name)
 	if ifc.MTU > 0 {
