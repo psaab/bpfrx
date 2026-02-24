@@ -6994,6 +6994,46 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		fmt.Fprintf(&buf, "  GC cycles: %d\n", m.NumGC)
 		fmt.Fprintf(&buf, "  Uptime: %s\n", uptime)
 
+	case "ipv6-router-advertisement":
+		if s.raMgr == nil {
+			fmt.Fprintln(&buf, "Router Advertisements: not available")
+		} else {
+			senders := s.raMgr.Status()
+			if len(senders) == 0 {
+				fmt.Fprintln(&buf, "Router Advertisements: no active senders")
+			} else {
+				fmt.Fprintf(&buf, "Router Advertisement: %d active sender(s)\n\n", len(senders))
+				for _, info := range senders {
+					fmt.Fprintf(&buf, "Interface: %s\n", info.Interface)
+					fmt.Fprintf(&buf, "  Source address:     %s\n", info.SrcAddr)
+					fmt.Fprintf(&buf, "  Router lifetime:    %ds\n", info.Lifetime)
+					fmt.Fprintf(&buf, "  Preference:         %s\n", info.Preference)
+					fmt.Fprintf(&buf, "  Max RA interval:    %ds\n", info.MaxInterval)
+					fmt.Fprintf(&buf, "  Min RA interval:    %ds\n", info.MinInterval)
+					if info.Managed {
+						fmt.Fprintln(&buf, "  Managed flag:       on")
+					}
+					if info.Other {
+						fmt.Fprintln(&buf, "  Other config flag:  on")
+					}
+					if info.LinkMTU > 0 {
+						fmt.Fprintf(&buf, "  Link MTU:           %d\n", info.LinkMTU)
+					}
+					for _, pfx := range info.Prefixes {
+						fmt.Fprintf(&buf, "  Prefix:             %s\n", pfx)
+					}
+					if len(info.DNSServers) > 0 {
+						fmt.Fprintf(&buf, "  DNS servers:        %s\n", strings.Join(info.DNSServers, ", "))
+					}
+					if info.NAT64Prefix != "" {
+						fmt.Fprintf(&buf, "  PREF64:             %s\n", info.NAT64Prefix)
+					}
+					fmt.Fprintf(&buf, "  Last RA sent:       %s\n", info.LastRA)
+					fmt.Fprintln(&buf)
+				}
+			}
+		}
+
 	default:
 		// Handle "log:<filename>[:<count>]" for syslog file destinations
 		if strings.HasPrefix(req.Topic, "log:") {
@@ -7181,46 +7221,6 @@ func (s *Server) GetSystemInfo(_ context.Context, req *pb.GetSystemInfoRequest) 
 			}
 			fmt.Fprintf(&buf, "%-18s %-40s %-12s %-10s\n",
 				n.HardwareAddr, n.IP, ifName, neighStateStr(n.State))
-		}
-
-	case "ipv6-router-advertisement":
-		if s.raMgr == nil {
-			fmt.Fprintln(&buf, "Router Advertisements: not available")
-		} else {
-			senders := s.raMgr.Status()
-			if len(senders) == 0 {
-				fmt.Fprintln(&buf, "Router Advertisements: no active senders")
-			} else {
-				fmt.Fprintf(&buf, "Router Advertisement: %d active sender(s)\n\n", len(senders))
-				for _, info := range senders {
-					fmt.Fprintf(&buf, "Interface: %s\n", info.Interface)
-					fmt.Fprintf(&buf, "  Source address:     %s\n", info.SrcAddr)
-					fmt.Fprintf(&buf, "  Router lifetime:    %ds\n", info.Lifetime)
-					fmt.Fprintf(&buf, "  Preference:         %s\n", info.Preference)
-					fmt.Fprintf(&buf, "  Max RA interval:    %ds\n", info.MaxInterval)
-					fmt.Fprintf(&buf, "  Min RA interval:    %ds\n", info.MinInterval)
-					if info.Managed {
-						fmt.Fprintln(&buf, "  Managed flag:       on")
-					}
-					if info.Other {
-						fmt.Fprintln(&buf, "  Other config flag:  on")
-					}
-					if info.LinkMTU > 0 {
-						fmt.Fprintf(&buf, "  Link MTU:           %d\n", info.LinkMTU)
-					}
-					for _, pfx := range info.Prefixes {
-						fmt.Fprintf(&buf, "  Prefix:             %s\n", pfx)
-					}
-					if len(info.DNSServers) > 0 {
-						fmt.Fprintf(&buf, "  DNS servers:        %s\n", strings.Join(info.DNSServers, ", "))
-					}
-					if info.NAT64Prefix != "" {
-						fmt.Fprintf(&buf, "  PREF64:             %s\n", info.NAT64Prefix)
-					}
-					fmt.Fprintf(&buf, "  Last RA sent:       %s\n", info.LastRA)
-					fmt.Fprintln(&buf)
-				}
-			}
 		}
 
 	case "boot-messages":
