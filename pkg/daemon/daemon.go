@@ -1116,6 +1116,40 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				slog.Warn("failed to set RETH MAC", "iface", linuxName, "mac", mac, "err", err)
 			}
 			clearDadFailed(linuxName)
+
+			// Re-disable VLAN RX offload after MAC programming.
+			// The iavf VF driver resets ethtool features (including
+			// rx-vlan-offload) during the link down/up cycle that
+			// programRethMAC requires. Without this, XDP cannot see
+			// VLAN tags in the packet data and drops VLAN traffic.
+			if out, err := exec.Command("ethtool", "-K", linuxName, "rxvlan", "off").CombinedOutput(); err != nil {
+				slog.Warn("failed to re-disable rxvlan after RETH MAC",
+					"interface", linuxName, "err", err, "output", strings.TrimSpace(string(out)))
+			} else {
+				slog.Info("re-disabled VLAN RX offload after RETH MAC", "interface", linuxName)
+			}
+
+			// Propagate MAC change to VLAN sub-interfaces.
+			// Linux VLAN sub-interfaces don't always inherit the
+			// parent's MAC change after link down/up.
+			if parentLink, err := netlink.LinkByName(linuxName); err == nil {
+				parentIdx := parentLink.Attrs().Index
+				links, _ := netlink.LinkList()
+				for _, l := range links {
+					if l.Attrs().ParentIndex != parentIdx {
+						continue
+					}
+					if !bytes.Equal(l.Attrs().HardwareAddr, mac) {
+						if err := netlink.LinkSetHardwareAddr(l, mac); err != nil {
+							slog.Warn("failed to propagate MAC to VLAN sub-interface",
+								"iface", l.Attrs().Name, "err", err)
+						} else {
+							slog.Info("propagated RETH MAC to VLAN sub-interface",
+								"iface", l.Attrs().Name, "mac", mac)
+						}
+					}
+				}
+			}
 		}
 	}
 
