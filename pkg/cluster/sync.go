@@ -412,6 +412,15 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener) {
 		if s.OnPeerConnected != nil {
 			go s.OnPeerConnected()
 		}
+
+		// Send our sessions to the peer that just connected.
+		// This covers the case where the peer's connectLoop connected
+		// to us before our connectLoop could connect to them — without
+		// this, the peer would never receive our sessions because only
+		// connectLoop calls BulkSync.
+		if err := s.BulkSync(); err != nil {
+			slog.Warn("cluster sync: accept bulk sync failed", "err", err)
+		}
 	}
 }
 
