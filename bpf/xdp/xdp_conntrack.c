@@ -385,31 +385,40 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
-	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
+	if (rc != BPF_FIB_LKUP_RET_SUCCESS &&
+	    rc != BPF_FIB_LKUP_RET_NO_NEIGH)
 		return -1;
 
-	/* Resolve VLAN sub-interface */
-	__u32 egress_if = fib.ifindex;
-	struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map,
-							 &egress_if);
-	if (vi) {
-		meta->fwd_ifindex = vi->parent_ifindex;
-		meta->egress_vlan_id = vi->vlan_id;
+	if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+		/*
+		 * Route exists but no ARP entry — let kernel forward.
+		 * Set fwd_ifindex=0 so xdp_forward does XDP_PASS.
+		 */
+		meta->fwd_ifindex = 0;
 	} else {
-		meta->fwd_ifindex = egress_if;
-		meta->egress_vlan_id = 0;
-	}
-	__builtin_memcpy(meta->fwd_dmac, fib.dmac, 6);
-	__builtin_memcpy(meta->fwd_smac, fib.smac, 6);
+		/* Resolve VLAN sub-interface */
+		__u32 egress_if = fib.ifindex;
+		struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map,
+								 &egress_if);
+		if (vi) {
+			meta->fwd_ifindex = vi->parent_ifindex;
+			meta->egress_vlan_id = vi->vlan_id;
+		} else {
+			meta->fwd_ifindex = egress_if;
+			meta->egress_vlan_id = 0;
+		}
+		__builtin_memcpy(meta->fwd_dmac, fib.dmac, 6);
+		__builtin_memcpy(meta->fwd_smac, fib.smac, 6);
 
-	/* Resolve egress zone */
-	struct iface_zone_key ezk = {
-		.ifindex = meta->fwd_ifindex,
-		.vlan_id = meta->egress_vlan_id,
-	};
-	__u16 *ez = bpf_map_lookup_elem(&iface_zone_map, &ezk);
-	if (ez)
-		meta->egress_zone = *ez;
+		/* Resolve egress zone */
+		struct iface_zone_key ezk = {
+			.ifindex = meta->fwd_ifindex,
+			.vlan_id = meta->egress_vlan_id,
+		};
+		__u16 *ez = bpf_map_lookup_elem(&iface_zone_map, &ezk);
+		if (ez)
+			meta->egress_zone = *ez;
+	}
 
 	if (needs_nat) {
 		/* Outer dst rewrite: WAN IP -> original client */
@@ -576,31 +585,40 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	__u32 fib_flags6 = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags6);
-	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
+	if (rc != BPF_FIB_LKUP_RET_SUCCESS &&
+	    rc != BPF_FIB_LKUP_RET_NO_NEIGH)
 		return -1;
 
-	/* Resolve VLAN sub-interface */
-	__u32 egress_if = fib.ifindex;
-	struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map,
-							 &egress_if);
-	if (vi) {
-		meta->fwd_ifindex = vi->parent_ifindex;
-		meta->egress_vlan_id = vi->vlan_id;
+	if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+		/*
+		 * Route exists but no NDP entry — let kernel forward.
+		 * Set fwd_ifindex=0 so xdp_forward does XDP_PASS.
+		 */
+		meta->fwd_ifindex = 0;
 	} else {
-		meta->fwd_ifindex = egress_if;
-		meta->egress_vlan_id = 0;
-	}
-	__builtin_memcpy(meta->fwd_dmac, fib.dmac, 6);
-	__builtin_memcpy(meta->fwd_smac, fib.smac, 6);
+		/* Resolve VLAN sub-interface */
+		__u32 egress_if = fib.ifindex;
+		struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map,
+								 &egress_if);
+		if (vi) {
+			meta->fwd_ifindex = vi->parent_ifindex;
+			meta->egress_vlan_id = vi->vlan_id;
+		} else {
+			meta->fwd_ifindex = egress_if;
+			meta->egress_vlan_id = 0;
+		}
+		__builtin_memcpy(meta->fwd_dmac, fib.dmac, 6);
+		__builtin_memcpy(meta->fwd_smac, fib.smac, 6);
 
-	/* Resolve egress zone */
-	struct iface_zone_key ezk = {
-		.ifindex = meta->fwd_ifindex,
-		.vlan_id = meta->egress_vlan_id,
-	};
-	__u16 *ez = bpf_map_lookup_elem(&iface_zone_map, &ezk);
-	if (ez)
-		meta->egress_zone = *ez;
+		/* Resolve egress zone */
+		struct iface_zone_key ezk = {
+			.ifindex = meta->fwd_ifindex,
+			.vlan_id = meta->egress_vlan_id,
+		};
+		__u16 *ez = bpf_map_lookup_elem(&iface_zone_map, &ezk);
+		if (ez)
+			meta->egress_zone = *ez;
+	}
 
 	if (needs_nat || nptv6_hit) {
 		/* Outer dst rewrite: WAN IP / NPTv6 external -> original client */
