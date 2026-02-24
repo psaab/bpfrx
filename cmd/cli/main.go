@@ -1612,71 +1612,15 @@ func (c *ctl) showNATDNATRuleStats(ruleSet string) error {
 }
 
 func (c *ctl) showEvents(args []string) error {
-	req := &pb.GetEventsRequest{Limit: 50}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "zone":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.ParseUint(args[i], 10, 32); err == nil {
-					req.Zone = uint32(v)
-				}
-			}
-		case "protocol":
-			if i+1 < len(args) {
-				i++
-				req.Protocol = args[i]
-			}
-		case "action":
-			if i+1 < len(args) {
-				i++
-				req.Action = args[i]
-			}
-		default:
-			if v, err := strconv.Atoi(args[i]); err == nil {
-				req.Limit = int32(v)
-			}
+	// Use ShowText for server-side formatting with full name resolution
+	filter := ""
+	for _, a := range args {
+		if _, err := strconv.Atoi(a); err == nil {
+			filter = a
+			break
 		}
 	}
-
-	resp, err := c.client.GetEvents(c.ctx(), req)
-	if err != nil {
-		return fmt.Errorf("%v", err)
-	}
-	if len(resp.Events) == 0 {
-		fmt.Println("no events recorded")
-		return nil
-	}
-	for _, e := range resp.Events {
-		inZone := e.IngressZoneName
-		if inZone == "" {
-			inZone = fmt.Sprintf("%d", e.IngressZone)
-		}
-		outZone := e.EgressZoneName
-		if outZone == "" {
-			outZone = fmt.Sprintf("%d", e.EgressZone)
-		}
-		policyDisp := e.PolicyName
-		if policyDisp == "" {
-			policyDisp = fmt.Sprintf("%d", e.PolicyId)
-		}
-		switch e.Type {
-		case "SCREEN_DROP":
-			fmt.Printf("%s %-14s screen=%-16s %s -> %s %s action=%s zone=%s\n",
-				e.Time, e.Type, e.ScreenCheck, e.SrcAddr, e.DstAddr, e.Protocol, e.Action, inZone)
-		case "SESSION_CLOSE":
-			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%s zone=%s->%s client=%d/%d server=%d/%d reason=%q\n",
-				e.Time, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
-				policyDisp, inZone, outZone,
-				e.SessionPackets, e.SessionBytes, e.RevSessionPkts, e.RevSessionBytes, e.CloseReason)
-		default:
-			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%s zone=%s->%s\n",
-				e.Time, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
-				policyDisp, inZone, outZone)
-		}
-	}
-	fmt.Printf("(%d events shown)\n", len(resp.Events))
-	return nil
+	return c.showTextFiltered("security-log", filter)
 }
 
 func (c *ctl) showStatistics(detail bool) error {
