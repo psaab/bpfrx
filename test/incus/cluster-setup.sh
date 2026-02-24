@@ -222,24 +222,29 @@ provision_vm() {
 		fi
 	done
 
-	# Bootstrap systemd-networkd .link files for interface renaming
+	# Bootstrap systemd-networkd .link files for interface renaming.
 	# Uses vSRX naming: fxp0 (mgmt), fxp1 (heartbeat), fab0 (fabric),
-	# ge-X-0-0 (LAN), ge-X-0-1 (WAN/SR-IOV)
+	# ge-X-0-0 (LAN), ge-X-0-1 (WAN/SR-IOV).
+	#
+	# RETH member interfaces (LAN + WAN) use OriginalName= (kernel PCI
+	# name) instead of MACAddress= because bpfrxd programs a virtual MAC
+	# (02:bf:72:...) at runtime. On reboot the interface reverts to its
+	# physical MAC, so a MACAddress= match would fail. OriginalName= is
+	# stable across reboots since it derives from the PCI slot.
 	info "Writing bootstrap networkd .link files ($vm, node $idx)..."
-	local mac_fxp0 mac_fxp1 mac_fab0 mac_lan
+	local mac_fxp0 mac_fxp1 mac_fab0
 	mac_fxp0=$(incus exec "$vm" -- cat /sys/class/net/enp5s0/address 2>/dev/null || true)
 	mac_fxp1=$(incus exec "$vm" -- cat /sys/class/net/enp6s0/address 2>/dev/null || true)
 	mac_fab0=$(incus exec "$vm" -- cat /sys/class/net/enp7s0/address 2>/dev/null || true)
-	mac_lan=$(incus exec "$vm" -- cat /sys/class/net/enp8s0/address 2>/dev/null || true)
 
-	# SR-IOV VF interface name varies — find it by exclusion
-	local mac_wan
-	mac_wan=$(incus exec "$vm" -- bash -c '
+	# SR-IOV VF kernel name varies — find it by exclusion
+	local pci_wan
+	pci_wan=$(incus exec "$vm" -- bash -c '
 		for iface in /sys/class/net/enp*/address; do
 			name=$(basename $(dirname "$iface"))
 			case "$name" in
 				enp5s0|enp6s0|enp7s0|enp8s0|lo) continue ;;
-				*) cat "$iface" 2>/dev/null; break ;;
+				*) echo "$name"; break ;;
 			esac
 		done
 	' 2>/dev/null || true)
@@ -248,7 +253,8 @@ provision_vm() {
 	lan_name=$(lan_ifname "$idx")
 	wan_name=$(wan_ifname "$idx")
 
-	for pair in "fxp0:$mac_fxp0" "fxp1:$mac_fxp1" "fab0:$mac_fab0" "${lan_name}:$mac_lan" "${wan_name}:$mac_wan"; do
+	# Non-RETH interfaces: match by MAC (stable — daemon never changes these MACs)
+	for pair in "fxp0:$mac_fxp0" "fxp1:$mac_fxp1" "fab0:$mac_fab0"; do
 		local name="${pair%%:*}" mac="${pair#*:}"
 		if [[ -n "$mac" ]]; then
 			incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-${name}.link << LINKEOF
@@ -261,6 +267,28 @@ Name=${name}
 LINKEOF"
 		fi
 	done
+
+	# RETH member interfaces: match by OriginalName (PCI kernel name is
+	# stable; MAC alternates between physical and virtual across reboots)
+	# LAN is always enp8s0 (from incus profile eth3→enp8s0→bpfrx-clan)
+	incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-${lan_name}.link << LINKEOF
+# Managed by bpfrxd — do not edit
+[Match]
+OriginalName=enp8s0
+
+[Link]
+Name=${lan_name}
+LINKEOF"
+	if [[ -n "$pci_wan" ]]; then
+		incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-${wan_name}.link << LINKEOF
+# Managed by bpfrxd — do not edit
+[Match]
+OriginalName=${pci_wan}
+
+[Link]
+Name=${wan_name}
+LINKEOF"
+	fi
 
 	incus exec "$vm" -- networkctl reload
 	sleep 1

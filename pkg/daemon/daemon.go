@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -799,6 +800,110 @@ func fixRethLinkFile(ifName, kernelName string) {
 	}
 }
 
+// ensureRethLinkOriginalName checks that a RETH member's .link file uses
+// OriginalName= (PCI kernel name) instead of MACAddress=. If the file still
+// uses MACAddress=, it derives the kernel name and rewrites the file. This
+// handles bootstrap .link files that were created before the daemon ran.
+func ensureRethLinkOriginalName(ifName string) {
+	path := fmt.Sprintf("/etc/systemd/network/10-bpfrx-%s.link", ifName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	content := string(data)
+	if !strings.Contains(content, "MACAddress=") {
+		return // already uses OriginalName= or other match
+	}
+	// Derive kernel name from altnames or sysfs
+	link, err := netlink.LinkByName(ifName)
+	if err != nil {
+		return
+	}
+	var kernelName string
+	for _, alt := range link.Attrs().AltNames {
+		if strings.HasPrefix(alt, "enp") || strings.HasPrefix(alt, "eno") ||
+			strings.HasPrefix(alt, "ens") || strings.HasPrefix(alt, "eth") {
+			kernelName = alt
+			break
+		}
+	}
+	if kernelName == "" {
+		kernelName = deriveKernelName(ifName)
+	}
+	if kernelName == "" {
+		return
+	}
+	slog.Info("fixing RETH .link file to use OriginalName",
+		"iface", ifName, "kernelName", kernelName)
+	fixRethLinkFile(ifName, kernelName)
+}
+
+// deriveKernelName returns the predictable kernel name (e.g. enp8s0) for an
+// interface by examining its sysfs device path. Handles both PCI-direct
+// devices (device → 0000:09:00.0) and virtio-over-PCI (device → virtioN,
+// parent → 0000:08:00.0).
+func deriveKernelName(ifName string) string {
+	devPath, err := filepath.EvalSymlinks(fmt.Sprintf("/sys/class/net/%s/device", ifName))
+	if err != nil {
+		return ""
+	}
+	pciAddr := pciAddrFromPath(devPath)
+	if pciAddr == "" {
+		// Virtio: device is virtioN, parent directory is the PCI device
+		parent := filepath.Dir(devPath)
+		pciAddr = pciAddrFromPath(parent)
+	}
+	if pciAddr == "" {
+		return ""
+	}
+	return pciAddrToEnp(pciAddr)
+}
+
+// pciAddrFromPath extracts a PCI address (domain:bus:slot.fn) from a sysfs
+// path basename. Returns "" if the basename is not a PCI address.
+func pciAddrFromPath(path string) string {
+	base := filepath.Base(path)
+	// PCI addresses look like "0000:08:00.0"
+	parts := strings.SplitN(base, ":", 3)
+	if len(parts) != 3 {
+		return ""
+	}
+	// Validate slot.fn exists
+	if !strings.Contains(parts[2], ".") {
+		return ""
+	}
+	return base
+}
+
+// pciAddrToEnp converts a PCI address like "0000:08:00.0" to a predictable
+// network name like "enp8s0".
+func pciAddrToEnp(pciAddr string) string {
+	parts := strings.SplitN(pciAddr, ":", 3)
+	if len(parts) != 3 {
+		return ""
+	}
+	bus, err := strconv.ParseUint(parts[1], 16, 16)
+	if err != nil {
+		return ""
+	}
+	sf := strings.SplitN(parts[2], ".", 2)
+	if len(sf) != 2 {
+		return ""
+	}
+	slot, err := strconv.ParseUint(sf[0], 16, 16)
+	if err != nil {
+		return ""
+	}
+	fn, err := strconv.ParseUint(sf[1], 16, 8)
+	if err != nil {
+		return ""
+	}
+	if fn > 0 {
+		return fmt.Sprintf("enp%ds%df%d", bus, slot, fn)
+	}
+	return fmt.Sprintf("enp%ds%d", bus, slot)
+}
+
 // renameRethMember finds an interface by its RETH virtual MAC and renames it
 // to the expected config name. Returns the old kernel name if renamed, or "".
 // The interface must be DOWN for the rename to succeed.
@@ -1102,11 +1207,15 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				if oldName := renameRethMember(linuxName, mac); oldName != "" {
 					slog.Info("renamed RETH member interface",
 						"from", oldName, "to", linuxName)
-					// Fix the .link file to use OriginalName (kernel name)
-					// for stable matching across reboots.
 					fixRethLinkFile(linuxName, oldName)
 				}
 			}
+			// Ensure the .link file uses OriginalName= (not MACAddress=)
+			// for stable matching across reboots. The bootstrap .link
+			// files may use MACAddress= which breaks after virtual MAC
+			// programming — the interface reboots with physical MAC but
+			// the MACAddress= line might reference the wrong one.
+			ensureRethLinkOriginalName(linuxName)
 			// Disable DAD — virtual MAC may still collide with peer on
 			// some deployments; disable to avoid DAD failures.
 			dadPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", linuxName)
