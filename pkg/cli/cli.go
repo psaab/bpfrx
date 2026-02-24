@@ -10212,53 +10212,77 @@ func (c *CLI) showChassisClusterStatus() error {
 }
 
 func (c *CLI) showChassisClusterInterfaces() error {
-	cfg := c.store.ActiveConfig()
-	if cfg == nil || cfg.Chassis.Cluster == nil {
+	if c.cluster == nil {
 		fmt.Println("Cluster not configured")
 		return nil
 	}
+	input := c.buildInterfacesInput()
+	fmt.Print(c.cluster.FormatInterfaces(input))
+	return nil
+}
+
+func (c *CLI) buildInterfacesInput() cluster.InterfacesInput {
+	var input cluster.InterfacesInput
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return input
+	}
 	cc := cfg.Chassis.Cluster
-	fmt.Println("Control link status: Up")
-	fmt.Println()
-	fmt.Printf("RETH count: %d\n", cc.RethCount)
-	// Show configured RETH names from config (bonds no longer created)
-	var rethNames []string
+	input.ControlInterface = cc.ControlInterface
+	input.FabricInterface = cc.FabricInterface
+
+	// Build RETH info from config.
+	rethMap := cfg.RethToPhysical() // reth-name -> physical-member
 	for name, ifc := range cfg.Interfaces.Interfaces {
 		if ifc.RedundancyGroup > 0 && strings.HasPrefix(name, "reth") {
-			rethNames = append(rethNames, name)
+			status := "Up"
+			// Check physical member link state.
+			if phys, ok := rethMap[name]; ok {
+				linuxName := config.LinuxIfName(phys)
+				link, err := netlink.LinkByName(linuxName)
+				if err != nil || (link.Attrs().OperState != netlink.OperUp &&
+					link.Attrs().Flags&net.FlagUp == 0) {
+					status = "Down"
+				}
+			}
+			input.Reths = append(input.Reths, cluster.RethInfo{
+				Name:            name,
+				RedundancyGroup: ifc.RedundancyGroup,
+				Status:          status,
+			})
 		}
 	}
-	sort.Strings(rethNames)
-	if len(rethNames) > 0 {
-		fmt.Printf("RETH interfaces: %s\n", strings.Join(rethNames, ", "))
-	}
-	fmt.Println()
+	sort.Slice(input.Reths, func(i, j int) bool { return input.Reths[i].Name < input.Reths[j].Name })
+
+	// Build interface monitor info.
 	monStatuses := make(map[int][]routing.InterfaceMonitorStatus)
 	if c.routing != nil {
-		monStatuses = c.routing.InterfaceMonitorStatuses()
+		if ms := c.routing.InterfaceMonitorStatuses(); ms != nil {
+			monStatuses = ms
+		}
 	}
 	for _, rg := range cc.RedundancyGroups {
-		if len(rg.InterfaceMonitors) == 0 {
-			continue
-		}
-		fmt.Printf("Interface monitoring for redundancy group %d:\n", rg.ID)
-		fmt.Printf("  %-20s %-8s %s\n", "Interface", "Weight", "Status")
 		if statuses, ok := monStatuses[rg.ID]; ok {
 			for _, st := range statuses {
-				state := "Up"
-				if !st.Up {
-					state = "Down"
-				}
-				fmt.Printf("  %-20s %-8d %s\n", st.Interface, st.Weight, state)
+				input.Monitors = append(input.Monitors, cluster.InterfaceMonitorInfo{
+					Interface:       st.Interface,
+					Weight:          st.Weight,
+					Up:              st.Up,
+					RedundancyGroup: rg.ID,
+				})
 			}
 		} else {
 			for _, mon := range rg.InterfaceMonitors {
-				fmt.Printf("  %-20s %-8d %s\n", mon.Interface, mon.Weight, "Unknown")
+				input.Monitors = append(input.Monitors, cluster.InterfaceMonitorInfo{
+					Interface:       mon.Interface,
+					Weight:          mon.Weight,
+					Up:              true, // unknown, assume up
+					RedundancyGroup: rg.ID,
+				})
 			}
 		}
-		fmt.Println()
 	}
-	return nil
+	return input
 }
 
 func (c *CLI) showChassisClusterInformation() error {

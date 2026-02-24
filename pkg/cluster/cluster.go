@@ -1149,57 +1149,105 @@ func (m *Manager) FormatIPMonitoringStatus() string {
 	return b.String()
 }
 
+// InterfaceMonitorInfo holds per-interface monitor state for display.
+type InterfaceMonitorInfo struct {
+	Interface      string
+	Weight         int
+	Up             bool // physical link state
+	RedundancyGroup int
+}
+
+// RethInfo holds RETH interface status for display.
+type RethInfo struct {
+	Name            string
+	RedundancyGroup int
+	Status          string // "Up" or "Down"
+	Members         []string
+}
+
+// InterfacesInput provides the data needed to format cluster interfaces output.
+type InterfacesInput struct {
+	ControlInterface string
+	FabricInterface  string
+	Reths            []RethInfo
+	Monitors         []InterfaceMonitorInfo
+}
+
 // FormatInterfaces returns cluster interface information matching vSRX output.
-func (m *Manager) FormatInterfaces() string {
+func (m *Manager) FormatInterfaces(input InterfacesInput) string {
 	var b strings.Builder
 
-	// Control link.
 	m.mu.RLock()
-	controlIface := m.controlInterface
 	peerAlive := m.peerAlive
 	m.mu.RUnlock()
 
-	fmt.Fprintln(&b, "Control link:")
-	if controlIface != "" {
-		status := "Up"
+	// Control link status.
+	controlStatus := "Up"
+	if !peerAlive {
+		controlStatus = "Down"
+	}
+	fmt.Fprintf(&b, "Control link status: %s\n", controlStatus)
+	fmt.Fprintln(&b)
+
+	// Control interfaces table.
+	if input.ControlInterface != "" {
+		fmt.Fprintln(&b, "Control interfaces:")
+		fmt.Fprintf(&b, "    %-8s%-12s%-21s%-14s%s\n", "Index", "Interface", "Monitored-Status", "Internal-SA", "Security")
+		monStatus := "Up"
 		if !peerAlive {
-			status = "Down"
+			monStatus = "Down"
 		}
-		fmt.Fprintf(&b, "  Interface: %s, Status: %s\n", controlIface, status)
-	} else {
-		fmt.Fprintln(&b, "  Not configured")
+		fmt.Fprintf(&b, "    %-8d%-12s%-21s%-14s%s\n", 0, input.ControlInterface, monStatus, "Disabled", "Disabled")
+		fmt.Fprintln(&b)
 	}
+
+	// Fabric link status.
+	fabricUp := m.IsSyncConnected()
+	fabricStatus := "Up"
+	if !fabricUp {
+		fabricStatus = "Down"
+	}
+	fmt.Fprintf(&b, "Fabric link status: %s\n", fabricStatus)
 	fmt.Fprintln(&b)
 
-	// Fabric link.
-	fmt.Fprintln(&b, "Fabric link:")
-	if m.IsSyncConnected() {
-		fmt.Fprintln(&b, "  Status: Up")
-	} else {
-		fmt.Fprintln(&b, "  Status: Down")
+	// Fabric interfaces table.
+	if input.FabricInterface != "" {
+		fmt.Fprintln(&b, "Fabric interfaces:")
+		fmt.Fprintf(&b, "    %-8s%-19s%-26s%s\n", "Name", "Child-interface", "Status", "Security")
+		fmt.Fprintf(&b, "    %-8s%-19s%s\n", "", "", "(Physical/Monitored)")
+		physStatus := "Up"
+		if !fabricUp {
+			physStatus = "Down"
+		}
+		statusStr := fmt.Sprintf("%s  /  %s", physStatus, physStatus)
+		fmt.Fprintf(&b, "    %-8s%-19s%-26s%s\n", input.FabricInterface, input.FabricInterface, statusStr, "Disabled")
+		fmt.Fprintln(&b)
 	}
-	fmt.Fprintln(&b)
 
-	// Interface monitoring.
-	states := m.GroupStates()
-	for _, rg := range states {
-		if len(rg.MonitorFails) == 0 {
-			continue
+	// Redundant-ethernet Information.
+	if len(input.Reths) > 0 {
+		fmt.Fprintln(&b, "Redundant-ethernet Information:")
+		fmt.Fprintf(&b, "    %-13s%-12s%s\n", "Name", "Status", "Redundancy-group")
+		for _, r := range input.Reths {
+			fmt.Fprintf(&b, "    %-13s%-12s%d\n", r.Name, r.Status, r.RedundancyGroup)
 		}
-		ifFails := 0
-		for _, f := range rg.MonitorFails {
-			if !strings.HasPrefix(f, "ip:") {
-				ifFails++
+		fmt.Fprintln(&b)
+	}
+
+	// Interface Monitoring.
+	if len(input.Monitors) > 0 {
+		fmt.Fprintln(&b, "Interface Monitoring:")
+		fmt.Fprintf(&b, "    %-18s%-10s%-26s%s\n", "Interface", "Weight", "Status", "Redundancy-group")
+		fmt.Fprintf(&b, "    %-18s%-10s%s\n", "", "", "(Physical/Monitored)")
+		for _, mon := range input.Monitors {
+			physStatus := "Up"
+			if !mon.Up {
+				physStatus = "Down"
 			}
-		}
-		if ifFails > 0 {
-			fmt.Fprintf(&b, "Interface monitoring for redundancy group %d:\n", rg.GroupID)
-			for _, f := range rg.MonitorFails {
-				if !strings.HasPrefix(f, "ip:") {
-					fmt.Fprintf(&b, "  %s: Down\n", f)
-				}
-			}
-			fmt.Fprintln(&b)
+			// Physical and monitored status are the same (link-state based).
+			statusStr := fmt.Sprintf("%s  /  %s", physStatus, physStatus)
+			fmt.Fprintf(&b, "    %-18s%-10d%-26s%d\n",
+				mon.Interface, mon.Weight, statusStr, mon.RedundancyGroup)
 		}
 	}
 

@@ -5900,53 +5900,12 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 
 	case "chassis-cluster-interfaces":
-		cfg := s.store.ActiveConfig()
-		if cfg == nil || cfg.Chassis.Cluster == nil {
+		if s.cluster == nil {
 			fmt.Fprintln(&buf, "Cluster not configured")
 			break
 		}
-		cc := cfg.Chassis.Cluster
-		fmt.Fprintf(&buf, "Control link status: Up\n\n")
-		// RETH interfaces
-		fmt.Fprintf(&buf, "RETH count: %d\n", cc.RethCount)
-		// Show configured RETH names from config (bonds no longer created)
-		var rethNames []string
-		for name, ifc := range cfg.Interfaces.Interfaces {
-			if ifc.RedundancyGroup > 0 && strings.HasPrefix(name, "reth") {
-				rethNames = append(rethNames, name)
-			}
-		}
-		sort.Strings(rethNames)
-		if len(rethNames) > 0 {
-			fmt.Fprintf(&buf, "RETH interfaces: %s\n", strings.Join(rethNames, ", "))
-		}
-		fmt.Fprintln(&buf)
-		// Interface monitoring
-		var monStatuses map[int][]routing.InterfaceMonitorStatus
-		if s.routing != nil {
-			monStatuses = s.routing.InterfaceMonitorStatuses()
-		}
-		for _, rg := range cc.RedundancyGroups {
-			if len(rg.InterfaceMonitors) == 0 {
-				continue
-			}
-			fmt.Fprintf(&buf, "Interface monitoring for redundancy group %d:\n", rg.ID)
-			fmt.Fprintf(&buf, "  %-20s %-8s %s\n", "Interface", "Weight", "Status")
-			if statuses, ok := monStatuses[rg.ID]; ok {
-				for _, st := range statuses {
-					state := "Up"
-					if !st.Up {
-						state = "Down"
-					}
-					fmt.Fprintf(&buf, "  %-20s %-8d %s\n", st.Interface, st.Weight, state)
-				}
-			} else {
-				for _, mon := range rg.InterfaceMonitors {
-					fmt.Fprintf(&buf, "  %-20s %-8d %s\n", mon.Interface, mon.Weight, "Unknown")
-				}
-			}
-			fmt.Fprintln(&buf)
-		}
+		input := s.buildInterfacesInput()
+		buf.WriteString(s.cluster.FormatInterfaces(input))
 
 	case "chassis-cluster-information":
 		if s.cluster != nil {
@@ -7787,4 +7746,68 @@ func grpcResolveAddress(cfg *config.Config, name string) string {
 		return " (address-set)"
 	}
 	return ""
+}
+
+// buildInterfacesInput gathers cluster interface data for FormatInterfaces.
+func (s *Server) buildInterfacesInput() cluster.InterfacesInput {
+	var input cluster.InterfacesInput
+	cfg := s.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return input
+	}
+	cc := cfg.Chassis.Cluster
+	input.ControlInterface = cc.ControlInterface
+	input.FabricInterface = cc.FabricInterface
+
+	// Build RETH info from config.
+	rethMap := cfg.RethToPhysical() // reth-name -> physical-member
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc.RedundancyGroup > 0 && strings.HasPrefix(name, "reth") {
+			status := "Up"
+			if phys, ok := rethMap[name]; ok {
+				linuxName := config.LinuxIfName(phys)
+				link, err := netlink.LinkByName(linuxName)
+				if err != nil || (link.Attrs().OperState != netlink.OperUp &&
+					link.Attrs().Flags&net.FlagUp == 0) {
+					status = "Down"
+				}
+			}
+			input.Reths = append(input.Reths, cluster.RethInfo{
+				Name:            name,
+				RedundancyGroup: ifc.RedundancyGroup,
+				Status:          status,
+			})
+		}
+	}
+	sort.Slice(input.Reths, func(i, j int) bool { return input.Reths[i].Name < input.Reths[j].Name })
+
+	// Build interface monitor info.
+	monStatuses := make(map[int][]routing.InterfaceMonitorStatus)
+	if s.routing != nil {
+		if ms := s.routing.InterfaceMonitorStatuses(); ms != nil {
+			monStatuses = ms
+		}
+	}
+	for _, rg := range cc.RedundancyGroups {
+		if statuses, ok := monStatuses[rg.ID]; ok {
+			for _, st := range statuses {
+				input.Monitors = append(input.Monitors, cluster.InterfaceMonitorInfo{
+					Interface:       st.Interface,
+					Weight:          st.Weight,
+					Up:              st.Up,
+					RedundancyGroup: rg.ID,
+				})
+			}
+		} else {
+			for _, mon := range rg.InterfaceMonitors {
+				input.Monitors = append(input.Monitors, cluster.InterfaceMonitorInfo{
+					Interface:       mon.Interface,
+					Weight:          mon.Weight,
+					Up:              true,
+					RedundancyGroup: rg.ID,
+				})
+			}
+		}
+	}
+	return input
 }
