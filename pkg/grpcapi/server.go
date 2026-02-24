@@ -1066,6 +1066,12 @@ func (s *Server) GetEvents(_ context.Context, req *pb.GetEventsRequest) (*pb.Get
 			ScreenCheck:     ev.ScreenCheck,
 			SessionPackets:  ev.SessionPkts,
 			SessionBytes:    ev.SessionBytes,
+			PolicyName:      ev.PolicyName,
+			RevSessionPkts:  ev.RevSessionPkts,
+			RevSessionBytes: ev.RevSessionBytes,
+			AppName:         ev.AppName,
+			IngressIface:    ev.IngressIface,
+			CloseReason:     ev.CloseReason,
 		})
 	}
 	return resp, nil
@@ -5224,6 +5230,60 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			fmt.Fprintf(&buf, "Kernel: %s %s (%s)\n", sysname, release, machine)
 		}
 		fmt.Fprintf(&buf, "Daemon uptime: %s\n", time.Since(s.startTime).Truncate(time.Second))
+
+	case "security-log":
+		if s.eventBuf == nil {
+			buf.WriteString("no events (event buffer not initialized)\n")
+		} else {
+			n := 50
+			if req.Filter != "" {
+				if v, err := strconv.Atoi(req.Filter); err == nil && v > 0 {
+					n = v
+				}
+			}
+			events := s.eventBuf.Latest(n)
+			if len(events) == 0 {
+				buf.WriteString("no events recorded\n")
+			} else {
+				// Build zone name map
+				evZoneNames := make(map[uint16]string)
+				if s.dp != nil {
+					if cr := s.dp.LastCompileResult(); cr != nil {
+						for name, id := range cr.ZoneIDs {
+							evZoneNames[id] = name
+						}
+					}
+				}
+				zoneName := func(id uint16) string {
+					if n, ok := evZoneNames[id]; ok {
+						return n
+					}
+					return fmt.Sprintf("%d", id)
+				}
+				for _, e := range events {
+					ts := e.Time.Format("15:04:05")
+					policyDisp := e.PolicyName
+					if policyDisp == "" {
+						policyDisp = fmt.Sprintf("%d", e.PolicyID)
+					}
+					switch e.Type {
+					case "SCREEN_DROP":
+						fmt.Fprintf(&buf, "%s %-14s screen=%-16s %s -> %s %s action=%s zone=%s\n",
+							ts, e.Type, e.ScreenCheck, e.SrcAddr, e.DstAddr, e.Protocol, e.Action, zoneName(e.InZone))
+					case "SESSION_CLOSE":
+						fmt.Fprintf(&buf, "%s %-14s %s -> %s %s action=%-6s policy=%s zone=%s->%s client=%d/%d server=%d/%d reason=%q\n",
+							ts, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
+							policyDisp, zoneName(e.InZone), zoneName(e.OutZone),
+							e.SessionPkts, e.SessionBytes, e.RevSessionPkts, e.RevSessionBytes, e.CloseReason)
+					default:
+						fmt.Fprintf(&buf, "%s %-14s %s -> %s %s action=%-6s policy=%s zone=%s->%s\n",
+							ts, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
+							policyDisp, zoneName(e.InZone), zoneName(e.OutZone))
+					}
+				}
+				fmt.Fprintf(&buf, "(%d events shown)\n", len(events))
+			}
+		}
 
 	case "chassis":
 		// CPU info

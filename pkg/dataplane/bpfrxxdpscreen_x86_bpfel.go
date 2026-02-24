@@ -437,7 +437,7 @@ type bpfrxXdpScreenSessionValue struct {
 	ReverseKey  bpfrxXdpScreenSessionKey
 	AlgType     uint8
 	LogFlags    uint8
-	PadSv       uint16
+	AppId       uint16
 	FibIfindex  uint32
 	FibVlanId   uint16
 	FibDmac     [6]uint8
@@ -469,7 +469,7 @@ type bpfrxXdpScreenSessionValueV6 struct {
 	ReverseKey  bpfrxXdpScreenSessionKeyV6
 	AlgType     uint8
 	LogFlags    uint8
-	PadSv6      uint16
+	AppId       uint16
 	FibIfindex  uint32
 	FibVlanId   uint16
 	FibDmac     [6]uint8

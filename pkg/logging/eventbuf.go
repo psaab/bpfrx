@@ -8,23 +8,30 @@ import (
 
 // EventRecord is a formatted event stored in the event buffer.
 type EventRecord struct {
-	Time         time.Time
-	Type         string // "SESSION_OPEN", "POLICY_DENY", etc.
-	SrcAddr      string // "10.0.1.5:443"
-	DstAddr      string
-	Protocol     string // "TCP", "UDP"
-	Action       string // "permit", "deny"
-	PolicyID     uint32
-	InZone       uint16
-	OutZone      uint16
-	ScreenCheck  string // for SCREEN_DROP
-	SessionPkts  uint64 // for SESSION_CLOSE
-	SessionBytes uint64
-	NATSrcAddr   string // "172.16.1.1:12345" (post-NAT source)
-	NATDstAddr   string // "10.0.2.1:80" (post-NAT destination)
-	InZoneName   string // resolved zone name
-	OutZoneName  string // resolved zone name
-	ElapsedTime  uint32 // seconds since session creation (for CLOSE)
+	Time            time.Time
+	Type            string // "SESSION_OPEN", "POLICY_DENY", etc.
+	SrcAddr         string // "10.0.1.5:443"
+	DstAddr         string
+	Protocol        string // "TCP", "UDP"
+	Action          string // "permit", "deny"
+	PolicyID        uint32
+	InZone          uint16
+	OutZone         uint16
+	ScreenCheck     string // for SCREEN_DROP
+	SessionPkts     uint64 // for SESSION_CLOSE (client→server)
+	SessionBytes    uint64
+	NATSrcAddr      string // "172.16.1.1:12345" (post-NAT source)
+	NATDstAddr      string // "10.0.2.1:80" (post-NAT destination)
+	InZoneName      string // resolved zone name
+	OutZoneName     string // resolved zone name
+	ElapsedTime     uint32 // seconds since session creation (for CLOSE)
+	PolicyName      string // resolved policy name (e.g. "allow-everything")
+	RevSessionPkts  uint64 // packets from server (for SESSION_CLOSE)
+	RevSessionBytes uint64 // bytes from server (for SESSION_CLOSE)
+	AppName         string // resolved application name (e.g. "junos-http")
+	IngressIface    string // resolved interface name (e.g. "trust0")
+	CloseReason     string // "idle Timeout", "TCP FIN", "TCP RST", etc.
+	SessionID       uint64 // unique session identifier
 }
 
 // EventBuffer is a thread-safe circular buffer for recent events.

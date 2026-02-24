@@ -3291,6 +3291,12 @@ type EventEntry struct {
 	SessionBytes    uint64                 `protobuf:"varint,12,opt,name=session_bytes,json=sessionBytes,proto3" json:"session_bytes,omitempty"`
 	IngressZoneName string                 `protobuf:"bytes,13,opt,name=ingress_zone_name,json=ingressZoneName,proto3" json:"ingress_zone_name,omitempty"`
 	EgressZoneName  string                 `protobuf:"bytes,14,opt,name=egress_zone_name,json=egressZoneName,proto3" json:"egress_zone_name,omitempty"`
+	PolicyName      string                 `protobuf:"bytes,15,opt,name=policy_name,json=policyName,proto3" json:"policy_name,omitempty"`
+	RevSessionPkts  uint64                 `protobuf:"varint,16,opt,name=rev_session_pkts,json=revSessionPkts,proto3" json:"rev_session_pkts,omitempty"`
+	RevSessionBytes uint64                 `protobuf:"varint,17,opt,name=rev_session_bytes,json=revSessionBytes,proto3" json:"rev_session_bytes,omitempty"`
+	AppName         string                 `protobuf:"bytes,18,opt,name=app_name,json=appName,proto3" json:"app_name,omitempty"`
+	IngressIface    string                 `protobuf:"bytes,19,opt,name=ingress_iface,json=ingressIface,proto3" json:"ingress_iface,omitempty"`
+	CloseReason     string                 `protobuf:"bytes,20,opt,name=close_reason,json=closeReason,proto3" json:"close_reason,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -3419,6 +3425,48 @@ func (x *EventEntry) GetIngressZoneName() string {
 func (x *EventEntry) GetEgressZoneName() string {
 	if x != nil {
 		return x.EgressZoneName
+	}
+	return ""
+}
+
+func (x *EventEntry) GetPolicyName() string {
+	if x != nil {
+		return x.PolicyName
+	}
+	return ""
+}
+
+func (x *EventEntry) GetRevSessionPkts() uint64 {
+	if x != nil {
+		return x.RevSessionPkts
+	}
+	return 0
+}
+
+func (x *EventEntry) GetRevSessionBytes() uint64 {
+	if x != nil {
+		return x.RevSessionBytes
+	}
+	return 0
+}
+
+func (x *EventEntry) GetAppName() string {
+	if x != nil {
+		return x.AppName
+	}
+	return ""
+}
+
+func (x *EventEntry) GetIngressIface() string {
+	if x != nil {
+		return x.IngressIface
+	}
+	return ""
+}
+
+func (x *EventEntry) GetCloseReason() string {
+	if x != nil {
+		return x.CloseReason
 	}
 	return ""
 }

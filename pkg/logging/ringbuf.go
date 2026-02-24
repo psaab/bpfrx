@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -29,6 +30,13 @@ type EventReader struct {
 	callbacks     []EventCallback
 	zoneNamesMu   sync.RWMutex
 	zoneNames     map[uint16]string // zone ID -> zone name
+	policyNamesMu sync.RWMutex
+	policyNames   map[uint32]string // rule_id -> policy name
+	ifNamesMu     sync.RWMutex
+	ifNames       map[uint32]string // ifindex -> interface name
+	appNamesMu    sync.RWMutex
+	appNames      map[uint16]string // app_id -> application name
+	sessionSeq    uint64            // monotonic session ID counter
 }
 
 // NewEventReader creates a new event reader for the given event source.
@@ -54,6 +62,60 @@ func (er *EventReader) resolveZoneName(id uint16) string {
 		return name
 	}
 	return fmt.Sprintf("%d", id)
+}
+
+// SetPolicyNames updates the rule ID to policy name mapping (goroutine-safe).
+func (er *EventReader) SetPolicyNames(names map[uint32]string) {
+	er.policyNamesMu.Lock()
+	er.policyNames = names
+	er.policyNamesMu.Unlock()
+}
+
+func (er *EventReader) resolvePolicyName(id uint32) string {
+	er.policyNamesMu.RLock()
+	name := er.policyNames[id]
+	er.policyNamesMu.RUnlock()
+	if name != "" {
+		return name
+	}
+	return fmt.Sprintf("%d", id)
+}
+
+// SetIfNames updates the ifindex to interface name mapping (goroutine-safe).
+func (er *EventReader) SetIfNames(names map[uint32]string) {
+	er.ifNamesMu.Lock()
+	er.ifNames = names
+	er.ifNamesMu.Unlock()
+}
+
+func (er *EventReader) resolveIfName(ifindex uint32) string {
+	if ifindex == 0 {
+		return ""
+	}
+	er.ifNamesMu.RLock()
+	name := er.ifNames[ifindex]
+	er.ifNamesMu.RUnlock()
+	return name
+}
+
+// SetAppNames updates the app ID to application name mapping (goroutine-safe).
+func (er *EventReader) SetAppNames(names map[uint16]string) {
+	er.appNamesMu.Lock()
+	er.appNames = names
+	er.appNamesMu.Unlock()
+}
+
+func (er *EventReader) resolveAppName(id uint16) string {
+	if id == 0 {
+		return "UNKNOWN"
+	}
+	er.appNamesMu.RLock()
+	name := er.appNames[id]
+	er.appNamesMu.RUnlock()
+	if name != "" {
+		return name
+	}
+	return "UNKNOWN"
 }
 
 // AddCallback registers a callback that will be invoked for every event.
@@ -244,6 +306,27 @@ func (er *EventReader) logEvent(data []byte) {
 		rec.ScreenCheck = screenFlagName(evt.PolicyID)
 	}
 
+	// Parse extended fields (offset 112+)
+	if len(data) >= 136 {
+		rec.RevSessionPkts = binary.LittleEndian.Uint64(data[112:120])
+		rec.RevSessionBytes = binary.LittleEndian.Uint64(data[120:128])
+		ifindex := binary.LittleEndian.Uint32(data[128:132])
+		appID := binary.LittleEndian.Uint16(data[132:134])
+		closeReason := data[134]
+
+		rec.IngressIface = er.resolveIfName(ifindex)
+		rec.AppName = er.resolveAppName(appID)
+		rec.CloseReason = closeReasonName(closeReason)
+	}
+
+	// Resolve policy name (skip for screen drops which repurpose policy_id)
+	if evt.EventType != dataplane.EventTypeScreenDrop {
+		rec.PolicyName = er.resolvePolicyName(evt.PolicyID)
+	}
+
+	// Assign monotonic session ID
+	rec.SessionID = atomic.AddUint64(&er.sessionSeq, 1)
+
 	// Store in buffer
 	if er.buffer != nil {
 		er.buffer.Add(rec)
@@ -414,6 +497,7 @@ func formatSyslogMsg(rec EventRecord) string {
 
 // formatStructuredMsg formats an EventRecord as a Junos-compatible structured
 // syslog message with RT_FLOW_SESSION_CREATE/CLOSE/DENY event tags.
+// Output matches vSRX RT_FLOW format with [junos@2636.1.1.1.2.129 ...] wrapping.
 func formatStructuredMsg(rec EventRecord, protoNum uint8) string {
 	// Split addr:port pairs
 	srcIP, srcPort := splitAddrPort(rec.SrcAddr)
@@ -421,46 +505,95 @@ func formatStructuredMsg(rec EventRecord, protoNum uint8) string {
 	natSrcIP, natSrcPort := splitAddrPort(rec.NATSrcAddr)
 	natDstIP, natDstPort := splitAddrPort(rec.NATDstAddr)
 
+	policyName := rec.PolicyName
+	if policyName == "" {
+		policyName = fmt.Sprintf("%d", rec.PolicyID)
+	}
+	appName := rec.AppName
+	if appName == "" {
+		appName = "UNKNOWN"
+	}
+	inIface := rec.IngressIface
+	if inIface == "" {
+		inIface = "N/A"
+	}
+
 	switch rec.Type {
 	case "SESSION_OPEN":
-		return fmt.Sprintf("RT_FLOW_SESSION_CREATE "+
+		return fmt.Sprintf("RT_FLOW - RT_FLOW_SESSION_CREATE "+
+			"[junos@2636.1.1.1.2.129 "+
 			"source-address=\"%s\" source-port=\"%s\" "+
 			"destination-address=\"%s\" destination-port=\"%s\" "+
+			"connection-tag=\"0\" service-name=\"%s\" "+
 			"nat-source-address=\"%s\" nat-source-port=\"%s\" "+
 			"nat-destination-address=\"%s\" nat-destination-port=\"%s\" "+
-			"protocol-id=\"%d\" policy-name=\"%d\" "+
-			"source-zone-name=\"%s\" destination-zone-name=\"%s\"",
+			"nat-connection-tag=\"0\" "+
+			"src-nat-rule-type=\"N/A\" src-nat-rule-name=\"N/A\" "+
+			"dst-nat-rule-type=\"N/A\" dst-nat-rule-name=\"N/A\" "+
+			"protocol-id=\"%d\" policy-name=\"%s\" "+
+			"source-zone-name=\"%s\" destination-zone-name=\"%s\" "+
+			"session-id=\"%d\" "+
+			"username=\"N/A\" roles=\"N/A\" "+
+			"packet-incoming-interface=\"%s\" application=\"%s\"]",
 			srcIP, srcPort, dstIP, dstPort,
+			appName,
 			natSrcIP, natSrcPort, natDstIP, natDstPort,
-			protoNum, rec.PolicyID,
-			rec.InZoneName, rec.OutZoneName)
+			protoNum, policyName,
+			rec.InZoneName, rec.OutZoneName,
+			rec.SessionID,
+			inIface, appName)
 
 	case "SESSION_CLOSE":
-		return fmt.Sprintf("RT_FLOW_SESSION_CLOSE "+
+		reason := rec.CloseReason
+		if reason == "" {
+			reason = "N/A"
+		}
+		return fmt.Sprintf("RT_FLOW - RT_FLOW_SESSION_CLOSE "+
+			"[junos@2636.1.1.1.2.129 "+
+			"reason=\"%s\" "+
 			"source-address=\"%s\" source-port=\"%s\" "+
 			"destination-address=\"%s\" destination-port=\"%s\" "+
+			"connection-tag=\"0\" service-name=\"%s\" "+
 			"nat-source-address=\"%s\" nat-source-port=\"%s\" "+
 			"nat-destination-address=\"%s\" nat-destination-port=\"%s\" "+
-			"protocol-id=\"%d\" policy-name=\"%d\" "+
+			"nat-connection-tag=\"0\" "+
+			"src-nat-rule-type=\"N/A\" src-nat-rule-name=\"N/A\" "+
+			"dst-nat-rule-type=\"N/A\" dst-nat-rule-name=\"N/A\" "+
+			"protocol-id=\"%d\" policy-name=\"%s\" "+
 			"source-zone-name=\"%s\" destination-zone-name=\"%s\" "+
+			"session-id=\"%d\" "+
 			"packets-from-client=\"%d\" bytes-from-client=\"%d\" "+
-			"elapsed-time=\"%d\"",
+			"packets-from-server=\"%d\" bytes-from-server=\"%d\" "+
+			"elapsed-time=\"%d\" "+
+			"packet-incoming-interface=\"%s\" application=\"%s\"]",
+			reason,
 			srcIP, srcPort, dstIP, dstPort,
+			appName,
 			natSrcIP, natSrcPort, natDstIP, natDstPort,
-			protoNum, rec.PolicyID,
+			protoNum, policyName,
 			rec.InZoneName, rec.OutZoneName,
+			rec.SessionID,
 			rec.SessionPkts, rec.SessionBytes,
-			rec.ElapsedTime)
+			rec.RevSessionPkts, rec.RevSessionBytes,
+			rec.ElapsedTime,
+			inIface, appName)
 
 	case "POLICY_DENY":
-		return fmt.Sprintf("RT_FLOW_SESSION_DENY "+
+		return fmt.Sprintf("RT_FLOW - RT_FLOW_SESSION_DENY "+
+			"[junos@2636.1.1.1.2.129 "+
 			"source-address=\"%s\" source-port=\"%s\" "+
 			"destination-address=\"%s\" destination-port=\"%s\" "+
-			"protocol-id=\"%d\" policy-name=\"%d\" "+
-			"source-zone-name=\"%s\" destination-zone-name=\"%s\"",
+			"connection-tag=\"0\" service-name=\"None\" "+
+			"protocol-id=\"%d\" policy-name=\"%s\" "+
+			"source-zone-name=\"%s\" destination-zone-name=\"%s\" "+
+			"session-id=\"%d\" "+
+			"packet-incoming-interface=\"%s\" application=\"%s\" "+
+			"reason=\"Rejected by policy\"]",
 			srcIP, srcPort, dstIP, dstPort,
-			protoNum, rec.PolicyID,
-			rec.InZoneName, rec.OutZoneName)
+			protoNum, policyName,
+			rec.InZoneName, rec.OutZoneName,
+			rec.SessionID,
+			inIface, appName)
 
 	default:
 		return formatSyslogMsg(rec)
@@ -529,4 +662,21 @@ func screenFlagName(flag uint32) string {
 		return name
 	}
 	return fmt.Sprintf("screen(0x%x)", flag)
+}
+
+func closeReasonName(reason uint8) string {
+	switch reason {
+	case dataplane.CloseReasonTimeout:
+		return "idle Timeout"
+	case dataplane.CloseReasonTCPFIN:
+		return "TCP FIN"
+	case dataplane.CloseReasonTCPRST:
+		return "TCP RST"
+	case dataplane.CloseReasonAgeOut:
+		return "aged out"
+	case dataplane.CloseReasonPolicy:
+		return "Rejected by policy"
+	default:
+		return "N/A"
+	}
 }

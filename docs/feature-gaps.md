@@ -17,7 +17,7 @@ Last updated: 2026-02-14
 | Screen/IDS Enhancements | 6 | 2 | 0 | 8 |
 | Security Flow Enhancements | 9 | 2 | 0 | 11 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
-| Security Logging Enhancements | 4 | 1 | 1 | 6 |
+| Security Logging Enhancements | 1 | 0 | 0 | 1 |
 | PKI / Certificates | 4 | 0 | 0 | 4 |
 | Routing Enhancements | 11 | 3 | 0 | 14 |
 | VPN Enhancements | 8 | 1 | 0 | 9 |
@@ -224,12 +224,12 @@ bpfrx has security logging with mode (stream/event), format, streams with host/p
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Structured Syslog Format** | `security log format structured` | Machine-parseable key-value syslog format (RT_FLOW_SESSION_CREATE, etc.) with standardized field names | Medium | Missing |
+| **Structured Syslog Format** | `security log format structured` | Machine-parseable key-value syslog format (RT_FLOW_SESSION_CREATE, etc.) with standardized field names | Medium | Done (vSRX-compatible RT_FLOW format with `[junos@2636.1.1.1.2.129 ...]` SD wrapping) |
 | **Binary Log Format** | `security log format binary` | High-performance binary log format for off-box collector (requires Juniper log receiver) | Low | Missing |
-| **Transport Protocol Selection** | `security log stream ... transport protocol tcp/tls` | Send security logs over TCP or TLS instead of UDP for reliable delivery | Medium | Missing |
-| **Per-Policy Logging** | `security policies ... then log session-init session-close` | bpfrx has this but may not fully support all log fields (app-name, nat-*, nested-app, etc.) | Medium | Partial (basic session-init/close logging works) |
-| **Log Event Mode** | `security log mode event` | Route security logs through eventd (control plane) for on-box processing, slower but allows local processing | Low | Parse-Only (parsed but always uses stream) |
-| **Session Aggregation Logs** | `security log ... report` | Aggregate session logs for top-N reporting (top talkers, top applications) | Low | Missing |
+| **Transport Protocol Selection** | `security log stream ... transport protocol tcp/tls` | Send security logs over TCP or TLS instead of UDP for reliable delivery | Medium | Done (TCP and TLS transport implemented) |
+| **Per-Policy Logging** | `security policies ... then log session-init session-close` | bpfrx has this but may not fully support all log fields (app-name, nat-*, nested-app, etc.) | Medium | Done (all key fields: policy-name, app, ingress-iface, client/server split, close-reason, session-id) |
+| **Log Event Mode** | `security log mode event` | Route security logs through eventd (control plane) for on-box processing, slower but allows local processing | Low | Done (event mode writes to local file) |
+| **Session Aggregation Logs** | `security log ... report` | Aggregate session logs for top-N reporting (top talkers, top applications) | Low | Done (session aggregation reporting implemented) |
 
 ---
 

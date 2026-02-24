@@ -42,7 +42,7 @@ type SessionValue struct {
 
 	ALGType  uint8
 	LogFlags uint8
-	PadSV    uint16
+	AppID    uint16
 
 	FibIfindex uint32
 	FibVlanID  uint16
@@ -91,7 +91,7 @@ type SessionValueV6 struct {
 
 	ALGType  uint8
 	LogFlags uint8
-	PadSV6   uint16
+	AppID    uint16
 
 	FibIfindex uint32
 	FibVlanID  uint16
@@ -178,7 +178,24 @@ type Event struct {
 	NATSrcPort     uint16
 	NATDstPort     uint16
 	Created        uint32
+	// Extended fields for structured logging (vSRX RT_FLOW compat)
+	RevPackets     uint64
+	RevBytes       uint64
+	IngressIfindex uint32
+	AppID          uint16
+	CloseReason    uint8
+	PadEvent       uint8
 }
+
+// Close reason constants (must match C CLOSE_REASON_* defines).
+const (
+	CloseReasonNone    = 0
+	CloseReasonTimeout = 1
+	CloseReasonTCPFIN  = 2
+	CloseReasonTCPRST  = 3
+	CloseReasonAgeOut  = 4
+	CloseReasonPolicy  = 5
+)
 
 // Tail call program indices -- must match C constants.
 const (

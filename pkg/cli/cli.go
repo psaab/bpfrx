@@ -5882,19 +5882,44 @@ func (c *CLI) showSecurityLog(args []string) error {
 		return fmt.Sprintf("%d", id)
 	}
 
+	policyName := func(e logging.EventRecord) string {
+		if e.PolicyName != "" {
+			return e.PolicyName
+		}
+		return fmt.Sprintf("%d", e.PolicyID)
+	}
+
 	for _, e := range events {
 		ts := e.Time.Format("15:04:05")
 		if e.Type == "SCREEN_DROP" {
 			fmt.Printf("%s %-14s screen=%-16s %s -> %s %s action=%s zone=%s\n",
 				ts, e.Type, e.ScreenCheck, e.SrcAddr, e.DstAddr, e.Protocol, e.Action, zoneName(e.InZone))
 		} else if e.Type == "SESSION_CLOSE" {
-			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%d zone=%s->%s pkts=%d bytes=%d\n",
+			extra := ""
+			if e.CloseReason != "" {
+				extra += fmt.Sprintf(" reason=%q", e.CloseReason)
+			}
+			if e.AppName != "" {
+				extra += fmt.Sprintf(" app=%s", e.AppName)
+			}
+			if e.IngressIface != "" {
+				extra += fmt.Sprintf(" iface=%s", e.IngressIface)
+			}
+			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%s zone=%s->%s client-pkts=%d client-bytes=%d server-pkts=%d server-bytes=%d%s\n",
 				ts, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
-				e.PolicyID, zoneName(e.InZone), zoneName(e.OutZone), e.SessionPkts, e.SessionBytes)
+				policyName(e), zoneName(e.InZone), zoneName(e.OutZone),
+				e.SessionPkts, e.SessionBytes, e.RevSessionPkts, e.RevSessionBytes, extra)
 		} else {
-			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%d zone=%s->%s\n",
+			extra := ""
+			if e.AppName != "" {
+				extra += fmt.Sprintf(" app=%s", e.AppName)
+			}
+			if e.IngressIface != "" {
+				extra += fmt.Sprintf(" iface=%s", e.IngressIface)
+			}
+			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%s zone=%s->%s%s\n",
 				ts, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
-				e.PolicyID, zoneName(e.InZone), zoneName(e.OutZone))
+				policyName(e), zoneName(e.InZone), zoneName(e.OutZone), extra)
 		}
 	}
 	fmt.Printf("(%d events shown)\n", len(events))

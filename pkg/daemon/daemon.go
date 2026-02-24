@@ -2170,6 +2170,29 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 	}
 	er.SetZoneNames(zoneNames)
 
+	// Wire policy names and app names for structured logging
+	if d.dp != nil {
+		if cr := d.dp.LastCompileResult(); cr != nil {
+			er.SetPolicyNames(cr.PolicyNames)
+			if cr.AppNames != nil {
+				er.SetAppNames(cr.AppNames)
+			}
+		}
+	}
+
+	// Wire interface names (ifindex -> name) from config
+	ifNames := make(map[uint32]string)
+	for name, iface := range cfg.Interfaces.Interfaces {
+		ifName := name
+		if iface != nil && iface.Name != "" {
+			ifName = iface.Name
+		}
+		if link, err := netlink.LinkByName(ifName); err == nil {
+			ifNames[uint32(link.Attrs().Index)] = ifName
+		}
+	}
+	er.SetIfNames(ifNames)
+
 	// Event mode: write to local file instead of remote syslog
 	if cfg.Security.Log.Mode == "event" {
 		er.SetSyslogClients(nil) // clear any remote clients

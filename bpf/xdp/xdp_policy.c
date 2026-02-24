@@ -81,7 +81,7 @@ addr_matches_v6(const __u8 *ip, __u32 rule_addr_id)
 static __always_inline int
 create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	       __u8 nat_flags, __be32 nat_src_ip, __be16 nat_src_port,
-	       __be32 nat_dst_ip, __be16 nat_dst_port)
+	       __be32 nat_dst_ip, __be16 nat_dst_port, __u16 app_id)
 {
 	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
 
@@ -125,6 +125,7 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	fwd_val->fwd_packets  = 1;
 	fwd_val->fwd_bytes    = meta->pkt_len;
 	fwd_val->log_flags    = log;
+	fwd_val->app_id       = app_id;
 	fwd_val->app_timeout  = meta->app_timeout;
 	fwd_val->reverse_key  = rev_key;
 	fwd_val->nat_src_ip   = nat_src_ip;
@@ -160,6 +161,7 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	rev_val->ingress_zone = meta->egress_zone;
 	rev_val->egress_zone  = meta->ingress_zone;
 	rev_val->log_flags    = log;
+	rev_val->app_id       = app_id;
 	rev_val->app_timeout  = meta->app_timeout;
 	rev_val->reverse_key  = fwd_key;
 	rev_val->nat_src_ip   = nat_src_ip;
@@ -185,7 +187,7 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 static __always_inline int
 create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 		  __u8 nat_flags, const __u8 *nat_src_ip, __be16 nat_src_port,
-		  const __u8 *nat_dst_ip, __be16 nat_dst_port)
+		  const __u8 *nat_dst_ip, __be16 nat_dst_port, __u16 app_id)
 {
 	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
 
@@ -229,6 +231,7 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	fwd_val->fwd_packets  = 1;
 	fwd_val->fwd_bytes    = meta->pkt_len;
 	fwd_val->log_flags    = log;
+	fwd_val->app_id       = app_id;
 	fwd_val->app_timeout  = meta->app_timeout;
 	fwd_val->reverse_key  = rev_key;
 	fwd_val->nat_src_port = nat_src_port;
@@ -267,6 +270,7 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	rev_val->ingress_zone = meta->egress_zone;
 	rev_val->egress_zone  = meta->ingress_zone;
 	rev_val->log_flags    = log;
+	rev_val->app_id       = app_id;
 	rev_val->app_timeout  = meta->app_timeout;
 	rev_val->reverse_key  = fwd_key;
 	rev_val->nat_src_port = nat_src_port;
@@ -891,13 +895,13 @@ int xdp_policy_prog(struct xdp_md *ctx)
 		__u8 *dp = bpf_map_lookup_elem(&default_policy, &dp_key);
 		if (dp && *dp == ACTION_PERMIT) {
 			if (meta->addr_family == AF_INET) {
-				if (create_session(meta, 0, 0, 0, 0, 0, 0, 0) < 0) {
+				if (create_session(meta, 0, 0, 0, 0, 0, 0, 0, 0) < 0) {
 					inc_counter(GLOBAL_CTR_DROPS);
 					return XDP_DROP;
 				}
 			} else {
 				__u8 zero_ip[16] = {};
-				if (create_session_v6(meta, 0, 0, 0, zero_ip, 0, zero_ip, 0) < 0) {
+				if (create_session_v6(meta, 0, 0, 0, zero_ip, 0, zero_ip, 0, 0) < 0) {
 					inc_counter(GLOBAL_CTR_DROPS);
 					return XDP_DROP;
 				}
@@ -1128,7 +1132,8 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				if (create_session(meta, rule->rule_id, rule->log,
 						   sess_nat_flags,
 						   sess_nat_src_ip, sess_nat_src_port,
-						   sess_nat_dst_ip, sess_nat_dst_port) < 0) {
+						   sess_nat_dst_ip, sess_nat_dst_port,
+						   (__u16)pkt_app_id) < 0) {
 					/* If dynamic SNAT dnat_table entry was created, clean it up */
 					if ((sess_nat_flags & SESS_FLAG_SNAT) &&
 					    !(sess_nat_flags & SESS_FLAG_STATIC_NAT)) {
@@ -1155,7 +1160,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 				if (rule->log & LOG_FLAG_SESSION_INIT)
 					emit_event(meta, EVENT_TYPE_SESSION_OPEN,
-						   ACTION_PERMIT, 0, 0);
+						   ACTION_PERMIT, 0, 0, 0);
 
 				if (sess_nat_flags)
 					bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
@@ -1205,14 +1210,15 @@ int xdp_policy_prog(struct xdp_md *ctx)
 							if (create_session_v6(meta, rule->rule_id, rule->log,
 									      sess_nat_flags,
 									      meta->src_ip.v6, alloc_v4_port,
-									      nat_dst_ptr, sess_nat_dst_port) < 0) {
+									      nat_dst_ptr, sess_nat_dst_port,
+									      (__u16)pkt_app_id) < 0) {
 								inc_counter(GLOBAL_CTR_DROPS);
 								return XDP_DROP;
 							}
 
 							if (rule->log & LOG_FLAG_SESSION_INIT)
 								emit_event(meta, EVENT_TYPE_SESSION_OPEN,
-									   ACTION_PERMIT, 0, 0);
+									   ACTION_PERMIT, 0, 0, 0);
 
 							bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
 							return XDP_PASS;
@@ -1359,7 +1365,8 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				if (create_session_v6(meta, rule->rule_id, rule->log,
 						      sess_nat_flags,
 						      nat_src_ptr, sess_nat_src_port,
-						      nat_dst_ptr, sess_nat_dst_port) < 0) {
+						      nat_dst_ptr, sess_nat_dst_port,
+						      (__u16)pkt_app_id) < 0) {
 					/* Clean up dnat_table_v6 entry on failure */
 					if (have_dynamic_snat) {
 						struct dnat_key_v6 dk6 = {
@@ -1381,7 +1388,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 				if (rule->log & LOG_FLAG_SESSION_INIT)
 					emit_event(meta, EVENT_TYPE_SESSION_OPEN,
-						   ACTION_PERMIT, 0, 0);
+						   ACTION_PERMIT, 0, 0, 0);
 
 				if (sess_nat_flags)
 					bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
@@ -1395,7 +1402,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 		inc_counter(GLOBAL_CTR_POLICY_DENY);
 		if (rule->log)
 			emit_event(meta, EVENT_TYPE_POLICY_DENY,
-				   rule->action, 0, 0);
+				   rule->action, 0, 0, CLOSE_REASON_POLICY);
 
 		if (rule->action == ACTION_REJECT) {
 			/* TCP: send RST */
@@ -1445,13 +1452,13 @@ int xdp_policy_prog(struct xdp_md *ctx)
 	/* No rule matched: apply default action */
 	if (ps->default_action == ACTION_PERMIT) {
 		if (meta->addr_family == AF_INET) {
-			if (create_session(meta, 0, 0, 0, 0, 0, 0, 0) < 0) {
+			if (create_session(meta, 0, 0, 0, 0, 0, 0, 0, (__u16)pkt_app_id) < 0) {
 				inc_counter(GLOBAL_CTR_DROPS);
 				return XDP_DROP;
 			}
 		} else {
 			__u8 zero_ip[16] = {};
-			if (create_session_v6(meta, 0, 0, 0, zero_ip, 0, zero_ip, 0) < 0) {
+			if (create_session_v6(meta, 0, 0, 0, zero_ip, 0, zero_ip, 0, (__u16)pkt_app_id) < 0) {
 				inc_counter(GLOBAL_CTR_DROPS);
 				return XDP_DROP;
 			}

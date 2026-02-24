@@ -1656,9 +1656,24 @@ func (c *ctl) showEvents(args []string) error {
 		if outZone == "" {
 			outZone = fmt.Sprintf("%d", e.EgressZone)
 		}
-		fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%d zone=%s->%s\n",
-			e.Time, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
-			e.PolicyId, inZone, outZone)
+		policyDisp := e.PolicyName
+		if policyDisp == "" {
+			policyDisp = fmt.Sprintf("%d", e.PolicyId)
+		}
+		switch e.Type {
+		case "SCREEN_DROP":
+			fmt.Printf("%s %-14s screen=%-16s %s -> %s %s action=%s zone=%s\n",
+				e.Time, e.Type, e.ScreenCheck, e.SrcAddr, e.DstAddr, e.Protocol, e.Action, inZone)
+		case "SESSION_CLOSE":
+			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%s zone=%s->%s client=%d/%d server=%d/%d reason=%q\n",
+				e.Time, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
+				policyDisp, inZone, outZone,
+				e.SessionPackets, e.SessionBytes, e.RevSessionPkts, e.RevSessionBytes, e.CloseReason)
+		default:
+			fmt.Printf("%s %-14s %s -> %s %s action=%-6s policy=%s zone=%s->%s\n",
+				e.Time, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
+				policyDisp, inZone, outZone)
+		}
 	}
 	fmt.Printf("(%d events shown)\n", len(resp.Events))
 	return nil

@@ -223,6 +223,14 @@ struct icmp6hdr {
 #define EVENT_TYPE_ALG_REQUEST    5
 #define EVENT_TYPE_FILTER_LOG     6
 
+/* Session close reason codes for structured logging */
+#define CLOSE_REASON_NONE         0
+#define CLOSE_REASON_TIMEOUT      1
+#define CLOSE_REASON_TCP_FIN      2
+#define CLOSE_REASON_TCP_RST      3
+#define CLOSE_REASON_AGE_OUT      4
+#define CLOSE_REASON_POLICY       5
+
 /* Global counter indices */
 #define GLOBAL_CTR_RX_PACKETS      0
 #define GLOBAL_CTR_TX_PACKETS      1
@@ -449,6 +457,13 @@ struct event {
 	__be16 nat_src_port;
 	__be16 nat_dst_port;
 	__u32  created;      /* session creation time (seconds since boot) */
+	/* Extended fields for structured logging (vSRX RT_FLOW compat) */
+	__u64  rev_packets;       /* reverse direction packets (server→client) */
+	__u64  rev_bytes;         /* reverse direction bytes */
+	__u32  ingress_ifindex;   /* incoming interface ifindex */
+	__u16  app_id;            /* application ID from policy rule match */
+	__u8   close_reason;      /* CLOSE_REASON_* */
+	__u8   pad_event;         /* alignment padding */
 };
 
 /* ============================================================

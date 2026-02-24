@@ -751,7 +751,7 @@ inc_policy_counter(__u32 policy_id, __u32 pkt_len)
 
 static __always_inline void
 emit_event(struct pkt_meta *meta, __u8 event_type, __u8 action,
-	   __u64 packets, __u64 bytes)
+	   __u64 packets, __u64 bytes, __u8 close_reason)
 {
 	struct event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
 	if (!evt)
@@ -787,6 +787,12 @@ emit_event(struct pkt_meta *meta, __u8 event_type, __u8 action,
 	evt->nat_src_port = 0;
 	evt->nat_dst_port = 0;
 	evt->created = 0;
+	evt->rev_packets = 0;
+	evt->rev_bytes = 0;
+	evt->ingress_ifindex = meta->ingress_ifindex;
+	evt->app_id = 0;
+	evt->close_reason = close_reason;
+	evt->pad_event = 0;
 
 	bpf_ringbuf_submit(evt, 0);
 }
@@ -800,7 +806,9 @@ emit_event_nat4(struct pkt_meta *meta, __u8 event_type, __u8 action,
 		__u64 packets, __u64 bytes,
 		__be32 nat_src_ip, __be32 nat_dst_ip,
 		__be16 nat_src_port, __be16 nat_dst_port,
-		__u32 created)
+		__u32 created,
+		__u64 rev_packets, __u64 rev_bytes,
+		__u16 app_id, __u8 close_reason)
 {
 	struct event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
 	if (!evt)
@@ -837,6 +845,12 @@ emit_event_nat4(struct pkt_meta *meta, __u8 event_type, __u8 action,
 	evt->nat_src_port = nat_src_port;
 	evt->nat_dst_port = nat_dst_port;
 	evt->created = created;
+	evt->rev_packets = rev_packets;
+	evt->rev_bytes = rev_bytes;
+	evt->ingress_ifindex = meta->ingress_ifindex;
+	evt->app_id = app_id;
+	evt->close_reason = close_reason;
+	evt->pad_event = 0;
 
 	bpf_ringbuf_submit(evt, 0);
 }
@@ -849,7 +863,9 @@ emit_event_nat6(struct pkt_meta *meta, __u8 event_type, __u8 action,
 		__u64 packets, __u64 bytes,
 		const __u8 *nat_src_ip, const __u8 *nat_dst_ip,
 		__be16 nat_src_port, __be16 nat_dst_port,
-		__u32 created)
+		__u32 created,
+		__u64 rev_packets, __u64 rev_bytes,
+		__u16 app_id, __u8 close_reason)
 {
 	struct event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
 	if (!evt)
@@ -879,6 +895,12 @@ emit_event_nat6(struct pkt_meta *meta, __u8 event_type, __u8 action,
 	evt->nat_src_port = nat_src_port;
 	evt->nat_dst_port = nat_dst_port;
 	evt->created = created;
+	evt->rev_packets = rev_packets;
+	evt->rev_bytes = rev_bytes;
+	evt->ingress_ifindex = meta->ingress_ifindex;
+	evt->app_id = app_id;
+	evt->close_reason = close_reason;
+	evt->pad_event = 0;
 
 	bpf_ringbuf_submit(evt, 0);
 }
@@ -1239,7 +1261,7 @@ evaluate_firewall_filter(struct pkt_meta *meta)
 			__u8 act = (rule->action == FILTER_ACTION_ACCEPT ||
 				    rule->action == FILTER_ACTION_ROUTE)
 				   ? ACTION_PERMIT : ACTION_DENY;
-			emit_event(meta, EVENT_TYPE_FILTER_LOG, act, 0, 0);
+			emit_event(meta, EVENT_TYPE_FILTER_LOG, act, 0, 0, 0);
 		}
 
 		/* DSCP rewrite if configured */
@@ -1429,7 +1451,7 @@ evaluate_firewall_filter_output(struct pkt_meta *meta, __u32 egress_ifindex)
 			__u8 act = (rule->action == FILTER_ACTION_ACCEPT ||
 				    rule->action == FILTER_ACTION_ROUTE)
 				   ? ACTION_PERMIT : ACTION_DENY;
-			emit_event(meta, EVENT_TYPE_FILTER_LOG, act, 0, 0);
+			emit_event(meta, EVENT_TYPE_FILTER_LOG, act, 0, 0, 0);
 		}
 
 		if (rule->dscp_rewrite != 0xFF)
@@ -1603,7 +1625,7 @@ evaluate_filter_by_id(__u32 fid, struct pkt_meta *meta)
 		if (rule->log_flag) {
 			__u8 act = (rule->action == FILTER_ACTION_ACCEPT)
 				   ? ACTION_PERMIT : ACTION_DENY;
-			emit_event(meta, EVENT_TYPE_FILTER_LOG, act, 0, 0);
+			emit_event(meta, EVENT_TYPE_FILTER_LOG, act, 0, 0, 0);
 		}
 
 		if (rule->dscp_rewrite != 0xFF)

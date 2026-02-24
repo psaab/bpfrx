@@ -341,6 +341,12 @@ message EventEntry {
   uint64 session_bytes = 12;
   string ingress_zone_name = 13;
   string egress_zone_name = 14;
+  string policy_name = 15;
+  uint64 rev_session_pkts = 16;
+  uint64 rev_session_bytes = 17;
+  string app_name = 18;
+  string ingress_iface = 19;
+  string close_reason = 20;
 }
 
 message GetInterfacesRequest {}

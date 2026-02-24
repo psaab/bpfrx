@@ -28,6 +28,7 @@ type CompileResult struct {
 	AppIDs      map[string]uint32  // application name -> app ID
 	PoolIDs     map[string]uint8   // NAT pool name -> pool ID (0-based)
 	PolicyNames map[uint32]string  // rule_id -> "from-zone/to-zone/policy-name" (or "global/policy-name")
+	AppNames    map[uint16]string  // app_id -> application name (for structured logging)
 	PolicySets  int                // number of policy sets created
 	FilterIDs  map[string]uint32 // "inet:name" or "inet6:name" -> filter_id
 
@@ -1056,6 +1057,7 @@ func compileAddressBook(dp DataPlane,cfg *config.Config, result *CompileResult) 
 func compileApplications(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenApps := make(map[AppKey]bool)
+	result.AppNames = make(map[uint16]string)
 
 	appID := uint32(1)
 	userApps := cfg.Applications.Applications
@@ -1100,6 +1102,7 @@ func compileApplications(dp DataPlane,cfg *config.Config, result *CompileResult)
 		proto := protocolNumber(app.Protocol)
 
 		result.AppIDs[appName] = appID
+		result.AppNames[uint16(appID)] = appName
 
 		// Parse destination port (may be a range like "8080-8090")
 		ports, err := parsePorts(app.DestinationPort)
