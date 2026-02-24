@@ -221,53 +221,27 @@ This is **additive** to the periodic sweep — it provides sub-millisecond sync 
 
 | Type | Action |
 |------|--------|
-| SessionV4/V6 | `decodeSessionPayload()` → install forward entry → create reverse entry → create dnat_table entry (SNAT) |
-| DeleteV4/V6 | Parse 5-tuple → lookup session → delete reverse entry → delete dnat_table entry (SNAT) → delete forward entry |
-| BulkStart/End | Log markers; BulkEnd triggers `OnBulkSyncReceived` callback (releases VRRP sync hold) |
+| SessionV4/V6 | Decode → install forward → create reverse → create dnat_table (SNAT) |
+| DeleteV4/V6 | Lookup → delete reverse → delete dnat_table (SNAT) → delete forward |
+| BulkStart/End | Log markers; BulkEnd triggers `OnBulkSyncReceived` (releases VRRP sync hold) |
 | Heartbeat | No-op (resets read deadline) |
 | Config | `OnConfigReceived` callback (runs in goroutine) |
 | IPsecSA | Store names, call `OnIPsecSAReceived` |
 
-### Receiver-Side Session Reconstruction
+### Session Reconstruction on Receiver
 
-The periodic sweep sends **forward-only** entries (IsReverse==0). The receiver must reconstruct the full conntrack state from each forward entry:
-
-1. **Install forward entry:** `SetSessionV4/V6(key, val)` writes the forward session to the BPF map.
-
-2. **Create reverse entry:** If `val.IsReverse == 0 && val.ReverseKey.Protocol != 0`:
-   - Copy forward value → set `IsReverse = 1` → set `ReverseKey = original key`
-   - Install via `SetSessionV4/V6(val.ReverseKey, revVal)`
-   - Without this, return traffic finds no conntrack match → goes to policy as new connection → dropped
-
-3. **Create dnat_table entry (SNAT only):** If the forward session has `SNAT` flag set (and NOT `StaticNAT`):
-   - Build `DNATKey{Protocol, DstIP=val.NATSrcIP, DstPort=val.NATSrcPort}`
-   - Build `DNATValue{NewDstIP=key.SrcIP, NewDstPort=key.SrcPort}`
-   - Install via `SetDNATEntry(dnatKey, dnatVal)`
-   - `xdp_zone` uses dnat_table to rewrite dst IP back to the real client before conntrack lookup on return traffic
-   - Without this, return traffic uses the SNAT'd dst IP for conntrack lookup → miss → RST or drop
-
-For **delete messages**, the receiver performs cleanup in reverse order:
-1. Look up the forward session to get the ReverseKey and NAT fields
-2. Delete the reverse entry (`DeleteSession(val.ReverseKey)`)
-3. Delete the dnat_table entry (SNAT sessions only)
-4. Delete the forward entry
+Forward-only sweep entries are reconstructed into full conntrack state:
+1. **Forward entry:** Install as-is via `SetSessionV4/V6(key, val)`
+2. **Reverse entry:** If `IsReverse==0 && ReverseKey.Protocol != 0`: copy val, set `IsReverse=1`, set `ReverseKey = original key`, install at `val.ReverseKey`
+3. **dnat_table (SNAT only):** If `Flags & SessFlagSNAT && !(Flags & SessFlagStaticNAT)`: create `{Protocol, NATSrcIP, NATSrcPort} → {SrcIP, SrcPort}`
 
 ### FIB Cache (Not Synced — By Design)
+- `fib_ifindex`, `fib_dmac`, `fib_smac`, `fib_gen` are zeroed in synced sessions
+- Interface indices and MACs differ between nodes; zero forces fresh `bpf_fib_lookup`
 
-Session FIB cache fields (`fib_ifindex`, `fib_dmac`, `fib_smac`, `fib_gen`) are **zeroed** in synced sessions. This is correct behavior:
-- Interface indices differ between cluster nodes (enp6s0 may be ifindex 3 on node0 but 5 on node1)
-- MAC addresses differ between nodes
-- Zero `fib_ifindex` forces a fresh `bpf_fib_lookup` on the first packet, populating the local FIB cache
-
-### Data Dependencies by Session Type
-
-| Session Type | Forward Entry | Reverse Entry | dnat_table Entry | Notes |
-|-------------|:---:|:---:|:---:|-------|
-| Plain (no NAT) | Yes | Yes | No | Return traffic matches reverse entry directly |
-| SNAT (interface/pool) | Yes | Yes | Yes | Return traffic needs dnat_table for pre-routing dst rewrite |
-| DNAT | Yes | Yes | No | DNAT rules exist in config; dnat_table populated from config, not sessions |
-| Static NAT (1:1) | Yes | Yes | No | Static NAT entries exist in config; bidirectional mapping from config |
-| NAT64 | Yes | Yes | No | NAT64 translation handled by xdp_nat64 program |
+### Known Issues
+- **NO_NEIGH after failover (IN PROGRESS):** Cold ARP cache on takeover → `bpf_fib_lookup` rc=7 → XDP_PASS un-NAT'd
+- **Monotonic clock skew (IN PROGRESS):** Remote timestamps in synced sessions → premature GC expiry
 
 ## Statistics (SyncStats)
 
@@ -311,227 +285,8 @@ BPF creates session
   │                                  │                         │
   │  GC expires session              │                    handleMessage
   │    │                             │                         │
-  │    └── OnDeleteV4/V6 ───────────┘                         │
-  │                                                     ┌─────┴──────┐
-  │                                                     │ SessionV4/V6│
-  │                                                     ├────────────┤
-  │                                                     │ 1. Install  │
-  │                                                     │    forward  │
-  │                                                     │ 2. Create   │
-  │                                                     │    reverse  │
-  │                                                     │ 3. Create   │
-  │                                                     │    dnat_tbl │
-  │                                                     │    (SNAT)   │
-  │                                                     └─────┬──────┘
+  │    └── OnDeleteV4/V6 ───────────┘                    SetSessionV4/V6
+  │                                                      DeleteSession
   │                                                           │
   │                                                      BPF map updated
-```
-
-## Known Issues and Fixes
-
-### FIXED: Forward-only session sync (missing reverse entries)
-
-**Symptom:** After VRRP failover, return traffic on the takeover node had no conntrack match. Packets went through policy evaluation as new connections and were dropped (deny-by-default) or created conflicting sessions.
-
-**Root cause:** The periodic sync sweep sent only forward entries (`IsReverse==0`), but `handleMessage()` installed them directly without creating the corresponding reverse entry. Only bulk sync sent both forward and reverse entries.
-
-**Fix:** `handleMessage()` now creates a reverse entry from each forward entry: copies the forward value, sets `IsReverse=1`, sets `ReverseKey = original forward key`, and installs via `SetSessionV4/V6(val.ReverseKey, revVal)`.
-
-### FIXED: Missing dnat_table entries for SNAT sessions
-
-**Symptom:** After failover, SNAT return traffic (server→firewall) was not being de-NAT'd correctly. The takeover node's `xdp_zone` couldn't find the dnat_table entry needed to rewrite the dst IP back to the original client. Conntrack lookup used the wrong (SNAT'd) dst IP → miss → new connection → kernel RST.
-
-**Root cause:** SNAT sessions need dnat_table entries on the takeover node for pre-routing dst rewrite. The sync protocol only sent session entries; dnat_table entries (which are derived from sessions, not config) were never synced.
-
-**Fix:** `handleMessage()` now creates a dnat_table entry for each forward SNAT session (Flags has `SessFlagSNAT` set, `SessFlagStaticNAT` not set). The entry maps `{Protocol, NATSrcIP, NATSrcPort} → {SrcIP, SrcPort}` from the forward session.
-
-### IN PROGRESS: NO_NEIGH drops synced SNAT sessions after failover
-
-**Symptom:** After VRRP failover, the takeover node has no ARP/NDP entries for next hops that were only used by the previous primary. `bpf_fib_lookup` returns `BPF_FIB_LKUP_RET_NO_NEIGH` (rc=7) → XDP_PASS with un-NAT'd packet → kernel sends RST (local dst) or forwards with wrong source IP.
-
-**Root cause:** ARP/NDP caches are per-node. When the primary sends SNAT'd traffic, only the primary has ARP entries for the next hop. The secondary never sends traffic to those destinations, so its ARP cache is cold.
-
-**Proposed fix:** Proactive ARP/NDP warmup after VRRP MASTER transition:
-- On becoming MASTER, iterate synced sessions with SNAT flag
-- Extract unique next-hop IPs from session NAT fields
-- Send ICMP echo (ping) to each next hop to trigger ARP resolution
-- Consider `BPF_FIB_LOOKUP_SKIP_NEIGH` flag for graceful degradation
-
-### IN PROGRESS: Monotonic clock skew in GC
-
-**Symptom:** Synced sessions carry the remote node's monotonic timestamps (`Created`, `LastSeen`). If the local node has been running longer than the remote, `LastSeen + Timeout < local_now` evaluates true immediately → premature session expiry within seconds of sync.
-
-**Root cause:** `CLOCK_MONOTONIC` timestamps are relative to each node's boot time. Node A reboots (low monotonic time), syncs sessions to Node B (high monotonic time). Node B's GC sees sessions with low `LastSeen` → expires them.
-
-**Proposed fix:** Set `LastSeen = local monotonic time` when installing synced sessions in `handleMessage()`. This ensures GC on the local node uses the local clock for expiry decisions. The `Created` timestamp remains original for auditing/display purposes.
-
-## Test Plan: Session Sync Failover
-
-### Prerequisites
-
-- Two-node cluster: bpfrx-fw0 (node 0, priority 200), bpfrx-fw1 (node 1, priority 100)
-- cluster-lan-host (10.0.60.102) as traffic source via RETH LAN VIP (10.0.60.1)
-- External host or WAN-reachable iperf server for SNAT testing
-- Heartbeat link: 10.99.0.0/30, Fabric link: 10.99.1.0/30
-- WAN RETH VIP: 172.16.50.10, LAN RETH VIP: 10.0.60.1
-
-### Test Cases
-
-#### 1. Basic SNAT failover (TCP)
-
-```bash
-# On external host: start iperf3 server
-iperf3 -s
-
-# On cluster-lan-host: start TCP flow through firewall
-incus exec cluster-lan-host -- iperf3 -c <external-host> -t 120 -C bbr
-
-# Verify sessions synced to fw1
-incus exec bpfrx-fw1 -- /opt/bpfrx/bpfrxd show security flow session
-
-# Trigger failover: stop fw0
-incus exec bpfrx-fw0 -- systemctl stop bpfrxd
-# OR: incus stop bpfrx-fw0
-
-# Verify on fw1:
-incus exec bpfrx-fw1 -- /opt/bpfrx/bpfrxd show vrrp summary        # MASTER state
-incus exec bpfrx-fw1 -- /opt/bpfrx/bpfrxd show security flow session # sessions present
-```
-
-**Pass criteria:**
-- fw1 becomes MASTER within 3.5s (master-down timer)
-- iperf throughput resumes within 5s
-- No RSTs sent by fw1 kernel (`ss -s` shows no resets)
-- Session counters continue increasing on fw1
-
-#### 2. SNAT failover (UDP)
-
-```bash
-# Same setup as TCP but with UDP
-incus exec cluster-lan-host -- iperf3 -c <external-host> -t 120 -u -b 100M
-```
-
-**Pass criteria:**
-- UDP should be more resilient (no RSTs, no TCP connection state)
-- Flow resumes within 3.5s of failover
-- Packet loss limited to failover window only
-
-#### 3. DNAT failover
-
-```bash
-# Set up DNAT rule: external:8080 → internal:80
-# Start HTTP server on cluster-lan-host
-incus exec cluster-lan-host -- python3 -m http.server 80
-
-# From external host, connect to DNAT VIP
-curl -v http://172.16.50.10:8080/
-
-# With long-running connection (iperf or curl --no-buffer)
-# Stop fw0 → verify connection survives on fw1
-```
-
-**Pass criteria:**
-- DNAT sessions synced including NATDstIP/NATDstPort
-- After failover, fw1 has both forward+reverse entries and dnat_table entries from config
-- New connections to DNAT VIP work through fw1
-
-#### 4. Preemption with sync hold
-
-```bash
-# Start with both nodes running, fw0 is MASTER (priority 200)
-# Stop fw0 → fw1 becomes MASTER
-incus exec bpfrx-fw0 -- systemctl stop bpfrxd
-
-# Establish sessions through fw1
-incus exec cluster-lan-host -- iperf3 -c <external-host> -t 120
-
-# Start fw0 → verify sync hold delays preemption
-incus exec bpfrx-fw0 -- systemctl start bpfrxd
-
-# Watch fw0 logs for sync hold
-incus exec bpfrx-fw0 -- journalctl -u bpfrxd -f
-# Should see: "vrrp: sync hold active" then "vrrp: sync hold released"
-```
-
-**Pass criteria:**
-- fw0 starts with `preempt=false` (sync hold active)
-- fw0 receives bulk sync from fw1 before becoming MASTER
-- "sync hold released" log appears after BulkEnd received (or 30s timeout)
-- Existing sessions survive fw0's preemption of fw1
-- No traffic interruption during preemption
-
-#### 5. GC doesn't kill synced sessions
-
-```bash
-# Sync sessions from fw0 to fw1 (verify with show sessions on fw1)
-incus exec bpfrx-fw1 -- /opt/bpfrx/bpfrxd show security flow session
-
-# Wait 30+ seconds (multiple GC cycles — GC runs every 10s)
-sleep 35
-
-# Verify sessions still exist on fw1
-incus exec bpfrx-fw1 -- /opt/bpfrx/bpfrxd show security flow session
-
-# Trigger failover → sessions should still work
-incus exec bpfrx-fw0 -- systemctl stop bpfrxd
-
-# Verify traffic still flows
-incus exec cluster-lan-host -- ping -c 3 <external-host>
-```
-
-**Pass criteria:**
-- Synced sessions survive 3+ GC cycles (30s) without expiry
-- After failover, sessions are usable (not garbage collected)
-- Note: requires monotonic clock fix (task #2) to pass reliably
-
-#### 6. ARP warmup after failover
-
-```bash
-# Flush fw1's ARP cache before test
-incus exec bpfrx-fw1 -- ip neigh flush all
-
-# Establish SNAT sessions through fw0
-incus exec cluster-lan-host -- iperf3 -c <external-host> -t 120
-
-# Trigger failover
-incus exec bpfrx-fw0 -- systemctl stop bpfrxd
-
-# Check ARP entries populated quickly
-incus exec bpfrx-fw1 -- ip neigh show
-
-# Check flow stats for NO_NEIGH drops
-incus exec bpfrx-fw1 -- /opt/bpfrx/bpfrxd show security flow statistics
-```
-
-**Pass criteria:**
-- ARP entries populated within 1s of becoming MASTER
-- No NO_NEIGH drops visible in flow stats
-- Note: requires NO_NEIGH fix (task #1) to pass
-
-### Verification Commands
-
-```bash
-# Check sessions on peer
-incus exec bpfrx-fw1 -- /opt/bpfrx/bpfrxd show security flow session
-
-# Check VRRP status
-incus exec bpfrx-fw1 -- /opt/bpfrx/bpfrxd show vrrp summary
-
-# Check sync stats
-incus exec bpfrx-fw1 -- /opt/bpfrx/bpfrxd show chassis cluster information
-
-# Check flow stats (includes NO_NEIGH counter)
-incus exec bpfrx-fw1 -- /opt/bpfrx/bpfrxd show security flow statistics
-
-# Check ARP cache
-incus exec bpfrx-fw1 -- ip neigh show
-
-# Check kernel RSTs (ss -s shows TCP reset counts)
-incus exec bpfrx-fw1 -- ss -s
-
-# Follow daemon logs during failover
-incus exec bpfrx-fw1 -- journalctl -u bpfrxd -f
-
-# Check dnat_table entries on fw1
-incus exec bpfrx-fw1 -- /opt/bpfrx/bpfrxd show security nat source summary
 ```

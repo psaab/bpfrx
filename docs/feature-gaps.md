@@ -17,19 +17,19 @@ Last updated: 2026-02-14
 | Screen/IDS Enhancements | 6 | 2 | 0 | 8 |
 | Security Flow Enhancements | 9 | 2 | 0 | 11 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
-| Security Logging Enhancements | 0 | 0 | 0 | 0 |
+| Security Logging Enhancements | 4 | 1 | 1 | 6 |
 | PKI / Certificates | 4 | 0 | 0 | 4 |
 | Routing Enhancements | 11 | 3 | 0 | 14 |
 | VPN Enhancements | 8 | 1 | 0 | 9 |
-| HA Enhancements | 0 | 0 | 0 | 0 |
-| Firewall Filter Enhancements | 0 | 0 | 0 | 0 |
+| HA Enhancements | 3 | 2 | 2 | 7 |
+| Firewall Filter Enhancements | 4 | 1 | 0 | 5 |
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
 | Management & Automation | 10 | 2 | 0 | 12 |
-| Interface Enhancements | 2 | 0 | 0 | 2 |
+| Interface Enhancements | 5 | 1 | 2 | 8 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **134** | **15** | **4** | **153** |
+| **TOTAL** | **148** | **20** | **9** | **177** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -220,16 +220,16 @@ bpfrx has ALG disable flags for DNS, FTP, SIP, TFTP. The vSRX supports many more
 
 ## 12. Security Logging Enhancements
 
-bpfrx has full security logging: stream mode (UDP/TCP/TLS), event mode (local file), structured syslog (RT_FLOW with NAT fields), per-policy session-init/close with full NAT translation, and session aggregation reporting. All vSRX security logging features are implemented (except binary format which requires a Juniper-specific receiver).
+bpfrx has security logging with mode (stream/event), format, streams with host/port/severity/facility/category/source-address. These are additional features.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Structured Syslog Format** | `security log format structured` | Machine-parseable key-value syslog format (RT_FLOW_SESSION_CREATE/CLOSE/DENY) with NAT fields, zone names, elapsed time | Medium | Implemented (Sprint SEC-LOG) |
-| **Binary Log Format** | `security log format binary` | High-performance binary log format for off-box collector (requires Juniper log receiver) | Low | N/A (requires Juniper-specific receiver) |
-| **Transport Protocol Selection** | `security log stream ... transport protocol tcp/tls` | Send security logs over TCP or TLS instead of UDP for reliable delivery. RFC 6587 octet-counting framing, auto-reconnect. | Medium | Implemented (Sprint SEC-LOG) |
-| **Per-Policy Logging** | `security policies ... then log session-init session-close` | Full NAT translation fields (nat-source-address, nat-destination-address, nat-source-port, nat-destination-port), zone names, elapsed time, session bytes/packets in log events | Medium | Implemented (Sprint SEC-LOG) |
-| **Log Event Mode** | `security log mode event` | Route security logs to local file (/var/log/bpfrx/security.log) with rotation instead of remote syslog. Configured via `security log mode event`. | Low | Implemented (Sprint SEC-LOG) |
-| **Session Aggregation Logs** | `security log ... report` | Periodic top-N source/destination reports by bytes (5-min intervals, RT_FLOW_SESSION_AGGREGATE). Enabled via `security log report`. | Low | Implemented (Sprint SEC-LOG) |
+| **Structured Syslog Format** | `security log format structured` | Machine-parseable key-value syslog format (RT_FLOW_SESSION_CREATE, etc.) with standardized field names | Medium | Missing |
+| **Binary Log Format** | `security log format binary` | High-performance binary log format for off-box collector (requires Juniper log receiver) | Low | Missing |
+| **Transport Protocol Selection** | `security log stream ... transport protocol tcp/tls` | Send security logs over TCP or TLS instead of UDP for reliable delivery | Medium | Missing |
+| **Per-Policy Logging** | `security policies ... then log session-init session-close` | bpfrx has this but may not fully support all log fields (app-name, nat-*, nested-app, etc.) | Medium | Partial (basic session-init/close logging works) |
+| **Log Event Mode** | `security log mode event` | Route security logs through eventd (control plane) for on-box processing, slower but allows local processing | Low | Parse-Only (parsed but always uses stream) |
+| **Session Aggregation Logs** | `security log ... report` | Aggregate session logs for top-N reporting (top talkers, top applications) | Low | Missing |
 
 ---
 
@@ -293,13 +293,13 @@ bpfrx has a chassis cluster implementation with redundancy groups, RETH, heartbe
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **In-Service Software Upgrade (ISSU)** | `request system software in-service-upgrade ...` | Upgrade software without traffic interruption using cluster failover. ForceSecondary() drains all RGs to peer, then operator replaces binary and restarts. | Low | Implemented (Sprint HA-8) |
-| **NAT State Synchronization** | `chassis cluster ... nat-state-synchronization` | Sync NAT translation table entries between cluster nodes for seamless failover. Session sync now decodes and installs v4/v6 sessions via SetSessionV4/V6 into BPF maps. | Medium | Implemented (Sprint HA-8) |
-| **IPsec SA Synchronization** | `chassis cluster ... ipsec-session-synchronization` | Sync IPsec SA connection names between nodes. Primary periodically sends active connections; new primary re-initiates via swanctl --initiate after failover. | Medium | Implemented (Sprint HA-8) |
-| **Active/Active Mode** | `chassis cluster redundancy-group N node 0 priority N node 1 priority N` (both nonzero) | Both nodes forward traffic simultaneously for different RGs. Per-RG primary election validated with unit tests. | Medium | Implemented (Sprint HA-8) |
-| **Redundant Ethernet (reth) Runtime** | `interfaces reth0 redundant-ether-options ...` | Full bond failover with GARP (IPv4) + unsolicited NA (IPv6) after primary transition. RethIPs() returns both address families, triggerGARP() dispatches IPv4/IPv6. | Medium | Implemented (Sprint HA-8) |
-| **Primary/Preferred Address per Interface** | `interfaces ... unit ... family inet address ... primary/preferred` | Select which address is used as source for traffic originated by the device. Primary ordered first in networkd, preferred gets PreferredLifetime=forever. | Low | Implemented (Sprint IF-1) |
-| **Fabric Link Redundancy** | `chassis cluster ... fabric-options member-interfaces` | Multiple fabric links between cluster nodes for data forwarding resilience. Session sync uses fabric link for all sync traffic (sessions, config, IPsec SAs). | Low | Implemented (Sprint HA-8) |
+| **In-Service Software Upgrade (ISSU)** | `request system software in-service-upgrade ...` | Upgrade software without traffic interruption using cluster failover | Low | Missing |
+| **NAT State Synchronization** | `chassis cluster ... nat-state-synchronization` | Sync NAT translation table entries between cluster nodes for seamless failover | Medium | Missing |
+| **IPsec SA Synchronization** | `chassis cluster ... ipsec-session-synchronization` | Sync IPsec Security Associations between nodes. Avoids tunnel re-establishment after failover. | Medium | Missing |
+| **Active/Active Mode** | `chassis cluster redundancy-group N node 0 priority N node 1 priority N` (both nonzero) | Both nodes forward traffic simultaneously for different RGs. bpfrx currently supports active/passive primarily. | Medium | Partial (election logic exists but active/active forwarding path may be incomplete) |
+| **Redundant Ethernet (reth) Runtime** | `interfaces reth0 redundant-ether-options ...` | While reth is parsed, full bond failover with MAC migration, fabric link forwarding, and ARP notifications needs verification | Medium | Partial (reth.go exists but needs end-to-end validation) |
+| **Primary/Preferred Address per Interface** | `interfaces ... unit ... family inet address ... primary/preferred` | Select which address is used as source for traffic originated by the device | Low | Parse-Only |
+| **Fabric Link Redundancy** | `chassis cluster ... fabric-options member-interfaces` | Multiple fabric links between cluster nodes for data forwarding resilience | Low | Parse-Only |
 
 ---
 
@@ -309,11 +309,11 @@ bpfrx has firewall filters with source/dest addresses, prefix-lists (with except
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color policer with BPF per-CPU token bucket. | High | Implemented (Sprint FF-1) |
-| **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR. Single-rate (RFC 2697) and two-rate (RFC 2698) modes with color-blind/color-aware support. | Medium | Implemented (Sprint FF-1) |
-| **Interface Policer** | `firewall policer ... logical-interface-policer` | Aggregate rate limiting across all protocol families on a logical interface. Parsed as `LogicalInterfacePolicer` flag on policer config. | Low | Implemented (Sprint FF-1) |
-| **Flexible Match Conditions** | `firewall filter ... term ... from flexible-match-range ...` | Match on arbitrary byte offsets within packet header for custom protocol matching. BPF evaluates via meta fields (protocol, src/dst IP). | Low | Implemented (Sprint FF-1) |
-| **Firewall Filter on lo0** | `interfaces lo0 unit 0 family inet filter input ...` | Host-bound traffic filtering via native BPF evaluation in xdp_forward. lo0 filter IDs stored in flow_config_map, evaluated on host-inbound packets. | Medium | Implemented (Sprint FF-1) |
+| **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Missing |
+| **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR | Medium | Missing |
+| **Interface Policer** | `firewall policer ... logical-interface-policer` | Aggregate rate limiting across all protocol families on a logical interface | Low | Missing |
+| **Flexible Match Conditions** | `firewall filter ... term ... from flexible-match-range ...` | Match on arbitrary byte offsets within packet header for custom protocol matching | Low | Missing |
+| **Firewall Filter on lo0** | `interfaces lo0 unit 0 family inet filter input ...` | Host-bound traffic filtering. bpfrx parses Lo0FilterInputV4/V6 but may not fully apply in BPF. | Medium | Partial (parsed and partially wired but needs verification) |
 
 ---
 
@@ -374,14 +374,14 @@ bpfrx manages all interfaces with .link/.network files, supports VLANs, tunnel i
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Link Aggregation (LAG/ae)** | `interfaces ae0 ...; interfaces ge-0/0/0 gigether-options 802.3ad ae0` | Bundle physical links into aggregate ethernet for bandwidth and redundancy. Different from reth. Bond .netdev/.network generation via networkd, LACP active/passive, periodic rate, minimum-links, link-speed. | Medium | Implemented (Sprint IF-1) |
+| **Link Aggregation (LAG/ae)** | `interfaces ae0 ...; interfaces ge-0/0/0 gigether-options 802.3ad ae0` | Bundle physical links into aggregate ethernet for bandwidth and redundancy. Different from reth. | Medium | Missing |
 | **Transparent Mode (L2 Bridging)** | `interfaces ... family ethernet-switching; bridge-domains ...` | Layer 2 bridge mode where firewall acts as transparent inline device. Zone-based policies still apply. MAC learning table. | Medium | Missing |
-| **Flexible VLAN Tagging** | `interfaces ... flexible-vlan-tagging; encapsulation flexible-ethernet-services` | Q-in-Q (802.1ad), flexible VLAN push/pop/swap operations. FlexibleVlanTagging flag, inner-vlan-id on units, encapsulation type parsing. | Low | Implemented (Sprint IF-1) |
-| **Interface Bandwidth** | `interfaces ... bandwidth ...` | Set logical interface bandwidth for OSPF cost calculation and traffic-engineering. Parsed as bps, emitted as FRR `bandwidth <kbps>` in interface stanza. | Low | Implemented (Sprint IF-1) |
+| **Flexible VLAN Tagging** | `interfaces ... flexible-vlan-tagging; encapsulation flexible-ethernet-services` | Q-in-Q (802.1ad), flexible VLAN push/pop/swap operations. bpfrx has basic 802.1Q single-tag. | Low | Missing |
+| **Interface Bandwidth** | `interfaces ... bandwidth ...` | Set logical interface bandwidth for OSPF cost calculation and traffic-engineering | Low | Missing |
 | **IRB Interfaces** | `interfaces irb unit N family inet address ...` | Integrated Routing and Bridging: L3 interface in bridge domain for inter-VLAN routing | Medium | Missing |
-| **Point-to-Point** | `interfaces ... unit ... point-to-point` | Mark interface as point-to-point. Wired to FRR `ip ospf network point-to-point` when no explicit OSPF network-type set. | Low | Implemented (Sprint IF-1) |
-| **Primary/Preferred Address** | `interfaces ... unit ... family inet address ... primary/preferred` | Control which address is used for sourced traffic. Primary address ordered first in networkd; preferred address gets PreferredLifetime=forever. | Low | Implemented (Sprint IF-1) |
-| **Interface Description** | `interfaces ... description "..."` | Interface descriptions displayed in `show interfaces detail/terse` via gRPC. Passed to systemd-networkd Description field. | Low | Implemented (Sprint IF-1) |
+| **Point-to-Point** | `interfaces ... unit ... point-to-point` | Mark interface as point-to-point (affects OSPF network type, ND behavior) | Low | Parse-Only |
+| **Primary/Preferred Address** | `interfaces ... unit ... family inet address ... primary/preferred` | Control which address is used for sourced traffic | Low | Parse-Only |
+| **Interface Description** | `interfaces ... description "..."` | bpfrx parses descriptions. Verify they appear in `show interfaces` output. | Low | Partial (parsed, display may need verification) |
 
 ---
 
@@ -437,26 +437,27 @@ Features commonly requested in enterprise deployments:
 11. **Aggressive Session Aging** - Session table management under load
 12. **Graceful Restart** - Non-stop routing (FRR already supports)
 13. **Twice NAT** - Complex NAT scenarios
-14. **Transparent Mode (L2)** - Inline transparent firewall deployment
-15. **Link Aggregation (LAG)** - Bandwidth aggregation and link redundancy
-16. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication
-17. **SecIntel / GeoIP** - Threat intelligence integration
-18. **Captive Portal / User Firewall** - User-based access control
-19. **Logical Systems (LSYS)** - Multi-tenancy
+14. **Structured Syslog** - Machine-parseable security logs
+15. **Transparent Mode (L2)** - Inline transparent firewall deployment
+16. **Link Aggregation (LAG)** - Bandwidth aggregation and link redundancy
+17. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication
+18. **SecIntel / GeoIP** - Threat intelligence integration
+19. **Captive Portal / User Firewall** - User-based access control
+20. **Logical Systems (LSYS)** - Multi-tenancy
 
 ### Tier 3 - Low Priority (Specialized / Niche)
 Features for specific use cases or carrier deployments:
 
-20. Content Security (UTM) - AV/web-filtering (consider ClamAV/rspamd)
-21. SSL Proxy - TLS inspection (consider mitmproxy integration)
-22. Multicast (PIM/IGMP)
-23. MPLS/LDP
-24. EVPN/VXLAN
-25. DS-Lite/6rd/MAP-E
-26. GTP Firewall
-27. SD-WAN
-28. PowerMode IPsec
-29. Class of Service (not supported on vSRX anyway)
+21. Content Security (UTM) - AV/web-filtering (consider ClamAV/rspamd)
+22. SSL Proxy - TLS inspection (consider mitmproxy integration)
+23. Multicast (PIM/IGMP)
+24. MPLS/LDP
+25. EVPN/VXLAN
+26. DS-Lite/6rd/MAP-E
+27. GTP Firewall
+28. SD-WAN
+29. PowerMode IPsec
+30. Class of Service (not supported on vSRX anyway)
 
 ---
 
@@ -466,11 +467,15 @@ These features have config parsing in bpfrx but NO runtime effect:
 
 | # | Config Path | Type | Notes |
 |---|------------|------|-------|
-| 1 | `security pre-id-default-policy` | PreIDDefaultPolicy | Requires AppID engine |
-| 2 | `system master-password` | SystemConfig.MasterPassword | No encrypted storage |
-| 3 | `system license autoupdate url` | SystemConfig.LicenseAutoUpdate | No licensing system |
-| 4 | `system ntp threshold action` | SystemConfig.NTPThresholdAction | Not wired to NTP config |
-| 5 | `services application-identification` | ServicesConfig.ApplicationIdentification | Bool flag only, no DPI |
+| 1 | `security log mode` | LogConfig.Mode | Always uses stream mode |
+| 2 | `security pre-id-default-policy` | PreIDDefaultPolicy | Requires AppID engine |
+| 3 | `system master-password` | SystemConfig.MasterPassword | No encrypted storage |
+| 4 | `system license autoupdate url` | SystemConfig.LicenseAutoUpdate | No licensing system |
+| 5 | `system ntp threshold action` | SystemConfig.NTPThresholdAction | Not wired to NTP config |
+| 6 | `interfaces ... address primary` | InterfaceUnit.PrimaryAddress | Not used for source selection |
+| 7 | `interfaces ... address preferred` | InterfaceUnit.PreferredAddress | Not used for source selection |
+| 8 | `interfaces ... point-to-point` | InterfaceUnit.PointToPoint | Not passed to networkd |
+| 9 | `services application-identification` | ServicesConfig.ApplicationIdentification | Bool flag only, no DPI |
 
 ---
 
@@ -486,9 +491,10 @@ These features have config parsing in bpfrx but NO runtime effect:
 - Implement per-source-IP and per-dest-IP session counting in BPF conntrack
 - Use per-CPU hash map for session counts, check in xdp_conntrack before creating new session
 
-### Firewall Filter Policers (Tier 1) — IMPLEMENTED (Sprint FF-1)
-- Single-rate two-color + three-color (RFC 2697/2698) policers in BPF
-- Token-bucket with per-CPU state maps; flexible match conditions; lo0 filter wiring
+### Firewall Filter Policers (Tier 1)
+- Add `PolicerConfig` to config types
+- Implement token-bucket in BPF using per-CPU maps for token state
+- Apply at XDP/TC attachment points based on interface filter binding
 
 ### BFD (Tier 1)
 - FRR already has `bfdd` daemon
