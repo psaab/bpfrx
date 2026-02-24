@@ -15,7 +15,7 @@ type Instance struct {
 	Priority          int
 	Preempt           bool
 	AcceptData        bool
-	AdvertiseInterval int
+	AdvertiseInterval int // milliseconds (wire format is centiseconds)
 	VirtualAddresses  []string // CIDR notation
 	AuthType          string   // "" or "md5"
 	AuthKey           string
@@ -46,7 +46,9 @@ func CollectInstances(cfg *config.Config) []*Instance {
 					TrackPriorityCost: vg.TrackPriorityDelta,
 				}
 				if inst.AdvertiseInterval == 0 {
-					inst.AdvertiseInterval = 1
+					inst.AdvertiseInterval = 1000 // default 1s
+				} else {
+					inst.AdvertiseInterval *= 1000 // config seconds → ms
 				}
 				instances = append(instances, inst)
 			}
@@ -117,7 +119,7 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 					Priority:          pri,
 					Preempt:           true,
 					AcceptData:        true,
-					AdvertiseInterval: 1,
+					AdvertiseInterval: 250,
 					VirtualAddresses:  unit.Addresses,
 				})
 			}
@@ -135,7 +137,7 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 				Priority:          pri,
 				Preempt:           true,
 				AcceptData:        true,
-				AdvertiseInterval: 1,
+				AdvertiseInterval: 250,
 				VirtualAddresses:  vips,
 			})
 		}

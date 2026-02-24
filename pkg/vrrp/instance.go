@@ -195,12 +195,13 @@ func (vi *vrrpInstance) setState(s VRRPState) {
 }
 
 // advertInterval returns the advertisement interval as a Duration.
+// AdvertiseInterval is in milliseconds.
 func (vi *vrrpInstance) advertInterval() time.Duration {
-	sec := vi.cfg.AdvertiseInterval
-	if sec <= 0 {
-		sec = 1
+	ms := vi.cfg.AdvertiseInterval
+	if ms <= 0 {
+		ms = 1000
 	}
-	return time.Duration(sec) * time.Second
+	return time.Duration(ms) * time.Millisecond
 }
 
 // masterDownInterval returns the master-down timer value.
@@ -537,7 +538,7 @@ func (vi *vrrpInstance) sendAdvert(priority int) {
 
 	// Send IPv4 advertisement if we have any IPv4 VIPs.
 	if len(v4Addrs) > 0 {
-		maxAdvert := uint16(vi.cfg.AdvertiseInterval * 100) // seconds → centiseconds
+		maxAdvert := uint16(vi.cfg.AdvertiseInterval / 10) // milliseconds → centiseconds
 		pkt := &VRRPPacket{
 			VRID:         uint8(vi.cfg.GroupID),
 			Priority:     uint8(priority),

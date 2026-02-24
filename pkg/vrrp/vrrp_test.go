@@ -73,8 +73,8 @@ func TestCollectRethInstances(t *testing.T) {
 	if !inst0.AcceptData {
 		t.Error("inst0.AcceptData should be true")
 	}
-	if inst0.AdvertiseInterval != 1 {
-		t.Errorf("inst0.AdvertiseInterval = %d, want 1", inst0.AdvertiseInterval)
+	if inst0.AdvertiseInterval != 250 {
+		t.Errorf("inst0.AdvertiseInterval = %d, want 250", inst0.AdvertiseInterval)
 	}
 	// Unit 0 addresses then unit 1 (sorted by unit number).
 	wantVIPs := []string{"10.0.1.1/24", "10.0.1.2/24", "10.0.2.1/24"}

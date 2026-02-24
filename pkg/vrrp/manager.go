@@ -224,7 +224,7 @@ func (m *Manager) Status() string {
 	for _, key := range keys {
 		vi := m.instances[key]
 		state := vi.getState()
-		sb.WriteString(fmt.Sprintf("  %s: state=%s, priority=%d, preempt=%t, interval=%ds\n",
+		sb.WriteString(fmt.Sprintf("  %s: state=%s, priority=%d, preempt=%t, interval=%dms\n",
 			vi.key(), state, vi.cfg.Priority, vi.cfg.Preempt, vi.cfg.AdvertiseInterval))
 		for _, vip := range vi.cfg.VirtualAddresses {
 			sb.WriteString(fmt.Sprintf("    VIP: %s\n", vip))

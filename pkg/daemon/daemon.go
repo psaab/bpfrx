@@ -3150,7 +3150,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// the returning high-priority node from preempting before it has
 			// session state, which would break all existing connections.
 			if time.Since(d.startTime) < 30*time.Second {
-				d.vrrpMgr.SetSyncHold(30 * time.Second)
+				d.vrrpMgr.SetSyncHold(10 * time.Second)
 			}
 
 			d.sessionSync.OnBulkSyncReceived = func() {
@@ -3282,11 +3282,11 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case ev := <-d.cluster.Events():
-			// Debounced VRRP priority update — 2s coalesce window.
+			// Debounced VRRP priority update — 500ms coalesce window.
 			if vrrpTimer != nil {
 				vrrpTimer.Stop()
 			}
-			vrrpTimer = time.AfterFunc(2*time.Second, func() {
+			vrrpTimer = time.AfterFunc(500*time.Millisecond, func() {
 				if cfg := d.store.ActiveConfig(); cfg != nil {
 					localPri := d.cluster.LocalPriorities()
 					var all []*vrrp.Instance

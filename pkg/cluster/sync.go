@@ -425,14 +425,21 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener) {
 }
 
 func (s *SessionSync) connectLoop(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(5 * time.Second):
+	for first := true; ; first = false {
+		if !first {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1 * time.Second):
+			}
 		}
 
 		if s.stats.Connected.Load() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1 * time.Second):
+			}
 			continue
 		}
 
