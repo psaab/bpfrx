@@ -27,6 +27,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:50051", "bpfrxd gRPC address")
+	cmdFlag := flag.String("c", "", "run a single command non-interactively and exit")
 	flag.Parse()
 
 	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -63,6 +64,18 @@ func main() {
 		configMode:    false,
 		clusterRole:   resp.ClusterRole,
 		clusterNodeID: resp.ClusterNodeId,
+	}
+
+	// Non-interactive mode: run single command and exit.
+	if *cmdFlag != "" {
+		c.startCmd()
+		err := c.dispatch(*cmdFlag)
+		c.endCmd()
+		if err != nil && err != errExit {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	rc := &remoteCompleter{ctl: c}
