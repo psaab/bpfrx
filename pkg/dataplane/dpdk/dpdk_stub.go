@@ -126,7 +126,13 @@ func (m *Manager) IterateSessions(_ func(dataplane.SessionKey, dataplane.Session
 	return nil
 }
 
+func (m *Manager) BatchIterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	return m.IterateSessions(fn)
+}
+
 func (m *Manager) DeleteSession(_ dataplane.SessionKey) error { return nil }
+
+func (m *Manager) BatchDeleteSessions(_ []dataplane.SessionKey) (int, error) { return 0, nil }
 
 func (m *Manager) SetSessionV4(_ dataplane.SessionKey, _ dataplane.SessionValue) error { return nil }
 
@@ -134,7 +140,13 @@ func (m *Manager) IterateSessionsV6(_ func(dataplane.SessionKeyV6, dataplane.Ses
 	return nil
 }
 
+func (m *Manager) BatchIterateSessionsV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return m.IterateSessionsV6(fn)
+}
+
 func (m *Manager) DeleteSessionV6(_ dataplane.SessionKeyV6) error { return nil }
+
+func (m *Manager) BatchDeleteSessionsV6(_ []dataplane.SessionKeyV6) (int, error) { return 0, nil }
 
 func (m *Manager) SetSessionV6(_ dataplane.SessionKeyV6, _ dataplane.SessionValueV6) error {
 	return nil

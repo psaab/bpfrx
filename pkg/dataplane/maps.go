@@ -3,9 +3,11 @@ package dataplane
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime"
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/bpfrx/pkg/config"
@@ -351,6 +353,90 @@ func (m *Manager) IterateSessionsV6(fn func(SessionKeyV6, SessionValueV6) bool) 
 		}
 	}
 	return iter.Err()
+}
+
+// BatchIterateSessions iterates sessions using batch lookup for reduced
+// kernel lock contention.  Yields between batches so BPF datapath isn't
+// starved of hash-table bucket locks.
+func (m *Manager) BatchIterateSessions(fn func(SessionKey, SessionValue) bool) error {
+	sm, ok := m.maps["sessions"]
+	if !ok {
+		return fmt.Errorf("sessions map not found")
+	}
+
+	const batchSize = 64
+	keys := make([]SessionKey, batchSize)
+	vals := make([]SessionValue, batchSize)
+	var cursor ebpf.MapBatchCursor
+
+	for {
+		n, err := sm.BatchLookup(&cursor, keys, vals, nil)
+		for i := 0; i < n; i++ {
+			if !fn(keys[i], vals[i]) {
+				return nil
+			}
+		}
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil // done
+		}
+		if err != nil {
+			return fmt.Errorf("batch lookup sessions: %w", err)
+		}
+		runtime.Gosched() // yield to reduce lock contention with BPF datapath
+	}
+}
+
+// BatchIterateSessionsV6 is the IPv6 variant of BatchIterateSessions.
+func (m *Manager) BatchIterateSessionsV6(fn func(SessionKeyV6, SessionValueV6) bool) error {
+	sm, ok := m.maps["sessions_v6"]
+	if !ok {
+		return fmt.Errorf("sessions_v6 map not found")
+	}
+
+	const batchSize = 64
+	keys := make([]SessionKeyV6, batchSize)
+	vals := make([]SessionValueV6, batchSize)
+	var cursor ebpf.MapBatchCursor
+
+	for {
+		n, err := sm.BatchLookup(&cursor, keys, vals, nil)
+		for i := 0; i < n; i++ {
+			if !fn(keys[i], vals[i]) {
+				return nil
+			}
+		}
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("batch lookup sessions_v6: %w", err)
+		}
+		runtime.Gosched()
+	}
+}
+
+// BatchDeleteSessions deletes multiple session entries in a single syscall.
+func (m *Manager) BatchDeleteSessions(keys []SessionKey) (int, error) {
+	sm, ok := m.maps["sessions"]
+	if !ok {
+		return 0, fmt.Errorf("sessions map not found")
+	}
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	return sm.BatchDelete(keys, nil)
+}
+
+// BatchDeleteSessionsV6 deletes multiple IPv6 session entries in a single syscall.
+func (m *Manager) BatchDeleteSessionsV6(keys []SessionKeyV6) (int, error) {
+	sm, ok := m.maps["sessions_v6"]
+	if !ok {
+		return 0, fmt.Errorf("sessions_v6 map not found")
+	}
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	return sm.BatchDelete(keys, nil)
 }
 
 // DeleteSessionV6 deletes an IPv6 session entry by key.

@@ -266,7 +266,8 @@ func (s *SessionSync) syncSweep() {
 	now := monotonicSeconds()
 	var count int
 
-	s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	// Batch iteration reduces kernel lock contention with BPF datapath
+	s.dp.BatchIterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -277,7 +278,7 @@ func (s *SessionSync) syncSweep() {
 		return true
 	})
 
-	s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	s.dp.BatchIterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
 		}

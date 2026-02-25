@@ -420,6 +420,14 @@ func (m *mockSweepDP) IterateSessionsV6(fn func(dataplane.SessionKeyV6, dataplan
 	return nil
 }
 
+func (m *mockSweepDP) BatchIterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	return m.IterateSessions(fn)
+}
+
+func (m *mockSweepDP) BatchIterateSessionsV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return m.IterateSessionsV6(fn)
+}
+
 func TestSyncSweepNewSessions(t *testing.T) {
 	now := monotonicSeconds()
 	dp := &mockSweepDP{

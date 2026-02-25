@@ -82,8 +82,8 @@ func (gc *GC) sweep() {
 	var toDelete []dataplane.SessionKey
 	var snatExpired []expiredSession
 
-	// IPv4 sessions
-	err := gc.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	// IPv4 sessions — batch iteration reduces kernel lock contention
+	err := gc.dp.BatchIterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		total++
 
 		// Only process forward entries to avoid double-counting
@@ -116,12 +116,19 @@ func (gc *GC) sweep() {
 		return
 	}
 
-	for i, key := range toDelete {
-		if err := gc.dp.DeleteSession(key); err != nil {
-			slog.Debug("conntrack GC delete failed", "err", err)
-		} else if i%2 == 0 && gc.OnDeleteV4 != nil {
-			// Only forward entries (even indices: forward at 0,2,4...; reverse at 1,3,5...)
-			gc.OnDeleteV4(key)
+	// Batch delete in chunks for fewer syscalls and reduced lock contention
+	const deleteBatch = 64
+	for i := 0; i < len(toDelete); i += deleteBatch {
+		end := i + deleteBatch
+		if end > len(toDelete) {
+			end = len(toDelete)
+		}
+		gc.dp.BatchDeleteSessions(toDelete[i:end])
+	}
+	// Fire delete callbacks for forward entries (even indices)
+	if gc.OnDeleteV4 != nil {
+		for i := 0; i < len(toDelete); i += 2 {
+			gc.OnDeleteV4(toDelete[i])
 		}
 	}
 
@@ -164,7 +171,7 @@ func (gc *GC) sweep() {
 	var toDeleteV6 []dataplane.SessionKeyV6
 	var snatExpiredV6 []expiredSessionV6
 
-	err = gc.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	err = gc.dp.BatchIterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		total++
 
 		if val.IsReverse != 0 {
@@ -191,11 +198,16 @@ func (gc *GC) sweep() {
 		slog.Error("conntrack GC v6 iteration failed", "err", err)
 	}
 
-	for i, key := range toDeleteV6 {
-		if err := gc.dp.DeleteSessionV6(key); err != nil {
-			slog.Debug("conntrack GC v6 delete failed", "err", err)
-		} else if i%2 == 0 && gc.OnDeleteV6 != nil {
-			gc.OnDeleteV6(key)
+	for i := 0; i < len(toDeleteV6); i += deleteBatch {
+		end := i + deleteBatch
+		if end > len(toDeleteV6) {
+			end = len(toDeleteV6)
+		}
+		gc.dp.BatchDeleteSessionsV6(toDeleteV6[i:end])
+	}
+	if gc.OnDeleteV6 != nil {
+		for i := 0; i < len(toDeleteV6); i += 2 {
+			gc.OnDeleteV6(toDeleteV6[i])
 		}
 	}
 

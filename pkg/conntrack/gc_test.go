@@ -59,6 +59,28 @@ func (m *mockGCDP) DeleteSessionV6(key dataplane.SessionKeyV6) error {
 	return nil
 }
 
+func (m *mockGCDP) BatchIterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	return m.IterateSessions(fn)
+}
+
+func (m *mockGCDP) BatchIterateSessionsV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return m.IterateSessionsV6(fn)
+}
+
+func (m *mockGCDP) BatchDeleteSessions(keys []dataplane.SessionKey) (int, error) {
+	for _, k := range keys {
+		m.DeleteSession(k)
+	}
+	return len(keys), nil
+}
+
+func (m *mockGCDP) BatchDeleteSessionsV6(keys []dataplane.SessionKeyV6) (int, error) {
+	for _, k := range keys {
+		m.DeleteSessionV6(k)
+	}
+	return len(keys), nil
+}
+
 func (m *mockGCDP) DeleteDNATEntry(_ dataplane.DNATKey) error       { return nil }
 func (m *mockGCDP) DeleteDNATEntryV6(_ dataplane.DNATKeyV6) error   { return nil }
 func (m *mockGCDP) GetPersistentNAT() *dataplane.PersistentNATTable { return nil }
