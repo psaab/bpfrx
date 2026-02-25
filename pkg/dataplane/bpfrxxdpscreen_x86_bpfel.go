@@ -141,11 +141,13 @@ type bpfrxXdpScreenFilterRule struct {
 }
 
 type bpfrxXdpScreenFloodState struct {
-	_           structs.HostLayout
-	SynCount    uint64
-	IcmpCount   uint64
-	UdpCount    uint64
-	WindowStart uint64
+	_              structs.HostLayout
+	SynCount       uint64
+	IcmpCount      uint64
+	UdpCount       uint64
+	WindowStart    uint64
+	SynproxyActive uint8
+	PadFs          [7]uint8
 }
 
 type bpfrxXdpScreenFlowConfig struct {
@@ -524,6 +526,19 @@ type bpfrxXdpScreenStaticNatValueV6 struct {
 	Ip [16]uint8
 }
 
+type bpfrxXdpScreenValidatedClientKey struct {
+	_       structs.HostLayout
+	SrcIp   uint32
+	DstIp   uint32
+	DstPort uint16
+	PadVck  uint16
+}
+
+type bpfrxXdpScreenValidatedClientValue struct {
+	_           structs.HostLayout
+	ValidatedAt uint64
+}
+
 type bpfrxXdpScreenVlanIfaceInfo struct {
 	_             structs.HostLayout
 	ParentIfindex uint32
@@ -643,6 +658,7 @@ type bpfrxXdpScreenMapSpecs struct {
 	StaticNatV6       *ebpf.MapSpec `ebpf:"static_nat_v6"`
 	TcProgs           *ebpf.MapSpec `ebpf:"tc_progs"`
 	TxPorts           *ebpf.MapSpec `ebpf:"tx_ports"`
+	ValidatedClients  *ebpf.MapSpec `ebpf:"validated_clients"`
 	VlanIfaceMap      *ebpf.MapSpec `ebpf:"vlan_iface_map"`
 	XdpProgs          *ebpf.MapSpec `ebpf:"xdp_progs"`
 	ZoneConfigs       *ebpf.MapSpec `ebpf:"zone_configs"`
@@ -724,6 +740,7 @@ type bpfrxXdpScreenMaps struct {
 	StaticNatV6       *ebpf.Map `ebpf:"static_nat_v6"`
 	TcProgs           *ebpf.Map `ebpf:"tc_progs"`
 	TxPorts           *ebpf.Map `ebpf:"tx_ports"`
+	ValidatedClients  *ebpf.Map `ebpf:"validated_clients"`
 	VlanIfaceMap      *ebpf.Map `ebpf:"vlan_iface_map"`
 	XdpProgs          *ebpf.Map `ebpf:"xdp_progs"`
 	ZoneConfigs       *ebpf.Map `ebpf:"zone_configs"`
@@ -781,6 +798,7 @@ func (m *bpfrxXdpScreenMaps) Close() error {
 		m.StaticNatV6,
 		m.TcProgs,
 		m.TxPorts,
+		m.ValidatedClients,
 		m.VlanIfaceMap,
 		m.XdpProgs,
 		m.ZoneConfigs,

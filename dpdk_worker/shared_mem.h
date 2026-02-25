@@ -324,6 +324,7 @@ struct app_value {
 #define SCREEN_WINNUKE         (1 << 11)
 #define SCREEN_IP_SOURCE_ROUTE (1 << 12)
 #define SCREEN_SYN_FRAG        (1 << 13)
+#define SCREEN_SYN_COOKIE      (1 << 14)
 
 struct screen_config {
 	uint32_t flags;
@@ -342,6 +343,8 @@ struct flood_state {
 	uint64_t icmp_count;
 	uint64_t udp_count;
 	uint64_t window_start;
+	uint8_t  synproxy_active;
+	uint8_t  pad_fs[7];
 };
 
 /* Per-source-IP tracking for port scan / IP sweep detection.

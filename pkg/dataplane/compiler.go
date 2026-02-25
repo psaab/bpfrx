@@ -2515,6 +2515,10 @@ func compileScreenProfiles(dp DataPlane,cfg *config.Config, result *CompileResul
 			if profile.TCP.SynFlood.Timeout > 0 {
 				sc.SynFloodTimeout = uint32(profile.TCP.SynFlood.Timeout)
 			}
+			// Enable SYN cookie mode when configured in flow settings
+			if cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie" {
+				flags |= ScreenSynCookie
+			}
 		}
 
 		// ICMP flags

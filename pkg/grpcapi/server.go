@@ -525,6 +525,10 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 		{dataplane.GlobalCtrScreenWinNuke, "winnuke"},
 		{dataplane.GlobalCtrScreenIPSrcRoute, "ip-source-route"},
 		{dataplane.GlobalCtrScreenSynFrag, "syn-fragment"},
+		{dataplane.GlobalCtrSyncookieSent, "syncookie-sent"},
+		{dataplane.GlobalCtrSyncookieValid, "syncookie-valid"},
+		{dataplane.GlobalCtrSyncookieInvalid, "syncookie-invalid"},
+		{dataplane.GlobalCtrSyncookieBypass, "syncookie-bypass"},
 	}
 	for _, sc := range screenCounters {
 		v := readCounter(sc.idx)

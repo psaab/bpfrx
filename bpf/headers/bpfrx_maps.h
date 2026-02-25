@@ -348,6 +348,15 @@ struct {
 	__type(value, struct flood_state);
 } flood_counters SEC(".maps");
 
+/* Validated SYN cookie clients -- sources that passed cookie challenge.
+ * LRU_HASH auto-evicts oldest entries when full. */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 65536);
+	__type(key, struct validated_client_key);
+	__type(value, struct validated_client_value);
+} validated_clients SEC(".maps");
+
 /* Per-source-IP tracking for port scan / IP sweep detection.
  * LRU_HASH auto-evicts oldest entries when full. */
 struct {

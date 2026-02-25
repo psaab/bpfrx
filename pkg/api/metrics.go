@@ -30,6 +30,7 @@ type bpfrxCollector struct {
 	natAllocFailsTotal   *prometheus.Desc
 	hostInboundDeny      *prometheus.Desc
 	tcEgressPacketsTotal *prometheus.Desc
+	syncookieTotal       *prometheus.Desc
 
 	// Interface counters
 	ifacePacketsTotal *prometheus.Desc
@@ -118,6 +119,11 @@ func newCollector(srv *Server) *bpfrxCollector {
 			"bpfrx_tc_egress_packets_total",
 			"Total TC egress packets processed.",
 			nil, nil,
+		),
+		syncookieTotal: prometheus.NewDesc(
+			"bpfrx_screen_syncookie_total",
+			"SYN cookie counters by type.",
+			[]string{"type"}, nil,
 		),
 		ifacePacketsTotal: prometheus.NewDesc(
 			"bpfrx_interface_packets_total",
@@ -243,6 +249,7 @@ func (c *bpfrxCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.natAllocFailsTotal
 	ch <- c.hostInboundDeny
 	ch <- c.tcEgressPacketsTotal
+	ch <- c.syncookieTotal
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.zonePacketsTotal
@@ -310,6 +317,16 @@ func (c *bpfrxCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp d
 		readCounter(dataplane.GlobalCtrHostInboundDeny))
 	ch <- prometheus.MustNewConstMetric(c.tcEgressPacketsTotal, prometheus.CounterValue,
 		readCounter(dataplane.GlobalCtrTCEgressPackets))
+
+	// SYN cookie counters
+	ch <- prometheus.MustNewConstMetric(c.syncookieTotal, prometheus.CounterValue,
+		readCounter(dataplane.GlobalCtrSyncookieSent), "sent")
+	ch <- prometheus.MustNewConstMetric(c.syncookieTotal, prometheus.CounterValue,
+		readCounter(dataplane.GlobalCtrSyncookieValid), "valid")
+	ch <- prometheus.MustNewConstMetric(c.syncookieTotal, prometheus.CounterValue,
+		readCounter(dataplane.GlobalCtrSyncookieInvalid), "invalid")
+	ch <- prometheus.MustNewConstMetric(c.syncookieTotal, prometheus.CounterValue,
+		readCounter(dataplane.GlobalCtrSyncookieBypass), "bypass")
 }
 
 func (c *bpfrxCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {

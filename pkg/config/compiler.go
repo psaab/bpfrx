@@ -2033,6 +2033,13 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 		sec.Flow.PowerModeDisable = true
 	}
 
+	// syn-flood-protection-mode
+	if spNode := node.FindChild("syn-flood-protection-mode"); spNode != nil {
+		if len(spNode.Keys) >= 2 {
+			sec.Flow.SynFloodProtectionMode = spNode.Keys[1]
+		}
+	}
+
 	// traceoptions
 	if toNode := node.FindChild("traceoptions"); toNode != nil {
 		to := &FlowTraceoptions{}

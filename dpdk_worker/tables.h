@@ -77,7 +77,11 @@
 #define GLOBAL_CTR_SCREEN_IP_SRC_ROUTE 24
 #define GLOBAL_CTR_SCREEN_SYN_FRAG    25
 #define GLOBAL_CTR_FABRIC_REDIRECT    26
-#define GLOBAL_CTR_MAX                27
+#define GLOBAL_CTR_SYNCOOKIE_SENT     27
+#define GLOBAL_CTR_SYNCOOKIE_VALID    28
+#define GLOBAL_CTR_SYNCOOKIE_INVALID  29
+#define GLOBAL_CTR_SYNCOOKIE_BYPASS   30
+#define GLOBAL_CTR_MAX                31
 
 /* ============================================================
  * RX mode constants

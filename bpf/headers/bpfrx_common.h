@@ -260,7 +260,11 @@ struct icmp6hdr {
 #define GLOBAL_CTR_SCREEN_IP_SRC_ROUTE   24
 #define GLOBAL_CTR_SCREEN_SYN_FRAG       25
 #define GLOBAL_CTR_FABRIC_REDIRECT       26
-#define GLOBAL_CTR_MAX                   27
+#define GLOBAL_CTR_SYNCOOKIE_SENT        27
+#define GLOBAL_CTR_SYNCOOKIE_VALID       28
+#define GLOBAL_CTR_SYNCOOKIE_INVALID     29
+#define GLOBAL_CTR_SYNCOOKIE_BYPASS      30
+#define GLOBAL_CTR_MAX                   31
 
 /* Flow timeout indices for flow_timeouts ARRAY map */
 #define FLOW_TIMEOUT_TCP_ESTABLISHED   0
@@ -287,6 +291,7 @@ struct icmp6hdr {
 #define SCREEN_WINNUKE           (1 << 11)
 #define SCREEN_IP_SOURCE_ROUTE   (1 << 12)
 #define SCREEN_SYN_FRAG          (1 << 13)
+#define SCREEN_SYN_COOKIE        (1 << 14)
 
 /* Host-inbound-traffic service flags (zone_config.host_inbound_flags) */
 #define HOST_INBOUND_SSH         (1 << 0)
@@ -515,6 +520,22 @@ struct flood_state {
 	__u64 icmp_count;
 	__u64 udp_count;
 	__u64 window_start;       /* ktime_ns / 1e9 (seconds) */
+	__u8  synproxy_active;    /* 1 when syn-cookie mode active for zone */
+	__u8  pad_fs[7];
+};
+
+/* Validated SYN cookie client tracking.
+ * Source IPs that passed cookie validation are remembered in an LRU map
+ * so subsequent SYNs bypass the challenge during an active flood. */
+struct validated_client_key {
+	__be32 src_ip;       /* IPv4 addr (or XOR hash of IPv6) */
+	__be32 dst_ip;
+	__be16 dst_port;
+	__u16  pad_vck;
+};
+
+struct validated_client_value {
+	__u64 validated_at;  /* ktime_ns / 1e9 */
 };
 
 /* Per-source-IP tracking for port scan / IP sweep detection.

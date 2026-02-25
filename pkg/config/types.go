@@ -692,15 +692,16 @@ type SecurityConfig struct {
 // FlowConfig holds flow/session timeout configuration.
 type FlowConfig struct {
 	TCPSession                 *TCPSessionConfig
-	UDPSessionTimeout          int // seconds, 0 = default (60s)
-	ICMPSessionTimeout         int // seconds, 0 = default (30s)
-	TCPMSSIPsecVPN             int // TCP MSS clamp for IPsec VPN traffic (0 = disabled)
-	TCPMSSGreIn                int // TCP MSS clamp for GRE ingress traffic (0 = disabled)
-	TCPMSSGreOut               int // TCP MSS clamp for GRE egress traffic (0 = disabled)
+	UDPSessionTimeout          int    // seconds, 0 = default (60s)
+	ICMPSessionTimeout         int    // seconds, 0 = default (30s)
+	TCPMSSIPsecVPN             int    // TCP MSS clamp for IPsec VPN traffic (0 = disabled)
+	TCPMSSGreIn                int    // TCP MSS clamp for GRE ingress traffic (0 = disabled)
+	TCPMSSGreOut               int    // TCP MSS clamp for GRE egress traffic (0 = disabled)
 	AllowDNSReply              bool
 	AllowEmbeddedICMP          bool
 	GREPerformanceAcceleration bool
 	PowerModeDisable           bool
+	SynFloodProtectionMode     string // "syn-cookie" or "" (default = drop)
 	Traceoptions               *FlowTraceoptions
 }
 

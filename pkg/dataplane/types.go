@@ -243,7 +243,11 @@ const (
 	GlobalCtrScreenIPSrcRoute  = 24
 	GlobalCtrScreenSynFrag     = 25
 	GlobalCtrFabricRedirect    = 26
-	GlobalCtrMax               = 27
+	GlobalCtrSyncookieSent     = 27
+	GlobalCtrSyncookieValid    = 28
+	GlobalCtrSyncookieInvalid  = 29
+	GlobalCtrSyncookieBypass   = 30
+	GlobalCtrMax               = 31
 )
 
 // Host-inbound-traffic service flags (bitmap in zone_config.host_inbound_flags).
@@ -541,10 +545,12 @@ type ScreenConfig struct {
 
 // FloodState mirrors the C struct flood_state.
 type FloodState struct {
-	SynCount    uint64
-	ICMPCount   uint64
-	UDPCount    uint64
-	WindowStart uint64
+	SynCount       uint64
+	ICMPCount      uint64
+	UDPCount       uint64
+	WindowStart    uint64
+	SynproxyActive uint8
+	PadFS          [7]uint8
 }
 
 // Screen flag constants -- must match C SCREEN_* defines.
@@ -563,6 +569,7 @@ const (
 	ScreenWinNuke       = 1 << 11
 	ScreenIPSourceRoute = 1 << 12
 	ScreenSynFrag       = 1 << 13
+	ScreenSynCookie     = 1 << 14
 )
 
 // ScreenFlagNames maps screen flag values to human-readable names.
@@ -581,6 +588,7 @@ var ScreenFlagNames = map[uint32]string{
 	ScreenWinNuke:       "WinNuke",
 	ScreenIPSourceRoute: "IP source-route",
 	ScreenSynFrag:       "SYN fragment",
+	ScreenSynCookie:     "SYN cookie",
 }
 
 // Per-rule logging flags (matches C LOG_FLAG_* defines).
