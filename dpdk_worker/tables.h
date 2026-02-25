@@ -27,7 +27,7 @@
 #define MAX_RULES_PER_POLICY   256
 #define MAX_SESSIONS           1048576  /* 1M sessions */
 #define MAX_NAT_POOLS          32
-#define MAX_NAT_POOL_IPS       256
+#define MAX_NAT_POOL_IPS       8192  /* MAX_NAT_POOLS * MAX_NAT_POOL_IPS_PER_POOL */
 #define MAX_NAT_RULE_COUNTERS  256
 #define MAX_ADDRESSES          8192
 #define MAX_APPLICATIONS       1024

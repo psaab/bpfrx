@@ -239,7 +239,61 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 						if (pool_id < MAX_NAT_POOLS) {
 							struct nat_pool_config *cfg =
 								&ctx->shm->nat_pool_configs[pool_id];
-							if (cfg->num_ips > 0) {
+							if (cfg->deterministic && cfg->block_size > 0 &&
+							    cfg->blocks_per_ip > 0) {
+								/* Deterministic NAT (CGNAT) */
+								uint32_t src_h = rte_be_to_cpu_32(meta->src_ip.v4);
+								uint32_t base_h = rte_be_to_cpu_32(cfg->host_base);
+								if (src_h >= base_h) {
+									uint32_t sub_idx = src_h - base_h;
+									if (sub_idx < cfg->host_count) {
+										uint32_t ip_idx = sub_idx / cfg->blocks_per_ip;
+										uint32_t block_idx = sub_idx % cfg->blocks_per_ip;
+										if (ip_idx < cfg->num_ips) {
+											uint32_t map_idx =
+												pool_id * MAX_NAT_POOL_IPS_PER_POOL + ip_idx;
+											if (map_idx < MAX_NAT_POOL_IPS) {
+												uint32_t alloc_ip =
+													ctx->shm->nat_pool_ips_v4[map_idx];
+												if (alloc_ip != 0) {
+													uint32_t port_start = cfg->port_low +
+														block_idx * cfg->block_size;
+													uint32_t offset =
+														(uint32_t)(ctx->snat_port_counter++) %
+														cfg->block_size;
+													uint16_t port =
+														(uint16_t)(port_start + offset);
+													if (port <= cfg->port_high) {
+														meta->nat_src_ip.v4 = alloc_ip;
+														meta->nat_src_port =
+															rte_cpu_to_be_16(port);
+														meta->nat_flags |= SESS_FLAG_SNAT;
+														ctr_nat_port_alloc(ctx, pool_id);
+														/* Insert return-path DNAT entry */
+														if (ctx->shm->dnat_table &&
+														    ctx->shm->dnat_values) {
+															struct dnat_key rdk = {
+																.protocol = meta->protocol,
+																.dst_ip = alloc_ip,
+																.dst_port = rte_cpu_to_be_16(port),
+															};
+															int rdpos = rte_hash_add_key(
+																ctx->shm->dnat_table, &rdk);
+															if (rdpos >= 0) {
+																struct dnat_value *rdv =
+																	&ctx->shm->dnat_values[rdpos];
+																rdv->new_dst_ip = meta->src_ip.v4;
+																rdv->new_dst_port = meta->src_port;
+																rdv->flags = 0;
+															}
+														}
+													}
+												}
+											}
+										}
+									}
+								}
+							} else if (cfg->num_ips > 0) {
 								uint32_t port_range =
 									cfg->port_high - cfg->port_low + 1;
 								if (port_range == 0)

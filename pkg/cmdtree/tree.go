@@ -283,6 +283,9 @@ var OperationalTree = map[string]*Node{
 						"detail": {Desc: "Show detailed source NAT rules"},
 					}},
 					"rule-set":             {Desc: "Show source NAT rule sets"},
+					"deterministic-nat": {Desc: "Show deterministic NAT information", Children: map[string]*Node{
+						"nat-table": {Desc: "Show deterministic NAT mapping table"},
+					}},
 				}},
 				"destination": {Desc: "Show destination NAT", Children: map[string]*Node{
 					"summary":  {Desc: "Show destination NAT summary"},

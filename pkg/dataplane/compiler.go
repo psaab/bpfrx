@@ -1841,6 +1841,22 @@ func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 				if poolCfg.PortHigh == 0 {
 					poolCfg.PortHigh = 65535
 				}
+
+				// Compile deterministic NAT fields
+				if pool.Deterministic != nil {
+					_, hostNet, err := net.ParseCIDR(pool.Deterministic.HostAddress)
+					if err == nil {
+						ones, bits := hostNet.Mask.Size()
+						hostCount := uint32(1) << uint(bits-ones)
+						portRange := int(poolCfg.PortHigh) - int(poolCfg.PortLow) + 1
+
+						poolCfg.Deterministic = 1
+						poolCfg.BlockSize = uint16(pool.Deterministic.BlockSize)
+						poolCfg.HostBase = ipToUint32BE(hostNet.IP.To4())
+						poolCfg.HostCount = hostCount
+						poolCfg.BlocksPerIP = uint16(portRange / pool.Deterministic.BlockSize)
+					}
+				}
 			}
 
 			// Write pool IPs to maps

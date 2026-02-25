@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"strconv"
@@ -1391,6 +1392,48 @@ func parseZoneList(node *Node) []string {
 	return zones
 }
 
+// expandAddressRange expands "low/mask to high/mask" into individual IP strings.
+// Both low and high must be /32 CIDRs. Max 256 IPs.
+func expandAddressRange(low, high string) ([]string, error) {
+	lowCIDR := low
+	if !strings.Contains(lowCIDR, "/") {
+		lowCIDR += "/32"
+	}
+	highCIDR := high
+	if !strings.Contains(highCIDR, "/") {
+		highCIDR += "/32"
+	}
+	lowIP, _, err := net.ParseCIDR(lowCIDR)
+	if err != nil {
+		return nil, fmt.Errorf("invalid low address %q: %w", low, err)
+	}
+	highIP, _, err := net.ParseCIDR(highCIDR)
+	if err != nil {
+		return nil, fmt.Errorf("invalid high address %q: %w", high, err)
+	}
+	lowIP = lowIP.To4()
+	highIP = highIP.To4()
+	if lowIP == nil || highIP == nil {
+		return nil, fmt.Errorf("address range only supports IPv4")
+	}
+	lowN := binary.BigEndian.Uint32(lowIP)
+	highN := binary.BigEndian.Uint32(highIP)
+	if lowN > highN {
+		return nil, fmt.Errorf("low address %s > high address %s", low, high)
+	}
+	count := highN - lowN + 1
+	if count > 256 {
+		return nil, fmt.Errorf("address range too large: %d IPs (max 256)", count)
+	}
+	var result []string
+	buf := make(net.IP, 4)
+	for i := uint32(0); i < count; i++ {
+		binary.BigEndian.PutUint32(buf, lowN+i)
+		result = append(result, buf.String()+"/32")
+	}
+	return result, nil
+}
+
 func compileNATSource(node *Node, sec *SecurityConfig) error {
 	// Global flags
 	if node.FindChild("address-persistent") != nil {
@@ -1404,8 +1447,27 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "address":
-				if v := nodeVal(prop); v != "" {
+				// Check for address range: "addr1 to addr2"
+				if len(prop.Keys) >= 4 && prop.Keys[2] == "to" {
+					expanded, err := expandAddressRange(prop.Keys[1], prop.Keys[3])
+					if err != nil {
+						return fmt.Errorf("pool %q address range: %w", pool.Name, err)
+					}
+					pool.Addresses = append(pool.Addresses, expanded...)
+				} else if v := nodeVal(prop); v != "" {
 					pool.Addresses = append(pool.Addresses, v)
+				}
+				// Also handle children for hierarchical syntax
+				for _, addrChild := range prop.Children {
+					if len(addrChild.Keys) >= 3 && addrChild.Keys[1] == "to" {
+						expanded, err := expandAddressRange(addrChild.Keys[0], addrChild.Keys[2])
+						if err != nil {
+							return fmt.Errorf("pool %q address range: %w", pool.Name, err)
+						}
+						pool.Addresses = append(pool.Addresses, expanded...)
+					} else if addrChild.IsLeaf && len(addrChild.Keys) >= 1 {
+						pool.Addresses = append(pool.Addresses, addrChild.Keys[0])
+					}
 				}
 			case "port":
 				// "port range low N high M" or "port N"
@@ -1422,6 +1484,64 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 						pool.PortLow = n
 						pool.PortHigh = n
 					}
+				}
+				// Check for deterministic port config (hierarchical)
+				for _, portChild := range prop.Children {
+					if portChild.Name() == "deterministic" {
+						detCfg := &DeterministicNATConfig{}
+						for _, detProp := range portChild.Children {
+							switch detProp.Name() {
+							case "block-size":
+								if v := nodeVal(detProp); v != "" {
+									if n, err := strconv.Atoi(v); err == nil {
+										detCfg.BlockSize = n
+									}
+								}
+							case "host":
+								// "host address 100.64.0.0/22"
+								if len(detProp.Keys) >= 3 && detProp.Keys[1] == "address" {
+									detCfg.HostAddress = detProp.Keys[2]
+								} else if v := nodeVal(detProp); v != "" {
+									detCfg.HostAddress = v
+								}
+								for _, hc := range detProp.Children {
+									if hc.Name() == "address" {
+										if v := nodeVal(hc); v != "" {
+											detCfg.HostAddress = v
+										}
+									}
+								}
+							}
+						}
+						pool.Deterministic = detCfg
+					}
+				}
+				// Flat set: "port deterministic block-size 2016"
+				if len(prop.Keys) >= 2 && prop.Keys[1] == "deterministic" {
+					detCfg := &DeterministicNATConfig{}
+					for i := 2; i < len(prop.Keys); i++ {
+						if prop.Keys[i] == "block-size" && i+1 < len(prop.Keys) {
+							if n, err := strconv.Atoi(prop.Keys[i+1]); err == nil {
+								detCfg.BlockSize = n
+							}
+						}
+					}
+					// host address from children
+					for _, portChild := range prop.Children {
+						if portChild.Name() == "host" {
+							if len(portChild.Keys) >= 3 && portChild.Keys[1] == "address" {
+								detCfg.HostAddress = portChild.Keys[2]
+							}
+							for _, hc := range portChild.Children {
+								if hc.Name() == "address" {
+									if v := nodeVal(hc); v != "" {
+										detCfg.HostAddress = v
+									}
+								}
+							}
+						}
+					}
+					pool.Deterministic = detCfg
 				}
 			case "persistent-nat":
 				pnat := &PersistentNATConfig{InactivityTimeout: 300}
@@ -1449,6 +1569,84 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 			pool.PortHigh = 65535
 		}
 		sec.NAT.SourcePools[pool.Name] = pool
+	}
+
+	// Parse pool-utilization-alarm
+	if alarmNode := node.FindChild("pool-utilization-alarm"); alarmNode != nil {
+		alarm := &PoolUtilizationAlarmConfig{}
+		for _, ap := range alarmNode.Children {
+			switch ap.Name() {
+			case "raise-threshold":
+				if v := nodeVal(ap); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						alarm.RaiseThreshold = n
+					}
+				}
+			case "clear-threshold":
+				if v := nodeVal(ap); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						alarm.ClearThreshold = n
+					}
+				}
+			}
+		}
+		// Also handle flat keys: pool-utilization-alarm raise-threshold 80 clear-threshold 70
+		for i := 1; i < len(alarmNode.Keys); i++ {
+			if alarmNode.Keys[i] == "raise-threshold" && i+1 < len(alarmNode.Keys) {
+				if n, err := strconv.Atoi(alarmNode.Keys[i+1]); err == nil {
+					alarm.RaiseThreshold = n
+				}
+			}
+			if alarmNode.Keys[i] == "clear-threshold" && i+1 < len(alarmNode.Keys) {
+				if n, err := strconv.Atoi(alarmNode.Keys[i+1]); err == nil {
+					alarm.ClearThreshold = n
+				}
+			}
+		}
+		sec.NAT.PoolUtilizationAlarm = alarm
+	}
+
+	// Validate deterministic NAT pools
+	for _, pool := range sec.NAT.SourcePools {
+		if pool.Deterministic == nil {
+			continue
+		}
+		det := pool.Deterministic
+		if det.BlockSize <= 0 {
+			return fmt.Errorf("pool %q: deterministic block-size must be > 0", pool.Name)
+		}
+		if det.HostAddress == "" {
+			return fmt.Errorf("pool %q: deterministic host address required", pool.Name)
+		}
+		_, hostNet, err := net.ParseCIDR(det.HostAddress)
+		if err != nil {
+			return fmt.Errorf("pool %q: invalid host address %q: %w", pool.Name, det.HostAddress, err)
+		}
+		ones, bits := hostNet.Mask.Size()
+		hostCount := 1 << uint(bits-ones)
+		portLow := pool.PortLow
+		if portLow == 0 {
+			portLow = 1024
+		}
+		portHigh := pool.PortHigh
+		if portHigh == 0 {
+			portHigh = 65535
+		}
+		portRange := portHigh - portLow + 1
+		if det.BlockSize > portRange {
+			return fmt.Errorf("pool %q: block-size %d exceeds port range %d", pool.Name, det.BlockSize, portRange)
+		}
+		blocksPerIP := portRange / det.BlockSize
+		totalBlocks := len(pool.Addresses) * blocksPerIP
+		if totalBlocks < hostCount {
+			return fmt.Errorf("pool %q: insufficient capacity (%d blocks) for %d subscribers", pool.Name, totalBlocks, hostCount)
+		}
+		if pool.PersistentNAT != nil {
+			return fmt.Errorf("pool %q: deterministic and persistent-nat are mutually exclusive", pool.Name)
+		}
+		if sec.NAT.AddressPersistent {
+			return fmt.Errorf("pool %q: deterministic and address-persistent are mutually exclusive", pool.Name)
+		}
 	}
 
 	// Parse source NAT rule-sets

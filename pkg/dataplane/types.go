@@ -378,7 +378,12 @@ type NATPoolConfig struct {
 	PortLow        uint16
 	PortHigh       uint16
 	AddrPersistent uint8
-	Pad            [3]uint8
+	Deterministic  uint8
+	BlockSize      uint16
+	HostBase       uint32 // network byte order
+	HostCount      uint32
+	BlocksPerIP    uint16
+	Pad2           [2]uint8
 }
 
 type NATPoolIPV6 struct {
@@ -389,7 +394,7 @@ type NATPortCounter struct {
 	Counter uint64
 }
 
-const MaxNATPoolIPsPerPool = 8
+const MaxNATPoolIPsPerPool = 256
 const MaxNATRuleCounters = 256
 const SNATModeOff = 0xFF // source-nat off: match but don't translate
 

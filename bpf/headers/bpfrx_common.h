@@ -146,7 +146,7 @@ struct icmp6hdr {
 #define MAX_RULES_PER_POLICY   256
 #define MAX_SESSIONS           10000000 /* 10M sessions */
 #define MAX_NAT_POOLS          32
-#define MAX_NAT_POOL_IPS       256
+#define MAX_NAT_POOL_IPS       8192  /* MAX_NAT_POOLS * MAX_NAT_POOL_IPS_PER_POOL */
 #define MAX_NAT_RULE_COUNTERS  256
 #define MAX_ADDRESSES          8192
 #define MAX_APPLICATIONS       1024
@@ -555,7 +555,7 @@ struct scan_track_value {
  * NAT pool configuration
  * ============================================================ */
 
-#define MAX_NAT_POOL_IPS_PER_POOL  8  /* max IPs per individual pool */
+#define MAX_NAT_POOL_IPS_PER_POOL  256  /* max IPs per individual pool (CGNAT pools may have 125+) */
 
 struct nat_pool_config {
 	__u16 num_ips;        /* number of v4 IPs in this pool */
@@ -563,7 +563,12 @@ struct nat_pool_config {
 	__u16 port_low;       /* default 1024 */
 	__u16 port_high;      /* default 65535 */
 	__u8  addr_persistent; /* same src IP always maps to same pool IP */
-	__u8  pad[3];
+	__u8  deterministic;  /* 1 = CGNAT deterministic mode */
+	__u16 block_size;     /* ports per subscriber (deterministic) */
+	__be32 host_base;     /* subscriber range base IP (deterministic) */
+	__u32 host_count;     /* number of subscriber IPs (deterministic) */
+	__u16 blocks_per_ip;  /* precomputed port_range / block_size */
+	__u8  pad2[2];
 };
 
 struct nat_pool_ip_v6 {

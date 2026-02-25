@@ -364,7 +364,7 @@ struct scan_track_value {
  * NAT (matches bpfrx_maps.h)
  * ============================================================ */
 
-#define MAX_NAT_POOL_IPS_PER_POOL 8
+#define MAX_NAT_POOL_IPS_PER_POOL 256
 #define SNAT_MODE_OFF             0xFF
 #define MAX_SNAT_RULES_PER_PAIR   8
 
@@ -374,7 +374,12 @@ struct nat_pool_config {
 	uint16_t port_low;
 	uint16_t port_high;
 	uint8_t  addr_persistent;
-	uint8_t  pad[3];
+	uint8_t  deterministic;   /* 1 = CGNAT deterministic mode */
+	uint16_t block_size;      /* ports per subscriber */
+	uint32_t host_base;       /* subscriber range base IP (network byte order) */
+	uint32_t host_count;      /* number of subscriber IPs */
+	uint16_t blocks_per_ip;   /* precomputed port_range / block_size */
+	uint8_t  pad2[2];
 };
 
 struct nat_pool_ip_v6 {

@@ -383,6 +383,57 @@ nat_pool_alloc_v6(__u8 pool_id, __u8 *src_ip, __u8 *out_ip, __be16 *out_port)
 }
 
 /*
+ * Deterministic NAT (CGNAT) port allocation for IPv4.
+ * Each subscriber from the host range gets a fixed block of ports
+ * on a deterministic public IP — no per-session state needed for
+ * reverse mapping.  Algorithm: RFC-compliant CGNAT block allocation.
+ */
+static __noinline int
+nat_pool_alloc_deterministic_v4(__u8 pool_id, __be32 src_ip,
+				__be32 *out_ip, __be16 *out_port)
+{
+	__u32 pid = pool_id;
+	struct nat_pool_config *cfg = bpf_map_lookup_elem(&nat_pool_configs, &pid);
+	if (!cfg || !cfg->num_ips || !cfg->block_size || !cfg->blocks_per_ip)
+		return -1;
+
+	__u32 src_h  = bpf_ntohl(src_ip);
+	__u32 base_h = bpf_ntohl(cfg->host_base);
+	if (src_h < base_h)
+		return -1;
+	__u32 sub_idx = src_h - base_h;
+	if (sub_idx >= cfg->host_count)
+		return -1;
+
+	__u32 bpi = cfg->blocks_per_ip;
+	__u32 ip_idx    = sub_idx / bpi;
+	__u32 block_idx = sub_idx % bpi;
+	if (ip_idx >= cfg->num_ips)
+		return -1;
+
+	__u32 map_idx = pid * MAX_NAT_POOL_IPS_PER_POOL + ip_idx;
+	if (map_idx >= MAX_NAT_POOL_IPS)
+		return -1;
+	__be32 *ip = bpf_map_lookup_elem(&nat_pool_ips_v4, &map_idx);
+	if (!ip || !*ip)
+		return -1;
+
+	struct nat_port_counter *ctr = bpf_map_lookup_elem(&nat_port_counters, &pid);
+	if (!ctr)
+		return -1;
+
+	__u32 port_start = cfg->port_low + block_idx * cfg->block_size;
+	__u32 offset = (__u32)(ctr->counter++) % cfg->block_size;
+	__u16 port = (__u16)(port_start + offset);
+	if (port > cfg->port_high)
+		return -1;
+
+	*out_ip  = *ip;
+	*out_port = bpf_htons(port);
+	return 0;
+}
+
+/*
  * Send a TCP RST reply for IPv4 REJECT action.
  * Swaps MACs, IPs, ports, sets RST flag, recomputes checksums.
  * Returns XDP_TX to send the packet back out the ingress interface.
@@ -1087,9 +1138,22 @@ int xdp_policy_prog(struct xdp_md *ctx)
 						__be32 alloc_ip = 0;
 						__be16 alloc_port = 0;
 
+						__u32 _pid = sv->mode;
+						struct nat_pool_config *_pcfg =
+							bpf_map_lookup_elem(&nat_pool_configs, &_pid);
+
 						#pragma unroll
 						for (int retry = 0; retry < 3; retry++) {
-							if (nat_pool_alloc_v4(sv->mode, meta->src_ip.v4, &alloc_ip, &alloc_port) < 0)
+							int rc;
+							if (_pcfg && _pcfg->deterministic)
+								rc = nat_pool_alloc_deterministic_v4(
+									sv->mode, meta->src_ip.v4,
+									&alloc_ip, &alloc_port);
+							else
+								rc = nat_pool_alloc_v4(
+									sv->mode, meta->src_ip.v4,
+									&alloc_ip, &alloc_port);
+							if (rc < 0)
 								break;
 
 							struct dnat_key dk = {

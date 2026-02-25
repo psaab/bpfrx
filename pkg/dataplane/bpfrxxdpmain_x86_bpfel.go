@@ -249,7 +249,12 @@ type bpfrxXdpMainNatPoolConfig struct {
 	PortLow        uint16
 	PortHigh       uint16
 	AddrPersistent uint8
-	Pad            [3]uint8
+	Deterministic  uint8
+	BlockSize      uint16
+	HostBase       uint32
+	HostCount      uint32
+	BlocksPerIp    uint16
+	Pad2           [2]uint8
 }
 
 type bpfrxXdpMainNatPoolIpV6 struct {

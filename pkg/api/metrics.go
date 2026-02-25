@@ -56,8 +56,9 @@ type bpfrxCollector struct {
 	gcSweepDuration     *prometheus.Desc
 
 	// NAT pool utilization
-	natPoolUsedPorts  *prometheus.Desc
-	natPoolTotalPorts *prometheus.Desc
+	natPoolUsedPorts         *prometheus.Desc
+	natPoolTotalPorts        *prometheus.Desc
+	natPoolDeterministicInfo *prometheus.Desc
 
 	// DHCP lease gauge
 	dhcpLeasesActive *prometheus.Desc
@@ -200,6 +201,11 @@ func newCollector(srv *Server) *bpfrxCollector {
 			"Total available ports in a NAT pool.",
 			[]string{"pool"}, nil,
 		),
+		natPoolDeterministicInfo: prometheus.NewDesc(
+			"bpfrx_nat_pool_deterministic_info",
+			"Deterministic NAT pool configuration (1 = enabled).",
+			[]string{"pool", "block_size", "host_count"}, nil,
+		),
 		dhcpLeasesActive: prometheus.NewDesc(
 			"bpfrx_dhcp_leases_active",
 			"Number of active DHCP leases.",
@@ -265,6 +271,7 @@ func (c *bpfrxCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.gcSweepDuration
 	ch <- c.natPoolUsedPorts
 	ch <- c.natPoolTotalPorts
+	ch <- c.natPoolDeterministicInfo
 	ch <- c.dhcpLeasesActive
 	ch <- c.sysCPUUser
 	ch <- c.sysCPUSystem
@@ -544,6 +551,18 @@ func (c *bpfrxCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp d
 				ch <- prometheus.MustNewConstMetric(c.natPoolUsedPorts, prometheus.GaugeValue,
 					float64(cnt), name)
 			}
+		}
+
+		if pool.Deterministic != nil {
+			hostCount := 0
+			if _, n, err := net.ParseCIDR(pool.Deterministic.HostAddress); err == nil {
+				ones, bits := n.Mask.Size()
+				hostCount = 1 << uint(bits-ones)
+			}
+			ch <- prometheus.MustNewConstMetric(c.natPoolDeterministicInfo, prometheus.GaugeValue,
+				1.0, name,
+				strconv.Itoa(pool.Deterministic.BlockSize),
+				strconv.Itoa(hostCount))
 		}
 	}
 }

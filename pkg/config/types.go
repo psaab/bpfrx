@@ -835,13 +835,20 @@ type PolicyLog struct {
 
 // NATConfig holds NAT configuration.
 type NATConfig struct {
-	Source            []*NATRuleSet
-	SourcePools       map[string]*NATPool    // named source NAT pools
-	AddressPersistent bool                   // source { address-persistent; }
-	Destination       *DestinationNATConfig
-	Static            []*StaticNATRuleSet
-	NAT64             []*NAT64RuleSet
-	NATv6v4           *NATv6v4Config         // natv6v4 options
+	Source               []*NATRuleSet
+	SourcePools          map[string]*NATPool    // named source NAT pools
+	AddressPersistent    bool                   // source { address-persistent; }
+	Destination          *DestinationNATConfig
+	Static               []*StaticNATRuleSet
+	NAT64                []*NAT64RuleSet
+	NATv6v4              *NATv6v4Config         // natv6v4 options
+	PoolUtilizationAlarm *PoolUtilizationAlarmConfig
+}
+
+// PoolUtilizationAlarmConfig configures NAT pool utilization alarms.
+type PoolUtilizationAlarmConfig struct {
+	RaiseThreshold int
+	ClearThreshold int
 }
 
 // NATv6v4Config holds NAT64 v6-to-v4 translation options.
@@ -923,12 +930,19 @@ type NATPool struct {
 	PortLow       int      // source pool port range low (default 1024)
 	PortHigh      int      // source pool port range high (default 65535)
 	PersistentNAT *PersistentNATConfig
+	Deterministic *DeterministicNATConfig
 }
 
 // PersistentNATConfig configures persistent NAT bindings for a pool.
 type PersistentNATConfig struct {
 	PermitAnyRemoteHost bool
 	InactivityTimeout   int // seconds (default 300)
+}
+
+// DeterministicNATConfig configures CGNAT deterministic port allocation.
+type DeterministicNATConfig struct {
+	BlockSize   int    // port block size per subscriber (e.g. 2016)
+	HostAddress string // subscriber CIDR (e.g. "100.64.0.0/22")
 }
 
 // StaticNATRule is a 1:1 bidirectional NAT rule.

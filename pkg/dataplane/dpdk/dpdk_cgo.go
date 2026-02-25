@@ -848,6 +848,11 @@ func (m *Manager) SetNATPoolConfig(poolID uint32, cfg dataplane.NATPoolConfig) e
 	ptr.port_low = C.uint16_t(cfg.PortLow)
 	ptr.port_high = C.uint16_t(cfg.PortHigh)
 	ptr.addr_persistent = C.uint8_t(cfg.AddrPersistent)
+	ptr.deterministic = C.uint8_t(cfg.Deterministic)
+	ptr.block_size = C.uint16_t(cfg.BlockSize)
+	ptr.host_base = C.uint32_t(cfg.HostBase)
+	ptr.host_count = C.uint32_t(cfg.HostCount)
+	ptr.blocks_per_ip = C.uint16_t(cfg.BlocksPerIP)
 	return nil
 }
 
