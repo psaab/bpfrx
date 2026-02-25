@@ -1285,13 +1285,14 @@ func (s *Server) writeInterfacesTerse(w http.ResponseWriter, cfg *config.Config,
 
 		// Physical RETH member: show aenet --> rethN[.M]
 		if rethName, ok := physToReth[baseName]; ok {
-			iface, err := net.InterfaceByName(baseName)
+			kernelIf := config.LinuxIfName(baseName)
+			iface, err := net.InterfaceByName(kernelIf)
 			admin, link := "down", "down"
 			if err == nil {
 				if iface.Flags&net.FlagUp != 0 {
 					admin = "up"
 				}
-				if data, err := os.ReadFile("/sys/class/net/" + baseName + "/operstate"); err == nil {
+				if data, err := os.ReadFile("/sys/class/net/" + kernelIf + "/operstate"); err == nil {
 					if strings.TrimSpace(string(data)) == "up" {
 						link = "up"
 					}
@@ -1307,13 +1308,14 @@ func (s *Server) writeInterfacesTerse(w http.ResponseWriter, cfg *config.Config,
 
 		// RETH interface: get addresses from config, status from physical member
 		if physMember, ok := rethToPhys[baseName]; ok {
-			iface, err := net.InterfaceByName(physMember)
+			kernelPhys := config.LinuxIfName(physMember)
+			iface, err := net.InterfaceByName(kernelPhys)
 			admin, link := "down", "down"
 			if err == nil {
 				if iface.Flags&net.FlagUp != 0 {
 					admin = "up"
 				}
-				if data, err := os.ReadFile("/sys/class/net/" + physMember + "/operstate"); err == nil {
+				if data, err := os.ReadFile("/sys/class/net/" + kernelPhys + "/operstate"); err == nil {
 					if strings.TrimSpace(string(data)) == "up" {
 						link = "up"
 					}
@@ -1339,14 +1341,15 @@ func (s *Server) writeInterfacesTerse(w http.ResponseWriter, cfg *config.Config,
 		}
 
 		// Normal interface: get addresses from kernel
-		iface, err := net.InterfaceByName(ifName)
+		kernelName := config.LinuxIfName(ifName)
+		iface, err := net.InterfaceByName(kernelName)
 		admin, link := "down", "down"
 		var addrs []string
 		if err == nil {
 			if iface.Flags&net.FlagUp != 0 {
 				admin = "up"
 			}
-			if data, err := os.ReadFile("/sys/class/net/" + ifName + "/operstate"); err == nil {
+			if data, err := os.ReadFile("/sys/class/net/" + kernelName + "/operstate"); err == nil {
 				if strings.TrimSpace(string(data)) == "up" {
 					link = "up"
 				}

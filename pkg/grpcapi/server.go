@@ -1488,14 +1488,15 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 			if phys, ok := rethToPhys[u.physName]; ok {
 				statusIf = phys
 			}
-			iface, err := net.InterfaceByName(statusIf)
+			kernelIf := config.LinuxIfName(statusIf)
+			iface, err := net.InterfaceByName(kernelIf)
 			if err != nil {
 				link = "down"
 			} else {
 				if iface.Flags&net.FlagUp == 0 {
 					admin = "down"
 				}
-				data, err := os.ReadFile("/sys/class/net/" + statusIf + "/operstate")
+				data, err := os.ReadFile("/sys/class/net/" + kernelIf + "/operstate")
 				if err == nil {
 					state := strings.TrimSpace(string(data))
 					if state != "up" {
@@ -1522,14 +1523,15 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 		if rethName, ok := physToReth[u.physName]; ok {
 			admin := "up"
 			link := "up"
-			iface, err := net.InterfaceByName(u.physName)
+			kernelIf := config.LinuxIfName(u.physName)
+			iface, err := net.InterfaceByName(kernelIf)
 			if err != nil {
 				link = "down"
 			} else {
 				if iface.Flags&net.FlagUp == 0 {
 					admin = "down"
 				}
-				data, err := os.ReadFile("/sys/class/net/" + u.physName + "/operstate")
+				data, err := os.ReadFile("/sys/class/net/" + kernelIf + "/operstate")
 				if err == nil && strings.TrimSpace(string(data)) != "up" {
 					link = "down"
 				}
@@ -1559,14 +1561,15 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 			}
 			admin := "up"
 			link := "up"
-			iface, err := net.InterfaceByName(physMember)
+			kernelPhys := config.LinuxIfName(physMember)
+			iface, err := net.InterfaceByName(kernelPhys)
 			if err != nil {
 				link = "down"
 			} else {
 				if iface.Flags&net.FlagUp == 0 {
 					admin = "down"
 				}
-				data, err := os.ReadFile("/sys/class/net/" + physMember + "/operstate")
+				data, err := os.ReadFile("/sys/class/net/" + kernelPhys + "/operstate")
 				if err == nil && strings.TrimSpace(string(data)) != "up" {
 					link = "down"
 				}
@@ -1595,16 +1598,16 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 		}
 
 		// Normal interface: get addresses from kernel
-		lookupName := u.physName
+		lookupName := config.LinuxIfName(u.physName)
 		if u.vlanID > 0 {
-			lookupName = fmt.Sprintf("%s.%d", u.physName, u.vlanID)
+			lookupName = fmt.Sprintf("%s.%d", config.LinuxIfName(u.physName), u.vlanID)
 		}
 
 		var v4Addrs, v6Addrs []string
 		liface, err := net.InterfaceByName(lookupName)
 		if err != nil {
 			// Try the physical interface for unit 0
-			liface, err = net.InterfaceByName(u.physName)
+			liface, err = net.InterfaceByName(config.LinuxIfName(u.physName))
 		}
 		if err == nil {
 			addrs, _ := liface.Addrs()
