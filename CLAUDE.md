@@ -34,9 +34,12 @@ make cluster-init    # Create networks + profile for HA cluster
 make cluster-create  # Launch bpfrx-fw0, bpfrx-fw1, cluster-lan-host
 make cluster-deploy  # Build + push to both VMs + restart
 make cluster-destroy # Tear down cluster VMs
+make test-failover   # Reboot fw0 during iperf3 — verify TCP survives failover+failback
 ```
 
 Or use `test/incus/cluster-setup.sh` directly: `init`, `create`, `deploy all`, `destroy`, `ssh 0|1`, `status`, `logs 0|1`.
+
+**IMPORTANT:** Any change touching cluster, VRRP, session sync, or failover code MUST pass `make test-failover` before commit.
 
 ## Architecture
 
