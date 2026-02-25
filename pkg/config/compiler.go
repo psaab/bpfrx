@@ -1623,7 +1623,6 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 			return fmt.Errorf("pool %q: invalid host address %q: %w", pool.Name, det.HostAddress, err)
 		}
 		ones, bits := hostNet.Mask.Size()
-		hostCount := 1 << uint(bits-ones)
 		portLow := pool.PortLow
 		if portLow == 0 {
 			portLow = 1024
@@ -1638,8 +1637,22 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 		}
 		blocksPerIP := portRange / det.BlockSize
 		totalBlocks := len(pool.Addresses) * blocksPerIP
-		if totalBlocks < hostCount {
-			return fmt.Errorf("pool %q: insufficient capacity (%d blocks) for %d subscribers", pool.Name, totalBlocks, hostCount)
+
+		if bits == 128 {
+			// IPv6 host address — validate word-aligned prefix
+			if ones != 32 && ones != 64 {
+				return fmt.Errorf("pool %q: IPv6 host prefix must be /32 or /64, got /%d", pool.Name, ones)
+			}
+			// For IPv6, subscriber count is capped by pool capacity
+			if totalBlocks == 0 {
+				return fmt.Errorf("pool %q: insufficient capacity (0 blocks) for IPv6 deterministic NAT", pool.Name)
+			}
+		} else {
+			// IPv4 host address
+			hostCount := 1 << uint(bits-ones)
+			if totalBlocks < hostCount {
+				return fmt.Errorf("pool %q: insufficient capacity (%d blocks) for %d subscribers", pool.Name, totalBlocks, hostCount)
+			}
 		}
 		if pool.PersistentNAT != nil {
 			return fmt.Errorf("pool %q: deterministic and persistent-nat are mutually exclusive", pool.Name)

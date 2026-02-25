@@ -853,6 +853,10 @@ func (m *Manager) SetNATPoolConfig(poolID uint32, cfg dataplane.NATPoolConfig) e
 	ptr.host_base = C.uint32_t(cfg.HostBase)
 	ptr.host_count = C.uint32_t(cfg.HostCount)
 	ptr.blocks_per_ip = C.uint16_t(cfg.BlocksPerIP)
+	ptr.host_prefix_len = C.uint8_t(cfg.HostPrefixLen)
+	for i := 0; i < 4; i++ {
+		ptr.host_base_v6[i] = C.uint32_t(cfg.HostBaseV6[i])
+	}
 	return nil
 }
 

@@ -254,7 +254,9 @@ type bpfrxXdpMainNatPoolConfig struct {
 	HostBase       uint32
 	HostCount      uint32
 	BlocksPerIp    uint16
-	Pad2           [2]uint8
+	HostPrefixLen  uint8
+	Pad2           uint8
+	HostBaseV6     [4]uint32
 }
 
 type bpfrxXdpMainNatPoolIpV6 struct {

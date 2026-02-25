@@ -1847,14 +1847,27 @@ func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 					_, hostNet, err := net.ParseCIDR(pool.Deterministic.HostAddress)
 					if err == nil {
 						ones, bits := hostNet.Mask.Size()
-						hostCount := uint32(1) << uint(bits-ones)
 						portRange := int(poolCfg.PortHigh) - int(poolCfg.PortLow) + 1
-
-						poolCfg.Deterministic = 1
 						poolCfg.BlockSize = uint16(pool.Deterministic.BlockSize)
-						poolCfg.HostBase = ipToUint32BE(hostNet.IP.To4())
-						poolCfg.HostCount = hostCount
 						poolCfg.BlocksPerIP = uint16(portRange / pool.Deterministic.BlockSize)
+
+						if bits == 128 {
+							// IPv6 host — deterministic mode 2
+							poolCfg.Deterministic = 2
+							poolCfg.HostPrefixLen = uint8(ones)
+							// Subscriber count capped by pool capacity
+							poolCfg.HostCount = uint32(len(v4IPs)) * uint32(poolCfg.BlocksPerIP)
+							ip16 := hostNet.IP.To16()
+							for i := 0; i < 4; i++ {
+								poolCfg.HostBaseV6[i] = binary.NativeEndian.Uint32(ip16[i*4 : (i+1)*4])
+							}
+						} else {
+							// IPv4 host — deterministic mode 1
+							hostCount := uint32(1) << uint(bits-ones)
+							poolCfg.Deterministic = 1
+							poolCfg.HostBase = ipToUint32BE(hostNet.IP.To4())
+							poolCfg.HostCount = hostCount
+						}
 					}
 				}
 			}

@@ -434,6 +434,69 @@ nat_pool_alloc_deterministic_v4(__u8 pool_id, __be32 src_ip,
 }
 
 /*
+ * Deterministic NAT (CGNAT) port allocation for IPv6 subscribers (NAT64).
+ * Each subscriber from the IPv6 host range gets a fixed block of ports
+ * on a deterministic public IPv4 IP.  Subscriber index is derived from
+ * the 32-bit word after the configured prefix (/32 → word[1], /64 → word[2]).
+ */
+static __noinline int
+nat_pool_alloc_deterministic_v6(__u8 pool_id, __u8 *src_v6,
+				__be32 *out_ip, __be16 *out_port)
+{
+	__u32 pid = pool_id;
+	struct nat_pool_config *cfg = bpf_map_lookup_elem(&nat_pool_configs, &pid);
+	if (!cfg || !cfg->num_ips || !cfg->block_size || !cfg->blocks_per_ip)
+		return -1;
+
+	/* Extract subscriber index from the 32 bits after the prefix.
+	 * /32: word[1], /64: word[2]. host_prefix_len validated to 32|64. */
+	__u32 src_word, base_word;
+
+	if (cfg->host_prefix_len == 64) {
+		__builtin_memcpy(&src_word, src_v6 + 8, 4);
+		__builtin_memcpy(&base_word, &cfg->host_base_v6[2], 4);
+	} else {
+		__builtin_memcpy(&src_word, src_v6 + 4, 4);
+		__builtin_memcpy(&base_word, &cfg->host_base_v6[1], 4);
+	}
+
+	__u32 src_h = bpf_ntohl(src_word);
+	__u32 base_h = bpf_ntohl(base_word);
+	if (src_h < base_h)
+		return -1;
+	__u32 sub_idx = src_h - base_h;
+	if (sub_idx >= cfg->host_count)
+		return -1;
+
+	__u32 bpi = cfg->blocks_per_ip;
+	__u32 ip_idx    = sub_idx / bpi;
+	__u32 block_idx = sub_idx % bpi;
+	if (ip_idx >= cfg->num_ips)
+		return -1;
+
+	__u32 map_idx = pid * MAX_NAT_POOL_IPS_PER_POOL + ip_idx;
+	if (map_idx >= MAX_NAT_POOL_IPS)
+		return -1;
+	__be32 *ip = bpf_map_lookup_elem(&nat_pool_ips_v4, &map_idx);
+	if (!ip || !*ip)
+		return -1;
+
+	struct nat_port_counter *ctr = bpf_map_lookup_elem(&nat_port_counters, &pid);
+	if (!ctr)
+		return -1;
+
+	__u32 port_start = cfg->port_low + block_idx * cfg->block_size;
+	__u32 offset = (__u32)(ctr->counter++) % cfg->block_size;
+	__u16 port = (__u16)(port_start + offset);
+	if (port > cfg->port_high)
+		return -1;
+
+	*out_ip  = *ip;
+	*out_port = bpf_htons(port);
+	return 0;
+}
+
+/*
  * Send a TCP RST reply for IPv4 REJECT action.
  * Swaps MACs, IPs, ports, sets RST flag, recomputes checksums.
  * Returns XDP_TX to send the packet back out the ingress interface.
@@ -1257,7 +1320,23 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					if (n64) {
 						__be32 alloc_v4_ip = 0;
 						__be16 alloc_v4_port = 0;
-						if (nat_pool_alloc_v4(pool_id, meta->src_ip.v4, &alloc_v4_ip, &alloc_v4_port) == 0) {
+						int alloc_rc;
+
+						/* Check if pool is deterministic for IPv6 subscribers */
+						__u32 _n64_pid = pool_id;
+						struct nat_pool_config *_n64_pcfg =
+							bpf_map_lookup_elem(&nat_pool_configs, &_n64_pid);
+
+						if (_n64_pcfg && _n64_pcfg->deterministic == 2)
+							alloc_rc = nat_pool_alloc_deterministic_v6(
+								pool_id, meta->src_ip.v6,
+								&alloc_v4_ip, &alloc_v4_port);
+						else
+							alloc_rc = nat_pool_alloc_v4(
+								pool_id, meta->src_ip.v4,
+								&alloc_v4_ip, &alloc_v4_port);
+
+						if (alloc_rc == 0) {
 							sess_nat_flags = SESS_FLAG_NAT64 | SESS_FLAG_SNAT;
 							sess_nat_src_port = alloc_v4_port;
 							/* Store allocated v4 SNAT addr in meta->src_ip

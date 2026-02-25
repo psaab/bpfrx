@@ -111,6 +111,60 @@ nat64_translate(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		if (pos < 0)
 			return;
 
+		/* Deterministic NAT64: derive SNAT from IPv6 src prefix */
+		struct nat64_config *n64cfg = &ctx->shm->nat64_configs[pos];
+		uint8_t pool_id = n64cfg->snat_pool_id;
+		if (pool_id < MAX_NAT_POOLS && ctx->shm->nat_pool_configs) {
+			struct nat_pool_config *cfg =
+				&ctx->shm->nat_pool_configs[pool_id];
+
+			if (cfg->deterministic == 2 && cfg->block_size > 0 &&
+			    cfg->blocks_per_ip > 0) {
+				uint32_t word_idx =
+					(cfg->host_prefix_len == 64) ? 2 : 1;
+				uint32_t src_word, base_word;
+				memcpy(&src_word,
+				       meta->src_ip.v6 + word_idx * 4, 4);
+				memcpy(&base_word,
+				       &cfg->host_base_v6[word_idx], 4);
+				uint32_t src_h = rte_be_to_cpu_32(src_word);
+				uint32_t base_h = rte_be_to_cpu_32(base_word);
+				if (src_h >= base_h) {
+					uint32_t sub_idx = src_h - base_h;
+					if (sub_idx < cfg->host_count) {
+						uint32_t bpi = cfg->blocks_per_ip;
+						uint32_t ip_idx = sub_idx / bpi;
+						uint32_t block_idx = sub_idx % bpi;
+						if (ip_idx < cfg->num_ips) {
+							uint32_t map_idx =
+								pool_id *
+								MAX_NAT_POOL_IPS_PER_POOL +
+								ip_idx;
+							if (map_idx < MAX_NAT_POOL_IPS) {
+								uint32_t alloc_ip =
+									ctx->shm->nat_pool_ips_v4[map_idx];
+								if (alloc_ip != 0) {
+									uint32_t port_start =
+										cfg->port_low +
+										block_idx * cfg->block_size;
+									uint32_t offset =
+										(uint32_t)(ctx->snat_port_counter++) %
+										cfg->block_size;
+									uint16_t port =
+										(uint16_t)(port_start + offset);
+									if (port <= cfg->port_high) {
+										meta->nat_src_ip.v4 = alloc_ip;
+										meta->nat_src_port =
+											rte_cpu_to_be_16(port);
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
 		/* Extract embedded IPv4 from last 32 bits of IPv6 dst */
 		uint32_t dst_v4;
 		memcpy(&dst_v4, meta->dst_ip.v6 + 12, 4);

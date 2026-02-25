@@ -378,12 +378,14 @@ type NATPoolConfig struct {
 	PortLow        uint16
 	PortHigh       uint16
 	AddrPersistent uint8
-	Deterministic  uint8
+	Deterministic  uint8  // 0=off, 1=IPv4 host, 2=IPv6 host
 	BlockSize      uint16
-	HostBase       uint32 // network byte order
+	HostBase       uint32 // network byte order (deterministic==1)
 	HostCount      uint32
 	BlocksPerIP    uint16
-	Pad2           [2]uint8
+	HostPrefixLen  uint8    // IPv6 prefix length: 32 or 64 (deterministic==2)
+	Pad2           uint8
+	HostBaseV6     [4]uint32 // IPv6 subscriber base (deterministic==2)
 }
 
 type NATPoolIPV6 struct {

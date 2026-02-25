@@ -563,12 +563,14 @@ struct nat_pool_config {
 	__u16 port_low;       /* default 1024 */
 	__u16 port_high;      /* default 65535 */
 	__u8  addr_persistent; /* same src IP always maps to same pool IP */
-	__u8  deterministic;  /* 1 = CGNAT deterministic mode */
+	__u8  deterministic;  /* 0=off, 1=IPv4 host, 2=IPv6 host */
 	__u16 block_size;     /* ports per subscriber (deterministic) */
-	__be32 host_base;     /* subscriber range base IP (deterministic) */
+	__be32 host_base;     /* subscriber range base IP (deterministic==1) */
 	__u32 host_count;     /* number of subscriber IPs (deterministic) */
 	__u16 blocks_per_ip;  /* precomputed port_range / block_size */
-	__u8  pad2[2];
+	__u8  host_prefix_len; /* IPv6 prefix length: 32 or 64 (deterministic==2) */
+	__u8  pad2;
+	__be32 host_base_v6[4]; /* IPv6 subscriber base (deterministic==2) */
 };
 
 struct nat_pool_ip_v6 {
