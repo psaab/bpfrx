@@ -238,8 +238,9 @@ int xdp_zone_prog(struct xdp_md *ctx)
 			.dst_port = meta->dst_port,
 		};
 		struct dnat_value *dv = bpf_map_lookup_elem(&dnat_table, &dk);
-		/* Fallback: try wildcard port (port=0) for IP-only DNAT rules */
-		if (!dv) {
+		/* Fallback: try wildcard port (port=0) for IP-only DNAT rules.
+		 * Skip when dst_port is already 0 to avoid duplicate lookup. */
+		if (!dv && meta->dst_port != 0) {
 			struct dnat_key dk_wild = {
 				.protocol = meta->protocol,
 				.dst_ip   = meta->dst_ip.v4,
@@ -278,8 +279,9 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		dk6.dst_port = meta->dst_port;
 
 		struct dnat_value_v6 *dv6 = bpf_map_lookup_elem(&dnat_table_v6, &dk6);
-		/* Fallback: try wildcard port (port=0) for IP-only DNAT rules */
-		if (!dv6) {
+		/* Fallback: try wildcard port (port=0) for IP-only DNAT rules.
+		 * Skip when dst_port is already 0 to avoid duplicate lookup. */
+		if (!dv6 && meta->dst_port != 0) {
 			struct dnat_key_v6 dk6_wild = { .protocol = meta->protocol };
 			__builtin_memcpy(dk6_wild.dst_ip, meta->dst_ip.v6, 16);
 			dk6_wild.dst_port = 0;
