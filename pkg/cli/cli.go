@@ -6416,6 +6416,60 @@ func (c *CLI) showInterfacesTerse() error {
 		}
 	}
 
+	// Add peer node interfaces (cluster mode).
+	peerIfaces := make(map[string]bool)
+	peerLinkUp := make(map[string]bool)
+	if c.cluster != nil {
+		peerNodeID := -1
+		if c.cluster.PeerAlive() {
+			peerNodeID = c.cluster.PeerNodeID()
+		} else if cfg.Chassis.Cluster != nil {
+			localID := c.cluster.NodeID()
+			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+				for nid := range rg.NodePriorities {
+					if nid != localID {
+						peerNodeID = nid
+						break
+					}
+				}
+				if peerNodeID >= 0 {
+					break
+				}
+			}
+		}
+		if peerNodeID >= 0 {
+			if peerMons := c.cluster.PeerMonitorStatuses(); peerMons != nil {
+				for _, pm := range peerMons {
+					peerLinkUp[pm.Interface] = pm.Up
+				}
+			}
+			tree := c.store.ActiveTree()
+			if tree != nil {
+				peerCfg, err := config.CompileConfigForNode(tree, peerNodeID)
+				if err == nil {
+					for physName, ifCfg := range peerCfg.Interfaces.Interfaces {
+						if _, isLocal := cfg.Interfaces.Interfaces[physName]; isLocal {
+							continue
+						}
+						peerIfaces[physName] = true
+						if ifCfg.RedundantParent != "" {
+							physToReth[physName] = ifCfg.RedundantParent
+							if rethCfg, ok := peerCfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok {
+								for unitNum, unit := range rethCfg.Units {
+									units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
+								}
+							}
+						} else {
+							for unitNum, unit := range ifCfg.Units {
+								units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	sort.Slice(units, func(i, j int) bool {
 		if units[i].physName != units[j].physName {
 			return units[i].physName < units[j].physName
@@ -6428,32 +6482,46 @@ func (c *CLI) showInterfacesTerse() error {
 	printedPhys := make(map[string]bool)
 
 	for _, u := range units {
+		isPeer := peerIfaces[u.physName]
+
 		if !printedPhys[u.physName] {
 			printedPhys[u.physName] = true
 			admin := "up"
-			// Check config-level disable flag
-			if ifCfg, ok := cfg.Interfaces.Interfaces[u.physName]; ok && ifCfg.Disable {
-				admin = "down"
-			}
 			link := "up"
-			// For RETH interfaces, get status from physical member
-			statusIf := u.physName
-			if phys, ok := rethToPhys[u.physName]; ok {
-				statusIf = phys
-			}
-			kernelIf := config.LinuxIfName(statusIf)
-			iface, err := net.InterfaceByName(kernelIf)
-			if err != nil {
-				link = "down"
-			} else {
-				if iface.Flags&net.FlagUp == 0 {
-					if admin == "up" {
-						admin = "down" // kernel says down
+			if isPeer {
+				// Peer interface: use heartbeat monitor data.
+				if up, ok := peerLinkUp[u.physName]; ok {
+					if !up {
+						link = "down"
 					}
-				}
-				data, err := os.ReadFile("/sys/class/net/" + kernelIf + "/operstate")
-				if err == nil && strings.TrimSpace(string(data)) != "up" {
+				} else if c.cluster != nil && !c.cluster.PeerAlive() {
 					link = "down"
+				}
+			} else {
+				// Local interface: query kernel.
+				// Check config-level disable flag
+				if ifCfg, ok := cfg.Interfaces.Interfaces[u.physName]; ok && ifCfg.Disable {
+					admin = "down"
+				}
+				// For RETH interfaces, get status from physical member
+				statusIf := u.physName
+				if phys, ok := rethToPhys[u.physName]; ok {
+					statusIf = phys
+				}
+				kernelIf := config.LinuxIfName(statusIf)
+				iface, err := net.InterfaceByName(kernelIf)
+				if err != nil {
+					link = "down"
+				} else {
+					if iface.Flags&net.FlagUp == 0 {
+						if admin == "up" {
+							admin = "down" // kernel says down
+						}
+					}
+					data, err := os.ReadFile("/sys/class/net/" + kernelIf + "/operstate")
+					if err == nil && strings.TrimSpace(string(data)) != "up" {
+						link = "down"
+					}
 				}
 			}
 			fmt.Printf("%-24s%-6s%-6s\n", u.physName, admin, link)
@@ -6465,17 +6533,27 @@ func (c *CLI) showInterfacesTerse() error {
 		if rethName, ok := physToReth[u.physName]; ok {
 			admin := "up"
 			link := "up"
-			kernelIf := config.LinuxIfName(u.physName)
-			iface, err := net.InterfaceByName(kernelIf)
-			if err != nil {
-				link = "down"
-			} else {
-				if iface.Flags&net.FlagUp == 0 {
-					admin = "down"
-				}
-				data, err := os.ReadFile("/sys/class/net/" + kernelIf + "/operstate")
-				if err == nil && strings.TrimSpace(string(data)) != "up" {
+			if isPeer {
+				if up, ok := peerLinkUp[u.physName]; ok {
+					if !up {
+						link = "down"
+					}
+				} else if c.cluster != nil && !c.cluster.PeerAlive() {
 					link = "down"
+				}
+			} else {
+				kernelIf := config.LinuxIfName(u.physName)
+				iface, err := net.InterfaceByName(kernelIf)
+				if err != nil {
+					link = "down"
+				} else {
+					if iface.Flags&net.FlagUp == 0 {
+						admin = "down"
+					}
+					data, err := os.ReadFile("/sys/class/net/" + kernelIf + "/operstate")
+					if err == nil && strings.TrimSpace(string(data)) != "up" {
+						link = "down"
+					}
 				}
 			}
 			rethLogical := fmt.Sprintf("%s.%d", rethName, u.unitNum)
