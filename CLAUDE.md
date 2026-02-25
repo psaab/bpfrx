@@ -172,7 +172,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Firewall**: Stateful inspection, zone-based policies (including global policies), address books, application matching, multi-term apps, filtered session clearing
 - **NAT**: SNAT (interface + pool, address-persistent), DNAT (with hit counters), static 1:1, NAT64 (native BPF)
 - **IPv4 + IPv6**: Dual-stack, DHCPv4/v6 clients, Router Advertisements
-- **Screen/IDS**: 11 checks (land, syn-flood, ping-death, teardrop, rate-limiting)
+- **Screen/IDS**: 11 checks (land, syn-flood, ping-death, teardrop, rate-limiting), SYN cookie flood protection (XDP-generated SYN-ACK cookies with source validation)
 - **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, export/redistribute, ECMP multipath, next-table + rib-group inter-VRF route leaking, route filtering by protocol/CIDR
 - **VLANs**: 802.1Q tagging in BPF, trunk ports
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces

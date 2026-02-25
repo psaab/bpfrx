@@ -14,7 +14,7 @@ Last updated: 2026-02-25
 | Advanced Threat Prevention | 5 | 1 | 0 | 6 |
 | User/Identity Firewall | 5 | 0 | 0 | 5 |
 | NAT Enhancements | 7 | 1 | 0 | 8 |
-| Screen/IDS Enhancements | 6 | 2 | 0 | 8 |
+| Screen/IDS Enhancements | 6 | 2 | 1 | 8 |
 | Security Flow Enhancements | 9 | 2 | 0 | 11 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
 | Security Logging Enhancements | 1 | 0 | 0 | 1 |
@@ -186,7 +186,7 @@ bpfrx has TCP session timeouts (established, initial, closing, time-wait), UDP/I
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **SYN Flood Protection Mode** | `security flow syn-flood-protection-mode syn-cookie` | Global SYN flood protection mode: syn-cookie (stateless) or syn-proxy (stateful). Different from per-screen syn-flood thresholds. | Medium | Missing |
+| **SYN Flood Protection Mode** | `security flow syn-flood-protection-mode syn-cookie` | Global SYN flood protection mode: syn-cookie (stateless) or syn-proxy (stateful). Different from per-screen syn-flood thresholds. | Medium | **Done** (`8cbf31a`) — syn-cookie mode implemented with BPF helpers, validated_clients LRU, 4 counters. syn-proxy mode not implemented. |
 | **TCP Strict SYN Check** | `security flow tcp-session strict-syn-check` | Require SYN as first packet for TCP session creation (drop mid-stream pickup) | Medium | Partial (bpfrx conntrack requires SYN for new sessions but this isn't configurable) |
 | **TCP No-SYN-Check** | `security flow tcp-session no-syn-check` | Allow mid-stream TCP session pickup (useful after failover or asymmetric routing) | Medium | Missing (bpfrx always requires SYN) |
 | **TCP No-SYN-Check in Tunnel** | `security flow tcp-session no-syn-check-in-tunnel` | Allow mid-stream pickup specifically for tunneled traffic (IPsec, GRE) | Low | Missing |
