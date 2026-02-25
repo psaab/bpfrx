@@ -1259,6 +1259,15 @@ func (s *Server) writeInterfacesTerse(w http.ResponseWriter, cfg *config.Config,
 		}
 	}
 
+	// Build RETH mappings
+	physToReth := make(map[string]string) // physical member → reth parent
+	rethToPhys := cfg.RethToPhysical()    // reth → physical member
+	for _, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg.RedundantParent != "" {
+			physToReth[ifCfg.Name] = ifCfg.RedundantParent
+		}
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "%-20s %-10s %-10s %s\n", "Interface", "Admin", "Link", "Addresses")
 
@@ -1272,6 +1281,64 @@ func (s *Server) writeInterfacesTerse(w http.ResponseWriter, cfg *config.Config,
 	sort.Strings(ifNames)
 
 	for _, ifName := range ifNames {
+		baseName := strings.SplitN(ifName, ".", 2)[0]
+
+		// Physical RETH member: show aenet --> rethN[.M]
+		if rethName, ok := physToReth[baseName]; ok {
+			iface, err := net.InterfaceByName(baseName)
+			admin, link := "down", "down"
+			if err == nil {
+				if iface.Flags&net.FlagUp != 0 {
+					admin = "up"
+				}
+				if data, err := os.ReadFile("/sys/class/net/" + baseName + "/operstate"); err == nil {
+					if strings.TrimSpace(string(data)) == "up" {
+						link = "up"
+					}
+				}
+			}
+			aenetTarget := rethName
+			if parts := strings.SplitN(ifName, ".", 2); len(parts) == 2 {
+				aenetTarget = rethName + "." + parts[1]
+			}
+			fmt.Fprintf(&b, "%-20s %-10s %-10s aenet --> %s\n", ifName, admin, link, aenetTarget)
+			continue
+		}
+
+		// RETH interface: get addresses from config, status from physical member
+		if physMember, ok := rethToPhys[baseName]; ok {
+			iface, err := net.InterfaceByName(physMember)
+			admin, link := "down", "down"
+			if err == nil {
+				if iface.Flags&net.FlagUp != 0 {
+					admin = "up"
+				}
+				if data, err := os.ReadFile("/sys/class/net/" + physMember + "/operstate"); err == nil {
+					if strings.TrimSpace(string(data)) == "up" {
+						link = "up"
+					}
+				}
+			}
+			var addrs []string
+			if ifCfg, ok := cfg.Interfaces.Interfaces[baseName]; ok {
+				// Determine which unit to look up
+				unitNum := 0
+				if parts := strings.SplitN(ifName, ".", 2); len(parts) == 2 {
+					fmt.Sscanf(parts[1], "%d", &unitNum)
+				}
+				if unit, ok := ifCfg.Units[unitNum]; ok {
+					addrs = append(addrs, unit.Addresses...)
+				}
+			}
+			addrStr := strings.Join(addrs, ", ")
+			if addrStr == "" {
+				addrStr = "-"
+			}
+			fmt.Fprintf(&b, "%-20s %-10s %-10s %s\n", ifName, admin, link, addrStr)
+			continue
+		}
+
+		// Normal interface: get addresses from kernel
 		iface, err := net.InterfaceByName(ifName)
 		admin, link := "down", "down"
 		var addrs []string

@@ -1411,6 +1411,15 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 		}
 	}
 
+	// Build RETH mappings
+	physToReth := make(map[string]string) // physical member → reth parent
+	rethToPhys := cfg.RethToPhysical()    // reth → physical member
+	for _, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg.RedundantParent != "" {
+			physToReth[ifCfg.Name] = ifCfg.RedundantParent
+		}
+	}
+
 	// Collect all configured interfaces with units
 	type ifUnit struct {
 		physName string
@@ -1424,8 +1433,17 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 			continue
 		}
 		seen[physName] = true
-		for unitNum, unit := range ifCfg.Units {
-			units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
+		if rethName, ok := physToReth[physName]; ok {
+			// Physical RETH member: inherit units from RETH parent
+			if rethCfg, ok := cfg.Interfaces.Interfaces[rethName]; ok {
+				for unitNum, unit := range rethCfg.Units {
+					units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
+				}
+			}
+		} else {
+			for unitNum, unit := range ifCfg.Units {
+				units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
+			}
 		}
 	}
 	// Also include zone-only interfaces not in interfaces config
@@ -1465,15 +1483,19 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 			printedPhys[u.physName] = true
 			admin := "up"
 			link := "up"
-			iface, err := net.InterfaceByName(u.physName)
+			// For RETH interfaces, get status from physical member
+			statusIf := u.physName
+			if phys, ok := rethToPhys[u.physName]; ok {
+				statusIf = phys
+			}
+			iface, err := net.InterfaceByName(statusIf)
 			if err != nil {
 				link = "down"
 			} else {
 				if iface.Flags&net.FlagUp == 0 {
 					admin = "down"
 				}
-				// Read operstate from sysfs
-				data, err := os.ReadFile("/sys/class/net/" + u.physName + "/operstate")
+				data, err := os.ReadFile("/sys/class/net/" + statusIf + "/operstate")
 				if err == nil {
 					state := strings.TrimSpace(string(data))
 					if state != "up" {
@@ -1495,12 +1517,89 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 
 		// Determine the logical interface name
 		logicalName := fmt.Sprintf("%s.%d", u.physName, u.unitNum)
+
+		// Physical RETH member: show aenet --> rethN.M
+		if rethName, ok := physToReth[u.physName]; ok {
+			admin := "up"
+			link := "up"
+			iface, err := net.InterfaceByName(u.physName)
+			if err != nil {
+				link = "down"
+			} else {
+				if iface.Flags&net.FlagUp == 0 {
+					admin = "down"
+				}
+				data, err := os.ReadFile("/sys/class/net/" + u.physName + "/operstate")
+				if err == nil && strings.TrimSpace(string(data)) != "up" {
+					link = "down"
+				}
+			}
+			rethLogical := fmt.Sprintf("%s.%d", rethName, u.unitNum)
+			fmt.Fprintf(&buf, "%-24s%-6s%-6s%-9s%s\n", logicalName, admin, link, "aenet", "--> "+rethLogical)
+			continue
+		}
+
+		// RETH interface: get addresses from config, status from physical member
+		if physMember, ok := rethToPhys[u.physName]; ok {
+			var v4Addrs, v6Addrs []string
+			if ifCfg, ok := cfg.Interfaces.Interfaces[u.physName]; ok {
+				if unit, ok := ifCfg.Units[u.unitNum]; ok {
+					for _, addr := range unit.Addresses {
+						ip, _, err := net.ParseCIDR(addr)
+						if err != nil {
+							continue
+						}
+						if ip.To4() != nil {
+							v4Addrs = append(v4Addrs, addr)
+						} else {
+							v6Addrs = append(v6Addrs, addr)
+						}
+					}
+				}
+			}
+			admin := "up"
+			link := "up"
+			iface, err := net.InterfaceByName(physMember)
+			if err != nil {
+				link = "down"
+			} else {
+				if iface.Flags&net.FlagUp == 0 {
+					admin = "down"
+				}
+				data, err := os.ReadFile("/sys/class/net/" + physMember + "/operstate")
+				if err == nil && strings.TrimSpace(string(data)) != "up" {
+					link = "down"
+				}
+			}
+			firstProto := ""
+			firstAddr := ""
+			if len(v4Addrs) > 0 {
+				firstProto = "inet"
+				firstAddr = v4Addrs[0]
+			} else if len(v6Addrs) > 0 {
+				firstProto = "inet6"
+				firstAddr = v6Addrs[0]
+			}
+			fmt.Fprintf(&buf, "%-24s%-6s%-6s%-9s%-22s\n", logicalName, admin, link, firstProto, firstAddr)
+			for i := 1; i < len(v4Addrs); i++ {
+				fmt.Fprintf(&buf, "%-36s%-9s%-22s\n", "", "inet", v4Addrs[i])
+			}
+			startIdx := 0
+			if firstProto == "inet6" {
+				startIdx = 1
+			}
+			for i := startIdx; i < len(v6Addrs); i++ {
+				fmt.Fprintf(&buf, "%-36s%-9s%-22s\n", "", "inet6", v6Addrs[i])
+			}
+			continue
+		}
+
+		// Normal interface: get addresses from kernel
 		lookupName := u.physName
 		if u.vlanID > 0 {
 			lookupName = fmt.Sprintf("%s.%d", u.physName, u.vlanID)
 		}
 
-		// Get addresses for this logical interface
 		var v4Addrs, v6Addrs []string
 		liface, err := net.InterfaceByName(lookupName)
 		if err != nil {
@@ -1534,7 +1633,6 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 			}
 		}
 
-		// Print logical interface with first protocol/address
 		firstProto := ""
 		firstAddr := ""
 		if len(v4Addrs) > 0 {
@@ -1547,14 +1645,12 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 
 		fmt.Fprintf(&buf, "%-24s%-6s%-6s%-9s%-22s\n", logicalName, admin, link, firstProto, firstAddr)
 
-		// Print remaining v4 addresses
 		if len(v4Addrs) > 1 {
 			for _, a := range v4Addrs[1:] {
 				fmt.Fprintf(&buf, "%-36s%-9s%-22s\n", "", "inet", a)
 			}
 		}
 
-		// Print v6 addresses (if v4 was first)
 		startIdx := 0
 		if firstProto == "inet6" {
 			startIdx = 1
