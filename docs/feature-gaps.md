@@ -1,6 +1,6 @@
 # bpfrx vs Juniper vSRX Feature Gap Analysis
 
-Last updated: 2026-02-24
+Last updated: 2026-02-25
 
 ## Summary
 
@@ -289,7 +289,7 @@ bpfrx has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfac
 
 ## 16. HA Enhancements
 
-bpfrx has a full chassis cluster implementation with redundancy groups, RETH (VRRP-backed, virtual MAC), heartbeat, GARP, weight-based failover, session sync (RTO, per-RG aware), config sync, IP monitoring, election logic, VRRP, active/active per-RG service management, fabric bond redundancy, and ISSU. All HA features are now implemented.
+bpfrx has a full chassis cluster implementation with redundancy groups, RETH (VRRP-backed, virtual MAC), heartbeat, GARP, weight-based failover, session sync (RTO, per-RG aware), config sync, IP monitoring, election logic, VRRP, active/active per-RG service management, fabric bond redundancy, embedded ICMP fabric redirect (mtr/traceroute through secondary), and ISSU. All HA features are now implemented.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -297,7 +297,7 @@ bpfrx has a full chassis cluster implementation with redundancy groups, RETH (VR
 | **NAT State Synchronization** | `chassis cluster ... nat-state-synchronization` | Sync NAT translation table entries between cluster nodes for seamless failover | Medium | Done (session sync via RTO protocol includes SNAT/DNAT flags and NAT addresses in session_value struct) |
 | **IPsec SA Synchronization** | `chassis cluster ... ipsec-session-synchronization` | Sync IPsec Security Associations between nodes. Avoids tunnel re-establishment after failover. | Medium | Done (primary sends active connection names every 30s; new primary re-initiates via `swanctl --initiate`) |
 | **Active/Active Mode** | `chassis cluster redundancy-group N node 0 priority N node 1 priority N` (both nonzero) | Both nodes forward traffic simultaneously for different RGs. Per-RG VRRP service management, per-RG session sync with zone→RG mapping. | Medium | Done (per-RG service mgmt, per-RG session sync, per-RG election all implemented and tested) |
-| **Redundant Ethernet (reth) Runtime** | `interfaces reth0 redundant-ether-options ...` | Bondless RETH via VRRP on physical member interfaces, virtual MAC per node (`02:bf:72:CC:RR:NN`), programRethMAC, VIP reconciliation, fabric forwarding, `.link` files with OriginalName matching, session sync across nodes | Medium | Done (fully implemented and validated in cluster testing) |
+| **Redundant Ethernet (reth) Runtime** | `interfaces reth0 redundant-ether-options ...` | Bondless RETH via VRRP on physical member interfaces, virtual MAC per node (`02:bf:72:CC:RR:NN`), programRethMAC, VIP reconciliation, fabric forwarding (including embedded ICMP redirect for mtr/traceroute through secondary), `.link` files with OriginalName matching, session sync across nodes | Medium | Done (fully implemented and validated in cluster testing) |
 | **Primary/Preferred Address per Interface** | `interfaces ... unit ... family inet address ... primary/preferred` | Select which address is used as source for traffic originated by the device. Syslog source address prefers PrimaryAddress, networkd orders primary first. | Low | Done (syslog source address + networkd ordering) |
 | **Fabric Link Redundancy** | `chassis cluster ... fabric-options member-interfaces` | Multiple fabric links between cluster nodes for data forwarding resilience. Linux bond (active-backup) with MII monitoring. | Low | Done (systemd-networkd bond generation with active-backup mode, transparent to BPF/sync) |
 
