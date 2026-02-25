@@ -5,6 +5,14 @@
 # Handles VRF-aware pinging automatically — interfaces in a VRF use
 # "ip vrf exec <vrf> ping" so tests work without manual intervention.
 #
+# Tests include:
+#   - Service health (bpfrxd active)
+#   - Same-subnet ping (fw → hosts)
+#   - Cross-zone ping (trust → untrust, IPv4 + IPv6)
+#   - mtr path validation (verify traffic traverses firewall)
+#   - Internet reachability (cluster only — needs real WAN gateway)
+#   - Cluster-specific: heartbeat, fabric, RETH VIP, session sync
+#
 # Usage:
 #   ./test/incus/test-connectivity.sh              # Run all tests
 #   ./test/incus/test-connectivity.sh standalone    # Standalone only
@@ -90,6 +98,45 @@ service_check() {
 	fi
 }
 
+# mtr_test <instance> <target_ip> <expected_hop_ip> <description>
+# Runs mtr and validates: (1) 0% loss at target, (2) expected intermediate hop exists.
+# expected_hop_ip can be "" to skip hop validation.
+mtr_test() {
+	local inst="$1" target="$2" hop="$3" desc="$4"
+	local output
+	output=$(incus exec "$inst" -- mtr --report --report-cycles 3 -n "$target" 2>&1) || true
+
+	# Check for 0% loss at the final hop (last non-empty line with a host)
+	local last_loss
+	last_loss=$(echo "$output" | grep -v '???' | grep '|--' | tail -1 | awk '{print $3}' || echo "100.0")
+	if [[ "$last_loss" != "0.0%" ]]; then
+		fail "$desc (${last_loss} loss at target)"
+		return
+	fi
+
+	# Validate expected intermediate hop if specified
+	if [[ -n "$hop" ]]; then
+		if echo "$output" | grep -q "$hop"; then
+			pass "$desc (via $hop)"
+		else
+			fail "$desc (expected hop $hop not in path)"
+		fi
+	else
+		pass "$desc"
+	fi
+}
+
+# internet_test <instance> <description>
+# Pings 1.1.1.1 — tests outbound internet through the firewall.
+internet_test() {
+	local inst="$1" desc="$2"
+	if ping_vrf_aware "$inst" -c 3 -W 3 "1.1.1.1"; then
+		pass "$desc"
+	else
+		fail "$desc"
+	fi
+}
+
 # ── Standalone Tests ─────────────────────────────────────────────────
 
 test_standalone() {
@@ -107,7 +154,6 @@ test_standalone() {
 	ping_test "bpfrx-fw" "10.0.1.102"  "standalone: fw → trust-host (10.0.1.102)"
 	ping_test "bpfrx-fw" "10.0.2.102"  "standalone: fw → untrust-host (10.0.2.102)"
 	ping_test "bpfrx-fw" "10.0.30.101" "standalone: fw → dmz-host (10.0.30.101)"
-	ping_test "bpfrx-fw" "172.16.50.1" "standalone: fw → WAN gateway (172.16.50.1)"
 
 	# Cross-zone: trust → untrust (requires policy permit + SNAT)
 	if instance_running "trust-host" && instance_running "untrust-host"; then
@@ -117,8 +163,19 @@ test_standalone() {
 		skip "standalone: cross-zone tests (trust-host or untrust-host not running)"
 	fi
 
-	# Cross-zone: trust → dmz (skipped — DMZ is in vrf-dmz-vr,
-	# inter-VRF cross-zone routing not configured in test env)
+	# Cross-zone: trust → WAN interface IP (proves trust→wan zone policy works)
+	if instance_running "trust-host"; then
+		ping_test "trust-host" "172.16.50.5" "standalone: trust-host → fw WAN IP (172.16.50.5)"
+	fi
+
+	# mtr path validation: verify traffic traverses the firewall
+	if instance_running "trust-host" && instance_running "untrust-host"; then
+		mtr_test "trust-host" "10.0.2.102" "10.0.1.10" \
+			"standalone: mtr trust→untrust (path through fw)"
+	fi
+
+	# Internet: standalone test env has no real WAN gateway — skip
+	# (cluster tests validate internet connectivity below)
 }
 
 # ── Cluster Tests ────────────────────────────────────────────────────
@@ -159,9 +216,23 @@ test_cluster() {
 
 		# IPv6 LAN connectivity
 		ping6_test "cluster-lan-host" "2001:559:8585:cf01::1" "cluster: LAN host → RETH VIP IPv6"
+
+		# Internet: LAN host → 1.1.1.1 (proves SNAT + routing through fw to internet)
+		internet_test "cluster-lan-host" "cluster: LAN host → internet (1.1.1.1)"
+
+		# mtr path validation: verify traffic traverses RETH VIP to WAN gateway
+		mtr_test "cluster-lan-host" "172.16.50.1" "10.0.60.1" \
+			"cluster: mtr LAN→WAN gateway (path through RETH VIP)"
+
+		# mtr to internet: verify full path (RETH VIP → WAN gateway → internet)
+		mtr_test "cluster-lan-host" "1.1.1.1" "10.0.60.1" \
+			"cluster: mtr LAN→internet (path through RETH VIP)"
 	else
 		skip "cluster: LAN host tests (cluster-lan-host not running)"
 	fi
+
+	# Internet from firewall directly
+	internet_test "bpfrx-fw0" "cluster: fw0 → internet (1.1.1.1)"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────
