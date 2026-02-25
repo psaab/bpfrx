@@ -823,15 +823,15 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*dhcpv6Result
 
 // buildDHCPv6Modifiers constructs DHCPv6 message modifiers from interface options.
 func (m *Manager) buildDHCPv6Modifiers(ifaceName string, opts *DHCPv6Options) []dhcpv6.Modifier {
+	if opts == nil {
+		return nil
+	}
+
 	var mods []dhcpv6.Modifier
 
 	// Use persistent DUID if configured
 	if duid, err := m.getDUID(ifaceName); err == nil {
 		mods = append(mods, dhcpv6.WithClientID(duid))
-	}
-
-	if opts == nil {
-		return mods
 	}
 
 	// Add IA_PD if requested
