@@ -281,6 +281,10 @@ func TestManualFailover(t *testing.T) {
 	if states[0].FailoverCount != 1 {
 		t.Errorf("failover count = %d, want 1", states[0].FailoverCount)
 	}
+	// Weight must be 0 so peer election sees "Peer weight 0" and elects itself primary.
+	if states[0].Weight != 0 {
+		t.Errorf("weight = %d, want 0 after manual failover", states[0].Weight)
+	}
 
 	// Failover event should be emitted.
 	select {
@@ -323,6 +327,10 @@ func TestResetFailover(t *testing.T) {
 	// Failover count should be preserved.
 	if states[0].FailoverCount != 1 {
 		t.Errorf("failover count = %d, want 1 (preserved)", states[0].FailoverCount)
+	}
+	// Weight must be restored to 255 (no monitor failures).
+	if states[0].Weight != 255 {
+		t.Errorf("weight = %d, want 255 after reset", states[0].Weight)
 	}
 }
 

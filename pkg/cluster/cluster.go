@@ -391,6 +391,7 @@ func (m *Manager) ManualFailover(rgID int) error {
 	}
 	oldState := rg.State
 	rg.ManualFailover = true
+	rg.Weight = 0 // zero weight so peer election sees "Peer weight 0" → becomes primary
 	rg.State = StateSecondary
 	rg.FailoverCount++
 	if oldState != rg.State {
@@ -438,11 +439,7 @@ func (m *Manager) ResetFailover(rgID int) error {
 		return fmt.Errorf("redundancy group %d not found", rgID)
 	}
 	rg.ManualFailover = false
-	if m.peerAlive {
-		m.runElection()
-	} else {
-		m.electSingleNode()
-	}
+	m.recalcWeight(rg) // restore weight from monitor state + run election
 	slog.Info("cluster: failover reset", "rg", rgID)
 	return nil
 }
