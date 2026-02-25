@@ -15,7 +15,7 @@ Last updated: 2026-02-25
 | User/Identity Firewall | 5 | 0 | 0 | 5 |
 | NAT Enhancements | 6 | 1 | 0 | 7 |
 | Screen/IDS Enhancements | 6 | 2 | 1 | 8 |
-| Security Flow Enhancements | 9 | 2 | 0 | 11 |
+| Security Flow Enhancements | 5 | 0 | 0 | 5 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
 | Security Logging Enhancements | 1 | 0 | 0 | 1 |
 | PKI / Certificates | 4 | 0 | 0 | 4 |
@@ -29,7 +29,7 @@ Last updated: 2026-02-25
 | Interface Enhancements | 4 | 2 | 1 | 7 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **142** | **19** | **6** | **167** |
+| **TOTAL** | **138** | **17** | **6** | **161** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -187,13 +187,13 @@ bpfrx has TCP session timeouts (established, initial, closing, time-wait), UDP/I
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **SYN Flood Protection Mode** | `security flow syn-flood-protection-mode syn-cookie` | Global SYN flood protection mode: syn-cookie (stateless) or syn-proxy (stateful). Different from per-screen syn-flood thresholds. | Medium | **Done** (`8cbf31a`) — syn-cookie mode implemented with BPF helpers, validated_clients LRU, 4 counters. syn-proxy mode not implemented. |
-| **TCP Strict SYN Check** | `security flow tcp-session strict-syn-check` | Require SYN as first packet for TCP session creation (drop mid-stream pickup) | Medium | Partial (bpfrx conntrack requires SYN for new sessions but this isn't configurable) |
-| **TCP No-SYN-Check** | `security flow tcp-session no-syn-check` | Allow mid-stream TCP session pickup (useful after failover or asymmetric routing) | Medium | Missing (bpfrx always requires SYN) |
-| **TCP No-SYN-Check in Tunnel** | `security flow tcp-session no-syn-check-in-tunnel` | Allow mid-stream pickup specifically for tunneled traffic (IPsec, GRE) | Low | Missing |
-| **TCP RST Invalidate Session** | `security flow tcp-session rst-invalidate-session` | Immediately invalidate session on TCP RST instead of waiting for timeout | Medium | Partial (bpfrx handles RST but may not have configurable invalidation) |
+| **TCP Strict SYN Check** | `security flow tcp-session strict-syn-check` | Require SYN as first packet for TCP session creation (drop mid-stream pickup) | Medium | **Done** (`2114333`) — default behavior (SYN required), configurable via no-syn-check / no-syn-check-in-tunnel. |
+| **TCP No-SYN-Check** | `security flow tcp-session no-syn-check` | Allow mid-stream TCP session pickup (useful after failover or asymmetric routing) | Medium | **Done** (`2114333`) — BPF flow_config tcp_flags bit, creates ESTABLISHED state for non-SYN first packet. eBPF + DPDK. |
+| **TCP No-SYN-Check in Tunnel** | `security flow tcp-session no-syn-check-in-tunnel` | Allow mid-stream pickup specifically for tunneled traffic (IPsec, GRE) | Low | **Done** (`2114333`) — per-interface IFACE_FLAG_TUNNEL in iface_zone_value, propagated via META_FLAG_TUNNEL in xdp_zone. |
+| **TCP RST Invalidate Session** | `security flow tcp-session rst-invalidate-session` | Immediately invalidate session on TCP RST instead of waiting for timeout | Medium | **Done** (`2114333`) — sets timeout=0/last_seen=0 on RST so next GC sweep deletes immediately. eBPF + DPDK. |
 | **Force IP Reassembly** | `security flow force-ip-reassembly` | Force reassembly of all IP fragments before processing (protects against fragment-based evasion) | Medium | Missing |
 | **Route Change Timeout** | `security flow route-change-timeout N` | Session timeout (6-1800s) applied when route changes to nonexistent route. Prevents sessions hanging on dead routes. | Low | Missing |
-| **Aggressive Session Aging** | `security flow aging early-ageout N; high-watermark N; low-watermark N` | Accelerate session timeout when session table exceeds watermark threshold | Medium | Missing |
+| **Aggressive Session Aging** | `security flow aging early-ageout N; high-watermark N; low-watermark N` | Accelerate session timeout when session table exceeds watermark threshold | Medium | **Done** (`2114333`) — Go-side GC watermark hysteresis, early-ageout overrides per-session timeout. |
 | **ICMP Session Sync** | `security flow sync-icmp-session` | Synchronize ICMP sessions between HA cluster nodes | Low | Missing |
 | **Multicast Session Timeout** | `security flow multicast-session ...` | Custom timeout values for multicast flow sessions | Low | Missing |
 | **Preserve Incoming Fragment Size** | `security flow preserve-incoming-fragment-size` | Maintain original fragment sizes through the device instead of reassemble-and-re-fragment | Low | Missing |
