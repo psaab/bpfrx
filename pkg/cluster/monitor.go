@@ -28,6 +28,10 @@ type Monitor struct {
 	ifaceDown map[monitorKey]bool
 	ipDown    map[ipMonitorKey]bool
 
+	// localStatuses holds the latest local interface monitor states,
+	// rebuilt on every poll cycle. Used to populate heartbeat packets.
+	localStatuses []InterfaceMonitorInfo
+
 	// nlHandle is the netlink handle for link state queries.
 	// Can be overridden for testing.
 	nlHandle nlLinkGetter
@@ -122,10 +126,26 @@ func (mon *Monitor) poll() {
 	groups := mon.groups
 	mon.mu.Unlock()
 
+	// Rebuild local statuses each cycle.
+	mon.localStatuses = mon.localStatuses[:0]
+
 	for _, rg := range groups {
 		mon.pollInterfaceMonitors(rg)
 		mon.pollIPMonitors(rg)
 	}
+}
+
+// LocalInterfaceStatuses returns the latest snapshot of local interface monitor states.
+// Used to populate heartbeat packets with per-interface status.
+func (mon *Monitor) LocalInterfaceStatuses() []InterfaceMonitorInfo {
+	mon.mu.Lock()
+	defer mon.mu.Unlock()
+	if len(mon.localStatuses) == 0 {
+		return nil
+	}
+	cp := make([]InterfaceMonitorInfo, len(mon.localStatuses))
+	copy(cp, mon.localStatuses)
+	return cp
 }
 
 func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup) {
@@ -145,6 +165,14 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup) {
 
 		up := link.Attrs().OperState == netlink.OperUp ||
 			link.Attrs().Flags&net.FlagUp != 0
+
+		// Track local interface status for heartbeat propagation.
+		mon.localStatuses = append(mon.localStatuses, InterfaceMonitorInfo{
+			Interface:       im.Interface,
+			Weight:          im.Weight,
+			Up:              up,
+			RedundancyGroup: rg.ID,
+		})
 
 		wasDown := mon.ifaceDown[key]
 		isDown := !up

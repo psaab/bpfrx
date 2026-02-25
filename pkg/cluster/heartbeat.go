@@ -38,16 +38,24 @@ const (
 //	[5]     NodeID
 //	[6:8]   ClusterID (little-endian uint16)
 //	[8]     NumGroups
-//	[9..]   Per-group entries (4 bytes each):
+//	[9..]   Per-group entries (5 bytes each):
 //	          [0] GroupID
-//	          [1] Priority high byte
-//	          [2] Priority low byte
+//	          [1:3] Priority (little-endian uint16)
 //	          [3] Weight
 //	          [4] State
+//	After groups:
+//	  NumMonitors (1 byte)
+//	  Per-monitor:
+//	    [0] RGID
+//	    [1] Flags (bit0=up)
+//	    [2] Weight
+//	    [3] NameLen
+//	    [4..4+NameLen] Interface name
 type HeartbeatPacket struct {
 	NodeID    uint8
 	ClusterID uint16
 	Groups    []HeartbeatGroup
+	Monitors  []HeartbeatMonitor
 }
 
 // HeartbeatGroup is a per-RG entry in the heartbeat.
@@ -58,6 +66,14 @@ type HeartbeatGroup struct {
 	State    uint8
 }
 
+// HeartbeatMonitor is a per-interface monitor entry in the heartbeat.
+type HeartbeatMonitor struct {
+	RGID      uint8
+	Weight    uint8
+	Up        bool
+	Interface string
+}
+
 // heartbeatHeaderSize is Magic(4) + Version(1) + NodeID(1) + ClusterID(2) + NumGroups(1).
 const heartbeatHeaderSize = 9
 
@@ -66,7 +82,15 @@ const heartbeatGroupSize = 5
 
 // MarshalHeartbeat encodes a heartbeat packet to wire format.
 func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
+	// Calculate size: header + groups + monitor section.
 	size := heartbeatHeaderSize + len(pkt.Groups)*heartbeatGroupSize
+	// Monitor section: NumMonitors(1) + per-monitor(RGID(1)+Flags(1)+Weight(1)+NameLen(1)+Name(N)).
+	monSize := 1 // NumMonitors byte
+	for _, mon := range pkt.Monitors {
+		monSize += 4 + len(mon.Interface) // RGID + Flags + Weight + NameLen + name
+	}
+	size += monSize
+
 	buf := make([]byte, size)
 	copy(buf[0:4], heartbeatMagic)
 	buf[4] = heartbeatVersion
@@ -81,6 +105,24 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 		buf[off+3] = g.Weight
 		buf[off+4] = g.State
 		off += heartbeatGroupSize
+	}
+
+	// Append monitor section.
+	buf[off] = uint8(len(pkt.Monitors))
+	off++
+	for _, mon := range pkt.Monitors {
+		buf[off] = mon.RGID
+		flags := uint8(0)
+		if mon.Up {
+			flags |= 1
+		}
+		buf[off+1] = flags
+		buf[off+2] = mon.Weight
+		nameBytes := []byte(mon.Interface)
+		buf[off+3] = uint8(len(nameBytes))
+		off += 4
+		copy(buf[off:off+len(nameBytes)], nameBytes)
+		off += len(nameBytes)
 	}
 	return buf
 }
@@ -119,6 +161,35 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 		}
 		off += heartbeatGroupSize
 	}
+
+	// Parse monitor section if present (backwards compatible — old packets
+	// without monitors just have no remaining data).
+	if off < len(data) {
+		numMonitors := int(data[off])
+		off++
+		for i := 0; i < numMonitors; i++ {
+			if off+4 > len(data) {
+				return nil, fmt.Errorf("heartbeat monitor truncated at entry %d", i)
+			}
+			rgID := data[off]
+			up := data[off+1]&1 != 0
+			weight := data[off+2]
+			nameLen := int(data[off+3])
+			off += 4
+			if off+nameLen > len(data) {
+				return nil, fmt.Errorf("heartbeat monitor name truncated at entry %d", i)
+			}
+			name := string(data[off : off+nameLen])
+			off += nameLen
+			pkt.Monitors = append(pkt.Monitors, HeartbeatMonitor{
+				RGID:      rgID,
+				Weight:    weight,
+				Up:        up,
+				Interface: name,
+			})
+		}
+	}
+
 	return pkt, nil
 }
 

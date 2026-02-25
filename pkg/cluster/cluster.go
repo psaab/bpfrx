@@ -85,6 +85,7 @@ type Manager struct {
 	peerAlive    bool
 	peerNodeID   int
 	peerGroups   map[int]PeerGroupState
+	peerMonitors []InterfaceMonitorInfo
 
 	// Heartbeat goroutines (nil when not started).
 	hbSender   *heartbeatSender
@@ -146,6 +147,19 @@ func (m *Manager) PeerGroupStates() map[int]PeerGroupState {
 	for k, v := range m.peerGroups {
 		cp[k] = v
 	}
+	return cp
+}
+
+// PeerMonitorStatuses returns the peer's interface monitor states from heartbeat.
+// Returns nil if peer is not alive or no monitor data received.
+func (m *Manager) PeerMonitorStatuses() []InterfaceMonitorInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.peerMonitors) == 0 {
+		return nil
+	}
+	cp := make([]InterfaceMonitorInfo, len(m.peerMonitors))
+	copy(cp, m.peerMonitors)
 	return cp
 }
 
@@ -573,6 +587,16 @@ func (m *Manager) StopHeartbeat() {
 // buildHeartbeat creates a heartbeat packet from current state.
 func (m *Manager) buildHeartbeat() *HeartbeatPacket {
 	m.mu.RLock()
+	mon := m.monitor
+	m.mu.RUnlock()
+
+	// Collect local interface statuses outside the lock (monitor has its own).
+	var localStatuses []InterfaceMonitorInfo
+	if mon != nil {
+		localStatuses = mon.LocalInterfaceStatuses()
+	}
+
+	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	pkt := &HeartbeatPacket{
@@ -585,6 +609,16 @@ func (m *Manager) buildHeartbeat() *HeartbeatPacket {
 			Priority: uint16(rg.LocalPriority),
 			Weight:   uint8(rg.Weight),
 			State:    uint8(rg.State),
+		})
+	}
+
+	// Include local interface monitor statuses.
+	for _, ls := range localStatuses {
+		pkt.Monitors = append(pkt.Monitors, HeartbeatMonitor{
+			RGID:      uint8(ls.RedundancyGroup),
+			Weight:    uint8(ls.Weight),
+			Up:        ls.Up,
+			Interface: ls.Interface,
 		})
 	}
 	return pkt
@@ -607,6 +641,21 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 			Weight:   int(g.Weight),
 			State:    NodeState(g.State),
 		}
+	}
+
+	// Update peer interface monitor statuses.
+	if len(pkt.Monitors) > 0 {
+		m.peerMonitors = make([]InterfaceMonitorInfo, len(pkt.Monitors))
+		for i, mon := range pkt.Monitors {
+			m.peerMonitors[i] = InterfaceMonitorInfo{
+				Interface:       mon.Interface,
+				Weight:          int(mon.Weight),
+				Up:              mon.Up,
+				RedundancyGroup: int(mon.RGID),
+			}
+		}
+	} else {
+		m.peerMonitors = nil
 	}
 
 	// Update PeerPriority on local RG state for display.
@@ -636,6 +685,7 @@ func (m *Manager) handlePeerTimeout() {
 
 	m.peerAlive = false
 	m.peerGroups = make(map[int]PeerGroupState)
+	m.peerMonitors = nil
 	slog.Warn("cluster: peer heartbeat timeout, marking peer lost")
 	m.history.Record(EventHeartbeat, -1, "Peer heartbeat timeout")
 
@@ -1183,6 +1233,7 @@ type InterfacesInput struct {
 	FabricInterface  string
 	Reths            []RethInfo
 	Monitors         []InterfaceMonitorInfo
+	PeerMonitors     []InterfaceMonitorInfo
 }
 
 // FormatInterfaces returns cluster interface information matching vSRX output.
@@ -1246,12 +1297,21 @@ func (m *Manager) FormatInterfaces(input InterfacesInput) string {
 		fmt.Fprintln(&b)
 	}
 
-	// Interface Monitoring.
-	if len(input.Monitors) > 0 {
+	// Interface Monitoring — merge local + peer monitors and sort by RG then name.
+	allMonitors := make([]InterfaceMonitorInfo, 0, len(input.Monitors)+len(input.PeerMonitors))
+	allMonitors = append(allMonitors, input.Monitors...)
+	allMonitors = append(allMonitors, input.PeerMonitors...)
+	if len(allMonitors) > 0 {
+		sort.Slice(allMonitors, func(i, j int) bool {
+			if allMonitors[i].RedundancyGroup != allMonitors[j].RedundancyGroup {
+				return allMonitors[i].RedundancyGroup < allMonitors[j].RedundancyGroup
+			}
+			return allMonitors[i].Interface < allMonitors[j].Interface
+		})
 		fmt.Fprintln(&b, "Interface Monitoring:")
 		fmt.Fprintf(&b, "    %-18s%-10s%-26s%s\n", "Interface", "Weight", "Status", "Redundancy-group")
 		fmt.Fprintf(&b, "    %-18s%-10s%s\n", "", "", "(Physical/Monitored)")
-		for _, mon := range input.Monitors {
+		for _, mon := range allMonitors {
 			physStatus := "Up"
 			if !mon.Up {
 				physStatus = "Down"

@@ -10383,7 +10383,8 @@ func (c *CLI) buildInterfacesInput() cluster.InterfacesInput {
 	}
 	sort.Slice(input.Reths, func(i, j int) bool { return input.Reths[i].Name < input.Reths[j].Name })
 
-	// Build interface monitor info.
+	// Build local interface monitor info.
+	localMonMap := make(map[string]bool) // track which interfaces are local
 	monStatuses := make(map[int][]routing.InterfaceMonitorStatus)
 	if c.routing != nil {
 		if ms := c.routing.InterfaceMonitorStatuses(); ms != nil {
@@ -10399,6 +10400,7 @@ func (c *CLI) buildInterfacesInput() cluster.InterfacesInput {
 					Up:              st.Up,
 					RedundancyGroup: rg.ID,
 				})
+				localMonMap[st.Interface] = true
 			}
 		} else {
 			for _, mon := range rg.InterfaceMonitors {
@@ -10408,9 +10410,38 @@ func (c *CLI) buildInterfacesInput() cluster.InterfacesInput {
 					Up:              true, // unknown, assume up
 					RedundancyGroup: rg.ID,
 				})
+				localMonMap[mon.Interface] = true
 			}
 		}
 	}
+
+	// Build peer interface monitor info from heartbeat.
+	if c.cluster != nil {
+		peerLive := c.cluster.PeerMonitorStatuses()
+		peerMap := make(map[string]bool)
+		for _, pm := range peerLive {
+			peerMap[pm.Interface] = true
+			input.PeerMonitors = append(input.PeerMonitors, pm)
+		}
+		// Fill config-only peer monitors (not local, not in heartbeat) as down.
+		for _, rg := range cc.RedundancyGroups {
+			for _, mon := range rg.InterfaceMonitors {
+				if localMonMap[mon.Interface] {
+					continue
+				}
+				if peerMap[mon.Interface] {
+					continue
+				}
+				input.PeerMonitors = append(input.PeerMonitors, cluster.InterfaceMonitorInfo{
+					Interface:       mon.Interface,
+					Weight:          mon.Weight,
+					Up:              false,
+					RedundancyGroup: rg.ID,
+				})
+			}
+		}
+	}
+
 	return input
 }
 
