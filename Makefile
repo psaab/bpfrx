@@ -12,7 +12,7 @@ LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime
 # eBPF compilation flags
 BPF_CFLAGS := -O2 -g -Wall -Werror -target bpf
 
-.PHONY: all generate build build-ctl proto install clean test build-dpdk-worker build-dpdk clean-dpdk
+.PHONY: all generate build build-ctl proto install clean test test-connectivity build-dpdk-worker build-dpdk clean-dpdk
 
 all: generate build build-ctl
 
@@ -85,6 +85,11 @@ test-logs:
 
 test-journal:
 	./test/incus/setup.sh journal
+
+# Connectivity tests (standalone + cluster, VRF-aware)
+MODE ?= all
+test-connectivity:
+	./test/incus/test-connectivity.sh $(MODE)
 
 # Cluster HA test environment (two-VM chassis cluster)
 NODE ?= all
