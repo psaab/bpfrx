@@ -2,6 +2,12 @@
 
 ## Critical Bugs
 
+### BulkSync nil pointer panic after SO_REUSEPORT fix (`e3ceebe`)
+- **Symptom:** `panic: runtime error: invalid memory address or nil pointer dereference` in `BulkSync()` at `sync.go:402` — 3 crash-loops on fw0 after cluster deploy
+- **Root cause:** `NewSessionSync()` created with `dp=nil`; `SetDataPlane()` called later during daemon startup. Previously masked by 60s socket bind retry delay (old sockets blocked rebind). After adding `SO_REUSEPORT`, sockets bind immediately → peer connects before dp is wired → `BulkSync()` calls `s.dp.IterateSessions()` on nil dp
+- **Fix:** Added `if s.dp == nil { return fmt.Errorf("dataplane not ready") }` guard at top of `BulkSync()`. Callers already handle error gracefully (log warning, continue). `handleMessage()` already had per-case `if s.dp != nil` guards — no change needed there
+- **Lesson:** When removing timing-dependent workarounds (bind retries), audit all code paths that assumed the old timing provided implicit ordering guarantees
+
 ### NAT64 TCP broken on generic XDP (CHECKSUM_PARTIAL corruption) (`78baec0`)
 - **Symptom:** NAT64 TCP (iperf3 via `64:ff9b::`) fails with bad checksum; ICMP ping works
 - **Root cause:** Three interacting bugs:

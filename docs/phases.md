@@ -2011,3 +2011,38 @@ of being resolved once outside (which failed permanently if fab0 had no address)
 
 ### Files
 1 file changed (53 insertions, 28 deletions) -- `pkg/daemon/daemon.go`
+
+## Deploy Restart Resilience (`e3ceebe`)
+
+### Overview
+Fixed three issues that caused stale BPF state and socket bind failures after
+`make cluster-deploy` / `make test-deploy`. The deploy cycle replaces the binary,
+requiring full BPF cleanup — but the deploy scripts only ran `systemctl stop` +
+`pkill -9`, leaving pinned BPF maps/links and sometimes bound sockets.
+
+### Problem
+1. **Stale BPF state:** `bpfrxd` hitless restart (`Close()`) preserves pinned BPF
+   maps/links by design. Deploy scripts replace the binary, so the old pins are
+   incompatible. Without `bpfrxd cleanup`, the new daemon inherits stale state.
+2. **Socket bind failures:** `pkill -9` interrupted graceful shutdown, leaving
+   heartbeat (UDP:4784) and sync (TCP:4785) sockets bound. New daemon's 30-retry
+   bind loop would fail for 60+ seconds.
+3. **BulkSync nil pointer panic:** Fixing #2 with `SO_REUSEPORT` allowed immediate
+   socket bind, exposing a latent race — peer connects before `SetDataPlane()` is
+   called, so `BulkSync()` called `s.dp.IterateSessions()` with `s.dp == nil`.
+
+### Changes
+1. **`pkg/cluster/cluster.go` — `vrfListenConfig()`:** Always set `SO_REUSEADDR` +
+   `SO_REUSEPORT` on sockets (even without VRF), allowing immediate rebind after restart.
+2. **`pkg/cluster/sync.go` — `BulkSync()`:** Added `if s.dp == nil` guard returning
+   error when dataplane isn't wired yet. Callers already handle errors gracefully.
+3. **`test/incus/cluster-setup.sh` + `test/incus/setup.sh`:** Deploy scripts now run
+   `bpfrxd cleanup` between `systemctl stop` and binary push, removing pinned BPF
+   maps/links. `pkill -9` kept as safety net.
+
+### Files
+4 files changed
+- `pkg/cluster/cluster.go` — SO_REUSEADDR + SO_REUSEPORT in vrfListenConfig()
+- `pkg/cluster/sync.go` — nil dp guard in BulkSync()
+- `test/incus/cluster-setup.sh` — bpfrxd cleanup in deploy_vm()
+- `test/incus/setup.sh` — bpfrxd cleanup in deploy step
