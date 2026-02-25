@@ -8335,6 +8335,54 @@ func TestChassisClusterSyncOptionsHierarchical(t *testing.T) {
 	}
 }
 
+func TestChassisClusterRethAdvertiseInterval(t *testing.T) {
+	commands := []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster reth-advertise-interval 30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range commands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if cfg.Chassis.Cluster.RethAdvertiseInterval != 30 {
+		t.Errorf("RethAdvertiseInterval = %d, want 30", cfg.Chassis.Cluster.RethAdvertiseInterval)
+	}
+}
+
+func TestChassisClusterRethAdvertiseIntervalHierarchical(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+        reth-advertise-interval 50;
+    }
+}`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if cfg.Chassis.Cluster.RethAdvertiseInterval != 50 {
+		t.Errorf("RethAdvertiseInterval = %d, want 50", cfg.Chassis.Cluster.RethAdvertiseInterval)
+	}
+}
+
 func TestChassisClusterIPMonitoring(t *testing.T) {
 	input := `chassis {
     cluster {

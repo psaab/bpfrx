@@ -21,6 +21,7 @@ type Instance struct {
 	AuthKey           string
 	TrackInterface    string
 	TrackPriorityCost int
+	GARPCount         int // gratuitous ARP count per VIP on failover; 0 = default (3)
 }
 
 // CollectInstances extracts VRRP instances from the interface config.
@@ -60,11 +61,29 @@ func CollectInstances(cfg *config.Config) []*Instance {
 // CollectRethInstances generates VRRP instances for RETH interfaces that have
 // a RedundancyGroup > 0. These provide VRRP-backed failover for HA cluster
 // RETH interfaces. VRID = 100 + redundancyGroupID.
+//
+// The advertisement interval defaults to 30ms for sub-100ms failover detection.
+// Override via chassis cluster reth-advertise-interval in config.
+// GARP counts are read per-RG from chassis cluster redundancy-group gratuitous-arp-count.
 func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Instance {
 	if cfg == nil {
 		return nil
 	}
 	rethToPhys := cfg.RethToPhysical()
+
+	// Read cluster-level settings for RETH VRRP instances.
+	advertInterval := 30 // 30ms default for sub-100ms failover
+	garpCounts := map[int]int{}
+	if cc := cfg.Chassis.Cluster; cc != nil {
+		if cc.RethAdvertiseInterval > 0 {
+			advertInterval = cc.RethAdvertiseInterval
+		}
+		for _, rg := range cc.RedundancyGroups {
+			if rg.GratuitousARPCount > 0 {
+				garpCounts[rg.ID] = rg.GratuitousARPCount
+			}
+		}
+	}
 
 	// Sort interface names for deterministic output.
 	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
@@ -85,6 +104,8 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 		if pri == 0 {
 			pri = 100 // default to secondary priority
 		}
+
+		gc := garpCounts[rgID] // 0 = use default (3)
 
 		// Resolve reth → physical member (no bond device)
 		physName := ifc.Name
@@ -119,7 +140,8 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 					Priority:          pri,
 					Preempt:           true,
 					AcceptData:        true,
-					AdvertiseInterval: 250,
+					AdvertiseInterval: advertInterval,
+					GARPCount:         gc,
 					VirtualAddresses:  unit.Addresses,
 				})
 			}
@@ -137,7 +159,8 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 				Priority:          pri,
 				Preempt:           true,
 				AcceptData:        true,
-				AdvertiseInterval: 250,
+				AdvertiseInterval: advertInterval,
+				GARPCount:         gc,
 				VirtualAddresses:  vips,
 			})
 		}

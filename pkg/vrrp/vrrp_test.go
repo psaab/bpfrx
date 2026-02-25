@@ -73,8 +73,8 @@ func TestCollectRethInstances(t *testing.T) {
 	if !inst0.AcceptData {
 		t.Error("inst0.AcceptData should be true")
 	}
-	if inst0.AdvertiseInterval != 250 {
-		t.Errorf("inst0.AdvertiseInterval = %d, want 250", inst0.AdvertiseInterval)
+	if inst0.AdvertiseInterval != 30 {
+		t.Errorf("inst0.AdvertiseInterval = %d, want 30", inst0.AdvertiseInterval)
 	}
 	// Unit 0 addresses then unit 1 (sorted by unit number).
 	wantVIPs := []string{"10.0.1.1/24", "10.0.1.2/24", "10.0.2.1/24"}
@@ -233,6 +233,70 @@ func TestCollectRethInstances_VlanTagging(t *testing.T) {
 	}
 	if inst1.Priority != 100 {
 		t.Errorf("inst1.Priority = %d, want 100", inst1.Priority)
+	}
+}
+
+func TestCollectRethInstances_ConfigurableInterval(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name:            "reth0",
+					RedundancyGroup: 1,
+					Units: map[int]*config.InterfaceUnit{
+						0: {Addresses: []string{"10.0.1.1/24"}},
+					},
+				},
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
+			},
+		},
+		Chassis: config.ChassisConfig{
+			Cluster: &config.ClusterConfig{
+				RethAdvertiseInterval: 50,
+				RedundancyGroups: []*config.RedundancyGroup{
+					{ID: 1, GratuitousARPCount: 5},
+				},
+			},
+		},
+	}
+	instances := CollectRethInstances(cfg, map[int]int{1: 200})
+	if len(instances) != 1 {
+		t.Fatalf("expected 1 instance, got %d", len(instances))
+	}
+	if instances[0].AdvertiseInterval != 50 {
+		t.Errorf("AdvertiseInterval = %d, want 50", instances[0].AdvertiseInterval)
+	}
+	if instances[0].GARPCount != 5 {
+		t.Errorf("GARPCount = %d, want 5", instances[0].GARPCount)
+	}
+}
+
+func TestCollectRethInstances_DefaultInterval30ms(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name:            "reth0",
+					RedundancyGroup: 1,
+					Units: map[int]*config.InterfaceUnit{
+						0: {Addresses: []string{"10.0.1.1/24"}},
+					},
+				},
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
+			},
+		},
+	}
+	instances := CollectRethInstances(cfg, map[int]int{1: 200})
+	if len(instances) != 1 {
+		t.Fatalf("expected 1 instance, got %d", len(instances))
+	}
+	// Default should be 30ms for sub-100ms failover.
+	if instances[0].AdvertiseInterval != 30 {
+		t.Errorf("AdvertiseInterval = %d, want 30 (default)", instances[0].AdvertiseInterval)
+	}
+	// GARP count should be 0 (use default of 3 at runtime).
+	if instances[0].GARPCount != 0 {
+		t.Errorf("GARPCount = %d, want 0 (default)", instances[0].GARPCount)
 	}
 }
 

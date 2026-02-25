@@ -99,6 +99,70 @@ func buildGratuitousARP(mac net.HardwareAddr, ip net.IP, opcode uint16) []byte {
 	return pkt
 }
 
+// SendGratuitousARPBurst sends one immediate GARP pair (request + reply), then
+// schedules (count-1) follow-up pairs at 50ms intervals in a background goroutine.
+// Returns after the first pair is sent (<1ms), making it suitable for the
+// critical failover path.
+func SendGratuitousARPBurst(iface string, ip net.IP, count int) error {
+	if count <= 0 {
+		count = 1
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return fmt.Errorf("not an IPv4 address: %s", ip)
+	}
+
+	ifi, err := net.InterfaceByName(iface)
+	if err != nil {
+		return fmt.Errorf("interface %s: %w", iface, err)
+	}
+
+	reqPkt := buildGratuitousARP(ifi.HardwareAddr, ip4, 1) // ARP Request
+	repPkt := buildGratuitousARP(ifi.HardwareAddr, ip4, 2) // ARP Reply
+
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ARP)))
+	if err != nil {
+		return fmt.Errorf("raw socket: %w", err)
+	}
+
+	addr := unix.SockaddrLinklayer{
+		Protocol: htons(unix.ETH_P_ARP),
+		Ifindex:  ifi.Index,
+		Halen:    6,
+	}
+	copy(addr.Addr[:], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+
+	// Send first pair synchronously (immediate).
+	if err := unix.Sendto(fd, reqPkt, 0, &addr); err != nil {
+		unix.Close(fd)
+		return fmt.Errorf("sendto request: %w", err)
+	}
+	if err := unix.Sendto(fd, repPkt, 0, &addr); err != nil {
+		unix.Close(fd)
+		return fmt.Errorf("sendto reply: %w", err)
+	}
+
+	slog.Info("cluster: sent gratuitous ARP burst (1st pair)",
+		"interface", iface, "ip", ip4.String(), "total", count)
+
+	// Schedule remaining pairs in background.
+	if count > 1 {
+		go func() {
+			defer unix.Close(fd)
+			for i := 1; i < count; i++ {
+				time.Sleep(50 * time.Millisecond)
+				unix.Sendto(fd, reqPkt, 0, &addr) //nolint:errcheck
+				unix.Sendto(fd, repPkt, 0, &addr) //nolint:errcheck
+			}
+		}()
+	} else {
+		unix.Close(fd)
+	}
+
+	return nil
+}
+
 // SendARPProbe sends a standard ARP Request for targetIP from the interface's
 // primary address. This forces the target (typically a router) to respond,
 // updating its ARP cache with our MAC as a side effect.
@@ -225,6 +289,64 @@ func SendGratuitousIPv6(iface string, ip net.IP, count int) error {
 
 	slog.Info("cluster: sent unsolicited IPv6 NA",
 		"interface", iface, "ip", ip6.String(), "count", count)
+	return nil
+}
+
+// SendGratuitousIPv6Burst sends one immediate unsolicited NA, then schedules
+// (count-1) follow-ups at 50ms intervals in a background goroutine.
+// Returns after the first NA is sent, making it suitable for the critical
+// failover path.
+func SendGratuitousIPv6Burst(iface string, ip net.IP, count int) error {
+	if count <= 0 {
+		count = 1
+	}
+
+	ip6 := ip.To16()
+	if ip6 == nil || ip6.To4() != nil {
+		return fmt.Errorf("not an IPv6 address: %s", ip)
+	}
+
+	ifi, err := net.InterfaceByName(iface)
+	if err != nil {
+		return fmt.Errorf("interface %s: %w", iface, err)
+	}
+
+	pkt := buildUnsolicitedNA(ifi.HardwareAddr, ip6)
+
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_IPV6)))
+	if err != nil {
+		return fmt.Errorf("raw socket: %w", err)
+	}
+
+	addr := unix.SockaddrLinklayer{
+		Protocol: htons(unix.ETH_P_IPV6),
+		Ifindex:  ifi.Index,
+		Halen:    6,
+	}
+	copy(addr.Addr[:], []byte{0x33, 0x33, 0x00, 0x00, 0x00, 0x01})
+
+	// Send first NA synchronously (immediate).
+	if err := unix.Sendto(fd, pkt, 0, &addr); err != nil {
+		unix.Close(fd)
+		return fmt.Errorf("sendto: %w", err)
+	}
+
+	slog.Info("cluster: sent unsolicited IPv6 NA burst (1st)",
+		"interface", iface, "ip", ip6.String(), "total", count)
+
+	// Schedule remaining NAs in background.
+	if count > 1 {
+		go func() {
+			defer unix.Close(fd)
+			for i := 1; i < count; i++ {
+				time.Sleep(50 * time.Millisecond)
+				unix.Sendto(fd, pkt, 0, &addr) //nolint:errcheck
+			}
+		}()
+	} else {
+		unix.Close(fd)
+	}
+
 	return nil
 }
 

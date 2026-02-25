@@ -276,8 +276,11 @@ func (vi *vrrpInstance) run() {
 		case StateMaster:
 			select {
 			case <-vi.stopCh:
-				// Send priority-0 advertisement to signal resignation.
-				vi.sendAdvert(0)
+				// Send burst of priority-0 advertisements to signal resignation.
+				// Multiple adverts improve reliability if one is lost on the wire.
+				for i := 0; i < 3; i++ {
+					vi.sendAdvert(0)
+				}
 				vi.removeVIPs()
 				return
 			case pkt := <-vi.rxCh:
@@ -448,9 +451,13 @@ func (vi *vrrpInstance) receiverAfPacket() {
 func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer *time.Timer) {
 	pri := vi.getPriority()
 	if pkt.Priority == 0 {
-		// Master is resigning — use short timer.
-		skew := time.Duration(256-pri) * vi.advertInterval() / 256
-		masterDownTimer.Reset(skew)
+		// Master is explicitly resigning — become Master immediately.
+		// RFC 5798 says use skew timer, but with only 2 HA nodes there's
+		// no contention risk, and immediate transition gives zero-delay
+		// planned failover (systemctl stop on primary).
+		slog.Info("vrrp: peer resigned (priority 0), immediate takeover",
+			"key", vi.key())
+		masterDownTimer.Reset(time.Millisecond)
 		return
 	}
 
@@ -478,16 +485,19 @@ func (vi *vrrpInstance) handleMasterRx(pkt *VRRPPacket, masterDownTimer, advertT
 	// Equal or lower priority: ignore (we stay Master).
 }
 
-// becomeMaster transitions to Master state: add VIPs, send GARP/NA, send advert.
+// becomeMaster transitions to Master state: add VIPs, send advert, emit event,
+// then send GARP/NA asynchronously. The critical path is addVIPs (kernel needs
+// VIP addresses for bpf_fib_lookup) + sendAdvert (tells peer to step down).
+// GARP only updates L2 switch/router MAC tables and runs in the background.
 func (vi *vrrpInstance) becomeMaster() {
 	pri := vi.getPriority()
 	slog.Info("vrrp: transitioning to MASTER",
 		"key", vi.key(), "priority", pri)
 	vi.setState(StateMaster)
 	vi.addVIPs()
-	vi.sendGARP()
 	vi.sendAdvert(pri)
 	vi.emitEvent()
+	go vi.sendGARP()
 }
 
 // becomeBackup transitions to Backup state: remove VIPs, reset timers.
@@ -553,7 +563,7 @@ func (vi *vrrpInstance) sendAdvert(priority int) {
 
 	// Send IPv6 advertisement if we have any IPv6 VIPs.
 	if hasIPv6 && len(v6Addrs) > 0 {
-		maxAdvert := uint16(vi.cfg.AdvertiseInterval * 100)
+		maxAdvert := uint16(vi.cfg.AdvertiseInterval / 10) // ms → centiseconds
 		pkt := &VRRPPacket{
 			VRID:         uint8(vi.cfg.GroupID),
 			Priority:     uint8(priority),
@@ -688,18 +698,25 @@ func (vi *vrrpInstance) removeVIPs() {
 }
 
 // sendGARP sends gratuitous ARP (IPv4) and unsolicited NA (IPv6) for all VIPs.
-// After each IPv4 GARP, also sends a standard ARP probe to the subnet's
+// Uses burst mode: one immediate pair then background follow-ups at 50ms intervals.
+// After each IPv4 GARP burst, also sends a standard ARP probe to the subnet's
 // gateway (.1) address. Some routers ignore gratuitous ARP but always update
 // their ARP cache when they receive a standard ARP Request with the VIP as
 // the source address.
+//
+// This method may be called in a goroutine from becomeMaster().
 func (vi *vrrpInstance) sendGARP() {
+	count := vi.cfg.GARPCount
+	if count <= 0 {
+		count = 3 // default
+	}
 	for _, vip := range vi.cfg.VirtualAddresses {
 		ip, ipNet, err := net.ParseCIDR(vip)
 		if err != nil {
 			continue
 		}
 		if ip.To4() != nil {
-			if err := cluster.SendGratuitousARP(vi.cfg.Interface, ip, 3); err != nil {
+			if err := cluster.SendGratuitousARPBurst(vi.cfg.Interface, ip, count); err != nil {
 				slog.Warn("vrrp: GARP failed", "key", vi.key(), "vip", ip, "err", err)
 			}
 			// Probe the .1 address of the VIP subnet — this is the most
@@ -718,7 +735,7 @@ func (vi *vrrpInstance) sendGARP() {
 				}
 			}
 		} else {
-			if err := cluster.SendGratuitousIPv6(vi.cfg.Interface, ip, 3); err != nil {
+			if err := cluster.SendGratuitousIPv6Burst(vi.cfg.Interface, ip, count); err != nil {
 				slog.Warn("vrrp: NA failed", "key", vi.key(), "vip", ip, "err", err)
 			}
 		}

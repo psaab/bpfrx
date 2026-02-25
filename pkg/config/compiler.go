@@ -5989,6 +5989,13 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 	if clusterNode.FindChild("ipsec-session-synchronization") != nil {
 		ch.Cluster.IPsecSASync = true
 	}
+	if n := clusterNode.FindChild("reth-advertise-interval"); n != nil {
+		if v := nodeVal(n); v != "" {
+			if ms, err := strconv.Atoi(v); err == nil {
+				ch.Cluster.RethAdvertiseInterval = ms
+			}
+		}
+	}
 
 	for _, rgInst := range namedInstances(clusterNode.FindChildren("redundancy-group")) {
 		rgID := 0
