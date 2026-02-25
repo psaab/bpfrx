@@ -213,3 +213,33 @@ func TestGCRunWithCallbacks(t *testing.T) {
 		t.Fatalf("expected 1 callback from Run, got %d", called)
 	}
 }
+
+func TestGCScratchBuffersReused(t *testing.T) {
+	now := monotonicSeconds()
+	fwdKey := dataplane.SessionKey{Protocol: 6, SrcPort: 1000, DstPort: 80}
+	revKey := dataplane.SessionKey{Protocol: 6, SrcPort: 80, DstPort: 1000}
+
+	dp := &mockGCDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			fwdKey: {
+				IsReverse: 0, LastSeen: now - 200, Timeout: 100,
+				ReverseKey: revKey,
+			},
+			revKey: {
+				IsReverse: 1, LastSeen: now - 200, Timeout: 100,
+			},
+		},
+		v6sessions: map[dataplane.SessionKeyV6]dataplane.SessionValueV6{},
+	}
+
+	gc := NewGC(dp, time.Minute)
+	if cap(gc.toDeleteV4) == 0 || cap(gc.snatExpiredV4) == 0 || cap(gc.toDeleteV6) == 0 || cap(gc.snatExpiredV6) == 0 {
+		t.Fatalf("expected preallocated scratch buffers")
+	}
+
+	gc.sweep()
+
+	if len(gc.toDeleteV4) != 0 || len(gc.snatExpiredV4) != 0 || len(gc.toDeleteV6) != 0 || len(gc.snatExpiredV6) != 0 {
+		t.Fatalf("expected scratch buffers reset after sweep")
+	}
+}

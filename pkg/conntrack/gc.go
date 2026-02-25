@@ -34,11 +34,25 @@ type GC struct {
 
 	lastV6Count int // v6 entries found in previous sweep
 	sweepCount  int // sweep counter for periodic forced v6 check
+
+	// Reused scratch slices to reduce per-sweep allocations.
+	toDeleteV4    []dataplane.SessionKey
+	snatExpiredV4 []expiredSession
+	toDeleteV6    []dataplane.SessionKeyV6
+	snatExpiredV6 []expiredSessionV6
 }
 
 // NewGC creates a new session garbage collector.
 func NewGC(dp dataplane.DataPlane, interval time.Duration) *GC {
-	return &GC{dp: dp, interval: interval, lastV6Count: -1}
+	return &GC{
+		dp:            dp,
+		interval:      interval,
+		lastV6Count:   -1,
+		toDeleteV4:    make([]dataplane.SessionKey, 0, 256),
+		snatExpiredV4: make([]expiredSession, 0, 64),
+		toDeleteV6:    make([]dataplane.SessionKeyV6, 0, 128),
+		snatExpiredV6: make([]expiredSessionV6, 0, 32),
+	}
 }
 
 // Stats returns a snapshot of the most recent GC sweep statistics.
@@ -82,8 +96,8 @@ func (gc *GC) sweep() {
 	now := monotonicSeconds()
 
 	var total, established, expired int
-	var toDelete []dataplane.SessionKey
-	var snatExpired []expiredSession
+	toDelete := gc.toDeleteV4[:0]
+	snatExpired := gc.snatExpiredV4[:0]
 
 	// IPv4 sessions — batch iteration reduces kernel lock contention
 	err := gc.dp.BatchIterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
@@ -173,8 +187,8 @@ func (gc *GC) sweep() {
 	// IPv6 sessions — skip iteration when previous sweep found zero entries,
 	// but force a check every 6th sweep (60s at default 10s interval).
 	gc.sweepCount++
-	var toDeleteV6 []dataplane.SessionKeyV6
-	var snatExpiredV6 []expiredSessionV6
+	toDeleteV6 := gc.toDeleteV6[:0]
+	snatExpiredV6 := gc.snatExpiredV6[:0]
 	skipV6 := gc.lastV6Count == 0 && gc.sweepCount%6 != 0
 
 	if !skipV6 {
@@ -257,6 +271,12 @@ func (gc *GC) sweep() {
 			slog.Info("persistent NAT GC", "removed", removed)
 		}
 	}
+
+	// Keep allocated backing arrays for reuse on the next sweep.
+	gc.toDeleteV4 = toDelete[:0]
+	gc.snatExpiredV4 = snatExpired[:0]
+	gc.toDeleteV6 = toDeleteV6[:0]
+	gc.snatExpiredV6 = snatExpiredV6[:0]
 
 	totalSnatCleaned := len(snatExpired) + len(snatExpiredV6)
 	if expired > 0 {
