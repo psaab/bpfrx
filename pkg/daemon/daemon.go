@@ -249,17 +249,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// WaitGroup for coordinated shutdown of background goroutines
 	var wg sync.WaitGroup
 
-	// Wire dataplane into session sync (dp is loaded after cluster init).
-	if d.sessionSync != nil && d.dp != nil {
-		d.sessionSync.SetDataPlane(d.dp)
-		d.sessionSync.IsPrimaryFn = func() bool {
-			return d.cluster != nil && d.cluster.IsLocalPrimary(0)
-		}
-		d.sessionSync.IsPrimaryForRGFn = func(rgID int) bool {
-			return d.cluster != nil && d.cluster.IsLocalPrimary(rgID)
-		}
-		d.sessionSync.StartSyncSweep(ctx)
-	}
+	// NOTE: session sync dp wiring + sweep start moved into startClusterComms
+	// goroutine to avoid race: d.sessionSync is created asynchronously.
 
 	// Start background services if dataplane is loaded
 	var er *logging.EventReader
@@ -3474,6 +3465,21 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				}
 				slog.Info("cluster session sync started",
 					"local", syncLocal, "peer", syncPeer, "vrf", vrfDevice)
+
+				// Wire dataplane into session sync and start the sweep.
+				// Must happen here (not in Run) because d.sessionSync is
+				// created asynchronously in this goroutine.
+				if d.dp != nil {
+					d.sessionSync.SetDataPlane(d.dp)
+					d.sessionSync.IsPrimaryFn = func() bool {
+						return d.cluster != nil && d.cluster.IsLocalPrimary(0)
+					}
+					d.sessionSync.IsPrimaryForRGFn = func(rgID int) bool {
+						return d.cluster != nil && d.cluster.IsLocalPrimary(rgID)
+					}
+					d.sessionSync.StartSyncSweep(ctx)
+				}
+
 				break
 			}
 
