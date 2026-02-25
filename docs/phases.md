@@ -1970,6 +1970,30 @@ went through xdp_nat as a pure dispatcher before reaching xdp_nat64.
 - `bpf/xdp/xdp_nat64.c` — FIB cache check/populate in forward path
 - `bpf/xdp/xdp_conntrack.c` — Direct dispatch to XDP_PROG_NAT64
 
+## Copilot PR Fixes (`5110ffe`)
+
+### Overview
+Four fixes sourced from GitHub Copilot draft PRs (#2-#5). Reviewed, validated
+against codebase, and applied.
+
+### Changes
+1. **NAT64 state cleanup (PR #5):** `compileNAT64()` returned early when
+   `len(ruleSets)==0`, skipping `SetNAT64Count(0)` and `DeleteStaleNAT64()`.
+   Removing all NAT64 rules left stale prefixes in BPF maps.
+2. **DNAT wildcard port-0 (PR #3):** Skip redundant `dnat_table` wildcard
+   lookup when `meta->dst_port` is already 0 (both v4 and v6 paths).
+3. **GC scratch buffer reuse (PR #4):** `sweep()` allocated fresh slices
+   every 10s cycle. Reuse backing arrays via `[:0]` reset.
+4. **DHCPv6 nil opts guard (PR #2):** Move `opts==nil` check before
+   `getDUID()` so nil opts returns nil modifiers.
+
+### Files
+5 files changed
+- `pkg/dataplane/compiler.go` — NAT64 cleanup on empty rule-sets
+- `bpf/xdp/xdp_zone.c` — DNAT wildcard port-0 guard (v4 + v6)
+- `pkg/conntrack/gc.go` — Scratch buffer reuse fields + `[:0]` reset
+- `pkg/dhcp/dhcp.go` — nil opts early return before getDUID()
+
 ## Graceful Startup Retry for Cluster Heartbeat and Sync (`2199e52`)
 
 ### Overview
