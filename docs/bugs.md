@@ -2,6 +2,21 @@
 
 ## Critical Bugs
 
+### NAT64 TCP broken on generic XDP (CHECKSUM_PARTIAL corruption) (`78baec0`)
+- **Symptom:** NAT64 TCP (iperf3 via `64:ff9b::`) fails with bad checksum; ICMP ping works
+- **Root cause:** Three interacting bugs:
+  1. **xdp_policy.c session key corruption:** `meta->src_ip` was overwritten with SNAT IPv4 addr BEFORE `create_session_v6()` used it as session key source. Fix: use `nat_src_ip` as scratch, overwrite `src_ip` after session creation.
+  2. **xdp_conntrack.c + xdp_zone.c NAT64 flag propagation:** On established session hits, `SESS_FLAG_NAT64` was not propagated from session flags to `meta->nat_flags`, so `xdp_nat` never dispatched to `xdp_nat64` for existing sessions.
+  3. **xdp_nat64.c CHECKSUM_PARTIAL corruption:** Generic XDP (virtio-net) preserves `skb->ip_summed=CHECKSUM_PARTIAL` through `bpf_redirect_map`. From-scratch TCP/UDP checksum was complete, but kernel/NIC finalizes by adding L4 byte sums to the existing check field — corrupting it.
+- **Fix for #3:** Split into two paths based on `meta->csum_partial`:
+  - `csum_partial=1`: write only IPv4 pseudo-header seed (`csum_fold(ph)` without complement). Kernel's `skb_checksum_help` finalizes by summing L4 bytes + seed.
+  - `csum_partial=0`: compute full from-scratch checksum (existing loop + `~csum_fold(sum)`)
+  - ICMPv4 (no pseudo-header): set `checksum=0` for CHECKSUM_PARTIAL (kernel sums all ICMP bytes)
+- **Why NAT44 wasn't affected:** NAT44 uses incremental checksum updates compatible with CHECKSUM_PARTIAL
+- **Why ICMP ping worked:** ICMPv6→ICMPv4 checksum happened to be correct because the from-scratch sum for short ICMP echo packets was finalized correctly
+- **Key insight:** `bpf_xdp_adjust_head(ctx, 20)` for IPv6→IPv4 doesn't move `skb->csum_start` — TCP header stays at same memory address, only `skb->data` shifts
+- **Files:** `bpf/xdp/xdp_nat64.c`, `bpf/xdp/xdp_conntrack.c`, `bpf/xdp/xdp_policy.c`, `bpf/xdp/xdp_zone.c`
+
 ### VRRP manager deadlock on cluster secondary node (`58ad85b`)
 - **Symptom:** `show security vrrp` hangs indefinitely on fw1 (cluster secondary)
 - **Root cause:** Three interacting bugs:

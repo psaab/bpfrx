@@ -1893,6 +1893,52 @@ make test-connectivity MODE=cluster     # Cluster only
 ### Files
 2 files changed (205 insertions) -- `test/incus/test-connectivity.sh`, `Makefile`
 
+## NAT64 TCP/UDP Fix for CHECKSUM_PARTIAL (`78baec0`)
+
+### Overview
+Three interacting bugs prevented NAT64 TCP from working on the HA cluster (generic XDP /
+virtio-net). ICMP ping worked but TCP/UDP checksums were corrupted on egress.
+
+### Bug 1: Session Key Corruption (xdp_policy.c)
+- `meta->src_ip` was overwritten with SNAT IPv4 address BEFORE `create_session_v6()` used it
+  as the session key source, causing sessions to be created with wrong source IPv6 address
+- Fix: use `meta->nat_src_ip` as scratch buffer, overwrite `src_ip` only after session creation
+
+### Bug 2: NAT64 Flag Propagation (xdp_conntrack.c, xdp_zone.c)
+- On established session hits, `SESS_FLAG_NAT64` was not propagated from session flags to
+  `meta->nat_flags`, so `xdp_nat` never dispatched to `xdp_nat64` for existing sessions
+- Fix: add `if (sess->flags & SESS_FLAG_NAT64) meta->nat_flags |= SESS_FLAG_NAT64`
+
+### Bug 3: CHECKSUM_PARTIAL Corruption (xdp_nat64.c)
+- Generic XDP (virtio-net) preserves `skb->ip_summed=CHECKSUM_PARTIAL` through `bpf_redirect_map`
+- From-scratch TCP/UDP checksum was complete, but kernel/NIC finalizes by adding L4 byte sums
+  to the existing check field — corrupting the already-correct checksum
+- Fix: split checksum into two paths based on `meta->csum_partial`:
+  - `csum_partial=1`: write only IPv4 pseudo-header seed (`csum_fold(ph)`, no complement)
+  - `csum_partial=0`: compute full from-scratch checksum (`~csum_fold(sum)`)
+  - ICMPv4 (no pseudo-header): set `checksum=0` for CHECKSUM_PARTIAL, kernel sums all bytes
+- Why NAT44 unaffected: incremental checksum updates are compatible with CHECKSUM_PARTIAL
+- Why ICMP ping worked: short echo packets happened to finalize correctly
+
+### Additional Fixes
+- NAT64 return-path v6 session update: TCP state machine + counters updated on IPv4 return
+  traffic via nat64_state reverse lookup (prevents sessions stuck in SYN_SENT)
+- Removed debug code (bpf_printk, XDP_PASS bypass) and unused `csum_v6_to_v4()` function
+
+### Verified
+- NAT64 TCP: 3.91 Gbps (`iperf3 -c 64:ff9b::172.16.100.247`)
+- NAT64 UDP: 1 Gbps, 0% loss
+- NAT64 ICMP: 0% loss
+- NAT44 TCP: 4.84 Gbps (no regression)
+
+### Files
+10 files changed (188 insertions, 99 deletions)
+- `bpf/xdp/xdp_nat64.c` — CHECKSUM_PARTIAL split, debug removal, csum_v6_to_v4 removal
+- `bpf/xdp/xdp_conntrack.c` — NAT64 flag propagation + return-path v6 session update
+- `bpf/xdp/xdp_policy.c` — Session key corruption fix (nat_src_ip scratch)
+- `bpf/xdp/xdp_zone.c` — NAT64 flag propagation
+- `docs/ha-cluster.conf` — NAT64 rule-set added to cluster config
+
 ## Graceful Startup Retry for Cluster Heartbeat and Sync (`2199e52`)
 
 ### Overview

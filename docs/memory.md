@@ -141,6 +141,13 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - BPF verifier: **pointer bitwise OR prohibited** (`0080cbc`)
   - `if (sv4 || sv6)` where both are pointers → compiler emits `|=` on pointer regs → verifier rejects
   - Fix: use separate `if (ptr != NULL)` checks — NEVER logical OR two BPF pointers
+- **CHECKSUM_PARTIAL in generic XDP (NAT64):** (`78baec0`)
+  - Generic XDP (virtio-net) preserves `skb->ip_summed=CHECKSUM_PARTIAL` through `bpf_redirect_map`
+  - From-scratch checksums get CORRUPTED: kernel/NIC adds L4 byte sum to already-complete value
+  - Fix: when `meta->csum_partial`, write only pseudo-header seed (`csum_fold(ph)` WITHOUT complement)
+  - ICMPv4 (no pseudo-header): set `checksum=0` for CHECKSUM_PARTIAL, kernel sums all bytes
+  - NAT44 unaffected: incremental updates (`csum_update`) are compatible with CHECKSUM_PARTIAL
+  - `bpf_xdp_adjust_head(ctx, 20)` doesn't move `skb->csum_start` — L4 header stays at same memory addr
 - `iter.Next(&key, nil)` crashes in cilium/ebpf v0.20 — use `var val []byte`
 - TTY detection: `unix.IoctlGetTermios(fd, TCGETS)` not `os.ModeCharDevice`
 - Interfaces must be brought UP after XDP/TC attachment (netlink.LinkSetUp)
