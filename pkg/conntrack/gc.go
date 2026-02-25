@@ -34,6 +34,12 @@ type GC struct {
 
 	lastV6Count int // v6 entries found in previous sweep
 	sweepCount  int // sweep counter for periodic forced v6 check
+
+	// Scratch buffers reused across sweeps to reduce allocation churn.
+	toDeleteV4    []dataplane.SessionKey
+	snatExpiredV4 []expiredSession
+	toDeleteV6    []dataplane.SessionKeyV6
+	snatExpiredV6 []expiredSessionV6
 }
 
 // NewGC creates a new session garbage collector.
@@ -82,8 +88,8 @@ func (gc *GC) sweep() {
 	now := monotonicSeconds()
 
 	var total, established, expired int
-	var toDelete []dataplane.SessionKey
-	var snatExpired []expiredSession
+	toDelete := gc.toDeleteV4[:0]
+	snatExpired := gc.snatExpiredV4[:0]
 
 	// IPv4 sessions — batch iteration reduces kernel lock contention
 	err := gc.dp.BatchIterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
@@ -170,11 +176,15 @@ func (gc *GC) sweep() {
 		}
 	}
 
+	// Save scratch buffers for reuse.
+	gc.toDeleteV4 = toDelete
+	gc.snatExpiredV4 = snatExpired
+
 	// IPv6 sessions — skip iteration when previous sweep found zero entries,
 	// but force a check every 6th sweep (60s at default 10s interval).
 	gc.sweepCount++
-	var toDeleteV6 []dataplane.SessionKeyV6
-	var snatExpiredV6 []expiredSessionV6
+	toDeleteV6 := gc.toDeleteV6[:0]
+	snatExpiredV6 := gc.snatExpiredV6[:0]
 	skipV6 := gc.lastV6Count == 0 && gc.sweepCount%6 != 0
 
 	if !skipV6 {
@@ -250,6 +260,10 @@ func (gc *GC) sweep() {
 			slog.Debug("conntrack GC dnat_v6 cleanup failed", "err", err)
 		}
 	}
+
+	// Save v6 scratch buffers for reuse.
+	gc.toDeleteV6 = toDeleteV6
+	gc.snatExpiredV6 = snatExpiredV6
 
 	// Run persistent NAT table GC to expire old bindings
 	if pnat != nil {

@@ -2433,6 +2433,11 @@ func compileNAT64(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 
 	ruleSets := cfg.Security.NAT.NAT64
 	if len(ruleSets) == 0 {
+		// Clear stale NAT64 state when all rule-sets are removed.
+		if err := dp.SetNAT64Count(0); err != nil {
+			return fmt.Errorf("clear NAT64 count: %w", err)
+		}
+		dp.DeleteStaleNAT64(0, writtenPrefixes)
 		return nil
 	}
 
