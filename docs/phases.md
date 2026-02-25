@@ -1769,3 +1769,144 @@ Fixed two bugs preventing reliable cluster reboot: RETH `.link` files using `MAC
 | Single node reboot (fw1) | Interfaces correct, VRRP BACKUP, connectivity OK |
 | Single node reboot (fw0) | Interfaces correct, VRRP MASTER in ~6s, connectivity OK |
 | Simultaneous reboot (both) | Both converge within ~10s, fw0 MASTER, all VIPs present |
+
+## Sprint SEC-SCREEN: SYN Cookie Flood Protection (`8cbf31a`)
+
+### Overview
+When `security flow syn-flood-protection-mode syn-cookie` is configured, SYN floods
+trigger cookie-based source validation in XDP instead of dropping all SYNs. Uses
+kernel BPF helpers `bpf_tcp_raw_gen_syncookie` and `bpf_tcp_raw_check_syncookie`
+(available since kernel 5.19).
+
+### Algorithm
+SYN flood detected -> zone enters syn-cookie mode -> unvalidated SYNs get SYN-ACK with
+cookie seq -> valid ACK returns -> source added to `validated_clients` LRU map -> RST sent
+-> client retransmits SYN which passes as validated. Zero per-packet overhead once validated.
+
+### BPF Changes
+- `SCREEN_SYN_COOKIE` flag (1<<14), 4 new global counters (27-30)
+- `flood_state` extended with `synproxy_active` field
+- `validated_clients` LRU_HASH map (65536 entries)
+- 4 `__noinline` functions: `send_syncookie_synack_v4/v6`, `validate_syncookie_v4/v6`
+- Existing drop-mode behavior preserved when syn-cookie not configured
+
+### Go Changes
+- `FlowConfig.SynFloodProtectionMode` parsing
+- `ScreenSynCookie` flag in dataplane compiler
+- 4 Prometheus metrics (`bpfrx_screen_syncookie_total{type=sent|valid|invalid|bypass}`)
+- 4 CLI screen counters in show output
+
+### Files
+39 files changed (1015 insertions, 84 deletions) -- primarily `bpf/xdp/xdp_screen.c` (+605 lines),
+`bpf/headers/bpfrx_common.h`, `bpf/headers/bpfrx_maps.h`, `pkg/config/`, `pkg/dataplane/`,
+`pkg/api/metrics.go`, `pkg/grpcapi/server.go`
+
+## Sprint CGNAT: Deterministic NAT / Carrier-Grade NAT (`74e1d17`)
+
+### Overview
+Carrier-grade NAT with deterministic port block allocation. Each subscriber from a
+configured host range gets a fixed, algorithmically-computed block of ports on a
+public IP. Purely mathematical mapping enables ISP compliance logging without
+per-session overhead.
+
+### Config Syntax
+```
+set security nat source pool POOL address 203.0.113.1/32 to 203.0.113.4/32
+set security nat source pool POOL port deterministic block-size 2016
+set security nat source pool POOL port deterministic host address 100.64.0.0/22
+```
+
+### BPF Changes
+- `nat_pool_alloc_deterministic_v4()` `__noinline` in xdp_policy.c
+- Dispatched via `cfg->deterministic` flag
+- `nat_pool_config` extended to 24 bytes (deterministic, block_size, host_base, host_count, blocks_per_ip)
+- `MAX_NAT_POOL_IPS_PER_POOL` increased from 8 to 256 for CGNAT pools
+
+### Go Changes
+- `DeterministicNATConfig` and `PoolUtilizationAlarmConfig` types
+- Address range expansion (`addr1/32 to addr2/32`)
+- Validation: capacity check, mutual exclusion with persistent-nat/address-persistent
+- `bpfrx_nat_pool_deterministic_info` Prometheus gauge
+- `show security nat source deterministic-nat nat-table` CLI command
+
+### DPDK Parity
+All struct and constant changes mirrored in `dpdk_worker/` (shared_mem.h, tables.h, policy.c)
+
+### Files
+18 files changed (426 insertions, 23 deletions) -- primarily `bpf/xdp/xdp_policy.c`,
+`bpf/headers/bpfrx_common.h`, `pkg/config/compiler.go`, `pkg/dataplane/`
+
+## Sprint CGNAT-64: Deterministic NAPT64 for IPv6 Subscribers (`439cd3f`)
+
+### Overview
+Extended deterministic NAT to support NAT64 traffic where IPv6 subscribers get
+deterministic IPv4 SNAT allocation based on their IPv6 source address prefix.
+The subscriber index is derived from the 32-bit word after the configured prefix
+(/32 -> word[1], /64 -> word[2]).
+
+### Config Syntax
+```
+set security nat source pool POOL port deterministic block-size 2016
+set security nat source pool POOL port deterministic host address 2001:db8::/32
+```
+
+### BPF Changes
+- New `nat_pool_alloc_deterministic_v6()` function in xdp_policy.c
+- NAT64 dispatch checks `deterministic==2` before falling back to regular allocation
+- `nat_pool_config` extended from 24 to 40 bytes (`host_prefix_len`, `host_base_v6[4]`)
+- Deterministic mode values: 0=off, 1=IPv4 host, 2=IPv6 host
+
+### Go Changes
+- Validation enforces /32 or /64 prefix for IPv6 host addresses
+- Compiler populates mode 2 with IPv6 base address and prefix length
+- `NATPoolConfig` Go struct extended with `HostPrefixLen` and `HostBaseV6`
+
+### DPDK Parity
+Inline deterministic v6 allocation added to `dpdk_worker/nat64.c`
+
+### Files
+14 files changed (199 insertions, 24 deletions) -- primarily `bpf/xdp/xdp_policy.c`,
+`bpf/headers/bpfrx_common.h`, `dpdk_worker/nat64.c`, `pkg/config/compiler.go`,
+`pkg/dataplane/compiler.go`
+
+## VRF-Aware Connectivity Test Suite (`367fa54`)
+
+### Overview
+New `make test-connectivity` target runs automated end-to-end connectivity tests
+across standalone and cluster deployments. The `ping_vrf_aware()` helper automatically
+tries each VRF when the default routing table ping fails, eliminating false failures
+for interfaces in management or other VRFs.
+
+### Test Coverage
+- **Standalone:** service health, direct host reachability (trust/untrust/dmz/WAN),
+  cross-zone IPv4 and IPv6 through firewall
+- **Cluster:** service health on both nodes, heartbeat connectivity, fabric connectivity,
+  WAN gateway, LAN host to RETH VIP (proves VRRP), cross-zone through cluster, IPv6
+
+### Usage
+```bash
+make test-connectivity              # Run all tests
+make test-connectivity MODE=standalone  # Standalone only
+make test-connectivity MODE=cluster     # Cluster only
+```
+
+### Files
+2 files changed (205 insertions) -- `test/incus/test-connectivity.sh`, `Makefile`
+
+## Graceful Startup Retry for Cluster Heartbeat and Sync (`2199e52`)
+
+### Overview
+Improved cluster startup resilience when VRF devices or interface addresses are not
+ready at daemon boot time. Both heartbeat and session sync bind retries now log at
+INFO level for the first 5 attempts (normal startup race), escalating to WARN only
+after 10 seconds. Fabric IP resolution is now retried inside the goroutine instead
+of being resolved once outside (which failed permanently if fab0 had no address).
+
+### Changes
+- **Heartbeat bind retry:** INFO for first 5 attempts, WARN after, 30 attempts at 2s intervals
+- **Fabric IP resolution:** Moved inside goroutine with retry loop (was single attempt outside)
+- **Session sync bind retry:** INFO for first 5 attempts, WARN after, integrated into fabric goroutine
+- **Context cancellation:** All retry loops honor `ctx.Done()` for clean shutdown
+
+### Files
+1 file changed (53 insertions, 28 deletions) -- `pkg/daemon/daemon.go`

@@ -13,7 +13,7 @@ Last updated: 2026-02-25
 | SSL/TLS Inspection | 4 | 0 | 0 | 4 |
 | Advanced Threat Prevention | 5 | 1 | 0 | 6 |
 | User/Identity Firewall | 5 | 0 | 0 | 5 |
-| NAT Enhancements | 7 | 1 | 0 | 8 |
+| NAT Enhancements | 6 | 1 | 0 | 7 |
 | Screen/IDS Enhancements | 6 | 2 | 1 | 8 |
 | Security Flow Enhancements | 9 | 2 | 0 | 11 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
@@ -29,7 +29,7 @@ Last updated: 2026-02-25
 | Interface Enhancements | 4 | 2 | 1 | 7 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **143** | **19** | **6** | **168** |
+| **TOTAL** | **142** | **19** | **6** | **167** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -159,7 +159,7 @@ bpfrx has SNAT (interface + pool, address-persistent), DNAT (with pools, hit cou
 | **Overflow Pool** | `security nat source pool ... overflow-pool ...` | Fallback to interface NAT or another pool when primary SNAT pool is exhausted | Low | Missing |
 | **Address Pooling (paired/no-paired)** | `security nat source pool ... address-pooling paired` | Per-pool override of global address-persistent: paired ensures same source always maps to same pool address; no-paired allows round-robin | Low | Missing |
 | **Port Randomization Control** | `security nat source pool ... port-randomization disable` | Disable random port selection in SNAT (use sequential instead). Enabled by default. | Low | Missing |
-| **Deterministic NAT (Port Block Allocation)** | `security nat source pool ... port-deterministic ...` | Predictable port mapping for logging compliance. Each source gets fixed port block. | Low | Missing |
+| **Deterministic NAT (Port Block Allocation)** | `security nat source pool ... port deterministic ...` | Predictable port mapping for logging compliance. Each source gets fixed port block. | Low | **Done** (`74e1d17`, `439cd3f`) -- IPv4 CGNAT + IPv6 NAPT64 deterministic allocation, address ranges, pool-utilization-alarm, Prometheus gauge |
 
 ---
 
