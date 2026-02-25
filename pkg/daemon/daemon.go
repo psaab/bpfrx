@@ -3299,23 +3299,28 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	}
 
 	// Start heartbeat if control-interface and peer-address are configured.
-	// Retry on bind failure: the control interface address may not yet be
-	// assigned by networkd during daemon startup (VRF race).
+	// Retry on bind failure: the control interface address and VRF device
+	// may not be ready during daemon startup (networkd race).
 	if cc.ControlInterface != "" && cc.PeerAddress != "" {
 		go func() {
 			for i := 0; i < 30; i++ {
 				localIP := resolveInterfaceAddr(cc.ControlInterface, "")
 				if localIP == "" {
 					if i == 0 {
-						slog.Warn("cluster: control interface has no IPv4 address, retrying",
+						slog.Info("cluster: control interface has no IPv4 address yet, waiting",
 							"interface", cc.ControlInterface)
 					}
 					time.Sleep(2 * time.Second)
 					continue
 				}
 				if err := d.cluster.StartHeartbeat(localIP, cc.PeerAddress, vrfDevice); err != nil {
-					slog.Warn("failed to start cluster heartbeat, retrying",
-						"err", err, "attempt", i+1)
+					if i < 5 {
+						slog.Info("cluster: heartbeat bind not ready, retrying",
+							"err", err, "attempt", i+1)
+					} else {
+						slog.Warn("failed to start cluster heartbeat, retrying",
+							"err", err, "attempt", i+1)
+					}
 					time.Sleep(2 * time.Second)
 					continue
 				}
@@ -3326,9 +3331,31 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	}
 
 	// Start session/config sync on fabric interface.
+	// Retry: fabric interface address and VRF may not be ready at startup.
 	if cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
-		fabIP := resolveInterfaceAddr(cc.FabricInterface, "")
-		if fabIP != "" {
+		go func() {
+			var fabIP string
+			for i := 0; i < 30; i++ {
+				fabIP = resolveInterfaceAddr(cc.FabricInterface, "")
+				if fabIP != "" {
+					break
+				}
+				if i == 0 {
+					slog.Info("cluster: fabric interface has no IPv4 address yet, waiting",
+						"interface", cc.FabricInterface)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+			}
+			if fabIP == "" {
+				slog.Error("cluster: fabric interface address not available after retries",
+					"interface", cc.FabricInterface)
+				return
+			}
+
 			syncLocal := fmt.Sprintf("%s:4785", fabIP)
 			syncPeer := fmt.Sprintf("%s:4785", cc.FabricPeerAddress)
 			d.sessionSync = cluster.NewSessionSync(syncLocal, syncPeer, nil)
@@ -3373,27 +3400,28 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			}
 
 			d.sessionSync.SetVRFDevice(vrfDevice)
-			// Retry sync start: the VRF device may not be created yet
-			// when this runs during daemon startup. The VRF is created
-			// during config compilation which happens shortly after.
-			go func() {
-				for i := 0; i < 30; i++ {
-					if err := d.sessionSync.Start(ctx); err != nil {
+			// Retry sync start: the VRF device and address binding may not
+			// be ready during daemon startup (networkd race).
+			for i := 0; i < 30; i++ {
+				if err := d.sessionSync.Start(ctx); err != nil {
+					if i < 5 {
+						slog.Info("cluster: sync bind not ready, retrying",
+							"err", err, "attempt", i+1)
+					} else {
 						slog.Warn("failed to start session sync, retrying",
 							"err", err, "attempt", i+1)
-						select {
-						case <-ctx.Done():
-							return
-						case <-time.After(2 * time.Second):
-						}
-						continue
 					}
-					slog.Info("cluster session sync started",
-						"local", syncLocal, "peer", syncPeer, "vrf", vrfDevice)
-					return
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(2 * time.Second):
+					}
+					continue
 				}
-				slog.Error("cluster session sync failed after retries")
-			}()
+				slog.Info("cluster session sync started",
+					"local", syncLocal, "peer", syncPeer, "vrf", vrfDevice)
+				break
+			}
 
 			// Start periodic IPsec SA sync if enabled.
 			if cc.IPsecSASync && d.ipsec != nil {
@@ -3406,10 +3434,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// program can redirect packets to the peer during VRRP
 			// failback asymmetric routing windows.
 			go d.populateFabricFwd(ctx, cc.FabricInterface, cc.FabricPeerAddress)
-		} else {
-			slog.Warn("cluster: fabric interface has no IPv4 address",
-				"interface", cc.FabricInterface)
-		}
+		}()
 	}
 }
 
