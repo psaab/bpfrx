@@ -218,6 +218,21 @@ type bpfrxXdpScreenNat64Config struct {
 	Pad        [3]uint8
 }
 
+type bpfrxXdpScreenNat64FibCacheKey struct {
+	_       structs.HostLayout
+	Ipv4Dst uint32
+	Tbid    uint32
+}
+
+type bpfrxXdpScreenNat64FibCacheVal struct {
+	_       structs.HostLayout
+	Ifindex uint32
+	VlanId  uint16
+	Gen     uint16
+	Dmac    [6]uint8
+	Smac    [6]uint8
+}
+
 type bpfrxXdpScreenNat64PrefixKey struct {
 	_      structs.HostLayout
 	Prefix [3]uint32
@@ -638,6 +653,7 @@ type bpfrxXdpScreenMapSpecs struct {
 	MirrorCounter     *ebpf.MapSpec `ebpf:"mirror_counter"`
 	Nat64Configs      *ebpf.MapSpec `ebpf:"nat64_configs"`
 	Nat64Count        *ebpf.MapSpec `ebpf:"nat64_count"`
+	Nat64FibCache     *ebpf.MapSpec `ebpf:"nat64_fib_cache"`
 	Nat64PrefixMap    *ebpf.MapSpec `ebpf:"nat64_prefix_map"`
 	Nat64State        *ebpf.MapSpec `ebpf:"nat64_state"`
 	Nptv6Rules        *ebpf.MapSpec `ebpf:"nptv6_rules"`
@@ -720,6 +736,7 @@ type bpfrxXdpScreenMaps struct {
 	MirrorCounter     *ebpf.Map `ebpf:"mirror_counter"`
 	Nat64Configs      *ebpf.Map `ebpf:"nat64_configs"`
 	Nat64Count        *ebpf.Map `ebpf:"nat64_count"`
+	Nat64FibCache     *ebpf.Map `ebpf:"nat64_fib_cache"`
 	Nat64PrefixMap    *ebpf.Map `ebpf:"nat64_prefix_map"`
 	Nat64State        *ebpf.Map `ebpf:"nat64_state"`
 	Nptv6Rules        *ebpf.Map `ebpf:"nptv6_rules"`
@@ -778,6 +795,7 @@ func (m *bpfrxXdpScreenMaps) Close() error {
 		m.MirrorCounter,
 		m.Nat64Configs,
 		m.Nat64Count,
+		m.Nat64FibCache,
 		m.Nat64PrefixMap,
 		m.Nat64State,
 		m.Nptv6Rules,

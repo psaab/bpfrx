@@ -393,35 +393,69 @@ nat64_xlate_6to4(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	inc_counter(GLOBAL_CTR_NAT64_XLATE);
 
-	/* FIB lookup for the new IPv4 destination */
-	struct bpf_fib_lookup fib = {};
-	fib.family      = AF_INET;
-	fib.l4_protocol = ip4_proto;
-	fib.tot_len     = tot_len;
-	fib.ifindex     = meta->ingress_ifindex;
-	fib.tbid        = meta->routing_table;
-	fib.ipv4_src    = v4_src;
-	fib.ipv4_dst    = v4_dst;
+	/* FIB cache: avoid bpf_fib_lookup for established flows.
+	 * Key = {translated IPv4 dst, routing table}.
+	 * Invalidated when fib_gen changes (route recompile). */
+	__u32 zero = 0;
+	__u32 fib_gen = 0;
+	__u32 *fib_gen_ptr = bpf_map_lookup_elem(&fib_gen_map, &zero);
+	if (fib_gen_ptr)
+		fib_gen = *fib_gen_ptr;
 
-	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
-	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
-	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
-		return XDP_PASS; /* let kernel handle */
-
-	/* Resolve VLAN sub-interface and store in meta for xdp_forward */
-	__u32 egress_if = fib.ifindex;
-	struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map,
-							 &egress_if);
-	if (vi) {
-		meta->fwd_ifindex = vi->parent_ifindex;
-		meta->egress_vlan_id = vi->vlan_id;
+	struct nat64_fib_cache_key fib_ckey = {
+		.ipv4_dst = v4_dst,
+		.tbid     = meta->routing_table,
+	};
+	struct nat64_fib_cache_val *cached =
+		bpf_map_lookup_elem(&nat64_fib_cache, &fib_ckey);
+	if (cached && cached->gen == (__u16)fib_gen) {
+		/* FIB cache hit */
+		meta->fwd_ifindex    = cached->ifindex;
+		meta->egress_vlan_id = cached->vlan_id;
+		__builtin_memcpy(meta->fwd_dmac, cached->dmac, 6);
+		__builtin_memcpy(meta->fwd_smac, cached->smac, 6);
 	} else {
-		meta->fwd_ifindex = egress_if;
-		meta->egress_vlan_id = 0;
-	}
+		/* FIB cache miss — full lookup */
+		struct bpf_fib_lookup fib = {};
+		fib.family      = AF_INET;
+		fib.l4_protocol = ip4_proto;
+		fib.tot_len     = tot_len;
+		fib.ifindex     = meta->ingress_ifindex;
+		fib.tbid        = meta->routing_table;
+		fib.ipv4_src    = v4_src;
+		fib.ipv4_dst    = v4_dst;
 
-	__builtin_memcpy(meta->fwd_dmac, fib.dmac, ETH_ALEN);
-	__builtin_memcpy(meta->fwd_smac, fib.smac, ETH_ALEN);
+		__u32 fib_flags = meta->routing_table ?
+				  BPF_FIB_LOOKUP_TBID : 0;
+		int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
+		if (rc != BPF_FIB_LKUP_RET_SUCCESS)
+			return XDP_PASS; /* let kernel handle */
+
+		/* Resolve VLAN sub-interface */
+		__u32 egress_if = fib.ifindex;
+		struct vlan_iface_info *vi =
+			bpf_map_lookup_elem(&vlan_iface_map, &egress_if);
+		if (vi) {
+			meta->fwd_ifindex    = vi->parent_ifindex;
+			meta->egress_vlan_id = vi->vlan_id;
+		} else {
+			meta->fwd_ifindex    = egress_if;
+			meta->egress_vlan_id = 0;
+		}
+		__builtin_memcpy(meta->fwd_dmac, fib.dmac, ETH_ALEN);
+		__builtin_memcpy(meta->fwd_smac, fib.smac, ETH_ALEN);
+
+		/* Populate cache for next packet */
+		struct nat64_fib_cache_val new_val = {
+			.ifindex  = meta->fwd_ifindex,
+			.vlan_id  = meta->egress_vlan_id,
+			.gen      = (__u16)fib_gen,
+		};
+		__builtin_memcpy(new_val.dmac, fib.dmac, 6);
+		__builtin_memcpy(new_val.smac, fib.smac, 6);
+		bpf_map_update_elem(&nat64_fib_cache, &fib_ckey,
+				    &new_val, BPF_ANY);
+	}
 
 	/* Update addr_family so xdp_forward does IPv4 TTL handling */
 	meta->addr_family = AF_INET;

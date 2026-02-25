@@ -196,13 +196,17 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		}
 	}
 
-	/* Propagate NAT64 flag so xdp_nat dispatches to xdp_nat64. */
-	if (sess->flags & SESS_FLAG_NAT64)
-		meta->nat_flags |= SESS_FLAG_NAT64;
-
+	/* NAT64 forward path: dispatch directly to xdp_nat64, skipping
+	 * xdp_nat which is just a dispatcher for NAT64 traffic.  NAT64
+	 * rebuilds the entire IPv4 header from meta, so no incremental
+	 * NAT44 rewrite is needed. */
 	__u32 next_prog = XDP_PROG_FORWARD;
-	if (sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT))
+	if (sess->flags & SESS_FLAG_NAT64) {
+		meta->nat_flags |= SESS_FLAG_NAT64;
+		next_prog = XDP_PROG_NAT64;
+	} else if (sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT)) {
 		next_prog = XDP_PROG_NAT;
+	}
 
 	switch (sess->state) {
 	case SESS_STATE_CLOSED:

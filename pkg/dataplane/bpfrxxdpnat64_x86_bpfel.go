@@ -218,6 +218,21 @@ type bpfrxXdpNat64Nat64Config struct {
 	Pad        [3]uint8
 }
 
+type bpfrxXdpNat64Nat64FibCacheKey struct {
+	_       structs.HostLayout
+	Ipv4Dst uint32
+	Tbid    uint32
+}
+
+type bpfrxXdpNat64Nat64FibCacheVal struct {
+	_       structs.HostLayout
+	Ifindex uint32
+	VlanId  uint16
+	Gen     uint16
+	Dmac    [6]uint8
+	Smac    [6]uint8
+}
+
 type bpfrxXdpNat64Nat64PrefixKey struct {
 	_      structs.HostLayout
 	Prefix [3]uint32
@@ -665,6 +680,7 @@ type bpfrxXdpNat64MapSpecs struct {
 	MirrorCounter     *ebpf.MapSpec `ebpf:"mirror_counter"`
 	Nat64Configs      *ebpf.MapSpec `ebpf:"nat64_configs"`
 	Nat64Count        *ebpf.MapSpec `ebpf:"nat64_count"`
+	Nat64FibCache     *ebpf.MapSpec `ebpf:"nat64_fib_cache"`
 	Nat64PrefixMap    *ebpf.MapSpec `ebpf:"nat64_prefix_map"`
 	Nat64State        *ebpf.MapSpec `ebpf:"nat64_state"`
 	NatPoolConfigs    *ebpf.MapSpec `ebpf:"nat_pool_configs"`
@@ -752,6 +768,7 @@ type bpfrxXdpNat64Maps struct {
 	MirrorCounter     *ebpf.Map `ebpf:"mirror_counter"`
 	Nat64Configs      *ebpf.Map `ebpf:"nat64_configs"`
 	Nat64Count        *ebpf.Map `ebpf:"nat64_count"`
+	Nat64FibCache     *ebpf.Map `ebpf:"nat64_fib_cache"`
 	Nat64PrefixMap    *ebpf.Map `ebpf:"nat64_prefix_map"`
 	Nat64State        *ebpf.Map `ebpf:"nat64_state"`
 	NatPoolConfigs    *ebpf.Map `ebpf:"nat_pool_configs"`
@@ -815,6 +832,7 @@ func (m *bpfrxXdpNat64Maps) Close() error {
 		m.MirrorCounter,
 		m.Nat64Configs,
 		m.Nat64Count,
+		m.Nat64FibCache,
 		m.Nat64PrefixMap,
 		m.Nat64State,
 		m.NatPoolConfigs,

@@ -671,6 +671,27 @@ struct {
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } nat64_state SEC(".maps");
 
+/* NAT64 FIB cache: translated IPv4 dst -> FIB result (LRU).
+ * Avoids bpf_fib_lookup on every NAT64 forward-path packet.
+ * Invalidated via fib_gen_map generation counter. */
+struct nat64_fib_cache_key {
+	__be32 ipv4_dst;
+	__u32  tbid;
+};
+struct nat64_fib_cache_val {
+	__u32 ifindex;     /* resolved physical ifindex */
+	__u16 vlan_id;
+	__u16 gen;         /* matches fib_gen_map[0] */
+	__u8  dmac[6];
+	__u8  smac[6];
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, struct nat64_fib_cache_key);
+	__type(value, struct nat64_fib_cache_val);
+} nat64_fib_cache SEC(".maps");
+
 /* ============================================================
  * Firewall filter maps
  * ============================================================ */
