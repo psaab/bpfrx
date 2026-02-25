@@ -1939,6 +1939,37 @@ virtio-net). ICMP ping worked but TCP/UDP checksums were corrupted on egress.
 - `bpf/xdp/xdp_zone.c` — NAT64 flag propagation
 - `docs/ha-cluster.conf` — NAT64 rule-set added to cluster config
 
+## NAT64 FIB Cache + Direct Dispatch (`1610362`)
+
+### Overview
+Two optimizations for NAT64 forward-path performance, eliminating ~7% CPU from
+`bpf_fib_lookup` on every packet and saving one tail call per established session.
+
+### Problem
+xdp_nat64 called `bpf_fib_lookup` on every forward-path packet after IPv6→IPv4
+translation. The existing session FIB cache (from xdp_zone) cached the IPv6 FIB
+result, which was wrong for NAT64's post-translation IPv4 routing — xdp_nat64
+always overwrote it with a fresh lookup. Additionally, established NAT64 sessions
+went through xdp_nat as a pure dispatcher before reaching xdp_nat64.
+
+### Changes
+1. **LRU FIB cache map** (`nat64_fib_cache`, 1024 entries): keyed by
+   `{ipv4_dst, routing_table}`, caches resolved FIB result (ifindex, MACs, VLAN).
+   Invalidated via `fib_gen_map` generation counter on route recompile.
+2. **Direct dispatch**: xdp_conntrack tail-calls directly to xdp_nat64 for
+   established NAT64 sessions, skipping xdp_nat (no NAT44 rewrite needed).
+
+### Perf Results
+- NAT64 FIB CPU: 7.39% → 0.44% (-94%)
+- NAT64 throughput: 7.96 → 8.38 Gbps (+5.3%)
+- NAT44: no regression (6.45 → 6.78 Gbps)
+
+### Files
+3 files changed (+ generated bindings)
+- `bpf/headers/bpfrx_maps.h` — `nat64_fib_cache` LRU map definition
+- `bpf/xdp/xdp_nat64.c` — FIB cache check/populate in forward path
+- `bpf/xdp/xdp_conntrack.c` — Direct dispatch to XDP_PROG_NAT64
+
 ## Graceful Startup Retry for Cluster Heartbeat and Sync (`2199e52`)
 
 ### Overview
