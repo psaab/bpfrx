@@ -426,8 +426,12 @@ cmd_deploy() {
 	info "Building bpfrxd and cli..."
 	make -C "$PROJECT_ROOT" build build-ctl
 
-	# Stop running service before pushing binaries (avoids "text file busy")
+	# Stop service gracefully, then clean BPF state for binary upgrade.
+	# Order matters: systemctl stop sends SIGTERM (graceful socket close),
+	# then bpfrxd cleanup removes pinned BPF maps/links.  The final
+	# pkill -9 is a safety net for "text file busy" on push.
 	incus exec "$INSTANCE_NAME" -- systemctl stop bpfrxd 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- bpfrxd cleanup 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- pkill -9 bpfrxd 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- pkill -9 cli 2>/dev/null || true
 	sleep 1

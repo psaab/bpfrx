@@ -385,6 +385,9 @@ func (s *SessionSync) QueueConfig(configText string) {
 
 // BulkSync sends the entire session table to the connected peer.
 func (s *SessionSync) BulkSync() error {
+	if s.dp == nil {
+		return fmt.Errorf("dataplane not ready")
+	}
 	s.mu.Lock()
 	conn := s.conn
 	s.mu.Unlock()

@@ -550,17 +550,24 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
 }
 
 // vrfListenConfig returns a net.ListenConfig that binds sockets to a VRF device
-// via SO_BINDTODEVICE. If vrfDevice is empty, returns a default ListenConfig.
+// via SO_BINDTODEVICE with SO_REUSEADDR+SO_REUSEPORT to allow immediate rebind
+// after a restart (even if old sockets linger from a killed process).
+// If vrfDevice is empty, only SO_REUSEADDR+SO_REUSEPORT are set.
 func vrfListenConfig(vrfDevice string) net.ListenConfig {
-	if vrfDevice == "" {
-		return net.ListenConfig{}
-	}
 	return net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			var err error
 			c.Control(func(fd uintptr) {
-				err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET,
-					syscall.SO_BINDTODEVICE, vrfDevice)
+				// Allow immediate rebind after restart — the kernel may
+				// still hold the old socket briefly after process death.
+				_ = unix.SetsockoptInt(int(fd), syscall.SOL_SOCKET,
+					unix.SO_REUSEADDR, 1)
+				_ = unix.SetsockoptInt(int(fd), syscall.SOL_SOCKET,
+					unix.SO_REUSEPORT, 1)
+				if vrfDevice != "" {
+					err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET,
+						syscall.SO_BINDTODEVICE, vrfDevice)
+				}
 			})
 			return err
 		},

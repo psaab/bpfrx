@@ -450,8 +450,13 @@ deploy_vm() {
 		die "Instance $vm does not exist. Run '$0 create' first."
 	fi
 
-	# Stop running service before pushing binaries (avoids "text file busy")
+	# Stop service gracefully, then clean BPF state for binary upgrade.
+	# Order matters: systemctl stop sends SIGTERM (graceful socket close),
+	# then bpfrxd cleanup removes pinned BPF maps/links.  The final
+	# pkill -9 is a safety net only — if the daemon hung during shutdown
+	# the binary is still "text file busy" and the push will fail.
 	incus exec "$vm" -- systemctl stop bpfrxd 2>/dev/null || true
+	incus exec "$vm" -- bpfrxd cleanup 2>/dev/null || true
 	incus exec "$vm" -- pkill -9 bpfrxd 2>/dev/null || true
 	incus exec "$vm" -- pkill -9 cli 2>/dev/null || true
 	sleep 1
