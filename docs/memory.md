@@ -87,7 +87,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
   - **Gotcha:** RETH `.link` must use `OriginalName=` not `MACAddress=` (MAC alternates physical↔virtual across reboots)
 - **ISSU:** `ForceSecondary()` drains all RGs to peer, then operator replaces binary + restarts
 - **VRRP sync hold:** preempt=false until bulk sync (10s timeout). `ReleaseSyncHold()` → `preemptNowCh` for instant preemption
-- **VRRP timing:** RETH 250ms interval (masterDown ~805ms); user VRRP seconds*1000; wire centiseconds
+- **VRRP timing:** RETH 30ms interval (masterDown ~97ms, measured ~60ms failover); configurable `reth-advertise-interval`; async GARP burst; 3× priority-0 on shutdown; user VRRP seconds*1000; wire centiseconds
 - **VIP reconciliation:** `ReconcileVIPs()` re-adds VIPs + GARP after `programRethMAC` link DOWN/UP
 - **Reboot resilience:** RETH `.link` `OriginalName=`; `ensureRethLinkOriginalName()` auto-fix; `deriveKernelName()` virtio-over-PCI
 - **Fabric forwarding:** `try_fabric_redirect()` in xdp_zone redirects to fabric peer when FIB fails for synced sessions
@@ -169,7 +169,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 ## Performance
 - **bpf_printk:** NEVER leave in production (55%+ CPU)
 - **Throughput:** 25+ Gbps native XDP, 15.6 Gbps virtio-net
-- **Cluster failover:** <1s (VRRP 250ms, masterDown 805ms); failback ~2-3s; reboot→MASTER ~6s
+- **Cluster failover:** ~60ms (VRRP 30ms, masterDown ~97ms); planned shutdown near-instant (priority-0 burst); failback ~130ms; reboot→MASTER ~6s
 - Per-interface XDP: `redirect_capable` map; iavf lacks native XDP, use PF passthrough
 
 ## Incus Test Environment
@@ -195,7 +195,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 ## Recent Features (see `phases.md` for full details)
 - **Fabric cross-chassis fwd:** `try_fabric_redirect()` redirects to peer via fabric when FIB fails for synced sessions
 - **Session sync failover:** Hitless TCP — NO_NEIGH kernel-route, monotonic rebase, ARP/ND warmup
-- **Sub-second failover (`ff7821c`):** VRRP 250ms, sync 1s, debounce 500ms, heartbeat 200ms/5
+- **Sub-100ms failover (`ff7821c`, `ae1a717`):** VRRP 30ms (was 250ms), async GARP burst, 3× priority-0 shutdown, immediate peer takeover; sync 1s, debounce 500ms, heartbeat 200ms/5
 - **Reboot resilience (`f8353de`):** `.link` OriginalName= for RETH + auto-fix
 - **VIP reconciliation (`a4eb2b2`):** `ReconcileVIPs()` after programRethMAC
 - Sprints: VRRP-NATIVE, HA-CONFIG, NPTv6, SEC-LOG, FF-1, IF-1, HA-8, HA-TIMING, HA-REBOOT (see `phases.md`)

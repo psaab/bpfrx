@@ -460,19 +460,19 @@ incus exec cluster-lan-host -- ping 8.8.8.8 &
 # 2. Stop primary
 incus exec bpfrx-fw0 -- systemctl stop bpfrxd
 
-# 3. Wait for failover (heartbeat-threshold * interval = 3s)
-sleep 5
+# 3. Wait for failover (30ms VRRP → ~97ms masterDown; planned stop near-instant)
+sleep 1
 
 # 4. Check cluster status on fw1
 printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
 
-# 5. Verify ping continues (may lose 3-5 packets during failover)
+# 5. Verify ping continues (expect ~6 lost at 10ms interval = ~60ms)
 ```
 
 **Pass criteria:**
-- fw1 becomes primary within ~5 seconds
-- GARP sent for reth0, reth1 VIPs
-- cluster-lan-host traffic resumes after brief interruption
+- fw1 becomes primary within ~100ms (measured ~60ms)
+- Async GARP burst sent for reth0, reth1 VIPs (first pair immediate, rest in background)
+- cluster-lan-host traffic resumes after ~60ms interruption
 - Sessions synced from fw0 survive on fw1
 
 ### TC-4: Failover — Recovery and Preemption
@@ -656,13 +656,14 @@ incus exec bpfrx-fw0 -- systemctl restart bpfrxd
 # Expected: similar 1-2 packet loss
 
 # Full failover test (stop primary, secondary takes over):
-incus exec cluster-lan-host -- ping -c 60 -i 0.5 10.0.60.1 &
-sleep 5
+incus exec cluster-lan-host -- ping -i 0.01 -c 500 -W 1 10.0.60.1 &
+sleep 1
 incus exec bpfrx-fw0 -- systemctl stop bpfrxd
-# Expected: 3-5 packets lost during VRRP failover (~3.5s)
-sleep 15
+# Expected: ~6 packets lost at 10ms interval = ~60ms failover
+# (3× priority-0 burst on shutdown → peer immediate takeover)
+sleep 5
 incus exec bpfrx-fw0 -- systemctl start bpfrxd
-# Expected: 3-5 more packets lost during preemption back
+# Expected: ~13 packets lost = ~130ms failback (daemon startup + sync hold)
 ```
 
 #### iperf3 failover tests (throughput under failover)

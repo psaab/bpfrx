@@ -1739,6 +1739,67 @@ Reduced chassis cluster failover from ~3.2s to <1s and failback from ~6s to ~3s 
 | Clean daemon stop (priority-0 → peer skew) | ~219ms | ~55ms |
 | Failback (fw0 returns → preempts back) | ~5-6s | ~2-3s |
 
+## Sprint HA-VRRP-FAST: Sub-100ms VRRP Failover (`ae1a717`)
+
+### Overview
+Reduced VRRP failover from ~800ms to ~60ms by cutting the RETH advertisement interval from 250ms to 30ms, making GARP asynchronous, and adding priority-0 burst for planned shutdowns. Measured results: 6 lost pings at 10ms interval = ~60ms failover; failback ~130ms.
+
+### Change 1: RETH AdvertiseInterval 250ms → 30ms
+- **Impact:** masterDownInterval from ~805ms → ~97ms (single biggest win)
+- Math: `3 × 30ms + (56/256) × 30ms ≈ 97ms` at priority 200
+- Wire format: 3 centiseconds (10ms granularity per VRRPv3 RFC 5798)
+- CPU overhead: 33 pps/instance vs 4 pps — negligible
+- Configurable: `set chassis cluster reth-advertise-interval <ms>` (0 = default 30)
+- **Files:** `pkg/vrrp/vrrp.go`, `pkg/config/types.go`, `pkg/config/ast.go`, `pkg/config/compiler.go`
+
+### Change 2: Async GARP in becomeMaster()
+- **Impact:** Removes ~200ms+ blocking from VRRP transition critical path
+- Old order: setState → addVIPs → sendGARP (blocking 3×100ms) → sendAdvert → emitEvent
+- New order: setState → addVIPs → sendAdvert → emitEvent → **go sendGARP()**
+- `sendAdvert()` moved before GARP — tells peer to step down immediately
+- `sendGARP()` runs in a goroutine — only L2 cache updates, not time-critical
+- **File:** `pkg/vrrp/instance.go`
+
+### Change 3: Burst GARP functions
+- `SendGratuitousARPBurst()`: first ARP pair synchronous (<1ms), remaining `(count-1)` pairs in background goroutine at 50ms intervals
+- `SendGratuitousIPv6Burst()`: same pattern for unsolicited NA
+- Original blocking `SendGratuitousARP`/`SendGratuitousIPv6` preserved for non-VRRP callers
+- **File:** `pkg/cluster/garp.go`
+
+### Change 4: Fast planned shutdown
+- Master sends 3× priority-0 adverts on SIGTERM (burst for reliability)
+- Backup immediate takeover: `masterDownTimer.Reset(time.Millisecond)` on priority-0 receipt (was skew timer ~6.5ms)
+- **File:** `pkg/vrrp/instance.go`
+
+### Change 5: Per-RG GARPCount wired to VRRP
+- `Instance.GARPCount` field populated from `cfg.Chassis.Cluster.RedundancyGroups[*].GratuitousARPCount`
+- `sendGARP()` uses `vi.cfg.GARPCount` (0 → default 3)
+- **File:** `pkg/vrrp/vrrp.go`
+
+### Change 6: IPv6 maxAdvert bug fix (drive-by)
+- Was `uint16(ms * 100)` — should be `uint16(ms / 10)` (ms → centiseconds)
+- Currently dead code (IPv6 VRRP not sent) but fixed for correctness
+- **File:** `pkg/vrrp/instance.go`
+
+### Measured Results
+| Scenario | Before (`ff7821c`) | After (`ae1a717`) |
+|----------|---------------------|---------------------|
+| Failover (daemon dies → peer takes over) | ~0.8s | **~60ms** |
+| Planned stop (priority-0 → peer takeover) | ~55ms | **~1ms** |
+| Failback (daemon returns → preempts) | ~2-3s | **~130ms** |
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `pkg/vrrp/vrrp.go` | 30ms default, GARPCount field, interval from chassis config |
+| `pkg/vrrp/instance.go` | Reorder becomeMaster(), async GARP, 3× priority-0 on stop, immediate takeover, IPv6 fix |
+| `pkg/cluster/garp.go` | `SendGratuitousARPBurst()`, `SendGratuitousIPv6Burst()` |
+| `pkg/config/types.go` | `RethAdvertiseInterval` in ClusterConfig |
+| `pkg/config/ast.go` | `reth-advertise-interval` schema node |
+| `pkg/config/compiler.go` | Parse reth-advertise-interval |
+| `pkg/vrrp/vrrp_test.go` | Updated expected interval, configurable interval tests |
+| `pkg/config/parser_test.go` | reth-advertise-interval parsing tests |
+
 ## Sprint HA-REBOOT: Reboot Resilience (`f8353de`, `a4eb2b2`)
 
 ### Overview

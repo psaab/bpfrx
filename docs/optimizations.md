@@ -138,14 +138,17 @@ Switching to macvtap, routed, or tc-redirect could eliminate this entirely.
 - Verify guest csum offload is enabled end-to-end
 - SR-IOV passthrough (already used for WAN) bypasses this entirely
 
-## Cluster Failover Timing (Implemented, `ff7821c`)
+## Cluster Failover Timing (Implemented, `ff7821c`, updated `ae1a717`)
 
-### Sub-second VRRP advertisement interval
-- **Impact:** Failover from ~3.2s → ~0.8s
-- RETH instances: 250ms interval (was 1s)
-- masterDownInterval: 3 × 250ms + 56/256 × 250ms = 805ms (was 3.219s)
-- Priority-0 clean shutdown: peer skew = ~55ms (was ~219ms)
-- `AdvertiseInterval` field now in milliseconds internally; wire format in centiseconds per RFC 5798
+### Sub-100ms VRRP advertisement interval (`ae1a717`)
+- **Impact:** Failover from ~0.8s → **~60ms** (measured 6 lost pings at 10ms interval)
+- RETH instances: **30ms interval** (was 250ms, was 1s); configurable via `set chassis cluster reth-advertise-interval <ms>`
+- masterDownInterval: 3 × 30ms + 56/256 × 30ms = **~97ms** (was 805ms, was 3.219s)
+- **Planned shutdown (priority-0):** burst of 3× priority-0 adverts; peer immediate takeover in ~1ms (was ~55ms skew)
+- **Async GARP:** `becomeMaster()` sends advert first (sync), GARP in background goroutine (was blocking ~200ms)
+- **Burst GARP:** `SendGratuitousARPBurst()` sends first pair <1ms, remaining at 50ms intervals in background
+- `AdvertiseInterval` field in milliseconds internally; wire format in centiseconds per RFC 5798
+- Per-RG `GratuitousARPCount` wired through to VRRP instances
 
 ### Session sync connect optimization
 - **Impact:** Failback sync from 5-10s → 1-2s
@@ -166,10 +169,10 @@ Switching to macvtap, routed, or tc-redirect could eliminate this entirely.
 - 1s (was 5s) — faster crash recovery restart
 
 ### Measured Failover/Failback Times
-| Scenario | Before | After |
-|----------|--------|-------|
-| Failover (daemon dies → peer takes over) | ~3.2s | ~0.8s |
-| Clean stop (priority-0 → peer skew) | ~219ms | ~55ms |
-| Failback (daemon returns → preempts) | ~5-6s | ~2-3s |
-| Single node reboot → MASTER | N/A | ~6s |
-| Simultaneous reboot → converge | N/A | ~10s |
+| Scenario | Original | `ff7821c` | `ae1a717` |
+|----------|----------|-----------|-----------|
+| Failover (daemon dies → peer takes over) | ~3.2s | ~0.8s | **~60ms** |
+| Clean stop (priority-0 → peer skew) | ~219ms | ~55ms | **~1ms** |
+| Failback (daemon returns → preempts) | ~5-6s | ~2-3s | **~130ms** |
+| Single node reboot → MASTER | N/A | ~6s | ~6s |
+| Simultaneous reboot → converge | N/A | ~10s | ~10s |

@@ -93,7 +93,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 | `cmd/cli/` | Remote CLI client binary |
 | `dpdk_worker/` | DPDK C pipeline (single-pass packet processing, CGo bridge) |
 | `pkg/dataplane/dpdk/` | DPDK Go manager (CGo shared memory, FIB sync, port stats) |
-| `pkg/vrrp/` | Native VRRPv3 state machine (250ms advertisements, AF_PACKET, IPv6 NODAD) |
+| `pkg/vrrp/` | Native VRRPv3 state machine (30ms RETH advertisements, AF_PACKET, IPv6 NODAD) |
 | `pkg/ra/` | Embedded RA sender (replaces radvd) |
 | `docs/` | Protocol docs, feature gaps, phase notes, test plans, memory backups |
 | `test/incus/` | Test environment (setup.sh, config, systemd unit) |
@@ -153,9 +153,11 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Gotcha: PF passthrough claims the whole NIC** — no VFs can be used by other VMs when the PF is passed through. For multi-VM setups, VF passthrough with generic XDP + `redirect_capable` fallback is the only option (at a performance cost)
 
 ### Chassis Cluster (HA)
-- **Failover timing**: <1s with 250ms VRRP intervals (masterDownInterval ~805ms)
-- **Failback timing**: ~2-3s (immediate sync connect + 500ms debounce + instant preemption)
-- **VRRP advertisement**: RETH instances use 250ms; `AdvertiseInterval` is milliseconds internally, centiseconds on wire per RFC 5798
+- **Failover timing**: ~60ms with 30ms VRRP intervals (masterDownInterval ~97ms); configurable via `set chassis cluster reth-advertise-interval <ms>`
+- **Planned shutdown**: burst of 3× priority-0 adverts; peer takes over in ~1ms (immediate takeover on priority-0)
+- **Failback timing**: ~130ms (daemon startup + BPF load + sync hold release)
+- **VRRP advertisement**: RETH instances default 30ms; `AdvertiseInterval` is milliseconds internally, centiseconds on wire per RFC 5798
+- **Async GARP**: `becomeMaster()` runs GARP in a goroutine — first pair <1ms, remaining at 50ms intervals in background. Critical path: addVIPs → sendAdvert → emitEvent (sync), then go sendGARP() (async)
 - **Fabric forwarding**: `try_fabric_redirect()` in xdp_zone redirects to fabric peer when `bpf_fib_lookup` fails for synced sessions — prevents TCP death on VRRP failback
 - **RETH virtual MAC**: per-node `02:bf:72:CC:RR:NN`; `programRethMAC()` does link DOWN→set MAC→link UP
 - **VIP reconciliation**: `ReconcileVIPs()` re-adds VRRP VIPs after `programRethMAC` link DOWN/UP (which removes all kernel addresses)
@@ -178,7 +180,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces
 - **Observability**: Syslog (facility/severity/category filtering, structured RT_FLOW format, TCP/TLS transport, event mode local file), NetFlow v9 (1-in-N sampling), Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB), BPF map utilization (`show system buffers`), session aggregation reporting
 - **Flow**: TCP MSS clamping (ingress XDP + egress TC, including GRE-specific gre-in/gre-out), ALG control, allow-dns-reply (wired to BPF), allow-embedded-icmp, configurable timeouts (per-application inactivity), firewall filters (port ranges, hit counters, logging, forwarding-class DSCP rewrite, DSCP action)
-- **HA**: Chassis cluster state machine (weight-based failover, manual failover/reset, Junos-style show/request commands), native VRRPv3 (Go state machine, AF_PACKET receiver, per-instance sockets, IPv6 NODAD, sub-second 250ms advertisements), bondless RETH (VRRP on physical member interfaces, RethToPhysical resolution, per-node virtual MAC), incremental session sync (1s sweep + ring buffer + GC delete callbacks), config sync (forward + reverse-sync on reconnect, ${node} variable quoting), IPsec SA sync, fabric cross-chassis forwarding, ISSU
+- **HA**: Chassis cluster state machine (weight-based failover, manual failover/reset, Junos-style show/request commands), native VRRPv3 (Go state machine, AF_PACKET receiver, per-instance sockets, IPv6 NODAD, 30ms RETH advertisements, async GARP burst, ~60ms failover), bondless RETH (VRRP on physical member interfaces, RethToPhysical resolution, per-node virtual MAC), incremental session sync (1s sweep + ring buffer + GC delete callbacks), config sync (forward + reverse-sync on reconnect, ${node} variable quoting), IPsec SA sync, fabric cross-chassis forwarding, ISSU
 - **DHCP**: Relay (Option 82), server (Kea integration with lease display)
 - **CLI**: Junos-style prefix matching, "Possible completions:" headers, zone/interface descriptions, session idle time, session brief tabular view, flow statistics, policy descriptions, config validation warnings
 

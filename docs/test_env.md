@@ -394,24 +394,25 @@ sg incus-admin -c 'incus exec bpfrx-fw1 -- ip addr show ge-7-0-1.50' | grep '172
 # Expected: VIP only on fw0
 ```
 
-### VRRP Failover Test (`d951626`, `7bcaee9`, updated `ff7821c`)
-Verify failover completes within ~1s with 250ms VRRP intervals.
+### VRRP Failover Test (`d951626`, `7bcaee9`, updated `ff7821c`, `ae1a717`)
+Verify failover completes within ~100ms with 30ms VRRP intervals.
 ```bash
-# Start continuous ping from host to WAN VIP
-ping 172.16.50.6 &
+# Rapid ping from cluster-lan-host to LAN RETH VIP (10ms interval)
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -i 0.01 -c 500 -W 1 10.0.60.1' &
 
-# Stop fw0 to trigger failover
+# Stop fw0 to trigger failover (sends 3× priority-0 burst)
+sleep 1
 sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
 
-# Expected: 0-1 lost pings (master-down ~805ms with 250ms intervals), then recovery
+# Expected: ~6 lost pings at 10ms interval = ~60ms failover
+# (masterDown ~97ms with 30ms intervals; planned stop near-instant via priority-0)
 # Check fw1 became MASTER:
-printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw1 -- cli' 2>/dev/null
+sg incus-admin -c 'incus exec bpfrx-fw1 -- cli -c "show security vrrp"'
 
-# Restart fw0 — preemption should reclaim primary within ~3s
+# Restart fw0 — preemption should reclaim primary within ~150ms
 sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
-# Verify fw0 reclaims MASTER
-sleep 5
-printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+sleep 3  # wait for daemon startup + BPF load + sync hold
+sg incus-admin -c 'incus exec bpfrx-fw0 -- cli -c "show security vrrp"'
 ```
 
 ### IPv6 VIP Reachability Test (`d03b29e`)
@@ -488,10 +489,10 @@ sg incus-admin -c 'incus exec cluster-lan-host -- ping -6 -c 3 2001:559:8585:cf0
 
 # 5. Failover + recovery
 sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
-sleep 3  # 250ms VRRP → ~805ms failover
+sleep 1  # 30ms VRRP → ~97ms failover (planned stop near-instant via priority-0)
 ping -c 3 172.16.50.6  # should reach fw1
 sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
-sleep 5
+sleep 3  # daemon startup + BPF load + sync hold
 ping -c 3 172.16.50.6  # should reach fw0 again
 ```
 
