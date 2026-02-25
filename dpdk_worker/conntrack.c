@@ -442,6 +442,17 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 						rsv->timeout = new_timeout;
 						rsv->last_seen = now;
 					}
+					/* rst-invalidate-session: expire immediately */
+					if (sv->state == SESS_STATE_CLOSED &&
+					    ctx->shm->flow_config &&
+					    (ctx->shm->flow_config->tcp_flags & FLOW_TCP_RST_INVALIDATE)) {
+						sv->timeout = 0;
+						sv->last_seen = 0;
+						if (rpos >= 0) {
+							ctx->shm->session_values_v4[rpos].timeout = 0;
+							ctx->shm->session_values_v4[rpos].last_seen = 0;
+						}
+					}
 				}
 				if (sv->state == SESS_STATE_CLOSED ||
 				    (sv->state == SESS_STATE_TIME_WAIT && old_state != SESS_STATE_TIME_WAIT)) {
@@ -523,6 +534,16 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 						fsv->timeout = new_timeout;
 						fsv->last_seen = now;
 					}
+					if (sv->state == SESS_STATE_CLOSED &&
+					    ctx->shm->flow_config &&
+					    (ctx->shm->flow_config->tcp_flags & FLOW_TCP_RST_INVALIDATE)) {
+						sv->timeout = 0;
+						sv->last_seen = 0;
+						if (fpos >= 0) {
+							ctx->shm->session_values_v4[fpos].timeout = 0;
+							ctx->shm->session_values_v4[fpos].last_seen = 0;
+						}
+					}
 				}
 				if (sv->state == SESS_STATE_CLOSED ||
 				    (sv->state == SESS_STATE_TIME_WAIT && old_state != SESS_STATE_TIME_WAIT)) {
@@ -585,7 +606,6 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 				sv->state = ct_tcp_update_state(old_state, meta->tcp_flags, dir);
 				if (sv->state != old_state) {
 					uint32_t new_timeout = ct_get_timeout(ctx, PROTO_TCP, sv->state);
-					/* Per-app timeout overrides default for non-closing states */
 					if (sv->app_timeout > 0 &&
 					    sv->state != SESS_STATE_CLOSED &&
 					    sv->state != SESS_STATE_FIN_WAIT)
@@ -597,6 +617,16 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 						rsv->state = sv->state;
 						rsv->timeout = new_timeout;
 						rsv->last_seen = now;
+					}
+					if (sv->state == SESS_STATE_CLOSED &&
+					    ctx->shm->flow_config &&
+					    (ctx->shm->flow_config->tcp_flags & FLOW_TCP_RST_INVALIDATE)) {
+						sv->timeout = 0;
+						sv->last_seen = 0;
+						if (rpos >= 0) {
+							ctx->shm->session_values_v6[rpos].timeout = 0;
+							ctx->shm->session_values_v6[rpos].last_seen = 0;
+						}
 					}
 				}
 				if (sv->state == SESS_STATE_CLOSED ||
@@ -660,7 +690,6 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 				sv->state = ct_tcp_update_state(old_state, meta->tcp_flags, 1);
 				if (sv->state != old_state) {
 					uint32_t new_timeout = ct_get_timeout(ctx, PROTO_TCP, sv->state);
-					/* Per-app timeout overrides default for non-closing states */
 					if (sv->app_timeout > 0 &&
 					    sv->state != SESS_STATE_CLOSED &&
 					    sv->state != SESS_STATE_FIN_WAIT)
@@ -672,6 +701,16 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 						fsv->state = sv->state;
 						fsv->timeout = new_timeout;
 						fsv->last_seen = now;
+					}
+					if (sv->state == SESS_STATE_CLOSED &&
+					    ctx->shm->flow_config &&
+					    (ctx->shm->flow_config->tcp_flags & FLOW_TCP_RST_INVALIDATE)) {
+						sv->timeout = 0;
+						sv->last_seen = 0;
+						if (fpos >= 0) {
+							ctx->shm->session_values_v6[fpos].timeout = 0;
+							ctx->shm->session_values_v6[fpos].last_seen = 0;
+						}
 					}
 				}
 				if (sv->state == SESS_STATE_CLOSED ||
@@ -749,8 +788,14 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		};
 
 		uint8_t init_state = SESS_STATE_NEW;
-		if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x02))
-			init_state = SESS_STATE_SYN_SENT;
+		if (meta->protocol == PROTO_TCP) {
+			if (meta->tcp_flags & 0x02) {
+				init_state = SESS_STATE_SYN_SENT;
+			} else if (ctx->shm->flow_config &&
+				   (ctx->shm->flow_config->tcp_flags & FLOW_TCP_NO_SYN_CHECK)) {
+				init_state = SESS_STATE_ESTABLISHED;
+			}
+		}
 
 		struct session_value fwd_val;
 		memset(&fwd_val, 0, sizeof(fwd_val));
@@ -830,8 +875,14 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		fwd_key6.protocol = meta->protocol;
 
 		uint8_t init_state = SESS_STATE_NEW;
-		if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x02))
-			init_state = SESS_STATE_SYN_SENT;
+		if (meta->protocol == PROTO_TCP) {
+			if (meta->tcp_flags & 0x02) {
+				init_state = SESS_STATE_SYN_SENT;
+			} else if (ctx->shm->flow_config &&
+				   (ctx->shm->flow_config->tcp_flags & FLOW_TCP_NO_SYN_CHECK)) {
+				init_state = SESS_STATE_ESTABLISHED;
+			}
+		}
 
 		struct session_value_v6 fwd_val6;
 		memset(&fwd_val6, 0, sizeof(fwd_val6));

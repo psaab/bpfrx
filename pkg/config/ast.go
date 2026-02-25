@@ -968,6 +968,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"flow": {children: map[string]*schemaNode{
+			"aging":                        {children: nil},
 			"tcp-session":                  {children: nil},
 			"udp-session":                  {children: nil},
 			"icmp-session":                 {children: nil},

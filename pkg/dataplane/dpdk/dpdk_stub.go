@@ -69,7 +69,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 
 // --- Zone / interface mapping ---
 
-func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32) error {
+func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8) error {
 	return nil
 }
 

@@ -215,7 +215,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 
 // --- Zone / interface mapping ---
 
-func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32) error {
+func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8) error {
 	shm := m.platform.shm
 	if shm == nil {
 		return fmt.Errorf("DPDK not initialized")
@@ -232,6 +232,7 @@ func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTabl
 		uintptr(unsafe.Pointer(shm.iface_zone_values)) +
 			uintptr(pos)*unsafe.Sizeof(C.struct_iface_zone_value{})))
 	valPtr.zone_id = C.uint16_t(zoneID)
+	valPtr.flags = C.uint8_t(flags)
 	valPtr.routing_table = C.uint32_t(routingTable)
 	return nil
 }
@@ -1076,6 +1077,7 @@ func (m *Manager) SetFlowConfig(cfg dataplane.FlowConfigValue) error {
 	shm.flow_config.alg_flags = C.uint8_t(cfg.ALGFlags)
 	shm.flow_config.lo0_filter_v4 = C.uint16_t(cfg.Lo0FilterV4)
 	shm.flow_config.lo0_filter_v6 = C.uint16_t(cfg.Lo0FilterV6)
+	shm.flow_config.tcp_flags = C.uint8_t(cfg.TCPFlags)
 	return nil
 }
 

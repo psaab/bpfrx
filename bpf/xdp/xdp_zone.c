@@ -223,6 +223,8 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		return XDP_DROP;
 	}
 	meta->ingress_zone = izv->zone_id;
+	if (izv->flags & IFACE_FLAG_TUNNEL)
+		meta->meta_flags |= META_FLAG_TUNNEL;
 	inc_zone_ingress((__u32)izv->zone_id, meta->pkt_len);
 
 	/* Set VRF routing table from interface's routing instance.

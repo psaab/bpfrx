@@ -98,6 +98,7 @@ type Daemon struct {
 	aggregator    *logging.SessionAggregator
 	aggCancel     context.CancelFunc
 	vrrpMgr       *vrrp.Manager
+	gc            *conntrack.GC
 	startTime     time.Time // daemon start time; used to suppress stale config sync
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
@@ -262,12 +263,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start background services if dataplane is loaded
 	var er *logging.EventReader
-	var gc *conntrack.GC
 	if d.dp != nil {
 		// Start FIB sync (DPDK: background route populator; eBPF: no-op)
 		d.dp.StartFIBSync(ctx)
 
-		gc = conntrack.NewGC(d.dp, 10*time.Second)
+		gc := conntrack.NewGC(d.dp, 10*time.Second)
+		d.gc = gc
 
 		// Wire GC delete callbacks for incremental session sync.
 		// Deletes are synced if this node is primary for any RG — the peer
@@ -555,7 +556,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			Store:    d.store,
 			DP:       d.dp,
 			EventBuf: eventBuf,
-			GC:       gc,
+			GC:       d.gc,
 			Routing:  d.routing,
 			FRR:      d.frr,
 			IPsec:    d.ipsec,
@@ -621,7 +622,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			Store:    d.store,
 			DP:       d.dp,
 			EventBuf: eventBuf,
-			GC:       gc,
+			GC:       d.gc,
 			Routing:  d.routing,
 			FRR:      d.frr,
 			IPsec:    d.ipsec,
@@ -1192,7 +1193,16 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
-	// 2.1. Build zone→RG map for per-RG session sync.
+	// 2.1. Wire aggressive session aging config to GC.
+	if d.gc != nil {
+		d.gc.SetAgingConfig(
+			cfg.Security.Flow.AgingEarlyAgeout,
+			cfg.Security.Flow.AgingHighWatermark,
+			cfg.Security.Flow.AgingLowWatermark,
+		)
+	}
+
+	// 2.2. Build zone→RG map for per-RG session sync.
 	if d.sessionSync != nil && compileResult != nil {
 		d.sessionSync.SetZoneRGMap(buildZoneRGMap(cfg, compileResult.ZoneIDs))
 	}

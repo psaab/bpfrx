@@ -2151,10 +2151,43 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 }
 
 func compileFlow(node *Node, sec *SecurityConfig) error {
+	// Aggressive session aging
+	if agingNode := node.FindChild("aging"); agingNode != nil {
+		for _, opt := range agingNode.Children {
+			if len(opt.Keys) < 2 {
+				continue
+			}
+			val, err := strconv.Atoi(opt.Keys[1])
+			if err != nil {
+				continue
+			}
+			switch opt.Name() {
+			case "early-ageout":
+				sec.Flow.AgingEarlyAgeout = val
+			case "high-watermark":
+				sec.Flow.AgingHighWatermark = val
+			case "low-watermark":
+				sec.Flow.AgingLowWatermark = val
+			}
+		}
+	}
+
 	tcpNode := node.FindChild("tcp-session")
 	if tcpNode != nil {
 		sec.Flow.TCPSession = &TCPSessionConfig{}
 		for _, opt := range tcpNode.Children {
+			// Handle leaf flags (no value)
+			switch opt.Name() {
+			case "no-syn-check":
+				sec.Flow.TCPSession.NoSynCheck = true
+				continue
+			case "no-syn-check-in-tunnel":
+				sec.Flow.TCPSession.NoSynCheckInTunnel = true
+				continue
+			case "rst-invalidate-session":
+				sec.Flow.TCPSession.RstInvalidateSession = true
+				continue
+			}
 			if len(opt.Keys) < 2 {
 				continue
 			}

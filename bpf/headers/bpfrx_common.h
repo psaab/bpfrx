@@ -197,6 +197,7 @@ struct icmp6hdr {
 #define META_FLAG_EMBEDDED_ICMP      (1 << 0)
 #define META_FLAG_NAT64_ICMP_ERR     (1 << 1)
 #define META_FLAG_KERNEL_ROUTE       (1 << 2)
+#define META_FLAG_TUNNEL             (1 << 3)  /* arrived via tunnel interface */
 
 /* Per-rule logging flags (policy_rule.log and session_value.log_flags) */
 #define LOG_FLAG_SESSION_INIT  (1 << 0)
@@ -344,9 +345,12 @@ struct iface_zone_key {
 /* Value for iface_zone_map: zone assignment + optional VRF routing table */
 struct iface_zone_value {
 	__u16 zone_id;
-	__u16 pad;
+	__u8  flags;          /* IFACE_FLAG_* bits */
+	__u8  pad;
 	__u32 routing_table;  /* kernel table ID, 0 = main table */
 };
+
+#define IFACE_FLAG_TUNNEL   (1 << 0)  /* GRE/IPsec tunnel interface */
 
 #ifndef BPF_FIB_LOOKUP_TBID
 #define BPF_FIB_LOOKUP_TBID (1U << 3)
@@ -758,7 +762,14 @@ struct flow_config {
 	                          bit 2: SIP disable, bit 3: TFTP disable */
 	__u16 lo0_filter_v4;   /* filter ID for lo0 inet input (0xFFFF=none) */
 	__u16 lo0_filter_v6;   /* filter ID for lo0 inet6 input (0xFFFF=none) */
+	__u8  tcp_flags;       /* bit 0: no-syn-check, bit 1: rst-invalidate,
+	                          bit 2: no-syn-check-in-tunnel */
+	__u8  pad_fc;          /* alignment padding */
 };
+
+#define FLOW_TCP_NO_SYN_CHECK          (1 << 0)
+#define FLOW_TCP_RST_INVALIDATE        (1 << 1)
+#define FLOW_TCP_NO_SYN_CHECK_TUNNEL   (1 << 2)
 
 /* ============================================================
  * Port mirroring (SPAN) configuration

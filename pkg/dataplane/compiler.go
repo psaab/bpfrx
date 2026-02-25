@@ -555,7 +555,11 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 
 			// Set zone mapping using composite key {physIfindex, vlanID}
 			tableID := ifaceTableID[ifaceRef] // 0 if not in any routing instance
-			if err := dp.SetZone(physIface.Index, uint16(vlanID), zid, tableID); err != nil {
+			var izFlags uint8
+			if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg.Tunnel != nil {
+				izFlags |= IfaceFlagTunnel
+			}
+			if err := dp.SetZone(physIface.Index, uint16(vlanID), zid, tableID, izFlags); err != nil {
 				return fmt.Errorf("set zone for %s vlan %d (ifindex %d): %w",
 					physName, vlanID, physIface.Index, err)
 			}
@@ -2696,6 +2700,19 @@ func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) 
 		fc.ALGFlags |= 0x08
 	}
 
+	// TCP session flags
+	if flow.TCPSession != nil {
+		if flow.TCPSession.NoSynCheck {
+			fc.TCPFlags |= 0x01
+		}
+		if flow.TCPSession.RstInvalidateSession {
+			fc.TCPFlags |= 0x02
+		}
+		if flow.TCPSession.NoSynCheckInTunnel {
+			fc.TCPFlags |= 0x04
+		}
+	}
+
 	// Lo0 filter IDs for host-bound traffic filtering (0xFFFF = none)
 	if result.Lo0FilterV4 != 0xFFFFFFFF {
 		fc.Lo0FilterV4 = uint16(result.Lo0FilterV4)
@@ -2718,6 +2735,7 @@ func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) 
 		"tcp_mss_gre_out", fc.TCPMSSGreOut,
 		"allow_dns_reply", fc.AllowDNSReply,
 		"allow_embedded_icmp", fc.AllowEmbeddedICMP,
+		"tcp_flags", fc.TCPFlags,
 		"lo0_filter_v4", fc.Lo0FilterV4,
 		"lo0_filter_v6", fc.Lo0FilterV6)
 

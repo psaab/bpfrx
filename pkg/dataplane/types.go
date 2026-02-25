@@ -641,9 +641,13 @@ type IfaceZoneKey struct {
 // IfaceZoneValue mirrors the C struct iface_zone_value.
 type IfaceZoneValue struct {
 	ZoneID       uint16
-	Pad          uint16
+	Flags        uint8  // IFACE_FLAG_* bits
+	Pad          uint8
 	RoutingTable uint32 // kernel table ID, 0 = main table
 }
+
+// IfaceFlagTunnel marks an interface as a tunnel (GRE/IPsec).
+const IfaceFlagTunnel = 1 << 0
 
 // VlanIfaceInfo mirrors the C struct vlan_iface_info.
 type VlanIfaceInfo struct {

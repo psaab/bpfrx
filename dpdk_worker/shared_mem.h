@@ -62,7 +62,8 @@ struct iface_zone_key {
 
 struct iface_zone_value {
 	uint16_t zone_id;
-	uint16_t pad;
+	uint8_t  flags;
+	uint8_t  pad;
 	uint32_t routing_table;
 };
 
@@ -615,7 +616,14 @@ struct flow_config {
 	uint8_t  alg_flags;
 	uint16_t lo0_filter_v4;
 	uint16_t lo0_filter_v6;
+	uint8_t  tcp_flags;       /* bit 0: no-syn-check, bit 1: rst-invalidate,
+	                             bit 2: no-syn-check-in-tunnel */
+	uint8_t  pad_fc;
 };
+
+#define FLOW_TCP_NO_SYN_CHECK          (1 << 0)
+#define FLOW_TCP_RST_INVALIDATE        (1 << 1)
+#define FLOW_TCP_NO_SYN_CHECK_TUNNEL   (1 << 2)
 
 /* ============================================================
  * FIB next-hop entry (populated by Go control plane)

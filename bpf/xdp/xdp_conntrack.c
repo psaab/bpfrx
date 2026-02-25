@@ -72,6 +72,24 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 				paired->timeout = new_timeout;
 				paired->last_seen = now;
 			}
+
+			/* rst-invalidate-session: expire immediately
+			 * so next GC sweep deletes both entries. */
+			if (new_state == SESS_STATE_CLOSED) {
+				__u32 z = 0;
+				struct flow_config *fc =
+					bpf_map_lookup_elem(
+						&flow_config_map, &z);
+				if (fc && (fc->tcp_flags &
+					   FLOW_TCP_RST_INVALIDATE)) {
+					sess->timeout = 0;
+					sess->last_seen = 0;
+					if (paired) {
+						paired->timeout = 0;
+						paired->last_seen = 0;
+					}
+				}
+			}
 		}
 	}
 
@@ -151,10 +169,6 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 	if (meta->protocol == PROTO_TCP) {
 		__u8 new_state = ct_tcp_update_state(
 			sess->state, meta->tcp_flags, pkt_dir);
-		/* Suppress RST→CLOSED when packet will be kernel-routed.
-		 * The kernel may drop the packet (no route during failback),
-		 * so the RST never actually reaches the peer — don't poison
-		 * session state based on a potentially-dropped RST. */
 		if (new_state == SESS_STATE_CLOSED &&
 		    (meta->meta_flags & META_FLAG_KERNEL_ROUTE))
 			new_state = sess->state;
@@ -166,8 +180,6 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 			    new_state != SESS_STATE_FIN_WAIT)
 				new_timeout = (__u32)sess->app_timeout;
 			sess->timeout = new_timeout;
-			/* Sync state to paired entry so both entries
-			 * share the same TCP state and timeout. */
 			struct session_value_v6 *paired =
 				bpf_map_lookup_elem(&sessions_v6,
 						    &sess->reverse_key);
@@ -175,6 +187,23 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 				paired->state = new_state;
 				paired->timeout = new_timeout;
 				paired->last_seen = now;
+			}
+
+			/* rst-invalidate-session: expire immediately */
+			if (new_state == SESS_STATE_CLOSED) {
+				__u32 z = 0;
+				struct flow_config *fc =
+					bpf_map_lookup_elem(
+						&flow_config_map, &z);
+				if (fc && (fc->tcp_flags &
+					   FLOW_TCP_RST_INVALIDATE)) {
+					sess->timeout = 0;
+					sess->last_seen = 0;
+					if (paired) {
+						paired->timeout = 0;
+						paired->last_seen = 0;
+					}
+				}
 			}
 		}
 	}

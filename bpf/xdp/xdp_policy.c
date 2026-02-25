@@ -96,10 +96,20 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	ct_reverse_key(&fwd_key, &rev_key);
 
 	__u8 initial_state;
-	if (meta->protocol == PROTO_TCP)
-		initial_state = SESS_STATE_SYN_SENT;
-	else
+	if (meta->protocol == PROTO_TCP) {
+		/* no-syn-check: allow mid-stream TCP → ESTABLISHED.
+		 * no-syn-check-in-tunnel: same, but only for tunnel traffic. */
+		__u32 z = 0;
+		struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &z);
+		if (fc && ((fc->tcp_flags & FLOW_TCP_NO_SYN_CHECK) ||
+			   ((fc->tcp_flags & FLOW_TCP_NO_SYN_CHECK_TUNNEL) &&
+			    (meta->meta_flags & META_FLAG_TUNNEL))))
+			initial_state = SESS_STATE_ESTABLISHED;
+		else
+			initial_state = SESS_STATE_SYN_SENT;
+	} else {
 		initial_state = SESS_STATE_ESTABLISHED;
+	}
 
 	__u32 timeout = ct_get_timeout(meta->protocol, initial_state);
 	if (meta->app_timeout > 0)
@@ -202,10 +212,18 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	ct_reverse_key_v6(&fwd_key, &rev_key);
 
 	__u8 initial_state;
-	if (meta->protocol == PROTO_TCP)
-		initial_state = SESS_STATE_SYN_SENT;
-	else
+	if (meta->protocol == PROTO_TCP) {
+		__u32 z = 0;
+		struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &z);
+		if (fc && ((fc->tcp_flags & FLOW_TCP_NO_SYN_CHECK) ||
+			   ((fc->tcp_flags & FLOW_TCP_NO_SYN_CHECK_TUNNEL) &&
+			    (meta->meta_flags & META_FLAG_TUNNEL))))
+			initial_state = SESS_STATE_ESTABLISHED;
+		else
+			initial_state = SESS_STATE_SYN_SENT;
+	} else {
 		initial_state = SESS_STATE_ESTABLISHED;
+	}
 
 	__u32 timeout = ct_get_timeout(meta->protocol, initial_state);
 	if (meta->app_timeout > 0)

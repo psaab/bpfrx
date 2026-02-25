@@ -161,6 +161,8 @@ type bpfrxTcScreenEgressFlowConfig struct {
 	AlgFlags          uint8
 	Lo0FilterV4       uint16
 	Lo0FilterV6       uint16
+	TcpFlags          uint8
+	PadFc             uint8
 }
 
 type bpfrxTcScreenEgressIfaceCounterValue struct {
@@ -189,7 +191,8 @@ type bpfrxTcScreenEgressIfaceZoneKey struct {
 type bpfrxTcScreenEgressIfaceZoneValue struct {
 	_            structs.HostLayout
 	ZoneId       uint16
-	Pad          uint16
+	Flags        uint8
+	Pad          uint8
 	RoutingTable uint32
 }
 

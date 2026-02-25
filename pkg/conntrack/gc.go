@@ -22,6 +22,11 @@ type GCStats struct {
 	ExpiredDeleted      int
 }
 
+// MaxSessions is the maximum number of session entries in the BPF map.
+// This counts both forward and reverse entries, so the effective session
+// count for watermark comparison is total/2.
+const MaxSessions = 10_000_000
+
 // GC performs periodic garbage collection on the session table.
 type GC struct {
 	dp       dataplane.DataPlane
@@ -44,11 +49,31 @@ type GC struct {
 	snatExpiredV4 []expiredSession
 	toDeleteV6    []dataplane.SessionKeyV6
 	snatExpiredV6 []expiredSessionV6
+
+	// Aggressive session aging (set via SetAgingConfig).
+	agingActive    bool
+	earlyAgeout    uint64 // seconds
+	highWatermark  int    // percent of MaxSessions
+	lowWatermark   int    // percent of MaxSessions
 }
 
 // NewGC creates a new session garbage collector.
 func NewGC(dp dataplane.DataPlane, interval time.Duration) *GC {
 	return &GC{dp: dp, interval: interval, lastV6Count: -1}
+}
+
+// SetAgingConfig updates the aggressive aging parameters.
+// earlyAgeout is the shortened timeout in seconds (0 = disabled).
+// highWM/lowWM are utilization percentages of MaxSessions (0 = disabled).
+func (gc *GC) SetAgingConfig(earlyAgeout, highWM, lowWM int) {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+	gc.earlyAgeout = uint64(earlyAgeout)
+	gc.highWatermark = highWM
+	gc.lowWatermark = lowWM
+	if highWM == 0 || earlyAgeout == 0 {
+		gc.agingActive = false
+	}
 }
 
 // Stats returns a snapshot of the most recent GC sweep statistics.
@@ -124,8 +149,12 @@ func (gc *GC) sweep() {
 			established++
 		}
 
-		// Check expiry
-		if val.LastSeen+uint64(val.Timeout) < now {
+		// Check expiry (aggressive aging shortens effective timeout)
+		effectiveTimeout := uint64(val.Timeout)
+		if gc.agingActive && gc.earlyAgeout > 0 && gc.earlyAgeout < effectiveTimeout {
+			effectiveTimeout = gc.earlyAgeout
+		}
+		if val.LastSeen+effectiveTimeout < now {
 			expired++
 			// Delete both forward and reverse entries
 			toDelete = append(toDelete, key)
@@ -221,7 +250,11 @@ func (gc *GC) sweep() {
 				established++
 			}
 
-			if val.LastSeen+uint64(val.Timeout) < now {
+			effectiveTimeout := uint64(val.Timeout)
+			if gc.agingActive && gc.earlyAgeout > 0 && gc.earlyAgeout < effectiveTimeout {
+				effectiveTimeout = gc.earlyAgeout
+			}
+			if val.LastSeen+effectiveTimeout < now {
 				expired++
 				toDeleteV6 = append(toDeleteV6, key)
 				toDeleteV6 = append(toDeleteV6, val.ReverseKey)
@@ -302,6 +335,22 @@ func (gc *GC) sweep() {
 	}
 
 	gc.lastTotal = total
+
+	// Aggressive aging watermark hysteresis.
+	// total counts both forward+reverse entries; MaxSessions is the map size
+	// which holds both. Compare directly against MaxSessions.
+	if gc.highWatermark > 0 && gc.earlyAgeout > 0 {
+		pct := total * 100 / MaxSessions
+		if !gc.agingActive && pct >= gc.highWatermark {
+			gc.agingActive = true
+			slog.Info("aggressive session aging activated",
+				"utilization_pct", pct, "high_watermark", gc.highWatermark)
+		} else if gc.agingActive && pct < gc.lowWatermark {
+			gc.agingActive = false
+			slog.Info("aggressive session aging deactivated",
+				"utilization_pct", pct, "low_watermark", gc.lowWatermark)
+		}
+	}
 
 	gc.mu.Lock()
 	gc.stats = GCStats{

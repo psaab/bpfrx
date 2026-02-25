@@ -703,6 +703,9 @@ type FlowConfig struct {
 	PowerModeDisable           bool
 	SynFloodProtectionMode     string // "syn-cookie" or "" (default = drop)
 	Traceoptions               *FlowTraceoptions
+	AgingEarlyAgeout           int // seconds (0 = disabled)
+	AgingHighWatermark         int // percent of max sessions (0 = disabled)
+	AgingLowWatermark          int // percent of max sessions (0 = disabled)
 }
 
 // FlowTraceoptions holds flow trace debugging configuration.
@@ -731,10 +734,13 @@ type ALGConfig struct {
 
 // TCPSessionConfig holds TCP session timeout configuration.
 type TCPSessionConfig struct {
-	EstablishedTimeout int // default 1800
-	InitialTimeout     int // default 30
-	ClosingTimeout     int // default 30
-	TimeWaitTimeout    int // default 120
+	EstablishedTimeout   int  // default 1800
+	InitialTimeout       int  // default 30
+	ClosingTimeout       int  // default 30
+	TimeWaitTimeout      int  // default 120
+	NoSynCheck           bool // allow mid-stream TCP session creation
+	NoSynCheckInTunnel   bool // allow mid-stream TCP for tunnel traffic only
+	RstInvalidateSession bool // immediately expire session on RST
 }
 
 // LogConfig holds logging/syslog configuration.
