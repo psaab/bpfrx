@@ -1339,25 +1339,34 @@ int xdp_policy_prog(struct xdp_md *ctx)
 						if (alloc_rc == 0) {
 							sess_nat_flags = SESS_FLAG_NAT64 | SESS_FLAG_SNAT;
 							sess_nat_src_port = alloc_v4_port;
-							/* Store allocated v4 SNAT addr in meta->src_ip
-							 * (nat64 stage uses this as the IPv4 source) */
-							__builtin_memset(&meta->src_ip, 0, sizeof(meta->src_ip));
-							meta->src_ip.v4 = alloc_v4_ip;
-							meta->src_port = alloc_v4_port;
 
-							/* Create v6 session with NAT64 flag.
-							 * meta->src_ip already has v4 addr in first 4 bytes
-							 * (set above), rest zeroed — use it as nat_src. */
+							/* Build SNAT v4 address as v6 bytes
+							 * in nat_src_ip (scratch buffer).
+							 * Do NOT overwrite meta->src_ip yet —
+							 * create_session_v6 uses it for the
+							 * session key which must retain the
+							 * original client IPv6 source. */
+							__builtin_memset(&meta->nat_src_ip, 0,
+								sizeof(meta->nat_src_ip));
+							meta->nat_src_ip.v4 = alloc_v4_ip;
+
 							const __u8 *nat_dst_ptr = (meta->nat_flags & SESS_FLAG_DNAT) ?
 								meta->nat_dst_ip.v6 : NULL;
 							if (create_session_v6(meta, rule->rule_id, rule->log,
 									      sess_nat_flags,
-									      meta->src_ip.v6, alloc_v4_port,
+									      meta->nat_src_ip.v6, alloc_v4_port,
 									      nat_dst_ptr, sess_nat_dst_port,
 									      (__u16)pkt_app_id) < 0) {
 								inc_counter(GLOBAL_CTR_DROPS);
 								return XDP_DROP;
 							}
+
+							/* NOW overwrite meta->src_ip for
+							 * xdp_nat64: it reads src_ip.v4
+							 * as the SNAT IPv4 source addr. */
+							__builtin_memset(&meta->src_ip, 0, sizeof(meta->src_ip));
+							meta->src_ip.v4 = alloc_v4_ip;
+							meta->src_port = alloc_v4_port;
 
 							if (rule->log & LOG_FLAG_SESSION_INIT)
 								emit_event(meta, EVENT_TYPE_SESSION_OPEN,

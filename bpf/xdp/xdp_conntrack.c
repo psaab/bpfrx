@@ -196,6 +196,10 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		}
 	}
 
+	/* Propagate NAT64 flag so xdp_nat dispatches to xdp_nat64. */
+	if (sess->flags & SESS_FLAG_NAT64)
+		meta->nat_flags |= SESS_FLAG_NAT64;
+
 	__u32 next_prog = XDP_PROG_FORWARD;
 	if (sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT))
 		next_prog = XDP_PROG_NAT;
@@ -720,6 +724,44 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 							 n64v->orig_dst_v6, 16);
 					meta->nat_flags |= SESS_FLAG_NAT64;
 					meta->dst_port = n64v->orig_src_port;
+
+					/* Update the v6 session so TCP state
+					 * machine and counters stay in sync.
+					 * Return traffic bypasses the v6 path
+					 * so without this the session stays
+					 * stuck in SYN_SENT. */
+					struct session_key_v6 n64_sk = {};
+					__builtin_memcpy(n64_sk.src_ip,
+						n64v->orig_src_v6, 16);
+					__builtin_memcpy(n64_sk.dst_ip,
+						n64v->orig_dst_v6, 16);
+					n64_sk.src_port = n64v->orig_src_port;
+					n64_sk.dst_port = n64v->orig_dst_port;
+					n64_sk.protocol = meta->protocol;
+					struct session_value_v6 *n64_sess =
+						bpf_map_lookup_elem(
+						&sessions_v6, &n64_sk);
+					if (n64_sess) {
+						__u64 now = meta->ktime_ns /
+							1000000000ULL;
+						n64_sess->last_seen = now;
+						__sync_fetch_and_add(
+							&n64_sess->rev_packets, 1);
+						__sync_fetch_and_add(
+							&n64_sess->rev_bytes,
+							meta->pkt_len);
+						if (meta->protocol == PROTO_TCP) {
+							__u8 ns = ct_tcp_update_state(
+								n64_sess->state,
+								meta->tcp_flags, 1);
+							if (ns != n64_sess->state) {
+								n64_sess->state = ns;
+								n64_sess->timeout =
+									ct_get_timeout(
+									PROTO_TCP, ns);
+							}
+						}
+					}
 
 					/* Skip policy, go directly to NAT64
 					 * translation (this is return traffic). */
