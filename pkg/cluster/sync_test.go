@@ -398,8 +398,13 @@ func TestHandleMessageDeleteV4(t *testing.T) {
 // Embeds DataPlane interface; only IterateSessions/V6 are implemented.
 type mockSweepDP struct {
 	dataplane.DataPlane
-	v4sessions map[dataplane.SessionKey]dataplane.SessionValue
-	v6sessions map[dataplane.SessionKeyV6]dataplane.SessionValueV6
+	v4sessions     map[dataplane.SessionKey]dataplane.SessionValue
+	v6sessions     map[dataplane.SessionKeyV6]dataplane.SessionValueV6
+	sessionCounter uint64
+}
+
+func (m *mockSweepDP) ReadGlobalCounter(index uint32) (uint64, error) {
+	return m.sessionCounter, nil
 }
 
 func (m *mockSweepDP) IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
@@ -439,6 +444,7 @@ func TestSyncSweepNewSessions(t *testing.T) {
 				State: dataplane.SessStateEstablished, Created: now - 100, IsReverse: 0, // old session
 			},
 		},
+		sessionCounter: 1,
 	}
 
 	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
@@ -462,6 +468,7 @@ func TestSyncSweepSkipsReverse(t *testing.T) {
 				Created: now, IsReverse: 1, // reverse entry
 			},
 		},
+		sessionCounter: 1,
 	}
 
 	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
@@ -482,6 +489,7 @@ func TestSyncSweepSkipsWhenNotPrimary(t *testing.T) {
 		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
 			{Protocol: 6}: {Created: now, IsReverse: 0},
 		},
+		sessionCounter: 1,
 	}
 
 	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
@@ -502,6 +510,7 @@ func TestSyncSweepSkipsWhenDisconnected(t *testing.T) {
 		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
 			{Protocol: 6}: {Created: now, IsReverse: 0},
 		},
+		sessionCounter: 1,
 	}
 
 	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
@@ -549,6 +558,7 @@ func TestSyncSweepV6(t *testing.T) {
 				Created: now, IsReverse: 0,
 			},
 		},
+		sessionCounter: 1,
 	}
 
 	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
@@ -618,6 +628,7 @@ func TestSyncSweepPerRG(t *testing.T) {
 				State: dataplane.SessStateEstablished, Created: now, IsReverse: 0, IngressZone: 2,
 			},
 		},
+		sessionCounter: 1,
 	}
 
 	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
@@ -653,6 +664,7 @@ func TestSyncSweepPerRGV6(t *testing.T) {
 				Created: now, IsReverse: 0, IngressZone: 2,
 			},
 		},
+		sessionCounter: 1,
 	}
 
 	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)

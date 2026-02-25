@@ -107,7 +107,8 @@ type SessionSync struct {
 
 	IsPrimaryFn      func() bool        // returns true if local node is primary for RG 0
 	IsPrimaryForRGFn func(rgID int) bool // returns true if local is primary for given RG
-	lastSweepTime    uint64             // monotonic seconds of last sync sweep
+	lastSweepTime       uint64 // monotonic seconds of last sync sweep
+	lastSessionCounter  uint64 // last seen GLOBAL_CTR_SESSIONS_NEW value
 	vrfDevice        string             // VRF device for SO_BINDTODEVICE (empty = default VRF)
 
 	zoneRGMu  sync.RWMutex
@@ -262,6 +263,13 @@ func (s *SessionSync) syncSweep() {
 		return
 	}
 
+	// Fast path: skip iteration when no new sessions since last sweep.
+	// GLOBAL_CTR_SESSIONS_NEW (index 3) is incremented by BPF on every new session.
+	newCount, err := s.dp.ReadGlobalCounter(3) // GLOBAL_CTR_SESSIONS_NEW
+	if err == nil && newCount == s.lastSessionCounter {
+		return
+	}
+
 	threshold := s.lastSweepTime
 	now := monotonicSeconds()
 	var count int
@@ -290,6 +298,9 @@ func (s *SessionSync) syncSweep() {
 	})
 
 	s.lastSweepTime = now
+	if newCount > 0 {
+		s.lastSessionCounter = newCount
+	}
 	if count > 0 {
 		slog.Info("cluster sync: sweep synced sessions", "count", count)
 	}

@@ -31,11 +31,14 @@ type GC struct {
 
 	OnDeleteV4 func(key dataplane.SessionKey)
 	OnDeleteV6 func(key dataplane.SessionKeyV6)
+
+	lastV6Count int // v6 entries found in previous sweep
+	sweepCount  int // sweep counter for periodic forced v6 check
 }
 
 // NewGC creates a new session garbage collector.
 func NewGC(dp dataplane.DataPlane, interval time.Duration) *GC {
-	return &GC{dp: dp, interval: interval}
+	return &GC{dp: dp, interval: interval, lastV6Count: -1}
 }
 
 // Stats returns a snapshot of the most recent GC sweep statistics.
@@ -167,35 +170,43 @@ func (gc *GC) sweep() {
 		}
 	}
 
-	// IPv6 sessions
+	// IPv6 sessions — skip iteration when previous sweep found zero entries,
+	// but force a check every 6th sweep (60s at default 10s interval).
+	gc.sweepCount++
 	var toDeleteV6 []dataplane.SessionKeyV6
 	var snatExpiredV6 []expiredSessionV6
+	skipV6 := gc.lastV6Count == 0 && gc.sweepCount%6 != 0
 
-	err = gc.dp.BatchIterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-		total++
+	if !skipV6 {
+		var v6Count int
+		err = gc.dp.BatchIterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			v6Count++
+			total++
 
-		if val.IsReverse != 0 {
-			return true
-		}
-
-		if val.State == dataplane.SessStateEstablished {
-			established++
-		}
-
-		if val.LastSeen+uint64(val.Timeout) < now {
-			expired++
-			toDeleteV6 = append(toDeleteV6, key)
-			toDeleteV6 = append(toDeleteV6, val.ReverseKey)
-
-			if val.Flags&dataplane.SessFlagSNAT != 0 &&
-				val.Flags&dataplane.SessFlagStaticNAT == 0 {
-				snatExpiredV6 = append(snatExpiredV6, expiredSessionV6{key: key, val: val})
+			if val.IsReverse != 0 {
+				return true
 			}
+
+			if val.State == dataplane.SessStateEstablished {
+				established++
+			}
+
+			if val.LastSeen+uint64(val.Timeout) < now {
+				expired++
+				toDeleteV6 = append(toDeleteV6, key)
+				toDeleteV6 = append(toDeleteV6, val.ReverseKey)
+
+				if val.Flags&dataplane.SessFlagSNAT != 0 &&
+					val.Flags&dataplane.SessFlagStaticNAT == 0 {
+					snatExpiredV6 = append(snatExpiredV6, expiredSessionV6{key: key, val: val})
+				}
+			}
+			return true
+		})
+		if err != nil {
+			slog.Error("conntrack GC v6 iteration failed", "err", err)
 		}
-		return true
-	})
-	if err != nil {
-		slog.Error("conntrack GC v6 iteration failed", "err", err)
+		gc.lastV6Count = v6Count
 	}
 
 	for i := 0; i < len(toDeleteV6); i += deleteBatch {

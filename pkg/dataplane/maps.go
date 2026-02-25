@@ -364,7 +364,7 @@ func (m *Manager) BatchIterateSessions(fn func(SessionKey, SessionValue) bool) e
 		return fmt.Errorf("sessions map not found")
 	}
 
-	const batchSize = 64
+	const batchSize = 256
 	keys := make([]SessionKey, batchSize)
 	vals := make([]SessionValue, batchSize)
 	var cursor ebpf.MapBatchCursor
@@ -393,7 +393,7 @@ func (m *Manager) BatchIterateSessionsV6(fn func(SessionKeyV6, SessionValueV6) b
 		return fmt.Errorf("sessions_v6 map not found")
 	}
 
-	const batchSize = 64
+	const batchSize = 256
 	keys := make([]SessionKeyV6, batchSize)
 	vals := make([]SessionValueV6, batchSize)
 	var cursor ebpf.MapBatchCursor
