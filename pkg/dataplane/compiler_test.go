@@ -7,6 +7,47 @@ import (
 	"github.com/psaab/bpfrx/pkg/config"
 )
 
+type nat64CompileTestDP struct {
+	DataPlane
+	counts        []uint32
+	deleteCalls   int
+	deleteCount   uint32
+	deleteWritten map[NAT64PrefixKey]bool
+}
+
+func (d *nat64CompileTestDP) SetNAT64Config(index uint32, cfg NAT64Config) error { return nil }
+func (d *nat64CompileTestDP) SetNAT64Count(count uint32) error {
+	d.counts = append(d.counts, count)
+	return nil
+}
+func (d *nat64CompileTestDP) DeleteStaleNAT64(count uint32, writtenPrefixes map[NAT64PrefixKey]bool) {
+	d.deleteCalls++
+	d.deleteCount = count
+	d.deleteWritten = writtenPrefixes
+}
+
+func TestCompileNAT64_NoRulesClearsState(t *testing.T) {
+	dp := &nat64CompileTestDP{}
+	cfg := &config.Config{}
+	result := &CompileResult{}
+
+	if err := compileNAT64(dp, cfg, result); err != nil {
+		t.Fatalf("compileNAT64() error = %v", err)
+	}
+	if len(dp.counts) != 1 || dp.counts[0] != 0 {
+		t.Fatalf("SetNAT64Count calls = %v, want [0]", dp.counts)
+	}
+	if dp.deleteCalls != 1 {
+		t.Fatalf("DeleteStaleNAT64 calls = %d, want 1", dp.deleteCalls)
+	}
+	if dp.deleteCount != 0 {
+		t.Fatalf("DeleteStaleNAT64 count = %d, want 0", dp.deleteCount)
+	}
+	if len(dp.deleteWritten) != 0 {
+		t.Fatalf("DeleteStaleNAT64 written map len = %d, want 0", len(dp.deleteWritten))
+	}
+}
+
 func TestExpandFilterTermNegateFlags(t *testing.T) {
 	prefixLists := map[string]*config.PrefixList{
 		"rfc1918": {
