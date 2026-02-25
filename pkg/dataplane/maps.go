@@ -636,6 +636,47 @@ func (m *Manager) ClearScreenConfigs() error {
 	return nil
 }
 
+// UpdateSessionCountSrc writes a per-source-IP session count entry.
+func (m *Manager) UpdateSessionCountSrc(key SessionCountKey, count uint32) error {
+	zm, ok := m.maps["session_count_src"]
+	if !ok {
+		return fmt.Errorf("session_count_src map not found")
+	}
+	val := SessionCountValue{Count: count}
+	return zm.Update(key, val, ebpf.UpdateAny)
+}
+
+// UpdateSessionCountDst writes a per-destination-IP session count entry.
+func (m *Manager) UpdateSessionCountDst(key SessionCountKey, count uint32) error {
+	zm, ok := m.maps["session_count_dst"]
+	if !ok {
+		return fmt.Errorf("session_count_dst map not found")
+	}
+	val := SessionCountValue{Count: count}
+	return zm.Update(key, val, ebpf.UpdateAny)
+}
+
+// ClearSessionCounts deletes all entries from the session count maps.
+func (m *Manager) ClearSessionCounts() error {
+	for _, name := range []string{"session_count_src", "session_count_dst"} {
+		zm, ok := m.maps[name]
+		if !ok {
+			continue
+		}
+		var key SessionCountKey
+		var val []byte
+		iter := zm.Iterate()
+		var keys []SessionCountKey
+		for iter.Next(&key, &val) {
+			keys = append(keys, key)
+		}
+		for _, k := range keys {
+			zm.Delete(k)
+		}
+	}
+	return nil
+}
+
 // SetMirrorConfig writes a port-mirroring entry for the given ingress ifindex.
 func (m *Manager) SetMirrorConfig(ifindex int, mirrorIfindex int, rate uint32) error {
 	zm, ok := m.maps["mirror_config"]

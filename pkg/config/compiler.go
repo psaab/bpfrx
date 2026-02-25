@@ -788,6 +788,25 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			}
 		}
 
+		limitNode := inst.node.FindChild("limit-session")
+		if limitNode != nil {
+			for _, opt := range limitNode.Children {
+				val := nodeVal(opt)
+				if val == "" && len(opt.Keys) >= 2 {
+					val = opt.Keys[1]
+				}
+				if val != "" {
+					n, _ := strconv.Atoi(val)
+					switch opt.Name() {
+					case "source-ip-based":
+						profile.LimitSession.SourceIPBased = n
+					case "destination-ip-based":
+						profile.LimitSession.DestinationIPBased = n
+					}
+				}
+			}
+		}
+
 		sec.Screen[profile.Name] = profile
 	}
 	return nil
@@ -1339,6 +1358,53 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 		sec.NAT.NATv6v4 = &NATv6v4Config{}
 		if v6v4Node.FindChild("no-v6-frag-header") != nil {
 			sec.NAT.NATv6v4.NoV6FragHeader = true
+		}
+	}
+
+	// proxy-arp { interface <name> { address <addr>; } }
+	proxyNode := node.FindChild("proxy-arp")
+	if proxyNode != nil {
+		for _, inst := range namedInstances(proxyNode.FindChildren("interface")) {
+			entry := &ProxyARPEntry{Interface: inst.name}
+			for _, prop := range inst.node.Children {
+				if prop.Name() != "address" {
+					continue
+				}
+				// Hierarchical range: Keys=["address","addr1","to","addr2"]
+				if len(prop.Keys) >= 4 && prop.Keys[2] == "to" {
+					expanded, err := expandAddressRange(prop.Keys[1], prop.Keys[3])
+					if err != nil {
+						return fmt.Errorf("proxy-arp interface %s: %w", inst.name, err)
+					}
+					entry.Addresses = append(entry.Addresses, expanded...)
+					continue
+				}
+
+				// Set syntax range: Keys=["address","addr1"], child Keys=["to","addr2"]
+				toChild := prop.FindChild("to")
+				if toChild != nil {
+					low := nodeVal(prop)
+					high := nodeVal(toChild)
+					if low != "" && high != "" {
+						expanded, err := expandAddressRange(low, high)
+						if err != nil {
+							return fmt.Errorf("proxy-arp interface %s: %w", inst.name, err)
+						}
+						entry.Addresses = append(entry.Addresses, expanded...)
+						continue
+					}
+				}
+
+				// Single address
+				if v := nodeVal(prop); v != "" {
+					addr := v
+					if !strings.Contains(addr, "/") {
+						addr += "/32"
+					}
+					entry.Addresses = append(entry.Addresses, addr)
+				}
+			}
+			sec.NAT.ProxyARP = append(sec.NAT.ProxyARP, entry)
 		}
 	}
 
@@ -3063,6 +3129,22 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 						}
 					case "bfd-liveness-detection":
 						iface.BFD = true
+						for _, bc := range prop.Children {
+							switch bc.Name() {
+							case "minimum-interval":
+								if v := nodeVal(bc); v != "" {
+									if n, err := strconv.Atoi(v); err == nil {
+										iface.BFDInterval = n
+									}
+								}
+							case "multiplier":
+								if v := nodeVal(bc); v != "" {
+									if n, err := strconv.Atoi(v); err == nil {
+										iface.BFDMultiplier = n
+									}
+								}
+							}
+						}
 					}
 				}
 				area.Interfaces = append(area.Interfaces, iface)
@@ -3186,6 +3268,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			var groupAuthKey string
 			var groupBFD bool
 			var groupBFDInterval int
+			var groupBFDMultiplier int
 			var groupDefaultOriginate bool
 			var groupAllowASIn int
 			var groupRemovePrivateAS bool
@@ -3248,10 +3331,17 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				case "bfd-liveness-detection":
 					groupBFD = true
 					for _, bc := range child.Children {
-						if bc.Name() == "minimum-interval" {
+						switch bc.Name() {
+						case "minimum-interval":
 							if v := nodeVal(bc); v != "" {
 								if n, err := strconv.Atoi(v); err == nil {
 									groupBFDInterval = n
+								}
+							}
+						case "multiplier":
+							if v := nodeVal(bc); v != "" {
+								if n, err := strconv.Atoi(v); err == nil {
+									groupBFDMultiplier = n
 								}
 							}
 						}
@@ -3271,6 +3361,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							AuthPassword:     groupAuthKey,
 							BFD:              groupBFD,
 							BFDInterval:      groupBFDInterval,
+							BFDMultiplier:    groupBFDMultiplier,
 							DefaultOriginate: groupDefaultOriginate,
 							AllowASIn:        groupAllowASIn,
 							RemovePrivateAS:  groupRemovePrivateAS,
@@ -3303,10 +3394,17 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							case "bfd-liveness-detection":
 								neighbor.BFD = true
 								for _, bc := range prop.Children {
-									if bc.Name() == "minimum-interval" {
+									switch bc.Name() {
+									case "minimum-interval":
 										if v := nodeVal(bc); v != "" {
 											if n, err := strconv.Atoi(v); err == nil {
 												neighbor.BFDInterval = n
+											}
+										}
+									case "multiplier":
+										if v := nodeVal(bc); v != "" {
+											if n, err := strconv.Atoi(v); err == nil {
+												neighbor.BFDMultiplier = n
 											}
 										}
 									}
@@ -3342,7 +3440,6 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			}
 		}
 	}
-
 
 	ospf3Node := node.FindChild("ospf3")
 	if ospf3Node != nil {
@@ -3481,6 +3578,24 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							iface.AuthKey = nodeVal(prop)
 						case "authentication-type":
 							iface.AuthType = nodeVal(prop)
+						case "bfd-liveness-detection":
+							iface.BFD = true
+							for _, bc := range prop.Children {
+								switch bc.Name() {
+								case "minimum-interval":
+									if v := nodeVal(bc); v != "" {
+										if n, err := strconv.Atoi(v); err == nil {
+											iface.BFDInterval = n
+										}
+									}
+								case "multiplier":
+									if v := nodeVal(bc); v != "" {
+										if n, err := strconv.Atoi(v); err == nil {
+											iface.BFDMultiplier = n
+										}
+									}
+								}
+							}
 						}
 					}
 					// Check keys for "level N" and "passive" shorthand

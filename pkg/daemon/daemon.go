@@ -28,12 +28,12 @@ import (
 	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
-	"github.com/psaab/bpfrx/pkg/eventengine"
 	"github.com/psaab/bpfrx/pkg/conntrack"
 	"github.com/psaab/bpfrx/pkg/dataplane"
 	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/dhcprelay"
 	"github.com/psaab/bpfrx/pkg/dhcpserver"
+	"github.com/psaab/bpfrx/pkg/eventengine"
 	"github.com/psaab/bpfrx/pkg/feeds"
 	"github.com/psaab/bpfrx/pkg/flowexport"
 	"github.com/psaab/bpfrx/pkg/frr"
@@ -67,18 +67,18 @@ const nodeIDFile = "/etc/bpfrx/node-id"
 
 // Daemon is the main bpfrx daemon.
 type Daemon struct {
-	opts         Options
-	store        *configstore.Store
-	dp           dataplane.DataPlane
-	networkd     *networkd.Manager
-	routing      *routing.Manager
-	frr          *frr.Manager
-	ipsec        *ipsec.Manager
-	ra           *ra.Manager
-	dhcp         *dhcp.Manager
-	dhcpServer   *dhcpserver.Manager
-	feeds        *feeds.Manager
-	rpm          *rpm.Manager
+	opts          Options
+	store         *configstore.Store
+	dp            dataplane.DataPlane
+	networkd      *networkd.Manager
+	routing       *routing.Manager
+	frr           *frr.Manager
+	ipsec         *ipsec.Manager
+	ra            *ra.Manager
+	dhcp          *dhcp.Manager
+	dhcpServer    *dhcpserver.Manager
+	feeds         *feeds.Manager
+	rpm           *rpm.Manager
 	flowExporter  *flowexport.Exporter
 	flowCancel    context.CancelFunc
 	flowWg        sync.WaitGroup
@@ -86,12 +86,12 @@ type Daemon struct {
 	ipfixCancel   context.CancelFunc
 	ipfixWg       sync.WaitGroup
 	dhcpRelay     *dhcprelay.Manager
-	snmpAgent    *snmp.Agent
-	lldpMgr      *lldp.Manager
-	scheduler    *scheduler.Scheduler
-	cluster      *cluster.Manager
-	sessionSync  *cluster.SessionSync
-	slogHandler  *logging.SyslogSlogHandler
+	snmpAgent     *snmp.Agent
+	lldpMgr       *lldp.Manager
+	scheduler     *scheduler.Scheduler
+	cluster       *cluster.Manager
+	sessionSync   *cluster.SessionSync
+	slogHandler   *logging.SyslogSlogHandler
 	traceWriter   *logging.TraceWriter
 	eventReader   *logging.EventReader
 	eventEngine   *eventengine.Engine
@@ -133,7 +133,7 @@ func New(opts Options) *Daemon {
 	return &Daemon{
 		opts:      opts,
 		startTime: time.Now(),
-		store: store,
+		store:     store,
 	}
 }
 
@@ -619,13 +619,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.syncConfigToPeer()
 		}
 		grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
-			Store:    d.store,
-			DP:       d.dp,
-			EventBuf: eventBuf,
-			GC:       d.gc,
-			Routing:  d.routing,
-			FRR:      d.frr,
-			IPsec:    d.ipsec,
+			Store:      d.store,
+			DP:         d.dp,
+			EventBuf:   eventBuf,
+			GC:         d.gc,
+			Routing:    d.routing,
+			FRR:        d.frr,
+			IPsec:      d.ipsec,
 			Cluster:    d.cluster,
 			DHCP:       d.dhcp,
 			DHCPServer: d.dhcpServer,
@@ -1200,6 +1200,16 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			cfg.Security.Flow.AgingHighWatermark,
 			cfg.Security.Flow.AgingLowWatermark,
 		)
+
+		// Enable per-IP session counting if any screen profile has session limits.
+		sessionLimitEnabled := false
+		for _, sp := range cfg.Security.Screen {
+			if sp.LimitSession.SourceIPBased > 0 || sp.LimitSession.DestinationIPBased > 0 {
+				sessionLimitEnabled = true
+				break
+			}
+		}
+		d.gc.SetSessionLimitEnabled(sessionLimitEnabled)
 	}
 
 	// 2.2. Build zone→RG map for per-RG session sync.
@@ -1295,6 +1305,40 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// addresses including VRRP VIPs. Re-add them on MASTER instances.
 	if d.vrrpMgr != nil {
 		d.vrrpMgr.ReconcileVIPs()
+	}
+
+	// 2.6c. Reconcile proxy ARP entries for NAT addresses.
+	if len(cfg.Security.NAT.ProxyARP) > 0 {
+		ifaceMap := make(map[string]int)
+		rethToPhys := cfg.RethToPhysical()
+		for _, entry := range cfg.Security.NAT.ProxyARP {
+			parts := strings.SplitN(entry.Interface, ".", 2)
+			baseName := parts[0]
+			if phys, ok := rethToPhys[baseName]; ok {
+				baseName = phys
+			}
+			linuxName := config.LinuxIfName(baseName)
+			if _, ok := ifaceMap[entry.Interface]; ok {
+				continue
+			}
+			iface, err := net.InterfaceByName(linuxName)
+			if err != nil {
+				slog.Warn("proxy-arp: interface not found", "iface", entry.Interface, "linux", linuxName, "err", err)
+				continue
+			}
+			ifaceMap[entry.Interface] = iface.Index
+		}
+		added, err := dataplane.ReconcileProxyARP(cfg, ifaceMap)
+		if err != nil {
+			slog.Warn("failed to reconcile proxy ARP", "err", err)
+		}
+		for _, a := range added {
+			if a.Iface != "" {
+				if err := cluster.SendGratuitousARP(a.Iface, a.IP, 1); err != nil {
+					slog.Warn("proxy-arp: GARP failed", "ip", a.IP, "iface", a.Iface, "err", err)
+				}
+			}
+		}
 	}
 
 	// 2.7. Re-bind management VRF interfaces after networkd.Apply().
@@ -1643,7 +1687,7 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 				if unit.DHCPOptions != nil {
 					dm.SetDHCPv4Options(dhcpIface, &dhcp.DHCPv4Options{
 						LeaseTime:              unit.DHCPOptions.LeaseTime,
-						RetransmissionAttempt:   unit.DHCPOptions.RetransmissionAttempt,
+						RetransmissionAttempt:  unit.DHCPOptions.RetransmissionAttempt,
 						RetransmissionInterval: unit.DHCPOptions.RetransmissionInterval,
 						ForceDiscover:          unit.DHCPOptions.ForceDiscover,
 					})

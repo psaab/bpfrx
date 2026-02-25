@@ -612,8 +612,26 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 // If vrfName is non-empty, generates VRF-scoped commands.
 // ecmpMaxPaths > 1 enables ECMP with the given maximum equal-cost paths.
 // policyOptions is used to resolve export policy names to route-map references.
+// bfdProfile holds a unique BFD profile (interval + multiplier).
+type bfdProfile struct {
+	interval   int
+	multiplier int
+}
+
+// bfdProfileName returns a deterministic profile name like "bpfrx-300-3".
+func bfdProfileName(interval, multiplier int) string {
+	if interval == 0 {
+		interval = 300
+	}
+	if multiplier == 0 {
+		multiplier = 3
+	}
+	return fmt.Sprintf("bpfrx-%d-%d", interval, multiplier)
+}
+
 func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPFv3Config, bgp *config.BGPConfig, rip *config.RIPConfig, isis *config.ISISConfig, vrfName string, ecmpMaxPaths int, policyOptions *config.PolicyOptionsConfig) string {
 	var b strings.Builder
+	bfdProfiles := make(map[string]bfdProfile)
 
 	vrfSuffix := ""
 	if vrfName != "" {
@@ -684,7 +702,13 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 						fmt.Fprintf(&b, " ip ospf authentication-key %s\n", iface.AuthKey)
 					}
 					if iface.BFD {
-						b.WriteString(" ip ospf bfd\n")
+						if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
+							profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
+							bfdProfiles[profile] = bfdProfile{iface.BFDInterval, iface.BFDMultiplier}
+							fmt.Fprintf(&b, " ip ospf bfd profile %s\n", profile)
+						} else {
+							b.WriteString(" ip ospf bfd\n")
+						}
 					}
 					fmt.Fprintf(&b, " ip ospf area %s\n", area.ID)
 					b.WriteString("exit\n!\n")
@@ -923,6 +947,15 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				}
 			}
 			b.WriteString("exit\n!\n")
+			if iface.BFD {
+				if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
+					profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
+					bfdProfiles[profile] = bfdProfile{iface.BFDInterval, iface.BFDMultiplier}
+					fmt.Fprintf(&b, " isis bfd profile %s\n", profile)
+				} else {
+					b.WriteString(" isis bfd\n")
+				}
+			}
 		}
 	}
 
@@ -938,7 +971,10 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			b.WriteString("bfd\n")
 			for _, n := range bfdPeers {
 				fmt.Fprintf(&b, " peer %s\n", n.Address)
-				multiplier := 3
+				multiplier := n.BFDMultiplier
+				if multiplier == 0 {
+					multiplier = 3
+				}
 				interval := n.BFDInterval
 				if interval == 0 {
 					interval = 300
@@ -950,6 +986,34 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			}
 			b.WriteString("exit\n!\n")
 		}
+	}
+
+	// Emit deduplicated BFD profile stanzas
+	if len(bfdProfiles) > 0 {
+		// Collect and sort profile names for deterministic output
+		var profileNames []string
+		for name := range bfdProfiles {
+			profileNames = append(profileNames, name)
+		}
+		sort.Strings(profileNames)
+		b.WriteString("bfd\n")
+		for _, name := range profileNames {
+			p := bfdProfiles[name]
+			interval := p.interval
+			if interval == 0 {
+				interval = 300
+			}
+			multiplier := p.multiplier
+			if multiplier == 0 {
+				multiplier = 3
+			}
+			fmt.Fprintf(&b, " profile %s\n", name)
+			fmt.Fprintf(&b, "  detect-multiplier %d\n", multiplier)
+			fmt.Fprintf(&b, "  receive-interval %d\n", interval)
+			fmt.Fprintf(&b, "  transmit-interval %d\n", interval)
+			b.WriteString(" exit\n")
+		}
+		b.WriteString("exit\n!\n")
 	}
 
 	return b.String()

@@ -1031,6 +1031,8 @@ func (m *Manager) SetScreenConfig(profileID uint32, cfg dataplane.ScreenConfig) 
 	ptr.syn_flood_timeout = C.uint32_t(cfg.SynFloodTimeout)
 	ptr.port_scan_thresh = C.uint32_t(cfg.PortScanThresh)
 	ptr.ip_sweep_thresh = C.uint32_t(cfg.IPSweepThresh)
+	ptr.session_limit_src = C.uint32_t(cfg.SessionLimitSrc)
+	ptr.session_limit_dst = C.uint32_t(cfg.SessionLimitDst)
 	return nil
 }
 
@@ -1041,6 +1043,62 @@ func (m *Manager) ClearScreenConfigs() error {
 	}
 	C.memset(unsafe.Pointer(shm.screen_configs), 0,
 		C.size_t(C.MAX_SCREEN_PROFILES)*C.size_t(unsafe.Sizeof(C.struct_screen_config{})))
+	return nil
+}
+
+// --- Session count maps ---
+
+func (m *Manager) UpdateSessionCountSrc(key dataplane.SessionCountKey, count uint32) error {
+	shm := m.platform.shm
+	if shm == nil || shm.session_count_src == nil {
+		return nil
+	}
+	cKey := C.struct_session_count_key{
+		ip:      C.uint32_t(key.IP),
+		zone_id: C.uint16_t(key.ZoneID),
+	}
+	pos := C.rte_hash_lookup(shm.session_count_src, unsafe.Pointer(&cKey))
+	if pos < 0 {
+		pos = C.rte_hash_add_key(shm.session_count_src, unsafe.Pointer(&cKey))
+		if pos < 0 {
+			return nil // hash full, best-effort
+		}
+	}
+	shm.session_count_src_values[pos].count = C.uint32_t(count)
+	return nil
+}
+
+func (m *Manager) UpdateSessionCountDst(key dataplane.SessionCountKey, count uint32) error {
+	shm := m.platform.shm
+	if shm == nil || shm.session_count_dst == nil {
+		return nil
+	}
+	cKey := C.struct_session_count_key{
+		ip:      C.uint32_t(key.IP),
+		zone_id: C.uint16_t(key.ZoneID),
+	}
+	pos := C.rte_hash_lookup(shm.session_count_dst, unsafe.Pointer(&cKey))
+	if pos < 0 {
+		pos = C.rte_hash_add_key(shm.session_count_dst, unsafe.Pointer(&cKey))
+		if pos < 0 {
+			return nil // hash full, best-effort
+		}
+	}
+	shm.session_count_dst_values[pos].count = C.uint32_t(count)
+	return nil
+}
+
+func (m *Manager) ClearSessionCounts() error {
+	shm := m.platform.shm
+	if shm == nil {
+		return nil
+	}
+	if shm.session_count_src != nil {
+		C.rte_hash_reset(shm.session_count_src)
+	}
+	if shm.session_count_dst != nil {
+		C.rte_hash_reset(shm.session_count_dst)
+	}
 	return nil
 }
 
@@ -1197,8 +1255,34 @@ func (m *Manager) ClearFilterConfigs() error {
 
 // --- Policers ---
 
-func (m *Manager) SetPolicerConfig(id uint32, cfg dataplane.PolicerConfig) error { return nil }
-func (m *Manager) ClearPolicerConfigs() error                                    { return nil }
+func (m *Manager) SetPolicerConfig(id uint32, cfg dataplane.PolicerConfig) error {
+	shm := m.platform.shm
+	if shm == nil {
+		return fmt.Errorf("DPDK not initialized")
+	}
+	ptr := (*C.struct_policer_config)(unsafe.Pointer(
+		uintptr(unsafe.Pointer(shm.policer_configs)) +
+			uintptr(id)*unsafe.Sizeof(C.struct_policer_config{})))
+	ptr.rate_bytes_sec = C.uint64_t(cfg.RateBytesSec)
+	ptr.burst_bytes = C.uint64_t(cfg.BurstBytes)
+	ptr.action = C.uint8_t(cfg.Action)
+	ptr.color_mode = C.uint8_t(cfg.ColorMode)
+	ptr.peak_rate = C.uint64_t(cfg.PeakRate)
+	ptr.peak_burst = C.uint64_t(cfg.PeakBurst)
+	return nil
+}
+
+func (m *Manager) ClearPolicerConfigs() error {
+	shm := m.platform.shm
+	if shm == nil {
+		return fmt.Errorf("DPDK not initialized")
+	}
+	C.memset(unsafe.Pointer(shm.policer_configs), 0,
+		C.size_t(C.MAX_POLICERS)*C.size_t(unsafe.Sizeof(C.struct_policer_config{})))
+	C.memset(unsafe.Pointer(shm.policer_states), 0,
+		C.size_t(C.MAX_POLICERS)*C.size_t(unsafe.Sizeof(C.struct_policer_state{})))
+	return nil
+}
 
 // --- Counters ---
 

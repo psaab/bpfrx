@@ -15,6 +15,7 @@
 #include "tables.h"
 #include "counters.h"
 #include "events.h"
+#include "policer.c"
 
 /**
  * addr_match — Check if an address matches a filter rule's address/mask.
@@ -168,6 +169,12 @@ evaluate_filter(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		/* DSCP rewrite */
 		if (r->dscp_rewrite != 0xFF)
 			meta->dscp_rewrite = r->dscp_rewrite;
+
+		/* Policer check */
+		if (r->policer_id > 0) {
+			if (evaluate_policer_dpdk(r->policer_id, rte_pktmbuf_pkt_len(pkt), ctx))
+				return FILTER_ACTION_DISCARD;
+		}
 
 		/* Routing instance override */
 		if (r->action == FILTER_ACTION_ROUTE)

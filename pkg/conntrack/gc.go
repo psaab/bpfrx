@@ -51,10 +51,14 @@ type GC struct {
 	snatExpiredV6 []expiredSessionV6
 
 	// Aggressive session aging (set via SetAgingConfig).
-	agingActive    bool
-	earlyAgeout    uint64 // seconds
-	highWatermark  int    // percent of MaxSessions
-	lowWatermark   int    // percent of MaxSessions
+	agingActive   bool
+	earlyAgeout   uint64 // seconds
+	highWatermark int    // percent of MaxSessions
+	lowWatermark  int    // percent of MaxSessions
+
+	// Per-IP session limiting: when enabled, GC accumulates per-src/dst
+	// session counts and pushes them to BPF maps for xdp_screen to check.
+	sessionLimitEnabled bool
 }
 
 // NewGC creates a new session garbage collector.
@@ -74,6 +78,15 @@ func (gc *GC) SetAgingConfig(earlyAgeout, highWM, lowWM int) {
 	if highWM == 0 || earlyAgeout == 0 {
 		gc.agingActive = false
 	}
+}
+
+// SetSessionLimitEnabled enables or disables per-IP session counting
+// during GC sweeps. When enabled, GC accumulates per-src/dst counts
+// and pushes them to BPF maps for xdp_screen session limiting.
+func (gc *GC) SetSessionLimitEnabled(enabled bool) {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+	gc.sessionLimitEnabled = enabled
 }
 
 // Stats returns a snapshot of the most recent GC sweep statistics.
@@ -136,6 +149,14 @@ func (gc *GC) sweep() {
 	toDelete := gc.toDeleteV4[:0]
 	snatExpired := gc.snatExpiredV4[:0]
 
+	// Per-IP session count accumulators (only used when session limiting is enabled)
+	countSessions := gc.sessionLimitEnabled
+	var srcCounts, dstCounts map[dataplane.SessionCountKey]uint32
+	if countSessions {
+		srcCounts = make(map[dataplane.SessionCountKey]uint32, 1024)
+		dstCounts = make(map[dataplane.SessionCountKey]uint32, 1024)
+	}
+
 	// IPv4 sessions — batch iteration reduces kernel lock contention
 	err := gc.dp.BatchIterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		total++
@@ -166,6 +187,18 @@ func (gc *GC) sweep() {
 				val.Flags&dataplane.SessFlagStaticNAT == 0 {
 				snatExpired = append(snatExpired, expiredSession{key: key, val: val})
 			}
+		} else if countSessions {
+			// Count active (non-expired) forward sessions per src/dst IP
+			srcKey := dataplane.SessionCountKey{
+				IP:     binary.NativeEndian.Uint32(key.SrcIP[:]),
+				ZoneID: val.IngressZone,
+			}
+			dstKey := dataplane.SessionCountKey{
+				IP:     binary.NativeEndian.Uint32(key.DstIP[:]),
+				ZoneID: val.IngressZone,
+			}
+			srcCounts[srcKey]++
+			dstCounts[dstKey]++
 		}
 		return true
 	})
@@ -263,6 +296,26 @@ func (gc *GC) sweep() {
 					val.Flags&dataplane.SessFlagStaticNAT == 0 {
 					snatExpiredV6 = append(snatExpiredV6, expiredSessionV6{key: key, val: val})
 				}
+			} else if countSessions {
+				// XOR-hash IPv6 addresses to uint32 for session count key
+				srcHash := binary.NativeEndian.Uint32(key.SrcIP[0:4]) ^
+					binary.NativeEndian.Uint32(key.SrcIP[4:8]) ^
+					binary.NativeEndian.Uint32(key.SrcIP[8:12]) ^
+					binary.NativeEndian.Uint32(key.SrcIP[12:16])
+				dstHash := binary.NativeEndian.Uint32(key.DstIP[0:4]) ^
+					binary.NativeEndian.Uint32(key.DstIP[4:8]) ^
+					binary.NativeEndian.Uint32(key.DstIP[8:12]) ^
+					binary.NativeEndian.Uint32(key.DstIP[12:16])
+				srcKey := dataplane.SessionCountKey{
+					IP:     srcHash,
+					ZoneID: val.IngressZone,
+				}
+				dstKey := dataplane.SessionCountKey{
+					IP:     dstHash,
+					ZoneID: val.IngressZone,
+				}
+				srcCounts[srcKey]++
+				dstCounts[dstKey]++
 			}
 			return true
 		})
@@ -335,6 +388,16 @@ func (gc *GC) sweep() {
 	}
 
 	gc.lastTotal = total
+
+	// Push per-IP session counts to BPF maps for xdp_screen limiting.
+	if countSessions {
+		for k, c := range srcCounts {
+			gc.dp.UpdateSessionCountSrc(k, c)
+		}
+		for k, c := range dstCounts {
+			gc.dp.UpdateSessionCountDst(k, c)
+		}
+	}
 
 	// Aggressive aging watermark hysteresis.
 	// total counts both forward+reverse entries; MaxSessions is the map size

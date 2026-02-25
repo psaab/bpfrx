@@ -166,11 +166,11 @@ func (m *Manager) ClearAllSessions() (int, int, error) { return 0, 0, nil }
 // --- DNAT ---
 
 func (m *Manager) SetDNATEntry(_ dataplane.DNATKey, _ dataplane.DNATValue) error       { return nil }
-func (m *Manager) DeleteDNATEntry(_ dataplane.DNATKey) error                            { return nil }
-func (m *Manager) ClearDNATStatic() error                                               { return nil }
-func (m *Manager) SetDNATEntryV6(_ dataplane.DNATKeyV6, _ dataplane.DNATValueV6) error  { return nil }
-func (m *Manager) DeleteDNATEntryV6(_ dataplane.DNATKeyV6) error                        { return nil }
-func (m *Manager) ClearDNATStaticV6() error                                             { return nil }
+func (m *Manager) DeleteDNATEntry(_ dataplane.DNATKey) error                           { return nil }
+func (m *Manager) ClearDNATStatic() error                                              { return nil }
+func (m *Manager) SetDNATEntryV6(_ dataplane.DNATKeyV6, _ dataplane.DNATValueV6) error { return nil }
+func (m *Manager) DeleteDNATEntryV6(_ dataplane.DNATKeyV6) error                       { return nil }
+func (m *Manager) ClearDNATStaticV6() error                                            { return nil }
 
 // --- SNAT ---
 
@@ -222,6 +222,16 @@ func (m *Manager) ClearNAT64Configs() error                                     
 func (m *Manager) SetScreenConfig(profileID uint32, cfg dataplane.ScreenConfig) error { return nil }
 func (m *Manager) ClearScreenConfigs() error                                          { return nil }
 
+// --- Session count maps ---
+
+func (m *Manager) UpdateSessionCountSrc(key dataplane.SessionCountKey, count uint32) error {
+	return nil
+}
+func (m *Manager) UpdateSessionCountDst(key dataplane.SessionCountKey, count uint32) error {
+	return nil
+}
+func (m *Manager) ClearSessionCounts() error { return nil }
+
 // --- Port mirroring ---
 
 func (m *Manager) SetMirrorConfig(ifindex int, mirrorIfindex int, rate uint32) error { return nil }
@@ -247,7 +257,7 @@ func (m *Manager) ReadFilterConfig(filterID uint32) (dataplane.FilterConfig, err
 }
 
 func (m *Manager) SetFilterRule(index uint32, rule dataplane.FilterRule) error { return nil }
-func (m *Manager) ClearFilterConfigs() error                                  { return nil }
+func (m *Manager) ClearFilterConfigs() error                                   { return nil }
 
 // --- Policers ---
 
@@ -299,7 +309,7 @@ func (m *Manager) NewEventSource() (dataplane.EventSource, error) { return nil, 
 // --- FIB ---
 
 func (m *Manager) StartFIBSync(_ context.Context) {}
-func (m *Manager) BumpFIBGeneration() {}
+func (m *Manager) BumpFIBGeneration()             {}
 
 // --- Map statistics ---
 
@@ -307,7 +317,7 @@ func (m *Manager) GetMapStats() []dataplane.MapStats { return nil }
 
 // --- Hitless restart: delete stale entries ---
 
-func (m *Manager) DeleteStaleIfaceZone(_ map[dataplane.IfaceZoneKey]bool)      {}
+func (m *Manager) DeleteStaleIfaceZone(_ map[dataplane.IfaceZoneKey]bool)       {}
 func (m *Manager) DeleteStaleVlanIface(_ map[uint32]bool)                       {}
 func (m *Manager) DeleteStaleZonePairPolicies(_ map[dataplane.ZonePairKey]bool) {}
 func (m *Manager) DeleteStaleApplications(_ map[dataplane.AppKey]bool)          {}

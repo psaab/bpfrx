@@ -439,6 +439,20 @@ type bpfrxXdpPolicyScreenConfig struct {
 	SynFloodTimeout   uint32
 	PortScanThresh    uint32
 	IpSweepThresh     uint32
+	SessionLimitSrc   uint32
+	SessionLimitDst   uint32
+}
+
+type bpfrxXdpPolicySessionCountKey struct {
+	_      structs.HostLayout
+	Ip     uint32
+	ZoneId uint16
+	Pad    uint16
+}
+
+type bpfrxXdpPolicySessionCountValue struct {
+	_     structs.HostLayout
+	Count uint32
 }
 
 type bpfrxXdpPolicySessionKey struct {
@@ -700,6 +714,8 @@ type bpfrxXdpPolicyMapSpecs struct {
 	PortScanTrack     *ebpf.MapSpec `ebpf:"port_scan_track"`
 	RedirectCapable   *ebpf.MapSpec `ebpf:"redirect_capable"`
 	ScreenConfigs     *ebpf.MapSpec `ebpf:"screen_configs"`
+	SessionCountDst   *ebpf.MapSpec `ebpf:"session_count_dst"`
+	SessionCountSrc   *ebpf.MapSpec `ebpf:"session_count_src"`
 	SessionV4Scratch  *ebpf.MapSpec `ebpf:"session_v4_scratch"`
 	SessionV6Scratch  *ebpf.MapSpec `ebpf:"session_v6_scratch"`
 	Sessions          *ebpf.MapSpec `ebpf:"sessions"`
@@ -788,6 +804,8 @@ type bpfrxXdpPolicyMaps struct {
 	PortScanTrack     *ebpf.Map `ebpf:"port_scan_track"`
 	RedirectCapable   *ebpf.Map `ebpf:"redirect_capable"`
 	ScreenConfigs     *ebpf.Map `ebpf:"screen_configs"`
+	SessionCountDst   *ebpf.Map `ebpf:"session_count_dst"`
+	SessionCountSrc   *ebpf.Map `ebpf:"session_count_src"`
 	SessionV4Scratch  *ebpf.Map `ebpf:"session_v4_scratch"`
 	SessionV6Scratch  *ebpf.Map `ebpf:"session_v6_scratch"`
 	Sessions          *ebpf.Map `ebpf:"sessions"`
@@ -852,6 +870,8 @@ func (m *bpfrxXdpPolicyMaps) Close() error {
 		m.PortScanTrack,
 		m.RedirectCapable,
 		m.ScreenConfigs,
+		m.SessionCountDst,
+		m.SessionCountSrc,
 		m.SessionV4Scratch,
 		m.SessionV6Scratch,
 		m.Sessions,

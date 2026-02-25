@@ -786,4 +786,25 @@ struct {
 	__type(value, struct policer_state);
 } policer_states SEC(".maps");
 
+/* ============================================================
+ * Per-IP session count maps (populated by Go GC sweep)
+ * Used by xdp_screen for per-source/destination session limiting.
+ * ============================================================ */
+
+/* Per-source-IP session count */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 65536);
+	__type(key, struct session_count_key);
+	__type(value, struct session_count_value);
+} session_count_src SEC(".maps");
+
+/* Per-destination-IP session count */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 65536);
+	__type(key, struct session_count_key);
+	__type(value, struct session_count_value);
+} session_count_dst SEC(".maps");
+
 #endif /* __BPFRX_MAPS_H__ */

@@ -265,7 +265,8 @@ struct icmp6hdr {
 #define GLOBAL_CTR_SYNCOOKIE_VALID       28
 #define GLOBAL_CTR_SYNCOOKIE_INVALID     29
 #define GLOBAL_CTR_SYNCOOKIE_BYPASS      30
-#define GLOBAL_CTR_MAX                   31
+#define GLOBAL_CTR_SCREEN_SESSION_LIMIT  31
+#define GLOBAL_CTR_MAX                   32
 
 /* Flow timeout indices for flow_timeouts ARRAY map */
 #define FLOW_TIMEOUT_TCP_ESTABLISHED   0
@@ -293,6 +294,8 @@ struct icmp6hdr {
 #define SCREEN_IP_SOURCE_ROUTE   (1 << 12)
 #define SCREEN_SYN_FRAG          (1 << 13)
 #define SCREEN_SYN_COOKIE        (1 << 14)
+#define SCREEN_SESSION_LIMIT_SRC (1 << 15)
+#define SCREEN_SESSION_LIMIT_DST (1 << 16)
 
 /* Host-inbound-traffic service flags (zone_config.host_inbound_flags) */
 #define HOST_INBOUND_SSH         (1 << 0)
@@ -520,6 +523,8 @@ struct screen_config {
 	__u32 syn_flood_timeout;     /* flood window duration in seconds (0=1s) */
 	__u32 port_scan_thresh;      /* TCP SYN attempts per source IP in window */
 	__u32 ip_sweep_thresh;       /* unique dest IPs per source IP in window */
+	__u32 session_limit_src;     /* max sessions per source IP, 0=disabled */
+	__u32 session_limit_dst;     /* max sessions per destination IP, 0=disabled */
 };
 
 struct flood_state {
@@ -556,6 +561,17 @@ struct scan_track_key {
 struct scan_track_value {
 	__u32 count;           /* unique attempts in current window */
 	__u32 window_start;    /* ktime_ns / 1e9 (seconds) */
+};
+
+/* Per-IP session count (populated by Go GC sweep for session limiting). */
+struct session_count_key {
+	__u32 ip;        /* IPv4 addr or XOR hash of IPv6 */
+	__u16 zone_id;
+	__u16 pad;
+};
+
+struct session_count_value {
+	__u32 count;
 };
 
 /* ============================================================

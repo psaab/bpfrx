@@ -85,6 +85,13 @@ func (m *mockGCDP) DeleteDNATEntry(_ dataplane.DNATKey) error       { return nil
 func (m *mockGCDP) DeleteDNATEntryV6(_ dataplane.DNATKeyV6) error   { return nil }
 func (m *mockGCDP) GetPersistentNAT() *dataplane.PersistentNATTable { return nil }
 func (m *mockGCDP) ReadGlobalCounter(_ uint32) (uint64, error)      { return 1, nil }
+func (m *mockGCDP) UpdateSessionCountSrc(_ dataplane.SessionCountKey, _ uint32) error {
+	return nil
+}
+func (m *mockGCDP) UpdateSessionCountDst(_ dataplane.SessionCountKey, _ uint32) error {
+	return nil
+}
+func (m *mockGCDP) ClearSessionCounts() error { return nil }
 
 func TestGCDeleteCallbackV4(t *testing.T) {
 	now := monotonicSeconds()

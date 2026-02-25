@@ -898,6 +898,45 @@ int xdp_screen_prog(struct xdp_md *ctx)
 		}
 	}
 
+	/* ============================================================
+	 * Per-IP session limiting (counts populated by Go GC sweep)
+	 * Only check for new TCP SYN packets.
+	 * ============================================================ */
+
+	/* Session limiting: per-source-IP */
+	if ((sc->flags & SCREEN_SESSION_LIMIT_SRC) && meta->protocol == PROTO_TCP &&
+	    (meta->tcp_flags & 0x02) && !(meta->tcp_flags & 0x10)) {
+		__u32 src = (meta->addr_family == AF_INET) ?
+			meta->src_ip.v4 :
+			(meta->src_ip.v6[0] ^ meta->src_ip.v6[4] ^
+			 meta->src_ip.v6[8] ^ meta->src_ip.v6[12]);
+		struct session_count_key sck = {
+			.ip = src,
+			.zone_id = meta->ingress_zone,
+		};
+		struct session_count_value *scv =
+			bpf_map_lookup_elem(&session_count_src, &sck);
+		if (scv && scv->count >= sc->session_limit_src)
+			return screen_drop(meta, SCREEN_SESSION_LIMIT_SRC);
+	}
+
+	/* Session limiting: per-destination-IP */
+	if ((sc->flags & SCREEN_SESSION_LIMIT_DST) && meta->protocol == PROTO_TCP &&
+	    (meta->tcp_flags & 0x02) && !(meta->tcp_flags & 0x10)) {
+		__u32 dst = (meta->addr_family == AF_INET) ?
+			meta->dst_ip.v4 :
+			(meta->dst_ip.v6[0] ^ meta->dst_ip.v6[4] ^
+			 meta->dst_ip.v6[8] ^ meta->dst_ip.v6[12]);
+		struct session_count_key dck = {
+			.ip = dst,
+			.zone_id = meta->ingress_zone,
+		};
+		struct session_count_value *dcv =
+			bpf_map_lookup_elem(&session_count_dst, &dck);
+		if (dcv && dcv->count >= sc->session_limit_dst)
+			return screen_drop(meta, SCREEN_SESSION_LIMIT_DST);
+	}
+
 pass:
 	/* All checks passed -- proceed to zone classification */
 	bpf_tail_call(ctx, &xdp_progs, XDP_PROG_ZONE);

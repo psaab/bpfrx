@@ -62,20 +62,20 @@ type ChassisConfig struct {
 
 // ClusterConfig defines chassis cluster settings for HA.
 type ClusterConfig struct {
-	ClusterID              int
-	NodeID                 int
-	RethCount              int
-	HeartbeatInterval      int    // milliseconds, 0=default(1000)
-	HeartbeatThreshold     int    // missed heartbeats before lost, 0=default(3)
-	ControlInterface       string // interface for heartbeat traffic (e.g. "hb0")
-	PeerAddress            string // peer node's control link IP (e.g. "10.99.0.2")
-	FabricInterface        string // interface for session/config sync (e.g. "fab0")
-	FabricPeerAddress      string // peer's fabric link IP (e.g. "10.99.1.2")
-	ConfigSync             bool   // enable config synchronization to peer on commit
-	ControlLinkRecovery    bool   // enable control-link-recovery
-	NATStateSync           bool   // enable NAT state synchronization (session sync with NAT fields)
-	IPsecSASync            bool   // enable IPsec SA synchronization (connection name sync for failover re-initiation)
-	RedundancyGroups       []*RedundancyGroup
+	ClusterID           int
+	NodeID              int
+	RethCount           int
+	HeartbeatInterval   int    // milliseconds, 0=default(1000)
+	HeartbeatThreshold  int    // missed heartbeats before lost, 0=default(3)
+	ControlInterface    string // interface for heartbeat traffic (e.g. "hb0")
+	PeerAddress         string // peer node's control link IP (e.g. "10.99.0.2")
+	FabricInterface     string // interface for session/config sync (e.g. "fab0")
+	FabricPeerAddress   string // peer's fabric link IP (e.g. "10.99.1.2")
+	ConfigSync          bool   // enable config synchronization to peer on commit
+	ControlLinkRecovery bool   // enable control-link-recovery
+	NATStateSync        bool   // enable NAT state synchronization (session sync with NAT fields)
+	IPsecSASync         bool   // enable IPsec SA synchronization (connection name sync for failover re-initiation)
+	RedundancyGroups    []*RedundancyGroup
 }
 
 // RedundancyGroup defines a cluster redundancy group.
@@ -109,26 +109,26 @@ type IPMonitorTarget struct {
 
 // EventPolicy defines an event-driven policy (event-options).
 type EventPolicy struct {
-	Name             string
-	Events           []string
-	WithinClauses    []*EventWithin
-	AttributesMatch  []string // raw "field matches pattern" strings
-	ThenCommands     []string // change-configuration commands
+	Name            string
+	Events          []string
+	WithinClauses   []*EventWithin
+	AttributesMatch []string // raw "field matches pattern" strings
+	ThenCommands    []string // change-configuration commands
 }
 
 // EventWithin defines a temporal trigger clause.
 type EventWithin struct {
-	Seconds    int
-	TriggerOn  int // trigger on N
+	Seconds      int
+	TriggerOn    int // trigger on N
 	TriggerUntil int // trigger until N
 }
 
 // BridgeDomainConfig defines a bridge domain with VLAN membership and optional IRB interface.
 type BridgeDomainConfig struct {
-	Name             string   // bridge domain name (e.g. "bd0")
-	VlanIDs          []int    // member VLAN IDs
-	RoutingInterface string   // IRB routing interface reference (e.g. "irb.0")
-	DomainType       string   // bridge domain type (optional)
+	Name             string // bridge domain name (e.g. "bd0")
+	VlanIDs          []int  // member VLAN IDs
+	RoutingInterface string // IRB routing interface reference (e.g. "irb.0")
+	DomainType       string // bridge domain type (optional)
 }
 
 // IRBToBridge returns a mapping of IRB interface reference (e.g. "irb.0") to
@@ -178,12 +178,12 @@ type PolicyStatement struct {
 
 // PolicyTerm is a single match+action clause within a policy-statement.
 type PolicyTerm struct {
-	Name         string
-	FromProtocol string         // "direct", "static", "bgp", "ospf"
-	PrefixList   string         // from prefix-list <name>
-	FromCommunity string        // from community <name> (match against community-list)
-	FromASPath    string        // from as-path <name> (match against as-path access-list)
-	RouteFilters []*RouteFilter // prefix matching
+	Name            string
+	FromProtocol    string         // "direct", "static", "bgp", "ospf"
+	PrefixList      string         // from prefix-list <name>
+	FromCommunity   string         // from community <name> (match against community-list)
+	FromASPath      string         // from as-path <name> (match against as-path access-list)
+	RouteFilters    []*RouteFilter // prefix matching
 	Action          string         // "accept", "reject"
 	NextHop         string         // then next-hop (e.g. "peer-address", "self", IP)
 	LoadBalance     string         // then load-balance (e.g. "consistent-hash", "per-packet")
@@ -236,8 +236,8 @@ type SystemConfig struct {
 	Login              *LoginConfig
 	RootAuthentication *RootAuthConfig
 	Archival           *ArchivalConfig
-	MasterPassword     string // pseudorandom-function value
-	LicenseAutoUpdate  string // license autoupdate URL
+	MasterPassword     string   // pseudorandom-function value
+	LicenseAutoUpdate  string   // license autoupdate URL
 	DisabledProcesses  []string // processes marked "disable"
 }
 
@@ -275,10 +275,10 @@ type RootAuthConfig struct {
 // ArchivalConfig holds configuration archival settings.
 type ArchivalConfig struct {
 	TransferOnCommit bool
-	TransferInterval int      // minutes between auto-archives (0 = on commit only)
+	TransferInterval int // minutes between auto-archives (0 = on commit only)
 	ArchiveSites     []string
-	ArchiveDir       string   // local directory for archives (default /var/lib/bpfrx/archive)
-	MaxArchives      int      // max number of archives to keep (default 10)
+	ArchiveDir       string // local directory for archives (default /var/lib/bpfrx/archive)
+	MaxArchives      int    // max number of archives to keep (default 10)
 }
 
 // InternetOptionsConfig holds internet-options settings.
@@ -300,12 +300,12 @@ type SSHServiceConfig struct {
 
 // WebManagementConfig holds web management settings.
 type WebManagementConfig struct {
-	HTTP                     bool
-	HTTPS                    bool
-	HTTPInterface            string // interface binding for HTTP
-	HTTPSInterface           string // interface binding for HTTPS
-	SystemGeneratedCert      bool   // auto-generated TLS certificate
-	APIAuth                  *APIAuthConfig // REST API authentication
+	HTTP                bool
+	HTTPS               bool
+	HTTPInterface       string         // interface binding for HTTP
+	HTTPSInterface      string         // interface binding for HTTPS
+	SystemGeneratedCert bool           // auto-generated TLS certificate
+	APIAuth             *APIAuthConfig // REST API authentication
 }
 
 // APIAuthConfig holds REST API authentication settings.
@@ -411,16 +411,16 @@ type LoginConfig struct {
 
 // LoginUser defines a system user account.
 type LoginUser struct {
-	Name     string
-	UID      int
-	Class    string // "super-user", "read-only", etc.
-	SSHKeys  []string // authorized SSH public keys
+	Name    string
+	UID     int
+	Class   string   // "super-user", "read-only", etc.
+	SSHKeys []string // authorized SSH public keys
 }
 
 // ServicesConfig holds service configuration (flow-monitoring, RPM, etc.).
 type ServicesConfig struct {
-	FlowMonitoring           *FlowMonitoringConfig
-	RPM                      *RPMConfig
+	FlowMonitoring            *FlowMonitoringConfig
+	RPM                       *RPMConfig
 	ApplicationIdentification bool // DPI-based application detection
 }
 
@@ -431,22 +431,22 @@ type RPMConfig struct {
 
 // RPMProbe defines a single RPM probe for health monitoring.
 type RPMProbe struct {
-	Name            string
-	Tests           map[string]*RPMTest
+	Name  string
+	Tests map[string]*RPMTest
 }
 
 // RPMTest defines a test within an RPM probe.
 type RPMTest struct {
-	Name             string
-	ProbeType        string // "http-get", "icmp-ping", "tcp-ping"
-	Target           string // target IP or hostname
-	SourceAddress    string
-	RoutingInstance  string
-	ProbeInterval    int // seconds (0 = default 5)
-	ProbeCount       int // number of probes per test (0 = default 1)
-	TestInterval     int // seconds (0 = default 60)
+	Name                string
+	ProbeType           string // "http-get", "icmp-ping", "tcp-ping"
+	Target              string // target IP or hostname
+	SourceAddress       string
+	RoutingInstance     string
+	ProbeInterval       int // seconds (0 = default 5)
+	ProbeCount          int // number of probes per test (0 = default 1)
+	TestInterval        int // seconds (0 = default 60)
 	ThresholdSuccessive int // successive failures before probe-fail (0 = default 3)
-	DestPort         int // for tcp-ping
+	DestPort            int // for tcp-ping
 }
 
 // FlowMonitoringConfig holds flow monitoring configuration.
@@ -479,7 +479,7 @@ type NetFlowV9Template struct {
 	Name                string
 	FlowActiveTimeout   int // seconds (0 = default 60)
 	FlowInactiveTimeout int // seconds (0 = default 15)
-	TemplateRefreshRate  int // seconds (0 = default 60)
+	TemplateRefreshRate int // seconds (0 = default 60)
 }
 
 // ForwardingOptionsConfig holds forwarding/sampling configuration.
@@ -529,8 +529,8 @@ type SamplingConfig struct {
 
 // SamplingInstance defines a traffic sampling instance.
 type SamplingInstance struct {
-	Name       string
-	InputRate  int // 1-in-N sampling rate (0 = sample all)
+	Name        string
+	InputRate   int // 1-in-N sampling rate (0 = sample all)
 	FamilyInet  *SamplingFamily
 	FamilyInet6 *SamplingFamily
 }
@@ -552,19 +552,19 @@ type FlowServer struct {
 
 // FirewallConfig holds firewall filter definitions.
 type FirewallConfig struct {
-	FiltersInet        map[string]*FirewallFilter        // family inet filters
-	FiltersInet6       map[string]*FirewallFilter        // family inet6 filters
-	Policers           map[string]*PolicerConfig         // named policer definitions
+	FiltersInet        map[string]*FirewallFilter          // family inet filters
+	FiltersInet6       map[string]*FirewallFilter          // family inet6 filters
+	Policers           map[string]*PolicerConfig           // named policer definitions
 	ThreeColorPolicers map[string]*ThreeColorPolicerConfig // named three-color policers
 }
 
 // PolicerConfig defines a single-rate two-color policer (token bucket).
 type PolicerConfig struct {
-	Name                   string
-	BandwidthLimit         uint64 // bytes per second (converted from Junos bits/sec)
-	BurstSizeLimit         uint64 // burst bucket size in bytes
-	ThenAction             string // "discard" or "loss-priority high/medium-high/medium-low/low"
-	LogicalInterfacePolicer bool  // shared across protocol families on the interface
+	Name                    string
+	BandwidthLimit          uint64 // bytes per second (converted from Junos bits/sec)
+	BurstSizeLimit          uint64 // burst bucket size in bytes
+	ThenAction              string // "discard" or "loss-priority high/medium-high/medium-low/low"
+	LogicalInterfacePolicer bool   // shared across protocol families on the interface
 }
 
 // ThreeColorPolicerConfig defines a three-color policer (RFC 2697/2698).
@@ -587,28 +587,28 @@ type FirewallFilter struct {
 
 // FirewallFilterTerm is a single match/action term within a filter.
 type FirewallFilterTerm struct {
-	Name               string
-	SourceAddresses    []string            // CIDRs
-	DestAddresses      []string            // CIDRs
-	SourcePrefixLists  []PrefixListRef     // source-prefix-list references
-	DestPrefixLists    []PrefixListRef     // destination-prefix-list references
-	DSCP               string              // DSCP/traffic-class name (ef, af43, etc.) or number
-	Protocol           string              // tcp, udp, icmp, icmpv6
-	DestinationPorts   []string            // port numbers or names
-	SourcePorts        []string            // source port numbers or ranges
-	ICMPType           int                 // -1 = not set
-	ICMPCode           int                 // -1 = not set
-	TCPFlags           []string            // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
-	IsFragment         bool                // match IP fragments
-	Action             string              // "accept", "reject", "discard", ""
-	RoutingInstance    string              // routing-instance name (policy-based routing)
-	Log                bool
-	Count              string              // counter name
-	ForwardingClass    string              // forwarding-class name
-	LossPriority       string              // loss-priority (low, medium-low, medium-high, high)
-	DSCPRewrite        string              // then dscp <value> — rewrite DSCP/traffic-class
-	Policer            string              // then policer <name> — reference to policer definition
-	FlexMatch          *FlexMatchConfig    // flexible-match-range configuration
+	Name              string
+	SourceAddresses   []string        // CIDRs
+	DestAddresses     []string        // CIDRs
+	SourcePrefixLists []PrefixListRef // source-prefix-list references
+	DestPrefixLists   []PrefixListRef // destination-prefix-list references
+	DSCP              string          // DSCP/traffic-class name (ef, af43, etc.) or number
+	Protocol          string          // tcp, udp, icmp, icmpv6
+	DestinationPorts  []string        // port numbers or names
+	SourcePorts       []string        // source port numbers or ranges
+	ICMPType          int             // -1 = not set
+	ICMPCode          int             // -1 = not set
+	TCPFlags          []string        // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
+	IsFragment        bool            // match IP fragments
+	Action            string          // "accept", "reject", "discard", ""
+	RoutingInstance   string          // routing-instance name (policy-based routing)
+	Log               bool
+	Count             string           // counter name
+	ForwardingClass   string           // forwarding-class name
+	LossPriority      string           // loss-priority (low, medium-low, medium-high, high)
+	DSCPRewrite       string           // then dscp <value> — rewrite DSCP/traffic-class
+	Policer           string           // then policer <name> — reference to policer definition
+	FlexMatch         *FlexMatchConfig // flexible-match-range configuration
 }
 
 // FlexMatchConfig defines a flexible byte-offset match condition.
@@ -672,12 +672,12 @@ type FeedServer struct {
 
 // SecurityConfig holds all security-related configuration.
 type SecurityConfig struct {
-	Zones              map[string]*ZoneConfig       // keyed by zone name
-	Policies           []*ZonePairPolicies          // ordered list of zone-pair policy sets
-	GlobalPolicies     []*Policy                    // global policies (apply to all zone pairs)
-	DefaultPolicy      PolicyAction                 // global fallback policy (permit-all or deny-all)
+	Zones              map[string]*ZoneConfig // keyed by zone name
+	Policies           []*ZonePairPolicies    // ordered list of zone-pair policy sets
+	GlobalPolicies     []*Policy              // global policies (apply to all zone pairs)
+	DefaultPolicy      PolicyAction           // global fallback policy (permit-all or deny-all)
 	NAT                NATConfig
-	Screen             map[string]*ScreenProfile    // keyed by profile name
+	Screen             map[string]*ScreenProfile // keyed by profile name
 	AddressBook        *AddressBook
 	Log                LogConfig
 	Flow               FlowConfig
@@ -692,11 +692,11 @@ type SecurityConfig struct {
 // FlowConfig holds flow/session timeout configuration.
 type FlowConfig struct {
 	TCPSession                 *TCPSessionConfig
-	UDPSessionTimeout          int    // seconds, 0 = default (60s)
-	ICMPSessionTimeout         int    // seconds, 0 = default (30s)
-	TCPMSSIPsecVPN             int    // TCP MSS clamp for IPsec VPN traffic (0 = disabled)
-	TCPMSSGreIn                int    // TCP MSS clamp for GRE ingress traffic (0 = disabled)
-	TCPMSSGreOut               int    // TCP MSS clamp for GRE egress traffic (0 = disabled)
+	UDPSessionTimeout          int // seconds, 0 = default (60s)
+	ICMPSessionTimeout         int // seconds, 0 = default (30s)
+	TCPMSSIPsecVPN             int // TCP MSS clamp for IPsec VPN traffic (0 = disabled)
+	TCPMSSGreIn                int // TCP MSS clamp for GRE ingress traffic (0 = disabled)
+	TCPMSSGreOut               int // TCP MSS clamp for GRE egress traffic (0 = disabled)
 	AllowDNSReply              bool
 	AllowEmbeddedICMP          bool
 	GREPerformanceAcceleration bool
@@ -710,9 +710,9 @@ type FlowConfig struct {
 
 // FlowTraceoptions holds flow trace debugging configuration.
 type FlowTraceoptions struct {
-	File          string // log file name
-	FileSize      int    // max file size in bytes
-	FileCount     int    // number of rotated files
+	File          string   // log file name
+	FileSize      int      // max file size in bytes
+	FileCount     int      // number of rotated files
 	Flags         []string // trace flags (e.g. "basic-datapath", "session")
 	PacketFilters []*TracePacketFilter
 }
@@ -842,13 +842,20 @@ type PolicyLog struct {
 // NATConfig holds NAT configuration.
 type NATConfig struct {
 	Source               []*NATRuleSet
-	SourcePools          map[string]*NATPool    // named source NAT pools
-	AddressPersistent    bool                   // source { address-persistent; }
+	SourcePools          map[string]*NATPool // named source NAT pools
+	AddressPersistent    bool                // source { address-persistent; }
 	Destination          *DestinationNATConfig
 	Static               []*StaticNATRuleSet
 	NAT64                []*NAT64RuleSet
-	NATv6v4              *NATv6v4Config         // natv6v4 options
+	NATv6v4              *NATv6v4Config // natv6v4 options
 	PoolUtilizationAlarm *PoolUtilizationAlarmConfig
+	ProxyARP             []*ProxyARPEntry
+}
+
+// ProxyARPEntry configures proxy ARP responses for NAT addresses.
+type ProxyARPEntry struct {
+	Interface string
+	Addresses []string // /32 CIDRs (expanded from ranges)
 }
 
 // PoolUtilizationAlarmConfig configures NAT pool utilization alarms.
@@ -864,9 +871,9 @@ type NATv6v4Config struct {
 
 // NAT64RuleSet defines NAT64 translation rules.
 type NAT64RuleSet struct {
-	Name        string
-	Prefix      string // well-known prefix, e.g. "64:ff9b::/96"
-	SourcePool  string // IPv4 source pool name for translated packets
+	Name       string
+	Prefix     string // well-known prefix, e.g. "64:ff9b::/96"
+	SourcePool string // IPv4 source pool name for translated packets
 }
 
 // StaticNATRuleSet is a set of static 1:1 NAT rules bound to a zone.
@@ -899,23 +906,23 @@ type NATRule struct {
 
 // NATMatch defines what traffic a NAT rule matches.
 type NATMatch struct {
-	SourceAddress      string   // CIDR (first address, for backward compat)
-	SourceAddresses    []string // all matched source CIDRs (bracket list support)
-	SourceAddressName  string   // address-book name (resolved during compilation)
+	SourceAddress        string   // CIDR (first address, for backward compat)
+	SourceAddresses      []string // all matched source CIDRs (bracket list support)
+	SourceAddressName    string   // address-book name (resolved during compilation)
 	DestinationAddress   string   // CIDR (first address, for backward compat)
 	DestinationAddresses []string // all matched destination CIDRs (bracket list support)
 	DestinationPort      int      // primary port (first port for BPF rule)
-	DestinationPorts   []int  // all matched ports (for multi-port DNAT rules)
-	Protocol           string // "tcp", "udp", "icmp6", "gre", or "" (auto)
-	Application        string // application name (e.g. "junos-http")
+	DestinationPorts     []int    // all matched ports (for multi-port DNAT rules)
+	Protocol             string   // "tcp", "udp", "icmp6", "gre", or "" (auto)
+	Application          string   // application name (e.g. "junos-http")
 }
 
 // NATThen defines the NAT translation action.
 type NATThen struct {
-	Type        NATType
-	Interface   bool   // source-nat interface mode
-	PoolName    string // pool reference
-	Off         bool   // source-nat off (no-NAT exemption)
+	Type      NATType
+	Interface bool   // source-nat interface mode
+	PoolName  string // pool reference
+	Off       bool   // source-nat off (no-NAT exemption)
 }
 
 // NATType is the type of NAT.
@@ -960,13 +967,20 @@ type StaticNATRule struct {
 	IsNPTv6       bool   // true if this is an nptv6-prefix rule (RFC 6296)
 }
 
+// LimitSessionScreen configures per-IP session limiting.
+type LimitSessionScreen struct {
+	SourceIPBased      int // max sessions per source IP, 0 = disabled
+	DestinationIPBased int // max sessions per destination IP, 0 = disabled
+}
+
 // ScreenProfile defines IDS screening options.
 type ScreenProfile struct {
-	Name string
-	ICMP ICMPScreen
-	IP   IPScreen
-	TCP  TCPScreen
-	UDP  UDPScreen
+	Name         string
+	ICMP         ICMPScreen
+	IP           IPScreen
+	TCP          TCPScreen
+	UDP          UDPScreen
+	LimitSession LimitSessionScreen
 }
 
 // ICMPScreen configures ICMP screening.
@@ -977,21 +991,21 @@ type ICMPScreen struct {
 
 // IPScreen configures IP screening.
 type IPScreen struct {
-	SourceRouteOption  bool
-	TearDrop           bool
-	IPSweepThreshold   int // unique destination IPs per source (0 = disabled)
+	SourceRouteOption bool
+	TearDrop          bool
+	IPSweepThreshold  int // unique destination IPs per source (0 = disabled)
 }
 
 // TCPScreen configures TCP screening.
 type TCPScreen struct {
-	SynFlood           *SynFloodConfig
-	Land               bool
-	WinNuke            bool
-	SynFrag            bool
-	SynFin             bool
-	NoFlag             bool
-	FinNoAck           bool
-	PortScanThreshold  int // TCP SYN count per source IP (0 = disabled)
+	SynFlood          *SynFloodConfig
+	Land              bool
+	WinNuke           bool
+	SynFrag           bool
+	SynFin            bool
+	NoFlag            bool
+	FinNoAck          bool
+	PortScanThreshold int // TCP SYN count per source IP (0 = disabled)
 }
 
 // UDPScreen configures UDP screening.
@@ -1034,23 +1048,23 @@ type InterfacesConfig struct {
 
 // InterfaceConfig represents a network interface.
 type InterfaceConfig struct {
-	Name                  string
-	Description           string // free-text interface description
-	MTU                   int    // interface-level MTU (overridden by unit MTU)
-	Speed                 string // interface speed (e.g. "1g", "10g", "auto")
-	Duplex                string // "full", "half", "auto"
-	VlanTagging           bool   // 802.1Q trunk mode
-	FlexibleVlanTagging   bool   // flexible 802.1Q VLAN tagging (QinQ)
-	Encapsulation         string // physical link-layer encapsulation (e.g. "flexible-ethernet-services")
-	Bandwidth             uint64 // interface bandwidth in bits per second
-	Disable               bool   // administratively disabled
-	RedundantParent       string // gigether-options redundant-parent (HA)
-	LAGParent             string // gigether-options 802.3ad <ae-name> (LAG member binding)
-	RedundancyGroup       int    // redundant-ether-options redundancy-group (0 = none)
-	FabricMembers         []string // fabric-options member-interfaces
-	AggregatedEtherOpts   *AggregatedEtherOptions // ae interface options (LACP, etc.)
-	Units                 map[int]*InterfaceUnit
-	Tunnel                *TunnelConfig // non-nil for tunnel interfaces (gre0, etc.)
+	Name                string
+	Description         string                  // free-text interface description
+	MTU                 int                     // interface-level MTU (overridden by unit MTU)
+	Speed               string                  // interface speed (e.g. "1g", "10g", "auto")
+	Duplex              string                  // "full", "half", "auto"
+	VlanTagging         bool                    // 802.1Q trunk mode
+	FlexibleVlanTagging bool                    // flexible 802.1Q VLAN tagging (QinQ)
+	Encapsulation       string                  // physical link-layer encapsulation (e.g. "flexible-ethernet-services")
+	Bandwidth           uint64                  // interface bandwidth in bits per second
+	Disable             bool                    // administratively disabled
+	RedundantParent     string                  // gigether-options redundant-parent (HA)
+	LAGParent           string                  // gigether-options 802.3ad <ae-name> (LAG member binding)
+	RedundancyGroup     int                     // redundant-ether-options redundancy-group (0 = none)
+	FabricMembers       []string                // fabric-options member-interfaces
+	AggregatedEtherOpts *AggregatedEtherOptions // ae interface options (LACP, etc.)
+	Units               map[int]*InterfaceUnit
+	Tunnel              *TunnelConfig // non-nil for tunnel interfaces (gre0, etc.)
 }
 
 // AggregatedEtherOptions defines LAG/ae interface parameters.
@@ -1064,27 +1078,27 @@ type AggregatedEtherOptions struct {
 
 // InterfaceUnit represents a logical unit on an interface.
 type InterfaceUnit struct {
-	Number         int
-	Description    string   // free-text unit description
-	VlanID         int      // 0 = native/untagged, >0 = 802.1Q tagged
-	InnerVlanID    int      // inner VLAN tag for QinQ (flexible-vlan-tagging)
-	PointToPoint   bool     // point-to-point link (for tunnels)
-	Addresses      []string // CIDR notation
-	PrimaryAddress   string // address marked as primary
-	PreferredAddress string // address marked as preferred
-	MTU            int      // family-level MTU (0 = default)
-	DHCP           bool     // family inet { dhcp; }
-	DHCPOptions    *DHCPInetOptions // dhcp sub-options (lease-time, etc.)
-	DHCPv6         bool     // family inet6 { dhcpv6; }
-	DHCPv6Client   *DHCPv6ClientConfig
-	DADDisable     bool   // family inet6 { dad-disable; }
-	SamplingInput  bool   // family inet/inet6 { sampling { input; } }
-	SamplingOutput bool   // family inet/inet6 { sampling { output; } }
-	FilterInputV4  string // family inet { filter { input NAME; } }
-	FilterOutputV4 string // family inet { filter { output NAME; } }
-	FilterInputV6  string // family inet6 { filter { input NAME; } }
-	FilterOutputV6 string // family inet6 { filter { output NAME; } }
-	VRRPGroups     map[string]*VRRPGroup // keyed by address (CIDR), each address can have VRRP groups
+	Number           int
+	Description      string           // free-text unit description
+	VlanID           int              // 0 = native/untagged, >0 = 802.1Q tagged
+	InnerVlanID      int              // inner VLAN tag for QinQ (flexible-vlan-tagging)
+	PointToPoint     bool             // point-to-point link (for tunnels)
+	Addresses        []string         // CIDR notation
+	PrimaryAddress   string           // address marked as primary
+	PreferredAddress string           // address marked as preferred
+	MTU              int              // family-level MTU (0 = default)
+	DHCP             bool             // family inet { dhcp; }
+	DHCPOptions      *DHCPInetOptions // dhcp sub-options (lease-time, etc.)
+	DHCPv6           bool             // family inet6 { dhcpv6; }
+	DHCPv6Client     *DHCPv6ClientConfig
+	DADDisable       bool                  // family inet6 { dad-disable; }
+	SamplingInput    bool                  // family inet/inet6 { sampling { input; } }
+	SamplingOutput   bool                  // family inet/inet6 { sampling { output; } }
+	FilterInputV4    string                // family inet { filter { input NAME; } }
+	FilterOutputV4   string                // family inet { filter { output NAME; } }
+	FilterInputV6    string                // family inet6 { filter { input NAME; } }
+	FilterOutputV6   string                // family inet6 { filter { output NAME; } }
+	VRRPGroups       map[string]*VRRPGroup // keyed by address (CIDR), each address can have VRRP groups
 }
 
 // VRRPGroup defines a VRRP (Virtual Router Redundancy Protocol) group.
@@ -1209,7 +1223,6 @@ type LLDPInterface struct {
 	Disable bool // per-interface disable
 }
 
-
 // OSPFv3Config holds OSPFv3 (IPv6 OSPF) routing configuration.
 type OSPFv3Config struct {
 	RouterID string
@@ -1253,37 +1266,40 @@ type ISISConfig struct {
 
 // ISISInterface defines an interface participating in IS-IS.
 type ISISInterface struct {
-	Name     string
-	Level    string // override per-interface
-	Passive  bool
-	Metric   int    // 0 = default
-	AuthKey  string // per-interface authentication key
-	AuthType string // "md5" or "simple"
+	Name          string
+	Level         string // override per-interface
+	Passive       bool
+	Metric        int    // 0 = default
+	AuthKey       string // per-interface authentication key
+	AuthType      string // "md5" or "simple"
+	BFD           bool   // enable BFD on this interface
+	BFDInterval   int    // BFD minimum-interval in ms (0 = default)
+	BFDMultiplier int    // BFD detect-multiplier (0 = default)
 }
 
 // RAInterfaceConfig configures Router Advertisement on an interface.
 type RAInterfaceConfig struct {
-	Interface          string
-	ManagedConfig      bool     // managed-configuration (M flag)
-	OtherStateful      bool     // other-stateful-configuration (O flag)
-	Preference         string   // "high", "medium", "low" (default: medium)
-	DefaultLifetime    int      // seconds, 0 = default (1800)
-	MaxAdvInterval     int      // seconds, 0 = default (600)
-	MinAdvInterval     int      // seconds, 0 = default (200)
-	Prefixes           []*RAPrefix
-	DNSServers         []string // recursive DNS server addresses
-	NAT64Prefix        string   // PREF64 prefix (e.g. "64:ff9b::/96")
-	NAT64PrefixLife    int      // PREF64 lifetime in seconds (0 = default)
-	LinkMTU            int      // advertised link MTU, 0 = omit
+	Interface       string
+	ManagedConfig   bool   // managed-configuration (M flag)
+	OtherStateful   bool   // other-stateful-configuration (O flag)
+	Preference      string // "high", "medium", "low" (default: medium)
+	DefaultLifetime int    // seconds, 0 = default (1800)
+	MaxAdvInterval  int    // seconds, 0 = default (600)
+	MinAdvInterval  int    // seconds, 0 = default (200)
+	Prefixes        []*RAPrefix
+	DNSServers      []string // recursive DNS server addresses
+	NAT64Prefix     string   // PREF64 prefix (e.g. "64:ff9b::/96")
+	NAT64PrefixLife int      // PREF64 lifetime in seconds (0 = default)
+	LinkMTU         int      // advertised link MTU, 0 = omit
 }
 
 // RAPrefix defines a prefix advertised via RA.
 type RAPrefix struct {
-	Prefix         string // CIDR notation
-	OnLink         bool   // on-link flag (default true)
-	Autonomous     bool   // SLAAC autonomous flag (default true)
-	ValidLifetime  int    // seconds, 0 = default (2592000 = 30 days)
-	PreferredLife  int    // seconds, 0 = default (604800 = 7 days)
+	Prefix        string // CIDR notation
+	OnLink        bool   // on-link flag (default true)
+	Autonomous    bool   // SLAAC autonomous flag (default true)
+	ValidLifetime int    // seconds, 0 = default (2592000 = 30 days)
+	PreferredLife int    // seconds, 0 = default (604800 = 7 days)
 }
 
 // OSPFConfig holds OSPF routing configuration.
@@ -1312,15 +1328,17 @@ type OSPFVirtualLink struct {
 
 // OSPFInterface defines an interface participating in OSPF.
 type OSPFInterface struct {
-	Name        string
-	Passive     bool   // passive interface (no hello)
-	NoPassive   bool   // override passive-default (explicitly active)
-	Cost        int    // OSPF cost, 0 = default
-	NetworkType string // "point-to-point", "broadcast", "" (default)
-	AuthType    string // "md5", "simple", "" (none)
-	AuthKey     string // authentication key/password
-	AuthKeyID   int    // key-id for MD5 (1-255)
-	BFD         bool   // enable BFD on this interface
+	Name          string
+	Passive       bool   // passive interface (no hello)
+	NoPassive     bool   // override passive-default (explicitly active)
+	Cost          int    // OSPF cost, 0 = default
+	NetworkType   string // "point-to-point", "broadcast", "" (default)
+	AuthType      string // "md5", "simple", "" (none)
+	AuthKey       string // authentication key/password
+	AuthKeyID     int    // key-id for MD5 (1-255)
+	BFD           bool   // enable BFD on this interface
+	BFDInterval   int    // BFD minimum-interval in ms (0 = default)
+	BFDMultiplier int    // BFD detect-multiplier (0 = default)
 }
 
 // BGPConfig holds BGP routing configuration.
@@ -1343,23 +1361,24 @@ type BGPConfig struct {
 
 // BGPNeighbor defines a BGP peer.
 type BGPNeighbor struct {
-	Address      string   // peer IP
-	PeerAS       uint32
-	Description  string
-	MultihopTTL  int      // 0 = directly connected
-	Export       []string // per-group export policies (route-map out)
-	FamilyInet   bool     // activate under address-family ipv4 unicast
-	FamilyInet6  bool     // activate under address-family ipv6 unicast
-	GroupName    string   // BGP group name (for display)
-	AuthPassword         string // TCP MD5 password for BGP session
-	BFD                  bool   // enable BFD for this neighbor
-	BFDInterval          int    // BFD minimum interval in ms (0 = default 300)
-	RouteReflectorClient bool   // mark as route-reflector client
-	DefaultOriginate     bool   // advertise default route to this neighbor
-	AllowASIn            int    // allow own AS in path N times (0 = disabled)
-	RemovePrivateAS      bool   // strip private AS numbers from updates
-	PrefixLimitInet      int    // max IPv4 prefixes (0 = unlimited)
-	PrefixLimitInet6     int    // max IPv6 prefixes (0 = unlimited)
+	Address              string // peer IP
+	PeerAS               uint32
+	Description          string
+	MultihopTTL          int      // 0 = directly connected
+	Export               []string // per-group export policies (route-map out)
+	FamilyInet           bool     // activate under address-family ipv4 unicast
+	FamilyInet6          bool     // activate under address-family ipv6 unicast
+	GroupName            string   // BGP group name (for display)
+	AuthPassword         string   // TCP MD5 password for BGP session
+	BFD                  bool     // enable BFD for this neighbor
+	BFDInterval          int      // BFD minimum interval in ms (0 = default 300)
+	BFDMultiplier        int      // BFD detect-multiplier (0 = default 3)
+	RouteReflectorClient bool     // mark as route-reflector client
+	DefaultOriginate     bool     // advertise default route to this neighbor
+	AllowASIn            int      // allow own AS in path N times (0 = disabled)
+	RemovePrivateAS      bool     // strip private AS numbers from updates
+	PrefixLimitInet      int      // max IPv4 prefixes (0 = unlimited)
+	PrefixLimitInet6     int      // max IPv6 prefixes (0 = unlimited)
 }
 
 // TunnelConfig defines a GRE or other tunnel interface.
@@ -1419,27 +1438,27 @@ type IPsecProposal struct {
 
 // IPsecPolicyDef defines Phase 2 policy (PFS + proposal reference).
 type IPsecPolicyDef struct {
-	Name       string
-	PFSGroup   int    // PFS DH group number (0 = disabled)
-	Proposals  string // IPsec proposal reference
+	Name      string
+	PFSGroup  int    // PFS DH group number (0 = disabled)
+	Proposals string // IPsec proposal reference
 }
 
 // IPsecGateway defines a remote IKE gateway.
 type IPsecGateway struct {
-	Name             string
-	Address          string // remote gateway IP
-	DynamicHostname  string // dynamic peer hostname (DNS-resolved)
-	LocalAddress     string // local IP
-	IKEPolicy        string // IKE policy reference
-	ExternalIface    string // external-facing interface
-	Version          string // "v1-only", "v2-only" (empty = both)
-	NoNATTraversal   bool   // disable NAT-T (legacy, use NATTraversal)
-	NATTraversal     string // "enable" (default), "disable", "force"
-	DeadPeerDetect   string // "always-send", "optimized", "probe-idle"
-	LocalIDType      string // "hostname", "inet", "fqdn"
-	LocalIDValue     string // identity value
-	RemoteIDType     string // "hostname", "inet", "fqdn"
-	RemoteIDValue    string // identity value
+	Name            string
+	Address         string // remote gateway IP
+	DynamicHostname string // dynamic peer hostname (DNS-resolved)
+	LocalAddress    string // local IP
+	IKEPolicy       string // IKE policy reference
+	ExternalIface   string // external-facing interface
+	Version         string // "v1-only", "v2-only" (empty = both)
+	NoNATTraversal  bool   // disable NAT-T (legacy, use NATTraversal)
+	NATTraversal    string // "enable" (default), "disable", "force"
+	DeadPeerDetect  string // "always-send", "optimized", "probe-idle"
+	LocalIDType     string // "hostname", "inet", "fqdn"
+	LocalIDValue    string // identity value
+	RemoteIDType    string // "hostname", "inet", "fqdn"
+	RemoteIDValue   string // identity value
 }
 
 // IPsecVPN defines an IPsec VPN tunnel.
@@ -1458,17 +1477,17 @@ type IPsecVPN struct {
 
 // RoutingInstanceConfig represents a VRF-based routing instance.
 type RoutingInstanceConfig struct {
-	Name                    string
-	Description             string
-	InstanceType            string              // "virtual-router" or "vrf"
-	Interfaces              []string            // interfaces belonging to this instance
-	StaticRoutes            []*StaticRoute      // per-instance static routes
-	OSPF                    *OSPFConfig         // per-instance OSPF (optional)
-	OSPFv3                  *OSPFv3Config       // per-instance OSPFv3 (optional)
-	BGP                     *BGPConfig          // per-instance BGP (optional)
-	RIP                     *RIPConfig          // per-instance RIP (optional)
-	ISIS                    *ISISConfig         // per-instance IS-IS (optional)
-	TableID                 int                 // Linux kernel routing table number (auto-assigned)
-	InterfaceRoutesRibGroup string              // interface-routes { rib-group inet <name>; }
-	InterfaceRoutesRibGroupV6 string            // interface-routes { rib-group inet6 <name>; }
+	Name                      string
+	Description               string
+	InstanceType              string         // "virtual-router" or "vrf"
+	Interfaces                []string       // interfaces belonging to this instance
+	StaticRoutes              []*StaticRoute // per-instance static routes
+	OSPF                      *OSPFConfig    // per-instance OSPF (optional)
+	OSPFv3                    *OSPFv3Config  // per-instance OSPFv3 (optional)
+	BGP                       *BGPConfig     // per-instance BGP (optional)
+	RIP                       *RIPConfig     // per-instance RIP (optional)
+	ISIS                      *ISISConfig    // per-instance IS-IS (optional)
+	TableID                   int            // Linux kernel routing table number (auto-assigned)
+	InterfaceRoutesRibGroup   string         // interface-routes { rib-group inet <name>; }
+	InterfaceRoutesRibGroupV6 string         // interface-routes { rib-group inet6 <name>; }
 }

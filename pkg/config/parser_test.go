@@ -9963,7 +9963,6 @@ func TestBGPLogUpdownSetSyntax(t *testing.T) {
 	}
 }
 
-
 func TestBGPAllowASInSetSyntax(t *testing.T) {
 	cmds := []string{
 		"set protocols bgp local-as 65001",
@@ -14136,5 +14135,320 @@ func TestIRBToBridge(t *testing.T) {
 	}
 	if _, ok := m["irb.1"]; ok {
 		t.Error("irb.1 should not be in map (bd1 has no routing-interface)")
+	}
+}
+
+func TestProxyARPHierarchical(t *testing.T) {
+	input := `security {
+    nat {
+        proxy-arp {
+            interface trust0.0 {
+                address 10.0.1.100/32;
+                address 10.0.1.101/32 to 10.0.1.110/32;
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Security.NAT.ProxyARP) != 1 {
+		t.Fatalf("got %d proxy-arp entries, want 1", len(cfg.Security.NAT.ProxyARP))
+	}
+	entry := cfg.Security.NAT.ProxyARP[0]
+	if entry.Interface != "trust0.0" {
+		t.Errorf("interface = %q, want trust0.0", entry.Interface)
+	}
+	// 1 single + 10 from range = 11
+	if len(entry.Addresses) != 11 {
+		t.Errorf("got %d addresses, want 11: %v", len(entry.Addresses), entry.Addresses)
+	}
+	if entry.Addresses[0] != "10.0.1.100/32" {
+		t.Errorf("first addr = %q, want 10.0.1.100/32", entry.Addresses[0])
+	}
+}
+
+func TestProxyARPSetSyntax(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set security nat proxy-arp interface trust0.0 address 10.0.1.100/32",
+		"set security nat proxy-arp interface trust0.0 address 10.0.1.101/32 to 10.0.1.110/32",
+	} {
+		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	if len(cfg.Security.NAT.ProxyARP) != 1 {
+		t.Fatalf("got %d proxy-arp entries, want 1", len(cfg.Security.NAT.ProxyARP))
+	}
+	entry := cfg.Security.NAT.ProxyARP[0]
+	if entry.Interface != "trust0.0" {
+		t.Errorf("interface = %q, want trust0.0", entry.Interface)
+	}
+	// 1 single + 10 from range = 11
+	if len(entry.Addresses) != 11 {
+		t.Errorf("got %d addresses, want 11: %v", len(entry.Addresses), entry.Addresses)
+	}
+}
+
+func TestProxyARPSingleAddress(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set security nat proxy-arp interface untrust0.0 address 203.0.113.5/32",
+	} {
+		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	if len(cfg.Security.NAT.ProxyARP) != 1 {
+		t.Fatalf("got %d proxy-arp entries, want 1", len(cfg.Security.NAT.ProxyARP))
+	}
+	entry := cfg.Security.NAT.ProxyARP[0]
+	if entry.Interface != "untrust0.0" {
+		t.Errorf("interface = %q, want untrust0.0", entry.Interface)
+	}
+	if len(entry.Addresses) != 1 {
+		t.Fatalf("got %d addresses, want 1", len(entry.Addresses))
+	}
+	if entry.Addresses[0] != "203.0.113.5/32" {
+		t.Errorf("address = %q, want 203.0.113.5/32", entry.Addresses[0])
+	}
+}
+
+func TestProxyARPBareIP(t *testing.T) {
+	// Address without /32 mask should get /32 appended.
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set security nat proxy-arp interface trust0.0 address 10.0.1.50",
+	} {
+		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	if len(cfg.Security.NAT.ProxyARP) != 1 {
+		t.Fatalf("got %d proxy-arp entries, want 1", len(cfg.Security.NAT.ProxyARP))
+	}
+	entry := cfg.Security.NAT.ProxyARP[0]
+	if len(entry.Addresses) != 1 {
+		t.Fatalf("got %d addresses, want 1", len(entry.Addresses))
+	}
+	if entry.Addresses[0] != "10.0.1.50/32" {
+		t.Errorf("address = %q, want 10.0.1.50/32", entry.Addresses[0])
+	}
+}
+
+func TestOSPFBFDIntervalMultiplierSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols ospf area 0.0.0.0 interface trust0 bfd-liveness-detection minimum-interval 300",
+		"set protocols ospf area 0.0.0.0 interface trust0 bfd-liveness-detection multiplier 3",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ospf := cfg.Protocols.OSPF
+	if ospf == nil {
+		t.Fatal("OSPF config is nil")
+	}
+	iface := ospf.Areas[0].Interfaces[0]
+	if !iface.BFD {
+		t.Error("OSPF interface BFD should be true")
+	}
+	if iface.BFDInterval != 300 {
+		t.Errorf("BFDInterval: got %d, want 300", iface.BFDInterval)
+	}
+	if iface.BFDMultiplier != 3 {
+		t.Errorf("BFDMultiplier: got %d, want 3", iface.BFDMultiplier)
+	}
+}
+
+func TestISISBFDSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols isis net 49.0001.0100.0000.0001.00",
+		"set protocols isis interface trust0 bfd-liveness-detection minimum-interval 300",
+		"set protocols isis interface trust0 bfd-liveness-detection multiplier 4",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	isis := cfg.Protocols.ISIS
+	if isis == nil {
+		t.Fatal("IS-IS config is nil")
+	}
+	if len(isis.Interfaces) != 1 {
+		t.Fatalf("interfaces: got %d, want 1", len(isis.Interfaces))
+	}
+	iface := isis.Interfaces[0]
+	if !iface.BFD {
+		t.Error("IS-IS interface BFD should be true")
+	}
+	if iface.BFDInterval != 300 {
+		t.Errorf("BFDInterval: got %d, want 300", iface.BFDInterval)
+	}
+	if iface.BFDMultiplier != 4 {
+		t.Errorf("BFDMultiplier: got %d, want 4", iface.BFDMultiplier)
+	}
+}
+
+func TestBGPBFDMultiplierSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group external peer-as 65002",
+		"set protocols bgp group external bfd-liveness-detection minimum-interval 200",
+		"set protocols bgp group external bfd-liveness-detection multiplier 5",
+		"set protocols bgp group external neighbor 10.0.2.1",
+		"set protocols bgp group external neighbor 10.0.3.1 bfd-liveness-detection multiplier 4",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	bgp := cfg.Protocols.BGP
+	if bgp == nil {
+		t.Fatal("BGP config is nil")
+	}
+	if len(bgp.Neighbors) != 2 {
+		t.Fatalf("neighbors: got %d, want 2", len(bgp.Neighbors))
+	}
+	// Inherited from group
+	if bgp.Neighbors[0].BFDMultiplier != 5 {
+		t.Errorf("neighbor[0] BFDMultiplier: got %d, want 5", bgp.Neighbors[0].BFDMultiplier)
+	}
+	if bgp.Neighbors[0].BFDInterval != 200 {
+		t.Errorf("neighbor[0] BFDInterval: got %d, want 200", bgp.Neighbors[0].BFDInterval)
+	}
+	// Per-neighbor override
+	if bgp.Neighbors[1].BFDMultiplier != 4 {
+		t.Errorf("neighbor[1] BFDMultiplier: got %d, want 4", bgp.Neighbors[1].BFDMultiplier)
+	}
+}
+
+func TestScreenSessionLimitCompilation(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set security screen ids-option wan-screen limit-session source-ip-based 100",
+		"set security screen ids-option wan-screen limit-session destination-ip-based 200",
+		"set security screen ids-option wan-screen tcp land",
+	}
+
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath: %v", err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	screen := cfg.Security.Screen["wan-screen"]
+	if screen == nil {
+		t.Fatal("missing screen profile wan-screen")
+	}
+
+	if screen.LimitSession.SourceIPBased != 100 {
+		t.Errorf("SourceIPBased = %d, want 100", screen.LimitSession.SourceIPBased)
+	}
+	if screen.LimitSession.DestinationIPBased != 200 {
+		t.Errorf("DestinationIPBased = %d, want 200", screen.LimitSession.DestinationIPBased)
+	}
+	if !screen.TCP.Land {
+		t.Error("Land should be true")
+	}
+}
+
+func TestScreenSessionLimitHierarchical(t *testing.T) {
+	input := `
+security {
+    screen {
+        ids-option test-screen {
+            limit-session {
+                source-ip-based 50;
+                destination-ip-based 75;
+            }
+        }
+    }
+}
+`
+	tree, perrs := NewParser(input).Parse()
+	if perrs != nil {
+		t.Fatalf("parse error: %v", perrs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	screen := cfg.Security.Screen["test-screen"]
+	if screen == nil {
+		t.Fatal("missing screen profile test-screen")
+	}
+
+	if screen.LimitSession.SourceIPBased != 50 {
+		t.Errorf("SourceIPBased = %d, want 50", screen.LimitSession.SourceIPBased)
+	}
+	if screen.LimitSession.DestinationIPBased != 75 {
+		t.Errorf("DestinationIPBased = %d, want 75", screen.LimitSession.DestinationIPBased)
 	}
 }

@@ -13,23 +13,23 @@ Last updated: 2026-02-25
 | SSL/TLS Inspection | 4 | 0 | 0 | 4 |
 | Advanced Threat Prevention | 5 | 1 | 0 | 6 |
 | User/Identity Firewall | 5 | 0 | 0 | 5 |
-| NAT Enhancements | 6 | 1 | 0 | 7 |
-| Screen/IDS Enhancements | 6 | 2 | 1 | 8 |
+| NAT Enhancements | 5 | 1 | 0 | 6 |
+| Screen/IDS Enhancements | 4 | 2 | 1 | 6 |
 | Security Flow Enhancements | 5 | 0 | 0 | 5 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
 | Security Logging Enhancements | 1 | 0 | 0 | 1 |
 | PKI / Certificates | 4 | 0 | 0 | 4 |
-| Routing Enhancements | 11 | 3 | 0 | 14 |
+| Routing Enhancements | 10 | 3 | 0 | 13 |
 | VPN Enhancements | 8 | 1 | 0 | 9 |
 | HA Enhancements | 0 | 0 | 0 | 0 |
-| Firewall Filter Enhancements | 4 | 1 | 0 | 5 |
+| Firewall Filter Enhancements | 2 | 1 | 0 | 3 |
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
 | Management & Automation | 9 | 2 | 0 | 11 |
 | Interface Enhancements | 4 | 2 | 1 | 7 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **138** | **17** | **6** | **161** |
+| **TOTAL** | **132** | **17** | **6** | **155** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -152,7 +152,7 @@ bpfrx has SNAT (interface + pool, address-persistent), DNAT (with pools, hit cou
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Proxy ARP for NAT** | `security nat proxy-arp interface ... address ...` | Auto-reply ARP for NAT pool addresses on same subnet as ingress interface. Required when SNAT pool or DNAT addresses are on same L2 segment. | High | Missing |
+| **Proxy ARP for NAT** | `security nat proxy-arp interface ... address ...` | Auto-reply ARP for NAT pool addresses on same subnet as ingress interface. Required when SNAT pool or DNAT addresses are on same L2 segment. | High | **Done** -- Proxy ARP neighbor entries for NAT addresses with GARP on addition. Config: `set security nat proxy-arp interface <iface> address <addr>` with range support. |
 | **Proxy NDP for NAT** | `security nat proxy-ndp interface ... address ...` | IPv6 equivalent of proxy ARP for NAT64/static NAT addresses | Medium | Missing |
 | **Twice NAT** | Combination of SNAT + DNAT rule-sets matching same traffic | Simultaneous source and destination translation in single flow. bpfrx handles SNAT and DNAT independently but may not combine in same session correctly. | Medium | Partial (separate SNAT/DNAT rules exist but not tested as combined twice-NAT) |
 | **DNS ALG with NAT** | `security alg dns enable` | DNS payload rewriting when NAT changes embedded IP addresses (A/AAAA record doctoring) | Medium | Missing |
@@ -165,12 +165,12 @@ bpfrx has SNAT (interface + pool, address-persistent), DNAT (with pools, hit cou
 
 ## 9. Screen/IDS Enhancements
 
-bpfrx implements 11 screen checks (land, syn-flood, ping-death, teardrop, rate-limiting, ip-sweep, winnuke, syn-frag, syn-fin, no-flag, fin-no-ack). These are additional vSRX screen options.
+bpfrx implements 11 screen checks (land, syn-flood, ping-death, teardrop, rate-limiting, ip-sweep, winnuke, syn-frag, syn-fin, no-flag, fin-no-ack) plus per-IP session limiting. These are additional vSRX screen options.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Session Limiting (source-ip)** | `security screen ids-option ... limit-session source-ip-based N` | Limit max concurrent sessions from single source IP (1-8M). Prevents session table exhaustion. | High | Missing |
-| **Session Limiting (dest-ip)** | `security screen ids-option ... limit-session destination-ip-based N` | Limit max concurrent sessions to single destination IP | High | Missing |
+| **Session Limiting (source-ip)** | `security screen ids-option ... limit-session source-ip-based N` | Limit max concurrent sessions from single source IP (1-8M). Prevents session table exhaustion. | High | **Done** -- GC sweep counts active sessions per source IP, pushes to BPF LRU maps, xdp_screen enforces limits on TCP SYN. |
+| **Session Limiting (dest-ip)** | `security screen ids-option ... limit-session destination-ip-based N` | Limit max concurrent sessions to single destination IP | High | **Done** -- Same mechanism as source-ip limiting but per destination IP. |
 | **TCP Port Scan Detection** | `security screen ids-option ... tcp port-scan threshold N` | Detect TCP port scanning by counting unique destination ports per source within time window | Medium | Partial (threshold parsed but detection algorithm may be incomplete) |
 | **UDP Port Scan Detection** | `security screen ids-option ... udp port-scan threshold N` | Same as TCP port scan but for UDP | Medium | Missing |
 | **UDP Sweep Detection** | `security screen ids-option ... udp udp-sweep threshold N` | Detect UDP sweeps (same port, many destinations) | Low | Missing |
@@ -252,7 +252,7 @@ bpfrx has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, rib
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **BFD** | `protocols ospf area ... interface ... bfd-liveness-detection ...` | Bidirectional Forwarding Detection for sub-second failure detection on routing adjacencies. FRR supports BFD natively. | High | Missing (FRR has BFD daemon but bpfrx doesn't configure it) |
+| **BFD** | `protocols ospf area ... interface ... bfd-liveness-detection ...` | Bidirectional Forwarding Detection for sub-second failure detection on routing adjacencies. FRR supports BFD natively. | High | **Done** -- OSPF BFD with interval/multiplier via FRR profiles, IS-IS BFD support with optional interval/multiplier, BGP BFD multiplier configurable. |
 | **Graceful Restart** | `routing-options graceful-restart` | Non-stop routing during control plane restart. Keep forwarding while protocols reconverge. FRR supports GR. | Medium | Missing (FRR has GR but bpfrx doesn't configure it) |
 | **Aggregate Routes** | `routing-options aggregate route ...` | Aggregate (summary) routes with policy control, different from generate routes in contributing route behavior | Medium | Partial (generate routes implemented but aggregate semantics differ) |
 | **Martian Addresses** | `routing-options martians ... allow/exact/orlonger` | Configure additional martian (reserved) address filtering or allow specific martians | Low | Missing |
@@ -309,8 +309,8 @@ bpfrx has firewall filters with source/dest addresses, prefix-lists (with except
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Missing |
-| **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR | Medium | Missing |
+| **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | **Done** -- Token bucket policer with single-rate two-color mode. eBPF and DPDK parity. |
+| **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR | Medium | **Done** -- Two-rate three-color (RFC 2698) and single-rate three-color (RFC 2697) modes implemented. |
 | **Interface Policer** | `firewall policer ... logical-interface-policer` | Aggregate rate limiting across all protocol families on a logical interface | Low | Missing |
 | **Flexible Match Conditions** | `firewall filter ... term ... from flexible-match-range ...` | Match on arbitrary byte offsets within packet header for custom protocol matching | Low | Missing |
 | **Firewall Filter on lo0** | `interfaces lo0 unit 0 family inet filter input ...` | Host-bound traffic filtering. bpfrx parses Lo0FilterInputV4/V6 but may not fully apply in BPF. | Medium | Partial (parsed and partially wired but needs verification) |
@@ -420,10 +420,10 @@ bpfrx has hostname, domain-name, domain-search, timezone, name-servers, NTP, ser
 ### Tier 1 - High Priority (Core NGFW / Common vSRX Features)
 Features most commonly used in production vSRX deployments:
 
-1. **Proxy ARP/NDP for NAT** - Required for any pool-based NAT on same subnet
-2. **Session Limiting (source/dest-ip)** - Critical DoS protection, very common screen config
-3. **Firewall Filter Policers** - Interface-level rate limiting, standard in any enterprise deployment
-4. **BFD** - Sub-second failure detection, FRR already has BFD daemon
+1. ~~**Proxy ARP/NDP for NAT**~~ - **Done** (proxy ARP with GARP; proxy NDP still missing)
+2. ~~**Session Limiting (source/dest-ip)**~~ - **Done** (GC sweep + BPF LRU maps + xdp_screen enforcement)
+3. ~~**Firewall Filter Policers**~~ - **Done** (token bucket: single-rate, two-rate RFC 2698, single-rate-3c RFC 2697; eBPF + DPDK)
+4. ~~**BFD**~~ - **Done** (OSPF/IS-IS/BGP BFD via FRR profiles)
 5. **NETCONF/YANG** - Industry-standard management, enables automation tooling
 6. **Unified Policies / AppID** - Foundation of modern NGFW (long-term, high complexity)
 7. **IDP/IPS** - Core NGFW feature differentiator (consider Suricata/Snort integration)
@@ -476,26 +476,23 @@ These features have config parsing in bpfrx but NO runtime effect:
 
 ## Implementation Suggestions for Top Gaps
 
-### Proxy ARP for NAT (Tier 1)
-- Implement in `pkg/dataplane/` or `pkg/networkd/`
-- When SNAT pool or DNAT address is on same subnet as ingress interface, auto-respond to ARP/NDP
-- Can use raw socket AF_PACKET (like GARP in cluster.go) or `ip neigh add proxy`
+### Proxy ARP for NAT (Tier 1) -- DONE
+- Proxy ARP neighbor entries for NAT addresses with GARP on addition
+- Config: `set security nat proxy-arp interface <iface> address <addr>` with address range support
 
-### Session Limiting (Tier 1)
-- Add `limit-session` to ScreenProfile struct and compiler
-- Implement per-source-IP and per-dest-IP session counting in BPF conntrack
-- Use per-CPU hash map for session counts, check in xdp_conntrack before creating new session
+### Session Limiting (Tier 1) -- DONE
+- GC sweep counts active sessions per source/destination IP, pushes to BPF LRU maps
+- xdp_screen enforces limits on TCP SYN
+- Config: `set security screen ids-option <name> limit-session source-ip-based <N>` / `destination-ip-based <N>`
 
-### Firewall Filter Policers (Tier 1)
-- Add `PolicerConfig` to config types
-- Implement token-bucket in BPF using per-CPU maps for token state
-- Apply at XDP/TC attachment points based on interface filter binding
+### Firewall Filter Policers (Tier 1) -- DONE
+- Token bucket policer with single-rate two-color, two-rate three-color (RFC 2698), and single-rate three-color (RFC 2697) modes
+- eBPF and DPDK parity
 
-### BFD (Tier 1)
-- FRR already has `bfdd` daemon
-- Add BFD config to OSPFInterface, BGPNeighbor types
-- Generate BFD peer config in FRR frr.conf
-- Minimal bpfrx code change - mostly FRR config generation
+### BFD (Tier 1) -- DONE
+- OSPF BFD with interval/multiplier via FRR profiles
+- IS-IS BFD support with optional interval/multiplier
+- BGP BFD multiplier configurable (was hardcoded to 3)
 
 ### NETCONF (Tier 1)
 - Consider using `openconfig/gnmic` or `netopeer2` for NETCONF server

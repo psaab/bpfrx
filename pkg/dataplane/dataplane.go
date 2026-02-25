@@ -141,6 +141,11 @@ type DataPlane interface {
 	SetScreenConfig(profileID uint32, cfg ScreenConfig) error
 	ClearScreenConfigs() error
 
+	// Session count maps (populated by GC for session limiting)
+	UpdateSessionCountSrc(key SessionCountKey, count uint32) error
+	UpdateSessionCountDst(key SessionCountKey, count uint32) error
+	ClearSessionCounts() error
+
 	// Port mirroring
 	SetMirrorConfig(ifindex int, mirrorIfindex int, rate uint32) error
 	ClearMirrorConfigs() error

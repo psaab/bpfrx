@@ -703,6 +703,8 @@ inc_screen_counter(__u32 screen_flag)
 	case SCREEN_WINNUKE:        idx = GLOBAL_CTR_SCREEN_WINNUKE; break;
 	case SCREEN_IP_SOURCE_ROUTE:idx = GLOBAL_CTR_SCREEN_IP_SRC_ROUTE; break;
 	case SCREEN_SYN_FRAG:       idx = GLOBAL_CTR_SCREEN_SYN_FRAG; break;
+	case SCREEN_SESSION_LIMIT_SRC: idx = GLOBAL_CTR_SCREEN_SESSION_LIMIT; break;
+	case SCREEN_SESSION_LIMIT_DST: idx = GLOBAL_CTR_SCREEN_SESSION_LIMIT; break;
 	default: return;
 	}
 	inc_counter(idx);

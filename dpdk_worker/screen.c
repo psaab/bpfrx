@@ -180,6 +180,43 @@ screen_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		}
 	}
 
+	/* Per-IP session limiting (counts populated by Go GC sweep) */
+	if ((sc->flags & SCREEN_SESSION_LIMIT_SRC) && meta->protocol == PROTO_TCP &&
+	    (meta->tcp_flags & 0x02) && !(meta->tcp_flags & 0x10)) {
+		struct session_count_key sck = {
+			.ip = (meta->addr_family == AF_INET) ? meta->src_ip.v4 :
+				(meta->src_ip.v6[0] ^ meta->src_ip.v6[4] ^
+				 meta->src_ip.v6[8] ^ meta->src_ip.v6[12]),
+			.zone_id = meta->ingress_zone,
+		};
+		if (ctx->shm && ctx->shm->session_count_src) {
+			int pos = rte_hash_lookup(ctx->shm->session_count_src, &sck);
+			if (pos >= 0 &&
+			    ctx->shm->session_count_src_values[pos].count >= sc->session_limit_src) {
+				emit_event(ctx, meta, EVENT_TYPE_SCREEN_DROP, ACTION_DENY);
+				return -1;
+			}
+		}
+	}
+
+	if ((sc->flags & SCREEN_SESSION_LIMIT_DST) && meta->protocol == PROTO_TCP &&
+	    (meta->tcp_flags & 0x02) && !(meta->tcp_flags & 0x10)) {
+		struct session_count_key dck = {
+			.ip = (meta->addr_family == AF_INET) ? meta->dst_ip.v4 :
+				(meta->dst_ip.v6[0] ^ meta->dst_ip.v6[4] ^
+				 meta->dst_ip.v6[8] ^ meta->dst_ip.v6[12]),
+			.zone_id = meta->ingress_zone,
+		};
+		if (ctx->shm && ctx->shm->session_count_dst) {
+			int pos = rte_hash_lookup(ctx->shm->session_count_dst, &dck);
+			if (pos >= 0 &&
+			    ctx->shm->session_count_dst_values[pos].count >= sc->session_limit_dst) {
+				emit_event(ctx, meta, EVENT_TYPE_SCREEN_DROP, ACTION_DENY);
+				return -1;
+			}
+		}
+	}
+
 	return 0;  /* Passed all checks */
 }
 

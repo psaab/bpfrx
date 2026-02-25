@@ -129,6 +129,8 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["policer_configs"] = mainObjs.PolicerConfigs
 	m.maps["policer_states"] = mainObjs.PolicerStates
 	m.maps["nptv6_rules"] = mainObjs.Nptv6Rules
+	m.maps["session_count_src"] = mainObjs.SessionCountSrc
+	m.maps["session_count_dst"] = mainObjs.SessionCountDst
 
 	// Store main program.
 	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
@@ -181,6 +183,8 @@ func (m *Manager) loadAllObjects() error {
 			"policer_configs":    mainObjs.PolicerConfigs,
 			"policer_states":     mainObjs.PolicerStates,
 			"nptv6_rules":        mainObjs.Nptv6Rules,
+			"session_count_src":  mainObjs.SessionCountSrc,
+			"session_count_dst":  mainObjs.SessionCountDst,
 		},
 	}
 

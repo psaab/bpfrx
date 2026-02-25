@@ -325,7 +325,20 @@ struct app_value {
 #define SCREEN_WINNUKE         (1 << 11)
 #define SCREEN_IP_SOURCE_ROUTE (1 << 12)
 #define SCREEN_SYN_FRAG        (1 << 13)
-#define SCREEN_SYN_COOKIE      (1 << 14)
+#define SCREEN_SYN_COOKIE        (1 << 14)
+#define SCREEN_SESSION_LIMIT_SRC (1 << 15)
+#define SCREEN_SESSION_LIMIT_DST (1 << 16)
+
+/* Per-IP session count (populated by Go GC sweep for session limiting). */
+struct session_count_key {
+	uint32_t ip;        /* IPv4 addr or XOR hash of IPv6 */
+	uint16_t zone_id;
+	uint16_t pad;
+};
+
+struct session_count_value {
+	uint32_t count;
+};
 
 struct screen_config {
 	uint32_t flags;
@@ -337,6 +350,8 @@ struct screen_config {
 	uint32_t syn_flood_timeout;
 	uint32_t port_scan_thresh;
 	uint32_t ip_sweep_thresh;
+	uint32_t session_limit_src;
+	uint32_t session_limit_dst;
 };
 
 struct flood_state {
@@ -829,6 +844,12 @@ struct shared_memory {
 	struct scan_track_value *port_scan_values;
 	struct rte_hash         *ip_sweep_track;
 	struct scan_track_value *ip_sweep_values;
+
+	/* Per-IP session count tracking (populated by Go GC sweep) */
+	struct rte_hash              *session_count_src;
+	struct session_count_value   *session_count_src_values;
+	struct rte_hash              *session_count_dst;
+	struct session_count_value   *session_count_dst_values;
 
 	/* NAT port allocation counters (per-pool atomic counter) */
 	struct nat_port_counter *nat_port_counters;

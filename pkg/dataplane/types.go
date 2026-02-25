@@ -130,13 +130,13 @@ type PolicyRule struct {
 	Action      uint8
 	Log         uint8
 
-	SrcAddrID  uint32
-	DstAddrID  uint32
+	SrcAddrID   uint32
+	DstAddrID   uint32
 	DstPortLow  uint16
 	DstPortHigh uint16
-	Protocol   uint8
-	Active     uint8
-	Pad        [2]byte
+	Protocol    uint8
+	Active      uint8
+	Pad         [2]byte
 
 	AppID     uint32
 	NATRuleID uint32
@@ -207,10 +207,10 @@ const (
 	XDPProgForward   = 5
 	XDPProgNAT64     = 6
 
-	TCProgConntrack   = 0
-	TCProgNAT         = 1
+	TCProgConntrack    = 0
+	TCProgNAT          = 1
 	TCProgScreenEgress = 2
-	TCProgForward     = 3
+	TCProgForward      = 3
 )
 
 // Global counter indices -- must match C constants.
@@ -228,14 +228,14 @@ const (
 	GlobalCtrNAT64Xlate      = 10
 	GlobalCtrHostInbound     = 11
 	// Per-screen-type drop counters (12..25)
-	GlobalCtrScreenSynFlood     = 12
-	GlobalCtrScreenICMPFlood    = 13
-	GlobalCtrScreenUDPFlood     = 14
-	GlobalCtrScreenPortScan     = 15
-	GlobalCtrScreenIPSweep      = 16
-	GlobalCtrScreenLandAttack   = 17
-	GlobalCtrScreenPingOfDeath  = 18
-	GlobalCtrScreenTearDrop     = 19
+	GlobalCtrScreenSynFlood    = 12
+	GlobalCtrScreenICMPFlood   = 13
+	GlobalCtrScreenUDPFlood    = 14
+	GlobalCtrScreenPortScan    = 15
+	GlobalCtrScreenIPSweep     = 16
+	GlobalCtrScreenLandAttack  = 17
+	GlobalCtrScreenPingOfDeath = 18
+	GlobalCtrScreenTearDrop    = 19
 	GlobalCtrScreenTCPSynFin   = 20
 	GlobalCtrScreenTCPNoFlag   = 21
 	GlobalCtrScreenTCPFinNoAck = 22
@@ -252,24 +252,24 @@ const (
 
 // Host-inbound-traffic service flags (bitmap in zone_config.host_inbound_flags).
 const (
-	HostInboundSSH        = 1 << 0
-	HostInboundPing       = 1 << 1
-	HostInboundDNS        = 1 << 2
-	HostInboundHTTP       = 1 << 3
-	HostInboundHTTPS      = 1 << 4
-	HostInboundDHCP       = 1 << 5
-	HostInboundNTP        = 1 << 6
-	HostInboundSNMP       = 1 << 7
-	HostInboundBGP        = 1 << 8
-	HostInboundOSPF       = 1 << 9
-	HostInboundTraceroute = 1 << 10
-	HostInboundTelnet     = 1 << 11
-	HostInboundFTP        = 1 << 12
-	HostInboundNetconf    = 1 << 13
-	HostInboundSyslog     = 1 << 14
-	HostInboundRadius     = 1 << 15
-	HostInboundIKE        = 1 << 16
-	HostInboundDHCPv6     = 1 << 17
+	HostInboundSSH             = 1 << 0
+	HostInboundPing            = 1 << 1
+	HostInboundDNS             = 1 << 2
+	HostInboundHTTP            = 1 << 3
+	HostInboundHTTPS           = 1 << 4
+	HostInboundDHCP            = 1 << 5
+	HostInboundNTP             = 1 << 6
+	HostInboundSNMP            = 1 << 7
+	HostInboundBGP             = 1 << 8
+	HostInboundOSPF            = 1 << 9
+	HostInboundTraceroute      = 1 << 10
+	HostInboundTelnet          = 1 << 11
+	HostInboundFTP             = 1 << 12
+	HostInboundNetconf         = 1 << 13
+	HostInboundSyslog          = 1 << 14
+	HostInboundRadius          = 1 << 15
+	HostInboundIKE             = 1 << 16
+	HostInboundDHCPv6          = 1 << 17
 	HostInboundVRRP            = 1 << 18
 	HostInboundESP             = 1 << 19
 	HostInboundRouterDiscovery = 1 << 20
@@ -378,12 +378,12 @@ type NATPoolConfig struct {
 	PortLow        uint16
 	PortHigh       uint16
 	AddrPersistent uint8
-	Deterministic  uint8  // 0=off, 1=IPv4 host, 2=IPv6 host
+	Deterministic  uint8 // 0=off, 1=IPv4 host, 2=IPv6 host
 	BlockSize      uint16
 	HostBase       uint32 // network byte order (deterministic==1)
 	HostCount      uint32
 	BlocksPerIP    uint16
-	HostPrefixLen  uint8    // IPv6 prefix length: 32 or 64 (deterministic==2)
+	HostPrefixLen  uint8 // IPv6 prefix length: 32 or 64 (deterministic==2)
 	Pad2           uint8
 	HostBaseV6     [4]uint32 // IPv6 subscriber base (deterministic==2)
 }
@@ -525,9 +525,9 @@ type SNATValueV6 struct {
 // FabricFwdInfo mirrors the C struct fabric_fwd_info for cluster
 // cross-chassis forwarding via the fabric link.
 type FabricFwdInfo struct {
-	Ifindex  uint32   // fabric interface ifindex, 0 = disabled
-	PeerMAC  [6]byte  // peer's fabric MAC
-	LocalMAC [6]byte  // our fabric MAC
+	Ifindex  uint32  // fabric interface ifindex, 0 = disabled
+	PeerMAC  [6]byte // peer's fabric MAC
+	LocalMAC [6]byte // our fabric MAC
 }
 
 // MirrorConfig mirrors the C struct mirror_config for port mirroring.
@@ -548,6 +548,8 @@ type ScreenConfig struct {
 	SynFloodTimeout   uint32
 	PortScanThresh    uint32
 	IPSweepThresh     uint32
+	SessionLimitSrc   uint32
+	SessionLimitDst   uint32
 }
 
 // FloodState mirrors the C struct flood_state.
@@ -562,40 +564,56 @@ type FloodState struct {
 
 // Screen flag constants -- must match C SCREEN_* defines.
 const (
-	ScreenSynFlood      = 1 << 0
-	ScreenICMPFlood     = 1 << 1
-	ScreenUDPFlood      = 1 << 2
-	ScreenPortScan      = 1 << 3
-	ScreenIPSweep       = 1 << 4
-	ScreenLandAttack    = 1 << 5
-	ScreenPingOfDeath   = 1 << 6
-	ScreenTearDrop      = 1 << 7
-	ScreenTCPSynFin     = 1 << 8
-	ScreenTCPNoFlag     = 1 << 9
-	ScreenTCPFinNoAck   = 1 << 10
-	ScreenWinNuke       = 1 << 11
-	ScreenIPSourceRoute = 1 << 12
-	ScreenSynFrag       = 1 << 13
-	ScreenSynCookie     = 1 << 14
+	ScreenSynFlood        = 1 << 0
+	ScreenICMPFlood       = 1 << 1
+	ScreenUDPFlood        = 1 << 2
+	ScreenPortScan        = 1 << 3
+	ScreenIPSweep         = 1 << 4
+	ScreenLandAttack      = 1 << 5
+	ScreenPingOfDeath     = 1 << 6
+	ScreenTearDrop        = 1 << 7
+	ScreenTCPSynFin       = 1 << 8
+	ScreenTCPNoFlag       = 1 << 9
+	ScreenTCPFinNoAck     = 1 << 10
+	ScreenWinNuke         = 1 << 11
+	ScreenIPSourceRoute   = 1 << 12
+	ScreenSynFrag         = 1 << 13
+	ScreenSynCookie       = 1 << 14
+	ScreenSessionLimitSrc = 1 << 15
+	ScreenSessionLimitDst = 1 << 16
 )
 
 // ScreenFlagNames maps screen flag values to human-readable names.
 var ScreenFlagNames = map[uint32]string{
-	ScreenSynFlood:      "SYN flood",
-	ScreenICMPFlood:     "ICMP flood",
-	ScreenUDPFlood:      "UDP flood",
-	ScreenPortScan:      "port scan",
-	ScreenIPSweep:       "IP sweep",
-	ScreenLandAttack:    "LAND attack",
-	ScreenPingOfDeath:   "ping of death",
-	ScreenTearDrop:      "tear drop",
-	ScreenTCPSynFin:     "TCP SYN+FIN",
-	ScreenTCPNoFlag:     "TCP no-flag",
-	ScreenTCPFinNoAck:   "TCP FIN-no-ACK",
-	ScreenWinNuke:       "WinNuke",
-	ScreenIPSourceRoute: "IP source-route",
-	ScreenSynFrag:       "SYN fragment",
-	ScreenSynCookie:     "SYN cookie",
+	ScreenSynFlood:        "SYN flood",
+	ScreenICMPFlood:       "ICMP flood",
+	ScreenUDPFlood:        "UDP flood",
+	ScreenPortScan:        "port scan",
+	ScreenIPSweep:         "IP sweep",
+	ScreenLandAttack:      "LAND attack",
+	ScreenPingOfDeath:     "ping of death",
+	ScreenTearDrop:        "tear drop",
+	ScreenTCPSynFin:       "TCP SYN+FIN",
+	ScreenTCPNoFlag:       "TCP no-flag",
+	ScreenTCPFinNoAck:     "TCP FIN-no-ACK",
+	ScreenWinNuke:         "WinNuke",
+	ScreenIPSourceRoute:   "IP source-route",
+	ScreenSynFrag:         "SYN fragment",
+	ScreenSynCookie:       "SYN cookie",
+	ScreenSessionLimitSrc: "session limit (source)",
+	ScreenSessionLimitDst: "session limit (destination)",
+}
+
+// SessionCountKey mirrors the C struct session_count_key.
+type SessionCountKey struct {
+	IP     uint32
+	ZoneID uint16
+	Pad    uint16
+}
+
+// SessionCountValue mirrors the C struct session_count_value.
+type SessionCountValue struct {
+	Count uint32
 }
 
 // Per-rule logging flags (matches C LOG_FLAG_* defines).
@@ -641,7 +659,7 @@ type IfaceZoneKey struct {
 // IfaceZoneValue mirrors the C struct iface_zone_value.
 type IfaceZoneValue struct {
 	ZoneID       uint16
-	Flags        uint8  // IFACE_FLAG_* bits
+	Flags        uint8 // IFACE_FLAG_* bits
 	Pad          uint8
 	RoutingTable uint32 // kernel table ID, 0 = main table
 }
@@ -709,9 +727,9 @@ type FilterRule struct {
 	DstAddr      [16]byte
 	DstMask      [16]byte
 	RoutingTable uint32
-	PolicerID    uint8  // policer index (0=none, 1-based)
-	FlexOffset   uint8  // flexible match: byte offset from L3 header start
-	FlexLength   uint8  // flexible match: match length in bytes (1,2,4)
+	PolicerID    uint8 // policer index (0=none, 1-based)
+	FlexOffset   uint8 // flexible match: byte offset from L3 header start
+	FlexLength   uint8 // flexible match: match length in bytes (1,2,4)
 	PadRule      byte
 	FlexValue    uint32 // flexible match: expected value (host byte order, masked)
 	FlexMask     uint32 // flexible match: mask to apply before comparison
@@ -719,30 +737,30 @@ type FilterRule struct {
 
 // PolicerConfig mirrors the C struct policer_config.
 type PolicerConfig struct {
-	RateBytesSec uint64  // CIR: token refill rate (bytes per second)
-	BurstBytes   uint64  // CBS: max committed bucket capacity (bytes)
-	Action       uint8   // POLICER_ACTION_DISCARD=0
-	ColorMode    uint8   // 0=single-rate, 1=two-rate, 2=single-rate-3c
+	RateBytesSec uint64 // CIR: token refill rate (bytes per second)
+	BurstBytes   uint64 // CBS: max committed bucket capacity (bytes)
+	Action       uint8  // POLICER_ACTION_DISCARD=0
+	ColorMode    uint8  // 0=single-rate, 1=two-rate, 2=single-rate-3c
 	Pad          [6]byte
-	PeakRate     uint64  // PIR: peak refill rate (two-rate only)
-	PeakBurst    uint64  // PBS/EBS: peak/excess burst size
+	PeakRate     uint64 // PIR: peak refill rate (two-rate only)
+	PeakBurst    uint64 // PBS/EBS: peak/excess burst size
 }
 
 // Filter match flag constants.
 const (
-	FilterMatchDSCP       = 1 << 0
-	FilterMatchProtocol   = 1 << 1
-	FilterMatchSrcAddr    = 1 << 2
-	FilterMatchDstAddr    = 1 << 3
-	FilterMatchDstPort    = 1 << 4
-	FilterMatchICMPType   = 1 << 5
-	FilterMatchICMPCode   = 1 << 6
-	FilterMatchSrcPort    = 1 << 7
-	FilterMatchSrcNegate  = 1 << 8 // negate source address match (prefix-list except)
-	FilterMatchDstNegate  = 1 << 9 // negate destination address match (prefix-list except)
-	FilterMatchTCPFlags   = 1 << 10 // match TCP flags bitmask
-	FilterMatchFragment   = 1 << 11 // match IP fragments
-	FilterMatchFlex       = 1 << 12 // flexible byte-offset match
+	FilterMatchDSCP      = 1 << 0
+	FilterMatchProtocol  = 1 << 1
+	FilterMatchSrcAddr   = 1 << 2
+	FilterMatchDstAddr   = 1 << 3
+	FilterMatchDstPort   = 1 << 4
+	FilterMatchICMPType  = 1 << 5
+	FilterMatchICMPCode  = 1 << 6
+	FilterMatchSrcPort   = 1 << 7
+	FilterMatchSrcNegate = 1 << 8  // negate source address match (prefix-list except)
+	FilterMatchDstNegate = 1 << 9  // negate destination address match (prefix-list except)
+	FilterMatchTCPFlags  = 1 << 10 // match TCP flags bitmask
+	FilterMatchFragment  = 1 << 11 // match IP fragments
+	FilterMatchFlex      = 1 << 12 // flexible byte-offset match
 )
 
 // Policer color mode constants.

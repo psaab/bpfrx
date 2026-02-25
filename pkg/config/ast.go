@@ -867,6 +867,10 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					// source-route-option, tear-drop -> leaf
 				}},
 				"udp": {children: nil},
+				"limit-session": {children: map[string]*schemaNode{
+					"source-ip-based":      {args: 1, children: nil},
+					"destination-ip-based": {args: 1, children: nil},
+				}},
 			}},
 		}},
 		"nat": {children: map[string]*schemaNode{
@@ -941,6 +945,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 			"natv6v4": {children: map[string]*schemaNode{
 				"no-v6-frag-header": {children: nil},
+			}},
+			"proxy-arp": {children: map[string]*schemaNode{
+				"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
+					"address": {args: 1, multi: true, children: nil},
+				}},
 			}},
 		}},
 		"address-book": {children: map[string]*schemaNode{
@@ -1274,6 +1283,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					}},
 					"bfd-liveness-detection": {children: map[string]*schemaNode{
 						"minimum-interval": {args: 1, children: nil},
+						"multiplier":       {args: 1, children: nil},
 					}},
 				}},
 				"area-type": {children: map[string]*schemaNode{
@@ -1342,6 +1352,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				}},
 				"bfd-liveness-detection": {children: map[string]*schemaNode{
 					"minimum-interval": {args: 1, children: nil},
+					"multiplier":       {args: 1, children: nil},
 				}},
 				"neighbor": {args: 1, children: map[string]*schemaNode{
 					"description":            {args: 1, children: nil},
@@ -1370,6 +1381,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					}},
 					"bfd-liveness-detection": {children: map[string]*schemaNode{
 						"minimum-interval": {args: 1, children: nil},
+						"multiplier":       {args: 1, children: nil},
 					}},
 				}},
 			}},
@@ -1393,6 +1405,10 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"metric":              {args: 1, children: nil},
 				"authentication-key":  {args: 1, children: nil},
 				"authentication-type": {args: 1, children: nil},
+				"bfd-liveness-detection": {children: map[string]*schemaNode{
+					"minimum-interval": {args: 1, children: nil},
+					"multiplier":       {args: 1, children: nil},
+				}},
 			}},
 			"authentication-key":  {args: 1, children: nil},
 			"authentication-type": {args: 1, children: nil},
@@ -1802,6 +1818,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 						}},
 						"bfd-liveness-detection": {children: map[string]*schemaNode{
 							"minimum-interval": {args: 1, children: nil},
+							"multiplier":       {args: 1, children: nil},
 						}},
 					}},
 					"area-type": {children: map[string]*schemaNode{
@@ -1848,6 +1865,10 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"metric":              {args: 1, children: nil},
 					"authentication-key":  {args: 1, children: nil},
 					"authentication-type": {args: 1, children: nil},
+					"bfd-liveness-detection": {children: map[string]*schemaNode{
+						"minimum-interval": {args: 1, children: nil},
+						"multiplier":       {args: 1, children: nil},
+					}},
 				}},
 				"authentication-key":  {args: 1, children: nil},
 				"authentication-type": {args: 1, children: nil},

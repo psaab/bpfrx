@@ -22,15 +22,15 @@ import (
 
 // CompileResult holds the result of a config compilation for reference.
 type CompileResult struct {
-	ZoneIDs     map[string]uint16  // zone name -> zone ID
-	ScreenIDs   map[string]uint16  // screen profile name -> profile ID (1-based)
-	AddrIDs     map[string]uint32  // address name -> address ID
-	AppIDs      map[string]uint32  // application name -> app ID
-	PoolIDs     map[string]uint8   // NAT pool name -> pool ID (0-based)
-	PolicyNames map[uint32]string  // rule_id -> "from-zone/to-zone/policy-name" (or "global/policy-name")
-	AppNames    map[uint16]string  // app_id -> application name (for structured logging)
-	PolicySets  int                // number of policy sets created
-	FilterIDs  map[string]uint32 // "inet:name" or "inet6:name" -> filter_id
+	ZoneIDs     map[string]uint16 // zone name -> zone ID
+	ScreenIDs   map[string]uint16 // screen profile name -> profile ID (1-based)
+	AddrIDs     map[string]uint32 // address name -> address ID
+	AppIDs      map[string]uint32 // application name -> app ID
+	PoolIDs     map[string]uint8  // NAT pool name -> pool ID (0-based)
+	PolicyNames map[uint32]string // rule_id -> "from-zone/to-zone/policy-name" (or "global/policy-name")
+	AppNames    map[uint16]string // app_id -> application name (for structured logging)
+	PolicySets  int               // number of policy sets created
+	FilterIDs   map[string]uint32 // "inet:name" or "inet6:name" -> filter_id
 
 	Lo0FilterV4 uint32 // lo0 inet filter ID (0=none), set by compileFirewallFilters
 	Lo0FilterV6 uint32 // lo0 inet6 filter ID (0=none), set by compileFirewallFilters
@@ -410,7 +410,7 @@ func reconcileInterfaceAddresses(ifaceName string, desired []string) {
 	}
 }
 
-func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error {
+func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear: write new entries first,
 	// then delete stale ones that are no longer in the config.
 	writtenIfaceZone := make(map[IfaceZoneKey]bool)
@@ -1080,7 +1080,7 @@ func compileZones(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 	return nil
 }
 
-func compileAddressBook(dp DataPlane,cfg *config.Config, result *CompileResult) error {
+func compileAddressBook(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Clear stale address book entries before repopulating.
 	if err := dp.ClearAddressBookV4(); err != nil {
 		return fmt.Errorf("clear address_book_v4: %w", err)
@@ -1172,7 +1172,7 @@ func compileAddressBook(dp DataPlane,cfg *config.Config, result *CompileResult) 
 	return nil
 }
 
-func compileApplications(dp DataPlane,cfg *config.Config, result *CompileResult) error {
+func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenApps := make(map[AppKey]bool)
 	result.AppNames = make(map[uint16]string)
@@ -1279,7 +1279,7 @@ func compileApplications(dp DataPlane,cfg *config.Config, result *CompileResult)
 // If the list has one entry, returns that entry's ID directly.
 // If the list has multiple entries, creates an implicit address-set containing
 // all referenced addresses and returns the set's ID.
-func resolveAddrList(dp DataPlane,names []string, result *CompileResult) (uint32, error) {
+func resolveAddrList(dp DataPlane, names []string, result *CompileResult) (uint32, error) {
 	if len(names) == 0 {
 		return 0, nil
 	}
@@ -1336,7 +1336,7 @@ func resolveAddrList(dp DataPlane,names []string, result *CompileResult) (uint32
 // If the CIDR already exists as an address-book entry, reuses that ID.
 // Otherwise, creates an implicit address-book entry with a synthetic name.
 // Returns 0 (any) if the CIDR is empty.
-func resolveSNATMatchAddr(dp DataPlane,cidr string, result *CompileResult) (uint32, error) {
+func resolveSNATMatchAddr(dp DataPlane, cidr string, result *CompileResult) (uint32, error) {
 	if cidr == "" {
 		return 0, nil
 	}
@@ -1371,7 +1371,7 @@ func resolveSNATMatchAddr(dp DataPlane,cidr string, result *CompileResult) (uint
 	return addrID, nil
 }
 
-func compilePolicies(dp DataPlane,cfg *config.Config, result *CompileResult) error {
+func compilePolicies(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenPolicySets := make(map[ZonePairKey]bool)
 	result.PolicyNames = make(map[uint32]string)
@@ -1391,8 +1391,8 @@ func compilePolicies(dp DataPlane,cfg *config.Config, result *CompileResult) err
 		// Expand rules: each config rule with N applications becomes N BPF rules.
 		// Collect expanded rules first to know the total count.
 		type expandedRule struct {
-			pol    *config.Policy
-			appID  uint32
+			pol   *config.Policy
+			appID uint32
 		}
 		var expanded []expandedRule
 
@@ -1481,14 +1481,14 @@ func compilePolicies(dp DataPlane,cfg *config.Config, result *CompileResult) err
 			}
 
 			// Source address (supports multiple via implicit address-set)
-			srcID, err := resolveAddrList(dp,pol.Match.SourceAddresses, result)
+			srcID, err := resolveAddrList(dp, pol.Match.SourceAddresses, result)
 			if err != nil {
 				return fmt.Errorf("policy %s source address: %w", pol.Name, err)
 			}
 			rule.SrcAddrID = srcID
 
 			// Destination address (supports multiple via implicit address-set)
-			dstID, err := resolveAddrList(dp,pol.Match.DestinationAddresses, result)
+			dstID, err := resolveAddrList(dp, pol.Match.DestinationAddresses, result)
 			if err != nil {
 				return fmt.Errorf("policy %s destination address: %w", pol.Name, err)
 			}
@@ -1599,13 +1599,13 @@ func compilePolicies(dp DataPlane,cfg *config.Config, result *CompileResult) err
 				}
 			}
 
-			srcID, err := resolveAddrList(dp,pol.Match.SourceAddresses, result)
+			srcID, err := resolveAddrList(dp, pol.Match.SourceAddresses, result)
 			if err != nil {
 				return fmt.Errorf("global policy %s source address: %w", pol.Name, err)
 			}
 			rule.SrcAddrID = srcID
 
-			dstID, err := resolveAddrList(dp,pol.Match.DestinationAddresses, result)
+			dstID, err := resolveAddrList(dp, pol.Match.DestinationAddresses, result)
 			if err != nil {
 				return fmt.Errorf("global policy %s destination address: %w", pol.Name, err)
 			}
@@ -1632,7 +1632,7 @@ func compilePolicies(dp DataPlane,cfg *config.Config, result *CompileResult) err
 	return nil
 }
 
-func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
+func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenSNAT := make(map[SNATKey]bool)
 	writtenSNATv6 := make(map[SNATKey]bool)
@@ -1971,56 +1971,56 @@ func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 							rs.Name, rule.Name, dstAddr, err)
 					}
 
-				// Write SNAT rule (v4)
-				if len(v4IPs) > 0 {
-					val := SNATValue{
-						Mode:      curPoolID,
-						SrcAddrID: srcAddrID,
-						DstAddrID: dstAddrID,
-						CounterID: counterID,
+					// Write SNAT rule (v4)
+					if len(v4IPs) > 0 {
+						val := SNATValue{
+							Mode:      curPoolID,
+							SrcAddrID: srcAddrID,
+							DstAddrID: dstAddrID,
+							CounterID: counterID,
+						}
+						ri := v4RuleIdx[zp]
+						if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
+							return fmt.Errorf("set snat rule %s/%s: %w",
+								rs.Name, rule.Name, err)
+						}
+						writtenSNAT[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
+						v4RuleIdx[zp] = ri + 1
+						slog.Info("source NAT rule compiled",
+							"rule-set", rs.Name, "rule", rule.Name,
+							"from", rs.FromZone, "to", rs.ToZone,
+							"pool_id", curPoolID, "rule_idx", ri,
+							"counter_id", counterID,
+							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+							"src_addr", srcAddr, "dst_addr", dstAddr,
+							"v4_ips", len(v4IPs),
+							"ports", fmt.Sprintf("%d-%d", poolCfg.PortLow, poolCfg.PortHigh))
 					}
-					ri := v4RuleIdx[zp]
-					if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
-						return fmt.Errorf("set snat rule %s/%s: %w",
-							rs.Name, rule.Name, err)
-					}
-					writtenSNAT[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
-					v4RuleIdx[zp] = ri + 1
-					slog.Info("source NAT rule compiled",
-						"rule-set", rs.Name, "rule", rule.Name,
-						"from", rs.FromZone, "to", rs.ToZone,
-						"pool_id", curPoolID, "rule_idx", ri,
-						"counter_id", counterID,
-						"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-						"src_addr", srcAddr, "dst_addr", dstAddr,
-						"v4_ips", len(v4IPs),
-						"ports", fmt.Sprintf("%d-%d", poolCfg.PortLow, poolCfg.PortHigh))
-				}
 
-				// Write SNAT rule (v6)
-				if len(v6IPs) > 0 {
-					val := SNATValueV6{
-						Mode:      curPoolID,
-						SrcAddrID: srcAddrID,
-						DstAddrID: dstAddrID,
-						CounterID: counterID,
+					// Write SNAT rule (v6)
+					if len(v6IPs) > 0 {
+						val := SNATValueV6{
+							Mode:      curPoolID,
+							SrcAddrID: srcAddrID,
+							DstAddrID: dstAddrID,
+							CounterID: counterID,
+						}
+						ri := v6RuleIdx[zp]
+						if err := dp.SetSNATRuleV6(fromZone, toZone, ri, val); err != nil {
+							return fmt.Errorf("set snat_v6 rule %s/%s: %w",
+								rs.Name, rule.Name, err)
+						}
+						writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
+						v6RuleIdx[zp] = ri + 1
+						slog.Info("source NAT v6 rule compiled",
+							"rule-set", rs.Name, "rule", rule.Name,
+							"from", rs.FromZone, "to", rs.ToZone,
+							"pool_id", curPoolID, "rule_idx", ri,
+							"counter_id", counterID,
+							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+							"src_addr", srcAddr, "dst_addr", dstAddr,
+							"v6_ips", len(v6IPs))
 					}
-					ri := v6RuleIdx[zp]
-					if err := dp.SetSNATRuleV6(fromZone, toZone, ri, val); err != nil {
-						return fmt.Errorf("set snat_v6 rule %s/%s: %w",
-							rs.Name, rule.Name, err)
-					}
-					writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
-					v6RuleIdx[zp] = ri + 1
-					slog.Info("source NAT v6 rule compiled",
-						"rule-set", rs.Name, "rule", rule.Name,
-						"from", rs.FromZone, "to", rs.ToZone,
-						"pool_id", curPoolID, "rule_idx", ri,
-						"counter_id", counterID,
-						"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-						"src_addr", srcAddr, "dst_addr", dstAddr,
-						"v6_ips", len(v6IPs))
-				}
 				} // end dstAddr loop
 			} // end srcAddr loop
 		}
@@ -2207,7 +2207,7 @@ func compileNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
 	return nil
 }
 
-func compileStaticNAT(dp DataPlane,cfg *config.Config, result *CompileResult) error {
+func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenV4 := make(map[StaticNATKeyV4]bool)
 	writtenV6 := make(map[StaticNATKeyV6]bool)
@@ -2386,7 +2386,7 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 			}
 
 			// Prefix byte count: 6 for /48, 8 for /64
-			prefixBytes := extOnes / 8 // 6 or 8
+			prefixBytes := extOnes / 8         // 6 or 8
 			prefixWords := uint8(extOnes / 16) // 3 or 4
 
 			// Extract prefix bytes and compute adjustment
@@ -2431,7 +2431,7 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 	return nil
 }
 
-func compileNAT64(dp DataPlane,cfg *config.Config, result *CompileResult) error {
+func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Track written prefixes for populate-before-clear.
 	writtenPrefixes := make(map[NAT64PrefixKey]bool)
 
@@ -2507,7 +2507,7 @@ func compileNAT64(dp DataPlane,cfg *config.Config, result *CompileResult) error 
 	return nil
 }
 
-func compileScreenProfiles(dp DataPlane,cfg *config.Config, result *CompileResult) error {
+func compileScreenProfiles(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	var maxScreenID uint32
 	for name, profile := range cfg.Security.Screen {
 		sid, ok := result.ScreenIDs[name]
@@ -2591,6 +2591,16 @@ func compileScreenProfiles(dp DataPlane,cfg *config.Config, result *CompileResul
 			sc.IPSweepThresh = uint32(profile.IP.IPSweepThreshold)
 		}
 
+		// Per-IP session limiting
+		if profile.LimitSession.SourceIPBased > 0 {
+			flags |= ScreenSessionLimitSrc
+			sc.SessionLimitSrc = uint32(profile.LimitSession.SourceIPBased)
+		}
+		if profile.LimitSession.DestinationIPBased > 0 {
+			flags |= ScreenSessionLimitDst
+			sc.SessionLimitDst = uint32(profile.LimitSession.DestinationIPBased)
+		}
+
 		sc.Flags = flags
 
 		if err := dp.SetScreenConfig(uint32(sid), sc); err != nil {
@@ -2614,7 +2624,7 @@ func compileScreenProfiles(dp DataPlane,cfg *config.Config, result *CompileResul
 	return nil
 }
 
-func compileDefaultPolicy(dp DataPlane,cfg *config.Config) error {
+func compileDefaultPolicy(dp DataPlane, cfg *config.Config) error {
 	action := uint8(ActionDeny) // default deny
 	if cfg.Security.DefaultPolicy == config.PolicyPermit {
 		action = ActionPermit
@@ -2630,7 +2640,7 @@ func compileDefaultPolicy(dp DataPlane,cfg *config.Config) error {
 	return nil
 }
 
-func compileFlowTimeouts(dp DataPlane,cfg *config.Config) error {
+func compileFlowTimeouts(dp DataPlane, cfg *config.Config) error {
 	flow := &cfg.Security.Flow
 
 	// Write all timeout slots; 0 means "use BPF default".
@@ -2671,7 +2681,7 @@ func compileFlowTimeouts(dp DataPlane,cfg *config.Config) error {
 func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	flow := &cfg.Security.Flow
 	fc := FlowConfigValue{
-		TCPMSSIPsec: uint16(flow.TCPMSSIPsecVPN),
+		TCPMSSIPsec:  uint16(flow.TCPMSSIPsecVPN),
 		TCPMSSGreIn:  uint16(flow.TCPMSSGreIn),
 		TCPMSSGreOut: uint16(flow.TCPMSSGreOut),
 	}
@@ -2949,7 +2959,7 @@ func parsePortRange(spec string) (uint16, uint16, error) {
 
 // compileFirewallFilters compiles firewall filter config into BPF maps.
 // It creates filter_rules, filter_configs, iface_filter_map, and policer_configs entries.
-func compileFirewallFilters(dp DataPlane,cfg *config.Config, result *CompileResult) error {
+func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenIfaceFilter := make(map[IfaceFilterKey]bool)
 
