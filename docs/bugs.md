@@ -2,6 +2,12 @@
 
 ## Critical Bugs
 
+### Manual failover leaves both nodes secondary (`6d63020`)
+- **Symptom:** `request chassis cluster failover redundancy-group 1 node 1` causes both nodes to show RG1 as "secondary" — peer never becomes primary
+- **Root cause:** `ManualFailover()` set `ManualFailover=true` and `State=Secondary` but left `Weight=255`. Heartbeat still advertised full weight. Peer's election saw `peerEff=200 > localEff=100` and stayed secondary. The `ManualFailover` flag is local-only (not sent in heartbeat) — peer relies entirely on weight to detect failover
+- **Fix:** Set `rg.Weight = 0` in `ManualFailover()` so peer sees "Peer weight 0" → `electLocalPrimary`. `ResetFailover()` calls `recalcWeight()` to restore weight from monitor state + re-run election
+- **Note:** `ForceSecondary()` (ISSU) already did `rg.Weight = 0` correctly — `ManualFailover()` was the only path missing it
+
 ### BulkSync nil pointer panic after SO_REUSEPORT fix (`e3ceebe`)
 - **Symptom:** `panic: runtime error: invalid memory address or nil pointer dereference` in `BulkSync()` at `sync.go:402` — 3 crash-loops on fw0 after cluster deploy
 - **Root cause:** `NewSessionSync()` created with `dp=nil`; `SetDataPlane()` called later during daemon startup. Previously masked by 60s socket bind retry delay (old sockets blocked rebind). After adding `SO_REUSEPORT`, sockets bind immediately → peer connects before dp is wired → `BulkSync()` calls `s.dp.IterateSessions()` on nil dp

@@ -530,6 +530,46 @@ printf 'show security flow session\nexit\n' | incus exec bpfrx-fw1 -- cli
 - Session appears on both fw0 and fw1
 - Session on fw1 matches fw0 (IPs, ports, NAT state)
 
+### TC-6b: Manual Failover / Reset (`6d63020`)
+
+**Objective:** Verify per-RG manual failover and reset, with connectivity maintained.
+
+```bash
+# 1. Baseline: verify node0 primary for all RGs
+echo 'show chassis cluster' | incus exec bpfrx-fw0 -- cli
+
+# 2. Manual failover RG1 to node1
+echo 'request chassis cluster failover redundancy-group 1 node 1' | \
+  incus exec bpfrx-fw0 -- cli
+sleep 2
+
+# 3. Verify RG1: node0=secondary(Manual=yes), node1=primary
+echo 'show chassis cluster' | incus exec bpfrx-fw0 -- cli
+echo 'show chassis cluster' | incus exec bpfrx-fw1 -- cli
+
+# 4. LAN VIP connectivity during failover
+incus exec cluster-lan-host -- ping -c 3 10.0.60.1
+incus exec cluster-lan-host -- ping -6 -c 3 2001:559:8585:cf01::1
+
+# 5. Reset failover — node0 preempts back
+echo 'request chassis cluster failover reset redundancy-group 1' | \
+  incus exec bpfrx-fw0 -- cli
+sleep 2
+
+# 6. Verify RG1: node0=primary, Manual=no, weight restored to 255
+echo 'show chassis cluster' | incus exec bpfrx-fw0 -- cli
+
+# 7. LAN VIP connectivity after reset
+incus exec cluster-lan-host -- ping -c 3 10.0.60.1
+incus exec cluster-lan-host -- ping -6 -c 3 2001:559:8585:cf01::1
+```
+
+**Pass criteria:**
+- After failover: RG1 node1=primary, node0=secondary with Manual=yes
+- After reset: RG1 node0=primary, Manual=no
+- LAN VIP IPv4 + IPv6: 0% packet loss through both transitions
+- Other RGs (0, 2) unaffected throughout
+
 ### TC-7: RETH Interface Monitor Failover
 
 **Objective:** Verify failover when a monitored RETH member loses link.

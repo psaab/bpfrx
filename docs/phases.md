@@ -1800,6 +1800,30 @@ Reduced VRRP failover from ~800ms to ~60ms by cutting the RETH advertisement int
 | `pkg/vrrp/vrrp_test.go` | Updated expected interval, configurable interval tests |
 | `pkg/config/parser_test.go` | reth-advertise-interval parsing tests |
 
+## Bug Fix: Manual Failover Weight (`6d63020`)
+
+### Problem
+`request chassis cluster failover redundancy-group 1 node 1` caused both nodes to show RG1 as "secondary" — the peer never became primary.
+
+### Root Cause
+`ManualFailover()` set `ManualFailover=true` and `State=Secondary` but left `Weight=255`. The heartbeat still advertised full weight, so the peer's election logic saw `peerEff=200*255/255=200 > localEff=100*255/255=100` and stayed secondary. The election code at `electRG()` line 32 skips RGs with `ManualFailover=true` on the local node, but the peer has no knowledge of the ManualFailover flag — it only sees weight and priority in the heartbeat.
+
+### Fix
+1. `ManualFailover()`: set `rg.Weight = 0` — peer sees "Peer weight 0" → `electLocalPrimary` (election.go:72-78)
+2. `ResetFailover()`: call `recalcWeight(rg)` instead of directly running election — restores weight from current interface monitor state (255 minus any monitor penalties) and re-runs election
+
+### Files
+| File | Change |
+|------|--------|
+| `pkg/cluster/cluster.go` | `rg.Weight = 0` in `ManualFailover()`, `recalcWeight()` in `ResetFailover()` |
+| `pkg/cluster/cluster_test.go` | Weight=0 assertion in `TestManualFailover`, Weight=255 in `TestResetFailover` |
+
+### Verified
+- Manual failover: node1 correctly becomes primary for RG1
+- Reset failover: node0 preempts back to primary
+- LAN VIP IPv4/IPv6 connectivity 0% loss through failover→reset cycle
+- Daemon stop/start failover + failback: 0% loss on LAN VIP
+
 ## Sprint HA-REBOOT: Reboot Resilience (`f8353de`, `a4eb2b2`)
 
 ### Overview

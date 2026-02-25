@@ -463,6 +463,39 @@ printf 'configure\ndelete routing-options static route 10.77.77.0/24\ndelete rou
   sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
 ```
 
+### Manual Failover / Reset Test (`6d63020`)
+Verify per-RG manual failover and reset work correctly with connectivity.
+```bash
+# Baseline: all RGs on node0
+echo 'show chassis cluster' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli'
+# Expected: all RGs node0=primary, node1=secondary
+
+# Manual failover RG1 → node1
+echo 'request chassis cluster failover redundancy-group 1 node 1' | \
+  sg incus-admin -c 'incus exec bpfrx-fw0 -- cli'
+sleep 2
+
+# Verify: RG1 node0=secondary(Manual=yes), node1=primary
+echo 'show chassis cluster' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli'
+echo 'show chassis cluster' | sg incus-admin -c 'incus exec bpfrx-fw1 -- cli'
+
+# LAN VIP connectivity must survive failover (0% loss)
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -6 -c 3 2001:559:8585:cf01::1'
+
+# Reset failover — node0 preempts back
+echo 'request chassis cluster failover reset redundancy-group 1' | \
+  sg incus-admin -c 'incus exec bpfrx-fw0 -- cli'
+sleep 2
+
+# Verify: RG1 node0=primary, node1=secondary, Manual=no
+echo 'show chassis cluster' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli'
+
+# LAN VIP connectivity after reset (0% loss)
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -6 -c 3 2001:559:8585:cf01::1'
+```
+
 ### LAN RETH Connectivity Test
 ```bash
 # From cluster-lan-host, ping LAN RETH VIP
@@ -490,10 +523,24 @@ sg incus-admin -c 'incus exec cluster-lan-host -- ping -6 -c 3 2001:559:8585:cf0
 # 5. Failover + recovery
 sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
 sleep 1  # 30ms VRRP → ~97ms failover (planned stop near-instant via priority-0)
-ping -c 3 172.16.50.6  # should reach fw1
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'  # should reach fw1
 sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
-sleep 3  # daemon startup + BPF load + sync hold
-ping -c 3 172.16.50.6  # should reach fw0 again
+sleep 5  # daemon startup + BPF load + sync hold
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'  # should reach fw0 again
+
+# 6. Manual failover + reset
+echo 'request chassis cluster failover redundancy-group 1 node 1' | \
+  sg incus-admin -c 'incus exec bpfrx-fw0 -- cli'
+sleep 2
+echo 'show chassis cluster' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli'
+# RG1: node0=secondary(Manual=yes), node1=primary
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -6 -c 3 2001:559:8585:cf01::1'
+echo 'request chassis cluster failover reset redundancy-group 1' | \
+  sg incus-admin -c 'incus exec bpfrx-fw0 -- cli'
+sleep 2
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -6 -c 3 2001:559:8585:cf01::1'
 ```
 
 ### Cluster Reboot Tests (`f8353de`, `a4eb2b2`)

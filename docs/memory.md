@@ -69,6 +69,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **State enum:** StateSecondary (0), StatePrimary (1), StateSecondaryHold (2), StateLost (3), StateDisabled (4)
 - **Weight scoring:** Initial 255, subtract per monitor; weight=0 → secondary; "ip:" prefix for IP monitors
 - **Event channel:** ClusterEvent → GARP on primary; manual failover/reset supported
+- **Manual failover (`6d63020`):** `ManualFailover()` MUST set `rg.Weight=0` so peer election sees "Peer weight 0" → becomes primary. `ResetFailover()` calls `recalcWeight()` to restore weight from monitor state
 - **Config:** ClusterConfig.{ClusterID, NodeID, HeartbeatInterval, HeartbeatThreshold, ControlInterface, PeerAddress, FabricInterface, FabricPeerAddress, ConfigSync, NATStateSync, IPsecSASync}
 - **Daemon:** Manager.Start(ctx)/Stop() lifecycle, RETH IP registration in applyConfig, auto-StartHeartbeat when PeerAddress configured
 - **Two-VM test env:** `test/incus/cluster-setup.sh` (bpfrx-fw0 + bpfrx-fw1 + cluster-lan-host)
