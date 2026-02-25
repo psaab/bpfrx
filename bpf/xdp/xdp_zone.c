@@ -22,7 +22,7 @@ static __always_inline int
 zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		  struct session_value *sess, __u8 direction)
 {
-	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+	__u64 now = meta->ktime_ns / 1000000000ULL;
 	sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {
@@ -107,7 +107,7 @@ static __always_inline int
 zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		  struct session_value_v6 *sess, __u8 direction)
 {
-	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+	__u64 now = meta->ktime_ns / 1000000000ULL;
 	sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {

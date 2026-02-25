@@ -39,6 +39,7 @@ int xdp_cpumap_prog(struct xdp_md *ctx)
 	meta->ingress_ifindex = ctx->ingress_ifindex;
 	meta->ingress_vlan_id = vlan_id;
 	meta->dscp_rewrite = 0xFF; /* no DSCP rewrite by default */
+	meta->ktime_ns = bpf_ktime_get_ns();
 
 	/* Strip VLAN tag if present so pipeline sees plain Ethernet */
 	if (vlan_id != 0) {

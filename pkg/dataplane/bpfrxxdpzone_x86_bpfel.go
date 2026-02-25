@@ -322,6 +322,7 @@ type bpfrxXdpZonePktMeta struct {
 	AppTimeout    uint32
 	MirrorIfindex uint32
 	MirrorRate    uint32
+	KtimeNs       uint64
 }
 
 type bpfrxXdpZonePolicerConfig struct {

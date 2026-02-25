@@ -23,7 +23,7 @@ static __always_inline int
 handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		 struct session_value *sess, __u8 direction)
 {
-	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+	__u64 now = meta->ktime_ns / 1000000000ULL;
 	sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {
@@ -132,7 +132,7 @@ static __always_inline int
 handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		 struct session_value_v6 *sess, __u8 direction)
 {
-	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+	__u64 now = meta->ktime_ns / 1000000000ULL;
 	sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {
@@ -371,7 +371,7 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 		return -1;  /* No matching session */
 
 	/* Touch the session so GC doesn't expire it while errors flow */
-	sess->last_seen = bpf_ktime_get_ns() / 1000000000ULL;
+	sess->last_seen = meta->ktime_ns / 1000000000ULL;
 
 	/* FIB lookup to route toward the original client */
 	struct bpf_fib_lookup fib = {};
@@ -577,7 +577,7 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 		return -1;  /* No matching session */
 
 	/* Touch the session so GC doesn't expire it while errors flow */
-	sess->last_seen = bpf_ktime_get_ns() / 1000000000ULL;
+	sess->last_seen = meta->ktime_ns / 1000000000ULL;
 
 	/* FIB lookup to route toward the original client */
 	struct bpf_fib_lookup fib = {};

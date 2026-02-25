@@ -39,7 +39,7 @@ check_flood_egress(struct pkt_meta *meta, struct screen_config *sc)
 	if (!fs)
 		return 0;
 
-	__u64 now_sec = bpf_ktime_get_ns() / 1000000000ULL;
+	__u64 now_sec = meta->ktime_ns / 1000000000ULL;
 
 	/* Reset window if a new second started */
 	if (now_sec != fs->window_start) {

@@ -435,6 +435,9 @@ struct pkt_meta {
 	/* Port mirroring (set by xdp_forward for TC egress to clone) */
 	__u32 mirror_ifindex;  /* 0 = no mirroring */
 	__u32 mirror_rate;     /* 1-in-N rate (0 = mirror all) */
+
+	/* Cached bpf_ktime_get_ns() — set once in main, reused across stages */
+	__u64 ktime_ns;
 };
 
 /* ============================================================

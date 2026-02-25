@@ -83,7 +83,7 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	       __u8 nat_flags, __be32 nat_src_ip, __be16 nat_src_port,
 	       __be32 nat_dst_ip, __be16 nat_dst_port, __u16 app_id)
 {
-	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+	__u64 now = meta->ktime_ns / 1000000000ULL;
 
 	struct session_key fwd_key = {};
 	fwd_key.src_ip   = meta->src_ip.v4;
@@ -189,7 +189,7 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 		  __u8 nat_flags, const __u8 *nat_src_ip, __be16 nat_src_port,
 		  const __u8 *nat_dst_ip, __be16 nat_dst_port, __u16 app_id)
 {
-	__u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+	__u64 now = meta->ktime_ns / 1000000000ULL;
 
 	struct session_key_v6 fwd_key = {};
 	__builtin_memcpy(fwd_key.src_ip, meta->src_ip.v6, 16);

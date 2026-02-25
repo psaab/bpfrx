@@ -975,7 +975,7 @@ host_inbound_flag(struct pkt_meta *meta)
  * Uses per-CPU state for lock-free operation.
  * ============================================================ */
 static __always_inline int
-evaluate_policer(__u32 policer_id, __u32 pkt_len)
+evaluate_policer(__u32 policer_id, __u32 pkt_len, __u64 ktime_ns)
 {
 	struct policer_config *cfg =
 		bpf_map_lookup_elem(&policer_configs, &policer_id);
@@ -987,7 +987,7 @@ evaluate_policer(__u32 policer_id, __u32 pkt_len)
 	if (!state)
 		return 0;
 
-	__u64 now = bpf_ktime_get_ns();
+	__u64 now = ktime_ns;
 	__u64 elapsed = now - state->last_refill_ns;
 
 	/* Refill committed tokens: elapsed_ns * rate_bytes_sec / 1e9 */
@@ -1252,7 +1252,7 @@ evaluate_firewall_filter(struct pkt_meta *meta)
 		 * If exceeded, apply policer action (discard). */
 		if (rule->policer_id) {
 			__u32 pid = rule->policer_id;
-			if (evaluate_policer(pid, meta->pkt_len))
+			if (evaluate_policer(pid, meta->pkt_len, meta->ktime_ns))
 				return -1; /* policer exceeded → discard */
 		}
 
@@ -1443,7 +1443,7 @@ evaluate_firewall_filter_output(struct pkt_meta *meta, __u32 egress_ifindex)
 		/* Policer: if rule has a policer, evaluate token bucket. */
 		if (rule->policer_id) {
 			__u32 pid = rule->policer_id;
-			if (evaluate_policer(pid, meta->pkt_len))
+			if (evaluate_policer(pid, meta->pkt_len, meta->ktime_ns))
 				return -1; /* policer exceeded → discard */
 		}
 
@@ -1618,7 +1618,7 @@ evaluate_filter_by_id(__u32 fid, struct pkt_meta *meta)
 
 		if (rule->policer_id) {
 			__u32 pid = rule->policer_id;
-			if (evaluate_policer(pid, meta->pkt_len))
+			if (evaluate_policer(pid, meta->pkt_len, meta->ktime_ns))
 				return -1;
 		}
 
