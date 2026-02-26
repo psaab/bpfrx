@@ -431,6 +431,20 @@ int xdp_zone_prog(struct xdp_md *ctx)
 			sv4 = bpf_map_lookup_elem(&sessions, &rk);
 			if (sv4) ct_direction = 1;
 		}
+		/* Active/active per-RG: check egress RG BEFORE FIB gen.
+		 * When a VIP moves to the peer, routes are removed and
+		 * bpf_fib_lookup will fail.  The session's cached egress
+		 * interface tells us which RG the traffic belongs to —
+		 * if that RG is inactive, redirect to fabric immediately
+		 * without needing a (doomed) FIB lookup. */
+		if (sv4 && sv4->fib_ifindex != 0 &&
+		    !check_egress_rg_active(sv4->fib_ifindex,
+					    sv4->fib_vlan_id)) {
+			int fab_rc = try_fabric_redirect(ctx, meta);
+			if (fab_rc >= 0)
+				return fab_rc;
+			/* Anti-loop or no fabric — fall through */
+		}
 		if (sv4 && sv4->fib_ifindex != 0 &&
 		    sv4->fib_gen == (__u16)fib_gen) {
 			meta->fwd_ifindex    = sv4->fib_ifindex;
@@ -438,7 +452,8 @@ int xdp_zone_prog(struct xdp_md *ctx)
 			__builtin_memcpy(meta->fwd_dmac, sv4->fib_dmac, 6);
 			__builtin_memcpy(meta->fwd_smac, sv4->fib_smac, 6);
 			meta->egress_zone    = sv4->egress_zone;
-			return zone_ct_update_v4(ctx, meta, sv4, ct_direction);
+			return zone_ct_update_v4(ctx, meta, sv4,
+						 ct_direction);
 		}
 	} else if (!is_tcp_syn) {
 		struct session_key_v6 sk6 = {};
@@ -456,13 +471,21 @@ int xdp_zone_prog(struct xdp_md *ctx)
 			if (sv6) ct_direction = 1;
 		}
 		if (sv6 && sv6->fib_ifindex != 0 &&
+		    !check_egress_rg_active(sv6->fib_ifindex,
+					    sv6->fib_vlan_id)) {
+			int fab_rc = try_fabric_redirect(ctx, meta);
+			if (fab_rc >= 0)
+				return fab_rc;
+		}
+		if (sv6 && sv6->fib_ifindex != 0 &&
 		    sv6->fib_gen == (__u16)fib_gen) {
 			meta->fwd_ifindex    = sv6->fib_ifindex;
 			meta->egress_vlan_id = sv6->fib_vlan_id;
 			__builtin_memcpy(meta->fwd_dmac, sv6->fib_dmac, 6);
 			__builtin_memcpy(meta->fwd_smac, sv6->fib_smac, 6);
 			meta->egress_zone    = sv6->egress_zone;
-			return zone_ct_update_v6(ctx, meta, sv6, ct_direction);
+			return zone_ct_update_v6(ctx, meta, sv6,
+						 ct_direction);
 		}
 	}
 
@@ -517,6 +540,72 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		if (ezv)
 			meta->egress_zone = ezv->zone_id;
 
+		/* Active/active per-RG check: if the egress interface's
+		 * RG is not locally active AND we have an existing session,
+		 * redirect to fabric peer.  New connections (no session)
+		 * proceed normally — the physical interface is still UP
+		 * so they can egress directly; the peer handles the
+		 * return path via synced sessions + fabric redirect. */
+		if (ezv && ezv->rg_id > 0) {
+			__u32 rg_key = ezv->rg_id;
+			__u8 *active = bpf_map_lookup_elem(&rg_active, &rg_key);
+			if (!active || !*active) {
+				/* Use volatile bool — NEVER let compiler
+				 * merge pointer NULL checks into |= on
+				 * pointer regs (verifier rejects). */
+				volatile int has_session = 0;
+				if (sv4 != NULL)
+					has_session = 1;
+				if (sv6 != NULL)
+					has_session = 1;
+				if (has_session) {
+					int fab_rc =
+						try_fabric_redirect(ctx, meta);
+					if (fab_rc >= 0)
+						return fab_rc;
+					/* Anti-loop or fabric down —
+					 * fall through to kernel route. */
+					meta->meta_flags |=
+						META_FLAG_KERNEL_ROUTE;
+					bpf_tail_call(ctx, &xdp_progs,
+						      XDP_PROG_CONNTRACK);
+					return XDP_PASS;
+				}
+				/* New connection: proceed through
+				 * pipeline normally (create session,
+				 * policy check, NAT, forward). */
+			}
+		}
+
+		/*
+		 * Hairpin detection for active/active per-RG:
+		 * If FIB routes an existing session back out the same
+		 * interface it arrived on (e.g. return traffic on WAN
+		 * routed back to WAN via default route because the LAN
+		 * connected route is missing), try fabric redirect.
+		 * The peer has the correct connected route.
+		 *
+		 * Only check for existing sessions — new connections
+		 * don't have this routing mismatch issue.
+		 * Skip if packet arrived on fabric (anti-loop covered
+		 * by try_fabric_redirect, but avoid the overhead).
+		 */
+		if (meta->fwd_ifindex == meta->ingress_ifindex &&
+		    meta->egress_vlan_id == meta->ingress_vlan_id) {
+			if (sv4 != NULL) {
+				int fab_rc =
+					try_fabric_redirect(ctx, meta);
+				if (fab_rc >= 0)
+					return fab_rc;
+			}
+			if (sv6 != NULL) {
+				int fab_rc =
+					try_fabric_redirect(ctx, meta);
+				if (fab_rc >= 0)
+					return fab_rc;
+			}
+		}
+
 		/* Populate FIB cache + conntrack fast-path using session
 		 * pointer from FIB cache check above (avoids duplicate
 		 * session lookup in xdp_conntrack). */
@@ -541,33 +630,28 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		/*
 		 * Route exists but no ARP/NDP entry for the next hop.
 		 *
-		 * For EXISTING sessions in cluster mode, try fabric
-		 * cross-chassis redirect first — send the ORIGINAL
-		 * (pre-NAT) packet to the peer which has the working
-		 * route.  Falls back to kernel-route if fabric is
-		 * unavailable.
+		 * Active/active per-RG: try fabric redirect first for
+		 * all packets — peer may have ARP/NDP.  Anti-loop
+		 * prevents forwarding loops.
 		 *
-		 * For EXISTING sessions without fabric, route through
-		 * conntrack for NAT reversal, then let the kernel
-		 * forward the post-NAT packet.
+		 * For existing sessions, fall back to conntrack +
+		 * kernel routing if fabric is unavailable.
 		 *
-		 * For NEW connections (no session), XDP_PASS the original
-		 * un-NAT'd packet so the kernel resolves ARP/NDP and the
-		 * TCP SYN retransmit goes through the full pipeline.
+		 * For new connections, XDP_PASS so the kernel resolves
+		 * ARP/NDP and the retransmit goes through the pipeline.
 		 */
-		if (sv4 != NULL) {
+		{
 			int fab_rc = try_fabric_redirect(ctx, meta);
 			if (fab_rc >= 0)
 				return fab_rc;
+		}
+		if (sv4 != NULL) {
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
 		if (sv6 != NULL) {
-			int fab_rc = try_fabric_redirect(ctx, meta);
-			if (fab_rc >= 0)
-				return fab_rc;
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
@@ -583,28 +667,33 @@ int xdp_zone_prog(struct xdp_md *ctx)
 
 	} else {
 		/*
-		 * No route or packet is destined locally.
+		 * FIB lookup failed with a non-SUCCESS, non-NO_NEIGH code.
 		 *
-		 * Existing session with failed FIB: try fabric cross-chassis
-		 * redirect first (cluster failback), then fall back to
-		 * conntrack + kernel routing.
+		 * NOT_FWDED (rc=4) means packet is locally destined
+		 * (heartbeat, control plane) — must XDP_PASS for local
+		 * delivery, never fabric-redirect.
 		 *
-		 * META_FLAG_KERNEL_ROUTE tells xdp_forward to skip
-		 * host-inbound filtering and XDP_PASS for kernel routing.
+		 * UNREACHABLE/BLACKHOLE/PROHIBIT mean no route exists.
+		 * Active/active per-RG: the local node may lack routes
+		 * because its WAN/LAN VIP was moved to the peer.
+		 * Try fabric cross-chassis redirect for these cases.
+		 * Anti-loop: try_fabric_redirect() returns -1 if the
+		 * packet arrived on the fabric interface.
 		 */
-		if (sv4 != NULL) {
+		if (rc == BPF_FIB_LKUP_RET_UNREACHABLE ||
+		    rc == BPF_FIB_LKUP_RET_BLACKHOLE ||
+		    rc == BPF_FIB_LKUP_RET_PROHIBIT) {
 			int fab_rc = try_fabric_redirect(ctx, meta);
 			if (fab_rc >= 0)
 				return fab_rc;
+		}
+		if (sv4 != NULL) {
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
 		if (sv6 != NULL) {
-			int fab_rc = try_fabric_redirect(ctx, meta);
-			if (fab_rc >= 0)
-				return fab_rc;
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);

@@ -750,6 +750,17 @@ struct {
 } mirror_counter SEC(".maps");
 
 /* ============================================================
+ * Per-RG active state (for active/active fabric forwarding)
+ * ============================================================ */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_REDUNDANCY_GROUPS);
+	__type(key, __u32);
+	__type(value, __u8);
+} rg_active SEC(".maps");
+
+/* ============================================================
  * Fabric cross-chassis forwarding (cluster failback)
  * ============================================================ */
 

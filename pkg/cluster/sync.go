@@ -660,6 +660,11 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 					val.Created = localNow
 				}
 
+				// Invalidate FIB cache — peer's cached ifindex/MAC/gen
+				// are meaningless on this node.  Forces a fresh
+				// bpf_fib_lookup so hairpin and RG-active checks work.
+				val.FibIfindex = 0
+
 				if err := s.dp.SetSessionV4(key, val); err == nil {
 					s.stats.SessionsInstalled.Add(1)
 				}
@@ -669,6 +674,10 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 					revVal := val
 					revVal.IsReverse = 1
 					revVal.ReverseKey = key
+					// Swap zones: reverse traffic enters on egress zone
+					// and exits on ingress zone.
+					revVal.IngressZone = val.EgressZone
+					revVal.EgressZone = val.IngressZone
 					if err := s.dp.SetSessionV4(val.ReverseKey, revVal); err != nil {
 						slog.Warn("cluster sync: failed to create reverse session", "err", err)
 					}
@@ -709,6 +718,9 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 					val.Created = localNow
 				}
 
+				// Invalidate FIB cache (same as V4 above).
+				val.FibIfindex = 0
+
 				if err := s.dp.SetSessionV6(key, val); err == nil {
 					s.stats.SessionsInstalled.Add(1)
 				}
@@ -716,6 +728,8 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 					revVal := val
 					revVal.IsReverse = 1
 					revVal.ReverseKey = key
+					revVal.IngressZone = val.EgressZone
+					revVal.EgressZone = val.IngressZone
 					s.dp.SetSessionV6(val.ReverseKey, revVal)
 				}
 				if val.IsReverse == 0 &&

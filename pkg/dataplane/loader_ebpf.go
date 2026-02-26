@@ -216,9 +216,11 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["flow_config_map"] = zoneObjs.FlowConfigMap
 	m.maps["fib_gen_map"] = zoneObjs.FibGenMap
 	m.maps["fabric_fwd"] = zoneObjs.FabricFwd
+	m.maps["rg_active"] = zoneObjs.RgActive
 	replaceOpts.MapReplacements["flow_config_map"] = zoneObjs.FlowConfigMap
 	replaceOpts.MapReplacements["fib_gen_map"] = zoneObjs.FibGenMap
 	replaceOpts.MapReplacements["fabric_fwd"] = zoneObjs.FabricFwd
+	replaceOpts.MapReplacements["rg_active"] = zoneObjs.RgActive
 
 	// Load XDP conntrack program.
 	conntrackReplaceOpts := &ebpf.CollectionOptions{

@@ -349,9 +349,11 @@ struct iface_zone_key {
 struct iface_zone_value {
 	__u16 zone_id;
 	__u8  flags;          /* IFACE_FLAG_* bits */
-	__u8  pad;
+	__u8  rg_id;          /* redundancy group ID (0 = standalone/non-RETH) */
 	__u32 routing_table;  /* kernel table ID, 0 = main table */
 };
+
+#define MAX_REDUNDANCY_GROUPS 16
 
 #define IFACE_FLAG_TUNNEL   (1 << 0)  /* GRE/IPsec tunnel interface */
 

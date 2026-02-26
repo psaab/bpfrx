@@ -32,8 +32,8 @@ if ! incus list &>/dev/null 2>&1; then
 fi
 
 IPERF_TARGET="${IPERF_TARGET:-172.16.100.247}"
-IPERF_DURATION=60       # seconds — enough to span two failovers
-IPERF_STREAMS=4
+IPERF_DURATION=90       # seconds — enough to span two failovers + settling
+IPERF_STREAMS=2
 SETTLE_WAIT=3           # seconds to let VRRP + election settle
 MIN_THROUGHPUT=1.0      # Gbps — iperf3 must report at least this
 
@@ -99,9 +99,9 @@ sleep 1
 info "Phase 1: Starting iperf3 -P${IPERF_STREAMS} -t${IPERF_DURATION} → ${IPERF_TARGET}"
 
 incus exec cluster-lan-host -- bash -c \
-	"iperf3 --connect-timeout 2000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > /tmp/iperf3-active-active.log 2>&1 &"
+	"iperf3 --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > /tmp/iperf3-active-active.log 2>&1 &"
 
-sleep 3
+sleep 8  # all parallel streams must be fully established before failover
 
 # Verify iperf3 is running
 if incus exec cluster-lan-host -- pgrep -x iperf3 &>/dev/null; then

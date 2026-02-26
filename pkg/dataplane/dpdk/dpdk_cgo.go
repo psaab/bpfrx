@@ -215,7 +215,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 
 // --- Zone / interface mapping ---
 
-func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8) error {
+func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8, rgID uint8) error {
 	shm := m.platform.shm
 	if shm == nil {
 		return fmt.Errorf("DPDK not initialized")
@@ -233,6 +233,7 @@ func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTabl
 			uintptr(pos)*unsafe.Sizeof(C.struct_iface_zone_value{})))
 	valPtr.zone_id = C.uint16_t(zoneID)
 	valPtr.flags = C.uint8_t(flags)
+	valPtr.rg_id = C.uint8_t(rgID)
 	valPtr.routing_table = C.uint32_t(routingTable)
 	return nil
 }
@@ -1143,6 +1144,24 @@ func (m *Manager) SetFlowConfig(cfg dataplane.FlowConfigValue) error {
 
 func (m *Manager) UpdateFabricFwd(info dataplane.FabricFwdInfo) error {
 	// DPDK fabric redirect not implemented — cluster uses eBPF path.
+	return nil
+}
+
+func (m *Manager) UpdateRGActive(rgID int, active bool) error {
+	shm := m.platform.shm
+	if shm == nil || shm.rg_active == nil {
+		return nil
+	}
+	if rgID < 0 || rgID >= 16 {
+		return nil
+	}
+	var val C.uint8_t
+	if active {
+		val = 1
+	}
+	ptr := (*C.uint8_t)(unsafe.Pointer(
+		uintptr(unsafe.Pointer(shm.rg_active)) + uintptr(rgID)))
+	*ptr = val
 	return nil
 }
 

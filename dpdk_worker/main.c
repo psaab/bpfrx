@@ -377,6 +377,8 @@ tables_init(struct shared_memory *shm)
 		sizeof(uint8_t), RTE_CACHE_LINE_SIZE);
 	shm->fib_gen = rte_zmalloc("fib_gen",
 		sizeof(uint32_t), RTE_CACHE_LINE_SIZE);
+	shm->rg_active = rte_zmalloc("rg_active",
+		sizeof(uint8_t) * MAX_REDUNDANCY_GROUPS, RTE_CACHE_LINE_SIZE);
 
 	/* Event ring for worker -> Go communication */
 	shm->event_ring = rte_ring_create("events", EVENT_RING_SIZE,

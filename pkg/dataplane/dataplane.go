@@ -62,7 +62,7 @@ type DataPlane interface {
 	LastCompileResult() *CompileResult
 
 	// Zone / interface mapping
-	SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8) error
+	SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8, rgID uint8) error
 	SetVlanIfaceInfo(subIfindex int, parentIfindex int, vlanID uint16) error
 	ClearIfaceZoneMap() error
 	ClearVlanIfaceMap() error
@@ -208,6 +208,7 @@ type DataPlane interface {
 
 	// Fabric cross-chassis forwarding
 	UpdateFabricFwd(info FabricFwdInfo) error
+	UpdateRGActive(rgID int, active bool) error
 
 	// Persistent NAT table
 	GetPersistentNAT() *PersistentNATTable

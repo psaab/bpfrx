@@ -192,7 +192,7 @@ type bpfrxXdpScreenIfaceZoneValue struct {
 	_            structs.HostLayout
 	ZoneId       uint16
 	Flags        uint8
-	Pad          uint8
+	RgId         uint8
 	RoutingTable uint32
 }
 
@@ -681,6 +681,7 @@ type bpfrxXdpScreenMapSpecs struct {
 	PolicyRules       *ebpf.MapSpec `ebpf:"policy_rules"`
 	PortScanTrack     *ebpf.MapSpec `ebpf:"port_scan_track"`
 	RedirectCapable   *ebpf.MapSpec `ebpf:"redirect_capable"`
+	RgActive          *ebpf.MapSpec `ebpf:"rg_active"`
 	ScreenConfigs     *ebpf.MapSpec `ebpf:"screen_configs"`
 	SessionCountDst   *ebpf.MapSpec `ebpf:"session_count_dst"`
 	SessionCountSrc   *ebpf.MapSpec `ebpf:"session_count_src"`
@@ -766,6 +767,7 @@ type bpfrxXdpScreenMaps struct {
 	PolicyRules       *ebpf.Map `ebpf:"policy_rules"`
 	PortScanTrack     *ebpf.Map `ebpf:"port_scan_track"`
 	RedirectCapable   *ebpf.Map `ebpf:"redirect_capable"`
+	RgActive          *ebpf.Map `ebpf:"rg_active"`
 	ScreenConfigs     *ebpf.Map `ebpf:"screen_configs"`
 	SessionCountDst   *ebpf.Map `ebpf:"session_count_dst"`
 	SessionCountSrc   *ebpf.Map `ebpf:"session_count_src"`
@@ -827,6 +829,7 @@ func (m *bpfrxXdpScreenMaps) Close() error {
 		m.PolicyRules,
 		m.PortScanTrack,
 		m.RedirectCapable,
+		m.RgActive,
 		m.ScreenConfigs,
 		m.SessionCountDst,
 		m.SessionCountSrc,

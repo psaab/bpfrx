@@ -186,6 +186,8 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 
 // ResignRG forces all VRRP instances for the given redundancy group
 // to resign by sending priority-0 adverts and transitioning to BACKUP.
+// Also immediately sets the instance priority to 0 to prevent
+// re-election before the debounced priority update fires.
 // Used when cluster state transitions from Primary to Secondary
 // (manual failover, weight drop, etc.) in non-preempt mode.
 func (m *Manager) ResignRG(rgID int) {
@@ -194,7 +196,36 @@ func (m *Manager) ResignRG(rgID int) {
 	vrid := 100 + rgID
 	for _, vi := range m.instances {
 		if vi.cfg.GroupID == vrid {
+			// Set priority to 0 BEFORE triggering resign. Without this,
+			// the masterDown timer (~97ms) can fire before the debounced
+			// priority update (500ms), causing the instance to re-elect
+			// at the old high priority and knock the peer back to BACKUP.
+			vi.mu.Lock()
+			vi.cfg.Priority = 0
+			vi.mu.Unlock()
 			vi.triggerResign()
+		}
+	}
+}
+
+// UpdateRGPriority immediately sets the VRRP priority for all instances
+// belonging to the given redundancy group. Used to restore priority
+// after ResignRG set it to 0 — e.g. when a cluster event transitions
+// the RG back to Primary before the debounced VRRP update fires.
+func (m *Manager) UpdateRGPriority(rgID int, priority int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	vrid := 100 + rgID
+	for _, vi := range m.instances {
+		if vi.cfg.GroupID == vrid {
+			vi.mu.Lock()
+			old := vi.cfg.Priority
+			vi.cfg.Priority = priority
+			vi.mu.Unlock()
+			if old != priority {
+				slog.Info("vrrp: immediate priority update",
+					"key", vi.key(), "old_pri", old, "new_pri", priority)
+			}
 		}
 	}
 }

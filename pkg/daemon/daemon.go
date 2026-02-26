@@ -3544,6 +3544,10 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 		copy(info.PeerMAC[:], peerMAC)
 		copy(info.LocalMAC[:], localMAC)
 
+		if d.dp == nil {
+			slog.Debug("cluster: dataplane not ready, retrying fabric_fwd")
+			continue
+		}
 		if err := d.dp.UpdateFabricFwd(info); err != nil {
 			slog.Warn("cluster: failed to update fabric_fwd map", "err", err)
 			continue
@@ -3572,12 +3576,30 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case ev := <-d.cluster.Events():
-			// Immediate VRRP resign on Primary→Secondary transition.
-			// Must happen before the debounced priority update so the peer
-			// receives priority-0 adverts and takes over promptly.
+			// Immediate VRRP priority + resign on state transitions.
+			// ResignRG sets priority=0 to prevent re-election race.
+			// On Primary transition, restore priority=200 immediately
+			// so the instance can accept the peer's resignation and
+			// send adverts at the correct priority.
 			if ev.OldState == cluster.StatePrimary &&
 				(ev.NewState == cluster.StateSecondary || ev.NewState == cluster.StateSecondaryHold) {
 				d.vrrpMgr.ResignRG(ev.GroupID)
+			}
+			if ev.NewState == cluster.StatePrimary {
+				d.vrrpMgr.UpdateRGPriority(ev.GroupID, 200)
+			}
+
+			// Update BPF rg_active map directly from cluster state.
+			// This is more reliable than waiting for the VRRP state
+			// machine to emit a MASTER/BACKUP event (which may be
+			// delayed by VRRP advertisement timing).
+			if d.dp != nil {
+				active := ev.NewState == cluster.StatePrimary
+				if err := d.dp.UpdateRGActive(ev.GroupID, active); err != nil {
+					slog.Warn("failed to update rg_active from cluster event",
+						"rg", ev.GroupID, "active", active, "err", err)
+				}
+				d.dp.BumpFIBGeneration()
 			}
 
 			// Debounced VRRP priority update — 500ms coalesce window.
@@ -3650,12 +3672,29 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 			if ev.State == vrrp.StateMaster {
 				d.rethMasterState[rgID] = true
 				if d.dp != nil {
+					// In cluster mode, only set rg_active=true if the
+					// cluster state agrees this RG is locally primary.
+					// VRRP may briefly re-elect MASTER during a resign
+					// race (priority update lag); the cluster state is
+					// authoritative.
+					if d.cluster == nil || d.cluster.IsLocalPrimary(rgID) {
+						if err := d.dp.UpdateRGActive(rgID, true); err != nil {
+							slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
+						}
+						d.dp.BumpFIBGeneration()
+					}
 					go d.warmNeighborCache()
 				}
 				d.applyRethServicesForRG(rgID)
 			}
 			if ev.State == vrrp.StateBackup {
 				d.rethMasterState[rgID] = false
+				if d.dp != nil {
+					if err := d.dp.UpdateRGActive(rgID, false); err != nil {
+						slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
+					}
+					d.dp.BumpFIBGeneration()
+				}
 				d.clearRethServicesForRG(rgID)
 			}
 		}

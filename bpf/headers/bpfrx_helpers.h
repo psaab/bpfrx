@@ -1814,6 +1814,23 @@ tc_tcp_mss_clamp(struct __sk_buff *skb, __u16 l4_offset, __u16 max_mss,
 }
 
 /* ============================================================
+ * Check whether the egress interface's redundancy group is locally
+ * active.  Returns 1 if active (or non-RETH/standalone), 0 if the
+ * RG is inactive on this node (traffic should cross fabric).
+ * ============================================================ */
+static __always_inline int
+check_egress_rg_active(__u32 ifindex, __u16 vlan_id)
+{
+	struct iface_zone_key ezk = { .ifindex = ifindex, .vlan_id = vlan_id };
+	struct iface_zone_value *ezv = bpf_map_lookup_elem(&iface_zone_map, &ezk);
+	if (!ezv || ezv->rg_id == 0)
+		return 1; /* No RG — standalone or non-RETH, always active */
+	__u32 rg_key = ezv->rg_id;
+	__u8 *active = bpf_map_lookup_elem(&rg_active, &rg_key);
+	return (active && *active);
+}
+
+/* ============================================================
  * Fabric cross-chassis redirect for cluster failback.
  *
  * When bpf_fib_lookup fails for an existing session (NO_NEIGH or

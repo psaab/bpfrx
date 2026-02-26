@@ -556,10 +556,16 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			// Set zone mapping using composite key {physIfindex, vlanID}
 			tableID := ifaceTableID[ifaceRef] // 0 if not in any routing instance
 			var izFlags uint8
-			if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg.Tunnel != nil {
-				izFlags |= IfaceFlagTunnel
+			var rgID uint8
+			if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
+				if ifCfg.Tunnel != nil {
+					izFlags |= IfaceFlagTunnel
+				}
+				if ifCfg.RedundancyGroup > 0 {
+					rgID = uint8(ifCfg.RedundancyGroup)
+				}
 			}
-			if err := dp.SetZone(physIface.Index, uint16(vlanID), zid, tableID, izFlags); err != nil {
+			if err := dp.SetZone(physIface.Index, uint16(vlanID), zid, tableID, izFlags, rgID); err != nil {
 				return fmt.Errorf("set zone for %s vlan %d (ifindex %d): %w",
 					physName, vlanID, physIface.Index, err)
 			}

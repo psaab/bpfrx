@@ -870,6 +870,20 @@ func (m *Manager) UpdateFabricFwd(info FabricFwdInfo) error {
 	return zm.Update(uint32(0), info, ebpf.UpdateAny)
 }
 
+// UpdateRGActive sets the active state of a redundancy group in BPF.
+// active=true means this node is primary for the RG; false means secondary.
+func (m *Manager) UpdateRGActive(rgID int, active bool) error {
+	zm, ok := m.maps["rg_active"]
+	if !ok {
+		return fmt.Errorf("rg_active map not found")
+	}
+	var val uint8
+	if active {
+		val = 1
+	}
+	return zm.Update(uint32(rgID), val, ebpf.UpdateAny)
+}
+
 // SetStaticNATEntryV4 writes a static NAT v4 entry.
 func (m *Manager) SetStaticNATEntryV4(ip uint32, direction uint8, translated uint32) error {
 	zm, ok := m.maps["static_nat_v4"]

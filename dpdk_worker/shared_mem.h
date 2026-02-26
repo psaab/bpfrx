@@ -63,9 +63,11 @@ struct iface_zone_key {
 struct iface_zone_value {
 	uint16_t zone_id;
 	uint8_t  flags;
-	uint8_t  pad;
+	uint8_t  rg_id;           /* redundancy group ID (0 = standalone) */
 	uint32_t routing_table;
 };
+
+#define MAX_REDUNDANCY_GROUPS 16
 
 /* Reverse mapping: sub-interface -> parent */
 struct vlan_iface_info {
@@ -856,6 +858,9 @@ struct shared_memory {
 
 	/* Per-interface redirect capability flag (1 = can use rte_eth_tx) */
 	uint8_t                 *redirect_capable;
+
+	/* Per-RG active state (0=inactive, 1=active) */
+	uint8_t                 *rg_active;
 
 	/* NAT64 state value array (indexed by rte_hash position) */
 	struct nat64_state_value *nat64_state_values;

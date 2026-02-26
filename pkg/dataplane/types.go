@@ -660,9 +660,12 @@ type IfaceZoneKey struct {
 type IfaceZoneValue struct {
 	ZoneID       uint16
 	Flags        uint8 // IFACE_FLAG_* bits
-	Pad          uint8
+	RGID         uint8 // redundancy group ID (0 = standalone/non-RETH)
 	RoutingTable uint32 // kernel table ID, 0 = main table
 }
+
+// MaxRedundancyGroups is the maximum number of RG entries.
+const MaxRedundancyGroups = 16
 
 // IfaceFlagTunnel marks an interface as a tunnel (GRE/IPsec).
 const IfaceFlagTunnel = 1 << 0
