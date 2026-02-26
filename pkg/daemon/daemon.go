@@ -3590,7 +3590,12 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// With preempt=false, VRRP won't self-elect even at
 				// higher priority. Force MASTER since cluster state
 				// is authoritative (e.g. after failover reset).
-				d.vrrpMgr.ForceRGMaster(ev.GroupID)
+				// Only do this for intentional promotions (Secondary →
+				// Primary), NOT on initial boot (SecondaryHold → Primary)
+				// where VRRP should follow its own election timer.
+				if ev.OldState == cluster.StateSecondary {
+					d.vrrpMgr.ForceRGMaster(ev.GroupID)
+				}
 			}
 
 			// Update BPF rg_active map directly from cluster state.

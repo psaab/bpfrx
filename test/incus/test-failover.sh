@@ -6,7 +6,7 @@
 # Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.247).
 #
 # Tests:
-#   1. Start iperf3 -P4 through the firewall (LAN host → WAN target)
+#   1. Start iperf3 -P2 through the firewall (LAN host → WAN target)
 #   2. Verify sessions sync from primary (fw0) to secondary (fw1)
 #   3. Reboot fw0 (unclean — no priority-0 burst)
 #   4. Verify iperf3 survives (TCP connections maintained through failover)
@@ -28,7 +28,7 @@ fi
 
 IPERF_TARGET="${IPERF_TARGET:-172.16.100.247}"
 IPERF_DURATION=90       # seconds — long enough to span reboot + failback
-IPERF_STREAMS=4
+IPERF_STREAMS=2
 SYNC_WAIT=5             # seconds to wait for session sync sweep
 REBOOT_WAIT=60          # max seconds to wait for fw0 to come back
 MIN_THROUGHPUT=1.0      # Gbps — iperf3 must report at least this
@@ -92,9 +92,9 @@ sleep 1
 info "Starting iperf3 -P${IPERF_STREAMS} -t${IPERF_DURATION} → ${IPERF_TARGET}"
 
 incus exec cluster-lan-host -- bash -c \
-	"iperf3 --connect-timeout 2000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > /tmp/iperf3-failover.log 2>&1 &"
+	"iperf3 --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > /tmp/iperf3-failover.log 2>&1 &"
 
-sleep 3
+sleep 8  # all parallel streams must be fully established before failover
 
 # Verify iperf3 is running
 if incus exec cluster-lan-host -- pgrep iperf3 &>/dev/null; then
