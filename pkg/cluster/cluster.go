@@ -99,6 +99,10 @@ type Manager struct {
 
 	// Sync stats provider (set by daemon after sessionSync creation).
 	syncStats SyncStatsProvider
+
+	// peerFailoverFn sends a remote failover request to the peer.
+	// Set by daemon after sessionSync creation.
+	peerFailoverFn func(rgID int) error
 }
 
 // NewManager creates a new cluster manager.
@@ -411,6 +415,49 @@ func (m *Manager) ManualFailover(rgID int) error {
 	}
 	slog.Info("cluster: manual failover", "rg", rgID)
 	return nil
+}
+
+// SetPeerFailoverFunc sets the callback used to send remote failover requests
+// to the peer via the fabric sync connection.
+func (m *Manager) SetPeerFailoverFunc(fn func(rgID int) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peerFailoverFn = fn
+}
+
+// RequestPeerFailover asks the peer to give up primary for the given RG,
+// making the local node primary. Used when "request chassis cluster failover
+// redundancy-group N node <local>" is run — the local node wants to become
+// primary, so the peer must resign.
+func (m *Manager) RequestPeerFailover(rgID int) error {
+	m.mu.Lock()
+	rg, ok := m.groups[rgID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("redundancy group %d not found", rgID)
+	}
+	if rg.State == StatePrimary {
+		m.mu.Unlock()
+		return fmt.Errorf("node is already primary for redundancy group %d", rgID)
+	}
+	if !m.peerAlive {
+		m.mu.Unlock()
+		return fmt.Errorf("peer not alive — cannot request failover")
+	}
+	fn := m.peerFailoverFn
+
+	// Clear local ManualFailover and restore weight so election can
+	// promote us once the peer resigns.
+	if rg.ManualFailover {
+		rg.ManualFailover = false
+		m.recalcWeight(rg) // restores weight from 0, runs election
+	}
+	m.mu.Unlock()
+
+	if fn == nil {
+		return fmt.Errorf("peer failover not available (sync not connected)")
+	}
+	return fn(rgID)
 }
 
 // ForceSecondary sets weight to 0 for all redundancy groups, forcing this node

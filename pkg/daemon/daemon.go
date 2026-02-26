@@ -3423,6 +3423,18 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				d.vrrpMgr.ReleaseSyncHold()
 			}
 
+			// Wire remote failover: when peer requests us to give up primary.
+			d.sessionSync.OnRemoteFailover = func(rgID int) {
+				slog.Info("cluster: remote failover request from peer", "rg", rgID)
+				if err := d.cluster.ManualFailover(rgID); err != nil {
+					slog.Warn("cluster: remote failover failed", "rg", rgID, "err", err)
+				}
+			}
+
+			// Wire peer failover sender so cluster Manager can send remote
+			// failover requests via the fabric sync connection.
+			d.cluster.SetPeerFailoverFunc(d.sessionSync.SendFailover)
+
 			d.sessionSync.SetVRFDevice(vrfDevice)
 			// Retry sync start: the VRF device and address binding may not
 			// be ready during daemon startup (networkd race).

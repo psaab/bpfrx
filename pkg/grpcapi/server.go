@@ -7745,11 +7745,40 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 			if s.cluster == nil {
 				return nil, status.Error(codes.Unavailable, "cluster not configured")
 			}
-			rgStr := strings.TrimPrefix(req.Action, "cluster-failover:")
+			rest := strings.TrimPrefix(req.Action, "cluster-failover:")
+
+			// Parse "cluster-failover:<rgID>[:node<N>]"
+			var rgStr, nodeStr string
+			if idx := strings.Index(rest, ":node"); idx >= 0 {
+				rgStr = rest[:idx]
+				nodeStr = rest[idx+5:] // skip ":node"
+			} else {
+				rgStr = rest
+			}
+
 			rgID, err := strconv.Atoi(rgStr)
 			if err != nil {
 				return nil, status.Errorf(codes.InvalidArgument, "invalid redundancy-group ID: %s", rgStr)
 			}
+
+			// If "node <N>" specified, route to correct node.
+			if nodeStr != "" {
+				targetNode, err := strconv.Atoi(nodeStr)
+				if err != nil {
+					return nil, status.Errorf(codes.InvalidArgument, "invalid node ID: %s", nodeStr)
+				}
+				if targetNode == s.cluster.NodeID() {
+					// Target is local → ask peer to failover
+					if err := s.cluster.RequestPeerFailover(rgID); err != nil {
+						return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+					}
+					return &pb.SystemActionResponse{
+						Message: fmt.Sprintf("Manual failover triggered for redundancy group %d (requesting peer to resign)", rgID),
+					}, nil
+				}
+				// Target is peer → local failover (fall through)
+			}
+
 			if err := s.cluster.ManualFailover(rgID); err != nil {
 				return nil, status.Errorf(codes.NotFound, "%v", err)
 			}

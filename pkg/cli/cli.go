@@ -11262,12 +11262,31 @@ func (c *CLI) handleRequestChassis(args []string) error {
 		return nil
 	}
 
-	// "request chassis cluster failover redundancy-group <N>"
+	// "request chassis cluster failover redundancy-group <N> [node <N>]"
 	if len(args) >= 2 && args[0] == "redundancy-group" {
 		rgID, err := strconv.Atoi(args[1])
 		if err != nil {
 			return fmt.Errorf("invalid redundancy-group ID: %s", args[1])
 		}
+
+		// If "node <N>" is specified, route to the correct node.
+		if len(args) >= 4 && args[2] == "node" {
+			targetNode, err := strconv.Atoi(args[3])
+			if err != nil {
+				return fmt.Errorf("invalid node ID: %s", args[3])
+			}
+			localNode := c.cluster.NodeID()
+			if targetNode == localNode {
+				// "node <local>" → make local primary → ask peer to failover
+				if err := c.cluster.RequestPeerFailover(rgID); err != nil {
+					return err
+				}
+				fmt.Printf("Manual failover triggered for redundancy group %d (requesting peer to resign)\n", rgID)
+				return nil
+			}
+			// "node <peer>" → make peer primary → local failover
+		}
+
 		if err := c.cluster.ManualFailover(rgID); err != nil {
 			return err
 		}
@@ -11275,7 +11294,7 @@ func (c *CLI) handleRequestChassis(args []string) error {
 		return nil
 	}
 
-	return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N>")
+	return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N> [node <N>]")
 }
 
 func (c *CLI) handleRequestDHCP(args []string) error {

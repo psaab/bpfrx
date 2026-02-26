@@ -2575,9 +2575,14 @@ func (c *ctl) handleRequestChassis(args []string) error {
 		return nil
 	}
 
-	// "request chassis cluster failover redundancy-group <N>"
+	// "request chassis cluster failover redundancy-group <N> [node <N>]"
 	if len(args) >= 2 && args[0] == "redundancy-group" {
-		action := "cluster-failover:" + args[1]
+		actionSuffix := args[1]
+		// Pass "node <N>" if specified.
+		if len(args) >= 4 && args[2] == "node" {
+			actionSuffix += ":node" + args[3]
+		}
+		action := "cluster-failover:" + actionSuffix
 		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: action,
 		})
@@ -2588,7 +2593,7 @@ func (c *ctl) handleRequestChassis(args []string) error {
 		return nil
 	}
 
-	return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N>")
+	return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N> [node <N>]")
 }
 
 func (c *ctl) handleRequestDHCP(args []string) error {

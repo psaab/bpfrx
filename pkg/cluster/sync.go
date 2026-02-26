@@ -32,7 +32,8 @@ const (
 	syncMsgBulkEnd      = 6
 	syncMsgHeartbeat    = 7
 	syncMsgConfig       = 8 // full config text sync from primary to secondary
-	syncMsgIPsecSA      = 9 // IPsec SA connection names sync
+	syncMsgIPsecSA      = 9  // IPsec SA connection names sync
+	syncMsgFailover     = 10 // remote failover request (payload: 1 byte rgID)
 )
 
 // syncHeader is the wire header for each sync message.
@@ -90,6 +91,11 @@ type SessionSync struct {
 	// OnIPsecSAReceived is called when an IPsec SA list arrives from the peer.
 	// On failover, the new primary calls swanctl --initiate for each connection name.
 	OnIPsecSAReceived func(connectionNames []string)
+
+	// OnRemoteFailover is called when the peer requests us to failover an RG.
+	// The callback receives the redundancy group ID. The receiver should call
+	// ManualFailover(rgID) to give up primary for that RG.
+	OnRemoteFailover func(rgID int)
 
 	// OnBulkSyncReceived is called when a bulk sync transfer completes
 	// (syncMsgBulkEnd received). The secondary uses this to release VRRP
@@ -381,6 +387,27 @@ func (s *SessionSync) QueueConfig(configText string) {
 	}
 	s.stats.ConfigsSent.Add(1)
 	slog.Info("cluster sync: config sent to peer", "size", len(payload))
+}
+
+// SendFailover sends a remote failover request to the peer, asking it to
+// give up primary for the specified redundancy group.
+func (s *SessionSync) SendFailover(rgID int) error {
+	s.mu.Lock()
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("peer not connected")
+	}
+
+	payload := []byte{byte(rgID)}
+	if err := writeMsg(conn, syncMsgFailover, payload); err != nil {
+		slog.Warn("cluster sync: failover send error", "err", err, "rg", rgID)
+		s.stats.Errors.Add(1)
+		s.handleDisconnect()
+		return fmt.Errorf("failed to send failover request: %w", err)
+	}
+	slog.Info("cluster sync: failover request sent to peer", "rg", rgID)
+	return nil
 }
 
 // BulkSync sends the entire session table to the connected peer.
@@ -797,6 +824,17 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 		slog.Debug("cluster sync: received IPsec SA list", "count", len(names))
 		if s.OnIPsecSAReceived != nil {
 			s.OnIPsecSAReceived(names)
+		}
+
+	case syncMsgFailover:
+		if len(payload) < 1 {
+			slog.Warn("cluster sync: failover message too short")
+			return
+		}
+		rgID := int(payload[0])
+		slog.Info("cluster sync: remote failover request received", "rg", rgID)
+		if s.OnRemoteFailover != nil {
+			s.OnRemoteFailover(rgID)
 		}
 	}
 }
