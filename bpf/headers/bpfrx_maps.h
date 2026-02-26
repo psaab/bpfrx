@@ -766,6 +766,7 @@ struct {
 
 struct fabric_fwd_info {
 	__u32 ifindex;       /* fabric interface ifindex, 0 = disabled */
+	__u32 fib_ifindex;   /* non-VRF ifindex for zone-decoded FIB lookups */
 	__u8  peer_mac[6];   /* peer's fabric MAC */
 	__u8  local_mac[6];  /* our fabric MAC */
 };

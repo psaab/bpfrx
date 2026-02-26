@@ -40,6 +40,43 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		 * is transit traffic, not host-bound.
 		 */
 		if (meta->meta_flags & META_FLAG_KERNEL_ROUTE) {
+			/*
+			 * Active/active per-RG: after NAT reversal, the
+			 * post-NAT destination may hit a blackhole route
+			 * (subnet of an inactive RG).  Re-check FIB for
+			 * the current packet destination and fabric-redirect
+			 * if unreachable — the peer has the connected route.
+			 */
+			struct bpf_fib_lookup fib = {};
+			fib.family = meta->addr_family;
+			fib.ifindex = ctx->ingress_ifindex;
+			if (meta->addr_family == AF_INET) {
+				struct iphdr *iph_kr = data +
+					sizeof(struct ethhdr);
+				if ((void *)(iph_kr + 1) <= data_end) {
+					fib.ipv4_src = iph_kr->saddr;
+					fib.ipv4_dst = iph_kr->daddr;
+				}
+			} else {
+				struct ipv6hdr *ip6_kr = data +
+					sizeof(struct ethhdr);
+				if ((void *)(ip6_kr + 1) <= data_end) {
+					__builtin_memcpy(fib.ipv6_src,
+						&ip6_kr->saddr, 16);
+					__builtin_memcpy(fib.ipv6_dst,
+						&ip6_kr->daddr, 16);
+				}
+			}
+			int kr_rc = bpf_fib_lookup(ctx, &fib,
+				sizeof(fib), BPF_FIB_LOOKUP_OUTPUT);
+			if (kr_rc == BPF_FIB_LKUP_RET_BLACKHOLE ||
+			    kr_rc == BPF_FIB_LKUP_RET_UNREACHABLE ||
+			    kr_rc == BPF_FIB_LKUP_RET_PROHIBIT) {
+				int fab_rc =
+					try_fabric_redirect(ctx, meta);
+				if (fab_rc >= 0)
+					return fab_rc;
+			}
 			if (meta->ingress_vlan_id != 0) {
 				if (xdp_vlan_tag_push(ctx,
 						meta->ingress_vlan_id) < 0)

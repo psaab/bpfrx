@@ -39,6 +39,27 @@ zone_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 	if (!ctx->shm->iface_zone_map)
 		return;
 
+	/* ---- Fabric zone-encoded MAC detection ----
+	 * When BPF redirects a new connection across fabric with zone
+	 * encoded in src MAC (02:bf:72:fe:00:ZZ), the DPDK worker
+	 * decodes it here.  This is the DPDK parity for the BPF
+	 * try_fabric_redirect_with_zone() / xdp_zone detection. */
+	{
+		struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt,
+			struct rte_ether_hdr *);
+		if (eth->src_addr.addr_bytes[0] == 0x02 &&
+		    eth->src_addr.addr_bytes[1] == 0xbf &&
+		    eth->src_addr.addr_bytes[2] == 0x72 &&
+		    eth->src_addr.addr_bytes[3] == FABRIC_ZONE_MAC_MAGIC) {
+			/* TODO: when DPDK fabric redirect is implemented,
+			 * decode zone and skip the zone lookup:
+			 *   meta->ingress_zone = eth->src_addr.addr_bytes[5];
+			 *   meta->routing_table = 254;
+			 *   return;
+			 */
+		}
+	}
+
 	/* ---- Ingress zone lookup ---- */
 	struct iface_zone_key zk = {
 		.ifindex = meta->ingress_ifindex,

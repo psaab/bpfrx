@@ -1866,4 +1866,53 @@ try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 	return bpf_redirect_map(&tx_ports, ff->ifindex, 0);
 }
 
+/* ============================================================
+ * Zone-encoded fabric redirect for new connections.
+ *
+ * When a new connection arrives on one node but the egress RG is on
+ * the peer, the packet must cross the fabric.  Unlike existing sessions
+ * (where the peer has synced session state with zone info), new
+ * connections have no session on the peer — so the peer doesn't know
+ * the original ingress zone.  This helper encodes the ingress zone
+ * in the source MAC (02:bf:72:fe:00:ZZ) before redirect.  The peer's
+ * xdp_zone detects this magic prefix and uses h_source[5] as the
+ * ingress zone instead of the fabric interface's zone.
+ *
+ * We use MAC encoding instead of VLAN tags because Linux bridges
+ * strip 802.1Q tags into skb->vlan_tci before generic XDP runs,
+ * making VLAN-encoded zones invisible to the BPF program.
+ *
+ * Returns >= 0 (XDP_REDIRECT) on success, -1 on failure.
+ * ============================================================ */
+static __always_inline int
+try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	__u32 zero = 0;
+	struct fabric_fwd_info *ff = bpf_map_lookup_elem(&fabric_fwd, &zero);
+	if (!ff || ff->ifindex == 0)
+		return -1;
+
+	/* Anti-loop: don't redirect if packet arrived on fabric */
+	if (ctx->ingress_ifindex == ff->ifindex)
+		return -1;
+
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return -1;
+
+	/* Encode ingress zone in source MAC: 02:bf:72:fe:00:ZZ */
+	eth->h_source[0] = 0x02;
+	eth->h_source[1] = 0xbf;
+	eth->h_source[2] = 0x72;
+	eth->h_source[3] = FABRIC_ZONE_MAC_MAGIC;
+	eth->h_source[4] = 0x00;
+	eth->h_source[5] = (__u8)(meta->ingress_zone & 0xff);
+	__builtin_memcpy(eth->h_dest, ff->peer_mac, ETH_ALEN);
+
+	inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+	return bpf_redirect_map(&tx_ports, ff->ifindex, 0);
+}
+
 #endif /* __BPFRX_HELPERS_H__ */

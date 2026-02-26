@@ -193,6 +193,33 @@ else
 	fail "iperf3 died after RG split (active/active fabric forwarding broken)"
 fi
 
+# ── Phase 3b: Verify NEW TCP connections work during split ────────────
+
+info "Phase 3b: Verify new TCP connections work through split cluster"
+
+# Test that a brand-new TCP 3-way handshake succeeds through the split
+# cluster.  The Phase 1 iperf3 occupies port 5201 (iperf3 server is
+# single-client), so we test TCP connectivity with /dev/tcp which
+# proves the full SYN → SYN-ACK → ACK path works across fabric.
+# The iperf3 server accepts the TCP connection (then sends "busy"),
+# but the 3-way handshake completing is what matters.
+if incus exec cluster-lan-host -- bash -c \
+	"timeout 5 bash -c 'echo > /dev/tcp/${IPERF_TARGET}/5201'" 2>/dev/null; then
+	pass "new TCP connection through split cluster"
+else
+	fail "new TCP connection failed during split (TCP handshake to ${IPERF_TARGET}:5201)"
+fi
+
+# ── Phase 3c: Verify ICMP (ping) works during split ─────────────────
+
+info "Phase 3c: Verify ping works through split cluster"
+
+if incus exec cluster-lan-host -- ping -c 3 -W 3 "$IPERF_TARGET" &>/dev/null; then
+	pass "ping through split cluster works"
+else
+	fail "ping through split cluster failed (new connections broken)"
+fi
+
 # ── Phase 4: Failover RG1 back to fw0 ───────────────────────────────
 
 info "Phase 4: Failover RG1 (WAN) back to node0 — reunifying all RGs"

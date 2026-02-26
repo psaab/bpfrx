@@ -196,7 +196,6 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	struct pkt_meta *meta = bpf_map_lookup_elem(&pkt_meta_scratch, &zero);
 	if (!meta)
 		return XDP_DROP;
-
 	/*
 	 * VRRP multicast (224.0.0.18, proto 112) — pass to host before zone
 	 * lookup.  xdp_main already stripped the VLAN tag for pipeline use;
@@ -209,6 +208,35 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		if (meta->ingress_vlan_id != 0)
 			xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
 		return XDP_PASS;
+	}
+
+	/* Fabric zone-encoded MAC: peer sent a new connection with zone
+	 * encoded in source MAC (02:bf:72:fe:00:ZZ).  Decode and use as
+	 * ingress zone, skip iface_zone_map lookup. */
+	{
+		void *zd = (void *)(long)ctx->data;
+		void *zde = (void *)(long)ctx->data_end;
+		struct ethhdr *zeth = zd;
+		if ((void *)(zeth + 1) <= zde &&
+		    zeth->h_source[0] == 0x02 &&
+		    zeth->h_source[1] == 0xbf &&
+		    zeth->h_source[2] == 0x72 &&
+		    zeth->h_source[3] == FABRIC_ZONE_MAC_MAGIC) {
+			__u32 zero_ff = 0;
+			struct fabric_fwd_info *ff =
+				bpf_map_lookup_elem(&fabric_fwd, &zero_ff);
+			if (ff && ctx->ingress_ifindex == ff->ifindex) {
+				meta->ingress_zone = zeth->h_source[5];
+				/* Force main routing table — fabric is
+				 * in vrf-mgmt, but the decoded zone's
+				 * traffic uses the main table. */
+				meta->routing_table = 254; /* RT_TABLE_MAIN */
+				inc_zone_ingress(
+					(__u32)meta->ingress_zone,
+					meta->pkt_len);
+				goto zone_resolved;
+			}
+		}
 	}
 
 	/* Look up ingress zone from {ifindex, vlan_id} composite key */
@@ -231,6 +259,27 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	 * Firewall filter PBR (already set in xdp_main) takes priority. */
 	if (meta->routing_table == 0 && izv->routing_table != 0)
 		meta->routing_table = izv->routing_table;
+
+	/* Mark fabric-ingress traffic so later stages can bypass
+	 * policy for sessionless return traffic (the peer already
+	 * validated via its policy; session sync hasn't propagated yet).
+	 *
+	 * Do NOT override routing_table here — locally-destined fabric
+	 * traffic (session sync, heartbeat, management) needs the VRF
+	 * routing table to resolve correctly (NOT_FWDED).  The routing
+	 * table override to main (254) is applied after the session
+	 * lookup, only when a synced session exists (forwarded traffic).
+	 * Zone-encoded packets already set routing_table=254 above. */
+	{
+		__u32 ff_key = 0;
+		struct fabric_fwd_info *ff =
+			bpf_map_lookup_elem(&fabric_fwd, &ff_key);
+		if (ff && ctx->ingress_ifindex == ff->ifindex)
+			meta->meta_flags |= META_FLAG_FABRIC_FWD;
+	}
+
+zone_resolved:
+	;
 
 	/*
 	 * Pre-routing NAT: check dnat_table before FIB lookup.
@@ -489,6 +538,22 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		}
 	}
 
+	/* Fabric-forwarded sessions: override VRF routing table to main (254).
+	 * fab0 is in vrf-mgmt (table 999), but forwarded traffic must use
+	 * the main table where WAN/LAN routes exist.  Only apply when we
+	 * found a synced session — locally-destined fabric traffic (session
+	 * sync, heartbeat) must use the VRF table so FIB correctly returns
+	 * NOT_FWDED for local addresses.
+	 *
+	 * NOTE: separate NULL checks — NEVER OR two BPF pointers (verifier
+	 * rejects bitwise OR on pointer regs). */
+	if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
+		if (sv4 != NULL)
+			meta->routing_table = 254; /* RT_TABLE_MAIN */
+		if (sv6 != NULL)
+			meta->routing_table = 254;
+	}
+
 	/*
 	 * FIB lookup to determine egress interface.
 	 * Uses the (possibly translated) dst_ip for routing.
@@ -502,6 +567,19 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	 * Only set tbid if routing_table is non-zero to avoid touching fib
 	 * fields unnecessarily. */
 	fib.tbid = meta->routing_table;
+
+	/* Zone-decoded packets arrived on fabric (VRF slave).  The kernel's
+	 * bpf_fib_lookup still honors l3mdev rules even with BPF_FIB_LOOKUP_TBID,
+	 * so using the fabric ifindex as input device causes the lookup to hit
+	 * the VRF table instead of the requested main table.  Override with a
+	 * non-VRF data-plane ifindex stored in fabric_fwd. */
+	if (meta->routing_table == 254) {
+		__u32 ff_key = 0;
+		struct fabric_fwd_info *ff_fib =
+			bpf_map_lookup_elem(&fabric_fwd, &ff_key);
+		if (ff_fib && ff_fib->fib_ifindex)
+			fib.ifindex = ff_fib->fib_ifindex;
+	}
 
 	if (meta->addr_family == AF_INET) {
 		fib.family   = AF_INET;
@@ -541,11 +619,10 @@ int xdp_zone_prog(struct xdp_md *ctx)
 			meta->egress_zone = ezv->zone_id;
 
 		/* Active/active per-RG check: if the egress interface's
-		 * RG is not locally active AND we have an existing session,
-		 * redirect to fabric peer.  New connections (no session)
-		 * proceed normally — the physical interface is still UP
-		 * so they can egress directly; the peer handles the
-		 * return path via synced sessions + fabric redirect. */
+		 * RG is not locally active, redirect to fabric peer.
+		 * Existing sessions use plain redirect (peer has synced
+		 * session with zone info).  New connections use zone-
+		 * encoded redirect (peer needs ingress zone for policy). */
 		if (ezv && ezv->rg_id > 0) {
 			__u32 rg_key = ezv->rg_id;
 			__u8 *active = bpf_map_lookup_elem(&rg_active, &rg_key);
@@ -571,9 +648,18 @@ int xdp_zone_prog(struct xdp_md *ctx)
 						      XDP_PROG_CONNTRACK);
 					return XDP_PASS;
 				}
-				/* New connection: proceed through
-				 * pipeline normally (create session,
-				 * policy check, NAT, forward). */
+				/* New connection: zone-encoded fabric
+				 * redirect so peer applies correct
+				 * security policy. */
+				{
+					int fab_rc =
+						try_fabric_redirect_with_zone(
+							ctx, meta);
+					if (fab_rc >= 0)
+						return fab_rc;
+					/* Anti-loop (arrived on fabric)
+					 * — process locally. */
+				}
 			}
 		}
 
@@ -626,13 +712,87 @@ int xdp_zone_prog(struct xdp_md *ctx)
 			return zone_ct_update_v6(ctx, meta, sv6, ct_direction);
 		}
 
+		/* Plain fabric redirect without local session: the peer
+		 * already validated this traffic (e.g. return traffic
+		 * for a session not yet synced, or active/active NAT-
+		 * reversed replies).  Bypass conntrack + policy — the
+		 * peer's pipeline already did full security validation.
+		 *
+		 * The first FIB lookup used the VRF mgmt table (because
+		 * fab0 is a VRF member and no session triggered the
+		 * routing_table=254 override).  The VRF mgmt default
+		 * route may have matched, giving the wrong egress.
+		 * Re-do FIB in the main table (254) for correct routing.
+		 * If the re-lookup succeeds, tail-call xdp_forward with
+		 * the correct result.  On failure, fall through to
+		 * XDP_PASS (kernel handles locally).
+		 *
+		 * Zone-encoded packets do NOT set FABRIC_FWD, so they
+		 * still go through the full conntrack/policy pipeline. */
+		if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
+			struct bpf_fib_lookup fib2 = {};
+			fib2.l4_protocol = meta->protocol;
+			fib2.tot_len     = meta->pkt_len;
+			fib2.tbid        = 254; /* RT_TABLE_MAIN */
+			/* Use non-VRF ifindex for main table lookup */
+			fib2.ifindex = meta->ingress_ifindex;
+			{
+				__u32 ff2_key = 0;
+				struct fabric_fwd_info *ff2 =
+					bpf_map_lookup_elem(&fabric_fwd,
+							    &ff2_key);
+				if (ff2 && ff2->fib_ifindex)
+					fib2.ifindex = ff2->fib_ifindex;
+			}
+			if (meta->addr_family == AF_INET) {
+				fib2.family   = AF_INET;
+				fib2.ipv4_src = meta->src_ip.v4;
+				fib2.ipv4_dst = meta->dst_ip.v4;
+			} else {
+				fib2.family = AF_INET6;
+				__builtin_memcpy(fib2.ipv6_src,
+						 meta->src_ip.v6, 16);
+				__builtin_memcpy(fib2.ipv6_dst,
+						 meta->dst_ip.v6, 16);
+			}
+			int rc2 = bpf_fib_lookup(ctx, &fib2,
+				sizeof(fib2), BPF_FIB_LOOKUP_TBID);
+			if (rc2 == BPF_FIB_LKUP_RET_SUCCESS) {
+				__u32 eg2 = fib2.ifindex;
+				__u16 ev2 = 0;
+				struct vlan_iface_info *vi2 =
+					bpf_map_lookup_elem(
+						&vlan_iface_map, &eg2);
+				if (vi2) {
+					eg2 = vi2->parent_ifindex;
+					ev2 = vi2->vlan_id;
+				}
+				meta->fwd_ifindex = eg2;
+				meta->egress_vlan_id = ev2;
+				__builtin_memcpy(meta->fwd_dmac,
+						 fib2.dmac, ETH_ALEN);
+				__builtin_memcpy(meta->fwd_smac,
+						 fib2.smac, ETH_ALEN);
+				bpf_tail_call(ctx, &xdp_progs,
+					      XDP_PROG_FORWARD);
+			}
+			/* Main table FIB failed — fall through to
+			 * XDP_PASS for kernel local delivery. */
+			if (meta->ingress_vlan_id != 0) {
+				if (xdp_vlan_tag_push(ctx,
+						meta->ingress_vlan_id) < 0)
+					return XDP_DROP;
+			}
+			inc_counter(GLOBAL_CTR_HOST_INBOUND);
+			return XDP_PASS;
+		}
+
 	} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
 		/*
 		 * Route exists but no ARP/NDP entry for the next hop.
 		 *
-		 * Active/active per-RG: try fabric redirect first for
-		 * all packets — peer may have ARP/NDP.  Anti-loop
-		 * prevents forwarding loops.
+		 * In cluster mode, try fabric redirect — the peer may
+		 * have the ARP/NDP entry.  Anti-loop prevents loops.
 		 *
 		 * For existing sessions, fall back to conntrack +
 		 * kernel routing if fabric is unavailable.
@@ -683,9 +843,35 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		if (rc == BPF_FIB_LKUP_RET_UNREACHABLE ||
 		    rc == BPF_FIB_LKUP_RET_BLACKHOLE ||
 		    rc == BPF_FIB_LKUP_RET_PROHIBIT) {
-			int fab_rc = try_fabric_redirect(ctx, meta);
-			if (fab_rc >= 0)
-				return fab_rc;
+			/* When an existing session is present, skip
+			 * fabric redirect here — the packet may need
+			 * NAT reversal first (e.g. SNAT reply with
+			 * pre-routing dnat_table rewrite in meta but
+			 * not yet in the packet header).  Let the
+			 * session handler below route through
+			 * conntrack → NAT → forward, where xdp_forward
+			 * re-checks FIB on the rewritten packet and
+			 * does fabric redirect with correct headers. */
+			volatile int bh_has_session = 0;
+			if (sv4 != NULL)
+				bh_has_session = 1;
+			if (sv6 != NULL)
+				bh_has_session = 1;
+			if (!bh_has_session) {
+				/* New connection: zone-encoded redirect
+				 * preserves ingress zone for policy on
+				 * the peer. */
+				int fab_rc =
+					try_fabric_redirect_with_zone(
+						ctx, meta);
+				if (fab_rc >= 0)
+					return fab_rc;
+				/* Plain redirect fallback. */
+				fab_rc =
+					try_fabric_redirect(ctx, meta);
+				if (fab_rc >= 0)
+					return fab_rc;
+			}
 		}
 		if (sv4 != NULL) {
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;

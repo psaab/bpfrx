@@ -108,6 +108,14 @@ type Daemon struct {
 	// rethMasterState tracks per-RG VRRP master state. In active/active HA,
 	// a node can be MASTER for one RG and BACKUP for another simultaneously.
 	rethMasterState map[int]bool
+
+	// blackholeRoutes tracks blackhole routes injected for inactive RG subnets.
+	// When an RG goes BACKUP, we inject blackhole routes for its RETH subnets
+	// to prevent FIB from routing return traffic via the default route (which
+	// would escape via WAN). Instead, bpf_fib_lookup returns BLACKHOLE and
+	// the FIB failure handler triggers fabric redirect to the peer.
+	blackholeRoutes map[int][]netlink.Route
+
 }
 
 // New creates a new Daemon.
@@ -1379,6 +1387,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			InterfaceBandwidths:   ifaceBandwidths,
 			InterfacePointToPoint: ifaceP2P,
 			RethMap:               cfg.RethToPhysical(),
+			ClusterMode:           d.cluster != nil,
 		}
 		for _, ri := range cfg.RoutingInstances {
 			vrfName := "vrf-" + ri.Name
@@ -3544,6 +3553,28 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 		copy(info.PeerMAC[:], peerMAC)
 		copy(info.LocalMAC[:], localMAC)
 
+		// Find a non-VRF interface for zone-decoded FIB lookups.
+		// The fabric interface is a VRF slave (vrf-mgmt), and
+		// bpf_fib_lookup honors l3mdev rules even with TBID, causing
+		// lookups to hit the VRF table instead of the main table.
+		links, lerr := netlink.LinkList()
+		if lerr == nil {
+			for _, l := range links {
+				a := l.Attrs()
+				if a.Index <= 1 || a.MasterIndex != 0 {
+					continue
+				}
+				if l.Type() == "vrf" || l.Type() == "veth" {
+					continue
+				}
+				if a.Flags&net.FlagUp == 0 {
+					continue
+				}
+				info.FIBIfindex = uint32(a.Index)
+				break
+			}
+		}
+
 		if d.dp == nil {
 			slog.Debug("cluster: dataplane not ready, retrying fabric_fwd")
 			continue
@@ -3554,6 +3585,7 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 		}
 		slog.Info("cluster: fabric cross-chassis redirect enabled",
 			"interface", fabIface, "ifindex", info.Ifindex,
+			"fib_ifindex", info.FIBIfindex,
 			"local_mac", localMAC, "peer_mac", peerMAC)
 		return
 	}
@@ -3664,6 +3696,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 	if d.rethMasterState == nil {
 		d.rethMasterState = make(map[int]bool)
 	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -3680,6 +3713,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				"state", ev.State.String())
 			if ev.State == vrrp.StateMaster {
 				d.rethMasterState[rgID] = true
+				d.removeBlackholeRoutes(rgID)
 				if d.dp != nil {
 					// In cluster mode, only set rg_active=true if the
 					// cluster state agrees this RG is locally primary.
@@ -3704,6 +3738,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					}
 					d.dp.BumpFIBGeneration()
 				}
+				d.injectBlackholeRoutes(rgID)
 				d.clearRethServicesForRG(rgID)
 			}
 		}
@@ -3728,6 +3763,70 @@ func rethInterfacesForRG(cfg *config.Config, rgID int) []string {
 		}
 	}
 	return names
+}
+
+// injectBlackholeRoutes adds blackhole routes for RETH subnets of the given
+// RG. Called on VRRP BACKUP transition — prevents bpf_fib_lookup from routing
+// return traffic via the default route (which would escape via WAN). Instead,
+// FIB returns BLACKHOLE and the BPF failure handler triggers fabric redirect.
+func (d *Daemon) injectBlackholeRoutes(rgID int) {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	if d.blackholeRoutes == nil {
+		d.blackholeRoutes = make(map[int][]netlink.Route)
+	}
+
+	var routes []netlink.Route
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc.RedundancyGroup != rgID || !strings.HasPrefix(name, "reth") {
+			continue
+		}
+		for _, unit := range ifc.Units {
+			for _, addr := range unit.Addresses {
+				_, ipNet, err := net.ParseCIDR(addr)
+				if err != nil {
+					slog.Warn("blackhole: failed to parse RETH address",
+						"rg", rgID, "iface", name, "addr", addr, "err", err)
+					continue
+				}
+				rt := netlink.Route{
+					Dst:      ipNet,
+					Type:     unix.RTN_BLACKHOLE,
+					Priority: 4242,
+				}
+				if err := netlink.RouteAdd(&rt); err != nil {
+					slog.Warn("blackhole: failed to add route",
+						"rg", rgID, "dst", ipNet, "err", err)
+					continue
+				}
+				routes = append(routes, rt)
+				slog.Info("blackhole: injected route for inactive RG",
+					"rg", rgID, "dst", ipNet)
+			}
+		}
+	}
+	d.blackholeRoutes[rgID] = routes
+}
+
+// removeBlackholeRoutes removes blackhole routes previously injected for the
+// given RG. Called on VRRP MASTER transition — the connected route returns
+// naturally when the VIP is added back.
+func (d *Daemon) removeBlackholeRoutes(rgID int) {
+	if d.blackholeRoutes == nil {
+		return
+	}
+	for _, rt := range d.blackholeRoutes[rgID] {
+		if err := netlink.RouteDel(&rt); err != nil {
+			slog.Warn("blackhole: failed to remove route",
+				"rg", rgID, "dst", rt.Dst, "err", err)
+		} else {
+			slog.Info("blackhole: removed route for active RG",
+				"rg", rgID, "dst", rt.Dst)
+		}
+	}
+	delete(d.blackholeRoutes, rgID)
 }
 
 // applyRethServicesForRG starts RA senders and Kea DHCP server only for

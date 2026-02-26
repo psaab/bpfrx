@@ -69,6 +69,12 @@ struct iface_zone_value {
 
 #define MAX_REDUNDANCY_GROUPS 16
 
+/* Fabric zone-encoded MAC marker for active/active per-RG cross-chassis
+ * forwarding of new connections.  Source MAC byte[3] = 0xfe indicates
+ * zone is encoded in byte[5].
+ * Mirrors FABRIC_ZONE_MAC_MAGIC in bpf/headers/bpfrx_common.h. */
+#define FABRIC_ZONE_MAC_MAGIC 0xfe
+
 /* Reverse mapping: sub-interface -> parent */
 struct vlan_iface_info {
 	uint32_t parent_ifindex;

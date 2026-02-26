@@ -98,10 +98,11 @@ type bpfrxXdpScreenDnatValueV6 struct {
 }
 
 type bpfrxXdpScreenFabricFwdInfo struct {
-	_        structs.HostLayout
-	Ifindex  uint32
-	PeerMac  [6]uint8
-	LocalMac [6]uint8
+	_          structs.HostLayout
+	Ifindex    uint32
+	FibIfindex uint32
+	PeerMac    [6]uint8
+	LocalMac   [6]uint8
 }
 
 type bpfrxXdpScreenFilterConfig struct {

@@ -525,9 +525,10 @@ type SNATValueV6 struct {
 // FabricFwdInfo mirrors the C struct fabric_fwd_info for cluster
 // cross-chassis forwarding via the fabric link.
 type FabricFwdInfo struct {
-	Ifindex  uint32  // fabric interface ifindex, 0 = disabled
-	PeerMAC  [6]byte // peer's fabric MAC
-	LocalMAC [6]byte // our fabric MAC
+	Ifindex    uint32  // fabric interface ifindex, 0 = disabled
+	FIBIfindex uint32  // non-VRF ifindex for zone-decoded FIB lookups
+	PeerMAC    [6]byte // peer's fabric MAC
+	LocalMAC   [6]byte // our fabric MAC
 }
 
 // MirrorConfig mirrors the C struct mirror_config for port mirroring.

@@ -93,6 +93,15 @@ type FullConfig struct {
 	// "load-balance consistent-hash". The daemon should set
 	// net.ipv4.fib_multipath_hash_policy=1 for L4 ECMP hashing.
 	ConsistentHash bool
+
+	// ClusterMode adds a blackhole default route with high admin distance
+	// (250) as a safety net for active/active per-RG failover.  When the
+	// WAN VIP moves to the peer, FRR withdraws the real default route
+	// (next-hop unreachable).  The blackhole default makes bpf_fib_lookup
+	// return BPF_FIB_LKUP_RET_BLACKHOLE instead of NOT_FWDED, triggering
+	// zone-encoded fabric redirect for new connections.  The real default
+	// route (AD 5 or 200) always takes priority when present.
+	ClusterMode bool
 }
 
 // Apply generates an FRR config from OSPF/BGP settings and reloads FRR.
@@ -220,7 +229,7 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	}
 
 	hasContent := fc.OSPF != nil || fc.OSPFv3 != nil || fc.BGP != nil || fc.RIP != nil || fc.ISIS != nil ||
-		len(fc.StaticRoutes) > 0 || len(fc.Inet6StaticRoutes) > 0 || len(fc.GenerateRoutes) > 0 || len(fc.DHCPRoutes) > 0 || fc.BackupRouter != ""
+		len(fc.StaticRoutes) > 0 || len(fc.Inet6StaticRoutes) > 0 || len(fc.GenerateRoutes) > 0 || len(fc.DHCPRoutes) > 0 || fc.BackupRouter != "" || fc.ClusterMode
 	for _, inst := range fc.Instances {
 		if inst.OSPF != nil || inst.OSPFv3 != nil || inst.BGP != nil || inst.RIP != nil || inst.ISIS != nil || len(inst.StaticRoutes) > 0 {
 			hasContent = true
@@ -316,6 +325,17 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 			prefix = "ipv6"
 		}
 		fmt.Fprintf(&b, "%s route %s %s 250\n", prefix, dst, fc.BackupRouter)
+		b.WriteString("!\n")
+	}
+
+	// Cluster mode: blackhole default route as fallback for fabric redirect.
+	// When the WAN VIP moves to the peer and FRR withdraws the real default,
+	// this blackhole makes bpf_fib_lookup return BLACKHOLE (not NOT_FWDED),
+	// triggering zone-encoded fabric redirect for new connections.
+	// AD=250 ensures real defaults (AD=5, DHCP AD=200) take priority.
+	if fc.ClusterMode {
+		fmt.Fprintf(&b, "ip route 0.0.0.0/0 Null0 250\n")
+		fmt.Fprintf(&b, "ipv6 route ::/0 Null0 250\n")
 		b.WriteString("!\n")
 	}
 

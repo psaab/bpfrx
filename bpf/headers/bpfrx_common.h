@@ -198,6 +198,7 @@ struct icmp6hdr {
 #define META_FLAG_NAT64_ICMP_ERR     (1 << 1)
 #define META_FLAG_KERNEL_ROUTE       (1 << 2)
 #define META_FLAG_TUNNEL             (1 << 3)  /* arrived via tunnel interface */
+#define META_FLAG_FABRIC_FWD         (1 << 4)  /* plain fabric redirect (not zone-encoded) */
 
 /* Per-rule logging flags (policy_rule.log and session_value.log_flags) */
 #define LOG_FLAG_SESSION_INIT  (1 << 0)
@@ -354,6 +355,14 @@ struct iface_zone_value {
 };
 
 #define MAX_REDUNDANCY_GROUPS 16
+
+/* Fabric zone-encoded MAC marker.  When redirecting a new connection
+ * across the fabric link, the ingress zone is encoded in the source
+ * MAC: {0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, zone_id}.
+ * The receiving node detects this magic prefix on the fabric interface
+ * and uses h_source[5] as the ingress zone.  This avoids VLAN tag
+ * issues (bridge filtering, SKB vlan_tci stripping in generic XDP). */
+#define FABRIC_ZONE_MAC_MAGIC 0xfe
 
 #define IFACE_FLAG_TUNNEL   (1 << 0)  /* GRE/IPsec tunnel interface */
 
