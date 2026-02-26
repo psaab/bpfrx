@@ -753,6 +753,18 @@ func (m *Manager) handlePeerTimeout() {
 	slog.Warn("cluster: peer heartbeat timeout, marking peer lost")
 	m.history.Record(EventHeartbeat, -1, "Peer heartbeat timeout")
 
+	// Clear ManualFailover on all RGs: the peer is dead, so the surviving
+	// node MUST be able to take over. Without this, a previous manual
+	// failover (which set Weight=0) prevents electSingleNode from
+	// promoting this node to primary.
+	for _, rg := range m.groups {
+		if rg.ManualFailover {
+			slog.Info("cluster: clearing manual failover (peer lost)", "rg", rg.GroupID)
+			rg.ManualFailover = false
+			m.recalcWeight(rg)
+		}
+	}
+
 	// Peer lost: re-run single-node election.
 	m.electSingleNode()
 }

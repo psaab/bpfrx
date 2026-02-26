@@ -68,6 +68,15 @@ for inst in bpfrx-fw0 bpfrx-fw1 cluster-lan-host; do
 	instance_running "$inst" || die "$inst is not running"
 done
 
+# Reset any stale manual failover flags from previous test runs.
+# Without this, fw1 can't take over during the reboot test because
+# ManualFailover blocks election even when the peer is lost.
+for rg in 0 1 2; do
+	incus exec bpfrx-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+	incus exec bpfrx-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+done
+sleep 2
+
 # Verify fw0 is primary
 fw0_status=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
 if echo "$fw0_status" | grep -q "node0.*primary"; then
@@ -195,19 +204,28 @@ fi
 
 # ── Phase 4b: Manual failover — fw0 becomes primary again ───────────
 
-info "Manual failover: requesting fw1 to failover RG0 to fw0"
+info "Manual failover: requesting fw1 to failover all RGs to fw0"
 
-# Execute manual failover on fw1 (current primary)
-incus exec bpfrx-fw1 -- cli -c 'request chassis cluster failover redundancy-group 0' 2>/dev/null || true
+# Execute manual failover on fw1 for all RGs (current primary).
+# Each RG must be explicitly failed over — RG0 alone doesn't move RG1/RG2
+# because per-RG election is independent with non-preempt.
+for rg in 0 1 2; do
+	incus exec bpfrx-fw1 -- cli -c "request chassis cluster failover redundancy-group $rg" 2>/dev/null || true
+done
 
 # Wait for failover to complete
 sleep 5
 
-# Verify fw0 is now primary
-if incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null | grep -q "node0.*primary"; then
-	pass "fw0 became primary after manual failover"
-else
-	fail "fw0 did not become primary after manual failover"
+# Verify fw0 is now primary for ALL RGs
+all_primary=true
+for rg in 0 1 2; do
+	if ! incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null | grep -A1 "Redundancy group: $rg" | grep -q "node0.*primary"; then
+		all_primary=false
+		fail "fw0 is not primary for RG$rg after manual failover"
+	fi
+done
+if $all_primary; then
+	pass "fw0 became primary for all RGs after manual failover"
 fi
 
 # Verify iperf3 survived manual failover
