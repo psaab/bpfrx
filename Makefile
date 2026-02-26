@@ -12,7 +12,7 @@ LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime
 # eBPF compilation flags
 BPF_CFLAGS := -O2 -g -Wall -Werror -target bpf
 
-.PHONY: all generate build build-ctl proto install clean test test-connectivity test-failover build-dpdk-worker build-dpdk clean-dpdk
+.PHONY: all generate build build-ctl proto install clean test test-connectivity test-failover test-active-active build-dpdk-worker build-dpdk clean-dpdk
 
 all: generate build build-ctl
 
@@ -94,6 +94,10 @@ test-connectivity:
 # Cluster failover test (iperf3 through reboot — requires cluster + iperf3 server)
 test-failover:
 	./test/incus/test-failover.sh
+
+# Active/active per-RG failover test (iperf3 through RG split — requires cluster + iperf3 server)
+test-active-active:
+	./test/incus/test-active-active.sh
 
 # Cluster HA test environment (two-VM chassis cluster)
 NODE ?= all
