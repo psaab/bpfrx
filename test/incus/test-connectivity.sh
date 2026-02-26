@@ -220,6 +220,10 @@ test_cluster() {
 		# Internet: LAN host → 1.1.1.1 (proves SNAT + routing through fw to internet)
 		internet_test "cluster-lan-host" "cluster: LAN host → internet (1.1.1.1)"
 
+		# Internet IPv6: LAN host → Google DNS IPv6 (proves IPv6 routing through fw)
+		ping6_test "cluster-lan-host" "2607:f8b0:4005:80e::200e" \
+			"cluster: LAN host → internet IPv6 (2607:f8b0:4005:80e::200e)"
+
 		# mtr path validation: verify traffic traverses RETH VIP to WAN gateway
 		mtr_test "cluster-lan-host" "172.16.50.1" "10.0.60.1" \
 			"cluster: mtr LAN→WAN gateway (path through RETH VIP)"
@@ -227,6 +231,10 @@ test_cluster() {
 		# mtr to internet: verify full path (RETH VIP → WAN gateway → internet)
 		mtr_test "cluster-lan-host" "1.1.1.1" "10.0.60.1" \
 			"cluster: mtr LAN→internet (path through RETH VIP)"
+
+		# mtr to internet IPv6: verify full IPv6 path through RETH VIP
+		mtr_test "cluster-lan-host" "2607:f8b0:4005:80e::200e" "2001:559:8585:cf01::1" \
+			"cluster: mtr LAN→internet IPv6 (path through RETH VIP)"
 	else
 		skip "cluster: LAN host tests (cluster-lan-host not running)"
 	fi
