@@ -39,7 +39,13 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 	// No peer info — single-node election.
 	if peerGroup == nil {
 		if !m.peerAlive {
-			// Peer lost or never seen.
+			// Non-preempt in cluster mode: don't claim primary on fresh
+			// boot before hearing from the peer. Wait for heartbeat
+			// timeout to confirm peer is truly down.
+			if !rg.Preempt && !m.peerEverSeen && rg.State == StateSecondary && m.controlInterface != "" {
+				return electNoChange, ""
+			}
+			// Peer lost (was alive, now timed out) or preempt mode.
 			if localWeight > 0 && rg.State != StatePrimary {
 				return electLocalPrimary, "Peer lost"
 			}

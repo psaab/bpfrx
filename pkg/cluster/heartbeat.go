@@ -224,6 +224,7 @@ type heartbeatReceiver struct {
 	lastSeen   atomic.Int64 // unix nano of last heartbeat
 	received   atomic.Uint64
 	recvErrors atomic.Uint64
+	startedAt  time.Time // when receiver started (for initial peer-lost detection)
 }
 
 func newHeartbeatSender(mgr *Manager, conn *net.UDPConn, peerAddr *net.UDPAddr, interval time.Duration) *heartbeatSender {
@@ -284,6 +285,7 @@ func newHeartbeatReceiver(mgr *Manager, conn *net.UDPConn, threshold int, interv
 }
 
 func (r *heartbeatReceiver) start() {
+	r.startedAt = time.Now()
 	r.wg.Add(2)
 	go r.readLoop()
 	go r.timeoutLoop()
@@ -354,8 +356,13 @@ func (r *heartbeatReceiver) timeoutLoop() {
 		case <-ticker.C:
 			lastNano := r.lastSeen.Load()
 			if lastNano == 0 {
-				// No heartbeat ever received — check if we've been running
-				// long enough to declare peer lost.
+				// No heartbeat ever received. Once we've waited the full
+				// timeout, declare peer absent so the election can proceed
+				// (non-preempt nodes start as secondary and need this to
+				// take primary when the peer is truly down).
+				if time.Since(r.startedAt) > timeout {
+					r.mgr.handlePeerNeverSeen()
+				}
 				continue
 			}
 			last := time.Unix(0, lastNano)

@@ -184,6 +184,21 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 	return nil
 }
 
+// ResignRG forces all VRRP instances for the given redundancy group
+// to resign by sending priority-0 adverts and transitioning to BACKUP.
+// Used when cluster state transitions from Primary to Secondary
+// (manual failover, weight drop, etc.) in non-preempt mode.
+func (m *Manager) ResignRG(rgID int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	vrid := 100 + rgID
+	for _, vi := range m.instances {
+		if vi.cfg.GroupID == vrid {
+			vi.triggerResign()
+		}
+	}
+}
+
 // ReconcileVIPs re-adds VIPs on any MASTER instances. Call this after
 // operations that may remove addresses (e.g. programRethMAC link down/up).
 func (m *Manager) ReconcileVIPs() {

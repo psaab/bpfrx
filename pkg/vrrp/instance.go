@@ -66,6 +66,7 @@ type vrrpInstance struct {
 	afPacketFD int
 
 	preemptNowCh chan struct{} // signals coordinated preemption from ReleaseSyncHold
+	resignCh     chan struct{} // signals forced resignation (manual failover)
 
 	rxCh    chan *VRRPPacket
 	stopCh  chan struct{}
@@ -81,6 +82,7 @@ func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent) *
 		eventCh:        eventCh,
 		afPacketFD:     -1,
 		preemptNowCh:   make(chan struct{}, 1),
+		resignCh:       make(chan struct{}, 1),
 		rxCh:           make(chan *VRRPPacket, 16),
 		stopCh:         make(chan struct{}),
 		stopped:        make(chan struct{}),
@@ -170,6 +172,15 @@ func (vi *vrrpInstance) triggerPreemptNow() {
 	}
 }
 
+// triggerResign signals the run loop to resign from MASTER by sending
+// priority-0 adverts and transitioning to BACKUP. Non-blocking.
+func (vi *vrrpInstance) triggerResign() {
+	select {
+	case vi.resignCh <- struct{}{}:
+	default:
+	}
+}
+
 func (vi *vrrpInstance) getPriority() int {
 	vi.mu.RLock()
 	defer vi.mu.RUnlock()
@@ -240,7 +251,19 @@ func (vi *vrrpInstance) run() {
 	vi.setState(StateBackup)
 	vi.emitEvent()
 
-	masterDownTimer := time.NewTimer(vi.masterDownInterval())
+	// Use an extended initial masterDown timer when preempt is disabled
+	// (either from config or sync hold). With short RETH intervals (30ms),
+	// the normal masterDown timer (~97ms) can fire before the AF_PACKET
+	// receiver starts capturing peer adverts — causing the returning node
+	// to erroneously become MASTER. A 3s initial timer gives enough time
+	// for the receiver to initialize and for the cluster election to
+	// determine our role. After the first received advert, handleBackupRx
+	// resets the timer to the normal short interval.
+	initialMasterDown := vi.masterDownInterval()
+	if !vi.getPreempt() {
+		initialMasterDown = 3 * time.Second
+	}
+	masterDownTimer := time.NewTimer(initialMasterDown)
 	defer masterDownTimer.Stop()
 
 	// Not used until we become Master.
@@ -288,6 +311,13 @@ func (vi *vrrpInstance) run() {
 			case <-advertTimer.C:
 				vi.sendAdvert(vi.getPriority())
 				advertTimer.Reset(vi.advertInterval())
+			case <-vi.resignCh:
+				// Forced resignation (manual failover / cluster Primary→Secondary).
+				slog.Info("vrrp: forced resignation", "key", vi.key())
+				for i := 0; i < 3; i++ {
+					vi.sendAdvert(0)
+				}
+				vi.becomeBackup(masterDownTimer, advertTimer)
 			}
 		}
 	}

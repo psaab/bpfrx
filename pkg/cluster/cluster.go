@@ -83,6 +83,7 @@ type Manager struct {
 
 	// Peer state tracking (heartbeat).
 	peerAlive    bool
+	peerEverSeen bool // true once first heartbeat received; distinguishes "never heard" from "lost"
 	peerNodeID   int
 	peerGroups   map[int]PeerGroupState
 	peerMonitors []InterfaceMonitorInfo
@@ -237,9 +238,20 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 
 // electSingleNode performs election when no heartbeat peer is present.
 // In single-node mode, the local node is always primary if weight > 0.
+// Non-preempt exception: if the peer has never been seen (fresh boot),
+// stay secondary and wait for the heartbeat timeout to confirm the peer
+// is truly absent before claiming primary.
 func (m *Manager) electSingleNode() {
 	for _, rg := range m.groups {
 		if rg.State == StateDisabled || rg.ManualFailover {
+			continue
+		}
+		// Non-preempt in cluster mode: don't claim primary on fresh boot
+		// before hearing from the peer. The peer may be running as
+		// primary — wait for heartbeat timeout to confirm it's truly
+		// down. controlInterface != "" indicates cluster mode (heartbeat
+		// configured); standalone nodes always elect immediately.
+		if !rg.Preempt && !m.peerEverSeen && rg.State == StateSecondary && m.controlInterface != "" {
 			continue
 		}
 		oldState := rg.State
@@ -635,6 +647,7 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 
 	wasAlive := m.peerAlive
 	m.peerAlive = true
+	m.peerEverSeen = true
 	m.peerNodeID = int(pkt.NodeID)
 
 	// Update peer group states.
@@ -694,6 +707,23 @@ func (m *Manager) handlePeerTimeout() {
 	m.history.Record(EventHeartbeat, -1, "Peer heartbeat timeout")
 
 	// Peer lost: re-run single-node election.
+	m.electSingleNode()
+}
+
+// handlePeerNeverSeen is called when the heartbeat timeout expires and no
+// peer heartbeat has ever been received. This confirms the peer is truly
+// absent (not just a fresh boot race). Sets peerEverSeen so non-preempt
+// nodes can claim primary via electSingleNode.
+func (m *Manager) handlePeerNeverSeen() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.peerEverSeen {
+		return // already handled
+	}
+	m.peerEverSeen = true // no longer "never seen" — now "confirmed absent"
+	slog.Info("cluster: peer never seen after heartbeat timeout, proceeding with election")
+	m.history.Record(EventHeartbeat, -1, "Peer never seen (timeout)")
 	m.electSingleNode()
 }
 

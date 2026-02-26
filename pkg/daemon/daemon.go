@@ -3284,35 +3284,14 @@ func (d *Daemon) pushConfigToPeer() {
 }
 
 // handleConfigSync processes a config received from the cluster primary.
-// It preserves the local chassis cluster settings (node ID, peer addresses)
-// and applies the rest of the config.
+// The received config includes the groups section with per-node settings
+// (node ID, peer addresses) and shared chassis settings. Per-node
+// differentiation is handled at compile time by CompileConfigForNode
+// using the local node-id, so no chassis preservation is needed.
 func (d *Daemon) handleConfigSync(configText string) {
 	slog.Info("cluster: applying synced config from primary")
 
-	// Get local chassis cluster settings before overwrite.
-	localCfg := d.store.ActiveConfig()
-	var localChassisNode *config.Node
-	if localCfg != nil {
-		localTree := d.store.ActiveTree()
-		if localTree != nil {
-			localChassisNode = localTree.FindChild("chassis")
-		}
-	}
-
-	compiled, err := d.store.SyncApply(configText, func(tree *config.ConfigTree) {
-		// Preserve local chassis cluster settings.
-		if localChassisNode != nil {
-			// Replace the received chassis node with local one.
-			for i, child := range tree.Children {
-				if len(child.Keys) > 0 && child.Keys[0] == "chassis" {
-					tree.Children[i] = localChassisNode
-					return
-				}
-			}
-			// No chassis node in received config — add local one.
-			tree.Children = append(tree.Children, localChassisNode)
-		}
-	})
+	compiled, err := d.store.SyncApply(configText, nil)
 	if err != nil {
 		slog.Error("cluster: config sync apply failed", "err", err)
 		return
@@ -3581,6 +3560,14 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case ev := <-d.cluster.Events():
+			// Immediate VRRP resign on Primary→Secondary transition.
+			// Must happen before the debounced priority update so the peer
+			// receives priority-0 adverts and takes over promptly.
+			if ev.OldState == cluster.StatePrimary &&
+				(ev.NewState == cluster.StateSecondary || ev.NewState == cluster.StateSecondaryHold) {
+				d.vrrpMgr.ResignRG(ev.GroupID)
+			}
+
 			// Debounced VRRP priority update — 500ms coalesce window.
 			if vrrpTimer != nil {
 				vrrpTimer.Stop()

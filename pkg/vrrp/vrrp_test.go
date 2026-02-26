@@ -67,8 +67,8 @@ func TestCollectRethInstances(t *testing.T) {
 	if inst0.Priority != 200 {
 		t.Errorf("inst0.Priority = %d, want 200", inst0.Priority)
 	}
-	if !inst0.Preempt {
-		t.Error("inst0.Preempt should be true")
+	if inst0.Preempt {
+		t.Error("inst0.Preempt should be false (no RG preempt config)")
 	}
 	if !inst0.AcceptData {
 		t.Error("inst0.AcceptData should be true")
@@ -713,5 +713,171 @@ func TestUpdateConfig_PreservesDesiredPreempt(t *testing.T) {
 	vi.mu.RUnlock()
 	if dp {
 		t.Error("desiredPreempt should be false after updateConfig")
+	}
+}
+
+// --- Preempt wiring tests ---
+
+func TestCollectRethInstances_PreemptFromRGConfig(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name:            "reth0",
+					RedundancyGroup: 1,
+					Units: map[int]*config.InterfaceUnit{
+						0: {Addresses: []string{"10.0.1.1/24"}},
+					},
+				},
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
+				"reth1": {
+					Name:            "reth1",
+					RedundancyGroup: 2,
+					Units: map[int]*config.InterfaceUnit{
+						0: {Addresses: []string{"10.0.2.1/24"}},
+					},
+				},
+				"ge-0/0/1": {Name: "ge-0/0/1", RedundantParent: "reth1"},
+			},
+		},
+		Chassis: config.ChassisConfig{
+			Cluster: &config.ClusterConfig{
+				RedundancyGroups: []*config.RedundancyGroup{
+					{ID: 1, Preempt: true},
+					{ID: 2, Preempt: false},
+				},
+			},
+		},
+	}
+	instances := CollectRethInstances(cfg, map[int]int{1: 200, 2: 100})
+	if len(instances) != 2 {
+		t.Fatalf("expected 2 instances, got %d", len(instances))
+	}
+	// RG1 has preempt=true, RG2 has preempt=false.
+	if !instances[0].Preempt {
+		t.Error("inst0 (RG1) should have Preempt=true")
+	}
+	if instances[1].Preempt {
+		t.Error("inst1 (RG2) should have Preempt=false")
+	}
+}
+
+func TestCollectRethInstances_NoPreemptByDefault(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name:            "reth0",
+					RedundancyGroup: 1,
+					Units: map[int]*config.InterfaceUnit{
+						0: {Addresses: []string{"10.0.1.1/24"}},
+					},
+				},
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
+			},
+		},
+		// No cluster config — preempt defaults to false.
+	}
+	instances := CollectRethInstances(cfg, map[int]int{1: 200})
+	if len(instances) != 1 {
+		t.Fatalf("expected 1 instance, got %d", len(instances))
+	}
+	if instances[0].Preempt {
+		t.Error("Preempt should default to false when no RG config")
+	}
+}
+
+// --- Resign channel tests ---
+
+func TestResignCh_Initialized(t *testing.T) {
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+
+	if vi.resignCh == nil {
+		t.Fatal("resignCh should be initialized")
+	}
+	if cap(vi.resignCh) != 1 {
+		t.Errorf("resignCh capacity = %d, want 1", cap(vi.resignCh))
+	}
+}
+
+func TestTriggerResign_NonBlocking(t *testing.T) {
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+
+	// First call should succeed (buffer of 1).
+	vi.triggerResign()
+	if len(vi.resignCh) != 1 {
+		t.Error("expected 1 pending signal after first trigger")
+	}
+
+	// Second call should NOT block (buffer full, silently dropped).
+	done := make(chan struct{})
+	go func() {
+		vi.triggerResign()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// ok — did not block
+	case <-time.After(1 * time.Second):
+		t.Fatal("triggerResign blocked on full channel")
+	}
+
+	// Still exactly 1 pending signal.
+	if len(vi.resignCh) != 1 {
+		t.Errorf("expected 1 pending signal, got %d", len(vi.resignCh))
+	}
+}
+
+func TestResignRG_SignalsCorrectInstances(t *testing.T) {
+	m := NewManager()
+
+	// Create instances for two different RGs.
+	vi1 := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101, // VRID 101 = RG 1
+		Priority:  200,
+	}, &net.Interface{Name: "eth0"}, m.eventCh)
+
+	vi2 := newInstance(Instance{
+		Interface: "eth1",
+		GroupID:   102, // VRID 102 = RG 2
+		Priority:  200,
+	}, &net.Interface{Name: "eth1"}, m.eventCh)
+
+	vi3 := newInstance(Instance{
+		Interface: "eth2",
+		GroupID:   101, // VRID 101 = RG 1 (second instance, same RG)
+		Priority:  200,
+	}, &net.Interface{Name: "eth2"}, m.eventCh)
+
+	m.mu.Lock()
+	m.instances = map[instanceKey]*vrrpInstance{
+		{iface: "eth0", groupID: 101}: vi1,
+		{iface: "eth1", groupID: 102}: vi2,
+		{iface: "eth2", groupID: 101}: vi3,
+	}
+	m.mu.Unlock()
+
+	// Resign RG 1 — should signal vi1 and vi3, not vi2.
+	m.ResignRG(1)
+
+	if len(vi1.resignCh) != 1 {
+		t.Error("vi1 (RG1) should have resign signal")
+	}
+	if len(vi2.resignCh) != 0 {
+		t.Error("vi2 (RG2) should NOT have resign signal")
+	}
+	if len(vi3.resignCh) != 1 {
+		t.Error("vi3 (RG1) should have resign signal")
 	}
 }

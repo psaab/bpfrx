@@ -74,6 +74,7 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 	// Read cluster-level settings for RETH VRRP instances.
 	advertInterval := 30 // 30ms default for sub-100ms failover
 	garpCounts := map[int]int{}
+	preemptMap := map[int]bool{}
 	if cc := cfg.Chassis.Cluster; cc != nil {
 		if cc.RethAdvertiseInterval > 0 {
 			advertInterval = cc.RethAdvertiseInterval
@@ -82,6 +83,7 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 			if rg.GratuitousARPCount > 0 {
 				garpCounts[rg.ID] = rg.GratuitousARPCount
 			}
+			preemptMap[rg.ID] = rg.Preempt
 		}
 	}
 
@@ -138,7 +140,7 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 					Interface:         subIface,
 					GroupID:           100 + rgID,
 					Priority:          pri,
-					Preempt:           true,
+					Preempt:           preemptMap[rgID],
 					AcceptData:        true,
 					AdvertiseInterval: advertInterval,
 					GARPCount:         gc,
@@ -157,7 +159,7 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 				Interface:         linuxName,
 				GroupID:           100 + rgID,
 				Priority:          pri,
-				Preempt:           true,
+				Preempt:           preemptMap[rgID],
 				AcceptData:        true,
 				AdvertiseInterval: advertInterval,
 				GARPCount:         gc,
