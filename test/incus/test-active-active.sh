@@ -59,6 +59,10 @@ cleanup() {
 	# Reset any manual failovers
 	incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1' 2>/dev/null || true
 	incus exec bpfrx-fw1 -- cli -c 'request chassis cluster failover reset redundancy-group 1' 2>/dev/null || true
+	# With preempt=false, resetting the flag alone doesn't move VRRP.
+	# Explicitly request RG1 back to fw0 so the next test starts clean.
+	incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0' 2>/dev/null || true
+	sleep 2
 }
 
 trap cleanup EXIT

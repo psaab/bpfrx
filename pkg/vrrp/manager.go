@@ -230,6 +230,27 @@ func (m *Manager) UpdateRGPriority(rgID int, priority int) {
 	}
 }
 
+// ForceRGMaster forces all VRRP instances for the given redundancy group
+// to become MASTER, even with preempt=false. Used when the cluster state
+// machine has determined this node is primary for the RG but VRRP hasn't
+// transitioned (e.g. after failover reset with preempt=false).
+// Temporarily enables preempt, signals preemptNow, then restores.
+func (m *Manager) ForceRGMaster(rgID int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	vrid := 100 + rgID
+	for _, vi := range m.instances {
+		if vi.cfg.GroupID == vrid && vi.getState() != StateMaster {
+			slog.Info("vrrp: forcing MASTER (cluster authoritative)",
+				"key", vi.key())
+			vi.mu.Lock()
+			vi.cfg.Preempt = true
+			vi.mu.Unlock()
+			vi.triggerPreemptNow()
+		}
+	}
+}
+
 // ReconcileVIPs re-adds VIPs on any MASTER instances. Call this after
 // operations that may remove addresses (e.g. programRethMAC link down/up).
 func (m *Manager) ReconcileVIPs() {

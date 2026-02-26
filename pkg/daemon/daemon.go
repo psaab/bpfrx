@@ -3587,6 +3587,10 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			}
 			if ev.NewState == cluster.StatePrimary {
 				d.vrrpMgr.UpdateRGPriority(ev.GroupID, 200)
+				// With preempt=false, VRRP won't self-elect even at
+				// higher priority. Force MASTER since cluster state
+				// is authoritative (e.g. after failover reset).
+				d.vrrpMgr.ForceRGMaster(ev.GroupID)
 			}
 
 			// Update BPF rg_active map directly from cluster state.
