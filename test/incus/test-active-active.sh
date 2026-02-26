@@ -75,6 +75,23 @@ for inst in bpfrx-fw0 bpfrx-fw1 cluster-lan-host; do
 	instance_running "$inst" || die "$inst is not running"
 done
 
+# Reset any stale manual failover flags from previous test runs.
+for rg in 0 1 2; do
+	incus exec bpfrx-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+	incus exec bpfrx-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+done
+sleep 2
+
+# Ensure all RGs are on fw0 (request peer failover if needed)
+fw0_status=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
+for rg in 0 1 2; do
+	rg_primary=$(echo "$fw0_status" | grep -A2 "Redundancy group: $rg" | grep "node0" | grep -c "primary" || true)
+	if [[ "$rg_primary" -ne 1 ]]; then
+		incus exec bpfrx-fw0 -- cli -c "request chassis cluster failover redundancy-group $rg node 0" 2>/dev/null || true
+	fi
+done
+sleep 3
+
 # Verify fw0 is primary for all RGs
 fw0_status=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
 rg0_primary=$(echo "$fw0_status" | grep -A2 "Redundancy group: 0" | grep "node0" | grep -c "primary" || true)
@@ -103,7 +120,7 @@ sleep 1
 info "Phase 1: Starting iperf3 -P${IPERF_STREAMS} -t${IPERF_DURATION} → ${IPERF_TARGET}"
 
 incus exec cluster-lan-host -- bash -c \
-	"iperf3 --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > /tmp/iperf3-active-active.log 2>&1 &"
+	"iperf3 --forceflush --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > /tmp/iperf3-active-active.log 2>&1 &"
 
 sleep 8  # all parallel streams must be fully established before failover
 
@@ -210,6 +227,35 @@ if incus exec cluster-lan-host -- pgrep -x iperf3 &>/dev/null; then
 	fi
 else
 	fail "iperf3 died after RG reunification"
+fi
+
+# ── Phase 6: Wait for iperf3 to complete and validate results ─────────
+
+info "Waiting for iperf3 to complete"
+
+for i in $(seq 1 "$IPERF_DURATION"); do
+	if ! incus exec cluster-lan-host -- pgrep -x iperf3 &>/dev/null; then
+		break
+	fi
+	sleep 1
+done
+
+# Check iperf3 completed successfully
+if incus exec cluster-lan-host -- grep -q "iperf Done" /tmp/iperf3-active-active.log 2>/dev/null; then
+	pass "iperf3 completed successfully"
+
+	# Extract final throughput
+	throughput=$(incus exec cluster-lan-host -- grep '\[SUM\].*sender' /tmp/iperf3-active-active.log 2>/dev/null \
+		| grep -oP '[\d.]+\s+Gbits' | grep -oP '[\d.]+' || echo "0")
+
+	if [[ -n "$throughput" ]] && awk "BEGIN{exit !($throughput >= $MIN_THROUGHPUT)}"; then
+		pass "iperf3 throughput: ${throughput} Gbps (>= ${MIN_THROUGHPUT} Gbps)"
+	else
+		fail "iperf3 throughput too low: ${throughput} Gbps (expected >= ${MIN_THROUGHPUT} Gbps)"
+	fi
+else
+	iperf_log=$(incus exec cluster-lan-host -- tail -5 /tmp/iperf3-active-active.log 2>/dev/null || echo "(no log)")
+	fail "iperf3 did not complete: $iperf_log"
 fi
 
 # ── Cleanup & Results ────────────────────────────────────────────────

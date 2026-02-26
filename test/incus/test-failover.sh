@@ -101,7 +101,7 @@ sleep 1
 info "Starting iperf3 -P${IPERF_STREAMS} -t${IPERF_DURATION} → ${IPERF_TARGET}"
 
 incus exec cluster-lan-host -- bash -c \
-	"iperf3 --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > /tmp/iperf3-failover.log 2>&1 &"
+	"iperf3 --forceflush --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > /tmp/iperf3-failover.log 2>&1 &"
 
 sleep 8  # all parallel streams must be fully established before failover
 
