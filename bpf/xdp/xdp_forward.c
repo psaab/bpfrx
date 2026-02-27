@@ -82,6 +82,12 @@ int xdp_forward_prog(struct xdp_md *ctx)
 						meta->ingress_vlan_id) < 0)
 					return XDP_DROP;
 			}
+			/* Belt-and-suspenders: catch any FABRIC_FWD
+			 * packets that slip through to KERNEL_ROUTE.
+			 * Passing SNAT'd fabric traffic to kernel
+			 * causes RSTs and cwnd collapse. */
+			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
+				return XDP_DROP;
 			inc_counter(GLOBAL_CTR_HOST_INBOUND);
 			return XDP_PASS;
 		}

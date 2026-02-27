@@ -3648,8 +3648,13 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 							slog.Warn("failed to update rg_active from cluster event",
 								"rg", ev.GroupID, "active", true, "err", err)
 						}
-						d.dp.BumpFIBGeneration()
 					}
+					// Always bump FIB generation on Primary transition,
+					// even when deferring rg_active to VRRP MASTER.
+					// This ensures sessions get fresh FIB lookups and
+					// don't use stale cached egress info from before
+					// the transition.
+					d.dp.BumpFIBGeneration()
 				} else {
 					// Set rg_active=false immediately on Secondary
 					// transition — stop accepting traffic right away.

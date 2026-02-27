@@ -640,8 +640,17 @@ zone_resolved:
 						try_fabric_redirect(ctx, meta);
 					if (fab_rc >= 0)
 						return fab_rc;
-					/* Anti-loop or fabric down —
-					 * fall through to kernel route. */
+					/* Fabric-forwarded + anti-loop:
+					 * both nodes have this RG inactive
+					 * (failback transition window).
+					 * KERNEL_ROUTE would SNAT and leak
+					 * to kernel, causing TCP damage
+					 * (RSTs, cwnd collapse). Drop
+					 * cleanly — TCP retransmits recover
+					 * after the ~30ms window. */
+					if (meta->meta_flags &
+					    META_FLAG_FABRIC_FWD)
+						return XDP_DROP;
 					meta->meta_flags |=
 						META_FLAG_KERNEL_ROUTE;
 					bpf_tail_call(ctx, &xdp_progs,
@@ -806,12 +815,16 @@ zone_resolved:
 				return fab_rc;
 		}
 		if (sv4 != NULL) {
+			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
+				return XDP_DROP;
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
 		if (sv6 != NULL) {
+			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
+				return XDP_DROP;
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
@@ -874,12 +887,16 @@ zone_resolved:
 			}
 		}
 		if (sv4 != NULL) {
+			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
+				return XDP_DROP;
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
 		if (sv6 != NULL) {
+			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
+				return XDP_DROP;
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);

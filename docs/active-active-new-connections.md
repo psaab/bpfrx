@@ -629,6 +629,65 @@ TCP RTO (~200ms) > window duration. But one stream's congestion window collapses
 to 1 MSS, and with 3 other streams at full throughput competing for bandwidth,
 the collapsed stream cannot reclaim capacity.
 
+## Bug: SNAT'd Packets Leak to Kernel via KERNEL_ROUTE on Fabric Peer
+
+### Symptom
+
+Rapid repeated failover cycles (fw0→fw1→fw0→fw1...) permanently kill 2+
+iperf3 streams. Streams show cwnd collapsed to 1 MSS, 0 bytes on receiver,
+"Broken pipe". Single-cycle failovers work fine.
+
+### Root Cause
+
+During failback (e.g. RG1: fw1 → fw0), there's a ~30ms window where **both
+nodes** have `rg_active[1]=false`:
+- fw0: waiting for VRRP MASTER (deferred by the previous fix)
+- fw1: cluster Secondary already set rg_active=false
+
+When a fabric-forwarded packet's egress RG is inactive and anti-loop prevents
+fabric redirect back, the code fell through to `META_FLAG_KERNEL_ROUTE`. This
+caused SNAT'd packets to leak to the kernel:
+
+1. Packet arrives at fw0 LAN → session found → RG inactive → fabric-redirect to fw1 (pre-NAT, good)
+2. On fw1: FABRIC_FWD + session found → FIB for destination → RG inactive →
+   try_fabric_redirect → ANTI-LOOP (came from fabric!) → falls through
+3. KERNEL_ROUTE path: conntrack → NAT (SNAT applied!) → xdp_forward re-FIB on
+   SNAT'd packet → uses fabric VRF context → FIB fails → try_fabric_redirect →
+   ANTI-LOOP → XDP_PASS
+4. Kernel receives SNAT'd packet in fabric VRF context → can't route → drops or
+   forwards via stale route
+
+**TCP damage per cycle:**
+- Kernel drop: clean packet loss, TCP retransmits recover (OK in isolation)
+- Kernel forward: duplicate data with different timing → duplicate ACKs → TCP
+  fast recovery halves cwnd
+- Kernel sees SNAT'd dst (local VIP + SNAT port), no socket → TCP RST → "Broken pipe"
+
+Each failover cycle compounds the damage. After several cycles, some streams'
+cwnd is permanently collapsed.
+
+### Fix
+
+Drop FABRIC_FWD packets cleanly instead of falling through to KERNEL_ROUTE.
+The ~30ms failover window will close and TCP retransmits succeed (200ms RTO >
+30ms window).
+
+Three guard points in BPF:
+
+1. **xdp_zone.c — Post-FIB RG check:** When `try_fabric_redirect()` returns -1
+   (anti-loop) and `META_FLAG_FABRIC_FWD` is set, `return XDP_DROP` instead of
+   setting `META_FLAG_KERNEL_ROUTE`
+
+2. **xdp_zone.c — BLACKHOLE handler:** Before setting `META_FLAG_KERNEL_ROUTE`
+   for sessions with BLACKHOLE FIB result, check `META_FLAG_FABRIC_FWD` and drop
+
+3. **xdp_forward.c — KERNEL_ROUTE XDP_PASS fallback:** Belt-and-suspenders
+   check before the final `XDP_PASS` in the KERNEL_ROUTE path
+
+Additionally, `BumpFIBGeneration()` is now called on every cluster Primary
+transition, not just when `rethMasterState` is true. This prevents sessions
+from using stale cached FIB results during transitions.
+
 ## References
 
 - AA-1 sprint: `23f1a3d` — Per-RG active state tracking in BPF
