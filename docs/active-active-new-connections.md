@@ -1,102 +1,589 @@
 # Active/Active Per-RG: New Connection Support
 
+Commit `83c9333`. Builds on AA-1 (`23f1a3d`) which solved existing connections.
+
 ## Problem
 
 In active/active HA (per-RG split), **existing** TCP connections survive when
-RG1 (WAN) moves to fw1 while RG2 (LAN) stays on fw0. However, **new**
-connections fail with "no route to host".
+RG1 (WAN) moves to fw1 while RG2 (LAN) stays on fw0 — the AA-1 sprint solved
+this with per-RG active state tracking in BPF.
 
-### Root Cause — Two Interacting Failures
+However, **new** connections fail. A fresh `ping` or TCP handshake from the LAN
+host cannot reach the internet through the split cluster.
 
-#### Forward path (SYN: LAN host → internet via fw0)
+## Topology During Split
+
+```
+                    ┌─────────────────┐
+                    │   WAN Router    │
+                    │  172.16.50.1    │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+    ┌─────────┴─────────┐       ┌───────────┴───────────┐
+    │      fw0          │       │        fw1            │
+    │                   │       │                       │
+    │  ge-0-0-1.50      │       │  ge-7-0-1.50          │
+    │  (WAN — BACKUP)   │       │  (WAN — MASTER)       │
+    │  RG1 inactive     │       │  RG1 active           │
+    │                   │ fab0  │                       │
+    │  ─────────────────├───────┤─────────────────────  │
+    │  10.99.1.1        │       │  10.99.1.2            │
+    │  (vrf-mgmt)       │       │  (vrf-mgmt)           │
+    │                   │       │                       │
+    │  ge-0-0-0         │       │  ge-7-0-0             │
+    │  (LAN — MASTER)   │       │  (LAN — BACKUP)       │
+    │  RG2 active       │       │  RG2 inactive         │
+    └─────────┬─────────┘       └───────────┬───────────┘
+              │                             │
+              └──────────────┬──────────────┘
+                             │
+                    ┌────────┴────────┐
+                    │  LAN Hosts      │
+                    │  10.0.60.0/24   │
+                    │  VIP: 10.0.60.1 │
+                    └─────────────────┘
+```
+
+Key: RG1 (WAN) is on fw1, RG2 (LAN) is on fw0. Traffic from LAN to internet
+must cross the fabric link between fw0 and fw1.
+
+## Root Cause Analysis
+
+### Forward path failure (SYN: LAN host → internet via fw0)
 
 On fw0 (LAN active, WAN inactive):
+
 1. SYN arrives on LAN interface (RG2, locally active) — zone lookup succeeds
-2. No session exists (new connection) — previous code skipped fabric redirect
-3. `bpf_fib_lookup` for internet dst **fails** — RETH VIP removed when RG1
-   moved, connected route gone, default route withdrawn by FRR
-4. FIB failure handler tries `try_fabric_redirect()` — packet reaches fw1
-5. **BUT** on fw1: packet arrives on fabric → zone = "control" (fab0) →
-   policy uses control→wan → no matching policy → **DROP**
+   (ingress_zone = lan).
 
-The receiving node has no way to know the packet's *original* ingress zone.
+2. No session exists (new connection). AA-1 code only fabric-redirected
+   **existing sessions** when the egress RG was inactive. New connections fell
+   through to FIB lookup.
 
-#### Return path (SYN-ACK: server → LAN host via fw1)
+3. `bpf_fib_lookup` for internet destination (e.g., 172.16.100.247):
+   - WAN RETH VIP (172.16.50.6) was removed when RG1 moved to fw1
+   - Connected route to 172.16.50.0/24 is gone
+   - Next-hop 172.16.50.1 becomes unreachable in FRR's RIB
+   - FRR **withdraws the default route** (`default via 172.16.50.1`)
+   - Without any default route, FIB returns `BPF_FIB_LKUP_RET_NOT_FWDED` (rc=4)
+
+4. FIB failure handler: the `NOT_FWDED` code path is for locally-destined
+   traffic (heartbeat, control plane). It does NOT try fabric redirect — the
+   packet falls through to `XDP_PASS` for local delivery. But this is transit
+   traffic, not local. It gets dropped by the kernel (no route).
+
+   **Root cause #1:** FIB returns `NOT_FWDED` instead of `BLACKHOLE` because
+   there's no blackhole catch-all route when the real default is withdrawn.
+
+5. Even if FIB returned BLACKHOLE and the failure handler fired
+   `try_fabric_redirect()`, the peer (fw1) would receive the packet on fab0.
+   fab0 is in the "control" security zone. fw1's zone-based policy would use
+   **control→wan** (not lan→wan), and there's no matching policy — **DROP**.
+
+   **Root cause #2:** The receiving node uses fab0's zone ("control") instead
+   of the original ingress zone ("lan").
+
+### Return path failure (SYN-ACK: server → LAN host via fw1)
 
 On fw1 (WAN active, LAN inactive):
-1. SYN-ACK arrives on WAN (RG1, locally active)
-2. No synced session yet (sync sweep is 1s, SYN-ACK arrives in ~50ms)
-3. `bpf_fib_lookup` for LAN host — LAN connected route gone, but **default
-   route** still exists → routes packet back out WAN → **lost**
 
-## Solution
+1. SYN-ACK arrives on WAN (RG1, locally active) — zone lookup succeeds.
+
+2. No synced session yet — session sync sweep runs at 1-second intervals, but
+   SYN-ACK arrives in ~50ms after the SYN.
+
+3. `bpf_fib_lookup` for LAN host (10.0.60.102):
+   - LAN connected route (10.0.60.0/24) is gone because RG2 VIP was removed
+   - But the **default route still exists** (fw1's WAN is active, default via
+     172.16.50.1 works)
+   - FIB returns **SUCCESS** with egress = WAN interface
+
+4. Packet is routed back out the WAN interface (hairpin) → escapes to the
+   internet → **lost**.
+
+   **Root cause #3:** No blackhole route for the LAN subnet on fw1, so return
+   traffic for LAN destinations matches the default route instead of being
+   fabric-redirected.
+
+### SNAT reverse path complication
+
+Even when fabric redirect succeeds for return traffic with existing sessions,
+a subtle NAT ordering bug caused failures:
+
+1. SNAT reply arrives at fw1's WAN (dst = SNAT VIP, e.g. 172.16.50.6).
+
+2. **Pre-routing NAT** (`dnat_table` lookup at `xdp_zone.c:289-311`) rewrites
+   `meta->dst_ip` from SNAT VIP to original client IP (10.0.60.102). This is
+   how SNAT reply matching works — the `dnat_table` entry maps
+   `(proto, SNAT_IP, SNAT_port) → (original_client_IP, original_port)`.
+
+   **Critical:** This only rewrites the **meta field**, not the actual packet
+   header. The packet still contains dst = SNAT VIP.
+
+3. Session lookup succeeds (using the meta-rewritten original client IP).
+
+4. `bpf_fib_lookup` for 10.0.60.102 hits BLACKHOLE (injected route).
+
+5. **BUG:** The BLACKHOLE handler immediately called `try_fabric_redirect()`.
+   The packet is sent to the peer with **unrewritten headers** (dst = SNAT VIP).
+   The peer can't reverse the SNAT because the `dnat_table` entry only exists
+   on the originating node.
+
+   **Root cause #4:** BLACKHOLE handler must not fabric-redirect when a session
+   exists. The packet needs NAT reversal first via the
+   conntrack→NAT→forward pipeline.
+
+### VRF routing table mismatch for fabric traffic
+
+`fab0` is in VRF mgmt (routing table 999). VRF mgmt has its own default route
+(`default via 10.0.100.1 dev fxp0`). When a packet arrives on fab0 via plain
+fabric redirect (`META_FLAG_FABRIC_FWD`):
+
+1. Without a session, the routing table override to 254 (main table) doesn't
+   fire — the override is guarded by session presence.
+
+2. `bpf_fib_lookup` uses VRF mgmt table 999, which has a default route.
+
+3. FIB returns **SUCCESS** with egress = `fxp0` (management interface). This is
+   the **wrong egress** — the packet should go to a data-plane interface.
+
+4. Additionally, `bpf_fib_lookup` with `BPF_FIB_LOOKUP_TBID` set to 254 (main
+   table) **still honors l3mdev rules** when `fib.ifindex` belongs to a VRF.
+   The lookup hits the VRF table instead of the requested table.
+
+   **Root cause #5:** Must use a non-VRF `fib.ifindex` for main table lookups.
+
+## Solution: Three-Part Fix
 
 ### Part 1: Zone-Encoded Fabric Redirect (BPF)
 
-Encode the original ingress zone in the source MAC when sending new connections
-across fabric.  The source MAC is set to `02:bf:72:fe:00:ZZ` where ZZ is the
-zone ID (`FABRIC_ZONE_MAC_MAGIC = 0xfe`).
+When a new connection arrives on one node but the egress RG is on the peer,
+encode the original ingress zone in the source MAC before fabric redirect.
 
-**Why MAC encoding instead of VLAN tags:** Linux bridges strip 802.1Q VLAN
-tags into `skb->vlan_tci` before generic XDP runs, making VLAN-encoded zones
-invisible to the BPF program.  MAC-based encoding uses plain Ethernet frames
+#### Why MAC encoding, not VLAN tags
+
+Initial implementation used VLAN tags (`FABRIC_ZONE_VLAN_BASE + zone_id`).
+This failed because Linux bridges strip 802.1Q VLAN tags into `skb->vlan_tci`
+before generic XDP runs. The BPF program never sees the VLAN tag — it's already
+been consumed by the bridge layer. MAC-based encoding uses plain Ethernet frames
 that traverse bridges without any stripping or filtering issues.
 
-**Sender** (`try_fabric_redirect_with_zone()` in `bpfrx_helpers.h`):
-- Set source MAC to `{0x02, 0xbf, 0x72, 0xfe, 0x00, ingress_zone}`
-- Set dest MAC to fabric peer, redirect via fabric
+#### Sender: `try_fabric_redirect_with_zone()` (`bpfrx_helpers.h:1887-1916`)
 
-**Receiver** (xdp_zone.c zone detection):
-- If source MAC matches `02:bf:72:fe:??:ZZ` AND packet arrived on fabric:
-  - Override `ingress_zone = h_source[5]`
-  - Skip normal zone lookup, continue through full pipeline with correct zone
+```c
+static __always_inline int
+try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+    struct fabric_fwd_info *ff = bpf_map_lookup_elem(&fabric_fwd, &zero);
+    if (!ff || ff->ifindex == 0) return -1;
+    if (ctx->ingress_ifindex == ff->ifindex) return -1;  /* anti-loop */
 
-**Routing table override:** Zone-decoded packets on fabric force
-`meta->routing_table = 254` (RT_TABLE_MAIN) because the fabric interface
-is in vrf-mgmt, and `bpf_fib_lookup` would otherwise search the wrong table.
+    /* Encode ingress zone in source MAC: 02:bf:72:fe:00:ZZ */
+    eth->h_source[0] = 0x02;
+    eth->h_source[1] = 0xbf;
+    eth->h_source[2] = 0x72;
+    eth->h_source[3] = FABRIC_ZONE_MAC_MAGIC;  /* 0xfe */
+    eth->h_source[4] = 0x00;
+    eth->h_source[5] = (__u8)(meta->ingress_zone & 0xff);
+    __builtin_memcpy(eth->h_dest, ff->peer_mac, ETH_ALEN);
 
-**Wire points in xdp_zone.c:**
-- Post-FIB RG check: new connections (no session) use zone-encoded redirect
-- FIB UNREACHABLE/BLACKHOLE/PROHIBIT: zone-encoded redirect first, then plain
-- FIB NO_NEIGH: plain `try_fabric_redirect()` only (route exists, just no ARP)
+    return bpf_redirect_map(&tx_ports, ff->ifindex, 0);
+}
+```
 
-Existing sessions continue using plain `try_fabric_redirect()` — the peer
-has the synced session with zone info.
+The magic MAC prefix `02:bf:72:fe` uses a locally-administered unicast bit
+(`02:` prefix) so it won't collide with real MACs. `FABRIC_ZONE_MAC_MAGIC`
+(`0xfe`) in byte[3] distinguishes zone-encoded packets from plain fabric
+redirects.
 
-### Part 2: Return Path — Hairpin Detection
+#### Receiver: Zone-encoded MAC detection (`xdp_zone.c:213-240`)
 
-When an RG becomes BACKUP, its RETH VIP is removed and the connected route
-disappears. Return traffic for those subnets hits the default route and FIB
-routes the packet back out the same interface it arrived on (hairpin).
+Before the normal zone lookup, xdp_zone checks for the magic MAC prefix:
 
-The existing hairpin detection in xdp_zone.c catches this: when
-`fwd_ifindex == ingress_ifindex` for an existing session, it tries
-`try_fabric_redirect()` to send the packet to the peer that has the correct
-connected route. This works for new connections too, because the SYN creates
-a session on the peer, so the SYN-ACK return traffic matches the session and
-triggers hairpin detection.
+```c
+if (zeth->h_source[0] == 0x02 &&
+    zeth->h_source[1] == 0xbf &&
+    zeth->h_source[2] == 0x72 &&
+    zeth->h_source[3] == FABRIC_ZONE_MAC_MAGIC) {
+    if (ff && ctx->ingress_ifindex == ff->ifindex) {
+        meta->ingress_zone = zeth->h_source[5];
+        meta->routing_table = 254;  /* RT_TABLE_MAIN */
+        goto zone_resolved;
+    }
+}
+```
 
-**Note:** Blackhole routes were initially considered but rejected — they
-break the `META_FLAG_KERNEL_ROUTE` → `XDP_PASS` fallback path because the
-kernel's ip rule evaluation hits the blackhole in the main table before
-checking cross-VRF rules.
+Zone-encoded packets:
+- Skip `iface_zone_map` lookup (zone already decoded from MAC)
+- Force `routing_table = 254` (main table, not VRF mgmt)
+- Go through the **full pipeline** (pre-routing NAT, FIB, conntrack, policy,
+  NAT, forward) with the correct ingress zone
+- Do NOT set `META_FLAG_FABRIC_FWD` — they're treated as regular ingress traffic
+  with an overridden zone
+
+#### Wire points in xdp_zone.c
+
+| Location | Trigger | Action |
+|----------|---------|--------|
+| RG check (line 651-662) | FIB SUCCESS, egress RG inactive, no session | `try_fabric_redirect_with_zone()` |
+| BLACKHOLE handler (line 860-873) | FIB UNREACHABLE/BLACKHOLE/PROHIBIT, no session | `try_fabric_redirect_with_zone()` then plain fallback |
+
+Existing sessions use plain `try_fabric_redirect()` — the peer has the synced
+session and knows the zones.
+
+### Part 2: Blackhole Routes for Inactive RG Subnets (Go daemon + FRR)
+
+#### Subnet blackhole routes (`daemon.go:3768-3830`)
+
+When an RG goes BACKUP (VRRP), the daemon injects blackhole routes for each
+RETH interface's subnet belonging to that RG:
+
+```go
+func (d *Daemon) injectBlackholeRoutes(rgID int) {
+    for name, ifc := range cfg.Interfaces.Interfaces {
+        if ifc.RedundancyGroup != rgID { continue }
+        for _, unit := range ifc.Units {
+            for _, addr := range unit.Addresses {
+                _, ipNet, _ := net.ParseCIDR(addr)
+                rt := netlink.Route{
+                    Dst:      ipNet,
+                    Type:     unix.RTN_BLACKHOLE,
+                    Priority: 4242,
+                }
+                netlink.RouteAdd(&rt)
+            }
+        }
+    }
+}
+```
+
+These are kernel routes added directly via netlink (not FRR). Metric 4242
+ensures the connected route (metric 0) takes priority when the VIP is present.
+Routes are tracked in `d.blackholeRoutes[rgID]` and removed on VRRP MASTER
+transition (`removeBlackholeRoutes`).
+
+**Effect on fw1 (WAN active, LAN inactive):**
+- `blackhole 10.0.60.0/24 metric 4242` is present
+- Return traffic for 10.0.60.102 hits BLACKHOLE instead of the default route
+- BPF BLACKHOLE handler triggers fabric redirect to fw0
+
+**Effect on fw0 (LAN active, WAN inactive):**
+- `blackhole 172.16.50.0/24 metric 4242` is present
+- But fw0 also lost the WAN connected route, so this is belt-and-suspenders
+
+#### FRR blackhole default route (`frr.go:331-339`)
+
+When the WAN VIP moves to the peer and FRR withdraws the real default route
+(next-hop unreachable), FIB returns `NOT_FWDED` (no route at all). The
+`NOT_FWDED` code path is for locally-destined traffic and does not attempt
+fabric redirect.
+
+Fix: in cluster mode, FRR injects a blackhole default route with high
+administrative distance (250):
+
+```
+ip route 0.0.0.0/0 Null0 250
+ipv6 route ::/0 Null0 250
+```
+
+The real default route (static AD=5, or DHCP-learned AD=200) always takes
+priority when present. When it's withdrawn, the blackhole default catches all
+traffic and makes `bpf_fib_lookup` return `BPF_FIB_LKUP_RET_BLACKHOLE` instead
+of `NOT_FWDED`. The BLACKHOLE handler then triggers zone-encoded fabric redirect.
+
+### Part 3: BPF Pipeline Fixes
+
+#### BLACKHOLE handler session guard (`xdp_zone.c:843-875`)
+
+When an existing session is found AND FIB returns BLACKHOLE, skip the immediate
+fabric redirect. The packet may have had pre-routing NAT applied (`dnat_table`
+rewrote `meta->dst_ip` but NOT the packet header). It needs to go through the
+full conntrack→NAT→forward pipeline for proper NAT reversal before being
+fabric-redirected.
+
+```c
+if (rc == BPF_FIB_LKUP_RET_BLACKHOLE || ...) {
+    volatile int bh_has_session = 0;
+    if (sv4 != NULL) bh_has_session = 1;
+    if (sv6 != NULL) bh_has_session = 1;
+    if (!bh_has_session) {
+        /* New connection: zone-encoded redirect */
+        int fab_rc = try_fabric_redirect_with_zone(ctx, meta);
+        if (fab_rc >= 0) return fab_rc;
+        /* Plain redirect fallback */
+        fab_rc = try_fabric_redirect(ctx, meta);
+        if (fab_rc >= 0) return fab_rc;
+    }
+    /* Sessions fall through to conntrack → NAT → forward path */
+}
+```
+
+After NAT reversal, `xdp_forward` re-checks FIB on the rewritten packet
+and does fabric redirect with correct headers (see below).
+
+Uses `volatile int` to prevent the compiler from merging pointer NULL checks
+into `|=` on pointer registers, which the BPF verifier rejects.
+
+#### xdp_forward FIB re-check (`xdp_forward.c:42-79`)
+
+After NAT reversal in the `META_FLAG_KERNEL_ROUTE` path, re-check FIB on the
+**current packet** (which now has NAT-reversed headers). If FIB returns
+BLACKHOLE, the destination subnet belongs to an inactive RG on this node —
+fabric-redirect to the peer which has the connected route.
+
+```c
+if (meta->meta_flags & META_FLAG_KERNEL_ROUTE) {
+    struct bpf_fib_lookup fib = {};
+    fib.family = meta->addr_family;
+    /* Read addresses from actual packet headers (post-NAT) */
+    fib.ipv4_src = iph_kr->saddr;
+    fib.ipv4_dst = iph_kr->daddr;
+    int kr_rc = bpf_fib_lookup(ctx, &fib, sizeof(fib),
+                               BPF_FIB_LOOKUP_OUTPUT);
+    if (kr_rc == BPF_FIB_LKUP_RET_BLACKHOLE || ...) {
+        int fab_rc = try_fabric_redirect(ctx, meta);
+        if (fab_rc >= 0) return fab_rc;
+    }
+    /* Normal kernel routing fallback */
+    return XDP_PASS;
+}
+```
+
+Uses `BPF_FIB_LOOKUP_OUTPUT` flag (no TBID) so the lookup uses the main table.
+Uses plain `try_fabric_redirect()` (not zone-encoded) because the session
+already exists on the peer (synced from the node that created it).
+
+#### Two-pass FIB for sessionless FABRIC_FWD (`xdp_zone.c:732-788`)
+
+When a packet arrives on fabric via plain redirect (`META_FLAG_FABRIC_FWD`) and
+has no local session (e.g., return traffic not yet synced):
+
+**Problem:** The first FIB lookup used VRF mgmt table 999 (because fab0 is a
+VRF member and no session triggered the routing_table=254 override). VRF mgmt
+has a default route via management network, so FIB returned SUCCESS with the
+wrong egress (management interface instead of data-plane interface).
+
+**Fix:** Re-do FIB in the main table (254) with a non-VRF ifindex:
+
+```c
+if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
+    struct bpf_fib_lookup fib2 = {};
+    fib2.tbid = 254;  /* RT_TABLE_MAIN */
+    fib2.ifindex = ff2->fib_ifindex;  /* non-VRF interface */
+    /* ... populate src/dst from meta ... */
+    int rc2 = bpf_fib_lookup(ctx, &fib2, sizeof(fib2),
+                             BPF_FIB_LOOKUP_TBID);
+    if (rc2 == BPF_FIB_LKUP_RET_SUCCESS) {
+        /* Use result: correct data-plane egress */
+        bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+    }
+    /* FIB failed: fall through to XDP_PASS for kernel local delivery */
+    return XDP_PASS;
+}
+```
+
+This only fires for FABRIC_FWD (plain redirect) traffic without sessions.
+Zone-encoded packets do NOT set FABRIC_FWD — they go through the full pipeline.
+
+Locally-destined fabric traffic (heartbeat, session sync) gets `NOT_FWDED` from
+the first FIB lookup (VRF mgmt table) and enters the `else` block, bypassing
+this handler entirely.
+
+#### fabric_fwd_info.fib_ifindex (`daemon.go:3556-3576`)
+
+`bpf_fib_lookup` with `BPF_FIB_LOOKUP_TBID` still honors kernel l3mdev rules
+when `fib.ifindex` belongs to a VRF. To look up the main table correctly, the
+lookup needs a non-VRF interface index.
+
+`populateFabricFwd()` discovers a non-VRF, non-loopback, UP interface and
+stores its ifindex in the `fib_ifindex` field of the `fabric_fwd` BPF map.
+BPF code uses this for all TBID=254 lookups where the ingress interface
+is a VRF member.
+
+#### FABRIC_FWD routing table override (`xdp_zone.c:541-555`)
+
+For FABRIC_FWD traffic with a synced session, override `routing_table` from
+VRF mgmt (999) to main (254). This must be **session-guarded** — unconditional
+override breaks locally-destined fabric traffic because the main table may have
+a default route that intercepts local addresses before `NOT_FWDED` fires.
+
+```c
+if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
+    if (sv4 != NULL) meta->routing_table = 254;
+    if (sv6 != NULL) meta->routing_table = 254;
+}
+```
+
+### Summary of Two Fabric Redirect Modes
+
+| | Plain redirect | Zone-encoded redirect |
+|---|---|---|
+| **Helper** | `try_fabric_redirect()` | `try_fabric_redirect_with_zone()` |
+| **MAC encoding** | Real local MAC as source | `02:bf:72:fe:00:ZZ` as source |
+| **When used** | Existing sessions (peer has synced session) | New connections (peer needs zone info) |
+| **Receiver flag** | `META_FLAG_FABRIC_FWD` | No flag (goes through full pipeline) |
+| **Routing table** | Session-guarded override to 254 | Unconditional 254 (set in zone detection) |
+| **Policy** | Bypassed (peer already validated) | Full evaluation (correct zone from MAC) |
+
+## Packet Flow: New ICMP Ping During Split
+
+```
+cluster-lan-host (10.0.60.102) → ping 172.16.100.247
+
+1. Echo request arrives at fw0 ge-0-0-0 (LAN, RG2 active)
+   xdp_zone: zone=lan, no session, FIB for 172.16.100.247
+   FIB: main table has blackhole default (AD=250) → BLACKHOLE
+   BLACKHOLE handler: no session → try_fabric_redirect_with_zone()
+   Source MAC = 02:bf:72:fe:00:02 (zone 2 = lan)
+   → bpf_redirect_map to fab0 → wire → fw1
+
+2. fw1 fab0 receives packet with magic MAC
+   xdp_zone: detect 02:bf:72:fe, ingress_zone=2 (lan), routing_table=254
+   Pre-routing NAT: no match
+   Session lookup: no session
+   FIB for 172.16.100.247 in main table: SUCCESS → ge-7-0-1.50 (WAN)
+   Egress RG check: RG1 active on fw1 → proceed normally
+   → conntrack → policy (lan→wan: allow) → NAT (SNAT) → forward → WAN
+
+3. Echo reply arrives at fw1 ge-7-0-1.50 (WAN, RG1 active)
+   xdp_zone: zone=wan, pre-routing NAT matches dnat_table (SNAT reverse)
+   meta->dst_ip rewritten to 10.0.60.102 (original client)
+   Session lookup: session found (created in step 2)
+   FIB for 10.0.60.102: BLACKHOLE (blackhole 10.0.60.0/24 metric 4242)
+   BLACKHOLE handler: session exists → skip fabric redirect
+   → conntrack (session hit, NAT reversal) → NAT (rewrite packet headers)
+   → forward (meta_flags & KERNEL_ROUTE)
+
+4. xdp_forward on fw1: KERNEL_ROUTE path
+   FIB re-check on actual packet (dst=10.0.60.102): BLACKHOLE
+   → try_fabric_redirect() → wire → fw0
+
+5. fw0 fab0 receives packet with FABRIC_FWD flag (plain redirect)
+   xdp_zone: zone=control (fab0), META_FLAG_FABRIC_FWD set
+   No session on fw0 (sync delay)
+   FIB in VRF mgmt: SUCCESS (VRF default route → wrong egress)
+   FABRIC_FWD handler: second FIB in main table (254)
+   10.0.60.102 → SUCCESS → ge-0-0-0 (LAN, connected route)
+   → tail-call xdp_forward → MAC rewrite → redirect to LAN
+
+6. Echo reply delivered to cluster-lan-host (10.0.60.102)
+```
 
 ## Files Modified
 
 | File | Change |
 |------|--------|
-| `bpf/headers/bpfrx_common.h` | `FABRIC_ZONE_MAC_MAGIC 0xfe` constant |
-| `bpf/headers/bpfrx_helpers.h` | `try_fabric_redirect_with_zone()` MAC encoding |
-| `bpf/xdp/xdp_zone.c` | Zone-encoded MAC detection + zone-aware redirects |
-| `pkg/daemon/daemon.go` | (no changes needed — hairpin detection handles return path) |
-| `test/incus/test-active-active.sh` | New-connection test phases (iperf3 + ping) |
-| `dpdk_worker/shared_mem.h` | `FABRIC_ZONE_MAC_MAGIC` constant (parity) |
-| `dpdk_worker/zone.c` | Zone-encoded MAC detection stub (TODO) |
+| `bpf/headers/bpfrx_common.h` | `META_FLAG_FABRIC_FWD (1<<4)`, `FABRIC_ZONE_MAC_MAGIC 0xfe` |
+| `bpf/headers/bpfrx_helpers.h` | `try_fabric_redirect_with_zone()` — MAC-encoded zone redirect |
+| `bpf/headers/bpfrx_maps.h` | `fabric_fwd_info.fib_ifindex` field for non-VRF FIB lookups |
+| `bpf/xdp/xdp_zone.c` | Zone-encoded MAC detection, FABRIC_FWD flag, session-guarded routing_table override, RG check for new connections, BLACKHOLE session guard, two-pass FIB for sessionless FABRIC_FWD |
+| `bpf/xdp/xdp_forward.c` | FIB re-check in KERNEL_ROUTE path — detect BLACKHOLE after NAT reversal |
+| `pkg/daemon/daemon.go` | `injectBlackholeRoutes()` / `removeBlackholeRoutes()` on VRRP transitions, `fib_ifindex` population in `populateFabricFwd()` |
+| `pkg/dataplane/types.go` | `FabricFwdInfo.FIBIfindex` field |
+| `pkg/frr/frr.go` | Cluster mode blackhole default route (`ip route 0.0.0.0/0 Null0 250`) |
+| `dpdk_worker/shared_mem.h` | `FABRIC_ZONE_MAC_MAGIC` constant (DPDK parity) |
+| `dpdk_worker/zone.c` | Zone-encoded MAC detection placeholder (TODO: full DPDK implementation) |
+| `test/incus/test-active-active.sh` | Phase 3b (TCP handshake via `/dev/tcp`) + Phase 3c (ICMP ping) during split |
 
-## Verification
+## Key Design Decisions
 
-1. `make generate && make build` — BPF + Go compile
-2. `make test` — all unit tests pass
-3. `make cluster-deploy` — deploy to both VMs
-4. `make test-active-active` — new Phases 3b/3c verify new connections
-5. `make test-failover` — existing failover tests still pass
+### MAC encoding vs VLAN tags for zone transport
+
+VLAN tags were the first approach (`FABRIC_ZONE_VLAN_BASE 4080`, VLANs
+4080-4095 reserved for zone encoding). This failed in testing because the Linux
+bridge connecting the two VMs strips 802.1Q tags into `skb->vlan_tci` before
+the generic XDP program runs. The BPF program sees `meta->ingress_vlan_id = 0`
+even though the sender pushed a VLAN tag.
+
+MAC encoding is immune to this because Ethernet source/destination addresses are
+never stripped or modified by bridges.
+
+### Session guard on BLACKHOLE handler
+
+Without the guard, SNAT return traffic gets fabric-redirected with unrewritten
+packet headers. The `dnat_table` pre-routing NAT (xdp_zone.c:289-311) only
+rewrites `meta->dst_ip`, not the actual IP header in the packet. NAT reversal
+happens later in `xdp_nat`. If we fabric-redirect before NAT reversal, the peer
+receives a packet with `dst = SNAT VIP` — it can't reverse the SNAT because the
+`dnat_table` entry only exists on the originating node.
+
+### Two-pass FIB vs unconditional routing table override
+
+Unconditional `routing_table = 254` for all FABRIC_FWD traffic was tried first.
+This broke locally-destined fabric traffic (heartbeat, session sync) because the
+main table may have a default route or blackhole that matches before the kernel
+detects the packet is locally destined. With VRF mgmt table, locally-destined
+traffic correctly gets `NOT_FWDED`.
+
+The two-pass approach: first FIB in VRF (catches NOT_FWDED for local addresses),
+then second FIB in main table for transit traffic that got SUCCESS from VRF's
+default route.
+
+### bpf_fib_lookup TBID + VRF interaction
+
+Even with `BPF_FIB_LOOKUP_TBID` flag and explicit `fib.tbid = 254`, the kernel
+honors l3mdev rules when `fib.ifindex` belongs to a VRF device. The lookup
+effectively ignores TBID and uses the VRF's table. Workaround: use
+`fabric_fwd_info.fib_ifindex` (a non-VRF interface) for all TBID=254 lookups
+where the natural ingress interface is a VRF member.
+
+### Blackhole route metric (4242)
+
+High metric ensures the connected route (metric 0, present when VIP is active)
+always wins. When the VIP is removed and the connected route disappears, the
+blackhole route is the only match for the subnet. On VRRP MASTER transition,
+the daemon removes the blackhole route before the VIP is re-added, avoiding
+any transient conflict.
+
+### FRR blackhole default AD (250)
+
+Must be higher than all real default routes: static (AD=5), DHCP-learned
+(AD=200). Lower than nothing (withdrawn = absent). The blackhole default is
+always present in cluster mode but never wins against a real default.
+
+## Debugging Methodology
+
+1. **Counter analysis:** `show security flow statistics` revealed host-inbound
+   deny counts not increasing during fabric ping failure — packet dropped before
+   reaching host-inbound check.
+
+2. **tcpdump at wire level:** Confirmed ICMP echo requests not appearing on
+   fw1's fab0 — packets never left fw0.
+
+3. **Routing table inspection:** `ip route get 10.99.1.2` showed packets routed
+   via WAN default route instead of fab0 — because fab0 is in VRF mgmt and the
+   main table doesn't have the 10.99.1.0/30 route.
+
+4. **bpf_printk tracing:** Added targeted prints in pre-routing NAT and FIB
+   result handler to trace per-packet decisions. Discovered FIB returning
+   SUCCESS with wrong egress (management interface) for FABRIC_FWD traffic.
+
+5. **VRF routing analysis:** `ip route show table 999` revealed VRF mgmt has
+   its own default route, causing FIB to match management-plane routes for
+   data-plane traffic arriving on the VRF-member fabric interface.
+
+## Test Coverage
+
+```
+make test              → all 22 packages pass
+make test-connectivity → 25/25 PASS
+make test-failover     → 14/14 PASS (existing sessions survive reboot + failback)
+make test-active-active → 14/14 PASS:
+  Phase 1:  Start iperf3 -P2 through firewall
+  Phase 2:  Failover RG1 (WAN) to fw1 — active/active split
+  Phase 3:  Existing iperf3 survives split (fabric forwarding)
+  Phase 3b: NEW TCP connection through split cluster (TCP handshake via /dev/tcp)
+  Phase 3c: NEW ICMP ping through split cluster
+  Phase 4:  Failover RG1 back to fw0 — reunify all RGs
+  Phase 5:  Existing iperf3 survives reunification
+  Phase 6:  iperf3 completed with >1 Gbps throughput
+```
+
+## References
+
+- AA-1 sprint: `23f1a3d` — Per-RG active state tracking in BPF
+- Fabric cross-chassis forwarding: `docs/fabric-cross-chassis-fwd.md`
+- Pre-routing NAT (dnat_table): `xdp_zone.c:284-340`
+- Session sync protocol: `docs/sync-protocol.md`
