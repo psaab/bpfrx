@@ -419,13 +419,26 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			struct session_value *sv = &ctx->shm->session_values_v4[pos];
 			uint8_t dir = sv->is_reverse ? 1 : 0;
 
-			/* Update timestamps */
-			sv->last_seen = now;
+			/* Don't update last_seen for CLOSED sessions — the
+			 * retransmits would prevent GC from ever cleaning up. */
+			if (sv->state != SESS_STATE_CLOSED)
+				sv->last_seen = now;
 
 			/* TCP state transition */
 			if (meta->protocol == PROTO_TCP) {
 				uint8_t old_state = sv->state;
-				sv->state = ct_tcp_update_state(old_state, meta->tcp_flags, dir);
+				uint8_t new_state = ct_tcp_update_state(old_state, meta->tcp_flags, dir);
+				/* Suppress RST→CLOSED for ESTABLISHED sessions.
+				 * Without TCP sequence validation, a spurious RST
+				 * permanently kills the session. Forward the RST
+				 * so endpoints decide, but keep session ESTABLISHED.
+				 * rst-invalidate-session overrides. */
+				if (new_state == SESS_STATE_CLOSED &&
+				    old_state == SESS_STATE_ESTABLISHED &&
+				    !(ctx->shm->flow_config &&
+				      (ctx->shm->flow_config->tcp_flags & FLOW_TCP_RST_INVALIDATE)))
+					new_state = old_state;
+				sv->state = new_state;
 				if (sv->state != old_state) {
 					/* Sync state/timeout to paired entry */
 					uint32_t new_timeout = ct_get_timeout(ctx, PROTO_TCP, sv->state);
@@ -514,10 +527,17 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		if (pos >= 0) {
 			struct session_value *sv = &ctx->shm->session_values_v4[pos];
 
-			sv->last_seen = now;
+			if (sv->state != SESS_STATE_CLOSED)
+				sv->last_seen = now;
 			if (meta->protocol == PROTO_TCP) {
 				uint8_t old_state = sv->state;
-				sv->state = ct_tcp_update_state(old_state, meta->tcp_flags, 1);
+				uint8_t new_state = ct_tcp_update_state(old_state, meta->tcp_flags, 1);
+				if (new_state == SESS_STATE_CLOSED &&
+				    old_state == SESS_STATE_ESTABLISHED &&
+				    !(ctx->shm->flow_config &&
+				      (ctx->shm->flow_config->tcp_flags & FLOW_TCP_RST_INVALIDATE)))
+					new_state = old_state;
+				sv->state = new_state;
 				if (sv->state != old_state) {
 					/* Sync state/timeout to paired entry */
 					uint32_t new_timeout = ct_get_timeout(ctx, PROTO_TCP, sv->state);
@@ -599,11 +619,18 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		int pos = rte_hash_lookup(ctx->shm->sessions_v6, &sk6);
 		if (pos >= 0) {
 			struct session_value_v6 *sv = &ctx->shm->session_values_v6[pos];
-			sv->last_seen = now;
+			if (sv->state != SESS_STATE_CLOSED)
+				sv->last_seen = now;
 			if (meta->protocol == PROTO_TCP) {
 				uint8_t old_state = sv->state;
 				uint8_t dir = sv->is_reverse ? 1 : 0;
-				sv->state = ct_tcp_update_state(old_state, meta->tcp_flags, dir);
+				uint8_t new_state = ct_tcp_update_state(old_state, meta->tcp_flags, dir);
+				if (new_state == SESS_STATE_CLOSED &&
+				    old_state == SESS_STATE_ESTABLISHED &&
+				    !(ctx->shm->flow_config &&
+				      (ctx->shm->flow_config->tcp_flags & FLOW_TCP_RST_INVALIDATE)))
+					new_state = old_state;
+				sv->state = new_state;
 				if (sv->state != old_state) {
 					uint32_t new_timeout = ct_get_timeout(ctx, PROTO_TCP, sv->state);
 					if (sv->app_timeout > 0 &&
@@ -684,10 +711,17 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		pos = rte_hash_lookup(ctx->shm->sessions_v6, &rsk6);
 		if (pos >= 0) {
 			struct session_value_v6 *sv = &ctx->shm->session_values_v6[pos];
-			sv->last_seen = now;
+			if (sv->state != SESS_STATE_CLOSED)
+				sv->last_seen = now;
 			if (meta->protocol == PROTO_TCP) {
 				uint8_t old_state = sv->state;
-				sv->state = ct_tcp_update_state(old_state, meta->tcp_flags, 1);
+				uint8_t new_state = ct_tcp_update_state(old_state, meta->tcp_flags, 1);
+				if (new_state == SESS_STATE_CLOSED &&
+				    old_state == SESS_STATE_ESTABLISHED &&
+				    !(ctx->shm->flow_config &&
+				      (ctx->shm->flow_config->tcp_flags & FLOW_TCP_RST_INVALIDATE)))
+					new_state = old_state;
+				sv->state = new_state;
 				if (sv->state != old_state) {
 					uint32_t new_timeout = ct_get_timeout(ctx, PROTO_TCP, sv->state);
 					if (sv->app_timeout > 0 &&

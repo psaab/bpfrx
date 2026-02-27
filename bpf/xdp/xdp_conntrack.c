@@ -24,7 +24,11 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		 struct session_value *sess, __u8 direction)
 {
 	__u64 now = meta->ktime_ns / 1000000000ULL;
-	sess->last_seen = now;
+
+	/* Don't update last_seen for CLOSED sessions — the
+	 * retransmits would prevent GC from ever cleaning up. */
+	if (sess->state != SESS_STATE_CLOSED)
+		sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {
 		__sync_fetch_and_add(&sess->fwd_packets, 1);
@@ -52,6 +56,26 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		if (new_state == SESS_STATE_CLOSED &&
 		    (meta->meta_flags & META_FLAG_KERNEL_ROUTE))
 			new_state = sess->state;
+		/* Suppress RST→CLOSED for ESTABLISHED sessions.
+		 * Without TCP sequence number validation, a single
+		 * spurious RST (packet corruption, out-of-window
+		 * segment response, middlebox) permanently kills
+		 * the session: all non-RST data gets XDP_DROP'd,
+		 * client retransmits never reach the server, cwnd
+		 * collapses to 1 MSS, and the stream dies.
+		 * Forward the RST so endpoints can decide, but
+		 * keep session ESTABLISHED.  rst-invalidate-session
+		 * overrides for users who want strict RST handling. */
+		if (new_state == SESS_STATE_CLOSED &&
+		    sess->state == SESS_STATE_ESTABLISHED) {
+			__u32 z = 0;
+			struct flow_config *fc =
+				bpf_map_lookup_elem(
+					&flow_config_map, &z);
+			if (!fc || !(fc->tcp_flags &
+				     FLOW_TCP_RST_INVALIDATE))
+				new_state = sess->state;
+		}
 		if (new_state != sess->state) {
 			sess->state = new_state;
 			__u32 new_timeout = ct_get_timeout(PROTO_TCP, new_state);
@@ -151,7 +175,9 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		 struct session_value_v6 *sess, __u8 direction)
 {
 	__u64 now = meta->ktime_ns / 1000000000ULL;
-	sess->last_seen = now;
+
+	if (sess->state != SESS_STATE_CLOSED)
+		sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {
 		__sync_fetch_and_add(&sess->fwd_packets, 1);
@@ -172,6 +198,18 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		if (new_state == SESS_STATE_CLOSED &&
 		    (meta->meta_flags & META_FLAG_KERNEL_ROUTE))
 			new_state = sess->state;
+		/* Suppress RST→CLOSED for ESTABLISHED sessions.
+		 * See handle_ct_hit_v4 for full explanation. */
+		if (new_state == SESS_STATE_CLOSED &&
+		    sess->state == SESS_STATE_ESTABLISHED) {
+			__u32 z = 0;
+			struct flow_config *fc =
+				bpf_map_lookup_elem(
+					&flow_config_map, &z);
+			if (!fc || !(fc->tcp_flags &
+				     FLOW_TCP_RST_INVALIDATE))
+				new_state = sess->state;
+		}
 		if (new_state != sess->state) {
 			sess->state = new_state;
 			__u32 new_timeout = ct_get_timeout(PROTO_TCP, new_state);

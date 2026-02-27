@@ -22,7 +22,8 @@ tc_ct_hit_v4(struct __sk_buff *skb, struct pkt_meta *meta,
 	     struct session_value *sess, __u8 direction)
 {
 	__u64 now = meta->ktime_ns / 1000000000ULL;
-	sess->last_seen = now;
+	if (sess->state != SESS_STATE_CLOSED)
+		sess->last_seen = now;
 
 	int is_fwd = (direction == sess->is_reverse);
 
@@ -64,7 +65,8 @@ tc_ct_hit_v6(struct __sk_buff *skb, struct pkt_meta *meta,
 	     struct session_value_v6 *sess, __u8 direction)
 {
 	__u64 now = meta->ktime_ns / 1000000000ULL;
-	sess->last_seen = now;
+	if (sess->state != SESS_STATE_CLOSED)
+		sess->last_seen = now;
 
 	int is_fwd = (direction == sess->is_reverse);
 
