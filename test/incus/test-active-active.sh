@@ -33,7 +33,7 @@ fi
 
 IPERF_TARGET="${IPERF_TARGET:-172.16.100.247}"
 IPERF_DURATION=90       # seconds — enough to span two failovers + settling
-IPERF_STREAMS=2
+IPERF_STREAMS=8
 SETTLE_WAIT=3           # seconds to let VRRP + election settle
 MIN_THROUGHPUT=1.0      # Gbps — iperf3 must report at least this
 
@@ -181,8 +181,10 @@ info "Phase 3: Verify traffic survives active/active split (fabric forwarding)"
 sleep 5  # let traffic settle after failover
 
 if incus exec cluster-lan-host -- pgrep -x iperf3 &>/dev/null; then
-	# Check last few seconds of iperf3 output for throughput
-	last_sum=$(incus exec cluster-lan-host -- tail -5 /tmp/iperf3-active-active.log 2>/dev/null | grep "SUM" | tail -1 || true)
+	# Check last interval of iperf3 output for throughput
+	# With -P N, each interval has N+2 lines (N streams + SUM + separator)
+	tail_lines=$(( IPERF_STREAMS * 2 + 5 ))
+	last_sum=$(incus exec cluster-lan-host -- tail -"$tail_lines" /tmp/iperf3-active-active.log 2>/dev/null | grep "SUM" | tail -1 || true)
 	if echo "$last_sum" | grep -qiE "[0-9]+ [MG]bits/sec"; then
 		bps=$(echo "$last_sum" | grep -oiE "[0-9.]+ [MG]bits/sec" | head -1)
 		pass "iperf3 survived RG split ($bps)"
@@ -245,7 +247,8 @@ info "Phase 5: Verify traffic survives RG reunification"
 sleep 5
 
 if incus exec cluster-lan-host -- pgrep -x iperf3 &>/dev/null; then
-	last_sum=$(incus exec cluster-lan-host -- tail -5 /tmp/iperf3-active-active.log 2>/dev/null | grep "SUM" | tail -1 || true)
+	tail_lines=$(( IPERF_STREAMS * 2 + 5 ))
+	last_sum=$(incus exec cluster-lan-host -- tail -"$tail_lines" /tmp/iperf3-active-active.log 2>/dev/null | grep "SUM" | tail -1 || true)
 	if echo "$last_sum" | grep -qiE "[0-9]+ [MG]bits/sec"; then
 		bps=$(echo "$last_sum" | grep -oiE "[0-9.]+ [MG]bits/sec" | head -1)
 		pass "iperf3 survived RG reunification ($bps)"
