@@ -739,6 +739,167 @@ The packet flow now:
 Added egress zone resolution to both re-FIB blocks (FIB SUCCESS path and
 UNREACHABLE handler) for correct zone egress counters.
 
+## Bug: TCP Stream Death from Blind RST→CLOSED in Conntrack
+
+### Symptom
+
+During long-duration high-throughput transfers (iperf3 -P4 -t1200 at ~9 Gbps),
+individual TCP streams die one by one over time. Dead streams show:
+
+- cwnd collapsed to 1.41 KBytes (1 MSS)
+- RTO escalating exponentially: 204→3264→13056→26112→52224→104448→120000ms
+- `bytes_sent` frozen — zero forward progress
+- Sessions remain "Established" in `show security flow session` but carry zero traffic
+- Drop counter increases at ~6 drops/sec matching retransmit rate of dead streams
+
+Observed stream death times: [5] at t=130s, [7] at t=176s, [11] at t=366s,
+[9] at t=435s — each after transferring ~50-200 GB.
+
+### Root Cause
+
+Three interacting bugs in the BPF conntrack TCP state machine:
+
+**1. Blind RST→CLOSED transition** (`bpfrx_conntrack.h:ct_tcp_update_state`)
+
+```c
+if (rst) return SESS_STATE_CLOSED;
+```
+
+Any RST packet transitions the session to CLOSED immediately, with no TCP
+sequence number validation. At 10 Gbps, the TCP sequence number space wraps
+every ~23 seconds. Spurious RSTs are inevitable from:
+- Packet corruption (bit flip sets RST flag)
+- Out-of-window segment responses from the server
+- Middlebox interference
+
+**2. CLOSED state drops all data** (`xdp_conntrack.c:handle_ct_hit_v4:118-131`)
+
+```c
+case SESS_STATE_CLOSED:
+    if (meta->tcp_flags & 0x04) {  /* RST */
+        bpf_tail_call(ctx, &xdp_progs, next_prog);
+        return XDP_PASS;
+    }
+    /* SESSION_CLOSE event, then: */
+    return XDP_DROP;  /* Drop ALL non-RST packets */
+```
+
+Once a session enters CLOSED, every data packet (SYN, ACK, PSH+ACK) is
+silently dropped. Only RST packets are forwarded.
+
+**3. last_seen update prevents GC cleanup**
+
+```c
+sess->last_seen = now;  /* Updated BEFORE state check */
+```
+
+`last_seen` was updated unconditionally at the top of `handle_ct_hit_v4/v6`,
+before any state checks. Client retransmits (which are dropped by the CLOSED
+handler) still refresh `last_seen`, preventing the GC sweep from ever expiring
+the session. The CLOSED session persists indefinitely.
+
+### Death Spiral
+
+```
+Normal traffic at 9 Gbps
+    │
+    ▼
+Spurious RST (1 in ~50 billion packets)
+    │
+    ▼  ct_tcp_update_state: rst → SESS_STATE_CLOSED
+    │
+    ▼  handle_ct_hit: CLOSED → XDP_DROP all data
+    │
+    ▼  Client TCP: no ACKs → RTO doubles each retry
+    │    200ms → 400ms → 800ms → ... → 120s (max)
+    │
+    ▼  Client retransmits hit conntrack → last_seen refreshed
+    │    GC never expires session (last_seen always recent)
+    │
+    ▼  Stream permanently dead
+       cwnd = 1 MSS, RTO = 120s, bytes_sent frozen
+       Session stuck in CLOSED forever
+```
+
+### Why Only at High Throughput
+
+At 10 Gbps with 1500-byte packets, the firewall processes ~830K packets/sec.
+TCP sequence space is 2³² = 4.3 billion bytes, wrapping every ~23 seconds at
+1.5 Gbps per stream. High packet rates increase the probability of:
+- NIC/memory bit flips creating RST flags
+- Kernel-generated RSTs for out-of-window segments
+- Retransmit/reordering causing endpoint RST responses
+
+At lower throughputs (<1 Gbps), the probability per-stream is negligible and
+streams survive for hours.
+
+### Fix
+
+**XDP conntrack** (`xdp_conntrack.c:handle_ct_hit_v4/v6`):
+
+1. Suppress RST→CLOSED for ESTABLISHED sessions. Forward the RST to endpoints
+   (they can decide to close), but keep the firewall session ESTABLISHED:
+
+```c
+if (new_state == SESS_STATE_CLOSED &&
+    sess->state == SESS_STATE_ESTABLISHED) {
+    __u32 z = 0;
+    struct flow_config *fc =
+        bpf_map_lookup_elem(&flow_config_map, &z);
+    if (!fc || !(fc->tcp_flags & FLOW_TCP_RST_INVALIDATE))
+        new_state = sess->state;
+}
+```
+
+The `rst-invalidate-session` config flag (`FLOW_TCP_RST_INVALIDATE`) overrides
+for users who want strict RST handling — this is the only way RST→CLOSED fires
+for ESTABLISHED sessions.
+
+2. Guard `last_seen` with CLOSED check to break the GC bypass:
+
+```c
+if (sess->state != SESS_STATE_CLOSED)
+    sess->last_seen = now;
+```
+
+**TC conntrack** (`tc_conntrack.c:tc_ct_hit_v4/v6`):
+
+Same `last_seen` guard. TC doesn't do TCP state tracking or CLOSED drops, but
+the guard prevents egress retransmits from resetting the GC timer.
+
+**DPDK conntrack** (`dpdk_worker/conntrack.c`):
+
+Same pattern at all 4 hit paths (v4 forward, v4 reverse, v6 forward, v6
+reverse): suppress RST→CLOSED for ESTABLISHED + guard `last_seen`.
+
+### Design Rationale
+
+**Why suppress instead of sequence validation?** BPF conntrack doesn't track
+TCP sequence numbers (would require ~8 more bytes per session entry plus
+window tracking logic). Suppressing RST→CLOSED for ESTABLISHED is simple, safe,
+and matches real-world firewall behavior — most stateful firewalls don't
+immediately kill sessions on RST without sequence validation.
+
+**Why forward the RST?** The RST still reaches both endpoints. If it's a
+legitimate RST (endpoint intentionally closed), both sides see it and perform
+graceful shutdown. The FIN→FIN_WAIT→TIME_WAIT path handles normal TCP
+termination. Only the RST→CLOSED shortcut is blocked.
+
+**Why keep rst-invalidate-session?** Some deployments want strict RST handling
+(e.g., active session tear-down for security). The config option preserves this
+capability for users who opt in, accepting the stream-death risk.
+
+### Verification
+
+```
+make test                → all unit tests pass
+make test-active-active  → 14/14 PASS (8 streams, 9.13 Gbps)
+make test-failover       → 14/14 PASS (8 streams, 7.77 Gbps)
+```
+
+Long-duration test: `iperf3 -P4 -t600` completed at 9.08 Gbps with zero
+stream deaths (previously streams died within 200-400 seconds).
+
 ## References
 
 - AA-1 sprint: `23f1a3d` — Per-RG active state tracking in BPF
