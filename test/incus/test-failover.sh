@@ -28,7 +28,7 @@ fi
 
 IPERF_TARGET="${IPERF_TARGET:-172.16.100.247}"
 IPERF_DURATION=90       # seconds — long enough to span reboot + failback
-IPERF_STREAMS=2
+IPERF_STREAMS=8
 SYNC_WAIT=5             # seconds to wait for session sync sweep
 REBOOT_WAIT=60          # max seconds to wait for fw0 to come back
 MIN_THROUGHPUT=1.0      # Gbps — iperf3 must report at least this
