@@ -190,6 +190,24 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 				return TC_ACT_OK;
 			}
 		}
+		/* Allow fabric transit: packets forwarded from the
+		 * fabric peer via kernel routing (XDP_PASS path).
+		 * In active/active, the peer does NAT reversal and
+		 * sends post-NAT traffic here for local delivery.
+		 * The session lives on the peer, not locally, so
+		 * TC conntrack won't find a match.  The peer's XDP
+		 * pipeline already validated the traffic — trust it. */
+		{
+			__u32 ff_key = 0;
+			struct fabric_fwd_info *ff =
+				bpf_map_lookup_elem(&fabric_fwd,
+						    &ff_key);
+			if (ff && meta->ingress_ifindex == ff->ifindex) {
+				bpf_tail_call(skb, &tc_progs,
+					      TC_PROG_FORWARD);
+				return TC_ACT_OK;
+			}
+		}
 		return TC_ACT_SHOT;
 	}
 

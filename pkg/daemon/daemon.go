@@ -3738,17 +3738,29 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				d.rethMasterState[rgID] = true
 				d.removeBlackholeRoutes(rgID)
 				if d.dp != nil {
-					// In cluster mode, only set rg_active=true if the
-					// cluster state agrees this RG is locally primary.
-					// VRRP may briefly re-elect MASTER during a resign
-					// race (priority update lag); the cluster state is
-					// authoritative.
-					if d.cluster == nil || d.cluster.IsLocalPrimary(rgID) {
-						if err := d.dp.UpdateRGActive(rgID, true); err != nil {
-							slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
-						}
-						d.dp.BumpFIBGeneration()
+					// Set rg_active=true immediately on VRRP MASTER.
+					// becomeMaster() already added VIPs and sent adverts
+					// before emitting this event, so routing is ready.
+					//
+					// Previously guarded by IsLocalPrimary() to prevent
+					// a brief re-election during resign races (priority
+					// update lag).  But that guard delays rg_active by
+					// up to 200ms (heartbeat interval) — the cluster
+					// Primary event hasn't fired yet because heartbeat
+					// propagation is slower than VRRP (priority-0 burst
+					// triggers MASTER in ~5ms vs 200ms heartbeat).
+					// The 200ms dual-inactive window causes TCP stream
+					// death during rapid repeated failovers (cwnd
+					// collapse + RTO growth).
+					//
+					// The resign race is self-correcting: if VRRP
+					// briefly re-elects MASTER, the subsequent cluster
+					// Secondary or VRRP BACKUP event sets rg_active
+					// back to false within ms.
+					if err := d.dp.UpdateRGActive(rgID, true); err != nil {
+						slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
 					}
+					d.dp.BumpFIBGeneration()
 					go d.warmNeighborCache()
 				}
 				d.applyRethServicesForRG(rgID)

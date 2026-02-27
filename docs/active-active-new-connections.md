@@ -688,6 +688,57 @@ Additionally, `BumpFIBGeneration()` is now called on every cluster Primary
 transition, not just when `rethMasterState` is true. This prevents sessions
 from using stale cached FIB results during transitions.
 
+## Bug: Fabric Transit Auto-Forward Used Wrong FIB Result
+
+### Symptom
+
+New TCP connections and ICMP ping during active/active split (Phase 3b/3c) fail.
+SYN-ACKs never reach the LAN client. Sessions on fw1 show SYN_RECV (SYN-ACK
+processed by conntrack) but the de-NAT'd packet is lost on fw0.
+
+### Root Cause
+
+The fabric transit auto-forward block (originally at xdp_zone.c line 710) was
+intended to fast-path sessionless FABRIC_FWD packets by tail-calling directly
+to XDP_PROG_FORWARD after the initial FIB lookup. But this auto-forward used
+the **initial FIB result**, which was wrong:
+
+1. Packet arrives on fw0 from fabric (`META_FLAG_FABRIC_FWD` set).
+2. No synced session yet (`sv4 == NULL`) — routing_table stays 0 (the
+   `routing_table = 254` override at line 624-629 requires a session).
+3. Initial FIB lookup uses `fib.ifindex = ctx->ingress_ifindex` (fabric
+   interface, in vrf-mgmt) with `fib_flags = 0` (no `BPF_FIB_LOOKUP_TBID`).
+4. Kernel uses vrf-mgmt's routing table (not main table).
+5. vrf-mgmt has a DHCP-learned default route → FIB returns **SUCCESS** with
+   egress = management interface (`fxp0`).
+6. Auto-forward fires: `FABRIC_FWD + sv4==NULL → bpf_tail_call(XDP_FORWARD)`.
+7. xdp_forward redirects packet to management interface → **lost**.
+
+The correct re-FIB (at line 839) — which uses `BPF_FIB_LOOKUP_TBID` with
+table 254 and a non-VRF ifindex — was never reached because the auto-forward
+short-circuited it with a tail call.
+
+### Fix
+
+Remove the auto-forward block and let the code fall through to the re-FIB
+at line 839, which correctly does a second FIB lookup in the main table (254)
+using `fabric_fwd_info.fib_ifindex` (a non-VRF interface). This was already
+the code that the auto-forward was supposed to be an optimization of, but the
+auto-forward used the wrong (initial) FIB result instead of doing its own
+correct lookup.
+
+The packet flow now:
+1. Initial FIB returns SUCCESS (vrf-mgmt default route, wrong egress)
+2. No auto-forward (removed)
+3. Post-FIB RG check: skipped (no session)
+4. Hairpin detection: skipped (no session)
+5. FIB cache update: skipped (no session)
+6. FABRIC_FWD re-FIB in table 254: SUCCESS → correct egress (LAN interface)
+7. `bpf_tail_call(XDP_FORWARD)` with correct MAC/ifindex
+
+Added egress zone resolution to both re-FIB blocks (FIB SUCCESS path and
+UNREACHABLE handler) for correct zone egress counters.
+
 ## References
 
 - AA-1 sprint: `23f1a3d` — Per-RG active state tracking in BPF

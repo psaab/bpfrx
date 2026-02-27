@@ -189,6 +189,79 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 	return XDP_PASS;
 }
 
+/*
+ * Apply pre-routing DNAT translation to packet headers before
+ * fabric redirect.  Pre-routing DNAT (dnat_table lookup) updates
+ * meta->dst_ip/port but defers packet header rewrite to xdp_nat.
+ * When we fabric-redirect before reaching xdp_nat, the peer
+ * receives a packet with post-NAT destination that it can't
+ * de-NAT (dnat_table entries are not synced between cluster
+ * nodes).  This function rewrites the packet destination to
+ * match meta so the peer receives pre-NAT addresses matching
+ * the synced session.
+ *
+ * IPv4 only — IPv6 dnat_table_v6 follows the same pattern
+ * but is not yet handled here.
+ */
+static __always_inline void
+apply_dnat_before_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	if (!(meta->nat_flags & SESS_FLAG_DNAT) ||
+	    meta->addr_family != AF_INET)
+		return;
+
+	void *_d = (void *)(long)ctx->data;
+	void *_de = (void *)(long)ctx->data_end;
+	struct iphdr *iph = _d + sizeof(struct ethhdr);
+	if ((void *)(iph + 1) > _de ||
+	    iph->daddr == meta->dst_ip.v4)
+		return;
+
+	__be32 old_dst = iph->daddr;
+	csum_update_4(&iph->check, old_dst, meta->dst_ip.v4);
+	iph->daddr = meta->dst_ip.v4;
+
+	void *l4 = (void *)iph + sizeof(struct iphdr);
+	__be16 new_dport = bpf_htons(meta->dst_port);
+
+	if (meta->protocol == PROTO_TCP) {
+		struct tcphdr *tcp = l4;
+		if ((void *)(tcp + 1) <= _de) {
+			csum_update_4(&tcp->check, old_dst,
+				      meta->dst_ip.v4);
+			if (tcp->dest != new_dport) {
+				csum_update_2(&tcp->check,
+					      tcp->dest, new_dport);
+				tcp->dest = new_dport;
+			}
+		}
+	} else if (meta->protocol == PROTO_UDP) {
+		struct udphdr *udp = l4;
+		if ((void *)(udp + 1) <= _de) {
+			if (udp->check != 0)
+				csum_update_4(&udp->check, old_dst,
+					      meta->dst_ip.v4);
+			if (udp->dest != new_dport) {
+				if (udp->check != 0)
+					csum_update_2(&udp->check,
+						      udp->dest,
+						      new_dport);
+				udp->dest = new_dport;
+			}
+		}
+	} else if (meta->protocol == PROTO_ICMP) {
+		struct icmphdr *icmp = l4;
+		if ((void *)(icmp + 1) <= _de) {
+			if (icmp->un.echo.id != new_dport) {
+				csum_update_2(&icmp->checksum,
+					      icmp->un.echo.id,
+					      new_dport);
+				icmp->un.echo.id = new_dport;
+			}
+		}
+	}
+}
+
 SEC("xdp")
 int xdp_zone_prog(struct xdp_md *ctx)
 {
@@ -489,6 +562,7 @@ zone_resolved:
 		if (sv4 && sv4->fib_ifindex != 0 &&
 		    !check_egress_rg_active(sv4->fib_ifindex,
 					    sv4->fib_vlan_id)) {
+			apply_dnat_before_fabric_redirect(ctx, meta);
 			int fab_rc = try_fabric_redirect(ctx, meta);
 			if (fab_rc >= 0)
 				return fab_rc;
@@ -618,6 +692,22 @@ zone_resolved:
 		if (ezv)
 			meta->egress_zone = ezv->zone_id;
 
+		/* Fabric transit auto-forward: post-NAT packets from
+		 * peer that went through KERNEL_ROUTE + NAT reversal +
+		 * fabric redirect.  These don't match any local session
+		 * (addresses are post-NAT) and don't need policy or
+		 * conntrack — the peer already validated the traffic.
+		 *
+		 * DO NOT forward here with the initial FIB result.
+		 * When routing_table is not set to 254 (no synced
+		 * session), the initial FIB uses the fabric interface's
+		 * VRF (vrf-mgmt).  If vrf-mgmt has a default route
+		 * (e.g. from DHCP), the FIB resolves to the management
+		 * interface — WRONG egress for cross-RG traffic.
+		 * Fall through to the re-FIB in table 254 below
+		 * (after session handlers) which uses a non-VRF
+		 * ifindex for correct main-table resolution. */
+
 		/* Active/active per-RG check: if the egress interface's
 		 * RG is not locally active, redirect to fabric peer.
 		 * Existing sessions use plain redirect (peer has synced
@@ -636,6 +726,8 @@ zone_resolved:
 				if (sv6 != NULL)
 					has_session = 1;
 				if (has_session) {
+					apply_dnat_before_fabric_redirect(
+						ctx, meta);
 					int fab_rc =
 						try_fabric_redirect(ctx, meta);
 					if (fab_rc >= 0)
@@ -782,6 +874,17 @@ zone_resolved:
 						 fib2.dmac, ETH_ALEN);
 				__builtin_memcpy(meta->fwd_smac,
 						 fib2.smac, ETH_ALEN);
+				/* Resolve egress zone for counters */
+				struct iface_zone_key ez2 = {
+					.ifindex = eg2,
+					.vlan_id = ev2,
+				};
+				struct iface_zone_value *ezv2 =
+					bpf_map_lookup_elem(
+						&iface_zone_map, &ez2);
+				if (ezv2)
+					meta->egress_zone =
+						ezv2->zone_id;
 				bpf_tail_call(ctx, &xdp_progs,
 					      XDP_PROG_FORWARD);
 			}
@@ -801,18 +904,50 @@ zone_resolved:
 		 * Route exists but no ARP/NDP entry for the next hop.
 		 *
 		 * In cluster mode, try fabric redirect — the peer may
-		 * have the ARP/NDP entry.  Anti-loop prevents loops.
+		 * have the ARP/NDP entry or the route.  During FRR
+		 * nexthop-tracking updates, NO_NEIGH may appear briefly
+		 * for routes that are actually blackholed (default route
+		 * not yet withdrawn).
 		 *
-		 * For existing sessions, fall back to conntrack +
-		 * kernel routing if fabric is unavailable.
+		 * New connections: zone-encoded redirect preserves
+		 * ingress zone for policy/SNAT on the peer (matches
+		 * BLACKHOLE handler pattern).  Plain redirect fallback
+		 * if zone-encoded fails.
 		 *
-		 * For new connections, XDP_PASS so the kernel resolves
-		 * ARP/NDP and the retransmit goes through the pipeline.
+		 * Existing sessions: plain redirect (peer has synced
+		 * session).  Falls back to conntrack + kernel routing
+		 * if fabric is unavailable.
+		 *
+		 * For new connections without fabric, XDP_PASS so the
+		 * kernel resolves ARP/NDP and the retransmit goes
+		 * through the pipeline.
 		 */
 		{
-			int fab_rc = try_fabric_redirect(ctx, meta);
-			if (fab_rc >= 0)
-				return fab_rc;
+			volatile int nn_has_session = 0;
+			if (sv4 != NULL)
+				nn_has_session = 1;
+			if (sv6 != NULL)
+				nn_has_session = 1;
+			if (nn_has_session) {
+				int fab_rc =
+					try_fabric_redirect(ctx, meta);
+				if (fab_rc >= 0)
+					return fab_rc;
+			} else {
+				/* New connection: zone-encoded redirect
+				 * preserves ingress zone for policy on
+				 * the peer. */
+				int fab_rc =
+					try_fabric_redirect_with_zone(
+						ctx, meta);
+				if (fab_rc >= 0)
+					return fab_rc;
+				/* Plain redirect fallback. */
+				fab_rc =
+					try_fabric_redirect(ctx, meta);
+				if (fab_rc >= 0)
+					return fab_rc;
+			}
 		}
 		if (sv4 != NULL) {
 			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
@@ -884,6 +1019,101 @@ zone_resolved:
 					try_fabric_redirect(ctx, meta);
 				if (fab_rc >= 0)
 					return fab_rc;
+
+				/* Fabric transit forward: the peer
+				 * NAT-reversed this traffic and plain-
+				 * fabric-redirected it here.  No local
+				 * session (not synced yet).  The first
+				 * FIB used vrf-mgmt (fab0's VRF — no
+				 * routing_table=254 override without a
+				 * session) and returned UNREACHABLE.
+				 * Re-FIB in main table to find the
+				 * correct egress for the de-NAT'd
+				 * destination address. */
+				if (meta->meta_flags &
+				    META_FLAG_FABRIC_FWD) {
+					struct bpf_fib_lookup fib3 = {};
+					fib3.l4_protocol =
+						meta->protocol;
+					fib3.tot_len = meta->pkt_len;
+					fib3.tbid = 254;
+					fib3.ifindex =
+						meta->ingress_ifindex;
+					{
+						__u32 ff3_key = 0;
+						struct fabric_fwd_info *ff3 =
+						    bpf_map_lookup_elem(
+							&fabric_fwd,
+							&ff3_key);
+						if (ff3 &&
+						    ff3->fib_ifindex)
+							fib3.ifindex =
+							    ff3->fib_ifindex;
+					}
+					if (meta->addr_family ==
+					    AF_INET) {
+						fib3.family = AF_INET;
+						fib3.ipv4_src =
+							meta->src_ip.v4;
+						fib3.ipv4_dst =
+							meta->dst_ip.v4;
+					} else {
+						fib3.family = AF_INET6;
+						__builtin_memcpy(
+							fib3.ipv6_src,
+							meta->src_ip.v6,
+							16);
+						__builtin_memcpy(
+							fib3.ipv6_dst,
+							meta->dst_ip.v6,
+							16);
+					}
+					int rc3 = bpf_fib_lookup(
+						ctx, &fib3, sizeof(fib3),
+						BPF_FIB_LOOKUP_TBID);
+					if (rc3 ==
+					    BPF_FIB_LKUP_RET_SUCCESS) {
+						__u32 eg3 = fib3.ifindex;
+						__u16 ev3 = 0;
+						struct vlan_iface_info
+							*vi3 =
+						    bpf_map_lookup_elem(
+							&vlan_iface_map,
+							&eg3);
+						if (vi3) {
+							eg3 =
+							    vi3->parent_ifindex;
+							ev3 =
+							    vi3->vlan_id;
+						}
+						meta->fwd_ifindex = eg3;
+						meta->egress_vlan_id = ev3;
+						__builtin_memcpy(
+							meta->fwd_dmac,
+							fib3.dmac,
+							ETH_ALEN);
+						__builtin_memcpy(
+							meta->fwd_smac,
+							fib3.smac,
+							ETH_ALEN);
+						struct iface_zone_key ez3 = {
+							.ifindex = eg3,
+							.vlan_id = ev3,
+						};
+						struct iface_zone_value
+							*ezv3 =
+						    bpf_map_lookup_elem(
+							&iface_zone_map,
+							&ez3);
+						if (ezv3)
+							meta->egress_zone =
+							    ezv3->zone_id;
+						bpf_tail_call(
+							ctx,
+							&xdp_progs,
+							XDP_PROG_FORWARD);
+					}
+				}
 			}
 		}
 		if (sv4 != NULL) {
