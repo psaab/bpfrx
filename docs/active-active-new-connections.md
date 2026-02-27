@@ -581,6 +581,54 @@ make test-active-active → 14/14 PASS:
   Phase 6:  iperf3 completed with >1 Gbps throughput
 ```
 
+## Bug: Failback Stream Death (rg_active Set Before Routing Ready)
+
+### Symptom
+
+After RG1 (WAN) failover to fw1 then failback to fw0, one of 4 parallel
+iperf3 streams permanently drops to 0 bytes/s while the other 3 continue at
+~1.7 Gbps. The dead stream shows cwnd collapsed to 1.41 KBytes (1 MSS) and
+never recovers.
+
+### Root Cause
+
+The cluster event handler (`watchClusterEvents()`) set `rg_active=true`
+**before** the VRRP MASTER event fired. This created a ~30-60ms window where
+`rg_active=true` but blackhole routes still existed:
+
+```
+T=0ms:    Cluster Primary event → UpdateRGActive(1, true) + BumpFIBGeneration()
+T=0-60ms: BLACKHOLE WINDOW — rg_active says "active" but routing broken
+T=30-60ms: VRRP MASTER → becomeMaster() → removeBlackholeRoutes()
+```
+
+During this window, packets hitting the pre-FIB RG check saw `rg_active=true`
+and proceeded to FIB lookup instead of fabric-redirecting. FIB returned
+BLACKHOLE (routes not yet removed), so the BLACKHOLE handler sent the packet
+through conntrack→NAT→forward. SNAT was applied (src rewritten to VIP), then
+xdp_forward's KERNEL_ROUTE path did a re-FIB → BLACKHOLE → `try_fabric_redirect()`
+to fw1. But the packet now had SNAT'd headers (src=172.16.50.10) that didn't
+match any synced session on fw1 (synced sessions use the original 5-tuple).
+The packet was dropped.
+
+### Fix
+
+In the cluster event handler, only set `rg_active=true` when VRRP is **already
+MASTER** for that RG (`d.rethMasterState[rgID]` is true). This covers the
+initial boot case (SecondaryHold→Primary, where VRRP self-elected before the
+cluster formed). When VRRP is BACKUP (the failback case), defer `rg_active=true`
+to the VRRP MASTER event handler, which fires **after** `becomeMaster()` has
+added the VIP and `removeBlackholeRoutes()` has cleaned up routing. This ensures
+packets continue to fabric-redirect (pre-NAT) until routing is fully ready.
+Setting `rg_active=false` on Secondary transition remains immediate.
+
+### Why Only One Stream Dies
+
+All 4 streams lose packets during the ~30-60ms window. Most recover because
+TCP RTO (~200ms) > window duration. But one stream's congestion window collapses
+to 1 MSS, and with 3 other streams at full throughput competing for bandwidth,
+the collapsed stream cannot reclaim capacity.
+
 ## References
 
 - AA-1 sprint: `23f1a3d` — Per-RG active state tracking in BPF

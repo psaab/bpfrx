@@ -3630,17 +3630,35 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				}
 			}
 
-			// Update BPF rg_active map directly from cluster state.
-			// This is more reliable than waiting for the VRRP state
-			// machine to emit a MASTER/BACKUP event (which may be
-			// delayed by VRRP advertisement timing).
+			// Update BPF rg_active map based on cluster state.
 			if d.dp != nil {
-				active := ev.NewState == cluster.StatePrimary
-				if err := d.dp.UpdateRGActive(ev.GroupID, active); err != nil {
-					slog.Warn("failed to update rg_active from cluster event",
-						"rg", ev.GroupID, "active", active, "err", err)
+				if ev.NewState == cluster.StatePrimary {
+					// On Primary transition, only set rg_active=true
+					// if VRRP is already MASTER (routing is ready).
+					// If VRRP is BACKUP (failback), defer to the VRRP
+					// MASTER event which fires after becomeMaster()
+					// adds VIPs and removeBlackholeRoutes() cleans up.
+					// Setting rg_active=true before routing is ready
+					// causes a ~30-60ms window where packets bypass
+					// fabric redirect, get SNAT'd, hit the blackhole,
+					// and arrive at the peer with SNAT'd headers that
+					// don't match any synced session.
+					if d.rethMasterState[ev.GroupID] {
+						if err := d.dp.UpdateRGActive(ev.GroupID, true); err != nil {
+							slog.Warn("failed to update rg_active from cluster event",
+								"rg", ev.GroupID, "active", true, "err", err)
+						}
+						d.dp.BumpFIBGeneration()
+					}
+				} else {
+					// Set rg_active=false immediately on Secondary
+					// transition — stop accepting traffic right away.
+					if err := d.dp.UpdateRGActive(ev.GroupID, false); err != nil {
+						slog.Warn("failed to update rg_active from cluster event",
+							"rg", ev.GroupID, "active", false, "err", err)
+					}
+					d.dp.BumpFIBGeneration()
 				}
-				d.dp.BumpFIBGeneration()
 			}
 
 			// Debounced VRRP priority update — 500ms coalesce window.
