@@ -272,13 +272,14 @@ fi
 incus exec cluster-lan-host -- pkill -9 iperf3 2>/dev/null || true
 sleep 1
 
-# Extract final throughput from whatever is in the log
-throughput=$(incus exec cluster-lan-host -- grep '\[SUM\].*sender' "$LOG" 2>/dev/null \
-	| grep -oP '[\d.]+\s+Gbits' | grep -oP '[\d.]+' || true)
-if [[ -z "$throughput" ]]; then
-	# Try last SUM line (iperf3 may not have finished)
-	throughput=$(incus exec cluster-lan-host -- grep 'SUM' "$LOG" 2>/dev/null \
-		| tail -1 | grep -oiE "[0-9.]+ Gbits" | grep -oP '[\d.]+' || echo "0")
+# Extract throughput from the last SUM line (iperf3 may still be running)
+last_sum=$(incus exec cluster-lan-host -- grep 'SUM' "$LOG" 2>/dev/null | tail -1 || true)
+throughput=""
+if echo "$last_sum" | grep -qiE "[0-9.]+ Gbits"; then
+	throughput=$(echo "$last_sum" | grep -oiE "[0-9.]+ Gbits" | grep -oP '[\d.]+')
+elif echo "$last_sum" | grep -qiE "[0-9.]+ Mbits"; then
+	mbits=$(echo "$last_sum" | grep -oiE "[0-9.]+ Mbits" | grep -oP '[\d.]+')
+	throughput=$(awk "BEGIN{printf \"%.3f\", $mbits / 1000}")
 fi
 
 if [[ -n "$throughput" ]] && awk "BEGIN{exit !($throughput >= $MIN_THROUGHPUT)}"; then
