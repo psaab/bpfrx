@@ -748,7 +748,9 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 					revVal.ReverseKey = key
 					revVal.IngressZone = val.EgressZone
 					revVal.EgressZone = val.IngressZone
-					s.dp.SetSessionV6(val.ReverseKey, revVal)
+					if err := s.dp.SetSessionV6(val.ReverseKey, revVal); err != nil {
+						slog.Warn("cluster sync: failed to create reverse v6 session", "err", err)
+					}
 				}
 				if val.IsReverse == 0 &&
 					val.Flags&dataplane.SessFlagSNAT != 0 &&
@@ -762,7 +764,9 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 						NewDstIP:   key.SrcIP,
 						NewDstPort: key.SrcPort,
 					}
-					s.dp.SetDNATEntryV6(dnatKey, dnatVal)
+					if err := s.dp.SetDNATEntryV6(dnatKey, dnatVal); err != nil {
+						slog.Warn("cluster sync: failed to create dnat_table_v6 entry", "err", err)
+					}
 				}
 			}
 		}

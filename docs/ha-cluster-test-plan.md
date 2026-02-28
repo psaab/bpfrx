@@ -783,6 +783,241 @@ incus exec bpfrx-fw0 -- systemctl start bpfrxd
 9. Once FRR converges (~1-2s) and ARP/NDP resolves, fresh FIB lookups succeed
    and XDP resumes direct forwarding
 
+### TC-13: IPv6 DNAT Across Fabric Redirect
+
+**Objective:** Verify IPv6 DNAT'd traffic survives failover via fabric cross-chassis
+redirect. Exercises `apply_dnat_before_fabric_redirect_v6()` which rewrites the
+IPv6 destination and L4 port in the packet header before fabric redirect.
+
+**Background:** When the active RG moves to the peer, the local node's cached session
+points to an inactive egress interface. `xdp_zone` detects this and redirects the
+packet over the fabric link to the peer. For DNAT sessions, the packet header still
+has the original VIP destination — `apply_dnat_before_fabric_redirect_v6()` must
+rewrite it to the real server address (using parsed `meta->l3_offset`/`meta->l4_offset`
+for VLAN support, and skipping port checksum updates when `meta->csum_partial` is set).
+
+**Prerequisites:**
+- IPv6 DNAT rule in cluster config (e.g., `[reth0-VIP]:5201` → `[server]:5201`)
+- IPv6 iperf3 server reachable from WAN
+
+**Config additions needed:**
+```
+security {
+    nat {
+        destination {
+            pool ipv6-server {
+                address 2001:559:8585:100::247/128;
+                port 5201;
+            }
+            rule-set wan-dnat-v6 {
+                from zone wan;
+                rule dnat-iperf6 {
+                    match {
+                        destination-address 2001:559:8585:50::6/128;
+                        destination-port 5201;
+                        protocol tcp;
+                    }
+                    then {
+                        destination-nat pool ipv6-server;
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+```bash
+# 1. Start IPv6 iperf3 through DNAT (WAN VIP → real server)
+incus exec cluster-lan-host -- iperf3 -6 -c 2001:559:8585:50::6 -t 60 -P 4 &
+
+# 2. Verify sessions on fw0 (should show DNAT flag)
+incus exec bpfrx-fw0 -- cli -c 'show security flow session destination-prefix 2001:559:8585:50::6'
+
+# 3. Verify sessions synced to fw1
+incus exec bpfrx-fw1 -- cli -c 'show security flow session destination-prefix 2001:559:8585:50::6'
+
+# 4. Failover RG1 to fw1
+incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 1'
+sleep 5
+
+# 5. Verify traffic still flowing (fw1 now MASTER, fabric redirect active)
+incus exec cluster-lan-host -- curl -6 --connect-timeout 5 http://[2001:559:8585:50::6]:5201
+
+# 6. Check iperf3 streams alive
+# Expected: all streams alive, throughput > 0
+
+# 7. Failback to fw0
+incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
+sleep 5
+
+# 8. Verify traffic still flowing
+```
+
+**Pass criteria:**
+- IPv6 DNAT sessions visible on both nodes (with DNAT flag set)
+- iperf3 connections survive failover (RG1 fw0→fw1)
+- iperf3 connections survive failback (RG1 fw1→fw0)
+- No permanent stream death
+- dnat_table_v6 entries created on secondary (verify via sync receiver logging)
+
+**Validates:**
+- `apply_dnat_before_fabric_redirect_v6()` correctness (parsed offsets, csum_partial)
+- IPv6 RG-inactive cached session fabric redirect (missing DNAT call before this fix)
+- `SetSessionV6(reverse)` and `SetDNATEntryV6` in sync receiver (error logging)
+
+---
+
+### TC-14: Port-Only DNAT Across Fabric Redirect
+
+**Objective:** Verify DNAT that changes only the destination port (same IP) works
+correctly across fabric redirect. This tests the fix for the short-circuit bug where
+`apply_dnat_before_fabric_redirect_v6()` returned early when the destination IP
+matched, skipping the L4 port rewrite.
+
+**Background:** The old code short-circuited on `ip_addr_eq_v6(meta->dst_ip, ip6h->daddr)`.
+For port-only DNAT (e.g., redirect port 80 → 8080 on the same VIP), the IPs match but
+the port differs. The fix uses a `need_addr` flag so L4 port rewrite runs even when
+the address hasn't changed.
+
+**Config additions needed:**
+```
+security {
+    nat {
+        destination {
+            pool port-redirect {
+                address 2001:559:8585:50::6/128;  # same VIP
+                port 8080;                         # different port
+            }
+            rule-set wan-dnat-port {
+                from zone wan;
+                rule port-only-dnat {
+                    match {
+                        destination-address 2001:559:8585:50::6/128;
+                        destination-port 80;
+                        protocol tcp;
+                    }
+                    then {
+                        destination-nat pool port-redirect;
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+```bash
+# 1. Start HTTP server on port 8080 behind the firewall
+# (or use an iperf3 server on port 8080)
+
+# 2. Connect to VIP:80 (DNAT rewrites port to 8080, same IP)
+incus exec cluster-lan-host -- curl -6 --connect-timeout 5 \
+    http://[2001:559:8585:50::6]:80/
+
+# 3. Verify session shows DNAT with port change
+incus exec bpfrx-fw0 -- cli -c 'show security flow session'
+# Expected: session shows dst port translated 80→8080
+
+# 4. Failover RG1 to fw1 (triggers fabric redirect)
+incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 1'
+sleep 3
+
+# 5. New connection to VIP:80 should still work via fabric
+incus exec cluster-lan-host -- curl -6 --connect-timeout 5 \
+    http://[2001:559:8585:50::6]:80/
+
+# 6. Verify the packet was rewritten (port 80→8080) before fabric redirect
+# Check fw1 sessions — should show correct port translation
+
+# 7. Reset
+incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
+```
+
+**Pass criteria:**
+- Port-only DNAT works in steady state (no failover)
+- Port-only DNAT survives failover via fabric redirect
+- Session on peer shows correct port translation (80→8080)
+- No checksum errors (verify with tcpdump on peer if needed)
+
+**Validates:**
+- Fix for `ip_addr_eq_v6` short-circuit — port rewrite runs even when IPs match
+- Both IPv4 and IPv6 variants (test both `apply_dnat_before_fabric_redirect` paths)
+
+---
+
+### TC-15: Multi-Cycle Failover Under IPv6 Load
+
+**Objective:** Verify IPv6 TCP streams survive repeated rapid failover cycles,
+analogous to the IPv4 stress test (`test-stress-failover.sh`).
+
+**Background:** The IPv4 stress test validates that 8 parallel iperf3 streams survive
+N failover/failback cycles with 0 dead streams. This test extends coverage to IPv6,
+exercising the IPv6 fabric redirect path (including DNAT rewrite if IPv6 DNAT rules
+are configured) and IPv6 session sync.
+
+```bash
+# 1. Start IPv6 iperf3 with parallel streams
+incus exec cluster-lan-host -- iperf3 -6 \
+    -c 2001:559:8585:100::247 -t 120 -P 8 --forceflush \
+    > /tmp/iperf3-v6-stress.log 2>&1 &
+
+# 2. Wait for streams to establish
+sleep 8
+
+# 3. Verify v6 sessions on fw0 and fw1
+incus exec bpfrx-fw0 -- cli -c 'show security flow session protocol tcp family inet6' \
+    | grep -c 'State: Established'
+# Expected: >= 8
+
+# 4. Run 5 failover/failback cycles (30s interval)
+for cycle in $(seq 1 5); do
+    echo "=== Cycle $cycle: failover fw0→fw1 ==="
+    incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1'
+    sleep 15
+
+    # Check for dead streams
+    incus exec cluster-lan-host -- tail -21 /tmp/iperf3-v6-stress.log \
+        | grep -E '^\[  [0-9]|^\[ [0-9][0-9]' | tail -8 \
+        | grep -c '0.00 bits/sec' || true
+
+    echo "=== Cycle $cycle: failback fw1→fw0 ==="
+    incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
+    incus exec bpfrx-fw1 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
+    incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0'
+    sleep 15
+
+    # Check again
+    incus exec cluster-lan-host -- tail -21 /tmp/iperf3-v6-stress.log \
+        | grep -E '^\[  [0-9]|^\[ [0-9][0-9]' | tail -8 \
+        | grep -c '0.00 bits/sec' || true
+done
+
+# 5. Final: count total zero-throughput intervals
+incus exec cluster-lan-host -- grep -E '^\[  [0-9]|^\[ [0-9][0-9]' \
+    /tmp/iperf3-v6-stress.log | grep -c '0.00 bits/sec' || true
+# Expected: 0
+
+# 6. Cleanup
+incus exec cluster-lan-host -- pkill -9 iperf3
+```
+
+**Pass criteria:**
+- All 8 IPv6 streams alive after each failover and failback
+- 0 zero-throughput intervals across the entire run
+- iperf3 process alive at end of test
+- Throughput >= 1.0 Gbps during steady state
+
+**Validates:**
+- IPv6 session sync (forward + reverse sessions, dnat_table_v6 entries)
+- IPv6 fabric redirect under load (all existing-session paths)
+- `apply_dnat_before_fabric_redirect_v6()` under repeated failovers
+- Sync receiver error handling (slog.Warn on SetSessionV6/SetDNATEntryV6 failures)
+
+**Future:** Integrate into `test-stress-failover.sh` as an `IPERF_FAMILY=6` option.
+
+---
+
 ## Performance Expectations
 
 | Metric | Expected | Verified | Notes |

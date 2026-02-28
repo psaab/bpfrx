@@ -250,34 +250,47 @@ apply_dnat_before_fabric_redirect_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 {
 	void *data = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
-	struct ipv6hdr *ip6h = data + sizeof(struct ethhdr);
+
+	/* Use parsed offsets — sizeof(struct ethhdr) is wrong for
+	 * VLAN-tagged packets (l3 at 18 instead of 14), and ip6h+1
+	 * is wrong when IPv6 extension headers are present. */
+	if (meta->l3_offset >= 64 || meta->l4_offset >= 192)
+		return;
+	struct ipv6hdr *ip6h = data + meta->l3_offset;
 	if ((void *)(ip6h + 1) > data_end)
 		return;
+	void *l4 = data + meta->l4_offset;
 
-	if (ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr))
-		return;
+	/* Don't short-circuit solely on dst IP equality — port-only
+	 * DNAT (same IP, different port) still needs L4 rewrite. */
+	int need_addr = !ip_addr_eq_v6(meta->dst_ip.v6,
+				       (__u8 *)&ip6h->daddr);
 
-	__u8 old_dst[16];
-	__builtin_memcpy(old_dst, &ip6h->daddr, 16);
+	if (need_addr) {
+		__u8 old_dst[16];
+		__builtin_memcpy(old_dst, &ip6h->daddr, 16);
+		nat_update_l4_csum_v6(l4, data_end, meta,
+				      old_dst, meta->dst_ip.v6);
+		__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
+	}
 
-	void *l4 = (void *)(ip6h + 1);
-
-	/* Update L4 checksum for address change (IPv6 has no IP checksum) */
-	nat_update_l4_csum_v6(l4, data_end, meta, old_dst, meta->dst_ip.v6);
-	__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
-
-	/* Update L4 destination port */
+	/* Update L4 destination port.  Skip incremental port checksum
+	 * when csum_partial — matches nat_rewrite_v6 behavior. */
 	__be16 new_dport = meta->dst_port;
 	if (meta->protocol == PROTO_TCP) {
 		struct tcphdr *tcp = l4;
 		if ((void *)(tcp + 1) <= data_end && tcp->dest != new_dport) {
-			csum_update_2(&tcp->check, tcp->dest, new_dport);
+			if (!meta->csum_partial)
+				csum_update_2(&tcp->check,
+					      tcp->dest, new_dport);
 			tcp->dest = new_dport;
 		}
 	} else if (meta->protocol == PROTO_UDP) {
 		struct udphdr *udp = l4;
 		if ((void *)(udp + 1) <= data_end && udp->dest != new_dport) {
-			csum_update_2(&udp->check, udp->dest, new_dport);
+			if (!meta->csum_partial)
+				csum_update_2(&udp->check,
+					      udp->dest, new_dport);
 			udp->dest = new_dport;
 		}
 	} else if (meta->protocol == PROTO_ICMPV6) {
@@ -285,8 +298,10 @@ apply_dnat_before_fabric_redirect_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 		if ((void *)(icmp6 + 1) <= data_end &&
 		    (icmp6->icmp6_type == 128 || icmp6->icmp6_type == 129) &&
 		    icmp6->un.echo.id != new_dport) {
-			csum_update_2(&icmp6->icmp6_cksum,
-				      icmp6->un.echo.id, new_dport);
+			if (!meta->csum_partial)
+				csum_update_2(&icmp6->icmp6_cksum,
+					      icmp6->un.echo.id,
+					      new_dport);
 			icmp6->un.echo.id = new_dport;
 		}
 	}
@@ -703,6 +718,7 @@ zone_resolved:
 		if (sv6 && sv6->fib_ifindex != 0 &&
 		    !check_egress_rg_active(sv6->fib_ifindex,
 					    sv6->fib_vlan_id)) {
+			apply_dnat_before_fabric_redirect(ctx, meta);
 			int fab_rc = try_fabric_redirect(ctx, meta);
 			if (fab_rc >= 0)
 				return fab_rc;
@@ -890,12 +906,14 @@ zone_resolved:
 		if (meta->fwd_ifindex == meta->ingress_ifindex &&
 		    meta->egress_vlan_id == meta->ingress_vlan_id) {
 			if (sv4 != NULL) {
+				apply_dnat_before_fabric_redirect(ctx, meta);
 				int fab_rc =
 					try_fabric_redirect(ctx, meta);
 				if (fab_rc >= 0)
 					return fab_rc;
 			}
 			if (sv6 != NULL) {
+				apply_dnat_before_fabric_redirect(ctx, meta);
 				int fab_rc =
 					try_fabric_redirect(ctx, meta);
 				if (fab_rc >= 0)
@@ -1039,6 +1057,7 @@ zone_resolved:
 			if (sv6 != NULL)
 				nn_has_session = 1;
 			if (nn_has_session) {
+				apply_dnat_before_fabric_redirect(ctx, meta);
 				int fab_rc =
 					try_fabric_redirect(ctx, meta);
 				if (fab_rc >= 0)
