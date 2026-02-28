@@ -234,13 +234,15 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
  * meta->dst_ip/port but defers packet header rewrite to xdp_nat.
  * When we fabric-redirect before reaching xdp_nat, the peer
  * receives a packet with post-NAT destination that it can't
- * de-NAT (dnat_table entries are not synced between cluster
- * nodes).  This function rewrites the packet destination to
- * match meta so the peer receives pre-NAT addresses matching
- * the synced session.
+ * de-NAT.  This function rewrites the packet destination to
+ * match meta so the peer receives the correct addresses
+ * matching the synced session.  (dnat_table entries ARE synced
+ * via session sync, but the rewrite is still needed because
+ * pre-routing DNAT only updates meta, not the packet.)
  *
- * IPv4 only — IPv6 dnat_table_v6 follows the same pattern
- * but is not yet handled here.
+ * IPv4 only — IPv6 DNAT must be handled in a separate
+ * __noinline function or tail-call to avoid inline code
+ * explosion that breaks the surrounding IPv4 fast-path.
  */
 static __always_inline void
 apply_dnat_before_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
@@ -261,7 +263,8 @@ apply_dnat_before_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 	iph->daddr = meta->dst_ip.v4;
 
 	void *l4 = (void *)iph + sizeof(struct iphdr);
-	__be16 new_dport = bpf_htons(meta->dst_port);
+	/* meta->dst_port is already __be16 (from tcp->dest) — no swap */
+	__be16 new_dport = meta->dst_port;
 
 	if (meta->protocol == PROTO_TCP) {
 		struct tcphdr *tcp = l4;
