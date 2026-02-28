@@ -570,6 +570,8 @@ zone_resolved:
 	struct session_value *sv4 = NULL;
 	struct session_value_v6 *sv6 = NULL;
 	__u8 ct_direction = 0;
+	int skip_cache_v4 = 0;
+	int skip_cache_v6 = 0;
 
 	/* Read global FIB generation counter for cache validation */
 	__u32 fib_gen = 0;
@@ -605,9 +607,18 @@ zone_resolved:
 			int fab_rc = try_fabric_redirect(ctx, meta);
 			if (fab_rc >= 0)
 				return fab_rc;
-			/* Anti-loop or no fabric — fall through */
+			/* Fabric-forwarded + anti-loop: both nodes have
+			 * this RG inactive during transition. Don't let
+			 * cached fast-path bypass downstream FABRIC_FWD
+			 * safety checks; drop cleanly. */
+			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
+				return XDP_DROP;
+			/* Redirect failed (anti-loop/no fabric): force
+			 * full FIB path below; cached FIB may point to
+			 * an inactive RG and bypass failover guards. */
+			skip_cache_v4 = 1;
 		}
-		if (sv4 && sv4->fib_ifindex != 0 &&
+		if (!skip_cache_v4 && sv4 && sv4->fib_ifindex != 0 &&
 		    sv4->fib_gen == (__u16)fib_gen) {
 			meta->fwd_ifindex    = sv4->fib_ifindex;
 			meta->egress_vlan_id = sv4->fib_vlan_id;
@@ -638,8 +649,11 @@ zone_resolved:
 			int fab_rc = try_fabric_redirect(ctx, meta);
 			if (fab_rc >= 0)
 				return fab_rc;
+			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
+				return XDP_DROP;
+			skip_cache_v6 = 1;
 		}
-		if (sv6 && sv6->fib_ifindex != 0 &&
+		if (!skip_cache_v6 && sv6 && sv6->fib_ifindex != 0 &&
 		    sv6->fib_gen == (__u16)fib_gen) {
 			meta->fwd_ifindex    = sv6->fib_ifindex;
 			meta->egress_vlan_id = sv6->fib_vlan_id;

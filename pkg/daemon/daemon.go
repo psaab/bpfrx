@@ -107,6 +107,7 @@ type Daemon struct {
 
 	// rethMasterState tracks per-RG VRRP master state. In active/active HA,
 	// a node can be MASTER for one RG and BACKUP for another simultaneously.
+	haStateMu       sync.RWMutex
 	rethMasterState map[int]bool
 
 	// blackholeRoutes tracks blackhole routes injected for inactive RG subnets.
@@ -114,8 +115,8 @@ type Daemon struct {
 	// to prevent FIB from routing return traffic via the default route (which
 	// would escape via WAN). Instead, bpf_fib_lookup returns BLACKHOLE and
 	// the FIB failure handler triggers fabric redirect to the peer.
+	blackholeMu     sync.Mutex
 	blackholeRoutes map[int][]netlink.Route
-
 }
 
 // New creates a new Daemon.
@@ -139,9 +140,11 @@ func New(opts Options) *Daemon {
 	}
 
 	return &Daemon{
-		opts:      opts,
-		startTime: time.Now(),
-		store:     store,
+		opts:            opts,
+		startTime:       time.Now(),
+		store:           store,
+		rethMasterState: make(map[int]bool),
+		blackholeRoutes: make(map[int][]netlink.Route),
 	}
 }
 
@@ -3604,6 +3607,29 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 	slog.Warn("cluster: fabric_fwd map population failed after retries")
 }
 
+func (d *Daemon) setRethMasterState(rgID int, isMaster bool) {
+	d.haStateMu.Lock()
+	d.rethMasterState[rgID] = isMaster
+	d.haStateMu.Unlock()
+}
+
+func (d *Daemon) isRethMasterState(rgID int) bool {
+	d.haStateMu.RLock()
+	isMaster := d.rethMasterState[rgID]
+	d.haStateMu.RUnlock()
+	return isMaster
+}
+
+func (d *Daemon) snapshotRethMasterState() map[int]bool {
+	d.haStateMu.RLock()
+	out := make(map[int]bool, len(d.rethMasterState))
+	for rgID, isMaster := range d.rethMasterState {
+		out[rgID] = isMaster
+	}
+	d.haStateMu.RUnlock()
+	return out
+}
+
 func (d *Daemon) watchClusterEvents(ctx context.Context) {
 	// Debounce VRRP updates: coalesce rapid cluster events into a single
 	// UpdateInstances call. Without this, every heartbeat-driven state change
@@ -3680,7 +3706,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// handler fires ~5ms later (after priority-0 burst
 				// propagates) and sets rg_active=false + injects
 				// blackhole routes.
-				if !d.rethMasterState[ev.GroupID] {
+				if !d.isRethMasterState(ev.GroupID) {
 					if err := d.dp.UpdateRGActive(ev.GroupID, false); err != nil {
 						slog.Warn("failed to update rg_active from cluster event",
 							"rg", ev.GroupID, "active", false, "err", err)
@@ -3739,10 +3765,6 @@ func rgIDFromVRID(vrid int) int {
 // active/active mode, a BACKUP event for RG1 must not clear services
 // started for RG0.
 func (d *Daemon) watchVRRPEvents(ctx context.Context) {
-	if d.rethMasterState == nil {
-		d.rethMasterState = make(map[int]bool)
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -3758,7 +3780,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				"rg", rgID,
 				"state", ev.State.String())
 			if ev.State == vrrp.StateMaster {
-				d.rethMasterState[rgID] = true
+				d.setRethMasterState(rgID, true)
 				d.removeBlackholeRoutes(rgID)
 				if d.dp != nil {
 					// Set rg_active=true immediately on VRRP MASTER.
@@ -3789,7 +3811,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				d.applyRethServicesForRG(rgID)
 			}
 			if ev.State == vrrp.StateBackup {
-				d.rethMasterState[rgID] = false
+				d.setRethMasterState(rgID, false)
 				if d.dp != nil {
 					if err := d.dp.UpdateRGActive(rgID, false); err != nil {
 						slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
@@ -3828,12 +3850,12 @@ func rethInterfacesForRG(cfg *config.Config, rgID int) []string {
 // return traffic via the default route (which would escape via WAN). Instead,
 // FIB returns BLACKHOLE and the BPF failure handler triggers fabric redirect.
 func (d *Daemon) injectBlackholeRoutes(rgID int) {
+	d.blackholeMu.Lock()
+	defer d.blackholeMu.Unlock()
+
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
 		return
-	}
-	if d.blackholeRoutes == nil {
-		d.blackholeRoutes = make(map[int][]netlink.Route)
 	}
 
 	var routes []netlink.Route
@@ -3872,9 +3894,9 @@ func (d *Daemon) injectBlackholeRoutes(rgID int) {
 // given RG. Called on VRRP MASTER transition — the connected route returns
 // naturally when the VIP is added back.
 func (d *Daemon) removeBlackholeRoutes(rgID int) {
-	if d.blackholeRoutes == nil {
-		return
-	}
+	d.blackholeMu.Lock()
+	defer d.blackholeMu.Unlock()
+
 	for _, rt := range d.blackholeRoutes[rgID] {
 		if err := netlink.RouteDel(&rt); err != nil {
 			slog.Warn("blackhole: failed to remove route",
@@ -3911,7 +3933,7 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 			}
 		}
 		// Collect RA configs from ALL master RGs (not just this one).
-		for otherRG, isMaster := range d.rethMasterState {
+		for otherRG, isMaster := range d.snapshotRethMasterState() {
 			if !isMaster || otherRG == rgID {
 				continue
 			}
@@ -3958,7 +3980,7 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 	// Check if any other RG is still master — if so, reapply services for
 	// those RGs only; otherwise clear everything.
 	anyOtherMaster := false
-	for otherRG, isMaster := range d.rethMasterState {
+	for otherRG, isMaster := range d.snapshotRethMasterState() {
 		if otherRG != rgID && isMaster {
 			anyOtherMaster = true
 			break
@@ -4002,7 +4024,7 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPServerConfig {
 	// Collect all interfaces belonging to master RGs.
 	masterIfaces := make(map[string]bool)
-	for rgID, isMaster := range d.rethMasterState {
+	for rgID, isMaster := range d.snapshotRethMasterState() {
 		if !isMaster {
 			continue
 		}
