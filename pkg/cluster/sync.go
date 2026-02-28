@@ -24,24 +24,24 @@ var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 
 // Sync message types.
 const (
-	syncMsgSessionV4    = 1
-	syncMsgSessionV6    = 2
-	syncMsgDeleteV4     = 3
-	syncMsgDeleteV6     = 4
-	syncMsgBulkStart    = 5
-	syncMsgBulkEnd      = 6
-	syncMsgHeartbeat    = 7
-	syncMsgConfig       = 8 // full config text sync from primary to secondary
-	syncMsgIPsecSA      = 9  // IPsec SA connection names sync
-	syncMsgFailover     = 10 // remote failover request (payload: 1 byte rgID)
+	syncMsgSessionV4 = 1
+	syncMsgSessionV6 = 2
+	syncMsgDeleteV4  = 3
+	syncMsgDeleteV6  = 4
+	syncMsgBulkStart = 5
+	syncMsgBulkEnd   = 6
+	syncMsgHeartbeat = 7
+	syncMsgConfig    = 8  // full config text sync from primary to secondary
+	syncMsgIPsecSA   = 9  // IPsec SA connection names sync
+	syncMsgFailover  = 10 // remote failover request (payload: 1 byte rgID)
 )
 
 // syncHeader is the wire header for each sync message.
 type syncHeader struct {
-	Magic   [4]byte
-	Type    uint8
-	Pad     [3]byte
-	Length  uint32 // payload length after header
+	Magic  [4]byte
+	Type   uint8
+	Pad    [3]byte
+	Length uint32 // payload length after header
 }
 
 const syncHeaderSize = 12
@@ -73,16 +73,16 @@ type SyncStats struct {
 
 // SessionSync manages TCP-based session state replication between cluster peers.
 type SessionSync struct {
-	localAddr  string // local listen address (e.g. ":4785")
-	peerAddr   string // peer connect address (e.g. "10.0.0.2:4785")
-	dp         dataplane.DataPlane
-	stats      SyncStats
-	mu         sync.Mutex
-	conn       net.Conn
-	listener   net.Listener
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	sendCh     chan []byte // buffered channel for outgoing messages
+	localAddr string // local listen address (e.g. ":4785")
+	peerAddr  string // peer connect address (e.g. "10.0.0.2:4785")
+	dp        dataplane.DataPlane
+	stats     SyncStats
+	mu        sync.Mutex
+	conn      net.Conn
+	listener  net.Listener
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	sendCh    chan []byte // buffered channel for outgoing messages
 
 	// OnConfigReceived is called when a config sync message arrives from peer.
 	// The callback receives the full config text. Set by the daemon before Start().
@@ -111,11 +111,12 @@ type SessionSync struct {
 	peerIPsecSAs   []string
 	peerIPsecSAsMu sync.Mutex
 
-	IsPrimaryFn      func() bool        // returns true if local node is primary for RG 0
-	IsPrimaryForRGFn func(rgID int) bool // returns true if local is primary for given RG
-	lastSweepTime       uint64 // monotonic seconds of last sync sweep
-	lastSessionCounter  uint64 // last seen GLOBAL_CTR_SESSIONS_NEW value
-	vrfDevice        string             // VRF device for SO_BINDTODEVICE (empty = default VRF)
+	IsPrimaryFn        func() bool         // returns true if local node is primary for RG 0
+	IsPrimaryForRGFn   func(rgID int) bool // returns true if local is primary for given RG
+	lastSweepTime      uint64              // monotonic seconds of last sync sweep
+	lastSessionCounter uint64              // last seen GLOBAL_CTR_SESSIONS_NEW value
+	syncBackfillNeeded atomic.Bool         // replay sweep window on send queue overflow
+	vrfDevice          string              // VRF device for SO_BINDTODEVICE (empty = default VRF)
 
 	zoneRGMu  sync.RWMutex
 	zoneRGMap map[uint16]int // zone_id -> RG_id (for per-RG session sync)
@@ -279,6 +280,8 @@ func (s *SessionSync) syncSweep() {
 	threshold := s.lastSweepTime
 	now := monotonicSeconds()
 	var count int
+	var overflow bool
+	replaying := s.syncBackfillNeeded.Load()
 
 	// Batch iteration reduces kernel lock contention with BPF datapath
 	s.dp.BatchIterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
@@ -286,8 +289,12 @@ func (s *SessionSync) syncSweep() {
 			return true
 		}
 		if val.Created >= threshold && s.ShouldSyncZone(val.IngressZone) {
-			s.QueueSessionV4(key, val)
-			count++
+			msg := encodeSessionV4(key, val)
+			if s.queueMessage(msg, &s.stats.SessionsSent, "sweep_v4") {
+				count++
+			} else {
+				overflow = true
+			}
 		}
 		return true
 	})
@@ -297,11 +304,34 @@ func (s *SessionSync) syncSweep() {
 			return true
 		}
 		if val.Created >= threshold && s.ShouldSyncZone(val.IngressZone) {
-			s.QueueSessionV6(key, val)
-			count++
+			msg := encodeSessionV6(key, val)
+			if s.queueMessage(msg, &s.stats.SessionsSent, "sweep_v6") {
+				count++
+			} else {
+				overflow = true
+			}
 		}
 		return true
 	})
+
+	if overflow {
+		// Keep lastSweepTime unchanged so the next sweep retries this
+		// same window, preventing permanent sync gaps on queue pressure.
+		s.syncBackfillNeeded.Store(true)
+		slog.Warn("cluster sync: sweep queue overflow, replaying previous window",
+			"threshold", threshold,
+			"queued", count,
+			"queue_len", len(s.sendCh),
+			"queue_cap", cap(s.sendCh))
+		return
+	}
+
+	if replaying {
+		s.syncBackfillNeeded.Store(false)
+		slog.Info("cluster sync: sweep replay recovered",
+			"queued", count,
+			"threshold", threshold)
+	}
 
 	s.lastSweepTime = now
 	if newCount > 0 {
@@ -312,60 +342,48 @@ func (s *SessionSync) syncSweep() {
 	}
 }
 
-// QueueSessionV4 queues a v4 session for sync to peer.
-func (s *SessionSync) QueueSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) {
+func (s *SessionSync) queueMessage(msg []byte, sentCounter *atomic.Uint64, source string) bool {
 	if !s.stats.Connected.Load() {
-		return
+		return false
 	}
-	msg := encodeSessionV4(key, val)
 	select {
 	case s.sendCh <- msg:
-		s.stats.SessionsSent.Add(1)
+		sentCounter.Add(1)
+		return true
 	default:
 		s.stats.Errors.Add(1)
+		if s.syncBackfillNeeded.CompareAndSwap(false, true) {
+			slog.Warn("cluster sync: send queue full, enabling sweep replay",
+				"source", source,
+				"queue_len", len(s.sendCh),
+				"queue_cap", cap(s.sendCh))
+		}
+		return false
 	}
+}
+
+// QueueSessionV4 queues a v4 session for sync to peer.
+func (s *SessionSync) QueueSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) {
+	msg := encodeSessionV4(key, val)
+	s.queueMessage(msg, &s.stats.SessionsSent, "session_v4")
 }
 
 // QueueSessionV6 queues a v6 session for sync to peer.
 func (s *SessionSync) QueueSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
-	if !s.stats.Connected.Load() {
-		return
-	}
 	msg := encodeSessionV6(key, val)
-	select {
-	case s.sendCh <- msg:
-		s.stats.SessionsSent.Add(1)
-	default:
-		s.stats.Errors.Add(1)
-	}
+	s.queueMessage(msg, &s.stats.SessionsSent, "session_v6")
 }
 
 // QueueDeleteV4 queues a v4 session deletion for sync.
 func (s *SessionSync) QueueDeleteV4(key dataplane.SessionKey) {
-	if !s.stats.Connected.Load() {
-		return
-	}
 	msg := encodeDeleteV4(key)
-	select {
-	case s.sendCh <- msg:
-		s.stats.DeletesSent.Add(1)
-	default:
-		s.stats.Errors.Add(1)
-	}
+	s.queueMessage(msg, &s.stats.DeletesSent, "delete_v4")
 }
 
 // QueueDeleteV6 queues a v6 session deletion for sync.
 func (s *SessionSync) QueueDeleteV6(key dataplane.SessionKeyV6) {
-	if !s.stats.Connected.Load() {
-		return
-	}
 	msg := encodeDeleteV6(key)
-	select {
-	case s.sendCh <- msg:
-		s.stats.DeletesSent.Add(1)
-	default:
-		s.stats.Errors.Add(1)
-	}
+	s.queueMessage(msg, &s.stats.DeletesSent, "delete_v6")
 }
 
 // QueueConfig sends the full config text to the peer for config synchronization.

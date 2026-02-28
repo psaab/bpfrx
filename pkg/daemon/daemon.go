@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -3877,6 +3878,15 @@ func (d *Daemon) injectBlackholeRoutes(rgID int) {
 					Priority: 4242,
 				}
 				if err := netlink.RouteAdd(&rt); err != nil {
+					if errors.Is(err, unix.EEXIST) {
+						// Idempotent transition: route already present
+						// from a prior BACKUP event. Track it so MASTER
+						// cleanup removes it deterministically.
+						routes = append(routes, rt)
+						slog.Debug("blackhole: route already exists",
+							"rg", rgID, "dst", ipNet)
+						continue
+					}
 					slog.Warn("blackhole: failed to add route",
 						"rg", rgID, "dst", ipNet, "err", err)
 					continue
@@ -3899,6 +3909,12 @@ func (d *Daemon) removeBlackholeRoutes(rgID int) {
 
 	for _, rt := range d.blackholeRoutes[rgID] {
 		if err := netlink.RouteDel(&rt); err != nil {
+			if errors.Is(err, unix.ESRCH) {
+				// Idempotent transition: route already gone.
+				slog.Debug("blackhole: route already removed",
+					"rg", rgID, "dst", rt.Dst)
+				continue
+			}
 			slog.Warn("blackhole: failed to remove route",
 				"rg", rgID, "dst", rt.Dst, "err", err)
 		} else {
