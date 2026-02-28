@@ -3525,6 +3525,18 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 			continue
 		}
 
+		// Increase fabric txqueuelen for generic XDP.
+		// virtio-net has only 256 TX ring entries; under
+		// bidirectional active/active load, bpf_redirect_map
+		// drops exceed 1.7% at default queuelen. 10000 brings
+		// drops to zero.
+		if link.Attrs().TxQLen < 10000 {
+			if err := netlink.LinkSetTxQLen(link, 10000); err != nil {
+				slog.Warn("cluster: failed to set fabric txqueuelen",
+					"interface", fabIface, "err", err)
+			}
+		}
+
 		// Resolve peer MAC from ARP/NDP table.
 		neighs, err := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
 		if err != nil {
@@ -3631,39 +3643,50 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			}
 
 			// Update BPF rg_active map based on cluster state.
-			if d.dp != nil {
-				if ev.NewState == cluster.StatePrimary {
-					// On Primary transition, only set rg_active=true
-					// if VRRP is already MASTER (routing is ready).
-					// If VRRP is BACKUP (failback), defer to the VRRP
-					// MASTER event which fires after becomeMaster()
-					// adds VIPs and removeBlackholeRoutes() cleans up.
-					// Setting rg_active=true before routing is ready
-					// causes a ~30-60ms window where packets bypass
-					// fabric redirect, get SNAT'd, hit the blackhole,
-					// and arrive at the peer with SNAT'd headers that
-					// don't match any synced session.
-					if d.rethMasterState[ev.GroupID] {
-						if err := d.dp.UpdateRGActive(ev.GroupID, true); err != nil {
-							slog.Warn("failed to update rg_active from cluster event",
-								"rg", ev.GroupID, "active", true, "err", err)
-						}
+			//
+			// Key insight: during manual failover (node0 → node1),
+			// there was a ~25ms dual-inactive window where BOTH nodes
+			// had rg_active=false:
+			//   - node0 (resigning): cluster Secondary → rg_active=false
+			//   - node1 (incoming): waiting for VRRP MASTER → rg_active still false
+			// At ~750K pps per stream, 25ms ≈ 18K drops per stream,
+			// causing TCP BBR cwnd collapse and permanent stream death.
+			//
+			// Fix: activate immediately on cluster Primary and defer
+			// deactivation on cluster Secondary until VRRP BACKUP fires.
+			// This creates a brief benign dual-active overlap (~5ms)
+			// instead of the traffic-killing dual-inactive gap.
+			if ev.NewState == cluster.StatePrimary {
+				// Activate immediately on Primary — don't wait for
+				// VRRP MASTER. Remove blackhole routes so FIB lookups
+				// succeed for synced sessions, then set rg_active=true.
+				// The FABRIC_FWD → XDP_DROP fix (4bdbefa) prevents
+				// SNAT'd packets from leaking to kernel even if FIB
+				// hits a stale blackhole before removal completes.
+				d.removeBlackholeRoutes(ev.GroupID)
+				if d.dp != nil {
+					if err := d.dp.UpdateRGActive(ev.GroupID, true); err != nil {
+						slog.Warn("failed to update rg_active from cluster event",
+							"rg", ev.GroupID, "active", true, "err", err)
 					}
-					// Always bump FIB generation on Primary transition,
-					// even when deferring rg_active to VRRP MASTER.
-					// This ensures sessions get fresh FIB lookups and
-					// don't use stale cached egress info from before
-					// the transition.
 					d.dp.BumpFIBGeneration()
-				} else {
-					// Set rg_active=false immediately on Secondary
-					// transition — stop accepting traffic right away.
+				}
+				go d.warmNeighborCache()
+			} else if d.dp != nil {
+				// On Secondary/Lost/Disabled: only set rg_active=false
+				// if VRRP is NOT master for this RG. If VRRP is still
+				// MASTER (resigning node), defer to VRRP BACKUP event
+				// to avoid the dual-inactive window. The VRRP BACKUP
+				// handler fires ~5ms later (after priority-0 burst
+				// propagates) and sets rg_active=false + injects
+				// blackhole routes.
+				if !d.rethMasterState[ev.GroupID] {
 					if err := d.dp.UpdateRGActive(ev.GroupID, false); err != nil {
 						slog.Warn("failed to update rg_active from cluster event",
 							"rg", ev.GroupID, "active", false, "err", err)
 					}
-					d.dp.BumpFIBGeneration()
 				}
+				d.dp.BumpFIBGeneration()
 			}
 
 			// Debounced VRRP priority update — 500ms coalesce window.

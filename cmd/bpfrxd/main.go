@@ -40,6 +40,15 @@ func main() {
 		return
 	}
 
+	// Reject unknown positional arguments — prevents accidentally starting
+	// a second daemon when running "bpfrxd show ..." outside the CLI.
+	// Use the "cli" binary or run bpfrxd interactively for show/request/configure.
+	if len(os.Args) > 1 && os.Args[1] != "" && os.Args[1][0] != '-' {
+		fmt.Fprintf(os.Stderr, "bpfrxd: unknown command %q\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "  use the 'cli' binary for remote commands, or run bpfrxd on a TTY\n")
+		os.Exit(1)
+	}
+
 	configFile := flag.String("config", "/etc/bpfrx/bpfrx.conf", "configuration file path")
 	noDataplane := flag.Bool("no-dataplane", false, "run without eBPF (config-only mode)")
 	apiAddr := flag.String("api-addr", "127.0.0.1:8080", "HTTP API listen address (empty to disable)")

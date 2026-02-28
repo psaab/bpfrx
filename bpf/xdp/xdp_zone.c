@@ -23,7 +23,11 @@ zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		  struct session_value *sess, __u8 direction)
 {
 	__u64 now = meta->ktime_ns / 1000000000ULL;
-	sess->last_seen = now;
+
+	/* Don't update last_seen for CLOSED sessions — retransmits
+	 * would prevent GC from ever cleaning up the dead session. */
+	if (sess->state != SESS_STATE_CLOSED)
+		sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {
 		__sync_fetch_and_add(&sess->fwd_packets, 1);
@@ -41,6 +45,23 @@ zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 	if (meta->protocol == PROTO_TCP) {
 		__u8 new_state = ct_tcp_update_state(
 			sess->state, meta->tcp_flags, pkt_dir);
+		/* Suppress RST→CLOSED for ESTABLISHED sessions.
+		 * Same fix as xdp_conntrack handle_ct_hit_v4:
+		 * without sequence validation, a single spurious
+		 * RST permanently kills the stream (all data
+		 * XDP_DROP'd, cwnd collapses to 1 MSS).  Forward
+		 * the RST but keep session ESTABLISHED unless
+		 * rst-invalidate-session is configured. */
+		if (new_state == SESS_STATE_CLOSED &&
+		    sess->state == SESS_STATE_ESTABLISHED) {
+			__u32 z = 0;
+			struct flow_config *fc =
+				bpf_map_lookup_elem(
+					&flow_config_map, &z);
+			if (!fc || !(fc->tcp_flags &
+				     FLOW_TCP_RST_INVALIDATE))
+				new_state = sess->state;
+		}
 		if (new_state != sess->state) {
 			sess->state = new_state;
 			sess->timeout = ct_get_timeout(PROTO_TCP, new_state);
@@ -52,7 +73,8 @@ zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 			if (paired) {
 				paired->state = new_state;
 				paired->timeout = sess->timeout;
-				paired->last_seen = now;
+				if (new_state != SESS_STATE_CLOSED)
+					paired->last_seen = now;
 			}
 		}
 	}
@@ -108,7 +130,11 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		  struct session_value_v6 *sess, __u8 direction)
 {
 	__u64 now = meta->ktime_ns / 1000000000ULL;
-	sess->last_seen = now;
+
+	/* Don't update last_seen for CLOSED sessions — retransmits
+	 * would prevent GC from ever cleaning up the dead session. */
+	if (sess->state != SESS_STATE_CLOSED)
+		sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {
 		__sync_fetch_and_add(&sess->fwd_packets, 1);
@@ -126,6 +152,18 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 	if (meta->protocol == PROTO_TCP) {
 		__u8 new_state = ct_tcp_update_state(
 			sess->state, meta->tcp_flags, pkt_dir);
+		/* Suppress RST→CLOSED for ESTABLISHED sessions
+		 * (same fix as zone_ct_update_v4 / xdp_conntrack). */
+		if (new_state == SESS_STATE_CLOSED &&
+		    sess->state == SESS_STATE_ESTABLISHED) {
+			__u32 z = 0;
+			struct flow_config *fc =
+				bpf_map_lookup_elem(
+					&flow_config_map, &z);
+			if (!fc || !(fc->tcp_flags &
+				     FLOW_TCP_RST_INVALIDATE))
+				new_state = sess->state;
+		}
 		if (new_state != sess->state) {
 			sess->state = new_state;
 			sess->timeout = ct_get_timeout(PROTO_TCP, new_state);
@@ -137,7 +175,8 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 			if (paired) {
 				paired->state = new_state;
 				paired->timeout = sess->timeout;
-				paired->last_seen = now;
+				if (new_state != SESS_STATE_CLOSED)
+					paired->last_seen = now;
 			}
 		}
 	}

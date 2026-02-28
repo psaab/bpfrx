@@ -900,6 +900,93 @@ make test-failover       → 14/14 PASS (8 streams, 7.77 Gbps)
 Long-duration test: `iperf3 -P4 -t600` completed at 9.08 Gbps with zero
 stream deaths (previously streams died within 200-400 seconds).
 
+## Bug: Dual-Inactive Transition Window During Manual Failover
+
+### Symptom
+
+Rapid repeated failover cycles (fw0→fw1→fw0→fw1...) permanently kill 2+ of 8
+iperf3 streams. Dead streams show cwnd collapsed to 1 MSS, RTO escalating to
+120s, "Broken pipe". Single-cycle failovers survived, but repeated cycles
+compounded damage.
+
+### Root Cause
+
+During manual failover (e.g., RG1: node0 → node1), there was a ~25ms window
+where **both** nodes had `rg_active[1]=false`:
+
+```
+T=0ms:    node0 receives cluster Secondary event
+          → immediately sets rg_active[1]=false
+T=0ms:    node1 receives cluster Primary event
+          → defers rg_active[1]=true until VRRP MASTER (previous fix)
+T=0-25ms: DUAL-INACTIVE WINDOW — both nodes drop RG1 traffic
+T=~25ms:  node1 VRRP MASTER fires → sets rg_active[1]=true
+```
+
+At ~750K pps per stream × 8 streams, 25ms = ~150K dropped packets. TCP BBR
+congestion control interprets this as severe congestion → cwnd collapse → RTO
+growth. Healthy streams competing for bandwidth prevent collapsed streams from
+ever recovering.
+
+### Additional Contributing Factors
+
+**zone_ct_update RST→CLOSED (primary code path):** The fast-path FIB cache hit
+in `xdp_zone.c` (`zone_ct_update_v4/v6`) was the PRIMARY code path for
+established sessions. This function updated TCP state including RST→CLOSED but
+lacked the `rst-invalidate-session` guard added to `xdp_conntrack.c`. A single
+spurious RST during the transition window permanently killed the stream even
+after the window closed.
+
+**Fabric txqueuelen drops:** The virtio-net fabric interface has a max 256-entry
+TX ring. Under bidirectional active/active load at ~10 Gbps, `bpf_redirect_map`
+drops exceeded 1.7%. Increasing `txqueuelen` from 1000 to 10000 eliminates
+these drops.
+
+### Fix: Eliminate the Dual-Inactive Window
+
+Replace the traffic-killing dual-inactive gap with a brief benign dual-active
+overlap (~5ms where both nodes forward):
+
+**1. Cluster Primary transition (`daemon.go`):**
+Set `rg_active=true` immediately + call `removeBlackholeRoutes()`. Don't wait
+for VRRP MASTER. The incoming node starts forwarding as soon as it knows it's
+primary, even before VRRP has converged. During the brief overlap, both nodes
+can forward — this is safe because sessions are synced.
+
+**2. Cluster Secondary transition (`daemon.go`):**
+Defer `rg_active=false` if VRRP is still MASTER for that RG
+(`rethMasterState[rgID]`). Let the VRRP BACKUP event handle deactivation instead
+of immediately setting inactive on Secondary. This prevents the old node from
+dropping traffic before the new node is ready.
+
+**3. zone_ct_update RST guard (`xdp_zone.c`):**
+Add `rst-invalidate-session` check to `zone_ct_update_v4()` and
+`zone_ct_update_v6()` — same guard as `xdp_conntrack.c`. Prevents spurious RSTs
+during transition from permanently killing streams.
+
+**4. Fabric txqueuelen (`daemon.go` or setup script):**
+Set fabric interface `txqueuelen=10000` to handle burst redirects during
+transitions.
+
+### Why Dual-Active Overlap Is Safe
+
+During the ~5ms overlap:
+- Both nodes have `rg_active=true` for the transitioning RG
+- Both can process packets for that RG
+- Synced sessions exist on both nodes
+- Worst case: duplicate processing of a few packets (TCP handles duplicates)
+- No SNAT mismatch: both nodes have the same SNAT VIP in synced sessions
+
+This is strictly better than the dual-inactive window where ALL packets are
+dropped.
+
+### Mixed XDP Mode (Attempted and Reverted)
+
+Per-interface native/generic XDP attachment was attempted to improve fabric
+throughput. This failed because TC egress BPF programs interfere with
+XDP_PASS'd packets — TC conntrack reverses the SNAT on packets that were
+supposed to be forwarded transparently.
+
 ## References
 
 - AA-1 sprint: `23f1a3d` — Per-RG active state tracking in BPF
