@@ -239,16 +239,70 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
  * matching the synced session.  (dnat_table entries ARE synced
  * via session sync, but the rewrite is still needed because
  * pre-routing DNAT only updates meta, not the packet.)
- *
- * IPv4 only — IPv6 DNAT must be handled in a separate
- * __noinline function or tail-call to avoid inline code
- * explosion that breaks the surrounding IPv4 fast-path.
  */
+
+/* IPv6 path is __noinline to avoid inline code explosion from
+ * csum_update_16 (#pragma unroll 4×csum_update_4) × protocol
+ * branches × 2 call sites.  Inlining this added +56KB to the
+ * object and broke the surrounding IPv4 fast-path codegen. */
+static __noinline void
+apply_dnat_before_fabric_redirect_v6(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ipv6hdr *ip6h = data + sizeof(struct ethhdr);
+	if ((void *)(ip6h + 1) > data_end)
+		return;
+
+	if (ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr))
+		return;
+
+	__u8 old_dst[16];
+	__builtin_memcpy(old_dst, &ip6h->daddr, 16);
+
+	void *l4 = (void *)(ip6h + 1);
+
+	/* Update L4 checksum for address change (IPv6 has no IP checksum) */
+	nat_update_l4_csum_v6(l4, data_end, meta, old_dst, meta->dst_ip.v6);
+	__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
+
+	/* Update L4 destination port */
+	__be16 new_dport = meta->dst_port;
+	if (meta->protocol == PROTO_TCP) {
+		struct tcphdr *tcp = l4;
+		if ((void *)(tcp + 1) <= data_end && tcp->dest != new_dport) {
+			csum_update_2(&tcp->check, tcp->dest, new_dport);
+			tcp->dest = new_dport;
+		}
+	} else if (meta->protocol == PROTO_UDP) {
+		struct udphdr *udp = l4;
+		if ((void *)(udp + 1) <= data_end && udp->dest != new_dport) {
+			csum_update_2(&udp->check, udp->dest, new_dport);
+			udp->dest = new_dport;
+		}
+	} else if (meta->protocol == PROTO_ICMPV6) {
+		struct icmp6hdr *icmp6 = l4;
+		if ((void *)(icmp6 + 1) <= data_end &&
+		    (icmp6->icmp6_type == 128 || icmp6->icmp6_type == 129) &&
+		    icmp6->un.echo.id != new_dport) {
+			csum_update_2(&icmp6->icmp6_cksum,
+				      icmp6->un.echo.id, new_dport);
+			icmp6->un.echo.id = new_dport;
+		}
+	}
+}
+
 static __always_inline void
 apply_dnat_before_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 {
-	if (!(meta->nat_flags & SESS_FLAG_DNAT) ||
-	    meta->addr_family != AF_INET)
+	if (!(meta->nat_flags & SESS_FLAG_DNAT))
+		return;
+
+	if (meta->addr_family == AF_INET6) {
+		apply_dnat_before_fabric_redirect_v6(ctx, meta);
+		return;
+	}
+	if (meta->addr_family != AF_INET)
 		return;
 
 	void *_d = (void *)(long)ctx->data;
