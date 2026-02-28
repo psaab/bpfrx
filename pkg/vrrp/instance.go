@@ -1,6 +1,7 @@
 package vrrp
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"net"
@@ -318,6 +319,17 @@ func (vi *vrrpInstance) run() {
 					vi.sendAdvert(0)
 				}
 				vi.becomeBackup(masterDownTimer, advertTimer)
+				// Stop the masterDown timer entirely after forced resignation.
+				// With short RETH intervals (30ms), masterDownInterval() at
+				// priority 0 is only ~120ms, which re-elects the resigned node
+				// before the peer can take over. Even with an extended timer,
+				// handleBackupRx resets it to the short value. On VLAN sub-
+				// interfaces, multicast adverts from the peer may not arrive
+				// reliably. The resigned node should only become MASTER via:
+				//   - preemptNowCh (cluster ForceRGMaster after failover reset)
+				//   - priority-0 from peer (peer resigning)
+				// This matches Junos behavior: manual failover stays until reset.
+				masterDownTimer.Stop()
 			}
 		}
 	}
@@ -499,6 +511,8 @@ func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer *time.Ti
 }
 
 // handleMasterRx processes a received advertisement while in Master state.
+// Per RFC 5798 §6.4.3: if priority is higher, step down. If equal,
+// the node with the higher source IP stays Master (tie-breaking).
 func (vi *vrrpInstance) handleMasterRx(pkt *VRRPPacket, masterDownTimer, advertTimer *time.Timer) {
 	pri := vi.getPriority()
 	if pkt.Priority == 0 {
@@ -508,11 +522,19 @@ func (vi *vrrpInstance) handleMasterRx(pkt *VRRPPacket, masterDownTimer, advertT
 		return
 	}
 
-	// If incoming priority is higher, step down.
-	if int(pkt.Priority) > pri {
+	pktPri := int(pkt.Priority)
+	if pktPri > pri {
+		// Higher priority — step down unconditionally.
+		vi.becomeBackup(masterDownTimer, advertTimer)
+	} else if pktPri == pri && pkt.SrcIP != nil && vi.localIP != nil &&
+		bytes.Compare(pkt.SrcIP.To4(), vi.localIP.To4()) > 0 {
+		// Equal priority — RFC 5798 §6.4.3 tie-break: higher IP wins.
+		slog.Info("vrrp: equal priority tie-break, peer IP is higher — stepping down",
+			"key", vi.key(), "our_ip", vi.localIP, "peer_ip", pkt.SrcIP,
+			"priority", pri)
 		vi.becomeBackup(masterDownTimer, advertTimer)
 	}
-	// Equal or lower priority: ignore (we stay Master).
+	// Lower priority, or equal with our IP higher: stay Master.
 }
 
 // becomeMaster transitions to Master state: add VIPs, send advert, emit event,

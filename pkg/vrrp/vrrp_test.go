@@ -881,3 +881,187 @@ func TestResignRG_SignalsCorrectInstances(t *testing.T) {
 		t.Error("vi3 (RG1) should have resign signal")
 	}
 }
+
+// --- handleMasterRx tie-breaking tests (RFC 5798 §6.4.3) ---
+
+func TestHandleMasterRx_HigherPriority_StepsDown(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  100,
+	}, &net.Interface{Name: "eth0"}, eventCh)
+	vi.localIP = net.IPv4(10, 0, 0, 1)
+	vi.setState(StateMaster)
+
+	masterDownTimer := time.NewTimer(time.Hour)
+	defer masterDownTimer.Stop()
+	advertTimer := time.NewTimer(time.Hour)
+	defer advertTimer.Stop()
+
+	pkt := &VRRPPacket{
+		Priority: 200,
+		SrcIP:    net.IPv4(10, 0, 0, 2),
+	}
+	vi.handleMasterRx(pkt, masterDownTimer, advertTimer)
+
+	if vi.getState() != StateBackup {
+		t.Errorf("state = %s, want BACKUP (higher priority should step down)", vi.getState())
+	}
+}
+
+func TestHandleMasterRx_LowerPriority_StaysMaster(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+	}, &net.Interface{Name: "eth0"}, eventCh)
+	vi.localIP = net.IPv4(10, 0, 0, 1)
+	vi.setState(StateMaster)
+
+	masterDownTimer := time.NewTimer(time.Hour)
+	defer masterDownTimer.Stop()
+	advertTimer := time.NewTimer(time.Hour)
+	defer advertTimer.Stop()
+
+	pkt := &VRRPPacket{
+		Priority: 100,
+		SrcIP:    net.IPv4(10, 0, 0, 2),
+	}
+	vi.handleMasterRx(pkt, masterDownTimer, advertTimer)
+
+	if vi.getState() != StateMaster {
+		t.Errorf("state = %s, want MASTER (lower priority should be ignored)", vi.getState())
+	}
+}
+
+func TestHandleMasterRx_EqualPriority_HigherPeerIP_StepsDown(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+	}, &net.Interface{Name: "eth0"}, eventCh)
+	vi.localIP = net.IPv4(10, 0, 0, 1) // lower IP
+	vi.setState(StateMaster)
+
+	masterDownTimer := time.NewTimer(time.Hour)
+	defer masterDownTimer.Stop()
+	advertTimer := time.NewTimer(time.Hour)
+	defer advertTimer.Stop()
+
+	pkt := &VRRPPacket{
+		Priority: 200,
+		SrcIP:    net.IPv4(10, 0, 0, 2), // higher IP
+	}
+	vi.handleMasterRx(pkt, masterDownTimer, advertTimer)
+
+	if vi.getState() != StateBackup {
+		t.Errorf("state = %s, want BACKUP (equal priority, peer has higher IP)", vi.getState())
+	}
+}
+
+func TestHandleMasterRx_EqualPriority_LowerPeerIP_StaysMaster(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+	}, &net.Interface{Name: "eth0"}, eventCh)
+	vi.localIP = net.IPv4(10, 0, 0, 2) // higher IP
+	vi.setState(StateMaster)
+
+	masterDownTimer := time.NewTimer(time.Hour)
+	defer masterDownTimer.Stop()
+	advertTimer := time.NewTimer(time.Hour)
+	defer advertTimer.Stop()
+
+	pkt := &VRRPPacket{
+		Priority: 200,
+		SrcIP:    net.IPv4(10, 0, 0, 1), // lower IP
+	}
+	vi.handleMasterRx(pkt, masterDownTimer, advertTimer)
+
+	if vi.getState() != StateMaster {
+		t.Errorf("state = %s, want MASTER (equal priority, we have higher IP)", vi.getState())
+	}
+}
+
+func TestHandleMasterRx_EqualPriority_NilSrcIP_StaysMaster(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+	}, &net.Interface{Name: "eth0"}, eventCh)
+	vi.localIP = net.IPv4(10, 0, 0, 1)
+	vi.setState(StateMaster)
+
+	masterDownTimer := time.NewTimer(time.Hour)
+	defer masterDownTimer.Stop()
+	advertTimer := time.NewTimer(time.Hour)
+	defer advertTimer.Stop()
+
+	// SrcIP nil — can't tie-break, stay Master (safe default).
+	pkt := &VRRPPacket{
+		Priority: 200,
+		SrcIP:    nil,
+	}
+	vi.handleMasterRx(pkt, masterDownTimer, advertTimer)
+
+	if vi.getState() != StateMaster {
+		t.Errorf("state = %s, want MASTER (nil SrcIP, can't tie-break)", vi.getState())
+	}
+}
+
+func TestHandleMasterRx_Priority0_StaysMaster(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+	}, &net.Interface{Name: "eth0"}, eventCh)
+	vi.localIP = net.IPv4(10, 0, 0, 1)
+	vi.setState(StateMaster)
+
+	masterDownTimer := time.NewTimer(time.Hour)
+	defer masterDownTimer.Stop()
+	advertTimer := time.NewTimer(time.Hour)
+	defer advertTimer.Stop()
+
+	pkt := &VRRPPacket{
+		Priority: 0, // resign
+		SrcIP:    net.IPv4(10, 0, 0, 2),
+	}
+	vi.handleMasterRx(pkt, masterDownTimer, advertTimer)
+
+	if vi.getState() != StateMaster {
+		t.Errorf("state = %s, want MASTER (priority-0 = resign)", vi.getState())
+	}
+}
+
+func TestParsedPacket_PreservesSrcIP(t *testing.T) {
+	pkt := &VRRPPacket{
+		VRID:         42,
+		Priority:     200,
+		MaxAdvertInt: 100,
+		IPAddresses:  []net.IP{net.IPv4(10, 0, 1, 1)},
+	}
+	srcIP := net.IPv4(192, 168, 1, 1)
+	dstIP := net.IPv4(224, 0, 0, 18)
+
+	data, err := pkt.Marshal(false, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parsed, err := ParseVRRPPacket(data, false, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !parsed.SrcIP.Equal(srcIP) {
+		t.Errorf("SrcIP = %s, want %s", parsed.SrcIP, srcIP)
+	}
+}

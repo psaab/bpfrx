@@ -22,6 +22,7 @@ type VRRPPacket struct {
 	Priority     uint8
 	MaxAdvertInt uint16 // centiseconds (default 100 = 1s)
 	IPAddresses  []net.IP
+	SrcIP        net.IP // source IP of the sender (for RFC 5798 §6.4.3 tie-breaking)
 }
 
 // Marshal serializes a VRRPv3 advertisement packet.
@@ -150,6 +151,7 @@ func ParseVRRPPacket(data []byte, isIPv6 bool, srcIP, dstIP net.IP) (*VRRPPacket
 		Priority:     priority,
 		MaxAdvertInt: maxAdvertInt,
 		IPAddresses:  addrs,
+		SrcIP:        srcIP,
 	}, nil
 }
 
