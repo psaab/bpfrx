@@ -1162,7 +1162,11 @@ func (m *Manager) SetFlowConfig(cfg dataplane.FlowConfigValue) error {
 // --- Fabric cross-chassis forwarding ---
 
 func (m *Manager) UpdateFabricFwd(info dataplane.FabricFwdInfo) error {
-	// DPDK fabric redirect not implemented — cluster uses eBPF path.
+	shm := m.platform.shm
+	if shm == nil {
+		return nil
+	}
+	shm.fabric_ifindex = C.uint32_t(info.Ifindex)
 	return nil
 }
 

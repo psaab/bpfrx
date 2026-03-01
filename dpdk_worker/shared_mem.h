@@ -868,6 +868,9 @@ struct shared_memory {
 	/* Per-RG active state (0=inactive, 1=active) */
 	uint8_t                 *rg_active;
 
+	/* Fabric interface ifindex (for zone-encoded MAC validation) */
+	volatile uint32_t        fabric_ifindex;
+
 	/* NAT64 state value array (indexed by rte_hash position) */
 	struct nat64_state_value *nat64_state_values;
 

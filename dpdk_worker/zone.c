@@ -43,33 +43,45 @@ zone_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 	 * When BPF redirects a new connection across fabric with zone
 	 * encoded in src MAC (02:bf:72:fe:00:ZZ), the DPDK worker
 	 * decodes it here.  This is the DPDK parity for the BPF
-	 * try_fabric_redirect_with_zone() / xdp_zone detection. */
+	 * try_fabric_redirect_with_zone() / xdp_zone detection.
+	 *
+	 * Only accept zone-encoded MACs from the fabric interface to
+	 * prevent spoofed source MACs on other interfaces from
+	 * bypassing zone lookup.  After decoding, fall through to
+	 * FIB lookup + egress zone resolution (skip only the normal
+	 * ingress zone lookup since we already decoded the zone). */
 	{
 		struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt,
 			struct rte_ether_hdr *);
 		if (eth->src_addr.addr_bytes[0] == 0x02 &&
 		    eth->src_addr.addr_bytes[1] == 0xbf &&
 		    eth->src_addr.addr_bytes[2] == 0x72 &&
-		    eth->src_addr.addr_bytes[3] == FABRIC_ZONE_MAC_MAGIC) {
+		    eth->src_addr.addr_bytes[3] == FABRIC_ZONE_MAC_MAGIC &&
+		    ctx->shm->fabric_ifindex != 0 &&
+		    meta->ingress_ifindex == ctx->shm->fabric_ifindex) {
 			meta->ingress_zone = eth->src_addr.addr_bytes[5];
 			meta->routing_table = 254; /* RT_TABLE_MAIN */
-			return;
+			goto skip_ingress_zone;
 		}
 	}
 
 	/* ---- Ingress zone lookup ---- */
-	struct iface_zone_key zk = {
-		.ifindex = meta->ingress_ifindex,
-		.vlan_id = meta->ingress_vlan_id,
-		.pad = 0,
-	};
+	{
+		struct iface_zone_key zk = {
+			.ifindex = meta->ingress_ifindex,
+			.vlan_id = meta->ingress_vlan_id,
+			.pad = 0,
+		};
 
-	int pos = rte_hash_lookup(ctx->shm->iface_zone_map, &zk);
-	if (pos >= 0 && ctx->shm->iface_zone_values) {
-		struct iface_zone_value *zv = &ctx->shm->iface_zone_values[pos];
-		meta->ingress_zone = zv->zone_id;
-		meta->routing_table = zv->routing_table;
+		int pos = rte_hash_lookup(ctx->shm->iface_zone_map, &zk);
+		if (pos >= 0 && ctx->shm->iface_zone_values) {
+			struct iface_zone_value *zv = &ctx->shm->iface_zone_values[pos];
+			meta->ingress_zone = zv->zone_id;
+			meta->routing_table = zv->routing_table;
+		}
 	}
+
+skip_ingress_zone:
 
 	/* ---- Pre-routing NAT: check dnat_table before FIB lookup.
 	 * This handles both port-based DNAT entries (from config) and
