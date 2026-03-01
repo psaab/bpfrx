@@ -793,8 +793,13 @@ func appendSplitAF(tables []TableRoutes, prefix string, entries []RouteEntry) []
 // FormatRouteDestination formats matching routes across all tables in Junos style.
 // The destination is an IP address (or CIDR prefix). For each table that has a
 // matching route, it prints a Junos-style header and route entries.
-func FormatRouteDestination(allTables []TableRoutes, destination string) string {
-	// Parse the destination for LPM matching.
+// The modifier controls matching behavior:
+//   - "" (empty): default LPM — show routes whose prefix contains the destination
+//   - "exact": only show routes matching the exact prefix (network + mask)
+//   - "longer": show routes with a strictly more-specific prefix (longer mask)
+//   - "orlonger": show routes with equal or more-specific prefix (equal or longer mask)
+func FormatRouteDestination(allTables []TableRoutes, destination, modifier string) string {
+	// Parse the destination for matching.
 	destIP := net.ParseIP(destination)
 	var destNet *net.IPNet
 	if strings.Contains(destination, "/") {
@@ -809,18 +814,42 @@ func FormatRouteDestination(allTables []TableRoutes, destination string) string 
 	if destNet == nil {
 		return fmt.Sprintf("invalid destination: %s\n", destination)
 	}
+	destOnes, destBits := destNet.Mask.Size()
 
 	var buf strings.Builder
 	for _, table := range allTables {
-		// Find matching routes: route.Dst must contain the destination IP.
 		var matches []RouteEntry
 		for _, e := range table.Entries {
 			_, routeNet, err := net.ParseCIDR(e.Destination)
 			if err != nil {
 				continue
 			}
-			if routeNet.Contains(destNet.IP) {
-				matches = append(matches, e)
+			routeOnes, _ := routeNet.Mask.Size()
+
+			switch modifier {
+			case "exact":
+				// Route must match the exact prefix (network + mask length).
+				if routeOnes == destOnes && destNet.IP.Equal(routeNet.IP) {
+					matches = append(matches, e)
+				}
+			case "longer":
+				// Route must be strictly more-specific (contained within dest, longer mask).
+				if routeOnes > destOnes && destNet.Contains(routeNet.IP) {
+					matches = append(matches, e)
+				}
+			case "orlonger":
+				// Route must be equal or more-specific (contained within dest, equal or longer mask).
+				if routeOnes >= destOnes && destNet.Contains(routeNet.IP) {
+					matches = append(matches, e)
+				}
+			default:
+				// Default LPM behavior: show routes whose prefix contains the
+				// destination. For a CIDR input, match routes that contain the
+				// requested network (route prefix contains dest IP AND route mask
+				// is equal or shorter).
+				if destBits > 0 && routeOnes <= destOnes && routeNet.Contains(destNet.IP) {
+					matches = append(matches, e)
+				}
 			}
 		}
 		if len(matches) == 0 {
@@ -850,13 +879,15 @@ func FormatRouteDestination(allTables []TableRoutes, destination string) string 
 
 // FormatRouteSummary formats a Junos-style route summary across all tables.
 // Output matches Junos: right-aligned protocol names, right-aligned counts,
-// separate inet.0/inet6.0 sections per table.
+// separate inet.0/inet6.0 sections per table, plus Highwater Mark section.
 func FormatRouteSummary(allTables []TableRoutes, routerID string) string {
 	var buf strings.Builder
 	if routerID != "" {
 		fmt.Fprintf(&buf, "Router ID: %s\n", routerID)
 	}
 
+	totalRoutes := 0
+	totalFIB := 0
 	for _, table := range allTables {
 		if len(table.Entries) == 0 {
 			continue
@@ -868,7 +899,17 @@ func FormatRouteSummary(allTables []TableRoutes, routerID string) string {
 		fmt.Fprintf(&buf, "\n%s: %d destinations, %d routes (%d active, 0 holddown, 0 hidden)\n",
 			table.Name, len(table.Entries), len(table.Entries), len(table.Entries))
 		formatSummaryProtos(&buf, byProto)
+		totalRoutes += len(table.Entries)
+		totalFIB += len(table.Entries)
 	}
+
+	// Highwater Mark section — since we don't track historical peaks,
+	// report current counts as the highwater mark.
+	if totalRoutes > 0 {
+		buf.WriteString("\nHighwater Mark:\n")
+		fmt.Fprintf(&buf, "  %d routes, %d FIB (currently active)\n", totalRoutes, totalFIB)
+	}
+
 	return buf.String()
 }
 

@@ -3407,7 +3407,17 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 	}
 
 	if strings.HasPrefix(req.Topic, "route-prefix:") {
-		prefix := strings.TrimPrefix(req.Topic, "route-prefix:")
+		prefixAndMod := strings.TrimPrefix(req.Topic, "route-prefix:")
+		prefix := prefixAndMod
+		modifier := ""
+		if idx := strings.LastIndex(prefixAndMod, " "); idx != -1 {
+			candidate := prefixAndMod[idx+1:]
+			switch candidate {
+			case "exact", "longer", "orlonger":
+				prefix = prefixAndMod[:idx]
+				modifier = candidate
+			}
+		}
 		if s.routing == nil {
 			buf.WriteString("Routing manager not available\n")
 		} else {
@@ -3419,7 +3429,7 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "get routes: %v", err)
 			}
-			buf.WriteString(routing.FormatRouteDestination(allTables, prefix))
+			buf.WriteString(routing.FormatRouteDestination(allTables, prefix, modifier))
 		}
 		return &pb.ShowTextResponse{Output: buf.String()}, nil
 	}

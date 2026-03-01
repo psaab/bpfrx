@@ -123,7 +123,11 @@ var OperationalTree = map[string]*Node{
 		"flow-monitoring": {Desc: "Show flow monitoring/NetFlow configuration"},
 		"log":             {Desc: "Show daemon log entries [N]"},
 		"route": {Desc: "Show routing table information", Children: map[string]*Node{
-			"<destination>": {Desc: "IP address or prefix to look up"},
+			"<destination>": {Desc: "IP address or prefix to look up", Children: map[string]*Node{
+				"exact":    {Desc: "Exactly match the prefix"},
+				"longer":   {Desc: "More-specific (longer) prefixes"},
+				"orlonger": {Desc: "Equal or more-specific prefixes"},
+			}},
 			"terse":         {Desc: "Display terse output"},
 			"detail":        {Desc: "Display detailed output"},
 			"summary":       {Desc: "Show routing table statistics"},
@@ -389,7 +393,9 @@ var OperationalTree = map[string]*Node{
 				"advertised-routes": {Desc: "Show advertised routes to neighbor"},
 			}},
 		}},
-		"arp":         {Desc: "Show system ARP table entries"},
+		"arp": {Desc: "Show system ARP table entries", Children: map[string]*Node{
+			"no-resolve": {Desc: "Don't attempt to resolve addresses"},
+		}},
 		"ipv6": {Desc: "Show IPv6 information", Children: map[string]*Node{
 			"neighbors":            {Desc: "Show IPv6 neighbor cache"},
 			"router-advertisement": {Desc: "Show Router Advertisement status"},
@@ -425,7 +431,9 @@ var OperationalTree = map[string]*Node{
 			"login":              {Desc: "Show login configuration"},
 			"memory":             {Desc: "Show system memory usage"},
 			"ntp":                {Desc: "Show NTP status"},
-			"processes":          {Desc: "Show system process table"},
+			"processes": {Desc: "Show system process table", Children: map[string]*Node{
+				"summary": {Desc: "Show summary of system processes (top-like view)"},
+			}},
 			"root-authentication": {Desc: "Show root authentication"},
 			"configuration": {Desc: "Show configuration info", Children: map[string]*Node{
 				"rescue": {Desc: "Show rescue configuration"},

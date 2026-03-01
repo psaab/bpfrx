@@ -748,9 +748,16 @@ func (c *ctl) handleShow(args []string) error {
 		if len(args) >= 3 && args[1] == "protocol" {
 			return c.showText("route-protocol:" + args[2])
 		}
-		// Single arg: treat as prefix filter (e.g. "show route 10.0.1.0/24")
+		// Prefix filter with optional modifier (e.g. "show route 10.0.1.0/24 exact")
 		if len(args) >= 2 && (strings.Contains(args[1], "/") || strings.Contains(args[1], ".") || strings.Contains(args[1], ":")) {
-			return c.showText("route-prefix:" + args[1])
+			topic := "route-prefix:" + args[1]
+			if len(args) >= 3 {
+				switch args[2] {
+				case "exact", "longer", "orlonger":
+					topic += " " + args[2]
+				}
+			}
+			return c.showText(topic)
 		}
 		return c.showRoutes()
 
