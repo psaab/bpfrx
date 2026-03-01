@@ -381,6 +381,14 @@ var OperationalTree = map[string]*Node{
 				"neighbors": {Desc: "Show LLDP neighbors"},
 			}},
 		}},
+		"bgp": {Desc: "Show BGP information (alias for show protocols bgp)", Children: map[string]*Node{
+			"summary":  {Desc: "Show BGP peer summary"},
+			"routes":   {Desc: "Show BGP routes"},
+			"neighbor": {Desc: "Show BGP neighbor details", Children: map[string]*Node{
+				"received-routes":   {Desc: "Show received routes from neighbor"},
+				"advertised-routes": {Desc: "Show advertised routes to neighbor"},
+			}},
+		}},
 		"arp":         {Desc: "Show system ARP table entries"},
 		"ipv6": {Desc: "Show IPv6 information", Children: map[string]*Node{
 			"neighbors":            {Desc: "Show IPv6 neighbor cache"},

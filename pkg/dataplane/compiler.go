@@ -1445,6 +1445,11 @@ func compilePolicies(dp DataPlane, cfg *config.Config, result *CompileResult) er
 			}
 		}
 
+		if len(expanded) >= MaxRulesPerPolicy {
+			return fmt.Errorf("policy %s->%s: %d expanded rules exceeds MaxRulesPerPolicy (%d)",
+				zpp.FromZone, zpp.ToZone, len(expanded), MaxRulesPerPolicy)
+		}
+
 		ps := PolicySet{
 			PolicySetID:   policySetID,
 			NumRules:      uint16(len(expanded)),
@@ -1565,6 +1570,11 @@ func compilePolicies(dp DataPlane, cfg *config.Config, result *CompileResult) er
 			for _, aid := range appIDs {
 				expanded = append(expanded, expandedRule{pol: pol, appID: aid})
 			}
+		}
+
+		if len(expanded) >= MaxRulesPerPolicy {
+			return fmt.Errorf("global policy: %d expanded rules exceeds MaxRulesPerPolicy (%d)",
+				len(expanded), MaxRulesPerPolicy)
 		}
 
 		ps := PolicySet{
@@ -1698,8 +1708,16 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 				zp := zonePairIdx{fromZone, toZone}
 				ruleKey := rs.Name + "/" + rule.Name
 				counterID := result.nextNATCounterID
+				if counterID >= MaxNATRuleCounters {
+					slog.Warn("NAT rule counter IDs exhausted, reusing counter 0",
+						"rule-set", rs.Name, "rule", rule.Name,
+						"counter_id", counterID, "max", MaxNATRuleCounters)
+					counterID = 0
+				}
 				result.NATCounterIDs[ruleKey] = counterID
-				result.nextNATCounterID++
+				if counterID != 0 {
+					result.nextNATCounterID++
+				}
 
 				for _, srcAddr := range srcAddrs {
 					srcAddrID, err := resolveSNATMatchAddr(dp, srcAddr, result)
@@ -2009,8 +2027,16 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 			// Assign NAT rule counter ID (shared across expanded address pairs)
 			ruleKey := rs.Name + "/" + rule.Name
 			counterID := result.nextNATCounterID
+			if counterID >= MaxNATRuleCounters {
+				slog.Warn("NAT rule counter IDs exhausted, reusing counter 0",
+					"rule-set", rs.Name, "rule", rule.Name,
+					"counter_id", counterID, "max", MaxNATRuleCounters)
+				counterID = 0
+			}
 			result.NATCounterIDs[ruleKey] = counterID
-			result.nextNATCounterID++
+			if counterID != 0 {
+				result.nextNATCounterID++
+			}
 
 			for _, srcAddr := range srcAddrs {
 				srcAddrID, err := resolveSNATMatchAddr(dp, srcAddr, result)
@@ -2109,7 +2135,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					continue
 				}
 
-				matchIP, _, err := net.ParseCIDR(rule.Match.DestinationAddress)
+				matchIP, matchNet, err := net.ParseCIDR(rule.Match.DestinationAddress)
 				if err != nil {
 					// Try as plain IP
 					matchIP = net.ParseIP(rule.Match.DestinationAddress)
@@ -2118,16 +2144,30 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 							"addr", rule.Match.DestinationAddress)
 						continue
 					}
+				} else {
+					// DNAT requires exact host match — reject non-host CIDRs.
+					ones, bits := matchNet.Mask.Size()
+					if (bits == 32 && ones != 32) || (bits == 128 && ones != 128) {
+						return fmt.Errorf("DNAT rule %q match destination-address %q is a network prefix, not a host address (use /%d for DNAT)",
+							rule.Name, rule.Match.DestinationAddress, bits)
+					}
 				}
 
 				// Parse pool address
-				poolIP, _, err := net.ParseCIDR(pool.Address)
+				poolIP, poolNet, err := net.ParseCIDR(pool.Address)
 				if err != nil {
 					poolIP = net.ParseIP(pool.Address)
 					if poolIP == nil {
 						slog.Warn("invalid DNAT pool address",
 							"addr", pool.Address)
 						continue
+					}
+				} else {
+					// DNAT requires exact host address — reject non-host CIDRs.
+					ones, bits := poolNet.Mask.Size()
+					if (bits == 32 && ones != 32) || (bits == 128 && ones != 128) {
+						return fmt.Errorf("DNAT pool %q address %q is a network prefix, not a host address (use /%d for DNAT)",
+							pool.Name, pool.Address, bits)
 					}
 				}
 
@@ -2313,8 +2353,16 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 				continue
 			}
 
+			// Validate address family consistency — mixed IPv4/IPv6 is not supported.
+			extIsV4 := extIP.To4() != nil
+			intIsV4 := intIP.To4() != nil
+			if extIsV4 != intIsV4 {
+				return fmt.Errorf("static NAT rule %q has mixed address families (match=%s, then=%s)",
+					rule.Name, rule.Match, rule.Then)
+			}
+
 			// Insert DNAT entry (external -> internal) and SNAT entry (internal -> external)
-			if extIP.To4() != nil && intIP.To4() != nil {
+			if extIsV4 && intIsV4 {
 				extU32 := ipToUint32BE(extIP)
 				intU32 := ipToUint32BE(intIP)
 
@@ -2572,16 +2620,29 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 					continue
 				}
 				if pip4 := pip.To4(); pip4 != nil && numV4 < int(MaxNATPoolIPsPerPool) {
-					dp.SetNATPoolIPV4(uint32(newID), uint32(numV4), ipToUint32BE(pip4))
+					if err := dp.SetNATPoolIPV4(uint32(newID), uint32(numV4), ipToUint32BE(pip4)); err != nil {
+						return fmt.Errorf("NAT64 rule-set %q: set pool IPv4 %d/%d: %w",
+							rs.Name, newID, numV4, err)
+					}
 					numV4++
 				} else if pip.To16() != nil && numV6 < int(MaxNATPoolIPsPerPool) {
-					dp.SetNATPoolIPV6(uint32(newID), uint32(numV6), ipTo16Bytes(pip))
+					if err := dp.SetNATPoolIPV6(uint32(newID), uint32(numV6), ipTo16Bytes(pip)); err != nil {
+						return fmt.Errorf("NAT64 rule-set %q: set pool IPv6 %d/%d: %w",
+							rs.Name, newID, numV6, err)
+					}
 					numV6++
 				}
 			}
+			if numV4 == 0 && numV6 == 0 {
+				return fmt.Errorf("NAT64 rule-set %q: source pool %q has no valid addresses",
+					rs.Name, pool.Name)
+			}
 			pcfg.NumIPs = uint16(numV4)
 			pcfg.NumIPsV6 = uint16(numV6)
-			dp.SetNATPoolConfig(uint32(newID), pcfg)
+			if err := dp.SetNATPoolConfig(uint32(newID), pcfg); err != nil {
+				return fmt.Errorf("NAT64 rule-set %q: set pool config %d: %w",
+					rs.Name, newID, err)
+			}
 			slog.Info("auto-assigned NAT64 source pool",
 				"pool", pool.Name, "pool_id", newID, "v4_ips", numV4, "v6_ips", numV6)
 		}
@@ -3858,7 +3919,7 @@ func compilePortMirroring(dp DataPlane, cfg *config.Config) error {
 			continue
 		}
 
-		outIface, err := net.InterfaceByName(inst.Output)
+		outIface, err := net.InterfaceByName(config.LinuxIfName(inst.Output))
 		if err != nil {
 			slog.Warn("port-mirroring output interface not found",
 				"name", name, "interface", inst.Output, "err", err)
@@ -3868,7 +3929,7 @@ func compilePortMirroring(dp DataPlane, cfg *config.Config) error {
 		rate := uint32(inst.InputRate)
 
 		for _, inputIface := range inst.Input {
-			inIface, err := net.InterfaceByName(inputIface)
+			inIface, err := net.InterfaceByName(config.LinuxIfName(inputIface))
 			if err != nil {
 				slog.Warn("port-mirroring input interface not found",
 					"name", name, "interface", inputIface, "err", err)

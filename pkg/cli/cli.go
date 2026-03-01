@@ -1080,6 +1080,10 @@ func (c *CLI) handleShow(args []string) error {
 	case "protocols":
 		return c.handleShowProtocols(args[1:])
 
+	case "bgp":
+		// "show bgp ..." is a shorthand alias for "show protocols bgp ..."
+		return c.showBGP(args[1:])
+
 	case "system":
 		return c.handleShowSystem(args[1:])
 
@@ -1183,6 +1187,8 @@ func (c *CLI) handleShowSecurity(args []string) error {
 	case "policies":
 		// Parse optional zone-pair filter: from-zone X to-zone Y
 		fromZone, toZone := parsePolicyZoneFilter(args[1:])
+		// "show security policies global" — only show global policies
+		globalOnly := len(args) >= 2 && args[1] == "global"
 		// "show security policies hit-count" — Junos-style hit count table
 		if len(args) >= 2 && args[1] == "hit-count" {
 			return c.showPoliciesHitCount(cfg, fromZone, toZone)
@@ -1251,49 +1257,54 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		}
 
 		policySetID := uint32(0)
-		for _, zpp := range cfg.Security.Policies {
-			if fromZone != "" && zpp.FromZone != fromZone {
-				policySetID++
-				continue
-			}
-			if toZone != "" && zpp.ToZone != toZone {
-				policySetID++
-				continue
-			}
-			fmt.Printf("From zone: %s, To zone: %s\n", zpp.FromZone, zpp.ToZone)
-			for i, pol := range zpp.Policies {
-				action := "permit"
-				switch pol.Action {
-				case 1:
-					action = "deny"
-				case 2:
-					action = "reject"
+		if !globalOnly {
+			for _, zpp := range cfg.Security.Policies {
+				if fromZone != "" && zpp.FromZone != fromZone {
+					policySetID++
+					continue
 				}
-				ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-				fmt.Printf("  Rule: %s (id: %d)\n", pol.Name, ruleID)
-				if pol.Description != "" {
-					fmt.Printf("    Description: %s\n", pol.Description)
+				if toZone != "" && zpp.ToZone != toZone {
+					policySetID++
+					continue
 				}
-				fmt.Printf("    Match: src=%v dst=%v app=%v\n",
-					pol.Match.SourceAddresses,
-					pol.Match.DestinationAddresses,
-					pol.Match.Applications)
-				fmt.Printf("    Action: %s\n", action)
+				fmt.Printf("From zone: %s, To zone: %s\n", zpp.FromZone, zpp.ToZone)
+				for i, pol := range zpp.Policies {
+					action := "permit"
+					switch pol.Action {
+					case 1:
+						action = "deny"
+					case 2:
+						action = "reject"
+					}
+					ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+					fmt.Printf("  Rule: %s (id: %d)\n", pol.Name, ruleID)
+					if pol.Description != "" {
+						fmt.Printf("    Description: %s\n", pol.Description)
+					}
+					fmt.Printf("    Match: src=%v dst=%v app=%v\n",
+						pol.Match.SourceAddresses,
+						pol.Match.DestinationAddresses,
+						pol.Match.Applications)
+					fmt.Printf("    Action: %s\n", action)
 
-				// Per-rule hit counts from BPF
-				if c.dp != nil && c.dp.IsLoaded() {
-					counters, err := c.dp.ReadPolicyCounters(ruleID)
-					if err == nil {
-						fmt.Printf("    Hit count: %d packets, %d bytes\n",
-							counters.Packets, counters.Bytes)
+					// Per-rule hit counts from BPF
+					if c.dp != nil && c.dp.IsLoaded() {
+						counters, err := c.dp.ReadPolicyCounters(ruleID)
+						if err == nil {
+							fmt.Printf("    Hit count: %d packets, %d bytes\n",
+								counters.Packets, counters.Bytes)
+						}
 					}
 				}
+				policySetID++
+				fmt.Println()
 			}
-			policySetID++
-			fmt.Println()
+		} else {
+			// When globalOnly, still count zone-pair policy sets to get correct global ruleID base
+			policySetID = uint32(len(cfg.Security.Policies))
 		}
 		// Global policies
-		if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
+		if len(cfg.Security.GlobalPolicies) > 0 && (globalOnly || (fromZone == "" && toZone == "")) {
 			fmt.Println("Global policies:")
 			for i, pol := range cfg.Security.GlobalPolicies {
 				action := "permit"
@@ -2974,7 +2985,7 @@ func (c *CLI) parseSessionFilter(args []string) sessionFilter {
 					f.dstPort = uint16(v)
 				}
 			}
-		case "nat":
+		case "nat", "nat-only":
 			f.natOnly = true
 		case "interface":
 			if i+1 < len(args) {
