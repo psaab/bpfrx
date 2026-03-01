@@ -3644,33 +3644,13 @@ func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting boo
 
 	// Find a non-VRF interface for zone-decoded FIB lookups.
 	// Prefer the fabric interface itself (known UP, non-VRF).
-	// Fall back to any other UP non-VRF link.
+	// Fall back to loopback (ifindex 1): always present, always
+	// UP, never a VRF member — deterministic across reboots.
 	info.FIBIfindex = uint32(link.Attrs().Index)
 	if link.Attrs().MasterIndex != 0 {
-		// Fabric link is a VRF member — find a non-VRF alternative.
-		info.FIBIfindex = 0
-		links, lerr := netlink.LinkList()
-		if lerr == nil {
-			for _, l := range links {
-				a := l.Attrs()
-				if a.Index <= 1 || a.MasterIndex != 0 {
-					continue
-				}
-				if l.Type() == "vrf" || l.Type() == "veth" {
-					continue
-				}
-				if a.Flags&net.FlagUp == 0 {
-					continue
-				}
-				info.FIBIfindex = uint32(a.Index)
-				break
-			}
-		}
-	}
-
-	if info.FIBIfindex == 0 {
-		slog.Warn("cluster: no non-VRF interface found for FIB lookups, fabric forwarding may fail")
-		return false
+		// Fabric link is a VRF member — use loopback for
+		// main-table FIB lookups (avoids l3mdev interference).
+		info.FIBIfindex = 1
 	}
 
 	if d.dp == nil {
