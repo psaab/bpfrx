@@ -3780,12 +3780,16 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			tr := s.SetCluster(isPrimary)
 			if isPrimary {
 				// Activation: enable forwarding first.
+				// Re-read desired state to guard against a
+				// concurrent VRRP goroutine that may have
+				// already superseded this transition.
 				if tr.Changed && d.dp != nil {
-					if err := d.dp.UpdateRGActive(ev.GroupID, tr.Active); err != nil {
+					cur, _ := s.CurrentDesired()
+					if err := d.dp.UpdateRGActive(ev.GroupID, cur); err != nil {
 						slog.Warn("failed to update rg_active from cluster event",
-							"rg", ev.GroupID, "active", tr.Active, "err", err)
+							"rg", ev.GroupID, "active", cur, "err", err)
 					} else {
-						s.MarkApplied(tr.Active)
+						s.ApplyIfCurrent(tr)
 					}
 				}
 				// Then remove blackhole routes — FIB lookups must
@@ -3799,11 +3803,12 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 					d.injectBlackholeRoutes(ev.GroupID)
 				}
 				if tr.Changed && d.dp != nil {
-					if err := d.dp.UpdateRGActive(ev.GroupID, tr.Active); err != nil {
+					cur, _ := s.CurrentDesired()
+					if err := d.dp.UpdateRGActive(ev.GroupID, cur); err != nil {
 						slog.Warn("failed to update rg_active from cluster event",
-							"rg", ev.GroupID, "active", tr.Active, "err", err)
+							"rg", ev.GroupID, "active", cur, "err", err)
 					} else {
-						s.MarkApplied(tr.Active)
+						s.ApplyIfCurrent(tr)
 					}
 				}
 			}
@@ -3900,12 +3905,13 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				tr := s.SetVRRP(ev.Interface, true)
 				if tr.Changed && d.dp != nil {
 					// Activation order: set rg_active FIRST, then
-					// remove blackhole routes. This ensures forwarding
-					// is enabled before routes allow FIB hits.
-					if err := d.dp.UpdateRGActive(rgID, true); err != nil {
+					// remove blackhole routes. Re-read desired state
+					// to guard against interleaved cluster goroutine.
+					cur, _ := s.CurrentDesired()
+					if err := d.dp.UpdateRGActive(rgID, cur); err != nil {
 						slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
 					} else {
-						s.MarkApplied(true)
+						s.ApplyIfCurrent(tr)
 					}
 					d.dp.BumpFIBGeneration()
 					go d.warmNeighborCache()
@@ -3919,14 +3925,15 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				tr := s.SetVRRP(ev.Interface, false)
 				if tr.Changed && !tr.Active {
 					// Deactivation order: inject blackhole routes FIRST,
-					// then clear rg_active. This prevents a window where
-					// FIB can route traffic but rg_active says inactive.
+					// then clear rg_active. Re-read desired state to
+					// guard against interleaved cluster goroutine.
 					d.injectBlackholeRoutes(rgID)
 					if d.dp != nil {
-						if err := d.dp.UpdateRGActive(rgID, false); err != nil {
+						cur, _ := s.CurrentDesired()
+						if err := d.dp.UpdateRGActive(rgID, cur); err != nil {
 							slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
 						} else {
-							s.MarkApplied(false)
+							s.ApplyIfCurrent(tr)
 						}
 						d.dp.BumpFIBGeneration()
 						go d.RefreshFabricFwd()

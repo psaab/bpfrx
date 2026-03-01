@@ -133,6 +133,32 @@ func (s *rgStateMachine) DesiredActive() bool {
 	return s.active
 }
 
+// ApplyIfCurrent atomically marks the transition as applied only if
+// the state machine's epoch still matches the transition's epoch.
+// Returns true if the apply was recorded, false if a newer transition
+// superseded it (stale-update detection for concurrent goroutines).
+func (s *rgStateMachine) ApplyIfCurrent(tr rgTransition) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.epoch != tr.Epoch {
+		return false
+	}
+	s.applied = tr.Active
+	if s.applied == s.active {
+		s.applyPending = false
+	}
+	return true
+}
+
+// CurrentDesired returns the current desired active state and epoch
+// atomically. Use this to re-read the authoritative state before
+// applying side effects in race-prone paths.
+func (s *rgStateMachine) CurrentDesired() (active bool, epoch uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active, s.epoch
+}
+
 func (s *rgStateMachine) reconcileLocked() rgTransition {
 	s.epoch++
 	desired := s.clusterPri || s.anyMasterLocked()

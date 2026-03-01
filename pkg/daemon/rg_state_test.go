@@ -281,6 +281,80 @@ func TestRGStateMachine_DesiredVsApplied(t *testing.T) {
 	}
 }
 
+func TestRGStateMachine_ApplyIfCurrent_StaleDetection(t *testing.T) {
+	s := newRGStateMachine()
+
+	// Activate via cluster.
+	tr1 := s.SetCluster(true)
+	if !tr1.Changed || !tr1.Active {
+		t.Fatal("cluster Primary should activate")
+	}
+
+	// Before applying tr1, a VRRP BACKUP event supersedes.
+	// First set VRRP MASTER so we can go to BACKUP.
+	s.SetVRRP("reth0", true) // epoch advances
+	tr3 := s.SetVRRP("reth0", false)
+
+	// Now also deactivate cluster — should deactivate (epoch advanced again).
+	tr4 := s.SetCluster(false)
+	if !tr4.Changed || tr4.Active {
+		t.Fatal("should deactivate after both sources false")
+	}
+
+	// Try to apply the stale tr1 (activation) — should be rejected.
+	if s.ApplyIfCurrent(tr1) {
+		t.Error("ApplyIfCurrent should reject stale transition (tr1)")
+	}
+
+	// Apply the stale tr3 — should also be rejected.
+	if s.ApplyIfCurrent(tr3) {
+		t.Error("ApplyIfCurrent should reject stale transition (tr3)")
+	}
+
+	// Apply the current tr4 — should succeed.
+	if !s.ApplyIfCurrent(tr4) {
+		t.Error("ApplyIfCurrent should accept current transition")
+	}
+
+	// Verify applied state matches.
+	if s.NeedsApply() {
+		t.Error("should not need apply after successful ApplyIfCurrent")
+	}
+}
+
+func TestRGStateMachine_CurrentDesired(t *testing.T) {
+	s := newRGStateMachine()
+
+	active, epoch := s.CurrentDesired()
+	if active {
+		t.Error("initial state should be inactive")
+	}
+	if epoch != 0 {
+		t.Error("initial epoch should be 0")
+	}
+
+	s.SetCluster(true)
+	active, epoch = s.CurrentDesired()
+	if !active {
+		t.Error("should be active after cluster Primary")
+	}
+	if epoch != 1 {
+		t.Errorf("epoch should be 1, got %d", epoch)
+	}
+
+	// Interleaved: VRRP goes MASTER then BACKUP while we hold stale active=true.
+	s.SetVRRP("reth0", true) // epoch 2
+	s.SetVRRP("reth0", false) // epoch 3, still active via cluster
+
+	active, epoch = s.CurrentDesired()
+	if !active {
+		t.Error("should still be active — cluster is Primary")
+	}
+	if epoch != 3 {
+		t.Errorf("epoch should be 3, got %d", epoch)
+	}
+}
+
 func TestRGStateMachine_DesiredVsApplied_RetryOnFailure(t *testing.T) {
 	s := newRGStateMachine()
 
