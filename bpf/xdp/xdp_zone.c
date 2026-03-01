@@ -1173,6 +1173,12 @@ zone_resolved:
 							&xdp_progs,
 							XDP_PROG_FORWARD);
 					}
+					/* Re-FIB failed — drop transit
+					 * FABRIC_FWD packets, same as
+					 * the SUCCESS path handler. */
+					inc_counter(
+						GLOBAL_CTR_FABRIC_FWD_DROP);
+					return XDP_DROP;
 				}
 			}
 		}
