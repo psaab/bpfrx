@@ -2178,3 +2178,37 @@ windows. Also hardens the DPDK worker's zone-encoded MAC decode path.
 - Adds counter visibility (`GLOBAL_CTR_FABRIC_FWD_DROP`) for fabric transit drops
 - Deterministic loopback fallback prevents boot-order-dependent FIB behavior
 - DPDK parity: fabric ingress validation + correct zone decode pipeline flow
+
+## Sprint DPDK-HA-HARDEN: DPDK Fabric + HA Race Fixes (#65–#66)
+
+### Overview
+Two fixes: correcting DPDK fabric validation to use port_id instead of kernel
+ifindex (follow-up to #64), and eliminating a race condition in HA failover
+where interleaved goroutine transitions could apply stale rg_active state.
+
+### #65: DPDK fabric validation compares port_id vs kernel ifindex
+- **Problem:** DPDK zone.c fabric ingress validation (from #64) compared
+  `meta->ingress_ifindex` (DPDK port_id) against `shm->fabric_ifindex` (kernel
+  ifindex). Different numbering namespaces — comparison always fails, rejecting
+  valid fabric-forwarded packets.
+- **Fix:** (1) Added `ifindex_to_port` mapping array in shared_memory, populated
+  at DPDK port_init. (2) Renamed `fabric_ifindex` to `fabric_port_id`.
+  (3) Go `UpdateFabricFwd()` translates kernel ifindex to DPDK port_id via the
+  mapping before writing to shared memory.
+- **Files:** `dpdk_worker/zone.c`, `dpdk_worker/tables.h`, `pkg/dataplane/dpdk/manager.go`
+
+### #66: HA failover race — stale rg_active from interleaved transitions
+- **Problem:** `watchClusterEvents` and `watchVRRPEvents` goroutines both call
+  `rgStateMachine` and apply `rg_active`/blackhole side effects. When they
+  interleave during rapid failover/failback, the first goroutine's side effects
+  can overwrite the second (newer) transition's correct state — causing brief
+  traffic drops or incorrect forwarding.
+- **Fix:** Added epoch guard — each transition increments a monotonic epoch
+  counter. After applying side effects, the goroutine re-reads the current epoch.
+  If a newer transition occurred (epoch mismatch), stale side effects are skipped.
+- **File:** `pkg/daemon/daemon.go`
+
+### Impact
+- DPDK fabric forwarding now correctly validates ingress port using native port_id
+- Eliminates race window where interleaved HA transitions could apply stale BPF map state
+- Epoch guard is zero-cost on the fast path (only checked during transition side effects)

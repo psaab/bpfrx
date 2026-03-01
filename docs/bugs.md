@@ -589,3 +589,17 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Root cause:** The zone-encoded MAC decode block had an early `return` that bypassed the rest of the zone processing pipeline (FIB lookup, forwarding decision). No check compared `port_id` against the expected fabric interface.
 - **Fix:** (1) Added `fabric_ifindex` field to DPDK `shared_memory` struct, populated by Go manager. (2) Added ingress validation — only accept zone-encoded MACs from the fabric interface. (3) Removed early return so decoded packets continue through FIB resolution.
 - **Files:** `dpdk_worker/zone.c`, `dpdk_worker/tables.h`, `pkg/dataplane/dpdk/manager.go`
+
+## DPDK + HA Hardening Sprint
+
+### #65: DPDK zone-encoded fabric validation compares port_id against kernel ifindex (FIXED)
+- **Symptom:** DPDK `zone.c` fabric ingress validation (added in #64) always fails — zone-encoded MAC packets from the fabric peer are rejected even on the correct interface.
+- **Root cause:** `meta->ingress_ifindex` in DPDK is the DPDK `port_id` (from `pkt->port`), but `shm->fabric_ifindex` is the kernel `ifindex` (populated from netlink). These are different numbering namespaces — DPDK port_id 0 is not kernel ifindex 5. The comparison `meta->ingress_ifindex != shm->fabric_ifindex` always evaluates true for non-matching IDs.
+- **Fix:** (1) Added `ifindex_to_port` mapping array in DPDK `shared_memory`, populated by the DPDK worker at `port_init` time. (2) Renamed `fabric_ifindex` to `fabric_port_id` in the DPDK shared memory struct. (3) Go `UpdateFabricFwd()` translates the kernel ifindex to DPDK port_id via the mapping before writing to shared memory.
+- **Files:** `dpdk_worker/zone.c`, `dpdk_worker/tables.h`, `pkg/dataplane/dpdk/manager.go`
+
+### #66: HA failover race — stale rg_active from interleaved transitions (FIXED)
+- **Symptom:** During rapid HA failover/failback sequences, the `rg_active` BPF map and blackhole side effects can be set to stale values. Traffic is dropped or forwarded incorrectly for a brief window after a valid transition has already occurred.
+- **Root cause:** `watchClusterEvents` and `watchVRRPEvents` goroutines both call into `rgStateMachine` and apply `rg_active`/blackhole side effects. When they interleave — e.g., a cluster state change triggers a transition, then a VRRP event triggers another transition before the first goroutine finishes applying side effects — the first goroutine's side effects overwrite the second (newer) transition's state. The side effects are non-atomic relative to the state machine transitions.
+- **Fix:** Added epoch guard to the state machine. Each transition increments a monotonic epoch counter. After applying side effects, the goroutine re-reads the current epoch from the state machine. If a newer transition has occurred (epoch mismatch), the stale side effects are skipped — the newer transition's goroutine will apply the correct state.
+- **Files:** `pkg/daemon/daemon.go`
