@@ -516,10 +516,14 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 	__builtin_memcpy(v6_src, meta->nat_dst_ip.v6, 16);
 	__builtin_memcpy(v6_dst, meta->nat_src_ip.v6, 16);
 
-	/* Finalize any CHECKSUM_PARTIAL before reading the L4 checksum. */
-	finalize_csum_partial(data, data_end, meta);
+	/* Save csum_partial flag. When true (generic XDP), we skip
+	 * the 750-iteration finalize_csum_partial() scan and instead
+	 * write the IPv6 pseudo-header seed directly after building
+	 * the IPv6 header. The NIC/kernel finalizes the checksum. */
+	__u8 is_csum_partial = meta->csum_partial;
 
-	/* Save L4 checksum and port before modifying */
+	/* Save L4 checksum (only needed for non-csum_partial incremental
+	 * path) and port before modifying */
 	__sum16 orig_l4_csum = 0;
 	__be16 old_dport = meta->dst_port;
 	__be16 new_dport = meta->dst_port; /* restored from nat64_state */
@@ -531,13 +535,15 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 		struct tcphdr *tcp = old_l4;
 		if ((void *)(tcp + 1) > data_end)
 			return XDP_DROP;
-		orig_l4_csum = tcp->check;
+		if (!is_csum_partial)
+			orig_l4_csum = tcp->check;
 		old_dport = tcp->dest;
 	} else if (orig_proto == PROTO_UDP) {
 		struct udphdr *udp = old_l4;
 		if ((void *)(udp + 1) > data_end)
 			return XDP_DROP;
-		orig_l4_csum = udp->check;
+		if (!is_csum_partial)
+			orig_l4_csum = udp->check;
 		old_dport = udp->dest;
 	}
 
@@ -582,23 +588,37 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 		if ((void *)(tcp + 1) > data_end)
 			return XDP_DROP;
 		tcp->dest = new_dport;
-		tcp->check = csum_v4_to_v6(orig_l4_csum,
-					    old_src_v4, old_dst_v4,
-					    v6_src, v6_dst,
-					    orig_proto, ip6_proto, l4_len,
-					    old_dport, new_dport);
+		if (is_csum_partial) {
+			/* CHECKSUM_PARTIAL: write IPv6 pseudo-header seed.
+			 * NIC/kernel sums L4 bytes and adds to seed. */
+			tcp->check = (__sum16)compute_ph_csum_v6(
+				v6_src, v6_dst, PROTO_TCP, l4_len);
+		} else {
+			tcp->check = csum_v4_to_v6(orig_l4_csum,
+						    old_src_v4, old_dst_v4,
+						    v6_src, v6_dst,
+						    orig_proto, ip6_proto,
+						    l4_len,
+						    old_dport, new_dport);
+		}
 	} else if (ip6_proto == PROTO_UDP) {
 		struct udphdr *udp = l4;
 		if ((void *)(udp + 1) > data_end)
 			return XDP_DROP;
 		udp->dest = new_dport;
-		udp->check = csum_v4_to_v6(orig_l4_csum,
-					    old_src_v4, old_dst_v4,
-					    v6_src, v6_dst,
-					    orig_proto, ip6_proto, l4_len,
-					    old_dport, new_dport);
-		if (udp->check == 0)
-			udp->check = 0xFFFF;
+		if (is_csum_partial) {
+			udp->check = (__sum16)compute_ph_csum_v6(
+				v6_src, v6_dst, PROTO_UDP, l4_len);
+		} else {
+			udp->check = csum_v4_to_v6(orig_l4_csum,
+						    old_src_v4, old_dst_v4,
+						    v6_src, v6_dst,
+						    orig_proto, ip6_proto,
+						    l4_len,
+						    old_dport, new_dport);
+			if (udp->check == 0)
+				udp->check = 0xFFFF;
+		}
 	} else if (ip6_proto == PROTO_ICMPV6) {
 		struct icmp6hdr *icmp6 = l4;
 		if ((void *)(icmp6 + 1) > data_end)
@@ -610,26 +630,31 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 		icmp6->icmp6_type = v6_type;
 		icmp6->icmp6_code = v6_code;
 
-		/* Compute ICMPv6 checksum from scratch.
-		 * ICMPv6 checksum covers IPv6 pseudo-header + full
-		 * ICMPv6 message (unlike ICMPv4 which has no pseudo-hdr).
-		 */
-		icmp6->icmp6_cksum = 0;
+		if (is_csum_partial) {
+			/* CHECKSUM_PARTIAL: write IPv6 pseudo-header seed.
+			 * ICMPv6 has a pseudo-header (unlike ICMPv4).
+			 * NIC/kernel sums ICMPv6 bytes and adds to seed. */
+			icmp6->icmp6_cksum = (__sum16)compute_ph_csum_v6(
+				v6_src, v6_dst, PROTO_ICMPV6, l4_len);
+		} else {
+			/* Native XDP: compute ICMPv6 checksum from scratch.
+			 * Covers IPv6 pseudo-header + full ICMPv6 message. */
+			icmp6->icmp6_cksum = 0;
 
-		/* IPv6 pseudo-header sum */
-		__u32 csum = csum_bytes16(v6_src) + csum_bytes16(v6_dst);
-		csum += bpf_htons(l4_len);
-		csum += bpf_htons((__u16)PROTO_ICMPV6);
+			__u32 csum = csum_bytes16(v6_src) +
+				     csum_bytes16(v6_dst);
+			csum += bpf_htons(l4_len);
+			csum += bpf_htons((__u16)PROTO_ICMPV6);
 
-		/* Sum all ICMPv6 16-bit words */
-		__u16 *icmp_w = (__u16 *)icmp6;
-		#pragma unroll
-		for (int i = 0; i < 64; i++) {
-			if ((void *)(&icmp_w[i] + 1) <= data_end)
-				csum += icmp_w[i];
+			__u16 *icmp_w = (__u16 *)icmp6;
+			#pragma unroll
+			for (int i = 0; i < 64; i++) {
+				if ((void *)(&icmp_w[i] + 1) <= data_end)
+					csum += icmp_w[i];
+			}
+
+			icmp6->icmp6_cksum = (__sum16)~csum_fold(csum);
 		}
-
-		icmp6->icmp6_cksum = (__sum16)~csum_fold(csum);
 	}
 
 	inc_counter(GLOBAL_CTR_NAT64_XLATE);
