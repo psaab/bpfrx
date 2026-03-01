@@ -441,7 +441,7 @@ func (c *ctl) dispatchOperational(line string) error {
 		return c.handleTest(parts[1:])
 
 	case "monitor":
-		return fmt.Errorf("monitor traffic is only available on the local CLI")
+		return c.handleMonitor(parts[1:])
 
 	case "quit", "exit":
 		return errExit
@@ -861,6 +861,13 @@ func (c *ctl) handleShow(args []string) error {
 
 	case "task":
 		return c.showText("task")
+
+	case "monitor":
+		if len(args) >= 3 && args[1] == "security" && args[2] == "flow" {
+			return c.showText("monitor-security-flow")
+		}
+		printRemoteTreeHelp("show monitor:", "show", "monitor")
+		return nil
 
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
@@ -2879,6 +2886,113 @@ func (c *ctl) handleTraceroute(args []string) error {
 			return fmt.Errorf("%v", err)
 		}
 		fmt.Println(resp.Output)
+	}
+	return nil
+}
+
+func (c *ctl) handleMonitor(args []string) error {
+	if len(args) == 0 {
+		cmdtree.PrintTreeHelp("monitor:", cmdtree.OperationalTree, "monitor")
+		return nil
+	}
+	switch args[0] {
+	case "traffic":
+		return fmt.Errorf("monitor traffic is only available on the local CLI")
+	case "security":
+		return c.handleMonitorSecurity(args[1:])
+	default:
+		return fmt.Errorf("unknown monitor target: %s", args[0])
+	}
+}
+
+func (c *ctl) handleMonitorSecurity(args []string) error {
+	if len(args) == 0 {
+		cmdtree.PrintTreeHelp("monitor security:", cmdtree.OperationalTree, "monitor", "security")
+		return nil
+	}
+	switch args[0] {
+	case "flow":
+		return fmt.Errorf("monitor security flow is only available on the local CLI")
+	case "packet-drop":
+		return c.handleMonitorSecurityPacketDrop(args[1:])
+	default:
+		return fmt.Errorf("unknown monitor security target: %s", args[0])
+	}
+}
+
+func (c *ctl) handleMonitorSecurityPacketDrop(args []string) error {
+	req := &pb.MonitorPacketDropRequest{}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "source-prefix":
+			if i+1 < len(args) {
+				i++
+				req.SourcePrefix = args[i]
+			}
+		case "destination-prefix":
+			if i+1 < len(args) {
+				i++
+				req.DestinationPrefix = args[i]
+			}
+		case "source-port":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil {
+					req.SourcePort = uint32(v)
+				}
+			}
+		case "destination-port":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil {
+					req.DestinationPort = uint32(v)
+				}
+			}
+		case "protocol":
+			if i+1 < len(args) {
+				i++
+				req.Protocol = args[i]
+			}
+		case "from-zone":
+			if i+1 < len(args) {
+				i++
+				req.FromZone = args[i]
+			}
+		case "interface":
+			if i+1 < len(args) {
+				i++
+				req.Interface = args[i]
+			}
+		case "count":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil {
+					req.Count = int32(v)
+				}
+			}
+		case "node":
+			if i+1 < len(args) {
+				i++
+				req.Node = args[i]
+			}
+		}
+	}
+
+	ctx, cancel := context.WithCancel(c.ctx())
+	defer cancel()
+	stream, err := c.client.MonitorPacketDrop(ctx, req)
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Line)
 	}
 	return nil
 }

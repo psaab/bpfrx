@@ -2212,3 +2212,36 @@ where interleaved goroutine transitions could apply stale rg_active state.
 - DPDK fabric forwarding now correctly validates ingress port using native port_id
 - Eliminates race window where interleaved HA transitions could apply stale BPF map state
 - Epoch guard is zero-cost on the fast path (only checked during transition side effects)
+
+## Sprint: Monitor Commands (PR #67)
+
+### Feature: `monitor security flow` (file/filter/start/stop)
+- **Junos-compatible** 3-step workflow: configure file, configure filter(s), start
+- Per-CLI-session state (not daemon-wide)
+- Subscribes to EventBuffer, filters via named monitorFlowFilter structs
+- Trace output written to `/var/log/<filename>`
+- Precondition errors match Junos: missing file → "Please specify the monitor flow trace file"
+- `show monitor security flow` displays status, file, filter count, per-filter details
+- **Files:** `pkg/cli/monitor.go`, `pkg/cmdtree/tree.go`
+
+### Feature: `monitor security packet-drop`
+- Real-time streaming of POLICY_DENY and SCREEN_DROP events
+- Filters: source-prefix, destination-prefix, source-port, destination-port, protocol, from-zone, interface
+- `count N` limits output to N entries then returns to prompt
+- Output format: `HH:MM:SS.ffffff src-->dst;proto,iface,reason`
+- Available on both local CLI and remote CLI (via gRPC streaming)
+- **gRPC:** `MonitorPacketDrop` server-streaming RPC
+- **Files:** `pkg/cli/monitor.go`, `pkg/grpcapi/server.go`, `cmd/cli/main.go`, `proto/bpfrx/v1/bpfrx.proto`
+
+### Command Tree
+- `monitor security flow file <filename> [size N] [files N] [match REGEX]`
+- `monitor security flow filter <name> [source-prefix X] [destination-prefix X] [protocol X] ...`
+- `monitor security flow start` / `monitor security flow stop`
+- `monitor security packet-drop [source-prefix X] [count N] ...`
+- `show monitor security flow`
+
+### Tests
+- 15 unit tests in `pkg/cli/monitor_test.go`
+- Filter matching: src/dst prefix, port, protocol, interface, combined
+- State lifecycle: file config, filter persistence, start preconditions
+- Format helpers: extractIP, extractPort, formatFlowEvent, formatPacketDropEvent

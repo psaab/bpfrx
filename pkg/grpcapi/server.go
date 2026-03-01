@@ -7277,7 +7277,13 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 
 	default:
 		// Handle "log:<filename>[:<count>]" for syslog file destinations
-		if strings.HasPrefix(req.Topic, "log:") {
+		if req.Topic == "monitor-security-flow" {
+			buf.WriteString("  Monitor security flow session status: Inactive\n")
+			buf.WriteString("  Monitor security flow trace file: (not configured)\n")
+			buf.WriteString("  Monitor security flow filters: 0\n")
+			buf.WriteString("\n  Note: Flow monitor state is per-CLI-session.\n")
+			buf.WriteString("  Use the local CLI on the firewall for flow tracing.\n")
+		} else if strings.HasPrefix(req.Topic, "log:") {
 			parts := strings.SplitN(req.Topic, ":", 3)
 			filename := filepath.Base(parts[1]) // sanitize path
 			n := "50"
@@ -8129,4 +8135,128 @@ func (s *Server) buildInterfacesInput() cluster.InterfacesInput {
 	}
 
 	return input
+}
+
+// MonitorPacketDrop streams packet drop events matching the request filters.
+func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc.ServerStreamingServer[pb.MonitorPacketDropResponse]) error {
+	if s.eventBuf == nil {
+		return status.Error(codes.Unavailable, "event buffer not available")
+	}
+
+	// Parse filters.
+	var srcNet, dstNet *net.IPNet
+	if req.SourcePrefix != "" {
+		_, cidr, err := net.ParseCIDR(req.SourcePrefix)
+		if err != nil {
+			ip := net.ParseIP(req.SourcePrefix)
+			if ip == nil {
+				return status.Errorf(codes.InvalidArgument, "invalid source-prefix: %s", req.SourcePrefix)
+			}
+			if ip.To4() != nil {
+				cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+			} else {
+				cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+			}
+		}
+		srcNet = cidr
+	}
+	if req.DestinationPrefix != "" {
+		_, cidr, err := net.ParseCIDR(req.DestinationPrefix)
+		if err != nil {
+			ip := net.ParseIP(req.DestinationPrefix)
+			if ip == nil {
+				return status.Errorf(codes.InvalidArgument, "invalid destination-prefix: %s", req.DestinationPrefix)
+			}
+			if ip.To4() != nil {
+				cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+			} else {
+				cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+			}
+		}
+		dstNet = cidr
+	}
+
+	count := int(req.Count)
+	sub := s.eventBuf.Subscribe(256)
+	defer sub.Close()
+
+	if err := stream.Send(&pb.MonitorPacketDropResponse{Line: "Starting packet drop:"}); err != nil {
+		return err
+	}
+
+	seen := 0
+	ctx := stream.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case rec := <-sub.C:
+			if rec.Type != "POLICY_DENY" && rec.Type != "SCREEN_DROP" {
+				continue
+			}
+			if srcNet != nil {
+				host, _, _ := net.SplitHostPort(rec.SrcAddr)
+				if host == "" {
+					host = rec.SrcAddr
+				}
+				if ip := net.ParseIP(host); ip == nil || !srcNet.Contains(ip) {
+					continue
+				}
+			}
+			if dstNet != nil {
+				host, _, _ := net.SplitHostPort(rec.DstAddr)
+				if host == "" {
+					host = rec.DstAddr
+				}
+				if ip := net.ParseIP(host); ip == nil || !dstNet.Contains(ip) {
+					continue
+				}
+			}
+			if req.SourcePort != 0 {
+				_, portStr, _ := net.SplitHostPort(rec.SrcAddr)
+				if p, _ := strconv.ParseUint(portStr, 10, 16); p != uint64(req.SourcePort) {
+					continue
+				}
+			}
+			if req.DestinationPort != 0 {
+				_, portStr, _ := net.SplitHostPort(rec.DstAddr)
+				if p, _ := strconv.ParseUint(portStr, 10, 16); p != uint64(req.DestinationPort) {
+					continue
+				}
+			}
+			if req.Protocol != "" && !strings.EqualFold(rec.Protocol, req.Protocol) {
+				continue
+			}
+			if req.FromZone != "" && rec.InZoneName != req.FromZone {
+				continue
+			}
+			if req.Interface != "" && rec.IngressIface != req.Interface {
+				continue
+			}
+
+			// Format the drop event.
+			ts := rec.Time.Format("15:04:05.000000")
+			reason := rec.Action
+			if rec.ScreenCheck != "" {
+				reason = "Dropped by SCREEN:" + rec.ScreenCheck
+			} else if rec.Type == "POLICY_DENY" {
+				reason = "Dropped by FLOW:Policy deny"
+				if rec.PolicyName != "" {
+					reason = "Dropped by FLOW:Policy " + rec.PolicyName
+				}
+			}
+			line := fmt.Sprintf("%s %s-->%s;%s,%s,%s",
+				ts, rec.SrcAddr, rec.DstAddr,
+				strings.ToLower(rec.Protocol),
+				rec.IngressIface, reason)
+
+			if err := stream.Send(&pb.MonitorPacketDropResponse{Line: line}); err != nil {
+				return err
+			}
+			seen++
+			if count > 0 && seen >= count {
+				return nil
+			}
+		}
+	}
 }

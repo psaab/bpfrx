@@ -64,6 +64,9 @@ type CLI struct {
 
 	vrrpMgr      *vrrp.Manager
 
+	// Monitor security flow state (per-CLI-session).
+	monitorFlow *monitorFlowState
+
 	// Command cancellation: Ctrl-C during a running external command cancels it.
 	cmdMu     sync.Mutex
 	cmdCancel context.CancelFunc
@@ -1139,6 +1142,13 @@ func (c *CLI) handleShow(args []string) error {
 
 	case "task":
 		return c.showTask()
+
+	case "monitor":
+		if len(args) >= 3 && args[1] == "security" && args[2] == "flow" {
+			return c.showMonitorSecurityFlow()
+		}
+		cmdtree.PrintTreeHelp("show monitor:", operationalTree, "show", "monitor")
+		return nil
 
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
@@ -10061,15 +10071,26 @@ func (c *CLI) testSecurityZone(args []string) error {
 
 // handleMonitor dispatches monitor sub-commands.
 func (c *CLI) handleMonitor(args []string) error {
+	monTree := operationalTree["monitor"].Children
 	if len(args) == 0 {
 		fmt.Println("monitor:")
-		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["monitor"].Children))
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(monTree))
 		return nil
 	}
-	if args[0] == "traffic" {
-		return c.handleMonitorTraffic(args[1:])
+
+	resolved, err := resolveCommand(args[0], keysFromTree(monTree))
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("unknown monitor target: %s", args[0])
+
+	switch resolved {
+	case "traffic":
+		return c.handleMonitorTraffic(args[1:])
+	case "security":
+		return c.handleMonitorSecurity(args[1:])
+	default:
+		return fmt.Errorf("unknown monitor target: %s", resolved)
+	}
 }
 
 // handleMonitorTraffic wraps tcpdump for live packet capture.

@@ -53,6 +53,9 @@ service BpfrxService {
   rpc Ping(PingRequest) returns (stream PingResponse);
   rpc Traceroute(TracerouteRequest) returns (stream TracerouteResponse);
 
+  // Monitor (server-streaming)
+  rpc MonitorPacketDrop(MonitorPacketDropRequest) returns (stream MonitorPacketDropResponse);
+
   // Mutations
   rpc ClearSessions(ClearSessionsRequest) returns (ClearSessionsResponse);
   rpc ClearCounters(ClearCountersRequest) returns (ClearCountersResponse);
@@ -588,3 +591,18 @@ message SystemActionRequest {
   string target = 2;  // optional target (e.g. interface name for dhcp-renew)
 }
 message SystemActionResponse { string message = 1; }
+
+// --- Monitor security packet-drop ---
+
+message MonitorPacketDropRequest {
+  string source_prefix = 1;
+  string destination_prefix = 2;
+  uint32 source_port = 3;
+  uint32 destination_port = 4;
+  string protocol = 5;
+  string from_zone = 6;
+  string interface = 7;
+  int32  count = 8;   // 0 = unlimited
+  string node = 9;    // cluster node filter
+}
+message MonitorPacketDropResponse { string line = 1; }

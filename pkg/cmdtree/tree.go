@@ -459,6 +459,11 @@ var OperationalTree = map[string]*Node{
 		}},
 		"vlans":              {Desc: "Show VLAN configuration"},
 		"version":            {Desc: "Show software process revision levels"},
+		"monitor": {Desc: "Show monitor information", Children: map[string]*Node{
+			"security": {Desc: "Show security monitor information", Children: map[string]*Node{
+				"flow": {Desc: "Show security flow monitor status"},
+			}},
+		}},
 	}},
 	"monitor": {Desc: "Show real-time debugging information", Children: map[string]*Node{
 		"traffic": {Desc: "Capture traffic on interface", Children: map[string]*Node{
@@ -474,6 +479,65 @@ var OperationalTree = map[string]*Node{
 			}},
 			"matching": {Desc: "Filter expression (tcpdump syntax)"},
 			"count":    {Desc: "Number of packets to capture"},
+		}},
+		"security": {Desc: "Monitor security events", Children: map[string]*Node{
+			"flow": {Desc: "Monitor security flow", Children: map[string]*Node{
+				"file":   {Desc: "Configure flow trace file", Children: map[string]*Node{
+					"<filename>": {Desc: "Name of trace file"},
+					"files":      {Desc: "Maximum number of trace files (2..1000)"},
+					"size":       {Desc: "Maximum trace file size (10240..1073741824)"},
+					"match":      {Desc: "Regular expression for lines to log"},
+				}},
+				"filter": {Desc: "Configure flow trace filter", Children: map[string]*Node{
+					"<filter-name>":  {Desc: "Name of filter"},
+					"source-prefix":      {Desc: "Source IP prefix to match"},
+					"destination-prefix": {Desc: "Destination IP prefix to match"},
+					"source-port":        {Desc: "Source port to match"},
+					"destination-port":   {Desc: "Destination port to match"},
+					"protocol":           {Desc: "Protocol to match (tcp/udp/icmp/0..255)"},
+					"interface":          {Desc: "Interface to match", DynamicFn: func(cfg *config.Config) []string {
+						if cfg == nil || cfg.Interfaces.Interfaces == nil {
+							return nil
+						}
+						names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+						for name := range cfg.Interfaces.Interfaces {
+							names = append(names, name)
+						}
+						return names
+					}},
+				}},
+				"start":  {Desc: "Start flow tracing"},
+				"stop":   {Desc: "Stop flow tracing"},
+			}},
+			"packet-drop": {Desc: "Monitor security packet drops", Children: map[string]*Node{
+				"source-prefix":      {Desc: "Source IP prefix to match"},
+				"destination-prefix": {Desc: "Destination IP prefix to match"},
+				"source-port":        {Desc: "Source port to match"},
+				"destination-port":   {Desc: "Destination port to match"},
+				"protocol":           {Desc: "Protocol to match (tcp/udp/icmp/0..255)"},
+				"from-zone":          {Desc: "Ingress zone to match", DynamicFn: func(cfg *config.Config) []string {
+					if cfg == nil {
+						return nil
+					}
+					names := make([]string, 0, len(cfg.Security.Zones))
+					for _, z := range cfg.Security.Zones {
+						names = append(names, z.Name)
+					}
+					return names
+				}},
+				"interface": {Desc: "Ingress interface to match", DynamicFn: func(cfg *config.Config) []string {
+					if cfg == nil || cfg.Interfaces.Interfaces == nil {
+						return nil
+					}
+					names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+					for name := range cfg.Interfaces.Interfaces {
+						names = append(names, name)
+					}
+					return names
+				}},
+				"count": {Desc: "Number of packet drops to display (1..8192)"},
+				"node":  {Desc: "Cluster node (0, 1, all, local, primary)"},
+			}},
 		}},
 	}},
 	"clear": {Desc: "Clear statistics and protocol information", Children: map[string]*Node{
