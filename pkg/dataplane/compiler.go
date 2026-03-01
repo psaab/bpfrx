@@ -1242,6 +1242,7 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 	// Track written keys for populate-before-clear.
 	writtenApps := make(map[AppKey]bool)
 	result.AppNames = make(map[uint16]string)
+	var rangeIdx uint32 // next free slot in app_ranges ARRAY
 
 	appID := uint32(1)
 	userApps := cfg.Applications.Applications
@@ -1288,8 +1289,8 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 		result.AppIDs[appName] = appID
 		result.AppNames[uint16(appID)] = appName
 
-		// Parse destination port (may be a range like "8080-8090")
-		ports, err := parsePorts(app.DestinationPort)
+		// Parse destination port range boundaries.
+		dstLow, dstHigh, err := parsePortRange(app.DestinationPort)
 		if err != nil {
 			slog.Warn("bad port for application",
 				"name", appName, "port", app.DestinationPort, "err", err)
@@ -1320,19 +1321,56 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 			protos = []uint8{6, 17} // TCP + UDP
 		}
 
-		for _, p := range protos {
-			for _, port := range ports {
-				if err := dp.SetApplication(p, port, appID, appTimeout, algType, srcLow, srcHigh); err != nil {
-					return fmt.Errorf("set application %s port %d: %w",
-						appName, port, err)
+		// Large ranges (>256 ports) go into app_ranges ARRAY to avoid
+		// expanding thousands of per-port HASH entries.
+		rangeSize := int(dstHigh) - int(dstLow) + 1
+		if rangeSize > 256 && rangeIdx < MaxAppRanges {
+			for _, p := range protos {
+				if rangeIdx >= MaxAppRanges {
+					slog.Warn("app_ranges full, falling back to HASH expansion",
+						"name", appName)
+					break
 				}
-				writtenApps[AppKey{Protocol: p, DstPort: htons(port)}] = true
+				entry := AppRangeEntry{
+					Protocol:    p,
+					ALGType:     algType,
+					PortLow:     dstLow,
+					PortHigh:    dstHigh,
+					SrcPortLow:  srcLow,
+					SrcPortHigh: srcHigh,
+					AppID:       appID,
+					Timeout:     appTimeout,
+				}
+				if err := dp.SetAppRange(rangeIdx, entry); err != nil {
+					return fmt.Errorf("set app range %s: %w", appName, err)
+				}
+				rangeIdx++
+			}
+		} else {
+			// Small range or single port — expand into per-port HASH entries.
+			for _, p := range protos {
+				for port := dstLow; port <= dstHigh; port++ {
+					if err := dp.SetApplication(p, port, appID, appTimeout, algType, srcLow, srcHigh); err != nil {
+						return fmt.Errorf("set application %s port %d: %w",
+							appName, port, err)
+					}
+					writtenApps[AppKey{Protocol: p, DstPort: htons(port)}] = true
+					if port == 65535 {
+						break // prevent uint16 overflow
+					}
+				}
 			}
 		}
 
 		slog.Debug("application compiled", "name", appName, "id", appID,
-			"proto", proto, "ports", ports, "srcPort", app.SourcePort, "timeout", appTimeout)
+			"proto", proto, "dstPort", app.DestinationPort, "srcPort", app.SourcePort, "timeout", appTimeout)
 		appID++
+	}
+
+	// Zero remaining app_ranges slots (sentinel for BPF iteration).
+	zeroRange := AppRangeEntry{}
+	for i := rangeIdx; i < MaxAppRanges; i++ {
+		dp.SetAppRange(i, zeroRange)
 	}
 
 	// Delete stale application entries no longer referenced.

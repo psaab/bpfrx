@@ -118,7 +118,9 @@ func (m *Manager) SetApplication(protocol uint8, dstPort uint16, appID uint32, t
 	return nil
 }
 
-func (m *Manager) ClearApplications() error { return nil }
+func (m *Manager) SetAppRange(_ uint32, _ dataplane.AppRangeEntry) error { return nil }
+func (m *Manager) ClearAppRanges() error                                 { return nil }
+func (m *Manager) ClearApplications() error                              { return nil }
 
 // --- Sessions ---
 

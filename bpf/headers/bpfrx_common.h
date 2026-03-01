@@ -150,6 +150,7 @@ struct icmp6hdr {
 #define MAX_NAT_RULE_COUNTERS  256
 #define MAX_ADDRESSES          8192
 #define MAX_APPLICATIONS       1024
+#define MAX_APP_RANGES         32     /* range-based application entries */
 #define MAX_SCREEN_PROFILES    64
 #define MAX_PORT_SCAN_TRACK    65536
 #define MAX_CPUS               256

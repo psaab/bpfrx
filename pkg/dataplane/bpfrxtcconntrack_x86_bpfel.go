@@ -31,6 +31,19 @@ type bpfrxTcConntrackAppKey struct {
 	DstPort  uint16
 }
 
+type bpfrxTcConntrackAppRangeEntry struct {
+	_           structs.HostLayout
+	Protocol    uint8
+	AlgType     uint8
+	PortLow     uint16
+	PortHigh    uint16
+	SrcPortLow  uint16
+	SrcPortHigh uint16
+	Pad         uint16
+	AppId       uint32
+	Timeout     uint32
+}
+
 type bpfrxTcConntrackAppValue struct {
 	_           structs.HostLayout
 	AppId       uint32
@@ -650,6 +663,7 @@ type bpfrxTcConntrackMapSpecs struct {
 	AddressBookV4     *ebpf.MapSpec `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.MapSpec `ebpf:"address_book_v6"`
 	AddressMembership *ebpf.MapSpec `ebpf:"address_membership"`
+	AppRanges         *ebpf.MapSpec `ebpf:"app_ranges"`
 	Applications      *ebpf.MapSpec `ebpf:"applications"`
 	CpuMap            *ebpf.MapSpec `ebpf:"cpu_map"`
 	CpumapAvailable   *ebpf.MapSpec `ebpf:"cpumap_available"`
@@ -737,6 +751,7 @@ type bpfrxTcConntrackMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
 	AddressMembership *ebpf.Map `ebpf:"address_membership"`
+	AppRanges         *ebpf.Map `ebpf:"app_ranges"`
 	Applications      *ebpf.Map `ebpf:"applications"`
 	CpuMap            *ebpf.Map `ebpf:"cpu_map"`
 	CpumapAvailable   *ebpf.Map `ebpf:"cpumap_available"`
@@ -800,6 +815,7 @@ func (m *bpfrxTcConntrackMaps) Close() error {
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
+		m.AppRanges,
 		m.Applications,
 		m.CpuMap,
 		m.CpumapAvailable,

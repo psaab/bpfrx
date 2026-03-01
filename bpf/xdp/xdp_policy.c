@@ -1180,6 +1180,36 @@ int xdp_policy_prog(struct xdp_md *ctx)
 		}
 	}
 
+	/* Fallback: check range-based application entries when exact HASH
+	 * lookup missed.  The app_ranges ARRAY holds entries with port
+	 * ranges that were too large to expand per-port in the HASH map. */
+	if (pkt_app_id == 0) {
+		__u16 dp = bpf_ntohs(meta->dst_port);
+		__u16 sp = bpf_ntohs(meta->src_port);
+
+		#pragma unroll 1
+		for (__u32 ri = 0; ri < MAX_APP_RANGES; ri++) {
+			struct app_range_entry *ar =
+				bpf_map_lookup_elem(&app_ranges, &ri);
+			if (!ar || ar->app_id == 0)
+				break; /* sentinel: end of populated entries */
+
+			if (ar->protocol != 0 &&
+			    ar->protocol != meta->protocol)
+				continue;
+			if (dp < ar->port_low || dp > ar->port_high)
+				continue;
+			if ((ar->src_port_low != 0 || ar->src_port_high != 0) &&
+			    (sp < ar->src_port_low || sp > ar->src_port_high))
+				continue;
+
+			pkt_app_id = ar->app_id;
+			if (ar->timeout > 0)
+				meta->app_timeout = ar->timeout;
+			break;
+		}
+	}
+
 	/* Iterate policy rules */
 	__u32 base_idx = ps->policy_set_id * MAX_RULES_PER_POLICY;
 	__u16 num_rules = ps->num_rules;

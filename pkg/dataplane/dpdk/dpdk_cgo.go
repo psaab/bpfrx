@@ -494,6 +494,16 @@ func (m *Manager) ClearApplications() error {
 	return nil
 }
 
+func (m *Manager) SetAppRange(index uint32, entry dataplane.AppRangeEntry) error {
+	// TODO: implement DPDK app_ranges when DPDK pipeline supports it
+	return nil
+}
+
+func (m *Manager) ClearAppRanges() error {
+	// TODO: implement DPDK app_ranges when DPDK pipeline supports it
+	return nil
+}
+
 // --- Sessions ---
 
 func (m *Manager) IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {

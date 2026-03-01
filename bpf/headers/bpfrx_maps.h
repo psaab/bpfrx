@@ -254,6 +254,29 @@ struct {
 	__type(value, struct app_value);
 } applications SEC(".maps");
 
+/* Range-based application entries for large port ranges.
+ * When a port range exceeds a threshold (e.g., 256 ports), the compiler
+ * stores a single range entry here instead of expanding per-port into
+ * the HASH map. Checked after exact HASH lookup misses. */
+struct app_range_entry {
+	__u8  protocol;
+	__u8  alg_type;
+	__u16 port_low;     /* host byte order */
+	__u16 port_high;    /* host byte order */
+	__u16 src_port_low; /* host byte order, 0=any */
+	__u16 src_port_high;/* host byte order, 0=any */
+	__u16 pad;
+	__u32 app_id;
+	__u32 timeout;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_APP_RANGES);
+	__type(key, __u32);
+	__type(value, struct app_range_entry);
+} app_ranges SEC(".maps");
+
 /* ============================================================
  * Counters & statistics (per-CPU for lock-free increments)
  * ============================================================ */

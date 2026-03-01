@@ -84,6 +84,8 @@ type DataPlane interface {
 
 	// Application
 	SetApplication(protocol uint8, dstPort uint16, appID uint32, timeout uint32, algType uint8, srcPortLow, srcPortHigh uint16) error
+	SetAppRange(index uint32, entry AppRangeEntry) error
+	ClearAppRanges() error
 	ClearApplications() error
 
 	// Sessions

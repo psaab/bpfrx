@@ -377,6 +377,23 @@ type AppValue struct {
 	SrcPortHigh uint16 // source port range high (host byte order), 0=any
 }
 
+// AppRangeEntry mirrors the C struct app_range_entry.
+// Used for large port ranges stored in the app_ranges ARRAY map.
+type AppRangeEntry struct {
+	Protocol    uint8
+	ALGType     uint8
+	PortLow     uint16 // host byte order
+	PortHigh    uint16 // host byte order
+	SrcPortLow  uint16 // host byte order, 0=any
+	SrcPortHigh uint16 // host byte order, 0=any
+	Pad         uint16
+	AppID       uint32
+	Timeout     uint32
+}
+
+// MaxAppRanges is the maximum number of range-based application entries.
+const MaxAppRanges = 32
+
 // NAT pool types.
 type NATPoolConfig struct {
 	NumIPs         uint16

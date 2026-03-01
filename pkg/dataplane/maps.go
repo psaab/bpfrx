@@ -170,6 +170,28 @@ func (m *Manager) SetApplication(protocol uint8, dstPort uint16, appID uint32, t
 	return zm.Update(key, val, ebpf.UpdateAny)
 }
 
+// SetAppRange writes a range-based application entry at the given index.
+func (m *Manager) SetAppRange(index uint32, entry AppRangeEntry) error {
+	zm, ok := m.maps["app_ranges"]
+	if !ok {
+		return fmt.Errorf("app_ranges map not found")
+	}
+	return zm.Update(index, entry, ebpf.UpdateAny)
+}
+
+// ClearAppRanges zeros all app_ranges entries.
+func (m *Manager) ClearAppRanges() error {
+	zm, ok := m.maps["app_ranges"]
+	if !ok {
+		return fmt.Errorf("app_ranges map not found")
+	}
+	zero := AppRangeEntry{}
+	for i := uint32(0); i < MaxAppRanges; i++ {
+		zm.Update(i, zero, ebpf.UpdateAny)
+	}
+	return nil
+}
+
 // IterateSessions iterates all session entries, calling fn for each.
 // fn receives the key and value; return false to stop iteration.
 func (m *Manager) IterateSessions(fn func(SessionKey, SessionValue) bool) error {
