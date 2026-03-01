@@ -382,6 +382,33 @@ apply_dnat_before_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 }
 
 /*
+ * Set up a bpf_fib_lookup struct for a main-table (254) re-lookup.
+ * Used by fabric transit paths that need to re-FIB after the initial
+ * lookup hit the wrong VRF table.
+ */
+static __always_inline void
+setup_main_table_fib(struct bpf_fib_lookup *fib, struct pkt_meta *meta,
+		     struct fabric_fwd_info *ff_cached)
+{
+	__builtin_memset(fib, 0, sizeof(*fib));
+	fib->l4_protocol = meta->protocol;
+	fib->tot_len     = meta->pkt_len;
+	fib->tbid        = 254; /* RT_TABLE_MAIN */
+	fib->ifindex     = meta->ingress_ifindex;
+	if (ff_cached && ff_cached->fib_ifindex)
+		fib->ifindex = ff_cached->fib_ifindex;
+	if (meta->addr_family == AF_INET) {
+		fib->family   = AF_INET;
+		fib->ipv4_src = meta->src_ip.v4;
+		fib->ipv4_dst = meta->dst_ip.v4;
+	} else {
+		fib->family = AF_INET6;
+		__builtin_memcpy(fib->ipv6_src, meta->src_ip.v6, 16);
+		__builtin_memcpy(fib->ipv6_dst, meta->dst_ip.v6, 16);
+	}
+}
+
+/*
  * Resolve FIB result: translate ifindex to physical interface + VLAN,
  * populate meta forwarding fields, and look up egress zone.
  * Returns the iface_zone_value pointer (NULL if zone not found).
@@ -965,24 +992,7 @@ zone_resolved:
 		 * still go through the full conntrack/policy pipeline. */
 		if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
 			struct bpf_fib_lookup fib2 = {};
-			fib2.l4_protocol = meta->protocol;
-			fib2.tot_len     = meta->pkt_len;
-			fib2.tbid        = 254; /* RT_TABLE_MAIN */
-			/* Use non-VRF ifindex for main table lookup */
-			fib2.ifindex = meta->ingress_ifindex;
-			if (ff_cached && ff_cached->fib_ifindex)
-				fib2.ifindex = ff_cached->fib_ifindex;
-			if (meta->addr_family == AF_INET) {
-				fib2.family   = AF_INET;
-				fib2.ipv4_src = meta->src_ip.v4;
-				fib2.ipv4_dst = meta->dst_ip.v4;
-			} else {
-				fib2.family = AF_INET6;
-				__builtin_memcpy(fib2.ipv6_src,
-						 meta->src_ip.v6, 16);
-				__builtin_memcpy(fib2.ipv6_dst,
-						 meta->dst_ip.v6, 16);
-			}
+			setup_main_table_fib(&fib2, meta, ff_cached);
 			int rc2 = bpf_fib_lookup(ctx, &fib2,
 				sizeof(fib2), BPF_FIB_LOOKUP_TBID);
 			if (rc2 == BPF_FIB_LKUP_RET_SUCCESS) {
@@ -1136,34 +1146,8 @@ zone_resolved:
 				if (meta->meta_flags &
 				    META_FLAG_FABRIC_FWD) {
 					struct bpf_fib_lookup fib3 = {};
-					fib3.l4_protocol =
-						meta->protocol;
-					fib3.tot_len = meta->pkt_len;
-					fib3.tbid = 254;
-					fib3.ifindex =
-						meta->ingress_ifindex;
-					if (ff_cached &&
-					    ff_cached->fib_ifindex)
-						fib3.ifindex =
-						    ff_cached->fib_ifindex;
-					if (meta->addr_family ==
-					    AF_INET) {
-						fib3.family = AF_INET;
-						fib3.ipv4_src =
-							meta->src_ip.v4;
-						fib3.ipv4_dst =
-							meta->dst_ip.v4;
-					} else {
-						fib3.family = AF_INET6;
-						__builtin_memcpy(
-							fib3.ipv6_src,
-							meta->src_ip.v6,
-							16);
-						__builtin_memcpy(
-							fib3.ipv6_dst,
-							meta->dst_ip.v6,
-							16);
-					}
+					setup_main_table_fib(
+						&fib3, meta, ff_cached);
 					int rc3 = bpf_fib_lookup(
 						ctx, &fib3, sizeof(fib3),
 						BPF_FIB_LOOKUP_TBID);
@@ -1250,35 +1234,7 @@ zone_resolved:
 						    sizeof(fib), 0);
 				if (rc == BPF_FIB_LKUP_RET_SUCCESS ||
 				    rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
-					__u32 eg_if = fib.ifindex;
-					__u16 eg_vlan = 0;
-					struct vlan_iface_info *vi2 =
-						bpf_map_lookup_elem(
-							&vlan_iface_map,
-							&eg_if);
-					if (vi2) {
-						eg_if = vi2->parent_ifindex;
-						eg_vlan = vi2->vlan_id;
-					}
-					meta->fwd_ifindex = eg_if;
-					meta->egress_vlan_id = eg_vlan;
-					__builtin_memcpy(meta->fwd_dmac,
-						fib.dmac, ETH_ALEN);
-					__builtin_memcpy(meta->fwd_smac,
-						fib.smac, ETH_ALEN);
-
-					struct iface_zone_key ezk = {
-						.ifindex = eg_if,
-						.vlan_id = eg_vlan,
-					};
-					struct iface_zone_value *ezv =
-						bpf_map_lookup_elem(
-							&iface_zone_map,
-							&ezk);
-					if (ezv)
-						meta->egress_zone =
-							ezv->zone_id;
-
+					resolve_fib_result(meta, &fib);
 					bpf_tail_call(ctx, &xdp_progs,
 						XDP_PROG_CONNTRACK);
 					return XDP_PASS;
