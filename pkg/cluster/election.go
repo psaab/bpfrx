@@ -1,6 +1,9 @@
 package cluster
 
-import "log/slog"
+import (
+	"log/slog"
+	"time"
+)
 
 // EffectivePriority calculates the effective priority for a node.
 // effective = base_priority * (weight / 255)
@@ -41,15 +44,25 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 	// restore weight to allow election, avoiding a dual-secondary deadlock
 	// during rapid failover cycles where one node resigns before the
 	// previous cycle's ManualFailover flag is cleared.
+	//
+	// Time guard: only clear after 2s to prevent re-promoting a node that
+	// JUST resigned. Without this, the resigned node sees stale peer
+	// weight=0 (from a previous cycle) and immediately re-elects itself
+	// as primary, defeating the resignation.
 	if rg.ManualFailover {
 		if peerGroup == nil || peerGroup.Weight > 0 {
 			return electNoChange, ""
 		}
-		// Peer weight 0 — both nodes resigned. Clear ManualFailover
-		// and restore weight so election can promote one of them.
+		if time.Since(rg.ManualFailoverAt) < 2*time.Second {
+			return electNoChange, ""
+		}
+		// Peer weight 0 for >2s — both nodes resigned. Clear
+		// ManualFailover and restore weight so election can promote
+		// one of them.
 		slog.Info("cluster: clearing manual failover (peer also resigned)",
 			"rg", rg.GroupID)
 		rg.ManualFailover = false
+		rg.ManualFailoverAt = time.Time{}
 		// Recalculate weight inline (recalcWeight calls runElection
 		// which would recurse back to electRG).
 		totalLost := 0

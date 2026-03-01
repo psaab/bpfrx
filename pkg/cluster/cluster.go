@@ -50,8 +50,9 @@ type RedundancyGroupState struct {
 	PeerPriority   int
 	State          NodeState
 	Preempt        bool
-	ManualFailover bool     // true if manually forced
-	Weight         int      // current effective weight (255 - sum of down monitor weights)
+	ManualFailover   bool      // true if manually forced
+	ManualFailoverAt time.Time // when ManualFailover was set (for deadlock detection)
+	Weight           int       // current effective weight (255 - sum of down monitor weights)
 	FailoverCount  int
 	MonitorFails   []string // names of currently-failed monitors
 }
@@ -407,6 +408,7 @@ func (m *Manager) ManualFailover(rgID int) error {
 	}
 	oldState := rg.State
 	rg.ManualFailover = true
+	rg.ManualFailoverAt = time.Now()
 	rg.Weight = 0 // zero weight so peer election sees "Peer weight 0" → becomes primary
 	rg.State = StateSecondary
 	rg.FailoverCount++
@@ -478,6 +480,7 @@ func (m *Manager) ForceSecondary() error {
 		oldState := rg.State
 		rg.Weight = 0
 		rg.ManualFailover = true
+		rg.ManualFailoverAt = time.Now()
 		rg.State = StateSecondary
 		if oldState != rg.State {
 			rg.FailoverCount++
@@ -498,6 +501,7 @@ func (m *Manager) ResetFailover(rgID int) error {
 		return fmt.Errorf("redundancy group %d not found", rgID)
 	}
 	rg.ManualFailover = false
+	rg.ManualFailoverAt = time.Time{}
 	m.recalcWeight(rg) // restore weight from monitor state + run election
 	slog.Info("cluster: failover reset", "rg", rgID)
 	return nil
@@ -761,6 +765,7 @@ func (m *Manager) handlePeerTimeout() {
 		if rg.ManualFailover {
 			slog.Info("cluster: clearing manual failover (peer lost)", "rg", rg.GroupID)
 			rg.ManualFailover = false
+			rg.ManualFailoverAt = time.Time{}
 			m.recalcWeight(rg)
 		}
 	}

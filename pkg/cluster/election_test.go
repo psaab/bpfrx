@@ -3,6 +3,7 @@ package cluster
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
@@ -236,6 +237,45 @@ func TestElection_ManualFailover_Preserved(t *testing.T) {
 	// Manual failover should keep us secondary even with higher priority.
 	if m.IsLocalPrimary(0) {
 		t.Error("manual failover should keep us secondary")
+	}
+}
+
+func TestElection_DualResign_TimeGuard(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	// Manual failover — just set, should NOT clear even if peer weight=0.
+	m.ManualFailover(0)
+	drainEvents(m, 1)
+
+	// Peer also resigned (weight 0).
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 0, State: uint8(StateSecondary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	// Within 2s time guard — should stay secondary.
+	if m.IsLocalPrimary(0) {
+		t.Error("should stay secondary within time guard (just resigned)")
+	}
+
+	// Backdate the ManualFailoverAt to simulate >2s elapsed.
+	m.mu.Lock()
+	m.groups[0].ManualFailoverAt = time.Now().Add(-3 * time.Second)
+	m.mu.Unlock()
+
+	// Now re-trigger election via heartbeat.
+	m.handlePeerHeartbeat(pkt)
+
+	// After time guard, dual-resign should clear ManualFailover → primary.
+	if !m.IsLocalPrimary(0) {
+		t.Error("should become primary after time guard expires (dual-resign deadlock recovery)")
 	}
 }
 
