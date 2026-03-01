@@ -629,12 +629,6 @@ type bpfrxXdpNat64ZoneConfig struct {
 	Pad              [3]uint8
 }
 
-type bpfrxXdpNat64ZonePairKey struct {
-	_        structs.HostLayout
-	FromZone uint16
-	ToZone   uint16
-}
-
 // loadBpfrxXdpNat64 returns the embedded CollectionSpec for bpfrxXdpNat64.
 func loadBpfrxXdpNat64() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_BpfrxXdpNat64Bytes)

@@ -116,6 +116,48 @@ csum_v4_to_v6(__sum16 old_csum,
 }
 
 /*
+ * Adjust L4 checksum when switching from IPv6 to IPv4 pseudo-header.
+ * Mirror of csum_v4_to_v6 for the 6→4 direction.
+ */
+static __always_inline __sum16
+csum_v6_to_v4(__sum16 old_csum,
+	      const __u8 *old_src_v6, const __u8 *old_dst_v6,
+	      __be32 new_src_v4, __be32 new_dst_v4,
+	      __u8 old_proto, __u8 new_proto, __u16 l4_len,
+	      __be16 old_sport, __be16 new_sport)
+{
+	__u32 csum;
+
+	csum = (__u16)~old_csum;
+
+	/* Subtract IPv6 pseudo-header */
+	__u32 v6sum = csum_bytes16(old_src_v6) + csum_bytes16(old_dst_v6);
+	v6sum += bpf_htons(l4_len);
+	v6sum += bpf_htons((__u16)old_proto);
+	v6sum = csum_fold(v6sum);
+	csum += (__u16)~v6sum;
+
+	/* Add IPv4 pseudo-header */
+	__u32 v4sum = 0;
+	v4sum += (new_src_v4 >> 16) & 0xFFFF;
+	v4sum += new_src_v4 & 0xFFFF;
+	v4sum += (new_dst_v4 >> 16) & 0xFFFF;
+	v4sum += new_dst_v4 & 0xFFFF;
+	v4sum += bpf_htons((__u16)new_proto);
+	v4sum += bpf_htons(l4_len);
+	v4sum = csum_fold(v4sum);
+	csum += v4sum;
+
+	/* Adjust for sport change */
+	if (old_sport != new_sport) {
+		csum += (__u16)~old_sport;
+		csum += new_sport;
+	}
+
+	return (__sum16)~csum_fold(csum);
+}
+
+/*
  * Translate ICMPv6 type/code to ICMPv4 equivalents.
  * Returns 0 on success, -1 if not translatable.
  */
@@ -204,18 +246,27 @@ nat64_xlate_6to4(struct xdp_md *ctx, struct pkt_meta *meta)
 	__be16 old_sport = meta->src_port;
 	__be16 new_sport = meta->src_port; /* already set to SNAT port by policy */
 
-	/* Read original source port from packet (meta may differ from wire) */
+	/* Finalize any CHECKSUM_PARTIAL before reading the L4 checksum.
+	 * After this, all packets have a complete L4 checksum and
+	 * incremental update works uniformly. */
+	finalize_csum_partial(data, data_end, meta);
+
+	/* Read original L4 checksum and source port from packet
+	 * (meta may differ from wire).  Must be before adjust_head. */
+	__sum16 orig_l4_csum = 0;
 	void *old_l4 = data + meta->l4_offset;
 	if (orig_proto == PROTO_TCP) {
 		struct tcphdr *tcp = old_l4;
 		if ((void *)(tcp + 1) > data_end)
 			return XDP_DROP;
 		old_sport = tcp->source;
+		orig_l4_csum = tcp->check;
 	} else if (orig_proto == PROTO_UDP) {
 		struct udphdr *udp = old_l4;
 		if ((void *)(udp + 1) > data_end)
 			return XDP_DROP;
 		old_sport = udp->source;
+		orig_l4_csum = udp->check;
 	} else if (orig_proto == PROTO_ICMPV6) {
 		/* For ICMP echo, meta->src_port was replaced with the
 		 * SNAT'd port by policy, but we need the original echo
@@ -267,81 +318,28 @@ nat64_xlate_6to4(struct xdp_md *ctx, struct pkt_meta *meta)
 			return XDP_DROP;
 		tcp->source = new_sport;
 
-		/* Compute TCP checksum for translated IPv4 packet.
-		 *
-		 * CHECKSUM_PARTIAL (generic XDP / virtio-net): write only
-		 * the IPv4 pseudo-header seed — the kernel finalizes by
-		 * summing L4 bytes via skb_checksum_help().
-		 *
-		 * Native XDP: compute full from-scratch checksum since
-		 * XDP_REDIRECT bypasses kernel TX finalization. */
-		tcp->check = 0;
-		__u32 tcp_csum = 0;
-		tcp_csum += (v4_src >> 16) + (v4_src & 0xFFFF);
-		tcp_csum += (v4_dst >> 16) + (v4_dst & 0xFFFF);
-		tcp_csum += bpf_htons((__u16)PROTO_TCP);
-		tcp_csum += bpf_htons(l4_len);
-
-		if (meta->csum_partial) {
-			tcp->check = (__sum16)csum_fold(tcp_csum);
-		} else {
-			__u16 *tw = (__u16 *)tcp;
-			__u16 n_words = l4_len >> 1;
-			if (n_words > 750)
-				n_words = 750;
-			#pragma unroll 1
-			for (__u16 i = 0; i < 750; i++) {
-				if (i >= n_words)
-					break;
-				if ((void *)(&tw[i] + 1) > data_end)
-					break;
-				tcp_csum += tw[i];
-			}
-			if (l4_len & 1) {
-				__u8 *tail = (__u8 *)tw + (n_words << 1);
-				if ((void *)(tail + 1) <= data_end)
-					tcp_csum += ((__u16)*tail) << 8;
-			}
-			tcp->check = (__sum16)~csum_fold(tcp_csum);
-		}
+		/* Incremental checksum: adjust for IPv6→IPv4 pseudo-header
+		 * change + source port change.  finalize_csum_partial()
+		 * was called before adjust_head so orig_l4_csum is a
+		 * complete checksum for both native and generic XDP. */
+		tcp->check = csum_v6_to_v4(orig_l4_csum,
+					    orig_src_v6, orig_dst_v6,
+					    v4_src, v4_dst,
+					    orig_proto, ip4_proto, l4_len,
+					    old_sport, new_sport);
 	} else if (ip4_proto == PROTO_UDP) {
 		struct udphdr *udp = l4;
 		if ((void *)(udp + 1) > data_end)
 			return XDP_DROP;
 		udp->source = new_sport;
 
-		/* UDP checksum: same CHECKSUM_PARTIAL split as TCP. */
-		udp->check = 0;
-		__u32 udp_csum = 0;
-		udp_csum += (v4_src >> 16) + (v4_src & 0xFFFF);
-		udp_csum += (v4_dst >> 16) + (v4_dst & 0xFFFF);
-		udp_csum += bpf_htons((__u16)PROTO_UDP);
-		udp_csum += bpf_htons(l4_len);
-
-		if (meta->csum_partial) {
-			udp->check = (__sum16)csum_fold(udp_csum);
-		} else {
-			__u16 *uw = (__u16 *)udp;
-			__u16 udp_n_words = l4_len >> 1;
-			if (udp_n_words > 750)
-				udp_n_words = 750;
-			#pragma unroll 1
-			for (__u16 i = 0; i < 750; i++) {
-				if (i >= udp_n_words)
-					break;
-				if ((void *)(&uw[i] + 1) > data_end)
-					break;
-				udp_csum += uw[i];
-			}
-			if (l4_len & 1) {
-				__u8 *utail = (__u8 *)uw + (udp_n_words << 1);
-				if ((void *)(utail + 1) <= data_end)
-					udp_csum += ((__u16)*utail) << 8;
-			}
-			udp->check = (__sum16)~csum_fold(udp_csum);
-			if (udp->check == 0)
-				udp->check = 0xFFFF;
-		}
+		udp->check = csum_v6_to_v4(orig_l4_csum,
+					    orig_src_v6, orig_dst_v6,
+					    v4_src, v4_dst,
+					    orig_proto, ip4_proto, l4_len,
+					    old_sport, new_sport);
+		if (udp->check == 0)
+			udp->check = 0xFFFF;
 	} else if (ip4_proto == PROTO_ICMP) {
 		struct icmphdr *icmp = l4;
 		if ((void *)(icmp + 1) > data_end)

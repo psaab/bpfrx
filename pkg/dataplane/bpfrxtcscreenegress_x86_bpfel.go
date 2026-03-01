@@ -602,12 +602,6 @@ type bpfrxTcScreenEgressZoneConfig struct {
 	Pad              [3]uint8
 }
 
-type bpfrxTcScreenEgressZonePairKey struct {
-	_        structs.HostLayout
-	FromZone uint16
-	ToZone   uint16
-}
-
 // loadBpfrxTcScreenEgress returns the embedded CollectionSpec for bpfrxTcScreenEgress.
 func loadBpfrxTcScreenEgress() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_BpfrxTcScreenEgressBytes)

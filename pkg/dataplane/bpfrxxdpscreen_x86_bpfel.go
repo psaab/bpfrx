@@ -602,12 +602,6 @@ type bpfrxXdpScreenZoneConfig struct {
 	Pad              [3]uint8
 }
 
-type bpfrxXdpScreenZonePairKey struct {
-	_        structs.HostLayout
-	FromZone uint16
-	ToZone   uint16
-}
-
 // loadBpfrxXdpScreen returns the embedded CollectionSpec for bpfrxXdpScreen.
 func loadBpfrxXdpScreen() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_BpfrxXdpScreenBytes)

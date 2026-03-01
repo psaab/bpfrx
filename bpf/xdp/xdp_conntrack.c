@@ -56,6 +56,11 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		if (new_state == SESS_STATE_CLOSED &&
 		    (meta->meta_flags & META_FLAG_KERNEL_ROUTE))
 			new_state = sess->state;
+		/* Single flow_config lookup for both RST suppress
+		 * and rst-invalidate-session expire below. */
+		__u32 fc_z = 0;
+		struct flow_config *fc =
+			bpf_map_lookup_elem(&flow_config_map, &fc_z);
 		/* Suppress RST→CLOSED for ESTABLISHED sessions.
 		 * Without TCP sequence number validation, a single
 		 * spurious RST (packet corruption, out-of-window
@@ -68,10 +73,6 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		 * overrides for users who want strict RST handling. */
 		if (new_state == SESS_STATE_CLOSED &&
 		    sess->state == SESS_STATE_ESTABLISHED) {
-			__u32 z = 0;
-			struct flow_config *fc =
-				bpf_map_lookup_elem(
-					&flow_config_map, &z);
 			if (!fc || !(fc->tcp_flags &
 				     FLOW_TCP_RST_INVALIDATE))
 				new_state = sess->state;
@@ -100,10 +101,6 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 			/* rst-invalidate-session: expire immediately
 			 * so next GC sweep deletes both entries. */
 			if (new_state == SESS_STATE_CLOSED) {
-				__u32 z = 0;
-				struct flow_config *fc =
-					bpf_map_lookup_elem(
-						&flow_config_map, &z);
 				if (fc && (fc->tcp_flags &
 					   FLOW_TCP_RST_INVALIDATE)) {
 					sess->timeout = 0;
@@ -198,14 +195,15 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		if (new_state == SESS_STATE_CLOSED &&
 		    (meta->meta_flags & META_FLAG_KERNEL_ROUTE))
 			new_state = sess->state;
+		/* Single flow_config lookup for both RST suppress
+		 * and rst-invalidate-session expire below. */
+		__u32 fc_z = 0;
+		struct flow_config *fc =
+			bpf_map_lookup_elem(&flow_config_map, &fc_z);
 		/* Suppress RST→CLOSED for ESTABLISHED sessions.
 		 * See handle_ct_hit_v4 for full explanation. */
 		if (new_state == SESS_STATE_CLOSED &&
 		    sess->state == SESS_STATE_ESTABLISHED) {
-			__u32 z = 0;
-			struct flow_config *fc =
-				bpf_map_lookup_elem(
-					&flow_config_map, &z);
 			if (!fc || !(fc->tcp_flags &
 				     FLOW_TCP_RST_INVALIDATE))
 				new_state = sess->state;
@@ -229,10 +227,6 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 
 			/* rst-invalidate-session: expire immediately */
 			if (new_state == SESS_STATE_CLOSED) {
-				__u32 z = 0;
-				struct flow_config *fc =
-					bpf_map_lookup_elem(
-						&flow_config_map, &z);
 				if (fc && (fc->tcp_flags &
 					   FLOW_TCP_RST_INVALIDATE)) {
 					sess->timeout = 0;
@@ -732,6 +726,9 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 	if (!meta)
 		return XDP_DROP;
 
+	/* Single flow_config lookup: reused for MSS clamp, allow-dns-reply. */
+	struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &zero);
+
 	/* TCP MSS clamping on SYN packets.
 	 * For CHECKSUM_PARTIAL, csum_partial=1 tells tcp_mss_clamp to
 	 * skip the incremental checksum update.  The MSS option bytes
@@ -739,7 +736,6 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 	 * finalization (generic XDP), so the final checksum will be
 	 * correct even though we modified the MSS value. */
 	if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x02)) {
-		struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &zero);
 		if (fc) {
 			__u16 mss = fc->tcp_mss_ipsec;
 			if (fc->tcp_mss_gre_in > 0 && (fc->tcp_mss_gre_in < mss || mss == 0))
@@ -864,9 +860,6 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 				 * a matching session. */
 				if (meta->protocol == PROTO_UDP &&
 				    meta->src_port == __bpf_htons(53)) {
-					struct flow_config *fc =
-						bpf_map_lookup_elem(
-						&flow_config_map, &zero);
 					if (fc && fc->allow_dns_reply) {
 						bpf_tail_call(ctx, &xdp_progs,
 							XDP_PROG_FORWARD);
@@ -945,9 +938,6 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 				 * a matching session. */
 				if (meta->protocol == PROTO_UDP &&
 				    meta->src_port == __bpf_htons(53)) {
-					struct flow_config *fc =
-						bpf_map_lookup_elem(
-						&flow_config_map, &zero);
 					if (fc && fc->allow_dns_reply) {
 						bpf_tail_call(ctx, &xdp_progs,
 							XDP_PROG_FORWARD);

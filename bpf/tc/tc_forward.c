@@ -81,14 +81,19 @@ int tc_forward_prog(struct __sk_buff *skb)
 		int do_mirror = 1;
 
 		if (rate > 1) {
-			/* Simple 1-in-N sampling using a per-CPU counter */
+			/* 1-in-N sampling using a per-CPU counter.
+			 * Power-of-2 rates use cheap bitmask;
+			 * others fall back to modulo. */
 			__u32 mirror_ctr_key = 0;
 			__u64 *cnt = bpf_map_lookup_elem(&mirror_counter, &mirror_ctr_key);
 			if (cnt) {
-				__u64 cur = *cnt;
-				__sync_fetch_and_add(cnt, 1);
-				if (cur % rate != 0)
+				__u64 cur = (*cnt)++;
+				if ((rate & (rate - 1)) == 0) {
+					if (cur & (rate - 1))
+						do_mirror = 0;
+				} else if (cur % rate != 0) {
 					do_mirror = 0;
+				}
 			}
 		}
 

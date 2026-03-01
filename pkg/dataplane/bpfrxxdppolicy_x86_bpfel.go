@@ -629,12 +629,6 @@ type bpfrxXdpPolicyZoneConfig struct {
 	Pad              [3]uint8
 }
 
-type bpfrxXdpPolicyZonePairKey struct {
-	_        structs.HostLayout
-	FromZone uint16
-	ToZone   uint16
-}
-
 // loadBpfrxXdpPolicy returns the embedded CollectionSpec for bpfrxXdpPolicy.
 func loadBpfrxXdpPolicy() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_BpfrxXdpPolicyBytes)

@@ -20,7 +20,8 @@
  */
 static __always_inline int
 zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
-		  struct session_value *sess, __u8 direction)
+		  struct session_value *sess, __u8 direction,
+		  struct flow_config *fc)
 {
 	__u64 now = meta->ktime_ns / 1000000000ULL;
 
@@ -54,10 +55,6 @@ zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		 * rst-invalidate-session is configured. */
 		if (new_state == SESS_STATE_CLOSED &&
 		    sess->state == SESS_STATE_ESTABLISHED) {
-			__u32 z = 0;
-			struct flow_config *fc =
-				bpf_map_lookup_elem(
-					&flow_config_map, &z);
 			if (!fc || !(fc->tcp_flags &
 				     FLOW_TCP_RST_INVALIDATE))
 				new_state = sess->state;
@@ -127,7 +124,8 @@ zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
  */
 static __always_inline int
 zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
-		  struct session_value_v6 *sess, __u8 direction)
+		  struct session_value_v6 *sess, __u8 direction,
+		  struct flow_config *fc)
 {
 	__u64 now = meta->ktime_ns / 1000000000ULL;
 
@@ -156,10 +154,6 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		 * (same fix as zone_ct_update_v4 / xdp_conntrack). */
 		if (new_state == SESS_STATE_CLOSED &&
 		    sess->state == SESS_STATE_ESTABLISHED) {
-			__u32 z = 0;
-			struct flow_config *fc =
-				bpf_map_lookup_elem(
-					&flow_config_map, &z);
 			if (!fc || !(fc->tcp_flags &
 				     FLOW_TCP_RST_INVALIDATE))
 				new_state = sess->state;
@@ -387,6 +381,38 @@ apply_dnat_before_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 	}
 }
 
+/*
+ * Resolve FIB result: translate ifindex to physical interface + VLAN,
+ * populate meta forwarding fields, and look up egress zone.
+ * Returns the iface_zone_value pointer (NULL if zone not found).
+ */
+static __always_inline struct iface_zone_value *
+resolve_fib_result(struct pkt_meta *meta, struct bpf_fib_lookup *fib)
+{
+	__u32 egress_if = fib->ifindex;
+	__u16 egress_vlan = 0;
+	struct vlan_iface_info *vi =
+		bpf_map_lookup_elem(&vlan_iface_map, &egress_if);
+	if (vi) {
+		egress_if = vi->parent_ifindex;
+		egress_vlan = vi->vlan_id;
+	}
+	meta->fwd_ifindex = egress_if;
+	meta->egress_vlan_id = egress_vlan;
+	__builtin_memcpy(meta->fwd_dmac, fib->dmac, ETH_ALEN);
+	__builtin_memcpy(meta->fwd_smac, fib->smac, ETH_ALEN);
+
+	struct iface_zone_key ezk = {
+		.ifindex = egress_if,
+		.vlan_id = egress_vlan,
+	};
+	struct iface_zone_value *ezv =
+		bpf_map_lookup_elem(&iface_zone_map, &ezk);
+	if (ezv)
+		meta->egress_zone = ezv->zone_id;
+	return ezv;
+}
+
 SEC("xdp")
 int xdp_zone_prog(struct xdp_md *ctx)
 {
@@ -394,6 +420,16 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	struct pkt_meta *meta = bpf_map_lookup_elem(&pkt_meta_scratch, &zero);
 	if (!meta)
 		return XDP_DROP;
+
+	/* Single flow_config lookup: passed to zone_ct_update and
+	 * reused for allow_embedded_icmp check below. */
+	struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &zero);
+
+	/* Cache fabric_fwd_info once: reused for zone-encoded MAC check,
+	 * fabric ingress detection, and re-FIB non-VRF ifindex overrides. */
+	struct fabric_fwd_info *ff_cached =
+		bpf_map_lookup_elem(&fabric_fwd, &zero);
+
 	/*
 	 * VRRP multicast (224.0.0.18, proto 112) — pass to host before zone
 	 * lookup.  xdp_main already stripped the VLAN tag for pipeline use;
@@ -420,10 +456,7 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		    zeth->h_source[1] == 0xbf &&
 		    zeth->h_source[2] == 0x72 &&
 		    zeth->h_source[3] == FABRIC_ZONE_MAC_MAGIC) {
-			__u32 zero_ff = 0;
-			struct fabric_fwd_info *ff =
-				bpf_map_lookup_elem(&fabric_fwd, &zero_ff);
-			if (ff && ctx->ingress_ifindex == ff->ifindex) {
+			if (ff_cached && ctx->ingress_ifindex == ff_cached->ifindex) {
 				meta->ingress_zone = zeth->h_source[5];
 				/* Force main routing table — fabric is
 				 * in vrf-mgmt, but the decoded zone's
@@ -437,26 +470,10 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		}
 	}
 
-	/* Look up ingress zone from {ifindex, vlan_id} composite key */
-	struct iface_zone_key izk = {
-		.ifindex = meta->ingress_ifindex,
-		.vlan_id = meta->ingress_vlan_id,
-	};
-	struct iface_zone_value *izv = bpf_map_lookup_elem(&iface_zone_map, &izk);
-	if (!izv) {
-		/* Interface not assigned to any zone -- drop */
-		inc_counter(GLOBAL_CTR_DROPS);
-		return XDP_DROP;
-	}
-	meta->ingress_zone = izv->zone_id;
-	if (izv->flags & IFACE_FLAG_TUNNEL)
-		meta->meta_flags |= META_FLAG_TUNNEL;
-	inc_zone_ingress((__u32)izv->zone_id, meta->pkt_len);
-
-	/* Set VRF routing table from interface's routing instance.
-	 * Firewall filter PBR (already set in xdp_main) takes priority. */
-	if (meta->routing_table == 0 && izv->routing_table != 0)
-		meta->routing_table = izv->routing_table;
+	/* Zone, tunnel flag, and routing table were already resolved
+	 * by xdp_screen (which always runs before xdp_zone).  Skip the
+	 * duplicate iface_zone_map HASH lookup; just increment counter. */
+	inc_zone_ingress((__u32)meta->ingress_zone, meta->pkt_len);
 
 	/* Mark fabric-ingress traffic so later stages can bypass
 	 * policy for sessionless return traffic (the peer already
@@ -468,13 +485,8 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	 * table override to main (254) is applied after the session
 	 * lookup, only when a synced session exists (forwarded traffic).
 	 * Zone-encoded packets already set routing_table=254 above. */
-	{
-		__u32 ff_key = 0;
-		struct fabric_fwd_info *ff =
-			bpf_map_lookup_elem(&fabric_fwd, &ff_key);
-		if (ff && ctx->ingress_ifindex == ff->ifindex)
-			meta->meta_flags |= META_FLAG_FABRIC_FWD;
-	}
+	if (ff_cached && ctx->ingress_ifindex == ff_cached->ifindex)
+		meta->meta_flags |= META_FLAG_FABRIC_FWD;
 
 zone_resolved:
 	;
@@ -712,7 +724,7 @@ zone_resolved:
 			__builtin_memcpy(meta->fwd_smac, sv4->fib_smac, 6);
 			meta->egress_zone    = sv4->egress_zone;
 			return zone_ct_update_v4(ctx, meta, sv4,
-						 ct_direction);
+						 ct_direction, fc);
 		}
 	} else if (!is_tcp_syn) {
 		struct session_key_v6 sk6 = {};
@@ -748,7 +760,7 @@ zone_resolved:
 			__builtin_memcpy(meta->fwd_smac, sv6->fib_smac, 6);
 			meta->egress_zone    = sv6->egress_zone;
 			return zone_ct_update_v6(ctx, meta, sv6,
-						 ct_direction);
+						 ct_direction, fc);
 		}
 	}
 
@@ -788,11 +800,8 @@ zone_resolved:
 	 * the VRF table instead of the requested main table.  Override with a
 	 * non-VRF data-plane ifindex stored in fabric_fwd. */
 	if (meta->routing_table == 254) {
-		__u32 ff_key = 0;
-		struct fabric_fwd_info *ff_fib =
-			bpf_map_lookup_elem(&fabric_fwd, &ff_key);
-		if (ff_fib && ff_fib->fib_ifindex)
-			fib.ifindex = ff_fib->fib_ifindex;
+		if (ff_cached && ff_cached->fib_ifindex)
+			fib.ifindex = ff_cached->fib_ifindex;
 	}
 
 	if (meta->addr_family == AF_INET) {
@@ -812,25 +821,7 @@ zone_resolved:
 	TRACE_FIB_RESULT(rc, fib.ifindex);
 
 	if (rc == BPF_FIB_LKUP_RET_SUCCESS) {
-		/* Store forwarding info -- resolve VLAN sub-interface */
-		__u32 egress_if = fib.ifindex;
-		__u16 egress_vlan = 0;
-		__u32 egress_phys_if = egress_if;
-		struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map, &egress_if);
-		if (vi) {
-			egress_phys_if = vi->parent_ifindex;
-			egress_vlan = vi->vlan_id;
-		}
-		meta->fwd_ifindex = egress_phys_if;
-		meta->egress_vlan_id = egress_vlan;
-		__builtin_memcpy(meta->fwd_dmac, fib.dmac, ETH_ALEN);
-		__builtin_memcpy(meta->fwd_smac, fib.smac, ETH_ALEN);
-
-		/* Look up egress zone using {physical_ifindex, vlan_id} */
-		struct iface_zone_key ezk = { .ifindex = egress_phys_if, .vlan_id = egress_vlan };
-		struct iface_zone_value *ezv = bpf_map_lookup_elem(&iface_zone_map, &ezk);
-		if (ezv)
-			meta->egress_zone = ezv->zone_id;
+		struct iface_zone_value *ezv = resolve_fib_result(meta, &fib);
 
 		/* Fabric transit auto-forward: post-NAT packets from
 		 * peer that went through KERNEL_ROUTE + NAT reversal +
@@ -944,7 +935,7 @@ zone_resolved:
 			__builtin_memcpy(sv4->fib_dmac, meta->fwd_dmac, 6);
 			__builtin_memcpy(sv4->fib_smac, meta->fwd_smac, 6);
 			sv4->fib_gen = (__u16)fib_gen;
-			return zone_ct_update_v4(ctx, meta, sv4, ct_direction);
+			return zone_ct_update_v4(ctx, meta, sv4, ct_direction, fc);
 		}
 		if (sv6) {
 			sv6->fib_ifindex = meta->fwd_ifindex;
@@ -952,7 +943,7 @@ zone_resolved:
 			__builtin_memcpy(sv6->fib_dmac, meta->fwd_dmac, 6);
 			__builtin_memcpy(sv6->fib_smac, meta->fwd_smac, 6);
 			sv6->fib_gen = (__u16)fib_gen;
-			return zone_ct_update_v6(ctx, meta, sv6, ct_direction);
+			return zone_ct_update_v6(ctx, meta, sv6, ct_direction, fc);
 		}
 
 		/* Plain fabric redirect without local session: the peer
@@ -979,14 +970,8 @@ zone_resolved:
 			fib2.tbid        = 254; /* RT_TABLE_MAIN */
 			/* Use non-VRF ifindex for main table lookup */
 			fib2.ifindex = meta->ingress_ifindex;
-			{
-				__u32 ff2_key = 0;
-				struct fabric_fwd_info *ff2 =
-					bpf_map_lookup_elem(&fabric_fwd,
-							    &ff2_key);
-				if (ff2 && ff2->fib_ifindex)
-					fib2.ifindex = ff2->fib_ifindex;
-			}
+			if (ff_cached && ff_cached->fib_ifindex)
+				fib2.ifindex = ff_cached->fib_ifindex;
 			if (meta->addr_family == AF_INET) {
 				fib2.family   = AF_INET;
 				fib2.ipv4_src = meta->src_ip.v4;
@@ -1001,32 +986,7 @@ zone_resolved:
 			int rc2 = bpf_fib_lookup(ctx, &fib2,
 				sizeof(fib2), BPF_FIB_LOOKUP_TBID);
 			if (rc2 == BPF_FIB_LKUP_RET_SUCCESS) {
-				__u32 eg2 = fib2.ifindex;
-				__u16 ev2 = 0;
-				struct vlan_iface_info *vi2 =
-					bpf_map_lookup_elem(
-						&vlan_iface_map, &eg2);
-				if (vi2) {
-					eg2 = vi2->parent_ifindex;
-					ev2 = vi2->vlan_id;
-				}
-				meta->fwd_ifindex = eg2;
-				meta->egress_vlan_id = ev2;
-				__builtin_memcpy(meta->fwd_dmac,
-						 fib2.dmac, ETH_ALEN);
-				__builtin_memcpy(meta->fwd_smac,
-						 fib2.smac, ETH_ALEN);
-				/* Resolve egress zone for counters */
-				struct iface_zone_key ez2 = {
-					.ifindex = eg2,
-					.vlan_id = ev2,
-				};
-				struct iface_zone_value *ezv2 =
-					bpf_map_lookup_elem(
-						&iface_zone_map, &ez2);
-				if (ezv2)
-					meta->egress_zone =
-						ezv2->zone_id;
+				resolve_fib_result(meta, &fib2);
 				bpf_tail_call(ctx, &xdp_progs,
 					      XDP_PROG_FORWARD);
 			}
@@ -1182,17 +1142,10 @@ zone_resolved:
 					fib3.tbid = 254;
 					fib3.ifindex =
 						meta->ingress_ifindex;
-					{
-						__u32 ff3_key = 0;
-						struct fabric_fwd_info *ff3 =
-						    bpf_map_lookup_elem(
-							&fabric_fwd,
-							&ff3_key);
-						if (ff3 &&
-						    ff3->fib_ifindex)
-							fib3.ifindex =
-							    ff3->fib_ifindex;
-					}
+					if (ff_cached &&
+					    ff_cached->fib_ifindex)
+						fib3.ifindex =
+						    ff_cached->fib_ifindex;
 					if (meta->addr_family ==
 					    AF_INET) {
 						fib3.family = AF_INET;
@@ -1216,41 +1169,8 @@ zone_resolved:
 						BPF_FIB_LOOKUP_TBID);
 					if (rc3 ==
 					    BPF_FIB_LKUP_RET_SUCCESS) {
-						__u32 eg3 = fib3.ifindex;
-						__u16 ev3 = 0;
-						struct vlan_iface_info
-							*vi3 =
-						    bpf_map_lookup_elem(
-							&vlan_iface_map,
-							&eg3);
-						if (vi3) {
-							eg3 =
-							    vi3->parent_ifindex;
-							ev3 =
-							    vi3->vlan_id;
-						}
-						meta->fwd_ifindex = eg3;
-						meta->egress_vlan_id = ev3;
-						__builtin_memcpy(
-							meta->fwd_dmac,
-							fib3.dmac,
-							ETH_ALEN);
-						__builtin_memcpy(
-							meta->fwd_smac,
-							fib3.smac,
-							ETH_ALEN);
-						struct iface_zone_key ez3 = {
-							.ifindex = eg3,
-							.vlan_id = ev3,
-						};
-						struct iface_zone_value
-							*ezv3 =
-						    bpf_map_lookup_elem(
-							&iface_zone_map,
-							&ez3);
-						if (ezv3)
-							meta->egress_zone =
-							    ezv3->zone_id;
+						resolve_fib_result(
+							meta, &fib3);
 						bpf_tail_call(
 							ctx,
 							&xdp_progs,
@@ -1379,8 +1299,6 @@ zone_resolved:
 		    (meta->protocol == PROTO_ICMPV6 &&
 		     (meta->icmp_type == 1 || meta->icmp_type == 3 ||
 		      meta->icmp_type == 4))) {
-			struct flow_config *fc =
-				bpf_map_lookup_elem(&flow_config_map, &zero);
 			if (fc && fc->allow_embedded_icmp) {
 				bpf_tail_call(ctx, &xdp_progs,
 					      XDP_PROG_CONNTRACK);

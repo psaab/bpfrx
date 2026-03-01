@@ -327,6 +327,9 @@ const (
 	ActionReject = 2
 )
 
+// MaxZones must match MAX_ZONES in bpfrx_common.h.
+const MaxZones = 64
+
 // MaxRulesPerPolicy is the maximum number of rules in a single policy set.
 const MaxRulesPerPolicy = 256
 

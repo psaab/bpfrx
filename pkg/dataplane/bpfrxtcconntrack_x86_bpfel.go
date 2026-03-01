@@ -602,12 +602,6 @@ type bpfrxTcConntrackZoneConfig struct {
 	Pad              [3]uint8
 }
 
-type bpfrxTcConntrackZonePairKey struct {
-	_        structs.HostLayout
-	FromZone uint16
-	ToZone   uint16
-}
-
 // loadBpfrxTcConntrack returns the embedded CollectionSpec for bpfrxTcConntrack.
 func loadBpfrxTcConntrack() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_BpfrxTcConntrackBytes)

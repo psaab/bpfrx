@@ -167,9 +167,9 @@ struct policy_rule {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, MAX_ZONES * MAX_ZONES);
-	__type(key, struct zone_pair_key);
+	__type(key, __u32);
 	__type(value, struct policy_set);
 } zone_pair_policies SEC(".maps");
 
@@ -305,7 +305,7 @@ struct {
  * ============================================================ */
 
 struct {
-	__uint(type, BPF_MAP_TYPE_DEVMAP_HASH);
+	__uint(type, BPF_MAP_TYPE_DEVMAP);
 	__uint(max_entries, MAX_INTERFACES);
 	__type(key, __u32);
 	__type(value, struct bpf_devmap_val);

@@ -602,12 +602,6 @@ type bpfrxTcMainZoneConfig struct {
 	Pad              [3]uint8
 }
 
-type bpfrxTcMainZonePairKey struct {
-	_        structs.HostLayout
-	FromZone uint16
-	ToZone   uint16
-}
-
 // loadBpfrxTcMain returns the embedded CollectionSpec for bpfrxTcMain.
 func loadBpfrxTcMain() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_BpfrxTcMainBytes)

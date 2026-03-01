@@ -1095,19 +1095,17 @@ int xdp_policy_prog(struct xdp_md *ctx)
 	if (!meta)
 		return XDP_DROP;
 
-	/* Build zone-pair key */
-	struct zone_pair_key zpk = {
-		.from_zone = meta->ingress_zone,
-		.to_zone   = meta->egress_zone,
-	};
+	/* Build zone-pair flat index for ARRAY lookup */
+	__u32 zp_idx = (__u32)meta->ingress_zone * MAX_ZONES +
+		       (__u32)meta->egress_zone;
 
-	struct policy_set *ps = bpf_map_lookup_elem(&zone_pair_policies, &zpk);
-	if (!ps) {
-		/* No zone-pair policy: try global policies (from_zone=0, to_zone=0) */
-		struct zone_pair_key global_zpk = { .from_zone = 0, .to_zone = 0 };
-		ps = bpf_map_lookup_elem(&zone_pair_policies, &global_zpk);
+	struct policy_set *ps = bpf_map_lookup_elem(&zone_pair_policies, &zp_idx);
+	if (!ps || ps->num_rules == 0) {
+		/* No zone-pair policy: try global policies (index 0) */
+		__u32 global_idx = 0;
+		ps = bpf_map_lookup_elem(&zone_pair_policies, &global_idx);
 	}
-	if (!ps) {
+	if (!ps || ps->num_rules == 0) {
 		/* No zone-pair or global policy: check default policy */
 		__u32 dp_key = 0;
 		__u8 *dp = bpf_map_lookup_elem(&default_policy, &dp_key);

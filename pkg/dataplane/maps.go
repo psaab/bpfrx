@@ -23,12 +23,14 @@ func (m *Manager) SetZoneConfig(zoneID uint16, cfg ZoneConfig) error {
 }
 
 // SetZonePairPolicy writes a zone-pair policy set entry.
+// The zone_pair_policies map is an ARRAY keyed by flat index:
+// from_zone * MaxZones + to_zone.
 func (m *Manager) SetZonePairPolicy(fromZone, toZone uint16, ps PolicySet) error {
 	zm, ok := m.maps["zone_pair_policies"]
 	if !ok {
 		return fmt.Errorf("zone_pair_policies map not found")
 	}
-	key := ZonePairKey{FromZone: fromZone, ToZone: toZone}
+	key := uint32(fromZone)*MaxZones + uint32(toZone)
 	return zm.Update(key, ps, ebpf.UpdateAny)
 }
 
@@ -231,21 +233,21 @@ func (m *Manager) GetSessionV6(key SessionKeyV6) (SessionValueV6, error) {
 	return val, nil
 }
 
-// ClearZonePairPolicies deletes all zone-pair policy entries.
+// ClearZonePairPolicies zeros all zone-pair policy entries.
+// The map is an ARRAY so entries cannot be deleted — zero means "no policy".
 func (m *Manager) ClearZonePairPolicies() error {
 	zm, ok := m.maps["zone_pair_policies"]
 	if !ok {
 		return fmt.Errorf("zone_pair_policies map not found")
 	}
-	var key ZonePairKey
+	zeroPS := PolicySet{}
+	var key uint32
+	var val PolicySet
 	iter := zm.Iterate()
-	var keys []ZonePairKey
-	var val []byte
 	for iter.Next(&key, &val) {
-		keys = append(keys, key)
-	}
-	for _, k := range keys {
-		zm.Delete(k)
+		if val.NumRules > 0 {
+			zm.Update(key, zeroPS, ebpf.UpdateAny)
+		}
 	}
 	return nil
 }
@@ -1438,26 +1440,32 @@ func (m *Manager) DeleteStaleVlanIface(written map[uint32]bool) {
 	}
 }
 
-// DeleteStaleZonePairPolicies removes zone_pair_policies entries not in the written set.
+// DeleteStaleZonePairPolicies zeros zone_pair_policies entries not in the written set.
+// The map is an ARRAY so entries cannot be deleted — zero means "no policy".
 func (m *Manager) DeleteStaleZonePairPolicies(written map[ZonePairKey]bool) {
 	zm, ok := m.maps["zone_pair_policies"]
 	if !ok {
 		return
 	}
-	var key ZonePairKey
-	var val []byte
+	zeroPS := PolicySet{}
+	var key uint32
+	var val PolicySet
 	iter := zm.Iterate()
-	var stale []ZonePairKey
+	count := 0
 	for iter.Next(&key, &val) {
-		if !written[key] {
-			stale = append(stale, key)
+		if val.NumRules == 0 {
+			continue // already empty
+		}
+		fromZone := uint16(key / MaxZones)
+		toZone := uint16(key % MaxZones)
+		zpk := ZonePairKey{FromZone: fromZone, ToZone: toZone}
+		if !written[zpk] {
+			zm.Update(key, zeroPS, ebpf.UpdateAny)
+			count++
 		}
 	}
-	for _, k := range stale {
-		zm.Delete(k)
-	}
-	if len(stale) > 0 {
-		slog.Info("deleted stale zone_pair_policies entries", "count", len(stale))
+	if count > 0 {
+		slog.Info("zeroed stale zone_pair_policies entries", "count", count)
 	}
 }
 

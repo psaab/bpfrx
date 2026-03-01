@@ -680,7 +680,7 @@ inc_counter(__u32 ctr_idx)
 {
 	__u64 *ctr = bpf_map_lookup_elem(&global_counters, &ctr_idx);
 	if (ctr)
-		__sync_fetch_and_add(ctr, 1);
+		(*ctr)++;
 }
 
 /* Map a SCREEN_* flag bit to a per-screen-type counter index. */

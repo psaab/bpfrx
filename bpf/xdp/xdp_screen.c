@@ -652,20 +652,27 @@ int xdp_screen_prog(struct xdp_md *ctx)
 	if (!meta)
 		return XDP_DROP;
 
-	/* Look up ingress zone from {ifindex, vlan_id} composite key */
+	/* Look up ingress zone from {ifindex, vlan_id} composite key.
+	 * Resolve the full iface_zone_value here so xdp_zone can skip
+	 * the duplicate HASH lookup (zone, flags, routing_table carried
+	 * in meta). */
 	struct iface_zone_key zk = {
 		.ifindex = meta->ingress_ifindex,
 		.vlan_id = meta->ingress_vlan_id,
 	};
-	__u16 *zone_ptr = bpf_map_lookup_elem(&iface_zone_map, &zk);
-	if (!zone_ptr) {
+	struct iface_zone_value *izv = bpf_map_lookup_elem(&iface_zone_map, &zk);
+	if (!izv) {
 		inc_counter(GLOBAL_CTR_DROPS);
 		return XDP_DROP;
 	}
-	meta->ingress_zone = *zone_ptr;
+	meta->ingress_zone = izv->zone_id;
+	if (izv->flags & IFACE_FLAG_TUNNEL)
+		meta->meta_flags |= META_FLAG_TUNNEL;
+	if (izv->routing_table != 0)
+		meta->routing_table = izv->routing_table;
 
 	/* Look up zone config to find screen profile ID */
-	__u32 zone_key = (__u32)*zone_ptr;
+	__u32 zone_key = (__u32)izv->zone_id;
 	struct zone_config *zc = bpf_map_lookup_elem(&zone_configs, &zone_key);
 	if (!zc || zc->screen_profile_id == 0) {
 		/* No screen profile assigned -- fast path to zone */

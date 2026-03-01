@@ -602,12 +602,6 @@ type bpfrxTcNatZoneConfig struct {
 	Pad              [3]uint8
 }
 
-type bpfrxTcNatZonePairKey struct {
-	_        structs.HostLayout
-	FromZone uint16
-	ToZone   uint16
-}
-
 // loadBpfrxTcNat returns the embedded CollectionSpec for bpfrxTcNat.
 func loadBpfrxTcNat() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_BpfrxTcNatBytes)

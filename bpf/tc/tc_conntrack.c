@@ -107,9 +107,12 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 	if (!meta)
 		return TC_ACT_SHOT;
 
+	/* Single flow_config lookup: reused for MSS clamp and
+	 * allow_embedded_icmp check below. */
+	struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &zero);
+
 	/* TCP MSS clamping on egress SYN packets (gre-out / ipsec-vpn). */
 	if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x02)) {
-		struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &zero);
 		if (fc) {
 			__u16 mss = fc->tcp_mss_gre_out;
 			if (fc->tcp_mss_ipsec > 0 && (fc->tcp_mss_ipsec < mss || mss == 0))
@@ -183,9 +186,6 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 		    (meta->protocol == PROTO_ICMPV6 &&
 		     (meta->icmp_type == 1 || meta->icmp_type == 3 ||
 		      meta->icmp_type == 4))) {
-			__u32 fc_key = 0;
-			struct flow_config *fc =
-				bpf_map_lookup_elem(&flow_config_map, &fc_key);
 			if (fc && fc->allow_embedded_icmp) {
 				bpf_tail_call(skb, &tc_progs,
 					      TC_PROG_FORWARD);

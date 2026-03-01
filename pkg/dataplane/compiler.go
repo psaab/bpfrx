@@ -50,6 +50,58 @@ type CompileResult struct {
 	// ManagedInterfaces describes all interfaces managed by the firewall,
 	// used by the networkd manager to generate .link and .network files.
 	ManagedInterfaces []networkd.InterfaceConfig
+
+	// ifCache avoids redundant net.InterfaceByName and netlink.LinkByName
+	// syscalls across compile phases. Lazily populated on first access.
+	ifCache    map[string]*net.Interface
+	linkCache  map[string]netlink.Link // by name
+	linkIdxMap map[int]netlink.Link    // by ifindex
+}
+
+// cachedInterfaceByName returns a cached *net.Interface, performing the
+// syscall only on the first lookup for each name.
+func (r *CompileResult) cachedInterfaceByName(name string) (*net.Interface, error) {
+	if iface, ok := r.ifCache[name]; ok {
+		return iface, nil
+	}
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return nil, err
+	}
+	r.ifCache[name] = iface
+	return iface, nil
+}
+
+// cachedLinkByName returns a cached netlink.Link, performing the
+// RTM_GETLINK syscall only on the first lookup for each name.
+func (r *CompileResult) cachedLinkByName(name string) (netlink.Link, error) {
+	if link, ok := r.linkCache[name]; ok {
+		return link, nil
+	}
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return nil, err
+	}
+	r.linkCache[name] = link
+	r.linkIdxMap[link.Attrs().Index] = link
+	return link, nil
+}
+
+// cachedLinkByIndex returns a cached netlink.Link, performing the
+// RTM_GETLINK syscall only on the first lookup for each index.
+func (r *CompileResult) cachedLinkByIndex(idx int) (netlink.Link, error) {
+	if link, ok := r.linkIdxMap[idx]; ok {
+		return link, nil
+	}
+	link, err := netlink.LinkByIndex(idx)
+	if err != nil {
+		return nil, err
+	}
+	r.linkIdxMap[idx] = link
+	if name := link.Attrs().Name; name != "" {
+		r.linkCache[name] = link
+	}
+	return link, nil
 }
 
 // CompileConfig translates a typed Config into dataplane table entries.
@@ -74,6 +126,9 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		NATCounterIDs:    make(map[string]uint16),
 		Lo0FilterV4:      0xFFFFFFFF, // sentinel: no lo0 filter
 		Lo0FilterV6:      0xFFFFFFFF,
+		ifCache:          make(map[string]*net.Interface),
+		linkCache:        make(map[string]netlink.Link),
+		linkIdxMap:       make(map[int]netlink.Link),
 	}
 
 	// Phase 1: Assign zone IDs (1-based; 0 = unassigned).
@@ -169,7 +224,7 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 	}
 
 	// Phase 11: Compile port mirroring
-	if err := compilePortMirroring(dp, cfg); err != nil {
+	if err := compilePortMirroring(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile port mirroring: %w", err)
 	}
 
@@ -490,8 +545,8 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		for _, ifaceRef := range zone.Interfaces {
 			physName, cfgName, unitNum, vlanID := resolveInterfaceRef(ifaceRef, cfg)
 
-			// Get the physical interface
-			physIface, err := net.InterfaceByName(physName)
+			// Get the physical interface (cached to avoid redundant syscalls)
+			physIface, err := result.cachedInterfaceByName(physName)
 			if err != nil {
 				slog.Warn("interface not found, skipping",
 					"interface", physName, "zone", name, "err", err)
@@ -536,7 +591,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				// Apply unit-level MTU to VLAN sub-interface
 				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
 					if unit, ok := ifCfg.Units[unitNum]; ok && unit.MTU > 0 {
-						if nl, err := netlink.LinkByName(subName); err == nil {
+						if nl, err := result.cachedLinkByName(subName); err == nil {
 							if nl.Attrs().MTU != unit.MTU {
 								if err := netlink.LinkSetMTU(nl, unit.MTU); err != nil {
 									slog.Warn("failed to set VLAN sub-interface MTU",
@@ -593,16 +648,17 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 					}
 				}
 
+				// Single cached netlink lookup for MTU, speed/duplex, and UP/DOWN.
+				nl, nlErr := result.cachedLinkByIndex(physIface.Index)
+
 				// Apply interface-level MTU from config
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg.MTU > 0 {
-					if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
-						if nl.Attrs().MTU != ifCfg.MTU {
-							if err := netlink.LinkSetMTU(nl, ifCfg.MTU); err != nil {
-								slog.Warn("failed to set MTU",
-									"name", physName, "mtu", ifCfg.MTU, "err", err)
-							} else {
-								slog.Info("set interface MTU", "name", physName, "mtu", ifCfg.MTU)
-							}
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg.MTU > 0 && nlErr == nil {
+					if nl.Attrs().MTU != ifCfg.MTU {
+						if err := netlink.LinkSetMTU(nl, ifCfg.MTU); err != nil {
+							slog.Warn("failed to set MTU",
+								"name", physName, "mtu", ifCfg.MTU, "err", err)
+						} else {
+							slog.Info("set interface MTU", "name", physName, "mtu", ifCfg.MTU)
 						}
 					}
 				}
@@ -621,7 +677,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				isDisabled := false
 				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg.Disable {
 					isDisabled = true
-					if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
+					if nlErr == nil {
 						if err := netlink.LinkSetDown(nl); err != nil {
 							slog.Warn("failed to bring disabled interface down",
 								"name", physName, "err", err)
@@ -629,7 +685,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 							slog.Info("interface administratively disabled", "name", physName)
 						}
 					}
-				} else if nl, err := netlink.LinkByIndex(physIface.Index); err == nil {
+				} else if nlErr == nil {
 					if err := netlink.LinkSetUp(nl); err != nil {
 						slog.Warn("failed to bring interface up",
 							"name", physName, "err", err)
@@ -673,7 +729,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				}
 				// Apply unit-level MTU (overrides interface-level MTU)
 				if unitMTU > 0 {
-					if nl, err := netlink.LinkByName(physName); err == nil {
+					if nl, err := result.cachedLinkByName(physName); err == nil {
 						if nl.Attrs().MTU != unitMTU {
 							if err := netlink.LinkSetMTU(nl, unitMTU); err != nil {
 								slog.Warn("failed to set unit MTU",
@@ -735,7 +791,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 
 		linuxName := config.LinuxIfName(ifName)
 		originalName := "" // kernel name before .link rename (for RETH recovery)
-		physIface, err := net.InterfaceByName(linuxName)
+		physIface, err := result.cachedInterfaceByName(linuxName)
 		if err != nil && isVRRPReth && cfg.Chassis.Cluster != nil {
 			// Interface not found under its config name — it may exist
 			// under its kernel name if the .link rename was lost. Search
@@ -771,7 +827,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			// matching. More reliable than MACAddress= because the MAC
 			// alternates between physical (boot) and virtual (daemon sets it).
 			if originalName == "" {
-				originalName = getOriginalKernelName(physIface.Name)
+				originalName = getOriginalKernelName(physIface.Name, result)
 				if originalName == "" {
 					originalName = readOriginalNameFromLink(linuxName)
 				}
@@ -783,7 +839,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			// Use permanent MAC when available to avoid writing the virtual
 			// MAC to the .link MACAddress field. If OriginalName is set,
 			// generateLink uses it instead of MACAddress anyway.
-			if permMAC := getPermAddr(physIface.Name); permMAC != "" {
+			if permMAC := getPermAddr(physIface.Name, result); permMAC != "" {
 				mac = permMAC
 			}
 		}
@@ -933,7 +989,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			}
 			seen[memberName] = true
 			var mac string
-			if iface, err := net.InterfaceByName(memberName); err == nil {
+			if iface, err := result.cachedInterfaceByName(memberName); err == nil {
 				mac = iface.HardwareAddr.String()
 			}
 			result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
@@ -1042,7 +1098,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 
 		// If this is a daemon-created bond/RETH that's no longer in config,
 		// delete the device entirely rather than marking it unmanaged.
-		nl, err := netlink.LinkByIndex(iface.Index)
+		nl, err := result.cachedLinkByIndex(iface.Index)
 		if err != nil {
 			continue
 		}
@@ -1674,6 +1730,13 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	v4RuleIdx := make(map[zonePairIdx]uint16)
 	v6RuleIdx := make(map[zonePairIdx]uint16)
 
+	// Cache compiled pool data to skip redundant parse+write when the same
+	// named pool is referenced by multiple SNAT rules.
+	type compiledPoolInfo struct {
+		hasV4, hasV6 bool
+	}
+	compiledPools := make(map[string]*compiledPoolInfo)
+
 	for _, rs := range natCfg.Source {
 		fromZone, ok := result.ZoneIDs[rs.FromZone]
 		if !ok {
@@ -1774,9 +1837,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 			}
 
 			var curPoolID uint8
-			var poolCfg NATPoolConfig
-			var v4IPs []net.IP
-			var v6IPs []net.IP
+			var hasV4, hasV6 bool
 
 			if rule.Then.Interface {
 				// Interface mode: populate snat_egress_ips with per-interface IPs
@@ -1788,10 +1849,14 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					continue
 				}
 
+				var poolCfg NATPoolConfig
+				var v4IPs []net.IP
+				var v6IPs []net.IP
+
 				for _, ifaceRef := range toZoneCfg.Interfaces {
 					physName, cfgName, unitNum, vlanID := resolveInterfaceRef(ifaceRef, cfg)
 
-					physIface, err := net.InterfaceByName(physName)
+					physIface, err := result.cachedInterfaceByName(physName)
 					if err != nil {
 						slog.Debug("interface not found for SNAT egress",
 							"interface", physName, "err", err)
@@ -1823,10 +1888,10 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						if vlanID > 0 {
 							subName = fmt.Sprintf("%s.%d", physName, vlanID)
 						}
-						if ip, ierr := getInterfaceIP(subName); ierr == nil {
+						if ip, ierr := getInterfaceIP(subName, result); ierr == nil {
 							unitV4 = ip
 						}
-						if ip, ierr := getInterfaceIPv6(subName); ierr == nil {
+						if ip, ierr := getInterfaceIPv6(subName, result); ierr == nil {
 							unitV6 = ip
 						}
 					}
@@ -1870,6 +1935,34 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 				poolCfg.PortHigh = 65535
 				curPoolID = poolID
 				poolID++
+				hasV4 = len(v4IPs) > 0
+				hasV6 = len(v6IPs) > 0
+
+				// Write pool IPs + config (interface pools are unique per rule)
+				poolCfg.NumIPs = uint16(len(v4IPs))
+				poolCfg.NumIPsV6 = uint16(len(v6IPs))
+				for i, ip := range v4IPs {
+					if i >= int(MaxNATPoolIPsPerPool) {
+						break
+					}
+					if err := dp.SetNATPoolIPV4(uint32(curPoolID), uint32(i), ipToUint32BE(ip)); err != nil {
+						return fmt.Errorf("set pool ip v4 %d/%d: %w", curPoolID, i, err)
+					}
+				}
+				for i, ip := range v6IPs {
+					if i >= int(MaxNATPoolIPsPerPool) {
+						break
+					}
+					if err := dp.SetNATPoolIPV6(uint32(curPoolID), uint32(i), ipTo16Bytes(ip)); err != nil {
+						return fmt.Errorf("set pool ip v6 %d/%d: %w", curPoolID, i, err)
+					}
+				}
+				if natCfg.AddressPersistent {
+					poolCfg.AddrPersistent = 1
+				}
+				if err := dp.SetNATPoolConfig(uint32(curPoolID), poolCfg); err != nil {
+					return fmt.Errorf("set pool config %d: %w", curPoolID, err)
+				}
 			} else {
 				// Pool mode: look up named pool
 				pool, ok := natCfg.SourcePools[rule.Then.PoolName]
@@ -1878,136 +1971,146 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						rule.Then.PoolName, rule.Name)
 				}
 
-				// Check if pool already has an ID assigned
-				if existingID, exists := result.PoolIDs[pool.Name]; exists {
-					curPoolID = existingID
+				// Check if pool was already compiled — skip parse+write, reuse cached info.
+				if cp, cached := compiledPools[pool.Name]; cached {
+					curPoolID = result.PoolIDs[pool.Name]
+					hasV4 = cp.hasV4
+					hasV6 = cp.hasV6
 				} else {
-					curPoolID = poolID
-					result.PoolIDs[pool.Name] = curPoolID
-					poolID++
-				}
-
-				// Parse pool addresses
-				for _, addr := range pool.Addresses {
-					cidr := addr
-					if !strings.Contains(cidr, "/") {
-						if strings.Contains(cidr, ":") {
-							cidr += "/128"
-						} else {
-							cidr += "/32"
-						}
-					}
-					ip, _, err := net.ParseCIDR(cidr)
-					if err != nil {
-						slog.Warn("invalid pool address", "addr", addr, "err", err)
-						continue
-					}
-					if ip.To4() != nil {
-						v4IPs = append(v4IPs, ip.To4())
+					// First encounter: assign ID, parse addresses, write maps.
+					if existingID, exists := result.PoolIDs[pool.Name]; exists {
+						curPoolID = existingID
 					} else {
-						v6IPs = append(v6IPs, ip)
+						curPoolID = poolID
+						result.PoolIDs[pool.Name] = curPoolID
+						poolID++
 					}
-				}
 
-				poolCfg.PortLow = uint16(pool.PortLow)
-				poolCfg.PortHigh = uint16(pool.PortHigh)
-				if poolCfg.PortLow == 0 {
-					poolCfg.PortLow = 1024
-				}
-				if poolCfg.PortHigh == 0 {
-					poolCfg.PortHigh = 65535
-				}
+					var poolCfg NATPoolConfig
+					var v4IPs []net.IP
+					var v6IPs []net.IP
 
-				// Compile deterministic NAT fields
-				if pool.Deterministic != nil {
-					_, hostNet, err := net.ParseCIDR(pool.Deterministic.HostAddress)
-					if err == nil {
-						ones, bits := hostNet.Mask.Size()
-						portRange := int(poolCfg.PortHigh) - int(poolCfg.PortLow) + 1
-						poolCfg.BlockSize = uint16(pool.Deterministic.BlockSize)
-						poolCfg.BlocksPerIP = uint16(portRange / pool.Deterministic.BlockSize)
-
-						if bits == 128 {
-							// IPv6 host — deterministic mode 2
-							poolCfg.Deterministic = 2
-							poolCfg.HostPrefixLen = uint8(ones)
-							// Subscriber count capped by pool capacity
-							poolCfg.HostCount = uint32(len(v4IPs)) * uint32(poolCfg.BlocksPerIP)
-							ip16 := hostNet.IP.To16()
-							for i := 0; i < 4; i++ {
-								poolCfg.HostBaseV6[i] = binary.NativeEndian.Uint32(ip16[i*4 : (i+1)*4])
+					// Parse pool addresses
+					for _, addr := range pool.Addresses {
+						cidr := addr
+						if !strings.Contains(cidr, "/") {
+							if strings.Contains(cidr, ":") {
+								cidr += "/128"
+							} else {
+								cidr += "/32"
 							}
+						}
+						ip, _, err := net.ParseCIDR(cidr)
+						if err != nil {
+							slog.Warn("invalid pool address", "addr", addr, "err", err)
+							continue
+						}
+						if ip.To4() != nil {
+							v4IPs = append(v4IPs, ip.To4())
 						} else {
-							// IPv4 host — deterministic mode 1
-							hostCount := uint32(1) << uint(bits-ones)
-							poolCfg.Deterministic = 1
-							poolCfg.HostBase = ipToUint32BE(hostNet.IP.To4())
-							poolCfg.HostCount = hostCount
+							v6IPs = append(v6IPs, ip)
 						}
 					}
-				}
-			}
 
-			// Write pool IPs to maps
-			poolCfg.NumIPs = uint16(len(v4IPs))
-			poolCfg.NumIPsV6 = uint16(len(v6IPs))
-
-			for i, ip := range v4IPs {
-				if i >= int(MaxNATPoolIPsPerPool) {
-					break
-				}
-				if err := dp.SetNATPoolIPV4(uint32(curPoolID), uint32(i), ipToUint32BE(ip)); err != nil {
-					return fmt.Errorf("set pool ip v4 %d/%d: %w", curPoolID, i, err)
-				}
-			}
-			for i, ip := range v6IPs {
-				if i >= int(MaxNATPoolIPsPerPool) {
-					break
-				}
-				if err := dp.SetNATPoolIPV6(uint32(curPoolID), uint32(i), ipTo16Bytes(ip)); err != nil {
-					return fmt.Errorf("set pool ip v6 %d/%d: %w", curPoolID, i, err)
-				}
-			}
-
-			if natCfg.AddressPersistent {
-				poolCfg.AddrPersistent = 1
-			}
-
-			if err := dp.SetNATPoolConfig(uint32(curPoolID), poolCfg); err != nil {
-				return fmt.Errorf("set pool config %d: %w", curPoolID, err)
-			}
-
-			// Register persistent NAT pool config and IPs on the persistent NAT table
-			if !rule.Then.Interface {
-				pool := natCfg.SourcePools[rule.Then.PoolName]
-				if pool.PersistentNAT != nil {
-					pnat := dp.GetPersistentNAT()
-					if pnat != nil {
-						timeout := time.Duration(pool.PersistentNAT.InactivityTimeout) * time.Second
-						if timeout == 0 {
-							timeout = 300 * time.Second
-						}
-						pnat.SetPoolConfig(pool.Name, PersistentNATPoolInfo{
-							Timeout:             timeout,
-							PermitAnyRemoteHost: pool.PersistentNAT.PermitAnyRemoteHost,
-						})
-						for _, ip := range v4IPs {
-							addr, ok := netip.AddrFromSlice(ip.To4())
-							if ok {
-								pnat.RegisterNATIP(addr, pool.Name)
-							}
-						}
-						for _, ip := range v6IPs {
-							addr, ok := netip.AddrFromSlice(ip.To16())
-							if ok {
-								pnat.RegisterNATIP(addr, pool.Name)
-							}
-						}
-						slog.Info("persistent NAT pool registered",
-							"pool", pool.Name,
-							"timeout", timeout,
-							"permit_any_remote_host", pool.PersistentNAT.PermitAnyRemoteHost)
+					poolCfg.PortLow = uint16(pool.PortLow)
+					poolCfg.PortHigh = uint16(pool.PortHigh)
+					if poolCfg.PortLow == 0 {
+						poolCfg.PortLow = 1024
 					}
+					if poolCfg.PortHigh == 0 {
+						poolCfg.PortHigh = 65535
+					}
+
+					// Compile deterministic NAT fields
+					if pool.Deterministic != nil {
+						_, hostNet, err := net.ParseCIDR(pool.Deterministic.HostAddress)
+						if err == nil {
+							ones, bits := hostNet.Mask.Size()
+							portRange := int(poolCfg.PortHigh) - int(poolCfg.PortLow) + 1
+							poolCfg.BlockSize = uint16(pool.Deterministic.BlockSize)
+							poolCfg.BlocksPerIP = uint16(portRange / pool.Deterministic.BlockSize)
+
+							if bits == 128 {
+								// IPv6 host — deterministic mode 2
+								poolCfg.Deterministic = 2
+								poolCfg.HostPrefixLen = uint8(ones)
+								// Subscriber count capped by pool capacity
+								poolCfg.HostCount = uint32(len(v4IPs)) * uint32(poolCfg.BlocksPerIP)
+								ip16 := hostNet.IP.To16()
+								for i := 0; i < 4; i++ {
+									poolCfg.HostBaseV6[i] = binary.NativeEndian.Uint32(ip16[i*4 : (i+1)*4])
+								}
+							} else {
+								// IPv4 host — deterministic mode 1
+								hostCount := uint32(1) << uint(bits-ones)
+								poolCfg.Deterministic = 1
+								poolCfg.HostBase = ipToUint32BE(hostNet.IP.To4())
+								poolCfg.HostCount = hostCount
+							}
+						}
+					}
+
+					// Write pool IPs to maps
+					poolCfg.NumIPs = uint16(len(v4IPs))
+					poolCfg.NumIPsV6 = uint16(len(v6IPs))
+					for i, ip := range v4IPs {
+						if i >= int(MaxNATPoolIPsPerPool) {
+							break
+						}
+						if err := dp.SetNATPoolIPV4(uint32(curPoolID), uint32(i), ipToUint32BE(ip)); err != nil {
+							return fmt.Errorf("set pool ip v4 %d/%d: %w", curPoolID, i, err)
+						}
+					}
+					for i, ip := range v6IPs {
+						if i >= int(MaxNATPoolIPsPerPool) {
+							break
+						}
+						if err := dp.SetNATPoolIPV6(uint32(curPoolID), uint32(i), ipTo16Bytes(ip)); err != nil {
+							return fmt.Errorf("set pool ip v6 %d/%d: %w", curPoolID, i, err)
+						}
+					}
+
+					if natCfg.AddressPersistent {
+						poolCfg.AddrPersistent = 1
+					}
+					if err := dp.SetNATPoolConfig(uint32(curPoolID), poolCfg); err != nil {
+						return fmt.Errorf("set pool config %d: %w", curPoolID, err)
+					}
+
+					// Register persistent NAT pool config and IPs
+					if pool.PersistentNAT != nil {
+						pnat := dp.GetPersistentNAT()
+						if pnat != nil {
+							timeout := time.Duration(pool.PersistentNAT.InactivityTimeout) * time.Second
+							if timeout == 0 {
+								timeout = 300 * time.Second
+							}
+							pnat.SetPoolConfig(pool.Name, PersistentNATPoolInfo{
+								Timeout:             timeout,
+								PermitAnyRemoteHost: pool.PersistentNAT.PermitAnyRemoteHost,
+							})
+							for _, ip := range v4IPs {
+								addr, ok := netip.AddrFromSlice(ip.To4())
+								if ok {
+									pnat.RegisterNATIP(addr, pool.Name)
+								}
+							}
+							for _, ip := range v6IPs {
+								addr, ok := netip.AddrFromSlice(ip.To16())
+								if ok {
+									pnat.RegisterNATIP(addr, pool.Name)
+								}
+							}
+							slog.Info("persistent NAT pool registered",
+								"pool", pool.Name,
+								"timeout", timeout,
+								"permit_any_remote_host", pool.PersistentNAT.PermitAnyRemoteHost)
+						}
+					}
+
+					hasV4 = len(v4IPs) > 0
+					hasV6 = len(v6IPs) > 0
+					compiledPools[pool.Name] = &compiledPoolInfo{hasV4: hasV4, hasV6: hasV6}
 				}
 			}
 
@@ -2052,7 +2155,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					}
 
 					// Write SNAT rule (v4)
-					if len(v4IPs) > 0 {
+					if hasV4 {
 						val := SNATValue{
 							Mode:      curPoolID,
 							SrcAddrID: srcAddrID,
@@ -2072,13 +2175,11 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 							"pool_id", curPoolID, "rule_idx", ri,
 							"counter_id", counterID,
 							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-							"src_addr", srcAddr, "dst_addr", dstAddr,
-							"v4_ips", len(v4IPs),
-							"ports", fmt.Sprintf("%d-%d", poolCfg.PortLow, poolCfg.PortHigh))
+							"src_addr", srcAddr, "dst_addr", dstAddr)
 					}
 
 					// Write SNAT rule (v6)
-					if len(v6IPs) > 0 {
+					if hasV6 {
 						val := SNATValueV6{
 							Mode:      curPoolID,
 							SrcAddrID: srcAddrID,
@@ -2098,8 +2199,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 							"pool_id", curPoolID, "rule_idx", ri,
 							"counter_id", counterID,
 							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-							"src_addr", srcAddr, "dst_addr", dstAddr,
-							"v6_ips", len(v6IPs))
+							"src_addr", srcAddr, "dst_addr", dstAddr)
 					}
 				} // end dstAddr loop
 			} // end srcAddr loop
@@ -2919,9 +3019,10 @@ func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) 
 }
 
 // getInterfaceIP returns the first IPv4 address of a network interface.
-// Accepts Junos-style names (ge-0/0/0) and translates to Linux names.
-func getInterfaceIP(ifaceName string) (net.IP, error) {
-	iface, err := net.InterfaceByName(config.LinuxIfName(ifaceName))
+// Uses the compile-pass cache to avoid redundant syscalls.
+func getInterfaceIP(ifaceName string, result *CompileResult) (net.IP, error) {
+	name := config.LinuxIfName(ifaceName)
+	iface, err := result.cachedInterfaceByName(name)
 	if err != nil {
 		return nil, fmt.Errorf("interface %s: %w", ifaceName, err)
 	}
@@ -2943,9 +3044,10 @@ func getInterfaceIP(ifaceName string) (net.IP, error) {
 }
 
 // getInterfaceIPv6 returns the first global unicast IPv6 address of a network interface.
-// Accepts Junos-style names (ge-0/0/0) and translates to Linux names.
-func getInterfaceIPv6(ifaceName string) (net.IP, error) {
-	iface, err := net.InterfaceByName(config.LinuxIfName(ifaceName))
+// Uses the compile-pass cache to avoid redundant syscalls.
+func getInterfaceIPv6(ifaceName string, result *CompileResult) (net.IP, error) {
+	name := config.LinuxIfName(ifaceName)
+	iface, err := result.cachedInterfaceByName(name)
 	if err != nil {
 		return nil, fmt.Errorf("interface %s: %w", ifaceName, err)
 	}
@@ -3299,8 +3401,8 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 			physName := config.LinuxIfName(ifCfg.Name)
 			vlanID := uint16(unit.VlanID)
 
-			// Resolve ifindex
-			iface, err := net.InterfaceByName(physName)
+			// Resolve ifindex (cached to avoid redundant syscalls)
+			iface, err := result.cachedInterfaceByName(physName)
 			if err != nil {
 				slog.Warn("interface not found for filter assignment",
 					"interface", physName, "err", err)
@@ -3311,7 +3413,7 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 			// If VLAN sub-interface, use the sub-interface ifindex
 			if vlanID > 0 {
 				subName := fmt.Sprintf("%s.%d", physName, vlanID)
-				subIface, err := net.InterfaceByName(subName)
+				subIface, err := result.cachedInterfaceByName(subName)
 				if err != nil {
 					slog.Warn("VLAN sub-interface not found for filter",
 						"name", subName, "err", err)
@@ -3371,7 +3473,7 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 			egressIfindex := ifindex
 			if vlanID > 0 {
 				subName := fmt.Sprintf("%s.%d", physName, vlanID)
-				if subIface, err := net.InterfaceByName(subName); err == nil {
+				if subIface, err := result.cachedInterfaceByName(subName); err == nil {
 					egressIfindex = uint32(subIface.Index)
 				}
 			}
@@ -3905,7 +4007,7 @@ func parseDuplex(d string) string {
 
 // compilePortMirroring populates the mirror_config BPF map from
 // forwarding-options { port-mirroring { instance ... } }.
-func compilePortMirroring(dp DataPlane, cfg *config.Config) error {
+func compilePortMirroring(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	dp.ClearMirrorConfigs()
 
 	pm := cfg.ForwardingOptions.PortMirroring
@@ -3919,7 +4021,7 @@ func compilePortMirroring(dp DataPlane, cfg *config.Config) error {
 			continue
 		}
 
-		outIface, err := net.InterfaceByName(config.LinuxIfName(inst.Output))
+		outIface, err := result.cachedInterfaceByName(config.LinuxIfName(inst.Output))
 		if err != nil {
 			slog.Warn("port-mirroring output interface not found",
 				"name", name, "interface", inst.Output, "err", err)
@@ -3929,7 +4031,7 @@ func compilePortMirroring(dp DataPlane, cfg *config.Config) error {
 		rate := uint32(inst.InputRate)
 
 		for _, inputIface := range inst.Input {
-			inIface, err := net.InterfaceByName(config.LinuxIfName(inputIface))
+			inIface, err := result.cachedInterfaceByName(config.LinuxIfName(inputIface))
 			if err != nil {
 				slog.Warn("port-mirroring input interface not found",
 					"name", name, "interface", inputIface, "err", err)
@@ -3957,9 +4059,15 @@ func isVirtualRethMAC(mac net.HardwareAddr) bool {
 }
 
 // getPermAddr returns the permanent (factory) MAC address for an interface
-// via netlink IFLA_PERM_ADDRESS. Returns "" if not available.
-func getPermAddr(ifName string) string {
-	link, err := netlink.LinkByName(ifName)
+// via netlink IFLA_PERM_ADDRESS. Uses the compile-pass cache when available.
+func getPermAddr(ifName string, result *CompileResult) string {
+	var link netlink.Link
+	var err error
+	if result != nil {
+		link, err = result.cachedLinkByName(ifName)
+	} else {
+		link, err = netlink.LinkByName(ifName)
+	}
 	if err != nil {
 		return ""
 	}
@@ -4004,8 +4112,15 @@ func readOriginalNameFromLink(ifName string) string {
 
 // getOriginalKernelName returns the predictable kernel name (e.g. enp9s0f0)
 // for a renamed interface. Tries altnames first, then derives from PCI sysfs.
-func getOriginalKernelName(ifName string) string {
-	link, err := netlink.LinkByName(ifName)
+// Uses the compile-pass cache when available.
+func getOriginalKernelName(ifName string, result *CompileResult) string {
+	var link netlink.Link
+	var err error
+	if result != nil {
+		link, err = result.cachedLinkByName(ifName)
+	} else {
+		link, err = netlink.LinkByName(ifName)
+	}
 	if err != nil {
 		return ""
 	}

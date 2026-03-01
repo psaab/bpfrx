@@ -602,12 +602,6 @@ type bpfrxXdpCpumapZoneConfig struct {
 	Pad              [3]uint8
 }
 
-type bpfrxXdpCpumapZonePairKey struct {
-	_        structs.HostLayout
-	FromZone uint16
-	ToZone   uint16
-}
-
 // loadBpfrxXdpCpumap returns the embedded CollectionSpec for bpfrxXdpCpumap.
 func loadBpfrxXdpCpumap() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_BpfrxXdpCpumapBytes)
