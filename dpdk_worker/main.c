@@ -776,6 +776,19 @@ main(int argc, char **argv)
 		       port_id, nb_workers, nb_workers);
 	}
 
+	/* Build ifindex → DPDK port_id mapping for Go control plane.
+	 * Uses rte_eth_dev_info_get() to retrieve each port's kernel ifindex. */
+	memset(g_shm->ifindex_to_port, 0xFF, sizeof(g_shm->ifindex_to_port));
+	g_shm->fabric_port_id = 0xFFFF;
+	RTE_ETH_FOREACH_DEV(port_id) {
+		struct rte_eth_dev_info di;
+		if (rte_eth_dev_info_get(port_id, &di) == 0 && di.if_index > 0 &&
+		    di.if_index < MAX_PORT_MAP) {
+			g_shm->ifindex_to_port[di.if_index] = (uint8_t)port_id;
+			printf("  ifindex %u -> DPDK port %u\n", di.if_index, port_id);
+		}
+	}
+
 	/* Each worker polls ALL ports on its own queue index */
 	unsigned worker_idx = 0;
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {

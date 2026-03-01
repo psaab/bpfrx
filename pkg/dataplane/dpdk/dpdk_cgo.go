@@ -1166,7 +1166,19 @@ func (m *Manager) UpdateFabricFwd(info dataplane.FabricFwdInfo) error {
 	if shm == nil {
 		return nil
 	}
-	shm.fabric_ifindex = C.uint32_t(info.Ifindex)
+	// Translate kernel ifindex to DPDK port_id using the mapping
+	// populated by the DPDK worker at port init time.
+	ifidx := info.Ifindex
+	if ifidx == 0 || ifidx >= C.MAX_PORT_MAP {
+		shm.fabric_port_id = 0xFFFF // sentinel: not mapped
+		return nil
+	}
+	portID := shm.ifindex_to_port[ifidx]
+	if portID == 0xFF {
+		shm.fabric_port_id = 0xFFFF // sentinel: not mapped
+		return nil
+	}
+	shm.fabric_port_id = C.uint16_t(portID)
 	return nil
 }
 

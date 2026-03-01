@@ -868,8 +868,15 @@ struct shared_memory {
 	/* Per-RG active state (0=inactive, 1=active) */
 	uint8_t                 *rg_active;
 
-	/* Fabric interface ifindex (for zone-encoded MAC validation) */
-	volatile uint32_t        fabric_ifindex;
+	/* Fabric interface DPDK port_id (for zone-encoded MAC validation).
+	 * 0xFFFF = not mapped (sentinel, since port_id 0 is valid). */
+	volatile uint16_t        fabric_port_id;
+	uint16_t                 fabric_port_pad;
+
+	/* Kernel ifindex → DPDK port_id mapping.
+	 * Populated by DPDK worker during port init.
+	 * Index = kernel ifindex, value = DPDK port_id (0xFF = unmapped). */
+	uint8_t                  ifindex_to_port[MAX_PORT_MAP];
 
 	/* NAT64 state value array (indexed by rte_hash position) */
 	struct nat64_state_value *nat64_state_values;
