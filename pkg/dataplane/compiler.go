@@ -56,6 +56,14 @@ type CompileResult struct {
 	ifCache    map[string]*net.Interface
 	linkCache  map[string]netlink.Link // by name
 	linkIdxMap map[int]netlink.Link    // by ifindex
+
+	// rxVlanOffCache caches per-interface rxvlan state to avoid redundant
+	// ethtool -k subprocess calls. Key is interface name, value is true
+	// when rxvlan is confirmed off.
+	rxVlanOffCache map[string]bool
+	// ethtoolApplied tracks which interfaces have already had speed/duplex
+	// settings applied via ethtool -s, keyed by "iface:speed:duplex".
+	ethtoolApplied map[string]bool
 }
 
 // cachedInterfaceByName returns a cached *net.Interface, performing the
@@ -129,6 +137,8 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		ifCache:          make(map[string]*net.Interface),
 		linkCache:        make(map[string]netlink.Link),
 		linkIdxMap:       make(map[int]netlink.Link),
+		rxVlanOffCache:   make(map[string]bool),
+		ethtoolApplied:   make(map[string]bool),
 	}
 
 	// Phase 1: Assign zone IDs (1-based; 0 = unassigned).
@@ -639,14 +649,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				// (otherwise NIC strips them into skb->vlan_tci which XDP can't read).
 				// Check current state first — toggling rxvlan on iavf VFs causes a
 				// driver reset that drops in-flight packets (kills active TCP sessions).
-				if !isRxVlanOff(physName) {
-					if out, err := exec.Command("ethtool", "-K", physName, "rxvlan", "off").CombinedOutput(); err != nil {
-						slog.Warn("failed to disable rxvlan offload (VLAN parsing may fail)",
-							"interface", physName, "err", err, "output", strings.TrimSpace(string(out)))
-					} else {
-						slog.Info("disabled VLAN RX offload for XDP", "interface", physName)
-					}
-				}
+				result.ensureRxVlanOff(physName)
 
 				// Single cached netlink lookup for MTU, speed/duplex, and UP/DOWN.
 				nl, nlErr := result.cachedLinkByIndex(physIface.Index)
@@ -665,7 +668,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 
 				// Apply interface speed/duplex via ethtool if configured
 				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
-					applyEthtool(physName, ifCfg)
+					result.applyEthtool(physName, ifCfg)
 				}
 
 				// Bring the interface UP so XDP can process traffic,
@@ -3917,29 +3920,49 @@ func resolvePortName(name string) uint16 {
 	}
 }
 
-// isRxVlanOff returns true if rx-vlan-offload is already disabled on iface.
-// Used to avoid redundant ethtool -K rxvlan off calls, which cause iavf VF
-// driver resets that drop in-flight packets.
-func isRxVlanOff(iface string) bool {
-	out, err := exec.Command("ethtool", "-k", iface).CombinedOutput()
-	if err != nil {
-		return false // assume it's on; the set call will report the real error
+// ensureRxVlanOff disables rx-vlan-offload on iface if not already off.
+// Results are cached to avoid redundant ethtool subprocess calls.
+// Toggling rxvlan on iavf VFs causes a driver reset that drops in-flight
+// packets, so we check current state before changing.
+func (r *CompileResult) ensureRxVlanOff(iface string) {
+	if r.rxVlanOffCache[iface] {
+		return
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "rx-vlan-offload:") {
-			return strings.Contains(line, "off")
+	// Check current state via ethtool -k.
+	out, err := exec.Command("ethtool", "-k", iface).CombinedOutput()
+	if err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "rx-vlan-offload:") {
+				if strings.Contains(line, "off") {
+					r.rxVlanOffCache[iface] = true
+					return
+				}
+				break
+			}
 		}
 	}
-	return false
+	// Not off yet — disable it.
+	if out, err := exec.Command("ethtool", "-K", iface, "rxvlan", "off").CombinedOutput(); err != nil {
+		slog.Warn("failed to disable rxvlan offload (VLAN parsing may fail)",
+			"interface", iface, "err", err, "output", strings.TrimSpace(string(out)))
+	} else {
+		r.rxVlanOffCache[iface] = true
+		slog.Info("disabled VLAN RX offload for XDP", "interface", iface)
+	}
 }
 
 // applyEthtool applies speed and duplex settings via ethtool if configured.
+// Results are cached to skip redundant calls for the same settings.
 // Errors are logged as warnings since virtual interfaces (virtio-net) don't
 // support ethtool speed/duplex changes.
-func applyEthtool(ifaceName string, ifCfg *config.InterfaceConfig) {
+func (r *CompileResult) applyEthtool(ifaceName string, ifCfg *config.InterfaceConfig) {
 	speed := parseSpeed(ifCfg.Speed)
 	duplex := parseDuplex(ifCfg.Duplex)
 	if speed == "" && duplex == "" {
+		return
+	}
+	cacheKey := ifaceName + ":" + speed + ":" + duplex
+	if r.ethtoolApplied[cacheKey] {
 		return
 	}
 	args := []string{"-s", ifaceName}
@@ -3954,6 +3977,7 @@ func applyEthtool(ifaceName string, ifCfg *config.InterfaceConfig) {
 			"name", ifaceName, "speed", ifCfg.Speed, "duplex", ifCfg.Duplex,
 			"err", fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))
 	} else {
+		r.ethtoolApplied[cacheKey] = true
 		slog.Info("applied ethtool settings", "name", ifaceName,
 			"speed", ifCfg.Speed, "duplex", ifCfg.Duplex)
 	}
