@@ -30,6 +30,7 @@ type GlobalStats struct {
 	HostInboundDeny  uint64 `json:"host_inbound_denies"`
 	TCEgressPackets  uint64 `json:"tc_egress_packets"`
 	FabricRedirects  uint64 `json:"fabric_redirects"`
+	FabricFwdDrops   uint64 `json:"fabric_fwd_drops"`
 }
 
 // InterfaceStats holds per-interface counter values.

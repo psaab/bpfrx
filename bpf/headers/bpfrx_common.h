@@ -268,7 +268,8 @@ struct icmp6hdr {
 #define GLOBAL_CTR_SYNCOOKIE_INVALID     29
 #define GLOBAL_CTR_SYNCOOKIE_BYPASS      30
 #define GLOBAL_CTR_SCREEN_SESSION_LIMIT  31
-#define GLOBAL_CTR_MAX                   32
+#define GLOBAL_CTR_FABRIC_FWD_DROP       32
+#define GLOBAL_CTR_MAX                   33
 
 /* Flow timeout indices for flow_timeouts ARRAY map */
 #define FLOW_TIMEOUT_TCP_ESTABLISHED   0

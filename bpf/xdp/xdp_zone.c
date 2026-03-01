@@ -1007,15 +1007,13 @@ zone_resolved:
 				bpf_tail_call(ctx, &xdp_progs,
 					      XDP_PROG_FORWARD);
 			}
-			/* Main table FIB failed — fall through to
-			 * XDP_PASS for kernel local delivery. */
-			if (meta->ingress_vlan_id != 0) {
-				if (xdp_vlan_tag_push(ctx,
-						meta->ingress_vlan_id) < 0)
-					return XDP_DROP;
-			}
-			inc_counter(GLOBAL_CTR_HOST_INBOUND);
-			return XDP_PASS;
+			/* Main table FIB failed — drop transit packets
+			 * rather than leaking to kernel via XDP_PASS.
+			 * Transient route state during RG movement is
+			 * expected; retransmit will succeed once routes
+			 * converge. */
+			inc_counter(GLOBAL_CTR_FABRIC_FWD_DROP);
+			return XDP_DROP;
 		}
 
 	} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {

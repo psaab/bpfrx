@@ -80,6 +80,7 @@ func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		HostInboundDeny:  readCounter(dataplane.GlobalCtrHostInboundDeny),
 		TCEgressPackets:  readCounter(dataplane.GlobalCtrTCEgressPackets),
 		FabricRedirects:  readCounter(dataplane.GlobalCtrFabricRedirect),
+		FabricFwdDrops:   readCounter(dataplane.GlobalCtrFabricFwdDrop),
 	}
 	writeOK(w, stats)
 }
