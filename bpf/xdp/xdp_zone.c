@@ -322,53 +322,67 @@ apply_dnat_before_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	void *_d = (void *)(long)ctx->data;
 	void *_de = (void *)(long)ctx->data_end;
-	struct iphdr *iph = _d + sizeof(struct ethhdr);
-	if ((void *)(iph + 1) > _de ||
-	    iph->daddr == meta->dst_ip.v4)
+
+	/* Use parsed offsets — sizeof(struct ethhdr) is wrong for
+	 * VLAN-tagged packets (l3 at 18 instead of 14), and iph+1
+	 * is wrong when IPv4 options are present.
+	 * Mask with & 0x3F to narrow var_off for BPF verifier. */
+	if (meta->l3_offset >= 64 || meta->l4_offset >= 192)
 		return;
+	struct iphdr *iph = _d + (meta->l3_offset & 0x3F);
+	if ((void *)(iph + 1) > _de)
+		return;
+	void *l4 = _d + (meta->l4_offset & 0xFF);
 
-	__be32 old_dst = iph->daddr;
-	csum_update_4(&iph->check, old_dst, meta->dst_ip.v4);
-	iph->daddr = meta->dst_ip.v4;
+	/* Don't short-circuit solely on dst IP equality — port-only
+	 * DNAT (same IP, different port) still needs L4 rewrite. */
+	int need_addr = (iph->daddr != meta->dst_ip.v4);
 
-	void *l4 = (void *)iph + sizeof(struct iphdr);
-	/* meta->dst_port is already __be16 (from tcp->dest) — no swap */
+	if (need_addr) {
+		__be32 old_dst = iph->daddr;
+		csum_update_4(&iph->check, old_dst, meta->dst_ip.v4);
+		iph->daddr = meta->dst_ip.v4;
+
+		if (meta->protocol == PROTO_TCP) {
+			struct tcphdr *tcp = l4;
+			if ((void *)(tcp + 1) <= _de)
+				csum_update_4(&tcp->check, old_dst,
+					      meta->dst_ip.v4);
+		} else if (meta->protocol == PROTO_UDP) {
+			struct udphdr *udp = l4;
+			if ((void *)(udp + 1) <= _de && udp->check != 0)
+				csum_update_4(&udp->check, old_dst,
+					      meta->dst_ip.v4);
+		}
+	}
+
+	/* Update L4 destination port. */
 	__be16 new_dport = meta->dst_port;
 
 	if (meta->protocol == PROTO_TCP) {
 		struct tcphdr *tcp = l4;
-		if ((void *)(tcp + 1) <= _de) {
-			csum_update_4(&tcp->check, old_dst,
-				      meta->dst_ip.v4);
-			if (tcp->dest != new_dport) {
-				csum_update_2(&tcp->check,
-					      tcp->dest, new_dport);
-				tcp->dest = new_dport;
-			}
+		if ((void *)(tcp + 1) <= _de && tcp->dest != new_dport) {
+			csum_update_2(&tcp->check,
+				      tcp->dest, new_dport);
+			tcp->dest = new_dport;
 		}
 	} else if (meta->protocol == PROTO_UDP) {
 		struct udphdr *udp = l4;
-		if ((void *)(udp + 1) <= _de) {
+		if ((void *)(udp + 1) <= _de && udp->dest != new_dport) {
 			if (udp->check != 0)
-				csum_update_4(&udp->check, old_dst,
-					      meta->dst_ip.v4);
-			if (udp->dest != new_dport) {
-				if (udp->check != 0)
-					csum_update_2(&udp->check,
-						      udp->dest,
-						      new_dport);
-				udp->dest = new_dport;
-			}
+				csum_update_2(&udp->check,
+					      udp->dest,
+					      new_dport);
+			udp->dest = new_dport;
 		}
 	} else if (meta->protocol == PROTO_ICMP) {
 		struct icmphdr *icmp = l4;
-		if ((void *)(icmp + 1) <= _de) {
-			if (icmp->un.echo.id != new_dport) {
-				csum_update_2(&icmp->checksum,
-					      icmp->un.echo.id,
-					      new_dport);
-				icmp->un.echo.id = new_dport;
-			}
+		if ((void *)(icmp + 1) <= _de &&
+		    icmp->un.echo.id != new_dport) {
+			csum_update_2(&icmp->checksum,
+				      icmp->un.echo.id,
+				      new_dport);
+			icmp->un.echo.id = new_dport;
 		}
 	}
 }

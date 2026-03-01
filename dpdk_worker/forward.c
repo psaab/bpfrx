@@ -27,22 +27,28 @@ extern void send_icmp_time_exceeded_v6(struct rte_mbuf *pkt, struct pkt_meta *me
 
 /**
  * host_inbound_flag — Map packet protocol/port to HOST_INBOUND_* flag.
- * Returns 0 for unrecognized services (allowed by default).
+ * Returns 0 for unrecognized services (denied when allowlist is active).
  */
 static inline uint32_t
 host_inbound_flag(struct pkt_meta *meta)
 {
 	uint8_t proto = meta->protocol;
 
-	/* ICMP/ICMPv6 echo request */
+	/* ICMP/ICMPv6 echo request + reply */
 	if (proto == PROTO_ICMP || proto == PROTO_ICMPV6) {
-		if (meta->icmp_type == 8 || meta->icmp_type == 128)
+		if (meta->icmp_type == 8 || meta->icmp_type == 0 ||
+		    meta->icmp_type == 128 || meta->icmp_type == 129)
 			return HOST_INBOUND_PING;
 		/* IRDP: Router Advertisement (9) / Router Solicitation (10) */
 		if (proto == PROTO_ICMP &&
 		    (meta->icmp_type == 9 || meta->icmp_type == 10))
 			return HOST_INBOUND_ROUTER_DISCOVERY;
-		return 0;  /* other ICMP always allowed */
+		/* ICMPv6 NDP: RS(133), RA(134), NS(135), NA(136) */
+		if (proto == PROTO_ICMPV6 &&
+		    meta->icmp_type >= 133 && meta->icmp_type <= 136)
+			return HOST_INBOUND_ROUTER_DISCOVERY;
+		/* Other ICMP (errors, redirects) — always allow */
+		return HOST_INBOUND_ALL;
 	}
 
 	/* OSPF is IP protocol 89, not port-based */
@@ -108,7 +114,13 @@ forward_packet(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			struct zone_config *zc = &ctx->shm->zone_configs[meta->ingress_zone];
 			if (zc->host_inbound_flags != 0) {
 				uint32_t flag = host_inbound_flag(meta);
-				if (flag != 0 && !(zc->host_inbound_flags & flag)) {
+				/*
+				 * True allowlist: if host-inbound is configured
+				 * and not HOST_INBOUND_ALL, deny unknown services
+				 * (flag==0) and known-but-not-enabled services.
+				 */
+				if (zc->host_inbound_flags != HOST_INBOUND_ALL &&
+				    (flag == 0 || !(zc->host_inbound_flags & flag))) {
 					ctr_global_inc(ctx, GLOBAL_CTR_HOST_INBOUND_DENY);
 					emit_event(ctx, meta, EVENT_TYPE_POLICY_DENY, ACTION_DENY);
 					rte_pktmbuf_free(pkt);

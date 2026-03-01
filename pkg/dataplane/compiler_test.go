@@ -339,6 +339,53 @@ func TestHostInboundRouterDiscoveryFlag(t *testing.T) {
 	}
 }
 
+func TestHostInboundAllowlistLogic(t *testing.T) {
+	// Verify the three-way semantics used in xdp_forward / dpdk forward:
+	//   flags == 0            → not configured, allow all
+	//   flags == HostInboundAll → explicit "all", allow all
+	//   flags != 0 && != All  → allowlist active, deny unknown (flag==0)
+
+	// shouldDeny mirrors the BPF enforcement logic.
+	shouldDeny := func(zoneFlags, pktFlag uint32) bool {
+		if zoneFlags == 0 {
+			return false // not configured
+		}
+		if zoneFlags == HostInboundAll {
+			return false // explicit all
+		}
+		return pktFlag == 0 || (zoneFlags&pktFlag) == 0
+	}
+
+	tests := []struct {
+		name      string
+		zoneFlags uint32
+		pktFlag   uint32
+		wantDeny  bool
+	}{
+		{"not-configured allows anything", 0, 0, false},
+		{"not-configured allows known", 0, HostInboundSSH, false},
+		{"all allows unknown", HostInboundAll, 0, false},
+		{"all allows known", HostInboundAll, HostInboundSSH, false},
+		{"allowlist denies unknown", HostInboundSSH | HostInboundPing, 0, true},
+		{"allowlist allows enabled", HostInboundSSH | HostInboundPing, HostInboundSSH, false},
+		{"allowlist denies disabled", HostInboundSSH | HostInboundPing, HostInboundHTTP, true},
+		{"single-service denies unknown", HostInboundPing, 0, true},
+		{"single-service allows match", HostInboundPing, HostInboundPing, false},
+		{"icmp-errors pass any allowlist", HostInboundPing, HostInboundAll, false},
+		{"icmp-errors pass single-service", HostInboundSSH, HostInboundAll, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldDeny(tt.zoneFlags, tt.pktFlag)
+			if got != tt.wantDeny {
+				t.Errorf("shouldDeny(0x%x, 0x%x) = %v, want %v",
+					tt.zoneFlags, tt.pktFlag, got, tt.wantDeny)
+			}
+		})
+	}
+}
+
 func TestAppPortsFromSpec(t *testing.T) {
 	tests := []struct {
 		spec string

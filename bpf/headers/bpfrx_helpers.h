@@ -912,22 +912,30 @@ emit_event_nat6(struct pkt_meta *meta, __u8 event_type, __u8 action,
  *
  * Maps a packet's protocol/port to the corresponding
  * HOST_INBOUND_* flag bit from bpfrx_common.h.
- * Returns 0 for unrecognized services (allowed by default).
+ * Returns 0 for unrecognized services (denied when allowlist is active).
  * ============================================================ */
 static __always_inline __u32
 host_inbound_flag(struct pkt_meta *meta)
 {
 	__u8 proto = meta->protocol;
 
-	/* ICMP/ICMPv6 echo request → HOST_INBOUND_PING */
+	/* ICMP/ICMPv6 echo request + reply → HOST_INBOUND_PING */
 	if (proto == PROTO_ICMP || proto == PROTO_ICMPV6) {
-		if (meta->icmp_type == 8 || meta->icmp_type == 128)
+		if (meta->icmp_type == 8 || meta->icmp_type == 0 ||
+		    meta->icmp_type == 128 || meta->icmp_type == 129)
 			return HOST_INBOUND_PING;
 		/* IRDP: Router Advertisement (9) / Router Solicitation (10) */
 		if (proto == PROTO_ICMP &&
 		    (meta->icmp_type == 9 || meta->icmp_type == 10))
 			return HOST_INBOUND_ROUTER_DISCOVERY;
-		return 0; /* other ICMP always allowed */
+		/* ICMPv6 NDP: RS(133), RA(134), NS(135), NA(136) */
+		if (proto == PROTO_ICMPV6 &&
+		    meta->icmp_type >= 133 && meta->icmp_type <= 136)
+			return HOST_INBOUND_ROUTER_DISCOVERY;
+		/* Other ICMP (errors, redirects) — always allow through
+		 * any allowlist.  HOST_INBOUND_ALL matches all non-zero
+		 * zone flags. */
+		return HOST_INBOUND_ALL;
 	}
 
 	/* OSPF is IP protocol 89, not port-based */
@@ -963,7 +971,7 @@ host_inbound_flag(struct pkt_meta *meta)
 	if (proto == PROTO_UDP && port >= 33434 && port <= 33523)
 		return HOST_INBOUND_TRACEROUTE;
 
-	return 0; /* unknown service → allow by default */
+	return 0; /* unknown service → denied when allowlist is active */
 }
 
 /* ============================================================

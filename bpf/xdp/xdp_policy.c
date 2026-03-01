@@ -357,8 +357,8 @@ nat_pool_alloc_v4(__u8 pool_id, __be32 src_ip, __be32 *out_ip, __be16 *out_port)
 /*
  * Allocate SNAT IP+port for "source-nat interface" mode.
  * Uses the actual egress interface IP from snat_egress_ips map,
- * with port allocation from the pool. Falls back to pool IP
- * if egress lookup fails.
+ * with port allocation from the pool. Returns failure if egress
+ * lookup misses — interface mode must not fall back to pool.
  */
 static __noinline int
 nat_pool_alloc_iface_v4(__u8 pool_id, struct pkt_meta *meta,
@@ -392,8 +392,8 @@ nat_pool_alloc_iface_v4(__u8 pool_id, struct pkt_meta *meta,
 		*out_port = bpf_htons(port);
 		return 0;
 	}
-	/* Fallback to pool-based allocation */
-	return nat_pool_alloc_v4(pool_id, src_ip, out_ip, out_port);
+	/* Interface mode: no egress IP means misconfiguration — fail */
+	return -1;
 }
 
 /*
@@ -444,6 +444,8 @@ nat_pool_alloc_v6(__u8 pool_id, __u8 *src_ip, __u8 *out_ip, __be16 *out_port)
 
 /*
  * Allocate SNAT IPv6+port for "source-nat interface" mode.
+ * Returns failure if egress lookup misses — interface mode must not
+ * fall back to pool.
  */
 static __noinline int
 nat_pool_alloc_iface_v6(__u8 pool_id, struct pkt_meta *meta,
@@ -480,7 +482,8 @@ nat_pool_alloc_iface_v6(__u8 pool_id, struct pkt_meta *meta,
 			return 0;
 		}
 	}
-	return nat_pool_alloc_v6(pool_id, src_ip, out_ip, out_port);
+	/* Interface mode: no egress IP means misconfiguration — fail */
+	return -1;
 }
 
 /*

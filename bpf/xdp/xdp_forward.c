@@ -95,7 +95,13 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		struct zone_config *zcfg = bpf_map_lookup_elem(&zone_configs, &zone_key);
 		if (zcfg && zcfg->host_inbound_flags != 0) {
 			__u32 flag = host_inbound_flag(meta);
-			if (flag != 0 && !(zcfg->host_inbound_flags & flag)) {
+			/*
+			 * True allowlist: if host-inbound is configured
+			 * and not HOST_INBOUND_ALL, deny unknown services
+			 * (flag==0) and known-but-not-enabled services.
+			 */
+			if (zcfg->host_inbound_flags != HOST_INBOUND_ALL &&
+			    (flag == 0 || !(zcfg->host_inbound_flags & flag))) {
 				inc_counter(GLOBAL_CTR_HOST_INBOUND_DENY);
 				return XDP_DROP;
 			}
