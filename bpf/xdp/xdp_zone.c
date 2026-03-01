@@ -1083,6 +1083,14 @@ zone_resolved:
 				      XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
+		/* FABRIC_FWD transit: fabric redirects that failed both
+		 * zone-encoded and plain redirect (anti-loop) and have
+		 * no local session.  Drop rather than leaking transit
+		 * traffic to kernel host path. */
+		if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
+			inc_counter(GLOBAL_CTR_FABRIC_FWD_DROP);
+			return XDP_DROP;
+		}
 		TRACE_ZONE(meta);
 		inc_counter(GLOBAL_CTR_HOST_INBOUND);
 		if (meta->ingress_vlan_id != 0) {
