@@ -2131,3 +2131,50 @@ requiring full BPF cleanup — but the deploy scripts only ran `systemctl stop` 
 - `pkg/cluster/sync.go` — nil dp guard in BulkSync()
 - `test/incus/cluster-setup.sh` — bpfrxd cleanup in deploy_vm()
 - `test/incus/setup.sh` — bpfrxd cleanup in deploy step
+
+## Sprint FABRIC-HARDEN: Fabric Forwarding Hardening (#61–#64)
+
+### Overview
+Four issues in the cross-chassis fabric forwarding path where transit packets
+could leak into the kernel stack or take incorrect paths during RG movement
+windows. Also hardens the DPDK worker's zone-encoded MAC decode path.
+
+### #61: NO_NEIGH FABRIC_FWD sessionless leak
+- **Problem:** In xdp_zone NO_NEIGH branch, `META_FLAG_FABRIC_FWD` packets without a
+  session (`sv4==NULL && sv6==NULL`) fell through to the host-inbound `XDP_PASS` path.
+  Fabric-forwarded transit packets should never reach the host stack.
+- **Fix:** Added `META_FLAG_FABRIC_FWD` guard before host-inbound fallthrough — drops
+  with `GLOBAL_CTR_FABRIC_FWD_DROP` counter instead of leaking to kernel.
+- **File:** `bpf/xdp/xdp_zone.c`
+
+### #62: UNREACHABLE/BLACKHOLE FABRIC_FWD re-FIB miss
+- **Problem:** In xdp_zone UNREACHABLE/BLACKHOLE branch, FABRIC_FWD packets attempted
+  re-FIB in main table (254) but had no explicit drop when that also failed. Transit
+  packets with unreachable routes could leak through without a counter increment.
+- **Fix:** Added `XDP_DROP` with `GLOBAL_CTR_FABRIC_FWD_DROP` counter when re-FIB in
+  table 254 fails for FABRIC_FWD packets.
+- **File:** `bpf/xdp/xdp_zone.c`
+
+### #63: Non-deterministic fib_ifindex fallback
+- **Problem:** `refreshFabricFwd()` in daemon.go needed a non-VRF ifindex for
+  `bpf_fib_lookup` main-table queries when the fabric interface is a VRF member.
+  Fallback iterated `netlink.LinkList()` and picked the first UP non-VRF link —
+  non-deterministic since link order varies between boots/reloads.
+- **Fix:** Use loopback (ifindex 1) as the fallback. Always present, always UP, never
+  a VRF member. Eliminates the `LinkList()` iteration entirely.
+- **File:** `pkg/daemon/daemon.go`
+
+### #64: DPDK zone decode early return + no fabric validation
+- **Problem:** In `dpdk_worker/zone.c`, zone-encoded MAC decode (fabric redirect)
+  returned immediately after decoding, skipping FIB resolution. No validation that the
+  packet arrived on the fabric interface — any interface could spoof a zone-encoded MAC.
+- **Fix:** (1) Added `fabric_ifindex` to DPDK `shared_memory`, populated by Go manager.
+  (2) Validate ingress port matches fabric interface before accepting zone-encoded MACs.
+  (3) Removed early return so decoded packets continue through normal FIB resolution.
+- **Files:** `dpdk_worker/zone.c`, `dpdk_worker/tables.h`, `pkg/dataplane/dpdk/manager.go`
+
+### Impact
+- Closes all fabric forwarding leak paths during RG movement / route convergence
+- Adds counter visibility (`GLOBAL_CTR_FABRIC_FWD_DROP`) for fabric transit drops
+- Deterministic loopback fallback prevents boot-order-dependent FIB behavior
+- DPDK parity: fabric ingress validation + correct zone decode pipeline flow

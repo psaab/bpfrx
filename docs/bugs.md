@@ -563,3 +563,29 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Fix:** Changed `RethMAC(clusterID, rgID)` to `RethMAC(clusterID, rgID, nodeID)`. MAC format changed from `02:bf:72:CC:RR:00` to `02:bf:72:CC:RR:NN`. Each node gets a unique MAC per RETH. VRRP + gratuitous ARP/NA handle failover (the MASTER advertises the VIP, clients use the VIP — the underlying MAC differences are transparent since clients use L3 addresses, not L2 MACs).
 - **Key insight:** On real hardware with dedicated L2 segments per node, identical RETH MACs would work. But in virtualized environments (Incus bridges, SR-IOV VFs from same PF), both nodes share L2 → unique MACs required. Per-node MAC is universally safe.
 - **Files:** `pkg/cluster/reth.go` (RethMAC signature), `pkg/cluster/reth_test.go`, `pkg/daemon/daemon.go` (programRethMAC calls), `pkg/dataplane/compiler.go` (isVirtualRethMAC)
+
+## Fabric Hardening Sprint
+
+### #61: NO_NEIGH FABRIC_FWD sessionless leak to XDP_PASS (FIXED)
+- **Symptom:** In xdp_zone NO_NEIGH branch, when `META_FLAG_FABRIC_FWD` is set and no session exists (`sv4==NULL && sv6==NULL`), code falls through to the host-inbound `XDP_PASS` path. Transit packets from the fabric peer leak into the kernel stack instead of being dropped.
+- **Root cause:** The NO_NEIGH handler had separate guards for existing sessions (`sv4 || sv6` → XDP_DROP) and `META_FLAG_KERNEL_ROUTE` (→ tail call conntrack), but no guard for `META_FLAG_FABRIC_FWD` on sessionless packets. FABRIC_FWD traffic without a local session should never reach the host.
+- **Fix:** Added `META_FLAG_FABRIC_FWD` check before the host-inbound fallthrough — drops with `GLOBAL_CTR_FABRIC_FWD_DROP` counter instead of `XDP_PASS`.
+- **File:** `bpf/xdp/xdp_zone.c`
+
+### #62: UNREACHABLE/BLACKHOLE FABRIC_FWD re-FIB miss leak (FIXED)
+- **Symptom:** In xdp_zone UNREACHABLE/BLACKHOLE branch, when `META_FLAG_FABRIC_FWD` is set and re-FIB in main table (254) also fails, no explicit drop occurs. Transit fabric packets with unreachable routes leak through.
+- **Root cause:** The UNREACHABLE/BLACKHOLE handler attempted re-FIB in main table for FABRIC_FWD traffic but had no explicit drop when that re-FIB also returned UNREACHABLE/BLACKHOLE. Missing counter increment on this path.
+- **Fix:** Added `XDP_DROP` with `GLOBAL_CTR_FABRIC_FWD_DROP` counter increment when re-FIB fails for FABRIC_FWD packets in the UNREACHABLE/BLACKHOLE branch.
+- **File:** `bpf/xdp/xdp_zone.c`
+
+### #63: Non-deterministic fib_ifindex fallback in refreshFabricFwd (FIXED)
+- **Symptom:** When the fabric interface is a VRF member, `refreshFabricFwd()` needs a non-VRF ifindex for `bpf_fib_lookup` main-table queries. The fallback iterated `netlink.LinkList()` and picked the first UP, non-VRF link — which is non-deterministic (link order varies between boots/reloads).
+- **Root cause:** `netlink.LinkList()` returns links in arbitrary kernel order. The "first UP non-VRF" heuristic could pick different interfaces each time, leading to inconsistent FIB lookup results.
+- **Fix:** Use loopback interface (ifindex 1) as the non-VRF fallback. Loopback is always present, always UP, and never a VRF member. Eliminates the `LinkList()` iteration entirely.
+- **File:** `pkg/daemon/daemon.go`
+
+### #64: DPDK zone decode returns early + no fabric ingress validation (FIXED)
+- **Symptom:** In `dpdk_worker/zone.c`, zone-encoded MAC decode (from `bpf_redirect_map` fabric forwarding) returned immediately after decoding, skipping FIB resolution. Additionally, no validation that the packet actually arrived on the fabric interface — any interface could spoof a zone-encoded MAC.
+- **Root cause:** The zone-encoded MAC decode block had an early `return` that bypassed the rest of the zone processing pipeline (FIB lookup, forwarding decision). No check compared `port_id` against the expected fabric interface.
+- **Fix:** (1) Added `fabric_ifindex` field to DPDK `shared_memory` struct, populated by Go manager. (2) Added ingress validation — only accept zone-encoded MACs from the fabric interface. (3) Removed early return so decoded packets continue through FIB resolution.
+- **Files:** `dpdk_worker/zone.c`, `dpdk_worker/tables.h`, `pkg/dataplane/dpdk/manager.go`
