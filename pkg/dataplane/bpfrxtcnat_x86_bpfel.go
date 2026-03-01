@@ -526,14 +526,6 @@ type bpfrxTcNatSnatEgressValue struct {
 	Ipv6 [16]uint8
 }
 
-type bpfrxTcNatSnatKey struct {
-	_        structs.HostLayout
-	FromZone uint16
-	ToZone   uint16
-	RuleIdx  uint16
-	Pad      uint16
-}
-
 type bpfrxTcNatSnatValue struct {
 	_         structs.HostLayout
 	SnatIp    uint32
