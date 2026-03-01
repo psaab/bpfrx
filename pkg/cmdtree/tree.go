@@ -244,7 +244,9 @@ var OperationalTree = map[string]*Node{
 			"alarms": {Desc: "Show active security alarm information", Children: map[string]*Node{
 				"detail": {Desc: "Show detailed security alarm information"},
 			}},
-			"alg": {Desc: "Show ALG status"},
+			"alg": {Desc: "Show ALG status", Children: map[string]*Node{
+				"status": {Desc: "Show ALG status details"},
+			}},
 			"dynamic-address": {Desc: "Show dynamic address feeds"},
 			"flow": {Desc: "Show security flow information", Children: map[string]*Node{
 				"session": {Desc: "Show session table", Children: map[string]*Node{

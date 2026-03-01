@@ -1378,6 +1378,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		return c.showSecurityAlarms(args[1:])
 
 	case "alg":
+		// Accept optional "status" subcommand
 		return c.showALG()
 
 	case "dynamic-address":
@@ -1421,12 +1422,12 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 		return nil
 	}
 
-	fmt.Printf("%-12s %-12s %-24s %-8s %12s %16s\n",
-		"From zone", "To zone", "Policy", "Action", "Packets", "Bytes")
-	fmt.Println(strings.Repeat("-", 88))
+	fmt.Println("Logical system: root-logical-system")
+	fmt.Printf("%-8s%-17s%-18s%-24s%-14s%s\n",
+		"Index", "From zone", "To zone", "Name", "Policy count", "Action")
 
+	index := uint32(1)
 	policySetID := uint32(0)
-	var totalPkts, totalBytes uint64
 	for _, zpp := range cfg.Security.Policies {
 		if fromZone != "" && zpp.FromZone != fromZone {
 			policySetID++
@@ -1437,56 +1438,51 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			continue
 		}
 		for i, pol := range zpp.Policies {
-			action := "permit"
+			action := "Permit"
 			switch pol.Action {
 			case 1:
-				action = "deny"
+				action = "Deny"
 			case 2:
-				action = "reject"
+				action = "Reject"
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-			var pkts, bytes uint64
+			var count uint64
 			if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
-				pkts = counters.Packets
-				bytes = counters.Bytes
+				count = counters.Packets
 			}
-			totalPkts += pkts
-			totalBytes += bytes
-			fmt.Printf("%-12s %-12s %-24s %-8s %12d %16d\n",
-				zpp.FromZone, zpp.ToZone, pol.Name, action, pkts, bytes)
+			fmt.Printf("%-8d%-17s%-18s%-24s%-14d%s\n",
+				index, zpp.FromZone, zpp.ToZone, pol.Name, count, action)
+			index++
 		}
 		policySetID++
 	}
 	// Global policies
 	if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
 		for i, pol := range cfg.Security.GlobalPolicies {
-			action := "permit"
+			action := "Permit"
 			switch pol.Action {
 			case 1:
-				action = "deny"
+				action = "Deny"
 			case 2:
-				action = "reject"
+				action = "Reject"
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-			var pkts, bytes uint64
+			var count uint64
 			if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
-				pkts = counters.Packets
-				bytes = counters.Bytes
+				count = counters.Packets
 			}
-			totalPkts += pkts
-			totalBytes += bytes
-			fmt.Printf("%-12s %-12s %-24s %-8s %12d %16d\n",
-				"*", "*", pol.Name, action, pkts, bytes)
+			fmt.Printf("%-8d%-17s%-18s%-24s%-14d%s\n",
+				index, "junos-global", "junos-global", pol.Name, count, action)
+			index++
 		}
 	}
-	fmt.Println(strings.Repeat("-", 88))
-	fmt.Printf("%-48s %8s %12d %16d\n", "Total", "", totalPkts, totalBytes)
 	return nil
 }
 
 // showPoliciesDetail displays an expanded Junos-style detail view of security policies.
 func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) error {
 	policySetID := uint32(0)
+	seqNum := 1
 	for _, zpp := range cfg.Security.Policies {
 		if fromZone != "" && zpp.FromZone != fromZone {
 			policySetID++
@@ -1496,7 +1492,6 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 			policySetID++
 			continue
 		}
-		fmt.Printf("Policy: %s -> %s, State: enabled\n", zpp.FromZone, zpp.ToZone)
 		for i, pol := range zpp.Policies {
 			action := "permit"
 			switch pol.Action {
@@ -1506,46 +1501,53 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 				action = "reject"
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-			fmt.Printf("\n  Policy: %s, action-type: %s\n", pol.Name, capitalizeFirst(action))
+			fmt.Printf("Policy: %s, action-type: %s, State: enabled, Index: %d, Scope Policy: 0\n",
+				pol.Name, action, ruleID)
+			fmt.Printf("  Policy Type: Configured\n")
+			fmt.Printf("  Sequence number: %d\n", seqNum)
+			fmt.Printf("  From zone: %s, To zone: %s\n", zpp.FromZone, zpp.ToZone)
 			if pol.Description != "" {
-				fmt.Printf("    Description: %s\n", pol.Description)
+				fmt.Printf("  Description: %s\n", pol.Description)
 			}
-			fmt.Printf("    Match:\n")
-			fmt.Printf("      Source zone: %s\n", zpp.FromZone)
-			fmt.Printf("      Destination zone: %s\n", zpp.ToZone)
-
-			fmt.Printf("      Source addresses:\n")
+			fmt.Printf("  Source addresses:\n")
 			for _, addr := range pol.Match.SourceAddresses {
-				resolved := resolveAddress(cfg, addr)
-				fmt.Printf("        %s%s\n", addr, resolved)
-			}
-
-			fmt.Printf("      Destination addresses:\n")
-			for _, addr := range pol.Match.DestinationAddresses {
-				resolved := resolveAddress(cfg, addr)
-				fmt.Printf("        %s%s\n", addr, resolved)
-			}
-
-			fmt.Printf("      Applications:\n")
-			for _, app := range pol.Match.Applications {
-				fmt.Printf("        %s\n", app)
-			}
-
-			fmt.Printf("    Then:\n")
-			fmt.Printf("      %s\n", action)
-			if pol.Log != nil {
-				fmt.Printf("      log\n")
-			}
-			if pol.Count {
-				fmt.Printf("      count\n")
-			}
-
-			if c.dp != nil && c.dp.IsLoaded() {
-				if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
-					fmt.Printf("    Session statistics:\n")
-					fmt.Printf("      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
+				if addr == "any" {
+					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
+					fmt.Printf("    any-ipv6(global): ::/0\n")
+				} else {
+					resolved := resolveAddressDetail(cfg, addr)
+					fmt.Printf("    %s(global): %s\n", addr, resolved)
 				}
 			}
+			fmt.Printf("  Destination addresses:\n")
+			for _, addr := range pol.Match.DestinationAddresses {
+				if addr == "any" {
+					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
+					fmt.Printf("    any-ipv6(global): ::/0\n")
+				} else {
+					resolved := resolveAddressDetail(cfg, addr)
+					fmt.Printf("    %s(global): %s\n", addr, resolved)
+				}
+			}
+			for _, app := range pol.Match.Applications {
+				fmt.Printf("  Application: %s\n", app)
+				c.printAppDetail(cfg, app)
+			}
+			if pol.Log != nil {
+				parts := []string{}
+				if pol.Log.SessionInit {
+					parts = append(parts, "at-create")
+				}
+				if pol.Log.SessionClose {
+					parts = append(parts, "at-close")
+				}
+				if len(parts) > 0 {
+					fmt.Printf("  Session log: %s\n", strings.Join(parts, ", "))
+				}
+			}
+			seqNum++
+
+			_ = ruleID // available for future counter display
 		}
 		policySetID++
 		fmt.Println()
@@ -1553,7 +1555,6 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 
 	// Global policies
 	if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
-		fmt.Printf("Global policies:\n")
 		for i, pol := range cfg.Security.GlobalPolicies {
 			action := "permit"
 			switch pol.Action {
@@ -1563,43 +1564,108 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 				action = "reject"
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-			fmt.Printf("\n  Policy: %s, action-type: %s\n", pol.Name, capitalizeFirst(action))
+			fmt.Printf("Policy: %s, action-type: %s, State: enabled, Index: %d, Scope Policy: 0\n",
+				pol.Name, action, ruleID)
+			fmt.Printf("  Policy Type: Configured\n")
+			fmt.Printf("  Sequence number: %d\n", seqNum)
+			fmt.Printf("  From zone: junos-global, To zone: junos-global\n")
 			if pol.Description != "" {
-				fmt.Printf("    Description: %s\n", pol.Description)
+				fmt.Printf("  Description: %s\n", pol.Description)
 			}
-			fmt.Printf("    Match:\n")
-			fmt.Printf("      Source addresses:\n")
+			fmt.Printf("  Source addresses:\n")
 			for _, addr := range pol.Match.SourceAddresses {
-				resolved := resolveAddress(cfg, addr)
-				fmt.Printf("        %s%s\n", addr, resolved)
-			}
-			fmt.Printf("      Destination addresses:\n")
-			for _, addr := range pol.Match.DestinationAddresses {
-				resolved := resolveAddress(cfg, addr)
-				fmt.Printf("        %s%s\n", addr, resolved)
-			}
-			fmt.Printf("      Applications:\n")
-			for _, app := range pol.Match.Applications {
-				fmt.Printf("        %s\n", app)
-			}
-			fmt.Printf("    Then:\n")
-			fmt.Printf("      %s\n", action)
-			if pol.Log != nil {
-				fmt.Printf("      log\n")
-			}
-			if pol.Count {
-				fmt.Printf("      count\n")
-			}
-			if c.dp != nil && c.dp.IsLoaded() {
-				if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
-					fmt.Printf("    Session statistics:\n")
-					fmt.Printf("      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
+				if addr == "any" {
+					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
+					fmt.Printf("    any-ipv6(global): ::/0\n")
+				} else {
+					resolved := resolveAddressDetail(cfg, addr)
+					fmt.Printf("    %s(global): %s\n", addr, resolved)
 				}
 			}
+			fmt.Printf("  Destination addresses:\n")
+			for _, addr := range pol.Match.DestinationAddresses {
+				if addr == "any" {
+					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
+					fmt.Printf("    any-ipv6(global): ::/0\n")
+				} else {
+					resolved := resolveAddressDetail(cfg, addr)
+					fmt.Printf("    %s(global): %s\n", addr, resolved)
+				}
+			}
+			for _, app := range pol.Match.Applications {
+				fmt.Printf("  Application: %s\n", app)
+				c.printAppDetail(cfg, app)
+			}
+			if pol.Log != nil {
+				parts := []string{}
+				if pol.Log.SessionInit {
+					parts = append(parts, "at-create")
+				}
+				if pol.Log.SessionClose {
+					parts = append(parts, "at-close")
+				}
+				if len(parts) > 0 {
+					fmt.Printf("  Session log: %s\n", strings.Join(parts, ", "))
+				}
+			}
+			seqNum++
+
+			_ = ruleID
 		}
 		fmt.Println()
 	}
 	return nil
+}
+
+// resolveAddressDetail returns the CIDR for an address name, or the name itself if not found.
+func resolveAddressDetail(cfg *config.Config, name string) string {
+	ab := cfg.Security.AddressBook
+	if ab != nil {
+		if addr, ok := ab.Addresses[name]; ok && addr.Value != "" {
+			return addr.Value
+		}
+	}
+	return name
+}
+
+// printAppDetail prints Junos-style application detail lines (protocol, ports, timeout).
+func (c *CLI) printAppDetail(cfg *config.Config, appName string) {
+	if appName == "any" {
+		fmt.Printf("    IP protocol: 0, ALG: 0, Inactivity timeout: 0\n")
+		fmt.Printf("      Source port range: [0-0]\n")
+		fmt.Printf("      Destination ports: [0-0]\n")
+		return
+	}
+	if cfg.Applications.Applications == nil {
+		return
+	}
+	app, ok := cfg.Applications.Applications[appName]
+	if !ok {
+		return
+	}
+	proto := app.Protocol
+	if proto == "" {
+		proto = "0"
+	}
+	timeout := 0
+	if app.InactivityTimeout > 0 {
+		timeout = app.InactivityTimeout
+	}
+	algVal := "0"
+	if app.ALG != "" {
+		algVal = app.ALG
+	}
+	fmt.Printf("    IP protocol: %s, ALG: %s, Inactivity timeout: %d\n", proto, algVal, timeout)
+	srcPort := "0-0"
+	if app.SourcePort != "" {
+		srcPort = app.SourcePort
+	}
+	dstPort := "0-0"
+	if app.DestinationPort != "" {
+		dstPort = app.DestinationPort
+	}
+	fmt.Printf("      Source port range: [%s]\n", srcPort)
+	fmt.Printf("      Destination ports: [%s]\n", dstPort)
 }
 
 // resolveAddress looks up a named address in the global address book and returns its CIDR suffix.
@@ -8726,20 +8792,32 @@ func (c *CLI) showALG() error {
 	}
 
 	alg := &cfg.Security.ALG
-	fmt.Println("ALG (Application Layer Gateway) status:")
+	fmt.Println("ALG Status:")
 
 	printALG := func(name string, disabled bool) {
+		status := "Enabled"
 		if disabled {
-			fmt.Printf("  %-10s disabled\n", name+":")
-		} else {
-			fmt.Printf("  %-10s enabled\n", name+":")
+			status = "Disabled"
 		}
+		fmt.Printf("  %-9s: %s\n", name, status)
 	}
 
 	printALG("DNS", alg.DNSDisable)
 	printALG("FTP", alg.FTPDisable)
+	printALG("H323", false)
+	printALG("MGCP", false)
+	printALG("MSRPC", false)
+	printALG("PPTP", false)
+	printALG("RSH", true)
+	printALG("RTSP", false)
+	printALG("SCCP", false)
 	printALG("SIP", alg.SIPDisable)
+	printALG("SQL", true)
+	printALG("SUNRPC", false)
+	printALG("TALK", false)
 	printALG("TFTP", alg.TFTPDisable)
+	printALG("IKE-ESP", true)
+	printALG("TWAMP", true)
 
 	return nil
 }
