@@ -255,7 +255,7 @@ func TestMonitor_IPMonitoring(t *testing.T) {
 
 	reachable := true
 	mon := NewMonitor(m, cfg.RedundancyGroups)
-	mon.icmpDialer = func() (icmpConn, error) {
+	mon.icmpDialer = func(network string) (icmpConn, error) {
 		return &mockICMPConn{reachable: reachable}, nil
 	}
 	setNoDampening(mon)
@@ -464,7 +464,7 @@ func TestMonitor_IPDampening(t *testing.T) {
 
 	reachable := true
 	mon := NewMonitor(m, cfg.RedundancyGroups)
-	mon.icmpDialer = func() (icmpConn, error) {
+	mon.icmpDialer = func(network string) (icmpConn, error) {
 		return &mockICMPConn{reachable: reachable}, nil
 	}
 	// Default thresholds (3/3), disable hold-down.
@@ -494,9 +494,129 @@ func TestMonitor_IPDampening(t *testing.T) {
 	}
 }
 
+func TestMonitor_IPv6IPMonitoring(t *testing.T) {
+	m := NewManager(0, 1)
+	rg := &config.RedundancyGroup{
+		ID:             0,
+		NodePriorities: map[int]int{0: 200},
+		IPMonitoring: &config.IPMonitoring{
+			GlobalWeight: 100,
+			Targets: []*config.IPMonitorTarget{
+				{Address: "2001:db8::1", Weight: 60},
+			},
+		},
+	}
+	cfg := &config.ClusterConfig{
+		RedundancyGroups: []*config.RedundancyGroup{rg},
+	}
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	reachable := true
+	var gotNetwork string
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	mon.icmpDialer = func(network string) (icmpConn, error) {
+		gotNetwork = network
+		return &mockICMPConn{reachable: reachable, v6: true}, nil
+	}
+	setNoDampening(mon)
+
+	// IPv6 target reachable.
+	mon.poll()
+	if gotNetwork != "udp6" {
+		t.Errorf("network = %q, want \"udp6\"", gotNetwork)
+	}
+	states := m.GroupStates()
+	if states[0].Weight != 255 {
+		t.Errorf("weight = %d, want 255 (IPv6 reachable)", states[0].Weight)
+	}
+
+	// IPv6 target unreachable.
+	reachable = false
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 195 {
+		t.Errorf("weight = %d, want 195 (255-60)", states[0].Weight)
+	}
+
+	// Recover.
+	reachable = true
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 255 {
+		t.Errorf("weight after recovery = %d, want 255", states[0].Weight)
+	}
+}
+
+func TestMonitor_IPv4ProbeUsesUDP4(t *testing.T) {
+	m := NewManager(0, 1)
+	rg := &config.RedundancyGroup{
+		ID:             0,
+		NodePriorities: map[int]int{0: 200},
+		IPMonitoring: &config.IPMonitoring{
+			GlobalWeight: 100,
+			Targets: []*config.IPMonitorTarget{
+				{Address: "10.0.1.1", Weight: 50},
+			},
+		},
+	}
+	cfg := &config.ClusterConfig{
+		RedundancyGroups: []*config.RedundancyGroup{rg},
+	}
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	var gotNetwork string
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	mon.icmpDialer = func(network string) (icmpConn, error) {
+		gotNetwork = network
+		return &mockICMPConn{reachable: true}, nil
+	}
+	setNoDampening(mon)
+
+	mon.poll()
+	if gotNetwork != "udp4" {
+		t.Errorf("network = %q, want \"udp4\"", gotNetwork)
+	}
+}
+
+func TestMonitor_InvalidAddress(t *testing.T) {
+	m := NewManager(0, 1)
+	rg := &config.RedundancyGroup{
+		ID:             0,
+		NodePriorities: map[int]int{0: 200},
+		IPMonitoring: &config.IPMonitoring{
+			GlobalWeight: 100,
+			Targets: []*config.IPMonitorTarget{
+				{Address: "not-an-ip", Weight: 50},
+			},
+		},
+	}
+	cfg := &config.ClusterConfig{
+		RedundancyGroups: []*config.RedundancyGroup{rg},
+	}
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	dialerCalled := false
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	mon.icmpDialer = func(network string) (icmpConn, error) {
+		dialerCalled = true
+		return &mockICMPConn{reachable: true}, nil
+	}
+	setNoDampening(mon)
+
+	// Invalid address should not crash and should be treated as unreachable.
+	mon.poll()
+	if dialerCalled {
+		t.Error("dialer should not be called for invalid address")
+	}
+}
+
 // mockICMPConn simulates ICMP for testing.
 type mockICMPConn struct {
 	reachable bool
+	v6        bool // if true, return ICMPv6 echo reply
 }
 
 func (c *mockICMPConn) WriteTo(b []byte, dst net.Addr) (int, error) {
@@ -507,8 +627,14 @@ func (c *mockICMPConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	if !c.reachable {
 		return 0, nil, net.UnknownNetworkError("timeout")
 	}
-	// Return a valid ICMP echo reply.
-	// Type=0 (echo reply), Code=0, Checksum, ID, Seq
+	if c.v6 {
+		// ICMPv6 echo reply: Type=129, Code=0, Checksum, ID, Seq
+		reply := []byte{0x81, 0x00, 0x00, 0x00, 0x00, 0xbf, 0x00, 0x01}
+		// Checksum is validated by kernel for UDP-based ICMP, set to zero.
+		n := copy(b, reply)
+		return n, &net.UDPAddr{IP: net.ParseIP("2001:db8::1")}, nil
+	}
+	// ICMPv4 echo reply: Type=0, Code=0, Checksum, ID, Seq
 	reply := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0xbf, 0x00, 0x01}
 	// Fix checksum
 	reply[2] = 0xff
@@ -519,5 +645,42 @@ func (c *mockICMPConn) ReadFrom(b []byte) (int, net.Addr, error) {
 
 func (c *mockICMPConn) SetReadDeadline(t time.Time) error { return nil }
 func (c *mockICMPConn) Close() error                      { return nil }
+
+func TestMonitor_LocalStatusesConcurrent(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200},
+			&config.InterfaceMonitor{Interface: "trust0", Weight: 100},
+		),
+	)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	nlh := newMockNlHandle()
+	nlh.setLink("trust0", true)
+
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	mon.nlHandle = nlh
+	setNoDampening(mon)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mon.Start(ctx)
+	defer func() {
+		cancel()
+		mon.Stop()
+	}()
+
+	// Hammer LocalInterfaceStatuses concurrently with poll() to trigger
+	// the race detector if the lock is not held properly.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			_ = mon.LocalInterfaceStatuses()
+		}
+	}()
+
+	<-done
+}
 
 // drainEvents is defined in election_test.go

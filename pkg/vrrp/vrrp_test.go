@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -1043,6 +1044,58 @@ func TestHandleMasterRx_Priority0_StaysMaster(t *testing.T) {
 	}
 }
 
+func TestHandleMasterRx_EqualPriority_HigherPeerIPv6_StepsDown(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+	}, &net.Interface{Name: "eth0"}, eventCh)
+	vi.localIPv6 = net.ParseIP("fe80::1") // lower IPv6
+	vi.setState(StateMaster)
+
+	masterDownTimer := time.NewTimer(time.Hour)
+	defer masterDownTimer.Stop()
+	advertTimer := time.NewTimer(time.Hour)
+	defer advertTimer.Stop()
+
+	pkt := &VRRPPacket{
+		Priority: 200,
+		SrcIP:    net.ParseIP("fe80::2"), // higher IPv6
+	}
+	vi.handleMasterRx(pkt, masterDownTimer, advertTimer)
+
+	if vi.getState() != StateBackup {
+		t.Errorf("state = %s, want BACKUP (equal priority, peer has higher IPv6)", vi.getState())
+	}
+}
+
+func TestHandleMasterRx_EqualPriority_LowerPeerIPv6_StaysMaster(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+	}, &net.Interface{Name: "eth0"}, eventCh)
+	vi.localIPv6 = net.ParseIP("fe80::2") // higher IPv6
+	vi.setState(StateMaster)
+
+	masterDownTimer := time.NewTimer(time.Hour)
+	defer masterDownTimer.Stop()
+	advertTimer := time.NewTimer(time.Hour)
+	defer advertTimer.Stop()
+
+	pkt := &VRRPPacket{
+		Priority: 200,
+		SrcIP:    net.ParseIP("fe80::1"), // lower IPv6
+	}
+	vi.handleMasterRx(pkt, masterDownTimer, advertTimer)
+
+	if vi.getState() != StateMaster {
+		t.Errorf("state = %s, want MASTER (equal priority, we have higher IPv6)", vi.getState())
+	}
+}
+
 func TestParsedPacket_PreservesSrcIP(t *testing.T) {
 	pkt := &VRRPPacket{
 		VRID:         42,
@@ -1521,4 +1574,219 @@ func TestForcePreemptOnce_ClearedAfterUse(t *testing.T) {
 	if vi.getPreempt() {
 		t.Error("cfg.Preempt should remain false throughout")
 	}
+}
+
+// mockPacketConn is a minimal PacketConn for testing receiverIPv6.
+type mockPacketConn struct {
+	data     []byte
+	srcAddr  net.Addr
+	readOnce chan struct{}
+	closed   chan struct{}
+}
+
+func (m *mockPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case <-m.readOnce:
+		// First read returns the packet.
+		n := copy(p, m.data)
+		return n, m.srcAddr, nil
+	case <-m.closed:
+		return 0, nil, net.ErrClosed
+	}
+}
+
+func (m *mockPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) { return len(p), nil }
+func (m *mockPacketConn) Close() error                                 { close(m.closed); return nil }
+func (m *mockPacketConn) LocalAddr() net.Addr                          { return nil }
+func (m *mockPacketConn) SetDeadline(t time.Time) error                { return nil }
+func (m *mockPacketConn) SetReadDeadline(t time.Time) error            { return nil }
+func (m *mockPacketConn) SetWriteDeadline(t time.Time) error           { return nil }
+
+func TestReceiverIPv6_DeliversPacket(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   42,
+		Priority:  100,
+	}, &net.Interface{Name: "eth0"}, eventCh)
+	vi.localIPv6 = net.ParseIP("fe80::1")
+
+	// Build a valid VRRPv3 packet.
+	srcIP := net.ParseIP("fe80::2")
+	dstIP := net.ParseIP("ff02::12")
+	pkt := &VRRPPacket{
+		VRID:         42,
+		Priority:     200,
+		MaxAdvertInt: 100,
+		IPAddresses:  []net.IP{net.ParseIP("2001:db8::1")},
+	}
+	data, err := pkt.Marshal(true, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readOnce := make(chan struct{}, 1)
+	readOnce <- struct{}{} // allow one read
+	mock := &mockPacketConn{
+		data:     data,
+		srcAddr:  &net.IPAddr{IP: srcIP},
+		readOnce: readOnce,
+		closed:   make(chan struct{}),
+	}
+	vi.ipv6Conn = mock
+
+	// Start receiver.
+	go vi.receiverIPv6()
+	defer close(vi.stopCh)
+
+	// Wait for packet delivery.
+	select {
+	case rx := <-vi.rxCh:
+		if rx.Priority != 200 {
+			t.Errorf("priority = %d, want 200", rx.Priority)
+		}
+		if rx.VRID != 42 {
+			t.Errorf("VRID = %d, want 42", rx.VRID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for IPv6 packet on rxCh")
+	}
+}
+
+func TestEmitEvent_DropDoesNotPanic(t *testing.T) {
+	// Create a channel with buffer 1 and fill it.
+	eventCh := make(chan VRRPEvent, 1)
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+	}, &net.Interface{Name: "eth0"}, eventCh)
+	vi.setState(StateMaster)
+
+	// First event should succeed.
+	vi.emitEvent()
+	if len(eventCh) != 1 {
+		t.Errorf("eventCh length = %d, want 1", len(eventCh))
+	}
+
+	// Second event should be dropped (channel full) without panic.
+	vi.emitEvent()
+	if len(eventCh) != 1 {
+		t.Errorf("eventCh length = %d, want 1 (dropped event should not grow)", len(eventCh))
+	}
+}
+
+func TestEmitEvent_DropSilentDuringShutdown(t *testing.T) {
+	// When stopCh is closed (shutting down), dropped events should not warn.
+	eventCh := make(chan VRRPEvent, 1)
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+	}, &net.Interface{Name: "eth0"}, eventCh)
+	vi.setState(StateMaster)
+
+	// Fill channel.
+	vi.emitEvent()
+
+	// Close stopCh to simulate shutdown.
+	close(vi.stopCh)
+
+	// This should drop silently without panic or warning.
+	vi.emitEvent()
+	if len(eventCh) != 1 {
+		t.Errorf("eventCh length = %d, want 1", len(eventCh))
+	}
+}
+
+func TestSendPacketIPv6_NilLocalIPv6_ReturnsError(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface: "lo",
+		GroupID:   42,
+		Priority:  200,
+		VirtualAddresses: []string{"2001:db8::1/128"},
+	}, &net.Interface{Name: "lo", Index: 1}, eventCh)
+	// localIPv6 is nil and interface has no link-local → should error.
+	vi.localIPv6 = nil
+
+	// Create a mock conn so ipv6Conn is non-nil (we test the srcIP path).
+	vi.ipv6Conn = &mockPacketConn{
+		closed: make(chan struct{}),
+	}
+
+	pkt := &VRRPPacket{
+		VRID:         42,
+		Priority:     200,
+		MaxAdvertInt: 100,
+		IPAddresses:  []net.IP{net.ParseIP("2001:db8::1")},
+	}
+	err := vi.sendPacketIPv6(pkt)
+	if err == nil {
+		t.Fatal("expected error for nil localIPv6, got nil")
+	}
+	if !strings.Contains(err.Error(), "no link-local IPv6") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestSendPacketIPv6_WithLocalIPv6_SendsPacket(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface: "lo",
+		GroupID:   42,
+		Priority:  200,
+		VirtualAddresses: []string{"2001:db8::1/128"},
+	}, &net.Interface{Name: "lo", Index: 1}, eventCh)
+	vi.localIPv6 = net.ParseIP("fe80::1")
+
+	var sentData []byte
+	var sentAddr net.Addr
+	mock := &mockPacketConn{
+		closed: make(chan struct{}),
+	}
+	// Override WriteTo to capture the sent data.
+	vi.ipv6Conn = &capturingPacketConn{
+		mockPacketConn: mock,
+		onWriteTo: func(p []byte, addr net.Addr) {
+			sentData = make([]byte, len(p))
+			copy(sentData, p)
+			sentAddr = addr
+		},
+	}
+
+	pkt := &VRRPPacket{
+		VRID:         42,
+		Priority:     200,
+		MaxAdvertInt: 100,
+		IPAddresses:  []net.IP{net.ParseIP("2001:db8::1")},
+	}
+	err := vi.sendPacketIPv6(pkt)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sentData == nil {
+		t.Fatal("no data was sent")
+	}
+	// Verify Zone is not set on destination.
+	ipAddr, ok := sentAddr.(*net.IPAddr)
+	if !ok {
+		t.Fatalf("addr type = %T, want *net.IPAddr", sentAddr)
+	}
+	if ipAddr.Zone != "" {
+		t.Errorf("Zone = %q, want empty (socket has IPV6_MULTICAST_IF)", ipAddr.Zone)
+	}
+}
+
+// capturingPacketConn wraps mockPacketConn to capture WriteTo calls.
+type capturingPacketConn struct {
+	*mockPacketConn
+	onWriteTo func(p []byte, addr net.Addr)
+}
+
+func (c *capturingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if c.onWriteTo != nil {
+		c.onWriteTo(p, addr)
+	}
+	return len(p), nil
 }

@@ -3768,10 +3768,20 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 	}
 }
 
+// rethVRIDBase is the VRRP GroupID offset for RETH instances.
+// RETH instances use GroupID = rethVRIDBase + rgID (set in pkg/vrrp/vrrp.go).
+// Standalone VRRP groups use GroupID < rethVRIDBase.
+const rethVRIDBase = 100
+
+// isRethVRID returns true if the VRRP GroupID belongs to a RETH instance.
+func isRethVRID(vrid int) bool {
+	return vrid >= rethVRIDBase
+}
+
 // rgIDFromVRID extracts the redundancy group ID from a VRRP group ID.
-// VRID = 100 + RG ID (set in pkg/vrrp/vrrp.go).
+// VRID = rethVRIDBase + RG ID (set in pkg/vrrp/vrrp.go).
 func rgIDFromVRID(vrid int) int {
-	return vrid - 100
+	return vrid - rethVRIDBase
 }
 
 // watchVRRPEvents monitors VRRP state changes and logs transitions.
@@ -3788,6 +3798,16 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 		case ev, ok := <-d.vrrpMgr.Events():
 			if !ok {
 				return
+			}
+			// Standalone VRRP instances (GroupID < rethVRIDBase) do not
+			// participate in HA redundancy group state. Skip the
+			// rg_active/blackhole logic to avoid creating phantom RG entries.
+			if !isRethVRID(ev.GroupID) {
+				slog.Info("vrrp: standalone state change (non-RETH)",
+					"interface", ev.Interface,
+					"group", ev.GroupID,
+					"state", ev.State.String())
+				continue
 			}
 			rgID := rgIDFromVRID(ev.GroupID)
 			slog.Info("vrrp: state change",
@@ -3829,6 +3849,9 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 // This is the safety net for dropped events (non-blocking channel sends).
 // Runs every 2s; skips if cluster or dataplane is nil.
 func (d *Daemon) reconcileRGStateLoop(ctx context.Context) {
+	// Run immediately on startup to correct stale rg_active from prior run.
+	d.reconcileRGState()
+
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -3851,8 +3874,12 @@ func (d *Daemon) reconcileRGState() {
 	vrrpStates := d.vrrpMgr.InstanceStates()
 
 	// Build per-RG VRRP state map: rgID → { iface → isMaster }.
+	// Skip standalone (non-RETH) VRRP instances.
 	rgVRRP := make(map[int]map[string]bool)
 	for _, ev := range vrrpStates {
+		if !isRethVRID(ev.GroupID) {
+			continue
+		}
 		rgID := rgIDFromVRID(ev.GroupID)
 		if rgVRRP[rgID] == nil {
 			rgVRRP[rgID] = make(map[string]bool)
@@ -3860,13 +3887,26 @@ func (d *Daemon) reconcileRGState() {
 		rgVRRP[rgID][ev.Interface] = (ev.State == vrrp.StateMaster)
 	}
 
-	// Reconcile each known RG.
+	// Collect all known RG IDs from three sources:
+	// 1) existing rgStates (event-driven)
+	// 2) cluster-configured groups (may exist before VRRP fires)
+	// 3) RETH VRRP instances (may exist before cluster events)
+	seen := make(map[int]bool)
 	d.rgStatesMu.RLock()
-	rgIDs := make([]int, 0, len(d.rgStates))
 	for rgID := range d.rgStates {
-		rgIDs = append(rgIDs, rgID)
+		seen[rgID] = true
 	}
 	d.rgStatesMu.RUnlock()
+	for _, gs := range d.cluster.GroupStates() {
+		seen[gs.GroupID] = true
+	}
+	for rgID := range rgVRRP {
+		seen[rgID] = true
+	}
+	rgIDs := make([]int, 0, len(seen))
+	for rgID := range seen {
+		rgIDs = append(rgIDs, rgID)
+	}
 
 	for _, rgID := range rgIDs {
 		clusterPri := d.cluster.IsLocalPrimary(rgID)

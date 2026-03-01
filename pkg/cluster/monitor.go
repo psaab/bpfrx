@@ -12,6 +12,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // monitorState tracks the dampened state for a single monitor probe.
@@ -54,8 +55,14 @@ type Monitor struct {
 	// Can be overridden for testing.
 	nlHandle nlLinkGetter
 
+	// cachedNlHandle is the production netlink handle created on first use.
+	// Stored separately so Stop() can close it without adding Close() to
+	// the nlLinkGetter test interface.
+	cachedNlHandle *netlink.Handle
+
 	// icmpDialer can be overridden for testing.
-	icmpDialer func() (icmpConn, error)
+	// network is "udp4" or "udp6".
+	icmpDialer func(network string) (icmpConn, error)
 
 	// Dampening thresholds (0 means use default).
 	FailThreshold int
@@ -166,11 +173,16 @@ func (mon *Monitor) Stop() {
 	mon.mu.Lock()
 	cancel := mon.cancel
 	mon.cancel = nil
+	nlh := mon.cachedNlHandle
+	mon.cachedNlHandle = nil
 	mon.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 		mon.wg.Wait()
+	}
+	if nlh != nil {
+		nlh.Close()
 	}
 }
 
@@ -205,13 +217,18 @@ func (mon *Monitor) poll() {
 	groups := mon.groups
 	mon.mu.Unlock()
 
-	// Rebuild local statuses each cycle.
-	mon.localStatuses = mon.localStatuses[:0]
+	// Rebuild local statuses into a local slice, then swap under lock
+	// to avoid racing with LocalInterfaceStatuses().
+	var statuses []InterfaceMonitorInfo
 
 	for _, rg := range groups {
-		mon.pollInterfaceMonitors(rg)
+		statuses = mon.pollInterfaceMonitors(rg, statuses)
 		mon.pollIPMonitors(rg)
 	}
+
+	mon.mu.Lock()
+	mon.localStatuses = statuses
+	mon.mu.Unlock()
 }
 
 // LocalInterfaceStatuses returns the latest snapshot of local interface monitor states.
@@ -227,7 +244,7 @@ func (mon *Monitor) LocalInterfaceStatuses() []InterfaceMonitorInfo {
 	return cp
 }
 
-func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup) {
+func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses []InterfaceMonitorInfo) []InterfaceMonitorInfo {
 	nlh := mon.getNlHandle()
 
 	for _, im := range rg.InterfaceMonitors {
@@ -246,7 +263,7 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup) {
 			link.Attrs().Flags&net.FlagUp != 0
 
 		// Track local interface status for heartbeat propagation.
-		mon.localStatuses = append(mon.localStatuses, InterfaceMonitorInfo{
+		statuses = append(statuses, InterfaceMonitorInfo{
 			Interface:       im.Interface,
 			Weight:          im.Weight,
 			Up:              up,
@@ -273,6 +290,7 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup) {
 				"up", up, "weight", im.Weight)
 		}
 	}
+	return statuses
 }
 
 func (mon *Monitor) pollIPMonitors(rg *config.RedundancyGroup) {
@@ -321,14 +339,38 @@ func (mon *Monitor) probeICMP(addr string) bool {
 		dialer = defaultICMPDialer
 	}
 
-	conn, err := dialer()
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+
+	isIPv6 := ip.To4() == nil
+
+	var network string
+	var echoType icmp.Type
+	var replyType icmp.Type
+	var proto int // IANA protocol number for icmp.ParseMessage
+
+	if isIPv6 {
+		network = "udp6"
+		echoType = ipv6.ICMPTypeEchoRequest
+		replyType = ipv6.ICMPTypeEchoReply
+		proto = 58 // ICMPv6
+	} else {
+		network = "udp4"
+		echoType = ipv4.ICMPTypeEcho
+		replyType = ipv4.ICMPTypeEchoReply
+		proto = 1 // ICMPv4
+	}
+
+	conn, err := dialer(network)
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
 
 	msg := icmp.Message{
-		Type: ipv4.ICMPTypeEcho,
+		Type: echoType,
 		Code: 0,
 		Body: &icmp.Echo{
 			ID:   0xbf,
@@ -341,7 +383,7 @@ func (mon *Monitor) probeICMP(addr string) bool {
 		return false
 	}
 
-	dst := &net.UDPAddr{IP: net.ParseIP(addr)}
+	dst := &net.UDPAddr{IP: ip}
 	if _, err := conn.WriteTo(b, dst); err != nil {
 		return false
 	}
@@ -353,15 +395,21 @@ func (mon *Monitor) probeICMP(addr string) bool {
 		return false
 	}
 
-	parsed, err := icmp.ParseMessage(1, reply[:n])
+	parsed, err := icmp.ParseMessage(proto, reply[:n])
 	if err != nil {
 		return false
 	}
-	return parsed.Type == ipv4.ICMPTypeEchoReply
+	return parsed.Type == replyType
 }
 
-func defaultICMPDialer() (icmpConn, error) {
-	c, err := icmp.ListenPacket("udp4", "0.0.0.0")
+func defaultICMPDialer(network string) (icmpConn, error) {
+	var listenAddr string
+	if network == "udp6" {
+		listenAddr = "::"
+	} else {
+		listenAddr = "0.0.0.0"
+	}
+	c, err := icmp.ListenPacket(network, listenAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -372,11 +420,16 @@ func (mon *Monitor) getNlHandle() nlLinkGetter {
 	if mon.nlHandle != nil {
 		return mon.nlHandle
 	}
+	// Cache the production handle to avoid leaking netlink sockets.
+	if mon.cachedNlHandle != nil {
+		return mon.cachedNlHandle
+	}
 	h, err := netlink.NewHandle()
 	if err != nil {
 		slog.Warn("cluster monitor: failed to create netlink handle", "err", err)
 		return &noopNlHandle{}
 	}
+	mon.cachedNlHandle = h
 	return h
 }
 

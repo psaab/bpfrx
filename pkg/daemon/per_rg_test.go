@@ -3,7 +3,9 @@ package daemon
 import (
 	"testing"
 
+	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/vrrp"
 )
 
 func newTestDaemon() *Daemon {
@@ -166,6 +168,66 @@ func TestRgIDFromVRID(t *testing.T) {
 	}
 }
 
+func TestIsRethVRID(t *testing.T) {
+	tests := []struct {
+		vrid int
+		want bool
+	}{
+		{0, false},   // standalone
+		{1, false},   // standalone
+		{50, false},  // standalone
+		{99, false},  // standalone
+		{100, true},  // RETH RG 0
+		{101, true},  // RETH RG 1
+		{200, true},  // RETH RG 100
+	}
+	for _, tt := range tests {
+		got := isRethVRID(tt.vrid)
+		if got != tt.want {
+			t.Errorf("isRethVRID(%d) = %v, want %v", tt.vrid, got, tt.want)
+		}
+	}
+}
+
+func TestNonRethVRRPDoesNotPollute(t *testing.T) {
+	d := newTestDaemon()
+
+	// Standalone VRRP with GroupID < rethVRIDBase should NOT create
+	// rgStates entries or produce valid RG IDs.
+	standaloneVRID := 50
+
+	// Verify isRethVRID blocks it.
+	if isRethVRID(standaloneVRID) {
+		t.Fatal("standalone VRID 50 should not be treated as RETH")
+	}
+
+	// Verify no phantom RG state was created.
+	d.rgStatesMu.RLock()
+	_, exists := d.rgStates[standaloneVRID-rethVRIDBase]
+	d.rgStatesMu.RUnlock()
+	if exists {
+		t.Error("standalone VRRP should not create rgStates entry")
+	}
+
+	// RETH VRRP with GroupID >= rethVRIDBase should create entries.
+	rethVRID := 100 // RG 0
+	if !isRethVRID(rethVRID) {
+		t.Fatal("RETH VRID 100 should be treated as RETH")
+	}
+	rgID := rgIDFromVRID(rethVRID)
+	d.getOrCreateRGState(rgID).SetVRRP("reth0", true)
+
+	d.rgStatesMu.RLock()
+	_, exists = d.rgStates[0]
+	d.rgStatesMu.RUnlock()
+	if !exists {
+		t.Error("RETH VRRP event should create rgStates entry for RG 0")
+	}
+	if !d.isRethMasterState(0) {
+		t.Error("RG 0 should be master after RETH VRRP MASTER event")
+	}
+}
+
 func TestBuildZoneRGMap(t *testing.T) {
 	cfg := &config.Config{
 		Security: config.SecurityConfig{
@@ -258,5 +320,104 @@ func TestRethInterfacesForRG(t *testing.T) {
 	ifaces3 := rethInterfacesForRG(cfg, 3)
 	if len(ifaces3) != 0 {
 		t.Fatalf("expected 0 interfaces for RG 3, got %d", len(ifaces3))
+	}
+}
+
+func TestReconcileDiscoversClusterGroups(t *testing.T) {
+	// Verify that reconcileRGState() discovers RGs from cluster state
+	// that haven't yet been created in d.rgStates by VRRP events.
+	cm := cluster.NewManager(0, 1)
+	cm.UpdateConfig(&config.ClusterConfig{
+		RedundancyGroups: []*config.RedundancyGroup{
+			{ID: 0, NodePriorities: map[int]int{0: 200}},
+			{ID: 1, NodePriorities: map[int]int{0: 100}},
+		},
+	})
+
+	vm := vrrp.NewManager()
+
+	d := &Daemon{
+		rgStates: make(map[int]*rgStateMachine),
+		cluster:  cm,
+		vrrpMgr:  vm,
+	}
+
+	// Before reconciliation: no rgStates entries.
+	d.rgStatesMu.RLock()
+	if len(d.rgStates) != 0 {
+		t.Fatalf("expected 0 rgStates entries initially, got %d", len(d.rgStates))
+	}
+	d.rgStatesMu.RUnlock()
+
+	// Run reconciliation — should discover RG 0 and RG 1 from cluster.
+	d.reconcileRGState()
+
+	d.rgStatesMu.RLock()
+	if len(d.rgStates) != 2 {
+		t.Fatalf("expected 2 rgStates entries after reconciliation, got %d", len(d.rgStates))
+	}
+	_, hasRG0 := d.rgStates[0]
+	_, hasRG1 := d.rgStates[1]
+	d.rgStatesMu.RUnlock()
+
+	if !hasRG0 {
+		t.Error("reconciliation should have created rgStates entry for RG 0")
+	}
+	if !hasRG1 {
+		t.Error("reconciliation should have created rgStates entry for RG 1")
+	}
+}
+
+func TestReconcileDiscoversVRRPInstances(t *testing.T) {
+	// Verify that reconcileRGState() discovers RGs from VRRP instance
+	// states even when cluster hasn't reported that group yet.
+	cm := cluster.NewManager(0, 1)
+	// No cluster groups configured — but RG 0 should still be
+	// discovered from VRRP instance state via the rgVRRP map.
+
+	vm := vrrp.NewManager()
+
+	d := &Daemon{
+		rgStates: make(map[int]*rgStateMachine),
+		cluster:  cm,
+		vrrpMgr:  vm,
+	}
+
+	// Manually create a RETH VRRP state entry via the event path.
+	// GroupID = 100 (= RG 0).
+	d.getOrCreateRGState(0).SetVRRP("reth0", true)
+
+	// Verify RG 0 exists in rgStates.
+	d.rgStatesMu.RLock()
+	if len(d.rgStates) != 1 {
+		t.Fatalf("expected 1 rgStates entry, got %d", len(d.rgStates))
+	}
+	d.rgStatesMu.RUnlock()
+
+	// Add another cluster group that rgStates doesn't have.
+	cm.UpdateConfig(&config.ClusterConfig{
+		RedundancyGroups: []*config.RedundancyGroup{
+			{ID: 0, NodePriorities: map[int]int{0: 200}},
+			{ID: 2, NodePriorities: map[int]int{0: 150}},
+		},
+	})
+
+	// Reconcile — should discover RG 2 from cluster, keep RG 0.
+	d.reconcileRGState()
+
+	d.rgStatesMu.RLock()
+	count := len(d.rgStates)
+	_, hasRG0 := d.rgStates[0]
+	_, hasRG2 := d.rgStates[2]
+	d.rgStatesMu.RUnlock()
+
+	if count != 2 {
+		t.Fatalf("expected 2 rgStates entries, got %d", count)
+	}
+	if !hasRG0 {
+		t.Error("should have RG 0 from VRRP event")
+	}
+	if !hasRG2 {
+		t.Error("should have RG 2 from cluster discovery")
 	}
 }

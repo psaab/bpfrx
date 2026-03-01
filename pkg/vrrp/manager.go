@@ -35,7 +35,7 @@ type Manager struct {
 func NewManager() *Manager {
 	return &Manager{
 		instances: make(map[instanceKey]*vrrpInstance),
-		eventCh:   make(chan VRRPEvent, 64),
+		eventCh:   make(chan VRRPEvent, 256),
 	}
 }
 

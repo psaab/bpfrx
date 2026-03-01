@@ -272,6 +272,16 @@ func (vi *vrrpInstance) run() {
 		go vi.receiverAfPacket()
 	} else {
 		go vi.receiver()
+		// The IPv4-only raw socket fallback cannot receive IPv6 VRRP.
+		// Start a separate IPv6 receiver if we have an IPv6 socket.
+		if vi.ipv6Conn != nil {
+			slog.Warn("vrrp: af_packet unavailable, using separate IPv6 raw socket fallback",
+				"key", vi.key())
+			go vi.receiverIPv6()
+		} else if vi.localIPv6 != nil {
+			slog.Warn("vrrp: af_packet unavailable and no IPv6 socket — IPv6 VRRP reception disabled",
+				"key", vi.key())
+		}
 	}
 
 	// Transition to Backup state.
@@ -439,6 +449,69 @@ func (vi *vrrpInstance) receiver() {
 		case vi.rxCh <- pkt:
 		default:
 			// Drop if channel full.
+		}
+	}
+}
+
+// receiverIPv6 reads VRRPv3 packets from the IPv6 raw socket (ip6:112).
+// Used as fallback when AF_PACKET is unavailable. The kernel strips the
+// IPv6 header for raw sockets, so ReadFrom returns the VRRP payload directly.
+// Source address comes from the addr parameter of ReadFrom.
+func (vi *vrrpInstance) receiverIPv6() {
+	buf := make([]byte, 1500)
+	for {
+		select {
+		case <-vi.stopCh:
+			return
+		default:
+		}
+
+		vi.ipv6Conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, addr, err := vi.ipv6Conn.ReadFrom(buf)
+		if err != nil {
+			select {
+			case <-vi.stopCh:
+				return
+			default:
+				if !isTimeoutError(err) {
+					slog.Debug("vrrp: ipv6 read error", "key", vi.key(), "err", err)
+				}
+				continue
+			}
+		}
+
+		if n < vrrpHeaderLen {
+			continue
+		}
+
+		// Only accept packets matching our VRID.
+		if buf[1] != uint8(vi.cfg.GroupID) {
+			continue
+		}
+
+		// Extract source IP from the addr returned by ReadFrom.
+		var srcIP net.IP
+		if ipAddr, ok := addr.(*net.IPAddr); ok {
+			srcIP = ipAddr.IP
+		}
+
+		// Filter self-sent packets.
+		if vi.localIPv6 != nil && srcIP != nil && srcIP.Equal(vi.localIPv6) {
+			continue
+		}
+
+		// IPv6 VRRP multicast destination (ff02::12).
+		dstIP := net.ParseIP("ff02::12")
+
+		pkt, err := ParseVRRPPacket(buf[:n], true, srcIP, dstIP)
+		if err != nil {
+			slog.Debug("vrrp: ipv6 parse error", "key", vi.key(), "err", err)
+			continue
+		}
+
+		select {
+		case vi.rxCh <- pkt:
+		default:
 		}
 	}
 }
@@ -631,13 +704,21 @@ func (vi *vrrpInstance) handleMasterRx(pkt *VRRPPacket, masterDownTimer, advertT
 	if pktPri > pri {
 		// Higher priority — step down unconditionally.
 		vi.becomeBackup(masterDownTimer, advertTimer)
-	} else if pktPri == pri && pkt.SrcIP != nil && vi.localIP != nil &&
-		bytes.Compare(pkt.SrcIP.To4(), vi.localIP.To4()) > 0 {
+	} else if pktPri == pri && pkt.SrcIP != nil {
 		// Equal priority — RFC 5798 §6.4.3 tie-break: higher IP wins.
-		slog.Info("vrrp: equal priority tie-break, peer IP is higher — stepping down",
-			"key", vi.key(), "our_ip", vi.localIP, "peer_ip", pkt.SrcIP,
-			"priority", pri)
-		vi.becomeBackup(masterDownTimer, advertTimer)
+		// Handle both IPv4 and IPv6 address families.
+		var peerHigher bool
+		if pkt.SrcIP.To4() != nil && vi.localIP != nil {
+			peerHigher = bytes.Compare(pkt.SrcIP.To4(), vi.localIP.To4()) > 0
+		} else if pkt.SrcIP.To4() == nil && vi.localIPv6 != nil {
+			peerHigher = bytes.Compare(pkt.SrcIP.To16(), vi.localIPv6.To16()) > 0
+		}
+		if peerHigher {
+			slog.Info("vrrp: equal priority tie-break, peer IP is higher — stepping down",
+				"key", vi.key(), "our_ip", vi.localIP, "our_ipv6", vi.localIPv6,
+				"peer_ip", pkt.SrcIP, "priority", pri)
+			vi.becomeBackup(masterDownTimer, advertTimer)
+		}
 	}
 	// Lower priority, or equal with our IP higher: stay Master.
 }
@@ -670,15 +751,22 @@ func (vi *vrrpInstance) becomeBackup(masterDownTimer, advertTimer *time.Timer) {
 
 // emitEvent sends a state change event to the manager's event channel.
 func (vi *vrrpInstance) emitEvent() {
-	select {
-	case vi.eventCh <- VRRPEvent{
+	evt := VRRPEvent{
 		Interface: vi.cfg.Interface,
 		GroupID:   vi.cfg.GroupID,
 		State:     vi.getState(),
 		VIPs:      vi.cfg.VirtualAddresses,
-	}:
+	}
+	select {
+	case vi.eventCh <- evt:
 	default:
-		// Drop if channel full — non-blocking.
+		// Drop if channel full — warn unless we're shutting down.
+		select {
+		case <-vi.stopCh:
+		default:
+			slog.Warn("vrrp: event channel full, dropping event",
+				"key", vi.key(), "state", evt.State)
+		}
 	}
 }
 
@@ -812,7 +900,9 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 
 	srcIP := vi.localIPv6
 	if srcIP == nil {
-		// Lazy resolve: find link-local address.
+		// Lazy resolve: find link-local address. This happens when the
+		// interface didn't have a link-local at openSocket() time (e.g.
+		// DAD still running or address assigned after socket open).
 		vipSet := make(map[string]bool, len(vi.cfg.VirtualAddresses))
 		for _, vip := range vi.cfg.VirtualAddresses {
 			addr := vip
@@ -829,11 +919,15 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 					!vipSet[ipNet.IP.String()] {
 					vi.localIPv6 = ipNet.IP
 					srcIP = vi.localIPv6
+					slog.Info("vrrp: late-resolved IPv6 link-local address",
+						"key", vi.key(), "addr", srcIP)
 					break
 				}
 			}
 		}
 		if srcIP == nil {
+			slog.Warn("vrrp: no link-local IPv6 address, skipping IPv6 advert",
+				"key", vi.key(), "interface", vi.cfg.Interface)
 			return fmt.Errorf("no link-local IPv6 address on %s", vi.cfg.Interface)
 		}
 	}
@@ -845,9 +939,11 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 		return err
 	}
 
+	// Don't set Zone — the socket already has IPV6_MULTICAST_IF bound
+	// to the interface. Setting Zone on the destination can cause EINVAL
+	// on some kernels when the socket option is already set.
 	dst := &net.IPAddr{
-		IP:   dstIP,
-		Zone: vi.cfg.Interface,
+		IP: dstIP,
 	}
 	if _, err := vi.ipv6Conn.WriteTo(data, dst); err != nil {
 		return fmt.Errorf("ipv6 writeto: %w", err)
