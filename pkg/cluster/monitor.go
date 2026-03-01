@@ -14,8 +14,26 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
+// monitorState tracks the dampened state for a single monitor probe.
+type monitorState struct {
+	down            bool      // dampened state (what we've reported to SetMonitorWeight)
+	consecutiveFail int       // consecutive polls seeing failure
+	consecutivePass int       // consecutive polls seeing success
+	holdDownUntil   time.Time // earliest allowed next state change
+}
+
+// Dampening defaults.
+const (
+	DefaultMonitorFailThreshold = 3              // consecutive failures before marking down
+	DefaultMonitorPassThreshold = 3              // consecutive successes before marking up
+	DefaultMonitorHoldDown      = 5 * time.Second // hold-down after state change
+)
+
 // Monitor periodically checks interface link states and IP reachability,
 // updating the cluster Manager's monitor weights when changes occur.
+// State changes are dampened: an interface must fail/recover for multiple
+// consecutive polls before the weight is adjusted, and a hold-down timer
+// prevents rapid oscillation after each transition.
 type Monitor struct {
 	mgr    *Manager
 	groups []*config.RedundancyGroup
@@ -24,9 +42,9 @@ type Monitor struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	// Track last-known states to only call SetMonitorWeight on changes.
-	ifaceDown map[monitorKey]bool
-	ipDown    map[ipMonitorKey]bool
+	// Dampened state per interface/IP monitor.
+	ifaceState map[monitorKey]*monitorState
+	ipState    map[ipMonitorKey]*monitorState
 
 	// localStatuses holds the latest local interface monitor states,
 	// rebuilt on every poll cycle. Used to populate heartbeat packets.
@@ -38,6 +56,14 @@ type Monitor struct {
 
 	// icmpDialer can be overridden for testing.
 	icmpDialer func() (icmpConn, error)
+
+	// Dampening thresholds (0 means use default).
+	FailThreshold int
+	PassThreshold int
+	HoldDown      time.Duration
+
+	// nowFunc can be overridden for testing time-dependent behavior.
+	nowFunc func() time.Time
 }
 
 // nlLinkGetter abstracts netlink.Handle.LinkByName for testing.
@@ -61,11 +87,64 @@ type ipMonitorKey struct {
 // NewMonitor creates a monitor that will poll interface and IP states.
 func NewMonitor(mgr *Manager, groups []*config.RedundancyGroup) *Monitor {
 	return &Monitor{
-		mgr:       mgr,
-		groups:    groups,
-		ifaceDown: make(map[monitorKey]bool),
-		ipDown:    make(map[ipMonitorKey]bool),
+		mgr:        mgr,
+		groups:     groups,
+		ifaceState: make(map[monitorKey]*monitorState),
+		ipState:    make(map[ipMonitorKey]*monitorState),
 	}
+}
+
+func (mon *Monitor) failThreshold() int {
+	if mon.FailThreshold > 0 {
+		return mon.FailThreshold
+	}
+	return DefaultMonitorFailThreshold
+}
+
+func (mon *Monitor) passThreshold() int {
+	if mon.PassThreshold > 0 {
+		return mon.PassThreshold
+	}
+	return DefaultMonitorPassThreshold
+}
+
+func (mon *Monitor) holdDownDuration() time.Duration {
+	if mon.HoldDown > 0 {
+		return mon.HoldDown
+	}
+	return DefaultMonitorHoldDown
+}
+
+func (mon *Monitor) now() time.Time {
+	if mon.nowFunc != nil {
+		return mon.nowFunc()
+	}
+	return time.Now()
+}
+
+// evaluateTransition applies dampening logic and returns true if the
+// dampened state has changed (caller should fire SetMonitorWeight).
+func (mon *Monitor) evaluateTransition(state *monitorState, currentlyDown bool) bool {
+	now := mon.now()
+
+	if currentlyDown {
+		state.consecutiveFail++
+		state.consecutivePass = 0
+		if !state.down && state.consecutiveFail >= mon.failThreshold() && now.After(state.holdDownUntil) {
+			state.down = true
+			state.holdDownUntil = now.Add(mon.holdDownDuration())
+			return true
+		}
+	} else {
+		state.consecutivePass++
+		state.consecutiveFail = 0
+		if state.down && state.consecutivePass >= mon.passThreshold() && now.After(state.holdDownUntil) {
+			state.down = false
+			state.holdDownUntil = now.Add(mon.holdDownDuration())
+			return true
+		}
+	}
+	return false
 }
 
 // Start begins periodic monitoring. Safe to call multiple times (stops previous).
@@ -174,13 +253,15 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup) {
 			RedundancyGroup: rg.ID,
 		})
 
-		wasDown := mon.ifaceDown[key]
-		isDown := !up
+		state := mon.ifaceState[key]
+		if state == nil {
+			state = &monitorState{}
+			mon.ifaceState[key] = state
+		}
 
-		if isDown != wasDown {
-			mon.ifaceDown[key] = isDown
-			mon.mgr.SetMonitorWeight(rg.ID, im.Interface, isDown, im.Weight)
-			if isDown {
+		if mon.evaluateTransition(state, !up) {
+			mon.mgr.SetMonitorWeight(rg.ID, im.Interface, state.down, im.Weight)
+			if state.down {
 				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
 					"Interface %s state changed to down, weight %d", im.Interface, im.Weight))
 			} else {
@@ -204,9 +285,6 @@ func (mon *Monitor) pollIPMonitors(rg *config.RedundancyGroup) {
 
 		reachable := mon.probeICMP(target.Address)
 
-		wasDown := mon.ipDown[key]
-		isDown := !reachable
-
 		weight := target.Weight
 		if weight == 0 {
 			weight = rg.IPMonitoring.GlobalWeight
@@ -215,10 +293,15 @@ func (mon *Monitor) pollIPMonitors(rg *config.RedundancyGroup) {
 		// Use "ip:" prefix to distinguish from interface monitors.
 		monName := "ip:" + target.Address
 
-		if isDown != wasDown {
-			mon.ipDown[key] = isDown
-			mon.mgr.SetMonitorWeight(rg.ID, monName, isDown, weight)
-			if isDown {
+		state := mon.ipState[key]
+		if state == nil {
+			state = &monitorState{}
+			mon.ipState[key] = state
+		}
+
+		if mon.evaluateTransition(state, !reachable) {
+			mon.mgr.SetMonitorWeight(rg.ID, monName, state.down, weight)
+			if state.down {
 				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
 					"IP %s unreachable, weight %d", target.Address, weight))
 			} else {

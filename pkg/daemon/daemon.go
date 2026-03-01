@@ -106,10 +106,13 @@ type Daemon struct {
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
 	mgmtVRFInterfaces map[string]bool
 
-	// rethMasterState tracks per-RG VRRP master state. In active/active HA,
-	// a node can be MASTER for one RG and BACKUP for another simultaneously.
-	haStateMu       sync.RWMutex
-	rethMasterState map[int]bool
+	// rgStates tracks the unified cluster + VRRP state for each
+	// redundancy group. Both watchClusterEvents and watchVRRPEvents
+	// funnel transitions through rgStateMachine, which determines the
+	// desired rg_active value and provides an epoch counter for
+	// stale-update detection.
+	rgStatesMu sync.RWMutex
+	rgStates   map[int]*rgStateMachine
 
 	// blackholeRoutes tracks blackhole routes injected for inactive RG subnets.
 	// When an RG goes BACKUP, we inject blackhole routes for its RETH subnets
@@ -144,7 +147,7 @@ func New(opts Options) *Daemon {
 		opts:            opts,
 		startTime:       time.Now(),
 		store:           store,
-		rethMasterState: make(map[int]bool),
+		rgStates: make(map[int]*rgStateMachine),
 		blackholeRoutes: make(map[int][]netlink.Route),
 	}
 }
@@ -236,6 +239,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.applyConfig(cfg)
 			}
 		}
+	}
+
+	// Remove stale blackhole routes from previous daemon runs before
+	// cluster comms start (which may inject new ones).
+	if d.cluster != nil {
+		d.reconcileBlackholeRoutes()
 	}
 
 	// Start cluster heartbeat + sync after applyConfig (needs VRF to exist).
@@ -551,6 +560,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start VRRP event watcher (manager was created earlier, before applyConfig).
 	go d.watchVRRPEvents(context.Background())
+
+	// Start reconciliation loop — periodic safety net that corrects
+	// rg_active and blackhole route drift from dropped events.
+	if d.cluster != nil {
+		go d.reconcileRGStateLoop(ctx)
+	}
 
 	// Start HTTP API server if configured.
 	if d.opts.APIAddr != "" {
@@ -3608,26 +3623,48 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 	slog.Warn("cluster: fabric_fwd map population failed after retries")
 }
 
-func (d *Daemon) setRethMasterState(rgID int, isMaster bool) {
-	d.haStateMu.Lock()
-	d.rethMasterState[rgID] = isMaster
-	d.haStateMu.Unlock()
-}
-
-func (d *Daemon) isRethMasterState(rgID int) bool {
-	d.haStateMu.RLock()
-	isMaster := d.rethMasterState[rgID]
-	d.haStateMu.RUnlock()
-	return isMaster
-}
-
-func (d *Daemon) snapshotRethMasterState() map[int]bool {
-	d.haStateMu.RLock()
-	out := make(map[int]bool, len(d.rethMasterState))
-	for rgID, isMaster := range d.rethMasterState {
-		out[rgID] = isMaster
+// getOrCreateRGState returns the rgStateMachine for the given RG, creating
+// one if it doesn't exist yet.
+func (d *Daemon) getOrCreateRGState(rgID int) *rgStateMachine {
+	d.rgStatesMu.RLock()
+	s, ok := d.rgStates[rgID]
+	d.rgStatesMu.RUnlock()
+	if ok {
+		return s
 	}
-	d.haStateMu.RUnlock()
+	d.rgStatesMu.Lock()
+	defer d.rgStatesMu.Unlock()
+	// Double-check after upgrading to write lock.
+	if s, ok = d.rgStates[rgID]; ok {
+		return s
+	}
+	s = newRGStateMachine()
+	d.rgStates[rgID] = s
+	return s
+}
+
+// isRethMasterState returns true when ALL VRRP instances for rgID are MASTER.
+// Returns false if no instances exist for the RG.
+func (d *Daemon) isRethMasterState(rgID int) bool {
+	return d.getOrCreateRGState(rgID).AllVRRPMaster()
+}
+
+// isAnyRethInstanceMaster returns true if ANY VRRP instance for rgID is
+// MASTER. Used by the cluster event handler to defer rg_active deactivation
+// until all VRRP instances have transitioned to BACKUP.
+func (d *Daemon) isAnyRethInstanceMaster(rgID int) bool {
+	return d.getOrCreateRGState(rgID).AnyVRRPMaster()
+}
+
+// snapshotRethMasterState returns per-RG master state derived from all
+// per-instance entries. An RG is MASTER only when ALL its instances are MASTER.
+func (d *Daemon) snapshotRethMasterState() map[int]bool {
+	d.rgStatesMu.RLock()
+	defer d.rgStatesMu.RUnlock()
+	out := make(map[int]bool, len(d.rgStates))
+	for rgID, s := range d.rgStates {
+		out[rgID] = s.AllVRRPMaster()
+	}
 	return out
 }
 
@@ -3669,50 +3706,28 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				}
 			}
 
-			// Update BPF rg_active map based on cluster state.
+			// Update rg_active through unified state machine.
 			//
-			// Key insight: during manual failover (node0 → node1),
-			// there was a ~25ms dual-inactive window where BOTH nodes
-			// had rg_active=false:
-			//   - node0 (resigning): cluster Secondary → rg_active=false
-			//   - node1 (incoming): waiting for VRRP MASTER → rg_active still false
-			// At ~750K pps per stream, 25ms ≈ 18K drops per stream,
-			// causing TCP BBR cwnd collapse and permanent stream death.
-			//
-			// Fix: activate immediately on cluster Primary and defer
-			// deactivation on cluster Secondary until VRRP BACKUP fires.
-			// This creates a brief benign dual-active overlap (~5ms)
-			// instead of the traffic-killing dual-inactive gap.
-			if ev.NewState == cluster.StatePrimary {
-				// Activate immediately on Primary — don't wait for
-				// VRRP MASTER. Remove blackhole routes so FIB lookups
-				// succeed for synced sessions, then set rg_active=true.
-				// The FABRIC_FWD → XDP_DROP fix (4bdbefa) prevents
-				// SNAT'd packets from leaking to kernel even if FIB
-				// hits a stale blackhole before removal completes.
+			// Both cluster and VRRP events funnel through rgStateMachine
+			// which determines rg_active = clusterPri || anyVrrpMaster.
+			// This prevents the dual-inactive window (both nodes
+			// rg_active=false during failover) and eliminates the race
+			// between the two independent goroutine writers.
+			isPrimary := ev.NewState == cluster.StatePrimary
+			tr := d.getOrCreateRGState(ev.GroupID).SetCluster(isPrimary)
+			if isPrimary {
+				// Always remove blackhole routes on Primary — FIB
+				// lookups must succeed for synced sessions.
 				d.removeBlackholeRoutes(ev.GroupID)
-				if d.dp != nil {
-					if err := d.dp.UpdateRGActive(ev.GroupID, true); err != nil {
-						slog.Warn("failed to update rg_active from cluster event",
-							"rg", ev.GroupID, "active", true, "err", err)
-					}
-					d.dp.BumpFIBGeneration()
-				}
 				go d.warmNeighborCache()
-			} else if d.dp != nil {
-				// On Secondary/Lost/Disabled: only set rg_active=false
-				// if VRRP is NOT master for this RG. If VRRP is still
-				// MASTER (resigning node), defer to VRRP BACKUP event
-				// to avoid the dual-inactive window. The VRRP BACKUP
-				// handler fires ~5ms later (after priority-0 burst
-				// propagates) and sets rg_active=false + injects
-				// blackhole routes.
-				if !d.isRethMasterState(ev.GroupID) {
-					if err := d.dp.UpdateRGActive(ev.GroupID, false); err != nil {
-						slog.Warn("failed to update rg_active from cluster event",
-							"rg", ev.GroupID, "active", false, "err", err)
-					}
+			}
+			if tr.Changed && d.dp != nil {
+				if err := d.dp.UpdateRGActive(ev.GroupID, tr.Active); err != nil {
+					slog.Warn("failed to update rg_active from cluster event",
+						"rg", ev.GroupID, "active", tr.Active, "err", err)
 				}
+			}
+			if d.dp != nil {
 				d.dp.BumpFIBGeneration()
 			}
 
@@ -3781,28 +3796,9 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				"rg", rgID,
 				"state", ev.State.String())
 			if ev.State == vrrp.StateMaster {
-				d.setRethMasterState(rgID, true)
+				tr := d.getOrCreateRGState(rgID).SetVRRP(ev.Interface, true)
 				d.removeBlackholeRoutes(rgID)
-				if d.dp != nil {
-					// Set rg_active=true immediately on VRRP MASTER.
-					// becomeMaster() already added VIPs and sent adverts
-					// before emitting this event, so routing is ready.
-					//
-					// Previously guarded by IsLocalPrimary() to prevent
-					// a brief re-election during resign races (priority
-					// update lag).  But that guard delays rg_active by
-					// up to 200ms (heartbeat interval) — the cluster
-					// Primary event hasn't fired yet because heartbeat
-					// propagation is slower than VRRP (priority-0 burst
-					// triggers MASTER in ~5ms vs 200ms heartbeat).
-					// The 200ms dual-inactive window causes TCP stream
-					// death during rapid repeated failovers (cwnd
-					// collapse + RTO growth).
-					//
-					// The resign race is self-correcting: if VRRP
-					// briefly re-elects MASTER, the subsequent cluster
-					// Secondary or VRRP BACKUP event sets rg_active
-					// back to false within ms.
+				if tr.Changed && d.dp != nil {
 					if err := d.dp.UpdateRGActive(rgID, true); err != nil {
 						slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
 					}
@@ -3812,15 +3808,90 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				d.applyRethServicesForRG(rgID)
 			}
 			if ev.State == vrrp.StateBackup {
-				d.setRethMasterState(rgID, false)
-				if d.dp != nil {
-					if err := d.dp.UpdateRGActive(rgID, false); err != nil {
-						slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
+				tr := d.getOrCreateRGState(rgID).SetVRRP(ev.Interface, false)
+				if tr.Changed && !tr.Active {
+					if d.dp != nil {
+						if err := d.dp.UpdateRGActive(rgID, false); err != nil {
+							slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
+						}
+						d.dp.BumpFIBGeneration()
 					}
-					d.dp.BumpFIBGeneration()
+					d.injectBlackholeRoutes(rgID)
+					d.clearRethServicesForRG(rgID)
 				}
+			}
+		}
+	}
+}
+
+// reconcileRGStateLoop periodically reads the authoritative cluster and VRRP
+// states and reconciles rgStateMachine / rg_active BPF map / blackhole routes.
+// This is the safety net for dropped events (non-blocking channel sends).
+// Runs every 2s; skips if cluster or dataplane is nil.
+func (d *Daemon) reconcileRGStateLoop(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.reconcileRGState()
+		}
+	}
+}
+
+func (d *Daemon) reconcileRGState() {
+	if d.cluster == nil || d.vrrpMgr == nil {
+		return
+	}
+
+	// Read authoritative VRRP instance states.
+	vrrpStates := d.vrrpMgr.InstanceStates()
+
+	// Build per-RG VRRP state map: rgID → { iface → isMaster }.
+	rgVRRP := make(map[int]map[string]bool)
+	for _, ev := range vrrpStates {
+		rgID := rgIDFromVRID(ev.GroupID)
+		if rgVRRP[rgID] == nil {
+			rgVRRP[rgID] = make(map[string]bool)
+		}
+		rgVRRP[rgID][ev.Interface] = (ev.State == vrrp.StateMaster)
+	}
+
+	// Reconcile each known RG.
+	d.rgStatesMu.RLock()
+	rgIDs := make([]int, 0, len(d.rgStates))
+	for rgID := range d.rgStates {
+		rgIDs = append(rgIDs, rgID)
+	}
+	d.rgStatesMu.RUnlock()
+
+	for _, rgID := range rgIDs {
+		clusterPri := d.cluster.IsLocalPrimary(rgID)
+		vrrp := rgVRRP[rgID] // may be nil if no VRRP instances for this RG
+		if vrrp == nil {
+			vrrp = make(map[string]bool)
+		}
+
+		s := d.getOrCreateRGState(rgID)
+		tr := s.Reconcile(clusterPri, vrrp)
+		if tr.Changed {
+			slog.Info("reconcile: correcting rg_active drift",
+				"rg", rgID, "active", tr.Active, "epoch", tr.Epoch)
+			if d.dp != nil {
+				if err := d.dp.UpdateRGActive(rgID, tr.Active); err != nil {
+					slog.Warn("reconcile: failed to update rg_active",
+						"rg", rgID, "active", tr.Active, "err", err)
+				}
+				d.dp.BumpFIBGeneration()
+			}
+			// Reconcile blackhole routes.
+			if tr.Active {
+				d.removeBlackholeRoutes(rgID)
+			} else {
 				d.injectBlackholeRoutes(rgID)
-				d.clearRethServicesForRG(rgID)
 			}
 		}
 	}
@@ -3923,6 +3994,39 @@ func (d *Daemon) removeBlackholeRoutes(rgID int) {
 		}
 	}
 	delete(d.blackholeRoutes, rgID)
+}
+
+// reconcileBlackholeRoutes removes stale blackhole routes left by a previous
+// daemon run. The in-memory blackholeRoutes map is lost on restart, so any
+// RTN_BLACKHOLE routes with priority 4242 (our sentinel) survive in the kernel.
+// Called once at startup before cluster comms start.
+func (d *Daemon) reconcileBlackholeRoutes() {
+	d.blackholeMu.Lock()
+	defer d.blackholeMu.Unlock()
+
+	families := []int{netlink.FAMILY_V4, netlink.FAMILY_V6}
+	for _, family := range families {
+		routes, err := netlink.RouteListFiltered(family, &netlink.Route{
+			Type: unix.RTN_BLACKHOLE,
+		}, netlink.RT_FILTER_TYPE)
+		if err != nil {
+			slog.Warn("blackhole: failed to list routes for reconciliation",
+				"family", family, "err", err)
+			continue
+		}
+		for _, rt := range routes {
+			if rt.Priority != 4242 {
+				continue
+			}
+			if err := netlink.RouteDel(&rt); err != nil && !errors.Is(err, unix.ESRCH) {
+				slog.Warn("blackhole: failed to remove stale route",
+					"dst", rt.Dst, "err", err)
+			} else {
+				slog.Info("blackhole: removed stale route from previous run",
+					"dst", rt.Dst)
+			}
+		}
+	}
 }
 
 // applyRethServicesForRG starts RA senders and Kea DHCP server only for

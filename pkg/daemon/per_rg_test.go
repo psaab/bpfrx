@@ -6,6 +6,148 @@ import (
 	"github.com/psaab/bpfrx/pkg/config"
 )
 
+func newTestDaemon() *Daemon {
+	return &Daemon{
+		rgStates: make(map[int]*rgStateMachine),
+	}
+}
+
+func TestRethMasterState_SingleInstance(t *testing.T) {
+	d := newTestDaemon()
+
+	// No instances → not master.
+	if d.isRethMasterState(1) {
+		t.Error("empty map should not be master")
+	}
+	if d.isAnyRethInstanceMaster(1) {
+		t.Error("empty map should not have any master")
+	}
+
+	// Set single instance MASTER via state machine.
+	d.getOrCreateRGState(1).SetVRRP("reth0", true)
+	if !d.isRethMasterState(1) {
+		t.Error("single MASTER instance should be master")
+	}
+	if !d.isAnyRethInstanceMaster(1) {
+		t.Error("single MASTER instance should have any master")
+	}
+
+	// Set it BACKUP.
+	d.getOrCreateRGState(1).SetVRRP("reth0", false)
+	if d.isRethMasterState(1) {
+		t.Error("single BACKUP instance should not be master")
+	}
+	if d.isAnyRethInstanceMaster(1) {
+		t.Error("single BACKUP instance should not have any master")
+	}
+}
+
+func TestRethMasterState_MultiInstance(t *testing.T) {
+	d := newTestDaemon()
+
+	// Two instances, both BACKUP initially.
+	s := d.getOrCreateRGState(1)
+	s.SetVRRP("reth1", false)
+	s.SetVRRP("reth1.50", false)
+	if d.isRethMasterState(1) {
+		t.Error("all BACKUP should not be master")
+	}
+	if d.isAnyRethInstanceMaster(1) {
+		t.Error("all BACKUP should not have any master")
+	}
+
+	// First instance goes MASTER.
+	s.SetVRRP("reth1", true)
+	if d.isRethMasterState(1) {
+		t.Error("partial MASTER should not be all-master")
+	}
+	if !d.isAnyRethInstanceMaster(1) {
+		t.Error("partial MASTER should have any master")
+	}
+
+	// Second instance goes MASTER — now all MASTER.
+	s.SetVRRP("reth1.50", true)
+	if !d.isRethMasterState(1) {
+		t.Error("all MASTER should be master")
+	}
+	if !d.isAnyRethInstanceMaster(1) {
+		t.Error("all MASTER should have any master")
+	}
+
+	// One instance goes BACKUP — not all MASTER anymore.
+	s.SetVRRP("reth1", false)
+	if d.isRethMasterState(1) {
+		t.Error("partial BACKUP should not be all-master")
+	}
+	if !d.isAnyRethInstanceMaster(1) {
+		t.Error("partial BACKUP should still have any master")
+	}
+}
+
+func TestRethMasterState_MultiRG(t *testing.T) {
+	d := newTestDaemon()
+
+	// RG 0 with one instance, RG 1 with two instances.
+	d.getOrCreateRGState(0).SetVRRP("reth0", true)
+	s1 := d.getOrCreateRGState(1)
+	s1.SetVRRP("reth1", true)
+	s1.SetVRRP("reth1.50", false)
+
+	if !d.isRethMasterState(0) {
+		t.Error("RG 0 should be master")
+	}
+	if d.isRethMasterState(1) {
+		t.Error("RG 1 should not be all-master (reth1.50 is BACKUP)")
+	}
+	if !d.isAnyRethInstanceMaster(1) {
+		t.Error("RG 1 should have any master (reth1 is MASTER)")
+	}
+}
+
+func TestSnapshotRethMasterState(t *testing.T) {
+	d := newTestDaemon()
+
+	d.getOrCreateRGState(0).SetVRRP("reth0", true)
+	s1 := d.getOrCreateRGState(1)
+	s1.SetVRRP("reth1", true)
+	s1.SetVRRP("reth1.50", true)
+
+	snap := d.snapshotRethMasterState()
+	if !snap[0] {
+		t.Error("snapshot: RG 0 should be master")
+	}
+	if !snap[1] {
+		t.Error("snapshot: RG 1 should be master (all instances MASTER)")
+	}
+
+	// Make RG 1 partial BACKUP.
+	s1.SetVRRP("reth1.50", false)
+	snap = d.snapshotRethMasterState()
+	if snap[1] {
+		t.Error("snapshot: RG 1 should not be master (partial BACKUP)")
+	}
+	if !snap[0] {
+		t.Error("snapshot: RG 0 should still be master")
+	}
+}
+
+func TestRethMasterState_LastEventWinsBug(t *testing.T) {
+	// Regression test: the old code used map[int]bool, so setting
+	// one interface to BACKUP would clobber another interface's MASTER.
+	d := newTestDaemon()
+	s := d.getOrCreateRGState(1)
+
+	// Simulate: reth1 goes MASTER, then reth1.50 goes BACKUP.
+	s.SetVRRP("reth1", true)
+	s.SetVRRP("reth1.50", false)
+
+	// Old code: rethMasterState[1] = false (last event wins = BUG).
+	// New code: reth1 is still MASTER.
+	if !d.isAnyRethInstanceMaster(1) {
+		t.Error("reth1 should still be MASTER despite reth1.50 going BACKUP")
+	}
+}
+
 func TestRgIDFromVRID(t *testing.T) {
 	tests := []struct {
 		vrid int

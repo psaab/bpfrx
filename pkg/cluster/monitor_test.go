@@ -44,6 +44,13 @@ func (h *mockNlHandle) setLink(name string, up bool) {
 	}
 }
 
+// setNoDampening configures the monitor for immediate state changes (no dampening).
+func setNoDampening(mon *Monitor) {
+	mon.FailThreshold = 1
+	mon.PassThreshold = 1
+	mon.HoldDown = 1 * time.Nanosecond
+}
+
 func TestMonitor_InterfaceStateChange(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(
@@ -62,6 +69,7 @@ func TestMonitor_InterfaceStateChange(t *testing.T) {
 
 	mon := NewMonitor(m, cfg.RedundancyGroups)
 	mon.nlHandle = nlh
+	setNoDampening(mon)
 
 	// Initial poll: all up, no weight change.
 	mon.poll()
@@ -107,6 +115,7 @@ func TestMonitor_AllInterfacesDown(t *testing.T) {
 
 	mon := NewMonitor(m, cfg.RedundancyGroups)
 	mon.nlHandle = nlh
+	setNoDampening(mon)
 
 	mon.poll()
 
@@ -134,6 +143,7 @@ func TestMonitor_NoChangeNoCall(t *testing.T) {
 
 	mon := NewMonitor(m, cfg.RedundancyGroups)
 	mon.nlHandle = nlh
+	setNoDampening(mon)
 
 	// Poll twice with same state — weight should remain 255.
 	mon.poll()
@@ -160,6 +170,7 @@ func TestMonitor_StartStop(t *testing.T) {
 
 	mon := NewMonitor(m, cfg.RedundancyGroups)
 	mon.nlHandle = nlh
+	setNoDampening(mon)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	mon.Start(ctx)
@@ -194,6 +205,7 @@ func TestMonitor_UpdateGroups(t *testing.T) {
 
 	mon := NewMonitor(m, cfg.RedundancyGroups)
 	mon.nlHandle = nlh
+	setNoDampening(mon)
 	mon.poll()
 
 	// Now add a second RG with dmz0 monitor.
@@ -246,6 +258,7 @@ func TestMonitor_IPMonitoring(t *testing.T) {
 	mon.icmpDialer = func() (icmpConn, error) {
 		return &mockICMPConn{reachable: reachable}, nil
 	}
+	setNoDampening(mon)
 
 	// Initial: reachable.
 	mon.poll()
@@ -268,6 +281,216 @@ func TestMonitor_IPMonitoring(t *testing.T) {
 	states = m.GroupStates()
 	if states[0].Weight != 255 {
 		t.Errorf("weight after recovery = %d, want 255", states[0].Weight)
+	}
+}
+
+func TestMonitor_Dampening(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200},
+			&config.InterfaceMonitor{Interface: "trust0", Weight: 100},
+		),
+	)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	nlh := newMockNlHandle()
+	nlh.setLink("trust0", true)
+
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	mon.nlHandle = nlh
+	// Use default thresholds (3/3), disable hold-down for this test.
+	mon.HoldDown = 1 * time.Nanosecond
+
+	// Initial poll: up.
+	mon.poll()
+	states := m.GroupStates()
+	if states[0].Weight != 255 {
+		t.Fatalf("initial weight = %d, want 255", states[0].Weight)
+	}
+
+	// Bring down. First 2 polls should NOT trigger (threshold=3).
+	nlh.setLink("trust0", false)
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 255 {
+		t.Errorf("weight after 1 failure = %d, want 255 (dampened)", states[0].Weight)
+	}
+
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 255 {
+		t.Errorf("weight after 2 failures = %d, want 255 (dampened)", states[0].Weight)
+	}
+
+	// 3rd poll triggers the state change.
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 155 {
+		t.Errorf("weight after 3 failures = %d, want 155", states[0].Weight)
+	}
+
+	// Recovery: first 2 passes should NOT trigger.
+	nlh.setLink("trust0", true)
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 155 {
+		t.Errorf("weight after 1 pass = %d, want 155 (dampened)", states[0].Weight)
+	}
+
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 155 {
+		t.Errorf("weight after 2 passes = %d, want 155 (dampened)", states[0].Weight)
+	}
+
+	// 3rd pass triggers recovery.
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 255 {
+		t.Errorf("weight after 3 passes = %d, want 255", states[0].Weight)
+	}
+}
+
+func TestMonitor_HoldDown(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200},
+			&config.InterfaceMonitor{Interface: "trust0", Weight: 100},
+		),
+	)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	nlh := newMockNlHandle()
+	nlh.setLink("trust0", true)
+
+	now := time.Now()
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	mon.nlHandle = nlh
+	mon.FailThreshold = 1
+	mon.PassThreshold = 1
+	mon.HoldDown = 5 * time.Second
+	mon.nowFunc = func() time.Time { return now }
+
+	// Initial poll.
+	mon.poll()
+
+	// Bring down — immediate (threshold=1).
+	nlh.setLink("trust0", false)
+	mon.poll()
+	states := m.GroupStates()
+	if states[0].Weight != 155 {
+		t.Fatalf("weight after down = %d, want 155", states[0].Weight)
+	}
+
+	// Bring up immediately — should be blocked by hold-down.
+	nlh.setLink("trust0", true)
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 155 {
+		t.Errorf("weight during hold-down = %d, want 155 (held)", states[0].Weight)
+	}
+
+	// Advance time but not past hold-down.
+	now = now.Add(3 * time.Second)
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 155 {
+		t.Errorf("weight during hold-down (3s) = %d, want 155 (held)", states[0].Weight)
+	}
+
+	// Advance past hold-down.
+	now = now.Add(3 * time.Second)
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 255 {
+		t.Errorf("weight after hold-down = %d, want 255", states[0].Weight)
+	}
+}
+
+func TestMonitor_Flapping(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200},
+			&config.InterfaceMonitor{Interface: "trust0", Weight: 100},
+		),
+	)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	nlh := newMockNlHandle()
+	nlh.setLink("trust0", true)
+
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	mon.nlHandle = nlh
+	// Use default thresholds (3/3), disable hold-down.
+	mon.HoldDown = 1 * time.Nanosecond
+
+	mon.poll() // initial: up
+
+	// Alternate up/down rapidly — consecutive count resets each flip,
+	// so threshold is never reached.
+	for i := 0; i < 20; i++ {
+		nlh.setLink("trust0", false)
+		mon.poll()
+		nlh.setLink("trust0", true)
+		mon.poll()
+	}
+
+	states := m.GroupStates()
+	if states[0].Weight != 255 {
+		t.Errorf("weight after flapping = %d, want 255 (dampened)", states[0].Weight)
+	}
+}
+
+func TestMonitor_IPDampening(t *testing.T) {
+	m := NewManager(0, 1)
+	rg := &config.RedundancyGroup{
+		ID:             0,
+		NodePriorities: map[int]int{0: 200},
+		IPMonitoring: &config.IPMonitoring{
+			GlobalWeight: 100,
+			Targets: []*config.IPMonitorTarget{
+				{Address: "10.0.1.1", Weight: 80},
+			},
+		},
+	}
+	cfg := &config.ClusterConfig{
+		RedundancyGroups: []*config.RedundancyGroup{rg},
+	}
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	reachable := true
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	mon.icmpDialer = func() (icmpConn, error) {
+		return &mockICMPConn{reachable: reachable}, nil
+	}
+	// Default thresholds (3/3), disable hold-down.
+	mon.HoldDown = 1 * time.Nanosecond
+
+	// Initial polls: reachable.
+	mon.poll()
+	states := m.GroupStates()
+	if states[0].Weight != 255 {
+		t.Fatalf("initial weight = %d, want 255", states[0].Weight)
+	}
+
+	// First two unreachable polls — dampened.
+	reachable = false
+	mon.poll()
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 255 {
+		t.Errorf("weight after 2 failures = %d, want 255 (dampened)", states[0].Weight)
+	}
+
+	// Third unreachable poll — triggers.
+	mon.poll()
+	states = m.GroupStates()
+	if states[0].Weight != 175 {
+		t.Errorf("weight after 3 failures = %d, want 175 (255-80)", states[0].Weight)
 	}
 }
 

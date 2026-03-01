@@ -234,7 +234,8 @@ func (m *Manager) UpdateRGPriority(rgID int, priority int) {
 // to become MASTER, even with preempt=false. Used when the cluster state
 // machine has determined this node is primary for the RG but VRRP hasn't
 // transitioned (e.g. after failover reset with preempt=false).
-// Temporarily enables preempt, signals preemptNow, then restores.
+// Uses a one-shot forcePreemptOnce flag instead of modifying cfg.Preempt,
+// so the configured preempt value is never leaked.
 func (m *Manager) ForceRGMaster(rgID int) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -244,7 +245,7 @@ func (m *Manager) ForceRGMaster(rgID int) {
 			slog.Info("vrrp: forcing MASTER (cluster authoritative)",
 				"key", vi.key())
 			vi.mu.Lock()
-			vi.cfg.Preempt = true
+			vi.forcePreemptOnce = true
 			vi.mu.Unlock()
 			vi.triggerPreemptNow()
 		}
@@ -276,6 +277,25 @@ func (m *Manager) States() map[string]string {
 		states[vi.key()] = vi.getState().String()
 	}
 	return states
+}
+
+// InstanceStates returns structured per-instance state. Each entry contains
+// the interface name, group ID, and current VRRP state. Used by the
+// reconciliation loop to verify that rg_active and blackhole routes match
+// actual VRRP state.
+func (m *Manager) InstanceStates() []VRRPEvent {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]VRRPEvent, 0, len(m.instances))
+	for _, vi := range m.instances {
+		out = append(out, VRRPEvent{
+			Interface: vi.cfg.Interface,
+			GroupID:   vi.cfg.GroupID,
+			State:     vi.getState(),
+		})
+	}
+	return out
 }
 
 // Status returns a formatted multi-line status string.
@@ -405,17 +425,46 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 		slog.Debug("vrrp: failed to set promisc", "err", err)
 	}
 
-	// BPF filter: accept only IPv4 VRRP (ethertype 0x0800, proto 112).
-	// SOCK_RAW includes the Ethernet header, so offsets are:
-	//   12-13: ethertype
-	//   23: IP protocol (14 + 9)
+	// BPF filter: accept VRRP (proto/next-header 112) for IPv4, IPv6,
+	// and 802.1Q-tagged variants. SOCK_RAW includes the Ethernet header.
+	// Protocol/next-header offsets:
+	//   IPv4 untagged:  ethertype 0x0800 @12, proto @23 (14+9)
+	//   IPv6 untagged:  ethertype 0x86DD @12, next-hdr @20 (14+6)
+	//   IPv4 802.1Q:    ethertype 0x8100 @12, real 0x0800 @16, proto @27 (18+9)
+	//   IPv6 802.1Q:    ethertype 0x8100 @12, real 0x86DD @16, next-hdr @24 (18+6)
+	//
+	// Jump offsets (Jt/Jf) are relative to the NEXT instruction.
 	filter := []unix.SockFilter{
-		{Code: 0x28, K: 12},                    // ldh [12] — ethertype
-		{Code: 0x15, Jt: 0, Jf: 3, K: 0x0800}, // jeq #0x0800, check proto; else reject
-		{Code: 0x30, K: 23},                     // ldb [23] — IP protocol
-		{Code: 0x15, Jt: 0, Jf: 1, K: 112},     // jeq #112 → accept; else reject
-		{Code: 0x06, K: 0xFFFFFFFF},             // ret accept
-		{Code: 0x06, K: 0},                      // ret reject
+		{Code: 0x28, K: 12},                     //  0: ldh [12] — ethertype
+		{Code: 0x15, Jt: 7, Jf: 0, K: 0x0800},  //  1: jeq 0x0800 → 9 (check_ipv4)
+		{Code: 0x15, Jt: 10, Jf: 0, K: 0x86DD}, //  2: jeq 0x86DD → 13 (check_ipv6)
+		{Code: 0x15, Jt: 1, Jf: 0, K: 0x8100},  //  3: jeq 0x8100 → 5 (check_vlan); else reject
+		{Code: 0x06, K: 0},                      //  4: ret reject
+		// check_vlan:
+		{Code: 0x28, K: 16},                     //  5: ldh [16] — real ethertype
+		{Code: 0x15, Jt: 10, Jf: 0, K: 0x0800}, //  6: jeq 0x0800 → 17 (check_ipv4_vlan)
+		{Code: 0x15, Jt: 13, Jf: 0, K: 0x86DD}, //  7: jeq 0x86DD → 21 (check_ipv6_vlan)
+		{Code: 0x06, K: 0},                      //  8: ret reject
+		// check_ipv4: proto at 14+9=23
+		{Code: 0x30, K: 23},                     //  9: ldb [23]
+		{Code: 0x15, Jt: 0, Jf: 1, K: 112},     // 10: jeq 112 → accept; else reject
+		{Code: 0x06, K: 0xFFFFFFFF},             // 11: ret accept
+		{Code: 0x06, K: 0},                      // 12: ret reject
+		// check_ipv6: next-header at 14+6=20
+		{Code: 0x30, K: 20},                     // 13: ldb [20]
+		{Code: 0x15, Jt: 0, Jf: 1, K: 112},     // 14: jeq 112 → accept; else reject
+		{Code: 0x06, K: 0xFFFFFFFF},             // 15: ret accept
+		{Code: 0x06, K: 0},                      // 16: ret reject
+		// check_ipv4_vlan: proto at 18+9=27
+		{Code: 0x30, K: 27},                     // 17: ldb [27]
+		{Code: 0x15, Jt: 0, Jf: 1, K: 112},     // 18: jeq 112 → accept; else reject
+		{Code: 0x06, K: 0xFFFFFFFF},             // 19: ret accept
+		{Code: 0x06, K: 0},                      // 20: ret reject
+		// check_ipv6_vlan: next-header at 18+6=24
+		{Code: 0x30, K: 24},                     // 21: ldb [24]
+		{Code: 0x15, Jt: 0, Jf: 1, K: 112},     // 22: jeq 112 → accept; else reject
+		{Code: 0x06, K: 0xFFFFFFFF},             // 23: ret accept
+		{Code: 0x06, K: 0},                      // 24: ret reject
 	}
 	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &unix.SockFprog{
 		Len:    uint16(len(filter)),
@@ -426,6 +475,65 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 	}
 
 	return fd, nil
+}
+
+// openIPv6Socket creates a raw IPv6 socket (IPPROTO_VRRP = 112) bound to
+// the given interface for sending VRRPv3 IPv6 advertisements.
+// Returns the PacketConn and the raw fd for setsockopt operations.
+func openIPv6Socket(ifName string, iface *net.Interface) (net.PacketConn, int, error) {
+	conn, err := net.ListenPacket("ip6:112", "::")
+	if err != nil {
+		return nil, -1, fmt.Errorf("listen ip6:112: %w", err)
+	}
+
+	sc, err := conn.(*net.IPConn).SyscallConn()
+	if err != nil {
+		conn.Close()
+		return nil, -1, fmt.Errorf("syscall conn: %w", err)
+	}
+
+	var fd int
+	var bindErr error
+	if err := sc.Control(func(rawfd uintptr) {
+		fd = int(rawfd)
+		// Bind to interface.
+		bindErr = unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, ifName)
+		if bindErr != nil {
+			return
+		}
+		// Set hop limit to 255 (RFC 5798 requirement).
+		bindErr = unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_HOPS, 255)
+		if bindErr != nil {
+			return
+		}
+		bindErr = unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_UNICAST_HOPS, 255)
+		if bindErr != nil {
+			return
+		}
+		// Set multicast interface.
+		bindErr = unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_IF, iface.Index)
+	}); err != nil {
+		conn.Close()
+		return nil, -1, fmt.Errorf("control: %w", err)
+	}
+	if bindErr != nil {
+		conn.Close()
+		return nil, -1, fmt.Errorf("ipv6 socket setup on %s: %w", ifName, bindErr)
+	}
+
+	// Join VRRP IPv6 multicast group (ff02::12).
+	mreq := &unix.IPv6Mreq{
+		Interface: uint32(iface.Index),
+	}
+	copy(mreq.Multiaddr[:], net.ParseIP("ff02::12").To16())
+	if err := sc.Control(func(rawfd uintptr) {
+		// Ignore error — may fail if group already joined.
+		_ = unix.SetsockoptIPv6Mreq(int(rawfd), unix.IPPROTO_IPV6, unix.IPV6_JOIN_GROUP, mreq)
+	}); err != nil {
+		slog.Debug("vrrp: ipv6 join multicast failed", "interface", ifName, "err", err)
+	}
+
+	return conn, fd, nil
 }
 
 // htons converts a uint16 from host to network byte order.

@@ -2,6 +2,7 @@ package vrrp
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -48,17 +49,24 @@ type VRRPEvent struct {
 
 // vrrpInstance is a per-VRRP-group state machine goroutine.
 type vrrpInstance struct {
-	mu             sync.RWMutex
-	cfg            Instance
-	desiredPreempt bool // configured preempt value (may differ from cfg.Preempt during sync hold)
-	state          VRRPState
-	iface          *net.Interface
-	eventCh        chan<- VRRPEvent
-	localIP        net.IP // our IPv4 address on this interface (for filtering self-sent)
+	mu               sync.RWMutex
+	cfg              Instance
+	desiredPreempt   bool // configured preempt value (may differ from cfg.Preempt during sync hold)
+	forcePreemptOnce bool // one-shot preempt override from ForceRGMaster (auto-cleared after use)
+	state            VRRPState
+	iface            *net.Interface
+	eventCh          chan<- VRRPEvent
+	localIP          net.IP // our IPv4 address on this interface (for filtering self-sent)
+	localIPv6        net.IP // our link-local IPv6 address (source for IPv6 VRRP adverts)
 
 	// Per-instance raw socket and receiver.
 	conn    net.PacketConn
 	rawConn *ipv4.RawConn
+
+	// IPv6 raw socket for sending VRRPv3 advertisements.
+	// nil when no IPv6 VIPs are configured.
+	ipv6Conn net.PacketConn
+	ipv6FD   int // raw fd for setsockopt (hop limit, multicast)
 
 	// AF_PACKET socket for receiving on VLAN sub-interfaces.
 	// Raw IP sockets don't reliably receive multicast on VLAN
@@ -82,6 +90,7 @@ func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent) *
 		iface:          iface,
 		eventCh:        eventCh,
 		afPacketFD:     -1,
+		ipv6FD:         -1,
 		preemptNowCh:   make(chan struct{}, 1),
 		resignCh:       make(chan struct{}, 1),
 		rxCh:           make(chan *VRRPPacket, 16),
@@ -121,12 +130,16 @@ func (vi *vrrpInstance) openSocket() error {
 	// have the VIP — using it as source would cause the peer to filter
 	// our adverts as "self-sent" (matching its own VIP).
 	vipSet := make(map[string]bool, len(vi.cfg.VirtualAddresses))
+	hasIPv6VIPs := false
 	for _, vip := range vi.cfg.VirtualAddresses {
 		addr := vip
 		if idx := strings.Index(addr, "/"); idx >= 0 {
 			addr = addr[:idx]
 		}
 		vipSet[addr] = true
+		if ip := net.ParseIP(addr); ip != nil && ip.To4() == nil {
+			hasIPv6VIPs = true
+		}
 	}
 	addrs, _ := vi.iface.Addrs()
 	for _, a := range addrs {
@@ -137,9 +150,25 @@ func (vi *vrrpInstance) openSocket() error {
 		ip4 := ipNet.IP.To4()
 		if ip4 != nil && !vipSet[ip4.String()] {
 			vi.localIP = ip4
-			break
+		}
+		// Resolve link-local IPv6 address (fe80::/10) for VRRP source.
+		if ip4 == nil && ipNet.IP.IsLinkLocalUnicast() && !vipSet[ipNet.IP.String()] {
+			vi.localIPv6 = ipNet.IP
 		}
 	}
+
+	// Open IPv6 raw socket if any VIPs are IPv6.
+	if hasIPv6VIPs {
+		v6Conn, v6FD, err := openIPv6Socket(vi.cfg.Interface, vi.iface)
+		if err != nil {
+			slog.Warn("vrrp: ipv6 socket open failed, IPv6 adverts disabled",
+				"key", vi.key(), "err", err)
+		} else {
+			vi.ipv6Conn = v6Conn
+			vi.ipv6FD = v6FD
+		}
+	}
+
 	return nil
 }
 
@@ -287,10 +316,15 @@ func (vi *vrrpInstance) run() {
 				vi.becomeMaster()
 				advertTimer.Reset(vi.advertInterval())
 			case <-vi.preemptNowCh:
-				// Coordinated preemption from ReleaseSyncHold — all
-				// instances preempt simultaneously to minimize the
-				// asymmetric routing window during failback.
-				if vi.getPreempt() {
+				// Coordinated preemption from ReleaseSyncHold or forced
+				// transition from ForceRGMaster. The forcePreemptOnce flag
+				// allows a one-shot preemption even when preempt=false,
+				// without leaking into the configured preempt value.
+				vi.mu.Lock()
+				force := vi.forcePreemptOnce
+				vi.forcePreemptOnce = false
+				vi.mu.Unlock()
+				if vi.getPreempt() || force {
 					vi.becomeMaster()
 					advertTimer.Reset(vi.advertInterval())
 					masterDownTimer.Stop()
@@ -411,9 +445,9 @@ func (vi *vrrpInstance) receiver() {
 
 // receiverAfPacket reads VRRP packets via AF_PACKET on VLAN sub-interfaces.
 // Uses SOCK_RAW + ETH_P_ALL (same as tcpdump) — receives full Ethernet frames.
-// We skip the 14-byte Ethernet header, then parse IP header + VRRP payload.
+// Handles IPv4, IPv6, and 802.1Q-tagged variants. Detects VLAN tags and
+// adjusts header skip: 14 bytes untagged, 18 bytes single-tagged.
 func (vi *vrrpInstance) receiverAfPacket() {
-	const ethHeaderLen = 14
 	buf := make([]byte, 1500)
 	for {
 		select {
@@ -436,57 +470,127 @@ func (vi *vrrpInstance) receiverAfPacket() {
 			}
 		}
 
-		// Minimum: 14-byte Ethernet + 20-byte IP + 8-byte VRRP.
-		if n < ethHeaderLen+20+vrrpHeaderLen {
+		// Need at least 14 bytes to read the ethertype.
+		if n < 14 {
 			continue
 		}
 
-		// Skip Ethernet header.
-		ip := buf[ethHeaderLen:]
-		ipLen := n - ethHeaderLen
-
-		// Parse IP header.
-		ihl := int(ip[0]&0x0F) * 4
-		if ihl < 20 || ipLen < ihl+vrrpHeaderLen {
-			continue
+		// Detect 802.1Q VLAN tag and resolve real ethertype.
+		ethHeaderLen := 14
+		ethertype := binary.BigEndian.Uint16(buf[12:14])
+		if ethertype == 0x8100 || ethertype == 0x88a8 {
+			ethHeaderLen = 18 // 14 + 4-byte VLAN tag
+			if n < 18 {
+				continue
+			}
+			ethertype = binary.BigEndian.Uint16(buf[16:18])
 		}
 
-		ttl := int(ip[8])
+		isIPv6 := ethertype == 0x86DD
 
-		// Verify TTL == 255 (RFC 5798 §5.1.1.3).
-		if ttl != 255 {
-			continue
+		if isIPv6 {
+			vi.parseAfPacketIPv6(buf, n, ethHeaderLen)
+		} else if ethertype == 0x0800 {
+			vi.parseAfPacketIPv4(buf, n, ethHeaderLen)
 		}
+	}
+}
 
-		srcIP := make(net.IP, 4)
-		copy(srcIP, ip[12:16])
+// parseAfPacketIPv4 parses an IPv4 VRRP packet from a raw Ethernet frame.
+func (vi *vrrpInstance) parseAfPacketIPv4(buf []byte, n, ethHeaderLen int) {
+	// Minimum: eth header + 20-byte IPv4 + 8-byte VRRP.
+	if n < ethHeaderLen+20+vrrpHeaderLen {
+		return
+	}
 
-		// Filter self-sent packets (RFC 5798 §6.4.2/6.4.3).
-		if vi.localIP != nil && srcIP.Equal(vi.localIP) {
-			continue
-		}
+	ip := buf[ethHeaderLen:]
+	ipLen := n - ethHeaderLen
 
-		payload := ip[ihl:ipLen]
+	ihl := int(ip[0]&0x0F) * 4
+	if ihl < 20 || ipLen < ihl+vrrpHeaderLen {
+		return
+	}
 
-		// Only accept packets matching our VRID.
-		if payload[1] != uint8(vi.cfg.GroupID) {
-			continue
-		}
+	// Verify TTL == 255 (RFC 5798 §5.1.1.3).
+	if ip[8] != 255 {
+		return
+	}
 
-		dstIP := make(net.IP, 4)
-		copy(dstIP, ip[16:20])
+	srcIP := make(net.IP, 4)
+	copy(srcIP, ip[12:16])
 
-		pkt, err := ParseVRRPPacket(payload, false, srcIP, dstIP)
-		if err != nil {
-			slog.Debug("vrrp: parse error", "key", vi.key(), "err", err)
-			continue
-		}
+	// Filter self-sent packets.
+	if vi.localIP != nil && srcIP.Equal(vi.localIP) {
+		return
+	}
 
-		select {
-		case vi.rxCh <- pkt:
-		default:
-			// Drop if channel full.
-		}
+	payload := ip[ihl:ipLen]
+	if payload[1] != uint8(vi.cfg.GroupID) {
+		return
+	}
+
+	dstIP := make(net.IP, 4)
+	copy(dstIP, ip[16:20])
+
+	pkt, err := ParseVRRPPacket(payload, false, srcIP, dstIP)
+	if err != nil {
+		slog.Debug("vrrp: parse error", "key", vi.key(), "err", err)
+		return
+	}
+
+	select {
+	case vi.rxCh <- pkt:
+	default:
+	}
+}
+
+// parseAfPacketIPv6 parses an IPv6 VRRP packet from a raw Ethernet frame.
+// IPv6 header: 40 bytes fixed, next-header at offset 6, hop limit at offset 7,
+// source at 8-24, destination at 24-40.
+func (vi *vrrpInstance) parseAfPacketIPv6(buf []byte, n, ethHeaderLen int) {
+	const ipv6HeaderLen = 40
+
+	// Minimum: eth header + 40-byte IPv6 + 8-byte VRRP.
+	if n < ethHeaderLen+ipv6HeaderLen+vrrpHeaderLen {
+		return
+	}
+
+	ip6 := buf[ethHeaderLen:]
+	ip6Len := n - ethHeaderLen
+
+	// Verify hop limit == 255 (RFC 5798 §5.1.2.3).
+	if ip6[7] != 255 {
+		return
+	}
+
+	srcIP := make(net.IP, 16)
+	copy(srcIP, ip6[8:24])
+
+	// Filter self-sent packets.
+	if vi.localIPv6 != nil && srcIP.Equal(vi.localIPv6) {
+		return
+	}
+
+	payload := ip6[ipv6HeaderLen:ip6Len]
+	if len(payload) < vrrpHeaderLen {
+		return
+	}
+	if payload[1] != uint8(vi.cfg.GroupID) {
+		return
+	}
+
+	dstIP := make(net.IP, 16)
+	copy(dstIP, ip6[24:40])
+
+	pkt, err := ParseVRRPPacket(payload, true, srcIP, dstIP)
+	if err != nil {
+		slog.Debug("vrrp: ipv6 parse error", "key", vi.key(), "err", err)
+		return
+	}
+
+	select {
+	case vi.rxCh <- pkt:
+	default:
 	}
 }
 
@@ -623,14 +727,19 @@ func (vi *vrrpInstance) sendAdvert(priority int) {
 			MaxAdvertInt: maxAdvert,
 			IPAddresses:  v6Addrs,
 		}
-		// IPv6 VRRP not yet implemented (would need ip6:112 socket).
-		_ = pkt
+		if err := vi.sendPacket(pkt, true); err != nil {
+			slog.Debug("vrrp: failed to send IPv6 advert",
+				"key", vi.key(), "err", err)
+		}
 	}
 }
 
 // sendPacket sends a VRRP advertisement via the per-instance raw socket.
 func (vi *vrrpInstance) sendPacket(pkt *VRRPPacket, isIPv6 bool) error {
-	if isIPv6 || vi.rawConn == nil {
+	if isIPv6 {
+		return vi.sendPacketIPv6(pkt)
+	}
+	if vi.rawConn == nil {
 		return nil
 	}
 
@@ -689,6 +798,59 @@ func (vi *vrrpInstance) sendPacket(pkt *VRRPPacket, isIPv6 bool) error {
 
 	if err := vi.rawConn.WriteTo(hdr, data, cm); err != nil {
 		return fmt.Errorf("writeto: %w", err)
+	}
+
+	return nil
+}
+
+// sendPacketIPv6 sends a VRRPv3 IPv6 advertisement.
+// Source: link-local address, Destination: ff02::12, Hop Limit: 255.
+func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
+	if vi.ipv6Conn == nil {
+		return nil
+	}
+
+	srcIP := vi.localIPv6
+	if srcIP == nil {
+		// Lazy resolve: find link-local address.
+		vipSet := make(map[string]bool, len(vi.cfg.VirtualAddresses))
+		for _, vip := range vi.cfg.VirtualAddresses {
+			addr := vip
+			if idx := strings.Index(addr, "/"); idx >= 0 {
+				addr = addr[:idx]
+			}
+			vipSet[addr] = true
+		}
+		if addrs, err := vi.iface.Addrs(); err == nil {
+			for _, a := range addrs {
+				if ipNet, ok := a.(*net.IPNet); ok &&
+					ipNet.IP.To4() == nil &&
+					ipNet.IP.IsLinkLocalUnicast() &&
+					!vipSet[ipNet.IP.String()] {
+					vi.localIPv6 = ipNet.IP
+					srcIP = vi.localIPv6
+					break
+				}
+			}
+		}
+		if srcIP == nil {
+			return fmt.Errorf("no link-local IPv6 address on %s", vi.cfg.Interface)
+		}
+	}
+
+	dstIP := net.ParseIP("ff02::12")
+
+	data, err := pkt.Marshal(true, srcIP, dstIP)
+	if err != nil {
+		return err
+	}
+
+	dst := &net.IPAddr{
+		IP:   dstIP,
+		Zone: vi.cfg.Interface,
+	}
+	if _, err := vi.ipv6Conn.WriteTo(data, dst); err != nil {
+		return fmt.Errorf("ipv6 writeto: %w", err)
 	}
 
 	return nil
@@ -802,6 +964,9 @@ func (vi *vrrpInstance) stop() {
 	// Close sockets to unblock any blocking recvmsg in receiver().
 	if vi.conn != nil {
 		vi.conn.Close()
+	}
+	if vi.ipv6Conn != nil {
+		vi.ipv6Conn.Close()
 	}
 	if vi.afPacketFD >= 0 {
 		unix.Close(vi.afPacketFD)

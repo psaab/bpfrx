@@ -1,6 +1,8 @@
 package vrrp
 
 import (
+	"encoding/binary"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -1063,5 +1065,460 @@ func TestParsedPacket_PreservesSrcIP(t *testing.T) {
 
 	if !parsed.SrcIP.Equal(srcIP) {
 		t.Errorf("SrcIP = %s, want %s", parsed.SrcIP, srcIP)
+	}
+}
+
+// --- VLAN AF_PACKET receive tests ---
+
+// buildEthFrame constructs a minimal Ethernet frame with an IPv4 VRRP packet.
+// If vlanID > 0, inserts an 802.1Q tag. Returns the raw frame bytes.
+func buildEthFrame(t *testing.T, vlanID int, srcIP, dstIP net.IP, vrrpPkt *VRRPPacket) []byte {
+	t.Helper()
+	vrrpData, err := vrrpPkt.Marshal(false, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build IP header (20 bytes, no options).
+	ipHdr := make([]byte, 20)
+	ipHdr[0] = 0x45 // version 4, IHL 5
+	totalLen := 20 + len(vrrpData)
+	ipHdr[2] = byte(totalLen >> 8)
+	ipHdr[3] = byte(totalLen)
+	ipHdr[8] = 255      // TTL
+	ipHdr[9] = 112      // protocol = VRRP
+	copy(ipHdr[12:16], srcIP.To4())
+	copy(ipHdr[16:20], dstIP.To4())
+
+	var frame []byte
+	// Ethernet dst + src (12 bytes)
+	ethDstSrc := make([]byte, 12)
+	ethDstSrc[0] = 0x01 // multicast dst
+	ethDstSrc[1] = 0x00
+	ethDstSrc[2] = 0x5E
+	ethDstSrc[3] = 0x00
+	ethDstSrc[4] = 0x00
+	ethDstSrc[5] = 0x12
+	frame = append(frame, ethDstSrc...)
+
+	if vlanID > 0 {
+		// 802.1Q: ethertype 0x8100 + VLAN tag (2 bytes) + real ethertype 0x0800
+		frame = append(frame, 0x81, 0x00)                       // TPID
+		frame = append(frame, byte(vlanID>>8), byte(vlanID))     // TCI (PCP=0, DEI=0, VID)
+		frame = append(frame, 0x08, 0x00)                        // real ethertype
+	} else {
+		frame = append(frame, 0x08, 0x00) // ethertype IPv4
+	}
+	frame = append(frame, ipHdr...)
+	frame = append(frame, vrrpData...)
+	return frame
+}
+
+// parseAfPacketFrame extracts a VRRPPacket from a raw Ethernet frame
+// the same way receiverAfPacket does. Returns the parsed packet or an error.
+func parseAfPacketFrame(buf []byte, n int, localIP net.IP, groupID int) (*VRRPPacket, error) {
+	if n < 14 {
+		return nil, fmt.Errorf("frame too short")
+	}
+
+	ethHeaderLen := 14
+	ethertype := binary.BigEndian.Uint16(buf[12:14])
+	if ethertype == 0x8100 || ethertype == 0x88a8 {
+		ethHeaderLen = 18
+		if n < 18 {
+			return nil, fmt.Errorf("frame too short for VLAN")
+		}
+		ethertype = binary.BigEndian.Uint16(buf[16:18])
+	}
+
+	if ethertype == 0x86DD {
+		return parseAfPacketIPv6Frame(buf, n, ethHeaderLen, localIP, groupID)
+	}
+
+	if n < ethHeaderLen+20+vrrpHeaderLen {
+		return nil, fmt.Errorf("frame too short for IP+VRRP")
+	}
+
+	ip := buf[ethHeaderLen:]
+	ipLen := n - ethHeaderLen
+
+	ihl := int(ip[0]&0x0F) * 4
+	if ihl < 20 || ipLen < ihl+vrrpHeaderLen {
+		return nil, fmt.Errorf("bad IHL")
+	}
+
+	ttl := int(ip[8])
+	if ttl != 255 {
+		return nil, fmt.Errorf("TTL %d != 255", ttl)
+	}
+
+	srcIP := make(net.IP, 4)
+	copy(srcIP, ip[12:16])
+
+	if localIP != nil && srcIP.Equal(localIP) {
+		return nil, fmt.Errorf("self-sent")
+	}
+
+	payload := ip[ihl:ipLen]
+	if payload[1] != uint8(groupID) {
+		return nil, fmt.Errorf("VRID mismatch")
+	}
+
+	dstIP := make(net.IP, 4)
+	copy(dstIP, ip[16:20])
+
+	return ParseVRRPPacket(payload, false, srcIP, dstIP)
+}
+
+// parseAfPacketIPv6Frame parses an IPv6 VRRP packet from a raw Ethernet frame.
+func parseAfPacketIPv6Frame(buf []byte, n, ethHeaderLen int, localIP net.IP, groupID int) (*VRRPPacket, error) {
+	const ipv6HeaderLen = 40
+	if n < ethHeaderLen+ipv6HeaderLen+vrrpHeaderLen {
+		return nil, fmt.Errorf("frame too short for IPv6+VRRP")
+	}
+
+	ip6 := buf[ethHeaderLen:]
+	ip6Len := n - ethHeaderLen
+
+	if ip6[7] != 255 {
+		return nil, fmt.Errorf("hop limit %d != 255", ip6[7])
+	}
+
+	srcIP := make(net.IP, 16)
+	copy(srcIP, ip6[8:24])
+
+	if localIP != nil && srcIP.Equal(localIP) {
+		return nil, fmt.Errorf("self-sent")
+	}
+
+	payload := ip6[ipv6HeaderLen:ip6Len]
+	if len(payload) < vrrpHeaderLen {
+		return nil, fmt.Errorf("payload too short")
+	}
+	if payload[1] != uint8(groupID) {
+		return nil, fmt.Errorf("VRID mismatch")
+	}
+
+	dstIP := make(net.IP, 16)
+	copy(dstIP, ip6[24:40])
+
+	return ParseVRRPPacket(payload, true, srcIP, dstIP)
+}
+
+func TestAfPacket_UntaggedFrame(t *testing.T) {
+	srcIP := net.IPv4(10, 0, 0, 1)
+	dstIP := net.IPv4(224, 0, 0, 18)
+	vrrpPkt := &VRRPPacket{
+		VRID:         101,
+		Priority:     200,
+		MaxAdvertInt: 3,
+		IPAddresses:  []net.IP{net.IPv4(172, 16, 50, 10)},
+	}
+
+	frame := buildEthFrame(t, 0, srcIP, dstIP, vrrpPkt)
+	parsed, err := parseAfPacketFrame(frame, len(frame), nil, 101)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.VRID != 101 {
+		t.Errorf("VRID = %d, want 101", parsed.VRID)
+	}
+	if parsed.Priority != 200 {
+		t.Errorf("Priority = %d, want 200", parsed.Priority)
+	}
+	if !parsed.SrcIP.Equal(srcIP) {
+		t.Errorf("SrcIP = %s, want %s", parsed.SrcIP, srcIP)
+	}
+}
+
+func TestAfPacket_VlanTaggedFrame(t *testing.T) {
+	srcIP := net.IPv4(10, 0, 0, 1)
+	dstIP := net.IPv4(224, 0, 0, 18)
+	vrrpPkt := &VRRPPacket{
+		VRID:         101,
+		Priority:     200,
+		MaxAdvertInt: 3,
+		IPAddresses:  []net.IP{net.IPv4(172, 16, 50, 10)},
+	}
+
+	frame := buildEthFrame(t, 50, srcIP, dstIP, vrrpPkt)
+	parsed, err := parseAfPacketFrame(frame, len(frame), nil, 101)
+	if err != nil {
+		t.Fatalf("unexpected error parsing VLAN-tagged frame: %v", err)
+	}
+	if parsed.VRID != 101 {
+		t.Errorf("VRID = %d, want 101", parsed.VRID)
+	}
+	if parsed.Priority != 200 {
+		t.Errorf("Priority = %d, want 200", parsed.Priority)
+	}
+	if !parsed.SrcIP.Equal(srcIP) {
+		t.Errorf("SrcIP = %s, want %s", parsed.SrcIP, srcIP)
+	}
+}
+
+func TestAfPacket_VlanQinQFrame(t *testing.T) {
+	srcIP := net.IPv4(10, 0, 0, 1)
+	dstIP := net.IPv4(224, 0, 0, 18)
+	vrrpPkt := &VRRPPacket{
+		VRID:         101,
+		Priority:     200,
+		MaxAdvertInt: 3,
+		IPAddresses:  []net.IP{net.IPv4(172, 16, 50, 10)},
+	}
+
+	// Build QinQ frame (0x88a8 outer tag).
+	vrrpData, err := vrrpPkt.Marshal(false, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ipHdr := make([]byte, 20)
+	ipHdr[0] = 0x45
+	totalLen := 20 + len(vrrpData)
+	ipHdr[2] = byte(totalLen >> 8)
+	ipHdr[3] = byte(totalLen)
+	ipHdr[8] = 255
+	ipHdr[9] = 112
+	copy(ipHdr[12:16], srcIP.To4())
+	copy(ipHdr[16:20], dstIP.To4())
+
+	var frame []byte
+	frame = append(frame, make([]byte, 12)...) // dst+src MAC
+	frame = append(frame, 0x88, 0xa8)          // 802.1ad (QinQ)
+	frame = append(frame, 0x00, 50)            // outer VLAN
+	frame = append(frame, 0x08, 0x00)          // real ethertype
+	frame = append(frame, ipHdr...)
+	frame = append(frame, vrrpData...)
+
+	parsed, err := parseAfPacketFrame(frame, len(frame), nil, 101)
+	if err != nil {
+		t.Fatalf("unexpected error parsing QinQ frame: %v", err)
+	}
+	if parsed.VRID != 101 {
+		t.Errorf("VRID = %d, want 101", parsed.VRID)
+	}
+}
+
+// buildEthIPv6Frame constructs a minimal Ethernet frame with an IPv6 VRRP packet.
+// If vlanID > 0, inserts an 802.1Q tag.
+func buildEthIPv6Frame(t *testing.T, vlanID int, srcIP, dstIP net.IP, vrrpPkt *VRRPPacket) []byte {
+	t.Helper()
+	vrrpData, err := vrrpPkt.Marshal(true, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build IPv6 header (40 bytes, no extension headers).
+	ip6Hdr := make([]byte, 40)
+	ip6Hdr[0] = 0x60                                          // version 6
+	binary.BigEndian.PutUint16(ip6Hdr[4:6], uint16(len(vrrpData))) // payload length
+	ip6Hdr[6] = 112                                            // next header = VRRP
+	ip6Hdr[7] = 255                                            // hop limit
+	copy(ip6Hdr[8:24], srcIP.To16())
+	copy(ip6Hdr[24:40], dstIP.To16())
+
+	var frame []byte
+	ethDstSrc := make([]byte, 12)
+	ethDstSrc[0] = 0x33 // IPv6 multicast dst
+	ethDstSrc[1] = 0x33
+	ethDstSrc[4] = 0x00
+	ethDstSrc[5] = 0x12
+	frame = append(frame, ethDstSrc...)
+
+	if vlanID > 0 {
+		frame = append(frame, 0x81, 0x00)
+		frame = append(frame, byte(vlanID>>8), byte(vlanID))
+		frame = append(frame, 0x86, 0xDD)
+	} else {
+		frame = append(frame, 0x86, 0xDD) // ethertype IPv6
+	}
+	frame = append(frame, ip6Hdr...)
+	frame = append(frame, vrrpData...)
+	return frame
+}
+
+func TestAfPacket_IPv6UntaggedFrame(t *testing.T) {
+	srcIP := net.ParseIP("fe80::1")
+	dstIP := net.ParseIP("ff02::12")
+	vrrpPkt := &VRRPPacket{
+		VRID:         101,
+		Priority:     200,
+		MaxAdvertInt: 3,
+		IPAddresses:  []net.IP{net.ParseIP("2001:db8::10")},
+	}
+
+	frame := buildEthIPv6Frame(t, 0, srcIP, dstIP, vrrpPkt)
+	parsed, err := parseAfPacketFrame(frame, len(frame), nil, 101)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.VRID != 101 {
+		t.Errorf("VRID = %d, want 101", parsed.VRID)
+	}
+	if parsed.Priority != 200 {
+		t.Errorf("Priority = %d, want 200", parsed.Priority)
+	}
+	if !parsed.SrcIP.Equal(srcIP) {
+		t.Errorf("SrcIP = %s, want %s", parsed.SrcIP, srcIP)
+	}
+	if len(parsed.IPAddresses) != 1 {
+		t.Fatalf("expected 1 address, got %d", len(parsed.IPAddresses))
+	}
+	if !parsed.IPAddresses[0].Equal(net.ParseIP("2001:db8::10")) {
+		t.Errorf("addr = %s, want 2001:db8::10", parsed.IPAddresses[0])
+	}
+}
+
+func TestAfPacket_IPv6VlanTaggedFrame(t *testing.T) {
+	srcIP := net.ParseIP("fe80::1")
+	dstIP := net.ParseIP("ff02::12")
+	vrrpPkt := &VRRPPacket{
+		VRID:         101,
+		Priority:     200,
+		MaxAdvertInt: 3,
+		IPAddresses:  []net.IP{net.ParseIP("2001:db8::10")},
+	}
+
+	frame := buildEthIPv6Frame(t, 50, srcIP, dstIP, vrrpPkt)
+	parsed, err := parseAfPacketFrame(frame, len(frame), nil, 101)
+	if err != nil {
+		t.Fatalf("unexpected error parsing VLAN-tagged IPv6 frame: %v", err)
+	}
+	if parsed.VRID != 101 {
+		t.Errorf("VRID = %d, want 101", parsed.VRID)
+	}
+	if parsed.Priority != 200 {
+		t.Errorf("Priority = %d, want 200", parsed.Priority)
+	}
+}
+
+func TestAfPacket_IPv6SelfSentFiltered(t *testing.T) {
+	srcIP := net.ParseIP("fe80::1")
+	dstIP := net.ParseIP("ff02::12")
+	vrrpPkt := &VRRPPacket{
+		VRID:         101,
+		Priority:     200,
+		MaxAdvertInt: 3,
+		IPAddresses:  []net.IP{net.ParseIP("2001:db8::10")},
+	}
+
+	frame := buildEthIPv6Frame(t, 0, srcIP, dstIP, vrrpPkt)
+	_, err := parseAfPacketFrame(frame, len(frame), srcIP, 101)
+	if err == nil {
+		t.Error("expected self-sent filter to reject IPv6 packet")
+	}
+}
+
+func TestAfPacket_SelfSentFiltered(t *testing.T) {
+	srcIP := net.IPv4(10, 0, 0, 1)
+	dstIP := net.IPv4(224, 0, 0, 18)
+	vrrpPkt := &VRRPPacket{
+		VRID:         101,
+		Priority:     200,
+		MaxAdvertInt: 3,
+		IPAddresses:  []net.IP{net.IPv4(172, 16, 50, 10)},
+	}
+
+	frame := buildEthFrame(t, 50, srcIP, dstIP, vrrpPkt)
+	_, err := parseAfPacketFrame(frame, len(frame), srcIP, 101)
+	if err == nil {
+		t.Error("expected self-sent filter to reject packet")
+	}
+}
+
+func TestAfPacket_VRIDMismatchFiltered(t *testing.T) {
+	srcIP := net.IPv4(10, 0, 0, 1)
+	dstIP := net.IPv4(224, 0, 0, 18)
+	vrrpPkt := &VRRPPacket{
+		VRID:         101,
+		Priority:     200,
+		MaxAdvertInt: 3,
+		IPAddresses:  []net.IP{net.IPv4(172, 16, 50, 10)},
+	}
+
+	frame := buildEthFrame(t, 50, srcIP, dstIP, vrrpPkt)
+	_, err := parseAfPacketFrame(frame, len(frame), nil, 102) // wrong VRID
+	if err == nil {
+		t.Error("expected VRID mismatch to reject packet")
+	}
+}
+
+// --- ForceRGMaster preempt leak tests ---
+
+func TestForceRGMaster_DoesNotLeakPreempt(t *testing.T) {
+	m := NewManager()
+
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   false, // preempt disabled
+	}, &net.Interface{Name: "eth0"}, m.eventCh)
+	vi.setState(StateBackup)
+
+	m.mu.Lock()
+	m.instances = map[instanceKey]*vrrpInstance{
+		{iface: "eth0", groupID: 101}: vi,
+	}
+	m.mu.Unlock()
+
+	// ForceRGMaster should set forcePreemptOnce, NOT cfg.Preempt.
+	m.ForceRGMaster(1) // RG 1 → VRID 101
+
+	vi.mu.RLock()
+	preempt := vi.cfg.Preempt
+	forceOnce := vi.forcePreemptOnce
+	vi.mu.RUnlock()
+
+	if preempt {
+		t.Error("cfg.Preempt should remain false after ForceRGMaster")
+	}
+	if !forceOnce {
+		t.Error("forcePreemptOnce should be true after ForceRGMaster")
+	}
+
+	// Verify preemptNowCh got signaled.
+	select {
+	case <-vi.preemptNowCh:
+		// ok
+	default:
+		t.Error("preemptNowCh should have been signaled")
+	}
+}
+
+func TestForcePreemptOnce_ClearedAfterUse(t *testing.T) {
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   false,
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 16))
+
+	// Simulate ForceRGMaster setting the flag.
+	vi.mu.Lock()
+	vi.forcePreemptOnce = true
+	vi.mu.Unlock()
+
+	// Simulate the preemptNowCh handler consuming the flag.
+	vi.mu.Lock()
+	force := vi.forcePreemptOnce
+	vi.forcePreemptOnce = false
+	vi.mu.Unlock()
+
+	if !force {
+		t.Error("forcePreemptOnce should have been true")
+	}
+
+	// After consumption, flag should be cleared.
+	vi.mu.RLock()
+	cleared := vi.forcePreemptOnce
+	vi.mu.RUnlock()
+	if cleared {
+		t.Error("forcePreemptOnce should be false after consumption")
+	}
+
+	// cfg.Preempt should still be false.
+	if vi.getPreempt() {
+		t.Error("cfg.Preempt should remain false throughout")
 	}
 }
