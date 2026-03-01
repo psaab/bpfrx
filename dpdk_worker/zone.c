@@ -51,12 +51,9 @@ zone_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		    eth->src_addr.addr_bytes[1] == 0xbf &&
 		    eth->src_addr.addr_bytes[2] == 0x72 &&
 		    eth->src_addr.addr_bytes[3] == FABRIC_ZONE_MAC_MAGIC) {
-			/* TODO: when DPDK fabric redirect is implemented,
-			 * decode zone and skip the zone lookup:
-			 *   meta->ingress_zone = eth->src_addr.addr_bytes[5];
-			 *   meta->routing_table = 254;
-			 *   return;
-			 */
+			meta->ingress_zone = eth->src_addr.addr_bytes[5];
+			meta->routing_table = 254; /* RT_TABLE_MAIN */
+			return;
 		}
 	}
 
