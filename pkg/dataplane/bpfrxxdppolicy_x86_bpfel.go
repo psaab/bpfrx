@@ -106,9 +106,13 @@ type bpfrxXdpPolicyFabricFwdInfo struct {
 }
 
 type bpfrxXdpPolicyFilterConfig struct {
-	_         structs.HostLayout
-	NumRules  uint32
-	RuleStart uint32
+	_            structs.HostLayout
+	NumRules     uint32
+	RuleStart    uint32
+	AllHaveProto uint8
+	ProtoCount   uint8
+	ProtoList    [4]uint8
+	Pad          [2]uint8
 }
 
 type bpfrxXdpPolicyFilterRule struct {

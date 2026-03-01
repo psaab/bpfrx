@@ -718,8 +718,12 @@ type NAT64Config struct {
 
 // FilterConfig mirrors the C struct filter_config.
 type FilterConfig struct {
-	NumRules  uint32
-	RuleStart uint32
+	NumRules     uint32
+	RuleStart    uint32
+	AllHaveProto uint8    // 1 if every term specifies FILTER_MATCH_PROTOCOL
+	ProtoCount   uint8    // distinct protocol values across all terms (max 4)
+	ProtoList    [4]uint8 // the distinct protocol numbers
+	Pad          [2]uint8
 }
 
 // IfaceFilterKey mirrors the C struct iface_filter_key.

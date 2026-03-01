@@ -721,6 +721,10 @@ struct nat64_state_value {
 struct filter_config {
 	__u32 num_rules;
 	__u32 rule_start;   /* index into filter_rules array */
+	__u8  all_have_proto; /* 1 if every term specifies FILTER_MATCH_PROTOCOL */
+	__u8  proto_count;    /* distinct protocol values across all terms (max 4) */
+	__u8  proto_list[4];  /* the distinct protocol numbers */
+	__u8  pad[2];
 };
 
 /* Interface filter assignment key: {ifindex, vlan_id, family, direction} -> filter_id */

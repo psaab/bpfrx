@@ -3326,6 +3326,7 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 			break
 		}
 		startIdx := ruleIdx
+		var allRules []FilterRule
 		for _, term := range filter.Terms {
 			rules := expandFilterTerm(term, AFInet, riTableIDs, cfg.PolicyOptions.PrefixLists, policerIDs)
 			for _, rule := range rules {
@@ -3336,14 +3337,17 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 				if err := dp.SetFilterRule(ruleIdx, rule); err != nil {
 					return fmt.Errorf("set filter rule %d: %w", ruleIdx, err)
 				}
+				allRules = append(allRules, rule)
 				ruleIdx++
 			}
 		}
 		numRules := ruleIdx - startIdx
-		if err := dp.SetFilterConfig(filterID, FilterConfig{
+		fcfg := FilterConfig{
 			NumRules:  numRules,
 			RuleStart: startIdx,
-		}); err != nil {
+		}
+		computeFilterProtoPrefilter(&fcfg, allRules)
+		if err := dp.SetFilterConfig(filterID, fcfg); err != nil {
 			return fmt.Errorf("set filter config %s: %w", name, err)
 		}
 		filterIDs["inet:"+name] = filterID
@@ -3366,6 +3370,7 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 			break
 		}
 		startIdx := ruleIdx
+		var allRules []FilterRule
 		for _, term := range filter.Terms {
 			rules := expandFilterTerm(term, AFInet6, riTableIDs, cfg.PolicyOptions.PrefixLists, policerIDs)
 			for _, rule := range rules {
@@ -3376,14 +3381,17 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 				if err := dp.SetFilterRule(ruleIdx, rule); err != nil {
 					return fmt.Errorf("set filter rule %d: %w", ruleIdx, err)
 				}
+				allRules = append(allRules, rule)
 				ruleIdx++
 			}
 		}
 		numRules := ruleIdx - startIdx
-		if err := dp.SetFilterConfig(filterID, FilterConfig{
+		fcfg := FilterConfig{
 			NumRules:  numRules,
 			RuleStart: startIdx,
-		}); err != nil {
+		}
+		computeFilterProtoPrefilter(&fcfg, allRules)
+		if err := dp.SetFilterConfig(filterID, fcfg); err != nil {
 			return fmt.Errorf("set filter config %s: %w", name, err)
 		}
 		filterIDs["inet6:"+name] = filterID
@@ -3830,6 +3838,35 @@ func setFilterAddr(addr, mask *[16]byte, cidr string, family uint8) {
 // resolvePortRange parses a port specification that may be a name, number,
 // or range ("1000-2000"). Returns low and high port numbers. If not a range,
 // hi equals lo.
+// computeFilterProtoPrefilter populates the protocol pre-filter fields on a
+// FilterConfig. If ALL rules specify FILTER_MATCH_PROTOCOL, the BPF code can
+// skip the entire evaluation loop when the packet's protocol doesn't match
+// any of the (up to 4) distinct protocol values.
+func computeFilterProtoPrefilter(fcfg *FilterConfig, rules []FilterRule) {
+	if len(rules) == 0 {
+		return
+	}
+	allHave := true
+	protos := make(map[uint8]bool)
+	for _, r := range rules {
+		if r.MatchFlags&FilterMatchProtocol == 0 {
+			allHave = false
+			break
+		}
+		protos[r.Protocol] = true
+	}
+	if !allHave || len(protos) == 0 || len(protos) > 4 {
+		return
+	}
+	fcfg.AllHaveProto = 1
+	i := 0
+	for p := range protos {
+		fcfg.ProtoList[i] = p
+		i++
+	}
+	fcfg.ProtoCount = uint8(len(protos))
+}
+
 func resolvePortRange(s string) (lo, hi uint16) {
 	if idx := strings.IndexByte(s, '-'); idx > 0 && idx < len(s)-1 {
 		lo = resolvePortName(s[:idx])

@@ -1104,6 +1104,18 @@ evaluate_firewall_filter(struct pkt_meta *meta)
 	if (!fcfg || fcfg->num_rules == 0)
 		return 0;
 
+	/* Protocol pre-filter: if ALL terms specify a protocol and the
+	 * packet protocol doesn't match any of them, skip the loop. */
+	if (fcfg->all_have_proto && fcfg->proto_count > 0) {
+		__u8 p = meta->protocol;
+		int hit = 0;
+		if (fcfg->proto_list[0] == p) hit = 1;
+		if (fcfg->proto_count >= 2 && fcfg->proto_list[1] == p) hit = 1;
+		if (fcfg->proto_count >= 3 && fcfg->proto_list[2] == p) hit = 1;
+		if (fcfg->proto_count >= 4 && fcfg->proto_list[3] == p) hit = 1;
+		if (!hit) return 0;
+	}
+
 	__u32 start = fcfg->rule_start;
 	__u32 count = fcfg->num_rules;
 	if (count > MAX_FILTER_RULES_PER_FILTER)
@@ -1319,6 +1331,17 @@ evaluate_firewall_filter_output(struct pkt_meta *meta, __u32 egress_ifindex)
 	if (!fcfg || fcfg->num_rules == 0)
 		return 0;
 
+	/* Protocol pre-filter */
+	if (fcfg->all_have_proto && fcfg->proto_count > 0) {
+		__u8 p = meta->protocol;
+		int hit = 0;
+		if (fcfg->proto_list[0] == p) hit = 1;
+		if (fcfg->proto_count >= 2 && fcfg->proto_list[1] == p) hit = 1;
+		if (fcfg->proto_count >= 3 && fcfg->proto_list[2] == p) hit = 1;
+		if (fcfg->proto_count >= 4 && fcfg->proto_list[3] == p) hit = 1;
+		if (!hit) return 0;
+	}
+
 	__u32 start = fcfg->rule_start;
 	__u32 count = fcfg->num_rules;
 	if (count > MAX_FILTER_RULES_PER_FILTER)
@@ -1498,6 +1521,17 @@ evaluate_filter_by_id(__u32 fid, struct pkt_meta *meta)
 	struct filter_config *fcfg = bpf_map_lookup_elem(&filter_configs, &fid);
 	if (!fcfg || fcfg->num_rules == 0)
 		return 0;
+
+	/* Protocol pre-filter */
+	if (fcfg->all_have_proto && fcfg->proto_count > 0) {
+		__u8 p = meta->protocol;
+		int hit = 0;
+		if (fcfg->proto_list[0] == p) hit = 1;
+		if (fcfg->proto_count >= 2 && fcfg->proto_list[1] == p) hit = 1;
+		if (fcfg->proto_count >= 3 && fcfg->proto_list[2] == p) hit = 1;
+		if (fcfg->proto_count >= 4 && fcfg->proto_list[3] == p) hit = 1;
+		if (!hit) return 0;
+	}
 
 	__u32 start = fcfg->rule_start;
 	__u32 count = fcfg->num_rules;
