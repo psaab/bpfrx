@@ -1,5 +1,7 @@
 package cluster
 
+import "log/slog"
+
 // EffectivePriority calculates the effective priority for a node.
 // effective = base_priority * (weight / 255)
 // Returns an integer value scaled to avoid floating-point issues.
@@ -28,9 +30,37 @@ const (
 //   - Non-preempt: incumbent stays unless weight drops to 0
 //   - Split-brain (both primary): lower node ID wins
 func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (electionResult, string) {
-	// Skip disabled or manually failed-over groups.
-	if rg.State == StateDisabled || rg.ManualFailover {
+	// Skip disabled groups entirely.
+	if rg.State == StateDisabled {
 		return electNoChange, ""
+	}
+
+	// ManualFailover normally blocks election (stays secondary until reset).
+	// Exception: if the peer has also resigned (weight 0), both nodes are
+	// secondary and neither can serve traffic. Clear ManualFailover and
+	// restore weight to allow election, avoiding a dual-secondary deadlock
+	// during rapid failover cycles where one node resigns before the
+	// previous cycle's ManualFailover flag is cleared.
+	if rg.ManualFailover {
+		if peerGroup == nil || peerGroup.Weight > 0 {
+			return electNoChange, ""
+		}
+		// Peer weight 0 — both nodes resigned. Clear ManualFailover
+		// and restore weight so election can promote one of them.
+		slog.Info("cluster: clearing manual failover (peer also resigned)",
+			"rg", rg.GroupID)
+		rg.ManualFailover = false
+		// Recalculate weight inline (recalcWeight calls runElection
+		// which would recurse back to electRG).
+		totalLost := 0
+		for _, iface := range rg.MonitorFails {
+			key := monitorKey{rgID: rg.GroupID, iface: iface}
+			totalLost += m.monitorWeights[key]
+		}
+		rg.Weight = 255 - totalLost
+		if rg.Weight < 0 {
+			rg.Weight = 0
+		}
 	}
 
 	localWeight := rg.Weight

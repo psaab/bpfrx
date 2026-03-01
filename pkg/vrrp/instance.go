@@ -323,9 +323,10 @@ func (vi *vrrpInstance) run() {
 				// With short RETH intervals (30ms), masterDownInterval() at
 				// priority 0 is only ~120ms, which re-elects the resigned node
 				// before the peer can take over. Even with an extended timer,
-				// handleBackupRx resets it to the short value. On VLAN sub-
-				// interfaces, multicast adverts from the peer may not arrive
-				// reliably. The resigned node should only become MASTER via:
+				// the resigned node would re-elect as MASTER and send
+				// high-priority adverts that keep the peer in BACKUP,
+				// creating a split-brain. The resigned node should only
+				// become MASTER via:
 				//   - preemptNowCh (cluster ForceRGMaster after failover reset)
 				//   - priority-0 from peer (peer resigning)
 				// This matches Junos behavior: manual failover stays until reset.
