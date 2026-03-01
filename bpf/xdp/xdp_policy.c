@@ -1199,7 +1199,23 @@ int xdp_policy_prog(struct xdp_md *ctx)
 		if (!rule->active)
 			continue;
 
-		/* Check source address (AF-aware) */
+		/* Check protocol (cheap — short-circuit before LPM) */
+		if (rule->protocol != 0 && rule->protocol != meta->protocol)
+			continue;
+
+		/* Check destination port range (cheap) */
+		if (rule->dst_port_low != 0 || rule->dst_port_high != 0) {
+			__u16 dport = bpf_ntohs(meta->dst_port);
+			if (dport < rule->dst_port_low ||
+			    dport > rule->dst_port_high)
+				continue;
+		}
+
+		/* Check application ID (cheap) */
+		if (rule->app_id != 0 && rule->app_id != pkt_app_id)
+			continue;
+
+		/* Check source address (AF-aware, expensive LPM lookup) */
 		if (meta->addr_family == AF_INET) {
 			if (!addr_matches(meta->src_ip.v4, rule->src_addr_id))
 				continue;
@@ -1208,7 +1224,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				continue;
 		}
 
-		/* Check destination address (AF-aware) */
+		/* Check destination address (AF-aware, expensive LPM lookup) */
 		if (meta->addr_family == AF_INET) {
 			if (!addr_matches(meta->dst_ip.v4, rule->dst_addr_id))
 				continue;
@@ -1216,22 +1232,6 @@ int xdp_policy_prog(struct xdp_md *ctx)
 			if (!addr_matches_v6(meta->dst_ip.v6, rule->dst_addr_id))
 				continue;
 		}
-
-		/* Check protocol */
-		if (rule->protocol != 0 && rule->protocol != meta->protocol)
-			continue;
-
-		/* Check destination port range */
-		if (rule->dst_port_low != 0 || rule->dst_port_high != 0) {
-			__u16 dport = bpf_ntohs(meta->dst_port);
-			if (dport < rule->dst_port_low ||
-			    dport > rule->dst_port_high)
-				continue;
-		}
-
-		/* Check application ID */
-		if (rule->app_id != 0 && rule->app_id != pkt_app_id)
-			continue;
 
 		/* Rule matches! */
 		meta->policy_id = rule->rule_id;
