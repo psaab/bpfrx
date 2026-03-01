@@ -473,11 +473,10 @@ struct snat_value {
 #define SNAT_MODE_OFF 0xFF  /* source-nat off: match but don't translate */
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, MAX_ZONES * MAX_ZONES * MAX_SNAT_RULES_PER_PAIR);
-	__type(key, struct snat_key);
+	__type(key, __u32);
 	__type(value, struct snat_value);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
 } snat_rules SEC(".maps");
 
 /* Per-egress-interface SNAT addresses for "source-nat interface" mode.
@@ -530,11 +529,10 @@ struct snat_value_v6 {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, MAX_ZONES * MAX_ZONES * MAX_SNAT_RULES_PER_PAIR);
-	__type(key, struct snat_key);
+	__type(key, __u32);
 	__type(value, struct snat_value_v6);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
 } snat_rules_v6 SEC(".maps");
 
 /* ============================================================

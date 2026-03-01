@@ -333,6 +333,9 @@ const MaxZones = 64
 // MaxRulesPerPolicy is the maximum number of rules in a single policy set.
 const MaxRulesPerPolicy = 256
 
+// MaxSNATRulesPerPair must match MAX_SNAT_RULES_PER_PAIR in bpfrx_maps.h.
+const MaxSNATRulesPerPair = 8
+
 // LPMKeyV4 mirrors the C struct lpm_key_v4 for address book LPM trie.
 type LPMKeyV4 struct {
 	PrefixLen uint32

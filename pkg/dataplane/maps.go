@@ -310,31 +310,27 @@ func (m *Manager) ClearDNATStatic() error {
 	return nil
 }
 
-// SetSNATRule writes a snat_rules entry at the given rule index.
+// SetSNATRule writes a snat_rules entry at the computed flat index.
+// The snat_rules map is an ARRAY keyed by flat index:
+// from_zone * MaxZones * MaxSNATRulesPerPair + to_zone * MaxSNATRulesPerPair + rule_idx.
 func (m *Manager) SetSNATRule(fromZone, toZone, ruleIdx uint16, val SNATValue) error {
 	zm, ok := m.maps["snat_rules"]
 	if !ok {
 		return fmt.Errorf("snat_rules map not found")
 	}
-	key := SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ruleIdx}
+	key := uint32(fromZone)*MaxZones*MaxSNATRulesPerPair + uint32(toZone)*MaxSNATRulesPerPair + uint32(ruleIdx)
 	return zm.Update(key, val, ebpf.UpdateAny)
 }
 
-// ClearSNATRules deletes all snat_rules entries.
+// ClearSNATRules zeroes all snat_rules entries (ARRAY map semantics).
 func (m *Manager) ClearSNATRules() error {
 	zm, ok := m.maps["snat_rules"]
 	if !ok {
 		return fmt.Errorf("snat_rules map not found")
 	}
-	var key SNATKey
-	iter := zm.Iterate()
-	var keys []SNATKey
-	var val []byte
-	for iter.Next(&key, &val) {
-		keys = append(keys, key)
-	}
-	for _, k := range keys {
-		zm.Delete(k)
+	empty := SNATValue{}
+	for i := uint32(0); i < MaxZones*MaxZones*MaxSNATRulesPerPair; i++ {
+		zm.Update(i, empty, ebpf.UpdateAny)
 	}
 	return nil
 }
@@ -524,31 +520,27 @@ func (m *Manager) ClearDNATStaticV6() error {
 	return nil
 }
 
-// SetSNATRuleV6 writes a snat_rules_v6 entry at the given rule index.
+// SetSNATRuleV6 writes a snat_rules_v6 entry at the computed flat index.
+// The snat_rules_v6 map is an ARRAY keyed by flat index:
+// from_zone * MaxZones * MaxSNATRulesPerPair + to_zone * MaxSNATRulesPerPair + rule_idx.
 func (m *Manager) SetSNATRuleV6(fromZone, toZone, ruleIdx uint16, val SNATValueV6) error {
 	zm, ok := m.maps["snat_rules_v6"]
 	if !ok {
 		return fmt.Errorf("snat_rules_v6 map not found")
 	}
-	key := SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ruleIdx}
+	key := uint32(fromZone)*MaxZones*MaxSNATRulesPerPair + uint32(toZone)*MaxSNATRulesPerPair + uint32(ruleIdx)
 	return zm.Update(key, val, ebpf.UpdateAny)
 }
 
-// ClearSNATRulesV6 deletes all snat_rules_v6 entries.
+// ClearSNATRulesV6 zeroes all snat_rules_v6 entries (ARRAY map semantics).
 func (m *Manager) ClearSNATRulesV6() error {
 	zm, ok := m.maps["snat_rules_v6"]
 	if !ok {
 		return fmt.Errorf("snat_rules_v6 map not found")
 	}
-	var key SNATKey
-	iter := zm.Iterate()
-	var keys []SNATKey
-	var val []byte
-	for iter.Next(&key, &val) {
-		keys = append(keys, key)
-	}
-	for _, k := range keys {
-		zm.Delete(k)
+	empty := SNATValueV6{}
+	for i := uint32(0); i < MaxZones*MaxZones*MaxSNATRulesPerPair; i++ {
+		zm.Update(i, empty, ebpf.UpdateAny)
 	}
 	return nil
 }
@@ -1492,49 +1484,65 @@ func (m *Manager) DeleteStaleApplications(written map[AppKey]bool) {
 	}
 }
 
-// DeleteStaleSNATRules removes snat_rules entries not in the written set.
+// DeleteStaleSNATRules zeroes snat_rules ARRAY entries not in the written set.
+// The map is an ARRAY so entries cannot be deleted — zero means "no rule".
 func (m *Manager) DeleteStaleSNATRules(written map[SNATKey]bool) {
 	zm, ok := m.maps["snat_rules"]
 	if !ok {
 		return
 	}
-	var key SNATKey
-	var val []byte
+	empty := SNATValue{}
+	var key uint32
+	var val SNATValue
 	iter := zm.Iterate()
-	var stale []SNATKey
+	count := 0
 	for iter.Next(&key, &val) {
-		if !written[key] {
-			stale = append(stale, key)
+		if val.Mode == 0 && val.SrcAddrID == 0 && val.DstAddrID == 0 {
+			continue // already empty
+		}
+		fromZone := uint16(key / (MaxZones * MaxSNATRulesPerPair))
+		rem := key % (MaxZones * MaxSNATRulesPerPair)
+		toZone := uint16(rem / MaxSNATRulesPerPair)
+		ruleIdx := uint16(rem % MaxSNATRulesPerPair)
+		sk := SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ruleIdx}
+		if !written[sk] {
+			zm.Update(key, empty, ebpf.UpdateAny)
+			count++
 		}
 	}
-	for _, k := range stale {
-		zm.Delete(k)
-	}
-	if len(stale) > 0 {
-		slog.Info("deleted stale snat_rules entries", "count", len(stale))
+	if count > 0 {
+		slog.Info("zeroed stale snat_rules entries", "count", count)
 	}
 }
 
-// DeleteStaleSNATRulesV6 removes snat_rules_v6 entries not in the written set.
+// DeleteStaleSNATRulesV6 zeroes snat_rules_v6 ARRAY entries not in the written set.
+// The map is an ARRAY so entries cannot be deleted — zero means "no rule".
 func (m *Manager) DeleteStaleSNATRulesV6(written map[SNATKey]bool) {
 	zm, ok := m.maps["snat_rules_v6"]
 	if !ok {
 		return
 	}
-	var key SNATKey
-	var val []byte
+	empty := SNATValueV6{}
+	var key uint32
+	var val SNATValueV6
 	iter := zm.Iterate()
-	var stale []SNATKey
+	count := 0
 	for iter.Next(&key, &val) {
-		if !written[key] {
-			stale = append(stale, key)
+		if val.Mode == 0 && val.SrcAddrID == 0 && val.DstAddrID == 0 {
+			continue // already empty
+		}
+		fromZone := uint16(key / (MaxZones * MaxSNATRulesPerPair))
+		rem := key % (MaxZones * MaxSNATRulesPerPair)
+		toZone := uint16(rem / MaxSNATRulesPerPair)
+		ruleIdx := uint16(rem % MaxSNATRulesPerPair)
+		sk := SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ruleIdx}
+		if !written[sk] {
+			zm.Update(key, empty, ebpf.UpdateAny)
+			count++
 		}
 	}
-	for _, k := range stale {
-		zm.Delete(k)
-	}
-	if len(stale) > 0 {
-		slog.Info("deleted stale snat_rules_v6 entries", "count", len(stale))
+	if count > 0 {
+		slog.Info("zeroed stale snat_rules_v6 entries", "count", count)
 	}
 }
 
@@ -1809,7 +1817,7 @@ func (m *Manager) GetMapStats() []MapStats {
 		{"address_book_v6", true},
 		{"address_membership", true},
 		{"applications", true},
-		{"snat_rules", true},
+		{"snat_rules", false},
 		{"dnat_table", true},
 		{"dnat_table_v6", true},
 		{"nat_pool_config", false},

@@ -1260,18 +1260,17 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 				/* Dynamic SNAT (skip if static already matched) */
 				if (!(sess_nat_flags & SESS_FLAG_STATIC_NAT)) {
-					struct snat_key sk = {
-						.from_zone = meta->ingress_zone,
-						.to_zone   = meta->egress_zone,
-					};
+					__u32 snat_base = (__u32)meta->ingress_zone * MAX_ZONES * MAX_SNAT_RULES_PER_PAIR +
+							  (__u32)meta->egress_zone * MAX_SNAT_RULES_PER_PAIR;
 					struct snat_value *sv = NULL;
 
 					/* Iterate SNAT rules for this zone-pair */
 					#pragma unroll 1
 					for (__u16 ri = 0; ri < MAX_SNAT_RULES_PER_PAIR; ri++) {
-						sk.rule_idx = ri;
-						struct snat_value *candidate = bpf_map_lookup_elem(&snat_rules, &sk);
-						if (!candidate)
+						__u32 snat_idx = snat_base + ri;
+						struct snat_value *candidate = bpf_map_lookup_elem(&snat_rules, &snat_idx);
+						if (!candidate || (candidate->mode == 0 &&
+						    candidate->src_addr_id == 0 && candidate->dst_addr_id == 0))
 							break;
 						if (candidate->src_addr_id != 0 &&
 						    !addr_matches(meta->src_ip.v4, candidate->src_addr_id))
@@ -1535,18 +1534,17 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 				/* Dynamic SNAT (skip if static already matched) */
 				if (!(sess_nat_flags & SESS_FLAG_STATIC_NAT)) {
-					struct snat_key sk = {
-						.from_zone = meta->ingress_zone,
-						.to_zone   = meta->egress_zone,
-					};
+					__u32 snat_base_v6 = (__u32)meta->ingress_zone * MAX_ZONES * MAX_SNAT_RULES_PER_PAIR +
+							     (__u32)meta->egress_zone * MAX_SNAT_RULES_PER_PAIR;
 					struct snat_value_v6 *sv6 = NULL;
 
 					/* Iterate SNAT rules for this zone-pair */
 					#pragma unroll 1
 					for (__u16 ri = 0; ri < MAX_SNAT_RULES_PER_PAIR; ri++) {
-						sk.rule_idx = ri;
-						struct snat_value_v6 *candidate = bpf_map_lookup_elem(&snat_rules_v6, &sk);
-						if (!candidate)
+						__u32 snat_idx_v6 = snat_base_v6 + ri;
+						struct snat_value_v6 *candidate = bpf_map_lookup_elem(&snat_rules_v6, &snat_idx_v6);
+						if (!candidate || (candidate->mode == 0 &&
+						    candidate->src_addr_id == 0 && candidate->dst_addr_id == 0))
 							break;
 						if (candidate->src_addr_id != 0 &&
 						    !addr_matches_v6(meta->src_ip.v6, candidate->src_addr_id))
