@@ -337,33 +337,39 @@ apply_dnat_before_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 		csum_update_4(&iph->check, old_dst, meta->dst_ip.v4);
 		iph->daddr = meta->dst_ip.v4;
 
-		if (meta->protocol == PROTO_TCP) {
-			struct tcphdr *tcp = l4;
-			if ((void *)(tcp + 1) <= _de)
-				csum_update_4(&tcp->check, old_dst,
-					      meta->dst_ip.v4);
-		} else if (meta->protocol == PROTO_UDP) {
-			struct udphdr *udp = l4;
-			if ((void *)(udp + 1) <= _de && udp->check != 0)
-				csum_update_4(&udp->check, old_dst,
-					      meta->dst_ip.v4);
+		if (!meta->csum_partial) {
+			if (meta->protocol == PROTO_TCP) {
+				struct tcphdr *tcp = l4;
+				if ((void *)(tcp + 1) <= _de)
+					csum_update_4(&tcp->check, old_dst,
+						      meta->dst_ip.v4);
+			} else if (meta->protocol == PROTO_UDP) {
+				struct udphdr *udp = l4;
+				if ((void *)(udp + 1) <= _de &&
+				    udp->check != 0)
+					csum_update_4(&udp->check,
+						      old_dst,
+						      meta->dst_ip.v4);
+			}
 		}
 	}
 
-	/* Update L4 destination port. */
+	/* Update L4 destination port.  Skip incremental L4 port
+	 * checksum when csum_partial — matches nat_rewrite_v4(). */
 	__be16 new_dport = meta->dst_port;
 
 	if (meta->protocol == PROTO_TCP) {
 		struct tcphdr *tcp = l4;
 		if ((void *)(tcp + 1) <= _de && tcp->dest != new_dport) {
-			csum_update_2(&tcp->check,
-				      tcp->dest, new_dport);
+			if (!meta->csum_partial)
+				csum_update_2(&tcp->check,
+					      tcp->dest, new_dport);
 			tcp->dest = new_dport;
 		}
 	} else if (meta->protocol == PROTO_UDP) {
 		struct udphdr *udp = l4;
 		if ((void *)(udp + 1) <= _de && udp->dest != new_dport) {
-			if (udp->check != 0)
+			if (!meta->csum_partial && udp->check != 0)
 				csum_update_2(&udp->check,
 					      udp->dest,
 					      new_dport);
@@ -373,9 +379,10 @@ apply_dnat_before_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 		struct icmphdr *icmp = l4;
 		if ((void *)(icmp + 1) <= _de &&
 		    icmp->un.echo.id != new_dport) {
-			csum_update_2(&icmp->checksum,
-				      icmp->un.echo.id,
-				      new_dport);
+			if (!meta->csum_partial)
+				csum_update_2(&icmp->checksum,
+					      icmp->un.echo.id,
+					      new_dport);
 			icmp->un.echo.id = new_dport;
 		}
 	}
