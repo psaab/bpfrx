@@ -238,3 +238,82 @@ func TestRGStateMachine_MultiInstanceVRRP(t *testing.T) {
 		t.Error("should be allMaster when both instances are MASTER")
 	}
 }
+
+func TestRGStateMachine_DesiredVsApplied(t *testing.T) {
+	s := newRGStateMachine()
+
+	// Initial: no pending apply.
+	if s.NeedsApply() {
+		t.Error("new state machine should not need apply")
+	}
+
+	// Activate — desired changes but not yet applied.
+	s.SetCluster(true)
+	if !s.NeedsApply() {
+		t.Error("should need apply after activation")
+	}
+	if !s.DesiredActive() {
+		t.Error("desired should be active")
+	}
+
+	// Mark applied — now in sync.
+	s.MarkApplied(true)
+	if s.NeedsApply() {
+		t.Error("should not need apply after MarkApplied")
+	}
+
+	// Deactivate — needs apply again.
+	s.SetCluster(false)
+	if !s.NeedsApply() {
+		t.Error("should need apply after deactivation")
+	}
+
+	// Mark wrong value — still needs apply.
+	s.MarkApplied(true)
+	if !s.NeedsApply() {
+		t.Error("should still need apply when applied != desired")
+	}
+
+	// Mark correct value.
+	s.MarkApplied(false)
+	if s.NeedsApply() {
+		t.Error("should not need apply after correct MarkApplied")
+	}
+}
+
+func TestRGStateMachine_DesiredVsApplied_RetryOnFailure(t *testing.T) {
+	s := newRGStateMachine()
+
+	// Activate.
+	s.SetCluster(true)
+	if !s.NeedsApply() {
+		t.Fatal("should need apply")
+	}
+
+	// Simulate failed apply (don't call MarkApplied).
+	// NeedsApply should still be true.
+	if !s.NeedsApply() {
+		t.Error("should still need apply after failed attempt")
+	}
+
+	// Reconcile with same state — NeedsApply stays true.
+	s.Reconcile(true, map[string]bool{})
+	if !s.NeedsApply() {
+		t.Error("reconcile should preserve pending apply")
+	}
+
+	// Mark applied.
+	s.MarkApplied(true)
+	if s.NeedsApply() {
+		t.Error("should not need apply after MarkApplied")
+	}
+
+	// Reconcile again — no change, no pending apply.
+	tr := s.Reconcile(true, map[string]bool{})
+	if tr.Changed {
+		t.Error("second reconcile should not change")
+	}
+	if s.NeedsApply() {
+		t.Error("should not need apply when already applied")
+	}
+}

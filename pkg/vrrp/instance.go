@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/ipv4"
@@ -80,9 +82,18 @@ type vrrpInstance struct {
 	rxCh    chan *VRRPPacket
 	stopCh  chan struct{}
 	stopped chan struct{}
+
+	// RX backpressure counters (atomic).
+	rxDrops    atomic.Uint64 // packets dropped due to full rxCh
+	rxReceived atomic.Uint64 // total packets delivered to rxCh
+	lastDropWarn time.Time    // last time we logged a drop warning (rate-limited)
+
+	// onEventDrop is called when an event is dropped due to a full eventCh.
+	// Set by the manager to trigger immediate reconciliation.
+	onEventDrop func()
 }
 
-func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent) *vrrpInstance {
+func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent, onEventDrop func()) *vrrpInstance {
 	return &vrrpInstance{
 		cfg:            cfg,
 		desiredPreempt: cfg.Preempt,
@@ -93,9 +104,10 @@ func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent) *
 		ipv6FD:         -1,
 		preemptNowCh:   make(chan struct{}, 1),
 		resignCh:       make(chan struct{}, 1),
-		rxCh:           make(chan *VRRPPacket, 16),
+		rxCh:           make(chan *VRRPPacket, 64),
 		stopCh:         make(chan struct{}),
 		stopped:        make(chan struct{}),
+		onEventDrop:    onEventDrop,
 	}
 }
 
@@ -151,11 +163,11 @@ func (vi *vrrpInstance) openSocket() error {
 		if ip4 != nil && !vipSet[ip4.String()] {
 			vi.localIP = ip4
 		}
-		// Resolve link-local IPv6 address (fe80::/10) for VRRP source.
-		if ip4 == nil && ipNet.IP.IsLinkLocalUnicast() && !vipSet[ipNet.IP.String()] {
-			vi.localIPv6 = ipNet.IP
-		}
 	}
+	// Deterministic IPv6 link-local selection: sort candidates and
+	// pick the lowest address. This ensures the same source address
+	// is used even when the interface has multiple link-locals.
+	vi.localIPv6 = vi.resolveIPv6LinkLocal(vipSet)
 
 	// Open IPv6 raw socket if any VIPs are IPv6.
 	if hasIPv6VIPs {
@@ -447,8 +459,9 @@ func (vi *vrrpInstance) receiver() {
 
 		select {
 		case vi.rxCh <- pkt:
+			vi.rxReceived.Add(1)
 		default:
-			// Drop if channel full.
+			vi.warnRXDrop()
 		}
 	}
 }
@@ -511,7 +524,9 @@ func (vi *vrrpInstance) receiverIPv6() {
 
 		select {
 		case vi.rxCh <- pkt:
+			vi.rxReceived.Add(1)
 		default:
+			vi.warnRXDrop()
 		}
 	}
 }
@@ -613,7 +628,9 @@ func (vi *vrrpInstance) parseAfPacketIPv4(buf []byte, n, ethHeaderLen int) {
 
 	select {
 	case vi.rxCh <- pkt:
+		vi.rxReceived.Add(1)
 	default:
+		vi.warnRXDrop()
 	}
 }
 
@@ -663,7 +680,9 @@ func (vi *vrrpInstance) parseAfPacketIPv6(buf []byte, n, ethHeaderLen int) {
 
 	select {
 	case vi.rxCh <- pkt:
+		vi.rxReceived.Add(1)
 	default:
+		vi.warnRXDrop()
 	}
 }
 
@@ -766,6 +785,9 @@ func (vi *vrrpInstance) emitEvent() {
 		default:
 			slog.Warn("vrrp: event channel full, dropping event",
 				"key", vi.key(), "state", evt.State)
+			if vi.onEventDrop != nil {
+				vi.onEventDrop()
+			}
 		}
 	}
 }
@@ -900,9 +922,9 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 
 	srcIP := vi.localIPv6
 	if srcIP == nil {
-		// Lazy resolve: find link-local address. This happens when the
-		// interface didn't have a link-local at openSocket() time (e.g.
-		// DAD still running or address assigned after socket open).
+		// Lazy resolve: deterministically select the lowest link-local
+		// address. This happens when the interface didn't have a
+		// link-local at openSocket() time (e.g. DAD still running).
 		vipSet := make(map[string]bool, len(vi.cfg.VirtualAddresses))
 		for _, vip := range vi.cfg.VirtualAddresses {
 			addr := vip
@@ -911,19 +933,12 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 			}
 			vipSet[addr] = true
 		}
-		if addrs, err := vi.iface.Addrs(); err == nil {
-			for _, a := range addrs {
-				if ipNet, ok := a.(*net.IPNet); ok &&
-					ipNet.IP.To4() == nil &&
-					ipNet.IP.IsLinkLocalUnicast() &&
-					!vipSet[ipNet.IP.String()] {
-					vi.localIPv6 = ipNet.IP
-					srcIP = vi.localIPv6
-					slog.Info("vrrp: late-resolved IPv6 link-local address",
-						"key", vi.key(), "addr", srcIP)
-					break
-				}
-			}
+		resolved := vi.resolveIPv6LinkLocal(vipSet)
+		if resolved != nil {
+			vi.localIPv6 = resolved
+			srcIP = resolved
+			slog.Info("vrrp: late-resolved IPv6 link-local address",
+				"key", vi.key(), "addr", srcIP)
 		}
 		if srcIP == nil {
 			slog.Warn("vrrp: no link-local IPv6 address, skipping IPv6 advert",
@@ -1050,6 +1065,53 @@ func (vi *vrrpInstance) sendGARP() {
 				slog.Warn("vrrp: NA failed", "key", vi.key(), "vip", ip, "err", err)
 			}
 		}
+	}
+}
+
+// resolveIPv6LinkLocal deterministically selects the lowest non-VIP
+// link-local IPv6 address on the interface. Sorting ensures the same
+// address is always chosen regardless of kernel enumeration order,
+// even when multiple link-locals exist (e.g. after MAC changes).
+func (vi *vrrpInstance) resolveIPv6LinkLocal(vipSet map[string]bool) net.IP {
+	addrs, err := vi.iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	var candidates []net.IP
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ipNet.IP.To4() != nil {
+			continue
+		}
+		if !ipNet.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		if vipSet[ipNet.IP.String()] {
+			continue
+		}
+		candidates = append(candidates, ipNet.IP)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	// Sort and pick lowest for determinism.
+	sort.Slice(candidates, func(i, j int) bool {
+		return bytes.Compare(candidates[i], candidates[j]) < 0
+	})
+	return candidates[0]
+}
+
+// warnRXDrop increments the drop counter and logs a rate-limited warning.
+func (vi *vrrpInstance) warnRXDrop() {
+	drops := vi.rxDrops.Add(1)
+	now := time.Now()
+	if now.Sub(vi.lastDropWarn) >= 10*time.Second {
+		vi.lastDropWarn = now
+		slog.Warn("vrrp: rx channel full, dropping advertisements",
+			"key", vi.key(), "total_drops", drops)
 	}
 }
 

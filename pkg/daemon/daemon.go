@@ -121,6 +121,16 @@ type Daemon struct {
 	// the FIB failure handler triggers fabric redirect to the peer.
 	blackholeMu     sync.Mutex
 	blackholeRoutes map[int][]netlink.Route
+
+	// reconcileNowCh triggers an immediate RG state reconciliation pass.
+	// Sent on event channel drops (cluster or VRRP) so recovery does not
+	// wait for the 2-second periodic ticker.
+	reconcileNowCh chan struct{}
+
+	// Fabric cross-chassis forwarding state for periodic refresh.
+	fabricMu     sync.RWMutex
+	fabricIface  string
+	fabricPeerIP net.IP
 }
 
 // New creates a new Daemon.
@@ -147,8 +157,9 @@ func New(opts Options) *Daemon {
 		opts:            opts,
 		startTime:       time.Now(),
 		store:           store,
-		rgStates: make(map[int]*rgStateMachine),
+		rgStates:        make(map[int]*rgStateMachine),
 		blackholeRoutes: make(map[int][]netlink.Route),
+		reconcileNowCh:  make(chan struct{}, 1),
 	}
 }
 
@@ -198,6 +209,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cluster = cluster.NewManager(cc.NodeID, cc.ClusterID)
 		d.cluster.UpdateConfig(cc)
 		d.cluster.Start(ctx)
+		// Wire event-drop callback: on dropped cluster events, trigger
+		// immediate reconciliation so the safety net doesn't wait 2s.
+		d.cluster.SetOnEventDrop(d.triggerReconcile)
 		slog.Info("cluster manager initialized",
 			"node", cc.NodeID, "cluster", cc.ClusterID)
 
@@ -212,6 +226,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Create VRRP manager eagerly — must exist before applyConfig runs.
 	d.vrrpMgr = vrrp.NewManager()
+	// Wire event-drop callback: on dropped VRRP events, trigger
+	// immediate reconciliation.
+	d.vrrpMgr.SetOnEventDrop(d.triggerReconcile)
 	if err := d.vrrpMgr.Start(context.Background()); err != nil {
 		slog.Warn("failed to start VRRP manager", "err", err)
 	}
@@ -3452,7 +3469,17 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			}
 
 			// Wire remote failover: when peer requests us to give up primary.
+			// Guard: only honor the request if we are actually primary for
+			// this RG. Stale/delayed sync messages can arrive after we've
+			// already transitioned to secondary — blindly calling
+			// ManualFailover would cause dual-resign (both nodes secondary)
+			// and a 30-second traffic blackhole.
 			d.sessionSync.OnRemoteFailover = func(rgID int) {
+				if !d.cluster.IsLocalPrimary(rgID) {
+					slog.Warn("cluster: ignoring remote failover request (not primary)",
+						"rg", rgID)
+					return
+				}
 				slog.Info("cluster: remote failover request from peer", "rg", rgID)
 				if err := d.cluster.ManualFailover(rgID); err != nil {
 					slog.Warn("cluster: remote failover failed", "rg", rgID, "err", err)
@@ -3507,11 +3534,8 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				go d.syncIPsecSAPeriodic(ctx)
 			}
 
-			// Populate fabric_fwd BPF map for cross-chassis redirect.
-			// Retry: the peer ARP entry may not exist yet (heartbeat
-			// hasn't exchanged packets). Once populated, the BPF
-			// program can redirect packets to the peer during VRRP
-			// failback asymmetric routing windows.
+			// Populate fabric_fwd BPF map for cross-chassis redirect,
+			// then periodically refresh to correct neighbor drift.
 			go d.populateFabricFwd(ctx, cc.FabricInterface, cc.FabricPeerAddress)
 		}()
 	}
@@ -3519,6 +3543,8 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 // populateFabricFwd resolves the fabric interface MACs and populates the
 // fabric_fwd BPF map for cross-chassis packet redirect during failback.
+// After initial population, runs a periodic refresh every 30s to correct
+// neighbor drift (MAC changes, stale ARP entries).
 func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr string) {
 	peerIP := net.ParseIP(peerAddr)
 	if peerIP == nil {
@@ -3526,6 +3552,13 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 		return
 	}
 
+	// Store fabric config for RefreshFabricFwd.
+	d.fabricMu.Lock()
+	d.fabricIface = fabIface
+	d.fabricPeerIP = peerIP
+	d.fabricMu.Unlock()
+
+	// Initial population with retries.
 	for i := 0; i < 30; i++ {
 		select {
 		case <-ctx.Done():
@@ -3533,94 +3566,123 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 		case <-time.After(2 * time.Second):
 		}
 
-		link, err := netlink.LinkByName(fabIface)
-		if err != nil {
-			slog.Debug("cluster: fabric link not found, retrying",
+		if d.refreshFabricFwd(fabIface, peerIP, i == 0) {
+			break
+		}
+		if i == 29 {
+			slog.Warn("cluster: fabric_fwd map population failed after retries")
+		}
+	}
+
+	// Periodic refresh every 30s to correct neighbor drift.
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.refreshFabricFwd(fabIface, peerIP, false)
+		}
+	}
+}
+
+// refreshFabricFwd resolves fabric link/neighbor state and updates the
+// fabric_fwd BPF map. Returns true on success. Called during initial
+// population and periodic drift correction.
+func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting bool) bool {
+	link, err := netlink.LinkByName(fabIface)
+	if err != nil {
+		slog.Debug("cluster: fabric link not found",
+			"interface", fabIface, "err", err)
+		return false
+	}
+	localMAC := link.Attrs().HardwareAddr
+	if len(localMAC) != 6 {
+		return false
+	}
+
+	// Increase fabric txqueuelen for generic XDP.
+	if link.Attrs().TxQLen < 10000 {
+		if err := netlink.LinkSetTxQLen(link, 10000); err != nil {
+			slog.Warn("cluster: failed to set fabric txqueuelen",
 				"interface", fabIface, "err", err)
-			continue
 		}
-		localMAC := link.Attrs().HardwareAddr
-		if len(localMAC) != 6 {
-			continue
-		}
+	}
 
-		// Increase fabric txqueuelen for generic XDP.
-		// virtio-net has only 256 TX ring entries; under
-		// bidirectional active/active load, bpf_redirect_map
-		// drops exceed 1.7% at default queuelen. 10000 brings
-		// drops to zero.
-		if link.Attrs().TxQLen < 10000 {
-			if err := netlink.LinkSetTxQLen(link, 10000); err != nil {
-				slog.Warn("cluster: failed to set fabric txqueuelen",
-					"interface", fabIface, "err", err)
+	// Resolve peer MAC from ARP/NDP table.
+	neighs, err := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
+	if err != nil {
+		slog.Debug("cluster: neigh list failed", "err", err)
+		return false
+	}
+	var peerMAC net.HardwareAddr
+	for _, n := range neighs {
+		if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
+			(n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT|netlink.NUD_DELAY|netlink.NUD_PROBE)) != 0 {
+			peerMAC = n.HardwareAddr
+			break
+		}
+	}
+	if peerMAC == nil {
+		if logWaiting {
+			slog.Info("cluster: waiting for fabric peer ARP entry",
+				"peer", peerIP)
+		}
+		return false
+	}
+
+	info := dataplane.FabricFwdInfo{
+		Ifindex: uint32(link.Attrs().Index),
+	}
+	copy(info.PeerMAC[:], peerMAC)
+	copy(info.LocalMAC[:], localMAC)
+
+	// Find a non-VRF interface for zone-decoded FIB lookups.
+	links, lerr := netlink.LinkList()
+	if lerr == nil {
+		for _, l := range links {
+			a := l.Attrs()
+			if a.Index <= 1 || a.MasterIndex != 0 {
+				continue
 			}
-		}
-
-		// Resolve peer MAC from ARP/NDP table.
-		neighs, err := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
-		if err != nil {
-			slog.Debug("cluster: neigh list failed", "err", err)
-			continue
-		}
-		var peerMAC net.HardwareAddr
-		for _, n := range neighs {
-			if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
-				(n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT|netlink.NUD_DELAY|netlink.NUD_PROBE)) != 0 {
-				peerMAC = n.HardwareAddr
-				break
+			if l.Type() == "vrf" || l.Type() == "veth" {
+				continue
 			}
-		}
-		if peerMAC == nil {
-			if i == 0 {
-				slog.Info("cluster: waiting for fabric peer ARP entry",
-					"peer", peerAddr)
+			if a.Flags&net.FlagUp == 0 {
+				continue
 			}
-			continue
+			info.FIBIfindex = uint32(a.Index)
+			break
 		}
+	}
 
-		info := dataplane.FabricFwdInfo{
-			Ifindex: uint32(link.Attrs().Index),
-		}
-		copy(info.PeerMAC[:], peerMAC)
-		copy(info.LocalMAC[:], localMAC)
+	if d.dp == nil {
+		slog.Debug("cluster: dataplane not ready, retrying fabric_fwd")
+		return false
+	}
+	if err := d.dp.UpdateFabricFwd(info); err != nil {
+		slog.Warn("cluster: failed to update fabric_fwd map", "err", err)
+		return false
+	}
+	slog.Info("cluster: fabric_fwd updated",
+		"interface", fabIface, "ifindex", info.Ifindex,
+		"fib_ifindex", info.FIBIfindex,
+		"local_mac", localMAC, "peer_mac", peerMAC)
+	return true
+}
 
-		// Find a non-VRF interface for zone-decoded FIB lookups.
-		// The fabric interface is a VRF slave (vrf-mgmt), and
-		// bpf_fib_lookup honors l3mdev rules even with TBID, causing
-		// lookups to hit the VRF table instead of the main table.
-		links, lerr := netlink.LinkList()
-		if lerr == nil {
-			for _, l := range links {
-				a := l.Attrs()
-				if a.Index <= 1 || a.MasterIndex != 0 {
-					continue
-				}
-				if l.Type() == "vrf" || l.Type() == "veth" {
-					continue
-				}
-				if a.Flags&net.FlagUp == 0 {
-					continue
-				}
-				info.FIBIfindex = uint32(a.Index)
-				break
-			}
-		}
-
-		if d.dp == nil {
-			slog.Debug("cluster: dataplane not ready, retrying fabric_fwd")
-			continue
-		}
-		if err := d.dp.UpdateFabricFwd(info); err != nil {
-			slog.Warn("cluster: failed to update fabric_fwd map", "err", err)
-			continue
-		}
-		slog.Info("cluster: fabric cross-chassis redirect enabled",
-			"interface", fabIface, "ifindex", info.Ifindex,
-			"fib_ifindex", info.FIBIfindex,
-			"local_mac", localMAC, "peer_mac", peerMAC)
+// RefreshFabricFwd triggers an immediate refresh of the fabric_fwd BPF map.
+// Call this on link state changes, neighbor changes, or failover transitions.
+func (d *Daemon) RefreshFabricFwd() {
+	d.fabricMu.RLock()
+	fabIface := d.fabricIface
+	peerIP := d.fabricPeerIP
+	d.fabricMu.RUnlock()
+	if fabIface == "" || peerIP == nil {
 		return
 	}
-	slog.Warn("cluster: fabric_fwd map population failed after retries")
+	d.refreshFabricFwd(fabIface, peerIP, false)
 }
 
 // getOrCreateRGState returns the rgStateMachine for the given RG, creating
@@ -3713,18 +3775,40 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			// This prevents the dual-inactive window (both nodes
 			// rg_active=false during failover) and eliminates the race
 			// between the two independent goroutine writers.
+			//
+			// Transition ordering safety:
+			// - Activation: set rg_active FIRST, then remove blackholes
+			// - Deactivation: add blackholes FIRST, then clear rg_active
 			isPrimary := ev.NewState == cluster.StatePrimary
-			tr := d.getOrCreateRGState(ev.GroupID).SetCluster(isPrimary)
+			s := d.getOrCreateRGState(ev.GroupID)
+			tr := s.SetCluster(isPrimary)
 			if isPrimary {
-				// Always remove blackhole routes on Primary — FIB
-				// lookups must succeed for synced sessions.
+				// Activation: enable forwarding first.
+				if tr.Changed && d.dp != nil {
+					if err := d.dp.UpdateRGActive(ev.GroupID, tr.Active); err != nil {
+						slog.Warn("failed to update rg_active from cluster event",
+							"rg", ev.GroupID, "active", tr.Active, "err", err)
+					} else {
+						s.MarkApplied(tr.Active)
+					}
+				}
+				// Then remove blackhole routes — FIB lookups must
+				// succeed for synced sessions.
 				d.removeBlackholeRoutes(ev.GroupID)
 				go d.warmNeighborCache()
-			}
-			if tr.Changed && d.dp != nil {
-				if err := d.dp.UpdateRGActive(ev.GroupID, tr.Active); err != nil {
-					slog.Warn("failed to update rg_active from cluster event",
-						"rg", ev.GroupID, "active", tr.Active, "err", err)
+			} else {
+				// Deactivation: blackhole routes first (if transitioning
+				// to inactive), then clear rg_active.
+				if tr.Changed && !tr.Active {
+					d.injectBlackholeRoutes(ev.GroupID)
+				}
+				if tr.Changed && d.dp != nil {
+					if err := d.dp.UpdateRGActive(ev.GroupID, tr.Active); err != nil {
+						slog.Warn("failed to update rg_active from cluster event",
+							"rg", ev.GroupID, "active", tr.Active, "err", err)
+					} else {
+						s.MarkApplied(tr.Active)
+					}
 				}
 			}
 			if d.dp != nil {
@@ -3816,27 +3900,41 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				"rg", rgID,
 				"state", ev.State.String())
 			if ev.State == vrrp.StateMaster {
-				tr := d.getOrCreateRGState(rgID).SetVRRP(ev.Interface, true)
-				d.removeBlackholeRoutes(rgID)
+				s := d.getOrCreateRGState(rgID)
+				tr := s.SetVRRP(ev.Interface, true)
 				if tr.Changed && d.dp != nil {
+					// Activation order: set rg_active FIRST, then
+					// remove blackhole routes. This ensures forwarding
+					// is enabled before routes allow FIB hits.
 					if err := d.dp.UpdateRGActive(rgID, true); err != nil {
 						slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
+					} else {
+						s.MarkApplied(true)
 					}
 					d.dp.BumpFIBGeneration()
 					go d.warmNeighborCache()
+					go d.RefreshFabricFwd()
 				}
+				d.removeBlackholeRoutes(rgID)
 				d.applyRethServicesForRG(rgID)
 			}
 			if ev.State == vrrp.StateBackup {
-				tr := d.getOrCreateRGState(rgID).SetVRRP(ev.Interface, false)
+				s := d.getOrCreateRGState(rgID)
+				tr := s.SetVRRP(ev.Interface, false)
 				if tr.Changed && !tr.Active {
+					// Deactivation order: inject blackhole routes FIRST,
+					// then clear rg_active. This prevents a window where
+					// FIB can route traffic but rg_active says inactive.
+					d.injectBlackholeRoutes(rgID)
 					if d.dp != nil {
 						if err := d.dp.UpdateRGActive(rgID, false); err != nil {
 							slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
+						} else {
+							s.MarkApplied(false)
 						}
 						d.dp.BumpFIBGeneration()
+						go d.RefreshFabricFwd()
 					}
-					d.injectBlackholeRoutes(rgID)
 					d.clearRethServicesForRG(rgID)
 				}
 			}
@@ -3847,7 +3945,8 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 // reconcileRGStateLoop periodically reads the authoritative cluster and VRRP
 // states and reconciles rgStateMachine / rg_active BPF map / blackhole routes.
 // This is the safety net for dropped events (non-blocking channel sends).
-// Runs every 2s; skips if cluster or dataplane is nil.
+// Runs every 2s; also wakes immediately on event-drop notifications via
+// reconcileNowCh. Skips if cluster or dataplane is nil.
 func (d *Daemon) reconcileRGStateLoop(ctx context.Context) {
 	// Run immediately on startup to correct stale rg_active from prior run.
 	d.reconcileRGState()
@@ -3861,7 +3960,18 @@ func (d *Daemon) reconcileRGStateLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			d.reconcileRGState()
+		case <-d.reconcileNowCh:
+			d.reconcileRGState()
 		}
+	}
+}
+
+// triggerReconcile requests an immediate RG state reconciliation pass.
+// Non-blocking: if a reconcile is already pending, the request is coalesced.
+func (d *Daemon) triggerReconcile() {
+	select {
+	case d.reconcileNowCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -3917,22 +4027,50 @@ func (d *Daemon) reconcileRGState() {
 
 		s := d.getOrCreateRGState(rgID)
 		tr := s.Reconcile(clusterPri, vrrp)
-		if tr.Changed {
-			slog.Info("reconcile: correcting rg_active drift",
-				"rg", rgID, "active", tr.Active, "epoch", tr.Epoch)
-			if d.dp != nil {
-				if err := d.dp.UpdateRGActive(rgID, tr.Active); err != nil {
+
+		// Desired-vs-applied retry: even if the state machine didn't
+		// change this pass, a prior UpdateRGActive failure may have
+		// left applied != desired. Retry unconditionally.
+		needsApply := tr.Changed || s.NeedsApply()
+		if needsApply && d.dp != nil {
+			if tr.Changed {
+				slog.Info("reconcile: correcting rg_active drift",
+					"rg", rgID, "active", tr.Active, "epoch", tr.Epoch)
+			} else {
+				slog.Info("reconcile: retrying rg_active apply",
+					"rg", rgID, "active", tr.Active)
+			}
+			if tr.Active {
+				// Activation ordering: set rg_active FIRST, then
+				// remove blackholes.
+				if err := d.dp.UpdateRGActive(rgID, true); err != nil {
 					slog.Warn("reconcile: failed to update rg_active",
-						"rg", rgID, "active", tr.Active, "err", err)
+						"rg", rgID, "active", true, "err", err)
+				} else {
+					s.MarkApplied(true)
+				}
+				d.dp.BumpFIBGeneration()
+			} else {
+				// Deactivation ordering: blackholes FIRST, then
+				// clear rg_active.
+				d.injectBlackholeRoutes(rgID)
+				if err := d.dp.UpdateRGActive(rgID, false); err != nil {
+					slog.Warn("reconcile: failed to update rg_active",
+						"rg", rgID, "active", false, "err", err)
+				} else {
+					s.MarkApplied(false)
 				}
 				d.dp.BumpFIBGeneration()
 			}
-			// Reconcile blackhole routes.
-			if tr.Active {
-				d.removeBlackholeRoutes(rgID)
-			} else {
-				d.injectBlackholeRoutes(rgID)
-			}
+		}
+
+		// Declarative blackhole route reconciliation: assert the route
+		// set that should exist regardless of prior transition results.
+		// Active RGs should NOT have blackholes; inactive RGs SHOULD.
+		if tr.Active {
+			d.removeBlackholeRoutes(rgID)
+		} else {
+			d.injectBlackholeRoutes(rgID)
 		}
 	}
 }

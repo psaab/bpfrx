@@ -104,6 +104,10 @@ type Manager struct {
 	// peerFailoverFn sends a remote failover request to the peer.
 	// Set by daemon after sessionSync creation.
 	peerFailoverFn func(rgID int) error
+
+	// onEventDrop is called when a cluster event is dropped due to a full
+	// channel. The daemon uses this to trigger immediate reconciliation.
+	onEventDrop func()
 }
 
 // NewManager creates a new cluster manager.
@@ -507,12 +511,24 @@ func (m *Manager) ResetFailover(rgID int) error {
 	return nil
 }
 
+// SetOnEventDrop registers a callback invoked when a cluster event is
+// dropped due to a full channel. The daemon uses this to schedule an
+// immediate reconciliation pass.
+func (m *Manager) SetOnEventDrop(fn func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onEventDrop = fn
+}
+
 func (m *Manager) sendEvent(groupID int, oldState, newState NodeState, reason string) {
 	select {
 	case m.eventCh <- ClusterEvent{GroupID: groupID, OldState: oldState, NewState: newState}:
 	default:
 		slog.Warn("cluster: event channel full, dropping event",
 			"rg", groupID, "old", oldState, "new", newState)
+		if m.onEventDrop != nil {
+			m.onEventDrop()
+		}
 	}
 
 	m.history.Record(EventRG, groupID, fmt.Sprintf("%s->%s, reason: %s", oldState, newState, reason))

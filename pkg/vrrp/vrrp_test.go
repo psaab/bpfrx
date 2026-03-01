@@ -518,7 +518,7 @@ func TestSyncHold_SuppressesPreempt(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 		Preempt:   true,
-	}, &net.Interface{Name: "eth0"}, m.eventCh)
+	}, &net.Interface{Name: "eth0"}, m.eventCh, nil)
 
 	// Simulate what UpdateInstances does during sync hold.
 	if m.syncHold {
@@ -563,7 +563,7 @@ func TestSyncHold_TimeoutReleasesAutomatically(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 		Preempt:   true,
-	}, &net.Interface{Name: "eth0"}, m.eventCh)
+	}, &net.Interface{Name: "eth0"}, m.eventCh, nil)
 
 	m.mu.Lock()
 	m.instances = map[instanceKey]*vrrpInstance{
@@ -593,7 +593,7 @@ func TestInstanceRestorePreempt(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 		Preempt:   true,
-	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1), nil)
 
 	// Simulate sync hold: override preempt=false but keep desiredPreempt=true.
 	vi.mu.Lock()
@@ -616,7 +616,7 @@ func TestPreemptNowCh_Initialized(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 		Preempt:   true,
-	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1), nil)
 
 	if vi.preemptNowCh == nil {
 		t.Fatal("preemptNowCh should be initialized")
@@ -632,7 +632,7 @@ func TestTriggerPreemptNow_NonBlocking(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 		Preempt:   true,
-	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1), nil)
 
 	// First call should succeed (buffer of 1).
 	vi.triggerPreemptNow()
@@ -667,7 +667,7 @@ func TestReleaseSyncHold_TriggersPreemptNow(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 		Preempt:   true,
-	}, &net.Interface{Name: "eth0"}, m.eventCh)
+	}, &net.Interface{Name: "eth0"}, m.eventCh, nil)
 
 	// Simulate sync hold: preempt suppressed.
 	vi.mu.Lock()
@@ -703,7 +703,7 @@ func TestUpdateConfig_PreservesDesiredPreempt(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 		Preempt:   true,
-	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1), nil)
 
 	// updateConfig should update both cfg.Preempt and desiredPreempt.
 	vi.updateConfig(Instance{Priority: 150, Preempt: false})
@@ -798,7 +798,7 @@ func TestResignCh_Initialized(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 		Preempt:   true,
-	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1), nil)
 
 	if vi.resignCh == nil {
 		t.Fatal("resignCh should be initialized")
@@ -814,7 +814,7 @@ func TestTriggerResign_NonBlocking(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 		Preempt:   true,
-	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1))
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 1), nil)
 
 	// First call should succeed (buffer of 1).
 	vi.triggerResign()
@@ -849,19 +849,19 @@ func TestResignRG_SignalsCorrectInstances(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   101, // VRID 101 = RG 1
 		Priority:  200,
-	}, &net.Interface{Name: "eth0"}, m.eventCh)
+	}, &net.Interface{Name: "eth0"}, m.eventCh, nil)
 
 	vi2 := newInstance(Instance{
 		Interface: "eth1",
 		GroupID:   102, // VRID 102 = RG 2
 		Priority:  200,
-	}, &net.Interface{Name: "eth1"}, m.eventCh)
+	}, &net.Interface{Name: "eth1"}, m.eventCh, nil)
 
 	vi3 := newInstance(Instance{
 		Interface: "eth2",
 		GroupID:   101, // VRID 101 = RG 1 (second instance, same RG)
 		Priority:  200,
-	}, &net.Interface{Name: "eth2"}, m.eventCh)
+	}, &net.Interface{Name: "eth2"}, m.eventCh, nil)
 
 	m.mu.Lock()
 	m.instances = map[instanceKey]*vrrpInstance{
@@ -893,7 +893,7 @@ func TestHandleMasterRx_HigherPriority_StepsDown(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   101,
 		Priority:  100,
-	}, &net.Interface{Name: "eth0"}, eventCh)
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.localIP = net.IPv4(10, 0, 0, 1)
 	vi.setState(StateMaster)
 
@@ -919,7 +919,7 @@ func TestHandleMasterRx_LowerPriority_StaysMaster(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   101,
 		Priority:  200,
-	}, &net.Interface{Name: "eth0"}, eventCh)
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.localIP = net.IPv4(10, 0, 0, 1)
 	vi.setState(StateMaster)
 
@@ -945,7 +945,7 @@ func TestHandleMasterRx_EqualPriority_HigherPeerIP_StepsDown(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   101,
 		Priority:  200,
-	}, &net.Interface{Name: "eth0"}, eventCh)
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.localIP = net.IPv4(10, 0, 0, 1) // lower IP
 	vi.setState(StateMaster)
 
@@ -971,7 +971,7 @@ func TestHandleMasterRx_EqualPriority_LowerPeerIP_StaysMaster(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   101,
 		Priority:  200,
-	}, &net.Interface{Name: "eth0"}, eventCh)
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.localIP = net.IPv4(10, 0, 0, 2) // higher IP
 	vi.setState(StateMaster)
 
@@ -997,7 +997,7 @@ func TestHandleMasterRx_EqualPriority_NilSrcIP_StaysMaster(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   101,
 		Priority:  200,
-	}, &net.Interface{Name: "eth0"}, eventCh)
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.localIP = net.IPv4(10, 0, 0, 1)
 	vi.setState(StateMaster)
 
@@ -1024,7 +1024,7 @@ func TestHandleMasterRx_Priority0_StaysMaster(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   101,
 		Priority:  200,
-	}, &net.Interface{Name: "eth0"}, eventCh)
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.localIP = net.IPv4(10, 0, 0, 1)
 	vi.setState(StateMaster)
 
@@ -1050,7 +1050,7 @@ func TestHandleMasterRx_EqualPriority_HigherPeerIPv6_StepsDown(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   101,
 		Priority:  200,
-	}, &net.Interface{Name: "eth0"}, eventCh)
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.localIPv6 = net.ParseIP("fe80::1") // lower IPv6
 	vi.setState(StateMaster)
 
@@ -1076,7 +1076,7 @@ func TestHandleMasterRx_EqualPriority_LowerPeerIPv6_StaysMaster(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   101,
 		Priority:  200,
-	}, &net.Interface{Name: "eth0"}, eventCh)
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.localIPv6 = net.ParseIP("fe80::2") // higher IPv6
 	vi.setState(StateMaster)
 
@@ -1506,7 +1506,7 @@ func TestForceRGMaster_DoesNotLeakPreempt(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 		Preempt:   false, // preempt disabled
-	}, &net.Interface{Name: "eth0"}, m.eventCh)
+	}, &net.Interface{Name: "eth0"}, m.eventCh, nil)
 	vi.setState(StateBackup)
 
 	m.mu.Lock()
@@ -1545,7 +1545,7 @@ func TestForcePreemptOnce_ClearedAfterUse(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 		Preempt:   false,
-	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 16))
+	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 16), nil)
 
 	// Simulate ForceRGMaster setting the flag.
 	vi.mu.Lock()
@@ -1608,7 +1608,7 @@ func TestReceiverIPv6_DeliversPacket(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   42,
 		Priority:  100,
-	}, &net.Interface{Name: "eth0"}, eventCh)
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.localIPv6 = net.ParseIP("fe80::1")
 
 	// Build a valid VRRPv3 packet.
@@ -1660,7 +1660,7 @@ func TestEmitEvent_DropDoesNotPanic(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   101,
 		Priority:  200,
-	}, &net.Interface{Name: "eth0"}, eventCh)
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.setState(StateMaster)
 
 	// First event should succeed.
@@ -1683,7 +1683,7 @@ func TestEmitEvent_DropSilentDuringShutdown(t *testing.T) {
 		Interface: "eth0",
 		GroupID:   101,
 		Priority:  200,
-	}, &net.Interface{Name: "eth0"}, eventCh)
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.setState(StateMaster)
 
 	// Fill channel.
@@ -1706,7 +1706,7 @@ func TestSendPacketIPv6_NilLocalIPv6_ReturnsError(t *testing.T) {
 		GroupID:   42,
 		Priority:  200,
 		VirtualAddresses: []string{"2001:db8::1/128"},
-	}, &net.Interface{Name: "lo", Index: 1}, eventCh)
+	}, &net.Interface{Name: "lo", Index: 1}, eventCh, nil)
 	// localIPv6 is nil and interface has no link-local → should error.
 	vi.localIPv6 = nil
 
@@ -1737,7 +1737,7 @@ func TestSendPacketIPv6_WithLocalIPv6_SendsPacket(t *testing.T) {
 		GroupID:   42,
 		Priority:  200,
 		VirtualAddresses: []string{"2001:db8::1/128"},
-	}, &net.Interface{Name: "lo", Index: 1}, eventCh)
+	}, &net.Interface{Name: "lo", Index: 1}, eventCh, nil)
 	vi.localIPv6 = net.ParseIP("fe80::1")
 
 	var sentData []byte

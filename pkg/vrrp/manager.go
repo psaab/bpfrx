@@ -29,6 +29,16 @@ type Manager struct {
 	cancel        context.CancelFunc
 	syncHold      bool        // suppress preemption until session sync completes
 	syncHoldTimer *time.Timer // safety timeout to release hold
+	onEventDrop   func()      // called when an event is dropped (full channel)
+}
+
+// SetOnEventDrop registers a callback invoked when a VRRP event is dropped
+// due to a full channel. The daemon uses this to schedule an immediate
+// reconciliation pass.
+func (m *Manager) SetOnEventDrop(fn func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onEventDrop = fn
 }
 
 // NewManager creates a new VRRP manager.
@@ -168,7 +178,7 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 		if m.syncHold {
 			instCfg.Preempt = false
 		}
-		vi := newInstance(instCfg, iface, m.eventCh)
+		vi := newInstance(instCfg, iface, m.eventCh, m.onEventDrop)
 		// Store the real configured preempt value for when sync hold releases.
 		vi.desiredPreempt = inst.Preempt
 		if err := vi.openSocket(); err != nil {
@@ -296,6 +306,21 @@ func (m *Manager) InstanceStates() []VRRPEvent {
 		})
 	}
 	return out
+}
+
+// RXDropStats returns per-instance RX drop and received counts.
+// Key format: "VI_<iface>_<group>".
+func (m *Manager) RXDropStats() map[string]uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	stats := make(map[string]uint64, len(m.instances)*2)
+	for _, vi := range m.instances {
+		k := vi.key()
+		stats[k+"/drops"] = vi.rxDrops.Load()
+		stats[k+"/received"] = vi.rxReceived.Load()
+	}
+	return stats
 }
 
 // Status returns a formatted multi-line status string.

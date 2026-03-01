@@ -14,13 +14,19 @@ import "sync"
 //     Primary event may lag by ~200ms)
 //   - Both false → deactivate
 //
+// Desired-vs-applied tracking: the state machine tracks both what the
+// desired rg_active value should be and whether it was successfully applied
+// to the BPF map. The reconciliation loop retries when they diverge.
+//
 // The epoch counter is monotonically incremented on every state change,
-// enabling stale-update detection in the reconciliation loop (task #2).
+// enabling stale-update detection in the reconciliation loop.
 type rgStateMachine struct {
 	mu            sync.Mutex
 	clusterPri    bool            // cluster says Primary for this RG
 	vrrpInstances map[string]bool // per-interface VRRP master state
-	active        bool            // current rg_active value in BPF
+	active        bool            // desired rg_active value
+	applied       bool            // last successfully applied rg_active value
+	applyPending  bool            // true when desired != applied
 	epoch         uint64          // monotonic counter
 }
 
@@ -56,7 +62,7 @@ func (s *rgStateMachine) SetVRRP(iface string, isMaster bool) rgTransition {
 	return s.reconcileLocked()
 }
 
-// IsActive returns the current rg_active value.
+// IsActive returns the current desired rg_active value.
 func (s *rgStateMachine) IsActive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -101,11 +107,40 @@ func (s *rgStateMachine) Reconcile(clusterPri bool, vrrpStates map[string]bool) 
 	return s.reconcileLocked()
 }
 
+// MarkApplied records that the desired rg_active value was successfully
+// written to the BPF map.
+func (s *rgStateMachine) MarkApplied(active bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applied = active
+	if s.applied == s.active {
+		s.applyPending = false
+	}
+}
+
+// NeedsApply returns true if the desired rg_active differs from the last
+// successfully applied value.
+func (s *rgStateMachine) NeedsApply() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applyPending
+}
+
+// DesiredActive returns the current desired active state.
+func (s *rgStateMachine) DesiredActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active
+}
+
 func (s *rgStateMachine) reconcileLocked() rgTransition {
 	s.epoch++
 	desired := s.clusterPri || s.anyMasterLocked()
 	changed := desired != s.active
 	s.active = desired
+	if s.active != s.applied {
+		s.applyPending = true
+	}
 	return rgTransition{Changed: changed, Active: desired, Epoch: s.epoch}
 }
 
