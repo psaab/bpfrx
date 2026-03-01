@@ -480,6 +480,19 @@ struct {
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } snat_rules SEC(".maps");
 
+/* Per-egress-interface SNAT addresses for "source-nat interface" mode.
+ * Key: (parent_ifindex, vlan_id) — same identity used by fwd_ifindex/egress_vlan_id.
+ * Value: IPv4 + IPv6 address of that interface.
+ * Populated by Go compiler; looked up at SNAT allocation time when pool
+ * has interface_mode=1 to pick the correct egress IP. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_LOGICAL_INTERFACES);
+	__type(key, struct snat_egress_key);
+	__type(value, struct snat_egress_value);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} snat_egress_ips SEC(".maps");
+
 /* ============================================================
  * NAT tables (IPv6)
  * ============================================================ */

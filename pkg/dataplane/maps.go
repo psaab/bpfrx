@@ -614,6 +614,34 @@ func (m *Manager) ClearNATPoolIPs() error {
 	return nil
 }
 
+// SetSNATEgressIP writes a per-interface SNAT address for interface-mode SNAT.
+func (m *Manager) SetSNATEgressIP(key SNATEgressKey, val SNATEgressValue) error {
+	zm, ok := m.maps["snat_egress_ips"]
+	if !ok {
+		return fmt.Errorf("snat_egress_ips map not found")
+	}
+	return zm.Update(key, val, ebpf.UpdateAny)
+}
+
+// ClearSNATEgressIPs deletes all snat_egress_ips entries.
+func (m *Manager) ClearSNATEgressIPs() error {
+	zm, ok := m.maps["snat_egress_ips"]
+	if !ok {
+		return fmt.Errorf("snat_egress_ips map not found")
+	}
+	var key SNATEgressKey
+	iter := zm.Iterate()
+	var keys []SNATEgressKey
+	var val []byte
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	for _, k := range keys {
+		zm.Delete(k)
+	}
+	return nil
+}
+
 // SetScreenConfig writes a screen profile configuration entry.
 func (m *Manager) SetScreenConfig(profileID uint32, cfg ScreenConfig) error {
 	zm, ok := m.maps["screen_configs"]

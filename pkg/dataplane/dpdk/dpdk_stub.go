@@ -194,6 +194,13 @@ func (m *Manager) SetNATPoolIPV6(poolID, index uint32, ip [16]byte) error       
 func (m *Manager) ClearNATPoolConfigs() error                                        { return nil }
 func (m *Manager) ClearNATPoolIPs() error                                            { return nil }
 
+// --- SNAT egress IPs (interface-mode SNAT) ---
+
+func (m *Manager) SetSNATEgressIP(key dataplane.SNATEgressKey, val dataplane.SNATEgressValue) error {
+	return nil
+}
+func (m *Manager) ClearSNATEgressIPs() error { return nil }
+
 // --- Static NAT ---
 
 func (m *Manager) SetStaticNATEntryV4(ip uint32, direction uint8, translated uint32) error {

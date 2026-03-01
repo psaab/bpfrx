@@ -27,6 +27,7 @@ type CompileResult struct {
 	AddrIDs     map[string]uint32 // address name -> address ID
 	AppIDs      map[string]uint32 // application name -> app ID
 	PoolIDs     map[string]uint8  // NAT pool name -> pool ID (0-based)
+	NextPoolID  uint8            // next available pool ID (after SNAT assignment)
 	PolicyNames map[uint32]string // rule_id -> "from-zone/to-zone/policy-name" (or "global/policy-name")
 	AppNames    map[uint16]string // app_id -> application name (for structured logging)
 	PolicySets  int               // number of policy sets created
@@ -1652,6 +1653,9 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 
 	natCfg := &cfg.Security.NAT
 
+	// Clear stale SNAT egress IP map before repopulating.
+	dp.ClearSNATEgressIPs()
+
 	// Source NAT: allocate pool IDs and compile pools + rules
 	poolID := uint8(0)
 
@@ -1757,49 +1761,93 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 			var v6IPs []net.IP
 
 			if rule.Then.Interface {
-				// Interface mode: create implicit pool from egress interface IP(s)
+				// Interface mode: populate snat_egress_ips with per-interface IPs
+				// so BPF picks the correct IP based on actual egress ifindex+vlan.
 				toZoneCfg, ok := cfg.Security.Zones[rs.ToZone]
 				if !ok || len(toZoneCfg.Interfaces) == 0 {
 					slog.Warn("to-zone has no interfaces",
 						"zone", rs.ToZone, "rule-set", rs.Name)
 					continue
 				}
-				ifaceName := toZoneCfg.Interfaces[0]
 
-				// Strip unit suffix for config lookup (e.g. reth0.50 → reth0)
-				cfgKey := ifaceName
-				if idx := strings.IndexByte(cfgKey, '.'); idx >= 0 {
-					cfgKey = cfgKey[:idx]
-				}
+				for _, ifaceRef := range toZoneCfg.Interfaces {
+					physName, cfgName, unitNum, vlanID := resolveInterfaceRef(ifaceRef, cfg)
 
-				// RETH interfaces backed by VRRP: read addresses from config
-				// instead of live interface query (VIPs may not be on this node).
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgKey]; ok && ifCfg.RedundancyGroup > 0 {
-					v4IPs, v6IPs = rethConfigAddrs(ifCfg)
-				} else {
-					snatIP, err := getInterfaceIP(ifaceName)
+					physIface, err := net.InterfaceByName(physName)
 					if err != nil {
-						slog.Warn("cannot get interface IPv4 for SNAT",
-							"interface", ifaceName, "err", err)
-					} else {
-						v4IPs = append(v4IPs, snatIP)
+						slog.Debug("interface not found for SNAT egress",
+							"interface", physName, "err", err)
+						continue
 					}
 
-					snatIPv6, err := getInterfaceIPv6(ifaceName)
-					if err != nil {
-						slog.Debug("no IPv6 address for SNAT",
-							"interface", ifaceName, "err", err)
+					var unitV4 net.IP
+					var unitV6 net.IP
+
+					ifCfg, ifOK := cfg.Interfaces.Interfaces[cfgName]
+					if ifOK && ifCfg.RedundancyGroup > 0 {
+						// RETH: read addresses from config (VIPs may not be on this node)
+						if unit, uOK := ifCfg.Units[unitNum]; uOK {
+							for _, addr := range unit.Addresses {
+								ip, _, perr := net.ParseCIDR(addr)
+								if perr != nil {
+									continue
+								}
+								if ip4 := ip.To4(); ip4 != nil && unitV4 == nil {
+									unitV4 = ip4
+								} else if ip.IsGlobalUnicast() && unitV6 == nil {
+									unitV6 = ip
+								}
+							}
+						}
 					} else {
-						v6IPs = append(v6IPs, snatIPv6)
+						// Non-RETH: query live interface
+						subName := physName
+						if vlanID > 0 {
+							subName = fmt.Sprintf("%s.%d", physName, vlanID)
+						}
+						if ip, ierr := getInterfaceIP(subName); ierr == nil {
+							unitV4 = ip
+						}
+						if ip, ierr := getInterfaceIPv6(subName); ierr == nil {
+							unitV6 = ip
+						}
+					}
+
+					if unitV4 == nil && unitV6 == nil {
+						continue
+					}
+
+					// Populate snat_egress_ips for this (ifindex, vlan) pair
+					ekey := SNATEgressKey{
+						Ifindex: uint32(physIface.Index),
+						VlanID:  uint16(vlanID),
+					}
+					var eval SNATEgressValue
+					if unitV4 != nil {
+						eval.IPv4 = ipToUint32BE(unitV4)
+						v4IPs = append(v4IPs, unitV4)
+					}
+					if unitV6 != nil {
+						eval.IPv6 = ipTo16Bytes(unitV6)
+						v6IPs = append(v6IPs, unitV6)
+					}
+					if err := dp.SetSNATEgressIP(ekey, eval); err != nil {
+						slog.Warn("failed to set SNAT egress IP",
+							"interface", ifaceRef, "err", err)
+					} else {
+						slog.Info("SNAT egress IP set",
+							"interface", ifaceRef, "ifindex", physIface.Index,
+							"vlan", vlanID, "v4", unitV4, "v6", unitV6)
 					}
 				}
 
 				if len(v4IPs) == 0 && len(v6IPs) == 0 {
 					slog.Warn("no IP addresses for interface SNAT",
-						"interface", ifaceName)
+						"zone", rs.ToZone)
 					continue
 				}
 
+				poolCfg.InterfaceMode = 1
 				poolCfg.PortLow = 1024
 				poolCfg.PortHigh = 65535
 				curPoolID = poolID
@@ -2203,6 +2251,9 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 		}
 	}
 
+	// Record highest pool ID so compileNAT64 can auto-assign additional pools.
+	result.NextPoolID = poolID
+
 	// Delete stale NAT entries and zero unused pool slots.
 	dp.DeleteStaleSNATRules(writtenSNAT)
 	dp.DeleteStaleSNATRulesV6(writtenSNATv6)
@@ -2481,10 +2532,58 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		prefix[1] = binary.NativeEndian.Uint32(ip16[4:8])
 		prefix[2] = binary.NativeEndian.Uint32(ip16[8:12])
 
-		// Look up the source pool ID
+		// Look up the source pool ID. If the pool was defined in source NAT
+		// but not referenced by any SNAT rule (e.g. interface-mode rules), we
+		// auto-assign it a pool ID here.
 		poolID, ok := result.PoolIDs[rs.SourcePool]
 		if !ok {
-			return fmt.Errorf("NAT64 rule-set %q: source pool %q not found (must be defined in source NAT)", rs.Name, rs.SourcePool)
+			pool, poolExists := cfg.Security.NAT.SourcePools[rs.SourcePool]
+			if !poolExists {
+				return fmt.Errorf("NAT64 rule-set %q: source pool %q not found", rs.Name, rs.SourcePool)
+			}
+			// Assign next pool ID (after those used by SNAT).
+			newID := result.NextPoolID
+			result.NextPoolID++
+			result.PoolIDs[pool.Name] = newID
+			poolID = newID
+
+			// Populate pool config and IPs.
+			var pcfg NATPoolConfig
+			pcfg.PortLow = uint16(pool.PortLow)
+			pcfg.PortHigh = uint16(pool.PortHigh)
+			if pcfg.PortLow == 0 {
+				pcfg.PortLow = 1024
+			}
+			if pcfg.PortHigh == 0 {
+				pcfg.PortHigh = 65535
+			}
+			var numV4, numV6 int
+			for _, addr := range pool.Addresses {
+				cidr := addr
+				if !strings.Contains(cidr, "/") {
+					if strings.Contains(cidr, ":") {
+						cidr += "/128"
+					} else {
+						cidr += "/32"
+					}
+				}
+				pip, _, perr := net.ParseCIDR(cidr)
+				if perr != nil {
+					continue
+				}
+				if pip4 := pip.To4(); pip4 != nil && numV4 < int(MaxNATPoolIPsPerPool) {
+					dp.SetNATPoolIPV4(uint32(newID), uint32(numV4), ipToUint32BE(pip4))
+					numV4++
+				} else if pip.To16() != nil && numV6 < int(MaxNATPoolIPsPerPool) {
+					dp.SetNATPoolIPV6(uint32(newID), uint32(numV6), ipTo16Bytes(pip))
+					numV6++
+				}
+			}
+			pcfg.NumIPs = uint16(numV4)
+			pcfg.NumIPsV6 = uint16(numV6)
+			dp.SetNATPoolConfig(uint32(newID), pcfg)
+			slog.Info("auto-assigned NAT64 source pool",
+				"pool", pool.Name, "pool_id", newID, "v4_ips", numV4, "v6_ips", numV6)
 		}
 
 		nat64Cfg := NAT64Config{

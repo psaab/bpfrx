@@ -603,8 +603,21 @@ struct nat_pool_config {
 	__u32 host_count;     /* number of subscriber IPs (deterministic) */
 	__u16 blocks_per_ip;  /* precomputed port_range / block_size */
 	__u8  host_prefix_len; /* IPv6 prefix length: 32 or 64 (deterministic==2) */
-	__u8  pad2;
+	__u8  interface_mode;  /* 1 = source-nat interface: use egress IP from snat_egress_ips */
 	__be32 host_base_v6[4]; /* IPv6 subscriber base (deterministic==2) */
+};
+
+/* Key for snat_egress_ips: egress interface identity */
+struct snat_egress_key {
+	__u32 ifindex;   /* parent interface index (meta->fwd_ifindex) */
+	__u16 vlan_id;   /* egress VLAN (meta->egress_vlan_id), 0 for non-VLAN */
+	__u16 pad;
+};
+
+/* Value for snat_egress_ips: per-interface SNAT address */
+struct snat_egress_value {
+	__be32 ipv4;
+	__u8   ipv6[16];
 };
 
 struct nat_pool_ip_v6 {

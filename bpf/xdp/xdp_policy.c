@@ -355,6 +355,48 @@ nat_pool_alloc_v4(__u8 pool_id, __be32 src_ip, __be32 *out_ip, __be16 *out_port)
 }
 
 /*
+ * Allocate SNAT IP+port for "source-nat interface" mode.
+ * Uses the actual egress interface IP from snat_egress_ips map,
+ * with port allocation from the pool. Falls back to pool IP
+ * if egress lookup fails.
+ */
+static __noinline int
+nat_pool_alloc_iface_v4(__u8 pool_id, struct pkt_meta *meta,
+			__be32 src_ip, __be32 *out_ip, __be16 *out_port)
+{
+	struct snat_egress_key ekey = {
+		.ifindex = meta->fwd_ifindex,
+		.vlan_id = meta->egress_vlan_id,
+	};
+	struct snat_egress_value *ev =
+		bpf_map_lookup_elem(&snat_egress_ips, &ekey);
+	if (ev && ev->ipv4 != 0) {
+		/* Got egress IP — allocate port from pool */
+		__u32 pid = pool_id;
+		struct nat_pool_config *cfg =
+			bpf_map_lookup_elem(&nat_pool_configs, &pid);
+		if (!cfg)
+			return -1;
+		struct nat_port_counter *ctr =
+			bpf_map_lookup_elem(&nat_port_counters, &pid);
+		if (!ctr)
+			return -1;
+		__u32 cpu = bpf_get_smp_processor_id() & 0xF;
+		__u64 val = ctr->counter++ * 16 + cpu;
+		__u32 port_range = cfg->port_high - cfg->port_low + 1;
+		if (port_range == 0)
+			port_range = 1;
+		__u16 port = cfg->port_low + (__u16)(val % port_range);
+
+		*out_ip = ev->ipv4;
+		*out_port = bpf_htons(port);
+		return 0;
+	}
+	/* Fallback to pool-based allocation */
+	return nat_pool_alloc_v4(pool_id, src_ip, out_ip, out_port);
+}
+
+/*
  * Allocate a NAT IP and port from a pool (IPv6).
  * src_ip: original source IP for address-persistent mode.
  * Returns 0 on success, -1 on failure.
@@ -398,6 +440,47 @@ nat_pool_alloc_v6(__u8 pool_id, __u8 *src_ip, __u8 *out_ip, __be16 *out_port)
 	__builtin_memcpy(out_ip, ip->ip, 16);
 	*out_port = bpf_htons(port);
 	return 0;
+}
+
+/*
+ * Allocate SNAT IPv6+port for "source-nat interface" mode.
+ */
+static __noinline int
+nat_pool_alloc_iface_v6(__u8 pool_id, struct pkt_meta *meta,
+			__u8 *src_ip, __u8 *out_ip, __be16 *out_port)
+{
+	struct snat_egress_key ekey = {
+		.ifindex = meta->fwd_ifindex,
+		.vlan_id = meta->egress_vlan_id,
+	};
+	struct snat_egress_value *ev =
+		bpf_map_lookup_elem(&snat_egress_ips, &ekey);
+	if (ev) {
+		/* Check if IPv6 is non-zero */
+		__u32 *v6 = (__u32 *)ev->ipv6;
+		if (v6[0] | v6[1] | v6[2] | v6[3]) {
+			__u32 pid = pool_id;
+			struct nat_pool_config *cfg =
+				bpf_map_lookup_elem(&nat_pool_configs, &pid);
+			if (!cfg)
+				return -1;
+			struct nat_port_counter *ctr =
+				bpf_map_lookup_elem(&nat_port_counters, &pid);
+			if (!ctr)
+				return -1;
+			__u32 cpu = bpf_get_smp_processor_id() & 0xF;
+			__u64 val = ctr->counter++ * 16 + cpu;
+			__u32 port_range = cfg->port_high - cfg->port_low + 1;
+			if (port_range == 0)
+				port_range = 1;
+			__u16 port = cfg->port_low + (__u16)(val % port_range);
+
+			__builtin_memcpy(out_ip, ev->ipv6, 16);
+			*out_port = bpf_htons(port);
+			return 0;
+		}
+	}
+	return nat_pool_alloc_v6(pool_id, src_ip, out_ip, out_port);
 }
 
 /*
@@ -1230,6 +1313,11 @@ int xdp_policy_prog(struct xdp_md *ctx)
 								rc = nat_pool_alloc_deterministic_v4(
 									sv->mode, meta->src_ip.v4,
 									&alloc_ip, &alloc_port);
+							else if (_pcfg && _pcfg->interface_mode)
+								rc = nat_pool_alloc_iface_v4(
+									sv->mode, meta,
+									meta->src_ip.v4,
+									&alloc_ip, &alloc_port);
 							else
 								rc = nat_pool_alloc_v4(
 									sv->mode, meta->src_ip.v4,
@@ -1348,6 +1436,11 @@ int xdp_policy_prog(struct xdp_md *ctx)
 						if (_n64_pcfg && _n64_pcfg->deterministic == 2)
 							alloc_rc = nat_pool_alloc_deterministic_v6(
 								pool_id, meta->src_ip.v6,
+								&alloc_v4_ip, &alloc_v4_port);
+						else if (_n64_pcfg && _n64_pcfg->interface_mode)
+							alloc_rc = nat_pool_alloc_iface_v4(
+								pool_id, meta,
+								meta->src_ip.v4,
 								&alloc_v4_ip, &alloc_v4_port);
 						else
 							alloc_rc = nat_pool_alloc_v4(
@@ -1485,9 +1578,26 @@ int xdp_policy_prog(struct xdp_md *ctx)
 						int snat_ok = 0;
 						__be16 alloc_port = 0;
 
+						__u32 _v6pid = sv6->mode;
+						struct nat_pool_config *_v6pcfg =
+							bpf_map_lookup_elem(&nat_pool_configs, &_v6pid);
+
 						#pragma unroll
 						for (int retry = 0; retry < 3; retry++) {
-							if (nat_pool_alloc_v6(sv6->mode, meta->src_ip.v6, meta->nat_src_ip.v6, &alloc_port) < 0)
+							int _v6rc;
+							if (_v6pcfg && _v6pcfg->interface_mode)
+								_v6rc = nat_pool_alloc_iface_v6(
+									sv6->mode, meta,
+									meta->src_ip.v6,
+									meta->nat_src_ip.v6,
+									&alloc_port);
+							else
+								_v6rc = nat_pool_alloc_v6(
+									sv6->mode,
+									meta->src_ip.v6,
+									meta->nat_src_ip.v6,
+									&alloc_port);
+							if (_v6rc < 0)
 								break;
 
 							struct dnat_key_v6 dk6 = {

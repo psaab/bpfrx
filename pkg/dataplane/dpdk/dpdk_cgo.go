@@ -910,6 +910,15 @@ func (m *Manager) ClearNATPoolIPs() error {
 	return nil
 }
 
+// --- SNAT egress IPs (interface-mode SNAT) ---
+// DPDK does not use BPF maps; interface-mode SNAT is eBPF-only for now.
+
+func (m *Manager) SetSNATEgressIP(key dataplane.SNATEgressKey, val dataplane.SNATEgressValue) error {
+	return nil
+}
+
+func (m *Manager) ClearSNATEgressIPs() error { return nil }
+
 // --- Static NAT ---
 
 func (m *Manager) SetStaticNATEntryV4(ip uint32, direction uint8, translated uint32) error {

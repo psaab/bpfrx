@@ -131,6 +131,7 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["nptv6_rules"] = mainObjs.Nptv6Rules
 	m.maps["session_count_src"] = mainObjs.SessionCountSrc
 	m.maps["session_count_dst"] = mainObjs.SessionCountDst
+	m.maps["snat_egress_ips"] = mainObjs.SnatEgressIps
 
 	// Store main program.
 	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
@@ -199,6 +200,7 @@ func (m *Manager) loadAllObjects() error {
 	policyReplaceOpts.MapReplacements["nat_pool_ips_v4"] = mainObjs.NatPoolIpsV4
 	policyReplaceOpts.MapReplacements["nat_pool_ips_v6"] = mainObjs.NatPoolIpsV6
 	policyReplaceOpts.MapReplacements["nat_port_counters"] = mainObjs.NatPortCounters
+	policyReplaceOpts.MapReplacements["snat_egress_ips"] = mainObjs.SnatEgressIps
 
 	// Load XDP screen program.
 	var screenObjs bpfrxXdpScreenObjects
@@ -392,6 +394,7 @@ func (m *Manager) loadCPUMapPrograms(replaceOpts *ebpf.CollectionOptions, mainOb
 	cpumapPolicyOpts.MapReplacements["nat_pool_ips_v4"] = mainObjs.NatPoolIpsV4
 	cpumapPolicyOpts.MapReplacements["nat_pool_ips_v6"] = mainObjs.NatPoolIpsV6
 	cpumapPolicyOpts.MapReplacements["nat_port_counters"] = mainObjs.NatPortCounters
+	cpumapPolicyOpts.MapReplacements["snat_egress_ips"] = mainObjs.SnatEgressIps
 
 	cpumapCtOpts := &ebpf.CollectionOptions{
 		MapReplacements: map[string]*ebpf.Map{},

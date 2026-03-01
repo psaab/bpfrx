@@ -513,6 +513,19 @@ type bpfrxXdpConntrackSessionValueV6 struct {
 	FibGen      uint16
 }
 
+type bpfrxXdpConntrackSnatEgressKey struct {
+	_       structs.HostLayout
+	Ifindex uint32
+	VlanId  uint16
+	Pad     uint16
+}
+
+type bpfrxXdpConntrackSnatEgressValue struct {
+	_    structs.HostLayout
+	Ipv4 uint32
+	Ipv6 [16]uint8
+}
+
 type bpfrxXdpConntrackSnatKey struct {
 	_        structs.HostLayout
 	FromZone uint16
@@ -690,6 +703,7 @@ type bpfrxXdpConntrackMapSpecs struct {
 	SessionV6Scratch  *ebpf.MapSpec `ebpf:"session_v6_scratch"`
 	Sessions          *ebpf.MapSpec `ebpf:"sessions"`
 	SessionsV6        *ebpf.MapSpec `ebpf:"sessions_v6"`
+	SnatEgressIps     *ebpf.MapSpec `ebpf:"snat_egress_ips"`
 	SnatRules         *ebpf.MapSpec `ebpf:"snat_rules"`
 	SnatRulesV6       *ebpf.MapSpec `ebpf:"snat_rules_v6"`
 	StaticNatV4       *ebpf.MapSpec `ebpf:"static_nat_v4"`
@@ -776,6 +790,7 @@ type bpfrxXdpConntrackMaps struct {
 	SessionV6Scratch  *ebpf.Map `ebpf:"session_v6_scratch"`
 	Sessions          *ebpf.Map `ebpf:"sessions"`
 	SessionsV6        *ebpf.Map `ebpf:"sessions_v6"`
+	SnatEgressIps     *ebpf.Map `ebpf:"snat_egress_ips"`
 	SnatRules         *ebpf.Map `ebpf:"snat_rules"`
 	SnatRulesV6       *ebpf.Map `ebpf:"snat_rules_v6"`
 	StaticNatV4       *ebpf.Map `ebpf:"static_nat_v4"`
@@ -838,6 +853,7 @@ func (m *bpfrxXdpConntrackMaps) Close() error {
 		m.SessionV6Scratch,
 		m.Sessions,
 		m.SessionsV6,
+		m.SnatEgressIps,
 		m.SnatRules,
 		m.SnatRulesV6,
 		m.StaticNatV4,

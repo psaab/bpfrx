@@ -123,6 +123,10 @@ type DataPlane interface {
 	ClearNATPoolConfigs() error
 	ClearNATPoolIPs() error
 
+	// SNAT egress IPs (interface-mode SNAT)
+	SetSNATEgressIP(key SNATEgressKey, val SNATEgressValue) error
+	ClearSNATEgressIPs() error
+
 	// Static NAT
 	SetStaticNATEntryV4(ip uint32, direction uint8, translated uint32) error
 	SetStaticNATEntryV6(ip [16]byte, direction uint8, translated [16]byte) error

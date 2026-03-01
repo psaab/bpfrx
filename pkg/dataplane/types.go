@@ -384,12 +384,27 @@ type NATPoolConfig struct {
 	HostCount      uint32
 	BlocksPerIP    uint16
 	HostPrefixLen  uint8 // IPv6 prefix length: 32 or 64 (deterministic==2)
-	Pad2           uint8
+	InterfaceMode  uint8 // 1 = source-nat interface: use egress IP from snat_egress_ips
 	HostBaseV6     [4]uint32 // IPv6 subscriber base (deterministic==2)
 }
 
 type NATPoolIPV6 struct {
 	IP [16]byte
+}
+
+// SNATEgressKey identifies an egress interface for interface-mode SNAT.
+// Mirrors struct snat_egress_key in bpfrx_common.h.
+type SNATEgressKey struct {
+	Ifindex uint32
+	VlanID  uint16
+	Pad     uint16
+}
+
+// SNATEgressValue holds the SNAT address for a specific egress interface.
+// Mirrors struct snat_egress_value in bpfrx_common.h.
+type SNATEgressValue struct {
+	IPv4 uint32
+	IPv6 [16]byte
 }
 
 type NATPortCounter struct {
