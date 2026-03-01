@@ -3610,8 +3610,12 @@ func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting boo
 		}
 	}
 
-	// Resolve peer MAC from ARP/NDP table.
-	neighs, err := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
+	// Resolve peer MAC from ARP (IPv4) or NDP (IPv6) table.
+	neighFamily := netlink.FAMILY_V4
+	if peerIP.To4() == nil {
+		neighFamily = netlink.FAMILY_V6
+	}
+	neighs, err := netlink.NeighList(link.Attrs().Index, neighFamily)
 	if err != nil {
 		slog.Debug("cluster: neigh list failed", "err", err)
 		return false
@@ -3626,7 +3630,7 @@ func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting boo
 	}
 	if peerMAC == nil {
 		if logWaiting {
-			slog.Info("cluster: waiting for fabric peer ARP entry",
+			slog.Info("cluster: waiting for fabric peer neighbor entry",
 				"peer", peerIP)
 		}
 		return false
