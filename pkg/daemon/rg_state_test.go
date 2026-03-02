@@ -623,3 +623,171 @@ func TestRGStateMachine_CheckVRRPPosture_MismatchResetSteadyState(t *testing.T) 
 		t.Errorf("should return NeedsMaster after 3s from timer reset, got %d", got)
 	}
 }
+
+// --- Strict VIP ownership tests (#104) ---
+
+func TestStrictVIPOwnershipActivation(t *testing.T) {
+	// In strict mode, rg_active is derived from VRRP master state ONLY.
+	// Cluster Primary alone does NOT activate.
+	s := newRGStateMachine()
+	s.SetStrictVIPOwnership(true)
+
+	// VRRP MASTER alone → active (same as default mode).
+	tr := s.SetVRRP("reth0", true)
+	if !tr.Changed || !tr.Active {
+		t.Errorf("strict: VRRP MASTER should activate, Changed=%v Active=%v", tr.Changed, tr.Active)
+	}
+
+	// VRRP BACKUP → inactive.
+	tr = s.SetVRRP("reth0", false)
+	if !tr.Changed || tr.Active {
+		t.Errorf("strict: VRRP BACKUP should deactivate, Changed=%v Active=%v", tr.Changed, tr.Active)
+	}
+
+	// Cluster Primary alone → NOT active in strict mode.
+	tr = s.SetCluster(true)
+	if tr.Active {
+		t.Error("strict: cluster Primary alone should NOT activate")
+	}
+	if s.IsActive() {
+		t.Error("strict: should remain inactive with only cluster Primary")
+	}
+
+	// VRRP MASTER with cluster Primary → active.
+	tr = s.SetVRRP("reth0", true)
+	if !tr.Changed || !tr.Active {
+		t.Error("strict: VRRP MASTER should activate even with cluster Primary")
+	}
+}
+
+func TestStrictVIPOwnershipClusterPrimaryNoVRRP(t *testing.T) {
+	// Cluster = Primary, VRRP = BACKUP → NOT active in strict mode.
+	// This is the key difference from default mode.
+	s := newRGStateMachine()
+	s.SetStrictVIPOwnership(true)
+
+	s.SetCluster(true)
+	s.SetVRRP("reth0", false)
+
+	if s.IsActive() {
+		t.Error("strict: cluster=Primary + VRRP=BACKUP should NOT be active")
+	}
+}
+
+func TestStrictVIPOwnershipSecondaryVRRPMaster(t *testing.T) {
+	// Cluster = Secondary, VRRP = MASTER → active in strict mode.
+	// VRRP is sole authority — cluster state is irrelevant for activation.
+	s := newRGStateMachine()
+	s.SetStrictVIPOwnership(true)
+
+	s.SetCluster(false)
+	tr := s.SetVRRP("reth0", true)
+	if !tr.Active {
+		t.Error("strict: cluster=Secondary + VRRP=MASTER should be active")
+	}
+	if !s.IsActive() {
+		t.Error("strict: should be active — VRRP MASTER is sole authority")
+	}
+}
+
+func TestDefaultModeUnchanged(t *testing.T) {
+	// Default mode: rg_active = clusterPri || anyVrrpMaster.
+	// Cluster Primary alone activates (existing behavior).
+	s := newRGStateMachine()
+	// strictVIPOwnership defaults to false.
+
+	tr := s.SetCluster(true)
+	if !tr.Changed || !tr.Active {
+		t.Error("default: cluster Primary alone should activate")
+	}
+	if !s.IsActive() {
+		t.Error("default: should be active with cluster Primary")
+	}
+
+	// VRRP BACKUP doesn't deactivate (cluster still Primary).
+	tr = s.SetVRRP("reth0", false)
+	if tr.Changed {
+		t.Error("default: VRRP BACKUP should not change when cluster is Primary")
+	}
+	if !s.IsActive() {
+		t.Error("default: should still be active via cluster Primary")
+	}
+}
+
+func TestStrictVIPOwnershipReconcile(t *testing.T) {
+	// Reconcile should respect strict mode.
+	s := newRGStateMachine()
+	s.SetStrictVIPOwnership(true)
+
+	// Set up: cluster Primary, VRRP MASTER → active.
+	s.SetCluster(true)
+	s.SetVRRP("reth0", true)
+	if !s.IsActive() {
+		t.Fatal("should be active")
+	}
+
+	// Reconcile with cluster=Primary, VRRP=BACKUP → inactive in strict mode.
+	tr := s.Reconcile(true, map[string]bool{"reth0": false})
+	if !tr.Changed || tr.Active {
+		t.Error("strict reconcile: cluster=Primary + VRRP=BACKUP should deactivate")
+	}
+
+	// Reconcile with cluster=Secondary, VRRP=MASTER → active in strict mode.
+	tr = s.Reconcile(false, map[string]bool{"reth0": true})
+	if !tr.Changed || !tr.Active {
+		t.Error("strict reconcile: cluster=Secondary + VRRP=MASTER should activate")
+	}
+}
+
+func TestStrictVIPOwnershipDualInactiveWindowPrevention(t *testing.T) {
+	// In strict mode, there's no dual-active window because cluster Primary
+	// alone cannot activate. The only active state is VRRP MASTER.
+	s := newRGStateMachine()
+	s.SetStrictVIPOwnership(true)
+
+	// Start as cluster Primary + VRRP MASTER.
+	s.SetCluster(true)
+	s.SetVRRP("reth0", true)
+	if !s.IsActive() {
+		t.Fatal("should be active initially")
+	}
+
+	// Cluster goes Secondary (failover) — VRRP still MASTER → stays active.
+	tr := s.SetCluster(false)
+	if tr.Changed {
+		t.Error("strict: cluster Secondary should not change when VRRP is still MASTER")
+	}
+	if !s.IsActive() {
+		t.Error("strict: should remain active — VRRP is MASTER")
+	}
+
+	// VRRP goes BACKUP → deactivate.
+	tr = s.SetVRRP("reth0", false)
+	if !tr.Changed || tr.Active {
+		t.Error("strict: should deactivate when VRRP goes BACKUP")
+	}
+}
+
+func TestStrictVIPOwnershipToggle(t *testing.T) {
+	// Toggling strict mode and verifying behavior changes.
+	s := newRGStateMachine()
+
+	// Default mode: cluster Primary alone activates.
+	s.SetCluster(true)
+	if !s.IsActive() {
+		t.Fatal("default: should be active with cluster Primary")
+	}
+
+	// Enable strict mode — cluster Primary alone no longer sufficient.
+	s.SetStrictVIPOwnership(true)
+	// Need to trigger a reconcile to recompute.
+	tr := s.SetCluster(true) // same value, but triggers reconcile.
+	if tr.Active {
+		t.Error("strict: should be inactive — no VRRP MASTER")
+	}
+
+	// Verify IsStrictVIPOwnership getter.
+	if !s.IsStrictVIPOwnership() {
+		t.Error("IsStrictVIPOwnership should return true")
+	}
+}

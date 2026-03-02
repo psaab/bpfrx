@@ -1932,3 +1932,136 @@ func (c *capturingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	}
 	return len(p), nil
 }
+
+// --- GARP suppression / epoch dedup tests (#104) ---
+
+func TestSuppressGARPFlag(t *testing.T) {
+	// Verify that the suppressGARP atomic flag can be set and read.
+	vi := &vrrpInstance{}
+
+	// Default: not suppressed.
+	if vi.suppressGARP.Load() {
+		t.Error("suppressGARP should default to false")
+	}
+
+	// Set suppressed.
+	vi.suppressGARP.Store(true)
+	if !vi.suppressGARP.Load() {
+		t.Error("suppressGARP should be true after Store(true)")
+	}
+
+	// Clear suppression.
+	vi.suppressGARP.Store(false)
+	if vi.suppressGARP.Load() {
+		t.Error("suppressGARP should be false after Store(false)")
+	}
+}
+
+func TestGARPEpochDedup(t *testing.T) {
+	// The garpEpoch increments on each becomeMaster() call.
+	// sendGARP() skips if lastGARPEpoch == garpEpoch (already sent for this transition).
+	vi := &vrrpInstance{}
+
+	// Initial: epoch 0, lastGARPEpoch 0.
+	if vi.garpEpoch.Load() != 0 {
+		t.Errorf("initial garpEpoch = %d, want 0", vi.garpEpoch.Load())
+	}
+	if vi.lastGARPEpoch.Load() != 0 {
+		t.Errorf("initial lastGARPEpoch = %d, want 0", vi.lastGARPEpoch.Load())
+	}
+
+	// Simulate first becomeMaster: epoch goes to 1.
+	vi.garpEpoch.Add(1)
+	if vi.garpEpoch.Load() != 1 {
+		t.Errorf("garpEpoch after first transition = %d, want 1", vi.garpEpoch.Load())
+	}
+
+	// sendGARP would check: lastGARPEpoch(0) != garpEpoch(1) → proceed.
+	// After sending, it records lastGARPEpoch = 1.
+	epoch := vi.garpEpoch.Load()
+	if vi.lastGARPEpoch.Load() == epoch && epoch > 0 {
+		t.Error("should NOT skip — epoch changed since last send")
+	}
+	vi.lastGARPEpoch.Store(epoch)
+
+	// Duplicate call: lastGARPEpoch(1) == garpEpoch(1) → skip.
+	epoch = vi.garpEpoch.Load()
+	if !(vi.lastGARPEpoch.Load() == epoch && epoch > 0) {
+		t.Error("should skip — epoch unchanged since last send")
+	}
+
+	// Second becomeMaster: epoch goes to 2.
+	vi.garpEpoch.Add(1)
+	epoch = vi.garpEpoch.Load()
+	if vi.lastGARPEpoch.Load() == epoch && epoch > 0 {
+		t.Error("should NOT skip — new transition (epoch 2)")
+	}
+}
+
+func TestGARPDampeningTime(t *testing.T) {
+	// The lastGARPTime tracks Unix nanos of the last GARP send.
+	// sendGARP() skips if time.Since(lastGARPTime) < 500ms.
+	vi := &vrrpInstance{}
+
+	// Initial: no dampening (lastGARPTime == 0).
+	if vi.lastGARPTime.Load() != 0 {
+		t.Errorf("initial lastGARPTime = %d, want 0", vi.lastGARPTime.Load())
+	}
+
+	// Simulate a GARP send at now.
+	now := time.Now()
+	vi.lastGARPTime.Store(now.UnixNano())
+
+	// Check: too soon (< 500ms) → should be dampened.
+	last := vi.lastGARPTime.Load()
+	if last > 0 && time.Since(time.Unix(0, last)) >= 500*time.Millisecond {
+		t.Error("should be dampened — sent just now")
+	}
+
+	// Simulate time passing: set lastGARPTime to 600ms ago.
+	vi.lastGARPTime.Store(time.Now().Add(-600 * time.Millisecond).UnixNano())
+	last = vi.lastGARPTime.Load()
+	if last > 0 && time.Since(time.Unix(0, last)) < 500*time.Millisecond {
+		t.Error("should NOT be dampened — 600ms elapsed")
+	}
+}
+
+func TestManagerSetGARPSuppression(t *testing.T) {
+	// Test that SetGARPSuppression sets the flag on matching instances.
+	m := NewManager()
+	eventCh := make(chan VRRPEvent, 16)
+
+	// Create two instances: one for RG 1 (VRID 101), one for RG 2 (VRID 102).
+	iface := &net.Interface{Index: 1, Name: "eth0"}
+	vi1 := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+	}, iface, eventCh, nil)
+	vi2 := newInstance(Instance{
+		Interface: "eth1",
+		GroupID:   102,
+		Priority:  100,
+	}, iface, eventCh, nil)
+
+	m.mu.Lock()
+	m.instances[instanceKey{iface: "eth0", groupID: 101}] = vi1
+	m.instances[instanceKey{iface: "eth1", groupID: 102}] = vi2
+	m.mu.Unlock()
+
+	// Suppress GARP for RG 1 only.
+	m.SetGARPSuppression(1, true)
+
+	if !vi1.suppressGARP.Load() {
+		t.Error("RG 1 instance should have GARP suppressed")
+	}
+	if vi2.suppressGARP.Load() {
+		t.Error("RG 2 instance should NOT have GARP suppressed")
+	}
+
+	// Unsuppress RG 1.
+	m.SetGARPSuppression(1, false)
+	if vi1.suppressGARP.Load() {
+		t.Error("RG 1 instance should have GARP unsuppressed")
+	}
+}

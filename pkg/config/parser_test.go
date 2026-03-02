@@ -14646,3 +14646,113 @@ security {
 		t.Errorf("DestinationIPBased = %d, want 75", screen.LimitSession.DestinationIPBased)
 	}
 }
+
+func TestStrictVIPOwnershipHierarchical(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+        reth-count 2;
+        redundancy-group 0 {
+            node 0 priority 200;
+            node 1 priority 100;
+        }
+        redundancy-group 1 {
+            node 0 priority 200;
+            node 1 priority 100;
+            strict-vip-ownership;
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	cl := cfg.Chassis.Cluster
+	if len(cl.RedundancyGroups) != 2 {
+		t.Fatalf("RedundancyGroups = %d, want 2", len(cl.RedundancyGroups))
+	}
+	// RG 0: no strict-vip-ownership → false.
+	if cl.RedundancyGroups[0].StrictVIPOwnership {
+		t.Error("rg0.StrictVIPOwnership should be false")
+	}
+	// RG 1: strict-vip-ownership → true.
+	if !cl.RedundancyGroups[1].StrictVIPOwnership {
+		t.Error("rg1.StrictVIPOwnership should be true")
+	}
+}
+
+func TestStrictVIPOwnershipSetSyntax(t *testing.T) {
+	commands := []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster reth-count 2",
+		"set chassis cluster redundancy-group 0 node 0 priority 200",
+		"set chassis cluster redundancy-group 0 node 1 priority 100",
+		"set chassis cluster redundancy-group 1 node 0 priority 200",
+		"set chassis cluster redundancy-group 1 node 1 priority 100",
+		"set chassis cluster redundancy-group 1 strict-vip-ownership",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range commands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree.SetPath(path)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	cl := cfg.Chassis.Cluster
+	if len(cl.RedundancyGroups) != 2 {
+		t.Fatalf("RedundancyGroups = %d, want 2", len(cl.RedundancyGroups))
+	}
+	// RG 0: no strict-vip-ownership.
+	if cl.RedundancyGroups[0].StrictVIPOwnership {
+		t.Error("rg0.StrictVIPOwnership should be false")
+	}
+	// RG 1: strict-vip-ownership.
+	if !cl.RedundancyGroups[1].StrictVIPOwnership {
+		t.Error("rg1.StrictVIPOwnership should be true")
+	}
+}
+
+func TestStrictVIPOwnershipDefaultFalse(t *testing.T) {
+	// When strict-vip-ownership is NOT set, it defaults to false.
+	input := `chassis {
+    cluster {
+        redundancy-group 1 {
+            node 0 priority 200;
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if len(cfg.Chassis.Cluster.RedundancyGroups) != 1 {
+		t.Fatalf("RedundancyGroups = %d, want 1", len(cfg.Chassis.Cluster.RedundancyGroups))
+	}
+	if cfg.Chassis.Cluster.RedundancyGroups[0].StrictVIPOwnership {
+		t.Error("StrictVIPOwnership should default to false")
+	}
+}
