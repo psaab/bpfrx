@@ -74,6 +74,7 @@ var OperationalTree = map[string]*Node{
 			"ip-monitoring": {Desc: "Show IP monitoring information", Children: map[string]*Node{
 				"status": {Desc: "Show IP monitoring status"},
 			}},
+			"fence-status": {Desc: "Show peer fencing configuration and history"},
 		}},
 			"alarms":         {Desc: "Show chassis alarm status"},
 			"environment":    {Desc: "Show chassis environment"},

@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -860,5 +861,170 @@ func TestActiveActiveElection(t *testing.T) {
 	}
 	if !m.IsLocalPrimaryAny() {
 		t.Fatal("node 0 is primary for RG 0 — IsLocalPrimaryAny should be true")
+	}
+}
+
+func TestHandlePeerTimeout_FencingDisableRG(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200, 1: 100}),
+	)
+	cfg.PeerFencing = "disable-rg"
+	m.UpdateConfig(cfg)
+
+	// Simulate peer alive.
+	m.mu.Lock()
+	m.peerAlive = true
+	m.peerEverSeen = true
+	m.mu.Unlock()
+
+	// Track fence calls.
+	fenceCalled := false
+	m.SetPeerFenceFunc(func() error {
+		fenceCalled = true
+		return nil
+	})
+
+	m.handlePeerTimeout()
+
+	if !fenceCalled {
+		t.Error("expected fence function to be called on peer timeout with disable-rg")
+	}
+
+	// Verify fence event was recorded.
+	events := m.EventHistoryFor(EventFence)
+	if len(events) == 0 {
+		t.Error("expected fence event in history")
+	} else if !strings.Contains(events[0].Message, "sent to peer") {
+		t.Errorf("fence event message = %q, want 'sent to peer'", events[0].Message)
+	}
+
+	// Drain election event.
+	select {
+	case <-m.Events():
+	default:
+	}
+}
+
+func TestHandlePeerTimeout_FencingDisabled(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200, 1: 100}),
+	)
+	// No PeerFencing configured (default empty).
+	m.UpdateConfig(cfg)
+
+	m.mu.Lock()
+	m.peerAlive = true
+	m.peerEverSeen = true
+	m.mu.Unlock()
+
+	fenceCalled := false
+	m.SetPeerFenceFunc(func() error {
+		fenceCalled = true
+		return nil
+	})
+
+	m.handlePeerTimeout()
+
+	if fenceCalled {
+		t.Error("fence function should NOT be called when fencing is not configured")
+	}
+
+	// No fence events.
+	events := m.EventHistoryFor(EventFence)
+	if len(events) != 0 {
+		t.Errorf("expected 0 fence events, got %d", len(events))
+	}
+
+	select {
+	case <-m.Events():
+	default:
+	}
+}
+
+func TestHandlePeerTimeout_FencingNoSyncFunc(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200, 1: 100}),
+	)
+	cfg.PeerFencing = "disable-rg"
+	m.UpdateConfig(cfg)
+
+	m.mu.Lock()
+	m.peerAlive = true
+	m.peerEverSeen = true
+	m.mu.Unlock()
+
+	// No fence function set (simulates sync not available).
+	m.handlePeerTimeout()
+
+	// Verify fence event records that sync was not available.
+	events := m.EventHistoryFor(EventFence)
+	if len(events) == 0 {
+		t.Error("expected fence event in history")
+	} else if !strings.Contains(events[0].Message, "sync not available") {
+		t.Errorf("fence event message = %q, want 'sync not available'", events[0].Message)
+	}
+
+	select {
+	case <-m.Events():
+	default:
+	}
+}
+
+func TestHandlePeerTimeout_FencingSendError(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200, 1: 100}),
+	)
+	cfg.PeerFencing = "disable-rg"
+	m.UpdateConfig(cfg)
+
+	m.mu.Lock()
+	m.peerAlive = true
+	m.peerEverSeen = true
+	m.mu.Unlock()
+
+	m.SetPeerFenceFunc(func() error {
+		return fmt.Errorf("connection refused")
+	})
+
+	m.handlePeerTimeout()
+
+	events := m.EventHistoryFor(EventFence)
+	if len(events) == 0 {
+		t.Error("expected fence event in history")
+	} else if !strings.Contains(events[0].Message, "Fence failed") {
+		t.Errorf("fence event message = %q, want 'Fence failed'", events[0].Message)
+	}
+
+	select {
+	case <-m.Events():
+	default:
+	}
+}
+
+func TestFenceStatus(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200, 1: 100}),
+	)
+	cfg.PeerFencing = "disable-rg"
+	m.UpdateConfig(cfg)
+
+	action, events := m.FenceStatus()
+	if action != "disable-rg" {
+		t.Errorf("FenceStatus action = %q, want %q", action, "disable-rg")
+	}
+	if len(events) != 0 {
+		t.Errorf("expected 0 fence events initially, got %d", len(events))
+	}
+
+	// Simulate a fence event.
+	m.history.Record(EventFence, -1, "test fence event")
+	_, events = m.FenceStatus()
+	if len(events) != 1 {
+		t.Errorf("expected 1 fence event, got %d", len(events))
 	}
 }

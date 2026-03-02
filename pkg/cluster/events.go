@@ -16,6 +16,7 @@ const (
 	EventColdSync                        // bulk session sync progress
 	EventConfigSync                      // config sync events
 	EventFabric                          // fabric link events
+	EventFence                           // peer fencing events
 )
 
 func (c EventCategory) String() string {
@@ -32,6 +33,8 @@ func (c EventCategory) String() string {
 		return "Config Sync"
 	case EventFabric:
 		return "Fabric"
+	case EventFence:
+		return "Fence"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(c))
 	}

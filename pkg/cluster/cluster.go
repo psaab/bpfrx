@@ -105,6 +105,13 @@ type Manager struct {
 	// Set by daemon after sessionSync creation.
 	peerFailoverFn func(rgID int) error
 
+	// peerFenceFn sends a fence (disable-rg) message to the peer.
+	// Set by daemon after sessionSync creation.
+	peerFenceFn func() error
+
+	// peerFencing holds the configured fencing action (e.g. "disable-rg").
+	peerFencing string
+
 	// onEventDrop is called when a cluster event is dropped due to a full
 	// channel. The daemon uses this to trigger immediate reconciliation.
 	onEventDrop func()
@@ -226,6 +233,9 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 	if cfg.ControlInterface != "" {
 		m.controlInterface = cfg.ControlInterface
 	}
+
+	// Update peer fencing config.
+	m.peerFencing = cfg.PeerFencing
 
 	// Store GARP counts and update monitor groups.
 	for _, rg := range cfg.RedundancyGroups {
@@ -429,6 +439,23 @@ func (m *Manager) SetPeerFailoverFunc(fn func(rgID int) error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.peerFailoverFn = fn
+}
+
+// SetPeerFenceFunc sets the callback used to send a fence message to the
+// peer via the fabric sync connection, telling it to disable all RGs.
+func (m *Manager) SetPeerFenceFunc(fn func() error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peerFenceFn = fn
+}
+
+// FenceStatus returns the configured fencing action and history of fence events.
+func (m *Manager) FenceStatus() (action string, events []HistoryEvent) {
+	m.mu.RLock()
+	action = m.peerFencing
+	m.mu.RUnlock()
+	events = m.history.Events(EventFence)
+	return
 }
 
 // RequestPeerFailover asks the peer to give up primary for the given RG,
@@ -788,6 +815,27 @@ func (m *Manager) handlePeerTimeout() {
 
 	// Peer lost: re-run single-node election.
 	m.electSingleNode()
+
+	// Attempt peer fencing if configured.
+	if m.peerFencing == "disable-rg" {
+		fn := m.peerFenceFn
+		if fn != nil {
+			// Release lock for the network call.
+			m.mu.Unlock()
+			err := fn()
+			m.mu.Lock()
+			if err != nil {
+				slog.Warn("cluster: fence: peer unreachable, relying on heartbeat-driven failover", "err", err)
+				m.history.Record(EventFence, -1, fmt.Sprintf("Fence failed: %v", err))
+			} else {
+				slog.Info("cluster: fence: disable-rg sent to peer")
+				m.history.Record(EventFence, -1, "Fence disable-rg sent to peer")
+			}
+		} else {
+			slog.Warn("cluster: fence: sync not available, peer unreachable")
+			m.history.Record(EventFence, -1, "Fence skipped: sync not available")
+		}
+	}
 }
 
 // handlePeerNeverSeen is called when the heartbeat timeout expires and no

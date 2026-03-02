@@ -5999,6 +5999,11 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 	if clusterNode.FindChild("hitless-restart") != nil {
 		ch.Cluster.HitlessRestart = true
 	}
+	if n := clusterNode.FindChild("peer-fencing"); n != nil {
+		if v := nodeVal(n); v != "" {
+			ch.Cluster.PeerFencing = v
+		}
+	}
 
 	for _, rgInst := range namedInstances(clusterNode.FindChildren("redundancy-group")) {
 		rgID := 0

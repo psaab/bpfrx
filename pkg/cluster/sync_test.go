@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -434,6 +435,62 @@ func (m *mockSweepDP) BatchIterateSessionsV6(fn func(dataplane.SessionKeyV6, dat
 	return m.IterateSessionsV6(fn)
 }
 
+func (m *mockSweepDP) GetSessionV4(key dataplane.SessionKey) (dataplane.SessionValue, error) {
+	if v, ok := m.v4sessions[key]; ok {
+		return v, nil
+	}
+	return dataplane.SessionValue{}, fmt.Errorf("not found")
+}
+
+func (m *mockSweepDP) GetSessionV6(key dataplane.SessionKeyV6) (dataplane.SessionValueV6, error) {
+	if v, ok := m.v6sessions[key]; ok {
+		return v, nil
+	}
+	return dataplane.SessionValueV6{}, fmt.Errorf("not found")
+}
+
+func (m *mockSweepDP) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
+	if m.v4sessions == nil {
+		m.v4sessions = make(map[dataplane.SessionKey]dataplane.SessionValue)
+	}
+	m.v4sessions[key] = val
+	return nil
+}
+
+func (m *mockSweepDP) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
+	if m.v6sessions == nil {
+		m.v6sessions = make(map[dataplane.SessionKeyV6]dataplane.SessionValueV6)
+	}
+	m.v6sessions[key] = val
+	return nil
+}
+
+func (m *mockSweepDP) DeleteSession(key dataplane.SessionKey) error {
+	delete(m.v4sessions, key)
+	return nil
+}
+
+func (m *mockSweepDP) DeleteSessionV6(key dataplane.SessionKeyV6) error {
+	delete(m.v6sessions, key)
+	return nil
+}
+
+func (m *mockSweepDP) DeleteDNATEntry(key dataplane.DNATKey) error {
+	return nil
+}
+
+func (m *mockSweepDP) DeleteDNATEntryV6(key dataplane.DNATKeyV6) error {
+	return nil
+}
+
+func (m *mockSweepDP) SetDNATEntry(key dataplane.DNATKey, val dataplane.DNATValue) error {
+	return nil
+}
+
+func (m *mockSweepDP) SetDNATEntryV6(key dataplane.DNATKeyV6, val dataplane.DNATValueV6) error {
+	return nil
+}
+
 func TestSyncSweepNewSessions(t *testing.T) {
 	now := monotonicSeconds()
 	dp := &mockSweepDP{
@@ -782,6 +839,111 @@ func TestBulkSyncSkipsReverseEntries(t *testing.T) {
 	// Only forward entry should be sent
 	if cw.sessionMsgs != 1 {
 		t.Fatalf("expected 1 session message (forward only), got %d", cw.sessionMsgs)
+	}
+}
+
+func TestReconcileStaleSessions(t *testing.T) {
+	// Simulate: we're secondary for zone 2 (RG 2 owned by peer).
+	// We have 3 sessions in zone 2: sessionA, sessionB, sessionC.
+	// Peer sends bulk with only sessionA — sessionB and sessionC are stale.
+	staleKeyB := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 3, 2}, DstIP: [4]byte{10, 0, 4, 2}, Protocol: 6, SrcPort: 2000, DstPort: 443}
+	staleKeyC := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 3, 3}, DstIP: [4]byte{10, 0, 4, 3}, Protocol: 6, SrcPort: 3000, DstPort: 80}
+	freshKeyA := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 3, 1}, DstIP: [4]byte{10, 0, 4, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}
+	// Session in zone 1 (locally owned) — should NOT be deleted.
+	localKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 1, 1}, DstIP: [4]byte{10, 0, 2, 1}, Protocol: 6, SrcPort: 5000, DstPort: 22}
+
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			freshKeyA: {IsReverse: 0, IngressZone: 2},
+			staleKeyB: {IsReverse: 0, IngressZone: 2},
+			staleKeyC: {IsReverse: 0, IngressZone: 2},
+			localKey:  {IsReverse: 0, IngressZone: 1},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.IsPrimaryForRGFn = func(rgID int) bool {
+		return rgID == 1 // we're primary for RG 1 (zone 1), peer owns RG 2 (zone 2)
+	}
+	ss.SetZoneRGMap(map[uint16]int{1: 1, 2: 2})
+
+	// Simulate bulk receive: BulkStart → sessionA → BulkEnd.
+	ss.handleMessage(syncMsgBulkStart, nil)
+
+	// Send freshKeyA as a session message.
+	payload := encodeSessionV4Payload(freshKeyA, dataplane.SessionValue{IsReverse: 0, IngressZone: 2})
+	ss.handleMessage(syncMsgSessionV4, payload)
+
+	ss.handleMessage(syncMsgBulkEnd, nil)
+
+	// freshKeyA should remain.
+	if _, ok := dp.v4sessions[freshKeyA]; !ok {
+		t.Fatal("freshKeyA should not be deleted")
+	}
+
+	// staleKeyB and staleKeyC should be deleted.
+	if _, ok := dp.v4sessions[staleKeyB]; ok {
+		t.Fatal("staleKeyB should be deleted (not in bulk)")
+	}
+	if _, ok := dp.v4sessions[staleKeyC]; ok {
+		t.Fatal("staleKeyC should be deleted (not in bulk)")
+	}
+
+	// localKey (zone 1, our RG) should NOT be touched.
+	if _, ok := dp.v4sessions[localKey]; !ok {
+		t.Fatal("localKey should not be deleted (our RG)")
+	}
+}
+
+func TestReconcileStaleSessionsV6(t *testing.T) {
+	staleKey := dataplane.SessionKeyV6{SrcIP: [16]byte{0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}, Protocol: 6, SrcPort: 2000, DstPort: 80}
+	freshKey := dataplane.SessionKeyV6{SrcIP: [16]byte{0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}
+
+	dp := &mockSweepDP{
+		v6sessions: map[dataplane.SessionKeyV6]dataplane.SessionValueV6{
+			freshKey: {IsReverse: 0, IngressZone: 2},
+			staleKey: {IsReverse: 0, IngressZone: 2},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.IsPrimaryForRGFn = func(rgID int) bool { return rgID == 1 }
+	ss.SetZoneRGMap(map[uint16]int{1: 1, 2: 2})
+
+	ss.handleMessage(syncMsgBulkStart, nil)
+	payload := encodeSessionV6Payload(freshKey, dataplane.SessionValueV6{IsReverse: 0, IngressZone: 2})
+	ss.handleMessage(syncMsgSessionV6, payload)
+	ss.handleMessage(syncMsgBulkEnd, nil)
+
+	if _, ok := dp.v6sessions[freshKey]; !ok {
+		t.Fatal("freshKey should remain")
+	}
+	if _, ok := dp.v6sessions[staleKey]; ok {
+		t.Fatal("staleKey should be deleted")
+	}
+}
+
+func TestReconcileNoBulkInProgress(t *testing.T) {
+	// If no bulk was in progress, reconciliation should be a no-op.
+	key := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6}
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			key: {IsReverse: 0, IngressZone: 2},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.IsPrimaryForRGFn = func(rgID int) bool { return false }
+	ss.SetZoneRGMap(map[uint16]int{2: 2})
+
+	// Call BulkEnd WITHOUT BulkStart — reconciliation should not run.
+	ss.handleMessage(syncMsgBulkEnd, nil)
+
+	if _, ok := dp.v4sessions[key]; !ok {
+		t.Fatal("session should not be deleted when no bulk was in progress")
 	}
 }
 

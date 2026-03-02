@@ -77,6 +77,7 @@ type ClusterConfig struct {
 	IPsecSASync           bool   // enable IPsec SA synchronization (connection name sync for failover re-initiation)
 	RethAdvertiseInterval int    // RETH VRRP advertisement interval in milliseconds, 0=default(30)
 	HitlessRestart        bool   // preserve BPF state on shutdown (default false in HA — fail-closed)
+	PeerFencing           string // peer fencing action on heartbeat timeout: "", "disable-rg"
 	RedundancyGroups      []*RedundancyGroup
 }
 

@@ -8456,6 +8456,79 @@ func TestChassisClusterHitlessRestartDefault(t *testing.T) {
 	}
 }
 
+func TestChassisClusterPeerFencingSet(t *testing.T) {
+	tree := &ConfigTree{}
+	sets := []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster node 0",
+		"set chassis cluster peer-fencing disable-rg",
+	}
+	for _, line := range sets {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tree.SetPath(cmd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if cfg.Chassis.Cluster.PeerFencing != "disable-rg" {
+		t.Errorf("PeerFencing = %q, want %q", cfg.Chassis.Cluster.PeerFencing, "disable-rg")
+	}
+}
+
+func TestChassisClusterPeerFencingHierarchical(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+        peer-fencing disable-rg;
+    }
+}`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if cfg.Chassis.Cluster.PeerFencing != "disable-rg" {
+		t.Errorf("PeerFencing = %q, want %q", cfg.Chassis.Cluster.PeerFencing, "disable-rg")
+	}
+}
+
+func TestChassisClusterPeerFencingDefault(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+    }
+}`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if cfg.Chassis.Cluster.PeerFencing != "" {
+		t.Errorf("PeerFencing = %q, want empty (default)", cfg.Chassis.Cluster.PeerFencing)
+	}
+}
+
 func TestChassisClusterIPMonitoring(t *testing.T) {
 	input := `chassis {
     cluster {

@@ -59,6 +59,8 @@ type SyncStats struct {
 	ConfigsReceived   atomic.Uint64
 	IPsecSASent       atomic.Uint64
 	IPsecSAReceived   atomic.Uint64
+	FencesSent        atomic.Uint64
+	FencesReceived    atomic.Uint64
 	Errors            atomic.Uint64
 	Connected         atomic.Bool
 
@@ -98,6 +100,11 @@ type SessionSync struct {
 	// ManualFailover(rgID) to give up primary for that RG.
 	OnRemoteFailover func(rgID int)
 
+	// OnFenceReceived is called when the peer sends a fence message, requesting
+	// this node to disable all RGs (set rg_active=false). The receiver should
+	// call dp.UpdateRGActive(rgID, false) for every RG.
+	OnFenceReceived func()
+
 	// OnBulkSyncReceived is called when a bulk sync transfer completes
 	// (syncMsgBulkEnd received). The secondary uses this to release VRRP
 	// sync hold after session state has been installed.
@@ -121,6 +128,15 @@ type SessionSync struct {
 
 	zoneRGMu  sync.RWMutex
 	zoneRGMap map[uint16]int // zone_id -> RG_id (for per-RG session sync)
+
+	// Bulk receive tracking for stale-entry reconciliation.
+	// During bulk receive (BulkStart..BulkEnd), track all received
+	// forward session keys. On BulkEnd, delete local sessions in
+	// peer-owned zones that were not refreshed.
+	bulkMu         sync.Mutex
+	bulkInProgress bool
+	bulkRecvV4     map[dataplane.SessionKey]struct{}
+	bulkRecvV6     map[dataplane.SessionKeyV6]struct{}
 }
 
 // NewSessionSync creates a new session synchronization manager.
@@ -429,6 +445,28 @@ func (s *SessionSync) SendFailover(rgID int) error {
 	return nil
 }
 
+// SendFence sends a fence message to the peer, requesting it to disable all
+// RGs (set rg_active=false). This is a best-effort operation — if the sync
+// connection is down (likely during a real failure), the call returns an error.
+func (s *SessionSync) SendFence() error {
+	s.mu.Lock()
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("peer not connected")
+	}
+
+	if err := writeMsg(conn, syncMsgFence, nil); err != nil {
+		slog.Warn("cluster sync: fence send error", "err", err)
+		s.stats.Errors.Add(1)
+		s.handleDisconnect(conn)
+		return fmt.Errorf("failed to send fence message: %w", err)
+	}
+	s.stats.FencesSent.Add(1)
+	slog.Info("cluster sync: fence message sent to peer")
+	return nil
+}
+
 // BulkSync sends the entire session table to the connected peer.
 func (s *SessionSync) BulkSync() error {
 	if s.dp == nil {
@@ -684,6 +722,15 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 		}
 		if s.dp != nil {
 			if key, val, ok := decodeSessionV4Payload(payload); ok {
+				// Track forward keys during bulk receive for stale reconciliation.
+				if val.IsReverse == 0 {
+					s.bulkMu.Lock()
+					if s.bulkInProgress {
+						s.bulkRecvV4[key] = struct{}{}
+					}
+					s.bulkMu.Unlock()
+				}
+
 				// Rebase timestamps to local monotonic clock so the
 				// local GC doesn't expire sessions due to clock skew
 				// between cluster nodes (different boot times).
@@ -744,6 +791,15 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 		}
 		if s.dp != nil {
 			if key, val, ok := decodeSessionV6Payload(payload); ok {
+				// Track forward keys during bulk receive for stale reconciliation.
+				if val.IsReverse == 0 {
+					s.bulkMu.Lock()
+					if s.bulkInProgress {
+						s.bulkRecvV6[key] = struct{}{}
+					}
+					s.bulkMu.Unlock()
+				}
+
 				// Rebase timestamps to local monotonic clock (same as V4).
 				localNow := monotonicSeconds()
 				val.LastSeen = localNow
@@ -844,10 +900,16 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 		s.stats.BulkSyncStartTime.Store(time.Now().UnixNano())
 		s.stats.BulkSyncEndTime.Store(0)
 		s.stats.BulkSyncSessions.Store(0)
+		s.bulkMu.Lock()
+		s.bulkInProgress = true
+		s.bulkRecvV4 = make(map[dataplane.SessionKey]struct{})
+		s.bulkRecvV6 = make(map[dataplane.SessionKeyV6]struct{})
+		s.bulkMu.Unlock()
 		slog.Info("cluster sync: bulk transfer starting")
 
 	case syncMsgBulkEnd:
 		s.stats.BulkSyncEndTime.Store(time.Now().UnixNano())
+		s.reconcileStaleSessions()
 		slog.Info("cluster sync: bulk transfer complete")
 		if s.OnBulkSyncReceived != nil {
 			go s.OnBulkSyncReceived()
@@ -887,6 +949,107 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 		if s.OnRemoteFailover != nil {
 			s.OnRemoteFailover(rgID)
 		}
+
+	case syncMsgFence:
+		s.stats.FencesReceived.Add(1)
+		slog.Warn("cluster sync: fence received from peer — disabling all RGs")
+		if s.OnFenceReceived != nil {
+			s.OnFenceReceived()
+		}
+	}
+}
+
+// reconcileStaleSessions deletes local sessions in peer-owned zones that
+// were not refreshed during the bulk receive. Called on BulkEnd.
+func (s *SessionSync) reconcileStaleSessions() {
+	s.bulkMu.Lock()
+	if !s.bulkInProgress {
+		s.bulkMu.Unlock()
+		return
+	}
+	recvV4 := s.bulkRecvV4
+	recvV6 := s.bulkRecvV6
+	s.bulkInProgress = false
+	s.bulkRecvV4 = nil
+	s.bulkRecvV6 = nil
+	s.bulkMu.Unlock()
+
+	if s.dp == nil {
+		return
+	}
+
+	var deleted int
+
+	// Collect stale v4 sessions for deletion (can't delete during iteration).
+	var staleV4 []dataplane.SessionKey
+	s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		// Only reconcile sessions in zones the peer owns (where we're NOT primary).
+		if s.ShouldSyncZone(val.IngressZone) {
+			return true
+		}
+		if _, ok := recvV4[key]; !ok {
+			staleV4 = append(staleV4, key)
+		}
+		return true
+	})
+
+	for _, key := range staleV4 {
+		// Look up to clean reverse entry and dnat_table.
+		if val, err := s.dp.GetSessionV4(key); err == nil {
+			if val.ReverseKey.Protocol != 0 {
+				s.dp.DeleteSession(val.ReverseKey)
+			}
+			if val.Flags&dataplane.SessFlagSNAT != 0 &&
+				val.Flags&dataplane.SessFlagStaticNAT == 0 {
+				s.dp.DeleteDNATEntry(dataplane.DNATKey{
+					Protocol: key.Protocol,
+					DstIP:    val.NATSrcIP,
+					DstPort:  val.NATSrcPort,
+				})
+			}
+		}
+		s.dp.DeleteSession(key)
+		deleted++
+	}
+
+	// Collect stale v6 sessions.
+	var staleV6 []dataplane.SessionKeyV6
+	s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if s.ShouldSyncZone(val.IngressZone) {
+			return true
+		}
+		if _, ok := recvV6[key]; !ok {
+			staleV6 = append(staleV6, key)
+		}
+		return true
+	})
+
+	for _, key := range staleV6 {
+		if val, err := s.dp.GetSessionV6(key); err == nil {
+			if val.ReverseKey.Protocol != 0 {
+				s.dp.DeleteSessionV6(val.ReverseKey)
+			}
+			if val.Flags&dataplane.SessFlagSNAT != 0 &&
+				val.Flags&dataplane.SessFlagStaticNAT == 0 {
+				s.dp.DeleteDNATEntryV6(dataplane.DNATKeyV6{
+					Protocol: key.Protocol,
+					DstIP:    val.NATSrcIP,
+					DstPort:  val.NATSrcPort,
+				})
+			}
+		}
+		s.dp.DeleteSessionV6(key)
+		deleted++
+	}
+
+	if deleted > 0 {
+		slog.Info("cluster sync: reconciled stale sessions", "deleted", deleted)
 	}
 }
 
@@ -920,6 +1083,8 @@ func (s *SessionSync) FormatStats() string {
 			"  Configs received:   %d\n"+
 			"  IPsec SAs sent:     %d\n"+
 			"  IPsec SAs received: %d\n"+
+			"  Fences sent:        %d\n"+
+			"  Fences received:    %d\n"+
 			"  Errors:             %d\n",
 		s.stats.Connected.Load(),
 		s.stats.SessionsSent.Load(),
@@ -932,6 +1097,8 @@ func (s *SessionSync) FormatStats() string {
 		s.stats.ConfigsReceived.Load(),
 		s.stats.IPsecSASent.Load(),
 		s.stats.IPsecSAReceived.Load(),
+		s.stats.FencesSent.Load(),
+		s.stats.FencesReceived.Load(),
 		s.stats.Errors.Load(),
 	)
 }
