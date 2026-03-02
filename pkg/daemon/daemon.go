@@ -2448,8 +2448,12 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 		if err != nil {
 			slog.Warn("failed to create local log writer", "err", err)
 		} else {
+			if cfg.Security.Log.Format != "" {
+				lw.Format = cfg.Security.Log.Format
+			}
 			er.ReplaceLocalWriters([]*logging.LocalLogWriter{lw})
-			slog.Info("security log event mode: writing to /var/log/bpfrx/security.log")
+			slog.Info("security log event mode: writing to /var/log/bpfrx/security.log",
+				"format", cfg.Security.Log.Format)
 		}
 		d.applyAggregator(er, cfg)
 		return

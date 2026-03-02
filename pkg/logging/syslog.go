@@ -218,6 +218,35 @@ func (s *SyslogClient) writeMsg(line string) error {
 	return err
 }
 
+// SendBinary sends a raw binary log record. The record is self-framing
+// (contains its own length at offset [3:5]), so no additional framing is added.
+// On write failure for TCP/TLS, attempts one reconnect.
+func (s *SyslogClient) SendBinary(data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.writeBinaryMsg(data); err != nil {
+		if s.protocol != "udp" {
+			slog.Debug("syslog binary send failed, reconnecting", "addr", s.remoteAddr, "err", err)
+			if rerr := s.reconnect(); rerr != nil {
+				return fmt.Errorf("syslog reconnect %s: %w", s.remoteAddr, rerr)
+			}
+			return s.writeBinaryMsg(data)
+		}
+		return err
+	}
+	return nil
+}
+
+// writeBinaryMsg writes the raw binary data to the connection. Called with mu held.
+func (s *SyslogClient) writeBinaryMsg(data []byte) error {
+	if s.conn == nil {
+		return fmt.Errorf("syslog connection closed")
+	}
+	_, err := s.conn.Write(data)
+	return err
+}
+
 // ShouldSend returns true if the event severity passes this client's filter.
 // Lower severity number = higher priority (error=3 < warning=4 < info=6).
 func (s *SyslogClient) ShouldSend(severity int) bool {

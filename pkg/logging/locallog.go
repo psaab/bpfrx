@@ -92,6 +92,29 @@ func (lw *LocalLogWriter) Send(severity int, msg string) error {
 	return nil
 }
 
+// SendBinary writes a binary log record to the local file.
+// The record is self-framing (contains its own length), so no additional
+// framing is added.
+func (lw *LocalLogWriter) SendBinary(data []byte) error {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+
+	if lw.file == nil {
+		return fmt.Errorf("log file closed")
+	}
+
+	n, err := lw.file.Write(data)
+	if err != nil {
+		return err
+	}
+	lw.written += int64(n)
+
+	if lw.written >= lw.maxSize {
+		lw.rotate()
+	}
+	return nil
+}
+
 // ShouldSendEvent returns true if both severity and category filters pass.
 func (lw *LocalLogWriter) ShouldSendEvent(severity int, categoryBit uint8) bool {
 	if lw.MinSeverity != 0 && severity > lw.MinSeverity {

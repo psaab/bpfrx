@@ -307,16 +307,17 @@ func (er *EventReader) logEvent(data []byte) {
 	}
 
 	// Parse extended fields (offset 112+)
+	var closeReasonCode uint8
 	if len(data) >= 136 {
 		rec.RevSessionPkts = binary.LittleEndian.Uint64(data[112:120])
 		rec.RevSessionBytes = binary.LittleEndian.Uint64(data[120:128])
 		ifindex := binary.LittleEndian.Uint32(data[128:132])
 		appID := binary.LittleEndian.Uint16(data[132:134])
-		closeReason := data[134]
+		closeReasonCode = data[134]
 
 		rec.IngressIface = er.resolveIfName(ifindex)
 		rec.AppName = er.resolveAppName(appID)
-		rec.CloseReason = closeReasonName(closeReason)
+		rec.CloseReason = closeReasonName(closeReasonCode)
 	}
 
 	// Resolve policy name (skip for screen drops which repurpose policy_id)
@@ -392,8 +393,18 @@ func (er *EventReader) logEvent(data []byte) {
 		catBit := eventCategory(evt.EventType)
 		// Cache formatted messages lazily per format type
 		var stdMsg, structMsg string
+		var binMsg []byte
 		for _, c := range clients {
 			if !c.ShouldSendEvent(severity, catBit) {
+				continue
+			}
+			if c.Format == "binary" {
+				if binMsg == nil {
+					binMsg = formatBinaryRecord(&evt, &rec, severity, closeReasonCode)
+				}
+				if err := c.SendBinary(binMsg); err != nil {
+					slog.Debug("syslog binary send failed", "err", err)
+				}
 				continue
 			}
 			var msg string
@@ -423,8 +434,18 @@ func (er *EventReader) logEvent(data []byte) {
 		severity := eventSeverity(evt.EventType)
 		catBit := eventCategory(evt.EventType)
 		var stdMsg string
+		var localBinMsg []byte
 		for _, lw := range localWriters {
 			if !lw.ShouldSendEvent(severity, catBit) {
+				continue
+			}
+			if lw.Format == "binary" {
+				if localBinMsg == nil {
+					localBinMsg = formatBinaryRecord(&evt, &rec, severity, closeReasonCode)
+				}
+				if err := lw.SendBinary(localBinMsg); err != nil {
+					slog.Debug("local log binary write failed", "err", err)
+				}
 				continue
 			}
 			if stdMsg == "" {
@@ -662,6 +683,128 @@ func screenFlagName(flag uint32) string {
 		return name
 	}
 	return fmt.Sprintf("screen(0x%x)", flag)
+}
+
+// Binary log format constants.
+const (
+	binaryLogMagicHi    = 0xBF
+	binaryLogMagicLo    = 0x52
+	binaryLogVersion    = 1
+	binaryLogHeaderSize = 143 // fixed portion before variable-length strings
+)
+
+// formatBinaryRecord encodes an event into a compact binary log record.
+//
+// Wire format:
+//
+//	Fixed header (143 bytes):
+//	  [0:2]     Magic 0xBF52 (big-endian)
+//	  [2]       Version (1)
+//	  [3:5]     Total record length (uint16 big-endian, includes header)
+//	  [5]       EventType
+//	  [6]       Protocol number
+//	  [7]       Action (0=permit, 1=deny, 2=reject)
+//	  [8]       AddrFamily (2=IPv4, 10=IPv6)
+//	  [9]       Severity (syslog level)
+//	  [10:18]   Timestamp (uint64 LE, Unix nanoseconds)
+//	  [18:34]   SrcIP [16]byte
+//	  [34:50]   DstIP [16]byte
+//	  [50:52]   SrcPort (big-endian)
+//	  [52:54]   DstPort (big-endian)
+//	  [54:58]   PolicyID (LE)
+//	  [58:60]   IngressZone ID (LE)
+//	  [60:62]   EgressZone ID (LE)
+//	  [62:78]   NATSrcIP [16]byte
+//	  [78:94]   NATDstIP [16]byte
+//	  [94:96]   NATSrcPort (big-endian)
+//	  [96:98]   NATDstPort (big-endian)
+//	  [98:106]  SessionPkts (LE)
+//	  [106:114] SessionBytes (LE)
+//	  [114:122] RevSessionPkts (LE)
+//	  [122:130] RevSessionBytes (LE)
+//	  [130:134] ElapsedTime seconds (LE)
+//	  [134:142] SessionID (LE)
+//	  [142]     CloseReason code
+//	Variable section (uint8 length + UTF-8 bytes each):
+//	  InZoneName, OutZoneName, PolicyName, AppName, IngressIface
+func formatBinaryRecord(evt *dataplane.Event, rec *EventRecord, severity int, closeReason uint8) []byte {
+	inZone := truncStr(rec.InZoneName, 255)
+	outZone := truncStr(rec.OutZoneName, 255)
+	policyName := truncStr(rec.PolicyName, 255)
+	appName := truncStr(rec.AppName, 255)
+	iface := truncStr(rec.IngressIface, 255)
+
+	varLen := 5 + len(inZone) + len(outZone) + len(policyName) + len(appName) + len(iface)
+	totalLen := binaryLogHeaderSize + varLen
+
+	buf := make([]byte, totalLen)
+
+	// Magic (big-endian)
+	buf[0] = binaryLogMagicHi
+	buf[1] = binaryLogMagicLo
+	// Version
+	buf[2] = binaryLogVersion
+	// Total record length (big-endian)
+	binary.BigEndian.PutUint16(buf[3:5], uint16(totalLen))
+	// Event fields
+	buf[5] = evt.EventType
+	buf[6] = evt.Protocol
+	buf[7] = evt.Action
+	buf[8] = evt.AddrFamily
+	buf[9] = uint8(severity)
+	// Timestamp
+	binary.LittleEndian.PutUint64(buf[10:18], uint64(rec.Time.UnixNano()))
+	// IPs (raw bytes, network order)
+	copy(buf[18:34], evt.SrcIP[:])
+	copy(buf[34:50], evt.DstIP[:])
+	// Ports (big-endian, as parsed from BPF)
+	binary.BigEndian.PutUint16(buf[50:52], evt.SrcPort)
+	binary.BigEndian.PutUint16(buf[52:54], evt.DstPort)
+	// PolicyID
+	binary.LittleEndian.PutUint32(buf[54:58], evt.PolicyID)
+	// Zone IDs
+	binary.LittleEndian.PutUint16(buf[58:60], evt.IngressZone)
+	binary.LittleEndian.PutUint16(buf[60:62], evt.EgressZone)
+	// NAT IPs
+	copy(buf[62:78], evt.NATSrcIP[:])
+	copy(buf[78:94], evt.NATDstIP[:])
+	// NAT ports
+	binary.BigEndian.PutUint16(buf[94:96], evt.NATSrcPort)
+	binary.BigEndian.PutUint16(buf[96:98], evt.NATDstPort)
+	// Session stats
+	binary.LittleEndian.PutUint64(buf[98:106], rec.SessionPkts)
+	binary.LittleEndian.PutUint64(buf[106:114], rec.SessionBytes)
+	binary.LittleEndian.PutUint64(buf[114:122], rec.RevSessionPkts)
+	binary.LittleEndian.PutUint64(buf[122:130], rec.RevSessionBytes)
+	// Elapsed time
+	binary.LittleEndian.PutUint32(buf[130:134], rec.ElapsedTime)
+	// Session ID
+	binary.LittleEndian.PutUint64(buf[134:142], rec.SessionID)
+	// Close reason
+	buf[142] = closeReason
+
+	// Variable section: length-prefixed strings
+	off := binaryLogHeaderSize
+	off = putLenStr(buf, off, inZone)
+	off = putLenStr(buf, off, outZone)
+	off = putLenStr(buf, off, policyName)
+	off = putLenStr(buf, off, appName)
+	putLenStr(buf, off, iface)
+
+	return buf
+}
+
+func truncStr(s string, max int) string {
+	if len(s) > max {
+		return s[:max]
+	}
+	return s
+}
+
+func putLenStr(buf []byte, off int, s string) int {
+	buf[off] = uint8(len(s))
+	copy(buf[off+1:], s)
+	return off + 1 + len(s)
 }
 
 func closeReasonName(reason uint8) string {
