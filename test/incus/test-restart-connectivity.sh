@@ -33,6 +33,7 @@ MAX_LOST_PINGS="${MAX_LOST_PINGS:-2}"       # allow 1-2 for VRRP transition
 PING_COUNT=40                                # pings per cycle (0.5s interval = 20s)
 PING_INTERVAL="0.5"
 PRE_RESTART_PINGS=6                          # pings before restart (3s)
+SETTLE_TIME="${SETTLE_TIME:-20}"             # seconds between cycles for cluster stabilization
 
 PASS=0
 FAIL=0
@@ -146,15 +147,14 @@ for cycle in $(seq 1 "$RESTART_CYCLES"); do
 	incus exec cluster-lan-host -- bash -c \
 		"ping -c ${PING_COUNT} -i ${PING_INTERVAL} ${IPERF_TARGET} > ${PING_LOG} 2>&1 &"
 
-	# Wait for a few pings to succeed before restart
-	sleep $(echo "$PRE_RESTART_PINGS * $PING_INTERVAL" | bc)
+	# Wait for a few pings to succeed before restart (3s)
+	sleep 3
 
 	# Restart bpfrxd on fw0
 	incus exec bpfrx-fw0 -- systemctl restart bpfrxd 2>/dev/null || true
 
-	# Wait for ping to finish
-	remaining=$(echo "($PING_COUNT - $PRE_RESTART_PINGS) * $PING_INTERVAL + 5" | bc)
-	sleep "${remaining%.*}"
+	# Wait for ping to finish (~22s total ping time minus 3s pre-restart + 5s buffer)
+	sleep 22
 
 	# Parse ping results
 	ping_output=$(incus exec cluster-lan-host -- cat "$PING_LOG" 2>/dev/null || true)
@@ -171,7 +171,7 @@ for cycle in $(seq 1 "$RESTART_CYCLES"); do
 	total_lost=$((total_lost + lost))
 
 	# Wait for cluster to stabilize before next cycle
-	sleep 10
+	sleep "$SETTLE_TIME"
 
 	# Ensure fw0 is primary for next cycle
 	if ! fw0_is_primary; then
