@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -267,15 +268,128 @@ func TestUnmarshalHeartbeat_TruncatedMonitor(t *testing.T) {
 	pkt := &HeartbeatPacket{
 		NodeID:    0,
 		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+		Monitors: []HeartbeatMonitor{
+			{RGID: 1, Weight: 255, Up: true, Interface: "ge-0/0/0"},
+			{RGID: 1, Weight: 128, Up: false, Interface: "ge-0/0/1"},
+		},
+	}
+	data := MarshalHeartbeat(pkt)
+
+	// Truncate in the middle of the second monitor entry — first monitor
+	// and RG state should still be returned without error.
+	// The full first monitor ends at: header(9) + 1*group(5) + numMon(1) + mon0(4+8) = 27.
+	// Truncate at 29 so the second monitor header is partially there.
+	truncAt := heartbeatHeaderSize + 1*heartbeatGroupSize + 1 + (4 + len("ge-0/0/0")) + 2
+	got, err := UnmarshalHeartbeat(data[:truncAt])
+	if err != nil {
+		t.Fatalf("unexpected error for truncated monitor: %v", err)
+	}
+	if len(got.Groups) != 1 {
+		t.Errorf("groups = %d, want 1", len(got.Groups))
+	}
+	if got.Groups[0].Priority != 200 {
+		t.Errorf("group 0 priority = %d, want 200", got.Groups[0].Priority)
+	}
+	if len(got.Monitors) != 1 {
+		t.Errorf("monitors = %d, want 1 (second was truncated)", len(got.Monitors))
+	}
+	if len(got.Monitors) > 0 && got.Monitors[0].Interface != "ge-0/0/0" {
+		t.Errorf("monitor 0 interface = %q, want ge-0/0/0", got.Monitors[0].Interface)
+	}
+}
+
+func TestUnmarshalHeartbeat_TruncatedMonitorName(t *testing.T) {
+	pkt := &HeartbeatPacket{
+		NodeID:    0,
+		ClusterID: 1,
 		Monitors: []HeartbeatMonitor{
 			{RGID: 1, Weight: 255, Up: true, Interface: "ge-0/0/0"},
 		},
 	}
 	data := MarshalHeartbeat(pkt)
-	// Truncate in the middle of the monitor entry.
-	_, err := UnmarshalHeartbeat(data[:len(data)-3])
-	if err == nil {
-		t.Error("expected error for truncated monitor data")
+	// Truncate inside the name — should return 0 monitors, no error.
+	truncAt := heartbeatHeaderSize + 1 + 4 + 2 // header + numMon + monHeader + partialName
+	got, err := UnmarshalHeartbeat(data[:truncAt])
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got.Monitors) != 0 {
+		t.Errorf("monitors = %d, want 0 (name was truncated)", len(got.Monitors))
+	}
+}
+
+func TestMarshalHeartbeat_LargeMonitorPayload_RGPreserved(t *testing.T) {
+	// Build a packet with many monitors that would exceed the old 512-byte
+	// limit. RG group state must always be preserved.
+	pkt := &HeartbeatPacket{
+		NodeID:    0,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+			{GroupID: 1, Priority: 150, Weight: 100, State: uint8(StateSecondary)},
+		},
+	}
+	// Each monitor with a 20-char interface name takes 4+20 = 24 bytes.
+	// 80 monitors × 24 bytes = 1920 bytes just for monitors (+ header, groups, numMon).
+	// This exceeds maxHeartbeatSize (1472) and forces truncation.
+	for i := 0; i < 80; i++ {
+		name := fmt.Sprintf("ge-0/0/%02d-longname__", i)
+		pkt.Monitors = append(pkt.Monitors, HeartbeatMonitor{
+			RGID: 0, Weight: 255, Up: true, Interface: name,
+		})
+	}
+
+	data := MarshalHeartbeat(pkt)
+	if len(data) > maxHeartbeatSize {
+		t.Fatalf("marshal produced %d bytes, exceeds maxHeartbeatSize %d", len(data), maxHeartbeatSize)
+	}
+
+	got, err := UnmarshalHeartbeat(data)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// RG groups must be intact.
+	if len(got.Groups) != 2 {
+		t.Fatalf("groups = %d, want 2", len(got.Groups))
+	}
+	if got.Groups[0].Priority != 200 {
+		t.Errorf("group 0 priority = %d, want 200", got.Groups[0].Priority)
+	}
+	if got.Groups[1].Priority != 150 {
+		t.Errorf("group 1 priority = %d, want 150", got.Groups[1].Priority)
+	}
+
+	// Some monitors should be present (but fewer than 80 due to truncation).
+	if len(got.Monitors) == 0 {
+		t.Error("expected at least some monitors")
+	}
+	if len(got.Monitors) >= 80 {
+		t.Errorf("expected monitors to be truncated, got all %d", len(got.Monitors))
+	}
+	t.Logf("fit %d/%d monitors in %d bytes", len(got.Monitors), 80, len(data))
+}
+
+func TestMarshalHeartbeat_CapsAtMaxSize(t *testing.T) {
+	pkt := &HeartbeatPacket{
+		NodeID:    0,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	// Add enough monitors to blow past the limit.
+	for i := 0; i < 200; i++ {
+		pkt.Monitors = append(pkt.Monitors, HeartbeatMonitor{
+			RGID: 0, Weight: 255, Up: true, Interface: fmt.Sprintf("interface-%d", i),
+		})
+	}
+	data := MarshalHeartbeat(pkt)
+	if len(data) > maxHeartbeatSize {
+		t.Errorf("marshal output %d bytes exceeds cap %d", len(data), maxHeartbeatSize)
 	}
 }
 

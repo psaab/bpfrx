@@ -20,8 +20,9 @@ const (
 	// heartbeatVersion is the current protocol version.
 	heartbeatVersion = 1
 
-	// maxHeartbeatSize is the max packet size we'll read.
-	maxHeartbeatSize = 512
+	// maxHeartbeatSize is the max packet size we'll read/write.
+	// 1472 = 1500 MTU - 20 IP header - 8 UDP header.
+	maxHeartbeatSize = 1472
 
 	// DefaultHeartbeatInterval is the default heartbeat send interval.
 	DefaultHeartbeatInterval = 1000 * time.Millisecond
@@ -81,17 +82,12 @@ const heartbeatHeaderSize = 9
 const heartbeatGroupSize = 5
 
 // MarshalHeartbeat encodes a heartbeat packet to wire format.
+// The output is capped at maxHeartbeatSize. RG group entries are always
+// included (they are critical for election). If monitors would cause the
+// packet to exceed the limit, the monitor section is truncated — as many
+// monitors as fit are included.
 func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
-	// Calculate size: header + groups + monitor section.
-	size := heartbeatHeaderSize + len(pkt.Groups)*heartbeatGroupSize
-	// Monitor section: NumMonitors(1) + per-monitor(RGID(1)+Flags(1)+Weight(1)+NameLen(1)+Name(N)).
-	monSize := 1 // NumMonitors byte
-	for _, mon := range pkt.Monitors {
-		monSize += 4 + len(mon.Interface) // RGID + Flags + Weight + NameLen + name
-	}
-	size += monSize
-
-	buf := make([]byte, size)
+	buf := make([]byte, maxHeartbeatSize)
 	copy(buf[0:4], heartbeatMagic)
 	buf[4] = heartbeatVersion
 	buf[5] = pkt.NodeID
@@ -107,10 +103,17 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 		off += heartbeatGroupSize
 	}
 
-	// Append monitor section.
-	buf[off] = uint8(len(pkt.Monitors))
+	// Append monitor section, fitting as many monitors as possible.
+	monCountOff := off // remember offset of NumMonitors byte
+	buf[off] = 0       // NumMonitors — updated below
 	off++
+	numMon := 0
 	for _, mon := range pkt.Monitors {
+		nameBytes := []byte(mon.Interface)
+		entrySize := 4 + len(nameBytes) // RGID + Flags + Weight + NameLen + name
+		if off+entrySize > maxHeartbeatSize {
+			break
+		}
 		buf[off] = mon.RGID
 		flags := uint8(0)
 		if mon.Up {
@@ -118,13 +121,14 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 		}
 		buf[off+1] = flags
 		buf[off+2] = mon.Weight
-		nameBytes := []byte(mon.Interface)
 		buf[off+3] = uint8(len(nameBytes))
 		off += 4
 		copy(buf[off:off+len(nameBytes)], nameBytes)
 		off += len(nameBytes)
+		numMon++
 	}
-	return buf
+	buf[monCountOff] = uint8(numMon)
+	return buf[:off]
 }
 
 // UnmarshalHeartbeat decodes a heartbeat packet from wire format.
@@ -163,13 +167,16 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 	}
 
 	// Parse monitor section if present (backwards compatible — old packets
-	// without monitors just have no remaining data).
+	// without monitors just have no remaining data). If the monitor section
+	// is truncated (sender capped at maxHeartbeatSize), return whatever
+	// monitors were successfully parsed rather than erroring — RG state
+	// (already parsed above) is the critical data.
 	if off < len(data) {
 		numMonitors := int(data[off])
 		off++
 		for i := 0; i < numMonitors; i++ {
 			if off+4 > len(data) {
-				return nil, fmt.Errorf("heartbeat monitor truncated at entry %d", i)
+				break // truncated — return what we have
 			}
 			rgID := data[off]
 			up := data[off+1]&1 != 0
@@ -177,7 +184,7 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 			nameLen := int(data[off+3])
 			off += 4
 			if off+nameLen > len(data) {
-				return nil, fmt.Errorf("heartbeat monitor name truncated at entry %d", i)
+				break // truncated name — return what we have
 			}
 			name := string(data[off : off+nameLen])
 			off += nameLen
