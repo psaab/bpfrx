@@ -18,51 +18,10 @@ type completionCandidate struct {
 
 // completeFromTreeWithDesc mirrors completeFromTree but returns name+desc pairs.
 func completeFromTreeWithDesc(tree map[string]*completionNode, words []string, partial string, cfg *config.Config) []completionCandidate {
-	current := tree
-	var currentNode *completionNode
-	dynamicConsumed := false // true when last word was a dynamic value
-	for wi, w := range words {
-		dynamicConsumed = false
-		node, ok := current[w]
-		if !ok {
-			if currentNode != nil && currentNode.HasDynamic() {
-				dynamicConsumed = true
-				continue
-			}
-			return nil
-		}
-		currentNode = node
-		if node.Children == nil {
-			if node.HasDynamic() && wi < len(words)-1 {
-				dynamicConsumed = true
-				continue
-			}
-			if node.HasDynamic() && cfg != nil {
-				var candidates []completionCandidate
-				for _, name := range node.DynamicValues(cfg, words) {
-					if strings.HasPrefix(name, partial) {
-						candidates = append(candidates, completionCandidate{name: name, desc: "(configured)"})
-					}
-				}
-				return candidates
-			}
-			return nil
-		}
-		current = node.Children
-	}
-
-	var candidates []completionCandidate
-	for name, node := range current {
-		if strings.HasPrefix(name, partial) {
-			candidates = append(candidates, completionCandidate{name: name, desc: node.Desc})
-		}
-	}
-	if !dynamicConsumed && currentNode != nil && currentNode.HasDynamic() && cfg != nil {
-		for _, name := range currentNode.DynamicValues(cfg, words) {
-			if strings.HasPrefix(name, partial) {
-				candidates = append(candidates, completionCandidate{name: name, desc: "(configured)"})
-			}
-		}
+	treeCands := cmdtree.CompleteFromTreeWithDesc(tree, words, partial, cfg)
+	candidates := make([]completionCandidate, 0, len(treeCands))
+	for _, c := range treeCands {
+		candidates = append(candidates, completionCandidate{name: c.Name, desc: c.Desc})
 	}
 	return candidates
 }

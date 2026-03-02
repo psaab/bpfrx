@@ -40,59 +40,59 @@ import (
 	"github.com/psaab/bpfrx/pkg/frr"
 	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
 	"github.com/psaab/bpfrx/pkg/ipsec"
-	"github.com/psaab/bpfrx/pkg/logging"
-	"github.com/psaab/bpfrx/pkg/routing"
 	"github.com/psaab/bpfrx/pkg/lldp"
+	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/ra"
+	"github.com/psaab/bpfrx/pkg/routing"
 	"github.com/psaab/bpfrx/pkg/rpm"
 	"github.com/psaab/bpfrx/pkg/vrrp"
 )
 
 // Config configures the gRPC server.
 type Config struct {
-	Store    *configstore.Store
-	DP       dataplane.DataPlane
-	EventBuf *logging.EventBuffer
-	GC       *conntrack.GC
-	Routing  *routing.Manager
-	FRR      *frr.Manager
-	IPsec    *ipsec.Manager
-	Cluster  *cluster.Manager
-	DHCP         *dhcp.Manager
-	DHCPServer   *dhcpserver.Manager
-	RPMResultsFn    func() []*rpm.ProbeResult      // returns live RPM results
+	Store           *configstore.Store
+	DP              dataplane.DataPlane
+	EventBuf        *logging.EventBuffer
+	GC              *conntrack.GC
+	Routing         *routing.Manager
+	FRR             *frr.Manager
+	IPsec           *ipsec.Manager
+	Cluster         *cluster.Manager
+	DHCP            *dhcp.Manager
+	DHCPServer      *dhcpserver.Manager
+	RPMResultsFn    func() []*rpm.ProbeResult        // returns live RPM results
 	FeedsFn         func() map[string]feeds.FeedInfo // returns live feed status
-	LLDPNeighborsFn func() []*lldp.Neighbor         // returns live LLDP neighbors
+	LLDPNeighborsFn func() []*lldp.Neighbor          // returns live LLDP neighbors
 	ApplyFn         func(*config.Config)             // daemon's applyConfig callback
 	VRRPMgr         *vrrp.Manager                    // native VRRP manager
 	RAMgr           *ra.Manager                      // embedded RA sender manager
-	Version      string                    // software version string
-	FabricPeerAddrFn func() string          // returns peer fabric IP (empty if standalone)
-	FabricVRFDevice  string                 // VRF for fabric interface (e.g. "vrf-mgmt")
+	Version          string                           // software version string
+	FabricPeerAddrFn func() string                    // returns peer fabric IP (empty if standalone)
+	FabricVRFDevice  string                           // VRF for fabric interface (e.g. "vrf-mgmt")
 }
 
 // Server implements the BpfrxService gRPC service.
 type Server struct {
 	pb.UnimplementedBpfrxServiceServer
-	store        *configstore.Store
-	dp           dataplane.DataPlane
-	eventBuf     *logging.EventBuffer
-	gc           *conntrack.GC
-	routing      *routing.Manager
-	frr          *frr.Manager
-	ipsec        *ipsec.Manager
-	cluster      *cluster.Manager
-	dhcp         *dhcp.Manager
-	dhcpServer   *dhcpserver.Manager
+	store           *configstore.Store
+	dp              dataplane.DataPlane
+	eventBuf        *logging.EventBuffer
+	gc              *conntrack.GC
+	routing         *routing.Manager
+	frr             *frr.Manager
+	ipsec           *ipsec.Manager
+	cluster         *cluster.Manager
+	dhcp            *dhcp.Manager
+	dhcpServer      *dhcpserver.Manager
 	rpmResultsFn    func() []*rpm.ProbeResult
 	feedsFn         func() map[string]feeds.FeedInfo
 	lldpNeighborsFn func() []*lldp.Neighbor
 	applyFn         func(*config.Config)
 	vrrpMgr         *vrrp.Manager
 	raMgr           *ra.Manager
-	startTime    time.Time
-	addr         string
-	version      string
+	startTime        time.Time
+	addr             string
+	version          string
 	fabricPeerAddrFn func() string
 	fabricVRFDevice  string
 }
@@ -103,25 +103,25 @@ type Server struct {
 // gRPC is ever exposed on non-loopback addresses.
 func NewServer(addr string, cfg Config) *Server {
 	return &Server{
-		store:        cfg.Store,
-		dp:           cfg.DP,
-		eventBuf:     cfg.EventBuf,
-		gc:           cfg.GC,
-		routing:      cfg.Routing,
-		frr:          cfg.FRR,
-		ipsec:        cfg.IPsec,
-		cluster:      cfg.Cluster,
-		dhcp:         cfg.DHCP,
-		dhcpServer:   cfg.DHCPServer,
+		store:           cfg.Store,
+		dp:              cfg.DP,
+		eventBuf:        cfg.EventBuf,
+		gc:              cfg.GC,
+		routing:         cfg.Routing,
+		frr:             cfg.FRR,
+		ipsec:           cfg.IPsec,
+		cluster:         cfg.Cluster,
+		dhcp:            cfg.DHCP,
+		dhcpServer:      cfg.DHCPServer,
 		rpmResultsFn:    cfg.RPMResultsFn,
 		feedsFn:         cfg.FeedsFn,
 		lldpNeighborsFn: cfg.LLDPNeighborsFn,
 		applyFn:         cfg.ApplyFn,
 		vrrpMgr:         cfg.VRRPMgr,
 		raMgr:           cfg.RAMgr,
-		startTime:    time.Now(),
-		addr:         addr,
-		version:      cfg.Version,
+		startTime:        time.Now(),
+		addr:             addr,
+		version:          cfg.Version,
 		fabricPeerAddrFn: cfg.FabricPeerAddrFn,
 		fabricVRFDevice:  cfg.FabricVRFDevice,
 	}
@@ -585,19 +585,19 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 	}
 
 	return &pb.GetGlobalStatsResponse{
-		RxPackets:           readCounter(dataplane.GlobalCtrRxPackets),
-		TxPackets:           readCounter(dataplane.GlobalCtrTxPackets),
-		Drops:               readCounter(dataplane.GlobalCtrDrops),
-		SessionsCreated:     readCounter(dataplane.GlobalCtrSessionsNew),
-		SessionsClosed:      readCounter(dataplane.GlobalCtrSessionsClosed),
-		ScreenDrops:         readCounter(dataplane.GlobalCtrScreenDrops),
-		PolicyDenies:        readCounter(dataplane.GlobalCtrPolicyDeny),
-		NatAllocFailures:    readCounter(dataplane.GlobalCtrNATAllocFail),
-		HostInboundDenies:   readCounter(dataplane.GlobalCtrHostInboundDeny),
-		TcEgressPackets:     readCounter(dataplane.GlobalCtrTCEgressPackets),
-		Nat64Translations:   readCounter(dataplane.GlobalCtrNAT64Xlate),
-		HostInboundAllowed:  readCounter(dataplane.GlobalCtrHostInbound),
-		ScreenDropDetails:   screenDetails,
+		RxPackets:          readCounter(dataplane.GlobalCtrRxPackets),
+		TxPackets:          readCounter(dataplane.GlobalCtrTxPackets),
+		Drops:              readCounter(dataplane.GlobalCtrDrops),
+		SessionsCreated:    readCounter(dataplane.GlobalCtrSessionsNew),
+		SessionsClosed:     readCounter(dataplane.GlobalCtrSessionsClosed),
+		ScreenDrops:        readCounter(dataplane.GlobalCtrScreenDrops),
+		PolicyDenies:       readCounter(dataplane.GlobalCtrPolicyDeny),
+		NatAllocFailures:   readCounter(dataplane.GlobalCtrNATAllocFail),
+		HostInboundDenies:  readCounter(dataplane.GlobalCtrHostInboundDeny),
+		TcEgressPackets:    readCounter(dataplane.GlobalCtrTCEgressPackets),
+		Nat64Translations:  readCounter(dataplane.GlobalCtrNAT64Xlate),
+		HostInboundAllowed: readCounter(dataplane.GlobalCtrHostInbound),
+		ScreenDropDetails:  screenDetails,
 	}, nil
 }
 
@@ -1517,8 +1517,8 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 	// Add peer node interfaces (cluster mode).
 	// Peer interfaces don't exist locally — compile the peer's config from the
 	// raw tree and extract interfaces not in our compiled config.
-	peerIfaces := make(map[string]bool)    // peer-only interface names
-	peerLinkUp := make(map[string]bool)    // peer interface link status from heartbeat
+	peerIfaces := make(map[string]bool) // peer-only interface names
+	peerLinkUp := make(map[string]bool) // peer interface link status from heartbeat
 	if s.cluster != nil {
 		// Determine peer node ID.
 		peerNodeID := -1
@@ -2632,16 +2632,20 @@ func (s *Server) completeConfigPairs(words []string, partial string) []completio
 		return pairs
 	case "commit":
 		if len(words) == 1 {
+			var pairs []completionPair
 			for _, name := range cmdtree.FilterPrefix([]string{"check", "confirmed"}, partial) {
-				return []completionPair{{name: name}}
+				pairs = append(pairs, completionPair{name: name})
 			}
+			return pairs
 		}
 		return nil
 	case "load":
 		if len(words) == 1 {
+			var pairs []completionPair
 			for _, name := range cmdtree.FilterPrefix([]string{"override", "merge"}, partial) {
-				return []completionPair{{name: name}}
+				pairs = append(pairs, completionPair{name: name})
 			}
+			return pairs
 		}
 		return nil
 	default:
@@ -2909,11 +2913,11 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 		EgressZone:      uint32(val.EgressZone),
 		IngressZoneName: zoneNames[val.IngressZone],
 		EgressZoneName:  zoneNames[val.EgressZone],
-		FwdPackets:     val.FwdPackets,
-		FwdBytes:       val.FwdBytes,
-		RevPackets:     val.RevPackets,
-		RevBytes:       val.RevBytes,
-		TimeoutSeconds: val.Timeout,
+		FwdPackets:      val.FwdPackets,
+		FwdBytes:        val.FwdBytes,
+		RevPackets:      val.RevPackets,
+		RevBytes:        val.RevBytes,
+		TimeoutSeconds:  val.Timeout,
 	}
 	if val.Created > 0 && now > val.Created {
 		se.AgeSeconds = int64(now - val.Created)
@@ -2944,11 +2948,11 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 		EgressZone:      uint32(val.EgressZone),
 		IngressZoneName: zoneNames[val.IngressZone],
 		EgressZoneName:  zoneNames[val.EgressZone],
-		FwdPackets:     val.FwdPackets,
-		FwdBytes:       val.FwdBytes,
-		RevPackets:     val.RevPackets,
-		RevBytes:       val.RevBytes,
-		TimeoutSeconds: val.Timeout,
+		FwdPackets:      val.FwdPackets,
+		FwdBytes:        val.FwdBytes,
+		RevPackets:      val.RevPackets,
+		RevBytes:        val.RevBytes,
+		TimeoutSeconds:  val.Timeout,
 	}
 	if val.Created > 0 && now > val.Created {
 		se.AgeSeconds = int64(now - val.Created)
