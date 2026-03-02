@@ -34,6 +34,7 @@ const (
 	syncMsgConfig    = 8  // full config text sync from primary to secondary
 	syncMsgIPsecSA   = 9  // IPsec SA connection names sync
 	syncMsgFailover  = 10 // remote failover request (payload: 1 byte rgID)
+	syncMsgFence     = 11 // peer fencing: receiver should disable all RGs
 )
 
 // syncHeader is the wire header for each sync message.
@@ -445,9 +446,16 @@ func (s *SessionSync) BulkSync() error {
 		return err
 	}
 
-	var count int
-	// Send all v4 sessions.
+	var count, skipped int
+	// Send owned v4 forward sessions.
 	err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if !s.ShouldSyncZone(val.IngressZone) {
+			skipped++
+			return true
+		}
 		msg := encodeSessionV4Payload(key, val)
 		if err := writeMsg(conn, syncMsgSessionV4, msg); err != nil {
 			slog.Warn("bulk sync v4 write error", "err", err)
@@ -460,8 +468,15 @@ func (s *SessionSync) BulkSync() error {
 		return fmt.Errorf("bulk sync v4 iterate: %w", err)
 	}
 
-	// Send all v6 sessions.
+	// Send owned v6 forward sessions.
 	err = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if !s.ShouldSyncZone(val.IngressZone) {
+			skipped++
+			return true
+		}
 		msg := encodeSessionV6Payload(key, val)
 		if err := writeMsg(conn, syncMsgSessionV6, msg); err != nil {
 			slog.Warn("bulk sync v6 write error", "err", err)
@@ -480,7 +495,7 @@ func (s *SessionSync) BulkSync() error {
 	}
 
 	s.stats.BulkSyncs.Add(1)
-	slog.Info("cluster sync: bulk sync complete", "sessions", count)
+	slog.Info("cluster sync: bulk sync complete", "sessions", count, "skipped", skipped)
 	return nil
 }
 

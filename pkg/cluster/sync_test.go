@@ -684,6 +684,107 @@ func TestSyncSweepPerRGV6(t *testing.T) {
 	}
 }
 
+// countingWriter wraps a net.Conn and counts sync messages written.
+type countingWriter struct {
+	net.Conn
+	sessionMsgs int
+}
+
+func (c *countingWriter) Write(b []byte) (int, error) {
+	// Count session messages by checking the magic + type in headers.
+	if len(b) >= syncHeaderSize && string(b[0:4]) == "BPSY" {
+		if b[4] == syncMsgSessionV4 || b[4] == syncMsgSessionV6 {
+			c.sessionMsgs++
+		}
+	}
+	return len(b), nil // discard
+}
+
+func TestBulkSyncRGFiltering(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			// Forward session in zone 1 (RG 1 — primary) — should sync
+			{SrcIP: [4]byte{10, 0, 1, 1}, DstIP: [4]byte{10, 0, 2, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}: {
+				State: dataplane.SessStateEstablished, IsReverse: 0, IngressZone: 1,
+			},
+			// Reverse session in zone 1 — should be skipped (reverse)
+			{SrcIP: [4]byte{10, 0, 2, 1}, DstIP: [4]byte{10, 0, 1, 1}, Protocol: 6, SrcPort: 80, DstPort: 1000}: {
+				State: dataplane.SessStateEstablished, IsReverse: 1, IngressZone: 1,
+			},
+			// Forward session in zone 2 (RG 2 — not primary) — should skip
+			{SrcIP: [4]byte{10, 0, 3, 1}, DstIP: [4]byte{10, 0, 4, 1}, Protocol: 6, SrcPort: 2000, DstPort: 443}: {
+				State: dataplane.SessStateEstablished, IsReverse: 0, IngressZone: 2,
+			},
+		},
+		v6sessions: map[dataplane.SessionKeyV6]dataplane.SessionValueV6{
+			// Forward v6 session in zone 1 (RG 1 — primary) — should sync
+			{SrcIP: [16]byte{0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, Protocol: 6}: {
+				IsReverse: 0, IngressZone: 1,
+			},
+			// Reverse v6 session — should be skipped
+			{SrcIP: [16]byte{0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}, Protocol: 6}: {
+				IsReverse: 1, IngressZone: 1,
+			},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.IsPrimaryForRGFn = func(rgID int) bool {
+		return rgID == 1 // primary for RG 1 only
+	}
+	ss.SetZoneRGMap(map[uint16]int{
+		1: 1, // zone 1 → RG 1
+		2: 2, // zone 2 → RG 2
+	})
+
+	cw := &countingWriter{}
+	ss.mu.Lock()
+	ss.conn = cw
+	ss.mu.Unlock()
+
+	err := ss.BulkSync()
+	if err != nil {
+		t.Fatalf("BulkSync failed: %v", err)
+	}
+
+	// Should only sync 2 sessions: 1 v4 forward in zone 1 + 1 v6 forward in zone 1
+	if cw.sessionMsgs != 2 {
+		t.Fatalf("expected 2 session messages (1 v4 + 1 v6 in owned RG), got %d", cw.sessionMsgs)
+	}
+}
+
+func TestBulkSyncSkipsReverseEntries(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}: {
+				IsReverse: 0, IngressZone: 1,
+			},
+			{SrcIP: [4]byte{10, 0, 2, 1}, Protocol: 6, SrcPort: 80, DstPort: 1000}: {
+				IsReverse: 1, IngressZone: 1,
+			},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return true }
+
+	cw := &countingWriter{}
+	ss.mu.Lock()
+	ss.conn = cw
+	ss.mu.Unlock()
+
+	err := ss.BulkSync()
+	if err != nil {
+		t.Fatalf("BulkSync failed: %v", err)
+	}
+
+	// Only forward entry should be sent
+	if cw.sessionMsgs != 1 {
+		t.Fatalf("expected 1 session message (forward only), got %d", cw.sessionMsgs)
+	}
+}
+
 func TestHandleDisconnectStaleConn(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 
