@@ -534,7 +534,7 @@ instead of dropping them or sending un-NAT'd packets to the kernel.
 
 ```bash
 # IPv4: ping through SNAT from LAN to external host
-sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 30 -i 0.5 172.16.100.247' &
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 30 -i 0.5 172.16.100.200' &
 
 # After 5 seconds, restart primary
 sleep 5

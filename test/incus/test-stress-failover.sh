@@ -9,7 +9,7 @@
 # This test codifies the stress scenario as a permanent regression gate.
 #
 # Requires: bpfrx-fw0, bpfrx-fw1, cluster-lan-host running.
-# Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.247).
+# Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.200).
 #
 # Tests:
 #   1. Start iperf3 through the firewall (LAN host → WAN target)
@@ -32,7 +32,7 @@ if ! incus list &>/dev/null 2>&1; then
 	fi
 fi
 
-IPERF_TARGET="${IPERF_TARGET:-172.16.100.247}"
+IPERF_TARGET="${IPERF_TARGET:-172.16.100.200}"
 IPERF_STREAMS="${IPERF_STREAMS:-8}"
 FAILOVER_INTERVAL="${FAILOVER_INTERVAL:-60}"   # seconds between failovers
 TOTAL_CYCLES="${TOTAL_CYCLES:-10}"

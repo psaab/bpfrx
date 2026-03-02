@@ -5,7 +5,7 @@
 # failures — scenarios not covered by the clean-reboot failover test.
 #
 # Requires: bpfrx-fw0, bpfrx-fw1, cluster-lan-host running.
-# Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.247).
+# Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.200).
 #
 # Tests:
 #   Phase 1: Hard VM stop (incus stop --force) — simulates kernel panic / power loss
@@ -40,7 +40,7 @@ if ! incus list &>/dev/null 2>&1; then
 	fi
 fi
 
-IPERF_TARGET="${IPERF_TARGET:-172.16.100.247}"
+IPERF_TARGET="${IPERF_TARGET:-172.16.100.200}"
 IPERF_STREAMS=4
 CRASH_CYCLES="${CRASH_CYCLES:-3}"          # multi-cycle crash iterations
 TAKEOVER_TIMEOUT=5                          # max seconds for fw1 to take over

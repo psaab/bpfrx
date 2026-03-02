@@ -684,7 +684,7 @@ This tests two `META_FLAG_KERNEL_ROUTE` BPF fallback paths:
 
 ```bash
 # IPv4 forwarding test through SNAT:
-incus exec cluster-lan-host -- ping -c 30 -i 0.5 172.16.100.247 &
+incus exec cluster-lan-host -- ping -c 30 -i 0.5 172.16.100.200 &
 sleep 5
 incus exec bpfrx-fw0 -- systemctl restart bpfrxd
 # Expected: 28-29/30 received (1-2 packets lost during restart)
@@ -712,12 +712,12 @@ These verify that bulk TCP transfers survive VRRP failover without permanent
 connection death. The TCP cwnd should recover after a brief dip, not collapse.
 
 ```bash
-# Requires an iperf3 server reachable from WAN (e.g. casper at 172.16.100.247
+# Requires an iperf3 server reachable from WAN (e.g. casper at 172.16.100.200
 # for IPv4 or 2001:559:8585:100::247 for IPv6).
 
 # --- IPv4 iperf3 failover ---
 # 1. Start iperf3 on LAN host (60s, BBR for fast recovery)
-incus exec cluster-lan-host -- iperf3 -c 172.16.100.247 -t 60 -C bbr &
+incus exec cluster-lan-host -- iperf3 -c 172.16.100.200 -t 60 -C bbr &
 
 # 2. After 15s of steady state, stop primary (full VRRP failover)
 sleep 15

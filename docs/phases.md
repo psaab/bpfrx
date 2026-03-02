@@ -2009,7 +2009,7 @@ virtio-net). ICMP ping worked but TCP/UDP checksums were corrupted on egress.
 - Removed debug code (bpf_printk, XDP_PASS bypass) and unused `csum_v6_to_v4()` function
 
 ### Verified
-- NAT64 TCP: 3.91 Gbps (`iperf3 -c 64:ff9b::172.16.100.247`)
+- NAT64 TCP: 3.91 Gbps (`iperf3 -c 64:ff9b::172.16.100.200`)
 - NAT64 UDP: 1 Gbps, 0% loss
 - NAT64 ICMP: 0% loss
 - NAT44 TCP: 4.84 Gbps (no regression)

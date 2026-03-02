@@ -3,7 +3,7 @@
 #
 # Validates that active TCP connections survive fw0 reboot.
 # Requires: bpfrx-fw0, bpfrx-fw1, cluster-lan-host running.
-# Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.247).
+# Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.200).
 #
 # Tests:
 #   1. Start iperf3 -P2 through the firewall (LAN host → WAN target)
@@ -26,7 +26,7 @@ if ! incus list &>/dev/null 2>&1; then
 	fi
 fi
 
-IPERF_TARGET="${IPERF_TARGET:-172.16.100.247}"
+IPERF_TARGET="${IPERF_TARGET:-172.16.100.200}"
 IPERF_DURATION=120      # seconds — long enough to span retries + reboot + failback
 IPERF_STREAMS=8
 MIN_SESSIONS=4          # minimum established sessions (control + some data streams)

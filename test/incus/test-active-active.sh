@@ -9,7 +9,7 @@
 # when the RGs are split across nodes.
 #
 # Requires: bpfrx-fw0, bpfrx-fw1, cluster-lan-host running.
-# Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.247).
+# Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.200).
 #
 # Tests:
 #   1. Start iperf3 from LAN host through the firewall to WAN target
@@ -31,7 +31,7 @@ if ! incus list &>/dev/null 2>&1; then
 	fi
 fi
 
-IPERF_TARGET="${IPERF_TARGET:-172.16.100.247}"
+IPERF_TARGET="${IPERF_TARGET:-172.16.100.200}"
 IPERF_DURATION=90       # seconds — enough to span two failovers + settling
 IPERF_STREAMS=8
 SETTLE_WAIT=3           # seconds to let VRRP + election settle

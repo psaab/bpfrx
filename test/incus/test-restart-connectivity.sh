@@ -6,7 +6,7 @@
 # must run after VRRP MASTER (not before VIPs are installed).
 #
 # Requires: bpfrx-fw0, bpfrx-fw1, cluster-lan-host running.
-# Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.247).
+# Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.200).
 #
 # Tests:
 #   1. Verify baseline connectivity from cluster-lan-host → IPERF_TARGET
@@ -27,7 +27,7 @@ if ! incus list &>/dev/null 2>&1; then
 	fi
 fi
 
-IPERF_TARGET="${IPERF_TARGET:-172.16.100.247}"
+IPERF_TARGET="${IPERF_TARGET:-172.16.100.200}"
 RESTART_CYCLES="${RESTART_CYCLES:-3}"
 MAX_LOST_PINGS="${MAX_LOST_PINGS:-2}"       # allow 1-2 for VRRP transition
 PING_COUNT=40                                # pings per cycle (0.5s interval = 20s)

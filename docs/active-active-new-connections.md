@@ -62,7 +62,7 @@ On fw0 (LAN active, WAN inactive):
    **existing sessions** when the egress RG was inactive. New connections fell
    through to FIB lookup.
 
-3. `bpf_fib_lookup` for internet destination (e.g., 172.16.100.247):
+3. `bpf_fib_lookup` for internet destination (e.g., 172.16.100.200):
    - WAN RETH VIP (172.16.50.6) was removed when RG1 moved to fw1
    - Connected route to 172.16.50.0/24 is gone
    - Next-hop 172.16.50.1 becomes unreachable in FRR's RIB
@@ -430,10 +430,10 @@ if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
 ## Packet Flow: New ICMP Ping During Split
 
 ```
-cluster-lan-host (10.0.60.102) → ping 172.16.100.247
+cluster-lan-host (10.0.60.102) → ping 172.16.100.200
 
 1. Echo request arrives at fw0 ge-0-0-0 (LAN, RG2 active)
-   xdp_zone: zone=lan, no session, FIB for 172.16.100.247
+   xdp_zone: zone=lan, no session, FIB for 172.16.100.200
    FIB: main table has blackhole default (AD=250) → BLACKHOLE
    BLACKHOLE handler: no session → try_fabric_redirect_with_zone()
    Source MAC = 02:bf:72:fe:00:02 (zone 2 = lan)
@@ -443,7 +443,7 @@ cluster-lan-host (10.0.60.102) → ping 172.16.100.247
    xdp_zone: detect 02:bf:72:fe, ingress_zone=2 (lan), routing_table=254
    Pre-routing NAT: no match
    Session lookup: no session
-   FIB for 172.16.100.247 in main table: SUCCESS → ge-7-0-1.50 (WAN)
+   FIB for 172.16.100.200 in main table: SUCCESS → ge-7-0-1.50 (WAN)
    Egress RG check: RG1 active on fw1 → proceed normally
    → conntrack → policy (lan→wan: allow) → NAT (SNAT) → forward → WAN
 

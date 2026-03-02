@@ -677,9 +677,9 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 
 ## Open Investigation
 
-### Transient connectivity loss to 172.16.100.247 from cluster-lan-host after deploy restart (FIXED)
+### Transient connectivity loss to 172.16.100.200 from cluster-lan-host after deploy restart (FIXED)
 - **Status:** FIXED — root cause identified and resolved (#75)
-- **Symptom:** After `make cluster-deploy` restarts both fw0 and fw1, `ping 172.16.100.247` from `cluster-lan-host` fails (100% packet loss) for ~10-30s, then self-resolves
+- **Symptom:** After `make cluster-deploy` restarts both fw0 and fw1, `ping 172.16.100.200` from `cluster-lan-host` fails (100% packet loss) for ~10-30s, then self-resolves
 - **Root cause:** `resolveNeighbors()` ran during `applyConfig()` BEFORE VRRP MASTER transition installed RETH VIPs. Without VIPs, `RouteGet()` for WAN next-hops failed — no ARP entries were primed. The periodic neighbor resolver had a 15s blind spot (no initial run at goroutine start), so recovery waited for the first tick at ~15s
 - **Fix:**
   1. Skip `resolveNeighbors()` in cluster mode during `applyConfig()` (useless without VIPs)
