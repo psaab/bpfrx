@@ -4297,13 +4297,21 @@ func (d *Daemon) reconcileRGState() {
 		// continuous mismatch to avoid fighting transient states (VRRP
 		// sync-hold, election timers, hitless restart). Skip entirely
 		// during sync-hold when VRRP is intentionally suppressing preempt.
+		//
+		// NeedsMaster: only re-send priority update — do NOT call
+		// ForceRGMaster here. ForceRGMaster overrides preempt=false,
+		// which should only happen from explicit cluster operations
+		// (Secondary→Primary in watchClusterEvents). After a reboot
+		// the transition is SecondaryHold→Primary, which intentionally
+		// skips ForceRGMaster so VRRP respects non-preempt config.
+		// The priority update fixes the dropped-event case (#86) while
+		// letting VRRP's preempt logic decide whether to transition.
 		if d.vrrpMgr != nil && !d.vrrpMgr.InSyncHold() {
 			switch s.CheckVRRPPosture(time.Now()) {
 			case vrrpPostureNeedsMaster:
-				slog.Warn("reconcile: VRRP posture mismatch — cluster=primary but VRRP!=MASTER, forcing",
+				slog.Warn("reconcile: VRRP posture mismatch — cluster=primary but VRRP!=MASTER, re-sending priority",
 					"rg", rgID)
 				d.vrrpMgr.UpdateRGPriority(rgID, 200)
-				d.vrrpMgr.ForceRGMaster(rgID)
 			case vrrpPostureNeedsResign:
 				slog.Warn("reconcile: VRRP posture mismatch — cluster=secondary but VRRP=MASTER, resigning",
 					"rg", rgID)

@@ -395,6 +395,31 @@ func TestRGStateMachine_DesiredVsApplied_RetryOnFailure(t *testing.T) {
 	}
 }
 
+func TestRGStateMachine_CheckVRRPPosture_NoInstances(t *testing.T) {
+	s := newRGStateMachine()
+	now := time.Now()
+
+	// Cluster says primary, but NO VRRP instances exist (e.g. interface
+	// missing after reboot). Should never trigger posture correction.
+	s.SetCluster(true)
+
+	// First check — should return OK (no instances to correct).
+	if got := s.CheckVRRPPosture(now); got != vrrpPostureOK {
+		t.Errorf("no instances: expected OK, got %d", got)
+	}
+
+	// Even after delay — still OK because correction is impossible.
+	if got := s.CheckVRRPPosture(now.Add(20 * time.Second)); got != vrrpPostureOK {
+		t.Errorf("no instances after delay: expected OK, got %d", got)
+	}
+
+	// Cluster secondary, no instances — also OK.
+	s.SetCluster(false)
+	if got := s.CheckVRRPPosture(now.Add(30 * time.Second)); got != vrrpPostureOK {
+		t.Errorf("secondary no instances: expected OK, got %d", got)
+	}
+}
+
 func TestRGStateMachine_CheckVRRPPosture_NoMismatch(t *testing.T) {
 	s := newRGStateMachine()
 	now := time.Now()

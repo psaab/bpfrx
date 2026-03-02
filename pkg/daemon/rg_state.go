@@ -202,9 +202,9 @@ func (s *rgStateMachine) allMasterLocked() bool {
 }
 
 // vrrpPostureDelay is the minimum duration a VRRP posture mismatch must
-// persist before the reconcile loop takes corrective action (ForceRGMaster
-// or ResignRG). This delay prevents fighting with transient states like
-// VRRP sync-hold, election timers, and hitless restart.
+// persist before the reconcile loop takes corrective action (priority
+// re-send or ResignRG). This delay prevents fighting with transient
+// states like VRRP sync-hold, election timers, and hitless restart.
 const vrrpPostureDelay = 10 * time.Second
 
 // vrrpPostureMismatch describes the type of posture correction needed.
@@ -224,6 +224,13 @@ const (
 func (s *rgStateMachine) CheckVRRPPosture(now time.Time) vrrpPostureMismatch {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// If no VRRP instances exist for this RG (e.g. member interface
+	// missing after reboot), posture correction is impossible — skip.
+	if len(s.vrrpInstances) == 0 {
+		s.vrrpMismatchSince = time.Time{}
+		return vrrpPostureOK
+	}
 
 	anyMaster := s.anyMasterLocked()
 
