@@ -251,6 +251,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.vrrpMgr.Start(context.Background()); err != nil {
 		slog.Warn("failed to start VRRP manager", "err", err)
 	}
+	// On fresh cluster daemon start, suppress VRRP preemption until session
+	// bulk sync completes (or timeout) to avoid preempt-before-sync outages.
+	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
+		cc := cfg.Chassis.Cluster
+		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
+			d.vrrpMgr.SetSyncHold(30 * time.Second)
+		}
+	}
 
 	// Create dataplane backend (unless in config-only mode)
 	if !d.opts.NoDataplane {
@@ -3567,14 +3575,6 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				}
 				slog.Info("cluster: pushing config to reconnected peer")
 				d.pushConfigToPeer()
-			}
-
-			// Enable VRRP sync hold on fresh daemon start: suppress preemption
-			// until bulk session sync completes from the peer. This prevents
-			// the returning high-priority node from preempting before it has
-			// session state, which would break all existing connections.
-			if time.Since(d.startTime) < 30*time.Second {
-				d.vrrpMgr.SetSyncHold(30 * time.Second)
 			}
 
 			d.sessionSync.OnBulkSyncReceived = func() {

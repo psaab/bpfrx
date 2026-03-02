@@ -197,6 +197,22 @@ func (vi *vrrpInstance) updateConfig(cfg Instance) {
 	vi.mu.Unlock()
 }
 
+// suppressPreempt forces effective preempt to false while preserving the
+// configured desiredPreempt value for later restore.
+func (vi *vrrpInstance) suppressPreempt() {
+	vi.mu.Lock()
+	vi.cfg.Preempt = false
+	vi.mu.Unlock()
+}
+
+// setDesiredPreempt updates the configured preempt value that should be
+// restored when sync hold is released.
+func (vi *vrrpInstance) setDesiredPreempt(preempt bool) {
+	vi.mu.Lock()
+	vi.desiredPreempt = preempt
+	vi.mu.Unlock()
+}
+
 // restorePreempt sets cfg.Preempt to the configured (desired) value.
 // Called when sync hold is released to re-enable preemption.
 func (vi *vrrpInstance) restorePreempt() {
