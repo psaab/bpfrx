@@ -1,5 +1,9 @@
 # DPDK Dataplane for bpfrx — Architecture Plan
 
+Note: This is an architecture/planning document. For the current project-level
+decision and recommendation between DPDK and VPP, see
+`docs/dataplane-decision-dpdk-vs-vpp.md`.
+
 ## Overview
 
 Add a DPDK-based dataplane as an alternative to the current XDP/TC eBPF pipeline. The existing `pkg/dataplane.Manager` API is already well-abstracted — the daemon, CLI, gRPC, config system, and all subsystems interact through this interface, not through BPF-specific code. A DPDK implementation would swap the packet processing engine while keeping everything else unchanged.
