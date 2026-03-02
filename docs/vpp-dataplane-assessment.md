@@ -1,5 +1,9 @@
 # VPP Dataplane Assessment for bpfrx
 
+Note: This is a deep VPP-focused assessment. For the current project-level
+decision and recommendation between DPDK and VPP, see
+`docs/dataplane-decision-dpdk-vs-vpp.md`.
+
 *Date: 2026-02-19*
 
 ## Executive Summary
