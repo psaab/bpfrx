@@ -92,6 +92,7 @@ type vrrpInstance struct {
 	suppressGARP  atomic.Bool   // when true, becomeMaster() skips GARP/NA
 	garpEpoch     atomic.Uint64 // incremented on each becomeMaster() transition
 	lastGARPEpoch atomic.Uint64 // epoch of last completed sendGARP()
+	lastGARPTime  atomic.Int64  // Unix nanos of last GARP send (dampening)
 
 	// onEventDrop is called when an event is dropped due to a full eventCh.
 	// Set by the manager to trigger immediate reconciliation.
@@ -1065,6 +1066,16 @@ func (vi *vrrpInstance) sendGARP() {
 			"key", vi.key(), "epoch", epoch)
 		return
 	}
+	// Dampening: minimum 500ms between GARP bursts to avoid storms
+	// during rapid VRRP flaps.
+	const minGARPInterval = 500 * time.Millisecond
+	if last := vi.lastGARPTime.Load(); last > 0 {
+		if time.Since(time.Unix(0, last)) < minGARPInterval {
+			slog.Debug("vrrp: GARP dampened (too soon)",
+				"key", vi.key(), "elapsed", time.Since(time.Unix(0, last)))
+			return
+		}
+	}
 	count := vi.cfg.GARPCount
 	if count <= 0 {
 		count = 3 // default
@@ -1100,6 +1111,7 @@ func (vi *vrrpInstance) sendGARP() {
 		}
 	}
 	vi.lastGARPEpoch.Store(epoch)
+	vi.lastGARPTime.Store(time.Now().UnixNano())
 }
 
 // resolveIPv6LinkLocal deterministically selects the lowest non-VIP
