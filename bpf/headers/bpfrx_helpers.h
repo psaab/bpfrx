@@ -1869,7 +1869,20 @@ check_egress_rg_active(__u32 ifindex, __u16 vlan_id)
 		return 1; /* No RG — standalone or non-RETH, always active */
 	__u32 rg_key = ezv->rg_id;
 	__u8 *active = bpf_map_lookup_elem(&rg_active, &rg_key);
-	return (active && *active);
+	if (!active || !*active)
+		return 0;
+
+	/* Userspace liveness watchdog: if Go daemon hasn't written a
+	 * heartbeat within 2 seconds, treat RG as inactive (fail-closed
+	 * on SIGKILL/panic).  Value 0 = standalone/uninit → skip. */
+	__u64 *last_ts = bpf_map_lookup_elem(&ha_watchdog, &rg_key);
+	if (last_ts && *last_ts != 0) {
+		__u64 now_ns = bpf_ktime_get_ns();
+		__u64 now_s = now_ns / 1000000000ULL;
+		if (now_s - *last_ts > 2)
+			return 0;
+	}
+	return 1;
 }
 
 /* ============================================================

@@ -833,6 +833,21 @@ struct {
 } policer_states SEC(".maps");
 
 /* ============================================================
+ * HA userspace liveness watchdog (per-RG monotonic timestamp)
+ * Go daemon writes current CLOCK_MONOTONIC seconds every 500ms.
+ * BPF checks freshness in check_egress_rg_active(); if userspace
+ * hasn't written in >2s, treat the RG as inactive (fail-closed).
+ * Value of 0 means "not initialized" (standalone) — skip check.
+ * ============================================================ */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_REDUNDANCY_GROUPS);
+	__type(key, __u32);
+	__type(value, __u64);
+} ha_watchdog SEC(".maps");
+
+/* ============================================================
  * Per-IP session count maps (populated by Go GC sweep)
  * Used by xdp_screen for per-source/destination session limiting.
  * ============================================================ */

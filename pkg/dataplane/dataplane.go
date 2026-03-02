@@ -215,6 +215,7 @@ type DataPlane interface {
 	// Fabric cross-chassis forwarding
 	UpdateFabricFwd(info FabricFwdInfo) error
 	UpdateRGActive(rgID int, active bool) error
+	UpdateHAWatchdog(rgID int, timestamp uint64) error
 
 	// Persistent NAT table
 	GetPersistentNAT() *PersistentNATTable

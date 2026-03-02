@@ -835,13 +835,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		hitless = true // operator explicitly opted in
 	}
 
-	// In HA fail-closed mode, clear rg_active immediately so BPF stops
-	// forwarding traffic even if subsequent cleanup steps hang.
+	// In HA fail-closed mode, clear rg_active and watchdog immediately so
+	// BPF stops forwarding traffic even if subsequent cleanup steps hang.
 	if !hitless && d.dp != nil && cfg.Chassis.Cluster != nil {
 		slog.Info("HA shutdown: clearing rg_active for all RGs")
 		for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
 			if err := d.dp.UpdateRGActive(rg.ID, false); err != nil {
 				slog.Warn("failed to clear rg_active on shutdown", "rg", rg.ID, "err", err)
+			}
+			if err := d.dp.UpdateHAWatchdog(rg.ID, 0); err != nil {
+				slog.Warn("failed to clear ha_watchdog on shutdown", "rg", rg.ID, "err", err)
 			}
 		}
 	}
@@ -3485,6 +3488,32 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	vrfDevice := ""
 	if len(d.mgmtVRFInterfaces) > 0 {
 		vrfDevice = "vrf-mgmt"
+	}
+
+	// Start BPF watchdog heartbeat: write monotonic timestamp to ha_watchdog
+	// map every 500ms for each configured RG. If the daemon is SIGKILL'd,
+	// the timestamp goes stale and BPF stops forwarding within 2s.
+	if d.dp != nil && len(cc.RedundancyGroups) > 0 {
+		go func() {
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-commsCtx.Done():
+					return
+				case <-ticker.C:
+					var ts unix.Timespec
+					_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+					now := uint64(ts.Sec)
+					for _, rg := range cc.RedundancyGroups {
+						if err := d.dp.UpdateHAWatchdog(rg.ID, now); err != nil {
+							slog.Warn("ha watchdog write failed", "rg", rg.ID, "err", err)
+						}
+					}
+				}
+			}
+		}()
+		slog.Info("HA watchdog heartbeat started", "rgs", len(cc.RedundancyGroups))
 	}
 
 	// Start heartbeat if control-interface and peer-address are configured.

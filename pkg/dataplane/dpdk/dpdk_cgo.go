@@ -1182,6 +1182,8 @@ func (m *Manager) UpdateFabricFwd(info dataplane.FabricFwdInfo) error {
 	return nil
 }
 
+func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error { return nil }
+
 func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	shm := m.platform.shm
 	if shm == nil || shm.rg_active == nil {

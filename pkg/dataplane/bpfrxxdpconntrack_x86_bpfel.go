@@ -680,6 +680,7 @@ type bpfrxXdpConntrackMapSpecs struct {
 	FlowConfigMap     *ebpf.MapSpec `ebpf:"flow_config_map"`
 	FlowTimeouts      *ebpf.MapSpec `ebpf:"flow_timeouts"`
 	GlobalCounters    *ebpf.MapSpec `ebpf:"global_counters"`
+	HaWatchdog        *ebpf.MapSpec `ebpf:"ha_watchdog"`
 	IfaceFilterMap    *ebpf.MapSpec `ebpf:"iface_filter_map"`
 	IfaceZoneMap      *ebpf.MapSpec `ebpf:"iface_zone_map"`
 	InterfaceCounters *ebpf.MapSpec `ebpf:"interface_counters"`
@@ -768,6 +769,7 @@ type bpfrxXdpConntrackMaps struct {
 	FlowConfigMap     *ebpf.Map `ebpf:"flow_config_map"`
 	FlowTimeouts      *ebpf.Map `ebpf:"flow_timeouts"`
 	GlobalCounters    *ebpf.Map `ebpf:"global_counters"`
+	HaWatchdog        *ebpf.Map `ebpf:"ha_watchdog"`
 	IfaceFilterMap    *ebpf.Map `ebpf:"iface_filter_map"`
 	IfaceZoneMap      *ebpf.Map `ebpf:"iface_zone_map"`
 	InterfaceCounters *ebpf.Map `ebpf:"interface_counters"`
@@ -832,6 +834,7 @@ func (m *bpfrxXdpConntrackMaps) Close() error {
 		m.FlowConfigMap,
 		m.FlowTimeouts,
 		m.GlobalCounters,
+		m.HaWatchdog,
 		m.IfaceFilterMap,
 		m.IfaceZoneMap,
 		m.InterfaceCounters,

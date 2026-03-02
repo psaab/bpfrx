@@ -928,6 +928,17 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	return zm.Update(uint32(rgID), val, ebpf.UpdateAny)
 }
 
+// UpdateHAWatchdog writes the current monotonic timestamp (seconds) for a
+// redundancy group. BPF checks this to detect userspace liveness — if the
+// timestamp is stale (>2s), the RG is treated as inactive (fail-closed).
+func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error {
+	zm, ok := m.maps["ha_watchdog"]
+	if !ok {
+		return fmt.Errorf("ha_watchdog map not found")
+	}
+	return zm.Update(uint32(rgID), timestamp, ebpf.UpdateAny)
+}
+
 // SetStaticNATEntryV4 writes a static NAT v4 entry.
 func (m *Manager) SetStaticNATEntryV4(ip uint32, direction uint8, translated uint32) error {
 	zm, ok := m.maps["static_nat_v4"]
