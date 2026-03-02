@@ -17,7 +17,7 @@ Last updated: 2026-03-02
 | Screen/IDS Enhancements | 4 | 2 | 0 | 6 |
 | Security Flow Enhancements | 5 | 0 | 0 | 5 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
-| Security Logging Enhancements | 0 | 0 | 0 | 0 |
+| Security Logging Enhancements | 1 | 0 | 0 | 1 |
 | PKI / Certificates | 4 | 0 | 0 | 4 |
 | Routing Enhancements | 10 | 3 | 0 | 13 |
 | VPN Enhancements | 8 | 1 | 0 | 9 |
@@ -29,7 +29,7 @@ Last updated: 2026-03-02
 | Interface Enhancements | 1 | 1 | 0 | 2 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **121** | **14** | **4** | **139** |
+| **TOTAL** | **122** | **14** | **4** | **140** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -225,7 +225,7 @@ bpfrx has security logging with mode (stream/event), format, streams with host/p
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Structured Syslog Format** | `security log format structured` | Machine-parseable key-value syslog format (RT_FLOW_SESSION_CREATE, etc.) with standardized field names | Medium | Done (vSRX-compatible RT_FLOW format with `[junos@2636.1.1.1.2.129 ...]` SD wrapping) |
-| **Binary Log Format** | `security log format binary` | High-performance binary log format for off-box collector (requires Juniper log receiver) | Low | Done (not applicable — Juniper-proprietary format; bpfrx uses structured syslog and NetFlow v9 for off-box collection) |
+| **Binary Log Format** | `security log format binary` | High-performance binary log format for off-box collector (requires Juniper log receiver) | Low | Missing |
 | **Transport Protocol Selection** | `security log stream ... transport protocol tcp/tls` | Send security logs over TCP or TLS instead of UDP for reliable delivery | Medium | Done (TCP and TLS transport implemented) |
 | **Per-Policy Logging** | `security policies ... then log session-init session-close` | bpfrx has this but may not fully support all log fields (app-name, nat-*, nested-app, etc.) | Medium | Done (all key fields: policy-name, app, ingress-iface, client/server split, close-reason, session-id) |
 | **Log Event Mode** | `security log mode event` | Route security logs through eventd (control plane) for on-box processing, slower but allows local processing | Low | Done (event mode writes to local file) |
