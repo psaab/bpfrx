@@ -629,3 +629,31 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Root cause:** No fence/STONITH mechanism existed to tell the peer to stand down.
 - **Fix:** Added `syncMsgFence` message type. On heartbeat timeout with `peer-fencing disable-rg` configured, the surviving node sends a fence message via the fabric sync connection. The receiver disables all RGs (`rg_active=false`). Best-effort — if the sync connection is also down, falls back to normal heartbeat-driven failover. Fence events tracked in cluster history.
 - **Files:** `pkg/cluster/cluster.go`, `pkg/cluster/cluster_test.go`, `pkg/cluster/events.go`, `pkg/cluster/sync.go`, `pkg/cmdtree/tree.go`, `pkg/config/ast.go`, `pkg/config/compiler.go`, `pkg/config/types.go`, `pkg/config/parser_test.go`
+
+## Open Investigation
+
+### Transient connectivity loss to 172.16.100.247 from cluster-lan-host after deploy restart
+- **Status:** OPEN — needs further investigation
+- **Symptom:** After `make cluster-deploy` restarts both fw0 and fw1, `ping 172.16.100.247` from `cluster-lan-host` fails (100% packet loss). Meanwhile:
+  - `ping 1.1.1.1` from cluster-lan-host works (via same lan→wan path with SNAT)
+  - `ping 172.16.100.247` from fw0 directly works (kernel bypass, no BPF)
+  - Cluster status is healthy (fw0 primary for all RGs)
+  - Route exists: `172.16.100.0/24 *[Direct/0] > via ge-0-0-1.100`
+  - Resolves itself after ~10-30 seconds; iperf3 TCP sessions then establish fine
+- **Observed:** 2026-03-02 during HA sync hardening sprint deploy
+- **Likely causes to investigate:**
+  1. **ARP/NDP resolution delay on RETH VLAN 100:** After daemon restart, RETH MAC is reprogrammed (`programRethMAC` link DOWN→set MAC→UP). ARP entries for 172.16.100.247 may be stale or missing. The direct route via `ge-0-0-1.100` means `bpf_fib_lookup` needs a valid neighbor entry — `NO_NEIGH` (rc=7) would cause XDP_PASS fallback, but ICMP still fails
+  2. **GARP timing on VLAN sub-interface:** GARP is sent on RETH physical interface but may not reach VLAN 100 peers if VLAN tagging isn't applied to GARP frames
+  3. **Proxy ARP / neighbor entry race:** `ReconcileProxyARP()` runs after VIP reconciliation — NAT pool addresses on VLAN 100 may not have proxy ARP entries yet
+  4. **BPF FIB generation counter:** After deploy restart, FIB generation bumps but `bpf_fib_lookup` cache may serve stale entries briefly
+  5. **Session table pollution:** Stale sessions from pre-restart may match ICMP and get forwarded incorrectly (though ICMP typically creates new sessions)
+- **Reproduction steps:**
+  1. `make cluster-deploy` (restarts both nodes)
+  2. Immediately: `incus exec cluster-lan-host -- ping 172.16.100.247` → fails
+  3. Wait 30s, retry → succeeds
+- **Next steps:**
+  - Add `bpf_printk` tracing in `xdp_zone` and `xdp_forward` for 172.16.100.247 during the failure window
+  - Check `bpf_fib_lookup` return code during failure
+  - Check ARP table on fw0 for 172.16.100.247 immediately after restart vs after recovery
+  - Compare behavior with `set chassis cluster hitless-restart` (preserves BPF state — may not have the issue)
+  - Check if issue is specific to VLAN 100 sub-interface or also affects VLAN 50
