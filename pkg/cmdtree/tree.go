@@ -60,22 +60,22 @@ var OperationalTree = map[string]*Node{
 	"show": {Desc: "Show system information", Children: map[string]*Node{
 		"chassis": {Desc: "Show chassis information", Children: map[string]*Node{
 			"cluster": {Desc: "Show cluster/HA status", Children: map[string]*Node{
-			"status":      {Desc: "Show cluster node status"},
-			"interfaces":  {Desc: "Show cluster interfaces"},
-			"information": {Desc: "Show cluster configuration details"},
-			"statistics":  {Desc: "Show cluster statistics"},
-			"control-plane": {Desc: "Show control-plane information", Children: map[string]*Node{
-				"statistics": {Desc: "Show control-plane statistics"},
+				"status":      {Desc: "Show cluster node status"},
+				"interfaces":  {Desc: "Show cluster interfaces"},
+				"information": {Desc: "Show cluster configuration details"},
+				"statistics":  {Desc: "Show cluster statistics"},
+				"control-plane": {Desc: "Show control-plane information", Children: map[string]*Node{
+					"statistics": {Desc: "Show control-plane statistics"},
+				}},
+				"data-plane": {Desc: "Show data-plane information", Children: map[string]*Node{
+					"statistics": {Desc: "Show data-plane statistics"},
+					"interfaces": {Desc: "Show data-plane interfaces"},
+				}},
+				"ip-monitoring": {Desc: "Show IP monitoring information", Children: map[string]*Node{
+					"status": {Desc: "Show IP monitoring status"},
+				}},
+				"fence-status": {Desc: "Show peer fencing configuration and history"},
 			}},
-			"data-plane": {Desc: "Show data-plane information", Children: map[string]*Node{
-				"statistics": {Desc: "Show data-plane statistics"},
-				"interfaces": {Desc: "Show data-plane interfaces"},
-			}},
-			"ip-monitoring": {Desc: "Show IP monitoring information", Children: map[string]*Node{
-				"status": {Desc: "Show IP monitoring status"},
-			}},
-			"fence-status": {Desc: "Show peer fencing configuration and history"},
-		}},
 			"alarms":         {Desc: "Show chassis alarm status"},
 			"environment":    {Desc: "Show chassis environment"},
 			"hardware":       {Desc: "Show installed hardware components"},
@@ -129,11 +129,23 @@ var OperationalTree = map[string]*Node{
 				"longer":   {Desc: "More-specific (longer) prefixes"},
 				"orlonger": {Desc: "Equal or more-specific prefixes"},
 			}},
-			"terse":         {Desc: "Display terse output"},
-			"detail":        {Desc: "Display detailed output"},
-			"summary":       {Desc: "Show routing table statistics"},
-			"table":         {Desc: "Show routes in named routing table"},
-			"protocol":      {Desc: "Show routes learned from named protocol"},
+			"terse":   {Desc: "Display terse output"},
+			"detail":  {Desc: "Display detailed output"},
+			"summary": {Desc: "Show routing table statistics"},
+			"table": {Desc: "Show routes in named routing table", DynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil {
+					return []string{"inet.0", "inet6.0"}
+				}
+				// Include main tables plus per-instance tables.
+				names := []string{"inet.0", "inet6.0"}
+				for _, ri := range cfg.RoutingInstances {
+					names = append(names, ri.Name+".inet.0", ri.Name+".inet6.0")
+				}
+				return names
+			}},
+			"protocol": {Desc: "Show routes learned from named protocol", DynamicFn: func(_ *config.Config) []string {
+				return []string{"static", "direct", "local", "ospf", "bgp", "rip", "isis", "kernel", "connected"}
+			}},
 			"instance": {Desc: "Show routes for a routing instance", DynamicFn: func(cfg *config.Config) []string {
 				if cfg == nil {
 					return nil
@@ -162,9 +174,9 @@ var OperationalTree = map[string]*Node{
 			"policies": {Desc: "Show security firewall policies", Children: map[string]*Node{
 				"global":      {Desc: "Show global security policy information"},
 				"policy-name": {Desc: "Show policy matching a specific name"},
-				"brief":     {Desc: "Show brief policy summary"},
-				"detail":    {Desc: "Show detailed policy information"},
-				"hit-count": {Desc: "Show policy hit counters [from-zone X to-zone Y]"},
+				"brief":       {Desc: "Show brief policy summary"},
+				"detail":      {Desc: "Show detailed policy information"},
+				"hit-count":   {Desc: "Show policy hit counters [from-zone X to-zone Y]"},
 				"from-zone": {Desc: "Filter by source zone", DynamicFn: func(cfg *config.Config) []string {
 					if cfg == nil {
 						return nil
@@ -281,22 +293,22 @@ var OperationalTree = map[string]*Node{
 			}},
 			"nat": {Desc: "Show Network Address Translation information", Children: map[string]*Node{
 				"source": {Desc: "Show source NAT", Children: map[string]*Node{
-					"summary":              {Desc: "Show source NAT summary"},
-					"pool":                 {Desc: "Show source NAT pools"},
+					"summary": {Desc: "Show source NAT summary"},
+					"pool":    {Desc: "Show source NAT pools"},
 					"persistent-nat-table": {Desc: "Show persistent NAT bindings", Children: map[string]*Node{
 						"detail": {Desc: "Show detailed persistent NAT bindings"},
 					}},
 					"rule": {Desc: "Show source NAT rules", Children: map[string]*Node{
 						"detail": {Desc: "Show detailed source NAT rules"},
 					}},
-					"rule-set":             {Desc: "Show source NAT rule sets"},
+					"rule-set": {Desc: "Show source NAT rule sets"},
 					"deterministic-nat": {Desc: "Show deterministic NAT information", Children: map[string]*Node{
 						"nat-table": {Desc: "Show deterministic NAT mapping table"},
 					}},
 				}},
 				"destination": {Desc: "Show destination NAT", Children: map[string]*Node{
-					"summary":  {Desc: "Show destination NAT summary"},
-					"pool":     {Desc: "Show destination NAT pools"},
+					"summary": {Desc: "Show destination NAT summary"},
+					"pool":    {Desc: "Show destination NAT pools"},
 					"rule": {Desc: "Show destination NAT rules", Children: map[string]*Node{
 						"detail": {Desc: "Show detailed destination NAT rules"},
 					}},
@@ -366,17 +378,17 @@ var OperationalTree = map[string]*Node{
 				"routes":    {Desc: "Show OSPF routes"},
 			}},
 			"bgp": {Desc: "Show BGP information", Children: map[string]*Node{
-				"summary":  {Desc: "Show BGP peer summary"},
-				"routes":   {Desc: "Show BGP routes"},
+				"summary": {Desc: "Show BGP peer summary"},
+				"routes":  {Desc: "Show BGP routes"},
 				"neighbor": {Desc: "Show BGP neighbor details", Children: map[string]*Node{
-					"received-routes":  {Desc: "Show received routes from neighbor"},
+					"received-routes":   {Desc: "Show received routes from neighbor"},
 					"advertised-routes": {Desc: "Show advertised routes to neighbor"},
 				}},
 			}},
 			"bfd": {Desc: "Show BFD status", Children: map[string]*Node{
 				"peers": {Desc: "Show BFD peer status"},
 			}},
-			"rip":  {Desc: "Show RIP information"},
+			"rip": {Desc: "Show RIP information"},
 			"isis": {Desc: "Show IS-IS information", Children: map[string]*Node{
 				"adjacency": {Desc: "Show IS-IS adjacencies", Children: map[string]*Node{
 					"detail": {Desc: "Show detailed IS-IS adjacency information"},
@@ -389,8 +401,8 @@ var OperationalTree = map[string]*Node{
 			}},
 		}},
 		"bgp": {Desc: "Show BGP information (alias for show protocols bgp)", Children: map[string]*Node{
-			"summary":  {Desc: "Show BGP peer summary"},
-			"routes":   {Desc: "Show BGP routes"},
+			"summary": {Desc: "Show BGP peer summary"},
+			"routes":  {Desc: "Show BGP routes"},
 			"neighbor": {Desc: "Show BGP neighbor details", Children: map[string]*Node{
 				"received-routes":   {Desc: "Show received routes from neighbor"},
 				"advertised-routes": {Desc: "Show advertised routes to neighbor"},
@@ -403,8 +415,8 @@ var OperationalTree = map[string]*Node{
 			"neighbors":            {Desc: "Show IPv6 neighbor cache"},
 			"router-advertisement": {Desc: "Show Router Advertisement status"},
 		}},
-		"schedulers":        {Desc: "Show policy schedulers"},
-		"dhcp-relay":        {Desc: "Show DHCP relay status"},
+		"schedulers": {Desc: "Show policy schedulers"},
+		"dhcp-relay": {Desc: "Show DHCP relay status"},
 		"dhcp-server": {Desc: "Show DHCP server leases", Children: map[string]*Node{
 			"detail": {Desc: "Show detailed DHCP server information with pool utilization"},
 		}},
@@ -420,20 +432,20 @@ var OperationalTree = map[string]*Node{
 			"commit": {Desc: "Show pending and historical commit information", Children: map[string]*Node{
 				"history": {Desc: "Show recent commit log"},
 			}},
-			"connections":   {Desc: "Show system connection activity"},
-			"core-dumps":    {Desc: "Show system core dumps"},
+			"connections": {Desc: "Show system connection activity"},
+			"core-dumps":  {Desc: "Show system core dumps"},
 			"rollback": {Desc: "Show rolled back configuration", Children: map[string]*Node{
 				"compare": {Desc: "Compare rollback with active config"},
 			}},
-			"backup-router":      {Desc: "Show backup router configuration"},
+			"backup-router": {Desc: "Show backup router configuration"},
 			"buffers": {Desc: "Show buffer utilization", Children: map[string]*Node{
 				"detail": {Desc: "Show detailed per-map statistics"},
 			}},
-			"internet-options":   {Desc: "Show internet options"},
-			"license":            {Desc: "Show system license"},
-			"login":              {Desc: "Show login configuration"},
-			"memory":             {Desc: "Show system memory usage"},
-			"ntp":                {Desc: "Show NTP status"},
+			"internet-options": {Desc: "Show internet options"},
+			"license":          {Desc: "Show system license"},
+			"login":            {Desc: "Show login configuration"},
+			"memory":           {Desc: "Show system memory usage"},
+			"ntp":              {Desc: "Show NTP status"},
 			"processes": {Desc: "Show system process table", Children: map[string]*Node{
 				"summary": {Desc: "Show summary of system processes (top-like view)"},
 			}},
@@ -441,25 +453,25 @@ var OperationalTree = map[string]*Node{
 			"configuration": {Desc: "Show configuration info", Children: map[string]*Node{
 				"rescue": {Desc: "Show rescue configuration"},
 			}},
-			"services":           {Desc: "Show configured system services"},
-			"storage":            {Desc: "Show local filesystem usage"},
-			"syslog":             {Desc: "Show system syslog configuration"},
-			"uptime":             {Desc: "Show time since last reboot"},
-			"users":              {Desc: "Show configured login users"},
+			"services": {Desc: "Show configured system services"},
+			"storage":  {Desc: "Show local filesystem usage"},
+			"syslog":   {Desc: "Show system syslog configuration"},
+			"uptime":   {Desc: "Show time since last reboot"},
+			"users":    {Desc: "Show configured login users"},
 		}},
-		"task": {Desc: "Show daemon task/runtime information"},
-		"route-map":          {Desc: "Show route-map information"},
-		"routing-options":    {Desc: "Show routing options"},
+		"task":            {Desc: "Show daemon task/runtime information"},
+		"route-map":       {Desc: "Show route-map information"},
+		"routing-options": {Desc: "Show routing options"},
 		"routing-instances": {Desc: "Show routing instances", Children: map[string]*Node{
 			"detail": {Desc: "Show detailed routing instance information"},
 		}},
-		"policy-options":     {Desc: "Show policy options"},
-		"event-options":      {Desc: "Show event policies"},
+		"policy-options": {Desc: "Show policy options"},
+		"event-options":  {Desc: "Show event policies"},
 		"forwarding-options": {Desc: "Show forwarding options", Children: map[string]*Node{
 			"port-mirroring": {Desc: "Show port mirroring instances"},
 		}},
-		"vlans":              {Desc: "Show VLAN configuration"},
-		"version":            {Desc: "Show software process revision levels"},
+		"vlans":   {Desc: "Show VLAN configuration"},
+		"version": {Desc: "Show software process revision levels"},
 		"monitor": {Desc: "Show monitor information", Children: map[string]*Node{
 			"security": {Desc: "Show security monitor information", Children: map[string]*Node{
 				"flow": {Desc: "Show security flow monitor status"},
@@ -615,15 +627,50 @@ var OperationalTree = map[string]*Node{
 		"chassis": {Desc: "Perform chassis-specific operations", Children: map[string]*Node{
 			"cluster": {Desc: "Cluster operations", Children: map[string]*Node{
 				"failover": {Desc: "Trigger cluster failover", Children: map[string]*Node{
-					"redundancy-group": {Desc: "Failover a specific redundancy group"},
-					"reset":            {Desc: "Reset manual failover", Children: map[string]*Node{
-						"redundancy-group": {Desc: "Reset failover for a redundancy group"},
+					"redundancy-group": {Desc: "Failover a specific redundancy group", DynamicFn: func(cfg *config.Config) []string {
+						if cfg == nil || cfg.Chassis.Cluster == nil {
+							return nil
+						}
+						names := make([]string, 0, len(cfg.Chassis.Cluster.RedundancyGroups))
+						for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+							names = append(names, fmt.Sprintf("%d", rg.ID))
+						}
+						return names
+					}, Children: map[string]*Node{
+						"node": {Desc: "Target node ID (local or peer)", DynamicFn: func(cfg *config.Config) []string {
+							if cfg == nil || cfg.Chassis.Cluster == nil {
+								return []string{"0", "1"}
+							}
+							// Cluster is currently 2-node only.
+							return []string{"0", "1"}
+						}},
+					}},
+					"reset": {Desc: "Reset manual failover", Children: map[string]*Node{
+						"redundancy-group": {Desc: "Reset failover for a redundancy group", DynamicFn: func(cfg *config.Config) []string {
+							if cfg == nil || cfg.Chassis.Cluster == nil {
+								return nil
+							}
+							names := make([]string, 0, len(cfg.Chassis.Cluster.RedundancyGroups))
+							for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+								names = append(names, fmt.Sprintf("%d", rg.ID))
+							}
+							return names
+						}},
 					}},
 				}},
 			}},
 		}},
 		"dhcp": {Desc: "Perform DHCP operations", Children: map[string]*Node{
-			"renew": {Desc: "Renew DHCP lease on an interface"},
+			"renew": {Desc: "Renew DHCP lease on an interface", DynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil || cfg.Interfaces.Interfaces == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+				for name := range cfg.Interfaces.Interfaces {
+					names = append(names, name)
+				}
+				return names
+			}},
 		}},
 		"protocols": {Desc: "Protocol operations", Children: map[string]*Node{
 			"ospf": {Desc: "OSPF operations", Children: map[string]*Node{
@@ -715,10 +762,10 @@ var OperationalTree = map[string]*Node{
 		}},
 	}},
 	"ping": {Desc: "Ping remote host", Children: map[string]*Node{
-		"<host>":  {Desc: "Hostname or IP address of remote host"},
-		"count":   {Desc: "Number of ping requests to send"},
-		"source":  {Desc: "Source address to use"},
-		"size":    {Desc: "Request data size in bytes"},
+		"<host>": {Desc: "Hostname or IP address of remote host"},
+		"count":  {Desc: "Number of ping requests to send"},
+		"source": {Desc: "Source address to use"},
+		"size":   {Desc: "Request data size in bytes"},
 		"routing-instance": {Desc: "Routing instance for route lookup", DynamicFn: func(cfg *config.Config) []string {
 			if cfg == nil {
 				return nil
@@ -744,8 +791,8 @@ var OperationalTree = map[string]*Node{
 			return names
 		}},
 	}},
-	"quit":       {Desc: "Exit CLI"},
-	"exit":       {Desc: "Exit CLI"},
+	"quit": {Desc: "Exit CLI"},
+	"exit": {Desc: "Exit CLI"},
 }
 
 // ConfigTopLevel defines tab completion for config mode top-level commands.
@@ -828,8 +875,15 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 			}
 			// Check for placeholder node that consumes any value
 			if ph := findPlaceholder(current); ph != nil {
-				// Placeholder consumed this word; stay at same tree level
-				// so sibling options remain available for completion
+				// Placeholder consumed this word. If the placeholder has
+				// children, descend so follow-on keywords can complete
+				// (e.g. "show route <dest> exact"). Otherwise stay at this
+				// level so sibling options remain available (e.g. "ping
+				// <host> count").
+				if ph.Children != nil {
+					currentNode = ph
+					current = ph.Children
+				}
 				dynamicConsumed = true
 				continue
 			}
@@ -870,6 +924,10 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 			}
 			// Check for placeholder node that consumes any value
 			if ph := findPlaceholder(current); ph != nil {
+				if ph.Children != nil {
+					currentNode = ph
+					current = ph.Children
+				}
 				dynamicConsumed = true
 				continue
 			}
@@ -958,11 +1016,15 @@ func LookupDesc(words []string, name string, configMode bool) string {
 		node, ok := current[w]
 		if !ok {
 			// Dynamic value — skip but stay at same children level.
-			if currentNode != nil && currentNode.DynamicFn != nil {
+			if currentNode != nil && currentNode.HasDynamic() {
 				continue
 			}
 			// Placeholder node consumes any value.
-			if findPlaceholder(current) != nil {
+			if ph := findPlaceholder(current); ph != nil {
+				if ph.Children != nil {
+					currentNode = ph
+					current = ph.Children
+				}
 				continue
 			}
 			return ""
