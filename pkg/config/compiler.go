@@ -6056,6 +6056,8 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 				}
 			case "preempt":
 				rg.Preempt = true
+			case "strict-vip-ownership":
+				rg.StrictVIPOwnership = true
 			case "interface-monitor":
 				for _, ifChild := range child.Children {
 					im := &InterfaceMonitor{

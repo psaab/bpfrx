@@ -87,9 +87,10 @@ type RedundancyGroup struct {
 	ID                 int
 	NodePriorities     map[int]int // node-id -> priority
 	GratuitousARPCount int
-	Preempt            bool
-	InterfaceMonitors  []*InterfaceMonitor
-	IPMonitoring       *IPMonitoring
+	Preempt              bool
+	StrictVIPOwnership   bool
+	InterfaceMonitors    []*InterfaceMonitor
+	IPMonitoring         *IPMonitoring
 }
 
 // InterfaceMonitor defines an interface health monitor within a redundancy group.
