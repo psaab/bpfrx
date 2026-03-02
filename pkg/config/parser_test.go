@@ -8383,6 +8383,79 @@ func TestChassisClusterRethAdvertiseIntervalHierarchical(t *testing.T) {
 	}
 }
 
+func TestChassisClusterHitlessRestartSet(t *testing.T) {
+	tree := &ConfigTree{}
+	sets := []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster node 0",
+		"set chassis cluster hitless-restart",
+	}
+	for _, line := range sets {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tree.SetPath(cmd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if !cfg.Chassis.Cluster.HitlessRestart {
+		t.Error("HitlessRestart = false, want true")
+	}
+}
+
+func TestChassisClusterHitlessRestartHierarchical(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+        hitless-restart;
+    }
+}`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if !cfg.Chassis.Cluster.HitlessRestart {
+		t.Error("HitlessRestart = false, want true")
+	}
+}
+
+func TestChassisClusterHitlessRestartDefault(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+    }
+}`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if cfg.Chassis.Cluster.HitlessRestart {
+		t.Error("HitlessRestart = true, want false (default)")
+	}
+}
+
 func TestChassisClusterIPMonitoring(t *testing.T) {
 	input := `chassis {
     cluster {

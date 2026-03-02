@@ -1471,6 +1471,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"nat-state-synchronization":      {children: nil},
 			"ipsec-session-synchronization":  {children: nil},
 			"reth-advertise-interval":       {args: 1, children: nil},
+			"hitless-restart":               {children: nil},
 			"redundancy-group": {args: 1, children: map[string]*schemaNode{
 				"node": {args: 1, children: map[string]*schemaNode{
 					"priority": {args: 1, children: nil},

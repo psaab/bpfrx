@@ -796,17 +796,35 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cluster.Stop()
 	}
 
-	// For hitless restarts, preserve all control-plane state so the next
-	// daemon inherits working routes, DHCP leases, VRFs, and tunnels.
-	// BPF programs keep running via pinned links; leaving FRR routes and
-	// interface addresses intact means zero forwarding disruption.
-	//
-	// Only close Go file handles — pinned BPF maps/links survive in-kernel.
-	// Full teardown (DHCP release, route removal, VRF cleanup) is done
-	// by "bpfrxd cleanup".
+	// Determine shutdown mode: in HA mode, default to fail-closed teardown
+	// to prevent a stopped/crashed node from continuing to forward traffic.
+	// Standalone mode preserves state for hitless restarts.
+	cfg := d.store.ActiveConfig()
+	haMode := cfg != nil && cfg.Chassis.Cluster != nil
+	hitless := !haMode // standalone = hitless by default
+	if haMode && cfg.Chassis.Cluster.HitlessRestart {
+		hitless = true // operator explicitly opted in
+	}
+
 	if d.dp != nil {
 		logFinalStats(d.dp)
-		d.dp.Close()
+		if hitless {
+			// Hitless: close Go handles only — BPF programs keep running.
+			slog.Info("hitless shutdown: preserving BPF state")
+			d.dp.Close()
+		} else {
+			// Fail-closed: clear rg_active for all RGs so the peer
+			// takes over, then fully tear down pinned BPF state.
+			slog.Info("HA shutdown: clearing rg_active and tearing down BPF state")
+			if cfg.Chassis.Cluster != nil {
+				for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+					if err := d.dp.UpdateRGActive(rg.ID, false); err != nil {
+						slog.Warn("failed to clear rg_active on shutdown", "rg", rg.ID, "err", err)
+					}
+				}
+			}
+			d.dp.Teardown()
+		}
 	}
 
 	slog.Info("shutdown complete")

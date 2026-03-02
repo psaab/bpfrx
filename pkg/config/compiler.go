@@ -5996,6 +5996,9 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 			}
 		}
 	}
+	if clusterNode.FindChild("hitless-restart") != nil {
+		ch.Cluster.HitlessRestart = true
+	}
 
 	for _, rgInst := range namedInstances(clusterNode.FindChildren("redundancy-group")) {
 		rgID := 0

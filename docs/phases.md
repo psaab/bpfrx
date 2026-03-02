@@ -2245,3 +2245,23 @@ where interleaved goroutine transitions could apply stale rg_active state.
 - Filter matching: src/dst prefix, port, protocol, interface, combined
 - State lifecycle: file config, filter persistence, start preconditions
 - Format helpers: extractIP, extractPort, formatFlowEvent, formatPacketDropEvent
+
+## Sprint: HA Fail-Closed Shutdown (#68)
+
+In HA mode, a stopped or crashed daemon must not leave stale BPF programs forwarding traffic
+without session management. This sprint changes the default shutdown behavior:
+
+- **Standalone mode (default):** hitless — preserves pinned BPF state for zero-disruption restart
+- **HA mode (default):** fail-closed — clears `rg_active` for all RGs, then tears down all pinned BPF state
+- **HA + hitless-restart:** opt-in via `set chassis cluster hitless-restart` to preserve BPF state
+
+### Implementation
+- `pkg/config/types.go`: `HitlessRestart bool` on `ClusterConfig`
+- `pkg/config/ast.go`: `hitless-restart` schema node under chassis cluster
+- `pkg/config/compiler.go`: compiles `hitless-restart` flag
+- `pkg/daemon/daemon.go`: conditional shutdown — standalone=hitless, HA=teardown, HA+hitless-restart=hitless
+
+### Tests
+- 3 parser tests: set syntax, hierarchical syntax, default-false verification
+- Verified standalone VM logs "hitless shutdown: preserving BPF state"
+- Known: `SessionSync.Stop()` blocks on WaitGroup in HA mode (pre-existing — sync reconnect loop doesn't exit cleanly within systemd's 20s timeout)
