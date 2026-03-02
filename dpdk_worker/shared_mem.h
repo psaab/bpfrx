@@ -392,13 +392,15 @@ struct scan_track_value {
 #define MAX_NAT_POOL_IPS_PER_POOL 256
 #define SNAT_MODE_OFF             0xFF
 #define MAX_SNAT_RULES_PER_PAIR   8
+#define NAT_POOL_FLAG_ADDR_PERSISTENT             0x1
+#define NAT_POOL_FLAG_PORT_RANDOMIZATION_DISABLE  0x2
 
 struct nat_pool_config {
 	uint16_t num_ips;
 	uint16_t num_ips_v6;
 	uint16_t port_low;
 	uint16_t port_high;
-	uint8_t  addr_persistent;
+	uint8_t  addr_persistent;    /* NAT_POOL_FLAG_* bitfield */
 	uint8_t  deterministic;     /* 0=off, 1=IPv4 host, 2=IPv6 host */
 	uint16_t block_size;        /* ports per subscriber */
 	uint32_t host_base;         /* subscriber range base IP (deterministic==1) */

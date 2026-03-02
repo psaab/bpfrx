@@ -3,6 +3,9 @@
 Date: 2026-03-01  
 Status: Proposed
 
+Related:
+- Same-L2 ownership mode proposal: `docs/next-features/ha-same-l2-vip-ownership.md` (issue #104)
+
 ## Problem
 
 Recent hardening fixed major VRRP failover bugs, but several edge cases can still

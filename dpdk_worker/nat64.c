@@ -13,11 +13,26 @@
 #include <rte_hash.h>
 #include <rte_ether.h>
 #include <rte_byteorder.h>
+#include <rte_random.h>
 #include <string.h>
 
 #include "shared_mem.h"
 #include "tables.h"
 #include "counters.h"
+
+static inline uint64_t
+nat64_port_seq_next(struct pipeline_ctx *ctx)
+{
+	return ctx->snat_port_counter++ * MAX_LCORES + ctx->lcore_id;
+}
+
+static inline uint32_t
+nat64_port_selector(const struct nat_pool_config *cfg, uint64_t seq)
+{
+	if (cfg->addr_persistent & NAT_POOL_FLAG_PORT_RANDOMIZATION_DISABLE)
+		return (uint32_t)seq;
+	return (uint32_t)rte_rand();
+}
 
 /**
  * icmpv4_type_to_v6 — Map ICMPv4 type/code to ICMPv6.
@@ -147,9 +162,11 @@ nat64_translate(struct rte_mbuf *pkt, struct pkt_meta *meta,
 									uint32_t port_start =
 										cfg->port_low +
 										block_idx * cfg->block_size;
+									uint64_t seq = nat64_port_seq_next(ctx);
+									uint32_t selector =
+										nat64_port_selector(cfg, seq);
 									uint32_t offset =
-										(uint32_t)(ctx->snat_port_counter++) %
-										cfg->block_size;
+										selector % cfg->block_size;
 									uint16_t port =
 										(uint16_t)(port_start + offset);
 									if (port <= cfg->port_high) {

@@ -13,6 +13,7 @@
 #include <rte_lpm.h>
 #include <rte_lpm6.h>
 #include <rte_byteorder.h>
+#include <rte_random.h>
 
 #include "shared_mem.h"
 #include "tables.h"
@@ -60,6 +61,20 @@ lpm_lookup_addr_id(struct pipeline_ctx *ctx, struct pkt_meta *meta,
 
 	/* Direct match: next_hop IS the address_id */
 	return (next_hop == required_id) ? required_id : 0;
+}
+
+static inline uint64_t
+nat_port_seq_next(struct pipeline_ctx *ctx)
+{
+	return ctx->snat_port_counter++ * MAX_LCORES + ctx->lcore_id;
+}
+
+static inline uint32_t
+nat_port_selector(const struct nat_pool_config *cfg, uint64_t seq)
+{
+	if (cfg->addr_persistent & NAT_POOL_FLAG_PORT_RANDOMIZATION_DISABLE)
+		return (uint32_t)seq;
+	return (uint32_t)rte_rand();
 }
 
 /**
@@ -258,9 +273,9 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 												if (alloc_ip != 0) {
 													uint32_t port_start = cfg->port_low +
 														block_idx * cfg->block_size;
-													uint32_t offset =
-														(uint32_t)(ctx->snat_port_counter++) %
-														cfg->block_size;
+													uint64_t seq = nat_port_seq_next(ctx);
+													uint32_t selector = nat_port_selector(cfg, seq);
+													uint32_t offset = selector % cfg->block_size;
 													uint16_t port =
 														(uint16_t)(port_start + offset);
 													if (port <= cfg->port_high) {
@@ -299,13 +314,13 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 								if (port_range == 0)
 									port_range = 1;
 
-								uint64_t val = ctx->snat_port_counter++
-									* MAX_LCORES + ctx->lcore_id;
+								uint64_t val = nat_port_seq_next(ctx);
+								uint32_t selector = nat_port_selector(cfg, val);
 								uint16_t port = cfg->port_low +
-									(uint16_t)(val % port_range);
+									(uint16_t)(selector % port_range);
 
 								uint32_t ip_idx;
-								if (cfg->addr_persistent)
+								if (cfg->addr_persistent & NAT_POOL_FLAG_ADDR_PERSISTENT)
 									ip_idx = meta->src_ip.v4 % cfg->num_ips;
 								else
 									ip_idx = (uint32_t)(
@@ -390,13 +405,13 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 								if (port_range == 0)
 									port_range = 1;
 
-								uint64_t val = ctx->snat_port_counter++
-									* MAX_LCORES + ctx->lcore_id;
+								uint64_t val = nat_port_seq_next(ctx);
+								uint32_t selector = nat_port_selector(cfg, val);
 								uint16_t port = cfg->port_low +
-									(uint16_t)(val % port_range);
+									(uint16_t)(selector % port_range);
 
 								uint32_t ip_idx;
-								if (cfg->addr_persistent) {
+								if (cfg->addr_persistent & NAT_POOL_FLAG_ADDR_PERSISTENT) {
 									uint32_t hash = 0;
 									for (int i = 0; i < 4; i++)
 										hash ^= ((uint32_t *)meta->src_ip.v6)[i];

@@ -1626,6 +1626,21 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					}
 				}
 				pool.PersistentNAT = pnat
+			case "port-randomization":
+				// Junos syntax:
+				//   port-randomization disable;
+				//   port-randomization { disable; }
+				if len(prop.Keys) >= 2 && prop.Keys[1] == "disable" {
+					pool.PortRandomizationDisable = true
+				}
+				if v := nodeVal(prop); v == "disable" {
+					pool.PortRandomizationDisable = true
+				}
+				for _, child := range prop.Children {
+					if child.Name() == "disable" || nodeVal(child) == "disable" {
+						pool.PortRandomizationDisable = true
+					}
+				}
 			}
 		}
 		if pool.PortLow == 0 {

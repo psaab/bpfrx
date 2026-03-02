@@ -309,11 +309,29 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	return 0;
 }
 
+static __always_inline __u64
+nat_port_seq_next(struct nat_port_counter *ctr)
+{
+	/* CPU-interleaved sequence:
+	 * CPU0: 0,16,32..., CPU1: 1,17,33..., etc.
+	 * Reduces duplicate port picks across per-CPU counters. */
+	__u32 cpu = bpf_get_smp_processor_id() & 0xF;
+	return ctr->counter++ * 16 + cpu;
+}
+
+static __always_inline __u32
+nat_port_selector(const struct nat_pool_config *cfg, __u64 seq)
+{
+	if (cfg->addr_persistent & NAT_POOL_FLAG_PORT_RANDOMIZATION_DISABLE)
+		return (__u32)seq;
+	return bpf_get_prandom_u32();
+}
+
 /*
  * Allocate a NAT IP and port from a pool (IPv4).
  * src_ip: original source IP for address-persistent mode.
  * Returns 0 on success, -1 on failure.
- */
+*/
 static __noinline int
 nat_pool_alloc_v4(__u8 pool_id, __be32 src_ip, __be32 *out_ip, __be16 *out_port)
 {
@@ -326,21 +344,18 @@ nat_pool_alloc_v4(__u8 pool_id, __be32 src_ip, __be32 *out_ip, __be16 *out_port)
 	if (!ctr)
 		return -1;
 
-	/* CPU-interleaved counter: each CPU gets distinct port sequence.
-	 * CPU 0: 0,16,32..., CPU 1: 1,17,33..., etc.
-	 * Avoids cross-CPU collisions on PERCPU counters. */
-	__u32 cpu = bpf_get_smp_processor_id() & 0xF;
-	__u64 val = ctr->counter++ * 16 + cpu;
+	__u64 seq = nat_port_seq_next(ctr);
 	__u32 port_range = cfg->port_high - cfg->port_low + 1;
 	if (port_range == 0)
 		port_range = 1;
-	__u16 port = cfg->port_low + (__u16)(val % port_range);
+	__u32 selector = nat_port_selector(cfg, seq);
+	__u16 port = cfg->port_low + (__u16)(selector % port_range);
 
 	__u32 ip_idx;
-	if (cfg->addr_persistent)
+	if (cfg->addr_persistent & NAT_POOL_FLAG_ADDR_PERSISTENT)
 		ip_idx = ((__u32)src_ip) % cfg->num_ips;
 	else
-		ip_idx = (__u32)((val / port_range) % cfg->num_ips);
+		ip_idx = (__u32)((seq / port_range) % cfg->num_ips);
 
 	__u32 map_idx = pid * MAX_NAT_POOL_IPS_PER_POOL + ip_idx;
 	if (map_idx >= MAX_NAT_POOLS * MAX_NAT_POOL_IPS_PER_POOL)
@@ -381,12 +396,12 @@ nat_pool_alloc_iface_v4(__u8 pool_id, struct pkt_meta *meta,
 			bpf_map_lookup_elem(&nat_port_counters, &pid);
 		if (!ctr)
 			return -1;
-		__u32 cpu = bpf_get_smp_processor_id() & 0xF;
-		__u64 val = ctr->counter++ * 16 + cpu;
+		__u64 seq = nat_port_seq_next(ctr);
 		__u32 port_range = cfg->port_high - cfg->port_low + 1;
 		if (port_range == 0)
 			port_range = 1;
-		__u16 port = cfg->port_low + (__u16)(val % port_range);
+		__u32 selector = nat_port_selector(cfg, seq);
+		__u16 port = cfg->port_low + (__u16)(selector % port_range);
 
 		*out_ip = ev->ipv4;
 		*out_port = bpf_htons(port);
@@ -413,21 +428,20 @@ nat_pool_alloc_v6(__u8 pool_id, __u8 *src_ip, __u8 *out_ip, __be16 *out_port)
 	if (!ctr)
 		return -1;
 
-	/* CPU-interleaved counter (same as v4 above) */
-	__u32 cpu = bpf_get_smp_processor_id() & 0xF;
-	__u64 val = ctr->counter++ * 16 + cpu;
+	__u64 seq = nat_port_seq_next(ctr);
 	__u32 port_range = cfg->port_high - cfg->port_low + 1;
 	if (port_range == 0)
 		port_range = 1;
-	__u16 port = cfg->port_low + (__u16)(val % port_range);
+	__u32 selector = nat_port_selector(cfg, seq);
+	__u16 port = cfg->port_low + (__u16)(selector % port_range);
 
 	__u32 ip_idx;
-	if (cfg->addr_persistent) {
+	if (cfg->addr_persistent & NAT_POOL_FLAG_ADDR_PERSISTENT) {
 		/* Hash last 4 bytes of IPv6 source for sticky mapping */
 		__u32 *s32 = (__u32 *)src_ip;
 		ip_idx = (s32[0] ^ s32[1] ^ s32[2] ^ s32[3]) % cfg->num_ips_v6;
 	} else {
-		ip_idx = (__u32)((val / port_range) % cfg->num_ips_v6);
+		ip_idx = (__u32)((seq / port_range) % cfg->num_ips_v6);
 	}
 
 	__u32 map_idx = pid * MAX_NAT_POOL_IPS_PER_POOL + ip_idx;
@@ -470,12 +484,12 @@ nat_pool_alloc_iface_v6(__u8 pool_id, struct pkt_meta *meta,
 				bpf_map_lookup_elem(&nat_port_counters, &pid);
 			if (!ctr)
 				return -1;
-			__u32 cpu = bpf_get_smp_processor_id() & 0xF;
-			__u64 val = ctr->counter++ * 16 + cpu;
+			__u64 seq = nat_port_seq_next(ctr);
 			__u32 port_range = cfg->port_high - cfg->port_low + 1;
 			if (port_range == 0)
 				port_range = 1;
-			__u16 port = cfg->port_low + (__u16)(val % port_range);
+			__u32 selector = nat_port_selector(cfg, seq);
+			__u16 port = cfg->port_low + (__u16)(selector % port_range);
 
 			__builtin_memcpy(out_ip, ev->ipv6, 16);
 			*out_port = bpf_htons(port);
@@ -527,7 +541,9 @@ nat_pool_alloc_deterministic_v4(__u8 pool_id, __be32 src_ip,
 		return -1;
 
 	__u32 port_start = cfg->port_low + block_idx * cfg->block_size;
-	__u32 offset = (__u32)(ctr->counter++) % cfg->block_size;
+	__u64 seq = nat_port_seq_next(ctr);
+	__u32 selector = nat_port_selector(cfg, seq);
+	__u32 offset = selector % cfg->block_size;
 	__u16 port = (__u16)(port_start + offset);
 	if (port > cfg->port_high)
 		return -1;
@@ -590,7 +606,9 @@ nat_pool_alloc_deterministic_v6(__u8 pool_id, __u8 *src_v6,
 		return -1;
 
 	__u32 port_start = cfg->port_low + block_idx * cfg->block_size;
-	__u32 offset = (__u32)(ctr->counter++) % cfg->block_size;
+	__u64 seq = nat_port_seq_next(ctr);
+	__u32 selector = nat_port_selector(cfg, seq);
+	__u32 offset = selector % cfg->block_size;
 	__u16 port = (__u16)(port_start + offset);
 	if (port > cfg->port_high)
 		return -1;

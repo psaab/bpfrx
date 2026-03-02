@@ -6029,6 +6029,9 @@ func TestNATSourceSetSyntax(t *testing.T) {
 	if len(pool.Addresses) != 1 || pool.Addresses[0] != "203.0.113.0/24" {
 		t.Errorf("pool addresses = %v, want [203.0.113.0/24]", pool.Addresses)
 	}
+	if pool.PortRandomizationDisable {
+		t.Error("port-randomization disable should be false by default")
+	}
 
 	if len(cfg.Security.NAT.Source) != 1 {
 		t.Fatalf("got %d source rule-sets, want 1", len(cfg.Security.NAT.Source))
@@ -6055,6 +6058,62 @@ func TestNATSourceSetSyntax(t *testing.T) {
 	}
 	if !rule.Then.Interface {
 		t.Error("then should be source-nat interface")
+	}
+}
+
+func TestNATSourcePoolPortRandomizationDisable(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set security nat source pool snat-pool address 203.0.113.0/24",
+		"set security nat source pool snat-pool port-randomization disable",
+	} {
+		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	pool := cfg.Security.NAT.SourcePools["snat-pool"]
+	if pool == nil {
+		t.Fatal("source pool not found")
+	}
+	if !pool.PortRandomizationDisable {
+		t.Error("expected port-randomization disable to be true")
+	}
+}
+
+func TestNATSourcePoolPortRandomizationDisableHierarchical(t *testing.T) {
+	input := `security {
+    nat {
+        source {
+            pool snat-pool {
+                address 203.0.113.10/32;
+                port-randomization disable;
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	pool := cfg.Security.NAT.SourcePools["snat-pool"]
+	if pool == nil {
+		t.Fatal("source pool not found")
+	}
+	if !pool.PortRandomizationDisable {
+		t.Error("expected port-randomization disable to be true")
 	}
 }
 

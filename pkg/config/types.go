@@ -941,14 +941,15 @@ const (
 
 // NATPool is a pool of addresses for NAT.
 type NATPool struct {
-	Name          string
-	Address       string   // single address (DNAT compat)
-	Addresses     []string // multiple addresses (source NAT pools)
-	Port          int      // optional port mapping (DNAT)
-	PortLow       int      // source pool port range low (default 1024)
-	PortHigh      int      // source pool port range high (default 65535)
-	PersistentNAT *PersistentNATConfig
-	Deterministic *DeterministicNATConfig
+	Name                     string
+	Address                  string   // single address (DNAT compat)
+	Addresses                []string // multiple addresses (source NAT pools)
+	Port                     int      // optional port mapping (DNAT)
+	PortLow                  int      // source pool port range low (default 1024)
+	PortHigh                 int      // source pool port range high (default 65535)
+	PortRandomizationDisable bool     // true when "port-randomization disable" is configured
+	PersistentNAT            *PersistentNATConfig
+	Deterministic            *DeterministicNATConfig
 }
 
 // PersistentNATConfig configures persistent NAT bindings for a pool.

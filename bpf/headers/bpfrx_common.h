@@ -593,13 +593,15 @@ struct session_count_value {
  * ============================================================ */
 
 #define MAX_NAT_POOL_IPS_PER_POOL  256  /* max IPs per individual pool (CGNAT pools may have 125+) */
+#define NAT_POOL_FLAG_ADDR_PERSISTENT             0x1
+#define NAT_POOL_FLAG_PORT_RANDOMIZATION_DISABLE  0x2
 
 struct nat_pool_config {
 	__u16 num_ips;        /* number of v4 IPs in this pool */
 	__u16 num_ips_v6;     /* number of v6 IPs in this pool */
 	__u16 port_low;       /* default 1024 */
 	__u16 port_high;      /* default 65535 */
-	__u8  addr_persistent; /* same src IP always maps to same pool IP */
+	__u8  addr_persistent; /* NAT_POOL_FLAG_* bitfield */
 	__u8  deterministic;  /* 0=off, 1=IPv4 host, 2=IPv6 host */
 	__u16 block_size;     /* ports per subscriber (deterministic) */
 	__be32 host_base;     /* subscriber range base IP (deterministic==1) */

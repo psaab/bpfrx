@@ -29,7 +29,7 @@ type CompileResult struct {
 	AddrIDs     map[string]uint32 // address name -> address ID
 	AppIDs      map[string]uint32 // application name -> app ID
 	PoolIDs     map[string]uint8  // NAT pool name -> pool ID (0-based)
-	NextPoolID  uint8            // next available pool ID (after SNAT assignment)
+	NextPoolID  uint8             // next available pool ID (after SNAT assignment)
 	PolicyNames map[uint32]string // rule_id -> "from-zone/to-zone/policy-name" (or "global/policy-name")
 	AppNames    map[uint16]string // app_id -> application name (for structured logging)
 	PolicySets  int               // number of policy sets created
@@ -2007,7 +2007,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					}
 				}
 				if natCfg.AddressPersistent {
-					poolCfg.AddrPersistent = 1
+					poolCfg.AddrPersistent |= NATPoolFlagAddrPersistent
 				}
 				if err := dp.SetNATPoolConfig(uint32(curPoolID), poolCfg); err != nil {
 					return fmt.Errorf("set pool config %d: %w", curPoolID, err)
@@ -2120,7 +2120,10 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					}
 
 					if natCfg.AddressPersistent {
-						poolCfg.AddrPersistent = 1
+						poolCfg.AddrPersistent |= NATPoolFlagAddrPersistent
+					}
+					if pool.PortRandomizationDisable {
+						poolCfg.AddrPersistent |= NATPoolFlagPortRandomizationDisable
 					}
 					if err := dp.SetNATPoolConfig(uint32(curPoolID), poolCfg); err != nil {
 						return fmt.Errorf("set pool config %d: %w", curPoolID, err)
@@ -2788,6 +2791,12 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			}
 			pcfg.NumIPs = uint16(numV4)
 			pcfg.NumIPsV6 = uint16(numV6)
+			if cfg.Security.NAT.AddressPersistent {
+				pcfg.AddrPersistent |= NATPoolFlagAddrPersistent
+			}
+			if pool.PortRandomizationDisable {
+				pcfg.AddrPersistent |= NATPoolFlagPortRandomizationDisable
+			}
 			if err := dp.SetNATPoolConfig(uint32(newID), pcfg); err != nil {
 				return fmt.Errorf("NAT64 rule-set %q: set pool config %d: %w",
 					rs.Name, newID, err)

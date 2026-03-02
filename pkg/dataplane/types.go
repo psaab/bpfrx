@@ -228,28 +228,28 @@ const (
 	GlobalCtrNAT64Xlate      = 10
 	GlobalCtrHostInbound     = 11
 	// Per-screen-type drop counters (12..25)
-	GlobalCtrScreenSynFlood    = 12
-	GlobalCtrScreenICMPFlood   = 13
-	GlobalCtrScreenUDPFlood    = 14
-	GlobalCtrScreenPortScan    = 15
-	GlobalCtrScreenIPSweep     = 16
-	GlobalCtrScreenLandAttack  = 17
-	GlobalCtrScreenPingOfDeath = 18
-	GlobalCtrScreenTearDrop    = 19
-	GlobalCtrScreenTCPSynFin   = 20
-	GlobalCtrScreenTCPNoFlag   = 21
-	GlobalCtrScreenTCPFinNoAck = 22
-	GlobalCtrScreenWinNuke     = 23
-	GlobalCtrScreenIPSrcRoute  = 24
-	GlobalCtrScreenSynFrag     = 25
-	GlobalCtrFabricRedirect    = 26
-	GlobalCtrSyncookieSent     = 27
-	GlobalCtrSyncookieValid    = 28
-	GlobalCtrSyncookieInvalid  = 29
+	GlobalCtrScreenSynFlood     = 12
+	GlobalCtrScreenICMPFlood    = 13
+	GlobalCtrScreenUDPFlood     = 14
+	GlobalCtrScreenPortScan     = 15
+	GlobalCtrScreenIPSweep      = 16
+	GlobalCtrScreenLandAttack   = 17
+	GlobalCtrScreenPingOfDeath  = 18
+	GlobalCtrScreenTearDrop     = 19
+	GlobalCtrScreenTCPSynFin    = 20
+	GlobalCtrScreenTCPNoFlag    = 21
+	GlobalCtrScreenTCPFinNoAck  = 22
+	GlobalCtrScreenWinNuke      = 23
+	GlobalCtrScreenIPSrcRoute   = 24
+	GlobalCtrScreenSynFrag      = 25
+	GlobalCtrFabricRedirect     = 26
+	GlobalCtrSyncookieSent      = 27
+	GlobalCtrSyncookieValid     = 28
+	GlobalCtrSyncookieInvalid   = 29
 	GlobalCtrSyncookieBypass    = 30
 	GlobalCtrScreenSessionLimit = 31
-	GlobalCtrFabricFwdDrop     = 32
-	GlobalCtrMax               = 33
+	GlobalCtrFabricFwdDrop      = 32
+	GlobalCtrMax                = 33
 )
 
 // Host-inbound-traffic service flags (bitmap in zone_config.host_inbound_flags).
@@ -402,16 +402,21 @@ type NATPoolConfig struct {
 	NumIPsV6       uint16
 	PortLow        uint16
 	PortHigh       uint16
-	AddrPersistent uint8
+	AddrPersistent uint8 // bitfield: NATPoolFlag*
 	Deterministic  uint8 // 0=off, 1=IPv4 host, 2=IPv6 host
 	BlockSize      uint16
 	HostBase       uint32 // network byte order (deterministic==1)
 	HostCount      uint32
 	BlocksPerIP    uint16
-	HostPrefixLen  uint8 // IPv6 prefix length: 32 or 64 (deterministic==2)
-	InterfaceMode  uint8 // 1 = source-nat interface: use egress IP from snat_egress_ips
+	HostPrefixLen  uint8     // IPv6 prefix length: 32 or 64 (deterministic==2)
+	InterfaceMode  uint8     // 1 = source-nat interface: use egress IP from snat_egress_ips
 	HostBaseV6     [4]uint32 // IPv6 subscriber base (deterministic==2)
 }
+
+const (
+	NATPoolFlagAddrPersistent           = 1 << 0
+	NATPoolFlagPortRandomizationDisable = 1 << 1
+)
 
 type NATPoolIPV6 struct {
 	IP [16]byte
@@ -700,8 +705,8 @@ type IfaceZoneKey struct {
 // IfaceZoneValue mirrors the C struct iface_zone_value.
 type IfaceZoneValue struct {
 	ZoneID       uint16
-	Flags        uint8 // IFACE_FLAG_* bits
-	RGID         uint8 // redundancy group ID (0 = standalone/non-RETH)
+	Flags        uint8  // IFACE_FLAG_* bits
+	RGID         uint8  // redundancy group ID (0 = standalone/non-RETH)
 	RoutingTable uint32 // kernel table ID, 0 = main table
 }
 
