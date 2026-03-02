@@ -651,14 +651,13 @@ func TestRGInterfaceReady(t *testing.T) {
 		t.Errorf("should be ready, got reasons: %v", reasons)
 	}
 
-	// Remove an interface.
+	// Remove an interface — simulates peer's interface not present on
+	// this node (e.g. ge-7/0/x on node 0). Should be skipped, matching
+	// pollInterfaceMonitors() behavior.
 	delete(nlh.links, "trust0")
 	ready, reasons = mon.RGInterfaceReady(0)
-	if ready {
-		t.Error("should NOT be ready with missing interface")
-	}
-	if len(reasons) != 1 || !strings.Contains(reasons[0], "trust0 not found") {
-		t.Errorf("unexpected reasons: %v", reasons)
+	if !ready {
+		t.Errorf("missing interface (peer's) should be skipped, got reasons: %v", reasons)
 	}
 
 	// Interface exists but is down.

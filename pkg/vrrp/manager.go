@@ -340,9 +340,18 @@ func (m *Manager) RGVRRPReady(rgID int) (bool, []string) {
 	vrid := 100 + rgID
 	for _, vi := range m.instances {
 		if vi.cfg.GroupID == vrid {
-			return true, nil
+			return true, nil // instance exists for this RG
 		}
 	}
+
+	// No instance for this RG. If other instances exist, VRRP is
+	// running but this RG simply has no RETH/VRRP interfaces
+	// (e.g. RG 0 is control-plane only) — ready by definition.
+	if len(m.instances) > 0 {
+		return true, nil
+	}
+
+	// No instances at all — VRRP hasn't started yet. Not ready.
 	return false, []string{fmt.Sprintf("vrrp: no instance for RG %d (VRID %d)", rgID, vrid)}
 }
 

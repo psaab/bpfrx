@@ -437,7 +437,10 @@ func (mon *Monitor) RGInterfaceReady(rgID int) (bool, []string) {
 			linuxName := config.LinuxIfName(im.Interface)
 			link, err := nlh.LinkByName(linuxName)
 			if err != nil {
-				reasons = append(reasons, fmt.Sprintf("interface %s not found", im.Interface))
+				// Interface doesn't exist on this node — belongs to
+				// peer (e.g. ge-7/0/x on node 0). Skip without
+				// counting against readiness, matching
+				// pollInterfaceMonitors() behavior.
 				continue
 			}
 			up := link.Attrs().OperState == netlink.OperUp ||
