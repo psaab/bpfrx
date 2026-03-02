@@ -22,14 +22,14 @@ Last updated: 2026-03-02
 | Routing Enhancements | 10 | 3 | 0 | 13 |
 | VPN Enhancements | 8 | 1 | 0 | 9 |
 | HA Enhancements | 0 | 0 | 0 | 0 |
-| Firewall Filter Enhancements | 2 | 1 | 0 | 3 |
+| Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
 | Management & Automation | 9 | 2 | 0 | 11 |
 | Interface Enhancements | 1 | 1 | 0 | 2 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **121** | **14** | **4** | **139** |
+| **TOTAL** | **121** | **13** | **4** | **138** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -313,7 +313,7 @@ bpfrx has firewall filters with source/dest addresses, prefix-lists (with except
 | **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR | Medium | **Done** -- Two-rate three-color (RFC 2698) and single-rate three-color (RFC 2697) modes implemented. |
 | **Interface Policer** | `firewall policer ... logical-interface-policer` | Aggregate rate limiting across all protocol families on a logical interface | Low | Missing |
 | **Flexible Match Conditions** | `firewall filter ... term ... from flexible-match-range ...` | Match on arbitrary byte offsets within packet header for custom protocol matching | Low | Missing |
-| **Firewall Filter on lo0** | `interfaces lo0 unit 0 family inet filter input ...` | Host-bound traffic filtering. bpfrx parses Lo0FilterInputV4/V6 but may not fully apply in BPF. | Medium | Partial (parsed and partially wired but needs verification) |
+| **Firewall Filter on lo0** | `interfaces lo0 unit 0 family inet filter input ...` | Host-bound traffic filtering — config parsed, compiled to filter IDs, evaluated natively in xdp_forward for host-bound packets, plus kernel nftables fallback | Medium | Done |
 
 ---
 

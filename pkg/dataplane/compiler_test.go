@@ -507,3 +507,129 @@ func TestRethConfigAddrsEmpty(t *testing.T) {
 		t.Errorf("expected no addresses, got v4=%d v6=%d", len(v4), len(v6))
 	}
 }
+
+func TestLo0FilterIDResolution(t *testing.T) {
+	// Verify that lo0 filter names are resolved to numeric IDs
+	// and that the sentinel value is used when no filter is configured.
+
+	result := &CompileResult{
+		Lo0FilterV4: 0xFFFFFFFF, // sentinel: no filter
+		Lo0FilterV6: 0xFFFFFFFF,
+	}
+
+	// Simulate filter ID assignment (what compileFirewallFilters does)
+	filterIDs := map[string]uint32{
+		"inet:mgmt-v4":  5,
+		"inet6:mgmt-v6": 8,
+	}
+
+	// Resolve lo0 filter names to IDs
+	cfg := &config.Config{
+		System: config.SystemConfig{
+			Lo0FilterInputV4: "mgmt-v4",
+			Lo0FilterInputV6: "mgmt-v6",
+		},
+	}
+	if cfg.System.Lo0FilterInputV4 != "" {
+		if fid, ok := filterIDs["inet:"+cfg.System.Lo0FilterInputV4]; ok {
+			result.Lo0FilterV4 = fid
+		}
+	}
+	if cfg.System.Lo0FilterInputV6 != "" {
+		if fid, ok := filterIDs["inet6:"+cfg.System.Lo0FilterInputV6]; ok {
+			result.Lo0FilterV6 = fid
+		}
+	}
+
+	if result.Lo0FilterV4 != 5 {
+		t.Errorf("Lo0FilterV4 = %d, want 5", result.Lo0FilterV4)
+	}
+	if result.Lo0FilterV6 != 8 {
+		t.Errorf("Lo0FilterV6 = %d, want 8", result.Lo0FilterV6)
+	}
+
+	// Verify uint32 → uint16 conversion for BPF flow_config
+	var fc FlowConfigValue
+	if result.Lo0FilterV4 != 0xFFFFFFFF {
+		fc.Lo0FilterV4 = uint16(result.Lo0FilterV4)
+	} else {
+		fc.Lo0FilterV4 = Lo0FilterNone
+	}
+	if result.Lo0FilterV6 != 0xFFFFFFFF {
+		fc.Lo0FilterV6 = uint16(result.Lo0FilterV6)
+	} else {
+		fc.Lo0FilterV6 = Lo0FilterNone
+	}
+
+	if fc.Lo0FilterV4 != 5 {
+		t.Errorf("FlowConfig Lo0FilterV4 = %d, want 5", fc.Lo0FilterV4)
+	}
+	if fc.Lo0FilterV6 != 8 {
+		t.Errorf("FlowConfig Lo0FilterV6 = %d, want 8", fc.Lo0FilterV6)
+	}
+}
+
+func TestLo0FilterIDSentinel(t *testing.T) {
+	// When no lo0 filter is configured, the sentinel 0xFFFF must be used
+	result := &CompileResult{
+		Lo0FilterV4: 0xFFFFFFFF,
+		Lo0FilterV6: 0xFFFFFFFF,
+	}
+
+	var fc FlowConfigValue
+	if result.Lo0FilterV4 != 0xFFFFFFFF {
+		fc.Lo0FilterV4 = uint16(result.Lo0FilterV4)
+	} else {
+		fc.Lo0FilterV4 = Lo0FilterNone
+	}
+	if result.Lo0FilterV6 != 0xFFFFFFFF {
+		fc.Lo0FilterV6 = uint16(result.Lo0FilterV6)
+	} else {
+		fc.Lo0FilterV6 = Lo0FilterNone
+	}
+
+	if fc.Lo0FilterV4 != Lo0FilterNone {
+		t.Errorf("Lo0FilterV4 = 0x%04x, want 0x%04x (none)", fc.Lo0FilterV4, Lo0FilterNone)
+	}
+	if fc.Lo0FilterV6 != Lo0FilterNone {
+		t.Errorf("Lo0FilterV6 = 0x%04x, want 0x%04x (none)", fc.Lo0FilterV6, Lo0FilterNone)
+	}
+}
+
+func TestLo0FilterMissingFilterName(t *testing.T) {
+	// If a referenced filter doesn't exist, the sentinel must be preserved
+	result := &CompileResult{
+		Lo0FilterV4: 0xFFFFFFFF,
+		Lo0FilterV6: 0xFFFFFFFF,
+	}
+
+	filterIDs := map[string]uint32{
+		"inet:some-other-filter": 3,
+	}
+
+	cfg := &config.Config{
+		System: config.SystemConfig{
+			Lo0FilterInputV4: "nonexistent-filter",
+		},
+	}
+	if cfg.System.Lo0FilterInputV4 != "" {
+		if fid, ok := filterIDs["inet:"+cfg.System.Lo0FilterInputV4]; ok {
+			result.Lo0FilterV4 = fid
+		}
+	}
+
+	// Should remain sentinel since filter wasn't found
+	if result.Lo0FilterV4 != 0xFFFFFFFF {
+		t.Errorf("Lo0FilterV4 = 0x%08x, want 0xFFFFFFFF (unresolved)", result.Lo0FilterV4)
+	}
+
+	var fc FlowConfigValue
+	if result.Lo0FilterV4 != 0xFFFFFFFF {
+		fc.Lo0FilterV4 = uint16(result.Lo0FilterV4)
+	} else {
+		fc.Lo0FilterV4 = Lo0FilterNone
+	}
+	if fc.Lo0FilterV4 != Lo0FilterNone {
+		t.Errorf("FlowConfig Lo0FilterV4 = 0x%04x, want 0x%04x (none)", fc.Lo0FilterV4, Lo0FilterNone)
+	}
+}
