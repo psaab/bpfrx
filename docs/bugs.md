@@ -630,6 +630,51 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Fix:** Added `syncMsgFence` message type. On heartbeat timeout with `peer-fencing disable-rg` configured, the surviving node sends a fence message via the fabric sync connection. The receiver disables all RGs (`rg_active=false`). Best-effort — if the sync connection is also down, falls back to normal heartbeat-driven failover. Fence events tracked in cluster history.
 - **Files:** `pkg/cluster/cluster.go`, `pkg/cluster/cluster_test.go`, `pkg/cluster/events.go`, `pkg/cluster/sync.go`, `pkg/cmdtree/tree.go`, `pkg/config/ast.go`, `pkg/config/compiler.go`, `pkg/config/types.go`, `pkg/config/parser_test.go`
 
+### #76: Concurrent sync writers / short-write framing corruption (FIXED)
+- **Symptom:** Under heavy load with simultaneous session sync (sendLoop), config push, failover, keepalive, and BulkSync all writing to the same TCP connection, the receiver intermittently failed to parse messages — invalid magic bytes or payload lengths exceeding sanity limits. This caused sync disconnects and session loss during the most critical moments (failover transitions).
+- **Root cause:** Two interacting bugs:
+  1. **No write serialization:** `sendLoop()` (incremental sessions), `QueueConfig()`, `SendFailover()`, `SendFence()`, `BulkSync()`, `receiveLoop()` (keepalives), and `QueueIPsecSA()` all called `conn.Write()` or `writeMsg()` concurrently without any mutex. TCP `Write()` on Go's `net.Conn` is not atomic for large payloads — concurrent writes can interleave bytes, producing corrupted framing.
+  2. **Split header+payload writes in `writeMsg()`:** `writeMsg()` used two separate `conn.Write()` calls — one for the 12-byte header and one for the payload. Even with a mutex, another writer could theoretically slip between the two writes in a race. More practically, the kernel could split the TCP segments at the header/payload boundary, making the corruption window wider.
+- **Fix:**
+  1. Added `writeMu sync.Mutex` to `SessionSync`. All write paths (`sendLoop`, `QueueConfig`, `SendFailover`, `SendFence`, `BulkSync`, `receiveLoop` keepalives, `QueueIPsecSA`) acquire `writeMu` before writing and release after.
+  2. Rewrote `writeMsg()` to allocate a single buffer (`syncHeaderSize + len(payload)`), copy header and payload into it, then issue one `conn.Write(buf)` call — eliminating the split-write hazard entirely.
+- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+
+### #77: Fixed 10s sync-hold timeout releasing before bulk sync (FIXED)
+- **Symptom:** On a returning high-priority node, VRRP preemption was released by the 10s safety timeout before the peer's BulkSync had arrived. The node became MASTER without session state, breaking all existing TCP connections that had been synced to the peer during the outage.
+- **Root cause:** `SetSyncHold(10s)` was a fixed timeout as a safety net. But in practice, BulkSync can take longer than 10s for large session tables or slow fabric links. Once the timeout fires, `ReleaseSyncHold()` restores preempt on all VRRP instances — the returning node preempts to MASTER immediately, without waiting for session state. The timeout and bulk-sync-complete paths were indistinguishable, making debugging difficult.
+- **Fix:**
+  1. Increased sync-hold timeout from 10s to 30s to provide adequate buffer for large bulk syncs.
+  2. Added `syncHoldReason` field to Manager: `"bulk-sync-complete"` (normal path via `ReleaseSyncHold()`) vs `"timeout-degraded"` (safety timeout fired). Internal `releaseSyncHoldWithReason()` records the reason.
+  3. Added `SyncHoldReason()` accessor for diagnostics — allows operators and logs to distinguish normal vs degraded preemption.
+  4. Timeout log message now warns about degraded mode: `"vrrp: sync-hold timeout: bulk sync did not complete within timeout, releasing in degraded mode"`.
+- **Files:** `pkg/vrrp/manager.go`, `pkg/vrrp/vrrp_test.go`
+
+### #78: Reconnect config sync accepting stale secondary config (FIXED)
+- **Symptom:** After a sync reconnection race (e.g., both nodes reconnect after fabric flap), the secondary could push its outdated config to the primary. The primary's `handleConfigSync()` had no authority check — it accepted any incoming config text. This overwrote the authoritative primary config with stale data, potentially reverting security policies.
+- **Root cause:** Two missing authority checks:
+  1. `handleConfigSync()` accepted config from any peer without checking whether this node is the RG0 primary (config authority). A reconnecting secondary that still had an old config in its push queue could overwrite the primary's current config.
+  2. `OnPeerConnected` callback pushed config on every reconnect regardless of RG0 ownership. A secondary that reconnected first could push its stale config before the primary had a chance to push the authoritative version.
+- **Fix:**
+  1. `handleConfigSync()` now checks `d.cluster.IsLocalPrimary(0)` — if this node is RG0 primary, incoming config sync is rejected with a warning log: `"cluster: rejecting config sync (this node is RG0 primary)"`.
+  2. `OnPeerConnected` now checks `d.cluster.IsLocalPrimary(0)` before pushing — only the RG0 primary pushes config to a reconnecting peer. Non-primary nodes log `"cluster: skipping config push (not RG0 primary)"` and return.
+- **Files:** `pkg/daemon/daemon.go`
+
+### #79: Fabric_fwd passive/delayed population at startup (FIXED)
+- **Symptom:** After a node restart, the `fabric_fwd` BPF map (cross-chassis forwarding MACs) took up to 60s to populate — the initial retry loop waited 2s between attempts with no active ARP probing, and the fabric peer's ARP entry was often absent after reboot. During this window, synced sessions hitting `try_fabric_redirect()` were silently dropped (no MAC to write into packet).
+- **Root cause:** `populateFabricFwd()` used a passive retry strategy: poll `netlink.NeighList()` every 2s for up to 30 attempts (60s total). It never actively triggered ARP resolution. After a reboot, the kernel ARP table is empty — waiting for an organic ARP reply could take the full 60s. Additionally, `arping` doesn't populate kernel ARP when XDP is attached (raw PF_PACKET sockets bypass XDP).
+- **Fix:**
+  1. Fast retry: reduced from 30×2s (60s) to 10×500ms (5s) with immediate first attempt (no initial delay).
+  2. Active ARP probe: added `probeFabricNeighbor()` — checks if a valid neighbor entry exists, and if not, runs `ping -c1 -W1 -I <fabIface> <peerIP>` to trigger kernel ARP resolution. Uses `ping` (not `arping`) because `ping` generates normal IP packets that go through the kernel stack and populate ARP, while `arping` uses PF_PACKET which bypasses XDP.
+  3. Fallback: if fast retries don't succeed within 5s, falls back to the existing 30s periodic refresh loop.
+- **Files:** `pkg/daemon/daemon.go`
+
+### #80: Periodic neighbor warmup using stale startup config snapshot (FIXED)
+- **Symptom:** After a config change that added new static routes or interfaces, the periodic neighbor resolver (15s interval) continued resolving neighbors based on the old config snapshot captured at daemon startup. New next-hops were never probed, causing `bpf_fib_lookup` NO_NEIGH (rc=7) failures for traffic using the new routes — packets fell back to kernel forwarding or were dropped.
+- **Root cause:** `runPeriodicNeighborResolution()` captured `cfg *config.Config` as a parameter at launch time. The config pointer was never updated — it used the startup config snapshot for the lifetime of the goroutine, even after `commit` applied new configs.
+- **Fix:** Changed `runPeriodicNeighborResolution()` to fetch fresh config from `d.store.ActiveConfig()` on each tick instead of using a captured parameter. Added nil guard (active config may be nil during early startup). The function signature changed from `(ctx, cfg)` to just `(ctx)`.
+- **Files:** `pkg/daemon/daemon.go`
+
 ## Open Investigation
 
 ### Transient connectivity loss to 172.16.100.247 from cluster-lan-host after deploy restart (FIXED)

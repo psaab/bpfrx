@@ -2376,3 +2376,70 @@ test coverage.
 ### Verification
 - Two consecutive `systemctl restart bpfrxd` with continuous ping: 0% loss (30/30, 40/40)
 - Previously: 10-30s gap (20-60 pings lost per restart)
+
+## Sprint: HA Race Condition Fixes (#76-#80)
+
+Five race conditions identified through cluster stress testing — concurrent sync writers,
+premature sync-hold timeout, stale config overwrite on reconnect, delayed fabric_fwd
+population, and stale config snapshot in periodic neighbor warmup.
+
+### #76: Serialize sync writers and fix short-write framing corruption
+- **Problem:** All sync write paths (`sendLoop`, `QueueConfig`, `SendFailover`, `SendFence`,
+  `BulkSync`, keepalives, `QueueIPsecSA`) wrote to the TCP connection concurrently with no
+  serialization. `writeMsg()` used two separate `conn.Write()` calls (header, then payload),
+  widening the interleave window. Under load, receivers saw corrupted framing.
+- **Fix:** Added `writeMu sync.Mutex` to serialize all write paths. Rewrote `writeMsg()` to
+  build a single buffer (header + payload) and issue one `conn.Write()` call — eliminating
+  the split-write hazard entirely.
+- **Tests:** `TestConcurrentSyncWriters` — 10 goroutines (5 session + 5 control) writing 500
+  total messages; receiver validates every frame has correct magic and length.
+- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+
+### #77: Make sync-hold release condition-driven, not timer-only
+- **Problem:** 10s fixed sync-hold timeout could fire before BulkSync arrived for large
+  session tables. Returning node preempted to MASTER without session state, breaking
+  existing TCP connections. Timeout vs bulk-sync completion was indistinguishable in logs.
+- **Fix:** Increased timeout 10s→30s. Added `syncHoldReason` tracking: `"bulk-sync-complete"`
+  (normal) vs `"timeout-degraded"` (safety timeout). `SyncHoldReason()` accessor for
+  diagnostics.
+- **Tests:** `TestSyncHold_BulkSyncCompleteReason`, updated `TestSyncHold_TimeoutReleasesAutomatically`
+  to verify reason field.
+- **Files:** `pkg/vrrp/manager.go`, `pkg/vrrp/vrrp_test.go`
+
+### #78: Add authority enforcement to reconnect config sync
+- **Problem:** `handleConfigSync()` accepted config from any peer without RG0 authority
+  check. Reconnecting secondary could push stale config to primary, overwriting
+  authoritative security policies. `OnPeerConnected` pushed config regardless of role.
+- **Fix:** `handleConfigSync()` rejects incoming config when `IsLocalPrimary(0)` is true.
+  `OnPeerConnected` only pushes config if this node is RG0 primary.
+- **Files:** `pkg/daemon/daemon.go`
+
+### #79: Make fabric_fwd population immediate with active ARP probe
+- **Problem:** `populateFabricFwd()` used passive 2s polling (30 attempts, 60s total) with
+  no ARP probing. After reboot, kernel ARP table is empty — fabric forwarding map could
+  take the full 60s to populate. Synced sessions silently dropped during this window.
+- **Fix:** Fast retry (10×500ms with immediate first attempt). Added `probeFabricNeighbor()`
+  which runs `ping -c1` to trigger kernel ARP (not `arping` — raw sockets don't populate
+  ARP with XDP attached). Falls back to 30s periodic refresh if fast retries fail.
+- **Files:** `pkg/daemon/daemon.go`
+
+### #80: Fix periodic neighbor warmup to use current active config
+- **Problem:** `runPeriodicNeighborResolution()` captured the config at goroutine launch
+  time. After `commit` applied new configs with new routes/interfaces, the periodic resolver
+  continued using the startup snapshot — new next-hops never probed, causing NO_NEIGH drops.
+- **Fix:** Changed to fetch `d.store.ActiveConfig()` on each 15s tick instead of using a
+  captured parameter. Added nil guard for early startup.
+- **Files:** `pkg/daemon/daemon.go`
+
+### Tests
+- `TestConcurrentSyncWriters`: 10 concurrent writers, 500 messages, validates framing integrity
+- `TestSyncHold_BulkSyncCompleteReason`: verifies bulk-sync-complete reason tracking
+- `TestSyncHold_TimeoutReleasesAutomatically`: updated to verify timeout-degraded reason
+- Existing HA integration tests (`make test-failover`, `make test-ha-crash`, `make test-restart-connectivity`)
+
+### Impact
+- Eliminates sync framing corruption under concurrent write load (session + control messages)
+- Prevents premature VRRP preemption before session state is transferred
+- Prevents stale config overwrite from reconnecting secondary nodes
+- Reduces fabric_fwd population time from up to 60s to <5s after reboot
+- Neighbor warmup always uses current config — no stale snapshot drift
