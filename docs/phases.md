@@ -2355,3 +2355,24 @@ test coverage.
 - Stale sessions cleaned up after bulk sync prevents phantom session black-holes
 - Peer fencing provides best-effort fast disable path for hung peers
 - Integration test coverage for hard-crash scenarios beyond clean reboot
+
+## Sprint: HA Restart Connectivity Fix (#74-#75)
+
+### Bug: Transient 10-30s connectivity loss after deploy restart (#74, #75)
+- **Root cause:** `resolveNeighbors()` ran during `applyConfig()` BEFORE VRRP MASTER transition installed RETH VIPs on interfaces. Without VIPs, `RouteGet()` for WAN next-hops failed — no ARP entries primed. Periodic neighbor resolver had 15s blind spot (no initial run at goroutine start)
+- **Fix (`9b04af4`):**
+  1. Skip `resolveNeighbors()` in cluster mode during `applyConfig()` (useless without VIPs)
+  2. Trigger `resolveNeighbors()` on VRRP MASTER event in `watchVRRPEvents()` (VIPs installed)
+  3. Run periodic resolver immediately at goroutine start (eliminate 15s blind spot)
+- **Files:** `pkg/daemon/daemon.go`, `docs/bugs.md`
+
+### New: Restart connectivity regression test (`test-restart-connectivity.sh`)
+- Restarts bpfrxd on fw0 while continuously pinging through cluster
+- Asserts ≤ 2 pings lost per cycle (VRRP failover/failback accounts for 1-2)
+- Configurable cycles (default 3) for intermittent detection
+- ARP pre-warm between cycles, session clearing, fw0 primary restoration
+- **Files:** `test/incus/test-restart-connectivity.sh`, `Makefile`
+
+### Verification
+- Two consecutive `systemctl restart bpfrxd` with continuous ping: 0% loss (30/30, 40/40)
+- Previously: 10-30s gap (20-60 pings lost per restart)

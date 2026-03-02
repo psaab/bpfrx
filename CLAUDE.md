@@ -30,11 +30,13 @@ If `incus` commands fail with permission errors, use `sg incus-admin -c "make ..
 
 ## Cluster Test Environment (Two-VM HA)
 ```bash
-make cluster-init    # Create networks + profile for HA cluster
-make cluster-create  # Launch bpfrx-fw0, bpfrx-fw1, cluster-lan-host
-make cluster-deploy  # Build + push to both VMs + restart
-make cluster-destroy # Tear down cluster VMs
-make test-failover   # Reboot fw0 during iperf3 — verify TCP survives failover+failback
+make cluster-init              # Create networks + profile for HA cluster
+make cluster-create            # Launch bpfrx-fw0, bpfrx-fw1, cluster-lan-host
+make cluster-deploy            # Build + push to both VMs + restart
+make cluster-destroy           # Tear down cluster VMs
+make test-failover             # Reboot fw0 during iperf3 — verify TCP survives failover+failback
+make test-ha-crash             # Force-stop/daemon-stop/multi-cycle crash recovery
+make test-restart-connectivity # Verify 0 packet loss during daemon restart
 ```
 
 Or use `test/incus/cluster-setup.sh` directly: `init`, `create`, `deploy all`, `destroy`, `ssh 0|1`, `status`, `logs 0|1`.

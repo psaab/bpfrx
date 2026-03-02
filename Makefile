@@ -107,6 +107,10 @@ test-stress-failover:
 test-ha-crash:
 	./test/incus/test-ha-crash.sh
 
+# Restart connectivity regression test (verify no transient loss during daemon restart — requires cluster + iperf3 server)
+test-restart-connectivity:
+	./test/incus/test-restart-connectivity.sh
+
 # Cluster HA test environment (two-VM chassis cluster)
 NODE ?= all
 .PHONY: cluster-init cluster-create cluster-deploy cluster-destroy cluster-status cluster-ssh cluster-logs cluster-start cluster-stop cluster-restart
