@@ -109,6 +109,24 @@ process_packet(struct rte_mbuf *pkt, struct pipeline_ctx *ctx)
 	if (parse_packet(pkt, &meta) < 0)
 		goto drop;
 
+	/* GRE performance acceleration: extract key for per-tunnel sessions.
+	 * parse_packet stores GRE flags MSB in icmp_type; check K bit. */
+	if (meta.protocol == PROTO_GRE &&
+	    ctx->shm->flow_config && ctx->shm->flow_config->gre_accel &&
+	    (meta.icmp_type & 0x20)) { /* K bit = 0x2000 >> 8 */
+		uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *);
+		uint32_t data_len = rte_pktmbuf_data_len(pkt);
+		/* Key offset: 4 (base) + 4 if checksum (C bit = 0x80) */
+		uint16_t key_off = meta.l4_offset + 4;
+		if (meta.icmp_type & 0x80)
+			key_off += 4;
+		if (data_len >= key_off + 4) {
+			uint32_t key = *(uint32_t *)(data + key_off);
+			meta.src_port = (uint16_t)(key >> 16);
+			meta.dst_port = (uint16_t)(key & 0xFFFF);
+		}
+	}
+
 	ctr_iface_rx_add(ctx, meta.ingress_ifindex, rte_pktmbuf_pkt_len(pkt));
 
 	/* 2. Ingress filter (replaces xdp_main filter check) */

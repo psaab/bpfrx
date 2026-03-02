@@ -189,6 +189,35 @@ parse_packet(struct rte_mbuf *pkt, struct pkt_meta *meta)
 		meta->payload_offset = meta->l4_offset + 8;
 		break;
 
+	case PROTO_GRE: {
+		/* GRE header (RFC 2784/2890):
+		 *   bytes 0-1: flags (C|res|K|S|Reserved0|Ver)
+		 *   bytes 2-3: protocol type
+		 * Key extraction is gated on gre_accel in the pipeline. */
+		if (data_len < meta->l4_offset + 4)
+			return -1;
+		uint16_t gre_flags =
+			rte_be_to_cpu_16(*(uint16_t *)(data + meta->l4_offset));
+		uint16_t gre_hdr_len = 4;
+
+		if (gre_flags & 0x8000) /* C: checksum present */
+			gre_hdr_len += 4;
+		if (gre_flags & 0x2000) /* K: key present */
+			gre_hdr_len += 4;
+		if (gre_flags & 0x1000) /* S: sequence present */
+			gre_hdr_len += 4;
+
+		if (data_len < meta->l4_offset + gre_hdr_len)
+			return -1;
+
+		/* Store flags in icmp_type for the pipeline to check K bit.
+		 * Key extraction into ports happens in pipeline.c when
+		 * gre_accel is enabled. */
+		meta->icmp_type = (gre_flags >> 8) & 0xFF;
+		meta->payload_offset = meta->l4_offset + gre_hdr_len;
+		break;
+	}
+
 	default:
 		/* Other protocols: no L4 ports */
 		meta->payload_offset = meta->l4_offset;

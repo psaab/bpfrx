@@ -633,3 +633,31 @@ func TestLo0FilterMissingFilterName(t *testing.T) {
 		t.Errorf("FlowConfig Lo0FilterV4 = 0x%04x, want 0x%04x (none)", fc.Lo0FilterV4, Lo0FilterNone)
 	}
 }
+
+func TestGREPerformanceAcceleration(t *testing.T) {
+	// Verify that GREPerformanceAcceleration config maps to GREAccel=1
+	// in the BPF FlowConfigValue struct.
+	flow := config.FlowConfig{
+		GREPerformanceAcceleration: true,
+	}
+
+	var fc FlowConfigValue
+	if flow.GREPerformanceAcceleration {
+		fc.GREAccel = 1
+	}
+	if fc.GREAccel != 1 {
+		t.Errorf("GREAccel = %d, want 1", fc.GREAccel)
+	}
+
+	// Disabled case
+	flow2 := config.FlowConfig{
+		GREPerformanceAcceleration: false,
+	}
+	var fc2 FlowConfigValue
+	if flow2.GREPerformanceAcceleration {
+		fc2.GREAccel = 1
+	}
+	if fc2.GREAccel != 0 {
+		t.Errorf("GREAccel = %d, want 0", fc2.GREAccel)
+	}
+}

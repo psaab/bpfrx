@@ -7714,6 +7714,8 @@ func protoNameFromNum(p uint8) string {
 		return "UDP"
 	case 1:
 		return "ICMP"
+	case 47:
+		return "GRE"
 	case dataplane.ProtoICMPv6:
 		return "ICMPv6"
 	default:
@@ -7730,6 +7732,8 @@ func protoNameToID(name string) string {
 		return "17"
 	case "ICMP":
 		return "1"
+	case "GRE":
+		return "47"
 	case "ICMPV6":
 		return "58"
 	default:

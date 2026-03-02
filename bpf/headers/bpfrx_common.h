@@ -214,6 +214,7 @@ struct icmp6hdr {
 #define PROTO_TCP              6
 #define PROTO_UDP              17
 #define PROTO_ICMP             1
+#define PROTO_GRE              47
 #define PROTO_ESP              50
 #define PROTO_AH               51
 #define PROTO_VRRP             112

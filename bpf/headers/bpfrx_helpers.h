@@ -485,6 +485,68 @@ parse_l4hdr(void *data, void *data_end, struct pkt_meta *meta)
 		/* No L4 checksum for ESP (auth covers entire payload) */
 		break;
 	}
+	case PROTO_GRE: {
+		/* GRE header (RFC 2784/2890):
+		 *   bytes 0-1: flags (C|res|K|S|Reserved0|Ver)
+		 *   bytes 2-3: protocol type
+		 *   optional:  checksum+reserved1 (4B if C=1),
+		 *              key (4B if K=1), sequence (4B if S=1)
+		 *
+		 * When gre_accel is enabled, split the 32-bit GRE key
+		 * into src_port/dst_port for per-tunnel session tracking
+		 * (same pattern as ESP SPI). */
+		struct {
+			__be16 flags;
+			__be16 protocol;
+		} *gre = l4;
+		if ((void *)(gre + 1) > data_end)
+			return -1;
+
+		__u16 flags = bpf_ntohs(gre->flags);
+		__u16 gre_hdr_len = 4; /* minimum */
+
+		if (flags & 0x8000) /* C: checksum present */
+			gre_hdr_len += 4;
+
+		/* Check gre_accel before parsing key — only extract key
+		 * into ports when acceleration is enabled. */
+		if (flags & 0x2000) { /* K: key present */
+			__u32 fc_z = 0;
+			struct flow_config *fc =
+				bpf_map_lookup_elem(&flow_config_map, &fc_z);
+			if (fc && fc->gre_accel) {
+				/* Read key at constant offset per branch
+				 * to keep verifier happy. */
+				if (flags & 0x8000) {
+					/* C+K: key at offset 8 */
+					__be32 *kp = l4 + 8;
+					if ((void *)(kp + 1) <= data_end) {
+						meta->src_port =
+							(__be16)(*kp >> 16);
+						meta->dst_port =
+							(__be16)(*kp & 0xFFFF);
+					}
+				} else {
+					/* K only: key at offset 4 */
+					__be32 *kp = l4 + 4;
+					if ((void *)(kp + 1) <= data_end) {
+						meta->src_port =
+							(__be16)(*kp >> 16);
+						meta->dst_port =
+							(__be16)(*kp & 0xFFFF);
+					}
+				}
+			}
+			gre_hdr_len += 4;
+		}
+
+		if (flags & 0x1000) /* S: sequence present */
+			gre_hdr_len += 4;
+
+		meta->payload_offset = meta->l4_offset + gre_hdr_len;
+		/* No L4 checksum field used for session tracking */
+		break;
+	}
 	default:
 		meta->payload_offset = meta->l4_offset;
 		break;
