@@ -1845,6 +1845,14 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 	}
 }
 
+// resolveJunosIfName converts a Junos-style interface name to its Linux
+// equivalent. It resolves RETH names to their physical members (e.g.
+// reth0.50 → ge-0/0/0.50) and converts Junos slashes to dashes (e.g.
+// ge-0/0/0 → ge-0-0-0).
+func resolveJunosIfName(cfg *config.Config, ifName string) string {
+	return config.LinuxIfName(cfg.ResolveReth(ifName))
+}
+
 // stripCIDR removes the /prefix from a CIDR string, returning just the IP.
 func stripCIDR(s string) string {
 	ip, _, err := net.ParseCIDR(s)
@@ -1893,7 +1901,11 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 		if ip == nil {
 			return
 		}
-		link, err := netlink.LinkByName(ifName)
+		resolved := resolveJunosIfName(cfg, ifName)
+		if resolved != ifName {
+			slog.Debug("neighbor warmup: resolved interface name", "from", ifName, "to", resolved)
+		}
+		link, err := netlink.LinkByName(resolved)
 		if err != nil {
 			return
 		}
