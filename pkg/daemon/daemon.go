@@ -1505,7 +1505,12 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// 4. Proactive neighbor resolution for all known next-hops/gateways.
 	// This ensures bpf_fib_lookup returns SUCCESS (with valid MACs)
 	// instead of NO_NEIGH for the first forwarded packet.
-	d.resolveNeighbors(cfg)
+	// In cluster mode, skip here — RETH VIPs are not yet installed (VRRP
+	// hasn't become MASTER), so RouteGet() for WAN next-hops may fail.
+	// resolveNeighbors() is triggered on VRRP MASTER in watchVRRPEvents.
+	if cfg.Chassis.Cluster == nil {
+		d.resolveNeighbors(cfg)
+	}
 
 	// 5. Apply RA config (Router Advertisements)
 	// In cluster mode, RA/kea are managed by watchVRRPEvents — only
@@ -1962,7 +1967,11 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 
 // runPeriodicNeighborResolution re-runs neighbor resolution every 15 seconds
 // to keep ARP/NDP entries warm for known forwarding targets.
+// Runs once immediately at start to avoid a 15s blind spot.
 func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context, cfg *config.Config) {
+	// Immediate first run — don't wait for first tick.
+	d.resolveNeighbors(cfg)
+
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -3950,6 +3959,14 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					}
 					d.dp.BumpFIBGeneration()
 					go d.warmNeighborCache()
+					go func() {
+						// Resolve config-based next-hops (static routes,
+						// DHCP gateways) now that RETH VIPs are installed
+						// and routes are reachable.
+						if cfg := d.store.ActiveConfig(); cfg != nil {
+							d.resolveNeighbors(cfg)
+						}
+					}()
 					go d.RefreshFabricFwd()
 				}
 				d.removeBlackholeRoutes(rgID)
