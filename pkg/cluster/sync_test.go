@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"encoding/binary"
+	"net"
 	"testing"
 	"time"
 
@@ -680,6 +681,73 @@ func TestSyncSweepPerRGV6(t *testing.T) {
 
 	if ss.stats.SessionsSent.Load() != 1 {
 		t.Fatalf("expected 1 v6 session synced, got %d", ss.stats.SessionsSent.Load())
+	}
+}
+
+func TestHandleDisconnectStaleConn(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+
+	// Create two pipe connections to simulate conn A and conn B.
+	connA1, connA2 := net.Pipe()
+	defer connA1.Close()
+	defer connA2.Close()
+	connB1, connB2 := net.Pipe()
+	defer connB1.Close()
+	defer connB2.Close()
+
+	// Set conn A as the active connection.
+	ss.mu.Lock()
+	ss.conn = connA1
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	// Replace conn A with conn B (simulates accept/connect race).
+	ss.mu.Lock()
+	ss.conn = connB1
+	ss.mu.Unlock()
+
+	// Conn A's goroutine calls handleDisconnect with stale conn A.
+	// This should NOT close conn B.
+	ss.handleDisconnect(connA1)
+
+	ss.mu.Lock()
+	currentConn := ss.conn
+	ss.mu.Unlock()
+
+	if currentConn != connB1 {
+		t.Fatal("handleDisconnect(staleConn) should not replace the active connection")
+	}
+	if !ss.stats.Connected.Load() {
+		t.Fatal("handleDisconnect(staleConn) should not mark as disconnected")
+	}
+
+	// Now disconnect with the actual conn B — should work.
+	ss.handleDisconnect(connB1)
+
+	ss.mu.Lock()
+	currentConn = ss.conn
+	ss.mu.Unlock()
+
+	if currentConn != nil {
+		t.Fatal("handleDisconnect(activeConn) should clear s.conn")
+	}
+	if ss.stats.Connected.Load() {
+		t.Fatal("handleDisconnect(activeConn) should mark as disconnected")
+	}
+}
+
+func TestHandleDisconnectAlreadyNil(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+
+	connA1, connA2 := net.Pipe()
+	defer connA1.Close()
+	defer connA2.Close()
+
+	// conn is nil, calling handleDisconnect should not panic.
+	ss.handleDisconnect(connA1)
+
+	if ss.stats.Connected.Load() {
+		t.Fatal("should remain disconnected")
 	}
 }
 

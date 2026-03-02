@@ -400,7 +400,7 @@ func (s *SessionSync) QueueConfig(configText string) {
 	if err := writeMsg(conn, syncMsgConfig, payload); err != nil {
 		slog.Warn("cluster sync: config send error", "err", err)
 		s.stats.Errors.Add(1)
-		s.handleDisconnect()
+		s.handleDisconnect(conn)
 		return
 	}
 	s.stats.ConfigsSent.Add(1)
@@ -421,7 +421,7 @@ func (s *SessionSync) SendFailover(rgID int) error {
 	if err := writeMsg(conn, syncMsgFailover, payload); err != nil {
 		slog.Warn("cluster sync: failover send error", "err", err, "rg", rgID)
 		s.stats.Errors.Add(1)
-		s.handleDisconnect()
+		s.handleDisconnect(conn)
 		return fmt.Errorf("failed to send failover request: %w", err)
 	}
 	slog.Info("cluster sync: failover request sent to peer", "rg", rgID)
@@ -598,7 +598,7 @@ func (s *SessionSync) sendLoop(ctx context.Context) {
 			if _, err := conn.Write(msg); err != nil {
 				slog.Debug("cluster sync: send error", "err", err)
 				s.stats.Errors.Add(1)
-				s.handleDisconnect()
+				s.handleDisconnect(conn)
 			}
 		}
 	}
@@ -606,7 +606,7 @@ func (s *SessionSync) sendLoop(ctx context.Context) {
 
 func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 	defer func() {
-		s.handleDisconnect()
+		s.handleDisconnect(conn)
 	}()
 
 	hdrBuf := make([]byte, syncHeaderSize)
@@ -875,15 +875,19 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 	}
 }
 
-func (s *SessionSync) handleDisconnect() {
+func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.conn != nil {
+	if s.conn != nil && s.conn == conn {
 		s.conn.Close()
 		s.conn = nil
+		s.stats.Connected.Store(false)
+		slog.Info("cluster sync: peer disconnected")
+	} else if s.conn != conn {
+		slog.Debug("cluster sync: ignoring stale disconnect",
+			"stale", fmt.Sprintf("%p", conn),
+			"current", fmt.Sprintf("%p", s.conn))
 	}
-	s.stats.Connected.Store(false)
-	slog.Info("cluster sync: peer disconnected")
 }
 
 // FormatStats returns a formatted string of sync statistics.
@@ -939,7 +943,7 @@ func (s *SessionSync) QueueIPsecSA(connectionNames []string) {
 	if err := writeMsg(conn, syncMsgIPsecSA, payload); err != nil {
 		slog.Warn("cluster sync: IPsec SA send error", "err", err)
 		s.stats.Errors.Add(1)
-		s.handleDisconnect()
+		s.handleDisconnect(conn)
 		return
 	}
 	s.stats.IPsecSASent.Add(1)
