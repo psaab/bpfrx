@@ -16,11 +16,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
@@ -65,6 +67,8 @@ type Config struct {
 	VRRPMgr         *vrrp.Manager                    // native VRRP manager
 	RAMgr           *ra.Manager                      // embedded RA sender manager
 	Version      string                    // software version string
+	FabricPeerAddrFn func() string          // returns peer fabric IP (empty if standalone)
+	FabricVRFDevice  string                 // VRF for fabric interface (e.g. "vrf-mgmt")
 }
 
 // Server implements the BpfrxService gRPC service.
@@ -89,6 +93,8 @@ type Server struct {
 	startTime    time.Time
 	addr         string
 	version      string
+	fabricPeerAddrFn func() string
+	fabricVRFDevice  string
 }
 
 // NewServer creates a new gRPC server.
@@ -116,6 +122,8 @@ func NewServer(addr string, cfg Config) *Server {
 		startTime:    time.Now(),
 		addr:         addr,
 		version:      cfg.Version,
+		fabricPeerAddrFn: cfg.FabricPeerAddrFn,
+		fabricVRFDevice:  cfg.FabricVRFDevice,
 	}
 }
 
@@ -148,6 +156,45 @@ func (s *Server) Run(ctx context.Context) error {
 
 	srv.GracefulStop()
 	return nil
+}
+
+// RunFabricListener starts an additional gRPC listener on the fabric IP
+// so the cluster peer can proxy monitor requests. Blocks until ctx is cancelled.
+// vrfDevice may be empty for default VRF, or e.g. "vrf-mgmt".
+func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var err error
+			c.Control(func(fd uintptr) {
+				_ = unix.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+				_ = unix.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+				if vrfDevice != "" {
+					err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, vrfDevice)
+				}
+			})
+			return err
+		},
+	}
+	lis, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		slog.Warn("gRPC fabric listener failed", "addr", addr, "vrf", vrfDevice, "err", err)
+		return
+	}
+
+	srv := grpc.NewServer(
+		grpc.UnaryInterceptor(s.configLockInterceptor),
+	)
+	pb.RegisterBpfrxServiceServer(srv, s)
+
+	go func() {
+		slog.Info("gRPC fabric listener started", "addr", addr, "vrf", vrfDevice)
+		if err := srv.Serve(lis); err != nil {
+			slog.Warn("gRPC fabric listener error", "err", err)
+		}
+	}()
+
+	<-ctx.Done()
+	srv.GracefulStop()
 }
 
 // configLockInterceptor auto-releases stale config locks when a gRPC client
@@ -8261,6 +8308,60 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 	}
 }
 
+// proxyMonitorInterface forwards a MonitorInterface stream to the cluster peer.
+func (s *Server) proxyMonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.ServerStreamingServer[pb.MonitorInterfaceResponse]) error {
+	if s.fabricPeerAddrFn == nil {
+		return status.Error(codes.Unavailable, "not in cluster mode")
+	}
+	peerIP := s.fabricPeerAddrFn()
+	if peerIP == "" {
+		return status.Error(codes.Unavailable, "cluster peer address not available")
+	}
+
+	peerAddr := fmt.Sprintf("%s:50051", peerIP)
+	ctx := stream.Context()
+
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if s.fabricVRFDevice != "" {
+		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Control: func(network, address string, c syscall.RawConn) error {
+					var err error
+					c.Control(func(fd uintptr) {
+						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, s.fabricVRFDevice)
+					})
+					return err
+				},
+			}
+			return dialer.DialContext(ctx, "tcp", addr)
+		}))
+	}
+	conn, err := grpc.NewClient(peerAddr, dialOpts...)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "cannot connect to peer %s: %v", peerAddr, err)
+	}
+	defer conn.Close()
+
+	client := pb.NewBpfrxServiceClient(conn)
+	peerStream, err := client.MonitorInterface(ctx, req)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "peer monitor failed: %v", err)
+	}
+
+	for {
+		resp, err := peerStream.Recv()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		if err := stream.Send(resp); err != nil {
+			return err
+		}
+	}
+}
+
 // MonitorInterface streams pre-formatted interface statistics frames.
 func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.ServerStreamingServer[pb.MonitorInterfaceResponse]) error {
 	cfg := s.store.ActiveConfig()
@@ -8280,14 +8381,63 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 		return config.LinuxIfName(resolved)
 	}
 
+	// isRethName returns true if the name is a RETH interface (reth0, reth1, etc).
+	isRethName := func(name string) bool {
+		return strings.HasPrefix(name, "reth")
+	}
+
+	// rethRG returns the redundancy group for a RETH interface, or -1.
+	rethRG := func(name string) int {
+		parts := strings.SplitN(name, ".", 2)
+		if ifc, ok := cfg.Interfaces.Interfaces[parts[0]]; ok && ifc.RedundancyGroup > 0 {
+			return ifc.RedundancyGroup
+		}
+		return -1
+	}
+
+	// isPeerInterface returns true if the named interface is a cluster peer's
+	// physical member. Checks redundancy-group interface monitors and member
+	// interfaces that don't exist locally.
+	isPeerInterface := func(name string) bool {
+		if cfg.Chassis.Cluster == nil {
+			return false
+		}
+		base := strings.SplitN(name, ".", 2)[0]
+		// Check RG interface monitors.
+		for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+			for _, mon := range rg.InterfaceMonitors {
+				if strings.SplitN(mon.Interface, ".", 2)[0] == base {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
 	isSingle := req.InterfaceName != ""
 	var singleDisplayName, singleKernelName string
 	if isSingle {
 		singleDisplayName = req.InterfaceName
 		singleKernelName = resolveToKernel(req.InterfaceName)
-		// Validate the interface exists.
+
+		// Check if interface should be proxied to the cluster peer.
+		needProxy := false
 		if _, err := net.InterfaceByName(singleKernelName); err != nil {
-			return status.Errorf(codes.NotFound, "interface %s not found", req.InterfaceName)
+			// Interface doesn't exist locally. Check if it's a peer's physical member.
+			if isPeerInterface(req.InterfaceName) {
+				needProxy = true
+			} else {
+				return status.Errorf(codes.NotFound, "interface %s not found", req.InterfaceName)
+			}
+		} else if isRethName(req.InterfaceName) {
+			// RETH exists locally but may be MASTER on the peer node.
+			if rg := rethRG(req.InterfaceName); rg > 0 && s.cluster != nil && !s.cluster.IsLocalPrimary(rg) {
+				needProxy = true
+			}
+		}
+
+		if needProxy {
+			return s.proxyMonitorInterface(req, stream)
 		}
 	}
 

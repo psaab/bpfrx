@@ -131,6 +131,9 @@ type Daemon struct {
 	fabricMu     sync.RWMutex
 	fabricIface  string
 	fabricPeerIP net.IP
+
+	// gRPC server reference for starting fabric listener in cluster mode.
+	grpcSrv *grpcapi.Server
 }
 
 // New creates a new Daemon.
@@ -686,7 +689,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 			VRRPMgr: d.vrrpMgr,
 			RAMgr:   d.ra,
 			Version: d.opts.Version,
+			FabricPeerAddrFn: func() string {
+				d.fabricMu.RLock()
+				defer d.fabricMu.RUnlock()
+				if d.fabricPeerIP != nil {
+					return d.fabricPeerIP.String()
+				}
+				return ""
+			},
+			FabricVRFDevice: func() string {
+				if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil && c.Chassis.Cluster.FabricInterface != "" {
+					return "vrf-mgmt"
+				}
+				return ""
+			}(),
 		})
+		d.grpcSrv = grpcSrv
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -3465,6 +3483,19 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			syncLocal := fmt.Sprintf("%s:4785", fabIP)
 			syncPeer := fmt.Sprintf("%s:4785", cc.FabricPeerAddress)
 			d.sessionSync = cluster.NewSessionSync(syncLocal, syncPeer, nil)
+
+			// Start gRPC fabric listener so peer can proxy monitor requests.
+			// d.grpcSrv is set after startClusterComms returns, so we poll briefly.
+			go func() {
+				for i := 0; i < 30; i++ {
+					if d.grpcSrv != nil {
+						fabricGRPC := fmt.Sprintf("%s:50051", fabIP)
+						d.grpcSrv.RunFabricListener(ctx, fabricGRPC, vrfDevice)
+						return
+					}
+					time.Sleep(time.Second)
+				}
+			}()
 
 			// Wire sync stats into cluster manager for CLI display.
 			d.cluster.SetSyncStats(d.sessionSync)
