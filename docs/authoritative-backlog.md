@@ -21,10 +21,10 @@ Use these sources in this order when there is disagreement:
 ### 1) vSRX parity gaps (from `docs/feature-gaps.md` row data)
 
 Row-level gap totals:
-- Missing: 125
-- Partial: 15
-- Parse-Only: 5
-- Total Open Gaps: 145
+- Missing: 122
+- Partial: 14
+- Parse-Only: 4
+- Total Open Gaps: 140
 
 Category totals:
 
@@ -49,7 +49,7 @@ Category totals:
 | 18. QoS / Class of Service | 7 | 1 | 0 | 8 |
 | 19. Multi-Tenancy | 4 | 0 | 0 | 4 |
 | 20. Management & Automation | 9 | 2 | 0 | 11 |
-| 21. Interface Enhancements | 4 | 2 | 1 | 7 |
+| 21. Interface Enhancements | 1 | 1 | 0 | 2 |
 | 22. System Enhancements | 5 | 1 | 2 | 8 |
 | 23. Miscellaneous Features | 6 | 0 | 0 | 6 |
 
@@ -96,6 +96,7 @@ These are not currently tracked as explicit rows in `docs/feature-gaps.md`.
 These are documented as implemented in `docs/phases.md` and should not remain in open status tables:
 
 - Sprint IF-1: LAG/ae, flexible VLAN tagging, interface bandwidth, point-to-point runtime wiring, primary/preferred wiring, interface description display
+- Remaining parity caveat in section 21: transparent mode is still missing, and primary/preferred is still partial for some device-originated traffic paths.
 - Sprint PR #67: `monitor security flow` and `monitor security packet-drop`
 - Sprint #68: HA fail-closed default + `set chassis cluster hitless-restart` opt-in
 - HA sync hardening sprint #69-#80 items called out as fixed in `docs/bugs.md`
@@ -103,33 +104,17 @@ These are documented as implemented in `docs/phases.md` and should not remain in
   - NO_NEIGH failover issue
   - Monotonic clock skew session expiry issue
 
-## Stale or contradictory documentation
+## Stale or historical docs
 
-### A) `docs/feature-gaps.md`
+### `docs/vsrx-gaps.md`
 
-- Top summary table reports 155 gaps, but row-level status totals produce 145 open gaps.
-- Section 21 still marks IF-1 interface items as missing/partial/parse-only despite IF-1 implemented status in `docs/phases.md`.
-- Parse-only summary table still includes items that were later wired.
-
-### B) Proposal docs that are now shipped
-
-- `docs/next-features/monitor-command.md` still reads as proposal, but monitor commands are documented as implemented in `docs/phases.md` and present in code.
-- `docs/ha-no-hitless-restart.md` still marked Proposed, but feature is documented as implemented in sprint #68 and wired in config/runtime.
-
-### C) `docs/sync-protocol.md` Known Issues drift
-
-- `NO_NEIGH after failover` and `Monotonic clock skew` are marked IN PROGRESS there, but marked FIXED in `docs/bugs.md`.
-
-### D) `docs/vsrx-gaps.md` drift
-
-- Contains legacy claims that conflict with later HA and interface implementation sprints.
+- Marked as a historical snapshot and superseded for active planning by `docs/feature-gaps.md` and this backlog file.
 
 ## Maintenance actions
 
-1. Rebuild `docs/feature-gaps.md` summary and section 21/parse-only statuses from current implementation evidence.
-2. Update proposal docs to either `Implemented` or move remaining deltas into explicit follow-up sections.
-3. Align `docs/sync-protocol.md` Known Issues with `docs/bugs.md` fixed state.
-4. Decide whether JTI/AppQoE/Cloud-init are in product scope; if yes, add explicit rows to `docs/feature-gaps.md`.
+1. Keep `docs/feature-gaps.md` summary totals in lockstep with row-level status changes.
+2. For `docs/next-features/*`, always include explicit `Date` and `Status` metadata and flip to `Implemented` when shipped.
+3. Decide whether JTI/AppQoE/Cloud-init are in product scope; if yes, add explicit rows to `docs/feature-gaps.md`.
 
 ## Reproducibility note
 

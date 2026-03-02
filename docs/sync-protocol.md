@@ -240,8 +240,8 @@ Forward-only sweep entries are reconstructed into full conntrack state:
 - Interface indices and MACs differ between nodes; zero forces fresh `bpf_fib_lookup`
 
 ### Known Issues
-- **NO_NEIGH after failover (IN PROGRESS):** Cold ARP cache on takeover → `bpf_fib_lookup` rc=7 → XDP_PASS un-NAT'd
-- **Monotonic clock skew (IN PROGRESS):** Remote timestamps in synced sessions → premature GC expiry
+- **NO_NEIGH after failover (FIXED, `0080cbc`):** Cold ARP cache on takeover previously caused `bpf_fib_lookup` rc=7 and mis-forward behavior. This was fixed in HA sync hardening.
+- **Monotonic clock skew (FIXED, `0080cbc`):** Remote timestamps in synced sessions previously caused premature GC expiry; this was fixed in receiver-side handling.
 
 ## Statistics (SyncStats)
 

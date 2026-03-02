@@ -1,5 +1,8 @@
 # Next Feature: `services application-identification`
 
+Date: 2026-03-02  
+Status: Proposed
+
 ## Config Evidence
 - Present in `/home/ps/git/bpfrx/vsrx.conf:214` as `application-identification;`
 

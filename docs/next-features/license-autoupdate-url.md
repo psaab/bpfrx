@@ -1,5 +1,8 @@
 # Next Feature: `system license autoupdate url`
 
+Date: 2026-03-02  
+Status: Proposed
+
 ## Config Evidence
 - Present in `/home/ps/git/bpfrx/vsrx.conf:98-99` under `license { autoupdate { url ... } }`
 

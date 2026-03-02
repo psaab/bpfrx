@@ -1,5 +1,8 @@
 # Next Feature: `system ntp threshold <ms> action <accept|reject>`
 
+Date: 2026-03-02  
+Status: Proposed
+
 ## Config Evidence
 - Present in `/home/ps/git/bpfrx/vsrx.conf:109` as `threshold 400 action accept;`
 
