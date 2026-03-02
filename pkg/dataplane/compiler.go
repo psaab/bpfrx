@@ -671,6 +671,12 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 					result.applyEthtool(physName, ifCfg)
 				}
 
+				// Tune ring buffers and txqueuelen BEFORE XDP attachment
+				// (ethtool -G can reset the NIC, disrupting attached programs).
+				if nlErr == nil {
+					result.tuneInterfaceBuffers(nl)
+				}
+
 				// Bring the interface UP so XDP can process traffic,
 				// unless the interface is administratively disabled.
 				// Note: For DPDK-bound ports, LinkSetDown has no effect because
@@ -4102,6 +4108,79 @@ func parseDuplex(d string) string {
 	default:
 		return ""
 	}
+}
+
+// tuneInterfaceBuffers increases txqueuelen and TX/RX ring buffer sizes on
+// data-plane interfaces to reduce packet drops from XDP redirect overflow.
+// Must be called BEFORE XDP attachment since ethtool -G can reset the NIC.
+// Results are cached to skip redundant calls across recompilations.
+func (r *CompileResult) tuneInterfaceBuffers(link netlink.Link) {
+	name := link.Attrs().Name
+	if r.ethtoolApplied["buffers:"+name] {
+		return
+	}
+
+	const desiredTxQLen = 10000
+	if link.Attrs().TxQLen < desiredTxQLen {
+		if err := netlink.LinkSetTxQLen(link, desiredTxQLen); err != nil {
+			slog.Debug("failed to set txqueuelen", "interface", name, "err", err)
+		}
+	}
+
+	// Increase ring buffers via ethtool -G. Query current/max first.
+	out, err := exec.Command("ethtool", "-g", name).CombinedOutput()
+	if err != nil {
+		r.ethtoolApplied["buffers:"+name] = true
+		return
+	}
+
+	maxTX, curTX := parseRingParams(string(out))
+	if maxTX > 0 && curTX < maxTX {
+		if out, err := exec.Command("ethtool", "-G", name,
+			"tx", strconv.Itoa(maxTX),
+			"rx", strconv.Itoa(maxTX),
+		).CombinedOutput(); err != nil {
+			slog.Debug("failed to increase ring buffers",
+				"interface", name, "err", fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))
+		} else {
+			slog.Info("increased ring buffers",
+				"interface", name, "tx", maxTX)
+		}
+	}
+
+	r.ethtoolApplied["buffers:"+name] = true
+}
+
+// parseRingParams extracts max and current TX ring sizes from ethtool -g output.
+func parseRingParams(output string) (maxTX, curTX int) {
+	lines := strings.Split(output, "\n")
+	inMax := false
+	inCur := false
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Pre-set maximums:") {
+			inMax = true
+			inCur = false
+			continue
+		}
+		if strings.HasPrefix(line, "Current hardware settings:") {
+			inCur = true
+			inMax = false
+			continue
+		}
+		if strings.HasPrefix(line, "TX:") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				val, _ := strconv.Atoi(parts[1])
+				if inMax {
+					maxTX = val
+				} else if inCur {
+					curTX = val
+				}
+			}
+		}
+	}
+	return
 }
 
 // compilePortMirroring populates the mirror_config BPF map from
