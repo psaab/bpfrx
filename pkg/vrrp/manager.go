@@ -329,6 +329,23 @@ func (m *Manager) ReconcileVIPs() {
 	}
 }
 
+// RGVRRPReady returns whether at least one VRRP instance exists and is
+// running for the given redundancy group. The RG ID is mapped to VRID
+// as 100 + rgID (the standard RETH VRID convention).
+// Returns (true, nil) if ready, (false, reasons) if not.
+func (m *Manager) RGVRRPReady(rgID int) (bool, []string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	vrid := 100 + rgID
+	for _, vi := range m.instances {
+		if vi.cfg.GroupID == vrid {
+			return true, nil
+		}
+	}
+	return false, []string{fmt.Sprintf("vrrp: no instance for RG %d (VRID %d)", rgID, vrid)}
+}
+
 // States returns the current state of all instances.
 // Key format: "VI_<iface>_<group>" → "MASTER", "BACKUP", "INIT".
 func (m *Manager) States() map[string]string {

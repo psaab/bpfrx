@@ -4278,6 +4278,25 @@ func (d *Daemon) reconcileRGState() {
 		rgIDs = append(rgIDs, rgID)
 	}
 
+	// Evaluate per-RG readiness for the takeover gate.
+	if mon := d.cluster.Monitor(); mon != nil {
+		for _, rgID := range rgIDs {
+			ifReady, ifReasons := mon.RGInterfaceReady(rgID)
+			var vrrpReady bool
+			var vrrpReasons []string
+			if d.vrrpMgr != nil {
+				vrrpReady, vrrpReasons = d.vrrpMgr.RGVRRPReady(rgID)
+			} else {
+				vrrpReady = true // no VRRP = always ready
+			}
+			ready := ifReady && vrrpReady
+			var reasons []string
+			reasons = append(reasons, ifReasons...)
+			reasons = append(reasons, vrrpReasons...)
+			d.cluster.SetRGReady(rgID, ready, reasons)
+		}
+	}
+
 	for _, rgID := range rgIDs {
 		clusterPri := d.cluster.IsLocalPrimary(rgID)
 		vrrp := rgVRRP[rgID] // may be nil if no VRRP instances for this RG

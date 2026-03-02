@@ -78,6 +78,7 @@ type ClusterConfig struct {
 	RethAdvertiseInterval int    // RETH VRRP advertisement interval in milliseconds, 0=default(30)
 	HitlessRestart        bool   // preserve BPF state on shutdown (default false in HA — fail-closed)
 	PeerFencing           string // peer fencing action on heartbeat timeout: "", "disable-rg"
+	TakeoverHoldTime      int    // milliseconds, 0=default(3000) — readiness gate hold time before allowing primary takeover
 	RedundancyGroups      []*RedundancyGroup
 }
 

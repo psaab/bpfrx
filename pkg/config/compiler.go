@@ -6004,6 +6004,13 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 			ch.Cluster.PeerFencing = v
 		}
 	}
+	if n := clusterNode.FindChild("takeover-hold-time"); n != nil {
+		if v := nodeVal(n); v != "" {
+			if ms, err := strconv.Atoi(v); err == nil {
+				ch.Cluster.TakeoverHoldTime = ms
+			}
+		}
+	}
 
 	for _, rgInst := range namedInstances(clusterNode.FindChildren("redundancy-group")) {
 		rgID := 0

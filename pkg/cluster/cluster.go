@@ -55,6 +55,18 @@ type RedundancyGroupState struct {
 	Weight           int       // current effective weight (255 - sum of down monitor weights)
 	FailoverCount  int
 	MonitorFails   []string // names of currently-failed monitors
+
+	// Readiness gate: blocks promotion to primary until interfaces + VRRP
+	// are confirmed ready and have been ready for at least TakeoverHoldTime.
+	Ready            bool      // true if all local prerequisites are satisfied
+	ReadySince       time.Time // when Ready transitioned to true (zero if not ready)
+	ReadinessReasons []string  // reasons why not ready (empty when ready)
+}
+
+// IsReadyForTakeover returns true if the RG has been ready for at least
+// the specified hold time duration. Used by election to gate promotion.
+func (rg *RedundancyGroupState) IsReadyForTakeover(holdTime time.Duration) bool {
+	return rg.Ready && !rg.ReadySince.IsZero() && time.Since(rg.ReadySince) >= holdTime
 }
 
 // ClusterEvent signals a state change in the cluster.
@@ -115,21 +127,30 @@ type Manager struct {
 	// onEventDrop is called when a cluster event is dropped due to a full
 	// channel. The daemon uses this to trigger immediate reconciliation.
 	onEventDrop func()
+
+	// takeoverHoldTime is the minimum duration an RG must be ready before
+	// election will promote it to primary. Default: 3s.
+	takeoverHoldTime time.Duration
 }
+
+// DefaultTakeoverHoldTime is the default duration an RG must be ready
+// before election promotes it to primary.
+const DefaultTakeoverHoldTime = 3 * time.Second
 
 // NewManager creates a new cluster manager.
 func NewManager(nodeID, clusterID int) *Manager {
 	return &Manager{
-		nodeID:         nodeID,
-		clusterID:      clusterID,
-		groups:         make(map[int]*RedundancyGroupState),
-		monitorWeights: make(map[monitorKey]int),
-		eventCh:        make(chan ClusterEvent, 64),
-		garpCounts:     make(map[int]int),
-		peerGroups:     make(map[int]PeerGroupState),
-		hbInterval:     DefaultHeartbeatInterval,
-		hbThreshold:    DefaultHeartbeatThreshold,
-		history:        NewEventHistory(64),
+		nodeID:           nodeID,
+		clusterID:        clusterID,
+		groups:           make(map[int]*RedundancyGroupState),
+		monitorWeights:   make(map[monitorKey]int),
+		eventCh:          make(chan ClusterEvent, 64),
+		garpCounts:       make(map[int]int),
+		peerGroups:       make(map[int]PeerGroupState),
+		hbInterval:       DefaultHeartbeatInterval,
+		hbThreshold:      DefaultHeartbeatThreshold,
+		history:          NewEventHistory(64),
+		takeoverHoldTime: DefaultTakeoverHoldTime,
 	}
 }
 
@@ -141,6 +162,54 @@ func (m *Manager) ClusterID() int { return m.clusterID }
 
 // Events returns the event channel for state change notifications.
 func (m *Manager) Events() <-chan ClusterEvent { return m.eventCh }
+
+// Monitor returns the cluster interface/IP monitor, or nil if not set.
+func (m *Manager) Monitor() *Monitor {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.monitor
+}
+
+// SetRGReady updates the readiness state for a redundancy group.
+// When transitioning not-ready → ready, sets ReadySince to now.
+// When transitioning ready → not-ready, clears ReadySince and stores reasons.
+// After any change, triggers re-election to evaluate the readiness gate.
+func (m *Manager) SetRGReady(rgID int, ready bool, reasons []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rg, ok := m.groups[rgID]
+	if !ok {
+		return
+	}
+
+	wasReady := rg.Ready
+	rg.Ready = ready
+
+	if ready && !wasReady {
+		// Transition: not-ready → ready.
+		rg.ReadySince = time.Now()
+		rg.ReadinessReasons = nil
+		slog.Info("cluster: RG readiness: ready", "rg", rgID)
+	} else if !ready && wasReady {
+		// Transition: ready → not-ready.
+		rg.ReadySince = time.Time{}
+		rg.ReadinessReasons = reasons
+		slog.Info("cluster: RG readiness: not ready", "rg", rgID, "reasons", reasons)
+	} else if !ready {
+		// Still not ready — update reasons.
+		rg.ReadinessReasons = reasons
+	}
+
+	// Re-evaluate election on readiness change.
+	if wasReady != ready {
+		if m.peerAlive {
+			m.runElection()
+		} else {
+			m.electSingleNode()
+		}
+	}
+}
 
 // PeerAlive returns whether the peer node is reachable.
 func (m *Manager) PeerAlive() bool {
@@ -237,6 +306,11 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 	// Update peer fencing config.
 	m.peerFencing = cfg.PeerFencing
 
+	// Update takeover hold time.
+	if cfg.TakeoverHoldTime > 0 {
+		m.takeoverHoldTime = time.Duration(cfg.TakeoverHoldTime) * time.Millisecond
+	}
+
 	// Store GARP counts and update monitor groups.
 	for _, rg := range cfg.RedundancyGroups {
 		if rg.GratuitousARPCount > 0 {
@@ -272,6 +346,14 @@ func (m *Manager) electSingleNode() {
 		// configured); standalone nodes always elect immediately.
 		if !rg.Preempt && !m.peerEverSeen && rg.State == StateSecondary && m.controlInterface != "" {
 			continue
+		}
+		// Readiness gate: block new promotions in cluster mode until
+		// interfaces + VRRP are confirmed ready for holdTime.
+		// Does not gate standalone mode (no controlInterface).
+		if rg.State != StatePrimary && rg.Weight > 0 && m.controlInterface != "" {
+			if !rg.IsReadyForTakeover(m.takeoverHoldTime) {
+				continue
+			}
 		}
 		oldState := rg.State
 		if rg.Weight > 0 {
@@ -366,6 +448,10 @@ func (m *Manager) GroupStates() []RedundancyGroupState {
 			cp.MonitorFails = make([]string, len(rg.MonitorFails))
 			copy(cp.MonitorFails, rg.MonitorFails)
 		}
+		if len(rg.ReadinessReasons) > 0 {
+			cp.ReadinessReasons = make([]string, len(rg.ReadinessReasons))
+			copy(cp.ReadinessReasons, rg.ReadinessReasons)
+		}
 		states = append(states, cp)
 	}
 	sort.Slice(states, func(i, j int) bool {
@@ -386,6 +472,10 @@ func (m *Manager) GroupState(rgID int) *RedundancyGroupState {
 	if len(rg.MonitorFails) > 0 {
 		cp.MonitorFails = make([]string, len(rg.MonitorFails))
 		copy(cp.MonitorFails, rg.MonitorFails)
+	}
+	if len(rg.ReadinessReasons) > 0 {
+		cp.ReadinessReasons = make([]string, len(rg.ReadinessReasons))
+		copy(cp.ReadinessReasons, rg.ReadinessReasons)
 	}
 	return &cp
 }
@@ -992,10 +1082,18 @@ func (m *Manager) FormatStatus() string {
 		if len(rg.MonitorFails) > 0 {
 			monFails = strings.Join(rg.MonitorFails, ", ")
 		}
+		readyStr := "yes"
+		if !rg.Ready {
+			readyStr = "no"
+			if len(rg.ReadinessReasons) > 0 {
+				readyStr = "no (" + strings.Join(rg.ReadinessReasons, ", ") + ")"
+			}
+		}
 		// Local node line.
 		fmt.Fprintf(&b, "%-6s %-8d %-14s %-8s %-8s %s\n",
 			fmt.Sprintf("node%d", m.nodeID),
 			rg.LocalPriority, rg.State, preempt, manual, monFails)
+		fmt.Fprintf(&b, "  Takeover ready: %s\n", readyStr)
 		// Peer node line (if alive).
 		if peerAlive {
 			if pg, ok := peerGroups[rg.GroupID]; ok {
@@ -1084,6 +1182,15 @@ func (m *Manager) FormatInformation() string {
 		}
 		fmt.Fprintf(&b, "  Preempt: %s\n", preempt)
 		fmt.Fprintf(&b, "  Failover count: %d\n", rg.FailoverCount)
+		if rg.Ready {
+			fmt.Fprintf(&b, "  Takeover ready: yes (since %s)\n", rg.ReadySince.Format("15:04:05"))
+		} else {
+			reasons := "none"
+			if len(rg.ReadinessReasons) > 0 {
+				reasons = strings.Join(rg.ReadinessReasons, ", ")
+			}
+			fmt.Fprintf(&b, "  Takeover ready: no (%s)\n", reasons)
+		}
 		if len(rg.MonitorFails) > 0 {
 			fmt.Fprintf(&b, "  Monitor failures: %s\n", strings.Join(rg.MonitorFails, ", "))
 		}

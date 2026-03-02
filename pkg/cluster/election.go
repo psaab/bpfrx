@@ -199,6 +199,22 @@ func (m *Manager) runElection() {
 		}
 
 		result, reason := m.electRG(rg, peerGroup)
+
+		// Readiness gate: block NEW promotions to primary if the RG
+		// hasn't been ready for takeoverHoldTime. This does NOT demote
+		// an already-primary node. Only applies in cluster mode
+		// (controlInterface configured) — standalone nodes skip the gate.
+		if result == electLocalPrimary && rg.State != StatePrimary && m.controlInterface != "" {
+			if !rg.IsReadyForTakeover(m.takeoverHoldTime) {
+				slog.Info("cluster: election blocked by readiness gate",
+					"rg", rg.GroupID, "ready", rg.Ready,
+					"readySince", rg.ReadySince,
+					"holdTime", m.takeoverHoldTime,
+					"reasons", rg.ReadinessReasons)
+				continue
+			}
+		}
+
 		oldState := rg.State
 
 		switch result {

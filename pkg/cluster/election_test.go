@@ -459,6 +459,225 @@ func TestElection_TiePriority_LowerNodeWins(t *testing.T) {
 	}
 }
 
+func TestElection_BlocksPromotionWhenNotReady(t *testing.T) {
+	m := NewManager(0, 1)
+	m.takeoverHoldTime = 100 * time.Millisecond
+	m.controlInterface = "hb0" // cluster mode — enables readiness gate
+
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	// Force back to secondary for a clean test.
+	m.mu.Lock()
+	m.groups[0].State = StateSecondary
+	m.groups[0].Ready = false
+	m.groups[0].ReadySince = time.Time{}
+	m.mu.Unlock()
+
+	// Peer is secondary — election would normally promote us.
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	// Should NOT be primary — readiness gate blocks it.
+	if m.IsLocalPrimary(0) {
+		t.Error("should NOT be primary when RG is not ready")
+	}
+}
+
+func TestElection_AllowsPromotionAfterHoldTimer(t *testing.T) {
+	m := NewManager(0, 1)
+	m.takeoverHoldTime = 50 * time.Millisecond
+	m.controlInterface = "hb0" // cluster mode
+
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	// Force back to secondary.
+	m.mu.Lock()
+	m.groups[0].State = StateSecondary
+	// Mark ready with a ReadySince in the past (>holdTime ago).
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-100 * time.Millisecond)
+	m.mu.Unlock()
+
+	// Peer is secondary — election should promote us since ready > holdTime.
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	if !m.IsLocalPrimary(0) {
+		t.Error("should be primary after readiness hold time expired")
+	}
+}
+
+func TestElection_DoesNotDemoteExistingPrimary(t *testing.T) {
+	m := NewManager(0, 1)
+	m.takeoverHoldTime = 100 * time.Millisecond
+	m.controlInterface = "hb0" // cluster mode
+
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 200})) // preempt=true for simpler setup
+	// Pre-set ready state before UpdateConfig so election can promote.
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	// Force to primary (simulating an already-established primary).
+	m.mu.Lock()
+	m.groups[0].State = StatePrimary
+	m.groups[0].Ready = false
+	m.groups[0].ReadySince = time.Time{}
+	m.mu.Unlock()
+
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("should be primary (forced)")
+	}
+
+	// Peer arrives as secondary.
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	// Already-primary node should NOT be demoted by readiness gate.
+	if !m.IsLocalPrimary(0) {
+		t.Error("already-primary node should NOT be demoted by readiness gate")
+	}
+}
+
+func TestSetRGReady_TransitionsAndTimer(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	// Initial state: not ready.
+	states := m.GroupStates()
+	if states[0].Ready {
+		t.Error("should start not ready")
+	}
+	if !states[0].ReadySince.IsZero() {
+		t.Error("ReadySince should be zero when not ready")
+	}
+
+	// Transition to ready.
+	m.SetRGReady(0, true, nil)
+	states = m.GroupStates()
+	if !states[0].Ready {
+		t.Error("should be ready after SetRGReady(true)")
+	}
+	if states[0].ReadySince.IsZero() {
+		t.Error("ReadySince should be set after ready transition")
+	}
+
+	// Transition back to not ready.
+	m.SetRGReady(0, false, []string{"interface trust0 not found"})
+	states = m.GroupStates()
+	if states[0].Ready {
+		t.Error("should be not ready after SetRGReady(false)")
+	}
+	if !states[0].ReadySince.IsZero() {
+		t.Error("ReadySince should be cleared on not-ready transition")
+	}
+	if len(states[0].ReadinessReasons) != 1 || states[0].ReadinessReasons[0] != "interface trust0 not found" {
+		t.Errorf("unexpected reasons: %v", states[0].ReadinessReasons)
+	}
+}
+
+func TestIsReadyForTakeover(t *testing.T) {
+	rg := &RedundancyGroupState{GroupID: 0}
+
+	// Not ready at all.
+	if rg.IsReadyForTakeover(100 * time.Millisecond) {
+		t.Error("should not be ready when Ready=false")
+	}
+
+	// Ready but too recent.
+	rg.Ready = true
+	rg.ReadySince = time.Now()
+	if rg.IsReadyForTakeover(1 * time.Second) {
+		t.Error("should not be ready before hold time expires")
+	}
+
+	// Ready and hold time expired.
+	rg.ReadySince = time.Now().Add(-2 * time.Second)
+	if !rg.IsReadyForTakeover(1 * time.Second) {
+		t.Error("should be ready after hold time expires")
+	}
+
+	// Zero hold time — ready immediately.
+	rg.ReadySince = time.Now()
+	if !rg.IsReadyForTakeover(0) {
+		t.Error("should be ready with zero hold time")
+	}
+}
+
+func TestRGInterfaceReady(t *testing.T) {
+	m := NewManager(0, 1)
+	nlh := newMockNlHandle()
+	nlh.setLink("trust0", true)
+	nlh.setLink("untrust0", true)
+
+	groups := []*config.RedundancyGroup{
+		{
+			ID: 0,
+			InterfaceMonitors: []*config.InterfaceMonitor{
+				{Interface: "trust0", Weight: 255},
+				{Interface: "untrust0", Weight: 128},
+			},
+		},
+	}
+	mon := NewMonitor(m, groups)
+	mon.nlHandle = nlh
+
+	// All interfaces up — should be ready.
+	ready, reasons := mon.RGInterfaceReady(0)
+	if !ready {
+		t.Errorf("should be ready, got reasons: %v", reasons)
+	}
+
+	// Remove an interface.
+	delete(nlh.links, "trust0")
+	ready, reasons = mon.RGInterfaceReady(0)
+	if ready {
+		t.Error("should NOT be ready with missing interface")
+	}
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "trust0 not found") {
+		t.Errorf("unexpected reasons: %v", reasons)
+	}
+
+	// Interface exists but is down.
+	nlh.setLink("trust0", false)
+	ready, reasons = mon.RGInterfaceReady(0)
+	if ready {
+		t.Error("should NOT be ready with interface down")
+	}
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "trust0 down") {
+		t.Errorf("unexpected reasons: %v", reasons)
+	}
+
+	// RG not in config — should be ready (nothing to check).
+	ready, reasons = mon.RGInterfaceReady(99)
+	if !ready {
+		t.Errorf("unknown RG should be ready, got reasons: %v", reasons)
+	}
+}
+
 // drainEvents drains up to n events from the channel.
 func drainEvents(m *Manager, n int) {
 	for i := 0; i < n; i++ {

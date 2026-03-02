@@ -416,6 +416,47 @@ func defaultICMPDialer(network string) (icmpConn, error) {
 	return c, nil
 }
 
+// RGInterfaceReady checks if all local required interfaces for the given RG
+// exist and are operationally up. Returns (true, nil) if all ready, or
+// (false, reasons) with a list of missing/down interface names.
+func (mon *Monitor) RGInterfaceReady(rgID int) (bool, []string) {
+	mon.mu.Lock()
+	groups := mon.groups
+	mon.mu.Unlock()
+
+	nlh := mon.getNlHandle()
+
+	var reasons []string
+	found := false
+	for _, rg := range groups {
+		if rg.ID != rgID {
+			continue
+		}
+		found = true
+		for _, im := range rg.InterfaceMonitors {
+			linuxName := config.LinuxIfName(im.Interface)
+			link, err := nlh.LinkByName(linuxName)
+			if err != nil {
+				reasons = append(reasons, fmt.Sprintf("interface %s not found", im.Interface))
+				continue
+			}
+			up := link.Attrs().OperState == netlink.OperUp ||
+				link.Attrs().Flags&net.FlagUp != 0
+			if !up {
+				reasons = append(reasons, fmt.Sprintf("interface %s down", im.Interface))
+			}
+		}
+	}
+	if !found {
+		// No RG config found — treat as ready (nothing to check).
+		return true, nil
+	}
+	if len(reasons) > 0 {
+		return false, reasons
+	}
+	return true, nil
+}
+
 func (mon *Monitor) getNlHandle() nlLinkGetter {
 	if mon.nlHandle != nil {
 		return mon.nlHandle
