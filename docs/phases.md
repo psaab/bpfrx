@@ -2265,3 +2265,93 @@ without session management. This sprint changes the default shutdown behavior:
 - 3 parser tests: set syntax, hierarchical syntax, default-false verification
 - Verified standalone VM logs "hitless shutdown: preserving BPF state"
 - Known: `SessionSync.Stop()` blocks on WaitGroup in HA mode (pre-existing — sync reconnect loop doesn't exit cleanly within systemd's 20s timeout)
+
+## Sprint: HA Sync Hardening (#69–#73)
+
+Five fixes hardening the chassis cluster session sync path against real-world
+failure modes: stale goroutine teardowns, per-RG ownership gaps in bulk sync,
+stale session accumulation, peer fencing on heartbeat loss, and hard-crash
+test coverage.
+
+### #69: Connection-Specific Disconnect
+
+- **Problem:** `handleDisconnect()` unconditionally closed `s.conn`, but when
+  a new connection (conn B) replaces an old one (conn A) via the accept/connect
+  race, conn A's stale `receiveLoop` goroutine would exit and tear down the
+  active conn B — killing the live sync link.
+- **Fix:** Pass the specific `net.Conn` to `handleDisconnect(conn)`. Only close
+  if `s.conn == conn` (pointer identity check). If the connection has already
+  been replaced, log "ignoring stale disconnect" and return. Updated all callers:
+  `receiveLoop` defer, `sendLoop`, `SendFailover`, `QueueConfig`, `QueueIPsecSA`.
+- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+
+### #70: Per-RG BulkSync Ownership Filtering
+
+- **Problem:** `BulkSync()` sent ALL sessions regardless of RG ownership, while
+  the incremental 1s sweep correctly filtered via `ShouldSyncZone()`. This sent
+  unnecessary traffic and could install sessions on a node that doesn't own the
+  corresponding RG in active/active configurations.
+- **Fix:** Skip reverse entries and apply `ShouldSyncZone()` ownership check in
+  both v4 and v6 `BulkSync` iterators, matching the incremental sweep behavior.
+  Log skipped count for debugging.
+- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+
+### #71: Authoritative Stale-Entry Reconciliation
+
+- **Problem:** After a hard crash, the recovering node's sessions are stale.
+  BulkSync installs the peer's current sessions but never deletes locally-held
+  sessions that the peer no longer has. These phantom sessions persist until GC
+  timeout, potentially black-holing traffic that matches them.
+- **Fix:** Track all received forward session keys during BulkStart→BulkEnd in
+  per-protocol maps (`bulkRecvV4`/`bulkRecvV6`). On BulkEnd, call
+  `reconcileStaleSessions()` which iterates local sessions in peer-owned zones
+  (where `!ShouldSyncZone`), deletes any not in the received set (forward +
+  reverse entries + dnat_table cleanup).
+- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+
+### #72: Peer Fencing on Heartbeat Timeout
+
+- **Problem:** When heartbeat detects peer loss, the surviving node elects itself
+  primary but cannot prevent the failed peer from partially forwarding traffic if
+  its daemon is hung (not crashed). No mechanism existed to tell the peer to
+  stand down.
+- **Fix:** Added `syncMsgFence` message type (type 11). On heartbeat timeout,
+  `handlePeerTimeout()` checks `peerFencing == "disable-rg"` and calls
+  `SendFence()` via the fabric sync connection. The receiver's
+  `OnFenceReceived` callback disables all RGs. Best-effort — if sync is down
+  (likely during real failure), falls back to heartbeat-driven failover. Fence
+  events tracked in cluster history (`EventFence` category). Config:
+  `set chassis cluster peer-fencing disable-rg`.
+- **Files:** `pkg/cluster/cluster.go`, `pkg/cluster/cluster_test.go`,
+  `pkg/cluster/events.go`, `pkg/cluster/sync.go`, `pkg/cmdtree/tree.go`,
+  `pkg/config/ast.go`, `pkg/config/compiler.go`, `pkg/config/types.go`,
+  `pkg/config/parser_test.go`
+
+### #73: Hard-Crash HA Test Coverage
+
+- **Test script:** `test/incus/test-ha-crash.sh` (`make test-ha-crash`)
+- **Phase 1 — Hard VM stop:** `incus stop --force` on fw0 (simulates kernel
+  panic), verify fw1 takes over within 2s, new TCP connections work, fw0 rejoins
+  as secondary on restart, manual failover back.
+- **Phase 2 — Daemon stop:** `systemctl stop bpfrxd` on fw0 (tests #68
+  fail-closed behavior), verify fw1 takes over, daemon restart recovery.
+- **Phase 3 — Multi-cycle crash:** 3 cycles (configurable via `CRASH_CYCLES`)
+  of force-stop/restart, tracks per-cycle takeover latency.
+- **Files:** `test/incus/test-ha-crash.sh`, `Makefile`
+
+### Tests
+- `TestHandleDisconnectStaleConn`: verifies stale conn doesn't close active conn
+- `TestBulkSyncRGFiltering`: verifies per-RG ownership filtering in BulkSync
+- `TestBulkSyncSkipsReverseEntries`: verifies reverse sessions excluded
+- `TestReconcileStaleSessions`, `TestReconcileStaleSessionsV6`, `TestReconcileNoBulkInProgress`: stale reconciliation
+- `TestHandlePeerTimeout_FencingDisableRG/Disabled/NoSyncFunc/SendError`: fence path coverage
+- `TestFenceStatus`: fence config + history query
+- `TestChassisClusterPeerFencingSet/Hierarchical/Default`: parser tests for peer-fencing config
+- `test-ha-crash.sh`: 3-phase integration test for hard crash scenarios
+
+### Impact
+- Eliminates stale goroutine teardown of active sync connections during reconnect races
+- BulkSync now respects RG ownership (parity with incremental sweep)
+- Stale sessions cleaned up after bulk sync prevents phantom session black-holes
+- Peer fencing provides best-effort fast disable path for hung peers
+- Integration test coverage for hard-crash scenarios beyond clean reboot

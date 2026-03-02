@@ -603,3 +603,29 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Root cause:** `watchClusterEvents` and `watchVRRPEvents` goroutines both call into `rgStateMachine` and apply `rg_active`/blackhole side effects. When they interleave — e.g., a cluster state change triggers a transition, then a VRRP event triggers another transition before the first goroutine finishes applying side effects — the first goroutine's side effects overwrite the second (newer) transition's state. The side effects are non-atomic relative to the state machine transitions.
 - **Fix:** Added epoch guard to the state machine. Each transition increments a monotonic epoch counter. After applying side effects, the goroutine re-reads the current epoch from the state machine. If a newer transition has occurred (epoch mismatch), the stale side effects are skipped — the newer transition's goroutine will apply the correct state.
 - **Files:** `pkg/daemon/daemon.go`
+
+## HA Sync Hardening Sprint
+
+### #69: Stale receiveLoop tears down active sync connection (FIXED)
+- **Symptom:** After a sync reconnect race (accept/connect overlap), the live sync connection is torn down. Session sync stops working until the next reconnect cycle (~1s). During that window, incremental session updates are lost.
+- **Root cause:** `handleDisconnect()` unconditionally closed `s.conn` and set it to nil. When conn A is replaced by conn B (via `acceptLoop` or `connectLoop`), conn A's lingering `receiveLoop` goroutine eventually gets a read error and calls `handleDisconnect()` — which closes conn B (the active connection) because `s.conn` now points to conn B.
+- **Fix:** Pass the specific `net.Conn` to `handleDisconnect(conn)`. Only close if `s.conn == conn` (pointer identity check). If the connection has been replaced, log "ignoring stale disconnect" and return without side effects.
+- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+
+### #70: BulkSync sends all sessions regardless of RG ownership (FIXED)
+- **Symptom:** In active/active per-RG configurations, `BulkSync()` sent every session in the table to the peer, including sessions owned by RGs the local node is not primary for. The incremental 1s sweep correctly filtered via `ShouldSyncZone()`, but bulk sync did not — causing unnecessary bandwidth and potentially installing sessions on the wrong node.
+- **Root cause:** `BulkSync()` iterated all sessions without checking `ShouldSyncZone()` or filtering reverse entries.
+- **Fix:** Skip reverse entries and apply `ShouldSyncZone()` ownership check in both v4 and v6 `BulkSync` iterators, matching the incremental sweep behavior.
+- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+
+### #71: Stale sessions persist after bulk sync from recovering peer (FIXED)
+- **Symptom:** After a node crashes and recovers, it receives the peer's current session table via BulkSync. But sessions that existed locally before the crash (and no longer exist on the peer) are never cleaned up. These phantom sessions persist until GC timeout and can black-hole traffic that matches them.
+- **Root cause:** BulkSync only installed received sessions — it never compared against local state to identify stale entries.
+- **Fix:** Track received forward session keys during BulkStart→BulkEnd. On BulkEnd, `reconcileStaleSessions()` iterates local sessions in peer-owned zones, deletes any not in the received set (forward + reverse + dnat_table cleanup).
+- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+
+### #72: No mechanism to fence a hung peer on heartbeat timeout (FIXED)
+- **Symptom:** When heartbeat detects peer loss, the surviving node takes over via VRRP. But if the peer's daemon is hung (not crashed), it may continue partially forwarding traffic — causing split-brain forwarding until the hung daemon times out or is killed.
+- **Root cause:** No fence/STONITH mechanism existed to tell the peer to stand down.
+- **Fix:** Added `syncMsgFence` message type. On heartbeat timeout with `peer-fencing disable-rg` configured, the surviving node sends a fence message via the fabric sync connection. The receiver disables all RGs (`rg_active=false`). Best-effort — if the sync connection is also down, falls back to normal heartbeat-driven failover. Fence events tracked in cluster history.
+- **Files:** `pkg/cluster/cluster.go`, `pkg/cluster/cluster_test.go`, `pkg/cluster/events.go`, `pkg/cluster/sync.go`, `pkg/cmdtree/tree.go`, `pkg/config/ast.go`, `pkg/config/compiler.go`, `pkg/config/types.go`, `pkg/config/parser_test.go`
