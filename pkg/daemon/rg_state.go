@@ -38,6 +38,8 @@ type rgStateMachine struct {
 	// reconcile loop from fighting transient states (sync-hold, election,
 	// hitless restart).
 	vrrpMismatchSince time.Time // when mismatch was first detected (zero = no mismatch)
+
+	startedAt time.Time // when this state machine was created (for posture delay selection)
 }
 
 // rgTransition is returned by state machine updates to inform the caller
@@ -51,6 +53,7 @@ type rgTransition struct {
 func newRGStateMachine() *rgStateMachine {
 	return &rgStateMachine{
 		vrrpInstances: make(map[string]bool),
+		startedAt:     time.Now(),
 	}
 }
 
@@ -201,11 +204,20 @@ func (s *rgStateMachine) allMasterLocked() bool {
 	return true
 }
 
-// vrrpPostureDelay is the minimum duration a VRRP posture mismatch must
-// persist before the reconcile loop takes corrective action (priority
-// re-send or ResignRG). This delay prevents fighting with transient
-// states like VRRP sync-hold, election timers, and hitless restart.
-const vrrpPostureDelay = 10 * time.Second
+// vrrpPostureDelayStartup is the posture mismatch delay used during the
+// first 30 seconds after daemon startup. The longer delay avoids fighting
+// transient states like sync-hold, VRRP election, and hitless restart.
+const vrrpPostureDelayStartup = 10 * time.Second
+
+// vrrpPostureDelaySteadyState is the posture mismatch delay used after
+// the startup window. In normal operation, 2 seconds is enough to ride
+// out brief VRRP election jitter while still recovering quickly from a
+// stuck mismatch (#101).
+const vrrpPostureDelaySteadyState = 2 * time.Second
+
+// vrrpPostureStartupWindow is how long after state machine creation the
+// startup (conservative) delay is used before switching to steady-state.
+const vrrpPostureStartupWindow = 30 * time.Second
 
 // vrrpPostureMismatch describes the type of posture correction needed.
 type vrrpPostureMismatch int
@@ -217,8 +229,10 @@ const (
 )
 
 // CheckVRRPPosture checks whether VRRP state matches cluster expectations
-// and returns a correction action if the mismatch has persisted for at
-// least vrrpPostureDelay. Resets the mismatch timer when state matches.
+// and returns a correction action if the mismatch has persisted long enough.
+// Uses a conservative 10s delay during the startup window (first 30s) and
+// a faster 2s delay in steady state. Resets the mismatch timer when state
+// matches.
 //
 // The caller is responsible for skipping this check during sync-hold.
 func (s *rgStateMachine) CheckVRRPPosture(now time.Time) vrrpPostureMismatch {
@@ -254,7 +268,14 @@ func (s *rgStateMachine) CheckVRRPPosture(now time.Time) vrrpPostureMismatch {
 		return vrrpPostureOK // first detection, don't act yet
 	}
 
-	if now.Sub(s.vrrpMismatchSince) < vrrpPostureDelay {
+	// Use conservative delay near startup (sync-hold, election), fast
+	// correction in steady state (#101).
+	delay := vrrpPostureDelaySteadyState
+	if now.Sub(s.startedAt) < vrrpPostureStartupWindow {
+		delay = vrrpPostureDelayStartup
+	}
+
+	if now.Sub(s.vrrpMismatchSince) < delay {
 		return vrrpPostureOK // mismatch hasn't persisted long enough
 	}
 
