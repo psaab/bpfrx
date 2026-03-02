@@ -3508,6 +3508,21 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// failover requests via the fabric sync connection.
 			d.cluster.SetPeerFailoverFunc(d.sessionSync.SendFailover)
 
+			// Wire peer fencing: on heartbeat timeout, cluster sends
+			// fence via sync; on receive, disable all local RGs.
+			d.cluster.SetPeerFenceFunc(d.sessionSync.SendFence)
+			d.sessionSync.OnFenceReceived = func() {
+				slog.Warn("cluster: fence received from peer, disabling all RGs")
+				if cfg.Chassis.Cluster != nil {
+					for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+						if err := d.dp.UpdateRGActive(rg.ID, false); err != nil {
+							slog.Warn("cluster: fence: failed to disable rg_active",
+								"rg", rg.ID, "err", err)
+						}
+					}
+				}
+			}
+
 			d.sessionSync.SetVRFDevice(vrfDevice)
 			// Retry sync start: the VRF device and address binding may not
 			// be ready during daemon startup (networkd race).
