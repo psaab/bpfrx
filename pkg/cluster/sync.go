@@ -82,6 +82,7 @@ type SessionSync struct {
 	stats     SyncStats
 	mu        sync.Mutex
 	conn      net.Conn
+	writeMu   sync.Mutex // serializes all conn.Write calls (sendLoop + writeMsg)
 	listener  net.Listener
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
@@ -427,7 +428,10 @@ func (s *SessionSync) QueueConfig(configText string) {
 	}
 
 	payload := []byte(configText)
-	if err := writeMsg(conn, syncMsgConfig, payload); err != nil {
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgConfig, payload)
+	s.writeMu.Unlock()
+	if err != nil {
 		slog.Warn("cluster sync: config send error", "err", err)
 		s.stats.Errors.Add(1)
 		s.handleDisconnect(conn)
@@ -448,7 +452,10 @@ func (s *SessionSync) SendFailover(rgID int) error {
 	}
 
 	payload := []byte{byte(rgID)}
-	if err := writeMsg(conn, syncMsgFailover, payload); err != nil {
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgFailover, payload)
+	s.writeMu.Unlock()
+	if err != nil {
 		slog.Warn("cluster sync: failover send error", "err", err, "rg", rgID)
 		s.stats.Errors.Add(1)
 		s.handleDisconnect(conn)
@@ -469,7 +476,10 @@ func (s *SessionSync) SendFence() error {
 		return fmt.Errorf("peer not connected")
 	}
 
-	if err := writeMsg(conn, syncMsgFence, nil); err != nil {
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgFence, nil)
+	s.writeMu.Unlock()
+	if err != nil {
 		slog.Warn("cluster sync: fence send error", "err", err)
 		s.stats.Errors.Add(1)
 		s.handleDisconnect(conn)
@@ -493,13 +503,16 @@ func (s *SessionSync) BulkSync() error {
 	}
 
 	// Send bulk start marker.
-	if err := writeMsg(conn, syncMsgBulkStart, nil); err != nil {
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgBulkStart, nil)
+	s.writeMu.Unlock()
+	if err != nil {
 		return err
 	}
 
 	var count, skipped int
 	// Send owned v4 forward sessions.
-	err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	err = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -508,7 +521,10 @@ func (s *SessionSync) BulkSync() error {
 			return true
 		}
 		msg := encodeSessionV4Payload(key, val)
-		if err := writeMsg(conn, syncMsgSessionV4, msg); err != nil {
+		s.writeMu.Lock()
+		err := writeMsg(conn, syncMsgSessionV4, msg)
+		s.writeMu.Unlock()
+		if err != nil {
 			slog.Warn("bulk sync v4 write error", "err", err)
 			return false
 		}
@@ -529,7 +545,10 @@ func (s *SessionSync) BulkSync() error {
 			return true
 		}
 		msg := encodeSessionV6Payload(key, val)
-		if err := writeMsg(conn, syncMsgSessionV6, msg); err != nil {
+		s.writeMu.Lock()
+		err := writeMsg(conn, syncMsgSessionV6, msg)
+		s.writeMu.Unlock()
+		if err != nil {
 			slog.Warn("bulk sync v6 write error", "err", err)
 			return false
 		}
@@ -541,7 +560,10 @@ func (s *SessionSync) BulkSync() error {
 	}
 
 	// Send bulk end marker.
-	if err := writeMsg(conn, syncMsgBulkEnd, nil); err != nil {
+	s.writeMu.Lock()
+	err = writeMsg(conn, syncMsgBulkEnd, nil)
+	s.writeMu.Unlock()
+	if err != nil {
 		return err
 	}
 
@@ -661,7 +683,10 @@ func (s *SessionSync) sendLoop(ctx context.Context) {
 			if conn == nil {
 				continue
 			}
-			if _, err := conn.Write(msg); err != nil {
+			s.writeMu.Lock()
+			_, err := conn.Write(msg)
+			s.writeMu.Unlock()
+			if err != nil {
 				slog.Debug("cluster sync: send error", "err", err)
 				s.stats.Errors.Add(1)
 				s.handleDisconnect(conn)
@@ -690,7 +715,10 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// Send keepalive.
-				if err := writeMsg(conn, syncMsgHeartbeat, nil); err != nil {
+				s.writeMu.Lock()
+				err := writeMsg(conn, syncMsgHeartbeat, nil)
+				s.writeMu.Unlock()
+				if err != nil {
 					return
 				}
 				continue
@@ -1135,7 +1163,10 @@ func (s *SessionSync) QueueIPsecSA(connectionNames []string) {
 	}
 
 	payload := encodeIPsecSAPayload(connectionNames)
-	if err := writeMsg(conn, syncMsgIPsecSA, payload); err != nil {
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgIPsecSA, payload)
+	s.writeMu.Unlock()
+	if err != nil {
 		slog.Warn("cluster sync: IPsec SA send error", "err", err)
 		s.stats.Errors.Add(1)
 		s.handleDisconnect(conn)
@@ -1155,19 +1186,13 @@ func monotonicSeconds() uint64 {
 // --- Wire encoding helpers ---
 
 func writeMsg(conn net.Conn, msgType uint8, payload []byte) error {
-	hdr := make([]byte, syncHeaderSize)
-	copy(hdr[:4], syncMagic[:])
-	hdr[4] = msgType
-	binary.LittleEndian.PutUint32(hdr[8:12], uint32(len(payload)))
-	if _, err := conn.Write(hdr); err != nil {
-		return err
-	}
-	if len(payload) > 0 {
-		if _, err := conn.Write(payload); err != nil {
-			return err
-		}
-	}
-	return nil
+	buf := make([]byte, syncHeaderSize+len(payload))
+	copy(buf[:4], syncMagic[:])
+	buf[4] = msgType
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(len(payload)))
+	copy(buf[syncHeaderSize:], payload)
+	_, err := conn.Write(buf)
+	return err
 }
 
 func encodeSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) []byte {

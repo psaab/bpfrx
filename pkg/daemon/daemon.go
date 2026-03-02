@@ -570,7 +570,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				d.runPeriodicNeighborResolution(ctx, cfg)
+				d.runPeriodicNeighborResolution(ctx)
 			}()
 		}
 	}
@@ -1968,9 +1968,12 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 // runPeriodicNeighborResolution re-runs neighbor resolution every 15 seconds
 // to keep ARP/NDP entries warm for known forwarding targets.
 // Runs once immediately at start to avoid a 15s blind spot.
-func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context, cfg *config.Config) {
+// Fetches fresh active config on each tick so config changes take effect.
+func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 	// Immediate first run — don't wait for first tick.
-	d.resolveNeighbors(cfg)
+	if cfg := d.store.ActiveConfig(); cfg != nil {
+		d.resolveNeighbors(cfg)
+	}
 
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -1979,7 +1982,9 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context, cfg *config.
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			d.resolveNeighbors(cfg)
+			if cfg := d.store.ActiveConfig(); cfg != nil {
+				d.resolveNeighbors(cfg)
+			}
 		}
 	}
 }
@@ -3357,13 +3362,16 @@ func (d *Daemon) pushConfigToPeer() {
 	d.sessionSync.QueueConfig(configText)
 }
 
-// handleConfigSync processes a config received from the cluster primary.
-// The received config includes the groups section with per-node settings
-// (node ID, peer addresses) and shared chassis settings. Per-node
-// differentiation is handled at compile time by CompileConfigForNode
-// using the local node-id, so no chassis preservation is needed.
+// handleConfigSync processes a config received from the cluster peer.
+// Config sync is unidirectional: primary → secondary only. If this node
+// is the RG0 primary (config authority), incoming config is rejected to
+// prevent a reconnecting secondary from overwriting the authoritative config.
 func (d *Daemon) handleConfigSync(configText string) {
-	slog.Info("cluster: applying synced config from primary")
+	if d.cluster != nil && d.cluster.IsLocalPrimary(0) {
+		slog.Warn("cluster: rejecting config sync (this node is RG0 primary)")
+		return
+	}
+	slog.Info("cluster: accepting config sync from peer", "size", len(configText))
 
 	compiled, err := d.store.SyncApply(configText, nil)
 	if err != nil {
@@ -3468,13 +3476,15 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			}
 
 			// Wire peer connected callback: push config to returning peer.
-			// Only push if this node has been running >30s (stable node).
-			// A freshly started node must NOT push stale config from disk.
-			// Uses pushConfigToPeer (not syncConfigToPeer) to bypass the
-			// primary check — the stable node may have been preempted by
-			// the time the TCP sync connection is established.
+			// Only push if this node is RG0 primary (config authority) and
+			// has been running >30s (stable node). A freshly started node
+			// must NOT push stale config from disk.
 			d.sessionSync.OnPeerConnected = func() {
 				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer connected")
+				if d.cluster == nil || !d.cluster.IsLocalPrimary(0) {
+					slog.Info("cluster: skipping config push (not RG0 primary)")
+					return
+				}
 				if time.Since(d.startTime) < 30*time.Second {
 					slog.Info("cluster: skipping config push (daemon just started)")
 					return
@@ -3488,7 +3498,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// the returning high-priority node from preempting before it has
 			// session state, which would break all existing connections.
 			if time.Since(d.startTime) < 30*time.Second {
-				d.vrrpMgr.SetSyncHold(10 * time.Second)
+				d.vrrpMgr.SetSyncHold(30 * time.Second)
 			}
 
 			d.sessionSync.OnBulkSyncReceived = func() {
@@ -3587,8 +3597,8 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 // populateFabricFwd resolves the fabric interface MACs and populates the
 // fabric_fwd BPF map for cross-chassis packet redirect during failback.
-// After initial population, runs a periodic refresh every 30s to correct
-// neighbor drift (MAC changes, stale ARP entries).
+// Attempts immediately on startup with fast 500ms retries (10 attempts),
+// then falls back to 30s periodic refresh.
 func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr string) {
 	peerIP := net.ParseIP(peerAddr)
 	if peerIP == nil {
@@ -3602,19 +3612,24 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 	d.fabricPeerIP = peerIP
 	d.fabricMu.Unlock()
 
-	// Initial population with retries.
-	for i := 0; i < 30; i++ {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(2 * time.Second):
+	// Fast initial population: attempt immediately, then 500ms retries.
+	for i := 0; i < 10; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
+
+		// Actively probe for neighbor entry if missing.
+		d.probeFabricNeighbor(ctx, fabIface, peerIP)
 
 		if d.refreshFabricFwd(fabIface, peerIP, i == 0) {
 			break
 		}
-		if i == 29 {
-			slog.Warn("cluster: fabric_fwd map population failed after retries")
+		if i == 9 {
+			slog.Warn("cluster: fabric_fwd not populated after fast retries, continuing with periodic refresh")
 		}
 	}
 
@@ -3628,6 +3643,37 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 		case <-ticker.C:
 			d.refreshFabricFwd(fabIface, peerIP, false)
 		}
+	}
+}
+
+// probeFabricNeighbor triggers ARP/NDP resolution for the fabric peer
+// if no neighbor entry exists. Uses ping (not arping) because arping's
+// PF_PACKET raw sockets don't populate the kernel ARP table with XDP attached.
+func (d *Daemon) probeFabricNeighbor(ctx context.Context, fabIface string, peerIP net.IP) {
+	link, err := netlink.LinkByName(fabIface)
+	if err != nil {
+		return
+	}
+
+	neighFamily := netlink.FAMILY_V4
+	if peerIP.To4() == nil {
+		neighFamily = netlink.FAMILY_V6
+	}
+	neighs, _ := netlink.NeighList(link.Attrs().Index, neighFamily)
+	for _, n := range neighs {
+		if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
+			(n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT|netlink.NUD_DELAY|netlink.NUD_PROBE)) != 0 {
+			return // Entry exists, no probe needed.
+		}
+	}
+
+	// No neighbor entry — trigger resolution via ping.
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if peerIP.To4() != nil {
+		exec.CommandContext(probeCtx, "ping", "-c1", "-W1", "-I", fabIface, peerIP.String()).Run()
+	} else {
+		exec.CommandContext(probeCtx, "ping", "-6", "-c1", "-W1", "-I", fabIface, peerIP.String()).Run()
 	}
 }
 

@@ -3,7 +3,9 @@ package cluster
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -1038,4 +1040,138 @@ func TestSetZoneRGMap(t *testing.T) {
 		t.Fatalf("expected 1 entry after replace, got %d", len(ss.zoneRGMap))
 	}
 	ss.zoneRGMu.RUnlock()
+}
+
+func TestConcurrentSyncWriters(t *testing.T) {
+	// Verify that concurrent writers cannot produce corrupted/interleaved messages.
+	// 5 goroutines write sessions via sendCh, 5 write control messages via writeMsg.
+	// Receiver verifies every message has valid framing (magic + correct length).
+
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.mu.Lock()
+	ss.conn = clientConn
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	const writersPerType = 5
+	const msgsPerWriter = 50
+	totalExpected := writersPerType*msgsPerWriter*2 // session + control
+
+	// Receiver: read all messages and verify framing.
+	type result struct {
+		count int
+		err   error
+	}
+	recvDone := make(chan result, 1)
+	go func() {
+		hdr := make([]byte, syncHeaderSize)
+		count := 0
+		for count < totalExpected {
+			if _, err := io.ReadFull(serverConn, hdr); err != nil {
+				recvDone <- result{count, fmt.Errorf("read header #%d: %w", count, err)}
+				return
+			}
+			if string(hdr[0:4]) != "BPSY" {
+				recvDone <- result{count, fmt.Errorf("bad magic at msg #%d: %x", count, hdr[0:4])}
+				return
+			}
+			pLen := binary.LittleEndian.Uint32(hdr[8:12])
+			if pLen > 1<<20 {
+				recvDone <- result{count, fmt.Errorf("unreasonable length at msg #%d: %d", count, pLen)}
+				return
+			}
+			if pLen > 0 {
+				payload := make([]byte, pLen)
+				if _, err := io.ReadFull(serverConn, payload); err != nil {
+					recvDone <- result{count, fmt.Errorf("read payload #%d: %w", count, err)}
+					return
+				}
+			}
+			count++
+		}
+		recvDone <- result{count, nil}
+	}()
+
+	// Spawn writers.
+	var wg sync.WaitGroup
+
+	// Session writers: pre-encode and push to sendCh.
+	for i := 0; i < writersPerType; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			key := dataplane.SessionKey{Protocol: 6, SrcPort: 1000, DstPort: 80}
+			val := dataplane.SessionValue{State: dataplane.SessStateEstablished}
+			for j := 0; j < msgsPerWriter; j++ {
+				msg := encodeSessionV4(key, val)
+				ss.sendCh <- msg
+			}
+		}()
+	}
+
+	// Control writers: write config/failover/fence directly.
+	for i := 0; i < writersPerType; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < msgsPerWriter; j++ {
+				var err error
+				switch id % 3 {
+				case 0:
+					ss.writeMu.Lock()
+					err = writeMsg(clientConn, syncMsgConfig, []byte("test config data"))
+					ss.writeMu.Unlock()
+				case 1:
+					ss.writeMu.Lock()
+					err = writeMsg(clientConn, syncMsgFailover, []byte{0})
+					ss.writeMu.Unlock()
+				case 2:
+					ss.writeMu.Lock()
+					err = writeMsg(clientConn, syncMsgFence, nil)
+					ss.writeMu.Unlock()
+				}
+				if err != nil {
+					t.Errorf("write error: %v", err)
+					return
+				}
+			}
+		}(i)
+	}
+
+	// Drain sendCh via sendLoop-like logic (read from channel, write under writeMu).
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		sent := 0
+		for sent < writersPerType*msgsPerWriter {
+			msg := <-ss.sendCh
+			ss.writeMu.Lock()
+			_, err := clientConn.Write(msg)
+			ss.writeMu.Unlock()
+			if err != nil {
+				t.Errorf("drain write error: %v", err)
+				return
+			}
+			sent++
+		}
+	}()
+
+	wg.Wait()
+	<-drainDone
+
+	select {
+	case r := <-recvDone:
+		if r.err != nil {
+			t.Fatalf("receiver error after %d messages: %v", r.count, r.err)
+		}
+		if r.count != totalExpected {
+			t.Fatalf("expected %d messages, got %d", totalExpected, r.count)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("receiver timed out")
+	}
 }

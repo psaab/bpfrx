@@ -23,13 +23,14 @@ type instanceKey struct {
 
 // Manager manages all VRRP instances.
 type Manager struct {
-	mu            sync.RWMutex
-	instances     map[instanceKey]*vrrpInstance
-	eventCh       chan VRRPEvent
-	cancel        context.CancelFunc
-	syncHold      bool        // suppress preemption until session sync completes
-	syncHoldTimer *time.Timer // safety timeout to release hold
-	onEventDrop   func()      // called when an event is dropped (full channel)
+	mu              sync.RWMutex
+	instances       map[instanceKey]*vrrpInstance
+	eventCh         chan VRRPEvent
+	cancel          context.CancelFunc
+	syncHold        bool        // suppress preemption until session sync completes
+	syncHoldTimer   *time.Timer // safety timeout to release hold
+	syncHoldReason  string      // "bulk-sync-complete" or "timeout-degraded"
+	onEventDrop     func()      // called when an event is dropped (full channel)
 }
 
 // SetOnEventDrop registers a callback invoked when a VRRP event is dropped
@@ -87,22 +88,32 @@ func (m *Manager) SetSyncHold(timeout time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.syncHold = true
+	m.syncHoldReason = ""
 	m.syncHoldTimer = time.AfterFunc(timeout, func() {
-		slog.Warn("vrrp: sync hold timeout expired, releasing")
-		m.ReleaseSyncHold()
+		slog.Warn("vrrp: sync-hold timeout: bulk sync did not complete within timeout, releasing in degraded mode",
+			"timeout", timeout)
+		m.releaseSyncHoldWithReason("timeout-degraded")
 	})
 	slog.Info("vrrp: sync hold active, preemption disabled", "timeout", timeout)
 }
 
 // ReleaseSyncHold restores configured preempt values on all instances,
-// allowing normal VRRP preemption to proceed.
+// allowing normal VRRP preemption to proceed. Records reason as
+// "bulk-sync-complete" (the normal path).
 func (m *Manager) ReleaseSyncHold() {
+	m.releaseSyncHoldWithReason("bulk-sync-complete")
+}
+
+// releaseSyncHoldWithReason is the internal release path that records why
+// the sync hold was released.
+func (m *Manager) releaseSyncHoldWithReason(reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.syncHold {
 		return
 	}
 	m.syncHold = false
+	m.syncHoldReason = reason
 	if m.syncHoldTimer != nil {
 		m.syncHoldTimer.Stop()
 	}
@@ -110,7 +121,16 @@ func (m *Manager) ReleaseSyncHold() {
 		vi.restorePreempt()
 		vi.triggerPreemptNow()
 	}
-	slog.Info("vrrp: sync hold released, preemption enabled")
+	slog.Info("vrrp: sync hold released, preemption enabled", "reason", reason)
+}
+
+// SyncHoldReason returns why the sync hold was released: "bulk-sync-complete"
+// for normal operation, "timeout-degraded" if the safety timeout fired before
+// bulk sync arrived, or "" if sync hold was never set or is still active.
+func (m *Manager) SyncHoldReason() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.syncHoldReason
 }
 
 // Events returns the event channel for state change notifications.

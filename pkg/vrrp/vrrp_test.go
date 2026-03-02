@@ -555,6 +555,22 @@ func TestSyncHold_ReleaseTwiceIsNoop(t *testing.T) {
 	m.ReleaseSyncHold()
 }
 
+func TestSyncHold_BulkSyncCompleteReason(t *testing.T) {
+	m := NewManager()
+	m.SetSyncHold(5 * time.Second)
+
+	// Before release, reason is empty.
+	if reason := m.SyncHoldReason(); reason != "" {
+		t.Errorf("expected empty reason before release, got %q", reason)
+	}
+
+	m.ReleaseSyncHold()
+
+	if reason := m.SyncHoldReason(); reason != "bulk-sync-complete" {
+		t.Errorf("expected reason 'bulk-sync-complete', got %q", reason)
+	}
+}
+
 func TestSyncHold_TimeoutReleasesAutomatically(t *testing.T) {
 	m := NewManager()
 
@@ -584,6 +600,9 @@ func TestSyncHold_TimeoutReleasesAutomatically(t *testing.T) {
 
 	if !vi.getPreempt() {
 		t.Error("expected preempt to be restored after sync hold timeout")
+	}
+	if reason := m.SyncHoldReason(); reason != "timeout-degraded" {
+		t.Errorf("expected reason 'timeout-degraded', got %q", reason)
 	}
 }
 
