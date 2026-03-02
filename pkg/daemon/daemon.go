@@ -134,6 +134,20 @@ type Daemon struct {
 
 	// gRPC server reference for starting fabric listener in cluster mode.
 	grpcSrv *grpcapi.Server
+
+	// daemonCtx is the parent context from Run(), used to derive
+	// independently-cancellable sub-contexts for cluster comms.
+	daemonCtx context.Context
+
+	// clusterCommsCancel cancels the sub-context used by startClusterComms
+	// goroutines. Set when cluster comms are started, called to restart them
+	// on config change (#87).
+	clusterCommsCancel context.CancelFunc
+
+	// activeClusterTransport stores the transport config used by the
+	// currently running cluster comms. Compared on each applyConfig to
+	// detect changes that require a comms restart (#87).
+	activeClusterTransport clusterTransportKey
 }
 
 // New creates a new Daemon.
@@ -168,6 +182,8 @@ func New(opts Options) *Daemon {
 
 // Run starts the daemon and blocks until shutdown.
 func (d *Daemon) Run(ctx context.Context) error {
+	d.daemonCtx = ctx
+
 	// Wrap the default slog handler to support system syslog forwarding.
 	// Syslog clients are added later when config is applied.
 	d.slogHandler = logging.NewSyslogSlogHandler(slog.Default().Handler())
@@ -579,6 +595,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	// Start VRRP event watcher (manager was created earlier, before applyConfig).
+	// Uses context.Background() — the watcher must outlive daemon ctx cancel
+	// so it can process VRRP BACKUP events during shutdown (rg_active cleanup).
+	// The watcher exits when eventCh is closed by vrrpMgr.Stop().
 	go d.watchVRRPEvents(context.Background())
 
 	// Start reconciliation loop — periodic safety net that corrects
@@ -1657,6 +1676,26 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 
 		// RETH GARP is handled by native VRRP (VRRP-backed RETH).
 		// No manual GARP registration needed.
+	}
+
+	// 20. Detect cluster transport config changes and restart comms (#87).
+	// Only restart if comms were previously started (activeClusterTransport
+	// is non-zero) and the new config differs.
+	if d.cluster != nil && d.daemonCtx != nil {
+		newTransport := clusterTransportFromConfig(cfg)
+		if d.activeClusterTransport != (clusterTransportKey{}) && newTransport != d.activeClusterTransport {
+			slog.Info("cluster: transport config changed, restarting comms",
+				"old_control", d.activeClusterTransport.ControlInterface,
+				"new_control", newTransport.ControlInterface,
+				"old_peer", d.activeClusterTransport.PeerAddress,
+				"new_peer", newTransport.PeerAddress,
+				"old_fabric", d.activeClusterTransport.FabricInterface,
+				"new_fabric", newTransport.FabricInterface,
+				"old_fabric_peer", d.activeClusterTransport.FabricPeerAddress,
+				"new_fabric_peer", newTransport.FabricPeerAddress)
+			d.stopClusterComms()
+			d.startClusterComms(d.daemonCtx)
+		}
 	}
 }
 
@@ -3416,6 +3455,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	}
 	cc := cfg.Chassis.Cluster
 
+	// Create an independently-cancellable sub-context so cluster comms can
+	// be restarted on config change (#87) without cancelling the daemon ctx.
+	commsCtx, commsCancel := context.WithCancel(ctx)
+	d.clusterCommsCancel = commsCancel
+	d.activeClusterTransport = clusterTransportFromConfig(cfg)
+
 	// Determine VRF device if control/fabric interfaces are in mgmt VRF.
 	vrfDevice := ""
 	if len(d.mgmtVRFInterfaces) > 0 {
@@ -3469,7 +3514,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 						"interface", cc.FabricInterface)
 				}
 				select {
-				case <-ctx.Done():
+				case <-commsCtx.Done():
 					return
 				case <-time.After(2 * time.Second):
 				}
@@ -3490,7 +3535,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				for i := 0; i < 30; i++ {
 					if d.grpcSrv != nil {
 						fabricGRPC := fmt.Sprintf("%s:50051", fabIP)
-						d.grpcSrv.RunFabricListener(ctx, fabricGRPC, vrfDevice)
+						d.grpcSrv.RunFabricListener(commsCtx, fabricGRPC, vrfDevice)
 						return
 					}
 					time.Sleep(time.Second)
@@ -3579,7 +3624,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Retry sync start: the VRF device and address binding may not
 			// be ready during daemon startup (networkd race).
 			for i := 0; i < 30; i++ {
-				if err := d.sessionSync.Start(ctx); err != nil {
+				if err := d.sessionSync.Start(commsCtx); err != nil {
 					if i < 5 {
 						slog.Info("cluster: sync bind not ready, retrying",
 							"err", err, "attempt", i+1)
@@ -3588,7 +3633,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 							"err", err, "attempt", i+1)
 					}
 					select {
-					case <-ctx.Done():
+					case <-commsCtx.Done():
 						return
 					case <-time.After(2 * time.Second):
 					}
@@ -3608,7 +3653,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 					d.sessionSync.IsPrimaryForRGFn = func(rgID int) bool {
 						return d.cluster != nil && d.cluster.IsLocalPrimary(rgID)
 					}
-					d.sessionSync.StartSyncSweep(ctx)
+					d.sessionSync.StartSyncSweep(commsCtx)
 				}
 
 				break
@@ -3616,13 +3661,54 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 			// Start periodic IPsec SA sync if enabled.
 			if cc.IPsecSASync && d.ipsec != nil {
-				go d.syncIPsecSAPeriodic(ctx)
+				go d.syncIPsecSAPeriodic(commsCtx)
 			}
 
 			// Populate fabric_fwd BPF map for cross-chassis redirect,
 			// then periodically refresh to correct neighbor drift.
-			go d.populateFabricFwd(ctx, cc.FabricInterface, cc.FabricPeerAddress)
+			go d.populateFabricFwd(commsCtx, cc.FabricInterface, cc.FabricPeerAddress)
 		}()
+	}
+}
+
+// stopClusterComms tears down heartbeat and session sync so they can be
+// restarted with new transport settings (#87). Cancels the comms sub-context
+// (which stops retry loops, fabric_fwd refresh, IPsec SA sync, sync sweep)
+// and explicitly stops heartbeat + session sync listeners/connections.
+func (d *Daemon) stopClusterComms() {
+	if d.clusterCommsCancel != nil {
+		d.clusterCommsCancel()
+		d.clusterCommsCancel = nil
+	}
+	if d.cluster != nil {
+		d.cluster.StopHeartbeat()
+	}
+	if d.sessionSync != nil {
+		d.sessionSync.Stop()
+		d.sessionSync = nil
+	}
+}
+
+// clusterTransportKey extracts the four cluster transport fields that
+// determine heartbeat and session sync endpoints. Used to detect config
+// changes that require restarting cluster comms.
+type clusterTransportKey struct {
+	ControlInterface  string
+	PeerAddress       string
+	FabricInterface   string
+	FabricPeerAddress string
+}
+
+func clusterTransportFromConfig(cfg *config.Config) clusterTransportKey {
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return clusterTransportKey{}
+	}
+	cc := cfg.Chassis.Cluster
+	return clusterTransportKey{
+		ControlInterface:  cc.ControlInterface,
+		PeerAddress:       cc.PeerAddress,
+		FabricInterface:   cc.FabricInterface,
+		FabricPeerAddress: cc.FabricPeerAddress,
 	}
 }
 
@@ -4075,7 +4161,8 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 }
 
 // reconcileRGStateLoop periodically reads the authoritative cluster and VRRP
-// states and reconciles rgStateMachine / rg_active BPF map / blackhole routes.
+// states and reconciles rgStateMachine / rg_active BPF map / blackhole routes /
+// VRRP posture / RA+DHCP services.
 // This is the safety net for dropped events (non-blocking channel sends).
 // Runs every 2s; also wakes immediately on event-drop notifications via
 // reconcileNowCh. Skips if cluster or dataplane is nil.
@@ -4203,6 +4290,25 @@ func (d *Daemon) reconcileRGState() {
 			d.removeBlackholeRoutes(rgID)
 		} else {
 			d.injectBlackholeRoutes(rgID)
+		}
+
+		// VRRP posture reconciliation (#86) is intentionally NOT done here.
+		// ForceRGMaster / ResignRG during the reconcile tick fights with
+		// normal VRRP state machine transitions (startup sync-hold, hitless
+		// restart). The event-driven path in watchVRRPEvents handles all
+		// VRRP→cluster state transitions; the reconcile loop only ensures
+		// rg_active + blackhole routes + services converge.
+
+		// RA/DHCP service reconciliation (#93): safety net for dropped
+		// VRRP events that should have started or stopped per-RG services.
+		// Only trigger on actual state change to avoid thrashing services
+		// every reconcile tick (RA/DHCP apply restarts daemons).
+		if tr.Changed {
+			if tr.Active {
+				d.applyRethServicesForRG(rgID)
+			} else {
+				d.clearRethServicesForRG(rgID)
+			}
 		}
 	}
 }
@@ -4344,6 +4450,9 @@ func (d *Daemon) reconcileBlackholeRoutes() {
 // transition — these services must only run on the primary to avoid
 // dual-router / dual-DHCP issues.
 func (d *Daemon) applyRethServicesForRG(rgID int) {
+	if d.store == nil {
+		return
+	}
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -4402,6 +4511,9 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 // for RETH interfaces belonging to the given RG. Called on VRRP BACKUP
 // transition. If other RGs are still MASTER, their services remain active.
 func (d *Daemon) clearRethServicesForRG(rgID int) {
+	if d.store == nil {
+		return
+	}
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
 		return

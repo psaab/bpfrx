@@ -26,6 +26,7 @@ type Manager struct {
 	mu              sync.RWMutex
 	instances       map[instanceKey]*vrrpInstance
 	eventCh         chan VRRPEvent
+	closeEventOnce  sync.Once   // guards closing eventCh
 	cancel          context.CancelFunc
 	syncHold        bool        // suppress preemption until session sync completes
 	syncHoldTimer   *time.Timer // safety timeout to release hold
@@ -75,6 +76,9 @@ func (m *Manager) Stop() {
 		vi.stop()
 	}
 
+	// Close events channel so watchers (e.g. daemon's watchVRRPEvents) unblock.
+	m.closeEventOnce.Do(func() { close(m.eventCh) })
+
 	if m.cancel != nil {
 		m.cancel()
 	}
@@ -122,6 +126,14 @@ func (m *Manager) releaseSyncHoldWithReason(reason string) {
 		vi.triggerPreemptNow()
 	}
 	slog.Info("vrrp: sync hold released, preemption enabled", "reason", reason)
+}
+
+// InSyncHold returns true if the manager is in sync-hold state (startup,
+// waiting for session sync before allowing preemption).
+func (m *Manager) InSyncHold() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.syncHold
 }
 
 // SyncHoldReason returns why the sync hold was released: "bulk-sync-complete"

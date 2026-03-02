@@ -744,15 +744,18 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 	m.peerEverSeen = true
 	m.peerNodeID = int(pkt.NodeID)
 
-	// Update peer group states.
+	// Rebuild peer group states from scratch — prunes stale RGs that
+	// the peer no longer reports (fix #92).
+	newPeerGroups := make(map[int]PeerGroupState, len(pkt.Groups))
 	for _, g := range pkt.Groups {
-		m.peerGroups[int(g.GroupID)] = PeerGroupState{
+		newPeerGroups[int(g.GroupID)] = PeerGroupState{
 			GroupID:  int(g.GroupID),
 			Priority: int(g.Priority),
 			Weight:   int(g.Weight),
 			State:    NodeState(g.State),
 		}
 	}
+	m.peerGroups = newPeerGroups
 
 	// Update peer interface monitor statuses.
 	if len(pkt.Monitors) > 0 {
