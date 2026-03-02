@@ -88,6 +88,11 @@ type vrrpInstance struct {
 	rxReceived atomic.Uint64 // total packets delivered to rxCh
 	lastDropWarn time.Time    // last time we logged a drop warning (rate-limited)
 
+	// GARP suppression for strict-vip-ownership mode.
+	suppressGARP  atomic.Bool   // when true, becomeMaster() skips GARP/NA
+	garpEpoch     atomic.Uint64 // incremented on each becomeMaster() transition
+	lastGARPEpoch atomic.Uint64 // epoch of last completed sendGARP()
+
 	// onEventDrop is called when an event is dropped due to a full eventCh.
 	// Set by the manager to trigger immediate reconciliation.
 	onEventDrop func()
@@ -770,7 +775,13 @@ func (vi *vrrpInstance) becomeMaster() {
 	vi.addVIPs()
 	vi.sendAdvert(pri)
 	vi.emitEvent()
-	go vi.sendGARP()
+	vi.garpEpoch.Add(1)
+	if !vi.suppressGARP.Load() {
+		go vi.sendGARP()
+	} else {
+		slog.Info("vrrp: GARP suppressed (strict-vip-ownership)",
+			"key", vi.key())
+	}
 }
 
 // becomeBackup transitions to Backup state: remove VIPs, reset timers.
@@ -1048,6 +1059,12 @@ func (vi *vrrpInstance) removeVIPs() {
 //
 // This method may be called in a goroutine from becomeMaster().
 func (vi *vrrpInstance) sendGARP() {
+	epoch := vi.garpEpoch.Load()
+	if vi.lastGARPEpoch.Load() == epoch && epoch > 0 {
+		slog.Debug("vrrp: GARP already sent for this epoch",
+			"key", vi.key(), "epoch", epoch)
+		return
+	}
 	count := vi.cfg.GARPCount
 	if count <= 0 {
 		count = 3 // default
@@ -1082,6 +1099,7 @@ func (vi *vrrpInstance) sendGARP() {
 			}
 		}
 	}
+	vi.lastGARPEpoch.Store(epoch)
 }
 
 // resolveIPv6LinkLocal deterministically selects the lowest non-VIP

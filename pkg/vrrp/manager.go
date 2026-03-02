@@ -324,7 +324,26 @@ func (m *Manager) ReconcileVIPs() {
 	for _, vi := range m.instances {
 		if vi.getState() == StateMaster {
 			vi.addVIPs()
-			vi.sendGARP()
+			if !vi.suppressGARP.Load() {
+				vi.sendGARP()
+			}
+		}
+	}
+}
+
+// SetGARPSuppression enables or disables GARP/NA suppression for all VRRP
+// instances belonging to the given redundancy group. Used by strict-vip-ownership
+// mode to prevent duplicate GARP/NA during failover windows.
+func (m *Manager) SetGARPSuppression(rgID int, suppress bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	vrid := 100 + rgID
+	for _, vi := range m.instances {
+		if vi.cfg.GroupID == vrid {
+			vi.suppressGARP.Store(suppress)
+			slog.Info("vrrp: GARP suppression updated",
+				"key", vi.key(), "rgID", rgID, "suppress", suppress)
 		}
 	}
 }
