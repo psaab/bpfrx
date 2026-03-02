@@ -9,6 +9,8 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -4146,6 +4148,31 @@ func (r *CompileResult) tuneInterfaceBuffers(link netlink.Link) {
 			slog.Info("increased ring buffers",
 				"interface", name, "tx", maxTX)
 		}
+	}
+
+	// Enable RPS on all RX queues to spread softirq processing across CPUs.
+	// Without this, generic XDP redirect concentrates TX on whichever CPU
+	// received the packet, causing ksoftirqd imbalance.
+	numCPU := runtime.NumCPU()
+	cpuMask := fmt.Sprintf("%x", (1<<numCPU)-1)
+	// Global RFS flow table (set once, idempotent).
+	os.WriteFile("/proc/sys/net/core/rps_sock_flow_entries", []byte("32768"), 0644)
+	rxQueues, _ := filepath.Glob(fmt.Sprintf("/sys/class/net/%s/queues/rx-*/rps_cpus", name))
+	for _, path := range rxQueues {
+		os.WriteFile(path, []byte(cpuMask), 0644)
+	}
+	// Set per-queue flow count for RFS (Receive Flow Steering) consistent hashing.
+	flowCnt := 32768 / max(len(rxQueues), 1)
+	for _, path := range rxQueues {
+		fcPath := strings.Replace(path, "rps_cpus", "rps_flow_cnt", 1)
+		os.WriteFile(fcPath, []byte(strconv.Itoa(flowCnt)), 0644)
+	}
+
+	// Enable XPS: pin each TX queue to its corresponding CPU for locality.
+	txQueues, _ := filepath.Glob(fmt.Sprintf("/sys/class/net/%s/queues/tx-*/xps_cpus", name))
+	for i, path := range txQueues {
+		cpu := i % numCPU
+		os.WriteFile(path, []byte(fmt.Sprintf("%x", 1<<cpu)), 0644)
 	}
 
 	r.ethtoolApplied["buffers:"+name] = true
