@@ -55,6 +55,7 @@ service BpfrxService {
 
   // Monitor (server-streaming)
   rpc MonitorPacketDrop(MonitorPacketDropRequest) returns (stream MonitorPacketDropResponse);
+  rpc MonitorInterface(MonitorInterfaceRequest) returns (stream MonitorInterfaceResponse);
 
   // Mutations
   rpc ClearSessions(ClearSessionsRequest) returns (ClearSessionsResponse);
@@ -606,3 +607,10 @@ message MonitorPacketDropRequest {
   string node = 9;    // cluster node filter
 }
 message MonitorPacketDropResponse { string line = 1; }
+
+message MonitorInterfaceRequest {
+  string interface_name = 1;  // empty = traffic summary mode
+}
+message MonitorInterfaceResponse {
+  string frame = 1;  // pre-formatted text frame
+}

@@ -481,6 +481,18 @@ var OperationalTree = map[string]*Node{
 			"matching": {Desc: "Filter expression (tcpdump syntax)"},
 			"count":    {Desc: "Number of packets to capture"},
 		}},
+		"interface": {Desc: "Show interface traffic statistics", DynamicFn: func(cfg *config.Config) []string {
+			if cfg == nil || cfg.Interfaces.Interfaces == nil {
+				return nil
+			}
+			names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+			for name := range cfg.Interfaces.Interfaces {
+				names = append(names, name)
+			}
+			return names
+		}, Children: map[string]*Node{
+			"traffic": {Desc: "Show traffic summary for all interfaces"},
+		}},
 		"security": {Desc: "Monitor security events", Children: map[string]*Node{
 			"flow": {Desc: "Monitor security flow", Children: map[string]*Node{
 				"file":   {Desc: "Configure flow trace file", Children: map[string]*Node{

@@ -10086,6 +10086,8 @@ func (c *CLI) handleMonitor(args []string) error {
 	switch resolved {
 	case "traffic":
 		return c.handleMonitorTraffic(args[1:])
+	case "interface":
+		return c.handleMonitorInterface(args[1:])
 	case "security":
 		return c.handleMonitorSecurity(args[1:])
 	default:

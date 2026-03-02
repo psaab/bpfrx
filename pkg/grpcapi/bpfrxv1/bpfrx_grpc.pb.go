@@ -61,6 +61,7 @@ const (
 	BpfrxService_Ping_FullMethodName                      = "/bpfrx.v1.BpfrxService/Ping"
 	BpfrxService_Traceroute_FullMethodName                = "/bpfrx.v1.BpfrxService/Traceroute"
 	BpfrxService_MonitorPacketDrop_FullMethodName         = "/bpfrx.v1.BpfrxService/MonitorPacketDrop"
+	BpfrxService_MonitorInterface_FullMethodName          = "/bpfrx.v1.BpfrxService/MonitorInterface"
 	BpfrxService_ClearSessions_FullMethodName             = "/bpfrx.v1.BpfrxService/ClearSessions"
 	BpfrxService_ClearCounters_FullMethodName             = "/bpfrx.v1.BpfrxService/ClearCounters"
 	BpfrxService_ClearDHCPClientIdentifier_FullMethodName = "/bpfrx.v1.BpfrxService/ClearDHCPClientIdentifier"
@@ -122,6 +123,7 @@ type BpfrxServiceClient interface {
 	Traceroute(ctx context.Context, in *TracerouteRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TracerouteResponse], error)
 	// Monitor (server-streaming)
 	MonitorPacketDrop(ctx context.Context, in *MonitorPacketDropRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MonitorPacketDropResponse], error)
+	MonitorInterface(ctx context.Context, in *MonitorInterfaceRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MonitorInterfaceResponse], error)
 	// Mutations
 	ClearSessions(ctx context.Context, in *ClearSessionsRequest, opts ...grpc.CallOption) (*ClearSessionsResponse, error)
 	ClearCounters(ctx context.Context, in *ClearCountersRequest, opts ...grpc.CallOption) (*ClearCountersResponse, error)
@@ -591,6 +593,25 @@ func (c *bpfrxServiceClient) MonitorPacketDrop(ctx context.Context, in *MonitorP
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type BpfrxService_MonitorPacketDropClient = grpc.ServerStreamingClient[MonitorPacketDropResponse]
 
+func (c *bpfrxServiceClient) MonitorInterface(ctx context.Context, in *MonitorInterfaceRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MonitorInterfaceResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &BpfrxService_ServiceDesc.Streams[3], BpfrxService_MonitorInterface_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[MonitorInterfaceRequest, MonitorInterfaceResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type BpfrxService_MonitorInterfaceClient = grpc.ServerStreamingClient[MonitorInterfaceResponse]
+
 func (c *bpfrxServiceClient) ClearSessions(ctx context.Context, in *ClearSessionsRequest, opts ...grpc.CallOption) (*ClearSessionsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ClearSessionsResponse)
@@ -713,6 +734,7 @@ type BpfrxServiceServer interface {
 	Traceroute(*TracerouteRequest, grpc.ServerStreamingServer[TracerouteResponse]) error
 	// Monitor (server-streaming)
 	MonitorPacketDrop(*MonitorPacketDropRequest, grpc.ServerStreamingServer[MonitorPacketDropResponse]) error
+	MonitorInterface(*MonitorInterfaceRequest, grpc.ServerStreamingServer[MonitorInterfaceResponse]) error
 	// Mutations
 	ClearSessions(context.Context, *ClearSessionsRequest) (*ClearSessionsResponse, error)
 	ClearCounters(context.Context, *ClearCountersRequest) (*ClearCountersResponse, error)
@@ -860,6 +882,9 @@ func (UnimplementedBpfrxServiceServer) Traceroute(*TracerouteRequest, grpc.Serve
 }
 func (UnimplementedBpfrxServiceServer) MonitorPacketDrop(*MonitorPacketDropRequest, grpc.ServerStreamingServer[MonitorPacketDropResponse]) error {
 	return status.Error(codes.Unimplemented, "method MonitorPacketDrop not implemented")
+}
+func (UnimplementedBpfrxServiceServer) MonitorInterface(*MonitorInterfaceRequest, grpc.ServerStreamingServer[MonitorInterfaceResponse]) error {
+	return status.Error(codes.Unimplemented, "method MonitorInterface not implemented")
 }
 func (UnimplementedBpfrxServiceServer) ClearSessions(context.Context, *ClearSessionsRequest) (*ClearSessionsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ClearSessions not implemented")
@@ -1638,6 +1663,17 @@ func _BpfrxService_MonitorPacketDrop_Handler(srv interface{}, stream grpc.Server
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type BpfrxService_MonitorPacketDropServer = grpc.ServerStreamingServer[MonitorPacketDropResponse]
 
+func _BpfrxService_MonitorInterface_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(MonitorInterfaceRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(BpfrxServiceServer).MonitorInterface(m, &grpc.GenericServerStream[MonitorInterfaceRequest, MonitorInterfaceResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type BpfrxService_MonitorInterfaceServer = grpc.ServerStreamingServer[MonitorInterfaceResponse]
+
 func _BpfrxService_ClearSessions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ClearSessionsRequest)
 	if err := dec(in); err != nil {
@@ -1970,6 +2006,11 @@ var BpfrxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "MonitorPacketDrop",
 			Handler:       _BpfrxService_MonitorPacketDrop_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "MonitorInterface",
+			Handler:       _BpfrxService_MonitorInterface_Handler,
 			ServerStreams: true,
 		},
 	},

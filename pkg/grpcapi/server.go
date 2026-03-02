@@ -8260,3 +8260,228 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 		}
 	}
 }
+
+// MonitorInterface streams pre-formatted interface statistics frames.
+func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.ServerStreamingServer[pb.MonitorInterfaceResponse]) error {
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		return status.Error(codes.Unavailable, "no active configuration")
+	}
+
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "bpfrx"
+	}
+
+	// resolveToKernel converts a config-level interface name to its kernel name.
+	// e.g. "ge-0/0/0" → "ge-0-0-0", "reth0" → physical member's kernel name.
+	resolveToKernel := func(cfgName string) string {
+		resolved := cfg.ResolveReth(cfgName)
+		return config.LinuxIfName(resolved)
+	}
+
+	isSingle := req.InterfaceName != ""
+	var singleDisplayName, singleKernelName string
+	if isSingle {
+		singleDisplayName = req.InterfaceName
+		singleKernelName = resolveToKernel(req.InterfaceName)
+		// Validate the interface exists.
+		if _, err := net.InterfaceByName(singleKernelName); err != nil {
+			return status.Errorf(codes.NotFound, "interface %s not found", req.InterfaceName)
+		}
+	}
+
+	// Helper: read interface counters.
+	type ifSnap struct {
+		rxBytes, txBytes, rxPkts, txPkts         uint64
+		rxErrors, txErrors, rxDrops, txDrops      uint64
+		rxFrame, txCarrier, collisions             uint64
+		ts                                         time.Time
+	}
+	readSnap := func(name string) *ifSnap {
+		iface, err := net.InterfaceByName(name)
+		if err != nil {
+			return nil
+		}
+		snap := &ifSnap{ts: time.Now()}
+		if s.dp != nil && s.dp.IsLoaded() {
+			if ctrs, err := s.dp.ReadInterfaceCounters(iface.Index); err == nil {
+				snap.rxBytes = ctrs.RxBytes
+				snap.txBytes = ctrs.TxBytes
+				snap.rxPkts = ctrs.RxPackets
+				snap.txPkts = ctrs.TxPackets
+			}
+		}
+		link, err := netlink.LinkByName(name)
+		if err == nil {
+			if st := link.Attrs().Statistics; st != nil {
+				snap.rxErrors = st.RxErrors
+				snap.txErrors = st.TxErrors
+				snap.rxDrops = st.RxDropped
+				snap.txDrops = st.TxDropped
+				snap.rxFrame = st.RxFrameErrors
+				snap.txCarrier = st.TxCarrierErrors
+				snap.collisions = st.Collisions
+				if snap.rxBytes == 0 && snap.txBytes == 0 {
+					snap.rxBytes = st.RxBytes
+					snap.txBytes = st.TxBytes
+					snap.rxPkts = st.RxPackets
+					snap.txPkts = st.TxPackets
+				}
+			}
+		}
+		return snap
+	}
+
+	readLinkState := func(name string) string {
+		if data, err := os.ReadFile("/sys/class/net/" + name + "/operstate"); err == nil {
+			if strings.TrimSpace(string(data)) == "up" {
+				return "Up"
+			}
+		}
+		return "Down"
+	}
+
+	readSpeed := func(name string) string {
+		raw, err := os.ReadFile("/sys/class/net/" + name + "/speed")
+		if err != nil {
+			return "unknown"
+		}
+		var mbps int
+		if _, err := fmt.Sscanf(strings.TrimSpace(string(raw)), "%d", &mbps); err != nil || mbps <= 0 {
+			return "unknown"
+		}
+		if mbps >= 1000 {
+			return fmt.Sprintf("%dgbps", mbps/1000)
+		}
+		return fmt.Sprintf("%dmbps", mbps)
+	}
+
+	// Collect sorted interface names.
+	sortedNames := func() []string {
+		c := s.store.ActiveConfig()
+		if c == nil || c.Interfaces.Interfaces == nil {
+			return nil
+		}
+		names := make([]string, 0, len(c.Interfaces.Interfaces))
+		for name := range c.Interfaces.Interfaces {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return names
+	}
+
+	startTime := time.Now()
+	ctx := stream.Context()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	// Previous snapshots for rate calculation.
+	prevSingle := (*ifSnap)(nil)
+	baselineSingle := (*ifSnap)(nil)
+	prevAll := make(map[string]*ifSnap)
+
+	for {
+		var buf strings.Builder
+		seconds := int(time.Since(startTime).Seconds())
+		now := time.Now().Format("15:04:05")
+
+		if isSingle {
+			snap := readSnap(singleKernelName)
+			if snap == nil {
+				fmt.Fprintf(&buf, "interface %s: not available\n", singleDisplayName)
+			} else {
+				if baselineSingle == nil {
+					baselineSingle = snap
+				}
+				linkState := readLinkState(singleKernelName)
+				speed := readSpeed(singleKernelName)
+
+				var rxBps, txBps, rxPps, txPps uint64
+				if prevSingle != nil {
+					dt := snap.ts.Sub(prevSingle.ts).Seconds()
+					if dt > 0 {
+						rxBps = uint64(float64(snap.rxBytes-prevSingle.rxBytes) * 8 / dt)
+						txBps = uint64(float64(snap.txBytes-prevSingle.txBytes) * 8 / dt)
+						rxPps = uint64(float64(snap.rxPkts-prevSingle.rxPkts) / dt)
+						txPps = uint64(float64(snap.txPkts-prevSingle.txPkts) / dt)
+					}
+				}
+
+				var rxBytesDelta, txBytesDelta, rxPktsDelta, txPktsDelta uint64
+				rxBytesDelta = snap.rxBytes - baselineSingle.rxBytes
+				txBytesDelta = snap.txBytes - baselineSingle.txBytes
+				rxPktsDelta = snap.rxPkts - baselineSingle.rxPkts
+				txPktsDelta = snap.txPkts - baselineSingle.txPkts
+
+				fmt.Fprintf(&buf, "%-40s Seconds: %-10d Time: %s\n", hostname, seconds, now)
+				fmt.Fprintf(&buf, "Interface: %s, Enabled, Link is %s\n", singleDisplayName, linkState)
+				fmt.Fprintf(&buf, "Encapsulation: Ethernet, Speed: %s\n", speed)
+				fmt.Fprintf(&buf, "Traffic statistics:                                Current delta\n")
+				fmt.Fprintf(&buf, "  Input  bytes:         %20d (%d bps)    [%d]\n", snap.rxBytes, rxBps, rxBytesDelta)
+				fmt.Fprintf(&buf, "  Output bytes:         %20d (%d bps)    [%d]\n", snap.txBytes, txBps, txBytesDelta)
+				fmt.Fprintf(&buf, "  Input  packets:       %20d (%d pps)    [%d]\n", snap.rxPkts, rxPps, rxPktsDelta)
+				fmt.Fprintf(&buf, "  Output packets:       %20d (%d pps)    [%d]\n", snap.txPkts, txPps, txPktsDelta)
+				fmt.Fprintf(&buf, "\n")
+
+				var rxErrD, txErrD, rxDropD, txDropD, rxFrameD, txCarrierD, colD uint64
+				rxErrD = snap.rxErrors - baselineSingle.rxErrors
+				txErrD = snap.txErrors - baselineSingle.txErrors
+				rxDropD = snap.rxDrops - baselineSingle.rxDrops
+				txDropD = snap.txDrops - baselineSingle.txDrops
+				rxFrameD = snap.rxFrame - baselineSingle.rxFrame
+				txCarrierD = snap.txCarrier - baselineSingle.txCarrier
+				colD = snap.collisions - baselineSingle.collisions
+
+				fmt.Fprintf(&buf, "Error statistics:                                  Current delta\n")
+				fmt.Fprintf(&buf, "  Input  errors:        %20d          [%d]\n", snap.rxErrors, rxErrD)
+				fmt.Fprintf(&buf, "  Output errors:        %20d          [%d]\n", snap.txErrors, txErrD)
+				fmt.Fprintf(&buf, "  Input  drops:         %20d          [%d]\n", snap.rxDrops, rxDropD)
+				fmt.Fprintf(&buf, "  Output drops:         %20d          [%d]\n", snap.txDrops, txDropD)
+				fmt.Fprintf(&buf, "  Input  frame errors:  %20d          [%d]\n", snap.rxFrame, rxFrameD)
+				fmt.Fprintf(&buf, "  Output carrier:       %20d          [%d]\n", snap.txCarrier, txCarrierD)
+				fmt.Fprintf(&buf, "  Collisions:           %20d          [%d]\n", snap.collisions, colD)
+
+				prevSingle = snap
+			}
+		} else {
+			// Traffic summary for all interfaces.
+			names := sortedNames()
+			fmt.Fprintf(&buf, "%-40s Seconds: %-10d Time: %s\n\n", hostname, seconds, now)
+			fmt.Fprintf(&buf, "%-16s %4s %20s %12s %20s %12s\n",
+				"Interface", "Link", "Input packets", "(pps)", "Output packets", "(pps)")
+
+			newPrev := make(map[string]*ifSnap, len(names))
+			for _, name := range names {
+				kernelName := resolveToKernel(name)
+				snap := readSnap(kernelName)
+				if snap == nil {
+					continue
+				}
+				newPrev[name] = snap
+				link := readLinkState(kernelName)
+				var rxPps, txPps uint64
+				if p, ok := prevAll[name]; ok && p != nil {
+					dt := snap.ts.Sub(p.ts).Seconds()
+					if dt > 0 {
+						rxPps = uint64(float64(snap.rxPkts-p.rxPkts) / dt)
+						txPps = uint64(float64(snap.txPkts-p.txPkts) / dt)
+					}
+				}
+				fmt.Fprintf(&buf, "%-16s %4s %20d %11d %20d %11d\n",
+					name, link, snap.rxPkts, rxPps, snap.txPkts, txPps)
+			}
+			prevAll = newPrev
+		}
+
+		if err := stream.Send(&pb.MonitorInterfaceResponse{Frame: buf.String()}); err != nil {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}

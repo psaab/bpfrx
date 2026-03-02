@@ -2898,11 +2898,46 @@ func (c *ctl) handleMonitor(args []string) error {
 	switch args[0] {
 	case "traffic":
 		return fmt.Errorf("monitor traffic is only available on the local CLI")
+	case "interface":
+		return c.handleMonitorInterface(args[1:])
 	case "security":
 		return c.handleMonitorSecurity(args[1:])
 	default:
 		return fmt.Errorf("unknown monitor target: %s", args[0])
 	}
+}
+
+func (c *ctl) handleMonitorInterface(args []string) error {
+	req := &pb.MonitorInterfaceRequest{}
+	if len(args) > 0 && args[0] != "traffic" {
+		req.InterfaceName = args[0]
+	}
+	// "traffic" or no args → summary mode (empty interface_name).
+
+	ctx, cancel := context.WithCancel(c.ctx())
+	defer cancel()
+	stream, err := c.client.MonitorInterface(ctx, req)
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+
+	// Enter alternate screen buffer for full-screen display.
+	fmt.Print("\x1b[?1049h\x1b[?25l")
+	defer fmt.Print("\x1b[?25h\x1b[?1049l")
+
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		// Clear screen and print the frame.
+		fmt.Print("\x1b[2J\x1b[H")
+		fmt.Print(resp.Frame)
+	}
+	return nil
 }
 
 func (c *ctl) handleMonitorSecurity(args []string) error {
