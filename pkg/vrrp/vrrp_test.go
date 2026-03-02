@@ -547,6 +547,129 @@ func TestSyncHold_SuppressesPreempt(t *testing.T) {
 	}
 }
 
+func TestSyncHold_AppliesToExistingInstances(t *testing.T) {
+	m := NewManager()
+
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, m.eventCh, nil)
+
+	m.mu.Lock()
+	m.instances = map[instanceKey]*vrrpInstance{
+		{iface: "eth0", groupID: 101}: vi,
+	}
+	m.mu.Unlock()
+
+	m.SetSyncHold(5 * time.Second)
+	defer m.ReleaseSyncHold()
+
+	if vi.getPreempt() {
+		t.Error("expected existing instance preempt to be suppressed during sync hold")
+	}
+	vi.mu.RLock()
+	dp := vi.desiredPreempt
+	vi.mu.RUnlock()
+	if !dp {
+		t.Error("expected desiredPreempt to remain true while hold is active")
+	}
+}
+
+func TestUpdateInstances_PreservesSyncHoldForExistingInstances(t *testing.T) {
+	m := NewManager()
+
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, m.eventCh, nil)
+
+	m.mu.Lock()
+	m.instances = map[instanceKey]*vrrpInstance{
+		{iface: "eth0", groupID: 101}: vi,
+	}
+	m.mu.Unlock()
+
+	m.SetSyncHold(5 * time.Second)
+	defer m.ReleaseSyncHold()
+
+	desired := []*Instance{
+		{
+			Interface: "eth0",
+			GroupID:   101,
+			Priority:  150,
+			Preempt:   true,
+		},
+	}
+	if err := m.UpdateInstances(desired); err != nil {
+		t.Fatalf("UpdateInstances failed: %v", err)
+	}
+
+	if vi.getPreempt() {
+		t.Error("expected sync hold to keep preempt disabled on updated instance")
+	}
+	if got := vi.getPriority(); got != 150 {
+		t.Errorf("priority = %d, want 150", got)
+	}
+	vi.mu.RLock()
+	dp := vi.desiredPreempt
+	vi.mu.RUnlock()
+	if !dp {
+		t.Error("expected desiredPreempt to track configured preempt during hold")
+	}
+}
+
+func TestSyncHold_RearmStopsPreviousTimer(t *testing.T) {
+	m := NewManager()
+	vi := newInstance(Instance{
+		Interface: "eth0",
+		GroupID:   101,
+		Priority:  200,
+		Preempt:   true,
+	}, &net.Interface{Name: "eth0"}, m.eventCh, nil)
+
+	m.mu.Lock()
+	m.instances = map[instanceKey]*vrrpInstance{
+		{iface: "eth0", groupID: 101}: vi,
+	}
+	m.mu.Unlock()
+
+	m.SetSyncHold(30 * time.Millisecond)
+	time.Sleep(15 * time.Millisecond)
+	m.SetSyncHold(120 * time.Millisecond)
+	defer m.ReleaseSyncHold()
+
+	time.Sleep(60 * time.Millisecond)
+
+	m.mu.RLock()
+	held := m.syncHold
+	m.mu.RUnlock()
+	if !held {
+		t.Fatal("expected sync hold to remain active after timer re-arm")
+	}
+	if reason := m.SyncHoldReason(); reason != "" {
+		t.Fatalf("expected empty sync hold reason while hold active, got %q", reason)
+	}
+
+	time.Sleep(90 * time.Millisecond)
+
+	m.mu.RLock()
+	held = m.syncHold
+	m.mu.RUnlock()
+	if held {
+		t.Fatal("expected sync hold to release after re-armed timeout")
+	}
+	if reason := m.SyncHoldReason(); reason != "timeout-degraded" {
+		t.Fatalf("expected timeout-degraded reason after timeout, got %q", reason)
+	}
+	if !vi.getPreempt() {
+		t.Fatal("expected preempt to be restored after timeout release")
+	}
+}
+
 func TestSyncHold_ReleaseTwiceIsNoop(t *testing.T) {
 	m := NewManager()
 	m.SetSyncHold(5 * time.Second)

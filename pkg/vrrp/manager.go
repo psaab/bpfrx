@@ -87,8 +87,21 @@ func (m *Manager) Stop() {
 func (m *Manager) SetSyncHold(timeout time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if m.syncHoldTimer != nil {
+		m.syncHoldTimer.Stop()
+		m.syncHoldTimer = nil
+	}
+	wasHeld := m.syncHold
 	m.syncHold = true
 	m.syncHoldReason = ""
+	if !wasHeld {
+		for _, vi := range m.instances {
+			vi.suppressPreempt()
+		}
+	}
 	m.syncHoldTimer = time.AfterFunc(timeout, func() {
 		slog.Warn("vrrp: sync-hold timeout: bulk sync did not complete within timeout, releasing in degraded mode",
 			"timeout", timeout)
@@ -116,6 +129,7 @@ func (m *Manager) releaseSyncHoldWithReason(reason string) {
 	m.syncHoldReason = reason
 	if m.syncHoldTimer != nil {
 		m.syncHoldTimer.Stop()
+		m.syncHoldTimer = nil
 	}
 	for _, vi := range m.instances {
 		vi.restorePreempt()
@@ -176,7 +190,14 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 			if vipsEqual(existing.cfg.VirtualAddresses, inst.VirtualAddresses) {
 				slog.Info("vrrp: priority update", "key", existing.key(),
 					"old_pri", existing.cfg.Priority, "new_pri", inst.Priority)
-				existing.updateConfig(*inst)
+				instCfg := *inst
+				if m.syncHold {
+					instCfg.Preempt = false
+				}
+				existing.updateConfig(instCfg)
+				if m.syncHold {
+					existing.setDesiredPreempt(inst.Preempt)
+				}
 				continue
 			}
 			// VIPs changed — must restart instance.
