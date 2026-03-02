@@ -684,7 +684,7 @@ func (s *SessionSync) sendLoop(ctx context.Context) {
 				continue
 			}
 			s.writeMu.Lock()
-			_, err := conn.Write(msg)
+			err := writeFull(conn, msg)
 			s.writeMu.Unlock()
 			if err != nil {
 				slog.Debug("cluster sync: send error", "err", err)
@@ -1185,14 +1185,26 @@ func monotonicSeconds() uint64 {
 
 // --- Wire encoding helpers ---
 
+// writeFull loops until all bytes are written or an error occurs,
+// handling short writes from TCP backpressure.
+func writeFull(conn net.Conn, buf []byte) error {
+	for len(buf) > 0 {
+		n, err := conn.Write(buf)
+		if err != nil {
+			return err
+		}
+		buf = buf[n:]
+	}
+	return nil
+}
+
 func writeMsg(conn net.Conn, msgType uint8, payload []byte) error {
 	buf := make([]byte, syncHeaderSize+len(payload))
 	copy(buf[:4], syncMagic[:])
 	buf[4] = msgType
 	binary.LittleEndian.PutUint32(buf[8:12], uint32(len(payload)))
 	copy(buf[syncHeaderSize:], payload)
-	_, err := conn.Write(buf)
-	return err
+	return writeFull(conn, buf)
 }
 
 func encodeSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) []byte {

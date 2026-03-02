@@ -743,6 +743,96 @@ func TestSyncSweepPerRGV6(t *testing.T) {
 	}
 }
 
+// shortWriteConn is a mock net.Conn that returns short writes (1 byte at a time).
+type shortWriteConn struct {
+	net.Conn
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (c *shortWriteConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(b) == 0 {
+		return 0, nil
+	}
+	// Only write 1 byte at a time to simulate short writes.
+	c.buf = append(c.buf, b[0])
+	return 1, nil
+}
+
+func (c *shortWriteConn) bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.buf...)
+}
+
+func TestWriteFullShortWrites(t *testing.T) {
+	sw := &shortWriteConn{}
+
+	// Use writeMsg which calls writeFull internally.
+	payload := []byte("hello world")
+	err := writeMsg(sw, syncMsgConfig, payload)
+	if err != nil {
+		t.Fatalf("writeMsg failed: %v", err)
+	}
+
+	got := sw.bytes()
+	expected := syncHeaderSize + len(payload)
+	if len(got) != expected {
+		t.Fatalf("expected %d bytes, got %d", expected, len(got))
+	}
+
+	// Verify header.
+	if string(got[0:4]) != "BPSY" {
+		t.Fatalf("bad magic: %q", got[0:4])
+	}
+	if got[4] != syncMsgConfig {
+		t.Fatalf("bad msg type: %d", got[4])
+	}
+	pLen := binary.LittleEndian.Uint32(got[8:12])
+	if int(pLen) != len(payload) {
+		t.Fatalf("bad payload length: %d", pLen)
+	}
+
+	// Verify payload.
+	if string(got[syncHeaderSize:]) != "hello world" {
+		t.Fatalf("bad payload: %q", got[syncHeaderSize:])
+	}
+}
+
+func TestWriteFullDirectShortWrites(t *testing.T) {
+	sw := &shortWriteConn{}
+
+	// Write a pre-encoded session message through writeFull directly.
+	key := dataplane.SessionKey{
+		SrcIP:    [4]byte{10, 0, 1, 1},
+		DstIP:    [4]byte{10, 0, 2, 1},
+		SrcPort:  12345,
+		DstPort:  80,
+		Protocol: 6,
+	}
+	val := dataplane.SessionValue{State: dataplane.SessStateEstablished}
+	msg := encodeSessionV4(key, val)
+
+	err := writeFull(sw, msg)
+	if err != nil {
+		t.Fatalf("writeFull failed: %v", err)
+	}
+
+	got := sw.bytes()
+	if len(got) != len(msg) {
+		t.Fatalf("expected %d bytes, got %d", len(msg), len(got))
+	}
+
+	// Verify byte-for-byte match.
+	for i := range msg {
+		if got[i] != msg[i] {
+			t.Fatalf("byte mismatch at offset %d: got %02x, want %02x", i, got[i], msg[i])
+		}
+	}
+}
+
 // countingWriter wraps a net.Conn and counts sync messages written.
 type countingWriter struct {
 	net.Conn
