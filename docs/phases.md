@@ -1596,8 +1596,8 @@ Manager
 Session sync had three critical bugs that prevented reliable stateful failover:
 1. Forward-only sweep entries had no reverse conntrack entry on the takeover node
 2. SNAT sessions lacked dnat_table entries for return traffic pre-routing
-3. Monotonic clock skew caused premature GC expiry of synced sessions (in progress)
-4. Cold ARP cache on takeover node caused NO_NEIGH drops (in progress)
+3. Monotonic clock skew caused premature GC expiry of synced sessions (fixed)
+4. Cold ARP cache on takeover node caused NO_NEIGH drops (fixed)
 
 ### Fix 1: Reverse Entry Creation (FIXED)
 - `handleMessage()` for SessionV4/V6 now creates reverse entries from forward entries
@@ -1610,13 +1610,11 @@ Session sync had three critical bugs that prevented reliable stateful failover:
   - Creates `DNATValue{NewDstIP=SrcIP, NewDstPort=SrcPort}`
 - Delete messages now also clean up reverse entries and dnat_table entries (lookup before delete)
 
-### Fix 3: Monotonic Clock Skew (IN PROGRESS — Task #2)
-- Proposed: Set `LastSeen = local monotonicSeconds()` when installing synced sessions
-- Prevents premature GC expiry when nodes have different uptimes
+### Fix 3: Monotonic Clock Skew (FIXED, `0080cbc`)
+- Synced session installation now uses local monotonic timing semantics to prevent premature GC expiry between nodes with different uptimes.
 
-### Fix 4: NO_NEIGH ARP Warmup (IN PROGRESS — Task #1)
-- Proposed: Proactive ARP/NDP warmup after VRRP MASTER transition
-- Consider `BPF_FIB_LOOKUP_SKIP_NEIGH` for graceful degradation
+### Fix 4: NO_NEIGH ARP Warmup (FIXED, `0080cbc`)
+- Receiver and failover handling were hardened to avoid takeover-path failures caused by cold neighbor state.
 
 ### Design Decision: FIB Cache Not Synced
 - `fib_ifindex`, `fib_dmac`, `fib_smac`, `fib_gen` zeroed in synced sessions

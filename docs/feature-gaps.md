@@ -1,6 +1,6 @@
 # bpfrx vs Juniper vSRX Feature Gap Analysis
 
-Last updated: 2026-02-25
+Last updated: 2026-03-02
 
 ## Summary
 
@@ -14,7 +14,7 @@ Last updated: 2026-02-25
 | Advanced Threat Prevention | 5 | 1 | 0 | 6 |
 | User/Identity Firewall | 5 | 0 | 0 | 5 |
 | NAT Enhancements | 5 | 1 | 0 | 6 |
-| Screen/IDS Enhancements | 4 | 2 | 1 | 6 |
+| Screen/IDS Enhancements | 4 | 2 | 0 | 6 |
 | Security Flow Enhancements | 5 | 0 | 0 | 5 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
 | Security Logging Enhancements | 1 | 0 | 0 | 1 |
@@ -26,10 +26,10 @@ Last updated: 2026-02-25
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
 | Management & Automation | 9 | 2 | 0 | 11 |
-| Interface Enhancements | 4 | 2 | 1 | 7 |
+| Interface Enhancements | 1 | 1 | 0 | 2 |
 | System Enhancements | 5 | 1 | 2 | 8 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **132** | **17** | **6** | **155** |
+| **TOTAL** | **122** | **14** | **4** | **140** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -374,14 +374,14 @@ bpfrx manages all interfaces with .link/.network files, supports VLANs, tunnel i
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Link Aggregation (LAG/ae)** | `interfaces ae0 ...; interfaces ge-0/0/0 gigether-options 802.3ad ae0` | Bundle physical links into aggregate ethernet for bandwidth and redundancy. Different from reth. | Medium | Missing |
+| **Link Aggregation (LAG/ae)** | `interfaces ae0 ...; interfaces ge-0/0/0 gigether-options 802.3ad ae0` | Bundle physical links into aggregate ethernet for bandwidth and redundancy. Different from reth. | Medium | Done (LACP/802.3ad parsing + bond/netdev generation + member enslaving) |
 | **Transparent Mode (L2 Bridging)** | `interfaces ... family ethernet-switching; bridge-domains ...` | Layer 2 bridge mode where firewall acts as transparent inline device. Zone-based policies still apply. MAC learning table. | Medium | Missing |
-| **Flexible VLAN Tagging** | `interfaces ... flexible-vlan-tagging; encapsulation flexible-ethernet-services` | Q-in-Q (802.1ad), flexible VLAN push/pop/swap operations. bpfrx has basic 802.1Q single-tag. | Low | Missing |
-| **Interface Bandwidth** | `interfaces ... bandwidth ...` | Set logical interface bandwidth for OSPF cost calculation and traffic-engineering | Low | Missing |
+| **Flexible VLAN Tagging** | `interfaces ... flexible-vlan-tagging; encapsulation flexible-ethernet-services` | Q-in-Q (802.1ad), flexible VLAN push/pop/swap operations. bpfrx has basic 802.1Q single-tag. | Low | Done (flexible-vlan-tagging + flexible-ethernet-services + inner-vlan parsing/wiring) |
+| **Interface Bandwidth** | `interfaces ... bandwidth ...` | Set logical interface bandwidth for OSPF cost calculation and traffic-engineering | Low | Done (parsed and rendered into FRR interface bandwidth) |
 | **IRB Interfaces** | `interfaces irb unit N family inet address ...; bridge-domains bd0 { vlan-id-list ...; routing-interface irb.0; }` | Integrated Routing and Bridging: kernel Linux bridge per bridge-domain, IRB addresses on bridge device, zone assignment, .netdev/.network generation | Medium | Done (config parsing, compiler, networkd bridge/member/IRB generation, zone resolution) |
-| **Point-to-Point** | `interfaces ... unit ... point-to-point` | Mark interface as point-to-point (affects OSPF network type, ND behavior) | Low | Parse-Only |
+| **Point-to-Point** | `interfaces ... unit ... point-to-point` | Mark interface as point-to-point (affects OSPF network type, ND behavior) | Low | Done (parsed and emitted as FRR OSPF point-to-point where applicable) |
 | **Primary/Preferred Address** | `interfaces ... unit ... family inet address ... primary/preferred` | Control which address is used for sourced traffic. Syslog source and networkd ordering implemented; not yet used for all device-originated traffic. | Low | Partial (syslog source + networkd ordering, not all traffic) |
-| **Interface Description** | `interfaces ... description "..."` | bpfrx parses descriptions. Verify they appear in `show interfaces` output. | Low | Partial (parsed, display may need verification) |
+| **Interface Description** | `interfaces ... description "..."` | bpfrx parses descriptions. Verify they appear in `show interfaces` output. | Low | Done (description displayed in interface output paths) |
 
 ---
 
@@ -433,11 +433,11 @@ Features commonly requested in enterprise deployments:
 
 8. **RADIUS/TACACS+ Authentication** - Enterprise AAA integration
 9. **SSL VPN / Remote Access VPN** - Remote worker connectivity
-10. **Aggressive Session Aging** - Session table management under load
+10. ~~**Aggressive Session Aging**~~ - **Done** (GC high/low-watermark early-ageout behavior)
 11. **Graceful Restart** - Non-stop routing (FRR already supports)
 12. **Twice NAT** - Complex NAT scenarios
 13. **Transparent Mode (L2)** - Inline transparent firewall deployment
-14. **Link Aggregation (LAG)** - Bandwidth aggregation and link redundancy
+14. ~~**Link Aggregation (LAG)**~~ - **Done**
 15. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication
 16. **SecIntel / GeoIP** - Threat intelligence integration
 17. **Captive Portal / User Firewall** - User-based access control
@@ -463,13 +463,16 @@ Features for specific use cases or carrier deployments:
 
 These features have config parsing in bpfrx but NO runtime effect:
 
+Note: This includes parse-only knobs that are outside the core category gap
+table, so this list count can be higher than the category-level Parse-Only total.
+
 | # | Config Path | Type | Notes |
 |---|------------|------|-------|
 | 1 | `security pre-id-default-policy` | PreIDDefaultPolicy | Requires AppID engine |
 | 2 | `system master-password` | SystemConfig.MasterPassword | No encrypted storage |
 | 3 | `system license autoupdate url` | SystemConfig.LicenseAutoUpdate | No licensing system |
 | 4 | `system ntp threshold action` | SystemConfig.NTPThresholdAction | Not wired to NTP config |
-| 5 | `interfaces ... point-to-point` | InterfaceUnit.PointToPoint | Not passed to networkd |
+| 5 | `security policies ... schedulers ...` | SchedulerConfig | Parsed, not runtime-enforced in policy engine |
 | 6 | `services application-identification` | ServicesConfig.ApplicationIdentification | Bool flag only, no DPI |
 
 ---

@@ -1,5 +1,8 @@
 # Next Feature: `system master-password`
 
+Date: 2026-03-02  
+Status: Proposed
+
 ## Config Evidence
 - Present in `/home/ps/git/bpfrx/vsrx.conf:111` as `master-password { pseudorandom-function ... }`
 

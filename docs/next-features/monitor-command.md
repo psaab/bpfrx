@@ -1,7 +1,10 @@
 # Next Feature: `monitor` Operational Commands
 
+Date: 2026-03-01  
+Status: Implemented (`docs/phases.md` Sprint: Monitor Commands, PR #67)
+
 ## Why this doc exists
-We need Junos-compatible `monitor` behavior in bpfrx. This document captures live behavior observed on `claude@172.16.100.1` (JUNOS 24.4R1-S2.9) so we can implement it accurately.
+This document captures Junos monitor behavior observed on `claude@172.16.100.1` (JUNOS 24.4R1-S2.9) and serves as the behavior reference for bpfrx monitor command parity.
 
 ## Command discovery (live)
 Top-level `monitor` subtree:
@@ -165,7 +168,7 @@ Fields present in each line:
 
 For now, security monitor commands are highest value for firewall operations.
 
-## Implementation plan for bpfrx
+## Implementation summary in bpfrx
 
 ### CLI grammar (operational mode)
 Implement these first:
@@ -194,8 +197,7 @@ Match Junos user-facing behavior:
 - `monitor security packet-drop` should consume policy/screen/drop events from the existing event pipeline and format them as packet-drop records.
 - `monitor security flow` should stream flow/session events into configured trace output with filter evaluation before write.
 
-## Open questions before coding
+## Open follow-up questions
 1. Should bpfrx write `flow` trace data to filesystem like Junos (`/var/log/<file>`) or keep initial implementation in-memory/CLI only?
 2. Do we need multi-node output prefixes (`node0/node1`) in standalone mode, or only when cluster mode is enabled?
 3. How strict should compatibility be for named port aliases in CLI parsing (`domain`, `https`, etc.) in the first iteration?
-

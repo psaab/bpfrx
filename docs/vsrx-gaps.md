@@ -3,6 +3,11 @@
 Comprehensive gap analysis between bpfrx and Juniper vSRX. Organized by category.
 Last updated: 2026-02-13
 
+> Status: Historical snapshot.  
+> This file is superseded for active planning by `docs/feature-gaps.md` and
+> `docs/authoritative-backlog.md`. Some statuses here are stale relative to
+> later HA/interface/monitor implementation sprints.
+
 ---
 
 ## 1. Security Features

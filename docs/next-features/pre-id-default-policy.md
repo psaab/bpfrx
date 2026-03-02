@@ -1,5 +1,8 @@
 # Next Feature: `security pre-id-default-policy`
 
+Date: 2026-03-02  
+Status: Proposed
+
 ## Config Evidence
 - Present in `/home/ps/git/bpfrx/vsrx.conf:21128` as `pre-id-default-policy { ... }`
 
