@@ -781,12 +781,32 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.lldpMgr.Stop()
 	}
 
+	// Determine shutdown mode early so we can clear rg_active BEFORE
+	// stopping subsystems (VRRP, sync) that may hang.
+	cfg := d.store.ActiveConfig()
+	haMode := cfg != nil && cfg.Chassis.Cluster != nil
+	hitless := !haMode // standalone = hitless by default
+	if haMode && cfg.Chassis.Cluster.HitlessRestart {
+		hitless = true // operator explicitly opted in
+	}
+
+	// In HA fail-closed mode, clear rg_active immediately so BPF stops
+	// forwarding traffic even if subsequent cleanup steps hang.
+	if !hitless && d.dp != nil && cfg.Chassis.Cluster != nil {
+		slog.Info("HA shutdown: clearing rg_active for all RGs")
+		for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+			if err := d.dp.UpdateRGActive(rg.ID, false); err != nil {
+				slog.Warn("failed to clear rg_active on shutdown", "rg", rg.ID, "err", err)
+			}
+		}
+	}
+
 	// Stop VRRP manager (removes VIPs, sends priority-0).
 	if d.vrrpMgr != nil {
 		d.vrrpMgr.Stop()
 	}
 
-	// Stop session sync.
+	// Stop session sync (5s timeout to avoid blocking teardown).
 	if d.sessionSync != nil {
 		d.sessionSync.Stop()
 	}
@@ -796,16 +816,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cluster.Stop()
 	}
 
-	// Determine shutdown mode: in HA mode, default to fail-closed teardown
-	// to prevent a stopped/crashed node from continuing to forward traffic.
-	// Standalone mode preserves state for hitless restarts.
-	cfg := d.store.ActiveConfig()
-	haMode := cfg != nil && cfg.Chassis.Cluster != nil
-	hitless := !haMode // standalone = hitless by default
-	if haMode && cfg.Chassis.Cluster.HitlessRestart {
-		hitless = true // operator explicitly opted in
-	}
-
 	if d.dp != nil {
 		logFinalStats(d.dp)
 		if hitless {
@@ -813,16 +823,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			slog.Info("hitless shutdown: preserving BPF state")
 			d.dp.Close()
 		} else {
-			// Fail-closed: clear rg_active for all RGs so the peer
-			// takes over, then fully tear down pinned BPF state.
-			slog.Info("HA shutdown: clearing rg_active and tearing down BPF state")
-			if cfg.Chassis.Cluster != nil {
-				for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
-					if err := d.dp.UpdateRGActive(rg.ID, false); err != nil {
-						slog.Warn("failed to clear rg_active on shutdown", "rg", rg.ID, "err", err)
-					}
-				}
-			}
+			// Fail-closed: tear down all pinned BPF state.
+			slog.Info("HA shutdown: tearing down BPF state")
 			d.dp.Teardown()
 		}
 	}

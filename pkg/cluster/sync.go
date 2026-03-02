@@ -216,7 +216,9 @@ func (s *SessionSync) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop gracefully shuts down session sync.
+// Stop gracefully shuts down session sync.  If goroutines do not exit
+// within 5 seconds the method returns anyway so the daemon can proceed
+// with HA teardown (clearing rg_active, removing BPF state).
 func (s *SessionSync) Stop() {
 	if s.cancel != nil {
 		s.cancel()
@@ -229,7 +231,18 @@ func (s *SessionSync) Stop() {
 		s.conn.Close()
 	}
 	s.mu.Unlock()
-	s.wg.Wait()
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// Clean exit.
+	case <-time.After(5 * time.Second):
+		slog.Warn("cluster sync: Stop timed out waiting for goroutines, proceeding with shutdown")
+	}
 }
 
 // StartSyncSweep starts a goroutine that periodically syncs new sessions to the peer.
