@@ -1,6 +1,9 @@
 package daemon
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestRGStateMachine_ClusterOnly(t *testing.T) {
 	s := newRGStateMachine()
@@ -389,5 +392,104 @@ func TestRGStateMachine_DesiredVsApplied_RetryOnFailure(t *testing.T) {
 	}
 	if s.NeedsApply() {
 		t.Error("should not need apply when already applied")
+	}
+}
+
+func TestRGStateMachine_CheckVRRPPosture_NoMismatch(t *testing.T) {
+	s := newRGStateMachine()
+	now := time.Now()
+
+	// Cluster Primary + VRRP MASTER → no mismatch.
+	s.SetCluster(true)
+	s.SetVRRP("reth0", true)
+	if got := s.CheckVRRPPosture(now); got != vrrpPostureOK {
+		t.Errorf("expected OK, got %d", got)
+	}
+
+	// Cluster Secondary + VRRP BACKUP → no mismatch.
+	s.SetCluster(false)
+	s.SetVRRP("reth0", false)
+	if got := s.CheckVRRPPosture(now); got != vrrpPostureOK {
+		t.Errorf("expected OK, got %d", got)
+	}
+}
+
+func TestRGStateMachine_CheckVRRPPosture_NeedsMaster_DelayedAction(t *testing.T) {
+	s := newRGStateMachine()
+	now := time.Now()
+
+	// Cluster Primary but VRRP BACKUP → mismatch detected.
+	s.SetCluster(true)
+	s.SetVRRP("reth0", false)
+
+	// First check: starts timer, returns OK (no immediate action).
+	if got := s.CheckVRRPPosture(now); got != vrrpPostureOK {
+		t.Errorf("first check should return OK, got %d", got)
+	}
+
+	// Check before delay expires: still OK.
+	if got := s.CheckVRRPPosture(now.Add(5 * time.Second)); got != vrrpPostureOK {
+		t.Errorf("check at 5s should return OK, got %d", got)
+	}
+
+	// Check after delay expires: needs MASTER.
+	if got := s.CheckVRRPPosture(now.Add(11 * time.Second)); got != vrrpPostureNeedsMaster {
+		t.Errorf("check at 11s should return NeedsMaster, got %d", got)
+	}
+
+	// Timer was reset — next check starts fresh.
+	if got := s.CheckVRRPPosture(now.Add(12 * time.Second)); got != vrrpPostureOK {
+		t.Errorf("check after correction should return OK (timer reset), got %d", got)
+	}
+}
+
+func TestRGStateMachine_CheckVRRPPosture_NeedsResign_DelayedAction(t *testing.T) {
+	s := newRGStateMachine()
+	now := time.Now()
+
+	// Cluster Secondary but VRRP MASTER → mismatch.
+	s.SetCluster(false)
+	s.SetVRRP("reth0", true)
+
+	// First check: starts timer.
+	if got := s.CheckVRRPPosture(now); got != vrrpPostureOK {
+		t.Errorf("first check should return OK, got %d", got)
+	}
+
+	// After delay: needs resign.
+	if got := s.CheckVRRPPosture(now.Add(11 * time.Second)); got != vrrpPostureNeedsResign {
+		t.Errorf("check at 11s should return NeedsResign, got %d", got)
+	}
+}
+
+func TestRGStateMachine_CheckVRRPPosture_MismatchClears(t *testing.T) {
+	s := newRGStateMachine()
+	now := time.Now()
+
+	// Create mismatch: cluster Primary, VRRP BACKUP.
+	s.SetCluster(true)
+	s.SetVRRP("reth0", false)
+
+	// Start mismatch timer.
+	s.CheckVRRPPosture(now)
+
+	// VRRP becomes MASTER before delay expires → mismatch clears.
+	s.SetVRRP("reth0", true)
+	if got := s.CheckVRRPPosture(now.Add(5 * time.Second)); got != vrrpPostureOK {
+		t.Errorf("should return OK after mismatch cleared, got %d", got)
+	}
+
+	// Verify timer was reset: create mismatch again.
+	s.SetVRRP("reth0", false)
+	s.CheckVRRPPosture(now.Add(6 * time.Second)) // start timer
+
+	// Check at original now+11s — should NOT trigger because timer was reset at +6s.
+	if got := s.CheckVRRPPosture(now.Add(11 * time.Second)); got != vrrpPostureOK {
+		t.Errorf("should return OK — timer was reset at 6s, only 5s elapsed, got %d", got)
+	}
+
+	// Check at +17s (11s since reset at +6s) — should trigger.
+	if got := s.CheckVRRPPosture(now.Add(17 * time.Second)); got != vrrpPostureNeedsMaster {
+		t.Errorf("should return NeedsMaster after 11s from timer reset, got %d", got)
 	}
 }

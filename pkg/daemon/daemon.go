@@ -4292,12 +4292,24 @@ func (d *Daemon) reconcileRGState() {
 			d.injectBlackholeRoutes(rgID)
 		}
 
-		// VRRP posture reconciliation (#86) is intentionally NOT done here.
-		// ForceRGMaster / ResignRG during the reconcile tick fights with
-		// normal VRRP state machine transitions (startup sync-hold, hitless
-		// restart). The event-driven path in watchVRRPEvents handles all
-		// VRRP→cluster state transitions; the reconcile loop only ensures
-		// rg_active + blackhole routes + services converge.
+		// VRRP posture reconciliation (#86): detect sustained mismatch
+		// between cluster state and VRRP state. Only act after 10s+
+		// continuous mismatch to avoid fighting transient states (VRRP
+		// sync-hold, election timers, hitless restart). Skip entirely
+		// during sync-hold when VRRP is intentionally suppressing preempt.
+		if d.vrrpMgr != nil && !d.vrrpMgr.InSyncHold() {
+			switch s.CheckVRRPPosture(time.Now()) {
+			case vrrpPostureNeedsMaster:
+				slog.Warn("reconcile: VRRP posture mismatch — cluster=primary but VRRP!=MASTER, forcing",
+					"rg", rgID)
+				d.vrrpMgr.UpdateRGPriority(rgID, 200)
+				d.vrrpMgr.ForceRGMaster(rgID)
+			case vrrpPostureNeedsResign:
+				slog.Warn("reconcile: VRRP posture mismatch — cluster=secondary but VRRP=MASTER, resigning",
+					"rg", rgID)
+				d.vrrpMgr.ResignRG(rgID)
+			}
+		}
 
 		// RA/DHCP service reconciliation (#93): safety net for dropped
 		// VRRP events that should have started or stopped per-RG services.

@@ -1,6 +1,9 @@
 package daemon
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // rgStateMachine tracks the combined cluster + VRRP state for a single
 // redundancy group. Both watchClusterEvents and watchVRRPEvents funnel
@@ -28,6 +31,13 @@ type rgStateMachine struct {
 	applied       bool            // last successfully applied rg_active value
 	applyPending  bool            // true when desired != applied
 	epoch         uint64          // monotonic counter
+
+	// VRRP posture mismatch tracking (#86): detect when VRRP state
+	// doesn't match cluster expectations and only take corrective action
+	// after a sustained mismatch (vrrpPostureDelay). This prevents the
+	// reconcile loop from fighting transient states (sync-hold, election,
+	// hitless restart).
+	vrrpMismatchSince time.Time // when mismatch was first detected (zero = no mismatch)
 }
 
 // rgTransition is returned by state machine updates to inform the caller
@@ -189,4 +199,59 @@ func (s *rgStateMachine) allMasterLocked() bool {
 		}
 	}
 	return true
+}
+
+// vrrpPostureDelay is the minimum duration a VRRP posture mismatch must
+// persist before the reconcile loop takes corrective action (ForceRGMaster
+// or ResignRG). This delay prevents fighting with transient states like
+// VRRP sync-hold, election timers, and hitless restart.
+const vrrpPostureDelay = 10 * time.Second
+
+// vrrpPostureMismatch describes the type of posture correction needed.
+type vrrpPostureMismatch int
+
+const (
+	vrrpPostureOK          vrrpPostureMismatch = iota // no correction needed
+	vrrpPostureNeedsMaster                            // cluster=primary but VRRP != MASTER
+	vrrpPostureNeedsResign                            // cluster=secondary but VRRP == MASTER
+)
+
+// CheckVRRPPosture checks whether VRRP state matches cluster expectations
+// and returns a correction action if the mismatch has persisted for at
+// least vrrpPostureDelay. Resets the mismatch timer when state matches.
+//
+// The caller is responsible for skipping this check during sync-hold.
+func (s *rgStateMachine) CheckVRRPPosture(now time.Time) vrrpPostureMismatch {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	anyMaster := s.anyMasterLocked()
+
+	var mismatch vrrpPostureMismatch
+	switch {
+	case s.clusterPri && !anyMaster:
+		// Cluster says we're primary but VRRP is not MASTER.
+		mismatch = vrrpPostureNeedsMaster
+	case !s.clusterPri && anyMaster:
+		// Cluster says secondary but VRRP is still MASTER.
+		mismatch = vrrpPostureNeedsResign
+	default:
+		// State matches — clear mismatch timer.
+		s.vrrpMismatchSince = time.Time{}
+		return vrrpPostureOK
+	}
+
+	// Start or continue mismatch tracking.
+	if s.vrrpMismatchSince.IsZero() {
+		s.vrrpMismatchSince = now
+		return vrrpPostureOK // first detection, don't act yet
+	}
+
+	if now.Sub(s.vrrpMismatchSince) < vrrpPostureDelay {
+		return vrrpPostureOK // mismatch hasn't persisted long enough
+	}
+
+	// Sustained mismatch — reset timer and signal correction.
+	s.vrrpMismatchSince = time.Time{}
+	return mismatch
 }
