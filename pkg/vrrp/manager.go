@@ -324,6 +324,10 @@ func (m *Manager) ReconcileVIPs() {
 	for _, vi := range m.instances {
 		if vi.getState() == StateMaster {
 			vi.addVIPs()
+			// Bump garpEpoch so the epoch-dedup in sendGARP() doesn't
+			// block this send. ReconcileVIPs is called after programRethMAC
+			// (link DOWN/UP) which changes the MAC — GARP is critical here.
+			vi.garpEpoch.Add(1)
 			if !vi.suppressGARP.Load() {
 				vi.sendGARP()
 			}
