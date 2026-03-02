@@ -10,12 +10,16 @@ import (
 // transitions through this struct, which determines the desired rg_active
 // value from the combined inputs.
 //
-// Activation rule: rg_active = clusterPri || anyVrrpMaster
+// Activation rule (default): rg_active = clusterPri || anyVrrpMaster
 //   - Cluster Primary alone activates (avoids dual-inactive window while
 //     VRRP catches up)
 //   - VRRP MASTER alone activates (VRRP is faster than heartbeat; cluster
 //     Primary event may lag by ~200ms)
 //   - Both false → deactivate
+//
+// Activation rule (strict-vip-ownership): rg_active = anyVrrpMaster
+//   - VRRP master state is the sole authority for activation
+//   - Prevents brief dual-active window during failover in same-L2 deployments
 //
 // Desired-vs-applied tracking: the state machine tracks both what the
 // desired rg_active value should be and whether it was successfully applied
@@ -40,6 +44,11 @@ type rgStateMachine struct {
 	vrrpMismatchSince time.Time // when mismatch was first detected (zero = no mismatch)
 
 	startedAt time.Time // when this state machine was created (for posture delay selection)
+
+	// Strict VIP ownership (#104): when enabled, rg_active is derived
+	// solely from VRRP master state, NOT clusterPri || anyVrrpMaster.
+	// This prevents the brief dual-active window during failover.
+	strictVIPOwnership bool
 }
 
 // rgTransition is returned by state machine updates to inform the caller
@@ -55,6 +64,21 @@ func newRGStateMachine() *rgStateMachine {
 		vrrpInstances: make(map[string]bool),
 		startedAt:     time.Now(),
 	}
+}
+
+// SetStrictVIPOwnership enables or disables strict VIP ownership mode.
+// When enabled, rg_active is derived from VRRP master state only.
+func (s *rgStateMachine) SetStrictVIPOwnership(strict bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.strictVIPOwnership = strict
+}
+
+// IsStrictVIPOwnership returns whether strict VIP ownership mode is enabled.
+func (s *rgStateMachine) IsStrictVIPOwnership() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.strictVIPOwnership
 }
 
 // SetCluster updates the cluster Primary/Secondary state and returns
@@ -174,7 +198,12 @@ func (s *rgStateMachine) CurrentDesired() (active bool, epoch uint64) {
 
 func (s *rgStateMachine) reconcileLocked() rgTransition {
 	s.epoch++
-	desired := s.clusterPri || s.anyMasterLocked()
+	var desired bool
+	if s.strictVIPOwnership {
+		desired = s.anyMasterLocked() // VRRP-only: prevents dual-active window
+	} else {
+		desired = s.clusterPri || s.anyMasterLocked()
+	}
 	changed := desired != s.active
 	s.active = desired
 	if s.active != s.applied {

@@ -3516,6 +3516,16 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 		slog.Info("HA watchdog heartbeat started", "rgs", len(cc.RedundancyGroups))
 	}
 
+	// Propagate strict-vip-ownership mode to RG state machines.
+	for _, rg := range cc.RedundancyGroups {
+		if rg.StrictVIPOwnership {
+			s := d.getOrCreateRGState(rg.ID)
+			s.SetStrictVIPOwnership(true)
+			slog.Info("cluster: strict-vip-ownership enabled for RG",
+				"rg", rg.ID)
+		}
+	}
+
 	// Start heartbeat if control-interface and peer-address are configured.
 	// Retry on bind failure: the control interface address and VRF device
 	// may not be ready during daemon startup (networkd race).
@@ -4062,6 +4072,11 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			}
 			if d.dp != nil {
 				d.dp.BumpFIBGeneration()
+			}
+
+			// Strict VIP ownership: suppress GARP on secondary, allow on primary.
+			if s.IsStrictVIPOwnership() {
+				d.vrrpMgr.SetGARPSuppression(ev.GroupID, !isPrimary)
 			}
 
 			// Debounced VRRP priority update — 500ms coalesce window.
