@@ -35,6 +35,7 @@ const (
 	syncMsgIPsecSA   = 9  // IPsec SA connection names sync
 	syncMsgFailover  = 10 // remote failover request (payload: 1 byte rgID)
 	syncMsgFence     = 11 // peer fencing: receiver should disable all RGs
+	syncMsgClockSync = 12 // monotonic clock exchange for timestamp rebasing
 )
 
 // syncHeader is the wire header for each sync message.
@@ -129,6 +130,11 @@ type SessionSync struct {
 	lastSessionCounter uint64              // last seen GLOBAL_CTR_SESSIONS_NEW value
 	syncBackfillNeeded atomic.Bool         // replay sweep window on send queue overflow
 	vrfDevice          string              // VRF device for SO_BINDTODEVICE (empty = default VRF)
+
+	// Peer clock offset: localMono - peerMono.  Added to incoming
+	// session timestamps so Created/LastSeen are in our clock domain.
+	peerClockOffset atomic.Int64
+	clockSynced     atomic.Bool
 
 	zoneRGMu  sync.RWMutex
 	zoneRGMap map[uint16]int // zone_id -> RG_id (for per-RG session sync)
@@ -609,6 +615,20 @@ func (s *SessionSync) BulkSync() error {
 	return nil
 }
 
+// sendClockSync sends our monotonic clock to the peer so it can compute
+// the offset between our clocks.  Called on both sides right after TCP
+// connect, before BulkSync.
+func (s *SessionSync) sendClockSync(conn net.Conn) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], monotonicSeconds())
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgClockSync, buf[:])
+	s.writeMu.Unlock()
+	if err != nil {
+		slog.Warn("cluster sync: failed to send clock sync", "err", err)
+	}
+}
+
 func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener) {
 	for {
 		conn, err := ln.Accept()
@@ -637,6 +657,9 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener) {
 			defer s.wg.Done()
 			s.receiveLoop(ctx, conn)
 		}()
+
+		// Exchange monotonic clocks before any session data.
+		s.sendClockSync(conn)
 
 		if s.OnPeerConnected != nil {
 			go s.OnPeerConnected()
@@ -707,6 +730,9 @@ func (s *SessionSync) connectLoop(ctx context.Context) {
 			defer s.wg.Done()
 			s.receiveLoop(ctx, conn)
 		}()
+
+		// Exchange monotonic clocks before any session data.
+		s.sendClockSync(conn)
 
 		if s.OnPeerConnected != nil {
 			go s.OnPeerConnected()
@@ -820,20 +846,11 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 					s.bulkMu.Unlock()
 				}
 
-				// Rebase timestamps to local monotonic clock so the
-				// local GC doesn't expire sessions due to clock skew
-				// between cluster nodes (different boot times).
-				localNow := monotonicSeconds()
-				age := uint64(0)
-				if val.LastSeen > val.Created {
-					age = val.LastSeen - val.Created
-				}
-				val.LastSeen = localNow
-				if age < localNow {
-					val.Created = localNow - age
-				} else {
-					val.Created = 0
-				}
+				// Rebase timestamps to local monotonic clock using
+				// the clock offset exchanged at connection setup.
+				offset := s.peerClockOffset.Load()
+				val.Created = rebaseTimestamp(val.Created, offset)
+				val.LastSeen = rebaseTimestamp(val.LastSeen, offset)
 
 				// Invalidate FIB cache — peer's cached ifindex/MAC/gen
 				// are meaningless on this node.  Forces a fresh
@@ -895,18 +912,10 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 					s.bulkMu.Unlock()
 				}
 
-				// Rebase timestamps to local monotonic clock (same as V4).
-				localNow := monotonicSeconds()
-				age := uint64(0)
-				if val.LastSeen > val.Created {
-					age = val.LastSeen - val.Created
-				}
-				val.LastSeen = localNow
-				if age < localNow {
-					val.Created = localNow - age
-				} else {
-					val.Created = 0
-				}
+				// Rebase timestamps using clock offset (same as V4).
+				offset := s.peerClockOffset.Load()
+				val.Created = rebaseTimestamp(val.Created, offset)
+				val.LastSeen = rebaseTimestamp(val.LastSeen, offset)
 
 				// Invalidate FIB cache (same as V4 above).
 				val.FibIfindex = 0
@@ -1057,6 +1066,19 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 		if s.OnFenceReceived != nil {
 			s.OnFenceReceived()
 		}
+
+	case syncMsgClockSync:
+		if len(payload) < 8 {
+			slog.Warn("cluster sync: clock sync message too short")
+			return
+		}
+		peerMono := binary.LittleEndian.Uint64(payload[:8])
+		localMono := monotonicSeconds()
+		offset := int64(localMono) - int64(peerMono)
+		s.peerClockOffset.Store(offset)
+		s.clockSynced.Store(true)
+		slog.Info("cluster sync: clock synced with peer",
+			"peer_mono", peerMono, "local_mono", localMono, "offset", offset)
 	}
 }
 
@@ -1161,6 +1183,7 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		s.conn.Close()
 		s.conn = nil
 		s.stats.Connected.Store(false)
+		s.clockSynced.Store(false)
 		slog.Info("cluster sync: peer disconnected")
 	} else if s.conn != conn {
 		slog.Debug("cluster sync: ignoring stale disconnect",
@@ -1241,6 +1264,16 @@ func monotonicSeconds() uint64 {
 	var ts unix.Timespec
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 	return uint64(ts.Sec)
+}
+
+// rebaseTimestamp adjusts a peer timestamp to the local clock domain.
+// offset = localMono − peerMono (computed at connection setup).
+func rebaseTimestamp(peerTS uint64, offset int64) uint64 {
+	v := int64(peerTS) + offset
+	if v < 0 {
+		return 0
+	}
+	return uint64(v)
 }
 
 // --- Wire encoding helpers ---
