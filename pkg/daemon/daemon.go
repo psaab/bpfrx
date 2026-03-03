@@ -280,6 +280,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				"err", err)
 			d.dp = nil
 		} else {
+			d.dp.SeedNATPortCounters()
 			// Apply current config using ordered flow
 			if cfg := d.store.ActiveConfig(); cfg != nil {
 				slog.Info("applying active configuration")

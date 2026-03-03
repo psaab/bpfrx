@@ -1457,6 +1457,10 @@ func (m *Manager) ReadNATPortCounter(poolID uint32) (uint64, error) {
 	return uint64(allocs), nil
 }
 
+func (m *Manager) SeedNATPortCounters() {
+	// DPDK port counter seeded via shared memory init
+}
+
 func (m *Manager) ClearGlobalCounters() error {
 	if m.platform.shm == nil {
 		return fmt.Errorf("DPDK not initialized")

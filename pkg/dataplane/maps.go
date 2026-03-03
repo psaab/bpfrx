@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"runtime"
 
@@ -1422,6 +1423,29 @@ func (m *Manager) ReadNATPortCounter(poolID uint32) (uint64, error) {
 		total += v.Counter
 	}
 	return total, nil
+}
+
+// SeedNATPortCounters initializes all NAT port allocation counters with a
+// random offset. This prevents SNAT port reuse after daemon restart — without
+// the seed, the allocator starts from port_low and reuses ports that remote
+// servers may still have in ESTABLISHED state from pre-restart sessions.
+func (m *Manager) SeedNATPortCounters() {
+	zm, ok := m.maps["nat_port_counters"]
+	if !ok {
+		return
+	}
+	numCPUs, err := ebpf.PossibleCPU()
+	if err != nil || numCPUs <= 0 {
+		return
+	}
+	for poolID := uint32(0); poolID < 32; poolID++ {
+		vals := make([]NATPortCounter, numCPUs)
+		// Only seed CPU 0; the CPU-interleaved formula ensures each CPU
+		// gets a distinct sequence regardless of starting offset.
+		vals[0] = NATPortCounter{Counter: rand.Uint64()}
+		zm.Update(poolID, vals, ebpf.UpdateAny)
+	}
+	slog.Info("seeded NAT port counters with random offset")
 }
 
 // --- Hitless restart: delete-stale methods ---
