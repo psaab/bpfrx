@@ -4132,6 +4132,7 @@ func (c *CLI) handleClearSecurity(args []string) error {
 			return fmt.Errorf("clear sessions: %w", err)
 		}
 		fmt.Printf("%d IPv4 and %d IPv6 session entries cleared\n", v4, v6)
+		c.clearPeerSessions(nil)
 		return nil
 
 	case "policies":
@@ -4257,7 +4258,65 @@ func (c *CLI) clearFilteredSessions(f sessionFilter) error {
 	}
 
 	fmt.Printf("%d IPv4 and %d IPv6 matching sessions cleared\n", v4Deleted, v6Deleted)
+	c.clearPeerSessions(&f)
 	return nil
+}
+
+// clearPeerSessions forwards a clear request to the cluster peer.
+func (c *CLI) clearPeerSessions(f *sessionFilter) {
+	if c.cluster == nil || c.fabricPeerAddrFn == nil {
+		return
+	}
+	peerIP := c.fabricPeerAddrFn()
+	if peerIP == "" {
+		return
+	}
+	peerAddr := fmt.Sprintf("%s:50051", peerIP)
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if c.fabricVRFDevice != "" {
+		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Control: func(network, address string, conn syscall.RawConn) error {
+					var err error
+					conn.Control(func(fd uintptr) {
+						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, c.fabricVRFDevice)
+					})
+					return err
+				},
+			}
+			return dialer.DialContext(ctx, "tcp", addr)
+		}))
+	}
+	conn, err := grpc.NewClient(peerAddr, dialOpts...)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req := &pb.ClearSessionsRequest{}
+	if f != nil {
+		if f.srcNet != nil {
+			req.SourcePrefix = f.srcNet.String()
+		}
+		if f.dstNet != nil {
+			req.DestinationPrefix = f.dstNet.String()
+		}
+		if f.proto != 0 {
+			switch f.proto {
+			case 6:
+				req.Protocol = "tcp"
+			case 17:
+				req.Protocol = "udp"
+			case 1:
+				req.Protocol = "icmp"
+			}
+		}
+		req.SourcePort = uint32(f.srcPort)
+		req.DestinationPort = uint32(f.dstPort)
+		req.Application = f.appName
+	}
+	_, _ = pb.NewBpfrxServiceClient(conn).ClearSessions(ctx, req)
 }
 
 func (c *CLI) handleClearFirewall(args []string) error {

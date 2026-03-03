@@ -2358,6 +2358,7 @@ func (s *Server) ClearSessions(_ context.Context, req *pb.ClearSessionsRequest) 
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
+		s.clearPeerSessions(req)
 		return &pb.ClearSessionsResponse{
 			Ipv4Cleared: int32(v4),
 			Ipv6Cleared: int32(v6),
@@ -2539,10 +2540,26 @@ func (s *Server) ClearSessions(_ context.Context, req *pb.ClearSessionsRequest) 
 		s.dp.DeleteDNATEntryV6(dk)
 	}
 
+	// Propagate clear to cluster peer so secondary's synced sessions
+	// are also removed (secondary GC doesn't expire them).
+	s.clearPeerSessions(req)
+
 	return &pb.ClearSessionsResponse{
 		Ipv4Cleared: int32(v4Deleted),
 		Ipv6Cleared: int32(v6Deleted),
 	}, nil
+}
+
+// clearPeerSessions forwards a ClearSessions request to the cluster peer.
+func (s *Server) clearPeerSessions(req *pb.ClearSessionsRequest) {
+	conn, err := s.dialPeer()
+	if err != nil {
+		return // not in cluster or peer unavailable
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = pb.NewBpfrxServiceClient(conn).ClearSessions(ctx, req)
 }
 
 func (s *Server) ClearCounters(_ context.Context, _ *pb.ClearCountersRequest) (*pb.ClearCountersResponse, error) {
