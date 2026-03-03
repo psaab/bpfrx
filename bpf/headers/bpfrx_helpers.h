@@ -1961,13 +1961,15 @@ check_egress_rg_active(__u32 ifindex, __u16 vlan_id)
 static __always_inline int
 try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 {
-	__u32 zero = 0;
-	struct fabric_fwd_info *ff = bpf_map_lookup_elem(&fabric_fwd, &zero);
-	if (!ff || ff->ifindex == 0)
-		return -1;
+	__u32 zero = 0, one = 1;
+	struct fabric_fwd_info *ff0 = bpf_map_lookup_elem(&fabric_fwd, &zero);
+	struct fabric_fwd_info *ff1 = bpf_map_lookup_elem(&fabric_fwd, &one);
+	__u32 ingress = ctx->ingress_ifindex;
 
-	/* Anti-loop: don't redirect if packet arrived on fabric */
-	if (ctx->ingress_ifindex == ff->ifindex)
+	/* Anti-loop: skip if ingressed on either fabric */
+	if (ff0 && ff0->ifindex != 0 && ingress == ff0->ifindex)
+		return -1;
+	if (ff1 && ff1->ifindex != 0 && ingress == ff1->ifindex)
 		return -1;
 
 	void *data = (void *)(long)ctx->data;
@@ -1976,11 +1978,23 @@ try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 	if ((void *)(eth + 1) > data_end)
 		return -1;
 
-	__builtin_memcpy(eth->h_dest, ff->peer_mac, ETH_ALEN);
-	__builtin_memcpy(eth->h_source, ff->local_mac, ETH_ALEN);
+	/* Try fab0 first */
+	if (ff0 && ff0->ifindex != 0) {
+		__builtin_memcpy(eth->h_dest, ff0->peer_mac, ETH_ALEN);
+		__builtin_memcpy(eth->h_source, ff0->local_mac, ETH_ALEN);
+		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		return bpf_redirect_map(&tx_ports, ff0->ifindex, 0);
+	}
 
-	inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
-	return bpf_redirect_map(&tx_ports, ff->ifindex, 0);
+	/* Try fab1 */
+	if (ff1 && ff1->ifindex != 0) {
+		__builtin_memcpy(eth->h_dest, ff1->peer_mac, ETH_ALEN);
+		__builtin_memcpy(eth->h_source, ff1->local_mac, ETH_ALEN);
+		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		return bpf_redirect_map(&tx_ports, ff1->ifindex, 0);
+	}
+
+	return -1;
 }
 
 /* ============================================================
@@ -2004,13 +2018,15 @@ try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 static __always_inline int
 try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
 {
-	__u32 zero = 0;
-	struct fabric_fwd_info *ff = bpf_map_lookup_elem(&fabric_fwd, &zero);
-	if (!ff || ff->ifindex == 0)
-		return -1;
+	__u32 zero = 0, one = 1;
+	struct fabric_fwd_info *ff0 = bpf_map_lookup_elem(&fabric_fwd, &zero);
+	struct fabric_fwd_info *ff1 = bpf_map_lookup_elem(&fabric_fwd, &one);
+	__u32 ingress = ctx->ingress_ifindex;
 
-	/* Anti-loop: don't redirect if packet arrived on fabric */
-	if (ctx->ingress_ifindex == ff->ifindex)
+	/* Anti-loop: don't redirect if packet arrived on either fabric */
+	if (ff0 && ff0->ifindex != 0 && ingress == ff0->ifindex)
+		return -1;
+	if (ff1 && ff1->ifindex != 0 && ingress == ff1->ifindex)
 		return -1;
 
 	void *data = (void *)(long)ctx->data;
@@ -2026,10 +2042,22 @@ try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
 	eth->h_source[3] = FABRIC_ZONE_MAC_MAGIC;
 	eth->h_source[4] = 0x00;
 	eth->h_source[5] = (__u8)(meta->ingress_zone & 0xff);
-	__builtin_memcpy(eth->h_dest, ff->peer_mac, ETH_ALEN);
 
-	inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
-	return bpf_redirect_map(&tx_ports, ff->ifindex, 0);
+	/* Try fab0 first */
+	if (ff0 && ff0->ifindex != 0) {
+		__builtin_memcpy(eth->h_dest, ff0->peer_mac, ETH_ALEN);
+		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		return bpf_redirect_map(&tx_ports, ff0->ifindex, 0);
+	}
+
+	/* Try fab1 */
+	if (ff1 && ff1->ifindex != 0) {
+		__builtin_memcpy(eth->h_dest, ff1->peer_mac, ETH_ALEN);
+		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		return bpf_redirect_map(&tx_ports, ff1->ifindex, 0);
+	}
+
+	return -1;
 }
 
 #endif /* __BPFRX_HELPERS_H__ */

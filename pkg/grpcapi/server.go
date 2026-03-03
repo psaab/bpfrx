@@ -8103,6 +8103,13 @@ func (s *Server) buildInterfacesInput() cluster.InterfacesInput {
 	cc := cfg.Chassis.Cluster
 	input.ControlInterface = cc.ControlInterface
 	input.FabricInterface = cc.FabricInterface
+	if fabIfc, ok := cfg.Interfaces.Interfaces[cc.FabricInterface]; ok {
+		input.FabricMembers = fabIfc.FabricMembers
+	}
+	input.Fabric1Interface = cc.Fabric1Interface
+	if fab1Ifc, ok := cfg.Interfaces.Interfaces[cc.Fabric1Interface]; ok {
+		input.Fabric1Members = fab1Ifc.FabricMembers
+	}
 
 	// Build RETH info from config.
 	rethMap := cfg.RethToPhysical() // reth-name -> physical-member

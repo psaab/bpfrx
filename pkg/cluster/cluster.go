@@ -1503,6 +1503,9 @@ type RethInfo struct {
 type InterfacesInput struct {
 	ControlInterface string
 	FabricInterface  string
+	FabricMembers    []string // bond member interfaces (e.g. fab0-m0, fab0-m1)
+	Fabric1Interface string   // secondary fabric interface (e.g. "fab1")
+	Fabric1Members   []string // secondary fabric bond members (if any)
 	Reths            []RethInfo
 	Monitors         []InterfaceMonitorInfo
 	PeerMonitors     []InterfaceMonitorInfo
@@ -1546,7 +1549,7 @@ func (m *Manager) FormatInterfaces(input InterfacesInput) string {
 	fmt.Fprintln(&b)
 
 	// Fabric interfaces table.
-	if input.FabricInterface != "" {
+	if input.FabricInterface != "" || input.Fabric1Interface != "" {
 		fmt.Fprintln(&b, "Fabric interfaces:")
 		fmt.Fprintf(&b, "    %-8s%-19s%-26s%s\n", "Name", "Child-interface", "Status", "Security")
 		fmt.Fprintf(&b, "    %-8s%-19s%s\n", "", "", "(Physical/Monitored)")
@@ -1555,7 +1558,32 @@ func (m *Manager) FormatInterfaces(input InterfacesInput) string {
 			physStatus = "Down"
 		}
 		statusStr := fmt.Sprintf("%s  /  %s", physStatus, physStatus)
-		fmt.Fprintf(&b, "    %-8s%-19s%-26s%s\n", input.FabricInterface, input.FabricInterface, statusStr, "Disabled")
+		if input.FabricInterface != "" {
+			if len(input.FabricMembers) > 0 {
+				for i, member := range input.FabricMembers {
+					name := ""
+					if i == 0 {
+						name = input.FabricInterface
+					}
+					fmt.Fprintf(&b, "    %-8s%-19s%-26s%s\n", name, member, statusStr, "Disabled")
+				}
+			} else {
+				fmt.Fprintf(&b, "    %-8s%-19s%-26s%s\n", input.FabricInterface, input.FabricInterface, statusStr, "Disabled")
+			}
+		}
+		if input.Fabric1Interface != "" {
+			if len(input.Fabric1Members) > 0 {
+				for i, member := range input.Fabric1Members {
+					name := ""
+					if i == 0 {
+						name = input.Fabric1Interface
+					}
+					fmt.Fprintf(&b, "    %-8s%-19s%-26s%s\n", name, member, statusStr, "Disabled")
+				}
+			} else {
+				fmt.Fprintf(&b, "    %-8s%-19s%-26s%s\n", input.Fabric1Interface, input.Fabric1Interface, statusStr, "Disabled")
+			}
+		}
 		fmt.Fprintln(&b)
 	}
 

@@ -200,11 +200,15 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 		 * TC conntrack won't find a match.  The peer's XDP
 		 * pipeline already validated the traffic — trust it. */
 		{
-			__u32 ff_key = 0;
-			struct fabric_fwd_info *ff =
+			__u32 ff_key0 = 0, ff_key1 = 1;
+			struct fabric_fwd_info *ff0 =
 				bpf_map_lookup_elem(&fabric_fwd,
-						    &ff_key);
-			if (ff && meta->ingress_ifindex == ff->ifindex) {
+						    &ff_key0);
+			struct fabric_fwd_info *ff1 =
+				bpf_map_lookup_elem(&fabric_fwd,
+						    &ff_key1);
+			if ((ff0 && ff0->ifindex != 0 && meta->ingress_ifindex == ff0->ifindex) ||
+			    (ff1 && ff1->ifindex != 0 && meta->ingress_ifindex == ff1->ifindex)) {
 				bpf_tail_call(skb, &tc_progs,
 					      TC_PROG_FORWARD);
 				return TC_ACT_OK;

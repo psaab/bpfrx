@@ -57,8 +57,10 @@ zone_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		    eth->src_addr.addr_bytes[1] == 0xbf &&
 		    eth->src_addr.addr_bytes[2] == 0x72 &&
 		    eth->src_addr.addr_bytes[3] == FABRIC_ZONE_MAC_MAGIC &&
-		    ctx->shm->fabric_port_id != 0xFFFF &&
-		    meta->ingress_ifindex == ctx->shm->fabric_port_id) {
+		    ((ctx->shm->fabric_port_id != 0xFFFF &&
+		      meta->ingress_ifindex == ctx->shm->fabric_port_id) ||
+		     (ctx->shm->fabric1_port_id != 0xFFFF &&
+		      meta->ingress_ifindex == ctx->shm->fabric1_port_id))) {
 			meta->ingress_zone = eth->src_addr.addr_bytes[5];
 			meta->routing_table = 254; /* RT_TABLE_MAIN */
 			goto skip_ingress_zone;

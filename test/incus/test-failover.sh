@@ -214,8 +214,8 @@ else
 	fail "fw0 bpfrxd did not come back within ${REBOOT_WAIT}s"
 fi
 
-# Wait for cluster to stabilize
-sleep 10
+# Wait for cluster to stabilize (gRPC takes ~15s after systemctl active)
+sleep 20
 
 # Verify fw0 is secondary (NOT primary — no auto-preempt)
 fw0_status_after=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)

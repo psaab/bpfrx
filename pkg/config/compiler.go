@@ -966,6 +966,9 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 					ifc.FabricMembers = append(ifc.FabricMembers, m.Name())
 				}
 			}
+			if len(ifc.FabricMembers) > 0 {
+				ifc.BondMode = "active-backup"
+			}
 		}
 
 		// Check for tunnel configuration
@@ -5978,6 +5981,16 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 	if n := clusterNode.FindChild("fabric-peer-address"); n != nil {
 		if v := nodeVal(n); v != "" {
 			ch.Cluster.FabricPeerAddress = v
+		}
+	}
+	if n := clusterNode.FindChild("fabric1-interface"); n != nil {
+		if v := nodeVal(n); v != "" {
+			ch.Cluster.Fabric1Interface = v
+		}
+	}
+	if n := clusterNode.FindChild("fabric1-peer-address"); n != nil {
+		if v := nodeVal(n); v != "" {
+			ch.Cluster.Fabric1PeerAddress = v
 		}
 	}
 	if clusterNode.FindChild("configuration-synchronize") != nil {

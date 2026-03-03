@@ -84,6 +84,9 @@ type SessionSync struct {
 	conn      net.Conn
 	writeMu   sync.Mutex // serializes all conn.Write calls (sendLoop + writeMsg)
 	listener  net.Listener
+	localAddr1 string       // secondary fabric listen address ("" = single-fabric)
+	peerAddr1  string       // secondary fabric peer address
+	listener1  net.Listener // secondary fabric listener
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	sendCh    chan []byte // buffered channel for outgoing messages
@@ -150,6 +153,19 @@ func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *Session
 	}
 }
 
+// NewDualSessionSync creates a session sync manager with dual fabric transport.
+// If local1/peer1 are empty, falls back to single-fabric behavior.
+func NewDualSessionSync(local, peer, local1, peer1 string, dp dataplane.DataPlane) *SessionSync {
+	return &SessionSync{
+		localAddr:  local,
+		peerAddr:   peer,
+		localAddr1: local1,
+		peerAddr1:  peer1,
+		dp:         dp,
+		sendCh:     make(chan []byte, 4096),
+	}
+}
+
 // SetVRFDevice sets the VRF device for SO_BINDTODEVICE on sync sockets.
 func (s *SessionSync) SetVRFDevice(dev string) {
 	s.vrfDevice = dev
@@ -200,6 +216,24 @@ func (s *SessionSync) Start(ctx context.Context) error {
 		s.acceptLoop(ctx, ln)
 	}()
 
+	// Start secondary fabric listener if configured.
+	if s.localAddr1 != "" {
+		lc1 := vrfListenConfig(s.vrfDevice)
+		ln1, err := lc1.Listen(ctx, "tcp", s.localAddr1)
+		if err != nil {
+			slog.Warn("cluster sync: secondary fabric listen failed, using primary only",
+				"addr", s.localAddr1, "err", err)
+		} else {
+			s.listener1 = ln1
+			slog.Info("cluster sync: listening on secondary fabric", "addr", s.localAddr1)
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				s.acceptLoop(ctx, ln1)
+			}()
+		}
+	}
+
 	// Connect to peer (retry loop).
 	s.wg.Add(1)
 	go func() {
@@ -226,6 +260,9 @@ func (s *SessionSync) Stop() {
 	}
 	if s.listener != nil {
 		s.listener.Close()
+	}
+	if s.listener1 != nil {
+		s.listener1.Close()
 	}
 	s.mu.Lock()
 	if s.conn != nil {
@@ -617,6 +654,12 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener) {
 }
 
 func (s *SessionSync) connectLoop(ctx context.Context) {
+	peerAddrs := []string{s.peerAddr}
+	if s.peerAddr1 != "" {
+		peerAddrs = append(peerAddrs, s.peerAddr1)
+	}
+	addrIdx := 0
+
 	for first := true; ; first = false {
 		if !first {
 			select {
@@ -635,16 +678,21 @@ func (s *SessionSync) connectLoop(ctx context.Context) {
 			continue
 		}
 
+		addr := peerAddrs[addrIdx]
 		dialer := net.Dialer{Timeout: 3 * time.Second}
 		if s.vrfDevice != "" {
 			dialer.Control = vrfListenConfig(s.vrfDevice).Control
 		}
-		conn, err := dialer.DialContext(ctx, "tcp", s.peerAddr)
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
-			continue // peer not available yet
+			// Rotate to next address on failure
+			addrIdx = (addrIdx + 1) % len(peerAddrs)
+			continue
 		}
 
-		slog.Info("cluster sync: connected to peer", "addr", s.peerAddr)
+		slog.Info("cluster sync: connected to peer", "addr", addr)
+		// Reset to prefer primary fabric on success
+		addrIdx = 0
 		s.mu.Lock()
 		if s.conn != nil {
 			s.conn.Close()

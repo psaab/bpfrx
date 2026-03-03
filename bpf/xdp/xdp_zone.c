@@ -463,6 +463,9 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	 * fabric ingress detection, and re-FIB non-VRF ifindex overrides. */
 	struct fabric_fwd_info *ff_cached =
 		bpf_map_lookup_elem(&fabric_fwd, &zero);
+	__u32 ff_one = 1;
+	struct fabric_fwd_info *ff1_cached =
+		bpf_map_lookup_elem(&fabric_fwd, &ff_one);
 
 	/*
 	 * VRRP multicast (224.0.0.18, proto 112) — pass to host before zone
@@ -490,7 +493,8 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		    zeth->h_source[1] == 0xbf &&
 		    zeth->h_source[2] == 0x72 &&
 		    zeth->h_source[3] == FABRIC_ZONE_MAC_MAGIC) {
-			if (ff_cached && ctx->ingress_ifindex == ff_cached->ifindex) {
+			if ((ff_cached && ff_cached->ifindex != 0 && ctx->ingress_ifindex == ff_cached->ifindex) ||
+			    (ff1_cached && ff1_cached->ifindex != 0 && ctx->ingress_ifindex == ff1_cached->ifindex)) {
 				meta->ingress_zone = zeth->h_source[5];
 				/* Force main routing table — fabric is
 				 * in vrf-mgmt, but the decoded zone's
@@ -519,7 +523,8 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	 * table override to main (254) is applied after the session
 	 * lookup, only when a synced session exists (forwarded traffic).
 	 * Zone-encoded packets already set routing_table=254 above. */
-	if (ff_cached && ctx->ingress_ifindex == ff_cached->ifindex)
+	if ((ff_cached && ff_cached->ifindex != 0 && ctx->ingress_ifindex == ff_cached->ifindex) ||
+	    (ff1_cached && ff1_cached->ifindex != 0 && ctx->ingress_ifindex == ff1_cached->ifindex))
 		meta->meta_flags |= META_FLAG_FABRIC_FWD;
 
 zone_resolved:
@@ -836,6 +841,8 @@ zone_resolved:
 	if (meta->routing_table == 254) {
 		if (ff_cached && ff_cached->fib_ifindex)
 			fib.ifindex = ff_cached->fib_ifindex;
+		else if (ff1_cached && ff1_cached->fib_ifindex)
+			fib.ifindex = ff1_cached->fib_ifindex;
 	}
 
 	if (meta->addr_family == AF_INET) {

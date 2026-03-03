@@ -71,6 +71,8 @@ type ClusterConfig struct {
 	PeerAddress           string // peer node's control link IP (e.g. "10.99.0.2")
 	FabricInterface       string // interface for session/config sync (e.g. "fab0")
 	FabricPeerAddress     string // peer's fabric link IP (e.g. "10.99.1.2")
+	Fabric1Interface      string // secondary fabric interface (e.g. "fab1")
+	Fabric1PeerAddress    string // peer's secondary fabric IP
 	ConfigSync            bool   // enable config synchronization to peer on commit
 	ControlLinkRecovery   bool   // enable control-link-recovery
 	NATStateSync          bool   // enable NAT state synchronization (session sync with NAT fields)
@@ -1067,6 +1069,7 @@ type InterfaceConfig struct {
 	LAGParent           string                  // gigether-options 802.3ad <ae-name> (LAG member binding)
 	RedundancyGroup     int                     // redundant-ether-options redundancy-group (0 = none)
 	FabricMembers       []string                // fabric-options member-interfaces
+	BondMode            string                  // bond mode: "active-backup" for fabric, "802.3ad" for ae
 	AggregatedEtherOpts *AggregatedEtherOptions // ae interface options (LACP, etc.)
 	Units               map[int]*InterfaceUnit
 	Tunnel              *TunnelConfig // non-nil for tunnel interfaces (gre0, etc.)

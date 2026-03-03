@@ -1182,6 +1182,25 @@ func (m *Manager) UpdateFabricFwd(info dataplane.FabricFwdInfo) error {
 	return nil
 }
 
+func (m *Manager) UpdateFabricFwd1(info dataplane.FabricFwdInfo) error {
+	shm := m.platform.shm
+	if shm == nil {
+		return nil
+	}
+	ifidx := info.Ifindex
+	if ifidx == 0 || ifidx >= C.MAX_PORT_MAP {
+		shm.fabric1_port_id = 0xFFFF
+		return nil
+	}
+	portID := shm.ifindex_to_port[ifidx]
+	if portID == 0xFF {
+		shm.fabric1_port_id = 0xFFFF
+		return nil
+	}
+	shm.fabric1_port_id = C.uint16_t(portID)
+	return nil
+}
+
 func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error { return nil }
 
 func (m *Manager) UpdateRGActive(rgID int, active bool) error {

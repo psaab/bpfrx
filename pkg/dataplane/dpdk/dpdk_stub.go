@@ -254,6 +254,7 @@ func (m *Manager) SetFlowConfig(cfg dataplane.FlowConfigValue) error { return ni
 // --- Fabric cross-chassis forwarding ---
 
 func (m *Manager) UpdateFabricFwd(info dataplane.FabricFwdInfo) error       { return nil }
+func (m *Manager) UpdateFabricFwd1(info dataplane.FabricFwdInfo) error     { return nil }
 func (m *Manager) UpdateRGActive(rgID int, active bool) error              { return nil }
 func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error       { return nil }
 

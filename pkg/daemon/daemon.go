@@ -128,9 +128,11 @@ type Daemon struct {
 	reconcileNowCh chan struct{}
 
 	// Fabric cross-chassis forwarding state for periodic refresh.
-	fabricMu     sync.RWMutex
-	fabricIface  string
-	fabricPeerIP net.IP
+	fabricMu      sync.RWMutex
+	fabricIface   string
+	fabricPeerIP  net.IP
+	fabricIface1  string // secondary fabric interface (fab1)
+	fabricPeerIP1 net.IP // secondary fabric peer IP
 
 	// gRPC server reference for starting fabric listener in cluster mode.
 	grpcSrv *grpcapi.Server
@@ -3590,7 +3592,42 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 			syncLocal := fmt.Sprintf("%s:4785", fabIP)
 			syncPeer := fmt.Sprintf("%s:4785", cc.FabricPeerAddress)
-			d.sessionSync = cluster.NewSessionSync(syncLocal, syncPeer, nil)
+
+			// Resolve secondary fabric (fab1) for dual transport failover.
+			var syncLocal1, syncPeer1 string
+			if cc.Fabric1Interface != "" && cc.Fabric1PeerAddress != "" {
+				var fab1IP string
+				for i := 0; i < 15; i++ {
+					fab1IP = resolveInterfaceAddr(cc.Fabric1Interface, "")
+					if fab1IP != "" {
+						break
+					}
+					if i == 0 {
+						slog.Info("cluster: fabric1 interface has no IPv4 address yet, waiting",
+							"interface", cc.Fabric1Interface)
+					}
+					select {
+					case <-commsCtx.Done():
+						return
+					case <-time.After(2 * time.Second):
+					}
+				}
+				if fab1IP != "" {
+					syncLocal1 = fmt.Sprintf("%s:4785", fab1IP)
+					syncPeer1 = fmt.Sprintf("%s:4785", cc.Fabric1PeerAddress)
+					slog.Info("cluster: dual fabric transport configured",
+						"fab0_local", syncLocal, "fab1_local", syncLocal1)
+				} else {
+					slog.Warn("cluster: fabric1 address not available, using single fabric only",
+						"interface", cc.Fabric1Interface)
+				}
+			}
+
+			if syncLocal1 != "" {
+				d.sessionSync = cluster.NewDualSessionSync(syncLocal, syncPeer, syncLocal1, syncPeer1, nil)
+			} else {
+				d.sessionSync = cluster.NewSessionSync(syncLocal, syncPeer, nil)
+			}
 
 			// Start gRPC fabric listener so peer can proxy monitor requests.
 			// d.grpcSrv is set after startClusterComms returns, so we poll briefly.
@@ -3722,6 +3759,11 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Populate fabric_fwd BPF map for cross-chassis redirect,
 			// then periodically refresh to correct neighbor drift.
 			go d.populateFabricFwd(commsCtx, cc.FabricInterface, cc.FabricPeerAddress)
+
+			// Populate secondary fabric_fwd entry (key=1) if fab1 configured.
+			if cc.Fabric1Interface != "" && cc.Fabric1PeerAddress != "" {
+				go d.populateFabricFwd1(commsCtx, cc.Fabric1Interface, cc.Fabric1PeerAddress)
+			}
 		}()
 	}
 }
@@ -3748,10 +3790,12 @@ func (d *Daemon) stopClusterComms() {
 // determine heartbeat and session sync endpoints. Used to detect config
 // changes that require restarting cluster comms.
 type clusterTransportKey struct {
-	ControlInterface  string
-	PeerAddress       string
-	FabricInterface   string
-	FabricPeerAddress string
+	ControlInterface   string
+	PeerAddress        string
+	FabricInterface    string
+	FabricPeerAddress  string
+	Fabric1Interface   string
+	Fabric1PeerAddress string
 }
 
 func clusterTransportFromConfig(cfg *config.Config) clusterTransportKey {
@@ -3760,10 +3804,12 @@ func clusterTransportFromConfig(cfg *config.Config) clusterTransportKey {
 	}
 	cc := cfg.Chassis.Cluster
 	return clusterTransportKey{
-		ControlInterface:  cc.ControlInterface,
-		PeerAddress:       cc.PeerAddress,
-		FabricInterface:   cc.FabricInterface,
-		FabricPeerAddress: cc.FabricPeerAddress,
+		ControlInterface:   cc.ControlInterface,
+		PeerAddress:        cc.PeerAddress,
+		FabricInterface:    cc.FabricInterface,
+		FabricPeerAddress:  cc.FabricPeerAddress,
+		Fabric1Interface:   cc.Fabric1Interface,
+		Fabric1PeerAddress: cc.Fabric1PeerAddress,
 	}
 }
 
@@ -3930,17 +3976,144 @@ func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting boo
 	return true
 }
 
+// populateFabricFwd1 resolves the secondary fabric interface MACs and populates
+// the fabric_fwd BPF map entry at key=1 for cross-chassis packet redirect.
+// Mirrors populateFabricFwd but writes to key=1 via UpdateFabricFwd1.
+func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, peerAddr string) {
+	peerIP := net.ParseIP(peerAddr)
+	if peerIP == nil {
+		slog.Warn("cluster: invalid fabric1 peer address", "addr", peerAddr)
+		return
+	}
+
+	// Store fabric1 config for RefreshFabricFwd.
+	d.fabricMu.Lock()
+	d.fabricIface1 = fabIface
+	d.fabricPeerIP1 = peerIP
+	d.fabricMu.Unlock()
+
+	// Fast initial population: attempt immediately, then 500ms retries.
+	for i := 0; i < 10; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+
+		d.probeFabricNeighbor(ctx, fabIface, peerIP)
+
+		if d.refreshFabricFwd1(fabIface, peerIP, i == 0) {
+			break
+		}
+		if i == 9 {
+			slog.Warn("cluster: fabric1_fwd not populated after fast retries, continuing with periodic refresh")
+		}
+	}
+
+	// Periodic refresh every 30s.
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.refreshFabricFwd1(fabIface, peerIP, false)
+		}
+	}
+}
+
+// refreshFabricFwd1 resolves secondary fabric link/neighbor state and updates
+// the fabric_fwd BPF map at key=1. Returns true on success.
+func (d *Daemon) refreshFabricFwd1(fabIface string, peerIP net.IP, logWaiting bool) bool {
+	link, err := netlink.LinkByName(fabIface)
+	if err != nil {
+		slog.Debug("cluster: fabric1 link not found",
+			"interface", fabIface, "err", err)
+		return false
+	}
+	localMAC := link.Attrs().HardwareAddr
+	if len(localMAC) != 6 {
+		return false
+	}
+
+	// Increase fabric txqueuelen for generic XDP.
+	if link.Attrs().TxQLen < 10000 {
+		if err := netlink.LinkSetTxQLen(link, 10000); err != nil {
+			slog.Warn("cluster: failed to set fabric1 txqueuelen",
+				"interface", fabIface, "err", err)
+		}
+	}
+
+	neighFamily := netlink.FAMILY_V4
+	if peerIP.To4() == nil {
+		neighFamily = netlink.FAMILY_V6
+	}
+	neighs, err := netlink.NeighList(link.Attrs().Index, neighFamily)
+	if err != nil {
+		slog.Debug("cluster: fabric1 neigh list failed", "err", err)
+		return false
+	}
+	var peerMAC net.HardwareAddr
+	for _, n := range neighs {
+		if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
+			(n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT|netlink.NUD_DELAY|netlink.NUD_PROBE)) != 0 {
+			peerMAC = n.HardwareAddr
+			break
+		}
+	}
+	if peerMAC == nil {
+		if logWaiting {
+			slog.Info("cluster: waiting for fabric1 peer neighbor entry",
+				"peer", peerIP)
+		}
+		return false
+	}
+
+	info := dataplane.FabricFwdInfo{
+		Ifindex: uint32(link.Attrs().Index),
+	}
+	copy(info.PeerMAC[:], peerMAC)
+	copy(info.LocalMAC[:], localMAC)
+
+	info.FIBIfindex = uint32(link.Attrs().Index)
+	if link.Attrs().MasterIndex != 0 {
+		info.FIBIfindex = 1
+	}
+
+	if d.dp == nil {
+		slog.Debug("cluster: dataplane not ready, retrying fabric1_fwd")
+		return false
+	}
+	if err := d.dp.UpdateFabricFwd1(info); err != nil {
+		slog.Warn("cluster: failed to update fabric1_fwd map", "err", err)
+		return false
+	}
+	slog.Info("cluster: fabric1_fwd updated",
+		"interface", fabIface, "ifindex", info.Ifindex,
+		"fib_ifindex", info.FIBIfindex,
+		"local_mac", localMAC, "peer_mac", peerMAC)
+	return true
+}
+
 // RefreshFabricFwd triggers an immediate refresh of the fabric_fwd BPF map.
 // Call this on link state changes, neighbor changes, or failover transitions.
+// Refreshes both fab0 (key=0) and fab1 (key=1) entries.
 func (d *Daemon) RefreshFabricFwd() {
 	d.fabricMu.RLock()
 	fabIface := d.fabricIface
 	peerIP := d.fabricPeerIP
+	fabIface1 := d.fabricIface1
+	peerIP1 := d.fabricPeerIP1
 	d.fabricMu.RUnlock()
-	if fabIface == "" || peerIP == nil {
-		return
+	if fabIface != "" && peerIP != nil {
+		d.refreshFabricFwd(fabIface, peerIP, false)
 	}
-	d.refreshFabricFwd(fabIface, peerIP, false)
+	if fabIface1 != "" && peerIP1 != nil {
+		d.refreshFabricFwd1(fabIface1, peerIP1, false)
+	}
 }
 
 // getOrCreateRGState returns the rgStateMachine for the given RG, creating

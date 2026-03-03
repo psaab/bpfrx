@@ -214,6 +214,7 @@ type DataPlane interface {
 
 	// Fabric cross-chassis forwarding
 	UpdateFabricFwd(info FabricFwdInfo) error
+	UpdateFabricFwd1(info FabricFwdInfo) error
 	UpdateRGActive(rgID int, active bool) error
 	UpdateHAWatchdog(rgID int, timestamp uint64) error
 

@@ -873,6 +873,8 @@ struct shared_memory {
 	 * 0xFFFF = not mapped (sentinel, since port_id 0 is valid). */
 	volatile uint16_t        fabric_port_id;
 	uint16_t                 fabric_port_pad;
+	volatile uint16_t        fabric1_port_id;
+	uint16_t                 fabric1_port_pad;
 
 	/* Kernel ifindex → DPDK port_id mapping.
 	 * Populated by DPDK worker during port init.

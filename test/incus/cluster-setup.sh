@@ -45,6 +45,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 NETWORKS=(
 	"bpfrx-heartbeat:none:false"
 	"bpfrx-fabric:none:false"
+	"bpfrx-fabric1:none:false"
 	"bpfrx-clan:none:false"
 )
 
@@ -141,6 +142,10 @@ devices:
     name: enp8s0
     network: bpfrx-clan
     type: nic
+  eth4:
+    name: enp9s0
+    network: bpfrx-fabric1
+    type: nic
 YAML
 }
 
@@ -223,8 +228,8 @@ provision_vm() {
 	done
 
 	# Bootstrap systemd-networkd .link files for interface renaming.
-	# Uses vSRX naming: fxp0 (mgmt), fxp1 (heartbeat), fab0 (fabric),
-	# ge-X-0-0 (LAN), ge-X-0-1 (WAN/SR-IOV).
+	# Uses vSRX naming: fxp0 (mgmt), fxp1 (heartbeat), fab0/fab1
+	# (fabric interfaces), ge-X-0-0 (LAN), ge-X-0-1 (WAN/SR-IOV).
 	#
 	# RETH member interfaces (LAN + WAN) use OriginalName= (kernel PCI
 	# name) instead of MACAddress= because bpfrxd programs a virtual MAC
@@ -232,10 +237,9 @@ provision_vm() {
 	# physical MAC, so a MACAddress= match would fail. OriginalName= is
 	# stable across reboots since it derives from the PCI slot.
 	info "Writing bootstrap networkd .link files ($vm, node $idx)..."
-	local mac_fxp0 mac_fxp1 mac_fab0
+	local mac_fxp0 mac_fxp1
 	mac_fxp0=$(incus exec "$vm" -- cat /sys/class/net/enp5s0/address 2>/dev/null || true)
 	mac_fxp1=$(incus exec "$vm" -- cat /sys/class/net/enp6s0/address 2>/dev/null || true)
-	mac_fab0=$(incus exec "$vm" -- cat /sys/class/net/enp7s0/address 2>/dev/null || true)
 
 	# SR-IOV VF kernel name varies — find it by exclusion
 	local pci_wan
@@ -243,7 +247,7 @@ provision_vm() {
 		for iface in /sys/class/net/enp*/address; do
 			name=$(basename $(dirname "$iface"))
 			case "$name" in
-				enp5s0|enp6s0|enp7s0|enp8s0|lo) continue ;;
+				enp5s0|enp6s0|enp7s0|enp8s0|enp9s0|lo) continue ;;
 				*) echo "$name"; break ;;
 			esac
 		done
@@ -254,7 +258,7 @@ provision_vm() {
 	wan_name=$(wan_ifname "$idx")
 
 	# Non-RETH interfaces: match by MAC (stable — daemon never changes these MACs)
-	for pair in "fxp0:$mac_fxp0" "fxp1:$mac_fxp1" "fab0:$mac_fab0"; do
+	for pair in "fxp0:$mac_fxp0" "fxp1:$mac_fxp1"; do
 		local name="${pair%%:*}" mac="${pair#*:}"
 		if [[ -n "$mac" ]]; then
 			incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-${name}.link << LINKEOF
@@ -267,6 +271,25 @@ Name=${name}
 LINKEOF"
 		fi
 	done
+
+	# Fabric interfaces: match by OriginalName (PCI kernel name)
+	# fab0 is enp7s0 (eth2, bpfrx-fabric), fab1 is enp9s0 (eth4, bpfrx-fabric1)
+	incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-fab0.link << LINKEOF
+# Managed by bpfrxd — do not edit
+[Match]
+OriginalName=enp7s0
+
+[Link]
+Name=fab0
+LINKEOF"
+	incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-fab1.link << LINKEOF
+# Managed by bpfrxd — do not edit
+[Match]
+OriginalName=enp9s0
+
+[Link]
+Name=fab1
+LINKEOF"
 
 	# RETH member interfaces: match by OriginalName (PCI kernel name is
 	# stable; MAC alternates between physical and virtual across reboots)
@@ -293,9 +316,9 @@ LINKEOF"
 	incus exec "$vm" -- networkctl reload
 	sleep 1
 
-	# Bring up interfaces
+	# Bring up interfaces (fab0/fab1 are separate fabric links)
 	info "Bringing up interfaces ($vm)..."
-	for iface in fxp0 fxp1 fab0 "$lan_name" "$wan_name"; do
+	for iface in fxp0 fxp1 fab0 fab1 "$lan_name" "$wan_name"; do
 		incus exec "$vm" -- ip link set "$iface" up 2>/dev/null || true
 	done
 

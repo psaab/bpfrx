@@ -823,6 +823,24 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				originalName = physIface.Name
 			}
 		}
+		// Fabric interface recovery: when a fabric interface (fab0, fab1)
+		// isn't found by name, read the bootstrap .link file for its
+		// OriginalName= (PCI kernel name) and look up the kernel interface
+		// under that name. This handles the case where the .link rename
+		// hasn't taken effect yet (e.g. no reboot since bootstrap).
+		if physIface == nil && strings.HasPrefix(ifName, "fab") {
+			origName := readOriginalNameFromLink(linuxName)
+			if origName != "" {
+				physIface, err = result.cachedInterfaceByName(origName)
+				if physIface != nil {
+					slog.Info("found fabric interface under kernel name",
+						"config", linuxName, "actual", physIface.Name,
+						"originalName", origName)
+					seen[physIface.Name] = true
+					originalName = origName
+				}
+			}
+		}
 		if physIface == nil {
 			continue
 		}

@@ -1457,7 +1457,8 @@ func resolveRibTable(ribName string, tableIDs map[string]int) int {
 }
 
 // ApplyBonds creates Linux bond devices for interfaces with fabric-options
-// member-interfaces configured. Uses 802.3ad (LACP) mode.
+// member-interfaces configured. Uses the bond mode from InterfaceConfig.BondMode
+// (active-backup for fabric bonds, 802.3ad for ae interfaces).
 func (m *Manager) ApplyBonds(interfaces []*config.InterfaceConfig) error {
 	// Clear previous bonds first
 	if err := m.ClearBonds(); err != nil {
@@ -1480,7 +1481,12 @@ func (m *Manager) ApplyBonds(interfaces []*config.InterfaceConfig) error {
 		}
 
 		bond := netlink.NewLinkBond(netlink.LinkAttrs{Name: bondName})
-		bond.Mode = netlink.BOND_MODE_802_3AD
+		switch ifc.BondMode {
+		case "active-backup":
+			bond.Mode = netlink.BOND_MODE_ACTIVE_BACKUP
+		default:
+			bond.Mode = netlink.BOND_MODE_802_3AD
+		}
 		if ifc.MTU > 0 {
 			bond.LinkAttrs.MTU = ifc.MTU
 		}
@@ -1518,8 +1524,12 @@ func (m *Manager) ApplyBonds(interfaces []*config.InterfaceConfig) error {
 			slog.Warn("failed to bring up bond", "name", bondName, "err", err)
 		}
 		m.bonds = append(m.bonds, bondName)
+		modeStr := "802.3ad"
+		if ifc.BondMode == "active-backup" {
+			modeStr = "active-backup"
+		}
 		slog.Info("bond created", "name", bondName,
-			"mode", "802.3ad", "members", ifc.FabricMembers)
+			"mode", modeStr, "members", ifc.FabricMembers)
 	}
 	return nil
 }

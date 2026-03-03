@@ -780,6 +780,7 @@ main(int argc, char **argv)
 	 * Uses rte_eth_dev_info_get() to retrieve each port's kernel ifindex. */
 	memset(g_shm->ifindex_to_port, 0xFF, sizeof(g_shm->ifindex_to_port));
 	g_shm->fabric_port_id = 0xFFFF;
+	g_shm->fabric1_port_id = 0xFFFF;
 	RTE_ETH_FOREACH_DEV(port_id) {
 		struct rte_eth_dev_info di;
 		if (rte_eth_dev_info_get(port_id, &di) == 0 && di.if_index > 0 &&
