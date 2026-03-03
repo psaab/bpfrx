@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
@@ -2344,9 +2345,17 @@ func streamDiagCmd(ctx context.Context, cmd []string, sendFn func(string) error)
 
 // --- Mutation RPCs ---
 
-func (s *Server) ClearSessions(_ context.Context, req *pb.ClearSessionsRequest) (*pb.ClearSessionsResponse, error) {
+func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest) (*pb.ClearSessionsResponse, error) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
+	}
+
+	// Check if this is a forwarded request from a peer (prevent recursion).
+	forwarded := false
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if vals := md.Get("x-peer-forwarded"); len(vals) > 0 {
+			forwarded = true
+		}
 	}
 
 	// If no filters, clear all
@@ -2358,7 +2367,9 @@ func (s *Server) ClearSessions(_ context.Context, req *pb.ClearSessionsRequest) 
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
-		s.clearPeerSessions(req)
+		if !forwarded {
+			s.clearPeerSessions(req)
+		}
 		return &pb.ClearSessionsResponse{
 			Ipv4Cleared: int32(v4),
 			Ipv6Cleared: int32(v6),
@@ -2540,10 +2551,9 @@ func (s *Server) ClearSessions(_ context.Context, req *pb.ClearSessionsRequest) 
 		s.dp.DeleteDNATEntryV6(dk)
 	}
 
-	// Propagate clear to cluster peer so secondary's synced sessions
-	// are also removed (secondary GC doesn't expire them).
-	s.clearPeerSessions(req)
-
+	if !forwarded {
+		s.clearPeerSessions(req)
+	}
 	return &pb.ClearSessionsResponse{
 		Ipv4Cleared: int32(v4Deleted),
 		Ipv6Cleared: int32(v6Deleted),
@@ -2551,14 +2561,16 @@ func (s *Server) ClearSessions(_ context.Context, req *pb.ClearSessionsRequest) 
 }
 
 // clearPeerSessions forwards a ClearSessions request to the cluster peer.
+// Uses x-peer-forwarded metadata to prevent infinite recursion.
 func (s *Server) clearPeerSessions(req *pb.ClearSessionsRequest) {
 	conn, err := s.dialPeer()
 	if err != nil {
-		return // not in cluster or peer unavailable
+		return
 	}
 	defer conn.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	ctx = metadata.AppendToOutgoingContext(ctx, "x-peer-forwarded", "1")
 	_, _ = pb.NewBpfrxServiceClient(conn).ClearSessions(ctx, req)
 }
 

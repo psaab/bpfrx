@@ -22,6 +22,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/chzyer/readline"
@@ -4316,6 +4317,7 @@ func (c *CLI) clearPeerSessions(f *sessionFilter) {
 		req.DestinationPort = uint32(f.dstPort)
 		req.Application = f.appName
 	}
+	ctx = metadata.AppendToOutgoingContext(ctx, "x-peer-forwarded", "1")
 	_, _ = pb.NewBpfrxServiceClient(conn).ClearSessions(ctx, req)
 }
 
