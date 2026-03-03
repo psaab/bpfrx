@@ -61,7 +61,14 @@ zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		}
 		if (new_state != sess->state) {
 			sess->state = new_state;
-			sess->timeout = ct_get_timeout(PROTO_TCP, new_state);
+			__u32 new_timeout = ct_get_timeout(PROTO_TCP, new_state);
+			/* Per-app timeout overrides default for
+			 * non-closing states (ESTABLISHED, SYN_RECV). */
+			if (sess->app_timeout > 0 &&
+			    new_state != SESS_STATE_CLOSED &&
+			    new_state != SESS_STATE_FIN_WAIT)
+				new_timeout = (__u32)sess->app_timeout;
+			sess->timeout = new_timeout;
 			/* Sync state to paired entry so both entries
 			 * share the same TCP state and timeout. */
 			struct session_value *paired =
@@ -160,7 +167,14 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		}
 		if (new_state != sess->state) {
 			sess->state = new_state;
-			sess->timeout = ct_get_timeout(PROTO_TCP, new_state);
+			__u32 new_timeout = ct_get_timeout(PROTO_TCP, new_state);
+			/* Per-app timeout overrides default for
+			 * non-closing states (ESTABLISHED, SYN_RECV). */
+			if (sess->app_timeout > 0 &&
+			    new_state != SESS_STATE_CLOSED &&
+			    new_state != SESS_STATE_FIN_WAIT)
+				new_timeout = (__u32)sess->app_timeout;
+			sess->timeout = new_timeout;
 			/* Sync state to paired entry so both entries
 			 * share the same TCP state and timeout. */
 			struct session_value_v6 *paired =
