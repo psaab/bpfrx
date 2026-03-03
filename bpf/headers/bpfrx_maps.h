@@ -76,6 +76,15 @@ struct {
 	__type(value, struct session_value_v6);
 } session_v6_scratch SEC(".maps");
 
+/* Per-CPU session ID generator. Each CPU increments independently.
+ * Go seeds with node-specific base at startup. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} session_id_gen SEC(".maps");
+
 /* ============================================================
  * Session table (connection tracking)
  * ============================================================ */

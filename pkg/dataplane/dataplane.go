@@ -182,6 +182,7 @@ type DataPlane interface {
 	ReadNATRuleCounter(counterID uint32) (CounterValue, error)
 	ReadNATPortCounter(poolID uint32) (uint64, error)
 	SeedNATPortCounters()
+	SeedSessionIDCounter(nodeID int)
 	ClearGlobalCounters() error
 	ClearInterfaceCounters() error
 	ClearZoneCounters() error

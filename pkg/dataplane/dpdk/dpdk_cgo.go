@@ -1461,6 +1461,14 @@ func (m *Manager) SeedNATPortCounters() {
 	// DPDK port counter seeded via shared memory init
 }
 
+func (m *Manager) SeedSessionIDCounter(nodeID int) {
+	if m.platform.shm == nil || m.platform.shm.session_id_gen == nil {
+		return
+	}
+	base := C.uint64_t(uint64(nodeID) << 32)
+	*m.platform.shm.session_id_gen = base
+}
+
 func (m *Manager) ClearGlobalCounters() error {
 	if m.platform.shm == nil {
 		return fmt.Errorf("DPDK not initialized")
@@ -1973,6 +1981,7 @@ func convertSessionValue(sv *C.struct_session_value) dataplane.SessionValue {
 	rv.Flags = uint8(sv.flags)
 	rv.TCPState = uint8(sv.tcp_state)
 	rv.IsReverse = uint8(sv.is_reverse)
+	rv.SessionID = uint64(sv.session_id)
 	rv.Created = uint64(sv.created)
 	rv.LastSeen = uint64(sv.last_seen)
 	rv.Timeout = uint32(sv.timeout)
@@ -2011,6 +2020,7 @@ func convertSessionValueV6(sv *C.struct_session_value_v6) dataplane.SessionValue
 	rv.Flags = uint8(sv.flags)
 	rv.TCPState = uint8(sv.tcp_state)
 	rv.IsReverse = uint8(sv.is_reverse)
+	rv.SessionID = uint64(sv.session_id)
 	rv.Created = uint64(sv.created)
 	rv.LastSeen = uint64(sv.last_seen)
 	rv.Timeout = uint32(sv.timeout)

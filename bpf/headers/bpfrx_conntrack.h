@@ -22,6 +22,8 @@ struct session_value {
 	__u8  is_reverse;      /* 1 if this is the reverse direction entry */
 	__u32 app_timeout;     /* per-application inactivity timeout (seconds), 0=use default */
 
+	__u64 session_id;      /* unique ID, same on both cluster nodes */
+
 	/* Timestamps (seconds since boot) */
 	__u64 created;
 	__u64 last_seen;
@@ -80,6 +82,8 @@ struct session_value_v6 {
 	__u8  tcp_state;       /* TCP-specific sub-state */
 	__u8  is_reverse;      /* 1 if this is the reverse direction entry */
 	__u32 app_timeout;     /* per-application inactivity timeout (seconds), 0=use default */
+
+	__u64 session_id;      /* unique ID, same on both cluster nodes */
 
 	/* Timestamps (seconds since boot) */
 	__u64 created;

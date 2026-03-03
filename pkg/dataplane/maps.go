@@ -1448,6 +1448,29 @@ func (m *Manager) SeedNATPortCounters() {
 	slog.Info("seeded NAT port counters with random offset")
 }
 
+// SeedSessionIDCounter seeds the session_id_gen PERCPU map with a
+// node-specific base to avoid collisions between cluster nodes.
+// Each CPU gets base = (nodeID << 48) | (cpuIndex << 32).
+func (m *Manager) SeedSessionIDCounter(nodeID int) {
+	zm, ok := m.maps["session_id_gen"]
+	if !ok {
+		return
+	}
+	numCPUs, err := ebpf.PossibleCPU()
+	if err != nil || numCPUs <= 0 {
+		return
+	}
+	vals := make([]uint64, numCPUs)
+	for i := range vals {
+		vals[i] = (uint64(nodeID) << 48) | (uint64(i) << 32)
+	}
+	if err := zm.Update(uint32(0), vals, ebpf.UpdateAny); err != nil {
+		slog.Warn("failed to seed session ID counter", "err", err)
+		return
+	}
+	slog.Info("seeded session ID counter", "nodeID", nodeID, "cpus", numCPUs)
+}
+
 // --- Hitless restart: delete-stale methods ---
 // These methods remove map entries that are no longer present in the new config,
 // AFTER new entries have been written. This avoids the clear-then-repopulate

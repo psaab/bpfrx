@@ -473,6 +473,7 @@ type bpfrxXdpNatSessionValue struct {
 	TcpState    uint8
 	IsReverse   uint8
 	AppTimeout  uint32
+	SessionId   uint64
 	Created     uint64
 	LastSeen    uint64
 	Timeout     uint32
@@ -505,6 +506,7 @@ type bpfrxXdpNatSessionValueV6 struct {
 	TcpState    uint8
 	IsReverse   uint8
 	AppTimeout  uint32
+	SessionId   uint64
 	Created     uint64
 	LastSeen    uint64
 	Timeout     uint32
@@ -704,6 +706,7 @@ type bpfrxXdpNatMapSpecs struct {
 	ScreenConfigs     *ebpf.MapSpec `ebpf:"screen_configs"`
 	SessionCountDst   *ebpf.MapSpec `ebpf:"session_count_dst"`
 	SessionCountSrc   *ebpf.MapSpec `ebpf:"session_count_src"`
+	SessionIdGen      *ebpf.MapSpec `ebpf:"session_id_gen"`
 	SessionV4Scratch  *ebpf.MapSpec `ebpf:"session_v4_scratch"`
 	SessionV6Scratch  *ebpf.MapSpec `ebpf:"session_v6_scratch"`
 	Sessions          *ebpf.MapSpec `ebpf:"sessions"`
@@ -793,6 +796,7 @@ type bpfrxXdpNatMaps struct {
 	ScreenConfigs     *ebpf.Map `ebpf:"screen_configs"`
 	SessionCountDst   *ebpf.Map `ebpf:"session_count_dst"`
 	SessionCountSrc   *ebpf.Map `ebpf:"session_count_src"`
+	SessionIdGen      *ebpf.Map `ebpf:"session_id_gen"`
 	SessionV4Scratch  *ebpf.Map `ebpf:"session_v4_scratch"`
 	SessionV6Scratch  *ebpf.Map `ebpf:"session_v6_scratch"`
 	Sessions          *ebpf.Map `ebpf:"sessions"`
@@ -858,6 +862,7 @@ func (m *bpfrxXdpNatMaps) Close() error {
 		m.ScreenConfigs,
 		m.SessionCountDst,
 		m.SessionCountSrc,
+		m.SessionIdGen,
 		m.SessionV4Scratch,
 		m.SessionV6Scratch,
 		m.Sessions,

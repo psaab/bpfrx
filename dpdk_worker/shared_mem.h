@@ -164,6 +164,8 @@ struct session_value {
 	uint8_t  is_reverse;
 	uint32_t app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
 
+	uint64_t session_id;  /* unique ID, same on both cluster nodes */
+
 	uint64_t created;
 	uint64_t last_seen;
 	uint32_t timeout;
@@ -210,6 +212,8 @@ struct session_value_v6 {
 	uint8_t  tcp_state;
 	uint8_t  is_reverse;
 	uint32_t app_timeout; /* per-application inactivity timeout (seconds), 0=use default */
+
+	uint64_t session_id;  /* unique ID, same on both cluster nodes */
 
 	uint64_t created;
 	uint64_t last_seen;
@@ -834,6 +838,7 @@ struct shared_memory {
 	uint32_t                *flow_timeouts;
 	uint8_t                 *default_policy;
 	uint32_t                *fib_gen;
+	uint64_t                *session_id_gen;  /* atomic session ID counter */
 
 	/* Session value arrays (indexed by rte_hash position) */
 	struct session_value    *session_values_v4;

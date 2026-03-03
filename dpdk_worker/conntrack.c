@@ -831,10 +831,15 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			}
 		}
 
+		uint64_t sid = 0;
+		if (ctx->shm->session_id_gen)
+			sid = __atomic_add_fetch(ctx->shm->session_id_gen, 1, __ATOMIC_RELAXED);
+
 		struct session_value fwd_val;
 		memset(&fwd_val, 0, sizeof(fwd_val));
 		fwd_val.state = init_state;
 		fwd_val.flags = meta->nat_flags;
+		fwd_val.session_id = sid;
 		fwd_val.created = now;
 		fwd_val.last_seen = now;
 		fwd_val.timeout = (meta->app_timeout > 0) ?
@@ -918,10 +923,15 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			}
 		}
 
+		uint64_t sid6 = 0;
+		if (ctx->shm->session_id_gen)
+			sid6 = __atomic_add_fetch(ctx->shm->session_id_gen, 1, __ATOMIC_RELAXED);
+
 		struct session_value_v6 fwd_val6;
 		memset(&fwd_val6, 0, sizeof(fwd_val6));
 		fwd_val6.state = init_state;
 		fwd_val6.flags = meta->nat_flags;
+		fwd_val6.session_id = sid6;
 		fwd_val6.created = now;
 		fwd_val6.last_seen = now;
 		fwd_val6.timeout = (meta->app_timeout > 0) ?

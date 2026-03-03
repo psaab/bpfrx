@@ -3265,6 +3265,11 @@ func (c *CLI) showFlowSession(args []string) error {
 			outZone = fmt.Sprintf("%d", val.EgressZone)
 		}
 
+		sid := val.SessionID
+		if sid == 0 {
+			sid = uint64(count)
+		}
+
 		if f.brief {
 			natFlag := " "
 			if val.Flags&dataplane.SessFlagSNAT != 0 {
@@ -3281,7 +3286,7 @@ func (c *CLI) showFlowSession(args []string) error {
 				age = now - val.Created
 			}
 			fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
-				count,
+				sid,
 				fmt.Sprintf("%s:%d", srcIP, srcPort),
 				fmt.Sprintf("%s:%d", dstIP, dstPort),
 				protoName, inZone+"->"+outZone, natFlag,
@@ -3296,7 +3301,7 @@ func (c *CLI) showFlowSession(args []string) error {
 		}
 		// Junos format: Session ID: <id>, Policy name: <name>/<index>, State: <state>, Timeout: <t>
 		fmt.Printf("Session ID: %d, Policy name: %s/%d, State: %s, Timeout: %d\n",
-			count, polName, val.PolicyID, stateName, val.Timeout)
+			sid, polName, val.PolicyID, stateName, val.Timeout)
 
 		// In line: original direction
 		inIf := zoneIfaces[val.IngressZone]
@@ -3382,6 +3387,11 @@ func (c *CLI) showFlowSession(args []string) error {
 			outZone = fmt.Sprintf("%d", val.EgressZone)
 		}
 
+		sid6 := val.SessionID
+		if sid6 == 0 {
+			sid6 = uint64(count)
+		}
+
 		if f.brief {
 			natFlag := " "
 			if val.Flags&dataplane.SessFlagSNAT != 0 {
@@ -3398,7 +3408,7 @@ func (c *CLI) showFlowSession(args []string) error {
 				age = now - val.Created
 			}
 			fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
-				count,
+				sid6,
 				fmt.Sprintf("[%s]:%d", srcIP, srcPort),
 				fmt.Sprintf("[%s]:%d", dstIP, dstPort),
 				protoName, inZone+"->"+outZone, natFlag,
@@ -3413,7 +3423,7 @@ func (c *CLI) showFlowSession(args []string) error {
 		}
 		// Junos format: Session ID: <id>, Policy name: <name>/<index>, State: <state>, Timeout: <t>
 		fmt.Printf("Session ID: %d, Policy name: %s/%d, State: %s, Timeout: %d\n",
-			count, polName, val.PolicyID, stateName, val.Timeout)
+			sid6, polName, val.PolicyID, stateName, val.Timeout)
 
 		// In line: original direction
 		inIf := zoneIfaces[val.IngressZone]
@@ -3555,8 +3565,12 @@ func (c *CLI) showFlowSession(args []string) error {
 					if len(st) > 5 {
 						st = st[:5]
 					}
+					peerSID := se.SessionId
+					if peerSID == 0 {
+						peerSID = uint64(i + 1)
+					}
 					fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
-						i+1,
+						peerSID,
 						fmt.Sprintf("%s:%d", se.SrcAddr, se.SrcPort),
 						fmt.Sprintf("%s:%d", se.DstAddr, se.DstPort),
 						se.Protocol, inZone+"->"+outZone, natFlag,
@@ -3569,8 +3583,12 @@ func (c *CLI) showFlowSession(args []string) error {
 					if polDisplay == "" {
 						polDisplay = fmt.Sprintf("%d", se.PolicyId)
 					}
+					peerFullSID := se.SessionId
+					if peerFullSID == 0 {
+						peerFullSID = uint64(i + 1)
+					}
 					fmt.Printf("Session ID: %d, Policy: %s, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
-						i+1, polDisplay, se.State, se.TimeoutSeconds, se.AgeSeconds, se.IdleSeconds)
+						peerFullSID, polDisplay, se.State, se.TimeoutSeconds, se.AgeSeconds, se.IdleSeconds)
 					inZone := se.IngressZoneName
 					if inZone == "" {
 						inZone = fmt.Sprintf("%d", se.IngressZone)

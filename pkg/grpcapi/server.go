@@ -3011,6 +3011,7 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 		RevPackets:      val.RevPackets,
 		RevBytes:        val.RevBytes,
 		TimeoutSeconds:  val.Timeout,
+		SessionId:       val.SessionID,
 	}
 	if val.Created > 0 && now > val.Created {
 		se.AgeSeconds = int64(now - val.Created)
@@ -3046,6 +3047,7 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 		RevPackets:      val.RevPackets,
 		RevBytes:        val.RevBytes,
 		TimeoutSeconds:  val.Timeout,
+		SessionId:       val.SessionID,
 	}
 	if val.Created > 0 && now > val.Created {
 		se.AgeSeconds = int64(now - val.Created)

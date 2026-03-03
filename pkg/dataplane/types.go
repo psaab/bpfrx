@@ -20,6 +20,8 @@ type SessionValue struct {
 	IsReverse  uint8
 	AppTimeout uint32 // per-application inactivity timeout (seconds), 0=use default
 
+	SessionID uint64 // unique ID, same on both cluster nodes
+
 	Created  uint64
 	LastSeen uint64
 	Timeout  uint32
@@ -68,6 +70,8 @@ type SessionValueV6 struct {
 	TCPState   uint8
 	IsReverse  uint8
 	AppTimeout uint32 // per-application inactivity timeout (seconds), 0=use default
+
+	SessionID uint64 // unique ID, same on both cluster nodes
 
 	Created  uint64
 	LastSeen uint64

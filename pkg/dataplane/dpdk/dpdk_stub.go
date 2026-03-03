@@ -306,6 +306,7 @@ func (m *Manager) ReadNATRuleCounter(counterID uint32) (dataplane.CounterValue, 
 
 func (m *Manager) ReadNATPortCounter(poolID uint32) (uint64, error) { return 0, nil }
 func (m *Manager) SeedNATPortCounters()                             {}
+func (m *Manager) SeedSessionIDCounter(_ int)                       {}
 
 func (m *Manager) ClearGlobalCounters() error    { return nil }
 func (m *Manager) ClearInterfaceCounters() error { return nil }

@@ -281,6 +281,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.dp = nil
 		} else {
 			d.dp.SeedNATPortCounters()
+			nodeID := 0
+			if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
+				nodeID = cfg.Chassis.Cluster.NodeID
+			}
+			d.dp.SeedSessionIDCounter(nodeID)
 			// Apply current config using ordered flow
 			if cfg := d.store.ActiveConfig(); cfg != nil {
 				slog.Info("applying active configuration")

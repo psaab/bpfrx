@@ -1311,7 +1311,7 @@ func encodeSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) []byt
 
 func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue) []byte {
 	keySize := 16  // SessionKey: 4+4+2+2+1+3
-	valSize := 120 // approximate SessionValue size
+	valSize := 128 // approximate SessionValue size
 	buf := make([]byte, keySize+valSize)
 	off := 0
 
@@ -1336,6 +1336,9 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	off++
 	buf[off] = val.IsReverse
 	off += 5 // include pad0
+
+	binary.LittleEndian.PutUint64(buf[off:], val.SessionID)
+	off += 8
 
 	binary.LittleEndian.PutUint64(buf[off:], val.Created)
 	off += 8
@@ -1424,6 +1427,9 @@ func encodeSessionV6Payload(key dataplane.SessionKeyV6, val dataplane.SessionVal
 	off++
 	buf[off] = val.IsReverse
 	off += 5
+
+	binary.LittleEndian.PutUint64(buf[off:], val.SessionID)
+	off += 8
 
 	binary.LittleEndian.PutUint64(buf[off:], val.Created)
 	off += 8
@@ -1549,9 +1555,12 @@ func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.Ses
 	val.IsReverse = payload[off]
 	off += 5 // include pad0
 
-	if off+40 > len(payload) {
+	if off+48 > len(payload) {
 		return key, val, true // partial value is OK for key-only
 	}
+
+	val.SessionID = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
 
 	val.Created = binary.LittleEndian.Uint64(payload[off:])
 	off += 8
@@ -1644,9 +1653,12 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 	val.IsReverse = payload[off]
 	off += 5 // include pad0
 
-	if off+40 > len(payload) {
+	if off+48 > len(payload) {
 		return key, val, true
 	}
+
+	val.SessionID = binary.LittleEndian.Uint64(payload[off:])
+	off += 8
 
 	val.Created = binary.LittleEndian.Uint64(payload[off:])
 	off += 8

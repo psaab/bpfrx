@@ -277,6 +277,7 @@ message SessionEntry {
   int64 idle_seconds = 19;
   string application = 20;        // resolved application name
   string policy_name = 21;        // resolved policy name
+  uint64 session_id = 22;         // unique session ID (same on both cluster nodes)
 }
 
 message GetSessionSummaryRequest {

@@ -2426,6 +2426,7 @@ type SessionEntry struct {
 	IdleSeconds     int64                  `protobuf:"varint,19,opt,name=idle_seconds,json=idleSeconds,proto3" json:"idle_seconds,omitempty"`
 	Application     string                 `protobuf:"bytes,20,opt,name=application,proto3" json:"application,omitempty"`                 // resolved application name
 	PolicyName      string                 `protobuf:"bytes,21,opt,name=policy_name,json=policyName,proto3" json:"policy_name,omitempty"` // resolved policy name
+	SessionId       uint64                 `protobuf:"varint,22,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`   // unique session ID (same on both cluster nodes)
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -2605,6 +2606,13 @@ func (x *SessionEntry) GetPolicyName() string {
 		return x.PolicyName
 	}
 	return ""
+}
+
+func (x *SessionEntry) GetSessionId() uint64 {
+	if x != nil {
+		return x.SessionId
+	}
+	return 0
 }
 
 type GetSessionSummaryRequest struct {
@@ -6878,7 +6886,7 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x06offset\x18\x03 \x01(\x05R\x06offset\x122\n" +
 	"\bsessions\x18\x04 \x03(\v2\x16.bpfrx.v1.SessionEntryR\bsessions\x12\x17\n" +
 	"\anode_id\x18\x05 \x01(\x05R\x06nodeId\x121\n" +
-	"\x04peer\x18\x06 \x01(\v2\x1d.bpfrx.v1.GetSessionsResponseR\x04peer\"\xa1\x05\n" +
+	"\x04peer\x18\x06 \x01(\v2\x1d.bpfrx.v1.GetSessionsResponseR\x04peer\"\xc0\x05\n" +
 	"\fSessionEntry\x12\x19\n" +
 	"\bsrc_addr\x18\x01 \x01(\tR\asrcAddr\x12\x19\n" +
 	"\bdst_addr\x18\x02 \x01(\tR\adstAddr\x12\x19\n" +
@@ -6906,7 +6914,9 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\fidle_seconds\x18\x13 \x01(\x03R\vidleSeconds\x12 \n" +
 	"\vapplication\x18\x14 \x01(\tR\vapplication\x12\x1f\n" +
 	"\vpolicy_name\x18\x15 \x01(\tR\n" +
-	"policyName\"=\n" +
+	"policyName\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x16 \x01(\x04R\tsessionId\"=\n" +
 	"\x18GetSessionSummaryRequest\x12!\n" +
 	"\finclude_peer\x18\x01 \x01(\bR\vincludePeer\"\xeb\x02\n" +
 	"\x19GetSessionSummaryResponse\x12#\n" +

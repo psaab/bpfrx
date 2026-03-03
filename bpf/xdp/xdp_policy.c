@@ -76,6 +76,24 @@ addr_matches_v6(const __u8 *ip, __u32 rule_addr_id)
 }
 
 /*
+ * Allocate a unique session ID.
+ * Uses per-CPU counter from session_id_gen PERCPU_ARRAY.
+ * ID = (cpu << 48) | per-CPU-counter.
+ * Node-specific base is seeded by Go at startup.
+ */
+static __always_inline __u64
+alloc_session_id(void)
+{
+	__u32 z = 0;
+	__u64 *gen = bpf_map_lookup_elem(&session_id_gen, &z);
+	if (!gen)
+		return 0;
+	__u64 val = *gen + 1;
+	*gen = val;
+	return val;
+}
+
+/*
  * Create dual session entries for a permitted IPv4 connection.
  */
 static __always_inline int
@@ -122,10 +140,13 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	if (!fwd_val)
 		return -1;
 
+	__u64 sid = alloc_session_id();
+
 	__builtin_memset(fwd_val, 0, sizeof(*fwd_val));
 	fwd_val->state        = initial_state;
 	fwd_val->flags        = nat_flags;
 	fwd_val->is_reverse   = 0;
+	fwd_val->session_id   = sid;
 	fwd_val->created      = now;
 	fwd_val->last_seen    = now;
 	fwd_val->timeout      = timeout;
@@ -164,6 +185,7 @@ create_session(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	rev_val->state        = initial_state;
 	rev_val->flags        = nat_flags;
 	rev_val->is_reverse   = 1;
+	rev_val->session_id   = sid;
 	rev_val->created      = now;
 	rev_val->last_seen    = now;
 	rev_val->timeout      = timeout;
@@ -236,10 +258,13 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	if (!fwd_val)
 		return -1;
 
+	__u64 sid6 = alloc_session_id();
+
 	__builtin_memset(fwd_val, 0, sizeof(*fwd_val));
 	fwd_val->state        = initial_state;
 	fwd_val->flags        = nat_flags;
 	fwd_val->is_reverse   = 0;
+	fwd_val->session_id   = sid6;
 	fwd_val->created      = now;
 	fwd_val->last_seen    = now;
 	fwd_val->timeout      = timeout;
@@ -281,6 +306,7 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	rev_val->state        = initial_state;
 	rev_val->flags        = nat_flags;
 	rev_val->is_reverse   = 1;
+	rev_val->session_id   = sid6;
 	rev_val->created      = now;
 	rev_val->last_seen    = now;
 	rev_val->timeout      = timeout;
