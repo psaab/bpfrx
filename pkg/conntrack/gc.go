@@ -37,6 +37,11 @@ type GC struct {
 	OnDeleteV4 func(key dataplane.SessionKey)
 	OnDeleteV6 func(key dataplane.SessionKeyV6)
 
+	// IsLocalPrimary returns true when this node owns session lifetime.
+	// When set and returning false, GC skips session expiry — the peer
+	// primary will age sessions and sync deletes to us.
+	IsLocalPrimary func() bool
+
 	lastV6Count int // v6 entries found in previous sweep
 	sweepCount  int // sweep counter for periodic forced v6 check
 	lastTotal   int // total entries (v4+v6) found in previous sweep
@@ -145,6 +150,10 @@ func (gc *GC) sweep() {
 	sweepStart := time.Now()
 	now := monotonicSeconds()
 
+	// When in cluster mode and this node is secondary, skip session
+	// expiry — the primary owns session lifetime and syncs deletes.
+	isPrimary := gc.IsLocalPrimary == nil || gc.IsLocalPrimary()
+
 	var total, established, expired int
 	toDelete := gc.toDeleteV4[:0]
 	snatExpired := gc.snatExpiredV4[:0]
@@ -170,25 +179,30 @@ func (gc *GC) sweep() {
 			established++
 		}
 
-		// Check expiry (aggressive aging shortens effective timeout)
-		effectiveTimeout := uint64(val.Timeout)
-		if gc.agingActive && gc.earlyAgeout > 0 && gc.earlyAgeout < effectiveTimeout {
-			effectiveTimeout = gc.earlyAgeout
-		}
-		if val.LastSeen+effectiveTimeout < now {
-			expired++
-			// Delete both forward and reverse entries
-			toDelete = append(toDelete, key)
-			toDelete = append(toDelete, val.ReverseKey)
-
-			// Track dynamic SNAT sessions for dnat_table cleanup
-			// (skip static NAT -- no dynamic dnat_table entry exists)
-			if val.Flags&dataplane.SessFlagSNAT != 0 &&
-				val.Flags&dataplane.SessFlagStaticNAT == 0 {
-				snatExpired = append(snatExpired, expiredSession{key: key, val: val})
+		// Check expiry (aggressive aging shortens effective timeout).
+		// Skip on secondary — primary owns session lifetime.
+		if isPrimary {
+			effectiveTimeout := uint64(val.Timeout)
+			if gc.agingActive && gc.earlyAgeout > 0 && gc.earlyAgeout < effectiveTimeout {
+				effectiveTimeout = gc.earlyAgeout
 			}
-		} else if countSessions {
-			// Count active (non-expired) forward sessions per src/dst IP
+			if val.LastSeen+effectiveTimeout < now {
+				expired++
+				// Delete both forward and reverse entries
+				toDelete = append(toDelete, key)
+				toDelete = append(toDelete, val.ReverseKey)
+
+				// Track dynamic SNAT sessions for dnat_table cleanup
+				// (skip static NAT -- no dynamic dnat_table entry exists)
+				if val.Flags&dataplane.SessFlagSNAT != 0 &&
+					val.Flags&dataplane.SessFlagStaticNAT == 0 {
+					snatExpired = append(snatExpired, expiredSession{key: key, val: val})
+				}
+			}
+		}
+		// Count active (non-expired) forward sessions per src/dst IP.
+		// On secondary, all sessions are active (no local expiry).
+		if countSessions && (!isPrimary || val.LastSeen+uint64(val.Timeout) >= now) {
 			srcKey := dataplane.SessionCountKey{
 				IP:     binary.NativeEndian.Uint32(key.SrcIP[:]),
 				ZoneID: val.IngressZone,
@@ -283,20 +297,24 @@ func (gc *GC) sweep() {
 				established++
 			}
 
-			effectiveTimeout := uint64(val.Timeout)
-			if gc.agingActive && gc.earlyAgeout > 0 && gc.earlyAgeout < effectiveTimeout {
-				effectiveTimeout = gc.earlyAgeout
-			}
-			if val.LastSeen+effectiveTimeout < now {
-				expired++
-				toDeleteV6 = append(toDeleteV6, key)
-				toDeleteV6 = append(toDeleteV6, val.ReverseKey)
-
-				if val.Flags&dataplane.SessFlagSNAT != 0 &&
-					val.Flags&dataplane.SessFlagStaticNAT == 0 {
-					snatExpiredV6 = append(snatExpiredV6, expiredSessionV6{key: key, val: val})
+			// Skip expiry on secondary — primary owns session lifetime.
+			if isPrimary {
+				effectiveTimeout := uint64(val.Timeout)
+				if gc.agingActive && gc.earlyAgeout > 0 && gc.earlyAgeout < effectiveTimeout {
+					effectiveTimeout = gc.earlyAgeout
 				}
-			} else if countSessions {
+				if val.LastSeen+effectiveTimeout < now {
+					expired++
+					toDeleteV6 = append(toDeleteV6, key)
+					toDeleteV6 = append(toDeleteV6, val.ReverseKey)
+
+					if val.Flags&dataplane.SessFlagSNAT != 0 &&
+						val.Flags&dataplane.SessFlagStaticNAT == 0 {
+						snatExpiredV6 = append(snatExpiredV6, expiredSessionV6{key: key, val: val})
+					}
+				}
+			}
+			if countSessions && (!isPrimary || val.LastSeen+uint64(val.Timeout) >= now) {
 				// XOR-hash IPv6 addresses to uint32 for session count key
 				srcHash := binary.NativeEndian.Uint32(key.SrcIP[0:4]) ^
 					binary.NativeEndian.Uint32(key.SrcIP[4:8]) ^
