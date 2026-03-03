@@ -547,6 +547,9 @@ func (c *CLI) Run() error {
 			}
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		}
+		// Refresh prompt after every command so cluster role
+		// changes (failover) are reflected immediately.
+		c.refreshPrompt()
 	}
 	return nil
 }
