@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -16,9 +17,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/chzyer/readline"
 	"github.com/psaab/bpfrx/pkg/cluster"
@@ -31,6 +35,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/dhcpserver"
 	"github.com/psaab/bpfrx/pkg/feeds"
 	"github.com/psaab/bpfrx/pkg/frr"
+	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
 	"github.com/psaab/bpfrx/pkg/ipsec"
 	"github.com/psaab/bpfrx/pkg/lldp"
 	"github.com/psaab/bpfrx/pkg/logging"
@@ -63,6 +68,10 @@ type CLI struct {
 	startTime    time.Time
 
 	vrrpMgr      *vrrp.Manager
+
+	// Fabric peer dialing for cluster-wide queries.
+	fabricPeerAddrFn func() string
+	fabricVRFDevice  string
 
 	// Monitor security flow state (per-CLI-session).
 	monitorFlow *monitorFlowState
@@ -128,6 +137,12 @@ func (c *CLI) SetUserClass(class string) {
 // SetVRRPManager sets the VRRP manager for runtime state queries.
 func (c *CLI) SetVRRPManager(m *vrrp.Manager) {
 	c.vrrpMgr = m
+}
+
+// SetFabricPeer configures fabric peer dialing for cluster-wide queries.
+func (c *CLI) SetFabricPeer(addrFn func() string, vrfDevice string) {
+	c.fabricPeerAddrFn = addrFn
+	c.fabricVRFDevice = vrfDevice
 }
 
 // checkPermission verifies the current user's login class permits the given action.
@@ -3430,6 +3445,11 @@ func (c *CLI) showFlowSession(args []string) error {
 	}
 
 	if f.summary {
+		// In cluster mode, print dual-node Junos-style output.
+		if c.cluster != nil {
+			fmt.Printf("node%d:\n", c.cluster.NodeID())
+			fmt.Println("--------------------------------------------------------------------------")
+		}
 		// Junos-style session summary format
 		fmt.Printf("Unicast-sessions: %d\n", count)
 		fmt.Printf("Multicast-sessions: 0\n")
@@ -3469,10 +3489,74 @@ func (c *CLI) showFlowSession(args []string) error {
 				fmt.Printf("    %-30s %d\n", zp, byZonePair[zp])
 			}
 		}
+
+		// Fetch and display peer node summary in cluster mode.
+		if c.cluster != nil && c.cluster.PeerAlive() {
+			if peerResp := c.fetchPeerSessionSummary(); peerResp != nil {
+				fmt.Println()
+				fmt.Printf("node%d:\n", peerResp.NodeId)
+				fmt.Println("--------------------------------------------------------------------------")
+				fmt.Printf("Unicast-sessions: %d\n", peerResp.ForwardOnly)
+				fmt.Printf("Multicast-sessions: 0\n")
+				fmt.Printf("Services-offload-sessions: 0\n")
+				fmt.Printf("Failed-sessions: 0\n")
+				fmt.Printf("Sessions-in-drop-flow: 0\n")
+				fmt.Printf("Sessions-in-use: %d\n", peerResp.ForwardOnly)
+				fmt.Printf("  Valid sessions: %d\n", peerResp.ForwardOnly)
+				fmt.Printf("  Pending sessions: 0\n")
+				fmt.Printf("  Invalidated sessions: 0\n")
+				fmt.Printf("  Sessions in other states: 0\n")
+				fmt.Printf("Maximum-sessions: 10000000\n")
+			}
+		}
 		return nil
 	}
 	fmt.Printf("Total sessions: %d\n", count)
 	return nil
+}
+
+// fetchPeerSessionSummary dials the cluster peer's gRPC and returns its session summary.
+func (c *CLI) fetchPeerSessionSummary() *pb.GetSessionSummaryResponse {
+	if c.fabricPeerAddrFn == nil {
+		return nil
+	}
+	peerIP := c.fabricPeerAddrFn()
+	if peerIP == "" {
+		return nil
+	}
+	peerAddr := fmt.Sprintf("%s:50051", peerIP)
+
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if c.fabricVRFDevice != "" {
+		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Control: func(network, address string, rc syscall.RawConn) error {
+					var err error
+					rc.Control(func(fd uintptr) {
+						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, c.fabricVRFDevice)
+					})
+					return err
+				},
+			}
+			return dialer.DialContext(ctx, "tcp", addr)
+		}))
+	}
+	conn, err := grpc.NewClient(peerAddr, dialOpts...)
+	if err != nil {
+		slog.Warn("failed to dial peer for session summary", "err", err)
+		return nil
+	}
+	defer conn.Close()
+
+	client := pb.NewBpfrxServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err := client.GetSessionSummary(ctx, &pb.GetSessionSummaryRequest{})
+	if err != nil {
+		slog.Warn("failed to fetch peer session summary", "err", err)
+		return nil
+	}
+	return resp
 }
 
 // topTalkerEntry holds a session's display info for sorting.

@@ -902,12 +902,17 @@ func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb
 	}, nil
 }
 
-func (s *Server) GetSessionSummary(_ context.Context, _ *pb.GetSessionSummaryRequest) (*pb.GetSessionSummaryResponse, error) {
+func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummaryRequest) (*pb.GetSessionSummaryResponse, error) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
 
 	resp := &pb.GetSessionSummaryResponse{}
+
+	// Set node ID from cluster manager (0 if standalone).
+	if s.cluster != nil {
+		resp.NodeId = int32(s.cluster.NodeID())
+	}
 
 	_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
 		resp.TotalEntries++
@@ -944,6 +949,26 @@ func (s *Server) GetSessionSummary(_ context.Context, _ *pb.GetSessionSummaryReq
 		}
 		return true
 	})
+
+	// Fetch peer summary if requested and in cluster mode.
+	if req.GetIncludePeer() && s.cluster != nil && s.cluster.PeerAlive() {
+		conn, err := s.dialPeer()
+		if err == nil {
+			defer conn.Close()
+			client := pb.NewBpfrxServiceClient(conn)
+			peerCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			// Do NOT set include_peer on the peer request — prevents recursion.
+			peerResp, err := client.GetSessionSummary(peerCtx, &pb.GetSessionSummaryRequest{})
+			if err != nil {
+				slog.Warn("failed to fetch peer session summary", "err", err)
+			} else {
+				resp.Peer = peerResp
+			}
+		} else {
+			slog.Warn("failed to dial peer for session summary", "err", err)
+		}
+	}
 
 	return resp, nil
 }
@@ -8319,18 +8344,18 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 	}
 }
 
-// proxyMonitorInterface forwards a MonitorInterface stream to the cluster peer.
-func (s *Server) proxyMonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.ServerStreamingServer[pb.MonitorInterfaceResponse]) error {
+// dialPeer establishes a gRPC connection to the cluster peer via the fabric link.
+// Returns the connection and peer address, or an error if not in cluster mode.
+func (s *Server) dialPeer() (*grpc.ClientConn, error) {
 	if s.fabricPeerAddrFn == nil {
-		return status.Error(codes.Unavailable, "not in cluster mode")
+		return nil, status.Error(codes.Unavailable, "not in cluster mode")
 	}
 	peerIP := s.fabricPeerAddrFn()
 	if peerIP == "" {
-		return status.Error(codes.Unavailable, "cluster peer address not available")
+		return nil, status.Error(codes.Unavailable, "cluster peer address not available")
 	}
 
 	peerAddr := fmt.Sprintf("%s:50051", peerIP)
-	ctx := stream.Context()
 
 	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 	if s.fabricVRFDevice != "" {
@@ -8349,9 +8374,20 @@ func (s *Server) proxyMonitorInterface(req *pb.MonitorInterfaceRequest, stream g
 	}
 	conn, err := grpc.NewClient(peerAddr, dialOpts...)
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "cannot connect to peer %s: %v", peerAddr, err)
+		return nil, status.Errorf(codes.Unavailable, "cannot connect to peer %s: %v", peerAddr, err)
+	}
+	return conn, nil
+}
+
+// proxyMonitorInterface forwards a MonitorInterface stream to the cluster peer.
+func (s *Server) proxyMonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.ServerStreamingServer[pb.MonitorInterfaceResponse]) error {
+	conn, err := s.dialPeer()
+	if err != nil {
+		return err
 	}
 	defer conn.Close()
+
+	ctx := stream.Context()
 
 	client := pb.NewBpfrxServiceClient(conn)
 	peerStream, err := client.MonitorInterface(ctx, req)

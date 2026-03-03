@@ -276,7 +276,9 @@ message SessionEntry {
   string policy_name = 21;        // resolved policy name
 }
 
-message GetSessionSummaryRequest {}
+message GetSessionSummaryRequest {
+  bool include_peer = 1;
+}
 message GetSessionSummaryResponse {
   int32 total_entries = 1;
   int32 forward_only = 2;
@@ -285,6 +287,8 @@ message GetSessionSummaryResponse {
   int32 ipv6_sessions = 5;
   int32 snat_sessions = 6;
   int32 dnat_sessions = 7;
+  int32 node_id = 8;
+  GetSessionSummaryResponse peer = 9;
 }
 
 message GetNATSourceRequest {}

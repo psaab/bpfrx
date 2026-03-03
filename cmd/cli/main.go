@@ -1237,19 +1237,42 @@ func (c *ctl) showFlowSession(args []string) error {
 }
 
 func (c *ctl) showSessionSummary() error {
-	resp, err := c.client.GetSessionSummary(c.ctx(), &pb.GetSessionSummaryRequest{})
+	resp, err := c.client.GetSessionSummary(c.ctx(), &pb.GetSessionSummaryRequest{IncludePeer: true})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
-	fmt.Printf("Session summary:\n")
-	fmt.Printf("  Total entries:    %d\n", resp.TotalEntries)
-	fmt.Printf("  Forward only:    %d\n", resp.ForwardOnly)
-	fmt.Printf("  Established:     %d\n", resp.Established)
-	fmt.Printf("  IPv4 sessions:   %d\n", resp.Ipv4Sessions)
-	fmt.Printf("  IPv6 sessions:   %d\n", resp.Ipv6Sessions)
-	fmt.Printf("  SNAT sessions:   %d\n", resp.SnatSessions)
-	fmt.Printf("  DNAT sessions:   %d\n", resp.DnatSessions)
+
+	if resp.Peer != nil {
+		// Cluster mode: print both nodes with Junos-style headers.
+		printNodeSessionSummary(int(resp.NodeId), resp)
+		fmt.Println()
+		printNodeSessionSummary(int(resp.Peer.NodeId), resp.Peer)
+	} else {
+		// Standalone: Junos-style summary without node headers.
+		printSessionSummaryBlock(resp)
+	}
 	return nil
+}
+
+func printNodeSessionSummary(nodeID int, resp *pb.GetSessionSummaryResponse) {
+	fmt.Printf("node%d:\n", nodeID)
+	fmt.Println("--------------------------------------------------------------------------")
+	printSessionSummaryBlock(resp)
+}
+
+func printSessionSummaryBlock(resp *pb.GetSessionSummaryResponse) {
+	unicast := resp.ForwardOnly
+	fmt.Printf("Unicast-sessions: %d\n", unicast)
+	fmt.Printf("Multicast-sessions: 0\n")
+	fmt.Printf("Services-offload-sessions: 0\n")
+	fmt.Printf("Failed-sessions: 0\n")
+	fmt.Printf("Sessions-in-drop-flow: 0\n")
+	fmt.Printf("Sessions-in-use: %d\n", unicast)
+	fmt.Printf("  Valid sessions: %d\n", unicast)
+	fmt.Printf("  Pending sessions: 0\n")
+	fmt.Printf("  Invalidated sessions: 0\n")
+	fmt.Printf("  Sessions in other states: 0\n")
+	fmt.Printf("Maximum-sessions: 10000000\n")
 }
 
 func (c *ctl) handleShowNAT(args []string) error {

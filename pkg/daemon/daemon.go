@@ -768,6 +768,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return nil
 		})
 		shell.SetVRRPManager(d.vrrpMgr)
+		shell.SetFabricPeer(func() string {
+			d.fabricMu.RLock()
+			defer d.fabricMu.RUnlock()
+			if d.fabricPeerIP != nil {
+				return d.fabricPeerIP.String()
+			}
+			return ""
+		}, func() string {
+			if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil && c.Chassis.Cluster.FabricInterface != "" {
+				return "vrf-mgmt"
+			}
+			return ""
+		}())
 
 		// Set RBAC login class from config (default to super-user if user not found)
 		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Login != nil {
