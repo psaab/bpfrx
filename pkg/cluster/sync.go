@@ -824,9 +824,15 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 				// local GC doesn't expire sessions due to clock skew
 				// between cluster nodes (different boot times).
 				localNow := monotonicSeconds()
+				age := uint64(0)
+				if val.LastSeen > val.Created {
+					age = val.LastSeen - val.Created
+				}
 				val.LastSeen = localNow
-				if val.Created > localNow {
-					val.Created = localNow
+				if age < localNow {
+					val.Created = localNow - age
+				} else {
+					val.Created = 0
 				}
 
 				// Invalidate FIB cache — peer's cached ifindex/MAC/gen
@@ -891,9 +897,15 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 
 				// Rebase timestamps to local monotonic clock (same as V4).
 				localNow := monotonicSeconds()
+				age := uint64(0)
+				if val.LastSeen > val.Created {
+					age = val.LastSeen - val.Created
+				}
 				val.LastSeen = localNow
-				if val.Created > localNow {
-					val.Created = localNow
+				if age < localNow {
+					val.Created = localNow - age
+				} else {
+					val.Created = 0
 				}
 
 				// Invalidate FIB cache (same as V4 above).
