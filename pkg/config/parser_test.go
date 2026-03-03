@@ -14829,3 +14829,116 @@ func TestChassisClusterRethVRRPDefault(t *testing.T) {
 		t.Error("RethVRRP = true, want false (default = direct VIP management)")
 	}
 }
+
+func TestValidateFabric1MissingPeerAddress(t *testing.T) {
+	cfg := &Config{
+		Interfaces: InterfacesConfig{
+			Interfaces: map[string]*InterfaceConfig{
+				"fab0": {Name: "fab0"},
+				"fab1": {Name: "fab1"},
+			},
+		},
+		Chassis: ChassisConfig{
+			Cluster: &ClusterConfig{
+				FabricInterface:    "fab0",
+				FabricPeerAddress:  "10.99.1.2",
+				Fabric1Interface:   "fab1",
+				// Missing Fabric1PeerAddress
+			},
+		},
+	}
+	warnings := ValidateConfig(cfg)
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "fabric1-interface and fabric1-peer-address must both be set") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected warning about incomplete fabric1 config, got none")
+	}
+}
+
+func TestValidateFabricInterfaceNotDefined(t *testing.T) {
+	cfg := &Config{
+		Interfaces: InterfacesConfig{
+			Interfaces: map[string]*InterfaceConfig{
+				"fab0": {Name: "fab0"},
+			},
+		},
+		Chassis: ChassisConfig{
+			Cluster: &ClusterConfig{
+				FabricInterface:    "fab0",
+				FabricPeerAddress:  "10.99.1.2",
+				Fabric1Interface:   "fab1",
+				Fabric1PeerAddress: "10.99.2.2",
+			},
+		},
+	}
+	warnings := ValidateConfig(cfg)
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "fabric1-interface") && strings.Contains(w, "not defined") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected warning about undefined fabric1-interface, got none")
+	}
+}
+
+func TestValidateFabricMembersOverlap(t *testing.T) {
+	cfg := &Config{
+		Interfaces: InterfacesConfig{
+			Interfaces: map[string]*InterfaceConfig{
+				"fab0": {Name: "fab0", FabricMembers: []string{"ge-0/0/2", "ge-0/0/3"}},
+				"fab1": {Name: "fab1", FabricMembers: []string{"ge-0/0/3", "ge-0/0/4"}},
+			},
+		},
+		Chassis: ChassisConfig{
+			Cluster: &ClusterConfig{
+				FabricInterface:    "fab0",
+				FabricPeerAddress:  "10.99.1.2",
+				Fabric1Interface:   "fab1",
+				Fabric1PeerAddress: "10.99.2.2",
+			},
+		},
+	}
+	warnings := ValidateConfig(cfg)
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "ge-0/0/3") && strings.Contains(w, "shared between") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected warning about overlapping fabric member ge-0/0/3, got none")
+	}
+}
+
+func TestValidateFabricDualValid(t *testing.T) {
+	cfg := &Config{
+		Interfaces: InterfacesConfig{
+			Interfaces: map[string]*InterfaceConfig{
+				"fab0": {Name: "fab0", FabricMembers: []string{"ge-0/0/2"}},
+				"fab1": {Name: "fab1", FabricMembers: []string{"ge-0/0/3"}},
+				"hb0":  {Name: "hb0"},
+			},
+		},
+		Chassis: ChassisConfig{
+			Cluster: &ClusterConfig{
+				ControlInterface:   "hb0",
+				FabricInterface:    "fab0",
+				FabricPeerAddress:  "10.99.1.2",
+				Fabric1Interface:   "fab1",
+				Fabric1PeerAddress: "10.99.2.2",
+			},
+		},
+	}
+	warnings := ValidateConfig(cfg)
+	for _, w := range warnings {
+		if strings.Contains(w, "fabric") || strings.Contains(w, "control") {
+			t.Errorf("unexpected fabric/control warning: %s", w)
+		}
+	}
+}

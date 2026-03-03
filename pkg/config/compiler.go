@@ -400,6 +400,52 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
+	// Validate chassis cluster fabric config
+	if cc := cfg.Chassis.Cluster; cc != nil {
+		// fabric1-interface without fabric1-peer-address (or vice versa) is incomplete
+		if (cc.Fabric1Interface != "") != (cc.Fabric1PeerAddress != "") {
+			warnings = append(warnings, "chassis cluster: fabric1-interface and fabric1-peer-address must both be set for dual-fabric")
+		}
+		// Check fabric interfaces are defined in interface config
+		for _, pair := range [][2]string{
+			{cc.FabricInterface, "fabric-interface"},
+			{cc.Fabric1Interface, "fabric1-interface"},
+		} {
+			ifName, label := pair[0], pair[1]
+			if ifName != "" {
+				if _, ok := cfg.Interfaces.Interfaces[ifName]; !ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"chassis cluster %s %q: interface not defined", label, ifName))
+				}
+			}
+		}
+		// Check control interface is defined
+		if cc.ControlInterface != "" {
+			if _, ok := cfg.Interfaces.Interfaces[cc.ControlInterface]; !ok {
+				warnings = append(warnings, fmt.Sprintf(
+					"chassis cluster control-interface %q: interface not defined", cc.ControlInterface))
+			}
+		}
+		// Check fabric member interfaces don't overlap between fab0 and fab1
+		if cc.FabricInterface != "" && cc.Fabric1Interface != "" {
+			fab0Members := make(map[string]bool)
+			if f0 := cfg.Interfaces.Interfaces[cc.FabricInterface]; f0 != nil {
+				for _, m := range f0.FabricMembers {
+					fab0Members[m] = true
+				}
+			}
+			if f1 := cfg.Interfaces.Interfaces[cc.Fabric1Interface]; f1 != nil {
+				for _, m := range f1.FabricMembers {
+					if fab0Members[m] {
+						warnings = append(warnings, fmt.Sprintf(
+							"chassis cluster: fabric member %q shared between %s and %s",
+							m, cc.FabricInterface, cc.Fabric1Interface))
+					}
+				}
+			}
+		}
+	}
+
 	// Validate strict-vip-ownership requires reth-vrrp
 	if cc := cfg.Chassis.Cluster; cc != nil && !cc.RethVRRP {
 		for _, rg := range cc.RedundancyGroups {
