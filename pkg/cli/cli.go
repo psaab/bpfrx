@@ -3174,6 +3174,13 @@ func (c *CLI) showFlowSession(args []string) error {
 
 	count := 0
 
+	// In cluster mode, print node header before local sessions.
+	clusterMode := c.cluster != nil
+	if clusterMode && !f.summary {
+		fmt.Printf("node%d:\n", c.cluster.NodeID())
+		fmt.Println("--------------------------------------------------------------------------")
+	}
+
 	// Summary counters for protocol/zone/NAT breakdown
 	var byProto map[uint8]int
 	var byZonePair map[string]int
@@ -3512,7 +3519,147 @@ func (c *CLI) showFlowSession(args []string) error {
 		return nil
 	}
 	fmt.Printf("Total sessions: %d\n", count)
+
+	// Fetch and display peer node sessions in cluster mode.
+	if clusterMode && c.cluster.PeerAlive() {
+		if peerResp := c.fetchPeerSessions(f); peerResp != nil {
+			fmt.Println()
+			fmt.Printf("node%d:\n", peerResp.NodeId)
+			fmt.Println("--------------------------------------------------------------------------")
+			if f.brief {
+				fmt.Printf("%-5s %-22s %-22s %-5s %-20s %-3s %-5s %5s %s\n",
+					"ID", "Source", "Destination", "Proto", "Zone", "NAT", "State", "Age", "Pkts(f/r)")
+				for i, se := range peerResp.Sessions {
+					inZone := se.IngressZoneName
+					if inZone == "" {
+						inZone = fmt.Sprintf("%d", se.IngressZone)
+					}
+					outZone := se.EgressZoneName
+					if outZone == "" {
+						outZone = fmt.Sprintf("%d", se.EgressZone)
+					}
+					natFlag := " "
+					if se.Nat != "" {
+						if strings.Contains(se.Nat, "SNAT") {
+							natFlag = "S"
+						}
+						if strings.Contains(se.Nat, "DNAT") || strings.HasPrefix(se.Nat, "dst") {
+							natFlag = "D"
+						}
+					}
+					st := se.State
+					if len(st) > 5 {
+						st = st[:5]
+					}
+					fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
+						i+1,
+						fmt.Sprintf("%s:%d", se.SrcAddr, se.SrcPort),
+						fmt.Sprintf("%s:%d", se.DstAddr, se.DstPort),
+						se.Protocol, inZone+"->"+outZone, natFlag,
+						st, se.AgeSeconds,
+						se.FwdPackets, se.RevPackets)
+				}
+			} else {
+				for i, se := range peerResp.Sessions {
+					polDisplay := se.PolicyName
+					if polDisplay == "" {
+						polDisplay = fmt.Sprintf("%d", se.PolicyId)
+					}
+					fmt.Printf("Session ID: %d, Policy: %s, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
+						i+1, polDisplay, se.State, se.TimeoutSeconds, se.AgeSeconds, se.IdleSeconds)
+					inZone := se.IngressZoneName
+					if inZone == "" {
+						inZone = fmt.Sprintf("%d", se.IngressZone)
+					}
+					outZone := se.EgressZoneName
+					if outZone == "" {
+						outZone = fmt.Sprintf("%d", se.EgressZone)
+					}
+					fmt.Printf("  In: %s:%d --> %s:%d;%s, Zone: %s -> %s\n",
+						se.SrcAddr, se.SrcPort, se.DstAddr, se.DstPort,
+						se.Protocol, inZone, outZone)
+					if se.Nat != "" {
+						fmt.Printf("  NAT: %s\n", se.Nat)
+					}
+					if se.Application != "" {
+						fmt.Printf("  Application: %s\n", se.Application)
+					}
+					fmt.Printf("  Packets: %d/%d, Bytes: %d/%d\n",
+						se.FwdPackets, se.RevPackets, se.FwdBytes, se.RevBytes)
+				}
+			}
+			fmt.Printf("Total sessions: %d\n", peerResp.Total)
+		}
+	}
 	return nil
+}
+
+// fetchPeerSessions dials the cluster peer's gRPC and returns its full session list.
+func (c *CLI) fetchPeerSessions(f sessionFilter) *pb.GetSessionsResponse {
+	if c.fabricPeerAddrFn == nil {
+		return nil
+	}
+	peerIP := c.fabricPeerAddrFn()
+	if peerIP == "" {
+		return nil
+	}
+	peerAddr := fmt.Sprintf("%s:50051", peerIP)
+
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if c.fabricVRFDevice != "" {
+		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Control: func(network, address string, rc syscall.RawConn) error {
+					var err error
+					rc.Control(func(fd uintptr) {
+						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, c.fabricVRFDevice)
+					})
+					return err
+				},
+			}
+			return dialer.DialContext(ctx, "tcp", addr)
+		}))
+	}
+	conn, err := grpc.NewClient(peerAddr, dialOpts...)
+	if err != nil {
+		slog.Warn("failed to dial peer for sessions", "err", err)
+		return nil
+	}
+	defer conn.Close()
+
+	client := pb.NewBpfrxServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req := &pb.GetSessionsRequest{Limit: 10000}
+	if f.proto != 0 {
+		req.Protocol = strings.ToUpper(protoNameFromNum(f.proto))
+	}
+	if f.srcNet != nil {
+		req.SourcePrefix = f.srcNet.String()
+	}
+	if f.dstNet != nil {
+		req.DestinationPrefix = f.dstNet.String()
+	}
+	if f.srcPort != 0 {
+		req.SourcePort = uint32(f.srcPort)
+	}
+	if f.dstPort != 0 {
+		req.DestinationPort = uint32(f.dstPort)
+	}
+	if f.natOnly {
+		req.NatOnly = true
+	}
+	if f.appName != "" {
+		req.Application = f.appName
+	}
+
+	resp, err := client.GetSessions(ctx, req)
+	if err != nil {
+		slog.Warn("failed to fetch peer sessions", "err", err)
+		return nil
+	}
+	return resp
 }
 
 // fetchPeerSessionSummary dials the cluster peer's gRPC and returns its session summary.

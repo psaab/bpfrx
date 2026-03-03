@@ -1092,7 +1092,7 @@ func (c *ctl) showScreen() error {
 }
 
 func (c *ctl) showFlowSession(args []string) error {
-	req := &pb.GetSessionsRequest{Limit: 100}
+	req := &pb.GetSessionsRequest{Limit: 100, IncludePeer: true}
 	brief := false
 	// Parse filter arguments (matches local CLI's session filter syntax)
 	for i := 0; i < len(args); i++ {
@@ -1168,6 +1168,27 @@ func (c *ctl) showFlowSession(args []string) error {
 		return fmt.Errorf("%v", err)
 	}
 
+	hasPeer := resp.Peer != nil
+
+	if hasPeer {
+		printNodeSessionHeader(int(resp.NodeId))
+	}
+	printSessionEntries(resp, brief)
+
+	if hasPeer {
+		fmt.Println()
+		printNodeSessionHeader(int(resp.Peer.NodeId))
+		printSessionEntries(resp.Peer, brief)
+	}
+	return nil
+}
+
+func printNodeSessionHeader(nodeID int) {
+	fmt.Printf("node%d:\n", nodeID)
+	fmt.Println("--------------------------------------------------------------------------")
+}
+
+func printSessionEntries(resp *pb.GetSessionsResponse, brief bool) {
 	if brief {
 		fmt.Printf("%-5s %-22s %-22s %-5s %-20s %-3s %-5s %5s %s\n",
 			"ID", "Source", "Destination", "Proto", "Zone", "NAT", "State", "Age", "Pkts(f/r)")
@@ -1202,7 +1223,7 @@ func (c *ctl) showFlowSession(args []string) error {
 				se.FwdPackets, se.RevPackets)
 		}
 		fmt.Printf("Total sessions: %d\n", resp.Total)
-		return nil
+		return
 	}
 
 	for i, se := range resp.Sessions {
@@ -1233,7 +1254,6 @@ func (c *ctl) showFlowSession(args []string) error {
 			se.FwdPackets, se.RevPackets, se.FwdBytes, se.RevBytes)
 	}
 	fmt.Printf("Total sessions: %d\n", resp.Total)
-	return nil
 }
 
 func (c *ctl) showSessionSummary() error {

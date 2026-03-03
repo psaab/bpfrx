@@ -245,12 +245,15 @@ message GetSessionsRequest {
   uint32 destination_port = 8;
   bool nat_only = 9;              // show only NAT sessions
   string application = 10;        // application name filter (e.g. "junos-http")
+  bool include_peer = 11;         // fetch sessions from cluster peer too
 }
 message GetSessionsResponse {
   int32 total = 1;
   int32 limit = 2;
   int32 offset = 3;
   repeated SessionEntry sessions = 4;
+  int32 node_id = 5;              // cluster node ID (0, 1, ...)
+  GetSessionsResponse peer = 6;   // peer node sessions (nil if standalone)
 }
 message SessionEntry {
   string src_addr = 1;

@@ -747,7 +747,7 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 	return resp, nil
 }
 
-func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
+func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
@@ -894,12 +894,51 @@ func (s *Server) GetSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb
 		return true
 	})
 
-	return &pb.GetSessionsResponse{
+	resp := &pb.GetSessionsResponse{
 		Total:    int32(idx),
 		Limit:    int32(limit),
 		Offset:   int32(offset),
 		Sessions: all,
-	}, nil
+	}
+
+	// Set node ID from cluster manager (0 if standalone).
+	if s.cluster != nil {
+		resp.NodeId = int32(s.cluster.NodeID())
+	}
+
+	// Fetch peer sessions if requested and in cluster mode.
+	if req.GetIncludePeer() && s.cluster != nil && s.cluster.PeerAlive() {
+		conn, err := s.dialPeer()
+		if err == nil {
+			defer conn.Close()
+			client := pb.NewBpfrxServiceClient(conn)
+			peerCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			// Forward all filters but NOT include_peer — prevents recursion.
+			peerReq := &pb.GetSessionsRequest{
+				Limit:             req.Limit,
+				Offset:            req.Offset,
+				Zone:              req.Zone,
+				Protocol:          req.Protocol,
+				SourcePrefix:      req.SourcePrefix,
+				DestinationPrefix: req.DestinationPrefix,
+				SourcePort:        req.SourcePort,
+				DestinationPort:   req.DestinationPort,
+				NatOnly:           req.NatOnly,
+				Application:       req.Application,
+			}
+			peerResp, err := client.GetSessions(peerCtx, peerReq)
+			if err != nil {
+				slog.Warn("failed to fetch peer sessions", "err", err)
+			} else {
+				resp.Peer = peerResp
+			}
+		} else {
+			slog.Warn("failed to dial peer for sessions", "err", err)
+		}
+	}
+
+	return resp, nil
 }
 
 func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummaryRequest) (*pb.GetSessionSummaryResponse, error) {
