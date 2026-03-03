@@ -1132,6 +1132,27 @@ func clearDadFailed(ifName string) {
 	}
 }
 
+// removeAutoLinkLocal removes the kernel auto-generated link-local IPv6 address
+// from a RETH member interface. With addr_gen_mode=1 set, no new link-local will
+// be created on link-up, but a stale one may remain from before the sysctl change.
+func removeAutoLinkLocal(ifName string) {
+	link, err := netlink.LinkByName(ifName)
+	if err != nil {
+		return
+	}
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
+	if err != nil {
+		return
+	}
+	for _, addr := range addrs {
+		if addr.IP.IsLinkLocalUnicast() {
+			if err := netlink.AddrDel(link, &addr); err == nil {
+				slog.Info("removed auto link-local from RETH member", "iface", ifName, "addr", addr.IP)
+			}
+		}
+	}
+}
+
 func isInteractive() bool {
 	_, err := unix.IoctlGetTermios(int(os.Stdin.Fd()), unix.TCGETS)
 	return err == nil
@@ -1390,11 +1411,18 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			// some deployments; disable to avoid DAD failures.
 			dadPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", linuxName)
 			os.WriteFile(dadPath, []byte("0"), 0644)
+			// Suppress auto link-local generation on RETH member interfaces.
+			// The virtual MAC triggers a kernel-generated link-local (fe80::...)
+			// which causes continuous MLDv2 multicast reports on the L2 segment.
+			// VIPs are managed explicitly; auto link-locals are unnecessary.
+			addrGenPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/addr_gen_mode", linuxName)
+			os.WriteFile(addrGenPath, []byte("1"), 0644)
 			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
 			if err := programRethMAC(linuxName, mac); err != nil {
 				slog.Warn("failed to set RETH MAC", "iface", linuxName, "mac", mac, "err", err)
 			}
 			clearDadFailed(linuxName)
+			removeAutoLinkLocal(linuxName)
 
 			// Re-disable VLAN RX offload after MAC programming.
 			// The iavf VF driver resets ethtool features (including
@@ -1418,15 +1446,20 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 					if l.Attrs().ParentIndex != parentIdx {
 						continue
 					}
+					subName := l.Attrs().Name
+					// Suppress auto link-local on VLAN sub-interfaces too.
+					subAddrGen := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/addr_gen_mode", subName)
+					os.WriteFile(subAddrGen, []byte("1"), 0644)
 					if !bytes.Equal(l.Attrs().HardwareAddr, mac) {
 						if err := netlink.LinkSetHardwareAddr(l, mac); err != nil {
 							slog.Warn("failed to propagate MAC to VLAN sub-interface",
-								"iface", l.Attrs().Name, "err", err)
+								"iface", subName, "err", err)
 						} else {
 							slog.Info("propagated RETH MAC to VLAN sub-interface",
-								"iface", l.Attrs().Name, "mac", mac)
+								"iface", subName, "mac", mac)
 						}
 					}
+					removeAutoLinkLocal(subName)
 				}
 			}
 		}
