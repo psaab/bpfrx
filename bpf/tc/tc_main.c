@@ -80,6 +80,18 @@ int tc_main_prog(struct __sk_buff *skb)
 	if (zone_ptr)
 		meta->egress_zone = zone_ptr->zone_id;
 
+	/* Suppress outgoing MLDv2 reports on RETH member interfaces.
+	 * The kernel's IPv6 stack sends periodic MLDv2 listener reports
+	 * for multicast groups joined by VIP addresses — unnecessary noise
+	 * on a firewall that manages addresses explicitly.
+	 * MLDv2 reports go to ff02::16 → Ethernet 33:33:00:00:00:16. */
+	if (zone_ptr && zone_ptr->rg_id > 0 &&
+	    eth->h_dest[0] == 0x33 && eth->h_dest[1] == 0x33 &&
+	    eth->h_dest[2] == 0x00 && eth->h_dest[3] == 0x00 &&
+	    eth->h_dest[4] == 0x00 && eth->h_dest[5] == 0x16) {
+		return TC_ACT_SHOT;
+	}
+
 	TRACE_TC_MAIN(meta);
 
 	/* Tail call to egress screen */
