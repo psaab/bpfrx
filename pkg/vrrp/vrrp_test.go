@@ -255,6 +255,7 @@ func TestCollectRethInstances_ConfigurableInterval(t *testing.T) {
 		},
 		Chassis: config.ChassisConfig{
 			Cluster: &config.ClusterConfig{
+				RethVRRP:              true,
 				RethAdvertiseInterval: 50,
 				RedundancyGroups: []*config.RedundancyGroup{
 					{ID: 1, GratuitousARPCount: 5},
@@ -887,6 +888,7 @@ func TestCollectRethInstances_PreemptFromRGConfig(t *testing.T) {
 		},
 		Chassis: config.ChassisConfig{
 			Cluster: &config.ClusterConfig{
+				RethVRRP: true,
 				RedundancyGroups: []*config.RedundancyGroup{
 					{ID: 1, Preempt: true},
 					{ID: 2, Preempt: false},

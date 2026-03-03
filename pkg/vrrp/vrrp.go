@@ -69,6 +69,11 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 	if cfg == nil {
 		return nil
 	}
+	// Unless reth-vrrp is explicitly enabled, the cluster state machine
+	// directly manages VIPs/GARPs — skip RETH VRRP instance creation.
+	if cc := cfg.Chassis.Cluster; cc != nil && !cc.RethVRRP {
+		return nil
+	}
 	rethToPhys := cfg.RethToPhysical()
 
 	// Read cluster-level settings for RETH VRRP instances.
@@ -168,4 +173,67 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 		}
 	}
 	return instances
+}
+
+// RethVIPsForRG returns the VIPs (CIDR strings) per Linux interface name for
+// RETH interfaces belonging to the given redundancy group. Used by
+// direct VIP mode (default when reth-vrrp is not set) where the daemon manages VIPs without VRRP.
+func RethVIPsForRG(cfg *config.Config, rgID int) map[string][]string {
+	if cfg == nil {
+		return nil
+	}
+	rethToPhys := cfg.RethToPhysical()
+
+	result := make(map[string][]string)
+	for _, name := range sortedIfNames(cfg) {
+		ifc := cfg.Interfaces.Interfaces[name]
+		if ifc.RedundancyGroup != rgID {
+			continue
+		}
+
+		physName := ifc.Name
+		if phys, ok := rethToPhys[ifc.Name]; ok {
+			physName = phys
+		}
+		linuxName := config.LinuxIfName(physName)
+
+		unitNums := make([]int, 0, len(ifc.Units))
+		for n := range ifc.Units {
+			unitNums = append(unitNums, n)
+		}
+		sort.Ints(unitNums)
+
+		if ifc.VlanTagging {
+			for _, n := range unitNums {
+				unit := ifc.Units[n]
+				if len(unit.Addresses) == 0 {
+					continue
+				}
+				subIface := linuxName
+				if unit.VlanID > 0 {
+					subIface = fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
+				}
+				result[subIface] = append(result[subIface], unit.Addresses...)
+			}
+		} else {
+			var vips []string
+			for _, n := range unitNums {
+				vips = append(vips, ifc.Units[n].Addresses...)
+			}
+			if len(vips) > 0 {
+				result[linuxName] = append(result[linuxName], vips...)
+			}
+		}
+	}
+	return result
+}
+
+// sortedIfNames returns sorted interface names from config for deterministic iteration.
+func sortedIfNames(cfg *config.Config) []string {
+	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

@@ -255,9 +255,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	// On fresh cluster daemon start, suppress VRRP preemption until session
 	// bulk sync completes (or timeout) to avoid preempt-before-sync outages.
+	// Only applies when reth-vrrp is enabled — otherwise no RETH VRRP instances.
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
 		cc := cfg.Chassis.Cluster
-		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
+		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" && cc.RethVRRP {
 			d.vrrpMgr.SetSyncHold(30 * time.Second)
 		}
 	}
@@ -870,6 +871,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
+	// Direct-mode: remove VIPs before VRRP stop (VRRP won't manage them).
+	if d.isNoRethVRRP() && cfg.Chassis.Cluster != nil {
+		for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+			d.directRemoveVIPs(rg.ID)
+		}
+	}
+
 	// Stop VRRP manager (removes VIPs, sends priority-0).
 	if d.vrrpMgr != nil {
 		d.vrrpMgr.Stop()
@@ -1427,7 +1435,17 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// 2.6b. Reconcile VRRP VIPs after RETH MAC programming.
 	// programRethMAC brings the interface DOWN/UP which removes all
 	// addresses including VRRP VIPs. Re-add them on MASTER instances.
-	if d.vrrpMgr != nil {
+	if d.isNoRethVRRP() {
+		// Direct mode: re-add VIPs for each RG where we are primary.
+		if d.cluster != nil {
+			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+				if d.cluster.IsLocalPrimary(rg.ID) {
+					d.directAddVIPs(rg.ID)
+					go d.directSendGARPs(rg.ID)
+				}
+			}
+		}
+	} else if d.vrrpMgr != nil {
 		d.vrrpMgr.ReconcileVIPs()
 	}
 
@@ -4196,25 +4214,29 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case ev := <-d.cluster.Events():
+			noRethVRRP := d.isNoRethVRRP()
+
 			// Immediate VRRP priority + resign on state transitions.
 			// ResignRG sets priority=0 to prevent re-election race.
 			// On Primary transition, restore priority=200 immediately
 			// so the instance can accept the peer's resignation and
 			// send adverts at the correct priority.
-			if ev.OldState == cluster.StatePrimary &&
-				(ev.NewState == cluster.StateSecondary || ev.NewState == cluster.StateSecondaryHold) {
-				d.vrrpMgr.ResignRG(ev.GroupID)
-			}
-			if ev.NewState == cluster.StatePrimary {
-				d.vrrpMgr.UpdateRGPriority(ev.GroupID, 200)
-				// With preempt=false, VRRP won't self-elect even at
-				// higher priority. Force MASTER since cluster state
-				// is authoritative (e.g. after failover reset).
-				// Only do this for intentional promotions (Secondary →
-				// Primary), NOT on initial boot (SecondaryHold → Primary)
-				// where VRRP should follow its own election timer.
-				if ev.OldState == cluster.StateSecondary {
-					d.vrrpMgr.ForceRGMaster(ev.GroupID)
+			if !noRethVRRP {
+				if ev.OldState == cluster.StatePrimary &&
+					(ev.NewState == cluster.StateSecondary || ev.NewState == cluster.StateSecondaryHold) {
+					d.vrrpMgr.ResignRG(ev.GroupID)
+				}
+				if ev.NewState == cluster.StatePrimary {
+					d.vrrpMgr.UpdateRGPriority(ev.GroupID, 200)
+					// With preempt=false, VRRP won't self-elect even at
+					// higher priority. Force MASTER since cluster state
+					// is authoritative (e.g. after failover reset).
+					// Only do this for intentional promotions (Secondary →
+					// Primary), NOT on initial boot (SecondaryHold → Primary)
+					// where VRRP should follow its own election timer.
+					if ev.OldState == cluster.StateSecondary {
+						d.vrrpMgr.ForceRGMaster(ev.GroupID)
+					}
 				}
 			}
 
@@ -4250,6 +4272,20 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// succeed for synced sessions.
 				d.removeBlackholeRoutes(ev.GroupID)
 				go d.warmNeighborCache()
+
+				// no-reth-vrrp direct mode: add VIPs + send GARPs +
+				// start per-RG services on primary transition.
+				if noRethVRRP {
+					d.directAddVIPs(ev.GroupID)
+					go d.directSendGARPs(ev.GroupID)
+					d.applyRethServicesForRG(ev.GroupID)
+					go func() {
+						if cfg := d.store.ActiveConfig(); cfg != nil {
+							d.resolveNeighbors(cfg)
+						}
+					}()
+					go d.RefreshFabricFwd()
+				}
 			} else {
 				// Deactivation: blackhole routes first (if transitioning
 				// to inactive), then clear rg_active.
@@ -4265,31 +4301,42 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 						s.ApplyIfCurrent(tr)
 					}
 				}
+
+				// no-reth-vrrp direct mode: remove VIPs + stop services
+				// on secondary transition.
+				if noRethVRRP && tr.Changed && !tr.Active {
+					d.directRemoveVIPs(ev.GroupID)
+					d.clearRethServicesForRG(ev.GroupID)
+				}
 			}
 			if d.dp != nil {
 				d.dp.BumpFIBGeneration()
 			}
 
 			// Strict VIP ownership: suppress GARP on secondary, allow on primary.
-			if s.IsStrictVIPOwnership() {
+			// Not applicable with no-reth-vrrp (no VRRP instances).
+			if !noRethVRRP && s.IsStrictVIPOwnership() {
 				d.vrrpMgr.SetGARPSuppression(ev.GroupID, !isPrimary)
 			}
 
 			// Debounced VRRP priority update — 500ms coalesce window.
-			if vrrpTimer != nil {
-				vrrpTimer.Stop()
-			}
-			vrrpTimer = time.AfterFunc(500*time.Millisecond, func() {
-				if cfg := d.store.ActiveConfig(); cfg != nil {
-					localPri := d.cluster.LocalPriorities()
-					var all []*vrrp.Instance
-					all = append(all, vrrp.CollectInstances(cfg)...)
-					all = append(all, vrrp.CollectRethInstances(cfg, localPri)...)
-					if err := d.vrrpMgr.UpdateInstances(all); err != nil {
-						slog.Warn("cluster: failed to update VRRP instances", "err", err)
-					}
+			// Skipped in no-reth-vrrp mode (no RETH VRRP instances to update).
+			if !noRethVRRP {
+				if vrrpTimer != nil {
+					vrrpTimer.Stop()
 				}
-			})
+				vrrpTimer = time.AfterFunc(500*time.Millisecond, func() {
+					if cfg := d.store.ActiveConfig(); cfg != nil {
+						localPri := d.cluster.LocalPriorities()
+						var all []*vrrp.Instance
+						all = append(all, vrrp.CollectInstances(cfg)...)
+						all = append(all, vrrp.CollectRethInstances(cfg, localPri)...)
+						if err := d.vrrpMgr.UpdateInstances(all); err != nil {
+							slog.Warn("cluster: failed to update VRRP instances", "err", err)
+						}
+					}
+				})
+			}
 
 			// RG0-specific: config ownership and IPsec SA re-initiation.
 			if ev.GroupID == 0 {
@@ -4490,12 +4537,15 @@ func (d *Daemon) reconcileRGState() {
 	}
 
 	// Evaluate per-RG readiness for the takeover gate.
+	noRethVRRP := d.isNoRethVRRP()
 	if mon := d.cluster.Monitor(); mon != nil {
 		for _, rgID := range rgIDs {
 			ifReady, ifReasons := mon.RGInterfaceReady(rgID)
 			var vrrpReady bool
 			var vrrpReasons []string
-			if d.vrrpMgr != nil {
+			if noRethVRRP {
+				vrrpReady = true // no RETH VRRP instances = always ready
+			} else if d.vrrpMgr != nil {
 				vrrpReady, vrrpReasons = d.vrrpMgr.RGVRRPReady(rgID)
 			} else {
 				vrrpReady = true // no VRRP = always ready
@@ -4568,6 +4618,7 @@ func (d *Daemon) reconcileRGState() {
 		// continuous mismatch to avoid fighting transient states (VRRP
 		// sync-hold, election timers, hitless restart). Skip entirely
 		// during sync-hold when VRRP is intentionally suppressing preempt.
+		// Also skip when no-reth-vrrp is active (no RETH VRRP instances).
 		//
 		// NeedsMaster: only re-send priority update — do NOT call
 		// ForceRGMaster here. ForceRGMaster overrides preempt=false,
@@ -4577,7 +4628,7 @@ func (d *Daemon) reconcileRGState() {
 		// skips ForceRGMaster so VRRP respects non-preempt config.
 		// The priority update fixes the dropped-event case (#86) while
 		// letting VRRP's preempt logic decide whether to transition.
-		if d.vrrpMgr != nil && !d.vrrpMgr.InSyncHold() {
+		if d.vrrpMgr != nil && !d.vrrpMgr.InSyncHold() && !noRethVRRP {
 			switch s.CheckVRRPPosture(time.Now()) {
 			case vrrpPostureNeedsMaster:
 				slog.Warn("reconcile: VRRP posture mismatch — cluster=primary but VRRP!=MASTER, re-sending priority",
@@ -4588,6 +4639,15 @@ func (d *Daemon) reconcileRGState() {
 					"rg", rgID)
 				d.vrrpMgr.ResignRG(rgID)
 			}
+		}
+
+		// Direct-mode VIP safety net: idempotently re-add VIPs on
+		// active RGs to recover from missed events or transient
+		// address removal (e.g. networkd reload). Only adds — never
+		// removes on inactive (event-driven only to avoid fighting
+		// transients).
+		if noRethVRRP && tr.Active {
+			d.directAddVIPs(rgID)
 		}
 
 		// RA/DHCP service reconciliation (#93): safety net for dropped
@@ -5037,11 +5097,133 @@ func (d *Daemon) warmNeighborCache() {
 
 // clusterConfig returns the current cluster config or nil.
 func (d *Daemon) clusterConfig() *config.ClusterConfig {
+	if d.store == nil {
+		return nil
+	}
 	cfg := d.store.ActiveConfig()
 	if cfg == nil || cfg.Chassis.Cluster == nil {
 		return nil
 	}
 	return cfg.Chassis.Cluster
+}
+
+// isNoRethVRRP returns true when the cluster is configured without reth-vrrp,
+// meaning the daemon directly manages VIPs/GARPs without VRRP instances.
+// This is the default for cluster mode; set reth-vrrp to use VRRP instead.
+func (d *Daemon) isNoRethVRRP() bool {
+	cc := d.clusterConfig()
+	return cc != nil && !cc.RethVRRP
+}
+
+// directAddVIPs adds VIPs for RETH interfaces in the given RG using netlink.
+// IPv6 addresses are added with IFA_F_NODAD to avoid DAD delays.
+// Idempotent — skips addresses that already exist.
+func (d *Daemon) directAddVIPs(rgID int) {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	vipMap := vrrp.RethVIPsForRG(cfg, rgID)
+	for ifName, addrs := range vipMap {
+		link, err := netlink.LinkByName(ifName)
+		if err != nil {
+			slog.Warn("directAddVIPs: interface not found", "iface", ifName, "err", err)
+			continue
+		}
+		for _, cidr := range addrs {
+			addr, err := netlink.ParseAddr(cidr)
+			if err != nil {
+				slog.Warn("directAddVIPs: bad address", "addr", cidr, "err", err)
+				continue
+			}
+			if addr.IP.To4() == nil {
+				addr.Flags = unix.IFA_F_NODAD
+			}
+			if err := netlink.AddrAdd(link, addr); err != nil {
+				if !errors.Is(err, syscall.EEXIST) {
+					slog.Warn("directAddVIPs: failed to add", "iface", ifName, "addr", cidr, "err", err)
+				}
+			} else {
+				slog.Info("directAddVIPs: added VIP", "iface", ifName, "addr", cidr)
+			}
+		}
+	}
+}
+
+// directRemoveVIPs removes VIPs for RETH interfaces in the given RG.
+// Ignores "not found" errors for idempotency.
+func (d *Daemon) directRemoveVIPs(rgID int) {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	vipMap := vrrp.RethVIPsForRG(cfg, rgID)
+	for ifName, addrs := range vipMap {
+		link, err := netlink.LinkByName(ifName)
+		if err != nil {
+			continue // interface may not exist yet
+		}
+		for _, cidr := range addrs {
+			addr, err := netlink.ParseAddr(cidr)
+			if err != nil {
+				continue
+			}
+			if err := netlink.AddrDel(link, addr); err != nil {
+				if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ESRCH) {
+					slog.Warn("directRemoveVIPs: failed to remove", "iface", ifName, "addr", cidr, "err", err)
+				}
+			} else {
+				slog.Info("directRemoveVIPs: removed VIP", "iface", ifName, "addr", cidr)
+			}
+		}
+	}
+}
+
+// directSendGARPs sends gratuitous ARP/IPv6 NA bursts for all VIPs in the
+// given RG. Reads per-RG GratuitousARPCount (default 3).
+func (d *Daemon) directSendGARPs(rgID int) {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	// Read per-RG GARP count.
+	garpCount := 3
+	if cc := cfg.Chassis.Cluster; cc != nil {
+		for _, rg := range cc.RedundancyGroups {
+			if rg.ID == rgID && rg.GratuitousARPCount > 0 {
+				garpCount = rg.GratuitousARPCount
+			}
+		}
+	}
+
+	vipMap := vrrp.RethVIPsForRG(cfg, rgID)
+	for ifName, addrs := range vipMap {
+		for _, cidr := range addrs {
+			ip, _, err := net.ParseCIDR(cidr)
+			if err != nil {
+				continue
+			}
+			if ip.To4() != nil {
+				if err := cluster.SendGratuitousARPBurst(ifName, ip, garpCount); err != nil {
+					slog.Warn("directSendGARPs: GARP failed", "iface", ifName, "ip", ip, "err", err)
+				}
+				// Send ARP probe to gateway (.1) to update upstream ARP caches.
+				_, ipNet, _ := net.ParseCIDR(cidr)
+				if ipNet != nil {
+					gw := make(net.IP, len(ipNet.IP))
+					copy(gw, ipNet.IP)
+					gw[len(gw)-1] = 1
+					if err := cluster.SendARPProbe(ifName, gw); err != nil {
+						slog.Warn("directSendGARPs: ARP probe failed", "iface", ifName, "gw", gw, "err", err)
+					}
+				}
+			} else {
+				if err := cluster.SendGratuitousIPv6Burst(ifName, ip, garpCount); err != nil {
+					slog.Warn("directSendGARPs: IPv6 NA failed", "iface", ifName, "ip", ip, "err", err)
+				}
+			}
+		}
+	}
 }
 
 // syncIPsecSAPeriodic runs on the primary node, periodically syncing active IPsec

@@ -81,6 +81,7 @@ type ClusterConfig struct {
 	HitlessRestart        bool   // preserve BPF state on shutdown (default false in HA — fail-closed)
 	PeerFencing           string // peer fencing action on heartbeat timeout: "", "disable-rg"
 	TakeoverHoldTime      int    // milliseconds, 0=default(3000) — readiness gate hold time before allowing primary takeover
+	RethVRRP              bool   // use VRRP for RETH failover (default: cluster manages VIPs directly)
 	RedundancyGroups      []*RedundancyGroup
 }
 
