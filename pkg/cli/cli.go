@@ -3221,6 +3221,13 @@ func (c *CLI) showFlowSession(args []string) error {
 
 	now := monotonicSeconds()
 
+	// Collect sessions for sorted display (deterministic order across cluster nodes).
+	type sessEntryV4 struct {
+		key dataplane.SessionKey
+		val dataplane.SessionValue
+	}
+	var v4Entries []sessEntryV4
+
 	// IPv4 sessions
 	err := c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
@@ -3249,6 +3256,22 @@ func (c *CLI) showFlowSession(args []string) error {
 			return true
 		}
 
+		v4Entries = append(v4Entries, sessEntryV4{key, val})
+		return true
+	})
+	if err != nil {
+		return fmt.Errorf("iterate sessions: %w", err)
+	}
+
+	// Sort by SessionID for deterministic display order across cluster nodes.
+	sort.Slice(v4Entries, func(i, j int) bool {
+		return v4Entries[i].val.SessionID < v4Entries[j].val.SessionID
+	})
+
+	for idx, entry := range v4Entries {
+		key := entry.key
+		val := entry.val
+
 		srcIP := net.IP(key.SrcIP[:])
 		dstIP := net.IP(key.DstIP[:])
 		srcPort := ntohs(key.SrcPort)
@@ -3267,7 +3290,7 @@ func (c *CLI) showFlowSession(args []string) error {
 
 		sid := val.SessionID
 		if sid == 0 {
-			sid = uint64(count)
+			sid = uint64(idx + 1)
 		}
 
 		if f.brief {
@@ -3292,7 +3315,7 @@ func (c *CLI) showFlowSession(args []string) error {
 				protoName, inZone+"->"+outZone, natFlag,
 				stateName[:min(5, len(stateName))], age,
 				val.FwdPackets, val.RevPackets)
-			return true
+			continue
 		}
 
 		polName := policyNames[val.PolicyID]
@@ -3337,13 +3360,15 @@ func (c *CLI) showFlowSession(args []string) error {
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
 			outIf, val.RevPackets, val.RevBytes)
 		fmt.Println()
-		return true
-	})
-	if err != nil {
-		return fmt.Errorf("iterate sessions: %w", err)
 	}
 
 	// IPv6 sessions
+	type sessEntryV6 struct {
+		key dataplane.SessionKeyV6
+		val dataplane.SessionValueV6
+	}
+	var v6Entries []sessEntryV6
+
 	err = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
@@ -3371,6 +3396,22 @@ func (c *CLI) showFlowSession(args []string) error {
 			return true
 		}
 
+		v6Entries = append(v6Entries, sessEntryV6{key, val})
+		return true
+	})
+	if err != nil {
+		return fmt.Errorf("iterate sessions_v6: %w", err)
+	}
+
+	// Sort by SessionID for deterministic display order across cluster nodes.
+	sort.Slice(v6Entries, func(i, j int) bool {
+		return v6Entries[i].val.SessionID < v6Entries[j].val.SessionID
+	})
+
+	for idx, entry := range v6Entries {
+		key := entry.key
+		val := entry.val
+
 		srcIP := net.IP(key.SrcIP[:])
 		dstIP := net.IP(key.DstIP[:])
 		srcPort := ntohs(key.SrcPort)
@@ -3389,7 +3430,7 @@ func (c *CLI) showFlowSession(args []string) error {
 
 		sid6 := val.SessionID
 		if sid6 == 0 {
-			sid6 = uint64(count)
+			sid6 = uint64(idx + 1)
 		}
 
 		if f.brief {
@@ -3414,7 +3455,7 @@ func (c *CLI) showFlowSession(args []string) error {
 				protoName, inZone+"->"+outZone, natFlag,
 				stateName[:min(5, len(stateName))], age,
 				val.FwdPackets, val.RevPackets)
-			return true
+			continue
 		}
 
 		polName := policyNames[val.PolicyID]
@@ -3459,10 +3500,6 @@ func (c *CLI) showFlowSession(args []string) error {
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
 			outIf, val.RevPackets, val.RevBytes)
 		fmt.Println()
-		return true
-	})
-	if err != nil {
-		return fmt.Errorf("iterate sessions_v6: %w", err)
 	}
 
 	if f.summary {
@@ -3537,6 +3574,10 @@ func (c *CLI) showFlowSession(args []string) error {
 	// Fetch and display peer node sessions in cluster mode.
 	if clusterMode && c.cluster.PeerAlive() {
 		if peerResp := c.fetchPeerSessions(f); peerResp != nil {
+			// Sort peer sessions by SessionID for deterministic order.
+			sort.Slice(peerResp.Sessions, func(i, j int) bool {
+				return peerResp.Sessions[i].SessionId < peerResp.Sessions[j].SessionId
+			})
 			fmt.Println()
 			fmt.Printf("node%d:\n", peerResp.NodeId)
 			fmt.Println("--------------------------------------------------------------------------")

@@ -895,6 +895,11 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 		return true
 	})
 
+	// Sort by SessionID for deterministic order across cluster nodes.
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].SessionId < all[j].SessionId
+	})
+
 	resp := &pb.GetSessionsResponse{
 		Total:    int32(idx),
 		Limit:    int32(limit),
