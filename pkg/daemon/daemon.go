@@ -134,6 +134,11 @@ type Daemon struct {
 	fabricIface1  string // secondary fabric interface (fab1)
 	fabricPeerIP1 net.IP // secondary fabric peer IP
 
+	// syncPeerAddr is the peer address used for gRPC peer dialing
+	// (session queries, config sync). Set to control link or fabric
+	// peer depending on sync transport mode.
+	syncPeerAddr string
+
 	// gRPC server reference for starting fabric listener in cluster mode.
 	grpcSrv *grpcapi.Server
 
@@ -744,6 +749,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			RAMgr:   d.ra,
 			Version: d.opts.Version,
 			FabricPeerAddrFn: func() string {
+				if d.syncPeerAddr != "" {
+					return d.syncPeerAddr
+				}
 				d.fabricMu.RLock()
 				defer d.fabricMu.RUnlock()
 				if d.fabricPeerIP != nil {
@@ -752,8 +760,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				return ""
 			},
 			FabricVRFDevice: func() string {
-				if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil && c.Chassis.Cluster.FabricInterface != "" {
-					return "vrf-mgmt"
+				if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil {
+					cc := c.Chassis.Cluster
+					if cc.ControlInterface != "" || cc.FabricInterface != "" {
+						return "vrf-mgmt"
+					}
 				}
 				return ""
 			}(),
@@ -794,6 +805,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		})
 		shell.SetVRRPManager(d.vrrpMgr)
 		shell.SetFabricPeer(func() string {
+			// Use sync peer address (control-link or fabric) for gRPC peer dial.
+			if d.syncPeerAddr != "" {
+				return d.syncPeerAddr
+			}
 			d.fabricMu.RLock()
 			defer d.fabricMu.RUnlock()
 			if d.fabricPeerIP != nil {
@@ -801,8 +816,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			return ""
 		}, func() string {
-			if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil && c.Chassis.Cluster.FabricInterface != "" {
-				return "vrf-mgmt"
+			if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil {
+				cc := c.Chassis.Cluster
+				if cc.ControlInterface != "" || cc.FabricInterface != "" {
+					return "vrf-mgmt"
+				}
 			}
 			return ""
 		}())
@@ -3795,6 +3813,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			}
 
 			d.cluster.SetSyncTransport(syncTransport)
+
+			// Store sync peer address for gRPC peer dialing (session queries etc).
+			d.syncPeerAddr = syncPeerAddr
 
 			// Start gRPC fabric listener so peer can proxy monitor requests.
 			// d.grpcSrv is set after startClusterComms returns, so we poll briefly.
