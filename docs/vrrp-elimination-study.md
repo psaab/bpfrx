@@ -1,4 +1,4 @@
-# Private RG Mastership Protocol: Replacing VRRP on Data-Plane Interfaces
+# Private RG Election: Replacing VRRP on Data-Plane Interfaces
 
 ## Problem Statement
 
@@ -8,261 +8,241 @@ VRRP on RETH interfaces floods every LAN segment with multicast traffic:
 - **IPv6:** `ff02::12` (protocol 112) every 30ms per RETH member interface
 - 2 RGs × 2 interfaces (parent + VLAN) = **4 instances × 33 pkt/s = ~132 multicast pkt/s** on each LAN segment
 
-Every host on the segment processes and discards this traffic. Every switch port floods it. This is pure overhead — the cluster already has a private control-plane interconnect (fxp1) that can carry election traffic without touching customer networks.
+Every host on the segment processes and discards this traffic. Every switch port floods it. The cluster already has a private control-plane interconnect (fxp1) carrying heartbeat traffic that includes per-RG state — we should be able to do election entirely over that private link.
 
 ## Why "Just Turn VRRP Off" Doesn't Work
 
-We tried this (`no-reth-vrrp`). It caused **dual-active** — both nodes simultaneously acted as primary, both added VIPs, both sent GARPs. The bug that exposed this was an inverted boolean (`RethVRRP` defaulting to false), but the underlying architectural problem is real:
+We tried `no-reth-vrrp`. It caused **dual-active** — both nodes simultaneously acted as primary, both added VIPs, both sent GARPs. The boolean bug (`RethVRRP` defaulting to false) exposed the issue, but the underlying architectural problem is real: the heartbeat election has a **dual-active gap in non-preempt mode**.
 
-**The heartbeat election has a race window.** Both nodes can simultaneously:
-1. Lose sight of the peer's heartbeat (network blip, CPU spike, GC pause)
-2. Independently elect themselves primary for the same RG
-3. Both add VIPs → duplicate packets, MAC table thrashing, session corruption
+## Root Cause: `electRG()` Non-Preempt Incumbent Bias
 
-VRRP prevents this because it's a **distributed consensus protocol**: when both nodes advertise as MASTER on the same VRID, the higher-priority advertisement forces the loser to BACKUP within one advertisement interval (30ms). The heartbeat has no such mechanism — it just exchanges state, each node runs election independently, and there's no tie-breaking feedback loop.
+The election code in `pkg/cluster/election.go:157-163`:
 
-**What VRRP provides that the heartbeat doesn't:**
-
-| Capability | Heartbeat | VRRP |
-|-----------|-----------|------|
-| Peer liveness detection | Yes (200ms interval) | Yes (30ms interval) |
-| Per-RG state exchange | Yes (priority, weight, state) | Yes (VRID, priority) |
-| Independent per-node election | Yes | Yes |
-| **Dual-active resolution** | **No** — both nodes can independently claim primary | **Yes** — advertisement comparison forces loser to resign |
-| **Convergence guarantee** | **No** — relies on heartbeat propagation | **Yes** — one advertisement interval resolves contention |
-
-The dual-active resolution is the critical gap. Without it, any transient loss of the heartbeat link can cause split-brain.
-
-## Proposed Solution: Private RG Mastership Protocol
-
-Run a lightweight per-RG mastership protocol over the **control link** (fxp1) — the same private point-to-point interconnect that already carries the heartbeat. The protocol provides the same dual-active prevention guarantee as VRRP but stays entirely on the control plane.
-
-### Why the Control Link, Not Fabric
-
-The control link (fxp1) is the right place for this:
-
-- **Control-plane function:** RG mastership election is a control-plane decision. The fabric links (fab0/fab1) are data-plane — they carry session sync traffic and cross-chassis packet forwarding. Mixing election traffic into the fabric data path conflates concerns.
-- **Already carries heartbeat:** The heartbeat (UDP 4784) already runs on fxp1. The RG mastership protocol is a natural companion — same link, different port (UDP 4785).
-- **Independent failure domain:** If the fabric links go down, session sync stops but election can still proceed over the control link. If the control link goes down, the heartbeat already detects this and triggers failover. Coupling election to the control link means a single link failure doesn't silently break both session sync AND election.
-- **Simpler topology:** One control link vs. dual fabric links. No need for fab0/fab1 fallback logic in the election protocol.
-
-### Design
-
-```
-  ┌──────────┐                                    ┌──────────┐
-  │   fw0    │                                    │   fw1    │
-  │          │  Heartbeat      (UDP 4784, fxp1)   │          │
-  │          ├────────────────────────────────────→│          │
-  │          │  RG Mastership  (UDP 4785, fxp1)   │          │
-  │          ├────────────────────────────────────→│          │
-  │          │←────────────────────────────────────┤          │
-  │          │                                    │          │
-  │          │  Session sync   (TCP, fab0/fab1)   │          │
-  │          ├────────────────────────────────────→│          │
-  │          │←────────────────────────────────────┤          │
-  └──────────┘                                    └──────────┘
-
-Control link (fxp1): heartbeat + RG mastership (control plane)
-Fabric links (fab0/fab1): session sync + cross-chassis forwarding (data plane)
-No VRRP multicast on LAN interfaces.
-```
-
-### Protocol: Per-RG Mastership Advertisements
-
-A single UDP socket on the control link carries **per-RG mastership advertisements** — functionally equivalent to VRRP advertisements but unicast to the peer on the private control-plane interconnect:
-
-**Wire format:**
-```
-[0:4]   Magic "BFRG"        (4 bytes)
-[4]     Version (1)          (1 byte)
-[5]     NodeID               (1 byte)
-[6:8]   ClusterID            (2 bytes, LE)
-[8]     NumEntries           (1 byte)
-[9..]   Per-RG entries (5 bytes each):
-          [0]    RGID
-          [1:3]  Priority (LE uint16, effective = base × weight/255)
-          [3]    State (0=secondary, 1=primary)
-          [4]    Epoch (monotonic counter, wraps)
-```
-
-**Behavior:**
-- Sent every **N ms** (configurable, default 50ms)
-- Unicast to peer's control-link address (same address heartbeat uses)
-- Port **4785** (adjacent to heartbeat port 4784)
-- Carries all RGs in a single compact packet
-- Each node runs independently — no request/response, pure advertisement
-- Shares the VRF/routing context with heartbeat (`vrfListenConfig`)
-
-### Dual-Active Resolution (The Key Mechanism)
-
-When a node receives a peer advertisement where the peer claims primary for the same RG:
-
-```
-if peer.state == PRIMARY && local.state == PRIMARY {
-    // Dual-active detected — resolve by priority tie-break
-    if peer.effectivePriority > local.effectivePriority {
-        // Peer wins — resign locally
-        transitionToSecondary(rgID)
-    } else if peer.effectivePriority == local.effectivePriority {
-        // Tie — lower node ID wins (deterministic)
-        if peer.nodeID < local.nodeID {
-            transitionToSecondary(rgID)
-        }
-    }
-    // else: we have higher priority, peer should resign
-    // (peer runs the same logic on our next advert → converges in 1 round)
+```go
+// Non-preempt: incumbent stays unless weight drops to 0.
+if rg.State == StatePrimary {
+    return electNoChange, "" // non-preempt: incumbent stays
 }
 ```
 
-**Convergence guarantee:** Within one advertisement interval, exactly one node resigns. Same guarantee as VRRP, but on the private control link.
+When both nodes are primary (split-brain from transient heartbeat loss), **both** hit this line and **both** return `electNoChange`. Neither yields. The peer's primary state (line 165) is only checked when `rg.State != StatePrimary`.
 
-### Peer Loss Detection
+In **preempt mode**, this self-resolves — the lower-priority node sees `localEff < peerEff` and demotes itself. But in **non-preempt mode**, incumbent bias means both stay primary forever.
 
-When advertisements stop arriving (peer died or control link down):
+**VRRP masks this gap.** When both VRRP instances advertise MASTER, RFC 5798 tie-breaking forces the loser to BACKUP within one advertisement interval. The VRRP state machine is the safety net that the cluster election lacks.
 
+## What Actually Needs to Change
+
+The heartbeat **already** carries per-RG state (GroupID, Priority, Weight, State) and **already** triggers `runElection()` on every received packet. We don't need a separate protocol — we need to fix the election and harden the direct-mode VIP management.
+
+### What the heartbeat already provides
+
+| Capability | Status |
+|-----------|--------|
+| Peer liveness detection | Done (configurable interval/threshold) |
+| Per-RG state exchange (priority, weight, state) | Done (in every heartbeat packet) |
+| Election on heartbeat reception | Done (`handlePeerHeartbeat` → `runElection`) |
+| Election on peer loss | Done (`handlePeerTimeout` → single-node election) |
+| Priority-based preemption | Done (higher effective priority wins) |
+| Node ID tie-breaking | Done (lower node ID wins ties) |
+| **Dual-active detection and resolution** | **Missing — this is the gap** |
+
+### What VRRP provides that would go away
+
+| VRRP Function | Replacement |
+|--------------|-------------|
+| VIP addition on MASTER | `directAddVIPs()` — already implemented |
+| VIP removal on BACKUP | `directRemoveVIPs()` — already implemented |
+| GARP bursts on MASTER | `directSendGARPs()` — already implemented |
+| Dual-active resolution | **Fix `electRG()` — new** |
+| Per-RG mastership reconciliation | **Harden reconcile loop — new** |
+
+## Implementation Plan
+
+### Phase 1: Fix Dual-Active in Election (Critical)
+
+**`pkg/cluster/election.go` — `electRG()` non-preempt path:**
+
+Add dual-active detection before the incumbent-stays shortcut:
+
+```go
+// Non-preempt: incumbent stays unless weight drops to 0.
+// BUT: detect dual-active (both primary) and resolve immediately.
+if rg.State == StatePrimary {
+    if peerGroup.State == StatePrimary {
+        // DUAL-ACTIVE: both nodes claim primary for this RG.
+        // Resolve by effective priority, then node ID tie-break.
+        // The lower-priority (or higher node ID) node must yield.
+        if localEff < peerEff {
+            return electLocalSecondary, "Dual-active: lower priority yields"
+        }
+        if localEff == peerEff && m.nodeID > m.peerNodeID {
+            return electLocalSecondary, "Dual-active: higher node ID yields"
+        }
+        // We win — peer should yield on its next heartbeat.
+        return electNoChange, ""
+    }
+    return electNoChange, "" // non-preempt: incumbent stays
+}
 ```
-masterDownInterval = (3 × advertInterval) + skewTime
-skewTime = ((256 - localPriority) × advertInterval) / 256
+
+**This is ~10 lines.** Both nodes receive each other's heartbeat, both see the dual-active, and the loser yields within one heartbeat interval. Same convergence guarantee as VRRP.
+
+### Phase 2: Harden `no-reth-vrrp` Direct Mode
+
+Gaps identified in the `control-link-only-reth-ownership` doc:
+
+**2a. Reconcile removes stale VIPs (not just adds)**
+
+Current code (`pkg/daemon/daemon.go:4747-4754`) only calls `directAddVIPs()` when active. Add removal:
+
+```go
+if noRethVRRP {
+    if tr.Active {
+        d.directAddVIPs(rgID)    // idempotent safety net
+    } else {
+        d.directRemoveVIPs(rgID) // remove stale VIPs on inactive RG
+    }
+}
 ```
 
-Same formula as VRRP RFC 5798. At 50ms interval, priority 100: masterDown = ~174ms. At 30ms interval: masterDown = ~104ms.
+**2b. Reconcile emits GARP on VIP correction**
 
-On timeout: feed `PeerLostForRG(rgID)` into the existing cluster election. This provides per-RG loss detection that complements the heartbeat's overall peer-liveness signal.
+If `directAddVIPs()` actually added any addresses (returns count > 0), emit a rate-limited GARP burst to update upstream MAC tables.
 
-Note: the heartbeat (200ms × 3 = 600ms) already runs on the same control link, so both will detect a control-link failure. The RG mastership protocol detects it faster due to shorter intervals, while the heartbeat serves as a backstop for overall cluster state.
+**2c. Per-RG owner epoch in cluster manager**
 
-### Integration Points
+Add `Epoch uint64` to `RedundancyGroupState`. Increment on every state transition. Include in heartbeat wire format (1 additional byte per RG, wrapping). Reject stale transitions when epoch mismatch detected.
 
-**Where it fits in the existing architecture:**
+This prevents a delayed/reordered heartbeat from causing a stale state flip after the real election has already resolved.
 
-1. **New component:** `pkg/cluster/rg_advert.go` — the per-RG advertisement sender/receiver
-2. **Socket:** UDP 4785 on control-link addresses (same local/peer addresses as heartbeat on port 4784)
-3. **Startup:** `StartRGAdvert(localAddr, peerAddr, vrfDevice)` — mirrors `StartHeartbeat()` API
-4. **Drives:** `rgStateMachine.SetCluster()` on state transitions (same interface as heartbeat election)
-5. **Replaces:** VRRP instances for RETH interfaces when `private-rg-election` is enabled
-6. **Co-exists with:** Heartbeat (overall liveness), session sync (data sync on fabric), VRRP (standalone non-RETH groups)
+### Phase 3: Config Knob + VRRP Suppression
 
-**Daemon integration (`pkg/daemon/daemon.go`):**
+**`pkg/config/types.go`** — add `PrivateRGElection bool` to `ClusterConfig`.
 
-```
-watchClusterEvents():
-    case rgAdvertPrimary:
-        directAddVIPs(rgID)
-        go directSendGARPs(rgID)
-        applyRethServicesForRG(rgID)   // RA, DHCP
-    case rgAdvertSecondary:
-        directRemoveVIPs(rgID)
-        clearRethServicesForRG(rgID)
-```
+**`pkg/config/ast.go`** — add `"private-rg-election"` schema node.
 
-Same VIP/GARP/service management as the existing `no-reth-vrrp` direct mode — the difference is that mastership is now resolved by the private protocol instead of relying solely on heartbeat election.
+**`pkg/config/compiler.go`** — compile flag. Validation: warns if combined with `no-reth-vrrp` (redundant — `private-rg-election` implies it).
 
-### Per-RG Support
+**`pkg/vrrp/vrrp.go`** — `CollectRethInstances()` returns nil when `PrivateRGElection` is true (same guard as `NoRethVRRP`).
 
-The protocol natively supports multiple RGs because each advertisement carries an array of RG entries. Each RG is independently resolved:
+**`pkg/daemon/daemon.go`** — `isNoRethVRRP()` returns true when either `NoRethVRRP` or `PrivateRGElection` is set.
 
-- RG0 can be primary on node0, RG1 primary on node1 (active-active per-RG)
-- Manual failover sets weight=0 for the targeted RG → peer sees priority drop → peer takes over
-- Interface monitoring reduces weight → priority drops → peer preempts (if enabled)
-
-This is identical to how VRRP handles it (separate VRID per RG), but multiplexed into a single packet.
-
-### Advantages Over VRRP
-
-| | VRRP | Private RG Protocol |
-|--|------|-------------------|
-| **LAN traffic** | 132 multicast pkt/s per segment | Zero |
-| **Link** | Data-plane (every LAN segment) | Control link (fxp1, private point-to-point) |
-| **Addressing** | Multicast 224.0.0.18 / ff02::12 | Unicast to peer control-link IP |
-| **Sockets** | Per-interface (4+ raw sockets + AF_PACKET) | 1 UDP socket |
-| **Dual-active resolution** | Same (priority comparison) | Same (priority comparison) |
-| **Detection speed** | ~97ms (30ms × 3 + skew) | ~174ms (50ms × 3 + skew), or ~104ms at 30ms |
-| **Per-RG** | Separate VRID per RG, separate socket per interface | All RGs in one packet, one socket |
-| **RFC compliance** | RFC 5798 | Proprietary |
-
-### Configuration
-
+Config:
 ```
 chassis {
     cluster {
         cluster-id 1;
-        private-rg-election;                    /* enable private protocol */
-        private-rg-election-interval 50;        /* ms, default 50 */
+        private-rg-election;
     }
 }
 ```
 
-When `private-rg-election` is set:
-- RETH VRRP instances are **not created** (same as `no-reth-vrrp`)
-- RG advertisement sender/receiver starts on control link (same addresses as heartbeat)
-- VIPs managed via `directAddVIPs/RemoveVIPs` (existing code)
-- GARPs sent via `directSendGARPs` (existing code)
-- Standalone VRRP groups (non-RETH, e.g., user-configured VRRPv3) are unaffected
+### Phase 4: Faster Heartbeat Option
 
-### Failure Scenarios
-
-**Control link failure (fxp1 down):**
-- Both heartbeat AND RG advertisements stop simultaneously
-- Heartbeat timeout fires → triggers peer-lost election → surviving node takes all RGs
-- Both protocols share the same failure domain — single link failure triggers clean failover
-- No worse than today: VRRP runs on LAN interfaces, but heartbeat loss on fxp1 already triggers election regardless of VRRP state
-
-**Daemon crash / SIGKILL:**
-- BPF watchdog (`ha_watchdog` map) detects daemon death within 2s → `rg_active=false` in BPF
-- Peer stops receiving advertisements → masterDown timer → peer takes over
-- Same behavior as VRRP daemon crash
-
-**Transient control link blip (brief packet loss):**
-- Heartbeat election may briefly race → both claim primary
-- **RG mastership protocol resolves this** — next advertisement forces loser to resign
-- This is exactly the gap VRRP fills today, now filled by the private protocol on the same link
-
-**Fabric link failure (fab0/fab1 down):**
-- Session sync stops, cross-chassis forwarding breaks
-- Election is NOT affected — it runs on the control link, not fabric
-- Clean separation: data-plane failures don't impact control-plane election
-
-### Implementation Estimate
-
-| Component | Effort |
-|-----------|--------|
-| `pkg/cluster/rg_advert.go` — protocol, sender, receiver | Core (~300 LOC) |
-| `pkg/cluster/cluster.go` — start/stop alongside heartbeat | Moderate (~100 LOC) |
-| `pkg/config/` — `private-rg-election` config knob | Small (~20 LOC) |
-| `pkg/daemon/daemon.go` — wire up events, skip VRRP | Moderate (~80 LOC, reuse existing direct-mode code) |
-| Tests — dual-active resolution, failover, per-RG | Tests (~200 LOC) |
-
-Most of the VIP/GARP/service management code already exists in the `no-reth-vrrp` direct mode. The new work is the advertisement protocol and its integration with the cluster state machine.
-
-### Relationship to `no-reth-vrrp`
-
-`no-reth-vrrp` is the **unsafe** version of this idea — it disables VRRP without adding any replacement election mechanism. The heartbeat alone isn't enough to prevent dual-active.
-
-`private-rg-election` is the **safe** version — it disables VRRP on LAN interfaces but adds a private advertisement protocol on the control link that provides the same dual-active resolution guarantee.
-
-When `private-rg-election` is enabled, `no-reth-vrrp` behavior is implicitly active (no RETH VRRP instances). The two flags should be mutually exclusive in config validation:
+The default heartbeat is 1000ms (3s detection). For environments wanting faster failover without VRRP:
 
 ```
-// Can't use both — private-rg-election supersedes no-reth-vrrp
-if cc.NoRethVRRP && cc.PrivateRGElection {
-    warning: "private-rg-election implies no-reth-vrrp; remove no-reth-vrrp"
+chassis {
+    cluster {
+        heartbeat-interval 100;    /* 100ms */
+        heartbeat-threshold 3;     /* 300ms detection */
+        private-rg-election;
+    }
 }
 ```
 
-### Why Not Embed This in the Heartbeat?
+No code changes — already configurable. Document the recommended tuning.
 
-The heartbeat already carries per-RG state (priority, weight, state) in every packet. Could we just add dual-active resolution logic to the heartbeat handler?
+## Architecture Diagram
 
-**No — the heartbeat interval is too slow.** The heartbeat runs at 200ms (configurable but intended for liveness, not election speed). Running it at 30-50ms to match VRRP would be a misuse of the protocol. The heartbeat is a coarse liveness signal; the RG mastership protocol is a fast election protocol. They have different timing requirements and should remain separate:
+```
+  ┌──────────┐                                    ┌──────────┐
+  │   fw0    │                                    │   fw1    │
+  │          │  Heartbeat + per-RG state           │          │
+  │          │  (UDP 4784, fxp1, private)          │          │
+  │          ├────────────────────────────────────→│          │
+  │          │←────────────────────────────────────┤          │
+  │          │                                    │          │
+  │          │  Session sync (TCP, fab0/fab1)      │          │
+  │          ├────────────────────────────────────→│          │
+  │          │←────────────────────────────────────┤          │
+  └──────────┘                                    └──────────┘
 
-- **Heartbeat (UDP 4784):** 200ms interval, 3 threshold. Answers: "is the peer alive?"
-- **RG Mastership (UDP 4785):** 50ms interval, 3 threshold. Answers: "who owns each RG right now?" and resolves contention.
+Heartbeat carries: per-RG (GroupID, Priority, Weight, State, Epoch)
+Election runs on every heartbeat reception — detects + resolves dual-active.
+No VRRP multicast on LAN interfaces.
+No new protocol or socket needed.
+```
 
-Both run on the same control link, share the same VRF routing context, and are started/stopped together. But they serve distinct roles with distinct timing.
+## Why NOT a Separate Protocol
 
-### Migration Path
+The earlier version of this doc proposed a separate UDP socket (port 4785) with its own advertisement format. After analyzing what exists:
 
-1. **Today:** VRRP on LAN interfaces (default, working, proven)
-2. **Next:** `private-rg-election` for environments that want zero LAN multicast
-3. **Future:** Consider making `private-rg-election` the default once battle-tested
-4. **Keep:** VRRP always available as fallback / for interop with third-party VRRP peers
+**The heartbeat already IS the advertisement protocol.** It carries per-RG state, runs election on every packet, and uses the control link. Adding a second protocol would:
+
+- Duplicate state that's already in the heartbeat
+- Add socket management, timeout logic, and failure handling that already exists
+- Create two sources of truth for per-RG election (heartbeat election vs. advertisement election)
+- Require resolving conflicts between the two protocols
+
+The only missing piece is **~10 lines in `electRG()`** to detect dual-active in non-preempt mode. A whole new protocol for that is overengineering.
+
+**Timing:** If the heartbeat interval (100-200ms) isn't fast enough for detection, tune it. If you need VRRP-like 30ms detection, set `heartbeat-interval 30`. The heartbeat packet is small (~50 bytes) and runs on a private point-to-point link — there's no reason it can't run fast.
+
+## Failure Scenarios
+
+**Transient heartbeat loss → dual-active:**
+- Both nodes elect themselves primary independently
+- Next heartbeat from either side delivers peer state to the other
+- `electRG()` detects both-primary, loser yields immediately
+- Resolution time: one heartbeat interval (100-200ms typical)
+
+**Sustained control link failure:**
+- Heartbeat timeout → both nodes run single-node election → both claim primary
+- No resolution possible without communication — same limitation as VRRP when all links fail
+- Mitigation: peer fencing (`disable-rg`), BPF watchdog
+
+**Daemon crash / SIGKILL:**
+- BPF watchdog detects death within 2s → `rg_active=false`
+- Peer heartbeat timeout → takes over all RGs
+- Same as current VRRP behavior
+
+**Stale heartbeat (delayed/reordered packet):**
+- Epoch field (Phase 2c) rejects state transitions from stale packets
+- Without epoch: benign — election re-evaluates on every packet, latest state wins
+
+## Gaps in Current `no-reth-vrrp` to Fix
+
+From `docs/next-features/control-link-only-reth-ownership.md`:
+
+| Gap | Fix | Phase |
+|-----|-----|-------|
+| Reconcile only adds VIPs, never removes stale | Add `directRemoveVIPs()` for inactive RGs | 2a |
+| No GARP on reconcile self-heal | Emit rate-limited GARP when VIPs corrected | 2b |
+| No epoch/lease to reject stale transitions | Add epoch to RG state + heartbeat | 2c |
+| No dedicated HA tests for direct mode | Event-drop simulation, crash loops, VIP ownership assertion | 2 |
+| `strict-vip-ownership` incompatible | Validate in compiler (already done) | — |
+| Failover timing depends on heartbeat tuning | Document recommended settings | 4 |
+
+## Comparison: VRRP vs Private-RG-Election
+
+| | VRRP (current) | Private RG Election (proposed) |
+|--|------|-------------------|
+| **LAN traffic** | ~132 multicast pkt/s per segment | Zero |
+| **Election link** | LAN interfaces (multicast) | Control link fxp1 (unicast) |
+| **Protocol** | RFC 5798 + cluster heartbeat | Cluster heartbeat only |
+| **Sockets** | 4+ raw/AF_PACKET per RETH interface | 0 additional (reuse heartbeat) |
+| **Dual-active resolution** | VRRP tie-break (~30ms) | Heartbeat tie-break (~100-200ms) |
+| **Detection speed** | ~97ms (VRRP masterDown) | Configurable (heartbeat interval × threshold) |
+| **Per-RG** | Separate VRID per RG | All RGs in heartbeat packet (already) |
+| **New code** | 0 (exists) | ~10 lines election fix + ~100 lines hardening |
+| **New protocol** | N/A | None needed |
+
+## Migration Path
+
+1. **Phase 1:** Fix dual-active in `electRG()` — safe to ship immediately, no behavioral change when VRRP is active (VRRP resolves it first anyway)
+2. **Phase 2:** Harden `no-reth-vrrp` reconcile paths
+3. **Phase 3:** Add `private-rg-election` config knob, suppress RETH VRRP
+4. **Phase 4:** Document fast heartbeat tuning, run `test-failover` validation
+5. **Future:** Consider making `private-rg-election` the default once battle-tested
