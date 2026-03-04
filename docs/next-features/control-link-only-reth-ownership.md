@@ -10,7 +10,7 @@ Can we stop running VRRP advertisements on LAN/WAN RETH interfaces and do HA ele
 Short answer: **mostly yes**. Election is already over the private control link.  
 The part still running on data interfaces is the VRRP VIP ownership/advertisement layer.
 
-## Per-RETH Election Over Private Fabric Link
+## Per-RETH Election Over Private Control Link
 
 Yes, there is a viable path.
 
