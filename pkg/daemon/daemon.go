@@ -2123,23 +2123,87 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 	}
 }
 
-// runPeriodicNeighborResolution re-runs neighbor resolution every 15 seconds
-// to keep ARP/NDP entries warm for known forwarding targets.
-// Runs once immediately at start to avoid a 15s blind spot.
+// cleanFailedNeighbors deletes NUD_FAILED neighbor entries on all interfaces
+// and proactively pings the IP to pre-populate ARP/NDP for fast recovery.
+//
+// When a host goes down, the kernel marks its ARP/NDP entry as FAILED and
+// retains it for ~60 seconds (gc_staletime). During that window, packets
+// XDP_PASS'd for NO_NEIGH resolution are silently dropped by the kernel
+// because it refuses to re-resolve a FAILED entry. Deleting the entry and
+// pinging ensures ARP/NDP is resolved before the next forwarded packet.
+func (d *Daemon) cleanFailedNeighbors() int {
+	type probe struct {
+		ip    net.IP
+		iface string
+	}
+	var probes []probe
+	cleaned := 0
+	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+		neighs, err := netlink.NeighList(0, family)
+		if err != nil {
+			continue
+		}
+		for i := range neighs {
+			if neighs[i].State&netlink.NUD_FAILED != 0 {
+				// Capture interface name for probing before delete.
+				link, linkErr := netlink.LinkByIndex(neighs[i].LinkIndex)
+				if err := netlink.NeighDel(&neighs[i]); err == nil {
+					cleaned++
+					if linkErr == nil {
+						probes = append(probes, probe{
+							ip:    neighs[i].IP,
+							iface: link.Attrs().Name,
+						})
+					}
+				}
+			}
+		}
+	}
+	if cleaned > 0 {
+		slog.Debug("cleaned failed neighbor entries", "count", cleaned)
+	}
+	// Send ARP requests for cleaned IPv4 entries so the kernel's
+	// neighbor table is re-populated before the next forwarded packet.
+	// Uses raw AF_PACKET socket (no shell-out). IPv6 entries rely on
+	// the BPF XDP_PASS path to trigger kernel NDP resolution.
+	for _, p := range probes {
+		if p.ip.To4() != nil {
+			cluster.SendARPProbe(p.iface, p.ip)
+		}
+	}
+	return cleaned
+}
+
+// runPeriodicNeighborResolution manages two periodic tasks:
+//   - Every 5 seconds: clean NUD_FAILED neighbor entries so the kernel
+//     retries ARP/NDP on the next forwarded packet (fast recovery).
+//   - Every 15 seconds: proactively resolve known forwarding targets
+//     (gateways, DNAT pools, etc.) to keep ARP/NDP entries warm.
+//
+// Runs once immediately at start to avoid a blind spot.
 // Fetches fresh active config on each tick so config changes take effect.
 func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 	// Immediate first run — don't wait for first tick.
 	if cfg := d.store.ActiveConfig(); cfg != nil {
 		d.resolveNeighbors(cfg)
 	}
+	d.cleanFailedNeighbors()
 
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+	const (
+		cleanInterval   = 5 * time.Second
+		resolveInterval = 15 * time.Second
+	)
+	cleanTicker := time.NewTicker(cleanInterval)
+	resolveTicker := time.NewTicker(resolveInterval)
+	defer cleanTicker.Stop()
+	defer resolveTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-cleanTicker.C:
+			d.cleanFailedNeighbors()
+		case <-resolveTicker.C:
 			if cfg := d.store.ActiveConfig(); cfg != nil {
 				d.resolveNeighbors(cfg)
 			}

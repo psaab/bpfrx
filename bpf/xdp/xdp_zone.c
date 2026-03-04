@@ -1041,24 +1041,19 @@ zone_resolved:
 		/*
 		 * Route exists but no ARP/NDP entry for the next hop.
 		 *
-		 * In cluster mode, try fabric redirect — the peer may
-		 * have the ARP/NDP entry or the route.  During FRR
-		 * nexthop-tracking updates, NO_NEIGH may appear briefly
-		 * for routes that are actually blackholed (default route
-		 * not yet withdrawn).
+		 * Existing sessions: try fabric redirect — the peer
+		 * has the synced session and may have the ARP/NDP entry.
+		 * Falls back to conntrack + kernel routing if fabric
+		 * is unavailable.
 		 *
-		 * New connections: zone-encoded redirect preserves
-		 * ingress zone for policy/SNAT on the peer (matches
-		 * BLACKHOLE handler pattern).  Plain redirect fallback
-		 * if zone-encoded fails.
-		 *
-		 * Existing sessions: plain redirect (peer has synced
-		 * session).  Falls back to conntrack + kernel routing
-		 * if fabric is unavailable.
-		 *
-		 * For new connections without fabric, XDP_PASS so the
-		 * kernel resolves ARP/NDP and the retransmit goes
-		 * through the pipeline.
+		 * New connections: XDP_PASS so the kernel resolves
+		 * ARP/NDP.  Do NOT fabric-redirect new connections
+		 * for NO_NEIGH — the peer also won't have the ARP
+		 * entry, and fabric-transit packets with NO_NEIGH
+		 * are dropped (anti-loop).  The kernel queues the
+		 * packet while ARP resolves, and subsequent packets
+		 * (or retransmits) go through the full BPF pipeline
+		 * with the ARP entry populated.
 		 */
 		{
 			volatile int nn_has_session = 0;
@@ -1069,20 +1064,6 @@ zone_resolved:
 			if (nn_has_session) {
 				apply_dnat_before_fabric_redirect(ctx, meta);
 				int fab_rc =
-					try_fabric_redirect(ctx, meta);
-				if (fab_rc >= 0)
-					return fab_rc;
-			} else {
-				/* New connection: zone-encoded redirect
-				 * preserves ingress zone for policy on
-				 * the peer. */
-				int fab_rc =
-					try_fabric_redirect_with_zone(
-						ctx, meta);
-				if (fab_rc >= 0)
-					return fab_rc;
-				/* Plain redirect fallback. */
-				fab_rc =
 					try_fabric_redirect(ctx, meta);
 				if (fab_rc >= 0)
 					return fab_rc;
