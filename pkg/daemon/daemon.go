@@ -5231,16 +5231,19 @@ func (d *Daemon) warmNeighborCache() {
 		return true
 	})
 
-	// Resolve IPv4 neighbors by sending a UDP connect (triggers kernel ARP).
+	// Resolve IPv4 neighbors by sending a UDP packet to trigger kernel ARP.
+	// UDP connect() alone does NOT trigger ARP — only the route lookup is
+	// performed. We must send at least one byte so the kernel actually
+	// calls neigh_resolve_output() → arp_solicit().
 	count := 0
 	for ip4 := range seen {
 		addr := netip.AddrFrom4(ip4)
 		if !addr.IsGlobalUnicast() || addr.IsPrivate() && addr.IsLoopback() {
 			continue
 		}
-		// net.Dial triggers kernel routing + ARP resolution.
 		conn, err := net.DialTimeout("udp4", netip.AddrPortFrom(addr, 1).String(), 50*time.Millisecond)
 		if err == nil {
+			conn.Write([]byte{0}) // triggers ARP resolution
 			conn.Close()
 			count++
 		}
@@ -5255,14 +5258,17 @@ func (d *Daemon) warmNeighborCache() {
 		}
 		conn, err := net.DialTimeout("udp6", netip.AddrPortFrom(addr, 1).String(), 50*time.Millisecond)
 		if err == nil {
+			conn.Write([]byte{0}) // triggers NDP resolution
 			conn.Close()
 			countV6++
 		}
 	}
 
 	if count > 0 || countV6 > 0 {
-		slog.Info("vrrp: neighbor cache warmup complete",
+		slog.Info("cluster: neighbor cache warmup complete",
 			"ipv4_hosts", count, "ipv6_hosts", countV6)
+		// Brief pause to allow ARP/NDP responses before traffic arrives.
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
