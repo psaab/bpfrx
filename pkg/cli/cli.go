@@ -798,6 +798,11 @@ func (c *CLI) dispatchOperational(line string) error {
 
 	switch parts[0] {
 	case "configure":
+		// Block configure mode on secondary node — config changes must
+		// be made on the primary (RG0 is config authority).
+		if c.cluster != nil && !c.cluster.IsLocalPrimary(0) {
+			return fmt.Errorf("error: node is not primary for RG0, configure on the primary node")
+		}
 		if len(parts) >= 2 && parts[1] == "exclusive" {
 			if err := c.store.EnterConfigureExclusive("cli"); err != nil {
 				return err

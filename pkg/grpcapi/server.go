@@ -228,6 +228,11 @@ func peerSessionID(ctx context.Context) string {
 // --- Config lifecycle RPCs ---
 
 func (s *Server) EnterConfigure(ctx context.Context, req *pb.EnterConfigureRequest) (*pb.EnterConfigureResponse, error) {
+	// Block configure mode on secondary node — config changes must
+	// be made on the primary (RG0 is config authority).
+	if s.cluster != nil && !s.cluster.IsLocalPrimary(0) {
+		return nil, status.Errorf(codes.FailedPrecondition, "node is not primary for RG0, configure on the primary node")
+	}
 	sessionID := peerSessionID(ctx)
 	var err error
 	if req.Exclusive {
