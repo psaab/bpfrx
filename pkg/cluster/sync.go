@@ -63,6 +63,7 @@ type SyncStats struct {
 	FencesSent        atomic.Uint64
 	FencesReceived    atomic.Uint64
 	Errors            atomic.Uint64
+	DeletesDropped    atomic.Uint64 // deletes lost when journal is full
 	Connected         atomic.Bool
 
 	// Cold sync timing.
@@ -73,6 +74,33 @@ type SyncStats struct {
 	// Config sync timing.
 	LastConfigSyncTime atomic.Int64  // UnixNano
 	LastConfigSyncSize atomic.Uint64 // bytes
+}
+
+// SyncStatsSnapshot is a point-in-time copy of SyncStats with plain
+// (non-atomic) fields, safe to copy by value and pass across API boundaries.
+type SyncStatsSnapshot struct {
+	SessionsSent      uint64
+	SessionsReceived  uint64
+	SessionsInstalled uint64
+	DeletesSent       uint64
+	DeletesReceived   uint64
+	BulkSyncs         uint64
+	ConfigsSent       uint64
+	ConfigsReceived   uint64
+	IPsecSASent       uint64
+	IPsecSAReceived   uint64
+	FencesSent        uint64
+	FencesReceived    uint64
+	Errors            uint64
+	DeletesDropped    uint64
+	Connected         bool
+
+	BulkSyncStartTime int64
+	BulkSyncEndTime   int64
+	BulkSyncSessions  uint64
+
+	LastConfigSyncTime int64
+	LastConfigSyncSize uint64
 }
 
 // SessionSync manages TCP-based session state replication between cluster peers.
@@ -139,23 +167,41 @@ type SessionSync struct {
 	zoneRGMu  sync.RWMutex
 	zoneRGMap map[uint16]int // zone_id -> RG_id (for per-RG session sync)
 
+	// Delete journal: bounded ring buffer for delete messages during disconnect.
+	// Deletes are journaled when queueMessage fails (disconnect), then flushed
+	// on reconnect before normal sync resumes.
+	deleteJournalMu sync.Mutex
+	deleteJournal   [][]byte // ring buffer of encoded delete messages
+	deleteJournalCap int     // max entries (default 10000)
+
+	// bulkSendMu serializes entire BulkSync() calls so two concurrent
+	// callers (e.g. acceptLoop and connectLoop) cannot interleave.
+	bulkSendMu   sync.Mutex
+	bulkSendNext atomic.Uint64 // monotonic epoch counter for outgoing bulk syncs
+
 	// Bulk receive tracking for stale-entry reconciliation.
 	// During bulk receive (BulkStart..BulkEnd), track all received
 	// forward session keys. On BulkEnd, delete local sessions in
 	// peer-owned zones that were not refreshed.
-	bulkMu         sync.Mutex
-	bulkInProgress bool
-	bulkRecvV4     map[dataplane.SessionKey]struct{}
-	bulkRecvV6     map[dataplane.SessionKeyV6]struct{}
+	bulkMu           sync.Mutex
+	bulkInProgress   bool
+	bulkRecvEpoch    uint64 // epoch of current in-progress bulk receive
+	bulkRecvV4       map[dataplane.SessionKey]struct{}
+	bulkRecvV6       map[dataplane.SessionKeyV6]struct{}
+	bulkZoneSnapshot map[uint16]bool // snapshot of ShouldSyncZone at BulkStart
 }
+
+// deleteJournalDefaultCap is the default max entries in the delete journal.
+const deleteJournalDefaultCap = 10000
 
 // NewSessionSync creates a new session synchronization manager.
 func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *SessionSync {
 	return &SessionSync{
-		localAddr: localAddr,
-		peerAddr:  peerAddr,
-		dp:        dp,
-		sendCh:    make(chan []byte, 4096),
+		localAddr:        localAddr,
+		peerAddr:         peerAddr,
+		dp:               dp,
+		sendCh:           make(chan []byte, 4096),
+		deleteJournalCap: deleteJournalDefaultCap,
 	}
 }
 
@@ -163,12 +209,13 @@ func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *Session
 // If local1/peer1 are empty, falls back to single-fabric behavior.
 func NewDualSessionSync(local, peer, local1, peer1 string, dp dataplane.DataPlane) *SessionSync {
 	return &SessionSync{
-		localAddr:  local,
-		peerAddr:   peer,
-		localAddr1: local1,
-		peerAddr1:  peer1,
-		dp:         dp,
-		sendCh:     make(chan []byte, 4096),
+		localAddr:        local,
+		peerAddr:         peer,
+		localAddr1:       local1,
+		peerAddr1:        peer1,
+		dp:               dp,
+		sendCh:           make(chan []byte, 4096),
+		deleteJournalCap: deleteJournalDefaultCap,
 	}
 }
 
@@ -192,9 +239,31 @@ func (s *SessionSync) SetDataPlane(dp dataplane.DataPlane) {
 	s.dp = dp
 }
 
-// Stats returns current sync statistics.
-func (s *SessionSync) Stats() SyncStats {
-	return s.stats
+// Stats returns a point-in-time snapshot of sync statistics.
+// The snapshot uses plain fields (no atomics) so it is safe to copy by value.
+func (s *SessionSync) Stats() SyncStatsSnapshot {
+	return SyncStatsSnapshot{
+		SessionsSent:       s.stats.SessionsSent.Load(),
+		SessionsReceived:   s.stats.SessionsReceived.Load(),
+		SessionsInstalled:  s.stats.SessionsInstalled.Load(),
+		DeletesSent:        s.stats.DeletesSent.Load(),
+		DeletesReceived:    s.stats.DeletesReceived.Load(),
+		BulkSyncs:          s.stats.BulkSyncs.Load(),
+		ConfigsSent:        s.stats.ConfigsSent.Load(),
+		ConfigsReceived:    s.stats.ConfigsReceived.Load(),
+		IPsecSASent:        s.stats.IPsecSASent.Load(),
+		IPsecSAReceived:    s.stats.IPsecSAReceived.Load(),
+		FencesSent:         s.stats.FencesSent.Load(),
+		FencesReceived:     s.stats.FencesReceived.Load(),
+		Errors:             s.stats.Errors.Load(),
+		DeletesDropped:     s.stats.DeletesDropped.Load(),
+		Connected:          s.stats.Connected.Load(),
+		BulkSyncStartTime:  s.stats.BulkSyncStartTime.Load(),
+		BulkSyncEndTime:    s.stats.BulkSyncEndTime.Load(),
+		BulkSyncSessions:   s.stats.BulkSyncSessions.Load(),
+		LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(),
+		LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(),
+	}
 }
 
 // IsConnected returns true if the peer connection is established.
@@ -449,15 +518,61 @@ func (s *SessionSync) QueueSessionV6(key dataplane.SessionKeyV6, val dataplane.S
 }
 
 // QueueDeleteV4 queues a v4 session deletion for sync.
+// If the peer is disconnected, the delete is journaled for replay on reconnect.
 func (s *SessionSync) QueueDeleteV4(key dataplane.SessionKey) {
 	msg := encodeDeleteV4(key)
-	s.queueMessage(msg, &s.stats.DeletesSent, "delete_v4")
+	if !s.queueMessage(msg, &s.stats.DeletesSent, "delete_v4") {
+		s.journalDelete(msg)
+	}
 }
 
 // QueueDeleteV6 queues a v6 session deletion for sync.
+// If the peer is disconnected, the delete is journaled for replay on reconnect.
 func (s *SessionSync) QueueDeleteV6(key dataplane.SessionKeyV6) {
 	msg := encodeDeleteV6(key)
-	s.queueMessage(msg, &s.stats.DeletesSent, "delete_v6")
+	if !s.queueMessage(msg, &s.stats.DeletesSent, "delete_v6") {
+		s.journalDelete(msg)
+	}
+}
+
+// journalDelete stores a delete message in the bounded ring buffer
+// for replay on reconnect. If the journal is full, the oldest entry
+// is evicted and DeletesDropped is incremented.
+func (s *SessionSync) journalDelete(msg []byte) {
+	s.deleteJournalMu.Lock()
+	defer s.deleteJournalMu.Unlock()
+
+	cap := s.deleteJournalCap
+	if cap <= 0 {
+		cap = deleteJournalDefaultCap
+	}
+	if len(s.deleteJournal) >= cap {
+		// Evict oldest entry (ring buffer behavior).
+		s.deleteJournal = s.deleteJournal[1:]
+		s.stats.DeletesDropped.Add(1)
+	}
+	s.deleteJournal = append(s.deleteJournal, msg)
+}
+
+// flushDeleteJournal replays all journaled delete messages through the
+// send channel. Called on reconnect before normal sync resumes.
+func (s *SessionSync) flushDeleteJournal() {
+	s.deleteJournalMu.Lock()
+	journal := s.deleteJournal
+	s.deleteJournal = nil
+	s.deleteJournalMu.Unlock()
+
+	if len(journal) == 0 {
+		return
+	}
+
+	var flushed int
+	for _, msg := range journal {
+		if s.queueMessage(msg, &s.stats.DeletesSent, "journal_flush") {
+			flushed++
+		}
+	}
+	slog.Info("cluster sync: flushed delete journal", "total", len(journal), "sent", flushed)
 }
 
 // QueueConfig sends the full config text to the peer for config synchronization.
@@ -534,7 +649,11 @@ func (s *SessionSync) SendFence() error {
 }
 
 // BulkSync sends the entire session table to the connected peer.
+// Serialized by bulkSendMu so concurrent callers cannot interleave.
 func (s *SessionSync) BulkSync() error {
+	s.bulkSendMu.Lock()
+	defer s.bulkSendMu.Unlock()
+
 	if s.dp == nil {
 		return fmt.Errorf("dataplane not ready")
 	}
@@ -545,9 +664,14 @@ func (s *SessionSync) BulkSync() error {
 		return fmt.Errorf("no peer connection")
 	}
 
-	// Send bulk start marker.
+	// Assign a monotonically increasing epoch to this bulk transfer.
+	epoch := s.bulkSendNext.Add(1)
+	var epochBuf [8]byte
+	binary.LittleEndian.PutUint64(epochBuf[:], epoch)
+
+	// Send bulk start marker with epoch.
 	s.writeMu.Lock()
-	err := writeMsg(conn, syncMsgBulkStart, nil)
+	err := writeMsg(conn, syncMsgBulkStart, epochBuf[:])
 	s.writeMu.Unlock()
 	if err != nil {
 		return err
@@ -602,16 +726,16 @@ func (s *SessionSync) BulkSync() error {
 		return fmt.Errorf("bulk sync v6 iterate: %w", err)
 	}
 
-	// Send bulk end marker.
+	// Send bulk end marker with matching epoch.
 	s.writeMu.Lock()
-	err = writeMsg(conn, syncMsgBulkEnd, nil)
+	err = writeMsg(conn, syncMsgBulkEnd, epochBuf[:])
 	s.writeMu.Unlock()
 	if err != nil {
 		return err
 	}
 
 	s.stats.BulkSyncs.Add(1)
-	slog.Info("cluster sync: bulk sync complete", "sessions", count, "skipped", skipped)
+	slog.Info("cluster sync: bulk sync complete", "sessions", count, "skipped", skipped, "epoch", epoch)
 	return nil
 }
 
@@ -660,6 +784,9 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener) {
 
 		// Exchange monotonic clocks before any session data.
 		s.sendClockSync(conn)
+
+		// Flush any delete messages that were journaled during disconnect.
+		s.flushDeleteJournal()
 
 		if s.OnPeerConnected != nil {
 			go s.OnPeerConnected()
@@ -733,6 +860,9 @@ func (s *SessionSync) connectLoop(ctx context.Context) {
 
 		// Exchange monotonic clocks before any session data.
 		s.sendClockSync(conn)
+
+		// Flush any delete messages that were journaled during disconnect.
+		s.flushDeleteJournal()
 
 		if s.OnPeerConnected != nil {
 			go s.OnPeerConnected()
@@ -1007,20 +1137,41 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 		}
 
 	case syncMsgBulkStart:
+		var epoch uint64
+		if len(payload) >= 8 {
+			epoch = binary.LittleEndian.Uint64(payload[:8])
+		}
 		s.stats.BulkSyncStartTime.Store(time.Now().UnixNano())
 		s.stats.BulkSyncEndTime.Store(0)
 		s.stats.BulkSyncSessions.Store(0)
+		// Snapshot zone ownership at BulkStart so reconciliation uses a
+		// consistent view even if primary/secondary roles flip mid-bulk.
+		zoneSnap := s.snapshotZoneOwnership()
 		s.bulkMu.Lock()
 		s.bulkInProgress = true
+		s.bulkRecvEpoch = epoch
 		s.bulkRecvV4 = make(map[dataplane.SessionKey]struct{})
 		s.bulkRecvV6 = make(map[dataplane.SessionKeyV6]struct{})
+		s.bulkZoneSnapshot = zoneSnap
 		s.bulkMu.Unlock()
-		slog.Info("cluster sync: bulk transfer starting")
+		slog.Info("cluster sync: bulk transfer starting", "epoch", epoch)
 
 	case syncMsgBulkEnd:
+		var epoch uint64
+		if len(payload) >= 8 {
+			epoch = binary.LittleEndian.Uint64(payload[:8])
+		}
+		s.bulkMu.Lock()
+		if s.bulkInProgress && s.bulkRecvEpoch != epoch {
+			s.bulkMu.Unlock()
+			slog.Warn("cluster sync: ignoring BulkEnd with mismatched epoch",
+				"expected", s.bulkRecvEpoch, "got", epoch)
+			break
+		}
+		s.bulkMu.Unlock()
 		s.stats.BulkSyncEndTime.Store(time.Now().UnixNano())
 		s.reconcileStaleSessions()
-		slog.Info("cluster sync: bulk transfer complete")
+		slog.Info("cluster sync: bulk transfer complete", "epoch", epoch)
 		if s.OnBulkSyncReceived != nil {
 			go s.OnBulkSyncReceived()
 		}
@@ -1082,6 +1233,20 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 	}
 }
 
+// snapshotZoneOwnership returns a map of zoneID→shouldSync for all zones
+// currently in the zone→RG mapping. Used to freeze ownership at BulkStart.
+func (s *SessionSync) snapshotZoneOwnership() map[uint16]bool {
+	s.zoneRGMu.RLock()
+	m := s.zoneRGMap
+	s.zoneRGMu.RUnlock()
+
+	snap := make(map[uint16]bool, len(m))
+	for zoneID := range m {
+		snap[zoneID] = s.ShouldSyncZone(zoneID)
+	}
+	return snap
+}
+
 // reconcileStaleSessions deletes local sessions in peer-owned zones that
 // were not refreshed during the bulk receive. Called on BulkEnd.
 func (s *SessionSync) reconcileStaleSessions() {
@@ -1092,13 +1257,27 @@ func (s *SessionSync) reconcileStaleSessions() {
 	}
 	recvV4 := s.bulkRecvV4
 	recvV6 := s.bulkRecvV6
+	zoneSnap := s.bulkZoneSnapshot
 	s.bulkInProgress = false
 	s.bulkRecvV4 = nil
 	s.bulkRecvV6 = nil
+	s.bulkZoneSnapshot = nil
 	s.bulkMu.Unlock()
 
 	if s.dp == nil {
 		return
+	}
+
+	// shouldSyncAtBulkStart uses the frozen snapshot if available, falling
+	// back to live ShouldSyncZone when no snapshot exists (backward compat).
+	shouldSyncAtBulkStart := func(zoneID uint16) bool {
+		if zoneSnap != nil {
+			if v, ok := zoneSnap[zoneID]; ok {
+				return v
+			}
+			// Zone not in snapshot — fall back to live check.
+		}
+		return s.ShouldSyncZone(zoneID)
 	}
 
 	var deleted int
@@ -1110,7 +1289,7 @@ func (s *SessionSync) reconcileStaleSessions() {
 			return true
 		}
 		// Only reconcile sessions in zones the peer owns (where we're NOT primary).
-		if s.ShouldSyncZone(val.IngressZone) {
+		if shouldSyncAtBulkStart(val.IngressZone) {
 			return true
 		}
 		if _, ok := recvV4[key]; !ok {
@@ -1144,7 +1323,7 @@ func (s *SessionSync) reconcileStaleSessions() {
 		if val.IsReverse != 0 {
 			return true
 		}
-		if s.ShouldSyncZone(val.IngressZone) {
+		if shouldSyncAtBulkStart(val.IngressZone) {
 			return true
 		}
 		if _, ok := recvV6[key]; !ok {

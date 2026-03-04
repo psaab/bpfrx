@@ -139,10 +139,10 @@ func TestEncodeSessionV6(t *testing.T) {
 func TestSyncStatsInit(t *testing.T) {
 	ss := NewSessionSync(":4785", "10.0.0.2:4785", nil)
 	stats := ss.Stats()
-	if stats.Connected.Load() {
+	if stats.Connected {
 		t.Fatal("should not be connected initially")
 	}
-	if stats.SessionsSent.Load() != 0 {
+	if stats.SessionsSent != 0 {
 		t.Fatal("sessions sent should be 0")
 	}
 }
@@ -833,6 +833,183 @@ func TestWriteFullDirectShortWrites(t *testing.T) {
 	}
 }
 
+// msgCapture wraps a net.Conn and records message types in order.
+type msgCapture struct {
+	net.Conn
+	mu       sync.Mutex
+	msgTypes []uint8
+}
+
+func (c *msgCapture) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(b) >= syncHeaderSize && string(b[0:4]) == "BPSY" {
+		c.msgTypes = append(c.msgTypes, b[4])
+	}
+	return len(b), nil
+}
+
+func (c *msgCapture) types() []uint8 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := make([]uint8, len(c.msgTypes))
+	copy(cp, c.msgTypes)
+	return cp
+}
+
+func TestBulkSyncSerialization(t *testing.T) {
+	// Verify that two concurrent BulkSync() calls are serialized:
+	// the message stream should never interleave BulkStart/BulkEnd
+	// from different epochs.
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}: {
+				IsReverse: 0, IngressZone: 1,
+			},
+		},
+	}
+
+	mc := &msgCapture{}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return true }
+	ss.mu.Lock()
+	ss.conn = mc
+	ss.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = ss.BulkSync()
+		}()
+	}
+	wg.Wait()
+
+	// Check that BulkStart/BulkEnd messages are always paired (never interleaved).
+	types := mc.types()
+	depth := 0
+	for i, mt := range types {
+		if mt == syncMsgBulkStart {
+			depth++
+			if depth > 1 {
+				t.Fatalf("interleaved BulkStart at msg index %d (depth %d)", i, depth)
+			}
+		}
+		if mt == syncMsgBulkEnd {
+			if depth != 1 {
+				t.Fatalf("BulkEnd without matching BulkStart at msg index %d", i)
+			}
+			depth--
+		}
+	}
+	if depth != 0 {
+		t.Fatalf("unmatched BulkStart remaining (depth %d)", depth)
+	}
+}
+
+func TestBulkEpochMismatchIgnored(t *testing.T) {
+	// BulkEnd with mismatched epoch should be ignored (no reconciliation, no callback).
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6}: {IsReverse: 0, IngressZone: 2},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.IsPrimaryForRGFn = func(rgID int) bool { return false }
+	ss.SetZoneRGMap(map[uint16]int{2: 2})
+
+	called := false
+	ss.OnBulkSyncReceived = func() { called = true }
+
+	// BulkStart with epoch 5
+	var startBuf [8]byte
+	binary.LittleEndian.PutUint64(startBuf[:], 5)
+	ss.handleMessage(syncMsgBulkStart, startBuf[:])
+
+	// BulkEnd with epoch 99 (mismatch)
+	var endBuf [8]byte
+	binary.LittleEndian.PutUint64(endBuf[:], 99)
+	ss.handleMessage(syncMsgBulkEnd, endBuf[:])
+
+	// Callback should NOT have been invoked
+	time.Sleep(50 * time.Millisecond)
+	if called {
+		t.Fatal("OnBulkSyncReceived should not be called on epoch mismatch")
+	}
+
+	// Session should NOT be reconciled (deleted)
+	if _, ok := dp.v4sessions[dataplane.SessionKey{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6}]; !ok {
+		t.Fatal("session should not be deleted on epoch mismatch")
+	}
+
+	// Now send matching BulkEnd — should trigger callback + reconciliation
+	var matchBuf [8]byte
+	binary.LittleEndian.PutUint64(matchBuf[:], 5)
+	ss.handleMessage(syncMsgBulkEnd, matchBuf[:])
+
+	time.Sleep(50 * time.Millisecond)
+	if !called {
+		t.Fatal("OnBulkSyncReceived should be called on matching epoch")
+	}
+}
+
+func TestReconcileUsesSnapshotNotLive(t *testing.T) {
+	// When IsPrimaryForRGFn flips between BulkStart and BulkEnd,
+	// reconciliation should use the snapshot taken at BulkStart time.
+	//
+	// Scenario: at BulkStart we're secondary for RG 2 (zone 2 owned by peer).
+	// Peer sends bulk with sessionA in zone 2. We also have staleB in zone 2.
+	// Between BulkStart and BulkEnd, we become primary for RG 2.
+	// With the snapshot, reconciliation still sees zone 2 as peer-owned →
+	// staleB gets deleted. Without snapshot, it would skip zone 2 and keep staleB.
+
+	freshKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 3, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}
+	staleKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 3, 2}, Protocol: 6, SrcPort: 2000, DstPort: 443}
+
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			freshKey: {IsReverse: 0, IngressZone: 2},
+			staleKey: {IsReverse: 0, IngressZone: 2},
+		},
+	}
+
+	primaryForRG2 := false // starts as secondary for RG 2
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.IsPrimaryForRGFn = func(rgID int) bool {
+		if rgID == 2 {
+			return primaryForRG2
+		}
+		return rgID == 1
+	}
+	ss.SetZoneRGMap(map[uint16]int{1: 1, 2: 2})
+
+	// BulkStart — snapshot sees us as secondary for RG 2
+	ss.handleMessage(syncMsgBulkStart, nil)
+
+	// Peer sends freshKey
+	payload := encodeSessionV4Payload(freshKey, dataplane.SessionValue{IsReverse: 0, IngressZone: 2})
+	ss.handleMessage(syncMsgSessionV4, payload)
+
+	// FLIP: we become primary for RG 2 mid-bulk
+	primaryForRG2 = true
+
+	// BulkEnd — reconciliation should use snapshot (secondary for RG 2)
+	ss.handleMessage(syncMsgBulkEnd, nil)
+
+	// freshKey should remain
+	if _, ok := dp.v4sessions[freshKey]; !ok {
+		t.Fatal("freshKey should not be deleted")
+	}
+	// staleKey should be deleted (snapshot says zone 2 is peer-owned)
+	if _, ok := dp.v4sessions[staleKey]; ok {
+		t.Fatal("staleKey should be deleted — snapshot should see zone 2 as peer-owned")
+	}
+}
+
 // countingWriter wraps a net.Conn and counts sync messages written.
 type countingWriter struct {
 	net.Conn
@@ -1264,4 +1441,155 @@ func TestConcurrentSyncWriters(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("receiver timed out")
 	}
+}
+
+func TestDeleteJournalBasic(t *testing.T) {
+	// Deletes while disconnected should be journaled and flushed on reconnect.
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	// Not connected — queueMessage will fail.
+
+	key1 := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}
+	key2 := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 1, 2}, Protocol: 6, SrcPort: 2000, DstPort: 443}
+	key3v6 := dataplane.SessionKeyV6{SrcIP: [16]byte{0x20, 0x01}, Protocol: 6, SrcPort: 3000, DstPort: 80}
+
+	ss.QueueDeleteV4(key1)
+	ss.QueueDeleteV4(key2)
+	ss.QueueDeleteV6(key3v6)
+
+	// Journal should have 3 entries.
+	ss.deleteJournalMu.Lock()
+	if len(ss.deleteJournal) != 3 {
+		t.Fatalf("expected 3 journal entries, got %d", len(ss.deleteJournal))
+	}
+	ss.deleteJournalMu.Unlock()
+
+	// No sends should have happened.
+	if ss.stats.DeletesSent.Load() != 0 {
+		t.Fatal("should not count sent when disconnected")
+	}
+
+	// Now "connect" and flush.
+	ss.stats.Connected.Store(true)
+	ss.flushDeleteJournal()
+
+	// All 3 should be flushed to sendCh.
+	if ss.stats.DeletesSent.Load() != 3 {
+		t.Fatalf("expected 3 deletes sent after flush, got %d", ss.stats.DeletesSent.Load())
+	}
+
+	// Journal should be empty.
+	ss.deleteJournalMu.Lock()
+	if len(ss.deleteJournal) != 0 {
+		t.Fatalf("journal should be empty after flush, got %d", len(ss.deleteJournal))
+	}
+	ss.deleteJournalMu.Unlock()
+}
+
+func TestDeleteJournalOverflow(t *testing.T) {
+	// When journal is full, oldest entries are evicted and DeletesDropped incremented.
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.deleteJournalCap = 5 // small cap for testing
+
+	// Queue 8 deletes while disconnected — first 3 should be evicted.
+	for i := 0; i < 8; i++ {
+		key := dataplane.SessionKey{
+			SrcIP:    [4]byte{10, 0, 1, byte(i)},
+			Protocol: 6,
+			SrcPort:  uint16(1000 + i),
+			DstPort:  80,
+		}
+		ss.QueueDeleteV4(key)
+	}
+
+	ss.deleteJournalMu.Lock()
+	if len(ss.deleteJournal) != 5 {
+		t.Fatalf("journal should be capped at 5, got %d", len(ss.deleteJournal))
+	}
+	ss.deleteJournalMu.Unlock()
+
+	if ss.stats.DeletesDropped.Load() != 3 {
+		t.Fatalf("expected 3 dropped deletes, got %d", ss.stats.DeletesDropped.Load())
+	}
+}
+
+func TestDeleteJournalFlushNoEntries(t *testing.T) {
+	// Flushing an empty journal should be a no-op.
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.stats.Connected.Store(true)
+	ss.flushDeleteJournal()
+	if ss.stats.DeletesSent.Load() != 0 {
+		t.Fatal("should not send anything on empty journal")
+	}
+}
+
+func TestDeleteJournalReconnectConvergence(t *testing.T) {
+	// End-to-end: disconnect→deletes→reconnect→verify deletes arrive on peer.
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	// Start disconnected.
+
+	key := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}
+	ss.QueueDeleteV4(key)
+	ss.QueueDeleteV4(key) // journal 2 deletes
+
+	// Simulate reconnect: set conn and connected.
+	ss.mu.Lock()
+	ss.conn = clientConn
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	// Flush in background (will write to clientConn via sendCh).
+	ss.flushDeleteJournal()
+
+	// Drain sendCh and write to conn.
+	go func() {
+		for i := 0; i < 2; i++ {
+			msg := <-ss.sendCh
+			ss.writeMu.Lock()
+			writeFull(clientConn, msg)
+			ss.writeMu.Unlock()
+		}
+	}()
+
+	// Read 2 messages from server side.
+	hdr := make([]byte, syncHeaderSize)
+	for i := 0; i < 2; i++ {
+		if _, err := io.ReadFull(serverConn, hdr); err != nil {
+			t.Fatalf("read header %d: %v", i, err)
+		}
+		if string(hdr[0:4]) != "BPSY" {
+			t.Fatalf("bad magic at msg %d", i)
+		}
+		if hdr[4] != syncMsgDeleteV4 {
+			t.Fatalf("expected delete msg, got type %d at msg %d", hdr[4], i)
+		}
+		pLen := binary.LittleEndian.Uint32(hdr[8:12])
+		payload := make([]byte, pLen)
+		if _, err := io.ReadFull(serverConn, payload); err != nil {
+			t.Fatalf("read payload %d: %v", i, err)
+		}
+	}
+
+	if ss.stats.DeletesSent.Load() != 2 {
+		t.Fatalf("expected 2 deletes sent, got %d", ss.stats.DeletesSent.Load())
+	}
+}
+
+func TestSessionQueueDoesNotJournal(t *testing.T) {
+	// Session updates (not deletes) should NOT be journaled — they get replayed by sweep.
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	// Disconnected.
+
+	key := dataplane.SessionKey{Protocol: 6}
+	val := dataplane.SessionValue{State: 1}
+	ss.QueueSessionV4(key, val)
+
+	ss.deleteJournalMu.Lock()
+	if len(ss.deleteJournal) != 0 {
+		t.Fatal("session updates should not be journaled")
+	}
+	ss.deleteJournalMu.Unlock()
 }

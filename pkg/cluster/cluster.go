@@ -1040,7 +1040,7 @@ func (m *Manager) HeartbeatStats() HeartbeatStats {
 
 // SyncStatsProvider abstracts access to session sync statistics.
 type SyncStatsProvider interface {
-	Stats() SyncStats
+	Stats() SyncStatsSnapshot
 	IsConnected() bool
 }
 
@@ -1052,7 +1052,7 @@ func (m *Manager) SetSyncStats(p SyncStatsProvider) {
 }
 
 // GetSyncStats returns sync stats, or nil if no provider is set.
-func (m *Manager) GetSyncStats() *SyncStats {
+func (m *Manager) GetSyncStats() *SyncStatsSnapshot {
 	m.mu.RLock()
 	p := m.syncStats
 	m.mu.RUnlock()
@@ -1281,7 +1281,7 @@ func (m *Manager) FormatInformation() string {
 			connected = "Up"
 		}
 		fmt.Fprintf(&b, "  Status: %s\n", connected)
-		fmt.Fprintf(&b, "  Errors: %d\n", syncStats.Errors.Load())
+		fmt.Fprintf(&b, "  Errors: %d\n", syncStats.Errors)
 	} else {
 		fmt.Fprintln(&b, "  Not configured")
 	}
@@ -1297,19 +1297,19 @@ func (m *Manager) FormatInformation() string {
 	// Cold synchronization.
 	fmt.Fprintln(&b, "Cold synchronization:")
 	if syncStats != nil {
-		startNano := syncStats.BulkSyncStartTime.Load()
-		endNano := syncStats.BulkSyncEndTime.Load()
-		bulkCount := syncStats.BulkSyncs.Load()
+		startNano := syncStats.BulkSyncStartTime
+		endNano := syncStats.BulkSyncEndTime
+		bulkCount := syncStats.BulkSyncs
 		if startNano > 0 {
 			startTime := time.Unix(0, startNano)
 			if endNano > 0 {
 				endTime := time.Unix(0, endNano)
 				dur := endTime.Sub(startTime)
 				fmt.Fprintf(&b, "  Last bulk sync: %s (duration: %s, sessions: %d)\n",
-					endTime.Format("Jan 02 15:04:05"), dur.Round(time.Millisecond), syncStats.BulkSyncSessions.Load())
+					endTime.Format("Jan 02 15:04:05"), dur.Round(time.Millisecond), syncStats.BulkSyncSessions)
 			} else {
 				fmt.Fprintf(&b, "  Bulk sync in progress since %s (sessions: %d)\n",
-					startTime.Format("Jan 02 15:04:05"), syncStats.BulkSyncSessions.Load())
+					startTime.Format("Jan 02 15:04:05"), syncStats.BulkSyncSessions)
 			}
 		}
 		fmt.Fprintf(&b, "  Bulk syncs completed: %d\n", bulkCount)
@@ -1342,14 +1342,14 @@ func (m *Manager) FormatInformation() string {
 	// Configuration synchronization.
 	fmt.Fprintln(&b, "Configuration synchronization:")
 	if syncStats != nil {
-		configNano := syncStats.LastConfigSyncTime.Load()
+		configNano := syncStats.LastConfigSyncTime
 		if configNano > 0 {
 			configTime := time.Unix(0, configNano)
 			fmt.Fprintf(&b, "  Last config sync: %s (size: %d bytes)\n",
-				configTime.Format("Jan 02 15:04:05"), syncStats.LastConfigSyncSize.Load())
+				configTime.Format("Jan 02 15:04:05"), syncStats.LastConfigSyncSize)
 		}
-		fmt.Fprintf(&b, "  Configs sent:     %d\n", syncStats.ConfigsSent.Load())
-		fmt.Fprintf(&b, "  Configs received: %d\n", syncStats.ConfigsReceived.Load())
+		fmt.Fprintf(&b, "  Configs sent:     %d\n", syncStats.ConfigsSent)
+		fmt.Fprintf(&b, "  Configs received: %d\n", syncStats.ConfigsReceived)
 	} else {
 		fmt.Fprintln(&b, "  Not configured")
 	}
@@ -1392,19 +1392,19 @@ func (m *Manager) FormatStatistics() string {
 		fmt.Fprintln(&b, "Services Synchronized:")
 		fmt.Fprintf(&b, "    %-32s %-12s %s\n", "Service name", "Sent", "Received")
 		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session create",
-			syncStats.SessionsSent.Load(), syncStats.SessionsReceived.Load())
+			syncStats.SessionsSent, syncStats.SessionsReceived)
 		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session close",
-			syncStats.DeletesSent.Load(), syncStats.DeletesReceived.Load())
+			syncStats.DeletesSent, syncStats.DeletesReceived)
 		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Config",
-			syncStats.ConfigsSent.Load(), syncStats.ConfigsReceived.Load())
+			syncStats.ConfigsSent, syncStats.ConfigsReceived)
 		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "IPsec SA",
-			syncStats.IPsecSASent.Load(), syncStats.IPsecSAReceived.Load())
+			syncStats.IPsecSASent, syncStats.IPsecSAReceived)
 		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Bulk syncs",
-			syncStats.BulkSyncs.Load(), syncStats.BulkSyncs.Load())
+			syncStats.BulkSyncs, syncStats.BulkSyncs)
 		fmt.Fprintf(&b, "    %-32s %-12s %d\n", "Sessions installed",
-			"", syncStats.SessionsInstalled.Load())
+			"", syncStats.SessionsInstalled)
 		fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Errors",
-			syncStats.Errors.Load(), "")
+			syncStats.Errors, "")
 	} else {
 		fmt.Fprintln(&b, "Session sync not configured")
 	}
@@ -1436,19 +1436,19 @@ func (m *Manager) FormatDataPlaneStatistics() string {
 	fmt.Fprintln(&b, "Services Synchronized:")
 	fmt.Fprintf(&b, "    %-32s %-12s %s\n", "Service name", "Sent", "Received")
 	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session create",
-		syncStats.SessionsSent.Load(), syncStats.SessionsReceived.Load())
+		syncStats.SessionsSent, syncStats.SessionsReceived)
 	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session close",
-		syncStats.DeletesSent.Load(), syncStats.DeletesReceived.Load())
+		syncStats.DeletesSent, syncStats.DeletesReceived)
 	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Config",
-		syncStats.ConfigsSent.Load(), syncStats.ConfigsReceived.Load())
+		syncStats.ConfigsSent, syncStats.ConfigsReceived)
 	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "IPsec SA",
-		syncStats.IPsecSASent.Load(), syncStats.IPsecSAReceived.Load())
+		syncStats.IPsecSASent, syncStats.IPsecSAReceived)
 	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Bulk syncs",
-		syncStats.BulkSyncs.Load(), syncStats.BulkSyncs.Load())
+		syncStats.BulkSyncs, syncStats.BulkSyncs)
 	fmt.Fprintf(&b, "    %-32s %-12s %d\n", "Sessions installed",
-		"", syncStats.SessionsInstalled.Load())
+		"", syncStats.SessionsInstalled)
 	fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Errors",
-		syncStats.Errors.Load(), "")
+		syncStats.Errors, "")
 	return b.String()
 }
 
@@ -1467,7 +1467,7 @@ func (m *Manager) FormatDataPlaneInterfaces() string {
 	}
 	syncStats := m.GetSyncStats()
 	if syncStats != nil {
-		fmt.Fprintf(&b, "  Errors: %d\n", syncStats.Errors.Load())
+		fmt.Fprintf(&b, "  Errors: %d\n", syncStats.Errors)
 	}
 	fabEvents := m.history.Events(EventFabric)
 	if len(fabEvents) > 0 {

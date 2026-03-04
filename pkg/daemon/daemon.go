@@ -160,6 +160,10 @@ type Daemon struct {
 	// sent for each inactive RG on startup. Prevents stale RA routes
 	// from a previous primary run keeping hosts dual-pathing traffic.
 	startupGoodbyeRA map[int]bool
+
+	// linkByNameFn resolves a network interface by name. Defaults to
+	// netlink.LinkByName; overridden in tests.
+	linkByNameFn func(string) (netlink.Link, error)
 }
 
 // New creates a new Daemon.
@@ -189,6 +193,7 @@ func New(opts Options) *Daemon {
 		rgStates:        make(map[int]*rgStateMachine),
 		blackholeRoutes: make(map[int][]netlink.Route),
 		reconcileNowCh:  make(chan struct{}, 1),
+		linkByNameFn:    netlink.LinkByName,
 	}
 }
 
@@ -4803,6 +4808,13 @@ func (d *Daemon) reconcileRGState() {
 				if !vrrpReady {
 					vrrpReasons = append(vrrpReasons, "session sync not ready")
 				}
+				// Also verify VIP ownership can be established: RETH
+				// interfaces must exist and be UP before we allow promotion.
+				vipOK, vipReasons := d.checkVIPReadiness(rgID)
+				if !vipOK {
+					vrrpReady = false
+					vrrpReasons = append(vrrpReasons, vipReasons...)
+				}
 			} else if d.vrrpMgr != nil {
 				vrrpReady, vrrpReasons = d.vrrpMgr.RGVRRPReady(rgID)
 			} else {
@@ -5406,6 +5418,44 @@ func (d *Daemon) clusterConfig() *config.ClusterConfig {
 		return nil
 	}
 	return cfg.Chassis.Cluster
+}
+
+// checkVIPReadiness verifies that RETH interfaces for the given RG exist and
+// are operationally UP, so that VIPs can actually be added. Used in
+// private-rg-election mode where there are no VRRP instances to gate readiness.
+func (d *Daemon) checkVIPReadiness(rgID int) (bool, []string) {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return true, nil // no config = nothing to check
+	}
+	linkByName := d.linkByNameFn
+	if linkByName == nil {
+		linkByName = netlink.LinkByName
+	}
+	return checkVIPReadinessForConfig(cfg, rgID, linkByName)
+}
+
+// checkVIPReadinessForConfig verifies that RETH interfaces for the given RG
+// exist and are operationally UP. Pure function for testability.
+func checkVIPReadinessForConfig(cfg *config.Config, rgID int, linkByName func(string) (netlink.Link, error)) (bool, []string) {
+	vipMap := vrrp.RethVIPsForRG(cfg, rgID)
+	if len(vipMap) == 0 {
+		return true, nil // no VIPs for this RG
+	}
+	var reasons []string
+	for ifName := range vipMap {
+		link, err := linkByName(ifName)
+		if err != nil {
+			reasons = append(reasons, fmt.Sprintf("vip interface %s not found", ifName))
+			continue
+		}
+		up := link.Attrs().OperState == netlink.OperUp ||
+			link.Attrs().Flags&net.FlagUp != 0
+		if !up {
+			reasons = append(reasons, fmt.Sprintf("vip interface %s down", ifName))
+		}
+	}
+	return len(reasons) == 0, reasons
 }
 
 // isNoRethVRRP returns true when no-reth-vrrp is explicitly configured,
