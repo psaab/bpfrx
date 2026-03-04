@@ -1062,11 +1062,24 @@ zone_resolved:
 			if (sv6 != NULL)
 				nn_has_session = 1;
 			if (nn_has_session) {
-				apply_dnat_before_fabric_redirect(ctx, meta);
-				int fab_rc =
-					try_fabric_redirect(ctx, meta);
-				if (fab_rc >= 0)
-					return fab_rc;
+				/* Only fabric-redirect when the egress
+				 * RG is NOT locally active.  When active,
+				 * the local kernel can resolve ARP/NDP
+				 * via KERNEL_ROUTE — the peer likely has
+				 * the same NO_NEIGH issue and fabric
+				 * redirect just wastes a round-trip. */
+				int nn_egress_active =
+					check_egress_rg_active(
+						fib.ifindex, 0);
+				if (!nn_egress_active) {
+					apply_dnat_before_fabric_redirect(
+						ctx, meta);
+					int fab_rc =
+						try_fabric_redirect(
+							ctx, meta);
+					if (fab_rc >= 0)
+						return fab_rc;
+				}
 			}
 		}
 		if (sv4 != NULL) {
