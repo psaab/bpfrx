@@ -79,7 +79,7 @@ This gives **per-RETH (per-RG) ownership election and failover over private HA l
 
 3. **There is already a switch to disable RETH VRRP**
 - `set chassis cluster no-reth-vrrp` compiles (`pkg/config/compiler.go:6071`).
-- In this mode, RETH VRRP instances are skipped (`pkg/vrrp/vrrp.go:72`).
+- In this mode, RETH VRRP instances are skipped (`pkg/vrrp/vrrp.go:72-75`).
 - Cluster events directly add/remove VIPs and send GARP/NA (`pkg/daemon/daemon.go:4379+`, `:4408+`).
 
 ## What "Turn VRRP Off On LAN/WAN" Looks Like
