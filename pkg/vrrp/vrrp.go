@@ -69,9 +69,9 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 	if cfg == nil {
 		return nil
 	}
-	// Unless reth-vrrp is explicitly enabled, the cluster state machine
-	// directly manages VIPs/GARPs — skip RETH VRRP instance creation.
-	if cc := cfg.Chassis.Cluster; cc != nil && !cc.RethVRRP {
+	// When no-reth-vrrp is set, the cluster state machine directly manages
+	// VIPs/GARPs — skip RETH VRRP instance creation.
+	if cc := cfg.Chassis.Cluster; cc != nil && cc.NoRethVRRP {
 		return nil
 	}
 	rethToPhys := cfg.RethToPhysical()
@@ -177,7 +177,7 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 
 // RethVIPsForRG returns the VIPs (CIDR strings) per Linux interface name for
 // RETH interfaces belonging to the given redundancy group. Used by
-// direct VIP mode (default when reth-vrrp is not set) where the daemon manages VIPs without VRRP.
+// direct VIP mode (when no-reth-vrrp is set) where the daemon manages VIPs without VRRP.
 func RethVIPsForRG(cfg *config.Config, rgID int) map[string][]string {
 	if cfg == nil {
 		return nil

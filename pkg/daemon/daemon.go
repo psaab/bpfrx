@@ -255,10 +255,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	// On fresh cluster daemon start, suppress VRRP preemption until session
 	// bulk sync completes (or timeout) to avoid preempt-before-sync outages.
-	// Only applies when reth-vrrp is enabled — otherwise no RETH VRRP instances.
+	// Only applies when VRRP is enabled — otherwise no RETH VRRP instances.
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
 		cc := cfg.Chassis.Cluster
-		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" && cc.RethVRRP {
+		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" && !cc.NoRethVRRP {
 			d.vrrpMgr.SetSyncHold(30 * time.Second)
 		}
 	}
@@ -5210,12 +5210,12 @@ func (d *Daemon) clusterConfig() *config.ClusterConfig {
 	return cfg.Chassis.Cluster
 }
 
-// isNoRethVRRP returns true when the cluster is configured without reth-vrrp,
+// isNoRethVRRP returns true when no-reth-vrrp is explicitly configured,
 // meaning the daemon directly manages VIPs/GARPs without VRRP instances.
-// This is the default for cluster mode; set reth-vrrp to use VRRP instead.
+// Default (no flag) uses VRRP for RETH failover.
 func (d *Daemon) isNoRethVRRP() bool {
 	cc := d.clusterConfig()
-	return cc != nil && !cc.RethVRRP
+	return cc != nil && cc.NoRethVRRP
 }
 
 // directAddVIPs adds VIPs for RETH interfaces in the given RG using netlink.

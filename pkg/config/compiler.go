@@ -446,12 +446,12 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
-	// Validate strict-vip-ownership requires reth-vrrp
-	if cc := cfg.Chassis.Cluster; cc != nil && !cc.RethVRRP {
+	// Validate strict-vip-ownership requires VRRP (incompatible with no-reth-vrrp)
+	if cc := cfg.Chassis.Cluster; cc != nil && cc.NoRethVRRP {
 		for _, rg := range cc.RedundancyGroups {
 			if rg.StrictVIPOwnership {
 				warnings = append(warnings, fmt.Sprintf(
-					"redundancy-group %d: strict-vip-ownership requires reth-vrrp (no VRRP instances to gate on)", rg.ID))
+					"redundancy-group %d: strict-vip-ownership incompatible with no-reth-vrrp (no VRRP instances to gate on)", rg.ID))
 			}
 		}
 	}
@@ -6068,8 +6068,8 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 	if clusterNode.FindChild("hitless-restart") != nil {
 		ch.Cluster.HitlessRestart = true
 	}
-	if clusterNode.FindChild("reth-vrrp") != nil {
-		ch.Cluster.RethVRRP = true
+	if clusterNode.FindChild("no-reth-vrrp") != nil {
+		ch.Cluster.NoRethVRRP = true
 	}
 	if n := clusterNode.FindChild("peer-fencing"); n != nil {
 		if v := nodeVal(n); v != "" {

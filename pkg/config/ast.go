@@ -1474,7 +1474,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"hitless-restart":               {children: nil},
 			"peer-fencing":                  {args: 1, children: nil},
 			"takeover-hold-time":            {args: 1, children: nil},
-			"reth-vrrp":                     {children: nil},
+			"no-reth-vrrp":                  {children: nil},
 			"redundancy-group": {args: 1, children: map[string]*schemaNode{
 				"node": {args: 1, children: map[string]*schemaNode{
 					"priority": {args: 1, children: nil},

@@ -14757,12 +14757,12 @@ func TestStrictVIPOwnershipDefaultFalse(t *testing.T) {
 	}
 }
 
-func TestChassisClusterRethVRRPSet(t *testing.T) {
+func TestChassisClusterNoRethVRRPSet(t *testing.T) {
 	tree := &ConfigTree{}
 	sets := []string{
 		"set chassis cluster cluster-id 1",
 		"set chassis cluster node 0",
-		"set chassis cluster reth-vrrp",
+		"set chassis cluster no-reth-vrrp",
 	}
 	for _, line := range sets {
 		cmd, err := ParseSetCommand(line)
@@ -14780,16 +14780,16 @@ func TestChassisClusterRethVRRPSet(t *testing.T) {
 	if cfg.Chassis.Cluster == nil {
 		t.Fatal("Cluster is nil")
 	}
-	if !cfg.Chassis.Cluster.RethVRRP {
-		t.Error("RethVRRP = false, want true")
+	if !cfg.Chassis.Cluster.NoRethVRRP {
+		t.Error("NoRethVRRP = false, want true")
 	}
 }
 
-func TestChassisClusterRethVRRPHierarchical(t *testing.T) {
+func TestChassisClusterNoRethVRRPHierarchical(t *testing.T) {
 	input := `chassis {
     cluster {
         cluster-id 1;
-        reth-vrrp;
+        no-reth-vrrp;
     }
 }`
 	tree, errs := NewParser(input).Parse()
@@ -14803,12 +14803,12 @@ func TestChassisClusterRethVRRPHierarchical(t *testing.T) {
 	if cfg.Chassis.Cluster == nil {
 		t.Fatal("Cluster is nil")
 	}
-	if !cfg.Chassis.Cluster.RethVRRP {
-		t.Error("RethVRRP = false, want true")
+	if !cfg.Chassis.Cluster.NoRethVRRP {
+		t.Error("NoRethVRRP = false, want true")
 	}
 }
 
-func TestChassisClusterRethVRRPDefault(t *testing.T) {
+func TestChassisClusterNoRethVRRPDefault(t *testing.T) {
 	input := `chassis {
     cluster {
         cluster-id 1;
@@ -14825,8 +14825,8 @@ func TestChassisClusterRethVRRPDefault(t *testing.T) {
 	if cfg.Chassis.Cluster == nil {
 		t.Fatal("Cluster is nil")
 	}
-	if cfg.Chassis.Cluster.RethVRRP {
-		t.Error("RethVRRP = true, want false (default = direct VIP management)")
+	if cfg.Chassis.Cluster.NoRethVRRP {
+		t.Error("NoRethVRRP = true, want false (default = VRRP enabled)")
 	}
 }
 
