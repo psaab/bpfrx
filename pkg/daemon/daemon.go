@@ -907,6 +907,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
+	// Withdraw RA senders (sends goodbye RAs with lifetime=0) before VRRP
+	// stop so hosts immediately stop using this node as a default router.
+	if d.ra != nil {
+		if err := d.ra.Withdraw(); err != nil {
+			slog.Warn("shutdown: failed to withdraw RA senders", "err", err)
+		}
+	}
+
 	// Direct-mode: remove VIPs before VRRP stop (VRRP won't manage them).
 	if d.isNoRethVRRP() && cfg.Chassis.Cluster != nil {
 		for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
@@ -1189,6 +1197,65 @@ func removeAutoLinkLocal(ifName string) {
 	}
 }
 
+// ensureRethLinkLocal adds a link-local IPv6 address to a RETH member
+// interface (or its VLAN sub-interface) if one is missing. RETH interfaces
+// have addr_gen_mode=1 to suppress MLDv2 noise, but the kernel needs a
+// link-local source address for NDP Neighbor Solicitations when forwarding
+// IPv6 traffic to on-link destinations. Without this, bpf_fib_lookup returns
+// NO_NEIGH and the kernel can never resolve the neighbor.
+//
+// Computes EUI-64 link-local from the interface MAC and adds it with NODAD.
+func ensureRethLinkLocal(ifName string) {
+	link, err := netlink.LinkByName(ifName)
+	if err != nil {
+		return
+	}
+	mac := link.Attrs().HardwareAddr
+	if len(mac) != 6 {
+		return
+	}
+	// Check if link-local already exists.
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
+	if err != nil {
+		return
+	}
+	for _, a := range addrs {
+		if a.IP.IsLinkLocalUnicast() {
+			return // already have one
+		}
+	}
+
+	// Compute EUI-64 link-local from MAC.
+	ll := net.IP{0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+		mac[0] ^ 0x02, mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]}
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: ll, Mask: net.CIDRMask(64, 128)},
+		Flags: unix.IFA_F_NODAD,
+	}
+	if err := netlink.AddrAdd(link, addr); err != nil {
+		slog.Warn("failed to add link-local to RETH interface",
+			"iface", ifName, "addr", ll, "err", err)
+	} else {
+		slog.Info("added link-local for NDP on RETH interface",
+			"iface", ifName, "addr", ll)
+	}
+}
+
+// rethUnitHasIPv6 checks whether the RETH config has IPv6 addresses on the
+// given unit number (VLAN ID). Unit 0 is the native/untagged interface.
+func rethUnitHasIPv6(rethCfg *config.InterfaceConfig, unitNum int) bool {
+	unit, ok := rethCfg.Units[unitNum]
+	if !ok {
+		return false
+	}
+	for _, addr := range unit.Addresses {
+		if strings.Contains(addr, ":") {
+			return true
+		}
+	}
+	return unit.DHCPv6
+}
+
 func isInteractive() bool {
 	_, err := unix.IoctlGetTermios(int(os.Stdin.Fd()), unix.TCGETS)
 	return err == nil
@@ -1459,6 +1526,11 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			}
 			clearDadFailed(linuxName)
 			removeAutoLinkLocal(linuxName)
+			// Re-add link-local if this parent interface has IPv6 on unit 0.
+			// NDP Neighbor Solicitation requires a link-local source address.
+			if rethUnitHasIPv6(rethCfg, 0) {
+				ensureRethLinkLocal(linuxName)
+			}
 
 			// Re-disable VLAN RX offload after MAC programming.
 			// The iavf VF driver resets ethtool features (including
@@ -1496,6 +1568,15 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 						}
 					}
 					removeAutoLinkLocal(subName)
+					// Re-add link-local if this VLAN sub-interface has IPv6.
+					// Extract VLAN ID from sub-interface name (e.g. "ge-7-0-1.100").
+					if dotIdx := strings.LastIndex(subName, "."); dotIdx >= 0 {
+						if vid, err := strconv.Atoi(subName[dotIdx+1:]); err == nil {
+							if rethUnitHasIPv6(rethCfg, vid) {
+								ensureRethLinkLocal(subName)
+							}
+						}
+					}
 				}
 			}
 		}
