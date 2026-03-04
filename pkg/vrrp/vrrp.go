@@ -4,6 +4,7 @@ package vrrp
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
@@ -188,6 +189,11 @@ func RethVIPsForRG(cfg *config.Config, rgID int) map[string][]string {
 	for _, name := range sortedIfNames(cfg) {
 		ifc := cfg.Interfaces.Interfaces[name]
 		if ifc.RedundancyGroup != rgID {
+			continue
+		}
+		// Only include actual RETH interfaces — skip fabric, control,
+		// and management interfaces that default to RedundancyGroup 0.
+		if !strings.HasPrefix(name, "reth") {
 			continue
 		}
 
