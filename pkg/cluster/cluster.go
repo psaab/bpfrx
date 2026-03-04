@@ -138,6 +138,10 @@ type Manager struct {
 	// equivalent of VRRP sync-hold — gates RG promotion until session state
 	// is synchronized from the peer.
 	syncReady bool
+
+	// syncTransport records whether session sync uses "fabric" or
+	// "control-link" transport. Displayed in CLI status.
+	syncTransport string
 }
 
 // DefaultTakeoverHoldTime is the default duration an RG must be ready
@@ -194,6 +198,23 @@ func (m *Manager) IsSyncReady() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.syncReady
+}
+
+// SetSyncTransport records the active sync transport mode ("fabric" or "control-link").
+func (m *Manager) SetSyncTransport(transport string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.syncTransport = transport
+}
+
+// SyncTransport returns the active sync transport mode.
+func (m *Manager) SyncTransport() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.syncTransport == "" {
+		return "fabric"
+	}
+	return m.syncTransport
 }
 
 // SetRGReady updates the readiness state for a redundancy group.
@@ -1175,6 +1196,7 @@ func (m *Manager) FormatInformation() string {
 	if controlIface != "" {
 		fmt.Fprintf(&b, "  Control interface: %s\n", controlIface)
 	}
+	fmt.Fprintf(&b, "  Sync transport: %s\n", m.SyncTransport())
 	fmt.Fprintln(&b)
 
 	// Node health.
@@ -1246,8 +1268,12 @@ func (m *Manager) FormatInformation() string {
 	fmt.Fprintf(&b, "  Heartbeat packet errors:    %d\n", hbStats.SendErrors+hbStats.RecvErrors)
 	fmt.Fprintln(&b)
 
-	// Fabric link statistics.
-	fmt.Fprintln(&b, "Fabric link statistics:")
+	// Sync link statistics.
+	syncLabel := "Fabric link statistics:"
+	if m.SyncTransport() == "control-link" {
+		syncLabel = "Sync link statistics (control-link):"
+	}
+	fmt.Fprintln(&b, syncLabel)
 	syncStats := m.GetSyncStats()
 	if syncStats != nil {
 		connected := "Down"
@@ -1429,7 +1455,11 @@ func (m *Manager) FormatDataPlaneStatistics() string {
 // FormatDataPlaneInterfaces returns fabric interface status.
 func (m *Manager) FormatDataPlaneInterfaces() string {
 	var b strings.Builder
-	fmt.Fprintln(&b, "Fabric link:")
+	if m.SyncTransport() == "control-link" {
+		fmt.Fprintln(&b, "Sync link (control-link):")
+	} else {
+		fmt.Fprintln(&b, "Fabric link:")
+	}
 	if m.IsSyncConnected() {
 		fmt.Fprintln(&b, "  Status: Up")
 	} else {
@@ -1565,13 +1595,17 @@ func (m *Manager) FormatInterfaces(input InterfacesInput) string {
 		fmt.Fprintln(&b)
 	}
 
-	// Fabric link status.
+	// Sync link status.
 	fabricUp := m.IsSyncConnected()
 	fabricStatus := "Up"
 	if !fabricUp {
 		fabricStatus = "Down"
 	}
-	fmt.Fprintf(&b, "Fabric link status: %s\n", fabricStatus)
+	if m.SyncTransport() == "control-link" {
+		fmt.Fprintf(&b, "Sync link status (control-link): %s\n", fabricStatus)
+	} else {
+		fmt.Fprintf(&b, "Fabric link status: %s\n", fabricStatus)
+	}
 	fmt.Fprintln(&b)
 
 	// Fabric interfaces table.

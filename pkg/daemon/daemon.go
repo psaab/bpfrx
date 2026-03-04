@@ -3716,19 +3716,29 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 		}()
 	}
 
-	// Start session/config sync on fabric interface.
-	// Retry: fabric interface address and VRF may not be ready at startup.
-	if cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
+	// Start session/config sync on the control link (same interface as
+	// heartbeat, port 4785). Consolidates all control-plane traffic onto
+	// the dedicated control path. Falls back to fabric if no control
+	// interface is configured (legacy compatibility).
+	syncIface := cc.ControlInterface
+	syncPeerAddr := cc.PeerAddress
+	syncTransport := "control-link"
+	if syncIface == "" || syncPeerAddr == "" {
+		syncIface = cc.FabricInterface
+		syncPeerAddr = cc.FabricPeerAddress
+		syncTransport = "fabric"
+	}
+	if syncIface != "" && syncPeerAddr != "" {
 		go func() {
-			var fabIP string
+			var syncIP string
 			for i := 0; i < 30; i++ {
-				fabIP = resolveInterfaceAddr(cc.FabricInterface, "")
-				if fabIP != "" {
+				syncIP = resolveInterfaceAddr(syncIface, "")
+				if syncIP != "" {
 					break
 				}
 				if i == 0 {
-					slog.Info("cluster: fabric interface has no IPv4 address yet, waiting",
-						"interface", cc.FabricInterface)
+					slog.Info("cluster: sync interface has no IPv4 address yet, waiting",
+						"interface", syncIface, "transport", syncTransport)
 				}
 				select {
 				case <-commsCtx.Done():
@@ -3736,18 +3746,21 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				case <-time.After(2 * time.Second):
 				}
 			}
-			if fabIP == "" {
-				slog.Error("cluster: fabric interface address not available after retries",
-					"interface", cc.FabricInterface)
+			if syncIP == "" {
+				slog.Error("cluster: sync interface address not available after retries",
+					"interface", syncIface)
 				return
 			}
 
-			syncLocal := fmt.Sprintf("%s:4785", fabIP)
-			syncPeer := fmt.Sprintf("%s:4785", cc.FabricPeerAddress)
+			syncLocal := fmt.Sprintf("%s:4785", syncIP)
+			syncPeer := fmt.Sprintf("%s:4785", syncPeerAddr)
+			slog.Info("cluster: session sync transport", "mode", syncTransport,
+				"local", syncLocal, "peer", syncPeer)
 
 			// Resolve secondary fabric (fab1) for dual transport failover.
+			// Only applicable when using fabric transport (not control-link).
 			var syncLocal1, syncPeer1 string
-			if cc.Fabric1Interface != "" && cc.Fabric1PeerAddress != "" {
+			if syncTransport == "fabric" && cc.Fabric1Interface != "" && cc.Fabric1PeerAddress != "" {
 				var fab1IP string
 				for i := 0; i < 15; i++ {
 					fab1IP = resolveInterfaceAddr(cc.Fabric1Interface, "")
@@ -3781,13 +3794,16 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				d.sessionSync = cluster.NewSessionSync(syncLocal, syncPeer, nil)
 			}
 
+			d.cluster.SetSyncTransport(syncTransport)
+
 			// Start gRPC fabric listener so peer can proxy monitor requests.
 			// d.grpcSrv is set after startClusterComms returns, so we poll briefly.
+			// Uses the sync interface address (fabric or control-link).
 			go func() {
 				for i := 0; i < 30; i++ {
 					if d.grpcSrv != nil {
-						fabricGRPC := fmt.Sprintf("%s:50051", fabIP)
-						d.grpcSrv.RunFabricListener(commsCtx, fabricGRPC, vrfDevice)
+						grpcAddr := fmt.Sprintf("%s:50051", syncIP)
+						d.grpcSrv.RunFabricListener(commsCtx, grpcAddr, vrfDevice)
 						return
 					}
 					time.Sleep(time.Second)
