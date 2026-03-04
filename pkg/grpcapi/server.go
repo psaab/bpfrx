@@ -865,6 +865,15 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 			return true
 		}
 		if idx >= offset && len(all) < limit {
+			// Merge counters from reverse entry — return packets
+			// increment rev_packets on the reverse entry, not the
+			// forward entry we're displaying.
+			if rev, err := s.dp.GetSessionV4(val.ReverseKey); err == nil {
+				val.RevPackets += rev.RevPackets
+				val.RevBytes += rev.RevBytes
+				val.FwdPackets += rev.FwdPackets
+				val.FwdBytes += rev.FwdBytes
+			}
 			se := sessionEntryV4(key, val, now, zoneNames, policyNames, zoneIfaces, haActive)
 			se.Application = resolveAppName(key.Protocol, ntohs(key.DstPort), cfg)
 			all = append(all, se)
@@ -903,6 +912,12 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 			return true
 		}
 		if idx >= offset && len(all) < limit {
+			if rev, err := s.dp.GetSessionV6(val.ReverseKey); err == nil {
+				val.RevPackets += rev.RevPackets
+				val.RevBytes += rev.RevBytes
+				val.FwdPackets += rev.FwdPackets
+				val.FwdBytes += rev.FwdBytes
+			}
 			se := sessionEntryV6(key, val, now, zoneNames, policyNames, zoneIfaces, haActive)
 			se.Application = resolveAppName(key.Protocol, ntohs(key.DstPort), cfg)
 			all = append(all, se)
