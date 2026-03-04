@@ -496,6 +496,9 @@ deploy_vm() {
 		info "Pushing unified HA config to $vm..."
 		incus exec "$vm" -- mkdir -p /etc/bpfrx
 		incus file push "$conf" "$vm/etc/bpfrx/bpfrx.conf"
+		# Clear configstore DB so daemon bootstraps from the new text file.
+		# Without this, the daemon loads the OLD config from active.json.
+		incus exec "$vm" -- rm -rf /etc/bpfrx/.configdb
 	else
 		warn "Config file $conf not found"
 	fi

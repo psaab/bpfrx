@@ -12,7 +12,7 @@ LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime
 # eBPF compilation flags
 BPF_CFLAGS := -O2 -g -Wall -Werror -target bpf
 
-.PHONY: all generate build build-ctl proto install clean test test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash build-dpdk-worker build-dpdk clean-dpdk
+.PHONY: all generate build build-ctl proto install clean test test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-private-rg build-dpdk-worker build-dpdk clean-dpdk
 
 all: generate build build-ctl
 
@@ -110,6 +110,10 @@ test-stress-failover:
 # Hard-crash / hung-node HA test (force-stop + daemon stop + multi-cycle — requires cluster + iperf3 server)
 test-ha-crash:
 	./test/incus/test-ha-crash.sh
+
+# Private RG election test (enable/disable private-rg-election, verify VRRP behavior)
+test-private-rg:
+	./test/incus/test-private-rg.sh $(MODE)
 
 # Restart connectivity regression test (verify no transient loss during daemon restart — requires cluster + iperf3 server)
 test-restart-connectivity:

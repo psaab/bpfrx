@@ -224,6 +224,28 @@ test_cluster() {
 		ping6_test "cluster-lan-host" "2607:f8b0:4005:80e::200e" \
 			"cluster: LAN host → internet IPv6 (2607:f8b0:4005:80e::200e)"
 
+		# IPv6 TCP: iperf3 from LAN host to WAN (proves SNAT v6 + return path)
+		if incus exec cluster-lan-host -- which iperf3 &>/dev/null 2>&1; then
+			if incus exec cluster-lan-host -- timeout 8 iperf3 -6 -c 2001:559:8585:100::200 -t 3 &>/dev/null 2>&1; then
+				pass "cluster: LAN host → WAN iperf3 IPv6 TCP"
+			else
+				fail "cluster: LAN host → WAN iperf3 IPv6 TCP (SNAT v6 may be missing)"
+			fi
+		else
+			skip "cluster: IPv6 TCP test (iperf3 not installed on cluster-lan-host)"
+		fi
+
+		# IPv4 TCP: iperf3 from LAN host to WAN
+		if incus exec cluster-lan-host -- which iperf3 &>/dev/null 2>&1; then
+			if incus exec cluster-lan-host -- timeout 8 iperf3 -c 172.16.100.200 -t 3 &>/dev/null 2>&1; then
+				pass "cluster: LAN host → WAN iperf3 IPv4 TCP"
+			else
+				fail "cluster: LAN host → WAN iperf3 IPv4 TCP"
+			fi
+		else
+			skip "cluster: IPv4 TCP test (iperf3 not installed on cluster-lan-host)"
+		fi
+
 		# mtr path validation: verify traffic traverses RETH VIP to WAN gateway
 		mtr_test "cluster-lan-host" "172.16.50.1" "10.0.60.1" \
 			"cluster: mtr LAN→WAN gateway (path through RETH VIP)"
