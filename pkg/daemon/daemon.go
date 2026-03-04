@@ -4744,15 +4744,16 @@ func (d *Daemon) reconcileRGState() {
 			}
 		}
 
-		// Direct-mode VIP safety net: idempotently add/remove VIPs
-		// to recover from missed events or transient address changes
-		// (e.g. networkd reload). Removes stale VIPs on inactive RGs.
+		// Direct-mode VIP safety net: idempotently add VIPs on active
+		// RGs to recover from missed events or transient address removal
+		// (e.g. networkd reload). VIP removal only on state change to
+		// avoid racing with event-driven directAddVIPs during failover.
 		if noRethVRRP {
 			if tr.Active {
 				if added := d.directAddVIPs(rgID); added > 0 {
 					go d.directSendGARPs(rgID)
 				}
-			} else {
+			} else if tr.Changed {
 				d.directRemoveVIPs(rgID)
 			}
 		}
