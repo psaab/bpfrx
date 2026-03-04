@@ -459,9 +459,53 @@ cmd_deploy() {
 	case "$target" in
 		0)   deploy_vm 0 ;;
 		1)   deploy_vm 1 ;;
-		all) deploy_vm 0; deploy_vm 1 ;;
+		all) deploy_rolling ;;
 		*)   die "Usage: $0 deploy [0|1|all]" ;;
 	esac
+}
+
+# Rolling deploy: secondary first, wait for sync, then primary.
+# This preserves traffic flow — the primary continues forwarding while
+# the secondary upgrades, then the upgraded secondary takes over when
+# the primary restarts.
+deploy_rolling() {
+	# Determine which node is currently secondary (deploy it first).
+	local secondary=1
+	local primary=0
+	if incus exec "$VM0" -- cli -c "show chassis cluster status" 2>/dev/null | grep -q "secondary:node0"; then
+		secondary=0
+		primary=1
+	fi
+
+	info "Rolling deploy: secondary=node${secondary}, primary=node${primary}"
+
+	# Phase 1: Deploy to secondary (traffic stays on primary).
+	info "Phase 1: Deploying to secondary (node${secondary})..."
+	deploy_vm "$secondary"
+
+	# Wait for the secondary to come up and establish session sync.
+	info "Waiting for node${secondary} to sync..."
+	local vm_sec
+	vm_sec=$(vm_name "$secondary")
+	local retries=30
+	while (( retries > 0 )); do
+		if incus exec "$vm_sec" -- cli -c "show chassis cluster status" 2>/dev/null | grep -q "primary\|secondary"; then
+			break
+		fi
+		sleep 2
+		(( retries-- ))
+	done
+	if (( retries == 0 )); then
+		warn "Timed out waiting for node${secondary} — continuing anyway"
+	fi
+	# Extra settle time for session sync bulk transfer.
+	sleep 5
+
+	# Phase 2: Deploy to primary (secondary takes over via VRRP).
+	info "Phase 2: Deploying to primary (node${primary})..."
+	deploy_vm "$primary"
+
+	info "Rolling deploy complete."
 }
 
 deploy_vm() {

@@ -1999,7 +1999,41 @@ func (t *ConfigTree) SetPath(path []string) error {
 			return nil
 		}
 
-		// More tokens follow: this is a container. Find or create matching node.
+		// More tokens follow. If the schema says this is a multi-value leaf
+		// with no children AND the next token is a known sibling keyword,
+		// add it as a leaf and continue at the same level so remaining
+		// tokens become siblings (e.g. "match" children:
+		// destination-address any source-address any application any).
+		// If the next token is NOT a known sibling, the remaining tokens
+		// are trailing values for this leaf (e.g. "destination-port 20000 to 20003").
+		if childSchema.children == nil && childSchema.multi && i < len(path) {
+			nextToken := path[i]
+			_, nextIsSibling := schema.children[nextToken]
+			if !nextIsSibling && schema.wildcard != nil {
+				nextIsSibling = true
+			}
+			if nextIsSibling {
+				// Dedup: skip if exact leaf already exists.
+				dup := false
+				for _, n := range *current {
+					if n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					*current = append(*current, &Node{
+						Keys:   append([]string(nil), nodeKeys...),
+						IsLeaf: true,
+					})
+				}
+				// Don't descend — continue at same level for next sibling.
+				continue
+			}
+		}
+
+		// This is a container (or a leaf with trailing value tokens).
+		// Find or create matching node.
 		found := false
 		for _, n := range *current {
 			if !n.IsLeaf && keysEqual(n.Keys, nodeKeys) {

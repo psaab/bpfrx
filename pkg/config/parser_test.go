@@ -6106,6 +6106,40 @@ func TestPolicySetSyntax(t *testing.T) {
 	}
 }
 
+// TestPolicyMatchSingleLineSetSyntax verifies that multiple match criteria on
+// a single set line become siblings under match, not nested children.
+// e.g. "set ... match destination-address any source-address any application any"
+func TestPolicyMatchSingleLineSetSyntax(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set security policies from-zone lan to-zone wan policy allow-ps match destination-address any source-address any application any",
+		"set security policies from-zone lan to-zone wan policy allow-ps then permit",
+	} {
+		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	if len(cfg.Security.Policies) != 1 {
+		t.Fatalf("got %d zone-pair policies, want 1", len(cfg.Security.Policies))
+	}
+	pol := cfg.Security.Policies[0].Policies[0]
+	if len(pol.Match.SourceAddresses) != 1 || pol.Match.SourceAddresses[0] != "any" {
+		t.Errorf("source-address = %v, want [any]", pol.Match.SourceAddresses)
+	}
+	if len(pol.Match.DestinationAddresses) != 1 || pol.Match.DestinationAddresses[0] != "any" {
+		t.Errorf("destination-address = %v, want [any]", pol.Match.DestinationAddresses)
+	}
+	if len(pol.Match.Applications) != 1 || pol.Match.Applications[0] != "any" {
+		t.Errorf("application = %v, want [any]", pol.Match.Applications)
+	}
+}
+
 func TestGlobalPolicies(t *testing.T) {
 	input := `
 security {
