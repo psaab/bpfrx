@@ -1,13 +1,17 @@
 package ra
 
 import (
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"os"
 	"time"
 
 	"github.com/mdlayher/ndp"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
@@ -54,8 +58,27 @@ func newSender(cfg *config.RAInterfaceConfig, iface *net.Interface) *sender {
 }
 
 // start opens the NDP connection and launches the sender goroutine.
+// Ensures a link-local address exists (RETH interfaces suppress auto
+// link-local via addr_gen_mode=1, so we add one explicitly with NODAD).
 func (s *sender) start() error {
-	conn, srcAddr, err := ndp.Listen(s.iface, ndp.LinkLocal)
+	if err := ensureLinkLocal(s.iface); err != nil {
+		slog.Warn("ra: failed to ensure link-local", "interface", s.iface.Name, "err", err)
+	}
+
+	var conn *ndp.Conn
+	var srcAddr netip.Addr
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		conn, srcAddr, err = ndp.Listen(s.iface, ndp.LinkLocal)
+		if err == nil {
+			break
+		}
+		// Re-read interface (link-local may appear after addr add).
+		time.Sleep(200 * time.Millisecond)
+		if iface, e := net.InterfaceByName(s.iface.Name); e == nil {
+			s.iface = iface
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -316,4 +339,64 @@ func (s *sender) randomAdvInterval() time.Duration {
 
 	interval := minI + rand.IntN(maxI-minI+1)
 	return time.Duration(interval) * time.Second
+}
+
+// ensureLinkLocal checks whether the interface has a link-local IPv6 address.
+// RETH interfaces have addr_gen_mode=1 (stable-privacy) set to suppress
+// automatic link-local generation, but the RA sender needs one for its NDP
+// socket. If no link-local exists, this computes one via EUI-64 from the
+// interface MAC and adds it with IFA_F_NODAD.
+func ensureLinkLocal(iface *net.Interface) error {
+	link, err := netlink.LinkByName(iface.Name)
+	if err != nil {
+		return err
+	}
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
+	if err != nil {
+		return err
+	}
+	for _, a := range addrs {
+		if a.IP.IsLinkLocalUnicast() {
+			return nil // already have one
+		}
+	}
+
+	// No link-local. Set addr_gen_mode=0 (EUI-64) so kernel generates one
+	// on next link toggle, then toggle the link.
+	addrGenPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/addr_gen_mode", iface.Name)
+	if err := os.WriteFile(addrGenPath, []byte("0"), 0644); err != nil {
+		return fmt.Errorf("set addr_gen_mode=0: %w", err)
+	}
+
+	// Disable DAD for the link-local — virtual MAC may conflict with peer.
+	dadPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", iface.Name)
+	os.WriteFile(dadPath, []byte("0"), 0644)
+
+	// Toggle link to trigger link-local generation.
+	netlink.LinkSetDown(link)
+	time.Sleep(50 * time.Millisecond)
+	if err := netlink.LinkSetUp(link); err != nil {
+		return fmt.Errorf("link up: %w", err)
+	}
+
+	// Wait for kernel to assign the address (may take >500ms on some systems).
+	for i := 0; i < 20; i++ {
+		time.Sleep(100 * time.Millisecond)
+		addrs, _ = netlink.AddrList(link, netlink.FAMILY_V6)
+		for _, a := range addrs {
+			if a.IP.IsLinkLocalUnicast() {
+				// Mark it NODAD to avoid MLDv2 DAD probes.
+				if a.Flags&unix.IFA_F_NODAD == 0 {
+					netlink.AddrDel(link, &a)
+					a.Flags = unix.IFA_F_NODAD
+					netlink.AddrAdd(link, &a)
+				}
+				slog.Info("ra: added link-local for RA sender",
+					"interface", iface.Name, "addr", a.IP)
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("link-local did not appear after addr_gen_mode=0 + link toggle")
 }
