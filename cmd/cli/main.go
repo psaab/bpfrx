@@ -1192,7 +1192,7 @@ func printSessionEntries(resp *pb.GetSessionsResponse, brief bool) {
 	if brief {
 		fmt.Printf("%-5s %-22s %-22s %-5s %-20s %-3s %-5s %5s %s\n",
 			"ID", "Source", "Destination", "Proto", "Zone", "NAT", "State", "Age", "Pkts(f/r)")
-		for i, se := range resp.Sessions {
+		for _, se := range resp.Sessions {
 			inZone := se.IngressZoneName
 			if inZone == "" {
 				inZone = fmt.Sprintf("%d", se.IngressZone)
@@ -1214,10 +1214,14 @@ func printSessionEntries(resp *pb.GetSessionsResponse, brief bool) {
 			if len(st) > 5 {
 				st = st[:5]
 			}
+			sid := se.SessionId
+			if sid == 0 {
+				sid = uint64(resp.Offset) + 1
+			}
 			fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
-				i+1,
-				fmt.Sprintf("%s:%d", se.SrcAddr, se.SrcPort),
-				fmt.Sprintf("%s:%d", se.DstAddr, se.DstPort),
+				sid,
+				fmt.Sprintf("%s/%d", se.SrcAddr, se.SrcPort),
+				fmt.Sprintf("%s/%d", se.DstAddr, se.DstPort),
 				se.Protocol, inZone+"->"+outZone, natFlag,
 				st, se.AgeSeconds,
 				se.FwdPackets, se.RevPackets)
@@ -1226,32 +1230,56 @@ func printSessionEntries(resp *pb.GetSessionsResponse, brief bool) {
 		return
 	}
 
-	for i, se := range resp.Sessions {
+	for _, se := range resp.Sessions {
 		polDisplay := se.PolicyName
 		if polDisplay == "" {
 			polDisplay = fmt.Sprintf("%d", se.PolicyId)
 		}
-		fmt.Printf("Session ID: %d, Policy: %s, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
-			i+1, polDisplay, se.State, se.TimeoutSeconds, se.AgeSeconds, se.IdleSeconds)
-		inZone := se.IngressZoneName
-		if inZone == "" {
-			inZone = fmt.Sprintf("%d", se.IngressZone)
+		sid := se.SessionId
+		if sid == 0 {
+			sid = uint64(resp.Offset) + 1
 		}
-		outZone := se.EgressZoneName
-		if outZone == "" {
-			outZone = fmt.Sprintf("%d", se.EgressZone)
+
+		// Junos format header
+		haStr := ""
+		if se.HaActive {
+			haStr = "Active"
+		} else {
+			haStr = "Backup"
 		}
-		fmt.Printf("  In: %s:%d --> %s:%d;%s, Zone: %s -> %s\n",
+		fmt.Printf("Session ID: %d, Policy name: %s/%d, HA State: %s, Timeout: %d, Session State: Valid\n",
+			sid, polDisplay, se.PolicyId, haStr, se.TimeoutSeconds)
+
+		// In line: original direction
+		inIf := se.IngressInterface
+		if inIf == "" {
+			inIf = se.IngressZoneName
+		}
+		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
 			se.SrcAddr, se.SrcPort, se.DstAddr, se.DstPort,
-			se.Protocol, inZone, outZone)
-		if se.Nat != "" {
-			fmt.Printf("  NAT: %s\n", se.Nat)
+			se.Protocol, inIf, se.FwdPackets, se.FwdBytes)
+
+		// Out line: reverse direction (with NAT translations applied)
+		outSrcAddr := se.DstAddr
+		outSrcPort := se.DstPort
+		outDstAddr := se.SrcAddr
+		outDstPort := se.SrcPort
+		if se.NatSrcAddr != "" {
+			outDstAddr = se.NatSrcAddr
+			outDstPort = se.NatSrcPort
 		}
-		if se.Application != "" {
-			fmt.Printf("  Application: %s\n", se.Application)
+		if se.NatDstAddr != "" {
+			outSrcAddr = se.NatDstAddr
+			outSrcPort = se.NatDstPort
 		}
-		fmt.Printf("  Packets: %d/%d, Bytes: %d/%d\n",
-			se.FwdPackets, se.RevPackets, se.FwdBytes, se.RevBytes)
+		outIf := se.EgressInterface
+		if outIf == "" {
+			outIf = se.EgressZoneName
+		}
+		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
+			outSrcAddr, outSrcPort, outDstAddr, outDstPort,
+			se.Protocol, outIf, se.RevPackets, se.RevBytes)
+		fmt.Println()
 	}
 	fmt.Printf("Total sessions: %d\n", resp.Total)
 }

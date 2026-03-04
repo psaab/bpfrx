@@ -278,6 +278,13 @@ message SessionEntry {
   string application = 20;        // resolved application name
   string policy_name = 21;        // resolved policy name
   uint64 session_id = 22;         // unique session ID (same on both cluster nodes)
+  string ingress_interface = 23;  // Junos-style interface name for ingress zone
+  string egress_interface = 24;   // Junos-style interface name for egress zone
+  string nat_src_addr = 25;       // SNAT translated source address
+  uint32 nat_src_port = 26;       // SNAT translated source port
+  string nat_dst_addr = 27;       // DNAT translated destination address
+  uint32 nat_dst_port = 28;       // DNAT translated destination port
+  bool ha_active = 29;            // true if session is on HA primary node
 }
 
 message GetSessionSummaryRequest {

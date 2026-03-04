@@ -2404,31 +2404,38 @@ func (x *GetSessionsResponse) GetPeer() *GetSessionsResponse {
 }
 
 type SessionEntry struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	SrcAddr         string                 `protobuf:"bytes,1,opt,name=src_addr,json=srcAddr,proto3" json:"src_addr,omitempty"`
-	DstAddr         string                 `protobuf:"bytes,2,opt,name=dst_addr,json=dstAddr,proto3" json:"dst_addr,omitempty"`
-	SrcPort         uint32                 `protobuf:"varint,3,opt,name=src_port,json=srcPort,proto3" json:"src_port,omitempty"`
-	DstPort         uint32                 `protobuf:"varint,4,opt,name=dst_port,json=dstPort,proto3" json:"dst_port,omitempty"`
-	Protocol        string                 `protobuf:"bytes,5,opt,name=protocol,proto3" json:"protocol,omitempty"`
-	State           string                 `protobuf:"bytes,6,opt,name=state,proto3" json:"state,omitempty"`
-	PolicyId        uint32                 `protobuf:"varint,7,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
-	IngressZone     uint32                 `protobuf:"varint,8,opt,name=ingress_zone,json=ingressZone,proto3" json:"ingress_zone,omitempty"`
-	EgressZone      uint32                 `protobuf:"varint,9,opt,name=egress_zone,json=egressZone,proto3" json:"egress_zone,omitempty"`
-	FwdPackets      uint64                 `protobuf:"varint,10,opt,name=fwd_packets,json=fwdPackets,proto3" json:"fwd_packets,omitempty"`
-	FwdBytes        uint64                 `protobuf:"varint,11,opt,name=fwd_bytes,json=fwdBytes,proto3" json:"fwd_bytes,omitempty"`
-	RevPackets      uint64                 `protobuf:"varint,12,opt,name=rev_packets,json=revPackets,proto3" json:"rev_packets,omitempty"`
-	RevBytes        uint64                 `protobuf:"varint,13,opt,name=rev_bytes,json=revBytes,proto3" json:"rev_bytes,omitempty"`
-	Nat             string                 `protobuf:"bytes,14,opt,name=nat,proto3" json:"nat,omitempty"`
-	AgeSeconds      int64                  `protobuf:"varint,15,opt,name=age_seconds,json=ageSeconds,proto3" json:"age_seconds,omitempty"`
-	TimeoutSeconds  uint32                 `protobuf:"varint,16,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
-	IngressZoneName string                 `protobuf:"bytes,17,opt,name=ingress_zone_name,json=ingressZoneName,proto3" json:"ingress_zone_name,omitempty"`
-	EgressZoneName  string                 `protobuf:"bytes,18,opt,name=egress_zone_name,json=egressZoneName,proto3" json:"egress_zone_name,omitempty"`
-	IdleSeconds     int64                  `protobuf:"varint,19,opt,name=idle_seconds,json=idleSeconds,proto3" json:"idle_seconds,omitempty"`
-	Application     string                 `protobuf:"bytes,20,opt,name=application,proto3" json:"application,omitempty"`                 // resolved application name
-	PolicyName      string                 `protobuf:"bytes,21,opt,name=policy_name,json=policyName,proto3" json:"policy_name,omitempty"` // resolved policy name
-	SessionId       uint64                 `protobuf:"varint,22,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`   // unique session ID (same on both cluster nodes)
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	SrcAddr          string                 `protobuf:"bytes,1,opt,name=src_addr,json=srcAddr,proto3" json:"src_addr,omitempty"`
+	DstAddr          string                 `protobuf:"bytes,2,opt,name=dst_addr,json=dstAddr,proto3" json:"dst_addr,omitempty"`
+	SrcPort          uint32                 `protobuf:"varint,3,opt,name=src_port,json=srcPort,proto3" json:"src_port,omitempty"`
+	DstPort          uint32                 `protobuf:"varint,4,opt,name=dst_port,json=dstPort,proto3" json:"dst_port,omitempty"`
+	Protocol         string                 `protobuf:"bytes,5,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	State            string                 `protobuf:"bytes,6,opt,name=state,proto3" json:"state,omitempty"`
+	PolicyId         uint32                 `protobuf:"varint,7,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
+	IngressZone      uint32                 `protobuf:"varint,8,opt,name=ingress_zone,json=ingressZone,proto3" json:"ingress_zone,omitempty"`
+	EgressZone       uint32                 `protobuf:"varint,9,opt,name=egress_zone,json=egressZone,proto3" json:"egress_zone,omitempty"`
+	FwdPackets       uint64                 `protobuf:"varint,10,opt,name=fwd_packets,json=fwdPackets,proto3" json:"fwd_packets,omitempty"`
+	FwdBytes         uint64                 `protobuf:"varint,11,opt,name=fwd_bytes,json=fwdBytes,proto3" json:"fwd_bytes,omitempty"`
+	RevPackets       uint64                 `protobuf:"varint,12,opt,name=rev_packets,json=revPackets,proto3" json:"rev_packets,omitempty"`
+	RevBytes         uint64                 `protobuf:"varint,13,opt,name=rev_bytes,json=revBytes,proto3" json:"rev_bytes,omitempty"`
+	Nat              string                 `protobuf:"bytes,14,opt,name=nat,proto3" json:"nat,omitempty"`
+	AgeSeconds       int64                  `protobuf:"varint,15,opt,name=age_seconds,json=ageSeconds,proto3" json:"age_seconds,omitempty"`
+	TimeoutSeconds   uint32                 `protobuf:"varint,16,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
+	IngressZoneName  string                 `protobuf:"bytes,17,opt,name=ingress_zone_name,json=ingressZoneName,proto3" json:"ingress_zone_name,omitempty"`
+	EgressZoneName   string                 `protobuf:"bytes,18,opt,name=egress_zone_name,json=egressZoneName,proto3" json:"egress_zone_name,omitempty"`
+	IdleSeconds      int64                  `protobuf:"varint,19,opt,name=idle_seconds,json=idleSeconds,proto3" json:"idle_seconds,omitempty"`
+	Application      string                 `protobuf:"bytes,20,opt,name=application,proto3" json:"application,omitempty"`                                   // resolved application name
+	PolicyName       string                 `protobuf:"bytes,21,opt,name=policy_name,json=policyName,proto3" json:"policy_name,omitempty"`                   // resolved policy name
+	SessionId        uint64                 `protobuf:"varint,22,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`                     // unique session ID (same on both cluster nodes)
+	IngressInterface string                 `protobuf:"bytes,23,opt,name=ingress_interface,json=ingressInterface,proto3" json:"ingress_interface,omitempty"` // Junos-style interface name for ingress zone
+	EgressInterface  string                 `protobuf:"bytes,24,opt,name=egress_interface,json=egressInterface,proto3" json:"egress_interface,omitempty"`    // Junos-style interface name for egress zone
+	NatSrcAddr       string                 `protobuf:"bytes,25,opt,name=nat_src_addr,json=natSrcAddr,proto3" json:"nat_src_addr,omitempty"`                 // SNAT translated source address
+	NatSrcPort       uint32                 `protobuf:"varint,26,opt,name=nat_src_port,json=natSrcPort,proto3" json:"nat_src_port,omitempty"`                // SNAT translated source port
+	NatDstAddr       string                 `protobuf:"bytes,27,opt,name=nat_dst_addr,json=natDstAddr,proto3" json:"nat_dst_addr,omitempty"`                 // DNAT translated destination address
+	NatDstPort       uint32                 `protobuf:"varint,28,opt,name=nat_dst_port,json=natDstPort,proto3" json:"nat_dst_port,omitempty"`                // DNAT translated destination port
+	HaActive         bool                   `protobuf:"varint,29,opt,name=ha_active,json=haActive,proto3" json:"ha_active,omitempty"`                        // true if session is on HA primary node
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *SessionEntry) Reset() {
@@ -2613,6 +2620,55 @@ func (x *SessionEntry) GetSessionId() uint64 {
 		return x.SessionId
 	}
 	return 0
+}
+
+func (x *SessionEntry) GetIngressInterface() string {
+	if x != nil {
+		return x.IngressInterface
+	}
+	return ""
+}
+
+func (x *SessionEntry) GetEgressInterface() string {
+	if x != nil {
+		return x.EgressInterface
+	}
+	return ""
+}
+
+func (x *SessionEntry) GetNatSrcAddr() string {
+	if x != nil {
+		return x.NatSrcAddr
+	}
+	return ""
+}
+
+func (x *SessionEntry) GetNatSrcPort() uint32 {
+	if x != nil {
+		return x.NatSrcPort
+	}
+	return 0
+}
+
+func (x *SessionEntry) GetNatDstAddr() string {
+	if x != nil {
+		return x.NatDstAddr
+	}
+	return ""
+}
+
+func (x *SessionEntry) GetNatDstPort() uint32 {
+	if x != nil {
+		return x.NatDstPort
+	}
+	return 0
+}
+
+func (x *SessionEntry) GetHaActive() bool {
+	if x != nil {
+		return x.HaActive
+	}
+	return false
 }
 
 type GetSessionSummaryRequest struct {
@@ -6886,7 +6942,7 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\x06offset\x18\x03 \x01(\x05R\x06offset\x122\n" +
 	"\bsessions\x18\x04 \x03(\v2\x16.bpfrx.v1.SessionEntryR\bsessions\x12\x17\n" +
 	"\anode_id\x18\x05 \x01(\x05R\x06nodeId\x121\n" +
-	"\x04peer\x18\x06 \x01(\v2\x1d.bpfrx.v1.GetSessionsResponseR\x04peer\"\xc0\x05\n" +
+	"\x04peer\x18\x06 \x01(\v2\x1d.bpfrx.v1.GetSessionsResponseR\x04peer\"\xbd\a\n" +
 	"\fSessionEntry\x12\x19\n" +
 	"\bsrc_addr\x18\x01 \x01(\tR\asrcAddr\x12\x19\n" +
 	"\bdst_addr\x18\x02 \x01(\tR\adstAddr\x12\x19\n" +
@@ -6916,7 +6972,18 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\vpolicy_name\x18\x15 \x01(\tR\n" +
 	"policyName\x12\x1d\n" +
 	"\n" +
-	"session_id\x18\x16 \x01(\x04R\tsessionId\"=\n" +
+	"session_id\x18\x16 \x01(\x04R\tsessionId\x12+\n" +
+	"\x11ingress_interface\x18\x17 \x01(\tR\x10ingressInterface\x12)\n" +
+	"\x10egress_interface\x18\x18 \x01(\tR\x0fegressInterface\x12 \n" +
+	"\fnat_src_addr\x18\x19 \x01(\tR\n" +
+	"natSrcAddr\x12 \n" +
+	"\fnat_src_port\x18\x1a \x01(\rR\n" +
+	"natSrcPort\x12 \n" +
+	"\fnat_dst_addr\x18\x1b \x01(\tR\n" +
+	"natDstAddr\x12 \n" +
+	"\fnat_dst_port\x18\x1c \x01(\rR\n" +
+	"natDstPort\x12\x1b\n" +
+	"\tha_active\x18\x1d \x01(\bR\bhaActive\"=\n" +
 	"\x18GetSessionSummaryRequest\x12!\n" +
 	"\finclude_peer\x18\x01 \x01(\bR\vincludePeer\"\xeb\x02\n" +
 	"\x19GetSessionSummaryResponse\x12#\n" +

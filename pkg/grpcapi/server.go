@@ -809,14 +809,30 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	var all []*pb.SessionEntry
 	idx := 0
 
-	// Build reverse zone ID → name map and policy name map
+	// Build reverse zone ID → name map, policy name map, and zone→interface map.
 	zoneNames := make(map[uint16]string)
+	zoneIfaces := make(map[uint16]string) // zone ID → first interface name
 	var policyNames map[uint32]string
 	if cr := s.dp.LastCompileResult(); cr != nil {
 		for name, id := range cr.ZoneIDs {
 			zoneNames[id] = name
 		}
 		policyNames = cr.PolicyNames
+	}
+	if cfg != nil {
+		for zoneName, zone := range cfg.Security.Zones {
+			if cr := s.dp.LastCompileResult(); cr != nil {
+				if zid, ok := cr.ZoneIDs[zoneName]; ok && len(zone.Interfaces) > 0 {
+					zoneIfaces[zid] = zone.Interfaces[0]
+				}
+			}
+		}
+	}
+
+	// Determine HA state for session display.
+	haActive := true // standalone default
+	if s.cluster != nil {
+		haActive = s.cluster.IsLocalPrimary(0)
 	}
 
 	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
@@ -827,7 +843,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 			return true
 		}
 		proto := protoName(key.Protocol)
-		if protoFilter != "" && proto != protoFilter {
+		if protoFilter != "" && !strings.EqualFold(proto, protoFilter) {
 			return true
 		}
 		if srcNet != nil && !srcNet.Contains(net.IP(key.SrcIP[:])) {
@@ -849,7 +865,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 			return true
 		}
 		if idx >= offset && len(all) < limit {
-			se := sessionEntryV4(key, val, now, zoneNames, policyNames)
+			se := sessionEntryV4(key, val, now, zoneNames, policyNames, zoneIfaces, haActive)
 			se.Application = resolveAppName(key.Protocol, ntohs(key.DstPort), cfg)
 			all = append(all, se)
 		}
@@ -865,7 +881,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 			return true
 		}
 		proto := protoName(key.Protocol)
-		if protoFilter != "" && proto != protoFilter {
+		if protoFilter != "" && !strings.EqualFold(proto, protoFilter) {
 			return true
 		}
 		if srcNet != nil && !srcNet.Contains(net.IP(key.SrcIP[:])) {
@@ -887,7 +903,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 			return true
 		}
 		if idx >= offset && len(all) < limit {
-			se := sessionEntryV6(key, val, now, zoneNames, policyNames)
+			se := sessionEntryV6(key, val, now, zoneNames, policyNames, zoneIfaces, haActive)
 			se.Application = resolveAppName(key.Protocol, ntohs(key.DstPort), cfg)
 			all = append(all, se)
 		}
@@ -2948,13 +2964,21 @@ func policyActionStr(a config.PolicyAction) string {
 func protoName(p uint8) string {
 	switch p {
 	case 6:
-		return "TCP"
+		return "tcp"
 	case 17:
-		return "UDP"
+		return "udp"
 	case 1:
-		return "ICMP"
+		return "icmp"
+	case 47:
+		return "gre"
+	case 50:
+		return "esp"
+	case 4:
+		return "ipip"
+	case 41:
+		return "ipv6"
 	case dataplane.ProtoICMPv6:
-		return "ICMPv6"
+		return "icmpv6"
 	default:
 		return fmt.Sprintf("%d", p)
 	}
@@ -2997,26 +3021,37 @@ func uint32ToIP(v uint32) net.IP {
 	return ip
 }
 
-func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string) *pb.SessionEntry {
+func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, haActive bool) *pb.SessionEntry {
+	inIf := zoneIfaces[val.IngressZone]
+	if inIf == "" {
+		inIf = zoneNames[val.IngressZone]
+	}
+	outIf := zoneIfaces[val.EgressZone]
+	if outIf == "" {
+		outIf = zoneNames[val.EgressZone]
+	}
 	se := &pb.SessionEntry{
-		SrcAddr:         net.IP(key.SrcIP[:]).String(),
-		DstAddr:         net.IP(key.DstIP[:]).String(),
-		SrcPort:         uint32(ntohs(key.SrcPort)),
-		DstPort:         uint32(ntohs(key.DstPort)),
-		Protocol:        protoName(key.Protocol),
-		State:           sessionStateName(val.State),
-		PolicyId:        val.PolicyID,
-		PolicyName:      policyNames[val.PolicyID],
-		IngressZone:     uint32(val.IngressZone),
-		EgressZone:      uint32(val.EgressZone),
-		IngressZoneName: zoneNames[val.IngressZone],
-		EgressZoneName:  zoneNames[val.EgressZone],
-		FwdPackets:      val.FwdPackets,
-		FwdBytes:        val.FwdBytes,
-		RevPackets:      val.RevPackets,
-		RevBytes:        val.RevBytes,
-		TimeoutSeconds:  val.Timeout,
-		SessionId:       val.SessionID,
+		SrcAddr:          net.IP(key.SrcIP[:]).String(),
+		DstAddr:          net.IP(key.DstIP[:]).String(),
+		SrcPort:          uint32(ntohs(key.SrcPort)),
+		DstPort:          uint32(ntohs(key.DstPort)),
+		Protocol:         protoName(key.Protocol),
+		State:            sessionStateName(val.State),
+		PolicyId:         val.PolicyID,
+		PolicyName:       policyNames[val.PolicyID],
+		IngressZone:      uint32(val.IngressZone),
+		EgressZone:       uint32(val.EgressZone),
+		IngressZoneName:  zoneNames[val.IngressZone],
+		EgressZoneName:   zoneNames[val.EgressZone],
+		IngressInterface: inIf,
+		EgressInterface:  outIf,
+		FwdPackets:       val.FwdPackets,
+		FwdBytes:         val.FwdBytes,
+		RevPackets:       val.RevPackets,
+		RevBytes:         val.RevBytes,
+		TimeoutSeconds:   val.Timeout,
+		SessionId:        val.SessionID,
+		HaActive:         haActive,
 	}
 	if val.Created > 0 && now > val.Created {
 		se.AgeSeconds = int64(now - val.Created)
@@ -3026,33 +3061,48 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 	}
 	if val.Flags&dataplane.SessFlagSNAT != 0 {
 		se.Nat = fmt.Sprintf("SNAT %s:%d", uint32ToIP(val.NATSrcIP), ntohs(val.NATSrcPort))
+		se.NatSrcAddr = uint32ToIP(val.NATSrcIP).String()
+		se.NatSrcPort = uint32(ntohs(val.NATSrcPort))
 	}
 	if val.Flags&dataplane.SessFlagDNAT != 0 {
 		se.Nat = fmt.Sprintf("DNAT %s:%d", uint32ToIP(val.NATDstIP), ntohs(val.NATDstPort))
+		se.NatDstAddr = uint32ToIP(val.NATDstIP).String()
+		se.NatDstPort = uint32(ntohs(val.NATDstPort))
 	}
 	return se
 }
 
-func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string) *pb.SessionEntry {
+func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, haActive bool) *pb.SessionEntry {
+	inIf := zoneIfaces[val.IngressZone]
+	if inIf == "" {
+		inIf = zoneNames[val.IngressZone]
+	}
+	outIf := zoneIfaces[val.EgressZone]
+	if outIf == "" {
+		outIf = zoneNames[val.EgressZone]
+	}
 	se := &pb.SessionEntry{
-		SrcAddr:         net.IP(key.SrcIP[:]).String(),
-		DstAddr:         net.IP(key.DstIP[:]).String(),
-		SrcPort:         uint32(ntohs(key.SrcPort)),
-		DstPort:         uint32(ntohs(key.DstPort)),
-		Protocol:        protoName(key.Protocol),
-		State:           sessionStateName(val.State),
-		PolicyId:        val.PolicyID,
-		PolicyName:      policyNames[val.PolicyID],
-		IngressZone:     uint32(val.IngressZone),
-		EgressZone:      uint32(val.EgressZone),
-		IngressZoneName: zoneNames[val.IngressZone],
-		EgressZoneName:  zoneNames[val.EgressZone],
-		FwdPackets:      val.FwdPackets,
-		FwdBytes:        val.FwdBytes,
-		RevPackets:      val.RevPackets,
-		RevBytes:        val.RevBytes,
-		TimeoutSeconds:  val.Timeout,
-		SessionId:       val.SessionID,
+		SrcAddr:          net.IP(key.SrcIP[:]).String(),
+		DstAddr:          net.IP(key.DstIP[:]).String(),
+		SrcPort:          uint32(ntohs(key.SrcPort)),
+		DstPort:          uint32(ntohs(key.DstPort)),
+		Protocol:         protoName(key.Protocol),
+		State:            sessionStateName(val.State),
+		PolicyId:         val.PolicyID,
+		PolicyName:       policyNames[val.PolicyID],
+		IngressZone:      uint32(val.IngressZone),
+		EgressZone:       uint32(val.EgressZone),
+		IngressZoneName:  zoneNames[val.IngressZone],
+		EgressZoneName:   zoneNames[val.EgressZone],
+		IngressInterface: inIf,
+		EgressInterface:  outIf,
+		FwdPackets:       val.FwdPackets,
+		FwdBytes:         val.FwdBytes,
+		RevPackets:       val.RevPackets,
+		RevBytes:         val.RevBytes,
+		TimeoutSeconds:   val.Timeout,
+		SessionId:        val.SessionID,
+		HaActive:         haActive,
 	}
 	if val.Created > 0 && now > val.Created {
 		se.AgeSeconds = int64(now - val.Created)
@@ -3062,9 +3112,13 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 	}
 	if val.Flags&dataplane.SessFlagSNAT != 0 {
 		se.Nat = fmt.Sprintf("SNAT [%s]:%d", net.IP(val.NATSrcIP[:]).String(), ntohs(val.NATSrcPort))
+		se.NatSrcAddr = net.IP(val.NATSrcIP[:]).String()
+		se.NatSrcPort = uint32(ntohs(val.NATSrcPort))
 	}
 	if val.Flags&dataplane.SessFlagDNAT != 0 {
 		se.Nat = fmt.Sprintf("DNAT [%s]:%d", net.IP(val.NATDstIP[:]).String(), ntohs(val.NATDstPort))
+		se.NatDstAddr = net.IP(val.NATDstIP[:]).String()
+		se.NatDstPort = uint32(ntohs(val.NATDstPort))
 	}
 	return se
 }

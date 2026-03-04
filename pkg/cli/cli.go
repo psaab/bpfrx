@@ -3185,6 +3185,16 @@ func (c *CLI) showFlowSession(args []string) error {
 		fmt.Println("--------------------------------------------------------------------------")
 	}
 
+	// Determine HA state string for session display.
+	haState := ""
+	if clusterMode {
+		if c.cluster.IsLocalPrimary(0) {
+			haState = "Active"
+		} else {
+			haState = "Backup"
+		}
+	}
+
 	// Summary counters for protocol/zone/NAT breakdown
 	var byProto map[uint8]int
 	var byZonePair map[string]int
@@ -3322,9 +3332,14 @@ func (c *CLI) showFlowSession(args []string) error {
 		if polName == "" {
 			polName = fmt.Sprintf("%d", val.PolicyID)
 		}
-		// Junos format: Session ID: <id>, Policy name: <name>/<index>, State: <state>, Timeout: <t>
-		fmt.Printf("Session ID: %d, Policy name: %s/%d, State: %s, Timeout: %d\n",
-			sid, polName, val.PolicyID, stateName, val.Timeout)
+		// Junos format header
+		if haState != "" {
+			fmt.Printf("Session ID: %d, Policy name: %s/%d, HA State: %s, Timeout: %d, Session State: Valid\n",
+				sid, polName, val.PolicyID, haState, val.Timeout)
+		} else {
+			fmt.Printf("Session ID: %d, Policy name: %s/%d, Timeout: %d, Session State: Valid\n",
+				sid, polName, val.PolicyID, val.Timeout)
+		}
 
 		// In line: original direction
 		inIf := zoneIfaces[val.IngressZone]
@@ -3462,9 +3477,14 @@ func (c *CLI) showFlowSession(args []string) error {
 		if polName == "" {
 			polName = fmt.Sprintf("%d", val.PolicyID)
 		}
-		// Junos format: Session ID: <id>, Policy name: <name>/<index>, State: <state>, Timeout: <t>
-		fmt.Printf("Session ID: %d, Policy name: %s/%d, State: %s, Timeout: %d\n",
-			sid6, polName, val.PolicyID, stateName, val.Timeout)
+		// Junos format header
+		if haState != "" {
+			fmt.Printf("Session ID: %d, Policy name: %s/%d, HA State: %s, Timeout: %d, Session State: Valid\n",
+				sid6, polName, val.PolicyID, haState, val.Timeout)
+		} else {
+			fmt.Printf("Session ID: %d, Policy name: %s/%d, Timeout: %d, Session State: Valid\n",
+				sid6, polName, val.PolicyID, val.Timeout)
+		}
 
 		// In line: original direction
 		inIf := zoneIfaces[val.IngressZone]
@@ -8063,15 +8083,21 @@ func (c *CLI) showSystemSyslog() error {
 func protoNameFromNum(p uint8) string {
 	switch p {
 	case 6:
-		return "TCP"
+		return "tcp"
 	case 17:
-		return "UDP"
+		return "udp"
 	case 1:
-		return "ICMP"
+		return "icmp"
 	case 47:
-		return "GRE"
+		return "gre"
+	case 50:
+		return "esp"
+	case 4:
+		return "ipip"
+	case 41:
+		return "ipv6"
 	case dataplane.ProtoICMPv6:
-		return "ICMPv6"
+		return "icmpv6"
 	default:
 		return fmt.Sprintf("%d", p)
 	}
