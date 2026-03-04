@@ -155,6 +155,11 @@ type Daemon struct {
 	// currently running cluster comms. Compared on each applyConfig to
 	// detect changes that require a comms restart (#87).
 	activeClusterTransport clusterTransportKey
+
+	// startupGoodbyeRA tracks whether the one-shot goodbye RA has been
+	// sent for each inactive RG on startup. Prevents stale RA routes
+	// from a previous primary run keeping hosts dual-pathing traffic.
+	startupGoodbyeRA map[int]bool
 }
 
 // New creates a new Daemon.
@@ -1767,6 +1772,12 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			}
 		}
 	}
+	// Cluster startup: goodbye RAs for stale routes are handled by the
+	// reconcile loop (reconcileRGState) after VRRP election settles.
+	// Each RETH node has a different virtual MAC (hence different
+	// link-local), so both nodes appear as separate routers to hosts.
+	// Only the primary sends RAs (via applyRethServicesForRG on MASTER);
+	// the reconcile loop sends goodbye RAs for inactive RGs.
 
 	// 6. Apply IPsec config
 	if d.ipsec != nil && len(cfg.Security.IPsec.VPNs) > 0 {
@@ -4911,6 +4922,38 @@ func (d *Daemon) reconcileRGState() {
 				d.applyRethServicesForRG(rgID)
 			} else {
 				d.clearRethServicesForRG(rgID)
+			}
+		}
+
+		// Startup goodbye RA: when an RG is inactive on the first
+		// reconcile pass (node booted as secondary), send a one-shot
+		// goodbye RA (lifetime=0) to clear stale routes from a
+		// previous primary run. Each RETH node has a per-node virtual
+		// MAC producing a distinct link-local, so hosts see each node
+		// as a separate IPv6 router. Without this, hosts ECMP-split
+		// traffic to BOTH nodes even though only one is active.
+		if !tr.Active && d.ra != nil && !d.startupGoodbyeRA[rgID] {
+			if d.startupGoodbyeRA == nil {
+				d.startupGoodbyeRA = make(map[int]bool)
+			}
+			d.startupGoodbyeRA[rgID] = true
+			cfg := d.store.ActiveConfig()
+			if cfg != nil {
+				rgIfaces := rethInterfacesForRG(cfg, rgID)
+				rgIfaceSet := make(map[string]bool, len(rgIfaces))
+				for _, n := range rgIfaces {
+					rgIfaceSet[n] = true
+				}
+				allRA := d.buildRAConfigs(cfg)
+				var rgRA []*config.RAInterfaceConfig
+				for _, ra := range allRA {
+					if rgIfaceSet[ra.Interface] {
+						rgRA = append(rgRA, ra)
+					}
+				}
+				if len(rgRA) > 0 {
+					go d.ra.WithdrawOnce(rgRA)
+				}
 			}
 		}
 	}

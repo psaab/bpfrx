@@ -127,6 +127,41 @@ func (m *Manager) WithdrawInterfaces(names []string) {
 	}
 }
 
+// WithdrawOnce sends a one-shot goodbye RA (router lifetime=0) on the given
+// interfaces. This is used on startup when a node boots as secondary to
+// withdraw stale RA routes from a previous primary run. Unlike Withdraw(),
+// this does NOT require a running sender — it creates a temporary NDP
+// connection, sends the goodbye RA, and closes it.
+//
+// Skips interfaces that already have a running sender (the sender goroutine
+// handles its own RA lifecycle, and a goodbye RA would kill a live primary).
+func (m *Manager) WithdrawOnce(configs []*config.RAInterfaceConfig) {
+	for _, cfg := range configs {
+		// Skip if a sender is already running (means VRRP MASTER won the
+		// race and started real RAs — don't clobber with lifetime=0).
+		m.mu.Lock()
+		_, running := m.senders[cfg.Interface]
+		m.mu.Unlock()
+		if running {
+			slog.Debug("ra: WithdrawOnce: sender already running, skipping", "interface", cfg.Interface)
+			continue
+		}
+
+		iface, err := net.InterfaceByName(cfg.Interface)
+		if err != nil {
+			slog.Debug("ra: WithdrawOnce: interface not found", "interface", cfg.Interface, "err", err)
+			continue
+		}
+		s := newSender(cfg, iface)
+		if err := s.start(); err != nil {
+			slog.Debug("ra: WithdrawOnce: failed to start", "interface", cfg.Interface, "err", err)
+			continue
+		}
+		s.sendGoodbyeRA()
+		s.stop()
+	}
+}
+
 // Clear stops all senders without sending goodbye RAs.
 func (m *Manager) Clear() error {
 	m.mu.Lock()
