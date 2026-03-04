@@ -167,7 +167,7 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 			if localEff == peerEff && m.nodeID > m.peerNodeID {
 				return electLocalSecondary, "Dual-active: higher node ID yields"
 			}
-			return electNoChange, "" // we win
+			return electNoChange, "Dual-active: winner stays"
 		}
 		return electNoChange, "" // non-preempt: incumbent stays
 	}
@@ -233,6 +233,21 @@ func (m *Manager) runElection() {
 		case electLocalSecondary:
 			rg.State = StateSecondary
 		case electNoChange:
+			// Dual-active winner: state unchanged but emit ownership
+			// reaffirm event so daemon can send GARPs to refresh
+			// upstream ARP/NDP caches.
+			if reason == "Dual-active: winner stays" {
+				select {
+				case m.eventCh <- ClusterEvent{
+					GroupID:       rg.GroupID,
+					OldState:      StatePrimary,
+					NewState:      StatePrimary,
+					DualActiveWin: true,
+				}:
+				default:
+				}
+				m.history.Record(EventRG, rg.GroupID, "dual-active resolved: winner reaffirm")
+			}
 			continue
 		}
 

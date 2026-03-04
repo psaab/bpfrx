@@ -71,9 +71,10 @@ func (rg *RedundancyGroupState) IsReadyForTakeover(holdTime time.Duration) bool 
 
 // ClusterEvent signals a state change in the cluster.
 type ClusterEvent struct {
-	GroupID  int
-	OldState NodeState
-	NewState NodeState
+	GroupID       int
+	OldState      NodeState
+	NewState      NodeState
+	DualActiveWin bool // true when dual-active resolved with local node as winner (no state change)
 }
 
 // monitorKey uniquely identifies a monitor within a redundancy group.
@@ -131,6 +132,12 @@ type Manager struct {
 	// takeoverHoldTime is the minimum duration an RG must be ready before
 	// election will promote it to primary. Default: 3s.
 	takeoverHoldTime time.Duration
+
+	// syncReady is true once bulk session sync has been received (or timed
+	// out). Used in private-rg-election / no-reth-vrrp mode as the
+	// equivalent of VRRP sync-hold — gates RG promotion until session state
+	// is synchronized from the peer.
+	syncReady bool
 }
 
 // DefaultTakeoverHoldTime is the default duration an RG must be ready
@@ -168,6 +175,25 @@ func (m *Manager) Monitor() *Monitor {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.monitor
+}
+
+// SetSyncReady marks session sync as ready (bulk sync received or timed out).
+// In private-rg-election mode this gates RG promotion via the readiness pipeline.
+func (m *Manager) SetSyncReady(ready bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.syncReady == ready {
+		return
+	}
+	m.syncReady = ready
+	slog.Info("cluster: sync readiness changed", "ready", ready)
+}
+
+// IsSyncReady returns true if session sync is ready.
+func (m *Manager) IsSyncReady() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.syncReady
 }
 
 // SetRGReady updates the readiness state for a redundancy group.

@@ -258,8 +258,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Only applies when VRRP is enabled — otherwise no RETH VRRP instances.
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
 		cc := cfg.Chassis.Cluster
-		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" && !cc.NoRethVRRP {
+		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" && !cc.NoRethVRRP && !cc.PrivateRGElection {
 			d.vrrpMgr.SetSyncHold(30 * time.Second)
+		}
+		// Private-rg-election mode: gate RG promotion on session sync
+		// readiness with a 30s timeout fallback (mirrors VRRP sync-hold).
+		// Without this, standalone nodes or nodes with permanently-down
+		// peers would never become primary.
+		if cc.PrivateRGElection && cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
+			time.AfterFunc(30*time.Second, func() {
+				if !d.cluster.IsSyncReady() {
+					slog.Info("cluster: sync readiness timeout, releasing hold")
+					d.cluster.SetSyncReady(true)
+				}
+			})
 		}
 	}
 
@@ -3813,6 +3825,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				d.cluster.RecordEvent(cluster.EventColdSync, -1, "Bulk sync completed")
 				slog.Info("cluster: session sync complete, releasing VRRP hold")
 				d.vrrpMgr.ReleaseSyncHold()
+				d.cluster.SetSyncReady(true)
 			}
 
 			// Wire remote failover: when peer requests us to give up primary.
@@ -4319,6 +4332,13 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 		case ev := <-d.cluster.Events():
 			noRethVRRP := d.isNoRethVRRP()
 
+			// Dual-active winner reaffirm: no state change but send
+			// GARPs to refresh upstream ARP/NDP caches after split-brain.
+			if ev.DualActiveWin && noRethVRRP {
+				go d.directSendGARPs(ev.GroupID)
+				continue
+			}
+
 			// Immediate VRRP priority + resign on state transitions.
 			// ResignRG sets priority=0 to prevent re-election race.
 			// On Primary transition, restore priority=200 immediately
@@ -4647,7 +4667,13 @@ func (d *Daemon) reconcileRGState() {
 			var vrrpReady bool
 			var vrrpReasons []string
 			if noRethVRRP {
-				vrrpReady = true // no RETH VRRP instances = always ready
+				// No RETH VRRP instances — check sync readiness instead.
+				// Blocks promotion until bulk session sync completes (or
+				// times out), equivalent to VRRP sync-hold in RETH mode.
+				vrrpReady = d.cluster.IsSyncReady()
+				if !vrrpReady {
+					vrrpReasons = append(vrrpReasons, "session sync not ready")
+				}
 			} else if d.vrrpMgr != nil {
 				vrrpReady, vrrpReasons = d.vrrpMgr.RGVRRPReady(rgID)
 			} else {
