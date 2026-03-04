@@ -14830,6 +14830,79 @@ func TestChassisClusterNoRethVRRPDefault(t *testing.T) {
 	}
 }
 
+func TestChassisClusterPrivateRGElectionSet(t *testing.T) {
+	tree := &ConfigTree{}
+	sets := []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster node 0",
+		"set chassis cluster private-rg-election",
+	}
+	for _, line := range sets {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tree.SetPath(cmd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if !cfg.Chassis.Cluster.PrivateRGElection {
+		t.Error("PrivateRGElection = false, want true")
+	}
+}
+
+func TestChassisClusterPrivateRGElectionHierarchical(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+        private-rg-election;
+    }
+}`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if !cfg.Chassis.Cluster.PrivateRGElection {
+		t.Error("PrivateRGElection = false, want true")
+	}
+}
+
+func TestChassisClusterPrivateRGElectionDefault(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+    }
+}`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if cfg.Chassis.Cluster.PrivateRGElection {
+		t.Error("PrivateRGElection = true, want false (default)")
+	}
+}
+
 func TestValidateFabric1MissingPeerAddress(t *testing.T) {
 	cfg := &Config{
 		Interfaces: InterfacesConfig{

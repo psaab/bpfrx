@@ -4744,13 +4744,17 @@ func (d *Daemon) reconcileRGState() {
 			}
 		}
 
-		// Direct-mode VIP safety net: idempotently re-add VIPs on
-		// active RGs to recover from missed events or transient
-		// address removal (e.g. networkd reload). Only adds — never
-		// removes on inactive (event-driven only to avoid fighting
-		// transients).
-		if noRethVRRP && tr.Active {
-			d.directAddVIPs(rgID)
+		// Direct-mode VIP safety net: idempotently add/remove VIPs
+		// to recover from missed events or transient address changes
+		// (e.g. networkd reload). Removes stale VIPs on inactive RGs.
+		if noRethVRRP {
+			if tr.Active {
+				if added := d.directAddVIPs(rgID); added > 0 {
+					go d.directSendGARPs(rgID)
+				}
+			} else {
+				d.directRemoveVIPs(rgID)
+			}
 		}
 
 		// RA/DHCP service reconciliation (#93): safety net for dropped
@@ -5215,17 +5219,19 @@ func (d *Daemon) clusterConfig() *config.ClusterConfig {
 // Default (no flag) uses VRRP for RETH failover.
 func (d *Daemon) isNoRethVRRP() bool {
 	cc := d.clusterConfig()
-	return cc != nil && cc.NoRethVRRP
+	return cc != nil && (cc.NoRethVRRP || cc.PrivateRGElection)
 }
 
 // directAddVIPs adds VIPs for RETH interfaces in the given RG using netlink.
 // IPv6 addresses are added with IFA_F_NODAD to avoid DAD delays.
-// Idempotent — skips addresses that already exist.
-func (d *Daemon) directAddVIPs(rgID int) {
+// Idempotent — skips addresses that already exist. Returns the number of
+// addresses actually added (non-EEXIST).
+func (d *Daemon) directAddVIPs(rgID int) int {
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
-		return
+		return 0
 	}
+	var added int
 	vipMap := vrrp.RethVIPsForRG(cfg, rgID)
 	for ifName, addrs := range vipMap {
 		link, err := netlink.LinkByName(ifName)
@@ -5248,9 +5254,11 @@ func (d *Daemon) directAddVIPs(rgID int) {
 				}
 			} else {
 				slog.Info("directAddVIPs: added VIP", "iface", ifName, "addr", cidr)
+				added++
 			}
 		}
 	}
+	return added
 }
 
 // directRemoveVIPs removes VIPs for RETH interfaces in the given RG.

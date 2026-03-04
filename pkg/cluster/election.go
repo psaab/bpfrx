@@ -159,6 +159,16 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 	// If we are currently primary, we stay primary (peer can't preempt us).
 	// If neither is primary (both secondary, e.g. initial state), use priority.
 	if rg.State == StatePrimary {
+		if peerGroup.State == StatePrimary {
+			// DUAL-ACTIVE: resolve by effective priority, then node ID.
+			if localEff < peerEff {
+				return electLocalSecondary, "Dual-active: lower priority yields"
+			}
+			if localEff == peerEff && m.nodeID > m.peerNodeID {
+				return electLocalSecondary, "Dual-active: higher node ID yields"
+			}
+			return electNoChange, "" // we win
+		}
 		return electNoChange, "" // non-preempt: incumbent stays
 	}
 

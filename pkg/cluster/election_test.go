@@ -677,6 +677,122 @@ func TestRGInterfaceReady(t *testing.T) {
 	}
 }
 
+func TestElection_NonPreemptDualActive_LowerPriorityYields(t *testing.T) {
+	// Both primary, different priorities, non-preempt.
+	// Lower effective priority must yield.
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 100})) // non-preempt, low priority
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	// Force local to primary.
+	m.mu.Lock()
+	m.groups[0].State = StatePrimary
+	m.mu.Unlock()
+
+	// Peer is also primary with higher priority.
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	// Lower priority (us) should yield.
+	if m.IsLocalPrimary(0) {
+		t.Error("lower priority should yield in non-preempt dual-active")
+	}
+}
+
+func TestElection_NonPreemptDualActive_TieBreakNodeID(t *testing.T) {
+	// Both primary, same priority, non-preempt.
+	// Higher node ID must yield.
+	m := NewManager(1, 1) // We are node 1 (higher)
+	cfg := makeConfig(makeRG(0, false, map[int]int{1: 200})) // non-preempt
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	// Force local to primary.
+	m.mu.Lock()
+	m.groups[0].State = StatePrimary
+	m.mu.Unlock()
+
+	// Peer (node 0) also primary with same priority.
+	pkt := &HeartbeatPacket{
+		NodeID:    0,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	// Higher node ID (us, node 1) should yield.
+	if m.IsLocalPrimary(0) {
+		t.Error("higher node ID should yield in non-preempt dual-active tie")
+	}
+}
+
+func TestElection_NonPreemptDualActive_WinnerStays(t *testing.T) {
+	// Both primary, we have higher priority, non-preempt.
+	// Winner stays primary (electNoChange).
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200})) // non-preempt, high priority
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	// Force local to primary.
+	m.mu.Lock()
+	m.groups[0].State = StatePrimary
+	m.mu.Unlock()
+
+	// Peer also primary with lower priority.
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	// We win — stay primary.
+	if !m.IsLocalPrimary(0) {
+		t.Error("higher priority should stay primary in non-preempt dual-active")
+	}
+}
+
+func TestElection_NonPreemptDualActive_PreemptSelfResolves(t *testing.T) {
+	// Regression guard: preempt mode already handles dual-active via
+	// priority comparison — ensure it still works.
+	m := NewManager(1, 1) // We are node 1 (higher)
+	cfg := makeConfig(makeRG(0, true, map[int]int{1: 100})) // preempt enabled
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	// Force local to primary.
+	m.mu.Lock()
+	m.groups[0].State = StatePrimary
+	m.mu.Unlock()
+
+	// Peer (node 0) also primary with higher priority.
+	pkt := &HeartbeatPacket{
+		NodeID:    0,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	// Preempt: peer has higher priority, we should yield.
+	if m.IsLocalPrimary(0) {
+		t.Error("preempt dual-active: lower priority should yield")
+	}
+}
+
 // drainEvents drains up to n events from the channel.
 func drainEvents(m *Manager, n int) {
 	for i := 0; i < n; i++ {

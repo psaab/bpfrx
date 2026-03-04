@@ -82,6 +82,7 @@ type ClusterConfig struct {
 	PeerFencing           string // peer fencing action on heartbeat timeout: "", "disable-rg"
 	TakeoverHoldTime      int    // milliseconds, 0=default(3000) — readiness gate hold time before allowing primary takeover
 	NoRethVRRP            bool   // cluster directly manages VIPs (no VRRP for RETH interfaces)
+	PrivateRGElection     bool   // election over control link only, suppress RETH VRRP
 	RedundancyGroups      []*RedundancyGroup
 }
 
