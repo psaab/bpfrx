@@ -2489,4 +2489,20 @@ firewall filter fixes, and cluster config parity.
 - **`update-router-advertisement`**: When PD prefix received, update RA sender with delegated prefix on specified interface
 - **`req-option dns-server`**: DNS server option request in DHCPv6 solicitation
 
+### IPIP Tunnels & Per-Unit Tunnel Config
+- **`ip-X/X/X` interfaces**: IPIP tunnel mode (protocol 4) alongside existing GRE — auto-detected from interface name prefix
+- **IPIP over IPv6**: IPv6 endpoints use `ip6tnl` with `IPPROTO_IPIP` (vs `iptun` for IPv4)
+- **Per-unit tunnel config**: Each unit under `gr-X/X/X` or `ip-X/X/X` can have independent `tunnel { source/destination/routing-instance }` — unit 0 → base Linux name, unit N>0 → `<base>uN`
+- **`routing-instance { destination <VRF>; }`**: Routes tunnel outer packets through a specific VRF — creates tunnel inside the target VRF
+- **`TunnelNameMap()`**: Maps Junos interface refs (e.g., `gr-0/0/0.1`) to Linux tunnel names (e.g., `gr-0-0-0u1`)
+- **Per-unit tunnel in dataplane compiler**: `resolveInterfaceRef()` resolves per-unit tunnel names; `compileZones()` sets `IfaceFlagTunnel` for per-unit tunnels; `daemonOwned` includes per-unit tunnel interfaces
+- **AST schema**: `tunnel` under unit expanded with full property children (source, destination, mode, key, ttl, keepalive, routing-instance)
+- **GRE over IPv6**: `Gretun.Type()` auto-detects IPv6 endpoints → returns "ip6gre"
+
+### Qualified Next-Hop with Interface & RIB inet6.0
+- **`qualified-next-hop <addr> { interface <name>; }`**: Link-local IPv6 next-hops require interface specification — parsed from both hierarchical and flat `set` syntax
+- **FRR output**: `ipv6 route ::/0 fe80::addr <interface> [vrf <name>]` — interface appended after next-hop address
+- **`rib <instance>.inet6.0 { static { route ... } }`**: Per-VRF IPv6 static routes — suffix match `strings.HasSuffix(ribName, ".inet6.0")` handles both global and per-instance forms
+- **`Inet6StaticRoutes` on RoutingInstanceConfig**: Separate field for per-instance IPv6 routes, wired through daemon → FRR `InstanceConfig`
+- **`next-table` inet6**: Verified `next-table` works for both `inet.0` and `inet6.0` address families
 

@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,6 +63,8 @@ type DHCPv4Options struct {
 
 // DHCPv6Options holds client behavior options for DHCPv6.
 type DHCPv6Options struct {
+	Stateless  bool     // true = send Information-Request only (no IA_NA/IA_PD)
+	UpdateDNS  bool     // true = install DNS servers to /etc/resolv.conf
 	IATypes    []string // "ia-na", "ia-pd" — which IA types to request
 	PDPrefLen  int      // preferred prefix length hint for IA_PD (0 = no hint)
 	PDSubLen   int      // sub-prefix length for deriving /64s (0 = not set)
@@ -447,7 +450,25 @@ func (m *Manager) LeaseFor(ifaceName string, af AddressFamily) *Lease {
 	return &lc
 }
 
+// installDNS writes DHCP-learned nameservers to /etc/resolv.conf.
+func (m *Manager) installDNS(lease *Lease) {
+	if len(lease.DNS) == 0 {
+		return
+	}
+	var buf strings.Builder
+	buf.WriteString("# Managed by bpfrx DHCP client — do not edit\n")
+	for _, dns := range lease.DNS {
+		fmt.Fprintf(&buf, "nameserver %s\n", dns)
+	}
+	if err := os.WriteFile("/etc/resolv.conf", []byte(buf.String()), 0644); err != nil {
+		slog.Warn("DHCP: failed to install DNS", "err", err)
+	}
+}
+
 // runDHCPv4 runs the DHCPv4 DORA cycle with retries and renewal.
+// Note: our client always performs a full DORA (Discover→Offer→Request→Ack)
+// on every cycle, including renewal. This is effectively force-discover
+// behavior, so the ForceDiscover option requires no special handling.
 func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 	key := clientKey{iface: ifaceName, family: AFInet}
 
@@ -529,13 +550,46 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 		case <-time.After(t1):
 			slog.Info("DHCPv4: T1 expired, renewing", "interface", ifaceName)
 		case <-ctx.Done():
-			// Release lease
 			m.removeAddress(ifaceName, lease)
 			m.mu.Lock()
 			delete(m.leases, key)
 			m.mu.Unlock()
 			return
 		}
+
+		// T1 renewal attempt
+		lease2, err := m.doDHCPv4(ctx, ifaceName)
+		if err == nil {
+			lease = lease2
+			continue // apply new lease at top of loop
+		}
+		slog.Warn("DHCPv4: T1 renewal failed, waiting for T2",
+			"interface", ifaceName, "err", err)
+
+		// Wait for T2 (87.5% of lease) — remaining time after T1
+		t2remaining := lease.LeaseTime*7/8 - lease.LeaseTime/2
+		if t2remaining < time.Second {
+			t2remaining = time.Second
+		}
+		select {
+		case <-time.After(t2remaining):
+		case <-ctx.Done():
+			m.removeAddress(ifaceName, lease)
+			m.mu.Lock()
+			delete(m.leases, key)
+			m.mu.Unlock()
+			return
+		}
+
+		// T2 rebind attempt
+		lease2, err = m.doDHCPv4(ctx, ifaceName)
+		if err == nil {
+			lease = lease2
+			continue
+		}
+		slog.Warn("DHCPv4: T2 rebind failed, lease will expire",
+			"interface", ifaceName, "err", err)
+		// Let the loop restart with a fresh DORA
 	}
 }
 
@@ -620,6 +674,12 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 	key := clientKey{iface: ifaceName, family: AFInet6}
 	backoff := time.Second
 
+	m.mu.Lock()
+	v6opts := m.v6opts[ifaceName]
+	m.mu.Unlock()
+
+	stateless := v6opts != nil && v6opts.Stateless
+
 	// Wait for link-local address
 	if err := m.waitForLinkLocal(ctx, ifaceName, 30*time.Second); err != nil {
 		slog.Warn("DHCPv6: no link-local address, aborting",
@@ -632,7 +692,11 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 			return
 		}
 
-		slog.Info("DHCPv6: starting solicit", "interface", ifaceName)
+		if stateless {
+			slog.Info("DHCPv6: starting information-request", "interface", ifaceName)
+		} else {
+			slog.Info("DHCPv6: starting solicit", "interface", ifaceName)
+		}
 
 		result, err := m.doDHCPv6(ctx, ifaceName)
 		if err != nil {
@@ -653,12 +717,16 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 		backoff = time.Second
 		lease := result.lease
 
-		if lease.Address.IsValid() {
+		if !stateless && lease.Address.IsValid() {
 			if err := m.applyAddress(ifaceName, lease); err != nil {
 				slog.Warn("DHCPv6: failed to apply address",
 					"interface", ifaceName, "err", err)
 				continue
 			}
+		}
+
+		if v6opts != nil && v6opts.UpdateDNS {
+			m.installDNS(lease)
 		}
 
 		m.mu.Lock()
@@ -670,11 +738,17 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 
 		m.scheduleRecompile()
 
-		slog.Info("DHCPv6: lease obtained",
-			"interface", ifaceName,
-			"address", lease.Address,
-			"delegated_prefixes", len(result.prefixes),
-			"lease_time", lease.LeaseTime)
+		if stateless {
+			slog.Info("DHCPv6: stateless options obtained",
+				"interface", ifaceName,
+				"dns", lease.DNS)
+		} else {
+			slog.Info("DHCPv6: lease obtained",
+				"interface", ifaceName,
+				"address", lease.Address,
+				"delegated_prefixes", len(result.prefixes),
+				"lease_time", lease.LeaseTime)
+		}
 
 		// Wait for T1
 		t1 := lease.LeaseTime / 2
@@ -686,7 +760,7 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 		case <-time.After(t1):
 			slog.Info("DHCPv6: T1 expired, renewing", "interface", ifaceName)
 		case <-ctx.Done():
-			if lease.Address.IsValid() {
+			if !stateless && lease.Address.IsValid() {
 				m.removeAddress(ifaceName, lease)
 			}
 			m.mu.Lock()
@@ -695,6 +769,44 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 			m.mu.Unlock()
 			return
 		}
+
+		// T1 renewal attempt
+		result2, err := m.doDHCPv6(ctx, ifaceName)
+		if err == nil {
+			result = result2
+			lease = result.lease
+			continue // apply at top of loop
+		}
+		slog.Warn("DHCPv6: T1 renewal failed, waiting for T2",
+			"interface", ifaceName, "err", err)
+
+		// Wait for T2 (87.5% of lease) — remaining time after T1
+		t2remaining := lease.LeaseTime*7/8 - lease.LeaseTime/2
+		if t2remaining < time.Second {
+			t2remaining = time.Second
+		}
+		select {
+		case <-time.After(t2remaining):
+		case <-ctx.Done():
+			if !stateless && lease.Address.IsValid() {
+				m.removeAddress(ifaceName, lease)
+			}
+			m.mu.Lock()
+			delete(m.leases, key)
+			delete(m.delegatedPDs, ifaceName)
+			m.mu.Unlock()
+			return
+		}
+
+		// T2 rebind attempt
+		result2, err = m.doDHCPv6(ctx, ifaceName)
+		if err == nil {
+			result = result2
+			lease = result.lease
+			continue
+		}
+		slog.Warn("DHCPv6: T2 rebind failed, lease will expire",
+			"interface", ifaceName, "err", err)
 	}
 }
 
@@ -721,6 +833,53 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*dhcpv6Result
 
 	// Build modifiers — use persistent DUID if configured
 	mods := m.buildDHCPv6Modifiers(ifaceName, v6opts)
+
+	stateless := v6opts != nil && v6opts.Stateless
+
+	// Stateless mode: send Information-Request (no IA_NA/IA_PD)
+	if stateless {
+		msg, err := dhcpv6.NewMessage()
+		if err != nil {
+			return nil, fmt.Errorf("DHCPv6 new message: %w", err)
+		}
+		msg.MessageType = dhcpv6.MessageTypeInformationRequest
+		// Apply modifiers (DUID, ORO options)
+		for _, mod := range mods {
+			mod(msg)
+		}
+		// Always request DNS
+		oro := msg.Options.RequestedOptions()
+		hasDNS := false
+		for _, code := range oro {
+			if code == dhcpv6.OptionDNSRecursiveNameServer {
+				hasDNS = true
+				break
+			}
+		}
+		if !hasDNS {
+			dhcpv6.WithRequestedOptions(dhcpv6.OptionDNSRecursiveNameServer)(msg)
+		}
+
+		resp, err := client.SendAndRead(exCtx, nclient6.AllDHCPRelayAgentsAndServers, msg, nil)
+		if err != nil {
+			return nil, fmt.Errorf("DHCPv6 information-request: %w", err)
+		}
+
+		lease := &Lease{
+			Interface: ifaceName,
+			Family:    AFInet6,
+			Obtained:  time.Now(),
+			LeaseTime: 3600 * time.Second, // 1-hour refresh for stateless
+		}
+		if dnsOpt := resp.Options.DNS(); len(dnsOpt) > 0 {
+			for _, dns := range dnsOpt {
+				if a, ok := netip.AddrFromSlice(dns); ok {
+					lease.DNS = append(lease.DNS, a)
+				}
+			}
+		}
+		return &dhcpv6Result{lease: lease}, nil
+	}
 
 	adv, err := client.RapidSolicit(exCtx, mods...)
 	if err != nil {

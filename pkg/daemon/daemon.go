@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2044,8 +2045,10 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 					dm.SetDUIDType(dhcpIface, "duid-ll") // default
 				}
 				// Configure DHCPv6 PD and other options
-				if unit.DHCPv6Client != nil && (len(unit.DHCPv6Client.ClientIATypes) > 0 || len(unit.DHCPv6Client.ReqOptions) > 0) {
+				if unit.DHCPv6Client != nil {
 					dm.SetDHCPv6Options(dhcpIface, &dhcp.DHCPv6Options{
+						Stateless:  unit.DHCPv6Client.ClientType == "stateless",
+						UpdateDNS:  slices.Contains(unit.DHCPv6Client.ReqOptions, "dns-server"),
 						IATypes:    unit.DHCPv6Client.ClientIATypes,
 						PDPrefLen:  unit.DHCPv6Client.PrefixDelegatingPrefixLen,
 						PDSubLen:   unit.DHCPv6Client.PrefixDelegatingSubPrefLen,
@@ -3345,6 +3348,10 @@ func (d *Daemon) applySyslogFiles(cfg *config.Config) {
 			if facility == "" || facility == "any" {
 				facility = "*"
 			}
+			// Junos "change-log" maps to local6; rsyslog doesn't know the name
+			if facility == "change-log" {
+				facility = "local6"
+			}
 			severity := f.Severity
 			if severity == "" || severity == "any" {
 				severity = "*"
@@ -3365,6 +3372,9 @@ func (d *Daemon) applySyslogFiles(cfg *config.Config) {
 			facility := u.Facility
 			if facility == "" || facility == "any" {
 				facility = "*"
+			}
+			if facility == "change-log" {
+				facility = "local6"
 			}
 			severity := u.Severity
 			if severity == "" || severity == "any" {

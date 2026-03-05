@@ -99,6 +99,186 @@ tc_ct_hit_v6(struct __sk_buff *skb, struct pkt_meta *meta,
 	bpf_tail_call(skb, &tc_progs, next);
 }
 
+/*
+ * Allocate a unique session ID from the per-CPU generator.
+ * (Same as xdp_policy.c — static inline, not in a shared header.)
+ */
+static __always_inline __u64
+alloc_session_id(void)
+{
+	__u32 z = 0;
+	__u64 *gen = bpf_map_lookup_elem(&session_id_gen, &z);
+	if (!gen)
+		return 0;
+	__u64 val = *gen + 1;
+	*gen = val;
+	return val;
+}
+
+/*
+ * Create dual session entries for locally-originated IPv4 traffic.
+ * ingress_zone = 0 (junos-host / self), egress_zone from meta.
+ * No NAT, no policy, no FIB cache.
+ */
+static __always_inline void
+tc_create_session_v4(struct pkt_meta *meta)
+{
+	__u64 now = meta->ktime_ns / 1000000000ULL;
+
+	struct session_key fwd_key = {};
+	fwd_key.src_ip   = meta->src_ip.v4;
+	fwd_key.dst_ip   = meta->dst_ip.v4;
+	fwd_key.src_port = meta->src_port;
+	fwd_key.dst_port = meta->dst_port;
+	fwd_key.protocol = meta->protocol;
+
+	struct session_key rev_key;
+	ct_reverse_key(&fwd_key, &rev_key);
+
+	__u8 initial_state;
+	if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x02))
+		initial_state = SESS_STATE_SYN_SENT;
+	else
+		initial_state = SESS_STATE_ESTABLISHED;
+
+	__u32 timeout = ct_get_timeout(meta->protocol, initial_state);
+
+	__u32 idx0 = 0;
+	struct session_value *fwd_val = bpf_map_lookup_elem(
+		&session_v4_scratch, &idx0);
+	if (!fwd_val)
+		return;
+
+	__u64 sid = alloc_session_id();
+
+	__builtin_memset(fwd_val, 0, sizeof(*fwd_val));
+	fwd_val->state        = initial_state;
+	fwd_val->is_reverse   = 0;
+	fwd_val->session_id   = sid;
+	fwd_val->created      = now;
+	fwd_val->last_seen    = now;
+	fwd_val->timeout      = timeout;
+	fwd_val->ingress_zone = 0; /* junos-host (self) */
+	fwd_val->egress_zone  = meta->egress_zone;
+	fwd_val->fwd_packets  = 1;
+	fwd_val->fwd_bytes    = meta->pkt_len;
+	fwd_val->reverse_key  = rev_key;
+
+	int ret = bpf_map_update_elem(&sessions, &fwd_key, fwd_val,
+				      BPF_NOEXIST);
+	if (ret < 0)
+		return;
+
+	__u32 idx1 = 1;
+	struct session_value *rev_val = bpf_map_lookup_elem(
+		&session_v4_scratch, &idx1);
+	if (!rev_val) {
+		bpf_map_delete_elem(&sessions, &fwd_key);
+		return;
+	}
+
+	__builtin_memset(rev_val, 0, sizeof(*rev_val));
+	rev_val->state        = initial_state;
+	rev_val->is_reverse   = 1;
+	rev_val->session_id   = sid;
+	rev_val->created      = now;
+	rev_val->last_seen    = now;
+	rev_val->timeout      = timeout;
+	rev_val->ingress_zone = meta->egress_zone;
+	rev_val->egress_zone  = 0; /* junos-host (self) */
+	rev_val->reverse_key  = fwd_key;
+
+	ret = bpf_map_update_elem(&sessions, &rev_key, rev_val,
+				  BPF_NOEXIST);
+	if (ret < 0) {
+		bpf_map_delete_elem(&sessions, &fwd_key);
+		return;
+	}
+
+	inc_counter(GLOBAL_CTR_SESSIONS_NEW);
+}
+
+/*
+ * Create dual session entries for locally-originated IPv6 traffic.
+ */
+static __always_inline void
+tc_create_session_v6(struct pkt_meta *meta)
+{
+	__u64 now = meta->ktime_ns / 1000000000ULL;
+
+	struct session_key_v6 fwd_key = {};
+	__builtin_memcpy(fwd_key.src_ip, meta->src_ip.v6, 16);
+	__builtin_memcpy(fwd_key.dst_ip, meta->dst_ip.v6, 16);
+	fwd_key.src_port = meta->src_port;
+	fwd_key.dst_port = meta->dst_port;
+	fwd_key.protocol = meta->protocol;
+
+	struct session_key_v6 rev_key;
+	ct_reverse_key_v6(&fwd_key, &rev_key);
+
+	__u8 initial_state;
+	if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x02))
+		initial_state = SESS_STATE_SYN_SENT;
+	else
+		initial_state = SESS_STATE_ESTABLISHED;
+
+	__u32 timeout = ct_get_timeout(meta->protocol, initial_state);
+
+	__u32 idx0 = 0;
+	struct session_value_v6 *fwd_val = bpf_map_lookup_elem(
+		&session_v6_scratch, &idx0);
+	if (!fwd_val)
+		return;
+
+	__u64 sid = alloc_session_id();
+
+	__builtin_memset(fwd_val, 0, sizeof(*fwd_val));
+	fwd_val->state        = initial_state;
+	fwd_val->is_reverse   = 0;
+	fwd_val->session_id   = sid;
+	fwd_val->created      = now;
+	fwd_val->last_seen    = now;
+	fwd_val->timeout      = timeout;
+	fwd_val->ingress_zone = 0;
+	fwd_val->egress_zone  = meta->egress_zone;
+	fwd_val->fwd_packets  = 1;
+	fwd_val->fwd_bytes    = meta->pkt_len;
+	fwd_val->reverse_key  = rev_key;
+
+	int ret = bpf_map_update_elem(&sessions_v6, &fwd_key, fwd_val,
+				      BPF_NOEXIST);
+	if (ret < 0)
+		return;
+
+	__u32 idx1 = 1;
+	struct session_value_v6 *rev_val = bpf_map_lookup_elem(
+		&session_v6_scratch, &idx1);
+	if (!rev_val) {
+		bpf_map_delete_elem(&sessions_v6, &fwd_key);
+		return;
+	}
+
+	__builtin_memset(rev_val, 0, sizeof(*rev_val));
+	rev_val->state        = initial_state;
+	rev_val->is_reverse   = 1;
+	rev_val->session_id   = sid;
+	rev_val->created      = now;
+	rev_val->last_seen    = now;
+	rev_val->timeout      = timeout;
+	rev_val->ingress_zone = meta->egress_zone;
+	rev_val->egress_zone  = 0;
+	rev_val->reverse_key  = fwd_key;
+
+	ret = bpf_map_update_elem(&sessions_v6, &rev_key, rev_val,
+				  BPF_NOEXIST);
+	if (ret < 0) {
+		bpf_map_delete_elem(&sessions_v6, &fwd_key);
+		return;
+	}
+
+	inc_counter(GLOBAL_CTR_SESSIONS_NEW);
+}
+
 SEC("tc")
 int tc_conntrack_prog(struct __sk_buff *skb)
 {
@@ -217,7 +397,12 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 
-	/* Locally-originated traffic -- tail-call to forward (pass through) */
+	/* Locally-originated traffic — create session for return matching */
+	if (meta->addr_family == AF_INET)
+		tc_create_session_v4(meta);
+	else
+		tc_create_session_v6(meta);
+
 	bpf_tail_call(skb, &tc_progs, TC_PROG_FORWARD);
 	return TC_ACT_OK; /* fallthrough = pass */
 }

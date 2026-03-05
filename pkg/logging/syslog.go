@@ -325,6 +325,8 @@ func ParseFacility(name string) int {
 		return FacilityLocal6
 	case "local7":
 		return FacilityLocal7
+	case "change-log":
+		return FacilityLocal6
 	default:
 		return FacilityLocal0
 	}
