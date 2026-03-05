@@ -454,22 +454,20 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
-	if (rc != BPF_FIB_LKUP_RET_SUCCESS &&
-	    rc != BPF_FIB_LKUP_RET_NO_NEIGH) {
+	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED ||
+	    rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+		/* NOT_FWDED: original sender is a local address
+		 * (firewall-originated traffic).  Deliver locally.
+		 * NO_NEIGH: route exists but no ARP — let kernel
+		 * forward.  Both set fwd_ifindex=0 for XDP_PASS. */
+		meta->fwd_ifindex = 0;
+	} else if (rc != BPF_FIB_LKUP_RET_SUCCESS) {
 		/* No route — cluster secondary may lack routes.
 		 * Try fabric redirect to primary. */
 		int fab_rc = try_fabric_redirect(ctx, meta);
 		if (fab_rc >= 0)
 			return fab_rc;
 		return -1;
-	}
-
-	if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
-		/*
-		 * Route exists but no ARP entry — let kernel forward.
-		 * Set fwd_ifindex=0 so xdp_forward does XDP_PASS.
-		 */
-		meta->fwd_ifindex = 0;
 	} else {
 		/* Resolve VLAN sub-interface */
 		__u32 egress_if = fib.ifindex;
@@ -660,22 +658,20 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	__u32 fib_flags6 = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags6);
-	if (rc != BPF_FIB_LKUP_RET_SUCCESS &&
-	    rc != BPF_FIB_LKUP_RET_NO_NEIGH) {
+	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED ||
+	    rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+		/* NOT_FWDED: original sender is a local address
+		 * (firewall-originated traffic).  Deliver locally.
+		 * NO_NEIGH: route exists but no NDP — let kernel
+		 * forward.  Both set fwd_ifindex=0 for XDP_PASS. */
+		meta->fwd_ifindex = 0;
+	} else if (rc != BPF_FIB_LKUP_RET_SUCCESS) {
 		/* No route — cluster secondary may lack routes.
 		 * Try fabric redirect to primary. */
 		int fab_rc = try_fabric_redirect(ctx, meta);
 		if (fab_rc >= 0)
 			return fab_rc;
 		return -1;
-	}
-
-	if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
-		/*
-		 * Route exists but no NDP entry — let kernel forward.
-		 * Set fwd_ifindex=0 so xdp_forward does XDP_PASS.
-		 */
-		meta->fwd_ifindex = 0;
 	} else {
 		/* Resolve VLAN sub-interface */
 		__u32 egress_if = fib.ifindex;
