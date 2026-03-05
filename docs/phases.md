@@ -2441,3 +2441,52 @@ population, and stale config snapshot in periodic neighbor warmup.
 - Prevents stale config overwrite from reconnecting secondary nodes
 - Reduces fabric_fwd population time from up to 60s to <5s after reboot
 - Neighbor warmup always uses current config — no stale snapshot drift
+
+## Sprint VSRX-PARITY: vSRX Configuration Compatibility
+
+Closes feature gaps identified by comparing bpfrx against a production vSRX configuration.
+Focus areas: config groups/templates, NAT edge cases, routing enhancements, tunnel types,
+firewall filter fixes, and cluster config parity.
+
+### General-Purpose Groups/Apply-Groups
+- **`groups { name { ... } }`**: Top-level group definitions parsed into AST — supports arbitrary config subtrees as reusable templates
+- **`apply-groups [ group1 group2 ]`**: Apply group inheritance at any hierarchy level — merges group subtree into current position
+- **Inheritance priority**: Later groups override earlier; explicit config overrides groups
+- **`apply-groups-except`**: Exclude specific groups from inheritance
+- **Template patterns**: Policy templates (default-deny-template), outbound policy groups (default-internet-out), per-node groups (node0/node1)
+- Extends existing `ExpandGroupsWithVars()` / `CompileConfigForNode()` infrastructure
+
+### NAT Feature Verification & Fixes
+- **`source-nat { off; }`**: Explicit NAT bypass in SNAT rules — verified parsing and compilation
+- **`source-address-name` in DNAT rules**: Address book name references in DNAT match conditions — verified/fixed resolution
+- **DNAT `protocol` match**: Protocol-only matching (ICMP, GRE) without ports — verified BPF path
+- **DNAT pool with port**: Port rewriting in DNAT pools (e.g., `address x.x.x.x/32 port 22`) — verified
+- **Multiple `destination-port`**: Multi-port matching in DNAT rules (e.g., `destination-port { 34201; 32401; }`) — verified
+
+### Firewall Filter & Policy Verification
+- **`source-prefix-list { name except; }`**: Inverted prefix-list matching in lo0 filters — verified parsing and BPF compilation
+- **`policy-statement` → FRR route-map**: BGP export policies with `from protocol direct; route-filter` terms compile to FRR route-maps
+- **`prefix-list` in policy-options**: Used in both firewall filters and route policies — verified
+- **`forwarding-table { export load-balancing-policy; }`**: ECMP consistent-hash — verified mapping
+- **IPv6 `traffic-class` matching**: `family inet6 { filter { input ...; } }` with `traffic-class` as IPv6 DSCP match — verified
+
+### Per-Interface NetFlow Sampling & Instance-Type Forwarding
+- **Per-interface sampling**: `family inet { sampling { input; output; } }` and `family inet6 { sampling { input; output; } }` parsed per unit
+- **Forwarding-options sampling instances**: `forwarding-options { sampling { instance name { input { rate N; } family inet { output { flow-server ... } inline-jflow { source-address ... } } } } }` — links interface sampling config to flow export instance
+- **`instance-type forwarding` VRF**: Forwarding-only VRF with routes but no interface binding — creates routing table and `ip rule` entry without interface assignment
+
+### Cluster Config Enhancements
+- **`gratuitous-arp-count N` per RG**: Configurable GARP burst count per redundancy-group (was fixed). Parsed, compiled, and used in VRRP becomeMaster() GARP burst
+- **`reth-count N`**: Parsed (informational, bpfrx auto-detects RETH count)
+- **`dad-disable`**: Disable IPv6 Duplicate Address Detection under `family inet6` — compiled to networkd config (`IPv6DuplicateAddressDetection=0`)
+- **Nested address-set resolution**: Recursive address-set references (e.g., `deny-plex-blocks` → `tmobile-blocks` → `tmobile-v4-blocks`) — verified compiler resolves recursively
+- **`address primary/preferred` modifiers**: Parse and apply `primary` and `preferred` address sub-options for source address selection
+
+### DHCPv6 Prefix Delegation (IA-PD)
+- **`client-ia-type ia-pd`**: DHCPv6 client extended to request IA_PD (option 25) alongside IA_NA
+- **`prefix-delegating`**: `preferred-prefix-length` and `sub-prefix-length` sub-options parsed and compiled
+- **`client-identifier duid-type duid-ll`**: DUID-LL client identifier type support
+- **`update-router-advertisement`**: When PD prefix received, update RA sender with delegated prefix on specified interface
+- **`req-option dns-server`**: DNS server option request in DHCPv6 solicitation
+
+

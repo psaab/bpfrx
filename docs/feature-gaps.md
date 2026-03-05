@@ -1,6 +1,6 @@
 # bpfrx vs Juniper vSRX Feature Gap Analysis
 
-Last updated: 2026-03-02
+Last updated: 2026-03-04
 
 ## Summary
 
@@ -148,7 +148,7 @@ User-based policy enforcement integrating with directory services. Not implement
 
 ## 8. NAT Enhancements
 
-bpfrx has SNAT (interface + pool, address-persistent), DNAT (with pools, hit counters), static 1:1, NAT64, and exemption rules. These are additional NAT features from the vSRX.
+bpfrx has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, protocol-only match, port rewriting, multi-port matching), static 1:1, NAT64, and exemption rules. These are additional NAT features from the vSRX.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -248,7 +248,7 @@ bpfrx uses strongSwan for IPsec which has its own certificate handling, but Juno
 
 ## 14. Routing Enhancements
 
-bpfrx has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, rib-groups, next-table route leaking, PBR, and FRR integration (OSPF, BGP, IS-IS, RIP, LLDP). These are additional routing features.
+bpfrx has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, IPIP tunnels (IPv4+IPv6), rib-groups, next-table route leaking, PBR, qualified-next-hop with interface (link-local IPv6), per-instance `rib <name>.inet6.0` IPv6 static routes, and FRR integration (OSPF, BGP, IS-IS, RIP, LLDP). These are additional routing features.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -289,7 +289,7 @@ bpfrx has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfac
 
 ## 16. HA Enhancements
 
-bpfrx has a broad chassis cluster implementation with redundancy groups, RETH (VRRP-backed, virtual MAC), heartbeat, GARP, weight-based failover, session sync (RTO, per-RG aware), config sync, IP monitoring, election logic, VRRP, active/active per-RG service management, fabric forwarding, and ISSU. Remaining gaps are tracked below.
+bpfrx has a broad chassis cluster implementation with redundancy groups, RETH (VRRP-backed, virtual MAC), heartbeat, configurable per-RG gratuitous-arp-count, weight-based failover, session sync (RTO, per-RG aware), config sync, IP monitoring, election logic, VRRP, active/active per-RG service management, fabric forwarding, and ISSU. Remaining gaps are tracked below.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -306,7 +306,7 @@ bpfrx has a broad chassis cluster implementation with redundancy groups, RETH (V
 
 ## 17. Firewall Filter Enhancements
 
-bpfrx has firewall filters with source/dest addresses, prefix-lists (with except), DSCP, protocol, dest/source ports, ICMP type/code, TCP flags, fragment match, actions (accept/reject/discard), routing-instance, log, count, forwarding-class, loss-priority, DSCP rewrite.
+bpfrx has firewall filters with source/dest addresses, prefix-lists (with except), DSCP, protocol, dest/source ports, ICMP type/code, TCP flags, fragment match, actions (accept/reject/discard), routing-instance, log, count, forwarding-class, loss-priority, DSCP rewrite, and IPv6 traffic-class matching.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -355,7 +355,7 @@ bpfrx has gRPC (48+ RPCs), REST API, Junos-style CLI (local + remote), Prometheu
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **NETCONF/YANG** | `system services netconf ...` | Standards-based config management (RFC 6241). Enables Ansible, Salt, Terraform, ncclient integration. XML-based RPC. | High | Missing |
-| **Configuration Groups** | `groups { name { ... } }; apply-groups name` | Template inheritance for config reuse. Apply common settings to multiple stanzas without duplication. | Medium | Done (`ExpandGroupsWithVars()` resolves apply-groups with `${node}` variable support; `CompileConfigForNode()` for HA per-node config) |
+| **Configuration Groups** | `groups { name { ... } }; apply-groups name` | Template inheritance for config reuse. Apply common settings to multiple stanzas without duplication. | Medium | Done (general-purpose groups/apply-groups with inheritance priority, `apply-groups-except`, `${node}` variable support, `CompileConfigForNode()` for HA per-node config) |
 | **Commit Scripts** | `system scripts commit ...` | Pre-commit validation scripts (SLAX/Python) that enforce config standards and generate warnings/errors | Low | Missing |
 | **Op Scripts** | `system scripts op ...` | Custom operational commands via SLAX/Python scripts | Low | Missing |
 | **RADIUS Authentication** | `system radius-server ...; system authentication-order radius` | External RADIUS authentication for management access (SSH, CLI, web) | Medium | Missing |
@@ -371,7 +371,7 @@ bpfrx has gRPC (48+ RPCs), REST API, Junos-style CLI (local + remote), Prometheu
 
 ## 21. Interface Enhancements
 
-bpfrx manages all interfaces with .link/.network files, supports VLANs, tunnel interfaces (GRE, IP-IP, XFRM), DHCP, VRRP, MTU, speed/duplex, disable, sampling, and per-interface firewall filters.
+bpfrx manages all interfaces with .link/.network files, supports VLANs, tunnel interfaces (GRE, IP-IP, XFRM), DHCP, VRRP, MTU, speed/duplex, disable, per-interface sampling (input/output, per-family), forwarding-options sampling instances with inline-jflow, and per-interface firewall filters.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|

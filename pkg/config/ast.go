@@ -1180,7 +1180,18 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"point-to-point": {children: nil},
 			"vlan-id":        {args: 1, children: nil},
 			"inner-vlan-id":  {args: 1, children: nil},
-			"tunnel":         {children: nil},
+			"tunnel": {desc: "Tunnel parameters", children: map[string]*schemaNode{
+				"source":      {desc: "Tunnel source address", args: 1, children: nil},
+				"destination": {desc: "Tunnel destination address", args: 1, children: nil},
+				"mode":        {desc: "Tunnel mode", args: 1, children: nil},
+				"key":         {desc: "Tunnel key", args: 1, children: nil},
+				"ttl":         {desc: "Time to live", args: 1, children: nil},
+				"keepalive":       {desc: "Keepalive interval", args: 1, children: nil},
+				"keepalive-retry": {desc: "Keepalive retry count", args: 1, children: nil},
+				"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
+					"destination": {desc: "Destination routing instance", args: 1, children: nil},
+				}},
+			}},
 			"family": {children: map[string]*schemaNode{
 				"inet": {children: map[string]*schemaNode{
 					"mtu":     {args: 1, children: nil},
@@ -1863,6 +1874,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"routing-options": {children: map[string]*schemaNode{
 			"static": {children: map[string]*schemaNode{
 				"route": {args: 1, children: nil},
+			}},
+			"rib": {args: 1, children: map[string]*schemaNode{
+				"static": {children: map[string]*schemaNode{
+					"route": {args: 1, children: nil},
+				}},
 			}},
 			"interface-routes": {children: map[string]*schemaNode{
 				"rib-group": {children: map[string]*schemaNode{

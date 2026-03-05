@@ -350,10 +350,14 @@ func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, confi
 		unitNum, _ = strconv.Atoi(parts[1])
 	}
 
-	// Look up VLAN ID from interface config (keyed by original config name)
+	// Per-unit tunnel interfaces have their own Linux interface name
+	// (e.g. gr-0/0/0 unit 1 → "gr-0-0-0u1")
 	if ifCfg, ok := cfg.Interfaces.Interfaces[configName]; ok {
 		if unit, ok := ifCfg.Units[unitNum]; ok {
 			vlanID = unit.VlanID
+			if unit.Tunnel != nil {
+				physName = unit.Tunnel.Name
+			}
 		}
 	}
 	return
@@ -627,6 +631,10 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			var rgID uint8
 			if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
 				if ifCfg.Tunnel != nil {
+					izFlags |= IfaceFlagTunnel
+				}
+				// Check per-unit tunnel
+				if unit, ok := ifCfg.Units[unitNum]; ok && unit.Tunnel != nil {
 					izFlags |= IfaceFlagTunnel
 				}
 				if ifCfg.RedundancyGroup > 0 {
@@ -1098,6 +1106,12 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	for name, ifc := range cfg.Interfaces.Interfaces {
 		if ifc.Tunnel != nil {
 			daemonOwned[ifc.Tunnel.Name] = true
+		}
+		// Per-unit tunnel interfaces
+		for _, unit := range ifc.Units {
+			if unit.Tunnel != nil {
+				daemonOwned[unit.Tunnel.Name] = true
+			}
 		}
 		if len(ifc.FabricMembers) > 0 {
 			daemonOwned[name] = true

@@ -1032,7 +1032,7 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 			}
 		}
 
-		// Check for tunnel configuration
+		// Check for interface-level tunnel configuration
 		tunnelNode := child.FindChild("tunnel")
 		if tunnelNode != nil {
 			// Default mode based on interface name prefix: ip-X/X/X → ipip, gr-X/X/X → gre
@@ -1041,7 +1041,7 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 				defaultMode = "ipip"
 			}
 			tc := &TunnelConfig{
-				Name: ifName,
+				Name: LinuxIfName(ifName),
 				Mode: defaultMode,
 			}
 			for _, prop := range tunnelNode.Children {
@@ -1113,14 +1113,22 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 
 			// Parse tunnel config at unit level (gr-0/0/0 unit N { tunnel { ... } })
 			if tunnelNode := unitInst.node.FindChild("tunnel"); tunnelNode != nil {
-				tc := ifc.Tunnel
-				if tc == nil {
-					defaultMode := "gre"
-					if strings.HasPrefix(ifName, "ip-") {
-						defaultMode = "ipip"
-					}
-					tc = &TunnelConfig{Name: ifName, Mode: defaultMode}
-					ifc.Tunnel = tc
+				defaultMode := "gre"
+				if strings.HasPrefix(ifName, "ip-") {
+					defaultMode = "ipip"
+				}
+				// Per-unit tunnel: each unit with its own tunnel config gets
+				// a separate Linux interface. Unit 0 uses the base name,
+				// unit N>0 appends "uN".
+				linuxName := LinuxIfName(ifName)
+				if unitNum > 0 {
+					linuxName = linuxName + "u" + strconv.Itoa(unitNum)
+				}
+				tc := &TunnelConfig{Name: linuxName, Mode: defaultMode}
+				// Inherit from interface-level tunnel if present
+				if ifc.Tunnel != nil {
+					*tc = *ifc.Tunnel
+					tc.Name = linuxName
 				}
 				for _, prop := range tunnelNode.Children {
 					switch prop.Name() {
@@ -1138,8 +1146,37 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 						} else if v := nodeVal(prop); v != "" {
 							tc.RoutingInstance = v
 						}
+					case "mode":
+						if v := nodeVal(prop); v != "" {
+							tc.Mode = v
+						}
+					case "key":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								tc.Key = uint32(n)
+							}
+						}
+					case "ttl":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								tc.TTL = n
+							}
+						}
+					case "keepalive":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								tc.Keepalive = n
+							}
+						}
+					case "keepalive-retry":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								tc.KeepaliveRetry = n
+							}
+						}
 					}
 				}
+				unit.Tunnel = tc
 			}
 
 			// Parse vlan-id on unit
@@ -1372,7 +1409,11 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 			ifc.Units[unitNum] = unit
 
 			// Collect tunnel addresses from unit config
-			if ifc.Tunnel != nil {
+			if unit.Tunnel != nil {
+				// Per-unit tunnel: addresses belong to this specific tunnel
+				unit.Tunnel.Addresses = append(unit.Tunnel.Addresses, unit.Addresses...)
+			} else if ifc.Tunnel != nil {
+				// Interface-level tunnel: all unit addresses go to shared tunnel
 				ifc.Tunnel.Addresses = append(ifc.Tunnel.Addresses, unit.Addresses...)
 			}
 		}
@@ -2753,9 +2794,10 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 	}
 
 	// Parse rib inet6.0 { static { route ... } }
+	// In routing-instances, the rib name is "<instance>.inet6.0" (e.g., "ATT.inet6.0").
 	for _, ribNode := range node.FindChildren("rib") {
 		ribName := nodeVal(ribNode)
-		if ribName == "inet6.0" {
+		if ribName == "inet6.0" || strings.HasSuffix(ribName, ".inet6.0") {
 			if ribStatic := ribNode.FindChild("static"); ribStatic != nil {
 				ro.Inet6StaticRoutes = compileStaticRoutes(ribStatic, ro.Inet6StaticRoutes)
 			}
@@ -2894,6 +2936,17 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 					if i+1 < len(routeInst.node.Keys) {
 						i++
 						route.NextTable = parseNextTableInstance(routeInst.node.Keys[i])
+					}
+				case "qualified-next-hop":
+					if i+1 < len(routeInst.node.Keys) {
+						i++
+						nh := NextHopEntry{Address: routeInst.node.Keys[i]}
+						// Check for "interface <name>" following the address
+						if i+2 < len(routeInst.node.Keys) && routeInst.node.Keys[i+1] == "interface" {
+							i += 2
+							nh.Interface = routeInst.node.Keys[i]
+						}
+						route.NextHops = append(route.NextHops, nh)
 					}
 				case "discard":
 					route.Discard = true
@@ -4185,6 +4238,7 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 					return fmt.Errorf("instance %s routing-options: %w", instanceName, err)
 				}
 				ri.StaticRoutes = ro.StaticRoutes
+				ri.Inet6StaticRoutes = ro.Inet6StaticRoutes
 				// Parse interface-routes rib-group
 				if irNode := prop.FindChild("interface-routes"); irNode != nil {
 					if rgNode := irNode.FindChild("rib-group"); rgNode != nil {

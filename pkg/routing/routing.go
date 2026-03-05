@@ -222,16 +222,30 @@ func (m *Manager) ApplyTunnels(tunnels []*config.TunnelConfig) error {
 			ttl = 64
 		}
 
+		isIPv6 := localIP.To4() == nil
+
 		var tunnelLink netlink.Link
 		switch tc.Mode {
 		case "ipip":
-			tunnelLink = &netlink.Iptun{
-				LinkAttrs: netlink.LinkAttrs{Name: tc.Name},
-				Local:     localIP,
-				Remote:    remoteIP,
-				Ttl:       uint8(ttl),
+			if isIPv6 {
+				// IPIP over IPv6: use ip6tnl with IPPROTO_IPIP
+				tunnelLink = &netlink.Ip6tnl{
+					LinkAttrs: netlink.LinkAttrs{Name: tc.Name},
+					Local:     localIP,
+					Remote:    remoteIP,
+					Ttl:       uint8(ttl),
+					Proto:     4, // IPPROTO_IPIP
+				}
+			} else {
+				tunnelLink = &netlink.Iptun{
+					LinkAttrs: netlink.LinkAttrs{Name: tc.Name},
+					Local:     localIP,
+					Remote:    remoteIP,
+					Ttl:       uint8(ttl),
+				}
 			}
 		default: // "gre" or ""
+			// Gretun.Type() auto-detects IPv6 → returns "ip6gre"
 			greLink := &netlink.Gretun{
 				LinkAttrs: netlink.LinkAttrs{Name: tc.Name},
 				Local:     localIP,
@@ -572,6 +586,9 @@ func (m *Manager) GetTunnelStatus() ([]TunnelStatus, error) {
 			ts.Source = tun.Local.String()
 			ts.Destination = tun.Remote.String()
 		case *netlink.Iptun:
+			ts.Source = tun.Local.String()
+			ts.Destination = tun.Remote.String()
+		case *netlink.Ip6tnl:
 			ts.Source = tun.Local.String()
 			ts.Destination = tun.Remote.String()
 		}

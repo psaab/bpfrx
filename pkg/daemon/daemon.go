@@ -1405,12 +1405,18 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// 0.6. Program default routes in the management VRF for DHCP leases.
 	d.applyMgmtVRFRoutes()
 
-	// 1. Create tunnel interfaces
+	// 1. Create tunnel interfaces (interface-level + per-unit tunnels)
 	if d.routing != nil {
 		var tunnels []*config.TunnelConfig
 		for _, ifc := range cfg.Interfaces.Interfaces {
-			if ifc.Tunnel != nil {
+			if ifc.Tunnel != nil && ifc.Tunnel.Source != "" {
 				tunnels = append(tunnels, ifc.Tunnel)
+			}
+			// Collect per-unit tunnels (each unit with its own tunnel config)
+			for _, unit := range ifc.Units {
+				if unit.Tunnel != nil {
+					tunnels = append(tunnels, unit.Tunnel)
+				}
 			}
 		}
 		if len(tunnels) > 0 {
@@ -1704,7 +1710,8 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				BGP:          ri.BGP,
 				RIP:          ri.RIP,
 				ISIS:         ri.ISIS,
-				StaticRoutes: ri.StaticRoutes,
+				StaticRoutes:      ri.StaticRoutes,
+			Inet6StaticRoutes: ri.Inet6StaticRoutes,
 			})
 		}
 		if err := d.frr.ApplyFull(fc); err != nil {

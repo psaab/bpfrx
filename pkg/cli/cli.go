@@ -2823,8 +2823,13 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 	if c.routing != nil {
 		var tunnels []*config.TunnelConfig
 		for _, ifc := range cfg.Interfaces.Interfaces {
-			if ifc.Tunnel != nil {
+			if ifc.Tunnel != nil && ifc.Tunnel.Source != "" {
 				tunnels = append(tunnels, ifc.Tunnel)
+			}
+			for _, unit := range ifc.Units {
+				if unit.Tunnel != nil {
+					tunnels = append(tunnels, unit.Tunnel)
+				}
 			}
 		}
 		if len(tunnels) > 0 {

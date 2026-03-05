@@ -39,13 +39,14 @@ func New() *Manager {
 
 // InstanceConfig pairs routing config with a VRF name for per-instance generation.
 type InstanceConfig struct {
-	VRFName      string
-	OSPF         *config.OSPFConfig
-	OSPFv3       *config.OSPFv3Config
-	BGP          *config.BGPConfig
-	RIP          *config.RIPConfig
-	ISIS         *config.ISISConfig
-	StaticRoutes []*config.StaticRoute
+	VRFName           string
+	OSPF              *config.OSPFConfig
+	OSPFv3            *config.OSPFv3Config
+	BGP               *config.BGPConfig
+	RIP               *config.RIPConfig
+	ISIS              *config.ISISConfig
+	StaticRoutes      []*config.StaticRoute
+	Inet6StaticRoutes []*config.StaticRoute
 }
 
 // DHCPRoute represents a default route learned via DHCP.
@@ -231,7 +232,7 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	hasContent := fc.OSPF != nil || fc.OSPFv3 != nil || fc.BGP != nil || fc.RIP != nil || fc.ISIS != nil ||
 		len(fc.StaticRoutes) > 0 || len(fc.Inet6StaticRoutes) > 0 || len(fc.GenerateRoutes) > 0 || len(fc.DHCPRoutes) > 0 || fc.BackupRouter != "" || fc.ClusterMode
 	for _, inst := range fc.Instances {
-		if inst.OSPF != nil || inst.OSPFv3 != nil || inst.BGP != nil || inst.RIP != nil || inst.ISIS != nil || len(inst.StaticRoutes) > 0 {
+		if inst.OSPF != nil || inst.OSPFv3 != nil || inst.BGP != nil || inst.RIP != nil || inst.ISIS != nil || len(inst.StaticRoutes) > 0 || len(inst.Inet6StaticRoutes) > 0 {
 			hasContent = true
 			break
 		}
@@ -341,8 +342,11 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 
 	// Per-VRF static routes and dynamic protocols
 	for _, inst := range fc.Instances {
-		if len(inst.StaticRoutes) > 0 {
+		if len(inst.StaticRoutes) > 0 || len(inst.Inet6StaticRoutes) > 0 {
 			for _, sr := range inst.StaticRoutes {
+				b.WriteString(m.generateStaticRoute(sr, inst.VRFName, fc.RethMap))
+			}
+			for _, sr := range inst.Inet6StaticRoutes {
 				b.WriteString(m.generateStaticRoute(sr, inst.VRFName, fc.RethMap))
 			}
 			b.WriteString("!\n")

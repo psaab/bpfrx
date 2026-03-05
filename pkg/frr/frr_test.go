@@ -2248,3 +2248,27 @@ func TestDHCPRoutesIPv6SuppressedByStaticDefault(t *testing.T) {
 		t.Errorf("IPv6 DHCP route should be suppressed when IPv6 static default exists, got:\n%s", got)
 	}
 }
+
+func TestPerInstanceInet6StaticRoutes(t *testing.T) {
+	m := New()
+	m.frrConf = t.TempDir() + "/frr.conf"
+	fc := &FullConfig{
+		Instances: []InstanceConfig{
+			{
+				VRFName: "vrf-ATT",
+				Inet6StaticRoutes: []*config.StaticRoute{
+					{
+						Destination: "::/0",
+						NextHops:    []config.NextHopEntry{{Address: "fe80::2d0:f6ff:feda:c180", Interface: "wan0"}},
+					},
+				},
+			},
+		},
+	}
+	_ = m.ApplyFull(fc)
+	data, _ := os.ReadFile(m.frrConf)
+	got := string(data)
+	if !strings.Contains(got, "ipv6 route ::/0 fe80::2d0:f6ff:feda:c180 wan0 vrf vrf-ATT") {
+		t.Errorf("expected per-VRF IPv6 static route, got:\n%s", got)
+	}
+}

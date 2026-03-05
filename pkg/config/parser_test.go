@@ -6745,17 +6745,21 @@ func TestInterfacePointToPointAndMTU(t *testing.T) {
 	if unit0.MTU != 1436 {
 		t.Errorf("MTU = %d, want 1436", unit0.MTU)
 	}
-	if gr.Tunnel == nil {
-		t.Fatal("tunnel not set")
+	// Per-unit tunnel config goes to unit.Tunnel (not ifc.Tunnel)
+	if unit0.Tunnel == nil {
+		t.Fatal("tunnel not set on unit 0")
 	}
-	if gr.Tunnel.Source != "10.0.0.1" {
-		t.Errorf("tunnel source = %q, want 10.0.0.1", gr.Tunnel.Source)
+	if unit0.Tunnel.Source != "10.0.0.1" {
+		t.Errorf("tunnel source = %q, want 10.0.0.1", unit0.Tunnel.Source)
 	}
-	if gr.Tunnel.Destination != "10.0.0.2" {
-		t.Errorf("tunnel destination = %q, want 10.0.0.2", gr.Tunnel.Destination)
+	if unit0.Tunnel.Destination != "10.0.0.2" {
+		t.Errorf("tunnel destination = %q, want 10.0.0.2", unit0.Tunnel.Destination)
 	}
-	if gr.Tunnel.RoutingInstance != "my-vrf" {
-		t.Errorf("tunnel routing-instance = %q, want my-vrf", gr.Tunnel.RoutingInstance)
+	if unit0.Tunnel.RoutingInstance != "my-vrf" {
+		t.Errorf("tunnel routing-instance = %q, want my-vrf", unit0.Tunnel.RoutingInstance)
+	}
+	if unit0.Tunnel.Name != "gr-0-0-0" {
+		t.Errorf("tunnel Name = %q, want gr-0-0-0", unit0.Tunnel.Name)
 	}
 }
 
@@ -15579,5 +15583,352 @@ func TestValidateFabricDualValid(t *testing.T) {
 		if strings.Contains(w, "fabric") || strings.Contains(w, "control") {
 			t.Errorf("unexpected fabric/control warning: %s", w)
 		}
+	}
+}
+
+func TestPerUnitTunnelConfig(t *testing.T) {
+	// Multi-unit GRE tunnel: each unit has its own tunnel endpoints
+	// (mirrors vsrx.conf gr-0/0/0 with IPv4 unit 0 and IPv6 unit 1)
+	cmds := []string{
+		"set interfaces gr-0/0/0 unit 0 point-to-point",
+		"set interfaces gr-0/0/0 unit 0 tunnel source 209.237.133.186",
+		"set interfaces gr-0/0/0 unit 0 tunnel destination 107.161.208.15",
+		"set interfaces gr-0/0/0 unit 0 tunnel routing-instance destination Atherton-Fiber",
+		"set interfaces gr-0/0/0 unit 0 family inet mtu 1456",
+		"set interfaces gr-0/0/0 unit 0 family inet address 10.255.192.22/30",
+		"set interfaces gr-0/0/0 unit 1 point-to-point",
+		"set interfaces gr-0/0/0 unit 1 tunnel source 2602:fd41:20:5::351",
+		"set interfaces gr-0/0/0 unit 1 tunnel destination 2602:ffd3:0:2::7",
+		"set interfaces gr-0/0/0 unit 1 tunnel routing-instance destination Atherton-Fiber",
+		"set interfaces gr-0/0/0 unit 1 family inet mtu 1456",
+		"set interfaces gr-0/0/0 unit 1 family inet address 10.255.192.34/30",
+		"set interfaces gr-0/0/0 unit 1 family inet6 mtu 1436",
+		"set interfaces gr-0/0/0 unit 1 family inet6 address fe80::8/64",
+		"set interfaces gr-0/0/0 unit 1 family inet6 address fc00::e/126",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ifc := cfg.Interfaces.Interfaces["gr-0/0/0"]
+	if ifc == nil {
+		t.Fatal("gr-0/0/0 interface not found")
+	}
+
+	// Interface-level tunnel should be nil (no interface-level tunnel config)
+	if ifc.Tunnel != nil {
+		t.Error("interface-level Tunnel should be nil when only per-unit tunnels are configured")
+	}
+
+	// Unit 0: IPv4 GRE tunnel
+	unit0, ok := ifc.Units[0]
+	if !ok {
+		t.Fatal("unit 0 not found")
+	}
+	if unit0.Tunnel == nil {
+		t.Fatal("unit 0 tunnel config is nil")
+	}
+	if unit0.Tunnel.Name != "gr-0-0-0" {
+		t.Errorf("unit 0 Tunnel.Name = %q, want %q", unit0.Tunnel.Name, "gr-0-0-0")
+	}
+	if unit0.Tunnel.Mode != "gre" {
+		t.Errorf("unit 0 Tunnel.Mode = %q, want %q", unit0.Tunnel.Mode, "gre")
+	}
+	if unit0.Tunnel.Source != "209.237.133.186" {
+		t.Errorf("unit 0 Tunnel.Source = %q, want 209.237.133.186", unit0.Tunnel.Source)
+	}
+	if unit0.Tunnel.Destination != "107.161.208.15" {
+		t.Errorf("unit 0 Tunnel.Destination = %q, want 107.161.208.15", unit0.Tunnel.Destination)
+	}
+	if unit0.Tunnel.RoutingInstance != "Atherton-Fiber" {
+		t.Errorf("unit 0 Tunnel.RoutingInstance = %q, want Atherton-Fiber", unit0.Tunnel.RoutingInstance)
+	}
+	if len(unit0.Tunnel.Addresses) != 1 || unit0.Tunnel.Addresses[0] != "10.255.192.22/30" {
+		t.Errorf("unit 0 Tunnel.Addresses = %v, want [10.255.192.22/30]", unit0.Tunnel.Addresses)
+	}
+
+	// Unit 1: IPv6 GRE tunnel with unique name
+	unit1, ok := ifc.Units[1]
+	if !ok {
+		t.Fatal("unit 1 not found")
+	}
+	if unit1.Tunnel == nil {
+		t.Fatal("unit 1 tunnel config is nil")
+	}
+	if unit1.Tunnel.Name != "gr-0-0-0u1" {
+		t.Errorf("unit 1 Tunnel.Name = %q, want %q", unit1.Tunnel.Name, "gr-0-0-0u1")
+	}
+	if unit1.Tunnel.Source != "2602:fd41:20:5::351" {
+		t.Errorf("unit 1 Tunnel.Source = %q, want 2602:fd41:20:5::351", unit1.Tunnel.Source)
+	}
+	if unit1.Tunnel.Destination != "2602:ffd3:0:2::7" {
+		t.Errorf("unit 1 Tunnel.Destination = %q, want 2602:ffd3:0:2::7", unit1.Tunnel.Destination)
+	}
+	if unit1.Tunnel.RoutingInstance != "Atherton-Fiber" {
+		t.Errorf("unit 1 RoutingInstance = %q, want Atherton-Fiber", unit1.Tunnel.RoutingInstance)
+	}
+	// Unit 1 has 3 addresses (1 IPv4 + 2 IPv6)
+	if len(unit1.Tunnel.Addresses) != 3 {
+		t.Errorf("unit 1 Tunnel.Addresses = %v, want 3 entries", unit1.Tunnel.Addresses)
+	}
+}
+
+func TestIPIPTunnelWithRoutingInstance(t *testing.T) {
+	// IPIP tunnel with routing-instance destination (mirrors vsrx.conf ip-0/0/0)
+	cmds := []string{
+		"set interfaces ip-0/0/0 unit 0 tunnel source 209.237.133.186",
+		"set interfaces ip-0/0/0 unit 0 tunnel destination 107.161.208.15",
+		"set interfaces ip-0/0/0 unit 0 tunnel routing-instance destination Atherton-Fiber",
+		"set interfaces ip-0/0/0 unit 0 family inet mtu 1456",
+		"set interfaces ip-0/0/0 unit 0 family inet address 10.255.192.26/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ifc := cfg.Interfaces.Interfaces["ip-0/0/0"]
+	if ifc == nil {
+		t.Fatal("ip-0/0/0 interface not found")
+	}
+
+	// Per-unit tunnel on unit 0
+	unit0, ok := ifc.Units[0]
+	if !ok {
+		t.Fatal("unit 0 not found")
+	}
+	if unit0.Tunnel == nil {
+		t.Fatal("unit 0 tunnel config is nil")
+	}
+	if unit0.Tunnel.Mode != "ipip" {
+		t.Errorf("Mode = %q, want %q (auto-detected from ip- prefix)", unit0.Tunnel.Mode, "ipip")
+	}
+	if unit0.Tunnel.Name != "ip-0-0-0" {
+		t.Errorf("Name = %q, want %q", unit0.Tunnel.Name, "ip-0-0-0")
+	}
+	if unit0.Tunnel.RoutingInstance != "Atherton-Fiber" {
+		t.Errorf("RoutingInstance = %q, want Atherton-Fiber", unit0.Tunnel.RoutingInstance)
+	}
+	if unit0.Tunnel.Source != "209.237.133.186" {
+		t.Errorf("Source = %q, want 209.237.133.186", unit0.Tunnel.Source)
+	}
+	if len(unit0.Tunnel.Addresses) != 1 || unit0.Tunnel.Addresses[0] != "10.255.192.26/30" {
+		t.Errorf("Addresses = %v, want [10.255.192.26/30]", unit0.Tunnel.Addresses)
+	}
+}
+
+func TestTunnelNameMap(t *testing.T) {
+	cmds := []string{
+		// Interface-level tunnel (single tunnel shared by all units)
+		"set interfaces gre0 tunnel source 10.0.0.1",
+		"set interfaces gre0 tunnel destination 10.0.0.2",
+		"set interfaces gre0 unit 0 family inet address 10.10.10.1/30",
+		// Per-unit tunnels with different endpoints
+		"set interfaces gr-0/0/0 unit 0 tunnel source 1.1.1.1",
+		"set interfaces gr-0/0/0 unit 0 tunnel destination 2.2.2.2",
+		"set interfaces gr-0/0/0 unit 0 family inet address 10.0.0.1/30",
+		"set interfaces gr-0/0/0 unit 1 tunnel source 3.3.3.3",
+		"set interfaces gr-0/0/0 unit 1 tunnel destination 4.4.4.4",
+		"set interfaces gr-0/0/0 unit 1 family inet address 10.0.1.1/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	nameMap := cfg.TunnelNameMap()
+
+	// Interface-level tunnel: all units share base name
+	if got, want := nameMap["gre0.0"], "gre0"; got != want {
+		t.Errorf("TunnelNameMap[gre0.0] = %q, want %q", got, want)
+	}
+
+	// Per-unit tunnels: each unit has its own name
+	if got, want := nameMap["gr-0/0/0.0"], "gr-0-0-0"; got != want {
+		t.Errorf("TunnelNameMap[gr-0/0/0.0] = %q, want %q", got, want)
+	}
+	if got, want := nameMap["gr-0/0/0.1"], "gr-0-0-0u1"; got != want {
+		t.Errorf("TunnelNameMap[gr-0/0/0.1] = %q, want %q", got, want)
+	}
+}
+
+func TestInterfaceLevelTunnelLinuxName(t *testing.T) {
+	// Verify interface-level tunnels use LinuxIfName (/ → -)
+	cmds := []string{
+		"set interfaces gr-0/0/0 tunnel source 10.0.0.1",
+		"set interfaces gr-0/0/0 tunnel destination 10.0.0.2",
+		"set interfaces gr-0/0/0 unit 0 family inet address 10.10.10.1/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ifc := cfg.Interfaces.Interfaces["gr-0/0/0"]
+	if ifc == nil {
+		t.Fatal("gr-0/0/0 not found")
+	}
+	if ifc.Tunnel == nil {
+		t.Fatal("interface-level tunnel is nil")
+	}
+	if ifc.Tunnel.Name != "gr-0-0-0" {
+		t.Errorf("Tunnel.Name = %q, want %q (LinuxIfName should replace /)", ifc.Tunnel.Name, "gr-0-0-0")
+	}
+}
+
+func TestQualifiedNextHopFlatSet(t *testing.T) {
+	tree := &ConfigTree{}
+	lines := []string{
+		"set routing-options static route ::/0 qualified-next-hop fe80::2d0:f6ff:feda:c180 interface reth2.0",
+	}
+	for _, line := range lines {
+		tokens, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(tokens); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if len(cfg.RoutingOptions.StaticRoutes) != 1 {
+		t.Fatalf("got %d static routes, want 1", len(cfg.RoutingOptions.StaticRoutes))
+	}
+	sr := cfg.RoutingOptions.StaticRoutes[0]
+	if sr.Destination != "::/0" {
+		t.Errorf("Destination = %q, want ::/0", sr.Destination)
+	}
+	if len(sr.NextHops) != 1 {
+		t.Fatalf("got %d next-hops, want 1", len(sr.NextHops))
+	}
+	nh := sr.NextHops[0]
+	if nh.Address != "fe80::2d0:f6ff:feda:c180" {
+		t.Errorf("Address = %q, want fe80::2d0:f6ff:feda:c180", nh.Address)
+	}
+	if nh.Interface != "reth2.0" {
+		t.Errorf("Interface = %q, want reth2.0", nh.Interface)
+	}
+}
+
+func TestQualifiedNextHopHierarchical(t *testing.T) {
+	input := `
+routing-options {
+    static {
+        route ::/0 {
+            qualified-next-hop fe80::2d0:f6ff:feda:c180 {
+                interface reth2.0;
+            }
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("Parse: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if len(cfg.RoutingOptions.StaticRoutes) != 1 {
+		t.Fatalf("got %d static routes, want 1", len(cfg.RoutingOptions.StaticRoutes))
+	}
+	sr := cfg.RoutingOptions.StaticRoutes[0]
+	if len(sr.NextHops) != 1 {
+		t.Fatalf("got %d next-hops, want 1", len(sr.NextHops))
+	}
+	nh := sr.NextHops[0]
+	if nh.Address != "fe80::2d0:f6ff:feda:c180" {
+		t.Errorf("Address = %q, want fe80::2d0:f6ff:feda:c180", nh.Address)
+	}
+	if nh.Interface != "reth2.0" {
+		t.Errorf("Interface = %q, want reth2.0", nh.Interface)
+	}
+}
+
+func TestRoutingInstanceRibInet6(t *testing.T) {
+	tree := &ConfigTree{}
+	lines := []string{
+		"set routing-instances ATT instance-type virtual-router",
+		"set routing-instances ATT routing-options rib ATT.inet6.0 static route ::/0 qualified-next-hop fe80::2d0:f6ff:feda:c180 interface reth2.0",
+	}
+	for _, line := range lines {
+		tokens, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(tokens); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if len(cfg.RoutingInstances) != 1 {
+		t.Fatalf("got %d routing instances, want 1", len(cfg.RoutingInstances))
+	}
+	ri := cfg.RoutingInstances[0]
+	if ri.Name != "ATT" {
+		t.Errorf("Name = %q, want ATT", ri.Name)
+	}
+	if len(ri.Inet6StaticRoutes) != 1 {
+		t.Fatalf("got %d inet6 static routes, want 1", len(ri.Inet6StaticRoutes))
+	}
+	sr := ri.Inet6StaticRoutes[0]
+	if sr.Destination != "::/0" {
+		t.Errorf("Destination = %q, want ::/0", sr.Destination)
+	}
+	if len(sr.NextHops) != 1 {
+		t.Fatalf("got %d next-hops, want 1", len(sr.NextHops))
+	}
+	nh := sr.NextHops[0]
+	if nh.Address != "fe80::2d0:f6ff:feda:c180" {
+		t.Errorf("Address = %q, want fe80::2d0:f6ff:feda:c180", nh.Address)
+	}
+	if nh.Interface != "reth2.0" {
+		t.Errorf("Interface = %q, want reth2.0", nh.Interface)
 	}
 }

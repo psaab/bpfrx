@@ -1,6 +1,9 @@
 package config
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // LinuxIfName translates a Junos-style interface name (e.g. "ge-0/0/0")
 // to a valid Linux interface name (e.g. "ge-0-0-0"). Linux IFNAMSIZ
@@ -1109,6 +1112,7 @@ type InterfaceUnit struct {
 	FilterInputV6    string                // family inet6 { filter { input NAME; } }
 	FilterOutputV6   string                // family inet6 { filter { output NAME; } }
 	VRRPGroups       map[string]*VRRPGroup // keyed by address (CIDR), each address can have VRRP groups
+	Tunnel           *TunnelConfig         // per-unit tunnel config (for multi-unit GRE/IPIP)
 }
 
 // VRRPGroup defines a VRRP (Virtual Router Redundancy Protocol) group.
@@ -1391,10 +1395,10 @@ type BGPNeighbor struct {
 	PrefixLimitInet6     int      // max IPv6 prefixes (0 = unlimited)
 }
 
-// TunnelConfig defines a GRE or other tunnel interface.
+// TunnelConfig defines a GRE, IPIP, or other tunnel interface.
 type TunnelConfig struct {
-	Name            string   // e.g. "gre0"
-	Mode            string   // "gre" (future: "ip-ip", "vxlan")
+	Name            string   // Linux interface name (e.g. "gr-0-0-0", "ip-0-0-0")
+	Mode            string   // "gre" or "ipip"
 	Source          string   // local tunnel endpoint IP
 	Destination     string   // remote tunnel endpoint IP
 	Key             uint32   // GRE key, 0 = none
@@ -1403,6 +1407,32 @@ type TunnelConfig struct {
 	RoutingInstance string   // destination routing-instance (VRF)
 	Keepalive       int      // keepalive interval in seconds (0 = disabled)
 	KeepaliveRetry  int      // number of missed keepalives before declaring down (0 = default 3)
+}
+
+// TunnelNameMap returns a mapping from Junos interface reference (e.g. "gr-0/0/0.0")
+// to the Linux tunnel interface name. For tunnel interfaces with per-unit tunnel config,
+// unit 0 uses the base Linux name, unit N>0 appends "uN".
+func (c *Config) TunnelNameMap() map[string]string {
+	m := make(map[string]string)
+	for ifName, ifc := range c.Interfaces.Interfaces {
+		if ifc.Tunnel != nil && ifc.Tunnel.Source != "" {
+			// Interface-level tunnel: all units share the same tunnel
+			baseName := LinuxIfName(ifName)
+			for unitNum := range ifc.Units {
+				ref := ifName + "." + strconv.Itoa(unitNum)
+				m[ref] = baseName
+			}
+			continue
+		}
+		// Per-unit tunnels: each unit with tunnel config gets its own Linux name
+		for unitNum, unit := range ifc.Units {
+			if unit.Tunnel != nil {
+				ref := ifName + "." + strconv.Itoa(unitNum)
+				m[ref] = unit.Tunnel.Name
+			}
+		}
+	}
+	return m
 }
 
 // IPsecConfig holds IPsec VPN configuration.
@@ -1492,6 +1522,7 @@ type RoutingInstanceConfig struct {
 	InstanceType              string         // "virtual-router" or "vrf"
 	Interfaces                []string       // interfaces belonging to this instance
 	StaticRoutes              []*StaticRoute // per-instance static routes
+	Inet6StaticRoutes         []*StaticRoute // per-instance rib inet6.0 static routes
 	OSPF                      *OSPFConfig    // per-instance OSPF (optional)
 	OSPFv3                    *OSPFv3Config  // per-instance OSPFv3 (optional)
 	BGP                       *BGPConfig     // per-instance BGP (optional)
