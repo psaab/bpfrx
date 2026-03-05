@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -11633,6 +11634,537 @@ func TestFormatInheritance(t *testing.T) {
 	if tree.FindChild("groups") == nil {
 		t.Error("groups node should not be removed from original tree")
 	}
+}
+
+func TestApplyGroupsBracketList(t *testing.T) {
+	// Test bracket-list syntax: apply-groups [ name1 name2 ]
+	input := `
+groups {
+    grp-host {
+        system {
+            host-name from-group;
+        }
+    }
+    grp-screen {
+        security {
+            screen {
+                ids-option basic {
+                    tcp {
+                        land;
+                    }
+                }
+            }
+        }
+    }
+}
+apply-groups [ grp-host grp-screen ];
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	if cfg.System.HostName != "from-group" {
+		t.Errorf("hostname = %q, want from-group", cfg.System.HostName)
+	}
+	if cfg.Security.Screen["basic"] == nil {
+		t.Fatal("expected screen profile 'basic' from grp-screen group")
+	}
+}
+
+func TestApplyGroupsBracketListWithVars(t *testing.T) {
+	// Test bracket-list with ${node} variable: apply-groups [ "${node}" common ]
+	input := `
+groups {
+    node0 {
+        system {
+            host-name fw0;
+        }
+    }
+    node1 {
+        system {
+            host-name fw1;
+        }
+    }
+    common {
+        security {
+            screen {
+                ids-option basic {
+                    tcp {
+                        land;
+                    }
+                }
+            }
+        }
+    }
+}
+apply-groups [ "${node}" common ];
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	// Node 0
+	clone0 := tree.Clone()
+	vars0 := map[string]string{"node": "node0"}
+	if err := clone0.ExpandGroupsWithVars(vars0); err != nil {
+		t.Fatalf("ExpandGroupsWithVars node0: %v", err)
+	}
+	cfg0, err := compileExpanded(clone0)
+	if err != nil {
+		t.Fatalf("compile node0: %v", err)
+	}
+	if cfg0.System.HostName != "fw0" {
+		t.Errorf("node0 hostname = %q, want fw0", cfg0.System.HostName)
+	}
+	if cfg0.Security.Screen["basic"] == nil {
+		t.Error("node0: expected screen profile 'basic' from common group")
+	}
+
+	// Node 1
+	clone1 := tree.Clone()
+	vars1 := map[string]string{"node": "node1"}
+	if err := clone1.ExpandGroupsWithVars(vars1); err != nil {
+		t.Fatalf("ExpandGroupsWithVars node1: %v", err)
+	}
+	cfg1, err := compileExpanded(clone1)
+	if err != nil {
+		t.Fatalf("compile node1: %v", err)
+	}
+	if cfg1.System.HostName != "fw1" {
+		t.Errorf("node1 hostname = %q, want fw1", cfg1.System.HostName)
+	}
+}
+
+// findZonePair finds a ZonePairPolicies by "from→to" key in the slice.
+func findZonePair(policies []*ZonePairPolicies, key string) *ZonePairPolicies {
+	parts := strings.SplitN(key, "→", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	for _, p := range policies {
+		if p.FromZone == parts[0] && p.ToZone == parts[1] {
+			return p
+		}
+	}
+	return nil
+}
+
+func TestApplyGroupsNested(t *testing.T) {
+	// Test apply-groups nested inside security policies (Junos zone-pair pattern).
+	// Group "allow-out" defines policies under from-zone <*> to-zone <*>.
+	// apply-groups at the zone-pair level should walk the group tree to match
+	// the context and merge the matching policies.
+	input := `
+groups {
+    allow-out {
+        security {
+            policies {
+                from-zone <*> to-zone <*> {
+                    policy allow-all-out {
+                        match {
+                            source-address any;
+                            destination-address any;
+                            application any;
+                        }
+                        then {
+                            permit;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+security {
+    zones {
+        security-zone trust {
+            interfaces {
+                trust0.0;
+            }
+        }
+        security-zone untrust {
+            interfaces {
+                untrust0.0;
+            }
+        }
+    }
+    policies {
+        from-zone trust to-zone untrust {
+            apply-groups allow-out;
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// The policy should have been merged into the trust→untrust zone pair.
+	pair := findZonePair(cfg.Security.Policies, "trust→untrust")
+	if pair == nil {
+		t.Fatal("expected trust→untrust zone pair")
+	}
+	found := false
+	for _, pol := range pair.Policies {
+		if pol.Name == "allow-all-out" {
+			found = true
+			if len(pol.Match.SourceAddresses) == 0 || pol.Match.SourceAddresses[0] != "any" {
+				t.Error("allow-all-out: expected source-address any")
+			}
+		}
+	}
+	if !found {
+		t.Error("expected policy 'allow-all-out' from nested apply-groups")
+	}
+}
+
+func TestApplyGroupsNestedBracketList(t *testing.T) {
+	// Test bracket-list apply-groups nested inside a zone pair.
+	input := `
+groups {
+    allow-icmp {
+        security {
+            policies {
+                from-zone <*> to-zone <*> {
+                    policy allow-icmp-in {
+                        match {
+                            source-address any;
+                            destination-address any;
+                            application junos-icmp-all;
+                        }
+                        then {
+                            permit;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    default-deny {
+        security {
+            policies {
+                from-zone <*> to-zone <*> {
+                    policy deny-all {
+                        match {
+                            source-address any;
+                            destination-address any;
+                            application any;
+                        }
+                        then {
+                            deny;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+security {
+    zones {
+        security-zone trust {
+            interfaces {
+                trust0.0;
+            }
+        }
+        security-zone untrust {
+            interfaces {
+                untrust0.0;
+            }
+        }
+    }
+    policies {
+        from-zone untrust to-zone trust {
+            apply-groups [ allow-icmp default-deny ];
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	pair := findZonePair(cfg.Security.Policies, "untrust→trust")
+	if pair == nil {
+		t.Fatal("expected untrust→trust zone pair")
+	}
+
+	names := make([]string, len(pair.Policies))
+	for i, pol := range pair.Policies {
+		names[i] = pol.Name
+	}
+
+	// Both policies should be present.
+	foundICMP := false
+	foundDeny := false
+	for _, n := range names {
+		if n == "allow-icmp-in" {
+			foundICMP = true
+		}
+		if n == "deny-all" {
+			foundDeny = true
+		}
+	}
+	if !foundICMP {
+		t.Errorf("expected policy 'allow-icmp-in' from nested bracket-list apply-groups, got %v", names)
+	}
+	if !foundDeny {
+		t.Errorf("expected policy 'deny-all' from nested bracket-list apply-groups, got %v", names)
+	}
+}
+
+func TestApplyGroupsMixedTopAndNested(t *testing.T) {
+	// Test both top-level and nested apply-groups in the same config.
+	input := `
+groups {
+    common {
+        system {
+            host-name test-fw;
+        }
+    }
+    outbound {
+        security {
+            policies {
+                from-zone <*> to-zone <*> {
+                    policy allow-out {
+                        match {
+                            source-address any;
+                            destination-address any;
+                            application any;
+                        }
+                        then {
+                            permit;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+apply-groups common;
+security {
+    zones {
+        security-zone trust {
+            interfaces {
+                trust0.0;
+            }
+        }
+        security-zone untrust {
+            interfaces {
+                untrust0.0;
+            }
+        }
+    }
+    policies {
+        from-zone trust to-zone untrust {
+            apply-groups outbound;
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Top-level group should set hostname.
+	if cfg.System.HostName != "test-fw" {
+		t.Errorf("hostname = %q, want test-fw", cfg.System.HostName)
+	}
+
+	// Nested group should add policy.
+	pair := findZonePair(cfg.Security.Policies, "trust→untrust")
+	if pair == nil {
+		t.Fatal("expected trust→untrust zone pair")
+	}
+	found := false
+	for _, pol := range pair.Policies {
+		if pol.Name == "allow-out" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected policy 'allow-out' from nested apply-groups")
+	}
+}
+
+func TestApplyGroupsNestedNoMatchSilent(t *testing.T) {
+	// When a nested apply-groups references a group that doesn't have
+	// a matching subtree for the current context, it should silently
+	// contribute nothing (not error).
+	input := `
+groups {
+    hostname-only {
+        system {
+            host-name from-group;
+        }
+    }
+}
+system {
+    host-name explicit;
+}
+security {
+    zones {
+        security-zone trust {
+            interfaces {
+                trust0.0;
+            }
+        }
+        security-zone untrust {
+            interfaces {
+                untrust0.0;
+            }
+        }
+    }
+    policies {
+        from-zone trust to-zone untrust {
+            apply-groups hostname-only;
+            policy explicit-policy {
+                match {
+                    source-address any;
+                    destination-address any;
+                    application any;
+                }
+                then {
+                    permit;
+                }
+            }
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Explicit hostname should remain (group doesn't match nested context).
+	if cfg.System.HostName != "explicit" {
+		t.Errorf("hostname = %q, want explicit", cfg.System.HostName)
+	}
+
+	// Explicit policy should still be present.
+	pair := findZonePair(cfg.Security.Policies, "trust→untrust")
+	if pair == nil {
+		t.Fatal("expected trust→untrust zone pair")
+	}
+	if len(pair.Policies) != 1 || pair.Policies[0].Name != "explicit-policy" {
+		t.Errorf("expected just explicit-policy, got %d policies", len(pair.Policies))
+	}
+}
+
+func TestApplyGroupsNestedSetSyntax(t *testing.T) {
+	// Test nested apply-groups using flat set syntax.
+	setCommands := []string{
+		"set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out match source-address any",
+		"set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out match destination-address any",
+		"set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out match application any",
+		"set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out then permit",
+		"set security zones security-zone trust interfaces trust0.0",
+		"set security zones security-zone untrust interfaces untrust0.0",
+		"set security policies from-zone trust to-zone untrust apply-groups allow-out",
+	}
+
+	tree := &ConfigTree{}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	pair := findZonePair(cfg.Security.Policies, "trust→untrust")
+	if pair == nil {
+		t.Fatal("expected trust→untrust zone pair")
+	}
+	found := false
+	for _, pol := range pair.Policies {
+		if pol.Name == "allow-all-out" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected policy 'allow-all-out' from nested apply-groups (set syntax)")
+	}
+}
+
+func TestApplyGroupsVsrxHAConf(t *testing.T) {
+	// Integration test: parse the real vsrx-ha.conf with groups/apply-groups.
+	data, err := os.ReadFile("../../vsrx-ha.conf")
+	if err != nil {
+		t.Skipf("vsrx-ha.conf not found: %v", err)
+	}
+	tree, errs := NewParser(string(data)).Parse()
+	if len(errs) > 0 {
+		t.Logf("parse warnings (%d): %v", len(errs), errs)
+	}
+
+	// Compile for node0 (should get vsrx-ernie hostname).
+	cfg, err := CompileConfigForNode(tree, 0)
+	if err != nil {
+		t.Fatalf("compile node0: %v", err)
+	}
+	if cfg.System.HostName != "vsrx-ernie" {
+		t.Errorf("node0 hostname = %q, want vsrx-ernie", cfg.System.HostName)
+	}
+
+	// Verify nested apply-groups expanded policies into zone pairs.
+	// The vsrx-ha.conf has many zone pairs with apply-groups for policy templates.
+	if len(cfg.Security.Policies) == 0 {
+		t.Fatal("expected zone pair policies after group expansion")
+	}
+
+	// Check that at least some zone pairs have group-expanded policies.
+	totalPolicies := 0
+	for _, zpp := range cfg.Security.Policies {
+		totalPolicies += len(zpp.Policies)
+	}
+	if totalPolicies < 10 {
+		t.Errorf("expected many policies from group expansion, got %d", totalPolicies)
+	}
+	t.Logf("compiled %d zone pairs with %d total policies", len(cfg.Security.Policies), totalPolicies)
 }
 
 func TestParseLoginClass(t *testing.T) {

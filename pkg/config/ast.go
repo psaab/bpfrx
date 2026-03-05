@@ -197,8 +197,9 @@ func (t *ConfigTree) expandGroups(tagInherited bool, vars map[string]string) err
 		return t.stripApplyGroups(vars)
 	}
 
-	// Resolve apply-groups at top level.
-	if err := expandGroupsInNodes(&t.Children, groups, nil, tagInherited, vars); err != nil {
+	// Recursively resolve apply-groups at all levels.
+	// The nil ancestorPath means we're at the top level.
+	if err := expandGroupsRecursive(&t.Children, groups, nil, nil, tagInherited, vars); err != nil {
 		return err
 	}
 
@@ -352,11 +353,15 @@ func tagNodesInherited(nodes []*Node, groupName string) {
 	}
 }
 
-// stripApplyGroups removes apply-groups nodes and returns error if they
-// reference undefined groups. vars is used to resolve ${var} placeholders
-// in group names for error messages.
+// stripApplyGroups recursively removes apply-groups nodes and returns error
+// if they reference undefined groups. vars is used to resolve ${var}
+// placeholders in group names for error messages.
 func (t *ConfigTree) stripApplyGroups(vars map[string]string) error {
-	for _, child := range t.Children {
+	return stripApplyGroupsInNodes(t.Children, vars)
+}
+
+func stripApplyGroupsInNodes(nodes []*Node, vars map[string]string) error {
+	for _, child := range nodes {
 		if child.Name() == "apply-groups" {
 			name := ""
 			if len(child.Keys) > 1 {
@@ -364,21 +369,59 @@ func (t *ConfigTree) stripApplyGroups(vars map[string]string) error {
 			}
 			return fmt.Errorf("apply-groups references undefined group %q", name)
 		}
+		if !child.IsLeaf {
+			if err := stripApplyGroupsInNodes(child.Children, vars); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
 
-// expandGroupsInNodes processes apply-groups nodes within a node list.
-// It merges referenced group children into the list, then removes apply-groups.
+// walkGroupToContext walks a group definition's tree to match the ancestor
+// context path. Each element of ancestorPath is the Keys slice of a parent
+// node from root to the current level. Returns the children of the deepest
+// matching node, or nil if the group has no matching subtree.
+// Supports <*> wildcard matching in group keys.
+func walkGroupToContext(groupChildren []*Node, ancestorPath [][]string) []*Node {
+	current := groupChildren
+	for _, pathKeys := range ancestorPath {
+		var next []*Node
+		for _, child := range current {
+			if child.IsLeaf {
+				continue
+			}
+			// Exact match or wildcard match (group keys may contain <*>).
+			if keysEqual(child.Keys, pathKeys) || keysMatchWildcard(pathKeys, child.Keys) {
+				next = child.Children
+				break
+			}
+		}
+		if next == nil {
+			return nil // group doesn't have matching subtree at this context
+		}
+		current = next
+	}
+	return current
+}
+
+// expandGroupsRecursive processes apply-groups nodes within a node list,
+// then recurses into all children to handle nested apply-groups.
+// ancestorPath tracks the key path from root to the current level, enabling
+// groups to be walked down to the matching context for nested apply-groups.
 // seen tracks group names being expanded to detect circular references.
 // If tagInherited is true, merged nodes get InheritedFrom set to the group name.
 // vars provides ${var} replacements for group names (may be nil).
-func expandGroupsInNodes(nodes *[]*Node, groups map[string]*Node, seen map[string]bool, tagInherited bool, vars map[string]string) error {
+func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath [][]string, seen map[string]bool, tagInherited bool, vars map[string]string) error {
 	// First, collect apply-groups references at this level.
+	// Support bracket-list syntax: apply-groups [ name1 name2 ] produces
+	// Keys = ["apply-groups", "name1", "name2"].
 	var applyNames []string
 	for _, n := range *nodes {
-		if n.Name() == "apply-groups" && len(n.Keys) > 1 {
-			applyNames = append(applyNames, resolveVars(n.Keys[1], vars))
+		if n.Name() == "apply-groups" {
+			for _, key := range n.Keys[1:] {
+				applyNames = append(applyNames, resolveVars(key, vars))
+			}
 		}
 	}
 
@@ -397,12 +440,22 @@ func expandGroupsInNodes(nodes *[]*Node, groups map[string]*Node, seen map[strin
 		}
 		seen[name] = true
 
-		// Clone group children and merge into current node list.
-		cloned := cloneNodes(g.Children)
-		if tagInherited {
-			tagNodesInherited(cloned, name)
+		// Walk the group tree to match the current context path.
+		var srcChildren []*Node
+		if len(ancestorPath) == 0 {
+			// Top-level: merge group's direct children.
+			srcChildren = g.Children
+		} else {
+			srcChildren = walkGroupToContext(g.Children, ancestorPath)
 		}
-		mergeNodes(nodes, cloned)
+
+		if srcChildren != nil {
+			cloned := cloneNodes(srcChildren)
+			if tagInherited {
+				tagNodesInherited(cloned, name)
+			}
+			mergeNodes(nodes, cloned)
+		}
 
 		delete(seen, name)
 	}
@@ -415,6 +468,18 @@ func expandGroupsInNodes(nodes *[]*Node, groups map[string]*Node, seen map[strin
 		}
 	}
 	*nodes = filtered
+
+	// Recurse into children to handle nested apply-groups.
+	for _, n := range *nodes {
+		if !n.IsLeaf && len(n.Children) > 0 {
+			childPath := make([][]string, len(ancestorPath)+1)
+			copy(childPath, ancestorPath)
+			childPath[len(ancestorPath)] = n.Keys
+			if err := expandGroupsRecursive(&n.Children, groups, childPath, seen, tagInherited, vars); err != nil {
+				return err
+			}
+		}
+	}
 
 	return nil
 }
