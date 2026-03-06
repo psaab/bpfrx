@@ -2905,3 +2905,62 @@ After the IPVLAN overlay refactor (CC-11/CC-12) and monitor fixes (CC-14), fabri
 - **XDP vs AF_PACKET incompatibility:** XDP processes packets before `sk_buff` allocation — tcpdump/AF_PACKET cannot capture XDP-redirected traffic. This is a fundamental platform constraint, not a bug
 - **BPF-native telemetry:** When XDP bypasses kernel networking, BPF maps are the only reliable counters. Per-link and per-zone granularity replaces what tcpdump would have provided
 - **Document limitations prominently:** When a tool (tcpdump) silently fails for a specific traffic path, the CLI should warn users proactively rather than letting them discover empty captures
+
+---
+
+## Sprint CC-16: Split-Brain Fix, Monitor Proxy, CLI History, Issue Triage (2026-03-06)
+
+### Fix: XDP host-inbound-all drops unknown services → cluster split-brain (`b1e966b`)
+- **Problem:** `xdp_policy.c` host-inbound fallback checked individual service flags (SSH, ping, DHCP, etc.) but NOT `HOST_INBOUND_ALL`. Zones with `system-services { all; }` still dropped services not in the enumerated flag list (e.g., heartbeat UDP 4784). After `bpfrxd cleanup` during deploy, conntrack sessions wiped → new heartbeat packets hit xdp_policy as new flows → denied → split-brain
+- **Fix:** Added `zcfg->host_inbound_flags == HOST_INBOUND_ALL` short-circuit in xdp_policy.c before individual flag checks. When all services are allowed, skip individual flag matching entirely
+- **Key insight:** `HOST_INBOUND_ALL` is a bitmask with all flags set — but custom/unknown services have no flag bit. The `== HOST_INBOUND_ALL` check must be treated as "accept everything" rather than "check all known flags"
+
+### Fix: Monitor interface peer proxy resolution (`2ca3841`)
+- **Problem:** `isPeerInterface()` only checked RG interface monitors, not FPC slot → node-id mapping. `ge-7/0/0` on node0 returned "not found" instead of proxying to peer
+- **Fix:** Check `InterfaceSlot()` + `SlotToNodeID()` first for FPC-based node resolution
+
+### CLI persistent history
+- Moved history files from `/tmp/` to `~/.bpfrx_history` (local CLI) and `~/.bpfrx_cli_history` (remote CLI)
+- History now persists across daemon restarts and reboots
+
+### Issues #145-#150 closed as N/A
+- #145 AppID: known future feature, no L7 classifier yet
+- #146 Pre-ID policy: depends on AppID
+- #147 License autoupdate: N/A for bpfrx (no license system)
+- #148 NTP threshold: delegated to chrony
+- #149 Power-mode-disable: N/A, vSRX hardware knob
+- #150 Policy-stats: already unconditionally enabled in BPF
+
+### Fix #140: RPM target url syntax
+- **Problem:** RPM probe `target url http://X.X.X.X` hierarchical syntax not parsed — `target` node had `url` child but compiler only read `nodeVal(target)`
+- **Fix:** Compiler checks `prop.FindChild("url")` first, falls back to `nodeVal(prop)` for plain `target 1.1.1.1` syntax
+- **AST:** Extended `test` schema node with `target { url }` children
+
+### Fix #141: RPM routing-instance wired to VRF
+- **Problem:** RPM probes ignored `routing-instance` config — all probes ran in default VRF
+- **Fix:** `vrfDialer()` in `pkg/rpm/rpm.go` binds probe sockets to VRF device via `SO_BINDTODEVICE` (`syscall.SO_BINDTODEVICE`). VRF device name derived from routing instance name (`vrf-` + instance name). Also supports `source-address` binding via `net.Dialer.LocalAddr`. All three probe types (ICMP, TCP, HTTP) updated to use `vrfDialer()` — HTTP uses custom `http.Transport` with `DialContext` set to the VRF-bound dialer
+
+### Fix #142: RPM probe-limit
+- **Problem:** No way to cap consecutive probe failures — probes ran indefinitely even when target is clearly down
+- **Fix:** Added `ProbeLimit int` field to `RPMTest` config type. Compiler parses `probe-limit` from both hierarchical and flat set syntax. AST schema extended with `probe-limit` under test node. In `runSingleTest()`, consecutive failure count checked against `probeLimit` — when reached, test cycle breaks early
+
+### Fix #143: Dynamic-address feed model extension
+- **Problem:** Feed-server only supported single URL per server. Junos supports `hostname` + per-feed `feed-name { path }` for multiple feeds from one server
+- **Fix:**
+  - New `FeedEntry` struct with `Name` + `Path` fields for per-feed path configuration
+  - `FeedServer` extended with `Hostname` (for base URL construction) and `FeedEntries []FeedEntry`
+  - `resolveBaseURL()` prefers explicit URL, falls back to `https://hostname`
+  - `AddressBinding` struct with `FeedNames` for `address-name { profile { feed-name } }` bindings
+  - `feedState` simplified: stores resolved `url` instead of `*FeedServer` pointer
+  - AST: `feed-server` schema expanded with `hostname`, `feed-name { path }`, and new `address-name { profile { feed-name } }` schema
+  - Backward compatible: single `feed-name` (no children) still works as before
+
+### Fix #144: Flow export extensions for NetFlow v9
+- **Problem:** NetFlow v9 templates had no way to specify export extensions (e.g., `app-id`, `flow-dir`), and template fields were hardcoded with fixed record sizes
+- **Fix:**
+  - Added `ExportExtensions []string` to `NetFlowV9Template` config type
+  - Compiler parses `export-extension` from `ipv4-template`/`ipv6-template` children in flow-monitoring config
+  - `V9TemplateOptions` struct with `IncludeFlowDir bool` controls optional fields
+  - Refactored template system from hardcoded `recordSizeV4`/`recordSizeV6` to dynamic `templateField` slices via `buildTemplateFieldsV4()`/`buildTemplateFieldsV6()` — record size computed from field list
+  - `encodeTemplateFlowSet()` and `encodeDataFlowSet()` now take options for conditional field inclusion
+  - `flow-dir` extension adds `fieldDirection` (IANA #61) to NetFlow v9 export templates

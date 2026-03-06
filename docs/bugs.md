@@ -144,6 +144,17 @@
 - Sends host-bound packets through policy pipeline where deny-all drops them
 - **Fix:** xdp_policy checks `host_inbound_flag()` before denying, tail-calls to xdp_forward with fwd_ifindex=0
 
+### XDP host-inbound-all drops unknown services → cluster split-brain (FIXED `b1e966b`)
+- **Symptom:** After `bpfrxd cleanup` + redeploy, cluster heartbeat (UDP 4784) dropped by xdp_policy → nodes can't see each other → split-brain
+- **Root cause:** `xdp_policy.c` host-inbound fallback checked individual service flags but not `HOST_INBOUND_ALL`. Zones configured with `system-services { all; }` still dropped unknown/custom services (like heartbeat UDP 4784). After `bpfrxd cleanup` wipes conntrack, new heartbeat packets hit xdp_policy as new flows and got denied
+- **Fix:** Added `zcfg->host_inbound_flags == HOST_INBOUND_ALL` short-circuit in xdp_policy.c before individual service flag checks
+- **Key insight:** `host_inbound_flags == HOST_INBOUND_ALL` means accept ALL host-bound traffic, not just the union of known flags. Any service not explicitly enumerated (heartbeat, custom UDP) was silently dropped
+
+### Monitor interface peer proxy doesn't resolve FPC slot → node-id (FIXED `2ca3841`)
+- **Symptom:** `monitor interface ge-7/0/0` on node0 returned "interface not found" instead of proxying to peer node
+- **Root cause:** `isPeerInterface()` only checked RG interface monitors, not FPC slot → node-id mapping. ge-7/0/0 has FPC slot 7 which maps to node1, but this resolution was missing
+- **Fix:** Check `InterfaceSlot()` + `SlotToNodeID()` first before falling back to RG interface monitor checks
+
 ## Important Bugs
 
 ### tx_ports devmap value size
