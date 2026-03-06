@@ -335,7 +335,7 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	return 0;
 }
 
-static __always_inline __u32
+static __noinline __u32
 resolve_pkt_app_id(struct pkt_meta *meta)
 {
 	__u32 pkt_app_id = 0;
@@ -1194,12 +1194,8 @@ int xdp_policy_prog(struct xdp_md *ctx)
 {
 	__u32 zero = 0;
 	struct pkt_meta *meta = bpf_map_lookup_elem(&pkt_meta_scratch, &zero);
-	struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &zero);
 	if (!meta)
 		return XDP_DROP;
-
-	__u32 pkt_app_id = resolve_pkt_app_id(meta);
-	__u8 preid_log = preid_log_flags(fc, pkt_app_id);
 
 	/* Build zone-pair flat index for ARRAY lookup */
 	__u32 zp_idx = (__u32)meta->ingress_zone * MAX_ZONES +
@@ -1216,6 +1212,10 @@ int xdp_policy_prog(struct xdp_md *ctx)
 		__u32 dp_key = 0;
 		__u8 *dp = bpf_map_lookup_elem(&default_policy, &dp_key);
 		if (dp && *dp == ACTION_PERMIT) {
+			struct flow_config *fc =
+				bpf_map_lookup_elem(&flow_config_map, &zero);
+			__u32 pkt_app_id = resolve_pkt_app_id(meta);
+			__u8 preid_log = preid_log_flags(fc, pkt_app_id);
 			if (meta->addr_family == AF_INET) {
 				if (create_session(meta, 0, preid_log, 0, 0, 0, 0, 0,
 						   (__u16)pkt_app_id) < 0) {
@@ -1261,7 +1261,10 @@ int xdp_policy_prog(struct xdp_md *ctx)
 		return XDP_DROP;
 	}
 
+	struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &zero);
 	/* Iterate policy rules */
+	__u32 pkt_app_id = resolve_pkt_app_id(meta);
+	__u8 preid_log = preid_log_flags(fc, pkt_app_id);
 	__u32 base_idx = ps->policy_set_id * MAX_RULES_PER_POLICY;
 	__u16 num_rules = ps->num_rules;
 
