@@ -3044,6 +3044,12 @@ func renderChronyThreshold(threshold int, action string) string {
 		return ""
 	}
 
+	// Only "accept" and "reject" are valid actions. Log and ignore anything else.
+	if action != "accept" && action != "reject" {
+		slog.Warn("unsupported NTP threshold action, ignoring", "action", action)
+		return ""
+	}
+
 	// Junos NTP threshold is configured in seconds; chrony directives use
 	// seconds as well. "accept" logs offsets beyond the threshold while
 	// allowing correction, and "reject" additionally refuses large changes
@@ -3066,10 +3072,11 @@ func reconcileManagedFile(path, content string) (bool, error) {
 	}
 
 	if content == "" {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return false, fmt.Errorf("remove %s: %w", path, err)
+		removeErr := os.Remove(path)
+		if removeErr != nil && !os.IsNotExist(removeErr) {
+			return false, fmt.Errorf("remove %s: %w", path, removeErr)
 		}
-		return !os.IsNotExist(err), nil
+		return removeErr == nil, nil
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -3082,8 +3089,11 @@ func reconcileManagedFile(path, content string) (bool, error) {
 }
 
 func reloadChronyRuntime(sourcesChanged, thresholdChanged bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
 	if sourcesChanged {
-		if out, err := exec.Command("chronyc", "reload", "sources").CombinedOutput(); err != nil {
+		if out, err := exec.CommandContext(ctx, "chronyc", "reload", "sources").CombinedOutput(); err != nil {
 			slog.Warn("failed to reload chrony sources", "err", err, "output", string(out))
 		}
 	}
@@ -3099,7 +3109,7 @@ func reloadChronyRuntime(sourcesChanged, thresholdChanged bool) {
 		{"systemctl", "restart", "chronyd"},
 	}
 	for _, cmd := range commands {
-		if out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput(); err == nil {
+		if out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput(); err == nil {
 			return
 		} else {
 			slog.Debug("chrony config reload attempt failed", "cmd", strings.Join(cmd, " "), "err", err, "output", string(out))
@@ -3113,11 +3123,17 @@ func reloadChronyRuntime(sourcesChanged, thresholdChanged bool) {
 // optional threshold directives to /etc/chrony/conf.d/bpfrx-threshold.conf.
 func (d *Daemon) applySystemNTP(cfg *config.Config) {
 	if isProcessDisabled(cfg, "ntp") {
-		if _, err := reconcileManagedFile(chronySourcesPath, ""); err != nil {
+		sourcesChanged, err := reconcileManagedFile(chronySourcesPath, "")
+		if err != nil {
 			slog.Warn("failed to remove chrony sources", "err", err)
 		}
-		if _, err := reconcileManagedFile(chronyThresholdPath, ""); err != nil {
+		thresholdChanged, err := reconcileManagedFile(chronyThresholdPath, "")
+		if err != nil {
 			slog.Warn("failed to remove chrony threshold config", "err", err)
+		}
+		if sourcesChanged || thresholdChanged {
+			reloadChronyRuntime(sourcesChanged, thresholdChanged)
+			slog.Info("NTP disabled; chrony managed configuration removed")
 		}
 		return
 	}
