@@ -27,6 +27,7 @@ type ExportConfig struct {
 	TemplateRefreshRate time.Duration
 	SamplingZones       map[uint16]SamplingDir // zone ID -> sampling directions
 	SamplingRate        int                    // 1-in-N sampling (0 = export all)
+	V9TemplateOpts      V9TemplateOptions      // optional v9 template field control
 	sampleCounter       atomic.Uint64          // monotonic counter for 1-in-N
 }
 
@@ -48,6 +49,7 @@ func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsC
 	inactiveTimeout := 15 * time.Second
 	refreshRate := 60 * time.Second
 
+	var v9opts V9TemplateOptions
 	if svc != nil && svc.FlowMonitoring != nil && svc.FlowMonitoring.Version9 != nil {
 		for _, tmpl := range svc.FlowMonitoring.Version9.Templates {
 			if tmpl.FlowActiveTimeout > 0 {
@@ -59,6 +61,12 @@ func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsC
 			if tmpl.TemplateRefreshRate > 0 {
 				refreshRate = time.Duration(tmpl.TemplateRefreshRate) * time.Second
 			}
+			for _, ext := range tmpl.ExportExtensions {
+				switch ext {
+				case "flow-dir":
+					v9opts.IncludeFlowDir = true
+				}
+			}
 			break // use first template
 		}
 	}
@@ -67,6 +75,7 @@ func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsC
 		FlowActiveTimeout:   activeTimeout,
 		FlowInactiveTimeout: inactiveTimeout,
 		TemplateRefreshRate: refreshRate,
+		V9TemplateOpts:      v9opts,
 	}
 
 	// Use the first sampling instance's input rate as the global sampling rate
@@ -323,7 +332,7 @@ func (e *Exporter) Close() {
 }
 
 func (e *Exporter) sendTemplates() {
-	tmplFS := encodeTemplateFlowSet()
+	tmplFS := encodeTemplateFlowSet(e.cfg.V9TemplateOpts)
 
 	e.mu.Lock()
 	seq := e.seq
@@ -369,13 +378,15 @@ func (e *Exporter) sendRecords(records []FlowRecord) {
 		return
 	}
 
+	opts := e.cfg.V9TemplateOpts
 	isV6 := records[0].IsIPv6
-	var recSize int
+	var fields []templateField
 	if isV6 {
-		recSize = recordSizeV6
+		fields = buildTemplateFieldsV6(opts)
 	} else {
-		recSize = recordSizeV4
+		fields = buildTemplateFieldsV4(opts)
 	}
+	recSize := recordSize(fields)
 
 	// Split into chunks that fit in maxPayload
 	// Reserve 20 bytes for header + 4 bytes for flowset header
@@ -391,7 +402,7 @@ func (e *Exporter) sendRecords(records []FlowRecord) {
 		}
 		batch := records[i:end]
 
-		dataFS := encodeDataFlowSet(batch, e.bootTime)
+		dataFS := encodeDataFlowSet(batch, e.bootTime, opts)
 		if dataFS == nil {
 			continue
 		}

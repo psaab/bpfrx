@@ -8946,6 +8946,9 @@ func (c *CLI) showFlowMonitoring() error {
 				fmt.Printf("    Flow active timeout:   %d seconds\n", activeTimeout)
 				fmt.Printf("    Flow inactive timeout: %d seconds\n", inactiveTimeout)
 				fmt.Printf("    Template refresh rate: %d seconds\n", refreshRate)
+				if len(tmpl.ExportExtensions) > 0 {
+					fmt.Printf("    Export extensions:     %s\n", strings.Join(tmpl.ExportExtensions, ", "))
+				}
 			}
 			fmt.Println()
 		}

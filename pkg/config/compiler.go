@@ -515,6 +515,28 @@ func ValidateConfig(cfg *Config) []string {
 		warnings = append(warnings, "chassis cluster: no-reth-vrrp is redundant when private-rg-election is set")
 	}
 
+	// Warn about unsupported export-extension app-id in flow monitoring templates
+	if fm := cfg.Services.FlowMonitoring; fm != nil {
+		checkExtWarning := func(kind, name string, exts []string) {
+			for _, ext := range exts {
+				if ext == "app-id" {
+					warnings = append(warnings, fmt.Sprintf(
+						"flow-monitoring %s template %s: export-extension app-id configured but application data is not available in flow records", kind, name))
+				}
+			}
+		}
+		if fm.Version9 != nil {
+			for _, tmpl := range fm.Version9.Templates {
+				checkExtWarning("version9", tmpl.Name, tmpl.ExportExtensions)
+			}
+		}
+		if fm.VersionIPFIX != nil {
+			for _, tmpl := range fm.VersionIPFIX.Templates {
+				checkExtWarning("version-ipfix", tmpl.Name, tmpl.ExportExtensions)
+			}
+		}
+	}
+
 	return warnings
 }
 
@@ -3852,6 +3874,25 @@ func nodeVal(n *Node) string {
 	return ""
 }
 
+// parseExportExtensions extracts export-extension values from an ipv4-template or
+// ipv6-template node. Handles both hierarchical (children) and flat set (Keys) AST shapes.
+func parseExportExtensions(prop *Node) []string {
+	var exts []string
+	// Hierarchical: prop has children named "export-extension"
+	for _, child := range prop.Children {
+		if child.Name() == "export-extension" {
+			if v := nodeVal(child); v != "" {
+				exts = append(exts, v)
+			}
+		}
+	}
+	// Flat set: prop.Keys = ["ipv4-template", "export-extension", "<value>"]
+	if len(exts) == 0 && len(prop.Keys) >= 3 && prop.Keys[1] == "export-extension" {
+		exts = append(exts, prop.Keys[2])
+	}
+	return exts
+}
+
 // peerFromPointToPoint derives the peer IP address from a /30 or /31 CIDR.
 // Returns "" if the CIDR is not a valid point-to-point subnet.
 func peerFromPointToPoint(cidr string) string {
@@ -5399,13 +5440,7 @@ func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
 						}
 					}
 				case "ipv4-template", "ipv6-template":
-					for _, child := range prop.Children {
-						if child.Name() == "export-extension" {
-							if v := nodeVal(child); v != "" {
-								tmpl.ExportExtensions = append(tmpl.ExportExtensions, v)
-							}
-						}
-					}
+					tmpl.ExportExtensions = append(tmpl.ExportExtensions, parseExportExtensions(prop)...)
 				}
 			}
 			v9cfg.Templates[tmpl.Name] = tmpl
@@ -5447,13 +5482,7 @@ func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
 						}
 					}
 				case "ipv4-template", "ipv6-template":
-					for _, child := range prop.Children {
-						if child.Name() == "export-extension" {
-							if v := nodeVal(child); v != "" {
-								tmpl.ExportExtensions = append(tmpl.ExportExtensions, v)
-							}
-						}
-					}
+					tmpl.ExportExtensions = append(tmpl.ExportExtensions, parseExportExtensions(prop)...)
 				}
 			}
 			ipfixCfg.Templates[tmpl.Name] = tmpl

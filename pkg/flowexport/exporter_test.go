@@ -369,3 +369,168 @@ func TestBuildIPFIXExportConfig_NilIPFIX(t *testing.T) {
 		t.Error("expected nil ExportConfig when VersionIPFIX is not set")
 	}
 }
+
+func TestV9TemplateFlowDirConditional(t *testing.T) {
+	// With flow-dir enabled, template should include fieldDirection
+	opts := V9TemplateOptions{IncludeFlowDir: true}
+	fieldsV4 := buildTemplateFieldsV4(opts)
+	hasDir := false
+	for _, f := range fieldsV4 {
+		if f.fieldType == fieldDirection {
+			hasDir = true
+		}
+	}
+	if !hasDir {
+		t.Error("expected fieldDirection in v4 template when IncludeFlowDir=true")
+	}
+
+	// Without flow-dir, template should NOT include fieldDirection
+	opts2 := V9TemplateOptions{IncludeFlowDir: false}
+	fieldsV4no := buildTemplateFieldsV4(opts2)
+	for _, f := range fieldsV4no {
+		if f.fieldType == fieldDirection {
+			t.Error("fieldDirection should not appear when IncludeFlowDir=false")
+		}
+	}
+
+	// Same check for v6
+	fieldsV6 := buildTemplateFieldsV6(opts)
+	hasDir = false
+	for _, f := range fieldsV6 {
+		if f.fieldType == fieldDirection {
+			hasDir = true
+		}
+	}
+	if !hasDir {
+		t.Error("expected fieldDirection in v6 template when IncludeFlowDir=true")
+	}
+
+	fieldsV6no := buildTemplateFieldsV6(opts2)
+	for _, f := range fieldsV6no {
+		if f.fieldType == fieldDirection {
+			t.Error("fieldDirection should not appear in v6 when IncludeFlowDir=false")
+		}
+	}
+}
+
+func TestV9TemplateEncodeWithoutFlowDir(t *testing.T) {
+	opts := V9TemplateOptions{IncludeFlowDir: false}
+	tmplFS := encodeTemplateFlowSet(opts)
+	if len(tmplFS) < 4 {
+		t.Fatalf("template flowset too short: %d bytes", len(tmplFS))
+	}
+
+	// FlowSet header: ID=0
+	setID := binary.BigEndian.Uint16(tmplFS[0:2])
+	if setID != 0 {
+		t.Errorf("flowset ID = %d, want 0", setID)
+	}
+
+	// Verify no fieldDirection (61) appears in the template field entries
+	// Skip flowset header (4), then parse template headers + fields
+	off := 4
+	for off < len(tmplFS) {
+		if off+4 > len(tmplFS) {
+			break
+		}
+		off += 2 // skip template ID
+		fieldCount := int(binary.BigEndian.Uint16(tmplFS[off : off+2]))
+		off += 2
+		for i := 0; i < fieldCount; i++ {
+			ft := binary.BigEndian.Uint16(tmplFS[off : off+2])
+			if ft == fieldDirection {
+				t.Errorf("fieldDirection found in template when IncludeFlowDir=false")
+			}
+			off += 4
+		}
+	}
+}
+
+func TestV9DataRecordSizeConsistency(t *testing.T) {
+	now := time.Now()
+	boot := now.Add(-time.Hour)
+
+	for _, includeDir := range []bool{true, false} {
+		opts := V9TemplateOptions{IncludeFlowDir: includeDir}
+		records := []FlowRecord{
+			{
+				SrcIP: net.IPv4(10, 0, 1, 1), DstIP: net.IPv4(10, 0, 2, 2),
+				SrcPort: 1234, DstPort: 80, Protocol: 6,
+				Direction: 1, Packets: 10, Bytes: 1000,
+				StartTime: now.Add(-time.Second), EndTime: now,
+			},
+		}
+		ds := encodeDataFlowSet(records, boot, opts)
+		if ds == nil {
+			t.Fatalf("encodeDataFlowSet returned nil (includeDir=%v)", includeDir)
+		}
+		fields := buildTemplateFieldsV4(opts)
+		expectedRecSize := recordSize(fields)
+		// data flowset = 4 (header) + N * recordSize (padded to 4)
+		expectedLen := 4 + expectedRecSize
+		// Pad to 4
+		expectedLen += (4 - expectedLen%4) % 4
+		dataLen := int(binary.BigEndian.Uint16(ds[2:4]))
+		if dataLen != expectedLen {
+			t.Errorf("includeDir=%v: data set length = %d, want %d", includeDir, dataLen, expectedLen)
+		}
+	}
+}
+
+func TestBuildExportConfig_V9Extensions(t *testing.T) {
+	svc := &config.ServicesConfig{
+		FlowMonitoring: &config.FlowMonitoringConfig{
+			Version9: &config.NetFlowV9Config{
+				Templates: map[string]*config.NetFlowV9Template{
+					"t1": {
+						Name:              "t1",
+						FlowActiveTimeout: 60,
+						ExportExtensions:  []string{"flow-dir"},
+					},
+				},
+			},
+		},
+	}
+	fo := &config.ForwardingOptionsConfig{
+		Sampling: &config.SamplingConfig{
+			Instances: map[string]*config.SamplingInstance{
+				"test": {
+					Name: "test",
+					FamilyInet: &config.SamplingFamily{
+						FlowServers: []*config.FlowServer{
+							{Address: "10.0.0.1", Port: 2055},
+						},
+					},
+				},
+			},
+		},
+	}
+	ec := BuildExportConfig(svc, fo)
+	if ec == nil {
+		t.Fatal("expected non-nil ExportConfig")
+	}
+	if !ec.V9TemplateOpts.IncludeFlowDir {
+		t.Error("V9TemplateOpts.IncludeFlowDir should be true when flow-dir extension is set")
+	}
+
+	// Without flow-dir extension
+	svc2 := &config.ServicesConfig{
+		FlowMonitoring: &config.FlowMonitoringConfig{
+			Version9: &config.NetFlowV9Config{
+				Templates: map[string]*config.NetFlowV9Template{
+					"t2": {
+						Name:             "t2",
+						ExportExtensions: nil,
+					},
+				},
+			},
+		},
+	}
+	ec2 := BuildExportConfig(svc2, fo)
+	if ec2 == nil {
+		t.Fatal("expected non-nil ExportConfig")
+	}
+	if ec2.V9TemplateOpts.IncludeFlowDir {
+		t.Error("V9TemplateOpts.IncludeFlowDir should be false when no extensions set")
+	}
+}

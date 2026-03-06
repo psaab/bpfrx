@@ -9,27 +9,27 @@ import (
 
 // NetFlow v9 field type IDs (RFC 3954).
 const (
-	fieldInBytes          = 1
-	fieldInPkts           = 2
-	fieldProtocol         = 4
-	fieldSrcTos           = 5
-	fieldTCPFlags         = 6
-	fieldL4SrcPort        = 7
-	fieldIPv4SrcAddr      = 8
-	fieldSrcMask          = 9
-	fieldInputSNMP        = 10
-	fieldL4DstPort        = 11
-	fieldIPv4DstAddr      = 12
-	fieldDstMask          = 13
-	fieldOutputSNMP       = 14
-	fieldLastSwitched      = 21
-	fieldFirstSwitched     = 22
-	fieldIPv6SrcAddr      = 27
-	fieldIPv6DstAddr      = 28
-	fieldIPv6SrcMask      = 29
-	fieldIPv6DstMask      = 30
-	fieldDirection        = 61
-	fieldIPv4Ident        = 54
+	fieldInBytes       = 1
+	fieldInPkts        = 2
+	fieldProtocol      = 4
+	fieldSrcTos        = 5
+	fieldTCPFlags      = 6
+	fieldL4SrcPort     = 7
+	fieldIPv4SrcAddr   = 8
+	fieldSrcMask       = 9
+	fieldInputSNMP     = 10
+	fieldL4DstPort     = 11
+	fieldIPv4DstAddr   = 12
+	fieldDstMask       = 13
+	fieldOutputSNMP    = 14
+	fieldLastSwitched  = 21
+	fieldFirstSwitched = 22
+	fieldIPv6SrcAddr   = 27
+	fieldIPv6DstAddr   = 28
+	fieldIPv6SrcMask   = 29
+	fieldIPv6DstMask   = 30
+	fieldDirection     = 61
+	fieldIPv4Ident     = 54
 )
 
 // Template IDs for IPv4 and IPv6.
@@ -44,59 +44,96 @@ const flowsetIDTemplate = 0
 // Maximum UDP payload size for NetFlow packets.
 const maxPayload = 1400
 
-// templateFieldV4 defines the IPv4 template fields and their byte sizes.
-var templateFieldV4 = []struct {
+// templateField describes a single field in a v9 template.
+type templateField struct {
 	fieldType uint16
 	fieldLen  uint16
-}{
-	{fieldIPv4SrcAddr, 4},
-	{fieldIPv4DstAddr, 4},
-	{fieldL4SrcPort, 2},
-	{fieldL4DstPort, 2},
-	{fieldProtocol, 1},
-	{fieldSrcTos, 1},
-	{fieldTCPFlags, 1},
-	{fieldDirection, 1},
-	{fieldInputSNMP, 4},
-	{fieldOutputSNMP, 4},
-	{fieldInPkts, 8},
-	{fieldInBytes, 8},
-	{fieldFirstSwitched, 4},
-	{fieldLastSwitched, 4},
-	{fieldSrcMask, 1},
-	{fieldDstMask, 1},
-	// 2 bytes padding to align to 4 bytes
 }
 
-// templateFieldV6 defines the IPv6 template fields and their byte sizes.
-var templateFieldV6 = []struct {
-	fieldType uint16
-	fieldLen  uint16
-}{
-	{fieldIPv6SrcAddr, 16},
-	{fieldIPv6DstAddr, 16},
-	{fieldL4SrcPort, 2},
-	{fieldL4DstPort, 2},
-	{fieldProtocol, 1},
-	{fieldSrcTos, 1},
-	{fieldTCPFlags, 1},
-	{fieldDirection, 1},
-	{fieldInputSNMP, 4},
-	{fieldOutputSNMP, 4},
-	{fieldInPkts, 8},
-	{fieldInBytes, 8},
-	{fieldFirstSwitched, 4},
-	{fieldLastSwitched, 4},
-	{fieldIPv6SrcMask, 1},
-	{fieldIPv6DstMask, 1},
-	// 2 bytes padding to align to 4 bytes
+// V9TemplateOptions controls which optional fields are included in v9 templates.
+type V9TemplateOptions struct {
+	IncludeFlowDir bool // include fieldDirection (export-extension flow-dir)
 }
 
-// recordSizeV4 is the byte size of a single IPv4 data record.
-const recordSizeV4 = 4 + 4 + 2 + 2 + 1 + 1 + 1 + 1 + 4 + 4 + 8 + 8 + 4 + 4 + 1 + 1 + 2 // 48 (incl padding)
+// DefaultV9TemplateOptions returns options with all extensions enabled (backward compat).
+func DefaultV9TemplateOptions() V9TemplateOptions {
+	return V9TemplateOptions{IncludeFlowDir: true}
+}
 
-// recordSizeV6 is the byte size of a single IPv6 data record.
-const recordSizeV6 = 16 + 16 + 2 + 2 + 1 + 1 + 1 + 1 + 4 + 4 + 8 + 8 + 4 + 4 + 1 + 1 + 2 // 72 (incl padding)
+// buildTemplateFieldsV4 returns the IPv4 template fields based on options.
+func buildTemplateFieldsV4(opts V9TemplateOptions) []templateField {
+	fields := []templateField{
+		{fieldIPv4SrcAddr, 4},
+		{fieldIPv4DstAddr, 4},
+		{fieldL4SrcPort, 2},
+		{fieldL4DstPort, 2},
+		{fieldProtocol, 1},
+		{fieldSrcTos, 1},
+		{fieldTCPFlags, 1},
+	}
+	if opts.IncludeFlowDir {
+		fields = append(fields, templateField{fieldDirection, 1})
+	} else {
+		// 1 byte padding to maintain alignment after tcp_flags
+		fields = append(fields, templateField{0, 0}) // placeholder, not emitted
+	}
+	fields = append(fields,
+		templateField{fieldInputSNMP, 4},
+		templateField{fieldOutputSNMP, 4},
+		templateField{fieldInPkts, 8},
+		templateField{fieldInBytes, 8},
+		templateField{fieldFirstSwitched, 4},
+		templateField{fieldLastSwitched, 4},
+		templateField{fieldSrcMask, 1},
+		templateField{fieldDstMask, 1},
+	)
+	// Filter out zero-type placeholders
+	var result []templateField
+	for _, f := range fields {
+		if f.fieldType != 0 || f.fieldLen != 0 {
+			result = append(result, f)
+		}
+	}
+	return result
+}
+
+// buildTemplateFieldsV6 returns the IPv6 template fields based on options.
+func buildTemplateFieldsV6(opts V9TemplateOptions) []templateField {
+	fields := []templateField{
+		{fieldIPv6SrcAddr, 16},
+		{fieldIPv6DstAddr, 16},
+		{fieldL4SrcPort, 2},
+		{fieldL4DstPort, 2},
+		{fieldProtocol, 1},
+		{fieldSrcTos, 1},
+		{fieldTCPFlags, 1},
+	}
+	if opts.IncludeFlowDir {
+		fields = append(fields, templateField{fieldDirection, 1})
+	}
+	fields = append(fields,
+		templateField{fieldInputSNMP, 4},
+		templateField{fieldOutputSNMP, 4},
+		templateField{fieldInPkts, 8},
+		templateField{fieldInBytes, 8},
+		templateField{fieldFirstSwitched, 4},
+		templateField{fieldLastSwitched, 4},
+		templateField{fieldIPv6SrcMask, 1},
+		templateField{fieldIPv6DstMask, 1},
+	)
+	return fields
+}
+
+// recordSize computes the data record size from template fields, padded to 4 bytes.
+func recordSize(fields []templateField) int {
+	size := 0
+	for _, f := range fields {
+		size += int(f.fieldLen)
+	}
+	// Pad to 4-byte boundary
+	pad := (4 - size%4) % 4
+	return size + pad
+}
 
 // FlowRecord holds the data for a single NetFlow record.
 type FlowRecord struct {
@@ -121,12 +158,12 @@ type FlowRecord struct {
 
 // nfHeader is the 20-byte NetFlow v9 packet header.
 type nfHeader struct {
-	Version    uint16
-	Count      uint16
-	SysUptime  uint32 // milliseconds since boot
-	UnixSecs   uint32
-	SeqNumber  uint32
-	SourceID   uint32
+	Version   uint16
+	Count     uint16
+	SysUptime uint32 // milliseconds since boot
+	UnixSecs  uint32
+	SeqNumber uint32
+	SourceID  uint32
 }
 
 func encodeHeader(h nfHeader) []byte {
@@ -141,13 +178,12 @@ func encodeHeader(h nfHeader) []byte {
 }
 
 // encodeTemplateFlowSet builds a template FlowSet containing both v4 and v6 templates.
-func encodeTemplateFlowSet() []byte {
-	// Each template: 4-byte header (ID + field count) + N * 4-byte field entries
-	v4fields := len(templateFieldV4)
-	v6fields := len(templateFieldV6)
+func encodeTemplateFlowSet(opts V9TemplateOptions) []byte {
+	v4fields := buildTemplateFieldsV4(opts)
+	v6fields := buildTemplateFieldsV6(opts)
+
 	// FlowSet header (4 bytes) + 2 template headers (4 each) + field entries
-	totalLen := 4 + (4 + v4fields*4) + (4 + v6fields*4)
-	// Pad to 4-byte boundary (already aligned since fields are 4 bytes each)
+	totalLen := 4 + (4 + len(v4fields)*4) + (4 + len(v6fields)*4)
 
 	b := make([]byte, totalLen)
 	off := 0
@@ -159,9 +195,9 @@ func encodeTemplateFlowSet() []byte {
 
 	// IPv4 template
 	binary.BigEndian.PutUint16(b[off:off+2], templateIDv4)
-	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(v4fields))
+	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(len(v4fields)))
 	off += 4
-	for _, f := range templateFieldV4 {
+	for _, f := range v4fields {
 		binary.BigEndian.PutUint16(b[off:off+2], f.fieldType)
 		binary.BigEndian.PutUint16(b[off+2:off+4], f.fieldLen)
 		off += 4
@@ -169,9 +205,9 @@ func encodeTemplateFlowSet() []byte {
 
 	// IPv6 template
 	binary.BigEndian.PutUint16(b[off:off+2], templateIDv6)
-	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(v6fields))
+	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(len(v6fields)))
 	off += 4
-	for _, f := range templateFieldV6 {
+	for _, f := range v6fields {
 		binary.BigEndian.PutUint16(b[off:off+2], f.fieldType)
 		binary.BigEndian.PutUint16(b[off+2:off+4], f.fieldLen)
 		off += 4
@@ -182,20 +218,21 @@ func encodeTemplateFlowSet() []byte {
 
 // encodeDataFlowSet builds a data FlowSet from a batch of records.
 // All records in a batch must be the same AF (v4 or v6).
-func encodeDataFlowSet(records []FlowRecord, bootTime time.Time) []byte {
+func encodeDataFlowSet(records []FlowRecord, bootTime time.Time, opts V9TemplateOptions) []byte {
 	if len(records) == 0 {
 		return nil
 	}
 	isV6 := records[0].IsIPv6
 	var tmplID uint16
-	var recSize int
+	var fields []templateField
 	if isV6 {
 		tmplID = templateIDv6
-		recSize = recordSizeV6
+		fields = buildTemplateFieldsV6(opts)
 	} else {
 		tmplID = templateIDv4
-		recSize = recordSizeV4
+		fields = buildTemplateFieldsV4(opts)
 	}
+	recSize := recordSize(fields)
 
 	// FlowSet header (4 bytes) + records
 	totalLen := 4 + len(records)*recSize
@@ -213,16 +250,17 @@ func encodeDataFlowSet(records []FlowRecord, bootTime time.Time) []byte {
 
 	for _, r := range records {
 		if isV6 {
-			off = encodeRecordV6(b, off, r, bootTime)
+			off = encodeRecordV6(b, off, r, bootTime, opts)
 		} else {
-			off = encodeRecordV4(b, off, r, bootTime)
+			off = encodeRecordV4(b, off, r, bootTime, opts)
 		}
 	}
 
 	return b
 }
 
-func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time) int {
+func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time, opts V9TemplateOptions) int {
+	startOff := off
 	src4 := r.SrcIP.To4()
 	dst4 := r.DstIP.To4()
 	if src4 == nil {
@@ -245,8 +283,10 @@ func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time) int {
 	off++
 	b[off] = r.TCPFlags
 	off++
-	b[off] = r.Direction
-	off++
+	if opts.IncludeFlowDir {
+		b[off] = r.Direction
+		off++
+	}
 	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
 	off += 4
 	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
@@ -263,12 +303,13 @@ func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time) int {
 	off++
 	b[off] = r.DstMask
 	off++
-	// 2 bytes padding
-	off += 2
-	return off
+	// Advance to padded record boundary
+	recSize := recordSize(buildTemplateFieldsV4(opts))
+	return startOff + recSize
 }
 
-func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time) int {
+func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time, opts V9TemplateOptions) int {
+	startOff := off
 	src16 := r.SrcIP.To16()
 	dst16 := r.DstIP.To16()
 	if src16 == nil {
@@ -291,8 +332,10 @@ func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time) int {
 	off++
 	b[off] = r.TCPFlags
 	off++
-	b[off] = r.Direction
-	off++
+	if opts.IncludeFlowDir {
+		b[off] = r.Direction
+		off++
+	}
 	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
 	off += 4
 	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
@@ -309,9 +352,9 @@ func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time) int {
 	off++
 	b[off] = r.DstMask
 	off++
-	// 2 bytes padding
-	off += 2
-	return off
+	// Advance to padded record boundary
+	recSize := recordSize(buildTemplateFieldsV6(opts))
+	return startOff + recSize
 }
 
 func uptimeMs(boot, t time.Time) uint32 {
