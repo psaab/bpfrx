@@ -2955,6 +2955,23 @@ func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.Sc
 
 // --- helpers ---
 
+// resolveFabricParent returns the physical parent interface name if name is a
+// fabric IPVLAN overlay (fab0/fab1). Monitor commands should show wire-level
+// fabric traffic, not the overlay (#135, #136).
+func resolveFabricParent(name string) string {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return name
+	}
+	if ipv, ok := link.(*netlink.IPVlan); ok {
+		parent, err := netlink.LinkByIndex(ipv.Attrs().ParentIndex)
+		if err == nil {
+			return parent.Attrs().Name
+		}
+	}
+	return name
+}
+
 func allInterfaceNames(cfg *config.Config) map[string]bool {
 	names := make(map[string]bool)
 	for ifName := range cfg.Interfaces.Interfaces {
@@ -8632,7 +8649,7 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 	var singleDisplayName, singleKernelName string
 	if isSingle {
 		singleDisplayName = req.InterfaceName
-		singleKernelName = resolveToKernel(req.InterfaceName)
+		singleKernelName = resolveFabricParent(resolveToKernel(req.InterfaceName))
 
 		// Check if interface should be proxied to the cluster peer.
 		needProxy := false
@@ -8817,7 +8834,7 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 
 			newPrev := make(map[string]*ifSnap, len(names))
 			for _, name := range names {
-				kernelName := resolveToKernel(name)
+				kernelName := resolveFabricParent(resolveToKernel(name))
 				snap := readSnap(kernelName)
 				if snap == nil {
 					continue

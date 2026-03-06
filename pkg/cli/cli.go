@@ -10507,6 +10507,9 @@ func (c *CLI) handleMonitorTraffic(args []string) error {
 		return nil
 	}
 
+	// Resolve fabric IPVLAN overlays to physical parent (#136).
+	iface = resolveFabricParent(iface)
+
 	cmdArgs := []string{"tcpdump", "-i", iface, "-n", "-l"}
 	if count != "0" {
 		cmdArgs = append(cmdArgs, "-c", count)

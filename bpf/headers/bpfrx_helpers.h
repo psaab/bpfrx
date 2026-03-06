@@ -1978,11 +1978,14 @@ try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 	if ((void *)(eth + 1) > data_end)
 		return -1;
 
+	__u32 pkt_len = (__u32)(data_end - data);
+
 	/* Try fab0 first */
 	if (ff0 && ff0->ifindex != 0) {
 		__builtin_memcpy(eth->h_dest, ff0->peer_mac, ETH_ALEN);
 		__builtin_memcpy(eth->h_source, ff0->local_mac, ETH_ALEN);
 		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		inc_iface_tx(ff0->ifindex, pkt_len);
 		return bpf_redirect_map(&tx_ports, ff0->ifindex, 0);
 	}
 
@@ -1991,6 +1994,7 @@ try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 		__builtin_memcpy(eth->h_dest, ff1->peer_mac, ETH_ALEN);
 		__builtin_memcpy(eth->h_source, ff1->local_mac, ETH_ALEN);
 		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		inc_iface_tx(ff1->ifindex, pkt_len);
 		return bpf_redirect_map(&tx_ports, ff1->ifindex, 0);
 	}
 
@@ -2035,6 +2039,8 @@ try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
 	if ((void *)(eth + 1) > data_end)
 		return -1;
 
+	__u32 pkt_len = (__u32)(data_end - data);
+
 	/* Encode ingress zone in source MAC: 02:bf:72:fe:00:ZZ */
 	eth->h_source[0] = 0x02;
 	eth->h_source[1] = 0xbf;
@@ -2047,6 +2053,7 @@ try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
 	if (ff0 && ff0->ifindex != 0) {
 		__builtin_memcpy(eth->h_dest, ff0->peer_mac, ETH_ALEN);
 		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		inc_iface_tx(ff0->ifindex, pkt_len);
 		return bpf_redirect_map(&tx_ports, ff0->ifindex, 0);
 	}
 
@@ -2054,6 +2061,7 @@ try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
 	if (ff1 && ff1->ifindex != 0) {
 		__builtin_memcpy(eth->h_dest, ff1->peer_mac, ETH_ALEN);
 		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		inc_iface_tx(ff1->ifindex, pkt_len);
 		return bpf_redirect_map(&tx_ports, ff1->ifindex, 0);
 	}
 

@@ -14,6 +14,24 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// resolveFabricParent checks if name is a fabric IPVLAN overlay (fab0/fab1)
+// and returns the physical parent interface name. After the IPVLAN rework,
+// cross-chassis forwarding runs on the parent — monitor commands should show
+// wire-level traffic, not the overlay (#135, #136).
+func resolveFabricParent(name string) string {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return name
+	}
+	if ipv, ok := link.(*netlink.IPVlan); ok {
+		parent, err := netlink.LinkByIndex(ipv.Attrs().ParentIndex)
+		if err == nil {
+			return parent.Attrs().Name
+		}
+	}
+	return name
+}
+
 // ifaceSnapshot holds a point-in-time sample of interface counters.
 type ifaceSnapshot struct {
 	rxBytes, txBytes       uint64
@@ -172,6 +190,8 @@ func (c *CLI) resolveToKernel(cfgName string) string {
 func (c *CLI) monitorInterfaceSingle(ifaceName string) error {
 	displayName := ifaceName
 	kernelName := c.resolveToKernel(ifaceName)
+	// Resolve fabric IPVLAN overlays to physical parent (#135).
+	kernelName = resolveFabricParent(kernelName)
 	// Validate interface exists.
 	if _, err := net.InterfaceByName(kernelName); err != nil {
 		return fmt.Errorf("interface %s not found", ifaceName)
@@ -372,7 +392,7 @@ func (c *CLI) monitorInterfaceTraffic() error {
 		snaps := make(map[string]*ifaceSnapshot, len(names))
 		kernelNames := make(map[string]string, len(names))
 		for _, name := range names {
-			kn := c.resolveToKernel(name)
+			kn := resolveFabricParent(c.resolveToKernel(name))
 			kernelNames[name] = kn
 			if snap, err := c.readIfaceSnapshot(kn); err == nil {
 				snaps[name] = &snap
