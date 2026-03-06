@@ -210,6 +210,28 @@ func TestParseSAOutput(t *testing.T) {
 	}
 }
 
+func TestParseSAOutput_MultiChild(t *testing.T) {
+	output := `site-a: #1, ESTABLISHED
+  local: 10.0.1.1 === 10.0.2.1
+  site-a-ts1: #1, reqid 1, INSTALLED
+    local_ts = 10.0.1.0/24
+    remote_ts = 10.0.2.0/24
+  site-a-ts2: #2, reqid 2, INSTALLED
+    local_ts = 10.0.3.0/24
+    remote_ts = 10.0.4.0/24
+`
+	sas := parseSAOutput(output)
+	if len(sas) != 2 {
+		t.Fatalf("expected 2 child SAs, got %d", len(sas))
+	}
+	if sas[0].Name != "site-a-ts1" || sas[0].ConnectionName != "site-a" {
+		t.Fatalf("unexpected first child: %+v", sas[0])
+	}
+	if sas[1].Name != "site-a-ts2" || sas[1].ConnectionName != "site-a" {
+		t.Fatalf("unexpected second child: %+v", sas[1])
+	}
+}
+
 func TestGenerateConfig_GatewayReference(t *testing.T) {
 	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
 	cfg := &config.IPsecConfig{
@@ -412,12 +434,14 @@ func TestGenerateConfig_IKEChain(t *testing.T) {
 		{"remote addr", "remote_addrs = 203.0.113.1"},
 		{"no NAT-T", "encap = no"},
 		{"DPD", "dpd_delay = 10s"},
+		{"DPD timeout", "dpd_timeout = 50s"},
 		{"local identity", "id = @vpn.example.com"},
 		{"remote identity", "id = 203.0.113.1"},
 		{"IKE proposal", "proposals = aes256-sha256-modp2048"},
 		{"ESP proposal", "esp_proposals = aes256-sha256128-modp2048"},
 		{"copy DF", "copy_df = yes"},
 		{"start action", "start_action = start"},
+		{"DPD action", "dpd_action = restart"},
 		{"XFRM if_id", "if_id_in = 1"},
 		{"PSK from IKE policy", `secret = "secret123"`},
 	}
@@ -425,9 +449,6 @@ func TestGenerateConfig_IKEChain(t *testing.T) {
 		if !strings.Contains(got, c.want) {
 			t.Errorf("%s: missing %q in:\n%s", c.name, c.want, got)
 		}
-	}
-	if strings.Contains(got, "dpd_action = restart") {
-		t.Errorf("PFS must not inject dpd_action into child config: %s", got)
 	}
 }
 
@@ -689,5 +710,205 @@ func TestGenerateConfig_EstablishTunnels(t *testing.T) {
 	got = m.generateConfig(cfg)
 	if strings.Contains(got, "start_action") {
 		t.Errorf("on-traffic should not produce start_action: %s", got)
+	}
+}
+
+func TestGenerateConfig_IKELifetime(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	cfg := &config.IPsecConfig{
+		IKEProposals: map[string]*config.IKEProposal{
+			"ike-p1": {
+				Name:            "ike-p1",
+				AuthMethod:      "pre-shared-keys",
+				EncryptionAlg:   "aes-256-cbc",
+				AuthAlg:         "sha-256",
+				DHGroup:         14,
+				LifetimeSeconds: 28800,
+			},
+		},
+		IKEPolicies: map[string]*config.IKEPolicy{
+			"pol1": {Name: "pol1", Proposals: "ike-p1", PSK: "secret"},
+		},
+		Gateways: map[string]*config.IPsecGateway{
+			"gw": {Name: "gw", Address: "203.0.113.1", IKEPolicy: "pol1"},
+		},
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {Gateway: "gw"},
+		},
+	}
+	got := m.generateConfig(cfg)
+	if !strings.Contains(got, "rekey_time = 28800s") {
+		t.Fatalf("expected IKE rekey_time from lifetime-seconds: %s", got)
+	}
+	if !strings.Contains(got, "rand_time = 0s") {
+		t.Fatalf("expected deterministic IKE rand_time: %s", got)
+	}
+}
+
+func TestGenerateConfig_ESPLifetime(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	cfg := &config.IPsecConfig{
+		Proposals: map[string]*config.IPsecProposal{
+			"esp-p2": {
+				Name:            "esp-p2",
+				EncryptionAlg:   "aes-256-cbc",
+				AuthAlg:         "hmac-sha-256-128",
+				LifetimeSeconds: 3600,
+			},
+		},
+		Policies: map[string]*config.IPsecPolicyDef{
+			"ipsec-pol": {Name: "ipsec-pol", Proposals: "esp-p2"},
+		},
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {Gateway: "203.0.113.1", IPsecPolicy: "ipsec-pol"},
+		},
+	}
+	got := m.generateConfig(cfg)
+	if !strings.Contains(got, "rekey_time = 3600s") {
+		t.Fatalf("expected child rekey_time from ESP lifetime-seconds: %s", got)
+	}
+}
+
+func TestGenerateConfig_DPDModes(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	cfg := &config.IPsecConfig{
+		Gateways: map[string]*config.IPsecGateway{
+			"gw": {
+				Name:           "gw",
+				Address:        "10.0.0.1",
+				DeadPeerDetect: "probe-idle-tunnel",
+				DPDInterval:    7,
+				DPDThreshold:   3,
+			},
+		},
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {Gateway: "gw", EstablishTunnels: "on-traffic"},
+		},
+	}
+	got := m.generateConfig(cfg)
+	for _, want := range []string{"dpd_delay = 7s", "dpd_timeout = 21s", "dpd_action = trap"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestGenerateConfig_JunosObfuscatedPSK(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	cfg := &config.IPsecConfig{
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {Gateway: "10.0.0.1", PSK: "$9$SpRrMLYgaZDirexdwgUDzFn9uO1RhlKW"},
+		},
+	}
+	got, err := m.renderConfig(cfg)
+	if err != nil {
+		t.Fatalf("renderConfig() error = %v", err)
+	}
+	if !strings.Contains(got, `secret = "QZ1agnL21L"`) {
+		t.Fatalf("expected decoded Junos secret, got:\n%s", got)
+	}
+}
+
+func TestGenerateConfig_PubkeyAuth(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	cfg := &config.IPsecConfig{
+		IKEProposals: map[string]*config.IKEProposal{
+			"ike-p1": {
+				Name:          "ike-p1",
+				AuthMethod:    "rsa-signatures",
+				EncryptionAlg: "aes-256-cbc",
+				AuthAlg:       "sha-256",
+				DHGroup:       14,
+			},
+		},
+		IKEPolicies: map[string]*config.IKEPolicy{
+			"pol1": {Name: "pol1", Proposals: "ike-p1"},
+		},
+		Gateways: map[string]*config.IPsecGateway{
+			"gw": {
+				Name:             "gw",
+				Address:          "203.0.113.1",
+				IKEPolicy:        "pol1",
+				LocalCertificate: "gw-cert.pem",
+			},
+		},
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {Gateway: "gw"},
+		},
+	}
+	got := m.generateConfig(cfg)
+	if !strings.Contains(got, "auth = pubkey") {
+		t.Fatalf("expected pubkey auth, got:\n%s", got)
+	}
+	if !strings.Contains(got, "certs = gw-cert.pem") {
+		t.Fatalf("expected local certificate, got:\n%s", got)
+	}
+	if strings.Contains(got, "secret = ") {
+		t.Fatalf("pubkey auth should not emit PSK secrets:\n%s", got)
+	}
+}
+
+func TestGenerateConfig_TrafficSelectors(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	cfg := &config.IPsecConfig{
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {
+				Gateway: "10.0.0.1",
+				TrafficSelectors: map[string]*config.IPsecTrafficSelector{
+					"corp-a": {Name: "corp-a", LocalIP: "10.0.1.0/24", RemoteIP: "10.10.1.0/24"},
+					"corp-b": {Name: "corp-b", LocalIP: "10.0.2.0/24", RemoteIP: "10.10.2.0/24"},
+				},
+			},
+		},
+	}
+	got := m.generateConfig(cfg)
+	for _, want := range []string{
+		"tun-corp-a {",
+		"local_ts = 10.0.1.0/24",
+		"remote_ts = 10.10.1.0/24",
+		"tun-corp-b {",
+		"local_ts = 10.0.2.0/24",
+		"remote_ts = 10.10.2.0/24",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestPrepareConfig_ExternalInterfaceLocalAddress(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"wan0": {
+					Name: "wan0",
+					Units: map[int]*config.InterfaceUnit{
+						0: {
+							PrimaryAddress: "198.51.100.1/24",
+							Addresses:      []string{"198.51.100.1/24"},
+						},
+					},
+				},
+			},
+		},
+		Security: config.SecurityConfig{
+			IPsec: config.IPsecConfig{
+				Gateways: map[string]*config.IPsecGateway{
+					"gw": {
+						Name:          "gw",
+						Address:       "203.0.113.1",
+						ExternalIface: "wan0.0",
+					},
+				},
+				VPNs: map[string]*config.IPsecVPN{
+					"tun": {Gateway: "gw"},
+				},
+			},
+		},
+	}
+
+	prepared := PrepareConfig(cfg)
+	if prepared.Gateways["gw"].LocalAddress != "198.51.100.1" {
+		t.Fatalf("resolved local-address = %q, want 198.51.100.1", prepared.Gateways["gw"].LocalAddress)
 	}
 }

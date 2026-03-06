@@ -51,46 +51,46 @@ import (
 
 // Config configures the gRPC server.
 type Config struct {
-	Store           *configstore.Store
-	DP              dataplane.DataPlane
-	EventBuf        *logging.EventBuffer
-	GC              *conntrack.GC
-	Routing         *routing.Manager
-	FRR             *frr.Manager
-	IPsec           *ipsec.Manager
-	Cluster         *cluster.Manager
-	DHCP            *dhcp.Manager
-	DHCPServer      *dhcpserver.Manager
-	RPMResultsFn    func() []*rpm.ProbeResult        // returns live RPM results
-	FeedsFn         func() map[string]feeds.FeedInfo // returns live feed status
-	LLDPNeighborsFn func() []*lldp.Neighbor          // returns live LLDP neighbors
-	ApplyFn         func(*config.Config)             // daemon's applyConfig callback
-	VRRPMgr         *vrrp.Manager                    // native VRRP manager
-	RAMgr           *ra.Manager                      // embedded RA sender manager
+	Store            *configstore.Store
+	DP               dataplane.DataPlane
+	EventBuf         *logging.EventBuffer
+	GC               *conntrack.GC
+	Routing          *routing.Manager
+	FRR              *frr.Manager
+	IPsec            *ipsec.Manager
+	Cluster          *cluster.Manager
+	DHCP             *dhcp.Manager
+	DHCPServer       *dhcpserver.Manager
+	RPMResultsFn     func() []*rpm.ProbeResult        // returns live RPM results
+	FeedsFn          func() map[string]feeds.FeedInfo // returns live feed status
+	LLDPNeighborsFn  func() []*lldp.Neighbor          // returns live LLDP neighbors
+	ApplyFn          func(*config.Config)             // daemon's applyConfig callback
+	VRRPMgr          *vrrp.Manager                    // native VRRP manager
+	RAMgr            *ra.Manager                      // embedded RA sender manager
 	Version          string                           // software version string
-	FabricPeerAddrFn func() []string                   // returns peer fabric IPs (fab0, fab1; empty if standalone)
+	FabricPeerAddrFn func() []string                  // returns peer fabric IPs (fab0, fab1; empty if standalone)
 	FabricVRFDevice  string                           // VRF for fabric interface (e.g. "vrf-mgmt")
 }
 
 // Server implements the BpfrxService gRPC service.
 type Server struct {
 	pb.UnimplementedBpfrxServiceServer
-	store           *configstore.Store
-	dp              dataplane.DataPlane
-	eventBuf        *logging.EventBuffer
-	gc              *conntrack.GC
-	routing         *routing.Manager
-	frr             *frr.Manager
-	ipsec           *ipsec.Manager
-	cluster         *cluster.Manager
-	dhcp            *dhcp.Manager
-	dhcpServer      *dhcpserver.Manager
-	rpmResultsFn    func() []*rpm.ProbeResult
-	feedsFn         func() map[string]feeds.FeedInfo
-	lldpNeighborsFn func() []*lldp.Neighbor
-	applyFn         func(*config.Config)
-	vrrpMgr         *vrrp.Manager
-	raMgr           *ra.Manager
+	store            *configstore.Store
+	dp               dataplane.DataPlane
+	eventBuf         *logging.EventBuffer
+	gc               *conntrack.GC
+	routing          *routing.Manager
+	frr              *frr.Manager
+	ipsec            *ipsec.Manager
+	cluster          *cluster.Manager
+	dhcp             *dhcp.Manager
+	dhcpServer       *dhcpserver.Manager
+	rpmResultsFn     func() []*rpm.ProbeResult
+	feedsFn          func() map[string]feeds.FeedInfo
+	lldpNeighborsFn  func() []*lldp.Neighbor
+	applyFn          func(*config.Config)
+	vrrpMgr          *vrrp.Manager
+	raMgr            *ra.Manager
 	startTime        time.Time
 	addr             string
 	version          string
@@ -104,22 +104,22 @@ type Server struct {
 // gRPC is ever exposed on non-loopback addresses.
 func NewServer(addr string, cfg Config) *Server {
 	return &Server{
-		store:           cfg.Store,
-		dp:              cfg.DP,
-		eventBuf:        cfg.EventBuf,
-		gc:              cfg.GC,
-		routing:         cfg.Routing,
-		frr:             cfg.FRR,
-		ipsec:           cfg.IPsec,
-		cluster:         cfg.Cluster,
-		dhcp:            cfg.DHCP,
-		dhcpServer:      cfg.DHCPServer,
-		rpmResultsFn:    cfg.RPMResultsFn,
-		feedsFn:         cfg.FeedsFn,
-		lldpNeighborsFn: cfg.LLDPNeighborsFn,
-		applyFn:         cfg.ApplyFn,
-		vrrpMgr:         cfg.VRRPMgr,
-		raMgr:           cfg.RAMgr,
+		store:            cfg.Store,
+		dp:               cfg.DP,
+		eventBuf:         cfg.EventBuf,
+		gc:               cfg.GC,
+		routing:          cfg.Routing,
+		frr:              cfg.FRR,
+		ipsec:            cfg.IPsec,
+		cluster:          cfg.Cluster,
+		dhcp:             cfg.DHCP,
+		dhcpServer:       cfg.DHCPServer,
+		rpmResultsFn:     cfg.RPMResultsFn,
+		feedsFn:          cfg.FeedsFn,
+		lldpNeighborsFn:  cfg.LLDPNeighborsFn,
+		applyFn:          cfg.ApplyFn,
+		vrrpMgr:          cfg.VRRPMgr,
+		raMgr:            cfg.RAMgr,
 		startTime:        time.Now(),
 		addr:             addr,
 		version:          cfg.Version,
@@ -6765,6 +6765,9 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 				if gw.ExternalIface != "" {
 					fmt.Fprintf(&buf, "  External interface: %s\n", gw.ExternalIface)
 				}
+				if gw.LocalCertificate != "" {
+					fmt.Fprintf(&buf, "  Local certificate:  %s\n", gw.LocalCertificate)
+				}
 				if gw.IKEPolicy != "" {
 					fmt.Fprintf(&buf, "  IKE policy:         %s\n", gw.IKEPolicy)
 					if pol, ok := cfg.Security.IPsec.IKEPolicies[gw.IKEPolicy]; ok {
@@ -6779,9 +6782,19 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 				fmt.Fprintf(&buf, "  IKE version:        %s\n", ver)
 				if gw.DeadPeerDetect != "" {
 					fmt.Fprintf(&buf, "  DPD:                %s\n", gw.DeadPeerDetect)
+					if gw.DPDInterval > 0 {
+						fmt.Fprintf(&buf, "  DPD interval:       %ds\n", gw.DPDInterval)
+					}
+					if gw.DPDThreshold > 0 {
+						fmt.Fprintf(&buf, "  DPD threshold:      %d\n", gw.DPDThreshold)
+					}
 				}
 				if gw.NoNATTraversal {
 					buf.WriteString("  NAT-T:              disabled\n")
+				} else if gw.NATTraversal == "force" {
+					buf.WriteString("  NAT-T:              force\n")
+				} else if gw.NATTraversal == "enable" {
+					buf.WriteString("  NAT-T:              enabled\n")
 				}
 				if gw.LocalIDValue != "" {
 					fmt.Fprintf(&buf, "  Local identity:     %s %s\n", gw.LocalIDType, gw.LocalIDValue)
@@ -8701,10 +8714,10 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 
 	// Helper: read interface counters.
 	type ifSnap struct {
-		rxBytes, txBytes, rxPkts, txPkts         uint64
-		rxErrors, txErrors, rxDrops, txDrops      uint64
-		rxFrame, txCarrier, collisions             uint64
-		ts                                         time.Time
+		rxBytes, txBytes, rxPkts, txPkts     uint64
+		rxErrors, txErrors, rxDrops, txDrops uint64
+		rxFrame, txCarrier, collisions       uint64
+		ts                                   time.Time
 	}
 	readSnap := func(name string) *ifSnap {
 		iface, err := net.InterfaceByName(name)

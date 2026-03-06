@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/psaab/bpfrx/pkg/config"
@@ -41,7 +42,10 @@ func (m *Manager) Apply(ipsecCfg *config.IPsecConfig) error {
 		return m.Clear()
 	}
 
-	cfg := m.generateConfig(ipsecCfg)
+	cfg, err := m.renderConfig(ipsecCfg)
+	if err != nil {
+		return err
+	}
 
 	if err := os.MkdirAll(m.configDir, 0755); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
@@ -71,13 +75,19 @@ func (m *Manager) Clear() error {
 }
 
 func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
+	cfg, _ := m.renderConfig(ipsecCfg)
+	return cfg
+}
+
+func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 	var b strings.Builder
 
 	b.WriteString("# bpfrx managed config - do not edit\n\n")
 
 	// Connections
 	b.WriteString("connections {\n")
-	for name, vpn := range ipsecCfg.VPNs {
+	for _, name := range sortedVPNNames(ipsecCfg.VPNs) {
+		vpn := ipsecCfg.VPNs[name]
 		fmt.Fprintf(&b, "  %s {\n", name)
 
 		// Resolve gateway reference
@@ -95,6 +105,12 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 				localAddr = gw.LocalAddress
 			}
 		}
+		authMethod, ikeProposals, ikeLifetime, aggressive, err := resolveIKESettings(ipsecCfg, gw)
+		if err != nil {
+			return "", fmt.Errorf("vpn %s: %w", name, err)
+		}
+		espProposals, espLifetime := resolveESPSettings(ipsecCfg, vpn)
+		dpd := deriveDPD(gw, vpn)
 
 		// IKE version
 		if gw != nil && gw.Version == "v2-only" {
@@ -103,13 +119,8 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 			b.WriteString("    version = 1\n")
 		}
 
-		// Aggressive mode: resolve IKE policy mode through gateway -> ike-policy chain
-		if gw != nil && gw.IKEPolicy != "" {
-			if ikePol, ok := ipsecCfg.IKEPolicies[gw.IKEPolicy]; ok {
-				if ikePol.Mode == "aggressive" {
-					b.WriteString("    aggressive = yes\n")
-				}
-			}
+		if aggressive {
+			b.WriteString("    aggressive = yes\n")
 		}
 
 		if localAddr != "" {
@@ -135,14 +146,19 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 			}
 		}
 
-		// DPD
-		if gw != nil && gw.DeadPeerDetect != "" {
-			b.WriteString("    dpd_delay = 10s\n")
+		if dpd.Delay > 0 {
+			fmt.Fprintf(&b, "    dpd_delay = %ds\n", dpd.Delay)
+		}
+		if dpd.Timeout > 0 {
+			fmt.Fprintf(&b, "    dpd_timeout = %ds\n", dpd.Timeout)
 		}
 
 		// Local auth section
 		b.WriteString("    local {\n")
-		b.WriteString("      auth = psk\n")
+		fmt.Fprintf(&b, "      auth = %s\n", authMethod)
+		if gw != nil && gw.LocalCertificate != "" {
+			fmt.Fprintf(&b, "      certs = %s\n", gw.LocalCertificate)
+		}
 		if gw != nil && gw.LocalIDValue != "" {
 			fmt.Fprintf(&b, "      id = %s\n", formatIdentity(gw.LocalIDType, gw.LocalIDValue))
 		}
@@ -150,44 +166,18 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 
 		// Remote auth section
 		b.WriteString("    remote {\n")
-		b.WriteString("      auth = psk\n")
+		fmt.Fprintf(&b, "      auth = %s\n", authMethod)
 		if gw != nil && gw.RemoteIDValue != "" {
 			fmt.Fprintf(&b, "      id = %s\n", formatIdentity(gw.RemoteIDType, gw.RemoteIDValue))
 		}
 		b.WriteString("    }\n")
 
-		// Build IKE proposals: gateway.IKEPolicy -> IKEPolicy -> IKEProposal
-		if gw != nil && gw.IKEPolicy != "" {
-			if ikePol, ok := ipsecCfg.IKEPolicies[gw.IKEPolicy]; ok {
-				if ikeProp, ok := ipsecCfg.IKEProposals[ikePol.Proposals]; ok {
-					fmt.Fprintf(&b, "    proposals = %s\n", buildIKEProposalFromIKE(ikeProp))
-				}
-			}
-			// Fallback: try IPsec proposals directly (legacy config)
-			if !hasIKEChain(ipsecCfg, gw.IKEPolicy) {
-				if prop, ok := ipsecCfg.Proposals[gw.IKEPolicy]; ok {
-					fmt.Fprintf(&b, "    proposals = %s\n", buildIKEProposal(prop))
-				}
-			}
+		if ikeProposals != "" {
+			fmt.Fprintf(&b, "    proposals = %s\n", ikeProposals)
 		}
-
-		// Build ESP proposals: vpn.IPsecPolicy -> IPsecPolicyDef -> IPsecProposal
-		espProposals := "default"
-		pfsGroup := 0
-		if vpn.IPsecPolicy != "" {
-			if ipsecPol, ok := ipsecCfg.Policies[vpn.IPsecPolicy]; ok {
-				pfsGroup = ipsecPol.PFSGroup
-				propRef := ipsecPol.Proposals
-				if propRef == "" {
-					propRef = vpn.IPsecPolicy
-				}
-				if prop, ok := ipsecCfg.Proposals[propRef]; ok {
-					espProposals = buildESPProposal(prop, pfsGroup)
-				}
-			} else if prop, ok := ipsecCfg.Proposals[vpn.IPsecPolicy]; ok {
-				// Fallback: direct proposal reference (legacy)
-				espProposals = buildESPProposal(prop, 0)
-			}
+		if ikeLifetime > 0 {
+			fmt.Fprintf(&b, "    rekey_time = %ds\n", ikeLifetime)
+			b.WriteString("    rand_time = 0s\n")
 		}
 
 		// Start immediately?
@@ -199,27 +189,36 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 		ifID := xfrmiIfID(vpn.BindInterface)
 
 		fmt.Fprintf(&b, "    children {\n")
-		fmt.Fprintf(&b, "      %s {\n", name)
-		if vpn.LocalID != "" {
-			fmt.Fprintf(&b, "        local_ts = %s\n", vpn.LocalID)
+		for _, child := range effectiveTrafficSelectors(name, vpn) {
+			fmt.Fprintf(&b, "      %s {\n", child.Name)
+			if child.LocalTS != "" {
+				fmt.Fprintf(&b, "        local_ts = %s\n", child.LocalTS)
+			}
+			if child.RemoteTS != "" {
+				fmt.Fprintf(&b, "        remote_ts = %s\n", child.RemoteTS)
+			}
+			fmt.Fprintf(&b, "        esp_proposals = %s\n", espProposals)
+			if espLifetime > 0 {
+				fmt.Fprintf(&b, "        rekey_time = %ds\n", espLifetime)
+				b.WriteString("        rand_time = 0s\n")
+			}
+			if vpn.DFBit == "copy" {
+				fmt.Fprintf(&b, "        copy_df = yes\n")
+			} else if vpn.DFBit == "set" {
+				fmt.Fprintf(&b, "        copy_df = no\n")
+			}
+			if vpn.EstablishTunnels == "immediately" {
+				fmt.Fprintf(&b, "        start_action = start\n")
+			}
+			if dpd.Action != "" {
+				fmt.Fprintf(&b, "        dpd_action = %s\n", dpd.Action)
+			}
+			if ifID > 0 {
+				fmt.Fprintf(&b, "        if_id_in = %d\n", ifID)
+				fmt.Fprintf(&b, "        if_id_out = %d\n", ifID)
+			}
+			fmt.Fprintf(&b, "      }\n")
 		}
-		if vpn.RemoteID != "" {
-			fmt.Fprintf(&b, "        remote_ts = %s\n", vpn.RemoteID)
-		}
-		fmt.Fprintf(&b, "        esp_proposals = %s\n", espProposals)
-		if vpn.DFBit == "copy" {
-			fmt.Fprintf(&b, "        copy_df = yes\n")
-		} else if vpn.DFBit == "set" {
-			fmt.Fprintf(&b, "        copy_df = no\n")
-		}
-		if vpn.EstablishTunnels == "immediately" {
-			fmt.Fprintf(&b, "        start_action = start\n")
-		}
-		if ifID > 0 {
-			fmt.Fprintf(&b, "        if_id_in = %d\n", ifID)
-			fmt.Fprintf(&b, "        if_id_out = %d\n", ifID)
-		}
-		fmt.Fprintf(&b, "      }\n")
 		fmt.Fprintf(&b, "    }\n")
 
 		fmt.Fprintf(&b, "  }\n")
@@ -228,7 +227,8 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 
 	// Secrets — resolve PSK from IKE policy chain
 	b.WriteString("secrets {\n")
-	for name, vpn := range ipsecCfg.VPNs {
+	for _, name := range sortedVPNNames(ipsecCfg.VPNs) {
+		vpn := ipsecCfg.VPNs[name]
 		secret := vpn.PSK
 		// Resolve PSK from IKE policy chain: VPN -> gateway -> IKE policy -> PSK
 		if secret == "" {
@@ -239,14 +239,163 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 			}
 		}
 		if secret != "" {
+			decoded, err := normalizePSK(secret)
+			if err != nil {
+				return "", fmt.Errorf("vpn %s: %w", name, err)
+			}
 			fmt.Fprintf(&b, "  ike-%s {\n", name)
-			fmt.Fprintf(&b, "    secret = \"%s\"\n", secret)
+			fmt.Fprintf(&b, "    secret = \"%s\"\n", decoded)
 			fmt.Fprintf(&b, "  }\n")
 		}
 	}
 	b.WriteString("}\n")
 
-	return b.String()
+	return b.String(), nil
+}
+
+type childSelector struct {
+	Name     string
+	LocalTS  string
+	RemoteTS string
+}
+
+type dpdSettings struct {
+	Delay   int
+	Timeout int
+	Action  string
+}
+
+func sortedVPNNames(vpns map[string]*config.IPsecVPN) []string {
+	names := make([]string, 0, len(vpns))
+	for name := range vpns {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func resolveIKESettings(cfg *config.IPsecConfig, gw *config.IPsecGateway) (authMethod, proposals string, lifetime int, aggressive bool, err error) {
+	authMethod = "psk"
+	if gw == nil || gw.IKEPolicy == "" {
+		return authMethod, "", 0, false, nil
+	}
+
+	if ikePol, ok := cfg.IKEPolicies[gw.IKEPolicy]; ok {
+		aggressive = ikePol.Mode == "aggressive"
+		if ikeProp, ok := cfg.IKEProposals[ikePol.Proposals]; ok {
+			authMethod, err = authMethodToSwan(ikeProp.AuthMethod)
+			if err != nil {
+				return "", "", 0, false, err
+			}
+			return authMethod, buildIKEProposalFromIKE(ikeProp), ikeProp.LifetimeSeconds, aggressive, nil
+		}
+	}
+
+	if !hasIKEChain(cfg, gw.IKEPolicy) {
+		if prop, ok := cfg.Proposals[gw.IKEPolicy]; ok {
+			return authMethod, buildIKEProposal(prop), prop.LifetimeSeconds, aggressive, nil
+		}
+	}
+
+	return authMethod, "", 0, aggressive, nil
+}
+
+func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, int) {
+	espProposals := "default"
+	pfsGroup := 0
+	if vpn.IPsecPolicy != "" {
+		if ipsecPol, ok := cfg.Policies[vpn.IPsecPolicy]; ok {
+			pfsGroup = ipsecPol.PFSGroup
+			propRef := ipsecPol.Proposals
+			if propRef == "" {
+				propRef = vpn.IPsecPolicy
+			}
+			if prop, ok := cfg.Proposals[propRef]; ok {
+				return buildESPProposal(prop, pfsGroup), prop.LifetimeSeconds
+			}
+		} else if prop, ok := cfg.Proposals[vpn.IPsecPolicy]; ok {
+			return buildESPProposal(prop, 0), prop.LifetimeSeconds
+		}
+	}
+	return espProposals, 0
+}
+
+func deriveDPD(gw *config.IPsecGateway, vpn *config.IPsecVPN) dpdSettings {
+	if gw == nil || gw.DeadPeerDetect == "" {
+		return dpdSettings{}
+	}
+
+	delay := gw.DPDInterval
+	if delay <= 0 {
+		delay = 10
+	}
+	threshold := gw.DPDThreshold
+	if threshold <= 0 {
+		threshold = 5
+	}
+
+	action := ""
+	switch gw.DeadPeerDetect {
+	case "always-send":
+		action = "restart"
+	case "optimized":
+		if vpn != nil && vpn.EstablishTunnels == "immediately" {
+			action = "restart"
+		} else {
+			action = "clear"
+		}
+	case "probe-idle-tunnel":
+		if vpn != nil && vpn.EstablishTunnels == "immediately" {
+			action = "restart"
+		} else {
+			action = "trap"
+		}
+	default:
+		if vpn != nil && vpn.EstablishTunnels == "immediately" {
+			action = "restart"
+		}
+	}
+
+	return dpdSettings{
+		Delay:   delay,
+		Timeout: delay * threshold,
+		Action:  action,
+	}
+}
+
+func effectiveTrafficSelectors(connName string, vpn *config.IPsecVPN) []childSelector {
+	if vpn == nil || len(vpn.TrafficSelectors) == 0 {
+		return []childSelector{{
+			Name:     connName,
+			LocalTS:  vpn.LocalID,
+			RemoteTS: vpn.RemoteID,
+		}}
+	}
+
+	names := make([]string, 0, len(vpn.TrafficSelectors))
+	for name := range vpn.TrafficSelectors {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	children := make([]childSelector, 0, len(names))
+	for _, name := range names {
+		ts := vpn.TrafficSelectors[name]
+		localTS := vpn.LocalID
+		remoteTS := vpn.RemoteID
+		if ts.LocalIP != "" {
+			localTS = ts.LocalIP
+		}
+		if ts.RemoteIP != "" {
+			remoteTS = ts.RemoteIP
+		}
+		children = append(children, childSelector{
+			Name:     connName + "-" + sanitizeChildName(name),
+			LocalTS:  localTS,
+			RemoteTS: remoteTS,
+		})
+	}
+	return children
 }
 
 // hasIKEChain checks if the IKE policy -> IKE proposal chain is available.
@@ -402,14 +551,15 @@ func (m *Manager) reload() error {
 
 // SAStatus represents an IPsec Security Association.
 type SAStatus struct {
-	Name       string
-	LocalAddr  string
-	RemoteAddr string
-	State      string
-	LocalTS    string
-	RemoteTS   string
-	InBytes    string
-	OutBytes   string
+	Name           string
+	ConnectionName string
+	LocalAddr      string
+	RemoteAddr     string
+	State          string
+	LocalTS        string
+	RemoteTS       string
+	InBytes        string
+	OutBytes       string
 }
 
 // TerminateAllSAs terminates all active IKE SAs via swanctl.
@@ -419,10 +569,19 @@ func (m *Manager) TerminateAllSAs() (int, error) {
 		return 0, err
 	}
 	count := 0
+	seen := make(map[string]bool)
 	for _, sa := range sas {
-		cmd := exec.Command("swanctl", "--terminate", "--ike", sa.Name)
+		ikeName := sa.ConnectionName
+		if ikeName == "" {
+			ikeName = sa.Name
+		}
+		if ikeName == "" || seen[ikeName] {
+			continue
+		}
+		seen[ikeName] = true
+		cmd := exec.Command("swanctl", "--terminate", "--ike", ikeName)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			slog.Warn("swanctl terminate failed", "ike", sa.Name, "err", err, "output", string(out))
+			slog.Warn("swanctl terminate failed", "ike", ikeName, "err", err, "output", string(out))
 		} else {
 			count++
 		}
@@ -437,8 +596,10 @@ func (m *Manager) ActiveConnectionNames() ([]string, error) {
 		return nil, err
 	}
 	names := make([]string, 0, len(sas))
+	seen := make(map[string]bool)
 	for _, sa := range sas {
-		if sa.Name != "" {
+		if sa.Name != "" && !seen[sa.Name] {
+			seen[sa.Name] = true
 			names = append(names, sa.Name)
 		}
 	}
@@ -469,44 +630,81 @@ func (m *Manager) GetSAStatus() ([]SAStatus, error) {
 
 func parseSAOutput(output string) []SAStatus {
 	var sas []SAStatus
-	var current *SAStatus
+	var currentConn *SAStatus
+	var currentChild *SAStatus
+	connHasChild := false
 
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimSpace(line)
 
 		// Connection name line (no leading whitespace = new SA)
 		if len(line) > 0 && line[0] != ' ' && strings.Contains(line, ":") {
-			if current != nil {
-				sas = append(sas, *current)
+			if currentChild != nil {
+				sas = append(sas, *currentChild)
+				currentChild = nil
+			}
+			if currentConn != nil && !connHasChild {
+				sas = append(sas, *currentConn)
 			}
 			name := strings.TrimSuffix(strings.Fields(trimmed)[0], ":")
-			current = &SAStatus{Name: name}
+			currentConn = &SAStatus{Name: name, ConnectionName: name}
+			connHasChild = false
 			// Extract state from the connection name line (e.g. "site-a: #1, ESTABLISHED")
 			for _, word := range []string{"ESTABLISHED", "CONNECTING", "INSTALLED", "REKEYING"} {
 				if strings.Contains(trimmed, word) {
-					current.State = word
+					currentConn.State = word
 					break
 				}
 			}
 			continue
 		}
 
-		if current == nil {
+		if currentConn == nil {
 			continue
+		}
+
+		if strings.Contains(trimmed, ", reqid ") && strings.Contains(trimmed, ":") {
+			if currentChild != nil {
+				sas = append(sas, *currentChild)
+			}
+			childName := strings.TrimSuffix(strings.Fields(trimmed)[0], ":")
+			currentChild = &SAStatus{
+				Name:           childName,
+				ConnectionName: currentConn.Name,
+				LocalAddr:      currentConn.LocalAddr,
+				RemoteAddr:     currentConn.RemoteAddr,
+			}
+			connHasChild = true
+			for _, word := range []string{"ESTABLISHED", "CONNECTING", "INSTALLED", "REKEYING"} {
+				if strings.Contains(trimmed, word) {
+					currentChild.State = word
+					break
+				}
+			}
+			continue
+		}
+
+		target := currentConn
+		if currentChild != nil {
+			target = currentChild
 		}
 
 		if strings.Contains(trimmed, "local") && strings.Contains(trimmed, "===") {
 			parts := strings.Split(trimmed, "===")
 			if len(parts) >= 2 {
-				current.LocalAddr = strings.TrimSpace(strings.TrimPrefix(parts[0], "local:"))
-				current.RemoteAddr = strings.TrimSpace(parts[1])
+				currentConn.LocalAddr = strings.TrimSpace(strings.TrimPrefix(parts[0], "local:"))
+				currentConn.RemoteAddr = strings.TrimSpace(parts[1])
+				if currentChild != nil {
+					currentChild.LocalAddr = currentConn.LocalAddr
+					currentChild.RemoteAddr = currentConn.RemoteAddr
+				}
 			}
 		}
 
 		if strings.Contains(trimmed, "ESTABLISHED") || strings.Contains(trimmed, "CONNECTING") {
 			for _, word := range []string{"ESTABLISHED", "CONNECTING", "INSTALLED", "REKEYING"} {
 				if strings.Contains(trimmed, word) {
-					current.State = word
+					target.State = word
 					break
 				}
 			}
@@ -514,30 +712,32 @@ func parseSAOutput(output string) []SAStatus {
 
 		if strings.Contains(trimmed, "local_ts") {
 			if idx := strings.Index(trimmed, "="); idx >= 0 {
-				current.LocalTS = strings.TrimSpace(trimmed[idx+1:])
+				target.LocalTS = strings.TrimSpace(trimmed[idx+1:])
 			}
 		}
 		if strings.Contains(trimmed, "remote_ts") {
 			if idx := strings.Index(trimmed, "="); idx >= 0 {
-				current.RemoteTS = strings.TrimSpace(trimmed[idx+1:])
+				target.RemoteTS = strings.TrimSpace(trimmed[idx+1:])
 			}
 		}
 		if strings.HasPrefix(trimmed, "bytes_in") || strings.Contains(trimmed, " bytes_in") {
 			for _, field := range strings.Fields(trimmed) {
 				if strings.HasPrefix(field, "bytes_in=") {
-					current.InBytes = strings.TrimPrefix(field, "bytes_in=")
-					current.InBytes = strings.TrimRight(current.InBytes, ",")
+					target.InBytes = strings.TrimPrefix(field, "bytes_in=")
+					target.InBytes = strings.TrimRight(target.InBytes, ",")
 				}
 				if strings.HasPrefix(field, "bytes_out=") {
-					current.OutBytes = strings.TrimPrefix(field, "bytes_out=")
-					current.OutBytes = strings.TrimRight(current.OutBytes, ",")
+					target.OutBytes = strings.TrimPrefix(field, "bytes_out=")
+					target.OutBytes = strings.TrimRight(target.OutBytes, ",")
 				}
 			}
 		}
 	}
 
-	if current != nil {
-		sas = append(sas, *current)
+	if currentChild != nil {
+		sas = append(sas, *currentChild)
+	} else if currentConn != nil && !connHasChild {
+		sas = append(sas, *currentConn)
 	}
 
 	return sas

@@ -2957,7 +2957,7 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 
 	// 5. Apply IPsec config
 	if c.ipsec != nil {
-		if err := c.ipsec.Apply(&cfg.Security.IPsec); err != nil {
+		if err := c.ipsec.Apply(ipsec.PrepareConfig(cfg)); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: IPsec apply failed: %v\n", err)
 		}
 	}
@@ -6105,11 +6105,25 @@ func (c *CLI) showIPsec(args []string) error {
 		if vpn.IPsecPolicy != "" {
 			fmt.Printf("  IPsec policy: %s\n", vpn.IPsecPolicy)
 		}
+		if vpn.BindInterface != "" {
+			fmt.Printf("  Bind interface: %s\n", vpn.BindInterface)
+		}
 		if vpn.LocalID != "" {
 			fmt.Printf("  Local identity: %s\n", vpn.LocalID)
 		}
 		if vpn.RemoteID != "" {
 			fmt.Printf("  Remote identity: %s\n", vpn.RemoteID)
+		}
+		if len(vpn.TrafficSelectors) > 0 {
+			names := make([]string, 0, len(vpn.TrafficSelectors))
+			for tsName := range vpn.TrafficSelectors {
+				names = append(names, tsName)
+			}
+			sort.Strings(names)
+			for _, tsName := range names {
+				ts := vpn.TrafficSelectors[tsName]
+				fmt.Printf("  Traffic selector %s: %s -> %s\n", tsName, ts.LocalIP, ts.RemoteIP)
+			}
 		}
 		fmt.Println()
 	}
@@ -6224,6 +6238,9 @@ func (c *CLI) showIKE(args []string) error {
 		if gw.ExternalIface != "" {
 			fmt.Printf("  External interface: %s\n", gw.ExternalIface)
 		}
+		if gw.LocalCertificate != "" {
+			fmt.Printf("  Local certificate:  %s\n", gw.LocalCertificate)
+		}
 		if gw.IKEPolicy != "" {
 			fmt.Printf("  IKE policy:         %s\n", gw.IKEPolicy)
 			if pol, ok := cfg.Security.IPsec.IKEPolicies[gw.IKEPolicy]; ok {
@@ -6238,9 +6255,19 @@ func (c *CLI) showIKE(args []string) error {
 		fmt.Printf("  IKE version:        %s\n", ver)
 		if gw.DeadPeerDetect != "" {
 			fmt.Printf("  DPD:                %s\n", gw.DeadPeerDetect)
+			if gw.DPDInterval > 0 {
+				fmt.Printf("  DPD interval:       %ds\n", gw.DPDInterval)
+			}
+			if gw.DPDThreshold > 0 {
+				fmt.Printf("  DPD threshold:      %d\n", gw.DPDThreshold)
+			}
 		}
 		if gw.NoNATTraversal {
 			fmt.Printf("  NAT-T:              disabled\n")
+		} else if gw.NATTraversal == "force" {
+			fmt.Printf("  NAT-T:              force\n")
+		} else if gw.NATTraversal == "enable" {
+			fmt.Printf("  NAT-T:              enabled\n")
 		}
 		if gw.LocalIDValue != "" {
 			fmt.Printf("  Local identity:     %s %s\n", gw.LocalIDType, gw.LocalIDValue)

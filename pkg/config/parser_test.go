@@ -4543,6 +4543,138 @@ func TestIKEAdvancedFeatures(t *testing.T) {
 	}
 }
 
+func TestIKEGatewayLocalCertificateAndDPD(t *testing.T) {
+	input := `security {
+    ike {
+        gateway remote-gw {
+            ike-policy ike-pol;
+            address 203.0.113.1;
+            local-certificate gw-cert.pem;
+            dead-peer-detection {
+                optimized;
+                interval 7;
+                threshold 3;
+            }
+            external-interface wan0;
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	gw := cfg.Security.IPsec.Gateways["remote-gw"]
+	if gw == nil {
+		t.Fatal("missing gateway remote-gw")
+	}
+	if gw.LocalCertificate != "gw-cert.pem" {
+		t.Fatalf("local-certificate = %q, want gw-cert.pem", gw.LocalCertificate)
+	}
+	if gw.DeadPeerDetect != "optimized" {
+		t.Fatalf("dead-peer-detection = %q, want optimized", gw.DeadPeerDetect)
+	}
+	if gw.DPDInterval != 7 {
+		t.Fatalf("dpd interval = %d, want 7", gw.DPDInterval)
+	}
+	if gw.DPDThreshold != 3 {
+		t.Fatalf("dpd threshold = %d, want 3", gw.DPDThreshold)
+	}
+}
+
+func TestIPsecTrafficSelectorSyntax(t *testing.T) {
+	input := `security {
+    ipsec {
+        vpn site-a {
+            bind-interface st0.0;
+            traffic-selector corp-a {
+                local-ip 10.0.1.0/24;
+                remote-ip 10.10.1.0/24;
+            }
+            traffic-selector corp-b {
+                local-ip 10.0.2.0/24;
+                remote-ip 10.10.2.0/24;
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	vpn := cfg.Security.IPsec.VPNs["site-a"]
+	if vpn == nil {
+		t.Fatal("missing VPN site-a")
+	}
+	if len(vpn.TrafficSelectors) != 2 {
+		t.Fatalf("expected 2 traffic selectors, got %d", len(vpn.TrafficSelectors))
+	}
+	if vpn.TrafficSelectors["corp-a"].LocalIP != "10.0.1.0/24" {
+		t.Fatalf("corp-a local-ip = %q", vpn.TrafficSelectors["corp-a"].LocalIP)
+	}
+	if vpn.TrafficSelectors["corp-b"].RemoteIP != "10.10.2.0/24" {
+		t.Fatalf("corp-b remote-ip = %q", vpn.TrafficSelectors["corp-b"].RemoteIP)
+	}
+}
+
+func TestIKEGatewayLocalCertificateAndTrafficSelectorSetSyntax(t *testing.T) {
+	setCommands := []string{
+		`set security ike gateway gw1 address 203.0.113.1`,
+		`set security ike gateway gw1 local-certificate gw-cert.pem`,
+		`set security ike gateway gw1 dead-peer-detection optimized`,
+		`set security ike gateway gw1 dead-peer-detection interval 7`,
+		`set security ike gateway gw1 dead-peer-detection threshold 3`,
+		`set security ipsec vpn site-a bind-interface st0.0`,
+		`set security ipsec vpn site-a traffic-selector corp-a local-ip 10.0.1.0/24`,
+		`set security ipsec vpn site-a traffic-selector corp-a remote-ip 10.10.1.0/24`,
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	gw := cfg.Security.IPsec.Gateways["gw1"]
+	if gw == nil {
+		t.Fatal("missing gateway gw1")
+	}
+	if gw.LocalCertificate != "gw-cert.pem" {
+		t.Fatalf("local-certificate = %q", gw.LocalCertificate)
+	}
+	if gw.DeadPeerDetect != "optimized" || gw.DPDInterval != 7 || gw.DPDThreshold != 3 {
+		t.Fatalf("unexpected DPD config: %+v", gw)
+	}
+
+	vpn := cfg.Security.IPsec.VPNs["site-a"]
+	if vpn == nil || vpn.TrafficSelectors["corp-a"] == nil {
+		t.Fatal("missing traffic-selector corp-a")
+	}
+	if vpn.TrafficSelectors["corp-a"].LocalIP != "10.0.1.0/24" {
+		t.Fatalf("corp-a local-ip = %q", vpn.TrafficSelectors["corp-a"].LocalIP)
+	}
+}
+
 func TestIKEAdvancedSetSyntax(t *testing.T) {
 	setCommands := []string{
 		`set security ike proposal ike-p1 authentication-method pre-shared-keys`,
@@ -15666,9 +15798,9 @@ func TestValidateFabric1MissingPeerAddress(t *testing.T) {
 		},
 		Chassis: ChassisConfig{
 			Cluster: &ClusterConfig{
-				FabricInterface:    "fab0",
-				FabricPeerAddress:  "10.99.1.2",
-				Fabric1Interface:   "fab1",
+				FabricInterface:   "fab0",
+				FabricPeerAddress: "10.99.1.2",
+				Fabric1Interface:  "fab1",
 				// Missing Fabric1PeerAddress
 			},
 		},
@@ -15812,9 +15944,9 @@ func TestPeerFromPointToPoint(t *testing.T) {
 		{"10.99.2.2/30", "10.99.2.1"},
 		{"192.168.0.1/31", "192.168.0.0"},
 		{"192.168.0.0/31", "192.168.0.1"},
-		{"10.0.0.0/30", ""},  // network address
-		{"10.0.0.3/30", ""},  // broadcast
-		{"10.0.0.1/24", ""},  // not point-to-point
+		{"10.0.0.0/30", ""}, // network address
+		{"10.0.0.3/30", ""}, // broadcast
+		{"10.0.0.1/24", ""}, // not point-to-point
 		{"invalid", ""},
 		{"", ""},
 	}

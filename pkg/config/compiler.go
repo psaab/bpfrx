@@ -4098,6 +4098,10 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 				if v != "" {
 					gw.ExternalIface = v
 				}
+			case "local-certificate":
+				if v != "" {
+					gw.LocalCertificate = v
+				}
 			case "version":
 				if v != "" {
 					gw.Version = v
@@ -4113,11 +4117,7 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 					gw.NoNATTraversal = true
 				}
 			case "dead-peer-detection":
-				if v != "" {
-					gw.DeadPeerDetect = v
-				} else {
-					gw.DeadPeerDetect = "always-send"
-				}
+				parseDeadPeerDetectionNode(p, gw)
 			case "local-identity":
 				if len(p.Keys) >= 3 {
 					gw.LocalIDType = p.Keys[1]
@@ -4155,6 +4155,35 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 	}
 
 	return nil
+}
+
+func parseDeadPeerDetectionNode(node *Node, gw *IPsecGateway) {
+	if gw == nil || node == nil {
+		return
+	}
+
+	if v := nodeVal(node); v != "" {
+		gw.DeadPeerDetect = v
+	}
+
+	for _, c := range node.Children {
+		switch c.Name() {
+		case "always-send", "optimized", "probe-idle-tunnel":
+			gw.DeadPeerDetect = c.Name()
+		case "interval":
+			if n, err := strconv.Atoi(nodeVal(c)); err == nil {
+				gw.DPDInterval = n
+			}
+		case "threshold":
+			if n, err := strconv.Atoi(nodeVal(c)); err == nil {
+				gw.DPDThreshold = n
+			}
+		}
+	}
+
+	if gw.DeadPeerDetect == "" && (len(node.Children) > 0 || len(node.Keys) > 1) {
+		gw.DeadPeerDetect = "always-send"
+	}
 }
 
 func compileIPsec(node *Node, sec *SecurityConfig) error {
@@ -4243,6 +4272,10 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 				if v != "" {
 					gw.ExternalIface = v
 				}
+			case "local-certificate":
+				if v != "" {
+					gw.LocalCertificate = v
+				}
 			case "version":
 				if v != "" {
 					gw.Version = v
@@ -4258,11 +4291,7 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 					gw.NoNATTraversal = true
 				}
 			case "dead-peer-detection":
-				if v != "" {
-					gw.DeadPeerDetect = v
-				} else {
-					gw.DeadPeerDetect = "always-send"
-				}
+				parseDeadPeerDetectionNode(p, gw)
 			case "local-identity":
 				if len(p.Keys) >= 3 {
 					gw.LocalIDType = p.Keys[1]
@@ -4334,6 +4363,21 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 			case "local-address":
 				vpn.LocalAddr = v
 			}
+		}
+		for _, tsInst := range namedInstances(inst.node.FindChildren("traffic-selector")) {
+			if vpn.TrafficSelectors == nil {
+				vpn.TrafficSelectors = make(map[string]*IPsecTrafficSelector)
+			}
+			ts := &IPsecTrafficSelector{Name: tsInst.name}
+			for _, p := range tsInst.node.Children {
+				switch p.Name() {
+				case "local-ip":
+					ts.LocalIP = nodeVal(p)
+				case "remote-ip":
+					ts.RemoteIP = nodeVal(p)
+				}
+			}
+			vpn.TrafficSelectors[ts.Name] = ts
 		}
 		sec.IPsec.VPNs[vpn.Name] = vpn
 	}

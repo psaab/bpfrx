@@ -1874,7 +1874,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// Always call Apply so stale swanctl config is removed when VPNs are
 	// deleted from config.
 	if d.ipsec != nil {
-		if err := d.ipsec.Apply(&cfg.Security.IPsec); err != nil {
+		if err := d.ipsec.Apply(ipsec.PrepareConfig(cfg)); err != nil {
 			slog.Warn("failed to apply IPsec config", "err", err)
 		}
 	}
