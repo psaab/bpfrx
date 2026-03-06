@@ -45,7 +45,6 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 NETWORKS=(
 	"bpfrx-heartbeat:none:false"
 	"bpfrx-fabric:none:false"
-	"bpfrx-fabric1:none:false"
 	"bpfrx-clan:none:false"
 )
 
@@ -62,14 +61,14 @@ vm_name() {
 	esac
 }
 
-# vSRX LAN interface name for a given node index
-# Node 0: ge-0-0-2, Node 1: ge-7-0-2
+# vSRX LAN interface name for a given node index (reth1 member)
+# Node 0: ge-0-0-1, Node 1: ge-7-0-1
 lan_ifname() {
 	local idx="$1"
-	if [[ "$idx" == "0" ]]; then echo "ge-0-0-2"; else echo "ge-7-0-2"; fi
+	if [[ "$idx" == "0" ]]; then echo "ge-0-0-1"; else echo "ge-7-0-1"; fi
 }
 
-# vSRX WAN interface name for a given node index
+# vSRX WAN interface name for a given node index (reth0 member, SR-IOV VF)
 # Node 0: ge-0-0-3, Node 1: ge-7-0-3
 wan_ifname() {
 	local idx="$1"
@@ -140,10 +139,6 @@ devices:
     type: nic
   eth3:
     name: enp8s0
-    network: bpfrx-fabric1
-    type: nic
-  eth4:
-    name: enp9s0
     network: bpfrx-clan
     type: nic
 YAML

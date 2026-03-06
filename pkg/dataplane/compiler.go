@@ -344,6 +344,13 @@ func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, confi
 	if phys, ok := rethToPhys[configName]; ok {
 		physBase = phys
 	}
+
+	// Resolve fabric interface to local physical member for BPF attachment.
+	// fab0 is an IPVLAN on ge-0-0-0; XDP/TC must attach to the parent.
+	if ifCfg, ok := cfg.Interfaces.Interfaces[configName]; ok && ifCfg.LocalFabricMember != "" {
+		physBase = ifCfg.LocalFabricMember
+	}
+
 	physName = config.LinuxIfName(physBase)
 
 	if len(parts) == 2 {
@@ -725,13 +732,15 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				attached[physIface.Index] = true
 			}
 
-			// Reconcile addresses for non-VLAN, non-DHCP, non-RETH interfaces.
+			// Reconcile addresses for non-VLAN, non-DHCP, non-RETH, non-fabric-parent interfaces.
 			// DHCP-managed interfaces are skipped — the DHCP client manages their addresses.
 			// RETH interfaces are skipped — VRRP manages their VIP addresses.
+			// Fabric parents are skipped — addresses go on the IPVLAN overlay (fab0/fab1).
 			if vlanID == 0 {
 				var addrs []string
 				isDHCP := false
 				isReth := false
+				isFabricParent := false
 				var unitMTU int
 				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
 					if unit, ok := ifCfg.Units[unitNum]; ok {
@@ -742,8 +751,11 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 					if ifCfg.RedundancyGroup > 0 {
 						isReth = true
 					}
+					if ifCfg.LocalFabricMember != "" {
+						isFabricParent = true
+					}
 				}
-				if !isDHCP && !isReth {
+				if !isDHCP && !isReth && !isFabricParent {
 					reconcileInterfaceAddresses(physName, addrs)
 				}
 				// Apply unit-level MTU (overrides interface-level MTU)
@@ -866,6 +878,20 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		if physIface == nil {
 			continue
 		}
+		// IPVLAN fabric: mark the parent interface as seen so unmanaged
+		// detection doesn't bring it DOWN (IPVLAN needs parent UP for carrier).
+		// Also add a ManagedInterfaces entry (no addresses, no .link) so the
+		// parent gets a .network file that keeps it UP.
+		if ifCfg.LocalFabricMember != "" {
+			parentLinux := config.LinuxIfName(ifCfg.LocalFabricMember)
+			if !seen[parentLinux] {
+				seen[parentLinux] = true
+				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
+					Name:        parentLinux,
+					Description: "fabric parent (IPVLAN host)",
+				})
+			}
+		}
 		mac := physIface.HardwareAddr.String()
 		if mac == "" {
 			continue
@@ -895,10 +921,10 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			}
 		}
 
-		// vSRX fabric members (LocalFabricMember set): the daemon renames
-		// these at runtime (ge-0-0-0 → fab0). Don't write a .link file —
-		// OriginalName would be the linksetup name (ge-X-0-Y), not the
-		// kernel name (enp*), so it won't match at boot anyway.
+		// vSRX fabric members (LocalFabricMember set): the parent physical
+		// interface (ge-0-0-0) keeps its name; fab0 is an IPVLAN overlay.
+		// Don't write a .link file for the fab* name — linksetup already
+		// handles ge-X-0-Y naming. Clear addresses since they go on the IPVLAN.
 		if ifCfg.LocalFabricMember != "" {
 			mac = ""
 			originalName = ""
@@ -1019,8 +1045,8 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	// Generate networkd .netdev + .network files for fabric bonds with multiple
 	// members. This makes the bond persistent across reboots via systemd-networkd
 	// (the routing package also creates the bond via netlink at runtime).
-	// Skip vSRX-style fabric (LocalFabricMember set) — the .link rename handles
-	// the single local member; no bond needed.
+	// Skip vSRX-style fabric (LocalFabricMember set) — the daemon creates an
+	// IPVLAN on the single local member; no bond needed.
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
 		if len(ifCfg.FabricMembers) <= 1 || ifCfg.LocalFabricMember != "" {
 			continue
@@ -1140,6 +1166,10 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		}
 		if len(ifc.FabricMembers) > 0 {
 			daemonOwned[name] = true
+		}
+		// IPVLAN fabric overlays (fab0, fab1) are daemon-created.
+		if ifc.LocalFabricMember != "" {
+			daemonOwned[config.LinuxIfName(name)] = true
 		}
 	}
 	for _, bd := range cfg.BridgeDomains {

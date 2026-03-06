@@ -154,14 +154,14 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 		}
 		// Auto-detect fabric interfaces from fab0/fab1 member-interfaces
 		// when not explicitly configured via fabric-interface/fabric1-interface.
+		// Only set if the local node has a member (LocalFabricMember resolved above).
+		// With single-member fab (fab0→node0, fab1→node1), only one fab is local.
+		// FabricPeerAddress is already correct from the per-node group — no swap needed.
 		if cc.FabricInterface == "" {
-			if f0, ok := cfg.Interfaces.Interfaces["fab0"]; ok && len(f0.FabricMembers) > 0 {
+			if f0, ok := cfg.Interfaces.Interfaces["fab0"]; ok && f0.LocalFabricMember != "" {
 				cc.FabricInterface = "fab0"
-			}
-		}
-		if cc.Fabric1Interface == "" {
-			if f1, ok := cfg.Interfaces.Interfaces["fab1"]; ok && len(f1.FabricMembers) > 0 {
-				cc.Fabric1Interface = "fab1"
+			} else if f1, ok := cfg.Interfaces.Interfaces["fab1"]; ok && f1.LocalFabricMember != "" {
+				cc.FabricInterface = "fab1"
 			}
 		}
 	}

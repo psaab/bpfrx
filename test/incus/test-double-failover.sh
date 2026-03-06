@@ -123,7 +123,7 @@ for attempt in 1 2 3; do
 	fi
 
 	fw0_sessions=$(incus exec bpfrx-fw0 -- cli -c \
-		"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "State: Established" || true)
+		"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
 	if [[ "$fw0_sessions" -ge "$IPERF_STREAMS" ]]; then
 		iperf_started=true
 		break
@@ -158,7 +158,7 @@ fi
 
 # Verify sessions exist on fw0
 fw0_sessions=$(incus exec bpfrx-fw0 -- cli -c \
-	"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "State: Established" || true)
+	"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
 if [[ "$fw0_sessions" -ge "$MIN_SESSIONS" ]]; then
 	pass "fw0 has $fw0_sessions established sessions"
 else
@@ -171,7 +171,7 @@ info "Waiting ${SYNC_WAIT}s for session sync to fw1"
 sleep "$SYNC_WAIT"
 
 fw1_sessions=$(incus exec bpfrx-fw1 -- cli -c \
-	"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "State: Established" || true)
+	"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
 if [[ "$fw1_sessions" -ge "$MIN_SESSIONS" ]]; then
 	pass "fw1 has $fw1_sessions synced sessions"
 else
@@ -274,7 +274,7 @@ info "Verifying session sync from fw1 → fw0"
 sleep "$SYNC_WAIT"
 
 fw0_synced=$(incus exec bpfrx-fw0 -- cli -c \
-	"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "State: Established" || true)
+	"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
 if [[ "$fw0_synced" -ge "$MIN_SESSIONS" ]]; then
 	pass "fw0 has $fw0_synced synced sessions from fw1"
 else

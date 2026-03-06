@@ -15700,6 +15700,8 @@ func TestFabricLocalMemberNode1(t *testing.T) {
 func TestFabricAutoDetectFabricInterface(t *testing.T) {
 	// vSRX-style: no explicit fabric-interface in chassis cluster,
 	// should auto-detect from fab0/fab1 member-interfaces.
+	// Single-member-per-fab: fab0 has ge-0/0/7 (node0), fab1 has ge-7/0/7 (node1).
+	// On node0, only fab0 is local → FabricInterface = "fab0", Fabric1Interface = "".
 	cmds := []string{
 		"set interfaces fab0 fabric-options member-interfaces ge-0/0/7",
 		"set interfaces fab1 fabric-options member-interfaces ge-7/0/7",
@@ -15728,8 +15730,45 @@ func TestFabricAutoDetectFabricInterface(t *testing.T) {
 	if cc.FabricInterface != "fab0" {
 		t.Errorf("FabricInterface = %q, want %q", cc.FabricInterface, "fab0")
 	}
-	if cc.Fabric1Interface != "fab1" {
-		t.Errorf("Fabric1Interface = %q, want %q", cc.Fabric1Interface, "fab1")
+	if cc.Fabric1Interface != "" {
+		t.Errorf("Fabric1Interface = %q, want empty (fab1 not local to node0)", cc.Fabric1Interface)
+	}
+}
+
+func TestFabricAutoDetectNode1(t *testing.T) {
+	// Node1: fab1 is local (ge-7/0/7), fab0 is remote.
+	// FabricInterface should be "fab1", FabricPeerAddress should NOT be blanked.
+	cmds := []string{
+		"set interfaces fab0 fabric-options member-interfaces ge-0/0/7",
+		"set interfaces fab1 fabric-options member-interfaces ge-7/0/7",
+		"set chassis cluster node 1",
+		"set chassis cluster control-interface hb0",
+		"set chassis cluster fabric-peer-address 10.99.1.1",
+		"set interfaces hb0 unit 0 family inet address 10.99.0.2/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := cfg.Chassis.Cluster
+	if cc == nil {
+		t.Fatal("cluster config not found")
+	}
+	if cc.FabricInterface != "fab1" {
+		t.Errorf("FabricInterface = %q, want %q", cc.FabricInterface, "fab1")
+	}
+	if cc.FabricPeerAddress != "10.99.1.1" {
+		t.Errorf("FabricPeerAddress = %q, want %q", cc.FabricPeerAddress, "10.99.1.1")
 	}
 }
 

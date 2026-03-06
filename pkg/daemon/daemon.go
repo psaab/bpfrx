@@ -1471,30 +1471,23 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		d.routing.ClearRethInterfaces()
 	}
 
-	// 1.9. Runtime rename of vSRX fabric member interfaces.
-	// enumerateAndRenameInterfaces renames kernel interfaces to ge-X-0-Y
-	// at daemon startup. The fabric rename (e.g. ge-0-0-0 → fab0) happens
-	// here because it's config-driven, not positional.
+	// 1.9. Create IPVLAN interfaces for fabric members (fab0, fab1).
+	// The physical member (ge-0-0-0) keeps its name; fab0 is IPVLAN L2
+	// on top for IP addressing. BPF attaches to the parent.
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
 		if ifCfg.LocalFabricMember == "" || !strings.HasPrefix(ifName, "fab") {
 			continue
 		}
+		parentLinux := config.LinuxIfName(ifCfg.LocalFabricMember)
 		fabLinux := config.LinuxIfName(ifName)
-		if _, err := netlink.LinkByName(fabLinux); err == nil {
-			continue // already named correctly
+		var addrs []string
+		if unit, ok := ifCfg.Units[0]; ok {
+			addrs = unit.Addresses
 		}
-		memberLinux := config.LinuxIfName(ifCfg.LocalFabricMember)
-		link, err := netlink.LinkByName(memberLinux)
-		if err != nil {
+		if err := ensureFabricIPVLAN(parentLinux, fabLinux, addrs); err != nil {
+			slog.Warn("failed to create fabric IPVLAN",
+				"parent", parentLinux, "name", fabLinux, "err", err)
 			continue
-		}
-		netlink.LinkSetDown(link)
-		if err := netlink.LinkSetName(link, fabLinux); err != nil {
-			slog.Warn("failed to rename fabric member",
-				"from", memberLinux, "to", fabLinux, "err", err)
-		} else {
-			slog.Info("renamed fabric member interface",
-				"from", memberLinux, "to", fabLinux)
 		}
 	}
 
@@ -4120,11 +4113,15 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 			// Populate fabric_fwd BPF map for cross-chassis redirect,
 			// then periodically refresh to correct neighbor drift.
-			go d.populateFabricFwd(commsCtx, cc.FabricInterface, cc.FabricPeerAddress)
+			// Resolve to physical parent (ge-0-0-0) — BPF runs on
+			// the parent, not the IPVLAN overlay.
+			fabParent := d.resolveFabricParent(cc.FabricInterface)
+			go d.populateFabricFwd(commsCtx, fabParent, cc.FabricPeerAddress)
 
 			// Populate secondary fabric_fwd entry (key=1) if fab1 configured.
 			if cc.Fabric1Interface != "" && cc.Fabric1PeerAddress != "" {
-				go d.populateFabricFwd1(commsCtx, cc.Fabric1Interface, cc.Fabric1PeerAddress)
+				fab1Parent := d.resolveFabricParent(cc.Fabric1Interface)
+				go d.populateFabricFwd1(commsCtx, fab1Parent, cc.Fabric1PeerAddress)
 			}
 		}()
 	}
@@ -4173,6 +4170,93 @@ func clusterTransportFromConfig(cfg *config.Config) clusterTransportKey {
 		Fabric1Interface:   cc.Fabric1Interface,
 		Fabric1PeerAddress: cc.Fabric1PeerAddress,
 	}
+}
+
+// ensureFabricIPVLAN creates an IPVLAN L2 interface on top of parent for
+// fabric IP addressing. The parent keeps its ge-X-0-Y name (XDP/TC attaches
+// there); the IPVLAN carries the fabric IP used for session sync.
+// Idempotent: skips creation if the IPVLAN already exists on the correct parent.
+func ensureFabricIPVLAN(parent, name string, addrs []string) error {
+	parentLink, err := netlink.LinkByName(parent)
+	if err != nil {
+		return fmt.Errorf("parent %s: %w", parent, err)
+	}
+
+	// Ensure parent is UP — IPVLAN inherits carrier from parent.
+	netlink.LinkSetUp(parentLink)
+
+	// Check if IPVLAN already exists on correct parent.
+	if existing, err := netlink.LinkByName(name); err == nil {
+		if existing.Attrs().ParentIndex == parentLink.Attrs().Index {
+			// Already correct — just ensure it's UP.
+			netlink.LinkSetUp(existing)
+			return nil
+		}
+		// Wrong parent — remove and recreate.
+		netlink.LinkDel(existing)
+	}
+
+	ipvlan := &netlink.IPVlan{
+		LinkAttrs: netlink.LinkAttrs{
+			Name:        name,
+			ParentIndex: parentLink.Attrs().Index,
+		},
+		Mode: netlink.IPVLAN_MODE_L2,
+	}
+	if err := netlink.LinkAdd(ipvlan); err != nil {
+		return fmt.Errorf("create IPVLAN %s on %s: %w", name, parent, err)
+	}
+
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return fmt.Errorf("find created IPVLAN %s: %w", name, err)
+	}
+
+	// Add configured addresses.
+	for _, addrStr := range addrs {
+		addr, err := netlink.ParseAddr(addrStr)
+		if err != nil {
+			slog.Warn("fabric IPVLAN: invalid address", "addr", addrStr, "err", err)
+			continue
+		}
+		if err := netlink.AddrReplace(link, addr); err != nil {
+			slog.Warn("fabric IPVLAN: failed to add address",
+				"name", name, "addr", addrStr, "err", err)
+		}
+	}
+
+	if err := netlink.LinkSetUp(link); err != nil {
+		return fmt.Errorf("bring up %s: %w", name, err)
+	}
+	slog.Info("created fabric IPVLAN", "name", name, "parent", parent,
+		"addrs", addrs)
+	return nil
+}
+
+// CleanupFabricIPVLANs removes all fabric IPVLAN interfaces (fab0, fab1).
+func CleanupFabricIPVLANs() {
+	for _, name := range []string{"fab0", "fab1"} {
+		if link, err := netlink.LinkByName(name); err == nil {
+			if _, ok := link.(*netlink.IPVlan); ok {
+				netlink.LinkDel(link)
+				slog.Info("removed fabric IPVLAN", "name", name)
+			}
+		}
+	}
+}
+
+// resolveFabricParent returns the Linux name of the physical parent interface
+// for a fabric interface (e.g. fab0 → ge-0-0-0). Falls back to fabName if
+// no LocalFabricMember is configured (legacy mode).
+func (d *Daemon) resolveFabricParent(fabName string) string {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return fabName
+	}
+	if ifCfg, ok := cfg.Interfaces.Interfaces[fabName]; ok && ifCfg.LocalFabricMember != "" {
+		return config.LinuxIfName(ifCfg.LocalFabricMember)
+	}
+	return fabName
 }
 
 // populateFabricFwd resolves the fabric interface MACs and populates the

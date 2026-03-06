@@ -34,6 +34,8 @@ func main() {
 			fmt.Fprintf(os.Stderr, "cleanup BPF: %v\n", err)
 			os.Exit(1)
 		}
+		// Remove fabric IPVLAN interfaces created by the daemon.
+		daemon.CleanupFabricIPVLANs()
 		// Also clear FRR managed routes so the kernel routing table is clean.
 		frr.New().Clear()
 		fmt.Println("all pinned BPF state and managed routes removed")
