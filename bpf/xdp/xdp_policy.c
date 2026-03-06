@@ -1164,7 +1164,8 @@ int xdp_policy_prog(struct xdp_md *ctx)
 			struct zone_config *zcfg = bpf_map_lookup_elem(&zone_configs, &zk);
 			if (zcfg) {
 				__u32 hif = host_inbound_flag(meta);
-				if (hif != 0 && (zcfg->host_inbound_flags & hif)) {
+				if (zcfg->host_inbound_flags == HOST_INBOUND_ALL ||
+				    (hif != 0 && (zcfg->host_inbound_flags & hif))) {
 					meta->fwd_ifindex = 0;
 					bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
 					return XDP_PASS;
