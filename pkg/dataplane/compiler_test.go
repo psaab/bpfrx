@@ -154,6 +154,35 @@ func TestResolveInterfaceRefXFRMUnit(t *testing.T) {
 	}
 }
 
+func TestIsConfiguredVLANSubInterface(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"trust0": {
+					Name:        "trust0",
+					VlanTagging: true,
+					Units: map[int]*config.InterfaceUnit{
+						100: {VlanID: 100},
+					},
+				},
+				"st0": {
+					Name: "st0",
+					Units: map[int]*config.InterfaceUnit{
+						1: {},
+					},
+				},
+			},
+		},
+	}
+
+	if !isConfiguredVLANSubInterface("trust0.100", cfg) {
+		t.Fatal("trust0.100 should be treated as a configured VLAN sub-interface")
+	}
+	if isConfiguredVLANSubInterface("st0.1", cfg) {
+		t.Fatal("st0.1 must not be treated as a VLAN sub-interface")
+	}
+}
+
 func TestExpandFilterTermFlexMatch(t *testing.T) {
 	term := &config.FirewallFilterTerm{
 		Name:   "flex-test",

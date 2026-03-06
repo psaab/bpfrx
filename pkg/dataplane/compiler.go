@@ -430,6 +430,30 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, error) {
 	return link.Attrs().Index, nil
 }
 
+func isConfiguredVLANSubInterface(name string, cfg *config.Config) bool {
+	idx := strings.IndexByte(name, '.')
+	if idx < 0 {
+		return false
+	}
+	base := name[:idx]
+	suffix := name[idx+1:]
+	vid, err := strconv.Atoi(suffix)
+	if err != nil {
+		return false
+	}
+	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
+		if !ifCfg.VlanTagging || config.LinuxIfName(ifName) != base {
+			continue
+		}
+		for _, unit := range ifCfg.Units {
+			if unit.VlanID == vid {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // reconcileInterfaceAddresses ensures the interface has exactly the configured
 // addresses. Stale addresses are removed and missing ones are added.
 // Link-local (fe80::/10) addresses are left untouched since the kernel manages them.
@@ -1174,7 +1198,9 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 
 	// Set BridgeMaster on VLAN sub-interfaces that are bridge domain members.
 	for i, mi := range result.ManagedInterfaces {
-		// VLAN sub-interfaces have names like "trust0.100"
+		if !isConfiguredVLANSubInterface(mi.Name, cfg) {
+			continue
+		}
 		if idx := strings.IndexByte(mi.Name, '.'); idx >= 0 {
 			suffix := mi.Name[idx+1:]
 			if vid, err := strconv.Atoi(suffix); err == nil {
