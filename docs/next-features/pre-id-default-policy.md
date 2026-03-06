@@ -1,26 +1,26 @@
 # Next Feature: `security pre-id-default-policy`
 
 Date: 2026-03-02  
-Status: Proposed
+Status: Implemented
 
 ## Config Evidence
 - Present in `/home/ps/git/bpfrx/vsrx.conf:21128` as `pre-id-default-policy { ... }`
 
 ## Current State
 - Parsed into `SecurityConfig.PreIDDefaultPolicy`: `pkg/config/compiler.go`
-- Struct exists in `pkg/config/types.go`
-- Not referenced by policy evaluation or dataplane flow pipeline
+- Wired into flow config/runtime flags: `pkg/dataplane/compiler.go`, `bpf/xdp/xdp_policy.c`, `dpdk_worker/policy.c`
+- Session init/close logging is now applied to unknown-app sessions when AppID is enabled
 
 ## Problem
-When application identification is in progress, vSRX can apply explicit pre-ID default handling (including session-init/session-close logging). bpfrx currently ignores this policy at runtime.
+When application identification is in progress, vSRX can apply explicit pre-ID default handling. bpfrx now honors the configured logging behavior for unknown/pre-ID sessions instead of ignoring the stanza entirely.
 
 ## Proposed Implementation Scope
-1. Add pre-ID phase marker to new sessions when AppID is enabled.
-2. Apply `pre-id-default-policy` actions during pre-ID state (starting with logging parity).
-3. Transition to final policy decision once app is identified or timeout expires.
-4. Add counters for pre-ID decisions and transitions.
+1. Treat `app_id == 0` while AppID is enabled as the unknown/pre-ID state.
+2. OR the configured `session-init` / `session-close` flags into new sessions in that state.
+3. Preserve normal policy behavior for non-pre-ID sessions.
+4. Keep richer pre-ID transition/counter work as future follow-up if full DPI is added.
 
 ## Acceptance Criteria
 - `session-init` and `session-close` logging under pre-ID policy occurs when configured.
-- Pre-ID behavior is deterministic and transitions to normal policy once classification completes.
 - No behavior change when `pre-id-default-policy` is not configured.
+- Scope is explicit: this is unknown/pre-ID logging parity, not full staged DPI policy enforcement.

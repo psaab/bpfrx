@@ -335,6 +335,82 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	return 0;
 }
 
+static __always_inline __u32
+resolve_pkt_app_id(struct pkt_meta *meta)
+{
+	__u32 pkt_app_id = 0;
+	struct app_key ak = {
+		.protocol = meta->protocol,
+		.pad = 0,
+		.dst_port = meta->dst_port,
+	};
+	struct app_value *av = bpf_map_lookup_elem(&applications, &ak);
+
+	/* For ICMP/ICMPv6 echo, dst_port is the echo ID — fall back to
+	 * port-0 lookup for wildcard ICMP apps (e.g. junos-icmp-all). */
+	if (!av && meta->dst_port != 0 &&
+	    (meta->protocol == PROTO_ICMP || meta->protocol == PROTO_ICMPV6)) {
+		ak.dst_port = 0;
+		av = bpf_map_lookup_elem(&applications, &ak);
+	}
+	if (av) {
+		if (av->src_port_low != 0 || av->src_port_high != 0) {
+			__u16 sp = bpf_ntohs(meta->src_port);
+			if (sp >= av->src_port_low && sp <= av->src_port_high) {
+				pkt_app_id = av->app_id;
+				if (av->timeout > 0)
+					meta->app_timeout = av->timeout;
+			}
+		} else {
+			pkt_app_id = av->app_id;
+			if (av->timeout > 0)
+				meta->app_timeout = av->timeout;
+		}
+	}
+
+	if (pkt_app_id == 0) {
+		__u16 dp = bpf_ntohs(meta->dst_port);
+		__u16 sp = bpf_ntohs(meta->src_port);
+
+		#pragma unroll 1
+		for (__u32 ri = 0; ri < MAX_APP_RANGES; ri++) {
+			struct app_range_entry *ar =
+				bpf_map_lookup_elem(&app_ranges, &ri);
+			if (!ar || ar->app_id == 0)
+				break;
+
+			if (ar->protocol != 0 && ar->protocol != meta->protocol)
+				continue;
+			if (dp < ar->port_low || dp > ar->port_high)
+				continue;
+			if ((ar->src_port_low != 0 || ar->src_port_high != 0) &&
+			    (sp < ar->src_port_low || sp > ar->src_port_high))
+				continue;
+
+			pkt_app_id = ar->app_id;
+			if (ar->timeout > 0)
+				meta->app_timeout = ar->timeout;
+			break;
+		}
+	}
+
+	return pkt_app_id;
+}
+
+static __always_inline __u8
+preid_log_flags(struct flow_config *fc, __u32 pkt_app_id)
+{
+	__u8 log = 0;
+
+	if (!fc || !(fc->app_flags & FLOW_APPID_ENABLED) || pkt_app_id != 0)
+		return 0;
+	if (fc->app_flags & FLOW_PREID_LOG_SESSION_INIT)
+		log |= LOG_FLAG_SESSION_INIT;
+	if (fc->app_flags & FLOW_PREID_LOG_SESSION_CLOSE)
+		log |= LOG_FLAG_SESSION_CLOSE;
+	return log;
+}
+
 /*
  * Allocate a NAT IP and port from a pool (IPv4).
  * src_ip: original source IP for address-persistent mode.
@@ -1118,8 +1194,12 @@ int xdp_policy_prog(struct xdp_md *ctx)
 {
 	__u32 zero = 0;
 	struct pkt_meta *meta = bpf_map_lookup_elem(&pkt_meta_scratch, &zero);
+	struct flow_config *fc = bpf_map_lookup_elem(&flow_config_map, &zero);
 	if (!meta)
 		return XDP_DROP;
+
+	__u32 pkt_app_id = resolve_pkt_app_id(meta);
+	__u8 preid_log = preid_log_flags(fc, pkt_app_id);
 
 	/* Build zone-pair flat index for ARRAY lookup */
 	__u32 zp_idx = (__u32)meta->ingress_zone * MAX_ZONES +
@@ -1137,17 +1217,22 @@ int xdp_policy_prog(struct xdp_md *ctx)
 		__u8 *dp = bpf_map_lookup_elem(&default_policy, &dp_key);
 		if (dp && *dp == ACTION_PERMIT) {
 			if (meta->addr_family == AF_INET) {
-				if (create_session(meta, 0, 0, 0, 0, 0, 0, 0, 0) < 0) {
+				if (create_session(meta, 0, preid_log, 0, 0, 0, 0, 0,
+						   (__u16)pkt_app_id) < 0) {
 					inc_counter(GLOBAL_CTR_DROPS);
 					return XDP_DROP;
 				}
 			} else {
 				__u8 zero_ip[16] = {};
-				if (create_session_v6(meta, 0, 0, 0, zero_ip, 0, zero_ip, 0, 0) < 0) {
+				if (create_session_v6(meta, 0, preid_log, 0, zero_ip, 0,
+						      zero_ip, 0, (__u16)pkt_app_id) < 0) {
 					inc_counter(GLOBAL_CTR_DROPS);
 					return XDP_DROP;
 				}
 			}
+			if (preid_log & LOG_FLAG_SESSION_INIT)
+				emit_event(meta, EVENT_TYPE_SESSION_OPEN,
+					   ACTION_PERMIT, 0, 0, 0);
 			bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
 			return XDP_PASS;
 		}
@@ -1174,67 +1259,6 @@ int xdp_policy_prog(struct xdp_md *ctx)
 		}
 		inc_counter(GLOBAL_CTR_POLICY_DENY);
 		return XDP_DROP;
-	}
-
-	/* Resolve application ID from (protocol, dst_port) */
-	__u32 pkt_app_id = 0;
-	struct app_key ak = {
-		.protocol = meta->protocol,
-		.pad = 0,
-		.dst_port = meta->dst_port,
-	};
-	struct app_value *av = bpf_map_lookup_elem(&applications, &ak);
-	/* For ICMP/ICMPv6 echo, dst_port is the echo ID — fall back to
-	 * port-0 lookup for wildcard ICMP apps (e.g. junos-icmp-all). */
-	if (!av && meta->dst_port != 0 &&
-	    (meta->protocol == PROTO_ICMP || meta->protocol == PROTO_ICMPV6)) {
-		ak.dst_port = 0;
-		av = bpf_map_lookup_elem(&applications, &ak);
-	}
-	if (av) {
-		/* Check source port range if specified (stored in host byte order) */
-		if (av->src_port_low != 0 || av->src_port_high != 0) {
-			__u16 sp = bpf_ntohs(meta->src_port);
-			if (sp >= av->src_port_low && sp <= av->src_port_high) {
-				pkt_app_id = av->app_id;
-				if (av->timeout > 0)
-					meta->app_timeout = av->timeout;
-			}
-		} else {
-			pkt_app_id = av->app_id;
-			if (av->timeout > 0)
-				meta->app_timeout = av->timeout;
-		}
-	}
-
-	/* Fallback: check range-based application entries when exact HASH
-	 * lookup missed.  The app_ranges ARRAY holds entries with port
-	 * ranges that were too large to expand per-port in the HASH map. */
-	if (pkt_app_id == 0) {
-		__u16 dp = bpf_ntohs(meta->dst_port);
-		__u16 sp = bpf_ntohs(meta->src_port);
-
-		#pragma unroll 1
-		for (__u32 ri = 0; ri < MAX_APP_RANGES; ri++) {
-			struct app_range_entry *ar =
-				bpf_map_lookup_elem(&app_ranges, &ri);
-			if (!ar || ar->app_id == 0)
-				break; /* sentinel: end of populated entries */
-
-			if (ar->protocol != 0 &&
-			    ar->protocol != meta->protocol)
-				continue;
-			if (dp < ar->port_low || dp > ar->port_high)
-				continue;
-			if ((ar->src_port_low != 0 || ar->src_port_high != 0) &&
-			    (sp < ar->src_port_low || sp > ar->src_port_high))
-				continue;
-
-			pkt_app_id = ar->app_id;
-			if (ar->timeout > 0)
-				meta->app_timeout = ar->timeout;
-			break;
-		}
 	}
 
 	/* Iterate policy rules */
@@ -1293,6 +1317,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 		/* Rule matches! */
 		meta->policy_id = rule->rule_id;
 		inc_policy_counter(rule->rule_id, meta->pkt_len);
+		__u8 sess_log = rule->log | preid_log;
 
 		if (rule->action == ACTION_PERMIT) {
 			if (meta->addr_family == AF_INET) {
@@ -1419,7 +1444,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				}
 
 				/* Create session with pre-NAT addresses */
-				if (create_session(meta, rule->rule_id, rule->log,
+				if (create_session(meta, rule->rule_id, sess_log,
 						   sess_nat_flags,
 						   sess_nat_src_ip, sess_nat_src_port,
 						   sess_nat_dst_ip, sess_nat_dst_port,
@@ -1448,7 +1473,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 				TRACE_POLICY(meta, ACTION_PERMIT, rule->rule_id);
 
-				if (rule->log & LOG_FLAG_SESSION_INIT)
+				if (sess_log & LOG_FLAG_SESSION_INIT)
 					emit_event(meta, EVENT_TYPE_SESSION_OPEN,
 						   ACTION_PERMIT, 0, 0, 0);
 
@@ -1520,7 +1545,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 							const __u8 *nat_dst_ptr = (meta->nat_flags & SESS_FLAG_DNAT) ?
 								meta->nat_dst_ip.v6 : NULL;
-							if (create_session_v6(meta, rule->rule_id, rule->log,
+							if (create_session_v6(meta, rule->rule_id, sess_log,
 									      sess_nat_flags,
 									      meta->nat_src_ip.v6, alloc_v4_port,
 									      nat_dst_ptr, sess_nat_dst_port,
@@ -1536,7 +1561,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 							meta->src_ip.v4 = alloc_v4_ip;
 							meta->src_port = alloc_v4_port;
 
-							if (rule->log & LOG_FLAG_SESSION_INIT)
+							if (sess_log & LOG_FLAG_SESSION_INIT)
 								emit_event(meta, EVENT_TYPE_SESSION_OPEN,
 									   ACTION_PERMIT, 0, 0, 0);
 
@@ -1698,7 +1723,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					meta->nat_dst_ip.v6 : NULL;
 
 				/* Create session with pre-NAT addresses */
-				if (create_session_v6(meta, rule->rule_id, rule->log,
+				if (create_session_v6(meta, rule->rule_id, sess_log,
 						      sess_nat_flags,
 						      nat_src_ptr, sess_nat_src_port,
 						      nat_dst_ptr, sess_nat_dst_port,
@@ -1722,7 +1747,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					meta->src_port = sess_nat_src_port;
 				}
 
-				if (rule->log & LOG_FLAG_SESSION_INIT)
+				if (sess_log & LOG_FLAG_SESSION_INIT)
 					emit_event(meta, EVENT_TYPE_SESSION_OPEN,
 						   ACTION_PERMIT, 0, 0, 0);
 
@@ -1788,17 +1813,22 @@ int xdp_policy_prog(struct xdp_md *ctx)
 	/* No rule matched: apply default action */
 	if (ps->default_action == ACTION_PERMIT) {
 		if (meta->addr_family == AF_INET) {
-			if (create_session(meta, 0, 0, 0, 0, 0, 0, 0, (__u16)pkt_app_id) < 0) {
+			if (create_session(meta, 0, preid_log, 0, 0, 0, 0, 0,
+					   (__u16)pkt_app_id) < 0) {
 				inc_counter(GLOBAL_CTR_DROPS);
 				return XDP_DROP;
 			}
 		} else {
 			__u8 zero_ip[16] = {};
-			if (create_session_v6(meta, 0, 0, 0, zero_ip, 0, zero_ip, 0, (__u16)pkt_app_id) < 0) {
+			if (create_session_v6(meta, 0, preid_log, 0, zero_ip, 0,
+					      zero_ip, 0, (__u16)pkt_app_id) < 0) {
 				inc_counter(GLOBAL_CTR_DROPS);
 				return XDP_DROP;
 			}
 		}
+		if (preid_log & LOG_FLAG_SESSION_INIT)
+			emit_event(meta, EVENT_TYPE_SESSION_OPEN,
+				   ACTION_PERMIT, 0, 0, 0);
 		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
 		return XDP_PASS;
 	}

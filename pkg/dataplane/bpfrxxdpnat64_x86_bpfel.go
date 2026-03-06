@@ -180,7 +180,7 @@ type bpfrxXdpNat64FlowConfig struct {
 	Lo0FilterV4       uint16
 	Lo0FilterV6       uint16
 	TcpFlags          uint8
-	PadFc             uint8
+	AppFlags          uint8
 }
 
 type bpfrxXdpNat64IfaceCounterValue struct {

@@ -62,6 +62,81 @@ lpm_lookup_addr_id(struct pipeline_ctx *ctx, struct pkt_meta *meta,
 	return (next_hop == required_id) ? required_id : 0;
 }
 
+static inline uint32_t
+resolve_pkt_app_id(struct pipeline_ctx *ctx, struct pkt_meta *meta)
+{
+	uint32_t pkt_app_id = 0;
+
+	if (ctx->shm->applications && ctx->shm->app_values) {
+		struct app_key ak = {
+			.protocol = meta->protocol,
+			.dst_port = meta->dst_port,
+		};
+		int apos = rte_hash_lookup(ctx->shm->applications, &ak);
+		if (apos < 0 && meta->dst_port != 0 &&
+		    (meta->protocol == PROTO_ICMP || meta->protocol == PROTO_ICMPV6)) {
+			ak.dst_port = 0;
+			apos = rte_hash_lookup(ctx->shm->applications, &ak);
+		}
+		if (apos >= 0) {
+			struct app_value *av = &ctx->shm->app_values[apos];
+			if (av->src_port_low != 0 || av->src_port_high != 0) {
+				uint16_t sp = rte_be_to_cpu_16(meta->src_port);
+				if (sp >= av->src_port_low && sp <= av->src_port_high) {
+					pkt_app_id = av->app_id;
+					if (av->timeout > 0)
+						meta->app_timeout = av->timeout;
+				}
+			} else {
+				pkt_app_id = av->app_id;
+				if (av->timeout > 0)
+					meta->app_timeout = av->timeout;
+			}
+		}
+	}
+
+	if (pkt_app_id == 0 && ctx->shm->app_ranges) {
+		uint16_t dp = rte_be_to_cpu_16(meta->dst_port);
+		uint16_t sp = rte_be_to_cpu_16(meta->src_port);
+
+		for (uint32_t i = 0; i < MAX_APP_RANGES; i++) {
+			struct app_range_entry *ar = &ctx->shm->app_ranges[i];
+			if (ar->app_id == 0)
+				break;
+			if (ar->protocol != 0 && ar->protocol != meta->protocol)
+				continue;
+			if (dp < ar->port_low || dp > ar->port_high)
+				continue;
+			if ((ar->src_port_low != 0 || ar->src_port_high != 0) &&
+			    (sp < ar->src_port_low || sp > ar->src_port_high))
+				continue;
+
+			pkt_app_id = ar->app_id;
+			if (ar->timeout > 0)
+				meta->app_timeout = ar->timeout;
+			break;
+		}
+	}
+
+	return pkt_app_id;
+}
+
+static inline uint8_t
+preid_log_flags(struct pipeline_ctx *ctx, uint32_t pkt_app_id)
+{
+	uint8_t log = 0;
+
+	if (!ctx->shm->flow_config ||
+	    !(ctx->shm->flow_config->app_flags & FLOW_APPID_ENABLED) ||
+	    pkt_app_id != 0)
+		return 0;
+	if (ctx->shm->flow_config->app_flags & FLOW_PREID_LOG_SESSION_INIT)
+		log |= LOG_FLAG_SESSION_INIT;
+	if (ctx->shm->flow_config->app_flags & FLOW_PREID_LOG_SESSION_CLOSE)
+		log |= LOG_FLAG_SESSION_CLOSE;
+	return log;
+}
+
 /**
  * policy_check — Check zone-pair policies for this packet.
  *
@@ -100,6 +175,10 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		if (pos >= 0 && ctx->shm->zone_pair_values)
 			ps = &ctx->shm->zone_pair_values[pos];
 	}
+
+	uint32_t pkt_app_id = resolve_pkt_app_id(ctx, meta);
+	meta->app_id = (uint16_t)pkt_app_id;
+	meta->log_flags = preid_log_flags(ctx, pkt_app_id);
 
 	/* No policy at all — use default */
 	if (!ps) {
@@ -144,33 +223,12 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 				continue;
 		}
 
-		/* Application match */
-		if (rule->app_id != 0 && ctx->shm->applications) {
-			struct app_key ak = {
-				.protocol = meta->protocol,
-				.dst_port = meta->dst_port,
-			};
-			int apos = rte_hash_lookup(ctx->shm->applications, &ak);
-			if (apos < 0 || !ctx->shm->app_values)
-				continue;
-			struct app_value *av = &ctx->shm->app_values[apos];
-			/* Check source port range if specified */
-			if (av->src_port_low != 0 || av->src_port_high != 0) {
-				uint16_t sp = rte_be_to_cpu_16(meta->src_port);
-				if (sp < av->src_port_low || sp > av->src_port_high)
-					continue;
-			}
-			if (av->app_id != rule->app_id)
-				continue;
-
-			/* Store app timeout if set */
-			if (av->timeout > 0)
-				meta->app_timeout = av->timeout;
-		}
+		if (rule->app_id != 0 && rule->app_id != pkt_app_id)
+			continue;
 
 		/* Match found */
 		meta->policy_id = rule->rule_id;
-		meta->log_flags = rule->log;
+		meta->log_flags = rule->log | preid_log_flags(ctx, pkt_app_id);
 
 		/* Counter */
 		if (rule->counter_id != 0)
@@ -452,6 +510,7 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 	}
 
 	/* No rule matched — default action from policy set */
+	meta->log_flags = preid_log_flags(ctx, pkt_app_id);
 	if (ps->default_action != ACTION_PERMIT)
 		ctr_global_inc(ctx, GLOBAL_CTR_POLICY_DENY);
 	return ps->default_action;

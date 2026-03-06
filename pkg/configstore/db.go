@@ -101,6 +101,10 @@ func (db *DB) readTree(path string) (*config.ConfigTree, error) {
 		}
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
+	data, err = db.maybeDecryptTreeJSON(data)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt %s: %w", path, err)
+	}
 
 	tree := &config.ConfigTree{}
 	if err := json.Unmarshal(data, tree); err != nil {
@@ -115,6 +119,10 @@ func (db *DB) writeTree(path string, tree *config.ConfigTree) error {
 	data, err := json.MarshalIndent(tree, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
+	}
+	data, err = db.maybeEncryptTreeJSON(data, tree)
+	if err != nil {
+		return fmt.Errorf("encrypt config: %w", err)
 	}
 
 	tmp := path + ".tmp"

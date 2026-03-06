@@ -64,6 +64,12 @@ emit_event(struct pipeline_ctx *ctx, struct pkt_meta *meta,
 	ev->nat_src_port = 0;
 	ev->nat_dst_port = 0;
 	ev->created = 0;
+	ev->rev_packets = 0;
+	ev->rev_bytes = 0;
+	ev->ingress_ifindex = meta->ingress_ifindex;
+	ev->app_id = meta->app_id;
+	ev->close_reason = 0;
+	ev->pad_event = 0;
 
 	if (rte_ring_enqueue(ctx->shm->event_ring, ev) != 0)
 		rte_free(ev);  /* Ring full — drop silently */
@@ -77,7 +83,9 @@ emit_event(struct pipeline_ctx *ctx, struct pkt_meta *meta,
 static inline void
 emit_event_with_stats(struct pipeline_ctx *ctx, struct pkt_meta *meta,
                       uint8_t event_type, uint8_t action,
-                      uint64_t packets, uint64_t bytes)
+                      uint64_t packets, uint64_t bytes,
+                      uint64_t rev_packets, uint64_t rev_bytes,
+                      uint8_t close_reason)
 {
 	if (!ctx->shm->event_ring)
 		return;
@@ -108,6 +116,12 @@ emit_event_with_stats(struct pipeline_ctx *ctx, struct pkt_meta *meta,
 	ev->nat_src_port = 0;
 	ev->nat_dst_port = 0;
 	ev->created = 0;
+	ev->rev_packets = rev_packets;
+	ev->rev_bytes = rev_bytes;
+	ev->ingress_ifindex = meta->ingress_ifindex;
+	ev->app_id = meta->app_id;
+	ev->close_reason = close_reason;
+	ev->pad_event = 0;
 
 	if (rte_ring_enqueue(ctx->shm->event_ring, ev) != 0)
 		rte_free(ev);

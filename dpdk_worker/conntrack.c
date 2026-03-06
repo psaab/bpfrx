@@ -472,10 +472,14 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 					meta->ingress_zone = sv->ingress_zone;
 					meta->egress_zone = sv->egress_zone;
 					meta->policy_id = sv->policy_id;
+					meta->app_id = sv->app_id;
 					emit_event_with_stats(ctx, meta, EVENT_TYPE_SESSION_CLOSE,
 					                      ACTION_PERMIT,
 					                      sv->fwd_packets + sv->rev_packets,
-					                      sv->fwd_bytes + sv->rev_bytes);
+					                      sv->fwd_bytes + sv->rev_bytes,
+					                      sv->rev_packets, sv->rev_bytes,
+					                      (meta->tcp_flags & 0x04) ? CLOSE_REASON_TCPRST :
+					                      CLOSE_REASON_TCPFIN);
 				}
 			}
 
@@ -495,6 +499,7 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			meta->ingress_zone = sv->ingress_zone;
 			meta->egress_zone = sv->egress_zone;
 			meta->log_flags = sv->log_flags;
+			meta->app_id = sv->app_id;
 
 			/* NAT info */
 			meta->nat_flags = sv->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT | SESS_FLAG_STATIC_NAT | SESS_FLAG_NAT64);
@@ -570,10 +575,14 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 					meta->ingress_zone = sv->egress_zone;
 					meta->egress_zone = sv->ingress_zone;
 					meta->policy_id = sv->policy_id;
+					meta->app_id = sv->app_id;
 					emit_event_with_stats(ctx, meta, EVENT_TYPE_SESSION_CLOSE,
 					                      ACTION_PERMIT,
 					                      sv->fwd_packets + sv->rev_packets,
-					                      sv->fwd_bytes + sv->rev_bytes);
+					                      sv->fwd_bytes + sv->rev_bytes,
+					                      sv->rev_packets, sv->rev_bytes,
+					                      (meta->tcp_flags & 0x04) ? CLOSE_REASON_TCPRST :
+					                      CLOSE_REASON_TCPFIN);
 				}
 			}
 
@@ -586,6 +595,7 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			meta->ingress_zone = sv->egress_zone;  /* Swap for reverse */
 			meta->egress_zone = sv->ingress_zone;
 			meta->log_flags = sv->log_flags;
+			meta->app_id = sv->app_id;
 
 			meta->nat_flags = sv->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT | SESS_FLAG_STATIC_NAT | SESS_FLAG_NAT64);
 			/* For reverse direction, swap NAT src/dst */
@@ -661,10 +671,14 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 					meta->ingress_zone = sv->ingress_zone;
 					meta->egress_zone = sv->egress_zone;
 					meta->policy_id = sv->policy_id;
+					meta->app_id = sv->app_id;
 					emit_event_with_stats(ctx, meta, EVENT_TYPE_SESSION_CLOSE,
 					                      ACTION_PERMIT,
 					                      sv->fwd_packets + sv->rev_packets,
-					                      sv->fwd_bytes + sv->rev_bytes);
+					                      sv->fwd_bytes + sv->rev_bytes,
+					                      sv->rev_packets, sv->rev_bytes,
+					                      (meta->tcp_flags & 0x04) ? CLOSE_REASON_TCPRST :
+					                      CLOSE_REASON_TCPFIN);
 				}
 			}
 
@@ -682,6 +696,7 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			meta->ingress_zone = sv->ingress_zone;
 			meta->egress_zone = sv->egress_zone;
 			meta->log_flags = sv->log_flags;
+			meta->app_id = sv->app_id;
 
 			meta->nat_flags = sv->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT | SESS_FLAG_STATIC_NAT | SESS_FLAG_NAT64);
 			memcpy(meta->nat_src_ip.v6, sv->nat_src_ip, 16);
@@ -752,10 +767,14 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 					meta->ingress_zone = sv->egress_zone;
 					meta->egress_zone = sv->ingress_zone;
 					meta->policy_id = sv->policy_id;
+					meta->app_id = sv->app_id;
 					emit_event_with_stats(ctx, meta, EVENT_TYPE_SESSION_CLOSE,
 					                      ACTION_PERMIT,
 					                      sv->fwd_packets + sv->rev_packets,
-					                      sv->fwd_bytes + sv->rev_bytes);
+					                      sv->fwd_bytes + sv->rev_bytes,
+					                      sv->rev_packets, sv->rev_bytes,
+					                      (meta->tcp_flags & 0x04) ? CLOSE_REASON_TCPRST :
+					                      CLOSE_REASON_TCPFIN);
 				}
 			}
 			sv->rev_packets++;
@@ -766,6 +785,7 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			meta->ingress_zone = sv->egress_zone;  /* Swap for reverse */
 			meta->egress_zone = sv->ingress_zone;
 			meta->log_flags = sv->log_flags;
+			meta->app_id = sv->app_id;
 
 			meta->nat_flags = sv->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT | SESS_FLAG_STATIC_NAT | SESS_FLAG_NAT64);
 			/* For reverse direction, swap NAT src/dst */
@@ -853,6 +873,7 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		fwd_val.nat_src_port = meta->nat_src_port;
 		fwd_val.nat_dst_port = meta->nat_dst_port;
 		fwd_val.log_flags = meta->log_flags;
+		fwd_val.app_id = meta->app_id;
 		fwd_val.app_timeout = meta->app_timeout;
 		fwd_val.is_reverse = 0;
 
@@ -899,7 +920,8 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		}
 		ctx->shm->session_values_v4[rpos] = rev_val;
 
-		emit_event(ctx, meta, EVENT_TYPE_SESSION_OPEN, ACTION_PERMIT);
+		if (meta->log_flags & LOG_FLAG_SESSION_INIT)
+			emit_event(ctx, meta, EVENT_TYPE_SESSION_OPEN, ACTION_PERMIT);
 
 	} else if (meta->addr_family == AF_INET6) {
 		if (!ctx->shm->sessions_v6 || !ctx->shm->session_values_v6)
@@ -945,6 +967,7 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		fwd_val6.nat_src_port = meta->nat_src_port;
 		fwd_val6.nat_dst_port = meta->nat_dst_port;
 		fwd_val6.log_flags = meta->log_flags;
+		fwd_val6.app_id = meta->app_id;
 		fwd_val6.app_timeout = meta->app_timeout;
 		fwd_val6.is_reverse = 0;
 
@@ -988,7 +1011,8 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		}
 		ctx->shm->session_values_v6[rpos] = rev_val6;
 
-		emit_event(ctx, meta, EVENT_TYPE_SESSION_OPEN, ACTION_PERMIT);
+		if (meta->log_flags & LOG_FLAG_SESSION_INIT)
+			emit_event(ctx, meta, EVENT_TYPE_SESSION_OPEN, ACTION_PERMIT);
 	}
 
 	return 0;

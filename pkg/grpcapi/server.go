@@ -29,6 +29,7 @@ import (
 
 	"github.com/vishvananda/netlink"
 
+	"github.com/psaab/bpfrx/pkg/appid"
 	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/psaab/bpfrx/pkg/cmdtree"
 	"github.com/psaab/bpfrx/pkg/config"
@@ -774,17 +775,6 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	appFilter := req.Application
 	cfg := s.store.ActiveConfig()
 
-	// Resolve application filter to proto+port for efficient matching
-	var appProto uint8
-	var appPort uint16
-	if appFilter != "" {
-		var ok bool
-		appProto, appPort, ok = lookupAppFilter(appFilter, cfg)
-		if !ok {
-			return &pb.GetSessionsResponse{}, nil // unknown app, no matches
-		}
-	}
-
 	// Parse CIDR prefix filters
 	var srcNet, dstNet *net.IPNet
 	if req.SourcePrefix != "" {
@@ -818,11 +808,13 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	zoneNames := make(map[uint16]string)
 	zoneIfaces := make(map[uint16]string) // zone ID → first interface name
 	var policyNames map[uint32]string
+	var appNames map[uint16]string
 	if cr := s.dp.LastCompileResult(); cr != nil {
 		for name, id := range cr.ZoneIDs {
 			zoneNames[id] = name
 		}
 		policyNames = cr.PolicyNames
+		appNames = cr.AppNames
 	}
 	if cfg != nil {
 		for zoneName, zone := range cfg.Security.Zones {
@@ -866,7 +858,8 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 		if natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
 			return true
 		}
-		if appFilter != "" && (key.Protocol != appProto || ntohs(key.DstPort) != appPort) {
+		if appFilter != "" && !appid.SessionMatches(appFilter, appNames, cfg,
+			key.Protocol, ntohs(key.DstPort), val.AppID) {
 			return true
 		}
 		if idx >= offset && len(all) < limit {
@@ -880,7 +873,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 				val.FwdBytes += rev.FwdBytes
 			}
 			se := sessionEntryV4(key, val, now, zoneNames, policyNames, zoneIfaces, haActive)
-			se.Application = resolveAppName(key.Protocol, ntohs(key.DstPort), cfg)
+			se.Application = appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
 			all = append(all, se)
 		}
 		idx++
@@ -913,7 +906,8 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 		if natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
 			return true
 		}
-		if appFilter != "" && (key.Protocol != appProto || ntohs(key.DstPort) != appPort) {
+		if appFilter != "" && !appid.SessionMatches(appFilter, appNames, cfg,
+			key.Protocol, ntohs(key.DstPort), val.AppID) {
 			return true
 		}
 		if idx >= offset && len(all) < limit {
@@ -924,7 +918,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 				val.FwdBytes += rev.FwdBytes
 			}
 			se := sessionEntryV6(key, val, now, zoneNames, policyNames, zoneIfaces, haActive)
-			se.Application = resolveAppName(key.Protocol, ntohs(key.DstPort), cfg)
+			se.Application = appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
 			all = append(all, se)
 		}
 		idx++
@@ -2452,15 +2446,10 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 		proto = 1
 	}
 
-	var clearAppProto uint8
-	var clearAppPort uint16
-	if req.Application != "" {
-		clearCfg := s.store.ActiveConfig()
-		var ok bool
-		clearAppProto, clearAppPort, ok = lookupAppFilter(req.Application, clearCfg)
-		if !ok {
-			return &pb.ClearSessionsResponse{}, nil
-		}
+	clearCfg := s.store.ActiveConfig()
+	var appNames map[uint16]string
+	if cr := s.dp.LastCompileResult(); cr != nil {
+		appNames = cr.AppNames
 	}
 
 	var zoneID uint16
@@ -2497,7 +2486,8 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 		if req.DestinationPort != 0 && key.DstPort != uint16(req.DestinationPort) {
 			return true
 		}
-		if req.Application != "" && (key.Protocol != clearAppProto || ntohs(key.DstPort) != clearAppPort) {
+		if req.Application != "" && !appid.SessionMatches(req.Application, appNames, clearCfg,
+			key.Protocol, ntohs(key.DstPort), val.AppID) {
 			return true
 		}
 		v4Keys = append(v4Keys, key)
@@ -2558,7 +2548,8 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 		if req.DestinationPort != 0 && key.DstPort != uint16(req.DestinationPort) {
 			return true
 		}
-		if req.Application != "" && (key.Protocol != clearAppProto || ntohs(key.DstPort) != clearAppPort) {
+		if req.Application != "" && !appid.SessionMatches(req.Application, appNames, clearCfg,
+			key.Protocol, ntohs(key.DstPort), val.AppID) {
 			return true
 		}
 		v6Keys = append(v6Keys, key)
@@ -5189,6 +5180,10 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 					zoneNames[id] = name
 				}
 			}
+			var appNames map[uint16]string
+			if cr := s.dp.LastCompileResult(); cr != nil {
+				appNames = cr.AppNames
+			}
 			var entries []topEntry
 
 			_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
@@ -5212,7 +5207,7 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 					dst:      fmt.Sprintf("%s:%d", net.IP(key.DstIP[:]), ntohs(key.DstPort)),
 					proto:    protoName(key.Protocol),
 					zone:     inZ + "->" + outZ,
-					app:      resolveAppName(key.Protocol, ntohs(key.DstPort), cfg),
+					app:      appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.DstPort), val.AppID),
 					fwdPkts:  val.FwdPackets,
 					revPkts:  val.RevPackets,
 					fwdBytes: val.FwdBytes,
@@ -5243,7 +5238,7 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 					dst:      fmt.Sprintf("[%s]:%d", net.IP(key.DstIP[:]), ntohs(key.DstPort)),
 					proto:    protoName(key.Protocol),
 					zone:     inZ + "->" + outZ,
-					app:      resolveAppName(key.Protocol, ntohs(key.DstPort), cfg),
+					app:      appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.DstPort), val.AppID),
 					fwdPkts:  val.FwdPackets,
 					revPkts:  val.RevPackets,
 					fwdBytes: val.FwdBytes,

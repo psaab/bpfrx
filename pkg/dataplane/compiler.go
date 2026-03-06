@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/psaab/bpfrx/pkg/appid"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/networkd"
 	"github.com/vishvananda/netlink"
@@ -1411,37 +1412,10 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 	appID := uint32(1)
 	userApps := cfg.Applications.Applications
 
-	// Collect all referenced application names from policies,
-	// expanding application-sets to individual apps.
-	referenced := make(map[string]bool)
-	for _, zpp := range cfg.Security.Policies {
-		for _, pol := range zpp.Policies {
-			for _, appName := range pol.Match.Applications {
-				if appName == "any" {
-					continue
-				}
-				// Check if it's an application-set
-				if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
-					expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications)
-					if err != nil {
-						return fmt.Errorf("expand application-set %q: %w", appName, err)
-					}
-					for _, a := range expanded {
-						referenced[a] = true
-					}
-				} else {
-					referenced[appName] = true
-				}
-			}
-		}
+	refNames, err := appid.CatalogNames(cfg, cfg.Services.ApplicationIdentification)
+	if err != nil {
+		return err
 	}
-
-	// Sort for deterministic app IDs across restarts.
-	refNames := make([]string, 0, len(referenced))
-	for name := range referenced {
-		refNames = append(refNames, name)
-	}
-	sort.Strings(refNames)
 	for _, appName := range refNames {
 		app, found := config.ResolveApplication(appName, userApps)
 		if !found {
@@ -3194,6 +3168,18 @@ func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) 
 		}
 	}
 
+	if cfg.Services.ApplicationIdentification {
+		fc.AppFlags |= 0x01
+	}
+	if cfg.Security.PreIDDefaultPolicy != nil {
+		if cfg.Security.PreIDDefaultPolicy.LogSessionInit {
+			fc.AppFlags |= 0x02
+		}
+		if cfg.Security.PreIDDefaultPolicy.LogSessionClose {
+			fc.AppFlags |= 0x04
+		}
+	}
+
 	// Lo0 filter IDs for host-bound traffic filtering (0xFFFF = none)
 	if result.Lo0FilterV4 != 0xFFFFFFFF {
 		fc.Lo0FilterV4 = uint16(result.Lo0FilterV4)
@@ -3217,6 +3203,7 @@ func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) 
 		"allow_dns_reply", fc.AllowDNSReply,
 		"allow_embedded_icmp", fc.AllowEmbeddedICMP,
 		"tcp_flags", fc.TCPFlags,
+		"app_flags", fc.AppFlags,
 		"lo0_filter_v4", fc.Lo0FilterV4,
 		"lo0_filter_v6", fc.Lo0FilterV6)
 

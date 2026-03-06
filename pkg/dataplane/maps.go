@@ -890,7 +890,7 @@ type FlowConfigValue struct {
 	Lo0FilterV4       uint16 // filter ID for lo0 inet input (0xFFFF=none)
 	Lo0FilterV6       uint16 // filter ID for lo0 inet6 input (0xFFFF=none)
 	TCPFlags          uint8  // bit 0: no-syn-check, bit 1: rst-invalidate-session
-	PadFC             uint8
+	AppFlags          uint8  // bit 0: AppID enabled, bit 1: pre-ID session-init log, bit 2: pre-ID session-close log
 }
 
 // Lo0FilterNone is the sentinel value meaning no lo0 filter configured.

@@ -75,6 +75,7 @@ struct iface_zone_value {
  * zone is encoded in byte[5].
  * Mirrors FABRIC_ZONE_MAC_MAGIC in bpf/headers/bpfrx_common.h. */
 #define FABRIC_ZONE_MAC_MAGIC 0xfe
+#define MAX_APP_RANGES        32
 
 /* Reverse mapping: sub-interface -> parent */
 struct vlan_iface_info {
@@ -188,7 +189,7 @@ struct session_value {
 
 	uint8_t  alg_type;
 	uint8_t  log_flags;
-	uint16_t pad_sv;
+	uint16_t app_id;
 
 	uint32_t fib_ifindex;
 	uint16_t fib_vlan_id;
@@ -237,7 +238,7 @@ struct session_value_v6 {
 
 	uint8_t  alg_type;
 	uint8_t  log_flags;
-	uint16_t pad_sv6;
+	uint16_t app_id;
 
 	uint32_t fib_ifindex;
 	uint16_t fib_vlan_id;
@@ -317,6 +318,18 @@ struct app_value {
 	uint32_t timeout;       /* inactivity timeout override (seconds), 0=default */
 	uint16_t src_port_low;  /* source port range low (0=any) */
 	uint16_t src_port_high; /* source port range high (0=any) */
+};
+
+struct app_range_entry {
+	uint8_t  protocol;
+	uint8_t  alg_type;
+	uint16_t port_low;
+	uint16_t port_high;
+	uint16_t src_port_low;
+	uint16_t src_port_high;
+	uint16_t pad;
+	uint32_t app_id;
+	uint32_t timeout;
 };
 
 /* ============================================================
@@ -646,12 +659,17 @@ struct flow_config {
 	uint16_t lo0_filter_v6;
 	uint8_t  tcp_flags;       /* bit 0: no-syn-check, bit 1: rst-invalidate,
 	                             bit 2: no-syn-check-in-tunnel */
-	uint8_t  pad_fc;
+	uint8_t  app_flags;       /* bit 0: AppID enabled,
+	                             bit 1: pre-ID log session-init,
+	                             bit 2: pre-ID log session-close */
 };
 
 #define FLOW_TCP_NO_SYN_CHECK          (1 << 0)
 #define FLOW_TCP_RST_INVALIDATE        (1 << 1)
 #define FLOW_TCP_NO_SYN_CHECK_TUNNEL   (1 << 2)
+#define FLOW_APPID_ENABLED             (1 << 0)
+#define FLOW_PREID_LOG_SESSION_INIT    (1 << 1)
+#define FLOW_PREID_LOG_SESSION_CLOSE   (1 << 2)
 
 /* ============================================================
  * FIB next-hop entry (populated by Go control plane)
@@ -681,6 +699,13 @@ struct fib_nexthop {
 #define EVENT_TYPE_FILTER_LOG    6
 #define EVENT_TYPE_PACKET_TRACE  7
 
+#define CLOSE_REASON_NONE    0
+#define CLOSE_REASON_TIMEOUT 1
+#define CLOSE_REASON_TCPFIN  2
+#define CLOSE_REASON_TCPRST  3
+#define CLOSE_REASON_AGE_OUT 4
+#define CLOSE_REASON_POLICY  5
+
 struct event {
 	uint64_t timestamp;
 	uint8_t  src_ip[16];
@@ -702,6 +727,12 @@ struct event {
 	uint16_t nat_src_port;
 	uint16_t nat_dst_port;
 	uint32_t created;      /* session creation time (seconds since boot) */
+	uint64_t rev_packets;
+	uint64_t rev_bytes;
+	uint32_t ingress_ifindex;
+	uint16_t app_id;
+	uint8_t  close_reason;
+	uint8_t  pad_event;
 };
 
 /* ============================================================
@@ -769,8 +800,10 @@ struct pkt_meta {
 
 	uint16_t pad_at;
 	uint32_t app_timeout;
+	uint16_t app_id;
 	uint8_t  log_flags;
-	uint8_t  meta_pad[3];
+	uint8_t  meta_pad;
+	uint16_t meta_pad2;
 };
 
 /* ============================================================
@@ -848,6 +881,7 @@ struct shared_memory {
 	struct iface_zone_value *iface_zone_values;
 	struct policy_set       *zone_pair_values;
 	struct app_value        *app_values;
+	struct app_range_entry  *app_ranges;
 	struct dnat_value       *dnat_values;
 	struct dnat_value_v6    *dnat_values_v6;
 	struct snat_value       *snat_values_v4;

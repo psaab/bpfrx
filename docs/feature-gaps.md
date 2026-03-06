@@ -7,7 +7,7 @@ Last updated: 2026-03-06
 | Category | Fully Missing | Partially Implemented | Parse-Only | Total Gaps |
 |----------|--------------|----------------------|------------|------------|
 | Security Policies (Unified/Advanced) | 7 | 0 | 1 | 8 |
-| Application Security (AppSecure) | 7 | 0 | 1 | 8 |
+| Application Security (AppSecure) | 7 | 1 | 0 | 8 |
 | IDP/IPS | 8 | 0 | 0 | 8 |
 | Content Security (UTM) | 6 | 0 | 0 | 6 |
 | SSL/TLS Inspection | 4 | 0 | 0 | 4 |
@@ -27,9 +27,9 @@ Last updated: 2026-03-06
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
 | Management & Automation | 9 | 2 | 0 | 11 |
 | Interface Enhancements | 1 | 1 | 0 | 2 |
-| System Enhancements | 5 | 0 | 1 | 6 |
+| System Enhancements | 5 | 0 | 0 | 5 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **120** | **12** | **3** | **135** |
+| **TOTAL** | **120** | **13** | **2** | **135** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -57,11 +57,11 @@ bpfrx has zone-based policies with source/dest address, application match, permi
 
 ## 2. Application Security (AppSecure)
 
-The AppSecure suite is a major differentiator for the vSRX as an NGFW. bpfrx currently has `services application-identification` parsed as a boolean but no DPI engine.
+The AppSecure suite is a major differentiator for the vSRX as an NGFW. bpfrx now has real runtime AppID plumbing for L3/L4 application catalog classification, session tracking, and unknown-app handling, but it still does not have a full Junos L7 DPI/signature engine.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Application Identification (AppID)** | `services application-identification` | L7 DPI engine using signatures, heuristics, pattern matching. Identifies 4000+ apps regardless of port/protocol. Foundation for all AppSecure features. | High | Parse-Only (bool flag, no DPI engine) |
+| **Application Identification (AppID)** | `services application-identification` | L7 DPI engine using signatures, heuristics, pattern matching. Identifies 4000+ apps regardless of port/protocol. Foundation for all AppSecure features. | High | Partial (runtime app catalog/session tracking + unknown-app handling are wired; full L7 DPI/signature engine is still missing) |
 | **Application Tracking (AppTrack)** | `security application-tracking` | Log and report on applications traversing the device. Generates AppTrack log messages per session with app name, bytes, duration. | Medium | Missing |
 | **Application Firewall (AppFW)** | `security application-firewall ...` | (Legacy, replaced by unified policies) Policy enforcement based on detected app identity | Medium | Missing |
 | **Application QoS (AppQoS)** | `class-of-service application-traffic-control` | QoS rate-limiting and marking based on detected application | Medium | Missing |
@@ -398,7 +398,7 @@ bpfrx has hostname, domain-name, domain-search, timezone, name-servers, NTP, ser
 | **Auto-Image Upgrade** | `system autoinstallation ...` | Zero-touch provisioning for initial deployment | Low | Missing |
 | **Time Zone (wired)** | `system time-zone ...` | bpfrx applies the configured timezone to the system runtime | Low | Done (daemon updates `/etc/localtime` and `/etc/timezone`) |
 | **NTP Threshold Action** | `system ntp threshold ... action ...` | Action when NTP offset exceeds threshold (accept or reject large time jumps) | Low | Done (maps to chrony `logchange` for `accept` and `logchange` + `maxchange` for `reject`, and is shown in operational output) |
-| **Master Password** | `system master-password ...` | Encrypted password storage with master key for config secrets | Low | Parse-Only |
+| **Master Password** | `system master-password ...` | Encrypted password storage with master key for config secrets | Low | Done (active/candidate/rollback config trees are encrypted at rest with a node-local master key derived using the configured PRF) |
 | **DNS Proxy** | `system services dns dns-proxy ...` | DNS proxy/caching server on firewall for client DNS resolution | Low | Missing |
 
 ---
@@ -469,11 +469,8 @@ table, so this list count can be higher than the category-level Parse-Only total
 
 | # | Config Path | Type | Notes |
 |---|------------|------|-------|
-| 1 | `security pre-id-default-policy` | PreIDDefaultPolicy | Requires AppID engine |
-| 2 | `system master-password` | SystemConfig.MasterPassword | No encrypted storage |
-| 3 | `system license autoupdate url` | SystemConfig.LicenseAutoUpdate | No licensing system |
-| 4 | `security policies ... schedulers ...` | SchedulerConfig | Parsed, not runtime-enforced in policy engine |
-| 5 | `services application-identification` | ServicesConfig.ApplicationIdentification | Bool flag only, no DPI |
+| 1 | `system license autoupdate url` | SystemConfig.LicenseAutoUpdate | No licensing system |
+| 2 | `security policies ... schedulers ...` | SchedulerConfig | Parsed, not runtime-enforced in policy engine |
 
 ---
 

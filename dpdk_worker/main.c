@@ -324,6 +324,8 @@ tables_init(struct shared_memory *shm)
 		RTE_CACHE_LINE_SIZE);
 	shm->app_values = rte_zmalloc("app_values",
 		sizeof(struct app_value) * MAX_APPLICATIONS, RTE_CACHE_LINE_SIZE);
+	shm->app_ranges = rte_zmalloc("app_ranges",
+		sizeof(struct app_range_entry) * MAX_APP_RANGES, RTE_CACHE_LINE_SIZE);
 	shm->dnat_values = rte_zmalloc("dnat_values",
 		sizeof(struct dnat_value) * MAX_STATIC_NAT_ENTRIES,
 		RTE_CACHE_LINE_SIZE);
@@ -398,7 +400,8 @@ tables_init(struct shared_memory *shm)
 	    !shm->fib_v4 || !shm->fib_v6 || !shm->nexthops ||
 	    !shm->session_values_v4 || !shm->session_values_v6 ||
 	    !shm->iface_zone_values || !shm->zone_pair_values ||
-	    !shm->app_values || !shm->dnat_values || !shm->dnat_values_v6 ||
+	    !shm->app_values || !shm->app_ranges ||
+	    !shm->dnat_values || !shm->dnat_values_v6 ||
 	    !shm->snat_values_v4 || !shm->snat_values_v6 ||
 	    !shm->nat_pool_ips_v4 || !shm->nat_pool_ips_v6 ||
 	    !shm->nat64_state_values || !shm->flood_states ||

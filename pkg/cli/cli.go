@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	"github.com/chzyer/readline"
+	"github.com/psaab/bpfrx/pkg/appid"
 	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/psaab/bpfrx/pkg/cmdtree"
 	"github.com/psaab/bpfrx/pkg/config"
@@ -3038,24 +3039,30 @@ func resolveAppName(proto uint8, dstPort uint16, cfg *config.Config) string {
 
 // sessionFilter holds parsed filter criteria for session display.
 type sessionFilter struct {
-	zoneID  uint16 // 0 = any
-	proto   uint8  // 0 = any
-	srcNet  *net.IPNet
-	dstNet  *net.IPNet
-	srcPort uint16         // 0 = any
-	dstPort uint16         // 0 = any
-	natOnly bool           // show only NAT sessions
-	iface   string         // ingress interface name filter
-	summary bool           // only show count
-	brief   bool           // compact tabular view
-	appName string         // application name filter
-	sortBy  string         // "bytes" or "packets" for top-talkers
-	cfg     *config.Config // for application resolution
+	zoneID   uint16 // 0 = any
+	proto    uint8  // 0 = any
+	srcNet   *net.IPNet
+	dstNet   *net.IPNet
+	srcPort  uint16         // 0 = any
+	dstPort  uint16         // 0 = any
+	natOnly  bool           // show only NAT sessions
+	iface    string         // ingress interface name filter
+	summary  bool           // only show count
+	brief    bool           // compact tabular view
+	appName  string         // application name filter
+	sortBy   string         // "bytes" or "packets" for top-talkers
+	cfg      *config.Config // for application resolution
+	appNames map[uint16]string
 }
 
 func (c *CLI) parseSessionFilter(args []string) sessionFilter {
 	var f sessionFilter
 	f.cfg = c.store.ActiveConfig()
+	if c.dp != nil {
+		if cr := c.dp.LastCompileResult(); cr != nil {
+			f.appNames = cr.AppNames
+		}
+	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "zone":
@@ -3190,7 +3197,8 @@ func (f *sessionFilter) matchesV4(key dataplane.SessionKey, val dataplane.Sessio
 		return false
 	}
 	if f.appName != "" {
-		if resolveAppName(key.Protocol, ntohs(key.DstPort), f.cfg) != f.appName {
+		if !appid.SessionMatches(f.appName, f.appNames, f.cfg,
+			key.Protocol, ntohs(key.DstPort), val.AppID) {
 			return false
 		}
 	}
@@ -3220,7 +3228,8 @@ func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.Sess
 		return false
 	}
 	if f.appName != "" {
-		if resolveAppName(key.Protocol, ntohs(key.DstPort), f.cfg) != f.appName {
+		if !appid.SessionMatches(f.appName, f.appNames, f.cfg,
+			key.Protocol, ntohs(key.DstPort), val.AppID) {
 			return false
 		}
 	}
@@ -3443,6 +3452,9 @@ func (c *CLI) showFlowSession(args []string) error {
 		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
 			outIf, val.RevPackets, val.RevBytes)
+		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, dstPort, val.AppID); appName != "" {
+			fmt.Printf("  Application: %s\n", appName)
+		}
 		fmt.Println()
 	}
 
@@ -3588,6 +3600,9 @@ func (c *CLI) showFlowSession(args []string) error {
 		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
 			outIf, val.RevPackets, val.RevBytes)
+		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, dstPort, val.AppID); appName != "" {
+			fmt.Printf("  Application: %s\n", appName)
+		}
 		fmt.Println()
 	}
 
@@ -3853,7 +3868,7 @@ func (c *CLI) showTopTalkers(f sessionFilter) error {
 			proto:    protoNameFromNum(key.Protocol),
 			zone:     inZone + "->" + outZone,
 			state:    sessionStateName(val.State),
-			app:      resolveAppName(key.Protocol, ntohs(key.DstPort), f.cfg),
+			app:      appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, ntohs(key.DstPort), val.AppID),
 			fwdPkts:  val.FwdPackets,
 			revPkts:  val.RevPackets,
 			fwdBytes: val.FwdBytes,
@@ -3890,7 +3905,7 @@ func (c *CLI) showTopTalkers(f sessionFilter) error {
 			proto:    protoNameFromNum(key.Protocol),
 			zone:     inZone + "->" + outZone,
 			state:    sessionStateName(val.State),
-			app:      resolveAppName(key.Protocol, ntohs(key.DstPort), f.cfg),
+			app:      appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, ntohs(key.DstPort), val.AppID),
 			fwdPkts:  val.FwdPackets,
 			revPkts:  val.RevPackets,
 			fwdBytes: val.FwdBytes,

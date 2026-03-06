@@ -22,8 +22,8 @@ Use these sources in this order when there is disagreement:
 
 Row-level gap totals:
 - Missing: 120
-- Partial: 12
-- Parse-Only: 3
+- Partial: 13
+- Parse-Only: 2
 - Total Open Gaps: 135
 
 Category totals:
@@ -31,7 +31,7 @@ Category totals:
 | Category | Missing | Partial | Parse-Only | Open |
 |---|---:|---:|---:|---:|
 | 1. Security Policies (Unified/Advanced) | 7 | 0 | 1 | 8 |
-| 2. Application Security (AppSecure) | 7 | 0 | 1 | 8 |
+| 2. Application Security (AppSecure) | 7 | 1 | 0 | 8 |
 | 3. Intrusion Detection & Prevention (IDP/IPS) | 8 | 0 | 0 | 8 |
 | 4. Content Security (UTM) | 6 | 0 | 0 | 6 |
 | 5. SSL/TLS Inspection | 4 | 0 | 0 | 4 |
@@ -50,14 +50,13 @@ Category totals:
 | 19. Multi-Tenancy | 4 | 0 | 0 | 4 |
 | 20. Management & Automation | 9 | 2 | 0 | 11 |
 | 21. Interface Enhancements | 1 | 1 | 0 | 2 |
-| 22. System Enhancements | 5 | 0 | 1 | 6 |
+| 22. System Enhancements | 5 | 0 | 0 | 5 |
 | 23. Miscellaneous Features | 6 | 0 | 0 | 6 |
 
 High-priority open items:
 - Unified Policies (requires AppID)
 - Dynamic Application Match (requires AppID)
 - Application Services in Policy
-- Application Identification (AppID) runtime wiring (currently parse-only)
 - IDP Policy
 - IDP Signature Database
 - IDP Protocol Anomaly Detection
@@ -68,9 +67,6 @@ High-priority open items:
 From `docs/next-features` and HA proposal docs:
 - Strict single-owner VIP mode for same-L2 HA (tracking issue #104)
 - Deterministic VRRP failover reconciliation
-- Runtime wiring for `services application-identification`
-- Runtime wiring for `security pre-id-default-policy`
-- Runtime behavior for `system master-password`
 - Runtime behavior for `system license autoupdate url`
 
 ### 3) Additional open items from bug/test planning docs
@@ -100,6 +96,12 @@ These are documented as implemented in `docs/phases.md` and should not remain in
 - Sprint #68: HA fail-closed default + `set chassis cluster hitless-restart` opt-in
 - HA sync hardening sprint #69-#80 items called out as fixed in `docs/bugs.md`
 - System NTP threshold action runtime wiring (`accept`/`reject`) via chrony
+- Application identification runtime wiring:
+  - compiles the broader application catalog when enabled
+  - stores real session `app_id` across eBPF and DPDK dataplanes
+  - uses session `app_id` for CLI/gRPC session display and filtering
+- Pre-ID default policy logging for unknown-app sessions
+- `system master-password` at-rest encryption for active/candidate/rollback config trees using the configured PRF + node-local master key
 - Sprint CC-18: Junos IKE/IPsec compatibility items now merged on `master`:
   - gateway `local-certificate` / pubkey auth generation
   - `traffic-selector` support

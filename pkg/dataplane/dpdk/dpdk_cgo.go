@@ -495,12 +495,34 @@ func (m *Manager) ClearApplications() error {
 }
 
 func (m *Manager) SetAppRange(index uint32, entry dataplane.AppRangeEntry) error {
-	// TODO: implement DPDK app_ranges when DPDK pipeline supports it
+	shm := m.platform.shm
+	if shm == nil {
+		return fmt.Errorf("DPDK not initialized")
+	}
+	if index >= dataplane.MaxAppRanges {
+		return fmt.Errorf("app range index %d out of range", index)
+	}
+	ptr := (*C.struct_app_range_entry)(unsafe.Pointer(
+		uintptr(unsafe.Pointer(shm.app_ranges)) +
+			uintptr(index)*unsafe.Sizeof(C.struct_app_range_entry{})))
+	ptr.protocol = C.uint8_t(entry.Protocol)
+	ptr.alg_type = C.uint8_t(entry.ALGType)
+	ptr.port_low = C.uint16_t(entry.PortLow)
+	ptr.port_high = C.uint16_t(entry.PortHigh)
+	ptr.src_port_low = C.uint16_t(entry.SrcPortLow)
+	ptr.src_port_high = C.uint16_t(entry.SrcPortHigh)
+	ptr.app_id = C.uint32_t(entry.AppID)
+	ptr.timeout = C.uint32_t(entry.Timeout)
 	return nil
 }
 
 func (m *Manager) ClearAppRanges() error {
-	// TODO: implement DPDK app_ranges when DPDK pipeline supports it
+	shm := m.platform.shm
+	if shm == nil {
+		return fmt.Errorf("DPDK not initialized")
+	}
+	C.memset(unsafe.Pointer(shm.app_ranges), 0,
+		C.size_t(dataplane.MaxAppRanges)*C.size_t(unsafe.Sizeof(C.struct_app_range_entry{})))
 	return nil
 }
 
@@ -1156,6 +1178,7 @@ func (m *Manager) SetFlowConfig(cfg dataplane.FlowConfigValue) error {
 	shm.flow_config.lo0_filter_v4 = C.uint16_t(cfg.Lo0FilterV4)
 	shm.flow_config.lo0_filter_v6 = C.uint16_t(cfg.Lo0FilterV6)
 	shm.flow_config.tcp_flags = C.uint8_t(cfg.TCPFlags)
+	shm.flow_config.app_flags = C.uint8_t(cfg.AppFlags)
 	return nil
 }
 
@@ -1595,6 +1618,12 @@ func (s *dpdkEventSource) ReadEvent() ([]byte, error) {
 		binary.BigEndian.PutUint16(data[104:106], uint16(evt.nat_src_port))
 		binary.BigEndian.PutUint16(data[106:108], uint16(evt.nat_dst_port))
 		binary.LittleEndian.PutUint32(data[108:112], uint32(evt.created))
+		binary.LittleEndian.PutUint64(data[112:120], uint64(evt.rev_packets))
+		binary.LittleEndian.PutUint64(data[120:128], uint64(evt.rev_bytes))
+		binary.LittleEndian.PutUint32(data[128:132], uint32(evt.ingress_ifindex))
+		binary.LittleEndian.PutUint16(data[132:134], uint16(evt.app_id))
+		data[134] = uint8(evt.close_reason)
+		data[135] = uint8(evt.pad_event)
 
 		// Free the event allocated by the worker
 		C.rte_free(unsafe.Pointer(evt))
@@ -2016,6 +2045,7 @@ func convertSessionValue(sv *C.struct_session_value) dataplane.SessionValue {
 	rv.ReverseKey.Protocol = uint8(sv.reverse_key.protocol)
 	rv.ALGType = uint8(sv.alg_type)
 	rv.LogFlags = uint8(sv.log_flags)
+	rv.AppID = uint16(sv.app_id)
 	rv.FibIfindex = uint32(sv.fib_ifindex)
 	rv.FibVlanID = uint16(sv.fib_vlan_id)
 	for i := 0; i < 6; i++ {
@@ -2055,6 +2085,7 @@ func convertSessionValueV6(sv *C.struct_session_value_v6) dataplane.SessionValue
 	rv.ReverseKey.Protocol = uint8(sv.reverse_key.protocol)
 	rv.ALGType = uint8(sv.alg_type)
 	rv.LogFlags = uint8(sv.log_flags)
+	rv.AppID = uint16(sv.app_id)
 	rv.FibIfindex = uint32(sv.fib_ifindex)
 	rv.FibVlanID = uint16(sv.fib_vlan_id)
 	for i := 0; i < 6; i++ {

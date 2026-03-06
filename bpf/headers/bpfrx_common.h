@@ -814,12 +814,17 @@ struct flow_config {
 	__u16 lo0_filter_v6;   /* filter ID for lo0 inet6 input (0xFFFF=none) */
 	__u8  tcp_flags;       /* bit 0: no-syn-check, bit 1: rst-invalidate,
 	                          bit 2: no-syn-check-in-tunnel */
-	__u8  pad_fc;          /* alignment padding */
+	__u8  app_flags;       /* bit 0: AppID enabled,
+	                          bit 1: pre-ID log session-init,
+	                          bit 2: pre-ID log session-close */
 };
 
 #define FLOW_TCP_NO_SYN_CHECK          (1 << 0)
 #define FLOW_TCP_RST_INVALIDATE        (1 << 1)
 #define FLOW_TCP_NO_SYN_CHECK_TUNNEL   (1 << 2)
+#define FLOW_APPID_ENABLED             (1 << 0)
+#define FLOW_PREID_LOG_SESSION_INIT    (1 << 1)
+#define FLOW_PREID_LOG_SESSION_CLOSE   (1 << 2)
 
 /* ============================================================
  * Port mirroring (SPAN) configuration
