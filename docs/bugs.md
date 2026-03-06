@@ -995,3 +995,25 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Symptom:** No way to see per-link (fab0 vs fab1) or per-zone fabric redirect traffic breakdown. Only aggregate TX counters available via `show interfaces statistics`
 - **Root cause:** `try_fabric_redirect()` increments a single per-interface TX counter but has no per-link or per-zone accounting
 - **Fix:** Add BPF per-link redirect counters (fab0/fab1 differentiated, zone-encoded) and expose via CLI (`show chassis cluster statistics` or similar)
+
+## Sprint CC-17: Performance + VPN Correctness (#151-#153, 2026-03-06)
+
+### CPU mask scaling incorrect for >32 CPUs (FIXED #151, `659143e`)
+- **Symptom:** On machines with more than 32 CPUs, the generated CPU mask for CPUMAP was truncated to a single 32-bit word, leaving higher-numbered CPUs out of XDP redirect distribution
+- **Root cause:** CPU mask generation used a single `uint32` instead of a multi-word slice. CPUs beyond index 31 were silently dropped
+- **Fix:** Extracted CPU mask logic into `pkg/dataplane/cpumask.go` with proper multi-word `[]uint32` slice generation and comma-separated hex formatting matching kernel sysfs format
+
+### IPsec PFS groups emitted as dpd_action instead of DH group (FIXED #153, `8001878`)
+- **Symptom:** IPsec tunnels configured with `perfect-forward-secrecy keys groupN` silently ran without PFS — ESP rekeys used no DH exchange
+- **Root cause:** Compiler mapped PFS group config to the `dpd_action` field in swanctl ESP proposals instead of `dh_groups`. The PFS value was written to the wrong config key
+- **Fix:** Compiler now correctly emits PFS group as `dh_groups` in swanctl ESP proposal output (e.g., `dh_groups = modp2048` for `group14`)
+
+### Stale xfrmi devices not cleaned up on VPN config removal (FIXED #153, `c592976`)
+- **Symptom:** After removing IPsec VPN config and committing, stale XFRM tunnel interfaces and swanctl config files remain in the kernel and filesystem. Re-adding the same tunnel could fail or produce unexpected behavior
+- **Root cause:** IPsec/xfrmi reconciliation was additive only — the daemon created new tunnels on commit but never compared against kernel state to remove stale ones
+- **Fix:** Full reconciliation on every commit compares desired state against kernel state. Stale XFRM interfaces are deleted and orphaned swanctl configs are removed
+
+### st0.X misidentified as VLAN sub-interface (FIXED #153, `c592976`)
+- **Symptom:** Secure tunnel interfaces like `st0.0` were treated as VLAN sub-interfaces by the interface compiler, generating incorrect 802.1Q VLAN tagging config
+- **Root cause:** The `.N` suffix parser did not distinguish between actual VLAN sub-interfaces (e.g., `ge-0-0-0.100`) and secure tunnel unit interfaces (`st0.0`)
+- **Fix:** Added `isConfiguredVLANSubInterface()` guard that verifies the parent interface is a known VLAN trunk before treating `.N` suffixed names as VLAN sub-interfaces

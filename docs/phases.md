@@ -2964,3 +2964,29 @@ After the IPVLAN overlay refactor (CC-11/CC-12) and monitor fixes (CC-14), fabri
   - Refactored template system from hardcoded `recordSizeV4`/`recordSizeV6` to dynamic `templateField` slices via `buildTemplateFieldsV4()`/`buildTemplateFieldsV6()` — record size computed from field list
   - `encodeTemplateFlowSet()` and `encodeDataFlowSet()` now take options for conditional field inclusion
   - `flow-dir` extension adds `fieldDirection` (IANA #61) to NetFlow v9 export templates
+
+---
+
+## Sprint CC-17: Performance + VPN Correctness (#151-#153, 2026-03-06)
+
+### Perf: Cache fabric redirect state and fix CPU mask scaling (#151, `659143e`)
+- **Problem:** `try_fabric_redirect()` in xdp_zone.c performed `bpf_map_lookup_elem` on `fabric_fwd` map on every packet, even though fabric state changes infrequently. Additionally, CPU mask generation in `pkg/dataplane/cpumask.go` produced incorrect masks for CPU counts beyond a single 32-bit word (>32 CPUs)
+- **Fix (BPF):** Added `fabric_ingress_match()` and `fabric_main_fib_peer()` helper functions in `xdp_zone.c` that cache `fabric_fwd` map lookup results in local variables, avoiding redundant map lookups in the hot path
+- **Fix (Go):** Extracted CPU mask logic into `pkg/dataplane/cpumask.go` with proper multi-word mask generation. `allCPUMask(numCPU)` builds a bitmask spanning multiple 32-bit words, `singleCPUMask(cpu)` targets a specific CPU, and `formatCPUMask()` renders as comma-separated hex (kernel sysfs format). Comprehensive tests in `cpumask_test.go`
+
+### Perf: Reduce flow export allocations and preserve source-address collectors (#152, `3961a0d`)
+- **Problem:** NetFlow v9/IPFIX export path allocated fresh template metadata and packet buffers on every export cycle, causing GC pressure under high flow rates. Collector deduplication was also lost across config changes — reloading config could create duplicate collector goroutines for the same destination
+- **Fix:**
+  - Precomputed template metadata: template field lists and record sizes computed once at config compile time, reused across export cycles
+  - Single-buffer packet encoding: reuse a pre-allocated byte buffer for packet serialization instead of allocating per-export
+  - Source-address collector dedup: collectors keyed by `(collector-addr, source-addr)` tuple — existing collectors preserved across config reloads instead of being torn down and recreated
+
+### VPN: Fix IPsec xfrmi lifecycle and PFS handling (#153, `c592976` + `8001878`)
+- **Problem (stale xfrmi):** Removing VPN config from the firewall left stale XFRM tunnel interfaces and swanctl config files in the kernel/filesystem. No reconciliation ran on commit — only additive changes were applied
+- **Fix (xfrmi lifecycle):** Full reconciliation on every commit — daemon compares desired tunnel/xfrmi/IPsec state against kernel state and removes stale devices and swanctl configs that no longer appear in the active config
+- **Problem (xfrmi naming):** XFRM interface names were not deterministic and could collide between different secure-tunnel devices (e.g., `st0` and `st1`)
+- **Fix (xfrmi naming):** New `config.XFRMIfNameAndID()` function (`pkg/config/xfrmi.go`) generates unit-specific names and stable `if_id` values: `st0.0`→if_id 1, `st0.1`→if_id 2, `st1.0`→if_id 65537. The `if_id` encodes `(stIndex << 16) | (unit + 1)`, guaranteeing uniqueness across all st devices and units
+- **Problem (PFS groups):** IPsec policy `perfect-forward-secrecy keys` config was incorrectly emitted as `dpd_action` in swanctl ESP proposals instead of the DH group (e.g., `group14`). PFS was silently disabled
+- **Fix (PFS):** Compiler now correctly maps PFS group config to ESP proposal `dh_groups` field in swanctl output
+- **Problem (VLAN guard):** `st0.0` was misidentified as a VLAN sub-interface by the interface compiler, causing incorrect VLAN tagging config to be generated
+- **Fix (VLAN guard):** Added `isConfiguredVLANSubInterface()` guard that checks the interface is a known VLAN parent before treating `.N` suffixed names as VLAN sub-interfaces. Secure tunnel interfaces (`st0.X`) are excluded
