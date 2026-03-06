@@ -130,9 +130,11 @@ type Daemon struct {
 
 	// Fabric cross-chassis forwarding state for periodic refresh.
 	fabricMu         sync.RWMutex
-	fabricIface      string
+	fabricIface      string         // physical parent (XDP attachment point)
+	fabricOverlay    string         // IPVLAN overlay for neighbor resolution (#129)
 	fabricPeerIP     net.IP
-	fabricIface1     string         // secondary fabric interface (fab1)
+	fabricIface1     string         // secondary fabric parent
+	fabricOverlay1   string         // secondary fabric overlay (#129)
 	fabricPeerIP1    net.IP         // secondary fabric peer IP
 	fabricPopulated  bool           // true after first successful fab0 write
 	fabric1Populated bool           // true after first successful fab1 write
@@ -1501,12 +1503,15 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// 1.9. Create IPVLAN interfaces for fabric members (fab0, fab1).
 	// The physical member (ge-0-0-0) keeps its name; fab0 is IPVLAN L2
 	// on top for IP addressing. BPF attaches to the parent.
+	// Track which overlays are configured so stale ones can be cleaned up (#128).
+	activeFabricOverlays := make(map[string]bool)
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
 		if ifCfg.LocalFabricMember == "" || !strings.HasPrefix(ifName, "fab") {
 			continue
 		}
 		parentLinux := config.LinuxIfName(ifCfg.LocalFabricMember)
 		fabLinux := config.LinuxIfName(ifName)
+		activeFabricOverlays[fabLinux] = true
 		var addrs []string
 		if unit, ok := ifCfg.Units[0]; ok {
 			addrs = unit.Addresses
@@ -1515,6 +1520,18 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			slog.Warn("failed to create fabric IPVLAN",
 				"parent", parentLinux, "name", fabLinux, "err", err)
 			continue
+		}
+	}
+	// Clean up stale fabric IPVLAN overlays not in current config (#128).
+	for _, name := range []string{"fab0", "fab1"} {
+		if activeFabricOverlays[name] {
+			continue
+		}
+		if link, err := netlink.LinkByName(name); err == nil {
+			if _, ok := link.(*netlink.IPVlan); ok {
+				netlink.LinkDel(link)
+				slog.Info("removed stale fabric IPVLAN", "name", name)
+			}
 		}
 	}
 
@@ -4155,14 +4172,23 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Populate fabric_fwd BPF map for cross-chassis redirect,
 			// then periodically refresh to correct neighbor drift.
 			// Resolve to physical parent (ge-0-0-0) — BPF runs on
-			// the parent, not the IPVLAN overlay.
+			// the parent, not the IPVLAN overlay. Neighbor resolution
+			// uses the overlay (fab0/fab1) where the sync IP lives (#129).
 			fabParent := d.resolveFabricParent(cc.FabricInterface)
-			go d.populateFabricFwd(commsCtx, fabParent, cc.FabricPeerAddress)
+			fabOverlay := config.LinuxIfName(cc.FabricInterface)
+			if fabOverlay == fabParent {
+				fabOverlay = "" // no overlay — legacy mode
+			}
+			go d.populateFabricFwd(commsCtx, fabParent, fabOverlay, cc.FabricPeerAddress)
 
 			// Populate secondary fabric_fwd entry (key=1) if fab1 configured.
 			if cc.Fabric1Interface != "" && cc.Fabric1PeerAddress != "" {
 				fab1Parent := d.resolveFabricParent(cc.Fabric1Interface)
-				go d.populateFabricFwd1(commsCtx, fab1Parent, cc.Fabric1PeerAddress)
+				fab1Overlay := config.LinuxIfName(cc.Fabric1Interface)
+				if fab1Overlay == fab1Parent {
+					fab1Overlay = "" // no overlay
+				}
+				go d.populateFabricFwd1(commsCtx, fab1Parent, fab1Overlay, cc.Fabric1PeerAddress)
 			}
 
 			// Monitor fabric link/neighbor state via netlink (#124).
@@ -4232,7 +4258,8 @@ func ensureFabricIPVLAN(parent, name string, addrs []string) error {
 	// Check if IPVLAN already exists on correct parent.
 	if existing, err := netlink.LinkByName(name); err == nil {
 		if existing.Attrs().ParentIndex == parentLink.Attrs().Index {
-			// Already correct — just ensure it's UP.
+			// Already correct — reconcile addresses and ensure UP (#127).
+			reconcileIPVLANAddrs(existing, name, addrs)
 			netlink.LinkSetUp(existing)
 			return nil
 		}
@@ -4277,6 +4304,58 @@ func ensureFabricIPVLAN(parent, name string, addrs []string) error {
 	return nil
 }
 
+// reconcileIPVLANAddrs adds missing addresses and removes stale ones from an
+// existing IPVLAN interface (#127). Called when ensureFabricIPVLAN finds the
+// overlay already exists on the correct parent.
+func reconcileIPVLANAddrs(link netlink.Link, name string, desired []string) {
+	// Build set of desired addresses (normalized to CIDR strings).
+	want := make(map[string]*netlink.Addr, len(desired))
+	for _, addrStr := range desired {
+		addr, err := netlink.ParseAddr(addrStr)
+		if err != nil {
+			slog.Warn("fabric IPVLAN: invalid address in config", "addr", addrStr, "err", err)
+			continue
+		}
+		want[addr.IPNet.String()] = addr
+	}
+
+	// Get current addresses.
+	existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		slog.Warn("fabric IPVLAN: failed to list addresses", "name", name, "err", err)
+		return
+	}
+
+	// Remove stale addresses not in desired set.
+	have := make(map[string]bool, len(existing))
+	for _, a := range existing {
+		key := a.IPNet.String()
+		have[key] = true
+		if _, ok := want[key]; !ok {
+			if err := netlink.AddrDel(link, &a); err != nil {
+				slog.Warn("fabric IPVLAN: failed to remove stale address",
+					"name", name, "addr", key, "err", err)
+			} else {
+				slog.Info("fabric IPVLAN: removed stale address",
+					"name", name, "addr", key)
+			}
+		}
+	}
+
+	// Add missing addresses.
+	for key, addr := range want {
+		if !have[key] {
+			if err := netlink.AddrReplace(link, addr); err != nil {
+				slog.Warn("fabric IPVLAN: failed to add address",
+					"name", name, "addr", key, "err", err)
+			} else {
+				slog.Info("fabric IPVLAN: added missing address",
+					"name", name, "addr", key)
+			}
+		}
+	}
+}
+
 // CleanupFabricIPVLANs removes all fabric IPVLAN interfaces (fab0, fab1).
 func CleanupFabricIPVLANs() {
 	for _, name := range []string{"fab0", "fab1"} {
@@ -4305,18 +4384,25 @@ func (d *Daemon) resolveFabricParent(fabName string) string {
 
 // populateFabricFwd resolves the fabric interface MACs and populates the
 // fabric_fwd BPF map for cross-chassis packet redirect during failback.
+// fabIface is the physical parent (XDP attachment point); overlay is the
+// IPVLAN child where the sync IP lives (neighbor resolution target, #129).
+// If overlay is empty, fabIface is used for both (legacy/no-IPVLAN mode).
 // Attempts immediately on startup with fast 500ms retries (10 attempts),
 // then falls back to 30s periodic refresh.
-func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr string) {
+func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, overlay, peerAddr string) {
 	peerIP := net.ParseIP(peerAddr)
 	if peerIP == nil {
 		slog.Warn("cluster: invalid fabric peer address", "addr", peerAddr)
 		return
 	}
+	if overlay == "" {
+		overlay = fabIface
+	}
 
 	// Store fabric config for RefreshFabricFwd.
 	d.fabricMu.Lock()
 	d.fabricIface = fabIface
+	d.fabricOverlay = overlay
 	d.fabricPeerIP = peerIP
 	d.fabricMu.Unlock()
 
@@ -4330,10 +4416,10 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 			}
 		}
 
-		// Actively probe for neighbor entry if missing.
-		d.probeFabricNeighbor(ctx, fabIface, peerIP)
+		// Actively probe for neighbor entry on the overlay (#129).
+		d.probeFabricNeighbor(ctx, overlay, peerIP)
 
-		if d.refreshFabricFwd(fabIface, peerIP, i == 0) {
+		if d.refreshFabricFwd(fabIface, overlay, peerIP, i == 0) {
 			break
 		}
 		if i == 9 {
@@ -4350,9 +4436,9 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			d.refreshFabricFwd(fabIface, peerIP, false)
+			d.refreshFabricFwd(fabIface, overlay, peerIP, false)
 		case <-d.fabricRefreshCh:
-			d.refreshFabricFwd(fabIface, peerIP, false)
+			d.refreshFabricFwd(fabIface, overlay, peerIP, false)
 		}
 	}
 }
@@ -4391,7 +4477,9 @@ func (d *Daemon) probeFabricNeighbor(ctx context.Context, fabIface string, peerI
 // refreshFabricFwd resolves fabric link/neighbor state and updates the
 // fabric_fwd BPF map. Returns true on success. Called during initial
 // population and periodic drift correction.
-func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting bool) bool {
+// fabIface is the physical parent (for ifindex/MAC); overlay is the IPVLAN
+// child where the sync IP lives (for neighbor resolution, #129).
+func (d *Daemon) refreshFabricFwd(fabIface, overlay string, peerIP net.IP, logWaiting bool) bool {
 	link, err := netlink.LinkByName(fabIface)
 	if err != nil {
 		slog.Debug("cluster: fabric link not found",
@@ -4422,12 +4510,20 @@ func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting boo
 		}
 	}
 
-	// Resolve peer MAC from ARP (IPv4) or NDP (IPv6) table.
+	// Resolve peer MAC from ARP/NDP table on the overlay interface (#129).
+	// The sync IP lives on the overlay (fab0/fab1), so neighbor entries
+	// are associated with the overlay's ifindex, not the parent's.
+	neighLink := link
+	if overlay != fabIface {
+		if ol, err := netlink.LinkByName(overlay); err == nil {
+			neighLink = ol
+		}
+	}
 	neighFamily := netlink.FAMILY_V4
 	if peerIP.To4() == nil {
 		neighFamily = netlink.FAMILY_V6
 	}
-	neighs, err := netlink.NeighList(link.Attrs().Index, neighFamily)
+	neighs, err := netlink.NeighList(neighLink.Attrs().Index, neighFamily)
 	if err != nil {
 		slog.Debug("cluster: neigh list failed", "err", err)
 		d.clearFabricFwd0()
@@ -4444,12 +4540,13 @@ func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting boo
 	if peerMAC == nil {
 		if logWaiting {
 			slog.Info("cluster: waiting for fabric peer neighbor entry",
-				"peer", peerIP)
+				"peer", peerIP, "overlay", overlay)
 		}
 		d.clearFabricFwd0()
 		return false
 	}
 
+	// Use parent's ifindex for redirect — XDP runs on the parent.
 	info := dataplane.FabricFwdInfo{
 		Ifindex: uint32(link.Attrs().Index),
 	}
@@ -4509,16 +4606,20 @@ func (d *Daemon) clearFabricFwd0() {
 // populateFabricFwd1 resolves the secondary fabric interface MACs and populates
 // the fabric_fwd BPF map entry at key=1 for cross-chassis packet redirect.
 // Mirrors populateFabricFwd but writes to key=1 via UpdateFabricFwd1.
-func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, peerAddr string) {
+func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, overlay, peerAddr string) {
 	peerIP := net.ParseIP(peerAddr)
 	if peerIP == nil {
 		slog.Warn("cluster: invalid fabric1 peer address", "addr", peerAddr)
 		return
 	}
+	if overlay == "" {
+		overlay = fabIface
+	}
 
 	// Store fabric1 config for RefreshFabricFwd.
 	d.fabricMu.Lock()
 	d.fabricIface1 = fabIface
+	d.fabricOverlay1 = overlay
 	d.fabricPeerIP1 = peerIP
 	d.fabricMu.Unlock()
 
@@ -4532,9 +4633,10 @@ func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, peerAddr stri
 			}
 		}
 
-		d.probeFabricNeighbor(ctx, fabIface, peerIP)
+		// Probe on the overlay (#129).
+		d.probeFabricNeighbor(ctx, overlay, peerIP)
 
-		if d.refreshFabricFwd1(fabIface, peerIP, i == 0) {
+		if d.refreshFabricFwd1(fabIface, overlay, peerIP, i == 0) {
 			break
 		}
 		if i == 9 {
@@ -4551,16 +4653,17 @@ func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, peerAddr stri
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			d.refreshFabricFwd1(fabIface, peerIP, false)
+			d.refreshFabricFwd1(fabIface, overlay, peerIP, false)
 		case <-d.fabricRefreshCh:
-			d.refreshFabricFwd1(fabIface, peerIP, false)
+			d.refreshFabricFwd1(fabIface, overlay, peerIP, false)
 		}
 	}
 }
 
 // refreshFabricFwd1 resolves secondary fabric link/neighbor state and updates
 // the fabric_fwd BPF map at key=1. Returns true on success.
-func (d *Daemon) refreshFabricFwd1(fabIface string, peerIP net.IP, logWaiting bool) bool {
+// fabIface is the physical parent; overlay is the IPVLAN child (#129).
+func (d *Daemon) refreshFabricFwd1(fabIface, overlay string, peerIP net.IP, logWaiting bool) bool {
 	link, err := netlink.LinkByName(fabIface)
 	if err != nil {
 		slog.Debug("cluster: fabric1 link not found",
@@ -4591,11 +4694,18 @@ func (d *Daemon) refreshFabricFwd1(fabIface string, peerIP net.IP, logWaiting bo
 		}
 	}
 
+	// Resolve peer MAC from overlay interface (#129).
+	neighLink := link
+	if overlay != fabIface {
+		if ol, err := netlink.LinkByName(overlay); err == nil {
+			neighLink = ol
+		}
+	}
 	neighFamily := netlink.FAMILY_V4
 	if peerIP.To4() == nil {
 		neighFamily = netlink.FAMILY_V6
 	}
-	neighs, err := netlink.NeighList(link.Attrs().Index, neighFamily)
+	neighs, err := netlink.NeighList(neighLink.Attrs().Index, neighFamily)
 	if err != nil {
 		slog.Debug("cluster: fabric1 neigh list failed", "err", err)
 		d.clearFabricFwd1()
@@ -4612,7 +4722,7 @@ func (d *Daemon) refreshFabricFwd1(fabIface string, peerIP net.IP, logWaiting bo
 	if peerMAC == nil {
 		if logWaiting {
 			slog.Info("cluster: waiting for fabric1 peer neighbor entry",
-				"peer", peerIP)
+				"peer", peerIP, "overlay", overlay)
 		}
 		d.clearFabricFwd1()
 		return false
@@ -4674,15 +4784,17 @@ func (d *Daemon) clearFabricFwd1() {
 func (d *Daemon) RefreshFabricFwd() {
 	d.fabricMu.RLock()
 	fabIface := d.fabricIface
+	overlay := d.fabricOverlay
 	peerIP := d.fabricPeerIP
 	fabIface1 := d.fabricIface1
+	overlay1 := d.fabricOverlay1
 	peerIP1 := d.fabricPeerIP1
 	d.fabricMu.RUnlock()
 	if fabIface != "" && peerIP != nil {
-		d.refreshFabricFwd(fabIface, peerIP, false)
+		d.refreshFabricFwd(fabIface, overlay, peerIP, false)
 	}
 	if fabIface1 != "" && peerIP1 != nil {
-		d.refreshFabricFwd1(fabIface1, peerIP1, false)
+		d.refreshFabricFwd1(fabIface1, overlay1, peerIP1, false)
 	}
 }
 
@@ -4720,7 +4832,8 @@ func (d *Daemon) monitorFabricState(ctx context.Context) {
 			}
 			name := update.Attrs().Name
 			d.fabricMu.RLock()
-			isFabric := name == d.fabricIface || name == d.fabricIface1
+			isFabric := name == d.fabricIface || name == d.fabricIface1 ||
+				name == d.fabricOverlay || name == d.fabricOverlay1
 			d.fabricMu.RUnlock()
 			if isFabric {
 				slog.Debug("cluster: fabric link state change detected",

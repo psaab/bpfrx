@@ -155,13 +155,35 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 		// Auto-detect fabric interfaces from fab0/fab1 member-interfaces
 		// when not explicitly configured via fabric-interface/fabric1-interface.
 		// Only set if the local node has a member (LocalFabricMember resolved above).
-		// With single-member fab (fab0→node0, fab1→node1), only one fab is local.
-		// FabricPeerAddress is already correct from the per-node group — no swap needed.
+		// Dual-fabric: if both fab0 and fab1 have local members, set both
+		// FabricInterface and Fabric1Interface (#130).
+		// Single-fabric: only one fab is local → FabricInterface only.
 		if cc.FabricInterface == "" {
 			if f0, ok := cfg.Interfaces.Interfaces["fab0"]; ok && f0.LocalFabricMember != "" {
 				cc.FabricInterface = "fab0"
 			} else if f1, ok := cfg.Interfaces.Interfaces["fab1"]; ok && f1.LocalFabricMember != "" {
 				cc.FabricInterface = "fab1"
+			}
+		}
+		// Auto-detect secondary fabric: fab1 when primary is fab0 and fab1
+		// also has a local member (dual-fabric topology).
+		if cc.Fabric1Interface == "" && cc.FabricInterface == "fab0" {
+			if f1, ok := cfg.Interfaces.Interfaces["fab1"]; ok && f1.LocalFabricMember != "" {
+				cc.Fabric1Interface = "fab1"
+			}
+		}
+		// Auto-derive Fabric1PeerAddress from the fab1 interface's /30 or /31
+		// address when not explicitly configured.
+		if cc.Fabric1Interface != "" && cc.Fabric1PeerAddress == "" {
+			if f1 := cfg.Interfaces.Interfaces[cc.Fabric1Interface]; f1 != nil {
+				if u0 := f1.Units[0]; u0 != nil {
+					for _, addr := range u0.Addresses {
+						if peer := peerFromPointToPoint(addr); peer != "" {
+							cc.Fabric1PeerAddress = peer
+							break
+						}
+					}
+				}
 			}
 		}
 	}
@@ -3826,6 +3848,45 @@ func nodeVal(n *Node) string {
 	}
 	if len(n.Children) > 0 {
 		return n.Children[0].Name()
+	}
+	return ""
+}
+
+// peerFromPointToPoint derives the peer IP address from a /30 or /31 CIDR.
+// Returns "" if the CIDR is not a valid point-to-point subnet.
+func peerFromPointToPoint(cidr string) string {
+	ip, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return ""
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return ""
+	}
+	ones, bits := ipNet.Mask.Size()
+	if bits != 32 {
+		return ""
+	}
+	ipNum := binary.BigEndian.Uint32(ip4)
+	switch ones {
+	case 30:
+		hostPart := ipNum & 0x3
+		var peerNum uint32
+		switch hostPart {
+		case 1:
+			peerNum = (ipNum &^ 0x3) | 2
+		case 2:
+			peerNum = (ipNum &^ 0x3) | 1
+		default:
+			return ""
+		}
+		peer := make(net.IP, 4)
+		binary.BigEndian.PutUint32(peer, peerNum)
+		return peer.String()
+	case 31:
+		peer := make(net.IP, 4)
+		binary.BigEndian.PutUint32(peer, ipNum^1)
+		return peer.String()
 	}
 	return ""
 }

@@ -15618,6 +15618,31 @@ func TestSlotToNodeID(t *testing.T) {
 	}
 }
 
+func TestPeerFromPointToPoint(t *testing.T) {
+	tests := []struct {
+		cidr string
+		want string
+	}{
+		{"10.99.1.1/30", "10.99.1.2"},
+		{"10.99.1.2/30", "10.99.1.1"},
+		{"10.99.2.1/30", "10.99.2.2"},
+		{"10.99.2.2/30", "10.99.2.1"},
+		{"192.168.0.1/31", "192.168.0.0"},
+		{"192.168.0.0/31", "192.168.0.1"},
+		{"10.0.0.0/30", ""},  // network address
+		{"10.0.0.3/30", ""},  // broadcast
+		{"10.0.0.1/24", ""},  // not point-to-point
+		{"invalid", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		got := peerFromPointToPoint(tt.cidr)
+		if got != tt.want {
+			t.Errorf("peerFromPointToPoint(%q) = %q, want %q", tt.cidr, got, tt.want)
+		}
+	}
+}
+
 func TestFabricLocalMemberResolution(t *testing.T) {
 	// vSRX-style config: fab0 has node0's member, fab1 has node1's member.
 	cmds := []string{
@@ -15732,6 +15757,95 @@ func TestFabricAutoDetectFabricInterface(t *testing.T) {
 	}
 	if cc.Fabric1Interface != "" {
 		t.Errorf("Fabric1Interface = %q, want empty (fab1 not local to node0)", cc.Fabric1Interface)
+	}
+}
+
+func TestFabricAutoDetectDualFabric(t *testing.T) {
+	// Dual-fabric: both fab0 and fab1 have members on both nodes (#130).
+	// On node0, both fab0 and fab1 have local members →
+	// FabricInterface = "fab0", Fabric1Interface = "fab1".
+	// Fabric1PeerAddress auto-derived from fab1's /30 address.
+	cmds := []string{
+		"set interfaces fab0 fabric-options member-interfaces ge-0/0/7",
+		"set interfaces fab0 fabric-options member-interfaces ge-7/0/7",
+		"set interfaces fab0 unit 0 family inet address 10.99.1.1/30",
+		"set interfaces fab1 fabric-options member-interfaces ge-0/0/8",
+		"set interfaces fab1 fabric-options member-interfaces ge-7/0/8",
+		"set interfaces fab1 unit 0 family inet address 10.99.2.1/30",
+		"set chassis cluster node 0",
+		"set chassis cluster control-interface hb0",
+		"set interfaces hb0 unit 0 family inet address 10.99.0.1/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := cfg.Chassis.Cluster
+	if cc == nil {
+		t.Fatal("cluster config not found")
+	}
+	if cc.FabricInterface != "fab0" {
+		t.Errorf("FabricInterface = %q, want %q", cc.FabricInterface, "fab0")
+	}
+	if cc.Fabric1Interface != "fab1" {
+		t.Errorf("Fabric1Interface = %q, want %q", cc.Fabric1Interface, "fab1")
+	}
+	if cc.Fabric1PeerAddress != "10.99.2.2" {
+		t.Errorf("Fabric1PeerAddress = %q, want %q", cc.Fabric1PeerAddress, "10.99.2.2")
+	}
+}
+
+func TestFabricAutoDetectDualFabricNode1(t *testing.T) {
+	// Dual-fabric on node1: both fab0 and fab1 have local members.
+	// FabricInterface = "fab0", Fabric1Interface = "fab1".
+	// Fabric1PeerAddress auto-derived from fab1's /30 address.
+	cmds := []string{
+		"set interfaces fab0 fabric-options member-interfaces ge-0/0/7",
+		"set interfaces fab0 fabric-options member-interfaces ge-7/0/7",
+		"set interfaces fab0 unit 0 family inet address 10.99.1.2/30",
+		"set interfaces fab1 fabric-options member-interfaces ge-0/0/8",
+		"set interfaces fab1 fabric-options member-interfaces ge-7/0/8",
+		"set interfaces fab1 unit 0 family inet address 10.99.2.2/30",
+		"set chassis cluster node 1",
+		"set chassis cluster control-interface hb0",
+		"set interfaces hb0 unit 0 family inet address 10.99.0.2/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := cfg.Chassis.Cluster
+	if cc == nil {
+		t.Fatal("cluster config not found")
+	}
+	if cc.FabricInterface != "fab0" {
+		t.Errorf("FabricInterface = %q, want %q", cc.FabricInterface, "fab0")
+	}
+	if cc.Fabric1Interface != "fab1" {
+		t.Errorf("Fabric1Interface = %q, want %q", cc.Fabric1Interface, "fab1")
+	}
+	if cc.Fabric1PeerAddress != "10.99.2.1" {
+		t.Errorf("Fabric1PeerAddress = %q, want %q", cc.Fabric1PeerAddress, "10.99.2.1")
 	}
 }
 
