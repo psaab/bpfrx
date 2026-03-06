@@ -252,8 +252,11 @@ const (
 	GlobalCtrSyncookieInvalid  = 29
 	GlobalCtrSyncookieBypass    = 30
 	GlobalCtrScreenSessionLimit = 31
-	GlobalCtrFabricFwdDrop     = 32
-	GlobalCtrMax               = 33
+	GlobalCtrFabricFwdDrop      = 32
+	GlobalCtrFabricRedirectFab0 = 33
+	GlobalCtrFabricRedirectFab1 = 34
+	GlobalCtrFabricRedirectZone = 35
+	GlobalCtrMax                = 36
 )
 
 // Host-inbound-traffic service flags (bitmap in zone_config.host_inbound_flags).

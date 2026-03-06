@@ -658,6 +658,11 @@ func (c *ctl) handleShow(args []string) error {
 							return c.showText("chassis-cluster-ip-monitoring-status")
 						}
 						return c.showText("chassis-cluster-ip-monitoring-status")
+					case "fabric":
+						if len(args) >= 4 && args[3] == "statistics" {
+							return c.showText("chassis-cluster-fabric-statistics")
+						}
+						return c.showText("chassis-cluster-fabric-statistics")
 					}
 				}
 				return c.showText("chassis-cluster")

@@ -90,7 +90,8 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Misc fixes (#98-#100,#103):** writeFull loops (#99), heartbeat MTU 1472 (#100), neighbor warmup chains (#98), readiness gate (#103)
 - **HA sync & activation (#131-#134):** LastSeen-based session refresh (#131), all-instances RG activation (#132), syncReady reset on disconnect (#133), hold timer `time.AfterFunc` wakeup (#134)
 - **Fabric monitor resolution (#135-#137):** Monitor commands resolve fab0/fab1 overlay→physical parent for stats/tcpdump; `inc_iface_tx` added to `try_fabric_redirect`
-- See `bugs.md` (CC-1 through CC-14), `phases.md`, and `sync-protocol.md` for full HA details
+- **Fabric observability (#138-#139):** tcpdump warning for XDP-redirected fabric traffic (AF_PACKET incompatible); per-link redirect counters (fab0/fab1/zone-encoded) in BPF + CLI
+- See `bugs.md` (CC-1 through CC-15), `phases.md`, and `sync-protocol.md` for full HA details
 
 ### NPTv6 (RFC 6296)
 - **Stateless IPv6 prefix translation:** 1:1 /48 prefix rewriting, checksum-neutral
@@ -194,7 +195,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - Guard context window — keep messages concise
 
 ## Recent Features (see `phases.md` for full details)
+- **CC-15 Fabric observability (#138-#139):** tcpdump XDP warning + per-link fabric redirect counters (fab0/fab1/zone-encoded)
 - **CC-14 Fabric monitor/stats (#135-#137):** Monitor interface/traffic resolves fab overlay→physical parent; BPF fabric redirect TX counter fix
 - **CC-13 HA sync & activation (#131-#134):** Session refresh for established flows, all-instances RG activation, syncReady reset, hold timer wakeup
 - **CC-12 IPVLAN fixes (#127-#130):** Address reconciliation, stale cleanup, overlay neighbor probe, dual-fabric compiler
-- **CC-11 Fabric health (#121-#126):** Event-driven refresh, stale clearing, oper-state check, gRPC failover, DPDK limitation

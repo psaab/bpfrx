@@ -6469,6 +6469,26 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 		buf.WriteString(s.cluster.FormatIPMonitoringStatus())
 
+	case "chassis-cluster-fabric-statistics":
+		if s.dp == nil || !s.dp.IsLoaded() {
+			fmt.Fprintln(&buf, "Dataplane not loaded")
+			break
+		}
+		total, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirect)
+		fab0, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab0)
+		fab1, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab1)
+		zone, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectZone)
+		drops, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricFwdDrop)
+		fmt.Fprintln(&buf, "Fabric redirect statistics:")
+		fmt.Fprintf(&buf, "    Total redirects:          %d\n", total)
+		fmt.Fprintf(&buf, "    fab0 redirects:           %d\n", fab0)
+		fmt.Fprintf(&buf, "    fab1 redirects:           %d\n", fab1)
+		fmt.Fprintf(&buf, "    Zone-encoded redirects:   %d\n", zone)
+		fmt.Fprintf(&buf, "    Redirect drops:           %d\n", drops)
+		fmt.Fprintln(&buf)
+		fmt.Fprintln(&buf, "Note: XDP-redirected packets bypass AF_PACKET (tcpdump).")
+		fmt.Fprintln(&buf, "Use these counters or 'monitor interface <fab>' for fabric telemetry.")
+
 	case "chassis-environment":
 		thermalZones, _ := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")
 		if len(thermalZones) > 0 {

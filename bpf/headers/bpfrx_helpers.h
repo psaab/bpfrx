@@ -1985,6 +1985,7 @@ try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 		__builtin_memcpy(eth->h_dest, ff0->peer_mac, ETH_ALEN);
 		__builtin_memcpy(eth->h_source, ff0->local_mac, ETH_ALEN);
 		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT_FAB0);
 		inc_iface_tx(ff0->ifindex, pkt_len);
 		return bpf_redirect_map(&tx_ports, ff0->ifindex, 0);
 	}
@@ -1994,6 +1995,7 @@ try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 		__builtin_memcpy(eth->h_dest, ff1->peer_mac, ETH_ALEN);
 		__builtin_memcpy(eth->h_source, ff1->local_mac, ETH_ALEN);
 		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT_FAB1);
 		inc_iface_tx(ff1->ifindex, pkt_len);
 		return bpf_redirect_map(&tx_ports, ff1->ifindex, 0);
 	}
@@ -2053,6 +2055,8 @@ try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
 	if (ff0 && ff0->ifindex != 0) {
 		__builtin_memcpy(eth->h_dest, ff0->peer_mac, ETH_ALEN);
 		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT_FAB0);
+		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT_ZONE);
 		inc_iface_tx(ff0->ifindex, pkt_len);
 		return bpf_redirect_map(&tx_ports, ff0->ifindex, 0);
 	}
@@ -2061,6 +2065,8 @@ try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
 	if (ff1 && ff1->ifindex != 0) {
 		__builtin_memcpy(eth->h_dest, ff1->peer_mac, ETH_ALEN);
 		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT);
+		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT_FAB1);
+		inc_counter(GLOBAL_CTR_FABRIC_REDIRECT_ZONE);
 		inc_iface_tx(ff1->ifindex, pkt_len);
 		return bpf_redirect_map(&tx_ports, ff1->ifindex, 0);
 	}

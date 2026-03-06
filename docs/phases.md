@@ -2870,3 +2870,38 @@ Monitor commands (`monitor interface`, `monitor traffic interface`) and BPF TX c
 - **IPVLAN overlay vs physical parent:** After IPVLAN split, monitor/stats must target the physical parent for wire-level counters. Overlay only sees its own IP traffic
 - **Consistent counter instrumentation:** Every BPF redirect exit path (XDP_REDIRECT via `bpf_redirect_map`) needs `inc_iface_tx` — fabric redirect was missing this
 - **Parent resolution pattern:** Fabric overlay→parent mapping should be centralized for reuse by monitor commands, stats, and any future wire-level operations
+
+---
+
+## Sprint CC-15: Fabric Observability (#138-#139, 2026-03-06)
+
+Two issues with fabric redirect observability. XDP-redirected packets bypass the kernel network stack, making tcpdump unreliable for fabric traffic. Additionally, per-link redirect counters are needed to distinguish fab0 vs fab1 traffic volumes and per-zone redirect breakdowns.
+
+### Context
+After the IPVLAN overlay refactor (CC-11/CC-12) and monitor fixes (CC-14), fabric redirect traffic is correctly counted at the aggregate level via `inc_iface_tx`. However:
+1. `tcpdump` on fabric interfaces (physical parent or overlay) cannot reliably capture XDP-redirected packets — XDP processes packets before `sk_buff` allocation, so `AF_PACKET`-based tools miss them
+2. There are no per-link (fab0 vs fab1) or per-zone redirect counters to diagnose asymmetric forwarding or identify which zones generate fabric redirect traffic
+
+### Fix #138: tcpdump unreliable for XDP fabric redirects — document + alternative telemetry (IN PROGRESS)
+
+**Problem:** `monitor traffic interface <fabric>` uses tcpdump (AF_PACKET), which cannot capture XDP-redirected packets. XDP processes packets before `sk_buff` creation, so AF_PACKET never sees them. Users relying on tcpdump for fabric traffic debugging get incomplete or empty captures.
+
+**Fix:** Add CLI warning when `monitor traffic interface` targets a fabric interface, explaining that XDP-redirected traffic is not visible to tcpdump. Point users to BPF counters (`show interfaces statistics`, `show security flow statistics`) and the new per-link redirect counters (#139) as alternative telemetry.
+
+**Key insight:** XDP and tcpdump are fundamentally incompatible for the same traffic — XDP acts before the kernel networking stack. This is a platform limitation, not a bug. The right approach is clear documentation + alternative observability paths.
+
+### Fix #139: Per-link fabric redirect counters in BPF + CLI exposure (IN PROGRESS)
+
+**Problem:** Fabric redirect traffic is counted as a single aggregate TX counter per interface. No way to distinguish:
+- How much traffic is redirected to fab0 vs fab1
+- Which zones generate fabric redirect traffic
+- Whether redirects are symmetric or asymmetric between nodes
+
+**Fix:** Add per-link redirect counters in BPF (fab0/fab1 differentiated, zone-encoded) and expose them through CLI commands (`show chassis cluster statistics` or similar). This provides the granular fabric telemetry that tcpdump cannot offer.
+
+**Key insight:** With XDP bypassing AF_PACKET, BPF-native counters are the only reliable source of fabric redirect telemetry. Per-link + per-zone granularity enables diagnosis of asymmetric forwarding and zone-specific failover patterns.
+
+### Key Patterns from CC-15
+- **XDP vs AF_PACKET incompatibility:** XDP processes packets before `sk_buff` allocation — tcpdump/AF_PACKET cannot capture XDP-redirected traffic. This is a fundamental platform constraint, not a bug
+- **BPF-native telemetry:** When XDP bypasses kernel networking, BPF maps are the only reliable counters. Per-link and per-zone granularity replaces what tcpdump would have provided
+- **Document limitations prominently:** When a tool (tcpdump) silently fails for a specific traffic path, the CLI should warn users proactively rather than letting them discover empty captures

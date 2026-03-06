@@ -10508,7 +10508,15 @@ func (c *CLI) handleMonitorTraffic(args []string) error {
 	}
 
 	// Resolve fabric IPVLAN overlays to physical parent (#136).
+	origName := iface
 	iface = resolveFabricParent(iface)
+
+	// Warn about XDP redirect visibility on fabric interfaces (#138).
+	if strings.HasPrefix(origName, "fab") || strings.HasPrefix(origName, "em") {
+		fmt.Println("WARNING: XDP-redirected packets bypass AF_PACKET and will not appear in tcpdump.")
+		fmt.Println("For fabric redirect telemetry, use: show chassis cluster fabric statistics")
+		fmt.Println()
+	}
 
 	cmdArgs := []string{"tcpdump", "-i", iface, "-n", "-l"}
 	if count != "0" {
@@ -11134,6 +11142,12 @@ func (c *CLI) showChassisCluster(args []string) error {
 			return c.showChassisClusterInformation()
 		case "statistics":
 			return c.showChassisClusterStatistics()
+		case "fabric":
+			if len(args) > 1 && args[1] == "statistics" {
+				return c.showChassisClusterFabricStatistics()
+			}
+			cmdtree.PrintTreeHelp("show chassis cluster fabric:", operationalTree, "show", "chassis", "cluster", "fabric")
+			return nil
 		case "control-plane":
 			if len(args) > 1 && args[1] == "statistics" {
 				return c.showChassisClusterControlPlaneStats()
@@ -11338,6 +11352,29 @@ func (c *CLI) showChassisClusterStatistics() error {
 		return nil
 	}
 	fmt.Print(c.cluster.FormatStatistics())
+	return nil
+}
+
+func (c *CLI) showChassisClusterFabricStatistics() error {
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("Dataplane not loaded")
+		return nil
+	}
+	total, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirect)
+	fab0, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab0)
+	fab1, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab1)
+	zone, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectZone)
+	drops, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricFwdDrop)
+
+	fmt.Println("Fabric redirect statistics:")
+	fmt.Printf("    Total redirects:          %d\n", total)
+	fmt.Printf("    fab0 redirects:           %d\n", fab0)
+	fmt.Printf("    fab1 redirects:           %d\n", fab1)
+	fmt.Printf("    Zone-encoded redirects:   %d\n", zone)
+	fmt.Printf("    Redirect drops:           %d\n", drops)
+	fmt.Println()
+	fmt.Println("Note: XDP-redirected packets bypass AF_PACKET (tcpdump).")
+	fmt.Println("Use these counters or 'monitor interface <fab>' for fabric telemetry.")
 	return nil
 }
 

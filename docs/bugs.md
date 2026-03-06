@@ -972,3 +972,15 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Symptom:** Fabric TX traffic not counted in `show interfaces statistics` or `monitor interface`. Packets forwarded via `try_fabric_redirect()` in xdp_zone.c bypass TX counter instrumentation
 - **Root cause:** `try_fabric_redirect()` calls `bpf_redirect_map` but never calls `inc_iface_tx(meta, fabric_ifindex)` before returning
 - **Fix:** Add `inc_iface_tx` call before `bpf_redirect_map` return in `try_fabric_redirect()`
+
+## Sprint CC-15: Fabric Observability (#138-#139, 2026-03-06)
+
+### tcpdump unreliable for XDP fabric redirects (IN PROGRESS #138)
+- **Symptom:** `monitor traffic interface <fabric>` shows incomplete or empty captures for fabric redirect traffic. Users see no packets despite active fabric forwarding
+- **Root cause:** XDP processes packets before `sk_buff` allocation. tcpdump uses AF_PACKET which hooks into the kernel network stack after `sk_buff` creation. XDP-redirected packets never reach AF_PACKET
+- **Fix:** Add CLI warning when `monitor traffic` targets fabric interfaces. Document the XDP/AF_PACKET incompatibility. Point users to BPF counters and per-link redirect stats (#139) as reliable alternatives
+
+### Per-link fabric redirect counters missing (IN PROGRESS #139)
+- **Symptom:** No way to see per-link (fab0 vs fab1) or per-zone fabric redirect traffic breakdown. Only aggregate TX counters available via `show interfaces statistics`
+- **Root cause:** `try_fabric_redirect()` increments a single per-interface TX counter but has no per-link or per-zone accounting
+- **Fix:** Add BPF per-link redirect counters (fab0/fab1 differentiated, zone-encoded) and expose via CLI (`show chassis cluster statistics` or similar)
