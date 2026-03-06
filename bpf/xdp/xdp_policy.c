@@ -335,7 +335,7 @@ create_session_v6(struct pkt_meta *meta, __u32 policy_id, __u8 log,
 	return 0;
 }
 
-static __always_inline __u32
+static __noinline __u32
 resolve_pkt_app_id(struct pkt_meta *meta)
 {
 	__u32 pkt_app_id = 0;
@@ -397,7 +397,7 @@ resolve_pkt_app_id(struct pkt_meta *meta)
 	return pkt_app_id;
 }
 
-static __always_inline __u8
+static __noinline __u8
 preid_log_flags(struct flow_config *fc, __u32 pkt_app_id)
 {
 	__u8 log = 0;

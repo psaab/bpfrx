@@ -336,11 +336,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 				nodeID = cfg.Chassis.Cluster.NodeID
 			}
 			d.dp.SeedSessionIDCounter(nodeID)
-			// Apply current config using ordered flow
-			if cfg := d.store.ActiveConfig(); cfg != nil {
-				slog.Info("applying active configuration")
-				d.applyConfig(cfg)
-			}
+		}
+		// Apply current config — needed even in config-only mode so that
+		// VRFs, interfaces, and routing are configured before cluster comms.
+		if cfg := d.store.ActiveConfig(); cfg != nil {
+			slog.Info("applying active configuration")
+			d.applyConfig(cfg)
 		}
 	}
 
@@ -3974,9 +3975,18 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	d.activeClusterTransport = clusterTransportFromConfig(cfg)
 
 	// Determine VRF device if control/fabric interfaces are in mgmt VRF.
+	// Check mgmtVRFInterfaces first, then fall back to probing the control
+	// interface directly (handles config-only mode where applyConfig may
+	// have run but mgmtVRFInterfaces is empty due to VRF creation failure).
 	vrfDevice := ""
 	if len(d.mgmtVRFInterfaces) > 0 {
 		vrfDevice = "vrf-mgmt"
+	} else if cc.ControlInterface != "" {
+		// Control/fabric interfaces (em*, fab*) are always placed in
+		// vrf-mgmt by the compiler. Check if the VRF device exists.
+		if _, err := net.InterfaceByName("vrf-mgmt"); err == nil {
+			vrfDevice = "vrf-mgmt"
+		}
 	}
 
 	// Start BPF watchdog heartbeat: write monotonic timestamp to ha_watchdog
