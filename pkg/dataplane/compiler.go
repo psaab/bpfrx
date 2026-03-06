@@ -29,7 +29,7 @@ type CompileResult struct {
 	AddrIDs     map[string]uint32 // address name -> address ID
 	AppIDs      map[string]uint32 // application name -> app ID
 	PoolIDs     map[string]uint8  // NAT pool name -> pool ID (0-based)
-	NextPoolID  uint8            // next available pool ID (after SNAT assignment)
+	NextPoolID  uint8             // next available pool ID (after SNAT assignment)
 	PolicyNames map[uint32]string // rule_id -> "from-zone/to-zone/policy-name" (or "global/policy-name")
 	AppNames    map[uint16]string // app_id -> application name (for structured logging)
 	PolicySets  int               // number of policy sets created
@@ -4241,7 +4241,7 @@ func (r *CompileResult) tuneInterfaceBuffers(link netlink.Link) {
 	// Without this, generic XDP redirect concentrates TX on whichever CPU
 	// received the packet, causing ksoftirqd imbalance.
 	numCPU := runtime.NumCPU()
-	cpuMask := fmt.Sprintf("%x", (1<<numCPU)-1)
+	cpuMask := allCPUMask(numCPU)
 	// Global RFS flow table (set once, idempotent).
 	os.WriteFile("/proc/sys/net/core/rps_sock_flow_entries", []byte("32768"), 0644)
 	rxQueues, _ := filepath.Glob(fmt.Sprintf("/sys/class/net/%s/queues/rx-*/rps_cpus", name))
@@ -4259,7 +4259,7 @@ func (r *CompileResult) tuneInterfaceBuffers(link netlink.Link) {
 	txQueues, _ := filepath.Glob(fmt.Sprintf("/sys/class/net/%s/queues/tx-*/xps_cpus", name))
 	for i, path := range txQueues {
 		cpu := i % numCPU
-		os.WriteFile(path, []byte(fmt.Sprintf("%x", 1<<cpu)), 0644)
+		os.WriteFile(path, []byte(singleCPUMask(cpu)), 0644)
 	}
 
 	r.ethtoolApplied["buffers:"+name] = true

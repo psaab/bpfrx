@@ -409,15 +409,17 @@ apply_dnat_before_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
  */
 static __always_inline void
 setup_main_table_fib(struct bpf_fib_lookup *fib, struct pkt_meta *meta,
-		     struct fabric_fwd_info *ff_cached)
+		     struct fabric_fwd_info *ff0,
+		     struct fabric_fwd_info *ff1)
 {
 	__builtin_memset(fib, 0, sizeof(*fib));
 	fib->l4_protocol = meta->protocol;
 	fib->tot_len     = meta->pkt_len;
 	fib->tbid        = 254; /* RT_TABLE_MAIN */
 	fib->ifindex     = meta->ingress_ifindex;
-	if (ff_cached && ff_cached->fib_ifindex)
-		fib->ifindex = ff_cached->fib_ifindex;
+	struct fabric_fwd_info *ff_main = fabric_main_fib_peer(ff0, ff1);
+	if (ff_main)
+		fib->ifindex = ff_main->fib_ifindex;
 	if (meta->addr_family == AF_INET) {
 		fib->family   = AF_INET;
 		fib->ipv4_src = meta->src_ip.v4;
@@ -480,6 +482,9 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	__u32 ff_one = 1;
 	struct fabric_fwd_info *ff1_cached =
 		bpf_map_lookup_elem(&fabric_fwd, &ff_one);
+	int ingress_is_fabric =
+		fabric_ingress_match(ctx->ingress_ifindex,
+				     ff_cached, ff1_cached);
 
 	/*
 	 * VRRP multicast (224.0.0.18, proto 112) — pass to host before zone
@@ -507,8 +512,7 @@ int xdp_zone_prog(struct xdp_md *ctx)
 		    zeth->h_source[1] == 0xbf &&
 		    zeth->h_source[2] == 0x72 &&
 		    zeth->h_source[3] == FABRIC_ZONE_MAC_MAGIC) {
-			if ((ff_cached && ff_cached->ifindex != 0 && ctx->ingress_ifindex == ff_cached->ifindex) ||
-			    (ff1_cached && ff1_cached->ifindex != 0 && ctx->ingress_ifindex == ff1_cached->ifindex)) {
+			if (ingress_is_fabric) {
 				meta->ingress_zone = zeth->h_source[5];
 				/* Force main routing table — fabric is
 				 * in vrf-mgmt, but the decoded zone's
@@ -537,8 +541,7 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	 * table override to main (254) is applied after the session
 	 * lookup, only when a synced session exists (forwarded traffic).
 	 * Zone-encoded packets already set routing_table=254 above. */
-	if ((ff_cached && ff_cached->ifindex != 0 && ctx->ingress_ifindex == ff_cached->ifindex) ||
-	    (ff1_cached && ff1_cached->ifindex != 0 && ctx->ingress_ifindex == ff1_cached->ifindex))
+	if (ingress_is_fabric)
 		meta->meta_flags |= META_FLAG_FABRIC_FWD;
 
 zone_resolved:
@@ -755,7 +758,8 @@ zone_resolved:
 		    !check_egress_rg_active(sv4->fib_ifindex,
 					    sv4->fib_vlan_id)) {
 			apply_dnat_before_fabric_redirect(ctx, meta);
-			int fab_rc = try_fabric_redirect(ctx, meta);
+			int fab_rc = try_fabric_redirect_cached(
+				ctx, meta, ff_cached, ff1_cached);
 			if (fab_rc >= 0)
 				return fab_rc;
 			/* Fabric-forwarded + anti-loop: both nodes have
@@ -798,7 +802,8 @@ zone_resolved:
 		    !check_egress_rg_active(sv6->fib_ifindex,
 					    sv6->fib_vlan_id)) {
 			apply_dnat_before_fabric_redirect(ctx, meta);
-			int fab_rc = try_fabric_redirect(ctx, meta);
+			int fab_rc = try_fabric_redirect_cached(
+				ctx, meta, ff_cached, ff1_cached);
 			if (fab_rc >= 0)
 				return fab_rc;
 			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
@@ -915,7 +920,9 @@ zone_resolved:
 					apply_dnat_before_fabric_redirect(
 						ctx, meta);
 					int fab_rc =
-						try_fabric_redirect(ctx, meta);
+						try_fabric_redirect_cached(
+							ctx, meta,
+							ff_cached, ff1_cached);
 					if (fab_rc >= 0)
 						return fab_rc;
 					/* Fabric-forwarded + anti-loop:
@@ -940,8 +947,9 @@ zone_resolved:
 				 * security policy. */
 				{
 					int fab_rc =
-						try_fabric_redirect_with_zone(
-							ctx, meta);
+						try_fabric_redirect_with_zone_cached(
+							ctx, meta,
+							ff_cached, ff1_cached);
 					if (fab_rc >= 0)
 						return fab_rc;
 					/* Anti-loop (arrived on fabric)
@@ -968,14 +976,18 @@ zone_resolved:
 			if (sv4 != NULL) {
 				apply_dnat_before_fabric_redirect(ctx, meta);
 				int fab_rc =
-					try_fabric_redirect(ctx, meta);
+					try_fabric_redirect_cached(
+						ctx, meta,
+						ff_cached, ff1_cached);
 				if (fab_rc >= 0)
 					return fab_rc;
 			}
 			if (sv6 != NULL) {
 				apply_dnat_before_fabric_redirect(ctx, meta);
 				int fab_rc =
-					try_fabric_redirect(ctx, meta);
+					try_fabric_redirect_cached(
+						ctx, meta,
+						ff_cached, ff1_cached);
 				if (fab_rc >= 0)
 					return fab_rc;
 			}
@@ -1020,7 +1032,8 @@ zone_resolved:
 		 * still go through the full conntrack/policy pipeline. */
 		if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
 			struct bpf_fib_lookup fib2 = {};
-			setup_main_table_fib(&fib2, meta, ff_cached);
+			setup_main_table_fib(&fib2, meta,
+					     ff_cached, ff1_cached);
 			int rc2 = bpf_fib_lookup(ctx, &fib2,
 				sizeof(fib2), BPF_FIB_LOOKUP_TBID);
 			if (rc2 == BPF_FIB_LKUP_RET_SUCCESS) {
@@ -1075,8 +1088,9 @@ zone_resolved:
 					apply_dnat_before_fabric_redirect(
 						ctx, meta);
 					int fab_rc =
-						try_fabric_redirect(
-							ctx, meta);
+						try_fabric_redirect_cached(
+							ctx, meta,
+							ff_cached, ff1_cached);
 					if (fab_rc >= 0)
 						return fab_rc;
 				}
@@ -1151,13 +1165,16 @@ zone_resolved:
 				 * preserves ingress zone for policy on
 				 * the peer. */
 				int fab_rc =
-					try_fabric_redirect_with_zone(
-						ctx, meta);
+					try_fabric_redirect_with_zone_cached(
+						ctx, meta,
+						ff_cached, ff1_cached);
 				if (fab_rc >= 0)
 					return fab_rc;
 				/* Plain redirect fallback. */
 				fab_rc =
-					try_fabric_redirect(ctx, meta);
+					try_fabric_redirect_cached(
+						ctx, meta,
+						ff_cached, ff1_cached);
 				if (fab_rc >= 0)
 					return fab_rc;
 
@@ -1175,7 +1192,8 @@ zone_resolved:
 				    META_FLAG_FABRIC_FWD) {
 					struct bpf_fib_lookup fib3 = {};
 					setup_main_table_fib(
-						&fib3, meta, ff_cached);
+						&fib3, meta,
+						ff_cached, ff1_cached);
 					int rc3 = bpf_fib_lookup(
 						ctx, &fib3, sizeof(fib3),
 						BPF_FIB_LOOKUP_TBID);

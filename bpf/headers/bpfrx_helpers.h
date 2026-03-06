@@ -1947,6 +1947,27 @@ check_egress_rg_active(__u32 ifindex, __u16 vlan_id)
 	return 1;
 }
 
+static __always_inline int
+fabric_ingress_match(__u32 ingress, struct fabric_fwd_info *ff0,
+		       struct fabric_fwd_info *ff1)
+{
+	if (ff0 && ff0->ifindex != 0 && ingress == ff0->ifindex)
+		return 1;
+	if (ff1 && ff1->ifindex != 0 && ingress == ff1->ifindex)
+		return 1;
+	return 0;
+}
+
+static __always_inline struct fabric_fwd_info *
+fabric_main_fib_peer(struct fabric_fwd_info *ff0, struct fabric_fwd_info *ff1)
+{
+	if (ff0 && ff0->fib_ifindex)
+		return ff0;
+	if (ff1 && ff1->fib_ifindex)
+		return ff1;
+	return NULL;
+}
+
 /* ============================================================
  * Fabric cross-chassis redirect for cluster failback.
  *
@@ -1959,17 +1980,12 @@ check_egress_rg_active(__u32 ifindex, __u16 vlan_id)
  * back to META_FLAG_KERNEL_ROUTE).
  * ============================================================ */
 static __always_inline int
-try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
+try_fabric_redirect_cached(struct xdp_md *ctx, struct pkt_meta *meta,
+			   struct fabric_fwd_info *ff0,
+			   struct fabric_fwd_info *ff1)
 {
-	__u32 zero = 0, one = 1;
-	struct fabric_fwd_info *ff0 = bpf_map_lookup_elem(&fabric_fwd, &zero);
-	struct fabric_fwd_info *ff1 = bpf_map_lookup_elem(&fabric_fwd, &one);
-	__u32 ingress = ctx->ingress_ifindex;
-
 	/* Anti-loop: skip if ingressed on either fabric */
-	if (ff0 && ff0->ifindex != 0 && ingress == ff0->ifindex)
-		return -1;
-	if (ff1 && ff1->ifindex != 0 && ingress == ff1->ifindex)
+	if (fabric_ingress_match(ctx->ingress_ifindex, ff0, ff1))
 		return -1;
 
 	void *data = (void *)(long)ctx->data;
@@ -2003,6 +2019,16 @@ try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 	return -1;
 }
 
+static __always_inline int
+try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	__u32 zero = 0, one = 1;
+	struct fabric_fwd_info *ff0 = bpf_map_lookup_elem(&fabric_fwd, &zero);
+	struct fabric_fwd_info *ff1 = bpf_map_lookup_elem(&fabric_fwd, &one);
+
+	return try_fabric_redirect_cached(ctx, meta, ff0, ff1);
+}
+
 /* ============================================================
  * Zone-encoded fabric redirect for new connections.
  *
@@ -2022,17 +2048,13 @@ try_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
  * Returns >= 0 (XDP_REDIRECT) on success, -1 on failure.
  * ============================================================ */
 static __always_inline int
-try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
+try_fabric_redirect_with_zone_cached(struct xdp_md *ctx,
+				     struct pkt_meta *meta,
+				     struct fabric_fwd_info *ff0,
+				     struct fabric_fwd_info *ff1)
 {
-	__u32 zero = 0, one = 1;
-	struct fabric_fwd_info *ff0 = bpf_map_lookup_elem(&fabric_fwd, &zero);
-	struct fabric_fwd_info *ff1 = bpf_map_lookup_elem(&fabric_fwd, &one);
-	__u32 ingress = ctx->ingress_ifindex;
-
 	/* Anti-loop: don't redirect if packet arrived on either fabric */
-	if (ff0 && ff0->ifindex != 0 && ingress == ff0->ifindex)
-		return -1;
-	if (ff1 && ff1->ifindex != 0 && ingress == ff1->ifindex)
+	if (fabric_ingress_match(ctx->ingress_ifindex, ff0, ff1))
 		return -1;
 
 	void *data = (void *)(long)ctx->data;
@@ -2072,6 +2094,16 @@ try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
 	}
 
 	return -1;
+}
+
+static __always_inline int
+try_fabric_redirect_with_zone(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	__u32 zero = 0, one = 1;
+	struct fabric_fwd_info *ff0 = bpf_map_lookup_elem(&fabric_fwd, &zero);
+	struct fabric_fwd_info *ff1 = bpf_map_lookup_elem(&fabric_fwd, &one);
+
+	return try_fabric_redirect_with_zone_cached(ctx, meta, ff0, ff1);
 }
 
 #endif /* __BPFRX_HELPERS_H__ */
