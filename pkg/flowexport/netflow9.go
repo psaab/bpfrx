@@ -55,14 +55,8 @@ type V9TemplateOptions struct {
 	IncludeFlowDir bool // include fieldDirection (export-extension flow-dir)
 }
 
-// DefaultV9TemplateOptions returns options with all extensions enabled (backward compat).
-func DefaultV9TemplateOptions() V9TemplateOptions {
-	return V9TemplateOptions{IncludeFlowDir: true}
-}
-
-// buildTemplateFieldsV4 returns the IPv4 template fields based on options.
-func buildTemplateFieldsV4(opts V9TemplateOptions) []templateField {
-	fields := []templateField{
+var (
+	netflowTemplateFieldsV4 = []templateField{
 		{fieldIPv4SrcAddr, 4},
 		{fieldIPv4DstAddr, 4},
 		{fieldL4SrcPort, 2},
@@ -70,36 +64,34 @@ func buildTemplateFieldsV4(opts V9TemplateOptions) []templateField {
 		{fieldProtocol, 1},
 		{fieldSrcTos, 1},
 		{fieldTCPFlags, 1},
+		{fieldDirection, 1},
+		{fieldInputSNMP, 4},
+		{fieldOutputSNMP, 4},
+		{fieldInPkts, 8},
+		{fieldInBytes, 8},
+		{fieldFirstSwitched, 4},
+		{fieldLastSwitched, 4},
+		{fieldSrcMask, 1},
+		{fieldDstMask, 1},
 	}
-	if opts.IncludeFlowDir {
-		fields = append(fields, templateField{fieldDirection, 1})
-	} else {
-		// 1 byte padding to maintain alignment after tcp_flags
-		fields = append(fields, templateField{0, 0}) // placeholder, not emitted
+	netflowTemplateFieldsV4NoDir = []templateField{
+		{fieldIPv4SrcAddr, 4},
+		{fieldIPv4DstAddr, 4},
+		{fieldL4SrcPort, 2},
+		{fieldL4DstPort, 2},
+		{fieldProtocol, 1},
+		{fieldSrcTos, 1},
+		{fieldTCPFlags, 1},
+		{fieldInputSNMP, 4},
+		{fieldOutputSNMP, 4},
+		{fieldInPkts, 8},
+		{fieldInBytes, 8},
+		{fieldFirstSwitched, 4},
+		{fieldLastSwitched, 4},
+		{fieldSrcMask, 1},
+		{fieldDstMask, 1},
 	}
-	fields = append(fields,
-		templateField{fieldInputSNMP, 4},
-		templateField{fieldOutputSNMP, 4},
-		templateField{fieldInPkts, 8},
-		templateField{fieldInBytes, 8},
-		templateField{fieldFirstSwitched, 4},
-		templateField{fieldLastSwitched, 4},
-		templateField{fieldSrcMask, 1},
-		templateField{fieldDstMask, 1},
-	)
-	// Filter out zero-type placeholders
-	var result []templateField
-	for _, f := range fields {
-		if f.fieldType != 0 || f.fieldLen != 0 {
-			result = append(result, f)
-		}
-	}
-	return result
-}
-
-// buildTemplateFieldsV6 returns the IPv6 template fields based on options.
-func buildTemplateFieldsV6(opts V9TemplateOptions) []templateField {
-	fields := []templateField{
+	netflowTemplateFieldsV6 = []templateField{
 		{fieldIPv6SrcAddr, 16},
 		{fieldIPv6DstAddr, 16},
 		{fieldL4SrcPort, 2},
@@ -107,21 +99,54 @@ func buildTemplateFieldsV6(opts V9TemplateOptions) []templateField {
 		{fieldProtocol, 1},
 		{fieldSrcTos, 1},
 		{fieldTCPFlags, 1},
+		{fieldDirection, 1},
+		{fieldInputSNMP, 4},
+		{fieldOutputSNMP, 4},
+		{fieldInPkts, 8},
+		{fieldInBytes, 8},
+		{fieldFirstSwitched, 4},
+		{fieldLastSwitched, 4},
+		{fieldIPv6SrcMask, 1},
+		{fieldIPv6DstMask, 1},
 	}
+	netflowTemplateFieldsV6NoDir = []templateField{
+		{fieldIPv6SrcAddr, 16},
+		{fieldIPv6DstAddr, 16},
+		{fieldL4SrcPort, 2},
+		{fieldL4DstPort, 2},
+		{fieldProtocol, 1},
+		{fieldSrcTos, 1},
+		{fieldTCPFlags, 1},
+		{fieldInputSNMP, 4},
+		{fieldOutputSNMP, 4},
+		{fieldInPkts, 8},
+		{fieldInBytes, 8},
+		{fieldFirstSwitched, 4},
+		{fieldLastSwitched, 4},
+		{fieldIPv6SrcMask, 1},
+		{fieldIPv6DstMask, 1},
+	}
+)
+
+// DefaultV9TemplateOptions returns options with all extensions enabled (backward compat).
+func DefaultV9TemplateOptions() V9TemplateOptions {
+	return V9TemplateOptions{IncludeFlowDir: true}
+}
+
+// buildTemplateFieldsV4 returns the IPv4 template fields based on options.
+func buildTemplateFieldsV4(opts V9TemplateOptions) []templateField {
 	if opts.IncludeFlowDir {
-		fields = append(fields, templateField{fieldDirection, 1})
+		return netflowTemplateFieldsV4
 	}
-	fields = append(fields,
-		templateField{fieldInputSNMP, 4},
-		templateField{fieldOutputSNMP, 4},
-		templateField{fieldInPkts, 8},
-		templateField{fieldInBytes, 8},
-		templateField{fieldFirstSwitched, 4},
-		templateField{fieldLastSwitched, 4},
-		templateField{fieldIPv6SrcMask, 1},
-		templateField{fieldIPv6DstMask, 1},
-	)
-	return fields
+	return netflowTemplateFieldsV4NoDir
+}
+
+// buildTemplateFieldsV6 returns the IPv6 template fields based on options.
+func buildTemplateFieldsV6(opts V9TemplateOptions) []templateField {
+	if opts.IncludeFlowDir {
+		return netflowTemplateFieldsV6
+	}
+	return netflowTemplateFieldsV6NoDir
 }
 
 // recordSize computes the data record size from template fields, padded to 4 bytes.
@@ -166,14 +191,18 @@ type nfHeader struct {
 	SourceID  uint32
 }
 
-func encodeHeader(h nfHeader) []byte {
-	b := make([]byte, 20)
+func encodeHeaderInto(b []byte, h nfHeader) {
 	binary.BigEndian.PutUint16(b[0:2], h.Version)
 	binary.BigEndian.PutUint16(b[2:4], h.Count)
 	binary.BigEndian.PutUint32(b[4:8], h.SysUptime)
 	binary.BigEndian.PutUint32(b[8:12], h.UnixSecs)
 	binary.BigEndian.PutUint32(b[12:16], h.SeqNumber)
 	binary.BigEndian.PutUint32(b[16:20], h.SourceID)
+}
+
+func encodeHeader(h nfHeader) []byte {
+	b := make([]byte, 20)
+	encodeHeaderInto(b, h)
 	return b
 }
 
@@ -222,44 +251,64 @@ func encodeDataFlowSet(records []FlowRecord, bootTime time.Time, opts V9Template
 	if len(records) == 0 {
 		return nil
 	}
-	isV6 := records[0].IsIPv6
-	var tmplID uint16
-	var fields []templateField
-	if isV6 {
-		tmplID = templateIDv6
-		fields = buildTemplateFieldsV6(opts)
-	} else {
-		tmplID = templateIDv4
-		fields = buildTemplateFieldsV4(opts)
-	}
-	recSize := recordSize(fields)
-
-	// FlowSet header (4 bytes) + records
-	totalLen := 4 + len(records)*recSize
-	// Pad to 4-byte boundary
-	pad := (4 - totalLen%4) % 4
-	totalLen += pad
-
+	tmplID, fields, recSize := netflowTemplateConfig(records[0].IsIPv6, opts)
+	totalLen := dataFlowSetLen(len(records), recSize)
 	b := make([]byte, totalLen)
-	off := 0
-
-	// FlowSet header
-	binary.BigEndian.PutUint16(b[off:off+2], tmplID)
-	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(totalLen))
-	off += 4
-
-	for _, r := range records {
-		if isV6 {
-			off = encodeRecordV6(b, off, r, bootTime, opts)
-		} else {
-			off = encodeRecordV4(b, off, r, bootTime, opts)
-		}
-	}
-
+	encodeDataFlowSetInto(b, records, bootTime, tmplID, fields, recSize)
 	return b
 }
 
-func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time, opts V9TemplateOptions) int {
+func netflowTemplateConfig(isV6 bool, opts V9TemplateOptions) (uint16, []templateField, int) {
+	if isV6 {
+		fields := buildTemplateFieldsV6(opts)
+		return templateIDv6, fields, recordSize(fields)
+	}
+	fields := buildTemplateFieldsV4(opts)
+	return templateIDv4, fields, recordSize(fields)
+}
+
+func dataFlowSetLen(recordCount, recSize int) int {
+	totalLen := 4 + recordCount*recSize
+	pad := (4 - totalLen%4) % 4
+	return totalLen + pad
+}
+
+func encodeDataFlowSetInto(b []byte, records []FlowRecord, bootTime time.Time,
+	tmplID uint16, fields []templateField, recSize int,
+) {
+	if len(records) == 0 {
+		return
+	}
+	totalLen := dataFlowSetLen(len(records), recSize)
+	binary.BigEndian.PutUint16(b[0:2], tmplID)
+	binary.BigEndian.PutUint16(b[2:4], uint16(totalLen))
+	off := 4
+	isV6 := records[0].IsIPv6
+	includeFlowDir := fieldSetIncludesFlowDir(fields)
+	for _, r := range records {
+		if isV6 {
+			off = encodeRecordV6(b, off, r, bootTime,
+				includeFlowDir, recSize)
+		} else {
+			off = encodeRecordV4(b, off, r, bootTime,
+				includeFlowDir, recSize)
+		}
+	}
+	clear(b[off:totalLen])
+}
+
+func fieldSetIncludesFlowDir(fields []templateField) bool {
+	for _, f := range fields {
+		if f.fieldType == fieldDirection {
+			return true
+		}
+	}
+	return false
+}
+
+func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time,
+	includeFlowDir bool, recSize int,
+) int {
 	startOff := off
 	src4 := r.SrcIP.To4()
 	dst4 := r.DstIP.To4()
@@ -283,7 +332,7 @@ func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time, opts V9
 	off++
 	b[off] = r.TCPFlags
 	off++
-	if opts.IncludeFlowDir {
+	if includeFlowDir {
 		b[off] = r.Direction
 		off++
 	}
@@ -303,12 +352,12 @@ func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time, opts V9
 	off++
 	b[off] = r.DstMask
 	off++
-	// Advance to padded record boundary
-	recSize := recordSize(buildTemplateFieldsV4(opts))
 	return startOff + recSize
 }
 
-func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time, opts V9TemplateOptions) int {
+func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time,
+	includeFlowDir bool, recSize int,
+) int {
 	startOff := off
 	src16 := r.SrcIP.To16()
 	dst16 := r.DstIP.To16()
@@ -332,7 +381,7 @@ func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time, opts V9
 	off++
 	b[off] = r.TCPFlags
 	off++
-	if opts.IncludeFlowDir {
+	if includeFlowDir {
 		b[off] = r.Direction
 		off++
 	}
@@ -352,8 +401,6 @@ func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time, opts V9
 	off++
 	b[off] = r.DstMask
 	off++
-	// Advance to padded record boundary
-	recSize := recordSize(buildTemplateFieldsV6(opts))
 	return startOff + recSize
 }
 

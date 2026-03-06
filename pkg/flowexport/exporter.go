@@ -118,8 +118,9 @@ func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsC
 	seen := make(map[string]bool)
 	deduped := ec.Collectors[:0]
 	for _, c := range ec.Collectors {
-		if !seen[c.Address] {
-			seen[c.Address] = true
+		key := collectorKey(c)
+		if !seen[key] {
+			seen[key] = true
 			deduped = append(deduped, c)
 		}
 	}
@@ -208,9 +209,14 @@ func parseIfaceRef(ref string) (string, int) {
 
 // Exporter sends NetFlow v9 packets to configured collectors.
 type Exporter struct {
-	cfg      ExportConfig
-	bootTime time.Time
-	sourceID uint32
+	cfg             ExportConfig
+	bootTime        time.Time
+	sourceID        uint32
+	fieldsV4        []templateField
+	fieldsV6        []templateField
+	recSizeV4       int
+	recSizeV6       int
+	templateFlowSet []byte
 
 	mu    sync.Mutex
 	seq   uint32
@@ -232,7 +238,12 @@ func NewExporter(cfg ExportConfig) (*Exporter, error) {
 		cfg:      cfg,
 		bootTime: time.Now(),
 		sourceID: 1,
+		fieldsV4: buildTemplateFieldsV4(cfg.V9TemplateOpts),
+		fieldsV6: buildTemplateFieldsV6(cfg.V9TemplateOpts),
 	}
+	e.recSizeV4 = recordSize(e.fieldsV4)
+	e.recSizeV6 = recordSize(e.fieldsV6)
+	e.templateFlowSet = encodeTemplateFlowSet(cfg.V9TemplateOpts)
 
 	for _, cc := range cfg.Collectors {
 		var conn net.Conn
@@ -332,8 +343,6 @@ func (e *Exporter) Close() {
 }
 
 func (e *Exporter) sendTemplates() {
-	tmplFS := encodeTemplateFlowSet(e.cfg.V9TemplateOpts)
-
 	e.mu.Lock()
 	seq := e.seq
 	e.seq++
@@ -349,7 +358,9 @@ func (e *Exporter) sendTemplates() {
 		SourceID:  e.sourceID,
 	}
 
-	pkt := append(encodeHeader(hdr), tmplFS...)
+	pkt := make([]byte, 20+len(e.templateFlowSet))
+	encodeHeaderInto(pkt[:20], hdr)
+	copy(pkt[20:], e.templateFlowSet)
 	for _, c := range e.conns {
 		if _, err := c.Write(pkt); err != nil {
 			slog.Debug("netflow template send failed", "err", err)
@@ -378,15 +389,21 @@ func (e *Exporter) sendRecords(records []FlowRecord) {
 		return
 	}
 
-	opts := e.cfg.V9TemplateOpts
 	isV6 := records[0].IsIPv6
-	var fields []templateField
+	var (
+		fields  []templateField
+		recSize int
+		tmplID  uint16
+	)
 	if isV6 {
-		fields = buildTemplateFieldsV6(opts)
+		fields = e.fieldsV6
+		recSize = e.recSizeV6
+		tmplID = templateIDv6
 	} else {
-		fields = buildTemplateFieldsV4(opts)
+		fields = e.fieldsV4
+		recSize = e.recSizeV4
+		tmplID = templateIDv4
 	}
-	recSize := recordSize(fields)
 
 	// Split into chunks that fit in maxPayload
 	// Reserve 20 bytes for header + 4 bytes for flowset header
@@ -401,11 +418,7 @@ func (e *Exporter) sendRecords(records []FlowRecord) {
 			end = len(records)
 		}
 		batch := records[i:end]
-
-		dataFS := encodeDataFlowSet(batch, e.bootTime, opts)
-		if dataFS == nil {
-			continue
-		}
+		dataLen := dataFlowSetLen(len(batch), recSize)
 
 		e.mu.Lock()
 		seq := e.seq
@@ -422,7 +435,10 @@ func (e *Exporter) sendRecords(records []FlowRecord) {
 			SourceID:  e.sourceID,
 		}
 
-		pkt := append(encodeHeader(hdr), dataFS...)
+		pkt := make([]byte, 20+dataLen)
+		encodeHeaderInto(pkt[:20], hdr)
+		encodeDataFlowSetInto(pkt[20:], batch, e.bootTime,
+			tmplID, fields, recSize)
 		for _, c := range e.conns {
 			if _, err := c.Write(pkt); err != nil {
 				slog.Debug("netflow data send failed", "err", err)
@@ -445,4 +461,8 @@ func estimateSessionDuration(pkts uint64, proto uint8) time.Duration {
 		return time.Duration(pkts) * 100 * time.Millisecond
 	}
 	return time.Duration(pkts) * 50 * time.Millisecond
+}
+
+func collectorKey(c CollectorConfig) string {
+	return c.Address + "\x00" + c.SourceAddress
 }
