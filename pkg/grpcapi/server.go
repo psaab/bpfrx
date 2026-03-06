@@ -6570,6 +6570,9 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 		if len(cfg.System.NTPServers) > 0 {
 			fmt.Fprintf(&buf, "  NTP servers:    %s\n", strings.Join(cfg.System.NTPServers, ", "))
+			if cfg.System.NTPThreshold > 0 && cfg.System.NTPThresholdAction != "" {
+				fmt.Fprintf(&buf, "  NTP threshold:  %d seconds (%s)\n", cfg.System.NTPThreshold, cfg.System.NTPThresholdAction)
+			}
 		}
 		if cfg.Security.Log.Mode != "" {
 			fmt.Fprintf(&buf, "  Security log:   mode %s\n", cfg.Security.Log.Mode)
@@ -6607,6 +6610,9 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		fmt.Fprintln(&buf, "NTP servers:")
 		for _, server := range cfg.System.NTPServers {
 			fmt.Fprintf(&buf, "  %s\n", server)
+		}
+		if cfg.System.NTPThreshold > 0 && cfg.System.NTPThresholdAction != "" {
+			fmt.Fprintf(&buf, "  Threshold: %d seconds (%s)\n", cfg.System.NTPThreshold, cfg.System.NTPThresholdAction)
 		}
 		if out, err := exec.Command("chronyc", "tracking").CombinedOutput(); err == nil {
 			writeChronyTracking(&buf, string(out))

@@ -1,26 +1,20 @@
-# Next Feature: `system ntp threshold <ms> action <accept|reject>`
+# Next Feature: `system ntp threshold <seconds> action <accept|reject>`
 
-Date: 2026-03-02  
-Status: Proposed
+Date: 2026-03-06
+Status: Implemented
 
 ## Config Evidence
 - Present in `/home/ps/git/bpfrx/vsrx.conf:109` as `threshold 400 action accept;`
 
-## Current State
-- Parsed into `SystemConfig.NTPThreshold` and `NTPThresholdAction`: `pkg/config/compiler.go`
-- Runtime NTP apply only writes chrony server lines and reloads sources: `pkg/daemon/daemon.go` (`applySystemNTP`)
-- Threshold/action values are currently ignored
+## Implemented Behavior
+1. `system ntp threshold <seconds> action accept` writes chrony `logchange <seconds>` so large offsets are logged while remaining acceptable.
+2. `system ntp threshold <seconds> action reject` writes `logchange <seconds>` and `maxchange <seconds> 1 -1` so large post-startup corrections are rejected.
+3. `show ntp` and system summary output display the configured threshold mode.
+4. Threshold config is reconciled through a managed chrony drop-in file alongside the existing managed source list.
 
-## Problem
-Time discipline behavior differs from operator intent in configs that rely on explicit threshold policy. Failover and session-sync systems can be sensitive to clock behavior, so silently ignoring this knob is risky.
+## Notes
+- This maps the Junos operator intent onto chrony primitives rather than re-implementing NTP discipline in bpfrxd.
+- The value is treated as seconds, matching Junos documentation and chrony directive units.
 
-## Proposed Implementation Scope
-1. Map threshold/action into chrony-compatible controls (or enforce in bpfrxd wrapper logic if chrony mapping is insufficient).
-2. Expose active threshold mode in operational output.
-3. Emit warning when configured value cannot be represented exactly.
-4. Add tests for accept/reject behaviors and config rendering.
-
-## Acceptance Criteria
-- Configured threshold/action changes runtime NTP behavior deterministically.
-- `show` output reflects effective threshold policy.
-- Unsupported combinations produce explicit warning, not silent ignore.
+## Validation
+- Unit tests cover chrony source rendering, threshold rendering for `accept` and `reject`, and managed file reconciliation.

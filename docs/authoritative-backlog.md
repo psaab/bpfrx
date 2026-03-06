@@ -23,8 +23,8 @@ Use these sources in this order when there is disagreement:
 Row-level gap totals:
 - Missing: 120
 - Partial: 12
-- Parse-Only: 4
-- Total Open Gaps: 136
+- Parse-Only: 3
+- Total Open Gaps: 135
 
 Category totals:
 
@@ -50,7 +50,7 @@ Category totals:
 | 19. Multi-Tenancy | 4 | 0 | 0 | 4 |
 | 20. Management & Automation | 9 | 2 | 0 | 11 |
 | 21. Interface Enhancements | 1 | 1 | 0 | 2 |
-| 22. System Enhancements | 5 | 0 | 2 | 7 |
+| 22. System Enhancements | 5 | 0 | 1 | 6 |
 | 23. Miscellaneous Features | 6 | 0 | 0 | 6 |
 
 High-priority open items:
@@ -72,7 +72,6 @@ From `docs/next-features` and HA proposal docs:
 - Runtime wiring for `security pre-id-default-policy`
 - Runtime behavior for `system master-password`
 - Runtime behavior for `system license autoupdate url`
-- Runtime behavior for `system ntp threshold ... action ...`
 
 ### 3) Additional open items from bug/test planning docs
 
@@ -100,6 +99,7 @@ These are documented as implemented in `docs/phases.md` and should not remain in
 - Sprint PR #67: `monitor security flow` and `monitor security packet-drop`
 - Sprint #68: HA fail-closed default + `set chassis cluster hitless-restart` opt-in
 - HA sync hardening sprint #69-#80 items called out as fixed in `docs/bugs.md`
+- System NTP threshold action runtime wiring (`accept`/`reject`) via chrony
 - Sprint CC-18: Junos IKE/IPsec compatibility items now merged on `master`:
   - gateway `local-certificate` / pubkey auth generation
   - `traffic-selector` support

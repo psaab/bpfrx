@@ -261,7 +261,7 @@ type SystemConfig struct {
 	TimeZone           string
 	NameServers        []string // DNS server addresses
 	NTPServers         []string // NTP server addresses
-	NTPThreshold       int      // NTP threshold in milliseconds (0 = default)
+	NTPThreshold       int      // NTP threshold in seconds (0 = default)
 	NTPThresholdAction string   // "accept" or "reject"
 	NoRedirects        bool     // disable ICMP redirects
 	BackupRouter       string   // backup default gateway IP

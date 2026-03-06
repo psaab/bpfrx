@@ -3021,40 +3021,126 @@ func restartResolved() {
 	}
 }
 
-// applySystemNTP configures chrony from system { ntp } config.
-// Writes per-server source lines to /etc/chrony/sources.d/bpfrx.sources
-// and reloads chrony to pick up changes.
-func (d *Daemon) applySystemNTP(cfg *config.Config) {
-	if len(cfg.System.NTPServers) == 0 || isProcessDisabled(cfg, "ntp") {
-		return
-	}
+const (
+	chronySourcesPath   = "/etc/chrony/sources.d/bpfrx.sources"
+	chronyThresholdPath = "/etc/chrony/conf.d/bpfrx-threshold.conf"
+)
 
+func renderChronySources(servers []string) string {
 	var b strings.Builder
-	for _, server := range cfg.System.NTPServers {
-		// Use "pool" directive for hostnames (multiple IPs), "server" for explicit IPs
+	for _, server := range servers {
+		// Use "pool" for hostnames and "server" for literal IPs.
 		directive := "pool"
 		if net.ParseIP(server) != nil {
 			directive = "server"
 		}
 		fmt.Fprintf(&b, "%s %s iburst\n", directive, server)
 	}
-	content := b.String()
-	confPath := "/etc/chrony/sources.d/bpfrx.sources"
+	return b.String()
+}
 
-	current, _ := os.ReadFile(confPath)
-	if string(current) == content {
-		return // no change
+func renderChronyThreshold(threshold int, action string) string {
+	if threshold <= 0 || action == "" {
+		return ""
 	}
 
-	os.MkdirAll("/etc/chrony/sources.d", 0755)
-	if err := os.WriteFile(confPath, []byte(content), 0644); err != nil {
-		slog.Warn("failed to write chrony sources", "err", err)
+	// Junos NTP threshold is configured in seconds; chrony directives use
+	// seconds as well. "accept" logs offsets beyond the threshold while
+	// allowing correction, and "reject" additionally refuses large changes
+	// after the initial update.
+	var b strings.Builder
+	fmt.Fprintf(&b, "logchange %d\n", threshold)
+	if action == "reject" {
+		fmt.Fprintf(&b, "maxchange %d 1 -1\n", threshold)
+	}
+	return b.String()
+}
+
+func reconcileManagedFile(path, content string) (bool, error) {
+	current, err := os.ReadFile(path)
+	if err == nil && string(current) == content {
+		return false, nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return false, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	if content == "" {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return false, fmt.Errorf("remove %s: %w", path, err)
+		}
+		return !os.IsNotExist(err), nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return false, fmt.Errorf("create dir for %s: %w", path, err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		return false, fmt.Errorf("write %s: %w", path, err)
+	}
+	return true, nil
+}
+
+func reloadChronyRuntime(sourcesChanged, thresholdChanged bool) {
+	if sourcesChanged {
+		if out, err := exec.Command("chronyc", "reload", "sources").CombinedOutput(); err != nil {
+			slog.Warn("failed to reload chrony sources", "err", err, "output", string(out))
+		}
+	}
+
+	if !thresholdChanged {
 		return
 	}
 
-	// Reload chrony to pick up new sources
-	exec.Command("chronyc", "reload", "sources").Run()
-	slog.Info("NTP config applied via chrony", "servers", cfg.System.NTPServers)
+	commands := [][]string{
+		{"systemctl", "reload", "chrony"},
+		{"systemctl", "reload", "chronyd"},
+		{"systemctl", "restart", "chrony"},
+		{"systemctl", "restart", "chronyd"},
+	}
+	for _, cmd := range commands {
+		if out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput(); err == nil {
+			return
+		} else {
+			slog.Debug("chrony config reload attempt failed", "cmd", strings.Join(cmd, " "), "err", err, "output", string(out))
+		}
+	}
+	slog.Warn("failed to reload chrony threshold config; change will apply on next chronyd restart")
+}
+
+// applySystemNTP configures chrony from system { ntp } config.
+// Writes per-server source lines to /etc/chrony/sources.d/bpfrx.sources and
+// optional threshold directives to /etc/chrony/conf.d/bpfrx-threshold.conf.
+func (d *Daemon) applySystemNTP(cfg *config.Config) {
+	if isProcessDisabled(cfg, "ntp") {
+		if _, err := reconcileManagedFile(chronySourcesPath, ""); err != nil {
+			slog.Warn("failed to remove chrony sources", "err", err)
+		}
+		if _, err := reconcileManagedFile(chronyThresholdPath, ""); err != nil {
+			slog.Warn("failed to remove chrony threshold config", "err", err)
+		}
+		return
+	}
+
+	sourcesChanged, err := reconcileManagedFile(chronySourcesPath, renderChronySources(cfg.System.NTPServers))
+	if err != nil {
+		slog.Warn("failed to reconcile chrony sources", "err", err)
+		return
+	}
+	thresholdChanged, err := reconcileManagedFile(chronyThresholdPath, renderChronyThreshold(cfg.System.NTPThreshold, cfg.System.NTPThresholdAction))
+	if err != nil {
+		slog.Warn("failed to reconcile chrony threshold config", "err", err)
+		return
+	}
+	if !sourcesChanged && !thresholdChanged {
+		return
+	}
+
+	reloadChronyRuntime(sourcesChanged, thresholdChanged)
+	slog.Info("NTP config applied via chrony",
+		"servers", cfg.System.NTPServers,
+		"threshold", cfg.System.NTPThreshold,
+		"action", cfg.System.NTPThresholdAction)
 }
 
 // applyDNSService manages systemd-resolved based on system { services { dns } }.

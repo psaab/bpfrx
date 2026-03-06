@@ -7891,6 +7891,9 @@ func (c *CLI) showSystemNTP() error {
 	for _, server := range cfg.System.NTPServers {
 		fmt.Printf("  %s\n", server)
 	}
+	if cfg.System.NTPThreshold > 0 && cfg.System.NTPThresholdAction != "" {
+		fmt.Printf("  Threshold: %d seconds (%s)\n", cfg.System.NTPThreshold, cfg.System.NTPThresholdAction)
+	}
 
 	// Try chronyc tracking for detailed sync status
 	if out, err := exec.Command("chronyc", "tracking").CombinedOutput(); err == nil {
@@ -8017,6 +8020,9 @@ func (c *CLI) showSystemServices() error {
 	// NTP
 	if len(cfg.System.NTPServers) > 0 {
 		fmt.Printf("  NTP servers:    %s\n", strings.Join(cfg.System.NTPServers, ", "))
+		if cfg.System.NTPThreshold > 0 && cfg.System.NTPThresholdAction != "" {
+			fmt.Printf("  NTP threshold:  %d seconds (%s)\n", cfg.System.NTPThreshold, cfg.System.NTPThresholdAction)
+		}
 	}
 
 	// Syslog
