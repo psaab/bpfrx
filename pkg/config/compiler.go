@@ -510,9 +510,9 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
-	// Warn if private-rg-election combined with no-reth-vrrp (redundant)
+	// Warn if no-reth-vrrp set explicitly — redundant since private-rg-election is now default
 	if cc := cfg.Chassis.Cluster; cc != nil && cc.PrivateRGElection && cc.NoRethVRRP {
-		warnings = append(warnings, "chassis cluster: no-reth-vrrp is redundant when private-rg-election is set")
+		warnings = append(warnings, "chassis cluster: no-reth-vrrp is redundant (private-rg-election is the default)")
 	}
 
 	// Warn about unsupported export-extension app-id in flow monitoring templates
@@ -6348,8 +6348,11 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 	if clusterNode.FindChild("no-reth-vrrp") != nil {
 		ch.Cluster.NoRethVRRP = true
 	}
-	if clusterNode.FindChild("private-rg-election") != nil {
-		ch.Cluster.PrivateRGElection = true
+	// Private RG election is the default — suppress RETH VRRP, elect over
+	// control link only.  "no-private-rg-election" opts out (legacy VRRP).
+	ch.Cluster.PrivateRGElection = true
+	if clusterNode.FindChild("no-private-rg-election") != nil {
+		ch.Cluster.PrivateRGElection = false
 	}
 	if n := clusterNode.FindChild("peer-fencing"); n != nil {
 		if v := nodeVal(n); v != "" {

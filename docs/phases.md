@@ -3047,3 +3047,28 @@ After the IPVLAN overlay refactor (CC-11/CC-12) and monitor fixes (CC-14), fabri
 - `accept` → chrony `logchange <threshold>` (log-only); `reject` → adds `maxchange <threshold> 1 -1` (rejects large post-startup corrections)
 - Managed drop-in at `/etc/chrony/conf.d/bpfrx-threshold.conf`; refactored `applySystemNTP()` into helpers (`renderChronySources`, `renderChronyThreshold`, `reconcileManagedFile`)
 - NTP threshold shown in `show ntp` and `show system services` CLI/gRPC output; unit tests in `pkg/daemon/ntp_test.go`
+
+---
+
+## Sprint CC-19: AppID Runtime, Pre-ID Logging, Master-Password Encryption (#163, 2026-03-06)
+
+### AppID runtime wiring
+- **Problem:** AppID signatures were parsed and compiled to BPF maps, but no Go-side runtime existed to use them for session classification or CLI display
+- **Fix:**
+  - New `pkg/appid/runtime.go` with three entry points: `CatalogNames()` lists all known AppID signatures, `ResolveSessionName()` maps a session's app_id field to a human-readable name, `SessionMatches()` checks if a session matches a given application name
+  - CLI `show security flow session` now supports filtering by application name via `appid.ResolveSessionName()`
+  - DPDK mirror: `app_id` field wired through sessions, events, and shared memory structs
+
+### Pre-ID default policy logging
+- **Problem:** Sessions matching the default policy before AppID classification completes had no way to log session-init or session-close events. The BPF pipeline lacked per-flow AppID state flags
+- **Fix:**
+  - New BPF `app_flags` field in flow metadata with three flags: `FLOW_APPID_ENABLED` (AppID is active for this flow), `FLOW_PREID_LOG_SESSION_INIT` (log session creation before classification), `FLOW_PREID_LOG_SESSION_CLOSE` (log session teardown before classification)
+  - Flags are set by the policy compiler based on default-policy logging configuration
+  - BPF ring buffer events include pre-ID log state for userspace syslog emission
+
+### Master-password at-rest encryption
+- **Problem:** Config persistence stored sensitive data (PSKs, secrets) in plaintext on disk. No at-rest encryption mechanism existed
+- **Fix:**
+  - New `pkg/configstore/crypto.go` implements AES-256-GCM encryption with HKDF key derivation from a master password
+  - Config files encrypted transparently on write and decrypted on read when master-password is configured
+  - Feature gap status: master-password moved from Parse-Only to Done; AppID moved from Parse-Only to Partial

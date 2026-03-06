@@ -1587,6 +1587,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"takeover-hold-time":            {args: 1, children: nil},
 			"no-reth-vrrp":                  {children: nil},
 			"private-rg-election":           {children: nil},
+			"no-private-rg-election":        {children: nil},
 			"redundancy-group": {args: 1, children: map[string]*schemaNode{
 				"node": {args: 1, children: map[string]*schemaNode{
 					"priority": {args: 1, children: nil},

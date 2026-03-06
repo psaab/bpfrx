@@ -15783,8 +15783,31 @@ func TestChassisClusterPrivateRGElectionDefault(t *testing.T) {
 	if cfg.Chassis.Cluster == nil {
 		t.Fatal("Cluster is nil")
 	}
+	if !cfg.Chassis.Cluster.PrivateRGElection {
+		t.Error("PrivateRGElection = false, want true (default)")
+	}
+}
+
+func TestChassisClusterNoPrivateRGElection(t *testing.T) {
+	input := `chassis {
+    cluster {
+        cluster-id 1;
+        no-private-rg-election;
+    }
+}`
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
 	if cfg.Chassis.Cluster.PrivateRGElection {
-		t.Error("PrivateRGElection = true, want false (default)")
+		t.Error("PrivateRGElection = true, want false (no-private-rg-election)")
 	}
 }
 

@@ -190,17 +190,17 @@ check_manual_failover() {
 # ── Mode functions ───────────────────────────────────────────────────
 
 enable_private_rg() {
-	info "Enabling private-rg-election..."
-	if ! grep -q "private-rg-election" "$CONF"; then
-		sed -i '/heartbeat-threshold/a\        private-rg-election;' "$CONF"
-	fi
+	info "Enabling private-rg-election (default — removing no-private-rg-election if present)..."
+	sed -i '/no-private-rg-election/d' "$CONF"
 	(cd "$PROJECT_ROOT" && make cluster-deploy) 2>&1 | tail -5
 	wait_cluster_ready
 }
 
 disable_private_rg() {
-	info "Disabling private-rg-election..."
-	sed -i '/private-rg-election/d' "$CONF"
+	info "Disabling private-rg-election (adding no-private-rg-election)..."
+	if ! grep -q "no-private-rg-election" "$CONF"; then
+		sed -i '/heartbeat-threshold/a\        no-private-rg-election;' "$CONF"
+	fi
 	(cd "$PROJECT_ROOT" && make cluster-deploy) 2>&1 | tail -5
 	wait_cluster_ready
 }

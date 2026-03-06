@@ -467,8 +467,9 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 						}
 					}
 				}
-				if (sv->state == SESS_STATE_CLOSED ||
-				    (sv->state == SESS_STATE_TIME_WAIT && old_state != SESS_STATE_TIME_WAIT)) {
+				if ((sv->state == SESS_STATE_CLOSED ||
+				    (sv->state == SESS_STATE_TIME_WAIT && old_state != SESS_STATE_TIME_WAIT)) &&
+				    (sv->log_flags & LOG_FLAG_SESSION_CLOSE)) {
 					meta->ingress_zone = sv->ingress_zone;
 					meta->egress_zone = sv->egress_zone;
 					meta->policy_id = sv->policy_id;
@@ -570,8 +571,9 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 						}
 					}
 				}
-				if (sv->state == SESS_STATE_CLOSED ||
-				    (sv->state == SESS_STATE_TIME_WAIT && old_state != SESS_STATE_TIME_WAIT)) {
+				if ((sv->state == SESS_STATE_CLOSED ||
+				    (sv->state == SESS_STATE_TIME_WAIT && old_state != SESS_STATE_TIME_WAIT)) &&
+				    (sv->log_flags & LOG_FLAG_SESSION_CLOSE)) {
 					meta->ingress_zone = sv->egress_zone;
 					meta->egress_zone = sv->ingress_zone;
 					meta->policy_id = sv->policy_id;
@@ -666,8 +668,9 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 						}
 					}
 				}
-				if (sv->state == SESS_STATE_CLOSED ||
-				    (sv->state == SESS_STATE_TIME_WAIT && old_state != SESS_STATE_TIME_WAIT)) {
+				if ((sv->state == SESS_STATE_CLOSED ||
+				    (sv->state == SESS_STATE_TIME_WAIT && old_state != SESS_STATE_TIME_WAIT)) &&
+				    (sv->log_flags & LOG_FLAG_SESSION_CLOSE)) {
 					meta->ingress_zone = sv->ingress_zone;
 					meta->egress_zone = sv->egress_zone;
 					meta->policy_id = sv->policy_id;
@@ -762,8 +765,9 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 						}
 					}
 				}
-				if (sv->state == SESS_STATE_CLOSED ||
-				    (sv->state == SESS_STATE_TIME_WAIT && old_state != SESS_STATE_TIME_WAIT)) {
+				if ((sv->state == SESS_STATE_CLOSED ||
+				    (sv->state == SESS_STATE_TIME_WAIT && old_state != SESS_STATE_TIME_WAIT)) &&
+				    (sv->log_flags & LOG_FLAG_SESSION_CLOSE)) {
 					meta->ingress_zone = sv->egress_zone;
 					meta->egress_zone = sv->ingress_zone;
 					meta->policy_id = sv->policy_id;

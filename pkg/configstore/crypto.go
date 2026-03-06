@@ -114,9 +114,9 @@ func (db *DB) maybeDecryptTreeJSON(data []byte) ([]byte, error) {
 		return data, nil
 	}
 
-	keyMaterial, err := db.readOrCreateMasterKey()
+	keyMaterial, err := db.readMasterKey()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("encrypted config but master key unavailable: %w", err)
 	}
 	salt, err := base64.StdEncoding.DecodeString(env.Salt)
 	if err != nil {
@@ -207,6 +207,20 @@ func prfHash(prf string) (func() hash.Hash, error) {
 	default:
 		return nil, fmt.Errorf("unsupported master-password pseudorandom-function %q", prf)
 	}
+}
+
+// readMasterKey reads an existing master key — never creates one.
+// Used by the decrypt path to avoid overwriting a lost key.
+func (db *DB) readMasterKey() ([]byte, error) {
+	path := db.masterKeyPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read master key: %w", err)
+	}
+	if len(data) != 32 {
+		return nil, fmt.Errorf("invalid master key length in %s", path)
+	}
+	return data, nil
 }
 
 func (db *DB) readOrCreateMasterKey() ([]byte, error) {

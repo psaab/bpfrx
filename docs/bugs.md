@@ -1044,3 +1044,11 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Symptom:** VPN tunnels with multiple `traffic-selector` entries only established a single SA. Only traffic matching the implicit default selector was encrypted
 - **Root cause:** `traffic-selector <name> { local-ip; remote-ip; }` config was not compiled. The swanctl generator always created exactly one unnamed child SA per connection
 - **Fix:** Traffic selectors compile to multiple named swanctl child SAs. `sanitizeChildName()` normalizes selector names. SA parsing handles multi-child `swanctl --list-sas` output
+
+## Sprint CC-19: AppID, Pre-ID Logging, Master-Password (#163, 2026-03-06)
+
+### Cluster heartbeat/sync bind fails when em0 is in vrf-mgmt (OPEN)
+- **Symptom:** Cluster heartbeat and session sync sockets fail to bind on startup with `listen udp4 10.99.0.1:4784: bind: cannot assign requested address`. Cluster nodes cannot form, VRRP never starts
+- **Root cause:** Race condition between VRF creation and cluster comms startup. `startClusterComms()` runs before `applyConfig` step 0.5 populates `mgmtVRFInterfaces`. When the control interface (em0) is in `vrf-mgmt`, the VRF device string is empty at bind time, so the socket binds without `SO_BINDTODEVICE` on the VRF — the kernel cannot route to the fabric/heartbeat address because it lives in a different routing table
+- **Workaround:** Restart bpfrxd after initial boot — second start finds the VRF already created by the previous run
+- **Fix needed:** Either defer `startClusterComms()` until after VRF creation completes, or add a retry/rebind loop that re-checks VRF membership after `applyConfig` step 0.5 finishes
