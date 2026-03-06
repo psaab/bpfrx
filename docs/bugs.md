@@ -1017,3 +1017,30 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Symptom:** Secure tunnel interfaces like `st0.0` were treated as VLAN sub-interfaces by the interface compiler, generating incorrect 802.1Q VLAN tagging config
 - **Root cause:** The `.N` suffix parser did not distinguish between actual VLAN sub-interfaces (e.g., `ge-0-0-0.100`) and secure tunnel unit interfaces (`st0.0`)
 - **Fix:** Added `isConfiguredVLANSubInterface()` guard that verifies the parent interface is a known VLAN trunk before treating `.N` suffixed names as VLAN sub-interfaces
+
+## Sprint CC-18: Junos IKE/IPsec Compatibility (#154-#159, 2026-03-06)
+
+### external-interface not resolved to local-address in swanctl (FIXED #154)
+- **Symptom:** IPsec tunnels configured with `external-interface` instead of explicit `local-address` failed to establish — strongSwan received an interface name where it expected an IP address
+- **Root cause:** The IPsec compiler passed `external-interface` through to swanctl.conf without resolving it to a concrete IP address from the interface configuration or kernel
+- **Fix:** New `ipsec.PrepareConfig()` deep-copies IPsec config and resolves `external-interface` to `local-address` at runtime, checking static interface addresses first, then kernel addresses. Address family matching pairs IPv4/IPv6 gateways with correct local addresses
+
+### Junos $9$ obfuscated PSK written verbatim to swanctl (FIXED #158)
+- **Symptom:** IKE authentication failed when importing Junos config with `$9$...` encoded pre-shared keys. strongSwan used the obfuscated string as the literal PSK
+- **Root cause:** No decoder existed for the Junos `$9$` secret encoding format. The obfuscated string was passed through unchanged to swanctl.conf
+- **Fix:** New `pkg/ipsec/junos_secret.go` decodes `$9$` secrets before writing to swanctl.conf. MIT-licensed adapter from github.com/nadddy/jcrypt
+
+### DPD parsed as flat string — interval and threshold lost (FIXED #157)
+- **Symptom:** Dead peer detection config with `interval` and `threshold` children was silently ignored. swanctl had no DPD config, so strongSwan used defaults instead of configured timeouts
+- **Root cause:** `dead-peer-detection` was parsed as a flat string value, not as a structured node with children. The mode (`optimized`/`always-send`/`probe-idle-tunnel`), interval, and threshold were all discarded
+- **Fix:** DPD now parsed as a structured node. Mode, interval, and threshold map to swanctl `dpd_delay`, `dpd_timeout`, `dpd_action` based on DPD mode and establish-tunnels setting
+
+### Auth method hardcoded to PSK — pubkey/certificates ignored (FIXED #155)
+- **Symptom:** IPsec gateways configured with `rsa-signatures` or `ecdsa-signatures` authentication method still used PSK in swanctl output. Certificate-based VPNs could not be established
+- **Root cause:** The swanctl compiler hardcoded `auth = psk` regardless of the IKE proposal's `authentication-method` setting. `local-certificate` gateway config was also not compiled
+- **Fix:** `authMethodToSwan()` maps `pre-shared-keys` → `psk`, `rsa-signatures`/`ecdsa-signatures` → `pubkey`. `local-certificate` config generates swanctl `certs` field
+
+### No traffic selector support — single child SA per connection (FIXED #159)
+- **Symptom:** VPN tunnels with multiple `traffic-selector` entries only established a single SA. Only traffic matching the implicit default selector was encrypted
+- **Root cause:** `traffic-selector <name> { local-ip; remote-ip; }` config was not compiled. The swanctl generator always created exactly one unnamed child SA per connection
+- **Fix:** Traffic selectors compile to multiple named swanctl child SAs. `sanitizeChildName()` normalizes selector names. SA parsing handles multi-child `swanctl --list-sas` output

@@ -2990,3 +2990,51 @@ After the IPVLAN overlay refactor (CC-11/CC-12) and monitor fixes (CC-14), fabri
 - **Fix (PFS):** Compiler now correctly maps PFS group config to ESP proposal `dh_groups` field in swanctl output
 - **Problem (VLAN guard):** `st0.0` was misidentified as a VLAN sub-interface by the interface compiler, causing incorrect VLAN tagging config to be generated
 - **Fix (VLAN guard):** Added `isConfiguredVLANSubInterface()` guard that checks the interface is a known VLAN parent before treating `.N` suffixed names as VLAN sub-interfaces. Secure tunnel interfaces (`st0.X`) are excluded
+
+---
+
+## Sprint CC-18: Junos IKE/IPsec Compatibility (#154-#159, 2026-03-06)
+
+### Fix #154: PrepareConfig deep copy for external-interface → local-address resolution
+- **Problem:** IPsec `external-interface` was not resolved to a concrete `local-address` before writing swanctl.conf. strongSwan requires `local_addrs` to be an IP address, not an interface name
+- **Fix:**
+  - New `ipsec.PrepareConfig(cfg)` function (`pkg/ipsec/prepare.go`) creates a deep copy of the IPsec config and resolves `external-interface` to `local-address` at runtime
+  - Resolution checks interface config for static addresses first, then falls back to kernel interface addresses
+  - Address family matching ensures IPv4/IPv6 gateway addresses pair with matching local addresses
+  - Used by both daemon apply path and CLI apply path — single source of truth for IPsec config preparation
+
+### Fix #155: Auth method selection and local certificate support
+- **Problem:** IKE authentication method was hardcoded to PSK (`psk`) in swanctl output. RSA/ECDSA signatures and local certificate configurations were ignored
+- **Fix:**
+  - IKE proposal `authentication-method` compiled to swanctl `auth` field: `pre-shared-keys` → `psk`, `rsa-signatures`/`ecdsa-signatures` → `pubkey`
+  - `local-certificate` gateway config generates swanctl `certs` field for certificate-based authentication
+  - New `authMethodToSwan()` helper in `pkg/ipsec/junos_secret.go`
+
+### Fix #156: IKE/ESP proposal lifetime support
+- **Problem:** `lifetime-seconds` on IKE and ESP proposals was not compiled to swanctl output, causing strongSwan to use its own defaults instead of configured values
+- **Fix:** `lifetime-seconds` maps to `rekey_time` in swanctl connection config, with `rand_time = 0s` for deterministic rekey behavior
+
+### Fix #157: DPD structured parsing with mode semantics
+- **Problem:** `dead-peer-detection` was parsed as a flat string, losing the `interval`, `threshold`, and mode (`optimized`/`always-send`/`probe-idle-tunnel`) children. swanctl DPD config was not generated
+- **Fix:**
+  - DPD now parsed as a structured node with children for mode, interval, and threshold
+  - Mode + establish-tunnels mapping to swanctl: `always-send` → `dpd_delay=interval`, `dpd_timeout=interval*threshold`; `optimized` → `dpd_action=trap`; `probe-idle-tunnel` → `dpd_action=trap` + `dpd_delay`
+  - Graceful defaults when interval/threshold not specified
+
+### Fix #158: Junos $9$ obfuscated PSK decoding
+- **Problem:** Junos configuration exports use `$9$...` obfuscated encoding for pre-shared keys. These were written verbatim to swanctl.conf, causing strongSwan to use the obfuscated string as the literal PSK — IKE authentication always failed
+- **Fix:**
+  - New `pkg/ipsec/junos_secret.go` implements the Junos `$9$` decoder (MIT-licensed adapter from github.com/nadddy/jcrypt)
+  - Decoder runs automatically before writing PSK to swanctl.conf
+  - Plaintext and `$9$`-encoded secrets both handled transparently
+
+### Fix #159: Traffic selector support for multi-child IPsec SAs
+- **Problem:** VPN `traffic-selector <name> { local-ip ...; remote-ip ...; }` config was not compiled. Only a single child SA per connection was generated, limiting IPsec tunnels to a single traffic pair
+- **Fix:**
+  - Traffic selectors create multiple named swanctl child SAs per connection
+  - `sanitizeChildName()` helper normalizes selector names for swanctl compatibility
+  - SA status parsing hardened to handle multi-child output from `swanctl --list-sas`
+
+### Deterministic config output and NAT-T display
+- VPN iteration sorted by name for reproducible swanctl.conf generation across commits
+- `nat-traversal force` mode displayed in `show security ike security-associations` CLI output
