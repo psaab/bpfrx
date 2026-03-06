@@ -462,12 +462,15 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 		 * forward.  Both set fwd_ifindex=0 for XDP_PASS. */
 		meta->fwd_ifindex = 0;
 	} else if (rc != BPF_FIB_LKUP_RET_SUCCESS) {
-		/* No route — cluster secondary may lack routes.
-		 * Try fabric redirect to primary. */
-		int fab_rc = try_fabric_redirect(ctx, meta);
-		if (fab_rc >= 0)
-			return fab_rc;
-		return -1;
+		/* No route (BLACKHOLE/UNREACHABLE) — in a split-RG
+		 * cluster the original client's subnet is on the peer.
+		 * Don't fabric-redirect here (before NAT rewrite) —
+		 * the peer can't match pre-NAT embedded headers.
+		 * Set KERNEL_ROUTE so xdp_forward re-FIBs and fabric-
+		 * redirects AFTER NAT has rewritten the outer/embedded
+		 * headers. */
+		meta->fwd_ifindex = 0;
+		meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 	} else {
 		/* Resolve VLAN sub-interface */
 		__u32 egress_if = fib.ifindex;
@@ -502,7 +505,7 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 				 sizeof(meta->nat_src_ip));
 		meta->nat_src_ip.v4 = orig_src_ip;
 		meta->nat_src_port = orig_src_port;
-		meta->meta_flags = META_FLAG_EMBEDDED_ICMP;
+		meta->meta_flags |= META_FLAG_EMBEDDED_ICMP;
 		meta->embedded_proto = emb_proto;
 		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
 	} else {
@@ -666,12 +669,10 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 		 * forward.  Both set fwd_ifindex=0 for XDP_PASS. */
 		meta->fwd_ifindex = 0;
 	} else if (rc != BPF_FIB_LKUP_RET_SUCCESS) {
-		/* No route — cluster secondary may lack routes.
-		 * Try fabric redirect to primary. */
-		int fab_rc = try_fabric_redirect(ctx, meta);
-		if (fab_rc >= 0)
-			return fab_rc;
-		return -1;
+		/* No route (BLACKHOLE/UNREACHABLE) — same as IPv4:
+		 * defer fabric redirect to xdp_forward (after NAT). */
+		meta->fwd_ifindex = 0;
+		meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 	} else {
 		/* Resolve VLAN sub-interface */
 		__u32 egress_if = fib.ifindex;
@@ -704,7 +705,7 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 		/* Embedded rewrite info: restore embedded src to pre-NAT/NPTv6 */
 		__builtin_memcpy(meta->nat_src_ip.v6, orig_src_ip, 16);
 		meta->nat_src_port = orig_src_port;
-		meta->meta_flags = META_FLAG_EMBEDDED_ICMP;
+		meta->meta_flags |= META_FLAG_EMBEDDED_ICMP;
 		meta->embedded_proto = emb_proto;
 		bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
 	} else {
