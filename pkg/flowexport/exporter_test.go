@@ -97,7 +97,7 @@ func TestShouldExport(t *testing.T) {
 	ec := &ExportConfig{
 		SamplingZones: map[uint16]SamplingDir{
 			2: {Input: true, Output: true},  // trust
-			3: {Input: true, Output: false},  // untrust
+			3: {Input: true, Output: false}, // untrust
 		},
 	}
 
@@ -169,6 +169,38 @@ func TestBuildExportConfig_FlowServerSourceAddressTakesPrecedence(t *testing.T) 
 	}
 	if ec.Collectors[0].SourceAddress != "10.0.1.20" {
 		t.Errorf("SourceAddress = %q, want flow-server source-address %q", ec.Collectors[0].SourceAddress, "10.0.1.20")
+	}
+}
+
+func TestBuildExportConfig_DistinctSourceAddressesAreNotDeduped(t *testing.T) {
+	fo := &config.ForwardingOptionsConfig{
+		Sampling: &config.SamplingConfig{
+			Instances: map[string]*config.SamplingInstance{
+				"test": {
+					Name: "test",
+					FamilyInet: &config.SamplingFamily{
+						FlowServers: []*config.FlowServer{
+							{Address: "10.0.0.1", Port: 2055},
+						},
+						SourceAddress: "10.0.1.10",
+					},
+					FamilyInet6: &config.SamplingFamily{
+						FlowServers: []*config.FlowServer{
+							{Address: "10.0.0.1", Port: 2055},
+						},
+						SourceAddress: "10.0.1.11",
+					},
+				},
+			},
+		},
+	}
+
+	ec := BuildExportConfig(nil, fo)
+	if ec == nil {
+		t.Fatal("expected non-nil ExportConfig")
+	}
+	if len(ec.Collectors) != 2 {
+		t.Fatalf("expected 2 collectors, got %d", len(ec.Collectors))
 	}
 }
 
@@ -367,6 +399,47 @@ func TestBuildIPFIXExportConfig_NilIPFIX(t *testing.T) {
 	ec := BuildIPFIXExportConfig(svc, fo)
 	if ec != nil {
 		t.Error("expected nil ExportConfig when VersionIPFIX is not set")
+	}
+}
+
+func TestBuildIPFIXExportConfig_DistinctSourceAddressesAreNotDeduped(t *testing.T) {
+	svc := &config.ServicesConfig{
+		FlowMonitoring: &config.FlowMonitoringConfig{
+			VersionIPFIX: &config.NetFlowIPFIXConfig{
+				Templates: map[string]*config.NetFlowIPFIXTemplate{
+					"tmpl": {Name: "tmpl"},
+				},
+			},
+		},
+	}
+	fo := &config.ForwardingOptionsConfig{
+		Sampling: &config.SamplingConfig{
+			Instances: map[string]*config.SamplingInstance{
+				"test": {
+					Name: "test",
+					FamilyInet: &config.SamplingFamily{
+						FlowServers: []*config.FlowServer{
+							{Address: "10.0.0.1", Port: 2055},
+						},
+						SourceAddress: "10.0.1.10",
+					},
+					FamilyInet6: &config.SamplingFamily{
+						FlowServers: []*config.FlowServer{
+							{Address: "10.0.0.1", Port: 2055},
+						},
+						SourceAddress: "10.0.1.11",
+					},
+				},
+			},
+		},
+	}
+
+	ec := BuildIPFIXExportConfig(svc, fo)
+	if ec == nil {
+		t.Fatal("expected non-nil ExportConfig")
+	}
+	if len(ec.Collectors) != 2 {
+		t.Fatalf("expected 2 collectors, got %d", len(ec.Collectors))
 	}
 }
 

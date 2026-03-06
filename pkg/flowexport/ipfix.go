@@ -17,23 +17,23 @@ import (
 
 // IPFIX field Information Element IDs (IANA-assigned, RFC 5102).
 const (
-	ipfixOctetDeltaCount        = 1
-	ipfixPacketDeltaCount       = 2
-	ipfixProtocolIdentifier     = 4
-	ipfixIpClassOfService       = 5
-	ipfixTcpControlBits         = 6
-	ipfixSourceTransportPort    = 7
-	ipfixSourceIPv4Address      = 8
+	ipfixOctetDeltaCount          = 1
+	ipfixPacketDeltaCount         = 2
+	ipfixProtocolIdentifier       = 4
+	ipfixIpClassOfService         = 5
+	ipfixTcpControlBits           = 6
+	ipfixSourceTransportPort      = 7
+	ipfixSourceIPv4Address        = 8
 	ipfixDestinationTransportPort = 11
-	ipfixDestinationIPv4Address = 12
-	ipfixIngressInterface       = 10
-	ipfixEgressInterface        = 14
-	ipfixSourceIPv6Address      = 27
-	ipfixDestinationIPv6Address = 28
-	ipfixFlowDirection          = 61
-	ipfixApplicationId          = 95
-	ipfixFlowStartMilliseconds  = 152
-	ipfixFlowEndMilliseconds    = 153
+	ipfixDestinationIPv4Address   = 12
+	ipfixIngressInterface         = 10
+	ipfixEgressInterface          = 14
+	ipfixSourceIPv6Address        = 27
+	ipfixDestinationIPv6Address   = 28
+	ipfixFlowDirection            = 61
+	ipfixApplicationId            = 95
+	ipfixFlowStartMilliseconds    = 152
+	ipfixFlowEndMilliseconds      = 153
 )
 
 // IPFIX Set IDs (RFC 7011 Section 3.3.2).
@@ -110,12 +110,16 @@ type ipfixHeader struct {
 
 func encodeIPFIXHeader(h ipfixHeader) []byte {
 	b := make([]byte, 16)
+	encodeIPFIXHeaderInto(b, h)
+	return b
+}
+
+func encodeIPFIXHeaderInto(b []byte, h ipfixHeader) {
 	binary.BigEndian.PutUint16(b[0:2], h.Version)
 	binary.BigEndian.PutUint16(b[2:4], h.Length)
 	binary.BigEndian.PutUint32(b[4:8], h.ExportTime)
 	binary.BigEndian.PutUint32(b[8:12], h.SequenceNumber)
 	binary.BigEndian.PutUint32(b[12:16], h.ObservationID)
-	return b
 }
 
 // encodeIPFIXTemplateSet builds an IPFIX template set containing v4 and v6 templates.
@@ -172,17 +176,25 @@ func encodeIPFIXDataSet(records []FlowRecord) []byte {
 		recSize = ipfixRecordSizeV4
 	}
 
-	// Set header (4 bytes) + records
-	totalLen := 4 + len(records)*recSize
-
+	totalLen := ipfixDataSetLen(len(records), recSize)
 	b := make([]byte, totalLen)
-	off := 0
+	encodeIPFIXDataSetInto(b, records, tmplID, recSize)
+	return b
+}
 
-	// Set header: Set ID = template ID, Length
-	binary.BigEndian.PutUint16(b[off:off+2], tmplID)
-	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(totalLen))
-	off += 4
+func ipfixDataSetLen(recordCount, recSize int) int {
+	return 4 + recordCount*recSize
+}
 
+func encodeIPFIXDataSetInto(b []byte, records []FlowRecord, tmplID uint16, recSize int) {
+	if len(records) == 0 {
+		return
+	}
+	totalLen := ipfixDataSetLen(len(records), recSize)
+	binary.BigEndian.PutUint16(b[0:2], tmplID)
+	binary.BigEndian.PutUint16(b[2:4], uint16(totalLen))
+	off := 4
+	isV6 := records[0].IsIPv6
 	for _, r := range records {
 		if isV6 {
 			off = encodeIPFIXRecordV6(b, off, r)
@@ -190,8 +202,7 @@ func encodeIPFIXDataSet(records []FlowRecord) []byte {
 			off = encodeIPFIXRecordV4(b, off, r)
 		}
 	}
-
-	return b
+	clear(b[off:totalLen])
 }
 
 func encodeIPFIXRecordV4(b []byte, off int, r FlowRecord) int {
@@ -276,8 +287,9 @@ func encodeIPFIXRecordV6(b []byte, off int, r FlowRecord) int {
 
 // IPFIXExporter sends IPFIX (NetFlow v10) messages to configured collectors.
 type IPFIXExporter struct {
-	cfg      ExportConfig
-	sourceID uint32
+	cfg         ExportConfig
+	sourceID    uint32
+	templateSet []byte
 
 	mu    sync.Mutex
 	seq   uint32 // cumulative data record count
@@ -294,8 +306,9 @@ type IPFIXExporter struct {
 // NewIPFIXExporter creates a new IPFIX exporter.
 func NewIPFIXExporter(cfg ExportConfig) (*IPFIXExporter, error) {
 	e := &IPFIXExporter{
-		cfg:      cfg,
-		sourceID: 1,
+		cfg:         cfg,
+		sourceID:    1,
+		templateSet: encodeIPFIXTemplateSet(),
 	}
 
 	for _, cc := range cfg.Collectors {
@@ -383,18 +396,18 @@ func (e *IPFIXExporter) Close() {
 }
 
 func (e *IPFIXExporter) sendTemplates() {
-	tmplSet := encodeIPFIXTemplateSet()
-
 	now := time.Now()
 	hdr := ipfixHeader{
 		Version:        10,
-		Length:         uint16(16 + len(tmplSet)),
+		Length:         uint16(16 + len(e.templateSet)),
 		ExportTime:     uint32(now.Unix()),
 		SequenceNumber: 0, // template-only messages use seq=0 per convention
 		ObservationID:  e.sourceID,
 	}
 
-	pkt := append(encodeIPFIXHeader(hdr), tmplSet...)
+	pkt := make([]byte, 16+len(e.templateSet))
+	encodeIPFIXHeaderInto(pkt[:16], hdr)
+	copy(pkt[16:], e.templateSet)
 	for _, c := range e.conns {
 		if _, err := c.Write(pkt); err != nil {
 			slog.Debug("ipfix template send failed", "err", err)
@@ -424,11 +437,16 @@ func (e *IPFIXExporter) sendRecords(records []FlowRecord) {
 	}
 
 	isV6 := records[0].IsIPv6
-	var recSize int
+	var (
+		recSize int
+		tmplID  uint16
+	)
 	if isV6 {
 		recSize = ipfixRecordSizeV6
+		tmplID = ipfixTemplateIDv6
 	} else {
 		recSize = ipfixRecordSizeV4
+		tmplID = ipfixTemplateIDv4
 	}
 
 	// Reserve 16 bytes for IPFIX header + 4 bytes for set header
@@ -443,11 +461,7 @@ func (e *IPFIXExporter) sendRecords(records []FlowRecord) {
 			end = len(records)
 		}
 		batch := records[i:end]
-
-		dataSet := encodeIPFIXDataSet(batch)
-		if dataSet == nil {
-			continue
-		}
+		dataLen := ipfixDataSetLen(len(batch), recSize)
 
 		e.mu.Lock()
 		seq := e.seq
@@ -457,13 +471,15 @@ func (e *IPFIXExporter) sendRecords(records []FlowRecord) {
 		now := time.Now()
 		hdr := ipfixHeader{
 			Version:        10,
-			Length:         uint16(16 + len(dataSet)),
+			Length:         uint16(16 + dataLen),
 			ExportTime:     uint32(now.Unix()),
 			SequenceNumber: seq,
 			ObservationID:  e.sourceID,
 		}
 
-		pkt := append(encodeIPFIXHeader(hdr), dataSet...)
+		pkt := make([]byte, 16+dataLen)
+		encodeIPFIXHeaderInto(pkt[:16], hdr)
+		encodeIPFIXDataSetInto(pkt[16:], batch, tmplID, recSize)
 		for _, c := range e.conns {
 			if _, err := c.Write(pkt); err != nil {
 				slog.Debug("ipfix data send failed", "err", err)
@@ -547,8 +563,9 @@ func BuildIPFIXExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOpt
 	seen := make(map[string]bool)
 	deduped := ec.Collectors[:0]
 	for _, c := range ec.Collectors {
-		if !seen[c.Address] {
-			seen[c.Address] = true
+		key := collectorKey(c)
+		if !seen[key] {
+			seen[key] = true
 			deduped = append(deduped, c)
 		}
 	}
