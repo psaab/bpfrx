@@ -394,7 +394,8 @@ func (c *CLI) Run() error {
 	completer := &cliCompleter{cli: c}
 	c.rl, err = readline.NewEx(&readline.Config{
 		Prompt:          c.operationalPrompt(),
-		HistoryFile:     "/tmp/bpfrx_history",
+		HistoryFile:     filepath.Join(os.Getenv("HOME"), ".bpfrx_history"),
+		HistoryLimit:    10000,
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
 		AutoComplete:    completer,

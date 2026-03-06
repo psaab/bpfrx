@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,7 +82,8 @@ func main() {
 	rc := &remoteCompleter{ctl: c}
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          c.operationalPrompt(),
-		HistoryFile:     "/tmp/cli_history",
+		HistoryFile:     filepath.Join(os.Getenv("HOME"), ".bpfrx_cli_history"),
+		HistoryLimit:    10000,
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
 		AutoComplete:    rc,
