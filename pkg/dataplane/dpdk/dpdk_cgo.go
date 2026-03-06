@@ -1166,6 +1166,15 @@ func (m *Manager) UpdateFabricFwd(info dataplane.FabricFwdInfo) error {
 	if shm == nil {
 		return nil
 	}
+	// NOTE (#126): DPDK fabric redirect is only partially supported.
+	// The fabric port ID is programmed for inbound zone-encoded MAC
+	// detection (zone.c), but there is no DPDK equivalent of the BPF
+	// try_fabric_redirect() / try_fabric_redirect_with_zone() helpers.
+	// Cross-chassis redirect for synced sessions and new connections
+	// is not implemented in the DPDK pipeline.
+	slog.Warn("DPDK: fabric port_id programmed for fab0 but cross-chassis redirect is not implemented in DPDK mode",
+		"ifindex", info.Ifindex)
+
 	// Translate kernel ifindex to DPDK port_id using the mapping
 	// populated by the DPDK worker at port init time.
 	ifidx := info.Ifindex
@@ -1187,6 +1196,10 @@ func (m *Manager) UpdateFabricFwd1(info dataplane.FabricFwdInfo) error {
 	if shm == nil {
 		return nil
 	}
+	// NOTE (#126): Same limitation as UpdateFabricFwd — see above.
+	slog.Warn("DPDK: fabric port_id programmed for fab1 but cross-chassis redirect is not implemented in DPDK mode",
+		"ifindex", info.Ifindex)
+
 	ifidx := info.Ifindex
 	if ifidx == 0 || ifidx >= C.MAX_PORT_MAP {
 		shm.fabric1_port_id = 0xFFFF
