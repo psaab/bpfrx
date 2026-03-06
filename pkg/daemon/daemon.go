@@ -130,15 +130,15 @@ type Daemon struct {
 
 	// Fabric cross-chassis forwarding state for periodic refresh.
 	fabricMu         sync.RWMutex
-	fabricIface      string         // physical parent (XDP attachment point)
-	fabricOverlay    string         // IPVLAN overlay for neighbor resolution (#129)
+	fabricIface      string // physical parent (XDP attachment point)
+	fabricOverlay    string // IPVLAN overlay for neighbor resolution (#129)
 	fabricPeerIP     net.IP
-	fabricIface1     string         // secondary fabric parent
-	fabricOverlay1   string         // secondary fabric overlay (#129)
-	fabricPeerIP1    net.IP         // secondary fabric peer IP
-	fabricPopulated  bool           // true after first successful fab0 write
-	fabric1Populated bool           // true after first successful fab1 write
-	fabricRefreshCh  chan struct{}  // triggers immediate fabric_fwd refresh
+	fabricIface1     string        // secondary fabric parent
+	fabricOverlay1   string        // secondary fabric overlay (#129)
+	fabricPeerIP1    net.IP        // secondary fabric peer IP
+	fabricPopulated  bool          // true after first successful fab0 write
+	fabric1Populated bool          // true after first successful fab1 write
+	fabricRefreshCh  chan struct{} // triggers immediate fabric_fwd refresh
 
 	// syncPeerAddr is the primary peer address used for gRPC peer dialing
 	// (session queries, config sync). Set to control link or fabric
@@ -1463,17 +1463,17 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				}
 			}
 		}
-		if len(tunnels) > 0 {
-			if err := d.routing.ApplyTunnels(tunnels); err != nil {
-				slog.Warn("failed to apply tunnels", "err", err)
-			}
+		if err := d.routing.ApplyTunnels(tunnels); err != nil {
+			slog.Warn("failed to apply tunnels", "err", err)
 		}
 	}
 
 	// 1.5. Create xfrmi interfaces for IPsec VPN tunnels.
 	// Must happen before BPF compilation so compileZones() can discover
 	// the xfrmi interfaces and map them to security zones.
-	if d.routing != nil && len(cfg.Security.IPsec.VPNs) > 0 {
+	// Always call ApplyXfrmi so stale xfrmi devices are removed when VPNs
+	// are deleted from config.
+	if d.routing != nil {
 		if err := d.routing.ApplyXfrmi(cfg.Security.IPsec.VPNs); err != nil {
 			slog.Warn("failed to apply xfrmi interfaces", "err", err)
 		}
@@ -1783,14 +1783,14 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				vrfName = "" // forwarding instances use the default table
 			}
 			fc.Instances = append(fc.Instances, frr.InstanceConfig{
-				VRFName:      vrfName,
-				OSPF:         ri.OSPF,
-				OSPFv3:       ri.OSPFv3,
-				BGP:          ri.BGP,
-				RIP:          ri.RIP,
-				ISIS:         ri.ISIS,
+				VRFName:           vrfName,
+				OSPF:              ri.OSPF,
+				OSPFv3:            ri.OSPFv3,
+				BGP:               ri.BGP,
+				RIP:               ri.RIP,
+				ISIS:              ri.ISIS,
 				StaticRoutes:      ri.StaticRoutes,
-			Inet6StaticRoutes: ri.Inet6StaticRoutes,
+				Inet6StaticRoutes: ri.Inet6StaticRoutes,
 			})
 		}
 		if err := d.frr.ApplyFull(fc); err != nil {
@@ -1871,7 +1871,9 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// the reconcile loop sends goodbye RAs for inactive RGs.
 
 	// 6. Apply IPsec config
-	if d.ipsec != nil && len(cfg.Security.IPsec.VPNs) > 0 {
+	// Always call Apply so stale swanctl config is removed when VPNs are
+	// deleted from config.
+	if d.ipsec != nil {
 		if err := d.ipsec.Apply(&cfg.Security.IPsec); err != nil {
 			slog.Warn("failed to apply IPsec config", "err", err)
 		}

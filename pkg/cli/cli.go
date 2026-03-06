@@ -22,8 +22,8 @@ import (
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/chzyer/readline"
 	"github.com/psaab/bpfrx/pkg/cluster"
@@ -48,27 +48,27 @@ import (
 
 // CLI is the interactive command-line interface.
 type CLI struct {
-	rl          *readline.Instance
-	store       *configstore.Store
-	dp          dataplane.DataPlane
-	eventBuf    *logging.EventBuffer
-	eventReader *logging.EventReader
-	routing     *routing.Manager
-	frr         *frr.Manager
-	ipsec       *ipsec.Manager
-	dhcp         *dhcp.Manager
-	dhcpRelay    *dhcprelay.Manager
-	cluster      *cluster.Manager
-	rpmResultsFn     func() []*rpm.ProbeResult
-	feedsFn          func() map[string]feeds.FeedInfo
-	lldpNeighborsFn  func() []*lldp.Neighbor
-	hostname     string
-	username     string
-	userClass    string
-	version      string
-	startTime    time.Time
+	rl              *readline.Instance
+	store           *configstore.Store
+	dp              dataplane.DataPlane
+	eventBuf        *logging.EventBuffer
+	eventReader     *logging.EventReader
+	routing         *routing.Manager
+	frr             *frr.Manager
+	ipsec           *ipsec.Manager
+	dhcp            *dhcp.Manager
+	dhcpRelay       *dhcprelay.Manager
+	cluster         *cluster.Manager
+	rpmResultsFn    func() []*rpm.ProbeResult
+	feedsFn         func() map[string]feeds.FeedInfo
+	lldpNeighborsFn func() []*lldp.Neighbor
+	hostname        string
+	username        string
+	userClass       string
+	version         string
+	startTime       time.Time
 
-	vrrpMgr      *vrrp.Manager
+	vrrpMgr *vrrp.Manager
 
 	// Fabric peer dialing for cluster-wide queries (fab0 + optional fab1).
 	fabricPeerAddrFn func() []string
@@ -251,8 +251,8 @@ var configTopLevel = cmdtree.ConfigTopLevel
 
 // cliCompleter implements readline.AutoCompleter.
 type cliCompleter struct {
-	cli          *CLI
-	helpWritten  bool // set by ? Listener to suppress duplicate help from Do()
+	cli         *CLI
+	helpWritten bool // set by ? Listener to suppress duplicate help from Do()
 }
 
 func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
@@ -2890,10 +2890,11 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 				}
 			}
 		}
-		if len(tunnels) > 0 {
-			if err := c.routing.ApplyTunnels(tunnels); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: tunnel apply failed: %v\n", err)
-			}
+		if err := c.routing.ApplyTunnels(tunnels); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: tunnel apply failed: %v\n", err)
+		}
+		if err := c.routing.ApplyXfrmi(cfg.Security.IPsec.VPNs); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: xfrmi apply failed: %v\n", err)
 		}
 	}
 
@@ -2955,7 +2956,7 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 	}
 
 	// 5. Apply IPsec config
-	if c.ipsec != nil && len(cfg.Security.IPsec.VPNs) > 0 {
+	if c.ipsec != nil {
 		if err := c.ipsec.Apply(&cfg.Security.IPsec); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: IPsec apply failed: %v\n", err)
 		}
@@ -3037,14 +3038,14 @@ func resolveAppName(proto uint8, dstPort uint16, cfg *config.Config) string {
 
 // sessionFilter holds parsed filter criteria for session display.
 type sessionFilter struct {
-	zoneID  uint16   // 0 = any
-	proto   uint8    // 0 = any
+	zoneID  uint16 // 0 = any
+	proto   uint8  // 0 = any
 	srcNet  *net.IPNet
 	dstNet  *net.IPNet
-	srcPort uint16   // 0 = any
-	dstPort uint16   // 0 = any
-	natOnly bool     // show only NAT sessions
-	iface   string   // ingress interface name filter
+	srcPort uint16         // 0 = any
+	dstPort uint16         // 0 = any
+	natOnly bool           // show only NAT sessions
+	iface   string         // ingress interface name filter
 	summary bool           // only show count
 	brief   bool           // compact tabular view
 	appName string         // application name filter
@@ -4613,7 +4614,7 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 		for _, rule := range rs.Rules {
 			if rule.Then.Interface {
 				pools = append(pools, poolInfo{
-					name: fmt.Sprintf("%s/%s (interface)", rs.FromZone, rs.ToZone),
+					name:    fmt.Sprintf("%s/%s (interface)", rs.FromZone, rs.ToZone),
 					address: "interface", isIface: true,
 				})
 			}
@@ -8820,11 +8821,11 @@ func (c *CLI) showClassOfServiceInterface() error {
 
 	// Collect interfaces with filter bindings
 	type ifBinding struct {
-		name       string
-		inputV4    string
-		outputV4   string
-		inputV6    string
-		outputV6   string
+		name     string
+		inputV4  string
+		outputV4 string
+		inputV6  string
+		outputV6 string
 	}
 	var bindings []ifBinding
 	for _, ifc := range cfg.Interfaces.Interfaces {

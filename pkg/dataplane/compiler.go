@@ -345,6 +345,12 @@ func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, confi
 		physBase = phys
 	}
 
+	if strings.HasPrefix(configName, "st") && len(parts) == 2 {
+		physName = config.LinuxIfName(ref)
+		unitNum, _ = strconv.Atoi(parts[1])
+		return
+	}
+
 	// Resolve fabric interface to local physical member for BPF attachment.
 	// fab0 is an IPVLAN on ge-0-0-0; XDP/TC must attach to the parent.
 	if ifCfg, ok := cfg.Interfaces.Interfaces[configName]; ok && ifCfg.LocalFabricMember != "" {
@@ -801,6 +807,43 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	rethToPhys := cfg.RethToPhysical()
 	seen := make(map[string]bool)
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
+		if strings.HasPrefix(ifName, "st") {
+			mtu := ifCfg.MTU
+			for unitNum, unit := range ifCfg.Units {
+				unitName, _ := config.XFRMIfNameAndID(fmt.Sprintf("%s.%d", ifName, unitNum))
+				if unitName == "" {
+					continue
+				}
+				if _, err := result.cachedInterfaceByName(unitName); err != nil {
+					continue
+				}
+				if seen[unitName] {
+					continue
+				}
+				seen[unitName] = true
+				unitMTU := mtu
+				if unit.MTU > 0 && (unitMTU == 0 || unit.MTU < unitMTU) {
+					unitMTU = unit.MTU
+				}
+				desc := ifCfg.Description
+				if unit.Description != "" {
+					desc = unit.Description
+				}
+				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
+					Name:             unitName,
+					Addresses:        unit.Addresses,
+					PrimaryAddress:   unit.PrimaryAddress,
+					PreferredAddress: unit.PreferredAddress,
+					DHCPv4:           unit.DHCP,
+					DHCPv6:           unit.DHCPv6,
+					DADDisable:       unit.DADDisable,
+					MTU:              unitMTU,
+					Description:      desc,
+				})
+			}
+			continue
+		}
+
 		// Skip reth interfaces — no physical device exists; the physical
 		// member interface inherits the reth's config below.
 		if _, isReth := rethToPhys[ifName]; isReth {

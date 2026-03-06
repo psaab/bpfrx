@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/psaab/bpfrx/pkg/config"
@@ -183,11 +182,11 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 					propRef = vpn.IPsecPolicy
 				}
 				if prop, ok := ipsecCfg.Proposals[propRef]; ok {
-					espProposals = buildESPProposal(prop)
+					espProposals = buildESPProposal(prop, pfsGroup)
 				}
 			} else if prop, ok := ipsecCfg.Proposals[vpn.IPsecPolicy]; ok {
 				// Fallback: direct proposal reference (legacy)
-				espProposals = buildESPProposal(prop)
+				espProposals = buildESPProposal(prop, 0)
 			}
 		}
 
@@ -208,9 +207,6 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 			fmt.Fprintf(&b, "        remote_ts = %s\n", vpn.RemoteID)
 		}
 		fmt.Fprintf(&b, "        esp_proposals = %s\n", espProposals)
-		if pfsGroup > 0 {
-			fmt.Fprintf(&b, "        dpd_action = restart\n")
-		}
 		if vpn.DFBit == "copy" {
 			fmt.Fprintf(&b, "        copy_df = yes\n")
 		} else if vpn.DFBit == "set" {
@@ -332,7 +328,7 @@ func buildIKEProposal(prop *config.IPsecProposal) string {
 	return strings.Join(parts, "-")
 }
 
-func buildESPProposal(prop *config.IPsecProposal) string {
+func buildESPProposal(prop *config.IPsecProposal, pfsGroup int) string {
 	var parts []string
 
 	// Encryption algorithm
@@ -354,31 +350,21 @@ func buildESPProposal(prop *config.IPsecProposal) string {
 	}
 
 	// DH group
-	if prop.DHGroup > 0 {
-		parts = append(parts, fmt.Sprintf("modp%d", dhGroupBits(prop.DHGroup)))
+	dhGroup := prop.DHGroup
+	if pfsGroup > 0 {
+		dhGroup = pfsGroup
+	}
+	if dhGroup > 0 {
+		parts = append(parts, fmt.Sprintf("modp%d", dhGroupBits(dhGroup)))
 	}
 
 	return strings.Join(parts, "-")
 }
 
 // xfrmiIfID derives the XFRM interface ID from a bind-interface name.
-// "st0.0" -> 1, "st1.0" -> 2, "" -> 0 (disabled).
 func xfrmiIfID(bindIface string) uint32 {
-	if bindIface == "" {
-		return 0
-	}
-	devName := bindIface
-	if dot := strings.IndexByte(bindIface, '.'); dot >= 0 {
-		devName = bindIface[:dot]
-	}
-	if len(devName) < 3 || devName[:2] != "st" {
-		return 0
-	}
-	idx, err := strconv.Atoi(devName[2:])
-	if err != nil {
-		return 0
-	}
-	return uint32(idx + 1)
+	_, ifID := config.XFRMIfNameAndID(bindIface)
+	return ifID
 }
 
 func dhGroupBits(group int) int {
@@ -416,14 +402,14 @@ func (m *Manager) reload() error {
 
 // SAStatus represents an IPsec Security Association.
 type SAStatus struct {
-	Name      string
-	LocalAddr string
+	Name       string
+	LocalAddr  string
 	RemoteAddr string
-	State     string
-	LocalTS   string
-	RemoteTS  string
-	InBytes   string
-	OutBytes  string
+	State      string
+	LocalTS    string
+	RemoteTS   string
+	InBytes    string
+	OutBytes   string
 }
 
 // TerminateAllSAs terminates all active IKE SAs via swanctl.

@@ -123,6 +123,37 @@ func TestExpandFilterTermNoNegateWithoutExcept(t *testing.T) {
 	}
 }
 
+func TestResolveInterfaceRefXFRMUnit(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"st0": {
+					Name: "st0",
+					Units: map[int]*config.InterfaceUnit{
+						1: {
+							Addresses: []string{"10.0.0.1/30"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	physName, cfgName, unitNum, vlanID := resolveInterfaceRef("st0.1", cfg)
+	if physName != "st0.1" {
+		t.Fatalf("physName = %q, want st0.1", physName)
+	}
+	if cfgName != "st0" {
+		t.Fatalf("cfgName = %q, want st0", cfgName)
+	}
+	if unitNum != 1 {
+		t.Fatalf("unitNum = %d, want 1", unitNum)
+	}
+	if vlanID != 0 {
+		t.Fatalf("vlanID = %d, want 0", vlanID)
+	}
+}
+
 func TestExpandFilterTermFlexMatch(t *testing.T) {
 	term := &config.FirewallFilterTerm{
 		Name:   "flex-test",

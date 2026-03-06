@@ -108,8 +108,9 @@ func TestXfrmiIfID(t *testing.T) {
 		want  uint32
 	}{
 		{"st0.0", 1},
-		{"st1.0", 2},
-		{"st5.0", 6},
+		{"st0.1", 2},
+		{"st1.0", 65537},
+		{"st5.0", 327681},
 		{"st0", 1},
 		{"", 0},
 		{"eth0", 0},
@@ -168,10 +169,22 @@ func TestBuildESPProposal(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := buildESPProposal(tt.prop); got != tt.want {
+			if got := buildESPProposal(tt.prop, 0); got != tt.want {
 				t.Errorf("buildESPProposal() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBuildESPProposal_PFSOverride(t *testing.T) {
+	prop := &config.IPsecProposal{
+		EncryptionAlg: "aes256-cbc",
+		AuthAlg:       "hmac-sha256-128",
+		DHGroup:       2,
+	}
+	got := buildESPProposal(prop, 14)
+	if got != "aes256-sha256128-modp2048" {
+		t.Fatalf("buildESPProposal() with PFS override = %q, want aes256-sha256128-modp2048", got)
 	}
 }
 
@@ -349,17 +362,17 @@ func TestGenerateConfig_IKEChain(t *testing.T) {
 		},
 		Gateways: map[string]*config.IPsecGateway{
 			"gw1": {
-				Name:            "gw1",
-				Address:         "203.0.113.1",
-				LocalAddress:    "198.51.100.1",
-				IKEPolicy:       "ike-pol",
-				Version:         "v2-only",
-				NoNATTraversal:  true,
-				DeadPeerDetect:  "always-send",
-				LocalIDType:     "hostname",
-				LocalIDValue:    "vpn.example.com",
-				RemoteIDType:    "inet",
-				RemoteIDValue:   "203.0.113.1",
+				Name:           "gw1",
+				Address:        "203.0.113.1",
+				LocalAddress:   "198.51.100.1",
+				IKEPolicy:      "ike-pol",
+				Version:        "v2-only",
+				NoNATTraversal: true,
+				DeadPeerDetect: "always-send",
+				LocalIDType:    "hostname",
+				LocalIDValue:   "vpn.example.com",
+				RemoteIDType:   "inet",
+				RemoteIDValue:  "203.0.113.1",
 			},
 		},
 		Proposals: map[string]*config.IPsecProposal{
@@ -413,6 +426,9 @@ func TestGenerateConfig_IKEChain(t *testing.T) {
 			t.Errorf("%s: missing %q in:\n%s", c.name, c.want, got)
 		}
 	}
+	if strings.Contains(got, "dpd_action = restart") {
+		t.Errorf("PFS must not inject dpd_action into child config: %s", got)
+	}
 }
 
 func TestGenerateConfig_DynamicHostname(t *testing.T) {
@@ -441,6 +457,9 @@ func TestGenerateConfig_DynamicHostname(t *testing.T) {
 	}
 	if !strings.Contains(got, "version = 2") {
 		t.Errorf("version not set: %s", got)
+	}
+	if !strings.Contains(got, "if_id_in = 2") || !strings.Contains(got, "if_id_out = 2") {
+		t.Errorf("expected st0.1 to map to if_id 2: %s", got)
 	}
 }
 
@@ -623,9 +642,9 @@ func TestGenerateConfig_AggressiveMode_NotSet(t *testing.T) {
 func TestGenerateConfig_DFBit(t *testing.T) {
 	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
 	tests := []struct {
-		name  string
-		dfbit string
-		want  string
+		name    string
+		dfbit   string
+		want    string
 		notWant string
 	}{
 		{"copy", "copy", "copy_df = yes", "copy_df = no"},

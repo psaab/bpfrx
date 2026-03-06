@@ -19,14 +19,14 @@ import (
 
 // KeepaliveState tracks the status of a GRE tunnel keepalive probe.
 type KeepaliveState struct {
-	mu           sync.Mutex
-	Up           bool   // true if tunnel is considered up
-	Failures     int    // consecutive probe failures
-	LastSuccess  time.Time
-	LastFailure  time.Time
-	RemoteAddr   string // remote endpoint being probed
-	Interval     int    // probe interval in seconds
-	MaxRetries   int    // failures before declaring down
+	mu          sync.Mutex
+	Up          bool // true if tunnel is considered up
+	Failures    int  // consecutive probe failures
+	LastSuccess time.Time
+	LastFailure time.Time
+	RemoteAddr  string // remote endpoint being probed
+	Interval    int    // probe interval in seconds
+	MaxRetries  int    // failures before declaring down
 }
 
 // InterfaceMonitorStatus tracks the link state of a monitored interface.
@@ -39,15 +39,15 @@ type InterfaceMonitorStatus struct {
 // Manager handles tunnel and VRF lifecycle.
 type Manager struct {
 	nlHandle   *netlink.Handle
-	tunnels    []string // currently created tunnel interface names
-	vrfs       []string // currently created VRF device names
-	xfrmis     []string // currently created xfrmi interface names
-	bonds      []string // currently created bond interface names
-	reths      []string // currently created RETH interface names
+	tunnels    []string                    // currently created tunnel interface names
+	vrfs       []string                    // currently created VRF device names
+	xfrmis     []string                    // currently created xfrmi interface names
+	bonds      []string                    // currently created bond interface names
+	reths      []string                    // currently created RETH interface names
 	keepalives map[string]*keepaliveRunner // tunnel name -> runner
 
-	mu             sync.Mutex
-	monitorStatus  map[int][]InterfaceMonitorStatus // redundancy-group ID -> monitor states
+	mu            sync.Mutex
+	monitorStatus map[int][]InterfaceMonitorStatus // redundancy-group ID -> monitor states
 }
 
 // keepaliveRunner manages the goroutine for a single tunnel's keepalive.
@@ -444,8 +444,8 @@ func (m *Manager) ClearTunnels() error {
 }
 
 // ApplyXfrmi creates XFRM virtual interfaces for IPsec VPN tunnels.
-// Each VPN with a BindInterface (e.g. "st0.0") gets an xfrmi device
-// with a unique XFRM interface ID derived from the "stN" index.
+// Each VPN with a BindInterface (e.g. "st0.0") gets a unit-specific xfrmi
+// device and a stable XFRM interface ID derived from the st/unit pair.
 func (m *Manager) ApplyXfrmi(vpns map[string]*config.IPsecVPN) error {
 	if err := m.ClearXfrmi(); err != nil {
 		slog.Warn("failed to clear previous xfrmi interfaces", "err", err)
@@ -456,8 +456,7 @@ func (m *Manager) ApplyXfrmi(vpns map[string]*config.IPsecVPN) error {
 			continue
 		}
 
-		// Parse interface name: "st0.0" -> device "st0", if_id from index
-		ifName, ifID := parseXfrmiName(vpn.BindInterface)
+		ifName, ifID := config.XFRMIfNameAndID(vpn.BindInterface)
 		if ifName == "" || ifID == 0 {
 			slog.Warn("invalid bind-interface name",
 				"vpn", vpn.Name, "bind-interface", vpn.BindInterface)
@@ -532,36 +531,15 @@ func (m *Manager) ClearXfrmi() error {
 	return nil
 }
 
-// parseXfrmiName parses "st0.0" into device name "st0" and if_id 1,
-// or "st1.0" into "st1" and if_id 2. The if_id is stN_index + 1.
-func parseXfrmiName(bindIface string) (string, uint32) {
-	// Strip unit number: "st0.0" -> "st0"
-	devName := bindIface
-	if dot := strings.IndexByte(bindIface, '.'); dot >= 0 {
-		devName = bindIface[:dot]
-	}
-
-	// Parse "stN" to get N
-	if len(devName) < 3 || devName[:2] != "st" {
-		return "", 0
-	}
-	idx, err := strconv.Atoi(devName[2:])
-	if err != nil {
-		return "", 0
-	}
-	// if_id starts at 1 (st0 -> 1, st1 -> 2, etc.)
-	return devName, uint32(idx + 1)
-}
-
 // TunnelStatus holds the status of a tunnel interface.
 type TunnelStatus struct {
-	Name           string
-	Source         string
-	Destination    string
-	State          string // "up" or "down"
-	Addresses      []string
-	KeepaliveUp    *bool  // nil if no keepalive configured
-	KeepaliveInfo  string // human-readable keepalive status
+	Name          string
+	Source        string
+	Destination   string
+	State         string // "up" or "down"
+	Addresses     []string
+	KeepaliveUp   *bool  // nil if no keepalive configured
+	KeepaliveInfo string // human-readable keepalive status
 }
 
 // GetTunnelStatus returns the status of managed tunnel interfaces.
