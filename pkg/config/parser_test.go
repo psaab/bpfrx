@@ -2998,6 +2998,109 @@ forwarding-options {
 	}
 }
 
+func TestV9ExportExtensions(t *testing.T) {
+	// Test hierarchical syntax with export-extension
+	input := `services {
+    flow-monitoring {
+        version9 {
+            template v9-ext {
+                flow-active-timeout 60;
+                ipv4-template {
+                    export-extension flow-dir;
+                    export-extension app-id;
+                }
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	if cfg.Services.FlowMonitoring == nil {
+		t.Fatal("expected FlowMonitoring to be non-nil")
+	}
+	v9 := cfg.Services.FlowMonitoring.Version9
+	if v9 == nil {
+		t.Fatal("expected Version9 to be non-nil")
+	}
+	tmpl := v9.Templates["v9-ext"]
+	if tmpl == nil {
+		t.Fatal("expected template v9-ext")
+	}
+	if len(tmpl.ExportExtensions) != 2 {
+		t.Fatalf("expected 2 export extensions, got %d: %v", len(tmpl.ExportExtensions), tmpl.ExportExtensions)
+	}
+	if tmpl.ExportExtensions[0] != "flow-dir" {
+		t.Errorf("ext[0] = %q, want flow-dir", tmpl.ExportExtensions[0])
+	}
+	if tmpl.ExportExtensions[1] != "app-id" {
+		t.Errorf("ext[1] = %q, want app-id", tmpl.ExportExtensions[1])
+	}
+
+	// Verify app-id generates a validation warning
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "app-id") && strings.Contains(w, "v9-ext") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected validation warning for app-id export-extension")
+	}
+
+	// Test set-command syntax
+	tree2 := &ConfigTree{}
+	setCommands := []string{
+		"set services flow-monitoring version9 template v9-set2 flow-active-timeout 90",
+		"set services flow-monitoring version9 template v9-set2 ipv4-template export-extension flow-dir",
+		"set services flow-monitoring version9 template v9-set2 ipv6-template export-extension flow-dir",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree2.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg2, err := CompileConfig(tree2)
+	if err != nil {
+		t.Fatalf("set-command compile error: %v", err)
+	}
+
+	tmpl2 := cfg2.Services.FlowMonitoring.Version9.Templates["v9-set2"]
+	if tmpl2 == nil {
+		t.Fatal("set syntax: expected template v9-set2")
+	}
+	if len(tmpl2.ExportExtensions) != 2 {
+		t.Fatalf("set syntax: expected 2 extensions, got %d: %v", len(tmpl2.ExportExtensions), tmpl2.ExportExtensions)
+	}
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || len(s) > 0 && containsStr(s, sub))
+}
+
+func containsStr(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
 func TestALGAndFlowOptions(t *testing.T) {
 	input := `security {
     flow {
@@ -3261,6 +3364,99 @@ func TestRPMConfig(t *testing.T) {
 	}
 	if pingTest.TestInterval != 60 {
 		t.Errorf("set syntax test-interval: got %d, want 60", pingTest.TestInterval)
+	}
+}
+
+func TestRPMTargetURLAndProbeLimit(t *testing.T) {
+	// Hierarchical: "target url http://1.1.1.1;" should extract the URL, not "url"
+	input := `services {
+    rpm {
+        probe web-check {
+            test http-url {
+                probe-type http-get;
+                target url http://10.0.1.1/health;
+                probe-limit 5;
+            }
+            test plain-ip {
+                probe-type icmp-ping;
+                target 8.8.8.8;
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	probe := cfg.Services.RPM.Probes["web-check"]
+	if probe == nil {
+		t.Fatal("expected probe web-check")
+	}
+
+	// "target url http://..." should resolve to the URL
+	httpTest := probe.Tests["http-url"]
+	if httpTest == nil {
+		t.Fatal("expected test http-url")
+	}
+	if httpTest.Target != "http://10.0.1.1/health" {
+		t.Errorf("target url: got %q, want http://10.0.1.1/health", httpTest.Target)
+	}
+	if httpTest.ProbeLimit != 5 {
+		t.Errorf("probe-limit: got %d, want 5", httpTest.ProbeLimit)
+	}
+
+	// Plain "target 8.8.8.8;" should still work
+	plainTest := probe.Tests["plain-ip"]
+	if plainTest == nil {
+		t.Fatal("expected test plain-ip")
+	}
+	if plainTest.Target != "8.8.8.8" {
+		t.Errorf("plain target: got %q, want 8.8.8.8", plainTest.Target)
+	}
+
+	// Set-command syntax for target url and probe-limit
+	tree2 := &ConfigTree{}
+	setCommands := []string{
+		"set services rpm probe web2 test url-test probe-type http-get",
+		"set services rpm probe web2 test url-test target url http://example.com",
+		"set services rpm probe web2 test url-test probe-limit 3",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree2.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg2, err := CompileConfig(tree2)
+	if err != nil {
+		t.Fatalf("set-command compile error: %v", err)
+	}
+
+	probe2 := cfg2.Services.RPM.Probes["web2"]
+	if probe2 == nil {
+		t.Fatal("set syntax: expected probe web2")
+	}
+	urlTest := probe2.Tests["url-test"]
+	if urlTest == nil {
+		t.Fatal("set syntax: expected test url-test")
+	}
+	if urlTest.Target != "http://example.com" {
+		t.Errorf("set syntax target url: got %q, want http://example.com", urlTest.Target)
+	}
+	if urlTest.ProbeLimit != 3 {
+		t.Errorf("set syntax probe-limit: got %d, want 3", urlTest.ProbeLimit)
 	}
 }
 
@@ -16261,5 +16457,199 @@ func TestRoutingInstanceRibInet6(t *testing.T) {
 	}
 	if nh.Interface != "reth2.0" {
 		t.Errorf("Interface = %q, want reth2.0", nh.Interface)
+	}
+}
+
+func TestDynamicAddressMultiFeedPaths(t *testing.T) {
+	input := `security {
+    dynamic-address {
+        feed-server cloudflare {
+            url https://www.cloudflare.com;
+            update-interval 86400;
+            hold-interval 864000;
+            feed-name feed-cloudflare-ipv4 {
+                path /ips-v4;
+            }
+            feed-name feed-cloudflare-ipv6 {
+                path /ips-v6;
+            }
+        }
+        address-name cloudflare-ipv4 {
+            profile {
+                feed-name feed-cloudflare-ipv4;
+            }
+        }
+        address-name cloudflare-ipv6 {
+            profile {
+                feed-name feed-cloudflare-ipv6;
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	da := cfg.Security.DynamicAddress
+	if da.FeedServers == nil || len(da.FeedServers) != 1 {
+		t.Fatalf("expected 1 feed server, got %d", len(da.FeedServers))
+	}
+
+	cf := da.FeedServers["cloudflare"]
+	if cf == nil {
+		t.Fatal("expected cloudflare feed server")
+	}
+	if cf.URL != "https://www.cloudflare.com" {
+		t.Errorf("url = %q, want https://www.cloudflare.com", cf.URL)
+	}
+	if cf.UpdateInterval != 86400 {
+		t.Errorf("update-interval = %d, want 86400", cf.UpdateInterval)
+	}
+	if cf.HoldInterval != 864000 {
+		t.Errorf("hold-interval = %d, want 864000", cf.HoldInterval)
+	}
+	if len(cf.FeedEntries) != 2 {
+		t.Fatalf("expected 2 feed entries, got %d", len(cf.FeedEntries))
+	}
+	if cf.FeedEntries[0].Name != "feed-cloudflare-ipv4" {
+		t.Errorf("feed entry 0 name = %q", cf.FeedEntries[0].Name)
+	}
+	if cf.FeedEntries[0].Path != "/ips-v4" {
+		t.Errorf("feed entry 0 path = %q", cf.FeedEntries[0].Path)
+	}
+	if cf.FeedEntries[1].Name != "feed-cloudflare-ipv6" {
+		t.Errorf("feed entry 1 name = %q", cf.FeedEntries[1].Name)
+	}
+	if cf.FeedEntries[1].Path != "/ips-v6" {
+		t.Errorf("feed entry 1 path = %q", cf.FeedEntries[1].Path)
+	}
+
+	// address-name bindings
+	if da.AddressBindings == nil || len(da.AddressBindings) != 2 {
+		t.Fatalf("expected 2 address bindings, got %d", len(da.AddressBindings))
+	}
+	ab4 := da.AddressBindings["cloudflare-ipv4"]
+	if ab4 == nil {
+		t.Fatal("expected cloudflare-ipv4 address binding")
+	}
+	if len(ab4.FeedNames) != 1 || ab4.FeedNames[0] != "feed-cloudflare-ipv4" {
+		t.Errorf("cloudflare-ipv4 feed-names = %v", ab4.FeedNames)
+	}
+	ab6 := da.AddressBindings["cloudflare-ipv6"]
+	if ab6 == nil {
+		t.Fatal("expected cloudflare-ipv6 address binding")
+	}
+	if len(ab6.FeedNames) != 1 || ab6.FeedNames[0] != "feed-cloudflare-ipv6" {
+		t.Errorf("cloudflare-ipv6 feed-names = %v", ab6.FeedNames)
+	}
+}
+
+func TestDynamicAddressMultiFeedPathsSetSyntax(t *testing.T) {
+	lines := []string{
+		"set security dynamic-address feed-server cloudflare url https://www.cloudflare.com",
+		"set security dynamic-address feed-server cloudflare update-interval 1440",
+		"set security dynamic-address feed-server cloudflare feed-name cloudflare-ipv4 path /ips-v4",
+		"set security dynamic-address feed-server cloudflare feed-name cloudflare-ipv6 path /ips-v6",
+		"set security dynamic-address address-name cloudflare-ipv4 profile feed-name cloudflare-ipv4",
+		"set security dynamic-address address-name cloudflare-ipv6 profile feed-name cloudflare-ipv6",
+	}
+
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		tree.SetPath(path)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	da := cfg.Security.DynamicAddress
+	cf := da.FeedServers["cloudflare"]
+	if cf == nil {
+		t.Fatal("expected cloudflare feed server")
+	}
+	if cf.URL != "https://www.cloudflare.com" {
+		t.Errorf("url = %q", cf.URL)
+	}
+	if cf.UpdateInterval != 1440 {
+		t.Errorf("update-interval = %d, want 1440", cf.UpdateInterval)
+	}
+	if len(cf.FeedEntries) != 2 {
+		t.Fatalf("expected 2 feed entries, got %d", len(cf.FeedEntries))
+	}
+
+	// address-name bindings
+	ab4 := da.AddressBindings["cloudflare-ipv4"]
+	if ab4 == nil {
+		t.Fatal("expected cloudflare-ipv4 address binding")
+	}
+	if len(ab4.FeedNames) != 1 || ab4.FeedNames[0] != "cloudflare-ipv4" {
+		t.Errorf("cloudflare-ipv4 feed-names = %v", ab4.FeedNames)
+	}
+}
+
+func TestDynamicAddressHostnameSyntax(t *testing.T) {
+	input := `security {
+    dynamic-address {
+        feed-server cloudflare {
+            hostname "www.cloudflare.com";
+            update-interval 1440;
+            feed-name cloudflare-ipv4 {
+                path "/ips-v4";
+            }
+            feed-name cloudflare-ipv6 {
+                path "/ips-v6";
+            }
+        }
+        address-name cloudflare-ipv4 {
+            profile {
+                feed-name cloudflare-ipv4;
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	da := cfg.Security.DynamicAddress
+	cf := da.FeedServers["cloudflare"]
+	if cf == nil {
+		t.Fatal("expected cloudflare feed server")
+	}
+	if cf.Hostname != "www.cloudflare.com" {
+		t.Errorf("hostname = %q, want www.cloudflare.com", cf.Hostname)
+	}
+	if cf.URL != "" {
+		t.Errorf("url should be empty when hostname is used, got %q", cf.URL)
+	}
+	if len(cf.FeedEntries) != 2 {
+		t.Fatalf("expected 2 feed entries, got %d", len(cf.FeedEntries))
+	}
+
+	ab := da.AddressBindings["cloudflare-ipv4"]
+	if ab == nil || len(ab.FeedNames) != 1 || ab.FeedNames[0] != "cloudflare-ipv4" {
+		t.Errorf("address binding = %v", ab)
 	}
 }

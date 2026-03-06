@@ -18,13 +18,14 @@ import (
 // Manager manages dynamic address feed servers and their periodic updates.
 type Manager struct {
 	mu      sync.RWMutex
-	feeds   map[string]*feedState // keyed by feed-server name
+	feeds   map[string]*feedState // keyed by feed-name (or feed-server name for single-feed servers)
 	client  *http.Client
 	onUpdate func() // callback when feeds are updated
 }
 
 type feedState struct {
-	cfg      *config.FeedServer
+	name     string // feed-name or server name
+	url      string // fully resolved URL
 	prefixes []string // currently fetched CIDRs
 	lastFetch time.Time
 	cancel   context.CancelFunc
@@ -42,8 +43,22 @@ func New(onUpdate func()) *Manager {
 	}
 }
 
+// resolveBaseURL returns the base URL for a feed server.
+// Prefers explicit URL; falls back to https://hostname.
+func resolveBaseURL(fsCfg *config.FeedServer) string {
+	if fsCfg.URL != "" {
+		return strings.TrimRight(fsCfg.URL, "/")
+	}
+	if fsCfg.Hostname != "" {
+		return "https://" + strings.TrimRight(fsCfg.Hostname, "/")
+	}
+	return ""
+}
+
 // Apply configures feeds from the given dynamic address config.
 // Starts background refresh goroutines for each feed server.
+// When a feed-server has FeedEntries, each entry becomes a separate feed
+// keyed by the feed-name with its per-feed path appended to the base URL.
 func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig) {
 	m.StopAll()
 
@@ -52,25 +67,56 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 	}
 
 	m.mu.Lock()
-	for name, fsCfg := range daCfg.FeedServers {
-		if fsCfg.URL == "" {
+	for _, fsCfg := range daCfg.FeedServers {
+		baseURL := resolveBaseURL(fsCfg)
+		if baseURL == "" {
 			continue
 		}
-		feedCtx, cancel := context.WithCancel(ctx)
-		fs := &feedState{
-			cfg:    fsCfg,
-			cancel: cancel,
-		}
-		m.feeds[name] = fs
 
 		interval := time.Duration(fsCfg.UpdateInterval) * time.Second
 		if interval <= 0 {
 			interval = time.Hour
 		}
 
-		go m.refreshLoop(feedCtx, fs, interval)
-		slog.Info("dynamic address feed started",
-			"name", name, "url", fsCfg.URL, "interval", interval)
+		if len(fsCfg.FeedEntries) > 0 {
+			// Multiple named feeds with per-feed paths
+			for _, fe := range fsCfg.FeedEntries {
+				feedURL := baseURL
+				if fe.Path != "" {
+					p := fe.Path
+					if !strings.HasPrefix(p, "/") {
+						p = "/" + p
+					}
+					feedURL = baseURL + p
+				}
+				feedCtx, cancel := context.WithCancel(ctx)
+				fs := &feedState{
+					name:   fe.Name,
+					url:    feedURL,
+					cancel: cancel,
+				}
+				m.feeds[fe.Name] = fs
+				go m.refreshLoop(feedCtx, fs, interval)
+				slog.Info("dynamic address feed started",
+					"name", fe.Name, "server", fsCfg.Name, "url", feedURL, "interval", interval)
+			}
+		} else {
+			// Single feed (backward compat): keyed by FeedName or server name
+			key := fsCfg.FeedName
+			if key == "" {
+				key = fsCfg.Name
+			}
+			feedCtx, cancel := context.WithCancel(ctx)
+			fs := &feedState{
+				name:   key,
+				url:    baseURL,
+				cancel: cancel,
+			}
+			m.feeds[key] = fs
+			go m.refreshLoop(feedCtx, fs, interval)
+			slog.Info("dynamic address feed started",
+				"name", key, "url", baseURL, "interval", interval)
+		}
 	}
 	m.mu.Unlock()
 }
@@ -87,7 +133,7 @@ func (m *Manager) StopAll() {
 	m.mu.Unlock()
 }
 
-// GetPrefixes returns the current prefixes for a named feed server.
+// GetPrefixes returns the current prefixes for a named feed.
 func (m *Manager) GetPrefixes(name string) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -104,7 +150,7 @@ func (m *Manager) AllFeeds() map[string]FeedInfo {
 	result := make(map[string]FeedInfo, len(m.feeds))
 	for name, fs := range m.feeds {
 		result[name] = FeedInfo{
-			URL:       fs.cfg.URL,
+			URL:       fs.url,
 			Prefixes:  len(fs.prefixes),
 			LastFetch: fs.lastFetch,
 		}
@@ -137,22 +183,22 @@ func (m *Manager) refreshLoop(ctx context.Context, fs *feedState, interval time.
 }
 
 func (m *Manager) fetchFeed(ctx context.Context, fs *feedState) {
-	req, err := http.NewRequestWithContext(ctx, "GET", fs.cfg.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", fs.url, nil)
 	if err != nil {
-		slog.Warn("dynamic-address: invalid URL", "name", fs.cfg.Name, "err", err)
+		slog.Warn("dynamic-address: invalid URL", "name", fs.name, "err", err)
 		return
 	}
 
 	resp, err := m.client.Do(req)
 	if err != nil {
-		slog.Warn("dynamic-address: fetch failed", "name", fs.cfg.Name, "err", err)
+		slog.Warn("dynamic-address: fetch failed", "name", fs.name, "err", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		slog.Warn("dynamic-address: unexpected status",
-			"name", fs.cfg.Name, "status", resp.StatusCode)
+			"name", fs.name, "status", resp.StatusCode)
 		return
 	}
 
@@ -182,7 +228,7 @@ func (m *Manager) fetchFeed(ctx context.Context, fs *feedState) {
 	m.mu.Unlock()
 
 	slog.Info("dynamic-address: feed updated",
-		"name", fs.cfg.Name, "prefixes", len(prefixes), "previous", oldCount)
+		"name", fs.name, "prefixes", len(prefixes), "previous", oldCount)
 
 	if m.onUpdate != nil && len(prefixes) != oldCount {
 		m.onUpdate()

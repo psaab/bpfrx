@@ -488,6 +488,7 @@ type RPMTest struct {
 	ProbeCount          int // number of probes per test (0 = default 1)
 	TestInterval        int // seconds (0 = default 60)
 	ThresholdSuccessive int // successive failures before probe-fail (0 = default 3)
+	ProbeLimit          int // max consecutive failed probes before test is declared failed (0 = unlimited)
 	DestPort            int // for tcp-ping
 }
 
@@ -519,9 +520,10 @@ type NetFlowV9Config struct {
 // NetFlowV9Template defines a NetFlow v9 export template.
 type NetFlowV9Template struct {
 	Name                string
-	FlowActiveTimeout   int // seconds (0 = default 60)
-	FlowInactiveTimeout int // seconds (0 = default 15)
-	TemplateRefreshRate int // seconds (0 = default 60)
+	FlowActiveTimeout   int      // seconds (0 = default 60)
+	FlowInactiveTimeout int      // seconds (0 = default 15)
+	TemplateRefreshRate int      // seconds (0 = default 60)
+	ExportExtensions    []string // e.g. "app-id", "flow-dir"
 }
 
 // ForwardingOptionsConfig holds forwarding/sampling configuration.
@@ -698,18 +700,33 @@ type DHCPPool struct {
 	Domain     string
 }
 
-// DynamicAddressConfig defines a dynamic address feed server.
+// DynamicAddressConfig defines dynamic address feed servers and address-name bindings.
 type DynamicAddressConfig struct {
-	FeedServers map[string]*FeedServer
+	FeedServers     map[string]*FeedServer
+	AddressBindings map[string]*AddressBinding // keyed by address-name
 }
 
-// FeedServer defines a remote address feed source.
+// FeedServer defines a remote address feed source with optional per-feed paths.
 type FeedServer struct {
 	Name           string
-	URL            string
-	UpdateInterval int // seconds (0 = default 3600)
-	HoldInterval   int // seconds (0 = default 7200)
-	FeedName       string
+	URL            string // explicit url (takes precedence)
+	Hostname       string // hostname for building URLs with per-feed paths
+	UpdateInterval int    // seconds (0 = default 3600)
+	HoldInterval   int    // seconds (0 = default 7200)
+	FeedName       string // single feed-name (backward compat, no path)
+	FeedEntries    []FeedEntry // named feeds with per-feed paths
+}
+
+// FeedEntry is a named feed within a feed-server, with an optional path.
+type FeedEntry struct {
+	Name string
+	Path string
+}
+
+// AddressBinding binds an address-name to one or more feed-names via a profile.
+type AddressBinding struct {
+	Name      string
+	FeedNames []string // feed-names referenced in the profile
 }
 
 // SecurityConfig holds all security-related configuration.

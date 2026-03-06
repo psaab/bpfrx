@@ -5202,6 +5202,9 @@ func compileDynamicAddress(node *Node, sec *SecurityConfig) error {
 	if sec.DynamicAddress.FeedServers == nil {
 		sec.DynamicAddress.FeedServers = make(map[string]*FeedServer)
 	}
+	if sec.DynamicAddress.AddressBindings == nil {
+		sec.DynamicAddress.AddressBindings = make(map[string]*AddressBinding)
+	}
 
 	for _, inst := range namedInstances(node.FindChildren("feed-server")) {
 		fs := &FeedServer{Name: inst.name}
@@ -5210,6 +5213,8 @@ func compileDynamicAddress(node *Node, sec *SecurityConfig) error {
 			switch prop.Name() {
 			case "url":
 				fs.URL = nodeVal(prop)
+			case "hostname":
+				fs.Hostname = nodeVal(prop)
 			case "update-interval":
 				if v := nodeVal(prop); v != "" {
 					if n, err := strconv.Atoi(v); err == nil {
@@ -5223,12 +5228,38 @@ func compileDynamicAddress(node *Node, sec *SecurityConfig) error {
 					}
 				}
 			case "feed-name":
-				fs.FeedName = nodeVal(prop)
+				fnName := nodeVal(prop)
+				if len(prop.Children) > 0 {
+					fe := FeedEntry{Name: fnName}
+					for _, c := range prop.Children {
+						if c.Name() == "path" {
+							fe.Path = nodeVal(c)
+						}
+					}
+					fs.FeedEntries = append(fs.FeedEntries, fe)
+				} else {
+					fs.FeedName = fnName
+				}
 			}
 		}
 
 		sec.DynamicAddress.FeedServers[fs.Name] = fs
 	}
+
+	for _, inst := range namedInstances(node.FindChildren("address-name")) {
+		ab := &AddressBinding{Name: inst.name}
+		if profile := inst.node.FindChild("profile"); profile != nil {
+			for _, c := range profile.Children {
+				if c.Name() == "feed-name" {
+					if fn := nodeVal(c); fn != "" {
+						ab.FeedNames = append(ab.FeedNames, fn)
+					}
+				}
+			}
+		}
+		sec.DynamicAddress.AddressBindings[ab.Name] = ab
+	}
+
 	return nil
 }
 
@@ -5266,7 +5297,14 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 				case "probe-type":
 					test.ProbeType = nodeVal(prop)
 				case "target":
-					test.Target = nodeVal(prop)
+					// Handle both "target 1.1.1.1;" and "target url http://1.1.1.1;"
+					if len(prop.Keys) >= 3 && prop.Keys[1] == "url" {
+						test.Target = prop.Keys[2]
+					} else if urlChild := prop.FindChild("url"); urlChild != nil {
+						test.Target = nodeVal(urlChild)
+					} else {
+						test.Target = nodeVal(prop)
+					}
 				case "source-address":
 					test.SourceAddress = nodeVal(prop)
 				case "routing-instance":
@@ -5297,6 +5335,12 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 									test.ThresholdSuccessive = n
 								}
 							}
+						}
+					}
+				case "probe-limit":
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							test.ProbeLimit = n
 						}
 					}
 				case "destination-port":
@@ -5351,6 +5395,14 @@ func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
 						if v := nodeVal(secNode); v != "" {
 							if n, err := strconv.Atoi(v); err == nil {
 								tmpl.TemplateRefreshRate = n
+							}
+						}
+					}
+				case "ipv4-template", "ipv6-template":
+					for _, child := range prop.Children {
+						if child.Name() == "export-extension" {
+							if v := nodeVal(child); v != "" {
+								tmpl.ExportExtensions = append(tmpl.ExportExtensions, v)
 							}
 						}
 					}

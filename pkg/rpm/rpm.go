@@ -9,10 +9,40 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
+	"golang.org/x/sys/unix"
 )
+
+// vrfDialer returns a net.Dialer bound to a VRF device via SO_BINDTODEVICE.
+// The VRF device name is "vrf-" + routing instance name.
+func vrfDialer(timeout time.Duration, sourceAddr string, vrfDevice string) *net.Dialer {
+	d := &net.Dialer{Timeout: timeout}
+	if sourceAddr != "" {
+		d.LocalAddr = &net.TCPAddr{IP: net.ParseIP(sourceAddr)}
+	}
+	if vrfDevice != "" {
+		d.Control = func(network, address string, c syscall.RawConn) error {
+			var err error
+			c.Control(func(fd uintptr) {
+				err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET,
+					syscall.SO_BINDTODEVICE, vrfDevice)
+			})
+			return err
+		}
+	}
+	return d
+}
+
+// vrfDeviceName returns the VRF device name for a routing instance.
+func vrfDeviceName(ri string) string {
+	if ri == "" {
+		return ""
+	}
+	return "vrf-" + ri
+}
 
 // ProbeResult holds the current state of a single RPM test.
 type ProbeResult struct {
@@ -183,6 +213,7 @@ func (m *Manager) runProbeLoop(ctx context.Context, probe *config.RPMProbe, test
 
 func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *config.RPMTest, key string, probeCount int, probeInterval time.Duration, threshold int) {
 	var successes, failures int
+	probeLimit := test.ProbeLimit // 0 = unlimited
 
 	for i := 0; i < probeCount; i++ {
 		if i > 0 {
@@ -210,12 +241,17 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 			if r.SuccFail >= threshold {
 				r.LastStatus = "fail"
 			}
+			// Check probe-limit: stop test cycle when reached
+			hitLimit := probeLimit > 0 && r.SuccFail >= probeLimit
 			m.mu.Unlock()
 			// Fire probe-level failure event
 			m.fireEvent("ping_probe_failed", probeName, test.Name)
 			// Fire test-level failure on transition
 			if r.SuccFail == threshold && prevStatus != "fail" {
 				m.fireEvent("ping_test_failed", probeName, test.Name)
+			}
+			if hitLimit {
+				break
 			}
 		} else {
 			successes++
@@ -276,10 +312,7 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest) (time.Dur
 	// reasonable proxy that works without elevated privileges.
 	target := test.Target
 	start := time.Now()
-	dialer := &net.Dialer{Timeout: 3 * time.Second}
-	if test.SourceAddress != "" {
-		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(test.SourceAddress)}
-	}
+	dialer := vrfDialer(3*time.Second, test.SourceAddress, vrfDeviceName(test.RoutingInstance))
 	conn, err := dialer.DialContext(ctx, "ip4:icmp", target)
 	if err != nil {
 		// Fallback: try UDP dial which succeeds if host is reachable
@@ -300,10 +333,7 @@ func (m *Manager) probeTCP(ctx context.Context, test *config.RPMTest) (time.Dura
 		port = 80
 	}
 	addr := net.JoinHostPort(test.Target, fmt.Sprintf("%d", port))
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	if test.SourceAddress != "" {
-		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(test.SourceAddress)}
-	}
+	dialer := vrfDialer(5*time.Second, test.SourceAddress, vrfDeviceName(test.RoutingInstance))
 
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
@@ -326,7 +356,11 @@ func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest) (time.Dur
 		url = "http://" + target
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	dialer := vrfDialer(10*time.Second, test.SourceAddress, vrfDeviceName(test.RoutingInstance))
+	transport := &http.Transport{
+		DialContext: dialer.DialContext,
+	}
+	client := &http.Client{Timeout: 10 * time.Second, Transport: transport}
 
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

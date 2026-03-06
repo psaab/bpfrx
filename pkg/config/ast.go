@@ -1117,7 +1117,20 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"dynamic-address": {children: map[string]*schemaNode{
-			"feed-server": {args: 1, children: nil},
+			"feed-server": {args: 1, children: map[string]*schemaNode{
+				"url":             {args: 1, children: nil},
+				"hostname":        {args: 1, children: nil},
+				"update-interval": {args: 1, children: nil},
+				"hold-interval":   {args: 1, children: nil},
+				"feed-name":       {args: 1, children: map[string]*schemaNode{
+					"path": {args: 1, children: nil},
+				}},
+			}},
+			"address-name": {args: 1, children: map[string]*schemaNode{
+				"profile": {children: map[string]*schemaNode{
+					"feed-name": {args: 1, children: nil},
+				}},
+			}},
 		}},
 		"ssh-known-hosts": {children: map[string]*schemaNode{
 			"host": {args: 1, children: nil},
@@ -1798,7 +1811,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	"services": {children: map[string]*schemaNode{
 		"rpm": {children: map[string]*schemaNode{
 			"probe": {args: 1, children: map[string]*schemaNode{
-				"test": {args: 1, children: nil},
+				"test": {args: 1, children: map[string]*schemaNode{
+					"probe-limit": {args: 1, children: nil},
+					"target": {children: map[string]*schemaNode{
+						"url": {args: 1, children: nil},
+					}},
+				}},
 			}},
 		}},
 		"flow-monitoring": {children: map[string]*schemaNode{
