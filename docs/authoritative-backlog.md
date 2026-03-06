@@ -1,6 +1,6 @@
 # Authoritative Backlog
 
-Date: 2026-03-02
+Date: 2026-03-06
 Status: Active
 
 This document is the canonical backlog snapshot for parity and HA-followup work.
@@ -21,10 +21,10 @@ Use these sources in this order when there is disagreement:
 ### 1) vSRX parity gaps (from `docs/feature-gaps.md` row data)
 
 Row-level gap totals:
-- Missing: 122
-- Partial: 14
+- Missing: 120
+- Partial: 12
 - Parse-Only: 4
-- Total Open Gaps: 140
+- Total Open Gaps: 136
 
 Category totals:
 
@@ -41,16 +41,16 @@ Category totals:
 | 9. Screen/IDS Enhancements | 4 | 2 | 0 | 6 |
 | 10. Security Flow Enhancements | 5 | 0 | 0 | 5 |
 | 11. ALG Enhancements | 9 | 0 | 0 | 9 |
-| 12. Security Logging Enhancements | 1 | 0 | 0 | 1 |
-| 13. PKI / Certificates | 4 | 0 | 0 | 4 |
+| 12. Security Logging Enhancements | 0 | 0 | 0 | 0 |
+| 13. PKI / Certificates | 3 | 1 | 0 | 4 |
 | 14. Routing Enhancements | 10 | 3 | 0 | 13 |
-| 15. VPN Enhancements | 8 | 1 | 0 | 9 |
-| 17. Firewall Filter Enhancements | 2 | 1 | 0 | 3 |
+| 15. VPN Enhancements | 8 | 0 | 0 | 8 |
+| 17. Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
 | 18. QoS / Class of Service | 7 | 1 | 0 | 8 |
 | 19. Multi-Tenancy | 4 | 0 | 0 | 4 |
 | 20. Management & Automation | 9 | 2 | 0 | 11 |
 | 21. Interface Enhancements | 1 | 1 | 0 | 2 |
-| 22. System Enhancements | 5 | 1 | 2 | 8 |
+| 22. System Enhancements | 5 | 0 | 2 | 7 |
 | 23. Miscellaneous Features | 6 | 0 | 0 | 6 |
 
 High-priority open items:
@@ -100,6 +100,12 @@ These are documented as implemented in `docs/phases.md` and should not remain in
 - Sprint PR #67: `monitor security flow` and `monitor security packet-drop`
 - Sprint #68: HA fail-closed default + `set chassis cluster hitless-restart` opt-in
 - HA sync hardening sprint #69-#80 items called out as fixed in `docs/bugs.md`
+- Sprint CC-18: Junos IKE/IPsec compatibility items now merged on `master`:
+  - gateway `local-certificate` / pubkey auth generation
+  - `traffic-selector` support
+  - structured DPD parsing and runtime generation
+  - `external-interface` to runtime `local-address` resolution
+  - Junos `$9$` PSK decoding
 - Sync known-issues pair below are marked fixed in `docs/bugs.md`:
   - NO_NEIGH failover issue
   - Monotonic clock skew session expiry issue

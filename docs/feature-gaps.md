@@ -1,6 +1,6 @@
 # bpfrx vs Juniper vSRX Feature Gap Analysis
 
-Last updated: 2026-03-04
+Last updated: 2026-03-06
 
 ## Summary
 
@@ -18,18 +18,18 @@ Last updated: 2026-03-04
 | Security Flow Enhancements | 5 | 0 | 0 | 5 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
 | Security Logging Enhancements | 0 | 0 | 0 | 0 |
-| PKI / Certificates | 4 | 0 | 0 | 4 |
+| PKI / Certificates | 3 | 1 | 0 | 4 |
 | Routing Enhancements | 10 | 3 | 0 | 13 |
-| VPN Enhancements | 8 | 1 | 0 | 9 |
+| VPN Enhancements | 8 | 0 | 0 | 8 |
 | HA Enhancements | 0 | 0 | 0 | 0 |
 | Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
 | Management & Automation | 9 | 2 | 0 | 11 |
 | Interface Enhancements | 1 | 1 | 0 | 2 |
-| System Enhancements | 5 | 1 | 2 | 8 |
+| System Enhancements | 5 | 0 | 2 | 7 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **121** | **13** | **4** | **138** |
+| **TOTAL** | **120** | **12** | **4** | **136** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -235,14 +235,14 @@ bpfrx has security logging with mode (stream/event), format, streams with host/p
 
 ## 13. PKI / Certificates
 
-bpfrx uses strongSwan for IPsec which has its own certificate handling, but Junos PKI management is not implemented.
+bpfrx uses strongSwan for IPsec. Basic certificate-auth IKE generation exists, but Junos PKI lifecycle management is still not implemented.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **CA Profile Management** | `security pki ca-profile ... ca-identity ... enrollment url ...` | CA certificate profiles with SCEP/CMPv2 enrollment, revocation checking (CRL/OCSP) | Medium | Missing |
 | **Local Certificate Management** | `security pki local-certificate ...` | Generate CSRs, load certificates, auto-enrollment, renewal tracking | Medium | Missing |
 | **CRL Management** | `security pki ca-profile ... revocation-check crl ...` | Certificate revocation list download, caching, periodic refresh | Low | Missing |
-| **Certificate-Based IPsec** | `security ike gateway ... local-certificate ...` | IPsec authentication using X.509 certificates instead of PSK | Medium | Missing (strongSwan supports this but bpfrx doesn't configure it) |
+| **Certificate-Based IPsec** | `security ike gateway ... local-certificate ...` | IPsec authentication using X.509 certificates instead of PSK | Medium | Partial (gateway `local-certificate` and pubkey auth compile into swanctl, but bpfrx still lacks Junos PKI/local-certificate object lifecycle management) |
 
 ---
 
@@ -271,7 +271,7 @@ bpfrx has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, IPI
 
 ## 15. VPN Enhancements
 
-bpfrx has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfaces, NAT-T, DPD modes, local/remote identity, DF-bit, establish-tunnels. These are additional VPN features.
+bpfrx has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfaces, NAT-T, DPD modes, local/remote identity, local-certificate auth generation, DF-bit, establish-tunnels, and traffic selectors. These are additional VPN features.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -280,7 +280,7 @@ bpfrx has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfac
 | **AutoVPN** | `security ike gateway ... dynamic ...` | Auto-provisioned hub-and-spoke IPsec VPN. Hub accepts dynamic spoke connections using DNS names or any. | Medium | Missing |
 | **ADVPN** | `security ipsec vpn ... advpn ...` | Auto Discovery VPN: dynamic spoke-to-spoke tunnels created on demand in hub-and-spoke topology | Low | Missing |
 | **Group VPN (GVPNv2)** | `security group-vpn ...` | Group key management for multipoint VPNs with single SA for multiple endpoints | Low | Missing |
-| **IPsec Traffic Selectors** | `security ipsec vpn ... traffic-selector ...` | Per-tunnel traffic selectors (proxy-IDs) defining which traffic enters the tunnel | Medium | Partial (basic local-id/remote-id exists but not full traffic-selector syntax) |
+| **IPsec Traffic Selectors** | `security ipsec vpn ... traffic-selector ...` | Per-tunnel traffic selectors (proxy-IDs) defining which traffic enters the tunnel | Medium | Done (named `traffic-selector` entries compile into multiple child SAs and are reflected in runtime status parsing) |
 | **PowerMode IPsec** | `security flow power-mode-ipsec` | VPP + Intel AES-NI acceleration for IPsec throughput. vSRX 3.0 feature. | Low | Missing |
 | **IPsec SA Lifetime (kilobytes)** | `security ipsec proposal ... lifetime-kilobytes N` | Rekey based on data volume in addition to time-based lifetime | Low | Missing |
 | **Dual-Stack IPsec Tunnels** | Multiple st0 units with inet+inet6 families | Parallel IPv4+IPv6 tunnels over single XFRM interface | Low | Missing |
@@ -396,7 +396,7 @@ bpfrx has hostname, domain-name, domain-search, timezone, name-servers, NTP, ser
 | **TACACS+ Server Config** | `system tacplus-server ... port ... secret ...` | TACACS+ server definitions for per-command authorization | Medium | Missing |
 | **Authentication Order** | `system authentication-order [radius tacplus password]` | Control order of authentication methods for management access | Medium | Missing |
 | **Auto-Image Upgrade** | `system autoinstallation ...` | Zero-touch provisioning for initial deployment | Low | Missing |
-| **Time Zone (wired)** | `system time-zone ...` | bpfrx parses timezone but verify it's applied to the system | Low | Partial (parsed, needs runtime verification) |
+| **Time Zone (wired)** | `system time-zone ...` | bpfrx applies the configured timezone to the system runtime | Low | Done (daemon updates `/etc/localtime` and `/etc/timezone`) |
 | **NTP Threshold Action** | `system ntp threshold ... action ...` | Action when NTP offset exceeds threshold (accept or reject large time jumps) | Low | Parse-Only |
 | **Master Password** | `system master-password ...` | Encrypted password storage with master key for config secrets | Low | Parse-Only |
 | **DNS Proxy** | `system services dns dns-proxy ...` | DNS proxy/caching server on firewall for client DNS resolution | Low | Missing |
