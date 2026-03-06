@@ -8647,11 +8647,18 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 	}
 
 	// isPeerInterface returns true if the named interface is a cluster peer's
-	// physical member. Checks redundancy-group interface monitors and member
-	// interfaces that don't exist locally.
+	// physical member. Checks FPC slot → node-id mapping first (ge-7/0/X on
+	// node0 belongs to node1), then falls back to RG interface monitors.
 	isPeerInterface := func(name string) bool {
 		if cfg.Chassis.Cluster == nil {
 			return false
+		}
+		// Check FPC slot: slot 0 → node0, slot 7 → node1.
+		if s.cluster != nil {
+			slot := config.InterfaceSlot(name)
+			if slot >= 0 && config.SlotToNodeID(slot) != s.cluster.NodeID() {
+				return true
+			}
 		}
 		base := strings.SplitN(name, ".", 2)[0]
 		// Check RG interface monitors.
