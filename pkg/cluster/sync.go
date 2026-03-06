@@ -93,7 +93,8 @@ type SyncStatsSnapshot struct {
 	FencesReceived    uint64
 	Errors            uint64
 	DeletesDropped    uint64
-	Connected         bool
+	Connected    bool
+	ActiveFabric int // 0=fab0, 1=fab1, -1=disconnected
 
 	BulkSyncStartTime int64
 	BulkSyncEndTime   int64
@@ -110,7 +111,8 @@ type SessionSync struct {
 	dp        dataplane.DataPlane
 	stats     SyncStats
 	mu        sync.Mutex
-	conn      net.Conn
+	conn0     net.Conn   // fab0 connection (preferred)
+	conn1     net.Conn   // fab1 connection (fallback)
 	writeMu   sync.Mutex // serializes all conn.Write calls (sendLoop + writeMsg)
 	listener  net.Listener
 	localAddr1 string       // secondary fabric listen address ("" = single-fabric)
@@ -242,6 +244,17 @@ func (s *SessionSync) SetDataPlane(dp dataplane.DataPlane) {
 // Stats returns a point-in-time snapshot of sync statistics.
 // The snapshot uses plain fields (no atomics) so it is safe to copy by value.
 func (s *SessionSync) Stats() SyncStatsSnapshot {
+	s.mu.Lock()
+	var activeFabric int
+	if s.conn0 != nil {
+		activeFabric = 0
+	} else if s.conn1 != nil {
+		activeFabric = 1
+	} else {
+		activeFabric = -1
+	}
+	s.mu.Unlock()
+
 	return SyncStatsSnapshot{
 		SessionsSent:       s.stats.SessionsSent.Load(),
 		SessionsReceived:   s.stats.SessionsReceived.Load(),
@@ -258,6 +271,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		Errors:             s.stats.Errors.Load(),
 		DeletesDropped:     s.stats.DeletesDropped.Load(),
 		Connected:          s.stats.Connected.Load(),
+		ActiveFabric:       activeFabric,
 		BulkSyncStartTime:  s.stats.BulkSyncStartTime.Load(),
 		BulkSyncEndTime:    s.stats.BulkSyncEndTime.Load(),
 		BulkSyncSessions:   s.stats.BulkSyncSessions.Load(),
@@ -269,6 +283,80 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 // IsConnected returns true if the peer connection is established.
 func (s *SessionSync) IsConnected() bool {
 	return s.stats.Connected.Load()
+}
+
+// ActiveFabric returns which fabric carries sync traffic: 0, 1, or -1 if disconnected.
+func (s *SessionSync) ActiveFabric() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn0 != nil {
+		return 0
+	}
+	if s.conn1 != nil {
+		return 1
+	}
+	return -1
+}
+
+// activeConnLocked returns the preferred active connection.
+// fab0 is preferred; fab1 is used only when fab0 is down.
+// Caller must hold s.mu.
+func (s *SessionSync) activeConnLocked() net.Conn {
+	if s.conn0 != nil {
+		return s.conn0
+	}
+	return s.conn1
+}
+
+// getActiveConn returns the active connection, taking the lock.
+func (s *SessionSync) getActiveConn() net.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.activeConnLocked()
+}
+
+// handleNewConnection processes a newly established connection on the given fabric.
+// It sets the connection in the appropriate slot, starts the receive loop, exchanges
+// clocks, and triggers bulk sync if this is the first connection after a total disconnect.
+func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, conn net.Conn) {
+	s.mu.Lock()
+	wasDisconnected := s.conn0 == nil && s.conn1 == nil
+	switch fabricIdx {
+	case 0:
+		if s.conn0 != nil {
+			s.conn0.Close()
+		}
+		s.conn0 = conn
+	case 1:
+		if s.conn1 != nil {
+			s.conn1.Close()
+		}
+		s.conn1 = conn
+	}
+	s.stats.Connected.Store(true)
+	s.mu.Unlock()
+
+	// Start receive loop for this connection.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.receiveLoop(ctx, conn)
+	}()
+
+	// Exchange monotonic clocks on every new connection.
+	s.sendClockSync(conn)
+
+	// Bulk sync, journal flush, and callbacks only on first connection
+	// after a total disconnect — not when adding a redundant fabric path.
+	if wasDisconnected {
+		s.flushDeleteJournal()
+		if s.OnPeerConnected != nil {
+			go s.OnPeerConnected()
+		}
+		if err := s.BulkSync(); err != nil {
+			slog.Warn("cluster sync: bulk sync failed", "err", err, "fabric", fabricIdx)
+		}
+	}
 }
 
 // Start begins the sync protocol (listener + connector).
@@ -284,11 +372,11 @@ func (s *SessionSync) Start(ctx context.Context) error {
 	s.listener = ln
 	slog.Info("cluster sync: listening", "addr", s.localAddr)
 
-	// Accept incoming connections.
+	// Accept incoming connections on primary fabric.
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.acceptLoop(ctx, ln)
+		s.acceptLoop(ctx, ln, 0)
 	}()
 
 	// Start secondary fabric listener if configured.
@@ -304,17 +392,26 @@ func (s *SessionSync) Start(ctx context.Context) error {
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
-				s.acceptLoop(ctx, ln1)
+				s.acceptLoop(ctx, ln1, 1)
 			}()
 		}
 	}
 
-	// Connect to peer (retry loop).
+	// Connect to peer on primary fabric (retry loop).
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.connectLoop(ctx)
+		s.fabricConnectLoop(ctx, 0, s.peerAddr)
 	}()
+
+	// Connect to peer on secondary fabric if configured.
+	if s.peerAddr1 != "" {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.fabricConnectLoop(ctx, 1, s.peerAddr1)
+		}()
+	}
 
 	// Sender goroutine.
 	s.wg.Add(1)
@@ -340,8 +437,11 @@ func (s *SessionSync) Stop() {
 		s.listener1.Close()
 	}
 	s.mu.Lock()
-	if s.conn != nil {
-		s.conn.Close()
+	if s.conn0 != nil {
+		s.conn0.Close()
+	}
+	if s.conn1 != nil {
+		s.conn1.Close()
 	}
 	s.mu.Unlock()
 
@@ -578,9 +678,7 @@ func (s *SessionSync) flushDeleteJournal() {
 // QueueConfig sends the full config text to the peer for config synchronization.
 // Called by the primary node after a successful commit.
 func (s *SessionSync) QueueConfig(configText string) {
-	s.mu.Lock()
-	conn := s.conn
-	s.mu.Unlock()
+	conn := s.getActiveConn()
 	if conn == nil {
 		return
 	}
@@ -602,9 +700,7 @@ func (s *SessionSync) QueueConfig(configText string) {
 // SendFailover sends a remote failover request to the peer, asking it to
 // give up primary for the specified redundancy group.
 func (s *SessionSync) SendFailover(rgID int) error {
-	s.mu.Lock()
-	conn := s.conn
-	s.mu.Unlock()
+	conn := s.getActiveConn()
 	if conn == nil {
 		return fmt.Errorf("peer not connected")
 	}
@@ -627,9 +723,7 @@ func (s *SessionSync) SendFailover(rgID int) error {
 // RGs (set rg_active=false). This is a best-effort operation — if the sync
 // connection is down (likely during a real failure), the call returns an error.
 func (s *SessionSync) SendFence() error {
-	s.mu.Lock()
-	conn := s.conn
-	s.mu.Unlock()
+	conn := s.getActiveConn()
 	if conn == nil {
 		return fmt.Errorf("peer not connected")
 	}
@@ -657,9 +751,7 @@ func (s *SessionSync) BulkSync() error {
 	if s.dp == nil {
 		return fmt.Errorf("dataplane not ready")
 	}
-	s.mu.Lock()
-	conn := s.conn
-	s.mu.Unlock()
+	conn := s.getActiveConn()
 	if conn == nil {
 		return fmt.Errorf("no peer connection")
 	}
@@ -753,7 +845,7 @@ func (s *SessionSync) sendClockSync(conn net.Conn) {
 	}
 }
 
-func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener) {
+func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener, fabricIdx int) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -766,50 +858,14 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener) {
 				continue
 			}
 		}
-		slog.Info("cluster sync: peer connected", "remote", conn.RemoteAddr())
-		s.mu.Lock()
-		if s.conn != nil {
-			s.conn.Close()
-		}
-		s.conn = conn
-		s.stats.Connected.Store(true)
-		s.mu.Unlock()
-
-		// Handle incoming messages from this connection.
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.receiveLoop(ctx, conn)
-		}()
-
-		// Exchange monotonic clocks before any session data.
-		s.sendClockSync(conn)
-
-		// Flush any delete messages that were journaled during disconnect.
-		s.flushDeleteJournal()
-
-		if s.OnPeerConnected != nil {
-			go s.OnPeerConnected()
-		}
-
-		// Send our sessions to the peer that just connected.
-		// This covers the case where the peer's connectLoop connected
-		// to us before our connectLoop could connect to them — without
-		// this, the peer would never receive our sessions because only
-		// connectLoop calls BulkSync.
-		if err := s.BulkSync(); err != nil {
-			slog.Warn("cluster sync: accept bulk sync failed", "err", err)
-		}
+		slog.Info("cluster sync: peer connected", "remote", conn.RemoteAddr(), "fabric", fabricIdx)
+		s.handleNewConnection(ctx, fabricIdx, conn)
 	}
 }
 
-func (s *SessionSync) connectLoop(ctx context.Context) {
-	peerAddrs := []string{s.peerAddr}
-	if s.peerAddr1 != "" {
-		peerAddrs = append(peerAddrs, s.peerAddr1)
-	}
-	addrIdx := 0
-
+// fabricConnectLoop retries outbound connection on a single fabric link.
+// Each fabric gets its own loop so fab0 reconnects independently of fab1.
+func (s *SessionSync) fabricConnectLoop(ctx context.Context, fabricIdx int, peerAddr string) {
 	for first := true; ; first = false {
 		if !first {
 			select {
@@ -819,7 +875,16 @@ func (s *SessionSync) connectLoop(ctx context.Context) {
 			}
 		}
 
-		if s.stats.Connected.Load() {
+		// Skip if this fabric is already connected.
+		s.mu.Lock()
+		var connected bool
+		if fabricIdx == 0 {
+			connected = s.conn0 != nil
+		} else {
+			connected = s.conn1 != nil
+		}
+		s.mu.Unlock()
+		if connected {
 			select {
 			case <-ctx.Done():
 				return
@@ -828,50 +893,17 @@ func (s *SessionSync) connectLoop(ctx context.Context) {
 			continue
 		}
 
-		addr := peerAddrs[addrIdx]
 		dialer := net.Dialer{Timeout: 3 * time.Second}
 		if s.vrfDevice != "" {
 			dialer.Control = vrfListenConfig(s.vrfDevice).Control
 		}
-		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		conn, err := dialer.DialContext(ctx, "tcp", peerAddr)
 		if err != nil {
-			// Rotate to next address on failure
-			addrIdx = (addrIdx + 1) % len(peerAddrs)
 			continue
 		}
 
-		slog.Info("cluster sync: connected to peer", "addr", addr)
-		// Reset to prefer primary fabric on success
-		addrIdx = 0
-		s.mu.Lock()
-		if s.conn != nil {
-			s.conn.Close()
-		}
-		s.conn = conn
-		s.stats.Connected.Store(true)
-		s.mu.Unlock()
-
-		// Receive from this connection.
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.receiveLoop(ctx, conn)
-		}()
-
-		// Exchange monotonic clocks before any session data.
-		s.sendClockSync(conn)
-
-		// Flush any delete messages that were journaled during disconnect.
-		s.flushDeleteJournal()
-
-		if s.OnPeerConnected != nil {
-			go s.OnPeerConnected()
-		}
-
-		// Perform initial bulk sync after connecting.
-		if err := s.BulkSync(); err != nil {
-			slog.Warn("cluster sync: initial bulk sync failed", "err", err)
-		}
+		slog.Info("cluster sync: connected to peer", "addr", peerAddr, "fabric", fabricIdx)
+		s.handleNewConnection(ctx, fabricIdx, conn)
 	}
 }
 
@@ -881,9 +913,7 @@ func (s *SessionSync) sendLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case msg := <-s.sendCh:
-			s.mu.Lock()
-			conn := s.conn
-			s.mu.Unlock()
+			conn := s.getActiveConn()
 			if conn == nil {
 				continue
 			}
@@ -1358,24 +1388,41 @@ func (s *SessionSync) reconcileStaleSessions() {
 func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.conn != nil && s.conn == conn {
-		s.conn.Close()
-		s.conn = nil
-		s.stats.Connected.Store(false)
-		s.clockSynced.Store(false)
-		slog.Info("cluster sync: peer disconnected")
-	} else if s.conn != conn {
+
+	switch {
+	case s.conn0 != nil && s.conn0 == conn:
+		s.conn0.Close()
+		s.conn0 = nil
+		slog.Info("cluster sync: fabric 0 disconnected")
+	case s.conn1 != nil && s.conn1 == conn:
+		s.conn1.Close()
+		s.conn1 = nil
+		slog.Info("cluster sync: fabric 1 disconnected")
+	default:
 		slog.Debug("cluster sync: ignoring stale disconnect",
-			"stale", fmt.Sprintf("%p", conn),
-			"current", fmt.Sprintf("%p", s.conn))
+			"stale", fmt.Sprintf("%p", conn))
+		return
+	}
+
+	connected := s.conn0 != nil || s.conn1 != nil
+	s.stats.Connected.Store(connected)
+	if !connected {
+		s.clockSynced.Store(false)
+		slog.Info("cluster sync: peer disconnected (all fabrics down)")
 	}
 }
 
 // FormatStats returns a formatted string of sync statistics.
 func (s *SessionSync) FormatStats() string {
+	activeFabric := s.ActiveFabric()
+	fabricStr := "none"
+	if activeFabric >= 0 {
+		fabricStr = fmt.Sprintf("fab%d", activeFabric)
+	}
 	return fmt.Sprintf(
 		"Session sync statistics:\n"+
 			"  Connected:          %v\n"+
+			"  Active fabric:      %s\n"+
 			"  Sessions sent:      %d\n"+
 			"  Sessions received:  %d\n"+
 			"  Sessions installed: %d\n"+
@@ -1390,6 +1437,7 @@ func (s *SessionSync) FormatStats() string {
 			"  Fences received:    %d\n"+
 			"  Errors:             %d\n",
 		s.stats.Connected.Load(),
+		fabricStr,
 		s.stats.SessionsSent.Load(),
 		s.stats.SessionsReceived.Load(),
 		s.stats.SessionsInstalled.Load(),
@@ -1417,9 +1465,7 @@ func (s *SessionSync) PeerIPsecSAs() []string {
 
 // QueueIPsecSA sends the list of active IPsec connection names to the peer.
 func (s *SessionSync) QueueIPsecSA(connectionNames []string) {
-	s.mu.Lock()
-	conn := s.conn
-	s.mu.Unlock()
+	conn := s.getActiveConn()
 	if conn == nil {
 		return
 	}

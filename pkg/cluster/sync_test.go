@@ -873,7 +873,7 @@ func TestBulkSyncSerialization(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
 	ss.IsPrimaryFn = func() bool { return true }
 	ss.mu.Lock()
-	ss.conn = mc
+	ss.conn0 = mc
 	ss.mu.Unlock()
 
 	var wg sync.WaitGroup
@@ -1066,7 +1066,7 @@ func TestBulkSyncRGFiltering(t *testing.T) {
 
 	cw := &countingWriter{}
 	ss.mu.Lock()
-	ss.conn = cw
+	ss.conn0 = cw
 	ss.mu.Unlock()
 
 	err := ss.BulkSync()
@@ -1097,7 +1097,7 @@ func TestBulkSyncSkipsReverseEntries(t *testing.T) {
 
 	cw := &countingWriter{}
 	ss.mu.Lock()
-	ss.conn = cw
+	ss.conn0 = cw
 	ss.mu.Unlock()
 
 	err := ss.BulkSync()
@@ -1229,13 +1229,13 @@ func TestHandleDisconnectStaleConn(t *testing.T) {
 
 	// Set conn A as the active connection.
 	ss.mu.Lock()
-	ss.conn = connA1
+	ss.conn0 = connA1
 	ss.stats.Connected.Store(true)
 	ss.mu.Unlock()
 
 	// Replace conn A with conn B (simulates accept/connect race).
 	ss.mu.Lock()
-	ss.conn = connB1
+	ss.conn0 = connB1
 	ss.mu.Unlock()
 
 	// Conn A's goroutine calls handleDisconnect with stale conn A.
@@ -1243,7 +1243,7 @@ func TestHandleDisconnectStaleConn(t *testing.T) {
 	ss.handleDisconnect(connA1)
 
 	ss.mu.Lock()
-	currentConn := ss.conn
+	currentConn := ss.conn0
 	ss.mu.Unlock()
 
 	if currentConn != connB1 {
@@ -1257,11 +1257,11 @@ func TestHandleDisconnectStaleConn(t *testing.T) {
 	ss.handleDisconnect(connB1)
 
 	ss.mu.Lock()
-	currentConn = ss.conn
+	currentConn = ss.conn0
 	ss.mu.Unlock()
 
 	if currentConn != nil {
-		t.Fatal("handleDisconnect(activeConn) should clear s.conn")
+		t.Fatal("handleDisconnect(activeConn) should clear s.conn0")
 	}
 	if ss.stats.Connected.Load() {
 		t.Fatal("handleDisconnect(activeConn) should mark as disconnected")
@@ -1320,7 +1320,7 @@ func TestConcurrentSyncWriters(t *testing.T) {
 
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	ss.mu.Lock()
-	ss.conn = clientConn
+	ss.conn0 = clientConn
 	ss.stats.Connected.Store(true)
 	ss.mu.Unlock()
 
@@ -1537,7 +1537,7 @@ func TestDeleteJournalReconnectConvergence(t *testing.T) {
 
 	// Simulate reconnect: set conn and connected.
 	ss.mu.Lock()
-	ss.conn = clientConn
+	ss.conn0 = clientConn
 	ss.stats.Connected.Store(true)
 	ss.mu.Unlock()
 
