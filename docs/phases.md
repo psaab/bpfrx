@@ -3038,3 +3038,12 @@ After the IPVLAN overlay refactor (CC-11/CC-12) and monitor fixes (CC-14), fabri
 ### Deterministic config output and NAT-T display
 - VPN iteration sorted by name for reproducible swanctl.conf generation across commits
 - `nat-traversal force` mode displayed in `show security ike security-associations` CLI output
+
+---
+
+## NTP Threshold Action (#162, 2026-03-06)
+
+- Wired `system ntp threshold <seconds> action accept|reject` to chrony runtime behavior
+- `accept` → chrony `logchange <threshold>` (log-only); `reject` → adds `maxchange <threshold> 1 -1` (rejects large post-startup corrections)
+- Managed drop-in at `/etc/chrony/conf.d/bpfrx-threshold.conf`; refactored `applySystemNTP()` into helpers (`renderChronySources`, `renderChronyThreshold`, `reconcileManagedFile`)
+- NTP threshold shown in `show ntp` and `show system services` CLI/gRPC output; unit tests in `pkg/daemon/ntp_test.go`
