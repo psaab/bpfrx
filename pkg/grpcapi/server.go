@@ -68,7 +68,7 @@ type Config struct {
 	VRRPMgr         *vrrp.Manager                    // native VRRP manager
 	RAMgr           *ra.Manager                      // embedded RA sender manager
 	Version          string                           // software version string
-	FabricPeerAddrFn func() string                    // returns peer fabric IP (empty if standalone)
+	FabricPeerAddrFn func() []string                   // returns peer fabric IPs (fab0, fab1; empty if standalone)
 	FabricVRFDevice  string                           // VRF for fabric interface (e.g. "vrf-mgmt")
 }
 
@@ -94,7 +94,7 @@ type Server struct {
 	startTime        time.Time
 	addr             string
 	version          string
-	fabricPeerAddrFn func() string
+	fabricPeerAddrFn func() []string
 	fabricVRFDevice  string
 }
 
@@ -8494,17 +8494,16 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 }
 
 // dialPeer establishes a gRPC connection to the cluster peer via the fabric link.
-// Returns the connection and peer address, or an error if not in cluster mode.
+// Tries fab0 first, then fab1 if dual-fabric is configured and fab0 fails.
+// Returns the connection or an error if not in cluster mode / all addresses fail.
 func (s *Server) dialPeer() (*grpc.ClientConn, error) {
 	if s.fabricPeerAddrFn == nil {
 		return nil, status.Error(codes.Unavailable, "not in cluster mode")
 	}
-	peerIP := s.fabricPeerAddrFn()
-	if peerIP == "" {
+	peerIPs := s.fabricPeerAddrFn()
+	if len(peerIPs) == 0 {
 		return nil, status.Error(codes.Unavailable, "cluster peer address not available")
 	}
-
-	peerAddr := fmt.Sprintf("%s:50051", peerIP)
 
 	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 	if s.fabricVRFDevice != "" {
@@ -8521,11 +8520,30 @@ func (s *Server) dialPeer() (*grpc.ClientConn, error) {
 			return dialer.DialContext(ctx, "tcp", addr)
 		}))
 	}
-	conn, err := grpc.NewClient(peerAddr, dialOpts...)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "cannot connect to peer %s: %v", peerAddr, err)
+
+	// Try each fabric address; return first successful connection.
+	var lastErr error
+	for _, ip := range peerIPs {
+		peerAddr := fmt.Sprintf("%s:50051", ip)
+		conn, err := grpc.NewClient(peerAddr, dialOpts...)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		// Verify the connection is usable with a short deadline.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		client := pb.NewBpfrxServiceClient(conn)
+		_, err = client.GetStatus(ctx, &pb.GetStatusRequest{})
+		cancel()
+		if err != nil {
+			conn.Close()
+			lastErr = err
+			slog.Debug("peer dial failed, trying next fabric address", "addr", peerAddr, "err", err)
+			continue
+		}
+		return conn, nil
 	}
-	return conn, nil
+	return nil, status.Errorf(codes.Unavailable, "cannot connect to peer on any fabric address: %v", lastErr)
 }
 
 // proxyMonitorInterface forwards a MonitorInterface stream to the cluster peer.

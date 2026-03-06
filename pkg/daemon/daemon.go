@@ -129,16 +129,22 @@ type Daemon struct {
 	reconcileNowCh chan struct{}
 
 	// Fabric cross-chassis forwarding state for periodic refresh.
-	fabricMu      sync.RWMutex
-	fabricIface   string
-	fabricPeerIP  net.IP
-	fabricIface1  string // secondary fabric interface (fab1)
-	fabricPeerIP1 net.IP // secondary fabric peer IP
+	fabricMu         sync.RWMutex
+	fabricIface      string
+	fabricPeerIP     net.IP
+	fabricIface1     string         // secondary fabric interface (fab1)
+	fabricPeerIP1    net.IP         // secondary fabric peer IP
+	fabricPopulated  bool           // true after first successful fab0 write
+	fabric1Populated bool           // true after first successful fab1 write
+	fabricRefreshCh  chan struct{}  // triggers immediate fabric_fwd refresh
 
-	// syncPeerAddr is the peer address used for gRPC peer dialing
+	// syncPeerAddr is the primary peer address used for gRPC peer dialing
 	// (session queries, config sync). Set to control link or fabric
 	// peer depending on sync transport mode.
 	syncPeerAddr string
+	// syncPeerAddr1 is the secondary fabric peer address (fab1) for
+	// gRPC peer dialing failover. Empty if no dual-fabric is configured.
+	syncPeerAddr1 string
 
 	// gRPC server reference for starting fabric listener in cluster mode.
 	grpcSrv *grpcapi.Server
@@ -773,16 +779,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 			VRRPMgr: d.vrrpMgr,
 			RAMgr:   d.ra,
 			Version: d.opts.Version,
-			FabricPeerAddrFn: func() string {
+			FabricPeerAddrFn: func() []string {
+				var addrs []string
 				if d.syncPeerAddr != "" {
-					return d.syncPeerAddr
+					addrs = append(addrs, d.syncPeerAddr)
+				} else {
+					d.fabricMu.RLock()
+					if d.fabricPeerIP != nil {
+						addrs = append(addrs, d.fabricPeerIP.String())
+					}
+					d.fabricMu.RUnlock()
 				}
-				d.fabricMu.RLock()
-				defer d.fabricMu.RUnlock()
-				if d.fabricPeerIP != nil {
-					return d.fabricPeerIP.String()
+				if d.syncPeerAddr1 != "" {
+					addrs = append(addrs, d.syncPeerAddr1)
+				} else {
+					d.fabricMu.RLock()
+					if d.fabricPeerIP1 != nil {
+						addrs = append(addrs, d.fabricPeerIP1.String())
+					}
+					d.fabricMu.RUnlock()
 				}
-				return ""
+				return addrs
 			},
 			FabricVRFDevice: func() string {
 				if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil {
@@ -829,17 +846,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return nil
 		})
 		shell.SetVRRPManager(d.vrrpMgr)
-		shell.SetFabricPeer(func() string {
-			// Use sync peer address (control-link or fabric) for gRPC peer dial.
+		shell.SetFabricPeer(func() []string {
+			var addrs []string
 			if d.syncPeerAddr != "" {
-				return d.syncPeerAddr
+				addrs = append(addrs, d.syncPeerAddr)
+			} else {
+				d.fabricMu.RLock()
+				if d.fabricPeerIP != nil {
+					addrs = append(addrs, d.fabricPeerIP.String())
+				}
+				d.fabricMu.RUnlock()
 			}
-			d.fabricMu.RLock()
-			defer d.fabricMu.RUnlock()
-			if d.fabricPeerIP != nil {
-				return d.fabricPeerIP.String()
+			if d.syncPeerAddr1 != "" {
+				addrs = append(addrs, d.syncPeerAddr1)
+			} else {
+				d.fabricMu.RLock()
+				if d.fabricPeerIP1 != nil {
+					addrs = append(addrs, d.fabricPeerIP1.String())
+				}
+				d.fabricMu.RUnlock()
 			}
-			return ""
+			return addrs
 		}, func() string {
 			if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil {
 				cc := c.Chassis.Cluster
@@ -3979,16 +4006,27 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 			d.cluster.SetSyncTransport(syncTransport)
 
-			// Store sync peer address for gRPC peer dialing (session queries etc).
+			// Store sync peer addresses for gRPC peer dialing (session queries etc).
 			d.syncPeerAddr = syncPeerAddr
+			if syncLocal1 != "" {
+				d.syncPeerAddr1 = cc.Fabric1PeerAddress
+			}
 
-			// Start gRPC fabric listener so peer can proxy monitor requests.
+			// Start gRPC fabric listener(s) so peer can proxy monitor requests.
 			// d.grpcSrv is set after startClusterComms returns, so we poll briefly.
 			// Uses the sync interface address (fabric or control-link).
+			// When dual-fabric is configured, listen on both fabric IPs.
 			go func() {
 				for i := 0; i < 30; i++ {
 					if d.grpcSrv != nil {
 						grpcAddr := fmt.Sprintf("%s:50051", syncIP)
+						if syncLocal1 != "" {
+							// Extract fab1 local IP (syncLocal1 is "ip:4785").
+							fab1Host, _, _ := net.SplitHostPort(syncLocal1)
+							grpcAddr1 := fmt.Sprintf("%s:50051", fab1Host)
+							go d.grpcSrv.RunFabricListener(commsCtx, grpcAddr1, vrfDevice)
+							slog.Info("gRPC dual fabric listeners", "fab0", grpcAddr, "fab1", grpcAddr1)
+						}
 						d.grpcSrv.RunFabricListener(commsCtx, grpcAddr, vrfDevice)
 						return
 					}
@@ -4111,6 +4149,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				go d.syncIPsecSAPeriodic(commsCtx)
 			}
 
+			// Initialize fabric refresh channel for event-driven updates (#124).
+			d.fabricRefreshCh = make(chan struct{}, 1)
+
 			// Populate fabric_fwd BPF map for cross-chassis redirect,
 			// then periodically refresh to correct neighbor drift.
 			// Resolve to physical parent (ge-0-0-0) — BPF runs on
@@ -4123,6 +4164,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				fab1Parent := d.resolveFabricParent(cc.Fabric1Interface)
 				go d.populateFabricFwd1(commsCtx, fab1Parent, cc.Fabric1PeerAddress)
 			}
+
+			// Monitor fabric link/neighbor state via netlink (#124).
+			go d.monitorFabricState(commsCtx)
 		}()
 	}
 }
@@ -4297,7 +4341,8 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 		}
 	}
 
-	// Periodic refresh every 30s to correct neighbor drift.
+	// Periodic refresh every 30s as safety net, plus event-driven
+	// refresh via fabricRefreshCh from netlink monitor (#124).
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -4305,6 +4350,8 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, peerAddr strin
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			d.refreshFabricFwd(fabIface, peerIP, false)
+		case <-d.fabricRefreshCh:
 			d.refreshFabricFwd(fabIface, peerIP, false)
 		}
 	}
@@ -4349,10 +4396,21 @@ func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting boo
 	if err != nil {
 		slog.Debug("cluster: fabric link not found",
 			"interface", fabIface, "err", err)
+		d.clearFabricFwd0()
 		return false
 	}
 	localMAC := link.Attrs().HardwareAddr
 	if len(localMAC) != 6 {
+		d.clearFabricFwd0()
+		return false
+	}
+
+	// Check oper-state: non-UP interfaces cannot forward (#122).
+	operState := link.Attrs().OperState
+	if operState != netlink.OperUp && operState != netlink.OperUnknown {
+		slog.Debug("cluster: fabric link not operational",
+			"interface", fabIface, "oper_state", operState)
+		d.clearFabricFwd0()
 		return false
 	}
 
@@ -4372,6 +4430,7 @@ func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting boo
 	neighs, err := netlink.NeighList(link.Attrs().Index, neighFamily)
 	if err != nil {
 		slog.Debug("cluster: neigh list failed", "err", err)
+		d.clearFabricFwd0()
 		return false
 	}
 	var peerMAC net.HardwareAddr
@@ -4387,6 +4446,7 @@ func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting boo
 			slog.Info("cluster: waiting for fabric peer neighbor entry",
 				"peer", peerIP)
 		}
+		d.clearFabricFwd0()
 		return false
 	}
 
@@ -4415,11 +4475,35 @@ func (d *Daemon) refreshFabricFwd(fabIface string, peerIP net.IP, logWaiting boo
 		slog.Warn("cluster: failed to update fabric_fwd map", "err", err)
 		return false
 	}
+
+	d.fabricMu.Lock()
+	d.fabricPopulated = true
+	d.fabricMu.Unlock()
+
 	slog.Info("cluster: fabric_fwd updated",
 		"interface", fabIface, "ifindex", info.Ifindex,
 		"fib_ifindex", info.FIBIfindex,
 		"local_mac", localMAC, "peer_mac", peerMAC)
 	return true
+}
+
+// clearFabricFwd0 writes a zeroed FabricFwdInfo to key=0 if a valid entry
+// was previously written, ensuring the dataplane falls back (#121).
+func (d *Daemon) clearFabricFwd0() {
+	d.fabricMu.RLock()
+	populated := d.fabricPopulated
+	d.fabricMu.RUnlock()
+	if !populated || d.dp == nil {
+		return
+	}
+	if err := d.dp.UpdateFabricFwd(dataplane.FabricFwdInfo{}); err != nil {
+		slog.Warn("cluster: failed to clear fabric_fwd[0]", "err", err)
+		return
+	}
+	d.fabricMu.Lock()
+	d.fabricPopulated = false
+	d.fabricMu.Unlock()
+	slog.Info("cluster: fabric_fwd[0] cleared (path down)")
 }
 
 // populateFabricFwd1 resolves the secondary fabric interface MACs and populates
@@ -4458,7 +4542,8 @@ func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, peerAddr stri
 		}
 	}
 
-	// Periodic refresh every 30s.
+	// Periodic refresh every 30s as safety net, plus event-driven
+	// refresh via fabricRefreshCh from netlink monitor (#124).
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -4466,6 +4551,8 @@ func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, peerAddr stri
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			d.refreshFabricFwd1(fabIface, peerIP, false)
+		case <-d.fabricRefreshCh:
 			d.refreshFabricFwd1(fabIface, peerIP, false)
 		}
 	}
@@ -4478,10 +4565,21 @@ func (d *Daemon) refreshFabricFwd1(fabIface string, peerIP net.IP, logWaiting bo
 	if err != nil {
 		slog.Debug("cluster: fabric1 link not found",
 			"interface", fabIface, "err", err)
+		d.clearFabricFwd1()
 		return false
 	}
 	localMAC := link.Attrs().HardwareAddr
 	if len(localMAC) != 6 {
+		d.clearFabricFwd1()
+		return false
+	}
+
+	// Check oper-state: non-UP interfaces cannot forward (#122).
+	operState := link.Attrs().OperState
+	if operState != netlink.OperUp && operState != netlink.OperUnknown {
+		slog.Debug("cluster: fabric1 link not operational",
+			"interface", fabIface, "oper_state", operState)
+		d.clearFabricFwd1()
 		return false
 	}
 
@@ -4500,6 +4598,7 @@ func (d *Daemon) refreshFabricFwd1(fabIface string, peerIP net.IP, logWaiting bo
 	neighs, err := netlink.NeighList(link.Attrs().Index, neighFamily)
 	if err != nil {
 		slog.Debug("cluster: fabric1 neigh list failed", "err", err)
+		d.clearFabricFwd1()
 		return false
 	}
 	var peerMAC net.HardwareAddr
@@ -4515,6 +4614,7 @@ func (d *Daemon) refreshFabricFwd1(fabIface string, peerIP net.IP, logWaiting bo
 			slog.Info("cluster: waiting for fabric1 peer neighbor entry",
 				"peer", peerIP)
 		}
+		d.clearFabricFwd1()
 		return false
 	}
 
@@ -4537,11 +4637,35 @@ func (d *Daemon) refreshFabricFwd1(fabIface string, peerIP net.IP, logWaiting bo
 		slog.Warn("cluster: failed to update fabric1_fwd map", "err", err)
 		return false
 	}
+
+	d.fabricMu.Lock()
+	d.fabric1Populated = true
+	d.fabricMu.Unlock()
+
 	slog.Info("cluster: fabric1_fwd updated",
 		"interface", fabIface, "ifindex", info.Ifindex,
 		"fib_ifindex", info.FIBIfindex,
 		"local_mac", localMAC, "peer_mac", peerMAC)
 	return true
+}
+
+// clearFabricFwd1 writes a zeroed FabricFwdInfo to key=1 if a valid entry
+// was previously written, ensuring the dataplane falls back (#121).
+func (d *Daemon) clearFabricFwd1() {
+	d.fabricMu.RLock()
+	populated := d.fabric1Populated
+	d.fabricMu.RUnlock()
+	if !populated || d.dp == nil {
+		return
+	}
+	if err := d.dp.UpdateFabricFwd1(dataplane.FabricFwdInfo{}); err != nil {
+		slog.Warn("cluster: failed to clear fabric_fwd[1]", "err", err)
+		return
+	}
+	d.fabricMu.Lock()
+	d.fabric1Populated = false
+	d.fabricMu.Unlock()
+	slog.Info("cluster: fabric_fwd[1] cleared (path down)")
 }
 
 // RefreshFabricFwd triggers an immediate refresh of the fabric_fwd BPF map.
@@ -4559,6 +4683,74 @@ func (d *Daemon) RefreshFabricFwd() {
 	}
 	if fabIface1 != "" && peerIP1 != nil {
 		d.refreshFabricFwd1(fabIface1, peerIP1, false)
+	}
+}
+
+// monitorFabricState subscribes to netlink link and neighbor updates and
+// triggers immediate fabric_fwd refresh when fabric interfaces or their
+// neighbor entries change (#124). The 30s ticker in populateFabricFwd
+// remains as a safety net.
+func (d *Daemon) monitorFabricState(ctx context.Context) {
+	linkUpdates := make(chan netlink.LinkUpdate, 64)
+	linkDone := make(chan struct{})
+	if err := netlink.LinkSubscribe(linkUpdates, linkDone); err != nil {
+		slog.Warn("cluster: failed to subscribe to link updates for fabric monitor", "err", err)
+		return
+	}
+
+	neighUpdates := make(chan netlink.NeighUpdate, 64)
+	neighDone := make(chan struct{})
+	if err := netlink.NeighSubscribe(neighUpdates, neighDone); err != nil {
+		slog.Warn("cluster: failed to subscribe to neigh updates for fabric monitor", "err", err)
+		close(linkDone)
+		return
+	}
+
+	slog.Info("cluster: fabric state monitor started (link + neighbor)")
+
+	for {
+		select {
+		case <-ctx.Done():
+			close(linkDone)
+			close(neighDone)
+			return
+		case update, ok := <-linkUpdates:
+			if !ok {
+				return
+			}
+			name := update.Attrs().Name
+			d.fabricMu.RLock()
+			isFabric := name == d.fabricIface || name == d.fabricIface1
+			d.fabricMu.RUnlock()
+			if isFabric {
+				slog.Debug("cluster: fabric link state change detected",
+					"interface", name, "oper_state", update.Attrs().OperState)
+				d.triggerFabricRefresh()
+			}
+		case update, ok := <-neighUpdates:
+			if !ok {
+				return
+			}
+			d.fabricMu.RLock()
+			isPeer := (d.fabricPeerIP != nil && update.IP.Equal(d.fabricPeerIP)) ||
+				(d.fabricPeerIP1 != nil && update.IP.Equal(d.fabricPeerIP1))
+			d.fabricMu.RUnlock()
+			if isPeer {
+				slog.Debug("cluster: fabric peer neighbor change detected",
+					"ip", update.IP, "type", update.Type)
+				d.triggerFabricRefresh()
+			}
+		}
+	}
+}
+
+// triggerFabricRefresh sends a non-blocking signal to the fabric refresh
+// channel, waking populateFabricFwd/populateFabricFwd1 loops.
+func (d *Daemon) triggerFabricRefresh() {
+	select {
+	case d.fabricRefreshCh <- struct{}{}:
+	default:
+		// Already pending — no need to queue another.
 	}
 }
 

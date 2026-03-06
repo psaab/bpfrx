@@ -70,8 +70,8 @@ type CLI struct {
 
 	vrrpMgr      *vrrp.Manager
 
-	// Fabric peer dialing for cluster-wide queries.
-	fabricPeerAddrFn func() string
+	// Fabric peer dialing for cluster-wide queries (fab0 + optional fab1).
+	fabricPeerAddrFn func() []string
 	fabricVRFDevice  string
 
 	// Monitor security flow state (per-CLI-session).
@@ -141,9 +141,66 @@ func (c *CLI) SetVRRPManager(m *vrrp.Manager) {
 }
 
 // SetFabricPeer configures fabric peer dialing for cluster-wide queries.
-func (c *CLI) SetFabricPeer(addrFn func() string, vrfDevice string) {
+func (c *CLI) SetFabricPeer(addrFn func() []string, vrfDevice string) {
 	c.fabricPeerAddrFn = addrFn
 	c.fabricVRFDevice = vrfDevice
+}
+
+// dialPeer establishes a gRPC connection to the cluster peer, trying fab0
+// then fab1 if dual-fabric is configured. Returns nil if not in cluster mode.
+func (c *CLI) dialPeer() *grpc.ClientConn {
+	if c.fabricPeerAddrFn == nil {
+		return nil
+	}
+	peerIPs := c.fabricPeerAddrFn()
+	if len(peerIPs) == 0 {
+		return nil
+	}
+
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if c.fabricVRFDevice != "" {
+		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Control: func(network, address string, rc syscall.RawConn) error {
+					var err error
+					rc.Control(func(fd uintptr) {
+						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, c.fabricVRFDevice)
+					})
+					return err
+				},
+			}
+			return dialer.DialContext(ctx, "tcp", addr)
+		}))
+	}
+
+	for _, ip := range peerIPs {
+		peerAddr := fmt.Sprintf("%s:50051", ip)
+		conn, err := grpc.NewClient(peerAddr, dialOpts...)
+		if err != nil {
+			continue
+		}
+		// Quick TCP probe to verify the address is reachable.
+		d := &net.Dialer{Timeout: 2 * time.Second}
+		if c.fabricVRFDevice != "" {
+			d.Control = func(network, address string, rc syscall.RawConn) error {
+				var err error
+				rc.Control(func(fd uintptr) {
+					err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, c.fabricVRFDevice)
+				})
+				return err
+			}
+		}
+		tc, err := d.DialContext(context.Background(), "tcp", peerAddr)
+		if err != nil {
+			conn.Close()
+			slog.Debug("peer dial failed, trying next fabric address", "addr", peerAddr, "err", err)
+			continue
+		}
+		tc.Close()
+		return conn
+	}
+	slog.Warn("failed to dial peer on any fabric address")
+	return nil
 }
 
 // checkPermission verifies the current user's login class permits the given action.
@@ -3690,33 +3747,8 @@ func (c *CLI) showFlowSession(args []string) error {
 
 // fetchPeerSessions dials the cluster peer's gRPC and returns its full session list.
 func (c *CLI) fetchPeerSessions(f sessionFilter) *pb.GetSessionsResponse {
-	if c.fabricPeerAddrFn == nil {
-		return nil
-	}
-	peerIP := c.fabricPeerAddrFn()
-	if peerIP == "" {
-		return nil
-	}
-	peerAddr := fmt.Sprintf("%s:50051", peerIP)
-
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-	if c.fabricVRFDevice != "" {
-		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-			dialer := &net.Dialer{
-				Control: func(network, address string, rc syscall.RawConn) error {
-					var err error
-					rc.Control(func(fd uintptr) {
-						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, c.fabricVRFDevice)
-					})
-					return err
-				},
-			}
-			return dialer.DialContext(ctx, "tcp", addr)
-		}))
-	}
-	conn, err := grpc.NewClient(peerAddr, dialOpts...)
-	if err != nil {
-		slog.Warn("failed to dial peer for sessions", "err", err)
+	conn := c.dialPeer()
+	if conn == nil {
 		return nil
 	}
 	defer conn.Close()
@@ -3758,33 +3790,8 @@ func (c *CLI) fetchPeerSessions(f sessionFilter) *pb.GetSessionsResponse {
 
 // fetchPeerSessionSummary dials the cluster peer's gRPC and returns its session summary.
 func (c *CLI) fetchPeerSessionSummary() *pb.GetSessionSummaryResponse {
-	if c.fabricPeerAddrFn == nil {
-		return nil
-	}
-	peerIP := c.fabricPeerAddrFn()
-	if peerIP == "" {
-		return nil
-	}
-	peerAddr := fmt.Sprintf("%s:50051", peerIP)
-
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-	if c.fabricVRFDevice != "" {
-		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-			dialer := &net.Dialer{
-				Control: func(network, address string, rc syscall.RawConn) error {
-					var err error
-					rc.Control(func(fd uintptr) {
-						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, c.fabricVRFDevice)
-					})
-					return err
-				},
-			}
-			return dialer.DialContext(ctx, "tcp", addr)
-		}))
-	}
-	conn, err := grpc.NewClient(peerAddr, dialOpts...)
-	if err != nil {
-		slog.Warn("failed to dial peer for session summary", "err", err)
+	conn := c.dialPeer()
+	if conn == nil {
 		return nil
 	}
 	defer conn.Close()
@@ -4358,31 +4365,11 @@ func (c *CLI) clearFilteredSessions(f sessionFilter) error {
 
 // clearPeerSessions forwards a clear request to the cluster peer.
 func (c *CLI) clearPeerSessions(f *sessionFilter) {
-	if c.cluster == nil || c.fabricPeerAddrFn == nil {
+	if c.cluster == nil {
 		return
 	}
-	peerIP := c.fabricPeerAddrFn()
-	if peerIP == "" {
-		return
-	}
-	peerAddr := fmt.Sprintf("%s:50051", peerIP)
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-	if c.fabricVRFDevice != "" {
-		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-			dialer := &net.Dialer{
-				Control: func(network, address string, conn syscall.RawConn) error {
-					var err error
-					conn.Control(func(fd uintptr) {
-						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, c.fabricVRFDevice)
-					})
-					return err
-				},
-			}
-			return dialer.DialContext(ctx, "tcp", addr)
-		}))
-	}
-	conn, err := grpc.NewClient(peerAddr, dialOpts...)
-	if err != nil {
+	conn := c.dialPeer()
+	if conn == nil {
 		return
 	}
 	defer conn.Close()
