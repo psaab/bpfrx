@@ -896,8 +896,8 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"description": {args: 1, children: nil},
 					"match": {children: map[string]*schemaNode{
 						"source-address":      {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},
-						"destination-address":  {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},
-						"application":          {args: 1, multi: true, valueHint: ValueHintPolicyApp, children: nil},
+						"destination-address": {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},
+						"application":         {args: 1, multi: true, valueHint: ValueHintPolicyApp, children: nil},
 					}},
 					"then": {children: map[string]*schemaNode{
 						"log": {children: nil},
@@ -910,8 +910,8 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"description": {args: 1, children: nil},
 					"match": {children: map[string]*schemaNode{
 						"source-address":      {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},
-						"destination-address":  {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},
-						"application":          {args: 1, multi: true, valueHint: ValueHintPolicyApp, children: nil},
+						"destination-address": {args: 1, multi: true, valueHint: ValueHintPolicyAddress, children: nil},
+						"application":         {args: 1, multi: true, valueHint: ValueHintPolicyApp, children: nil},
 					}},
 					"then": {children: map[string]*schemaNode{
 						"log": {children: nil},
@@ -923,8 +923,8 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"ids-option": {args: 1, valueHint: ValueHintScreenProfile, children: map[string]*schemaNode{
 				"icmp": {children: nil},
 				"tcp": {children: map[string]*schemaNode{
-					"syn-flood":  {children: nil},
-					"port-scan":  {children: nil},
+					"syn-flood": {children: nil},
+					"port-scan": {children: nil},
 					// land, winnuke, syn-frag -> leaf
 				}},
 				"ip": {children: map[string]*schemaNode{
@@ -940,7 +940,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"nat": {children: map[string]*schemaNode{
 			"source": {children: map[string]*schemaNode{
-				"pool":              {args: 1, valueHint: ValueHintPoolName, children: nil},
+				"pool":               {args: 1, valueHint: ValueHintPoolName, children: nil},
 				"address-persistent": {children: nil},
 				"rule-set": {args: 1, children: map[string]*schemaNode{
 					"from": {children: map[string]*schemaNode{
@@ -952,9 +952,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"rule": {args: 1, children: map[string]*schemaNode{
 						"match": {children: map[string]*schemaNode{
 							"source-address":      {args: 1, multi: true, children: nil},
-							"destination-address":  {args: 1, multi: true, children: nil},
-							"destination-port":     {args: 1, multi: true, children: nil},
-							"application":          {args: 1, multi: true, children: nil},
+							"destination-address": {args: 1, multi: true, children: nil},
+							"destination-port":    {args: 1, multi: true, children: nil},
+							"application":         {args: 1, multi: true, children: nil},
 						}},
 						"then": {children: map[string]*schemaNode{
 							"source-nat": {children: map[string]*schemaNode{
@@ -977,12 +977,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					}},
 					"rule": {args: 1, children: map[string]*schemaNode{
 						"match": {children: map[string]*schemaNode{
-							"source-address":       {args: 1, multi: true, children: nil},
-							"source-address-name":  {args: 1, multi: true, children: nil},
-							"destination-address":  {args: 1, multi: true, children: nil},
-							"destination-port":     {args: 1, multi: true, children: nil},
-							"protocol":             {args: 1, multi: true, children: nil},
-							"application":          {args: 1, multi: true, children: nil},
+							"source-address":      {args: 1, multi: true, children: nil},
+							"source-address-name": {args: 1, multi: true, children: nil},
+							"destination-address": {args: 1, multi: true, children: nil},
+							"destination-port":    {args: 1, multi: true, children: nil},
+							"protocol":            {args: 1, multi: true, children: nil},
+							"application":         {args: 1, multi: true, children: nil},
 						}},
 						"then": {children: map[string]*schemaNode{
 							"destination-nat": {children: map[string]*schemaNode{
@@ -996,7 +996,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"rule-set": {args: 1, children: map[string]*schemaNode{
 					"rule": {args: 1, children: map[string]*schemaNode{
 						"match": {children: nil},
-						"then":  {children: map[string]*schemaNode{
+						"then": {children: map[string]*schemaNode{
 							"static-nat": {children: nil},
 						}},
 					}},
@@ -1052,8 +1052,8 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"gre-performance-acceleration": {children: nil},
 			"power-mode-disable":           {children: nil},
 			"traceoptions": {children: map[string]*schemaNode{
-				"file":          {args: 1, children: nil},
-				"flag":          {args: 1, children: nil},
+				"file": {args: 1, children: nil},
+				"flag": {args: 1, children: nil},
 				"packet-filter": {args: 1, children: map[string]*schemaNode{
 					"source-prefix":      {args: 1, children: nil},
 					"destination-prefix": {args: 1, children: nil},
@@ -1074,17 +1074,24 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"pre-shared-key": {children: nil},
 			}},
 			"gateway": {args: 1, children: map[string]*schemaNode{
-				"address":              {args: 1, children: nil},
-				"local-address":        {args: 1, children: nil},
-				"ike-policy":           {args: 1, children: nil},
-				"external-interface":   {args: 1, children: nil},
-				"version":              {args: 1, children: nil},
-				"no-nat-traversal":     {children: nil},
-				"nat-traversal":        {args: 1, children: nil},
-				"dead-peer-detection":  {args: 1, children: nil},
-				"local-identity":       {children: nil},
-				"remote-identity":      {children: nil},
-				"dynamic":              {children: nil},
+				"address":            {args: 1, children: nil},
+				"local-address":      {args: 1, children: nil},
+				"ike-policy":         {args: 1, children: nil},
+				"external-interface": {args: 1, children: nil},
+				"local-certificate":  {args: 1, children: nil},
+				"version":            {args: 1, children: nil},
+				"no-nat-traversal":   {children: nil},
+				"nat-traversal":      {args: 1, children: nil},
+				"dead-peer-detection": {children: map[string]*schemaNode{
+					"always-send":       {children: nil},
+					"optimized":         {children: nil},
+					"probe-idle-tunnel": {children: nil},
+					"interval":          {args: 1, children: nil},
+					"threshold":         {args: 1, children: nil},
+				}},
+				"local-identity":  {children: nil},
+				"remote-identity": {children: nil},
+				"dynamic":         {children: nil},
 			}},
 		}},
 		"ipsec": {children: map[string]*schemaNode{
@@ -1094,22 +1101,37 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"proposals":               {args: 1, children: nil},
 			}},
 			"gateway": {args: 1, children: map[string]*schemaNode{
-				"address":              {args: 1, children: nil},
-				"local-address":        {args: 1, children: nil},
-				"ike-policy":           {args: 1, children: nil},
-				"external-interface":   {args: 1, children: nil},
-				"version":              {args: 1, children: nil},
-				"no-nat-traversal":     {children: nil},
-				"nat-traversal":        {args: 1, children: nil},
-				"dead-peer-detection":  {args: 1, children: nil},
-				"local-identity":       {children: nil},
-				"remote-identity":      {children: nil},
-				"dynamic":              {children: nil},
+				"address":            {args: 1, children: nil},
+				"local-address":      {args: 1, children: nil},
+				"ike-policy":         {args: 1, children: nil},
+				"external-interface": {args: 1, children: nil},
+				"local-certificate":  {args: 1, children: nil},
+				"version":            {args: 1, children: nil},
+				"no-nat-traversal":   {children: nil},
+				"nat-traversal":      {args: 1, children: nil},
+				"dead-peer-detection": {children: map[string]*schemaNode{
+					"always-send":       {children: nil},
+					"optimized":         {children: nil},
+					"probe-idle-tunnel": {children: nil},
+					"interval":          {args: 1, children: nil},
+					"threshold":         {args: 1, children: nil},
+				}},
+				"local-identity":  {children: nil},
+				"remote-identity": {children: nil},
+				"dynamic":         {children: nil},
 			}},
 			"vpn": {args: 1, children: map[string]*schemaNode{
 				"bind-interface":    {args: 1, children: nil},
-				"df-bit":           {args: 1, children: nil},
+				"df-bit":            {args: 1, children: nil},
 				"establish-tunnels": {args: 1, children: nil},
+				"local-identity":    {args: 1, children: nil},
+				"remote-identity":   {args: 1, children: nil},
+				"pre-shared-key":    {args: 1, children: nil},
+				"local-address":     {args: 1, children: nil},
+				"traffic-selector": {args: 1, children: map[string]*schemaNode{
+					"local-ip":  {args: 1, children: nil},
+					"remote-ip": {args: 1, children: nil},
+				}},
 				"ike": {children: map[string]*schemaNode{
 					"gateway":      {args: 1, children: nil},
 					"ipsec-policy": {args: 1, children: nil},
@@ -1122,7 +1144,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"hostname":        {args: 1, children: nil},
 				"update-interval": {args: 1, children: nil},
 				"hold-interval":   {args: 1, children: nil},
-				"feed-name":       {args: 1, children: map[string]*schemaNode{
+				"feed-name": {args: 1, children: map[string]*schemaNode{
 					"path": {args: 1, children: nil},
 				}},
 			}},
@@ -1148,23 +1170,23 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 	}},
 	"interfaces": {desc: "Interface configuration", wildcard: &schemaNode{valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-		"description":            {desc: "Text description of interface", args: 1, children: nil},
-		"mtu":                    {desc: "Maximum transmit packet size", args: 1, children: nil},
-		"speed":                  {desc: "Link speed", args: 1, children: nil},
-		"duplex":                 {desc: "Link duplex mode", args: 1, children: nil},
-		"bandwidth":              {desc: "Interface bandwidth", args: 1, children: nil},
-		"disable":                {desc: "Disable this interface", children: nil},
-		"vlan-tagging":           {desc: "Enable 802.1Q VLAN tagging", children: nil},
-		"flexible-vlan-tagging":  {desc: "Enable flexible 802.1Q VLAN tagging (QinQ)", children: nil},
-		"encapsulation":          {desc: "Physical link-layer encapsulation", args: 1, children: nil},
+		"description":           {desc: "Text description of interface", args: 1, children: nil},
+		"mtu":                   {desc: "Maximum transmit packet size", args: 1, children: nil},
+		"speed":                 {desc: "Link speed", args: 1, children: nil},
+		"duplex":                {desc: "Link duplex mode", args: 1, children: nil},
+		"bandwidth":             {desc: "Interface bandwidth", args: 1, children: nil},
+		"disable":               {desc: "Disable this interface", children: nil},
+		"vlan-tagging":          {desc: "Enable 802.1Q VLAN tagging", children: nil},
+		"flexible-vlan-tagging": {desc: "Enable flexible 802.1Q VLAN tagging (QinQ)", children: nil},
+		"encapsulation":         {desc: "Physical link-layer encapsulation", args: 1, children: nil},
 		"gigether-options": {desc: "Gigabit Ethernet interface options", children: map[string]*schemaNode{
 			"redundant-parent": {desc: "Parent of this redundant interface", args: 1, children: nil},
 			"802.3ad":          {desc: "Link aggregation group", args: 1, children: nil},
 		}},
 		"aggregated-ether-options": {desc: "Aggregated Ethernet interface options", children: map[string]*schemaNode{
 			"lacp": {desc: "LACP parameters", children: map[string]*schemaNode{
-				"active":  {desc: "Active LACP mode", children: nil},
-				"passive": {desc: "Passive LACP mode", children: nil},
+				"active":   {desc: "Active LACP mode", children: nil},
+				"passive":  {desc: "Passive LACP mode", children: nil},
 				"periodic": {desc: "LACP timer period", args: 1, children: nil},
 			}},
 			"link-speed":    {desc: "Member link speed", args: 1, children: nil},
@@ -1177,11 +1199,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"member-interfaces": {desc: "Member interfaces", children: nil},
 		}},
 		"tunnel": {desc: "Tunnel parameters", children: map[string]*schemaNode{
-			"source":      {desc: "Tunnel source address", args: 1, children: nil},
-			"destination": {desc: "Tunnel destination address", args: 1, children: nil},
-			"mode":        {desc: "Tunnel mode", args: 1, children: nil},
-			"key":         {desc: "Tunnel key", args: 1, children: nil},
-			"ttl":         {desc: "Time to live", args: 1, children: nil},
+			"source":          {desc: "Tunnel source address", args: 1, children: nil},
+			"destination":     {desc: "Tunnel destination address", args: 1, children: nil},
+			"mode":            {desc: "Tunnel mode", args: 1, children: nil},
+			"key":             {desc: "Tunnel key", args: 1, children: nil},
+			"ttl":             {desc: "Time to live", args: 1, children: nil},
 			"keepalive":       {desc: "Keepalive interval", args: 1, children: nil},
 			"keepalive-retry": {desc: "Keepalive retry count", args: 1, children: nil},
 			"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
@@ -1194,11 +1216,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"vlan-id":        {args: 1, children: nil},
 			"inner-vlan-id":  {args: 1, children: nil},
 			"tunnel": {desc: "Tunnel parameters", children: map[string]*schemaNode{
-				"source":      {desc: "Tunnel source address", args: 1, children: nil},
-				"destination": {desc: "Tunnel destination address", args: 1, children: nil},
-				"mode":        {desc: "Tunnel mode", args: 1, children: nil},
-				"key":         {desc: "Tunnel key", args: 1, children: nil},
-				"ttl":         {desc: "Time to live", args: 1, children: nil},
+				"source":          {desc: "Tunnel source address", args: 1, children: nil},
+				"destination":     {desc: "Tunnel destination address", args: 1, children: nil},
+				"mode":            {desc: "Tunnel mode", args: 1, children: nil},
+				"key":             {desc: "Tunnel key", args: 1, children: nil},
+				"ttl":             {desc: "Time to live", args: 1, children: nil},
 				"keepalive":       {desc: "Keepalive interval", args: 1, children: nil},
 				"keepalive-retry": {desc: "Keepalive retry count", args: 1, children: nil},
 				"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
@@ -1207,7 +1229,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 			"family": {children: map[string]*schemaNode{
 				"inet": {children: map[string]*schemaNode{
-					"mtu":     {args: 1, children: nil},
+					"mtu": {args: 1, children: nil},
 					"address": {args: 1, children: map[string]*schemaNode{
 						"primary":   {children: nil},
 						"preferred": {children: nil},
@@ -1230,7 +1252,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"inet6": {children: map[string]*schemaNode{
 					"mtu":         {args: 1, children: nil},
 					"dad-disable": {children: nil},
-					"address":     {args: 1, children: map[string]*schemaNode{
+					"address": {args: 1, children: map[string]*schemaNode{
 						"primary":   {children: nil},
 						"preferred": {children: nil},
 					}},
@@ -1399,11 +1421,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"bgp": {children: map[string]*schemaNode{
-			"local-as":        {args: 1, children: nil},
-			"router-id":       {args: 1, children: nil},
-			"cluster-id":      {args: 1, children: nil},
+			"local-as":         {args: 1, children: nil},
+			"router-id":        {args: 1, children: nil},
+			"cluster-id":       {args: 1, children: nil},
 			"graceful-restart": {children: nil},
-			"log-updown":      {children: nil},
+			"log-updown":       {children: nil},
 			"multipath": {children: map[string]*schemaNode{
 				"multiple-as": {children: nil},
 			}},
@@ -1413,7 +1435,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"suppress":     {args: 1, children: nil},
 				"max-suppress": {args: 1, children: nil},
 			}},
-			"export":          {args: 1, multi: true, children: nil},
+			"export": {args: 1, multi: true, children: nil},
 			"group": {args: 1, children: map[string]*schemaNode{
 				"peer-as":            {args: 1, children: nil},
 				"description":        {args: 1, children: nil},
@@ -1445,9 +1467,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				}},
 				"neighbor": {args: 1, children: map[string]*schemaNode{
 					"description":            {args: 1, children: nil},
-					"peer-as":               {args: 1, children: nil},
-					"multihop":              {args: 1, children: nil},
-					"authentication-key":    {args: 1, children: nil},
+					"peer-as":                {args: 1, children: nil},
+					"multihop":               {args: 1, children: nil},
+					"authentication-key":     {args: 1, children: nil},
 					"route-reflector-client": {children: nil},
 					"default-originate":      {children: nil},
 					"loops":                  {args: 1, children: nil},
@@ -1484,10 +1506,10 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"authentication-type": {args: 1, children: nil},
 		}},
 		"isis": {children: map[string]*schemaNode{
-			"net":                 {args: 1, children: nil},
-			"level":              {args: 1, children: nil},
-			"is-type":            {args: 1, children: nil},
-			"export":             {args: 1, multi: true, children: nil},
+			"net":     {args: 1, children: nil},
+			"level":   {args: 1, children: nil},
+			"is-type": {args: 1, children: nil},
+			"export":  {args: 1, multi: true, children: nil},
 			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 				"level":               {args: 1, children: nil},
 				"passive":             {children: nil},
@@ -1508,7 +1530,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 				"prefix":     {args: 1, children: nil}, // prefix <prefix/len>
 				"preference": {args: 1, children: nil},
-				"nat-prefix":   {args: 1, children: map[string]*schemaNode{
+				"nat-prefix": {args: 1, children: map[string]*schemaNode{
 					"lifetime": {args: 1, children: nil},
 				}},
 				"nat64prefix": {args: 1, children: map[string]*schemaNode{
@@ -1541,24 +1563,24 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	}},
 	"chassis": {children: map[string]*schemaNode{
 		"cluster": {children: map[string]*schemaNode{
-			"cluster-id":           {args: 1, children: nil},
-			"node":                 {args: 1, children: nil},
-			"reth-count":           {args: 1, children: nil},
-			"heartbeat-interval":   {args: 1, children: nil},
-			"heartbeat-threshold":  {args: 1, children: nil},
+			"cluster-id":            {args: 1, children: nil},
+			"node":                  {args: 1, children: nil},
+			"reth-count":            {args: 1, children: nil},
+			"heartbeat-interval":    {args: 1, children: nil},
+			"heartbeat-threshold":   {args: 1, children: nil},
 			"control-link-recovery": {children: nil},
 			"control-ports": {children: map[string]*schemaNode{
 				"fpc": {args: 1, children: map[string]*schemaNode{
 					"port": {args: 1, children: nil},
 				}},
 			}},
-			"control-interface":          {args: 1, children: nil},
-			"peer-address":              {args: 1, children: nil},
-			"fabric-interface":          {args: 1, children: nil},
-			"fabric-peer-address":       {args: 1, children: nil},
-			"configuration-synchronize":      {children: nil},
-			"nat-state-synchronization":      {children: nil},
-			"ipsec-session-synchronization":  {children: nil},
+			"control-interface":             {args: 1, children: nil},
+			"peer-address":                  {args: 1, children: nil},
+			"fabric-interface":              {args: 1, children: nil},
+			"fabric-peer-address":           {args: 1, children: nil},
+			"configuration-synchronize":     {children: nil},
+			"nat-state-synchronization":     {children: nil},
+			"ipsec-session-synchronization": {children: nil},
 			"reth-advertise-interval":       {args: 1, children: nil},
 			"hitless-restart":               {children: nil},
 			"peer-fencing":                  {args: 1, children: nil},
@@ -1587,8 +1609,8 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	"firewall": {children: map[string]*schemaNode{
 		"policer": {args: 1, multi: true, children: map[string]*schemaNode{
 			"if-exceeding": {children: map[string]*schemaNode{
-				"bandwidth-limit":   {args: 1, children: nil},
-				"burst-size-limit":  {args: 1, children: nil},
+				"bandwidth-limit":  {args: 1, children: nil},
+				"burst-size-limit": {args: 1, children: nil},
 			}},
 			"logical-interface-policer": {children: nil},
 			"then": {children: map[string]*schemaNode{
@@ -1598,19 +1620,19 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"three-color-policer": {args: 1, multi: true, children: map[string]*schemaNode{
 			"single-rate": {children: map[string]*schemaNode{
-				"color-blind":                  {children: nil},
-				"color-aware":                  {children: nil},
-				"committed-information-rate":    {args: 1, children: nil},
-				"committed-burst-size":          {args: 1, children: nil},
-				"excess-burst-size":             {args: 1, children: nil},
+				"color-blind":                {children: nil},
+				"color-aware":                {children: nil},
+				"committed-information-rate": {args: 1, children: nil},
+				"committed-burst-size":       {args: 1, children: nil},
+				"excess-burst-size":          {args: 1, children: nil},
 			}},
 			"two-rate": {children: map[string]*schemaNode{
-				"color-blind":                  {children: nil},
-				"color-aware":                  {children: nil},
-				"committed-information-rate":    {args: 1, children: nil},
-				"committed-burst-size":          {args: 1, children: nil},
-				"peak-information-rate":         {args: 1, children: nil},
-				"peak-burst-size":               {args: 1, children: nil},
+				"color-blind":                {children: nil},
+				"color-aware":                {children: nil},
+				"committed-information-rate": {args: 1, children: nil},
+				"committed-burst-size":       {args: 1, children: nil},
+				"peak-information-rate":      {args: 1, children: nil},
+				"peak-burst-size":            {args: 1, children: nil},
 			}},
 			"then": {children: map[string]*schemaNode{
 				"discard":       {children: nil},
@@ -1636,12 +1658,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"is-fragment":             {children: nil},
 							"flexible-match-range": {children: map[string]*schemaNode{
 								"range": {args: 1, children: map[string]*schemaNode{
-									"match-start":  {args: 1, children: nil},
-									"byte-offset":  {args: 1, children: nil},
-									"bit-length":   {args: 1, children: nil},
-									"range":        {args: 1, children: nil},
-									"match-value":  {args: 1, children: nil},
-									"match-mask":   {args: 1, children: nil},
+									"match-start": {args: 1, children: nil},
+									"byte-offset": {args: 1, children: nil},
+									"bit-length":  {args: 1, children: nil},
+									"range":       {args: 1, children: nil},
+									"match-value": {args: 1, children: nil},
+									"match-mask":  {args: 1, children: nil},
 								}},
 							}},
 						}},
@@ -1680,12 +1702,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"is-fragment":             {children: nil},
 							"flexible-match-range": {children: map[string]*schemaNode{
 								"range": {args: 1, children: map[string]*schemaNode{
-									"match-start":  {args: 1, children: nil},
-									"byte-offset":  {args: 1, children: nil},
-									"bit-length":   {args: 1, children: nil},
-									"range":        {args: 1, children: nil},
-									"match-value":  {args: 1, children: nil},
-									"match-mask":   {args: 1, children: nil},
+									"match-start": {args: 1, children: nil},
+									"byte-offset": {args: 1, children: nil},
+									"bit-length":  {args: 1, children: nil},
+									"range":       {args: 1, children: nil},
+									"match-value": {args: 1, children: nil},
+									"match-mask":  {args: 1, children: nil},
 								}},
 							}},
 						}},
@@ -1795,7 +1817,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"api-key": {args: 1, children: nil},
 				}},
 			}},
-			"dns":               {children: nil},
+			"dns": {children: nil},
 			"dhcp-local-server": {children: map[string]*schemaNode{
 				"group": {args: 1, children: map[string]*schemaNode{
 					"pool": {args: 1, children: nil},
@@ -1822,7 +1844,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"flow-monitoring": {children: map[string]*schemaNode{
 			"version9": {children: map[string]*schemaNode{
 				"template": {args: 1, children: map[string]*schemaNode{
-					"flow-active-timeout":  {args: 1, children: nil},
+					"flow-active-timeout":   {args: 1, children: nil},
 					"flow-inactive-timeout": {args: 1, children: nil},
 					"template-refresh-rate": {children: map[string]*schemaNode{
 						"seconds": {args: 1, children: nil},
@@ -1831,7 +1853,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 			"version-ipfix": {children: map[string]*schemaNode{
 				"template": {args: 1, children: map[string]*schemaNode{
-					"flow-active-timeout":  {args: 1, children: nil},
+					"flow-active-timeout":   {args: 1, children: nil},
 					"flow-inactive-timeout": {args: 1, children: nil},
 					"template-refresh-rate": {children: map[string]*schemaNode{
 						"seconds": {args: 1, children: nil},
@@ -1859,13 +1881,13 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"family": {children: map[string]*schemaNode{
 					"inet": {children: map[string]*schemaNode{
 						"output": {children: map[string]*schemaNode{
-							"flow-server": {args: 1, children: nil},
+							"flow-server":  {args: 1, children: nil},
 							"inline-jflow": {children: nil},
 						}},
 					}},
 					"inet6": {children: map[string]*schemaNode{
 						"output": {children: map[string]*schemaNode{
-							"flow-server": {args: 1, children: nil},
+							"flow-server":  {args: 1, children: nil},
 							"inline-jflow": {children: nil},
 						}},
 					}},
@@ -1957,13 +1979,13 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"suppress":     {args: 1, children: nil},
 					"max-suppress": {args: 1, children: nil},
 				}},
-				"group":            {args: 1, children: nil},
+				"group": {args: 1, children: nil},
 			}},
 			"isis": {children: map[string]*schemaNode{
-				"net":                 {args: 1, children: nil},
-				"level":              {args: 1, children: nil},
-				"is-type":            {args: 1, children: nil},
-				"export":             {args: 1, multi: true, children: nil},
+				"net":     {args: 1, children: nil},
+				"level":   {args: 1, children: nil},
+				"is-type": {args: 1, children: nil},
+				"export":  {args: 1, multi: true, children: nil},
 				"interface": {args: 1, valueHint: ValueHintInterfaceName, children: map[string]*schemaNode{
 					"level":               {args: 1, children: nil},
 					"passive":             {children: nil},

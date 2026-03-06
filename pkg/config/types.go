@@ -124,10 +124,10 @@ type RedundancyGroup struct {
 	ID                 int
 	NodePriorities     map[int]int // node-id -> priority
 	GratuitousARPCount int
-	Preempt              bool
-	StrictVIPOwnership   bool
-	InterfaceMonitors    []*InterfaceMonitor
-	IPMonitoring         *IPMonitoring
+	Preempt            bool
+	StrictVIPOwnership bool
+	InterfaceMonitors  []*InterfaceMonitor
+	IPMonitoring       *IPMonitoring
 }
 
 // InterfaceMonitor defines an interface health monitor within a redundancy group.
@@ -709,11 +709,11 @@ type DynamicAddressConfig struct {
 // FeedServer defines a remote address feed source with optional per-feed paths.
 type FeedServer struct {
 	Name           string
-	URL            string // explicit url (takes precedence)
-	Hostname       string // hostname for building URLs with per-feed paths
-	UpdateInterval int    // seconds (0 = default 3600)
-	HoldInterval   int    // seconds (0 = default 7200)
-	FeedName       string // single feed-name (backward compat, no path)
+	URL            string      // explicit url (takes precedence)
+	Hostname       string      // hostname for building URLs with per-feed paths
+	UpdateInterval int         // seconds (0 = default 3600)
+	HoldInterval   int         // seconds (0 = default 7200)
+	FeedName       string      // single feed-name (backward compat, no path)
 	FeedEntries    []FeedEntry // named feeds with per-feed paths
 }
 
@@ -1533,20 +1533,29 @@ type IPsecPolicyDef struct {
 
 // IPsecGateway defines a remote IKE gateway.
 type IPsecGateway struct {
-	Name            string
-	Address         string // remote gateway IP
-	DynamicHostname string // dynamic peer hostname (DNS-resolved)
-	LocalAddress    string // local IP
-	IKEPolicy       string // IKE policy reference
-	ExternalIface   string // external-facing interface
-	Version         string // "v1-only", "v2-only" (empty = both)
-	NoNATTraversal  bool   // disable NAT-T (legacy, use NATTraversal)
-	NATTraversal    string // "enable" (default), "disable", "force"
-	DeadPeerDetect  string // "always-send", "optimized", "probe-idle"
-	LocalIDType     string // "hostname", "inet", "fqdn"
-	LocalIDValue    string // identity value
-	RemoteIDType    string // "hostname", "inet", "fqdn"
-	RemoteIDValue   string // identity value
+	Name             string
+	Address          string // remote gateway IP
+	DynamicHostname  string // dynamic peer hostname (DNS-resolved)
+	LocalAddress     string // local IP
+	IKEPolicy        string // IKE policy reference
+	ExternalIface    string // external-facing interface
+	LocalCertificate string // local certificate name for pubkey auth
+	Version          string // "v1-only", "v2-only" (empty = both)
+	NoNATTraversal   bool   // disable NAT-T (legacy, use NATTraversal)
+	NATTraversal     string // "enable" (default), "disable", "force"
+	DeadPeerDetect   string // "always-send", "optimized", "probe-idle"
+	DPDInterval      int    // seconds
+	DPDThreshold     int    // retry count before peer is considered dead
+	LocalIDType      string // "hostname", "inet", "fqdn"
+	LocalIDValue     string // identity value
+	RemoteIDType     string // "hostname", "inet", "fqdn"
+	RemoteIDValue    string // identity value
+}
+
+type IPsecTrafficSelector struct {
+	Name     string
+	LocalIP  string
+	RemoteIP string
 }
 
 // IPsecVPN defines an IPsec VPN tunnel.
@@ -1561,6 +1570,7 @@ type IPsecVPN struct {
 	BindInterface    string // tunnel interface (e.g. "st0.0") — creates xfrmi with if_id
 	DFBit            string // "copy", "set", "clear"
 	EstablishTunnels string // "immediately", "on-traffic"
+	TrafficSelectors map[string]*IPsecTrafficSelector
 }
 
 // RoutingInstanceConfig represents a VRF-based routing instance.
