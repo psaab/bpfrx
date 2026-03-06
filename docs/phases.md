@@ -1596,8 +1596,8 @@ Manager
 Session sync had three critical bugs that prevented reliable stateful failover:
 1. Forward-only sweep entries had no reverse conntrack entry on the takeover node
 2. SNAT sessions lacked dnat_table entries for return traffic pre-routing
-3. Monotonic clock skew caused premature GC expiry of synced sessions (fixed)
-4. Cold ARP cache on takeover node caused NO_NEIGH drops (fixed)
+3. Monotonic clock skew caused premature GC expiry of synced sessions (in progress)
+4. Cold ARP cache on takeover node caused NO_NEIGH drops (in progress)
 
 ### Fix 1: Reverse Entry Creation (FIXED)
 - `handleMessage()` for SessionV4/V6 now creates reverse entries from forward entries
@@ -1610,11 +1610,13 @@ Session sync had three critical bugs that prevented reliable stateful failover:
   - Creates `DNATValue{NewDstIP=SrcIP, NewDstPort=SrcPort}`
 - Delete messages now also clean up reverse entries and dnat_table entries (lookup before delete)
 
-### Fix 3: Monotonic Clock Skew (FIXED, `0080cbc`)
-- Synced session installation now uses local monotonic timing semantics to prevent premature GC expiry between nodes with different uptimes.
+### Fix 3: Monotonic Clock Skew (IN PROGRESS — Task #2)
+- Proposed: Set `LastSeen = local monotonicSeconds()` when installing synced sessions
+- Prevents premature GC expiry when nodes have different uptimes
 
-### Fix 4: NO_NEIGH ARP Warmup (FIXED, `0080cbc`)
-- Receiver and failover handling were hardened to avoid takeover-path failures caused by cold neighbor state.
+### Fix 4: NO_NEIGH ARP Warmup (IN PROGRESS — Task #1)
+- Proposed: Proactive ARP/NDP warmup after VRRP MASTER transition
+- Consider `BPF_FIB_LOOKUP_SKIP_NEIGH` for graceful degradation
 
 ### Design Decision: FIB Cache Not Synced
 - `fib_ifindex`, `fib_dmac`, `fib_smac`, `fib_gen` zeroed in synced sessions
@@ -1737,91 +1739,6 @@ Reduced chassis cluster failover from ~3.2s to <1s and failback from ~6s to ~3s 
 | Clean daemon stop (priority-0 → peer skew) | ~219ms | ~55ms |
 | Failback (fw0 returns → preempts back) | ~5-6s | ~2-3s |
 
-## Sprint HA-VRRP-FAST: Sub-100ms VRRP Failover (`ae1a717`)
-
-### Overview
-Reduced VRRP failover from ~800ms to ~60ms by cutting the RETH advertisement interval from 250ms to 30ms, making GARP asynchronous, and adding priority-0 burst for planned shutdowns. Measured results: 6 lost pings at 10ms interval = ~60ms failover; failback ~130ms.
-
-### Change 1: RETH AdvertiseInterval 250ms → 30ms
-- **Impact:** masterDownInterval from ~805ms → ~97ms (single biggest win)
-- Math: `3 × 30ms + (56/256) × 30ms ≈ 97ms` at priority 200
-- Wire format: 3 centiseconds (10ms granularity per VRRPv3 RFC 5798)
-- CPU overhead: 33 pps/instance vs 4 pps — negligible
-- Configurable: `set chassis cluster reth-advertise-interval <ms>` (0 = default 30)
-- **Files:** `pkg/vrrp/vrrp.go`, `pkg/config/types.go`, `pkg/config/ast.go`, `pkg/config/compiler.go`
-
-### Change 2: Async GARP in becomeMaster()
-- **Impact:** Removes ~200ms+ blocking from VRRP transition critical path
-- Old order: setState → addVIPs → sendGARP (blocking 3×100ms) → sendAdvert → emitEvent
-- New order: setState → addVIPs → sendAdvert → emitEvent → **go sendGARP()**
-- `sendAdvert()` moved before GARP — tells peer to step down immediately
-- `sendGARP()` runs in a goroutine — only L2 cache updates, not time-critical
-- **File:** `pkg/vrrp/instance.go`
-
-### Change 3: Burst GARP functions
-- `SendGratuitousARPBurst()`: first ARP pair synchronous (<1ms), remaining `(count-1)` pairs in background goroutine at 50ms intervals
-- `SendGratuitousIPv6Burst()`: same pattern for unsolicited NA
-- Original blocking `SendGratuitousARP`/`SendGratuitousIPv6` preserved for non-VRRP callers
-- **File:** `pkg/cluster/garp.go`
-
-### Change 4: Fast planned shutdown
-- Master sends 3× priority-0 adverts on SIGTERM (burst for reliability)
-- Backup immediate takeover: `masterDownTimer.Reset(time.Millisecond)` on priority-0 receipt (was skew timer ~6.5ms)
-- **File:** `pkg/vrrp/instance.go`
-
-### Change 5: Per-RG GARPCount wired to VRRP
-- `Instance.GARPCount` field populated from `cfg.Chassis.Cluster.RedundancyGroups[*].GratuitousARPCount`
-- `sendGARP()` uses `vi.cfg.GARPCount` (0 → default 3)
-- **File:** `pkg/vrrp/vrrp.go`
-
-### Change 6: IPv6 maxAdvert bug fix (drive-by)
-- Was `uint16(ms * 100)` — should be `uint16(ms / 10)` (ms → centiseconds)
-- Currently dead code (IPv6 VRRP not sent) but fixed for correctness
-- **File:** `pkg/vrrp/instance.go`
-
-### Measured Results
-| Scenario | Before (`ff7821c`) | After (`ae1a717`) |
-|----------|---------------------|---------------------|
-| Failover (daemon dies → peer takes over) | ~0.8s | **~60ms** |
-| Planned stop (priority-0 → peer takeover) | ~55ms | **~1ms** |
-| Failback (daemon returns → preempts) | ~2-3s | **~130ms** |
-
-### Files Modified
-| File | Change |
-|------|--------|
-| `pkg/vrrp/vrrp.go` | 30ms default, GARPCount field, interval from chassis config |
-| `pkg/vrrp/instance.go` | Reorder becomeMaster(), async GARP, 3× priority-0 on stop, immediate takeover, IPv6 fix |
-| `pkg/cluster/garp.go` | `SendGratuitousARPBurst()`, `SendGratuitousIPv6Burst()` |
-| `pkg/config/types.go` | `RethAdvertiseInterval` in ClusterConfig |
-| `pkg/config/ast.go` | `reth-advertise-interval` schema node |
-| `pkg/config/compiler.go` | Parse reth-advertise-interval |
-| `pkg/vrrp/vrrp_test.go` | Updated expected interval, configurable interval tests |
-| `pkg/config/parser_test.go` | reth-advertise-interval parsing tests |
-
-## Bug Fix: Manual Failover Weight (`6d63020`)
-
-### Problem
-`request chassis cluster failover redundancy-group 1 node 1` caused both nodes to show RG1 as "secondary" — the peer never became primary.
-
-### Root Cause
-`ManualFailover()` set `ManualFailover=true` and `State=Secondary` but left `Weight=255`. The heartbeat still advertised full weight, so the peer's election logic saw `peerEff=200*255/255=200 > localEff=100*255/255=100` and stayed secondary. The election code at `electRG()` line 32 skips RGs with `ManualFailover=true` on the local node, but the peer has no knowledge of the ManualFailover flag — it only sees weight and priority in the heartbeat.
-
-### Fix
-1. `ManualFailover()`: set `rg.Weight = 0` — peer sees "Peer weight 0" → `electLocalPrimary` (election.go:72-78)
-2. `ResetFailover()`: call `recalcWeight(rg)` instead of directly running election — restores weight from current interface monitor state (255 minus any monitor penalties) and re-runs election
-
-### Files
-| File | Change |
-|------|--------|
-| `pkg/cluster/cluster.go` | `rg.Weight = 0` in `ManualFailover()`, `recalcWeight()` in `ResetFailover()` |
-| `pkg/cluster/cluster_test.go` | Weight=0 assertion in `TestManualFailover`, Weight=255 in `TestResetFailover` |
-
-### Verified
-- Manual failover: node1 correctly becomes primary for RG1
-- Reset failover: node0 preempts back to primary
-- LAN VIP IPv4/IPv6 connectivity 0% loss through failover→reset cycle
-- Daemon stop/start failover + failback: 0% loss on LAN VIP
-
 ## Sprint HA-REBOOT: Reboot Resilience (`f8353de`, `a4eb2b2`)
 
 ### Overview
@@ -1853,46 +1770,65 @@ Fixed two bugs preventing reliable cluster reboot: RETH `.link` files using `MAC
 | Single node reboot (fw0) | Interfaces correct, VRRP MASTER in ~6s, connectivity OK |
 | Simultaneous reboot (both) | Both converge within ~10s, fw0 MASTER, all VIPs present |
 
-## Sprint SEC-SCREEN: SYN Cookie Flood Protection (`8cbf31a`)
+## Sprint SYNCOOKIE: SYN Cookie Flood Protection (`8cbf31a`)
 
 ### Overview
-When `security flow syn-flood-protection-mode syn-cookie` is configured, SYN floods
-trigger cookie-based source validation in XDP instead of dropping all SYNs. Uses
-kernel BPF helpers `bpf_tcp_raw_gen_syncookie` and `bpf_tcp_raw_check_syncookie`
-(available since kernel 5.19).
+When `security flow syn-flood-protection-mode syn-cookie` is configured and a zone's SYN rate exceeds its screen threshold, bpfrx generates SYN-ACK cookies from XDP instead of dropping all SYNs. Validates real sources (not spoofed) before allowing connections through. Zero per-packet overhead once validated.
 
 ### Algorithm
-SYN flood detected -> zone enters syn-cookie mode -> unvalidated SYNs get SYN-ACK with
-cookie seq -> valid ACK returns -> source added to `validated_clients` LRU map -> RST sent
--> client retransmits SYN which passes as validated. Zero per-packet overhead once validated.
+1. SYN flood detected → zone's `flood_state.synproxy_active = 1`
+2. SYN from unvalidated source → `bpf_tcp_raw_gen_syncookie_ipv4/v6` → SYN-ACK with cookie seq → XDP_TX
+3. ACK returns → `bpf_tcp_raw_check_syncookie_ipv4/v6` → valid: add to `validated_clients` LRU → send RST → XDP_TX
+4. Client retransmits SYN → source is validated → passes through pipeline normally
+5. Zone rate drops below threshold/2 → `synproxy_active = 0`
 
 ### BPF Changes
-- `SCREEN_SYN_COOKIE` flag (1<<14), 4 new global counters (27-30)
-- `flood_state` extended with `synproxy_active` field
-- `validated_clients` LRU_HASH map (65536 entries)
-- 4 `__noinline` functions: `send_syncookie_synack_v4/v6`, `validate_syncookie_v4/v6`
-- Existing drop-mode behavior preserved when syn-cookie not configured
+- `SCREEN_SYN_COOKIE (1<<14)` flag in `bpfrx_common.h`
+- 4 new global counters: `GLOBAL_CTR_SYNCOOKIE_SENT/VALID/INVALID/BYPASS` (27-30)
+- `flood_state` extended: `__u8 synproxy_active` + `__u8 pad_fs[7]`
+- `validated_clients` LRU_HASH map (65536 entries) in `bpfrx_maps.h`
+- 4 `__noinline` functions in `xdp_screen.c`: `send_syncookie_synack_v4/v6`, `validate_syncookie_v4/v6`
+- Uses kernel BPF helpers 204-207 (available since 5.19, running 6.18)
 
 ### Go Changes
-- `FlowConfig.SynFloodProtectionMode` parsing
-- `ScreenSynCookie` flag in dataplane compiler
-- 4 Prometheus metrics (`bpfrx_screen_syncookie_total{type=sent|valid|invalid|bypass}`)
-- 4 CLI screen counters in show output
+- `FlowConfig.SynFloodProtectionMode` in `pkg/config/types.go`
+- `syn-flood-protection-mode` parsing in `pkg/config/compiler.go`
+- `ScreenSynCookie` flag + 4 counter constants in `pkg/dataplane/types.go`
+- Flag set in `pkg/dataplane/compiler.go` when syn-cookie + syn-flood configured
+- 4 syncookie counters in `pkg/grpcapi/server.go` screen stats
+- `bpfrx_screen_syncookie_total{type}` Prometheus metric in `pkg/api/metrics.go`
 
-### Files
-39 files changed (1015 insertions, 84 deletions) -- primarily `bpf/xdp/xdp_screen.c` (+605 lines),
-`bpf/headers/bpfrx_common.h`, `bpf/headers/bpfrx_maps.h`, `pkg/config/`, `pkg/dataplane/`,
-`pkg/api/metrics.go`, `pkg/grpcapi/server.go`
+### DPDK Parity
+- `SCREEN_SYN_COOKIE` and counter defines in `dpdk_worker/shared_mem.h` + `tables.h`
+- `flood_state` struct updated with `synproxy_active` field
+
+### Verifier Issues Fixed
+1. **Variable TCP header length:** `tcph->doff * 4` gives var_off up to 60; helper needs that many validated bytes. Fix: use constant `sizeof(struct tcphdr)` (20) for helper call
+2. **Stale packet pointers after helper call:** Compiler reordered MAC reads past BPF helper, losing packet validation. Fix: read MACs after `bpf_xdp_adjust_tail` (packet beginning unchanged by tail truncation)
+
+### Files Modified (39 files, 1015 insertions)
+| File | Changes |
+|------|---------|
+| `bpf/headers/bpfrx_common.h` | SCREEN_SYN_COOKIE flag, 4 counters, synproxy_active in flood_state, validated_client structs |
+| `bpf/headers/bpfrx_maps.h` | `validated_clients` LRU_HASH map |
+| `bpf/xdp/xdp_screen.c` | SYN-ACK generation (v4+v6), cookie validation (v4+v6), synproxy activation, validated bypass |
+| `pkg/config/types.go` | `SynFloodProtectionMode` in FlowConfig |
+| `pkg/config/compiler.go` | Parse `syn-flood-protection-mode` |
+| `pkg/dataplane/compiler.go` | Set `SCREEN_SYN_COOKIE` flag |
+| `pkg/dataplane/types.go` | `ScreenSynCookie` constant, 4 counter constants, FloodState struct update |
+| `pkg/grpcapi/server.go` | 4 syncookie counters in screen stats |
+| `pkg/api/metrics.go` | `bpfrx_screen_syncookie_total` Prometheus metric |
+| `dpdk_worker/shared_mem.h` | SCREEN_SYN_COOKIE, flood_state update |
+| `dpdk_worker/tables.h` | 4 counter defines, GLOBAL_CTR_MAX=31 |
 
 ## Sprint CGNAT: Deterministic NAT / Carrier-Grade NAT (`74e1d17`)
 
 ### Overview
-Carrier-grade NAT with deterministic port block allocation. Each subscriber from a
-configured host range gets a fixed, algorithmically-computed block of ports on a
-public IP. Purely mathematical mapping enables ISP compliance logging without
-per-session overhead.
+Carrier-grade NAT with deterministic port block allocation. Each subscriber from a configured
+host range gets a fixed, algorithmically-computed block of ports on a public IP. Purely
+mathematical mapping enables ISP compliance logging without per-session overhead.
 
-### Config Syntax
+### Config
 ```
 set security nat source pool POOL address 203.0.113.1/32 to 203.0.113.4/32
 set security nat source pool POOL port deterministic block-size 2016
@@ -1900,78 +1836,60 @@ set security nat source pool POOL port deterministic host address 100.64.0.0/22
 ```
 
 ### BPF Changes
-- `nat_pool_alloc_deterministic_v4()` `__noinline` in xdp_policy.c
-- Dispatched via `cfg->deterministic` flag
+- `nat_pool_alloc_deterministic_v4()` __noinline in `xdp_policy.c`
+- Dispatched via `cfg->deterministic` flag (mode 1 = IPv4)
 - `nat_pool_config` extended to 24 bytes (deterministic, block_size, host_base, host_count, blocks_per_ip)
-- `MAX_NAT_POOL_IPS_PER_POOL` increased from 8 to 256 for CGNAT pools
+- `MAX_NAT_POOL_IPS_PER_POOL` 8 -> 256, `MAX_NAT_POOL_IPS` -> 8192
 
 ### Go Changes
-- `DeterministicNATConfig` and `PoolUtilizationAlarmConfig` types
-- Address range expansion (`addr1/32 to addr2/32`)
-- Validation: capacity check, mutual exclusion with persistent-nat/address-persistent
+- `DeterministicNATConfig` struct (block_size, host_address)
+- `PoolUtilizationAlarmConfig` (raise/clear threshold)
+- Address range expansion (`expandAddressRange`, max 256 IPs)
+- Validation: capacity, mutual exclusion with persistent-nat/address-persistent
 - `bpfrx_nat_pool_deterministic_info` Prometheus gauge
-- `show security nat source deterministic-nat nat-table` CLI command
-
-### DPDK Parity
-All struct and constant changes mirrored in `dpdk_worker/` (shared_mem.h, tables.h, policy.c)
+- `deterministic-nat nat-table` CLI command
 
 ### Files
-18 files changed (426 insertions, 23 deletions) -- primarily `bpf/xdp/xdp_policy.c`,
-`bpf/headers/bpfrx_common.h`, `pkg/config/compiler.go`, `pkg/dataplane/`
+18 files changed (426 insertions, 23 deletions)
 
 ## Sprint CGNAT-64: Deterministic NAPT64 for IPv6 Subscribers (`439cd3f`)
 
 ### Overview
-Extended deterministic NAT to support NAT64 traffic where IPv6 subscribers get
-deterministic IPv4 SNAT allocation based on their IPv6 source address prefix.
-The subscriber index is derived from the 32-bit word after the configured prefix
-(/32 -> word[1], /64 -> word[2]).
+Extended deterministic NAT to support NAT64 traffic. IPv6 subscribers get deterministic
+IPv4 SNAT allocation based on their IPv6 source address prefix. Subscriber index derived
+from the 32-bit word after the configured prefix (/32 -> word[1], /64 -> word[2]).
 
-### Config Syntax
+### Config
 ```
 set security nat source pool POOL port deterministic block-size 2016
 set security nat source pool POOL port deterministic host address 2001:db8::/32
 ```
 
 ### BPF Changes
-- New `nat_pool_alloc_deterministic_v6()` function in xdp_policy.c
-- NAT64 dispatch checks `deterministic==2` before falling back to regular allocation
-- `nat_pool_config` extended from 24 to 40 bytes (`host_prefix_len`, `host_base_v6[4]`)
-- Deterministic mode values: 0=off, 1=IPv4 host, 2=IPv6 host
+- New `nat_pool_alloc_deterministic_v6()` in xdp_policy.c
+- NAT64 dispatch checks `deterministic==2` before regular allocation
+- `nat_pool_config` extended 24 -> 40 bytes (host_prefix_len, host_base_v6[4])
 
 ### Go Changes
-- Validation enforces /32 or /64 prefix for IPv6 host addresses
-- Compiler populates mode 2 with IPv6 base address and prefix length
-- `NATPoolConfig` Go struct extended with `HostPrefixLen` and `HostBaseV6`
+- IPv6 host prefix validation (/32 or /64 only)
+- Compiler mode 2 with IPv6 base address
 
 ### DPDK Parity
-Inline deterministic v6 allocation added to `dpdk_worker/nat64.c`
+Inline deterministic v6 allocation in `dpdk_worker/nat64.c`
 
 ### Files
-14 files changed (199 insertions, 24 deletions) -- primarily `bpf/xdp/xdp_policy.c`,
-`bpf/headers/bpfrx_common.h`, `dpdk_worker/nat64.c`, `pkg/config/compiler.go`,
-`pkg/dataplane/compiler.go`
+14 files changed (199 insertions, 24 deletions)
 
 ## VRF-Aware Connectivity Test Suite (`367fa54`)
 
 ### Overview
-New `make test-connectivity` target runs automated end-to-end connectivity tests
-across standalone and cluster deployments. The `ping_vrf_aware()` helper automatically
-tries each VRF when the default routing table ping fails, eliminating false failures
-for interfaces in management or other VRFs.
+New `make test-connectivity` target with VRF-aware ping helper. Tests standalone (service,
+reachability, cross-zone IPv4/IPv6) and cluster (heartbeat, fabric, RETH VIP, cross-zone).
 
-### Test Coverage
-- **Standalone:** service health, direct host reachability (trust/untrust/dmz/WAN),
-  cross-zone IPv4 and IPv6 through firewall
-- **Cluster:** service health on both nodes, heartbeat connectivity, fabric connectivity,
-  WAN gateway, LAN host to RETH VIP (proves VRRP), cross-zone through cluster, IPv6
-
-### Usage
-```bash
-make test-connectivity              # Run all tests
-make test-connectivity MODE=standalone  # Standalone only
-make test-connectivity MODE=cluster     # Cluster only
-```
+### Key Design
+- `ping_vrf_aware()`: tries default table first, then each VRF (`ip vrf show`)
+- Auto-detects running instances, skips unavailable tests
+- Supports `standalone`, `cluster`, `all` modes
 
 ### Files
 2 files changed (205 insertions) -- `test/incus/test-connectivity.sh`, `Makefile`
@@ -2022,487 +1940,933 @@ virtio-net). ICMP ping worked but TCP/UDP checksums were corrupted on egress.
 - `bpf/xdp/xdp_zone.c` — NAT64 flag propagation
 - `docs/ha-cluster.conf` — NAT64 rule-set added to cluster config
 
-## NAT64 FIB Cache + Direct Dispatch (`1610362`)
-
-### Overview
-Two optimizations for NAT64 forward-path performance, eliminating ~7% CPU from
-`bpf_fib_lookup` on every packet and saving one tail call per established session.
-
-### Problem
-xdp_nat64 called `bpf_fib_lookup` on every forward-path packet after IPv6→IPv4
-translation. The existing session FIB cache (from xdp_zone) cached the IPv6 FIB
-result, which was wrong for NAT64's post-translation IPv4 routing — xdp_nat64
-always overwrote it with a fresh lookup. Additionally, established NAT64 sessions
-went through xdp_nat as a pure dispatcher before reaching xdp_nat64.
-
-### Changes
-1. **LRU FIB cache map** (`nat64_fib_cache`, 1024 entries): keyed by
-   `{ipv4_dst, routing_table}`, caches resolved FIB result (ifindex, MACs, VLAN).
-   Invalidated via `fib_gen_map` generation counter on route recompile.
-2. **Direct dispatch**: xdp_conntrack tail-calls directly to xdp_nat64 for
-   established NAT64 sessions, skipping xdp_nat (no NAT44 rewrite needed).
-
-### Perf Results
-- NAT64 FIB CPU: 7.39% → 0.44% (-94%)
-- NAT64 throughput: 7.96 → 8.38 Gbps (+5.3%)
-- NAT44: no regression (6.45 → 6.78 Gbps)
-
-### Files
-3 files changed (+ generated bindings)
-- `bpf/headers/bpfrx_maps.h` — `nat64_fib_cache` LRU map definition
-- `bpf/xdp/xdp_nat64.c` — FIB cache check/populate in forward path
-- `bpf/xdp/xdp_conntrack.c` — Direct dispatch to XDP_PROG_NAT64
-
-## Copilot PR Fixes (`5110ffe`)
-
-### Overview
-Four fixes sourced from GitHub Copilot draft PRs (#2-#5). Reviewed, validated
-against codebase, and applied.
-
-### Changes
-1. **NAT64 state cleanup (PR #5):** `compileNAT64()` returned early when
-   `len(ruleSets)==0`, skipping `SetNAT64Count(0)` and `DeleteStaleNAT64()`.
-   Removing all NAT64 rules left stale prefixes in BPF maps.
-2. **DNAT wildcard port-0 (PR #3):** Skip redundant `dnat_table` wildcard
-   lookup when `meta->dst_port` is already 0 (both v4 and v6 paths).
-3. **GC scratch buffer reuse (PR #4):** `sweep()` allocated fresh slices
-   every 10s cycle. Reuse backing arrays via `[:0]` reset.
-4. **DHCPv6 nil opts guard (PR #2):** Move `opts==nil` check before
-   `getDUID()` so nil opts returns nil modifiers.
-
-### Files
-5 files changed
-- `pkg/dataplane/compiler.go` — NAT64 cleanup on empty rule-sets
-- `bpf/xdp/xdp_zone.c` — DNAT wildcard port-0 guard (v4 + v6)
-- `pkg/conntrack/gc.go` — Scratch buffer reuse fields + `[:0]` reset
-- `pkg/dhcp/dhcp.go` — nil opts early return before getDUID()
-
 ## Graceful Startup Retry for Cluster Heartbeat and Sync (`2199e52`)
 
 ### Overview
-Improved cluster startup resilience when VRF devices or interface addresses are not
-ready at daemon boot time. Both heartbeat and session sync bind retries now log at
-INFO level for the first 5 attempts (normal startup race), escalating to WARN only
-after 10 seconds. Fabric IP resolution is now retried inside the goroutine instead
-of being resolved once outside (which failed permanently if fab0 had no address).
+Improved cluster startup resilience. Heartbeat + sync bind retries log at INFO for first
+5 attempts (normal startup race), escalating to WARN after 10s. Fabric IP resolution
+retried inside goroutine (was single attempt outside, failing permanently).
 
 ### Changes
-- **Heartbeat bind retry:** INFO for first 5 attempts, WARN after, 30 attempts at 2s intervals
-- **Fabric IP resolution:** Moved inside goroutine with retry loop (was single attempt outside)
-- **Session sync bind retry:** INFO for first 5 attempts, WARN after, integrated into fabric goroutine
-- **Context cancellation:** All retry loops honor `ctx.Done()` for clean shutdown
+- Heartbeat: INFO first 5, WARN after, 30 attempts at 2s
+- Fabric IP: retry loop inside goroutine with ctx.Done() honoring
+- Session sync: INFO first 5, WARN after, integrated into fabric goroutine
 
 ### Files
 1 file changed (53 insertions, 28 deletions) -- `pkg/daemon/daemon.go`
 
-## Deploy Restart Resilience (`e3ceebe`)
+## Sprint FLOW-OPTS: Aggressive Session Aging + TCP Session Options
 
 ### Overview
-Fixed three issues that caused stale BPF state and socket bind failures after
-`make cluster-deploy` / `make test-deploy`. The deploy cycle replaces the binary,
-requiring full BPF cleanup — but the deploy scripts only ran `systemctl stop` +
-`pkill -9`, leaving pinned BPF maps/links and sometimes bound sockets.
+Two flow-level enhancements: aggressive session aging with GC watermark hysteresis for
+session table capacity management, and TCP session options (no-syn-check,
+no-syn-check-in-tunnel, rst-invalidate-session) in BPF and DPDK datapaths.
+
+### Aggressive Session Aging
+- **Config parsing:** `set security flow aging` with high-watermark/low-watermark/early-ageout
+- **GC watermark hysteresis:** Go-side GC (`pkg/conntrack/gc.go`) monitors session table
+  utilization against high/low watermarks. When utilization exceeds high watermark, early
+  ageout override kicks in to aggressively expire sessions. Returns to normal when below
+  low watermark.
+- **Daemon integration:** `pkg/daemon/daemon.go` passes aging config to GC
+
+### TCP Session Options
+- **no-syn-check:** Skip SYN validation for mid-stream TCP pickup (asymmetric routing).
+  BPF: `xdp_conntrack.c` creates sessions for non-SYN TCP packets when flag set.
+  DPDK: `dpdk_worker/conntrack.c` equivalent logic.
+- **no-syn-check-in-tunnel:** Same as no-syn-check but only for tunnel interfaces.
+  Per-interface tunnel flag via `iface_zone_value.flags` in `bpfrx_common.h`.
+  BPF: `xdp_zone.c` sets meta tunnel flag from interface flags.
+- **rst-invalidate-session:** Immediately close sessions on RST instead of waiting for
+  timeout. BPF: `xdp_conntrack.c` transitions to CLOSED on RST when flag set.
+  DPDK: `dpdk_worker/conntrack.c` equivalent.
+
+### Config Compilation
+- `pkg/config/types.go` — FlowConfig aging + TCP session option fields
+- `pkg/config/compiler.go` — Junos AST → typed config compilation for flow options
+- `pkg/config/ast.go` — Parser support for flow aging/TCP-session nodes
+- `pkg/dataplane/compiler.go` — Typed config → BPF map entries (flow_config map)
+- `pkg/dataplane/maps.go` — Flow config map definitions
+- `pkg/dataplane/types.go` — BPF-side flow config struct
+
+### Files Changed
+- `bpf/headers/bpfrx_common.h` — flow_config struct, tunnel flag in iface_zone_value.flags, TCP option flags
+- `bpf/xdp/xdp_conntrack.c` — no-syn-check + rst-invalidate-session logic
+- `bpf/xdp/xdp_policy.c` — flow config flag reads
+- `bpf/xdp/xdp_zone.c` — per-interface tunnel flag propagation to meta
+- `pkg/conntrack/gc.go` — watermark hysteresis, early ageout override
+- `pkg/conntrack/gc_test.go` — tests for watermark aging behavior
+- `pkg/daemon/daemon.go` — aging config plumbing to GC
+- `pkg/config/types.go` — FlowConfig Go types
+- `pkg/config/compiler.go` — flow option compilation
+- `pkg/config/ast.go` — parser support
+- `pkg/dataplane/compiler.go` — BPF map compilation
+- `pkg/dataplane/maps.go` — flow config map
+- `pkg/dataplane/types.go` — BPF struct mirror
+- `pkg/dataplane/dataplane.go` — flow config loading
+- `pkg/dataplane/loader.go` — map pinning
+- `dpdk_worker/conntrack.c` — DPDK no-syn-check + rst-invalidate-session
+- `dpdk_worker/shared_mem.h` — DPDK shared flow config struct
+- `pkg/dataplane/dpdk/dpdk_cgo.go` — CGo flow config bridge
+- `pkg/dataplane/dpdk/dpdk_stub.go` — stub for non-DPDK builds
+
+---
+
+## Sprint FEAT-4: Proxy ARP, Session Limiting, BFD Profiles, DPDK Policer
+
+**Commit:** `f0511af` — 54 files changed, +1997/-511 lines
+**Date:** 2026-02-25
+
+Four features from feature-gaps.md Tier 1 priority list, reducing gap count 161→155.
+
+### Feature 1: DPDK Policer Parity
+
+eBPF policer (`evaluate_policer()` in `bpfrx_helpers.h`) already worked. DPDK had structs
+and map pointers but stubs for evaluation. Now fully functional.
+
+- **`dpdk_worker/policer.c`** (new) — Ports BPF token bucket to DPDK:
+  - `rte_rdtsc()` / `rte_get_tsc_hz()` for timing (TSC ticks instead of ktime_ns)
+  - Three modes: POLICER_MODE_SINGLE_RATE, POLICER_MODE_TWO_RATE (RFC 2698),
+    POLICER_MODE_SR3C (RFC 2697)
+  - Returns 0=conform, 1=exceed, 2=violate
+- **`dpdk_worker/filter.c`** — `#include "policer.c"`, policer check after rule match/DSCP rewrite
+- **`dpdk_worker/tables.h`** — `MAX_POLICERS 64`
+- **`pkg/dataplane/dpdk/dpdk_cgo.go`** — `SetPolicerConfig()` + `ClearPolicerConfigs()`
+
+### Feature 2: BFD via FRR Profiles
+
+Extended existing partial BFD support. OSPF had `BFD bool`, BGP had `BFD bool` +
+`BFDInterval int`. Now all three protocols support interval/multiplier via FRR BFD profiles.
+
+- **`pkg/config/types.go`**:
+  - `OSPFInterface`: added `BFDInterval int`, `BFDMultiplier int`
+  - `ISISInterface`: added `BFD bool`, `BFDInterval int`, `BFDMultiplier int`
+  - `BGPNeighbor`: added `BFDMultiplier int`
+- **`pkg/config/ast.go`** — `multiplier` child for OSPF/BGP `bfd-liveness-detection`;
+  new `bfd-liveness-detection` with `minimum-interval` + `multiplier` for IS-IS interface
+  (both default and per-VRF variants)
+- **`pkg/config/compiler.go`** — Parse interval/multiplier for OSPF, IS-IS, BGP
+  (group-level + per-neighbor). Gotcha: `groupBFDMultiplier` must be propagated to
+  neighbor initialization
+- **`pkg/frr/frr.go`**:
+  - `bfdProfile` struct + `bfdProfileName()` helper (e.g. `bpfrx-300-3`)
+  - OSPF: `ip ospf bfd profile <name>` when interval/multiplier set (plain `ip ospf bfd` otherwise)
+  - IS-IS: `isis bfd` per interface, `isis bfd profile <name>` when custom interval
+  - BGP: `n.BFDMultiplier` instead of hardcoded `3`
+  - Deduplicated BFD profile stanzas generated at end of `generateProtocols()`
+
+### Feature 3: Proxy ARP for NAT
+
+New feature — auto-reply ARP for NAT pool addresses on same L2 segment.
+
+- **`pkg/config/types.go`** — `ProxyARPEntry` struct + `ProxyARP []*ProxyARPEntry` in `NATConfig`
+- **`pkg/config/ast.go`** — `proxy-arp` → `interface` (args:1) → `address` (args:1, multi:true)
+- **`pkg/config/compiler.go`** — Parse in `compileNAT()`, range expansion via `expandAddressRange()`
+- **`pkg/dataplane/proxyarp.go`** (new) — `ReconcileProxyARP(cfg, ifaceMap)`:
+  - Builds desired `{ifindex, IP}` set from config
+  - Lists existing NTF_PROXY neighbors via `netlink.NeighList()`
+  - Adds missing entries with `netlink.NeighSet()` (NTF_PROXY flag)
+  - Removes stale entries with `netlink.NeighDel()`
+  - Returns `ProxyARPAdded` structs for caller to send GARPs (avoids cluster import cycle)
+- **`pkg/daemon/daemon.go`** — Calls `ReconcileProxyARP()` after VRRP VIP reconciliation;
+  sends GARPs for newly added entries
+- Config: `set security nat proxy-arp interface trust0 address 10.0.1.100/32`
+  or range `address 10.0.1.101/32 to 10.0.1.110/32`
+
+### Feature 4: Per-IP Session Limiting (Screen)
+
+New screen check — prevents session table exhaustion from single source/destination.
+Design: Go GC counts → BPF LRU maps → xdp_screen enforcement.
+
+- **BPF C changes:**
+  - `bpfrx_common.h` — `session_limit_src`/`session_limit_dst` in `screen_config`,
+    flags `SCREEN_SESSION_LIMIT_SRC (1<<15)` / `SCREEN_SESSION_LIMIT_DST (1<<16)`,
+    `GLOBAL_CTR_SCREEN_SESSION_LIMIT`, `session_count_key`/`session_count_value` structs
+  - `bpfrx_maps.h` — `session_count_src`/`session_count_dst` LRU_HASH maps (65536 entries)
+  - `xdp_screen.c` — Session limit checks after IP sweep for TCP SYN;
+    IPv6 XOR-hashes 4 words to uint32 key
+- **Go config:**
+  - `types.go` — `LimitSessionScreen` struct in `ScreenProfile`
+  - `ast.go` — `limit-session` → `source-ip-based` + `destination-ip-based`
+  - `compiler.go` — Parse thresholds in `compileScreen()`
+- **Go dataplane:**
+  - `types.go` — `SessionLimitSrc`/`SessionLimitDst` in `ScreenConfig`, `SessionCountKey`/
+    `SessionCountValue` Go mirror structs
+  - `dataplane.go` — `UpdateSessionCountSrc`/`UpdateSessionCountDst`/`ClearSessionCounts` interface
+  - `maps.go` — Implementation using ebpf map operations
+  - `loader_ebpf.go` — Register new maps from bpf2go objects
+  - `compiler.go` — Compile session limit thresholds/flags in screen profiles
+- **Conntrack GC (`gc.go`):**
+  - `sessionLimitEnabled bool` + `SetSessionLimitEnabled()`
+  - During sweep: accumulates `srcCounts`/`dstCounts` maps for forward entries (v4+v6)
+  - After sweep: pushes all counts to BPF maps
+- **DPDK parity:**
+  - `shared_mem.h` — Updated `screen_config`, added count key/value structs + hash tables
+  - `screen.c` — Session limit checks via rte_hash lookups
+  - `dpdk_cgo.go` — `UpdateSessionCountSrc`/`UpdateSessionCountDst`/`ClearSessionCounts`
+  - `dpdk_stub.go` — Stubs
+- **`daemon.go`** — Detects session limit config, calls `gc.SetSessionLimitEnabled()`
+- Config: `set security screen ids-option untrust-screen limit-session source-ip-based 100`
+
+### Tests Added
+- `pkg/config/parser_test.go` — 11 new tests:
+  - Proxy ARP: hierarchical, set syntax, single address, bare IP
+  - BFD: OSPF interval/multiplier, IS-IS BFD, BGP multiplier (all set syntax)
+  - Session limiting: compilation, hierarchical
+- `pkg/conntrack/gc_test.go` — Session limit enabled flag test
+
+### Key Gotchas Discovered
+- `cfg.Security` and `cfg.Security.NAT` are Go structs (not pointers) — never `!= nil` check,
+  use `len(cfg.Security.NAT.ProxyARP) > 0`
+- BGP `groupBFDMultiplier` must be explicitly set in neighbor struct initialization
+- Per-neighbor BFD parsing needs `switch` (not just `if`) to handle both `minimum-interval`
+  and `multiplier` children
+- FRR BFD profile name helper must match actual struct name (`bfdProfile` not `bfdProfileParams`)
+
+---
+
+## Sprint HA-NONPREEMPT: Non-Preempt HA (No Auto-Failback on Rejoin)
+
+**Commit:** `de23c78` — Implement non-preempt HA: no auto-failback on rejoin
 
 ### Problem
-1. **Stale BPF state:** `bpfrxd` hitless restart (`Close()`) preserves pinned BPF
-   maps/links by design. Deploy scripts replace the binary, so the old pins are
-   incompatible. Without `bpfrxd cleanup`, the new daemon inherits stale state.
-2. **Socket bind failures:** `pkill -9` interrupted graceful shutdown, leaving
-   heartbeat (UDP:4784) and sync (TCP:4785) sockets bound. New daemon's 30-retry
-   bind loop would fail for 60+ seconds.
-3. **BulkSync nil pointer panic:** Fixing #2 with `SO_REUSEPORT` allowed immediate
-   socket bind, exposing a latent race — peer connects before `SetDataPlane()` is
-   called, so `BulkSync()` called `s.dp.IterateSessions()` with `s.dp == nil`.
+When a firewall node reboots and comes back, it automatically preempted back to primary (higher base priority). Two independent preempt mechanisms existed:
+1. **Cluster election** (`election.go`): checked `rg.Preempt` — already supported non-preempt
+2. **VRRP instances** (`vrrp.go`): hardcoded `Preempt: true` for all RETH instances — ignored config
+
+Additionally, config sync preserved the entire `chassis` node from the local config, preventing preempt changes from propagating to the secondary node. And manual failover (`ResignRG`) had no mechanism to force VRRP MASTER→BACKUP transitions.
+
+### Goal
+Returning node rejoins as secondary and stays there until:
+1. Admin triggers `request chassis cluster failover` on the current primary, OR
+2. Current primary restarts
+
+Matches Junos behavior when `preempt` is NOT configured on a redundancy group.
 
 ### Changes
-1. **`pkg/cluster/cluster.go` — `vrfListenConfig()`:** Always set `SO_REUSEADDR` +
-   `SO_REUSEPORT` on sockets (even without VRF), allowing immediate rebind after restart.
-2. **`pkg/cluster/sync.go` — `BulkSync()`:** Added `if s.dp == nil` guard returning
-   error when dataplane isn't wired yet. Callers already handle errors gracefully.
-3. **`test/incus/cluster-setup.sh` + `test/incus/setup.sh`:** Deploy scripts now run
-   `bpfrxd cleanup` between `systemctl stop` and binary push, removing pinned BPF
-   maps/links. `pkill -9` kept as safety net.
 
-### Files
-4 files changed
-- `pkg/cluster/cluster.go` — SO_REUSEADDR + SO_REUSEPORT in vrfListenConfig()
-- `pkg/cluster/sync.go` — nil dp guard in BulkSync()
-- `test/incus/cluster-setup.sh` — bpfrxd cleanup in deploy_vm()
-- `test/incus/setup.sh` — bpfrxd cleanup in deploy step
+#### 1. Wire RG preempt config to VRRP instances (`pkg/vrrp/vrrp.go`)
+- Built `preemptMap` from RG configs (like existing `garpCounts`)
+- Used `preemptMap[rgID]` instead of hardcoded `true` for both VLAN and non-VLAN instance creation
 
-## Sprint FABRIC-HARDEN: Fabric Forwarding Hardening (#61–#64)
+#### 2. Add resign channel to VRRP instances (`pkg/vrrp/instance.go`)
+- Added `resignCh chan struct{}` to `vrrpInstance` (alongside existing `preemptNowCh`)
+- Initialized as buffered channel of size 1 in `newInstance()`
+- MASTER state handler: sends 3× priority-0 adverts then calls `becomeBackup()`
+- `triggerResign()` method: non-blocking send (like `triggerPreemptNow()`)
 
-### Overview
-Four issues in the cross-chassis fabric forwarding path where transit packets
-could leak into the kernel stack or take incorrect paths during RG movement
-windows. Also hardens the DPDK worker's zone-encoded MAC decode path.
+#### 3. Fix VRRP startup masterDown timer race (`pkg/vrrp/instance.go`)
+- **Bug:** With 30ms RETH intervals, masterDown timer (~97ms) fires before AF_PACKET receiver starts capturing peer adverts — returning node erroneously becomes MASTER within 85ms
+- **Fix:** Extended initial masterDown timer to 3 seconds when `preempt=false` (either from config or sync hold)
+- After first received advert, `handleBackupRx` resets to normal short interval — fast failover detection preserved
 
-### #61: NO_NEIGH FABRIC_FWD sessionless leak
-- **Problem:** In xdp_zone NO_NEIGH branch, `META_FLAG_FABRIC_FWD` packets without a
-  session (`sv4==NULL && sv6==NULL`) fell through to the host-inbound `XDP_PASS` path.
-  Fabric-forwarded transit packets should never reach the host stack.
-- **Fix:** Added `META_FLAG_FABRIC_FWD` guard before host-inbound fallthrough — drops
-  with `GLOBAL_CTR_FABRIC_FWD_DROP` counter instead of leaking to kernel.
-- **File:** `bpf/xdp/xdp_zone.c`
+#### 4. Add `ResignRG()` to VRRP Manager (`pkg/vrrp/manager.go`)
+- Forces all VRRP instances for a given RG to resign
+- Matches by `GroupID == 100 + rgID` (VRID convention)
+- Used when cluster state transitions Primary→Secondary
 
-### #62: UNREACHABLE/BLACKHOLE FABRIC_FWD re-FIB miss
-- **Problem:** In xdp_zone UNREACHABLE/BLACKHOLE branch, FABRIC_FWD packets attempted
-  re-FIB in main table (254) but had no explicit drop when that also failed. Transit
-  packets with unreachable routes could leak through without a counter increment.
-- **Fix:** Added `XDP_DROP` with `GLOBAL_CTR_FABRIC_FWD_DROP` counter when re-FIB in
-  table 254 fails for FABRIC_FWD packets.
-- **File:** `bpf/xdp/xdp_zone.c`
+#### 5. Wire cluster Primary→Secondary to VRRP resign (`pkg/daemon/daemon.go`)
+- In `watchClusterEvents()`: when `ev.OldState == StatePrimary && ev.NewState == StateSecondary|SecondaryHold`, calls `d.vrrpMgr.ResignRG(ev.GroupID)`
+- Happens before debounced VRRP priority update — peer receives priority-0 adverts promptly
 
-### #63: Non-deterministic fib_ifindex fallback
-- **Problem:** `refreshFabricFwd()` in daemon.go needed a non-VRF ifindex for
-  `bpf_fib_lookup` main-table queries when the fabric interface is a VRF member.
-  Fallback iterated `netlink.LinkList()` and picked the first UP non-VRF link —
-  non-deterministic since link order varies between boots/reloads.
-- **Fix:** Use loopback (ifindex 1) as the fallback. Always present, always UP, never
-  a VRF member. Eliminates the `LinkList()` iteration entirely.
-- **File:** `pkg/daemon/daemon.go`
+#### 6. Fix config sync chassis preservation (`pkg/daemon/daemon.go`)
+- **Bug:** `handleConfigSync()` replaced the entire received `chassis` node with the local copy, preserving stale settings (like `preempt;`) on the secondary
+- **Root cause:** Per-node settings live in `groups` section (not chassis), and `CompileConfigForNode` handles per-node expansion using local node-id file
+- **Fix:** Removed chassis preservation entirely — pass `nil` as chassisPreserve to `SyncApply()`
 
-### #64: DPDK zone decode early return + no fabric validation
-- **Problem:** In `dpdk_worker/zone.c`, zone-encoded MAC decode (fabric redirect)
-  returned immediately after decoding, skipping FIB resolution. No validation that the
-  packet arrived on the fabric interface — any interface could spoof a zone-encoded MAC.
-- **Fix:** (1) Added `fabric_ifindex` to DPDK `shared_memory`, populated by Go manager.
-  (2) Validate ingress port matches fabric interface before accepting zone-encoded MACs.
-  (3) Removed early return so decoded packets continue through normal FIB resolution.
-- **Files:** `dpdk_worker/zone.c`, `dpdk_worker/tables.h`, `pkg/dataplane/dpdk/manager.go`
+#### 7. Cluster election guards (`pkg/cluster/`)
+- `cluster.go`: Added `peerEverSeen bool` flag, set in `handlePeerHeartbeat()`; `handlePeerNeverSeen()` for timeout when peer never seen
+- `election.go`: Non-preempt guard — if `!rg.Preempt && !peerEverSeen && rg.State == StateSecondary`, skip election (stay secondary until peer heartbeat received)
+- `heartbeat.go`: Added `startedAt` field; timeout loop calls `handlePeerNeverSeen()` when no heartbeat ever received
 
-### Impact
-- Closes all fabric forwarding leak paths during RG movement / route convergence
-- Adds counter visibility (`GLOBAL_CTR_FABRIC_FWD_DROP`) for fabric transit drops
-- Deterministic loopback fallback prevents boot-order-dependent FIB behavior
-- DPDK parity: fabric ingress validation + correct zone decode pipeline flow
+#### 8. Remove `preempt` from test configs
+- `docs/ha-cluster.conf`, `test/incus/bpfrx-cluster-fw0.conf`, `test/incus/bpfrx-cluster-fw1.conf` — removed `preempt;` from all 3 RGs
 
-## Sprint DPDK-HA-HARDEN: DPDK Fabric + HA Race Fixes (#65–#66)
+#### 9. Update failover test (`test/incus/test-failover.sh`)
+- Phase 4: Verify fw0 rejoins as **secondary** (not primary) after reboot
+- Phase 4b: Manual failover test — `request chassis cluster failover redundancy-group 0` on fw1 → verify fw0 becomes primary and iperf3 survives
+- Total: 14 tests (was 13), all pass
 
-### Overview
-Two fixes: correcting DPDK fabric validation to use port_id instead of kernel
-ifindex (follow-up to #64), and eliminating a race condition in HA failover
-where interleaved goroutine transitions could apply stale rg_active state.
+### Files Modified (12 files, +336/-55)
+| File | Change |
+|------|--------|
+| `pkg/vrrp/vrrp.go` | Wire RG preempt config to VRRP instances |
+| `pkg/vrrp/instance.go` | resignCh, triggerResign(), 3s initial masterDown when !preempt |
+| `pkg/vrrp/manager.go` | ResignRG() method |
+| `pkg/vrrp/vrrp_test.go` | 5 new tests (preempt wiring, resignCh, ResignRG) |
+| `pkg/cluster/cluster.go` | peerEverSeen flag, handlePeerNeverSeen() |
+| `pkg/cluster/election.go` | Non-preempt guard in electRG() |
+| `pkg/cluster/heartbeat.go` | startedAt field, peer-never-seen detection |
+| `pkg/daemon/daemon.go` | Remove chassis preservation, add VRRP resign on Primary→Secondary |
+| `docs/ha-cluster.conf` | Remove preempt from all 3 RGs |
+| `test/incus/bpfrx-cluster-fw0.conf` | Remove preempt from all 3 RGs |
+| `test/incus/bpfrx-cluster-fw1.conf` | Remove preempt from all 3 RGs |
+| `test/incus/test-failover.sh` | Phase 4b manual failover test |
 
-### #65: DPDK fabric validation compares port_id vs kernel ifindex
-- **Problem:** DPDK zone.c fabric ingress validation (from #64) compared
-  `meta->ingress_ifindex` (DPDK port_id) against `shm->fabric_ifindex` (kernel
-  ifindex). Different numbering namespaces — comparison always fails, rejecting
-  valid fabric-forwarded packets.
-- **Fix:** (1) Added `ifindex_to_port` mapping array in shared_memory, populated
-  at DPDK port_init. (2) Renamed `fabric_ifindex` to `fabric_port_id`.
-  (3) Go `UpdateFabricFwd()` translates kernel ifindex to DPDK port_id via the
-  mapping before writing to shared memory.
-- **Files:** `dpdk_worker/zone.c`, `dpdk_worker/tables.h`, `pkg/dataplane/dpdk/manager.go`
+### Tests Added
+- `TestCollectRethInstances_PreemptFromRGConfig` — preempt=true in RG → VRRP Preempt=true
+- `TestCollectRethInstances_NoPreemptByDefault` — preempt absent → VRRP Preempt=false
+- `TestResignCh_Initialized` — resignCh channel exists and is non-nil
+- `TestTriggerResign_NonBlocking` — double triggerResign() doesn't block
+- `TestResignRG_SignalsCorrectInstances` — only instances matching the RG get signaled
 
-### #66: HA failover race — stale rg_active from interleaved transitions
-- **Problem:** `watchClusterEvents` and `watchVRRPEvents` goroutines both call
-  `rgStateMachine` and apply `rg_active`/blackhole side effects. When they
-  interleave during rapid failover/failback, the first goroutine's side effects
-  can overwrite the second (newer) transition's correct state — causing brief
-  traffic drops or incorrect forwarding.
-- **Fix:** Added epoch guard — each transition increments a monotonic epoch
-  counter. After applying side effects, the goroutine re-reads the current epoch.
-  If a newer transition occurred (epoch mismatch), stale side effects are skipped.
-- **File:** `pkg/daemon/daemon.go`
+### Key Gotchas Discovered
+- **Config sync chassis preservation was too coarse-grained:** Replacing the entire `chassis` node preserved shared settings (preempt, gratuitous-arp-count) alongside intended per-node settings (node ID, peer addresses). Per-node settings actually live in `groups` section and are expanded at compile time by `CompileConfigForNode`.
+- **VRRP masterDown timer fires before AF_PACKET receiver starts:** With 30ms adverts, the ~97ms masterDown interval is too short for the AF_PACKET socket to initialize and receive the first peer advert. Logs showed: instance start → BACKUP → MASTER in 85ms with zero received adverts.
+- **RFC 5798 masterDown BACKUP→MASTER transition has no preempt check:** The masterDown handler unconditionally becomes MASTER (correct per spec — masterDown means the current MASTER is gone). Non-preempt must be enforced by ensuring the timer doesn't fire prematurely.
+- **Manual failover requires VRRP resign:** Cluster state change alone isn't enough — the VRRP layer continues advertising as MASTER. Must send priority-0 adverts to force peer takeover, especially when peer has preempt=false.
 
-### Impact
-- DPDK fabric forwarding now correctly validates ingress port using native port_id
-- Eliminates race window where interleaved HA transitions could apply stale BPF map state
-- Epoch guard is zero-cost on the fast path (only checked during transition side effects)
+---
 
-## Sprint: Monitor Commands (PR #67)
+## Sprint HA-REMOTE-FAILOVER: Remote Failover via `node <N>` Parameter
 
-### Feature: `monitor security flow` (file/filter/start/stop)
-- **Junos-compatible** 3-step workflow: configure file, configure filter(s), start
-- Per-CLI-session state (not daemon-wide)
-- Subscribes to EventBuffer, filters via named monitorFlowFilter structs
-- Trace output written to `/var/log/<filename>`
-- Precondition errors match Junos: missing file → "Please specify the monitor flow trace file"
-- `show monitor security flow` displays status, file, filter count, per-filter details
-- **Files:** `pkg/cli/monitor.go`, `pkg/cmdtree/tree.go`
+**Commit:** `29fc8d2` — Add remote failover via node parameter
 
-### Feature: `monitor security packet-drop`
-- Real-time streaming of POLICY_DENY and SCREEN_DROP events
-- Filters: source-prefix, destination-prefix, source-port, destination-port, protocol, from-zone, interface
-- `count N` limits output to N entries then returns to prompt
-- Output format: `HH:MM:SS.ffffff src-->dst;proto,iface,reason`
-- Available on both local CLI and remote CLI (via gRPC streaming)
-- **gRPC:** `MonitorPacketDrop` server-streaming RPC
-- **Files:** `pkg/cli/monitor.go`, `pkg/grpcapi/server.go`, `cmd/cli/main.go`, `proto/bpfrx/v1/bpfrx.proto`
+### Problem
+The `request chassis cluster failover redundancy-group N node <N>` command ignored the `node` parameter entirely. It always called `ManualFailover` on the local node, making it secondary. When the user specified `node 0` on node0 (intending to make node0 primary), the command did the opposite — made node0 secondary. Additionally, `ManualFailover` sets a flag that blocks election from promoting the node, so even after peer resignation both nodes could end up secondary.
 
-### Command Tree
-- `monitor security flow file <filename> [size N] [files N] [match REGEX]`
-- `monitor security flow filter <name> [source-prefix X] [destination-prefix X] [protocol X] ...`
-- `monitor security flow start` / `monitor security flow stop`
-- `monitor security packet-drop [source-prefix X] [count N] ...`
-- `show monitor security flow`
+### Goal
+Match Junos semantics for the `node` parameter:
+- `node <local>` → make local node primary (peer must resign)
+- `node <peer>` → make peer primary (local resigns)
+- No node → local resigns (existing behavior)
 
-### Tests
-- 15 unit tests in `pkg/cli/monitor_test.go`
-- Filter matching: src/dst prefix, port, protocol, interface, combined
-- State lifecycle: file config, filter persistence, start preconditions
-- Format helpers: extractIP, extractPort, formatFlowEvent, formatPacketDropEvent
+### Changes
 
-## Sprint: HA Fail-Closed Shutdown (#68)
+#### 1. Add `syncMsgFailover` message type (`pkg/cluster/sync.go`)
+- New sync message type 10 (one byte payload: rgID)
+- `SendFailover(rgID int)` method: sends failover request to peer via fabric TCP connection
+- `OnRemoteFailover func(rgID int)` callback: called when peer requests us to resign
 
-In HA mode, a stopped or crashed daemon must not leave stale BPF programs forwarding traffic
-without session management. This sprint changes the default shutdown behavior:
+#### 2. Add `RequestPeerFailover()` to cluster Manager (`pkg/cluster/cluster.go`)
+- Validates RG exists, local isn't already primary, peer is alive
+- Clears local `ManualFailover` flag and restores weight via `recalcWeight()` — this is critical because `ManualFailover=true` blocks `electRG()` from promoting the node
+- Calls `peerFailoverFn` to send the request via fabric sync
 
-- **Standalone mode (default):** hitless — preserves pinned BPF state for zero-disruption restart
-- **HA mode (default):** fail-closed — clears `rg_active` for all RGs, then tears down all pinned BPF state
-- **HA + hitless-restart:** opt-in via `set chassis cluster hitless-restart` to preserve BPF state
+#### 3. Add `SetPeerFailoverFunc()` to cluster Manager (`pkg/cluster/cluster.go`)
+- Sets the callback used by `RequestPeerFailover` to send messages
+- Wired by daemon: `d.cluster.SetPeerFailoverFunc(d.sessionSync.SendFailover)`
 
-### Implementation
-- `pkg/config/types.go`: `HitlessRestart bool` on `ClusterConfig`
-- `pkg/config/ast.go`: `hitless-restart` schema node under chassis cluster
-- `pkg/config/compiler.go`: compiles `hitless-restart` flag
-- `pkg/daemon/daemon.go`: conditional shutdown — standalone=hitless, HA=teardown, HA+hitless-restart=hitless
+#### 4. Wire `OnRemoteFailover` callback (`pkg/daemon/daemon.go`)
+- When peer requests failover, calls `d.cluster.ManualFailover(rgID)` locally
+- Peer's ManualFailover → weight=0 → heartbeat propagates → local election promotes self
 
-### Tests
-- 3 parser tests: set syntax, hierarchical syntax, default-false verification
-- Verified standalone VM logs "hitless shutdown: preserving BPF state"
-- Known: `SessionSync.Stop()` blocks on WaitGroup in HA mode (pre-existing — sync reconnect loop doesn't exit cleanly within systemd's 20s timeout)
+#### 5. Parse `node <N>` in CLI handlers
+- **Local CLI** (`pkg/cli/cli.go`): compares target node with `c.cluster.NodeID()`, calls `RequestPeerFailover` for local target
+- **Remote CLI** (`cmd/cli/main.go`): passes `:node<N>` suffix in gRPC action string
+- **gRPC server** (`pkg/grpcapi/server.go`): parses `cluster-failover:<rgID>:node<N>`, routes to `RequestPeerFailover` or `ManualFailover`
 
-## Sprint: HA Sync Hardening (#69–#73)
+### Files Modified (6 files, +157/-7)
+| File | Change |
+|------|--------|
+| `pkg/cluster/sync.go` | syncMsgFailover type 10, SendFailover(), OnRemoteFailover |
+| `pkg/cluster/cluster.go` | peerFailoverFn, SetPeerFailoverFunc(), RequestPeerFailover() |
+| `pkg/daemon/daemon.go` | Wire OnRemoteFailover + SetPeerFailoverFunc callbacks |
+| `pkg/cli/cli.go` | Parse `node <N>`, route to RequestPeerFailover for local target |
+| `cmd/cli/main.go` | Parse `node <N>`, pass in gRPC action string |
+| `pkg/grpcapi/server.go` | Parse `:node<N>` suffix, route accordingly |
 
-Five fixes hardening the chassis cluster session sync path against real-world
-failure modes: stale goroutine teardowns, per-RG ownership gaps in bulk sync,
-stale session accumulation, peer fencing on heartbeat loss, and hard-crash
-test coverage.
+### Key Gotchas Discovered
+- **ManualFailover flag blocks election:** `electRG()` returns `electNoChange` when `ManualFailover=true`. Simply asking the peer to resign isn't enough — must also clear the local ManualFailover flag and restore weight, otherwise both nodes end up secondary.
+- **recalcWeight() runs election:** Calling `recalcWeight()` after clearing `ManualFailover` immediately runs election. If the peer has already resigned (weight=0 in heartbeat), election promotes the local node to primary in the same call.
+- **Fabric sync connection may not be ready:** `peerFailoverFn` can be nil if session sync hasn't connected yet. `RequestPeerFailover` checks for this and returns a clear error.
 
-### #69: Connection-Specific Disconnect
+## Sprint AA-1: Active/Active Per-RG Fabric Forwarding (`23f1a3d`)
 
-- **Problem:** `handleDisconnect()` unconditionally closed `s.conn`, but when
-  a new connection (conn B) replaces an old one (conn A) via the accept/connect
-  race, conn A's stale `receiveLoop` goroutine would exit and tear down the
-  active conn B — killing the live sync link.
-- **Fix:** Pass the specific `net.Conn` to `handleDisconnect(conn)`. Only close
-  if `s.conn == conn` (pointer identity check). If the connection has already
-  been replaced, log "ignoring stale disconnect" and return. Updated all callers:
-  `receiveLoop` defer, `sendLoop`, `SendFailover`, `QueueConfig`, `QueueIPsecSA`.
-- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+### Problem
+When RGs are split across nodes (RG1/WAN on fw1, RG2/LAN on fw0), traffic entering fw0's LAN must cross the fabric link to exit on fw1's WAN. Previously, `try_fabric_redirect()` only fired on FIB lookup failure, but `bpf_fib_lookup` succeeded (WAN interface still UP on fw0) yet forwarding failed because the VIP/routes were removed.
 
-### #70: Per-RG BulkSync Ownership Filtering
+### Solution: Per-RG Active State Tracking in BPF
+- **New `rg_active` ARRAY map** (16 entries, key=u32, value=u8): tracks which RGs are locally active
+- **New `rg_id` field** in `iface_zone_value` (renamed from `pad`): links interfaces to their RG
+- **New `check_egress_rg_active()` helper**: looks up egress interface's RG in iface_zone_map, checks rg_active[rg_id]
 
-- **Problem:** `BulkSync()` sent ALL sessions regardless of RG ownership, while
-  the incremental 1s sweep correctly filtered via `ShouldSyncZone()`. This sent
-  unnecessary traffic and could install sessions on a node that doesn't own the
-  corresponding RG in active/active configurations.
-- **Fix:** Skip reverse entries and apply `ShouldSyncZone()` ownership check in
-  both v4 and v6 `BulkSync` iterators, matching the incremental sweep behavior.
-  Log skipped count for debugging.
-- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+### Three bugs fixed:
+1. **RG check inside FIB gen check (root cause):** The RG-active check was nested inside the `fib_gen == fib_gen` cache check. When fib_gen was bumped during failover, the entire block was skipped — RG check never ran. Fix: check RG-active BEFORE fib_gen, using session's cached egress interface.
 
-### #71: Authoritative Stale-Entry Reconciliation
+2. **VRRP resign re-election race:** `ResignRG()` sent priority-0 adverts and entered BACKUP, but the VRRP instance still had priority 200. The ~97ms masterDown timer fired before the debounced priority update (500ms), causing re-election at priority 200. Fix: `ResignRG()` now sets priority=0 BEFORE triggering resign. New `UpdateRGPriority()` immediately restores priority=200 on Primary transition.
 
-- **Problem:** After a hard crash, the recovering node's sessions are stale.
-  BulkSync installs the peer's current sessions but never deletes locally-held
-  sessions that the peer no longer has. These phantom sessions persist until GC
-  timeout, potentially black-holing traffic that matches them.
-- **Fix:** Track all received forward session keys during BulkStart→BulkEnd in
-  per-protocol maps (`bulkRecvV4`/`bulkRecvV6`). On BulkEnd, call
-  `reconcileStaleSessions()` which iterates local sessions in peer-owned zones
-  (where `!ShouldSyncZone`), deletes any not in the received set (forward +
-  reverse entries + dnat_table cleanup).
-- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+3. **VRRP event overriding cluster state:** Brief VRRP MASTER flap during resign race caused `watchVRRPEvents` to call `UpdateRGActive(rg, true)`, overriding the cluster event's `UpdateRGActive(rg, false)`. Fix: in cluster mode, VRRP MASTER event only sets rg_active=true if cluster state agrees (`IsLocalPrimary(rgID)`).
 
-### #72: Peer Fencing on Heartbeat Timeout
+### Files Modified
+| File | Change |
+|------|--------|
+| `bpf/headers/bpfrx_common.h` | `iface_zone_value.pad` → `rg_id`, `MAX_REDUNDANCY_GROUPS 16` |
+| `bpf/headers/bpfrx_maps.h` | New `rg_active` ARRAY map |
+| `bpf/headers/bpfrx_helpers.h` | New `check_egress_rg_active()` helper |
+| `bpf/xdp/xdp_zone.c` | RG check before FIB gen (v4+v6), FIB success path RG check |
+| `pkg/dataplane/types.go` | `IfaceZoneValue.Pad` → `RGID` |
+| `pkg/dataplane/dataplane.go` | `SetZone` + rgID, `UpdateRGActive` interface method |
+| `pkg/dataplane/loader.go` | SetZone RGID field |
+| `pkg/dataplane/loader_ebpf.go` | Register `rg_active` map |
+| `pkg/dataplane/maps.go` | `UpdateRGActive()` + `BumpFIBGeneration()` impl |
+| `pkg/dataplane/compiler.go` | Pass `RedundancyGroup` as rgID to `SetZone` |
+| `pkg/daemon/daemon.go` | watchClusterEvents: immediate priority update; watchVRRPEvents: cluster-authoritative guard |
+| `pkg/vrrp/manager.go` | ResignRG sets priority=0, new UpdateRGPriority() |
+| `pkg/cluster/sync.go` | RG-active update on remote failover events |
+| `dpdk_worker/shared_mem.h` | rg_active array, rg_id field |
+| `dpdk_worker/main.c` | Forwarding check placeholder |
+| `pkg/dataplane/dpdk/dpdk_cgo.go` | UpdateRGActive(), SetZone rgID |
+| `pkg/dataplane/dpdk/dpdk_stub.go` | Stub methods |
+| `test/incus/test-active-active.sh` | Tuned: -P2 streams, 90s duration, 8s initial wait |
 
-- **Problem:** When heartbeat detects peer loss, the surviving node elects itself
-  primary but cannot prevent the failed peer from partially forwarding traffic if
-  its daemon is hung (not crashed). No mechanism existed to tell the peer to
-  stand down.
-- **Fix:** Added `syncMsgFence` message type (type 11). On heartbeat timeout,
-  `handlePeerTimeout()` checks `peerFencing == "disable-rg"` and calls
-  `SendFence()` via the fabric sync connection. The receiver's
-  `OnFenceReceived` callback disables all RGs. Best-effort — if sync is down
-  (likely during real failure), falls back to heartbeat-driven failover. Fence
-  events tracked in cluster history (`EventFence` category). Config:
-  `set chassis cluster peer-fencing disable-rg`.
-- **Files:** `pkg/cluster/cluster.go`, `pkg/cluster/cluster_test.go`,
-  `pkg/cluster/events.go`, `pkg/cluster/sync.go`, `pkg/cmdtree/tree.go`,
-  `pkg/config/ast.go`, `pkg/config/compiler.go`, `pkg/config/types.go`,
-  `pkg/config/parser_test.go`
+### Test Results
+- `make test`: all pass
+- `make test-active-active`: 10/10 pass (iperf3 survives RG split + reunification at ~1.6 Gbps via fabric)
+- `make test-failover`: 14/14 pass (single-active failover unaffected)
+- `make test-connectivity`: 22/23 pass (1 pre-existing)
 
-### #73: Hard-Crash HA Test Coverage
+## Sprint AA-2: New Connections During Active/Active Split (`83c9333`)
 
-- **Test script:** `test/incus/test-ha-crash.sh` (`make test-ha-crash`)
-- **Phase 1 — Hard VM stop:** `incus stop --force` on fw0 (simulates kernel
-  panic), verify fw1 takes over within 2s, new TCP connections work, fw0 rejoins
-  as secondary on restart, manual failover back.
-- **Phase 2 — Daemon stop:** `systemctl stop bpfrxd` on fw0 (tests #68
-  fail-closed behavior), verify fw1 takes over, daemon restart recovery.
-- **Phase 3 — Multi-cycle crash:** 3 cycles (configurable via `CRASH_CYCLES`)
-  of force-stop/restart, tracks per-cycle takeover latency.
-- **Files:** `test/incus/test-ha-crash.sh`, `Makefile`
+### Problem
+AA-1 solved existing connections during per-RG split, but NEW TCP/ICMP connections failed with "no route to host". Two interacting failures:
 
-### Tests
-- `TestHandleDisconnectStaleConn`: verifies stale conn doesn't close active conn
-- `TestBulkSyncRGFiltering`: verifies per-RG ownership filtering in BulkSync
-- `TestBulkSyncSkipsReverseEntries`: verifies reverse sessions excluded
-- `TestReconcileStaleSessions`, `TestReconcileStaleSessionsV6`, `TestReconcileNoBulkInProgress`: stale reconciliation
-- `TestHandlePeerTimeout_FencingDisableRG/Disabled/NoSyncFunc/SendError`: fence path coverage
-- `TestFenceStatus`: fence config + history query
-- `TestChassisClusterPeerFencingSet/Hierarchical/Default`: parser tests for peer-fencing config
-- `test-ha-crash.sh`: 3-phase integration test for hard crash scenarios
+**Forward path (SYN: LAN→internet via fw0):** On fw0 (LAN active, WAN inactive), FIB returned NOT_FWDED (no default route) because FRR withdrew the default route when WAN VIP was removed (next-hop unreachable). Without a route, the packet was dropped instead of fabric-redirected. When fabric redirect did work (FIB failure), the peer's xdp_zone applied wrong security policy because it used fab0's zone ("control") instead of the original ingress zone ("lan").
 
-### Impact
-- Eliminates stale goroutine teardown of active sync connections during reconnect races
-- BulkSync now respects RG ownership (parity with incremental sweep)
-- Stale sessions cleaned up after bulk sync prevents phantom session black-holes
-- Peer fencing provides best-effort fast disable path for hung peers
-- Integration test coverage for hard-crash scenarios beyond clean reboot
+**Return path (SYN-ACK: server→LAN via fw1):** On fw1 (WAN active, LAN inactive), return traffic for 10.0.60.102 hit the default route and escaped via WAN instead of being fabric-redirected to fw0, because the LAN connected route was gone.
 
-## Sprint: HA Restart Connectivity Fix (#74-#75)
+### Solution: Three-Part Fix
 
-### Bug: Transient 10-30s connectivity loss after deploy restart (#74, #75)
-- **Root cause:** `resolveNeighbors()` ran during `applyConfig()` BEFORE VRRP MASTER transition installed RETH VIPs on interfaces. Without VIPs, `RouteGet()` for WAN next-hops failed — no ARP entries primed. Periodic neighbor resolver had 15s blind spot (no initial run at goroutine start)
-- **Fix (`9b04af4`):**
-  1. Skip `resolveNeighbors()` in cluster mode during `applyConfig()` (useless without VIPs)
-  2. Trigger `resolveNeighbors()` on VRRP MASTER event in `watchVRRPEvents()` (VIPs installed)
-  3. Run periodic resolver immediately at goroutine start (eliminate 15s blind spot)
-- **Files:** `pkg/daemon/daemon.go`, `docs/bugs.md`
+**Part 1: Zone-encoded fabric redirect (BPF)**
+- `try_fabric_redirect_with_zone()` helper encodes ingress zone in source MAC: `02:bf:72:fe:00:ZZ`
+- MAC-based encoding (not VLAN) because Linux bridges strip 802.1Q into `skb->vlan_tci` before generic XDP
+- Receiving node detects magic MAC prefix on fabric ingress, uses byte[5] as ingress zone
+- Zone-encoded packets get `routing_table=254` (main table) and go through full pipeline
+- Plain `FABRIC_FWD` packets (existing sessions) skip policy (peer already validated)
 
-### New: Restart connectivity regression test (`test-restart-connectivity.sh`)
-- Restarts bpfrxd on fw0 while continuously pinging through cluster
-- Asserts ≤ 2 pings lost per cycle (VRRP failover/failback accounts for 1-2)
-- Configurable cycles (default 3) for intermittent detection
-- ARP pre-warm between cycles, session clearing, fw0 primary restoration
-- **Files:** `test/incus/test-restart-connectivity.sh`, `Makefile`
+**Part 2: Route fixes for inactive RG subnets**
+- `injectBlackholeRoutes(rgID)` on VRRP BACKUP: `blackhole <subnet> metric 4242` via netlink
+- `removeBlackholeRoutes(rgID)` on VRRP MASTER: cleanup tracked routes
+- FRR blackhole default route (`AD=250`): makes FIB return BLACKHOLE (not NOT_FWDED) when real default is withdrawn, triggering fabric redirect for new connections
 
-### Verification
-- Two consecutive `systemctl restart bpfrxd` with continuous ping: 0% loss (30/30, 40/40)
-- Previously: 10-30s gap (20-60 pings lost per restart)
+**Part 3: BPF pipeline fixes**
+- BLACKHOLE handler session guard: skip immediate fabric redirect when session exists — packet needs NAT reversal via conntrack→NAT→forward path first (pre-routing dnat_table rewrites meta but not packet headers)
+- Two-pass FIB for sessionless FABRIC_FWD: first FIB in VRF (local delivery detection), second in main table (correct data-plane routing)
+- xdp_forward FIB re-check: after NAT reversal in KERNEL_ROUTE path, detect BLACKHOLE and fabric-redirect with correctly rewritten headers
+- `fabric_fwd_info.fib_ifindex`: non-VRF ifindex for zone-decoded FIB lookups (BPF_FIB_LOOKUP_TBID still honors l3mdev rules on VRF slaves)
 
-## Sprint: HA Race Condition Fixes (#76-#80)
+### Key Discoveries
+- **VRF routing table mismatch:** fab0 is in VRF mgmt (table 999). Sessionless FABRIC_FWD traffic used VRF table → FIB SUCCESS with wrong egress (management interface). Two-pass FIB: first in VRF (NOT_FWDED for local), then main table (254) for data-plane routing
+- **SNAT reverse session key via pre-routing NAT:** `dnat_table` lookup at xdp_zone line 285-311 converts SNAT'd destination back to original client IP BEFORE session lookup. BLACKHOLE handler must NOT fabric-redirect before this conversion (packet headers still have SNAT'd addresses)
+- **BPF_FIB_LOOKUP_TBID + VRF:** Even with explicit TBID, kernel honors l3mdev rules when input ifindex belongs to a VRF. Must use non-VRF ifindex for main table lookups
 
-Five race conditions identified through cluster stress testing — concurrent sync writers,
-premature sync-hold timeout, stale config overwrite on reconnect, delayed fabric_fwd
-population, and stale config snapshot in periodic neighbor warmup.
+### Files Modified
+| File | Change |
+|------|--------|
+| `bpf/headers/bpfrx_common.h` | `META_FLAG_FABRIC_FWD`, `FABRIC_ZONE_MAC_MAGIC` |
+| `bpf/headers/bpfrx_helpers.h` | `try_fabric_redirect_with_zone()` helper |
+| `bpf/headers/bpfrx_maps.h` | `fabric_fwd_info.fib_ifindex` field |
+| `bpf/xdp/xdp_zone.c` | Zone-encoded MAC detection, FABRIC_FWD flag, session guard on routing_table override, RG check for new connections, BLACKHOLE session guard, two-pass FIB |
+| `bpf/xdp/xdp_forward.c` | FIB re-check in KERNEL_ROUTE path (BLACKHOLE→fabric redirect) |
+| `pkg/daemon/daemon.go` | Blackhole route injection/removal on VRRP transitions, fib_ifindex population |
+| `pkg/dataplane/types.go` | `FabricFwdInfo.FIBIfindex` field |
+| `pkg/frr/frr.go` | Cluster mode blackhole default route (AD=250) |
+| `dpdk_worker/shared_mem.h` | `FABRIC_ZONE_MAC_MAGIC` constant |
+| `dpdk_worker/zone.c` | Zone-encoded MAC detection placeholder |
+| `test/incus/test-active-active.sh` | Phase 3b (TCP handshake) + 3c (ping) during split |
 
-### #76: Serialize sync writers and fix short-write framing corruption
-- **Problem:** All sync write paths (`sendLoop`, `QueueConfig`, `SendFailover`, `SendFence`,
-  `BulkSync`, keepalives, `QueueIPsecSA`) wrote to the TCP connection concurrently with no
-  serialization. `writeMsg()` used two separate `conn.Write()` calls (header, then payload),
-  widening the interleave window. Under load, receivers saw corrupted framing.
-- **Fix:** Added `writeMu sync.Mutex` to serialize all write paths. Rewrote `writeMsg()` to
-  build a single buffer (header + payload) and issue one `conn.Write()` call — eliminating
-  the split-write hazard entirely.
-- **Tests:** `TestConcurrentSyncWriters` — 10 goroutines (5 session + 5 control) writing 500
-  total messages; receiver validates every frame has correct magic and length.
-- **Files:** `pkg/cluster/sync.go`, `pkg/cluster/sync_test.go`
+### Test Results
+- `make test`: all pass
+- `make test-connectivity`: 25/25 pass
+- `make test-failover`: 14/14 pass
+- `make test-active-active`: 14/14 pass (existing iperf3 + new TCP + new ICMP during split)
 
-### #77: Make sync-hold release condition-driven, not timer-only
-- **Problem:** 10s fixed sync-hold timeout could fire before BulkSync arrived for large
-  session tables. Returning node preempted to MASTER without session state, breaking
-  existing TCP connections. Timeout vs bulk-sync completion was indistinguishable in logs.
-- **Fix:** Increased timeout 10s→30s. Added `syncHoldReason` tracking: `"bulk-sync-complete"`
-  (normal) vs `"timeout-degraded"` (safety timeout). `SyncHoldReason()` accessor for
-  diagnostics.
-- **Tests:** `TestSyncHold_BulkSyncCompleteReason`, updated `TestSyncHold_TimeoutReleasesAutomatically`
-  to verify reason field.
-- **Files:** `pkg/vrrp/manager.go`, `pkg/vrrp/vrrp_test.go`
+## Sprint AA-2b: Active/Active Failback Bug Fixes (`1b62df9`, `4bdbefa`)
 
-### #78: Add authority enforcement to reconnect config sync
-- **Problem:** `handleConfigSync()` accepted config from any peer without RG0 authority
-  check. Reconnecting secondary could push stale config to primary, overwriting
-  authoritative security policies. `OnPeerConnected` pushed config regardless of role.
-- **Fix:** `handleConfigSync()` rejects incoming config when `IsLocalPrimary(0)` is true.
-  `OnPeerConnected` only pushes config if this node is RG0 primary.
+### Problem 1: TCP stream death during active/active failback (`1b62df9`)
+After RG1 failover→failback, 1 of 4 iperf3 streams permanently died (cwnd=1 MSS). Root cause: cluster event handler set `rg_active=true` ~30-60ms BEFORE VRRP MASTER event (which removes blackhole routes). During this window: packets bypass fabric redirect → SNAT applied → hit blackhole → fabric-redirect with SNAT'd headers → peer can't match synced session (original 5-tuple) → dropped.
+
+**Fix:** In cluster event handler, only set `rg_active=true` if VRRP is already MASTER (`rethMasterState[rgID]`). If VRRP is BACKUP (failback case), defer to VRRP MASTER handler (fires after VIP added + blackhole removed).
+
+### Problem 2: SNAT'd KERNEL_ROUTE leak on fabric peer (`4bdbefa`)
+Rapid repeated failover cycles permanently killed 2+ iperf3 streams. During failback, ~30ms window where both nodes have `rg_active=false`. Fabric-forwarded packets hit anti-loop, fell through to `META_FLAG_KERNEL_ROUTE` instead of dropping. SNAT applied → kernel received SNAT'd packet in fabric VRF → RSTs/duplicates compound per cycle.
+
+**Fix (BPF):** Drop `META_FLAG_FABRIC_FWD` packets instead of KERNEL_ROUTE fallback in xdp_zone.c (post-FIB RG check + BLACKHOLE handler) and xdp_forward.c (KERNEL_ROUTE XDP_PASS).
+**Fix (Go):** Always `BumpFIBGeneration()` on cluster Primary transition, even when deferring rg_active to VRRP MASTER.
+
+### Problem 3: Fabric transit traffic dropped — vrf-mgmt FIB mismatch (`4bdbefa`)
+Peer NAT-reverses traffic and plain-fabric-redirects it for local delivery. Traffic arrives on fab0 (VRF mgmt). Without a session match, `routing_table=254` override doesn't apply → FIB uses vrf-mgmt table → UNREACHABLE. Additionally, TC conntrack has no session → TC_ACT_SHOT.
+
+**Fix (BPF xdp_zone):** In BLACKHOLE/UNREACHABLE handler, after fabric redirect fails (anti-loop), check `META_FLAG_FABRIC_FWD` and re-FIB in main table (tbid=254) using `fabric_fwd_info.fib_ifindex` (non-VRF ifindex).
+**Fix (BPF tc_conntrack):** Fabric transit bypass — packets from fabric peer skip TC conntrack and tail-call directly to `TC_PROG_FORWARD`.
+**Fix (NO_NEIGH):** Zone-encoded redirect for new connections in NO_NEIGH handler preserves ingress zone for policy/SNAT on peer.
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `bpf/xdp/xdp_zone.c` | BLACKHOLE session guard, fabric transit re-FIB, NO_NEIGH zone-encoded redirect, FABRIC_FWD drop instead of KERNEL_ROUTE |
+| `bpf/xdp/xdp_forward.c` | FABRIC_FWD drop guard in KERNEL_ROUTE XDP_PASS path |
+| `bpf/tc/tc_conntrack.c` | Fabric transit bypass to TC_PROG_FORWARD |
+| `pkg/daemon/daemon.go` | Deferred rg_active, rethMasterState tracking, BumpFIBGeneration on Primary |
+
+## Sprint VRRP-Hardening: IPv6 + Reliability Audit (2026-02-28)
+
+### Summary
+Code audit of VRRP/HA paths found 8 latent bugs — 1 HIGH (IPv6 split-brain), 5 MEDIUM, 2 LOW. All preventive fixes, none triggered in production. Focus areas: IPv6 VRRP correctness, daemon event handling, cluster monitor reliability.
+
+### Fixes
+
+1. **IPv6 tie-break in handleMasterRx (HIGH):** `.To4()` returned nil for IPv6 → `bytes.Compare(nil,nil)==0` → no tie-break → split-brain. Fixed: dual address-family comparison using `localIPv6`
+2. **Non-RETH VRRP guard (MEDIUM):** Standalone VRRP (GroupID<100) produced negative RG IDs → phantom BPF entries. Fixed: `isRethVRID()` guard + `rethVRIDBase` constant
+3. **IPv6 VRRP fallback receiver (MEDIUM):** Raw socket fallback was IPv4-only. Added `receiverIPv6()` goroutine + degradation warning
+4. **Reconciliation coverage + startup (MEDIUM):** Only iterated `d.rgStates`; no immediate run. Fixed: scan 3 sources (rgStates + cluster groups + VRRP instances), immediate first reconciliation
+5. **VRRP event drop logging (LOW):** Silent drops on full channel. Fixed: `slog.Warn` (suppressed during shutdown), buffer 64→256
+6. **IPv6 advert checksum/Zone (MEDIUM):** Nil srcIP → bad checksum; Zone on multicast dst → EINVAL. Fixed: warn on nil resolve, removed Zone
+7. **Monitor poll() data race (MEDIUM):** localStatuses written outside lock. Fixed: local slice + swap under lock
+8. **Monitor netlink fd leak (MEDIUM):** New handle per poll cycle. Fixed: `cachedNlHandle` + `Stop()` close
+9. **IPv6 IP monitoring (LOW):** Hardcoded udp4/ICMPv4. Fixed: detect AF, `icmpDialer(network string)`
+
+### Key Patterns Added
+- `isRethVRID(vrid int) bool` — guard for RETH vs standalone VRRP (GroupID >= 100)
+- `rethVRIDBase = 100` — constant replacing magic number
+- VRRP event channel buffer: 64→256 (rapid failover with multiple RETHs)
+- IPv6 VRRP destination: don't set Zone when socket has `IPV6_MULTICAST_IF`
+- Monitor `cachedNlHandle` pattern: create on first use, close in `Stop()`
+- `pollInterfaceMonitors()` returns slice (no shared mutable field)
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `pkg/vrrp/instance.go` | IPv6 tie-break, receiverIPv6(), emitEvent warn, sendPacketIPv6 nil guard + Zone removal |
+| `pkg/vrrp/manager.go` | Event channel buffer 64→256 |
+| `pkg/vrrp/vrrp_test.go` | 9 new tests (IPv6 tie-break, receiverIPv6, emitEvent, sendPacketIPv6) |
+| `pkg/daemon/daemon.go` | isRethVRID guard, rethVRIDBase, reconciliation 3-source scan, immediate first reconcile |
+| `pkg/daemon/per_rg_test.go` | 4 new tests (isRethVRID, non-RETH pollution, reconcile cluster/VRRP discovery) |
+| `pkg/cluster/monitor.go` | poll() race fix, cachedNlHandle, IPv6 ICMP probes, icmpDialer(network) |
+| `pkg/cluster/monitor_test.go` | 4 new tests (IPv6 monitoring, IPv4 network, invalid addr, concurrent race) |
+
+### Test Results
+- 817 lines added across 7 files (no files deleted)
+- `go build ./...`: pass
+- `go test ./pkg/vrrp/... -count=1`: pass
+- `go test ./pkg/daemon/... -count=1`: pass
+- `go test ./pkg/cluster/... -count=1`: pass
+
+## Sprint SNAT-Interface: Egress IP Selection Fix (2026-02-28)
+
+### Summary
+SNAT `interface` mode was broken on RETH interfaces with multiple VLAN sub-interfaces. The compiler built a single NAT pool from all RETH unit addresses, and BPF allocated from it blindly without considering the actual egress interface. This caused packets to be SNAT'd with the wrong VLAN sub-interface IP (e.g., using VLAN 50's IP for traffic egressing VLAN 100).
+
+### Root Cause
+The interface-mode SNAT compiler picked a single interface from the to-zone and collected ALL RETH unit addresses into one pool. At runtime, `nat_pool_alloc_v4()` selected from the pool without considering `meta->fwd_ifindex` or `meta->egress_vlan_id`. With multiple VLAN sub-interfaces (e.g., wan0.50 at 172.16.50.6 and wan0.100 at 172.16.100.6), the wrong IP was used.
+
+### Fix
+New `snat_egress_ips` BPF HASH map keyed by `(ifindex, vlan_id)` maps to per-interface SNAT IP. The compiler iterates ALL interfaces in the to-zone and populates the map. New BPF functions `nat_pool_alloc_iface_v4/v6()` look up the egress IP from `meta->fwd_ifindex` + `meta->egress_vlan_id`, falling back to pool-based allocation on miss.
+
+Secondary fix: NAT64 source pool auto-assignment. Named pools defined in source NAT config but only referenced from the nat64 section were never assigned pool IDs, causing compile failure and preventing XDP attachment.
+
+### Key Patterns
+- **BPF function arg limit:** BPF functions max 5 args. Initial implementation passed 6 (including ifindex and vlan_id separately). Fixed by passing `struct pkt_meta *meta` pointer instead
+- **`snat_egress_ips` map:** HASH(256), key `snat_egress_key { __u32 ifindex; __u16 vlan_id; }`, value `snat_egress_value { __be32 ip4; struct in6_addr ip6; }`
+- **`interface_mode` flag:** Added to `nat_pool_config` struct — BPF checks this to dispatch to `nat_pool_alloc_iface_v4/v6()` instead of regular pool allocation
+- **NAT64 pool auto-assignment:** `NextPoolID` tracking ensures pools referenced only by NAT64 get IDs
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `bpf/headers/bpfrx_common.h` | Add `interface_mode` to nat_pool_config, snat_egress_key/value structs |
+| `bpf/headers/bpfrx_maps.h` | Add `snat_egress_ips` HASH map |
+| `bpf/xdp/xdp_policy.c` | Add `nat_pool_alloc_iface_v4/v6()`, update 3 SNAT call sites |
+| `pkg/dataplane/types.go` | Rename Pad2→InterfaceMode, add SNATEgressKey/Value Go types |
+| `pkg/dataplane/dataplane.go` | Add SetSNATEgressIP/ClearSNATEgressIPs to DataPlane interface |
+| `pkg/dataplane/maps.go` | Implement eBPF map accessors for snat_egress_ips |
+| `pkg/dataplane/loader_ebpf.go` | Register snat_egress_ips map + replacements |
+| `pkg/dataplane/compiler.go` | Iterate all to-zone interfaces, populate egress map, set InterfaceMode=1, NAT64 pool auto-assign |
+| `pkg/dataplane/dpdk/dpdk_cgo.go` | DPDK stub for SetSNATEgressIP/ClearSNATEgressIPs |
+| `pkg/dataplane/dpdk/dpdk_stub.go` | DPDK stub for SetSNATEgressIP/ClearSNATEgressIPs |
+
+### Test Results
+- 555 lines added, 30 deleted across 38 files (includes bpf2go regenerated bindings)
+- `make test`: all pass
+- `make test-failover`: 14/14 pass, 8.51 Gbps throughput
+
+## Sprint ha-fixes-2: HA Lifecycle & Reconciliation Hardening (2026-03-01)
+
+5 bugs fixed addressing HA daemon lifecycle, reconciliation, and runtime reconfiguration gaps.
+
+### Fix #84: VRRP watcher daemon context (FIXED)
+- `watchVRRPEvents` used `context.Background()` — outlived daemon shutdown
+- Changed to daemon `ctx` + shutdown waitgroup; VRRP manager closes events channel on `Stop()`
+- **Files:** `pkg/daemon/daemon.go`, `pkg/vrrp/manager.go`
+
+### Fix #92: Stale peer RG entries in heartbeat (FIXED)
+- `handlePeerHeartbeat()` never pruned missing RGs — stale entries persisted forever
+- Rebuild `peerGroups` from scratch each heartbeat (authoritative map replacement)
+- **Files:** `pkg/cluster/cluster.go`
+
+### Fix #86 + #93: reconcileRGState repairs VRRP control + RA/DHCP services (FIXED)
+- `reconcileRGState()` only repaired `rg_active` + blackhole routes, not VRRP posture or per-RG services
+- Extended to: (1) delay-based VRRP posture correction (10s sustained mismatch before acting), resign when cluster says Secondary but VRRP is MASTER; (2) apply/clear per-RG RA/DHCP services based on active state
+- **Critical fix (`8b288f4`):** Posture reconciliation must use `UpdateRGPriority()` NOT `ForceRGMaster()` — ForceRGMaster overrides `preempt=false`, causing the reconcile loop to preempt VRRP on returning nodes after reboot. Only `watchClusterEvents` Secondary→Primary transition may call ForceRGMaster
+- Added no-VRRP-instances guard to `CheckVRRPPosture()` — prevents infinite log spam when member interface missing after reboot
+- **Files:** `pkg/daemon/daemon.go` (reconcileRGState), `pkg/daemon/rg_state.go` (CheckVRRPPosture, vrrpPostureDelay)
+
+### Fix #87: HA endpoints runtime reconfiguration (FIXED)
+- `startClusterComms()` was one-shot at boot — config changes to control/fabric settings were ignored
+- Config apply path now detects HA transport config changes, cancels existing comms context, restarts with new settings
 - **Files:** `pkg/daemon/daemon.go`
 
-### #79: Make fabric_fwd population immediate with active ARP probe
-- **Problem:** `populateFabricFwd()` used passive 2s polling (30 attempts, 60s total) with
-  no ARP probing. After reboot, kernel ARP table is empty — fabric forwarding map could
-  take the full 60s to populate. Synced sessions silently dropped during this window.
-- **Fix:** Fast retry (10×500ms with immediate first attempt). Added `probeFabricNeighbor()`
-  which runs `ping -c1` to trigger kernel ARP (not `arping` — raw sockets don't populate
-  ARP with XDP attached). Falls back to 30s periodic refresh if fast retries fail.
+### Key Patterns Learned
+- **Reconciliation as safety net:** Event-driven state machines MUST have periodic reconciliation to repair drift from dropped events
+- **Reconciliation must not override design intent:** Posture reconciliation should re-send priority updates, NOT force preemption — ForceRGMaster overrides `preempt=false` config, causing unintended VRRP takeover after reboot. Only explicit cluster operations (failover reset) should call ForceRGMaster
+- **Authoritative state rebuild:** When receiving peer heartbeats, rebuild state from scratch rather than incremental update to prevent stale entries
+- **Context lifecycle:** Goroutines watching daemon events MUST use daemon context and be tracked in shutdown waitgroup
+- **Runtime reconfigurability:** One-shot initialization of cluster comms is insufficient — must detect config changes and restart endpoints
+
+## Sprint CC-10: HA Hardening #98-#102
+
+### Fix #98: Neighbor warmup Junos name resolution (FIXED `3425fee`)
+- `resolveNeighbors()` → `addByName()` → `LinkByName()` failed silently on Junos names
+- Added `resolveJunosIfName()`: `cfg.ResolveReth()` + `config.LinuxIfName()`
 - **Files:** `pkg/daemon/daemon.go`
 
-### #80: Fix periodic neighbor warmup to use current active config
-- **Problem:** `runPeriodicNeighborResolution()` captured the config at goroutine launch
-  time. After `commit` applied new configs with new routes/interfaces, the periodic resolver
-  continued using the startup snapshot — new next-hops never probed, causing NO_NEIGH drops.
-- **Fix:** Changed to fetch `d.store.ActiveConfig()` on each 15s tick instead of using a
-  captured parameter. Added nil guard for early startup.
-- **Files:** `pkg/daemon/daemon.go`
+### Fix #99: Sync protocol full-write loop (FIXED `3b63d6b`)
+- TCP `Write()` can short-write under backpressure → truncated sync frames
+- Added `writeFull()` helper that loops until all bytes sent
+- **Files:** `pkg/cluster/sync.go`
 
-### Tests
-- `TestConcurrentSyncWriters`: 10 concurrent writers, 500 messages, validates framing integrity
-- `TestSyncHold_BulkSyncCompleteReason`: verifies bulk-sync-complete reason tracking
-- `TestSyncHold_TimeoutReleasesAutomatically`: updated to verify timeout-degraded reason
-- Existing HA integration tests (`make test-failover`, `make test-ha-crash`, `make test-restart-connectivity`)
+### Fix #100: Heartbeat buffer + monitor cap (FIXED `85a79e4`)
+- `maxHeartbeatSize` 512→1472 (safe UDP MTU), marshal caps at limit (truncates monitors, preserves RGs), unmarshal handles truncation gracefully
+- **Files:** `pkg/cluster/heartbeat.go`
 
-### Impact
-- Eliminates sync framing corruption under concurrent write load (session + control messages)
-- Prevents premature VRRP preemption before session state is transferred
-- Prevents stale config overwrite from reconnecting secondary nodes
-- Reduces fabric_fwd population time from up to 60s to <5s after reboot
-- Neighbor warmup always uses current config — no stale snapshot drift
+### Fix #101: Context-aware posture delay (FIXED `d12694a`)
+- Startup delay 10s (first 30s), steady-state 2s. Added `startedAt` field to `rgStateMachine`
+- Reduces real mismatch correction from 10-12s to 2-4s
+- **Files:** `pkg/daemon/rg_state.go`
 
-## Sprint VSRX-PARITY: vSRX Configuration Compatibility
+### Fix #102: BPF watchdog fail-closed (FIXED `00de701`)
+- `ha_watchdog` BPF ARRAY map, Go writes every 500ms, BPF checks freshness in `check_egress_rg_active()` — >2s stale = inactive
+- Ensures forwarding stops within bounded window after SIGKILL/panic
+- **Files:** `bpf/headers/bpfrx_maps.h`, `bpf/headers/bpfrx_helpers.h`, `pkg/dataplane/maps.go`, `pkg/daemon/daemon.go`
 
-Closes feature gaps identified by comparing bpfrx against a production vSRX configuration.
-Focus areas: config groups/templates, NAT edge cases, routing enhancements, tunnel types,
-firewall filter fixes, and cluster config parity.
+### Fix #103: Per-RG readiness gate for startup takeover (FIXED `91a57cf`)
+- Per-RG readiness contract: interfaces exist+up AND VRRP instances running
+- Election blocks promotion until readiness sustained for `takeover-hold-time` (default 3s)
+- Monitor's `RGInterfaceReady()` treats missing interfaces as not-ready (was silently skipped)
+- VRRP manager's `RGVRRPReady()` checks per-RG instance existence
+- Daemon reconcile loop wires readiness into cluster manager
+- Already-primary nodes never demoted by readiness gate
+- Status display shows readiness state and reasons
+- **Files:** `pkg/cluster/cluster.go`, `pkg/cluster/election.go`, `pkg/cluster/monitor.go`, `pkg/vrrp/manager.go`, `pkg/daemon/daemon.go`, `pkg/config/`
 
-### General-Purpose Groups/Apply-Groups
-- **`groups { name { ... } }`**: Top-level group definitions parsed into AST — supports arbitrary config subtrees as reusable templates
-- **`apply-groups [ group1 group2 ]`**: Apply group inheritance at any hierarchy level — merges group subtree into current position
-- **Inheritance priority**: Later groups override earlier; explicit config overrides groups
-- **`apply-groups-except`**: Exclude specific groups from inheritance
-- **Template patterns**: Policy templates (default-deny-template), outbound policy groups (default-internet-out), per-node groups (node0/node1)
-- Extends existing `ExpandGroupsWithVars()` / `CompileConfigForNode()` infrastructure
+## Issue #104: HA Same-L2 Strict Single-Owner VIP Mode
 
-### NAT Feature Verification & Fixes
-- **`source-nat { off; }`**: Explicit NAT bypass in SNAT rules — verified parsing and compilation
-- **`source-address-name` in DNAT rules**: Address book name references in DNAT match conditions — verified/fixed resolution
-- **DNAT `protocol` match**: Protocol-only matching (ICMP, GRE) without ports — verified BPF path
-- **DNAT pool with port**: Port rewriting in DNAT pools (e.g., `address x.x.x.x/32 port 22`) — verified
-- **Multiple `destination-port`**: Multi-port matching in DNAT rules (e.g., `destination-port { 34201; 32401; }`) — verified
+### Problem
+In same-L2 HA deployments (both nodes on same broadcast domain), VRRP failover creates a window where **both** nodes send GARP/NA for the same VIPs. The default activation rule `rg_active = clusterPri || anyVrrpMaster` means the cluster primary immediately activates when heartbeat elects it, even before VRRP state settles. This causes:
+1. **Duplicate GARP/NA storms** — both nodes announce ownership of VIPs simultaneously
+2. **ARP table thrashing** on upstream switches/routers
+3. **Brief dual-active window** where both nodes forward traffic for the same VIPs
 
-### Firewall Filter & Policy Verification
-- **`source-prefix-list { name except; }`**: Inverted prefix-list matching in lo0 filters — verified parsing and BPF compilation
-- **`policy-statement` → FRR route-map**: BGP export policies with `from protocol direct; route-filter` terms compile to FRR route-maps
-- **`prefix-list` in policy-options**: Used in both firewall filters and route policies — verified
-- **`forwarding-table { export load-balancing-policy; }`**: ECMP consistent-hash — verified mapping
-- **IPv6 `traffic-class` matching**: `family inet6 { filter { input ...; } }` with `traffic-class` as IPv6 DSCP match — verified
+### Solution: `strict-vip-ownership` per-RG knob
 
-### Per-Interface NetFlow Sampling & Instance-Type Forwarding
-- **Per-interface sampling**: `family inet { sampling { input; output; } }` and `family inet6 { sampling { input; output; } }` parsed per unit
-- **Forwarding-options sampling instances**: `forwarding-options { sampling { instance name { input { rate N; } family inet { output { flow-server ... } inline-jflow { source-address ... } } } } }` — links interface sampling config to flow export instance
-- **`instance-type forwarding` VRF**: Forwarding-only VRF with routes but no interface binding — creates routing table and `ip rule` entry without interface assignment
+**Config syntax:**
+```
+set chassis cluster redundancy-group 1 strict-vip-ownership
+```
 
-### Cluster Config Enhancements
-- **`gratuitous-arp-count N` per RG**: Configurable GARP burst count per redundancy-group (was fixed). Parsed, compiled, and used in VRRP becomeMaster() GARP burst
-- **`reth-count N`**: Parsed (informational, bpfrx auto-detects RETH count)
-- **`dad-disable`**: Disable IPv6 Duplicate Address Detection under `family inet6` — compiled to networkd config (`IPv6DuplicateAddressDetection=0`)
-- **Nested address-set resolution**: Recursive address-set references (e.g., `deny-plex-blocks` → `tmobile-blocks` → `tmobile-v4-blocks`) — verified compiler resolves recursively
-- **`address primary/preferred` modifiers**: Parse and apply `primary` and `preferred` address sub-options for source address selection
+**Behavioral changes when enabled:**
+1. **VRRP-only activation** — `rg_active = anyVrrpMaster` (removes `clusterPri ||` from activation rule). Only the VRRP MASTER node activates for that RG, eliminating the dual-active window
+2. **GARP suppression on secondary** — `SetGARPSuppression(rgID, !isPrimary)` toggles GARP/NA suppression based on cluster role. Secondary nodes never send GARP even if they briefly become VRRP MASTER during transition
+3. **GARP epoch dedup** — `garpEpoch/lastGARPEpoch` atomic counters prevent duplicate GARP bursts from `ReconcileVIPs()` calls within the same BACKUP→MASTER transition
+4. **500ms GARP dampening** — `lastGARPTime` atomic Int64 tracks last send; skips if <500ms elapsed. Prevents storms during rapid VRRP flaps
 
-### DHCPv6 Prefix Delegation (IA-PD)
-- **`client-ia-type ia-pd`**: DHCPv6 client extended to request IA_PD (option 25) alongside IA_NA
-- **`prefix-delegating`**: `preferred-prefix-length` and `sub-prefix-length` sub-options parsed and compiled
-- **`client-identifier duid-type duid-ll`**: DUID-LL client identifier type support
-- **`update-router-advertisement`**: When PD prefix received, update RA sender with delegated prefix on specified interface
-- **`req-option dns-server`**: DNS server option request in DHCPv6 solicitation
+### Implementation (4 commits)
 
-### IPIP Tunnels & Per-Unit Tunnel Config
-- **`ip-X/X/X` interfaces**: IPIP tunnel mode (protocol 4) alongside existing GRE — auto-detected from interface name prefix
-- **IPIP over IPv6**: IPv6 endpoints use `ip6tnl` with `IPPROTO_IPIP` (vs `iptun` for IPv4)
-- **Per-unit tunnel config**: Each unit under `gr-X/X/X` or `ip-X/X/X` can have independent `tunnel { source/destination/routing-instance }` — unit 0 → base Linux name, unit N>0 → `<base>uN`
-- **`routing-instance { destination <VRF>; }`**: Routes tunnel outer packets through a specific VRF — creates tunnel inside the target VRF
-- **`TunnelNameMap()`**: Maps Junos interface refs (e.g., `gr-0/0/0.1`) to Linux tunnel names (e.g., `gr-0-0-0u1`)
-- **Per-unit tunnel in dataplane compiler**: `resolveInterfaceRef()` resolves per-unit tunnel names; `compileZones()` sets `IfaceFlagTunnel` for per-unit tunnels; `daemonOwned` includes per-unit tunnel interfaces
-- **AST schema**: `tunnel` under unit expanded with full property children (source, destination, mode, key, ttl, keepalive, routing-instance)
-- **GRE over IPv6**: `Gretun.Type()` auto-detects IPv6 endpoints → returns "ip6gre"
+#### Part 1/4: Config knob (`05f5208`)
+- `StrictVIPOwnership bool` field in `RedundancyGroup` config type
+- Parser: `strict-vip-ownership` keyword in chassis cluster redundancy-group stanza
+- **Files:** `pkg/config/types.go`, `pkg/config/compiler.go`
 
-### Qualified Next-Hop with Interface & RIB inet6.0
-- **`qualified-next-hop <addr> { interface <name>; }`**: Link-local IPv6 next-hops require interface specification — parsed from both hierarchical and flat `set` syntax
-- **FRR output**: `ipv6 route ::/0 fe80::addr <interface> [vrf <name>]` — interface appended after next-hop address
-- **`rib <instance>.inet6.0 { static { route ... } }`**: Per-VRF IPv6 static routes — suffix match `strings.HasSuffix(ribName, ".inet6.0")` handles both global and per-instance forms
-- **`Inet6StaticRoutes` on RoutingInstanceConfig**: Separate field for per-instance IPv6 routes, wired through daemon → FRR `InstanceConfig`
-- **`next-table` inet6**: Verified `next-table` works for both `inet.0` and `inet6.0` address families
+#### Part 2/4: GARP suppression and epoch tracking (`68d5636`)
+- `vrrpInstance`: `suppressGARP atomic.Bool`, `garpEpoch atomic.Uint64`, `lastGARPEpoch atomic.Uint64`
+- `becomeMaster()`: increments `garpEpoch`, checks `suppressGARP` before starting GARP goroutine
+- `sendGARP()`: epoch dedup — skips if `lastGARPEpoch == garpEpoch`
+- `ReconcileVIPs()`: respects `suppressGARP` flag
+- `Manager.SetGARPSuppression(rgID, suppress)`: toggles suppression for all instances in an RG
+- **Files:** `pkg/vrrp/instance.go`, `pkg/vrrp/manager.go`
 
+#### Part 3/4: Daemon activation wiring (`ab6b272`)
+- `rgStateMachine`: `strictVIPOwnership bool` field with `SetStrictVIPOwnership()`/`IsStrictVIPOwnership()` accessors
+- `reconcileLocked()`: in strict mode, `desired = anyMasterLocked()` (VRRP-only); default: `desired = clusterPri || anyMasterLocked()`
+- `startClusterComms()`: propagates `StrictVIPOwnership` from config to RG state machines
+- `watchClusterEvents()`: toggles GARP suppression via `vrrpMgr.SetGARPSuppression(ev.GroupID, !isPrimary)` when strict mode enabled
+- **Files:** `pkg/daemon/daemon.go`, `pkg/daemon/rg_state.go`
+
+#### Part 4/4: GARP dampening (`a2e826b`)
+- `vrrpInstance`: `lastGARPTime atomic.Int64` (Unix nanos)
+- `sendGARP()`: checks `time.Since(lastGARPTime) < 500ms` → skip
+- Stored after successful GARP burst completion
+- Two-layer protection: epoch (same transition) + dampening (across transitions)
+- **Files:** `pkg/vrrp/instance.go`
+
+#### Tests (`3f25d1b`)
+- Unit tests for strict-vip-ownership: config parsing, rg_state machine strict mode, GARP suppression manager method, epoch dedup, dampening
+- **Files:** `pkg/config/compiler_test.go`, `pkg/daemon/rg_state_test.go`, `pkg/vrrp/vrrp_test.go`
+
+### Key Design Decisions
+- **Per-RG granularity** — strict mode is per-redundancy-group, not global. Different RGs can have different activation semantics
+- **Atomic fields for lockless hot path** — `suppressGARP`, `garpEpoch`, `lastGARPTime` are all atomics, keeping the VRRP fast path lock-free
+- **Epoch + dampening = two-layer dedup** — epoch handles reconciliation-triggered duplicates (same transition), dampening handles rapid flap scenarios (different transitions)
+- **Suppression toggled by cluster role, not VRRP state** — the cluster event handler (heartbeat-derived) controls suppression, while VRRP controls activation. This decouples the two state machines cleanly
+
+## Sprint Infra: Interface Naming Refactor + DNS + Fabric Overlay (2026-03-05..06)
+
+### Refactor: Move interface naming into bpfrxd daemon (`e481325`)
+
+Ported PCI enumeration and vSRX-style naming (fxp0, em0, ge-{FPC}-0-{PORT}) from the external `bpfrx-link-setup` bash script into the daemon itself (`pkg/daemon/linksetup.go`). The daemon now calls `enumerateAndRenameInterfaces()` early in `Run()`, before routing/networkd managers and BPF load. This eliminates cascading rename conflicts, DHCP bootstrap breakage, and duplicate interface management logic.
+
+**Key changes:**
+- `linksetup.go`: 318-line Go implementation of PCI enumeration, sorting by bus address, vSRX name assignment
+- Fabric member renames (ge-X-0-Y → fab0/fab1) remain config-driven in `applyConfig`
+- Standalone: no node-id → fxp0 + ge-0-0-X (no em0); Cluster: node-id 0/1 → fxp0 + em0 + ge-{0,7}-0-X
+- Test env scripts simplified — removed ~400 lines of bash interface management
+
+**Files:** `pkg/daemon/linksetup.go` (new), `pkg/daemon/daemon.go`, `pkg/config/compiler.go`, `pkg/config/types.go`, `pkg/config/parser_test.go`, `pkg/dataplane/compiler.go`, `pkg/networkd/networkd.go`, `pkg/networkd/networkd_test.go`, `test/incus/setup.sh`, `test/incus/cluster-setup.sh`, `test/incus/bpfrx-test.conf`
+
+### Refactor: systemd-resolved DNS drop-in (`11cdf8a`)
+
+Replaced direct `/etc/resolv.conf` writes with `/etc/systemd/resolved.conf.d/bpfrx.conf` drop-in + `systemctl restart systemd-resolved`. Avoids conflict with systemd-resolved management of resolv.conf.
+
+**Files:** `pkg/daemon/daemon.go`
+
+### Feat: Fabric IPVLAN overlay + single-fabric-per-node (`97c0424`)
+
+Replaced fabric interface rename (ge-0-0-0 → fab0) with IPVLAN L2 overlay. Physical member keeps its ge-X-0-Y name for XDP/TC attachment; fab0/fab1 are IPVLAN interfaces for IP addressing and session sync. This avoids link down/up cycling during rename and preserves PCI identity.
+
+**Key design:**
+- Single fabric per node: fab0 on node0 (ge-0-0-0), fab1 on node1 (ge-7-0-0)
+- Auto-detect picks local fabric only (not both), fixing blank FabricPeerAddress on node1
+- Cluster NIC layout simplified: removed bpfrx-fabric1 network (single fabric link)
+- IPVLAN L2 mode = same broadcast domain as parent, no separate routing needed
+
+**Files:** `pkg/daemon/daemon.go`, `pkg/config/compiler.go`, `pkg/dataplane/compiler.go`, `test/incus/cluster-setup.sh`, test scripts
+
+**Tested:** make test (all pass), make test-failover (14/14 pass, 7.49 Gbps)
+
+### Fix: Embedded ICMP fabric redirect after NAT rewrite (`7c8f243`)
+
+In split-RG cluster, ICMP Time Exceeded from transit routers arrives on the WAN node but must reach the LAN host on the peer node. `handle_embedded_icmp_v4/v6()` was calling `try_fabric_redirect()` BEFORE NAT rewrite — the peer received packets with SNAT'd embedded headers and couldn't match them to any session.
+
+**Fix:** When FIB fails (UNREACHABLE/BLACKHOLE) for the original client, set `META_FLAG_KERNEL_ROUTE` instead of immediate fabric redirect. `xdp_forward`'s KERNEL_ROUTE path re-FIBs using post-NAT packet headers (outer dst rewritten to original client IP), detects UNREACHABLE, and fabric-redirects with correct headers. Also changed `meta_flags` assignment from `=` to `|=` to preserve KERNEL_ROUTE flag when setting `META_FLAG_EMBEDDED_ICMP`.
+
+**Files:** `bpf/xdp/xdp_conntrack.c`
+**Tested:** split-RG MTR shows all intermediate hops (was 100% loss), make test-failover 14/14 pass at 7.86 Gbps
+
+### Fix: Embedded ICMP handler NOT_FWDED local delivery (`7158942`)
+
+The embedded ICMP handler treated `NOT_FWDED` (BPF_FIB_LKUP_RET_NOT_FWDED) as an error, but this return code means the destination is local (the firewall itself). For ICMP TE/Destination Unreachable containing packets originally destined for the firewall, this is the correct behavior — deliver locally.
+
+**Files:** `bpf/xdp/xdp_conntrack.c`
+
+## Sprint CC-11: Fabric Health & Reliability (#121-#126) (2026-03-06)
+
+### Summary
+Six improvements to fabric forwarding reliability in chassis cluster HA deployments. Focus: stale fabric_fwd entry clearing when paths die, oper-state validation before programming, event-driven fabric refresh via netlink, session sync connection stability with dual fabrics, gRPC/monitor failover across dual fabric addresses, and DPDK fabric redirect limitation documentation.
+
+### Fix #121+#122: Clear stale fabric_fwd entries + oper-state check (FIXED `e02ceeb`)
+
+**Problem (#121):** When a fabric link or neighbor fails, the `fabric_fwd` BPF map retains stale entries (MAC, ifindex, peer IP). BPF `try_fabric_redirect()` uses these entries to redirect packets to a dead path → silent packet drops until the 30s refresh ticker runs.
+
+**Problem (#122):** `populateFabricFwd()` programs `fabric_fwd` entries without checking the fabric interface's operational state. If the interface exists but is operationally DOWN (cable unplugged, peer VM stopped), BPF redirects to a non-functional path.
+
+**Fix (#121):** When fabric link goes DOWN or neighbor entry disappears, write zeroed `FabricFwdInfo` to the BPF map. This causes `try_fabric_redirect()` to fail the ifindex check (`ff->ifindex == 0`) and skip the dead path immediately.
+
+**Fix (#122):** Before programming `fabric_fwd`, check `link.Attrs().OperState` — reject non-UP interfaces. Combined with #121's zeroing, this ensures only healthy paths are ever programmed.
+
+**Key pattern:** Zeroing a BPF map entry is idempotent and cheaper than deleting+re-adding. BPF code already handles zero ifindex as "no entry" — no C changes needed.
+
+### Fix #123: Dual-fabric session sync connection flapping (FIXED `1358477`)
+
+**Problem:** With dual fabrics (fab0 + fab1), the session sync `connectLoop()` rotates between fabric addresses on failure. When one fabric is healthy and the other is down, this causes unnecessary disconnect/reconnect cycles on the working connection — each rotation attempt tears down the existing connection before trying the next address.
+
+**Fix:** Track per-fabric connection state (`fab0Connected`, `fab1Connected`). Prefer fab0 as primary connection. Only attempt secondary (fab1) when primary is down. Don't tear down a working connection to try the other address. On primary recovery, migrate back to fab0 (preferred path) gracefully.
+
+**Key pattern:** Connection affinity with graceful migration — prefer one path but tolerate degraded operation on the backup. Avoid the "grass is greener" anti-pattern where a working connection is killed to try a potentially-better one.
+
+### Fix #124: Event-driven fabric refresh via netlink (FIXED `e02ceeb`)
+
+**Problem:** Fabric path health is only checked on a 30s ticker. When a fabric interface goes DOWN or a neighbor entry changes/disappears, up to 30s of stale forwarding occurs before the next refresh detects the failure.
+
+**Fix:** Subscribe to netlink `LinkUpdate` and `NeighUpdate` channels via `netlink.LinkSubscribe()` and `netlink.NeighSubscribe()`. Filter for fabric interface names and peer IP addresses. On match, trigger immediate `fabric_fwd` refresh via `fabricRefreshCh` (non-blocking channel send). The 30s ticker remains as a safety net.
+
+**Implementation:**
+- `monitorFabricState(ctx)` goroutine subscribes to link + neighbor updates
+- `triggerFabricRefresh()` non-blocking send to `fabricRefreshCh`
+- `fabricIface`/`fabricIface1` and `fabricPeerIP`/`fabricPeerIP1` under `fabricMu` for filter matching
+- Clean shutdown via context cancellation → `close(linkDone)` + `close(neighDone)`
+
+**Files:** `pkg/daemon/daemon.go`
+
+### Fix #125: gRPC/monitor dual-address failover (FIXED `e02ceeb`)
+
+**Problem:** In dual-fabric clusters, the gRPC server listens on only one fabric address and the cluster monitor dials only one address. When that fabric path fails, gRPC connectivity and health monitoring are lost even though the other fabric is healthy.
+
+**Fix:** gRPC server listens on both fabric addresses (fab0 + fab1). Monitor dial uses fab0→fab1 fallback — try primary first, fall back to secondary on connection failure or timeout.
+
+### Fix #126: Mark DPDK fabric redirect as unsupported (`dc6f6bd`)
+
+**Problem:** The DPDK dataplane programs fabric port IDs for inbound zone-encoded MAC detection but has no equivalent of the BPF `try_fabric_redirect()` and `try_fabric_redirect_with_zone()` helpers. Users enabling DPDK in HA clusters would get silent packet drops on fabric redirect paths.
+
+**Fix:** Added `slog.Warn` calls in `UpdateFabricFwd()` and `UpdateFabricFwd1()` in DPDK CGo bridge. Clarified the limitation in `dpdk_worker/zone.c` comments. This makes the gap visible in logs rather than silently dropping.
+
+**Files:** `dpdk_worker/zone.c`, `pkg/dataplane/dpdk/dpdk_cgo.go`
+
+### Key Patterns from CC-11
+- **Zeroed BPF map entry as tombstone:** Writing `FabricFwdInfo{}` (all zeros) is cheaper than delete+re-add. BPF already treats `ifindex==0` as "no entry" — no C-side changes needed
+- **Event-driven + ticker safety net:** Netlink subscriptions for immediate reaction + 30s ticker as fallback. Never rely solely on events (can be lost) or solely on timers (too slow)
+- **Connection affinity:** Prefer one path (fab0) but tolerate degraded on backup. Don't tear down working connections to try alternatives
+- **Oper-state gating:** Always check `link.Attrs().OperState` before programming forwarding entries — interface existence alone is insufficient
+- **IPVLAN L2 overlay for fabric:** Physical member keeps XDP-visible name; IPVLAN child gets fab0/fab1 for IP/sync. Avoids link down/up rename cycling
+
+### Files Modified (Sprint CC-11)
+| File | Change |
+|------|--------|
+| `pkg/daemon/daemon.go` | `monitorFabricState()`, `triggerFabricRefresh()`, fabric oper-state check, stale clearing, `fabricRefreshCh` |
+| `dpdk_worker/zone.c` | DPDK fabric redirect limitation comments |
+| `pkg/dataplane/dpdk/dpdk_cgo.go` | `slog.Warn` in `UpdateFabricFwd`/`UpdateFabricFwd1` |
+
+### Test Results
+- `dc6f6bd` (#126): committed, make test pass
+- `1358477` (#123): committed — per-fabric session sync connections
+- `e02ceeb` (#121, #122, #124, #125): committed — fabric health + gRPC dual-address failover
+- All CC-11 fixes merged to master
+
+---
+
+## Sprint CC-12: IPVLAN Fabric Fixes (#127-#130, 2026-03-06)
+
+Discovered during CC-11 validation: the IPVLAN overlay refactor (`97c0424`) introduced four correctness issues with fabric overlay lifecycle management.
+
+### Context
+The IPVLAN overlay design (`97c0424`) keeps physical fabric members visible to XDP/TC (ge-X-0-Y name) while creating IPVLAN L2 children (fab0/fab1) for IP addressing and sync transport. This split introduced gaps in address reconciliation, cleanup, neighbor probing, and compiler auto-detection.
+
+### Fix #127: IPVLAN address reconciliation on restart
+
+**Problem:** `ensureFabricIPVLAN()` returns early when the IPVLAN interface already exists (survives daemon restart), skipping IP address reconciliation. After restart, fab0/fab1 may lack addresses → fabric sync broken.
+
+**Fix:** Remove early return — always check and reconcile addresses on existing IPVLAN interfaces. The function now creates-if-missing AND reconciles-if-existing.
+
+**Key insight:** IPVLAN interfaces survive daemon restart but their addresses may be lost (networkd reload, link cycling). Must treat address config as idempotent.
+
+**Files:** `pkg/daemon/daemon.go`
+
+### Fix #128: Stale IPVLAN overlay cleanup
+
+**Problem:** `CleanupFabricIPVLANs()` was defined but never called. Orphaned fab0/fab1 interfaces persist across config changes, potentially causing address conflicts or stale routes.
+
+**Fix:** Wire `CleanupFabricIPVLANs()` into daemon cleanup and config-change paths. Remove stale overlays when fabric topology changes or daemon runs `bpfrxd cleanup`.
+
+**Files:** `pkg/daemon/daemon.go`
+
+### Fix #129: Neighbor probe on IPVLAN overlay, not parent
+
+**Problem:** `probeFabricNeighbor()` sends ARP/NDP probe from the physical parent (ge-X-0-Y) which no longer holds the fabric IP address. Probe has wrong source IP → peer ignores → no ARP entry → `bpf_fib_lookup` returns NO_NEIGH → fabric forwarding broken.
+
+**Fix:** Send neighbor probe from the IPVLAN child (fab0/fab1) where the fabric IP actually lives. Probe source IP matches the address, peer responds correctly, ARP entry populates.
+
+**Key insight:** After IPVLAN refactor, physical parent is for XDP/TC attachment only. All IP-level operations (probes, binds, sync) must use the IPVLAN overlay.
+
+**Files:** `pkg/daemon/daemon.go`
+
+### Fix #130: Compiler dual-fabric auto-detection
+
+**Problem:** Fabric auto-detection finds both fabric interfaces but collapses them into `FabricInterface` only. `Fabric1Interface` stays empty → node1 has no fabric forwarding path → unidirectional session sync, broken failover.
+
+**Fix:** Auto-detect distinguishes fab0 vs fab1 based on interface naming or node assignment. Populate both `FabricInterface` and `Fabric1Interface` in compiled config.
+
+**Key insight:** Single-fabric-per-node design means each node creates only its own overlay (fab0 on node0, fab1 on node1). Compiler must still know about BOTH fabrics for the BPF `fabric_fwd` map (dual lookup: try fab0 first, then fab1).
+
+**Files:** `pkg/config/compiler.go`
+
+### Key Patterns from CC-12
+- **Idempotent overlay lifecycle:** IPVLAN create-or-reconcile, never assume current state
+- **IP operations on overlay, not parent:** After IPVLAN split, all IP-level work (probes, binds, addresses) targets fab0/fab1. Physical parent is XDP/TC attachment only
+- **Dual-fabric compiler awareness:** Both FabricInterface and Fabric1Interface must be populated even though each node only creates one overlay. BPF needs both for dual-lookup
+- **Cleanup must be wired:** Defining a cleanup function is not enough — it must be called from all relevant lifecycle paths (config change, daemon cleanup, overlay rebuild)
+
+---
+
+## Sprint CC-13: HA Session Sync & Activation Fixes (#131-#134, 2026-03-06)
+
+Four correctness issues in HA session sync and RG activation discovered during extended failover testing with long-lived sessions.
+
+### Context
+CC-11/CC-12 fixed fabric health and IPVLAN overlay issues. CC-13 addresses higher-level HA state machine bugs: session sync only at creation (stale sessions on failover), premature RG activation (partial forwarding), latched syncReady (skipped bulk sync on reconnect), and edge-triggered hold timer (missed preemption).
+
+### Fix #131: Session sync refresh for established flows (FIXED `b35bb45`)
+
+**Problem:** Session sync sweep only sends sessions at creation time. Long-lived established sessions (hours/days) are never re-synced. On failover, peer has stale `LastSeen` — GC may purge the session before the failover packet arrives, or TCP state is outdated.
+
+**Fix:** Sweep includes `LastSeen`-based activity detection. Sessions with recent activity since last sweep cycle are re-synced to peer, keeping the peer's session table fresh.
+
+**Key insight:** Session sync must be incremental AND continuous — not just "sync on create, delete on GC". Active sessions need periodic refresh to survive long intervals between failovers.
+
+### Fix #132: RG activation requires all VRRP instances MASTER (FIXED `08c17e3`)
+
+**Problem:** `rg_active` BPF map set to true on the FIRST VRRP instance reaching MASTER for an RG. If the RG has multiple VRRP instances (e.g., multiple RETH interfaces), some interfaces may still be BACKUP with blackhole routes when `rg_active=true` allows traffic through.
+
+**Fix:** Track per-RG VRRP instance count and state. Only set `rg_active=true` and remove blackhole routes when ALL instances for the RG have reached MASTER. Single instance reaching MASTER increments a counter but doesn't trigger activation.
+
+**Key insight:** RG activation is an all-or-nothing decision. Partial MASTER (some interfaces active, some blackholed) causes asymmetric forwarding failures.
+
+### Fix #133: Reset syncReady on peer disconnect/reconnect (FIXED `f5b445e`)
+
+**Problem:** `syncReady` is latched to `true` after the first successful bulk sync and never reset. When peer disconnects and reconnects (e.g., daemon restart, network partition recovery), bulk sync is skipped because `syncReady` is still true. Reconnected peer may have empty/stale session table.
+
+**Fix:** Reset `syncReady` to `false` when all sync connections to peer are lost (total disconnect). Next reconnect triggers fresh bulk sync handshake, ensuring the peer has a complete session table.
+
+**Key insight:** `syncReady` is a per-connection property, not a permanent system state. Each new peer connection must complete bulk sync before incremental sync is meaningful.
+
+### Fix #134: Hold timer scheduled re-election wakeup (FIXED `f5b445e`)
+
+**Problem:** Sync hold timer expiry sets a flag but doesn't schedule a re-election. VRRP priority update (preemption) only happens reactively when other events fire. If no events occur after hold expiry, the node stays BACKUP indefinitely despite having higher priority.
+
+**Fix:** Use `time.AfterFunc` to schedule an explicit re-election evaluation at hold timer expiry. The callback calls `UpdateRGPriority()` which recalculates weight and updates VRRP priority, triggering preemption if appropriate.
+
+**Key insight:** Hold timer expiry is a state transition that must be level-triggered (schedule action), not edge-triggered (set flag and hope someone checks it).
+
+### Key Patterns from CC-13
+- **Continuous sync, not just creation sync:** Session sync must refresh active sessions periodically, not just on initial creation. `LastSeen` comparison against last sweep timestamp identifies active sessions
+- **All-or-nothing RG activation:** Never partially activate an RG — all VRRP instances must be MASTER before clearing blackholes and setting `rg_active=true`
+- **Connection-scoped readiness:** `syncReady` must be reset on disconnect — it tracks the current connection's sync state, not a permanent system property
+- **Level-triggered timers:** Hold timer expiry must schedule an action (`time.AfterFunc`), not just set a flag. Edge-triggered flags depend on other events to be observed
+
+---
+
+## Sprint CC-14: Fabric Monitor & Stats Fixes (#135-#137, 2026-03-06)
+
+Three issues with fabric interface monitoring and statistics after the IPVLAN overlay refactor (CC-11/CC-12). The IPVLAN split moved IP/sync to overlay interfaces (fab0/fab1), but monitor commands and BPF TX counters still target the overlay instead of the physical parent.
+
+### Context
+After the IPVLAN overlay refactor (`97c0424`, CC-11/CC-12), the fabric topology is:
+- Physical parent: `ge-X-0-Y` — carries wire-level traffic, has XDP/TC attached
+- IPVLAN overlay: `fab0`/`fab1` — L2 child for IP addresses, sync connections, gRPC
+
+Monitor commands (`monitor interface`, `monitor traffic interface`) and BPF TX counters need wire-level stats from the physical parent, not the overlay.
+
+### Fix #135: monitor interface fab0/fab1 shows IPVLAN overlay stats (FIXED `6fd6124`)
+
+**Problem:** `monitor interface fab0` and `monitor interface fab1` display stats from the IPVLAN overlay interface. These show only local IP traffic (sync, gRPC), missing all XDP/TC redirected traffic that traverses the physical parent.
+
+**Fix:** When the monitored interface is a fabric overlay (fab0/fab1), resolve to the physical parent interface for stats collection. The overlay→parent mapping comes from the IPVLAN relationship.
+
+**Key insight:** IPVLAN children see only their own traffic. Wire-level counters live on the physical parent where XDP/TC programs are attached.
+
+### Fix #136: monitor traffic interface fab0/fab1 tcpdump captures overlay (FIXED `6fd6124`)
+
+**Problem:** `monitor traffic interface fab0` captures packets on the IPVLAN overlay, which only shows sync/gRPC traffic. Wire-level fabric traffic (redirected packets) flows through the physical parent and is invisible on the overlay.
+
+**Fix:** Resolve fabric overlay name to physical parent before starting tcpdump capture. Same parent resolution as #135.
+
+### Fix #137: try_fabric_redirect never calls inc_iface_tx (FIXED `6fd6124`)
+
+**Problem:** `try_fabric_redirect()` in xdp_zone.c uses `bpf_redirect_map` to send packets to the fabric peer, but never increments the per-interface TX counter (`inc_iface_tx`). Fabric TX traffic is undercounted in `show interfaces statistics` and `monitor interface`.
+
+**Fix:** Add `inc_iface_tx(meta, fabric_ifindex)` call before `bpf_redirect_map` return in `try_fabric_redirect()`.
+
+**Key insight:** Every `bpf_redirect_map` exit path must have a corresponding `inc_iface_tx` call, or TX counters diverge from actual forwarded traffic.
+
+### Key Patterns from CC-14
+- **IPVLAN overlay vs physical parent:** After IPVLAN split, monitor/stats must target the physical parent for wire-level counters. Overlay only sees its own IP traffic
+- **Consistent counter instrumentation:** Every BPF redirect exit path (XDP_REDIRECT via `bpf_redirect_map`) needs `inc_iface_tx` — fabric redirect was missing this
+- **Parent resolution pattern:** Fabric overlay→parent mapping should be centralized for reuse by monitor commands, stats, and any future wire-level operations

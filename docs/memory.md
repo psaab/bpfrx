@@ -8,6 +8,7 @@
 - **Bug tracker:** `bugs.md`
 - **Future optimizations:** `optimizations.md`
 - **Sync protocol reference:** `sync-protocol.md`
+- **Perf profiling guide:** `profiling.md`
 
 ## Build & Deployment
 - `make generate` then `make build` for full build (bpf2go + Go binary)
@@ -15,8 +16,8 @@
 - `make proto` regenerates protobuf Go code (needs `PATH=$PATH:$HOME/go/bin`)
 - All 14 BPF programs pass verifier on kernel 6.18.9 (9 XDP + 5 TC)
 - **Known:** xdp_zone fails verifier on kernel 6.12 (NAT64 loop complexity)
-- 630+ tests pass (`make test`) across 20 packages
-- **systemd deployment:** `make test-deploy` builds, pushes, installs unit, starts service
+- 880+ tests pass (`make test`) across 30 packages; `make test-deploy` builds, pushes, installs unit, starts
+- **ALWAYS deploy to ALL VMs:** `make test-deploy` (bpfrx-fw) AND `make cluster-deploy` (bpfrx-fw0 + bpfrx-fw1)
 
 ## Architecture
 
@@ -42,12 +43,13 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 
 ### Interface Management (networkd)
 - **bpfrxd manages ALL interfaces** — renames, addresses, DHCP, and brings down unconfigured ones
-- `.link` files: boot-time rename via `bpfrx-link-setup.service` (PCI bus order → fxp0, em0, ge-X-0-Y), prefix `10-bpfrx-`; RETH members use `OriginalName=` (PCI name) instead of `MACAddress=` for stable boot matching
+- `.link` files: MAC→name rename (e.g. enp6s0→ge-0-0-0), prefix `10-bpfrx-`; RETH members use `OriginalName=` (PCI name) instead of `MACAddress=` for stable boot matching
 - `.network` files: addresses, RA disable, VLAN parent, ActivationPolicy=always-down for unmanaged
 - Unmanaged interfaces: brought down immediately + ActivationPolicy=always-down for persistence
 - DHCP interfaces: daemon's DHCP client manages addresses; address reconciliation skipped
 - VRF devices and tunnel interfaces excluded from unmanaged detection (`daemonOwned` map)
-- `setup.sh` writes bootstrap `.link` files for first boot (before daemon has ever run)
+- **Boot-time naming:** `enumerateAndRenameInterfaces()` in `pkg/daemon/linksetup.go` runs at daemon start, assigns vSRX names (fxp0, em0, ge-X-0-Y) based on PCI bus order and `/etc/bpfrx/node-id`
+- **Standalone:** no node-id file → fxp0 + ge-0-0-X (no em0). **Cluster:** node-id 0/1 → fxp0 + em0 + ge-{0,7}-0-X
 
 ### APIs & CLIs
 - **gRPC:** 127.0.0.1:50051 (config, sessions, stats, routes, IPsec, DHCP)
@@ -63,39 +65,32 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Junos-style prefix matching:** `resolveCommand()` + `cmdtree.KeysFromTree()` — no hardcoded lists
 - **`?` instant help:** readline `Listener` intercepts `?` key, shows help without Enter
 - **Tab descriptions:** Multi-match tab shows descriptions above prompt via `cmdtree.WriteHelp()`
+- **CLI history:** Persisted to `~/.bpfrx_history` (local) and via gRPC `HistoryAppend`/`HistoryGet` (remote CLI)
 
 ### Chassis Cluster (HA)
-- **pkg/cluster/cluster.go:** Core state machine — Manager, NodeState, RedundancyGroupState
-- **State enum:** StateSecondary (0), StatePrimary (1), StateSecondaryHold (2), StateLost (3), StateDisabled (4)
-- **Weight scoring:** Initial 255, subtract per monitor; weight=0 → secondary; "ip:" prefix for IP monitors
-- **Event channel:** ClusterEvent → GARP on primary; manual failover/reset supported
-- **Manual failover (`6d63020`):** `ManualFailover()` MUST set `rg.Weight=0` so peer election sees "Peer weight 0" → becomes primary. `ResetFailover()` calls `recalcWeight()` to restore weight from monitor state
-- **Config:** ClusterConfig.{ClusterID, NodeID, HeartbeatInterval, HeartbeatThreshold, ControlInterface, PeerAddress, FabricInterface, FabricPeerAddress, ConfigSync, NATStateSync, IPsecSASync}
-- **Daemon:** Manager.Start(ctx)/Stop() lifecycle, RETH IP registration in applyConfig, auto-StartHeartbeat when PeerAddress configured
-- **Two-VM test env:** `test/incus/cluster-setup.sh` (bpfrx-fw0 + bpfrx-fw1 + cluster-lan-host)
-- **Commands:** show chassis cluster {status,interfaces,information,statistics}; request failover; request system software in-service-upgrade
-- **monitor.go:** 1s netlink link state + ICMP probes; testable via interfaces
-- **garp.go:** AF_PACKET ARP reply + IPv6 NA (unsolicited, RFC 4861), auto on primary; **heartbeat.go:** UDP:4784, "BPFX" magic
-- **election.go:** Preempt/non-preempt/split-brain, effective priority = base*weight/255; active/active per-RG primary
-- **sync.go:** TCP RTO — "BPSY" magic, 9 msg types (7 session + 1 config + 1 IPsec SA), full session install via SetSessionV4/V6; **reth.go:** physical member management
-- **VRRP-backed RETH (bondless):** native Go VRRPv3 daemon (`pkg/vrrp/`) manages RETH VIPs directly on physical member interfaces; VRID=100+rgID; priority 200(primary)/100(secondary); no bond devices — VRRP runs on physical; `RethToPhysical()` resolves reth→physical member; networkd omits static addresses for RETH (VRRP owns VIPs); SNAT uses config-based address lookup for RETH interfaces
-  - **pkg/vrrp/**: packet.go (codec), instance.go (state machine, VIP mgmt), manager.go (lifecycle, AF_PACKET sockets)
-  - AF_PACKET receiver for all instances; `reconcileInterfaceAddresses()` skips RETH; IPv6 NODAD; RETH→physical FRR routes
-- **RETH virtual MAC:** Per-node `02:bf:72:CC:RR:NN`; `programRethMAC()` step 2.6 (link-down→set MAC→link-up); `accept_dad=0`; compiler skips `.link` when virtual MAC; `bpf_fib_lookup` smac auto-uses kernel MAC
-  - **Gotcha:** `netlink.LinkSetHardwareAddr` returns EAGAIN on UP interfaces — must bring down first
-  - **Gotcha:** kernel link-local not regenerated without down/up cycle after MAC change
-  - **Gotcha:** import cycle `cluster↔dataplane` — `isVirtualRethMAC()` duplicated locally in compiler.go
-  - **Gotcha:** RETH `.link` must use `OriginalName=` not `MACAddress=` (MAC alternates physical↔virtual across reboots)
-- **ISSU:** `ForceSecondary()` drains all RGs to peer, then operator replaces binary + restarts
-- **VRRP sync hold:** preempt=false until bulk sync (10s timeout). `ReleaseSyncHold()` → `preemptNowCh` for instant preemption
-- **VRRP timing:** RETH 30ms interval (masterDown ~97ms, measured ~60ms failover); configurable `reth-advertise-interval`; async GARP burst; 3× priority-0 on shutdown; user VRRP seconds*1000; wire centiseconds
-- **VIP reconciliation:** `ReconcileVIPs()` re-adds VIPs + GARP after `programRethMAC` link DOWN/UP
-- **Reboot resilience:** RETH `.link` `OriginalName=`; `ensureRethLinkOriginalName()` auto-fix; `deriveKernelName()` virtio-over-PCI
-- **Fabric forwarding:** `try_fabric_redirect()` in xdp_zone redirects to fabric peer when FIB fails for synced sessions
-- **IPsec SA sync:** Primary sends active connection names every 30s; new primary re-initiates via swanctl --initiate
-- **Config sync:** `syncMsgConfig=8`, `QueueConfig()` sends full config text, `OnConfigReceived` callback, 16MB payload limit
-- **Config read-only:** `clusterReadOnly` field in configstore — secondary nodes reject config mutations
-- **MASTER-only radvd/kea:** `watchVRRPEvents()` → `applyRethServices()` on MASTER, `clearRethServices()` + goodbye RA on BACKUP
+- **State machine:** StateSecondary(0), StatePrimary(1), SecondaryHold(2), Lost(3), Disabled(4); weight-based election
+- **VRRP-backed RETH (bondless):** native Go VRRPv3 (`pkg/vrrp/`), 30ms interval (configurable), virtual MAC `02:bf:72:CC:RR:NN`
+- **Sync:** TCP RTO on fabric link — 11 msg types (sessions, config, IPsec SA, failover, fence); incremental 1s sweep + GC delete callbacks; `writeMu` serializes ALL conn.Write paths
+- **Sync hardening (#69-#73):** connection-specific disconnect (stale goroutine guard), per-RG BulkSync filtering, stale session reconciliation on BulkEnd, peer fencing (`syncMsgFence`), hard-crash test (`make test-ha-crash`)
+- **Sync race fixes (#76-#80):** writeMu + single-buffer writeMsg, sync-hold 30s+reason, config authority, fast fabric_fwd ARP probe, fresh config per tick
+- **Config sync:** Primary→secondary only; `handleConfigSync()` rejects if `IsLocalPrimary(0)`; `OnPeerConnected` only pushes if RG0 primary
+- **Fabric IPVLAN overlay (`97c0424`):** Physical member keeps ge-X-0-Y name (XDP/TC visible); fab0/fab1 are IPVLAN L2 children for IP/sync. Single fabric per node: fab0 on node0, fab1 on node1. **After IPVLAN split:** all IP ops (probes, binds, addresses) on overlay, not parent
+- **Fabric forwarding:** `try_fabric_redirect()` in xdp_zone when FIB fails for synced sessions — dual lookup (ff0, ff1), anti-loop on both, try fab0 first then fab1
+- **Fabric health (#121-#125):** Zeroed `FabricFwdInfo{}` on link DOWN/neighbor loss; oper-state check before programming; netlink `LinkSubscribe`+`NeighSubscribe` for event-driven refresh; 30s ticker as safety net; gRPC dual-address failover
+- **Fabric IPVLAN fixes (#127-#130):** Address reconciliation on restart (not just create), stale overlay cleanup wired in, neighbor probe on overlay not parent, compiler dual-fabric auto-detect
+- **Fabric interface recovery:** compiler reads bootstrap `.link` file `OriginalName=` to find unrenamed kernel interfaces (chicken-and-egg fix for first boot)
+- **Per-RG:** active/active per-RG primary, per-RG service/session management
+- **Timing:** Failover ~60ms (30ms VRRP, masterDown ~97ms); planned shutdown near-instant (priority-0 burst); failback ~130ms; heartbeat 200ms/threshold 5
+- **Dual-inactive window fix:** During manual failover, old code had ~25ms where BOTH nodes had `rg_active=false` → all RG traffic XDP_DROP'd → TCP stream death. Fix: Primary sets `rg_active=true` immediately (brief benign dual-active overlap); Secondary defers `rg_active=false` until VRRP BACKUP event
+- **zone_ct_update RST guard:** `zone_ct_update_v4/v6()` in xdp_zone.c is the PRIMARY established-session path (fast-path FIB cache hit). Must have same RST→CLOSED suppression as xdp_conntrack
+- **Fabric txqueuelen:** virtio-net TX ring max 256 entries; set `txqueuelen=10000` on fabric interface to avoid `bpf_redirect_map` drops under bidirectional load
+- **RETH gotchas:** `.link` must use `OriginalName=` (MAC alternates), EAGAIN on UP link MAC set, import cycle workaround
+- **Posture reconciliation (#86→#101):** Context-aware delay — 10s during startup (first 30s), 2s steady-state. CRITICAL: use `UpdateRGPriority` NOT `ForceRGMaster`
+- **BPF watchdog (#102):** `ha_watchdog` ARRAY map, Go writes every 500ms, BPF checks freshness >2s = inactive. Ensures fail-closed on SIGKILL/panic
+- **Misc fixes (#98-#100,#103):** writeFull loops (#99), heartbeat MTU 1472 (#100), neighbor warmup chains (#98), readiness gate (#103)
+- **HA sync & activation (#131-#134):** LastSeen-based session refresh (#131), all-instances RG activation (#132), syncReady reset on disconnect (#133), hold timer `time.AfterFunc` wakeup (#134)
+- **Fabric monitor resolution (#135-#137):** Monitor commands resolve fab0/fab1 overlay→physical parent for stats/tcpdump; `inc_iface_tx` added to `try_fabric_redirect`
+- See `bugs.md` (CC-1 through CC-14), `phases.md`, and `sync-protocol.md` for full HA details
 
 ### NPTv6 (RFC 6296)
 - **Stateless IPv6 prefix translation:** 1:1 /48 prefix rewriting, checksum-neutral
@@ -152,6 +147,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - `iter.Next(&key, nil)` crashes in cilium/ebpf v0.20 — use `var val []byte`
 - TTY detection: `unix.IoctlGetTermios(fd, TCGETS)` not `os.ModeCharDevice`
 - Interfaces must be brought UP after XDP/TC attachment (netlink.LinkSetUp)
+- **`bpf_fib_lookup` TBID + VRF:** Even with `BPF_FIB_LOOKUP_TBID`, kernel honors l3mdev rules when `fib.ifindex` belongs to a VRF. Must use non-VRF ifindex for main table lookups. `fabric_fwd_info.fib_ifindex` stores a non-VRF interface for this.
 - `bpf_fib_lookup` NO_NEIGH (rc=7): route exists but no ARP entry
   - STALE entries work fine — only truly absent entries cause NO_NEIGH
   - `arping` doesn't populate kernel ARP with XDP attached — use `ping` instead
@@ -166,18 +162,21 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - Deferred `link.Update()` AFTER all compilation; stale pins need `bpfrxd cleanup` + fresh start
 - **PROG_ARRAY pinning (CRITICAL):** `xdp_progs`/`tc_progs` MUST be pinned to survive daemon exit
 - Deterministic IDs (sorted keys); populate-before-clear; dnat_table before sessions (`a030446`)
+- **Deploy restart:** `systemctl stop` → `bpfrxd cleanup` → push binary → start. SO_REUSEADDR+SO_REUSEPORT for rebind
 
 ## Performance
 - **bpf_printk:** NEVER leave in production (55%+ CPU)
 - **Throughput:** 25+ Gbps native XDP, 15.6 Gbps virtio-net
-- **Cluster failover:** ~60ms (VRRP 30ms, masterDown ~97ms); planned shutdown near-instant (priority-0 burst); failback ~130ms; reboot→MASTER ~6s
+- **Cluster failover:** ~60ms (VRRP 30ms, masterDown ~97ms); planned shutdown near-instant; failback ~130ms; reboot→MASTER ~6s
+- **Manual failover bug (`6d63020`):** `ManualFailover()` MUST set `rg.Weight=0` — without it, peer stays secondary (sees high weight in heartbeat). `ResetFailover()` uses `recalcWeight()` to restore
 - Per-interface XDP: `redirect_capable` map; iavf lacks native XDP, use PF passthrough
+- **Profiling:** See `profiling.md` — perf record/report via incus exec; cluster traffic must originate from `cluster-lan-host` (not fw itself)
+- **Cluster bottleneck:** `__htab_map_lookup_and_delete_batch` 85.66% CPU — Go-side session sync sweep, not BPF datapath
 
 ## Incus Test Environment
-- See `test_env.md` for topology details; CLAUDE.md for make targets
-- VM: Debian 13, kernel 6.18.9; `sg incus-admin -c "make ..."` if permission errors
-- **Cluster:** `make cluster-init/create/deploy/destroy` — bpfrx-fw0 (pri 200) + bpfrx-fw1 (pri 100) + cluster-lan-host
-  - Heartbeat: 10.99.0.0/30, Fabric: 10.99.1.0/30, WAN RETH: 172.16.50.10, LAN RETH: 10.0.60.1
+- See `test_env.md` for topology; VM: Debian 13, kernel 6.18.9; `sg incus-admin -c "make ..."` for perms
+- **Naming:** vSRX-style via `enumerateAndRenameInterfaces()` — PCI passthrough always higher bus than virtio
+- **Cluster:** bpfrx-fw0 (pri 200) + bpfrx-fw1 (pri 100) + cluster-lan-host; Fabric: 10.99.1.0/30
 
 ## SSH / Git Push — `source ~/.sshrc` before `git push`
 
@@ -191,15 +190,11 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 ## Workflow
 - **Always commit and push** when finishing a task
 - **Full validation before commit:** `make test` + `make test-deploy` + connectivity tests
+- **Cluster changes MUST run failover test:** `make test-failover` + `make test-ha-crash`
 - Guard context window — keep messages concise
 
 ## Recent Features (see `phases.md` for full details)
-- **Fabric cross-chassis fwd:** `try_fabric_redirect()` redirects to peer via fabric when FIB fails for synced sessions
-- **Session sync failover:** Hitless TCP — NO_NEIGH kernel-route, monotonic rebase, ARP/ND warmup
-- **Sub-100ms failover (`ff7821c`, `ae1a717`):** VRRP 30ms (was 250ms), async GARP burst, 3× priority-0 shutdown, immediate peer takeover; sync 1s, debounce 500ms, heartbeat 200ms/5
-- **Reboot resilience (`f8353de`):** `.link` OriginalName= for RETH + auto-fix
-- **VIP reconciliation (`a4eb2b2`):** `ReconcileVIPs()` after programRethMAC
-- Sprints: VRRP-NATIVE, HA-CONFIG, NPTv6, SEC-LOG, FF-1, IF-1, HA-8, HA-TIMING, HA-REBOOT (see `phases.md`)
-
-### Firewall Filter Policer Architecture
-- Token bucket + three-color policer (per-CPU lock-free); lo0 filter in `xdp_forward.c`; flex match byte-offset from L3
+- **CC-14 Fabric monitor/stats (#135-#137):** Monitor interface/traffic resolves fab overlay→physical parent; BPF fabric redirect TX counter fix
+- **CC-13 HA sync & activation (#131-#134):** Session refresh for established flows, all-instances RG activation, syncReady reset, hold timer wakeup
+- **CC-12 IPVLAN fixes (#127-#130):** Address reconciliation, stale cleanup, overlay neighbor probe, dual-fabric compiler
+- **CC-11 Fabric health (#121-#126):** Event-driven refresh, stale clearing, oper-state check, gRPC failover, DPDK limitation
