@@ -150,14 +150,18 @@ type SessionSync struct {
 	// push config to a returning secondary.
 	OnPeerConnected func()
 
+	// OnPeerDisconnected is called when all fabric connections are lost
+	// (total disconnect). Used to reset sync readiness so that a fresh
+	// bulk sync is required before the node can promote to primary.
+	OnPeerDisconnected func()
+
 	// peerIPsecSAs holds the latest IPsec connection names received from the peer.
 	peerIPsecSAs   []string
 	peerIPsecSAsMu sync.Mutex
 
 	IsPrimaryFn        func() bool         // returns true if local node is primary for RG 0
 	IsPrimaryForRGFn   func(rgID int) bool // returns true if local is primary for given RG
-	lastSweepTime      uint64              // monotonic seconds of last sync sweep
-	lastSessionCounter uint64              // last seen GLOBAL_CTR_SESSIONS_NEW value
+	lastSweepTime uint64 // monotonic seconds of last sync sweep
 	syncBackfillNeeded atomic.Bool         // replay sweep window on send queue overflow
 	vrfDevice          string              // VRF device for SO_BINDTODEVICE (empty = default VRF)
 
@@ -458,8 +462,10 @@ func (s *SessionSync) Stop() {
 	}
 }
 
-// StartSyncSweep starts a goroutine that periodically syncs new sessions to the peer.
-// Sessions with Created >= lastSweepTime are considered new and queued for sync.
+// StartSyncSweep starts a goroutine that periodically syncs sessions to the peer.
+// Sessions with Created >= lastSweepTime (new) or LastSeen >= lastSweepTime
+// (recently active) are queued for sync, ensuring established flows get their
+// updated TCP state, timeouts, and last-seen timestamps replicated to standby.
 func (s *SessionSync) StartSyncSweep(ctx context.Context) {
 	s.lastSweepTime = monotonicSeconds()
 	s.wg.Add(1)
@@ -513,13 +519,6 @@ func (s *SessionSync) syncSweep() {
 		return
 	}
 
-	// Fast path: skip iteration when no new sessions since last sweep.
-	// GLOBAL_CTR_SESSIONS_NEW (index 3) is incremented by BPF on every new session.
-	newCount, err := s.dp.ReadGlobalCounter(3) // GLOBAL_CTR_SESSIONS_NEW
-	if err == nil && newCount == s.lastSessionCounter {
-		return
-	}
-
 	threshold := s.lastSweepTime
 	now := monotonicSeconds()
 	var count int
@@ -531,7 +530,7 @@ func (s *SessionSync) syncSweep() {
 		if val.IsReverse != 0 {
 			return true
 		}
-		if val.Created >= threshold && s.ShouldSyncZone(val.IngressZone) {
+		if (val.Created >= threshold || val.LastSeen >= threshold) && s.ShouldSyncZone(val.IngressZone) {
 			msg := encodeSessionV4(key, val)
 			if s.queueMessage(msg, &s.stats.SessionsSent, "sweep_v4") {
 				count++
@@ -546,7 +545,7 @@ func (s *SessionSync) syncSweep() {
 		if val.IsReverse != 0 {
 			return true
 		}
-		if val.Created >= threshold && s.ShouldSyncZone(val.IngressZone) {
+		if (val.Created >= threshold || val.LastSeen >= threshold) && s.ShouldSyncZone(val.IngressZone) {
 			msg := encodeSessionV6(key, val)
 			if s.queueMessage(msg, &s.stats.SessionsSent, "sweep_v6") {
 				count++
@@ -577,9 +576,6 @@ func (s *SessionSync) syncSweep() {
 	}
 
 	s.lastSweepTime = now
-	if newCount > 0 {
-		s.lastSessionCounter = newCount
-	}
 	if count > 0 {
 		slog.Info("cluster sync: sweep synced sessions", "count", count)
 	}
@@ -1409,6 +1405,9 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	if !connected {
 		s.clockSynced.Store(false)
 		slog.Info("cluster sync: peer disconnected (all fabrics down)")
+		if s.OnPeerDisconnected != nil {
+			go s.OnPeerDisconnected()
+		}
 	}
 }
 
