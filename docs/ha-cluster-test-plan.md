@@ -32,12 +32,17 @@ bpfrx uses vSRX-style interface names:
 | vSRX Name | Linux Name | Role |
 |-----------|-----------|------|
 | `fxp0` | `fxp0` | Management (out-of-band) |
-| `fxp1` | `fxp1` | Cluster control (heartbeat) |
-| `fab0` | `fab0` | Fabric sync link |
-| `ge-0/0/0` | `ge-0-0-0` | Node 0 data interface (LAN, reth1 member) |
-| `ge-0/0/1` | `ge-0-0-1` | Node 0 data interface (WAN, reth0 member) |
-| `ge-7/0/0` | `ge-7-0-0` | Node 1 data interface (LAN, reth1 member) |
-| `ge-7/0/1` | `ge-7-0-1` | Node 1 data interface (WAN, reth0 member) |
+| `em0` | `em0` | Embedded management / cluster control (heartbeat) |
+| `fab0` | `fab0` | Fabric sync link (member: ge-0/0/0 or ge-7/0/0) |
+| `fab1` | `fab1` | Fabric sync link (member: ge-0/0/1 or ge-7/0/1) |
+| `ge-0/0/0` | `ge-0-0-0` | Node 0: fab0 member (renamed to fab0 by daemon) |
+| `ge-0/0/1` | `ge-0-0-1` | Node 0: fab1 member (renamed to fab1 by daemon) |
+| `ge-0/0/2` | `ge-0-0-2` | Node 0 data interface (LAN, reth1 member) |
+| `ge-0/0/3` | `ge-0-0-3` | Node 0 data interface (WAN, reth0 member) |
+| `ge-7/0/0` | `ge-7-0-0` | Node 1: fab0 member (renamed to fab0 by daemon) |
+| `ge-7/0/1` | `ge-7-0-1` | Node 1: fab1 member (renamed to fab1 by daemon) |
+| `ge-7/0/2` | `ge-7-0-2` | Node 1 data interface (LAN, reth1 member) |
+| `ge-7/0/3` | `ge-7-0-3` | Node 1 data interface (WAN, reth0 member) |
 | `reth0` | `reth0` | Redundant Ethernet — WAN |
 | `reth1` | `reth1` | Redundant Ethernet — LAN |
 
@@ -75,14 +80,14 @@ Host NIC: eno6np1 (i40e, Intel X710/X722)
               +--+--+--+--+-+  +-+--+--+--+--+
                  |  |  |  |      |  |  |  |
   fxp0 ---------+  |  |  |      +--|--------  fxp0
-  fxp1 ------------+  |  |      +--|---------  fxp1
+  em0 ------------+  |  |      +--|---------  em0
   fab0 ----------------+  |      |  +--------  fab0
   ge-0/0/0 ---------------+      +-----------  ge-7/0/0
                  |                   |
                  +------+   +-------+
                         |   |
            incusbr0             (fxp0, DHCP)
-           bpfrx-heartbeat      (fxp1, 10.99.0.0/30)
+           bpfrx-heartbeat      (em0, 10.99.0.0/30)
            bpfrx-fabric         (fab0, 10.99.1.0/30)
            bpfrx-clan           (reth1: 10.0.60.0/24)
 
@@ -118,17 +123,20 @@ Disk:   20 GB (pool: default)
 | Device | VM Interface | Renamed To | Network | Purpose |
 |--------|-------------|-----------|---------|---------|
 | `eth0` | enp5s0 | fxp0 | incusbr0 | Management (DHCP) |
-| `eth1` | enp6s0 | fxp1 | bpfrx-heartbeat | Heartbeat / control |
-| `eth2` | enp7s0 | fab0 | bpfrx-fabric | Fabric sync |
-| `eth3` | enp8s0 | ge-X-0-0 | bpfrx-clan | LAN (reth1 member) |
+| `eth1` | enp6s0 | em0 | bpfrx-heartbeat | Heartbeat / control |
+| `eth2` | enp7s0 | ge-X-0-0 → fab0 | bpfrx-fabric | Fabric fab0 member |
+| `eth3` | enp8s0 | ge-X-0-1 → fab1 | bpfrx-fabric1 | Fabric fab1 member |
+| `eth4` | enp9s0 | ge-X-0-2 | bpfrx-clan | LAN (reth1 member) |
+| `eth5` | enp10s0 | ge-X-0-3 | incusbr0 | Spare |
 
-SR-IOV WAN VF added per-VM as PCI passthrough (becomes `ge-X-0-1`):
+SR-IOV WAN VF added per-VM as PCI passthrough (becomes `ge-X-0-4`):
 ```bash
 incus config device add $vm wan-vf pci address=0000:b7:06.0  # VF0 for fw0
 incus config device add $vm wan-vf pci address=0000:b7:06.1  # VF1 for fw1
 ```
 
-Where X = 0 for node 0 (`ge-0-0-0`, `ge-0-0-1`) and X = 7 for node 1 (`ge-7-0-0`, `ge-7-0-1`).
+Where X = 0 for node 0 and X = 7 for node 1. Fabric member interfaces (ge-X-0-0, ge-X-0-1)
+are renamed to fab0/fab1 by the daemon via fabric-options member-interfaces.
 
 ### Instances
 
@@ -147,27 +155,29 @@ Where X = 0 for node 0 (`ge-0-0-0`, `ge-0-0-1`) and X = 7 for node 1 (`ge-7-0-0`
 | Kernel Name | Renamed To | Config Name | Driver | XDP Mode | Role |
 |-------------|-----------|-------------|--------|----------|------|
 | enp5s0 | fxp0 | fxp0 | virtio_net | native | Management (DHCP) |
-| enp6s0 | fxp1 | fxp1 | virtio_net | native | Heartbeat / control |
-| enp7s0 | fab0 | fab0 | virtio_net | native | Fabric sync |
-| enp8s0 | ge-0-0-0 | ge-0/0/0 | virtio_net | native | LAN (reth1 member) |
-| enp9s0f0 (VF) | ge-0-0-1 | ge-0/0/1 | iavf | generic | WAN (reth0 member) |
+| enp6s0 | em0 | em0 | virtio_net | native | Heartbeat / control |
+| enp7s0 | ge-0-0-0 → fab0 | ge-0/0/0 | virtio_net | native | Fabric fab0 member |
+| enp8s0 | ge-0-0-1 → fab1 | ge-0/0/1 | virtio_net | native | Fabric fab1 member |
+| enp9s0 | ge-0-0-2 | ge-0/0/2 | virtio_net | native | LAN (reth1 member) |
+| VF (PCI) | ge-0-0-3 | ge-0/0/3 | iavf | generic | WAN (reth0 member) |
 
 **Node 1 (bpfrx-fw1):**
 
 | Kernel Name | Renamed To | Config Name | Driver | XDP Mode | Role |
 |-------------|-----------|-------------|--------|----------|------|
 | enp5s0 | fxp0 | fxp0 | virtio_net | native | Management (DHCP) |
-| enp6s0 | fxp1 | fxp1 | virtio_net | native | Heartbeat / control |
-| enp7s0 | fab0 | fab0 | virtio_net | native | Fabric sync |
-| enp8s0 | ge-7-0-0 | ge-7/0/0 | virtio_net | native | LAN (reth1 member) |
-| enp9s0f0 (VF) | ge-7-0-1 | ge-7/0/1 | iavf | generic | WAN (reth0 member) |
+| enp6s0 | em0 | em0 | virtio_net | native | Heartbeat / control |
+| enp7s0 | ge-7-0-0 → fab0 | ge-7/0/0 | virtio_net | native | Fabric fab0 member |
+| enp8s0 | ge-7-0-1 → fab1 | ge-7/0/1 | virtio_net | native | Fabric fab1 member |
+| enp9s0 | ge-7-0-2 | ge-7/0/2 | virtio_net | native | LAN (reth1 member) |
+| VF (PCI) | ge-7-0-3 | ge-7/0/3 | iavf | generic | WAN (reth0 member) |
 
 ### RETH Bonds
 
 | RETH | Node 0 Member | Node 1 Member | IPv4 VIP | IPv6 VIP | Zone | Purpose |
 |------|--------------|--------------|----------|----------|------|---------|
-| reth0 | ge-0/0/1 | ge-7/0/1 | 172.16.50.6/24 (VLAN 50) | 2001:559:8585:50::6/64 | wan | WAN uplink |
-| reth1 | ge-0/0/0 | ge-7/0/0 | 10.0.60.1/24 | 2001:559:8585:cf01::1/64 | lan | LAN |
+| reth0 | ge-0/0/3 | ge-7/0/3 | 172.16.50.6/24 (VLAN 50) | 2001:559:8585:50::6/64 | wan | WAN uplink |
+| reth1 | ge-0/0/2 | ge-7/0/2 | 10.0.60.1/24 | 2001:559:8585:cf01::1/64 | lan | LAN |
 
 ## IP Addressing
 
@@ -175,7 +185,7 @@ Where X = 0 for node 0 (`ge-0-0-0`, `ge-0-0-1`) and X = 7 for node 1 (`ge-7-0-0`
 
 | Link | fw0 | fw1 | Subnet |
 |------|-----|-----|--------|
-| Heartbeat (fxp1) | 10.99.0.1/30 | 10.99.0.2/30 | 10.99.0.0/30 |
+| Heartbeat (em0) | 10.99.0.1/30 | 10.99.0.2/30 | 10.99.0.0/30 |
 | Fabric (fab0) | 10.99.1.1/30 | 10.99.1.2/30 | 10.99.1.0/30 |
 
 ### RETH VIPs (float to primary)
@@ -207,10 +217,10 @@ does not exist, the daemon runs in standalone (non-cluster) mode.
 | cluster node | 0 | 1 |
 | peer-address | 10.99.0.2 | 10.99.0.1 |
 | fabric-peer-address | 10.99.1.2 | 10.99.1.1 |
-| fxp1 address | 10.99.0.1/30 | 10.99.0.2/30 |
+| em0 address | 10.99.0.1/30 | 10.99.0.2/30 |
 | fab0 address | 10.99.1.1/30 | 10.99.1.2/30 |
-| WAN RETH member | ge-0/0/1 | ge-7/0/1 |
-| LAN RETH member | ge-0/0/0 | ge-7/0/0 |
+| WAN RETH member | ge-0/0/3 | ge-7/0/3 |
+| LAN RETH member | ge-0/0/2 | ge-7/0/2 |
 
 ### Shared Cluster Settings
 
@@ -221,8 +231,23 @@ chassis {
         reth-count 2;
         heartbeat-interval 1000;
         heartbeat-threshold 3;
-        control-interface fxp1;
-        fabric-interface fab0;
+        control-interface em0;
+        fab0 {
+            fabric-options {
+                member-interfaces {
+                    ge-0/0/0;
+                    ge-7/0/0;
+                }
+            }
+        }
+        fab1 {
+            fabric-options {
+                member-interfaces {
+                    ge-0/0/1;
+                    ge-7/0/1;
+                }
+            }
+        }
         configuration-synchronize;
         redundancy-group 0 {
             node 0 priority 200;
@@ -262,7 +287,7 @@ chassis {
 | Zone | Interfaces | Allowed Services | Allowed Protocols |
 |------|-----------|-----------------|------------------|
 | mgmt | fxp0 | ssh, ping, dhcp | — |
-| control | fxp1, fab0 | ping | — |
+| control | em0, fab0 | ping | — |
 | wan | reth0 | ping | — |
 | lan | reth1 | ssh, ping, dhcp, dhcpv6 | router-discovery |
 

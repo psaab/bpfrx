@@ -15586,6 +15586,184 @@ func TestValidateFabricDualValid(t *testing.T) {
 	}
 }
 
+func TestInterfaceSlot(t *testing.T) {
+	tests := []struct {
+		name string
+		want int
+	}{
+		{"ge-0/0/7", 0},
+		{"ge-7/0/7", 7},
+		{"xe-3/1/2", 3},
+		{"et-0/0/0", 0},
+		{"fab0", -1},
+		{"hb0", -1},
+		{"", -1},
+	}
+	for _, tt := range tests {
+		if got := InterfaceSlot(tt.name); got != tt.want {
+			t.Errorf("InterfaceSlot(%q) = %d, want %d", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestSlotToNodeID(t *testing.T) {
+	if SlotToNodeID(0) != 0 {
+		t.Error("slot 0 should map to node 0")
+	}
+	if SlotToNodeID(7) != 1 {
+		t.Error("slot 7 should map to node 1")
+	}
+	if SlotToNodeID(3) != 0 {
+		t.Error("slot 3 should map to node 0")
+	}
+}
+
+func TestFabricLocalMemberResolution(t *testing.T) {
+	// vSRX-style config: fab0 has node0's member, fab1 has node1's member.
+	cmds := []string{
+		"set interfaces fab0 fabric-options member-interfaces ge-0/0/7",
+		"set interfaces fab0 unit 0 family inet address 10.99.1.1/30",
+		"set interfaces fab1 fabric-options member-interfaces ge-7/0/7",
+		"set interfaces fab1 unit 0 family inet address 10.99.2.1/30",
+		"set chassis cluster node 0",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Node 0: fab0's member ge-0/0/7 (slot 0) should be resolved.
+	fab0 := cfg.Interfaces.Interfaces["fab0"]
+	if fab0 == nil {
+		t.Fatal("fab0 not found")
+	}
+	if fab0.LocalFabricMember != "ge-0/0/7" {
+		t.Errorf("fab0 LocalFabricMember = %q, want %q", fab0.LocalFabricMember, "ge-0/0/7")
+	}
+	// fab1's member ge-7/0/7 (slot 7 = node1) should NOT be resolved for node0.
+	fab1 := cfg.Interfaces.Interfaces["fab1"]
+	if fab1 == nil {
+		t.Fatal("fab1 not found")
+	}
+	if fab1.LocalFabricMember != "" {
+		t.Errorf("fab1 LocalFabricMember = %q, want empty (not this node)", fab1.LocalFabricMember)
+	}
+}
+
+func TestFabricLocalMemberNode1(t *testing.T) {
+	cmds := []string{
+		"set interfaces fab0 fabric-options member-interfaces ge-0/0/7",
+		"set interfaces fab1 fabric-options member-interfaces ge-7/0/7",
+		"set chassis cluster node 1",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Node 1: fab1's member ge-7/0/7 (slot 7) should be resolved.
+	fab1 := cfg.Interfaces.Interfaces["fab1"]
+	if fab1 == nil {
+		t.Fatal("fab1 not found")
+	}
+	if fab1.LocalFabricMember != "ge-7/0/7" {
+		t.Errorf("fab1 LocalFabricMember = %q, want %q", fab1.LocalFabricMember, "ge-7/0/7")
+	}
+	// fab0's member ge-0/0/7 (slot 0 = node0) should NOT be resolved for node1.
+	fab0 := cfg.Interfaces.Interfaces["fab0"]
+	if fab0 == nil {
+		t.Fatal("fab0 not found")
+	}
+	if fab0.LocalFabricMember != "" {
+		t.Errorf("fab0 LocalFabricMember = %q, want empty", fab0.LocalFabricMember)
+	}
+}
+
+func TestFabricAutoDetectFabricInterface(t *testing.T) {
+	// vSRX-style: no explicit fabric-interface in chassis cluster,
+	// should auto-detect from fab0/fab1 member-interfaces.
+	cmds := []string{
+		"set interfaces fab0 fabric-options member-interfaces ge-0/0/7",
+		"set interfaces fab1 fabric-options member-interfaces ge-7/0/7",
+		"set chassis cluster node 0",
+		"set chassis cluster control-interface hb0",
+		"set interfaces hb0 unit 0 family inet address 10.99.0.1/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := cfg.Chassis.Cluster
+	if cc == nil {
+		t.Fatal("cluster config not found")
+	}
+	if cc.FabricInterface != "fab0" {
+		t.Errorf("FabricInterface = %q, want %q", cc.FabricInterface, "fab0")
+	}
+	if cc.Fabric1Interface != "fab1" {
+		t.Errorf("Fabric1Interface = %q, want %q", cc.Fabric1Interface, "fab1")
+	}
+}
+
+func TestFabricLegacyModeNoLocalMember(t *testing.T) {
+	// Legacy mode: fab0 without fabric-options member-interfaces.
+	// LocalFabricMember should stay empty.
+	cmds := []string{
+		"set interfaces fab0 unit 0 family inet address 10.99.1.1/30",
+		"set chassis cluster node 0",
+		"set chassis cluster fabric-interface fab0",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fab0 := cfg.Interfaces.Interfaces["fab0"]
+	if fab0 == nil {
+		t.Fatal("fab0 not found")
+	}
+	if fab0.LocalFabricMember != "" {
+		t.Errorf("legacy fab0 LocalFabricMember = %q, want empty", fab0.LocalFabricMember)
+	}
+}
+
 func TestPerUnitTunnelConfig(t *testing.T) {
 	// Multi-unit GRE tunnel: each unit has its own tunnel endpoints
 	// (mirrors vsrx.conf gr-0/0/0 with IPv4 unit 0 and IPv6 unit 1)

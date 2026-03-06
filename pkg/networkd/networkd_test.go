@@ -525,6 +525,43 @@ func TestGenerateNetwork_BridgeDevice(t *testing.T) {
 	}
 }
 
+func TestApply_UnmanagedNoLinkFile(t *testing.T) {
+	dir := t.TempDir()
+	m := &Manager{networkDir: dir}
+
+	// Pre-create a stale .link file for an unmanaged interface (simulates
+	// old daemon behavior that wrote .link files for unmanaged interfaces).
+	staleLinkPath := filepath.Join(dir, filePrefix+"ge-0-0-0.link")
+	os.WriteFile(staleLinkPath, []byte("stale"), 0644)
+
+	interfaces := []InterfaceConfig{
+		{
+			Name:       "ge-0-0-0",
+			MACAddress: "10:66:6a:eb:3b:ba",
+			Unmanaged:  true,
+		},
+	}
+
+	_ = m.Apply(interfaces)
+
+	// Stale .link file should be removed (unmanaged interfaces don't get .link files)
+	if _, err := os.Stat(staleLinkPath); !os.IsNotExist(err) {
+		t.Error("stale .link file for unmanaged interface should be removed")
+	}
+
+	// .network file should still exist
+	networkPath := filepath.Join(dir, filePrefix+"ge-0-0-0.network")
+	if _, err := os.Stat(networkPath); os.IsNotExist(err) {
+		t.Error("missing .network file for unmanaged interface")
+	}
+
+	// .network should have ActivationPolicy=always-down
+	data, _ := os.ReadFile(networkPath)
+	if !strings.Contains(string(data), "ActivationPolicy=always-down") {
+		t.Error("missing ActivationPolicy=always-down in unmanaged .network")
+	}
+}
+
 func TestApply_BridgeExpectedFiles(t *testing.T) {
 	dir := t.TempDir()
 	m := &Manager{networkDir: dir}

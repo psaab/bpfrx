@@ -6,7 +6,7 @@
 #
 # Single-config model: both nodes share docs/ha-cluster.conf with
 # apply-groups "${node}" expansion. Node ID comes from /etc/bpfrx/node-id.
-# Interface names follow vSRX conventions: fxp0, fxp1, fab0, ge-X/Y/Z.
+# Interface names follow vSRX conventions: fxp0, em0, ge-X/Y/Z.
 #
 # Usage:
 #   ./test/incus/cluster-setup.sh init              # Create networks + profile
@@ -63,17 +63,17 @@ vm_name() {
 }
 
 # vSRX LAN interface name for a given node index
-# Node 0: ge-0-0-0, Node 1: ge-7-0-0
+# Node 0: ge-0-0-2, Node 1: ge-7-0-2
 lan_ifname() {
 	local idx="$1"
-	if [[ "$idx" == "0" ]]; then echo "ge-0-0-0"; else echo "ge-7-0-0"; fi
+	if [[ "$idx" == "0" ]]; then echo "ge-0-0-2"; else echo "ge-7-0-2"; fi
 }
 
 # vSRX WAN interface name for a given node index
-# Node 0: ge-0-0-1, Node 1: ge-7-0-1
+# Node 0: ge-0-0-3, Node 1: ge-7-0-3
 wan_ifname() {
 	local idx="$1"
-	if [[ "$idx" == "0" ]]; then echo "ge-0-0-1"; else echo "ge-7-0-1"; fi
+	if [[ "$idx" == "0" ]]; then echo "ge-0-0-3"; else echo "ge-7-0-3"; fi
 }
 
 # ── Init ─────────────────────────────────────────────────────────────
@@ -140,11 +140,11 @@ devices:
     type: nic
   eth3:
     name: enp8s0
-    network: bpfrx-clan
+    network: bpfrx-fabric1
     type: nic
   eth4:
     name: enp9s0
-    network: bpfrx-fabric1
+    network: bpfrx-clan
     type: nic
 YAML
 }
@@ -180,8 +180,8 @@ create_vm() {
 	while ! incus exec "$vm" -- true &>/dev/null; do
 		sleep 2
 		tries=$((tries + 1))
-		if [[ $tries -ge 30 ]]; then
-			die "VM agent for $vm did not become ready after 60 seconds"
+		if [[ $tries -ge 90 ]]; then
+			die "VM agent for $vm did not become ready after 180 seconds"
 		fi
 	done
 
@@ -202,8 +202,8 @@ create_vm() {
 	while ! incus exec "$vm" -- true &>/dev/null; do
 		sleep 2
 		tries=$((tries + 1))
-		if [[ $tries -ge 30 ]]; then
-			die "VM agent for $vm did not become ready after 60 seconds"
+		if [[ $tries -ge 90 ]]; then
+			die "VM agent for $vm did not become ready after 180 seconds"
 		fi
 	done
 
@@ -227,100 +227,8 @@ provision_vm() {
 		fi
 	done
 
-	# Bootstrap systemd-networkd .link files for interface renaming.
-	# Uses vSRX naming: fxp0 (mgmt), fxp1 (heartbeat), fab0/fab1
-	# (fabric interfaces), ge-X-0-0 (LAN), ge-X-0-1 (WAN/SR-IOV).
-	#
-	# RETH member interfaces (LAN + WAN) use OriginalName= (kernel PCI
-	# name) instead of MACAddress= because bpfrxd programs a virtual MAC
-	# (02:bf:72:...) at runtime. On reboot the interface reverts to its
-	# physical MAC, so a MACAddress= match would fail. OriginalName= is
-	# stable across reboots since it derives from the PCI slot.
-	info "Writing bootstrap networkd .link files ($vm, node $idx)..."
-	local mac_fxp0 mac_fxp1
-	mac_fxp0=$(incus exec "$vm" -- cat /sys/class/net/enp5s0/address 2>/dev/null || true)
-	mac_fxp1=$(incus exec "$vm" -- cat /sys/class/net/enp6s0/address 2>/dev/null || true)
-
-	# SR-IOV VF kernel name varies — find it by exclusion
-	local pci_wan
-	pci_wan=$(incus exec "$vm" -- bash -c '
-		for iface in /sys/class/net/enp*/address; do
-			name=$(basename $(dirname "$iface"))
-			case "$name" in
-				enp5s0|enp6s0|enp7s0|enp8s0|enp9s0|lo) continue ;;
-				*) echo "$name"; break ;;
-			esac
-		done
-	' 2>/dev/null || true)
-
-	local lan_name wan_name
-	lan_name=$(lan_ifname "$idx")
-	wan_name=$(wan_ifname "$idx")
-
-	# Non-RETH interfaces: match by MAC (stable — daemon never changes these MACs)
-	for pair in "fxp0:$mac_fxp0" "fxp1:$mac_fxp1"; do
-		local name="${pair%%:*}" mac="${pair#*:}"
-		if [[ -n "$mac" ]]; then
-			incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-${name}.link << LINKEOF
-# Managed by bpfrxd — do not edit
-[Match]
-MACAddress=${mac}
-
-[Link]
-Name=${name}
-LINKEOF"
-		fi
-	done
-
-	# Fabric interfaces: match by OriginalName (PCI kernel name)
-	# fab0 is enp7s0 (eth2, bpfrx-fabric), fab1 is enp9s0 (eth4, bpfrx-fabric1)
-	incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-fab0.link << LINKEOF
-# Managed by bpfrxd — do not edit
-[Match]
-OriginalName=enp7s0
-
-[Link]
-Name=fab0
-LINKEOF"
-	incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-fab1.link << LINKEOF
-# Managed by bpfrxd — do not edit
-[Match]
-OriginalName=enp9s0
-
-[Link]
-Name=fab1
-LINKEOF"
-
-	# RETH member interfaces: match by OriginalName (PCI kernel name is
-	# stable; MAC alternates between physical and virtual across reboots)
-	# LAN is always enp8s0 (from incus profile eth3→enp8s0→bpfrx-clan)
-	incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-${lan_name}.link << LINKEOF
-# Managed by bpfrxd — do not edit
-[Match]
-OriginalName=enp8s0
-
-[Link]
-Name=${lan_name}
-LINKEOF"
-	if [[ -n "$pci_wan" ]]; then
-		incus exec "$vm" -- bash -c "cat > /etc/systemd/network/10-bpfrx-${wan_name}.link << LINKEOF
-# Managed by bpfrxd — do not edit
-[Match]
-OriginalName=${pci_wan}
-
-[Link]
-Name=${wan_name}
-LINKEOF"
-	fi
-
-	incus exec "$vm" -- networkctl reload
-	sleep 1
-
-	# Bring up interfaces (fab0/fab1 are separate fabric links)
-	info "Bringing up interfaces ($vm)..."
-	for iface in fxp0 fxp1 fab0 fab1 "$lan_name" "$wan_name"; do
-		incus exec "$vm" -- ip link set "$iface" up 2>/dev/null || true
-	done
+	# Interface naming (fxp0, em0, ge-X/0/Y) is now handled by bpfrxd itself
+	# at startup — no external script needed.
 
 	info "Configuring sysctl ($vm)..."
 	incus exec "$vm" -- bash -c 'cat > /etc/sysctl.d/99-bpf.conf <<EOF
@@ -333,7 +241,7 @@ EOF'
 	incus exec "$vm" -- sysctl --system
 
 	info "Installing packages ($vm, this may take a few minutes)..."
-	incus exec "$vm" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony ethtool mtr-tiny linux-perf host'
+	incus exec "$vm" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony ethtool mtr-tiny linux-perf host pciutils'
 
 	# Upgrade kernel to latest from Debian unstable
 	info "Adding Debian unstable repo for kernel upgrade ($vm)..."
@@ -414,6 +322,10 @@ IPv6AcceptRA=true
 RequiredForOnline=no
 EOF'
 	incus exec "$LAN_HOST" -- systemctl restart systemd-networkd
+
+	info "Installing packages on $LAN_HOST..."
+	incus exec "$LAN_HOST" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 mtr-tiny pciutils'
+
 	info "Container $LAN_HOST ready (10.0.60.102/24)."
 }
 

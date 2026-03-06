@@ -831,6 +831,20 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				originalName = physIface.Name
 			}
 		}
+		// vSRX fabric member resolution: when a fabric interface (fab0, fab1)
+		// has a LocalFabricMember set (vSRX fabric-options mode), look up the
+		// member's Linux name to find the physical interface and rename it.
+		if physIface == nil && strings.HasPrefix(ifName, "fab") && ifCfg.LocalFabricMember != "" {
+			memberLinux := config.LinuxIfName(ifCfg.LocalFabricMember)
+			physIface, _ = result.cachedInterfaceByName(memberLinux)
+			if physIface != nil {
+				slog.Info("found vSRX fabric member interface",
+					"fab", linuxName, "member", ifCfg.LocalFabricMember,
+					"kernel", physIface.Name)
+				seen[physIface.Name] = true
+				originalName = physIface.Name
+			}
+		}
 		// Fabric interface recovery: when a fabric interface (fab0, fab1)
 		// isn't found by name, read the bootstrap .link file for its
 		// OriginalName= (PCI kernel name) and look up the kernel interface
@@ -879,6 +893,15 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			if permMAC := getPermAddr(physIface.Name, result); permMAC != "" {
 				mac = permMAC
 			}
+		}
+
+		// vSRX fabric members (LocalFabricMember set): the daemon renames
+		// these at runtime (ge-0-0-0 → fab0). Don't write a .link file —
+		// OriginalName would be the linksetup name (ge-X-0-Y), not the
+		// kernel name (enp*), so it won't match at boot anyway.
+		if ifCfg.LocalFabricMember != "" {
+			mac = ""
+			originalName = ""
 		}
 
 		if effectiveCfg.VlanTagging {
@@ -968,7 +991,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				// Management interfaces (fxp*, fab*) are bound to vrf-mgmt.
 				// Include VRF= in .network so networkctl reconfigure preserves binding.
 				vrfName := ""
-				if strings.HasPrefix(ifName, "fxp") || strings.HasPrefix(ifName, "fab") {
+				if strings.HasPrefix(ifName, "fxp") || strings.HasPrefix(ifName, "fab") || strings.HasPrefix(ifName, "em") {
 					vrfName = "vrf-mgmt"
 				}
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
@@ -996,8 +1019,10 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	// Generate networkd .netdev + .network files for fabric bonds with multiple
 	// members. This makes the bond persistent across reboots via systemd-networkd
 	// (the routing package also creates the bond via netlink at runtime).
+	// Skip vSRX-style fabric (LocalFabricMember set) — the .link rename handles
+	// the single local member; no bond needed.
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
-		if len(ifCfg.FabricMembers) <= 1 {
+		if len(ifCfg.FabricMembers) <= 1 || ifCfg.LocalFabricMember != "" {
 			continue
 		}
 		bondName := ifName

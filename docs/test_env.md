@@ -9,19 +9,19 @@
                           |
               +-----------+-----------+------ ...
               |           |           |
-         incusbr0    bpfrx-trust  bpfrx-untrust  bpfrx-dmz  bpfrx-tunnel
-         10.0.100.1  10.0.1.1     10.0.2.1       10.0.30.1   10.0.40.1
-              |           |           |              |           |
-        +-----+-----+----+-----------+--------------+-----------+------+
-        |  bpfrx-fw VM                                                 |
-        |  enp5s0   (mgmt)     10.0.100.x   — incusbr0 (no default route)|
-        |  enp6s0   (trust)    10.0.1.10     — bpfrx-trust zone        |
-        |  enp7s0   (untrust)  10.0.2.10     — bpfrx-untrust zone      |
-        |  enp8s0   (dmz)      10.0.30.10    — bpfrx-dmz zone          |
-        |  enp9s0   (tunnel)   10.0.40.10    — bpfrx-tunnel zone       |
-        |  enp10s0f0np0 (wan)  i40e PCI pass  — wan zone (VLAN 50)      |
-        |  enp101s0f1np1 (loss0)  i40e PCI pass — loss zone           |
-        +--------------------------------------------------------------+
+         incusbr0    bpfrx-trust  bpfrx-untrust  bpfrx-dmz
+         10.0.100.1  10.0.1.1     10.0.2.1       10.0.30.1
+              |           |           |              |
+        +-----+-----+----+-----------+--------------+------+
+        |  bpfrx-fw VM                                      |
+        |  enp5s0 → fxp0     (mgmt)     DHCP       — incusbr0      |
+        |  enp6s0 → em0      (unused)               — incusbr0      |
+        |  enp7s0 → ge-0-0-0 (trust)    10.0.1.10   — bpfrx-trust   |
+        |  enp8s0 → ge-0-0-1 (untrust)  10.0.2.10   — bpfrx-untrust |
+        |  enp9s0 → ge-0-0-2 (dmz)      10.0.30.10  — bpfrx-dmz     |
+        |  PCI    → ge-0-0-3 (wan)  i40e PCI pass — wan zone (VLAN 50)  |
+        |  PCI    → ge-0-0-4 (loss) i40e PCI pass — loss zone          |
+        +---------------------------------------------------------------+
 ```
 
 ## Test Containers (iperf endpoints)
@@ -42,17 +42,17 @@ dmz-host      10.0.30.101   on bpfrx-dmz bridge
 - Static IPv6: 2001:559:8585:50::5/64, default route via fe80::50 on enp10s0f0np0.50
 - Default routes configured via `routing-options { static { ... } }`
 
-## Management Interface (enp5s0)
+## Management Interface (fxp0)
 - UseRoutes=false in systemd-networkd — suppresses DHCP default route
 - FRR is the sole route manager — only FRR routes in kernel FIB
 - Still reachable via 10.0.100.0/24 connected route (for incus access)
 
 ## IPv6 Addressing
 ```
-enp6s0  (trust)    2001:559:8585:bf01::1/64
-enp7s0  (untrust)  2001:559:8585:bf02::1/64
-enp8s0  (dmz)      2001:559:8585:bf03::1/64
-enp10s0f0np0.50    2001:559:8585:50::5/64
+ge-0/0/0  (trust)    2001:559:8585:bf01::1/64
+ge-0/0/1  (untrust)  2001:559:8585:bf02::1/64
+ge-0/0/2  (dmz)      2001:559:8585:bf03::1/64
+ge-0/0/3.50          2001:559:8585:50::5/64
 ```
 - Router advertisements enabled on trust, untrust, dmz (managed + other-stateful)
 - DHCPv6 server pools on trust, untrust, dmz (::100 to ::1ff range)
@@ -79,8 +79,8 @@ enp10s0f0np0.50    2001:559:8585:50::5/64
 - untrust->trust: [2001:559:8585:bf02::1]:8080 -> [2001:559:8585:bf01::100]:80 (pool web-server-v6)
 
 ## Firewall Filters
-- `dscp-filter` (inet, on untrust enp7s0 input): accepts DSCP EF, blocks SSH (tcp/22), accepts rest
-- `block-ra` (inet6, on untrust enp7s0 input): blocks ICMPv6 type 134 (router advertisements), accepts rest
+- `dscp-filter` (inet, on untrust ge-0/0/1 input): accepts DSCP EF, blocks SSH (tcp/22), accepts rest
+- `block-ra` (inet6, on untrust ge-0/0/1 input): blocks ICMPv6 type 134 (router advertisements), accepts rest
 
 ## Screen / IDS
 - `untrust-screen`: tcp land, syn-flood; icmp ping-death; ip source-route-option
@@ -108,12 +108,11 @@ enp10s0f0np0.50    2001:559:8585:50::5/64
 ## XDP Mode per Interface
 | Interface | Driver | XDP Mode | Reason |
 |-----------|--------|----------|--------|
-| enp6s0 | virtio_net | native | supports ndo_xdp_xmit |
-| enp7s0 | virtio_net | native | supports ndo_xdp_xmit |
-| enp8s0 | virtio_net | native | supports ndo_xdp_xmit |
-| enp9s0 | virtio_net | native | supports ndo_xdp_xmit |
-| enp10s0f0np0 | i40e | native | PF driver supports ndo_xdp_xmit |
-| enp101s0f1np1 | i40e | native | PF driver supports ndo_xdp_xmit |
+| ge-0-0-0 (enp7s0) | virtio_net | native | supports ndo_xdp_xmit |
+| ge-0-0-1 (enp8s0) | virtio_net | native | supports ndo_xdp_xmit |
+| ge-0-0-2 (enp9s0) | virtio_net | native | supports ndo_xdp_xmit |
+| ge-0-0-3 (PCI) | i40e | native | PF driver supports ndo_xdp_xmit |
+| ge-0-0-4 (PCI) | i40e | native | PF driver supports ndo_xdp_xmit |
 
 ## BPF Pin Paths
 ```
@@ -158,25 +157,25 @@ packet arrives on an interface belonging to a routing instance, `xdp_zone` sets
 when `routing_table != 0`. PBR from firewall filters takes priority over VRF routing.
 
 ### Current test config
-`tunnel-vr` routing instance: enp9s0 in VRF table 100, static route 10.0.50.0/24 via 10.0.40.1.
+`dmz-vr` routing instance: ge-0-0-2 in VRF, rib-group route leaking to main table.
 
 ### Infrastructure verification (DONE)
 ```bash
 # 1. VRF device exists
 sg incus-admin -c "incus exec bpfrx-fw -- ip vrf show"
-# Expected: vrf-tunnel-vr  100
+# Expected: vrf-dmz-vr  100
 
 # 2. Interface bound to VRF
-sg incus-admin -c "incus exec bpfrx-fw -- ip link show enp9s0"
-# Expected: master vrf-tunnel-vr, XDP still attached
+sg incus-admin -c "incus exec bpfrx-fw -- ip link show ge-0-0-2"
+# Expected: master vrf-dmz-vr, XDP still attached
 
 # 3. VRF routing table populated
 sg incus-admin -c "incus exec bpfrx-fw -- ip route show table 100"
-# Expected: 10.0.40.0/24 connected + 10.0.50.0/24 via 10.0.40.1
+# Expected: 10.0.30.0/24 connected
 
 # 4. FRR has per-VRF route
 sg incus-admin -c "incus exec bpfrx-fw -- cat /etc/frr/frr.conf" | grep -A 2 vrf
-# Expected: ip route 10.0.50.0/24 10.0.40.1 5 vrf vrf-tunnel-vr
+# Expected: vrf vrf-dmz-vr section
 
 # 5. No regressions — existing zones still work
 sg incus-admin -c "incus exec trust-host -- ping -c 3 10.0.2.102"     # trust→untrust
@@ -315,11 +314,12 @@ Both nodes share `docs/ha-cluster.conf` using `apply-groups "${node}"`. Node ID 
           | pri 200    |  | pri 100    |
           +------------+  +------------+
           | fxp0  DHCP |  | fxp0  DHCP|  ← incusbr0
-          | fxp1 .0.1  |←→| fxp1 .0.2 |  ← bpfrx-heartbeat
-          | fab0 .1.1  |←→| fab0 .1.2 |  ← bpfrx-fabric
-          | ge-0-0-1   |  | ge-7-0-1  |  ← SR-IOV VF (PCI passthrough)
+          | em0  .0.1  |←→| em0  .0.2 |  ← bpfrx-heartbeat
+          | ge-0-0-0→fab0|←→|ge-7-0-0→fab0| ← bpfrx-fabric
+          | ge-0-0-1→fab1|←→|ge-7-0-1→fab1| ← bpfrx-fabric1
+          | ge-0-0-3   |  | ge-7-0-3  |  ← SR-IOV VF (PCI passthrough)
           |  └reth0────|──|──reth0┘   |  RETH: 172.16.50.6/24
-          | ge-0-0-0   |  | ge-7-0-0  |  ← bpfrx-clan bridge
+          | ge-0-0-2   |  | ge-7-0-2  |  ← bpfrx-clan bridge
           |  └reth1────|──|──reth1┘   |  RETH: 10.0.60.1/24
           +------------+  +------------+
                                |
@@ -333,7 +333,7 @@ Both nodes share `docs/ha-cluster.conf` using `apply-groups "${node}"`. Node ID 
 ### IP Addressing
 | Link | Subnet | fw0 | fw1 |
 |------|--------|-----|-----|
-| Heartbeat (fxp1) | 10.99.0.0/30 | 10.99.0.1 | 10.99.0.2 |
+| Heartbeat (em0) | 10.99.0.0/30 | 10.99.0.1 | 10.99.0.2 |
 | Fabric (fab0) | 10.99.1.0/30 | 10.99.1.1 | 10.99.1.2 |
 | WAN RETH (reth0) | 172.16.50.0/24 | VIP 172.16.50.6 | |
 | LAN RETH (reth1) | 10.0.60.0/24 | VIP 10.0.60.1 | |
@@ -345,8 +345,8 @@ Both nodes share `docs/ha-cluster.conf` using `apply-groups "${node}"`. Node ID 
 
 ### Profile: `bpfrx-cluster`
 - 4 CPU, 4GB RAM, 20GB disk
-- eth0→incusbr0 (fxp0), eth1→bpfrx-heartbeat (fxp1), eth2→bpfrx-fabric (fab0), eth3→bpfrx-clan (ge-X-0-0)
-- SR-IOV VF added per-VM as PCI passthrough device `wan-vf`
+- eth0→incusbr0 (fxp0), eth1→bpfrx-heartbeat (em0), eth2→bpfrx-fabric (ge-X-0-0→fab0), eth3→bpfrx-fabric1 (ge-X-0-1→fab1), eth4→bpfrx-clan (ge-X-0-2), eth5→incusbr0 (ge-X-0-3, spare)
+- SR-IOV VF added per-VM as PCI passthrough device `wan-vf` (ge-X-0-4)
 
 ### Config
 - Single unified config: `docs/ha-cluster.conf` (pushed to both VMs as `/etc/bpfrx/bpfrx.conf`)
@@ -365,7 +365,7 @@ Both nodes share `docs/ha-cluster.conf` using `apply-groups "${node}"`. Node ID 
 ```
 
 ### Validation Steps
-1. Heartbeat: fw0 pings fw1 on 10.99.0.x via fxp1
+1. Heartbeat: fw0 pings fw1 on 10.99.0.x via em0
 2. Fabric: fw0 pings fw1 on 10.99.1.x via fab0
 3. Cluster status: `show chassis cluster status` — fw0=primary, fw1=secondary
 4. RETH active: reth0/reth1 IPs on fw0 only

@@ -136,7 +136,8 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - Every interface must be defined in the firewall config and assigned to a security zone
 - Interfaces not in the config are brought down and marked `ActivationPolicy=always-down` in networkd
 - VRF devices and tunnel interfaces created by the daemon are excluded from unmanaged detection
-- **`.link` files**: written per-interface, prefix `10-bpfrx-`, rename kernel names (enp6s0→trust0)
+- **`.link` files**: written per-interface, prefix `10-bpfrx-`, rename kernel names (enp7s0→ge-0-0-0)
+  - Startup naming: `enumerateAndRenameInterfaces()` in `pkg/daemon/linksetup.go` runs at daemon start, assigns vSRX names (fxp0, em0, ge-{FPC}-0-{PORT})
   - Non-RETH interfaces: match by `MACAddress=` (MAC is stable)
   - RETH member interfaces: match by `OriginalName=` (PCI kernel name) — MAC alternates between physical (boot) and virtual (daemon), so `MACAddress=` is unreliable
   - `ensureRethLinkOriginalName()` auto-fixes stale `.link` files that use `MACAddress=` for RETH members
@@ -144,7 +145,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
   - `KeepConfiguration=static` on RETH interfaces preserves VRRP VIPs across `networkctl reload`
 - Stale files are auto-removed; `networkctl reload` called only when files actually change
 - **DHCP interfaces**: daemon's DHCP client manages the address; address reconciliation is skipped
-- **Bootstrap**: `cluster-setup.sh` writes initial `.link` files for first boot (before daemon has run)
+- **Bootstrap**: daemon's `enumerateAndRenameInterfaces()` runs at startup, writes `.link` files + bootstrap fxp0 DHCP `.network`
 - DHCP-learned default routes get admin distance 200 in FRR (lower priority than static routes)
 
 ### XDP on SR-IOV Interfaces
@@ -192,18 +193,18 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 ## Network Topology (Test VM)
 
 All interfaces are managed by bpfrxd — renamed via `.link` files, configured via `.network` files.
+Startup naming by `enumerateAndRenameInterfaces()` assigns vSRX names based on PCI bus order.
 
 ```
-VM (bpfrx-fw) — Virtio NICs (via Incus bridges), all managed by bpfrxd:
-  enp5s0  → mgmt0     DHCP          — mgmt zone (SSH + ping)
-  enp6s0  → trust0    10.0.1.10     — trust zone
-  enp7s0  → untrust0  10.0.2.10     — untrust zone
-  enp8s0  → dmz0      10.0.30.10    — dmz zone
-  enp9s0  → tunnel0   10.0.40.10    — tunnel zone
-
-VM (bpfrx-fw) — i40e PCI passthrough, managed by bpfrxd:
-  enp10s0f0np0  → wan0   172.16.50.5  — wan zone (VLAN 50, IPv6 2001:559:8585:50::5/64)
-  enp101s0f1np1 → loss0               — loss zone (PCI passthrough)
+Standalone VM (bpfrx-fw) — no /etc/bpfrx/node-id, no em0:
+  Virtio (PCI bus 05-08):
+    enp5s0  → fxp0       DHCP          — mgmt zone (SSH + ping)
+    enp6s0  → ge-0-0-0   10.0.1.10     — trust zone
+    enp7s0  → ge-0-0-1   10.0.2.10     — untrust zone
+    enp8s0  → ge-0-0-2   10.0.30.10    — dmz zone
+  i40e PCI passthrough (PCI bus 09+, always higher than virtio):
+    enp9s0f0np0   → ge-0-0-3  172.16.50.5  — wan zone (VLAN 50, IPv6)
+    enp101s0f1np1 → ge-0-0-4               — loss zone
 
 Test containers:
   trust-host    10.0.1.102  (2001:559:8585:bf01::102)  — bpfrx-trust bridge

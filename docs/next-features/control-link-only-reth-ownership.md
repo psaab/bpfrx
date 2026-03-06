@@ -26,17 +26,17 @@ So the target architecture is:
 ### Practical Design Direction
 
 Recommended control-plane path:
-- Use `control-interface` (prefer `fxp1`) for election, owner lease renewals, and failover control RPCs.
+- Use `control-interface` (prefer `em0`) for election, owner lease renewals, and failover control RPCs.
 - Keep `fab0/fab1` for session/config sync and cross-chassis forwarding data-path needs.
 
 Rationale:
-- `fxp1` is already the dedicated heartbeat/election interface in current design.
+- `em0` is already the dedicated heartbeat/election interface in current design.
 - Separating election control from fabric forwarding reduces coupling to fabric load/churn.
 - `fxp0` is typically external/OOB management and less ideal for HA control traffic dependence.
 
 1. **Elect per RG over private links**
 - Reuse current per-RG scoring (`priority`, `weight`, `preempt`, tie-break) from cluster election.
-- Carry lease/election control over `control-interface` (`fxp1`), not LAN/WAN VRRP multicast.
+- Carry lease/election control over `control-interface` (`em0`), not LAN/WAN VRRP multicast.
 
 2. **Add explicit per-RG owner lease (epoch)**
 - Winner gets `(rg_id, owner_node, epoch, lease_expiry)`.
@@ -47,7 +47,7 @@ Rationale:
 - Epoch prevents stale late messages from restoring old owner state.
 
 3. **Use dual private transports for resiliency**
-- Primary: election/control strictly over control link (`fxp1`).
+- Primary: election/control strictly over control link (`em0`).
 - Optional safety: fabric can carry corroboration/health hints, but should not be authority for ownership decisions.
 - Do not couple ownership to LAN/WAN multicast reception.
 
@@ -87,7 +87,7 @@ This gives **per-RETH (per-RG) ownership election and failover over private HA l
 ### Config shape (current code)
 
 ```junos
-set chassis cluster control-interface fxp1
+set chassis cluster control-interface em0
 set chassis cluster peer-address 10.99.0.2
 set chassis cluster fabric-interface fab0
 set chassis cluster fabric-peer-address 10.99.1.2
@@ -154,7 +154,7 @@ Result:
 - Require control heartbeat healthy, monitored interfaces up, and sync connectivity healthy before allowing promotion.
 
 3. Add transport policy for election path:
-- Make `control-interface` (`fxp1`) the explicit authoritative election/control path.
+- Make `control-interface` (`em0`) the explicit authoritative election/control path.
 - Keep fabric signals non-authoritative (diagnostic/corroboration only) unless explicitly configured otherwise.
 - Expose active authority path in config/status.
 
@@ -191,7 +191,7 @@ Cons:
 Do **not** flip globally yet.  
 Create one issue to harden and validate the existing `no-reth-vrrp` path, then run a lab canary.
 
-For architecture direction: choose `fxp1` as the control/election authority and avoid
+For architecture direction: choose `em0` as the control/election authority and avoid
 using `fab0/1` as the primary control-plane election channel.
 
 If you need lower chatter immediately without architecture change, raise

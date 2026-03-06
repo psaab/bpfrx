@@ -12,6 +12,36 @@ func LinuxIfName(name string) string {
 	return strings.ReplaceAll(name, "/", "-")
 }
 
+// InterfaceSlot extracts the FPC slot number from a Junos interface name.
+// "ge-0/0/7" → 0, "ge-7/0/7" → 7, "xe-3/1/2" → 3.
+// Returns -1 if the name doesn't match the <type>-N/N/N pattern.
+func InterfaceSlot(name string) int {
+	// Find the first "-" separator, then parse the FPC number before the first "/".
+	dashIdx := strings.Index(name, "-")
+	if dashIdx < 0 || dashIdx+1 >= len(name) {
+		return -1
+	}
+	rest := name[dashIdx+1:]
+	slashIdx := strings.Index(rest, "/")
+	if slashIdx < 0 {
+		return -1
+	}
+	slot, err := strconv.Atoi(rest[:slashIdx])
+	if err != nil {
+		return -1
+	}
+	return slot
+}
+
+// SlotToNodeID maps a vSRX FPC slot to a cluster node-id.
+// Convention: slot 0 → node0, slot 7 → node1.
+func SlotToNodeID(slot int) int {
+	if slot == 7 {
+		return 1
+	}
+	return 0
+}
+
 // RethToPhysical returns a map of reth name → local physical member name.
 // Built from interfaces that have RedundantParent set.
 func (c *Config) RethToPhysical() map[string]string {
@@ -1074,6 +1104,7 @@ type InterfaceConfig struct {
 	LAGParent           string                  // gigether-options 802.3ad <ae-name> (LAG member binding)
 	RedundancyGroup     int                     // redundant-ether-options redundancy-group (0 = none)
 	FabricMembers       []string                // fabric-options member-interfaces
+	LocalFabricMember   string                  // resolved local member for this node (vSRX fabric-options mode)
 	BondMode            string                  // bond mode: "active-backup" for fabric, "802.3ad" for ae
 	AggregatedEtherOpts *AggregatedEtherOptions // ae interface options (LACP, etc.)
 	Units               map[int]*InterfaceUnit

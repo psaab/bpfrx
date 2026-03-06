@@ -225,6 +225,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Info("configuration loaded from db")
 	}
 
+	// Enumerate PCI NICs and assign vSRX-style names (fxp0, em0, ge-X-0-Y)
+	// before any manager creation or BPF load.
+	if !d.opts.NoDataplane {
+		clusterMode := false
+		nodeID := 0
+		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
+			clusterMode = true
+			nodeID = cfg.Chassis.Cluster.NodeID
+		}
+		if err := enumerateAndRenameInterfaces(nodeID, clusterMode); err != nil {
+			slog.Warn("interface naming failed", "err", err)
+		}
+	}
+
 	// Initialize routing, FRR, and IPsec managers
 	if !d.opts.NoDataplane {
 		rm, err := routing.New()
@@ -1382,7 +1396,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	if d.routing != nil {
 		mgmtIfaces := make(map[string]bool)
 		for name := range cfg.Interfaces.Interfaces {
-			if strings.HasPrefix(name, "fxp") || strings.HasPrefix(name, "fab") {
+			if strings.HasPrefix(name, "fxp") || strings.HasPrefix(name, "fab") || strings.HasPrefix(name, "em") {
 				mgmtIfaces[config.LinuxIfName(name)] = true
 			}
 		}
@@ -1455,6 +1469,33 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// VRRP now runs directly on physical member interfaces — no bonds needed.
 	if d.routing != nil {
 		d.routing.ClearRethInterfaces()
+	}
+
+	// 1.9. Runtime rename of vSRX fabric member interfaces.
+	// enumerateAndRenameInterfaces renames kernel interfaces to ge-X-0-Y
+	// at daemon startup. The fabric rename (e.g. ge-0-0-0 → fab0) happens
+	// here because it's config-driven, not positional.
+	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg.LocalFabricMember == "" || !strings.HasPrefix(ifName, "fab") {
+			continue
+		}
+		fabLinux := config.LinuxIfName(ifName)
+		if _, err := netlink.LinkByName(fabLinux); err == nil {
+			continue // already named correctly
+		}
+		memberLinux := config.LinuxIfName(ifCfg.LocalFabricMember)
+		link, err := netlink.LinkByName(memberLinux)
+		if err != nil {
+			continue
+		}
+		netlink.LinkSetDown(link)
+		if err := netlink.LinkSetName(link, fabLinux); err != nil {
+			slog.Warn("failed to rename fabric member",
+				"from", memberLinux, "to", fabLinux, "err", err)
+		} else {
+			slog.Info("renamed fabric member interface",
+				"from", memberLinux, "to", fabLinux)
+		}
 	}
 
 	// 2. Compile eBPF dataplane

@@ -36,7 +36,6 @@ NETWORKS=(
 	"bpfrx-trust:none:false"
 	"bpfrx-untrust:none:false"
 	"bpfrx-dmz:none:false"
-	"bpfrx-tunnel:10.0.40.1/24:false"
 )
 
 info()  { echo "==> $*"; }
@@ -112,6 +111,9 @@ create_vm_profile() {
 	fi
 	info "Creating profile $VM_PROFILE"
 	incus profile create "$VM_PROFILE"
+	# Only fxp0 (mgmt) in profile — em0 and data NICs are added in
+	# cmd_create_vm while the VM is stopped, to control PCI bus ordering.
+	# em0 can't share incusbr0 with fxp0 (Incus DNS name conflict).
 	incus profile edit "$VM_PROFILE" <<'YAML'
 config:
   limits.cpu: "4"
@@ -126,32 +128,16 @@ devices:
     name: enp5s0
     network: incusbr0
     type: nic
-  eth1:
-    name: enp6s0
-    network: bpfrx-trust
-    type: nic
-  eth2:
-    name: enp7s0
-    network: bpfrx-untrust
-    type: nic
-  eth3:
-    name: enp8s0
-    network: bpfrx-dmz
-    type: nic
-  eth4:
-    name: enp9s0
-    network: bpfrx-tunnel
-    type: nic
 YAML
 }
 
 create_ct_profile() {
-	if incus profile show "$CT_PROFILE" &>/dev/null 2>&1; then
-		info "Profile $CT_PROFILE already exists, updating..."
-		incus profile delete "$CT_PROFILE" 2>/dev/null || true
+	if ! incus profile show "$CT_PROFILE" &>/dev/null 2>&1; then
+		info "Creating profile $CT_PROFILE"
+		incus profile create "$CT_PROFILE"
+	else
+		info "Updating profile $CT_PROFILE"
 	fi
-	info "Creating profile $CT_PROFILE"
-	incus profile create "$CT_PROFILE"
 	incus profile edit "$CT_PROFILE" <<'YAML'
 config:
   security.privileged: "true"
@@ -173,19 +159,19 @@ devices:
     type: nic
   eth1:
     name: eth1
-    network: bpfrx-trust
+    network: incusbr0
     type: nic
   eth2:
     name: eth2
-    network: bpfrx-untrust
+    network: bpfrx-trust
     type: nic
   eth3:
     name: eth3
-    network: bpfrx-dmz
+    network: bpfrx-untrust
     type: nic
   eth4:
     name: eth4
-    network: bpfrx-tunnel
+    network: bpfrx-dmz
     type: nic
 YAML
 }
@@ -204,51 +190,60 @@ cmd_create_vm() {
 	while ! incus exec "$INSTANCE_NAME" -- true &>/dev/null; do
 		sleep 2
 		tries=$((tries + 1))
-		if [[ $tries -ge 30 ]]; then
-			die "VM agent did not become ready after 60 seconds"
+		if [[ $tries -ge 90 ]]; then
+			die "VM agent did not become ready after 180 seconds"
 		fi
 	done
 
-	# Hot-add PCI passthrough NICs after boot
-	# (NIC type fails with agent race; PCI type does raw VFIO passthrough)
-	# Capture MACs before passthrough (host sysfs disappears after VFIO bind)
-	local wan_pci wan_mac loss_pci loss_mac
-	wan_pci=$(readlink -f /sys/class/net/enp101s0f0v0/device 2>/dev/null | xargs basename 2>/dev/null)
-	wan_mac=$(cat /sys/class/net/enp101s0f0v0/address 2>/dev/null || echo "")
+	# Stop VM to add PCI passthrough devices (can't be hotplugged) and
+	# extra virtio data NICs. Profile only has fxp0. Standalone has no em0.
+	# Note: PCI passthrough always gets higher bus numbers than virtio (QEMU).
+	info "Stopping VM to add NICs and PCI devices..."
+	incus stop "$INSTANCE_NAME"
+
+	# Add virtio data NICs
+	info "Adding virtio data NICs (trust, untrust, dmz)..."
+	incus config device add "$INSTANCE_NAME" eth1 nic network=bpfrx-trust
+	incus config device add "$INSTANCE_NAME" eth2 nic network=bpfrx-untrust
+	incus config device add "$INSTANCE_NAME" eth3 nic network=bpfrx-dmz
+
+	# Add PCI passthrough devices
+	local wan_pci loss_pci
+	wan_pci=$(readlink -f /sys/class/net/enp101s0f0np0/device 2>/dev/null | xargs basename 2>/dev/null)
 	if [[ -n "$wan_pci" ]]; then
-		info "Adding WAN NIC ($wan_pci, MAC=$wan_mac) to VM via PCI passthrough..."
+		info "Adding WAN PF ($wan_pci)..."
 		incus config device add "$INSTANCE_NAME" internet pci address="$wan_pci"
 	else
-		warn "WAN interface enp101s0f0v0 not found, skipping"
+		warn "WAN interface enp101s0f0np0 not found, skipping"
 	fi
 
 	loss_pci=$(readlink -f /sys/class/net/enp101s0f1np1/device 2>/dev/null | xargs basename 2>/dev/null)
-	loss_mac=$(cat /sys/class/net/enp101s0f1np1/address 2>/dev/null || echo "")
 	if [[ -n "$loss_pci" ]]; then
-		info "Adding loss NIC ($loss_pci, MAC=$loss_mac) to VM via PCI passthrough..."
+		info "Adding loss PF ($loss_pci)..."
 		incus config device add "$INSTANCE_NAME" loss pci address="$loss_pci"
 	else
 		warn "Loss interface enp101s0f1np1 not found, skipping"
 	fi
 
-	provision_instance vm "$wan_mac" "$loss_mac"
+	# Start VM with all devices
+	info "Starting VM..."
+	incus start "$INSTANCE_NAME"
+	info "Waiting for VM agent..."
+	tries=0
+	while ! incus exec "$INSTANCE_NAME" -- true &>/dev/null; do
+		sleep 2
+		tries=$((tries + 1))
+		if [[ $tries -ge 90 ]]; then
+			die "VM agent did not become ready after 180 seconds"
+		fi
+	done
+
+	provision_instance vm
 	info "VM ready. Run '$0 deploy' to push bpfrxd binary."
 }
 
 provision_instance() {
 	local type="$1"  # "vm" or "ct"
-	local wan_mac_arg="${2:-}"
-	local loss_mac_arg="${3:-}"
-
-	# Interface names differ between VM (PCI enumeration) and container
-	local iface_mgmt iface_trust iface_untrust iface_dmz iface_tunnel
-	if [[ "$type" == "vm" ]]; then
-		iface_mgmt=enp5s0; iface_trust=enp6s0; iface_untrust=enp7s0
-		iface_dmz=enp8s0; iface_tunnel=enp9s0
-	else
-		iface_mgmt=eth0; iface_trust=eth1; iface_untrust=eth2
-		iface_dmz=eth3; iface_tunnel=eth4
-	fi
 
 	# Wait for systemd to be ready (VM agent may respond before systemd is up)
 	info "Waiting for system to be ready..."
@@ -262,60 +257,15 @@ provision_instance() {
 		fi
 	done
 
-	# Bootstrap systemd-networkd .link files for interface renaming.
-	# bpfrxd writes the same files once running, but these bootstrap files
-	# ensure interfaces are renamed before the daemon's first start.
-	# All interfaces (including mgmt) are fully managed by bpfrxd.
-	info "Writing bootstrap networkd .link files..."
-	if [[ "$type" == "vm" ]]; then
-		# Read MAC addresses from kernel interfaces
-		local mac_mgmt mac_trust mac_untrust mac_dmz mac_tunnel mac_wan
-		mac_mgmt=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_mgmt"/address 2>/dev/null || true)
-		mac_trust=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_trust"/address 2>/dev/null || true)
-		mac_untrust=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_untrust"/address 2>/dev/null || true)
-		mac_dmz=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_dmz"/address 2>/dev/null || true)
-		mac_tunnel=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/"$iface_tunnel"/address 2>/dev/null || true)
-		mac_wan=$(incus exec "$INSTANCE_NAME" -- cat /sys/class/net/enp10s0f0np0/address 2>/dev/null || true)
-		# loss0 MAC: try reading from VM, fall back to arg passed from host
-		local mac_loss
-		mac_loss=$(incus exec "$INSTANCE_NAME" -- bash -c 'for i in /sys/class/net/enp*s0*np1/address; do cat "$i" 2>/dev/null && break; done' 2>/dev/null || true)
-		[[ -z "$mac_loss" ]] && mac_loss="$loss_mac_arg"
+	# Interface naming (fxp0, em0, ge-X/0/Y) is now handled by bpfrxd itself
+	# at startup — no external script needed.
+	incus exec "$INSTANCE_NAME" -- mkdir -p /etc/bpfrx
 
-		# Write .link files (same format bpfrxd generates)
-		for pair in "mgmt0:$mac_mgmt" "trust0:$mac_trust" "untrust0:$mac_untrust" \
-			"dmz0:$mac_dmz" "tunnel0:$mac_tunnel" "wan0:$mac_wan" "loss0:$mac_loss"; do
-			local name="${pair%%:*}" mac="${pair#*:}"
-			if [[ -n "$mac" ]]; then
-				incus exec "$INSTANCE_NAME" -- bash -c "cat > /etc/systemd/network/10-bpfrx-${name}.link << LINKEOF
-# Managed by bpfrxd — do not edit
-[Match]
-MACAddress=${mac}
-
-[Link]
-Name=${name}
-LINKEOF"
-			fi
-		done
-
-		# Remove any stale non-bpfrx networkd files for firewall interfaces
-		incus exec "$INSTANCE_NAME" -- rm -f \
-			/etc/systemd/network/enp5s0.network \
-			/etc/systemd/network/10-mgmt0.network \
-			/etc/systemd/network/10-mgmt0.link 2>/dev/null || true
-
-		incus exec "$INSTANCE_NAME" -- networkctl reload
-		sleep 1
-	fi
-
-	# Bring up interfaces (IPs are assigned by bpfrxd from config)
-	info "Bringing up interfaces..."
-	incus exec "$INSTANCE_NAME" -- ip link set mgmt0 up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set trust0 up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set untrust0 up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set dmz0 up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set tunnel0 up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set wan0 up 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- ip link set loss0 up 2>/dev/null || true
+	# Remove any stale non-bpfrx networkd files
+	incus exec "$INSTANCE_NAME" -- rm -f \
+		/etc/systemd/network/enp5s0.network \
+		/etc/systemd/network/10-mgmt0.network \
+		/etc/systemd/network/10-mgmt0.link 2>/dev/null || true
 
 	info "Configuring sysctl..."
 	incus exec "$INSTANCE_NAME" -- bash -c 'cat > /etc/sysctl.d/99-bpf.conf <<EOF
@@ -328,7 +278,7 @@ EOF'
 	incus exec "$INSTANCE_NAME" -- sysctl --system
 
 	info "Installing packages (this may take a few minutes)..."
-	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony mtr-tiny linux-perf host'
+	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony mtr-tiny linux-perf host pciutils'
 
 	# Upgrade kernel to latest from Debian unstable for full BPF verifier support
 	info "Adding Debian unstable repo for kernel upgrade..."

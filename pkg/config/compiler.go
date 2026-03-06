@@ -134,6 +134,38 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 		}
 	}
 
+	// Post-compilation fixup: resolve vSRX-style fabric member-interfaces.
+	// For fab0/fab1 with fabric-options member-interfaces, resolve which member
+	// belongs to the local node using FPC slot → node-id mapping (slot 0 → node0,
+	// slot 7 → node1). Also auto-populate FabricInterface/Fabric1Interface when
+	// not explicitly set in chassis cluster config.
+	if cc := cfg.Chassis.Cluster; cc != nil {
+		for ifName, ifc := range cfg.Interfaces.Interfaces {
+			if !strings.HasPrefix(ifName, "fab") || len(ifc.FabricMembers) == 0 {
+				continue
+			}
+			for _, member := range ifc.FabricMembers {
+				slot := InterfaceSlot(member)
+				if slot >= 0 && SlotToNodeID(slot) == cc.NodeID {
+					ifc.LocalFabricMember = member
+					break
+				}
+			}
+		}
+		// Auto-detect fabric interfaces from fab0/fab1 member-interfaces
+		// when not explicitly configured via fabric-interface/fabric1-interface.
+		if cc.FabricInterface == "" {
+			if f0, ok := cfg.Interfaces.Interfaces["fab0"]; ok && len(f0.FabricMembers) > 0 {
+				cc.FabricInterface = "fab0"
+			}
+		}
+		if cc.Fabric1Interface == "" {
+			if f1, ok := cfg.Interfaces.Interfaces["fab1"]; ok && len(f1.FabricMembers) > 0 {
+				cc.Fabric1Interface = "fab1"
+			}
+		}
+	}
+
 	if warnings := ValidateConfig(cfg); len(warnings) > 0 {
 		for _, w := range warnings {
 			cfg.Warnings = append(cfg.Warnings, w)

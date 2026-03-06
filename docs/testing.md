@@ -18,32 +18,33 @@ VM:   Debian 13, kernel 6.18.9 (from unstable repo)
                           |
               +-----------+-----------+------ ...
               |           |           |
-         incusbr0    bpfrx-trust  bpfrx-untrust  bpfrx-dmz  bpfrx-tunnel
-         10.0.100.1  10.0.1.1     10.0.2.1       10.0.30.1   10.0.40.1
-              |           |           |              |           |
-        +-----+-----+----+-----------+--------------+-----------+------+
-        |  bpfrx-fw VM                                                 |
-        |  enp5s0   (mgmt)     10.0.100.x   — incusbr0 (no default route)|
-        |  enp6s0   (trust)    10.0.1.10     — bpfrx-trust zone        |
-        |  enp7s0   (untrust)  10.0.2.10     — bpfrx-untrust zone      |
-        |  enp8s0   (dmz)      10.0.30.10    — bpfrx-dmz zone          |
-        |  enp9s0   (tunnel)   DHCP          — bpfrx-tunnel zone       |
-        |  enp10s0f0(internet) SR-IOV PCI    — wan zone (VLAN + DHCP)  |
-        +--------------------------------------------------------------+
+         incusbr0    bpfrx-trust  bpfrx-untrust  bpfrx-dmz
+         10.0.100.1  10.0.1.1     10.0.2.1       10.0.30.1
+              |           |           |              |
+        +-----+-----+----+-----------+--------------+-----------+
+        |  bpfrx-fw VM                                          |
+        |  enp5s0 → fxp0    (mgmt)     DHCP    — incusbr0      |
+        |  enp6s0 → em0     (unused in standalone)              |
+        |  enp7s0 → ge-0-0-0 (trust)   10.0.1.10  — trust zone |
+        |  enp8s0 → ge-0-0-1 (untrust) 10.0.2.10  — untrust    |
+        |  enp9s0 → ge-0-0-2 (dmz)     10.0.30.10 — dmz zone   |
+        |  PCI    → ge-0-0-3 (wan)     172.16.50.5 — wan zone   |
+        |  PCI    → ge-0-0-4 (loss)    PCI passthrough          |
+        +-------------------------------------------------------+
 ```
 
 ### Interface Details
 | Interface | Renamed | Driver | XDP Mode | Zone | Address |
 |-----------|---------|--------|----------|------|---------|
-| enp5s0 | mgmt0 | virtio_net | native | mgmt | DHCP |
-| enp6s0 | trust0 | virtio_net | native | trust | 10.0.1.10/24 |
-| enp7s0 | untrust0 | virtio_net | native | untrust | 10.0.2.10/24 |
-| enp8s0 | dmz0 | virtio_net | native | dmz | 10.0.30.10/24 |
-| enp9s0 | tunnel0 | virtio_net | native | tunnel | 10.0.40.10/24 |
-| enp10s0f0np0 | wan0 | i40e (PF) | native | wan | VLAN 50, 172.16.50.5 + IPv6 |
-| enp101s0f1np1 | loss0 | i40e (PF) | native | loss | PCI passthrough |
+| enp5s0 | fxp0 | virtio_net | native | mgmt | DHCP |
+| enp6s0 | em0 | virtio_net | native | — | unused (standalone) |
+| enp7s0 | ge-0-0-0 | virtio_net | native | trust | 10.0.1.10/24 |
+| enp8s0 | ge-0-0-1 | virtio_net | native | untrust | 10.0.2.10/24 |
+| enp9s0 | ge-0-0-2 | virtio_net | native | dmz | 10.0.30.10/24 |
+| enp10s0f0np0 | ge-0-0-3 | i40e (PF) | native | wan | VLAN 50, 172.16.50.5 + IPv6 |
+| enp101s0f1np1 | ge-0-0-4 | i40e (PF) | native | loss | PCI passthrough |
 
-All interfaces renamed via `.link` files (MAC→name), configured via `.network` files by bpfrxd.
+All interfaces renamed at boot by `bpfrx-link-setup.service` (PCI bus order → vSRX names), configured via `.network` files by bpfrxd.
 
 ### WAN Interface (PF Passthrough)
 - Intel X710 PF (enp10s0f0np0 on host) passed through via PCI/VFIO
@@ -309,7 +310,7 @@ incus exec bpfrx-fw -- ip -6 route show
 
 # Via CLI: all routes, by VRF, by protocol, by prefix
 printf 'show route\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
-printf 'show route table vrf-tunnel-vr\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show route table vrf-dmz-vr\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
 printf 'show route protocol static\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
 printf 'show route 10.0.1.0/24\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
 ```

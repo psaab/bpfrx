@@ -42,7 +42,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 
 ### Interface Management (networkd)
 - **bpfrxd manages ALL interfaces** — renames, addresses, DHCP, and brings down unconfigured ones
-- `.link` files: MAC→name rename (e.g. enp6s0→trust0), prefix `10-bpfrx-`; RETH members use `OriginalName=` (PCI name) instead of `MACAddress=` for stable boot matching
+- `.link` files: boot-time rename via `bpfrx-link-setup.service` (PCI bus order → fxp0, em0, ge-X-0-Y), prefix `10-bpfrx-`; RETH members use `OriginalName=` (PCI name) instead of `MACAddress=` for stable boot matching
 - `.network` files: addresses, RA disable, VLAN parent, ActivationPolicy=always-down for unmanaged
 - Unmanaged interfaces: brought down immediately + ActivationPolicy=always-down for persistence
 - DHCP interfaces: daemon's DHCP client manages addresses; address reconciliation skipped

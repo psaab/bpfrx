@@ -1486,6 +1486,11 @@ func (m *Manager) ApplyBonds(interfaces []*config.InterfaceConfig) error {
 		if len(ifc.FabricMembers) == 0 {
 			continue
 		}
+		// vSRX fabric-options mode: single local member resolved via .link
+		// rename — no bond needed.
+		if ifc.LocalFabricMember != "" {
+			continue
+		}
 		bondName := ifc.Name
 
 		// Check if bond already exists

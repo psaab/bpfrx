@@ -192,7 +192,7 @@ test_cluster() {
 	service_check "bpfrx-fw0" "cluster: bpfrxd service active on fw0"
 	service_check "bpfrx-fw1" "cluster: bpfrxd service active on fw1"
 
-	# Heartbeat connectivity (auto VRF — fxp1/fab0 may be in vrf-mgmt)
+	# Heartbeat connectivity (auto VRF — em0/fab0 may be in vrf-mgmt)
 	ping_test "bpfrx-fw0" "10.99.0.2" "cluster: fw0 → fw1 heartbeat (10.99.0.2)"
 	ping_test "bpfrx-fw1" "10.99.0.1" "cluster: fw1 → fw0 heartbeat (10.99.0.1)"
 

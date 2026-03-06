@@ -85,12 +85,13 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 	interfaces = filtered
 
 	// Build set of expected filenames.
-	// .link files are only for physical interfaces (have MAC address).
+	// .link files are only for managed physical interfaces (have MAC address,
+	// not unmanaged). Unmanaged interfaces are named by the daemon at startup.
 	// .netdev files are for bond (LAG) and bridge devices.
 	// VLAN sub-interfaces (wan0.50) only get .network files.
 	expected := make(map[string]bool)
 	for _, ifc := range interfaces {
-		if ifc.MACAddress != "" {
+		if ifc.MACAddress != "" && !ifc.Unmanaged {
 			expected[filePrefix+ifc.Name+".link"] = true
 		}
 		if ifc.IsBond || ifc.IsBridge {
@@ -133,8 +134,11 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 			}
 		}
 
-		// .link file: only for physical interfaces with a MAC address
-		if ifc.MACAddress != "" {
+		// .link file: only for managed physical interfaces with a MAC address.
+		// Skip unmanaged interfaces — the daemon's linksetup handles their
+		// naming at startup. Writing .link files for unmanaged interfaces would
+		// override the FPC-aware naming (e.g. ge-7-0-X on node1).
+		if ifc.MACAddress != "" && !ifc.Unmanaged {
 			linkPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".link")
 			linkContent := m.generateLink(ifc)
 			if writeIfChanged(linkPath, linkContent) {
