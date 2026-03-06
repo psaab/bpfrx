@@ -4085,6 +4085,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				d.cluster.SetSyncReady(true)
 			}
 
+			d.sessionSync.OnPeerDisconnected = func() {
+				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer disconnected (all fabrics)")
+				slog.Info("cluster: sync peer disconnected, resetting sync readiness")
+				d.cluster.SetSyncReady(false)
+			}
+
 			// Wire remote failover: when peer requests us to give up primary.
 			// Guard: only honor the request if we are actually primary for
 			// this RG. Stale/delayed sync messages can arrive after we've
@@ -5130,10 +5136,12 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 			if ev.State == vrrp.StateMaster {
 				s := d.getOrCreateRGState(rgID)
 				tr := s.SetVRRP(ev.Interface, true)
-				if tr.Changed && d.dp != nil {
+				if tr.Changed && tr.Active && d.dp != nil {
 					// Activation order: set rg_active FIRST, then
 					// remove blackhole routes. Re-read desired state
 					// to guard against interleaved cluster goroutine.
+					// Only activate when ALL VRRP instances in the RG
+					// are MASTER — prevents partial ownership (#132).
 					cur, _ := s.CurrentDesired()
 					if err := d.dp.UpdateRGActive(rgID, cur); err != nil {
 						slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
@@ -5152,8 +5160,12 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					}()
 					go d.RefreshFabricFwd()
 				}
-				d.removeBlackholeRoutes(rgID)
-				d.applyRethServicesForRG(rgID)
+				// Only remove blackholes and apply services when ALL
+				// VRRP instances in the RG are MASTER (#132).
+				if tr.Changed && tr.Active {
+					d.removeBlackholeRoutes(rgID)
+					d.applyRethServicesForRG(rgID)
+				}
 			}
 			if ev.State == vrrp.StateBackup {
 				s := d.getOrCreateRGState(rgID)

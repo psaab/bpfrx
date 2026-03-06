@@ -189,17 +189,17 @@ func TestRGStateMachine_ReconcileMultiInstance(t *testing.T) {
 	// State machine knows reth1 but not reth1.50 (dropped event).
 	s.SetVRRP("reth1", true)
 	if !s.IsActive() {
-		t.Fatal("should be active")
+		t.Fatal("should be active (sole instance = allMaster)")
 	}
 
 	// Reconcile reveals reth1 is BACKUP, reth1.50 is MASTER.
+	// allMaster is false (reth1 BACKUP) → deactivate (#132).
 	tr := s.Reconcile(false, map[string]bool{
 		"reth1":    false,
 		"reth1.50": true,
 	})
-	// Still active (anyVrrpMaster=true via reth1.50).
-	if tr.Changed {
-		t.Error("should remain active — reth1.50 is MASTER")
+	if !tr.Changed || tr.Active {
+		t.Error("should deactivate — not all instances are MASTER (#132)")
 	}
 
 	// allMaster should be false (reth1 is BACKUP).
@@ -211,22 +211,22 @@ func TestRGStateMachine_ReconcileMultiInstance(t *testing.T) {
 func TestRGStateMachine_MultiInstanceVRRP(t *testing.T) {
 	s := newRGStateMachine()
 
-	// Instance A MASTER → active.
+	// Instance A MASTER (only instance) → active (allMaster: 1/1).
 	tr := s.SetVRRP("reth1", true)
 	if !tr.Changed || !tr.Active {
-		t.Fatal("first MASTER instance should activate")
+		t.Fatal("sole MASTER instance should activate")
 	}
 
-	// Instance B still BACKUP → still active (anyMaster=true).
+	// Instance B registered as BACKUP → deactivate (allMaster: 1/2, #132).
 	tr = s.SetVRRP("reth1.50", false)
-	if tr.Changed {
-		t.Error("should remain active while reth1 is MASTER")
+	if !tr.Changed || tr.Active {
+		t.Error("should deactivate — not all instances are MASTER (#132)")
 	}
 
-	// Instance A BACKUP → now deactivate (no master instances).
+	// Instance A BACKUP → already inactive (allMaster: 0/2).
 	tr = s.SetVRRP("reth1", false)
-	if !tr.Changed || tr.Active {
-		t.Error("should deactivate when all instances are BACKUP")
+	if tr.Changed {
+		t.Error("should remain inactive — was already deactivated")
 	}
 
 	// allMaster check: only one of two is MASTER.
@@ -235,10 +235,13 @@ func TestRGStateMachine_MultiInstanceVRRP(t *testing.T) {
 		t.Error("should not be allMaster when reth1.50 is BACKUP")
 	}
 
-	// Both MASTER → allMaster.
-	s.SetVRRP("reth1.50", true)
+	// Both MASTER → allMaster and active.
+	tr = s.SetVRRP("reth1.50", true)
 	if !s.AllVRRPMaster() {
 		t.Error("should be allMaster when both instances are MASTER")
+	}
+	if !tr.Changed || !tr.Active {
+		t.Error("should activate when all instances become MASTER")
 	}
 }
 

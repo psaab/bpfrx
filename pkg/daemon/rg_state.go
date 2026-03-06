@@ -10,15 +10,16 @@ import (
 // transitions through this struct, which determines the desired rg_active
 // value from the combined inputs.
 //
-// Activation rule (default): rg_active = clusterPri || anyVrrpMaster
+// Activation rule (default): rg_active = clusterPri || allVrrpMaster
 //   - Cluster Primary alone activates (avoids dual-inactive window while
 //     VRRP catches up)
-//   - VRRP MASTER alone activates (VRRP is faster than heartbeat; cluster
-//     Primary event may lag by ~200ms)
+//   - ALL VRRP instances MASTER activates (prevents partial ownership
+//     when one interface reaches MASTER before others — #132)
 //   - Both false → deactivate
 //
-// Activation rule (strict-vip-ownership): rg_active = anyVrrpMaster
+// Activation rule (strict-vip-ownership): rg_active = allVrrpMaster
 //   - VRRP master state is the sole authority for activation
+//   - ALL instances must be MASTER (prevents partial ownership — #132)
 //   - Prevents brief dual-active window during failover in same-L2 deployments
 //
 // Desired-vs-applied tracking: the state machine tracks both what the
@@ -200,9 +201,9 @@ func (s *rgStateMachine) reconcileLocked() rgTransition {
 	s.epoch++
 	var desired bool
 	if s.strictVIPOwnership {
-		desired = s.anyMasterLocked() // VRRP-only: prevents dual-active window
+		desired = s.allMasterLocked() // VRRP-only: ALL instances must be MASTER (#132)
 	} else {
-		desired = s.clusterPri || s.anyMasterLocked()
+		desired = s.clusterPri || s.allMasterLocked() // ALL VRRP instances required (#132)
 	}
 	changed := desired != s.active
 	s.active = desired
