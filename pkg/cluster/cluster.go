@@ -58,9 +58,10 @@ type RedundancyGroupState struct {
 
 	// Readiness gate: blocks promotion to primary until interfaces + VRRP
 	// are confirmed ready and have been ready for at least TakeoverHoldTime.
-	Ready            bool      // true if all local prerequisites are satisfied
-	ReadySince       time.Time // when Ready transitioned to true (zero if not ready)
-	ReadinessReasons []string  // reasons why not ready (empty when ready)
+	Ready            bool        // true if all local prerequisites are satisfied
+	ReadySince       time.Time   // when Ready transitioned to true (zero if not ready)
+	ReadinessReasons []string    // reasons why not ready (empty when ready)
+	holdTimer        *time.Timer // fires at ReadySince+holdTime to re-trigger election
 }
 
 // IsReadyForTakeover returns true if the RG has been ready for at least
@@ -238,10 +239,37 @@ func (m *Manager) SetRGReady(rgID int, ready bool, reasons []string) {
 		rg.ReadySince = time.Now()
 		rg.ReadinessReasons = nil
 		slog.Info("cluster: RG readiness: ready", "rg", rgID)
+
+		// Schedule a wakeup at ReadySince + takeoverHoldTime to
+		// re-trigger election. Without this, the edge-triggered
+		// election at readiness change would check too early (hold
+		// time not yet elapsed) and never retry.
+		if m.takeoverHoldTime > 0 {
+			if rg.holdTimer != nil {
+				rg.holdTimer.Stop()
+			}
+			rg.holdTimer = time.AfterFunc(m.takeoverHoldTime, func() {
+				m.mu.Lock()
+				defer m.mu.Unlock()
+				if !rg.Ready {
+					return
+				}
+				slog.Info("cluster: hold timer expired, re-evaluating election", "rg", rgID)
+				if m.peerAlive {
+					m.runElection()
+				} else {
+					m.electSingleNode()
+				}
+			})
+		}
 	} else if !ready && wasReady {
 		// Transition: ready → not-ready.
 		rg.ReadySince = time.Time{}
 		rg.ReadinessReasons = reasons
+		if rg.holdTimer != nil {
+			rg.holdTimer.Stop()
+			rg.holdTimer = nil
+		}
 		slog.Info("cluster: RG readiness: not ready", "rg", rgID, "reasons", reasons)
 	} else if !ready {
 		// Still not ready — update reasons.
