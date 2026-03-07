@@ -92,6 +92,30 @@ FIB lookup: 0% (cached in session entries).
 - Invalidates on FIB generation change or RG ownership loss
 - Design notes: `docs/next-features/ipv6-session-fast-path.md`
 
+### 10. IPv6 no-extension-header fast path (`a1b6d1c`, #165)
+- **Impact:** IPv6 `xdp_main_prog` drops to 8.8% (parity with IPv4's 9.4%)
+- `parse_ipv6hdr()` returns immediately for TCP/UDP/ICMPv6 nexthdr without entering the extension header walker loop
+- Most real-world IPv6 traffic has no extension headers — the generic walker was pure overhead
+
+### 11. Deferred CHECKSUM_PARTIAL detection (`a1b6d1c`, #170)
+- **Impact:** Established non-NAT IPv6 flows pay zero checksum computation cost
+- Moved IPv6 pseudo-header checksum from `parse_l4hdr()` (every packet) to `resolve_csum_partial()` (only NAT/MSS paths)
+- Resolver reads IPs directly from packet headers (not meta) for correctness with pre-routing DNAT/NPTv6
+
+### 12. IPv6 flow cache hit/miss/flush/invalidation counters (`a1b6d1c`, #167)
+- **Impact:** 96% cache hit rate measured on loss cluster (iperf3 -P 4)
+- Four counters in `global_counters` map: hit, miss, flush, invalidation
+- Exposed via CLI (`show security flow statistics`), gRPC, REST API, and Prometheus (`bpfrx_flow_cache_total` with `type` label)
+- Enables data-driven cache tuning (slot count, eviction policy)
+
+### IPv6 Parity Results (a1b6d1c, loss cluster, iperf3 -P 4)
+| Metric | IPv4 | IPv6 | Gap |
+|--------|------|------|-----|
+| Throughput | 22.2 Gbps | 21.9 Gbps | 1.4% (was 6%) |
+| xdp_main_prog CPU | 9.4% | 8.8% | parity |
+| htab_map_hash CPU | 5.3% | 6.5% | residual 40B key cost |
+| Flow cache hit rate | — | 96.0% | — |
+
 ## Host-Side Perf Profile (from host during iperf through VM, Feb 2026)
 
 Profile captured from the **host** (not VM). No BPF/XDP stacks visible — XDP pipeline

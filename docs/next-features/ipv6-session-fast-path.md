@@ -1,7 +1,7 @@
 ## Next Feature: IPv6 Session Fast Path
 
-Date: 2026-03-06  
-Status: Phase 1 implemented in `perf-ipv6-flow-cache`
+Date: 2026-03-06
+Status: Phase 1 implemented in `perf-ipv6-flow-cache`; Phase 4 + counters completed in `a1b6d1c`
 
 ## Problem
 
@@ -99,9 +99,11 @@ Follow-on work:
 1. Move cold/logging/GC data out of the hottest lookup value.
 2. Keep the lookup-time value as small as possible.
 
-### Phase 4: IPv6 parser fast path
+### Phase 4: IPv6 parser fast path — COMPLETED (`a1b6d1c`, #165)
 
-Add a cheap no-extension-header fast path in [`parse_ipv6hdr()`](/home/ps/git/codex-bpfrx/bpf/headers/bpfrx_helpers.h), then fall back to the current generic extension-header walker only when needed.
+~~Add a cheap no-extension-header fast path in `parse_ipv6hdr()`, then fall back to the current generic extension-header walker only when needed.~~
+
+Implemented: `parse_ipv6hdr()` returns immediately for TCP/UDP/ICMPv6 nexthdr without entering the extension header walker. IPv6 `xdp_main_prog` CPU drops to 8.8% (parity with IPv4's 9.4%).
 
 ## Phase 1 Notes
 
@@ -117,6 +119,10 @@ Why zone stage:
 The zone stage already owns the established-session fast path and cached FIB
 reuse. Adding the cache there avoids duplicating another lookup path in
 `xdp_conntrack`.
+
+### Supplementary: Deferred CHECKSUM_PARTIAL detection — COMPLETED (`a1b6d1c`, #170)
+
+Moved IPv6 pseudo-header checksum computation from `parse_l4hdr()` (every packet) to `resolve_csum_partial()` (only NAT/MSS paths). Established non-NAT IPv6 flows pay zero checksum cost. Resolver reads IPs from packet headers (not meta) for correctness with pre-routing DNAT/NPTv6.
 
 ## Risks
 
@@ -134,7 +140,7 @@ reuse. Adding the cache there avoids duplicating another lookup path in
 
 ## Next Issues
 
-1. Add observability counters for IPv6 cache hit/flush/fallback.
+1. ~~Add observability counters for IPv6 cache hit/flush/fallback.~~ — COMPLETED (`a1b6d1c`, #167): hit/miss/flush/invalidation counters in `global_counters`, exposed via CLI/gRPC/REST/Prometheus. 96% hit rate measured.
 2. Compact IPv6 session key.
 3. Split hot/cold IPv6 session state.
-4. Add IPv6 parser no-extension fast path.
+4. ~~Add IPv6 parser no-extension fast path.~~ — COMPLETED (`a1b6d1c`, #165)
