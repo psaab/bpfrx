@@ -92,6 +92,12 @@ FIB lookup: 0% (cached in session entries).
 - Invalidates on FIB generation change or RG ownership loss
 - Design notes: `docs/next-features/ipv6-session-fast-path.md`
 
+### 10. IPv6 no-extension parse fast path + narrower NAT rewrite (`perf-ipv6-flow-cache`)
+- Added a common-case fast return in `parse_ipv6hdr()` when the base IPv6 header directly names the upper-layer protocol
+- The generic extension-header walker now runs only when extension headers are actually present
+- Reworked `nat_rewrite_v6()` to specialize by protocol and actual NAT direction
+- This avoids repeated protocol branches and avoids touching source/destination fields that are not changing for the packet
+
 ## Host-Side Perf Profile (from host during iperf through VM, Feb 2026)
 
 Profile captured from the **host** (not VM). No BPF/XDP stacks visible — XDP pipeline

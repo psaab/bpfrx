@@ -14,7 +14,7 @@
 #include "../headers/bpfrx_trace.h"
 
 #define IPV6_FLOW_CACHE_SLOTS      256
-#define IPV6_FLOW_CACHE_BATCH_PKTS 32
+#define IPV6_FLOW_CACHE_BATCH_PKTS 256
 
 struct ipv6_flow_cache_key {
 	__be32 src_ip[4];
@@ -255,6 +255,22 @@ try_ipv6_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
 
 	bpf_tail_call(ctx, &xdp_progs, entry->next_prog);
 	return XDP_PASS;
+}
+
+static __always_inline void
+flush_matching_ipv6_flow_cache(struct pkt_meta *meta)
+{
+	if (meta->addr_family != AF_INET6 || meta->protocol != PROTO_TCP)
+		return;
+
+	__u32 slot = ipv6_flow_cache_slot(meta);
+	struct ipv6_flow_cache_entry *entry =
+		bpf_map_lookup_elem(&ipv6_flow_cache, &slot);
+	if (!entry || !ipv6_flow_cache_match(entry, meta))
+		return;
+
+	flush_ipv6_flow_cache_entry(entry);
+	entry->valid = 0;
 }
 
 /*
@@ -979,6 +995,9 @@ zone_resolved:
 
 	if (!is_tcp_syn && try_ipv6_flow_cache(ctx, meta, fib_gen) >= 0)
 		return XDP_PASS;
+	if (!is_tcp_syn && meta->addr_family == AF_INET6 &&
+	    meta->protocol == PROTO_TCP && !ipv6_flow_cacheable_tcp(meta))
+		flush_matching_ipv6_flow_cache(meta);
 
 	if (!is_tcp_syn && meta->addr_family == AF_INET) {
 		struct session_key sk = {};
