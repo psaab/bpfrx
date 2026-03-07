@@ -29,8 +29,12 @@ type GlobalStats struct {
 	NATAllocFails   uint64 `json:"nat_alloc_failures"`
 	HostInboundDeny  uint64 `json:"host_inbound_denies"`
 	TCEgressPackets  uint64 `json:"tc_egress_packets"`
-	FabricRedirects  uint64 `json:"fabric_redirects"`
-	FabricFwdDrops   uint64 `json:"fabric_fwd_drops"`
+	FabricRedirects      uint64 `json:"fabric_redirects"`
+	FabricFwdDrops       uint64 `json:"fabric_fwd_drops"`
+	FlowCacheHits        uint64 `json:"flow_cache_hits"`
+	FlowCacheMisses      uint64 `json:"flow_cache_misses"`
+	FlowCacheFlushes     uint64 `json:"flow_cache_flushes"`
+	FlowCacheInvalidates uint64 `json:"flow_cache_invalidations"`
 }
 
 // InterfaceStats holds per-interface counter values.

@@ -79,8 +79,12 @@ func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		NATAllocFails:   readCounter(dataplane.GlobalCtrNATAllocFail),
 		HostInboundDeny:  readCounter(dataplane.GlobalCtrHostInboundDeny),
 		TCEgressPackets:  readCounter(dataplane.GlobalCtrTCEgressPackets),
-		FabricRedirects:  readCounter(dataplane.GlobalCtrFabricRedirect),
-		FabricFwdDrops:   readCounter(dataplane.GlobalCtrFabricFwdDrop),
+		FabricRedirects:      readCounter(dataplane.GlobalCtrFabricRedirect),
+		FabricFwdDrops:       readCounter(dataplane.GlobalCtrFabricFwdDrop),
+		FlowCacheHits:        readCounter(dataplane.GlobalCtrFlowCacheHit),
+		FlowCacheMisses:      readCounter(dataplane.GlobalCtrFlowCacheMiss),
+		FlowCacheFlushes:     readCounter(dataplane.GlobalCtrFlowCacheFlush),
+		FlowCacheInvalidates: readCounter(dataplane.GlobalCtrFlowCacheInvalidate),
 	}
 	writeOK(w, stats)
 }

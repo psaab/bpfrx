@@ -354,7 +354,7 @@ type bpfrxTcConntrackPktMeta struct {
 	RoutingTable  uint32
 	DscpRewrite   uint8
 	PadMeta       uint8
-	PadAt         uint16
+	L4CsumSaved   uint16
 	AppTimeout    uint32
 	MirrorIfindex uint32
 	MirrorRate    uint32

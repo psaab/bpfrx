@@ -733,6 +733,10 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 	 * finalization (generic XDP), so the final checksum will be
 	 * correct even though we modified the MSS value. */
 	if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x02)) {
+		/* Resolve deferred IPv6 CHECKSUM_PARTIAL for MSS clamp. */
+		void *data = (void *)(long)ctx->data;
+		void *data_end = (void *)(long)ctx->data_end;
+		resolve_csum_partial(data, data_end, meta);
 		if (fc) {
 			__u16 mss = fc->tcp_mss_ipsec;
 			if (fc->tcp_mss_gre_in > 0 && (fc->tcp_mss_gre_in < mss || mss == 0))

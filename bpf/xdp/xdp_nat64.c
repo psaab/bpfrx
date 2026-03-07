@@ -246,9 +246,10 @@ nat64_xlate_6to4(struct xdp_md *ctx, struct pkt_meta *meta)
 	__be16 old_sport = meta->src_port;
 	__be16 new_sport = meta->src_port; /* already set to SNAT port by policy */
 
-	/* Finalize any CHECKSUM_PARTIAL before reading the L4 checksum.
-	 * After this, all packets have a complete L4 checksum and
-	 * incremental update works uniformly. */
+	/* Resolve deferred IPv6 CHECKSUM_PARTIAL detection, then
+	 * finalize: after this, all packets have a complete L4
+	 * checksum and incremental update works uniformly. */
+	resolve_csum_partial(data, data_end, meta);
 	finalize_csum_partial(data, data_end, meta);
 
 	/* Read original L4 checksum and source port from packet

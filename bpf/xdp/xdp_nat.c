@@ -80,6 +80,9 @@ int xdp_nat_prog(struct xdp_md *ctx)
 	 * so the NIC must finalize via HW TX checksum offload.
 	 */
 
+	/* Resolve deferred IPv6 CHECKSUM_PARTIAL before any rewrite. */
+	resolve_csum_partial(data, data_end, meta);
+
 	TRACE_NAT_REWRITE(meta, "xdp-pre");
 
 	if (meta->addr_family == AF_INET) {

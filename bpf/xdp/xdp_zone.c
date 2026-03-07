@@ -163,6 +163,7 @@ flush_ipv6_flow_cache_entry(struct ipv6_flow_cache_entry *entry)
 	entry->pending_packets = 0;
 	entry->pending_bytes = 0;
 	entry->last_flush = (__u32)entry->last_seen;
+	inc_counter(GLOBAL_CTR_FLOW_CACHE_FLUSH);
 	return 0;
 }
 
@@ -217,22 +218,27 @@ try_ipv6_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
 	__u32 slot = ipv6_flow_cache_slot(meta);
 	struct ipv6_flow_cache_entry *entry =
 		bpf_map_lookup_elem(&ipv6_flow_cache, &slot);
-	if (!entry || !ipv6_flow_cache_match(entry, meta))
+	if (!entry || !ipv6_flow_cache_match(entry, meta)) {
+		inc_counter(GLOBAL_CTR_FLOW_CACHE_MISS);
 		return -1;
+	}
 
 	if (entry->fwd_ifindex == 0 ||
 	    entry->fib_gen != (__u16)fib_gen ||
 	    !check_egress_rg_active(entry->fwd_ifindex, entry->egress_vlan_id)) {
 		flush_ipv6_flow_cache_entry(entry);
 		entry->valid = 0;
+		inc_counter(GLOBAL_CTR_FLOW_CACHE_INVALIDATE);
 		return -1;
 	}
 
 	__u64 now = meta->ktime_ns / 1000000000ULL;
 	if (entry->pending_packets >= IPV6_FLOW_CACHE_BATCH_PKTS ||
 	    entry->last_flush != (__u32)now) {
-		if (flush_ipv6_flow_cache_entry(entry) < 0)
+		if (flush_ipv6_flow_cache_entry(entry) < 0) {
+			inc_counter(GLOBAL_CTR_FLOW_CACHE_INVALIDATE);
 			return -1;
+		}
 	}
 
 	entry->pending_packets++;
@@ -253,6 +259,7 @@ try_ipv6_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
 		meta->src_port = entry->rewrite_src_port;
 	}
 
+	inc_counter(GLOBAL_CTR_FLOW_CACHE_HIT);
 	bpf_tail_call(ctx, &xdp_progs, entry->next_prog);
 	return XDP_PASS;
 }
@@ -564,6 +571,11 @@ apply_dnat_before_fabric_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 {
 	if (!(meta->nat_flags & SESS_FLAG_DNAT))
 		return;
+
+	/* Resolve deferred IPv6 CHECKSUM_PARTIAL before packet mods. */
+	void *rd = (void *)(long)ctx->data;
+	void *rde = (void *)(long)ctx->data_end;
+	resolve_csum_partial(rd, rde, meta);
 
 	if (meta->addr_family == AF_INET6) {
 		apply_dnat_before_fabric_redirect_v6(ctx, meta);

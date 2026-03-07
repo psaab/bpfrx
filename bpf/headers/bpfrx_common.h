@@ -273,7 +273,11 @@ struct icmp6hdr {
 #define GLOBAL_CTR_FABRIC_REDIRECT_FAB0  33
 #define GLOBAL_CTR_FABRIC_REDIRECT_FAB1  34
 #define GLOBAL_CTR_FABRIC_REDIRECT_ZONE  35
-#define GLOBAL_CTR_MAX                   36
+#define GLOBAL_CTR_FLOW_CACHE_HIT        36
+#define GLOBAL_CTR_FLOW_CACHE_MISS       37
+#define GLOBAL_CTR_FLOW_CACHE_FLUSH      38
+#define GLOBAL_CTR_FLOW_CACHE_INVALIDATE 39
+#define GLOBAL_CTR_MAX                   40
 
 /* Flow timeout indices for flow_timeouts ARRAY map */
 #define FLOW_TIMEOUT_TCP_ESTABLISHED   0
@@ -453,7 +457,7 @@ struct pkt_meta {
 	__u8  pad_meta;
 
 	/* Per-application inactivity timeout override (seconds, 0 = use default) */
-	__u16 pad_at;
+	__u16 l4_csum_saved;  /* deferred L4 checksum for lazy CHECKSUM_PARTIAL (IPv6) */
 	__u32 app_timeout;
 
 	/* Port mirroring (set by xdp_forward for TC egress to clone) */

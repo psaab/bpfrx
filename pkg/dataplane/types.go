@@ -255,8 +255,12 @@ const (
 	GlobalCtrFabricFwdDrop      = 32
 	GlobalCtrFabricRedirectFab0 = 33
 	GlobalCtrFabricRedirectFab1 = 34
-	GlobalCtrFabricRedirectZone = 35
-	GlobalCtrMax                = 36
+	GlobalCtrFabricRedirectZone   = 35
+	GlobalCtrFlowCacheHit        = 36
+	GlobalCtrFlowCacheMiss       = 37
+	GlobalCtrFlowCacheFlush      = 38
+	GlobalCtrFlowCacheInvalidate = 39
+	GlobalCtrMax                 = 40
 )
 
 // Host-inbound-traffic service flags (bitmap in zone_config.host_inbound_flags).

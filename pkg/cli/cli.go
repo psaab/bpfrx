@@ -4049,6 +4049,10 @@ func (c *CLI) showFlowStatistics() error {
 	tcEgress := readCounter(dataplane.GlobalCtrTCEgressPackets)
 	nat64 := readCounter(dataplane.GlobalCtrNAT64Xlate)
 	fabricRedir := readCounter(dataplane.GlobalCtrFabricRedirect)
+	cacheHit := readCounter(dataplane.GlobalCtrFlowCacheHit)
+	cacheMiss := readCounter(dataplane.GlobalCtrFlowCacheMiss)
+	cacheFlush := readCounter(dataplane.GlobalCtrFlowCacheFlush)
+	cacheInval := readCounter(dataplane.GlobalCtrFlowCacheInvalidate)
 
 	fmt.Println("Flow statistics:")
 	fmt.Printf("  %-30s %d\n", "Current sessions:", sessNew-sessClosed)
@@ -4067,6 +4071,19 @@ func (c *CLI) showFlowStatistics() error {
 	fmt.Println()
 	fmt.Printf("  %-30s %d\n", "Host-inbound allowed:", hostAllow)
 	fmt.Printf("  %-30s %d\n", "Host-inbound denied:", hostDeny)
+
+	// IPv6 flow cache
+	if cacheHit > 0 || cacheMiss > 0 {
+		fmt.Println()
+		fmt.Printf("  %-30s %d\n", "IPv6 flow cache hits:", cacheHit)
+		fmt.Printf("  %-30s %d\n", "IPv6 flow cache misses:", cacheMiss)
+		fmt.Printf("  %-30s %d\n", "IPv6 flow cache flushes:", cacheFlush)
+		fmt.Printf("  %-30s %d\n", "IPv6 flow cache invalidations:", cacheInval)
+		if cacheHit+cacheMiss > 0 {
+			hitRate := float64(cacheHit) / float64(cacheHit+cacheMiss) * 100
+			fmt.Printf("  %-30s %.1f%%\n", "IPv6 flow cache hit rate:", hitRate)
+		}
+	}
 
 	// Screen drops breakdown
 	if screenDrops > 0 {

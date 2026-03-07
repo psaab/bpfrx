@@ -31,6 +31,7 @@ type bpfrxCollector struct {
 	hostInboundDeny      *prometheus.Desc
 	tcEgressPacketsTotal *prometheus.Desc
 	syncookieTotal       *prometheus.Desc
+	flowCacheTotal       *prometheus.Desc
 
 	// Interface counters
 	ifacePacketsTotal *prometheus.Desc
@@ -124,6 +125,11 @@ func newCollector(srv *Server) *bpfrxCollector {
 		syncookieTotal: prometheus.NewDesc(
 			"bpfrx_screen_syncookie_total",
 			"SYN cookie counters by type.",
+			[]string{"type"}, nil,
+		),
+		flowCacheTotal: prometheus.NewDesc(
+			"bpfrx_flow_cache_total",
+			"IPv6 flow cache counters by type.",
 			[]string{"type"}, nil,
 		),
 		ifacePacketsTotal: prometheus.NewDesc(
@@ -256,6 +262,7 @@ func (c *bpfrxCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.hostInboundDeny
 	ch <- c.tcEgressPacketsTotal
 	ch <- c.syncookieTotal
+	ch <- c.flowCacheTotal
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.zonePacketsTotal
@@ -334,6 +341,16 @@ func (c *bpfrxCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp d
 		readCounter(dataplane.GlobalCtrSyncookieInvalid), "invalid")
 	ch <- prometheus.MustNewConstMetric(c.syncookieTotal, prometheus.CounterValue,
 		readCounter(dataplane.GlobalCtrSyncookieBypass), "bypass")
+
+	// IPv6 flow cache counters
+	ch <- prometheus.MustNewConstMetric(c.flowCacheTotal, prometheus.CounterValue,
+		readCounter(dataplane.GlobalCtrFlowCacheHit), "hit")
+	ch <- prometheus.MustNewConstMetric(c.flowCacheTotal, prometheus.CounterValue,
+		readCounter(dataplane.GlobalCtrFlowCacheMiss), "miss")
+	ch <- prometheus.MustNewConstMetric(c.flowCacheTotal, prometheus.CounterValue,
+		readCounter(dataplane.GlobalCtrFlowCacheFlush), "flush")
+	ch <- prometheus.MustNewConstMetric(c.flowCacheTotal, prometheus.CounterValue,
+		readCounter(dataplane.GlobalCtrFlowCacheInvalidate), "invalidate")
 }
 
 func (c *bpfrxCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {

@@ -204,6 +204,14 @@ parse_ipv6hdr(void *data, void *data_end, struct pkt_meta *meta)
 	__u8 nexthdr = ip6h->nexthdr;
 	__u16 offset = meta->l3_offset + sizeof(struct ipv6hdr);
 
+	/* Fast path: skip extension header walker for common protocols */
+	if (nexthdr == PROTO_TCP || nexthdr == PROTO_UDP ||
+	    nexthdr == PROTO_ICMPV6) {
+		meta->protocol  = nexthdr;
+		meta->l4_offset = offset;
+		return 0;
+	}
+
 	#pragma unroll
 	for (int i = 0; i < MAX_EXT_HDRS; i++) {
 		switch (nexthdr) {
@@ -323,6 +331,45 @@ compute_ph_csum_v6(const __u8 *saddr, const __u8 *daddr,
 	sum = (sum & 0xFFFF) + (sum >> 16);
 	sum = (sum & 0xFFFF) + (sum >> 16);
 	return (__u16)sum;
+}
+
+/*
+ * Lazy CHECKSUM_PARTIAL resolution for IPv6.
+ *
+ * parse_l4hdr() defers the expensive IPv6 pseudo-header checksum
+ * computation (16 u16 additions for 128-bit src+dst) and stores
+ * the raw L4 checksum in l4_csum_saved.  Call this before any
+ * code path that reads meta->csum_partial for IPv6 packets.
+ *
+ * Reads source/destination addresses from the PACKET (not meta),
+ * so must be called BEFORE any packet header modification.
+ *
+ * For IPv4, l4_csum_saved is always 0 (detection stays inline
+ * in parse_l4hdr), making this a single-branch no-op.
+ */
+static __always_inline void
+resolve_csum_partial(void *data, void *data_end, struct pkt_meta *meta)
+{
+	if (!meta->l4_csum_saved)
+		return;
+
+	__u16 saved = meta->l4_csum_saved;
+	meta->l4_csum_saved = 0;
+
+	if (meta->l3_offset >= 64)
+		return;
+
+	struct ipv6hdr *ip6h = data + (meta->l3_offset & 0x3F);
+	if ((void *)(ip6h + 1) > data_end)
+		return;
+
+	__u16 l4_len = meta->pkt_len -
+		       (meta->l4_offset - meta->l3_offset);
+	__u16 ph = compute_ph_csum_v6((__u8 *)&ip6h->saddr,
+				      (__u8 *)&ip6h->daddr,
+				      meta->protocol, l4_len);
+	if (saved == ph)
+		meta->csum_partial = 1;
 }
 
 /*
@@ -558,22 +605,28 @@ parse_l4hdr(void *data, void *data_end, struct pkt_meta *meta)
 	 * offload and we must NOT do incremental updates for non-
 	 * pseudo-header fields (ports, TCP options) -- the NIC or
 	 * skb_checksum_help will sum the actual data bytes later.
+	 *
+	 * IPv4: detect inline (cheap — 4 additions for 2x32-bit addrs).
+	 * IPv6: defer to resolve_csum_partial() (expensive — 16
+	 *        additions for 2x128-bit addrs).  Only NAT/MSS paths
+	 *        call the resolver; established non-NAT sessions skip it.
 	 */
 	meta->csum_partial = 0;
+	meta->l4_csum_saved = 0;
 	if (l4_csum != 0) {
-		__u16 l4_len = meta->pkt_len -
-			       (meta->l4_offset - meta->l3_offset);
-		__u16 ph;
-		if (meta->addr_family == AF_INET)
-			ph = compute_ph_csum_v4(meta->src_ip.v4,
-						meta->dst_ip.v4,
-						meta->protocol, l4_len);
-		else
-			ph = compute_ph_csum_v6(meta->src_ip.v6,
-						meta->dst_ip.v6,
-						meta->protocol, l4_len);
-		if ((__u16)l4_csum == ph)
-			meta->csum_partial = 1;
+		if (meta->addr_family == AF_INET) {
+			__u16 l4_len = meta->pkt_len -
+				       (meta->l4_offset - meta->l3_offset);
+			__u16 ph = compute_ph_csum_v4(meta->src_ip.v4,
+						      meta->dst_ip.v4,
+						      meta->protocol,
+						      l4_len);
+			if ((__u16)l4_csum == ph)
+				meta->csum_partial = 1;
+		} else {
+			/* IPv6: save L4 checksum for lazy resolution. */
+			meta->l4_csum_saved = (__u16)l4_csum;
+		}
 	}
 
 	return 0;

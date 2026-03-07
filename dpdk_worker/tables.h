@@ -83,8 +83,15 @@
 #define GLOBAL_CTR_SYNCOOKIE_INVALID  29
 #define GLOBAL_CTR_SYNCOOKIE_BYPASS   30
 #define GLOBAL_CTR_SCREEN_SESSION_LIMIT 31
-#define GLOBAL_CTR_FABRIC_FWD_DROP   32
-#define GLOBAL_CTR_MAX               33
+#define GLOBAL_CTR_FABRIC_FWD_DROP        32
+#define GLOBAL_CTR_FABRIC_REDIRECT_FAB0  33
+#define GLOBAL_CTR_FABRIC_REDIRECT_FAB1  34
+#define GLOBAL_CTR_FABRIC_REDIRECT_ZONE  35
+#define GLOBAL_CTR_FLOW_CACHE_HIT        36
+#define GLOBAL_CTR_FLOW_CACHE_MISS       37
+#define GLOBAL_CTR_FLOW_CACHE_FLUSH      38
+#define GLOBAL_CTR_FLOW_CACHE_INVALIDATE 39
+#define GLOBAL_CTR_MAX                   40
 
 /* ============================================================
  * RX mode constants

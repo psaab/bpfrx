@@ -293,6 +293,10 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 
 	/* TCP MSS clamping on egress SYN packets (gre-out / ipsec-vpn). */
 	if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x02)) {
+		/* Resolve deferred IPv6 CHECKSUM_PARTIAL for MSS clamp. */
+		void *data = (void *)(long)skb->data;
+		void *data_end = (void *)(long)skb->data_end;
+		resolve_csum_partial(data, data_end, meta);
 		if (fc) {
 			__u16 mss = fc->tcp_mss_gre_out;
 			if (fc->tcp_mss_ipsec > 0 && (fc->tcp_mss_ipsec < mss || mss == 0))

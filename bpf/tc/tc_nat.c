@@ -24,6 +24,9 @@ int tc_nat_prog(struct __sk_buff *skb)
 	if (!meta)
 		return TC_ACT_SHOT;
 
+	/* Resolve deferred IPv6 CHECKSUM_PARTIAL before any rewrite. */
+	resolve_csum_partial(data, data_end, meta);
+
 	TRACE_TC_NAT(meta);
 
 	if (meta->addr_family == AF_INET)
