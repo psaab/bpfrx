@@ -158,7 +158,8 @@ flush_ipv6_flow_cache_entry(struct ipv6_flow_cache_entry *entry)
 		__sync_fetch_and_add(&sess->rev_packets, entry->pending_packets);
 		__sync_fetch_and_add(&sess->rev_bytes, entry->pending_bytes);
 	}
-	sess->last_seen = entry->last_seen;
+	if (sess->last_seen != entry->last_seen)
+		sess->last_seen = entry->last_seen;
 
 	entry->pending_packets = 0;
 	entry->pending_bytes = 0;
@@ -228,7 +229,7 @@ try_ipv6_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
 		return -1;
 	}
 
-	__u64 now = meta->ktime_ns / 1000000000ULL;
+	__u64 now = meta->now_sec;
 	if (entry->pending_packets >= IPV6_FLOW_CACHE_BATCH_PKTS ||
 	    entry->last_flush != (__u32)now) {
 		if (flush_ipv6_flow_cache_entry(entry) < 0)
@@ -283,11 +284,11 @@ zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		  struct session_value *sess, __u8 direction,
 		  struct flow_config *fc)
 {
-	__u64 now = meta->ktime_ns / 1000000000ULL;
+	__u64 now = meta->now_sec;
 
 	/* Don't update last_seen for CLOSED sessions — retransmits
 	 * would prevent GC from ever cleaning up the dead session. */
-	if (sess->state != SESS_STATE_CLOSED)
+	if (sess->state != SESS_STATE_CLOSED && sess->last_seen != now)
 		sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {
@@ -337,7 +338,8 @@ zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 			if (paired) {
 				paired->state = new_state;
 				paired->timeout = sess->timeout;
-				if (new_state != SESS_STATE_CLOSED)
+				if (new_state != SESS_STATE_CLOSED &&
+				    paired->last_seen != now)
 					paired->last_seen = now;
 			}
 		}
@@ -394,11 +396,11 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		  struct session_value_v6 *sess, __u8 direction,
 		  struct flow_config *fc)
 {
-	__u64 now = meta->ktime_ns / 1000000000ULL;
+	__u64 now = meta->now_sec;
 
 	/* Don't update last_seen for CLOSED sessions — retransmits
 	 * would prevent GC from ever cleaning up the dead session. */
-	if (sess->state != SESS_STATE_CLOSED)
+	if (sess->state != SESS_STATE_CLOSED && sess->last_seen != now)
 		sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {
@@ -443,7 +445,8 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 			if (paired) {
 				paired->state = new_state;
 				paired->timeout = sess->timeout;
-				if (new_state != SESS_STATE_CLOSED)
+				if (new_state != SESS_STATE_CLOSED &&
+				    paired->last_seen != now)
 					paired->last_seen = now;
 			}
 		}
@@ -1089,7 +1092,7 @@ zone_resolved:
 								 sv6,
 								 ct_direction,
 								 fib_gen,
-								 meta->ktime_ns / 1000000000ULL);
+								 meta->now_sec);
 			}
 			meta->fwd_ifindex    = sv6->fib_ifindex;
 			meta->egress_vlan_id = sv6->fib_vlan_id;

@@ -57,7 +57,7 @@ check_flood(struct pkt_meta *meta, struct screen_config *sc)
 	if (!fs)
 		return 0;
 
-	__u64 now_sec = meta->ktime_ns / 1000000000ULL;
+	__u64 now_sec = meta->now_sec;
 
 	/* Reset window when duration expires.
 	 * syn_flood_timeout configures the window in seconds (0 = 1s default). */
@@ -423,7 +423,7 @@ validate_syncookie_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 		.dst_port = meta->dst_port,
 	};
 	struct validated_client_value vv = {
-		.validated_at = meta->ktime_ns / 1000000000ULL,
+		.validated_at = meta->now_sec,
 	};
 	bpf_map_update_elem(&validated_clients, &vk, &vv, BPF_ANY);
 	inc_counter(GLOBAL_CTR_SYNCOOKIE_VALID);
@@ -555,7 +555,7 @@ validate_syncookie_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 		.dst_port = meta->dst_port,
 	};
 	struct validated_client_value vv = {
-		.validated_at = meta->ktime_ns / 1000000000ULL,
+		.validated_at = meta->now_sec,
 	};
 	bpf_map_update_elem(&validated_clients, &vk, &vv, BPF_ANY);
 	inc_counter(GLOBAL_CTR_SYNCOOKIE_VALID);
@@ -848,7 +848,7 @@ int xdp_screen_prog(struct xdp_md *ctx)
 		};
 		struct scan_track_value *sv =
 			bpf_map_lookup_elem(&port_scan_track, &sk);
-		__u64 now_sec = meta->ktime_ns / 1000000000ULL;
+		__u64 now_sec = meta->now_sec;
 
 		if (sv) {
 			__u32 window_dur = sc->syn_flood_timeout;
@@ -885,7 +885,7 @@ int xdp_screen_prog(struct xdp_md *ctx)
 		};
 		struct scan_track_value *sv =
 			bpf_map_lookup_elem(&ip_sweep_track, &sk);
-		__u64 now_sec = meta->ktime_ns / 1000000000ULL;
+		__u64 now_sec = meta->now_sec;
 
 		if (sv) {
 			__u32 window_dur = sc->syn_flood_timeout;

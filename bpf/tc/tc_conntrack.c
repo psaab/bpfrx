@@ -21,8 +21,8 @@ static __always_inline void
 tc_ct_hit_v4(struct __sk_buff *skb, struct pkt_meta *meta,
 	     struct session_value *sess, __u8 direction)
 {
-	__u64 now = meta->ktime_ns / 1000000000ULL;
-	if (sess->state != SESS_STATE_CLOSED)
+	__u64 now = meta->now_sec;
+	if (sess->state != SESS_STATE_CLOSED && sess->last_seen != now)
 		sess->last_seen = now;
 
 	int is_fwd = (direction == sess->is_reverse);
@@ -64,8 +64,8 @@ static __always_inline void
 tc_ct_hit_v6(struct __sk_buff *skb, struct pkt_meta *meta,
 	     struct session_value_v6 *sess, __u8 direction)
 {
-	__u64 now = meta->ktime_ns / 1000000000ULL;
-	if (sess->state != SESS_STATE_CLOSED)
+	__u64 now = meta->now_sec;
+	if (sess->state != SESS_STATE_CLOSED && sess->last_seen != now)
 		sess->last_seen = now;
 
 	int is_fwd = (direction == sess->is_reverse);
@@ -123,7 +123,7 @@ alloc_session_id(void)
 static __always_inline void
 tc_create_session_v4(struct pkt_meta *meta)
 {
-	__u64 now = meta->ktime_ns / 1000000000ULL;
+	__u64 now = meta->now_sec;
 
 	struct session_key fwd_key = {};
 	fwd_key.src_ip   = meta->src_ip.v4;
@@ -204,7 +204,7 @@ tc_create_session_v4(struct pkt_meta *meta)
 static __always_inline void
 tc_create_session_v6(struct pkt_meta *meta)
 {
-	__u64 now = meta->ktime_ns / 1000000000ULL;
+	__u64 now = meta->now_sec;
 
 	struct session_key_v6 fwd_key = {};
 	__builtin_memcpy(fwd_key.src_ip, meta->src_ip.v6, 16);
