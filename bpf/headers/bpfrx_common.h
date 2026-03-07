@@ -200,6 +200,7 @@ struct icmp6hdr {
 #define META_FLAG_KERNEL_ROUTE       (1 << 2)
 #define META_FLAG_TUNNEL             (1 << 3)  /* arrived via tunnel interface */
 #define META_FLAG_FABRIC_FWD         (1 << 4)  /* plain fabric redirect (not zone-encoded) */
+#define META_FLAG_INGRESS_RESOLVED   (1 << 5)  /* ingress zone/routing already resolved */
 
 /* Per-rule logging flags (policy_rule.log and session_value.log_flags) */
 #define LOG_FLAG_SESSION_INIT  (1 << 0)

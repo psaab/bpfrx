@@ -139,6 +139,62 @@ xdp_vlan_tag_push(struct xdp_md *ctx, __u16 vid)
 }
 
 /*
+ * Resolve the ingress zone before the screen stage so callers can bypass the
+ * extra tail call when no effective screen work exists for this packet.
+ *
+ * Returns:
+ *   XDP_PROG_ZONE   when screen can be skipped safely
+ *   XDP_PROG_SCREEN when the packet still needs the screen stage
+ *   -1             when ingress zone resolution failed
+ */
+static __always_inline int
+resolve_ingress_xdp_target(struct pkt_meta *meta)
+{
+	struct iface_zone_key zk = {
+		.ifindex = meta->ingress_ifindex,
+		.vlan_id = meta->ingress_vlan_id,
+	};
+	struct iface_zone_value *izv = bpf_map_lookup_elem(&iface_zone_map, &zk);
+	if (!izv)
+		return -1;
+
+	meta->ingress_zone = izv->zone_id;
+	meta->meta_flags |= META_FLAG_INGRESS_RESOLVED;
+	if (izv->flags & IFACE_FLAG_TUNNEL)
+		meta->meta_flags |= META_FLAG_TUNNEL;
+	if (izv->routing_table != 0)
+		meta->routing_table = izv->routing_table;
+
+	__u32 zone_key = (__u32)izv->zone_id;
+	struct zone_config *zc = bpf_map_lookup_elem(&zone_configs, &zone_key);
+	if (!zc || zc->screen_profile_id == 0)
+		return XDP_PROG_ZONE;
+
+	__u32 profile_key = (__u32)zc->screen_profile_id;
+	struct screen_config *sc =
+		bpf_map_lookup_elem(&screen_configs, &profile_key);
+	if (!sc || sc->flags == 0)
+		return XDP_PROG_ZONE;
+
+	/*
+	 * Common-case fast path: established TCP data/ACK packets don't need
+	 * the SYN-centric screen logic. Keep the slow path for the few checks
+	 * that can still apply mid-flow.
+	 */
+	if (meta->protocol == PROTO_TCP && !meta->is_fragment) {
+		__u8 tf = meta->tcp_flags;
+		if (!(tf & (0x02 /* SYN */ | 0x01 /* FIN */ |
+			    0x04 /* RST */ | 0x20 /* URG */)) &&
+		    !(sc->flags & SCREEN_LAND_ATTACK) &&
+		    !(meta->addr_family == AF_INET &&
+		      (sc->flags & SCREEN_IP_SOURCE_ROUTE)))
+			return XDP_PROG_ZONE;
+	}
+
+	return XDP_PROG_SCREEN;
+}
+
+/*
  * Parse IPv4 header. Validates version and IHL.
  * Returns 0 on success, populates meta fields.
  */
