@@ -20,12 +20,15 @@ type GCStats struct {
 	TotalEntries        int
 	EstablishedSessions int
 	ExpiredDeleted      int
+	NextSweepDelay      time.Duration
 }
 
 // MaxSessions is the maximum number of session entries in the BPF map.
 // This counts both forward and reverse entries, so the effective session
 // count for watermark comparison is total/2.
 const MaxSessions = 10_000_000
+
+const maxAdaptiveInterval = 60 * time.Second
 
 // GC performs periodic garbage collection on the session table.
 type GC struct {
@@ -104,16 +107,20 @@ func (gc *GC) Stats() GCStats {
 // Run starts the GC loop. It blocks until ctx is cancelled.
 func (gc *GC) Run(ctx context.Context) {
 	slog.Info("conntrack GC started", "interval", gc.interval)
-	ticker := time.NewTicker(gc.interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(gc.interval)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("conntrack GC stopped")
 			return
-		case <-ticker.C:
-			gc.sweep()
+		case <-timer.C:
+			next := gc.sweep()
+			if next <= 0 {
+				next = gc.interval
+			}
+			timer.Reset(next)
 		}
 	}
 }
@@ -130,7 +137,7 @@ type expiredSessionV6 struct {
 	val dataplane.SessionValueV6
 }
 
-func (gc *GC) sweep() {
+func (gc *GC) sweep() time.Duration {
 	// Fast path: if no sessions existed on last sweep AND no new sessions
 	// have been created since, skip the entire iteration.  This eliminates
 	// ~25% CPU from empty-table batch lookups on idle firewalls.
@@ -140,7 +147,7 @@ func (gc *GC) sweep() {
 		if err1 == nil && err2 == nil &&
 			newCtr == gc.lastSessionCounter &&
 			closedCtr == gc.lastClosedCounter {
-			return
+			return gc.nextSweepDelay(0, false, false, 0)
 		}
 		// Counters changed — fall through to full sweep.
 		gc.lastSessionCounter = newCtr
@@ -155,6 +162,7 @@ func (gc *GC) sweep() {
 	isPrimary := gc.IsLocalPrimary == nil || gc.IsLocalPrimary()
 
 	var total, established, expired int
+	var earliestDeadline uint64
 	toDelete := gc.toDeleteV4[:0]
 	snatExpired := gc.snatExpiredV4[:0]
 
@@ -186,7 +194,8 @@ func (gc *GC) sweep() {
 			if gc.agingActive && gc.earlyAgeout > 0 && gc.earlyAgeout < effectiveTimeout {
 				effectiveTimeout = gc.earlyAgeout
 			}
-			if val.LastSeen+effectiveTimeout < now {
+			deadline := val.LastSeen + effectiveTimeout
+			if deadline < now {
 				expired++
 				// Delete both forward and reverse entries
 				toDelete = append(toDelete, key)
@@ -198,6 +207,8 @@ func (gc *GC) sweep() {
 					val.Flags&dataplane.SessFlagStaticNAT == 0 {
 					snatExpired = append(snatExpired, expiredSession{key: key, val: val})
 				}
+			} else if earliestDeadline == 0 || deadline < earliestDeadline {
+				earliestDeadline = deadline
 			}
 		}
 		// Count active (non-expired) forward sessions per src/dst IP.
@@ -218,7 +229,7 @@ func (gc *GC) sweep() {
 	})
 	if err != nil {
 		slog.Error("conntrack GC iteration failed", "err", err)
-		return
+		return gc.interval
 	}
 
 	// Batch delete in chunks for fewer syscalls and reduced lock contention
@@ -303,7 +314,8 @@ func (gc *GC) sweep() {
 				if gc.agingActive && gc.earlyAgeout > 0 && gc.earlyAgeout < effectiveTimeout {
 					effectiveTimeout = gc.earlyAgeout
 				}
-				if val.LastSeen+effectiveTimeout < now {
+				deadline := val.LastSeen + effectiveTimeout
+				if deadline < now {
 					expired++
 					toDeleteV6 = append(toDeleteV6, key)
 					toDeleteV6 = append(toDeleteV6, val.ReverseKey)
@@ -312,6 +324,8 @@ func (gc *GC) sweep() {
 						val.Flags&dataplane.SessFlagStaticNAT == 0 {
 						snatExpiredV6 = append(snatExpiredV6, expiredSessionV6{key: key, val: val})
 					}
+				} else if earliestDeadline == 0 || deadline < earliestDeadline {
+					earliestDeadline = deadline
 				}
 			}
 			if countSessions && (!isPrimary || val.LastSeen+uint64(val.Timeout) >= now) {
@@ -339,6 +353,7 @@ func (gc *GC) sweep() {
 		})
 		if err != nil {
 			slog.Error("conntrack GC v6 iteration failed", "err", err)
+			return gc.interval
 		}
 		gc.lastV6Count = v6Count
 	}
@@ -433,6 +448,8 @@ func (gc *GC) sweep() {
 		}
 	}
 
+	nextDelay := gc.nextSweepDelay(earliestDeadline, countSessions, isPrimary, total)
+
 	gc.mu.Lock()
 	gc.stats = GCStats{
 		LastSweepTime:       sweepStart,
@@ -440,8 +457,50 @@ func (gc *GC) sweep() {
 		TotalEntries:        total,
 		EstablishedSessions: established,
 		ExpiredDeleted:      expired,
+		NextSweepDelay:      nextDelay,
 	}
 	gc.mu.Unlock()
+
+	return nextDelay
+}
+
+func (gc *GC) nextSweepDelay(earliestDeadline uint64, countSessions, isPrimary bool, total int) time.Duration {
+	return gc.nextSweepDelayAt(monotonicSeconds(), earliestDeadline, countSessions, isPrimary, total)
+}
+
+func (gc *GC) nextSweepDelayAt(now, earliestDeadline uint64, countSessions, isPrimary bool, total int) time.Duration {
+	if gc.interval <= 0 {
+		return 0
+	}
+	if countSessions {
+		return gc.interval
+	}
+	if gc.agingActive && gc.earlyAgeout > 0 {
+		return gc.interval
+	}
+	if !isPrimary {
+		return maxAdaptiveDelay(gc.interval, maxAdaptiveInterval)
+	}
+	if total == 0 || earliestDeadline == 0 {
+		return maxAdaptiveDelay(gc.interval, maxAdaptiveInterval)
+	}
+
+	if earliestDeadline <= now {
+		return gc.interval
+	}
+
+	until := time.Duration(earliestDeadline-now) * time.Second
+	if until < gc.interval {
+		return gc.interval
+	}
+	return maxAdaptiveDelay(until, maxAdaptiveInterval)
+}
+
+func maxAdaptiveDelay(delay, limit time.Duration) time.Duration {
+	if delay > limit {
+		return limit
+	}
+	return delay
 }
 
 // monotonicSeconds returns the current monotonic clock in seconds,

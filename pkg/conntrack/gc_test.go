@@ -322,3 +322,30 @@ func TestGCAggressiveAgingHysteresis(t *testing.T) {
 		t.Fatal("aging should deactivate when earlyAgeout set to 0")
 	}
 }
+
+func TestGCNextSweepDelayCapsStablePrimary(t *testing.T) {
+	gc := NewGC(&mockGCDP{}, 10*time.Second)
+
+	got := gc.nextSweepDelayAt(100, 1900, false, true, 2)
+	if got != 60*time.Second {
+		t.Fatalf("nextSweepDelayAt() = %v, want %v", got, 60*time.Second)
+	}
+}
+
+func TestGCNextSweepDelayUsesNearestExpiry(t *testing.T) {
+	gc := NewGC(&mockGCDP{}, 10*time.Second)
+
+	got := gc.nextSweepDelayAt(100, 125, false, true, 2)
+	if got != 25*time.Second {
+		t.Fatalf("nextSweepDelayAt() = %v, want %v", got, 25*time.Second)
+	}
+}
+
+func TestGCNextSweepDelayDisablesBackoffForSessionLimits(t *testing.T) {
+	gc := NewGC(&mockGCDP{}, 10*time.Second)
+
+	got := gc.nextSweepDelayAt(100, 1900, true, true, 2)
+	if got != 10*time.Second {
+		t.Fatalf("nextSweepDelayAt() = %v, want %v", got, 10*time.Second)
+	}
+}
