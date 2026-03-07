@@ -220,6 +220,7 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["flow_config_map"] = zoneObjs.FlowConfigMap
 	m.maps["fib_gen_map"] = zoneObjs.FibGenMap
 	m.maps["fabric_fwd"] = zoneObjs.FabricFwd
+	m.maps["ipv6_flow_cache"] = zoneObjs.Ipv6FlowCache
 	m.maps["rg_active"] = zoneObjs.RgActive
 	m.maps["ha_watchdog"] = zoneObjs.HaWatchdog
 	replaceOpts.MapReplacements["flow_config_map"] = zoneObjs.FlowConfigMap

@@ -80,6 +80,18 @@ FIB lookup: 0% (cached in session entries).
   and full CPU mitigations enabled
 - Added to `/etc/default/grub` + `update-grub`; requires reboot
 
+### 9. IPv6 established-flow cache in `xdp_zone` (`perf-ipv6-flow-cache`)
+- **Goal:** reduce `sessions_v6` lookup pressure for long-running IPv6 TCP flows
+- Added a small per-CPU exact-flow cache for established IPv6 TCP traffic
+- Cache is intentionally narrow:
+  - IPv6 only
+  - TCP ACK/data only
+  - no `SYN/FIN/RST`
+  - no `NAT64`, `ALG`, or predicted sessions
+- Cache entries batch counter / `last_seen` writeback to the real session map
+- Invalidates on FIB generation change or RG ownership loss
+- Design notes: `docs/next-features/ipv6-session-fast-path.md`
+
 ## Host-Side Perf Profile (from host during iperf through VM, Feb 2026)
 
 Profile captured from the **host** (not VM). No BPF/XDP stacks visible — XDP pipeline
