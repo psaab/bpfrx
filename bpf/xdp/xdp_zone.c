@@ -41,7 +41,8 @@ struct ipv6_flow_cache_entry {
 	__u8  next_prog;
 	__u8  count_as_fwd;
 	__u8  rewrite_src;
-	__u8  pad0[3];
+	__u8  nat_flags;
+	__u8  pad0[2];
 	__u8  rewrite_src_ip[16];
 	__be16 rewrite_src_port;
 	__u8  fwd_dmac[6];
@@ -67,7 +68,7 @@ ipv6_flow_cacheable_tcp(struct pkt_meta *meta)
 	return 1;
 }
 
-static __always_inline __attribute__((unused)) int
+static __always_inline int
 ipv6_session_cacheable(struct session_value_v6 *sess)
 {
 	if (!sess || sess->state != SESS_STATE_ESTABLISHED)
@@ -168,7 +169,7 @@ flush_ipv6_flow_cache_entry(struct ipv6_flow_cache_entry *entry)
 	return 0;
 }
 
-static __always_inline __attribute__((unused)) void
+static __always_inline void
 populate_ipv6_flow_cache(struct ipv6_flow_cache_entry *entry,
 			 struct pkt_meta *meta,
 			 struct session_value_v6 *sess,
@@ -185,7 +186,8 @@ populate_ipv6_flow_cache(struct ipv6_flow_cache_entry *entry,
 	fill_ipv6_flow_cache_key(&entry->key, meta);
 	entry->valid = 1;
 	entry->ct_direction = direction;
-	entry->next_prog = (sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT)) ?
+	entry->nat_flags = sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT);
+	entry->next_prog = entry->nat_flags ?
 		XDP_PROG_NAT : XDP_PROG_FORWARD;
 	entry->count_as_fwd = (direction == sess->is_reverse);
 	entry->policy_id = sess->policy_id;
@@ -209,7 +211,7 @@ populate_ipv6_flow_cache(struct ipv6_flow_cache_entry *entry,
 	}
 }
 
-static __always_inline __attribute__((unused)) int
+static __always_inline int
 try_ipv6_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
 		    __u32 fib_gen)
 {
@@ -249,6 +251,7 @@ try_ipv6_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
 	meta->ct_state = SESS_STATE_ESTABLISHED;
 	meta->ct_direction = entry->ct_direction;
 	meta->policy_id = entry->policy_id;
+	meta->nat_flags = entry->nat_flags;
 	meta->fwd_ifindex = entry->fwd_ifindex;
 	meta->egress_vlan_id = entry->egress_vlan_id;
 	meta->egress_zone = entry->egress_zone;
@@ -1008,11 +1011,8 @@ zone_resolved:
 	if (fib_gen_ptr)
 		fib_gen = *fib_gen_ptr;
 
-	/*
-	 * Disabled pending correctness work. The IPv6 flow cache is a
-	 * pure optimization; fall back to the proven session path until
-	 * the established-flow fast path is validated in the lab.
-	 */
+	if (!is_tcp_syn && try_ipv6_flow_cache(ctx, meta, fib_gen) >= 0)
+		return XDP_PASS;
 	if (!is_tcp_syn && meta->addr_family == AF_INET6 &&
 	    meta->protocol == PROTO_TCP && !ipv6_flow_cacheable_tcp(meta))
 		flush_matching_ipv6_flow_cache(meta);
@@ -1096,6 +1096,19 @@ zone_resolved:
 		}
 		if (!skip_cache_v6 && sv6 && sv6->fib_ifindex != 0 &&
 		    sv6->fib_gen == (__u16)fib_gen) {
+			if (ipv6_flow_cacheable_tcp(meta) &&
+			    ipv6_session_cacheable(sv6)) {
+				__u32 slot = ipv6_flow_cache_slot(meta);
+				struct ipv6_flow_cache_entry *entry =
+					bpf_map_lookup_elem(&ipv6_flow_cache,
+							    &slot);
+				if (entry)
+					populate_ipv6_flow_cache(entry, meta,
+								 sv6,
+								 ct_direction,
+								 fib_gen,
+								 meta->now_sec);
+			}
 			meta->fwd_ifindex    = sv6->fib_ifindex;
 			meta->egress_vlan_id = sv6->fib_vlan_id;
 			__builtin_memcpy(meta->fwd_dmac, sv6->fib_dmac, 6);
