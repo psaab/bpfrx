@@ -194,6 +194,14 @@ resolve_ingress_xdp_target(struct pkt_meta *meta)
 	return XDP_PROG_SCREEN;
 }
 
+static __always_inline __u64
+get_precise_ktime_ns(struct pkt_meta *meta)
+{
+	if (meta->ktime_ns == 0)
+		meta->ktime_ns = bpf_ktime_get_ns();
+	return meta->ktime_ns;
+}
+
 /*
  * Parse IPv4 header. Validates version and IHL.
  * Returns 0 on success, populates meta fields.
@@ -1460,7 +1468,7 @@ evaluate_firewall_filter(struct pkt_meta *meta)
 		 * If exceeded, apply policer action (discard). */
 		if (rule->policer_id) {
 			__u32 pid = rule->policer_id;
-			if (evaluate_policer(pid, meta->pkt_len, meta->ktime_ns))
+			if (evaluate_policer(pid, meta->pkt_len, get_precise_ktime_ns(meta)))
 				return -1; /* policer exceeded → discard */
 		}
 
@@ -1662,7 +1670,7 @@ evaluate_firewall_filter_output(struct pkt_meta *meta, __u32 egress_ifindex)
 		/* Policer: if rule has a policer, evaluate token bucket. */
 		if (rule->policer_id) {
 			__u32 pid = rule->policer_id;
-			if (evaluate_policer(pid, meta->pkt_len, meta->ktime_ns))
+			if (evaluate_policer(pid, meta->pkt_len, get_precise_ktime_ns(meta)))
 				return -1; /* policer exceeded → discard */
 		}
 
@@ -1848,7 +1856,7 @@ evaluate_filter_by_id(__u32 fid, struct pkt_meta *meta)
 
 		if (rule->policer_id) {
 			__u32 pid = rule->policer_id;
-			if (evaluate_policer(pid, meta->pkt_len, meta->ktime_ns))
+			if (evaluate_policer(pid, meta->pkt_len, get_precise_ktime_ns(meta)))
 				return -1;
 		}
 

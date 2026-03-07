@@ -385,6 +385,8 @@ type bpfrxXdpMainPktMeta struct {
 	AppTimeout    uint32
 	MirrorIfindex uint32
 	MirrorRate    uint32
+	NowSec        uint32
+	PadTime       uint32
 	KtimeNs       uint64
 }
 

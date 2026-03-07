@@ -465,7 +465,12 @@ struct pkt_meta {
 	__u32 mirror_ifindex;  /* 0 = no mirroring */
 	__u32 mirror_rate;     /* 1-in-N rate (0 = mirror all) */
 
-	/* Cached bpf_ktime_get_ns() — set once in main, reused across stages */
+	/* Cached coarse seconds for conntrack/screen aging. */
+	__u32 now_sec;
+	__u32 pad_time;
+
+	/* Cached precise bpf_ktime_get_ns() — populated lazily when policers
+	 * or other precise timers need it. */
 	__u64 ktime_ns;
 };
 

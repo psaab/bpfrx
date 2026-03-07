@@ -23,11 +23,11 @@ static __always_inline int
 handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		 struct session_value *sess, __u8 direction)
 {
-	__u64 now = meta->ktime_ns / 1000000000ULL;
+	__u64 now = meta->now_sec;
 
 	/* Don't update last_seen for CLOSED sessions — the
 	 * retransmits would prevent GC from ever cleaning up. */
-	if (sess->state != SESS_STATE_CLOSED)
+	if (sess->state != SESS_STATE_CLOSED && sess->last_seen != now)
 		sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {
@@ -95,7 +95,8 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 			if (paired) {
 				paired->state = new_state;
 				paired->timeout = new_timeout;
-				paired->last_seen = now;
+				if (paired->last_seen != now)
+					paired->last_seen = now;
 			}
 
 			/* rst-invalidate-session: expire immediately
@@ -171,9 +172,9 @@ static __always_inline int
 handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		 struct session_value_v6 *sess, __u8 direction)
 {
-	__u64 now = meta->ktime_ns / 1000000000ULL;
+	__u64 now = meta->now_sec;
 
-	if (sess->state != SESS_STATE_CLOSED)
+	if (sess->state != SESS_STATE_CLOSED && sess->last_seen != now)
 		sess->last_seen = now;
 
 	if (direction == sess->is_reverse) {
@@ -222,7 +223,8 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 			if (paired) {
 				paired->state = new_state;
 				paired->timeout = new_timeout;
-				paired->last_seen = now;
+				if (paired->last_seen != now)
+					paired->last_seen = now;
 			}
 
 			/* rst-invalidate-session: expire immediately */
@@ -440,7 +442,8 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 		return -1;  /* No matching session */
 
 	/* Touch the session so GC doesn't expire it while errors flow */
-	sess->last_seen = meta->ktime_ns / 1000000000ULL;
+	if (sess->last_seen != meta->now_sec)
+		sess->last_seen = meta->now_sec;
 
 	/* FIB lookup to route toward the original client */
 	struct bpf_fib_lookup fib = {};
@@ -647,7 +650,8 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 		return -1;  /* No matching session */
 
 	/* Touch the session so GC doesn't expire it while errors flow */
-	sess->last_seen = meta->ktime_ns / 1000000000ULL;
+	if (sess->last_seen != meta->now_sec)
+		sess->last_seen = meta->now_sec;
 
 	/* FIB lookup to route toward the original client */
 	struct bpf_fib_lookup fib = {};
@@ -810,9 +814,9 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 						bpf_map_lookup_elem(
 						&sessions_v6, &n64_sk);
 					if (n64_sess) {
-						__u64 now = meta->ktime_ns /
-							1000000000ULL;
-						n64_sess->last_seen = now;
+						__u64 now = meta->now_sec;
+						if (n64_sess->last_seen != now)
+							n64_sess->last_seen = now;
 						__sync_fetch_and_add(
 							&n64_sess->rev_packets, 1);
 						__sync_fetch_and_add(

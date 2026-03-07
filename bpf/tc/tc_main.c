@@ -29,7 +29,8 @@ int tc_main_prog(struct __sk_buff *skb)
 	meta->direction = 1; /* egress */
 	meta->ingress_ifindex = skb->ingress_ifindex;
 	meta->dscp_rewrite = 0xFF; /* no DSCP rewrite by default */
-	meta->ktime_ns = bpf_ktime_get_ns();
+	meta->now_sec = (__u32)(bpf_ktime_get_coarse_ns() / 1000000000ULL);
+	meta->ktime_ns = 0;
 
 	/* Parse Ethernet header (extract VLAN ID for zone lookup) */
 	struct ethhdr *eth = data;
