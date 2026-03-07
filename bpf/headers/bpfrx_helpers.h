@@ -267,29 +267,6 @@ parse_ipv6hdr(void *data, void *data_end, struct pkt_meta *meta)
 	/* Walk extension header chain to find the upper-layer protocol */
 	__u8 nexthdr = ip6h->nexthdr;
 	__u16 offset = meta->l3_offset + sizeof(struct ipv6hdr);
-	if (nexthdr != NEXTHDR_HOP &&
-	    nexthdr != NEXTHDR_ROUTING &&
-	    nexthdr != NEXTHDR_DEST &&
-	    nexthdr != NEXTHDR_AUTH &&
-	    nexthdr != NEXTHDR_FRAGMENT &&
-	    nexthdr != NEXTHDR_NONE) {
-		meta->protocol = nexthdr;
-		meta->l4_offset = offset;
-		return 0;
-	}
-	if (nexthdr == NEXTHDR_NONE) {
-		meta->protocol = nexthdr;
-		meta->l4_offset = offset;
-		return 0;
-	}
-
-	/* Fast path: skip extension header walker for common protocols */
-	if (nexthdr == PROTO_TCP || nexthdr == PROTO_UDP ||
-	    nexthdr == PROTO_ICMPV6) {
-		meta->protocol  = nexthdr;
-		meta->l4_offset = offset;
-		return 0;
-	}
 
 	#pragma unroll
 	for (int i = 0; i < MAX_EXT_HDRS; i++) {
