@@ -334,18 +334,15 @@ compute_ph_csum_v6(const __u8 *saddr, const __u8 *daddr,
 }
 
 /*
- * Lazy CHECKSUM_PARTIAL resolution for IPv6.
+ * Optional CHECKSUM_PARTIAL resolution for IPv6.
  *
- * parse_l4hdr() defers the expensive IPv6 pseudo-header checksum
- * computation (16 u16 additions for 128-bit src+dst) and stores
- * the raw L4 checksum in l4_csum_saved.  Call this before any
- * code path that reads meta->csum_partial for IPv6 packets.
+ * Some call sites can choose to defer IPv6 pseudo-header checksum
+ * detection by saving the raw L4 checksum in l4_csum_saved.  When
+ * parse_l4hdr() resolves the checksum inline, l4_csum_saved stays 0
+ * and this becomes a no-op.
  *
  * Reads source/destination addresses from the PACKET (not meta),
  * so must be called BEFORE any packet header modification.
- *
- * For IPv4, l4_csum_saved is always 0 (detection stays inline
- * in parse_l4hdr), making this a single-branch no-op.
  */
 static __always_inline void
 resolve_csum_partial(void *data, void *data_end, struct pkt_meta *meta)
@@ -606,27 +603,28 @@ parse_l4hdr(void *data, void *data_end, struct pkt_meta *meta)
 	 * pseudo-header fields (ports, TCP options) -- the NIC or
 	 * skb_checksum_help will sum the actual data bytes later.
 	 *
-	 * IPv4: detect inline (cheap — 4 additions for 2x32-bit addrs).
-	 * IPv6: defer to resolve_csum_partial() (expensive — 16
-	 *        additions for 2x128-bit addrs).  Only NAT/MSS paths
-	 *        call the resolver; established non-NAT sessions skip it.
+	 * Detect inline for both IPv4 and IPv6. The lazy IPv6 path is
+	 * retained as a helper, but eager detection keeps forwarding
+	 * behavior correct across all packet paths.
 	 */
 	meta->csum_partial = 0;
 	meta->l4_csum_saved = 0;
 	if (l4_csum != 0) {
-		if (meta->addr_family == AF_INET) {
-			__u16 l4_len = meta->pkt_len -
-				       (meta->l4_offset - meta->l3_offset);
-			__u16 ph = compute_ph_csum_v4(meta->src_ip.v4,
-						      meta->dst_ip.v4,
-						      meta->protocol,
-						      l4_len);
-			if ((__u16)l4_csum == ph)
-				meta->csum_partial = 1;
-		} else {
-			/* IPv6: save L4 checksum for lazy resolution. */
-			meta->l4_csum_saved = (__u16)l4_csum;
-		}
+		__u16 l4_len = meta->pkt_len -
+			       (meta->l4_offset - meta->l3_offset);
+		__u16 ph;
+		if (meta->addr_family == AF_INET)
+			ph = compute_ph_csum_v4(meta->src_ip.v4,
+						meta->dst_ip.v4,
+						meta->protocol,
+						l4_len);
+		else
+			ph = compute_ph_csum_v6(meta->src_ip.v6,
+						meta->dst_ip.v6,
+						meta->protocol,
+						l4_len);
+		if ((__u16)l4_csum == ph)
+			meta->csum_partial = 1;
 	}
 
 	return 0;
