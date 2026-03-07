@@ -3948,6 +3948,57 @@ func TestVLANInterfaceCompilation(t *testing.T) {
 	}
 }
 
+func TestSetPathFamilyCompoundKey(t *testing.T) {
+	// Regression: "set ... family inet6 address X" must merge into existing
+	// "family inet6" node, not create nested "family { inet6 { ... } }".
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set interfaces reth1 unit 0 family inet address 10.0.89.1/24",
+		"set interfaces reth1 unit 0 family inet6 address 2001:559:8585:ef01::1/64",
+		"set interfaces reth1 unit 0 family inet6 address 2001:559:8585:df01::1/64",
+	}
+
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	// Verify tree structure: unit 0 should have "family inet" and "family inet6" nodes,
+	// NOT a "family" node with "inet6" child.
+	unit0 := tree.Children[0].Children[0].Children[0] // interfaces → reth1 → unit 0
+	if unit0 == nil {
+		t.Fatal("missing unit 0")
+	}
+	for _, child := range unit0.Children {
+		if len(child.Keys) == 1 && child.Keys[0] == "family" {
+			t.Errorf("found bare 'family' node — should be compound key ['family','inet'] or ['family','inet6']")
+		}
+	}
+
+	// Verify compilation produces correct addresses.
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+
+	ifc := cfg.Interfaces.Interfaces["reth1"]
+	if ifc == nil {
+		t.Fatal("missing interface reth1")
+	}
+	unit := ifc.Units[0]
+	if unit == nil {
+		t.Fatal("missing unit 0")
+	}
+	if len(unit.Addresses) != 3 {
+		t.Errorf("expected 3 addresses, got %d: %v", len(unit.Addresses), unit.Addresses)
+	}
+}
+
 func TestEdgeCases(t *testing.T) {
 	// Empty block
 	input := `security {

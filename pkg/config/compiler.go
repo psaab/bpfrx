@@ -3494,8 +3494,10 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 						switch child.Keys[1] {
 						case "inet":
 							familyInet = true
+							groupPrefixLimitInet = parsePrefixLimit(child)
 						case "inet6":
 							familyInet6 = true
+							groupPrefixLimitInet6 = parsePrefixLimit(child)
 						}
 					} else {
 						for _, fc := range child.Children {
@@ -3611,17 +3613,32 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							case "remove-private":
 								neighbor.RemovePrivateAS = true
 							case "family":
-								for _, fc := range prop.Children {
-									switch fc.Name() {
+								if len(prop.Keys) >= 2 {
+									switch prop.Keys[1] {
 									case "inet":
 										neighbor.FamilyInet = true
-										if pl := parsePrefixLimit(fc); pl > 0 {
+										if pl := parsePrefixLimit(prop); pl > 0 {
 											neighbor.PrefixLimitInet = pl
 										}
 									case "inet6":
 										neighbor.FamilyInet6 = true
-										if pl := parsePrefixLimit(fc); pl > 0 {
+										if pl := parsePrefixLimit(prop); pl > 0 {
 											neighbor.PrefixLimitInet6 = pl
+										}
+									}
+								} else {
+									for _, fc := range prop.Children {
+										switch fc.Name() {
+										case "inet":
+											neighbor.FamilyInet = true
+											if pl := parsePrefixLimit(fc); pl > 0 {
+												neighbor.PrefixLimitInet = pl
+											}
+										case "inet6":
+											neighbor.FamilyInet6 = true
+											if pl := parsePrefixLimit(fc); pl > 0 {
+												neighbor.PrefixLimitInet6 = pl
+											}
 										}
 									}
 								}
@@ -6451,29 +6468,40 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 						}
 					}
 				}
-				if familyNode := child.FindChild("family"); familyNode != nil {
-					if inetNode := familyNode.FindChild("inet"); inetNode != nil {
-						for _, addrChild := range inetNode.Children {
-							target := &IPMonitorTarget{
-								Address: addrChild.Name(),
-							}
-							// weight inline: "10.0.1.1 weight 100"
-							for i := 1; i < len(addrChild.Keys)-1; i++ {
-								if addrChild.Keys[i] == "weight" {
-									if n, err := strconv.Atoi(addrChild.Keys[i+1]); err == nil {
-										target.Weight = n
-									}
-								}
-							}
-							if wNode := addrChild.FindChild("weight"); wNode != nil {
-								if v := nodeVal(wNode); v != "" {
-									if n, err := strconv.Atoi(v); err == nil {
-										target.Weight = n
-									}
-								}
-							}
-							ipm.Targets = append(ipm.Targets, target)
+				for _, familyNode := range child.Children {
+					if familyNode.Name() != "family" {
+						continue
+					}
+					// Determine inet node: compound key "family inet" vs nested family { inet { } }
+					var inetNode *Node
+					if len(familyNode.Keys) >= 2 && familyNode.Keys[1] == "inet" {
+						inetNode = familyNode
+					} else {
+						inetNode = familyNode.FindChild("inet")
+					}
+					if inetNode == nil {
+						continue
+					}
+					for _, addrChild := range inetNode.Children {
+						target := &IPMonitorTarget{
+							Address: addrChild.Name(),
 						}
+						// weight inline: "10.0.1.1 weight 100"
+						for i := 1; i < len(addrChild.Keys)-1; i++ {
+							if addrChild.Keys[i] == "weight" {
+								if n, err := strconv.Atoi(addrChild.Keys[i+1]); err == nil {
+									target.Weight = n
+								}
+							}
+						}
+						if wNode := addrChild.FindChild("weight"); wNode != nil {
+							if v := nodeVal(wNode); v != "" {
+								if n, err := strconv.Atoi(v); err == nil {
+									target.Weight = n
+								}
+							}
+						}
+						ipm.Targets = append(ipm.Targets, target)
 					}
 				}
 				rg.IPMonitoring = ipm

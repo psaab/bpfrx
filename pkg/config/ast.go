@@ -869,6 +869,7 @@ type schemaNode struct {
 	placeholder  string                 // Junos-style placeholder (e.g., "<interface-name>")
 	midKeyword   string                 // fixed keyword in the middle of args (e.g., "to-zone")
 	midKeywordAt int                    // 1-based arg position where midKeyword appears (e.g., 2 for "from-zone X to-zone Y")
+	compoundKey  bool                   // children form compound key (e.g., "family inet6" → Keys=["family","inet6"])
 }
 
 // setSchema defines the Junos configuration tree structure.
@@ -1227,7 +1228,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"destination": {desc: "Destination routing instance", args: 1, children: nil},
 				}},
 			}},
-			"family": {children: map[string]*schemaNode{
+			"family": {compoundKey: true, children: map[string]*schemaNode{
 				"inet": {children: map[string]*schemaNode{
 					"mtu": {args: 1, children: nil},
 					"address": {args: 1, children: map[string]*schemaNode{
@@ -1445,7 +1446,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"default-originate":  {children: nil},
 				"loops":              {args: 1, children: nil},
 				"remove-private":     {children: nil},
-				"family": {children: map[string]*schemaNode{
+				"family": {compoundKey: true, children: map[string]*schemaNode{
 					"inet": {children: map[string]*schemaNode{
 						"unicast": {children: map[string]*schemaNode{
 							"prefix-limit": {children: map[string]*schemaNode{
@@ -1474,7 +1475,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"default-originate":      {children: nil},
 					"loops":                  {args: 1, children: nil},
 					"remove-private":         {children: nil},
-					"family": {children: map[string]*schemaNode{
+					"family": {compoundKey: true, children: map[string]*schemaNode{
 						"inet": {children: map[string]*schemaNode{
 							"unicast": {children: map[string]*schemaNode{
 								"prefix-limit": {children: map[string]*schemaNode{
@@ -1598,7 +1599,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"ip-monitoring": {children: map[string]*schemaNode{
 					"global-weight":    {args: 1, children: nil},
 					"global-threshold": {args: 1, children: nil},
-					"family": {children: map[string]*schemaNode{
+					"family": {compoundKey: true, children: map[string]*schemaNode{
 						"inet": {wildcard: &schemaNode{children: map[string]*schemaNode{
 							"weight": {args: 1, children: nil},
 						}}},
@@ -1640,7 +1641,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"loss-priority": {args: 1, children: nil},
 			}},
 		}},
-		"family": {children: map[string]*schemaNode{
+		"family": {compoundKey: true, children: map[string]*schemaNode{
 			"inet": {children: map[string]*schemaNode{
 				"filter": {args: 1, children: map[string]*schemaNode{
 					"term": {args: 1, children: map[string]*schemaNode{
@@ -1871,7 +1872,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"application-identification": {children: nil},
 	}},
 	"forwarding-options": {children: map[string]*schemaNode{
-		"family": {children: map[string]*schemaNode{
+		"family": {compoundKey: true, children: map[string]*schemaNode{
 			"inet6": {children: map[string]*schemaNode{
 				"mode": {args: 1, children: nil},
 			}},
@@ -1879,7 +1880,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"sampling": {children: map[string]*schemaNode{
 			"instance": {args: 1, children: map[string]*schemaNode{
 				"input": {children: nil},
-				"family": {children: map[string]*schemaNode{
+				"family": {compoundKey: true, children: map[string]*schemaNode{
 					"inet": {children: map[string]*schemaNode{
 						"output": {children: map[string]*schemaNode{
 							"flow-server":  {args: 1, children: nil},
@@ -2078,6 +2079,17 @@ func (t *ConfigTree) SetPath(path []string) error {
 		nodeKeys := path[i : i+nodeKeyCount]
 		i += nodeKeyCount
 
+		// Compound key: children form part of the key rather than
+		// separate hierarchy levels (e.g. "family inet6" is a single
+		// node with Keys=["family","inet6"], not nested nodes).
+		if childSchema.compoundKey && i < len(path) {
+			if sub, ok := childSchema.children[path[i]]; ok {
+				nodeKeys = append(append([]string(nil), nodeKeys...), path[i])
+				i++
+				childSchema = sub
+			}
+		}
+
 		if i >= len(path) {
 			// No more tokens after this node: it's a leaf.
 			if childSchema.args > 0 && !childSchema.multi && childSchema.children == nil {
@@ -2222,6 +2234,15 @@ func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) erro
 	nodeKeys := path[i : i+nodeKeyCount]
 	i += nodeKeyCount
 
+	// Compound key: consume child token as part of key.
+	if childSchema.compoundKey && i < len(path) {
+		if sub, ok := childSchema.children[path[i]]; ok {
+			nodeKeys = append(append([]string(nil), nodeKeys...), path[i])
+			i++
+			childSchema = sub
+		}
+	}
+
 	if i >= len(path) {
 		// No more tokens: this container node itself is the target.
 		return removeMatchingNode(current, nodeKeys)
@@ -2344,6 +2365,15 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []Schema
 		}
 		path = append(path, tokens[i:end]...)
 		i += nodeKeyCount
+
+		// Compound key: consume child token as part of key.
+		if childSchema.compoundKey && i < len(tokens) {
+			if sub, ok := childSchema.children[tokens[i]]; ok {
+				path = append(path, tokens[i])
+				i++
+				childSchema = sub
+			}
+		}
 
 		if i > len(tokens) {
 			// Still consuming args for this node — user needs to type a value.
