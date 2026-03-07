@@ -178,8 +178,12 @@ int xdp_main_prog(struct xdp_md *ctx)
 
 	TRACE_XDP_MAIN(meta);
 
-	/* Dispatch to pipeline: screen -> zone -> conntrack -> policy -> nat -> forward */
-	bpf_tail_call(ctx, &xdp_progs, XDP_PROG_SCREEN);
+	/* Bypass the screen tail call when the ingress zone has no effective
+	 * screen work for this packet. */
+	int target = resolve_ingress_xdp_target(meta);
+	if (target < 0)
+		return XDP_DROP;
+	bpf_tail_call(ctx, &xdp_progs, target);
 
 	/* Tail call failed -- pass to kernel stack as fallback */
 	return XDP_PASS;

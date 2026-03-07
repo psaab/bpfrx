@@ -1,7 +1,7 @@
 ## Next Feature: IPv6 Session Fast Path
 
-Date: 2026-03-06
-Status: Phase 1 implemented in `perf-ipv6-flow-cache`; Phase 4 + counters completed in `a1b6d1c`
+Date: 2026-03-06  
+Status: Phase 1 partially implemented in `perf-ipv6-flow-cache`
 
 ## Problem
 
@@ -50,13 +50,14 @@ Design:
    - `policy_id`
    - tail-call target (`forward` or `nat`)
 4. Batch write back counters and `last_seen` to the real `sessions_v6` map:
-   - every `32` packets, or
+   - every `256` packets, or
    - once per second
 5. Invalidate/fallback immediately if:
    - FIB generation changed
    - RG ownership is no longer active locally
    - the backing session disappeared
    - the backing session left `ESTABLISHED`
+6. Flush/invalidate the cached entry before falling back on non-cacheable TCP control packets for the same flow.
 
 Safety constraints:
 
@@ -99,11 +100,26 @@ Follow-on work:
 1. Move cold/logging/GC data out of the hottest lookup value.
 2. Keep the lookup-time value as small as possible.
 
-### Phase 4: IPv6 parser fast path — COMPLETED (`a1b6d1c`, #165)
+### Phase 4: IPv6 parser fast path
 
-~~Add a cheap no-extension-header fast path in `parse_ipv6hdr()`, then fall back to the current generic extension-header walker only when needed.~~
+Implemented in [`parse_ipv6hdr()`](/home/ps/git/codex-bpfrx/bpf/headers/bpfrx_helpers.h).
 
-Implemented: `parse_ipv6hdr()` returns immediately for TCP/UDP/ICMPv6 nexthdr without entering the extension header walker. IPv6 `xdp_main_prog` CPU drops to 8.8% (parity with IPv4's 9.4%).
+The parser now returns immediately for the common case where the IPv6 base
+header directly names the upper-layer protocol, and only falls back to the
+generic extension-header walker when the packet actually contains extension
+headers.
+
+### Phase 5: Narrower IPv6 NAT rewrite path
+
+Implemented in [`nat_rewrite_v6()`](/home/ps/git/codex-bpfrx/bpf/headers/bpfrx_nat.h).
+
+The IPv6 NAT path now specializes work based on:
+
+1. protocol (`TCP`, `UDP`, `ICMPv6`, other)
+2. actual direction of rewrite (`SNAT`, `DNAT`, or both)
+
+This removes repeated protocol branching and avoids touching source/destination
+fields that are not changing for the current packet.
 
 ## Phase 1 Notes
 
@@ -113,16 +129,14 @@ Current implementation details:
 2. Placement: XDP zone stage, before `sessions_v6` lookup.
 3. Entry lifetime: replaced on collision, with flush-before-replace.
 4. Loader keeps the cache map FD alive via [`loader_ebpf.go`](/home/ps/git/codex-bpfrx/pkg/dataplane/loader_ebpf.go).
+5. Batch threshold is `256` packets, chosen to reduce steady-state session-map pressure while keeping accounting drift bounded.
+6. The same branch also includes the IPv6 no-extension parse fast path and a narrower IPv6 NAT rewrite path.
 
 Why zone stage:
 
 The zone stage already owns the established-session fast path and cached FIB
 reuse. Adding the cache there avoids duplicating another lookup path in
 `xdp_conntrack`.
-
-### Supplementary: Deferred CHECKSUM_PARTIAL detection — COMPLETED (`a1b6d1c`, #170)
-
-Moved IPv6 pseudo-header checksum computation from `parse_l4hdr()` (every packet) to `resolve_csum_partial()` (only NAT/MSS paths). Established non-NAT IPv6 flows pay zero checksum cost. Resolver reads IPs from packet headers (not meta) for correctness with pre-routing DNAT/NPTv6.
 
 ## Risks
 
@@ -140,7 +154,7 @@ Moved IPv6 pseudo-header checksum computation from `parse_l4hdr()` (every packet
 
 ## Next Issues
 
-1. ~~Add observability counters for IPv6 cache hit/flush/fallback.~~ — COMPLETED (`a1b6d1c`, #167): hit/miss/flush/invalidation counters in `global_counters`, exposed via CLI/gRPC/REST/Prometheus. 96% hit rate measured.
+1. Add observability counters for IPv6 cache hit/flush/fallback.
 2. Compact IPv6 session key.
 3. Split hot/cold IPv6 session state.
-4. ~~Add IPv6 parser no-extension fast path.~~ — COMPLETED (`a1b6d1c`, #165)
+4. Reduce remaining IPv6 checksum-partial detection cost in `xdp_main`.

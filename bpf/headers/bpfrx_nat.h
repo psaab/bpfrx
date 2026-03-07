@@ -387,75 +387,113 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 
 	/* Compute l4 pointer once -- all helpers share this */
 	void *l4 = data + meta->l4_offset;
+	int rewrite_src = !!(meta->nat_flags & SESS_FLAG_SNAT);
+	int rewrite_dst = !!(meta->nat_flags & SESS_FLAG_DNAT);
 
-	/* Source IP rewrite */
-	if (!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
-		__u8 old_src[16];
-		__builtin_memcpy(old_src, &ip6h->saddr, 16);
-		nat_update_l4_csum_v6(l4, data_end, meta, old_src, meta->src_ip.v6);
-		__builtin_memcpy(&ip6h->saddr, meta->src_ip.v6, 16);
-	}
+	switch (meta->protocol) {
+	case PROTO_TCP: {
+		struct tcphdr *tcp = l4;
+		if ((void *)(tcp + 1) > data_end)
+			return;
 
-	/* Source port rewrite.
-	 * For CHECKSUM_PARTIAL, skip the L4 checksum update. */
-	if (meta->src_port != 0) {
-		if (meta->protocol == PROTO_TCP) {
-			struct tcphdr *tcp = l4;
-			if ((void *)(tcp + 1) <= data_end && tcp->source != meta->src_port) {
+		if (rewrite_src) {
+			if (!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
+				__u8 old_src[16];
+				__builtin_memcpy(old_src, &ip6h->saddr, 16);
+				nat_update_l4_csum_v6(l4, data_end, meta, old_src,
+					      meta->src_ip.v6);
+				__builtin_memcpy(&ip6h->saddr, meta->src_ip.v6, 16);
+			}
+			if (meta->src_port != 0 && tcp->source != meta->src_port) {
 				if (!meta->csum_partial)
-					nat_update_l4_port_csum(l4, data_end, meta,
-								tcp->source, meta->src_port);
+					csum_update_2(&tcp->check, tcp->source,
+						      meta->src_port);
 				tcp->source = meta->src_port;
 			}
-		} else if (meta->protocol == PROTO_UDP) {
-			struct udphdr *udp = l4;
-			if ((void *)(udp + 1) <= data_end && udp->source != meta->src_port) {
+		}
+
+		if (rewrite_dst) {
+			if (!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
+				__u8 old_dst[16];
+				__builtin_memcpy(old_dst, &ip6h->daddr, 16);
+				nat_update_l4_csum_v6(l4, data_end, meta, old_dst,
+					      meta->dst_ip.v6);
+				__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
+			}
+			if (meta->dst_port != 0 && tcp->dest != meta->dst_port) {
 				if (!meta->csum_partial)
-					nat_update_l4_port_csum(l4, data_end, meta,
-								udp->source, meta->src_port);
+					csum_update_2(&tcp->check, tcp->dest,
+						      meta->dst_port);
+				tcp->dest = meta->dst_port;
+			}
+		}
+		break;
+	}
+	case PROTO_UDP: {
+		struct udphdr *udp = l4;
+		if ((void *)(udp + 1) > data_end)
+			return;
+
+		if (rewrite_src) {
+			if (!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
+				__u8 old_src[16];
+				__builtin_memcpy(old_src, &ip6h->saddr, 16);
+				nat_update_l4_csum_v6(l4, data_end, meta, old_src,
+					      meta->src_ip.v6);
+				__builtin_memcpy(&ip6h->saddr, meta->src_ip.v6, 16);
+			}
+			if (meta->src_port != 0 && udp->source != meta->src_port) {
+				if (!meta->csum_partial)
+					csum_update_2(&udp->check, udp->source,
+						      meta->src_port);
 				udp->source = meta->src_port;
 			}
 		}
-	}
 
-	/* Destination IP rewrite */
-	if (!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
-		__u8 old_dst[16];
-		__builtin_memcpy(old_dst, &ip6h->daddr, 16);
-		nat_update_l4_csum_v6(l4, data_end, meta, old_dst, meta->dst_ip.v6);
-		__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
-	}
-
-	/* Destination port rewrite */
-	if (meta->dst_port != 0) {
-		if (meta->protocol == PROTO_TCP) {
-			struct tcphdr *tcp = l4;
-			if ((void *)(tcp + 1) <= data_end && tcp->dest != meta->dst_port) {
-				if (!meta->csum_partial)
-					nat_update_l4_port_csum(l4, data_end, meta,
-								tcp->dest, meta->dst_port);
-				tcp->dest = meta->dst_port;
+		if (rewrite_dst) {
+			if (!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
+				__u8 old_dst[16];
+				__builtin_memcpy(old_dst, &ip6h->daddr, 16);
+				nat_update_l4_csum_v6(l4, data_end, meta, old_dst,
+					      meta->dst_ip.v6);
+				__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
 			}
-		} else if (meta->protocol == PROTO_UDP) {
-			struct udphdr *udp = l4;
-			if ((void *)(udp + 1) <= data_end && udp->dest != meta->dst_port) {
+			if (meta->dst_port != 0 && udp->dest != meta->dst_port) {
 				if (!meta->csum_partial)
-					nat_update_l4_port_csum(l4, data_end, meta,
-								udp->dest, meta->dst_port);
+					csum_update_2(&udp->check, udp->dest,
+						      meta->dst_port);
 				udp->dest = meta->dst_port;
 			}
 		}
+		break;
 	}
-
-	/* ICMPv6 echo ID rewrite.
-	 * ICMPv6 checksum covers a pseudo-header, so CHECKSUM_PARTIAL
-	 * applies -- skip ID checksum update when partial. */
-	if (meta->protocol == PROTO_ICMPV6) {
+	case PROTO_ICMPV6: {
 		struct icmp6hdr *icmp6 = l4;
-		if ((void *)(icmp6 + 1) <= data_end &&
-		    (icmp6->icmp6_type == 128 || icmp6->icmp6_type == 129)) {
+		if ((void *)(icmp6 + 1) > data_end)
+			return;
+
+		if (rewrite_src &&
+		    !ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
+			__u8 old_src[16];
+			__builtin_memcpy(old_src, &ip6h->saddr, 16);
+			nat_update_l4_csum_v6(l4, data_end, meta, old_src,
+				      meta->src_ip.v6);
+			__builtin_memcpy(&ip6h->saddr, meta->src_ip.v6, 16);
+		}
+
+		if (rewrite_dst &&
+		    !ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
+			__u8 old_dst[16];
+			__builtin_memcpy(old_dst, &ip6h->daddr, 16);
+			nat_update_l4_csum_v6(l4, data_end, meta, old_dst,
+				      meta->dst_ip.v6);
+			__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
+		}
+
+		if ((icmp6->icmp6_type == 128 || icmp6->icmp6_type == 129) &&
+		    (rewrite_src || rewrite_dst)) {
 			__be16 desired_id = meta->src_port;
-			if (meta->nat_flags & SESS_FLAG_DNAT)
+			if (rewrite_dst)
 				desired_id = meta->dst_port;
 			if (icmp6->un.echo.id != desired_id) {
 				if (!meta->csum_partial)
@@ -465,6 +503,26 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 				icmp6->un.echo.id = desired_id;
 			}
 		}
+		break;
+	}
+	default:
+		if (rewrite_src &&
+		    !ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
+			__u8 old_src[16];
+			__builtin_memcpy(old_src, &ip6h->saddr, 16);
+			nat_update_l4_csum_v6(l4, data_end, meta, old_src,
+				      meta->src_ip.v6);
+			__builtin_memcpy(&ip6h->saddr, meta->src_ip.v6, 16);
+		}
+		if (rewrite_dst &&
+		    !ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
+			__u8 old_dst[16];
+			__builtin_memcpy(old_dst, &ip6h->daddr, 16);
+			nat_update_l4_csum_v6(l4, data_end, meta, old_dst,
+				      meta->dst_ip.v6);
+			__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
+		}
+		break;
 	}
 }
 
