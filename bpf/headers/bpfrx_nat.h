@@ -387,14 +387,21 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 
 	/* Compute l4 pointer once -- all helpers share this */
 	void *l4 = data + meta->l4_offset;
-	int rewrite_src = !!(meta->nat_flags & SESS_FLAG_SNAT);
-	int rewrite_dst = !!(meta->nat_flags & SESS_FLAG_DNAT);
+	int rewrite_src = 0;
+	int rewrite_dst = 0;
 
 	switch (meta->protocol) {
 	case PROTO_TCP: {
 		struct tcphdr *tcp = l4;
 		if ((void *)(tcp + 1) > data_end)
 			return;
+
+		rewrite_src =
+			!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr) ||
+			(meta->src_port != 0 && tcp->source != meta->src_port);
+		rewrite_dst =
+			!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr) ||
+			(meta->dst_port != 0 && tcp->dest != meta->dst_port);
 
 		if (rewrite_src) {
 			if (!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
@@ -434,6 +441,13 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 		if ((void *)(udp + 1) > data_end)
 			return;
 
+		rewrite_src =
+			!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr) ||
+			(meta->src_port != 0 && udp->source != meta->src_port);
+		rewrite_dst =
+			!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr) ||
+			(meta->dst_port != 0 && udp->dest != meta->dst_port);
+
 		if (rewrite_src) {
 			if (!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
 				__u8 old_src[16];
@@ -472,6 +486,13 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 		if ((void *)(icmp6 + 1) > data_end)
 			return;
 
+		rewrite_src =
+			!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr) ||
+			(meta->src_port != 0 && icmp6->un.echo.id != meta->src_port);
+		rewrite_dst =
+			!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr) ||
+			(meta->dst_port != 0 && icmp6->un.echo.id != meta->dst_port);
+
 		if (rewrite_src &&
 		    !ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
 			__u8 old_src[16];
@@ -493,7 +514,7 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 		if ((icmp6->icmp6_type == 128 || icmp6->icmp6_type == 129) &&
 		    (rewrite_src || rewrite_dst)) {
 			__be16 desired_id = meta->src_port;
-			if (rewrite_dst)
+			if (!rewrite_src && rewrite_dst)
 				desired_id = meta->dst_port;
 			if (icmp6->un.echo.id != desired_id) {
 				if (!meta->csum_partial)
@@ -506,6 +527,11 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 		break;
 	}
 	default:
+		rewrite_src =
+			!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr);
+		rewrite_dst =
+			!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr);
+
 		if (rewrite_src &&
 		    !ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
 			__u8 old_src[16];
