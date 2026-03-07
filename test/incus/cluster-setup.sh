@@ -4,9 +4,13 @@
 # Creates a two-VM HA cluster with heartbeat, fabric, and shared LAN
 # networks, plus a test container on the cluster LAN.
 #
-# Single-config model: both nodes share docs/ha-cluster.conf with
+# Single-config model: both nodes share a unified config with
 # apply-groups "${node}" expansion. Node ID comes from /etc/bpfrx/node-id.
 # Interface names follow vSRX conventions: fxp0, em0, ge-X/Y/Z.
+#
+# Parameterized via env file — set BPFRX_CLUSTER_ENV to source custom
+# settings (remote host, SR-IOV parents, VF indices, network names, etc.).
+# Without an env file, defaults match the original local cluster.
 #
 # Usage:
 #   ./test/incus/cluster-setup.sh init              # Create networks + profile
@@ -22,35 +26,81 @@
 
 set -euo pipefail
 
-# Re-exec under incus-admin group if needed
-if ! incus list &>/dev/null 2>&1; then
-	if getent group incus-admin &>/dev/null && id -nG | grep -qw incus-admin; then
-		exec sg incus-admin -c "$(printf '%q ' "$0" "$@")"
-	fi
-fi
-
-VM0="bpfrx-fw0"
-VM1="bpfrx-fw1"
-LAN_HOST="cluster-lan-host"
-PROFILE="bpfrx-cluster"
-IMAGE_VM="images:debian/13"
-IMAGE_CT="images:debian/13"
-SRIOV_PARENT="eno6np1"
-# PCI addresses for SR-IOV VFs (one per VM, from $SRIOV_PARENT)
-VF_PCI=("0000:b7:06.0" "0000:b7:06.1")
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# Network definitions: name:subnet:nat
-NETWORKS=(
-	"bpfrx-heartbeat:none:false"
-	"bpfrx-fabric:none:false"
-	"bpfrx-clan:none:false"
-)
+# Source env file for custom deployments (remote, SR-IOV config, etc.)
+if [[ -n "${BPFRX_CLUSTER_ENV:-}" && -f "$BPFRX_CLUSTER_ENV" ]]; then
+	# shellcheck disable=SC1090
+	source "$BPFRX_CLUSTER_ENV"
+fi
+
+# Re-exec under incus-admin group if needed (preserve BPFRX_CLUSTER_ENV)
+if ! incus list &>/dev/null 2>&1; then
+	if getent group incus-admin &>/dev/null && id -nG | grep -qw incus-admin; then
+		local_env=""
+		if [[ -n "${BPFRX_CLUSTER_ENV:-}" ]]; then
+			local_env="BPFRX_CLUSTER_ENV=$(printf '%q' "$BPFRX_CLUSTER_ENV") "
+		fi
+		exec sg incus-admin -c "${local_env}$(printf '%q ' "$0" "$@")"
+	fi
+fi
+
+# ── Defaults (local cluster values if no env file) ───────────────────
+
+INCUS_REMOTE="${INCUS_REMOTE:-}"
+VM0="${VM0:-bpfrx-fw0}"
+VM1="${VM1:-bpfrx-fw1}"
+LAN_HOST="${LAN_HOST:-cluster-lan-host}"
+PROFILE="${PROFILE:-bpfrx-cluster}"
+IMAGE_VM="${IMAGE_VM:-images:debian/13}"
+IMAGE_CT="${IMAGE_CT:-images:debian/13}"
+
+# SR-IOV: PCI passthrough for VM VFs, nictype=sriov for container VFs
+SRIOV_PARENT="${SRIOV_PARENT:-eno6np1}"
+SRIOV_LAN_PARENT="${SRIOV_LAN_PARENT:-}"   # Container LAN: nictype=sriov parent
+
+# WAN VF PCI addresses per VM (VF_PCI is legacy alias for VF_WAN_PCI)
+if [[ -z "${VF_WAN_PCI+x}" ]]; then
+	if [[ -z "${VF_PCI+x}" ]]; then
+		VF_WAN_PCI=("0000:b7:06.0" "0000:b7:06.1")
+	else
+		VF_WAN_PCI=("${VF_PCI[@]}")
+	fi
+fi
+# LAN VF PCI addresses per VM (empty = no LAN VF passthrough)
+if [[ -z "${VF_LAN_PCI+x}" ]]; then VF_LAN_PCI=(); fi
+
+# Network names (parameterized for remote)
+NET_MGMT="${NET_MGMT:-incusbr0}"
+NET_HEARTBEAT="${NET_HEARTBEAT:-bpfrx-heartbeat}"
+NET_FABRIC="${NET_FABRIC:-bpfrx-fabric}"
+# NET_CLAN: set to empty in env file to skip bridge-based LAN (SR-IOV LAN)
+if [[ -z "${NET_CLAN+x}" ]]; then NET_CLAN="bpfrx-clan"; fi
+
+# Config file path
+CLUSTER_CONF="${CLUSTER_CONF:-${PROJECT_ROOT}/docs/ha-cluster.conf}"
+
+# Network definitions: name:subnet:nat (only for networks we manage)
+NETWORKS=()
+# Always manage heartbeat and fabric
+NETWORKS+=("${NET_HEARTBEAT}:none:false")
+NETWORKS+=("${NET_FABRIC}:none:false")
+# Only manage cluster LAN bridge if it's set (not for SR-IOV LAN)
+if [[ -n "$NET_CLAN" && "$NET_CLAN" != "none" ]]; then
+	NETWORKS+=("${NET_CLAN}:none:false")
+fi
 
 info()  { echo "==> $*"; }
 warn()  { echo "WARNING: $*" >&2; }
 die()   { echo "ERROR: $*" >&2; exit 1; }
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+# Prefix instance name with remote if set: "loss:bpfrx-fw0" or "bpfrx-fw0"
+r() {
+	echo "${INCUS_REMOTE:+${INCUS_REMOTE}:}$1"
+}
 
 # Resolve VM name from node index (0 or 1)
 vm_name() {
@@ -61,18 +111,18 @@ vm_name() {
 	esac
 }
 
-# vSRX LAN interface name for a given node index (reth1 member)
-# Node 0: ge-0-0-1, Node 1: ge-7-0-1
-lan_ifname() {
-	local idx="$1"
-	if [[ "$idx" == "0" ]]; then echo "ge-0-0-1"; else echo "ge-7-0-1"; fi
-}
-
-# vSRX WAN interface name for a given node index (reth0 member, SR-IOV VF)
-# Node 0: ge-0-0-3, Node 1: ge-7-0-3
-wan_ifname() {
-	local idx="$1"
-	if [[ "$idx" == "0" ]]; then echo "ge-0-0-3"; else echo "ge-7-0-3"; fi
+# Wait for incus agent to be ready inside a VM
+wait_for_agent() {
+	local inst="$1"
+	local max="${2:-90}"
+	local tries=0
+	while ! incus exec "$(r "$inst")" -- true &>/dev/null; do
+		sleep 2
+		tries=$((tries + 1))
+		if [[ $tries -ge $max ]]; then
+			die "VM agent for $inst did not become ready after $((max * 2)) seconds"
+		fi
+	done
 }
 
 # ── Init ─────────────────────────────────────────────────────────────
@@ -86,20 +136,20 @@ cmd_init() {
 create_networks() {
 	for entry in "${NETWORKS[@]}"; do
 		IFS=: read -r name subnet nat <<< "$entry"
-		if incus network show "$name" &>/dev/null 2>&1; then
+		if incus network show "$(r "$name")" &>/dev/null 2>&1; then
 			info "Network $name already exists"
 			continue
 		fi
 		info "Creating network $name (subnet=$subnet, nat=$nat)"
-		incus network create "$name" \
+		incus network create "$(r "$name")" \
 			ipv4.address="$subnet" \
 			ipv4.nat="$nat" \
 			ipv6.address=none
 		# Enable IPv6 on cluster LAN bridge so incus doesn't strip IPv6
 		# routes from containers. ra-param=*,0,0 suppresses default
 		# router advertisements so only the firewall's embedded RA sender is used.
-		if [[ "$name" == "bpfrx-clan" ]]; then
-			incus network set "$name" \
+		if [[ "$name" == "$NET_CLAN" && "$NET_CLAN" != "none" ]]; then
+			incus network set "$(r "$name")" \
 				ipv6.address=fd42:cafe::1/64 \
 				ipv6.nat=false \
 				ipv6.dhcp=false \
@@ -109,15 +159,17 @@ create_networks() {
 }
 
 create_profile() {
-	if incus profile show "$PROFILE" &>/dev/null 2>&1; then
+	if incus profile show "$(r "$PROFILE")" &>/dev/null 2>&1; then
 		info "Profile $PROFILE already exists, updating..."
-		incus profile delete "$PROFILE" 2>/dev/null || true
+		incus profile delete "$(r "$PROFILE")" 2>/dev/null || true
 	fi
 	info "Creating profile $PROFILE"
-	incus profile create "$PROFILE"
-	incus profile edit "$PROFILE" <<'YAML'
-config:
-  limits.cpu: "4"
+	incus profile create "$(r "$PROFILE")"
+
+	# Build profile YAML dynamically based on network config
+	local yaml
+	yaml="config:
+  limits.cpu: \"4\"
   limits.memory: 4GB
 devices:
   root:
@@ -127,21 +179,27 @@ devices:
     type: disk
   eth0:
     name: enp5s0
-    network: incusbr0
+    network: ${NET_MGMT}
     type: nic
   eth1:
     name: enp6s0
-    network: bpfrx-heartbeat
+    network: ${NET_HEARTBEAT}
     type: nic
   eth2:
     name: enp7s0
-    network: bpfrx-fabric
-    type: nic
+    network: ${NET_FABRIC}
+    type: nic"
+
+	# Only add LAN bridge NIC if NET_CLAN is set (not SR-IOV LAN)
+	if [[ -n "$NET_CLAN" && "$NET_CLAN" != "none" ]]; then
+		yaml+="
   eth3:
     name: enp8s0
-    network: bpfrx-clan
-    type: nic
-YAML
+    network: ${NET_CLAN}
+    type: nic"
+	fi
+
+	echo "$yaml" | incus profile edit "$(r "$PROFILE")"
 }
 
 # ── Instance Management ──────────────────────────────────────────────
@@ -163,44 +221,65 @@ create_vm() {
 	local vm
 	vm=$(vm_name "$idx")
 
-	if incus info "$vm" &>/dev/null 2>&1; then
+	if incus info "$(r "$vm")" &>/dev/null 2>&1; then
 		die "Instance $vm already exists. Run '$0 destroy' first."
 	fi
 
 	info "Launching VM $vm..."
-	incus launch "$IMAGE_VM" "$vm" --vm --profile "$PROFILE"
+	incus launch "$IMAGE_VM" "$(r "$vm")" --vm --profile "$PROFILE"
 
 	info "Waiting for VM agent ($vm)..."
-	local tries=0
-	while ! incus exec "$vm" -- true &>/dev/null; do
-		sleep 2
-		tries=$((tries + 1))
-		if [[ $tries -ge 90 ]]; then
-			die "VM agent for $vm did not become ready after 180 seconds"
-		fi
-	done
+	wait_for_agent "$vm"
 
-	# Stop VM to add SR-IOV VF via PCI passthrough (hotplug doesn't work)
-	info "Stopping VM to add SR-IOV VF..."
-	incus stop "$vm" --force
+	# Stop VM to add SR-IOV VFs via PCI passthrough (hotplug doesn't work)
+	info "Stopping VM to add SR-IOV VF(s)..."
+	incus stop "$(r "$vm")" --force
 	sleep 2
 
-	local pci="${VF_PCI[$idx]}"
-	info "Adding SR-IOV VF PCI $pci to $vm..."
-	incus config device add "$vm" wan-vf pci address="$pci"
+	# WAN VF (always present)
+	local wan_pci="${VF_WAN_PCI[$idx]}"
+	info "Adding WAN SR-IOV VF PCI $wan_pci to $vm..."
+	incus config device add "$(r "$vm")" wan-vf pci address="$wan_pci"
 
-	info "Starting VM with VF..."
-	incus start "$vm"
+	# LAN VF (optional — only if VF_LAN_PCI is configured)
+	if [[ ${#VF_LAN_PCI[@]} -gt 0 ]]; then
+		local lan_pci="${VF_LAN_PCI[$idx]}"
+		info "Adding LAN SR-IOV VF PCI $lan_pci to $vm..."
+		incus config device add "$(r "$vm")" lan-vf pci address="$lan_pci"
+	fi
+
+	# Set host-level VF VLAN for LAN VFs (PCI passthrough doesn't get incus vlan= option)
+	if [[ -n "${VF_LAN_VLAN:-}" && -n "${SRIOV_LAN_PARENT:-}" && ${#VF_LAN_PCI[@]} -gt 0 ]]; then
+		local lan_pci="${VF_LAN_PCI[$idx]}"
+		# Find VF index from PCI address
+		local vf_idx
+		for vf_path in /sys/class/net/"${SRIOV_LAN_PARENT}"/device/virtfn*; do
+			local vf_pci
+			if [[ -n "${INCUS_REMOTE:-}" ]]; then
+				vf_pci=$(ssh "$INCUS_REMOTE" "readlink -f '$vf_path' | xargs basename")
+			else
+				vf_pci=$(readlink -f "$vf_path" | xargs basename)
+			fi
+			if [[ "$vf_pci" == "$lan_pci" ]]; then
+				vf_idx=$(basename "$vf_path" | sed 's/virtfn//')
+				break
+			fi
+		done
+		if [[ -n "${vf_idx:-}" ]]; then
+			info "Setting host VF VLAN $VF_LAN_VLAN on $SRIOV_LAN_PARENT vf $vf_idx ($lan_pci)..."
+			if [[ -n "${INCUS_REMOTE:-}" ]]; then
+				ssh "$INCUS_REMOTE" "sudo ip link set dev $SRIOV_LAN_PARENT vf $vf_idx vlan $VF_LAN_VLAN"
+			else
+				sudo ip link set dev "$SRIOV_LAN_PARENT" vf "$vf_idx" vlan "$VF_LAN_VLAN"
+			fi
+		fi
+	fi
+
+	info "Starting VM with VF(s)..."
+	incus start "$(r "$vm")"
 
 	# Wait for agent again after restart
-	tries=0
-	while ! incus exec "$vm" -- true &>/dev/null; do
-		sleep 2
-		tries=$((tries + 1))
-		if [[ $tries -ge 90 ]]; then
-			die "VM agent for $vm did not become ready after 180 seconds"
-		fi
-	done
+	wait_for_agent "$vm"
 
 	provision_vm "$vm" "$idx"
 	info "VM $vm ready."
@@ -209,11 +288,13 @@ create_vm() {
 provision_vm() {
 	local vm="$1"
 	local idx="$2"
+	local rinst
+	rinst=$(r "$vm")
 
 	# Wait for systemd to be ready
 	info "Waiting for system to be ready ($vm)..."
 	local stries=0
-	while ! incus exec "$vm" -- systemctl is-system-running &>/dev/null 2>&1; do
+	while ! incus exec "$rinst" -- systemctl is-system-running &>/dev/null 2>&1; do
 		sleep 2
 		stries=$((stries + 1))
 		if [[ $stries -ge 30 ]]; then
@@ -226,21 +307,21 @@ provision_vm() {
 	# at startup — no external script needed.
 
 	info "Configuring sysctl ($vm)..."
-	incus exec "$vm" -- bash -c 'cat > /etc/sysctl.d/99-bpf.conf <<EOF
+	incus exec "$rinst" -- bash -c 'cat > /etc/sysctl.d/99-bpf.conf <<EOF
 net.core.bpf_jit_enable=1
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
 net.ipv6.conf.all.accept_ra=0
 net.ipv6.conf.default.accept_ra=0
 EOF'
-	incus exec "$vm" -- sysctl --system
+	incus exec "$rinst" -- sysctl --system
 
 	info "Installing packages ($vm, this may take a few minutes)..."
-	incus exec "$vm" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony ethtool mtr-tiny linux-perf host pciutils'
+	incus exec "$rinst" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony ethtool mtr-tiny linux-perf host pciutils'
 
 	# Upgrade kernel to latest from Debian unstable
 	info "Adding Debian unstable repo for kernel upgrade ($vm)..."
-	incus exec "$vm" -- bash -c 'cat > /etc/apt/sources.list.d/unstable.list <<EOF
+	incus exec "$rinst" -- bash -c 'cat > /etc/apt/sources.list.d/unstable.list <<EOF
 deb http://deb.debian.org/debian unstable main
 EOF
 cat > /etc/apt/preferences.d/pin-stable <<EOF
@@ -253,17 +334,17 @@ Pin: release a=unstable
 Pin-Priority: 990
 EOF'
 	info "Installing latest kernel from unstable ($vm)..."
-	incus exec "$vm" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-image-amd64 linux-headers-amd64'
+	incus exec "$rinst" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-image-amd64 linux-headers-amd64'
 
 	# Disable init_on_alloc for XDP performance
 	info "Disabling init_on_alloc for XDP performance ($vm)..."
-	incus exec "$vm" -- sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="[^"]*"/GRUB_CMDLINE_LINUX_DEFAULT="quiet init_on_alloc=0"/' /etc/default/grub
-	incus exec "$vm" -- update-grub
+	incus exec "$rinst" -- sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="[^"]*"/GRUB_CMDLINE_LINUX_DEFAULT="quiet init_on_alloc=0"/' /etc/default/grub
+	incus exec "$rinst" -- update-grub
 
 	info "Rebooting VM for new kernel ($vm)..."
-	incus restart "$vm"
+	incus restart "$(r "$vm")"
 	local ktries=0
-	while ! incus exec "$vm" -- true &>/dev/null; do
+	while ! incus exec "$rinst" -- true &>/dev/null; do
 		sleep 2
 		ktries=$((ktries + 1))
 		if [[ $ktries -ge 30 ]]; then
@@ -271,67 +352,92 @@ EOF'
 			break
 		fi
 	done
-	incus exec "$vm" -- uname -r
+	incus exec "$rinst" -- uname -r
 
-	incus exec "$vm" -- systemctl enable frr
+	incus exec "$rinst" -- systemctl enable frr
 
 	# Chrony: enable and clear default pool sources
-	incus exec "$vm" -- systemctl enable chrony
-	incus exec "$vm" -- bash -c 'sed -i "s/^pool /#pool /" /etc/chrony/chrony.conf; sed -i "s/^server /#server /" /etc/chrony/chrony.conf'
-	incus exec "$vm" -- mkdir -p /etc/chrony/sources.d
+	incus exec "$rinst" -- systemctl enable chrony
+	incus exec "$rinst" -- bash -c 'sed -i "s/^pool /#pool /" /etc/chrony/chrony.conf; sed -i "s/^server /#server /" /etc/chrony/chrony.conf'
+	incus exec "$rinst" -- mkdir -p /etc/chrony/sources.d
 
 	# Write cluster node ID file for ${node} variable expansion
 	info "Writing node-id file ($vm, node $idx)..."
-	incus exec "$vm" -- mkdir -p /etc/bpfrx
-	incus exec "$vm" -- bash -c "echo $idx > /etc/bpfrx/node-id"
+	incus exec "$rinst" -- mkdir -p /etc/bpfrx
+	incus exec "$rinst" -- bash -c "echo $idx > /etc/bpfrx/node-id"
 }
 
 create_lan_host() {
-	if incus info "$LAN_HOST" &>/dev/null 2>&1; then
+	local rinst
+	rinst=$(r "$LAN_HOST")
+
+	if incus info "$rinst" &>/dev/null 2>&1; then
 		info "Container $LAN_HOST already exists, skipping"
 		return
 	fi
 
 	info "Launching test container $LAN_HOST..."
-	incus launch "$IMAGE_CT" "$LAN_HOST" -s default
+	incus launch "$IMAGE_CT" "$rinst" -s default
 
-	# Attach only the cluster LAN network
-	incus config device add "$LAN_HOST" eth0 nic network=bpfrx-clan
-	incus restart "$LAN_HOST"
+	if [[ -n "$SRIOV_LAN_PARENT" ]]; then
+		# SR-IOV LAN: incus picks a free VF, applies VLAN at host level
+		local lan_host_args=(nictype=sriov parent="$SRIOV_LAN_PARENT")
+		if [[ -n "${VF_LAN_VLAN:-}" ]]; then
+			lan_host_args+=(vlan="${VF_LAN_VLAN}")
+		fi
+		info "Adding LAN SR-IOV VF (parent=$SRIOV_LAN_PARENT${VF_LAN_VLAN:+ vlan=$VF_LAN_VLAN}) to $LAN_HOST..."
+		incus config device add "$rinst" eth0 nic "${lan_host_args[@]}"
+	else
+		# Bridge-based LAN
+		incus config device add "$rinst" eth0 nic network="$NET_CLAN"
+	fi
+	incus restart "$rinst"
 
 	info "Waiting for container to start..."
 	sleep 3
 
+	# Determine LAN IP config based on cluster config
+	local lan_addr lan_gw
+	if [[ "$CLUSTER_CONF" == *"loss"* ]]; then
+		lan_addr="10.0.89.102/24"
+		lan_gw="10.0.89.1"
+	else
+		lan_addr="10.0.60.102/24"
+		lan_gw="10.0.60.1"
+	fi
+
 	# Configure static IP
-	info "Configuring static IP on $LAN_HOST..."
-	incus exec "$LAN_HOST" -- bash -c 'cat > /etc/systemd/network/10-cluster-lan.network <<EOF
+	info "Configuring static IP on $LAN_HOST ($lan_addr)..."
+	incus exec "$rinst" -- bash -c "cat > /etc/systemd/network/10-cluster-lan.network <<EOF
 [Match]
 Name=eth0
 
 [Network]
-Address=10.0.60.102/24
-Gateway=10.0.60.1
+Address=${lan_addr}
+Gateway=${lan_gw}
 IPv6AcceptRA=true
 
 [Link]
 RequiredForOnline=no
-EOF'
-	incus exec "$LAN_HOST" -- systemctl restart systemd-networkd
+EOF"
+	incus exec "$rinst" -- systemctl restart systemd-networkd
 
-	info "Installing packages on $LAN_HOST..."
-	incus exec "$LAN_HOST" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 mtr-tiny pciutils'
+	info "Installing packages on $LAN_HOST (may fail if firewall not yet deployed)..."
+	if ! incus exec "$rinst" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 mtr-tiny pciutils' 2>/dev/null; then
+		warn "Package install failed (firewall not running?). Re-run after deploy: incus exec $(r "$LAN_HOST") -- apt-get install -y iperf3 mtr-tiny"
+	fi
 
-	info "Container $LAN_HOST ready (10.0.60.102/24)."
+	info "Container $LAN_HOST ready ($lan_addr)."
 }
 
 # ── Destroy ──────────────────────────────────────────────────────────
 
 cmd_destroy() {
 	for inst in "$VM0" "$VM1" "$LAN_HOST"; do
-		if incus info "$inst" &>/dev/null 2>&1; then
+		if incus info "$(r "$inst")" &>/dev/null 2>&1; then
 			info "Stopping and deleting $inst..."
-			incus stop "$inst" --force 2>/dev/null || true
-			incus delete "$inst" --force
+			incus stop "$(r "$inst")" --force 2>/dev/null || true
+			incus delete "$(r "$inst")" --force
 		else
 			info "$inst does not exist"
 		fi
@@ -342,14 +448,14 @@ cmd_destroy() {
 	if [[ "${answer,,}" == "y" ]]; then
 		for entry in "${NETWORKS[@]}"; do
 			IFS=: read -r name _ _ <<< "$entry"
-			if incus network show "$name" &>/dev/null 2>&1; then
+			if incus network show "$(r "$name")" &>/dev/null 2>&1; then
 				info "Deleting network $name"
-				incus network delete "$name"
+				incus network delete "$(r "$name")"
 			fi
 		done
-		if incus profile show "$PROFILE" &>/dev/null 2>&1; then
+		if incus profile show "$(r "$PROFILE")" &>/dev/null 2>&1; then
 			info "Deleting profile $PROFILE"
-			incus profile delete "$PROFILE"
+			incus profile delete "$(r "$PROFILE")"
 		fi
 	fi
 	info "Destroy complete."
@@ -379,7 +485,7 @@ deploy_rolling() {
 	# Determine which node is currently secondary (deploy it first).
 	local secondary=1
 	local primary=0
-	if incus exec "$VM0" -- cli -c "show chassis cluster status" 2>/dev/null | grep -q "secondary:node0"; then
+	if incus exec "$(r "$VM0")" -- cli -c "show chassis cluster status" 2>/dev/null | grep -q "secondary:node0"; then
 		secondary=0
 		primary=1
 	fi
@@ -396,7 +502,7 @@ deploy_rolling() {
 	vm_sec=$(vm_name "$secondary")
 	local retries=30
 	while (( retries > 0 )); do
-		if incus exec "$vm_sec" -- cli -c "show chassis cluster status" 2>/dev/null | grep -q "primary\|secondary"; then
+		if incus exec "$(r "$vm_sec")" -- cli -c "show chassis cluster status" 2>/dev/null | grep -q "primary\|secondary"; then
 			break
 		fi
 		sleep 2
@@ -419,8 +525,10 @@ deploy_vm() {
 	local idx="$1"
 	local vm
 	vm=$(vm_name "$idx")
+	local rinst
+	rinst=$(r "$vm")
 
-	if ! incus info "$vm" &>/dev/null 2>&1; then
+	if ! incus info "$rinst" &>/dev/null 2>&1; then
 		die "Instance $vm does not exist. Run '$0 create' first."
 	fi
 
@@ -429,42 +537,41 @@ deploy_vm() {
 	# then bpfrxd cleanup removes pinned BPF maps/links.  The final
 	# pkill -9 is a safety net only — if the daemon hung during shutdown
 	# the binary is still "text file busy" and the push will fail.
-	incus exec "$vm" -- systemctl stop bpfrxd 2>/dev/null || true
-	incus exec "$vm" -- bpfrxd cleanup 2>/dev/null || true
-	incus exec "$vm" -- pkill -9 bpfrxd 2>/dev/null || true
-	incus exec "$vm" -- pkill -9 cli 2>/dev/null || true
+	incus exec "$rinst" -- systemctl stop bpfrxd 2>/dev/null || true
+	incus exec "$rinst" -- bpfrxd cleanup 2>/dev/null || true
+	incus exec "$rinst" -- pkill -9 bpfrxd 2>/dev/null || true
+	incus exec "$rinst" -- pkill -9 cli 2>/dev/null || true
 	sleep 1
 
 	info "Pushing bpfrxd to $vm..."
-	incus file push "$PROJECT_ROOT/bpfrxd" "$vm/usr/local/sbin/bpfrxd" --mode 0755
+	incus file push "$PROJECT_ROOT/bpfrxd" "${rinst}/usr/local/sbin/bpfrxd" --mode 0755
 
 	info "Pushing cli to $vm..."
-	incus file push "$PROJECT_ROOT/cli" "$vm/usr/local/sbin/cli" --mode 0755
+	incus file push "$PROJECT_ROOT/cli" "${rinst}/usr/local/sbin/cli" --mode 0755
 
 	# Push the single unified HA config (same file for both nodes)
-	local conf="${PROJECT_ROOT}/docs/ha-cluster.conf"
-	if [[ -f "$conf" ]]; then
+	if [[ -f "$CLUSTER_CONF" ]]; then
 		info "Pushing unified HA config to $vm..."
-		incus exec "$vm" -- mkdir -p /etc/bpfrx
-		incus file push "$conf" "$vm/etc/bpfrx/bpfrx.conf"
+		incus exec "$rinst" -- mkdir -p /etc/bpfrx
+		incus file push "$CLUSTER_CONF" "${rinst}/etc/bpfrx/bpfrx.conf"
 		# Clear configstore DB so daemon bootstraps from the new text file.
 		# Without this, the daemon loads the OLD config from active.json.
-		incus exec "$vm" -- rm -rf /etc/bpfrx/.configdb
+		incus exec "$rinst" -- rm -rf /etc/bpfrx/.configdb
 	else
-		warn "Config file $conf not found"
+		warn "Config file $CLUSTER_CONF not found"
 	fi
 
 	# Ensure node-id file exists
-	incus exec "$vm" -- bash -c "echo $idx > /etc/bpfrx/node-id"
+	incus exec "$rinst" -- bash -c "echo $idx > /etc/bpfrx/node-id"
 
 	# Disable radvd — embedded RA sender in bpfrxd replaces it
-	incus exec "$vm" -- systemctl disable --now radvd 2>/dev/null || true
+	incus exec "$rinst" -- systemctl disable --now radvd 2>/dev/null || true
 
 	# Install systemd unit
 	info "Installing systemd service on $vm..."
-	incus file push "${SCRIPT_DIR}/bpfrxd.service" "$vm/etc/systemd/system/bpfrxd.service"
-	incus exec "$vm" -- systemctl daemon-reload
-	incus exec "$vm" -- systemctl enable --now bpfrxd
+	incus file push "${SCRIPT_DIR}/bpfrxd.service" "${rinst}/etc/systemd/system/bpfrxd.service"
+	incus exec "$rinst" -- systemctl daemon-reload
+	incus exec "$rinst" -- systemctl enable --now bpfrxd
 
 	info "Deploy complete for $vm."
 }
@@ -476,18 +583,18 @@ cmd_ssh() {
 	[[ -z "$idx" ]] && die "Usage: $0 ssh 0|1"
 	local vm
 	vm=$(vm_name "$idx")
-	if ! incus info "$vm" &>/dev/null 2>&1; then
+	if ! incus info "$(r "$vm")" &>/dev/null 2>&1; then
 		die "Instance $vm does not exist."
 	fi
-	exec incus exec "$vm" -- bash -l
+	exec incus exec "$(r "$vm")" -- bash -l
 }
 
 cmd_status() {
 	echo "── Instances ──"
 	for inst in "$VM0" "$VM1" "$LAN_HOST"; do
-		if incus info "$inst" &>/dev/null 2>&1; then
+		if incus info "$(r "$inst")" &>/dev/null 2>&1; then
 			local state
-			state=$(incus list "$inst" -f csv -c s 2>/dev/null || echo "unknown")
+			state=$(incus list "$(r "$inst")" -f csv -c s 2>/dev/null || echo "unknown")
 			echo "  $inst: $state"
 		else
 			echo "  $inst: not created"
@@ -499,9 +606,9 @@ cmd_status() {
 	for idx in 0 1; do
 		local vm
 		vm=$(vm_name "$idx")
-		if incus info "$vm" &>/dev/null 2>&1; then
+		if incus info "$(r "$vm")" &>/dev/null 2>&1; then
 			echo "  $vm:"
-			incus exec "$vm" -- systemctl is-active bpfrxd 2>/dev/null || echo "    (not installed)"
+			incus exec "$(r "$vm")" -- systemctl is-active bpfrxd 2>/dev/null || echo "    (not installed)"
 		fi
 	done
 
@@ -509,8 +616,8 @@ cmd_status() {
 	echo "── Networks ──"
 	for entry in "${NETWORKS[@]}"; do
 		IFS=: read -r name _ _ <<< "$entry"
-		if incus network show "$name" &>/dev/null 2>&1; then
-			echo "  $name: $(incus network get "$name" ipv4.address) nat=$(incus network get "$name" ipv4.nat)"
+		if incus network show "$(r "$name")" &>/dev/null 2>&1; then
+			echo "  $name: $(incus network get "$(r "$name")" ipv4.address) nat=$(incus network get "$(r "$name")" ipv4.nat)"
 		else
 			echo "  $name: not created"
 		fi
@@ -518,7 +625,7 @@ cmd_status() {
 
 	echo ""
 	echo "── Profile ──"
-	if incus profile show "$PROFILE" &>/dev/null 2>&1; then
+	if incus profile show "$(r "$PROFILE")" &>/dev/null 2>&1; then
 		echo "  $PROFILE: exists"
 	else
 		echo "  $PROFILE: not created"
@@ -530,7 +637,7 @@ cmd_logs() {
 	[[ -z "$idx" ]] && die "Usage: $0 logs 0|1"
 	local vm
 	vm=$(vm_name "$idx")
-	incus exec "$vm" -- journalctl -u bpfrxd -n 50 --no-pager
+	incus exec "$(r "$vm")" -- journalctl -u bpfrxd -n 50 --no-pager
 }
 
 cmd_journal() {
@@ -538,15 +645,15 @@ cmd_journal() {
 	[[ -z "$idx" ]] && die "Usage: $0 journal 0|1"
 	local vm
 	vm=$(vm_name "$idx")
-	incus exec "$vm" -- journalctl -u bpfrxd -f
+	incus exec "$(r "$vm")" -- journalctl -u bpfrxd -f
 }
 
 cmd_start() {
 	local target="${1:-all}"
 	case "$target" in
-		0)   incus exec "$VM0" -- systemctl start bpfrxd; info "bpfrxd started on $VM0" ;;
-		1)   incus exec "$VM1" -- systemctl start bpfrxd; info "bpfrxd started on $VM1" ;;
-		all) incus exec "$VM0" -- systemctl start bpfrxd; incus exec "$VM1" -- systemctl start bpfrxd; info "bpfrxd started on both VMs" ;;
+		0)   incus exec "$(r "$VM0")" -- systemctl start bpfrxd; info "bpfrxd started on $VM0" ;;
+		1)   incus exec "$(r "$VM1")" -- systemctl start bpfrxd; info "bpfrxd started on $VM1" ;;
+		all) incus exec "$(r "$VM0")" -- systemctl start bpfrxd; incus exec "$(r "$VM1")" -- systemctl start bpfrxd; info "bpfrxd started on both VMs" ;;
 		*)   die "Usage: $0 start [0|1|all]" ;;
 	esac
 }
@@ -554,9 +661,9 @@ cmd_start() {
 cmd_stop() {
 	local target="${1:-all}"
 	case "$target" in
-		0)   incus exec "$VM0" -- systemctl stop bpfrxd; info "bpfrxd stopped on $VM0" ;;
-		1)   incus exec "$VM1" -- systemctl stop bpfrxd; info "bpfrxd stopped on $VM1" ;;
-		all) incus exec "$VM0" -- systemctl stop bpfrxd; incus exec "$VM1" -- systemctl stop bpfrxd; info "bpfrxd stopped on both VMs" ;;
+		0)   incus exec "$(r "$VM0")" -- systemctl stop bpfrxd; info "bpfrxd stopped on $VM0" ;;
+		1)   incus exec "$(r "$VM1")" -- systemctl stop bpfrxd; info "bpfrxd stopped on $VM1" ;;
+		all) incus exec "$(r "$VM0")" -- systemctl stop bpfrxd; incus exec "$(r "$VM1")" -- systemctl stop bpfrxd; info "bpfrxd stopped on both VMs" ;;
 		*)   die "Usage: $0 stop [0|1|all]" ;;
 	esac
 }
@@ -564,9 +671,9 @@ cmd_stop() {
 cmd_restart() {
 	local target="${1:-all}"
 	case "$target" in
-		0)   incus exec "$VM0" -- systemctl restart bpfrxd; info "bpfrxd restarted on $VM0" ;;
-		1)   incus exec "$VM1" -- systemctl restart bpfrxd; info "bpfrxd restarted on $VM1" ;;
-		all) incus exec "$VM0" -- systemctl restart bpfrxd; incus exec "$VM1" -- systemctl restart bpfrxd; info "bpfrxd restarted on both VMs" ;;
+		0)   incus exec "$(r "$VM0")" -- systemctl restart bpfrxd; info "bpfrxd restarted on $VM0" ;;
+		1)   incus exec "$(r "$VM1")" -- systemctl restart bpfrxd; info "bpfrxd restarted on $VM1" ;;
+		all) incus exec "$(r "$VM0")" -- systemctl restart bpfrxd; incus exec "$(r "$VM1")" -- systemctl restart bpfrxd; info "bpfrxd restarted on both VMs" ;;
 		*)   die "Usage: $0 restart [0|1|all]" ;;
 	esac
 }

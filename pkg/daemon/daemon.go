@@ -140,6 +140,11 @@ type Daemon struct {
 	fabric1Populated bool          // true after first successful fab1 write
 	fabricRefreshCh  chan struct{} // triggers immediate fabric_fwd refresh
 
+	// vipWarnedIfaces tracks interfaces that already emitted a
+	// "directAddVIPs: interface not found" warning to avoid log spam
+	// from the reconcile ticker. Reset on config commit.
+	vipWarnedIfaces map[string]bool
+
 	// syncPeerAddr is the primary peer address used for gRPC peer dialing
 	// (session queries, config sync). Set to control link or fabric
 	// peer depending on sync transport mode.
@@ -1388,6 +1393,9 @@ func (d *Daemon) bootstrapFromFile() error {
 // 4. Apply FRR config (OSPF/BGP, global + per-VRF)
 // 5. Apply IPsec config (strongSwan)
 func (d *Daemon) applyConfig(cfg *config.Config) {
+	// Reset VIP warning suppression so new config gets fresh warnings.
+	d.vipWarnedIfaces = nil
+
 	// Log config validation warnings
 	for _, w := range cfg.Warnings {
 		slog.Warn("config validation", "warning", w)
@@ -6070,9 +6078,17 @@ func (d *Daemon) directAddVIPs(rgID int) int {
 	for ifName, addrs := range vipMap {
 		link, err := netlink.LinkByName(ifName)
 		if err != nil {
-			slog.Warn("directAddVIPs: interface not found", "iface", ifName, "err", err)
+			if d.vipWarnedIfaces == nil {
+				d.vipWarnedIfaces = make(map[string]bool)
+			}
+			if !d.vipWarnedIfaces[ifName] {
+				slog.Warn("directAddVIPs: interface not found", "iface", ifName, "err", err)
+				d.vipWarnedIfaces[ifName] = true
+			}
 			continue
 		}
+		// Interface exists now — clear any previous warning suppression
+		delete(d.vipWarnedIfaces, ifName)
 		for _, cidr := range addrs {
 			addr, err := netlink.ParseAddr(cidr)
 			if err != nil {

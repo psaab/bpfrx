@@ -157,6 +157,39 @@ cluster-stop:
 cluster-restart:
 	./test/incus/cluster-setup.sh restart $(NODE)
 
+# Remote cluster on "loss" host (Mellanox SR-IOV VFs)
+.PHONY: loss-cluster-init loss-cluster-create loss-cluster-deploy loss-cluster-destroy loss-cluster-status loss-cluster-ssh loss-cluster-logs loss-cluster-start loss-cluster-stop loss-cluster-restart
+
+loss-cluster-init:
+	BPFRX_CLUSTER_ENV=test/incus/loss-cluster.env ./test/incus/cluster-setup.sh init
+
+loss-cluster-create:
+	BPFRX_CLUSTER_ENV=test/incus/loss-cluster.env ./test/incus/cluster-setup.sh create
+
+loss-cluster-deploy: build build-ctl
+	BPFRX_CLUSTER_ENV=test/incus/loss-cluster.env ./test/incus/cluster-setup.sh deploy $(NODE)
+
+loss-cluster-destroy:
+	BPFRX_CLUSTER_ENV=test/incus/loss-cluster.env ./test/incus/cluster-setup.sh destroy
+
+loss-cluster-status:
+	BPFRX_CLUSTER_ENV=test/incus/loss-cluster.env ./test/incus/cluster-setup.sh status
+
+loss-cluster-ssh:
+	BPFRX_CLUSTER_ENV=test/incus/loss-cluster.env ./test/incus/cluster-setup.sh ssh $(NODE)
+
+loss-cluster-logs:
+	BPFRX_CLUSTER_ENV=test/incus/loss-cluster.env ./test/incus/cluster-setup.sh logs $(NODE)
+
+loss-cluster-start:
+	BPFRX_CLUSTER_ENV=test/incus/loss-cluster.env ./test/incus/cluster-setup.sh start $(NODE)
+
+loss-cluster-stop:
+	BPFRX_CLUSTER_ENV=test/incus/loss-cluster.env ./test/incus/cluster-setup.sh stop $(NODE)
+
+loss-cluster-restart:
+	BPFRX_CLUSTER_ENV=test/incus/loss-cluster.env ./test/incus/cluster-setup.sh restart $(NODE)
+
 # --- DPDK targets (require dpdk-dev, meson, ninja) ---
 
 build-dpdk-worker:
