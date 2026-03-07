@@ -118,6 +118,7 @@ handle_ct_hit_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 	meta->ct_state = sess->state;
 	meta->ct_direction = direction;
 	meta->policy_id = sess->policy_id;
+	meta->nat_flags = sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT);
 
 	if (sess->flags & SESS_FLAG_SNAT) {
 		if (is_fwd) {
@@ -245,6 +246,7 @@ handle_ct_hit_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 	meta->ct_state = sess->state;
 	meta->ct_direction = direction;
 	meta->policy_id = sess->policy_id;
+	meta->nat_flags = sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT);
 
 	if (sess->flags & SESS_FLAG_SNAT) {
 		if (is_fwd) {

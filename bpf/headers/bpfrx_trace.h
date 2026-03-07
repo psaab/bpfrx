@@ -17,7 +17,7 @@
 #define BPFRX_TRACE 0
 
 /* Optional: set to specific protocol number to filter (0 = trace all) */
-#define BPFRX_TRACE_PROTO 6  /* TCP only */
+#define BPFRX_TRACE_PROTO 58  /* ICMPv6 only */
 
 #if BPFRX_TRACE
 
