@@ -466,20 +466,17 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 	meta->ct_direction = direction;
 	meta->policy_id = sess->policy_id;
 	meta->nat_flags = sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT);
-	int nat_needed = 0;
 
 	if (sess->flags & SESS_FLAG_SNAT) {
 		if (is_fwd) {
 			__builtin_memcpy(meta->src_ip.v6, sess->nat_src_ip, 16);
 			meta->src_port = sess->nat_src_port;
-			nat_needed = 1;
 		}
 	}
 	if (sess->flags & SESS_FLAG_DNAT) {
 		if (!is_fwd) {
 			__builtin_memcpy(meta->src_ip.v6, sess->nat_dst_ip, 16);
 			meta->src_port = sess->nat_dst_port;
-			nat_needed = 1;
 		}
 	}
 
@@ -487,8 +484,13 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 	if (sess->flags & SESS_FLAG_NAT64)
 		meta->nat_flags |= SESS_FLAG_NAT64;
 
+	/* Dispatch to xdp_nat when ANY NAT flag is set — not just when
+	 * meta was modified.  Reverse SNAT/DNAT rely on pre-routing
+	 * dnat_table rewrites (meta->dst_ip already changed) so
+	 * nat_rewrite_v6 must run even though conntrack didn't modify meta.
+	 */
 	__u32 next_prog = XDP_PROG_FORWARD;
-	if (nat_needed)
+	if (sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT))
 		next_prog = XDP_PROG_NAT;
 
 	if (sess->state == SESS_STATE_CLOSED) {

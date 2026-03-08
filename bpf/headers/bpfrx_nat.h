@@ -387,8 +387,13 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 
 	/* Compute l4 pointer once -- all helpers share this */
 	void *l4 = data + meta->l4_offset;
-	int rewrite_src = !!(meta->nat_flags & SESS_FLAG_SNAT);
-	int rewrite_dst = !!(meta->nat_flags & SESS_FLAG_DNAT);
+
+	/* Unconditionally compare meta vs packet — rewrite any field that
+	 * differs.  This matches nat_rewrite_v4 behavior and correctly
+	 * handles reverse SNAT (pre-routing dnat_table rewrites meta->dst_ip
+	 * but conntrack only sets SESS_FLAG_SNAT in nat_flags) and reverse
+	 * DNAT (conntrack sets meta->src_ip but only SESS_FLAG_DNAT in
+	 * nat_flags).  Flag-gating would skip the needed rewrite. */
 
 	switch (meta->protocol) {
 	case PROTO_TCP: {
@@ -396,36 +401,34 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 		if ((void *)(tcp + 1) > data_end)
 			return;
 
-		if (rewrite_src) {
-			if (!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
-				__u8 old_src[16];
-				__builtin_memcpy(old_src, &ip6h->saddr, 16);
-				nat_update_l4_csum_v6(l4, data_end, meta, old_src,
-					      meta->src_ip.v6);
-				__builtin_memcpy(&ip6h->saddr, meta->src_ip.v6, 16);
-			}
-			if (meta->src_port != 0 && tcp->source != meta->src_port) {
-				if (!meta->csum_partial)
-					csum_update_2(&tcp->check, tcp->source,
-						      meta->src_port);
-				tcp->source = meta->src_port;
-			}
+		/* Source IP rewrite */
+		if (!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
+			__u8 old_src[16];
+			__builtin_memcpy(old_src, &ip6h->saddr, 16);
+			nat_update_l4_csum_v6(l4, data_end, meta, old_src,
+				      meta->src_ip.v6);
+			__builtin_memcpy(&ip6h->saddr, meta->src_ip.v6, 16);
+		}
+		if (meta->src_port != 0 && tcp->source != meta->src_port) {
+			if (!meta->csum_partial)
+				csum_update_2(&tcp->check, tcp->source,
+					      meta->src_port);
+			tcp->source = meta->src_port;
 		}
 
-		if (rewrite_dst) {
-			if (!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
-				__u8 old_dst[16];
-				__builtin_memcpy(old_dst, &ip6h->daddr, 16);
-				nat_update_l4_csum_v6(l4, data_end, meta, old_dst,
-					      meta->dst_ip.v6);
-				__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
-			}
-			if (meta->dst_port != 0 && tcp->dest != meta->dst_port) {
-				if (!meta->csum_partial)
-					csum_update_2(&tcp->check, tcp->dest,
-						      meta->dst_port);
-				tcp->dest = meta->dst_port;
-			}
+		/* Destination IP rewrite */
+		if (!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
+			__u8 old_dst[16];
+			__builtin_memcpy(old_dst, &ip6h->daddr, 16);
+			nat_update_l4_csum_v6(l4, data_end, meta, old_dst,
+				      meta->dst_ip.v6);
+			__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
+		}
+		if (meta->dst_port != 0 && tcp->dest != meta->dst_port) {
+			if (!meta->csum_partial)
+				csum_update_2(&tcp->check, tcp->dest,
+					      meta->dst_port);
+			tcp->dest = meta->dst_port;
 		}
 		break;
 	}
@@ -434,36 +437,34 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 		if ((void *)(udp + 1) > data_end)
 			return;
 
-		if (rewrite_src) {
-			if (!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
-				__u8 old_src[16];
-				__builtin_memcpy(old_src, &ip6h->saddr, 16);
-				nat_update_l4_csum_v6(l4, data_end, meta, old_src,
-					      meta->src_ip.v6);
-				__builtin_memcpy(&ip6h->saddr, meta->src_ip.v6, 16);
-			}
-			if (meta->src_port != 0 && udp->source != meta->src_port) {
-				if (!meta->csum_partial)
-					csum_update_2(&udp->check, udp->source,
-						      meta->src_port);
-				udp->source = meta->src_port;
-			}
+		/* Source IP rewrite */
+		if (!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
+			__u8 old_src[16];
+			__builtin_memcpy(old_src, &ip6h->saddr, 16);
+			nat_update_l4_csum_v6(l4, data_end, meta, old_src,
+				      meta->src_ip.v6);
+			__builtin_memcpy(&ip6h->saddr, meta->src_ip.v6, 16);
+		}
+		if (meta->src_port != 0 && udp->source != meta->src_port) {
+			if (!meta->csum_partial)
+				csum_update_2(&udp->check, udp->source,
+					      meta->src_port);
+			udp->source = meta->src_port;
 		}
 
-		if (rewrite_dst) {
-			if (!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
-				__u8 old_dst[16];
-				__builtin_memcpy(old_dst, &ip6h->daddr, 16);
-				nat_update_l4_csum_v6(l4, data_end, meta, old_dst,
-					      meta->dst_ip.v6);
-				__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
-			}
-			if (meta->dst_port != 0 && udp->dest != meta->dst_port) {
-				if (!meta->csum_partial)
-					csum_update_2(&udp->check, udp->dest,
-						      meta->dst_port);
-				udp->dest = meta->dst_port;
-			}
+		/* Destination IP rewrite */
+		if (!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
+			__u8 old_dst[16];
+			__builtin_memcpy(old_dst, &ip6h->daddr, 16);
+			nat_update_l4_csum_v6(l4, data_end, meta, old_dst,
+				      meta->dst_ip.v6);
+			__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
+		}
+		if (meta->dst_port != 0 && udp->dest != meta->dst_port) {
+			if (!meta->csum_partial)
+				csum_update_2(&udp->check, udp->dest,
+					      meta->dst_port);
+			udp->dest = meta->dst_port;
 		}
 		break;
 	}
@@ -472,8 +473,7 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 		if ((void *)(icmp6 + 1) > data_end)
 			return;
 
-		if (rewrite_src &&
-		    !ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
+		if (!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
 			__u8 old_src[16];
 			__builtin_memcpy(old_src, &ip6h->saddr, 16);
 			nat_update_l4_csum_v6(l4, data_end, meta, old_src,
@@ -481,8 +481,7 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 			__builtin_memcpy(&ip6h->saddr, meta->src_ip.v6, 16);
 		}
 
-		if (rewrite_dst &&
-		    !ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
+		if (!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
 			__u8 old_dst[16];
 			__builtin_memcpy(old_dst, &ip6h->daddr, 16);
 			nat_update_l4_csum_v6(l4, data_end, meta, old_dst,
@@ -490,10 +489,12 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 			__builtin_memcpy(&ip6h->daddr, meta->dst_ip.v6, 16);
 		}
 
-		if ((icmp6->icmp6_type == 128 || icmp6->icmp6_type == 129) &&
-		    (rewrite_src || rewrite_dst)) {
+		/* ICMP echo ID rewrite */
+		if (icmp6->icmp6_type == 128 || icmp6->icmp6_type == 129) {
+			/* Forward SNAT: use allocated port (src_port).
+			 * Return DNAT: dst_port holds the original echo ID. */
 			__be16 desired_id = meta->src_port;
-			if (rewrite_dst)
+			if (meta->nat_flags & SESS_FLAG_DNAT)
 				desired_id = meta->dst_port;
 			if (icmp6->un.echo.id != desired_id) {
 				if (!meta->csum_partial)
@@ -506,16 +507,14 @@ nat_rewrite_v6(void *data, void *data_end, struct pkt_meta *meta)
 		break;
 	}
 	default:
-		if (rewrite_src &&
-		    !ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
+		if (!ip_addr_eq_v6(meta->src_ip.v6, (__u8 *)&ip6h->saddr)) {
 			__u8 old_src[16];
 			__builtin_memcpy(old_src, &ip6h->saddr, 16);
 			nat_update_l4_csum_v6(l4, data_end, meta, old_src,
 				      meta->src_ip.v6);
 			__builtin_memcpy(&ip6h->saddr, meta->src_ip.v6, 16);
 		}
-		if (rewrite_dst &&
-		    !ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
+		if (!ip_addr_eq_v6(meta->dst_ip.v6, (__u8 *)&ip6h->daddr)) {
 			__u8 old_dst[16];
 			__builtin_memcpy(old_dst, &ip6h->daddr, 16);
 			nat_update_l4_csum_v6(l4, data_end, meta, old_dst,
