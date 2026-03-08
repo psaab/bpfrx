@@ -91,6 +91,47 @@ Treat the system as:
 That gives you the best chance of staying close to native-XDP efficiency while moving
 stateful complexity into userspace.
 
+### Support Envelope
+
+This design only makes sense if the implementation is explicit about what it supports.
+
+#### Primary supported mode
+
+- native XDP capable NIC
+- AF_XDP bound to hardware RX/TX queues
+- zero-copy AF_XDP where the driver supports it
+- pinned worker cores with stable RSS / queue affinity
+
+This is the target mode for the fast path.
+
+#### Acceptable but not target mode
+
+- native XDP with AF_XDP copy mode
+
+This can still be useful for bring-up, labs, and lower-end systems, but it should not
+be treated as the performance target when comparing against the current eBPF or DPDK
+dataplanes.
+
+#### Explicitly not the primary fast path
+
+- generic XDP plus AF_XDP
+- raw sockets consumed with io_uring
+- TUN/TAP as the primary packet handoff
+
+If an interface only supports those paths, bpfrx should keep using the current eBPF/TC
+dataplane on that interface instead of pretending the userspace dataplane is equivalent.
+
+#### Mixed-mode operation
+
+The implementation should allow mixed dataplanes on the same node:
+
+- AF_XDP userspace dataplane on native-XDP-capable data interfaces
+- existing eBPF/TC dataplane on unsupported interfaces
+- the same Go control plane publishing config to both backends
+
+That reduces bring-up risk and avoids turning driver capability mismatches into an
+all-or-nothing deployment problem.
+
 ## Why This Fits bpfrx Better Than a Pure io_uring Packet Engine
 
 bpfrx already has:
@@ -156,6 +197,42 @@ struct usr_dp_meta {
 This matters because it avoids reparsing and redoing the same zone/HA classification
 in userspace.
 
+#### Metadata ABI contract
+
+This must be treated as a real ABI, not an informal struct.
+
+Rules:
+
+- XDP writes metadata via `bpf_xdp_adjust_meta()`, not by overloading packet payload.
+- The metadata struct must be fixed-size, naturally aligned, and versioned.
+- All multi-byte fields should be little-endian host order unless there is a strong
+  reason to preserve network order. The choice must be documented and consistent.
+- The metadata version must be the first field so workers can reject incompatible
+  packets instead of silently misparsing them.
+- `pkt_len` must represent the post-VLAN-pop packet length seen by workers.
+- `ingress_vlan` must preserve the original logical ingress VLAN so userspace can
+  reason about sub-interface ownership and restore tags on transmit when needed.
+- `flow_hash` must be the same shard key used for worker assignment and for session
+  sync shard ownership on both cluster nodes.
+- `fib_gen` and config generation fields must be checked by workers so packets
+  stamped under an old control-plane snapshot cannot be processed against a newer
+  snapshot silently.
+
+Recommended first fields:
+
+```c
+struct usr_dp_meta_v1 {
+    __u16 version;
+    __u16 meta_len;
+    __u32 config_gen;
+    __u32 ingress_ifindex;
+    ...
+};
+```
+
+Workers should hard-drop packets with unknown metadata versions or impossible
+`meta_len` values.
+
 ### 3. AF_XDP is the handoff boundary
 
 Each worker owns one AF_XDP socket per queue, ideally per interface queue index.
@@ -167,6 +244,39 @@ Example on a 4-core box:
 - worker 3 owns queue 3 on trust/untrust/fabric interfaces
 
 This preserves queue affinity and avoids cross-thread packet movement.
+
+### 3a. Queue Ownership Model
+
+The design needs a precise queue ownership contract.
+
+Rules:
+
+- each worker owns one queue index per participating interface
+- a worker never touches another worker's AF_XDP rings in the fast path
+- each flow must map to the same worker on ingress and on the standby node
+- queue ownership must be configured from the smallest queue count across the active
+  dataplane interfaces in a forwarding group
+
+Example:
+
+- if LAN has 8 queues and WAN has 4 queues, the userspace fast path should use 4
+  worker shards unless there is an explicit remapping layer
+- the remaining LAN queues should either be disabled for AF_XDP or remain on the
+  existing dataplane
+
+This is stricter than "one worker per core", but it avoids hidden cross-queue
+forwarding costs.
+
+#### RSS and repair strategy
+
+- symmetric NIC RSS is the first choice
+- if NIC RSS cannot guarantee symmetry, XDP may compute the same flow hash itself
+  and redirect into the appropriate `XSKMAP` entry
+- `CPUMAP` should not be the normal repair mechanism for this backend; it adds
+  another handoff and defeats the point of queue ownership
+
+If stable flow-to-worker mapping cannot be guaranteed, this backend should not be
+enabled on that interface set.
 
 ### 4. Userspace worker does the stateful firewall work
 
@@ -195,6 +305,30 @@ For packets with a resolved L2 adjacency and a supported egress interface:
 - enqueue directly to the worker's AF_XDP TX ring for the egress interface/queue
 
 That keeps the common path fully out of the SKB stack.
+
+### 5a. Backpressure and Overload Policy
+
+This needs an explicit policy. Without one, "slow path" just becomes hidden packet loss.
+
+Recommended rules:
+
+- if the worker RX ring is starved for fill entries, XDP drops forwarded traffic
+  and increments an explicit backpressure counter
+- if the worker is alive but its rings are saturated, forwarded traffic is dropped
+  fail-closed by default
+- host-local traffic may still `XDP_PASS` to the kernel if that is already the
+  current behavior for the interface/zone
+- unresolved-neighbor and unsupported-route exceptions may use a bounded slow path,
+  but only behind an explicit rate limiter
+- there must be no automatic "everything falls back to kernel sockets" mode for
+  forwarded traffic under overload
+
+The point is to preserve deterministic behavior:
+
+- local control-plane reachability may degrade gracefully
+- transit forwarding must either stay on the fast path or fail closed
+
+Anything else will create opaque overload behavior during HA or traffic tests.
 
 ### 6. io_uring handles exceptions and slow-path work
 
@@ -278,6 +412,20 @@ Use shared memory or copy-on-publish snapshots for config tables:
 
 Do not make workers call back into Go on packet path decisions.
 
+#### Snapshot publication contract
+
+This part needs hard rules:
+
+- workers only read immutable snapshots
+- the Go control plane publishes a new snapshot, then flips a generation pointer
+- old snapshots remain valid until all workers have quiesced past the old generation
+- XDP stamps `config_gen` and `fib_gen` into packet metadata
+- workers must reject or slow-path packets whose stamped generation no longer matches
+  an installed snapshot
+
+That avoids processing a packet classified under config generation `N` with policy or
+adjacency state from generation `N+1`.
+
 ## What Should Stay in XDP vs Move to Userspace
 
 ### Keep in XDP
@@ -306,6 +454,37 @@ Move the heavier, stateful, branchy work:
 
 This is the right split because the expensive part of bpfrx is not Ethernet parsing.
 It is state, hashing, timers, NAT, and policy.
+
+### Feature Coverage Boundaries
+
+The implementation should be explicit about what is in scope for the first usable backend.
+
+#### Fast path in userspace
+
+- IPv4/IPv6 routed forwarding
+- zone policy
+- session state / TCP tracking
+- source NAT / destination NAT / NAT64 / NPTv6
+- basic FIB + adjacency forwarding
+- HA ownership checks and fabric redirect decisions
+
+#### Slow path through kernel or helper thread
+
+- local services / host-inbound traffic
+- unresolved neighbors
+- ICMP error generation
+- route types not supported by the worker fast path
+- exceptional packets that fail metadata or adjacency validation
+
+#### Keep on current backend initially
+
+- IPsec dataplane handling through `xfrmi`
+- GRE/IPIP encapsulation and decapsulation
+- TC egress mirroring / clone semantics
+- any feature that depends on skb-only helpers or existing TC hooks
+
+This is important because bpfrx is not just a basic routed firewall. Pretending the
+first userspace backend covers every current feature would guarantee a bad rollout.
 
 ## Where io_uring Actually Helps
 
@@ -379,6 +558,28 @@ Use batched delta publication from workers to a sync thread:
 
 That preserves the current bpfrx sync design principles.
 
+### Shard ownership and replay rules
+
+This part should not stay implicit.
+
+- the same `flow_hash` used for worker selection must determine the owning worker shard
+- both HA nodes must use the same hash algorithm and shard count for replicated flows
+- session sync messages must carry shard ID so replay and backfill can be targeted
+- bulk replay should be partitioned by shard, not emitted as one global stream
+- standby workers should install sessions into the shard that would own the flow if
+  the node became active
+
+That keeps failover from turning into a cross-thread session migration problem.
+
+#### Fabric forwarding interaction
+
+- XDP still decides whether the packet belongs on the local node or should be sent
+  to the peer under HA ownership rules
+- once a packet is handed to a local worker, that worker is authoritative for the
+  local session shard
+- fabric redirects must preserve enough metadata for the receiving node to derive
+  the same worker shard deterministically
+
 ## Crash and Recovery Model
 
 This is the biggest architectural tradeoff versus today's eBPF dataplane.
@@ -400,6 +601,15 @@ Use XDP as a hard guard:
   - forwarded traffic should fail closed or fail to a deliberately-limited slow path
 
 This gives deterministic failure instead of undefined stale forwarding.
+
+#### Watchdog contract
+
+- each worker updates a per-shard heartbeat map entry
+- XDP checks both process-wide liveness and shard-local liveness before redirect
+- a stale shard heartbeat must fail closed for forwarded traffic even if the process
+  is still partially alive
+- workers should not be considered healthy until their AF_XDP rings, config snapshot,
+  and route snapshot are all installed
 
 ## What an Implementation Would Look Like in bpfrx
 
@@ -459,6 +669,32 @@ That is the order that makes architectural sense.
 8. **Use per-worker expiry structures, not a global GC sweep.**
 9. **Keep XDP watchdog ownership checks so userspace failures fail closed.**
 10. **Use io_uring for the edges of the dataplane, not as a substitute for AF_XDP.**
+
+## Observability Requirements
+
+This backend will be too hard to debug unless observability is part of the design.
+
+Required counters and state:
+
+- per-worker RX/TX packets and bytes
+- per-worker drop reasons
+- AF_XDP fill/rx/tx/completion ring occupancy and starvation counters
+- worker heartbeat age
+- packets dropped by XDP because the worker shard was stale or overloaded
+- slow-path packet counts by reason
+- per-shard session counts
+- per-shard session-sync delta backlog
+- route/adjacency snapshot generation currently installed per worker
+- queue imbalance indicators across workers
+
+Required CLI / API surface:
+
+- `show dataplane workers`
+- `show dataplane xsk`
+- `show dataplane backpressure`
+- `show cluster shard-sync`
+
+Without that, bring-up and HA debugging will be mostly guesswork.
 
 ## Advantages of This Design
 
