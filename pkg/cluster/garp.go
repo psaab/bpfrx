@@ -71,15 +71,15 @@ func buildGratuitousARP(mac net.HardwareAddr, ip net.IP, opcode uint16) []byte {
 
 	// Ethernet header
 	copy(pkt[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) // dst: broadcast
-	copy(pkt[6:12], mac)                                         // src: our MAC
-	binary.BigEndian.PutUint16(pkt[12:14], unix.ETH_P_ARP)       // ethertype
+	copy(pkt[6:12], mac)                                       // src: our MAC
+	binary.BigEndian.PutUint16(pkt[12:14], unix.ETH_P_ARP)     // ethertype
 
 	// ARP header
 	binary.BigEndian.PutUint16(pkt[14:16], 1)      // hardware type: Ethernet
-	binary.BigEndian.PutUint16(pkt[16:18], 0x0800)  // protocol type: IPv4
-	pkt[18] = 6                                      // hardware addr len
-	pkt[19] = 4                                      // protocol addr len
-	binary.BigEndian.PutUint16(pkt[20:22], opcode)   // opcode
+	binary.BigEndian.PutUint16(pkt[16:18], 0x0800) // protocol type: IPv4
+	pkt[18] = 6                                    // hardware addr len
+	pkt[19] = 4                                    // protocol addr len
+	binary.BigEndian.PutUint16(pkt[20:22], opcode) // opcode
 
 	// Sender hardware + protocol address
 	copy(pkt[22:28], mac)
@@ -218,21 +218,65 @@ func SendARPProbe(iface string, targetIP net.IP) error {
 	return unix.Sendto(fd, pkt, 0, &addr)
 }
 
+func probeIPv6Source(addrs []net.Addr) net.IP {
+	var linkLocal net.IP
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipNet.IP.To16()
+		if ip == nil || ipNet.IP.To4() != nil {
+			continue
+		}
+		if ip.IsLinkLocalUnicast() {
+			if linkLocal == nil {
+				linkLocal = append(net.IP(nil), ip...)
+			}
+			continue
+		}
+		if ip.IsGlobalUnicast() {
+			return append(net.IP(nil), ip...)
+		}
+	}
+	return linkLocal
+}
+
+// SendNDSolicitationFromInterface resolves a suitable IPv6 source address from
+// the interface, then sends a standard Neighbor Solicitation for targetIP.
+// Prefers a global/ULA address so the target refreshes the service address
+// neighbor cache, but falls back to link-local if no other IPv6 exists.
+func SendNDSolicitationFromInterface(iface string, targetIP net.IP) error {
+	ifi, err := net.InterfaceByName(iface)
+	if err != nil {
+		return fmt.Errorf("interface %s: %w", iface, err)
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return fmt.Errorf("interface addrs: %w", err)
+	}
+	sourceIP := probeIPv6Source(addrs)
+	if sourceIP == nil {
+		return fmt.Errorf("no suitable IPv6 address on %s", iface)
+	}
+	return SendNDSolicitation(iface, sourceIP, targetIP)
+}
+
 // buildARPRequest constructs a standard ARP Request packet.
 func buildARPRequest(srcMAC net.HardwareAddr, srcIP, dstIP net.IP) []byte {
 	pkt := make([]byte, 42) // 14 ethernet + 28 ARP
 
 	// Ethernet header
 	copy(pkt[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) // dst: broadcast
-	copy(pkt[6:12], srcMAC)                                      // src: our MAC
-	binary.BigEndian.PutUint16(pkt[12:14], unix.ETH_P_ARP)       // ethertype
+	copy(pkt[6:12], srcMAC)                                    // src: our MAC
+	binary.BigEndian.PutUint16(pkt[12:14], unix.ETH_P_ARP)     // ethertype
 
 	// ARP header
 	binary.BigEndian.PutUint16(pkt[14:16], 1)      // hardware type: Ethernet
-	binary.BigEndian.PutUint16(pkt[16:18], 0x0800)  // protocol type: IPv4
-	pkt[18] = 6                                      // hardware addr len
-	pkt[19] = 4                                      // protocol addr len
-	binary.BigEndian.PutUint16(pkt[20:22], 1)        // opcode: ARP Request
+	binary.BigEndian.PutUint16(pkt[16:18], 0x0800) // protocol type: IPv4
+	pkt[18] = 6                                    // hardware addr len
+	pkt[19] = 4                                    // protocol addr len
+	binary.BigEndian.PutUint16(pkt[20:22], 1)      // opcode: ARP Request
 
 	// Sender hardware + protocol address
 	copy(pkt[22:28], srcMAC)
@@ -368,8 +412,8 @@ func buildUnsolicitedNA(mac net.HardwareAddr, ip net.IP) []byte {
 	pkt[14] = 0x60 // Version 6, TC=0
 	// pkt[15:18] = 0 (TC low + Flow Label)
 	binary.BigEndian.PutUint16(pkt[18:20], 32) // Payload Length: ICMPv6 NA(24) + TLLA option(8)
-	pkt[20] = 58                                // Next Header: ICMPv6
-	pkt[21] = 255                               // Hop Limit
+	pkt[20] = 58                               // Next Header: ICMPv6
+	pkt[21] = 255                              // Hop Limit
 	// Source: our IP
 	copy(pkt[22:38], ip.To16())
 	// Destination: ff02::1 (all-nodes multicast)
@@ -379,8 +423,8 @@ func buildUnsolicitedNA(mac net.HardwareAddr, ip net.IP) []byte {
 	pkt[53] = 0x01
 
 	// --- ICMPv6 Neighbor Advertisement (32 bytes) ---
-	pkt[54] = 136  // Type: Neighbor Advertisement
-	pkt[55] = 0    // Code: 0
+	pkt[54] = 136 // Type: Neighbor Advertisement
+	pkt[55] = 0   // Code: 0
 	// pkt[56:58] = checksum (filled below)
 	// Flags: Override=1, Router=0, Solicited=0
 	pkt[58] = 0x20 // Override flag (bit 29, byte offset 0 bit 5)
@@ -484,10 +528,10 @@ func buildNDSolicitation(mac net.HardwareAddr, srcIP, targetIP net.IP) []byte {
 	binary.BigEndian.PutUint16(pkt[12:14], unix.ETH_P_IPV6)
 
 	// --- IPv6 header (40 bytes) ---
-	pkt[14] = 0x60 // Version 6, TC=0
+	pkt[14] = 0x60                             // Version 6, TC=0
 	binary.BigEndian.PutUint16(pkt[18:20], 32) // Payload Length: NS(24) + SLLA(8)
-	pkt[20] = 58                                // Next Header: ICMPv6
-	pkt[21] = 255                               // Hop Limit
+	pkt[20] = 58                               // Next Header: ICMPv6
+	pkt[21] = 255                              // Hop Limit
 	copy(pkt[22:38], srcIP.To16())
 	// Destination: solicited-node multicast ff02::1:ffXX:XXXX
 	pkt[38] = 0xff

@@ -2177,8 +2177,8 @@ func stripCIDR(s string) string {
 // instead of NO_NEIGH for the first packet.
 func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 	type target struct {
-		ip        net.IP
-		linkIndex int
+		neighborIP net.IP
+		linkIndex  int
 	}
 	var targets []target
 	seen := make(map[string]bool)
@@ -2189,7 +2189,7 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 			return
 		}
 		seen[key] = true
-		targets = append(targets, target{ip: ip, linkIndex: linkIndex})
+		targets = append(targets, target{neighborIP: ip, linkIndex: linkIndex})
 	}
 
 	// addByIP resolves the outgoing interface via the kernel routing table.
@@ -2202,7 +2202,11 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 		if err != nil || len(routes) == 0 {
 			return
 		}
-		addByLink(ip, routes[0].LinkIndex)
+		neighborIP := ip
+		if gw := routes[0].Gw; gw != nil && !gw.IsUnspecified() {
+			neighborIP = gw
+		}
+		addByLink(neighborIP, routes[0].LinkIndex)
 	}
 
 	addByName := func(ipStr, ifName string) {
@@ -2313,14 +2317,14 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 		}
 		ifName := link.Attrs().Name
 		family := netlink.FAMILY_V4
-		if t.ip.To4() == nil {
+		if t.neighborIP.To4() == nil {
 			family = netlink.FAMILY_V6
 		}
 		// Skip if neighbor already exists and is usable
 		neighs, _ := netlink.NeighList(t.linkIndex, family)
 		skip := false
 		for _, n := range neighs {
-			if n.IP.Equal(t.ip) && (n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT)) != 0 {
+			if n.IP.Equal(t.neighborIP) && (n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT)) != 0 {
 				skip = true
 				break
 			}
@@ -2329,19 +2333,23 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 			continue
 		}
 		resolved++
-		// Use ping to trigger kernel ARP/NDP resolution.
-		// arping uses PF_PACKET raw sockets which don't populate the kernel
-		// ARP table when XDP is attached. ping triggers the kernel's own
-		// neighbor resolution before sending, which works with XDP.
+		// Trigger proactive neighbor discovery.
+		// IPv4 continues to use ping so the kernel owns ARP resolution.
+		// IPv6 additionally sends an explicit NS before pinging so the
+		// failover path also nudges peer neighbor caches directly.
 		go func(ip net.IP, iface string) {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			if ip.To4() != nil {
 				exec.CommandContext(ctx, "ping", "-c1", "-W1", "-I", iface, ip.String()).Run()
 			} else {
+				if err := cluster.SendNDSolicitationFromInterface(iface, ip); err != nil {
+					slog.Debug("neighbor warmup: IPv6 NS probe failed",
+						"iface", iface, "ip", ip, "err", err)
+				}
 				exec.CommandContext(ctx, "ping", "-6", "-c1", "-W1", "-I", iface, ip.String()).Run()
 			}
-		}(t.ip, ifName)
+		}(t.neighborIP, ifName)
 	}
 
 	if resolved > 0 {
@@ -2390,13 +2398,18 @@ func (d *Daemon) cleanFailedNeighbors() int {
 	if cleaned > 0 {
 		slog.Debug("cleaned failed neighbor entries", "count", cleaned)
 	}
-	// Send ARP requests for cleaned IPv4 entries so the kernel's
-	// neighbor table is re-populated before the next forwarded packet.
-	// Uses raw AF_PACKET socket (no shell-out). IPv6 entries rely on
-	// the BPF XDP_PASS path to trigger kernel NDP resolution.
+	// Reprobe cleaned neighbors so the kernel's table repopulates before
+	// the next forwarded packet. IPv4 keeps the existing ARP probe path.
+	// IPv6 now sends an explicit NS instead of waiting for passive later
+	// traffic to trigger NDP.
 	for _, p := range probes {
 		if p.ip.To4() != nil {
 			cluster.SendARPProbe(p.iface, p.ip)
+		} else {
+			if err := cluster.SendNDSolicitationFromInterface(p.iface, p.ip); err != nil {
+				slog.Debug("failed-neighbor reprobe: IPv6 NS failed",
+					"iface", p.iface, "ip", p.ip, "err", err)
+			}
 		}
 	}
 	return cleaned
