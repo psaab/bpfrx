@@ -33,22 +33,12 @@ int xdp_nat_prog(struct xdp_md *ctx)
 	 * Only applies to forwarded packets (fwd_ifindex != 0).
 	 */
 	if (meta->fwd_ifindex != 0) {
-		if (meta->addr_family == AF_INET) {
-			struct iphdr *iph = data + sizeof(struct ethhdr);
-			if ((void *)(iph + 1) <= data_end && iph->ttl <= 1) {
-				/* Push ingress VLAN tag back so kernel
-				 * delivers to the correct sub-interface. */
-				if (meta->ingress_vlan_id != 0)
-					xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
-				return XDP_PASS;
-			}
-		} else {
-			struct ipv6hdr *ip6h = data + sizeof(struct ethhdr);
-			if ((void *)(ip6h + 1) <= data_end && ip6h->hop_limit <= 1) {
-				if (meta->ingress_vlan_id != 0)
-					xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
-				return XDP_PASS;
-			}
+		if (meta->ip_ttl <= 1) {
+			/* Push ingress VLAN tag back so kernel
+			 * delivers to the correct sub-interface. */
+			if (meta->ingress_vlan_id != 0)
+				xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
+			return XDP_PASS;
 		}
 	}
 

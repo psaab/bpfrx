@@ -109,11 +109,27 @@ int xdp_main_prog(struct xdp_md *ctx)
 
 	/* Parse L3 header based on EtherType */
 	if (eth_proto == ETH_P_IP) {
-		if (parse_iphdr(data, data_end, meta) < 0)
+		int fast_rc = parse_ipv4_l4_fast(data, data_end, meta);
+		if (fast_rc < 0)
 			return XDP_DROP;
+		if (fast_rc == 0) {
+			if (parse_iphdr(data, data_end, meta) < 0)
+				return XDP_DROP;
+			if (!meta->is_fragment &&
+			    parse_l4hdr(data, data_end, meta) < 0)
+				return XDP_DROP;
+		}
 	} else if (eth_proto == 0x86DD) { /* ETH_P_IPV6 */
-		if (parse_ipv6hdr(data, data_end, meta) < 0)
+		int fast_rc = parse_ipv6_l4_fast(data, data_end, meta);
+		if (fast_rc < 0)
 			return XDP_DROP;
+		if (fast_rc == 0) {
+			if (parse_ipv6hdr(data, data_end, meta) < 0)
+				return XDP_DROP;
+			if (!meta->is_fragment &&
+			    parse_l4hdr(data, data_end, meta) < 0)
+				return XDP_DROP;
+		}
 	} else {
 		/* Non-IP traffic (ARP, etc.) — pass to kernel.
 		 * Restore VLAN tag so kernel delivers to sub-interface. */
@@ -122,12 +138,6 @@ int xdp_main_prog(struct xdp_md *ctx)
 				return XDP_DROP;
 		}
 		return XDP_PASS;
-	}
-
-	/* Parse L4 header */
-	if (!meta->is_fragment) {
-		if (parse_l4hdr(data, data_end, meta) < 0)
-			return XDP_DROP;
 	}
 
 	/* Evaluate firewall filter (if assigned to this interface) */

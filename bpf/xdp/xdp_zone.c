@@ -465,17 +465,21 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 	meta->ct_state = sess->state;
 	meta->ct_direction = direction;
 	meta->policy_id = sess->policy_id;
+	meta->nat_flags = sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT);
+	int nat_needed = 0;
 
 	if (sess->flags & SESS_FLAG_SNAT) {
 		if (is_fwd) {
 			__builtin_memcpy(meta->src_ip.v6, sess->nat_src_ip, 16);
 			meta->src_port = sess->nat_src_port;
+			nat_needed = 1;
 		}
 	}
 	if (sess->flags & SESS_FLAG_DNAT) {
 		if (!is_fwd) {
 			__builtin_memcpy(meta->src_ip.v6, sess->nat_dst_ip, 16);
 			meta->src_port = sess->nat_dst_port;
+			nat_needed = 1;
 		}
 	}
 
@@ -484,7 +488,7 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 		meta->nat_flags |= SESS_FLAG_NAT64;
 
 	__u32 next_prog = XDP_PROG_FORWARD;
-	if (sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT))
+	if (nat_needed)
 		next_prog = XDP_PROG_NAT;
 
 	if (sess->state == SESS_STATE_CLOSED) {
