@@ -13,20 +13,16 @@
 #include "../headers/bpfrx_nat.h"
 #include "../headers/bpfrx_trace.h"
 
-#define IPV6_FLOW_CACHE_SLOTS      256
+#define IPV6_FLOW_CACHE_ENTRIES    4096
 #define IPV6_FLOW_CACHE_BATCH_PKTS 256
 
-struct ipv6_flow_cache_key {
-	__be32 src_ip[4];
-	__be32 dst_ip[4];
-	__be16 src_port;
-	__be16 dst_port;
-	__u8   protocol;
-	__u8   pad[3];
+struct ipv6_flow_lookup_key {
+	__u64 hash_hi;
+	__u64 hash_lo;
 };
 
 struct ipv6_flow_cache_entry {
-	struct ipv6_flow_cache_key key;
+	struct session_key_v6 full_key;
 	__u64 last_seen;
 	__u64 pending_bytes;
 	__u32 policy_id;
@@ -36,13 +32,10 @@ struct ipv6_flow_cache_entry {
 	__u16 egress_vlan_id;
 	__u16 egress_zone;
 	__u16 fib_gen;
-	__u8  valid;
 	__u8  ct_direction;
-	__u8  next_prog;
 	__u8  count_as_fwd;
 	__u8  rewrite_src;
-	__u8  nat_flags;
-	__u8  pad0[2];
+	__u8  pad0;
 	__u8  rewrite_src_ip[16];
 	__be16 rewrite_src_port;
 	__u8  fwd_dmac[6];
@@ -50,9 +43,9 @@ struct ipv6_flow_cache_entry {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, IPV6_FLOW_CACHE_SLOTS);
-	__type(key, __u32);
+	__uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
+	__uint(max_entries, IPV6_FLOW_CACHE_ENTRIES);
+	__type(key, struct ipv6_flow_lookup_key);
 	__type(value, struct ipv6_flow_cache_entry);
 } ipv6_flow_cache SEC(".maps");
 
@@ -78,50 +71,68 @@ ipv6_session_cacheable(struct session_value_v6 *sess)
 	return 1;
 }
 
-static __always_inline __u32
-ipv6_flow_cache_slot(struct pkt_meta *meta)
+static __always_inline __u64
+ipv6_flow_mix32(__u64 seed, __u32 word)
 {
-	__be32 *src = (__be32 *)meta->src_ip.v6;
-	__be32 *dst = (__be32 *)meta->dst_ip.v6;
-	__u32 hash = ((__u32)meta->src_port << 16) ^ (__u32)meta->dst_port;
-
-	#pragma unroll
-	for (int i = 0; i < 4; i++) {
-		hash ^= (__u32)src[i];
-		hash ^= ((__u32)dst[i] << ((i & 1) ? 1 : 0));
-	}
-	hash ^= ((__u32)meta->protocol << 24);
-	return hash & (IPV6_FLOW_CACHE_SLOTS - 1);
+	seed ^= (__u64)word;
+	seed *= 0x100000001b3ULL;
+	seed ^= seed >> 32;
+	return seed;
 }
 
 static __always_inline void
-fill_ipv6_flow_cache_key(struct ipv6_flow_cache_key *key, struct pkt_meta *meta)
+build_ipv6_flow_lookup_key_from_full(const struct session_key_v6 *full,
+				     struct ipv6_flow_lookup_key *key)
 {
-	__builtin_memcpy(key->src_ip, meta->src_ip.v6, 16);
-	__builtin_memcpy(key->dst_ip, meta->dst_ip.v6, 16);
-	key->src_port = meta->src_port;
-	key->dst_port = meta->dst_port;
-	key->protocol = meta->protocol;
+	const __be32 *src = (const __be32 *)full->src_ip;
+	const __be32 *dst = (const __be32 *)full->dst_ip;
+	__u32 ports_proto = ((__u32)bpf_ntohs(full->src_port) << 16) |
+			    (__u32)bpf_ntohs(full->dst_port);
+	ports_proto ^= ((__u32)full->protocol << 24);
+	__u64 hi = 0xcbf29ce484222325ULL;
+	__u64 lo = 0x84222325cbf29ce4ULL;
+
+	#pragma unroll
+	for (int i = 0; i < 4; i++) {
+		hi = ipv6_flow_mix32(hi, (__u32)src[i]);
+		hi = ipv6_flow_mix32(hi, (__u32)dst[i]);
+		lo = ipv6_flow_mix32(lo, (__u32)dst[i]);
+		lo = ipv6_flow_mix32(lo, (__u32)src[i]);
+	}
+	hi = ipv6_flow_mix32(hi, ports_proto);
+	lo = ipv6_flow_mix32(lo, ports_proto ^ 0x9e3779b9U);
+	key->hash_hi = hi;
+	key->hash_lo = lo;
+}
+
+static __always_inline void
+build_ipv6_flow_lookup_key_from_meta(struct pkt_meta *meta,
+				     struct ipv6_flow_lookup_key *key)
+{
+	struct session_key_v6 full = {};
+	__builtin_memcpy(full.src_ip, meta->src_ip.v6, 16);
+	__builtin_memcpy(full.dst_ip, meta->dst_ip.v6, 16);
+	full.src_port = meta->src_port;
+	full.dst_port = meta->dst_port;
+	full.protocol = meta->protocol;
+	build_ipv6_flow_lookup_key_from_full(&full, key);
 }
 
 static __always_inline int
 ipv6_flow_cache_match(struct ipv6_flow_cache_entry *entry,
 		      struct pkt_meta *meta)
 {
+	if (entry->full_key.src_port != meta->src_port ||
+	    entry->full_key.dst_port != meta->dst_port ||
+	    entry->full_key.protocol != meta->protocol)
+		return 0;
+
 	__be32 *src = (__be32 *)meta->src_ip.v6;
 	__be32 *dst = (__be32 *)meta->dst_ip.v6;
-
-	if (!entry->valid)
-		return 0;
-	if (entry->key.src_port != meta->src_port ||
-	    entry->key.dst_port != meta->dst_port ||
-	    entry->key.protocol != meta->protocol)
-		return 0;
-
 	#pragma unroll
 	for (int i = 0; i < 4; i++) {
-		if (entry->key.src_ip[i] != src[i] ||
-		    entry->key.dst_ip[i] != dst[i])
+		if (((__be32 *)entry->full_key.src_ip)[i] != src[i] ||
+		    ((__be32 *)entry->full_key.dst_ip)[i] != dst[i])
 			return 0;
 	}
 
@@ -131,22 +142,15 @@ ipv6_flow_cache_match(struct ipv6_flow_cache_entry *entry,
 static __noinline int
 flush_ipv6_flow_cache_entry(struct ipv6_flow_cache_entry *entry)
 {
-	if (!entry->valid || entry->pending_packets == 0)
+	if (!entry || entry->pending_packets == 0)
 		return 0;
 
-	struct session_key_v6 key = {};
-	__builtin_memcpy(key.src_ip, entry->key.src_ip, 16);
-	__builtin_memcpy(key.dst_ip, entry->key.dst_ip, 16);
-	key.src_port = entry->key.src_port;
-	key.dst_port = entry->key.dst_port;
-	key.protocol = entry->key.protocol;
-
-	struct session_value_v6 *sess = bpf_map_lookup_elem(&sessions_v6, &key);
+	struct session_value_v6 *sess =
+		bpf_map_lookup_elem(&sessions_v6, &entry->full_key);
 	if (!sess || sess->state != SESS_STATE_ESTABLISHED ||
 	    sess->fib_ifindex != entry->fwd_ifindex ||
 	    sess->fib_vlan_id != entry->egress_vlan_id ||
 	    sess->fib_gen != entry->fib_gen) {
-		entry->valid = 0;
 		entry->pending_packets = 0;
 		entry->pending_bytes = 0;
 		return -1;
@@ -170,25 +174,61 @@ flush_ipv6_flow_cache_entry(struct ipv6_flow_cache_entry *entry)
 }
 
 static __always_inline void
-populate_ipv6_flow_cache(struct ipv6_flow_cache_entry *entry,
-			 struct pkt_meta *meta,
+populate_ipv6_flow_cache(struct pkt_meta *meta,
 			 struct session_value_v6 *sess,
 			 __u8 direction,
 			 __u32 fib_gen,
 			 __u64 now)
 {
 	int is_fwd = (direction == sess->is_reverse);
+	struct ipv6_flow_lookup_key lookup_key = {};
+	build_ipv6_flow_lookup_key_from_meta(meta, &lookup_key);
+	struct ipv6_flow_cache_entry *entry =
+		bpf_map_lookup_elem(&ipv6_flow_cache, &lookup_key);
 
-	if (entry->valid)
-		flush_ipv6_flow_cache_entry(entry);
+	if (!entry) {
+		struct ipv6_flow_cache_entry new_entry = {};
+		entry = &new_entry;
+		__builtin_memset(entry, 0, sizeof(*entry));
+		__builtin_memcpy(entry->full_key.src_ip, meta->src_ip.v6, 16);
+		__builtin_memcpy(entry->full_key.dst_ip, meta->dst_ip.v6, 16);
+		entry->full_key.src_port = meta->src_port;
+		entry->full_key.dst_port = meta->dst_port;
+		entry->full_key.protocol = meta->protocol;
+		entry->ct_direction = direction;
+		entry->count_as_fwd = (direction == sess->is_reverse);
+		entry->policy_id = sess->policy_id;
+		entry->fwd_ifindex = sess->fib_ifindex;
+		entry->egress_vlan_id = sess->fib_vlan_id;
+		entry->egress_zone = sess->egress_zone;
+		entry->fib_gen = (__u16)fib_gen;
+		entry->last_seen = now;
+		entry->last_flush = (__u32)now;
+		__builtin_memcpy(entry->fwd_dmac, sess->fib_dmac, 6);
+		__builtin_memcpy(entry->fwd_smac, sess->fib_smac, 6);
 
+		if ((sess->flags & SESS_FLAG_SNAT) && is_fwd) {
+			entry->rewrite_src = 1;
+			__builtin_memcpy(entry->rewrite_src_ip, sess->nat_src_ip, 16);
+			entry->rewrite_src_port = sess->nat_src_port;
+		} else if ((sess->flags & SESS_FLAG_DNAT) && !is_fwd) {
+			entry->rewrite_src = 1;
+			__builtin_memcpy(entry->rewrite_src_ip, sess->nat_dst_ip, 16);
+			entry->rewrite_src_port = sess->nat_dst_port;
+		}
+
+		bpf_map_update_elem(&ipv6_flow_cache, &lookup_key, entry, BPF_ANY);
+		return;
+	}
+
+	flush_ipv6_flow_cache_entry(entry);
 	__builtin_memset(entry, 0, sizeof(*entry));
-	fill_ipv6_flow_cache_key(&entry->key, meta);
-	entry->valid = 1;
+	__builtin_memcpy(entry->full_key.src_ip, meta->src_ip.v6, 16);
+	__builtin_memcpy(entry->full_key.dst_ip, meta->dst_ip.v6, 16);
+	entry->full_key.src_port = meta->src_port;
+	entry->full_key.dst_port = meta->dst_port;
+	entry->full_key.protocol = meta->protocol;
 	entry->ct_direction = direction;
-	entry->nat_flags = sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT);
-	entry->next_prog = entry->nat_flags ?
-		XDP_PROG_NAT : XDP_PROG_FORWARD;
 	entry->count_as_fwd = (direction == sess->is_reverse);
 	entry->policy_id = sess->policy_id;
 	entry->fwd_ifindex = sess->fib_ifindex;
@@ -218,9 +258,10 @@ try_ipv6_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
 	if (!ipv6_flow_cacheable_tcp(meta))
 		return -1;
 
-	__u32 slot = ipv6_flow_cache_slot(meta);
+	struct ipv6_flow_lookup_key lookup_key = {};
+	build_ipv6_flow_lookup_key_from_meta(meta, &lookup_key);
 	struct ipv6_flow_cache_entry *entry =
-		bpf_map_lookup_elem(&ipv6_flow_cache, &slot);
+		bpf_map_lookup_elem(&ipv6_flow_cache, &lookup_key);
 	if (!entry || !ipv6_flow_cache_match(entry, meta)) {
 		inc_counter(GLOBAL_CTR_FLOW_CACHE_MISS);
 		return -1;
@@ -230,7 +271,7 @@ try_ipv6_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
 	    entry->fib_gen != (__u16)fib_gen ||
 	    !check_egress_rg_active(entry->fwd_ifindex, entry->egress_vlan_id)) {
 		flush_ipv6_flow_cache_entry(entry);
-		entry->valid = 0;
+		bpf_map_delete_elem(&ipv6_flow_cache, &lookup_key);
 		inc_counter(GLOBAL_CTR_FLOW_CACHE_INVALIDATE);
 		return -1;
 	}
@@ -239,6 +280,7 @@ try_ipv6_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
 	if (entry->pending_packets >= IPV6_FLOW_CACHE_BATCH_PKTS ||
 	    entry->last_flush != (__u32)now) {
 		if (flush_ipv6_flow_cache_entry(entry) < 0) {
+			bpf_map_delete_elem(&ipv6_flow_cache, &lookup_key);
 			inc_counter(GLOBAL_CTR_FLOW_CACHE_INVALIDATE);
 			return -1;
 		}
@@ -251,7 +293,6 @@ try_ipv6_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
 	meta->ct_state = SESS_STATE_ESTABLISHED;
 	meta->ct_direction = entry->ct_direction;
 	meta->policy_id = entry->policy_id;
-	meta->nat_flags = entry->nat_flags;
 	meta->fwd_ifindex = entry->fwd_ifindex;
 	meta->egress_vlan_id = entry->egress_vlan_id;
 	meta->egress_zone = entry->egress_zone;
@@ -259,12 +300,19 @@ try_ipv6_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
 	__builtin_memcpy(meta->fwd_smac, entry->fwd_smac, 6);
 
 	if (entry->rewrite_src) {
-		__builtin_memcpy(meta->src_ip.v6, entry->rewrite_src_ip, 16);
-		meta->src_port = entry->rewrite_src_port;
+		void *data = (void *)(long)ctx->data;
+		void *data_end = (void *)(long)ctx->data_end;
+		resolve_csum_partial(data, data_end, meta);
+		if (nat_rewrite_v6_tcp_src_cached(data, data_end, meta,
+						  entry->rewrite_src_ip,
+						  entry->rewrite_src_port) < 0) {
+			inc_counter(GLOBAL_CTR_FLOW_CACHE_MISS);
+			return -1;
+		}
 	}
 
 	inc_counter(GLOBAL_CTR_FLOW_CACHE_HIT);
-	bpf_tail_call(ctx, &xdp_progs, entry->next_prog);
+	bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
 	return XDP_PASS;
 }
 
@@ -274,14 +322,15 @@ flush_matching_ipv6_flow_cache(struct pkt_meta *meta)
 	if (meta->addr_family != AF_INET6 || meta->protocol != PROTO_TCP)
 		return;
 
-	__u32 slot = ipv6_flow_cache_slot(meta);
+	struct ipv6_flow_lookup_key lookup_key = {};
+	build_ipv6_flow_lookup_key_from_meta(meta, &lookup_key);
 	struct ipv6_flow_cache_entry *entry =
-		bpf_map_lookup_elem(&ipv6_flow_cache, &slot);
+		bpf_map_lookup_elem(&ipv6_flow_cache, &lookup_key);
 	if (!entry || !ipv6_flow_cache_match(entry, meta))
 		return;
 
 	flush_ipv6_flow_cache_entry(entry);
-	entry->valid = 0;
+	bpf_map_delete_elem(&ipv6_flow_cache, &lookup_key);
 }
 
 /*
@@ -1102,16 +1151,10 @@ zone_resolved:
 		    sv6->fib_gen == (__u16)fib_gen) {
 			if (ipv6_flow_cacheable_tcp(meta) &&
 			    ipv6_session_cacheable(sv6)) {
-				__u32 slot = ipv6_flow_cache_slot(meta);
-				struct ipv6_flow_cache_entry *entry =
-					bpf_map_lookup_elem(&ipv6_flow_cache,
-							    &slot);
-				if (entry)
-					populate_ipv6_flow_cache(entry, meta,
-								 sv6,
-								 ct_direction,
-								 fib_gen,
-								 meta->now_sec);
+				populate_ipv6_flow_cache(meta, sv6,
+							 ct_direction,
+							 fib_gen,
+							 meta->now_sec);
 			}
 			meta->fwd_ifindex    = sv6->fib_ifindex;
 			meta->egress_vlan_id = sv6->fib_vlan_id;

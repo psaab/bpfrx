@@ -1,7 +1,7 @@
 ## Next Feature: IPv6 Session Fast Path
 
 Date: 2026-03-06  
-Status: Phase 1 partially implemented in `perf-ipv6-flow-cache`
+Status: Phases 1-3 implemented in stacked perf PRs
 
 ## Problem
 
@@ -73,32 +73,37 @@ They are updated in bounded batches instead. That is the core performance win.
 
 ### Phase 2: Compact IPv6 session key
 
-Current IPv6 session lookups use a 40-byte key. That is expensive to hash and
-compare.
+Implemented in [`xdp_zone.c`](/home/ps/git/codex-bpfrx/bpf/xdp/xdp_zone.c).
 
-Follow-on work:
+The established-flow cache no longer uses the full 40-byte IPv6 5-tuple as the
+map key. It now uses a compact 128-bit lookup key built from the tuple and
+keeps the full tuple in the cached value for verification.
 
-1. Evaluate a compact hashed key design for IPv6 sessions.
-2. Preserve collision safety with an explicit secondary tag or cold-path verify.
-3. Revisit session sync and GC implications before changing map layout.
+Collision safety:
 
-This is higher-risk than phase 1, but likely the next largest win.
+1. Cache lookup verifies the embedded full 5-tuple before use.
+2. Any key collision falls back to the authoritative `sessions_v6` map path.
+3. The real session map layout, GC behavior, and HA/session-sync semantics stay
+   anchored on the unchanged full `sessions_v6` key/value state.
 
 ### Phase 3: Split hot and cold IPv6 session state
 
-`session_value_v6` is large because it mixes:
+Implemented in [`xdp_zone.c`](/home/ps/git/codex-bpfrx/bpf/xdp/xdp_zone.c).
 
-1. hot forwarding fields
-2. counters
-3. timestamps
-4. reverse key
-5. NAT metadata
-6. cached FIB metadata
+This phase does not rewrite the public `sessions_v6` map format. Instead it
+splits the hot established-flow lookup state into the front-side IPv6 flow
+cache and leaves the colder accounting / GC / HA state in `sessions_v6`.
 
-Follow-on work:
+The hot cache now carries only the fields needed on the steady-state fast path:
 
-1. Move cold/logging/GC data out of the hottest lookup value.
-2. Keep the lookup-time value as small as possible.
+1. compact lookup key + verified full tuple
+2. forwarding metadata (`fwd_ifindex`, VLAN, zone, MACs)
+3. current-direction source rewrite state
+4. policy ID
+5. batched packet/byte counters and `last_seen`
+
+That means established IPv6 TCP cache hits no longer need to pull the full
+`session_value_v6` object into the hottest path.
 
 ### Phase 4: IPv6 parser fast path
 
@@ -125,12 +130,13 @@ fields that are not changing for the current packet.
 
 Current implementation details:
 
-1. Cache map: per-CPU array, `256` slots.
+1. Cache map: per-CPU LRU hash, `4096` entries.
 2. Placement: XDP zone stage, before `sessions_v6` lookup.
-3. Entry lifetime: replaced on collision, with flush-before-replace.
+3. Entry lifetime: LRU-managed, with flush-before-replace/delete.
 4. Loader keeps the cache map FD alive via [`loader_ebpf.go`](/home/ps/git/codex-bpfrx/pkg/dataplane/loader_ebpf.go).
 5. Batch threshold is `256` packets, chosen to reduce steady-state session-map pressure while keeping accounting drift bounded.
-6. The same branch also includes the IPv6 no-extension parse fast path and a narrower IPv6 NAT rewrite path.
+6. Cache hits with current-direction IPv6 TCP source rewrite now patch the
+   packet inline and tail-call straight to `xdp_forward`, bypassing `xdp_nat`.
 
 Why zone stage:
 
@@ -140,8 +146,8 @@ reuse. Adding the cache there avoids duplicating another lookup path in
 
 ## Risks
 
-1. Direct-mapped cache means collision eviction under many concurrent IPv6 flows.
-2. Batched `last_seen` updates slightly relax session freshness granularity.
+1. Batched `last_seen` updates slightly relax session freshness granularity.
+2. Compact-key collisions can increase fallback pressure under adversarial flow mixes.
 3. XDP-only for now; DPDK remains on the old path.
 
 ## Acceptance Criteria
@@ -155,6 +161,4 @@ reuse. Adding the cache there avoids duplicating another lookup path in
 ## Next Issues
 
 1. Add observability counters for IPv6 cache hit/flush/fallback.
-2. Compact IPv6 session key.
-3. Split hot/cold IPv6 session state.
-4. Reduce remaining IPv6 checksum-partial detection cost in `xdp_main`.
+2. Reduce remaining IPv6 checksum-partial detection cost in `xdp_main`.

@@ -216,16 +216,8 @@ type bpfrxXdpZoneIfaceZoneValue struct {
 }
 
 type bpfrxXdpZoneIpv6FlowCacheEntry struct {
-	_   structs.HostLayout
-	Key struct {
-		_        structs.HostLayout
-		SrcIp    [4]uint32
-		DstIp    [4]uint32
-		SrcPort  uint16
-		DstPort  uint16
-		Protocol uint8
-		Pad      [3]uint8
-	}
+	_              structs.HostLayout
+	FullKey        bpfrxXdpZoneSessionKeyV6
 	LastSeen       uint64
 	PendingBytes   uint64
 	PolicyId       uint32
@@ -235,18 +227,20 @@ type bpfrxXdpZoneIpv6FlowCacheEntry struct {
 	EgressVlanId   uint16
 	EgressZone     uint16
 	FibGen         uint16
-	Valid          uint8
 	CtDirection    uint8
-	NextProg       uint8
 	CountAsFwd     uint8
 	RewriteSrc     uint8
-	NatFlags       uint8
-	Pad0           [2]uint8
+	Pad0           uint8
 	RewriteSrcIp   [16]uint8
 	RewriteSrcPort uint16
 	FwdDmac        [6]uint8
 	FwdSmac        [6]uint8
-	_              [4]byte
+}
+
+type bpfrxXdpZoneIpv6FlowLookupKey struct {
+	_      structs.HostLayout
+	HashHi uint64
+	HashLo uint64
 }
 
 type bpfrxXdpZoneLpmKeyV4 struct {

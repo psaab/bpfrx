@@ -371,6 +371,45 @@ nat_rewrite_embedded_v6(void *data, void *data_end, struct pkt_meta *meta)
 }
 
 /*
+ * Cached established-flow helper for the common IPv6 TCP source-rewrite case.
+ * Used by the IPv6 flow cache so those packets can tail-call directly to
+ * xdp_forward instead of paying the xdp_nat dispatcher on every hit.
+ *
+ * Returns 0 on success, -1 when packet bounds are not valid and the caller
+ * should fall back to the regular NAT path.
+ */
+static __always_inline int
+nat_rewrite_v6_tcp_src_cached(void *data, void *data_end, struct pkt_meta *meta,
+			      const __u8 *new_src_ip, __be16 new_src_port)
+{
+	if (meta->l3_offset >= 64 || meta->l4_offset >= 128)
+		return -1;
+
+	struct ipv6hdr *ip6h = data + meta->l3_offset;
+	if ((void *)(ip6h + 1) > data_end)
+		return -1;
+
+	struct tcphdr *tcp = data + meta->l4_offset;
+	if ((void *)(tcp + 1) > data_end)
+		return -1;
+
+	if (!ip_addr_eq_v6(new_src_ip, (__u8 *)&ip6h->saddr)) {
+		__u8 old_src[16];
+		__builtin_memcpy(old_src, &ip6h->saddr, 16);
+		nat_update_l4_csum_v6(tcp, data_end, meta, old_src, new_src_ip);
+		__builtin_memcpy(&ip6h->saddr, new_src_ip, 16);
+	}
+
+	if (new_src_port != 0 && tcp->source != new_src_port) {
+		if (!meta->csum_partial)
+			csum_update_2(&tcp->check, tcp->source, new_src_port);
+		tcp->source = new_src_port;
+	}
+
+	return 0;
+}
+
+/*
  * IPv6 NAT rewrite.
  * IPv6 has no IP header checksum. Only L4 checksums need updating.
  */
