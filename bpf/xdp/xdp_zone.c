@@ -1384,9 +1384,20 @@ zone_resolved:
 				 * via KERNEL_ROUTE — the peer likely has
 				 * the same NO_NEIGH issue and fabric
 				 * redirect just wastes a round-trip. */
+				/* Resolve VLAN context for RG active check */
+				__u32 nn_egress_if = fib.ifindex;
+				__u16 nn_egress_vlan = 0;
+				struct vlan_iface_info *nn_vi =
+					bpf_map_lookup_elem(&vlan_iface_map,
+							    &nn_egress_if);
+				if (nn_vi) {
+					nn_egress_if = nn_vi->parent_ifindex;
+					nn_egress_vlan = nn_vi->vlan_id;
+				}
 				int nn_egress_active =
 					check_egress_rg_active(
-						fib.ifindex, 0);
+						nn_egress_if,
+						nn_egress_vlan);
 				if (!nn_egress_active) {
 					apply_dnat_before_fabric_redirect(
 						ctx, meta);

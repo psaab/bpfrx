@@ -254,8 +254,13 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 		linuxName := config.LinuxIfName(im.Interface)
 		link, err := nlh.LinkByName(linuxName)
 		if err != nil {
-			// Interface doesn't exist on this node — belongs to peer
-			// (e.g. ge-7/0/x on node 0). Skip without counting as down.
+			// Check if interface belongs to peer based on FPC slot.
+			slot := config.InterfaceSlot(im.Interface)
+			if slot >= 0 && config.SlotToNodeID(slot) != mon.mgr.NodeID() {
+				continue // peer's interface
+			}
+			slog.Warn("cluster monitor: local interface missing",
+				"rg", rg.ID, "interface", im.Interface)
 			continue
 		}
 
@@ -437,10 +442,12 @@ func (mon *Monitor) RGInterfaceReady(rgID int) (bool, []string) {
 			linuxName := config.LinuxIfName(im.Interface)
 			link, err := nlh.LinkByName(linuxName)
 			if err != nil {
-				// Interface doesn't exist on this node — belongs to
-				// peer (e.g. ge-7/0/x on node 0). Skip without
-				// counting against readiness, matching
-				// pollInterfaceMonitors() behavior.
+				// Check if interface belongs to peer based on FPC slot.
+				slot := config.InterfaceSlot(im.Interface)
+				if slot >= 0 && config.SlotToNodeID(slot) != mon.mgr.NodeID() {
+					continue // peer's interface
+				}
+				reasons = append(reasons, fmt.Sprintf("interface %s missing", im.Interface))
 				continue
 			}
 			up := link.Attrs().OperState == netlink.OperUp ||

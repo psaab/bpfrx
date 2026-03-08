@@ -628,17 +628,17 @@ func TestIsReadyForTakeover(t *testing.T) {
 }
 
 func TestRGInterfaceReady(t *testing.T) {
-	m := NewManager(0, 1)
+	m := NewManager(0, 1) // node 0
 	nlh := newMockNlHandle()
-	nlh.setLink("trust0", true)
-	nlh.setLink("untrust0", true)
+	nlh.setLink("ge-0-0-0", true)
+	nlh.setLink("ge-7-0-0", true)
 
 	groups := []*config.RedundancyGroup{
 		{
 			ID: 0,
 			InterfaceMonitors: []*config.InterfaceMonitor{
-				{Interface: "trust0", Weight: 255},
-				{Interface: "untrust0", Weight: 128},
+				{Interface: "ge-0/0/0", Weight: 255},  // local (slot 0 → node 0)
+				{Interface: "ge-7/0/0", Weight: 128},  // peer  (slot 7 → node 1)
 			},
 		},
 	}
@@ -651,22 +651,31 @@ func TestRGInterfaceReady(t *testing.T) {
 		t.Errorf("should be ready, got reasons: %v", reasons)
 	}
 
-	// Remove an interface — simulates peer's interface not present on
-	// this node (e.g. ge-7/0/x on node 0). Should be skipped, matching
-	// pollInterfaceMonitors() behavior.
-	delete(nlh.links, "trust0")
+	// Remove peer's interface — should be skipped (ge-7/0/x belongs
+	// to node 1, we are node 0).
+	delete(nlh.links, "ge-7-0-0")
 	ready, reasons = mon.RGInterfaceReady(0)
 	if !ready {
-		t.Errorf("missing interface (peer's) should be skipped, got reasons: %v", reasons)
+		t.Errorf("missing peer interface should be skipped, got reasons: %v", reasons)
+	}
+
+	// Remove local interface — should fail readiness.
+	delete(nlh.links, "ge-0-0-0")
+	ready, reasons = mon.RGInterfaceReady(0)
+	if ready {
+		t.Error("missing local interface should fail readiness")
+	}
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "ge-0/0/0 missing") {
+		t.Errorf("unexpected reasons: %v", reasons)
 	}
 
 	// Interface exists but is down.
-	nlh.setLink("trust0", false)
+	nlh.setLink("ge-0-0-0", false)
 	ready, reasons = mon.RGInterfaceReady(0)
 	if ready {
 		t.Error("should NOT be ready with interface down")
 	}
-	if len(reasons) != 1 || !strings.Contains(reasons[0], "trust0 down") {
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "ge-0/0/0 down") {
 		t.Errorf("unexpected reasons: %v", reasons)
 	}
 

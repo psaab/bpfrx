@@ -2696,6 +2696,7 @@ func buildZoneRGMap(cfg *config.Config, zoneIDs map[string]uint16) map[uint16]in
 		if !ok {
 			continue
 		}
+		rgSeen := -1
 		for _, ifName := range zone.Interfaces {
 			// Strip unit suffix (e.g. "reth0.0" → "reth0") for config lookup.
 			baseName := ifName
@@ -2703,12 +2704,33 @@ func buildZoneRGMap(cfg *config.Config, zoneIDs map[string]uint16) map[uint16]in
 				baseName = ifName[:idx]
 			}
 			if ifc, ok := cfg.Interfaces.Interfaces[baseName]; ok && ifc.RedundancyGroup > 0 {
-				result[zid] = ifc.RedundancyGroup
-				break // one RETH per zone is enough to determine the RG
+				if rgSeen >= 0 && rgSeen != ifc.RedundancyGroup {
+					slog.Warn("zone spans multiple redundancy groups; "+
+						"active/active session sync ownership is ambiguous",
+						"zone", zoneName,
+						"rg1", rgSeen, "rg2", ifc.RedundancyGroup)
+				}
+				if rgSeen < 0 {
+					result[zid] = ifc.RedundancyGroup
+					rgSeen = ifc.RedundancyGroup
+				}
 			}
 		}
 	}
 	return result
+}
+
+// rgHasRETH returns whether the given redundancy group has any RETH interfaces.
+func rgHasRETH(cfg *config.Config, rgID int) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc.RedundancyGroup == rgID {
+			return true
+		}
+	}
+	return false
 }
 
 // parseAddrPair parses "ip:port" or "[ip]:port" into net.IPs and IPv6 flag.
@@ -5395,6 +5417,18 @@ func (d *Daemon) reconcileRGState() {
 
 	// Evaluate per-RG readiness for the takeover gate.
 	noRethVRRP := d.isNoRethVRRP()
+
+	// Check fabric readiness — only relevant when peer is alive.
+	fabricReady := true
+	if d.cluster.PeerAlive() {
+		d.fabricMu.RLock()
+		fp := d.fabricPopulated
+		d.fabricMu.RUnlock()
+		if !fp {
+			fabricReady = false
+		}
+	}
+
 	if mon := d.cluster.Monitor(); mon != nil {
 		for _, rgID := range rgIDs {
 			ifReady, ifReasons := mon.RGInterfaceReady(rgID)
@@ -5416,14 +5450,18 @@ func (d *Daemon) reconcileRGState() {
 					vrrpReasons = append(vrrpReasons, vipReasons...)
 				}
 			} else if d.vrrpMgr != nil {
-				vrrpReady, vrrpReasons = d.vrrpMgr.RGVRRPReady(rgID)
+				hasRETH := rgHasRETH(d.store.ActiveConfig(), rgID)
+				vrrpReady, vrrpReasons = d.vrrpMgr.RGVRRPReady(rgID, hasRETH)
 			} else {
 				vrrpReady = true // no VRRP = always ready
 			}
-			ready := ifReady && vrrpReady
+			ready := ifReady && vrrpReady && fabricReady
 			var reasons []string
 			reasons = append(reasons, ifReasons...)
 			reasons = append(reasons, vrrpReasons...)
+			if !fabricReady {
+				reasons = append(reasons, "fabric forwarding path not ready")
+			}
 			d.cluster.SetRGReady(rgID, ready, reasons)
 		}
 	}

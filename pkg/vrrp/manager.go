@@ -355,8 +355,9 @@ func (m *Manager) SetGARPSuppression(rgID int, suppress bool) {
 // RGVRRPReady returns whether at least one VRRP instance exists and is
 // running for the given redundancy group. The RG ID is mapped to VRID
 // as 100 + rgID (the standard RETH VRID convention).
+// hasRETH indicates whether the RG has any RETH interfaces configured.
 // Returns (true, nil) if ready, (false, reasons) if not.
-func (m *Manager) RGVRRPReady(rgID int) (bool, []string) {
+func (m *Manager) RGVRRPReady(rgID int, hasRETH bool) (bool, []string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -367,14 +368,13 @@ func (m *Manager) RGVRRPReady(rgID int) (bool, []string) {
 		}
 	}
 
-	// No instance for this RG. If other instances exist, VRRP is
-	// running but this RG simply has no RETH/VRRP interfaces
-	// (e.g. RG 0 is control-plane only) — ready by definition.
-	if len(m.instances) > 0 {
+	// No instance for this RG. If the RG has no RETH interfaces
+	// (e.g. RG 0 is control-plane only), it has no VRRP requirement.
+	if !hasRETH {
 		return true, nil
 	}
 
-	// No instances at all — VRRP hasn't started yet. Not ready.
+	// RG has RETH interfaces but no VRRP instance yet — not ready.
 	return false, []string{fmt.Sprintf("vrrp: no instance for RG %d (VRID %d)", rgID, vrid)}
 }
 
