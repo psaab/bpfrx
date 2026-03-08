@@ -397,18 +397,26 @@ func (vi *vrrpInstance) run() {
 					vi.sendAdvert(0)
 				}
 				vi.becomeBackup(masterDownTimer, advertTimer)
-				// Stop the masterDown timer entirely after forced resignation.
+				// Use an extended safety-net timer instead of stopping entirely.
 				// With short RETH intervals (30ms), masterDownInterval() at
 				// priority 0 is only ~120ms, which re-elects the resigned node
-				// before the peer can take over. Even with an extended timer,
-				// the resigned node would re-elect as MASTER and send
-				// high-priority adverts that keep the peer in BACKUP,
-				// creating a split-brain. The resigned node should only
-				// become MASTER via:
+				// before the peer can take over. We use 3× the normal
+				// masterDownInterval to give the peer time to become MASTER
+				// and start advertising, while still providing a recovery path
+				// if the peer crashes without sending priority-0.
+				//
+				// Normal recovery paths (faster than the safety timer):
 				//   - preemptNowCh (cluster ForceRGMaster after failover reset)
-				//   - priority-0 from peer (peer resigning)
-				// This matches Junos behavior: manual failover stays until reset.
-				masterDownTimer.Stop()
+				//   - priority-0 from peer (peer resigning) → 1ms takeover
+				//   - peer advert received → resets timer to masterDownInterval
+				//
+				// The safety timer only fires if the peer is completely gone
+				// (crash without priority-0, network partition).
+				safetyTimeout := 3 * vi.masterDownInterval()
+				if safetyTimeout < 500*time.Millisecond {
+					safetyTimeout = 500 * time.Millisecond
+				}
+				masterDownTimer.Reset(safetyTimeout)
 			}
 		}
 	}

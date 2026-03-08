@@ -987,14 +987,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.vrrpMgr.Stop()
 	}
 
+	// Stop cluster monitor (heartbeats) immediately after VRRP priority-0.
+	// This ensures the peer's heartbeat timeout starts promptly instead of
+	// being delayed by the 5s sync Stop timeout below.
+	if d.cluster != nil {
+		d.cluster.Stop()
+	}
+
 	// Stop session sync (5s timeout to avoid blocking teardown).
 	if d.sessionSync != nil {
 		d.sessionSync.Stop()
-	}
-
-	// Stop cluster monitor.
-	if d.cluster != nil {
-		d.cluster.Stop()
 	}
 
 	if d.dp != nil {
