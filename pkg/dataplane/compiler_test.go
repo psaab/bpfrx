@@ -359,23 +359,7 @@ func TestBuildScreenConfig(t *testing.T) {
 			profile := &config.ScreenProfile{
 				TCP: config.TCPScreen{SynFlood: tt.sf},
 			}
-
-			var flags uint32
-			var sc ScreenConfig
-			if profile.TCP.SynFlood != nil && profile.TCP.SynFlood.AttackThreshold > 0 {
-				flags |= ScreenSynFlood
-				sc.SynFloodThresh = uint32(profile.TCP.SynFlood.AttackThreshold)
-				if profile.TCP.SynFlood.SourceThreshold > 0 {
-					sc.SynFloodSrcThresh = uint32(profile.TCP.SynFlood.SourceThreshold)
-				}
-				if profile.TCP.SynFlood.DestinationThreshold > 0 {
-					sc.SynFloodDstThresh = uint32(profile.TCP.SynFlood.DestinationThreshold)
-				}
-				if profile.TCP.SynFlood.Timeout > 0 {
-					sc.SynFloodTimeout = uint32(profile.TCP.SynFlood.Timeout)
-				}
-			}
-			sc.Flags = flags
+			sc := buildScreenConfig(profile, false)
 
 			if sc != tt.expect {
 				t.Errorf("got %+v, want %+v", sc, tt.expect)

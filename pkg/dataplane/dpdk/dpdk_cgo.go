@@ -215,7 +215,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 
 // --- Zone / interface mapping ---
 
-func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8, rgID uint8) error {
+func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8, rgID uint8, screenFlags uint32) error {
 	shm := m.platform.shm
 	if shm == nil {
 		return fmt.Errorf("DPDK not initialized")
@@ -235,6 +235,7 @@ func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTabl
 	valPtr.flags = C.uint8_t(flags)
 	valPtr.rg_id = C.uint8_t(rgID)
 	valPtr.routing_table = C.uint32_t(routingTable)
+	valPtr.screen_flags = C.uint32_t(screenFlags)
 	return nil
 }
 

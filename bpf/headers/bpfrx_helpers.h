@@ -165,15 +165,8 @@ resolve_ingress_xdp_target(struct pkt_meta *meta)
 	if (izv->routing_table != 0)
 		meta->routing_table = izv->routing_table;
 
-	__u32 zone_key = (__u32)izv->zone_id;
-	struct zone_config *zc = bpf_map_lookup_elem(&zone_configs, &zone_key);
-	if (!zc || zc->screen_profile_id == 0)
-		return XDP_PROG_ZONE;
-
-	__u32 profile_key = (__u32)zc->screen_profile_id;
-	struct screen_config *sc =
-		bpf_map_lookup_elem(&screen_configs, &profile_key);
-	if (!sc || sc->flags == 0)
+	__u32 screen_flags = izv->screen_flags;
+	if (screen_flags == 0)
 		return XDP_PROG_ZONE;
 
 	/*
@@ -185,9 +178,9 @@ resolve_ingress_xdp_target(struct pkt_meta *meta)
 		__u8 tf = meta->tcp_flags;
 		if (!(tf & (0x02 /* SYN */ | 0x01 /* FIN */ |
 			    0x04 /* RST */ | 0x20 /* URG */)) &&
-		    !(sc->flags & SCREEN_LAND_ATTACK) &&
+		    !(screen_flags & SCREEN_LAND_ATTACK) &&
 		    !(meta->addr_family == AF_INET &&
-		      (sc->flags & SCREEN_IP_SOURCE_ROUTE)))
+		      (screen_flags & SCREEN_IP_SOURCE_ROUTE)))
 			return XDP_PROG_ZONE;
 	}
 

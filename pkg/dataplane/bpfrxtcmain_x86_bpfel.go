@@ -212,6 +212,7 @@ type bpfrxTcMainIfaceZoneValue struct {
 	Flags        uint8
 	RgId         uint8
 	RoutingTable uint32
+	ScreenFlags  uint32
 }
 
 type bpfrxTcMainLpmKeyV4 struct {

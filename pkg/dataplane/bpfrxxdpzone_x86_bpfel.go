@@ -212,6 +212,7 @@ type bpfrxXdpZoneIfaceZoneValue struct {
 	Flags        uint8
 	RgId         uint8
 	RoutingTable uint32
+	ScreenFlags  uint32
 }
 
 type bpfrxXdpZoneIpv6FlowCacheEntry struct {
@@ -239,7 +240,8 @@ type bpfrxXdpZoneIpv6FlowCacheEntry struct {
 	NextProg       uint8
 	CountAsFwd     uint8
 	RewriteSrc     uint8
-	Pad0           [3]uint8
+	NatFlags       uint8
+	Pad0           [2]uint8
 	RewriteSrcIp   [16]uint8
 	RewriteSrcPort uint16
 	FwdDmac        [6]uint8
