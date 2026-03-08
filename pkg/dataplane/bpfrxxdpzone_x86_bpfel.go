@@ -215,32 +215,37 @@ type bpfrxXdpZoneIfaceZoneValue struct {
 	ScreenFlags  uint32
 }
 
-type bpfrxXdpZoneIpv6FlowCacheEntry struct {
-	_              structs.HostLayout
-	FullKey        bpfrxXdpZoneSessionKeyV6
-	LastSeen       uint64
-	PendingBytes   uint64
-	PolicyId       uint32
-	FwdIfindex     uint32
-	LastFlush      uint32
-	PendingPackets uint32
-	EgressVlanId   uint16
-	EgressZone     uint16
-	FibGen         uint16
-	CtDirection    uint8
-	CountAsFwd     uint8
-	RewriteSrc     uint8
-	Pad0           uint8
-	RewriteSrcIp   [16]uint8
-	RewriteSrcPort uint16
-	FwdDmac        [6]uint8
-	FwdSmac        [6]uint8
-}
-
-type bpfrxXdpZoneIpv6FlowLookupKey struct {
-	_      structs.HostLayout
-	HashHi uint64
-	HashLo uint64
+type bpfrxXdpZoneIpv6FlowCacheSet struct {
+	_    structs.HostLayout
+	Ways [2]struct {
+		_   structs.HostLayout
+		Tag struct {
+			_      structs.HostLayout
+			HashHi uint64
+			HashLo uint64
+		}
+		FullKey        bpfrxXdpZoneSessionKeyV6
+		LastSeen       uint64
+		PendingBytes   uint64
+		PolicyId       uint32
+		FwdIfindex     uint32
+		LastFlush      uint32
+		PendingPackets uint32
+		EgressVlanId   uint16
+		EgressZone     uint16
+		FibGen         uint16
+		Valid          uint8
+		CtDirection    uint8
+		CountAsFwd     uint8
+		RewriteSrc     uint8
+		Pad0           uint8
+		RewriteSrcIp   [16]uint8
+		_              [1]byte
+		RewriteSrcPort uint16
+		FwdDmac        [6]uint8
+		FwdSmac        [6]uint8
+		_              [6]byte
+	}
 }
 
 type bpfrxXdpZoneLpmKeyV4 struct {

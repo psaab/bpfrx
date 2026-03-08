@@ -76,13 +76,14 @@ They are updated in bounded batches instead. That is the core performance win.
 Implemented in [`xdp_zone.c`](/home/ps/git/codex-bpfrx/bpf/xdp/xdp_zone.c).
 
 The established-flow cache no longer uses the full 40-byte IPv6 5-tuple as the
-map key. It now uses a compact 128-bit lookup key built from the tuple and
-keeps the full tuple in the cached value for verification.
+map key. It now uses a compact 128-bit lookup key to choose a small per-CPU
+cache set, and keeps the full tuple in the cached value for verification.
 
 Collision safety:
 
 1. Cache lookup verifies the embedded full 5-tuple before use.
-2. Any key collision falls back to the authoritative `sessions_v6` map path.
+2. Any compact-key collision inside the selected set falls back to the
+   authoritative `sessions_v6` map path.
 3. The real session map layout, GC behavior, and HA/session-sync semantics stay
    anchored on the unchanged full `sessions_v6` key/value state.
 
@@ -130,9 +131,9 @@ fields that are not changing for the current packet.
 
 Current implementation details:
 
-1. Cache map: per-CPU LRU hash, `4096` entries.
+1. Cache map: per-CPU array of `2048` two-way cache sets (`4096` total slots).
 2. Placement: XDP zone stage, before `sessions_v6` lookup.
-3. Entry lifetime: LRU-managed, with flush-before-replace/delete.
+3. Entry lifetime: set-associative replacement with flush-before-overwrite.
 4. Loader keeps the cache map FD alive via [`loader_ebpf.go`](/home/ps/git/codex-bpfrx/pkg/dataplane/loader_ebpf.go).
 5. Batch threshold is `256` packets, chosen to reduce steady-state session-map pressure while keeping accounting drift bounded.
 6. Cache hits with current-direction IPv6 TCP source rewrite now patch the
@@ -147,7 +148,7 @@ reuse. Adding the cache there avoids duplicating another lookup path in
 ## Risks
 
 1. Batched `last_seen` updates slightly relax session freshness granularity.
-2. Compact-key collisions can increase fallback pressure under adversarial flow mixes.
+2. Compact-key set collisions can increase fallback pressure under adversarial flow mixes.
 3. XDP-only for now; DPDK remains on the old path.
 
 ## Acceptance Criteria
