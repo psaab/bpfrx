@@ -258,6 +258,38 @@ func TestBuildUnsolicitedNA(t *testing.T) {
 	}
 }
 
+func TestProbeIPv6SourcePrefersGlobal(t *testing.T) {
+	addrs := []net.Addr{
+		&net.IPNet{IP: net.ParseIP("fe80::1"), Mask: net.CIDRMask(64, 128)},
+		&net.IPNet{IP: net.ParseIP("2001:db8::10"), Mask: net.CIDRMask(64, 128)},
+	}
+	got := probeIPv6Source(addrs)
+	want := net.ParseIP("2001:db8::10")
+	if got == nil || !got.Equal(want) {
+		t.Fatalf("probeIPv6Source() = %v, want %v", got, want)
+	}
+}
+
+func TestProbeIPv6SourceFallsBackToLinkLocal(t *testing.T) {
+	addrs := []net.Addr{
+		&net.IPNet{IP: net.ParseIP("fe80::1234"), Mask: net.CIDRMask(64, 128)},
+	}
+	got := probeIPv6Source(addrs)
+	want := net.ParseIP("fe80::1234")
+	if got == nil || !got.Equal(want) {
+		t.Fatalf("probeIPv6Source() = %v, want %v", got, want)
+	}
+}
+
+func TestProbeIPv6SourceRejectsIPv4Only(t *testing.T) {
+	addrs := []net.Addr{
+		&net.IPNet{IP: net.ParseIP("10.0.0.1"), Mask: net.CIDRMask(24, 32)},
+	}
+	if got := probeIPv6Source(addrs); got != nil {
+		t.Fatalf("probeIPv6Source() = %v, want nil", got)
+	}
+}
+
 func TestICMPv6Checksum(t *testing.T) {
 	// Build a known packet and verify checksum validates.
 	mac, _ := net.ParseMAC("de:ad:be:ef:00:01")
