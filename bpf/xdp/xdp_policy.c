@@ -1470,6 +1470,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					meta->src_ip.v4 = sess_nat_src_ip;
 					meta->src_port = sess_nat_src_port;
 				}
+				meta->nat_flags = sess_nat_flags;
 
 				TRACE_POLICY(meta, ACTION_PERMIT, rule->rule_id);
 
@@ -1746,6 +1747,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					__builtin_memcpy(meta->src_ip.v6, meta->nat_src_ip.v6, 16);
 					meta->src_port = sess_nat_src_port;
 				}
+				meta->nat_flags = sess_nat_flags;
 
 				if (sess_log & LOG_FLAG_SESSION_INIT)
 					emit_event(meta, EVENT_TYPE_SESSION_OPEN,

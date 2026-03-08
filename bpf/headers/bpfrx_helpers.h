@@ -382,6 +382,147 @@ compute_ph_csum_v6(const __u8 *saddr, const __u8 *daddr,
 	return (__u16)sum;
 }
 
+static __always_inline void
+set_l4_csum_flags(struct pkt_meta *meta, __sum16 l4_csum)
+{
+	meta->csum_partial = 0;
+	meta->l4_csum_saved = 0;
+	if (l4_csum != 0) {
+		__u16 l4_len = meta->pkt_len -
+			       (meta->l4_offset - meta->l3_offset);
+		__u16 ph;
+		if (meta->addr_family == AF_INET)
+			ph = compute_ph_csum_v4(meta->src_ip.v4,
+						meta->dst_ip.v4,
+						meta->protocol,
+						l4_len);
+		else
+			ph = compute_ph_csum_v6(meta->src_ip.v6,
+						meta->dst_ip.v6,
+						meta->protocol,
+						l4_len);
+		if ((__u16)l4_csum == ph)
+			meta->csum_partial = 1;
+	}
+}
+
+/*
+ * Conservative fast path for the common IPv4 TCP/UDP case.
+ * Returns:
+ *   1  packet fully parsed
+ *   0  caller should fall back to the generic parse path
+ *  -1  malformed packet
+ */
+static __always_inline int
+parse_ipv4_l4_fast(void *data, void *data_end, struct pkt_meta *meta)
+{
+	struct iphdr *iph = data + meta->l3_offset;
+	if ((void *)(iph + 1) > data_end)
+		return -1;
+	if (iph->version != 4 || iph->ihl != 5)
+		return 0;
+
+	meta->src_ip.v4 = iph->saddr;
+	meta->dst_ip.v4 = iph->daddr;
+	meta->protocol = iph->protocol;
+	meta->ip_ttl = iph->ttl;
+	meta->dscp = iph->tos >> 2;
+	meta->l4_offset = meta->l3_offset + sizeof(struct iphdr);
+	meta->pkt_len = bpf_ntohs(iph->tot_len);
+	meta->addr_family = AF_INET;
+
+	__u16 frag_off = bpf_ntohs(iph->frag_off);
+	meta->is_fragment = (frag_off & 0x2000) || (frag_off & 0x1FFF);
+	if (meta->is_fragment)
+		return 0;
+
+	void *l4 = data + meta->l4_offset;
+	__sum16 l4_csum = 0;
+
+	if (meta->protocol == PROTO_TCP) {
+		struct tcphdr *tcp = l4;
+		if ((void *)(tcp + 1) > data_end)
+			return -1;
+		meta->src_port = tcp->source;
+		meta->dst_port = tcp->dest;
+		meta->tcp_flags = ((__u8 *)tcp)[13];
+		meta->tcp_seq = tcp->seq;
+		meta->tcp_ack_seq = tcp->ack_seq;
+		meta->payload_offset = meta->l4_offset + tcp->doff * 4;
+		l4_csum = tcp->check;
+	} else if (meta->protocol == PROTO_UDP) {
+		struct udphdr *udp = l4;
+		if ((void *)(udp + 1) > data_end)
+			return -1;
+		meta->src_port = udp->source;
+		meta->dst_port = udp->dest;
+		meta->payload_offset = meta->l4_offset +
+				       sizeof(struct udphdr);
+		l4_csum = udp->check;
+	} else {
+		return 0;
+	}
+
+	set_l4_csum_flags(meta, l4_csum);
+	return 1;
+}
+
+/*
+ * Conservative fast path for the common IPv6 TCP/UDP case with no
+ * extension headers. Falls back for any extension-header packet.
+ */
+static __always_inline int
+parse_ipv6_l4_fast(void *data, void *data_end, struct pkt_meta *meta)
+{
+	struct ipv6hdr *ip6h = data + meta->l3_offset;
+	if ((void *)(ip6h + 1) > data_end)
+		return -1;
+	if (ip6h->version != 6)
+		return -1;
+
+	__u8 nexthdr = ip6h->nexthdr;
+	if (nexthdr != PROTO_TCP && nexthdr != PROTO_UDP)
+		return 0;
+
+	__builtin_memcpy(meta->src_ip.v6, &ip6h->saddr, 16);
+	__builtin_memcpy(meta->dst_ip.v6, &ip6h->daddr, 16);
+	meta->protocol = nexthdr;
+	meta->ip_ttl = ip6h->hop_limit;
+	meta->dscp = (ip6h->priority << 2) | (ip6h->flow_lbl[0] >> 6);
+	meta->pkt_len = bpf_ntohs(ip6h->payload_len) + sizeof(struct ipv6hdr);
+	meta->addr_family = AF_INET6;
+	meta->is_fragment = 0;
+	meta->l4_offset = meta->l3_offset + sizeof(struct ipv6hdr);
+
+	void *l4 = data + meta->l4_offset;
+	__sum16 l4_csum = 0;
+
+	if (nexthdr == PROTO_TCP) {
+		struct tcphdr *tcp = l4;
+		if ((void *)(tcp + 1) > data_end)
+			return -1;
+		meta->src_port = tcp->source;
+		meta->dst_port = tcp->dest;
+		meta->tcp_flags = ((__u8 *)tcp)[13];
+		meta->tcp_seq = tcp->seq;
+		meta->tcp_ack_seq = tcp->ack_seq;
+		meta->payload_offset = meta->l4_offset + tcp->doff * 4;
+		l4_csum = tcp->check;
+	} else {
+		struct udphdr *udp = l4;
+		if ((void *)(udp + 1) > data_end)
+			return -1;
+		meta->src_port = udp->source;
+		meta->dst_port = udp->dest;
+		meta->payload_offset = meta->l4_offset +
+				       sizeof(struct udphdr);
+		l4_csum = udp->check;
+	}
+
+	set_l4_csum_flags(meta, l4_csum);
+	return 1;
+}
+
 /*
  * Optional CHECKSUM_PARTIAL resolution for IPv6.
  *
@@ -656,25 +797,7 @@ parse_l4hdr(void *data, void *data_end, struct pkt_meta *meta)
 	 * retained as a helper, but eager detection keeps forwarding
 	 * behavior correct across all packet paths.
 	 */
-	meta->csum_partial = 0;
-	meta->l4_csum_saved = 0;
-	if (l4_csum != 0) {
-		__u16 l4_len = meta->pkt_len -
-			       (meta->l4_offset - meta->l3_offset);
-		__u16 ph;
-		if (meta->addr_family == AF_INET)
-			ph = compute_ph_csum_v4(meta->src_ip.v4,
-						meta->dst_ip.v4,
-						meta->protocol,
-						l4_len);
-		else
-			ph = compute_ph_csum_v6(meta->src_ip.v6,
-						meta->dst_ip.v6,
-						meta->protocol,
-						l4_len);
-		if ((__u16)l4_csum == ph)
-			meta->csum_partial = 1;
-	}
+	set_l4_csum_flags(meta, l4_csum);
 
 	return 0;
 }
