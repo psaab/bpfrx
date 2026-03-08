@@ -667,6 +667,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			tableID := ifaceTableID[ifaceRef] // 0 if not in any routing instance
 			var izFlags uint8
 			var rgID uint8
+			var screenFlags uint32
 			if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
 				if ifCfg.Tunnel != nil {
 					izFlags |= IfaceFlagTunnel
@@ -679,7 +680,18 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 					rgID = uint8(ifCfg.RedundancyGroup)
 				}
 			}
-			if err := dp.SetZone(physIface.Index, uint16(vlanID), zid, tableID, izFlags, rgID); err != nil {
+			if zone.ScreenProfile != "" {
+				profile, ok := cfg.Security.Screen[zone.ScreenProfile]
+				if !ok {
+					return fmt.Errorf("screen profile %q not found for zone %q",
+						zone.ScreenProfile, name)
+				}
+				screenFlags = buildScreenConfig(
+					profile,
+					cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie",
+				).Flags
+			}
+			if err := dp.SetZone(physIface.Index, uint16(vlanID), zid, tableID, izFlags, rgID, screenFlags); err != nil {
 				return fmt.Errorf("set zone for %s vlan %d (ifindex %d): %w",
 					physName, vlanID, physIface.Index, err)
 			}
@@ -2960,93 +2972,10 @@ func compileScreenProfiles(dp DataPlane, cfg *config.Config, result *CompileResu
 			continue
 		}
 
-		var flags uint32
-		var sc ScreenConfig
-
-		// TCP flags
-		if profile.TCP.Land {
-			flags |= ScreenLandAttack
-		}
-		if profile.TCP.SynFin {
-			flags |= ScreenTCPSynFin
-		}
-		if profile.TCP.NoFlag {
-			flags |= ScreenTCPNoFlag
-		}
-		if profile.TCP.FinNoAck {
-			flags |= ScreenTCPFinNoAck
-		}
-		if profile.TCP.WinNuke {
-			flags |= ScreenWinNuke
-		}
-		if profile.TCP.SynFrag {
-			flags |= ScreenSynFrag
-		}
-		// IP flags (early, before IP section for co-location with related checks)
-		if profile.IP.TearDrop {
-			flags |= ScreenTearDrop
-		}
-		if profile.TCP.SynFlood != nil && profile.TCP.SynFlood.AttackThreshold > 0 {
-			flags |= ScreenSynFlood
-			sc.SynFloodThresh = uint32(profile.TCP.SynFlood.AttackThreshold)
-			if profile.TCP.SynFlood.SourceThreshold > 0 {
-				sc.SynFloodSrcThresh = uint32(profile.TCP.SynFlood.SourceThreshold)
-			}
-			if profile.TCP.SynFlood.DestinationThreshold > 0 {
-				sc.SynFloodDstThresh = uint32(profile.TCP.SynFlood.DestinationThreshold)
-			}
-			if profile.TCP.SynFlood.Timeout > 0 {
-				sc.SynFloodTimeout = uint32(profile.TCP.SynFlood.Timeout)
-			}
-			// Enable SYN cookie mode when configured in flow settings
-			if cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie" {
-				flags |= ScreenSynCookie
-			}
-		}
-
-		// ICMP flags
-		if profile.ICMP.PingDeath {
-			flags |= ScreenPingOfDeath
-		}
-		if profile.ICMP.FloodThreshold > 0 {
-			flags |= ScreenICMPFlood
-			sc.ICMPFloodThresh = uint32(profile.ICMP.FloodThreshold)
-		}
-
-		// IP flags
-		if profile.IP.SourceRouteOption {
-			flags |= ScreenIPSourceRoute
-		}
-
-		// UDP flags
-		if profile.UDP.FloodThreshold > 0 {
-			flags |= ScreenUDPFlood
-			sc.UDPFloodThresh = uint32(profile.UDP.FloodThreshold)
-		}
-
-		// Port scan detection
-		if profile.TCP.PortScanThreshold > 0 {
-			flags |= ScreenPortScan
-			sc.PortScanThresh = uint32(profile.TCP.PortScanThreshold)
-		}
-
-		// IP sweep detection
-		if profile.IP.IPSweepThreshold > 0 {
-			flags |= ScreenIPSweep
-			sc.IPSweepThresh = uint32(profile.IP.IPSweepThreshold)
-		}
-
-		// Per-IP session limiting
-		if profile.LimitSession.SourceIPBased > 0 {
-			flags |= ScreenSessionLimitSrc
-			sc.SessionLimitSrc = uint32(profile.LimitSession.SourceIPBased)
-		}
-		if profile.LimitSession.DestinationIPBased > 0 {
-			flags |= ScreenSessionLimitDst
-			sc.SessionLimitDst = uint32(profile.LimitSession.DestinationIPBased)
-		}
-
-		sc.Flags = flags
+		sc := buildScreenConfig(
+			profile,
+			cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie",
+		)
 
 		if err := dp.SetScreenConfig(uint32(sid), sc); err != nil {
 			return fmt.Errorf("set screen config %s (id=%d): %w", name, sid, err)
@@ -3057,7 +2986,7 @@ func compileScreenProfiles(dp DataPlane, cfg *config.Config, result *CompileResu
 
 		slog.Info("screen profile compiled",
 			"name", name, "id", sid,
-			"flags", fmt.Sprintf("0x%x", flags),
+			"flags", fmt.Sprintf("0x%x", sc.Flags),
 			"syn_thresh", sc.SynFloodThresh,
 			"icmp_thresh", sc.ICMPFloodThresh,
 			"udp_thresh", sc.UDPFloodThresh)
@@ -3067,6 +2996,84 @@ func compileScreenProfiles(dp DataPlane, cfg *config.Config, result *CompileResu
 	dp.ZeroStaleScreenConfigs(maxScreenID)
 
 	return nil
+}
+
+func buildScreenConfig(profile *config.ScreenProfile, synCookie bool) ScreenConfig {
+	var sc ScreenConfig
+
+	if profile == nil {
+		return sc
+	}
+
+	if profile.TCP.Land {
+		sc.Flags |= ScreenLandAttack
+	}
+	if profile.TCP.SynFin {
+		sc.Flags |= ScreenTCPSynFin
+	}
+	if profile.TCP.NoFlag {
+		sc.Flags |= ScreenTCPNoFlag
+	}
+	if profile.TCP.FinNoAck {
+		sc.Flags |= ScreenTCPFinNoAck
+	}
+	if profile.TCP.WinNuke {
+		sc.Flags |= ScreenWinNuke
+	}
+	if profile.TCP.SynFrag {
+		sc.Flags |= ScreenSynFrag
+	}
+	if profile.IP.TearDrop {
+		sc.Flags |= ScreenTearDrop
+	}
+	if profile.TCP.SynFlood != nil && profile.TCP.SynFlood.AttackThreshold > 0 {
+		sc.Flags |= ScreenSynFlood
+		sc.SynFloodThresh = uint32(profile.TCP.SynFlood.AttackThreshold)
+		if profile.TCP.SynFlood.SourceThreshold > 0 {
+			sc.SynFloodSrcThresh = uint32(profile.TCP.SynFlood.SourceThreshold)
+		}
+		if profile.TCP.SynFlood.DestinationThreshold > 0 {
+			sc.SynFloodDstThresh = uint32(profile.TCP.SynFlood.DestinationThreshold)
+		}
+		if profile.TCP.SynFlood.Timeout > 0 {
+			sc.SynFloodTimeout = uint32(profile.TCP.SynFlood.Timeout)
+		}
+		if synCookie {
+			sc.Flags |= ScreenSynCookie
+		}
+	}
+	if profile.ICMP.PingDeath {
+		sc.Flags |= ScreenPingOfDeath
+	}
+	if profile.ICMP.FloodThreshold > 0 {
+		sc.Flags |= ScreenICMPFlood
+		sc.ICMPFloodThresh = uint32(profile.ICMP.FloodThreshold)
+	}
+	if profile.IP.SourceRouteOption {
+		sc.Flags |= ScreenIPSourceRoute
+	}
+	if profile.UDP.FloodThreshold > 0 {
+		sc.Flags |= ScreenUDPFlood
+		sc.UDPFloodThresh = uint32(profile.UDP.FloodThreshold)
+	}
+	if profile.TCP.PortScanThreshold > 0 {
+		sc.Flags |= ScreenPortScan
+		sc.PortScanThresh = uint32(profile.TCP.PortScanThreshold)
+	}
+	if profile.IP.IPSweepThreshold > 0 {
+		sc.Flags |= ScreenIPSweep
+		sc.IPSweepThresh = uint32(profile.IP.IPSweepThreshold)
+	}
+	if profile.LimitSession.SourceIPBased > 0 {
+		sc.Flags |= ScreenSessionLimitSrc
+		sc.SessionLimitSrc = uint32(profile.LimitSession.SourceIPBased)
+	}
+	if profile.LimitSession.DestinationIPBased > 0 {
+		sc.Flags |= ScreenSessionLimitDst
+		sc.SessionLimitDst = uint32(profile.LimitSession.DestinationIPBased)
+	}
+
+	return sc
 }
 
 func compileDefaultPolicy(dp DataPlane, cfg *config.Config) error {

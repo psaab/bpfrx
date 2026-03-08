@@ -66,6 +66,7 @@ struct iface_zone_value {
 	uint8_t  flags;
 	uint8_t  rg_id;           /* redundancy group ID (0 = standalone) */
 	uint32_t routing_table;
+	uint32_t screen_flags;    /* precomputed screen_config.flags for ingress fast-path */
 };
 
 #define MAX_REDUNDANCY_GROUPS 16

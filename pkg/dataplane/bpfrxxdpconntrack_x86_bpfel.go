@@ -212,6 +212,7 @@ type bpfrxXdpConntrackIfaceZoneValue struct {
 	Flags        uint8
 	RgId         uint8
 	RoutingTable uint32
+	ScreenFlags  uint32
 }
 
 type bpfrxXdpConntrackLpmKeyV4 struct {

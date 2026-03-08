@@ -212,6 +212,7 @@ type bpfrxXdpNat64IfaceZoneValue struct {
 	Flags        uint8
 	RgId         uint8
 	RoutingTable uint32
+	ScreenFlags  uint32
 }
 
 type bpfrxXdpNat64LpmKeyV4 struct {
