@@ -19,7 +19,13 @@ func TestFormatStatusSummary(t *testing.T) {
 		InterfaceAddresses:     6,
 		NeighborEntries:        9,
 		RouteEntries:           4,
-		WorkerHeartbeats:       []time.Time{now.Add(-500 * time.Millisecond), now.Add(-700 * time.Millisecond)},
+		LastResolution: &PacketResolution{
+			Disposition:   "forward_candidate",
+			EgressIfindex: 11,
+			NextHop:       "172.16.50.1",
+			NeighborMAC:   "00:10:db:ff:10:01",
+		},
+		WorkerHeartbeats: []time.Time{now.Add(-500 * time.Millisecond), now.Add(-700 * time.Millisecond)},
 		Queues: []QueueStatus{
 			{QueueID: 0, Ready: true},
 			{QueueID: 1, Ready: false},
@@ -41,6 +47,7 @@ func TestFormatStatusSummary(t *testing.T) {
 		"Interface addresses:       6",
 		"Neighbor entries:          9",
 		"Route entries:             4",
+		"Last resolution:           forward_candidate egress-ifindex=11 next-hop=172.16.50.1 mac=00:10:db:ff:10:01",
 		"Bound bindings:            2/2",
 		"XSK-registered bindings:   1/2",
 		"Ready queues:              1/2",

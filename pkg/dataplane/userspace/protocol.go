@@ -115,6 +115,15 @@ type ProcessStatus struct {
 	Queues                 []QueueStatus     `json:"queues,omitempty"`
 	Bindings               []BindingStatus   `json:"bindings,omitempty"`
 	RecentExceptions       []ExceptionStatus `json:"recent_exceptions,omitempty"`
+	LastResolution         *PacketResolution `json:"last_resolution,omitempty"`
+}
+
+type PacketResolution struct {
+	Disposition   string `json:"disposition"`
+	LocalIfindex  int    `json:"local_ifindex,omitempty"`
+	EgressIfindex int    `json:"egress_ifindex,omitempty"`
+	NextHop       string `json:"next_hop,omitempty"`
+	NeighborMAC   string `json:"neighbor_mac,omitempty"`
 }
 
 type QueueControlRequest struct {

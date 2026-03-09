@@ -180,6 +180,8 @@ struct ProcessStatus {
     bindings: Vec<BindingStatus>,
     #[serde(rename = "recent_exceptions", default)]
     recent_exceptions: Vec<ExceptionStatus>,
+    #[serde(rename = "last_resolution", skip_serializing_if = "Option::is_none")]
+    last_resolution: Option<PacketResolution>,
     #[serde(rename = "debug_worker_threads", default)]
     debug_worker_threads: usize,
     #[serde(rename = "debug_identity_slots", default)]
@@ -203,6 +205,19 @@ struct ControlResponse {
     error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<ProcessStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct PacketResolution {
+    disposition: String,
+    #[serde(rename = "local_ifindex", default)]
+    local_ifindex: i32,
+    #[serde(rename = "egress_ifindex", default)]
+    egress_ifindex: i32,
+    #[serde(rename = "next_hop", default)]
+    next_hop: String,
+    #[serde(rename = "neighbor_mac", default)]
+    neighbor_mac: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -410,6 +425,7 @@ fn run() -> Result<(), String> {
             queues: Vec::new(),
             bindings: Vec::new(),
             recent_exceptions: Vec::new(),
+            last_resolution: None,
             debug_worker_threads: 0,
             debug_identity_slots: 0,
             debug_live_slots: 0,
@@ -690,6 +706,7 @@ fn refresh_status(state: &mut ServerState) {
         .any(|b| b.registered && b.ready);
     state.status.queues = summarize_queues(&state.status.bindings);
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
+    state.status.last_resolution = state.afxdp.last_resolution();
 }
 
 fn replan_queues(

@@ -56,6 +56,22 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  Interface addresses:       %d\n", status.InterfaceAddresses)
 	fmt.Fprintf(&b, "  Neighbor entries:          %d\n", status.NeighborEntries)
 	fmt.Fprintf(&b, "  Route entries:             %d\n", status.RouteEntries)
+	if status.LastResolution != nil {
+		fmt.Fprintf(&b, "  Last resolution:           %s", status.LastResolution.Disposition)
+		if status.LastResolution.LocalIfindex > 0 {
+			fmt.Fprintf(&b, " local-ifindex=%d", status.LastResolution.LocalIfindex)
+		}
+		if status.LastResolution.EgressIfindex > 0 {
+			fmt.Fprintf(&b, " egress-ifindex=%d", status.LastResolution.EgressIfindex)
+		}
+		if status.LastResolution.NextHop != "" {
+			fmt.Fprintf(&b, " next-hop=%s", status.LastResolution.NextHop)
+		}
+		if status.LastResolution.NeighborMAC != "" {
+			fmt.Fprintf(&b, " mac=%s", status.LastResolution.NeighborMAC)
+		}
+		fmt.Fprintln(&b)
+	}
 	fmt.Fprintf(&b, "  Bound bindings:            %d/%d\n", boundBindings, len(status.Bindings))
 	fmt.Fprintf(&b, "  XSK-registered bindings:   %d/%d\n", xskBindings, len(status.Bindings))
 	fmt.Fprintf(&b, "  Ready queues:              %d/%d\n", readyQueues, len(status.Queues))

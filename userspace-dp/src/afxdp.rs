@@ -1,4 +1,6 @@
-use super::{BindingStatus, ConfigSnapshot, ExceptionStatus, InjectPacketRequest};
+use super::{
+    BindingStatus, ConfigSnapshot, ExceptionStatus, InjectPacketRequest, PacketResolution,
+};
 use chrono::Utc;
 use core::ffi::{c_int, c_void};
 use core::num::NonZeroU32;
@@ -58,6 +60,7 @@ pub struct Coordinator {
     workers: BTreeMap<u32, WorkerHandle>,
     forwarding: ForwardingState,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    last_resolution: Arc<Mutex<Option<PacketResolution>>>,
     validation: ValidationState,
     last_planned_workers: usize,
     last_planned_bindings: usize,
@@ -74,6 +77,7 @@ impl Coordinator {
             workers: BTreeMap::new(),
             forwarding: ForwardingState::default(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
+            last_resolution: Arc::new(Mutex::new(None)),
             validation: ValidationState::default(),
             last_planned_workers: 0,
             last_planned_bindings: 0,
@@ -103,6 +107,9 @@ impl Coordinator {
         self.forwarding = ForwardingState::default();
         if let Ok(mut recent) = self.recent_exceptions.lock() {
             recent.clear();
+        }
+        if let Ok(mut last) = self.last_resolution.lock() {
+            *last = None;
         }
         self.validation = ValidationState::default();
         self.last_planned_workers = 0;
@@ -226,6 +233,7 @@ impl Coordinator {
             let stop = Arc::new(AtomicBool::new(false));
             let heartbeat = Arc::new(AtomicI64::new(now_nanos()));
             let recent_exceptions = self.recent_exceptions.clone();
+            let last_resolution = self.last_resolution.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
             let validation = self.validation;
@@ -239,6 +247,7 @@ impl Coordinator {
                         validation,
                         forwarding,
                         recent_exceptions,
+                        last_resolution,
                         stop_clone,
                         heartbeat_clone,
                     );
@@ -291,6 +300,13 @@ impl Coordinator {
             .lock()
             .map(|recent| recent.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    pub fn last_resolution(&self) -> Option<PacketResolution> {
+        self.last_resolution
+            .lock()
+            .ok()
+            .and_then(|last| last.clone())
     }
 
     pub fn worker_heartbeats(&self) -> Vec<chrono::DateTime<Utc>> {
@@ -365,10 +381,11 @@ impl Coordinator {
                     record_forwarding_disposition(
                         &ident,
                         live,
-                        lookup_forwarding_for_ip(&self.forwarding, dst),
+                        lookup_forwarding_resolution(&self.forwarding, dst),
                         packet_length,
                         Some(meta),
                         &self.recent_exceptions,
+                        &self.last_resolution,
                     );
                 } else {
                     record_exception(
@@ -542,6 +559,35 @@ enum ForwardingDisposition {
     NextTableUnsupported,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForwardingResolution {
+    disposition: ForwardingDisposition,
+    local_ifindex: i32,
+    egress_ifindex: i32,
+    next_hop: Option<IpAddr>,
+    neighbor_mac: Option<[u8; 6]>,
+}
+
+impl ForwardingResolution {
+    fn status(self) -> PacketResolution {
+        PacketResolution {
+            disposition: match self.disposition {
+                ForwardingDisposition::LocalDelivery => "local_delivery",
+                ForwardingDisposition::ForwardCandidate => "forward_candidate",
+                ForwardingDisposition::NoRoute => "no_route",
+                ForwardingDisposition::MissingNeighbor => "missing_neighbor",
+                ForwardingDisposition::DiscardRoute => "discard_route",
+                ForwardingDisposition::NextTableUnsupported => "next_table_unsupported",
+            }
+            .to_string(),
+            local_ifindex: self.local_ifindex,
+            egress_ifindex: self.egress_ifindex,
+            next_hop: self.next_hop.map(|ip| ip.to_string()).unwrap_or_default(),
+            neighbor_mac: self.neighbor_mac.map(format_mac).unwrap_or_default(),
+        }
+    }
+}
+
 struct BindingWorker {
     slot: u32,
     queue_id: u32,
@@ -640,6 +686,7 @@ fn poll_binding(
     validation: ValidationState,
     forwarding: &ForwardingState,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
     poll_stats: bool,
 ) -> bool {
     let ident = binding.identity();
@@ -680,10 +727,11 @@ fn poll_binding(
                 record_forwarding_disposition(
                     &ident,
                     &binding.live,
-                    classify_forwarding(&binding.area, desc, meta, forwarding),
+                    resolve_forwarding(&binding.area, desc, meta, forwarding),
                     desc.len as u32,
                     Some(meta),
                     recent_exceptions,
+                    last_resolution,
                 );
             }
         } else {
@@ -815,12 +863,16 @@ fn record_disposition(
 fn record_forwarding_disposition(
     binding: &BindingIdentity,
     live: &BindingLiveState,
-    disposition: ForwardingDisposition,
+    resolution: ForwardingResolution,
     packet_length: u32,
     meta: Option<UserspaceDpMeta>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
 ) {
-    match disposition {
+    if let Ok(mut last) = last_resolution.lock() {
+        *last = Some(resolution.status());
+    }
+    match resolution.disposition {
         ForwardingDisposition::LocalDelivery => {
             live.local_delivery_packets.fetch_add(1, Ordering::Relaxed);
         }
@@ -871,6 +923,7 @@ fn worker_loop(
     validation: ValidationState,
     forwarding: Arc<ForwardingState>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    last_resolution: Arc<Mutex<Option<PacketResolution>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicI64>,
 ) {
@@ -898,6 +951,7 @@ fn worker_loop(
                 validation,
                 &forwarding,
                 &recent_exceptions,
+                &last_resolution,
                 poll_stats,
             ) {
                 did_work = true;
@@ -1226,6 +1280,13 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     Some(out)
 }
 
+fn format_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
 fn parse_packet_destination(
     area: &MmapArea,
     desc: XdpDesc,
@@ -1259,23 +1320,45 @@ fn parse_packet_destination(
     }
 }
 
-fn classify_forwarding(
+fn resolve_forwarding(
     area: &MmapArea,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     state: &ForwardingState,
-) -> ForwardingDisposition {
+) -> ForwardingResolution {
     let Some(dst) = parse_packet_destination(area, desc, meta) else {
-        return ForwardingDisposition::NoRoute;
+        return ForwardingResolution {
+            disposition: ForwardingDisposition::NoRoute,
+            local_ifindex: 0,
+            egress_ifindex: 0,
+            next_hop: None,
+            neighbor_mac: None,
+        };
     };
-    lookup_forwarding_for_ip(state, dst)
+    lookup_forwarding_resolution(state, dst)
 }
 
 fn lookup_forwarding_for_ip(state: &ForwardingState, dst: IpAddr) -> ForwardingDisposition {
+    lookup_forwarding_resolution(state, dst).disposition
+}
+
+fn lookup_forwarding_resolution(state: &ForwardingState, dst: IpAddr) -> ForwardingResolution {
     match dst {
         IpAddr::V4(ip) => {
             if state.local_v4.contains(&ip) {
-                return ForwardingDisposition::LocalDelivery;
+                let local_ifindex = state
+                    .connected_v4
+                    .iter()
+                    .find(|entry| entry.prefix.addr() == ip)
+                    .map(|entry| entry.ifindex)
+                    .unwrap_or(0);
+                return ForwardingResolution {
+                    disposition: ForwardingDisposition::LocalDelivery,
+                    local_ifindex,
+                    egress_ifindex: local_ifindex,
+                    next_hop: None,
+                    neighbor_mac: None,
+                };
             }
             let static_match = state
                 .routes_v4
@@ -1287,10 +1370,17 @@ fn lookup_forwarding_for_ip(state: &ForwardingState, dst: IpAddr) -> ForwardingD
                 .find(|entry| entry.prefix.contains(&ip));
             match choose_v4_route(static_match, connected_match) {
                 Some(ResolvedRouteV4::Connected { ifindex }) => {
-                    if state.neighbors.contains_key(&(ifindex, IpAddr::V4(ip))) {
-                        ForwardingDisposition::ForwardCandidate
-                    } else {
-                        ForwardingDisposition::MissingNeighbor
+                    let neighbor = state.neighbors.get(&(ifindex, IpAddr::V4(ip)));
+                    ForwardingResolution {
+                        disposition: if neighbor.is_some() {
+                            ForwardingDisposition::ForwardCandidate
+                        } else {
+                            ForwardingDisposition::MissingNeighbor
+                        },
+                        local_ifindex: 0,
+                        egress_ifindex: ifindex,
+                        next_hop: Some(IpAddr::V4(ip)),
+                        neighbor_mac: neighbor.map(|entry| entry.mac),
                     }
                 }
                 Some(ResolvedRouteV4::Static {
@@ -1300,27 +1390,70 @@ fn lookup_forwarding_for_ip(state: &ForwardingState, dst: IpAddr) -> ForwardingD
                     next_table,
                 }) => {
                     if discard {
-                        return ForwardingDisposition::DiscardRoute;
+                        return ForwardingResolution {
+                            disposition: ForwardingDisposition::DiscardRoute,
+                            local_ifindex: 0,
+                            egress_ifindex: ifindex,
+                            next_hop: next_hop.map(IpAddr::V4),
+                            neighbor_mac: None,
+                        };
                     }
                     if next_table {
-                        return ForwardingDisposition::NextTableUnsupported;
+                        return ForwardingResolution {
+                            disposition: ForwardingDisposition::NextTableUnsupported,
+                            local_ifindex: 0,
+                            egress_ifindex: ifindex,
+                            next_hop: next_hop.map(IpAddr::V4),
+                            neighbor_mac: None,
+                        };
                     }
                     if ifindex <= 0 {
-                        return ForwardingDisposition::NoRoute;
+                        return ForwardingResolution {
+                            disposition: ForwardingDisposition::NoRoute,
+                            local_ifindex: 0,
+                            egress_ifindex: 0,
+                            next_hop: next_hop.map(IpAddr::V4),
+                            neighbor_mac: None,
+                        };
                     }
                     let target = next_hop.unwrap_or(ip);
-                    if state.neighbors.contains_key(&(ifindex, IpAddr::V4(target))) {
-                        ForwardingDisposition::ForwardCandidate
-                    } else {
-                        ForwardingDisposition::MissingNeighbor
+                    let neighbor = state.neighbors.get(&(ifindex, IpAddr::V4(target)));
+                    ForwardingResolution {
+                        disposition: if neighbor.is_some() {
+                            ForwardingDisposition::ForwardCandidate
+                        } else {
+                            ForwardingDisposition::MissingNeighbor
+                        },
+                        local_ifindex: 0,
+                        egress_ifindex: ifindex,
+                        next_hop: Some(IpAddr::V4(target)),
+                        neighbor_mac: neighbor.map(|entry| entry.mac),
                     }
                 }
-                None => ForwardingDisposition::NoRoute,
+                None => ForwardingResolution {
+                    disposition: ForwardingDisposition::NoRoute,
+                    local_ifindex: 0,
+                    egress_ifindex: 0,
+                    next_hop: None,
+                    neighbor_mac: None,
+                },
             }
         }
         IpAddr::V6(ip) => {
             if state.local_v6.contains(&ip) {
-                return ForwardingDisposition::LocalDelivery;
+                let local_ifindex = state
+                    .connected_v6
+                    .iter()
+                    .find(|entry| entry.prefix.addr() == ip)
+                    .map(|entry| entry.ifindex)
+                    .unwrap_or(0);
+                return ForwardingResolution {
+                    disposition: ForwardingDisposition::LocalDelivery,
+                    local_ifindex,
+                    egress_ifindex: local_ifindex,
+                    next_hop: None,
+                    neighbor_mac: None,
+                };
             }
             let static_match = state
                 .routes_v6
@@ -1332,10 +1465,17 @@ fn lookup_forwarding_for_ip(state: &ForwardingState, dst: IpAddr) -> ForwardingD
                 .find(|entry| entry.prefix.contains(&ip));
             match choose_v6_route(static_match, connected_match) {
                 Some(ResolvedRouteV6::Connected { ifindex }) => {
-                    if state.neighbors.contains_key(&(ifindex, IpAddr::V6(ip))) {
-                        ForwardingDisposition::ForwardCandidate
-                    } else {
-                        ForwardingDisposition::MissingNeighbor
+                    let neighbor = state.neighbors.get(&(ifindex, IpAddr::V6(ip)));
+                    ForwardingResolution {
+                        disposition: if neighbor.is_some() {
+                            ForwardingDisposition::ForwardCandidate
+                        } else {
+                            ForwardingDisposition::MissingNeighbor
+                        },
+                        local_ifindex: 0,
+                        egress_ifindex: ifindex,
+                        next_hop: Some(IpAddr::V6(ip)),
+                        neighbor_mac: neighbor.map(|entry| entry.mac),
                     }
                 }
                 Some(ResolvedRouteV6::Static {
@@ -1345,22 +1485,53 @@ fn lookup_forwarding_for_ip(state: &ForwardingState, dst: IpAddr) -> ForwardingD
                     next_table,
                 }) => {
                     if discard {
-                        return ForwardingDisposition::DiscardRoute;
+                        return ForwardingResolution {
+                            disposition: ForwardingDisposition::DiscardRoute,
+                            local_ifindex: 0,
+                            egress_ifindex: ifindex,
+                            next_hop: next_hop.map(IpAddr::V6),
+                            neighbor_mac: None,
+                        };
                     }
                     if next_table {
-                        return ForwardingDisposition::NextTableUnsupported;
+                        return ForwardingResolution {
+                            disposition: ForwardingDisposition::NextTableUnsupported,
+                            local_ifindex: 0,
+                            egress_ifindex: ifindex,
+                            next_hop: next_hop.map(IpAddr::V6),
+                            neighbor_mac: None,
+                        };
                     }
                     if ifindex <= 0 {
-                        return ForwardingDisposition::NoRoute;
+                        return ForwardingResolution {
+                            disposition: ForwardingDisposition::NoRoute,
+                            local_ifindex: 0,
+                            egress_ifindex: 0,
+                            next_hop: next_hop.map(IpAddr::V6),
+                            neighbor_mac: None,
+                        };
                     }
                     let target = next_hop.unwrap_or(ip);
-                    if state.neighbors.contains_key(&(ifindex, IpAddr::V6(target))) {
-                        ForwardingDisposition::ForwardCandidate
-                    } else {
-                        ForwardingDisposition::MissingNeighbor
+                    let neighbor = state.neighbors.get(&(ifindex, IpAddr::V6(target)));
+                    ForwardingResolution {
+                        disposition: if neighbor.is_some() {
+                            ForwardingDisposition::ForwardCandidate
+                        } else {
+                            ForwardingDisposition::MissingNeighbor
+                        },
+                        local_ifindex: 0,
+                        egress_ifindex: ifindex,
+                        next_hop: Some(IpAddr::V6(target)),
+                        neighbor_mac: neighbor.map(|entry| entry.mac),
                     }
                 }
-                None => ForwardingDisposition::NoRoute,
+                None => ForwardingResolution {
+                    disposition: ForwardingDisposition::NoRoute,
+                    local_ifindex: 0,
+                    egress_ifindex: 0,
+                    next_hop: None,
+                    neighbor_mac: None,
+                },
             }
         }
     }
@@ -1854,6 +2025,25 @@ mod tests {
         assert_eq!(
             lookup_forwarding_for_ip(&missing_neighbor, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),),
             ForwardingDisposition::MissingNeighbor
+        );
+    }
+
+    #[test]
+    fn forwarding_resolution_reports_egress_and_neighbor() {
+        let state = build_forwarding_state(&forwarding_snapshot(true));
+        let resolved = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.egress_ifindex, 12);
+        assert_eq!(
+            resolved.next_hop,
+            Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1)))
+        );
+        assert_eq!(
+            resolved.neighbor_mac,
+            Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
         );
     }
 }
