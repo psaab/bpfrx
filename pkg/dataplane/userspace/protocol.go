@@ -117,6 +117,9 @@ type ProcessStatus struct {
 	RingEntries            int                   `json:"ring_entries"`
 	HelperMode             string                `json:"helper_mode"`
 	IOUringPlanned         bool                  `json:"io_uring_planned"`
+	IOUringActive          bool                  `json:"io_uring_active,omitempty"`
+	IOUringMode            string                `json:"io_uring_mode,omitempty"`
+	IOUringLastError       string                `json:"io_uring_last_error,omitempty"`
 	Enabled                bool                  `json:"enabled"`
 	ForwardingArmed        bool                  `json:"forwarding_armed,omitempty"`
 	Capabilities           UserspaceCapabilities `json:"capabilities"`

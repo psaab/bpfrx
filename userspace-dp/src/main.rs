@@ -1,4 +1,5 @@
 mod afxdp;
+mod state_writer;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use state_writer::StateWriter;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct SnapshotSummary {
@@ -182,6 +185,12 @@ struct ProcessStatus {
     helper_mode: String,
     #[serde(rename = "io_uring_planned")]
     io_uring_planned: bool,
+    #[serde(rename = "io_uring_active", default)]
+    io_uring_active: bool,
+    #[serde(rename = "io_uring_mode", default)]
+    io_uring_mode: String,
+    #[serde(rename = "io_uring_last_error", default)]
+    io_uring_last_error: String,
     #[serde(default)]
     enabled: bool,
     #[serde(rename = "forwarding_armed", default)]
@@ -426,6 +435,7 @@ struct ServerState {
     status: ProcessStatus,
     snapshot: Option<ConfigSnapshot>,
     afxdp: afxdp::Coordinator,
+    state_writer: Arc<StateWriter>,
 }
 
 fn main() {
@@ -451,6 +461,7 @@ fn run() -> Result<(), String> {
         .set_nonblocking(true)
         .map_err(|e| format!("set nonblocking listener: {e}"))?;
 
+    let state_writer = Arc::new(StateWriter::new());
     let running = Arc::new(AtomicBool::new(true));
     let state = Arc::new(Mutex::new(ServerState {
         status: ProcessStatus {
@@ -462,6 +473,9 @@ fn run() -> Result<(), String> {
             ring_entries: args.ring_entries,
             helper_mode: "rust-afxdp-bootstrap".to_string(),
             io_uring_planned: true,
+            io_uring_active: false,
+            io_uring_mode: String::new(),
+            io_uring_last_error: String::new(),
             enabled: false,
             forwarding_armed: false,
             capabilities: UserspaceCapabilities::default(),
@@ -486,6 +500,7 @@ fn run() -> Result<(), String> {
         },
         snapshot: None,
         afxdp: afxdp::Coordinator::new(),
+        state_writer: state_writer.clone(),
     }));
 
     {
@@ -752,6 +767,10 @@ fn handle_stream(
 
 fn refresh_status(state: &mut ServerState) {
     state.afxdp.refresh_bindings(&mut state.status.bindings);
+    let writer_status = state.state_writer.status();
+    state.status.io_uring_active = writer_status.active;
+    state.status.io_uring_mode = writer_status.mode;
+    state.status.io_uring_last_error = writer_status.last_error;
     state.status.interface_addresses = state
         .snapshot
         .as_ref()
@@ -972,7 +991,11 @@ fn write_state(state_file: &str, state: &Arc<Mutex<ServerState>>) -> Result<(), 
         snapshot: &guard.snapshot,
     };
     let data = serde_json::to_vec_pretty(&payload).map_err(|e| format!("encode state: {e}"))?;
-    fs::write(state_file, [data, vec![b'\n']].concat())
+    let mut bytes = data;
+    bytes.push(b'\n');
+    guard
+        .state_writer
+        .persist(state_file, bytes)
         .map_err(|e| format!("write state file: {e}"))?;
     Ok(())
 }

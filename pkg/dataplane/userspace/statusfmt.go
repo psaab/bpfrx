@@ -59,6 +59,13 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintln(&b, "Userspace dataplane helper:")
 	fmt.Fprintf(&b, "  PID:                       %d\n", status.PID)
 	fmt.Fprintf(&b, "  Helper mode:               %s\n", status.HelperMode)
+	fmt.Fprintf(&b, "  io_uring active:           %t\n", status.IOUringActive)
+	if status.IOUringMode != "" {
+		fmt.Fprintf(&b, "  io_uring mode:             %s\n", status.IOUringMode)
+	}
+	if status.IOUringLastError != "" {
+		fmt.Fprintf(&b, "  io_uring last error:       %s\n", status.IOUringLastError)
+	}
 	fmt.Fprintf(&b, "  Enabled:                   %t\n", status.Enabled)
 	fmt.Fprintf(&b, "  Forwarding armed:          %t\n", status.ForwardingArmed)
 	fmt.Fprintf(&b, "  Forwarding supported:      %t\n", status.Capabilities.ForwardingSupported)
