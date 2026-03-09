@@ -727,6 +727,8 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
   - publish helper/binding status through the existing CLI/gRPC surfaces
   - consume and validate stamped metadata
   - track config/FIB generation mismatches
+  - resolve stateless forwarding decisions from connected and static routes
+  - recurse through `next-table` static route chains
   - record bounded recent exception summaries
   - accept synthetic packet injection requests for safe validation on lab clusters
 - `bpfrxd` already publishes interface, address, neighbor, and static-route summaries
@@ -735,10 +737,10 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
 What is still intentionally not implemented:
 
 - live packet redirect enablement for production traffic
-- AF_XDP TX / reinjection forwarding logic
+- stateful or policy/NAT-aware userspace forwarding
 - worker-local session/NAT/policy state
 - shared-memory snapshot regions
-- io_uring-backed slow-path transport
+- io_uring-backed slow-path transport beyond helper state persistence
 
 That means the backend is now a real bring-up target with a real native helper,
 not just a design sketch, but it is still a guarded bootstrap path rather than a
@@ -819,12 +821,13 @@ Implemented today:
 - status/state publication
 - AF_XDP socket lifecycle/bootstrap
 - binding/queue planning
+- narrow stateless live-forward path for supported routed traffic
 - synthetic packet validation path
 
 Not implemented yet:
-- dedicated worker threads that own live forwarding
-- per-worker watchdog maps
-- real exception reinjection or TX path
+- per-worker watchdog maps beyond the current binding heartbeat map
+- real exception reinjection / slow-path transport
+- live forwarding for HA, NAT, zones/policy, and stateful flows
 
 ## Phase 4: Move session/NAT/policy into worker-local tables
 
@@ -847,7 +850,14 @@ Once the packet fast path is correct, add io_uring to:
 
 That is the order that makes architectural sense.
 
-Status: planned only.
+Status: partially implemented.
+
+Implemented today:
+- helper state persistence through `io_uring` with sync fallback
+
+Not implemented yet:
+- io_uring slow-path reinjection
+- io_uring-backed session-sync / export transport
 
 ## Performance Rules If This Must Be Extremely Fast
 
