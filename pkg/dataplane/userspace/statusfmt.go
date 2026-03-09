@@ -57,6 +57,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  RX packets:                %d\n", rxPackets)
 	fmt.Fprintf(&b, "  Validated packets:         %d\n", validatedPackets)
 	fmt.Fprintf(&b, "  Exception packets:         %d\n", exceptionPackets)
+	fmt.Fprintf(&b, "  Recent exceptions:         %d\n", len(status.RecentExceptions))
 	for i, hb := range status.WorkerHeartbeats {
 		if hb.IsZero() {
 			fmt.Fprintf(&b, "  Worker %d heartbeat age:    unknown\n", i)
@@ -93,6 +94,19 @@ func FormatBindings(status ProcessStatus) string {
 			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Ready, binding.Bound, binding.XSKRegistered, binding.Ifindex, binding.RXPackets, binding.ExceptionPackets, binding.Interface)
 		if binding.LastError != "" {
 			fmt.Fprintf(&b, " (%s)", binding.LastError)
+		}
+		fmt.Fprintln(&b)
+	}
+	if len(status.RecentExceptions) == 0 {
+		return b.String()
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "Recent userspace exceptions:")
+	for _, exc := range status.RecentExceptions {
+		fmt.Fprintf(&b, "  %s slot=%d queue=%d if=%s reason=%s len=%d af=%d proto=%d",
+			exc.Timestamp.Format(time.RFC3339), exc.Slot, exc.QueueID, exc.Interface, exc.Reason, exc.PacketLength, exc.AddrFamily, exc.Protocol)
+		if exc.ConfigGeneration != 0 || exc.FIBGeneration != 0 {
+			fmt.Fprintf(&b, " cfg=%d fib=%d", exc.ConfigGeneration, exc.FIBGeneration)
 		}
 		fmt.Fprintln(&b)
 	}

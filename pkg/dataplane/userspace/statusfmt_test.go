@@ -28,6 +28,9 @@ func TestFormatStatusSummary(t *testing.T) {
 			{Slot: 0, Ready: true, Bound: true, XSKRegistered: true, RXPackets: 10, ValidatedPackets: 8, ExceptionPackets: 1},
 			{Slot: 1, Ready: false, Bound: true, XSKRegistered: false, RXPackets: 5, ValidatedPackets: 4, ExceptionPackets: 2},
 		},
+		RecentExceptions: []ExceptionStatus{
+			{Timestamp: now, Slot: 1, QueueID: 0, Interface: "ge-0-0-2", Reason: "metadata_parse", PacketLength: 128},
+		},
 	}
 
 	out := FormatStatusSummary(status)
@@ -45,6 +48,7 @@ func TestFormatStatusSummary(t *testing.T) {
 		"RX packets:                15",
 		"Validated packets:         12",
 		"Exception packets:         3",
+		"Recent exceptions:         1",
 		"Worker 0 heartbeat age:",
 	} {
 		if !strings.Contains(out, want) {
@@ -62,6 +66,9 @@ func TestFormatBindings(t *testing.T) {
 			{Slot: 0, QueueID: 0, WorkerID: 0, Registered: true, Ready: false, Bound: true, XSKRegistered: true, Ifindex: 5, Interface: "ge-0-0-1", RXPackets: 99, ExceptionPackets: 3},
 			{Slot: 1, QueueID: 0, WorkerID: 0, Registered: true, Ready: false, Bound: true, XSKRegistered: false, Ifindex: 6, Interface: "ge-0-0-2", ExceptionPackets: 1, LastError: "xsk map update failed"},
 		},
+		RecentExceptions: []ExceptionStatus{
+			{Timestamp: time.Unix(0, 0).UTC(), Slot: 1, QueueID: 0, Interface: "ge-0-0-2", Reason: "fib_generation_mismatch", PacketLength: 512, AddrFamily: 10, Protocol: 6, ConfigGeneration: 11, FIBGeneration: 9},
+		},
 	}
 
 	out := FormatBindings(status)
@@ -72,6 +79,8 @@ func TestFormatBindings(t *testing.T) {
 		"ge-0-0-1",
 		"ge-0-0-2",
 		"xsk map update failed",
+		"Recent userspace exceptions:",
+		"fib_generation_mismatch",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("bindings output missing %q:\n%s", want, out)

@@ -176,6 +176,8 @@ struct ProcessStatus {
     queues: Vec<QueueStatus>,
     #[serde(default)]
     bindings: Vec<BindingStatus>,
+    #[serde(rename = "recent_exceptions", default)]
+    recent_exceptions: Vec<ExceptionStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -277,6 +279,31 @@ struct BindingStatus {
     last_change: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct ExceptionStatus {
+    timestamp: DateTime<Utc>,
+    slot: u32,
+    #[serde(rename = "queue_id")]
+    queue_id: u32,
+    #[serde(rename = "worker_id")]
+    worker_id: u32,
+    #[serde(default)]
+    interface: String,
+    #[serde(default)]
+    ifindex: i32,
+    reason: String,
+    #[serde(rename = "packet_length", default)]
+    packet_length: u32,
+    #[serde(rename = "addr_family", default)]
+    addr_family: u8,
+    #[serde(default)]
+    protocol: u8,
+    #[serde(rename = "config_generation", default)]
+    config_generation: u64,
+    #[serde(rename = "fib_generation", default)]
+    fib_generation: u32,
+}
+
 #[derive(Debug)]
 struct Args {
     control_socket: String,
@@ -336,6 +363,7 @@ fn run() -> Result<(), String> {
             worker_heartbeats: Vec::new(),
             queues: Vec::new(),
             bindings: Vec::new(),
+            recent_exceptions: Vec::new(),
         },
         snapshot: None,
         heartbeats: Vec::new(),
@@ -612,6 +640,7 @@ fn refresh_status(state: &mut ServerState) {
         .iter()
         .any(|b| b.registered && b.ready);
     state.status.queues = summarize_queues(&state.status.bindings);
+    state.status.recent_exceptions = state.afxdp.recent_exceptions();
 }
 
 fn replan_queues(

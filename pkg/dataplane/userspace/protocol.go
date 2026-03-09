@@ -95,24 +95,25 @@ type UserspaceMapPins struct {
 }
 
 type ProcessStatus struct {
-	PID                    int             `json:"pid"`
-	StartedAt              time.Time       `json:"started_at"`
-	ControlSocket          string          `json:"control_socket"`
-	StateFile              string          `json:"state_file"`
-	Workers                int             `json:"workers"`
-	RingEntries            int             `json:"ring_entries"`
-	HelperMode             string          `json:"helper_mode"`
-	IOUringPlanned         bool            `json:"io_uring_planned"`
-	Enabled                bool            `json:"enabled"`
-	LastSnapshotGeneration uint64          `json:"last_snapshot_generation"`
-	LastFIBGeneration      uint32          `json:"last_fib_generation,omitempty"`
-	LastSnapshotAt         time.Time       `json:"last_snapshot_at,omitempty"`
-	InterfaceAddresses     int             `json:"interface_addresses,omitempty"`
-	NeighborEntries        int             `json:"neighbor_entries,omitempty"`
-	RouteEntries           int             `json:"route_entries,omitempty"`
-	WorkerHeartbeats       []time.Time     `json:"worker_heartbeats,omitempty"`
-	Queues                 []QueueStatus   `json:"queues,omitempty"`
-	Bindings               []BindingStatus `json:"bindings,omitempty"`
+	PID                    int               `json:"pid"`
+	StartedAt              time.Time         `json:"started_at"`
+	ControlSocket          string            `json:"control_socket"`
+	StateFile              string            `json:"state_file"`
+	Workers                int               `json:"workers"`
+	RingEntries            int               `json:"ring_entries"`
+	HelperMode             string            `json:"helper_mode"`
+	IOUringPlanned         bool              `json:"io_uring_planned"`
+	Enabled                bool              `json:"enabled"`
+	LastSnapshotGeneration uint64            `json:"last_snapshot_generation"`
+	LastFIBGeneration      uint32            `json:"last_fib_generation,omitempty"`
+	LastSnapshotAt         time.Time         `json:"last_snapshot_at,omitempty"`
+	InterfaceAddresses     int               `json:"interface_addresses,omitempty"`
+	NeighborEntries        int               `json:"neighbor_entries,omitempty"`
+	RouteEntries           int               `json:"route_entries,omitempty"`
+	WorkerHeartbeats       []time.Time       `json:"worker_heartbeats,omitempty"`
+	Queues                 []QueueStatus     `json:"queues,omitempty"`
+	Bindings               []BindingStatus   `json:"bindings,omitempty"`
+	RecentExceptions       []ExceptionStatus `json:"recent_exceptions,omitempty"`
 }
 
 type QueueControlRequest struct {
@@ -163,4 +164,19 @@ type BindingStatus struct {
 	KernelRXInvalidDescs uint64    `json:"kernel_rx_invalid_descs,omitempty"`
 	LastError            string    `json:"last_error,omitempty"`
 	LastChange           time.Time `json:"last_change,omitempty"`
+}
+
+type ExceptionStatus struct {
+	Timestamp        time.Time `json:"timestamp"`
+	Slot             uint32    `json:"slot"`
+	QueueID          uint32    `json:"queue_id"`
+	WorkerID         uint32    `json:"worker_id"`
+	Interface        string    `json:"interface,omitempty"`
+	Ifindex          int       `json:"ifindex,omitempty"`
+	Reason           string    `json:"reason"`
+	PacketLength     uint32    `json:"packet_length,omitempty"`
+	AddrFamily       uint8     `json:"addr_family,omitempty"`
+	Protocol         uint8     `json:"protocol,omitempty"`
+	ConfigGeneration uint64    `json:"config_generation,omitempty"`
+	FIBGeneration    uint32    `json:"fib_generation,omitempty"`
 }

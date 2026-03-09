@@ -1,8 +1,9 @@
-use super::{BindingStatus, ConfigSnapshot};
+use super::{BindingStatus, ConfigSnapshot, ExceptionStatus};
+use chrono::Utc;
 use core::ffi::{c_int, c_void};
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -17,6 +18,7 @@ const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 64;
 const STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_RECENT_EXCEPTIONS: usize = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -49,6 +51,7 @@ pub struct Coordinator {
     map_fd: Option<OwnedFd>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     bindings: BTreeMap<u32, BindingWorker>,
+    recent_exceptions: VecDeque<ExceptionStatus>,
     validation: ValidationState,
     last_stats_poll: Instant,
 }
@@ -59,6 +62,7 @@ impl Coordinator {
             map_fd: None,
             live: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            recent_exceptions: VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS),
             validation: ValidationState::default(),
             last_stats_poll: Instant::now(),
         }
@@ -73,6 +77,7 @@ impl Coordinator {
         self.bindings.clear();
         self.live.clear();
         self.map_fd = None;
+        self.recent_exceptions.clear();
         self.validation = ValidationState::default();
     }
 
@@ -156,11 +161,20 @@ impl Coordinator {
     pub fn poll_once(&mut self) {
         let poll_stats = self.last_stats_poll.elapsed() >= STATS_POLL_INTERVAL;
         for binding in self.bindings.values_mut() {
-            poll_binding(binding, self.validation, poll_stats);
+            poll_binding(
+                binding,
+                self.validation,
+                &mut self.recent_exceptions,
+                poll_stats,
+            );
         }
         if poll_stats {
             self.last_stats_poll = Instant::now();
         }
+    }
+
+    pub fn recent_exceptions(&self) -> Vec<ExceptionStatus> {
+        self.recent_exceptions.iter().cloned().collect()
     }
 
     pub fn refresh_bindings(&self, bindings: &mut [BindingStatus]) {
@@ -229,13 +243,26 @@ enum PacketDisposition {
 }
 
 struct BindingWorker {
-    _slot: u32,
+    slot: u32,
+    queue_id: u32,
+    worker_id: u32,
+    interface: String,
+    ifindex: i32,
     live: Arc<BindingLiveState>,
     area: MmapArea,
     _umem: Umem,
     user: User,
     device: xdpilone::DeviceQueue,
     rx: xdpilone::RingRx,
+}
+
+#[derive(Clone, Debug)]
+struct BindingIdentity {
+    slot: u32,
+    queue_id: u32,
+    worker_id: u32,
+    interface: String,
+    ifindex: i32,
 }
 
 impl BindingWorker {
@@ -288,7 +315,11 @@ impl BindingWorker {
         binding.ready = false;
 
         Ok(Self {
-            _slot: binding.slot,
+            slot: binding.slot,
+            queue_id: binding.queue_id,
+            worker_id: binding.worker_id,
+            interface: binding.interface.clone(),
+            ifindex: binding.ifindex,
             live,
             area,
             _umem: umem,
@@ -299,7 +330,19 @@ impl BindingWorker {
     }
 }
 
-fn poll_binding(binding: &mut BindingWorker, validation: ValidationState, poll_stats: bool) {
+fn poll_binding(
+    binding: &mut BindingWorker,
+    validation: ValidationState,
+    recent_exceptions: &mut VecDeque<ExceptionStatus>,
+    poll_stats: bool,
+) {
+    let ident = BindingIdentity {
+        slot: binding.slot,
+        queue_id: binding.queue_id,
+        worker_id: binding.worker_id,
+        interface: binding.interface.clone(),
+        ifindex: binding.ifindex,
+    };
     if binding.device.needs_wakeup() {
         binding.device.wake();
         binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -340,6 +383,7 @@ fn poll_binding(binding: &mut BindingWorker, validation: ValidationState, poll_s
                         .live
                         .exception_packets
                         .fetch_add(1, Ordering::Relaxed);
+                    record_exception(recent_exceptions, &ident, "no_snapshot", desc, Some(meta));
                 }
                 PacketDisposition::ConfigGenerationMismatch => {
                     binding
@@ -350,6 +394,13 @@ fn poll_binding(binding: &mut BindingWorker, validation: ValidationState, poll_s
                         .live
                         .config_gen_mismatches
                         .fetch_add(1, Ordering::Relaxed);
+                    record_exception(
+                        recent_exceptions,
+                        &ident,
+                        "config_generation_mismatch",
+                        desc,
+                        Some(meta),
+                    );
                 }
                 PacketDisposition::FibGenerationMismatch => {
                     binding
@@ -360,6 +411,13 @@ fn poll_binding(binding: &mut BindingWorker, validation: ValidationState, poll_s
                         .live
                         .fib_gen_mismatches
                         .fetch_add(1, Ordering::Relaxed);
+                    record_exception(
+                        recent_exceptions,
+                        &ident,
+                        "fib_generation_mismatch",
+                        desc,
+                        Some(meta),
+                    );
                 }
                 PacketDisposition::UnsupportedPacket => {
                     binding
@@ -370,10 +428,18 @@ fn poll_binding(binding: &mut BindingWorker, validation: ValidationState, poll_s
                         .live
                         .unsupported_packets
                         .fetch_add(1, Ordering::Relaxed);
+                    record_exception(
+                        recent_exceptions,
+                        &ident,
+                        "unsupported_packet",
+                        desc,
+                        Some(meta),
+                    );
                 }
             }
         } else {
             binding.live.metadata_errors.fetch_add(1, Ordering::Relaxed);
+            record_exception(recent_exceptions, &ident, "metadata_parse", desc, None);
         }
         recycle.push(desc.addr);
     }
@@ -400,6 +466,32 @@ fn poll_binding(binding: &mut BindingWorker, validation: ValidationState, poll_s
     if poll_stats {
         poll_kernel_stats(&binding.user, &binding.live);
     }
+}
+
+fn record_exception(
+    recent_exceptions: &mut VecDeque<ExceptionStatus>,
+    binding: &BindingIdentity,
+    reason: &str,
+    desc: XdpDesc,
+    meta: Option<UserspaceDpMeta>,
+) {
+    if recent_exceptions.len() >= MAX_RECENT_EXCEPTIONS {
+        recent_exceptions.pop_front();
+    }
+    recent_exceptions.push_back(ExceptionStatus {
+        timestamp: Utc::now(),
+        slot: binding.slot,
+        queue_id: binding.queue_id,
+        worker_id: binding.worker_id,
+        interface: binding.interface.clone(),
+        ifindex: binding.ifindex,
+        reason: reason.to_string(),
+        packet_length: desc.len as u32,
+        addr_family: meta.map(|m| m.addr_family).unwrap_or(0),
+        protocol: meta.map(|m| m.protocol).unwrap_or(0),
+        config_generation: meta.map(|m| m.config_generation).unwrap_or(0),
+        fib_generation: meta.map(|m| m.fib_generation).unwrap_or(0),
+    });
 }
 
 fn classify_metadata(meta: UserspaceDpMeta, validation: ValidationState) -> PacketDisposition {
@@ -709,7 +801,10 @@ mod tests {
             config_generation: 11,
             fib_generation: 7,
         };
-        assert_eq!(classify_metadata(valid_meta(), validation), PacketDisposition::Valid);
+        assert_eq!(
+            classify_metadata(valid_meta(), validation),
+            PacketDisposition::Valid
+        );
     }
 
     #[test]
