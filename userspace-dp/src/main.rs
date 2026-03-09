@@ -84,8 +84,8 @@ struct ConfigSnapshot {
 struct MapPins {
     #[serde(default)]
     ctrl: String,
-    #[serde(rename = "queue_ready", default)]
-    queue_ready: String,
+    #[serde(default)]
+    bindings: String,
     #[serde(default)]
     xsk: String,
 }
@@ -126,6 +126,8 @@ struct ProcessStatus {
     worker_heartbeats: Vec<DateTime<Utc>>,
     #[serde(default)]
     queues: Vec<QueueStatus>,
+    #[serde(default)]
+    bindings: Vec<BindingStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -155,6 +157,25 @@ struct QueueStatus {
     worker_id: u32,
     #[serde(default)]
     interfaces: Vec<String>,
+    #[serde(default)]
+    registered: bool,
+    #[serde(default)]
+    ready: bool,
+    #[serde(rename = "last_change", skip_serializing_if = "Option::is_none")]
+    last_change: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct BindingStatus {
+    slot: u32,
+    #[serde(rename = "queue_id")]
+    queue_id: u32,
+    #[serde(rename = "worker_id")]
+    worker_id: u32,
+    #[serde(default)]
+    interface: String,
+    #[serde(default)]
+    ifindex: i32,
     #[serde(default)]
     registered: bool,
     #[serde(default)]
@@ -216,6 +237,7 @@ fn run() -> Result<(), String> {
             last_snapshot_at: None,
             worker_heartbeats: Vec::new(),
             queues: Vec::new(),
+            bindings: Vec::new(),
         },
         snapshot: None,
         heartbeats: Vec::new(),
@@ -364,13 +386,13 @@ fn handle_stream(
                     guard.status.last_snapshot_generation = snapshot.generation;
                     guard.status.last_snapshot_at = Some(snapshot.generated_at);
                     guard.snapshot = Some(snapshot);
-                    let existing_queues = guard.status.queues.clone();
+                    let existing_bindings = guard.status.bindings.clone();
                     let replanned = replan_queues(
                         guard.snapshot.as_ref(),
                         guard.status.workers,
-                        &existing_queues,
+                        &existing_bindings,
                     );
-                    guard.status.queues = replanned;
+                    guard.status.bindings = replanned;
                     refresh_status(&mut guard);
                     persist_state = true;
                 } else {
@@ -380,15 +402,19 @@ fn handle_stream(
             }
             "set_queue_state" => {
                 if let Some(queue_req) = request.queue {
-                    if let Some(queue) = guard
+                    let mut found = false;
+                    for binding in guard
                         .status
-                        .queues
+                        .bindings
                         .iter_mut()
-                        .find(|q| q.queue_id == queue_req.queue_id)
+                        .filter(|b| b.queue_id == queue_req.queue_id)
                     {
-                        queue.registered = queue_req.registered;
-                        queue.ready = queue_req.ready && queue_req.registered;
-                        queue.last_change = Some(Utc::now());
+                        binding.registered = queue_req.registered;
+                        binding.ready = queue_req.ready && queue_req.registered;
+                        binding.last_change = Some(Utc::now());
+                        found = true;
+                    }
+                    if found {
                         refresh_status(&mut guard);
                         persist_state = true;
                     } else {
@@ -428,15 +454,21 @@ fn handle_stream(
 
 fn refresh_status(state: &mut ServerState) {
     state.status.worker_heartbeats = collect_heartbeats(&state.heartbeats);
-    state.status.enabled = state.status.queues.iter().any(|q| q.registered && q.ready);
+    state.status.enabled = state
+        .status
+        .bindings
+        .iter()
+        .any(|b| b.registered && b.ready);
+    state.status.queues = summarize_queues(&state.status.bindings);
 }
 
 fn replan_queues(
     snapshot: Option<&ConfigSnapshot>,
     workers: usize,
-    existing: &[QueueStatus],
-) -> Vec<QueueStatus> {
+    existing: &[BindingStatus],
+) -> Vec<BindingStatus> {
     let mut candidates: Vec<(String, usize)> = Vec::new();
+    let mut ifindex_by_name: BTreeMap<String, i32> = BTreeMap::new();
     if let Some(snapshot) = snapshot {
         for iface in &snapshot.interfaces {
             if !is_userspace_candidate_interface(&iface.name) {
@@ -453,47 +485,79 @@ fn replan_queues(
                 rx_queue_count(&linux_name)
             };
             if rx_queues > 0 {
+                ifindex_by_name.insert(linux_name.clone(), iface.ifindex);
                 candidates.push((linux_name, rx_queues));
             }
         }
     }
-    let mut queue_ifaces: BTreeMap<u32, Vec<String>> = BTreeMap::new();
-    if !candidates.is_empty() {
-        let queue_count = candidates.iter().map(|(_, rx)| *rx).min().unwrap_or(0);
-        let interfaces = candidates
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
-        for qid in 0..queue_count {
-            queue_ifaces.insert(qid as u32, interfaces.clone());
-        }
-    }
-    replan_queues_from_layout(workers, existing, queue_ifaces)
+    replan_bindings_from_candidates(workers, existing, candidates, ifindex_by_name)
 }
 
-fn replan_queues_from_layout(
+fn replan_bindings_from_candidates(
     workers: usize,
-    existing: &[QueueStatus],
-    queue_ifaces: BTreeMap<u32, Vec<String>>,
-) -> Vec<QueueStatus> {
-    let mut existing_by_queue = BTreeMap::new();
-    for q in existing {
-        existing_by_queue.insert(q.queue_id, q.clone());
+    existing: &[BindingStatus],
+    candidates: Vec<(String, usize)>,
+    ifindex_by_name: BTreeMap<String, i32>,
+) -> Vec<BindingStatus> {
+    let mut existing_by_slot = BTreeMap::new();
+    for binding in existing {
+        existing_by_slot.insert(binding.slot, binding.clone());
     }
-    let mut out = Vec::with_capacity(queue_ifaces.len());
-    for (queue_id, interfaces) in queue_ifaces {
-        let mut queue = existing_by_queue.remove(&queue_id).unwrap_or_default();
-        queue.queue_id = queue_id;
-        queue.worker_id = queue_id % workers.max(1) as u32;
-        queue.interfaces = interfaces;
-        queue.registered = !queue.interfaces.is_empty();
-        if !queue.registered {
-            queue.ready = false;
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let queue_count = candidates.iter().map(|(_, rx)| *rx).min().unwrap_or(0);
+    let interfaces = candidates
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let mut out = Vec::with_capacity(queue_count * interfaces.len());
+    let mut slot = 0u32;
+    for queue_id in 0..queue_count {
+        for iface in &interfaces {
+            let mut binding = existing_by_slot.remove(&slot).unwrap_or_default();
+            binding.slot = slot;
+            binding.queue_id = queue_id as u32;
+            binding.worker_id = (queue_id % workers.max(1)) as u32;
+            binding.interface = iface.clone();
+            binding.ifindex = *ifindex_by_name.get(iface).unwrap_or(&0);
+            binding.registered = binding.ifindex > 0;
+            if !binding.registered {
+                binding.ready = false;
+            }
+            if binding.last_change.is_none() {
+                binding.last_change = Some(Utc::now());
+            }
+            out.push(binding);
+            slot += 1;
         }
-        if queue.last_change.is_none() {
-            queue.last_change = Some(Utc::now());
-        }
-        out.push(queue);
+    }
+    out
+}
+
+fn summarize_queues(bindings: &[BindingStatus]) -> Vec<QueueStatus> {
+    let mut by_queue: BTreeMap<u32, Vec<&BindingStatus>> = BTreeMap::new();
+    for binding in bindings {
+        by_queue.entry(binding.queue_id).or_default().push(binding);
+    }
+    let mut out = Vec::with_capacity(by_queue.len());
+    for (queue_id, group) in by_queue {
+        let worker_id = group.first().map(|b| b.worker_id).unwrap_or(0);
+        let interfaces = group
+            .iter()
+            .map(|b| b.interface.clone())
+            .collect::<Vec<_>>();
+        let registered = !group.is_empty() && group.iter().all(|b| b.registered);
+        let ready = !group.is_empty() && group.iter().all(|b| b.registered && b.ready);
+        let last_change = group.iter().filter_map(|b| b.last_change).max();
+        out.push(QueueStatus {
+            queue_id,
+            worker_id,
+            interfaces,
+            registered,
+            ready,
+            last_change,
+        });
     }
     out
 }
@@ -553,36 +617,65 @@ mod tests {
 
     #[test]
     fn queue_planner_filters_non_data_interfaces() {
-        let mut layout = BTreeMap::new();
-        layout.insert(0, vec!["ge-0-0-1".to_string()]);
-        layout.insert(1, vec!["xe-0-0-0".to_string()]);
-        let queues = replan_queues_from_layout(2, &[], layout);
-        assert!(queues.iter().all(|q| {
-            q.interfaces.iter().all(|name| {
-                name.starts_with("ge-") || name.starts_with("xe-") || name.starts_with("et-")
-            })
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "ge-0/0/1".to_string(),
+                    linux_name: "ge-0-0-1".to_string(),
+                    ifindex: 11,
+                    rx_queues: 1,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "xe-0/0/0".to_string(),
+                    linux_name: "xe-0-0-0".to_string(),
+                    ifindex: 12,
+                    rx_queues: 1,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "fab0".to_string(),
+                    linux_name: "fab0".to_string(),
+                    ifindex: 13,
+                    rx_queues: 4,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let bindings = replan_queues(Some(&snapshot), 2, &[]);
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().all(|b| {
+            b.interface.starts_with("ge-")
+                || b.interface.starts_with("xe-")
+                || b.interface.starts_with("et-")
         }));
-        assert!(queues.iter().all(|q| q.registered));
+        assert!(bindings.iter().all(|b| b.registered));
     }
 
     #[test]
     fn queue_planner_preserves_existing_state() {
-        let existing = vec![QueueStatus {
+        let existing = vec![BindingStatus {
+            slot: 0,
             queue_id: 0,
             worker_id: 0,
-            interfaces: vec!["ge-0-0-1".to_string()],
+            interface: "ge-0-0-1".to_string(),
+            ifindex: 11,
             registered: true,
             ready: true,
             last_change: Some(Utc::now()),
         }];
-        let mut layout = BTreeMap::new();
-        layout.insert(0, vec!["ge-0-0-1".to_string()]);
-        let queues = replan_queues_from_layout(1, &existing, layout);
-        if let Some(q0) = queues.iter().find(|q| q.queue_id == 0) {
-            assert!(q0.registered);
-            assert!(q0.ready);
+        let bindings = replan_bindings_from_candidates(
+            1,
+            &existing,
+            vec![("ge-0-0-1".to_string(), 1)],
+            BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
+        );
+        if let Some(b0) = bindings.iter().find(|b| b.slot == 0) {
+            assert!(b0.registered);
+            assert!(b0.ready);
         } else {
-            panic!("queue 0 missing");
+            panic!("binding 0 missing");
         }
     }
 
@@ -605,7 +698,9 @@ mod tests {
             ],
             ..Default::default()
         };
-        let queues = replan_queues(Some(&snapshot), 2, &[]);
+        let bindings = replan_queues(Some(&snapshot), 2, &[]);
+        assert_eq!(bindings.len(), 4);
+        let queues = summarize_queues(&bindings);
         assert_eq!(queues.len(), 2);
         for (idx, q) in queues.iter().enumerate() {
             assert_eq!(q.queue_id, idx as u32);
@@ -613,7 +708,7 @@ mod tests {
                 q.interfaces,
                 vec!["ge-0-0-1".to_string(), "ge-0-0-2".to_string()]
             );
-            assert!(q.registered);
+            assert!(!q.registered);
         }
     }
 }

@@ -51,7 +51,7 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	if snap.Generation != 11 {
 		t.Fatalf("Generation = %d, want 11", snap.Generation)
 	}
-	if snap.MapPins.Ctrl == "" || snap.MapPins.QueueReady == "" || snap.MapPins.XSK == "" {
+	if snap.MapPins.Ctrl == "" || snap.MapPins.Bindings == "" || snap.MapPins.XSK == "" {
 		t.Fatalf("MapPins = %+v, want all paths populated", snap.MapPins)
 	}
 	if snap.Summary.HostName != "fw-test" {

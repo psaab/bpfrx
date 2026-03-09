@@ -23,8 +23,8 @@ func UserspaceCtrlPinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_ctrl")
 }
 
-func UserspaceQueueReadyPinPath() string {
-	return filepath.Join(bpfPinPath, "userspace_queue_ready")
+func UserspaceBindingsPinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_bindings")
 }
 
 func UserspaceXSKMapPinPath() string {

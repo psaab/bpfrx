@@ -7,12 +7,12 @@
  *
  * - parse packet and run cheap ingress filter work
  * - resolve ingress zone and decide whether screen can be skipped
- * - if userspace redirection is enabled for this RX queue, stamp metadata and
- *   redirect to the XSKMAP
+ * - if userspace redirection is enabled for this ingress interface + RX queue,
+ *   stamp metadata and redirect to the XSKMAP
  * - otherwise tail-call into the existing XDP pipeline
  *
  * Redirect remains disabled until a userspace worker installs AF_XDP sockets
- * and marks the queue ready via userspace_ctrl/userspace_queue_ready.
+ * and marks the binding ready via userspace_ctrl/userspace_bindings.
  */
 
 #include "../headers/bpfrx_common.h"
@@ -53,6 +53,16 @@ struct userspace_dp_meta {
 	__u16 reserved;
 };
 
+struct userspace_binding_key {
+	__u32 ifindex;
+	__u32 queue_id;
+};
+
+struct userspace_binding_value {
+	__u32 slot;
+	__u32 flags;
+};
+
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -61,15 +71,15 @@ struct {
 } userspace_ctrl SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, MAX_CPUS);
-	__type(key, __u32);
-	__type(value, __u32);
-} userspace_queue_ready SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct userspace_binding_key);
+	__type(value, struct userspace_binding_value);
+} userspace_bindings SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_XSKMAP);
-	__uint(max_entries, MAX_CPUS);
+	__uint(max_entries, 4096);
 	__type(key, __u32);
 	__type(value, __u32);
 } userspace_xsk_map SEC(".maps");
@@ -118,7 +128,11 @@ try_userspace_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 	__u32 zero = 0;
 	struct userspace_ctrl *ctrl = bpf_map_lookup_elem(&userspace_ctrl, &zero);
 	__u32 q = ctx->rx_queue_index;
-	__u32 *ready;
+	struct userspace_binding_key binding_key = {
+		.ifindex = meta->ingress_ifindex,
+		.queue_id = q,
+	};
+	struct userspace_binding_value *binding;
 	struct userspace_dp_meta *umeta;
 	void *data_meta;
 	void *data;
@@ -127,8 +141,8 @@ try_userspace_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 	if (!ctrl || ctrl->enabled == 0 || ctrl->metadata_version != USERSPACE_META_VERSION)
 		return 0;
 
-	ready = bpf_map_lookup_elem(&userspace_queue_ready, &q);
-	if (!ready || *ready == 0)
+	binding = bpf_map_lookup_elem(&userspace_bindings, &binding_key);
+	if (!binding || !(binding->flags & 1))
 		return 0;
 
 	if (bpf_xdp_adjust_meta(ctx, 0 - (__s32)sizeof(*umeta)) < 0)
@@ -160,7 +174,7 @@ try_userspace_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 	umeta->dscp = meta->dscp;
 	umeta->dscp_rewrite = meta->dscp_rewrite;
 
-	rc = bpf_redirect_map(&userspace_xsk_map, q, 0);
+	rc = bpf_redirect_map(&userspace_xsk_map, binding->slot, 0);
 	if (rc == XDP_REDIRECT)
 		return rc;
 

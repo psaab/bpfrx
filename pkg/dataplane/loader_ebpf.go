@@ -199,15 +199,15 @@ func (m *Manager) loadAllObjects() error {
 	if err := pinUserspaceMap(userspaceObjs.UserspaceCtrl, UserspaceCtrlPinPath()); err != nil {
 		return fmt.Errorf("pin userspace_ctrl: %w", err)
 	}
-	if err := pinUserspaceMap(userspaceObjs.UserspaceQueueReady, UserspaceQueueReadyPinPath()); err != nil {
-		return fmt.Errorf("pin userspace_queue_ready: %w", err)
+	if err := pinUserspaceMap(userspaceObjs.UserspaceBindings, UserspaceBindingsPinPath()); err != nil {
+		return fmt.Errorf("pin userspace_bindings: %w", err)
 	}
 	if err := pinUserspaceMap(userspaceObjs.UserspaceXskMap, UserspaceXSKMapPinPath()); err != nil {
 		return fmt.Errorf("pin userspace_xsk_map: %w", err)
 	}
 	m.programs["xdp_userspace_prog"] = userspaceObjs.XdpUserspaceProg
 	m.maps["userspace_ctrl"] = userspaceObjs.UserspaceCtrl
-	m.maps["userspace_queue_ready"] = userspaceObjs.UserspaceQueueReady
+	m.maps["userspace_bindings"] = userspaceObjs.UserspaceBindings
 	m.maps["userspace_xsk_map"] = userspaceObjs.UserspaceXskMap
 
 	// Extended replacements for xdp_policy which also includes NAT pool maps.

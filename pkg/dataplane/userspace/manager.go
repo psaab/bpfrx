@@ -158,9 +158,9 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 
 func userspaceMapPins() UserspaceMapPins {
 	return UserspaceMapPins{
-		Ctrl:       dataplane.UserspaceCtrlPinPath(),
-		QueueReady: dataplane.UserspaceQueueReadyPinPath(),
-		XSK:        dataplane.UserspaceXSKMapPinPath(),
+		Ctrl:     dataplane.UserspaceCtrlPinPath(),
+		Bindings: dataplane.UserspaceBindingsPinPath(),
+		XSK:      dataplane.UserspaceXSKMapPinPath(),
 	}
 }
 
@@ -396,9 +396,9 @@ func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
 	if ctrlMap == nil {
 		return errors.New("userspace_ctrl map not loaded")
 	}
-	readyMap := m.inner.Map("userspace_queue_ready")
-	if readyMap == nil {
-		return errors.New("userspace_queue_ready map not loaded")
+	bindingsMap := m.inner.Map("userspace_bindings")
+	if bindingsMap == nil {
+		return errors.New("userspace_bindings map not loaded")
 	}
 
 	zero := uint32(0)
@@ -412,11 +412,16 @@ func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
 		return fmt.Errorf("update userspace_ctrl: %w", err)
 	}
 
-	const maxQueues = 256
-	for q := 0; q < maxQueues; q++ {
-		ready := uint32(0)
-		if err := readyMap.Update(uint32(q), ready, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update userspace_queue_ready[%d]: %w", q, err)
+	var key userspaceBindingKey
+	var val userspaceBindingValue
+	iter := bindingsMap.Iterate()
+	var keys []userspaceBindingKey
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	for _, key := range keys {
+		if err := bindingsMap.Delete(key); err != nil {
+			return fmt.Errorf("delete userspace_bindings %+v: %w", key, err)
 		}
 	}
 	return nil
@@ -427,19 +432,21 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	if ctrlMap == nil {
 		return errors.New("userspace_ctrl map not loaded")
 	}
-	readyMap := m.inner.Map("userspace_queue_ready")
-	if readyMap == nil {
-		return errors.New("userspace_queue_ready map not loaded")
+	bindingsMap := m.inner.Map("userspace_bindings")
+	if bindingsMap == nil {
+		return errors.New("userspace_bindings map not loaded")
 	}
 
-	const maxQueues = 256
-	readyByQueue := make(map[uint32]uint32, len(status.Queues))
-	for _, q := range status.Queues {
-		if q.QueueID >= maxQueues {
-			continue
-		}
-		if q.Registered && q.Ready {
-			readyByQueue[q.QueueID] = 1
+	var key userspaceBindingKey
+	var val userspaceBindingValue
+	iter := bindingsMap.Iterate()
+	var keys []userspaceBindingKey
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	for _, key := range keys {
+		if err := bindingsMap.Delete(key); err != nil {
+			return fmt.Errorf("delete userspace_bindings %+v: %w", key, err)
 		}
 	}
 
@@ -457,13 +464,39 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		return fmt.Errorf("update userspace_ctrl from helper status: %w", err)
 	}
 
-	for q := uint32(0); q < maxQueues; q++ {
-		ready := readyByQueue[q]
-		if err := readyMap.Update(q, ready, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update userspace_queue_ready[%d] from helper status: %w", q, err)
+	for _, binding := range status.Bindings {
+		if binding.Ifindex <= 0 {
+			continue
+		}
+		flags := uint32(0)
+		if binding.Registered && binding.Ready {
+			flags = userspaceBindingReady
+		}
+		key := userspaceBindingKey{
+			Ifindex: uint32(binding.Ifindex),
+			QueueID: binding.QueueID,
+		}
+		val := userspaceBindingValue{
+			Slot:  binding.Slot,
+			Flags: flags,
+		}
+		if err := bindingsMap.Update(key, val, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_bindings %+v: %w", key, err)
 		}
 	}
 	return nil
+}
+
+const userspaceBindingReady = 1
+
+type userspaceBindingKey struct {
+	Ifindex uint32
+	QueueID uint32
+}
+
+type userspaceBindingValue struct {
+	Slot  uint32
+	Flags uint32
 }
 
 func (m *Manager) ensureStatusLoopLocked() {

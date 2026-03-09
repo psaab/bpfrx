@@ -66,25 +66,26 @@ type RouteSnapshot struct {
 }
 
 type UserspaceMapPins struct {
-	Ctrl       string `json:"ctrl,omitempty"`
-	QueueReady string `json:"queue_ready,omitempty"`
-	XSK        string `json:"xsk,omitempty"`
+	Ctrl     string `json:"ctrl,omitempty"`
+	Bindings string `json:"bindings,omitempty"`
+	XSK      string `json:"xsk,omitempty"`
 }
 
 type ProcessStatus struct {
-	PID                    int           `json:"pid"`
-	StartedAt              time.Time     `json:"started_at"`
-	ControlSocket          string        `json:"control_socket"`
-	StateFile              string        `json:"state_file"`
-	Workers                int           `json:"workers"`
-	RingEntries            int           `json:"ring_entries"`
-	HelperMode             string        `json:"helper_mode"`
-	IOUringPlanned         bool          `json:"io_uring_planned"`
-	Enabled                bool          `json:"enabled"`
-	LastSnapshotGeneration uint64        `json:"last_snapshot_generation"`
-	LastSnapshotAt         time.Time     `json:"last_snapshot_at,omitempty"`
-	WorkerHeartbeats       []time.Time   `json:"worker_heartbeats,omitempty"`
-	Queues                 []QueueStatus `json:"queues,omitempty"`
+	PID                    int             `json:"pid"`
+	StartedAt              time.Time       `json:"started_at"`
+	ControlSocket          string          `json:"control_socket"`
+	StateFile              string          `json:"state_file"`
+	Workers                int             `json:"workers"`
+	RingEntries            int             `json:"ring_entries"`
+	HelperMode             string          `json:"helper_mode"`
+	IOUringPlanned         bool            `json:"io_uring_planned"`
+	Enabled                bool            `json:"enabled"`
+	LastSnapshotGeneration uint64          `json:"last_snapshot_generation"`
+	LastSnapshotAt         time.Time       `json:"last_snapshot_at,omitempty"`
+	WorkerHeartbeats       []time.Time     `json:"worker_heartbeats,omitempty"`
+	Queues                 []QueueStatus   `json:"queues,omitempty"`
+	Bindings               []BindingStatus `json:"bindings,omitempty"`
 }
 
 type QueueControlRequest struct {
@@ -97,6 +98,17 @@ type QueueStatus struct {
 	QueueID    uint32    `json:"queue_id"`
 	WorkerID   uint32    `json:"worker_id"`
 	Interfaces []string  `json:"interfaces,omitempty"`
+	Registered bool      `json:"registered"`
+	Ready      bool      `json:"ready"`
+	LastChange time.Time `json:"last_change,omitempty"`
+}
+
+type BindingStatus struct {
+	Slot       uint32    `json:"slot"`
+	QueueID    uint32    `json:"queue_id"`
+	WorkerID   uint32    `json:"worker_id"`
+	Interface  string    `json:"interface,omitempty"`
+	Ifindex    int       `json:"ifindex,omitempty"`
 	Registered bool      `json:"registered"`
 	Ready      bool      `json:"ready"`
 	LastChange time.Time `json:"last_change,omitempty"`
