@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
