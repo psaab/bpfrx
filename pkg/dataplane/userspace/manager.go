@@ -709,6 +709,23 @@ func (m *Manager) SetBindingState(slot uint32, registered, ready bool) error {
 	return m.applyHelperStatusLocked(&status)
 }
 
+func (m *Manager) InjectPacket(req InjectPacketRequest) (ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "inject_packet", Packet: &req}, &status); err != nil {
+		return ProcessStatus{}, err
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return status, err
+	}
+	return status, nil
+}
+
 const userspaceBindingReady = 1
 
 type userspaceBindingKey struct {

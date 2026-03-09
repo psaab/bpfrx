@@ -11493,6 +11493,20 @@ func (c *CLI) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
 	return provider.Status()
 }
 
+func (c *CLI) userspaceDataplaneControl() (interface {
+	Status() (dpuserspace.ProcessStatus, error)
+	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
+}, error) {
+	provider, ok := c.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+		InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("userspace dataplane control unavailable")
+	}
+	return provider, nil
+}
+
 func (c *CLI) showChassisClusterIPMonitoringStatus() error {
 	if c.cluster == nil {
 		fmt.Println("Cluster not configured")
@@ -12141,17 +12155,27 @@ func (c *CLI) handleRequestChassis(args []string) error {
 		return nil
 	}
 	args = args[1:] // consume "cluster"
-	if len(args) == 0 || args[0] != "failover" {
+	if len(args) == 0 {
 		fmt.Println("request chassis cluster:")
 		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children["cluster"].Children))
 		return nil
 	}
-	args = args[1:] // consume "failover"
+	switch args[0] {
+	case "failover":
+		return c.handleRequestChassisClusterFailover(args[1:])
+	case "data-plane":
+		return c.handleRequestChassisClusterDataPlane(args[1:])
+	default:
+		fmt.Println("request chassis cluster:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children["cluster"].Children))
+		return nil
+	}
+}
 
+func (c *CLI) handleRequestChassisClusterFailover(args []string) error {
 	if c.cluster == nil {
 		return fmt.Errorf("cluster not configured")
 	}
-
 	// "request chassis cluster failover reset redundancy-group <N>"
 	if len(args) >= 1 && args[0] == "reset" {
 		if len(args) < 3 || args[1] != "redundancy-group" {
@@ -12183,14 +12207,12 @@ func (c *CLI) handleRequestChassis(args []string) error {
 			}
 			localNode := c.cluster.NodeID()
 			if targetNode == localNode {
-				// "node <local>" → make local primary → ask peer to failover
 				if err := c.cluster.RequestPeerFailover(rgID); err != nil {
 					return err
 				}
 				fmt.Printf("Manual failover triggered for redundancy group %d (requesting peer to resign)\n", rgID)
 				return nil
 			}
-			// "node <peer>" → make peer primary → local failover
 		}
 
 		if err := c.cluster.ManualFailover(rgID); err != nil {
@@ -12201,6 +12223,62 @@ func (c *CLI) handleRequestChassis(args []string) error {
 	}
 
 	return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N> [node <N>]")
+}
+
+func (c *CLI) handleRequestChassisClusterDataPlane(args []string) error {
+	if len(args) == 0 || args[0] != "userspace" {
+		fmt.Println("request chassis cluster data-plane:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children["cluster"].Children["data-plane"].Children))
+		return nil
+	}
+	args = args[1:]
+	if len(args) < 4 || args[0] != "inject-packet" || args[1] != "slot" {
+		return fmt.Errorf("usage: request chassis cluster data-plane userspace inject-packet slot <N> <valid|fib-mismatch|metadata-parse-error>")
+	}
+	slot, err := strconv.Atoi(args[2])
+	if err != nil {
+		return fmt.Errorf("invalid slot: %s", args[2])
+	}
+	mode := args[3]
+	provider, err := c.userspaceDataplaneControl()
+	if err != nil {
+		return err
+	}
+	status, err := provider.Status()
+	if err != nil {
+		return err
+	}
+	req := dpuserspace.InjectPacketRequest{
+		Slot:             uint32(slot),
+		PacketLength:     128,
+		AddrFamily:       uint8(syscall.AF_INET),
+		Protocol:         6,
+		ConfigGeneration: status.LastSnapshotGeneration,
+		FIBGeneration:    status.LastFIBGeneration,
+		MetadataValid:    true,
+	}
+	switch mode {
+	case "valid":
+	case "fib-mismatch":
+		req.FIBGeneration++
+	case "metadata-parse-error":
+		req.MetadataValid = false
+		req.PacketLength = 96
+		req.AddrFamily = 0
+		req.Protocol = 0
+		req.ConfigGeneration = 0
+		req.FIBGeneration = 0
+	default:
+		return fmt.Errorf("unknown inject mode %q", mode)
+	}
+	status, err = provider.InjectPacket(req)
+	if err != nil {
+		return err
+	}
+	fmt.Print(dpuserspace.FormatStatusSummary(status))
+	fmt.Println()
+	fmt.Print(dpuserspace.FormatBindings(status))
+	return nil
 }
 
 func (c *CLI) handleRequestDHCP(args []string) error {
