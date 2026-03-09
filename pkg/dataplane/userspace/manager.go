@@ -202,9 +202,6 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 		}
 		linuxName := snapshotLinuxName(cfg, name, iface, nil)
 		ifindex, mtu, hardwareAddr, addresses := buildLinkSnapshot(linuxName)
-		if len(addresses) == 0 {
-			addresses = buildConfiguredAddressSnapshots(nil)
-		}
 		out = append(out, InterfaceSnapshot{
 			Name:            name,
 			LinuxName:       linuxName,
@@ -234,9 +231,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			unitName := fmt.Sprintf("%s.%d", name, unitNum)
 			linuxUnit := snapshotLinuxName(cfg, name, iface, unit)
 			ifindex, mtu, hardwareAddr, addresses := buildLinkSnapshot(linuxUnit)
-			if len(addresses) == 0 {
-				addresses = buildConfiguredAddressSnapshots(unit.Addresses)
-			}
+			addresses = mergeInterfaceAddressSnapshots(addresses, buildConfiguredAddressSnapshots(unit.Addresses))
 			out = append(out, InterfaceSnapshot{
 				Name:            unitName,
 				LinuxName:       linuxUnit,
@@ -323,6 +318,40 @@ func buildConfiguredAddressSnapshots(addrs []string) []InterfaceAddressSnapshot 
 			Address: netw.String(),
 			Scope:   int(netlink.SCOPE_UNIVERSE),
 		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Family != out[j].Family {
+			return out[i].Family < out[j].Family
+		}
+		return out[i].Address < out[j].Address
+	})
+	return out
+}
+
+func mergeInterfaceAddressSnapshots(live []InterfaceAddressSnapshot, configured []InterfaceAddressSnapshot) []InterfaceAddressSnapshot {
+	if len(live) == 0 {
+		return configured
+	}
+	if len(configured) == 0 {
+		return live
+	}
+	seen := make(map[string]bool, len(live)+len(configured))
+	out := make([]InterfaceAddressSnapshot, 0, len(live)+len(configured))
+	for _, addr := range live {
+		key := addr.Family + "/" + addr.Address
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, addr)
+	}
+	for _, addr := range configured {
+		key := addr.Family + "/" + addr.Address
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, addr)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Family != out[j].Family {

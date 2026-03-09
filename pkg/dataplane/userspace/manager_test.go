@@ -135,3 +135,36 @@ func TestBuildSnapshotIncludesUnitInterfaces(t *testing.T) {
 		t.Fatalf("reth0.50 Addresses = %+v, want config fallback addresses", got["reth0.50"].Addresses)
 	}
 }
+
+func TestMergeInterfaceAddressSnapshots(t *testing.T) {
+	live := []InterfaceAddressSnapshot{
+		{Family: "inet", Address: "169.254.1.1/32", Scope: 253},
+		{Family: "inet6", Address: "fe80::1/128", Scope: 253},
+	}
+	configured := []InterfaceAddressSnapshot{
+		{Family: "inet", Address: "172.16.50.8/24", Scope: 0},
+		{Family: "inet6", Address: "2001:559:8585:50::8/64", Scope: 0},
+		{Family: "inet", Address: "169.254.1.1/32", Scope: 253},
+	}
+
+	got := mergeInterfaceAddressSnapshots(live, configured)
+	if len(got) != 4 {
+		t.Fatalf("len(got) = %d, want 4 (%+v)", len(got), got)
+	}
+	want := map[string]bool{
+		"inet/169.254.1.1/32":          true,
+		"inet/172.16.50.8/24":          true,
+		"inet6/2001:559:8585:50::8/64": true,
+		"inet6/fe80::1/128":            true,
+	}
+	for _, addr := range got {
+		key := addr.Family + "/" + addr.Address
+		if !want[key] {
+			t.Fatalf("unexpected address %s in %+v", key, got)
+		}
+		delete(want, key)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing addresses: %+v from %+v", want, got)
+	}
+}
