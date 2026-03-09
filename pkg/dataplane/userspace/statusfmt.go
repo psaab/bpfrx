@@ -16,10 +16,20 @@ func FormatStatusSummary(status ProcessStatus) string {
 		}
 	}
 	readyBindings := 0
+	boundBindings := 0
+	xskBindings := 0
+	var rxPackets uint64
 	for _, binding := range status.Bindings {
 		if binding.Ready {
 			readyBindings++
 		}
+		if binding.Bound {
+			boundBindings++
+		}
+		if binding.XSKRegistered {
+			xskBindings++
+		}
+		rxPackets += binding.RXPackets
 	}
 
 	fmt.Fprintln(&b, "Userspace dataplane helper:")
@@ -32,8 +42,11 @@ func FormatStatusSummary(status ProcessStatus) string {
 	if !status.LastSnapshotAt.IsZero() {
 		fmt.Fprintf(&b, "  Last snapshot age:         %s\n", formatStatusAge(now.Sub(status.LastSnapshotAt)))
 	}
+	fmt.Fprintf(&b, "  Bound bindings:            %d/%d\n", boundBindings, len(status.Bindings))
+	fmt.Fprintf(&b, "  XSK-registered bindings:   %d/%d\n", xskBindings, len(status.Bindings))
 	fmt.Fprintf(&b, "  Ready queues:              %d/%d\n", readyQueues, len(status.Queues))
 	fmt.Fprintf(&b, "  Ready bindings:            %d/%d\n", readyBindings, len(status.Bindings))
+	fmt.Fprintf(&b, "  RX packets:                %d\n", rxPackets)
 	for i, hb := range status.WorkerHeartbeats {
 		if hb.IsZero() {
 			fmt.Fprintf(&b, "  Worker %d heartbeat age:    unknown\n", i)
@@ -64,10 +77,14 @@ func FormatBindings(status ProcessStatus) string {
 		fmt.Fprintln(&b, "  none")
 		return b.String()
 	}
-	fmt.Fprintf(&b, "  %-6s %-7s %-8s %-10s %-7s %-8s %s\n", "Slot", "Queue", "Worker", "Registered", "Ready", "Ifindex", "Interface")
+	fmt.Fprintf(&b, "  %-6s %-7s %-8s %-10s %-7s %-7s %-5s %-8s %-10s %s\n", "Slot", "Queue", "Worker", "Registered", "Ready", "Bound", "XSK", "Ifindex", "RXPkts", "Interface")
 	for _, binding := range status.Bindings {
-		fmt.Fprintf(&b, "  %-6d %-7d %-8d %-10t %-7t %-8d %s\n",
-			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Ready, binding.Ifindex, binding.Interface)
+		fmt.Fprintf(&b, "  %-6d %-7d %-8d %-10t %-7t %-7t %-5t %-8d %-10d %s",
+			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Ready, binding.Bound, binding.XSKRegistered, binding.Ifindex, binding.RXPackets, binding.Interface)
+		if binding.LastError != "" {
+			fmt.Fprintf(&b, " (%s)", binding.LastError)
+		}
+		fmt.Fprintln(&b)
 	}
 	return b.String()
 }

@@ -1,3 +1,5 @@
+mod afxdp;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -191,6 +193,30 @@ struct BindingStatus {
     registered: bool,
     #[serde(default)]
     ready: bool,
+    #[serde(default)]
+    bound: bool,
+    #[serde(rename = "xsk_registered", default)]
+    xsk_registered: bool,
+    #[serde(rename = "socket_fd", default)]
+    socket_fd: i32,
+    #[serde(rename = "rx_packets", default)]
+    rx_packets: u64,
+    #[serde(rename = "rx_bytes", default)]
+    rx_bytes: u64,
+    #[serde(rename = "rx_batches", default)]
+    rx_batches: u64,
+    #[serde(rename = "rx_wakeups", default)]
+    rx_wakeups: u64,
+    #[serde(rename = "metadata_packets", default)]
+    metadata_packets: u64,
+    #[serde(rename = "metadata_errors", default)]
+    metadata_errors: u64,
+    #[serde(rename = "kernel_rx_dropped", default)]
+    kernel_rx_dropped: u64,
+    #[serde(rename = "kernel_rx_invalid_descs", default)]
+    kernel_rx_invalid_descs: u64,
+    #[serde(rename = "last_error", default)]
+    last_error: String,
     #[serde(rename = "last_change", skip_serializing_if = "Option::is_none")]
     last_change: Option<DateTime<Utc>>,
 }
@@ -207,6 +233,7 @@ struct ServerState {
     status: ProcessStatus,
     snapshot: Option<ConfigSnapshot>,
     heartbeats: Vec<Arc<AtomicI64>>,
+    afxdp: afxdp::Coordinator,
 }
 
 fn main() {
@@ -241,7 +268,7 @@ fn run() -> Result<(), String> {
             state_file: args.state_file.clone(),
             workers: args.workers,
             ring_entries: args.ring_entries,
-            helper_mode: "rust-bootstrap".to_string(),
+            helper_mode: "rust-afxdp-bootstrap".to_string(),
             io_uring_planned: true,
             enabled: false,
             last_snapshot_generation: 0,
@@ -252,6 +279,7 @@ fn run() -> Result<(), String> {
         },
         snapshot: None,
         heartbeats: Vec::new(),
+        afxdp: afxdp::Coordinator::new(),
     }));
 
     {
@@ -266,14 +294,13 @@ fn run() -> Result<(), String> {
     write_state(&args.state_file, &state)?;
 
     while running.load(Ordering::SeqCst) {
+        {
+            let mut guard = state.lock().expect("state poisoned");
+            guard.afxdp.poll_once();
+        }
         match listener.accept() {
             Ok((stream, _)) => {
-                let running = running.clone();
-                let state = state.clone();
-                let state_file = args.state_file.clone();
-                thread::spawn(move || {
-                    let _ = handle_stream(stream, &state_file, state, running);
-                });
+                let _ = handle_stream(stream, &args.state_file, state.clone(), running.clone());
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
@@ -282,6 +309,11 @@ fn run() -> Result<(), String> {
         }
     }
 
+    {
+        let mut guard = state.lock().expect("state poisoned");
+        guard.afxdp.stop();
+        refresh_status(&mut guard);
+    }
     write_state(&args.state_file, &state)?;
     let _ = fs::remove_file(&args.control_socket);
     Ok(())
@@ -404,6 +436,13 @@ fn handle_stream(
                         &existing_bindings,
                     );
                     guard.status.bindings = replanned;
+                    let snapshot = guard.snapshot.clone();
+                    let ring_entries = guard.status.ring_entries;
+                    let mut bindings = std::mem::take(&mut guard.status.bindings);
+                    guard
+                        .afxdp
+                        .reconcile(snapshot.as_ref(), &mut bindings, ring_entries);
+                    guard.status.bindings = bindings;
                     refresh_status(&mut guard);
                     persist_state = true;
                 } else {
@@ -421,7 +460,10 @@ fn handle_stream(
                         .filter(|b| b.queue_id == queue_req.queue_id)
                     {
                         binding.registered = queue_req.registered;
-                        binding.ready = queue_req.ready && queue_req.registered;
+                        binding.ready = queue_req.ready
+                            && queue_req.registered
+                            && binding.bound
+                            && binding.xsk_registered;
                         binding.last_change = Some(Utc::now());
                         found = true;
                     }
@@ -446,7 +488,10 @@ fn handle_stream(
                         .find(|b| b.slot == binding_req.slot)
                     {
                         binding.registered = binding_req.registered;
-                        binding.ready = binding_req.ready && binding_req.registered;
+                        binding.ready = binding_req.ready
+                            && binding_req.registered
+                            && binding.bound
+                            && binding.xsk_registered;
                         binding.last_change = Some(Utc::now());
                         refresh_status(&mut guard);
                         persist_state = true;
@@ -460,6 +505,7 @@ fn handle_stream(
                 }
             }
             "shutdown" => {
+                guard.afxdp.stop();
                 running.store(false, Ordering::SeqCst);
                 persist_state = true;
             }
@@ -486,6 +532,7 @@ fn handle_stream(
 }
 
 fn refresh_status(state: &mut ServerState) {
+    state.afxdp.refresh_bindings(&mut state.status.bindings);
     state.status.worker_heartbeats = collect_heartbeats(&state.heartbeats);
     state.status.enabled = state
         .status
@@ -633,7 +680,8 @@ fn write_state(state_file: &str, state: &Arc<Mutex<ServerState>>) -> Result<(), 
         snapshot: &'a Option<ConfigSnapshot>,
     }
 
-    let guard = state.lock().expect("state poisoned");
+    let mut guard = state.lock().expect("state poisoned");
+    refresh_status(&mut guard);
     let payload = Payload {
         status: &guard.status,
         snapshot: &guard.snapshot,
@@ -697,6 +745,7 @@ mod tests {
             registered: true,
             ready: true,
             last_change: Some(Utc::now()),
+            ..Default::default()
         }];
         let bindings = replan_bindings_from_candidates(
             1,

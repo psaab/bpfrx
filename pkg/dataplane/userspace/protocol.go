@@ -111,12 +111,24 @@ type QueueStatus struct {
 }
 
 type BindingStatus struct {
-	Slot       uint32    `json:"slot"`
-	QueueID    uint32    `json:"queue_id"`
-	WorkerID   uint32    `json:"worker_id"`
-	Interface  string    `json:"interface,omitempty"`
-	Ifindex    int       `json:"ifindex,omitempty"`
-	Registered bool      `json:"registered"`
-	Ready      bool      `json:"ready"`
-	LastChange time.Time `json:"last_change,omitempty"`
+	Slot                 uint32    `json:"slot"`
+	QueueID              uint32    `json:"queue_id"`
+	WorkerID             uint32    `json:"worker_id"`
+	Interface            string    `json:"interface,omitempty"`
+	Ifindex              int       `json:"ifindex,omitempty"`
+	Registered           bool      `json:"registered"`
+	Ready                bool      `json:"ready"`
+	Bound                bool      `json:"bound"`
+	XSKRegistered        bool      `json:"xsk_registered"`
+	SocketFD             int       `json:"socket_fd,omitempty"`
+	RXPackets            uint64    `json:"rx_packets,omitempty"`
+	RXBytes              uint64    `json:"rx_bytes,omitempty"`
+	RXBatches            uint64    `json:"rx_batches,omitempty"`
+	RXWakeups            uint64    `json:"rx_wakeups,omitempty"`
+	MetadataPackets      uint64    `json:"metadata_packets,omitempty"`
+	MetadataErrors       uint64    `json:"metadata_errors,omitempty"`
+	KernelRXDropped      uint64    `json:"kernel_rx_dropped,omitempty"`
+	KernelRXInvalidDescs uint64    `json:"kernel_rx_invalid_descs,omitempty"`
+	LastError            string    `json:"last_error,omitempty"`
+	LastChange           time.Time `json:"last_change,omitempty"`
 }
