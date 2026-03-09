@@ -4072,16 +4072,16 @@ func (c *CLI) showFlowStatistics() error {
 	fmt.Printf("  %-30s %d\n", "Host-inbound allowed:", hostAllow)
 	fmt.Printf("  %-30s %d\n", "Host-inbound denied:", hostDeny)
 
-	// IPv6 flow cache
+	// Flow cache (IPv4 + IPv6)
 	if cacheHit > 0 || cacheMiss > 0 {
 		fmt.Println()
-		fmt.Printf("  %-30s %d\n", "IPv6 flow cache hits:", cacheHit)
-		fmt.Printf("  %-30s %d\n", "IPv6 flow cache misses:", cacheMiss)
-		fmt.Printf("  %-30s %d\n", "IPv6 flow cache flushes:", cacheFlush)
-		fmt.Printf("  %-30s %d\n", "IPv6 flow cache invalidations:", cacheInval)
+		fmt.Printf("  %-30s %d\n", "Flow cache hits:", cacheHit)
+		fmt.Printf("  %-30s %d\n", "Flow cache misses:", cacheMiss)
+		fmt.Printf("  %-30s %d\n", "Flow cache flushes:", cacheFlush)
+		fmt.Printf("  %-30s %d\n", "Flow cache invalidations:", cacheInval)
 		if cacheHit+cacheMiss > 0 {
 			hitRate := float64(cacheHit) / float64(cacheHit+cacheMiss) * 100
-			fmt.Printf("  %-30s %.1f%%\n", "IPv6 flow cache hit rate:", hitRate)
+			fmt.Printf("  %-30s %.1f%%\n", "Flow cache hit rate:", hitRate)
 		}
 	}
 

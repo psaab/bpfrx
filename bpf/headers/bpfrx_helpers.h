@@ -387,6 +387,12 @@ set_l4_csum_flags(struct pkt_meta *meta, __sum16 l4_csum)
 {
 	meta->csum_partial = 0;
 	meta->l4_csum_saved = 0;
+
+	/* Native XDP never has CHECKSUM_PARTIAL — skip expensive
+	 * pseudo-header computation (saves ~10 insns IPv4, ~30 IPv6). */
+	if (meta->native_xdp)
+		return;
+
 	if (l4_csum != 0) {
 		__u16 l4_len = meta->pkt_len -
 			       (meta->l4_offset - meta->l3_offset);

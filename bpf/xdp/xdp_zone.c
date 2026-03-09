@@ -13,8 +13,269 @@
 #include "../headers/bpfrx_nat.h"
 #include "../headers/bpfrx_trace.h"
 
-#define IPV6_FLOW_CACHE_SLOTS      256
-#define IPV6_FLOW_CACHE_BATCH_PKTS 256
+#define FLOW_CACHE_SLOTS           256
+#define FLOW_CACHE_BATCH_PKTS      256
+
+/* ---- IPv4 per-CPU flow cache ---- */
+
+struct ipv4_flow_cache_key {
+	__be32 src_ip;
+	__be32 dst_ip;
+	__be16 src_port;
+	__be16 dst_port;
+	__u8   protocol;
+	__u8   pad[3];
+};
+
+struct ipv4_flow_cache_entry {
+	struct ipv4_flow_cache_key key;
+	__u64 last_seen;
+	__u64 pending_bytes;
+	__u32 policy_id;
+	__u32 fwd_ifindex;
+	__u32 last_flush;
+	__u32 pending_packets;
+	__u16 egress_vlan_id;
+	__u16 egress_zone;
+	__u16 fib_gen;
+	__u8  valid;
+	__u8  ct_direction;
+	__u8  next_prog;
+	__u8  count_as_fwd;
+	__u8  rewrite_src;
+	__u8  nat_flags;
+	__be32 rewrite_src_ip;
+	__be16 rewrite_src_port;
+	__u8  fwd_dmac[6];
+	__u8  fwd_smac[6];
+	__u8  pad0[2];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, FLOW_CACHE_SLOTS);
+	__type(key, __u32);
+	__type(value, struct ipv4_flow_cache_entry);
+} ipv4_flow_cache SEC(".maps");
+
+static __always_inline int
+ipv4_flow_cacheable_tcp(struct pkt_meta *meta)
+{
+	if (meta->addr_family != AF_INET || meta->protocol != PROTO_TCP)
+		return 0;
+	if (!(meta->tcp_flags & 0x10))
+		return 0;
+	if (meta->tcp_flags & 0x07)
+		return 0;
+	return 1;
+}
+
+static __always_inline int
+ipv4_session_cacheable(struct session_value *sess)
+{
+	if (!sess || sess->state != SESS_STATE_ESTABLISHED)
+		return 0;
+	if (sess->flags & (SESS_FLAG_ALG | SESS_FLAG_PREDICTED))
+		return 0;
+	return 1;
+}
+
+static __always_inline __u32
+ipv4_flow_cache_slot(struct pkt_meta *meta)
+{
+	__u32 hash = (__u32)meta->src_ip.v4 ^ (__u32)meta->dst_ip.v4;
+	hash ^= ((__u32)meta->src_port << 16) ^ (__u32)meta->dst_port;
+	hash ^= ((__u32)meta->protocol << 24);
+	/* Mix bits down */
+	hash ^= (hash >> 16);
+	return hash & (FLOW_CACHE_SLOTS - 1);
+}
+
+static __always_inline void
+fill_ipv4_flow_cache_key(struct ipv4_flow_cache_key *key, struct pkt_meta *meta)
+{
+	key->src_ip   = meta->src_ip.v4;
+	key->dst_ip   = meta->dst_ip.v4;
+	key->src_port = meta->src_port;
+	key->dst_port = meta->dst_port;
+	key->protocol = meta->protocol;
+}
+
+static __always_inline int
+ipv4_flow_cache_match(struct ipv4_flow_cache_entry *entry,
+		      struct pkt_meta *meta)
+{
+	if (!entry->valid)
+		return 0;
+	if (entry->key.src_ip   != meta->src_ip.v4 ||
+	    entry->key.dst_ip   != meta->dst_ip.v4 ||
+	    entry->key.src_port != meta->src_port ||
+	    entry->key.dst_port != meta->dst_port ||
+	    entry->key.protocol != meta->protocol)
+		return 0;
+	return 1;
+}
+
+static __noinline int
+flush_ipv4_flow_cache_entry(struct ipv4_flow_cache_entry *entry)
+{
+	if (!entry->valid || entry->pending_packets == 0)
+		return 0;
+
+	struct session_key key = {};
+	key.src_ip   = entry->key.src_ip;
+	key.dst_ip   = entry->key.dst_ip;
+	key.src_port = entry->key.src_port;
+	key.dst_port = entry->key.dst_port;
+	key.protocol = entry->key.protocol;
+
+	struct session_value *sess = bpf_map_lookup_elem(&sessions, &key);
+	if (!sess || sess->state != SESS_STATE_ESTABLISHED ||
+	    sess->fib_ifindex != entry->fwd_ifindex ||
+	    sess->fib_vlan_id != entry->egress_vlan_id ||
+	    sess->fib_gen != entry->fib_gen) {
+		entry->valid = 0;
+		entry->pending_packets = 0;
+		entry->pending_bytes = 0;
+		return -1;
+	}
+
+	if (entry->count_as_fwd) {
+		__sync_fetch_and_add(&sess->fwd_packets, entry->pending_packets);
+		__sync_fetch_and_add(&sess->fwd_bytes, entry->pending_bytes);
+	} else {
+		__sync_fetch_and_add(&sess->rev_packets, entry->pending_packets);
+		__sync_fetch_and_add(&sess->rev_bytes, entry->pending_bytes);
+	}
+	if (sess->last_seen != entry->last_seen)
+		sess->last_seen = entry->last_seen;
+
+	entry->pending_packets = 0;
+	entry->pending_bytes = 0;
+	entry->last_flush = (__u32)entry->last_seen;
+	inc_counter(GLOBAL_CTR_FLOW_CACHE_FLUSH);
+	return 0;
+}
+
+static __always_inline void
+populate_ipv4_flow_cache(struct ipv4_flow_cache_entry *entry,
+			 struct pkt_meta *meta,
+			 struct session_value *sess,
+			 __u8 direction,
+			 __u32 fib_gen,
+			 __u64 now)
+{
+	int is_fwd = (direction == sess->is_reverse);
+
+	if (entry->valid)
+		flush_ipv4_flow_cache_entry(entry);
+
+	__builtin_memset(entry, 0, sizeof(*entry));
+	fill_ipv4_flow_cache_key(&entry->key, meta);
+	entry->valid = 1;
+	entry->ct_direction = direction;
+	entry->nat_flags = sess->flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT);
+	entry->next_prog = entry->nat_flags ?
+		XDP_PROG_NAT : XDP_PROG_FORWARD;
+	entry->count_as_fwd = (direction == sess->is_reverse);
+	entry->policy_id = sess->policy_id;
+	entry->fwd_ifindex = sess->fib_ifindex;
+	entry->egress_vlan_id = sess->fib_vlan_id;
+	entry->egress_zone = sess->egress_zone;
+	entry->fib_gen = (__u16)fib_gen;
+	entry->last_seen = now;
+	entry->last_flush = (__u32)now;
+	__builtin_memcpy(entry->fwd_dmac, sess->fib_dmac, 6);
+	__builtin_memcpy(entry->fwd_smac, sess->fib_smac, 6);
+
+	if ((sess->flags & SESS_FLAG_SNAT) && is_fwd) {
+		entry->rewrite_src = 1;
+		entry->rewrite_src_ip = sess->nat_src_ip;
+		entry->rewrite_src_port = sess->nat_src_port;
+	} else if ((sess->flags & SESS_FLAG_DNAT) && !is_fwd) {
+		entry->rewrite_src = 1;
+		entry->rewrite_src_ip = sess->nat_dst_ip;
+		entry->rewrite_src_port = sess->nat_dst_port;
+	}
+}
+
+static __always_inline int
+try_ipv4_flow_cache(struct xdp_md *ctx, struct pkt_meta *meta,
+		    __u32 fib_gen)
+{
+	if (!ipv4_flow_cacheable_tcp(meta))
+		return -1;
+
+	__u32 slot = ipv4_flow_cache_slot(meta);
+	struct ipv4_flow_cache_entry *entry =
+		bpf_map_lookup_elem(&ipv4_flow_cache, &slot);
+	if (!entry || !ipv4_flow_cache_match(entry, meta)) {
+		inc_counter(GLOBAL_CTR_FLOW_CACHE_MISS);
+		return -1;
+	}
+
+	if (entry->fwd_ifindex == 0 ||
+	    entry->fib_gen != (__u16)fib_gen ||
+	    !check_egress_rg_active(entry->fwd_ifindex, entry->egress_vlan_id)) {
+		flush_ipv4_flow_cache_entry(entry);
+		entry->valid = 0;
+		inc_counter(GLOBAL_CTR_FLOW_CACHE_INVALIDATE);
+		return -1;
+	}
+
+	__u64 now = meta->now_sec;
+	if (entry->pending_packets >= FLOW_CACHE_BATCH_PKTS ||
+	    entry->last_flush != (__u32)now) {
+		if (flush_ipv4_flow_cache_entry(entry) < 0) {
+			inc_counter(GLOBAL_CTR_FLOW_CACHE_INVALIDATE);
+			return -1;
+		}
+	}
+
+	entry->pending_packets++;
+	entry->pending_bytes += meta->pkt_len;
+	entry->last_seen = now;
+
+	meta->ct_state = SESS_STATE_ESTABLISHED;
+	meta->ct_direction = entry->ct_direction;
+	meta->policy_id = entry->policy_id;
+	meta->nat_flags = entry->nat_flags;
+	meta->fwd_ifindex = entry->fwd_ifindex;
+	meta->egress_vlan_id = entry->egress_vlan_id;
+	meta->egress_zone = entry->egress_zone;
+	__builtin_memcpy(meta->fwd_dmac, entry->fwd_dmac, 6);
+	__builtin_memcpy(meta->fwd_smac, entry->fwd_smac, 6);
+
+	if (entry->rewrite_src) {
+		meta->src_ip.v4 = entry->rewrite_src_ip;
+		meta->src_port = entry->rewrite_src_port;
+	}
+
+	inc_counter(GLOBAL_CTR_FLOW_CACHE_HIT);
+	bpf_tail_call(ctx, &xdp_progs, entry->next_prog);
+	return XDP_PASS;
+}
+
+static __always_inline void
+flush_matching_ipv4_flow_cache(struct pkt_meta *meta)
+{
+	if (meta->addr_family != AF_INET || meta->protocol != PROTO_TCP)
+		return;
+
+	__u32 slot = ipv4_flow_cache_slot(meta);
+	struct ipv4_flow_cache_entry *entry =
+		bpf_map_lookup_elem(&ipv4_flow_cache, &slot);
+	if (!entry || !ipv4_flow_cache_match(entry, meta))
+		return;
+
+	flush_ipv4_flow_cache_entry(entry);
+	entry->valid = 0;
+}
+
+/* ---- IPv6 per-CPU flow cache ---- */
+
+#define IPV6_FLOW_CACHE_SLOTS      FLOW_CACHE_SLOTS
+#define IPV6_FLOW_CACHE_BATCH_PKTS FLOW_CACHE_BATCH_PKTS
 
 struct ipv6_flow_cache_key {
 	__be32 src_ip[4];
@@ -1017,6 +1278,12 @@ zone_resolved:
 	if (fib_gen_ptr)
 		fib_gen = *fib_gen_ptr;
 
+	if (!is_tcp_syn && try_ipv4_flow_cache(ctx, meta, fib_gen) >= 0)
+		return XDP_PASS;
+	if (!is_tcp_syn && meta->addr_family == AF_INET &&
+	    meta->protocol == PROTO_TCP && !ipv4_flow_cacheable_tcp(meta))
+		flush_matching_ipv4_flow_cache(meta);
+
 	if (!is_tcp_syn && try_ipv6_flow_cache(ctx, meta, fib_gen) >= 0)
 		return XDP_PASS;
 	if (!is_tcp_syn && meta->addr_family == AF_INET6 &&
@@ -1065,6 +1332,19 @@ zone_resolved:
 		}
 		if (!skip_cache_v4 && sv4 && sv4->fib_ifindex != 0 &&
 		    sv4->fib_gen == (__u16)fib_gen) {
+			if (ipv4_flow_cacheable_tcp(meta) &&
+			    ipv4_session_cacheable(sv4)) {
+				__u32 slot = ipv4_flow_cache_slot(meta);
+				struct ipv4_flow_cache_entry *entry =
+					bpf_map_lookup_elem(&ipv4_flow_cache,
+							    &slot);
+				if (entry)
+					populate_ipv4_flow_cache(entry, meta,
+								 sv4,
+								 ct_direction,
+								 fib_gen,
+								 meta->now_sec);
+			}
 			meta->fwd_ifindex    = sv4->fib_ifindex;
 			meta->egress_vlan_id = sv4->fib_vlan_id;
 			__builtin_memcpy(meta->fwd_dmac, sv4->fib_dmac, 6);

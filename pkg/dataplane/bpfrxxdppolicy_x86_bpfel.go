@@ -381,7 +381,7 @@ type bpfrxXdpPolicyPktMeta struct {
 	FwdSmac       [6]uint8
 	RoutingTable  uint32
 	DscpRewrite   uint8
-	PadMeta       uint8
+	NativeXdp     uint8
 	L4CsumSaved   uint16
 	AppTimeout    uint32
 	MirrorIfindex uint32

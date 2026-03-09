@@ -456,7 +456,7 @@ struct pkt_meta {
 
 	/* DSCP rewrite (set by firewall filter, 0xFF = no rewrite) */
 	__u8  dscp_rewrite;
-	__u8  pad_meta;
+	__u8  native_xdp;  /* 1 = ingress iface has native XDP (no CHECKSUM_PARTIAL) */
 
 	/* Per-application inactivity timeout override (seconds, 0 = use default) */
 	__u16 l4_csum_saved;  /* deferred L4 checksum for lazy CHECKSUM_PARTIAL (IPv6) */

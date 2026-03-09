@@ -215,6 +215,39 @@ type bpfrxXdpZoneIfaceZoneValue struct {
 	ScreenFlags  uint32
 }
 
+type bpfrxXdpZoneIpv4FlowCacheEntry struct {
+	_   structs.HostLayout
+	Key struct {
+		_        structs.HostLayout
+		SrcIp    uint32
+		DstIp    uint32
+		SrcPort  uint16
+		DstPort  uint16
+		Protocol uint8
+		Pad      [3]uint8
+	}
+	LastSeen       uint64
+	PendingBytes   uint64
+	PolicyId       uint32
+	FwdIfindex     uint32
+	LastFlush      uint32
+	PendingPackets uint32
+	EgressVlanId   uint16
+	EgressZone     uint16
+	FibGen         uint16
+	Valid          uint8
+	CtDirection    uint8
+	NextProg       uint8
+	CountAsFwd     uint8
+	RewriteSrc     uint8
+	NatFlags       uint8
+	RewriteSrcIp   uint32
+	RewriteSrcPort uint16
+	FwdDmac        [6]uint8
+	FwdSmac        [6]uint8
+	Pad0           [2]uint8
+}
+
 type bpfrxXdpZoneIpv6FlowCacheEntry struct {
 	_   structs.HostLayout
 	Key struct {
@@ -388,7 +421,7 @@ type bpfrxXdpZonePktMeta struct {
 	FwdSmac       [6]uint8
 	RoutingTable  uint32
 	DscpRewrite   uint8
-	PadMeta       uint8
+	NativeXdp     uint8
 	L4CsumSaved   uint16
 	AppTimeout    uint32
 	MirrorIfindex uint32
@@ -724,6 +757,7 @@ type bpfrxXdpZoneMapSpecs struct {
 	IfaceZoneMap      *ebpf.MapSpec `ebpf:"iface_zone_map"`
 	InterfaceCounters *ebpf.MapSpec `ebpf:"interface_counters"`
 	IpSweepTrack      *ebpf.MapSpec `ebpf:"ip_sweep_track"`
+	Ipv4FlowCache     *ebpf.MapSpec `ebpf:"ipv4_flow_cache"`
 	Ipv6FlowCache     *ebpf.MapSpec `ebpf:"ipv6_flow_cache"`
 	MirrorConfig      *ebpf.MapSpec `ebpf:"mirror_config"`
 	MirrorCounter     *ebpf.MapSpec `ebpf:"mirror_counter"`
@@ -815,6 +849,7 @@ type bpfrxXdpZoneMaps struct {
 	IfaceZoneMap      *ebpf.Map `ebpf:"iface_zone_map"`
 	InterfaceCounters *ebpf.Map `ebpf:"interface_counters"`
 	IpSweepTrack      *ebpf.Map `ebpf:"ip_sweep_track"`
+	Ipv4FlowCache     *ebpf.Map `ebpf:"ipv4_flow_cache"`
 	Ipv6FlowCache     *ebpf.Map `ebpf:"ipv6_flow_cache"`
 	MirrorConfig      *ebpf.Map `ebpf:"mirror_config"`
 	MirrorCounter     *ebpf.Map `ebpf:"mirror_counter"`
@@ -882,6 +917,7 @@ func (m *bpfrxXdpZoneMaps) Close() error {
 		m.IfaceZoneMap,
 		m.InterfaceCounters,
 		m.IpSweepTrack,
+		m.Ipv4FlowCache,
 		m.Ipv6FlowCache,
 		m.MirrorConfig,
 		m.MirrorCounter,

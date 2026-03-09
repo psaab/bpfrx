@@ -129,7 +129,7 @@ func newCollector(srv *Server) *bpfrxCollector {
 		),
 		flowCacheTotal: prometheus.NewDesc(
 			"bpfrx_flow_cache_total",
-			"IPv6 flow cache counters by type.",
+			"Flow cache counters by type (IPv4 + IPv6).",
 			[]string{"type"}, nil,
 		),
 		ifacePacketsTotal: prometheus.NewDesc(
@@ -342,7 +342,7 @@ func (c *bpfrxCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp d
 	ch <- prometheus.MustNewConstMetric(c.syncookieTotal, prometheus.CounterValue,
 		readCounter(dataplane.GlobalCtrSyncookieBypass), "bypass")
 
-	// IPv6 flow cache counters
+	// Flow cache counters (IPv4 + IPv6)
 	ch <- prometheus.MustNewConstMetric(c.flowCacheTotal, prometheus.CounterValue,
 		readCounter(dataplane.GlobalCtrFlowCacheHit), "hit")
 	ch <- prometheus.MustNewConstMetric(c.flowCacheTotal, prometheus.CounterValue,

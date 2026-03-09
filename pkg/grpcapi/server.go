@@ -5159,13 +5159,13 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			cacheMiss := readCtr(dataplane.GlobalCtrFlowCacheMiss)
 			if cacheHit > 0 || cacheMiss > 0 {
 				buf.WriteString("\n")
-				fmt.Fprintf(&buf, "  %-30s %d\n", "IPv6 flow cache hits:", cacheHit)
-				fmt.Fprintf(&buf, "  %-30s %d\n", "IPv6 flow cache misses:", cacheMiss)
-				fmt.Fprintf(&buf, "  %-30s %d\n", "IPv6 flow cache flushes:", readCtr(dataplane.GlobalCtrFlowCacheFlush))
-				fmt.Fprintf(&buf, "  %-30s %d\n", "IPv6 flow cache invalidations:", readCtr(dataplane.GlobalCtrFlowCacheInvalidate))
+				fmt.Fprintf(&buf, "  %-30s %d\n", "Flow cache hits:", cacheHit)
+				fmt.Fprintf(&buf, "  %-30s %d\n", "Flow cache misses:", cacheMiss)
+				fmt.Fprintf(&buf, "  %-30s %d\n", "Flow cache flushes:", readCtr(dataplane.GlobalCtrFlowCacheFlush))
+				fmt.Fprintf(&buf, "  %-30s %d\n", "Flow cache invalidations:", readCtr(dataplane.GlobalCtrFlowCacheInvalidate))
 				if cacheHit+cacheMiss > 0 {
 					hitRate := float64(cacheHit) / float64(cacheHit+cacheMiss) * 100
-					fmt.Fprintf(&buf, "  %-30s %.1f%%\n", "IPv6 flow cache hit rate:", hitRate)
+					fmt.Fprintf(&buf, "  %-30s %.1f%%\n", "Flow cache hit rate:", hitRate)
 				}
 			}
 		}
