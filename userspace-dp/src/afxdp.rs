@@ -29,6 +29,8 @@ const STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
+const BIND_RETRY_ATTEMPTS: usize = 10;
+const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -753,8 +755,7 @@ impl BindingWorker {
             .map_err(|e| format!("configure rx ring: {e}"))?;
         let rx = user.map_rx().map_err(|e| format!("map rx ring: {e}"))?;
         let tx = user.map_tx().map_err(|e| format!("map tx ring: {e}"))?;
-        umem.bind(&user)
-            .map_err(|e| format!("bind AF_XDP socket: {e}"))?;
+        bind_user_with_retry(&umem, &user)?;
         let reserved_tx = RESERVED_TX_FRAMES
             .min(ring_entries.saturating_sub(1))
             .max(1);
@@ -804,6 +805,26 @@ impl BindingWorker {
             ifindex: self.ifindex,
         }
     }
+}
+
+fn bind_user_with_retry(
+    umem: &Umem,
+    user: &User,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for attempt in 0..BIND_RETRY_ATTEMPTS {
+        match umem.bind(user) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let msg = err.to_string();
+                if attempt + 1 < BIND_RETRY_ATTEMPTS && msg.contains("Device or resource busy") {
+                    thread::sleep(BIND_RETRY_DELAY);
+                    continue;
+                }
+                return Err(format!("bind AF_XDP socket: {msg}").into());
+            }
+        }
+    }
+    Err("bind AF_XDP socket: exhausted retries".into())
 }
 
 fn poll_binding(
