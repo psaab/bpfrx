@@ -870,12 +870,60 @@ func (m *Manager) Status() (ProcessStatus, error) {
 	return status, nil
 }
 
-func (m *Manager) SetBindingState(slot uint32, registered, armed bool) error {
+func (m *Manager) SetForwardingArmed(armed bool) (ProcessStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.proc == nil {
-		return errors.New("userspace dataplane helper not running")
+		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	var status ProcessStatus
+	req := ControlRequest{
+		Type: "set_forwarding_state",
+		Forwarding: &ForwardingControlRequest{
+			Armed: armed,
+		},
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		return ProcessStatus{}, err
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return status, err
+	}
+	return status, nil
+}
+
+func (m *Manager) SetQueueState(queueID uint32, registered, armed bool) (ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	var status ProcessStatus
+	req := ControlRequest{
+		Type: "set_queue_state",
+		Queue: &QueueControlRequest{
+			QueueID:    queueID,
+			Registered: registered,
+			Armed:      armed,
+		},
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		return ProcessStatus{}, err
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return status, err
+	}
+	return status, nil
+}
+
+func (m *Manager) SetBindingState(slot uint32, registered, armed bool) (ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
 	}
 	var status ProcessStatus
 	req := ControlRequest{
@@ -887,9 +935,12 @@ func (m *Manager) SetBindingState(slot uint32, registered, armed bool) error {
 		},
 	}
 	if err := m.requestLocked(req, &status); err != nil {
-		return err
+		return ProcessStatus{}, err
 	}
-	return m.applyHelperStatusLocked(&status)
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return status, err
+	}
+	return status, nil
 }
 
 func (m *Manager) InjectPacket(req InjectPacketRequest) (ProcessStatus, error) {

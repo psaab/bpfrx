@@ -424,7 +424,8 @@ impl Coordinator {
                         &self.last_resolution,
                     );
                     if req.emit_on_wire {
-                        let Some(egress) = self.forwarding.egress.get(&resolution.egress_ifindex) else {
+                        let Some(egress) = self.forwarding.egress.get(&resolution.egress_ifindex)
+                        else {
                             return Err(format!(
                                 "no egress interface metadata for ifindex {}",
                                 resolution.egress_ifindex
@@ -455,10 +456,9 @@ impl Coordinator {
                                     egress.bind_ifindex
                                 )
                             })?;
-                        let target_live = self
-                            .live
-                            .get(&target_slot)
-                            .ok_or_else(|| format!("binding slot {} has no live state", target_slot))?;
+                        let target_live = self.live.get(&target_slot).ok_or_else(|| {
+                            format!("binding slot {} has no live state", target_slot)
+                        })?;
                         let frame = build_injected_packet(&req, dst, resolution, egress)?;
                         target_live.enqueue_tx(TxRequest { bytes: frame })?;
                     }
@@ -755,7 +755,9 @@ impl BindingWorker {
         let tx = user.map_tx().map_err(|e| format!("map tx ring: {e}"))?;
         umem.bind(&user)
             .map_err(|e| format!("bind AF_XDP socket: {e}"))?;
-        let reserved_tx = RESERVED_TX_FRAMES.min(ring_entries.saturating_sub(1)).max(1);
+        let reserved_tx = RESERVED_TX_FRAMES
+            .min(ring_entries.saturating_sub(1))
+            .max(1);
         prime_fill_ring(&umem, &mut device, reserved_tx)?;
         let mut free_tx_frames = VecDeque::with_capacity(reserved_tx as usize);
         for idx in 0..reserved_tx {
@@ -919,7 +921,10 @@ fn drain_pending_tx(binding: &mut BindingWorker) {
         match transmit_frame(binding, &req.bytes) {
             Ok(len) => {
                 binding.live.tx_packets.fetch_add(1, Ordering::Relaxed);
-                binding.live.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                binding
+                    .live
+                    .tx_bytes
+                    .fetch_add(len as u64, Ordering::Relaxed);
             }
             Err(err) => {
                 binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
@@ -935,7 +940,10 @@ fn transmit_frame(binding: &mut BindingWorker, frame: &[u8]) -> Result<usize, St
     };
     let Some(area) = binding.area.slice_mut(offset as usize, frame.len()) else {
         binding.free_tx_frames.push_front(offset);
-        return Err(format!("tx frame slice out of range: offset={offset} len={}", frame.len()));
+        return Err(format!(
+            "tx frame slice out of range: offset={offset} len={}",
+            frame.len()
+        ));
     };
     area.copy_from_slice(frame);
     let mut writer = binding.tx.transmit(1);
@@ -1320,7 +1328,9 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         } else {
             iface.ifindex
         };
-        let src_mac = match parse_mac(&iface.hardware_addr).or_else(|| mac_by_ifindex.get(&bind_ifindex).copied()) {
+        let src_mac = match parse_mac(&iface.hardware_addr)
+            .or_else(|| mac_by_ifindex.get(&bind_ifindex).copied())
+        {
             Some(mac) => mac,
             None => continue,
         };
@@ -1851,7 +1861,18 @@ fn build_injected_ipv4(
     let total_len = (20 + 8 + payload_len) as u16;
     let ip_start = frame.len();
     frame.extend_from_slice(&[
-        0x45, 0x00, (total_len >> 8) as u8, total_len as u8, 0x00, 0x01, 0x00, 0x00, 64, 1, 0, 0,
+        0x45,
+        0x00,
+        (total_len >> 8) as u8,
+        total_len as u8,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        64,
+        1,
+        0,
+        0,
     ]);
     frame.extend_from_slice(&src_ip.octets());
     frame.extend_from_slice(&dst_ip.octets());
@@ -1889,7 +1910,16 @@ fn build_injected_ipv6(
     let mut frame = Vec::with_capacity(target_len);
     write_eth_header(&mut frame, dst_mac, egress.src_mac, egress.vlan_id, 0x86dd);
     let plen = (8 + payload_len) as u16;
-    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, (plen >> 8) as u8, plen as u8, 58, 64]);
+    frame.extend_from_slice(&[
+        0x60,
+        0x00,
+        0x00,
+        0x00,
+        (plen >> 8) as u8,
+        plen as u8,
+        58,
+        64,
+    ]);
     frame.extend_from_slice(&src_ip.octets());
     frame.extend_from_slice(&dst_ip.octets());
 

@@ -2704,14 +2704,45 @@ func (c *ctl) handleRequestChassisClusterDataPlane(args []string) error {
 		return nil
 	}
 	args = args[1:]
-	slot, mode, extra, err := dpuserspace.ParseInjectPacketCommand(args)
-	if err != nil {
-		return err
+	var action string
+	var target string
+	switch {
+	case len(args) > 0 && args[0] == "inject-packet":
+		slot, mode, extra, err := dpuserspace.ParseInjectPacketCommand(args)
+		if err != nil {
+			return err
+		}
+		action = fmt.Sprintf("userspace-inject:%d:%s", slot, mode)
+		target = extra["destination-ip"]
+	case len(args) > 0 && args[0] == "forwarding":
+		armed, err := dpuserspace.ParseForwardingCommand(args)
+		if err != nil {
+			return err
+		}
+		if armed {
+			action = "userspace-forwarding:arm"
+		} else {
+			action = "userspace-forwarding:disarm"
+		}
+	case len(args) > 0 && args[0] == "queue":
+		queueID, _, _, err := dpuserspace.ParseQueueCommand(args)
+		if err != nil {
+			return err
+		}
+		action = fmt.Sprintf("userspace-queue:%d:%s", queueID, strings.ToLower(args[2]))
+	case len(args) > 0 && args[0] == "binding":
+		slot, _, _, err := dpuserspace.ParseBindingCommand(args)
+		if err != nil {
+			return err
+		}
+		action = fmt.Sprintf("userspace-binding:%d:%s", slot, strings.ToLower(args[3]))
+	default:
+		printRemoteTreeHelp("request chassis cluster data-plane userspace:", "request", "chassis", "cluster", "data-plane", "userspace")
+		return nil
 	}
-	action := fmt.Sprintf("userspace-inject:%d:%s", slot, mode)
 	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 		Action: action,
-		Target: extra["destination-ip"],
+		Target: target,
 	})
 	if err != nil {
 		return fmt.Errorf("%v", err)

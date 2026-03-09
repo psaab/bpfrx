@@ -11501,10 +11501,16 @@ func (c *CLI) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
 
 func (c *CLI) userspaceDataplaneControl() (interface {
 	Status() (dpuserspace.ProcessStatus, error)
+	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
+	SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
 	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
 }, error) {
 	provider, ok := c.dp.(interface {
 		Status() (dpuserspace.ProcessStatus, error)
+		SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
+		SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+		SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
 		InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
 	})
 	if !ok {
@@ -12237,26 +12243,62 @@ func (c *CLI) handleRequestChassisClusterDataPlane(args []string) error {
 		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children["cluster"].Children["data-plane"].Children))
 		return nil
 	}
-	args = args[1:]
-	slot, mode, extra, err := dpuserspace.ParseInjectPacketCommand(args)
-	if err != nil {
-		return err
-	}
 	provider, err := c.userspaceDataplaneControl()
 	if err != nil {
 		return err
 	}
-	status, err := provider.Status()
-	if err != nil {
-		return err
-	}
-	req, err := dpuserspace.BuildInjectPacketRequest(slot, mode, extra, status)
-	if err != nil {
-		return err
-	}
-	status, err = provider.InjectPacket(req)
-	if err != nil {
-		return err
+	args = args[1:]
+
+	var status dpuserspace.ProcessStatus
+	switch {
+	case len(args) > 0 && args[0] == "inject-packet":
+		slot, mode, extra, err := dpuserspace.ParseInjectPacketCommand(args)
+		if err != nil {
+			return err
+		}
+		status, err = provider.Status()
+		if err != nil {
+			return err
+		}
+		req, err := dpuserspace.BuildInjectPacketRequest(slot, mode, extra, status)
+		if err != nil {
+			return err
+		}
+		status, err = provider.InjectPacket(req)
+		if err != nil {
+			return err
+		}
+	case len(args) > 0 && args[0] == "forwarding":
+		armed, err := dpuserspace.ParseForwardingCommand(args)
+		if err != nil {
+			return err
+		}
+		status, err = provider.SetForwardingArmed(armed)
+		if err != nil {
+			return err
+		}
+	case len(args) > 0 && args[0] == "queue":
+		queueID, registered, armed, err := dpuserspace.ParseQueueCommand(args)
+		if err != nil {
+			return err
+		}
+		status, err = provider.SetQueueState(queueID, registered, armed)
+		if err != nil {
+			return err
+		}
+	case len(args) > 0 && args[0] == "binding":
+		slot, registered, armed, err := dpuserspace.ParseBindingCommand(args)
+		if err != nil {
+			return err
+		}
+		status, err = provider.SetBindingState(slot, registered, armed)
+		if err != nil {
+			return err
+		}
+	default:
+		fmt.Println("request chassis cluster data-plane userspace:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children["cluster"].Children["data-plane"].Children["userspace"].Children))
+		return nil
 	}
 	fmt.Print(dpuserspace.FormatStatusSummary(status))
 	fmt.Println()

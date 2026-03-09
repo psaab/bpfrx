@@ -143,6 +143,8 @@ struct ControlRequest {
     #[serde(default)]
     snapshot: Option<ConfigSnapshot>,
     #[serde(default)]
+    forwarding: Option<ForwardingControlRequest>,
+    #[serde(default)]
     queue: Option<QueueControlRequest>,
     #[serde(default)]
     binding: Option<BindingControlRequest>,
@@ -228,6 +230,12 @@ struct PacketResolution {
     next_hop: String,
     #[serde(rename = "neighbor_mac", default)]
     neighbor_mac: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct ForwardingControlRequest {
+    #[serde(default)]
+    armed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -603,21 +611,38 @@ fn handle_stream(
                     response.error = "missing snapshot".to_string();
                 }
             }
+            "set_forwarding_state" => {
+                if let Some(forwarding_req) = request.forwarding {
+                    guard.status.forwarding_armed = forwarding_req.armed;
+                    refresh_status(&mut guard);
+                    persist_state = true;
+                } else {
+                    response.ok = false;
+                    response.error = "missing forwarding state".to_string();
+                }
+            }
             "set_queue_state" => {
                 if let Some(queue_req) = request.queue {
                     let mut found = false;
+                    let mut registration_changed = false;
                     for binding in guard
                         .status
                         .bindings
                         .iter_mut()
                         .filter(|b| b.queue_id == queue_req.queue_id)
                     {
+                        if binding.registered != queue_req.registered {
+                            registration_changed = true;
+                        }
                         binding.registered = queue_req.registered;
                         binding.armed = queue_req.armed && queue_req.registered;
                         binding.last_change = Some(Utc::now());
                         found = true;
                     }
                     if found {
+                        if registration_changed {
+                            reconcile_status_bindings(&mut guard);
+                        }
                         refresh_status(&mut guard);
                         persist_state = true;
                     } else {
@@ -637,9 +662,13 @@ fn handle_stream(
                         .iter_mut()
                         .find(|b| b.slot == binding_req.slot)
                     {
+                        let registration_changed = binding.registered != binding_req.registered;
                         binding.registered = binding_req.registered;
                         binding.armed = binding_req.armed && binding_req.registered;
                         binding.last_change = Some(Utc::now());
+                        if registration_changed {
+                            reconcile_status_bindings(&mut guard);
+                        }
                         refresh_status(&mut guard);
                         persist_state = true;
                     } else {
@@ -718,9 +747,7 @@ fn refresh_status(state: &mut ServerState) {
     let (reconcile_calls, reconcile_stage) = state.afxdp.reconcile_debug();
     state.status.debug_reconcile_calls = reconcile_calls;
     state.status.debug_reconcile_stage = reconcile_stage;
-    state.status.enabled = state
-        .status
-        .forwarding_armed
+    state.status.enabled = state.status.forwarding_armed
         && state
             .status
             .bindings
@@ -729,6 +756,16 @@ fn refresh_status(state: &mut ServerState) {
     state.status.queues = summarize_queues(&state.status.bindings);
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
     state.status.last_resolution = state.afxdp.last_resolution();
+}
+
+fn reconcile_status_bindings(state: &mut ServerState) {
+    let snapshot = state.snapshot.clone();
+    let ring_entries = state.status.ring_entries;
+    let mut bindings = std::mem::take(&mut state.status.bindings);
+    state
+        .afxdp
+        .reconcile(snapshot.as_ref(), &mut bindings, ring_entries);
+    state.status.bindings = bindings;
 }
 
 fn replan_queues(
@@ -785,15 +822,23 @@ fn replan_bindings_from_candidates(
     for queue_id in 0..queue_count {
         for iface in &interfaces {
             let mut binding = existing_by_slot.remove(&slot).unwrap_or_default();
+            let had_existing = binding.last_change.is_some()
+                || binding.registered
+                || binding.armed
+                || binding.ready
+                || binding.bound
+                || binding.xsk_registered;
             binding.slot = slot;
             binding.queue_id = queue_id as u32;
             binding.worker_id = (queue_id % workers.max(1)) as u32;
             binding.interface = iface.clone();
             binding.ifindex = *ifindex_by_name.get(iface).unwrap_or(&0);
-            binding.registered = binding.ifindex > 0;
-            if !binding.registered {
+            if binding.ifindex <= 0 {
+                binding.registered = false;
                 binding.armed = false;
                 binding.ready = false;
+            } else if !had_existing {
+                binding.registered = true;
             }
             if binding.last_change.is_none() {
                 binding.last_change = Some(Utc::now());
@@ -925,6 +970,7 @@ mod tests {
             interface: "ge-0-0-1".to_string(),
             ifindex: 11,
             registered: true,
+            armed: true,
             ready: true,
             last_change: Some(Utc::now()),
             ..Default::default()
@@ -937,10 +983,35 @@ mod tests {
         );
         if let Some(b0) = bindings.iter().find(|b| b.slot == 0) {
             assert!(b0.registered);
+            assert!(b0.armed);
             assert!(b0.ready);
         } else {
             panic!("binding 0 missing");
         }
+    }
+
+    #[test]
+    fn queue_planner_preserves_manual_unregistration() {
+        let existing = vec![BindingStatus {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: "ge-0-0-1".to_string(),
+            ifindex: 11,
+            registered: false,
+            armed: false,
+            last_change: Some(Utc::now()),
+            ..Default::default()
+        }];
+        let bindings = replan_bindings_from_candidates(
+            1,
+            &existing,
+            vec![("ge-0-0-1".to_string(), 1)],
+            BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
+        );
+        let b0 = bindings.iter().find(|b| b.slot == 0).expect("binding 0");
+        assert!(!b0.registered);
+        assert!(!b0.armed);
     }
 
     #[test]

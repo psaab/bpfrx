@@ -12,11 +12,12 @@ const (
 )
 
 type ControlRequest struct {
-	Type     string                 `json:"type"`
-	Snapshot *ConfigSnapshot        `json:"snapshot,omitempty"`
-	Queue    *QueueControlRequest   `json:"queue,omitempty"`
-	Binding  *BindingControlRequest `json:"binding,omitempty"`
-	Packet   *InjectPacketRequest   `json:"packet,omitempty"`
+	Type       string                    `json:"type"`
+	Snapshot   *ConfigSnapshot           `json:"snapshot,omitempty"`
+	Forwarding *ForwardingControlRequest `json:"forwarding,omitempty"`
+	Queue      *QueueControlRequest      `json:"queue,omitempty"`
+	Binding    *BindingControlRequest    `json:"binding,omitempty"`
+	Packet     *InjectPacketRequest      `json:"packet,omitempty"`
 }
 
 type ControlResponse struct {
@@ -129,6 +130,10 @@ type PacketResolution struct {
 	EgressIfindex int    `json:"egress_ifindex,omitempty"`
 	NextHop       string `json:"next_hop,omitempty"`
 	NeighborMAC   string `json:"neighbor_mac,omitempty"`
+}
+
+type ForwardingControlRequest struct {
+	Armed bool `json:"armed"`
 }
 
 type QueueControlRequest struct {

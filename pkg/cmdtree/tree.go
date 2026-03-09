@@ -663,6 +663,36 @@ var OperationalTree = map[string]*Node{
 				}},
 				"data-plane": {Desc: "Userspace dataplane operations", Children: map[string]*Node{
 					"userspace": {Desc: "Userspace dataplane helper operations", Children: map[string]*Node{
+						"forwarding": {Desc: "Control live userspace forwarding", Children: map[string]*Node{
+							"arm":    {Desc: "Arm live userspace forwarding"},
+							"disarm": {Desc: "Disarm live userspace forwarding"},
+						}},
+						"queue": {Desc: "Control a userspace queue", DynamicFn: func(cfg *config.Config) []string {
+							out := make([]string, 0, 16)
+							for i := 0; i < 16; i++ {
+								out = append(out, fmt.Sprintf("%d", i))
+							}
+							return out
+						}, Children: map[string]*Node{
+							"register":   {Desc: "Register a queue without arming redirect"},
+							"unregister": {Desc: "Unregister a queue and release redirect ownership"},
+							"arm":        {Desc: "Register and arm a queue for redirect"},
+							"disarm":     {Desc: "Disarm a queue while keeping it registered"},
+						}},
+						"binding": {Desc: "Control a userspace binding slot", Children: map[string]*Node{
+							"slot": {Desc: "Binding slot", DynamicFn: func(cfg *config.Config) []string {
+								out := make([]string, 0, 16)
+								for i := 0; i < 16; i++ {
+									out = append(out, fmt.Sprintf("%d", i))
+								}
+								return out
+							}, Children: map[string]*Node{
+								"register":   {Desc: "Register a binding without arming redirect"},
+								"unregister": {Desc: "Unregister a binding and release redirect ownership"},
+								"arm":        {Desc: "Register and arm a binding for redirect"},
+								"disarm":     {Desc: "Disarm a binding while keeping it registered"},
+							}},
+						}},
 						"inject-packet": {Desc: "Inject a synthetic userspace dataplane packet", Children: map[string]*Node{
 							"slot": {Desc: "Binding slot", DynamicFn: func(cfg *config.Config) []string {
 								out := make([]string, 0, 16)

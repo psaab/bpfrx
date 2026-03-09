@@ -117,10 +117,16 @@ func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
 
 func (s *Server) userspaceDataplaneControl() (interface {
 	Status() (dpuserspace.ProcessStatus, error)
+	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
+	SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
 	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
 }, error) {
 	provider, ok := s.dp.(interface {
 		Status() (dpuserspace.ProcessStatus, error)
+		SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
+		SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+		SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
 		InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
 	})
 	if !ok {
@@ -8190,6 +8196,72 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 			statusAfter, err := provider.InjectPacket(injectReq)
 			if err != nil {
 				return nil, status.Errorf(codes.FailedPrecondition, "userspace inject: %v", err)
+			}
+			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			return &pb.SystemActionResponse{Message: msg}, nil
+		}
+		if strings.HasPrefix(req.Action, "userspace-forwarding:") {
+			provider, err := s.userspaceDataplaneControl()
+			if err != nil {
+				return nil, status.Error(codes.Unavailable, err.Error())
+			}
+			armed, err := dpuserspace.ParseForwardingCommand([]string{"forwarding", strings.TrimPrefix(req.Action, "userspace-forwarding:")})
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+			statusAfter, err := provider.SetForwardingArmed(armed)
+			if err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "userspace forwarding control: %v", err)
+			}
+			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			return &pb.SystemActionResponse{Message: msg}, nil
+		}
+		if strings.HasPrefix(req.Action, "userspace-queue:") {
+			provider, err := s.userspaceDataplaneControl()
+			if err != nil {
+				return nil, status.Error(codes.Unavailable, err.Error())
+			}
+			rest := strings.TrimPrefix(req.Action, "userspace-queue:")
+			parts := strings.SplitN(rest, ":", 2)
+			if len(parts) != 2 {
+				return nil, status.Error(codes.InvalidArgument, "usage: userspace-queue:<queue>:<register|unregister|arm|disarm>")
+			}
+			queueID, err := strconv.Atoi(parts[0])
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid userspace queue: %s", parts[0])
+			}
+			registered, armed, err := dpuserspace.ParseRegistrationOperation(parts[1])
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+			statusAfter, err := provider.SetQueueState(uint32(queueID), registered, armed)
+			if err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "userspace queue control: %v", err)
+			}
+			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			return &pb.SystemActionResponse{Message: msg}, nil
+		}
+		if strings.HasPrefix(req.Action, "userspace-binding:") {
+			provider, err := s.userspaceDataplaneControl()
+			if err != nil {
+				return nil, status.Error(codes.Unavailable, err.Error())
+			}
+			rest := strings.TrimPrefix(req.Action, "userspace-binding:")
+			parts := strings.SplitN(rest, ":", 2)
+			if len(parts) != 2 {
+				return nil, status.Error(codes.InvalidArgument, "usage: userspace-binding:<slot>:<register|unregister|arm|disarm>")
+			}
+			slot, err := strconv.Atoi(parts[0])
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid userspace slot: %s", parts[0])
+			}
+			registered, armed, err := dpuserspace.ParseRegistrationOperation(parts[1])
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+			statusAfter, err := provider.SetBindingState(uint32(slot), registered, armed)
+			if err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "userspace binding control: %v", err)
 			}
 			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
 			return &pb.SystemActionResponse{Message: msg}, nil
