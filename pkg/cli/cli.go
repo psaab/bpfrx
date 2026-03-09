@@ -12232,14 +12232,10 @@ func (c *CLI) handleRequestChassisClusterDataPlane(args []string) error {
 		return nil
 	}
 	args = args[1:]
-	if len(args) < 4 || args[0] != "inject-packet" || args[1] != "slot" {
-		return fmt.Errorf("usage: request chassis cluster data-plane userspace inject-packet slot <N> <valid|fib-mismatch|metadata-parse-error>")
-	}
-	slot, err := strconv.Atoi(args[2])
+	slot, mode, extra, err := dpuserspace.ParseInjectPacketCommand(args)
 	if err != nil {
-		return fmt.Errorf("invalid slot: %s", args[2])
+		return err
 	}
-	mode := args[3]
 	provider, err := c.userspaceDataplaneControl()
 	if err != nil {
 		return err
@@ -12248,28 +12244,9 @@ func (c *CLI) handleRequestChassisClusterDataPlane(args []string) error {
 	if err != nil {
 		return err
 	}
-	req := dpuserspace.InjectPacketRequest{
-		Slot:             uint32(slot),
-		PacketLength:     128,
-		AddrFamily:       uint8(syscall.AF_INET),
-		Protocol:         6,
-		ConfigGeneration: status.LastSnapshotGeneration,
-		FIBGeneration:    status.LastFIBGeneration,
-		MetadataValid:    true,
-	}
-	switch mode {
-	case "valid":
-	case "fib-mismatch":
-		req.FIBGeneration++
-	case "metadata-parse-error":
-		req.MetadataValid = false
-		req.PacketLength = 96
-		req.AddrFamily = 0
-		req.Protocol = 0
-		req.ConfigGeneration = 0
-		req.FIBGeneration = 0
-	default:
-		return fmt.Errorf("unknown inject mode %q", mode)
+	req, err := dpuserspace.BuildInjectPacketRequest(slot, mode, extra, status)
+	if err != nil {
+		return err
 	}
 	status, err = provider.InjectPacket(req)
 	if err != nil {

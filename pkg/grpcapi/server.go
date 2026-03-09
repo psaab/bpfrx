@@ -8143,28 +8143,13 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 			if err != nil {
 				return nil, status.Errorf(codes.Unavailable, "userspace status: %v", err)
 			}
-			injectReq := dpuserspace.InjectPacketRequest{
-				Slot:             uint32(slot),
-				PacketLength:     128,
-				AddrFamily:       uint8(syscall.AF_INET),
-				Protocol:         6,
-				ConfigGeneration: statusNow.LastSnapshotGeneration,
-				FIBGeneration:    statusNow.LastFIBGeneration,
-				MetadataValid:    true,
+			extra := map[string]string{}
+			if req.Target != "" {
+				extra["destination-ip"] = req.Target
 			}
-			switch mode {
-			case "valid":
-			case "fib-mismatch":
-				injectReq.FIBGeneration++
-			case "metadata-parse-error":
-				injectReq.MetadataValid = false
-				injectReq.PacketLength = 96
-				injectReq.AddrFamily = 0
-				injectReq.Protocol = 0
-				injectReq.ConfigGeneration = 0
-				injectReq.FIBGeneration = 0
-			default:
-				return nil, status.Errorf(codes.InvalidArgument, "unknown userspace inject mode: %s", mode)
+			injectReq, err := dpuserspace.BuildInjectPacketRequest(uint32(slot), mode, extra, statusNow)
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
 			}
 			statusAfter, err := provider.InjectPacket(injectReq)
 			if err != nil {

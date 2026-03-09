@@ -671,9 +671,15 @@ var OperationalTree = map[string]*Node{
 								}
 								return out
 							}, Children: map[string]*Node{
-								"valid":                {Desc: "Inject a valid packet using the current snapshot generations"},
-								"fib-mismatch":         {Desc: "Inject a packet with a mismatched FIB generation"},
-								"metadata-parse-error": {Desc: "Inject a malformed metadata packet"},
+								"valid": {Desc: "Inject a valid packet using the current snapshot generations", Children: map[string]*Node{
+									"destination-ip": {Desc: "Optional destination IP used for forwarding resolution"},
+								}},
+								"fib-mismatch": {Desc: "Inject a packet with a mismatched FIB generation", Children: map[string]*Node{
+									"destination-ip": {Desc: "Optional destination IP used for forwarding resolution"},
+								}},
+								"metadata-parse-error": {Desc: "Inject a malformed metadata packet", Children: map[string]*Node{
+									"destination-ip": {Desc: "Optional destination IP used for forwarding resolution"},
+								}},
 							}},
 						}},
 					}},

@@ -2703,11 +2703,15 @@ func (c *ctl) handleRequestChassisClusterDataPlane(args []string) error {
 		return nil
 	}
 	args = args[1:]
-	if len(args) < 4 || args[0] != "inject-packet" || args[1] != "slot" {
-		return fmt.Errorf("usage: request chassis cluster data-plane userspace inject-packet slot <N> <valid|fib-mismatch|metadata-parse-error>")
+	slot, mode, extra, err := dpuserspace.ParseInjectPacketCommand(args)
+	if err != nil {
+		return err
 	}
-	action := "userspace-inject:" + args[2] + ":" + args[3]
-	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{Action: action})
+	action := fmt.Sprintf("userspace-inject:%d:%s", slot, mode)
+	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
+		Action: action,
+		Target: extra["destination-ip"],
+	})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
