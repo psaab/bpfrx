@@ -94,3 +94,28 @@ func TestBuildSnapshotSummary(t *testing.T) {
 		t.Fatalf("Routes[1] = %+v", snap.Routes[1])
 	}
 }
+
+func TestBuildSnapshotIncludesUnitInterfaces(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {
+			Name:            "reth0",
+			RedundancyGroup: 1,
+			Units: map[int]*config.InterfaceUnit{
+				0:  {Number: 0, Addresses: []string{"10.0.61.1/24", "2001:559:8585:ef00::1/64"}},
+				50: {Number: 50, Addresses: []string{"172.16.50.8/24", "2001:559:8585:50::8/64"}},
+			},
+		},
+	}
+
+	snap := buildSnapshot(cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 1, 0)
+	got := map[string]bool{}
+	for _, iface := range snap.Interfaces {
+		got[iface.Name] = true
+	}
+	for _, name := range []string{"reth0", "reth0.0", "reth0.50"} {
+		if !got[name] {
+			t.Fatalf("snapshot missing interface %s: %+v", name, snap.Interfaces)
+		}
+	}
+}

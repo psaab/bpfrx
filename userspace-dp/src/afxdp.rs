@@ -1051,36 +1051,28 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         .sort_by(|a, b| b.prefix.prefix_len().cmp(&a.prefix.prefix_len()));
 
     for route in &snapshot.routes {
-        match route.family.as_str() {
-            "inet" => {
-                let Ok(prefix) = route.destination.parse::<Ipv4Net>() else {
-                    continue;
-                };
-                let (next_hop, ifindex) =
-                    resolve_route_target_v4(route, &name_to_ifindex, &linux_to_ifindex, &state);
-                state.routes_v4.push(RouteEntryV4 {
-                    prefix,
-                    ifindex,
-                    next_hop,
-                    discard: route.discard,
-                    next_table: !route.next_table.is_empty(),
-                });
-            }
-            "inet6" => {
-                let Ok(prefix) = route.destination.parse::<Ipv6Net>() else {
-                    continue;
-                };
-                let (next_hop, ifindex) =
-                    resolve_route_target_v6(route, &name_to_ifindex, &linux_to_ifindex, &state);
-                state.routes_v6.push(RouteEntryV6 {
-                    prefix,
-                    ifindex,
-                    next_hop,
-                    discard: route.discard,
-                    next_table: !route.next_table.is_empty(),
-                });
-            }
-            _ => {}
+        if let Ok(prefix) = route.destination.parse::<Ipv4Net>() {
+            let (next_hop, ifindex) =
+                resolve_route_target_v4(route, &name_to_ifindex, &linux_to_ifindex, &state);
+            state.routes_v4.push(RouteEntryV4 {
+                prefix,
+                ifindex,
+                next_hop,
+                discard: route.discard,
+                next_table: !route.next_table.is_empty(),
+            });
+            continue;
+        }
+        if let Ok(prefix) = route.destination.parse::<Ipv6Net>() {
+            let (next_hop, ifindex) =
+                resolve_route_target_v6(route, &name_to_ifindex, &linux_to_ifindex, &state);
+            state.routes_v6.push(RouteEntryV6 {
+                prefix,
+                ifindex,
+                next_hop,
+                discard: route.discard,
+                next_table: !route.next_table.is_empty(),
+            });
         }
     }
     state

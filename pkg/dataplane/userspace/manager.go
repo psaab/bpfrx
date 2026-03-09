@@ -201,20 +201,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			continue
 		}
 		linuxName := config.LinuxIfName(name)
-		ifindex := 0
-		mtu := 0
-		hardwareAddr := ""
-		addresses := []InterfaceAddressSnapshot(nil)
-		if link, err := net.InterfaceByName(linuxName); err == nil {
-			ifindex = link.Index
-		}
-		if link, err := netlink.LinkByName(linuxName); err == nil && link != nil {
-			mtu = link.Attrs().MTU
-			if hw := link.Attrs().HardwareAddr; len(hw) > 0 {
-				hardwareAddr = hw.String()
-			}
-			addresses = buildInterfaceAddressSnapshots(link)
-		}
+		ifindex, mtu, hardwareAddr, addresses := buildLinkSnapshot(linuxName)
 		out = append(out, InterfaceSnapshot{
 			Name:            name,
 			LinuxName:       linuxName,
@@ -228,8 +215,55 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			HardwareAddr:    hardwareAddr,
 			Addresses:       addresses,
 		})
+		if len(iface.Units) == 0 {
+			continue
+		}
+		unitNums := make([]int, 0, len(iface.Units))
+		for unitNum := range iface.Units {
+			unitNums = append(unitNums, unitNum)
+		}
+		sort.Ints(unitNums)
+		for _, unitNum := range unitNums {
+			unit := iface.Units[unitNum]
+			if unit == nil {
+				continue
+			}
+			unitName := fmt.Sprintf("%s.%d", name, unitNum)
+			linuxUnit := config.LinuxIfName(unitName)
+			ifindex, mtu, hardwareAddr, addresses := buildLinkSnapshot(linuxUnit)
+			out = append(out, InterfaceSnapshot{
+				Name:            unitName,
+				LinuxName:       linuxUnit,
+				Ifindex:         ifindex,
+				RXQueues:        userspaceRXQueueCount(linuxUnit),
+				LocalFabric:     iface.LocalFabricMember,
+				RedundancyGroup: iface.RedundancyGroup,
+				UnitCount:       0,
+				Tunnel:          iface.Tunnel != nil || unit.Tunnel != nil,
+				MTU:             mtu,
+				HardwareAddr:    hardwareAddr,
+				Addresses:       addresses,
+			})
+		}
 	}
 	return out
+}
+
+func buildLinkSnapshot(linuxName string) (ifindex int, mtu int, hardwareAddr string, addresses []InterfaceAddressSnapshot) {
+	if linuxName == "" {
+		return 0, 0, "", nil
+	}
+	if link, err := net.InterfaceByName(linuxName); err == nil {
+		ifindex = link.Index
+	}
+	if link, err := netlink.LinkByName(linuxName); err == nil && link != nil {
+		mtu = link.Attrs().MTU
+		if hw := link.Attrs().HardwareAddr; len(hw) > 0 {
+			hardwareAddr = hw.String()
+		}
+		addresses = buildInterfaceAddressSnapshots(link)
+	}
+	return ifindex, mtu, hardwareAddr, addresses
 }
 
 func buildInterfaceAddressSnapshots(link netlink.Link) []InterfaceAddressSnapshot {
@@ -359,43 +393,55 @@ func buildNeighborSnapshots(cfg *config.Config) []NeighborSnapshot {
 		if iface == nil {
 			continue
 		}
-		linuxName := config.LinuxIfName(name)
-		link, err := netlink.LinkByName(linuxName)
-		if err != nil || link == nil {
-			continue
+		linuxNames := []string{config.LinuxIfName(name)}
+		if len(iface.Units) > 0 {
+			unitNums := make([]int, 0, len(iface.Units))
+			for unitNum := range iface.Units {
+				unitNums = append(unitNums, unitNum)
+			}
+			sort.Ints(unitNums)
+			for _, unitNum := range unitNums {
+				linuxNames = append(linuxNames, config.LinuxIfName(fmt.Sprintf("%s.%d", name, unitNum)))
+			}
 		}
-		for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-			neighs, err := netlink.NeighList(link.Attrs().Index, family)
-			if err != nil {
+		for _, linuxName := range linuxNames {
+			link, err := netlink.LinkByName(linuxName)
+			if err != nil || link == nil {
 				continue
 			}
-			for _, neigh := range neighs {
-				if neigh.IP == nil {
+			for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+				neighs, err := netlink.NeighList(link.Attrs().Index, family)
+				if err != nil {
 					continue
 				}
-				key := fmt.Sprintf("%d/%s", link.Attrs().Index, neigh.IP.String())
-				if seen[key] {
-					continue
+				for _, neigh := range neighs {
+					if neigh.IP == nil {
+						continue
+					}
+					key := fmt.Sprintf("%d/%s", link.Attrs().Index, neigh.IP.String())
+					if seen[key] {
+						continue
+					}
+					seen[key] = true
+					fam := "inet"
+					if family == netlink.FAMILY_V6 {
+						fam = "inet6"
+					}
+					mac := ""
+					if neigh.HardwareAddr != nil {
+						mac = neigh.HardwareAddr.String()
+					}
+					out = append(out, NeighborSnapshot{
+						Interface: linuxName,
+						Ifindex:   link.Attrs().Index,
+						Family:    fam,
+						IP:        neigh.IP.String(),
+						MAC:       mac,
+						State:     neighborStateString(neigh.State),
+						Router:    neigh.Flags&netlink.NTF_ROUTER != 0,
+						LinkLocal: neigh.IP.IsLinkLocalUnicast(),
+					})
 				}
-				seen[key] = true
-				fam := "inet"
-				if family == netlink.FAMILY_V6 {
-					fam = "inet6"
-				}
-				mac := ""
-				if neigh.HardwareAddr != nil {
-					mac = neigh.HardwareAddr.String()
-				}
-				out = append(out, NeighborSnapshot{
-					Interface: linuxName,
-					Ifindex:   link.Attrs().Index,
-					Family:    fam,
-					IP:        neigh.IP.String(),
-					MAC:       mac,
-					State:     neighborStateString(neigh.State),
-					Router:    neigh.Flags&netlink.NTF_ROUTER != 0,
-					LinkLocal: neigh.IP.IsLinkLocalUnicast(),
-				})
 			}
 		}
 	}
