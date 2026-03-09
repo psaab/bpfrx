@@ -18,6 +18,9 @@ Tracked cluster config:
 Validation script:
 - [userspace-ha-validation.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-ha-validation.sh)
 
+Phase-cycle script:
+- [userspace-phase-cycle.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-phase-cycle.sh)
+
 ## Root Cause
 
 The unstable `iperf3` behavior on the isolated userspace cluster had two
@@ -76,6 +79,21 @@ Optional perf capture on `bpfrx-userspace-fw0`:
 ./scripts/userspace-ha-validation.sh --perf
 ```
 
+Standard phase workflow:
+
+```bash
+./scripts/userspace-phase-cycle.sh
+./scripts/userspace-phase-cycle.sh --perf
+```
+
+This is the required sequence after each userspace dataplane phase:
+
+1. push the current branch to GitHub
+2. deploy to:
+   - `loss:bpfrx-userspace-fw0`
+   - `loss:bpfrx-userspace-fw1`
+3. run the isolated userspace HA validation script
+
 The script does this in order:
 
 1. uses the tracked env file, not `/tmp`
@@ -106,3 +124,4 @@ Use:
 
 - [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx-userspace-wip/test/incus/loss-userspace-cluster.env)
 - [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx-userspace-wip/docs/ha-cluster-userspace.conf)
+- [userspace-phase-cycle.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-phase-cycle.sh)

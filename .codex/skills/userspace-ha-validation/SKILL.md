@@ -12,19 +12,19 @@ Cluster inputs:
 - env file: `test/incus/loss-userspace-cluster.env`
 - config: `docs/ha-cluster-userspace.conf`
 - script: `scripts/userspace-ha-validation.sh`
+- phase cycle: `scripts/userspace-phase-cycle.sh`
 
 Workflow:
 
-1. Run the validation script from the repo root.
-2. Use `--deploy` if the firewalls need a fresh rollout.
-3. Use `--perf` if the task requires `perf` profiles on `bpfrx-userspace-fw0`.
+1. After each userspace dataplane phase, run the phase-cycle script from the repo root.
+2. The phase-cycle script pushes the current branch, deploys `bpfrx-userspace-fw0/1`, and then runs the validation script.
+3. Use `--perf` when the phase needs fresh `perf` profiles on `bpfrx-userspace-fw0`.
 
 Commands:
 
 ```bash
-./scripts/userspace-ha-validation.sh
-./scripts/userspace-ha-validation.sh --deploy
-./scripts/userspace-ha-validation.sh --perf
+./scripts/userspace-phase-cycle.sh
+./scripts/userspace-phase-cycle.sh --perf
 ```
 
 What the script enforces:
@@ -36,6 +36,8 @@ What the script enforces:
 - one unmeasured warm-up `iperf3` pass is run for each address family
 - repeated IPv4 `iperf3` to `172.16.80.200` must stay above threshold
 - repeated IPv6 `iperf3` to `2001:559:8585:80::200` must stay above threshold
+
+Use `scripts/userspace-ha-validation.sh` directly only when you are debugging the validator itself.
 
 If the script fails on IPv6 route state:
 
