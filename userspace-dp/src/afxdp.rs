@@ -176,8 +176,16 @@ impl Coordinator {
                     ring_entries,
                 });
         }
+        let planned_bindings: usize = workers.values().map(|group| group.len()).sum();
+        eprintln!(
+            "bpfrx-userspace-dp: reconcile planned_workers={} planned_bindings={} live_slots={}",
+            workers.len(),
+            planned_bindings,
+            self.live.len()
+        );
         self.map_fd = Some(map_fd);
         for (worker_id, binding_plans) in workers {
+            let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
             let heartbeat = Arc::new(AtomicI64::new(now_nanos()));
             let recent_exceptions = self.recent_exceptions.clone();
@@ -198,6 +206,10 @@ impl Coordinator {
                 });
             match join {
                 Ok(join) => {
+                    eprintln!(
+                        "bpfrx-userspace-dp: started worker thread worker_id={} planned_bindings={}",
+                        worker_id, plan_count
+                    );
                     self.workers.insert(
                         worker_id,
                         WorkerHandle {
@@ -208,6 +220,10 @@ impl Coordinator {
                     );
                 }
                 Err(err) => {
+                    eprintln!(
+                        "bpfrx-userspace-dp: failed to start worker thread worker_id={} err={}",
+                        worker_id, err
+                    );
                     if let Ok(mut recent) = self.recent_exceptions.lock() {
                         push_recent_exception(
                             &mut recent,
