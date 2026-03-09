@@ -56,6 +56,8 @@ pub struct Coordinator {
     workers: BTreeMap<u32, WorkerHandle>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     validation: ValidationState,
+    last_planned_workers: usize,
+    last_planned_bindings: usize,
 }
 
 impl Coordinator {
@@ -67,6 +69,8 @@ impl Coordinator {
             workers: BTreeMap::new(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
             validation: ValidationState::default(),
+            last_planned_workers: 0,
+            last_planned_bindings: 0,
         }
     }
 
@@ -92,6 +96,8 @@ impl Coordinator {
             recent.clear();
         }
         self.validation = ValidationState::default();
+        self.last_planned_workers = 0;
+        self.last_planned_bindings = 0;
     }
 
     pub fn reconcile(
@@ -177,6 +183,8 @@ impl Coordinator {
                 });
         }
         let planned_bindings: usize = workers.values().map(|group| group.len()).sum();
+        self.last_planned_workers = workers.len();
+        self.last_planned_bindings = planned_bindings;
         eprintln!(
             "bpfrx-userspace-dp: reconcile planned_workers={} planned_bindings={} live_slots={}",
             workers.len(),
@@ -256,6 +264,22 @@ impl Coordinator {
                 )
             })
             .collect()
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    pub fn identity_count(&self) -> usize {
+        self.identities.len()
+    }
+
+    pub fn live_count(&self) -> usize {
+        self.live.len()
+    }
+
+    pub fn planned_counts(&self) -> (usize, usize) {
+        (self.last_planned_workers, self.last_planned_bindings)
     }
 
     pub fn inject_test_packet(&mut self, req: InjectPacketRequest) -> Result<(), String> {

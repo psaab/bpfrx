@@ -180,6 +180,16 @@ struct ProcessStatus {
     bindings: Vec<BindingStatus>,
     #[serde(rename = "recent_exceptions", default)]
     recent_exceptions: Vec<ExceptionStatus>,
+    #[serde(rename = "debug_worker_threads", default)]
+    debug_worker_threads: usize,
+    #[serde(rename = "debug_identity_slots", default)]
+    debug_identity_slots: usize,
+    #[serde(rename = "debug_live_slots", default)]
+    debug_live_slots: usize,
+    #[serde(rename = "debug_planned_workers", default)]
+    debug_planned_workers: usize,
+    #[serde(rename = "debug_planned_bindings", default)]
+    debug_planned_bindings: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -382,6 +392,11 @@ fn run() -> Result<(), String> {
             queues: Vec::new(),
             bindings: Vec::new(),
             recent_exceptions: Vec::new(),
+            debug_worker_threads: 0,
+            debug_identity_slots: 0,
+            debug_live_slots: 0,
+            debug_planned_workers: 0,
+            debug_planned_bindings: 0,
         },
         snapshot: None,
         afxdp: afxdp::Coordinator::new(),
@@ -639,6 +654,12 @@ fn refresh_status(state: &mut ServerState) {
         .unwrap_or(0);
     state.status.route_entries = state.snapshot.as_ref().map(|s| s.routes.len()).unwrap_or(0);
     state.status.worker_heartbeats = state.afxdp.worker_heartbeats();
+    state.status.debug_worker_threads = state.afxdp.worker_count();
+    state.status.debug_identity_slots = state.afxdp.identity_count();
+    state.status.debug_live_slots = state.afxdp.live_count();
+    let (planned_workers, planned_bindings) = state.afxdp.planned_counts();
+    state.status.debug_planned_workers = planned_workers;
+    state.status.debug_planned_bindings = planned_bindings;
     state.status.enabled = state
         .status
         .bindings
