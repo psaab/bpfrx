@@ -103,19 +103,35 @@ func TestBuildSnapshotIncludesUnitInterfaces(t *testing.T) {
 			RedundancyGroup: 1,
 			Units: map[int]*config.InterfaceUnit{
 				0:  {Number: 0, Addresses: []string{"10.0.61.1/24", "2001:559:8585:ef00::1/64"}},
-				50: {Number: 50, Addresses: []string{"172.16.50.8/24", "2001:559:8585:50::8/64"}},
+				50: {Number: 50, VlanID: 50, Addresses: []string{"172.16.50.8/24", "2001:559:8585:50::8/64"}},
 			},
+		},
+		"ge-0/0/2": {
+			Name:            "ge-0/0/2",
+			RedundantParent: "reth0",
 		},
 	}
 
 	snap := buildSnapshot(cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 1, 0)
-	got := map[string]bool{}
+	got := map[string]InterfaceSnapshot{}
 	for _, iface := range snap.Interfaces {
-		got[iface.Name] = true
+		got[iface.Name] = iface
 	}
 	for _, name := range []string{"reth0", "reth0.0", "reth0.50"} {
-		if !got[name] {
+		if _, ok := got[name]; !ok {
 			t.Fatalf("snapshot missing interface %s: %+v", name, snap.Interfaces)
 		}
+	}
+	if got["reth0"].LinuxName != "ge-0-0-2" {
+		t.Fatalf("reth0 LinuxName = %q, want ge-0-0-2", got["reth0"].LinuxName)
+	}
+	if got["reth0.0"].LinuxName != "ge-0-0-2" {
+		t.Fatalf("reth0.0 LinuxName = %q, want ge-0-0-2", got["reth0.0"].LinuxName)
+	}
+	if got["reth0.50"].LinuxName != "ge-0-0-2.50" {
+		t.Fatalf("reth0.50 LinuxName = %q, want ge-0-0-2.50", got["reth0.50"].LinuxName)
+	}
+	if len(got["reth0.50"].Addresses) != 2 {
+		t.Fatalf("reth0.50 Addresses = %+v, want config fallback addresses", got["reth0.50"].Addresses)
 	}
 }

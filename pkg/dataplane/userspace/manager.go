@@ -200,8 +200,11 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 		if iface == nil {
 			continue
 		}
-		linuxName := config.LinuxIfName(name)
+		linuxName := snapshotLinuxName(cfg, name, iface, nil)
 		ifindex, mtu, hardwareAddr, addresses := buildLinkSnapshot(linuxName)
+		if len(addresses) == 0 {
+			addresses = buildConfiguredAddressSnapshots(nil)
+		}
 		out = append(out, InterfaceSnapshot{
 			Name:            name,
 			LinuxName:       linuxName,
@@ -229,8 +232,11 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				continue
 			}
 			unitName := fmt.Sprintf("%s.%d", name, unitNum)
-			linuxUnit := config.LinuxIfName(unitName)
+			linuxUnit := snapshotLinuxName(cfg, name, iface, unit)
 			ifindex, mtu, hardwareAddr, addresses := buildLinkSnapshot(linuxUnit)
+			if len(addresses) == 0 {
+				addresses = buildConfiguredAddressSnapshots(unit.Addresses)
+			}
 			out = append(out, InterfaceSnapshot{
 				Name:            unitName,
 				LinuxName:       linuxUnit,
@@ -249,6 +255,37 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 	return out
 }
 
+func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.InterfaceConfig, unit *config.InterfaceUnit) string {
+	if iface == nil {
+		return config.LinuxIfName(ifName)
+	}
+	if unit != nil {
+		if tunnelNames := cfg.TunnelNameMap(); len(tunnelNames) > 0 {
+			ref := fmt.Sprintf("%s.%d", ifName, unit.Number)
+			if linuxName, ok := tunnelNames[ref]; ok && linuxName != "" {
+				return linuxName
+			}
+		}
+		if unit.VlanID > 0 {
+			return fmt.Sprintf("%s.%d", config.LinuxIfName(cfg.ResolveReth(ifName)), unit.VlanID)
+		}
+		if strings.HasPrefix(ifName, "reth") {
+			if unit.Number == 0 {
+				return config.LinuxIfName(cfg.ResolveReth(ifName))
+			}
+			return config.LinuxIfName(cfg.ResolveReth(fmt.Sprintf("%s.%d", ifName, unit.Number)))
+		}
+		if unit.Number == 0 {
+			return config.LinuxIfName(ifName)
+		}
+		return config.LinuxIfName(fmt.Sprintf("%s.%d", ifName, unit.Number))
+	}
+	if strings.HasPrefix(ifName, "reth") {
+		return config.LinuxIfName(cfg.ResolveReth(ifName))
+	}
+	return config.LinuxIfName(ifName)
+}
+
 func buildLinkSnapshot(linuxName string) (ifindex int, mtu int, hardwareAddr string, addresses []InterfaceAddressSnapshot) {
 	if linuxName == "" {
 		return 0, 0, "", nil
@@ -264,6 +301,36 @@ func buildLinkSnapshot(linuxName string) (ifindex int, mtu int, hardwareAddr str
 		addresses = buildInterfaceAddressSnapshots(link)
 	}
 	return ifindex, mtu, hardwareAddr, addresses
+}
+
+func buildConfiguredAddressSnapshots(addrs []string) []InterfaceAddressSnapshot {
+	if len(addrs) == 0 {
+		return nil
+	}
+	out := make([]InterfaceAddressSnapshot, 0, len(addrs))
+	for _, cidr := range addrs {
+		ip, netw, err := net.ParseCIDR(cidr)
+		if err != nil || netw == nil {
+			continue
+		}
+		netw.IP = ip
+		family := "inet"
+		if ip.To4() == nil {
+			family = "inet6"
+		}
+		out = append(out, InterfaceAddressSnapshot{
+			Family:  family,
+			Address: netw.String(),
+			Scope:   int(netlink.SCOPE_UNIVERSE),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Family != out[j].Family {
+			return out[i].Family < out[j].Family
+		}
+		return out[i].Address < out[j].Address
+	})
+	return out
 }
 
 func buildInterfaceAddressSnapshots(link netlink.Link) []InterfaceAddressSnapshot {
@@ -393,7 +460,7 @@ func buildNeighborSnapshots(cfg *config.Config) []NeighborSnapshot {
 		if iface == nil {
 			continue
 		}
-		linuxNames := []string{config.LinuxIfName(name)}
+		linuxNames := []string{snapshotLinuxName(cfg, name, iface, nil)}
 		if len(iface.Units) > 0 {
 			unitNums := make([]int, 0, len(iface.Units))
 			for unitNum := range iface.Units {
@@ -401,7 +468,11 @@ func buildNeighborSnapshots(cfg *config.Config) []NeighborSnapshot {
 			}
 			sort.Ints(unitNums)
 			for _, unitNum := range unitNums {
-				linuxNames = append(linuxNames, config.LinuxIfName(fmt.Sprintf("%s.%d", name, unitNum)))
+				unit := iface.Units[unitNum]
+				if unit == nil {
+					continue
+				}
+				linuxNames = append(linuxNames, snapshotLinuxName(cfg, name, iface, unit))
 			}
 		}
 		for _, linuxName := range linuxNames {
