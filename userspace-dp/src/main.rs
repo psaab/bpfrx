@@ -190,6 +190,10 @@ struct ProcessStatus {
     debug_planned_workers: usize,
     #[serde(rename = "debug_planned_bindings", default)]
     debug_planned_bindings: usize,
+    #[serde(rename = "debug_reconcile_calls", default)]
+    debug_reconcile_calls: u64,
+    #[serde(rename = "debug_reconcile_stage", default)]
+    debug_reconcile_stage: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -397,6 +401,8 @@ fn run() -> Result<(), String> {
             debug_live_slots: 0,
             debug_planned_workers: 0,
             debug_planned_bindings: 0,
+            debug_reconcile_calls: 0,
+            debug_reconcile_stage: String::new(),
         },
         snapshot: None,
         afxdp: afxdp::Coordinator::new(),
@@ -660,6 +666,9 @@ fn refresh_status(state: &mut ServerState) {
     let (planned_workers, planned_bindings) = state.afxdp.planned_counts();
     state.status.debug_planned_workers = planned_workers;
     state.status.debug_planned_bindings = planned_bindings;
+    let (reconcile_calls, reconcile_stage) = state.afxdp.reconcile_debug();
+    state.status.debug_reconcile_calls = reconcile_calls;
+    state.status.debug_reconcile_stage = reconcile_stage;
     state.status.enabled = state
         .status
         .bindings

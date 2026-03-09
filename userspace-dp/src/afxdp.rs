@@ -58,6 +58,8 @@ pub struct Coordinator {
     validation: ValidationState,
     last_planned_workers: usize,
     last_planned_bindings: usize,
+    reconcile_calls: u64,
+    last_reconcile_stage: String,
 }
 
 impl Coordinator {
@@ -71,6 +73,8 @@ impl Coordinator {
             validation: ValidationState::default(),
             last_planned_workers: 0,
             last_planned_bindings: 0,
+            reconcile_calls: 0,
+            last_reconcile_stage: "idle".to_string(),
         }
     }
 
@@ -98,6 +102,7 @@ impl Coordinator {
         self.validation = ValidationState::default();
         self.last_planned_workers = 0;
         self.last_planned_bindings = 0;
+        self.last_reconcile_stage = "stopped".to_string();
     }
 
     pub fn reconcile(
@@ -106,6 +111,8 @@ impl Coordinator {
         bindings: &mut [BindingStatus],
         ring_entries: usize,
     ) {
+        self.reconcile_calls += 1;
+        self.last_reconcile_stage = "start".to_string();
         self.stop();
         for binding in bindings.iter_mut() {
             binding.bound = false;
@@ -129,6 +136,7 @@ impl Coordinator {
             binding.ready = false;
         }
         let Some(snapshot) = snapshot else {
+            self.last_reconcile_stage = "no_snapshot".to_string();
             return;
         };
         self.validation = ValidationState {
@@ -137,6 +145,7 @@ impl Coordinator {
             fib_generation: snapshot.fib_generation,
         };
         if snapshot.map_pins.xsk.is_empty() {
+            self.last_reconcile_stage = "missing_xsk_pin".to_string();
             for binding in bindings.iter_mut() {
                 if binding.registered {
                     binding.last_error = "missing XSK map pin path".to_string();
@@ -147,6 +156,7 @@ impl Coordinator {
         let map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.xsk) {
             Ok(fd) => fd,
             Err(err) => {
+                self.last_reconcile_stage = format!("open_xsk_map_failed:{err}");
                 for binding in bindings.iter_mut() {
                     if binding.registered {
                         binding.last_error = format!("open XSK map: {err}");
@@ -185,6 +195,12 @@ impl Coordinator {
         let planned_bindings: usize = workers.values().map(|group| group.len()).sum();
         self.last_planned_workers = workers.len();
         self.last_planned_bindings = planned_bindings;
+        self.last_reconcile_stage = format!(
+            "planned:workers={}:bindings={}:live={}",
+            self.last_planned_workers,
+            self.last_planned_bindings,
+            self.live.len()
+        );
         eprintln!(
             "bpfrx-userspace-dp: reconcile planned_workers={} planned_bindings={} live_slots={}",
             workers.len(),
@@ -232,6 +248,7 @@ impl Coordinator {
                         "bpfrx-userspace-dp: failed to start worker thread worker_id={} err={}",
                         worker_id, err
                     );
+                    self.last_reconcile_stage = format!("spawn_worker_failed:{worker_id}:{err}");
                     if let Ok(mut recent) = self.recent_exceptions.lock() {
                         push_recent_exception(
                             &mut recent,
@@ -245,6 +262,12 @@ impl Coordinator {
                 }
             }
         }
+        self.last_reconcile_stage = format!(
+            "spawned:workers={}:identities={}:live={}",
+            self.workers.len(),
+            self.identities.len(),
+            self.live.len()
+        );
         self.refresh_bindings(bindings);
     }
 
@@ -280,6 +303,10 @@ impl Coordinator {
 
     pub fn planned_counts(&self) -> (usize, usize) {
         (self.last_planned_workers, self.last_planned_bindings)
+    }
+
+    pub fn reconcile_debug(&self) -> (u64, String) {
+        (self.reconcile_calls, self.last_reconcile_stage.clone())
     }
 
     pub fn inject_test_packet(&mut self, req: InjectPacketRequest) -> Result<(), String> {
