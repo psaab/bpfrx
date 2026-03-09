@@ -10,12 +10,17 @@ func FormatStatusSummary(status ProcessStatus) string {
 	var b strings.Builder
 	now := time.Now()
 	readyQueues := 0
+	armedQueues := 0
 	for _, q := range status.Queues {
 		if q.Ready {
 			readyQueues++
 		}
+		if q.Armed {
+			armedQueues++
+		}
 	}
 	readyBindings := 0
+	armedBindings := 0
 	boundBindings := 0
 	xskBindings := 0
 	var rxPackets uint64
@@ -30,6 +35,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	for _, binding := range status.Bindings {
 		if binding.Ready {
 			readyBindings++
+		}
+		if binding.Armed {
+			armedBindings++
 		}
 		if binding.Bound {
 			boundBindings++
@@ -52,6 +60,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  PID:                       %d\n", status.PID)
 	fmt.Fprintf(&b, "  Helper mode:               %s\n", status.HelperMode)
 	fmt.Fprintf(&b, "  Enabled:                   %t\n", status.Enabled)
+	fmt.Fprintf(&b, "  Forwarding armed:          %t\n", status.ForwardingArmed)
 	fmt.Fprintf(&b, "  Workers:                   %d\n", status.Workers)
 	fmt.Fprintf(&b, "  Ring entries:              %d\n", status.RingEntries)
 	fmt.Fprintf(&b, "  Last snapshot generation:  %d\n", status.LastSnapshotGeneration)
@@ -80,7 +89,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	}
 	fmt.Fprintf(&b, "  Bound bindings:            %d/%d\n", boundBindings, len(status.Bindings))
 	fmt.Fprintf(&b, "  XSK-registered bindings:   %d/%d\n", xskBindings, len(status.Bindings))
+	fmt.Fprintf(&b, "  Armed queues:              %d/%d\n", armedQueues, len(status.Queues))
 	fmt.Fprintf(&b, "  Ready queues:              %d/%d\n", readyQueues, len(status.Queues))
+	fmt.Fprintf(&b, "  Armed bindings:            %d/%d\n", armedBindings, len(status.Bindings))
 	fmt.Fprintf(&b, "  Ready bindings:            %d/%d\n", readyBindings, len(status.Bindings))
 	fmt.Fprintf(&b, "  RX packets:                %d\n", rxPackets)
 	fmt.Fprintf(&b, "  Validated packets:         %d\n", validatedPackets)
@@ -109,10 +120,10 @@ func FormatBindings(status ProcessStatus) string {
 	if len(status.Queues) == 0 {
 		fmt.Fprintln(&b, "  none")
 	} else {
-		fmt.Fprintf(&b, "  %-7s %-8s %-10s %-7s %s\n", "Queue", "Worker", "Registered", "Ready", "Interfaces")
+		fmt.Fprintf(&b, "  %-7s %-8s %-10s %-7s %-7s %s\n", "Queue", "Worker", "Registered", "Armed", "Ready", "Interfaces")
 		for _, q := range status.Queues {
-			fmt.Fprintf(&b, "  %-7d %-8d %-10t %-7t %s\n",
-				q.QueueID, q.WorkerID, q.Registered, q.Ready, strings.Join(q.Interfaces, ","))
+			fmt.Fprintf(&b, "  %-7d %-8d %-10t %-7t %-7t %s\n",
+				q.QueueID, q.WorkerID, q.Registered, q.Armed, q.Ready, strings.Join(q.Interfaces, ","))
 		}
 	}
 	fmt.Fprintln(&b)
@@ -122,10 +133,10 @@ func FormatBindings(status ProcessStatus) string {
 		fmt.Fprintln(&b, "  none")
 		return b.String()
 	}
-	fmt.Fprintf(&b, "  %-6s %-7s %-8s %-10s %-7s %-7s %-5s %-8s %-9s %-9s %-9s %-9s %-9s %s\n", "Slot", "Queue", "Worker", "Registered", "Ready", "Bound", "XSK", "Ifindex", "RXPkts", "TXPkts", "FwdPkts", "RtMiss", "ExcPkts", "Interface")
+	fmt.Fprintf(&b, "  %-6s %-7s %-8s %-10s %-7s %-7s %-7s %-5s %-8s %-9s %-9s %-9s %-9s %-9s %s\n", "Slot", "Queue", "Worker", "Registered", "Armed", "Ready", "Bound", "XSK", "Ifindex", "RXPkts", "TXPkts", "FwdPkts", "RtMiss", "ExcPkts", "Interface")
 	for _, binding := range status.Bindings {
-		fmt.Fprintf(&b, "  %-6d %-7d %-8d %-10t %-7t %-7t %-5t %-8d %-9d %-9d %-9d %-9d %-9d %s",
-			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Ready, binding.Bound, binding.XSKRegistered, binding.Ifindex, binding.RXPackets, binding.TXPackets, binding.ForwardCandidatePkts, binding.RouteMissPackets, binding.ExceptionPackets, binding.Interface)
+		fmt.Fprintf(&b, "  %-6d %-7d %-8d %-10t %-7t %-7t %-7t %-5t %-8d %-9d %-9d %-9d %-9d %-9d %s",
+			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Armed, binding.Ready, binding.Bound, binding.XSKRegistered, binding.Ifindex, binding.RXPackets, binding.TXPackets, binding.ForwardCandidatePkts, binding.RouteMissPackets, binding.ExceptionPackets, binding.Interface)
 		if binding.LastError != "" {
 			fmt.Fprintf(&b, " (%s)", binding.LastError)
 		}

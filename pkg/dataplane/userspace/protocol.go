@@ -109,6 +109,7 @@ type ProcessStatus struct {
 	HelperMode             string            `json:"helper_mode"`
 	IOUringPlanned         bool              `json:"io_uring_planned"`
 	Enabled                bool              `json:"enabled"`
+	ForwardingArmed        bool              `json:"forwarding_armed,omitempty"`
 	LastSnapshotGeneration uint64            `json:"last_snapshot_generation"`
 	LastFIBGeneration      uint32            `json:"last_fib_generation,omitempty"`
 	LastSnapshotAt         time.Time         `json:"last_snapshot_at,omitempty"`
@@ -133,13 +134,13 @@ type PacketResolution struct {
 type QueueControlRequest struct {
 	QueueID    uint32 `json:"queue_id"`
 	Registered bool   `json:"registered"`
-	Ready      bool   `json:"ready"`
+	Armed      bool   `json:"armed"`
 }
 
 type BindingControlRequest struct {
 	Slot       uint32 `json:"slot"`
 	Registered bool   `json:"registered"`
-	Ready      bool   `json:"ready"`
+	Armed      bool   `json:"armed"`
 }
 
 type QueueStatus struct {
@@ -147,6 +148,7 @@ type QueueStatus struct {
 	WorkerID   uint32    `json:"worker_id"`
 	Interfaces []string  `json:"interfaces,omitempty"`
 	Registered bool      `json:"registered"`
+	Armed      bool      `json:"armed"`
 	Ready      bool      `json:"ready"`
 	LastChange time.Time `json:"last_change,omitempty"`
 }
@@ -158,6 +160,7 @@ type BindingStatus struct {
 	Interface            string    `json:"interface,omitempty"`
 	Ifindex              int       `json:"ifindex,omitempty"`
 	Registered           bool      `json:"registered"`
+	Armed                bool      `json:"armed"`
 	Ready                bool      `json:"ready"`
 	Bound                bool      `json:"bound"`
 	XSKRegistered        bool      `json:"xsk_registered"`

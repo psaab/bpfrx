@@ -520,8 +520,7 @@ impl Coordinator {
                 binding.tx_errors = snap.tx_errors;
                 binding.last_heartbeat = snap.last_heartbeat;
                 binding.last_error = snap.last_error;
-                binding.ready = binding.ready
-                    && binding.registered
+                binding.ready = binding.registered
                     && binding.bound
                     && binding.xsk_registered
                     && heartbeat_fresh(snap.last_heartbeat);

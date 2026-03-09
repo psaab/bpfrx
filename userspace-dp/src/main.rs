@@ -168,6 +168,8 @@ struct ProcessStatus {
     io_uring_planned: bool,
     #[serde(default)]
     enabled: bool,
+    #[serde(rename = "forwarding_armed", default)]
+    forwarding_armed: bool,
     #[serde(rename = "last_snapshot_generation")]
     last_snapshot_generation: u64,
     #[serde(rename = "last_fib_generation", default)]
@@ -235,7 +237,7 @@ struct QueueControlRequest {
     #[serde(default)]
     registered: bool,
     #[serde(default)]
-    ready: bool,
+    armed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -244,7 +246,7 @@ struct BindingControlRequest {
     #[serde(default)]
     registered: bool,
     #[serde(default)]
-    ready: bool,
+    armed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -257,6 +259,8 @@ struct QueueStatus {
     interfaces: Vec<String>,
     #[serde(default)]
     registered: bool,
+    #[serde(default)]
+    armed: bool,
     #[serde(default)]
     ready: bool,
     #[serde(rename = "last_change", skip_serializing_if = "Option::is_none")]
@@ -276,6 +280,8 @@ struct BindingStatus {
     ifindex: i32,
     #[serde(default)]
     registered: bool,
+    #[serde(default)]
+    armed: bool,
     #[serde(default)]
     ready: bool,
     #[serde(default)]
@@ -433,6 +439,7 @@ fn run() -> Result<(), String> {
             helper_mode: "rust-afxdp-bootstrap".to_string(),
             io_uring_planned: true,
             enabled: false,
+            forwarding_armed: false,
             last_snapshot_generation: 0,
             last_fib_generation: 0,
             last_snapshot_at: None,
@@ -606,10 +613,7 @@ fn handle_stream(
                         .filter(|b| b.queue_id == queue_req.queue_id)
                     {
                         binding.registered = queue_req.registered;
-                        binding.ready = queue_req.ready
-                            && queue_req.registered
-                            && binding.bound
-                            && binding.xsk_registered;
+                        binding.armed = queue_req.armed && queue_req.registered;
                         binding.last_change = Some(Utc::now());
                         found = true;
                     }
@@ -634,10 +638,7 @@ fn handle_stream(
                         .find(|b| b.slot == binding_req.slot)
                     {
                         binding.registered = binding_req.registered;
-                        binding.ready = binding_req.ready
-                            && binding_req.registered
-                            && binding.bound
-                            && binding.xsk_registered;
+                        binding.armed = binding_req.armed && binding_req.registered;
                         binding.last_change = Some(Utc::now());
                         refresh_status(&mut guard);
                         persist_state = true;
@@ -719,9 +720,12 @@ fn refresh_status(state: &mut ServerState) {
     state.status.debug_reconcile_stage = reconcile_stage;
     state.status.enabled = state
         .status
-        .bindings
-        .iter()
-        .any(|b| b.registered && b.ready);
+        .forwarding_armed
+        && state
+            .status
+            .bindings
+            .iter()
+            .any(|b| b.registered && b.armed && b.ready);
     state.status.queues = summarize_queues(&state.status.bindings);
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
     state.status.last_resolution = state.afxdp.last_resolution();
@@ -788,6 +792,7 @@ fn replan_bindings_from_candidates(
             binding.ifindex = *ifindex_by_name.get(iface).unwrap_or(&0);
             binding.registered = binding.ifindex > 0;
             if !binding.registered {
+                binding.armed = false;
                 binding.ready = false;
             }
             if binding.last_change.is_none() {
@@ -813,6 +818,7 @@ fn summarize_queues(bindings: &[BindingStatus]) -> Vec<QueueStatus> {
             .map(|b| b.interface.clone())
             .collect::<Vec<_>>();
         let registered = !group.is_empty() && group.iter().all(|b| b.registered);
+        let armed = !group.is_empty() && group.iter().all(|b| b.registered && b.armed);
         let ready = !group.is_empty() && group.iter().all(|b| b.registered && b.ready);
         let last_change = group.iter().filter_map(|b| b.last_change).max();
         out.push(QueueStatus {
@@ -820,6 +826,7 @@ fn summarize_queues(bindings: &[BindingStatus]) -> Vec<QueueStatus> {
             worker_id,
             interfaces,
             registered,
+            armed,
             ready,
             last_change,
         });

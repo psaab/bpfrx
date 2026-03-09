@@ -827,7 +827,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			continue
 		}
 		flags := uint32(0)
-		if binding.Registered && binding.Ready {
+		if binding.Registered && binding.Armed && binding.Ready {
 			flags = userspaceBindingReady
 		}
 		key := userspaceBindingKey{
@@ -870,7 +870,7 @@ func (m *Manager) Status() (ProcessStatus, error) {
 	return status, nil
 }
 
-func (m *Manager) SetBindingState(slot uint32, registered, ready bool) error {
+func (m *Manager) SetBindingState(slot uint32, registered, armed bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -883,7 +883,7 @@ func (m *Manager) SetBindingState(slot uint32, registered, ready bool) error {
 		Binding: &BindingControlRequest{
 			Slot:       slot,
 			Registered: registered,
-			Ready:      ready,
+			Armed:      armed,
 		},
 	}
 	if err := m.requestLocked(req, &status); err != nil {
