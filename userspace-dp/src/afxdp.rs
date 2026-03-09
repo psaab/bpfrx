@@ -828,13 +828,18 @@ fn bind_user_with_retry(
 }
 
 fn poll_binding(
-    binding: &mut BindingWorker,
+    binding_index: usize,
+    bindings: &mut [BindingWorker],
     validation: ValidationState,
     forwarding: &ForwardingState,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
     poll_stats: bool,
 ) -> bool {
+    let (left, rest) = bindings.split_at_mut(binding_index);
+    let Some((binding, right)) = rest.split_first_mut() else {
+        return false;
+    };
     let ident = binding.identity();
     maybe_touch_heartbeat(binding);
     reap_tx_completions(binding);
@@ -873,15 +878,31 @@ fn poll_binding(
                 recent_exceptions,
             );
             if disposition == PacketDisposition::Valid {
+                let resolution = resolve_forwarding(&binding.area, desc, meta, forwarding);
                 record_forwarding_disposition(
                     &ident,
                     &binding.live,
-                    resolve_forwarding(&binding.area, desc, meta, forwarding),
+                    resolution.clone(),
                     desc.len as u32,
                     Some(meta),
                     recent_exceptions,
                     last_resolution,
                 );
+                if resolution.disposition == ForwardingDisposition::ForwardCandidate {
+                    forward_live_packet(
+                        left,
+                        &ident,
+                        binding.ifindex,
+                        binding.live.clone(),
+                        &binding.area,
+                        right,
+                        forwarding,
+                        desc,
+                        meta,
+                        &resolution,
+                        recent_exceptions,
+                    );
+                }
             }
         } else {
             binding.live.metadata_errors.fetch_add(1, Ordering::Relaxed);
@@ -919,6 +940,79 @@ fn poll_binding(
         poll_kernel_stats(&binding.user, &binding.live);
     }
     true
+}
+
+fn forward_live_packet(
+    left: &[BindingWorker],
+    ingress_ident: &BindingIdentity,
+    ingress_ifindex: i32,
+    ingress_live: Arc<BindingLiveState>,
+    ingress_area: &MmapArea,
+    right: &[BindingWorker],
+    forwarding: &ForwardingState,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    resolution: &ForwardingResolution,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+) {
+    let Some(frame) = build_forwarded_frame(ingress_area, desc, meta, resolution, forwarding)
+    else {
+        record_exception(
+            recent_exceptions,
+            ingress_ident,
+            "forward_build_failed",
+            desc.len as u32,
+            Some(meta),
+        );
+        return;
+    };
+    let Some(target_live) = find_target_live(
+        left,
+        ingress_ifindex,
+        ingress_live.clone(),
+        right,
+        resolution.egress_ifindex,
+    ) else {
+        record_exception(
+            recent_exceptions,
+            ingress_ident,
+            "missing_egress_binding",
+            desc.len as u32,
+            Some(meta),
+        );
+        return;
+    };
+    if let Err(err) = target_live.enqueue_tx(TxRequest { bytes: frame }) {
+        ingress_live
+            .exception_packets
+            .fetch_add(1, Ordering::Relaxed);
+        ingress_live.set_error(err.clone());
+        record_exception(
+            recent_exceptions,
+            ingress_ident,
+            "enqueue_tx_failed",
+            desc.len as u32,
+            Some(meta),
+        );
+    }
+}
+
+fn find_target_live(
+    left: &[BindingWorker],
+    ingress_ifindex: i32,
+    ingress_live: Arc<BindingLiveState>,
+    right: &[BindingWorker],
+    egress_ifindex: i32,
+) -> Option<Arc<BindingLiveState>> {
+    if ingress_ifindex == egress_ifindex {
+        return Some(ingress_live);
+    }
+    for binding in left.iter().chain(right.iter()) {
+        if binding.ifindex == egress_ifindex {
+            return Some(binding.live.clone());
+        }
+    }
+    None
 }
 
 fn reap_tx_completions(binding: &mut BindingWorker) {
@@ -1159,9 +1253,10 @@ fn worker_loop(
         heartbeat.store(now_nanos(), Ordering::Relaxed);
         let poll_stats = last_stats_poll.elapsed() >= STATS_POLL_INTERVAL;
         let mut did_work = false;
-        for binding in bindings.iter_mut() {
+        for idx in 0..bindings.len() {
             if poll_binding(
-                binding,
+                idx,
+                &mut bindings,
                 validation,
                 &forwarding,
                 &recent_exceptions,
@@ -1862,6 +1957,70 @@ fn build_injected_packet(
     }
 }
 
+fn build_forwarded_frame(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    resolution: &ForwardingResolution,
+    forwarding: &ForwardingState,
+) -> Option<Vec<u8>> {
+    let dst_mac = resolution.neighbor_mac?;
+    let egress = forwarding.egress.get(&resolution.egress_ifindex)?;
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    let l3 = meta.l3_offset as usize;
+    if l3 >= frame.len() {
+        return None;
+    }
+    let payload = &frame[l3..];
+    let eth_len = if egress.vlan_id > 0 { 18 } else { 14 };
+    let ether_type = match meta.addr_family as i32 {
+        libc::AF_INET => 0x0800,
+        libc::AF_INET6 => 0x86dd,
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(eth_len + payload.len());
+    write_eth_header(
+        &mut out,
+        dst_mac,
+        egress.src_mac,
+        egress.vlan_id,
+        ether_type,
+    );
+    out.extend_from_slice(payload);
+    let ip_start = eth_len;
+    match meta.addr_family as i32 {
+        libc::AF_INET => {
+            if out.len() < ip_start + 20 {
+                return None;
+            }
+            let ihl = ((out[ip_start] & 0x0f) as usize) * 4;
+            if ihl < 20 || out.len() < ip_start + ihl {
+                return None;
+            }
+            if out[ip_start + 8] <= 1 {
+                return None;
+            }
+            out[ip_start + 8] -= 1;
+            out[ip_start + 10] = 0;
+            out[ip_start + 11] = 0;
+            let sum = checksum16(&out[ip_start..ip_start + ihl]);
+            out[ip_start + 10] = (sum >> 8) as u8;
+            out[ip_start + 11] = sum as u8;
+        }
+        libc::AF_INET6 => {
+            if out.len() < ip_start + 40 {
+                return None;
+            }
+            if out[ip_start + 7] <= 1 {
+                return None;
+            }
+            out[ip_start + 7] -= 1;
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
 fn build_injected_ipv4(
     req: &InjectPacketRequest,
     dst_mac: [u8; 6],
@@ -2422,6 +2581,7 @@ mod tests {
                 name: "ge-0/0/0.50".to_string(),
                 linux_name: "ge-0-0-0.50".to_string(),
                 ifindex: 12,
+                hardware_addr: "02:bf:72:00:50:08".to_string(),
                 addresses: vec![
                     InterfaceAddressSnapshot {
                         family: "inet".to_string(),
@@ -2601,5 +2761,60 @@ mod tests {
             resolved.neighbor_mac,
             Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
         );
+    }
+
+    #[test]
+    fn build_forwarded_frame_rewrites_l2_and_decrements_ttl() {
+        let state = build_forwarding_state(&forwarding_snapshot(true));
+        let resolution =
+            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(
+            resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, 1, 0, 0, 192, 0, 2, 10, 8, 8, 8, 8,
+            8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01,
+        ]);
+        let sum = checksum16(&frame[14..34]);
+        frame[24] = (sum >> 8) as u8;
+        frame[25] = sum as u8;
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            addr_family: libc::AF_INET as u8,
+            ..UserspaceDpMeta::default()
+        };
+        let out = build_forwarded_frame(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &resolution,
+            &state,
+        )
+        .expect("forwarded frame");
+        assert_eq!(&out[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]);
+        assert_eq!(out[22], 63);
     }
 }
