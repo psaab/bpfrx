@@ -31,6 +31,7 @@ type ConfigSnapshot struct {
 	Summary     SnapshotSummary        `json:"summary"`
 	MapPins     UserspaceMapPins       `json:"map_pins"`
 	Interfaces  []InterfaceSnapshot    `json:"interfaces,omitempty"`
+	Neighbors   []NeighborSnapshot     `json:"neighbors,omitempty"`
 	Routes      []RouteSnapshot        `json:"routes,omitempty"`
 	Config      *config.Config         `json:"config,omitempty"`
 	Userspace   config.UserspaceConfig `json:"userspace"`
@@ -47,14 +48,23 @@ type SnapshotSummary struct {
 }
 
 type InterfaceSnapshot struct {
-	Name            string `json:"name"`
-	LinuxName       string `json:"linux_name,omitempty"`
-	Ifindex         int    `json:"ifindex,omitempty"`
-	RXQueues        int    `json:"rx_queues,omitempty"`
-	LocalFabric     string `json:"local_fabric_member,omitempty"`
-	RedundancyGroup int    `json:"redundancy_group,omitempty"`
-	UnitCount       int    `json:"unit_count"`
-	Tunnel          bool   `json:"tunnel"`
+	Name            string                     `json:"name"`
+	LinuxName       string                     `json:"linux_name,omitempty"`
+	Ifindex         int                        `json:"ifindex,omitempty"`
+	RXQueues        int                        `json:"rx_queues,omitempty"`
+	LocalFabric     string                     `json:"local_fabric_member,omitempty"`
+	RedundancyGroup int                        `json:"redundancy_group,omitempty"`
+	UnitCount       int                        `json:"unit_count"`
+	Tunnel          bool                       `json:"tunnel"`
+	MTU             int                        `json:"mtu,omitempty"`
+	HardwareAddr    string                     `json:"hardware_addr,omitempty"`
+	Addresses       []InterfaceAddressSnapshot `json:"addresses,omitempty"`
+}
+
+type InterfaceAddressSnapshot struct {
+	Family  string `json:"family"`
+	Address string `json:"address"`
+	Scope   int    `json:"scope,omitempty"`
 }
 
 type RouteSnapshot struct {
@@ -64,6 +74,17 @@ type RouteSnapshot struct {
 	NextHops    []string `json:"next_hops,omitempty"`
 	Discard     bool     `json:"discard"`
 	NextTable   string   `json:"next_table,omitempty"`
+}
+
+type NeighborSnapshot struct {
+	Interface string `json:"interface,omitempty"`
+	Ifindex   int    `json:"ifindex,omitempty"`
+	Family    string `json:"family"`
+	IP        string `json:"ip"`
+	MAC       string `json:"mac,omitempty"`
+	State     string `json:"state,omitempty"`
+	Router    bool   `json:"router,omitempty"`
+	LinkLocal bool   `json:"link_local,omitempty"`
 }
 
 type UserspaceMapPins struct {
@@ -84,6 +105,9 @@ type ProcessStatus struct {
 	Enabled                bool            `json:"enabled"`
 	LastSnapshotGeneration uint64          `json:"last_snapshot_generation"`
 	LastSnapshotAt         time.Time       `json:"last_snapshot_at,omitempty"`
+	InterfaceAddresses     int             `json:"interface_addresses,omitempty"`
+	NeighborEntries        int             `json:"neighbor_entries,omitempty"`
+	RouteEntries           int             `json:"route_entries,omitempty"`
 	WorkerHeartbeats       []time.Time     `json:"worker_heartbeats,omitempty"`
 	Queues                 []QueueStatus   `json:"queues,omitempty"`
 	Bindings               []BindingStatus `json:"bindings,omitempty"`

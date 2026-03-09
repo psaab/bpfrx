@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/vishvananda/netlink"
 )
 
 var _ dataplane.DataPlane = (*Manager)(nil)
@@ -143,6 +145,7 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		MapPins:     userspaceMapPins(),
 		Userspace:   ucfg,
 		Interfaces:  buildInterfaceSnapshots(cfg),
+		Neighbors:   buildNeighborSnapshots(cfg),
 		Routes:      buildRouteSnapshots(cfg),
 		Config:      cfg,
 		Summary: SnapshotSummary{
@@ -182,8 +185,18 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 		}
 		linuxName := config.LinuxIfName(name)
 		ifindex := 0
+		mtu := 0
+		hardwareAddr := ""
+		addresses := []InterfaceAddressSnapshot(nil)
 		if link, err := net.InterfaceByName(linuxName); err == nil {
 			ifindex = link.Index
+		}
+		if link, err := netlink.LinkByName(linuxName); err == nil && link != nil {
+			mtu = link.Attrs().MTU
+			if hw := link.Attrs().HardwareAddr; len(hw) > 0 {
+				hardwareAddr = hw.String()
+			}
+			addresses = buildInterfaceAddressSnapshots(link)
 		}
 		out = append(out, InterfaceSnapshot{
 			Name:            name,
@@ -194,8 +207,43 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			RedundancyGroup: iface.RedundancyGroup,
 			UnitCount:       len(iface.Units),
 			Tunnel:          iface.Tunnel != nil,
+			MTU:             mtu,
+			HardwareAddr:    hardwareAddr,
+			Addresses:       addresses,
 		})
 	}
+	return out
+}
+
+func buildInterfaceAddressSnapshots(link netlink.Link) []InterfaceAddressSnapshot {
+	if link == nil {
+		return nil
+	}
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+	if err != nil || len(addrs) == 0 {
+		return nil
+	}
+	out := make([]InterfaceAddressSnapshot, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr.IPNet == nil {
+			continue
+		}
+		family := "inet"
+		if addr.IPNet.IP.To4() == nil {
+			family = "inet6"
+		}
+		out = append(out, InterfaceAddressSnapshot{
+			Family:  family,
+			Address: addr.IPNet.String(),
+			Scope:   addr.Scope,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Family != out[j].Family {
+			return out[i].Family < out[j].Family
+		}
+		return out[i].Address < out[j].Address
+	})
 	return out
 }
 
@@ -276,6 +324,106 @@ func buildRouteSnapshots(cfg *config.Config) []RouteSnapshot {
 		return out[i].Destination < out[j].Destination
 	})
 	return out
+}
+
+func buildNeighborSnapshots(cfg *config.Config) []NeighborSnapshot {
+	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]NeighborSnapshot, 0)
+	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		iface := cfg.Interfaces.Interfaces[name]
+		if iface == nil {
+			continue
+		}
+		linuxName := config.LinuxIfName(name)
+		link, err := netlink.LinkByName(linuxName)
+		if err != nil || link == nil {
+			continue
+		}
+		for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+			neighs, err := netlink.NeighList(link.Attrs().Index, family)
+			if err != nil {
+				continue
+			}
+			for _, neigh := range neighs {
+				if neigh.IP == nil {
+					continue
+				}
+				key := fmt.Sprintf("%d/%s", link.Attrs().Index, neigh.IP.String())
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				fam := "inet"
+				if family == netlink.FAMILY_V6 {
+					fam = "inet6"
+				}
+				mac := ""
+				if neigh.HardwareAddr != nil {
+					mac = neigh.HardwareAddr.String()
+				}
+				out = append(out, NeighborSnapshot{
+					Interface: linuxName,
+					Ifindex:   link.Attrs().Index,
+					Family:    fam,
+					IP:        neigh.IP.String(),
+					MAC:       mac,
+					State:     neighborStateString(neigh.State),
+					Router:    neigh.Flags&netlink.NTF_ROUTER != 0,
+					LinkLocal: neigh.IP.IsLinkLocalUnicast(),
+				})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Interface != out[j].Interface {
+			return out[i].Interface < out[j].Interface
+		}
+		if out[i].Family != out[j].Family {
+			return out[i].Family < out[j].Family
+		}
+		return out[i].IP < out[j].IP
+	})
+	return out
+}
+
+func neighborStateString(state int) string {
+	parts := make([]string, 0, 4)
+	if state&netlink.NUD_PERMANENT != 0 {
+		parts = append(parts, "permanent")
+	}
+	if state&netlink.NUD_REACHABLE != 0 {
+		parts = append(parts, "reachable")
+	}
+	if state&netlink.NUD_STALE != 0 {
+		parts = append(parts, "stale")
+	}
+	if state&netlink.NUD_DELAY != 0 {
+		parts = append(parts, "delay")
+	}
+	if state&netlink.NUD_PROBE != 0 {
+		parts = append(parts, "probe")
+	}
+	if state&netlink.NUD_FAILED != 0 {
+		parts = append(parts, "failed")
+	}
+	if state&netlink.NUD_NOARP != 0 {
+		parts = append(parts, "noarp")
+	}
+	if state&netlink.NUD_INCOMPLETE != 0 {
+		parts = append(parts, "incomplete")
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, "|")
 }
 
 func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {

@@ -15,6 +15,9 @@ func TestFormatStatusSummary(t *testing.T) {
 		RingEntries:            2048,
 		LastSnapshotGeneration: 7,
 		LastSnapshotAt:         now.Add(-2 * time.Second),
+		InterfaceAddresses:     6,
+		NeighborEntries:        9,
+		RouteEntries:           4,
 		WorkerHeartbeats:       []time.Time{now.Add(-500 * time.Millisecond), now.Add(-700 * time.Millisecond)},
 		Queues: []QueueStatus{
 			{QueueID: 0, Ready: true},
@@ -30,6 +33,9 @@ func TestFormatStatusSummary(t *testing.T) {
 	for _, want := range []string{
 		"Userspace dataplane helper:",
 		"PID:",
+		"Interface addresses:       6",
+		"Neighbor entries:          9",
+		"Route entries:             4",
 		"Bound bindings:            2/2",
 		"XSK-registered bindings:   1/2",
 		"Ready queues:              1/2",

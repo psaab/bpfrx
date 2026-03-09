@@ -48,6 +48,20 @@ struct InterfaceSnapshot {
     unit_count: usize,
     #[serde(default)]
     tunnel: bool,
+    #[serde(default)]
+    mtu: i32,
+    #[serde(rename = "hardware_addr", default)]
+    hardware_addr: String,
+    #[serde(default)]
+    addresses: Vec<InterfaceAddressSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct InterfaceAddressSnapshot {
+    family: String,
+    address: String,
+    #[serde(default)]
+    scope: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -64,6 +78,24 @@ struct RouteSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct NeighborSnapshot {
+    #[serde(default)]
+    interface: String,
+    #[serde(default)]
+    ifindex: i32,
+    family: String,
+    ip: String,
+    #[serde(default)]
+    mac: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    router: bool,
+    #[serde(rename = "link_local", default)]
+    link_local: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct ConfigSnapshot {
     version: i32,
     generation: u64,
@@ -74,6 +106,8 @@ struct ConfigSnapshot {
     map_pins: MapPins,
     #[serde(default)]
     interfaces: Vec<InterfaceSnapshot>,
+    #[serde(default)]
+    neighbors: Vec<NeighborSnapshot>,
     #[serde(default)]
     routes: Vec<RouteSnapshot>,
     #[serde(default)]
@@ -126,6 +160,12 @@ struct ProcessStatus {
     last_snapshot_generation: u64,
     #[serde(rename = "last_snapshot_at", skip_serializing_if = "Option::is_none")]
     last_snapshot_at: Option<DateTime<Utc>>,
+    #[serde(rename = "interface_addresses", default)]
+    interface_addresses: usize,
+    #[serde(rename = "neighbor_entries", default)]
+    neighbor_entries: usize,
+    #[serde(rename = "route_entries", default)]
+    route_entries: usize,
     #[serde(rename = "worker_heartbeats", default)]
     worker_heartbeats: Vec<DateTime<Utc>>,
     #[serde(default)]
@@ -273,6 +313,9 @@ fn run() -> Result<(), String> {
             enabled: false,
             last_snapshot_generation: 0,
             last_snapshot_at: None,
+            interface_addresses: 0,
+            neighbor_entries: 0,
+            route_entries: 0,
             worker_heartbeats: Vec::new(),
             queues: Vec::new(),
             bindings: Vec::new(),
@@ -533,6 +576,17 @@ fn handle_stream(
 
 fn refresh_status(state: &mut ServerState) {
     state.afxdp.refresh_bindings(&mut state.status.bindings);
+    state.status.interface_addresses = state
+        .snapshot
+        .as_ref()
+        .map(|s| s.interfaces.iter().map(|iface| iface.addresses.len()).sum())
+        .unwrap_or(0);
+    state.status.neighbor_entries = state
+        .snapshot
+        .as_ref()
+        .map(|s| s.neighbors.len())
+        .unwrap_or(0);
+    state.status.route_entries = state.snapshot.as_ref().map(|s| s.routes.len()).unwrap_or(0);
     state.status.worker_heartbeats = collect_heartbeats(&state.heartbeats);
     state.status.enabled = state
         .status

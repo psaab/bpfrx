@@ -42,6 +42,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	if !status.LastSnapshotAt.IsZero() {
 		fmt.Fprintf(&b, "  Last snapshot age:         %s\n", formatStatusAge(now.Sub(status.LastSnapshotAt)))
 	}
+	fmt.Fprintf(&b, "  Interface addresses:       %d\n", status.InterfaceAddresses)
+	fmt.Fprintf(&b, "  Neighbor entries:          %d\n", status.NeighborEntries)
+	fmt.Fprintf(&b, "  Route entries:             %d\n", status.RouteEntries)
 	fmt.Fprintf(&b, "  Bound bindings:            %d/%d\n", boundBindings, len(status.Bindings))
 	fmt.Fprintf(&b, "  XSK-registered bindings:   %d/%d\n", xskBindings, len(status.Bindings))
 	fmt.Fprintf(&b, "  Ready queues:              %d/%d\n", readyQueues, len(status.Queues))
