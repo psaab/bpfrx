@@ -36,10 +36,16 @@ struct InterfaceSnapshot {
     name: String,
     #[serde(rename = "linux_name", default)]
     linux_name: String,
+    #[serde(rename = "parent_linux_name", default)]
+    parent_linux_name: String,
     #[serde(default)]
     ifindex: i32,
+    #[serde(rename = "parent_ifindex", default)]
+    parent_ifindex: i32,
     #[serde(rename = "rx_queues", default)]
     rx_queues: usize,
+    #[serde(rename = "vlan_id", default)]
+    vlan_id: i32,
     #[serde(rename = "local_fabric_member", default)]
     local_fabric_member: String,
     #[serde(rename = "redundancy_group", default)]

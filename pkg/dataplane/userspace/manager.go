@@ -206,8 +206,11 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 		out = append(out, InterfaceSnapshot{
 			Name:            name,
 			LinuxName:       linuxName,
+			ParentLinuxName: "",
 			Ifindex:         ifindex,
+			ParentIfindex:   0,
 			RXQueues:        userspaceRXQueueCount(linuxName),
+			VLANID:          0,
 			LocalFabric:     iface.LocalFabricMember,
 			RedundancyGroup: iface.RedundancyGroup,
 			UnitCount:       len(iface.Units),
@@ -230,14 +233,19 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				continue
 			}
 			unitName := fmt.Sprintf("%s.%d", name, unitNum)
+			parentLinux := snapshotLinuxName(cfg, name, iface, nil)
+			parentIfindex, _, _, _ := buildLinkSnapshot(parentLinux)
 			linuxUnit := snapshotLinuxName(cfg, name, iface, unit)
 			ifindex, mtu, hardwareAddr, addresses := buildLinkSnapshot(linuxUnit)
 			addresses = mergeInterfaceAddressSnapshots(addresses, buildConfiguredAddressSnapshots(unit.Addresses))
 			out = append(out, InterfaceSnapshot{
 				Name:            unitName,
 				LinuxName:       linuxUnit,
+				ParentLinuxName: parentLinux,
 				Ifindex:         ifindex,
+				ParentIfindex:   parentIfindex,
 				RXQueues:        userspaceRXQueueCount(linuxUnit),
+				VLANID:          unit.VlanID,
 				LocalFabric:     iface.LocalFabricMember,
 				RedundancyGroup: iface.RedundancyGroup,
 				UnitCount:       0,

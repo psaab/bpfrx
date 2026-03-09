@@ -52,8 +52,11 @@ type SnapshotSummary struct {
 type InterfaceSnapshot struct {
 	Name            string                     `json:"name"`
 	LinuxName       string                     `json:"linux_name,omitempty"`
+	ParentLinuxName string                     `json:"parent_linux_name,omitempty"`
 	Ifindex         int                        `json:"ifindex,omitempty"`
+	ParentIfindex   int                        `json:"parent_ifindex,omitempty"`
 	RXQueues        int                        `json:"rx_queues,omitempty"`
+	VLANID          int                        `json:"vlan_id,omitempty"`
 	LocalFabric     string                     `json:"local_fabric_member,omitempty"`
 	RedundancyGroup int                        `json:"redundancy_group,omitempty"`
 	UnitCount       int                        `json:"unit_count"`

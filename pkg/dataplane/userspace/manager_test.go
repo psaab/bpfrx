@@ -128,8 +128,17 @@ func TestBuildSnapshotIncludesUnitInterfaces(t *testing.T) {
 	if got["reth0.0"].LinuxName != "ge-0-0-2" {
 		t.Fatalf("reth0.0 LinuxName = %q, want ge-0-0-2", got["reth0.0"].LinuxName)
 	}
+	if got["reth0.0"].ParentLinuxName != "ge-0-0-2" {
+		t.Fatalf("reth0.0 ParentLinuxName = %q, want ge-0-0-2", got["reth0.0"].ParentLinuxName)
+	}
 	if got["reth0.50"].LinuxName != "ge-0-0-2.50" {
 		t.Fatalf("reth0.50 LinuxName = %q, want ge-0-0-2.50", got["reth0.50"].LinuxName)
+	}
+	if got["reth0.50"].ParentLinuxName != "ge-0-0-2" {
+		t.Fatalf("reth0.50 ParentLinuxName = %q, want ge-0-0-2", got["reth0.50"].ParentLinuxName)
+	}
+	if got["reth0.50"].VLANID != 50 {
+		t.Fatalf("reth0.50 VLANID = %d, want 50", got["reth0.50"].VLANID)
 	}
 	if len(got["reth0.50"].Addresses) != 2 {
 		t.Fatalf("reth0.50 Addresses = %+v, want config fallback addresses", got["reth0.50"].Addresses)
