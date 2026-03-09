@@ -160,16 +160,16 @@ static USERSPACE_FALLBACK_PROGS: ProgramArray = ProgramArray::with_max_entries(1
 
 #[xdp]
 pub fn xdp_userspace_prog(ctx: XdpContext) -> u32 {
-    match try_xdp_userspace(ctx) {
+    match try_xdp_userspace(&ctx) {
         Ok(ret) => ret,
-        Err(_) => xdp_action::XDP_ABORTED,
+        Err(_) => fallback_to_main_or_abort(&ctx),
     }
 }
 
-fn try_xdp_userspace(ctx: XdpContext) -> Result<u32, i64> {
+fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let ctrl = USERSPACE_CTRL.get(0).ok_or(0i64)?;
     if ctrl.enabled == 0 || ctrl.metadata_version != USERSPACE_META_VERSION as u32 {
-        return fallback_to_main(&ctx);
+        return fallback_to_main(ctx);
     }
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
@@ -187,7 +187,7 @@ fn try_xdp_userspace(ctx: XdpContext) -> Result<u32, i64> {
     }
     let last_heartbeat = unsafe { USERSPACE_HEARTBEAT.get(&binding.slot) };
     let Some(last_heartbeat) = last_heartbeat else {
-        return fallback_to_main(&ctx);
+        return fallback_to_main(ctx);
     };
     let timeout_ms = if ctrl.heartbeat_timeout_ms == 0 {
         USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS
@@ -197,23 +197,25 @@ fn try_xdp_userspace(ctx: XdpContext) -> Result<u32, i64> {
     let timeout_ns = (timeout_ms as u64) * 1_000_000;
     let now_ns = unsafe { bpf_ktime_get_ns() };
     if now_ns < *last_heartbeat || now_ns.saturating_sub(*last_heartbeat) > timeout_ns {
-        return fallback_to_main(&ctx);
+        return fallback_to_main(ctx);
     }
 
     let data = ctx.data();
     let data_end = ctx.data_end();
     let packet_len = data_end.saturating_sub(data);
-    let parsed = parse_packet(data, data_end).ok_or(0i64)?;
+    let Some(parsed) = parse_packet(data, data_end) else {
+        return fallback_to_main(ctx);
+    };
 
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
     if adjust_rc != 0 {
-        return fallback_to_main(&ctx);
+        return fallback_to_main(ctx);
     }
 
     let meta_ptr = ctx.metadata() as *mut UserspaceDpMeta;
     if (meta_ptr as usize).saturating_add(mem::size_of::<UserspaceDpMeta>()) > ctx.metadata_end() {
-        return fallback_to_main(&ctx);
+        return fallback_to_main(ctx);
     }
 
     unsafe {
@@ -245,7 +247,7 @@ fn try_xdp_userspace(ctx: XdpContext) -> Result<u32, i64> {
 
     match USERSPACE_XSK_MAP.redirect(binding.slot, 0) {
         Ok(action) => Ok(action),
-        Err(_) => fallback_to_main(&ctx),
+        Err(_) => fallback_to_main(ctx),
     }
 }
 
@@ -254,6 +256,10 @@ fn fallback_to_main(ctx: &XdpContext) -> Result<u32, i64> {
         let _ = USERSPACE_FALLBACK_PROGS.tail_call(ctx, USERSPACE_FALLBACK_MAIN);
     }
     Ok(xdp_action::XDP_DROP)
+}
+
+fn fallback_to_main_or_abort(ctx: &XdpContext) -> u32 {
+    fallback_to_main(ctx).unwrap_or(xdp_action::XDP_ABORTED)
 }
 
 #[derive(Clone, Copy)]

@@ -70,6 +70,7 @@ if [[ -z "${VF_WAN_PCI+x}" ]]; then
 		VF_WAN_PCI=("${VF_PCI[@]}")
 	fi
 fi
+VF_WAN_TRUST="${VF_WAN_TRUST:-true}"
 # LAN VF PCI addresses per VM (empty = no LAN VF passthrough)
 if [[ -z "${VF_LAN_PCI+x}" ]]; then VF_LAN_PCI=(); fi
 
@@ -242,6 +243,33 @@ create_vm() {
 	local wan_pci="${VF_WAN_PCI[$idx]}"
 	info "Adding WAN SR-IOV VF PCI $wan_pci to $vm..."
 	incus config device add "$(r "$vm")" wan-vf pci address="$wan_pci"
+
+	# Allow VLAN-tagged traffic from WAN VF guests. The HA lab uses guest
+	# VLAN subinterfaces (e.g. reth0.50/reth0.80), which requires trust on
+	# the passed-through VF.
+	if [[ "${VF_WAN_TRUST}" == "true" && -n "${SRIOV_PARENT:-}" ]]; then
+		local wan_vf_idx=""
+		for vf_path in /sys/class/net/"${SRIOV_PARENT}"/device/virtfn*; do
+			local vf_pci
+			if [[ -n "${INCUS_REMOTE:-}" ]]; then
+				vf_pci=$(ssh "$INCUS_REMOTE" "readlink -f '$vf_path' | xargs basename")
+			else
+				vf_pci=$(readlink -f "$vf_path" | xargs basename)
+			fi
+			if [[ "$vf_pci" == "$wan_pci" ]]; then
+				wan_vf_idx=$(basename "$vf_path" | sed 's/virtfn//')
+				break
+			fi
+		done
+		if [[ -n "${wan_vf_idx:-}" ]]; then
+			info "Setting host WAN VF trust on $SRIOV_PARENT vf $wan_vf_idx ($wan_pci)..."
+			if [[ -n "${INCUS_REMOTE:-}" ]]; then
+				ssh "$INCUS_REMOTE" "sudo ip link set dev $SRIOV_PARENT vf $wan_vf_idx trust on"
+			else
+				sudo ip link set dev "$SRIOV_PARENT" vf "$wan_vf_idx" trust on
+			fi
+		fi
+	fi
 
 	# LAN VF (optional — only if VF_LAN_PCI is configured)
 	if [[ ${#VF_LAN_PCI[@]} -gt 0 ]]; then
