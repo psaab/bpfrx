@@ -157,6 +157,12 @@ type BindingStatus struct {
 	MetadataErrors       uint64    `json:"metadata_errors,omitempty"`
 	ValidatedPackets     uint64    `json:"validated_packets,omitempty"`
 	ValidatedBytes       uint64    `json:"validated_bytes,omitempty"`
+	LocalDeliveryPackets uint64    `json:"local_delivery_packets,omitempty"`
+	ForwardCandidatePkts uint64    `json:"forward_candidate_packets,omitempty"`
+	RouteMissPackets     uint64    `json:"route_miss_packets,omitempty"`
+	NeighborMissPackets  uint64    `json:"neighbor_miss_packets,omitempty"`
+	DiscardRoutePackets  uint64    `json:"discard_route_packets,omitempty"`
+	NextTablePackets     uint64    `json:"next_table_packets,omitempty"`
 	ExceptionPackets     uint64    `json:"exception_packets,omitempty"`
 	ConfigGenMismatches  uint64    `json:"config_gen_mismatches,omitempty"`
 	FIBGenMismatches     uint64    `json:"fib_gen_mismatches,omitempty"`

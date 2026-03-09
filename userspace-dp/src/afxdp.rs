@@ -3,9 +3,11 @@ use chrono::Utc;
 use core::ffi::{c_int, c_void};
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -126,6 +128,12 @@ impl Coordinator {
             binding.metadata_errors = 0;
             binding.validated_packets = 0;
             binding.validated_bytes = 0;
+            binding.local_delivery_packets = 0;
+            binding.forward_candidate_packets = 0;
+            binding.route_miss_packets = 0;
+            binding.neighbor_miss_packets = 0;
+            binding.discard_route_packets = 0;
+            binding.next_table_packets = 0;
             binding.exception_packets = 0;
             binding.config_gen_mismatches = 0;
             binding.fib_gen_mismatches = 0;
@@ -144,6 +152,7 @@ impl Coordinator {
             config_generation: snapshot.generation,
             fib_generation: snapshot.fib_generation,
         };
+        let forwarding = Arc::new(build_forwarding_state(snapshot));
         if snapshot.map_pins.xsk.is_empty() {
             self.last_reconcile_stage = "missing_xsk_pin".to_string();
             for binding in bindings.iter_mut() {
@@ -216,6 +225,7 @@ impl Coordinator {
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
             let validation = self.validation;
+            let forwarding = forwarding.clone();
             let join = thread::Builder::new()
                 .name(format!("bpfrx-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -223,6 +233,7 @@ impl Coordinator {
                         worker_id,
                         binding_plans,
                         validation,
+                        forwarding,
                         recent_exceptions,
                         stop_clone,
                         heartbeat_clone,
@@ -373,6 +384,12 @@ impl Coordinator {
                 binding.metadata_errors = snap.metadata_errors;
                 binding.validated_packets = snap.validated_packets;
                 binding.validated_bytes = snap.validated_bytes;
+                binding.local_delivery_packets = snap.local_delivery_packets;
+                binding.forward_candidate_packets = snap.forward_candidate_packets;
+                binding.route_miss_packets = snap.route_miss_packets;
+                binding.neighbor_miss_packets = snap.neighbor_miss_packets;
+                binding.discard_route_packets = snap.discard_route_packets;
+                binding.next_table_packets = snap.next_table_packets;
                 binding.exception_packets = snap.exception_packets;
                 binding.config_gen_mismatches = snap.config_gen_mismatches;
                 binding.fib_gen_mismatches = snap.fib_gen_mismatches;
@@ -394,6 +411,12 @@ impl Coordinator {
                 binding.metadata_errors = 0;
                 binding.validated_packets = 0;
                 binding.validated_bytes = 0;
+                binding.local_delivery_packets = 0;
+                binding.forward_candidate_packets = 0;
+                binding.route_miss_packets = 0;
+                binding.neighbor_miss_packets = 0;
+                binding.discard_route_packets = 0;
+                binding.next_table_packets = 0;
                 binding.exception_packets = 0;
                 binding.config_gen_mismatches = 0;
                 binding.fib_gen_mismatches = 0;
@@ -434,6 +457,64 @@ enum PacketDisposition {
     ConfigGenerationMismatch,
     FibGenerationMismatch,
     UnsupportedPacket,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ForwardingState {
+    local_v4: Vec<Ipv4Addr>,
+    local_v6: Vec<Ipv6Addr>,
+    connected_v4: Vec<ConnectedRouteV4>,
+    connected_v6: Vec<ConnectedRouteV6>,
+    routes_v4: Vec<RouteEntryV4>,
+    routes_v6: Vec<RouteEntryV6>,
+    neighbors: BTreeMap<(i32, IpAddr), NeighborEntry>,
+    ifindex_to_name: BTreeMap<i32, String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectedRouteV4 {
+    prefix: Ipv4Net,
+    ifindex: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectedRouteV6 {
+    prefix: Ipv6Net,
+    ifindex: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RouteEntryV4 {
+    prefix: Ipv4Net,
+    ifindex: i32,
+    next_hop: Option<Ipv4Addr>,
+    discard: bool,
+    next_table: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RouteEntryV6 {
+    prefix: Ipv6Net,
+    ifindex: i32,
+    next_hop: Option<Ipv6Addr>,
+    discard: bool,
+    next_table: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+struct NeighborEntry {
+    mac: [u8; 6],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardingDisposition {
+    LocalDelivery,
+    ForwardCandidate,
+    NoRoute,
+    MissingNeighbor,
+    DiscardRoute,
+    NextTableUnsupported,
 }
 
 struct BindingWorker {
@@ -532,6 +613,7 @@ impl BindingWorker {
 fn poll_binding(
     binding: &mut BindingWorker,
     validation: ValidationState,
+    forwarding: &ForwardingState,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     poll_stats: bool,
 ) -> bool {
@@ -560,14 +642,25 @@ fn poll_binding(
                 .live
                 .metadata_packets
                 .fetch_add(1, Ordering::Relaxed);
+            let disposition = classify_metadata(meta, validation);
             record_disposition(
                 &ident,
                 &binding.live,
-                classify_metadata(meta, validation),
+                disposition,
                 desc.len as u32,
                 Some(meta),
                 recent_exceptions,
             );
+            if disposition == PacketDisposition::Valid {
+                record_forwarding_disposition(
+                    &ident,
+                    &binding.live,
+                    classify_forwarding(&binding.area, desc, meta, forwarding),
+                    desc.len as u32,
+                    Some(meta),
+                    recent_exceptions,
+                );
+            }
         } else {
             binding.live.metadata_errors.fetch_add(1, Ordering::Relaxed);
             record_exception(
@@ -694,10 +787,64 @@ fn record_disposition(
     }
 }
 
+fn record_forwarding_disposition(
+    binding: &BindingIdentity,
+    live: &BindingLiveState,
+    disposition: ForwardingDisposition,
+    packet_length: u32,
+    meta: Option<UserspaceDpMeta>,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+) {
+    match disposition {
+        ForwardingDisposition::LocalDelivery => {
+            live.local_delivery_packets.fetch_add(1, Ordering::Relaxed);
+        }
+        ForwardingDisposition::ForwardCandidate => {
+            live.forward_candidate_packets
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        ForwardingDisposition::NoRoute => {
+            live.route_miss_packets.fetch_add(1, Ordering::Relaxed);
+            record_exception(recent_exceptions, binding, "no_route", packet_length, meta);
+        }
+        ForwardingDisposition::MissingNeighbor => {
+            live.neighbor_miss_packets.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "missing_neighbor",
+                packet_length,
+                meta,
+            );
+        }
+        ForwardingDisposition::DiscardRoute => {
+            live.discard_route_packets.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "discard_route",
+                packet_length,
+                meta,
+            );
+        }
+        ForwardingDisposition::NextTableUnsupported => {
+            live.next_table_packets.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "next_table_unsupported",
+                packet_length,
+                meta,
+            );
+        }
+    }
+}
+
 fn worker_loop(
     worker_id: u32,
     binding_plans: Vec<BindingPlan>,
     validation: ValidationState,
+    forwarding: Arc<ForwardingState>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicI64>,
@@ -721,7 +868,13 @@ fn worker_loop(
         let poll_stats = last_stats_poll.elapsed() >= STATS_POLL_INTERVAL;
         let mut did_work = false;
         for binding in bindings.iter_mut() {
-            if poll_binding(binding, validation, &recent_exceptions, poll_stats) {
+            if poll_binding(
+                binding,
+                validation,
+                &forwarding,
+                &recent_exceptions,
+                poll_stats,
+            ) {
                 did_work = true;
             }
         }
@@ -821,6 +974,449 @@ fn ifinfo_from_binding(
         .map_err(|e| format!("lookup ifindex {}: {e}", binding.ifindex))?;
     info.set_queue(binding.queue_id);
     Ok(info)
+}
+
+fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
+    let mut state = ForwardingState::default();
+    let mut name_to_ifindex = BTreeMap::new();
+    let mut linux_to_ifindex = BTreeMap::new();
+
+    for iface in &snapshot.interfaces {
+        if iface.ifindex <= 0 {
+            continue;
+        }
+        let label = if iface.linux_name.is_empty() {
+            iface.name.clone()
+        } else {
+            iface.linux_name.clone()
+        };
+        state.ifindex_to_name.insert(iface.ifindex, label);
+        name_to_ifindex.insert(iface.name.clone(), iface.ifindex);
+        if !iface.linux_name.is_empty() {
+            linux_to_ifindex.insert(iface.linux_name.clone(), iface.ifindex);
+        }
+        for addr in &iface.addresses {
+            let Ok(net) = addr.address.parse::<IpNet>() else {
+                continue;
+            };
+            match net {
+                IpNet::V4(v4) => {
+                    state.local_v4.push(v4.addr());
+                    state.connected_v4.push(ConnectedRouteV4 {
+                        prefix: v4,
+                        ifindex: iface.ifindex,
+                    });
+                }
+                IpNet::V6(v6) => {
+                    state.local_v6.push(v6.addr());
+                    state.connected_v6.push(ConnectedRouteV6 {
+                        prefix: v6,
+                        ifindex: iface.ifindex,
+                    });
+                }
+            }
+        }
+    }
+
+    state
+        .connected_v4
+        .sort_by(|a, b| b.prefix.prefix_len().cmp(&a.prefix.prefix_len()));
+    state
+        .connected_v6
+        .sort_by(|a, b| b.prefix.prefix_len().cmp(&a.prefix.prefix_len()));
+
+    for route in &snapshot.routes {
+        match route.family.as_str() {
+            "inet" => {
+                let Ok(prefix) = route.destination.parse::<Ipv4Net>() else {
+                    continue;
+                };
+                let (next_hop, ifindex) =
+                    resolve_route_target_v4(route, &name_to_ifindex, &linux_to_ifindex, &state);
+                state.routes_v4.push(RouteEntryV4 {
+                    prefix,
+                    ifindex,
+                    next_hop,
+                    discard: route.discard,
+                    next_table: !route.next_table.is_empty(),
+                });
+            }
+            "inet6" => {
+                let Ok(prefix) = route.destination.parse::<Ipv6Net>() else {
+                    continue;
+                };
+                let (next_hop, ifindex) =
+                    resolve_route_target_v6(route, &name_to_ifindex, &linux_to_ifindex, &state);
+                state.routes_v6.push(RouteEntryV6 {
+                    prefix,
+                    ifindex,
+                    next_hop,
+                    discard: route.discard,
+                    next_table: !route.next_table.is_empty(),
+                });
+            }
+            _ => {}
+        }
+    }
+    state
+        .routes_v4
+        .sort_by(|a, b| b.prefix.prefix_len().cmp(&a.prefix.prefix_len()));
+    state
+        .routes_v6
+        .sort_by(|a, b| b.prefix.prefix_len().cmp(&a.prefix.prefix_len()));
+
+    for neigh in &snapshot.neighbors {
+        if neigh.ifindex <= 0 || !neighbor_state_usable(&neigh.state) {
+            continue;
+        }
+        let Ok(ip) = neigh.ip.parse::<IpAddr>() else {
+            continue;
+        };
+        let Some(mac) = parse_mac(&neigh.mac) else {
+            continue;
+        };
+        state
+            .neighbors
+            .insert((neigh.ifindex, ip), NeighborEntry { mac });
+    }
+    state
+}
+
+fn resolve_route_target_v4(
+    route: &super::RouteSnapshot,
+    names: &BTreeMap<String, i32>,
+    linux_names: &BTreeMap<String, i32>,
+    state: &ForwardingState,
+) -> (Option<Ipv4Addr>, i32) {
+    if route.discard || !route.next_table.is_empty() {
+        return (None, 0);
+    }
+    let Some((next_hop, interface)) = route
+        .next_hops
+        .first()
+        .map(|nh| parse_route_next_hop(nh.as_str()))
+    else {
+        return (None, 0);
+    };
+    let egress = interface
+        .as_deref()
+        .and_then(|name| resolve_ifindex(name, names, linux_names))
+        .or_else(|| next_hop.and_then(|ip| infer_connected_ifindex_v4(state, ip)));
+    (next_hop, egress.unwrap_or(0))
+}
+
+fn resolve_route_target_v6(
+    route: &super::RouteSnapshot,
+    names: &BTreeMap<String, i32>,
+    linux_names: &BTreeMap<String, i32>,
+    state: &ForwardingState,
+) -> (Option<Ipv6Addr>, i32) {
+    if route.discard || !route.next_table.is_empty() {
+        return (None, 0);
+    }
+    let Some((next_hop, interface)) = route
+        .next_hops
+        .first()
+        .map(|nh| parse_route_next_hop_v6(nh.as_str()))
+    else {
+        return (None, 0);
+    };
+    let egress = interface
+        .as_deref()
+        .and_then(|name| resolve_ifindex(name, names, linux_names))
+        .or_else(|| next_hop.and_then(|ip| infer_connected_ifindex_v6(state, ip)));
+    (next_hop, egress.unwrap_or(0))
+}
+
+fn parse_route_next_hop(spec: &str) -> (Option<Ipv4Addr>, Option<String>) {
+    let (ip_part, if_part) = if let Some((lhs, rhs)) = spec.split_once('@') {
+        (lhs, rhs)
+    } else {
+        (spec, "")
+    };
+    let ip = if ip_part.is_empty() {
+        None
+    } else {
+        ip_part.parse::<Ipv4Addr>().ok()
+    };
+    let iface = if if_part.is_empty() {
+        None
+    } else {
+        Some(if_part.to_string())
+    };
+    (ip, iface)
+}
+
+fn parse_route_next_hop_v6(spec: &str) -> (Option<Ipv6Addr>, Option<String>) {
+    let (ip_part, if_part) = if let Some((lhs, rhs)) = spec.split_once('@') {
+        (lhs, rhs)
+    } else {
+        (spec, "")
+    };
+    let ip = if ip_part.is_empty() {
+        None
+    } else {
+        ip_part.parse::<Ipv6Addr>().ok()
+    };
+    let iface = if if_part.is_empty() {
+        None
+    } else {
+        Some(if_part.to_string())
+    };
+    (ip, iface)
+}
+
+fn resolve_ifindex(
+    name: &str,
+    names: &BTreeMap<String, i32>,
+    linux_names: &BTreeMap<String, i32>,
+) -> Option<i32> {
+    names
+        .get(name)
+        .copied()
+        .or_else(|| linux_names.get(name).copied())
+}
+
+fn infer_connected_ifindex_v4(state: &ForwardingState, ip: Ipv4Addr) -> Option<i32> {
+    state
+        .connected_v4
+        .iter()
+        .find(|entry| entry.prefix.contains(&ip))
+        .map(|entry| entry.ifindex)
+}
+
+fn infer_connected_ifindex_v6(state: &ForwardingState, ip: Ipv6Addr) -> Option<i32> {
+    state
+        .connected_v6
+        .iter()
+        .find(|entry| entry.prefix.contains(&ip))
+        .map(|entry| entry.ifindex)
+}
+
+fn neighbor_state_usable(state: &str) -> bool {
+    !(state.contains("failed") || state.contains("incomplete"))
+}
+
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for byte in &mut out {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+fn parse_packet_destination(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+) -> Option<IpAddr> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    let l3 = meta.l3_offset as usize;
+    match meta.addr_family as i32 {
+        libc::AF_INET => {
+            let end = l3.checked_add(20)?;
+            if end > frame.len() {
+                return None;
+            }
+            Some(IpAddr::V4(Ipv4Addr::new(
+                frame[l3 + 16],
+                frame[l3 + 17],
+                frame[l3 + 18],
+                frame[l3 + 19],
+            )))
+        }
+        libc::AF_INET6 => {
+            let end = l3.checked_add(40)?;
+            if end > frame.len() {
+                return None;
+            }
+            Some(IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[l3 + 24..l3 + 40]).ok()?,
+            )))
+        }
+        _ => None,
+    }
+}
+
+fn classify_forwarding(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    state: &ForwardingState,
+) -> ForwardingDisposition {
+    let Some(dst) = parse_packet_destination(area, desc, meta) else {
+        return ForwardingDisposition::NoRoute;
+    };
+    lookup_forwarding_for_ip(state, dst)
+}
+
+fn lookup_forwarding_for_ip(state: &ForwardingState, dst: IpAddr) -> ForwardingDisposition {
+    match dst {
+        IpAddr::V4(ip) => {
+            if state.local_v4.contains(&ip) {
+                return ForwardingDisposition::LocalDelivery;
+            }
+            let static_match = state
+                .routes_v4
+                .iter()
+                .find(|entry| entry.prefix.contains(&ip));
+            let connected_match = state
+                .connected_v4
+                .iter()
+                .find(|entry| entry.prefix.contains(&ip));
+            match choose_v4_route(static_match, connected_match) {
+                Some(ResolvedRouteV4::Connected { ifindex }) => {
+                    if state.neighbors.contains_key(&(ifindex, IpAddr::V4(ip))) {
+                        ForwardingDisposition::ForwardCandidate
+                    } else {
+                        ForwardingDisposition::MissingNeighbor
+                    }
+                }
+                Some(ResolvedRouteV4::Static {
+                    ifindex,
+                    next_hop,
+                    discard,
+                    next_table,
+                }) => {
+                    if discard {
+                        return ForwardingDisposition::DiscardRoute;
+                    }
+                    if next_table {
+                        return ForwardingDisposition::NextTableUnsupported;
+                    }
+                    if ifindex <= 0 {
+                        return ForwardingDisposition::NoRoute;
+                    }
+                    let target = next_hop.unwrap_or(ip);
+                    if state.neighbors.contains_key(&(ifindex, IpAddr::V4(target))) {
+                        ForwardingDisposition::ForwardCandidate
+                    } else {
+                        ForwardingDisposition::MissingNeighbor
+                    }
+                }
+                None => ForwardingDisposition::NoRoute,
+            }
+        }
+        IpAddr::V6(ip) => {
+            if state.local_v6.contains(&ip) {
+                return ForwardingDisposition::LocalDelivery;
+            }
+            let static_match = state
+                .routes_v6
+                .iter()
+                .find(|entry| entry.prefix.contains(&ip));
+            let connected_match = state
+                .connected_v6
+                .iter()
+                .find(|entry| entry.prefix.contains(&ip));
+            match choose_v6_route(static_match, connected_match) {
+                Some(ResolvedRouteV6::Connected { ifindex }) => {
+                    if state.neighbors.contains_key(&(ifindex, IpAddr::V6(ip))) {
+                        ForwardingDisposition::ForwardCandidate
+                    } else {
+                        ForwardingDisposition::MissingNeighbor
+                    }
+                }
+                Some(ResolvedRouteV6::Static {
+                    ifindex,
+                    next_hop,
+                    discard,
+                    next_table,
+                }) => {
+                    if discard {
+                        return ForwardingDisposition::DiscardRoute;
+                    }
+                    if next_table {
+                        return ForwardingDisposition::NextTableUnsupported;
+                    }
+                    if ifindex <= 0 {
+                        return ForwardingDisposition::NoRoute;
+                    }
+                    let target = next_hop.unwrap_or(ip);
+                    if state.neighbors.contains_key(&(ifindex, IpAddr::V6(target))) {
+                        ForwardingDisposition::ForwardCandidate
+                    } else {
+                        ForwardingDisposition::MissingNeighbor
+                    }
+                }
+                None => ForwardingDisposition::NoRoute,
+            }
+        }
+    }
+}
+
+enum ResolvedRouteV4 {
+    Connected {
+        ifindex: i32,
+    },
+    Static {
+        ifindex: i32,
+        next_hop: Option<Ipv4Addr>,
+        discard: bool,
+        next_table: bool,
+    },
+}
+
+enum ResolvedRouteV6 {
+    Connected {
+        ifindex: i32,
+    },
+    Static {
+        ifindex: i32,
+        next_hop: Option<Ipv6Addr>,
+        discard: bool,
+        next_table: bool,
+    },
+}
+
+fn choose_v4_route(
+    static_match: Option<&RouteEntryV4>,
+    connected_match: Option<&ConnectedRouteV4>,
+) -> Option<ResolvedRouteV4> {
+    match (static_match, connected_match) {
+        (Some(route), Some(conn)) if conn.prefix.prefix_len() >= route.prefix.prefix_len() => {
+            Some(ResolvedRouteV4::Connected {
+                ifindex: conn.ifindex,
+            })
+        }
+        (Some(route), _) => Some(ResolvedRouteV4::Static {
+            ifindex: route.ifindex,
+            next_hop: route.next_hop,
+            discard: route.discard,
+            next_table: route.next_table,
+        }),
+        (None, Some(conn)) => Some(ResolvedRouteV4::Connected {
+            ifindex: conn.ifindex,
+        }),
+        (None, None) => None,
+    }
+}
+
+fn choose_v6_route(
+    static_match: Option<&RouteEntryV6>,
+    connected_match: Option<&ConnectedRouteV6>,
+) -> Option<ResolvedRouteV6> {
+    match (static_match, connected_match) {
+        (Some(route), Some(conn)) if conn.prefix.prefix_len() >= route.prefix.prefix_len() => {
+            Some(ResolvedRouteV6::Connected {
+                ifindex: conn.ifindex,
+            })
+        }
+        (Some(route), _) => Some(ResolvedRouteV6::Static {
+            ifindex: route.ifindex,
+            next_hop: route.next_hop,
+            discard: route.discard,
+            next_table: route.next_table,
+        }),
+        (None, Some(conn)) => Some(ResolvedRouteV6::Connected {
+            ifindex: conn.ifindex,
+        }),
+        (None, None) => None,
+    }
 }
 
 fn try_parse_metadata(area: &MmapArea, desc: XdpDesc) -> Option<UserspaceDpMeta> {
@@ -944,6 +1540,12 @@ struct BindingLiveState {
     metadata_errors: AtomicU64,
     validated_packets: AtomicU64,
     validated_bytes: AtomicU64,
+    local_delivery_packets: AtomicU64,
+    forward_candidate_packets: AtomicU64,
+    route_miss_packets: AtomicU64,
+    neighbor_miss_packets: AtomicU64,
+    discard_route_packets: AtomicU64,
+    next_table_packets: AtomicU64,
     exception_packets: AtomicU64,
     config_gen_mismatches: AtomicU64,
     fib_gen_mismatches: AtomicU64,
@@ -967,6 +1569,12 @@ impl BindingLiveState {
             metadata_errors: AtomicU64::new(0),
             validated_packets: AtomicU64::new(0),
             validated_bytes: AtomicU64::new(0),
+            local_delivery_packets: AtomicU64::new(0),
+            forward_candidate_packets: AtomicU64::new(0),
+            route_miss_packets: AtomicU64::new(0),
+            neighbor_miss_packets: AtomicU64::new(0),
+            discard_route_packets: AtomicU64::new(0),
+            next_table_packets: AtomicU64::new(0),
             exception_packets: AtomicU64::new(0),
             config_gen_mismatches: AtomicU64::new(0),
             fib_gen_mismatches: AtomicU64::new(0),
@@ -1011,6 +1619,12 @@ impl BindingLiveState {
             metadata_errors: self.metadata_errors.load(Ordering::Relaxed),
             validated_packets: self.validated_packets.load(Ordering::Relaxed),
             validated_bytes: self.validated_bytes.load(Ordering::Relaxed),
+            local_delivery_packets: self.local_delivery_packets.load(Ordering::Relaxed),
+            forward_candidate_packets: self.forward_candidate_packets.load(Ordering::Relaxed),
+            route_miss_packets: self.route_miss_packets.load(Ordering::Relaxed),
+            neighbor_miss_packets: self.neighbor_miss_packets.load(Ordering::Relaxed),
+            discard_route_packets: self.discard_route_packets.load(Ordering::Relaxed),
+            next_table_packets: self.next_table_packets.load(Ordering::Relaxed),
             exception_packets: self.exception_packets.load(Ordering::Relaxed),
             config_gen_mismatches: self.config_gen_mismatches.load(Ordering::Relaxed),
             fib_gen_mismatches: self.fib_gen_mismatches.load(Ordering::Relaxed),
@@ -1038,6 +1652,12 @@ struct BindingLiveSnapshot {
     metadata_errors: u64,
     validated_packets: u64,
     validated_bytes: u64,
+    local_delivery_packets: u64,
+    forward_candidate_packets: u64,
+    route_miss_packets: u64,
+    neighbor_miss_packets: u64,
+    discard_route_packets: u64,
+    next_table_packets: u64,
     exception_packets: u64,
     config_gen_mismatches: u64,
     fib_gen_mismatches: u64,
@@ -1050,6 +1670,75 @@ struct BindingLiveSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{InterfaceAddressSnapshot, InterfaceSnapshot, NeighborSnapshot, RouteSnapshot};
+
+    fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
+        ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                name: "ge-0/0/0.50".to_string(),
+                linux_name: "ge-0-0-0.50".to_string(),
+                ifindex: 12,
+                addresses: vec![
+                    InterfaceAddressSnapshot {
+                        family: "inet".to_string(),
+                        address: "172.16.50.8/24".to_string(),
+                        scope: 0,
+                    },
+                    InterfaceAddressSnapshot {
+                        family: "inet6".to_string(),
+                        address: "2001:559:8585:50::8/64".to_string(),
+                        scope: 0,
+                    },
+                ],
+                ..Default::default()
+            }],
+            routes: vec![
+                RouteSnapshot {
+                    table: "inet.0".to_string(),
+                    family: "inet".to_string(),
+                    destination: "0.0.0.0/0".to_string(),
+                    next_hops: vec!["172.16.50.1@ge-0/0/0.50".to_string()],
+                    discard: false,
+                    next_table: String::new(),
+                },
+                RouteSnapshot {
+                    table: "inet6.0".to_string(),
+                    family: "inet6".to_string(),
+                    destination: "::/0".to_string(),
+                    next_hops: vec!["2001:559:8585:50::1@ge-0/0/0.50".to_string()],
+                    discard: false,
+                    next_table: String::new(),
+                },
+            ],
+            neighbors: if include_neighbor {
+                vec![
+                    NeighborSnapshot {
+                        interface: "ge-0-0-0.50".to_string(),
+                        ifindex: 12,
+                        family: "inet".to_string(),
+                        ip: "172.16.50.1".to_string(),
+                        mac: "00:11:22:33:44:55".to_string(),
+                        state: "reachable".to_string(),
+                        router: true,
+                        link_local: false,
+                    },
+                    NeighborSnapshot {
+                        interface: "ge-0-0-0.50".to_string(),
+                        ifindex: 12,
+                        family: "inet6".to_string(),
+                        ip: "2001:559:8585:50::1".to_string(),
+                        mac: "00:11:22:33:44:55".to_string(),
+                        state: "reachable".to_string(),
+                        router: true,
+                        link_local: false,
+                    },
+                ]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        }
+    }
 
     fn valid_meta() -> UserspaceDpMeta {
         UserspaceDpMeta {
@@ -1110,6 +1799,44 @@ mod tests {
         assert_eq!(
             classify_metadata(meta, validation),
             PacketDisposition::UnsupportedPacket
+        );
+    }
+
+    #[test]
+    fn forwarding_lookup_prefers_local_delivery() {
+        let state = build_forwarding_state(&forwarding_snapshot(true));
+        assert_eq!(
+            lookup_forwarding_for_ip(&state, IpAddr::V4(Ipv4Addr::new(172, 16, 50, 8))),
+            ForwardingDisposition::LocalDelivery
+        );
+        assert_eq!(
+            lookup_forwarding_for_ip(
+                &state,
+                IpAddr::V6("2001:559:8585:50::8".parse().expect("ipv6")),
+            ),
+            ForwardingDisposition::LocalDelivery
+        );
+    }
+
+    #[test]
+    fn forwarding_lookup_requires_neighbor_for_forward_candidate() {
+        let good = build_forwarding_state(&forwarding_snapshot(true));
+        assert_eq!(
+            lookup_forwarding_for_ip(&good, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(
+            lookup_forwarding_for_ip(
+                &good,
+                IpAddr::V6("2606:4700:4700::1111".parse().expect("ipv6")),
+            ),
+            ForwardingDisposition::ForwardCandidate
+        );
+
+        let missing_neighbor = build_forwarding_state(&forwarding_snapshot(false));
+        assert_eq!(
+            lookup_forwarding_for_ip(&missing_neighbor, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),),
+            ForwardingDisposition::MissingNeighbor
         );
     }
 }

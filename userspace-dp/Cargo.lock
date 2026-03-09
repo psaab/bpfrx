@@ -38,6 +38,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "ctrlc",
+ "ipnet",
  "libbpf-sys",
  "libc",
  "serde",
@@ -145,6 +146,12 @@ checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
 ]
+
+[[package]]
+name = "ipnet"
+version = "2.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "itoa"

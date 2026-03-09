@@ -277,6 +277,18 @@ struct BindingStatus {
     validated_packets: u64,
     #[serde(rename = "validated_bytes", default)]
     validated_bytes: u64,
+    #[serde(rename = "local_delivery_packets", default)]
+    local_delivery_packets: u64,
+    #[serde(rename = "forward_candidate_packets", default)]
+    forward_candidate_packets: u64,
+    #[serde(rename = "route_miss_packets", default)]
+    route_miss_packets: u64,
+    #[serde(rename = "neighbor_miss_packets", default)]
+    neighbor_miss_packets: u64,
+    #[serde(rename = "discard_route_packets", default)]
+    discard_route_packets: u64,
+    #[serde(rename = "next_table_packets", default)]
+    next_table_packets: u64,
     #[serde(rename = "exception_packets", default)]
     exception_packets: u64,
     #[serde(rename = "config_gen_mismatches", default)]
