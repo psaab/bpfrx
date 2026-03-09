@@ -46,9 +46,30 @@ func SlotToNodeID(slot int) int {
 // Built from interfaces that have RedundantParent set.
 func (c *Config) RethToPhysical() map[string]string {
 	m := make(map[string]string)
+	bestScore := make(map[string]int)
+	localNodeID := -1
+	if c.Chassis.Cluster != nil {
+		localNodeID = c.Chassis.Cluster.NodeID
+	}
 	for _, ifc := range c.Interfaces.Interfaces {
 		if ifc.RedundantParent != "" {
-			m[ifc.RedundantParent] = ifc.Name
+			score := 1
+			if localNodeID >= 0 {
+				slot := InterfaceSlot(ifc.Name)
+				if slot >= 0 {
+					if SlotToNodeID(slot) == localNodeID {
+						score = 2
+					} else {
+						score = 0
+					}
+				}
+			}
+			prev, ok := m[ifc.RedundantParent]
+			if !ok || score > bestScore[ifc.RedundantParent] ||
+				(score == bestScore[ifc.RedundantParent] && ifc.Name < prev) {
+				m[ifc.RedundantParent] = ifc.Name
+				bestScore[ifc.RedundantParent] = score
+			}
 		}
 	}
 	return m

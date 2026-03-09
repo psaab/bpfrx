@@ -68,3 +68,25 @@ func TestResolveReth(t *testing.T) {
 		}
 	}
 }
+
+func TestRethToPhysical_PrefersLocalClusterMember(t *testing.T) {
+	cfg := &Config{
+		Chassis: ChassisConfig{
+			Cluster: &ClusterConfig{NodeID: 0},
+		},
+		Interfaces: InterfacesConfig{
+			Interfaces: map[string]*InterfaceConfig{
+				"reth0":    {Name: "reth0", RedundancyGroup: 1},
+				"ge-0/0/2": {Name: "ge-0/0/2", RedundantParent: "reth0"},
+				"ge-7/0/2": {Name: "ge-7/0/2", RedundantParent: "reth0"},
+			},
+		},
+	}
+
+	if got := cfg.RethToPhysical()["reth0"]; got != "ge-0/0/2" {
+		t.Fatalf("reth0 → %q, want ge-0/0/2", got)
+	}
+	if got := cfg.ResolveReth("reth0.80"); got != "ge-0/0/2.80" {
+		t.Fatalf("ResolveReth(reth0.80) = %q, want ge-0/0/2.80", got)
+	}
+}
