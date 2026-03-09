@@ -181,10 +181,16 @@ So the most likely fault domain is:
 
 ## Status
 
-This is documented evidence, not a fix.
+This file is historical evidence from the broken state.
 
-At the moment:
-- original cluster VLAN 80 IPv4/IPv6: working
-- isolated userspace cluster VLAN 80 IPv6: working
-- isolated userspace cluster VLAN 80 IPv4: broken
-- current proof: ARP requests leave the isolated firewall as `172.16.80.8`, replies do not return
+That regression is now closed for the isolated userspace cluster:
+
+1. unsupported userspace HA configs were moved back onto the legacy XDP
+   dataplane, so they no longer bind AF_XDP/XSK state and perturb forwarding
+2. the isolated cluster is now deployed from the tracked repo config instead of
+   a stale `/tmp/ha-cluster-userspace.conf`
+3. the tracked config restores fast RA timing on `reth1`, which keeps the
+   LAN host's IPv6 default route fresh enough for repeatable testing
+
+Current repeatable validation is documented in
+[userspace-ha-validation.md](/home/ps/git/codex-bpfrx-userspace-wip/docs/userspace-ha-validation.md).
