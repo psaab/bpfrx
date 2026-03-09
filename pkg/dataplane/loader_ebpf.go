@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime"
 	"unsafe"
 
@@ -230,14 +231,19 @@ func (m *Manager) loadAllObjects() error {
 	if !ok {
 		return fmt.Errorf("Rust userspace_fallback_progs map not found")
 	}
-	if err := pinUserspaceMap(userspaceCtrl, UserspaceCtrlPinPath()); err != nil {
-		return fmt.Errorf("pin userspace_ctrl: %w", err)
-	}
-	if err := pinUserspaceMap(userspaceBindings, UserspaceBindingsPinPath()); err != nil {
-		return fmt.Errorf("pin userspace_bindings: %w", err)
-	}
-	if err := pinUserspaceMap(userspaceXSK, UserspaceXSKMapPinPath()); err != nil {
-		return fmt.Errorf("pin userspace_xsk_map: %w", err)
+	for _, pin := range []struct {
+		name string
+		m    *ebpf.Map
+		path string
+	}{
+		{name: "userspace_ctrl", m: userspaceCtrl, path: UserspaceCtrlPinPath()},
+		{name: "userspace_bindings", m: userspaceBindings, path: UserspaceBindingsPinPath()},
+		{name: "userspace_xsk_map", m: userspaceXSK, path: UserspaceXSKMapPinPath()},
+		{name: "userspace_fallback_progs", m: userspaceFallback, path: filepath.Join(bpfPinPath, "userspace_fallback_progs")},
+	} {
+		if err := ensureUserspaceMapPinned(pin.name, pin.m, pin.path); err != nil {
+			return err
+		}
 	}
 	m.programs["xdp_userspace_prog"] = userspaceProg
 	m.maps["userspace_ctrl"] = userspaceCtrl
@@ -407,13 +413,20 @@ func (m *Manager) loadAllObjects() error {
 	return nil
 }
 
-func pinUserspaceMap(m *ebpf.Map, path string) error {
+func ensureUserspaceMapPinned(name string, m *ebpf.Map, path string) error {
 	if m == nil {
 		return fmt.Errorf("nil map for %s", path)
 	}
-	_ = os.Remove(path)
-	if err := m.Pin(path); err != nil {
-		return err
+	if _, err := os.Stat(path); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("stat %s pin path %s: %w", name, path, err)
+		}
+		if err := m.Pin(path); err != nil {
+			return fmt.Errorf("pin %s at %s: %w", name, path, err)
+		}
+	}
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("%s pin missing at %s after load: %w", name, path, err)
 	}
 	return nil
 }
