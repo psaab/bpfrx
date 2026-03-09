@@ -22,13 +22,16 @@
 #include "../headers/bpfrx_trace.h"
 
 #define USERSPACE_META_MAGIC   0x42505553 /* "BPUS" */
-#define USERSPACE_META_VERSION 1
+#define USERSPACE_META_VERSION 2
 
 struct userspace_ctrl {
 	__u32 enabled;
 	__u32 metadata_version;
 	__u32 workers;
 	__u32 flags;
+	__u64 config_generation;
+	__u32 fib_generation;
+	__u32 reserved;
 };
 
 struct userspace_dp_meta {
@@ -51,6 +54,9 @@ struct userspace_dp_meta {
 	__u8  dscp;
 	__u8  dscp_rewrite;
 	__u16 reserved;
+	__u64 config_generation;
+	__u32 fib_generation;
+	__u32 reserved2;
 };
 
 struct userspace_binding_key {
@@ -173,6 +179,8 @@ try_userspace_redirect(struct xdp_md *ctx, struct pkt_meta *meta)
 	umeta->meta_flags = meta->meta_flags;
 	umeta->dscp = meta->dscp;
 	umeta->dscp_rewrite = meta->dscp_rewrite;
+	umeta->config_generation = ctrl->config_generation;
+	umeta->fib_generation = ctrl->fib_generation;
 
 	rc = bpf_redirect_map(&userspace_xsk_map, binding->slot, 0);
 	if (rc == XDP_REDIRECT)

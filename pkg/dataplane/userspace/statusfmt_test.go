@@ -14,6 +14,7 @@ func TestFormatStatusSummary(t *testing.T) {
 		Workers:                2,
 		RingEntries:            2048,
 		LastSnapshotGeneration: 7,
+		LastFIBGeneration:      3,
 		LastSnapshotAt:         now.Add(-2 * time.Second),
 		InterfaceAddresses:     6,
 		NeighborEntries:        9,
@@ -24,8 +25,8 @@ func TestFormatStatusSummary(t *testing.T) {
 			{QueueID: 1, Ready: false},
 		},
 		Bindings: []BindingStatus{
-			{Slot: 0, Ready: true, Bound: true, XSKRegistered: true, RXPackets: 10},
-			{Slot: 1, Ready: false, Bound: true, XSKRegistered: false, RXPackets: 5},
+			{Slot: 0, Ready: true, Bound: true, XSKRegistered: true, RXPackets: 10, ValidatedPackets: 8, ExceptionPackets: 1},
+			{Slot: 1, Ready: false, Bound: true, XSKRegistered: false, RXPackets: 5, ValidatedPackets: 4, ExceptionPackets: 2},
 		},
 	}
 
@@ -33,6 +34,7 @@ func TestFormatStatusSummary(t *testing.T) {
 	for _, want := range []string{
 		"Userspace dataplane helper:",
 		"PID:",
+		"Last FIB generation:       3",
 		"Interface addresses:       6",
 		"Neighbor entries:          9",
 		"Route entries:             4",
@@ -41,6 +43,8 @@ func TestFormatStatusSummary(t *testing.T) {
 		"Ready queues:              1/2",
 		"Ready bindings:            1/2",
 		"RX packets:                15",
+		"Validated packets:         12",
+		"Exception packets:         3",
 		"Worker 0 heartbeat age:",
 	} {
 		if !strings.Contains(out, want) {
@@ -55,8 +59,8 @@ func TestFormatBindings(t *testing.T) {
 			{QueueID: 0, WorkerID: 0, Interfaces: []string{"ge-0-0-1", "ge-0-0-2"}, Registered: true, Ready: false},
 		},
 		Bindings: []BindingStatus{
-			{Slot: 0, QueueID: 0, WorkerID: 0, Registered: true, Ready: false, Bound: true, XSKRegistered: true, Ifindex: 5, Interface: "ge-0-0-1", RXPackets: 99},
-			{Slot: 1, QueueID: 0, WorkerID: 0, Registered: true, Ready: false, Bound: true, XSKRegistered: false, Ifindex: 6, Interface: "ge-0-0-2", LastError: "xsk map update failed"},
+			{Slot: 0, QueueID: 0, WorkerID: 0, Registered: true, Ready: false, Bound: true, XSKRegistered: true, Ifindex: 5, Interface: "ge-0-0-1", RXPackets: 99, ExceptionPackets: 3},
+			{Slot: 1, QueueID: 0, WorkerID: 0, Registered: true, Ready: false, Bound: true, XSKRegistered: false, Ifindex: 6, Interface: "ge-0-0-2", ExceptionPackets: 1, LastError: "xsk map update failed"},
 		},
 	}
 

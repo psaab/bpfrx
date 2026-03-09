@@ -99,6 +99,8 @@ struct NeighborSnapshot {
 struct ConfigSnapshot {
     version: i32,
     generation: u64,
+    #[serde(rename = "fib_generation", default)]
+    fib_generation: u32,
     #[serde(rename = "generated_at")]
     generated_at: DateTime<Utc>,
     summary: SnapshotSummary,
@@ -158,6 +160,8 @@ struct ProcessStatus {
     enabled: bool,
     #[serde(rename = "last_snapshot_generation")]
     last_snapshot_generation: u64,
+    #[serde(rename = "last_fib_generation", default)]
+    last_fib_generation: u32,
     #[serde(rename = "last_snapshot_at", skip_serializing_if = "Option::is_none")]
     last_snapshot_at: Option<DateTime<Utc>>,
     #[serde(rename = "interface_addresses", default)]
@@ -251,6 +255,18 @@ struct BindingStatus {
     metadata_packets: u64,
     #[serde(rename = "metadata_errors", default)]
     metadata_errors: u64,
+    #[serde(rename = "validated_packets", default)]
+    validated_packets: u64,
+    #[serde(rename = "validated_bytes", default)]
+    validated_bytes: u64,
+    #[serde(rename = "exception_packets", default)]
+    exception_packets: u64,
+    #[serde(rename = "config_gen_mismatches", default)]
+    config_gen_mismatches: u64,
+    #[serde(rename = "fib_gen_mismatches", default)]
+    fib_gen_mismatches: u64,
+    #[serde(rename = "unsupported_packets", default)]
+    unsupported_packets: u64,
     #[serde(rename = "kernel_rx_dropped", default)]
     kernel_rx_dropped: u64,
     #[serde(rename = "kernel_rx_invalid_descs", default)]
@@ -312,6 +328,7 @@ fn run() -> Result<(), String> {
             io_uring_planned: true,
             enabled: false,
             last_snapshot_generation: 0,
+            last_fib_generation: 0,
             last_snapshot_at: None,
             interface_addresses: 0,
             neighbor_entries: 0,
@@ -470,6 +487,7 @@ fn handle_stream(
             "apply_snapshot" => {
                 if let Some(snapshot) = request.snapshot {
                     guard.status.last_snapshot_generation = snapshot.generation;
+                    guard.status.last_fib_generation = snapshot.fib_generation;
                     guard.status.last_snapshot_at = Some(snapshot.generated_at);
                     guard.snapshot = Some(snapshot);
                     let existing_bindings = guard.status.bindings.clone();

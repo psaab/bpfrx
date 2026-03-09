@@ -73,7 +73,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		return nil, err
 	}
 	ucfg := deriveUserspaceConfig(cfg)
-	snap := buildSnapshot(cfg, ucfg, m.bumpGeneration())
+	snap := buildSnapshot(cfg, ucfg, m.bumpGeneration(), m.readFIBGeneration())
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -127,27 +127,29 @@ func deriveUserspaceConfig(cfg *config.Config) config.UserspaceConfig {
 	return out
 }
 
-func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64) *ConfigSnapshot {
+func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32) *ConfigSnapshot {
 	if cfg == nil {
 		return &ConfigSnapshot{
-			Version:     ProtocolVersion,
-			Generation:  generation,
-			GeneratedAt: time.Now().UTC(),
-			MapPins:     userspaceMapPins(),
-			Userspace:   ucfg,
+			Version:       ProtocolVersion,
+			Generation:    generation,
+			FIBGeneration: 0,
+			GeneratedAt:   time.Now().UTC(),
+			MapPins:       userspaceMapPins(),
+			Userspace:     ucfg,
 		}
 	}
 	policyCount := len(cfg.Security.Policies)
 	return &ConfigSnapshot{
-		Version:     ProtocolVersion,
-		Generation:  generation,
-		GeneratedAt: time.Now().UTC(),
-		MapPins:     userspaceMapPins(),
-		Userspace:   ucfg,
-		Interfaces:  buildInterfaceSnapshots(cfg),
-		Neighbors:   buildNeighborSnapshots(cfg),
-		Routes:      buildRouteSnapshots(cfg),
-		Config:      cfg,
+		Version:       ProtocolVersion,
+		Generation:    generation,
+		FIBGeneration: fibGeneration,
+		GeneratedAt:   time.Now().UTC(),
+		MapPins:       userspaceMapPins(),
+		Userspace:     ucfg,
+		Interfaces:    buildInterfaceSnapshots(cfg),
+		Neighbors:     buildNeighborSnapshots(cfg),
+		Routes:        buildRouteSnapshots(cfg),
+		Config:        cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
 			DataplaneType:  cfg.System.DataplaneType,
@@ -166,6 +168,21 @@ func userspaceMapPins() UserspaceMapPins {
 		Bindings: dataplane.UserspaceBindingsPinPath(),
 		XSK:      dataplane.UserspaceXSKMapPinPath(),
 	}
+}
+
+func (m *Manager) readFIBGeneration() uint32 {
+	fibGenMap := m.inner.Map("fib_gen_map")
+	if fibGenMap == nil {
+		return 0
+	}
+	var (
+		key uint32
+		gen uint32
+	)
+	if err := fibGenMap.Lookup(key, &gen); err != nil {
+		return 0
+	}
+	return gen
 }
 
 func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
@@ -534,10 +551,13 @@ func (m *Manager) requestLocked(req ControlRequest, status *ProcessStatus) error
 }
 
 type userspaceCtrlValue struct {
-	Enabled         uint32
-	MetadataVersion uint32
-	Workers         uint32
-	Flags           uint32
+	Enabled          uint32
+	MetadataVersion  uint32
+	Workers          uint32
+	Flags            uint32
+	ConfigGeneration uint64
+	FIBGeneration    uint32
+	Reserved         uint32
 }
 
 func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
@@ -552,10 +572,13 @@ func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
 
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
-		Enabled:         0,
-		MetadataVersion: 1,
-		Workers:         uint32(cfg.Workers),
-		Flags:           0,
+		Enabled:          0,
+		MetadataVersion:  2,
+		Workers:          uint32(cfg.Workers),
+		Flags:            0,
+		ConfigGeneration: 0,
+		FIBGeneration:    0,
+		Reserved:         0,
 	}
 	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update userspace_ctrl: %w", err)
@@ -601,10 +624,13 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
-		Enabled:         0,
-		MetadataVersion: 1,
-		Workers:         uint32(maxInt(status.Workers, 1)),
-		Flags:           0,
+		Enabled:          0,
+		MetadataVersion:  2,
+		Workers:          uint32(maxInt(status.Workers, 1)),
+		Flags:            0,
+		ConfigGeneration: status.LastSnapshotGeneration,
+		FIBGeneration:    status.LastFIBGeneration,
+		Reserved:         0,
 	}
 	if status.Enabled {
 		ctrl.Enabled = 1

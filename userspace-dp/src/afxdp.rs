@@ -12,7 +12,7 @@ use xdpilone::xdp::XdpDesc;
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig, User};
 
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
-const USERSPACE_META_VERSION: u16 = 1;
+const USERSPACE_META_VERSION: u16 = 2;
 const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 64;
@@ -40,12 +40,16 @@ struct UserspaceDpMeta {
     dscp: u8,
     dscp_rewrite: u8,
     reserved: u16,
+    config_generation: u64,
+    fib_generation: u32,
+    reserved2: u32,
 }
 
 pub struct Coordinator {
     map_fd: Option<OwnedFd>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     bindings: BTreeMap<u32, BindingWorker>,
+    validation: ValidationState,
     last_stats_poll: Instant,
 }
 
@@ -55,6 +59,7 @@ impl Coordinator {
             map_fd: None,
             live: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            validation: ValidationState::default(),
             last_stats_poll: Instant::now(),
         }
     }
@@ -68,6 +73,7 @@ impl Coordinator {
         self.bindings.clear();
         self.live.clear();
         self.map_fd = None;
+        self.validation = ValidationState::default();
     }
 
     pub fn reconcile(
@@ -87,6 +93,12 @@ impl Coordinator {
             binding.rx_wakeups = 0;
             binding.metadata_packets = 0;
             binding.metadata_errors = 0;
+            binding.validated_packets = 0;
+            binding.validated_bytes = 0;
+            binding.exception_packets = 0;
+            binding.config_gen_mismatches = 0;
+            binding.fib_gen_mismatches = 0;
+            binding.unsupported_packets = 0;
             binding.kernel_rx_dropped = 0;
             binding.kernel_rx_invalid_descs = 0;
             binding.last_error.clear();
@@ -94,6 +106,11 @@ impl Coordinator {
         }
         let Some(snapshot) = snapshot else {
             return;
+        };
+        self.validation = ValidationState {
+            snapshot_installed: true,
+            config_generation: snapshot.generation,
+            fib_generation: snapshot.fib_generation,
         };
         if snapshot.map_pins.xsk.is_empty() {
             for binding in bindings.iter_mut() {
@@ -139,7 +156,7 @@ impl Coordinator {
     pub fn poll_once(&mut self) {
         let poll_stats = self.last_stats_poll.elapsed() >= STATS_POLL_INTERVAL;
         for binding in self.bindings.values_mut() {
-            poll_binding(binding, poll_stats);
+            poll_binding(binding, self.validation, poll_stats);
         }
         if poll_stats {
             self.last_stats_poll = Instant::now();
@@ -159,6 +176,12 @@ impl Coordinator {
                 binding.rx_wakeups = snap.rx_wakeups;
                 binding.metadata_packets = snap.metadata_packets;
                 binding.metadata_errors = snap.metadata_errors;
+                binding.validated_packets = snap.validated_packets;
+                binding.validated_bytes = snap.validated_bytes;
+                binding.exception_packets = snap.exception_packets;
+                binding.config_gen_mismatches = snap.config_gen_mismatches;
+                binding.fib_gen_mismatches = snap.fib_gen_mismatches;
+                binding.unsupported_packets = snap.unsupported_packets;
                 binding.kernel_rx_dropped = snap.kernel_rx_dropped;
                 binding.kernel_rx_invalid_descs = snap.kernel_rx_invalid_descs;
                 binding.last_error = snap.last_error;
@@ -174,6 +197,12 @@ impl Coordinator {
                 binding.rx_wakeups = 0;
                 binding.metadata_packets = 0;
                 binding.metadata_errors = 0;
+                binding.validated_packets = 0;
+                binding.validated_bytes = 0;
+                binding.exception_packets = 0;
+                binding.config_gen_mismatches = 0;
+                binding.fib_gen_mismatches = 0;
+                binding.unsupported_packets = 0;
                 binding.kernel_rx_dropped = 0;
                 binding.kernel_rx_invalid_descs = 0;
                 binding.last_error.clear();
@@ -181,6 +210,22 @@ impl Coordinator {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ValidationState {
+    snapshot_installed: bool,
+    config_generation: u64,
+    fib_generation: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PacketDisposition {
+    Valid,
+    NoSnapshot,
+    ConfigGenerationMismatch,
+    FibGenerationMismatch,
+    UnsupportedPacket,
 }
 
 struct BindingWorker {
@@ -254,7 +299,7 @@ impl BindingWorker {
     }
 }
 
-fn poll_binding(binding: &mut BindingWorker, poll_stats: bool) {
+fn poll_binding(binding: &mut BindingWorker, validation: ValidationState, poll_stats: bool) {
     if binding.device.needs_wakeup() {
         binding.device.wake();
         binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -274,11 +319,59 @@ fn poll_binding(binding: &mut BindingWorker, poll_stats: bool) {
     while let Some(desc) = received.read() {
         batch_packets += 1;
         batch_bytes += desc.len as u64;
-        if try_parse_metadata(&binding.area, desc).is_some() {
+        if let Some(meta) = try_parse_metadata(&binding.area, desc) {
             binding
                 .live
                 .metadata_packets
                 .fetch_add(1, Ordering::Relaxed);
+            match classify_metadata(meta, validation) {
+                PacketDisposition::Valid => {
+                    binding
+                        .live
+                        .validated_packets
+                        .fetch_add(1, Ordering::Relaxed);
+                    binding
+                        .live
+                        .validated_bytes
+                        .fetch_add(desc.len as u64, Ordering::Relaxed);
+                }
+                PacketDisposition::NoSnapshot => {
+                    binding
+                        .live
+                        .exception_packets
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                PacketDisposition::ConfigGenerationMismatch => {
+                    binding
+                        .live
+                        .exception_packets
+                        .fetch_add(1, Ordering::Relaxed);
+                    binding
+                        .live
+                        .config_gen_mismatches
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                PacketDisposition::FibGenerationMismatch => {
+                    binding
+                        .live
+                        .exception_packets
+                        .fetch_add(1, Ordering::Relaxed);
+                    binding
+                        .live
+                        .fib_gen_mismatches
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                PacketDisposition::UnsupportedPacket => {
+                    binding
+                        .live
+                        .exception_packets
+                        .fetch_add(1, Ordering::Relaxed);
+                    binding
+                        .live
+                        .unsupported_packets
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
         } else {
             binding.live.metadata_errors.fetch_add(1, Ordering::Relaxed);
         }
@@ -306,6 +399,22 @@ fn poll_binding(binding: &mut BindingWorker, poll_stats: bool) {
     binding.live.rx_batches.fetch_add(1, Ordering::Relaxed);
     if poll_stats {
         poll_kernel_stats(&binding.user, &binding.live);
+    }
+}
+
+fn classify_metadata(meta: UserspaceDpMeta, validation: ValidationState) -> PacketDisposition {
+    if !validation.snapshot_installed {
+        return PacketDisposition::NoSnapshot;
+    }
+    if meta.config_generation != validation.config_generation {
+        return PacketDisposition::ConfigGenerationMismatch;
+    }
+    if meta.fib_generation != validation.fib_generation {
+        return PacketDisposition::FibGenerationMismatch;
+    }
+    match meta.addr_family as i32 {
+        libc::AF_INET | libc::AF_INET6 => PacketDisposition::Valid,
+        _ => PacketDisposition::UnsupportedPacket,
     }
 }
 
@@ -472,6 +581,12 @@ struct BindingLiveState {
     rx_wakeups: AtomicU64,
     metadata_packets: AtomicU64,
     metadata_errors: AtomicU64,
+    validated_packets: AtomicU64,
+    validated_bytes: AtomicU64,
+    exception_packets: AtomicU64,
+    config_gen_mismatches: AtomicU64,
+    fib_gen_mismatches: AtomicU64,
+    unsupported_packets: AtomicU64,
     kernel_rx_dropped: AtomicU64,
     kernel_rx_invalid_descs: AtomicU64,
     last_error: Mutex<String>,
@@ -489,6 +604,12 @@ impl BindingLiveState {
             rx_wakeups: AtomicU64::new(0),
             metadata_packets: AtomicU64::new(0),
             metadata_errors: AtomicU64::new(0),
+            validated_packets: AtomicU64::new(0),
+            validated_bytes: AtomicU64::new(0),
+            exception_packets: AtomicU64::new(0),
+            config_gen_mismatches: AtomicU64::new(0),
+            fib_gen_mismatches: AtomicU64::new(0),
+            unsupported_packets: AtomicU64::new(0),
             kernel_rx_dropped: AtomicU64::new(0),
             kernel_rx_invalid_descs: AtomicU64::new(0),
             last_error: Mutex::new(String::new()),
@@ -527,6 +648,12 @@ impl BindingLiveState {
             rx_wakeups: self.rx_wakeups.load(Ordering::Relaxed),
             metadata_packets: self.metadata_packets.load(Ordering::Relaxed),
             metadata_errors: self.metadata_errors.load(Ordering::Relaxed),
+            validated_packets: self.validated_packets.load(Ordering::Relaxed),
+            validated_bytes: self.validated_bytes.load(Ordering::Relaxed),
+            exception_packets: self.exception_packets.load(Ordering::Relaxed),
+            config_gen_mismatches: self.config_gen_mismatches.load(Ordering::Relaxed),
+            fib_gen_mismatches: self.fib_gen_mismatches.load(Ordering::Relaxed),
+            unsupported_packets: self.unsupported_packets.load(Ordering::Relaxed),
             kernel_rx_dropped: self.kernel_rx_dropped.load(Ordering::Relaxed),
             kernel_rx_invalid_descs: self.kernel_rx_invalid_descs.load(Ordering::Relaxed),
             last_error: self
@@ -548,7 +675,77 @@ struct BindingLiveSnapshot {
     rx_wakeups: u64,
     metadata_packets: u64,
     metadata_errors: u64,
+    validated_packets: u64,
+    validated_bytes: u64,
+    exception_packets: u64,
+    config_gen_mismatches: u64,
+    fib_gen_mismatches: u64,
+    unsupported_packets: u64,
     kernel_rx_dropped: u64,
     kernel_rx_invalid_descs: u64,
     last_error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_meta() -> UserspaceDpMeta {
+        UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            addr_family: libc::AF_INET as u8,
+            config_generation: 11,
+            fib_generation: 7,
+            ..UserspaceDpMeta::default()
+        }
+    }
+
+    #[test]
+    fn metadata_classification_accepts_matching_generations() {
+        let validation = ValidationState {
+            snapshot_installed: true,
+            config_generation: 11,
+            fib_generation: 7,
+        };
+        assert_eq!(classify_metadata(valid_meta(), validation), PacketDisposition::Valid);
+    }
+
+    #[test]
+    fn metadata_classification_rejects_generation_mismatch() {
+        let validation = ValidationState {
+            snapshot_installed: true,
+            config_generation: 22,
+            fib_generation: 9,
+        };
+        assert_eq!(
+            classify_metadata(valid_meta(), validation),
+            PacketDisposition::ConfigGenerationMismatch
+        );
+        let validation = ValidationState {
+            snapshot_installed: true,
+            config_generation: 11,
+            fib_generation: 9,
+        };
+        assert_eq!(
+            classify_metadata(valid_meta(), validation),
+            PacketDisposition::FibGenerationMismatch
+        );
+    }
+
+    #[test]
+    fn metadata_classification_rejects_unknown_address_family() {
+        let validation = ValidationState {
+            snapshot_installed: true,
+            config_generation: 11,
+            fib_generation: 7,
+        };
+        let mut meta = valid_meta();
+        meta.addr_family = 0;
+        assert_eq!(
+            classify_metadata(meta, validation),
+            PacketDisposition::UnsupportedPacket
+        );
+    }
 }

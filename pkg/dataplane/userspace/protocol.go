@@ -25,16 +25,17 @@ type ControlResponse struct {
 }
 
 type ConfigSnapshot struct {
-	Version     int                    `json:"version"`
-	Generation  uint64                 `json:"generation"`
-	GeneratedAt time.Time              `json:"generated_at"`
-	Summary     SnapshotSummary        `json:"summary"`
-	MapPins     UserspaceMapPins       `json:"map_pins"`
-	Interfaces  []InterfaceSnapshot    `json:"interfaces,omitempty"`
-	Neighbors   []NeighborSnapshot     `json:"neighbors,omitempty"`
-	Routes      []RouteSnapshot        `json:"routes,omitempty"`
-	Config      *config.Config         `json:"config,omitempty"`
-	Userspace   config.UserspaceConfig `json:"userspace"`
+	Version       int                    `json:"version"`
+	Generation    uint64                 `json:"generation"`
+	FIBGeneration uint32                 `json:"fib_generation,omitempty"`
+	GeneratedAt   time.Time              `json:"generated_at"`
+	Summary       SnapshotSummary        `json:"summary"`
+	MapPins       UserspaceMapPins       `json:"map_pins"`
+	Interfaces    []InterfaceSnapshot    `json:"interfaces,omitempty"`
+	Neighbors     []NeighborSnapshot     `json:"neighbors,omitempty"`
+	Routes        []RouteSnapshot        `json:"routes,omitempty"`
+	Config        *config.Config         `json:"config,omitempty"`
+	Userspace     config.UserspaceConfig `json:"userspace"`
 }
 
 type SnapshotSummary struct {
@@ -104,6 +105,7 @@ type ProcessStatus struct {
 	IOUringPlanned         bool            `json:"io_uring_planned"`
 	Enabled                bool            `json:"enabled"`
 	LastSnapshotGeneration uint64          `json:"last_snapshot_generation"`
+	LastFIBGeneration      uint32          `json:"last_fib_generation,omitempty"`
 	LastSnapshotAt         time.Time       `json:"last_snapshot_at,omitempty"`
 	InterfaceAddresses     int             `json:"interface_addresses,omitempty"`
 	NeighborEntries        int             `json:"neighbor_entries,omitempty"`
@@ -151,6 +153,12 @@ type BindingStatus struct {
 	RXWakeups            uint64    `json:"rx_wakeups,omitempty"`
 	MetadataPackets      uint64    `json:"metadata_packets,omitempty"`
 	MetadataErrors       uint64    `json:"metadata_errors,omitempty"`
+	ValidatedPackets     uint64    `json:"validated_packets,omitempty"`
+	ValidatedBytes       uint64    `json:"validated_bytes,omitempty"`
+	ExceptionPackets     uint64    `json:"exception_packets,omitempty"`
+	ConfigGenMismatches  uint64    `json:"config_gen_mismatches,omitempty"`
+	FIBGenMismatches     uint64    `json:"fib_gen_mismatches,omitempty"`
+	UnsupportedPackets   uint64    `json:"unsupported_packets,omitempty"`
 	KernelRXDropped      uint64    `json:"kernel_rx_dropped,omitempty"`
 	KernelRXInvalidDescs uint64    `json:"kernel_rx_invalid_descs,omitempty"`
 	LastError            string    `json:"last_error,omitempty"`

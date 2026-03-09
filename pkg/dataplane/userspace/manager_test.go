@@ -47,9 +47,12 @@ func TestBuildSnapshotSummary(t *testing.T) {
 		},
 	}
 
-	snap := buildSnapshot(cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 11)
+	snap := buildSnapshot(cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 11, 5)
 	if snap.Generation != 11 {
 		t.Fatalf("Generation = %d, want 11", snap.Generation)
+	}
+	if snap.FIBGeneration != 5 {
+		t.Fatalf("FIBGeneration = %d, want 5", snap.FIBGeneration)
 	}
 	if snap.MapPins.Ctrl == "" || snap.MapPins.Bindings == "" || snap.MapPins.XSK == "" {
 		t.Fatalf("MapPins = %+v, want all paths populated", snap.MapPins)
