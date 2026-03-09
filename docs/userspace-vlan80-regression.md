@@ -14,7 +14,7 @@ Environment:
 
 ## Symptom
 
-From `loss:cluster-userspace-host`, traffic toward VLAN 80 destinations fails:
+From `loss:cluster-userspace-host`, IPv4 traffic toward VLAN 80 destinations fails:
 
 ```text
 ping -c 2 172.16.80.200
@@ -30,7 +30,7 @@ ping -c 3 -W 1 172.16.80.1
 ```
 
 So this is not a LAN policy or session-sync symptom. The firewall itself cannot
-resolve or reach VLAN 80 peers.
+resolve the IPv4 VLAN 80 peer.
 
 ## What Is Confirmed Working
 
@@ -45,7 +45,14 @@ level:
 172.16.80.0/24 dev ge-0-0-2.80 proto kernel scope link src 172.16.80.8
 ```
 
-The original non-userspace loss cluster still reaches VLAN 80:
+The isolated userspace cluster does have working WAN reachability after the VF
+move to `0000:65:01.4` / `0000:65:01.5`:
+
+- `cluster-userspace-host -> 1.1.1.1`: works
+- `cluster-userspace-host -> 2001:559:8585:80::200`: works
+- `cluster-userspace-host -> 2001:559:8585:80::200` via `iperf3 -P 1`: works
+
+The original non-userspace loss cluster still reaches VLAN 80 over both IPv4 and IPv6:
 
 ```text
 incus exec loss:bpfrx-fw0 -- ping -c 1 -W 1 172.16.80.1
@@ -73,10 +80,19 @@ tcpdump -ni ge-0-0-2 -e -vvv vlan 80 and (arp or icmp)
 
 No ARP replies were observed.
 
+For IPv6 on the same isolated interface, neighbor discovery does work:
+
+```text
+2001:559:8585:80::200 lladdr ba:86:e9:f6:4b:d5 REACHABLE
+ping -6 -c 2 2001:559:8585:80::200
+2 packets transmitted, 2 received
+```
+
 This is the key finding:
 
 - the isolated userspace firewall is emitting correctly tagged VLAN 80 ARP requests
-- no reply returns to the firewall on that interface
+- no IPv4 ARP reply returns to the firewall on that interface
+- IPv6 ND on that same interface does complete
 
 ## What This Rules Out
 
@@ -85,11 +101,12 @@ This does **not** look like:
 - a missing connected route
 - a LAN-to-WAN policy deny
 - a session-sync issue
-- a userspace helper forwarding-resolution bug
+- a general userspace helper forwarding-resolution bug
 - a DHCP/RA issue on `reth1`
+- a general WAN VF outage
 
 Those are higher-layer problems. The current failure is below that: VLAN 80 neighbor
-discovery is not completing on the isolated userspace firewall.
+discovery is not completing for IPv4 on the isolated userspace firewall.
 
 ## Important Context
 
@@ -109,40 +126,65 @@ Current VM device state confirms that:
 - `loss:bpfrx-fw0` uses WAN VF `0000:65:00.2`
 - `loss:bpfrx-userspace-fw0` uses WAN VF `0000:65:01.4`
 
-That difference matters because the original cluster still has working VLAN 80
-adjacency while the isolated userspace cluster does not.
+That original VF difference mattered earlier, and moving the isolated userspace
+cluster to `65:01.4/65:01.5` restored general WAN + IPv6 behavior. The remaining
+failure is narrower than the original regression report.
+
+There is also a live address asymmetry on VLAN 80:
+
+- original cluster primary IPv4 on VLAN 80: `172.16.80.7`
+- isolated userspace cluster IPv4 on VLAN 80: `172.16.80.8`
+
+Read-only comparison against the original cluster shows:
+
+```text
+bpfrx-fw0 (172.16.80.7) -> ARP reply received from 172.16.80.200
+bpfrx-userspace-fw0 (172.16.80.8) -> no ARP reply from 172.16.80.200
+```
+
+On the original cluster, tcpdump shows the full ARP exchange:
+
+```text
+Request who-has 172.16.80.200 tell 172.16.80.7
+Reply 172.16.80.200 is-at ba:86:e9:f6:4b:d5
+```
+
+On the isolated userspace cluster, tcpdump shows only the requests:
+
+```text
+Request who-has 172.16.80.200 tell 172.16.80.8
+```
 
 ## Current Best Reading
 
-Based on current evidence, the regression is below the firewall routing/policy layer:
+Based on current evidence, the remaining regression is below the firewall routing/policy layer:
 
 1. VLAN 80 is configured on the isolated userspace firewall.
-2. The firewall emits VLAN 80 ARP requests.
-3. No VLAN 80 ARP replies are seen back on that WAN VF.
-4. The original cluster still receives VLAN 80 replies on a different WAN VF pair.
+2. IPv6 ND on VLAN 80 works.
+3. The firewall emits VLAN 80 ARP requests for `172.16.80.200`.
+4. No ARP reply is seen for `172.16.80.8`.
+5. The original cluster does receive ARP replies for `172.16.80.7`.
 
 So the most likely fault domain is:
 
-- isolated userspace cluster WAN attachment
-- host-side VF wiring / switch exposure for the `65:01.4/65:01.5` pair
-- or some regression that changed which WAN VF pair the isolated cluster should use
+- an environment-side IPv4 ARP asymmetry specific to the isolated cluster’s `.8` address
+- host-side or network-side policy that differs between `.7` and `.8`
+- or an upstream device state that is independent of the userspace dataplane code
 
 ## Follow-Up Checks
 
-1. Compare the historical working userspace cluster WAN VF assignment against the
-   current `/tmp/bpfrx-loss-userspace.env`.
-2. Capture VLAN 80 traffic on the `loss` host side for VF `0000:65:01.4` while the
-   isolated firewall ARPs.
-3. If the isolated userspace cluster previously used the `65:00.x` pair, move it
-   back to the known-good WAN VF pair and retest.
-4. If the WAN VF pair is correct, inspect host-side switchdev/trust/VLAN settings for
-   `mlx0` `virtfn10` / `virtfn11`.
+1. Capture VLAN 80 traffic on the `loss` host side for VF `0000:65:01.4` while the
+   isolated firewall ARPs for `172.16.80.200`.
+2. Check whether any upstream host/network policy is keyed to `172.16.80.7` vs `.8`.
+3. Verify whether `172.16.80.200` itself still owns/responds on IPv4 to `.8`.
+4. Keep the userspace dataplane investigation separate from this lab-side ARP asymmetry.
 
 ## Status
 
 This is documented evidence, not a fix.
 
 At the moment:
-- original cluster VLAN 80: working
-- isolated userspace cluster VLAN 80: broken
-- current proof: ARP requests leave the isolated firewall, replies do not return
+- original cluster VLAN 80 IPv4/IPv6: working
+- isolated userspace cluster VLAN 80 IPv6: working
+- isolated userspace cluster VLAN 80 IPv4: broken
+- current proof: ARP requests leave the isolated firewall as `172.16.80.8`, replies do not return
