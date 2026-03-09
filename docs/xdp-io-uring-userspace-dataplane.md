@@ -21,6 +21,8 @@ The performant design is a **hybrid**:
 - **XDP stays on the NIC ingress path** for early parse, early drop, metadata stamping,
   HA ownership gating, and fast bypass decisions.
 - **AF_XDP (XSK)** is the real packet handoff into userspace.
+- **A separate native dataplane process** owns packet workers and packet slow path.
+- **`bpfrxd` stays the Go control plane**, not the packet engine.
 - **io_uring** is used around that fast path for the things it is actually good at:
   slow-path reinjection, control sockets, session-sync transport, logging/export,
   async netlink helpers, disk I/O, and wakeup orchestration.
@@ -90,6 +92,59 @@ Treat the system as:
 
 That gives you the best chance of staying close to native-XDP efficiency while moving
 stateful complexity into userspace.
+
+### Recommended process boundary
+
+Do not embed the packet slow path under `bpfrxd`.
+
+Recommended split:
+
+- `bpfrxd` remains the control-plane authority:
+  - config parse / compile
+  - HA / cluster state
+  - VRRP orchestration
+  - route / neighbor / policy snapshot publication
+  - API / CLI / service lifecycle
+- a separate native dataplane process owns all packet-carrying work:
+  - AF_XDP workers
+  - local session / NAT / policy execution
+  - packet slow path and exception handling
+  - TUN/TAP reinjection
+  - local route / adjacency cache consumption
+  - watchdog publication back to XDP / control plane
+
+Why:
+
+- packet-path failures should not take down the Go control plane
+- Go GC and scheduler behavior should not be in the packet hot path
+- cgo-heavy hot loops inside `bpfrxd` would make the runtime model harder to reason about
+- a separate native process is easier to pin, restart, rate-limit, and observe
+- packet slow path is still dataplane work; once packets cross into Go, the design has
+  already lost too much performance
+
+This means the "slow path" in this design is not "send packets into `bpfrxd`".
+It is "send exceptions into a native helper thread inside the dataplane process".
+
+### Recommended language
+
+Rust is the right plan-of-record language for the userspace dataplane process.
+
+Why Rust over Go for this part:
+
+- no GC pauses or Go scheduler interaction in the packet path
+- stronger control over memory layout, cachelines, and lock-free queue ownership
+- better fit for AF_XDP, io_uring, eventfd, mmap, and pinned shared-memory work
+- safer than writing the whole packet engine in C while still allowing small unsafe
+  islands where kernel interfaces require them
+- cleaner than trying to hide native hot loops behind cgo inside a Go daemon
+
+Recommended language split:
+
+- Go: `bpfrxd` control plane
+- Rust: userspace dataplane process and worker runtime
+
+Go is still fine for orchestration, snapshots, HA control, APIs, and service management.
+It is not the language I would choose for the steady-state AF_XDP worker loop.
 
 ### Support Envelope
 
@@ -343,6 +398,13 @@ Use io_uring for:
 
 This is where io_uring is a real win.
 
+Important:
+
+- this slow path should live in the native dataplane process
+- `bpfrxd` should receive metadata, counters, and summaries, not packet buffers
+- the only reason to let packets cross into `bpfrxd` is as a temporary bring-up hack,
+  not as the planned architecture
+
 ## Threading Model
 
 ### One worker per RX queue/core
@@ -425,6 +487,24 @@ This part needs hard rules:
 
 That avoids processing a packet classified under config generation `N` with policy or
 adjacency state from generation `N+1`.
+
+#### Control-plane to dataplane interface
+
+If the dataplane is a separate native process, the interface should be explicit:
+
+- a versioned Unix control socket for lifecycle and snapshot publication
+- shared-memory regions for immutable config / route / adjacency snapshots
+- shared-memory rings for counters, worker health, and packet-path exception summaries
+- optional delta rings for session-sync export toward the Go cluster layer
+
+Do not make the native dataplane call back into Go for per-packet or per-flow decisions.
+The boundary should look like:
+
+- Go publishes immutable state
+- native workers consume it
+- native workers publish summaries and deltas back out
+
+That is a better fit than cgo callbacks or embedding packet workers inside the Go process.
 
 ## What Should Stay in XDP vs Move to Userspace
 
@@ -629,14 +709,40 @@ Replace the full XDP tail-call chain on selected interfaces with:
 - metadata stamp
 - XSK redirect
 
-## Phase 3: Build a per-core userspace worker runtime
+## Phase 3: Build a separate native userspace dataplane process
 
-Likely process layout:
-- same process as `bpfrxd`, with pinned worker goroutines plus C/Rust hot loops, or
-- separate worker process with shared memory control plane
+Planned process layout:
 
-For performance, a separate native worker binary is cleaner than trying to run the
-hot loop in normal Go goroutines.
+- `bpfrxd` remains the Go control plane
+- a separate native dataplane process owns:
+  - AF_XDP workers
+  - packet slow path
+  - io_uring helper threads
+  - worker-local state and watchdogs
+
+This should not be implemented as normal Go goroutines inside `bpfrxd`.
+If an in-process mode ever exists, it should be treated as a bring-up/debug mode,
+not the target production architecture.
+
+### Why a separate process is the right plan
+
+- isolates packet crashes from config / HA control
+- avoids cgo-heavy hot loops under the Go scheduler
+- makes CPU pinning and memory ownership clearer
+- makes restart semantics simpler: control plane can survive while dataplane is restarted
+- preserves a hard boundary between packet data and control logic
+
+### Native process structure
+
+Recommended internal structure:
+
+- one pinned AF_XDP worker per queue shard
+- one native slow-path / exception thread group
+- one route / adjacency snapshot consumer
+- one control socket thread for commands from `bpfrxd`
+- one session-delta aggregator for HA/session sync export
+
+Rust is the best default implementation language for this process.
 
 ## Phase 4: Move session/NAT/policy into worker-local tables
 
@@ -718,7 +824,7 @@ Without that, bring-up and HA debugging will be mostly guesswork.
 
 If bpfrx wants to explore this space seriously, the right target is:
 
-**XDP front-end + AF_XDP userspace workers + io_uring for slow-path and async systems work**
+**XDP front-end + AF_XDP userspace workers + a separate Rust dataplane process + io_uring for slow-path and async systems work**
 
 Not:
 
@@ -727,13 +833,23 @@ Not:
 That second design is architecturally possible, but it is not the version I would
 expect to be "extremely performant".
 
+## Current Plan
+
+If this path is pursued, the working plan should be:
+
+1. separate native dataplane process, not an in-process Go backend
+2. Rust for the native dataplane runtime
+3. AF_XDP only on native-XDP-capable interfaces, mixed with current eBPF/TC elsewhere
+4. packet slow path remains inside the native dataplane process
+5. `bpfrxd` owns control, HA, and snapshot publication
+6. worker-local delta rings aggregate toward the HA/session-sync layer
+
 ## Open Questions
 
-1. Should this be a separate worker process, or an in-process backend under `bpfrxd`?
-2. Do we want AF_XDP only for native-XDP-capable NICs, with eBPF/TC retained elsewhere?
-3. Do we want a kernel slow path via TUN/TAP, or strict fail-closed on unresolved neighbors/local exceptions?
-4. Should session sync read worker-local delta rings directly, or aggregate through a single userspace dataplane manager?
-5. If this path is pursued, is it still worth carrying both this and the DPDK backend long-term?
+1. Do we want AF_XDP only for native-XDP-capable NICs, with eBPF/TC retained elsewhere?
+2. Do we want a kernel slow path via TUN/TAP, or strict fail-closed on unresolved neighbors/local exceptions?
+3. Should session sync read worker-local delta rings directly, or aggregate through a single native dataplane manager thread?
+4. If this path is pursued, is it still worth carrying both this and the DPDK backend long-term?
 
 ## Bottom Line
 
@@ -741,5 +857,7 @@ A performant design exists, but it is really:
 - **XDP + AF_XDP** for packet handoff
 - **multithreaded userspace workers** for stateful processing
 - **io_uring** for the surrounding async plumbing
+- **a separate native dataplane process**, not packet handling inside `bpfrxd`
+- **Rust for the worker runtime**, with Go retained for the control plane
 
 If the goal is maximum performance, I would design it that way from day one.
