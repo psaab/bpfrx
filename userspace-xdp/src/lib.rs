@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     bindings::{xdp_action, xdp_md},
-    helpers::r#gen::bpf_xdp_adjust_meta,
+    helpers::r#gen::{bpf_ktime_get_ns, bpf_xdp_adjust_meta},
     macros::{map, xdp},
     maps::{Array, HashMap, ProgramArray, XskMap},
     programs::XdpContext,
@@ -14,6 +14,7 @@ const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
 const USERSPACE_META_VERSION: u16 = 2;
 const USERSPACE_BINDING_READY: u32 = 1;
 const USERSPACE_FALLBACK_MAIN: u32 = 0;
+const USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS: u32 = 5000;
 const ETH_P_8021Q: u16 = 0x8100;
 const ETH_P_8021AD: u16 = 0x88a8;
 const ETH_P_IP: u16 = 0x0800;
@@ -39,7 +40,7 @@ struct UserspaceCtrl {
     flags: u32,
     config_generation: u64,
     fib_generation: u32,
-    reserved: u32,
+    heartbeat_timeout_ms: u32,
 }
 
 #[repr(C)]
@@ -148,6 +149,9 @@ static USERSPACE_CTRL: Array<UserspaceCtrl> = Array::with_max_entries(1, 0);
 static USERSPACE_BINDINGS: HashMap<UserspaceBindingKey, UserspaceBindingValue> =
     HashMap::with_max_entries(4096, 0);
 
+#[map(name = "userspace_heartbeat")]
+static USERSPACE_HEARTBEAT: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
+
 #[map(name = "userspace_xsk_map")]
 static USERSPACE_XSK_MAP: XskMap = XskMap::with_max_entries(4096, 0);
 
@@ -179,6 +183,20 @@ fn try_xdp_userspace(ctx: XdpContext) -> Result<u32, i64> {
         return fallback_to_main(&ctx);
     };
     if (binding.flags & USERSPACE_BINDING_READY) == 0 {
+        return fallback_to_main(&ctx);
+    }
+    let last_heartbeat = unsafe { USERSPACE_HEARTBEAT.get(&binding.slot) };
+    let Some(last_heartbeat) = last_heartbeat else {
+        return fallback_to_main(&ctx);
+    };
+    let timeout_ms = if ctrl.heartbeat_timeout_ms == 0 {
+        USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS
+    } else {
+        ctrl.heartbeat_timeout_ms
+    };
+    let timeout_ns = (timeout_ms as u64) * 1_000_000;
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    if now_ns < *last_heartbeat || now_ns.saturating_sub(*last_heartbeat) > timeout_ns {
         return fallback_to_main(&ctx);
     }
 

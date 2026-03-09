@@ -200,6 +200,7 @@ func (m *Manager) loadAllObjects() error {
 	for _, name := range []string{
 		"userspace_ctrl",
 		"userspace_bindings",
+		"userspace_heartbeat",
 		"userspace_xsk_map",
 		"userspace_fallback_progs",
 	} {
@@ -223,6 +224,10 @@ func (m *Manager) loadAllObjects() error {
 	if !ok {
 		return fmt.Errorf("Rust userspace_bindings map not found")
 	}
+	userspaceHeartbeat, ok := userspaceCollection.Maps["userspace_heartbeat"]
+	if !ok {
+		return fmt.Errorf("Rust userspace_heartbeat map not found")
+	}
 	userspaceXSK, ok := userspaceCollection.Maps["userspace_xsk_map"]
 	if !ok {
 		return fmt.Errorf("Rust userspace_xsk_map not found")
@@ -238,6 +243,7 @@ func (m *Manager) loadAllObjects() error {
 	}{
 		{name: "userspace_ctrl", m: userspaceCtrl, path: UserspaceCtrlPinPath()},
 		{name: "userspace_bindings", m: userspaceBindings, path: UserspaceBindingsPinPath()},
+		{name: "userspace_heartbeat", m: userspaceHeartbeat, path: UserspaceHeartbeatPinPath()},
 		{name: "userspace_xsk_map", m: userspaceXSK, path: UserspaceXSKMapPinPath()},
 		{name: "userspace_fallback_progs", m: userspaceFallback, path: filepath.Join(bpfPinPath, "userspace_fallback_progs")},
 	} {
@@ -248,6 +254,7 @@ func (m *Manager) loadAllObjects() error {
 	m.programs["xdp_userspace_prog"] = userspaceProg
 	m.maps["userspace_ctrl"] = userspaceCtrl
 	m.maps["userspace_bindings"] = userspaceBindings
+	m.maps["userspace_heartbeat"] = userspaceHeartbeat
 	m.maps["userspace_xsk_map"] = userspaceXSK
 	m.maps["userspace_fallback_progs"] = userspaceFallback
 

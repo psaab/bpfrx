@@ -90,9 +90,10 @@ type NeighborSnapshot struct {
 }
 
 type UserspaceMapPins struct {
-	Ctrl     string `json:"ctrl,omitempty"`
-	Bindings string `json:"bindings,omitempty"`
-	XSK      string `json:"xsk,omitempty"`
+	Ctrl      string `json:"ctrl,omitempty"`
+	Bindings  string `json:"bindings,omitempty"`
+	Heartbeat string `json:"heartbeat,omitempty"`
+	XSK       string `json:"xsk,omitempty"`
 }
 
 type ProcessStatus struct {
@@ -178,6 +179,7 @@ type BindingStatus struct {
 	UnsupportedPackets   uint64    `json:"unsupported_packets,omitempty"`
 	KernelRXDropped      uint64    `json:"kernel_rx_dropped,omitempty"`
 	KernelRXInvalidDescs uint64    `json:"kernel_rx_invalid_descs,omitempty"`
+	LastHeartbeat        time.Time `json:"last_heartbeat,omitempty"`
 	LastError            string    `json:"last_error,omitempty"`
 	LastChange           time.Time `json:"last_change,omitempty"`
 }

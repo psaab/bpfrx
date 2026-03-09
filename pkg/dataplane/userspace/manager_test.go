@@ -54,7 +54,7 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	if snap.FIBGeneration != 5 {
 		t.Fatalf("FIBGeneration = %d, want 5", snap.FIBGeneration)
 	}
-	if snap.MapPins.Ctrl == "" || snap.MapPins.Bindings == "" || snap.MapPins.XSK == "" {
+	if snap.MapPins.Ctrl == "" || snap.MapPins.Bindings == "" || snap.MapPins.Heartbeat == "" || snap.MapPins.XSK == "" {
 		t.Fatalf("MapPins = %+v, want all paths populated", snap.MapPins)
 	}
 	if snap.Summary.HostName != "fw-test" {

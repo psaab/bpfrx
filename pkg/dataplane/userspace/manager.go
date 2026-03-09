@@ -164,9 +164,10 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 
 func userspaceMapPins() UserspaceMapPins {
 	return UserspaceMapPins{
-		Ctrl:     dataplane.UserspaceCtrlPinPath(),
-		Bindings: dataplane.UserspaceBindingsPinPath(),
-		XSK:      dataplane.UserspaceXSKMapPinPath(),
+		Ctrl:      dataplane.UserspaceCtrlPinPath(),
+		Bindings:  dataplane.UserspaceBindingsPinPath(),
+		Heartbeat: dataplane.UserspaceHeartbeatPinPath(),
+		XSK:       dataplane.UserspaceXSKMapPinPath(),
 	}
 }
 
@@ -697,13 +698,13 @@ func (m *Manager) requestLocked(req ControlRequest, status *ProcessStatus) error
 }
 
 type userspaceCtrlValue struct {
-	Enabled          uint32
-	MetadataVersion  uint32
-	Workers          uint32
-	Flags            uint32
-	ConfigGeneration uint64
-	FIBGeneration    uint32
-	Reserved         uint32
+	Enabled            uint32
+	MetadataVersion    uint32
+	Workers            uint32
+	Flags              uint32
+	ConfigGeneration   uint64
+	FIBGeneration      uint32
+	HeartbeatTimeoutMS uint32
 }
 
 func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
@@ -714,6 +715,10 @@ func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
 	bindingsMap := m.inner.Map("userspace_bindings")
 	if bindingsMap == nil {
 		return errors.New("userspace_bindings map not loaded")
+	}
+	heartbeatMap := m.inner.Map("userspace_heartbeat")
+	if heartbeatMap == nil {
+		return errors.New("userspace_heartbeat map not loaded")
 	}
 	fallbackMap := m.inner.Map("userspace_fallback_progs")
 	if fallbackMap == nil {
@@ -726,13 +731,13 @@ func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
 
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
-		Enabled:          0,
-		MetadataVersion:  2,
-		Workers:          uint32(cfg.Workers),
-		Flags:            0,
-		ConfigGeneration: 0,
-		FIBGeneration:    0,
-		Reserved:         0,
+		Enabled:            0,
+		MetadataVersion:    2,
+		Workers:            uint32(cfg.Workers),
+		Flags:              0,
+		ConfigGeneration:   0,
+		FIBGeneration:      0,
+		HeartbeatTimeoutMS: 5000,
 	}
 	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update userspace_ctrl: %w", err)
@@ -752,6 +757,18 @@ func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
 	for _, key := range keys {
 		if err := bindingsMap.Delete(key); err != nil {
 			return fmt.Errorf("delete userspace_bindings %+v: %w", key, err)
+		}
+	}
+	var hbKey uint32
+	var hbVal uint64
+	hbIter := heartbeatMap.Iterate()
+	var hbKeys []uint32
+	for hbIter.Next(&hbKey, &hbVal) {
+		hbKeys = append(hbKeys, hbKey)
+	}
+	for _, key := range hbKeys {
+		if err := heartbeatMap.Delete(key); err != nil {
+			return fmt.Errorf("delete userspace_heartbeat %d: %w", key, err)
 		}
 	}
 	return nil
@@ -782,13 +799,13 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
-		Enabled:          0,
-		MetadataVersion:  2,
-		Workers:          uint32(maxInt(status.Workers, 1)),
-		Flags:            0,
-		ConfigGeneration: status.LastSnapshotGeneration,
-		FIBGeneration:    status.LastFIBGeneration,
-		Reserved:         0,
+		Enabled:            0,
+		MetadataVersion:    2,
+		Workers:            uint32(maxInt(status.Workers, 1)),
+		Flags:              0,
+		ConfigGeneration:   status.LastSnapshotGeneration,
+		FIBGeneration:      status.LastFIBGeneration,
+		HeartbeatTimeoutMS: 5000,
 	}
 	if status.Enabled {
 		ctrl.Enabled = 1

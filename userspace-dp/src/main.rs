@@ -125,6 +125,8 @@ struct MapPins {
     #[serde(default)]
     bindings: String,
     #[serde(default)]
+    heartbeat: String,
+    #[serde(default)]
     xsk: String,
 }
 
@@ -316,6 +318,8 @@ struct BindingStatus {
     kernel_rx_dropped: u64,
     #[serde(rename = "kernel_rx_invalid_descs", default)]
     kernel_rx_invalid_descs: u64,
+    #[serde(rename = "last_heartbeat", skip_serializing_if = "Option::is_none")]
+    last_heartbeat: Option<DateTime<Utc>>,
     #[serde(rename = "last_error", default)]
     last_error: String,
     #[serde(rename = "last_change", skip_serializing_if = "Option::is_none")]

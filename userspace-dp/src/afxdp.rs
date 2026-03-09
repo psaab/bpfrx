@@ -24,6 +24,8 @@ const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 64;
 const STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const HEARTBEAT_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
+const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
 
 #[repr(C)]
@@ -55,6 +57,7 @@ struct UserspaceDpMeta {
 
 pub struct Coordinator {
     map_fd: Option<OwnedFd>,
+    heartbeat_map_fd: Option<OwnedFd>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
@@ -72,6 +75,7 @@ impl Coordinator {
     pub fn new() -> Self {
         Self {
             map_fd: None,
+            heartbeat_map_fd: None,
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
@@ -100,10 +104,16 @@ impl Coordinator {
                 let _ = delete_xsk_slot(map_fd.fd, slot);
             }
         }
+        if let Some(map_fd) = self.heartbeat_map_fd.as_ref() {
+            for slot in self.live.keys().copied().collect::<Vec<_>>() {
+                let _ = delete_heartbeat_slot(map_fd.fd, slot);
+            }
+        }
         self.workers.clear();
         self.identities.clear();
         self.live.clear();
         self.map_fd = None;
+        self.heartbeat_map_fd = None;
         self.forwarding = ForwardingState::default();
         if let Ok(mut recent) = self.recent_exceptions.lock() {
             recent.clear();
@@ -173,6 +183,15 @@ impl Coordinator {
             }
             return;
         }
+        if snapshot.map_pins.heartbeat.is_empty() {
+            self.last_reconcile_stage = "missing_heartbeat_pin".to_string();
+            for binding in bindings.iter_mut() {
+                if binding.registered {
+                    binding.last_error = "missing heartbeat map pin path".to_string();
+                }
+            }
+            return;
+        }
         let map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.xsk) {
             Ok(fd) => fd,
             Err(err) => {
@@ -180,6 +199,18 @@ impl Coordinator {
                 for binding in bindings.iter_mut() {
                     if binding.registered {
                         binding.last_error = format!("open XSK map: {err}");
+                    }
+                }
+                return;
+            }
+        };
+        let heartbeat_map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.heartbeat) {
+            Ok(fd) => fd,
+            Err(err) => {
+                self.last_reconcile_stage = format!("open_heartbeat_map_failed:{err}");
+                for binding in bindings.iter_mut() {
+                    if binding.registered {
+                        binding.last_error = format!("open heartbeat map: {err}");
                     }
                 }
                 return;
@@ -209,6 +240,7 @@ impl Coordinator {
                     status: binding.clone(),
                     live,
                     xsk_map_fd: map_fd.fd,
+                    heartbeat_map_fd: heartbeat_map_fd.fd,
                     ring_entries,
                 });
         }
@@ -228,6 +260,7 @@ impl Coordinator {
             self.live.len()
         );
         self.map_fd = Some(map_fd);
+        self.heartbeat_map_fd = Some(heartbeat_map_fd);
         for (worker_id, binding_plans) in workers {
             let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
@@ -438,9 +471,13 @@ impl Coordinator {
                 binding.unsupported_packets = snap.unsupported_packets;
                 binding.kernel_rx_dropped = snap.kernel_rx_dropped;
                 binding.kernel_rx_invalid_descs = snap.kernel_rx_invalid_descs;
+                binding.last_heartbeat = snap.last_heartbeat;
                 binding.last_error = snap.last_error;
-                binding.ready =
-                    binding.ready && binding.registered && binding.bound && binding.xsk_registered;
+                binding.ready = binding.ready
+                    && binding.registered
+                    && binding.bound
+                    && binding.xsk_registered
+                    && heartbeat_fresh(snap.last_heartbeat);
             } else {
                 binding.bound = false;
                 binding.xsk_registered = false;
@@ -465,6 +502,7 @@ impl Coordinator {
                 binding.unsupported_packets = 0;
                 binding.kernel_rx_dropped = 0;
                 binding.kernel_rx_invalid_descs = 0;
+                binding.last_heartbeat = None;
                 binding.last_error.clear();
                 binding.ready = false;
             }
@@ -482,6 +520,7 @@ struct BindingPlan {
     status: BindingStatus,
     live: Arc<BindingLiveState>,
     xsk_map_fd: c_int,
+    heartbeat_map_fd: c_int,
     ring_entries: u32,
 }
 
@@ -600,6 +639,8 @@ struct BindingWorker {
     user: User,
     device: xdpilone::DeviceQueue,
     rx: xdpilone::RingRx,
+    heartbeat_map_fd: c_int,
+    last_heartbeat_update: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -616,6 +657,7 @@ impl BindingWorker {
         binding: &BindingStatus,
         ring_entries: u32,
         xsk_map_fd: c_int,
+        heartbeat_map_fd: c_int,
         live: Arc<BindingLiveState>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let area = MmapArea::new((ring_entries as usize) * (UMEM_FRAME_SIZE as usize))?;
@@ -655,6 +697,9 @@ impl BindingWorker {
             live.set_xsk_registered(true);
             live.clear_error();
         }
+        if let Err(err) = touch_heartbeat(heartbeat_map_fd, binding.slot, &live) {
+            live.set_error(format!("update heartbeat slot: {err}"));
+        }
         Ok(Self {
             slot: binding.slot,
             queue_id: binding.queue_id,
@@ -667,6 +712,8 @@ impl BindingWorker {
             user,
             device,
             rx,
+            heartbeat_map_fd,
+            last_heartbeat_update: Instant::now(),
         })
     }
 
@@ -690,6 +737,7 @@ fn poll_binding(
     poll_stats: bool,
 ) -> bool {
     let ident = binding.identity();
+    maybe_touch_heartbeat(binding);
     if binding.device.needs_wakeup() {
         binding.device.wake();
         binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -934,6 +982,7 @@ fn worker_loop(
             &plan.status,
             plan.ring_entries,
             plan.xsk_map_fd,
+            plan.heartbeat_map_fd,
             plan.live.clone(),
         ) {
             Ok(binding) => bindings.push(binding),
@@ -979,6 +1028,27 @@ fn push_recent_exception(
 
 fn now_nanos() -> i64 {
     Utc::now().timestamp_nanos_opt().unwrap_or(0)
+}
+
+fn monotonic_nanos() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
+fn timestamp_from_nanos(nanos: i64) -> Option<chrono::DateTime<Utc>> {
+    if nanos <= 0 {
+        return None;
+    }
+    Some(chrono::DateTime::<Utc>::from_timestamp_nanos(nanos))
 }
 
 fn pin_current_thread(worker_id: u32) {
@@ -1639,6 +1709,21 @@ fn register_xsk_slot(map_fd: c_int, slot: u32, sock_fd: c_int) -> io::Result<()>
     Ok(())
 }
 
+fn update_heartbeat_slot(map_fd: c_int, slot: u32, timestamp_ns: u64) -> io::Result<()> {
+    let rc = unsafe {
+        libbpf_sys::bpf_map_update_elem(
+            map_fd,
+            (&slot as *const u32).cast::<c_void>(),
+            (&timestamp_ns as *const u64).cast::<c_void>(),
+            libbpf_sys::BPF_ANY as u64,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn delete_xsk_slot(map_fd: c_int, slot: u32) -> io::Result<()> {
     let rc =
         unsafe { libbpf_sys::bpf_map_delete_elem(map_fd, (&slot as *const u32).cast::<c_void>()) };
@@ -1646,6 +1731,45 @@ fn delete_xsk_slot(map_fd: c_int, slot: u32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn delete_heartbeat_slot(map_fd: c_int, slot: u32) -> io::Result<()> {
+    let rc =
+        unsafe { libbpf_sys::bpf_map_delete_elem(map_fd, (&slot as *const u32).cast::<c_void>()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn maybe_touch_heartbeat(binding: &mut BindingWorker) {
+    if binding.last_heartbeat_update.elapsed() < HEARTBEAT_UPDATE_INTERVAL {
+        return;
+    }
+    match touch_heartbeat(binding.heartbeat_map_fd, binding.slot, &binding.live) {
+        Ok(()) => binding.last_heartbeat_update = Instant::now(),
+        Err(err) => binding
+            .live
+            .set_error(format!("update heartbeat slot: {err}")),
+    }
+}
+
+fn touch_heartbeat(map_fd: c_int, slot: u32, live: &BindingLiveState) -> io::Result<()> {
+    let monotonic = monotonic_nanos();
+    update_heartbeat_slot(map_fd, slot, monotonic)?;
+    live.set_last_heartbeat();
+    Ok(())
+}
+
+fn heartbeat_fresh(last_heartbeat: Option<chrono::DateTime<Utc>>) -> bool {
+    match last_heartbeat {
+        Some(last) => Utc::now()
+            .signed_duration_since(last)
+            .to_std()
+            .map(|age| age <= HEARTBEAT_STALE_AFTER)
+            .unwrap_or(true),
+        None => false,
+    }
 }
 
 struct OwnedFd {
@@ -1740,6 +1864,7 @@ struct BindingLiveState {
     unsupported_packets: AtomicU64,
     kernel_rx_dropped: AtomicU64,
     kernel_rx_invalid_descs: AtomicU64,
+    last_heartbeat: AtomicI64,
     last_error: Mutex<String>,
 }
 
@@ -1769,6 +1894,7 @@ impl BindingLiveState {
             unsupported_packets: AtomicU64::new(0),
             kernel_rx_dropped: AtomicU64::new(0),
             kernel_rx_invalid_descs: AtomicU64::new(0),
+            last_heartbeat: AtomicI64::new(0),
             last_error: Mutex::new(String::new()),
         }
     }
@@ -1780,6 +1906,10 @@ impl BindingLiveState {
 
     fn set_xsk_registered(&self, value: bool) {
         self.xsk_registered.store(value, Ordering::Relaxed);
+    }
+
+    fn set_last_heartbeat(&self) {
+        self.last_heartbeat.store(now_nanos(), Ordering::Relaxed);
     }
 
     fn clear_error(&self) {
@@ -1819,6 +1949,7 @@ impl BindingLiveState {
             unsupported_packets: self.unsupported_packets.load(Ordering::Relaxed),
             kernel_rx_dropped: self.kernel_rx_dropped.load(Ordering::Relaxed),
             kernel_rx_invalid_descs: self.kernel_rx_invalid_descs.load(Ordering::Relaxed),
+            last_heartbeat: timestamp_from_nanos(self.last_heartbeat.load(Ordering::Relaxed)),
             last_error: self
                 .last_error
                 .lock()
@@ -1852,6 +1983,7 @@ struct BindingLiveSnapshot {
     unsupported_packets: u64,
     kernel_rx_dropped: u64,
     kernel_rx_invalid_descs: u64,
+    last_heartbeat: Option<chrono::DateTime<Utc>>,
     last_error: String,
 }
 
