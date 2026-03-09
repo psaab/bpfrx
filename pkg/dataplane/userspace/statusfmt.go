@@ -1,0 +1,86 @@
+package userspace
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+func FormatStatusSummary(status ProcessStatus) string {
+	var b strings.Builder
+	now := time.Now()
+	readyQueues := 0
+	for _, q := range status.Queues {
+		if q.Ready {
+			readyQueues++
+		}
+	}
+	readyBindings := 0
+	for _, binding := range status.Bindings {
+		if binding.Ready {
+			readyBindings++
+		}
+	}
+
+	fmt.Fprintln(&b, "Userspace dataplane helper:")
+	fmt.Fprintf(&b, "  PID:                       %d\n", status.PID)
+	fmt.Fprintf(&b, "  Helper mode:               %s\n", status.HelperMode)
+	fmt.Fprintf(&b, "  Enabled:                   %t\n", status.Enabled)
+	fmt.Fprintf(&b, "  Workers:                   %d\n", status.Workers)
+	fmt.Fprintf(&b, "  Ring entries:              %d\n", status.RingEntries)
+	fmt.Fprintf(&b, "  Last snapshot generation:  %d\n", status.LastSnapshotGeneration)
+	if !status.LastSnapshotAt.IsZero() {
+		fmt.Fprintf(&b, "  Last snapshot age:         %s\n", formatStatusAge(now.Sub(status.LastSnapshotAt)))
+	}
+	fmt.Fprintf(&b, "  Ready queues:              %d/%d\n", readyQueues, len(status.Queues))
+	fmt.Fprintf(&b, "  Ready bindings:            %d/%d\n", readyBindings, len(status.Bindings))
+	for i, hb := range status.WorkerHeartbeats {
+		if hb.IsZero() {
+			fmt.Fprintf(&b, "  Worker %d heartbeat age:    unknown\n", i)
+			continue
+		}
+		fmt.Fprintf(&b, "  Worker %d heartbeat age:    %s\n", i, formatStatusAge(now.Sub(hb)))
+	}
+	return b.String()
+}
+
+func FormatBindings(status ProcessStatus) string {
+	var b strings.Builder
+
+	fmt.Fprintln(&b, "Userspace queues:")
+	if len(status.Queues) == 0 {
+		fmt.Fprintln(&b, "  none")
+	} else {
+		fmt.Fprintf(&b, "  %-7s %-8s %-10s %-7s %s\n", "Queue", "Worker", "Registered", "Ready", "Interfaces")
+		for _, q := range status.Queues {
+			fmt.Fprintf(&b, "  %-7d %-8d %-10t %-7t %s\n",
+				q.QueueID, q.WorkerID, q.Registered, q.Ready, strings.Join(q.Interfaces, ","))
+		}
+	}
+	fmt.Fprintln(&b)
+
+	fmt.Fprintln(&b, "Userspace bindings:")
+	if len(status.Bindings) == 0 {
+		fmt.Fprintln(&b, "  none")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "  %-6s %-7s %-8s %-10s %-7s %-8s %s\n", "Slot", "Queue", "Worker", "Registered", "Ready", "Ifindex", "Interface")
+	for _, binding := range status.Bindings {
+		fmt.Fprintf(&b, "  %-6d %-7d %-8d %-10t %-7t %-8d %s\n",
+			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Ready, binding.Ifindex, binding.Interface)
+	}
+	return b.String()
+}
+
+func formatStatusAge(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	return d.Round(time.Second).String()
+}

@@ -36,6 +36,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/conntrack"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/dhcpserver"
 	"github.com/psaab/bpfrx/pkg/feeds"
@@ -97,6 +98,16 @@ type Server struct {
 	version          string
 	fabricPeerAddrFn func() []string
 	fabricVRFDevice  string
+}
+
+func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
+	provider, ok := s.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return dpuserspace.ProcessStatus{}, fmt.Errorf("userspace status unavailable")
+	}
+	return provider.Status()
 }
 
 // NewServer creates a new gRPC server.
@@ -6462,6 +6473,10 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			break
 		}
 		buf.WriteString(s.cluster.FormatDataPlaneStatistics())
+		if status, err := s.userspaceDataplaneStatus(); err == nil {
+			buf.WriteString("\n")
+			buf.WriteString(dpuserspace.FormatStatusSummary(status))
+		}
 
 	case "chassis-cluster-data-plane-interfaces":
 		if s.cluster == nil {
@@ -6469,6 +6484,10 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			break
 		}
 		buf.WriteString(s.cluster.FormatDataPlaneInterfaces())
+		if status, err := s.userspaceDataplaneStatus(); err == nil {
+			buf.WriteString("\n")
+			buf.WriteString(dpuserspace.FormatBindings(status))
+		}
 
 	case "chassis-cluster-ip-monitoring-status":
 		if s.cluster == nil {

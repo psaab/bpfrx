@@ -32,6 +32,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/dhcprelay"
 	"github.com/psaab/bpfrx/pkg/dhcpserver"
@@ -11462,6 +11463,10 @@ func (c *CLI) showChassisClusterDataPlaneStats() error {
 		return nil
 	}
 	fmt.Print(c.cluster.FormatDataPlaneStatistics())
+	if status, err := c.userspaceDataplaneStatus(); err == nil {
+		fmt.Println()
+		fmt.Print(dpuserspace.FormatStatusSummary(status))
+	}
 	return nil
 }
 
@@ -11471,7 +11476,21 @@ func (c *CLI) showChassisClusterDataPlaneInterfaces() error {
 		return nil
 	}
 	fmt.Print(c.cluster.FormatDataPlaneInterfaces())
+	if status, err := c.userspaceDataplaneStatus(); err == nil {
+		fmt.Println()
+		fmt.Print(dpuserspace.FormatBindings(status))
+	}
 	return nil
+}
+
+func (c *CLI) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
+	provider, ok := c.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return dpuserspace.ProcessStatus{}, fmt.Errorf("userspace status unavailable")
+	}
+	return provider.Status()
 }
 
 func (c *CLI) showChassisClusterIPMonitoringStatus() error {

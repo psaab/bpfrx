@@ -38,6 +38,7 @@ type Manager struct {
 	cfg        config.UserspaceConfig
 	generation uint64
 	syncCancel context.CancelFunc
+	lastStatus ProcessStatus
 }
 
 func New() *Manager {
@@ -484,7 +485,54 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			return fmt.Errorf("update userspace_bindings %+v: %w", key, err)
 		}
 	}
+	m.lastStatus = *status
 	return nil
+}
+
+func (m *Manager) Status() (ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		if m.lastStatus.PID != 0 {
+			return m.lastStatus, nil
+		}
+		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err != nil {
+		if m.lastStatus.PID != 0 {
+			return m.lastStatus, err
+		}
+		return ProcessStatus{}, err
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return status, err
+	}
+	return status, nil
+}
+
+func (m *Manager) SetBindingState(slot uint32, registered, ready bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return errors.New("userspace dataplane helper not running")
+	}
+	var status ProcessStatus
+	req := ControlRequest{
+		Type: "set_binding_state",
+		Binding: &BindingControlRequest{
+			Slot:       slot,
+			Registered: registered,
+			Ready:      ready,
+		},
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		return err
+	}
+	return m.applyHelperStatusLocked(&status)
 }
 
 const userspaceBindingReady = 1

@@ -12,9 +12,10 @@ const (
 )
 
 type ControlRequest struct {
-	Type     string               `json:"type"`
-	Snapshot *ConfigSnapshot      `json:"snapshot,omitempty"`
-	Queue    *QueueControlRequest `json:"queue,omitempty"`
+	Type     string                 `json:"type"`
+	Snapshot *ConfigSnapshot        `json:"snapshot,omitempty"`
+	Queue    *QueueControlRequest   `json:"queue,omitempty"`
+	Binding  *BindingControlRequest `json:"binding,omitempty"`
 }
 
 type ControlResponse struct {
@@ -90,6 +91,12 @@ type ProcessStatus struct {
 
 type QueueControlRequest struct {
 	QueueID    uint32 `json:"queue_id"`
+	Registered bool   `json:"registered"`
+	Ready      bool   `json:"ready"`
+}
+
+type BindingControlRequest struct {
+	Slot       uint32 `json:"slot"`
 	Registered bool   `json:"registered"`
 	Ready      bool   `json:"ready"`
 }

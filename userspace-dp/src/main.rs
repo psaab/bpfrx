@@ -98,6 +98,8 @@ struct ControlRequest {
     snapshot: Option<ConfigSnapshot>,
     #[serde(default)]
     queue: Option<QueueControlRequest>,
+    #[serde(default)]
+    binding: Option<BindingControlRequest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -143,6 +145,15 @@ struct ControlResponse {
 struct QueueControlRequest {
     #[serde(rename = "queue_id")]
     queue_id: u32,
+    #[serde(default)]
+    registered: bool,
+    #[serde(default)]
+    ready: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct BindingControlRequest {
+    slot: u32,
     #[serde(default)]
     registered: bool,
     #[serde(default)]
@@ -424,6 +435,28 @@ fn handle_stream(
                 } else {
                     response.ok = false;
                     response.error = "missing queue state".to_string();
+                }
+            }
+            "set_binding_state" => {
+                if let Some(binding_req) = request.binding {
+                    if let Some(binding) = guard
+                        .status
+                        .bindings
+                        .iter_mut()
+                        .find(|b| b.slot == binding_req.slot)
+                    {
+                        binding.registered = binding_req.registered;
+                        binding.ready = binding_req.ready && binding_req.registered;
+                        binding.last_change = Some(Utc::now());
+                        refresh_status(&mut guard);
+                        persist_state = true;
+                    } else {
+                        response.ok = false;
+                        response.error = format!("unknown binding slot {}", binding_req.slot);
+                    }
+                } else {
+                    response.ok = false;
+                    response.error = "missing binding state".to_string();
                 }
             }
             "shutdown" => {
