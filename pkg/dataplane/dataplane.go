@@ -35,6 +35,14 @@ func UserspaceXSKMapPinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_xsk_map")
 }
 
+func UserspaceLocalV4PinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_local_v4")
+}
+
+func UserspaceLocalV6PinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_local_v6")
+}
+
 // backendRegistry holds constructors for non-eBPF dataplane backends.
 // Sub-packages register themselves via RegisterBackend in their init().
 var backendRegistry = map[string]func() DataPlane{}

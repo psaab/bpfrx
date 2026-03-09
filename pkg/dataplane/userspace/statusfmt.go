@@ -61,6 +61,10 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  Helper mode:               %s\n", status.HelperMode)
 	fmt.Fprintf(&b, "  Enabled:                   %t\n", status.Enabled)
 	fmt.Fprintf(&b, "  Forwarding armed:          %t\n", status.ForwardingArmed)
+	fmt.Fprintf(&b, "  Forwarding supported:      %t\n", status.Capabilities.ForwardingSupported)
+	if len(status.Capabilities.UnsupportedReasons) > 0 {
+		fmt.Fprintf(&b, "  Forwarding blocked by:     %s\n", strings.Join(status.Capabilities.UnsupportedReasons, "; "))
+	}
 	fmt.Fprintf(&b, "  Workers:                   %d\n", status.Workers)
 	fmt.Fprintf(&b, "  Ring entries:              %d\n", status.RingEntries)
 	fmt.Fprintf(&b, "  Last snapshot generation:  %d\n", status.LastSnapshotGeneration)

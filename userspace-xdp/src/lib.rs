@@ -84,6 +84,12 @@ struct UserspaceBindingValue {
     flags: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserspaceLocalV6Key {
+    addr: [u8; 16],
+}
+
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct EthHdr {
@@ -155,6 +161,12 @@ static USERSPACE_HEARTBEAT: HashMap<u32, u64> = HashMap::with_max_entries(4096, 
 #[map(name = "userspace_xsk_map")]
 static USERSPACE_XSK_MAP: XskMap = XskMap::with_max_entries(4096, 0);
 
+#[map(name = "userspace_local_v4")]
+static USERSPACE_LOCAL_V4: HashMap<u32, u8> = HashMap::with_max_entries(8192, 0);
+
+#[map(name = "userspace_local_v6")]
+static USERSPACE_LOCAL_V6: HashMap<UserspaceLocalV6Key, u8> = HashMap::with_max_entries(8192, 0);
+
 #[map(name = "userspace_fallback_progs")]
 static USERSPACE_FALLBACK_PROGS: ProgramArray = ProgramArray::with_max_entries(1, 0);
 
@@ -206,6 +218,9 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let Some(parsed) = parse_packet(data, data_end) else {
         return fallback_to_main(ctx);
     };
+    if should_fallback_local(&parsed) {
+        return fallback_to_main(ctx);
+    }
 
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
@@ -272,6 +287,8 @@ struct ParsedPacket {
     protocol: u8,
     tcp_flags: u8,
     dscp: u8,
+    dst_v4: u32,
+    dst_v6: [u8; 16],
 }
 
 fn parse_packet(data: usize, data_end: usize) -> Option<ParsedPacket> {
@@ -309,6 +326,7 @@ fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
     let tos = unsafe { (*iph).tos };
     let l4_offset = l3_offset.checked_add(ihl as u16)?;
     let (payload_offset, tcp_flags) = parse_l4(data, data_end, l4_offset, protocol)?;
+    let dst_bytes = read_bytes(data, data_end, l3_offset as usize + 16, 4)?;
     Some(ParsedPacket {
         vlan_id,
         l3_offset,
@@ -318,6 +336,8 @@ fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
         protocol,
         tcp_flags,
         dscp: tos >> 2,
+        dst_v4: u32::from_be_bytes([dst_bytes[0], dst_bytes[1], dst_bytes[2], dst_bytes[3]]),
+        dst_v6: [0; 16],
     })
 }
 
@@ -367,6 +387,8 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
     let flow_lbl0 = unsafe { (*ip6).flow_lbl[0] };
     let dscp = ((version_priority & 0x0f) << 2) | (flow_lbl0 >> 6);
     let (payload_offset, tcp_flags) = parse_l4(data, data_end, offset, protocol)?;
+    let mut dst_v6 = [0u8; 16];
+    dst_v6.copy_from_slice(read_bytes(data, data_end, l3_offset as usize + 24, 16)?);
     Some(ParsedPacket {
         vlan_id,
         l3_offset,
@@ -376,7 +398,43 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
         protocol,
         tcp_flags,
         dscp,
+        dst_v4: 0,
+        dst_v6,
     })
+}
+
+fn should_fallback_local(pkt: &ParsedPacket) -> bool {
+    match pkt.addr_family {
+        AF_INET => {
+            if pkt.dst_v4 == 0xffff_ffff
+                || is_ipv4_multicast(pkt.dst_v4)
+                || is_ipv4_link_local(pkt.dst_v4)
+            {
+                return true;
+            }
+            unsafe { USERSPACE_LOCAL_V4.get(&pkt.dst_v4) }.is_some()
+        }
+        AF_INET6 => {
+            if pkt.dst_v6[0] == 0xff || is_ipv6_link_local(pkt.dst_v6) {
+                return true;
+            }
+            let key = UserspaceLocalV6Key { addr: pkt.dst_v6 };
+            unsafe { USERSPACE_LOCAL_V6.get(&key) }.is_some()
+        }
+        _ => true,
+    }
+}
+
+fn is_ipv4_multicast(ip: u32) -> bool {
+    (ip & 0xf000_0000) == 0xe000_0000
+}
+
+fn is_ipv4_link_local(ip: u32) -> bool {
+    (ip & 0xffff_0000) == 0xa9fe_0000
+}
+
+fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
+    ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80
 }
 
 fn parse_l4(data: usize, data_end: usize, l4_offset: u16, protocol: u8) -> Option<(u16, u8)> {

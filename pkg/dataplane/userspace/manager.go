@@ -3,6 +3,7 @@ package userspace
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,7 +78,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.programBootstrapMapsLocked(ucfg); err != nil {
+	if err := m.programBootstrapMapsLocked(snap, ucfg); err != nil {
 		return result, err
 	}
 	if err := m.ensureProcessLocked(ucfg); err != nil {
@@ -127,6 +128,74 @@ func deriveUserspaceConfig(cfg *config.Config) config.UserspaceConfig {
 	return out
 }
 
+func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
+	caps := UserspaceCapabilities{ForwardingSupported: true}
+	if cfg == nil {
+		return caps
+	}
+	addReason := func(reason string) {
+		caps.ForwardingSupported = false
+		caps.UnsupportedReasons = append(caps.UnsupportedReasons, reason)
+	}
+	if cfg.Chassis.Cluster != nil {
+		addReason("HA cluster ownership and fabric redirect are not implemented in the userspace dataplane")
+	}
+	if len(cfg.Security.Zones) > 0 || len(cfg.Security.Policies) > 0 || len(cfg.Security.GlobalPolicies) > 0 {
+		addReason("security zones and policies still require the existing flow dataplane")
+	}
+	if len(cfg.Security.NAT.Source) > 0 ||
+		(cfg.Security.NAT.Destination != nil && len(cfg.Security.NAT.Destination.RuleSets) > 0) ||
+		len(cfg.Security.NAT.Static) > 0 ||
+		len(cfg.Security.NAT.NAT64) > 0 ||
+		cfg.Security.NAT.NATv6v4 != nil {
+		addReason("NAT and NAT64 are not implemented in the userspace dataplane")
+	}
+	if cfg.Security.Flow.TCPSession != nil ||
+		cfg.Security.Flow.UDPSessionTimeout != 0 ||
+		cfg.Security.Flow.ICMPSessionTimeout != 0 ||
+		cfg.Security.Flow.AllowDNSReply ||
+		cfg.Security.Flow.AllowEmbeddedICMP ||
+		cfg.Security.Flow.GREPerformanceAcceleration ||
+		cfg.Security.Flow.TCPMSSIPsecVPN != 0 ||
+		cfg.Security.Flow.TCPMSSGreIn != 0 ||
+		cfg.Security.Flow.TCPMSSGreOut != 0 {
+		addReason("stateful flow processing is not implemented in the userspace dataplane")
+	}
+	if len(cfg.Firewall.FiltersInet) > 0 || len(cfg.Firewall.FiltersInet6) > 0 ||
+		len(cfg.Firewall.Policers) > 0 || len(cfg.Firewall.ThreeColorPolicers) > 0 {
+		addReason("firewall filters are not implemented in the userspace dataplane")
+	}
+	if cfg.Security.IPsec.Gateways != nil || cfg.Security.IPsec.VPNs != nil || cfg.Security.IPsec.Policies != nil || cfg.Security.IPsec.IKEPolicies != nil {
+		addReason("IPsec and secure tunnel processing are not implemented in the userspace dataplane")
+	}
+	for _, iface := range cfg.Interfaces.Interfaces {
+		if iface == nil {
+			continue
+		}
+		if iface.Tunnel != nil {
+			addReason("tunnel interfaces are not implemented in the userspace dataplane")
+			break
+		}
+		for _, unit := range iface.Units {
+			if unit != nil && unit.Tunnel != nil {
+				addReason("tunnel interfaces are not implemented in the userspace dataplane")
+				break
+			}
+		}
+		if !caps.ForwardingSupported && len(caps.UnsupportedReasons) > 0 &&
+			caps.UnsupportedReasons[len(caps.UnsupportedReasons)-1] == "tunnel interfaces are not implemented in the userspace dataplane" {
+			break
+		}
+	}
+	if cfg.ForwardingOptions.PortMirroring != nil {
+		addReason("port mirroring is not implemented in the userspace dataplane")
+	}
+	if cfg.Services.FlowMonitoring != nil {
+		addReason("flow export offload is not implemented in the userspace dataplane")
+	}
+	return caps
+}
+
 func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32) *ConfigSnapshot {
 	if cfg == nil {
 		return &ConfigSnapshot{
@@ -134,6 +203,7 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 			Generation:    generation,
 			FIBGeneration: 0,
 			GeneratedAt:   time.Now().UTC(),
+			Capabilities:  deriveUserspaceCapabilities(nil),
 			MapPins:       userspaceMapPins(),
 			Userspace:     ucfg,
 		}
@@ -144,6 +214,7 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		Generation:    generation,
 		FIBGeneration: fibGeneration,
 		GeneratedAt:   time.Now().UTC(),
+		Capabilities:  deriveUserspaceCapabilities(cfg),
 		MapPins:       userspaceMapPins(),
 		Userspace:     ucfg,
 		Interfaces:    buildInterfaceSnapshots(cfg),
@@ -168,6 +239,8 @@ func userspaceMapPins() UserspaceMapPins {
 		Bindings:  dataplane.UserspaceBindingsPinPath(),
 		Heartbeat: dataplane.UserspaceHeartbeatPinPath(),
 		XSK:       dataplane.UserspaceXSKMapPinPath(),
+		LocalV4:   dataplane.UserspaceLocalV4PinPath(),
+		LocalV6:   dataplane.UserspaceLocalV6PinPath(),
 	}
 }
 
@@ -715,7 +788,7 @@ type userspaceCtrlValue struct {
 	HeartbeatTimeoutMS uint32
 }
 
-func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
+func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
 	ctrlMap := m.inner.Map("userspace_ctrl")
 	if ctrlMap == nil {
 		return errors.New("userspace_ctrl map not loaded")
@@ -727,6 +800,14 @@ func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
 	heartbeatMap := m.inner.Map("userspace_heartbeat")
 	if heartbeatMap == nil {
 		return errors.New("userspace_heartbeat map not loaded")
+	}
+	localV4Map := m.inner.Map("userspace_local_v4")
+	if localV4Map == nil {
+		return errors.New("userspace_local_v4 map not loaded")
+	}
+	localV6Map := m.inner.Map("userspace_local_v6")
+	if localV6Map == nil {
+		return errors.New("userspace_local_v6 map not loaded")
 	}
 	fallbackMap := m.inner.Map("userspace_fallback_progs")
 	if fallbackMap == nil {
@@ -777,6 +858,45 @@ func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
 	for _, key := range hbKeys {
 		if err := heartbeatMap.Delete(key); err != nil {
 			return fmt.Errorf("delete userspace_heartbeat %d: %w", key, err)
+		}
+	}
+	var (
+		localV4Key uint32
+		localV4Val uint8
+	)
+	localV4Iter := localV4Map.Iterate()
+	var localV4Keys []uint32
+	for localV4Iter.Next(&localV4Key, &localV4Val) {
+		localV4Keys = append(localV4Keys, localV4Key)
+	}
+	for _, key := range localV4Keys {
+		if err := localV4Map.Delete(key); err != nil {
+			return fmt.Errorf("delete userspace_local_v4 %08x: %w", key, err)
+		}
+	}
+	var (
+		localV6Key userspaceLocalV6Key
+		localV6Val uint8
+	)
+	localV6Iter := localV6Map.Iterate()
+	var localV6Keys []userspaceLocalV6Key
+	for localV6Iter.Next(&localV6Key, &localV6Val) {
+		localV6Keys = append(localV6Keys, localV6Key)
+	}
+	for _, key := range localV6Keys {
+		if err := localV6Map.Delete(key); err != nil {
+			return fmt.Errorf("delete userspace_local_v6 %+v: %w", key, err)
+		}
+	}
+	for _, entry := range buildLocalAddressEntries(snapshot) {
+		if entry.v4 {
+			if err := localV4Map.Update(entry.v4Key, uint8(1), ebpf.UpdateAny); err != nil {
+				return fmt.Errorf("update userspace_local_v4 %08x: %w", entry.v4Key, err)
+			}
+			continue
+		}
+		if err := localV6Map.Update(entry.v6Key, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_local_v6 %+v: %w", entry.v6Key, err)
 		}
 	}
 	return nil
@@ -877,6 +997,15 @@ func (m *Manager) SetForwardingArmed(armed bool) (ProcessStatus, error) {
 	if m.proc == nil {
 		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
 	}
+	if armed && !m.lastStatus.Capabilities.ForwardingSupported {
+		if len(m.lastStatus.Capabilities.UnsupportedReasons) == 0 {
+			return m.lastStatus, errors.New("userspace live forwarding is not supported for the current configuration")
+		}
+		return m.lastStatus, fmt.Errorf(
+			"userspace live forwarding is not supported: %s",
+			strings.Join(m.lastStatus.Capabilities.UnsupportedReasons, "; "),
+		)
+	}
 	var status ProcessStatus
 	req := ControlRequest{
 		Type: "set_forwarding_state",
@@ -970,6 +1099,50 @@ type userspaceBindingKey struct {
 type userspaceBindingValue struct {
 	Slot  uint32
 	Flags uint32
+}
+
+type userspaceLocalV6Key struct {
+	Addr [16]byte
+}
+
+type userspaceLocalAddressEntry struct {
+	v4    bool
+	v4Key uint32
+	v6Key userspaceLocalV6Key
+}
+
+func buildLocalAddressEntries(snapshot *ConfigSnapshot) []userspaceLocalAddressEntry {
+	if snapshot == nil {
+		return nil
+	}
+	seenV4 := make(map[uint32]bool)
+	seenV6 := make(map[[16]byte]bool)
+	out := make([]userspaceLocalAddressEntry, 0)
+	for _, iface := range snapshot.Interfaces {
+		for _, addr := range iface.Addresses {
+			ip, _, err := net.ParseCIDR(addr.Address)
+			if err != nil || ip == nil {
+				continue
+			}
+			if v4 := ip.To4(); v4 != nil {
+				key := binary.BigEndian.Uint32(v4)
+				if seenV4[key] {
+					continue
+				}
+				seenV4[key] = true
+				out = append(out, userspaceLocalAddressEntry{v4: true, v4Key: key})
+				continue
+			}
+			var key [16]byte
+			copy(key[:], ip.To16())
+			if seenV6[key] {
+				continue
+			}
+			seenV6[key] = true
+			out = append(out, userspaceLocalAddressEntry{v6Key: userspaceLocalV6Key{Addr: key}})
+		}
+	}
+	return out
 }
 
 func (m *Manager) ensureStatusLoopLocked() {

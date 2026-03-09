@@ -202,6 +202,8 @@ func (m *Manager) loadAllObjects() error {
 		"userspace_bindings",
 		"userspace_heartbeat",
 		"userspace_xsk_map",
+		"userspace_local_v4",
+		"userspace_local_v6",
 		"userspace_fallback_progs",
 	} {
 		if ms, ok := userspaceSpec.Maps[name]; ok {
@@ -232,6 +234,14 @@ func (m *Manager) loadAllObjects() error {
 	if !ok {
 		return fmt.Errorf("Rust userspace_xsk_map not found")
 	}
+	userspaceLocalV4, ok := userspaceCollection.Maps["userspace_local_v4"]
+	if !ok {
+		return fmt.Errorf("Rust userspace_local_v4 map not found")
+	}
+	userspaceLocalV6, ok := userspaceCollection.Maps["userspace_local_v6"]
+	if !ok {
+		return fmt.Errorf("Rust userspace_local_v6 map not found")
+	}
 	userspaceFallback, ok := userspaceCollection.Maps["userspace_fallback_progs"]
 	if !ok {
 		return fmt.Errorf("Rust userspace_fallback_progs map not found")
@@ -245,6 +255,8 @@ func (m *Manager) loadAllObjects() error {
 		{name: "userspace_bindings", m: userspaceBindings, path: UserspaceBindingsPinPath()},
 		{name: "userspace_heartbeat", m: userspaceHeartbeat, path: UserspaceHeartbeatPinPath()},
 		{name: "userspace_xsk_map", m: userspaceXSK, path: UserspaceXSKMapPinPath()},
+		{name: "userspace_local_v4", m: userspaceLocalV4, path: UserspaceLocalV4PinPath()},
+		{name: "userspace_local_v6", m: userspaceLocalV6, path: UserspaceLocalV6PinPath()},
 		{name: "userspace_fallback_progs", m: userspaceFallback, path: filepath.Join(bpfPinPath, "userspace_fallback_progs")},
 	} {
 		if err := ensureUserspaceMapPinned(pin.name, pin.m, pin.path); err != nil {
@@ -256,6 +268,8 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["userspace_bindings"] = userspaceBindings
 	m.maps["userspace_heartbeat"] = userspaceHeartbeat
 	m.maps["userspace_xsk_map"] = userspaceXSK
+	m.maps["userspace_local_v4"] = userspaceLocalV4
+	m.maps["userspace_local_v6"] = userspaceLocalV6
 	m.maps["userspace_fallback_progs"] = userspaceFallback
 
 	// Extended replacements for xdp_policy which also includes NAT pool maps.

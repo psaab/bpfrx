@@ -54,7 +54,7 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	if snap.FIBGeneration != 5 {
 		t.Fatalf("FIBGeneration = %d, want 5", snap.FIBGeneration)
 	}
-	if snap.MapPins.Ctrl == "" || snap.MapPins.Bindings == "" || snap.MapPins.Heartbeat == "" || snap.MapPins.XSK == "" {
+	if snap.MapPins.Ctrl == "" || snap.MapPins.Bindings == "" || snap.MapPins.Heartbeat == "" || snap.MapPins.XSK == "" || snap.MapPins.LocalV4 == "" || snap.MapPins.LocalV6 == "" {
 		t.Fatalf("MapPins = %+v, want all paths populated", snap.MapPins)
 	}
 	if snap.Summary.HostName != "fw-test" {
@@ -92,6 +92,51 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	}
 	if snap.Routes[1].Table != "vrf1.inet6.0" || snap.Routes[1].Destination != "::/0" {
 		t.Fatalf("Routes[1] = %+v", snap.Routes[1])
+	}
+}
+
+func TestBuildLocalAddressEntries(t *testing.T) {
+	snapshot := &ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{
+			{
+				Name: "reth0.50",
+				Addresses: []InterfaceAddressSnapshot{
+					{Family: "inet", Address: "172.16.50.8/24"},
+					{Family: "inet6", Address: "2001:559:8585:50::8/64"},
+				},
+			},
+			{
+				Name: "reth1.0",
+				Addresses: []InterfaceAddressSnapshot{
+					{Family: "inet", Address: "10.0.61.1/24"},
+					{Family: "inet6", Address: "fe80::1/128"},
+					{Family: "inet6", Address: "2001:559:8585:ef00::1/64"},
+				},
+			},
+		},
+	}
+	got := buildLocalAddressEntries(snapshot)
+	if len(got) != 5 {
+		t.Fatalf("len(got) = %d, want 5 (%+v)", len(got), got)
+	}
+}
+
+func TestDeriveUserspaceCapabilitiesDetectsFirewallFeatures(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chassis.Cluster = &config.ClusterConfig{ClusterID: 1}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{"trust": {Name: "trust"}}
+	cfg.Security.NAT.Source = []*config.NATRuleSet{{Name: "src"}}
+	cfg.Security.Flow.AllowDNSReply = true
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{"f1": {Name: "f1"}}
+	cfg.Security.IPsec.Gateways = map[string]*config.IPsecGateway{"gw1": {Name: "gw1"}}
+	cfg.Services.FlowMonitoring = &config.FlowMonitoringConfig{}
+
+	caps := deriveUserspaceCapabilities(cfg)
+	if caps.ForwardingSupported {
+		t.Fatal("ForwardingSupported = true, want false")
+	}
+	if len(caps.UnsupportedReasons) < 5 {
+		t.Fatalf("UnsupportedReasons = %+v, want multiple reasons", caps.UnsupportedReasons)
 	}
 }
 

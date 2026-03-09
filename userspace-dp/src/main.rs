@@ -110,6 +110,8 @@ struct ConfigSnapshot {
     #[serde(rename = "generated_at")]
     generated_at: DateTime<Utc>,
     summary: SnapshotSummary,
+    #[serde(default)]
+    capabilities: UserspaceCapabilities,
     #[serde(rename = "map_pins", default)]
     map_pins: MapPins,
     #[serde(default)]
@@ -134,6 +136,18 @@ struct MapPins {
     heartbeat: String,
     #[serde(default)]
     xsk: String,
+    #[serde(rename = "local_v4", default)]
+    local_v4: String,
+    #[serde(rename = "local_v6", default)]
+    local_v6: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct UserspaceCapabilities {
+    #[serde(rename = "forwarding_supported", default)]
+    forwarding_supported: bool,
+    #[serde(rename = "unsupported_reasons", default)]
+    unsupported_reasons: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -172,6 +186,8 @@ struct ProcessStatus {
     enabled: bool,
     #[serde(rename = "forwarding_armed", default)]
     forwarding_armed: bool,
+    #[serde(default)]
+    capabilities: UserspaceCapabilities,
     #[serde(rename = "last_snapshot_generation")]
     last_snapshot_generation: u64,
     #[serde(rename = "last_fib_generation", default)]
@@ -448,6 +464,7 @@ fn run() -> Result<(), String> {
             io_uring_planned: true,
             enabled: false,
             forwarding_armed: false,
+            capabilities: UserspaceCapabilities::default(),
             last_snapshot_generation: 0,
             last_fib_generation: 0,
             last_snapshot_at: None,
@@ -589,6 +606,7 @@ fn handle_stream(
                     guard.status.last_snapshot_generation = snapshot.generation;
                     guard.status.last_fib_generation = snapshot.fib_generation;
                     guard.status.last_snapshot_at = Some(snapshot.generated_at);
+                    guard.status.capabilities = snapshot.capabilities.clone();
                     guard.snapshot = Some(snapshot);
                     let existing_bindings = guard.status.bindings.clone();
                     let replanned = replan_queues(
@@ -614,9 +632,14 @@ fn handle_stream(
             }
             "set_forwarding_state" => {
                 if let Some(forwarding_req) = request.forwarding {
-                    guard.status.forwarding_armed = forwarding_req.armed;
-                    refresh_status(&mut guard);
-                    persist_state = true;
+                    if forwarding_req.armed && !guard.status.capabilities.forwarding_supported {
+                        response.ok = false;
+                        response.error = forwarding_unsupported_error(&guard.status.capabilities);
+                    } else {
+                        guard.status.forwarding_armed = forwarding_req.armed;
+                        refresh_status(&mut guard);
+                        persist_state = true;
+                    }
                 } else {
                     response.ok = false;
                     response.error = "missing forwarding state".to_string();
@@ -751,6 +774,7 @@ fn refresh_status(state: &mut ServerState) {
     state.status.debug_reconcile_calls = reconcile_calls;
     state.status.debug_reconcile_stage = reconcile_stage;
     state.status.enabled = state.status.forwarding_armed
+        && state.status.capabilities.forwarding_supported
         && state
             .status
             .bindings
@@ -759,6 +783,17 @@ fn refresh_status(state: &mut ServerState) {
     state.status.queues = summarize_queues(&state.status.bindings);
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
     state.status.last_resolution = state.afxdp.last_resolution();
+}
+
+fn forwarding_unsupported_error(cap: &UserspaceCapabilities) -> String {
+    if cap.unsupported_reasons.is_empty() {
+        return "userspace live forwarding is not supported for the current configuration"
+            .to_string();
+    }
+    format!(
+        "userspace live forwarding is not supported: {}",
+        cap.unsupported_reasons.join("; ")
+    )
 }
 
 fn reconcile_status_bindings(state: &mut ServerState) {

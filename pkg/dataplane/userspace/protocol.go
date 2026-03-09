@@ -32,6 +32,7 @@ type ConfigSnapshot struct {
 	FIBGeneration uint32                 `json:"fib_generation,omitempty"`
 	GeneratedAt   time.Time              `json:"generated_at"`
 	Summary       SnapshotSummary        `json:"summary"`
+	Capabilities  UserspaceCapabilities  `json:"capabilities"`
 	MapPins       UserspaceMapPins       `json:"map_pins"`
 	Interfaces    []InterfaceSnapshot    `json:"interfaces,omitempty"`
 	Neighbors     []NeighborSnapshot     `json:"neighbors,omitempty"`
@@ -98,30 +99,38 @@ type UserspaceMapPins struct {
 	Bindings  string `json:"bindings,omitempty"`
 	Heartbeat string `json:"heartbeat,omitempty"`
 	XSK       string `json:"xsk,omitempty"`
+	LocalV4   string `json:"local_v4,omitempty"`
+	LocalV6   string `json:"local_v6,omitempty"`
+}
+
+type UserspaceCapabilities struct {
+	ForwardingSupported bool     `json:"forwarding_supported"`
+	UnsupportedReasons  []string `json:"unsupported_reasons,omitempty"`
 }
 
 type ProcessStatus struct {
-	PID                    int               `json:"pid"`
-	StartedAt              time.Time         `json:"started_at"`
-	ControlSocket          string            `json:"control_socket"`
-	StateFile              string            `json:"state_file"`
-	Workers                int               `json:"workers"`
-	RingEntries            int               `json:"ring_entries"`
-	HelperMode             string            `json:"helper_mode"`
-	IOUringPlanned         bool              `json:"io_uring_planned"`
-	Enabled                bool              `json:"enabled"`
-	ForwardingArmed        bool              `json:"forwarding_armed,omitempty"`
-	LastSnapshotGeneration uint64            `json:"last_snapshot_generation"`
-	LastFIBGeneration      uint32            `json:"last_fib_generation,omitempty"`
-	LastSnapshotAt         time.Time         `json:"last_snapshot_at,omitempty"`
-	InterfaceAddresses     int               `json:"interface_addresses,omitempty"`
-	NeighborEntries        int               `json:"neighbor_entries,omitempty"`
-	RouteEntries           int               `json:"route_entries,omitempty"`
-	WorkerHeartbeats       []time.Time       `json:"worker_heartbeats,omitempty"`
-	Queues                 []QueueStatus     `json:"queues,omitempty"`
-	Bindings               []BindingStatus   `json:"bindings,omitempty"`
-	RecentExceptions       []ExceptionStatus `json:"recent_exceptions,omitempty"`
-	LastResolution         *PacketResolution `json:"last_resolution,omitempty"`
+	PID                    int                   `json:"pid"`
+	StartedAt              time.Time             `json:"started_at"`
+	ControlSocket          string                `json:"control_socket"`
+	StateFile              string                `json:"state_file"`
+	Workers                int                   `json:"workers"`
+	RingEntries            int                   `json:"ring_entries"`
+	HelperMode             string                `json:"helper_mode"`
+	IOUringPlanned         bool                  `json:"io_uring_planned"`
+	Enabled                bool                  `json:"enabled"`
+	ForwardingArmed        bool                  `json:"forwarding_armed,omitempty"`
+	Capabilities           UserspaceCapabilities `json:"capabilities"`
+	LastSnapshotGeneration uint64                `json:"last_snapshot_generation"`
+	LastFIBGeneration      uint32                `json:"last_fib_generation,omitempty"`
+	LastSnapshotAt         time.Time             `json:"last_snapshot_at,omitempty"`
+	InterfaceAddresses     int                   `json:"interface_addresses,omitempty"`
+	NeighborEntries        int                   `json:"neighbor_entries,omitempty"`
+	RouteEntries           int                   `json:"route_entries,omitempty"`
+	WorkerHeartbeats       []time.Time           `json:"worker_heartbeats,omitempty"`
+	Queues                 []QueueStatus         `json:"queues,omitempty"`
+	Bindings               []BindingStatus       `json:"bindings,omitempty"`
+	RecentExceptions       []ExceptionStatus     `json:"recent_exceptions,omitempty"`
+	LastResolution         *PacketResolution     `json:"last_resolution,omitempty"`
 }
 
 type PacketResolution struct {
