@@ -31,8 +31,8 @@ func TestFormatStatusSummary(t *testing.T) {
 			{QueueID: 1, Ready: false},
 		},
 		Bindings: []BindingStatus{
-			{Slot: 0, Ready: true, Bound: true, XSKRegistered: true, RXPackets: 10, ValidatedPackets: 8, ExceptionPackets: 1},
-			{Slot: 1, Ready: false, Bound: true, XSKRegistered: false, RXPackets: 5, ValidatedPackets: 4, ExceptionPackets: 2},
+			{Slot: 0, Ready: true, Bound: true, XSKRegistered: true, RXPackets: 10, ValidatedPackets: 8, ExceptionPackets: 1, TXPackets: 3, TXBytes: 420},
+			{Slot: 1, Ready: false, Bound: true, XSKRegistered: false, RXPackets: 5, ValidatedPackets: 4, ExceptionPackets: 2, TXErrors: 1},
 		},
 		RecentExceptions: []ExceptionStatus{
 			{Timestamp: now, Slot: 1, QueueID: 0, Interface: "ge-0-0-2", Reason: "metadata_parse", PacketLength: 128},
@@ -55,6 +55,9 @@ func TestFormatStatusSummary(t *testing.T) {
 		"RX packets:                15",
 		"Validated packets:         12",
 		"Exception packets:         3",
+		"TX packets:                3",
+		"TX bytes:                  420",
+		"TX errors:                 1",
 		"Recent exceptions:         1",
 		"Worker 0 heartbeat age:",
 	} {
@@ -70,7 +73,7 @@ func TestFormatBindings(t *testing.T) {
 			{QueueID: 0, WorkerID: 0, Interfaces: []string{"ge-0-0-1", "ge-0-0-2"}, Registered: true, Ready: false},
 		},
 		Bindings: []BindingStatus{
-			{Slot: 0, QueueID: 0, WorkerID: 0, Registered: true, Ready: false, Bound: true, XSKRegistered: true, Ifindex: 5, Interface: "ge-0-0-1", RXPackets: 99, ExceptionPackets: 3},
+			{Slot: 0, QueueID: 0, WorkerID: 0, Registered: true, Ready: false, Bound: true, XSKRegistered: true, Ifindex: 5, Interface: "ge-0-0-1", RXPackets: 99, TXPackets: 7, ExceptionPackets: 3},
 			{Slot: 1, QueueID: 0, WorkerID: 0, Registered: true, Ready: false, Bound: true, XSKRegistered: false, Ifindex: 6, Interface: "ge-0-0-2", ExceptionPackets: 1, LastError: "xsk map update failed"},
 		},
 		RecentExceptions: []ExceptionStatus{
@@ -85,6 +88,7 @@ func TestFormatBindings(t *testing.T) {
 		"ge-0-0-1,ge-0-0-2",
 		"ge-0-0-1",
 		"ge-0-0-2",
+		"TXPkts",
 		"xsk map update failed",
 		"Recent userspace exceptions:",
 		"fib_generation_mismatch",

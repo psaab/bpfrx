@@ -24,6 +24,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	var routeMisses uint64
 	var neighborMisses uint64
 	var exceptionPackets uint64
+	var txPackets uint64
+	var txBytes uint64
+	var txErrors uint64
 	for _, binding := range status.Bindings {
 		if binding.Ready {
 			readyBindings++
@@ -40,6 +43,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 		routeMisses += binding.RouteMissPackets
 		neighborMisses += binding.NeighborMissPackets
 		exceptionPackets += binding.ExceptionPackets
+		txPackets += binding.TXPackets
+		txBytes += binding.TXBytes
+		txErrors += binding.TXErrors
 	}
 
 	fmt.Fprintln(&b, "Userspace dataplane helper:")
@@ -82,6 +88,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  Route misses:              %d\n", routeMisses)
 	fmt.Fprintf(&b, "  Neighbor misses:           %d\n", neighborMisses)
 	fmt.Fprintf(&b, "  Exception packets:         %d\n", exceptionPackets)
+	fmt.Fprintf(&b, "  TX packets:                %d\n", txPackets)
+	fmt.Fprintf(&b, "  TX bytes:                  %d\n", txBytes)
+	fmt.Fprintf(&b, "  TX errors:                 %d\n", txErrors)
 	fmt.Fprintf(&b, "  Recent exceptions:         %d\n", len(status.RecentExceptions))
 	for i, hb := range status.WorkerHeartbeats {
 		if hb.IsZero() {
@@ -113,10 +122,10 @@ func FormatBindings(status ProcessStatus) string {
 		fmt.Fprintln(&b, "  none")
 		return b.String()
 	}
-	fmt.Fprintf(&b, "  %-6s %-7s %-8s %-10s %-7s %-7s %-5s %-8s %-9s %-9s %-9s %-9s %s\n", "Slot", "Queue", "Worker", "Registered", "Ready", "Bound", "XSK", "Ifindex", "RXPkts", "FwdPkts", "RtMiss", "ExcPkts", "Interface")
+	fmt.Fprintf(&b, "  %-6s %-7s %-8s %-10s %-7s %-7s %-5s %-8s %-9s %-9s %-9s %-9s %-9s %s\n", "Slot", "Queue", "Worker", "Registered", "Ready", "Bound", "XSK", "Ifindex", "RXPkts", "TXPkts", "FwdPkts", "RtMiss", "ExcPkts", "Interface")
 	for _, binding := range status.Bindings {
-		fmt.Fprintf(&b, "  %-6d %-7d %-8d %-10t %-7t %-7t %-5t %-8d %-9d %-9d %-9d %-9d %s",
-			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Ready, binding.Bound, binding.XSKRegistered, binding.Ifindex, binding.RXPackets, binding.ForwardCandidatePkts, binding.RouteMissPackets, binding.ExceptionPackets, binding.Interface)
+		fmt.Fprintf(&b, "  %-6d %-7d %-8d %-10t %-7t %-7t %-5t %-8d %-9d %-9d %-9d %-9d %-9d %s",
+			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Ready, binding.Bound, binding.XSKRegistered, binding.Ifindex, binding.RXPackets, binding.TXPackets, binding.ForwardCandidatePkts, binding.RouteMissPackets, binding.ExceptionPackets, binding.Interface)
 		if binding.LastError != "" {
 			fmt.Fprintf(&b, " (%s)", binding.LastError)
 		}
