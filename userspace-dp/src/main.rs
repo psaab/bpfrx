@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct SnapshotSummary {
@@ -604,6 +604,7 @@ fn handle_stream(
                         .afxdp
                         .reconcile(snapshot.as_ref(), &mut bindings, ring_entries);
                     guard.status.bindings = bindings;
+                    wait_for_binding_settle(&mut guard, Duration::from_secs(2));
                     refresh_status(&mut guard);
                     persist_state = true;
                 } else {
@@ -642,6 +643,7 @@ fn handle_stream(
                     if found {
                         if registration_changed {
                             reconcile_status_bindings(&mut guard);
+                            wait_for_binding_settle(&mut guard, Duration::from_secs(2));
                         }
                         refresh_status(&mut guard);
                         persist_state = true;
@@ -668,6 +670,7 @@ fn handle_stream(
                         binding.last_change = Some(Utc::now());
                         if registration_changed {
                             reconcile_status_bindings(&mut guard);
+                            wait_for_binding_settle(&mut guard, Duration::from_secs(2));
                         }
                         refresh_status(&mut guard);
                         persist_state = true;
@@ -766,6 +769,26 @@ fn reconcile_status_bindings(state: &mut ServerState) {
         .afxdp
         .reconcile(snapshot.as_ref(), &mut bindings, ring_entries);
     state.status.bindings = bindings;
+}
+
+fn wait_for_binding_settle(state: &mut ServerState, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        refresh_status(state);
+        if bindings_settled(&state.status.bindings) || Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn bindings_settled(bindings: &[BindingStatus]) -> bool {
+    bindings.iter().all(|binding| {
+        if !binding.registered {
+            return !binding.bound && !binding.xsk_registered;
+        }
+        binding.ready || !binding.last_error.is_empty()
+    })
 }
 
 fn replan_queues(
