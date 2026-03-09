@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -334,7 +334,6 @@ struct Args {
 struct ServerState {
     status: ProcessStatus,
     snapshot: Option<ConfigSnapshot>,
-    heartbeats: Vec<Arc<AtomicI64>>,
     afxdp: afxdp::Coordinator,
 }
 
@@ -385,7 +384,6 @@ fn run() -> Result<(), String> {
             recent_exceptions: Vec::new(),
         },
         snapshot: None,
-        heartbeats: Vec::new(),
         afxdp: afxdp::Coordinator::new(),
     }));
 
@@ -397,14 +395,9 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("install ctrlc handler: {e}"))?;
     }
 
-    spawn_workers(&state, &running, args.workers);
     write_state(&args.state_file, &state)?;
 
     while running.load(Ordering::SeqCst) {
-        {
-            let mut guard = state.lock().expect("state poisoned");
-            guard.afxdp.poll_once();
-        }
         match listener.accept() {
             Ok((stream, _)) => {
                 let _ = handle_stream(stream, &args.state_file, state.clone(), running.clone());
@@ -415,7 +408,6 @@ fn run() -> Result<(), String> {
             Err(err) => return Err(format!("accept: {err}")),
         }
     }
-
     {
         let mut guard = state.lock().expect("state poisoned");
         guard.afxdp.stop();
@@ -470,29 +462,6 @@ fn parse_args() -> Result<Args, String> {
         workers,
         ring_entries,
     })
-}
-
-fn spawn_workers(state: &Arc<Mutex<ServerState>>, running: &Arc<AtomicBool>, count: usize) {
-    let mut beats = Vec::with_capacity(count);
-    for _ in 0..count {
-        let beat = Arc::new(AtomicI64::new(
-            Utc::now().timestamp_nanos_opt().unwrap_or(0),
-        ));
-        beats.push(beat.clone());
-        let running = running.clone();
-        thread::spawn(move || {
-            while running.load(Ordering::SeqCst) {
-                beat.store(
-                    Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                    Ordering::Relaxed,
-                );
-                thread::sleep(Duration::from_millis(250));
-            }
-        });
-    }
-    let mut guard = state.lock().expect("worker state poisoned");
-    guard.heartbeats = beats;
-    refresh_status(&mut guard);
 }
 
 fn handle_stream(
@@ -669,7 +638,7 @@ fn refresh_status(state: &mut ServerState) {
         .map(|s| s.neighbors.len())
         .unwrap_or(0);
     state.status.route_entries = state.snapshot.as_ref().map(|s| s.routes.len()).unwrap_or(0);
-    state.status.worker_heartbeats = collect_heartbeats(&state.heartbeats);
+    state.status.worker_heartbeats = state.afxdp.worker_heartbeats();
     state.status.enabled = state
         .status
         .bindings
@@ -798,16 +767,6 @@ fn rx_queue_count(name: &str) -> usize {
         .filter(|entry| entry.starts_with("rx-"))
         .count();
     count.max(1)
-}
-
-fn collect_heartbeats(beats: &[Arc<AtomicI64>]) -> Vec<DateTime<Utc>> {
-    let mut out = Vec::with_capacity(beats.len());
-    for beat in beats {
-        let ns = beat.load(Ordering::Relaxed);
-        let dt = DateTime::<Utc>::from_timestamp_nanos(ns);
-        out.push(dt);
-    }
-    out
 }
 
 fn write_state(state_file: &str, state: &Arc<Mutex<ServerState>>) -> Result<(), String> {

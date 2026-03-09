@@ -6,8 +6,10 @@ use core::ptr::NonNull;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use xdpilone::xdp::XdpDesc;
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig, User};
@@ -50,10 +52,10 @@ struct UserspaceDpMeta {
 pub struct Coordinator {
     map_fd: Option<OwnedFd>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
-    bindings: BTreeMap<u32, BindingWorker>,
-    recent_exceptions: VecDeque<ExceptionStatus>,
+    identities: BTreeMap<u32, BindingIdentity>,
+    workers: BTreeMap<u32, WorkerHandle>,
+    recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     validation: ValidationState,
-    last_stats_poll: Instant,
 }
 
 impl Coordinator {
@@ -61,23 +63,34 @@ impl Coordinator {
         Self {
             map_fd: None,
             live: BTreeMap::new(),
-            bindings: BTreeMap::new(),
-            recent_exceptions: VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS),
+            identities: BTreeMap::new(),
+            workers: BTreeMap::new(),
+            recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
             validation: ValidationState::default(),
-            last_stats_poll: Instant::now(),
         }
     }
 
     pub fn stop(&mut self) {
+        for handle in self.workers.values_mut() {
+            handle.stop.store(true, Ordering::Relaxed);
+        }
+        for (_, handle) in self.workers.iter_mut() {
+            if let Some(join) = handle.join.take() {
+                let _ = join.join();
+            }
+        }
         if let Some(map_fd) = self.map_fd.as_ref() {
             for slot in self.live.keys().copied().collect::<Vec<_>>() {
                 let _ = delete_xsk_slot(map_fd.fd, slot);
             }
         }
-        self.bindings.clear();
+        self.workers.clear();
+        self.identities.clear();
         self.live.clear();
         self.map_fd = None;
-        self.recent_exceptions.clear();
+        if let Ok(mut recent) = self.recent_exceptions.lock() {
+            recent.clear();
+        }
         self.validation = ValidationState::default();
     }
 
@@ -137,6 +150,7 @@ impl Coordinator {
             }
         };
         let ring_entries = ring_entries.max(64).min(u32::MAX as usize) as u32;
+        let mut workers: BTreeMap<u32, Vec<BindingPlan>> = BTreeMap::new();
         for binding in bindings.iter_mut() {
             if !binding.registered || binding.ifindex <= 0 {
                 binding.ready = false;
@@ -144,49 +158,100 @@ impl Coordinator {
             }
             let live = Arc::new(BindingLiveState::new());
             self.live.insert(binding.slot, live.clone());
-            match BindingWorker::create(binding, ring_entries, map_fd.fd, live.clone()) {
-                Ok(worker_binding) => {
-                    self.bindings.insert(binding.slot, worker_binding);
+            let identity = BindingIdentity {
+                slot: binding.slot,
+                queue_id: binding.queue_id,
+                worker_id: binding.worker_id,
+                interface: binding.interface.clone(),
+                ifindex: binding.ifindex,
+            };
+            self.identities.insert(binding.slot, identity);
+            workers
+                .entry(binding.worker_id)
+                .or_default()
+                .push(BindingPlan {
+                    status: binding.clone(),
+                    live,
+                    xsk_map_fd: map_fd.fd,
+                    ring_entries,
+                });
+        }
+        self.map_fd = Some(map_fd);
+        for (worker_id, binding_plans) in workers {
+            let stop = Arc::new(AtomicBool::new(false));
+            let heartbeat = Arc::new(AtomicI64::new(now_nanos()));
+            let recent_exceptions = self.recent_exceptions.clone();
+            let stop_clone = stop.clone();
+            let heartbeat_clone = heartbeat.clone();
+            let validation = self.validation;
+            let join = thread::Builder::new()
+                .name(format!("bpfrx-userspace-worker-{worker_id}"))
+                .spawn(move || {
+                    worker_loop(
+                        worker_id,
+                        binding_plans,
+                        validation,
+                        recent_exceptions,
+                        stop_clone,
+                        heartbeat_clone,
+                    );
+                });
+            match join {
+                Ok(join) => {
+                    self.workers.insert(
+                        worker_id,
+                        WorkerHandle {
+                            stop,
+                            heartbeat,
+                            join: Some(join),
+                        },
+                    );
                 }
                 Err(err) => {
-                    live.set_error(err.to_string());
+                    if let Ok(mut recent) = self.recent_exceptions.lock() {
+                        push_recent_exception(
+                            &mut recent,
+                            ExceptionStatus {
+                                timestamp: Utc::now(),
+                                reason: format!("spawn_worker_failed:{worker_id}:{err}"),
+                                ..ExceptionStatus::default()
+                            },
+                        );
+                    }
                 }
             }
         }
-        self.map_fd = Some(map_fd);
-        self.last_stats_poll = Instant::now();
         self.refresh_bindings(bindings);
     }
 
-    pub fn poll_once(&mut self) {
-        let poll_stats = self.last_stats_poll.elapsed() >= STATS_POLL_INTERVAL;
-        for binding in self.bindings.values_mut() {
-            poll_binding(
-                binding,
-                self.validation,
-                &mut self.recent_exceptions,
-                poll_stats,
-            );
-        }
-        if poll_stats {
-            self.last_stats_poll = Instant::now();
-        }
+    pub fn recent_exceptions(&self) -> Vec<ExceptionStatus> {
+        self.recent_exceptions
+            .lock()
+            .map(|recent| recent.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
-    pub fn recent_exceptions(&self) -> Vec<ExceptionStatus> {
-        self.recent_exceptions.iter().cloned().collect()
+    pub fn worker_heartbeats(&self) -> Vec<chrono::DateTime<Utc>> {
+        self.workers
+            .iter()
+            .map(|(_, handle)| {
+                chrono::DateTime::<Utc>::from_timestamp_nanos(
+                    handle.heartbeat.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
     }
 
     pub fn inject_test_packet(&mut self, req: InjectPacketRequest) -> Result<(), String> {
         let binding = self
-            .bindings
+            .identities
             .get(&req.slot)
             .ok_or_else(|| format!("unknown binding slot {}", req.slot))?;
         let live = self
             .live
             .get(&req.slot)
             .ok_or_else(|| format!("binding slot {} has no live state", req.slot))?;
-        let ident = binding.identity();
+        let ident = binding.clone();
         let packet_length = req.packet_length.max(64);
 
         if req.metadata_valid {
@@ -210,14 +275,14 @@ impl Coordinator {
                 classify_metadata(meta, self.validation),
                 packet_length,
                 Some(meta),
-                &mut self.recent_exceptions,
+                &self.recent_exceptions,
             );
             return Ok(());
         }
 
         live.metadata_errors.fetch_add(1, Ordering::Relaxed);
         record_exception(
-            &mut self.recent_exceptions,
+            &self.recent_exceptions,
             &ident,
             "metadata_parse",
             packet_length,
@@ -275,6 +340,19 @@ impl Coordinator {
     }
 }
 
+struct WorkerHandle {
+    stop: Arc<AtomicBool>,
+    heartbeat: Arc<AtomicI64>,
+    join: Option<JoinHandle<()>>,
+}
+
+struct BindingPlan {
+    status: BindingStatus,
+    live: Arc<BindingLiveState>,
+    xsk_map_fd: c_int,
+    ring_entries: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ValidationState {
     snapshot_installed: bool,
@@ -316,7 +394,7 @@ struct BindingIdentity {
 
 impl BindingWorker {
     fn create(
-        binding: &mut BindingStatus,
+        binding: &BindingStatus,
         ring_entries: u32,
         xsk_map_fd: c_int,
         live: Arc<BindingLiveState>,
@@ -358,11 +436,6 @@ impl BindingWorker {
             live.set_xsk_registered(true);
             live.clear_error();
         }
-        binding.bound = true;
-        binding.xsk_registered = live.xsk_registered.load(Ordering::Relaxed);
-        binding.socket_fd = user.as_raw_fd();
-        binding.ready = false;
-
         Ok(Self {
             slot: binding.slot,
             queue_id: binding.queue_id,
@@ -392,9 +465,9 @@ impl BindingWorker {
 fn poll_binding(
     binding: &mut BindingWorker,
     validation: ValidationState,
-    recent_exceptions: &mut VecDeque<ExceptionStatus>,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     poll_stats: bool,
-) {
+) -> bool {
     let ident = binding.identity();
     if binding.device.needs_wakeup() {
         binding.device.wake();
@@ -405,7 +478,7 @@ fn poll_binding(
         if poll_stats {
             poll_kernel_stats(&binding.user, &binding.live);
         }
-        return;
+        return false;
     }
 
     let mut received = binding.rx.receive(available);
@@ -463,32 +536,35 @@ fn poll_binding(
     if poll_stats {
         poll_kernel_stats(&binding.user, &binding.live);
     }
+    true
 }
 
 fn record_exception(
-    recent_exceptions: &mut VecDeque<ExceptionStatus>,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     binding: &BindingIdentity,
     reason: &str,
     packet_length: u32,
     meta: Option<UserspaceDpMeta>,
 ) {
-    if recent_exceptions.len() >= MAX_RECENT_EXCEPTIONS {
-        recent_exceptions.pop_front();
+    if let Ok(mut recent) = recent_exceptions.lock() {
+        push_recent_exception(
+            &mut recent,
+            ExceptionStatus {
+                timestamp: Utc::now(),
+                slot: binding.slot,
+                queue_id: binding.queue_id,
+                worker_id: binding.worker_id,
+                interface: binding.interface.clone(),
+                ifindex: binding.ifindex,
+                reason: reason.to_string(),
+                packet_length,
+                addr_family: meta.map(|m| m.addr_family).unwrap_or(0),
+                protocol: meta.map(|m| m.protocol).unwrap_or(0),
+                config_generation: meta.map(|m| m.config_generation).unwrap_or(0),
+                fib_generation: meta.map(|m| m.fib_generation).unwrap_or(0),
+            },
+        );
     }
-    recent_exceptions.push_back(ExceptionStatus {
-        timestamp: Utc::now(),
-        slot: binding.slot,
-        queue_id: binding.queue_id,
-        worker_id: binding.worker_id,
-        interface: binding.interface.clone(),
-        ifindex: binding.ifindex,
-        reason: reason.to_string(),
-        packet_length,
-        addr_family: meta.map(|m| m.addr_family).unwrap_or(0),
-        protocol: meta.map(|m| m.protocol).unwrap_or(0),
-        config_generation: meta.map(|m| m.config_generation).unwrap_or(0),
-        fib_generation: meta.map(|m| m.fib_generation).unwrap_or(0),
-    });
 }
 
 fn record_disposition(
@@ -497,7 +573,7 @@ fn record_disposition(
     disposition: PacketDisposition,
     packet_length: u32,
     meta: Option<UserspaceDpMeta>,
-    recent_exceptions: &mut VecDeque<ExceptionStatus>,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
     match disposition {
         PacketDisposition::Valid => {
@@ -548,6 +624,75 @@ fn record_disposition(
                 meta,
             );
         }
+    }
+}
+
+fn worker_loop(
+    worker_id: u32,
+    binding_plans: Vec<BindingPlan>,
+    validation: ValidationState,
+    recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    stop: Arc<AtomicBool>,
+    heartbeat: Arc<AtomicI64>,
+) {
+    pin_current_thread(worker_id);
+    let mut bindings = Vec::with_capacity(binding_plans.len());
+    for plan in binding_plans {
+        match BindingWorker::create(
+            &plan.status,
+            plan.ring_entries,
+            plan.xsk_map_fd,
+            plan.live.clone(),
+        ) {
+            Ok(binding) => bindings.push(binding),
+            Err(err) => plan.live.set_error(err.to_string()),
+        }
+    }
+    let mut last_stats_poll = Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        heartbeat.store(now_nanos(), Ordering::Relaxed);
+        let poll_stats = last_stats_poll.elapsed() >= STATS_POLL_INTERVAL;
+        let mut did_work = false;
+        for binding in bindings.iter_mut() {
+            if poll_binding(binding, validation, &recent_exceptions, poll_stats) {
+                did_work = true;
+            }
+        }
+        if poll_stats {
+            last_stats_poll = Instant::now();
+        }
+        if !did_work {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    heartbeat.store(now_nanos(), Ordering::Relaxed);
+}
+
+fn push_recent_exception(
+    recent_exceptions: &mut VecDeque<ExceptionStatus>,
+    exception: ExceptionStatus,
+) {
+    if recent_exceptions.len() >= MAX_RECENT_EXCEPTIONS {
+        recent_exceptions.pop_front();
+    }
+    recent_exceptions.push_back(exception);
+}
+
+fn now_nanos() -> i64 {
+    Utc::now().timestamp_nanos_opt().unwrap_or(0)
+}
+
+fn pin_current_thread(worker_id: u32) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let cpus = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let cpu = (worker_id as usize) % cpus.max(1);
+        let mut set: libc::cpu_set_t = core::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        let _ = libc::sched_setaffinity(0, core::mem::size_of::<libc::cpu_set_t>(), &set);
     }
 }
 
