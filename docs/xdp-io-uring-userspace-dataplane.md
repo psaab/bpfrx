@@ -146,22 +146,24 @@ Recommended language split:
 Go is still fine for orchestration, snapshots, HA control, APIs, and service management.
 It is not the language I would choose for the steady-state AF_XDP worker loop.
 
-### What should not move to Rust first
+### Rust boundary in the current plan
 
-Do not force the first-stage XDP program itself into Rust as the first migration step.
+For the userspace dataplane path, the XDP handoff program should live in Rust too.
 
 Reason:
 
-- bpfrx already has a working C/libbpf/bpf2go BPF toolchain
-- the XDP ingress shim should stay tiny and stable
-- adding Aya/libbpf-rs or a parallel Rust-BPF toolchain just to replace that shim
-  would add build and verifier complexity without moving the real performance boundary
+- the handoff ABI and AF_XDP queue model are owned by the Rust userspace dataplane
+- keeping the userspace entry path in the same language makes metadata evolution,
+  queue handoff, and future userspace-owned parsing easier to reason about
+- the existing C/libbpf/bpf2go pipeline is still useful for the main firewall path
+  and as the guarded fallback while the Rust dataplane matures
 
-So the current plan should be:
+So the current plan is:
 
-- keep the tiny XDP handoff program in the existing BPF toolchain
-- move the separate native dataplane process and worker runtime to Rust
-- revisit Rust-authored BPF only if there is a strong later reason to unify toolchains
+- keep the main firewall XDP/TC pipeline in the existing C/libbpf/bpf2go toolchain
+- move the userspace-specific XDP entry and the separate dataplane process to Rust
+- use a narrow fallback boundary from the Rust XDP entry into `xdp_main` until
+  the Rust dataplane owns live forwarding end-to-end
 
 ### Support Envelope
 
@@ -716,7 +718,7 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
 
 - `system dataplane-type userspace` is implemented
 - `bpfrxd` can launch a separate Rust helper process
-- a dedicated `xdp_userspace` entry program exists and can hand off to an `XSKMAP`
+- a dedicated Rust `xdp_userspace` entry program exists and can hand off to an `XSKMAP`
 - pinned control maps exist for userspace enablement, binding state, and AF_XDP sockets
 - the Rust helper can:
   - plan per-interface/per-queue bindings
@@ -764,10 +766,12 @@ Status: partially implemented.
 
 Current `xdp_userspace` behavior:
 - parse
-- cheap ingress filter/screen decision
 - metadata stamp
 - gated XSK redirect if a binding is marked ready
-- safe fallback into the existing XDP pipeline otherwise
+- safe fallback tail call into `xdp_main` otherwise
+
+That means the userspace-specific XDP boundary is now Rust-owned, while the
+existing C pipeline remains the fallback and the non-userspace dataplane.
 
 The remaining missing part is actual production redirection enablement backed by a
 real userspace forwarding path.

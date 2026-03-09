@@ -17,7 +17,7 @@ const linkPinPath = "/sys/fs/bpf/bpfrx/links"
 // These produce the *_bpfel.go files with embedded ELF objects.
 //
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpMain ../../bpf/xdp/xdp_main.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpUserspace ../../bpf/xdp/xdp_userspace.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
+//go:generate bash build-userspace-xdp.sh
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpScreen ../../bpf/xdp/xdp_screen.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpZone ../../bpf/xdp/xdp_zone.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpConntrack ../../bpf/xdp/xdp_conntrack.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
@@ -313,6 +313,11 @@ func (m *Manager) GetPersistentNAT() *PersistentNATTable {
 // Map returns a named eBPF map, or nil if not found.
 func (m *Manager) Map(name string) *ebpf.Map {
 	return m.maps[name]
+}
+
+// Program returns a named eBPF program, or nil if not found.
+func (m *Manager) Program(name string) *ebpf.Program {
+	return m.programs[name]
 }
 
 // NewEventSource creates an EventSource that reads from the eBPF events ring buffer.

@@ -190,25 +190,60 @@ func (m *Manager) loadAllObjects() error {
 		},
 	}
 
-	// Load userspace XDP entry program. It shares the normal pipeline maps,
-	// but owns its AF_XDP/XSK control maps.
-	var userspaceObjs bpfrxXdpUserspaceObjects
-	if err := loadBpfrxXdpUserspaceObjects(&userspaceObjs, replaceOpts); err != nil {
-		return fmt.Errorf("load xdp_userspace: %w", err)
+	// Load the Rust userspace XDP entry program. It owns only the AF_XDP
+	// control maps and a fallback prog-array that jumps into xdp_main.
+	userspaceSpec, err := loadRustUserspaceXDP()
+	if err != nil {
+		return fmt.Errorf("load Rust xdp_userspace spec: %w", err)
 	}
-	if err := pinUserspaceMap(userspaceObjs.UserspaceCtrl, UserspaceCtrlPinPath()); err != nil {
+	for _, name := range []string{
+		"userspace_ctrl",
+		"userspace_bindings",
+		"userspace_xsk_map",
+		"userspace_fallback_progs",
+	} {
+		if ms, ok := userspaceSpec.Maps[name]; ok {
+			ms.Pinning = ebpf.PinByName
+		}
+	}
+	userspaceCollection, err := ebpf.NewCollectionWithOptions(userspaceSpec, *opts)
+	if err != nil {
+		return fmt.Errorf("load Rust xdp_userspace collection: %w", err)
+	}
+	userspaceProg, ok := userspaceCollection.Programs["xdp_userspace_prog"]
+	if !ok {
+		return fmt.Errorf("Rust xdp_userspace_prog not found")
+	}
+	userspaceCtrl, ok := userspaceCollection.Maps["userspace_ctrl"]
+	if !ok {
+		return fmt.Errorf("Rust userspace_ctrl map not found")
+	}
+	userspaceBindings, ok := userspaceCollection.Maps["userspace_bindings"]
+	if !ok {
+		return fmt.Errorf("Rust userspace_bindings map not found")
+	}
+	userspaceXSK, ok := userspaceCollection.Maps["userspace_xsk_map"]
+	if !ok {
+		return fmt.Errorf("Rust userspace_xsk_map not found")
+	}
+	userspaceFallback, ok := userspaceCollection.Maps["userspace_fallback_progs"]
+	if !ok {
+		return fmt.Errorf("Rust userspace_fallback_progs map not found")
+	}
+	if err := pinUserspaceMap(userspaceCtrl, UserspaceCtrlPinPath()); err != nil {
 		return fmt.Errorf("pin userspace_ctrl: %w", err)
 	}
-	if err := pinUserspaceMap(userspaceObjs.UserspaceBindings, UserspaceBindingsPinPath()); err != nil {
+	if err := pinUserspaceMap(userspaceBindings, UserspaceBindingsPinPath()); err != nil {
 		return fmt.Errorf("pin userspace_bindings: %w", err)
 	}
-	if err := pinUserspaceMap(userspaceObjs.UserspaceXskMap, UserspaceXSKMapPinPath()); err != nil {
+	if err := pinUserspaceMap(userspaceXSK, UserspaceXSKMapPinPath()); err != nil {
 		return fmt.Errorf("pin userspace_xsk_map: %w", err)
 	}
-	m.programs["xdp_userspace_prog"] = userspaceObjs.XdpUserspaceProg
-	m.maps["userspace_ctrl"] = userspaceObjs.UserspaceCtrl
-	m.maps["userspace_bindings"] = userspaceObjs.UserspaceBindings
-	m.maps["userspace_xsk_map"] = userspaceObjs.UserspaceXskMap
+	m.programs["xdp_userspace_prog"] = userspaceProg
+	m.maps["userspace_ctrl"] = userspaceCtrl
+	m.maps["userspace_bindings"] = userspaceBindings
+	m.maps["userspace_xsk_map"] = userspaceXSK
+	m.maps["userspace_fallback_progs"] = userspaceFallback
 
 	// Extended replacements for xdp_policy which also includes NAT pool maps.
 	policyReplaceOpts := &ebpf.CollectionOptions{

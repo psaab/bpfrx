@@ -569,6 +569,14 @@ func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
 	if bindingsMap == nil {
 		return errors.New("userspace_bindings map not loaded")
 	}
+	fallbackMap := m.inner.Map("userspace_fallback_progs")
+	if fallbackMap == nil {
+		return errors.New("userspace_fallback_progs map not loaded")
+	}
+	fallbackProg := m.inner.Program("xdp_main_prog")
+	if fallbackProg == nil {
+		return errors.New("xdp_main_prog not loaded")
+	}
 
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
@@ -582,6 +590,10 @@ func (m *Manager) programBootstrapMapsLocked(cfg config.UserspaceConfig) error {
 	}
 	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update userspace_ctrl: %w", err)
+	}
+	fallbackFD := uint32(fallbackProg.FD())
+	if err := fallbackMap.Update(zero, fallbackFD, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update userspace_fallback_progs: %w", err)
 	}
 
 	var key userspaceBindingKey
