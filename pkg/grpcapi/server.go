@@ -110,6 +110,20 @@ func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
 	return provider.Status()
 }
 
+func (s *Server) userspaceDataplaneControl() (interface {
+	Status() (dpuserspace.ProcessStatus, error)
+	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
+}, error) {
+	provider, ok := s.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+		InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("userspace dataplane control unavailable")
+	}
+	return provider, nil
+}
+
 // NewServer creates a new gRPC server.
 // NOTE: gRPC is local-only (127.0.0.1) so all RPCs are inherently trusted.
 // Login class RBAC enforcement could be added here via per-RPC interceptors if
@@ -8109,6 +8123,55 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 			return &pb.SystemActionResponse{
 				Message: fmt.Sprintf("Manual failover triggered for redundancy group %d", rgID),
 			}, nil
+		}
+		if strings.HasPrefix(req.Action, "userspace-inject:") {
+			provider, err := s.userspaceDataplaneControl()
+			if err != nil {
+				return nil, status.Error(codes.Unavailable, err.Error())
+			}
+			rest := strings.TrimPrefix(req.Action, "userspace-inject:")
+			parts := strings.SplitN(rest, ":", 2)
+			if len(parts) != 2 {
+				return nil, status.Error(codes.InvalidArgument, "usage: userspace-inject:<slot>:<mode>")
+			}
+			slot, err := strconv.Atoi(parts[0])
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid userspace slot: %s", parts[0])
+			}
+			mode := parts[1]
+			statusNow, err := provider.Status()
+			if err != nil {
+				return nil, status.Errorf(codes.Unavailable, "userspace status: %v", err)
+			}
+			injectReq := dpuserspace.InjectPacketRequest{
+				Slot:             uint32(slot),
+				PacketLength:     128,
+				AddrFamily:       uint8(syscall.AF_INET),
+				Protocol:         6,
+				ConfigGeneration: statusNow.LastSnapshotGeneration,
+				FIBGeneration:    statusNow.LastFIBGeneration,
+				MetadataValid:    true,
+			}
+			switch mode {
+			case "valid":
+			case "fib-mismatch":
+				injectReq.FIBGeneration++
+			case "metadata-parse-error":
+				injectReq.MetadataValid = false
+				injectReq.PacketLength = 96
+				injectReq.AddrFamily = 0
+				injectReq.Protocol = 0
+				injectReq.ConfigGeneration = 0
+				injectReq.FIBGeneration = 0
+			default:
+				return nil, status.Errorf(codes.InvalidArgument, "unknown userspace inject mode: %s", mode)
+			}
+			statusAfter, err := provider.InjectPacket(injectReq)
+			if err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "userspace inject: %v", err)
+			}
+			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			return &pb.SystemActionResponse{Message: msg}, nil
 		}
 		return nil, status.Errorf(codes.InvalidArgument, "unknown action: %s", req.Action)
 	}
