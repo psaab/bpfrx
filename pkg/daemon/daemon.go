@@ -5072,7 +5072,7 @@ func (d *Daemon) snapshotRethMasterState() map[int]bool {
 	defer d.rgStatesMu.RUnlock()
 	out := make(map[int]bool, len(d.rgStates))
 	for rgID, s := range d.rgStates {
-		out[rgID] = s.AllVRRPMaster()
+		out[rgID] = s.IsActive()
 	}
 	return out
 }
@@ -5163,6 +5163,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// start per-RG services on primary transition.
 				if noRethVRRP {
 					d.directAddVIPs(ev.GroupID)
+					d.addStableRethLinkLocal(ev.GroupID)
 					go d.directSendGARPs(ev.GroupID)
 					d.applyRethServicesForRG(ev.GroupID)
 					go func() {
@@ -5192,6 +5193,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// on secondary transition.
 				if noRethVRRP && tr.Changed && !tr.Active {
 					d.directRemoveVIPs(ev.GroupID)
+					d.removeStableRethLinkLocal(ev.GroupID)
 					d.clearRethServicesForRG(ev.GroupID)
 				}
 			}
@@ -5323,6 +5325,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 				// VRRP instances in the RG are MASTER (#132).
 				if tr.Changed && tr.Active {
 					d.removeBlackholeRoutes(rgID)
+					d.addStableRethLinkLocal(rgID)
 					d.applyRethServicesForRG(rgID)
 				}
 			}
@@ -5344,6 +5347,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 						d.dp.BumpFIBGeneration()
 						go d.RefreshFabricFwd()
 					}
+					d.removeStableRethLinkLocal(rgID)
 					d.clearRethServicesForRG(rgID)
 				}
 			}
@@ -5582,8 +5586,10 @@ func (d *Daemon) reconcileRGState() {
 		// every reconcile tick (RA/DHCP apply restarts daemons).
 		if tr.Changed {
 			if tr.Active {
+				d.addStableRethLinkLocal(rgID)
 				d.applyRethServicesForRG(rgID)
 			} else {
+				d.removeStableRethLinkLocal(rgID)
 				d.clearRethServicesForRG(rgID)
 			}
 		}
@@ -6193,6 +6199,124 @@ func (d *Daemon) directRemoveVIPs(rgID int) {
 	}
 }
 
+// addStableRethLinkLocal adds the stable router link-local address to all
+// RETH interfaces for the given RG. This address is shared across cluster
+// nodes (no nodeID component) so hosts see the same IPv6 router identity
+// regardless of which node is primary. Managed like a VIP: only present
+// on the MASTER node.
+func (d *Daemon) addStableRethLinkLocal(rgID int) {
+	if d.store == nil {
+		return
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return
+	}
+	clusterID := cfg.Chassis.Cluster.ClusterID
+	stableLL := cluster.StableRethLinkLocal(clusterID, rgID)
+	rethToPhys := cfg.RethToPhysical()
+
+	for ifName, ifc := range cfg.Interfaces.Interfaces {
+		if ifc.RedundancyGroup != rgID {
+			continue
+		}
+		if !strings.HasPrefix(ifName, "reth") {
+			continue
+		}
+		physName := ifc.Name
+		if phys, ok := rethToPhys[ifc.Name]; ok {
+			physName = phys
+		}
+		linuxName := config.LinuxIfName(physName)
+		addStableLLToInterface(linuxName, stableLL)
+		for unitNum := range ifc.Units {
+			if unitNum > 0 && rethUnitHasIPv6(ifc, unitNum) {
+				unit := ifc.Units[unitNum]
+				subIface := linuxName
+				if unit.VlanID > 0 {
+					subIface = fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
+				}
+				addStableLLToInterface(subIface, stableLL)
+			}
+		}
+	}
+}
+
+func addStableLLToInterface(ifName string, ll net.IP) {
+	link, err := netlink.LinkByName(ifName)
+	if err != nil {
+		return
+	}
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: ll, Mask: net.CIDRMask(128, 128)},
+		Flags: unix.IFA_F_NODAD,
+	}
+	if err := netlink.AddrAdd(link, addr); err != nil {
+		if !errors.Is(err, syscall.EEXIST) {
+			slog.Warn("failed to add stable link-local", "iface", ifName, "addr", ll, "err", err)
+		}
+	} else {
+		slog.Info("added stable router link-local", "iface", ifName, "addr", ll)
+	}
+}
+
+// removeStableRethLinkLocal removes the stable router link-local address
+// from all RETH interfaces for the given RG. Called on BACKUP transition.
+func (d *Daemon) removeStableRethLinkLocal(rgID int) {
+	if d.store == nil {
+		return
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return
+	}
+	clusterID := cfg.Chassis.Cluster.ClusterID
+	stableLL := cluster.StableRethLinkLocal(clusterID, rgID)
+	rethToPhys := cfg.RethToPhysical()
+
+	for ifName, ifc := range cfg.Interfaces.Interfaces {
+		if ifc.RedundancyGroup != rgID {
+			continue
+		}
+		if !strings.HasPrefix(ifName, "reth") {
+			continue
+		}
+		physName := ifc.Name
+		if phys, ok := rethToPhys[ifc.Name]; ok {
+			physName = phys
+		}
+		linuxName := config.LinuxIfName(physName)
+		removeStableLLFromInterface(linuxName, stableLL)
+		for unitNum := range ifc.Units {
+			if unitNum > 0 {
+				unit := ifc.Units[unitNum]
+				subIface := linuxName
+				if unit.VlanID > 0 {
+					subIface = fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
+				}
+				removeStableLLFromInterface(subIface, stableLL)
+			}
+		}
+	}
+}
+
+func removeStableLLFromInterface(ifName string, ll net.IP) {
+	link, err := netlink.LinkByName(ifName)
+	if err != nil {
+		return
+	}
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: ll, Mask: net.CIDRMask(128, 128)},
+	}
+	if err := netlink.AddrDel(link, addr); err != nil {
+		if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ESRCH) {
+			slog.Warn("failed to remove stable link-local", "iface", ifName, "addr", ll, "err", err)
+		}
+	} else {
+		slog.Info("removed stable router link-local", "iface", ifName, "addr", ll)
+	}
+}
+
 // directSendGARPs sends gratuitous ARP/IPv6 NA bursts for all VIPs in the
 // given RG. Reads per-RG GratuitousARPCount (default 3).
 func (d *Daemon) directSendGARPs(rgID int) {
@@ -6234,6 +6358,46 @@ func (d *Daemon) directSendGARPs(rgID int) {
 			} else {
 				if err := cluster.SendGratuitousIPv6Burst(ifName, ip, garpCount); err != nil {
 					slog.Warn("directSendGARPs: IPv6 NA failed", "iface", ifName, "ip", ip, "err", err)
+				}
+			}
+		}
+	}
+
+	// Send NA burst for stable router link-local so hosts update neighbor
+	// cache for the router identity (not just VIPs). Send on base interface
+	// AND all VLAN sub-interfaces since each VLAN is a separate L2 domain.
+	if cfg.Chassis.Cluster != nil {
+		stableLL := cluster.StableRethLinkLocal(cfg.Chassis.Cluster.ClusterID, rgID)
+		rethToPhys := cfg.RethToPhysical()
+		seen := make(map[string]bool)
+		for ifName, ifc := range cfg.Interfaces.Interfaces {
+			if ifc.RedundancyGroup != rgID || !strings.HasPrefix(ifName, "reth") {
+				continue
+			}
+			physName := ifc.Name
+			if phys, ok := rethToPhys[ifc.Name]; ok {
+				physName = phys
+			}
+			linuxName := config.LinuxIfName(physName)
+			// Send on base interface.
+			if !seen[linuxName] {
+				seen[linuxName] = true
+				if err := cluster.SendGratuitousIPv6Burst(linuxName, stableLL, garpCount); err != nil {
+					slog.Warn("directSendGARPs: stable link-local NA failed",
+						"iface", linuxName, "ip", stableLL, "err", err)
+				}
+			}
+			// Send on each VLAN sub-interface.
+			for _, unit := range ifc.Units {
+				if unit.VlanID > 0 {
+					subIface := fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
+					if !seen[subIface] {
+						seen[subIface] = true
+						if err := cluster.SendGratuitousIPv6Burst(subIface, stableLL, garpCount); err != nil {
+							slog.Warn("directSendGARPs: stable link-local NA failed",
+								"iface", subIface, "ip", stableLL, "err", err)
+						}
+					}
 				}
 			}
 		}

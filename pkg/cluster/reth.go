@@ -113,6 +113,17 @@ func RethMAC(clusterID, rgID, nodeID int) net.HardwareAddr {
 	return net.HardwareAddr{0x02, 0xbf, 0x72, byte(clusterID), byte(rgID), byte(nodeID)}
 }
 
+// StableRethLinkLocal returns a deterministic link-local IPv6 address shared
+// by both cluster nodes for the same RETH interface. Used as the RA source
+// address so hosts see a stable IPv6 router identity across failover.
+// Format: fe80::bf:72:CC:RR (clusterID, rgID — no nodeID component).
+// This address sorts lower than EUI-64 link-locals derived from per-node
+// RethMAC, so ndp.Listen and resolveIPv6LinkLocal will prefer it.
+func StableRethLinkLocal(clusterID, rgID int) net.IP {
+	return net.IP{0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+		0, 0, 0xbf, 0x72, 0, byte(clusterID), 0, byte(rgID)}
+}
+
 // IsVirtualRethMAC returns true if the MAC matches the virtual RETH pattern (02:bf:72:...).
 func IsVirtualRethMAC(mac net.HardwareAddr) bool {
 	return len(mac) == 6 && mac[0] == 0x02 && mac[1] == 0xbf && mac[2] == 0x72
