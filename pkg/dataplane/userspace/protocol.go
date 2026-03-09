@@ -196,4 +196,5 @@ type InjectPacketRequest struct {
 	ConfigGeneration uint64 `json:"config_generation,omitempty"`
 	FIBGeneration    uint32 `json:"fib_generation,omitempty"`
 	MetadataValid    bool   `json:"metadata_valid"`
+	DestinationIP    string `json:"destination_ip,omitempty"`
 }

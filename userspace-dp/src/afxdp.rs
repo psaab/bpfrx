@@ -56,6 +56,7 @@ pub struct Coordinator {
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
+    forwarding: ForwardingState,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     validation: ValidationState,
     last_planned_workers: usize,
@@ -71,6 +72,7 @@ impl Coordinator {
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
+            forwarding: ForwardingState::default(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
             validation: ValidationState::default(),
             last_planned_workers: 0,
@@ -98,6 +100,7 @@ impl Coordinator {
         self.identities.clear();
         self.live.clear();
         self.map_fd = None;
+        self.forwarding = ForwardingState::default();
         if let Ok(mut recent) = self.recent_exceptions.lock() {
             recent.clear();
         }
@@ -152,7 +155,8 @@ impl Coordinator {
             config_generation: snapshot.generation,
             fib_generation: snapshot.fib_generation,
         };
-        let forwarding = Arc::new(build_forwarding_state(snapshot));
+        self.forwarding = build_forwarding_state(snapshot);
+        let forwarding = Arc::new(self.forwarding.clone());
         if snapshot.map_pins.xsk.is_empty() {
             self.last_reconcile_stage = "missing_xsk_pin".to_string();
             for binding in bindings.iter_mut() {
@@ -347,14 +351,35 @@ impl Coordinator {
                 ..UserspaceDpMeta::default()
             };
             live.metadata_packets.fetch_add(1, Ordering::Relaxed);
+            let disposition = classify_metadata(meta, self.validation);
             record_disposition(
                 &ident,
                 live,
-                classify_metadata(meta, self.validation),
+                disposition,
                 packet_length,
                 Some(meta),
                 &self.recent_exceptions,
             );
+            if disposition == PacketDisposition::Valid && !req.destination_ip.is_empty() {
+                if let Ok(dst) = req.destination_ip.parse::<IpAddr>() {
+                    record_forwarding_disposition(
+                        &ident,
+                        live,
+                        lookup_forwarding_for_ip(&self.forwarding, dst),
+                        packet_length,
+                        Some(meta),
+                        &self.recent_exceptions,
+                    );
+                } else {
+                    record_exception(
+                        &self.recent_exceptions,
+                        &ident,
+                        "invalid_destination_ip",
+                        packet_length,
+                        Some(meta),
+                    );
+                }
+            }
             return Ok(());
         }
 

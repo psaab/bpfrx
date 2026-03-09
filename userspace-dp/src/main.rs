@@ -347,6 +347,8 @@ struct InjectPacketRequest {
     fib_generation: u32,
     #[serde(rename = "metadata_valid", default)]
     metadata_valid: bool,
+    #[serde(rename = "destination_ip", default)]
+    destination_ip: String,
 }
 
 #[derive(Debug)]
