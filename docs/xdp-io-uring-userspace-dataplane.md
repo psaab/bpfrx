@@ -710,12 +710,46 @@ This gives deterministic failure instead of undefined stale forwarding.
 
 ## What an Implementation Would Look Like in bpfrx
 
+### Current repo state
+
+As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-tree:
+
+- `system dataplane-type userspace` is implemented
+- `bpfrxd` can launch a separate Rust helper process
+- a dedicated `xdp_userspace` entry program exists and can hand off to an `XSKMAP`
+- pinned control maps exist for userspace enablement, binding state, and AF_XDP sockets
+- the Rust helper can:
+  - plan per-interface/per-queue bindings
+  - create UMEM and AF_XDP sockets
+  - register sockets into the pinned XSK map
+  - publish helper/binding status through the existing CLI/gRPC surfaces
+  - consume and validate stamped metadata
+  - track config/FIB generation mismatches
+  - record bounded recent exception summaries
+  - accept synthetic packet injection requests for safe validation on lab clusters
+- `bpfrxd` already publishes interface, address, neighbor, and static-route summaries
+  into the userspace snapshot contract
+
+What is still intentionally not implemented:
+
+- live packet redirect enablement for production traffic
+- AF_XDP TX / reinjection forwarding logic
+- worker-local session/NAT/policy state
+- shared-memory snapshot regions
+- io_uring-backed slow-path transport
+
+That means the backend is now a real bring-up target with a real native helper,
+not just a design sketch, but it is still a guarded bootstrap path rather than a
+forwarding dataplane.
+
 ## Phase 1: Add a new dataplane backend type
 
 Add a new backend type, likely:
 - `TypeAFXDPUring` or `TypeUser`
 
 Keep the existing `DataPlane` interface and implement a new backend alongside eBPF and DPDK.
+
+Status: implemented.
 
 ## Phase 2: Shrink XDP to a front-end classifier
 
@@ -725,6 +759,18 @@ Replace the full XDP tail-call chain on selected interfaces with:
 - HA guard
 - metadata stamp
 - XSK redirect
+
+Status: partially implemented.
+
+Current `xdp_userspace` behavior:
+- parse
+- cheap ingress filter/screen decision
+- metadata stamp
+- gated XSK redirect if a binding is marked ready
+- safe fallback into the existing XDP pipeline otherwise
+
+The remaining missing part is actual production redirection enablement backed by a
+real userspace forwarding path.
 
 ## Phase 3: Build a separate native userspace dataplane process
 
@@ -761,6 +807,21 @@ Recommended internal structure:
 
 Rust is the best default implementation language for this process.
 
+Status: partially implemented.
+
+Implemented today:
+- separate Rust helper process
+- Unix control socket
+- status/state publication
+- AF_XDP socket lifecycle/bootstrap
+- binding/queue planning
+- synthetic packet validation path
+
+Not implemented yet:
+- dedicated worker threads that own live forwarding
+- per-worker watchdog maps
+- real exception reinjection or TX path
+
 ## Phase 4: Move session/NAT/policy into worker-local tables
 
 Do not preserve the current "global map + GC sweep" design as-is.
@@ -768,6 +829,8 @@ For userspace, the right model is:
 - sharded tables
 - worker-local expiry wheels
 - batched aggregation to control plane
+
+Status: not implemented.
 
 ## Phase 5: Use io_uring for the non-AF_XDP parts
 
@@ -779,6 +842,8 @@ Once the packet fast path is correct, add io_uring to:
 - helper socket polling
 
 That is the order that makes architectural sense.
+
+Status: planned only.
 
 ## Performance Rules If This Must Be Extremely Fast
 
@@ -816,6 +881,14 @@ Required CLI / API surface:
 - `show dataplane xsk`
 - `show dataplane backpressure`
 - `show cluster shard-sync`
+
+Implemented now:
+
+- `show chassis cluster data-plane statistics`
+- `show chassis cluster data-plane interfaces`
+
+Those commands already surface userspace helper state, queue/binding layout, packet
+validation counters, and bounded recent exception summaries.
 
 Without that, bring-up and HA debugging will be mostly guesswork.
 
