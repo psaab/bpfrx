@@ -1786,9 +1786,14 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"dataplane-type": {args: 1, children: nil},
 		"dataplane": {children: map[string]*schemaNode{
-			"cores":      {args: 1, children: nil},
-			"memory":     {args: 1, children: nil},
-			"socket-mem": {args: 1, children: nil},
+			"cores":          {args: 1, children: nil},
+			"memory":         {args: 1, children: nil},
+			"socket-mem":     {args: 1, children: nil},
+			"binary":         {args: 1, children: nil},
+			"control-socket": {args: 1, children: nil},
+			"state-file":     {args: 1, children: nil},
+			"workers":        {args: 1, children: nil},
+			"ring-entries":   {args: 1, children: nil},
 			"rx-mode": {children: map[string]*schemaNode{
 				"idle-threshold":   {args: 1, children: nil},
 				"resume-threshold": {args: 1, children: nil},

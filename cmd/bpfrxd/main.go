@@ -13,6 +13,8 @@ import (
 
 	"github.com/psaab/bpfrx/pkg/daemon"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	_ "github.com/psaab/bpfrx/pkg/dataplane/dpdk"
+	_ "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"github.com/psaab/bpfrx/pkg/frr"
 )
 

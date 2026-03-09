@@ -17,6 +17,7 @@ const linkPinPath = "/sys/fs/bpf/bpfrx/links"
 // These produce the *_bpfel.go files with embedded ELF objects.
 //
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpMain ../../bpf/xdp/xdp_main.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpUserspace ../../bpf/xdp/xdp_userspace.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpScreen ../../bpf/xdp/xdp_screen.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpZone ../../bpf/xdp/xdp_zone.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpConntrack ../../bpf/xdp/xdp_conntrack.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
@@ -41,6 +42,7 @@ type Manager struct {
 	lastCompile   *CompileResult
 	PersistentNAT *PersistentNATTable
 	EnableCPUMap  bool // Enable cpumap multi-CPU distribution (adds startup overhead)
+	XDPEntryProg  string
 }
 
 // New creates a new dataplane Manager.
@@ -51,6 +53,7 @@ func New() *Manager {
 		xdpLinks:      make(map[int]link.Link),
 		tcLinks:       make(map[int]link.Link),
 		PersistentNAT: NewPersistentNATTable(),
+		XDPEntryProg:  "xdp_main_prog",
 	}
 }
 
@@ -84,9 +87,13 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 		return fmt.Errorf("eBPF programs not loaded")
 	}
 
-	prog, ok := m.programs["xdp_main_prog"]
+	entryProg := m.XDPEntryProg
+	if entryProg == "" {
+		entryProg = "xdp_main_prog"
+	}
+	prog, ok := m.programs[entryProg]
 	if !ok {
-		return fmt.Errorf("xdp_main_prog not found")
+		return fmt.Errorf("%s not found", entryProg)
 	}
 
 	if _, exists := m.xdpLinks[ifindex]; exists {

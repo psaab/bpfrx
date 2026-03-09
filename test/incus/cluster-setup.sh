@@ -55,6 +55,8 @@ LAN_HOST="${LAN_HOST:-cluster-lan-host}"
 PROFILE="${PROFILE:-bpfrx-cluster}"
 IMAGE_VM="${IMAGE_VM:-images:debian/13}"
 IMAGE_CT="${IMAGE_CT:-images:debian/13}"
+LAN_ADDR="${LAN_ADDR:-}"
+LAN_GW="${LAN_GW:-}"
 
 # SR-IOV: PCI passthrough for VM VFs, nictype=sriov for container VFs
 SRIOV_PARENT="${SRIOV_PARENT:-eno6np1}"
@@ -396,9 +398,12 @@ create_lan_host() {
 	info "Waiting for container to start..."
 	sleep 3
 
-	# Determine LAN IP config based on cluster config
+	# Determine LAN IP config; allow env override for isolated labs.
 	local lan_addr lan_gw
-	if [[ "$CLUSTER_CONF" == *"loss"* ]]; then
+	if [[ -n "${LAN_ADDR}" && -n "${LAN_GW}" ]]; then
+		lan_addr="${LAN_ADDR}"
+		lan_gw="${LAN_GW}"
+	elif [[ "$CLUSTER_CONF" == *"loss"* ]]; then
 		lan_addr="10.0.89.102/24"
 		lan_gw="10.0.89.1"
 	else
@@ -468,6 +473,12 @@ cmd_deploy() {
 
 	info "Building bpfrxd and cli..."
 	make -C "$PROJECT_ROOT" build build-ctl
+	if [[ -x "$HOME/.cargo/bin/cargo" || -n "$(command -v cargo 2>/dev/null)" ]]; then
+		info "Building bpfrx-userspace-dp helper..."
+		make -C "$PROJECT_ROOT" build-userspace-dp
+	else
+		warn "Rust toolchain not found; skipping bpfrx-userspace-dp build"
+	fi
 
 	case "$target" in
 		0)   deploy_vm 0 ;;
@@ -548,6 +559,13 @@ deploy_vm() {
 
 	info "Pushing cli to $vm..."
 	incus file push "$PROJECT_ROOT/cli" "${rinst}/usr/local/sbin/cli" --mode 0755
+
+	if [[ -f "$PROJECT_ROOT/bpfrx-userspace-dp" ]]; then
+		info "Pushing bpfrx-userspace-dp to $vm..."
+		incus file push "$PROJECT_ROOT/bpfrx-userspace-dp" "${rinst}/usr/local/sbin/bpfrx-userspace-dp" --mode 0755
+	else
+		warn "bpfrx-userspace-dp not found locally; helper not pushed to $vm"
+	fi
 
 	# Push the single unified HA config (same file for both nodes)
 	if [[ -f "$CLUSTER_CONF" ]]; then

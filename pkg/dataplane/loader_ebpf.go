@@ -146,22 +146,22 @@ func (m *Manager) loadAllObjects() error {
 			"sessions":           mainObjs.Sessions,
 			"global_counters":    mainObjs.GlobalCounters,
 			"tx_ports":           mainObjs.TxPorts,
-			"xdp_progs":         mainObjs.XdpProgs,
-			"tc_progs":          mainObjs.TcProgs,
+			"xdp_progs":          mainObjs.XdpProgs,
+			"tc_progs":           mainObjs.TcProgs,
 			"zone_pair_policies": mainObjs.ZonePairPolicies,
-			"policy_rules":      mainObjs.PolicyRules,
-			"address_book_v4":   mainObjs.AddressBookV4,
+			"policy_rules":       mainObjs.PolicyRules,
+			"address_book_v4":    mainObjs.AddressBookV4,
 			"address_membership": mainObjs.AddressMembership,
-			"applications":      mainObjs.Applications,
-			"policy_counters":   mainObjs.PolicyCounters,
-			"zone_counters":     mainObjs.ZoneCounters,
-			"events":            mainObjs.Events,
-			"dnat_table":        mainObjs.DnatTable,
-			"snat_rules":        mainObjs.SnatRules,
-			"sessions_v6":       mainObjs.SessionsV6,
-			"address_book_v6":   mainObjs.AddressBookV6,
-			"dnat_table_v6":     mainObjs.DnatTableV6,
-			"snat_rules_v6":     mainObjs.SnatRulesV6,
+			"applications":       mainObjs.Applications,
+			"policy_counters":    mainObjs.PolicyCounters,
+			"zone_counters":      mainObjs.ZoneCounters,
+			"events":             mainObjs.Events,
+			"dnat_table":         mainObjs.DnatTable,
+			"snat_rules":         mainObjs.SnatRules,
+			"sessions_v6":        mainObjs.SessionsV6,
+			"address_book_v6":    mainObjs.AddressBookV6,
+			"dnat_table_v6":      mainObjs.DnatTableV6,
+			"snat_rules_v6":      mainObjs.SnatRulesV6,
 			"session_v6_scratch": mainObjs.SessionV6Scratch,
 			"screen_configs":     mainObjs.ScreenConfigs,
 			"flood_counters":     mainObjs.FloodCounters,
@@ -189,6 +189,26 @@ func (m *Manager) loadAllObjects() error {
 			"session_count_dst":  mainObjs.SessionCountDst,
 		},
 	}
+
+	// Load userspace XDP entry program. It shares the normal pipeline maps,
+	// but owns its AF_XDP/XSK control maps.
+	var userspaceObjs bpfrxXdpUserspaceObjects
+	if err := loadBpfrxXdpUserspaceObjects(&userspaceObjs, replaceOpts); err != nil {
+		return fmt.Errorf("load xdp_userspace: %w", err)
+	}
+	if err := pinUserspaceMap(userspaceObjs.UserspaceCtrl, UserspaceCtrlPinPath()); err != nil {
+		return fmt.Errorf("pin userspace_ctrl: %w", err)
+	}
+	if err := pinUserspaceMap(userspaceObjs.UserspaceQueueReady, UserspaceQueueReadyPinPath()); err != nil {
+		return fmt.Errorf("pin userspace_queue_ready: %w", err)
+	}
+	if err := pinUserspaceMap(userspaceObjs.UserspaceXskMap, UserspaceXSKMapPinPath()); err != nil {
+		return fmt.Errorf("pin userspace_xsk_map: %w", err)
+	}
+	m.programs["xdp_userspace_prog"] = userspaceObjs.XdpUserspaceProg
+	m.maps["userspace_ctrl"] = userspaceObjs.UserspaceCtrl
+	m.maps["userspace_queue_ready"] = userspaceObjs.UserspaceQueueReady
+	m.maps["userspace_xsk_map"] = userspaceObjs.UserspaceXskMap
 
 	// Extended replacements for xdp_policy which also includes NAT pool maps.
 	policyReplaceOpts := &ebpf.CollectionOptions{
@@ -349,6 +369,17 @@ func (m *Manager) loadAllObjects() error {
 		}
 	}
 
+	return nil
+}
+
+func pinUserspaceMap(m *ebpf.Map, path string) error {
+	if m == nil {
+		return fmt.Errorf("nil map for %s", path)
+	}
+	_ = os.Remove(path)
+	if err := m.Pin(path); err != nil {
+		return err
+	}
 	return nil
 }
 

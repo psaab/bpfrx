@@ -146,6 +146,23 @@ Recommended language split:
 Go is still fine for orchestration, snapshots, HA control, APIs, and service management.
 It is not the language I would choose for the steady-state AF_XDP worker loop.
 
+### What should not move to Rust first
+
+Do not force the first-stage XDP program itself into Rust as the first migration step.
+
+Reason:
+
+- bpfrx already has a working C/libbpf/bpf2go BPF toolchain
+- the XDP ingress shim should stay tiny and stable
+- adding Aya/libbpf-rs or a parallel Rust-BPF toolchain just to replace that shim
+  would add build and verifier complexity without moving the real performance boundary
+
+So the current plan should be:
+
+- keep the tiny XDP handoff program in the existing BPF toolchain
+- move the separate native dataplane process and worker runtime to Rust
+- revisit Rust-authored BPF only if there is a strong later reason to unify toolchains
+
 ### Support Envelope
 
 This design only makes sense if the implementation is explicit about what it supports.
