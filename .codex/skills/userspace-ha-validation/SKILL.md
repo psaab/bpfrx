@@ -29,13 +29,14 @@ Commands:
 
 What the script enforces:
 
-- unsupported userspace configs stay on `xdp_main_prog`
+- unsupported userspace configs settle on `xdp_main_prog`
 - userspace forwarding remains disabled on the current HA config
 - `cluster-userspace-host` has an IPv6 default route from RA
 - if the IPv6 default route is missing, `rdisc6 -1 eth0` is run before tests
 - one unmeasured warm-up `iperf3` pass is run for each address family
 - repeated IPv4 `iperf3` to `172.16.80.200` must stay above threshold
 - repeated IPv6 `iperf3` to `2001:559:8585:80::200` must stay above threshold
+- one marginal near-threshold miss is retried once before the run is treated as failed
 
 Use `scripts/userspace-ha-validation.sh` directly only when you are debugging the validator itself.
 

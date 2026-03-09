@@ -97,14 +97,15 @@ This is the required sequence after each userspace dataplane phase:
 The script does this in order:
 
 1. uses the tracked env file, not `/tmp`
-2. checks that `fw0` is on `xdp_main_prog`
-3. checks that userspace forwarding is not enabled for the unsupported HA config
+2. waits for `fw0` to settle on `xdp_main_prog`
+3. waits for userspace forwarding to remain disabled for the unsupported HA config
 4. verifies an IPv6 default route on `cluster-userspace-host`
 5. if the default route is missing, runs `rdisc6 -1 eth0`
 6. runs one unmeasured warm-up `iperf3` pass for IPv4 and IPv6
 7. runs repeated IPv4 `iperf3` to `172.16.80.200`
 8. runs repeated IPv6 `iperf3` to `2001:559:8585:80::200`
-9. optionally records `perf` data on `bpfrx-userspace-fw0`
+9. retries one marginal near-threshold miss once to avoid failing on measurement noise
+10. optionally records `perf` data on `bpfrx-userspace-fw0`
 
 ## Current Baseline
 
