@@ -733,6 +733,8 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
   - accept synthetic packet injection requests for safe validation on lab clusters
 - `bpfrxd` already publishes interface, address, neighbor, and static-route summaries
   into the userspace snapshot contract
+- the Rust helper now has a bounded TUN-backed slow path for local-delivery and
+  selected exception traffic, with explicit rate limits and helper-visible status counters
 
 What is still intentionally not implemented:
 
@@ -740,7 +742,7 @@ What is still intentionally not implemented:
 - stateful or policy/NAT-aware userspace forwarding
 - worker-local session/NAT/policy state
 - shared-memory snapshot regions
-- io_uring-backed slow-path transport beyond helper state persistence
+- io_uring-backed slow-path transport beyond bounded TUN reinjection
 
 That means the backend is now a real bring-up target with a real native helper,
 not just a design sketch, but it is still a guarded bootstrap path rather than a
@@ -822,11 +824,11 @@ Implemented today:
 - AF_XDP socket lifecycle/bootstrap
 - binding/queue planning
 - narrow stateless live-forward path for supported routed traffic
+- bounded TUN slow-path reinjection for local-delivery and selected exception traffic
 - synthetic packet validation path
 
 Not implemented yet:
 - per-worker watchdog maps beyond the current binding heartbeat map
-- real exception reinjection / slow-path transport
 - live forwarding for HA, NAT, zones/policy, and stateful flows
 
 ## Phase 4: Move session/NAT/policy into worker-local tables
@@ -854,9 +856,9 @@ Status: partially implemented.
 
 Implemented today:
 - helper state persistence through `io_uring` with sync fallback
+- slow-path TUN reinjection through `io_uring` with sync fallback
 
 Not implemented yet:
-- io_uring slow-path reinjection
 - io_uring-backed session-sync / export transport
 
 ## Performance Rules If This Must Be Extremely Fast

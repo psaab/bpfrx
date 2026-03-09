@@ -134,6 +134,22 @@ type ProcessStatus struct {
 	Bindings               []BindingStatus       `json:"bindings,omitempty"`
 	RecentExceptions       []ExceptionStatus     `json:"recent_exceptions,omitempty"`
 	LastResolution         *PacketResolution     `json:"last_resolution,omitempty"`
+	SlowPath               SlowPathStatus        `json:"slow_path,omitempty"`
+}
+
+type SlowPathStatus struct {
+	Active             bool   `json:"active"`
+	DeviceName         string `json:"device_name,omitempty"`
+	Mode               string `json:"mode,omitempty"`
+	LastError          string `json:"last_error,omitempty"`
+	QueuedPackets      uint64 `json:"queued_packets,omitempty"`
+	InjectedPackets    uint64 `json:"injected_packets,omitempty"`
+	InjectedBytes      uint64 `json:"injected_bytes,omitempty"`
+	DroppedPackets     uint64 `json:"dropped_packets,omitempty"`
+	DroppedBytes       uint64 `json:"dropped_bytes,omitempty"`
+	RateLimitedPackets uint64 `json:"rate_limited_packets,omitempty"`
+	QueueFullPackets   uint64 `json:"queue_full_packets,omitempty"`
+	WriteErrors        uint64 `json:"write_errors,omitempty"`
 }
 
 type PacketResolution struct {
@@ -200,6 +216,10 @@ type BindingStatus struct {
 	ConfigGenMismatches  uint64    `json:"config_gen_mismatches,omitempty"`
 	FIBGenMismatches     uint64    `json:"fib_gen_mismatches,omitempty"`
 	UnsupportedPackets   uint64    `json:"unsupported_packets,omitempty"`
+	SlowPathPackets      uint64    `json:"slow_path_packets,omitempty"`
+	SlowPathBytes        uint64    `json:"slow_path_bytes,omitempty"`
+	SlowPathDrops        uint64    `json:"slow_path_drops,omitempty"`
+	SlowPathRateLimited  uint64    `json:"slow_path_rate_limited,omitempty"`
 	KernelRXDropped      uint64    `json:"kernel_rx_dropped,omitempty"`
 	KernelRXInvalidDescs uint64    `json:"kernel_rx_invalid_descs,omitempty"`
 	TXPackets            uint64    `json:"tx_packets,omitempty"`

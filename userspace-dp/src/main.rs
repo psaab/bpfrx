@@ -1,4 +1,5 @@
 mod afxdp;
+mod slowpath;
 mod state_writer;
 
 use chrono::{DateTime, Utc};
@@ -219,6 +220,8 @@ struct ProcessStatus {
     recent_exceptions: Vec<ExceptionStatus>,
     #[serde(rename = "last_resolution", skip_serializing_if = "Option::is_none")]
     last_resolution: Option<PacketResolution>,
+    #[serde(rename = "slow_path", default)]
+    slow_path: SlowPathStatus,
     #[serde(rename = "debug_worker_threads", default)]
     debug_worker_threads: usize,
     #[serde(rename = "debug_identity_slots", default)]
@@ -233,6 +236,53 @@ struct ProcessStatus {
     debug_reconcile_calls: u64,
     #[serde(rename = "debug_reconcile_stage", default)]
     debug_reconcile_stage: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct SlowPathStatus {
+    #[serde(default)]
+    active: bool,
+    #[serde(rename = "device_name", default)]
+    device_name: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(rename = "last_error", default)]
+    last_error: String,
+    #[serde(rename = "queued_packets", default)]
+    queued_packets: u64,
+    #[serde(rename = "injected_packets", default)]
+    injected_packets: u64,
+    #[serde(rename = "injected_bytes", default)]
+    injected_bytes: u64,
+    #[serde(rename = "dropped_packets", default)]
+    dropped_packets: u64,
+    #[serde(rename = "dropped_bytes", default)]
+    dropped_bytes: u64,
+    #[serde(rename = "rate_limited_packets", default)]
+    rate_limited_packets: u64,
+    #[serde(rename = "queue_full_packets", default)]
+    queue_full_packets: u64,
+    #[serde(rename = "write_errors", default)]
+    write_errors: u64,
+}
+
+impl From<slowpath::SlowPathStatus> for SlowPathStatus {
+    fn from(value: slowpath::SlowPathStatus) -> Self {
+        Self {
+            active: value.active,
+            device_name: value.device_name,
+            mode: value.mode,
+            last_error: value.last_error,
+            queued_packets: value.queued_packets,
+            injected_packets: value.injected_packets,
+            injected_bytes: value.injected_bytes,
+            dropped_packets: value.dropped_packets,
+            dropped_bytes: value.dropped_bytes,
+            rate_limited_packets: value.rate_limited_packets,
+            queue_full_packets: value.queue_full_packets,
+            write_errors: value.write_errors,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -359,6 +409,14 @@ struct BindingStatus {
     fib_gen_mismatches: u64,
     #[serde(rename = "unsupported_packets", default)]
     unsupported_packets: u64,
+    #[serde(rename = "slow_path_packets", default)]
+    slow_path_packets: u64,
+    #[serde(rename = "slow_path_bytes", default)]
+    slow_path_bytes: u64,
+    #[serde(rename = "slow_path_drops", default)]
+    slow_path_drops: u64,
+    #[serde(rename = "slow_path_rate_limited", default)]
+    slow_path_rate_limited: u64,
     #[serde(rename = "kernel_rx_dropped", default)]
     kernel_rx_dropped: u64,
     #[serde(rename = "kernel_rx_invalid_descs", default)]
@@ -490,6 +548,7 @@ fn run() -> Result<(), String> {
             bindings: Vec::new(),
             recent_exceptions: Vec::new(),
             last_resolution: None,
+            slow_path: SlowPathStatus::default(),
             debug_worker_threads: 0,
             debug_identity_slots: 0,
             debug_live_slots: 0,
@@ -796,6 +855,7 @@ fn refresh_status(state: &mut ServerState) {
     state.status.queues = summarize_queues(&state.status.bindings);
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
     state.status.last_resolution = state.afxdp.last_resolution();
+    state.status.slow_path = state.afxdp.slow_path_status().into();
 }
 
 fn forwarding_unsupported_error(cap: &UserspaceCapabilities) -> String {

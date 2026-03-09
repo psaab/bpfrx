@@ -2,6 +2,7 @@ use super::{
     BindingStatus, ConfigSnapshot, ExceptionStatus, InjectPacketRequest, InterfaceSnapshot,
     PacketResolution,
 };
+use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus};
 use chrono::Utc;
 use core::ffi::{c_int, c_void};
 use core::num::NonZeroU32;
@@ -31,6 +32,7 @@ const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
 const BIND_RETRY_ATTEMPTS: usize = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
+const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -62,6 +64,8 @@ struct UserspaceDpMeta {
 pub struct Coordinator {
     map_fd: Option<OwnedFd>,
     heartbeat_map_fd: Option<OwnedFd>,
+    slow_path: Option<Arc<SlowPathReinjector>>,
+    last_slow_path_status: SlowPathStatus,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
@@ -80,6 +84,8 @@ impl Coordinator {
         Self {
             map_fd: None,
             heartbeat_map_fd: None,
+            slow_path: None,
+            last_slow_path_status: SlowPathStatus::default(),
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
@@ -116,6 +122,12 @@ impl Coordinator {
         self.workers.clear();
         self.identities.clear();
         self.live.clear();
+        self.last_slow_path_status = self
+            .slow_path
+            .as_ref()
+            .map(|slow| slow.status())
+            .unwrap_or_default();
+        self.slow_path = None;
         self.map_fd = None;
         self.heartbeat_map_fd = None;
         self.forwarding = ForwardingState::default();
@@ -162,6 +174,10 @@ impl Coordinator {
             binding.config_gen_mismatches = 0;
             binding.fib_gen_mismatches = 0;
             binding.unsupported_packets = 0;
+            binding.slow_path_packets = 0;
+            binding.slow_path_bytes = 0;
+            binding.slow_path_drops = 0;
+            binding.slow_path_rate_limited = 0;
             binding.kernel_rx_dropped = 0;
             binding.kernel_rx_invalid_descs = 0;
             binding.last_error.clear();
@@ -177,6 +193,19 @@ impl Coordinator {
             fib_generation: snapshot.fib_generation,
         };
         self.forwarding = build_forwarding_state(snapshot);
+        self.slow_path = match SlowPathReinjector::new(DEFAULT_SLOW_PATH_TUN) {
+            Ok(reinjector) => {
+                self.last_slow_path_status = reinjector.status();
+                Some(Arc::new(reinjector))
+            }
+            Err(err) => {
+                self.last_slow_path_status = SlowPathStatus {
+                    last_error: err,
+                    ..SlowPathStatus::default()
+                };
+                None
+            }
+        };
         let forwarding = Arc::new(self.forwarding.clone());
         if snapshot.map_pins.xsk.is_empty() {
             self.last_reconcile_stage = "missing_xsk_pin".to_string();
@@ -271,6 +300,7 @@ impl Coordinator {
             let heartbeat = Arc::new(AtomicI64::new(now_nanos()));
             let recent_exceptions = self.recent_exceptions.clone();
             let last_resolution = self.last_resolution.clone();
+            let slow_path = self.slow_path.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
             let validation = self.validation;
@@ -283,6 +313,7 @@ impl Coordinator {
                         binding_plans,
                         validation,
                         forwarding,
+                        slow_path,
                         recent_exceptions,
                         last_resolution,
                         stop_clone,
@@ -344,6 +375,13 @@ impl Coordinator {
             .lock()
             .ok()
             .and_then(|last| last.clone())
+    }
+
+    pub fn slow_path_status(&self) -> SlowPathStatus {
+        self.slow_path
+            .as_ref()
+            .map(|slow| slow.status())
+            .unwrap_or_else(|| self.last_slow_path_status.clone())
     }
 
     pub fn worker_heartbeats(&self) -> Vec<chrono::DateTime<Utc>> {
@@ -515,6 +553,10 @@ impl Coordinator {
                 binding.config_gen_mismatches = snap.config_gen_mismatches;
                 binding.fib_gen_mismatches = snap.fib_gen_mismatches;
                 binding.unsupported_packets = snap.unsupported_packets;
+                binding.slow_path_packets = snap.slow_path_packets;
+                binding.slow_path_bytes = snap.slow_path_bytes;
+                binding.slow_path_drops = snap.slow_path_drops;
+                binding.slow_path_rate_limited = snap.slow_path_rate_limited;
                 binding.kernel_rx_dropped = snap.kernel_rx_dropped;
                 binding.kernel_rx_invalid_descs = snap.kernel_rx_invalid_descs;
                 binding.tx_packets = snap.tx_packets;
@@ -548,6 +590,10 @@ impl Coordinator {
                 binding.config_gen_mismatches = 0;
                 binding.fib_gen_mismatches = 0;
                 binding.unsupported_packets = 0;
+                binding.slow_path_packets = 0;
+                binding.slow_path_bytes = 0;
+                binding.slow_path_drops = 0;
+                binding.slow_path_rate_limited = 0;
                 binding.kernel_rx_dropped = 0;
                 binding.kernel_rx_invalid_descs = 0;
                 binding.tx_packets = 0;
@@ -836,6 +882,7 @@ fn poll_binding(
     bindings: &mut [BindingWorker],
     validation: ValidationState,
     forwarding: &ForwardingState,
+    slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
     poll_stats: bool,
@@ -904,6 +951,17 @@ fn poll_binding(
                         desc,
                         meta,
                         &resolution,
+                        recent_exceptions,
+                    );
+                } else {
+                    maybe_reinject_slow_path(
+                        &ident,
+                        &binding.live,
+                        slow_path,
+                        &binding.area,
+                        desc,
+                        meta,
+                        resolution,
                         recent_exceptions,
                     );
                 }
@@ -999,6 +1057,98 @@ fn forward_live_packet(
             Some(meta),
         );
     }
+}
+
+fn maybe_reinject_slow_path(
+    binding: &BindingIdentity,
+    live: &BindingLiveState,
+    slow_path: Option<&Arc<SlowPathReinjector>>,
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    resolution: ForwardingResolution,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+) {
+    if !matches!(
+        resolution.disposition,
+        ForwardingDisposition::LocalDelivery
+            | ForwardingDisposition::NoRoute
+            | ForwardingDisposition::MissingNeighbor
+            | ForwardingDisposition::NextTableUnsupported
+    ) {
+        return;
+    }
+    let Some(packet) = extract_l3_packet(area, desc, meta) else {
+        live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
+        record_exception(
+            recent_exceptions,
+            binding,
+            "slow_path_extract_failed",
+            desc.len as u32,
+            Some(meta),
+        );
+        return;
+    };
+    let packet_len = packet.len() as u64;
+    let Some(slow_path) = slow_path else {
+        live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
+        record_exception(
+            recent_exceptions,
+            binding,
+            "slow_path_unavailable",
+            desc.len as u32,
+            Some(meta),
+        );
+        return;
+    };
+    match slow_path.enqueue(packet) {
+        Ok(EnqueueOutcome::Accepted) => {
+            live.slow_path_packets.fetch_add(1, Ordering::Relaxed);
+            live.slow_path_bytes
+                .fetch_add(packet_len, Ordering::Relaxed);
+        }
+        Ok(EnqueueOutcome::RateLimited) => {
+            live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
+            live.slow_path_rate_limited.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "slow_path_rate_limited",
+                desc.len as u32,
+                Some(meta),
+            );
+        }
+        Ok(EnqueueOutcome::QueueFull) => {
+            live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "slow_path_queue_full",
+                desc.len as u32,
+                Some(meta),
+            );
+        }
+        Err(err) => {
+            live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
+            live.set_error(err);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "slow_path_enqueue_failed",
+                desc.len as u32,
+                Some(meta),
+            );
+        }
+    }
+}
+
+fn extract_l3_packet(area: &MmapArea, desc: XdpDesc, meta: UserspaceDpMeta) -> Option<Vec<u8>> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    let l3 = meta.l3_offset as usize;
+    if l3 >= frame.len() {
+        return None;
+    }
+    Some(frame[l3..].to_vec())
 }
 
 fn find_target_live(
@@ -1233,6 +1383,7 @@ fn worker_loop(
     binding_plans: Vec<BindingPlan>,
     validation: ValidationState,
     forwarding: Arc<ForwardingState>,
+    slow_path: Option<Arc<SlowPathReinjector>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: Arc<Mutex<Option<PacketResolution>>>,
     stop: Arc<AtomicBool>,
@@ -1263,6 +1414,7 @@ fn worker_loop(
                 &mut bindings,
                 validation,
                 &forwarding,
+                slow_path.as_ref(),
                 &recent_exceptions,
                 &last_resolution,
                 poll_stats,
@@ -2476,6 +2628,10 @@ struct BindingLiveState {
     config_gen_mismatches: AtomicU64,
     fib_gen_mismatches: AtomicU64,
     unsupported_packets: AtomicU64,
+    slow_path_packets: AtomicU64,
+    slow_path_bytes: AtomicU64,
+    slow_path_drops: AtomicU64,
+    slow_path_rate_limited: AtomicU64,
     kernel_rx_dropped: AtomicU64,
     kernel_rx_invalid_descs: AtomicU64,
     tx_packets: AtomicU64,
@@ -2510,6 +2666,10 @@ impl BindingLiveState {
             config_gen_mismatches: AtomicU64::new(0),
             fib_gen_mismatches: AtomicU64::new(0),
             unsupported_packets: AtomicU64::new(0),
+            slow_path_packets: AtomicU64::new(0),
+            slow_path_bytes: AtomicU64::new(0),
+            slow_path_drops: AtomicU64::new(0),
+            slow_path_rate_limited: AtomicU64::new(0),
             kernel_rx_dropped: AtomicU64::new(0),
             kernel_rx_invalid_descs: AtomicU64::new(0),
             tx_packets: AtomicU64::new(0),
@@ -2569,6 +2729,10 @@ impl BindingLiveState {
             config_gen_mismatches: self.config_gen_mismatches.load(Ordering::Relaxed),
             fib_gen_mismatches: self.fib_gen_mismatches.load(Ordering::Relaxed),
             unsupported_packets: self.unsupported_packets.load(Ordering::Relaxed),
+            slow_path_packets: self.slow_path_packets.load(Ordering::Relaxed),
+            slow_path_bytes: self.slow_path_bytes.load(Ordering::Relaxed),
+            slow_path_drops: self.slow_path_drops.load(Ordering::Relaxed),
+            slow_path_rate_limited: self.slow_path_rate_limited.load(Ordering::Relaxed),
             kernel_rx_dropped: self.kernel_rx_dropped.load(Ordering::Relaxed),
             kernel_rx_invalid_descs: self.kernel_rx_invalid_descs.load(Ordering::Relaxed),
             tx_packets: self.tx_packets.load(Ordering::Relaxed),
@@ -2623,6 +2787,10 @@ struct BindingLiveSnapshot {
     config_gen_mismatches: u64,
     fib_gen_mismatches: u64,
     unsupported_packets: u64,
+    slow_path_packets: u64,
+    slow_path_bytes: u64,
+    slow_path_drops: u64,
+    slow_path_rate_limited: u64,
     kernel_rx_dropped: u64,
     kernel_rx_invalid_descs: u64,
     tx_packets: u64,
