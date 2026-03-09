@@ -324,6 +324,12 @@ struct BindingStatus {
     kernel_rx_dropped: u64,
     #[serde(rename = "kernel_rx_invalid_descs", default)]
     kernel_rx_invalid_descs: u64,
+    #[serde(rename = "tx_packets", default)]
+    tx_packets: u64,
+    #[serde(rename = "tx_bytes", default)]
+    tx_bytes: u64,
+    #[serde(rename = "tx_errors", default)]
+    tx_errors: u64,
     #[serde(rename = "last_heartbeat", skip_serializing_if = "Option::is_none")]
     last_heartbeat: Option<DateTime<Utc>>,
     #[serde(rename = "last_error", default)]
@@ -374,6 +380,8 @@ struct InjectPacketRequest {
     metadata_valid: bool,
     #[serde(rename = "destination_ip", default)]
     destination_ip: String,
+    #[serde(rename = "emit_on_wire", default)]
+    emit_on_wire: bool,
 }
 
 #[derive(Debug)]

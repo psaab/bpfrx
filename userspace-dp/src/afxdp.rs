@@ -1,5 +1,6 @@
 use super::{
-    BindingStatus, ConfigSnapshot, ExceptionStatus, InjectPacketRequest, PacketResolution,
+    BindingStatus, ConfigSnapshot, ExceptionStatus, InjectPacketRequest, InterfaceSnapshot,
+    PacketResolution,
 };
 use chrono::Utc;
 use core::ffi::{c_int, c_void};
@@ -23,6 +24,7 @@ const USERSPACE_META_VERSION: u16 = 2;
 const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 64;
+const RESERVED_TX_FRAMES: u32 = 64;
 const STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
@@ -411,15 +413,55 @@ impl Coordinator {
             );
             if disposition == PacketDisposition::Valid && !req.destination_ip.is_empty() {
                 if let Ok(dst) = req.destination_ip.parse::<IpAddr>() {
+                    let resolution = lookup_forwarding_resolution(&self.forwarding, dst);
                     record_forwarding_disposition(
                         &ident,
                         live,
-                        lookup_forwarding_resolution(&self.forwarding, dst),
+                        resolution,
                         packet_length,
                         Some(meta),
                         &self.recent_exceptions,
                         &self.last_resolution,
                     );
+                    if req.emit_on_wire {
+                        let Some(egress) = self.forwarding.egress.get(&resolution.egress_ifindex) else {
+                            return Err(format!(
+                                "no egress interface metadata for ifindex {}",
+                                resolution.egress_ifindex
+                            ));
+                        };
+                        if resolution.disposition != ForwardingDisposition::ForwardCandidate {
+                            return Err(format!(
+                                "destination is not forwardable via userspace TX: {}",
+                                resolution.status().disposition
+                            ));
+                        }
+                        let target_slot = self
+                            .identities
+                            .values()
+                            .find(|candidate| {
+                                candidate.ifindex == egress.bind_ifindex
+                                    && candidate.queue_id == ident.queue_id
+                            })
+                            .or_else(|| {
+                                self.identities
+                                    .values()
+                                    .find(|candidate| candidate.ifindex == egress.bind_ifindex)
+                            })
+                            .map(|candidate| candidate.slot)
+                            .ok_or_else(|| {
+                                format!(
+                                    "no bound userspace slot for egress ifindex {}",
+                                    egress.bind_ifindex
+                                )
+                            })?;
+                        let target_live = self
+                            .live
+                            .get(&target_slot)
+                            .ok_or_else(|| format!("binding slot {} has no live state", target_slot))?;
+                        let frame = build_injected_packet(&req, dst, resolution, egress)?;
+                        target_live.enqueue_tx(TxRequest { bytes: frame })?;
+                    }
                 } else {
                     record_exception(
                         &self.recent_exceptions,
@@ -429,6 +471,8 @@ impl Coordinator {
                         Some(meta),
                     );
                 }
+            } else if req.emit_on_wire {
+                return Err("emit-on-wire requires destination-ip and valid metadata".to_string());
             }
             return Ok(());
         }
@@ -471,6 +515,9 @@ impl Coordinator {
                 binding.unsupported_packets = snap.unsupported_packets;
                 binding.kernel_rx_dropped = snap.kernel_rx_dropped;
                 binding.kernel_rx_invalid_descs = snap.kernel_rx_invalid_descs;
+                binding.tx_packets = snap.tx_packets;
+                binding.tx_bytes = snap.tx_bytes;
+                binding.tx_errors = snap.tx_errors;
                 binding.last_heartbeat = snap.last_heartbeat;
                 binding.last_error = snap.last_error;
                 binding.ready = binding.ready
@@ -502,6 +549,9 @@ impl Coordinator {
                 binding.unsupported_packets = 0;
                 binding.kernel_rx_dropped = 0;
                 binding.kernel_rx_invalid_descs = 0;
+                binding.tx_packets = 0;
+                binding.tx_bytes = 0;
+                binding.tx_errors = 0;
                 binding.last_heartbeat = None;
                 binding.last_error.clear();
                 binding.ready = false;
@@ -550,6 +600,7 @@ struct ForwardingState {
     routes_v6: Vec<RouteEntryV6>,
     neighbors: BTreeMap<(i32, IpAddr), NeighborEntry>,
     ifindex_to_name: BTreeMap<i32, String>,
+    egress: BTreeMap<i32, EgressInterface>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -586,6 +637,15 @@ struct RouteEntryV6 {
 #[derive(Clone, Copy, Debug)]
 struct NeighborEntry {
     mac: [u8; 6],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EgressInterface {
+    bind_ifindex: i32,
+    vlan_id: u16,
+    src_mac: [u8; 6],
+    primary_v4: Option<Ipv4Addr>,
+    primary_v6: Option<Ipv6Addr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -639,6 +699,8 @@ struct BindingWorker {
     user: User,
     device: xdpilone::DeviceQueue,
     rx: xdpilone::RingRx,
+    tx: xdpilone::RingTx,
+    free_tx_frames: VecDeque<u64>,
     heartbeat_map_fd: c_int,
     last_heartbeat_update: Instant,
 }
@@ -650,6 +712,11 @@ struct BindingIdentity {
     worker_id: u32,
     interface: String,
     ifindex: i32,
+}
+
+#[derive(Clone, Debug)]
+struct TxRequest {
+    bytes: Vec<u8>,
 }
 
 impl BindingWorker {
@@ -680,15 +747,23 @@ impl BindingWorker {
                 &sock,
                 &SocketConfig {
                     rx_size: NonZeroU32::new(ring_entries),
-                    tx_size: None,
+                    tx_size: NonZeroU32::new(ring_entries),
                     bind_flags: SocketConfig::XDP_BIND_NEED_WAKEUP,
                 },
             )
             .map_err(|e| format!("configure rx ring: {e}"))?;
         let rx = user.map_rx().map_err(|e| format!("map rx ring: {e}"))?;
+        let tx = user.map_tx().map_err(|e| format!("map tx ring: {e}"))?;
         umem.bind(&user)
             .map_err(|e| format!("bind AF_XDP socket: {e}"))?;
-        prime_fill_ring(&umem, &mut device)?;
+        let reserved_tx = RESERVED_TX_FRAMES.min(ring_entries.saturating_sub(1)).max(1);
+        prime_fill_ring(&umem, &mut device, reserved_tx)?;
+        let mut free_tx_frames = VecDeque::with_capacity(reserved_tx as usize);
+        for idx in 0..reserved_tx {
+            if let Some(frame) = umem.frame(BufIdx(idx)) {
+                free_tx_frames.push_back(frame.offset);
+            }
+        }
 
         live.set_bound(user.as_raw_fd());
         if let Err(err) = register_xsk_slot(xsk_map_fd, binding.slot, user.as_raw_fd()) {
@@ -712,6 +787,8 @@ impl BindingWorker {
             user,
             device,
             rx,
+            tx,
+            free_tx_frames,
             heartbeat_map_fd,
             last_heartbeat_update: Instant::now(),
         })
@@ -738,6 +815,8 @@ fn poll_binding(
 ) -> bool {
     let ident = binding.identity();
     maybe_touch_heartbeat(binding);
+    reap_tx_completions(binding);
+    drain_pending_tx(binding);
     if binding.device.needs_wakeup() {
         binding.device.wake();
         binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -818,6 +897,64 @@ fn poll_binding(
         poll_kernel_stats(&binding.user, &binding.live);
     }
     true
+}
+
+fn reap_tx_completions(binding: &mut BindingWorker) {
+    let available = binding.device.available();
+    if available == 0 {
+        return;
+    }
+    let mut completed = binding.device.complete(available);
+    while let Some(offset) = completed.read() {
+        binding.free_tx_frames.push_back(offset);
+    }
+    completed.release();
+}
+
+fn drain_pending_tx(binding: &mut BindingWorker) {
+    let mut pending = binding.live.take_pending_tx();
+    if pending.is_empty() {
+        return;
+    }
+    while let Some(req) = pending.pop_front() {
+        match transmit_frame(binding, &req.bytes) {
+            Ok(len) => {
+                binding.live.tx_packets.fetch_add(1, Ordering::Relaxed);
+                binding.live.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+            }
+            Err(err) => {
+                binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+                binding.live.set_error(err);
+            }
+        }
+    }
+}
+
+fn transmit_frame(binding: &mut BindingWorker, frame: &[u8]) -> Result<usize, String> {
+    let Some(offset) = binding.free_tx_frames.pop_front() else {
+        return Err("no free TX frame available".to_string());
+    };
+    let Some(area) = binding.area.slice_mut(offset as usize, frame.len()) else {
+        binding.free_tx_frames.push_front(offset);
+        return Err(format!("tx frame slice out of range: offset={offset} len={}", frame.len()));
+    };
+    area.copy_from_slice(frame);
+    let mut writer = binding.tx.transmit(1);
+    let inserted = writer.insert(core::iter::once(XdpDesc {
+        addr: offset,
+        len: frame.len() as u32,
+        options: 0,
+    }));
+    writer.commit();
+    drop(writer);
+    if inserted != 1 {
+        binding.free_tx_frames.push_front(offset);
+        return Err("tx ring insert failed".to_string());
+    }
+    if binding.tx.needs_wakeup() {
+        binding.tx.wake();
+    }
+    Ok(frame.len())
 }
 
 fn record_exception(
@@ -1096,18 +1233,22 @@ fn poll_kernel_stats(user: &User, live: &BindingLiveState) {
 fn prime_fill_ring(
     umem: &Umem,
     device: &mut xdpilone::DeviceQueue,
+    skip_frames: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let frame_count = umem.len_frames();
     let inserted = {
-        let mut fill = device.fill(frame_count);
+        let available_frames = frame_count.saturating_sub(skip_frames);
+        let mut fill = device.fill(available_frames);
         let inserted = fill.insert(
-            (0..frame_count).filter_map(|idx| umem.frame(BufIdx(idx)).map(|frame| frame.offset)),
+            (skip_frames..frame_count)
+                .filter_map(|idx| umem.frame(BufIdx(idx)).map(|frame| frame.offset)),
         );
         fill.commit();
         inserted
     };
-    if inserted != frame_count {
-        return Err(format!("prefill fill ring inserted {inserted}/{frame_count} frames").into());
+    let want = frame_count.saturating_sub(skip_frames);
+    if inserted != want {
+        return Err(format!("prefill fill ring inserted {inserted}/{want} frames").into());
     }
     if device.needs_wakeup() {
         device.wake();
@@ -1129,6 +1270,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     let mut state = ForwardingState::default();
     let mut name_to_ifindex = BTreeMap::new();
     let mut linux_to_ifindex = BTreeMap::new();
+    let mut mac_by_ifindex = BTreeMap::new();
 
     for iface in &snapshot.interfaces {
         if iface.ifindex <= 0 {
@@ -1143,6 +1285,9 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         name_to_ifindex.insert(iface.name.clone(), iface.ifindex);
         if !iface.linux_name.is_empty() {
             linux_to_ifindex.insert(iface.linux_name.clone(), iface.ifindex);
+        }
+        if let Some(mac) = parse_mac(&iface.hardware_addr) {
+            mac_by_ifindex.insert(iface.ifindex, mac);
         }
         for addr in &iface.addresses {
             let Ok(net) = addr.address.parse::<IpNet>() else {
@@ -1165,6 +1310,31 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                 }
             }
         }
+    }
+
+    for iface in &snapshot.interfaces {
+        if iface.ifindex <= 0 {
+            continue;
+        }
+        let bind_ifindex = if iface.parent_ifindex > 0 {
+            iface.parent_ifindex
+        } else {
+            iface.ifindex
+        };
+        let src_mac = match parse_mac(&iface.hardware_addr).or_else(|| mac_by_ifindex.get(&bind_ifindex).copied()) {
+            Some(mac) => mac,
+            None => continue,
+        };
+        state.egress.insert(
+            iface.ifindex,
+            EgressInterface {
+                bind_ifindex,
+                vlan_id: iface.vlan_id.max(0) as u16,
+                src_mac,
+                primary_v4: pick_interface_v4(iface),
+                primary_v6: pick_interface_v6(iface),
+            },
+        );
     }
 
     state
@@ -1221,6 +1391,46 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             .insert((neigh.ifindex, ip), NeighborEntry { mac });
     }
     state
+}
+
+fn pick_interface_v4(iface: &InterfaceSnapshot) -> Option<Ipv4Addr> {
+    let mut fallback = None;
+    for addr in &iface.addresses {
+        if addr.family != "inet" {
+            continue;
+        }
+        let Ok(net) = addr.address.parse::<Ipv4Net>() else {
+            continue;
+        };
+        let ip = net.addr();
+        if fallback.is_none() {
+            fallback = Some(ip);
+        }
+        if !ip.is_link_local() {
+            return Some(ip);
+        }
+    }
+    fallback
+}
+
+fn pick_interface_v6(iface: &InterfaceSnapshot) -> Option<Ipv6Addr> {
+    let mut fallback = None;
+    for addr in &iface.addresses {
+        if addr.family != "inet6" {
+            continue;
+        }
+        let Ok(net) = addr.address.parse::<Ipv6Net>() else {
+            continue;
+        };
+        let ip = net.addr();
+        if fallback.is_none() {
+            fallback = Some(ip);
+        }
+        if !ip.is_unicast_link_local() {
+            return Some(ip);
+        }
+    }
+    fallback
 }
 
 fn resolve_route_target_v4(
@@ -1607,6 +1817,131 @@ fn lookup_forwarding_resolution(state: &ForwardingState, dst: IpAddr) -> Forward
     }
 }
 
+fn build_injected_packet(
+    req: &InjectPacketRequest,
+    dst: IpAddr,
+    resolution: ForwardingResolution,
+    egress: &EgressInterface,
+) -> Result<Vec<u8>, String> {
+    let dst_mac = resolution
+        .neighbor_mac
+        .ok_or_else(|| "missing neighbor MAC".to_string())?;
+    match dst {
+        IpAddr::V4(dst_v4) => build_injected_ipv4(req, dst_mac, dst_v4, egress),
+        IpAddr::V6(dst_v6) => build_injected_ipv6(req, dst_mac, dst_v6, egress),
+    }
+}
+
+fn build_injected_ipv4(
+    req: &InjectPacketRequest,
+    dst_mac: [u8; 6],
+    dst_ip: Ipv4Addr,
+    egress: &EgressInterface,
+) -> Result<Vec<u8>, String> {
+    let src_ip = egress
+        .primary_v4
+        .ok_or_else(|| "egress interface has no IPv4 source address".to_string())?;
+    let eth_len = if egress.vlan_id > 0 { 18 } else { 14 };
+    let min_total = eth_len + 20 + 8 + 16;
+    let target_len = req.packet_length.max(min_total as u32) as usize;
+    let payload_len = target_len.saturating_sub(eth_len + 20 + 8);
+
+    let mut frame = Vec::with_capacity(target_len);
+    write_eth_header(&mut frame, dst_mac, egress.src_mac, egress.vlan_id, 0x0800);
+
+    let total_len = (20 + 8 + payload_len) as u16;
+    let ip_start = frame.len();
+    frame.extend_from_slice(&[
+        0x45, 0x00, (total_len >> 8) as u8, total_len as u8, 0x00, 0x01, 0x00, 0x00, 64, 1, 0, 0,
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    let ip_sum = checksum16(&frame[ip_start..ip_start + 20]);
+    frame[ip_start + 10] = (ip_sum >> 8) as u8;
+    frame[ip_start + 11] = ip_sum as u8;
+
+    let icmp_start = frame.len();
+    frame.extend_from_slice(&[8, 0, 0, 0]);
+    frame.extend_from_slice(&(req.slot as u16).to_be_bytes());
+    frame.extend_from_slice(&1u16.to_be_bytes());
+    for i in 0..payload_len {
+        frame.push((i & 0xff) as u8);
+    }
+    let icmp_sum = checksum16(&frame[icmp_start..]);
+    frame[icmp_start + 2] = (icmp_sum >> 8) as u8;
+    frame[icmp_start + 3] = icmp_sum as u8;
+    Ok(frame)
+}
+
+fn build_injected_ipv6(
+    req: &InjectPacketRequest,
+    dst_mac: [u8; 6],
+    dst_ip: Ipv6Addr,
+    egress: &EgressInterface,
+) -> Result<Vec<u8>, String> {
+    let src_ip = egress
+        .primary_v6
+        .ok_or_else(|| "egress interface has no IPv6 source address".to_string())?;
+    let eth_len = if egress.vlan_id > 0 { 18 } else { 14 };
+    let min_total = eth_len + 40 + 8 + 16;
+    let target_len = req.packet_length.max(min_total as u32) as usize;
+    let payload_len = target_len.saturating_sub(eth_len + 40 + 8);
+
+    let mut frame = Vec::with_capacity(target_len);
+    write_eth_header(&mut frame, dst_mac, egress.src_mac, egress.vlan_id, 0x86dd);
+    let plen = (8 + payload_len) as u16;
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, (plen >> 8) as u8, plen as u8, 58, 64]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+
+    let icmp_start = frame.len();
+    frame.extend_from_slice(&[128, 0, 0, 0]);
+    frame.extend_from_slice(&(req.slot as u16).to_be_bytes());
+    frame.extend_from_slice(&1u16.to_be_bytes());
+    for i in 0..payload_len {
+        frame.push((i & 0xff) as u8);
+    }
+    let icmp_sum = checksum16_ipv6(src_ip, dst_ip, &frame[icmp_start..]);
+    frame[icmp_start + 2] = (icmp_sum >> 8) as u8;
+    frame[icmp_start + 3] = icmp_sum as u8;
+    Ok(frame)
+}
+
+fn write_eth_header(buf: &mut Vec<u8>, dst: [u8; 6], src: [u8; 6], vlan_id: u16, ether_type: u16) {
+    buf.extend_from_slice(&dst);
+    buf.extend_from_slice(&src);
+    if vlan_id > 0 {
+        buf.extend_from_slice(&0x8100u16.to_be_bytes());
+        buf.extend_from_slice(&(vlan_id & 0x0fff).to_be_bytes());
+    }
+    buf.extend_from_slice(&ether_type.to_be_bytes());
+}
+
+fn checksum16(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(last) = chunks.remainder().first() {
+        sum += (*last as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn checksum16_ipv6(src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8]) -> u16 {
+    let mut pseudo = Vec::with_capacity(40 + payload.len());
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 58]);
+    pseudo.extend_from_slice(payload);
+    checksum16(&pseudo)
+}
+
 enum ResolvedRouteV4 {
     Connected {
         ifindex: i32,
@@ -1832,6 +2167,14 @@ impl MmapArea {
         }
         Some(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) })
     }
+
+    fn slice_mut(&mut self, offset: usize, len: usize) -> Option<&mut [u8]> {
+        let end = offset.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(offset), len) })
+    }
 }
 
 impl Drop for MmapArea {
@@ -1864,8 +2207,12 @@ struct BindingLiveState {
     unsupported_packets: AtomicU64,
     kernel_rx_dropped: AtomicU64,
     kernel_rx_invalid_descs: AtomicU64,
+    tx_packets: AtomicU64,
+    tx_bytes: AtomicU64,
+    tx_errors: AtomicU64,
     last_heartbeat: AtomicI64,
     last_error: Mutex<String>,
+    pending_tx: Mutex<VecDeque<TxRequest>>,
 }
 
 impl BindingLiveState {
@@ -1894,8 +2241,12 @@ impl BindingLiveState {
             unsupported_packets: AtomicU64::new(0),
             kernel_rx_dropped: AtomicU64::new(0),
             kernel_rx_invalid_descs: AtomicU64::new(0),
+            tx_packets: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
+            tx_errors: AtomicU64::new(0),
             last_heartbeat: AtomicI64::new(0),
             last_error: Mutex::new(String::new()),
+            pending_tx: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -1949,12 +2300,32 @@ impl BindingLiveState {
             unsupported_packets: self.unsupported_packets.load(Ordering::Relaxed),
             kernel_rx_dropped: self.kernel_rx_dropped.load(Ordering::Relaxed),
             kernel_rx_invalid_descs: self.kernel_rx_invalid_descs.load(Ordering::Relaxed),
+            tx_packets: self.tx_packets.load(Ordering::Relaxed),
+            tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
+            tx_errors: self.tx_errors.load(Ordering::Relaxed),
             last_heartbeat: timestamp_from_nanos(self.last_heartbeat.load(Ordering::Relaxed)),
             last_error: self
                 .last_error
                 .lock()
                 .map(|v| v.clone())
                 .unwrap_or_default(),
+        }
+    }
+
+    fn enqueue_tx(&self, req: TxRequest) -> Result<(), String> {
+        match self.pending_tx.lock() {
+            Ok(mut pending) => {
+                pending.push_back(req);
+                Ok(())
+            }
+            Err(_) => Err("pending_tx lock poisoned".to_string()),
+        }
+    }
+
+    fn take_pending_tx(&self) -> VecDeque<TxRequest> {
+        match self.pending_tx.lock() {
+            Ok(mut pending) => core::mem::take(&mut *pending),
+            Err(_) => VecDeque::new(),
         }
     }
 }
@@ -1983,6 +2354,9 @@ struct BindingLiveSnapshot {
     unsupported_packets: u64,
     kernel_rx_dropped: u64,
     kernel_rx_invalid_descs: u64,
+    tx_packets: u64,
+    tx_bytes: u64,
+    tx_errors: u64,
     last_heartbeat: Option<chrono::DateTime<Utc>>,
     last_error: String,
 }

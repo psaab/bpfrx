@@ -182,6 +182,9 @@ type BindingStatus struct {
 	UnsupportedPackets   uint64    `json:"unsupported_packets,omitempty"`
 	KernelRXDropped      uint64    `json:"kernel_rx_dropped,omitempty"`
 	KernelRXInvalidDescs uint64    `json:"kernel_rx_invalid_descs,omitempty"`
+	TXPackets            uint64    `json:"tx_packets,omitempty"`
+	TXBytes              uint64    `json:"tx_bytes,omitempty"`
+	TXErrors             uint64    `json:"tx_errors,omitempty"`
 	LastHeartbeat        time.Time `json:"last_heartbeat,omitempty"`
 	LastError            string    `json:"last_error,omitempty"`
 	LastChange           time.Time `json:"last_change,omitempty"`
@@ -211,4 +214,5 @@ type InjectPacketRequest struct {
 	FIBGeneration    uint32 `json:"fib_generation,omitempty"`
 	MetadataValid    bool   `json:"metadata_valid"`
 	DestinationIP    string `json:"destination_ip,omitempty"`
+	EmitOnWire       bool   `json:"emit_on_wire,omitempty"`
 }

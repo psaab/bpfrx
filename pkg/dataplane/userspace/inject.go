@@ -7,7 +7,7 @@ import (
 	"syscall"
 )
 
-const InjectPacketUsage = "request chassis cluster data-plane userspace inject-packet slot <N> <valid|fib-mismatch|metadata-parse-error> [destination-ip <ip>]"
+const InjectPacketUsage = "request chassis cluster data-plane userspace inject-packet slot <N> <valid|fib-mismatch|metadata-parse-error> [destination-ip <ip>] [emit-on-wire true]"
 
 func ParseInjectPacketCommand(args []string) (slot uint32, mode string, extra map[string]string, err error) {
 	if len(args) < 4 || args[0] != "inject-packet" || args[1] != "slot" {
@@ -40,6 +40,7 @@ func BuildInjectPacketRequest(slot uint32, mode string, extra map[string]string,
 		FIBGeneration:    status.LastFIBGeneration,
 		MetadataValid:    true,
 		DestinationIP:    extra["destination-ip"],
+		EmitOnWire:       strings.EqualFold(extra["emit-on-wire"], "true"),
 	}
 	switch mode {
 	case "valid":
