@@ -3307,33 +3307,7 @@ func (c *CLI) showFlowSession(args []string) error {
 			}
 		}
 	}
-	type sessionIfaceKey struct {
-		ifindex uint32
-		vlanID  uint16
-	}
-	egressIfaces := make(map[sessionIfaceKey]string)
-	if f.cfg != nil {
-		for ifName, ifc := range f.cfg.Interfaces.Interfaces {
-			resolvedParent := config.LinuxIfName(strings.SplitN(f.cfg.ResolveReth(ifName), ".", 2)[0])
-			parentLink, err := net.InterfaceByName(resolvedParent)
-			if err != nil {
-				continue
-			}
-			for _, unit := range ifc.Units {
-				displayName := ifName
-				if unit.Number != 0 || unit.VlanID != 0 {
-					displayName = fmt.Sprintf("%s.%d", ifName, unit.Number)
-				}
-				key := sessionIfaceKey{
-					ifindex: uint32(parentLink.Index),
-					vlanID:  uint16(unit.VlanID),
-				}
-				if _, exists := egressIfaces[key]; !exists {
-					egressIfaces[key] = displayName
-				}
-			}
-		}
-	}
+	egressIfaces := buildSessionEgressIfaces(f.cfg)
 	sessionEgressIf := func(fibIfindex uint32, fibVlanID uint16, zoneID uint16, zoneName string) string {
 		if fibIfindex != 0 {
 			if ifName, ok := egressIfaces[sessionIfaceKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {

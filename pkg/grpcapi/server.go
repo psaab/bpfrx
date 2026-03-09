@@ -100,6 +100,11 @@ type Server struct {
 	fabricVRFDevice  string
 }
 
+type sessionEgressKey struct {
+	ifindex uint32
+	vlanID  uint16
+}
+
 func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
 	provider, ok := s.dp.(interface {
 		Status() (dpuserspace.ProcessStatus, error)
@@ -832,6 +837,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	// Build reverse zone ID → name map, policy name map, and zone→interface map.
 	zoneNames := make(map[uint16]string)
 	zoneIfaces := make(map[uint16]string) // zone ID → first interface name
+	egressIfaces := make(map[sessionEgressKey]string)
 	var policyNames map[uint32]string
 	var appNames map[uint16]string
 	if cr := s.dp.LastCompileResult(); cr != nil {
@@ -846,6 +852,30 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 			if cr := s.dp.LastCompileResult(); cr != nil {
 				if zid, ok := cr.ZoneIDs[zoneName]; ok && len(zone.Interfaces) > 0 {
 					zoneIfaces[zid] = zone.Interfaces[0]
+				}
+			}
+		}
+		for ifName, ifc := range cfg.Interfaces.Interfaces {
+			resolvedParent := config.LinuxIfName(strings.SplitN(cfg.ResolveReth(ifName), ".", 2)[0])
+			parentLink, err := net.InterfaceByName(resolvedParent)
+			if err != nil {
+				continue
+			}
+			for _, unit := range ifc.Units {
+				displayName := ifName
+				if unit.Number != 0 || unit.VlanID != 0 {
+					displayName = fmt.Sprintf("%s.%d", ifName, unit.Number)
+				}
+				vlanID := uint16(unit.VlanID)
+				if vlanID == 0 && unit.Number > 0 {
+					vlanID = uint16(unit.Number)
+				}
+				key := sessionEgressKey{
+					ifindex: uint32(parentLink.Index),
+					vlanID:  vlanID,
+				}
+				if _, exists := egressIfaces[key]; !exists {
+					egressIfaces[key] = displayName
 				}
 			}
 		}
@@ -897,7 +927,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 				val.FwdPackets += rev.FwdPackets
 				val.FwdBytes += rev.FwdBytes
 			}
-			se := sessionEntryV4(key, val, now, zoneNames, policyNames, zoneIfaces, haActive)
+			se := sessionEntryV4(key, val, now, zoneNames, policyNames, zoneIfaces, egressIfaces, haActive)
 			se.Application = appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
 			all = append(all, se)
 		}
@@ -942,7 +972,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 				val.FwdPackets += rev.FwdPackets
 				val.FwdBytes += rev.FwdBytes
 			}
-			se := sessionEntryV6(key, val, now, zoneNames, policyNames, zoneIfaces, haActive)
+			se := sessionEntryV6(key, val, now, zoneNames, policyNames, zoneIfaces, egressIfaces, haActive)
 			se.Application = appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
 			all = append(all, se)
 		}
@@ -3074,14 +3104,17 @@ func uint32ToIP(v uint32) net.IP {
 	return ip
 }
 
-func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, haActive bool) *pb.SessionEntry {
+func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, egressIfaces map[sessionEgressKey]string, haActive bool) *pb.SessionEntry {
 	inIf := zoneIfaces[val.IngressZone]
 	if inIf == "" {
 		inIf = zoneNames[val.IngressZone]
 	}
-	outIf := zoneIfaces[val.EgressZone]
+	outIf := egressIfaces[sessionEgressKey{ifindex: val.FibIfindex, vlanID: val.FibVlanID}]
 	if outIf == "" {
-		outIf = zoneNames[val.EgressZone]
+		outIf = zoneIfaces[val.EgressZone]
+		if outIf == "" {
+			outIf = zoneNames[val.EgressZone]
+		}
 	}
 	se := &pb.SessionEntry{
 		SrcAddr:          net.IP(key.SrcIP[:]).String(),
@@ -3125,14 +3158,17 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 	return se
 }
 
-func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, haActive bool) *pb.SessionEntry {
+func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, egressIfaces map[sessionEgressKey]string, haActive bool) *pb.SessionEntry {
 	inIf := zoneIfaces[val.IngressZone]
 	if inIf == "" {
 		inIf = zoneNames[val.IngressZone]
 	}
-	outIf := zoneIfaces[val.EgressZone]
+	outIf := egressIfaces[sessionEgressKey{ifindex: val.FibIfindex, vlanID: val.FibVlanID}]
 	if outIf == "" {
-		outIf = zoneNames[val.EgressZone]
+		outIf = zoneIfaces[val.EgressZone]
+		if outIf == "" {
+			outIf = zoneNames[val.EgressZone]
+		}
 	}
 	se := &pb.SessionEntry{
 		SrcAddr:          net.IP(key.SrcIP[:]).String(),
