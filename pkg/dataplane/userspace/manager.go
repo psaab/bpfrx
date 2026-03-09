@@ -69,6 +69,14 @@ func (m *Manager) Teardown() error {
 }
 
 func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
+	caps := deriveUserspaceCapabilities(cfg)
+	if caps.ForwardingSupported {
+		m.inner.XDPEntryProg = "xdp_userspace_prog"
+	} else {
+		// Unsupported configs must remain on the existing XDP dataplane
+		// until the userspace runtime can own forwarding safely.
+		m.inner.XDPEntryProg = "xdp_main_prog"
+	}
 	result, err := m.inner.Compile(cfg)
 	if err != nil {
 		return nil, err

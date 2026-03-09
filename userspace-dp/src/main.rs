@@ -630,14 +630,7 @@ fn handle_stream(
                         &existing_bindings,
                     );
                     guard.status.bindings = replanned;
-                    let snapshot = guard.snapshot.clone();
-                    let ring_entries = guard.status.ring_entries;
-                    let mut bindings = std::mem::take(&mut guard.status.bindings);
-                    guard
-                        .afxdp
-                        .reconcile(snapshot.as_ref(), &mut bindings, ring_entries);
-                    guard.status.bindings = bindings;
-                    wait_for_binding_settle(&mut guard, Duration::from_secs(2));
+                    reconcile_status_bindings(&mut guard);
                     refresh_status(&mut guard);
                     persist_state = true;
                 } else {
@@ -652,6 +645,7 @@ fn handle_stream(
                         response.error = forwarding_unsupported_error(&guard.status.capabilities);
                     } else {
                         guard.status.forwarding_armed = forwarding_req.armed;
+                        reconcile_status_bindings(&mut guard);
                         refresh_status(&mut guard);
                         persist_state = true;
                     }
@@ -816,6 +810,17 @@ fn forwarding_unsupported_error(cap: &UserspaceCapabilities) -> String {
 }
 
 fn reconcile_status_bindings(state: &mut ServerState) {
+    if !should_run_afxdp(&state.status) {
+        state.afxdp.stop();
+        state.status.bindings.iter_mut().for_each(|binding| {
+            binding.bound = false;
+            binding.xsk_registered = false;
+            binding.socket_fd = 0;
+            binding.ready = false;
+            binding.last_error.clear();
+        });
+        return;
+    }
     let snapshot = state.snapshot.clone();
     let ring_entries = state.status.ring_entries;
     let mut bindings = std::mem::take(&mut state.status.bindings);
@@ -823,6 +828,10 @@ fn reconcile_status_bindings(state: &mut ServerState) {
         .afxdp
         .reconcile(snapshot.as_ref(), &mut bindings, ring_entries);
     state.status.bindings = bindings;
+}
+
+fn should_run_afxdp(status: &ProcessStatus) -> bool {
+    status.forwarding_armed && status.capabilities.forwarding_supported
 }
 
 fn wait_for_binding_settle(state: &mut ServerState, timeout: Duration) {
@@ -1126,5 +1135,44 @@ mod tests {
             );
             assert!(!q.registered);
         }
+    }
+
+    #[test]
+    fn afxdp_runtime_stays_off_when_forwarding_is_unarmed() {
+        let status = ProcessStatus {
+            forwarding_armed: false,
+            capabilities: UserspaceCapabilities {
+                forwarding_supported: true,
+                unsupported_reasons: Vec::new(),
+            },
+            ..Default::default()
+        };
+        assert!(!should_run_afxdp(&status));
+    }
+
+    #[test]
+    fn afxdp_runtime_stays_off_when_forwarding_is_unsupported() {
+        let status = ProcessStatus {
+            forwarding_armed: true,
+            capabilities: UserspaceCapabilities {
+                forwarding_supported: false,
+                unsupported_reasons: vec!["ha".to_string()],
+            },
+            ..Default::default()
+        };
+        assert!(!should_run_afxdp(&status));
+    }
+
+    #[test]
+    fn afxdp_runtime_starts_only_when_armed_and_supported() {
+        let status = ProcessStatus {
+            forwarding_armed: true,
+            capabilities: UserspaceCapabilities {
+                forwarding_supported: true,
+                unsupported_reasons: Vec::new(),
+            },
+            ..Default::default()
+        };
+        assert!(should_run_afxdp(&status));
     }
 }
