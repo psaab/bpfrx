@@ -250,7 +250,8 @@ func configEqual(a, b *config.RAInterfaceConfig) bool {
 		a.MinAdvInterval != b.MinAdvInterval ||
 		a.LinkMTU != b.LinkMTU ||
 		a.NAT64Prefix != b.NAT64Prefix ||
-		a.NAT64PrefixLife != b.NAT64PrefixLife {
+		a.NAT64PrefixLife != b.NAT64PrefixLife ||
+		a.SourceLinkLocal != b.SourceLinkLocal {
 		return false
 	}
 

@@ -65,11 +65,18 @@ func (s *sender) start() error {
 		slog.Warn("ra: failed to ensure link-local", "interface", s.iface.Name, "err", err)
 	}
 
+	// Determine NDP bind address: use explicitly configured link-local if set,
+	// otherwise default to any link-local on the interface.
+	var bindAddr ndp.Addr = ndp.LinkLocal
+	if s.cfg.SourceLinkLocal != "" {
+		bindAddr = ndp.Addr(s.cfg.SourceLinkLocal)
+	}
+
 	var conn *ndp.Conn
 	var srcAddr netip.Addr
 	var err error
 	for attempt := 0; attempt < 10; attempt++ {
-		conn, srcAddr, err = ndp.Listen(s.iface, ndp.LinkLocal)
+		conn, srcAddr, err = ndp.Listen(s.iface, bindAddr)
 		if err == nil {
 			break
 		}

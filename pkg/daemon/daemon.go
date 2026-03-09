@@ -1307,6 +1307,25 @@ func ensureRethLinkLocal(ifName string) {
 	}
 }
 
+// rethUnitHasConfiguredLinkLocal checks whether the RETH config has an
+// explicitly configured link-local IPv6 address (fe80::/10) on the given unit.
+func rethUnitHasConfiguredLinkLocal(rethCfg *config.InterfaceConfig, unitNum int) bool {
+	unit, ok := rethCfg.Units[unitNum]
+	if !ok {
+		return false
+	}
+	for _, addr := range unit.Addresses {
+		ip, _, err := net.ParseCIDR(addr)
+		if err != nil {
+			continue
+		}
+		if ip.IsLinkLocalUnicast() && ip.To4() == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // rethUnitHasIPv6 checks whether the RETH config has IPv6 addresses on the
 // given unit number (VLAN ID). Unit 0 is the native/untagged interface.
 func rethUnitHasIPv6(rethCfg *config.InterfaceConfig, unitNum int) bool {
@@ -2083,6 +2102,26 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 		slog.Info("DHCPv6 PD: advertising prefix via RA",
 			"prefix", subPrefix, "interface", mapping.RAIface,
 			"delegated_from", mapping.Interface)
+	}
+
+	// Detect explicitly configured link-local addresses on RA interfaces.
+	// If a user configures e.g. fe80::face/64 on a RETH interface, the RA
+	// sender should bind to that address instead of auto-selecting one.
+	for _, ra := range result {
+		if ifc, ok := cfg.Interfaces.Interfaces[ra.Interface]; ok {
+			if unit, ok := ifc.Units[0]; ok {
+				for _, addr := range unit.Addresses {
+					ip, _, err := net.ParseCIDR(addr)
+					if err != nil {
+						continue
+					}
+					if ip.IsLinkLocalUnicast() && ip.To4() == nil {
+						ra.SourceLinkLocal = ip.String()
+						break
+					}
+				}
+			}
+		}
 	}
 
 	// Resolve RETH interface names for RA senders (needs real Linux names).
@@ -6239,6 +6278,12 @@ func (d *Daemon) addStableRethLinkLocal(rgID int) {
 		if !strings.HasPrefix(ifName, "reth") {
 			continue
 		}
+		// Skip interfaces with an explicitly configured link-local address —
+		// the user's configured LL replaces the auto-generated stable LL.
+		if rethUnitHasConfiguredLinkLocal(ifc, 0) {
+			slog.Debug("skipping stable LL (explicit LL configured)", "iface", ifName)
+			continue
+		}
 		physName := ifc.Name
 		if phys, ok := rethToPhys[ifc.Name]; ok {
 			physName = phys
@@ -6379,9 +6424,10 @@ func (d *Daemon) directSendGARPs(rgID int) {
 		}
 	}
 
-	// Send NA burst for stable router link-local so hosts update neighbor
-	// cache for the router identity (not just VIPs). Send on base interface
-	// AND all VLAN sub-interfaces since each VLAN is a separate L2 domain.
+	// Send NA burst for router link-local so hosts update neighbor cache for
+	// the router identity (not just VIPs). Uses the explicitly configured
+	// link-local if present, otherwise the auto-generated stable LL.
+	// Send on base interface AND all VLAN sub-interfaces (separate L2 domains).
 	if cfg.Chassis.Cluster != nil {
 		stableLL := cluster.StableRethLinkLocal(cfg.Chassis.Cluster.ClusterID, rgID)
 		rethToPhys := cfg.RethToPhysical()
@@ -6389,6 +6435,17 @@ func (d *Daemon) directSendGARPs(rgID int) {
 		for ifName, ifc := range cfg.Interfaces.Interfaces {
 			if ifc.RedundancyGroup != rgID || !strings.HasPrefix(ifName, "reth") {
 				continue
+			}
+			// Use configured link-local if present, otherwise stable LL.
+			routerLL := stableLL
+			if unit, ok := ifc.Units[0]; ok {
+				for _, addr := range unit.Addresses {
+					ip, _, err := net.ParseCIDR(addr)
+					if err == nil && ip.IsLinkLocalUnicast() && ip.To4() == nil {
+						routerLL = ip
+						break
+					}
+				}
 			}
 			physName := ifc.Name
 			if phys, ok := rethToPhys[ifc.Name]; ok {
@@ -6398,9 +6455,9 @@ func (d *Daemon) directSendGARPs(rgID int) {
 			// Send on base interface.
 			if !seen[linuxName] {
 				seen[linuxName] = true
-				if err := cluster.SendGratuitousIPv6Burst(linuxName, stableLL, garpCount); err != nil {
-					slog.Warn("directSendGARPs: stable link-local NA failed",
-						"iface", linuxName, "ip", stableLL, "err", err)
+				if err := cluster.SendGratuitousIPv6Burst(linuxName, routerLL, garpCount); err != nil {
+					slog.Warn("directSendGARPs: router link-local NA failed",
+						"iface", linuxName, "ip", routerLL, "err", err)
 				}
 			}
 			// Send on each VLAN sub-interface.
@@ -6409,9 +6466,9 @@ func (d *Daemon) directSendGARPs(rgID int) {
 					subIface := fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
 					if !seen[subIface] {
 						seen[subIface] = true
-						if err := cluster.SendGratuitousIPv6Burst(subIface, stableLL, garpCount); err != nil {
-							slog.Warn("directSendGARPs: stable link-local NA failed",
-								"iface", subIface, "ip", stableLL, "err", err)
+						if err := cluster.SendGratuitousIPv6Burst(subIface, routerLL, garpCount); err != nil {
+							slog.Warn("directSendGARPs: router link-local NA failed",
+								"iface", subIface, "ip", routerLL, "err", err)
 						}
 					}
 				}

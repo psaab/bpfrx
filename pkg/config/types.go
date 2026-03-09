@@ -1353,6 +1353,7 @@ type RAInterfaceConfig struct {
 	NAT64Prefix     string   // PREF64 prefix (e.g. "64:ff9b::/96")
 	NAT64PrefixLife int      // PREF64 lifetime in seconds (0 = default)
 	LinkMTU         int      // advertised link MTU, 0 = omit
+	SourceLinkLocal string   // explicit link-local to use as RA source (overrides auto-selected)
 }
 
 // RAPrefix defines a prefix advertised via RA.
