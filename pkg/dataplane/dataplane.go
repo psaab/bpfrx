@@ -3,7 +3,6 @@ package dataplane
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/bpfrx/pkg/config"
@@ -14,26 +13,9 @@ var _ DataPlane = (*Manager)(nil)
 
 // Dataplane type constants used in system { dataplane-type <type>; }.
 const (
-	TypeEBPF      = "ebpf" // default
-	TypeDPDK      = "dpdk"
-	TypeUserspace = "userspace"
+	TypeEBPF = "ebpf" // default
+	TypeDPDK = "dpdk"
 )
-
-func UserspaceCtrlPinPath() string {
-	return filepath.Join(bpfPinPath, "userspace_ctrl")
-}
-
-func UserspaceBindingsPinPath() string {
-	return filepath.Join(bpfPinPath, "userspace_bindings")
-}
-
-func UserspaceHeartbeatPinPath() string {
-	return filepath.Join(bpfPinPath, "userspace_heartbeat")
-}
-
-func UserspaceXSKMapPinPath() string {
-	return filepath.Join(bpfPinPath, "userspace_xsk_map")
-}
 
 // backendRegistry holds constructors for non-eBPF dataplane backends.
 // Sub-packages register themselves via RegisterBackend in their init().
@@ -54,7 +36,7 @@ func NewDataPlane(dpType string) (DataPlane, error) {
 		if ctor, ok := backendRegistry[dpType]; ok {
 			return ctor(), nil
 		}
-		return nil, fmt.Errorf("unknown dataplane type %q (valid: ebpf, dpdk, userspace)", dpType)
+		return nil, fmt.Errorf("unknown dataplane type %q (valid: ebpf, dpdk)", dpType)
 	}
 }
 

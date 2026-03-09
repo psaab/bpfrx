@@ -55,8 +55,6 @@ LAN_HOST="${LAN_HOST:-cluster-lan-host}"
 PROFILE="${PROFILE:-bpfrx-cluster}"
 IMAGE_VM="${IMAGE_VM:-images:debian/13}"
 IMAGE_CT="${IMAGE_CT:-images:debian/13}"
-LAN_ADDR="${LAN_ADDR:-}"
-LAN_GW="${LAN_GW:-}"
 
 # SR-IOV: PCI passthrough for VM VFs, nictype=sriov for container VFs
 SRIOV_PARENT="${SRIOV_PARENT:-eno6np1}"
@@ -70,7 +68,6 @@ if [[ -z "${VF_WAN_PCI+x}" ]]; then
 		VF_WAN_PCI=("${VF_PCI[@]}")
 	fi
 fi
-VF_WAN_TRUST="${VF_WAN_TRUST:-true}"
 # LAN VF PCI addresses per VM (empty = no LAN VF passthrough)
 if [[ -z "${VF_LAN_PCI+x}" ]]; then VF_LAN_PCI=(); fi
 
@@ -244,33 +241,6 @@ create_vm() {
 	info "Adding WAN SR-IOV VF PCI $wan_pci to $vm..."
 	incus config device add "$(r "$vm")" wan-vf pci address="$wan_pci"
 
-	# Allow VLAN-tagged traffic from WAN VF guests. The HA lab uses guest
-	# VLAN subinterfaces (e.g. reth0.50/reth0.80), which requires trust on
-	# the passed-through VF.
-	if [[ "${VF_WAN_TRUST}" == "true" && -n "${SRIOV_PARENT:-}" ]]; then
-		local wan_vf_idx=""
-		for vf_path in /sys/class/net/"${SRIOV_PARENT}"/device/virtfn*; do
-			local vf_pci
-			if [[ -n "${INCUS_REMOTE:-}" ]]; then
-				vf_pci=$(ssh "$INCUS_REMOTE" "readlink -f '$vf_path' | xargs basename")
-			else
-				vf_pci=$(readlink -f "$vf_path" | xargs basename)
-			fi
-			if [[ "$vf_pci" == "$wan_pci" ]]; then
-				wan_vf_idx=$(basename "$vf_path" | sed 's/virtfn//')
-				break
-			fi
-		done
-		if [[ -n "${wan_vf_idx:-}" ]]; then
-			info "Setting host WAN VF trust on $SRIOV_PARENT vf $wan_vf_idx ($wan_pci)..."
-			if [[ -n "${INCUS_REMOTE:-}" ]]; then
-				ssh "$INCUS_REMOTE" "sudo ip link set dev $SRIOV_PARENT vf $wan_vf_idx trust on"
-			else
-				sudo ip link set dev "$SRIOV_PARENT" vf "$wan_vf_idx" trust on
-			fi
-		fi
-	fi
-
 	# LAN VF (optional — only if VF_LAN_PCI is configured)
 	if [[ ${#VF_LAN_PCI[@]} -gt 0 ]]; then
 		local lan_pci="${VF_LAN_PCI[$idx]}"
@@ -426,12 +396,9 @@ create_lan_host() {
 	info "Waiting for container to start..."
 	sleep 3
 
-	# Determine LAN IP config; allow env override for isolated labs.
+	# Determine LAN IP config based on cluster config
 	local lan_addr lan_gw
-	if [[ -n "${LAN_ADDR}" && -n "${LAN_GW}" ]]; then
-		lan_addr="${LAN_ADDR}"
-		lan_gw="${LAN_GW}"
-	elif [[ "$CLUSTER_CONF" == *"loss"* ]]; then
+	if [[ "$CLUSTER_CONF" == *"loss"* ]]; then
 		lan_addr="10.0.89.102/24"
 		lan_gw="10.0.89.1"
 	else
@@ -501,12 +468,6 @@ cmd_deploy() {
 
 	info "Building bpfrxd and cli..."
 	make -C "$PROJECT_ROOT" build build-ctl
-	if [[ -x "$HOME/.cargo/bin/cargo" || -n "$(command -v cargo 2>/dev/null)" ]]; then
-		info "Building bpfrx-userspace-dp helper..."
-		make -C "$PROJECT_ROOT" build-userspace-dp
-	else
-		warn "Rust toolchain not found; skipping bpfrx-userspace-dp build"
-	fi
 
 	case "$target" in
 		0)   deploy_vm 0 ;;
@@ -587,13 +548,6 @@ deploy_vm() {
 
 	info "Pushing cli to $vm..."
 	incus file push "$PROJECT_ROOT/cli" "${rinst}/usr/local/sbin/cli" --mode 0755
-
-	if [[ -f "$PROJECT_ROOT/bpfrx-userspace-dp" ]]; then
-		info "Pushing bpfrx-userspace-dp to $vm..."
-		incus file push "$PROJECT_ROOT/bpfrx-userspace-dp" "${rinst}/usr/local/sbin/bpfrx-userspace-dp" --mode 0755
-	else
-		warn "bpfrx-userspace-dp not found locally; helper not pushed to $vm"
-	fi
 
 	# Push the single unified HA config (same file for both nodes)
 	if [[ -f "$CLUSTER_CONF" ]]; then

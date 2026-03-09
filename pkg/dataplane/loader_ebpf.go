@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"runtime"
 	"unsafe"
 
@@ -147,22 +146,22 @@ func (m *Manager) loadAllObjects() error {
 			"sessions":           mainObjs.Sessions,
 			"global_counters":    mainObjs.GlobalCounters,
 			"tx_ports":           mainObjs.TxPorts,
-			"xdp_progs":          mainObjs.XdpProgs,
-			"tc_progs":           mainObjs.TcProgs,
+			"xdp_progs":         mainObjs.XdpProgs,
+			"tc_progs":          mainObjs.TcProgs,
 			"zone_pair_policies": mainObjs.ZonePairPolicies,
-			"policy_rules":       mainObjs.PolicyRules,
-			"address_book_v4":    mainObjs.AddressBookV4,
+			"policy_rules":      mainObjs.PolicyRules,
+			"address_book_v4":   mainObjs.AddressBookV4,
 			"address_membership": mainObjs.AddressMembership,
-			"applications":       mainObjs.Applications,
-			"policy_counters":    mainObjs.PolicyCounters,
-			"zone_counters":      mainObjs.ZoneCounters,
-			"events":             mainObjs.Events,
-			"dnat_table":         mainObjs.DnatTable,
-			"snat_rules":         mainObjs.SnatRules,
-			"sessions_v6":        mainObjs.SessionsV6,
-			"address_book_v6":    mainObjs.AddressBookV6,
-			"dnat_table_v6":      mainObjs.DnatTableV6,
-			"snat_rules_v6":      mainObjs.SnatRulesV6,
+			"applications":      mainObjs.Applications,
+			"policy_counters":   mainObjs.PolicyCounters,
+			"zone_counters":     mainObjs.ZoneCounters,
+			"events":            mainObjs.Events,
+			"dnat_table":        mainObjs.DnatTable,
+			"snat_rules":        mainObjs.SnatRules,
+			"sessions_v6":       mainObjs.SessionsV6,
+			"address_book_v6":   mainObjs.AddressBookV6,
+			"dnat_table_v6":     mainObjs.DnatTableV6,
+			"snat_rules_v6":     mainObjs.SnatRulesV6,
 			"session_v6_scratch": mainObjs.SessionV6Scratch,
 			"screen_configs":     mainObjs.ScreenConfigs,
 			"flood_counters":     mainObjs.FloodCounters,
@@ -190,73 +189,6 @@ func (m *Manager) loadAllObjects() error {
 			"session_count_dst":  mainObjs.SessionCountDst,
 		},
 	}
-
-	// Load the Rust userspace XDP entry program. It owns only the AF_XDP
-	// control maps and a fallback prog-array that jumps into xdp_main.
-	userspaceSpec, err := loadRustUserspaceXDP()
-	if err != nil {
-		return fmt.Errorf("load Rust xdp_userspace spec: %w", err)
-	}
-	for _, name := range []string{
-		"userspace_ctrl",
-		"userspace_bindings",
-		"userspace_heartbeat",
-		"userspace_xsk_map",
-		"userspace_fallback_progs",
-	} {
-		if ms, ok := userspaceSpec.Maps[name]; ok {
-			ms.Pinning = ebpf.PinByName
-		}
-	}
-	userspaceCollection, err := ebpf.NewCollectionWithOptions(userspaceSpec, *opts)
-	if err != nil {
-		return fmt.Errorf("load Rust xdp_userspace collection: %w", err)
-	}
-	userspaceProg, ok := userspaceCollection.Programs["xdp_userspace_prog"]
-	if !ok {
-		return fmt.Errorf("Rust xdp_userspace_prog not found")
-	}
-	userspaceCtrl, ok := userspaceCollection.Maps["userspace_ctrl"]
-	if !ok {
-		return fmt.Errorf("Rust userspace_ctrl map not found")
-	}
-	userspaceBindings, ok := userspaceCollection.Maps["userspace_bindings"]
-	if !ok {
-		return fmt.Errorf("Rust userspace_bindings map not found")
-	}
-	userspaceHeartbeat, ok := userspaceCollection.Maps["userspace_heartbeat"]
-	if !ok {
-		return fmt.Errorf("Rust userspace_heartbeat map not found")
-	}
-	userspaceXSK, ok := userspaceCollection.Maps["userspace_xsk_map"]
-	if !ok {
-		return fmt.Errorf("Rust userspace_xsk_map not found")
-	}
-	userspaceFallback, ok := userspaceCollection.Maps["userspace_fallback_progs"]
-	if !ok {
-		return fmt.Errorf("Rust userspace_fallback_progs map not found")
-	}
-	for _, pin := range []struct {
-		name string
-		m    *ebpf.Map
-		path string
-	}{
-		{name: "userspace_ctrl", m: userspaceCtrl, path: UserspaceCtrlPinPath()},
-		{name: "userspace_bindings", m: userspaceBindings, path: UserspaceBindingsPinPath()},
-		{name: "userspace_heartbeat", m: userspaceHeartbeat, path: UserspaceHeartbeatPinPath()},
-		{name: "userspace_xsk_map", m: userspaceXSK, path: UserspaceXSKMapPinPath()},
-		{name: "userspace_fallback_progs", m: userspaceFallback, path: filepath.Join(bpfPinPath, "userspace_fallback_progs")},
-	} {
-		if err := ensureUserspaceMapPinned(pin.name, pin.m, pin.path); err != nil {
-			return err
-		}
-	}
-	m.programs["xdp_userspace_prog"] = userspaceProg
-	m.maps["userspace_ctrl"] = userspaceCtrl
-	m.maps["userspace_bindings"] = userspaceBindings
-	m.maps["userspace_heartbeat"] = userspaceHeartbeat
-	m.maps["userspace_xsk_map"] = userspaceXSK
-	m.maps["userspace_fallback_progs"] = userspaceFallback
 
 	// Extended replacements for xdp_policy which also includes NAT pool maps.
 	policyReplaceOpts := &ebpf.CollectionOptions{
@@ -417,24 +349,6 @@ func (m *Manager) loadAllObjects() error {
 		}
 	}
 
-	return nil
-}
-
-func ensureUserspaceMapPinned(name string, m *ebpf.Map, path string) error {
-	if m == nil {
-		return fmt.Errorf("nil map for %s", path)
-	}
-	if _, err := os.Stat(path); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("stat %s pin path %s: %w", name, path, err)
-		}
-		if err := m.Pin(path); err != nil {
-			return fmt.Errorf("pin %s at %s: %w", name, path, err)
-		}
-	}
-	if _, err := os.Stat(path); err != nil {
-		return fmt.Errorf("%s pin missing at %s after load: %w", name, path, err)
-	}
 	return nil
 }
 

@@ -510,20 +510,20 @@ var OperationalTree = map[string]*Node{
 		}},
 		"security": {Desc: "Monitor security events", Children: map[string]*Node{
 			"flow": {Desc: "Monitor security flow", Children: map[string]*Node{
-				"file": {Desc: "Configure flow trace file", Children: map[string]*Node{
+				"file":   {Desc: "Configure flow trace file", Children: map[string]*Node{
 					"<filename>": {Desc: "Name of trace file"},
 					"files":      {Desc: "Maximum number of trace files (2..1000)"},
 					"size":       {Desc: "Maximum trace file size (10240..1073741824)"},
 					"match":      {Desc: "Regular expression for lines to log"},
 				}},
 				"filter": {Desc: "Configure flow trace filter", Children: map[string]*Node{
-					"<filter-name>":      {Desc: "Name of filter"},
+					"<filter-name>":  {Desc: "Name of filter"},
 					"source-prefix":      {Desc: "Source IP prefix to match"},
 					"destination-prefix": {Desc: "Destination IP prefix to match"},
 					"source-port":        {Desc: "Source port to match"},
 					"destination-port":   {Desc: "Destination port to match"},
 					"protocol":           {Desc: "Protocol to match (tcp/udp/icmp/0..255)"},
-					"interface": {Desc: "Interface to match", DynamicFn: func(cfg *config.Config) []string {
+					"interface":          {Desc: "Interface to match", DynamicFn: func(cfg *config.Config) []string {
 						if cfg == nil || cfg.Interfaces.Interfaces == nil {
 							return nil
 						}
@@ -534,8 +534,8 @@ var OperationalTree = map[string]*Node{
 						return names
 					}},
 				}},
-				"start": {Desc: "Start flow tracing"},
-				"stop":  {Desc: "Stop flow tracing"},
+				"start":  {Desc: "Start flow tracing"},
+				"stop":   {Desc: "Stop flow tracing"},
 			}},
 			"packet-drop": {Desc: "Monitor security packet drops", Children: map[string]*Node{
 				"source-prefix":      {Desc: "Source IP prefix to match"},
@@ -543,7 +543,7 @@ var OperationalTree = map[string]*Node{
 				"source-port":        {Desc: "Source port to match"},
 				"destination-port":   {Desc: "Destination port to match"},
 				"protocol":           {Desc: "Protocol to match (tcp/udp/icmp/0..255)"},
-				"from-zone": {Desc: "Ingress zone to match", DynamicFn: func(cfg *config.Config) []string {
+				"from-zone":          {Desc: "Ingress zone to match", DynamicFn: func(cfg *config.Config) []string {
 					if cfg == nil {
 						return nil
 					}
@@ -658,29 +658,6 @@ var OperationalTree = map[string]*Node{
 								names = append(names, fmt.Sprintf("%d", rg.ID))
 							}
 							return names
-						}},
-					}},
-				}},
-				"data-plane": {Desc: "Userspace dataplane operations", Children: map[string]*Node{
-					"userspace": {Desc: "Userspace dataplane helper operations", Children: map[string]*Node{
-						"inject-packet": {Desc: "Inject a synthetic userspace dataplane packet", Children: map[string]*Node{
-							"slot": {Desc: "Binding slot", DynamicFn: func(cfg *config.Config) []string {
-								out := make([]string, 0, 16)
-								for i := 0; i < 16; i++ {
-									out = append(out, fmt.Sprintf("%d", i))
-								}
-								return out
-							}, Children: map[string]*Node{
-								"valid": {Desc: "Inject a valid packet using the current snapshot generations", Children: map[string]*Node{
-									"destination-ip": {Desc: "Optional destination IP used for forwarding resolution"},
-								}},
-								"fib-mismatch": {Desc: "Inject a packet with a mismatched FIB generation", Children: map[string]*Node{
-									"destination-ip": {Desc: "Optional destination IP used for forwarding resolution"},
-								}},
-								"metadata-parse-error": {Desc: "Inject a malformed metadata packet", Children: map[string]*Node{
-									"destination-ip": {Desc: "Optional destination IP used for forwarding resolution"},
-								}},
-							}},
 						}},
 					}},
 				}},
