@@ -163,6 +163,9 @@ type SessionSync struct {
 	IsPrimaryForRGFn   func(rgID int) bool // returns true if local is primary for given RG
 	lastSweepTime uint64 // monotonic seconds of last sync sweep
 	syncBackfillNeeded atomic.Bool         // replay sweep window on send queue overflow
+	lastNewCounter     uint64              // last seen GLOBAL_CTR_SESSIONS_NEW
+	lastClosedCounter  uint64              // last seen GLOBAL_CTR_SESSIONS_CLOSED
+	lastSweepEmpty     bool                // previous sweep found 0 sessions to sync
 	vrfDevice          string              // VRF device for SO_BINDTODEVICE (empty = default VRF)
 
 	// Peer clock offset: localMono - peerMono.  Added to incoming
@@ -471,15 +474,27 @@ func (s *SessionSync) StartSyncSweep(ctx context.Context) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
+		// Adaptive interval: 1s when sessions were synced (minimize
+		// replication lag), 10s when idle (avoid 10M-bucket hash walk).
+		interval := time.Second
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				s.syncSweep()
+			case <-timer.C:
+				synced := s.syncSweep()
+				if synced > 0 || s.syncBackfillNeeded.Load() {
+					interval = time.Second
+				} else {
+					// Back off when nothing to sync. Cap at 10s
+					// so new sessions are caught within one
+					// GC interval even without ring buffer events.
+					interval = min(interval*2, 10*time.Second)
+				}
+				timer.Reset(interval)
 			}
 		}
 	}()
@@ -507,16 +522,32 @@ func (s *SessionSync) ShouldSyncZone(zoneID uint16) bool {
 	return false
 }
 
-func (s *SessionSync) syncSweep() {
+func (s *SessionSync) syncSweep() int {
 	// At least one primary check must be wired.
 	if s.IsPrimaryFn == nil && s.IsPrimaryForRGFn == nil {
-		return
+		return 0
 	}
 	if !s.stats.Connected.Load() {
-		return
+		return 0
 	}
 	if s.dp == nil {
-		return
+		return 0
+	}
+
+	// Fast path: skip expensive BatchIterate when no sessions have changed.
+	// Reading two per-CPU counters is O(1) vs BatchIterate which is O(buckets)
+	// even for an empty 10M-entry hash map.
+	if s.lastSweepEmpty && !s.syncBackfillNeeded.Load() {
+		newCtr, err1 := s.dp.ReadGlobalCounter(dataplane.GlobalCtrSessionsNew)
+		closedCtr, err2 := s.dp.ReadGlobalCounter(dataplane.GlobalCtrSessionsClosed)
+		if err1 == nil && err2 == nil &&
+			newCtr == s.lastNewCounter &&
+			closedCtr == s.lastClosedCounter {
+			s.lastSweepTime = monotonicSeconds()
+			return 0
+		}
+		s.lastNewCounter = newCtr
+		s.lastClosedCounter = closedCtr
 	}
 
 	threshold := s.lastSweepTime
@@ -565,7 +596,7 @@ func (s *SessionSync) syncSweep() {
 			"queued", count,
 			"queue_len", len(s.sendCh),
 			"queue_cap", cap(s.sendCh))
-		return
+		return count
 	}
 
 	if replaying {
@@ -576,9 +607,20 @@ func (s *SessionSync) syncSweep() {
 	}
 
 	s.lastSweepTime = now
+	s.lastSweepEmpty = (count == 0)
+	if count == 0 {
+		// Snapshot counters so next sweep can skip if nothing changed.
+		newCtr, err1 := s.dp.ReadGlobalCounter(dataplane.GlobalCtrSessionsNew)
+		closedCtr, err2 := s.dp.ReadGlobalCounter(dataplane.GlobalCtrSessionsClosed)
+		if err1 == nil && err2 == nil {
+			s.lastNewCounter = newCtr
+			s.lastClosedCounter = closedCtr
+		}
+	}
 	if count > 0 {
 		slog.Info("cluster sync: sweep synced sessions", "count", count)
 	}
+	return count
 }
 
 func (s *SessionSync) queueMessage(msg []byte, sentCounter *atomic.Uint64, source string) bool {
