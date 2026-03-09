@@ -1252,6 +1252,10 @@ func removeAutoLinkLocal(ifName string) {
 	}
 	for _, addr := range addrs {
 		if addr.IP.IsLinkLocalUnicast() {
+			// Preserve stable router link-locals managed by addStableRethLinkLocal.
+			if cluster.IsStableRethLinkLocal(addr.IP) {
+				continue
+			}
 			if err := netlink.AddrDel(link, &addr); err == nil {
 				slog.Info("removed auto link-local from RETH member", "iface", ifName, "addr", addr.IP)
 			}
@@ -1688,21 +1692,33 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
-	// 2.6b. Reconcile VRRP VIPs after RETH MAC programming.
-	// programRethMAC brings the interface DOWN/UP which removes all
-	// addresses including VRRP VIPs. Re-add them on MASTER instances.
+	// 2.6b. Reconcile VRRP VIPs and stable link-locals after RETH MAC
+	// programming. programRethMAC brings the interface DOWN/UP which
+	// removes all addresses including VRRP VIPs and stable link-locals.
+	// Re-add them on MASTER instances.
 	if d.isNoRethVRRP() {
-		// Direct mode: re-add VIPs for each RG where we are primary.
+		// Direct mode: re-add VIPs + stable link-locals for each RG
+		// where we are primary.
 		if d.cluster != nil {
 			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
 				if d.cluster.IsLocalPrimary(rg.ID) {
 					d.directAddVIPs(rg.ID)
+					d.addStableRethLinkLocal(rg.ID)
 					go d.directSendGARPs(rg.ID)
 				}
 			}
 		}
 	} else if d.vrrpMgr != nil {
 		d.vrrpMgr.ReconcileVIPs()
+		// Re-add stable link-locals for active RGs after MAC bounce.
+		if d.cluster != nil && cfg.Chassis.Cluster != nil {
+			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+				s := d.getOrCreateRGState(rg.ID)
+				if s.IsActive() {
+					d.addStableRethLinkLocal(rg.ID)
+				}
+			}
+		}
 	}
 
 	// 2.6c. Reconcile proxy ARP entries for NAT addresses.

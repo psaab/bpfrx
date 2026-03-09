@@ -124,6 +124,16 @@ func StableRethLinkLocal(clusterID, rgID int) net.IP {
 		0, 0, 0xbf, 0x72, 0, byte(clusterID), 0, byte(rgID)}
 }
 
+// IsStableRethLinkLocal returns true if the address matches the stable RETH
+// link-local pattern (fe80::00:00:bf:72:...).
+func IsStableRethLinkLocal(ip net.IP) bool {
+	ip = ip.To16()
+	return len(ip) == 16 &&
+		ip[0] == 0xfe && ip[1] == 0x80 &&
+		ip[8] == 0 && ip[9] == 0 &&
+		ip[10] == 0xbf && ip[11] == 0x72
+}
+
 // IsVirtualRethMAC returns true if the MAC matches the virtual RETH pattern (02:bf:72:...).
 func IsVirtualRethMAC(mac net.HardwareAddr) bool {
 	return len(mac) == 6 && mac[0] == 0x02 && mac[1] == 0xbf && mac[2] == 0x72
