@@ -138,6 +138,8 @@ struct ControlRequest {
     queue: Option<QueueControlRequest>,
     #[serde(default)]
     binding: Option<BindingControlRequest>,
+    #[serde(default)]
+    packet: Option<InjectPacketRequest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -302,6 +304,23 @@ struct ExceptionStatus {
     config_generation: u64,
     #[serde(rename = "fib_generation", default)]
     fib_generation: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct InjectPacketRequest {
+    slot: u32,
+    #[serde(rename = "packet_length", default)]
+    packet_length: u32,
+    #[serde(rename = "addr_family", default)]
+    addr_family: u8,
+    #[serde(default)]
+    protocol: u8,
+    #[serde(rename = "config_generation", default)]
+    config_generation: u64,
+    #[serde(rename = "fib_generation", default)]
+    fib_generation: u32,
+    #[serde(rename = "metadata_valid", default)]
+    metadata_valid: bool,
 }
 
 #[derive(Debug)]
@@ -591,6 +610,23 @@ fn handle_stream(
                 } else {
                     response.ok = false;
                     response.error = "missing binding state".to_string();
+                }
+            }
+            "inject_packet" => {
+                if let Some(packet_req) = request.packet {
+                    match guard.afxdp.inject_test_packet(packet_req) {
+                        Ok(()) => {
+                            refresh_status(&mut guard);
+                            persist_state = true;
+                        }
+                        Err(err) => {
+                            response.ok = false;
+                            response.error = err;
+                        }
+                    }
+                } else {
+                    response.ok = false;
+                    response.error = "missing packet injection request".to_string();
                 }
             }
             "shutdown" => {

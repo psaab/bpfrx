@@ -16,6 +16,7 @@ type ControlRequest struct {
 	Snapshot *ConfigSnapshot        `json:"snapshot,omitempty"`
 	Queue    *QueueControlRequest   `json:"queue,omitempty"`
 	Binding  *BindingControlRequest `json:"binding,omitempty"`
+	Packet   *InjectPacketRequest   `json:"packet,omitempty"`
 }
 
 type ControlResponse struct {
@@ -179,4 +180,14 @@ type ExceptionStatus struct {
 	Protocol         uint8     `json:"protocol,omitempty"`
 	ConfigGeneration uint64    `json:"config_generation,omitempty"`
 	FIBGeneration    uint32    `json:"fib_generation,omitempty"`
+}
+
+type InjectPacketRequest struct {
+	Slot             uint32 `json:"slot"`
+	PacketLength     uint32 `json:"packet_length,omitempty"`
+	AddrFamily       uint8  `json:"addr_family,omitempty"`
+	Protocol         uint8  `json:"protocol,omitempty"`
+	ConfigGeneration uint64 `json:"config_generation,omitempty"`
+	FIBGeneration    uint32 `json:"fib_generation,omitempty"`
+	MetadataValid    bool   `json:"metadata_valid"`
 }

@@ -1,4 +1,4 @@
-use super::{BindingStatus, ConfigSnapshot, ExceptionStatus};
+use super::{BindingStatus, ConfigSnapshot, ExceptionStatus, InjectPacketRequest};
 use chrono::Utc;
 use core::ffi::{c_int, c_void};
 use core::num::NonZeroU32;
@@ -177,6 +177,55 @@ impl Coordinator {
         self.recent_exceptions.iter().cloned().collect()
     }
 
+    pub fn inject_test_packet(&mut self, req: InjectPacketRequest) -> Result<(), String> {
+        let binding = self
+            .bindings
+            .get(&req.slot)
+            .ok_or_else(|| format!("unknown binding slot {}", req.slot))?;
+        let live = self
+            .live
+            .get(&req.slot)
+            .ok_or_else(|| format!("binding slot {} has no live state", req.slot))?;
+        let ident = binding.identity();
+        let packet_length = req.packet_length.max(64);
+
+        if req.metadata_valid {
+            let meta = UserspaceDpMeta {
+                magic: USERSPACE_META_MAGIC,
+                version: USERSPACE_META_VERSION,
+                length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+                ingress_ifindex: ident.ifindex as u32,
+                rx_queue_index: ident.queue_id,
+                pkt_len: packet_length.min(u16::MAX as u32) as u16,
+                addr_family: req.addr_family,
+                protocol: req.protocol,
+                config_generation: req.config_generation,
+                fib_generation: req.fib_generation,
+                ..UserspaceDpMeta::default()
+            };
+            live.metadata_packets.fetch_add(1, Ordering::Relaxed);
+            record_disposition(
+                &ident,
+                live,
+                classify_metadata(meta, self.validation),
+                packet_length,
+                Some(meta),
+                &mut self.recent_exceptions,
+            );
+            return Ok(());
+        }
+
+        live.metadata_errors.fetch_add(1, Ordering::Relaxed);
+        record_exception(
+            &mut self.recent_exceptions,
+            &ident,
+            "metadata_parse",
+            packet_length,
+            None,
+        );
+        Ok(())
+    }
+
     pub fn refresh_bindings(&self, bindings: &mut [BindingStatus]) {
         for binding in bindings.iter_mut() {
             if let Some(live) = self.live.get(&binding.slot) {
@@ -328,6 +377,16 @@ impl BindingWorker {
             rx,
         })
     }
+
+    fn identity(&self) -> BindingIdentity {
+        BindingIdentity {
+            slot: self.slot,
+            queue_id: self.queue_id,
+            worker_id: self.worker_id,
+            interface: self.interface.clone(),
+            ifindex: self.ifindex,
+        }
+    }
 }
 
 fn poll_binding(
@@ -336,13 +395,7 @@ fn poll_binding(
     recent_exceptions: &mut VecDeque<ExceptionStatus>,
     poll_stats: bool,
 ) {
-    let ident = BindingIdentity {
-        slot: binding.slot,
-        queue_id: binding.queue_id,
-        worker_id: binding.worker_id,
-        interface: binding.interface.clone(),
-        ifindex: binding.ifindex,
-    };
+    let ident = binding.identity();
     if binding.device.needs_wakeup() {
         binding.device.wake();
         binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -367,79 +420,23 @@ fn poll_binding(
                 .live
                 .metadata_packets
                 .fetch_add(1, Ordering::Relaxed);
-            match classify_metadata(meta, validation) {
-                PacketDisposition::Valid => {
-                    binding
-                        .live
-                        .validated_packets
-                        .fetch_add(1, Ordering::Relaxed);
-                    binding
-                        .live
-                        .validated_bytes
-                        .fetch_add(desc.len as u64, Ordering::Relaxed);
-                }
-                PacketDisposition::NoSnapshot => {
-                    binding
-                        .live
-                        .exception_packets
-                        .fetch_add(1, Ordering::Relaxed);
-                    record_exception(recent_exceptions, &ident, "no_snapshot", desc, Some(meta));
-                }
-                PacketDisposition::ConfigGenerationMismatch => {
-                    binding
-                        .live
-                        .exception_packets
-                        .fetch_add(1, Ordering::Relaxed);
-                    binding
-                        .live
-                        .config_gen_mismatches
-                        .fetch_add(1, Ordering::Relaxed);
-                    record_exception(
-                        recent_exceptions,
-                        &ident,
-                        "config_generation_mismatch",
-                        desc,
-                        Some(meta),
-                    );
-                }
-                PacketDisposition::FibGenerationMismatch => {
-                    binding
-                        .live
-                        .exception_packets
-                        .fetch_add(1, Ordering::Relaxed);
-                    binding
-                        .live
-                        .fib_gen_mismatches
-                        .fetch_add(1, Ordering::Relaxed);
-                    record_exception(
-                        recent_exceptions,
-                        &ident,
-                        "fib_generation_mismatch",
-                        desc,
-                        Some(meta),
-                    );
-                }
-                PacketDisposition::UnsupportedPacket => {
-                    binding
-                        .live
-                        .exception_packets
-                        .fetch_add(1, Ordering::Relaxed);
-                    binding
-                        .live
-                        .unsupported_packets
-                        .fetch_add(1, Ordering::Relaxed);
-                    record_exception(
-                        recent_exceptions,
-                        &ident,
-                        "unsupported_packet",
-                        desc,
-                        Some(meta),
-                    );
-                }
-            }
+            record_disposition(
+                &ident,
+                &binding.live,
+                classify_metadata(meta, validation),
+                desc.len as u32,
+                Some(meta),
+                recent_exceptions,
+            );
         } else {
             binding.live.metadata_errors.fetch_add(1, Ordering::Relaxed);
-            record_exception(recent_exceptions, &ident, "metadata_parse", desc, None);
+            record_exception(
+                recent_exceptions,
+                &ident,
+                "metadata_parse",
+                desc.len as u32,
+                None,
+            );
         }
         recycle.push(desc.addr);
     }
@@ -472,7 +469,7 @@ fn record_exception(
     recent_exceptions: &mut VecDeque<ExceptionStatus>,
     binding: &BindingIdentity,
     reason: &str,
-    desc: XdpDesc,
+    packet_length: u32,
     meta: Option<UserspaceDpMeta>,
 ) {
     if recent_exceptions.len() >= MAX_RECENT_EXCEPTIONS {
@@ -486,12 +483,72 @@ fn record_exception(
         interface: binding.interface.clone(),
         ifindex: binding.ifindex,
         reason: reason.to_string(),
-        packet_length: desc.len as u32,
+        packet_length,
         addr_family: meta.map(|m| m.addr_family).unwrap_or(0),
         protocol: meta.map(|m| m.protocol).unwrap_or(0),
         config_generation: meta.map(|m| m.config_generation).unwrap_or(0),
         fib_generation: meta.map(|m| m.fib_generation).unwrap_or(0),
     });
+}
+
+fn record_disposition(
+    binding: &BindingIdentity,
+    live: &BindingLiveState,
+    disposition: PacketDisposition,
+    packet_length: u32,
+    meta: Option<UserspaceDpMeta>,
+    recent_exceptions: &mut VecDeque<ExceptionStatus>,
+) {
+    match disposition {
+        PacketDisposition::Valid => {
+            live.validated_packets.fetch_add(1, Ordering::Relaxed);
+            live.validated_bytes
+                .fetch_add(packet_length as u64, Ordering::Relaxed);
+        }
+        PacketDisposition::NoSnapshot => {
+            live.exception_packets.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "no_snapshot",
+                packet_length,
+                meta,
+            );
+        }
+        PacketDisposition::ConfigGenerationMismatch => {
+            live.exception_packets.fetch_add(1, Ordering::Relaxed);
+            live.config_gen_mismatches.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "config_generation_mismatch",
+                packet_length,
+                meta,
+            );
+        }
+        PacketDisposition::FibGenerationMismatch => {
+            live.exception_packets.fetch_add(1, Ordering::Relaxed);
+            live.fib_gen_mismatches.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "fib_generation_mismatch",
+                packet_length,
+                meta,
+            );
+        }
+        PacketDisposition::UnsupportedPacket => {
+            live.exception_packets.fetch_add(1, Ordering::Relaxed);
+            live.unsupported_packets.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "unsupported_packet",
+                packet_length,
+                meta,
+            );
+        }
+    }
 }
 
 fn classify_metadata(meta: UserspaceDpMeta, validation: ValidationState) -> PacketDisposition {
