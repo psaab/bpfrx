@@ -916,13 +916,19 @@ struct SessionFlow {
 
 impl SessionFlow {
     fn reverse_key_with_nat(&self, nat: NatDecision) -> SessionKey {
+        let (src_port, dst_port) = if matches!(self.forward_key.protocol, PROTO_ICMP | PROTO_ICMPV6)
+        {
+            (self.forward_key.src_port, self.forward_key.dst_port)
+        } else {
+            (self.forward_key.dst_port, self.forward_key.src_port)
+        };
         SessionKey {
             addr_family: self.forward_key.addr_family,
             protocol: self.forward_key.protocol,
             src_ip: nat.rewrite_dst.unwrap_or(self.dst_ip),
             dst_ip: nat.rewrite_src.unwrap_or(self.src_ip),
-            src_port: self.forward_key.dst_port,
-            dst_port: self.forward_key.src_port,
+            src_port,
+            dst_port,
         }
     }
 }
@@ -4692,6 +4698,30 @@ mod tests {
     fn tx_binding_resolution_prefers_bind_ifindex_for_vlan_units() {
         let state = build_forwarding_state(&nat_snapshot());
         assert_eq!(resolve_tx_binding_ifindex(&state, 12), 11);
+    }
+
+    #[test]
+    fn icmp_reverse_key_keeps_identifier_position() {
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_ICMP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 0x1234,
+                dst_port: 0,
+            },
+        };
+        let reverse = flow.reverse_key_with_nat(NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+            ..NatDecision::default()
+        });
+        assert_eq!(reverse.src_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        assert_eq!(reverse.dst_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
+        assert_eq!(reverse.src_port, 0x1234);
+        assert_eq!(reverse.dst_port, 0);
     }
 
     #[test]
