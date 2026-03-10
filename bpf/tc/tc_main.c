@@ -81,6 +81,19 @@ int tc_main_prog(struct __sk_buff *skb)
 	if (zone_ptr)
 		meta->egress_zone = zone_ptr->zone_id;
 
+	/* Tunnel egress bypass: when the kernel forwards a packet through
+	 * a tunnel (GRE, ip6gre, XFRM), TC egress fires on the tunnel
+	 * device with the INNER packet before encapsulation.  The XDP
+	 * pipeline already validated, conntracked, and NAT'd this traffic.
+	 * TC conntrack won't find a session match (post-NAT IPs don't
+	 * match pre-NAT session keys), and the ingress_ifindex != 0 drop
+	 * would kill the packet.  Pass it through — kernel handles
+	 * encapsulation after TC returns. */
+	if (zone_ptr && (zone_ptr->flags & IFACE_FLAG_TUNNEL) &&
+	    skb->ingress_ifindex != 0) {
+		return TC_ACT_OK;
+	}
+
 	/* Suppress outgoing MLDv2 reports on RETH member interfaces.
 	 * The kernel's IPv6 stack sends periodic MLDv2 listener reports
 	 * for multicast groups joined by VIP addresses — unnecessary noise

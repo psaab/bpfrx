@@ -89,7 +89,7 @@ int xdp_forward_prog(struct xdp_md *ctx)
 			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
 				return XDP_DROP;
 			inc_counter(GLOBAL_CTR_HOST_INBOUND);
-			return XDP_PASS;
+			return tunnel_pass(ctx, meta);
 		}
 		__u32 zone_key = (__u32)meta->ingress_zone;
 		struct zone_config *zcfg = bpf_map_lookup_elem(&zone_configs, &zone_key);
@@ -130,7 +130,7 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		}
 		inc_counter(GLOBAL_CTR_HOST_INBOUND);
 		/* flags==0 means no host-inbound configured → allow all */
-		return XDP_PASS;
+		return tunnel_pass(ctx, meta);
 	}
 
 	/*
@@ -148,14 +148,14 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		if ((void *)(iph_ttl + 1) <= data_end && iph_ttl->ttl <= 1) {
 			if (meta->ingress_vlan_id != 0)
 				xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
-			return XDP_PASS;
+			return tunnel_pass(ctx, meta);
 		}
 	} else {
 		struct ipv6hdr *ip6h_ttl = data + sizeof(struct ethhdr);
 		if ((void *)(ip6h_ttl + 1) <= data_end && ip6h_ttl->hop_limit <= 1) {
 			if (meta->ingress_vlan_id != 0)
 				xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
-			return XDP_PASS;
+			return tunnel_pass(ctx, meta);
 		}
 	}
 
@@ -171,7 +171,7 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		inc_counter(GLOBAL_CTR_TX_PACKETS);
 		inc_iface_tx(meta->fwd_ifindex, meta->pkt_len);
 		inc_zone_egress((__u32)meta->egress_zone, meta->pkt_len);
-		return XDP_PASS;
+		return tunnel_pass(ctx, meta);
 	}
 
 	/* Push VLAN tag if egress is a VLAN sub-interface */
@@ -257,7 +257,7 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		/* Store mirror info in meta for TC egress to pick up */
 		meta->mirror_ifindex = mcfg->mirror_ifindex;
 		meta->mirror_rate = mcfg->rate;
-		return XDP_PASS;
+		return tunnel_pass(ctx, meta);
 	}
 
 	/* Redirect via devmap to egress interface */

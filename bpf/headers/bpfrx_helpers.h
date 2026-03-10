@@ -47,6 +47,21 @@ parse_ethhdr(void *data, void *data_end, __u16 *l3_offset, __u16 *eth_proto,
 }
 
 /*
+ * Strip the pseudo-Ethernet header prepended by xdp_main for tunnel
+ * (POINTOPOINT) packets before XDP_PASS to the kernel stack.
+ * The kernel expects raw IP on tunnel devices, not Ethernet frames.
+ */
+static __always_inline int
+tunnel_pass(struct xdp_md *ctx, struct pkt_meta *meta)
+{
+	if (meta->meta_flags & META_FLAG_TUNNEL) {
+		if (bpf_xdp_adjust_head(ctx, (int)sizeof(struct ethhdr)))
+			return XDP_DROP;
+	}
+	return XDP_PASS;
+}
+
+/*
  * Strip 802.1Q VLAN tag from an XDP packet by shifting the Ethernet
  * header 4 bytes forward and shrinking the head.
  * Returns 0 on success, -1 on failure.

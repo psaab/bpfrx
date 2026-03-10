@@ -1032,6 +1032,11 @@ func enableForwarding() {
 		// interfaces from sockets not bound to the VRF (needed for SSH).
 		"/proc/sys/net/ipv4/tcp_l3mdev_accept": "1",
 		"/proc/sys/net/ipv4/udp_l3mdev_accept": "1",
+		// accept_local: allow packets with a source IP that is local to the
+		// machine on a different interface. Required when XDP SNAT rewrites
+		// src to a tunnel endpoint IP and XDP_PASS to kernel for routing —
+		// kernel would otherwise reject the packet as a martian.
+		"/proc/sys/net/ipv4/conf/all/accept_local": "1",
 	}
 	for path, val := range sysctls {
 		if err := os.WriteFile(path, []byte(val), 0644); err != nil {

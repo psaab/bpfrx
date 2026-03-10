@@ -269,6 +269,14 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 	// eBPF-specific: attach XDP/TC programs AFTER all maps are populated.
 	// link.Update() atomically switches to programs with complete config.
 	for _, ifidx := range result.pendingTC {
+		// Skip TC egress for tunnel interfaces — kernel forwards the
+		// inner packet to the tunnel device before encapsulation, and
+		// TC egress would see it with ingress_ifindex != 0 and drop it.
+		if result.tunnelIfindexes[ifidx] {
+			m.DetachTC(ifidx)
+			slog.Info("skipping TC for tunnel interface", "ifindex", ifidx)
+			continue
+		}
 		if err := m.AttachTC(ifidx); err != nil {
 			if !strings.Contains(err.Error(), "already attached") {
 				return nil, fmt.Errorf("attach TC to ifindex %d: %w", ifidx, err)
@@ -789,7 +797,17 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 					// Defer actual XDP/TC attachment to after all compile phases
 					// so link.Update() switches to programs with fully-populated maps.
 					xdpIfindexes = append(xdpIfindexes, physIface.Index)
-					result.pendingTC = append(result.pendingTC, physIface.Index)
+					// Skip TC egress for tunnel interfaces — kernel forwards
+					// the inner packet to the tunnel device, and TC egress
+					// would see it with ingress_ifindex != 0 and drop it.
+					// Tunnels need XDP for ingress (decapsulated traffic)
+					// but not TC for egress (encapsulation is kernel work).
+					if !tunnelIfindexes[physIface.Index] {
+						result.pendingTC = append(result.pendingTC, physIface.Index)
+					} else {
+						slog.Info("skipping TC for tunnel interface",
+							"name", physName, "ifindex", physIface.Index)
+					}
 				}
 				attached[physIface.Index] = true
 			}

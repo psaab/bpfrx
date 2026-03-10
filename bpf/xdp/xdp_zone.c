@@ -1706,6 +1706,31 @@ zone_resolved:
 				      XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
+		/*
+		 * Tunnel interface: NO_NEIGH is permanent for POINTOPOINT
+		 * (no ARP/NDP entry will ever exist).  Unlike normal
+		 * NO_NEIGH where the kernel resolves ARP and retransmit
+		 * goes through the full pipeline, tunnel packets must be
+		 * processed on the FIRST attempt — go through the full
+		 * conntrack/policy/nat pipeline so SNAT is applied.
+		 * xdp_forward will XDP_PASS (redirect_capable=0).
+		 */
+		{
+			__u32 nn_if = fib.ifindex;
+			struct iface_zone_key nn_zk = {
+				.ifindex = nn_if, .vlan_id = 0,
+			};
+			struct iface_zone_value *nn_zv =
+				bpf_map_lookup_elem(&iface_zone_map,
+						    &nn_zk);
+			if (nn_zv && (nn_zv->flags & IFACE_FLAG_TUNNEL)) {
+				resolve_fib_result(meta, &fib);
+				meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
+				bpf_tail_call(ctx, &xdp_progs,
+					      XDP_PROG_CONNTRACK);
+				return XDP_PASS;
+			}
+		}
 		/* FABRIC_FWD transit: fabric redirects that failed both
 		 * zone-encoded and plain redirect (anti-loop) and have
 		 * no local session.  Drop rather than leaking transit

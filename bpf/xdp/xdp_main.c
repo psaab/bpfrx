@@ -61,6 +61,43 @@ int xdp_main_prog(struct xdp_md *ctx)
 	void *data_end = (void *)(long)ctx->data_end;
 	__u16 l3_offset, eth_proto, vlan_id = 0;
 
+	/* Tunnel interfaces (GRE, ip6gre, XFRM) deliver raw IP with no
+	 * Ethernet header.  Detect via IFACE_FLAG_TUNNEL and prepend a
+	 * pseudo-Ethernet header so the rest of the pipeline has
+	 * consistent Ethernet framing.  xdp_forward strips it before
+	 * any XDP_PASS back to the kernel. */
+	{
+		struct iface_zone_key zk = {
+			.ifindex = ctx->ingress_ifindex,
+			.vlan_id = 0,
+		};
+		struct iface_zone_value *zv =
+			bpf_map_lookup_elem(&iface_zone_map, &zk);
+		if (zv && (zv->flags & IFACE_FLAG_TUNNEL)) {
+			__u8 *first = data;
+			if ((void *)(first + 1) > data_end)
+				return XDP_DROP;
+			__u8 ver = (*first) >> 4;
+			__be16 proto;
+			if (ver == 4)
+				proto = bpf_htons(ETH_P_IP);
+			else if (ver == 6)
+				proto = bpf_htons(0x86DD);
+			else
+				return XDP_PASS;
+			if (bpf_xdp_adjust_head(ctx,
+					-(int)sizeof(struct ethhdr)))
+				return XDP_DROP;
+			data     = (void *)(long)ctx->data;
+			data_end = (void *)(long)ctx->data_end;
+			struct ethhdr *eth = data;
+			if ((void *)(eth + 1) > data_end)
+				return XDP_DROP;
+			__builtin_memset(eth, 0, sizeof(*eth));
+			eth->h_proto = proto;
+		}
+	}
+
 	/* Parse Ethernet header (extracts VLAN ID if present) */
 	if (parse_ethhdr(data, data_end, &l3_offset, &eth_proto, &vlan_id) < 0)
 		return XDP_DROP;
