@@ -4656,15 +4656,29 @@ fn build_forwarded_frame_into(
             if out[ip_start + 8] <= 1 {
                 return None;
             }
+            let old_src = Ipv4Addr::new(
+                out[ip_start + 12],
+                out[ip_start + 13],
+                out[ip_start + 14],
+                out[ip_start + 15],
+            );
+            let old_dst = Ipv4Addr::new(
+                out[ip_start + 16],
+                out[ip_start + 17],
+                out[ip_start + 18],
+                out[ip_start + 19],
+            );
+            let old_ttl = out[ip_start + 8];
             if apply_nat {
                 apply_nat_ipv4(&mut out[ip_start..], meta.protocol, decision.nat)?;
             }
             out[ip_start + 8] -= 1;
-            out[ip_start + 10] = 0;
-            out[ip_start + 11] = 0;
-            let sum = checksum16(&out[ip_start..ip_start + ihl]);
-            out[ip_start + 10] = (sum >> 8) as u8;
-            out[ip_start + 11] = sum as u8;
+            adjust_ipv4_header_checksum(
+                &mut out[ip_start..ip_start + ihl],
+                old_src,
+                old_dst,
+                old_ttl,
+            )?;
         }
         libc::AF_INET6 => {
             if out.len() < ip_start + 40 {
@@ -4690,18 +4704,32 @@ fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
     if packet.len() < 20 {
         return None;
     }
-    if let Some(IpAddr::V4(ip)) = nat.rewrite_src {
+    let old_src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let old_dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let new_src = nat.rewrite_src.and_then(|ip| match ip {
+        IpAddr::V4(ip) => Some(ip),
+        _ => None,
+    });
+    let new_dst = nat.rewrite_dst.and_then(|ip| match ip {
+        IpAddr::V4(ip) => Some(ip),
+        _ => None,
+    });
+    if let Some(ip) = new_src {
         packet.get_mut(12..16)?.copy_from_slice(&ip.octets());
     }
-    if let Some(IpAddr::V4(ip)) = nat.rewrite_dst {
+    if let Some(ip) = new_dst {
         packet.get_mut(16..20)?.copy_from_slice(&ip.octets());
     }
     let ihl = ((packet[0] & 0x0f) as usize) * 4;
     if ihl < 20 || packet.len() < ihl {
         return None;
     }
+    let new_src = new_src.unwrap_or(old_src);
+    let new_dst = new_dst.unwrap_or(old_dst);
     match protocol {
-        PROTO_TCP => recompute_l4_checksum_ipv4(packet, ihl, protocol, false)?,
+        PROTO_TCP => {
+            adjust_l4_checksum_ipv4(packet, ihl, protocol, old_src, new_src, old_dst, new_dst)?
+        }
         PROTO_UDP => {
             let checksum_offset = ihl.checked_add(6)?;
             let keep_zero = packet
@@ -4709,7 +4737,7 @@ fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
                 .map(|bytes| bytes == [0, 0])
                 .unwrap_or(false);
             if !keep_zero {
-                recompute_l4_checksum_ipv4(packet, ihl, protocol, false)?;
+                adjust_l4_checksum_ipv4(packet, ihl, protocol, old_src, new_src, old_dst, new_dst)?;
             }
         }
         _ => {}
@@ -4724,14 +4752,28 @@ fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
     if packet.len() < 40 {
         return None;
     }
-    if let Some(IpAddr::V6(ip)) = nat.rewrite_src {
+    let old_src = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(8..24)?).ok()?);
+    let old_dst = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(24..40)?).ok()?);
+    let new_src = nat.rewrite_src.and_then(|ip| match ip {
+        IpAddr::V6(ip) => Some(ip),
+        _ => None,
+    });
+    let new_dst = nat.rewrite_dst.and_then(|ip| match ip {
+        IpAddr::V6(ip) => Some(ip),
+        _ => None,
+    });
+    if let Some(ip) = new_src {
         packet.get_mut(8..24)?.copy_from_slice(&ip.octets());
     }
-    if let Some(IpAddr::V6(ip)) = nat.rewrite_dst {
+    if let Some(ip) = new_dst {
         packet.get_mut(24..40)?.copy_from_slice(&ip.octets());
     }
+    let new_src = new_src.unwrap_or(old_src);
+    let new_dst = new_dst.unwrap_or(old_dst);
     match protocol {
-        PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => recompute_l4_checksum_ipv6(packet, protocol)?,
+        PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {
+            adjust_l4_checksum_ipv6(packet, protocol, old_src, new_src, old_dst, new_dst)?
+        }
         _ => {}
     }
     Some(())
@@ -4884,6 +4926,69 @@ fn checksum16(bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+fn checksum16_finish(mut sum: u32) -> u16 {
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn checksum16_adjust(checksum: u16, old_words: &[u16], new_words: &[u16]) -> u16 {
+    let mut sum = (!checksum as u32) & 0xffff;
+    for word in old_words {
+        sum += (!u32::from(*word)) & 0xffff;
+    }
+    for word in new_words {
+        sum += u32::from(*word);
+    }
+    checksum16_finish(sum)
+}
+
+fn ipv4_words(ip: Ipv4Addr) -> [u16; 2] {
+    let octets = ip.octets();
+    [
+        u16::from_be_bytes([octets[0], octets[1]]),
+        u16::from_be_bytes([octets[2], octets[3]]),
+    ]
+}
+
+fn ipv6_words(ip: Ipv6Addr) -> [u16; 8] {
+    let octets = ip.octets();
+    [
+        u16::from_be_bytes([octets[0], octets[1]]),
+        u16::from_be_bytes([octets[2], octets[3]]),
+        u16::from_be_bytes([octets[4], octets[5]]),
+        u16::from_be_bytes([octets[6], octets[7]]),
+        u16::from_be_bytes([octets[8], octets[9]]),
+        u16::from_be_bytes([octets[10], octets[11]]),
+        u16::from_be_bytes([octets[12], octets[13]]),
+        u16::from_be_bytes([octets[14], octets[15]]),
+    ]
+}
+
+fn adjust_ipv4_header_checksum(
+    packet: &mut [u8],
+    old_src: Ipv4Addr,
+    old_dst: Ipv4Addr,
+    old_ttl: u8,
+) -> Option<()> {
+    if packet.len() < 20 {
+        return None;
+    }
+    let current = u16::from_be_bytes([packet[10], packet[11]]);
+    let new_src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let new_dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let old_ttl_word = u16::from_be_bytes([old_ttl, packet[9]]);
+    let new_ttl_word = u16::from_be_bytes([packet[8], packet[9]]);
+    let mut updated = checksum16_adjust(current, &ipv4_words(old_src), &ipv4_words(new_src));
+    updated = checksum16_adjust(updated, &ipv4_words(old_dst), &ipv4_words(new_dst));
+    updated = checksum16_adjust(updated, &[old_ttl_word], &[new_ttl_word]);
+    packet
+        .get_mut(10..12)?
+        .copy_from_slice(&updated.to_be_bytes());
+    Some(())
+}
+
 fn checksum16_ipv6(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, payload: &[u8]) -> u16 {
     let mut pseudo = Vec::with_capacity(40 + payload.len());
     pseudo.extend_from_slice(&src.octets());
@@ -4903,6 +5008,63 @@ fn checksum16_ipv4(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, payload: &[u8]) -
     pseudo.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     pseudo.extend_from_slice(payload);
     checksum16(&pseudo)
+}
+
+fn adjust_l4_checksum_ipv4(
+    packet: &mut [u8],
+    ihl: usize,
+    protocol: u8,
+    old_src: Ipv4Addr,
+    new_src: Ipv4Addr,
+    old_dst: Ipv4Addr,
+    new_dst: Ipv4Addr,
+) -> Option<()> {
+    let checksum_offset = match protocol {
+        PROTO_TCP => ihl.checked_add(16)?,
+        PROTO_UDP => ihl.checked_add(6)?,
+        _ => return Some(()),
+    };
+    let current = u16::from_be_bytes([
+        *packet.get(checksum_offset)?,
+        *packet.get(checksum_offset + 1)?,
+    ]);
+    let mut updated = checksum16_adjust(current, &ipv4_words(old_src), &ipv4_words(new_src));
+    updated = checksum16_adjust(updated, &ipv4_words(old_dst), &ipv4_words(new_dst));
+    if matches!(protocol, PROTO_UDP) && updated == 0 {
+        updated = 0xffff;
+    }
+    packet
+        .get_mut(checksum_offset..checksum_offset + 2)?
+        .copy_from_slice(&updated.to_be_bytes());
+    Some(())
+}
+
+fn adjust_l4_checksum_ipv6(
+    packet: &mut [u8],
+    protocol: u8,
+    old_src: Ipv6Addr,
+    new_src: Ipv6Addr,
+    old_dst: Ipv6Addr,
+    new_dst: Ipv6Addr,
+) -> Option<()> {
+    let checksum_offset = match protocol {
+        PROTO_TCP => 40usize.checked_add(16)?,
+        PROTO_UDP | PROTO_ICMPV6 => 40usize.checked_add(6)?,
+        _ => return Some(()),
+    };
+    let current = u16::from_be_bytes([
+        *packet.get(checksum_offset)?,
+        *packet.get(checksum_offset + 1)?,
+    ]);
+    let mut updated = checksum16_adjust(current, &ipv6_words(old_src), &ipv6_words(new_src));
+    updated = checksum16_adjust(updated, &ipv6_words(old_dst), &ipv6_words(new_dst));
+    if matches!(protocol, PROTO_UDP | PROTO_ICMPV6) && updated == 0 {
+        updated = 0xffff;
+    }
+    packet
+        .get_mut(checksum_offset..checksum_offset + 2)?
+        .copy_from_slice(&updated.to_be_bytes());
+    Some(())
 }
 
 fn recompute_l4_checksum_ipv4(
