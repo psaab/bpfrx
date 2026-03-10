@@ -221,6 +221,9 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     if should_fallback_early(&parsed) {
         return fallback_to_main(ctx);
     }
+    if is_local_destination(&parsed) {
+        return fallback_to_main(ctx);
+    }
 
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
@@ -420,6 +423,15 @@ fn should_fallback_early(pkt: &ParsedPacket) -> bool {
             }
             false
         }
+        _ => true,
+    }
+}
+
+fn is_local_destination(pkt: &ParsedPacket) -> bool {
+    match pkt.addr_family {
+        AF_INET => unsafe { USERSPACE_LOCAL_V4.get(&pkt.dst_v4) }.is_some(),
+        AF_INET6 => unsafe { USERSPACE_LOCAL_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_v6 }) }
+            .is_some(),
         _ => true,
     }
 }
