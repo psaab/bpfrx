@@ -1123,18 +1123,38 @@ impl BindingWorker {
         live: Arc<BindingLiveState>,
         shared_umem: &WorkerSharedUmem,
         partition_start_frame: u32,
+        use_shared_socket: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let info = ifinfo_from_binding(binding)?;
-        let sock = Socket::new(&info).map_err(|e| format!("create socket: {e}"))?;
-        let mut device = shared_umem
+        let open_socket = || {
+            if use_shared_socket {
+                Socket::with_shared(&info, &shared_umem._umem)
+            } else {
+                Socket::new(&info)
+            }
+            .map_err(|e| format!("create socket: {e}"))
+        };
+        let sock = open_socket()?;
+        let preferred_device = shared_umem
             ._umem
             .fq_cq(&sock)
             .map_err(|e| format!("create fq/cq: {e}"))?;
-        let (user, rx, tx, bind_mode) =
-            match open_user_rings(&shared_umem._umem, &sock, ring_entries, XSK_BIND_FLAGS_PREFERRED)
-            {
-                Ok(bound) => bound,
-                Err(preferred_err) => open_user_rings(
+        let (user, rx, tx, bind_mode, mut device) = match open_user_rings(
+            &shared_umem._umem,
+            &sock,
+            ring_entries,
+            XSK_BIND_FLAGS_PREFERRED,
+        ) {
+            Ok((user, rx, tx, bind_mode)) => (user, rx, tx, bind_mode, preferred_device),
+            Err(preferred_err) => {
+                drop(preferred_device);
+                drop(sock);
+                let sock = open_socket()?;
+                let device = shared_umem
+                    ._umem
+                    .fq_cq(&sock)
+                    .map_err(|e| format!("create fq/cq: {e}"))?;
+                let (user, rx, tx, bind_mode) = open_user_rings(
                     &shared_umem._umem,
                     &sock,
                     ring_entries,
@@ -1144,8 +1164,10 @@ impl BindingWorker {
                     format!(
                         "configure AF_XDP rings: zerocopy={preferred_err}; fallback={fallback_err}"
                     )
-                })?,
-            };
+                })?;
+                (user, rx, tx, bind_mode, device)
+            }
+        };
         let reserved_tx = ring_entries
             .saturating_div(4)
             .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
@@ -3254,7 +3276,7 @@ fn remove_shared_session(
         }
     };
     let mut partition_start_frame = 0u32;
-    for plan in binding_plans {
+    for (idx, plan) in binding_plans.into_iter().enumerate() {
         match BindingWorker::create(
             &plan.status,
             plan.ring_entries,
@@ -3263,6 +3285,7 @@ fn remove_shared_session(
             plan.live.clone(),
             &shared_umem,
             partition_start_frame,
+            idx == 0,
         ) {
             Ok(binding) => bindings.push(binding),
             Err(err) => plan.live.set_error(err.to_string()),
