@@ -216,13 +216,13 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let data_end = ctx.data_end();
     let packet_len = data_end.saturating_sub(data);
     let Some(parsed) = parse_packet(data, data_end) else {
-        return pass_to_kernel();
+        return fallback_to_main(ctx);
     };
     if should_fallback_early(&parsed) {
-        return pass_to_kernel();
+        return fallback_to_main(ctx);
     }
     if is_local_destination(&parsed) {
-        return pass_to_kernel();
+        return fallback_to_main(ctx);
     }
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
@@ -275,12 +275,8 @@ fn fallback_to_main(ctx: &XdpContext) -> Result<u32, i64> {
     Ok(xdp_action::XDP_DROP)
 }
 
-fn pass_to_kernel() -> Result<u32, i64> {
-    Ok(xdp_action::XDP_PASS)
-}
-
 fn pass_to_kernel_or_abort() -> u32 {
-    pass_to_kernel().unwrap_or(xdp_action::XDP_ABORTED)
+    xdp_action::XDP_PASS
 }
 
 #[derive(Clone, Copy)]
