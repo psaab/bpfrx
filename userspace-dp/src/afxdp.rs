@@ -972,6 +972,7 @@ struct BindingWorker {
     rx: xdpilone::RingRx,
     tx: xdpilone::RingTx,
     free_tx_frames: VecDeque<u64>,
+    pending_tx_local: VecDeque<TxRequest>,
     pending_fill_frames: VecDeque<u64>,
     heartbeat_map_fd: c_int,
     last_heartbeat_update: Instant,
@@ -1027,6 +1028,12 @@ impl ResolutionDebug {
 #[derive(Clone, Debug)]
 struct TxRequest {
     bytes: Vec<u8>,
+}
+
+struct PendingForwardRequest {
+    target_ifindex: i32,
+    ingress_queue_id: u32,
+    frame: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -1117,6 +1124,7 @@ impl BindingWorker {
             rx,
             tx,
             free_tx_frames,
+            pending_tx_local: VecDeque::new(),
             pending_fill_frames: VecDeque::new(),
             heartbeat_map_fd,
             last_heartbeat_update: Instant::now(),
@@ -1208,6 +1216,7 @@ fn poll_binding(
 
     let mut received = binding.rx.receive(available);
     let mut recycle = Vec::with_capacity(available as usize);
+    let mut pending_forwards = Vec::with_capacity(available as usize);
     let mut batch_packets = 0u64;
     let mut batch_bytes = 0u64;
     while let Some(desc) = received.read() {
@@ -1584,19 +1593,22 @@ fn poll_binding(
                     decision.resolution.disposition,
                     ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
                 ) {
-                    forward_live_packet(
-                        left,
+                    if let Some(request) = build_live_forward_request(
                         &ident,
-                        binding.ifindex,
-                        binding.live.clone(),
+                        &binding.live,
                         &binding.area,
-                        right,
-                        forwarding,
                         desc,
                         meta,
                         &decision,
+                        forwarding,
                         recent_exceptions,
-                    );
+                    ) {
+                        pending_forwards.push(PendingForwardRequest {
+                            target_ifindex: request.target_ifindex,
+                            ingress_queue_id: ident.queue_id,
+                            frame: request.frame,
+                        });
+                    }
                 } else {
                     maybe_reinject_slow_path(
                         &ident,
@@ -1633,6 +1645,14 @@ fn poll_binding(
     );
     received.release();
     drop(received);
+    enqueue_pending_forwards(
+        left,
+        binding,
+        right,
+        pending_forwards,
+        &ident,
+        recent_exceptions,
+    );
     if !recycle.is_empty() {
         binding.pending_fill_frames.extend(recycle.into_iter());
         let _ = drain_pending_fill(binding);
@@ -1652,20 +1672,18 @@ fn poll_binding(
     true
 }
 
-fn forward_live_packet(
-    left: &[BindingWorker],
+fn build_live_forward_request(
     ingress_ident: &BindingIdentity,
-    ingress_ifindex: i32,
-    ingress_live: Arc<BindingLiveState>,
+    ingress_live: &BindingLiveState,
     ingress_area: &MmapArea,
-    right: &[BindingWorker],
-    forwarding: &ForwardingState,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
+    forwarding: &ForwardingState,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
-) {
-    let Some(frame) = build_forwarded_frame(ingress_area, desc, meta, decision, forwarding) else {
+) -> Option<PendingForwardRequest> {
+    let Some(frame) = build_forwarded_frame(ingress_area, desc, meta, decision, forwarding)
+    else {
         record_exception(
             recent_exceptions,
             ingress_ident,
@@ -1674,7 +1692,7 @@ fn forward_live_packet(
             Some(meta),
             None,
         );
-        return;
+        return None;
     };
     if decision.nat.rewrite_src.is_some() {
         ingress_live.snat_packets.fetch_add(1, Ordering::Relaxed);
@@ -1690,38 +1708,45 @@ fn forward_live_packet(
             decision.resolution.egress_ifindex
         },
     );
-    let Some(target_live) = find_target_live(
-        left,
-        ingress_ifindex,
-        ingress_ident.queue_id,
-        ingress_ident.worker_id,
-        ingress_live.clone(),
-        right,
+    Some(PendingForwardRequest {
         target_ifindex,
+        ingress_queue_id: ingress_ident.queue_id,
+        frame,
+    })
+}
+
+fn enqueue_pending_forwards(
+    left: &mut [BindingWorker],
+    ingress_binding: &mut BindingWorker,
+    right: &mut [BindingWorker],
+    pending_forwards: Vec<PendingForwardRequest>,
+    ingress_ident: &BindingIdentity,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+) {
+    for request in pending_forwards {
+        let Some(target_binding) = find_target_binding_mut(
+        left,
+        ingress_binding,
+        request.ingress_queue_id,
+        right,
+        request.target_ifindex,
     ) else {
         record_exception(
             recent_exceptions,
             ingress_ident,
             "missing_egress_binding",
-            desc.len as u32,
-            Some(meta),
+            request.frame.len() as u32,
+            None,
             None,
         );
-        return;
-    };
-    if let Err(err) = target_live.enqueue_tx(TxRequest { bytes: frame }) {
-        ingress_live
-            .exception_packets
-            .fetch_add(1, Ordering::Relaxed);
-        ingress_live.set_error(err.clone());
-        record_exception(
-            recent_exceptions,
-            ingress_ident,
-            "enqueue_tx_failed",
-            desc.len as u32,
-            Some(meta),
-            None,
-        );
+            continue;
+        };
+        target_binding
+            .pending_tx_local
+            .push_back(TxRequest { bytes: request.frame });
+        if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
+            let _ = drain_pending_tx(target_binding);
+        }
     }
 }
 
@@ -2141,35 +2166,35 @@ fn learn_dynamic_neighbor(
     }
 }
 
-fn find_target_live(
-    left: &[BindingWorker],
-    ingress_ifindex: i32,
+fn find_target_binding_mut<'a>(
+    left: &'a mut [BindingWorker],
+    ingress_binding: &'a mut BindingWorker,
     ingress_queue_id: u32,
-    ingress_worker_id: u32,
-    ingress_live: Arc<BindingLiveState>,
-    right: &[BindingWorker],
+    right: &'a mut [BindingWorker],
     egress_ifindex: i32,
-) -> Option<Arc<BindingLiveState>> {
-    if ingress_ifindex == egress_ifindex {
-        return Some(ingress_live);
+) -> Option<&'a mut BindingWorker> {
+    if ingress_binding.ifindex == egress_ifindex {
+        return Some(ingress_binding);
     }
-    let candidates = left
+    if let Some(pos) = left
         .iter()
-        .chain(right.iter())
-        .filter(|binding| binding.ifindex == egress_ifindex)
-        .collect::<Vec<_>>();
-    candidates
+        .position(|binding| binding.ifindex == egress_ifindex && binding.queue_id == ingress_queue_id)
+    {
+        return Some(&mut left[pos]);
+    }
+    if let Some(pos) = right
         .iter()
-        .find(|binding| binding.queue_id == ingress_queue_id)
-        .copied()
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|binding| binding.worker_id == ingress_worker_id)
-                .copied()
-        })
-        .or_else(|| candidates.first().copied())
-        .map(|binding| binding.live.clone())
+        .position(|binding| binding.ifindex == egress_ifindex && binding.queue_id == ingress_queue_id)
+    {
+        return Some(&mut right[pos]);
+    }
+    if let Some(pos) = left.iter().position(|binding| binding.ifindex == egress_ifindex) {
+        return Some(&mut left[pos]);
+    }
+    if let Some(pos) = right.iter().position(|binding| binding.ifindex == egress_ifindex) {
+        return Some(&mut right[pos]);
+    }
+    None
 }
 
 fn flush_session_deltas(
@@ -2300,7 +2325,9 @@ fn drain_pending_fill(binding: &mut BindingWorker) -> bool {
 }
 
 fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
-    let mut pending = binding.live.take_pending_tx();
+    let mut pending = core::mem::take(&mut binding.pending_tx_local);
+    let mut shared = binding.live.take_pending_tx();
+    pending.append(&mut shared);
     if pending.is_empty() {
         return false;
     }
@@ -2330,9 +2357,10 @@ fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
         }
     }
     if !retry.is_empty() {
-        binding.live.prepend_pending_tx(retry);
+        retry.append(&mut binding.pending_tx_local);
+        binding.pending_tx_local = retry;
     }
-    did_work || !binding.live.pending_tx_empty()
+    did_work || !binding.pending_tx_local.is_empty() || !binding.live.pending_tx_empty()
 }
 
 enum TxError {
@@ -5032,13 +5060,6 @@ impl BindingLiveState {
         match self.pending_tx.lock() {
             Ok(mut pending) => core::mem::take(&mut *pending),
             Err(_) => VecDeque::new(),
-        }
-    }
-
-    fn prepend_pending_tx(&self, mut retry: VecDeque<TxRequest>) {
-        if let Ok(mut pending) = self.pending_tx.lock() {
-            retry.append(&mut *pending);
-            *pending = retry;
         }
     }
 
