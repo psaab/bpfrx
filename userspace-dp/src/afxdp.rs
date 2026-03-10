@@ -48,7 +48,6 @@ const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
 const RX_WAKE_MIN_INTERVAL_NS: u64 = 200_000;
-const STATS_POLL_INTERVAL_NS: u64 = 1_000_000_000;
 const NEIGHBOR_SYNC_INTERVAL_NS: u64 = 1_000_000_000;
 const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
 const TX_WAKE_MIN_INTERVAL_NS: u64 = 50_000;
@@ -1372,7 +1371,6 @@ fn poll_binding(
     _recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
-    poll_stats: bool,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) -> bool {
     #[derive(Default)]
@@ -1452,9 +1450,6 @@ fn poll_binding(
         let available = binding.rx.available().min(RX_BATCH_SIZE);
         if available == 0 {
             maybe_wake_rx(binding, false, now_ns);
-            if poll_stats {
-                poll_kernel_stats(&binding.user, &binding.live);
-            }
             return did_work;
         }
         binding.empty_rx_polls = 0;
@@ -1919,9 +1914,6 @@ fn poll_binding(
             .fetch_add(batch_bytes, Ordering::Relaxed);
         binding.live.rx_batches.fetch_add(1, Ordering::Relaxed);
         did_work = true;
-    }
-    if poll_stats {
-        poll_kernel_stats(&binding.user, &binding.live);
     }
     did_work
 }
@@ -3528,7 +3520,6 @@ fn worker_loop(
             Err(err) => plan.live.set_error(err.to_string()),
         }
     }
-    let mut last_stats_poll_ns = 0u64;
     let mut last_neighbor_sync_ns = 0u64;
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
@@ -3549,7 +3540,6 @@ fn worker_loop(
                     .fetch_add(expired, Ordering::Relaxed);
             }
         }
-        let poll_stats = loop_now_ns.saturating_sub(last_stats_poll_ns) >= STATS_POLL_INTERVAL_NS;
         let poll_neighbors = worker_id == 0
             && loop_now_ns.saturating_sub(last_neighbor_sync_ns) >= NEIGHBOR_SYNC_INTERVAL_NS;
         if poll_neighbors {
@@ -3575,7 +3565,6 @@ fn worker_loop(
                 &recent_session_deltas,
                 &last_resolution,
                 &peer_worker_commands,
-                poll_stats,
                 &mut shared_recycles,
             ) {
                 did_work = true;
@@ -3610,7 +3599,6 @@ fn worker_loop(
                 &recent_session_deltas,
                 &last_resolution,
                 &peer_worker_commands,
-                poll_stats,
                 &mut shared_recycles,
             ) {
                 did_work = true;
@@ -3632,9 +3620,6 @@ fn worker_loop(
                     &peer_worker_commands,
                 );
             }
-        }
-        if poll_stats {
-            last_stats_poll_ns = loop_now_ns;
         }
         if did_work {
             idle_iters = 0;
@@ -3723,18 +3708,6 @@ fn classify_metadata(meta: UserspaceDpMeta, validation: ValidationState) -> Pack
     match meta.addr_family as i32 {
         libc::AF_INET | libc::AF_INET6 => PacketDisposition::Valid,
         _ => PacketDisposition::UnsupportedPacket,
-    }
-}
-
-fn poll_kernel_stats(user: &User, live: &BindingLiveState) {
-    match user.statistics_v2() {
-        Ok(stats) => {
-            live.kernel_rx_dropped
-                .store(stats.rx_dropped, Ordering::Relaxed);
-            live.kernel_rx_invalid_descs
-                .store(stats.rx_invalid_descs, Ordering::Relaxed);
-        }
-        Err(err) => live.set_error(format!("read XSK stats: {err}")),
     }
 }
 
