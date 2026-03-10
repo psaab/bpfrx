@@ -132,13 +132,10 @@ int xdp_main_prog(struct xdp_md *ctx)
 	meta->now_sec = (__u32)(bpf_ktime_get_coarse_ns() / 1000000000ULL);
 	meta->ktime_ns = 0;
 
-	/* Detect native XDP: skip CHECKSUM_PARTIAL detection in parser. */
-	{
-		__u32 ifidx = ctx->ingress_ifindex;
-		__u8 *rc = bpf_map_lookup_elem(&redirect_capable, &ifidx);
-		if (rc && *rc)
-			meta->native_xdp = 1;
-	}
+	/* Note: native_xdp detection removed — always run CHECKSUM_PARTIAL
+	 * detection in set_l4_csum_flags().  The ~10-30 insn cost is
+	 * negligible, and skipping it for generic XDP (which preserves
+	 * skb checksums) corrupts TCP/UDP checksums after NAT. */
 
 	/* Strip VLAN tag if present so pipeline sees plain Ethernet */
 	if (vlan_id != 0) {

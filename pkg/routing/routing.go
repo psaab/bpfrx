@@ -1247,9 +1247,10 @@ func (m *Manager) clearRibGroupRules() error {
 }
 
 // pbrRulePriority is the base priority for policy-based routing ip rules.
-// After rib-group rules (33000-33099), before the default table (32766 is main).
-// We use 34000-34999 range.
-const pbrRulePriority = 34000
+// BEFORE the main table (32766) so the kernel also honors PBR for XDP_PASS'd
+// packets (e.g. SNAT'd traffic destined for a VRF/GRE tunnel).
+// We use 31000-31999 range.
+const pbrRulePriority = 31000
 
 // PBRRule describes a single policy-based routing rule derived from a
 // firewall filter term with a routing-instance action.

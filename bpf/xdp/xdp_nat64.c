@@ -425,7 +425,7 @@ nat64_xlate_6to4(struct xdp_md *ctx, struct pkt_meta *meta)
 		fib.ipv4_dst    = v4_dst;
 
 		__u32 fib_flags = meta->routing_table ?
-				  BPF_FIB_LOOKUP_TBID : 0;
+				  BPF_FIB_LOOKUP_DIRECT_TBID : 0;
 		int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
 		if (rc != BPF_FIB_LKUP_RET_SUCCESS)
 			return XDP_PASS; /* let kernel handle */
@@ -670,7 +670,7 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 	__builtin_memcpy(fib.ipv6_src, v6_src, 16);
 	__builtin_memcpy(fib.ipv6_dst, v6_dst, 16);
 
-	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
+	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_DIRECT_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS &&
 	    rc != BPF_FIB_LKUP_RET_NO_NEIGH)
@@ -985,7 +985,7 @@ nat64_icmp_error_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 	__builtin_memcpy(fib.ipv6_src, router_v6, 16);
 	__builtin_memcpy(fib.ipv6_dst, client_v6, 16);
 
-	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
+	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_DIRECT_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS &&
 	    rc != BPF_FIB_LKUP_RET_NO_NEIGH)

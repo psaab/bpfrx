@@ -1448,9 +1448,16 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				continue
 			}
 			for _, ifaceName := range ri.Interfaces {
-				if err := d.routing.BindInterfaceToVRF(ifaceName, ri.Name); err != nil {
+				// Convert Junos name (gr-0/0/0.0) to Linux name (gr-0-0-0).
+				// Strip ".0" unit suffix — unit 0 is the base interface.
+				linuxName := config.LinuxIfName(ifaceName)
+				if strings.HasSuffix(linuxName, ".0") {
+					linuxName = strings.TrimSuffix(linuxName, ".0")
+				}
+				if err := d.routing.BindInterfaceToVRF(linuxName, ri.Name); err != nil {
 					slog.Warn("failed to bind interface to VRF",
-						"interface", ifaceName, "instance", ri.Name, "err", err)
+						"interface", ifaceName, "linux", linuxName,
+						"instance", ri.Name, "err", err)
 				}
 			}
 		}

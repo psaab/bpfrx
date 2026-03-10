@@ -3730,7 +3730,7 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 				continue
 			}
 
-			physName := config.LinuxIfName(ifCfg.Name)
+			physName := config.LinuxIfName(cfg.ResolveReth(ifCfg.Name))
 			vlanID := uint16(unit.VlanID)
 
 			// Resolve ifindex (cached to avoid redundant syscalls)

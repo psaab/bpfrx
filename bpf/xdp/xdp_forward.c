@@ -33,6 +33,64 @@ int xdp_forward_prog(struct xdp_md *ctx)
 	 */
 	if (meta->fwd_ifindex == 0) {
 		/*
+		 * NAT re-FIB: after SNAT/DNAT reversal the destination
+		 * may have changed from a local address (the NAT'd IP)
+		 * to an external host.  This happens for VRF/tunnel
+		 * return traffic: zone FIB resolved the pre-NAT dest as
+		 * local (fwd_ifindex=0), but after NAT reversal the real
+		 * destination is in a different routing domain (e.g. the
+		 * LAN subnet, reachable only via the main table).
+		 *
+		 * Re-FIB using the default table (no TBID) to find the
+		 * correct egress.  On success, jump to the forwarding
+		 * path so the packet is redirected directly — avoiding
+		 * the kernel's VRF routing which would loop.
+		 */
+		if (meta->nat_flags) {
+			struct bpf_fib_lookup fib = {};
+			fib.family  = meta->addr_family;
+			fib.ifindex = ctx->ingress_ifindex;
+			/* Force main table: ingress may be in a VRF,
+			 * and bpf_fib_lookup honors l3mdev rules for
+			 * fib.ifindex.  DIRECT+TBID with RT_TABLE_MAIN
+			 * bypasses VRF routing entirely. */
+			fib.tbid    = 254; /* RT_TABLE_MAIN */
+			if (meta->addr_family == AF_INET) {
+				struct iphdr *iph_n = data +
+					sizeof(struct ethhdr);
+				if ((void *)(iph_n + 1) <= data_end) {
+					fib.ipv4_src = iph_n->saddr;
+					fib.ipv4_dst = iph_n->daddr;
+					fib.l4_protocol = iph_n->protocol;
+					fib.tot_len =
+						bpf_ntohs(iph_n->tot_len);
+				}
+			} else {
+				struct ipv6hdr *ip6_n = data +
+					sizeof(struct ethhdr);
+				if ((void *)(ip6_n + 1) <= data_end) {
+					__builtin_memcpy(fib.ipv6_src,
+						&ip6_n->saddr, 16);
+					__builtin_memcpy(fib.ipv6_dst,
+						&ip6_n->daddr, 16);
+					fib.l4_protocol = ip6_n->nexthdr;
+					fib.tot_len = bpf_ntohs(
+						ip6_n->payload_len);
+				}
+			}
+			int nat_rc = bpf_fib_lookup(ctx, &fib,
+				sizeof(fib), BPF_FIB_LOOKUP_DIRECT_TBID);
+			if (nat_rc == BPF_FIB_LKUP_RET_SUCCESS) {
+				meta->fwd_ifindex = fib.ifindex;
+				__builtin_memcpy(meta->fwd_dmac,
+					fib.dmac, ETH_ALEN);
+				__builtin_memcpy(meta->fwd_smac,
+					fib.smac, ETH_ALEN);
+				goto forward_transit;
+			}
+		}
+
+		/*
 		 * Kernel routing fallback: session traffic where BPF FIB
 		 * lookup failed (e.g. FRR routes not yet converged after
 		 * VRRP MASTER transition) but NAT has been reversed by
@@ -149,6 +207,7 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		return tunnel_pass(ctx, meta);
 	}
 
+forward_transit:
 	/*
 	 * TTL/hop-limit expiry check: if TTL would expire after
 	 * decrement, XDP_PASS the unmodified packet so the kernel

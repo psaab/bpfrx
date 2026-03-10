@@ -379,8 +379,19 @@ struct iface_zone_value {
 
 #define IFACE_FLAG_TUNNEL   (1 << 0)  /* GRE/IPsec tunnel interface */
 
+#ifndef BPF_FIB_LOOKUP_DIRECT
+#define BPF_FIB_LOOKUP_DIRECT (1U << 0)
+#endif
 #ifndef BPF_FIB_LOOKUP_TBID
 #define BPF_FIB_LOOKUP_TBID (1U << 3)
+#endif
+
+/* BPF_FIB_LOOKUP_TBID only works when combined with BPF_FIB_LOOKUP_DIRECT.
+ * The kernel checks for TBID inside the DIRECT code path. */
+#define BPF_FIB_LOOKUP_DIRECT_TBID (BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_TBID)
+
+#ifndef BPF_FIB_LOOKUP_SKIP_NEIGH
+#define BPF_FIB_LOOKUP_SKIP_NEIGH (1U << 2)
 #endif
 
 /* Reverse mapping: sub-interface ifindex -> parent physical info */

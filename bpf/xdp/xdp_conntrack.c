@@ -457,7 +457,7 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 	fib.ipv4_src = meta->src_ip.v4;
 	fib.ipv4_dst = orig_src_ip;
 
-	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
+	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_DIRECT_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
 	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED) {
 		/* Original sender is a local address (firewall-originated
@@ -669,7 +669,7 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 	__builtin_memcpy(fib.ipv6_src, meta->src_ip.v6, 16);
 	__builtin_memcpy(fib.ipv6_dst, orig_src_ip, 16);
 
-	__u32 fib_flags6 = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
+	__u32 fib_flags6 = meta->routing_table ? BPF_FIB_LOOKUP_DIRECT_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags6);
 	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED) {
 		/* Original sender is a local address (firewall-originated
