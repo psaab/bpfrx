@@ -32,8 +32,8 @@ const USERSPACE_META_VERSION: u16 = 3;
 const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 64;
-const MIN_RESERVED_TX_FRAMES: u32 = 128;
-const MAX_RESERVED_TX_FRAMES: u32 = 1024;
+const MIN_RESERVED_TX_FRAMES: u32 = 64;
+const MAX_RESERVED_TX_FRAMES: u32 = 512;
 const TX_BATCH_SIZE: usize = 64;
 const STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const NEIGHBOR_SYNC_INTERVAL: Duration = Duration::from_secs(1);
@@ -1077,7 +1077,7 @@ impl BindingWorker {
         let tx = user.map_tx().map_err(|e| format!("map tx ring: {e}"))?;
         bind_user_with_retry(&umem, &user)?;
         let reserved_tx = ring_entries
-            .saturating_div(2)
+            .saturating_div(4)
             .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
             .min(ring_entries.saturating_sub(1))
             .max(1);
