@@ -52,7 +52,6 @@ const STATS_POLL_INTERVAL_NS: u64 = 1_000_000_000;
 const NEIGHBOR_SYNC_INTERVAL_NS: u64 = 1_000_000_000;
 const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
 const TX_WAKE_MIN_INTERVAL_NS: u64 = 50_000;
-const LOOP_TIME_REFRESH_ITERS: u32 = 8;
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
 const MAX_RECENT_SESSION_DELTAS: usize = 64;
@@ -3317,20 +3316,10 @@ fn worker_loop(
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut hot_binding: Option<usize> = None;
-    let mut cached_now_ns = monotonic_nanos();
-    let mut cached_now_secs = cached_now_ns / 1_000_000_000;
-    let mut time_refresh_budget = 0u32;
     while !stop.load(Ordering::Relaxed) {
         apply_worker_commands(&commands, &mut sessions);
-        if time_refresh_budget == 0 || idle_iters > 0 {
-            cached_now_ns = monotonic_nanos();
-            cached_now_secs = cached_now_ns / 1_000_000_000;
-            time_refresh_budget = LOOP_TIME_REFRESH_ITERS;
-        } else {
-            time_refresh_budget -= 1;
-        }
-        let loop_now_ns = cached_now_ns;
-        let loop_now_secs = cached_now_secs;
+        let loop_now_ns = monotonic_nanos();
+        let loop_now_secs = loop_now_ns / 1_000_000_000;
         let ha_runtime = ha_state.load();
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
         let expired = sessions.expire_stale(loop_now_ns);
