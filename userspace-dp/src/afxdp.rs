@@ -22,11 +22,11 @@ use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use xdpilone::xdp::XdpDesc;
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig, User};
 
@@ -1300,7 +1300,6 @@ fn poll_binding(
     bindings: &mut [BindingWorker],
     sessions: &mut SessionTable,
     validation: ValidationState,
-    now: Instant,
     now_ns: u64,
     forwarding: &ForwardingState,
     ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
@@ -1319,7 +1318,7 @@ fn poll_binding(
     };
     let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
-    let expired = sessions.expire_stale(now);
+    let expired = sessions.expire_stale(now_ns);
     if expired > 0 {
         binding
             .live
@@ -1393,7 +1392,9 @@ fn poll_binding(
                         .as_ref()
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
                     let decision = if let Some(flow) = flow.as_ref() {
-                        if let Some(hit) = sessions.lookup(&flow.forward_key, now, meta.tcp_flags) {
+                        if let Some(hit) =
+                            sessions.lookup(&flow.forward_key, now_ns, meta.tcp_flags)
+                        {
                             binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
                             let mut decision = hit.decision;
                             if let Some(debug) = debug.as_mut() {
@@ -1432,7 +1433,7 @@ fn poll_binding(
                                     &flow.forward_key,
                                     decision,
                                     promoted.clone(),
-                                    now,
+                                    now_ns,
                                     meta.protocol,
                                     meta.tcp_flags,
                                 ) {
@@ -1457,7 +1458,7 @@ fn poll_binding(
                                 replica.key.clone(),
                                 replica.decision,
                                 replica.metadata.clone(),
-                                now,
+                                now_ns,
                                 replica.protocol,
                                 meta.tcp_flags,
                             );
@@ -1497,7 +1498,7 @@ fn poll_binding(
                                     &flow.forward_key,
                                     decision,
                                     promoted.clone(),
-                                    now,
+                                    now_ns,
                                     meta.protocol,
                                     meta.tcp_flags,
                                 ) {
@@ -1521,7 +1522,7 @@ fn poll_binding(
                             ha_state,
                             dynamic_neighbors,
                             flow,
-                            now,
+                            now_ns,
                             meta.protocol,
                             meta.tcp_flags,
                         ) {
@@ -1620,7 +1621,7 @@ fn poll_binding(
                                         flow.forward_key.clone(),
                                         decision,
                                         forward_metadata.clone(),
-                                        now,
+                                        now_ns,
                                         meta.protocol,
                                         meta.tcp_flags,
                                     ) {
@@ -1670,7 +1671,7 @@ fn poll_binding(
                                         reverse_key.clone(),
                                         reverse_decision,
                                         reverse_metadata.clone(),
-                                        now,
+                                        now_ns,
                                         meta.protocol,
                                         meta.tcp_flags,
                                     ) {
@@ -3109,7 +3110,7 @@ fn apply_worker_commands(
         Ok(mut pending) => core::mem::take(&mut *pending),
         Err(_) => return,
     };
-    let now = Instant::now();
+    let now_ns = monotonic_nanos();
     for cmd in pending {
         match cmd {
             WorkerCommand::UpsertSynced(entry) => {
@@ -3117,7 +3118,7 @@ fn apply_worker_commands(
                     entry.key,
                     entry.decision,
                     entry.metadata,
-                    now,
+                    now_ns,
                     entry.protocol,
                     entry.tcp_flags,
                 );
@@ -3189,7 +3190,7 @@ fn repair_reverse_session_from_forward(
     ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     flow: &SessionFlow,
-    now: Instant,
+    now_ns: u64,
     protocol: u8,
     tcp_flags: u8,
 ) -> Option<SessionLookup> {
@@ -3231,7 +3232,7 @@ fn repair_reverse_session_from_forward(
         flow.forward_key.clone(),
         reverse_decision,
         reverse_metadata.clone(),
-        now,
+        now_ns,
         protocol,
         tcp_flags,
     ) {
@@ -3308,7 +3309,6 @@ fn worker_loop(
     let mut hot_binding: Option<usize> = None;
     while !stop.load(Ordering::Relaxed) {
         apply_worker_commands(&commands, &mut sessions);
-        let loop_now = Instant::now();
         let loop_now_ns = monotonic_nanos();
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
         let poll_stats =
@@ -3326,7 +3326,6 @@ fn worker_loop(
                 &mut bindings,
                 &mut sessions,
                 validation,
-                loop_now,
                 loop_now_ns,
                 &forwarding,
                 &ha_state,
@@ -3359,7 +3358,6 @@ fn worker_loop(
                 &mut bindings,
                 &mut sessions,
                 validation,
-                loop_now,
                 loop_now_ns,
                 &forwarding,
                 &ha_state,
@@ -5701,6 +5699,7 @@ struct BindingLiveState {
     tx_bytes: AtomicU64,
     tx_errors: AtomicU64,
     last_heartbeat: AtomicU64,
+    pending_tx_len: AtomicU32,
     last_error: Mutex<String>,
     pending_tx: Mutex<VecDeque<TxRequest>>,
     pending_session_deltas: Mutex<VecDeque<SessionDeltaInfo>>,
@@ -5751,6 +5750,7 @@ impl BindingLiveState {
             tx_bytes: AtomicU64::new(0),
             tx_errors: AtomicU64::new(0),
             last_heartbeat: AtomicU64::new(0),
+            pending_tx_len: AtomicU32::new(0),
             last_error: Mutex::new(String::new()),
             pending_tx: Mutex::new(VecDeque::new()),
             pending_session_deltas: Mutex::new(VecDeque::new()),
@@ -5858,6 +5858,7 @@ impl BindingLiveState {
         match self.pending_tx.lock() {
             Ok(mut pending) => {
                 pending.push_back(req);
+                self.pending_tx_len.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
             Err(_) => Err("pending_tx lock poisoned".to_string()),
@@ -5865,17 +5866,21 @@ impl BindingLiveState {
     }
 
     fn take_pending_tx(&self) -> VecDeque<TxRequest> {
+        if self.pending_tx_len.load(Ordering::Relaxed) == 0 {
+            return VecDeque::new();
+        }
         match self.pending_tx.lock() {
-            Ok(mut pending) => core::mem::take(&mut *pending),
+            Ok(mut pending) => {
+                let drained = core::mem::take(&mut *pending);
+                self.pending_tx_len.store(0, Ordering::Relaxed);
+                drained
+            }
             Err(_) => VecDeque::new(),
         }
     }
 
     fn pending_tx_empty(&self) -> bool {
-        match self.pending_tx.lock() {
-            Ok(pending) => pending.is_empty(),
-            Err(_) => true,
-        }
+        self.pending_tx_len.load(Ordering::Relaxed) == 0
     }
 
     fn push_session_delta(&self, delta: SessionDeltaInfo) {

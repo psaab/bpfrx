@@ -4,15 +4,14 @@ use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-const SESSION_GC_INTERVAL: Duration = Duration::from_secs(1);
+const SESSION_GC_INTERVAL_NS: u64 = 1_000_000_000;
 const DEFAULT_MAX_SESSIONS: usize = 131072;
-const TCP_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
-const TCP_CLOSING_TIMEOUT: Duration = Duration::from_secs(30);
-const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
-const ICMP_SESSION_TIMEOUT: Duration = Duration::from_secs(15);
-const OTHER_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+const TCP_SESSION_TIMEOUT_NS: u64 = 300_000_000_000;
+const TCP_CLOSING_TIMEOUT_NS: u64 = 30_000_000_000;
+const UDP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
+const ICMP_SESSION_TIMEOUT_NS: u64 = 15_000_000_000;
+const OTHER_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
 const MAX_SESSION_DELTAS: usize = 4096;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -35,8 +34,8 @@ pub(crate) struct SessionKey {
 struct SessionEntry {
     decision: SessionDecision,
     metadata: SessionMetadata,
-    last_seen: Instant,
-    expires_after: Duration,
+    last_seen_ns: u64,
+    expires_after_ns: u64,
     closing: bool,
 }
 
@@ -85,7 +84,7 @@ pub(crate) struct SessionDelta {
 pub(crate) struct SessionTable {
     sessions: FxHashMap<SessionKey, SessionEntry>,
     deltas: VecDeque<SessionDelta>,
-    last_gc: Instant,
+    last_gc_ns: u64,
     max_sessions: usize,
     expired: u64,
     create_drops: u64,
@@ -98,7 +97,7 @@ impl SessionTable {
         Self {
             sessions: FxHashMap::default(),
             deltas: VecDeque::with_capacity(MAX_SESSION_DELTAS.min(256)),
-            last_gc: Instant::now(),
+            last_gc_ns: 0,
             max_sessions: DEFAULT_MAX_SESSIONS,
             expired: 0,
             create_drops: 0,
@@ -107,16 +106,18 @@ impl SessionTable {
         }
     }
 
-    pub fn expire_stale(&mut self, now: Instant) -> u64 {
-        if now.duration_since(self.last_gc) < SESSION_GC_INTERVAL {
+    pub fn expire_stale(&mut self, now_ns: u64) -> u64 {
+        if self.last_gc_ns != 0
+            && now_ns.saturating_sub(self.last_gc_ns) < SESSION_GC_INTERVAL_NS
+        {
             return 0;
         }
-        self.last_gc = now;
+        self.last_gc_ns = now_ns;
         let stale = self
             .sessions
             .iter()
             .filter_map(|(key, entry)| {
-                if now.duration_since(entry.last_seen) > entry.expires_after {
+                if now_ns.saturating_sub(entry.last_seen_ns) > entry.expires_after_ns {
                     Some(key.clone())
                 } else {
                     None
@@ -143,18 +144,18 @@ impl SessionTable {
     pub fn lookup(
         &mut self,
         key: &SessionKey,
-        now: Instant,
+        now_ns: u64,
         tcp_flags: u8,
     ) -> Option<SessionLookup> {
         self.sessions.get_mut(key).map(|entry| {
             if matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
                 entry.closing = true;
             }
-            entry.last_seen = now;
-            entry.expires_after = if matches!(key.protocol, PROTO_TCP) && entry.closing {
-                TCP_CLOSING_TIMEOUT
+            entry.last_seen_ns = now_ns;
+            entry.expires_after_ns = if matches!(key.protocol, PROTO_TCP) && entry.closing {
+                TCP_CLOSING_TIMEOUT_NS
             } else {
-                session_timeout(key.protocol, tcp_flags)
+                session_timeout_ns(key.protocol, tcp_flags)
             };
             SessionLookup {
                 decision: entry.decision,
@@ -184,7 +185,7 @@ impl SessionTable {
         key: SessionKey,
         decision: SessionDecision,
         metadata: SessionMetadata,
-        now: Instant,
+        now_ns: u64,
         protocol: u8,
         tcp_flags: u8,
     ) -> bool {
@@ -197,8 +198,8 @@ impl SessionTable {
             SessionEntry {
                 decision,
                 metadata: metadata.clone(),
-                last_seen: now,
-                expires_after: session_timeout(protocol, tcp_flags),
+                last_seen_ns: now_ns,
+                expires_after_ns: session_timeout_ns(protocol, tcp_flags),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
             },
         );
@@ -218,7 +219,7 @@ impl SessionTable {
         key: SessionKey,
         decision: SessionDecision,
         metadata: SessionMetadata,
-        now: Instant,
+        now_ns: u64,
         protocol: u8,
         tcp_flags: u8,
     ) {
@@ -227,8 +228,8 @@ impl SessionTable {
             SessionEntry {
                 decision,
                 metadata,
-                last_seen: now,
-                expires_after: session_timeout(protocol, tcp_flags),
+                last_seen_ns: now_ns,
+                expires_after_ns: session_timeout_ns(protocol, tcp_flags),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
             },
         );
@@ -239,7 +240,7 @@ impl SessionTable {
         key: &SessionKey,
         decision: SessionDecision,
         metadata: SessionMetadata,
-        now: Instant,
+        now_ns: u64,
         protocol: u8,
         tcp_flags: u8,
     ) -> bool {
@@ -251,8 +252,8 @@ impl SessionTable {
         }
         entry.decision = decision;
         entry.metadata = metadata.clone();
-        entry.last_seen = now;
-        entry.expires_after = session_timeout(protocol, tcp_flags);
+        entry.last_seen_ns = now_ns;
+        entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags);
         entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
         if !metadata.is_reverse {
             self.push_delta(SessionDelta {
@@ -294,18 +295,18 @@ impl SessionTable {
     }
 }
 
-fn session_timeout(protocol: u8, tcp_flags: u8) -> Duration {
+fn session_timeout_ns(protocol: u8, tcp_flags: u8) -> u64 {
     match protocol {
         PROTO_TCP => {
             if (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
-                TCP_CLOSING_TIMEOUT
+                TCP_CLOSING_TIMEOUT_NS
             } else {
-                TCP_SESSION_TIMEOUT
+                TCP_SESSION_TIMEOUT_NS
             }
         }
-        PROTO_UDP => UDP_SESSION_TIMEOUT,
-        PROTO_ICMP | PROTO_ICMPV6 => ICMP_SESSION_TIMEOUT,
-        _ => OTHER_SESSION_TIMEOUT,
+        PROTO_UDP => UDP_SESSION_TIMEOUT_NS,
+        PROTO_ICMP | PROTO_ICMPV6 => ICMP_SESSION_TIMEOUT_NS,
+        _ => OTHER_SESSION_TIMEOUT_NS,
     }
 }
 
@@ -399,7 +400,7 @@ mod tests {
     fn session_lookup_hits_after_install() {
         let mut table = SessionTable::new();
         let key = key_v4();
-        let now = Instant::now();
+        let now = 1_000_000_000u64;
         assert!(table.install_with_protocol(
             key.clone(),
             decision(),
@@ -408,7 +409,7 @@ mod tests {
             PROTO_TCP,
             0x10
         ));
-        let hit = table.lookup(&key, now + Duration::from_millis(1), 0x10);
+        let hit = table.lookup(&key, now + 1_000_000, 0x10);
         assert_eq!(
             hit,
             Some(SessionLookup {
@@ -426,7 +427,7 @@ mod tests {
     fn session_expire_removes_stale_entries() {
         let mut table = SessionTable::new();
         let key = key_v6();
-        let then = Instant::now() - Duration::from_secs(120);
+        let then = 1_000_000_000u64;
         assert!(table.install_with_protocol(
             key.clone(),
             decision(),
@@ -436,10 +437,10 @@ mod tests {
             0
         ));
         let _ = table.drain_deltas(8);
-        table.last_gc = Instant::now() - Duration::from_secs(2);
-        let expired = table.expire_stale(Instant::now());
+        table.last_gc_ns = then + 118_000_000_000;
+        let expired = table.expire_stale(then + 120_000_000_000);
         assert_eq!(expired, 1);
-        assert!(table.lookup(&key, Instant::now(), 0).is_none());
+        assert!(table.lookup(&key, then + 121_000_000_000, 0).is_none());
         let deltas = table.drain_deltas(8);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
@@ -450,7 +451,7 @@ mod tests {
     fn tcp_fin_keeps_session_until_closing_timeout() {
         let mut table = SessionTable::new();
         let key = key_v4();
-        let now = Instant::now();
+        let now = 1_000_000_000u64;
         assert!(table.install_with_protocol(
             key.clone(),
             decision(),
@@ -460,7 +461,7 @@ mod tests {
             0x10
         ));
         let _ = table.drain_deltas(8);
-        let hit = table.lookup(&key, now + Duration::from_millis(1), TCP_FIN);
+        let hit = table.lookup(&key, now + 1_000_000, TCP_FIN);
         assert_eq!(
             hit,
             Some(SessionLookup {
@@ -470,15 +471,15 @@ mod tests {
         );
         assert!(
             table
-                .lookup(&key, now + Duration::from_millis(2), 0x10)
+                .lookup(&key, now + 2_000_000, 0x10)
                 .is_some()
         );
-        table.last_gc = now + TCP_CLOSING_TIMEOUT;
-        let expired = table.expire_stale(now + TCP_CLOSING_TIMEOUT + Duration::from_secs(1));
+        table.last_gc_ns = now + TCP_CLOSING_TIMEOUT_NS;
+        let expired = table.expire_stale(now + TCP_CLOSING_TIMEOUT_NS + 1_000_000_000);
         assert_eq!(expired, 1);
         assert!(
             table
-                .lookup(&key, now + TCP_CLOSING_TIMEOUT + Duration::from_secs(2), 0)
+                .lookup(&key, now + TCP_CLOSING_TIMEOUT_NS + 2_000_000_000, 0)
                 .is_none()
         );
         let deltas = table.drain_deltas(8);
@@ -491,7 +492,7 @@ mod tests {
     fn synced_sessions_do_not_emit_deltas() {
         let mut table = SessionTable::new();
         let key = key_v4();
-        let now = Instant::now();
+        let now = 1_000_000_000u64;
         let mut synced = metadata();
         synced.synced = true;
         table.upsert_synced(
@@ -502,7 +503,7 @@ mod tests {
             PROTO_TCP,
             0x10,
         );
-        let hit = table.lookup(&key, now + Duration::from_millis(1), 0x10);
+        let hit = table.lookup(&key, now + 1_000_000, 0x10);
         assert_eq!(
             hit,
             Some(SessionLookup {
@@ -511,7 +512,7 @@ mod tests {
             })
         );
         assert!(table.drain_deltas(8).is_empty());
-        let _ = table.lookup(&key, now + Duration::from_millis(2), TCP_FIN);
+        let _ = table.lookup(&key, now + 2_000_000, TCP_FIN);
         assert!(table.drain_deltas(8).is_empty());
     }
 
@@ -519,7 +520,7 @@ mod tests {
     fn promote_synced_forward_session_emits_open_delta() {
         let mut table = SessionTable::new();
         let key = key_v4();
-        let now = Instant::now();
+        let now = 1_000_000_000u64;
         let mut synced = metadata();
         synced.synced = true;
         table.upsert_synced(key.clone(), decision(), synced, now, PROTO_TCP, 0x10);
@@ -529,11 +530,11 @@ mod tests {
             &key,
             decision(),
             promoted.clone(),
-            now + Duration::from_millis(1),
+            now + 1_000_000,
             PROTO_TCP,
             0x10,
         ));
-        let hit = table.lookup(&key, now + Duration::from_millis(2), 0x10);
+        let hit = table.lookup(&key, now + 2_000_000, 0x10);
         assert_eq!(
             hit,
             Some(SessionLookup {
@@ -552,7 +553,7 @@ mod tests {
     fn promote_synced_reverse_session_stays_quiet() {
         let mut table = SessionTable::new();
         let key = key_v4();
-        let now = Instant::now();
+        let now = 1_000_000_000u64;
         let mut synced = metadata();
         synced.synced = true;
         synced.is_reverse = true;
@@ -564,11 +565,11 @@ mod tests {
             &key,
             decision(),
             promoted.clone(),
-            now + Duration::from_millis(1),
+            now + 1_000_000,
             PROTO_TCP,
             0x10,
         ));
-        let hit = table.lookup(&key, now + Duration::from_millis(2), 0x10);
+        let hit = table.lookup(&key, now + 2_000_000, 0x10);
         assert_eq!(
             hit,
             Some(SessionLookup {
