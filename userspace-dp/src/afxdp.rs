@@ -1307,7 +1307,7 @@ fn poll_binding(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
-    recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
+    _recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     poll_stats: bool,
@@ -1318,23 +1318,6 @@ fn poll_binding(
     };
     let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
-    let expired = sessions.expire_stale(now_ns);
-    if expired > 0 {
-        binding
-            .live
-            .session_expires
-            .fetch_add(expired, Ordering::Relaxed);
-    }
-    if sessions.has_pending_deltas() {
-        flush_session_deltas(
-            &ident,
-            &binding.live,
-            sessions.drain_deltas(256),
-            shared_sessions,
-            recent_session_deltas,
-            peer_worker_commands,
-        );
-    }
     let reaped = reap_tx_completions(binding);
     let tx_work = drain_pending_tx(binding);
     let fill_work = drain_pending_fill(binding);
@@ -1784,16 +1767,6 @@ fn poll_binding(
             if recycle_now {
                 binding.scratch_recycle.push(desc.addr);
             }
-        }
-        if sessions.has_pending_deltas() {
-            flush_session_deltas(
-                &ident,
-                &binding.live,
-                sessions.drain_deltas(256),
-                shared_sessions,
-                recent_session_deltas,
-                peer_worker_commands,
-            );
         }
         received.release();
         drop(received);
@@ -3311,6 +3284,15 @@ fn worker_loop(
         apply_worker_commands(&commands, &mut sessions);
         let loop_now_ns = monotonic_nanos();
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
+        let expired = sessions.expire_stale(loop_now_ns);
+        if expired > 0 {
+            if let Some(binding) = bindings.first() {
+                binding
+                    .live
+                    .session_expires
+                    .fetch_add(expired, Ordering::Relaxed);
+            }
+        }
         let poll_stats =
             loop_now_ns.saturating_sub(last_stats_poll_ns) >= STATS_POLL_INTERVAL_NS;
         let poll_neighbors = worker_id == 0
@@ -3376,6 +3358,19 @@ fn worker_loop(
         }
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
+        }
+        if sessions.has_pending_deltas() {
+            if let Some(binding) = bindings.first() {
+                let ident = binding.identity();
+                flush_session_deltas(
+                    &ident,
+                    &binding.live,
+                    sessions.drain_deltas(256),
+                    &shared_sessions,
+                    &recent_session_deltas,
+                    &peer_worker_commands,
+                );
+            }
         }
         if poll_stats {
             last_stats_poll_ns = loop_now_ns;
