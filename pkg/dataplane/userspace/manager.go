@@ -58,6 +58,21 @@ func New() *Manager {
 	}
 }
 
+func (m *Manager) SessionSyncSweepProfile() (bool, time.Duration, time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proc == nil {
+		return false, 0, 0
+	}
+	if !m.lastStatus.Enabled || !m.lastStatus.ForwardingArmed || !m.lastStatus.Capabilities.ForwardingSupported {
+		return false, 0, 0
+	}
+	// Userspace forwarding already streams authoritative open/close deltas.
+	// Keep a periodic refresh for long-lived flows, but avoid the 1s batch walk
+	// that was tuned for the eBPF session tables.
+	return true, 15 * time.Second, 60 * time.Second
+}
+
 func (m *Manager) Load() error {
 	return m.inner.Load()
 }

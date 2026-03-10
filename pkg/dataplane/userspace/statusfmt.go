@@ -23,6 +23,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 	armedBindings := 0
 	boundBindings := 0
 	xskBindings := 0
+	zeroCopyBindings := 0
 	var rxPackets uint64
 	var validatedPackets uint64
 	var forwardCandidates uint64
@@ -57,6 +58,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 		}
 		if binding.XSKRegistered {
 			xskBindings++
+		}
+		if binding.ZeroCopy {
+			zeroCopyBindings++
 		}
 		rxPackets += binding.RXPackets
 		validatedPackets += binding.ValidatedPackets
@@ -161,6 +165,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 	}
 	fmt.Fprintf(&b, "  Bound bindings:            %d/%d\n", boundBindings, len(status.Bindings))
 	fmt.Fprintf(&b, "  XSK-registered bindings:   %d/%d\n", xskBindings, len(status.Bindings))
+	fmt.Fprintf(&b, "  Zerocopy bindings:         %d/%d\n", zeroCopyBindings, len(status.Bindings))
 	fmt.Fprintf(&b, "  Armed queues:              %d/%d\n", armedQueues, len(status.Queues))
 	fmt.Fprintf(&b, "  Ready queues:              %d/%d\n", readyQueues, len(status.Queues))
 	fmt.Fprintf(&b, "  Armed bindings:            %d/%d\n", armedBindings, len(status.Bindings))
@@ -250,10 +255,14 @@ func FormatBindings(status ProcessStatus) string {
 		fmt.Fprintln(&b, "  none")
 		return b.String()
 	}
-	fmt.Fprintf(&b, "  %-6s %-7s %-8s %-10s %-7s %-7s %-7s %-5s %-8s %-9s %-9s %-9s %-9s %-9s %-9s %s\n", "Slot", "Queue", "Worker", "Registered", "Armed", "Ready", "Bound", "XSK", "Ifindex", "RXPkts", "TXPkts", "SessHit", "SlowPkts", "ExcPkts", "RtMiss", "Interface")
+	fmt.Fprintf(&b, "  %-6s %-7s %-8s %-10s %-7s %-7s %-7s %-5s %-8s %-8s %-9s %-9s %-9s %-9s %-9s %-9s %s\n", "Slot", "Queue", "Worker", "Registered", "Armed", "Ready", "Bound", "XSK", "Mode", "Ifindex", "RXPkts", "TXPkts", "SessHit", "SlowPkts", "ExcPkts", "RtMiss", "Interface")
 	for _, binding := range status.Bindings {
-		fmt.Fprintf(&b, "  %-6d %-7d %-8d %-10t %-7t %-7t %-7t %-5t %-8d %-9d %-9d %-9d %-9d %-9d %-9d %s",
-			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Armed, binding.Ready, binding.Bound, binding.XSKRegistered, binding.Ifindex, binding.RXPackets, binding.TXPackets, binding.SessionHits, binding.SlowPathPackets, binding.ExceptionPackets, binding.RouteMissPackets, binding.Interface)
+		mode := binding.XSKBindMode
+		if mode == "" {
+			mode = "-"
+		}
+		fmt.Fprintf(&b, "  %-6d %-7d %-8d %-10t %-7t %-7t %-7t %-5t %-8s %-8d %-9d %-9d %-9d %-9d %-9d %-9d %s",
+			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Armed, binding.Ready, binding.Bound, binding.XSKRegistered, mode, binding.Ifindex, binding.RXPackets, binding.TXPackets, binding.SessionHits, binding.SlowPathPackets, binding.ExceptionPackets, binding.RouteMissPackets, binding.Interface)
 		if binding.LastError != "" {
 			fmt.Fprintf(&b, " (%s)", binding.LastError)
 		}

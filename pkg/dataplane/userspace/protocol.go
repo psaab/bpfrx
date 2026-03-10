@@ -278,6 +278,8 @@ type BindingStatus struct {
 	Ready                 bool      `json:"ready"`
 	Bound                 bool      `json:"bound"`
 	XSKRegistered         bool      `json:"xsk_registered"`
+	XSKBindMode           string    `json:"xsk_bind_mode,omitempty"`
+	ZeroCopy              bool      `json:"zero_copy,omitempty"`
 	SocketFD              int       `json:"socket_fd,omitempty"`
 	RXPackets             uint64    `json:"rx_packets,omitempty"`
 	RXBytes               uint64    `json:"rx_bytes,omitempty"`

@@ -19,7 +19,7 @@ use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
@@ -33,8 +33,10 @@ const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 128;
 const MIN_RESERVED_TX_FRAMES: u32 = 64;
-const MAX_RESERVED_TX_FRAMES: u32 = 512;
+const MAX_RESERVED_TX_FRAMES: u32 = 256;
 const TX_BATCH_SIZE: usize = 128;
+const FILL_BATCH_SIZE: usize = 512;
+const FILL_DRAIN_WATERMARK: usize = 64;
 const XSK_BIND_FLAGS_FALLBACK: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP;
 const XSK_BIND_FLAGS_PREFERRED: u16 =
     SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY;
@@ -692,6 +694,8 @@ impl Coordinator {
                 let snap = live.snapshot();
                 binding.bound = snap.bound;
                 binding.xsk_registered = snap.xsk_registered;
+                binding.xsk_bind_mode = snap.xsk_bind_mode;
+                binding.zero_copy = snap.zero_copy;
                 binding.socket_fd = snap.socket_fd;
                 binding.rx_packets = snap.rx_packets;
                 binding.rx_bytes = snap.rx_bytes;
@@ -740,6 +744,8 @@ impl Coordinator {
             } else {
                 binding.bound = false;
                 binding.xsk_registered = false;
+                binding.xsk_bind_mode.clear();
+                binding.zero_copy = false;
                 binding.socket_fd = 0;
                 binding.rx_packets = 0;
                 binding.rx_bytes = 0;
@@ -982,6 +988,43 @@ struct BindingWorker {
     last_heartbeat_update: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum XskBindMode {
+    Unknown,
+    Copy,
+    ZeroCopy,
+}
+
+impl XskBindMode {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Copy => 1,
+            Self::ZeroCopy => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Copy,
+            2 => Self::ZeroCopy,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "",
+            Self::Copy => "copy",
+            Self::ZeroCopy => "zerocopy",
+        }
+    }
+
+    fn is_zerocopy(self) -> bool {
+        matches!(self, Self::ZeroCopy)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BindingIdentity {
     slot: u32,
@@ -1086,7 +1129,7 @@ impl BindingWorker {
         let mut device = umem
             .fq_cq(&sock)
             .map_err(|e| format!("create fq/cq: {e}"))?;
-        let (user, rx, tx) =
+        let (user, rx, tx, bind_mode) =
             match open_user_rings(&umem, &sock, ring_entries, XSK_BIND_FLAGS_PREFERRED) {
                 Ok(bound) => bound,
                 Err(preferred_err) => open_user_rings(
@@ -1102,7 +1145,7 @@ impl BindingWorker {
                 })?,
             };
         let reserved_tx = ring_entries
-            .saturating_div(4)
+            .saturating_div(8)
             .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
             .min(ring_entries.saturating_sub(1))
             .max(1);
@@ -1115,6 +1158,7 @@ impl BindingWorker {
         }
 
         live.set_bound(user.as_raw_fd());
+        live.set_bind_mode(bind_mode);
         if let Err(err) = register_xsk_slot(xsk_map_fd, binding.slot, user.as_raw_fd()) {
             live.set_error(format!("register XSK slot: {err}"));
         } else {
@@ -1162,8 +1206,10 @@ fn open_user_rings(
     sock: &Socket,
     ring_entries: u32,
     bind_flags: u16,
-) -> Result<(User, xdpilone::RingRx, xdpilone::RingTx), Box<dyn std::error::Error + Send + Sync>>
-{
+) -> Result<
+    (User, xdpilone::RingRx, xdpilone::RingTx, XskBindMode),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let user = umem
         .rx_tx(
             sock,
@@ -1177,7 +1223,12 @@ fn open_user_rings(
     let rx = user.map_rx().map_err(|e| format!("map rx ring: {e}"))?;
     let tx = user.map_tx().map_err(|e| format!("map tx ring: {e}"))?;
     bind_user_with_retry(umem, &user)?;
-    Ok((user, rx, tx))
+    let bind_mode = if (bind_flags & SocketConfig::XDP_BIND_ZEROCOPY) != 0 {
+        XskBindMode::ZeroCopy
+    } else {
+        XskBindMode::Copy
+    };
+    Ok((user, rx, tx, bind_mode))
 }
 
 fn bind_user_with_retry(
@@ -1754,20 +1805,20 @@ fn enqueue_pending_forwards(
     for request in pending_forwards {
         let source_offset = request.source_offset;
         let Some(target_binding) = find_target_binding_mut(
-        left,
-        ingress_binding,
-        request.ingress_queue_id,
-        right,
-        request.target_ifindex,
+            left,
+            ingress_binding,
+            request.ingress_queue_id,
+            right,
+            request.target_ifindex,
         ) else {
-        record_exception(
-            recent_exceptions,
-            ingress_ident,
-            "missing_egress_binding",
-            request.desc.len,
-            None,
-            None,
-        );
+            record_exception(
+                recent_exceptions,
+                ingress_ident,
+                "missing_egress_binding",
+                request.desc.len,
+                None,
+                None,
+            );
             ingress_binding.pending_fill_frames.push_back(source_offset);
             continue;
         };
@@ -1792,7 +1843,10 @@ fn enqueue_pending_forwards(
                 Some(frame_len) => {
                     target_binding
                         .pending_tx_prepared
-                        .push_back(PreparedTxRequest { offset, len: frame_len as u32 });
+                        .push_back(PreparedTxRequest {
+                            offset,
+                            len: frame_len as u32,
+                        });
                 }
                 None => {
                     target_binding.free_tx_frames.push_front(offset);
@@ -1804,7 +1858,9 @@ fn enqueue_pending_forwards(
                         forwarding,
                     ) {
                         Some(frame) => {
-                            target_binding.pending_tx_local.push_back(TxRequest { bytes: frame });
+                            target_binding
+                                .pending_tx_local
+                                .push_back(TxRequest { bytes: frame });
                         }
                         None => {
                             record_exception(
@@ -1830,7 +1886,9 @@ fn enqueue_pending_forwards(
                 forwarding,
             ) {
                 Some(frame) => {
-                    target_binding.pending_tx_local.push_back(TxRequest { bytes: frame });
+                    target_binding
+                        .pending_tx_local
+                        .push_back(TxRequest { bytes: frame });
                 }
                 None => {
                     record_exception(
@@ -1852,7 +1910,7 @@ fn enqueue_pending_forwards(
             let _ = drain_pending_tx(target_binding);
         }
         ingress_binding.pending_fill_frames.push_back(source_offset);
-        if ingress_binding.pending_fill_frames.len() >= (RX_BATCH_SIZE as usize / 2).max(1) {
+        if ingress_binding.pending_fill_frames.len() >= FILL_DRAIN_WATERMARK {
             let _ = drain_pending_fill(ingress_binding);
         }
     }
@@ -2284,22 +2342,26 @@ fn find_target_binding_mut<'a>(
     if ingress_binding.ifindex == egress_ifindex {
         return Some(ingress_binding);
     }
+    if let Some(pos) = left.iter().position(|binding| {
+        binding.ifindex == egress_ifindex && binding.queue_id == ingress_queue_id
+    }) {
+        return Some(&mut left[pos]);
+    }
+    if let Some(pos) = right.iter().position(|binding| {
+        binding.ifindex == egress_ifindex && binding.queue_id == ingress_queue_id
+    }) {
+        return Some(&mut right[pos]);
+    }
     if let Some(pos) = left
         .iter()
-        .position(|binding| binding.ifindex == egress_ifindex && binding.queue_id == ingress_queue_id)
+        .position(|binding| binding.ifindex == egress_ifindex)
     {
         return Some(&mut left[pos]);
     }
     if let Some(pos) = right
         .iter()
-        .position(|binding| binding.ifindex == egress_ifindex && binding.queue_id == ingress_queue_id)
+        .position(|binding| binding.ifindex == egress_ifindex)
     {
-        return Some(&mut right[pos]);
-    }
-    if let Some(pos) = left.iter().position(|binding| binding.ifindex == egress_ifindex) {
-        return Some(&mut left[pos]);
-    }
-    if let Some(pos) = right.iter().position(|binding| binding.ifindex == egress_ifindex) {
         return Some(&mut right[pos]);
     }
     None
@@ -2394,7 +2456,7 @@ fn drain_pending_fill(binding: &mut BindingWorker) -> bool {
     if binding.pending_fill_frames.is_empty() {
         return false;
     }
-    let batch_size = binding.pending_fill_frames.len().min(RX_BATCH_SIZE as usize);
+    let batch_size = binding.pending_fill_frames.len().min(FILL_BATCH_SIZE);
     let mut batch = Vec::with_capacity(batch_size);
     while batch.len() < batch_size {
         let Some(offset) = binding.pending_fill_frames.pop_front() else {
@@ -2441,7 +2503,10 @@ fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
                     break;
                 }
                 did_work = true;
-                binding.live.tx_packets.fetch_add(packets, Ordering::Relaxed);
+                binding
+                    .live
+                    .tx_packets
+                    .fetch_add(packets, Ordering::Relaxed);
                 binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
             }
             Err(TxError::Retry(err)) => {
@@ -2468,7 +2533,10 @@ fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
                 Ok((packets, bytes)) => {
                     if packets > 0 {
                         did_work = true;
-                        binding.live.tx_packets.fetch_add(packets, Ordering::Relaxed);
+                        binding
+                            .live
+                            .tx_packets
+                            .fetch_add(packets, Ordering::Relaxed);
                         binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
                     }
                 }
@@ -2506,7 +2574,10 @@ fn transmit_batch(
     if pending.is_empty() {
         return Ok((0, 0));
     }
-    let batch_size = pending.len().min(binding.free_tx_frames.len()).min(TX_BATCH_SIZE);
+    let batch_size = pending
+        .len()
+        .min(binding.free_tx_frames.len())
+        .min(TX_BATCH_SIZE);
     if batch_size == 0 {
         return Err(TxError::Retry("no free TX frame available".to_string()));
     }
@@ -4510,7 +4581,13 @@ fn build_forwarded_frame_into(
     if frame_len > out.len() {
         return None;
     }
-    write_eth_header_slice(out.get_mut(..eth_len)?, dst_mac, src_mac, vlan_id, ether_type)?;
+    write_eth_header_slice(
+        out.get_mut(..eth_len)?,
+        dst_mac,
+        src_mac,
+        vlan_id,
+        ether_type,
+    )?;
     out.get_mut(eth_len..frame_len)?.copy_from_slice(payload);
     let out = &mut out[..frame_len];
     let ip_start = eth_len;
@@ -4726,12 +4803,15 @@ fn write_eth_header_slice(
     buf.get_mut(0..6)?.copy_from_slice(&dst);
     buf.get_mut(6..12)?.copy_from_slice(&src);
     if vlan_id > 0 {
-        buf.get_mut(12..14)?.copy_from_slice(&0x8100u16.to_be_bytes());
+        buf.get_mut(12..14)?
+            .copy_from_slice(&0x8100u16.to_be_bytes());
         buf.get_mut(14..16)?
             .copy_from_slice(&(vlan_id & 0x0fff).to_be_bytes());
-        buf.get_mut(16..18)?.copy_from_slice(&ether_type.to_be_bytes());
+        buf.get_mut(16..18)?
+            .copy_from_slice(&ether_type.to_be_bytes());
     } else {
-        buf.get_mut(12..14)?.copy_from_slice(&ether_type.to_be_bytes());
+        buf.get_mut(12..14)?
+            .copy_from_slice(&ether_type.to_be_bytes());
     }
     Some(())
 }
@@ -5103,6 +5183,7 @@ impl Drop for MmapArea {
 struct BindingLiveState {
     bound: AtomicBool,
     xsk_registered: AtomicBool,
+    bind_mode: AtomicU8,
     socket_fd: AtomicI32,
     rx_packets: AtomicU64,
     rx_bytes: AtomicU64,
@@ -5152,6 +5233,7 @@ impl BindingLiveState {
         Self {
             bound: AtomicBool::new(false),
             xsk_registered: AtomicBool::new(false),
+            bind_mode: AtomicU8::new(XskBindMode::Unknown.as_u8()),
             socket_fd: AtomicI32::new(0),
             rx_packets: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
@@ -5206,6 +5288,10 @@ impl BindingLiveState {
         self.xsk_registered.store(value, Ordering::Relaxed);
     }
 
+    fn set_bind_mode(&self, mode: XskBindMode) {
+        self.bind_mode.store(mode.as_u8(), Ordering::Relaxed);
+    }
+
     fn set_last_heartbeat(&self) {
         self.last_heartbeat.store(now_nanos(), Ordering::Relaxed);
     }
@@ -5231,6 +5317,10 @@ impl BindingLiveState {
         BindingLiveSnapshot {
             bound: self.bound.load(Ordering::Relaxed),
             xsk_registered: self.xsk_registered.load(Ordering::Relaxed),
+            xsk_bind_mode: XskBindMode::from_u8(self.bind_mode.load(Ordering::Relaxed))
+                .as_str()
+                .to_string(),
+            zero_copy: XskBindMode::from_u8(self.bind_mode.load(Ordering::Relaxed)).is_zerocopy(),
             socket_fd: self.socket_fd.load(Ordering::Relaxed),
             rx_packets: self.rx_packets.load(Ordering::Relaxed),
             rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
@@ -5342,6 +5432,8 @@ impl BindingLiveState {
 struct BindingLiveSnapshot {
     bound: bool,
     xsk_registered: bool,
+    xsk_bind_mode: String,
+    zero_copy: bool,
     socket_fd: c_int,
     rx_packets: u64,
     rx_bytes: u64,
@@ -6823,10 +6915,10 @@ mod tests {
     #[test]
     fn apply_nat_ipv4_recomputes_tcp_checksum() {
         let mut packet = vec![
-            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0,
-            61, 102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00,
-            0x00, 0x00, 0x01, 0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
-            b'd', b'a', b't', b'a',
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
+            102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x01, 0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd',
+            b'a', b't', b'a',
         ];
         let ip_sum = checksum16(&packet[..20]);
         packet[10] = (ip_sum >> 8) as u8;
@@ -6860,10 +6952,10 @@ mod tests {
             0x0800,
         );
         frame.extend_from_slice(&[
-            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0,
-            61, 102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00,
-            0x00, 0x00, 0x01, 0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
-            b'd', b'a', b't', b'a',
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
+            102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x01, 0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd',
+            b'a', b't', b'a',
         ]);
         let ip_sum = checksum16(&frame[14..34]);
         frame[24] = (ip_sum >> 8) as u8;
@@ -6871,7 +6963,9 @@ mod tests {
         recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
 
         let mut area = MmapArea::new(4096).expect("mmap");
-        area.slice_mut(0, frame.len()).expect("slice").copy_from_slice(&frame);
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
             version: USERSPACE_META_VERSION,
@@ -6883,7 +6977,11 @@ mod tests {
         };
         let out = build_forwarded_frame(
             &area,
-            XdpDesc { addr: 0, len: frame.len() as u32, options: 0 },
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
             meta,
             &SessionDecision {
                 resolution: ForwardingResolution {

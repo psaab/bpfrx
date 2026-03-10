@@ -520,6 +520,10 @@ struct BindingStatus {
     bound: bool,
     #[serde(rename = "xsk_registered", default)]
     xsk_registered: bool,
+    #[serde(rename = "xsk_bind_mode", default)]
+    xsk_bind_mode: String,
+    #[serde(rename = "zero_copy", default)]
+    zero_copy: bool,
     #[serde(rename = "socket_fd", default)]
     socket_fd: i32,
     #[serde(rename = "rx_packets", default)]
@@ -1333,6 +1337,8 @@ fn reconcile_status_bindings(state: &mut ServerState) {
         state.status.bindings.iter_mut().for_each(|binding| {
             binding.bound = false;
             binding.xsk_registered = false;
+            binding.xsk_bind_mode.clear();
+            binding.zero_copy = false;
             binding.socket_fd = 0;
             binding.ready = false;
             binding.last_error.clear();

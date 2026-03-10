@@ -35,7 +35,7 @@ func TestFormatStatusSummary(t *testing.T) {
 			{QueueID: 1, Armed: false, Ready: false},
 		},
 		Bindings: []BindingStatus{
-			{Slot: 0, Armed: false, Ready: true, Bound: true, XSKRegistered: true, RXPackets: 10, ValidatedPackets: 8, ExceptionPackets: 1, TXPackets: 3, TXBytes: 420},
+			{Slot: 0, Armed: false, Ready: true, Bound: true, XSKRegistered: true, XSKBindMode: "zerocopy", ZeroCopy: true, RXPackets: 10, ValidatedPackets: 8, ExceptionPackets: 1, TXPackets: 3, TXBytes: 420},
 			{Slot: 1, Armed: false, Ready: false, Bound: true, XSKRegistered: false, RXPackets: 5, ValidatedPackets: 4, ExceptionPackets: 2, TXErrors: 1},
 		},
 		RecentExceptions: []ExceptionStatus{
@@ -56,6 +56,7 @@ func TestFormatStatusSummary(t *testing.T) {
 		"Last resolution:           forward_candidate egress-ifindex=11 next-hop=172.16.50.1 mac=00:10:db:ff:10:01",
 		"Bound bindings:            2/2",
 		"XSK-registered bindings:   1/2",
+		"Zerocopy bindings:         1/2",
 		"Armed queues:              0/2",
 		"Ready queues:              1/2",
 		"Armed bindings:            0/2",
@@ -84,7 +85,7 @@ func TestFormatBindings(t *testing.T) {
 			{QueueID: 0, WorkerID: 0, Interfaces: []string{"ge-0-0-1", "ge-0-0-2"}, Registered: true, Armed: false, Ready: false},
 		},
 		Bindings: []BindingStatus{
-			{Slot: 0, QueueID: 0, WorkerID: 0, Registered: true, Armed: false, Ready: false, Bound: true, XSKRegistered: true, Ifindex: 5, Interface: "ge-0-0-1", RXPackets: 99, TXPackets: 7, ExceptionPackets: 3},
+			{Slot: 0, QueueID: 0, WorkerID: 0, Registered: true, Armed: false, Ready: false, Bound: true, XSKRegistered: true, XSKBindMode: "zerocopy", ZeroCopy: true, Ifindex: 5, Interface: "ge-0-0-1", RXPackets: 99, TXPackets: 7, ExceptionPackets: 3},
 			{Slot: 1, QueueID: 0, WorkerID: 0, Registered: true, Armed: false, Ready: false, Bound: true, XSKRegistered: false, Ifindex: 6, Interface: "ge-0-0-2", ExceptionPackets: 1, LastError: "xsk map update failed"},
 		},
 		RecentExceptions: []ExceptionStatus{
@@ -101,6 +102,7 @@ func TestFormatBindings(t *testing.T) {
 		"ge-0-0-1,ge-0-0-2",
 		"ge-0-0-1",
 		"ge-0-0-2",
+		"zerocopy",
 		"TXPkts",
 		"xsk map update failed",
 		"Recent userspace exceptions:",
