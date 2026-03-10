@@ -956,12 +956,22 @@ impl ForwardingResolution {
             ingress_ifindex: debug.map(|d| d.ingress_ifindex).unwrap_or_default(),
             next_hop: self.next_hop.map(|ip| ip.to_string()).unwrap_or_default(),
             neighbor_mac: self.neighbor_mac.map(format_mac).unwrap_or_default(),
-            src_ip: debug.map(|d| d.src_ip.clone()).unwrap_or_default(),
-            dst_ip: debug.map(|d| d.dst_ip.clone()).unwrap_or_default(),
+            src_ip: debug
+                .and_then(|d| d.src_ip)
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            dst_ip: debug
+                .and_then(|d| d.dst_ip)
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
             src_port: debug.map(|d| d.src_port).unwrap_or_default(),
             dst_port: debug.map(|d| d.dst_port).unwrap_or_default(),
-            from_zone: debug.map(|d| d.from_zone.clone()).unwrap_or_default(),
-            to_zone: debug.map(|d| d.to_zone.clone()).unwrap_or_default(),
+            from_zone: debug
+                .and_then(|d| d.from_zone.clone())
+                .unwrap_or_default(),
+            to_zone: debug
+                .and_then(|d| d.to_zone.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -1055,24 +1065,24 @@ impl SessionFlow {
 #[derive(Clone, Debug, Default)]
 struct ResolutionDebug {
     ingress_ifindex: i32,
-    src_ip: String,
-    dst_ip: String,
+    src_ip: Option<IpAddr>,
+    dst_ip: Option<IpAddr>,
     src_port: u16,
     dst_port: u16,
-    from_zone: String,
-    to_zone: String,
+    from_zone: Option<String>,
+    to_zone: Option<String>,
 }
 
 impl ResolutionDebug {
     fn from_flow(ingress_ifindex: i32, flow: &SessionFlow) -> Self {
         Self {
             ingress_ifindex,
-            src_ip: flow.src_ip.to_string(),
-            dst_ip: flow.dst_ip.to_string(),
+            src_ip: Some(flow.src_ip),
+            dst_ip: Some(flow.dst_ip),
             src_port: flow.forward_key.src_port,
             dst_port: flow.forward_key.dst_port,
-            from_zone: String::new(),
-            to_zone: String::new(),
+            from_zone: None,
+            to_zone: None,
         }
     }
 }
@@ -1356,8 +1366,8 @@ fn poll_binding(
                             binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
                             let mut decision = hit.decision;
                             if let Some(debug) = debug.as_mut() {
-                                debug.from_zone = hit.metadata.ingress_zone.clone();
-                                debug.to_zone = hit.metadata.egress_zone.clone();
+                                debug.from_zone = Some(hit.metadata.ingress_zone.clone());
+                                debug.to_zone = Some(hit.metadata.egress_zone.clone());
                             }
                             decision.resolution = redirect_via_fabric_if_needed(
                                 forwarding,
@@ -1419,8 +1429,8 @@ fn poll_binding(
                                 meta.tcp_flags,
                             );
                             if let Some(debug) = debug.as_mut() {
-                                debug.from_zone = replica.metadata.ingress_zone.clone();
-                                debug.to_zone = replica.metadata.egress_zone.clone();
+                                debug.from_zone = Some(replica.metadata.ingress_zone.clone());
+                                debug.to_zone = Some(replica.metadata.egress_zone.clone());
                             }
                             let mut decision = replica.decision;
                             decision.resolution = redirect_via_fabric_if_needed(
@@ -1483,8 +1493,8 @@ fn poll_binding(
                             binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
                             binding.live.session_creates.fetch_add(1, Ordering::Relaxed);
                             if let Some(debug) = debug.as_mut() {
-                                debug.from_zone = repaired.metadata.ingress_zone.clone();
-                                debug.to_zone = repaired.metadata.egress_zone.clone();
+                                debug.from_zone = Some(repaired.metadata.ingress_zone.clone());
+                                debug.to_zone = Some(repaired.metadata.egress_zone.clone());
                             }
                             let mut decision = repaired.decision;
                             decision.resolution = redirect_via_fabric_if_needed(
@@ -1528,8 +1538,8 @@ fn poll_binding(
                                     ingress_zone_override.as_deref(),
                                     resolution.egress_ifindex,
                                 );
-                                debug.from_zone = from_zone;
-                                debug.to_zone = to_zone;
+                                debug.from_zone = Some(from_zone);
+                                debug.to_zone = Some(to_zone);
                             }
                             if resolution.disposition == ForwardingDisposition::ForwardCandidate {
                                 let (from_zone, to_zone) = zone_pair_for_flow_with_override(
@@ -1654,9 +1664,9 @@ fn poll_binding(
                             } else if resolution.disposition == ForwardingDisposition::HAInactive
                                 && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
                             {
-                                if let Some((from_zone, _)) = debug
-                                    .as_ref()
-                                    .map(|debug| (debug.from_zone.clone(), debug.to_zone.clone()))
+                                if let Some((Some(from_zone), _)) = debug.as_ref().map(|debug| {
+                                    (debug.from_zone.clone(), debug.to_zone.clone())
+                                })
                                 {
                                     if let Some(redirect) =
                                         resolve_zone_encoded_fabric_redirect(forwarding, &from_zone)
@@ -2760,12 +2770,22 @@ fn record_exception(
                 protocol: meta.map(|m| m.protocol).unwrap_or(0),
                 config_generation: meta.map(|m| m.config_generation).unwrap_or(0),
                 fib_generation: meta.map(|m| m.fib_generation).unwrap_or(0),
-                src_ip: debug.map(|d| d.src_ip.clone()).unwrap_or_default(),
-                dst_ip: debug.map(|d| d.dst_ip.clone()).unwrap_or_default(),
+                src_ip: debug
+                    .and_then(|d| d.src_ip)
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_default(),
+                dst_ip: debug
+                    .and_then(|d| d.dst_ip)
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_default(),
                 src_port: debug.map(|d| d.src_port).unwrap_or_default(),
                 dst_port: debug.map(|d| d.dst_port).unwrap_or_default(),
-                from_zone: debug.map(|d| d.from_zone.clone()).unwrap_or_default(),
-                to_zone: debug.map(|d| d.to_zone.clone()).unwrap_or_default(),
+                from_zone: debug
+                    .and_then(|d| d.from_zone.clone())
+                    .unwrap_or_default(),
+                to_zone: debug
+                    .and_then(|d| d.to_zone.clone())
+                    .unwrap_or_default(),
             },
         );
     }
