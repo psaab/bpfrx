@@ -52,6 +52,7 @@ const STATS_POLL_INTERVAL_NS: u64 = 1_000_000_000;
 const NEIGHBOR_SYNC_INTERVAL_NS: u64 = 1_000_000_000;
 const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
 const TX_WAKE_MIN_INTERVAL_NS: u64 = 50_000;
+const LOOP_TIME_REFRESH_ITERS: u32 = 8;
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
 const MAX_RECENT_SESSION_DELTAS: usize = 64;
@@ -1304,7 +1305,7 @@ fn poll_binding(
     now_ns: u64,
     now_secs: u64,
     forwarding: &ForwardingState,
-    ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<&Arc<SlowPathReinjector>>,
@@ -1318,7 +1319,6 @@ fn poll_binding(
     let Some((binding, right)) = rest.split_first_mut() else {
         return false;
     };
-    let ha_runtime = ha_state.load();
     let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
     let tx_work = drain_pending_tx(binding, now_ns);
@@ -1390,7 +1390,7 @@ fn poll_binding(
                                 forwarding,
                                 enforce_ha_resolution_snapshot(
                                     forwarding,
-                                    ha_runtime.as_ref(),
+                                    ha_state,
                                     now_secs,
                                     lookup_forwarding_resolution_for_session(
                                         forwarding,
@@ -1455,7 +1455,7 @@ fn poll_binding(
                                 forwarding,
                                 enforce_ha_resolution_snapshot(
                                     forwarding,
-                                    ha_runtime.as_ref(),
+                                    ha_state,
                                     now_secs,
                                     lookup_forwarding_resolution_for_session(
                                         forwarding,
@@ -1502,7 +1502,7 @@ fn poll_binding(
                             shared_sessions,
                             peer_worker_commands,
                             forwarding,
-                            ha_runtime.as_ref(),
+                            ha_state,
                             dynamic_neighbors,
                             flow,
                             now_ns,
@@ -1521,7 +1521,7 @@ fn poll_binding(
                                 forwarding,
                                 enforce_ha_resolution_snapshot(
                                     forwarding,
-                                    ha_runtime.as_ref(),
+                                    ha_state,
                                     now_secs,
                                     lookup_forwarding_resolution_for_session(
                                         forwarding,
@@ -1540,7 +1540,7 @@ fn poll_binding(
                                     .unwrap_or_else(|| {
                                         enforce_ha_resolution_snapshot(
                                             forwarding,
-                                            ha_runtime.as_ref(),
+                                            ha_state,
                                             now_secs,
                                             lookup_forwarding_resolution_with_dynamic(
                                                 forwarding,
@@ -1621,7 +1621,7 @@ fn poll_binding(
                                     }
                                     let reverse_resolution = enforce_ha_resolution_snapshot(
                                         forwarding,
-                                        ha_runtime.as_ref(),
+                                        ha_state,
                                         now_secs,
                                         lookup_forwarding_resolution_with_dynamic(
                                             forwarding,
@@ -1701,7 +1701,7 @@ fn poll_binding(
                         SessionDecision {
                             resolution: enforce_ha_resolution_snapshot(
                                 forwarding,
-                                ha_runtime.as_ref(),
+                                ha_state,
                                 now_secs,
                                 resolve_forwarding(
                                     &binding.area,
@@ -3317,10 +3317,21 @@ fn worker_loop(
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut hot_binding: Option<usize> = None;
+    let mut cached_now_ns = monotonic_nanos();
+    let mut cached_now_secs = cached_now_ns / 1_000_000_000;
+    let mut time_refresh_budget = 0u32;
     while !stop.load(Ordering::Relaxed) {
         apply_worker_commands(&commands, &mut sessions);
-        let loop_now_ns = monotonic_nanos();
-        let loop_now_secs = loop_now_ns / 1_000_000_000;
+        if time_refresh_budget == 0 || idle_iters > 0 {
+            cached_now_ns = monotonic_nanos();
+            cached_now_secs = cached_now_ns / 1_000_000_000;
+            time_refresh_budget = LOOP_TIME_REFRESH_ITERS;
+        } else {
+            time_refresh_budget -= 1;
+        }
+        let loop_now_ns = cached_now_ns;
+        let loop_now_secs = cached_now_secs;
+        let ha_runtime = ha_state.load();
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
         let expired = sessions.expire_stale(loop_now_ns);
         if expired > 0 {
@@ -3348,7 +3359,7 @@ fn worker_loop(
                 loop_now_ns,
                 loop_now_secs,
                 &forwarding,
-                &ha_state,
+                ha_runtime.as_ref(),
                 &dynamic_neighbors,
                 &shared_sessions,
                 slow_path.as_ref(),
@@ -3381,7 +3392,7 @@ fn worker_loop(
                 loop_now_ns,
                 loop_now_secs,
                 &forwarding,
-                &ha_state,
+                ha_runtime.as_ref(),
                 &dynamic_neighbors,
                 &shared_sessions,
                 slow_path.as_ref(),
