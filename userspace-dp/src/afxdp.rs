@@ -1037,6 +1037,7 @@ struct TxRequest {
 struct PendingForwardRequest {
     target_ifindex: i32,
     ingress_queue_id: u32,
+    source_offset: u64,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     decision: SessionDecision,
@@ -1259,6 +1260,7 @@ fn poll_binding(
     while let Some(desc) = received.read() {
         batch_packets += 1;
         batch_bytes += desc.len as u64;
+        let mut recycle_now = true;
         if let Some(meta) = try_parse_metadata(&binding.area, desc) {
             binding
                 .live
@@ -1639,6 +1641,7 @@ fn poll_binding(
                         forwarding,
                     ) {
                         pending_forwards.push(request);
+                        recycle_now = false;
                     }
                 } else {
                     maybe_reinject_slow_path(
@@ -1664,7 +1667,9 @@ fn poll_binding(
                 None,
             );
         }
-        recycle.push(desc.addr);
+        if recycle_now {
+            recycle.push(desc.addr);
+        }
     }
     flush_session_deltas(
         &ident,
@@ -1729,6 +1734,7 @@ fn build_live_forward_request(
     Some(PendingForwardRequest {
         target_ifindex,
         ingress_queue_id: ingress_ident.queue_id,
+        source_offset: desc.addr,
         desc,
         meta,
         decision: *decision,
@@ -1746,6 +1752,7 @@ fn enqueue_pending_forwards(
 ) {
     let ingress_area_ptr: *const MmapArea = &ingress_binding.area;
     for request in pending_forwards {
+        let source_offset = request.source_offset;
         let Some(target_binding) = find_target_binding_mut(
         left,
         ingress_binding,
@@ -1761,6 +1768,7 @@ fn enqueue_pending_forwards(
             None,
             None,
         );
+            ingress_binding.pending_fill_frames.push_back(source_offset);
             continue;
         };
         // Safe because RX frames are not recycled back into the fill ring until
@@ -1807,6 +1815,7 @@ fn enqueue_pending_forwards(
                                 Some(request.meta),
                                 None,
                             );
+                            ingress_binding.pending_fill_frames.push_back(source_offset);
                             continue;
                         }
                     }
@@ -1832,6 +1841,7 @@ fn enqueue_pending_forwards(
                         Some(request.meta),
                         None,
                     );
+                    ingress_binding.pending_fill_frames.push_back(source_offset);
                     continue;
                 }
             }
@@ -1840,6 +1850,10 @@ fn enqueue_pending_forwards(
             || target_binding.pending_tx_local.len() >= TX_BATCH_SIZE
         {
             let _ = drain_pending_tx(target_binding);
+        }
+        ingress_binding.pending_fill_frames.push_back(source_offset);
+        if ingress_binding.pending_fill_frames.len() >= (RX_BATCH_SIZE as usize / 2).max(1) {
+            let _ = drain_pending_fill(ingress_binding);
         }
     }
 }
