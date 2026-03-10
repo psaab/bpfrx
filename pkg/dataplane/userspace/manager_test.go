@@ -222,6 +222,39 @@ func TestDeriveUserspaceCapabilitiesAllowsDNSFlowKnobs(t *testing.T) {
 	}
 }
 
+func TestDesiredForwardingArmedTracksClusterOwnership(t *testing.T) {
+	m := &Manager{
+		clusterHA: true,
+		lastStatus: ProcessStatus{
+			Capabilities: UserspaceCapabilities{ForwardingSupported: true},
+		},
+		haGroups: map[int]HAGroupStatus{
+			0: {RGID: 0, Active: true},
+			1: {RGID: 1, Active: false},
+			2: {RGID: 2, Active: false},
+		},
+	}
+	if m.desiredForwardingArmedLocked() {
+		t.Fatal("desiredForwardingArmedLocked() = true, want false with no active data RG")
+	}
+	m.haGroups[2] = HAGroupStatus{RGID: 2, Active: true}
+	if !m.desiredForwardingArmedLocked() {
+		t.Fatal("desiredForwardingArmedLocked() = false, want true with active data RG")
+	}
+}
+
+func TestDesiredForwardingArmedDefaultsOnStandalone(t *testing.T) {
+	m := &Manager{
+		clusterHA: false,
+		lastStatus: ProcessStatus{
+			Capabilities: UserspaceCapabilities{ForwardingSupported: true},
+		},
+	}
+	if !m.desiredForwardingArmedLocked() {
+		t.Fatal("desiredForwardingArmedLocked() = false, want true on standalone supported config")
+	}
+}
+
 func TestUserspaceSupportsSimpleZonePolicies(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.DefaultPolicy = config.PolicyDeny

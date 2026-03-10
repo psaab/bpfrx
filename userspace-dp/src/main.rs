@@ -895,7 +895,11 @@ fn handle_stream(
                         response.error = forwarding_unsupported_error(&guard.status.capabilities);
                     } else {
                         guard.status.forwarding_armed = forwarding_req.armed;
+                        set_bindings_forwarding_armed(&mut guard.status, forwarding_req.armed);
                         reconcile_status_bindings(&mut guard);
+                        if forwarding_req.armed {
+                            wait_for_binding_settle(&mut guard, Duration::from_secs(2));
+                        }
                         refresh_status(&mut guard);
                         persist_state = true;
                     }
@@ -1207,6 +1211,13 @@ fn reconcile_status_bindings(state: &mut ServerState) {
 
 fn should_run_afxdp(status: &ProcessStatus) -> bool {
     status.forwarding_armed && status.capabilities.forwarding_supported
+}
+
+fn set_bindings_forwarding_armed(status: &mut ProcessStatus, armed: bool) {
+    for binding in &mut status.bindings {
+        binding.armed = armed && binding.registered;
+        binding.last_change = Some(Utc::now());
+    }
 }
 
 fn wait_for_binding_settle(state: &mut ServerState, timeout: Duration) {
@@ -1549,5 +1560,28 @@ mod tests {
             ..Default::default()
         };
         assert!(should_run_afxdp(&status));
+    }
+
+    #[test]
+    fn forwarding_arm_updates_registered_bindings() {
+        let mut status = ProcessStatus {
+            bindings: vec![
+                BindingStatus {
+                    registered: true,
+                    ..Default::default()
+                },
+                BindingStatus {
+                    registered: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        set_bindings_forwarding_armed(&mut status, true);
+        assert!(status.bindings[0].armed);
+        assert!(!status.bindings[1].armed);
+        set_bindings_forwarding_armed(&mut status, false);
+        assert!(!status.bindings[0].armed);
+        assert!(!status.bindings[1].armed);
     }
 }

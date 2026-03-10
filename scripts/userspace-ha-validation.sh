@@ -34,7 +34,9 @@ source "$ENV_FILE"
 
 REMOTE_PREFIX="${INCUS_REMOTE:+${INCUS_REMOTE}:}"
 FW0="${REMOTE_PREFIX}${VM0}"
+FW1="${REMOTE_PREFIX}${VM1}"
 HOST="${REMOTE_PREFIX}${LAN_HOST}"
+ACTIVE_FW="${FW0}"
 
 info() { printf '==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -43,14 +45,29 @@ run_host() {
 	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "$1")"
 }
 
-run_fw0() {
-	sg incus-admin -c "incus exec ${FW0} -- bash -lc $(printf %q "$1")"
+run_vm() {
+	local vm="$1"
+	shift
+	sg incus-admin -c "incus exec ${vm} -- bash -lc $(printf %q "$1")"
 }
 
-wait_for_fw0_cli() {
+run_fw0() {
+	run_vm "${FW0}" "$1"
+}
+
+run_fw1() {
+	run_vm "${FW1}" "$1"
+}
+
+run_active_fw() {
+	run_vm "${ACTIVE_FW}" "$1"
+}
+
+wait_for_vm_cli() {
+	local vm="$1"
 	local tries=30
 	while (( tries > 0 )); do
-		if run_fw0 'cli -c "show chassis cluster data-plane statistics" >/tmp/userspace-cli-ready.out 2>/dev/null'; then
+		if run_vm "$vm" 'cli -c "show chassis cluster data-plane statistics" >/tmp/userspace-cli-ready.out 2>/dev/null'; then
 			return 0
 		fi
 		sleep 1
@@ -84,26 +101,37 @@ runtime_mode() {
 	return 1
 }
 
-queue_ids() {
-	run_fw0 'python3 - <<'"'"'PY'"'"'
-import json
-with open("/run/bpfrx/userspace-dp.json", "r", encoding="utf-8") as fh:
-    data = json.load(fh)
-queues = data.get("status", {}).get("queues", [])
-print(" ".join(str(q.get("queue_id")) for q in queues if "queue_id" in q))
-PY'
+enabled_userspace_vm() {
+	local vm="$1"
+	local stats
+	stats="$(run_vm "$vm" 'cli -c "show chassis cluster data-plane statistics"')"
+	grep -Eq 'Enabled:[[:space:]]+true' <<<"$stats" &&
+		grep -Eq 'Forwarding supported:[[:space:]]+true' <<<"$stats" &&
+		grep -Eq 'Ready bindings:[[:space:]]+[1-9][0-9]*/[0-9]+' <<<"$stats"
 }
 
-wait_for_enabled_userspace() {
-	local tries=30
-	while (( tries > 0 )); do
-		local stats
-		stats="$(run_fw0 'cli -c "show chassis cluster data-plane statistics"')"
-		if grep -Eq 'Enabled:[[:space:]]+true' <<<"$stats" &&
-			grep -Eq 'Forwarding supported:[[:space:]]+true' <<<"$stats" &&
-			grep -Eq 'Ready bindings:[[:space:]]+[1-9][0-9]*/[0-9]+' <<<"$stats"; then
+active_owner_vm() {
+	local vm stats
+	for vm in "$FW0" "$FW1"; do
+		stats="$(run_vm "$vm" 'cli -c "show chassis cluster data-plane statistics"' 2>/dev/null || true)"
+		if grep -Eq 'HA groups:[[:space:]].*rg[1-9][0-9]* active=true' <<<"$stats"; then
+			printf '%s\n' "$vm"
 			return 0
 		fi
+	done
+	return 1
+}
+
+wait_for_active_supported_runtime() {
+	local tries=30
+	while (( tries > 0 )); do
+		local vm
+		for vm in "$FW0" "$FW1"; do
+			if enabled_userspace_vm "$vm" >/dev/null 2>&1; then
+				printf '%s\n' "$vm"
+				return 0
+			fi
+		done
 		sleep 1
 		tries=$((tries - 1))
 	done
@@ -111,17 +139,24 @@ wait_for_enabled_userspace() {
 }
 
 arm_supported_runtime() {
-	info "arming userspace forwarding on fw0"
-	run_fw0 'cli -c "request chassis cluster data-plane userspace forwarding arm" >/tmp/userspace-arm.out'
-	local queues
-	queues="$(queue_ids)"
-	for q in $queues; do
-		run_fw0 "cli -c \"request chassis cluster data-plane userspace queue ${q} arm\" >/tmp/userspace-queue-${q}.out"
-	done
-	wait_for_enabled_userspace || {
-		run_fw0 'cli -c "show chassis cluster data-plane statistics" >&2 || true'
-		die "userspace forwarding did not become enabled after arming fw0"
-	}
+	local owner
+	owner="$(active_owner_vm || true)"
+	if [[ -z "$owner" ]]; then
+		owner="$FW0"
+	fi
+	info "waiting for userspace forwarding to auto-arm on the active node"
+	if ACTIVE_FW="$(wait_for_active_supported_runtime)"; then
+		info "active userspace firewall: ${ACTIVE_FW}"
+		return 0
+	fi
+	info "auto-arm did not settle, forcing forwarding arm on ${owner}"
+	run_vm "$owner" 'cli -c "request chassis cluster data-plane userspace forwarding arm" >/tmp/userspace-arm.out'
+	if ACTIVE_FW="$(wait_for_active_supported_runtime)"; then
+		info "active userspace firewall: ${ACTIVE_FW}"
+		return 0
+	fi
+	run_vm "$owner" 'cli -c "show chassis cluster data-plane statistics" >&2 || true'
+	die "userspace forwarding did not become enabled on the active node"
 }
 
 wait_for_ipv6_default_route() {
@@ -145,7 +180,8 @@ if [[ $DEPLOY -eq 1 ]]; then
 fi
 
 info "waiting for bpfrxd gRPC/CLI readiness"
-wait_for_fw0_cli || die "fw0 bpfrxd did not become reachable in time"
+wait_for_vm_cli "$FW0" || die "fw0 bpfrxd did not become reachable in time"
+wait_for_vm_cli "$FW1" || die "fw1 bpfrxd did not become reachable in time"
 
 info "detecting userspace runtime mode"
 MODE="$(runtime_mode)" || die "userspace runtime mode did not settle in time"
@@ -275,12 +311,12 @@ run_perf_pair() {
 	local perf_pid
 
 	info "profiling ${label}"
-	sg incus-admin -c "incus exec ${FW0} -- bash -lc $(printf %q "rm -f ${perf_data} ${perf_report}; perf record -a -g -F 997 -o ${perf_data} -- sleep $((DURATION + 2))")" &
+	sg incus-admin -c "incus exec ${ACTIVE_FW} -- bash -lc $(printf %q "rm -f ${perf_data} ${perf_report}; perf record -a -g -F 997 -o ${perf_data} -- sleep $((DURATION + 2))")" &
 	perf_pid=$!
 	sleep 1
 	run_iperf_json "$family" "$target" "$iperf_json"
 	wait "$perf_pid" || true
-	run_fw0 "perf report --stdio -i ${perf_data} --sort symbol | sed -n '1,80p' > ${perf_report}"
+	run_active_fw "perf report --stdio -i ${perf_data} --sort symbol | sed -n '1,80p' > ${perf_report}"
 }
 
 warm_up_family ipv4 172.16.80.200 4
@@ -295,7 +331,8 @@ if [[ $WITH_PERF -eq 1 ]]; then
 fi
 
 info "validation summary"
+printf 'active fw: %s\n' "${ACTIVE_FW}" | tee -a "$summary_file"
 cat "$summary_file"
 if [[ $WITH_PERF -eq 1 ]]; then
-	info "perf artifacts on fw0: /tmp/perf-userspace-ipv4.{data,report} /tmp/perf-userspace-ipv6.{data,report}"
+	info "perf artifacts on ${ACTIVE_FW}: /tmp/perf-userspace-ipv4.{data,report} /tmp/perf-userspace-ipv6.{data,report}"
 fi

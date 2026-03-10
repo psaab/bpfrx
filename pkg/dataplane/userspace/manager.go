@@ -39,6 +39,7 @@ type Manager struct {
 	mu         sync.Mutex
 	proc       *exec.Cmd
 	cfg        config.UserspaceConfig
+	clusterHA  bool
 	generation uint64
 	syncCancel context.CancelFunc
 	lastStatus ProcessStatus
@@ -91,6 +92,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.clusterHA = cfg != nil && cfg.Chassis.Cluster != nil
 	if err := m.programBootstrapMapsLocked(snap, ucfg); err != nil {
 		return result, err
 	}
@@ -106,6 +108,9 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	}
 	if err := m.syncHAStateLocked(); err != nil {
 		return result, fmt.Errorf("publish userspace HA state: %w", err)
+	}
+	if err := m.syncDesiredForwardingStateLocked(); err != nil {
+		return result, fmt.Errorf("sync userspace forwarding state: %w", err)
 	}
 	m.ensureStatusLoopLocked()
 	m.cfg = ucfg
@@ -1029,6 +1034,60 @@ func (m *Manager) syncHAStateLocked() error {
 		Type: "update_ha_state",
 		HAState: &HAStateUpdateRequest{
 			Groups: groups,
+		},
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		return err
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return err
+	}
+	return m.syncDesiredForwardingStateLocked()
+}
+
+func (m *Manager) desiredForwardingArmedLocked() bool {
+	if !m.lastStatus.Capabilities.ForwardingSupported {
+		return false
+	}
+	if !m.clusterHA {
+		return true
+	}
+	if len(m.haGroups) == 0 {
+		return false
+	}
+	hasDataRG := false
+	for rgID, group := range m.haGroups {
+		if rgID <= 0 {
+			continue
+		}
+		hasDataRG = true
+		if group.Active {
+			return true
+		}
+	}
+	if !hasDataRG {
+		for _, group := range m.haGroups {
+			if group.Active {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (m *Manager) syncDesiredForwardingStateLocked() error {
+	if m.proc == nil || m.proc.Process == nil {
+		return nil
+	}
+	desired := m.desiredForwardingArmedLocked()
+	if m.lastStatus.ForwardingArmed == desired {
+		return nil
+	}
+	var status ProcessStatus
+	req := ControlRequest{
+		Type: "set_forwarding_state",
+		Forwarding: &ForwardingControlRequest{
+			Armed: desired,
 		},
 	}
 	if err := m.requestLocked(req, &status); err != nil {
