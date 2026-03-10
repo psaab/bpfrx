@@ -398,6 +398,19 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 				return TC_ACT_OK;
 			}
 		}
+		/* Allow tunnel-encapsulated outer packets.  When XDP
+		 * does XDP_PASS for tunnel-routed traffic, the kernel
+		 * forwards through the tunnel (GRE/ESP).  The tunnel
+		 * driver prepends outer headers to the same skb, so
+		 * ingress_ifindex is still set from the original inner
+		 * packet.  The inner packet was validated by XDP — the
+		 * outer encapsulation is trusted local kernel work. */
+		if (meta->protocol == PROTO_GRE ||
+		    meta->protocol == PROTO_ESP) {
+			bpf_tail_call(skb, &tc_progs,
+				      TC_PROG_FORWARD);
+			return TC_ACT_OK;
+		}
 		return TC_ACT_SHOT;
 	}
 

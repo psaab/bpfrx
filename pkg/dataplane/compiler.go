@@ -47,8 +47,9 @@ type CompileResult struct {
 	// pendingXDP/TC collect interface indexes for deferred program attachment.
 	// Attachment happens AFTER all compilation phases so that link.Update()
 	// atomically switches to programs with fully-populated maps.
-	pendingXDP []int
-	pendingTC  []int
+	pendingXDP      []int
+	pendingTC       []int
+	tunnelIfindexes map[int]bool // tunnel interfaces: XDP ingress only, no redirect
 
 	// ManagedInterfaces describes all interfaces managed by the firewall,
 	// used by the networkd manager to generate .link and .network files.
@@ -279,8 +280,14 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		rcMap := m.maps["redirect_capable"]
 
 		// Populate redirect_capable BEFORE link.Update() swaps programs.
+		// Skip tunnel interfaces — bpf_redirect_map sends Ethernet frames
+		// but POINTOPOINT tunnels (GRE, ip6gre, XFRM) expect raw IP.
+		// Those interfaces still get XDP for ingress decapsulated traffic.
 		if rcMap != nil {
 			for _, ifidx := range result.pendingXDP {
+				if result.tunnelIfindexes[ifidx] {
+					continue
+				}
 				rcMap.Update(uint32(ifidx), uint8(1), ebpf.UpdateAny)
 			}
 		}
@@ -542,6 +549,10 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	attached := make(map[int]bool)
 	// Collect physical ifindexes for deferred XDP attachment
 	var xdpIfindexes []int
+	// Tunnel interfaces need XDP for ingress but must NOT be in
+	// redirect_capable or tx_ports — bpf_redirect_map sends the full
+	// Ethernet frame, but POINTOPOINT tunnels expect raw IP.
+	tunnelIfindexes := make(map[int]bool)
 
 	for name, zone := range cfg.Security.Zones {
 		zid := result.ZoneIDs[name]
@@ -691,6 +702,9 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 					cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie",
 				).Flags
 			}
+			if izFlags&IfaceFlagTunnel != 0 {
+				tunnelIfindexes[physIface.Index] = true
+			}
 			if err := dp.SetZone(physIface.Index, uint16(vlanID), zid, tableID, izFlags, rgID, screenFlags); err != nil {
 				return fmt.Errorf("set zone for %s vlan %d (ifindex %d): %w",
 					physName, vlanID, physIface.Index, err)
@@ -701,7 +715,12 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			// XDP attachment is deferred to after the loop so we can ensure
 			// all interfaces use the same XDP mode (native vs generic).
 			if !attached[physIface.Index] {
-				if err := dp.AddTxPort(physIface.Index); err != nil {
+				// Skip tx_ports for tunnel interfaces — bpf_redirect_map
+				// sends Ethernet frames but tunnels expect raw IP.
+				if tunnelIfindexes[physIface.Index] {
+					slog.Info("skipping tx_port for tunnel interface",
+						"name", physName, "ifindex", physIface.Index)
+				} else if err := dp.AddTxPort(physIface.Index); err != nil {
 					return fmt.Errorf("add tx port %s: %w", physName, err)
 				}
 
@@ -825,6 +844,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 
 	// Store pending XDP ifindexes for deferred attachment after all compile phases.
 	result.pendingXDP = xdpIfindexes
+	result.tunnelIfindexes = tunnelIfindexes
 
 	// Collect managed interface info for networkd config generation.
 	// Iterate over configured interfaces (not zones) to get a clean
