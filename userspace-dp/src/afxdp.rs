@@ -1325,6 +1325,8 @@ fn poll_binding(
         session_hits: u64,
         session_misses: u64,
         session_creates: u64,
+        snat_packets: u64,
+        dnat_packets: u64,
     }
 
     impl BatchCounters {
@@ -1363,6 +1365,16 @@ fn poll_binding(
                 live.session_creates
                     .fetch_add(self.session_creates, Ordering::Relaxed);
                 self.session_creates = 0;
+            }
+            if self.snat_packets != 0 {
+                live.snat_packets
+                    .fetch_add(self.snat_packets, Ordering::Relaxed);
+                self.snat_packets = 0;
+            }
+            if self.dnat_packets != 0 {
+                live.dnat_packets
+                    .fetch_add(self.dnat_packets, Ordering::Relaxed);
+                self.dnat_packets = 0;
             }
         }
     }
@@ -1761,14 +1773,15 @@ fn poll_binding(
                             | ForwardingDisposition::FabricRedirect
                     ) {
                         counters.forward_candidate_packets += 1;
-                        if let Some(request) = build_live_forward_request(
-                            &ident,
-                            &binding.live,
-                            desc,
-                            meta,
-                            &decision,
-                            forwarding,
-                        ) {
+                        if decision.nat.rewrite_src.is_some() {
+                            counters.snat_packets += 1;
+                        }
+                        if decision.nat.rewrite_dst.is_some() {
+                            counters.dnat_packets += 1;
+                        }
+                        if let Some(request) =
+                            build_live_forward_request(&ident, desc, meta, &decision, forwarding)
+                        {
                             binding.scratch_forwards.push(request);
                             recycle_now = false;
                         }
@@ -1859,18 +1872,11 @@ fn poll_binding(
 
 fn build_live_forward_request(
     ingress_ident: &BindingIdentity,
-    ingress_live: &BindingLiveState,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
     forwarding: &ForwardingState,
 ) -> Option<PendingForwardRequest> {
-    if decision.nat.rewrite_src.is_some() {
-        ingress_live.snat_packets.fetch_add(1, Ordering::Relaxed);
-    }
-    if decision.nat.rewrite_dst.is_some() {
-        ingress_live.dnat_packets.fetch_add(1, Ordering::Relaxed);
-    }
     let target_ifindex = if decision.resolution.tx_ifindex > 0 {
         decision.resolution.tx_ifindex
     } else {
@@ -5014,39 +5020,42 @@ fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
     if packet.len() < 40 {
         return None;
     }
-    let old_src = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(8..24)?).ok()?);
-    let old_dst = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(24..40)?).ok()?);
+    let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
+    let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
     let new_src = nat.rewrite_src.and_then(|ip| match ip {
-        IpAddr::V6(ip) => Some(ip),
+        IpAddr::V6(ip) => Some(ip.octets()),
         _ => None,
     });
     let new_dst = nat.rewrite_dst.and_then(|ip| match ip {
-        IpAddr::V6(ip) => Some(ip),
+        IpAddr::V6(ip) => Some(ip.octets()),
         _ => None,
     });
     if new_src.is_some() && new_dst.is_none() {
         let new_src = new_src?;
-        packet.get_mut(8..24)?.copy_from_slice(&new_src.octets());
-        adjust_l4_checksum_ipv6_src(packet, protocol, old_src, new_src)?;
+        packet.get_mut(8..24)?.copy_from_slice(&new_src);
+        let new_src_words = ipv6_words_from_octets(new_src);
+        adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
         return Some(());
     }
     if new_dst.is_some() && new_src.is_none() {
         let new_dst = new_dst?;
-        packet.get_mut(24..40)?.copy_from_slice(&new_dst.octets());
-        adjust_l4_checksum_ipv6_dst(packet, protocol, old_dst, new_dst)?;
+        packet.get_mut(24..40)?.copy_from_slice(&new_dst);
+        let new_dst_words = ipv6_words_from_octets(new_dst);
+        adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
         return Some(());
     }
     if let Some(ip) = new_src {
-        packet.get_mut(8..24)?.copy_from_slice(&ip.octets());
+        packet.get_mut(8..24)?.copy_from_slice(&ip);
     }
     if let Some(ip) = new_dst {
-        packet.get_mut(24..40)?.copy_from_slice(&ip.octets());
+        packet.get_mut(24..40)?.copy_from_slice(&ip);
     }
-    let new_src = new_src.unwrap_or(old_src);
-    let new_dst = new_dst.unwrap_or(old_dst);
+    let new_src_words = new_src.map(ipv6_words_from_octets).unwrap_or(old_src_words);
+    let new_dst_words = new_dst.map(ipv6_words_from_octets).unwrap_or(old_dst_words);
     match protocol {
         PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {
-            adjust_l4_checksum_ipv6(packet, protocol, old_src, new_src, old_dst, new_dst)?
+            adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
+            adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
         }
         _ => {}
     }
@@ -5227,7 +5236,10 @@ fn ipv4_words(ip: Ipv4Addr) -> [u16; 2] {
 }
 
 fn ipv6_words(ip: Ipv6Addr) -> [u16; 8] {
-    let octets = ip.octets();
+    ipv6_words_from_octets(ip.octets())
+}
+
+fn ipv6_words_from_octets(octets: [u8; 16]) -> [u16; 8] {
     [
         u16::from_be_bytes([octets[0], octets[1]]),
         u16::from_be_bytes([octets[2], octets[3]]),
@@ -5238,6 +5250,11 @@ fn ipv6_words(ip: Ipv6Addr) -> [u16; 8] {
         u16::from_be_bytes([octets[12], octets[13]]),
         u16::from_be_bytes([octets[14], octets[15]]),
     ]
+}
+
+fn ipv6_words_from_slice(bytes: &[u8]) -> Option<[u16; 8]> {
+    let octets: [u8; 16] = bytes.get(..16)?.try_into().ok()?;
+    Some(ipv6_words_from_octets(octets))
 }
 
 fn adjust_ipv4_header_checksum(
