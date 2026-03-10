@@ -1118,6 +1118,16 @@ fn poll_binding(
             );
             if disposition == PacketDisposition::Valid {
                 let flow = parse_session_flow(&binding.area, desc, meta);
+                if let Some(flow) = flow.as_ref() {
+                    learn_dynamic_neighbor_from_packet(
+                        &binding.area,
+                        desc,
+                        meta,
+                        flow.src_ip,
+                        forwarding,
+                        dynamic_neighbors,
+                    );
+                }
                 let decision = if let Some(flow) = flow.as_ref() {
                     let now = Instant::now();
                     if let Some(hit) = sessions.lookup(&flow.forward_key, now, meta.tcp_flags) {
@@ -1574,6 +1584,58 @@ fn parse_flow_ports(frame: &[u8], l4: usize, protocol: u8) -> Option<(u16, u16)>
             Some((ident, 0))
         }
         _ => None,
+    }
+}
+
+fn learn_dynamic_neighbor_from_packet(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    src_ip: IpAddr,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+) {
+    let Some(frame) = area.slice(desc.addr as usize, desc.len as usize) else {
+        return;
+    };
+    if frame.len() < 12 {
+        return;
+    }
+    let mut src_mac = [0u8; 6];
+    src_mac.copy_from_slice(&frame[6..12]);
+    if src_mac == [0; 6] || (src_mac[0] & 1) != 0 {
+        return;
+    }
+    learn_dynamic_neighbor(
+        forwarding,
+        dynamic_neighbors,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+        src_ip,
+        src_mac,
+    );
+}
+
+fn learn_dynamic_neighbor(
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    ingress_ifindex: i32,
+    ingress_vlan_id: u16,
+    src_ip: IpAddr,
+    src_mac: [u8; 6],
+) {
+    let mut ifindexes = vec![ingress_ifindex];
+    if let Some(logical_ifindex) =
+        resolve_ingress_logical_ifindex(forwarding, ingress_ifindex, ingress_vlan_id)
+    {
+        if logical_ifindex > 0 && logical_ifindex != ingress_ifindex {
+            ifindexes.push(logical_ifindex);
+        }
+    }
+    if let Ok(mut cache) = dynamic_neighbors.lock() {
+        for ifindex in ifindexes {
+            cache.insert((ifindex, src_ip), NeighborEntry { mac: src_mac });
+        }
     }
 }
 
@@ -2532,6 +2594,23 @@ fn owner_rg_for_flow(forwarding: &ForwardingState, egress_ifindex: i32) -> i32 {
         .get(&egress_ifindex)
         .map(|iface| iface.redundancy_group.max(0))
         .unwrap_or_default()
+}
+
+fn resolve_ingress_logical_ifindex(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    ingress_vlan_id: u16,
+) -> Option<i32> {
+    forwarding
+        .egress
+        .iter()
+        .find_map(|(ifindex, iface)| {
+            if iface.bind_ifindex == ingress_ifindex && iface.vlan_id == ingress_vlan_id {
+                Some(*ifindex)
+            } else {
+                None
+            }
+        })
 }
 
 fn enforce_ha_resolution(
@@ -4540,6 +4619,62 @@ mod tests {
         assert_eq!(
             resolved.neighbor_mac,
             Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+        );
+    }
+
+    #[test]
+    fn learned_ingress_neighbor_enables_reverse_lan_resolution() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let dynamic_neighbors = Arc::new(Mutex::new(BTreeMap::new()));
+        learn_dynamic_neighbor(
+            &state,
+            &dynamic_neighbors,
+            24,
+            0,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        );
+        let resolved = lookup_forwarding_resolution_with_dynamic(
+            &state,
+            &dynamic_neighbors,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.egress_ifindex, 24);
+        assert_eq!(
+            resolved.neighbor_mac,
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+    }
+
+    #[test]
+    fn learned_vlan_ingress_neighbor_maps_to_logical_ifindex() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let dynamic_neighbors = Arc::new(Mutex::new(BTreeMap::new()));
+        learn_dynamic_neighbor(
+            &state,
+            &dynamic_neighbors,
+            11,
+            80,
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+        );
+        let resolved = lookup_forwarding_resolution_with_dynamic(
+            &state,
+            &dynamic_neighbors,
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.egress_ifindex, 12);
+        assert_eq!(
+            resolved.neighbor_mac,
+            Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01])
         );
     }
 
