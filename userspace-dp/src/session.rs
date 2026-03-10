@@ -35,6 +35,7 @@ struct SessionEntry {
     metadata: SessionMetadata,
     last_seen: Instant,
     expires_after: Duration,
+    closing: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,29 +137,21 @@ impl SessionTable {
         now: Instant,
         tcp_flags: u8,
     ) -> Option<SessionLookup> {
-        let remove_after =
-            matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
-        let result = self.sessions.get_mut(key).map(|entry| {
+        self.sessions.get_mut(key).map(|entry| {
+            if matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
+                entry.closing = true;
+            }
             entry.last_seen = now;
-            entry.expires_after = session_timeout(key.protocol, tcp_flags);
+            entry.expires_after = if matches!(key.protocol, PROTO_TCP) && entry.closing {
+                TCP_CLOSING_TIMEOUT
+            } else {
+                session_timeout(key.protocol, tcp_flags)
+            };
             SessionLookup {
                 decision: entry.decision,
                 metadata: entry.metadata.clone(),
             }
-        });
-        if remove_after {
-            if let Some(entry) = self.sessions.remove(key) {
-                if !entry.metadata.is_reverse && !entry.metadata.synced {
-                    self.push_delta(SessionDelta {
-                        kind: SessionDeltaKind::Close,
-                        key: key.clone(),
-                        decision: entry.decision,
-                        metadata: entry.metadata,
-                    });
-                }
-            }
-        }
-        result
+        })
     }
 
     pub fn install_with_protocol(
@@ -181,6 +174,7 @@ impl SessionTable {
                 metadata: metadata.clone(),
                 last_seen: now,
                 expires_after: session_timeout(protocol, tcp_flags),
+                closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
             },
         );
         if !metadata.is_reverse && !metadata.synced {
@@ -210,6 +204,7 @@ impl SessionTable {
                 metadata,
                 last_seen: now,
                 expires_after: session_timeout(protocol, tcp_flags),
+                closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
             },
         );
     }
@@ -360,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_fin_removes_session_after_lookup() {
+    fn tcp_fin_keeps_session_until_closing_timeout() {
         let mut table = SessionTable::new();
         let key = key_v4();
         let now = Instant::now();
@@ -384,8 +379,12 @@ mod tests {
         assert!(
             table
                 .lookup(&key, now + Duration::from_millis(2), 0x10)
-                .is_none()
+                .is_some()
         );
+        table.last_gc = now + TCP_CLOSING_TIMEOUT;
+        let expired = table.expire_stale(now + TCP_CLOSING_TIMEOUT + Duration::from_secs(1));
+        assert_eq!(expired, 1);
+        assert!(table.lookup(&key, now + TCP_CLOSING_TIMEOUT + Duration::from_secs(2), 0).is_none());
         let deltas = table.drain_deltas(8);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
