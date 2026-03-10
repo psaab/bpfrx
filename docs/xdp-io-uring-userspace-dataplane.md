@@ -5,6 +5,15 @@ Date: 2026-03-06
 Note: This is an architecture exploration document. It is intentionally grounded in
 bpfrx's current XDP/TC, HA, and `pkg/dataplane.DataPlane` model.
 
+This file now serves two purposes:
+
+- the target design for the userspace dataplane
+- the current branch status on `userspace-dataplane-rust-wip`
+
+Those are not the same thing. The branch has real Rust AF_XDP forwarding and real
+lab validation, but it is still experimental, incomplete for full HA/policy parity,
+and not yet at performance parity with the legacy XDP/TC dataplane.
+
 ## Executive Summary
 
 If the goal is "use XDP to hand packets to a multithreaded userspace dataplane and
@@ -741,6 +750,8 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
   selected exception traffic, with explicit rate limits and helper-visible status counters
 - the Rust helper now has an initial per-worker session table for routed traffic,
   including bidirectional keying, lazy expiry, and cached forwarding resolution reuse
+- the Rust helper now has a shared-UMEM worker model across bindings, including
+  in-place rewrite/recycle support for same-worker forwarded traffic
 - the Rust helper now has a first worker-local NAT slice for interface-mode source NAT:
   ordered source-NAT rule snapshots, ingress/egress zone matching, per-session NAT
   decisions, forward-path SNAT rewrite, and reverse-path reply DNAT rewrite
@@ -764,10 +775,28 @@ What is still intentionally not implemented:
   schedulers, counters, and logging semantics
 - shared-memory snapshot regions
 - io_uring-backed slow-path transport beyond bounded TUN reinjection
+- performance parity with the legacy XDP/TC dataplane; current userspace forwarding
+  is still under active perf-guided tuning and should not be described as at-target
+  or production-ready
 
-That means the backend is now a real bring-up target with a real native helper,
-not just a design sketch, but it is still a guarded bootstrap path rather than a
-forwarding dataplane.
+### Current support boundary
+
+The current branch reality is:
+
+- authoritative validation target: the isolated userspace cluster on `loss`
+- the userspace dataplane can be armed and exercised there
+- the legacy XDP/TC dataplane remains the default and the correctness reference
+- current userspace work is focused on:
+  - forwarding correctness
+  - AF_XDP/Rust hot-path performance
+  - closing the gap to the `22-23 Gbps` target on the isolated lab
+
+Do not read this document as claiming that the userspace dataplane is already a
+drop-in replacement for the existing eBPF dataplane. It is not there yet.
+
+That means the backend is now a real forwarding bring-up target with a real native
+helper, not just a design sketch. It is still experimental and not yet a drop-in
+replacement for the existing eBPF dataplane.
 
 ## Phase 1: Add a new dataplane backend type
 
@@ -847,10 +876,13 @@ Implemented today:
 - initial per-worker session tracking and cached forwarding resolution reuse
 - bounded TUN slow-path reinjection for local-delivery and selected exception traffic
 - synthetic packet validation path
+- shared-UMEM forwarding across bindings with in-place frame reuse on the common
+  same-worker forward path
 
 Not implemented yet:
 - per-worker watchdog maps beyond the current binding heartbeat map
-- live forwarding for HA, NAT, zones/policy, and stateful flows
+- full live forwarding parity for HA, NAT, zones/policy, and stateful flows
+- enough hot-path optimization to claim parity with the legacy dataplane
 
 ## Phase 4: Move session/NAT/policy into worker-local tables
 

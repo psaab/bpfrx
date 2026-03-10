@@ -2,6 +2,10 @@
 
 Use [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-perf-compare.sh) when you need a repeatable IPv4/IPv6 performance capture on the isolated userspace cluster without coupling the result to the pass/fail thresholds in `userspace-ha-validation.sh`.
 
+This is the authoritative workflow for current branch measurements. During active
+performance work, do not cite the validation doc’s `22-23 Gbps` target as if it
+describes the current branch head. Use this workflow and the saved artifacts instead.
+
 This is the right tool when:
 - the branch is still unstable and validation fails at a reachability or throughput gate
 - you still need current `perf` data from `bpfrx-userspace-fw0/1`
@@ -45,7 +49,15 @@ Interpretation rule:
 
 Current expected hotspot categories:
 - `bpfrx_userspace_dp::afxdp::poll_binding`
+- `bpfrx_userspace_dp::afxdp::drain_pending_tx`
 - `bpfrx_userspace_dp::afxdp::build_forwarded_frame_into`
 - `bpfrx_userspace_dp::afxdp::apply_nat_ipv6`
 - kernel AF_XDP copy or queue work such as `mlx5e_xsk_*`
-- remaining lookup cost from route, neighbor, or session structures
+- remaining lookup cost from route, neighbor, or session structures such as B-tree search
+
+When interpreting the saved profile:
+
+- compare IPv4 and IPv6 on the same active userspace node
+- treat forwarding failures or connect-then-stall runs as correctness bugs first,
+  not as throughput numbers
+- use the reachability section in `summary.md` before trusting any `perf` sample

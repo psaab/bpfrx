@@ -10,7 +10,10 @@ Environment:
 - test host:
   - `loss:cluster-userspace-host`
 - tracked config:
-  - [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx/docs/ha-cluster-userspace.conf)
+  - [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx-userspace-wip/docs/ha-cluster-userspace.conf)
+
+This file is historical. It captures a closed lab regression and should not be read
+as the explanation for current userspace forwarding bugs on this branch.
 
 ## Symptom
 
@@ -191,6 +194,12 @@ That regression is now closed for the isolated userspace cluster:
    a stale `/tmp/ha-cluster-userspace.conf`
 3. the tracked config restores fast RA timing on `reth1`, which keeps the
    LAN host's IPv6 default route fresh enough for repeatable testing
+
+Current remaining userspace work is in the forwarding path itself:
+
+- forwarding correctness when the userspace dataplane is armed
+- AF_XDP/Rust hot-path performance
+- closing the gap to the `22-23 Gbps` target on the isolated lab
 
 Current repeatable validation is documented in
 [userspace-ha-validation.md](/home/ps/git/codex-bpfrx-userspace-wip/docs/userspace-ha-validation.md).

@@ -18,7 +18,8 @@ Tracked inputs:
 
 ## Current Model
 
-The isolated userspace cluster is no longer a legacy-only fallback case.
+The isolated userspace cluster is no longer a legacy-only fallback case, but it is
+still an experimental branch-only environment.
 
 Current expected behavior:
 - the Rust userspace dataplane is supported on this isolated cluster
@@ -111,17 +112,31 @@ The validator does this in order:
 11. retries one marginal near-threshold miss once
 12. optionally records `perf` data on the active userspace firewall
 
-## Current Baseline
+## Target And Interpretation
 
-Recent clean validation runs on the isolated userspace cluster are:
+Validation target for this branch:
 
-- IPv4 `iperf3 -P 4 -t 5`: about `22.0-22.6 Gbps`
-- IPv6 `iperf3 -P 4 -t 5`: about `21.8-22.4 Gbps`
+- IPv4 `iperf3 -P 4 -t 5`: `22-23 Gbps`
+- IPv6 `iperf3 -P 4 -t 5`: `22-23 Gbps`
 - Retransmits: `0`
 
+That is the target, not a guarantee of the current branch head.
+
+Current branch reality:
+
+- userspace forwarding is real and repeatable on the isolated lab
+- the branch is still under active forwarding-correctness and performance work
+- it is normal for the validator to fail while a phase is in progress
+- a failing validation run is signal; do not “fix” it by lowering the threshold
+
+Use [userspace-perf-compare.md](/home/ps/git/codex-bpfrx-userspace-wip/docs/userspace-perf-compare.md)
+for the current measured numbers and current hot-path deltas. This document defines
+the required workflow and the target, not the current performance claim for every
+branch head.
+
 Short-lived outliers can still happen immediately after rolling deploy while HA
-ownership and RA converge. That is why the validator now follows the active
-node, pins the preferred validation owner, and explicitly waits for IPv6 route state.
+ownership and RA converge. That is why the validator follows the active node,
+pins the preferred validation owner, and explicitly waits for IPv6 route state.
 
 ## Preferred Active Node
 
