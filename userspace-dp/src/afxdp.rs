@@ -20,7 +20,7 @@ use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
@@ -42,8 +42,7 @@ const MAX_RX_BATCHES_PER_POLL: usize = 4;
 const XSK_BIND_FLAGS_FALLBACK: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP;
 const XSK_BIND_FLAGS_PREFERRED: u16 =
     SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY;
-const IDLE_YIELD_ITERS: u32 = 64;
-const IDLE_SLEEP_AFTER: u32 = 256;
+const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
 const RX_WAKE_MIN_INTERVAL_NS: u64 = 200_000;
@@ -363,7 +362,7 @@ impl Coordinator {
         for (worker_id, binding_plans) in workers {
             let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
-            let heartbeat = Arc::new(AtomicI64::new(now_nanos()));
+            let heartbeat = Arc::new(AtomicU64::new(monotonic_nanos()));
             let commands = worker_command_queues
                 .get(&worker_id)
                 .cloned()
@@ -542,12 +541,17 @@ impl Coordinator {
     }
 
     pub fn worker_heartbeats(&self) -> Vec<chrono::DateTime<Utc>> {
+        let now_wall = Utc::now();
+        let now_mono = monotonic_nanos();
         self.workers
             .iter()
             .map(|(_, handle)| {
-                chrono::DateTime::<Utc>::from_timestamp_nanos(
+                monotonic_timestamp_to_datetime(
                     handle.heartbeat.load(Ordering::Relaxed),
+                    now_mono,
+                    now_wall,
                 )
+                .unwrap_or(now_wall)
             })
             .collect()
     }
@@ -799,7 +803,7 @@ impl Coordinator {
 
 struct WorkerHandle {
     stop: Arc<AtomicBool>,
-    heartbeat: Arc<AtomicI64>,
+    heartbeat: Arc<AtomicU64>,
     commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
     join: Option<JoinHandle<()>>,
 }
@@ -998,6 +1002,8 @@ struct BindingWorker {
     pending_tx_prepared: VecDeque<PreparedTxRequest>,
     pending_tx_local: VecDeque<TxRequest>,
     pending_fill_frames: VecDeque<u64>,
+    scratch_recycle: Vec<u64>,
+    scratch_forwards: Vec<PendingForwardRequest>,
     heartbeat_map_fd: c_int,
     last_heartbeat_update_ns: u64,
     last_rx_wake_ns: u64,
@@ -1201,6 +1207,8 @@ impl BindingWorker {
             pending_tx_prepared: VecDeque::new(),
             pending_tx_local: VecDeque::new(),
             pending_fill_frames: VecDeque::new(),
+            scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            scratch_forwards: Vec::with_capacity(RX_BATCH_SIZE as usize),
             heartbeat_map_fd,
             last_heartbeat_update_ns: monotonic_nanos(),
             last_rx_wake_ns: monotonic_nanos(),
@@ -1324,8 +1332,8 @@ fn poll_binding(
         binding.empty_rx_polls = 0;
 
         let mut received = binding.rx.receive(available);
-        let mut recycle = Vec::with_capacity(available as usize);
-        let mut pending_forwards = Vec::with_capacity(available as usize);
+        binding.scratch_recycle.clear();
+        binding.scratch_forwards.clear();
         let mut batch_packets = 0u64;
         let mut batch_bytes = 0u64;
         while let Some(desc) = received.read() {
@@ -1724,7 +1732,7 @@ fn poll_binding(
                             &decision,
                             forwarding,
                         ) {
-                            pending_forwards.push(request);
+                            binding.scratch_forwards.push(request);
                             recycle_now = false;
                         }
                     } else {
@@ -1752,7 +1760,7 @@ fn poll_binding(
                 );
             }
             if recycle_now {
-                recycle.push(desc.addr);
+                binding.scratch_recycle.push(desc.addr);
             }
         }
         flush_session_deltas(
@@ -1765,17 +1773,21 @@ fn poll_binding(
         );
         received.release();
         drop(received);
+        let mut pending_forwards = core::mem::take(&mut binding.scratch_forwards);
         enqueue_pending_forwards(
             left,
             binding,
             right,
-            pending_forwards,
+            &mut pending_forwards,
             forwarding,
             &ident,
             recent_exceptions,
         );
-        if !recycle.is_empty() {
-            binding.pending_fill_frames.extend(recycle.into_iter());
+        binding.scratch_forwards = pending_forwards;
+        if !binding.scratch_recycle.is_empty() {
+            binding
+                .pending_fill_frames
+                .extend(binding.scratch_recycle.drain(..));
             let _ = drain_pending_fill(binding);
         }
         binding
@@ -1831,13 +1843,13 @@ fn enqueue_pending_forwards(
     left: &mut [BindingWorker],
     ingress_binding: &mut BindingWorker,
     right: &mut [BindingWorker],
-    pending_forwards: Vec<PendingForwardRequest>,
+    pending_forwards: &mut Vec<PendingForwardRequest>,
     forwarding: &ForwardingState,
     ingress_ident: &BindingIdentity,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
     let ingress_area_ptr: *const MmapArea = &ingress_binding.area;
-    for request in pending_forwards {
+    for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let Some(target_binding) = find_target_binding_mut(
             left,
@@ -3207,7 +3219,7 @@ fn worker_loop(
     commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
     peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     stop: Arc<AtomicBool>,
-    heartbeat: Arc<AtomicI64>,
+    heartbeat: Arc<AtomicU64>,
 ) {
     pin_current_thread(worker_id);
     let mut sessions = SessionTable::new();
@@ -3230,10 +3242,10 @@ fn worker_loop(
     let mut poll_start = 0usize;
     let mut hot_binding: Option<usize> = None;
     while !stop.load(Ordering::Relaxed) {
-        heartbeat.store(now_nanos(), Ordering::Relaxed);
         apply_worker_commands(&commands, &mut sessions);
         let loop_now = Instant::now();
         let loop_now_ns = monotonic_nanos();
+        heartbeat.store(loop_now_ns, Ordering::Relaxed);
         let poll_stats =
             loop_now_ns.saturating_sub(last_stats_poll_ns) >= STATS_POLL_INTERVAL_NS;
         let poll_neighbors = worker_id == 0
@@ -3310,15 +3322,13 @@ fn worker_loop(
             continue;
         }
         idle_iters = idle_iters.saturating_add(1);
-        if idle_iters <= IDLE_YIELD_ITERS {
-            thread::yield_now();
-        } else if idle_iters <= IDLE_SLEEP_AFTER {
+        if idle_iters <= IDLE_SPIN_ITERS {
             std::hint::spin_loop();
         } else {
             thread::sleep(Duration::from_micros(IDLE_SLEEP_US));
         }
     }
-    heartbeat.store(now_nanos(), Ordering::Relaxed);
+    heartbeat.store(monotonic_nanos(), Ordering::Relaxed);
 }
 
 fn push_recent_exception(
@@ -3341,10 +3351,6 @@ fn push_recent_session_delta(
     recent_session_deltas.push_back(delta);
 }
 
-fn now_nanos() -> i64 {
-    Utc::now().timestamp_nanos_opt().unwrap_or(0)
-}
-
 fn monotonic_nanos() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -3359,11 +3365,16 @@ fn monotonic_nanos() -> u64 {
         .saturating_add(ts.tv_nsec as u64)
 }
 
-fn timestamp_from_nanos(nanos: i64) -> Option<chrono::DateTime<Utc>> {
-    if nanos <= 0 {
+fn monotonic_timestamp_to_datetime(
+    last_nanos: u64,
+    now_mono: u64,
+    now_wall: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    if last_nanos == 0 {
         return None;
     }
-    Some(chrono::DateTime::<Utc>::from_timestamp_nanos(nanos))
+    let age_ns = now_mono.saturating_sub(last_nanos).min(i64::MAX as u64) as i64;
+    now_wall.checked_sub_signed(chrono::TimeDelta::nanoseconds(age_ns))
 }
 
 fn pin_current_thread(worker_id: u32) {
@@ -5493,7 +5504,7 @@ struct BindingLiveState {
     tx_packets: AtomicU64,
     tx_bytes: AtomicU64,
     tx_errors: AtomicU64,
-    last_heartbeat: AtomicI64,
+    last_heartbeat: AtomicU64,
     last_error: Mutex<String>,
     pending_tx: Mutex<VecDeque<TxRequest>>,
     pending_session_deltas: Mutex<VecDeque<SessionDeltaInfo>>,
@@ -5543,7 +5554,7 @@ impl BindingLiveState {
             tx_packets: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             tx_errors: AtomicU64::new(0),
-            last_heartbeat: AtomicI64::new(0),
+            last_heartbeat: AtomicU64::new(0),
             last_error: Mutex::new(String::new()),
             pending_tx: Mutex::new(VecDeque::new()),
             pending_session_deltas: Mutex::new(VecDeque::new()),
@@ -5564,7 +5575,8 @@ impl BindingLiveState {
     }
 
     fn set_last_heartbeat(&self) {
-        self.last_heartbeat.store(now_nanos(), Ordering::Relaxed);
+        self.last_heartbeat
+            .store(monotonic_nanos(), Ordering::Relaxed);
     }
 
     fn clear_error(&self) {
@@ -5580,6 +5592,8 @@ impl BindingLiveState {
     }
 
     fn snapshot(&self) -> BindingLiveSnapshot {
+        let now_wall = Utc::now();
+        let now_mono = monotonic_nanos();
         let session_delta_pending = self
             .pending_session_deltas
             .lock()
@@ -5631,7 +5645,11 @@ impl BindingLiveState {
             tx_packets: self.tx_packets.load(Ordering::Relaxed),
             tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
             tx_errors: self.tx_errors.load(Ordering::Relaxed),
-            last_heartbeat: timestamp_from_nanos(self.last_heartbeat.load(Ordering::Relaxed)),
+            last_heartbeat: monotonic_timestamp_to_datetime(
+                self.last_heartbeat.load(Ordering::Relaxed),
+                now_mono,
+                now_wall,
+            ),
             last_error: self
                 .last_error
                 .lock()
