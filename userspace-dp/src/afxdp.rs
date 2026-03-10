@@ -34,8 +34,8 @@ const USERSPACE_META_VERSION: u16 = 3;
 const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 256;
-const MIN_RESERVED_TX_FRAMES: u32 = 64;
-const MAX_RESERVED_TX_FRAMES: u32 = 512;
+const MIN_RESERVED_TX_FRAMES: u32 = 256;
+const MAX_RESERVED_TX_FRAMES: u32 = 2048;
 const TX_BATCH_SIZE: usize = 256;
 const FILL_BATCH_SIZE: usize = 1024;
 const FILL_DRAIN_WATERMARK: usize = 64;
@@ -50,6 +50,7 @@ const RX_WAKE_MIN_INTERVAL_NS: u64 = 200_000;
 const STATS_POLL_INTERVAL_NS: u64 = 1_000_000_000;
 const NEIGHBOR_SYNC_INTERVAL_NS: u64 = 1_000_000_000;
 const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
+const TX_WAKE_MIN_INTERVAL_NS: u64 = 50_000;
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
 const MAX_RECENT_SESSION_DELTAS: usize = 64;
@@ -1000,9 +1001,13 @@ struct BindingWorker {
     pending_fill_frames: VecDeque<u64>,
     scratch_recycle: Vec<u64>,
     scratch_forwards: Vec<PendingForwardRequest>,
+    scratch_fill: Vec<u64>,
+    scratch_prepared_tx: Vec<PreparedTxRequest>,
+    scratch_local_tx: Vec<(u64, TxRequest)>,
     heartbeat_map_fd: c_int,
     last_heartbeat_update_ns: u64,
     last_rx_wake_ns: u64,
+    last_tx_wake_ns: u64,
     empty_rx_polls: u32,
 }
 
@@ -1163,7 +1168,7 @@ impl BindingWorker {
                 })?,
             };
         let reserved_tx = ring_entries
-            .saturating_div(4)
+            .saturating_div(2)
             .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
             .min(ring_entries.saturating_sub(1))
             .max(1);
@@ -1205,9 +1210,13 @@ impl BindingWorker {
             pending_fill_frames: VecDeque::new(),
             scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
             scratch_forwards: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            scratch_fill: Vec::with_capacity(FILL_BATCH_SIZE),
+            scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
+            scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
             heartbeat_map_fd,
             last_heartbeat_update_ns: monotonic_nanos(),
             last_rx_wake_ns: monotonic_nanos(),
+            last_tx_wake_ns: monotonic_nanos(),
             empty_rx_polls: 0,
         })
     }
@@ -2504,24 +2513,24 @@ fn drain_pending_fill(binding: &mut BindingWorker) -> bool {
         return false;
     }
     let batch_size = binding.pending_fill_frames.len().min(FILL_BATCH_SIZE);
-    let mut batch = Vec::with_capacity(batch_size);
-    while batch.len() < batch_size {
+    binding.scratch_fill.clear();
+    while binding.scratch_fill.len() < batch_size {
         let Some(offset) = binding.pending_fill_frames.pop_front() else {
             break;
         };
-        batch.push(offset);
+        binding.scratch_fill.push(offset);
     }
-    if batch.is_empty() {
+    if binding.scratch_fill.is_empty() {
         return false;
     }
     let inserted = {
-        let mut fill = binding.device.fill(batch.len() as u32);
-        let inserted = fill.insert(batch.iter().copied());
+        let mut fill = binding.device.fill(binding.scratch_fill.len() as u32);
+        let inserted = fill.insert(binding.scratch_fill.iter().copied());
         fill.commit();
         inserted
     };
     if inserted == 0 {
-        for offset in batch.into_iter().rev() {
+        for offset in binding.scratch_fill.drain(..).rev() {
             binding.pending_fill_frames.push_front(offset);
         }
         binding
@@ -2529,11 +2538,12 @@ fn drain_pending_fill(binding: &mut BindingWorker) -> bool {
             .set_error("fill ring insert returned 0".to_string());
         return !binding.pending_fill_frames.is_empty();
     }
-    if inserted < batch.len() as u32 {
-        for offset in batch.into_iter().skip(inserted as usize).rev() {
+    if inserted < binding.scratch_fill.len() as u32 {
+        for offset in binding.scratch_fill.drain(inserted as usize..).rev() {
             binding.pending_fill_frames.push_front(offset);
         }
     }
+    binding.scratch_fill.clear();
     maybe_wake_rx(binding, true, monotonic_nanos());
     true
 }
@@ -2646,11 +2656,12 @@ fn transmit_batch(
         .min(binding.free_tx_frames.len())
         .min(TX_BATCH_SIZE);
     if batch_size == 0 {
+        maybe_wake_tx(binding, true, monotonic_nanos());
         return Err(TxError::Retry("no free TX frame available".to_string()));
     }
 
-    let mut batch = Vec::with_capacity(batch_size);
-    while batch.len() < batch_size {
+    binding.scratch_local_tx.clear();
+    while binding.scratch_local_tx.len() < batch_size {
         let Some(req) = pending.pop_front() else {
             break;
         };
@@ -2666,15 +2677,16 @@ fn transmit_batch(
             )));
         };
         area.copy_from_slice(&req.bytes);
-        batch.push((offset, req));
+        binding.scratch_local_tx.push((offset, req));
     }
 
-    if batch.is_empty() {
+    if binding.scratch_local_tx.is_empty() {
+        maybe_wake_tx(binding, true, monotonic_nanos());
         return Err(TxError::Retry("no prepared TX frame available".to_string()));
     }
 
-    let mut writer = binding.tx.transmit(batch.len() as u32);
-    let inserted = writer.insert(batch.iter().map(|(offset, req)| XdpDesc {
+    let mut writer = binding.tx.transmit(binding.scratch_local_tx.len() as u32);
+    let inserted = writer.insert(binding.scratch_local_tx.iter().map(|(offset, req)| XdpDesc {
         addr: *offset,
         len: req.bytes.len() as u32,
         options: 0,
@@ -2683,7 +2695,8 @@ fn transmit_batch(
     drop(writer);
 
     if inserted == 0 {
-        while let Some((offset, req)) = batch.pop() {
+        maybe_wake_tx(binding, true, monotonic_nanos());
+        while let Some((offset, req)) = binding.scratch_local_tx.pop() {
             binding.free_tx_frames.push_front(offset);
             pending.push_front(req);
         }
@@ -2692,7 +2705,7 @@ fn transmit_batch(
 
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
-    for (idx, (offset, req)) in batch.into_iter().enumerate() {
+    for (idx, (offset, req)) in binding.scratch_local_tx.drain(..).enumerate() {
         if idx < inserted as usize {
             sent_packets += 1;
             sent_bytes += req.bytes.len() as u64;
@@ -2702,7 +2715,7 @@ fn transmit_batch(
         }
     }
 
-    maybe_wake_tx(binding);
+    maybe_wake_tx(binding, inserted < batch_size as u32, monotonic_nanos());
     Ok((sent_packets, sent_bytes))
 }
 
@@ -2711,19 +2724,19 @@ fn transmit_prepared_batch(binding: &mut BindingWorker) -> Result<(u64, u64), Tx
         return Ok((0, 0));
     }
     let batch_size = binding.pending_tx_prepared.len().min(TX_BATCH_SIZE);
-    let mut batch = Vec::with_capacity(batch_size);
-    while batch.len() < batch_size {
+    binding.scratch_prepared_tx.clear();
+    while binding.scratch_prepared_tx.len() < batch_size {
         let Some(req) = binding.pending_tx_prepared.pop_front() else {
             break;
         };
-        batch.push(req);
+        binding.scratch_prepared_tx.push(req);
     }
-    if batch.is_empty() {
+    if binding.scratch_prepared_tx.is_empty() {
         return Ok((0, 0));
     }
 
-    let mut writer = binding.tx.transmit(batch.len() as u32);
-    let inserted = writer.insert(batch.iter().map(|req| XdpDesc {
+    let mut writer = binding.tx.transmit(binding.scratch_prepared_tx.len() as u32);
+    let inserted = writer.insert(binding.scratch_prepared_tx.iter().map(|req| XdpDesc {
         addr: req.offset,
         len: req.len,
         options: 0,
@@ -2732,7 +2745,8 @@ fn transmit_prepared_batch(binding: &mut BindingWorker) -> Result<(u64, u64), Tx
     drop(writer);
 
     if inserted == 0 {
-        while let Some(req) = batch.pop() {
+        maybe_wake_tx(binding, true, monotonic_nanos());
+        while let Some(req) = binding.scratch_prepared_tx.pop() {
             binding.pending_tx_prepared.push_front(req);
         }
         return Err(TxError::Retry("prepared tx ring insert failed".to_string()));
@@ -2740,7 +2754,7 @@ fn transmit_prepared_batch(binding: &mut BindingWorker) -> Result<(u64, u64), Tx
 
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
-    for (idx, req) in batch.into_iter().enumerate() {
+    for (idx, req) in binding.scratch_prepared_tx.drain(..).enumerate() {
         if idx < inserted as usize {
             sent_packets += 1;
             sent_bytes += req.len as u64;
@@ -2749,14 +2763,19 @@ fn transmit_prepared_batch(binding: &mut BindingWorker) -> Result<(u64, u64), Tx
         }
     }
 
-    maybe_wake_tx(binding);
+    maybe_wake_tx(binding, inserted < batch_size as u32, monotonic_nanos());
     Ok((sent_packets, sent_bytes))
 }
 
-fn maybe_wake_tx(binding: &BindingWorker) {
+fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, now_ns: u64) {
     let bind_mode = XskBindMode::from_u8(binding.live.bind_mode.load(Ordering::Relaxed));
-    if !bind_mode.is_zerocopy() || binding.tx.needs_wakeup() {
+    if !bind_mode.is_zerocopy()
+        || binding.tx.needs_wakeup()
+        || force
+        || now_ns.saturating_sub(binding.last_tx_wake_ns) >= TX_WAKE_MIN_INTERVAL_NS
+    {
         binding.tx.wake();
+        binding.last_tx_wake_ns = now_ns;
     }
 }
 
