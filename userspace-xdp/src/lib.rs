@@ -190,6 +190,12 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         return fallback_to_main(ctx);
     }
 
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if !is_ip_packet(data, data_end) {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
     let binding_key = UserspaceBindingKey {
@@ -218,17 +224,15 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         return fallback_to_main(ctx);
     }
 
-    let data = ctx.data();
-    let data_end = ctx.data_end();
     let packet_len = data_end.saturating_sub(data);
     let Some(parsed) = parse_packet(data, data_end) else {
         return fallback_to_main(ctx);
     };
     if should_fallback_early(&parsed) {
-        return fallback_to_main(ctx);
+        return Ok(xdp_action::XDP_PASS);
     }
     if is_local_destination(&parsed) {
-        return fallback_to_main(ctx);
+        return Ok(xdp_action::XDP_PASS);
     }
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
@@ -308,6 +312,20 @@ struct ParsedPacket {
 }
 
 fn parse_packet(data: usize, data_end: usize) -> Option<ParsedPacket> {
+    let (eth_proto, vlan_id, l3_offset) = parse_l2(data, data_end)?;
+
+    match eth_proto {
+        ETH_P_IP => parse_ipv4(data, data_end, vlan_id, l3_offset),
+        ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, l3_offset),
+        _ => None,
+    }
+}
+
+fn is_ip_packet(data: usize, data_end: usize) -> bool {
+    matches!(parse_l2(data, data_end), Some((ETH_P_IP | ETH_P_IPV6, _, _)))
+}
+
+fn parse_l2(data: usize, data_end: usize) -> Option<(u16, u16, u16)> {
     let eth = read_ptr::<EthHdr>(data, data_end, 0)?;
     let mut eth_proto = u16::from_be(unsafe { (*eth).proto });
     let mut l3_offset = mem::size_of::<EthHdr>() as u16;
@@ -320,11 +338,7 @@ fn parse_packet(data: usize, data_end: usize) -> Option<ParsedPacket> {
         l3_offset += mem::size_of::<VlanHdr>() as u16;
     }
 
-    match eth_proto {
-        ETH_P_IP => parse_ipv4(data, data_end, vlan_id, l3_offset),
-        ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, l3_offset),
-        _ => None,
-    }
+    Some((eth_proto, vlan_id, l3_offset))
 }
 
 fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Option<ParsedPacket> {
