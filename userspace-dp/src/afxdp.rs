@@ -324,17 +324,30 @@ impl Coordinator {
         );
         self.map_fd = Some(map_fd);
         self.heartbeat_map_fd = Some(heartbeat_map_fd);
+        let worker_command_queues: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = workers
+            .keys()
+            .copied()
+            .map(|worker_id| (worker_id, Arc::new(Mutex::new(VecDeque::new()))))
+            .collect();
+        let all_worker_commands = worker_command_queues
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         for (worker_id, binding_plans) in workers {
             let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
             let heartbeat = Arc::new(AtomicI64::new(now_nanos()));
-            let commands = Arc::new(Mutex::new(VecDeque::new()));
+            let commands = worker_command_queues
+                .get(&worker_id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Mutex::new(VecDeque::new())));
             let recent_exceptions = self.recent_exceptions.clone();
             let last_resolution = self.last_resolution.clone();
             let slow_path = self.slow_path.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
             let commands_clone = commands.clone();
+            let all_commands_clone = all_worker_commands.clone();
             let validation = self.validation;
             let forwarding = forwarding.clone();
             let ha_state = self.ha_state.clone();
@@ -353,6 +366,7 @@ impl Coordinator {
                         recent_exceptions,
                         last_resolution,
                         commands_clone,
+                        all_commands_clone,
                         stop_clone,
                         heartbeat_clone,
                     );
@@ -916,20 +930,7 @@ struct SessionFlow {
 
 impl SessionFlow {
     fn reverse_key_with_nat(&self, nat: NatDecision) -> SessionKey {
-        let (src_port, dst_port) = if matches!(self.forward_key.protocol, PROTO_ICMP | PROTO_ICMPV6)
-        {
-            (self.forward_key.src_port, self.forward_key.dst_port)
-        } else {
-            (self.forward_key.dst_port, self.forward_key.src_port)
-        };
-        SessionKey {
-            addr_family: self.forward_key.addr_family,
-            protocol: self.forward_key.protocol,
-            src_ip: nat.rewrite_dst.unwrap_or(self.dst_ip),
-            dst_ip: nat.rewrite_src.unwrap_or(self.src_ip),
-            src_port,
-            dst_port,
-        }
+        reverse_session_key(&self.forward_key, nat)
     }
 }
 
@@ -1071,6 +1072,7 @@ fn poll_binding(
     slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
+    worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     poll_stats: bool,
 ) -> bool {
     let (left, rest) = bindings.split_at_mut(binding_index);
@@ -1086,7 +1088,12 @@ fn poll_binding(
             .session_expires
             .fetch_add(expired, Ordering::Relaxed);
     }
-    flush_session_deltas(&ident, &binding.live, sessions.drain_deltas(256));
+    flush_session_deltas(
+        &ident,
+        &binding.live,
+        sessions.drain_deltas(256),
+        worker_commands,
+    );
     reap_tx_completions(binding);
     drain_pending_tx(binding);
     if binding.device.needs_wakeup() {
@@ -1193,21 +1200,32 @@ fn poll_binding(
                                 )
                                 .unwrap_or_default();
                                 let mut created = 0u64;
+                                let forward_metadata = SessionMetadata {
+                                    ingress_zone: from_zone.clone(),
+                                    egress_zone: to_zone.clone(),
+                                    owner_rg_id,
+                                    is_reverse: false,
+                                    synced: false,
+                                };
                                 if sessions.install_with_protocol(
                                     flow.forward_key.clone(),
                                     decision,
-                                    SessionMetadata {
-                                        ingress_zone: from_zone.clone(),
-                                        egress_zone: to_zone.clone(),
-                                        owner_rg_id,
-                                        is_reverse: false,
-                                        synced: false,
-                                    },
+                                    forward_metadata.clone(),
                                     now,
                                     meta.protocol,
                                     meta.tcp_flags,
                                 ) {
                                     created += 1;
+                                    replicate_session_upsert(
+                                        worker_commands,
+                                        SyncedSessionEntry {
+                                            key: flow.forward_key.clone(),
+                                            decision,
+                                            metadata: forward_metadata,
+                                            protocol: meta.protocol,
+                                            tcp_flags: meta.tcp_flags,
+                                        },
+                                    );
                                 }
                                 let reverse_resolution = enforce_ha_resolution(
                                     forwarding,
@@ -1225,21 +1243,33 @@ fn poll_binding(
                                         resolution: reverse_resolution,
                                         nat: decision.nat.reverse(flow.src_ip, flow.dst_ip),
                                     };
+                                    let reverse_key = flow.reverse_key_with_nat(decision.nat);
+                                    let reverse_metadata = SessionMetadata {
+                                        ingress_zone: to_zone.clone(),
+                                        egress_zone: from_zone.clone(),
+                                        owner_rg_id,
+                                        is_reverse: true,
+                                        synced: false,
+                                    };
                                     if sessions.install_with_protocol(
-                                        flow.reverse_key_with_nat(decision.nat),
+                                        reverse_key.clone(),
                                         reverse_decision,
-                                        SessionMetadata {
-                                            ingress_zone: to_zone.clone(),
-                                            egress_zone: from_zone.clone(),
-                                            owner_rg_id,
-                                            is_reverse: true,
-                                            synced: false,
-                                        },
+                                        reverse_metadata.clone(),
                                         now,
                                         meta.protocol,
                                         meta.tcp_flags,
                                     ) {
                                         created += 1;
+                                        replicate_session_upsert(
+                                            worker_commands,
+                                            SyncedSessionEntry {
+                                                key: reverse_key,
+                                                decision: reverse_decision,
+                                                metadata: reverse_metadata,
+                                                protocol: meta.protocol,
+                                                tcp_flags: meta.tcp_flags,
+                                            },
+                                        );
                                     }
                                 }
                                 if created > 0 {
@@ -1319,7 +1349,12 @@ fn poll_binding(
         }
         recycle.push(desc.addr);
     }
-    flush_session_deltas(&ident, &binding.live, sessions.drain_deltas(256));
+    flush_session_deltas(
+        &ident,
+        &binding.live,
+        sessions.drain_deltas(256),
+        worker_commands,
+    );
     received.release();
     if !recycle.is_empty() {
         let mut fill = binding.device.fill(recycle.len() as u32);
@@ -1667,6 +1702,7 @@ fn flush_session_deltas(
     ident: &BindingIdentity,
     live: &BindingLiveState,
     deltas: Vec<SessionDelta>,
+    worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
 ) {
     for delta in deltas {
         live.push_session_delta(SessionDeltaInfo {
@@ -1706,6 +1742,13 @@ fn flush_session_deltas(
                 .map(|ip| ip.to_string())
                 .unwrap_or_default(),
         });
+        if delta.kind == SessionDeltaKind::Close {
+            replicate_session_delete(worker_commands, &delta.key);
+            replicate_session_delete(
+                worker_commands,
+                &reverse_session_key(&delta.key, delta.decision.nat),
+            );
+        }
     }
 }
 
@@ -1945,6 +1988,22 @@ fn record_forwarding_disposition(
     }
 }
 
+fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> SessionKey {
+    let (src_port, dst_port) = if matches!(key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        (key.src_port, key.dst_port)
+    } else {
+        (key.dst_port, key.src_port)
+    };
+    SessionKey {
+        addr_family: key.addr_family,
+        protocol: key.protocol,
+        src_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
+        dst_ip: nat.rewrite_src.unwrap_or(key.src_ip),
+        src_port,
+        dst_port,
+    }
+}
+
 fn apply_worker_commands(
     commands: &Arc<Mutex<VecDeque<WorkerCommand>>>,
     sessions: &mut SessionTable,
@@ -1971,6 +2030,28 @@ fn apply_worker_commands(
     }
 }
 
+fn replicate_session_upsert(
+    worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    entry: SyncedSessionEntry,
+) {
+    for commands in worker_commands {
+        if let Ok(mut pending) = commands.lock() {
+            pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
+        }
+    }
+}
+
+fn replicate_session_delete(
+    worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    key: &SessionKey,
+) {
+    for commands in worker_commands {
+        if let Ok(mut pending) = commands.lock() {
+            pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
+        }
+    }
+}
+
 fn worker_loop(
     worker_id: u32,
     binding_plans: Vec<BindingPlan>,
@@ -1982,6 +2063,7 @@ fn worker_loop(
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: Arc<Mutex<Option<PacketResolution>>>,
     commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
+    worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicI64>,
 ) {
@@ -2018,6 +2100,7 @@ fn worker_loop(
                 slow_path.as_ref(),
                 &recent_exceptions,
                 &last_resolution,
+                &worker_commands,
                 poll_stats,
             ) {
                 did_work = true;
