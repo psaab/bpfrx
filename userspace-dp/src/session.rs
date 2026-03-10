@@ -281,8 +281,11 @@ mod tests {
             disposition: crate::afxdp::ForwardingDisposition::ForwardCandidate,
             local_ifindex: 0,
             egress_ifindex: 12,
+            tx_ifindex: 12,
             next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
             neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+            src_mac: None,
+            tx_vlan_id: 0,
         }
     }
 

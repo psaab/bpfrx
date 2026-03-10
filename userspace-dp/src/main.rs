@@ -1244,8 +1244,11 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
                 disposition: afxdp::ForwardingDisposition::ForwardCandidate,
                 local_ifindex: 0,
                 egress_ifindex: 0,
+                tx_ifindex: 0,
                 next_hop: None,
                 neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
             },
             nat: crate::nat::NatDecision {
                 rewrite_src: nat_src,

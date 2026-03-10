@@ -748,11 +748,15 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
   ordered zone-pair policy snapshots, default-policy handling, address-book-expanded
   `any`/CIDR/IP source and destination matching, named application and application-set
   protocol/port matching, and per-session permit/deny gating before install
+- the Rust helper now has the first HA fabric slice for established traffic:
+  owner-RG-aware session state, HA watchdog enforcement, and plain fabric redirect
+  for existing/synced sessions when the local node is no longer the active owner
 
 What is still intentionally not implemented:
 
 - full policy parity: AppID/application-identification matching, global policies,
   schedulers, counters, and logging semantics
+- zone-encoded fabric redirect for brand-new flows to peer-owned RGs
 - shared-memory snapshot regions
 - io_uring-backed slow-path transport beyond bounded TUN reinjection
 

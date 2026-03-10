@@ -817,6 +817,7 @@ struct ForwardingState {
     ifindex_to_name: BTreeMap<i32, String>,
     ifindex_to_zone: BTreeMap<i32, String>,
     egress: BTreeMap<i32, EgressInterface>,
+    fabrics: Vec<FabricLink>,
     allow_dns_reply: bool,
     policy: PolicyState,
     source_nat_rules: Vec<SourceNatRule>,
@@ -875,10 +876,20 @@ struct EgressInterface {
     primary_v6: Option<Ipv6Addr>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FabricLink {
+    parent_ifindex: i32,
+    overlay_ifindex: i32,
+    peer_addr: IpAddr,
+    peer_mac: [u8; 6],
+    local_mac: [u8; 6],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ForwardingDisposition {
     LocalDelivery,
     ForwardCandidate,
+    FabricRedirect,
     HAInactive,
     PolicyDenied,
     NoRoute,
@@ -892,8 +903,11 @@ pub(crate) struct ForwardingResolution {
     pub(crate) disposition: ForwardingDisposition,
     pub(crate) local_ifindex: i32,
     pub(crate) egress_ifindex: i32,
+    pub(crate) tx_ifindex: i32,
     pub(crate) next_hop: Option<IpAddr>,
     pub(crate) neighbor_mac: Option<[u8; 6]>,
+    pub(crate) src_mac: Option<[u8; 6]>,
+    pub(crate) tx_vlan_id: u16,
 }
 
 impl ForwardingResolution {
@@ -902,6 +916,7 @@ impl ForwardingResolution {
             disposition: match self.disposition {
                 ForwardingDisposition::LocalDelivery => "local_delivery",
                 ForwardingDisposition::ForwardCandidate => "forward_candidate",
+                ForwardingDisposition::FabricRedirect => "fabric_redirect",
                 ForwardingDisposition::HAInactive => "ha_inactive",
                 ForwardingDisposition::PolicyDenied => "policy_denied",
                 ForwardingDisposition::NoRoute => "no_route",
@@ -1219,9 +1234,10 @@ fn poll_binding(
                             debug.from_zone = hit.metadata.ingress_zone.clone();
                             debug.to_zone = hit.metadata.egress_zone.clone();
                         }
-                        if hit.metadata.synced {
-                            let target = resolution_target_for_session(flow, decision);
-                            decision.resolution = enforce_ha_resolution(
+                        let target = resolution_target_for_session(flow, decision);
+                        decision.resolution = redirect_via_fabric_if_needed(
+                            forwarding,
+                            enforce_ha_resolution(
                                 forwarding,
                                 ha_state,
                                 lookup_forwarding_resolution_with_dynamic(
@@ -1229,8 +1245,9 @@ fn poll_binding(
                                     dynamic_neighbors,
                                     target,
                                 ),
-                            );
-                        }
+                            ),
+                            meta.ingress_ifindex as i32,
+                        );
                         decision
                     } else if let Some(shared) =
                         lookup_shared_session(shared_sessions, &flow.forward_key)
@@ -1250,9 +1267,10 @@ fn poll_binding(
                             debug.to_zone = replica.metadata.egress_zone.clone();
                         }
                         let mut decision = replica.decision;
-                        if replica.metadata.synced {
-                            let target = resolution_target_for_session(flow, decision);
-                            decision.resolution = enforce_ha_resolution(
+                        let target = resolution_target_for_session(flow, decision);
+                        decision.resolution = redirect_via_fabric_if_needed(
+                            forwarding,
+                            enforce_ha_resolution(
                                 forwarding,
                                 ha_state,
                                 lookup_forwarding_resolution_with_dynamic(
@@ -1260,8 +1278,9 @@ fn poll_binding(
                                     dynamic_neighbors,
                                     target,
                                 ),
-                            );
-                        }
+                            ),
+                            meta.ingress_ifindex as i32,
+                        );
                         decision
                     } else {
                         binding.live.session_misses.fetch_add(1, Ordering::Relaxed);
@@ -1429,7 +1448,10 @@ fn poll_binding(
                     recent_exceptions,
                     last_resolution,
                 );
-                if decision.resolution.disposition == ForwardingDisposition::ForwardCandidate {
+                if matches!(
+                    decision.resolution.disposition,
+                    ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
+                ) {
                     forward_live_packet(
                         left,
                         &ident,
@@ -1533,7 +1555,14 @@ fn forward_live_packet(
     if decision.nat.rewrite_dst.is_some() {
         ingress_live.dnat_packets.fetch_add(1, Ordering::Relaxed);
     }
-    let target_ifindex = resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex);
+    let target_ifindex = resolve_tx_binding_ifindex(
+        forwarding,
+        if decision.resolution.tx_ifindex > 0 {
+            decision.resolution.tx_ifindex
+        } else {
+            decision.resolution.egress_ifindex
+        },
+    );
     let Some(target_live) = find_target_live(
         left,
         ingress_ifindex,
@@ -1568,6 +1597,13 @@ fn forward_live_packet(
 }
 
 fn resolve_tx_binding_ifindex(forwarding: &ForwardingState, egress_ifindex: i32) -> i32 {
+    if let Some(fabric) = forwarding
+        .fabrics
+        .iter()
+        .find(|fabric| fabric.parent_ifindex == egress_ifindex)
+    {
+        return fabric.parent_ifindex;
+    }
     forwarding
         .egress
         .get(&egress_ifindex)
@@ -2094,7 +2130,7 @@ fn record_forwarding_disposition(
         ForwardingDisposition::LocalDelivery => {
             live.local_delivery_packets.fetch_add(1, Ordering::Relaxed);
         }
-        ForwardingDisposition::ForwardCandidate => {
+        ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect => {
             live.forward_candidate_packets
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -2621,6 +2657,33 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             .neighbors
             .insert((neigh.ifindex, ip), NeighborEntry { mac });
     }
+    for fabric in &snapshot.fabrics {
+        if fabric.parent_ifindex <= 0 {
+            continue;
+        }
+        let Ok(peer_addr) = fabric.peer_address.parse::<IpAddr>() else {
+            continue;
+        };
+        let local_mac = match mac_by_ifindex.get(&fabric.parent_ifindex).copied() {
+            Some(mac) => mac,
+            None => continue,
+        };
+        let peer_mac = state
+            .neighbors
+            .get(&(fabric.overlay_ifindex, peer_addr))
+            .or_else(|| state.neighbors.get(&(fabric.parent_ifindex, peer_addr)))
+            .map(|entry| entry.mac);
+        let Some(peer_mac) = peer_mac else {
+            continue;
+        };
+        state.fabrics.push(FabricLink {
+            parent_ifindex: fabric.parent_ifindex,
+            overlay_ifindex: fabric.overlay_ifindex,
+            peer_addr,
+            peer_mac,
+            local_mac,
+        });
+    }
     state.policy = parse_policy_state(&snapshot.default_policy, &snapshot.policies);
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.source_nat_rules = parse_source_nat_rules(&snapshot.source_nat_rules);
@@ -2866,8 +2929,11 @@ fn resolve_forwarding(
             disposition: ForwardingDisposition::NoRoute,
             local_ifindex: 0,
             egress_ifindex: 0,
+            tx_ifindex: 0,
             next_hop: None,
             neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
         };
     };
     lookup_forwarding_resolution_with_dynamic(state, dynamic_neighbors, dst)
@@ -2922,6 +2988,44 @@ fn owner_rg_for_flow(forwarding: &ForwardingState, egress_ifindex: i32) -> i32 {
         .get(&egress_ifindex)
         .map(|iface| iface.redundancy_group.max(0))
         .unwrap_or_default()
+}
+
+fn ingress_is_fabric(forwarding: &ForwardingState, ingress_ifindex: i32) -> bool {
+    forwarding.fabrics.iter().any(|fabric| {
+        fabric.parent_ifindex == ingress_ifindex || fabric.overlay_ifindex == ingress_ifindex
+    })
+}
+
+fn resolve_fabric_redirect(forwarding: &ForwardingState) -> Option<ForwardingResolution> {
+    let fabric = forwarding
+        .fabrics
+        .iter()
+        .find(|fabric| fabric.parent_ifindex > 0)
+        .copied()?;
+    Some(ForwardingResolution {
+        disposition: ForwardingDisposition::FabricRedirect,
+        local_ifindex: 0,
+        egress_ifindex: fabric.parent_ifindex,
+        tx_ifindex: fabric.parent_ifindex,
+        next_hop: Some(fabric.peer_addr),
+        neighbor_mac: Some(fabric.peer_mac),
+        src_mac: Some(fabric.local_mac),
+        tx_vlan_id: 0,
+    })
+}
+
+fn redirect_via_fabric_if_needed(
+    forwarding: &ForwardingState,
+    resolution: ForwardingResolution,
+    ingress_ifindex: i32,
+) -> ForwardingResolution {
+    if resolution.disposition != ForwardingDisposition::HAInactive {
+        return resolution;
+    }
+    if ingress_is_fabric(forwarding, ingress_ifindex) {
+        return resolution;
+    }
+    resolve_fabric_redirect(forwarding).unwrap_or(resolution)
 }
 
 fn resolve_ingress_logical_ifindex(
@@ -3016,8 +3120,11 @@ fn lookup_forwarding_resolution_inner(
                     disposition: ForwardingDisposition::LocalDelivery,
                     local_ifindex,
                     egress_ifindex: local_ifindex,
+                    tx_ifindex: local_ifindex,
                     next_hop: None,
                     neighbor_mac: None,
+                    src_mac: None,
+                    tx_vlan_id: 0,
                 };
             }
             lookup_forwarding_resolution_v4(state, dynamic_neighbors, ip, DEFAULT_V4_TABLE, 0)
@@ -3034,8 +3141,11 @@ fn lookup_forwarding_resolution_inner(
                     disposition: ForwardingDisposition::LocalDelivery,
                     local_ifindex,
                     egress_ifindex: local_ifindex,
+                    tx_ifindex: local_ifindex,
                     next_hop: None,
                     neighbor_mac: None,
+                    src_mac: None,
+                    tx_vlan_id: 0,
                 };
             }
             lookup_forwarding_resolution_v6(state, dynamic_neighbors, ip, DEFAULT_V6_TABLE, 0)
@@ -3055,8 +3165,11 @@ fn lookup_forwarding_resolution_v4(
             disposition: ForwardingDisposition::NextTableUnsupported,
             local_ifindex: 0,
             egress_ifindex: 0,
+            tx_ifindex: 0,
             next_hop: Some(IpAddr::V4(ip)),
             neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
         };
     }
     let static_match = state
@@ -3078,8 +3191,11 @@ fn lookup_forwarding_resolution_v4(
                 },
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
+                tx_ifindex: ifindex,
                 next_hop: Some(IpAddr::V4(ip)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
+                src_mac: None,
+                tx_vlan_id: 0,
             }
         }
         Some(ResolvedRouteV4::Static {
@@ -3093,8 +3209,11 @@ fn lookup_forwarding_resolution_v4(
                     disposition: ForwardingDisposition::DiscardRoute,
                     local_ifindex: 0,
                     egress_ifindex: ifindex,
+                    tx_ifindex: ifindex,
                     next_hop: next_hop.map(IpAddr::V4),
                     neighbor_mac: None,
+                    src_mac: None,
+                    tx_vlan_id: 0,
                 };
             }
             if let Some(next_table_name) = next_table {
@@ -3103,8 +3222,11 @@ fn lookup_forwarding_resolution_v4(
                         disposition: ForwardingDisposition::NextTableUnsupported,
                         local_ifindex: 0,
                         egress_ifindex: 0,
+                        tx_ifindex: 0,
                         next_hop: Some(IpAddr::V4(ip)),
                         neighbor_mac: None,
+                        src_mac: None,
+                        tx_vlan_id: 0,
                     };
                 }
                 return lookup_forwarding_resolution_v4(
@@ -3120,8 +3242,11 @@ fn lookup_forwarding_resolution_v4(
                     disposition: ForwardingDisposition::NoRoute,
                     local_ifindex: 0,
                     egress_ifindex: 0,
+                    tx_ifindex: 0,
                     next_hop: next_hop.map(IpAddr::V4),
                     neighbor_mac: None,
+                    src_mac: None,
+                    tx_vlan_id: 0,
                 };
             }
             let target = next_hop.unwrap_or(ip);
@@ -3135,16 +3260,22 @@ fn lookup_forwarding_resolution_v4(
                 },
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
+                tx_ifindex: ifindex,
                 next_hop: Some(IpAddr::V4(target)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
+                src_mac: None,
+                tx_vlan_id: 0,
             }
         }
         None => ForwardingResolution {
             disposition: ForwardingDisposition::NoRoute,
             local_ifindex: 0,
             egress_ifindex: 0,
+            tx_ifindex: 0,
             next_hop: None,
             neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
         },
     }
 }
@@ -3161,8 +3292,11 @@ fn lookup_forwarding_resolution_v6(
             disposition: ForwardingDisposition::NextTableUnsupported,
             local_ifindex: 0,
             egress_ifindex: 0,
+            tx_ifindex: 0,
             next_hop: Some(IpAddr::V6(ip)),
             neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
         };
     }
     let static_match = state
@@ -3184,8 +3318,11 @@ fn lookup_forwarding_resolution_v6(
                 },
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
+                tx_ifindex: ifindex,
                 next_hop: Some(IpAddr::V6(ip)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
+                src_mac: None,
+                tx_vlan_id: 0,
             }
         }
         Some(ResolvedRouteV6::Static {
@@ -3199,8 +3336,11 @@ fn lookup_forwarding_resolution_v6(
                     disposition: ForwardingDisposition::DiscardRoute,
                     local_ifindex: 0,
                     egress_ifindex: ifindex,
+                    tx_ifindex: ifindex,
                     next_hop: next_hop.map(IpAddr::V6),
                     neighbor_mac: None,
+                    src_mac: None,
+                    tx_vlan_id: 0,
                 };
             }
             if let Some(next_table_name) = next_table {
@@ -3209,8 +3349,11 @@ fn lookup_forwarding_resolution_v6(
                         disposition: ForwardingDisposition::NextTableUnsupported,
                         local_ifindex: 0,
                         egress_ifindex: 0,
+                        tx_ifindex: 0,
                         next_hop: Some(IpAddr::V6(ip)),
                         neighbor_mac: None,
+                        src_mac: None,
+                        tx_vlan_id: 0,
                     };
                 }
                 return lookup_forwarding_resolution_v6(
@@ -3226,8 +3369,11 @@ fn lookup_forwarding_resolution_v6(
                     disposition: ForwardingDisposition::NoRoute,
                     local_ifindex: 0,
                     egress_ifindex: 0,
+                    tx_ifindex: 0,
                     next_hop: next_hop.map(IpAddr::V6),
                     neighbor_mac: None,
+                    src_mac: None,
+                    tx_vlan_id: 0,
                 };
             }
             let target = next_hop.unwrap_or(ip);
@@ -3241,16 +3387,22 @@ fn lookup_forwarding_resolution_v6(
                 },
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
+                tx_ifindex: ifindex,
                 next_hop: Some(IpAddr::V6(target)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
+                src_mac: None,
+                tx_vlan_id: 0,
             }
         }
         None => ForwardingResolution {
             disposition: ForwardingDisposition::NoRoute,
             local_ifindex: 0,
             egress_ifindex: 0,
+            tx_ifindex: 0,
             next_hop: None,
             neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
         },
     }
 }
@@ -3455,27 +3607,31 @@ fn build_forwarded_frame(
     forwarding: &ForwardingState,
 ) -> Option<Vec<u8>> {
     let dst_mac = decision.resolution.neighbor_mac?;
-    let egress = forwarding.egress.get(&decision.resolution.egress_ifindex)?;
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     let l3 = meta.l3_offset as usize;
     if l3 >= frame.len() {
         return None;
     }
     let payload = &frame[l3..];
-    let eth_len = if egress.vlan_id > 0 { 18 } else { 14 };
+    let (src_mac, vlan_id, apply_nat) =
+        if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
+            (
+                decision.resolution.src_mac?,
+                decision.resolution.tx_vlan_id,
+                false,
+            )
+        } else {
+            let egress = forwarding.egress.get(&decision.resolution.egress_ifindex)?;
+            (egress.src_mac, egress.vlan_id, true)
+        };
+    let eth_len = if vlan_id > 0 { 18 } else { 14 };
     let ether_type = match meta.addr_family as i32 {
         libc::AF_INET => 0x0800,
         libc::AF_INET6 => 0x86dd,
         _ => return None,
     };
     let mut out = Vec::with_capacity(eth_len + payload.len());
-    write_eth_header(
-        &mut out,
-        dst_mac,
-        egress.src_mac,
-        egress.vlan_id,
-        ether_type,
-    );
+    write_eth_header(&mut out, dst_mac, src_mac, vlan_id, ether_type);
     out.extend_from_slice(payload);
     let ip_start = eth_len;
     match meta.addr_family as i32 {
@@ -3490,7 +3646,9 @@ fn build_forwarded_frame(
             if out[ip_start + 8] <= 1 {
                 return None;
             }
-            apply_nat_ipv4(&mut out[ip_start..], meta.protocol, decision.nat)?;
+            if apply_nat {
+                apply_nat_ipv4(&mut out[ip_start..], meta.protocol, decision.nat)?;
+            }
             out[ip_start + 8] -= 1;
             out[ip_start + 10] = 0;
             out[ip_start + 11] = 0;
@@ -3505,7 +3663,9 @@ fn build_forwarded_frame(
             if out[ip_start + 7] <= 1 {
                 return None;
             }
-            apply_nat_ipv6(&mut out[ip_start..], meta.protocol, decision.nat)?;
+            if apply_nat {
+                apply_nat_ipv6(&mut out[ip_start..], meta.protocol, decision.nat)?;
+            }
             out[ip_start + 7] -= 1;
         }
         _ => return None,
@@ -4325,8 +4485,8 @@ struct BindingLiveSnapshot {
 mod tests {
     use super::*;
     use crate::{
-        InterfaceAddressSnapshot, InterfaceSnapshot, NeighborSnapshot, PolicyRuleSnapshot,
-        RouteSnapshot, SourceNATRuleSnapshot,
+        FabricSnapshot, InterfaceAddressSnapshot, InterfaceSnapshot, NeighborSnapshot,
+        PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot,
     };
 
     fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
@@ -4628,6 +4788,38 @@ mod tests {
         }
     }
 
+    fn nat_snapshot_with_fabric() -> ConfigSnapshot {
+        let mut snapshot = nat_snapshot();
+        snapshot.interfaces.push(InterfaceSnapshot {
+            name: "ge-0/0/0".to_string(),
+            linux_name: "ge-0-0-0".to_string(),
+            ifindex: 21,
+            hardware_addr: "02:bf:72:ff:00:01".to_string(),
+            ..Default::default()
+        });
+        snapshot.fabrics = vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_interface: "ge-0/0/0".to_string(),
+            parent_linux_name: "ge-0-0-0".to_string(),
+            parent_ifindex: 21,
+            overlay_linux_name: "fab0".to_string(),
+            overlay_ifindex: 101,
+            rx_queues: 2,
+            peer_address: "10.99.13.2".to_string(),
+        }];
+        snapshot.neighbors.push(NeighborSnapshot {
+            interface: "fab0".to_string(),
+            ifindex: 101,
+            family: "inet".to_string(),
+            ip: "10.99.13.2".to_string(),
+            mac: "00:aa:bb:cc:dd:ee".to_string(),
+            state: "reachable".to_string(),
+            router: false,
+            link_local: false,
+        });
+        snapshot
+    }
+
     fn policy_deny_snapshot() -> ConfigSnapshot {
         ConfigSnapshot {
             interfaces: vec![
@@ -4805,6 +4997,62 @@ mod tests {
         assert_eq!(
             resolved.disposition,
             ForwardingDisposition::ForwardCandidate
+        );
+    }
+
+    #[test]
+    fn inactive_owner_rg_redirects_established_session_to_fabric() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let ha_state = Arc::new(Mutex::new(BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )])));
+        let blocked = enforce_ha_resolution(
+            &state,
+            &ha_state,
+            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        );
+        assert_eq!(blocked.disposition, ForwardingDisposition::HAInactive);
+        let redirected = redirect_via_fabric_if_needed(&state, blocked, 24);
+        assert_eq!(
+            redirected.disposition,
+            ForwardingDisposition::FabricRedirect
+        );
+        assert_eq!(redirected.egress_ifindex, 21);
+        assert_eq!(redirected.tx_ifindex, 21);
+        assert_eq!(
+            redirected.next_hop,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)))
+        );
+        assert_eq!(
+            redirected.neighbor_mac,
+            Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee])
+        );
+        assert_eq!(
+            redirected.src_mac,
+            Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01])
+        );
+    }
+
+    #[test]
+    fn fabric_ingress_does_not_redirect_back_to_fabric() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let blocked = ForwardingResolution {
+            disposition: ForwardingDisposition::HAInactive,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 12,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            src_mac: None,
+            tx_vlan_id: 80,
+        };
+        assert_eq!(
+            redirect_via_fabric_if_needed(&state, blocked, 21).disposition,
+            ForwardingDisposition::HAInactive
         );
     }
 
@@ -5122,6 +5370,12 @@ mod tests {
     }
 
     #[test]
+    fn tx_binding_resolution_uses_fabric_parent_ifindex() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        assert_eq!(resolve_tx_binding_ifindex(&state, 21), 21);
+    }
+
+    #[test]
     fn icmp_reverse_key_keeps_identifier_position() {
         let flow = SessionFlow {
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
@@ -5201,10 +5455,13 @@ mod tests {
                 disposition: ForwardingDisposition::ForwardCandidate,
                 local_ifindex: 0,
                 egress_ifindex: 5,
+                tx_ifindex: 5,
                 next_hop: Some(IpAddr::V6(
                     "2001:559:8585:ef00::100".parse().expect("next hop"),
                 )),
                 neighbor_mac: Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+                src_mac: None,
+                tx_vlan_id: 0,
             },
             nat: NatDecision {
                 rewrite_src: None,
@@ -5272,6 +5529,70 @@ mod tests {
         .expect("forwarded frame");
         assert_eq!(&out[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
         assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]);
+        assert_eq!(out[22], 63);
+    }
+
+    #[test]
+    fn build_forwarded_frame_uses_fabric_header_without_nat() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, 1, 0, 0, 10, 0, 61, 100, 172, 16,
+            80, 200, 8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01,
+        ]);
+        let sum = checksum16(&frame[14..34]);
+        frame[24] = (sum >> 8) as u8;
+        frame[25] = sum as u8;
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            addr_family: libc::AF_INET as u8,
+            ..UserspaceDpMeta::default()
+        };
+        let out = build_forwarded_frame(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::FabricRedirect,
+                    local_ifindex: 0,
+                    egress_ifindex: 21,
+                    tx_ifindex: 21,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
+                    neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                    src_mac: Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]),
+                    tx_vlan_id: 0,
+                },
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                    ..NatDecision::default()
+                },
+            },
+            &state,
+        )
+        .expect("fabric frame");
+        assert_eq!(&out[0..6], &[0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+        assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+        assert_eq!(&out[26..30], &[10, 0, 61, 100]);
         assert_eq!(out[22], 63);
     }
 }
