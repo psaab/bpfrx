@@ -355,6 +355,77 @@ func TestUserspaceSupportsSimpleZonePolicies(t *testing.T) {
 	}
 }
 
+func TestUserspaceSupportsAddressBookPolicyMatches(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.DefaultPolicy = config.PolicyDeny
+	cfg.Security.AddressBook = &config.AddressBook{
+		Addresses: map[string]*config.Address{
+			"lan-subnet": {Name: "lan-subnet", Value: "10.0.61.0/24"},
+			"wan-host":   {Name: "wan-host", Value: "172.16.80.200/32"},
+		},
+		AddressSets: map[string]*config.AddressSet{
+			"wan-targets": {
+				Name:      "wan-targets",
+				Addresses: []string{"wan-host"},
+			},
+		},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan", Interfaces: []string{"reth1"}},
+		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
+	}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "lan",
+		ToZone:   "wan",
+		Policies: []*config.Policy{{
+			Name: "allow-address-book",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"lan-subnet"},
+				DestinationAddresses: []string{"wan-targets"},
+				Applications:         []string{"any"},
+			},
+			Action: config.PolicyPermit,
+		}},
+	}}
+	if !userspaceSupportsSecurityPolicies(cfg) {
+		t.Fatal("userspaceSupportsSecurityPolicies = false, want true with resolvable address-book entries")
+	}
+	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if len(snap.Policies) != 1 {
+		t.Fatalf("len(Policies) = %d, want 1", len(snap.Policies))
+	}
+	if got := snap.Policies[0].SourceAddresses; len(got) != 1 || got[0] != "10.0.61.0/24" {
+		t.Fatalf("SourceAddresses = %+v, want expanded address-book prefix", got)
+	}
+	if got := snap.Policies[0].DestinationAddresses; len(got) != 1 || got[0] != "172.16.80.200/32" {
+		t.Fatalf("DestinationAddresses = %+v, want expanded address-set prefix", got)
+	}
+}
+
+func TestUserspaceRejectsUnknownAddressBookPolicyMatches(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan", Interfaces: []string{"reth1"}},
+		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
+	}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "lan",
+		ToZone:   "wan",
+		Policies: []*config.Policy{{
+			Name: "allow-missing-address-book",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"missing-src"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"any"},
+			},
+			Action: config.PolicyPermit,
+		}},
+	}}
+	if userspaceSupportsSecurityPolicies(cfg) {
+		t.Fatal("userspaceSupportsSecurityPolicies = true, want false with unresolved address-book entry")
+	}
+}
+
 func TestBuildSnapshotIncludesUnitInterfaces(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -230,8 +231,8 @@ func userspaceSupportsSecurityPolicies(cfg *config.Config) bool {
 			if pol.SchedulerName != "" || pol.Count {
 				return false
 			}
-			if !userspacePolicyAddressesSupported(pol.Match.SourceAddresses) ||
-				!userspacePolicyAddressesSupported(pol.Match.DestinationAddresses) ||
+			if !userspacePolicyAddressesSupported(cfg, pol.Match.SourceAddresses) ||
+				!userspacePolicyAddressesSupported(cfg, pol.Match.DestinationAddresses) ||
 				!userspacePolicyApplicationsSupported(pol.Match.Applications) {
 				return false
 			}
@@ -240,23 +241,121 @@ func userspaceSupportsSecurityPolicies(cfg *config.Config) bool {
 	return true
 }
 
-func userspacePolicyAddressesSupported(addrs []string) bool {
+func userspacePolicyAddressesSupported(cfg *config.Config, addrs []string) bool {
+	_, ok := expandUserspacePolicyAddresses(cfg, addrs)
+	return ok
+}
+
+func expandUserspacePolicyAddresses(cfg *config.Config, addrs []string) ([]string, bool) {
 	if len(addrs) == 0 {
-		return true
+		return nil, true
+	}
+	expanded := make([]string, 0, len(addrs))
+	seen := make(map[string]struct{}, len(addrs))
+	addUnique := func(value string) {
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		expanded = append(expanded, value)
 	}
 	for _, addr := range addrs {
-		if addr == "" || addr == "any" {
-			continue
+		switch {
+		case addr == "" || addr == "any":
+			addUnique("any")
+		case isUserspaceLiteralAddress(addr):
+			addUnique(normalizeUserspaceLiteralAddress(addr))
+		default:
+			values, ok := resolveUserspaceAddressBookEntry(cfg, addr)
+			if !ok || len(values) == 0 {
+				return nil, false
+			}
+			for _, value := range values {
+				if value == "" {
+					return nil, false
+				}
+				if !isUserspaceLiteralAddress(value) {
+					return nil, false
+				}
+				addUnique(normalizeUserspaceLiteralAddress(value))
+			}
 		}
-		if _, _, err := net.ParseCIDR(addr); err == nil {
-			continue
-		}
-		if ip := net.ParseIP(addr); ip != nil {
-			continue
-		}
-		return false
 	}
-	return true
+	sort.Strings(expanded)
+	return expanded, true
+}
+
+func isUserspaceLiteralAddress(value string) bool {
+	if value == "" || value == "any" {
+		return true
+	}
+	if _, _, err := net.ParseCIDR(value); err == nil {
+		return true
+	}
+	return net.ParseIP(value) != nil
+}
+
+func normalizeUserspaceLiteralAddress(value string) string {
+	if value == "" || value == "any" {
+		return value
+	}
+	if _, ipNet, err := net.ParseCIDR(value); err == nil && ipNet != nil {
+		return ipNet.String()
+	}
+	if ip := net.ParseIP(value); ip != nil {
+		return ip.String()
+	}
+	return value
+}
+
+func resolveUserspaceAddressBookEntry(cfg *config.Config, name string) ([]string, bool) {
+	if cfg == nil || cfg.Security.AddressBook == nil || name == "" {
+		return nil, false
+	}
+	addressBook := cfg.Security.AddressBook
+	seenSets := make(map[string]bool)
+	expanded := make([]string, 0, 4)
+	var resolve func(string) bool
+	resolve = func(ref string) bool {
+		if ref == "" {
+			return false
+		}
+		if addr := addressBook.Addresses[ref]; addr != nil {
+			if addr.Value == "" {
+				return false
+			}
+			expanded = append(expanded, addr.Value)
+			return true
+		}
+		set := addressBook.AddressSets[ref]
+		if set == nil {
+			return false
+		}
+		if seenSets[ref] {
+			return true
+		}
+		seenSets[ref] = true
+		resolvedAny := false
+		for _, member := range set.Addresses {
+			if !resolve(member) {
+				return false
+			}
+			resolvedAny = true
+		}
+		for _, member := range set.AddressSets {
+			if !resolve(member) {
+				return false
+			}
+			resolvedAny = true
+		}
+		return resolvedAny
+	}
+	if !resolve(name) {
+		return nil, false
+	}
+	sort.Strings(expanded)
+	expanded = slices.Compact(expanded)
+	return expanded, true
 }
 
 func userspacePolicyApplicationsSupported(apps []string) bool {
@@ -827,12 +926,20 @@ func buildPolicySnapshots(cfg *config.Config) []PolicyRuleSnapshot {
 			if pol == nil {
 				continue
 			}
+			sourceAddresses, ok := expandUserspacePolicyAddresses(cfg, pol.Match.SourceAddresses)
+			if !ok {
+				sourceAddresses = append([]string(nil), pol.Match.SourceAddresses...)
+			}
+			destinationAddresses, ok := expandUserspacePolicyAddresses(cfg, pol.Match.DestinationAddresses)
+			if !ok {
+				destinationAddresses = append([]string(nil), pol.Match.DestinationAddresses...)
+			}
 			out = append(out, PolicyRuleSnapshot{
 				Name:                 pol.Name,
 				FromZone:             zpp.FromZone,
 				ToZone:               zpp.ToZone,
-				SourceAddresses:      append([]string(nil), pol.Match.SourceAddresses...),
-				DestinationAddresses: append([]string(nil), pol.Match.DestinationAddresses...),
+				SourceAddresses:      sourceAddresses,
+				DestinationAddresses: destinationAddresses,
 				Applications:         append([]string(nil), pol.Match.Applications...),
 				Action:               policyActionString(pol.Action),
 			})

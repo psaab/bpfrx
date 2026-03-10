@@ -745,14 +745,14 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
   ordered source-NAT rule snapshots, ingress/egress zone matching, per-session NAT
   decisions, forward-path SNAT rewrite, and reverse-path reply DNAT rewrite
 - the Rust helper now has a first worker-local zone-policy slice:
-  ordered zone-pair policy snapshots, default-policy handling, `any`/literal-CIDR
-  source and destination matching, and per-session permit/deny gating before install
+  ordered zone-pair policy snapshots, default-policy handling, address-book-expanded
+  `any`/CIDR/IP source and destination matching, and per-session permit/deny gating
+  before install
 
 What is still intentionally not implemented:
 
-- live packet redirect enablement for production traffic
-- full policy parity: address-book resolution, application matching, global policies,
-  schedulers, counters, and logging semantics
+- full policy parity: application matching, global policies, schedulers, counters,
+  and logging semantics
 - shared-memory snapshot regions
 - io_uring-backed slow-path transport beyond bounded TUN reinjection
 
@@ -778,7 +778,7 @@ Replace the full XDP tail-call chain on selected interfaces with:
 - metadata stamp
 - XSK redirect
 
-Status: partially implemented.
+Status: implemented for supported configs; guarded fallback remains for unsupported configs.
 
 Current `xdp_userspace` behavior:
 - parse
@@ -789,8 +789,7 @@ Current `xdp_userspace` behavior:
 That means the userspace-specific XDP boundary is now Rust-owned, while the
 existing C pipeline remains the fallback and the non-userspace dataplane.
 
-The remaining missing part is actual production redirection enablement backed by a
-real userspace forwarding path.
+The remaining missing part is broader feature coverage and parity, not the handoff itself.
 
 ## Phase 3: Build a separate native userspace dataplane process
 
