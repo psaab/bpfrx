@@ -16,7 +16,8 @@ use core::ffi::{c_int, c_void};
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use rustc_hash::FxHashMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -58,6 +59,8 @@ const MAX_PENDING_SESSION_DELTAS: usize = 4096;
 const BIND_RETRY_ATTEMPTS: usize = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
+
+type FastMap<K, V> = FxHashMap<K, V>;
 const HA_WATCHDOG_STALE_AFTER_SECS: u64 = 2;
 const FABRIC_ZONE_MAC_MAGIC: u8 = 0xfe;
 const PROTO_TCP: u8 = 6;
@@ -102,8 +105,8 @@ pub struct Coordinator {
     slow_path: Option<Arc<SlowPathReinjector>>,
     last_slow_path_status: SlowPathStatus,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
-    dynamic_neighbors: Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
-    shared_sessions: Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
@@ -126,8 +129,8 @@ impl Coordinator {
             slow_path: None,
             last_slow_path_status: SlowPathStatus::default(),
             ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
-            dynamic_neighbors: Arc::new(Mutex::new(BTreeMap::new())),
-            shared_sessions: Arc::new(Mutex::new(HashMap::new())),
+            dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
+            shared_sessions: Arc::new(Mutex::new(FastMap::default())),
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
@@ -833,18 +836,18 @@ enum PacketDisposition {
 struct ForwardingState {
     local_v4: Vec<Ipv4Addr>,
     local_v6: Vec<Ipv6Addr>,
-    interface_nat_v4: BTreeMap<Ipv4Addr, i32>,
-    interface_nat_v6: BTreeMap<Ipv6Addr, i32>,
+    interface_nat_v4: FastMap<Ipv4Addr, i32>,
+    interface_nat_v6: FastMap<Ipv6Addr, i32>,
     connected_v4: Vec<ConnectedRouteV4>,
     connected_v6: Vec<ConnectedRouteV6>,
-    routes_v4: BTreeMap<String, Vec<RouteEntryV4>>,
-    routes_v6: BTreeMap<String, Vec<RouteEntryV6>>,
-    neighbors: BTreeMap<(i32, IpAddr), NeighborEntry>,
-    ifindex_to_name: BTreeMap<i32, String>,
-    ifindex_to_zone: BTreeMap<i32, String>,
-    zone_name_to_id: BTreeMap<String, u16>,
-    zone_id_to_name: BTreeMap<u16, String>,
-    egress: BTreeMap<i32, EgressInterface>,
+    routes_v4: FastMap<String, Vec<RouteEntryV4>>,
+    routes_v6: FastMap<String, Vec<RouteEntryV6>>,
+    neighbors: FastMap<(i32, IpAddr), NeighborEntry>,
+    ifindex_to_name: FastMap<i32, String>,
+    ifindex_to_zone: FastMap<i32, String>,
+    zone_name_to_id: FastMap<String, u16>,
+    zone_id_to_name: FastMap<u16, String>,
+    egress: FastMap<i32, EgressInterface>,
     fabrics: Vec<FabricLink>,
     allow_dns_reply: bool,
     policy: PolicyState,
@@ -1009,6 +1012,7 @@ struct BindingWorker {
     last_rx_wake_ns: u64,
     last_tx_wake_ns: u64,
     empty_rx_polls: u32,
+    last_learned_neighbor: Option<LearnedNeighborKey>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1112,6 +1116,14 @@ struct PendingForwardRequest {
 struct PreparedTxRequest {
     offset: u64,
     len: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LearnedNeighborKey {
+    ingress_ifindex: i32,
+    ingress_vlan_id: u16,
+    src_ip: IpAddr,
+    src_mac: [u8; 6],
 }
 
 #[derive(Clone, Debug)]
@@ -1218,6 +1230,7 @@ impl BindingWorker {
             last_rx_wake_ns: monotonic_nanos(),
             last_tx_wake_ns: monotonic_nanos(),
             empty_rx_polls: 0,
+            last_learned_neighbor: None,
         })
     }
 
@@ -1291,8 +1304,8 @@ fn poll_binding(
     now_ns: u64,
     forwarding: &ForwardingState,
     ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
-    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
-    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
@@ -1369,6 +1382,7 @@ fn poll_binding(
                             desc,
                             meta,
                             flow.src_ip,
+                            &mut binding.last_learned_neighbor,
                             forwarding,
                             dynamic_neighbors,
                         );
@@ -2334,8 +2348,9 @@ fn learn_dynamic_neighbor_from_packet(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     src_ip: IpAddr,
+    last_learned_neighbor: &mut Option<LearnedNeighborKey>,
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
 ) {
     let Some(frame) = area.slice(desc.addr as usize, desc.len as usize) else {
         return;
@@ -2356,6 +2371,15 @@ fn learn_dynamic_neighbor_from_packet(
     if src_mac == [0; 6] || (src_mac[0] & 1) != 0 {
         return;
     }
+    let learned = LearnedNeighborKey {
+        ingress_ifindex: meta.ingress_ifindex as i32,
+        ingress_vlan_id: meta.ingress_vlan_id,
+        src_ip,
+        src_mac,
+    };
+    if last_learned_neighbor.as_ref() == Some(&learned) {
+        return;
+    }
     learn_dynamic_neighbor(
         forwarding,
         dynamic_neighbors,
@@ -2364,11 +2388,12 @@ fn learn_dynamic_neighbor_from_packet(
         src_ip,
         src_mac,
     );
+    *last_learned_neighbor = Some(learned);
 }
 
 fn learn_dynamic_neighbor(
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     ingress_ifindex: i32,
     ingress_vlan_id: u16,
     src_ip: IpAddr,
@@ -2428,7 +2453,7 @@ fn flush_session_deltas(
     ident: &BindingIdentity,
     live: &BindingLiveState,
     deltas: Vec<SessionDelta>,
-    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
 ) {
@@ -3059,7 +3084,7 @@ fn populate_egress_resolution(
 
 fn lookup_forwarding_resolution_for_session(
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     flow: &SessionFlow,
     decision: SessionDecision,
 ) -> ForwardingResolution {
@@ -3129,7 +3154,7 @@ fn synced_replica_entry(entry: &SyncedSessionEntry) -> SyncedSessionEntry {
 }
 
 fn lookup_shared_session(
-    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     key: &SessionKey,
 ) -> Option<SyncedSessionEntry> {
     shared_sessions
@@ -3139,7 +3164,7 @@ fn lookup_shared_session(
 }
 
 fn lookup_shared_forward_nat_match(
-    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     reply_key: &SessionKey,
 ) -> Option<SyncedSessionEntry> {
     shared_sessions.lock().ok().and_then(|sessions| {
@@ -3155,11 +3180,11 @@ fn lookup_shared_forward_nat_match(
 
 fn repair_reverse_session_from_forward(
     sessions: &mut SessionTable,
-    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
     ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
-    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     flow: &SessionFlow,
     now: Instant,
     protocol: u8,
@@ -3224,7 +3249,7 @@ fn repair_reverse_session_from_forward(
 }
 
 fn publish_shared_session(
-    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     entry: &SyncedSessionEntry,
 ) {
     if let Ok(mut sessions) = shared_sessions.lock() {
@@ -3233,7 +3258,7 @@ fn publish_shared_session(
 }
 
 fn remove_shared_session(
-    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     key: &SessionKey,
 ) {
     if let Ok(mut sessions) = shared_sessions.lock() {
@@ -3247,8 +3272,8 @@ fn worker_loop(
     validation: ValidationState,
     forwarding: Arc<ForwardingState>,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
-    dynamic_neighbors: Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
-    shared_sessions: Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<Arc<SlowPathReinjector>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
@@ -3955,7 +3980,7 @@ fn resolve_forwarding(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     state: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
 ) -> ForwardingResolution {
     let Some(dst) = parse_packet_destination(area, desc, meta) else {
         return ForwardingResolution {
@@ -4145,7 +4170,7 @@ fn lookup_forwarding_resolution(state: &ForwardingState, dst: IpAddr) -> Forward
 
 fn lookup_forwarding_resolution_with_dynamic(
     state: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     dst: IpAddr,
 ) -> ForwardingResolution {
     lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst)
@@ -4153,7 +4178,7 @@ fn lookup_forwarding_resolution_with_dynamic(
 
 fn lookup_forwarding_resolution_inner(
     state: &ForwardingState,
-    dynamic_neighbors: Option<&Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>>,
+    dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
     dst: IpAddr,
 ) -> ForwardingResolution {
     match dst {
@@ -4240,7 +4265,7 @@ fn interface_nat_local_resolution(
 
 fn lookup_forwarding_resolution_v4(
     state: &ForwardingState,
-    dynamic_neighbors: Option<&Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>>,
+    dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
     ip: Ipv4Addr,
     table: &str,
     depth: usize,
@@ -4371,7 +4396,7 @@ fn lookup_forwarding_resolution_v4(
 
 fn lookup_forwarding_resolution_v6(
     state: &ForwardingState,
-    dynamic_neighbors: Option<&Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>>,
+    dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
     ip: Ipv6Addr,
     table: &str,
     depth: usize,
@@ -4502,7 +4527,7 @@ fn lookup_forwarding_resolution_v6(
 
 fn lookup_neighbor_entry(
     state: &ForwardingState,
-    dynamic_neighbors: Option<&Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>>,
+    dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
     ifindex: i32,
     target: IpAddr,
 ) -> Option<NeighborEntry> {
@@ -4527,7 +4552,7 @@ fn lookup_neighbor_entry(
 
 fn sync_dynamic_neighbors(
     state: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
 ) {
     let mut updates = Vec::new();
     for (ifindex, iface) in &state.egress {
@@ -6544,7 +6569,8 @@ mod tests {
         area.slice_mut(0, frame.len())
             .expect("slice")
             .copy_from_slice(&frame);
-        let neighbors = Arc::new(Mutex::new(BTreeMap::new()));
+        let neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let mut last_learned = None;
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
             version: USERSPACE_META_VERSION,
@@ -6561,6 +6587,7 @@ mod tests {
             },
             meta,
             IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            &mut last_learned,
             &state,
             &neighbors,
         );
@@ -6858,7 +6885,7 @@ mod tests {
     #[test]
     fn dynamic_neighbor_cache_enables_forward_candidate() {
         let state = build_forwarding_state(&forwarding_snapshot(false));
-        let dynamic_neighbors = Arc::new(Mutex::new(BTreeMap::from([(
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::from_iter([(
             (12, IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
             NeighborEntry {
                 mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
@@ -6897,7 +6924,7 @@ mod tests {
     #[test]
     fn learned_ingress_neighbor_enables_reverse_lan_resolution() {
         let state = build_forwarding_state(&nat_snapshot());
-        let dynamic_neighbors = Arc::new(Mutex::new(BTreeMap::new()));
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         learn_dynamic_neighbor(
             &state,
             &dynamic_neighbors,
@@ -6925,7 +6952,7 @@ mod tests {
     #[test]
     fn learned_vlan_ingress_neighbor_maps_to_logical_ifindex() {
         let state = build_forwarding_state(&nat_snapshot());
-        let dynamic_neighbors = Arc::new(Mutex::new(BTreeMap::new()));
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         learn_dynamic_neighbor(
             &state,
             &dynamic_neighbors,
@@ -7102,7 +7129,7 @@ mod tests {
         };
         let resolved = lookup_forwarding_resolution_for_session(
             &state,
-            &Arc::new(Mutex::new(BTreeMap::new())),
+            &Arc::new(Mutex::new(FastMap::default())),
             &flow,
             decision,
         );

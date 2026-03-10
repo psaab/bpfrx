@@ -1,6 +1,7 @@
 use crate::afxdp::ForwardingResolution;
 use crate::nat::NatDecision;
-use std::collections::{HashMap, VecDeque};
+use rustc_hash::FxHashMap;
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -82,7 +83,7 @@ pub(crate) struct SessionDelta {
 }
 
 pub(crate) struct SessionTable {
-    sessions: HashMap<SessionKey, SessionEntry>,
+    sessions: FxHashMap<SessionKey, SessionEntry>,
     deltas: VecDeque<SessionDelta>,
     last_gc: Instant,
     max_sessions: usize,
@@ -95,7 +96,7 @@ pub(crate) struct SessionTable {
 impl SessionTable {
     pub fn new() -> Self {
         Self {
-            sessions: HashMap::new(),
+            sessions: FxHashMap::default(),
             deltas: VecDeque::with_capacity(MAX_SESSION_DELTAS.min(256)),
             last_gc: Instant::now(),
             max_sessions: DEFAULT_MAX_SESSIONS,
