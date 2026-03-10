@@ -3045,7 +3045,11 @@ fn populate_egress_resolution(
         return;
     }
     if let Some(egress) = state.egress.get(&egress_ifindex) {
-        resolution.tx_ifindex = egress.bind_ifindex.max(egress_ifindex);
+        resolution.tx_ifindex = if egress.bind_ifindex > 0 {
+            egress.bind_ifindex
+        } else {
+            egress_ifindex
+        };
         resolution.src_mac = Some(egress.src_mac);
         resolution.tx_vlan_id = egress.vlan_id;
     } else if resolution.tx_ifindex <= 0 {
