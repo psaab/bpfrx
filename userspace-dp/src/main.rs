@@ -1,6 +1,7 @@
 mod afxdp;
 mod nat;
 mod policy;
+mod prefix;
 mod session;
 mod slowpath;
 mod state_writer;

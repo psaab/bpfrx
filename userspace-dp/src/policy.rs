@@ -1,5 +1,6 @@
+use crate::prefix::{PrefixV4, PrefixV6};
 use crate::{PolicyApplicationSnapshot, PolicyRuleSnapshot};
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 const PROTO_TCP: u8 = 6;
@@ -27,10 +28,10 @@ impl Default for PolicyAction {
 pub(crate) struct PolicyRule {
     pub(crate) from_zone: String,
     pub(crate) to_zone: String,
-    pub(crate) source_v4: Vec<Ipv4Net>,
-    pub(crate) source_v6: Vec<Ipv6Net>,
-    pub(crate) destination_v4: Vec<Ipv4Net>,
-    pub(crate) destination_v6: Vec<Ipv6Net>,
+    pub(crate) source_v4: Vec<PrefixV4>,
+    pub(crate) source_v6: Vec<PrefixV6>,
+    pub(crate) destination_v4: Vec<PrefixV4>,
+    pub(crate) destination_v6: Vec<PrefixV6>,
     pub(crate) applications: Vec<ApplicationMatch>,
     pub(crate) action: PolicyAction,
 }
@@ -137,18 +138,22 @@ fn parse_action(action: &str) -> PolicyAction {
     }
 }
 
-fn parse_address(prefix: &str, out_v4: &mut Vec<Ipv4Net>, out_v6: &mut Vec<Ipv6Net>) {
+fn parse_address(prefix: &str, out_v4: &mut Vec<PrefixV4>, out_v6: &mut Vec<PrefixV6>) {
     if prefix.is_empty() || prefix == "any" {
         return;
     }
     match prefix.parse::<IpNet>() {
-        Ok(IpNet::V4(net)) => out_v4.push(net),
-        Ok(IpNet::V6(net)) => out_v6.push(net),
+        Ok(IpNet::V4(net)) => out_v4.push(PrefixV4::from_net(net)),
+        Ok(IpNet::V6(net)) => out_v6.push(PrefixV6::from_net(net)),
         Err(_) => {
             if let Ok(ip) = prefix.parse::<Ipv4Addr>() {
-                out_v4.push(Ipv4Net::new(ip, 32).expect("v4 /32"));
+                out_v4.push(PrefixV4::from_net(
+                    ipnet::Ipv4Net::new(ip, 32).expect("v4 /32"),
+                ));
             } else if let Ok(ip) = prefix.parse::<Ipv6Addr>() {
-                out_v6.push(Ipv6Net::new(ip, 128).expect("v6 /128"));
+                out_v6.push(PrefixV6::from_net(
+                    ipnet::Ipv6Net::new(ip, 128).expect("v6 /128"),
+                ));
             }
         }
     }
@@ -256,12 +261,12 @@ fn port_ranges_match(ranges: &[PortRange], port: u16) -> bool {
             .any(|range| port >= range.low && port <= range.high)
 }
 
-fn nets_match_v4(nets: &[Ipv4Net], ip: Ipv4Addr) -> bool {
-    nets.is_empty() || nets.iter().any(|net| net.contains(&ip))
+fn nets_match_v4(nets: &[PrefixV4], ip: Ipv4Addr) -> bool {
+    nets.is_empty() || nets.iter().any(|net| net.contains(ip))
 }
 
-fn nets_match_v6(nets: &[Ipv6Net], ip: Ipv6Addr) -> bool {
-    nets.is_empty() || nets.iter().any(|net| net.contains(&ip))
+fn nets_match_v6(nets: &[PrefixV6], ip: Ipv6Addr) -> bool {
+    nets.is_empty() || nets.iter().any(|net| net.contains(ip))
 }
 
 #[cfg(test)]

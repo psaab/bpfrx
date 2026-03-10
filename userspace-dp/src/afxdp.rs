@@ -4,6 +4,7 @@ use super::{
 };
 use crate::nat::{NatDecision, SourceNatRule, match_source_nat, parse_source_nat_rules};
 use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
+use crate::prefix::{PrefixV4, PrefixV6};
 use crate::session::{
     ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
     SessionLookup, SessionMetadata, SessionTable, reply_matches_forward_nat,
@@ -857,19 +858,19 @@ struct HAGroupRuntime {
 
 #[derive(Clone, Copy, Debug)]
 struct ConnectedRouteV4 {
-    prefix: Ipv4Net,
+    prefix: PrefixV4,
     ifindex: i32,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ConnectedRouteV6 {
-    prefix: Ipv6Net,
+    prefix: PrefixV6,
     ifindex: i32,
 }
 
 #[derive(Clone, Debug)]
 struct RouteEntryV4 {
-    prefix: Ipv4Net,
+    prefix: PrefixV4,
     ifindex: i32,
     next_hop: Option<Ipv4Addr>,
     discard: bool,
@@ -878,7 +879,7 @@ struct RouteEntryV4 {
 
 #[derive(Clone, Debug)]
 struct RouteEntryV6 {
-    prefix: Ipv6Net,
+    prefix: PrefixV6,
     ifindex: i32,
     next_hop: Option<Ipv6Addr>,
     discard: bool,
@@ -3502,7 +3503,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                         state.local_v4.push(v4.addr());
                     }
                     state.connected_v4.push(ConnectedRouteV4 {
-                        prefix: v4,
+                        prefix: PrefixV4::from_net(v4),
                         ifindex: iface.ifindex,
                     });
                 }
@@ -3513,7 +3514,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                         state.local_v6.push(v6.addr());
                     }
                     state.connected_v6.push(ConnectedRouteV6 {
-                        prefix: v6,
+                        prefix: PrefixV6::from_net(v6),
                         ifindex: iface.ifindex,
                     });
                 }
@@ -3567,7 +3568,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                 .entry(table)
                 .or_default()
                 .push(RouteEntryV4 {
-                    prefix,
+                    prefix: PrefixV4::from_net(prefix),
                     ifindex,
                     next_hop,
                     discard: route.discard,
@@ -3584,7 +3585,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                 .entry(table)
                 .or_default()
                 .push(RouteEntryV6 {
-                    prefix,
+                    prefix: PrefixV6::from_net(prefix),
                     ifindex,
                     next_hop,
                     discard: route.discard,
@@ -3832,7 +3833,7 @@ fn infer_connected_ifindex_v4(state: &ForwardingState, ip: Ipv4Addr) -> Option<i
     state
         .connected_v4
         .iter()
-        .find(|entry| entry.prefix.contains(&ip))
+        .find(|entry| entry.prefix.contains(ip))
         .map(|entry| entry.ifindex)
 }
 
@@ -3840,7 +3841,7 @@ fn infer_connected_ifindex_v6(state: &ForwardingState, ip: Ipv6Addr) -> Option<i
     state
         .connected_v6
         .iter()
-        .find(|entry| entry.prefix.contains(&ip))
+        .find(|entry| entry.prefix.contains(ip))
         .map(|entry| entry.ifindex)
 }
 
@@ -4216,11 +4217,11 @@ fn lookup_forwarding_resolution_v4(
     let static_match = state
         .routes_v4
         .get(table)
-        .and_then(|routes| routes.iter().find(|entry| entry.prefix.contains(&ip)));
+        .and_then(|routes| routes.iter().find(|entry| entry.prefix.contains(ip)));
     let connected_match = state
         .connected_v4
         .iter()
-        .find(|entry| entry.prefix.contains(&ip));
+        .find(|entry| entry.prefix.contains(ip));
     match choose_v4_route(static_match, connected_match) {
         Some(ResolvedRouteV4::Connected { ifindex }) => {
             let neighbor = lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V4(ip));
@@ -4343,11 +4344,11 @@ fn lookup_forwarding_resolution_v6(
     let static_match = state
         .routes_v6
         .get(table)
-        .and_then(|routes| routes.iter().find(|entry| entry.prefix.contains(&ip)));
+        .and_then(|routes| routes.iter().find(|entry| entry.prefix.contains(ip)));
     let connected_match = state
         .connected_v6
         .iter()
-        .find(|entry| entry.prefix.contains(&ip));
+        .find(|entry| entry.prefix.contains(ip));
     match choose_v6_route(static_match, connected_match) {
         Some(ResolvedRouteV6::Connected { ifindex }) => {
             let neighbor = lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V6(ip));

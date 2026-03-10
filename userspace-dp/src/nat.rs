@@ -1,5 +1,6 @@
+use crate::prefix::{PrefixV4, PrefixV6};
 use crate::SourceNATRuleSnapshot;
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -21,10 +22,10 @@ impl NatDecision {
 pub(crate) struct SourceNatRule {
     pub(crate) from_zone: String,
     pub(crate) to_zone: String,
-    pub(crate) source_v4: Vec<Ipv4Net>,
-    pub(crate) source_v6: Vec<Ipv6Net>,
-    pub(crate) destination_v4: Vec<Ipv4Net>,
-    pub(crate) destination_v6: Vec<Ipv6Net>,
+    pub(crate) source_v4: Vec<PrefixV4>,
+    pub(crate) source_v6: Vec<PrefixV6>,
+    pub(crate) destination_v4: Vec<PrefixV4>,
+    pub(crate) destination_v6: Vec<PrefixV6>,
     pub(crate) interface_mode: bool,
     pub(crate) off: bool,
 }
@@ -61,15 +62,15 @@ pub(crate) fn parse_source_nat_rules(snaps: &[SourceNATRuleSnapshot]) -> Vec<Sou
         };
         for prefix in &snap.source_addresses {
             match prefix.parse::<IpNet>() {
-                Ok(IpNet::V4(net)) => rule.source_v4.push(net),
-                Ok(IpNet::V6(net)) => rule.source_v6.push(net),
+                Ok(IpNet::V4(net)) => rule.source_v4.push(PrefixV4::from_net(net)),
+                Ok(IpNet::V6(net)) => rule.source_v6.push(PrefixV6::from_net(net)),
                 Err(_) => {}
             }
         }
         for prefix in &snap.destination_addresses {
             match prefix.parse::<IpNet>() {
-                Ok(IpNet::V4(net)) => rule.destination_v4.push(net),
-                Ok(IpNet::V6(net)) => rule.destination_v6.push(net),
+                Ok(IpNet::V4(net)) => rule.destination_v4.push(PrefixV4::from_net(net)),
+                Ok(IpNet::V6(net)) => rule.destination_v6.push(PrefixV6::from_net(net)),
                 Err(_) => {}
             }
         }
@@ -109,12 +110,12 @@ pub(crate) fn match_source_nat(
     None
 }
 
-fn nets_match_v4(nets: &[Ipv4Net], ip: Ipv4Addr) -> bool {
-    nets.is_empty() || nets.iter().any(|net| net.contains(&ip))
+fn nets_match_v4(nets: &[PrefixV4], ip: Ipv4Addr) -> bool {
+    nets.is_empty() || nets.iter().any(|net| net.contains(ip))
 }
 
-fn nets_match_v6(nets: &[Ipv6Net], ip: Ipv6Addr) -> bool {
-    nets.is_empty() || nets.iter().any(|net| net.contains(&ip))
+fn nets_match_v6(nets: &[PrefixV6], ip: Ipv6Addr) -> bool {
+    nets.is_empty() || nets.iter().any(|net| net.contains(ip))
 }
 
 #[cfg(test)]
