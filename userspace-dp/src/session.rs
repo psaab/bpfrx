@@ -107,9 +107,7 @@ impl SessionTable {
     }
 
     pub fn expire_stale(&mut self, now_ns: u64) -> u64 {
-        if self.last_gc_ns != 0
-            && now_ns.saturating_sub(self.last_gc_ns) < SESSION_GC_INTERVAL_NS
-        {
+        if self.last_gc_ns != 0 && now_ns.saturating_sub(self.last_gc_ns) < SESSION_GC_INTERVAL_NS {
             return 0;
         }
         self.last_gc_ns = now_ns;
@@ -469,11 +467,7 @@ mod tests {
                 metadata: metadata(),
             })
         );
-        assert!(
-            table
-                .lookup(&key, now + 2_000_000, 0x10)
-                .is_some()
-        );
+        assert!(table.lookup(&key, now + 2_000_000, 0x10).is_some());
         table.last_gc_ns = now + TCP_CLOSING_TIMEOUT_NS;
         let expired = table.expire_stale(now + TCP_CLOSING_TIMEOUT_NS + 1_000_000_000);
         assert_eq!(expired, 1);

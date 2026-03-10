@@ -1,5 +1,5 @@
-use crate::prefix::{PrefixV4, PrefixV6};
 use crate::SourceNATRuleSnapshot;
+use crate::prefix::{PrefixV4, PrefixV6};
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
