@@ -33,7 +33,7 @@ const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 128;
 const MIN_RESERVED_TX_FRAMES: u32 = 64;
-const MAX_RESERVED_TX_FRAMES: u32 = 256;
+const MAX_RESERVED_TX_FRAMES: u32 = 512;
 const TX_BATCH_SIZE: usize = 128;
 const FILL_BATCH_SIZE: usize = 512;
 const FILL_DRAIN_WATERMARK: usize = 64;
@@ -1145,7 +1145,7 @@ impl BindingWorker {
                 })?,
             };
         let reserved_tx = ring_entries
-            .saturating_div(8)
+            .saturating_div(4)
             .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
             .min(ring_entries.saturating_sub(1))
             .max(1);
@@ -1826,6 +1826,10 @@ fn enqueue_pending_forwards(
         // after enqueue_pending_forwards completes, and TX uses a reserved frame
         // subset that does not overlap RX descriptors on the same worker.
         let ingress_area = unsafe { &*ingress_area_ptr };
+        if target_binding.free_tx_frames.is_empty() {
+            let _ = drain_pending_tx(target_binding);
+            let _ = reap_tx_completions(target_binding);
+        }
         if let Some(offset) = target_binding.free_tx_frames.pop_front() {
             match target_binding
                 .area
@@ -2573,6 +2577,9 @@ fn transmit_batch(
 ) -> Result<(u64, u64), TxError> {
     if pending.is_empty() {
         return Ok((0, 0));
+    }
+    if binding.free_tx_frames.is_empty() {
+        let _ = reap_tx_completions(binding);
     }
     let batch_size = pending
         .len()
