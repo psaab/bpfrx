@@ -384,7 +384,11 @@ mod tests {
         table.last_gc = now + TCP_CLOSING_TIMEOUT;
         let expired = table.expire_stale(now + TCP_CLOSING_TIMEOUT + Duration::from_secs(1));
         assert_eq!(expired, 1);
-        assert!(table.lookup(&key, now + TCP_CLOSING_TIMEOUT + Duration::from_secs(2), 0).is_none());
+        assert!(
+            table
+                .lookup(&key, now + TCP_CLOSING_TIMEOUT + Duration::from_secs(2), 0)
+                .is_none()
+        );
         let deltas = table.drain_deltas(8);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
