@@ -13,7 +13,7 @@ use core::ffi::{c_int, c_void};
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -2676,6 +2676,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     let mut name_to_ifindex = BTreeMap::new();
     let mut linux_to_ifindex = BTreeMap::new();
     let mut mac_by_ifindex = BTreeMap::new();
+    let (excluded_local_v4, excluded_local_v6) = nat_translated_local_exclusions(snapshot);
 
     for zone in &snapshot.zones {
         if zone.id == 0 || zone.name.is_empty() {
@@ -2723,14 +2724,18 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             };
             match net {
                 IpNet::V4(v4) => {
-                    state.local_v4.push(v4.addr());
+                    if !excluded_local_v4.contains(&v4.addr()) {
+                        state.local_v4.push(v4.addr());
+                    }
                     state.connected_v4.push(ConnectedRouteV4 {
                         prefix: v4,
                         ifindex: iface.ifindex,
                     });
                 }
                 IpNet::V6(v6) => {
-                    state.local_v6.push(v6.addr());
+                    if !excluded_local_v6.contains(&v6.addr()) {
+                        state.local_v6.push(v6.addr());
+                    }
                     state.connected_v6.push(ConnectedRouteV6 {
                         prefix: v6,
                         ifindex: iface.ifindex,
@@ -2863,6 +2868,34 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.source_nat_rules = parse_source_nat_rules(&snapshot.source_nat_rules);
     state
+}
+
+fn nat_translated_local_exclusions(
+    snapshot: &ConfigSnapshot,
+) -> (BTreeSet<Ipv4Addr>, BTreeSet<Ipv6Addr>) {
+    let mut excluded_v4 = BTreeSet::new();
+    let mut excluded_v6 = BTreeSet::new();
+    let mut to_zones = BTreeSet::new();
+    for rule in &snapshot.source_nat_rules {
+        if rule.interface_mode && !rule.off && !rule.to_zone.is_empty() {
+            to_zones.insert(rule.to_zone.clone());
+        }
+    }
+    if to_zones.is_empty() {
+        return (excluded_v4, excluded_v6);
+    }
+    for iface in &snapshot.interfaces {
+        if iface.zone.is_empty() || !to_zones.contains(&iface.zone) {
+            continue;
+        }
+        if let Some(v4) = pick_interface_v4(iface) {
+            excluded_v4.insert(v4);
+        }
+        if let Some(v6) = pick_interface_v6(iface) {
+            excluded_v6.insert(v6);
+        }
+    }
+    (excluded_v4, excluded_v6)
 }
 
 fn canonical_route_table(table: &str, is_ipv6: bool) -> String {
@@ -5135,7 +5168,9 @@ mod tests {
 
     #[test]
     fn forwarding_lookup_prefers_local_delivery() {
-        let state = build_forwarding_state(&forwarding_snapshot(true));
+        let mut snapshot = forwarding_snapshot(true);
+        snapshot.source_nat_rules.clear();
+        let state = build_forwarding_state(&snapshot);
         assert_eq!(
             lookup_forwarding_for_ip(&state, IpAddr::V4(Ipv4Addr::new(172, 16, 50, 8))),
             ForwardingDisposition::LocalDelivery
@@ -5422,6 +5457,22 @@ mod tests {
                 rewrite_src: Some("2001:559:8585:80::8".parse().expect("snat")),
                 rewrite_dst: None,
             })
+        );
+    }
+
+    #[test]
+    fn interface_snat_addresses_are_not_treated_as_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let resolved_v4 = lookup_forwarding_resolution(&state, "172.16.80.8".parse().expect("v4"));
+        assert_ne!(
+            resolved_v4.disposition,
+            ForwardingDisposition::LocalDelivery
+        );
+        let resolved_v6 =
+            lookup_forwarding_resolution(&state, "2001:559:8585:80::8".parse().expect("v6"));
+        assert_ne!(
+            resolved_v6.disposition,
+            ForwardingDisposition::LocalDelivery
         );
     }
 
