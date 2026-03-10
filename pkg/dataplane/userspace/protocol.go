@@ -12,18 +12,20 @@ const (
 )
 
 type ControlRequest struct {
-	Type       string                    `json:"type"`
-	Snapshot   *ConfigSnapshot           `json:"snapshot,omitempty"`
-	Forwarding *ForwardingControlRequest `json:"forwarding,omitempty"`
-	Queue      *QueueControlRequest      `json:"queue,omitempty"`
-	Binding    *BindingControlRequest    `json:"binding,omitempty"`
-	Packet     *InjectPacketRequest      `json:"packet,omitempty"`
+	Type          string                    `json:"type"`
+	Snapshot      *ConfigSnapshot           `json:"snapshot,omitempty"`
+	Forwarding    *ForwardingControlRequest `json:"forwarding,omitempty"`
+	Queue         *QueueControlRequest      `json:"queue,omitempty"`
+	Binding       *BindingControlRequest    `json:"binding,omitempty"`
+	Packet        *InjectPacketRequest      `json:"packet,omitempty"`
+	SessionDeltas *SessionDeltaDrainRequest `json:"session_deltas,omitempty"`
 }
 
 type ControlResponse struct {
-	OK     bool           `json:"ok"`
-	Error  string         `json:"error,omitempty"`
-	Status *ProcessStatus `json:"status,omitempty"`
+	OK            bool               `json:"ok"`
+	Error         string             `json:"error,omitempty"`
+	Status        *ProcessStatus     `json:"status,omitempty"`
+	SessionDeltas []SessionDeltaInfo `json:"session_deltas,omitempty"`
 }
 
 type ConfigSnapshot struct {
@@ -212,54 +214,58 @@ type QueueStatus struct {
 }
 
 type BindingStatus struct {
-	Slot                 uint32    `json:"slot"`
-	QueueID              uint32    `json:"queue_id"`
-	WorkerID             uint32    `json:"worker_id"`
-	Interface            string    `json:"interface,omitempty"`
-	Ifindex              int       `json:"ifindex,omitempty"`
-	Registered           bool      `json:"registered"`
-	Armed                bool      `json:"armed"`
-	Ready                bool      `json:"ready"`
-	Bound                bool      `json:"bound"`
-	XSKRegistered        bool      `json:"xsk_registered"`
-	SocketFD             int       `json:"socket_fd,omitempty"`
-	RXPackets            uint64    `json:"rx_packets,omitempty"`
-	RXBytes              uint64    `json:"rx_bytes,omitempty"`
-	RXBatches            uint64    `json:"rx_batches,omitempty"`
-	RXWakeups            uint64    `json:"rx_wakeups,omitempty"`
-	MetadataPackets      uint64    `json:"metadata_packets,omitempty"`
-	MetadataErrors       uint64    `json:"metadata_errors,omitempty"`
-	ValidatedPackets     uint64    `json:"validated_packets,omitempty"`
-	ValidatedBytes       uint64    `json:"validated_bytes,omitempty"`
-	LocalDeliveryPackets uint64    `json:"local_delivery_packets,omitempty"`
-	ForwardCandidatePkts uint64    `json:"forward_candidate_packets,omitempty"`
-	RouteMissPackets     uint64    `json:"route_miss_packets,omitempty"`
-	NeighborMissPackets  uint64    `json:"neighbor_miss_packets,omitempty"`
-	DiscardRoutePackets  uint64    `json:"discard_route_packets,omitempty"`
-	NextTablePackets     uint64    `json:"next_table_packets,omitempty"`
-	ExceptionPackets     uint64    `json:"exception_packets,omitempty"`
-	ConfigGenMismatches  uint64    `json:"config_gen_mismatches,omitempty"`
-	FIBGenMismatches     uint64    `json:"fib_gen_mismatches,omitempty"`
-	UnsupportedPackets   uint64    `json:"unsupported_packets,omitempty"`
-	SessionHits          uint64    `json:"session_hits,omitempty"`
-	SessionMisses        uint64    `json:"session_misses,omitempty"`
-	SessionCreates       uint64    `json:"session_creates,omitempty"`
-	SessionExpires       uint64    `json:"session_expires,omitempty"`
-	PolicyDeniedPackets  uint64    `json:"policy_denied_packets,omitempty"`
-	SNATPackets          uint64    `json:"snat_packets,omitempty"`
-	DNATPackets          uint64    `json:"dnat_packets,omitempty"`
-	SlowPathPackets      uint64    `json:"slow_path_packets,omitempty"`
-	SlowPathBytes        uint64    `json:"slow_path_bytes,omitempty"`
-	SlowPathDrops        uint64    `json:"slow_path_drops,omitempty"`
-	SlowPathRateLimited  uint64    `json:"slow_path_rate_limited,omitempty"`
-	KernelRXDropped      uint64    `json:"kernel_rx_dropped,omitempty"`
-	KernelRXInvalidDescs uint64    `json:"kernel_rx_invalid_descs,omitempty"`
-	TXPackets            uint64    `json:"tx_packets,omitempty"`
-	TXBytes              uint64    `json:"tx_bytes,omitempty"`
-	TXErrors             uint64    `json:"tx_errors,omitempty"`
-	LastHeartbeat        time.Time `json:"last_heartbeat,omitempty"`
-	LastError            string    `json:"last_error,omitempty"`
-	LastChange           time.Time `json:"last_change,omitempty"`
+	Slot                  uint32    `json:"slot"`
+	QueueID               uint32    `json:"queue_id"`
+	WorkerID              uint32    `json:"worker_id"`
+	Interface             string    `json:"interface,omitempty"`
+	Ifindex               int       `json:"ifindex,omitempty"`
+	Registered            bool      `json:"registered"`
+	Armed                 bool      `json:"armed"`
+	Ready                 bool      `json:"ready"`
+	Bound                 bool      `json:"bound"`
+	XSKRegistered         bool      `json:"xsk_registered"`
+	SocketFD              int       `json:"socket_fd,omitempty"`
+	RXPackets             uint64    `json:"rx_packets,omitempty"`
+	RXBytes               uint64    `json:"rx_bytes,omitempty"`
+	RXBatches             uint64    `json:"rx_batches,omitempty"`
+	RXWakeups             uint64    `json:"rx_wakeups,omitempty"`
+	MetadataPackets       uint64    `json:"metadata_packets,omitempty"`
+	MetadataErrors        uint64    `json:"metadata_errors,omitempty"`
+	ValidatedPackets      uint64    `json:"validated_packets,omitempty"`
+	ValidatedBytes        uint64    `json:"validated_bytes,omitempty"`
+	LocalDeliveryPackets  uint64    `json:"local_delivery_packets,omitempty"`
+	ForwardCandidatePkts  uint64    `json:"forward_candidate_packets,omitempty"`
+	RouteMissPackets      uint64    `json:"route_miss_packets,omitempty"`
+	NeighborMissPackets   uint64    `json:"neighbor_miss_packets,omitempty"`
+	DiscardRoutePackets   uint64    `json:"discard_route_packets,omitempty"`
+	NextTablePackets      uint64    `json:"next_table_packets,omitempty"`
+	ExceptionPackets      uint64    `json:"exception_packets,omitempty"`
+	ConfigGenMismatches   uint64    `json:"config_gen_mismatches,omitempty"`
+	FIBGenMismatches      uint64    `json:"fib_gen_mismatches,omitempty"`
+	UnsupportedPackets    uint64    `json:"unsupported_packets,omitempty"`
+	SessionHits           uint64    `json:"session_hits,omitempty"`
+	SessionMisses         uint64    `json:"session_misses,omitempty"`
+	SessionCreates        uint64    `json:"session_creates,omitempty"`
+	SessionExpires        uint64    `json:"session_expires,omitempty"`
+	SessionDeltaPending   uint64    `json:"session_delta_pending,omitempty"`
+	SessionDeltaGenerated uint64    `json:"session_delta_generated,omitempty"`
+	SessionDeltaDropped   uint64    `json:"session_delta_dropped,omitempty"`
+	SessionDeltaDrained   uint64    `json:"session_delta_drained,omitempty"`
+	PolicyDeniedPackets   uint64    `json:"policy_denied_packets,omitempty"`
+	SNATPackets           uint64    `json:"snat_packets,omitempty"`
+	DNATPackets           uint64    `json:"dnat_packets,omitempty"`
+	SlowPathPackets       uint64    `json:"slow_path_packets,omitempty"`
+	SlowPathBytes         uint64    `json:"slow_path_bytes,omitempty"`
+	SlowPathDrops         uint64    `json:"slow_path_drops,omitempty"`
+	SlowPathRateLimited   uint64    `json:"slow_path_rate_limited,omitempty"`
+	KernelRXDropped       uint64    `json:"kernel_rx_dropped,omitempty"`
+	KernelRXInvalidDescs  uint64    `json:"kernel_rx_invalid_descs,omitempty"`
+	TXPackets             uint64    `json:"tx_packets,omitempty"`
+	TXBytes               uint64    `json:"tx_bytes,omitempty"`
+	TXErrors              uint64    `json:"tx_errors,omitempty"`
+	LastHeartbeat         time.Time `json:"last_heartbeat,omitempty"`
+	LastError             string    `json:"last_error,omitempty"`
+	LastChange            time.Time `json:"last_change,omitempty"`
 }
 
 type ExceptionStatus struct {
@@ -287,4 +293,30 @@ type InjectPacketRequest struct {
 	MetadataValid    bool   `json:"metadata_valid"`
 	DestinationIP    string `json:"destination_ip,omitempty"`
 	EmitOnWire       bool   `json:"emit_on_wire,omitempty"`
+}
+
+type SessionDeltaDrainRequest struct {
+	Max uint32 `json:"max,omitempty"`
+}
+
+type SessionDeltaInfo struct {
+	Timestamp     time.Time `json:"timestamp"`
+	Slot          uint32    `json:"slot"`
+	QueueID       uint32    `json:"queue_id"`
+	WorkerID      uint32    `json:"worker_id"`
+	Interface     string    `json:"interface,omitempty"`
+	Ifindex       int       `json:"ifindex,omitempty"`
+	Event         string    `json:"event"`
+	AddrFamily    uint8     `json:"addr_family,omitempty"`
+	Protocol      uint8     `json:"protocol,omitempty"`
+	SrcIP         string    `json:"src_ip,omitempty"`
+	DstIP         string    `json:"dst_ip,omitempty"`
+	SrcPort       uint16    `json:"src_port,omitempty"`
+	DstPort       uint16    `json:"dst_port,omitempty"`
+	IngressZone   string    `json:"ingress_zone,omitempty"`
+	EgressZone    string    `json:"egress_zone,omitempty"`
+	EgressIfindex int       `json:"egress_ifindex,omitempty"`
+	NextHop       string    `json:"next_hop,omitempty"`
+	NATSrcIP      string    `json:"nat_src_ip,omitempty"`
+	NATDstIP      string    `json:"nat_dst_ip,omitempty"`
 }

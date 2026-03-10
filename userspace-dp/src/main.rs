@@ -215,6 +215,8 @@ struct ControlRequest {
     binding: Option<BindingControlRequest>,
     #[serde(default)]
     packet: Option<InjectPacketRequest>,
+    #[serde(rename = "session_deltas", default)]
+    session_deltas: Option<SessionDeltaDrainRequest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -339,6 +341,12 @@ struct ControlResponse {
     error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<ProcessStatus>,
+    #[serde(
+        rename = "session_deltas",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    session_deltas: Vec<SessionDeltaInfo>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -464,6 +472,14 @@ struct BindingStatus {
     session_creates: u64,
     #[serde(rename = "session_expires", default)]
     session_expires: u64,
+    #[serde(rename = "session_delta_pending", default)]
+    session_delta_pending: u64,
+    #[serde(rename = "session_delta_generated", default)]
+    session_delta_generated: u64,
+    #[serde(rename = "session_delta_dropped", default)]
+    session_delta_dropped: u64,
+    #[serde(rename = "session_delta_drained", default)]
+    session_delta_drained: u64,
     #[serde(rename = "policy_denied_packets", default)]
     policy_denied_packets: u64,
     #[serde(rename = "snat_packets", default)]
@@ -540,6 +556,53 @@ struct InjectPacketRequest {
     destination_ip: String,
     #[serde(rename = "emit_on_wire", default)]
     emit_on_wire: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct SessionDeltaDrainRequest {
+    #[serde(default)]
+    max: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct SessionDeltaInfo {
+    timestamp: DateTime<Utc>,
+    #[serde(default)]
+    slot: u32,
+    #[serde(rename = "queue_id", default)]
+    queue_id: u32,
+    #[serde(rename = "worker_id", default)]
+    worker_id: u32,
+    #[serde(default)]
+    interface: String,
+    #[serde(default)]
+    ifindex: i32,
+    #[serde(default)]
+    event: String,
+    #[serde(rename = "addr_family", default)]
+    addr_family: u8,
+    #[serde(default)]
+    protocol: u8,
+    #[serde(rename = "src_ip", default)]
+    src_ip: String,
+    #[serde(rename = "dst_ip", default)]
+    dst_ip: String,
+    #[serde(rename = "src_port", default)]
+    src_port: u16,
+    #[serde(rename = "dst_port", default)]
+    dst_port: u16,
+    #[serde(rename = "ingress_zone", default)]
+    ingress_zone: String,
+    #[serde(rename = "egress_zone", default)]
+    egress_zone: String,
+    #[serde(rename = "egress_ifindex", default)]
+    egress_ifindex: i32,
+    #[serde(rename = "next_hop", default)]
+    next_hop: String,
+    #[serde(rename = "nat_src_ip", default)]
+    nat_src_ip: String,
+    #[serde(rename = "nat_dst_ip", default)]
+    nat_dst_ip: String,
 }
 
 #[derive(Debug)]
@@ -729,6 +792,7 @@ fn handle_stream(
         ok: true,
         error: String::new(),
         status: None,
+        session_deltas: Vec::new(),
     };
     let mut persist_state = false;
 
@@ -851,6 +915,17 @@ fn handle_stream(
                     response.ok = false;
                     response.error = "missing packet injection request".to_string();
                 }
+            }
+            "drain_session_deltas" => {
+                let max = request
+                    .session_deltas
+                    .as_ref()
+                    .map(|req| req.max)
+                    .unwrap_or(256)
+                    .max(1) as usize;
+                response.session_deltas = guard.afxdp.drain_session_deltas(max);
+                refresh_status(&mut guard);
+                persist_state = true;
             }
             "shutdown" => {
                 guard.afxdp.stop();

@@ -1,6 +1,6 @@
 use crate::afxdp::ForwardingResolution;
 use crate::nat::NatDecision;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,7 @@ const TCP_CLOSING_TIMEOUT: Duration = Duration::from_secs(30);
 const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const ICMP_SESSION_TIMEOUT: Duration = Duration::from_secs(15);
 const OTHER_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SESSION_DELTAS: usize = 4096;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const PROTO_ICMP: u8 = 1;
@@ -31,6 +32,7 @@ pub(crate) struct SessionKey {
 #[derive(Clone, Debug)]
 struct SessionEntry {
     decision: SessionDecision,
+    metadata: SessionMetadata,
     last_seen: Instant,
     expires_after: Duration,
 }
@@ -41,22 +43,49 @@ pub(crate) struct SessionDecision {
     pub(crate) nat: NatDecision,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionMetadata {
+    pub(crate) ingress_zone: String,
+    pub(crate) egress_zone: String,
+    pub(crate) is_reverse: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionDeltaKind {
+    Open,
+    Close,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionDelta {
+    pub(crate) kind: SessionDeltaKind,
+    pub(crate) key: SessionKey,
+    pub(crate) decision: SessionDecision,
+    pub(crate) metadata: SessionMetadata,
+}
+
 pub(crate) struct SessionTable {
     sessions: HashMap<SessionKey, SessionEntry>,
+    deltas: VecDeque<SessionDelta>,
     last_gc: Instant,
     max_sessions: usize,
     expired: u64,
     create_drops: u64,
+    delta_drops: u64,
+    delta_drained: u64,
 }
 
 impl SessionTable {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            deltas: VecDeque::with_capacity(MAX_SESSION_DELTAS.min(256)),
             last_gc: Instant::now(),
             max_sessions: DEFAULT_MAX_SESSIONS,
             expired: 0,
             create_drops: 0,
+            delta_drops: 0,
+            delta_drained: 0,
         }
     }
 
@@ -65,10 +94,30 @@ impl SessionTable {
             return 0;
         }
         self.last_gc = now;
-        let before = self.sessions.len();
-        self.sessions
-            .retain(|_, entry| now.duration_since(entry.last_seen) <= entry.expires_after);
-        let expired = before.saturating_sub(self.sessions.len()) as u64;
+        let stale = self
+            .sessions
+            .iter()
+            .filter_map(|(key, entry)| {
+                if now.duration_since(entry.last_seen) > entry.expires_after {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for key in &stale {
+            if let Some(entry) = self.sessions.remove(key) {
+                if !entry.metadata.is_reverse {
+                    self.push_delta(SessionDelta {
+                        kind: SessionDeltaKind::Close,
+                        key: key.clone(),
+                        decision: entry.decision,
+                        metadata: entry.metadata,
+                    });
+                }
+            }
+        }
+        let expired = stale.len() as u64;
         self.expired = self.expired.saturating_add(expired);
         expired
     }
@@ -87,7 +136,16 @@ impl SessionTable {
             entry.decision
         });
         if remove_after {
-            let _ = self.sessions.remove(key);
+            if let Some(entry) = self.sessions.remove(key) {
+                if !entry.metadata.is_reverse {
+                    self.push_delta(SessionDelta {
+                        kind: SessionDeltaKind::Close,
+                        key: key.clone(),
+                        decision: entry.decision,
+                        metadata: entry.metadata,
+                    });
+                }
+            }
         }
         result
     }
@@ -96,6 +154,7 @@ impl SessionTable {
         &mut self,
         key: SessionKey,
         decision: SessionDecision,
+        metadata: SessionMetadata,
         now: Instant,
         protocol: u8,
         tcp_flags: u8,
@@ -105,14 +164,43 @@ impl SessionTable {
             return false;
         }
         self.sessions.insert(
-            key,
+            key.clone(),
             SessionEntry {
                 decision,
+                metadata: metadata.clone(),
                 last_seen: now,
                 expires_after: session_timeout(protocol, tcp_flags),
             },
         );
+        if !metadata.is_reverse {
+            self.push_delta(SessionDelta {
+                kind: SessionDeltaKind::Open,
+                key,
+                decision,
+                metadata,
+            });
+        }
         true
+    }
+
+    pub fn drain_deltas(&mut self, max: usize) -> Vec<SessionDelta> {
+        let drain = max.max(1).min(self.deltas.len());
+        let mut out = Vec::with_capacity(drain);
+        for _ in 0..drain {
+            if let Some(delta) = self.deltas.pop_front() {
+                out.push(delta);
+            }
+        }
+        self.delta_drained = self.delta_drained.saturating_add(out.len() as u64);
+        out
+    }
+
+    fn push_delta(&mut self, delta: SessionDelta) {
+        if self.deltas.len() >= MAX_SESSION_DELTAS {
+            self.delta_drops = self.delta_drops.saturating_add(1);
+            return;
+        }
+        self.deltas.push_back(delta);
     }
 }
 
@@ -175,14 +263,33 @@ mod tests {
         }
     }
 
+    fn metadata() -> SessionMetadata {
+        SessionMetadata {
+            ingress_zone: "lan".to_string(),
+            egress_zone: "wan".to_string(),
+            is_reverse: false,
+        }
+    }
+
     #[test]
     fn session_lookup_hits_after_install() {
         let mut table = SessionTable::new();
         let key = key_v4();
         let now = Instant::now();
-        assert!(table.install_with_protocol(key.clone(), decision(), now, PROTO_TCP, 0x10));
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            now,
+            PROTO_TCP,
+            0x10
+        ));
         let hit = table.lookup(&key, now + Duration::from_millis(1), 0x10);
         assert_eq!(hit, Some(decision()));
+        let deltas = table.drain_deltas(8);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
+        assert_eq!(deltas[0].key, key);
     }
 
     #[test]
@@ -190,11 +297,23 @@ mod tests {
         let mut table = SessionTable::new();
         let key = key_v6();
         let then = Instant::now() - Duration::from_secs(120);
-        assert!(table.install_with_protocol(key.clone(), decision(), then, PROTO_UDP, 0));
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            then,
+            PROTO_UDP,
+            0
+        ));
+        let _ = table.drain_deltas(8);
         table.last_gc = Instant::now() - Duration::from_secs(2);
         let expired = table.expire_stale(Instant::now());
         assert_eq!(expired, 1);
         assert!(table.lookup(&key, Instant::now(), 0).is_none());
+        let deltas = table.drain_deltas(8);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
+        assert_eq!(deltas[0].key, key);
     }
 
     #[test]
@@ -202,7 +321,15 @@ mod tests {
         let mut table = SessionTable::new();
         let key = key_v4();
         let now = Instant::now();
-        assert!(table.install_with_protocol(key.clone(), decision(), now, PROTO_TCP, 0x10));
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            now,
+            PROTO_TCP,
+            0x10
+        ));
+        let _ = table.drain_deltas(8);
         let hit = table.lookup(&key, now + Duration::from_millis(1), TCP_FIN);
         assert_eq!(hit, Some(decision()));
         assert!(
@@ -210,5 +337,9 @@ mod tests {
                 .lookup(&key, now + Duration::from_millis(2), 0x10)
                 .is_none()
         );
+        let deltas = table.drain_deltas(8);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
+        assert_eq!(deltas[0].key, key);
     }
 }

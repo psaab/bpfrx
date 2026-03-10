@@ -33,6 +33,10 @@ func FormatStatusSummary(status ProcessStatus) string {
 	var sessionMisses uint64
 	var sessionCreates uint64
 	var sessionExpires uint64
+	var sessionDeltaPending uint64
+	var sessionDeltaGenerated uint64
+	var sessionDeltaDropped uint64
+	var sessionDeltaDrained uint64
 	var policyDeniedPackets uint64
 	var snatPackets uint64
 	var dnatPackets uint64
@@ -64,6 +68,10 @@ func FormatStatusSummary(status ProcessStatus) string {
 		sessionMisses += binding.SessionMisses
 		sessionCreates += binding.SessionCreates
 		sessionExpires += binding.SessionExpires
+		sessionDeltaPending += binding.SessionDeltaPending
+		sessionDeltaGenerated += binding.SessionDeltaGenerated
+		sessionDeltaDropped += binding.SessionDeltaDropped
+		sessionDeltaDrained += binding.SessionDeltaDrained
 		policyDeniedPackets += binding.PolicyDeniedPackets
 		snatPackets += binding.SNATPackets
 		dnatPackets += binding.DNATPackets
@@ -132,6 +140,10 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  Session misses:            %d\n", sessionMisses)
 	fmt.Fprintf(&b, "  Session creates:           %d\n", sessionCreates)
 	fmt.Fprintf(&b, "  Session expires:           %d\n", sessionExpires)
+	fmt.Fprintf(&b, "  Session delta pending:     %d\n", sessionDeltaPending)
+	fmt.Fprintf(&b, "  Session delta generated:   %d\n", sessionDeltaGenerated)
+	fmt.Fprintf(&b, "  Session delta dropped:     %d\n", sessionDeltaDropped)
+	fmt.Fprintf(&b, "  Session delta drained:     %d\n", sessionDeltaDrained)
 	fmt.Fprintf(&b, "  Policy denied packets:     %d\n", policyDeniedPackets)
 	fmt.Fprintf(&b, "  SNAT packets:              %d\n", snatPackets)
 	fmt.Fprintf(&b, "  DNAT packets:              %d\n", dnatPackets)

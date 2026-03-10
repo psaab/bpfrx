@@ -957,28 +957,36 @@ func findBinary(explicit string) (string, error) {
 	return "", errors.New("userspace dataplane helper binary not found; build ./cmd/bpfrx-userspace-dp or configure system dataplane binary")
 }
 
-func (m *Manager) requestLocked(req ControlRequest, status *ProcessStatus) error {
+func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, error) {
 	if m.cfg.ControlSocket == "" {
-		return errors.New("userspace dataplane control socket not configured")
+		return ControlResponse{}, errors.New("userspace dataplane control socket not configured")
 	}
 	conn, err := net.DialTimeout("unix", m.cfg.ControlSocket, 2*time.Second)
 	if err != nil {
-		return err
+		return ControlResponse{}, err
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 	if err := json.NewEncoder(conn).Encode(&req); err != nil {
-		return err
+		return ControlResponse{}, err
 	}
 	var resp ControlResponse
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
-		return err
+		return ControlResponse{}, err
 	}
 	if !resp.OK {
 		if resp.Error == "" {
 			resp.Error = "unknown helper error"
 		}
-		return errors.New(resp.Error)
+		return ControlResponse{}, errors.New(resp.Error)
+	}
+	return resp, nil
+}
+
+func (m *Manager) requestLocked(req ControlRequest, status *ProcessStatus) error {
+	resp, err := m.requestDetailedLocked(req)
+	if err != nil {
+		return err
 	}
 	if status != nil && resp.Status != nil {
 		*status = *resp.Status
@@ -1295,6 +1303,32 @@ func (m *Manager) InjectPacket(req InjectPacketRequest) (ProcessStatus, error) {
 		return status, err
 	}
 	return status, nil
+}
+
+func (m *Manager) DrainSessionDeltas(max uint32) ([]SessionDeltaInfo, ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return nil, ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	resp, err := m.requestDetailedLocked(ControlRequest{
+		Type: "drain_session_deltas",
+		SessionDeltas: &SessionDeltaDrainRequest{
+			Max: max,
+		},
+	})
+	if err != nil {
+		return nil, ProcessStatus{}, err
+	}
+	var status ProcessStatus
+	if resp.Status != nil {
+		status = *resp.Status
+		if err := m.applyHelperStatusLocked(&status); err != nil {
+			return resp.SessionDeltas, status, err
+		}
+	}
+	return resp.SessionDeltas, status, nil
 }
 
 const userspaceBindingReady = 1

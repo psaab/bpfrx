@@ -1,10 +1,12 @@
 use super::{
     BindingStatus, ConfigSnapshot, ExceptionStatus, InjectPacketRequest, InterfaceSnapshot,
-    PacketResolution, SourceNATRuleSnapshot,
+    PacketResolution, SessionDeltaInfo,
 };
 use crate::nat::{NatDecision, SourceNatRule, match_source_nat, parse_source_nat_rules};
 use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
-use crate::session::{SessionDecision, SessionKey, SessionTable};
+use crate::session::{
+    SessionDecision, SessionDelta, SessionDeltaKind, SessionKey, SessionMetadata, SessionTable,
+};
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus};
 use chrono::Utc;
 use core::ffi::{c_int, c_void};
@@ -33,6 +35,7 @@ const STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
+const MAX_PENDING_SESSION_DELTAS: usize = 4096;
 const BIND_RETRY_ATTEMPTS: usize = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
@@ -185,6 +188,10 @@ impl Coordinator {
             binding.session_misses = 0;
             binding.session_creates = 0;
             binding.session_expires = 0;
+            binding.session_delta_pending = 0;
+            binding.session_delta_generated = 0;
+            binding.session_delta_dropped = 0;
+            binding.session_delta_drained = 0;
             binding.policy_denied_packets = 0;
             binding.snat_packets = 0;
             binding.dnat_packets = 0;
@@ -398,6 +405,20 @@ impl Coordinator {
             .unwrap_or_else(|| self.last_slow_path_status.clone())
     }
 
+    pub fn drain_session_deltas(&self, max: usize) -> Vec<SessionDeltaInfo> {
+        let mut remaining = max.max(1);
+        let mut out = Vec::new();
+        for live in self.live.values() {
+            if remaining == 0 {
+                break;
+            }
+            let drained = live.drain_session_deltas(remaining);
+            remaining = remaining.saturating_sub(drained.len());
+            out.extend(drained);
+        }
+        out
+    }
+
     pub fn worker_heartbeats(&self) -> Vec<chrono::DateTime<Utc>> {
         self.workers
             .iter()
@@ -571,6 +592,10 @@ impl Coordinator {
                 binding.session_misses = snap.session_misses;
                 binding.session_creates = snap.session_creates;
                 binding.session_expires = snap.session_expires;
+                binding.session_delta_pending = snap.session_delta_pending;
+                binding.session_delta_generated = snap.session_delta_generated;
+                binding.session_delta_dropped = snap.session_delta_dropped;
+                binding.session_delta_drained = snap.session_delta_drained;
                 binding.policy_denied_packets = snap.policy_denied_packets;
                 binding.snat_packets = snap.snat_packets;
                 binding.dnat_packets = snap.dnat_packets;
@@ -615,6 +640,10 @@ impl Coordinator {
                 binding.session_misses = 0;
                 binding.session_creates = 0;
                 binding.session_expires = 0;
+                binding.session_delta_pending = 0;
+                binding.session_delta_generated = 0;
+                binding.session_delta_dropped = 0;
+                binding.session_delta_drained = 0;
                 binding.policy_denied_packets = 0;
                 binding.snat_packets = 0;
                 binding.dnat_packets = 0;
@@ -955,6 +984,7 @@ fn poll_binding(
             .session_expires
             .fetch_add(expired, Ordering::Relaxed);
     }
+    flush_session_deltas(&ident, &binding.live, sessions.drain_deltas(256));
     reap_tx_completions(binding);
     drain_pending_tx(binding);
     if binding.device.needs_wakeup() {
@@ -1005,15 +1035,22 @@ fn poll_binding(
                             nat: NatDecision::default(),
                         };
                         if resolution.disposition == ForwardingDisposition::ForwardCandidate {
-                            if let PolicyAction::Permit = match_policy_for_flow(
+                            let (from_zone, to_zone) = zone_pair_for_flow(
                                 forwarding,
                                 meta.ingress_ifindex as i32,
                                 resolution.egress_ifindex,
-                                flow,
+                            );
+                            if let PolicyAction::Permit = evaluate_policy(
+                                &forwarding.policy,
+                                &from_zone,
+                                &to_zone,
+                                flow.src_ip,
+                                flow.dst_ip,
                             ) {
                                 decision.nat = match_source_nat_for_flow(
                                     forwarding,
-                                    meta.ingress_ifindex as i32,
+                                    &from_zone,
+                                    &to_zone,
                                     resolution.egress_ifindex,
                                     flow,
                                 )
@@ -1022,6 +1059,11 @@ fn poll_binding(
                                 if sessions.install_with_protocol(
                                     flow.forward_key.clone(),
                                     decision,
+                                    SessionMetadata {
+                                        ingress_zone: from_zone.clone(),
+                                        egress_zone: to_zone.clone(),
+                                        is_reverse: false,
+                                    },
                                     now,
                                     meta.protocol,
                                     meta.tcp_flags,
@@ -1040,6 +1082,11 @@ fn poll_binding(
                                     if sessions.install_with_protocol(
                                         flow.reverse_key_with_nat(decision.nat),
                                         reverse_decision,
+                                        SessionMetadata {
+                                            ingress_zone: to_zone.clone(),
+                                            egress_zone: from_zone.clone(),
+                                            is_reverse: true,
+                                        },
                                         now,
                                         meta.protocol,
                                         meta.tcp_flags,
@@ -1114,6 +1161,7 @@ fn poll_binding(
         }
         recycle.push(desc.addr);
     }
+    flush_session_deltas(&ident, &binding.live, sessions.drain_deltas(256));
     received.release();
     if !recycle.is_empty() {
         let mut fill = binding.device.fill(recycle.len() as u32);
@@ -1393,6 +1441,58 @@ fn find_target_live(
         }
     }
     None
+}
+
+fn flush_session_deltas(
+    ident: &BindingIdentity,
+    live: &BindingLiveState,
+    deltas: Vec<SessionDelta>,
+) {
+    for delta in deltas {
+        live.push_session_delta(SessionDeltaInfo {
+            timestamp: Utc::now(),
+            slot: ident.slot,
+            queue_id: ident.queue_id,
+            worker_id: ident.worker_id,
+            interface: ident.interface.clone(),
+            ifindex: ident.ifindex,
+            event: session_delta_event(delta.kind).to_string(),
+            addr_family: delta.key.addr_family,
+            protocol: delta.key.protocol,
+            src_ip: delta.key.src_ip.to_string(),
+            dst_ip: delta.key.dst_ip.to_string(),
+            src_port: delta.key.src_port,
+            dst_port: delta.key.dst_port,
+            ingress_zone: delta.metadata.ingress_zone,
+            egress_zone: delta.metadata.egress_zone,
+            egress_ifindex: delta.decision.resolution.egress_ifindex,
+            next_hop: delta
+                .decision
+                .resolution
+                .next_hop
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            nat_src_ip: delta
+                .decision
+                .nat
+                .rewrite_src
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            nat_dst_ip: delta
+                .decision
+                .nat
+                .rewrite_dst
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+        });
+    }
+}
+
+fn session_delta_event(kind: SessionDeltaKind) -> &'static str {
+    match kind {
+        SessionDeltaKind::Open => "open",
+        SessionDeltaKind::Close => "close",
+    }
 }
 
 fn reap_tx_completions(binding: &mut BindingWorker) {
@@ -2165,20 +2265,11 @@ fn resolve_forwarding(
 
 fn match_source_nat_for_flow(
     forwarding: &ForwardingState,
-    ingress_ifindex: i32,
+    from_zone: &str,
+    to_zone: &str,
     egress_ifindex: i32,
     flow: &SessionFlow,
 ) -> Option<NatDecision> {
-    let from_zone = forwarding
-        .ifindex_to_zone
-        .get(&ingress_ifindex)
-        .map(|zone| zone.as_str())
-        .unwrap_or("");
-    let to_zone = forwarding
-        .egress
-        .get(&egress_ifindex)
-        .map(|iface| iface.zone.as_str())
-        .unwrap_or("");
     let egress = forwarding.egress.get(&egress_ifindex)?;
     match_source_nat(
         &forwarding.source_nat_rules,
@@ -2191,29 +2282,22 @@ fn match_source_nat_for_flow(
     )
 }
 
-fn match_policy_for_flow(
+fn zone_pair_for_flow(
     forwarding: &ForwardingState,
     ingress_ifindex: i32,
     egress_ifindex: i32,
-    flow: &SessionFlow,
-) -> PolicyAction {
+) -> (String, String) {
     let from_zone = forwarding
         .ifindex_to_zone
         .get(&ingress_ifindex)
-        .map(|zone| zone.as_str())
-        .unwrap_or("");
+        .cloned()
+        .unwrap_or_default();
     let to_zone = forwarding
         .egress
         .get(&egress_ifindex)
-        .map(|iface| iface.zone.as_str())
-        .unwrap_or("");
-    evaluate_policy(
-        &forwarding.policy,
-        from_zone,
-        to_zone,
-        flow.src_ip,
-        flow.dst_ip,
-    )
+        .map(|iface| iface.zone.clone())
+        .unwrap_or_default();
+    (from_zone, to_zone)
 }
 
 #[cfg(test)]
@@ -3088,6 +3172,9 @@ struct BindingLiveState {
     session_misses: AtomicU64,
     session_creates: AtomicU64,
     session_expires: AtomicU64,
+    session_delta_generated: AtomicU64,
+    session_delta_dropped: AtomicU64,
+    session_delta_drained: AtomicU64,
     policy_denied_packets: AtomicU64,
     snat_packets: AtomicU64,
     dnat_packets: AtomicU64,
@@ -3103,6 +3190,7 @@ struct BindingLiveState {
     last_heartbeat: AtomicI64,
     last_error: Mutex<String>,
     pending_tx: Mutex<VecDeque<TxRequest>>,
+    pending_session_deltas: Mutex<VecDeque<SessionDeltaInfo>>,
 }
 
 impl BindingLiveState {
@@ -3133,6 +3221,9 @@ impl BindingLiveState {
             session_misses: AtomicU64::new(0),
             session_creates: AtomicU64::new(0),
             session_expires: AtomicU64::new(0),
+            session_delta_generated: AtomicU64::new(0),
+            session_delta_dropped: AtomicU64::new(0),
+            session_delta_drained: AtomicU64::new(0),
             policy_denied_packets: AtomicU64::new(0),
             snat_packets: AtomicU64::new(0),
             dnat_packets: AtomicU64::new(0),
@@ -3148,6 +3239,7 @@ impl BindingLiveState {
             last_heartbeat: AtomicI64::new(0),
             last_error: Mutex::new(String::new()),
             pending_tx: Mutex::new(VecDeque::new()),
+            pending_session_deltas: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -3177,6 +3269,11 @@ impl BindingLiveState {
     }
 
     fn snapshot(&self) -> BindingLiveSnapshot {
+        let session_delta_pending = self
+            .pending_session_deltas
+            .lock()
+            .map(|pending| pending.len() as u64)
+            .unwrap_or(0);
         BindingLiveSnapshot {
             bound: self.bound.load(Ordering::Relaxed),
             xsk_registered: self.xsk_registered.load(Ordering::Relaxed),
@@ -3203,6 +3300,10 @@ impl BindingLiveState {
             session_misses: self.session_misses.load(Ordering::Relaxed),
             session_creates: self.session_creates.load(Ordering::Relaxed),
             session_expires: self.session_expires.load(Ordering::Relaxed),
+            session_delta_pending,
+            session_delta_generated: self.session_delta_generated.load(Ordering::Relaxed),
+            session_delta_dropped: self.session_delta_dropped.load(Ordering::Relaxed),
+            session_delta_drained: self.session_delta_drained.load(Ordering::Relaxed),
             policy_denied_packets: self.policy_denied_packets.load(Ordering::Relaxed),
             snat_packets: self.snat_packets.load(Ordering::Relaxed),
             dnat_packets: self.dnat_packets.load(Ordering::Relaxed),
@@ -3240,6 +3341,41 @@ impl BindingLiveState {
             Err(_) => VecDeque::new(),
         }
     }
+
+    fn push_session_delta(&self, delta: SessionDeltaInfo) {
+        self.session_delta_generated.fetch_add(1, Ordering::Relaxed);
+        match self.pending_session_deltas.lock() {
+            Ok(mut pending) => {
+                if pending.len() >= MAX_PENDING_SESSION_DELTAS {
+                    self.session_delta_dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                pending.push_back(delta);
+            }
+            Err(_) => {
+                self.session_delta_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn drain_session_deltas(&self, max: usize) -> Vec<SessionDeltaInfo> {
+        let drain = max.max(1);
+        match self.pending_session_deltas.lock() {
+            Ok(mut pending) => {
+                let count = drain.min(pending.len());
+                let mut out = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if let Some(delta) = pending.pop_front() {
+                        out.push(delta);
+                    }
+                }
+                self.session_delta_drained
+                    .fetch_add(out.len() as u64, Ordering::Relaxed);
+                out
+            }
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 struct BindingLiveSnapshot {
@@ -3268,6 +3404,10 @@ struct BindingLiveSnapshot {
     session_misses: u64,
     session_creates: u64,
     session_expires: u64,
+    session_delta_pending: u64,
+    session_delta_generated: u64,
+    session_delta_dropped: u64,
+    session_delta_drained: u64,
     policy_denied_packets: u64,
     snat_packets: u64,
     dnat_packets: u64,
@@ -3289,7 +3429,7 @@ mod tests {
     use super::*;
     use crate::{
         InterfaceAddressSnapshot, InterfaceSnapshot, NeighborSnapshot, PolicyRuleSnapshot,
-        RouteSnapshot,
+        RouteSnapshot, SourceNATRuleSnapshot,
     };
 
     fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
@@ -3743,8 +3883,9 @@ mod tests {
                 dst_port: 5201,
             },
         };
+        let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
         assert_eq!(
-            match_source_nat_for_flow(&state, 24, 12, &flow),
+            match_source_nat_for_flow(&state, &from_zone, &to_zone, 12, &flow),
             Some(NatDecision {
                 rewrite_src: Some("172.16.80.8".parse().expect("snat")),
                 rewrite_dst: None,
@@ -3767,8 +3908,9 @@ mod tests {
                 dst_port: 5201,
             },
         };
+        let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
         assert_eq!(
-            match_source_nat_for_flow(&state, 24, 12, &flow),
+            match_source_nat_for_flow(&state, &from_zone, &to_zone, 12, &flow),
             Some(NatDecision {
                 rewrite_src: Some("2001:559:8585:80::8".parse().expect("snat")),
                 rewrite_dst: None,
@@ -3791,8 +3933,15 @@ mod tests {
                 dst_port: 5201,
             },
         };
+        let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
         assert_eq!(
-            match_policy_for_flow(&state, 24, 12, &flow),
+            evaluate_policy(
+                &state.policy,
+                &from_zone,
+                &to_zone,
+                flow.src_ip,
+                flow.dst_ip
+            ),
             PolicyAction::Permit
         );
     }
@@ -3812,8 +3961,15 @@ mod tests {
                 dst_port: 5201,
             },
         };
+        let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
         assert_eq!(
-            match_policy_for_flow(&state, 24, 12, &flow),
+            evaluate_policy(
+                &state.policy,
+                &from_zone,
+                &to_zone,
+                flow.src_ip,
+                flow.dst_ip
+            ),
             PolicyAction::Deny
         );
     }
