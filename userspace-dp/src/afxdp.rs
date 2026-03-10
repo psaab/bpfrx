@@ -13,7 +13,7 @@ use core::ffi::{c_int, c_void};
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -83,6 +83,7 @@ pub struct Coordinator {
     last_slow_path_status: SlowPathStatus,
     ha_state: Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    shared_sessions: Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
@@ -106,6 +107,7 @@ impl Coordinator {
             last_slow_path_status: SlowPathStatus::default(),
             ha_state: Arc::new(Mutex::new(BTreeMap::new())),
             dynamic_neighbors: Arc::new(Mutex::new(BTreeMap::new())),
+            shared_sessions: Arc::new(Mutex::new(HashMap::new())),
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
@@ -339,10 +341,6 @@ impl Coordinator {
             .copied()
             .map(|worker_id| (worker_id, Arc::new(Mutex::new(VecDeque::new()))))
             .collect();
-        let all_worker_commands = worker_command_queues
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
         for (worker_id, binding_plans) in workers {
             let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
@@ -355,10 +353,15 @@ impl Coordinator {
             let recent_session_deltas = self.recent_session_deltas.clone();
             let last_resolution = self.last_resolution.clone();
             let slow_path = self.slow_path.clone();
+            let shared_sessions = self.shared_sessions.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
             let commands_clone = commands.clone();
-            let all_commands_clone = all_worker_commands.clone();
+            let peer_commands_clone = worker_command_queues
+                .iter()
+                .filter(|(id, _)| **id != worker_id)
+                .map(|(_, queue)| queue.clone())
+                .collect::<Vec<_>>();
             let validation = self.validation;
             let forwarding = forwarding.clone();
             let ha_state = self.ha_state.clone();
@@ -373,12 +376,13 @@ impl Coordinator {
                         forwarding,
                         ha_state,
                         dynamic_neighbors,
+                        shared_sessions,
                         slow_path,
                         recent_exceptions,
                         recent_session_deltas,
                         last_resolution,
                         commands_clone,
-                        all_commands_clone,
+                        peer_commands_clone,
                         stop_clone,
                         heartbeat_clone,
                     );
@@ -501,6 +505,7 @@ impl Coordinator {
     }
 
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
+        publish_shared_session(&self.shared_sessions, &entry);
         for handle in self.workers.values() {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
@@ -509,6 +514,7 @@ impl Coordinator {
     }
 
     pub fn delete_synced_session(&self, key: SessionKey) {
+        remove_shared_session(&self.shared_sessions, &key);
         for handle in self.workers.values() {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
@@ -1125,11 +1131,12 @@ fn poll_binding(
     forwarding: &ForwardingState,
     ha_state: &Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
-    worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     poll_stats: bool,
 ) -> bool {
     let (left, rest) = bindings.split_at_mut(binding_index);
@@ -1149,8 +1156,9 @@ fn poll_binding(
         &ident,
         &binding.live,
         sessions.drain_deltas(256),
+        shared_sessions,
         recent_session_deltas,
-        worker_commands,
+        peer_worker_commands,
     );
     reap_tx_completions(binding);
     drain_pending_tx(binding);
@@ -1212,6 +1220,36 @@ fn poll_binding(
                             debug.to_zone = hit.metadata.egress_zone.clone();
                         }
                         if hit.metadata.synced {
+                            decision.resolution = enforce_ha_resolution(
+                                forwarding,
+                                ha_state,
+                                lookup_forwarding_resolution_with_dynamic(
+                                    forwarding,
+                                    dynamic_neighbors,
+                                    flow.dst_ip,
+                                ),
+                            );
+                        }
+                        decision
+                    } else if let Some(shared) =
+                        lookup_shared_session(shared_sessions, &flow.forward_key)
+                    {
+                        binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
+                        let replica = synced_replica_entry(&shared);
+                        sessions.upsert_synced(
+                            replica.key.clone(),
+                            replica.decision,
+                            replica.metadata.clone(),
+                            now,
+                            replica.protocol,
+                            meta.tcp_flags,
+                        );
+                        if let Some(debug) = debug.as_mut() {
+                            debug.from_zone = replica.metadata.ingress_zone.clone();
+                            debug.to_zone = replica.metadata.egress_zone.clone();
+                        }
+                        let mut decision = replica.decision;
+                        if replica.metadata.synced {
                             decision.resolution = enforce_ha_resolution(
                                 forwarding,
                                 ha_state,
@@ -1290,16 +1328,15 @@ fn poll_binding(
                                     meta.tcp_flags,
                                 ) {
                                     created += 1;
-                                    replicate_session_upsert(
-                                        worker_commands,
-                                        SyncedSessionEntry {
-                                            key: flow.forward_key.clone(),
-                                            decision,
-                                            metadata: forward_metadata,
-                                            protocol: meta.protocol,
-                                            tcp_flags: meta.tcp_flags,
-                                        },
-                                    );
+                                    let forward_entry = SyncedSessionEntry {
+                                        key: flow.forward_key.clone(),
+                                        decision,
+                                        metadata: forward_metadata,
+                                        protocol: meta.protocol,
+                                        tcp_flags: meta.tcp_flags,
+                                    };
+                                    publish_shared_session(shared_sessions, &forward_entry);
+                                    replicate_session_upsert(peer_worker_commands, &forward_entry);
                                 }
                                 let reverse_resolution = enforce_ha_resolution(
                                     forwarding,
@@ -1334,15 +1371,17 @@ fn poll_binding(
                                         meta.tcp_flags,
                                     ) {
                                         created += 1;
+                                        let reverse_entry = SyncedSessionEntry {
+                                            key: reverse_key,
+                                            decision: reverse_decision,
+                                            metadata: reverse_metadata,
+                                            protocol: meta.protocol,
+                                            tcp_flags: meta.tcp_flags,
+                                        };
+                                        publish_shared_session(shared_sessions, &reverse_entry);
                                         replicate_session_upsert(
-                                            worker_commands,
-                                            SyncedSessionEntry {
-                                                key: reverse_key,
-                                                decision: reverse_decision,
-                                                metadata: reverse_metadata,
-                                                protocol: meta.protocol,
-                                                tcp_flags: meta.tcp_flags,
-                                            },
+                                            peer_worker_commands,
+                                            &reverse_entry,
                                         );
                                     }
                                 }
@@ -1429,8 +1468,9 @@ fn poll_binding(
         &ident,
         &binding.live,
         sessions.drain_deltas(256),
+        shared_sessions,
         recent_session_deltas,
-        worker_commands,
+        peer_worker_commands,
     );
     received.release();
     if !recycle.is_empty() {
@@ -1787,8 +1827,9 @@ fn flush_session_deltas(
     ident: &BindingIdentity,
     live: &BindingLiveState,
     deltas: Vec<SessionDelta>,
+    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
-    worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
 ) {
     for delta in deltas {
         let info = SessionDeltaInfo {
@@ -1833,9 +1874,12 @@ fn flush_session_deltas(
             push_recent_session_delta(&mut recent, info);
         }
         if delta.kind == SessionDeltaKind::Close {
-            replicate_session_delete(worker_commands, &delta.key);
+            remove_shared_session(shared_sessions, &delta.key);
+            let reverse_key = reverse_session_key(&delta.key, delta.decision.nat);
+            remove_shared_session(shared_sessions, &reverse_key);
+            replicate_session_delete(peer_worker_commands, &delta.key);
             replicate_session_delete(
-                worker_commands,
+                peer_worker_commands,
                 &reverse_session_key(&delta.key, delta.decision.nat),
             );
         }
@@ -2162,11 +2206,12 @@ fn apply_worker_commands(
 
 fn replicate_session_upsert(
     worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
-    entry: SyncedSessionEntry,
+    entry: &SyncedSessionEntry,
 ) {
+    let replica = synced_replica_entry(entry);
     for commands in worker_commands {
         if let Ok(mut pending) = commands.lock() {
-            pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
+            pending.push_back(WorkerCommand::UpsertSynced(replica.clone()));
         }
     }
 }
@@ -2182,6 +2227,40 @@ fn replicate_session_delete(
     }
 }
 
+fn synced_replica_entry(entry: &SyncedSessionEntry) -> SyncedSessionEntry {
+    let mut replica = entry.clone();
+    replica.metadata.synced = true;
+    replica
+}
+
+fn lookup_shared_session(
+    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    key: &SessionKey,
+) -> Option<SyncedSessionEntry> {
+    shared_sessions
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(key).cloned())
+}
+
+fn publish_shared_session(
+    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    entry: &SyncedSessionEntry,
+) {
+    if let Ok(mut sessions) = shared_sessions.lock() {
+        sessions.insert(entry.key.clone(), entry.clone());
+    }
+}
+
+fn remove_shared_session(
+    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    key: &SessionKey,
+) {
+    if let Ok(mut sessions) = shared_sessions.lock() {
+        sessions.remove(key);
+    }
+}
+
 fn worker_loop(
     worker_id: u32,
     binding_plans: Vec<BindingPlan>,
@@ -2189,12 +2268,13 @@ fn worker_loop(
     forwarding: Arc<ForwardingState>,
     ha_state: Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    shared_sessions: Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<Arc<SlowPathReinjector>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     last_resolution: Arc<Mutex<Option<PacketResolution>>>,
     commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
-    worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicI64>,
 ) {
@@ -2219,7 +2299,8 @@ fn worker_loop(
         heartbeat.store(now_nanos(), Ordering::Relaxed);
         apply_worker_commands(&commands, &mut sessions);
         let poll_stats = last_stats_poll.elapsed() >= STATS_POLL_INTERVAL;
-        let poll_neighbors = worker_id == 0 && last_neighbor_sync.elapsed() >= NEIGHBOR_SYNC_INTERVAL;
+        let poll_neighbors =
+            worker_id == 0 && last_neighbor_sync.elapsed() >= NEIGHBOR_SYNC_INTERVAL;
         if poll_neighbors {
             sync_dynamic_neighbors(&forwarding, &dynamic_neighbors);
             last_neighbor_sync = Instant::now();
@@ -2234,11 +2315,12 @@ fn worker_loop(
                 &forwarding,
                 &ha_state,
                 &dynamic_neighbors,
+                &shared_sessions,
                 slow_path.as_ref(),
                 &recent_exceptions,
                 &recent_session_deltas,
                 &last_resolution,
-                &worker_commands,
+                &peer_worker_commands,
                 poll_stats,
             ) {
                 did_work = true;
@@ -2838,16 +2920,13 @@ fn resolve_ingress_logical_ifindex(
     ingress_ifindex: i32,
     ingress_vlan_id: u16,
 ) -> Option<i32> {
-    forwarding
-        .egress
-        .iter()
-        .find_map(|(ifindex, iface)| {
-            if iface.bind_ifindex == ingress_ifindex && iface.vlan_id == ingress_vlan_id {
-                Some(*ifindex)
-            } else {
-                None
-            }
-        })
+    forwarding.egress.iter().find_map(|(ifindex, iface)| {
+        if iface.bind_ifindex == ingress_ifindex && iface.vlan_id == ingress_vlan_id {
+            Some(*ifindex)
+        } else {
+            None
+        }
+    })
 }
 
 fn enforce_ha_resolution(
@@ -2981,12 +3060,7 @@ fn lookup_forwarding_resolution_v4(
         .find(|entry| entry.prefix.contains(&ip));
     match choose_v4_route(static_match, connected_match) {
         Some(ResolvedRouteV4::Connected { ifindex }) => {
-            let neighbor = lookup_neighbor_entry(
-                state,
-                dynamic_neighbors,
-                ifindex,
-                IpAddr::V4(ip),
-            );
+            let neighbor = lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V4(ip));
             ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
@@ -2995,7 +3069,7 @@ fn lookup_forwarding_resolution_v4(
                 },
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
-                    next_hop: Some(IpAddr::V4(ip)),
+                next_hop: Some(IpAddr::V4(ip)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
             }
         }
@@ -3042,12 +3116,8 @@ fn lookup_forwarding_resolution_v4(
                 };
             }
             let target = next_hop.unwrap_or(ip);
-            let neighbor = lookup_neighbor_entry(
-                state,
-                dynamic_neighbors,
-                ifindex,
-                IpAddr::V4(target),
-            );
+            let neighbor =
+                lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V4(target));
             ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
@@ -3096,12 +3166,7 @@ fn lookup_forwarding_resolution_v6(
         .find(|entry| entry.prefix.contains(&ip));
     match choose_v6_route(static_match, connected_match) {
         Some(ResolvedRouteV6::Connected { ifindex }) => {
-            let neighbor = lookup_neighbor_entry(
-                state,
-                dynamic_neighbors,
-                ifindex,
-                IpAddr::V6(ip),
-            );
+            let neighbor = lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V6(ip));
             ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
@@ -3157,12 +3222,8 @@ fn lookup_forwarding_resolution_v6(
                 };
             }
             let target = next_hop.unwrap_or(ip);
-            let neighbor = lookup_neighbor_entry(
-                state,
-                dynamic_neighbors,
-                ifindex,
-                IpAddr::V6(target),
-            );
+            let neighbor =
+                lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V6(target));
             ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
@@ -3219,7 +3280,11 @@ fn sync_dynamic_neighbors(
         let Some(ifname) = state.ifindex_to_name.get(ifindex) else {
             continue;
         };
-        updates.extend(read_neighbor_entries(ifname).into_iter().map(|(ip, entry)| ((*ifindex, ip), entry)));
+        updates.extend(
+            read_neighbor_entries(ifname)
+                .into_iter()
+                .map(|(ip, entry)| ((*ifindex, ip), entry)),
+        );
         if iface.bind_ifindex > 0 && iface.bind_ifindex != *ifindex {
             updates.extend(
                 read_neighbor_entries(ifname)
@@ -3252,11 +3317,21 @@ fn read_neighbor_entry(ifname: &str, target: IpAddr) -> Option<NeighborEntry> {
         IpAddr::V6(_) => "-6",
     };
     let output = Command::new("ip")
-        .args([family, "neigh", "show", "to", &target.to_string(), "dev", ifname])
+        .args([
+            family,
+            "neigh",
+            "show",
+            "to",
+            &target.to_string(),
+            "dev",
+            ifname,
+        ])
         .output()
         .ok()?;
     if output.status.success() {
-        if let Some(entry) = parse_neighbor_output(String::from_utf8_lossy(&output.stdout).as_ref(), target) {
+        if let Some(entry) =
+            parse_neighbor_output(String::from_utf8_lossy(&output.stdout).as_ref(), target)
+        {
             return Some(entry);
         }
     }
@@ -3288,10 +3363,28 @@ fn trigger_neighbor_probe(ifname: &str, target: IpAddr) {
     let mut cmd = Command::new("ping");
     match target {
         IpAddr::V4(_) => {
-            cmd.args(["-4", "-c", "1", "-W", "1", "-I", ifname, &target.to_string()]);
+            cmd.args([
+                "-4",
+                "-c",
+                "1",
+                "-W",
+                "1",
+                "-I",
+                ifname,
+                &target.to_string(),
+            ]);
         }
         IpAddr::V6(_) => {
-            cmd.args(["-6", "-c", "1", "-W", "1", "-I", ifname, &target.to_string()]);
+            cmd.args([
+                "-6",
+                "-c",
+                "1",
+                "-W",
+                "1",
+                "-I",
+                ifname,
+                &target.to_string(),
+            ]);
         }
     }
     let _ = cmd.output();
@@ -4931,7 +5024,10 @@ mod tests {
         );
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].0, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
-        assert_eq!(parsed[1].0, IpAddr::V6("2001:559:8585:80::200".parse().expect("ipv6")));
+        assert_eq!(
+            parsed[1].0,
+            IpAddr::V6("2001:559:8585:80::200".parse().expect("ipv6"))
+        );
         assert_eq!(parsed[0].1.mac, [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
         assert_eq!(parsed[1].1.mac, [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
     }
@@ -5030,6 +5126,43 @@ mod tests {
         assert_eq!(reverse.dst_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
         assert_eq!(reverse.src_port, 0x1234);
         assert_eq!(reverse.dst_port, 0);
+    }
+
+    #[test]
+    fn synced_replica_entry_marks_replica_synced() {
+        let entry = SyncedSessionEntry {
+            key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 5201,
+            },
+            decision: SessionDecision {
+                resolution: lookup_forwarding_resolution(
+                    &build_forwarding_state(&nat_snapshot()),
+                    IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                ),
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                    ..NatDecision::default()
+                },
+            },
+            metadata: SessionMetadata {
+                ingress_zone: "lan".to_string(),
+                egress_zone: "wan".to_string(),
+                owner_rg_id: 1,
+                is_reverse: false,
+                synced: false,
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let replica = synced_replica_entry(&entry);
+        assert!(replica.metadata.synced);
+        assert_eq!(replica.key, entry.key);
+        assert_eq!(replica.decision, entry.decision);
     }
 
     #[test]
