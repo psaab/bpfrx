@@ -31,8 +31,9 @@ What the script enforces:
 
 - unsupported userspace configs settle on `xdp_main_prog`
 - userspace forwarding remains disabled on the current HA config
+- `bpfrxd` is reachable before validation samples dataplane state
 - `cluster-userspace-host` has an IPv6 default route from RA
-- if the IPv6 default route is missing, `rdisc6 -1 eth0` is run before tests
+- if the IPv6 default route is missing, repeated `rdisc6 -1 eth0` is run before tests
 - one unmeasured warm-up `iperf3` pass is run for each address family
 - repeated IPv4 `iperf3` to `172.16.80.200` must stay above threshold
 - repeated IPv6 `iperf3` to `2001:559:8585:80::200` must stay above threshold

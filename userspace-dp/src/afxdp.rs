@@ -2089,6 +2089,7 @@ fn resolve_forwarding(
     lookup_forwarding_resolution(state, dst)
 }
 
+#[cfg(test)]
 fn lookup_forwarding_for_ip(state: &ForwardingState, dst: IpAddr) -> ForwardingDisposition {
     lookup_forwarding_resolution(state, dst).disposition
 }

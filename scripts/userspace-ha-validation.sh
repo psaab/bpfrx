@@ -47,6 +47,18 @@ run_fw0() {
 	sg incus-admin -c "incus exec ${FW0} -- bash -lc $(printf %q "$1")"
 }
 
+wait_for_fw0_cli() {
+	local tries=30
+	while (( tries > 0 )); do
+		if run_fw0 'cli -c "show chassis cluster data-plane statistics" >/tmp/userspace-cli-ready.out 2>/dev/null'; then
+			return 0
+		fi
+		sleep 1
+		tries=$((tries - 1))
+	done
+	return 1
+}
+
 wait_for_unsupported_runtime() {
 	local tries=20
 	local prog_check helper_stats
@@ -68,21 +80,34 @@ wait_for_unsupported_runtime() {
 	return 1
 }
 
+wait_for_ipv6_default_route() {
+	local tries=20
+	while (( tries > 0 )); do
+		local route
+		route="$(run_host 'ip -6 route show default || true')"
+		if [[ -n "$route" ]]; then
+			return 0
+		fi
+		run_host 'timeout 8 rdisc6 -1 eth0 >/tmp/userspace-rdisc6.out 2>/dev/null || true'
+		sleep 1
+		tries=$((tries - 1))
+	done
+	return 1
+}
+
 if [[ $DEPLOY -eq 1 ]]; then
 	info "deploying isolated userspace cluster from ${ENV_FILE}"
 	BPFRX_CLUSTER_ENV="$ENV_FILE" "${PROJECT_ROOT}/test/incus/cluster-setup.sh" deploy all
 fi
 
+info "waiting for bpfrxd gRPC/CLI readiness"
+wait_for_fw0_cli || die "fw0 bpfrxd did not become reachable in time"
+
 info "validating unsupported userspace configs stay on legacy XDP"
 wait_for_unsupported_runtime || die "unsupported userspace config did not settle on legacy XDP/runtime state in time"
 
 info "ensuring IPv6 default route via router advertisement"
-route_before="$(run_host 'ip -6 route show default || true')"
-if [[ -z "$route_before" ]]; then
-	run_host 'timeout 8 rdisc6 -1 eth0 >/tmp/userspace-rdisc6.out 2>/dev/null || true'
-fi
-route_after="$(run_host 'ip -6 route show default || true')"
-[[ -n "$route_after" ]] || die "cluster userspace host still has no IPv6 default route after RA solicitation"
+wait_for_ipv6_default_route || die "cluster userspace host still has no IPv6 default route after repeated RA solicitation"
 
 info "basic reachability checks"
 run_host 'ping -c 2 -W 1 172.16.80.200 >/tmp/userspace-ping-v4.out'
