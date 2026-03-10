@@ -33,6 +33,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 	var sessionMisses uint64
 	var sessionCreates uint64
 	var sessionExpires uint64
+	var policyDeniedPackets uint64
 	var snatPackets uint64
 	var dnatPackets uint64
 	var txPackets uint64
@@ -63,6 +64,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 		sessionMisses += binding.SessionMisses
 		sessionCreates += binding.SessionCreates
 		sessionExpires += binding.SessionExpires
+		policyDeniedPackets += binding.PolicyDeniedPackets
 		snatPackets += binding.SNATPackets
 		dnatPackets += binding.DNATPackets
 		txPackets += binding.TXPackets
@@ -130,6 +132,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  Session misses:            %d\n", sessionMisses)
 	fmt.Fprintf(&b, "  Session creates:           %d\n", sessionCreates)
 	fmt.Fprintf(&b, "  Session expires:           %d\n", sessionExpires)
+	fmt.Fprintf(&b, "  Policy denied packets:     %d\n", policyDeniedPackets)
 	fmt.Fprintf(&b, "  SNAT packets:              %d\n", snatPackets)
 	fmt.Fprintf(&b, "  DNAT packets:              %d\n", dnatPackets)
 	fmt.Fprintf(&b, "  TX packets:                %d\n", txPackets)

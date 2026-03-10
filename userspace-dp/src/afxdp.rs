@@ -3,6 +3,7 @@ use super::{
     PacketResolution, SourceNATRuleSnapshot,
 };
 use crate::nat::{NatDecision, SourceNatRule, match_source_nat, parse_source_nat_rules};
+use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
 use crate::session::{SessionDecision, SessionKey, SessionTable};
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus};
 use chrono::Utc;
@@ -184,6 +185,7 @@ impl Coordinator {
             binding.session_misses = 0;
             binding.session_creates = 0;
             binding.session_expires = 0;
+            binding.policy_denied_packets = 0;
             binding.snat_packets = 0;
             binding.dnat_packets = 0;
             binding.slow_path_packets = 0;
@@ -569,6 +571,7 @@ impl Coordinator {
                 binding.session_misses = snap.session_misses;
                 binding.session_creates = snap.session_creates;
                 binding.session_expires = snap.session_expires;
+                binding.policy_denied_packets = snap.policy_denied_packets;
                 binding.snat_packets = snap.snat_packets;
                 binding.dnat_packets = snap.dnat_packets;
                 binding.slow_path_packets = snap.slow_path_packets;
@@ -612,6 +615,7 @@ impl Coordinator {
                 binding.session_misses = 0;
                 binding.session_creates = 0;
                 binding.session_expires = 0;
+                binding.policy_denied_packets = 0;
                 binding.snat_packets = 0;
                 binding.dnat_packets = 0;
                 binding.slow_path_packets = 0;
@@ -673,6 +677,7 @@ struct ForwardingState {
     ifindex_to_name: BTreeMap<i32, String>,
     ifindex_to_zone: BTreeMap<i32, String>,
     egress: BTreeMap<i32, EgressInterface>,
+    policy: PolicyState,
     source_nat_rules: Vec<SourceNatRule>,
 }
 
@@ -726,6 +731,7 @@ struct EgressInterface {
 pub(crate) enum ForwardingDisposition {
     LocalDelivery,
     ForwardCandidate,
+    PolicyDenied,
     NoRoute,
     MissingNeighbor,
     DiscardRoute,
@@ -747,6 +753,7 @@ impl ForwardingResolution {
             disposition: match self.disposition {
                 ForwardingDisposition::LocalDelivery => "local_delivery",
                 ForwardingDisposition::ForwardCandidate => "forward_candidate",
+                ForwardingDisposition::PolicyDenied => "policy_denied",
                 ForwardingDisposition::NoRoute => "no_route",
                 ForwardingDisposition::MissingNeighbor => "missing_neighbor",
                 ForwardingDisposition::DiscardRoute => "discard_route",
@@ -998,47 +1005,57 @@ fn poll_binding(
                             nat: NatDecision::default(),
                         };
                         if resolution.disposition == ForwardingDisposition::ForwardCandidate {
-                            decision.nat = match_source_nat_for_flow(
+                            if let PolicyAction::Permit = match_policy_for_flow(
                                 forwarding,
                                 meta.ingress_ifindex as i32,
                                 resolution.egress_ifindex,
                                 flow,
-                            )
-                            .unwrap_or_default();
-                            let mut created = 0u64;
-                            if sessions.install_with_protocol(
-                                flow.forward_key.clone(),
-                                decision,
-                                now,
-                                meta.protocol,
-                                meta.tcp_flags,
                             ) {
-                                created += 1;
-                            }
-                            let reverse_resolution =
-                                lookup_forwarding_resolution(forwarding, flow.src_ip);
-                            if reverse_resolution.disposition
-                                == ForwardingDisposition::ForwardCandidate
-                            {
-                                let reverse_decision = SessionDecision {
-                                    resolution: reverse_resolution,
-                                    nat: decision.nat.reverse(flow.src_ip, flow.dst_ip),
-                                };
+                                decision.nat = match_source_nat_for_flow(
+                                    forwarding,
+                                    meta.ingress_ifindex as i32,
+                                    resolution.egress_ifindex,
+                                    flow,
+                                )
+                                .unwrap_or_default();
+                                let mut created = 0u64;
                                 if sessions.install_with_protocol(
-                                    flow.reverse_key_with_nat(decision.nat),
-                                    reverse_decision,
+                                    flow.forward_key.clone(),
+                                    decision,
                                     now,
                                     meta.protocol,
                                     meta.tcp_flags,
                                 ) {
                                     created += 1;
                                 }
-                            }
-                            if created > 0 {
-                                binding
-                                    .live
-                                    .session_creates
-                                    .fetch_add(created, Ordering::Relaxed);
+                                let reverse_resolution =
+                                    lookup_forwarding_resolution(forwarding, flow.src_ip);
+                                if reverse_resolution.disposition
+                                    == ForwardingDisposition::ForwardCandidate
+                                {
+                                    let reverse_decision = SessionDecision {
+                                        resolution: reverse_resolution,
+                                        nat: decision.nat.reverse(flow.src_ip, flow.dst_ip),
+                                    };
+                                    if sessions.install_with_protocol(
+                                        flow.reverse_key_with_nat(decision.nat),
+                                        reverse_decision,
+                                        now,
+                                        meta.protocol,
+                                        meta.tcp_flags,
+                                    ) {
+                                        created += 1;
+                                    }
+                                }
+                                if created > 0 {
+                                    binding
+                                        .live
+                                        .session_creates
+                                        .fetch_add(created, Ordering::Relaxed);
+                                }
+                            } else {
+                                decision.resolution.disposition =
+                                    ForwardingDisposition::PolicyDenied;
                             }
                         }
                         decision
@@ -1550,6 +1567,16 @@ fn record_forwarding_disposition(
             live.forward_candidate_packets
                 .fetch_add(1, Ordering::Relaxed);
         }
+        ForwardingDisposition::PolicyDenied => {
+            live.policy_denied_packets.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "policy_denied",
+                packet_length,
+                meta,
+            );
+        }
         ForwardingDisposition::NoRoute => {
             live.route_miss_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(recent_exceptions, binding, "no_route", packet_length, meta);
@@ -1906,6 +1933,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             .neighbors
             .insert((neigh.ifindex, ip), NeighborEntry { mac });
     }
+    state.policy = parse_policy_state(&snapshot.default_policy, &snapshot.policies);
     state.source_nat_rules = parse_source_nat_rules(&snapshot.source_nat_rules);
     state
 }
@@ -2160,6 +2188,31 @@ fn match_source_nat_for_flow(
         flow.dst_ip,
         egress.primary_v4,
         egress.primary_v6,
+    )
+}
+
+fn match_policy_for_flow(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    egress_ifindex: i32,
+    flow: &SessionFlow,
+) -> PolicyAction {
+    let from_zone = forwarding
+        .ifindex_to_zone
+        .get(&ingress_ifindex)
+        .map(|zone| zone.as_str())
+        .unwrap_or("");
+    let to_zone = forwarding
+        .egress
+        .get(&egress_ifindex)
+        .map(|iface| iface.zone.as_str())
+        .unwrap_or("");
+    evaluate_policy(
+        &forwarding.policy,
+        from_zone,
+        to_zone,
+        flow.src_ip,
+        flow.dst_ip,
     )
 }
 
@@ -3035,6 +3088,7 @@ struct BindingLiveState {
     session_misses: AtomicU64,
     session_creates: AtomicU64,
     session_expires: AtomicU64,
+    policy_denied_packets: AtomicU64,
     snat_packets: AtomicU64,
     dnat_packets: AtomicU64,
     slow_path_packets: AtomicU64,
@@ -3079,6 +3133,7 @@ impl BindingLiveState {
             session_misses: AtomicU64::new(0),
             session_creates: AtomicU64::new(0),
             session_expires: AtomicU64::new(0),
+            policy_denied_packets: AtomicU64::new(0),
             snat_packets: AtomicU64::new(0),
             dnat_packets: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
@@ -3148,6 +3203,7 @@ impl BindingLiveState {
             session_misses: self.session_misses.load(Ordering::Relaxed),
             session_creates: self.session_creates.load(Ordering::Relaxed),
             session_expires: self.session_expires.load(Ordering::Relaxed),
+            policy_denied_packets: self.policy_denied_packets.load(Ordering::Relaxed),
             snat_packets: self.snat_packets.load(Ordering::Relaxed),
             dnat_packets: self.dnat_packets.load(Ordering::Relaxed),
             slow_path_packets: self.slow_path_packets.load(Ordering::Relaxed),
@@ -3212,6 +3268,7 @@ struct BindingLiveSnapshot {
     session_misses: u64,
     session_creates: u64,
     session_expires: u64,
+    policy_denied_packets: u64,
     snat_packets: u64,
     dnat_packets: u64,
     slow_path_packets: u64,
@@ -3230,7 +3287,10 @@ struct BindingLiveSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InterfaceAddressSnapshot, InterfaceSnapshot, NeighborSnapshot, RouteSnapshot};
+    use crate::{
+        InterfaceAddressSnapshot, InterfaceSnapshot, NeighborSnapshot, PolicyRuleSnapshot,
+        RouteSnapshot,
+    };
 
     fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
         ConfigSnapshot {
@@ -3492,6 +3552,16 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            default_policy: "deny".to_string(),
+            policies: vec![PolicyRuleSnapshot {
+                name: "allow-all".to_string(),
+                from_zone: "lan".to_string(),
+                to_zone: "wan".to_string(),
+                source_addresses: vec!["any".to_string()],
+                destination_addresses: vec!["any".to_string()],
+                applications: vec!["any".to_string()],
+                action: "permit".to_string(),
+            }],
             neighbors: vec![
                 NeighborSnapshot {
                     interface: "ge-0-0-0.80".to_string(),
@@ -3514,6 +3584,46 @@ mod tests {
                     link_local: false,
                 },
             ],
+            ..Default::default()
+        }
+    }
+
+    fn policy_deny_snapshot() -> ConfigSnapshot {
+        ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "reth1.0".to_string(),
+                    zone: "lan".to_string(),
+                    linux_name: "ge-0-0-1".to_string(),
+                    ifindex: 24,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "reth0.80".to_string(),
+                    zone: "wan".to_string(),
+                    linux_name: "ge-0-0-0.80".to_string(),
+                    ifindex: 12,
+                    parent_ifindex: 11,
+                    vlan_id: 80,
+                    hardware_addr: "02:bf:72:00:80:08".to_string(),
+                    addresses: vec![InterfaceAddressSnapshot {
+                        family: "inet".to_string(),
+                        address: "172.16.80.8/24".to_string(),
+                        scope: 0,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            default_policy: "deny".to_string(),
+            policies: vec![PolicyRuleSnapshot {
+                name: "allow-other".to_string(),
+                from_zone: "dmz".to_string(),
+                to_zone: "wan".to_string(),
+                source_addresses: vec!["any".to_string()],
+                destination_addresses: vec!["any".to_string()],
+                applications: vec!["any".to_string()],
+                action: "permit".to_string(),
+            }],
             ..Default::default()
         }
     }
@@ -3663,6 +3773,48 @@ mod tests {
                 rewrite_src: Some("2001:559:8585:80::8".parse().expect("snat")),
                 rewrite_dst: None,
             })
+        );
+    }
+
+    #[test]
+    fn policy_selection_permits_matching_zone_pair() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let flow = SessionFlow {
+            src_ip: "10.0.61.102".parse().expect("src"),
+            dst_ip: "172.16.80.200".parse().expect("dst"),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: "10.0.61.102".parse().expect("src"),
+                dst_ip: "172.16.80.200".parse().expect("dst"),
+                src_port: 12345,
+                dst_port: 5201,
+            },
+        };
+        assert_eq!(
+            match_policy_for_flow(&state, 24, 12, &flow),
+            PolicyAction::Permit
+        );
+    }
+
+    #[test]
+    fn policy_selection_denies_on_default_policy() {
+        let state = build_forwarding_state(&policy_deny_snapshot());
+        let flow = SessionFlow {
+            src_ip: "10.0.61.102".parse().expect("src"),
+            dst_ip: "172.16.80.200".parse().expect("dst"),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: "10.0.61.102".parse().expect("src"),
+                dst_ip: "172.16.80.200".parse().expect("dst"),
+                src_port: 12345,
+                dst_port: 5201,
+            },
+        };
+        assert_eq!(
+            match_policy_for_flow(&state, 24, 12, &flow),
+            PolicyAction::Deny
         );
     }
 

@@ -34,7 +34,20 @@ func TestBuildSnapshotSummary(t *testing.T) {
 		"trust":   {Name: "trust", Interfaces: []string{"ge-0/0/1"}},
 		"untrust": {Name: "untrust", Interfaces: []string{"ge-0/0/0"}},
 	}
-	cfg.Security.Policies = []*config.ZonePairPolicies{{FromZone: "trust", ToZone: "untrust"}}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "trust",
+		ToZone:   "untrust",
+		Policies: []*config.Policy{{
+			Name: "allow-all",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"any"},
+			},
+			Action: config.PolicyPermit,
+		}},
+	}}
+	cfg.Security.DefaultPolicy = config.PolicyDeny
 	cfg.Security.NAT.Source = []*config.NATRuleSet{{
 		Name:     "src",
 		FromZone: "trust",
@@ -117,6 +130,15 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	if !snap.SourceNAT[0].InterfaceMode || snap.SourceNAT[0].FromZone != "trust" || snap.SourceNAT[0].ToZone != "untrust" {
 		t.Fatalf("SourceNAT[0] = %+v", snap.SourceNAT[0])
 	}
+	if snap.DefaultPolicy != "deny" {
+		t.Fatalf("DefaultPolicy = %q, want deny", snap.DefaultPolicy)
+	}
+	if len(snap.Policies) != 1 {
+		t.Fatalf("len(Policies) = %d, want 1", len(snap.Policies))
+	}
+	if snap.Policies[0].Action != "deny" && snap.Policies[0].Action != "permit" {
+		t.Fatalf("Policies[0].Action = %q", snap.Policies[0].Action)
+	}
 }
 
 func TestBuildLocalAddressEntries(t *testing.T) {
@@ -161,6 +183,35 @@ func TestDeriveUserspaceCapabilitiesDetectsFirewallFeatures(t *testing.T) {
 	}
 	if len(caps.UnsupportedReasons) < 5 {
 		t.Fatalf("UnsupportedReasons = %+v, want multiple reasons", caps.UnsupportedReasons)
+	}
+}
+
+func TestUserspaceSupportsSimpleZonePolicies(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.DefaultPolicy = config.PolicyDeny
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust":   {Name: "trust", Interfaces: []string{"reth1"}},
+		"untrust": {Name: "untrust", Interfaces: []string{"reth0.80"}},
+	}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "trust",
+		ToZone:   "untrust",
+		Policies: []*config.Policy{{
+			Name: "allow-all",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"any"},
+			},
+			Action: config.PolicyPermit,
+		}},
+	}}
+	if !userspaceSupportsSecurityPolicies(cfg) {
+		t.Fatal("userspaceSupportsSecurityPolicies = false, want true")
+	}
+	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if snap.DefaultPolicy != "deny" || len(snap.Policies) != 1 || snap.Policies[0].Action != "permit" {
+		t.Fatalf("unexpected policy snapshot: %+v", snap.Policies)
 	}
 }
 

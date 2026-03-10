@@ -37,6 +37,8 @@ type ConfigSnapshot struct {
 	Interfaces    []InterfaceSnapshot     `json:"interfaces,omitempty"`
 	Neighbors     []NeighborSnapshot      `json:"neighbors,omitempty"`
 	Routes        []RouteSnapshot         `json:"routes,omitempty"`
+	DefaultPolicy string                  `json:"default_policy,omitempty"`
+	Policies      []PolicyRuleSnapshot    `json:"policies,omitempty"`
 	SourceNAT     []SourceNATRuleSnapshot `json:"source_nat_rules,omitempty"`
 	Config        *config.Config          `json:"config,omitempty"`
 	Userspace     config.UserspaceConfig  `json:"userspace"`
@@ -79,6 +81,16 @@ type SourceNATRuleSnapshot struct {
 	InterfaceMode        bool     `json:"interface_mode,omitempty"`
 	Off                  bool     `json:"off,omitempty"`
 	PoolName             string   `json:"pool_name,omitempty"`
+}
+
+type PolicyRuleSnapshot struct {
+	Name                 string   `json:"name"`
+	FromZone             string   `json:"from_zone,omitempty"`
+	ToZone               string   `json:"to_zone,omitempty"`
+	SourceAddresses      []string `json:"source_addresses,omitempty"`
+	DestinationAddresses []string `json:"destination_addresses,omitempty"`
+	Applications         []string `json:"applications,omitempty"`
+	Action               string   `json:"action,omitempty"`
 }
 
 type InterfaceAddressSnapshot struct {
@@ -233,6 +245,7 @@ type BindingStatus struct {
 	SessionMisses        uint64    `json:"session_misses,omitempty"`
 	SessionCreates       uint64    `json:"session_creates,omitempty"`
 	SessionExpires       uint64    `json:"session_expires,omitempty"`
+	PolicyDeniedPackets  uint64    `json:"policy_denied_packets,omitempty"`
 	SNATPackets          uint64    `json:"snat_packets,omitempty"`
 	DNATPackets          uint64    `json:"dnat_packets,omitempty"`
 	SlowPathPackets      uint64    `json:"slow_path_packets,omitempty"`

@@ -148,8 +148,8 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	if cfg.Chassis.Cluster != nil {
 		addReason("HA cluster ownership and fabric redirect are not implemented in the userspace dataplane")
 	}
-	if len(cfg.Security.Zones) > 0 || len(cfg.Security.Policies) > 0 || len(cfg.Security.GlobalPolicies) > 0 {
-		addReason("security zones and policies still require the existing flow dataplane")
+	if !userspaceSupportsSecurityPolicies(cfg) {
+		addReason("full security policy semantics are not implemented in the userspace dataplane")
 	}
 	if !userspaceSupportsSourceNAT(cfg.Security.NAT.Source) ||
 		(cfg.Security.NAT.Destination != nil && len(cfg.Security.NAT.Destination.RuleSets) > 0) ||
@@ -204,6 +204,65 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	return caps
 }
 
+func userspaceSupportsSecurityPolicies(cfg *config.Config) bool {
+	if cfg == nil {
+		return true
+	}
+	if len(cfg.Security.GlobalPolicies) > 0 {
+		return false
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol == nil {
+				continue
+			}
+			if pol.SchedulerName != "" || pol.Count {
+				return false
+			}
+			if !userspacePolicyAddressesSupported(pol.Match.SourceAddresses) ||
+				!userspacePolicyAddressesSupported(pol.Match.DestinationAddresses) ||
+				!userspacePolicyApplicationsSupported(pol.Match.Applications) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func userspacePolicyAddressesSupported(addrs []string) bool {
+	if len(addrs) == 0 {
+		return true
+	}
+	for _, addr := range addrs {
+		if addr == "" || addr == "any" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(addr); err == nil {
+			continue
+		}
+		if ip := net.ParseIP(addr); ip != nil {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func userspacePolicyApplicationsSupported(apps []string) bool {
+	if len(apps) == 0 {
+		return true
+	}
+	for _, app := range apps {
+		if app != "" && app != "any" {
+			return false
+		}
+	}
+	return true
+}
+
 func userspaceSupportsSourceNAT(ruleSets []*config.NATRuleSet) bool {
 	for _, rs := range ruleSets {
 		if rs == nil {
@@ -246,6 +305,8 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		Interfaces:    buildInterfaceSnapshots(cfg),
 		Neighbors:     buildNeighborSnapshots(cfg),
 		Routes:        buildRouteSnapshots(cfg),
+		DefaultPolicy: policyActionString(cfg.Security.DefaultPolicy),
+		Policies:      buildPolicySnapshots(cfg),
 		SourceNAT:     buildSourceNATSnapshots(cfg),
 		Config:        cfg,
 		Summary: SnapshotSummary{
@@ -383,6 +444,22 @@ func buildInterfaceZoneMap(cfg *config.Config) map[string]string {
 			}
 			if _, exists := out[iface]; !exists {
 				out[iface] = zoneName
+			}
+			if base, unit, ok := strings.Cut(iface, "."); ok && base != "" {
+				if _, exists := out[base]; !exists {
+					out[base] = zoneName
+				}
+				if unit != "" {
+					continue
+				}
+			}
+			if ifCfg := cfg.Interfaces.Interfaces[iface]; ifCfg != nil {
+				for unitNum := range ifCfg.Units {
+					unitName := fmt.Sprintf("%s.%d", iface, unitNum)
+					if _, exists := out[unitName]; !exists {
+						out[unitName] = zoneName
+					}
+				}
 			}
 		}
 	}
@@ -646,6 +723,44 @@ func buildSourceNATSnapshots(cfg *config.Config) []SourceNATRuleSnapshot {
 		}
 	}
 	return out
+}
+
+func buildPolicySnapshots(cfg *config.Config) []PolicyRuleSnapshot {
+	if cfg == nil || len(cfg.Security.Policies) == 0 {
+		return nil
+	}
+	out := make([]PolicyRuleSnapshot, 0)
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol == nil {
+				continue
+			}
+			out = append(out, PolicyRuleSnapshot{
+				Name:                 pol.Name,
+				FromZone:             zpp.FromZone,
+				ToZone:               zpp.ToZone,
+				SourceAddresses:      append([]string(nil), pol.Match.SourceAddresses...),
+				DestinationAddresses: append([]string(nil), pol.Match.DestinationAddresses...),
+				Applications:         append([]string(nil), pol.Match.Applications...),
+				Action:               policyActionString(pol.Action),
+			})
+		}
+	}
+	return out
+}
+
+func policyActionString(action config.PolicyAction) string {
+	switch action {
+	case config.PolicyPermit:
+		return "permit"
+	case config.PolicyReject:
+		return "reject"
+	default:
+		return "deny"
+	}
 }
 
 func buildNeighborSnapshots(cfg *config.Config) []NeighborSnapshot {

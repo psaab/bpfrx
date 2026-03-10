@@ -740,12 +740,15 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
 - the Rust helper now has a first worker-local NAT slice for interface-mode source NAT:
   ordered source-NAT rule snapshots, ingress/egress zone matching, per-session NAT
   decisions, forward-path SNAT rewrite, and reverse-path reply DNAT rewrite
+- the Rust helper now has a first worker-local zone-policy slice:
+  ordered zone-pair policy snapshots, default-policy handling, `any`/literal-CIDR
+  source and destination matching, and per-session permit/deny gating before install
 
 What is still intentionally not implemented:
 
 - live packet redirect enablement for production traffic
-- policy-aware userspace forwarding
-- worker-local policy state
+- full policy parity: address-book resolution, application matching, global policies,
+  schedulers, counters, and logging semantics
 - shared-memory snapshot regions
 - io_uring-backed slow-path transport beyond bounded TUN reinjection
 
@@ -854,12 +857,16 @@ Implemented today:
 - interface-mode source NAT rule snapshots from the Go control plane
 - per-session NAT decisions and reply-direction key installation
 - source and destination IP rewrite on the Rust fast path for interface-mode source NAT
+- zone-pair policy snapshots from the Go control plane
+- default-policy permit/deny behavior in the Rust worker
+- per-flow zone policy evaluation before session create/install
 
 Not implemented yet:
-- policy-aware session create/deny
 - HA/session-sync export from worker-local state
 - worker-local timer wheels or batched expiry structures beyond lazy GC
 - full NAT parity: destination NAT, static NAT, NAT64, NATv6v4, and pool-based source NAT
+- full policy parity: address-books, applications/AppID, global policies, counters,
+  reject semantics, and logging
 
 ## Phase 5: Use io_uring for the non-AF_XDP parts
 

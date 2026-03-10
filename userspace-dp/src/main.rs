@@ -1,5 +1,6 @@
 mod afxdp;
 mod nat;
+mod policy;
 mod session;
 mod slowpath;
 mod state_writer;
@@ -128,6 +129,10 @@ struct ConfigSnapshot {
     neighbors: Vec<NeighborSnapshot>,
     #[serde(default)]
     routes: Vec<RouteSnapshot>,
+    #[serde(rename = "default_policy", default)]
+    default_policy: String,
+    #[serde(default)]
+    policies: Vec<PolicyRuleSnapshot>,
     #[serde(rename = "source_nat_rules", default)]
     source_nat_rules: Vec<SourceNATRuleSnapshot>,
     #[serde(default)]
@@ -153,6 +158,23 @@ struct SourceNATRuleSnapshot {
     off: bool,
     #[serde(rename = "pool_name", default)]
     pool_name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct PolicyRuleSnapshot {
+    name: String,
+    #[serde(rename = "from_zone", default)]
+    from_zone: String,
+    #[serde(rename = "to_zone", default)]
+    to_zone: String,
+    #[serde(rename = "source_addresses", default)]
+    source_addresses: Vec<String>,
+    #[serde(rename = "destination_addresses", default)]
+    destination_addresses: Vec<String>,
+    #[serde(default)]
+    applications: Vec<String>,
+    #[serde(default)]
+    action: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -442,6 +464,8 @@ struct BindingStatus {
     session_creates: u64,
     #[serde(rename = "session_expires", default)]
     session_expires: u64,
+    #[serde(rename = "policy_denied_packets", default)]
+    policy_denied_packets: u64,
     #[serde(rename = "snat_packets", default)]
     snat_packets: u64,
     #[serde(rename = "dnat_packets", default)]
