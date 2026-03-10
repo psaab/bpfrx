@@ -277,7 +277,7 @@ run_iperf_json() {
 
 parse_gbps() {
 	local path="$1"
-	if [[ "$(run_host "test -s ${path}; echo $?")" != "0" ]]; then
+	if ! run_host "[ -s ${path} ]" >/dev/null 2>&1; then
 		local err
 		err="$(run_host "cat ${path}.err 2>/dev/null || true")"
 		if [[ -z "$err" ]]; then
