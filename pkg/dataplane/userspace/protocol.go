@@ -315,6 +315,7 @@ type SessionDeltaInfo struct {
 	DstPort       uint16    `json:"dst_port,omitempty"`
 	IngressZone   string    `json:"ingress_zone,omitempty"`
 	EgressZone    string    `json:"egress_zone,omitempty"`
+	OwnerRGID     int       `json:"owner_rg_id,omitempty"`
 	EgressIfindex int       `json:"egress_ifindex,omitempty"`
 	NextHop       string    `json:"next_hop,omitempty"`
 	NATSrcIP      string    `json:"nat_src_ip,omitempty"`

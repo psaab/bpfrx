@@ -2909,6 +2909,13 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	return key, val, true
 }
 
+func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, ingressZone uint16) bool {
+	if delta.OwnerRGID > 0 && d.sessionSync != nil && d.sessionSync.IsPrimaryForRGFn != nil {
+		return d.sessionSync.IsPrimaryForRGFn(delta.OwnerRGID)
+	}
+	return d.sessionSync != nil && d.sessionSync.ShouldSyncZone(ingressZone)
+}
+
 // buildZoneRGMap builds a zone_id→RG mapping by looking up which interfaces
 // belong to each zone, then checking those interfaces' RedundancyGroup.
 // Zones with RETH interfaces inherit the RETH's RG; non-RETH zones are not
@@ -2998,13 +3005,13 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 				switch delta.AddrFamily {
 				case dataplane.AFInet:
 					key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
-					if !ok || !d.sessionSync.ShouldSyncZone(val.IngressZone) {
+					if !ok || !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
 						continue
 					}
 					d.sessionSync.QueueSessionV4(key, val)
 				case dataplane.AFInet6:
 					key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
-					if !ok || !d.sessionSync.ShouldSyncZone(val.IngressZone) {
+					if !ok || !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
 						continue
 					}
 					d.sessionSync.QueueSessionV6(key, val)
@@ -3012,13 +3019,13 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 			case "close":
 				switch delta.AddrFamily {
 				case dataplane.AFInet:
-					key, _, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
-					if ok {
+					key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
+					if ok && d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
 						d.sessionSync.QueueDeleteV4(key)
 					}
 				case dataplane.AFInet6:
-					key, _, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
-					if ok {
+					key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
+					if ok && d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
 						d.sessionSync.QueueDeleteV6(key)
 					}
 				}

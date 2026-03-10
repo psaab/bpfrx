@@ -752,6 +752,7 @@ struct EgressInterface {
     vlan_id: u16,
     src_mac: [u8; 6],
     zone: String,
+    redundancy_group: i32,
     primary_v4: Option<Ipv4Addr>,
     primary_v6: Option<Ipv6Addr>,
 }
@@ -1040,6 +1041,8 @@ fn poll_binding(
                                 meta.ingress_ifindex as i32,
                                 resolution.egress_ifindex,
                             );
+                            let owner_rg_id =
+                                owner_rg_for_flow(forwarding, resolution.egress_ifindex);
                             if let PolicyAction::Permit = evaluate_policy(
                                 &forwarding.policy,
                                 &from_zone,
@@ -1062,6 +1065,7 @@ fn poll_binding(
                                     SessionMetadata {
                                         ingress_zone: from_zone.clone(),
                                         egress_zone: to_zone.clone(),
+                                        owner_rg_id,
                                         is_reverse: false,
                                     },
                                     now,
@@ -1085,6 +1089,7 @@ fn poll_binding(
                                         SessionMetadata {
                                             ingress_zone: to_zone.clone(),
                                             egress_zone: from_zone.clone(),
+                                            owner_rg_id,
                                             is_reverse: true,
                                         },
                                         now,
@@ -1465,6 +1470,7 @@ fn flush_session_deltas(
             dst_port: delta.key.dst_port,
             ingress_zone: delta.metadata.ingress_zone,
             egress_zone: delta.metadata.egress_zone,
+            owner_rg_id: delta.metadata.owner_rg_id,
             egress_ifindex: delta.decision.resolution.egress_ifindex,
             next_hop: delta
                 .decision
@@ -1966,6 +1972,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                 vlan_id: iface.vlan_id.max(0) as u16,
                 src_mac,
                 zone: iface.zone.clone(),
+                redundancy_group: iface.redundancy_group,
                 primary_v4: pick_interface_v4(iface),
                 primary_v6: pick_interface_v6(iface),
             },
@@ -2298,6 +2305,14 @@ fn zone_pair_for_flow(
         .map(|iface| iface.zone.clone())
         .unwrap_or_default();
     (from_zone, to_zone)
+}
+
+fn owner_rg_for_flow(forwarding: &ForwardingState, egress_ifindex: i32) -> i32 {
+    forwarding
+        .egress
+        .get(&egress_ifindex)
+        .map(|iface| iface.redundancy_group.max(0))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

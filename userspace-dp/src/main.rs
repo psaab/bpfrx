@@ -595,6 +595,8 @@ struct SessionDeltaInfo {
     ingress_zone: String,
     #[serde(rename = "egress_zone", default)]
     egress_zone: String,
+    #[serde(rename = "owner_rg_id", default)]
+    owner_rg_id: i32,
     #[serde(rename = "egress_ifindex", default)]
     egress_ifindex: i32,
     #[serde(rename = "next_hop", default)]

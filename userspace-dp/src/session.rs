@@ -47,6 +47,7 @@ pub(crate) struct SessionDecision {
 pub(crate) struct SessionMetadata {
     pub(crate) ingress_zone: String,
     pub(crate) egress_zone: String,
+    pub(crate) owner_rg_id: i32,
     pub(crate) is_reverse: bool,
 }
 
@@ -267,6 +268,7 @@ mod tests {
         SessionMetadata {
             ingress_zone: "lan".to_string(),
             egress_zone: "wan".to_string(),
+            owner_rg_id: 1,
             is_reverse: false,
         }
     }

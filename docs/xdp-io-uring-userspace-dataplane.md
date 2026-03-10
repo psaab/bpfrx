@@ -855,7 +855,9 @@ Implemented today:
 - bidirectional session key installation
 - lazy expiry and session counters in helper status
 - bounded worker-local session delta journals with drainable control-plane export
+- owner RG tagging on worker-local session deltas from the resolved egress interface
 - Go-side bridge from worker-local session deltas into the existing HA/session-sync transport
+- owner-aware HA/session-sync export that prefers RG ownership over pure zone fallback
 - interface-mode source NAT rule snapshots from the Go control plane
 - per-session NAT decisions and reply-direction key installation
 - source and destination IP rewrite on the Rust fast path for interface-mode source NAT
