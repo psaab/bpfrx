@@ -1,6 +1,6 @@
 use super::{
-    BindingStatus, ConfigSnapshot, ExceptionStatus, InjectPacketRequest, InterfaceSnapshot,
-    PacketResolution, SessionDeltaInfo,
+    BindingStatus, ConfigSnapshot, ExceptionStatus, HAGroupStatus, InjectPacketRequest,
+    InterfaceSnapshot, PacketResolution, SessionDeltaInfo,
 };
 use crate::nat::{NatDecision, SourceNatRule, match_source_nat, parse_source_nat_rules};
 use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
@@ -39,6 +39,7 @@ const MAX_PENDING_SESSION_DELTAS: usize = 4096;
 const BIND_RETRY_ATTEMPTS: usize = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
+const HA_WATCHDOG_STALE_AFTER_SECS: u64 = 2;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const PROTO_ICMP: u8 = 1;
@@ -76,6 +77,7 @@ pub struct Coordinator {
     heartbeat_map_fd: Option<OwnedFd>,
     slow_path: Option<Arc<SlowPathReinjector>>,
     last_slow_path_status: SlowPathStatus,
+    ha_state: Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
@@ -96,6 +98,7 @@ impl Coordinator {
             heartbeat_map_fd: None,
             slow_path: None,
             last_slow_path_status: SlowPathStatus::default(),
+            ha_state: Arc::new(Mutex::new(BTreeMap::new())),
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
@@ -326,6 +329,7 @@ impl Coordinator {
             let heartbeat_clone = heartbeat.clone();
             let validation = self.validation;
             let forwarding = forwarding.clone();
+            let ha_state = self.ha_state.clone();
             let join = thread::Builder::new()
                 .name(format!("bpfrx-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -334,6 +338,7 @@ impl Coordinator {
                         binding_plans,
                         validation,
                         forwarding,
+                        ha_state,
                         slow_path,
                         recent_exceptions,
                         last_resolution,
@@ -419,6 +424,37 @@ impl Coordinator {
         out
     }
 
+    pub fn update_ha_state(&self, groups: &[HAGroupStatus]) {
+        if let Ok(mut state) = self.ha_state.lock() {
+            state.clear();
+            for group in groups {
+                state.insert(
+                    group.rg_id,
+                    HAGroupRuntime {
+                        active: group.active,
+                        watchdog_timestamp: group.watchdog_timestamp,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn ha_groups(&self) -> Vec<HAGroupStatus> {
+        self.ha_state
+            .lock()
+            .map(|state| {
+                state
+                    .iter()
+                    .map(|(rg_id, runtime)| HAGroupStatus {
+                        rg_id: *rg_id,
+                        active: runtime.active,
+                        watchdog_timestamp: runtime.watchdog_timestamp,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn worker_heartbeats(&self) -> Vec<chrono::DateTime<Utc>> {
         self.workers
             .iter()
@@ -488,7 +524,11 @@ impl Coordinator {
             );
             if disposition == PacketDisposition::Valid && !req.destination_ip.is_empty() {
                 if let Ok(dst) = req.destination_ip.parse::<IpAddr>() {
-                    let resolution = lookup_forwarding_resolution(&self.forwarding, dst);
+                    let resolution = enforce_ha_resolution(
+                        &self.forwarding,
+                        &self.ha_state,
+                        lookup_forwarding_resolution(&self.forwarding, dst),
+                    );
                     record_forwarding_disposition(
                         &ident,
                         live,
@@ -710,6 +750,12 @@ struct ForwardingState {
     source_nat_rules: Vec<SourceNatRule>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct HAGroupRuntime {
+    active: bool,
+    watchdog_timestamp: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ConnectedRouteV4 {
     prefix: Ipv4Net,
@@ -761,6 +807,7 @@ struct EgressInterface {
 pub(crate) enum ForwardingDisposition {
     LocalDelivery,
     ForwardCandidate,
+    HAInactive,
     PolicyDenied,
     NoRoute,
     MissingNeighbor,
@@ -783,6 +830,7 @@ impl ForwardingResolution {
             disposition: match self.disposition {
                 ForwardingDisposition::LocalDelivery => "local_delivery",
                 ForwardingDisposition::ForwardCandidate => "forward_candidate",
+                ForwardingDisposition::HAInactive => "ha_inactive",
                 ForwardingDisposition::PolicyDenied => "policy_denied",
                 ForwardingDisposition::NoRoute => "no_route",
                 ForwardingDisposition::MissingNeighbor => "missing_neighbor",
@@ -967,6 +1015,7 @@ fn poll_binding(
     sessions: &mut SessionTable,
     validation: ValidationState,
     forwarding: &ForwardingState,
+    ha_state: &Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
@@ -1030,7 +1079,11 @@ fn poll_binding(
                         hit
                     } else {
                         binding.live.session_misses.fetch_add(1, Ordering::Relaxed);
-                        let resolution = lookup_forwarding_resolution(forwarding, flow.dst_ip);
+                        let resolution = enforce_ha_resolution(
+                            forwarding,
+                            ha_state,
+                            lookup_forwarding_resolution(forwarding, flow.dst_ip),
+                        );
                         let mut decision = SessionDecision {
                             resolution,
                             nat: NatDecision::default(),
@@ -1074,8 +1127,11 @@ fn poll_binding(
                                 ) {
                                     created += 1;
                                 }
-                                let reverse_resolution =
-                                    lookup_forwarding_resolution(forwarding, flow.src_ip);
+                                let reverse_resolution = enforce_ha_resolution(
+                                    forwarding,
+                                    ha_state,
+                                    lookup_forwarding_resolution(forwarding, flow.src_ip),
+                                );
                                 if reverse_resolution.disposition
                                     == ForwardingDisposition::ForwardCandidate
                                 {
@@ -1114,7 +1170,11 @@ fn poll_binding(
                     }
                 } else {
                     SessionDecision {
-                        resolution: resolve_forwarding(&binding.area, desc, meta, forwarding),
+                        resolution: enforce_ha_resolution(
+                            forwarding,
+                            ha_state,
+                            resolve_forwarding(&binding.area, desc, meta, forwarding),
+                        ),
                         nat: NatDecision::default(),
                     }
                 };
@@ -1673,6 +1733,16 @@ fn record_forwarding_disposition(
             live.forward_candidate_packets
                 .fetch_add(1, Ordering::Relaxed);
         }
+        ForwardingDisposition::HAInactive => {
+            live.exception_packets.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "ha_inactive",
+                packet_length,
+                meta,
+            );
+        }
         ForwardingDisposition::PolicyDenied => {
             live.policy_denied_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
@@ -1725,6 +1795,7 @@ fn worker_loop(
     binding_plans: Vec<BindingPlan>,
     validation: ValidationState,
     forwarding: Arc<ForwardingState>,
+    ha_state: Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
     slow_path: Option<Arc<SlowPathReinjector>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: Arc<Mutex<Option<PacketResolution>>>,
@@ -1758,6 +1829,7 @@ fn worker_loop(
                 &mut sessions,
                 validation,
                 &forwarding,
+                &ha_state,
                 slow_path.as_ref(),
                 &recent_exceptions,
                 &last_resolution,
@@ -2313,6 +2385,49 @@ fn owner_rg_for_flow(forwarding: &ForwardingState, egress_ifindex: i32) -> i32 {
         .get(&egress_ifindex)
         .map(|iface| iface.redundancy_group.max(0))
         .unwrap_or_default()
+}
+
+fn enforce_ha_resolution(
+    forwarding: &ForwardingState,
+    ha_state: &Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
+    resolution: ForwardingResolution,
+) -> ForwardingResolution {
+    if resolution.disposition != ForwardingDisposition::ForwardCandidate {
+        return resolution;
+    }
+    let owner_rg_id = owner_rg_for_flow(forwarding, resolution.egress_ifindex);
+    if owner_rg_id <= 0 {
+        return resolution;
+    }
+    let Ok(state) = ha_state.lock() else {
+        return ForwardingResolution {
+            disposition: ForwardingDisposition::HAInactive,
+            ..resolution
+        };
+    };
+    let Some(group) = state.get(&owner_rg_id) else {
+        return ForwardingResolution {
+            disposition: ForwardingDisposition::HAInactive,
+            ..resolution
+        };
+    };
+    if !group.active {
+        return ForwardingResolution {
+            disposition: ForwardingDisposition::HAInactive,
+            ..resolution
+        };
+    }
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    if group.watchdog_timestamp == 0
+        || now_secs < group.watchdog_timestamp
+        || now_secs.saturating_sub(group.watchdog_timestamp) > HA_WATCHDOG_STALE_AFTER_SECS
+    {
+        return ForwardingResolution {
+            disposition: ForwardingDisposition::HAInactive,
+            ..resolution
+        };
+    }
+    resolution
 }
 
 #[cfg(test)]
@@ -3633,6 +3748,7 @@ mod tests {
                     zone: "lan".to_string(),
                     linux_name: "ge-0-0-1".to_string(),
                     ifindex: 24,
+                    redundancy_group: 2,
                     hardware_addr: "02:bf:72:01:00:01".to_string(),
                     addresses: vec![
                         InterfaceAddressSnapshot {
@@ -3654,6 +3770,7 @@ mod tests {
                     linux_name: "ge-0-0-0.80".to_string(),
                     ifindex: 12,
                     parent_ifindex: 11,
+                    redundancy_group: 1,
                     vlan_id: 80,
                     hardware_addr: "02:bf:72:00:80:08".to_string(),
                     addresses: vec![
@@ -3880,6 +3997,45 @@ mod tests {
         assert_eq!(
             lookup_forwarding_for_ip(&missing_neighbor, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),),
             ForwardingDisposition::MissingNeighbor
+        );
+    }
+
+    #[test]
+    fn ha_resolution_blocks_inactive_owner_rg() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let ha_state = Arc::new(Mutex::new(BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )])));
+        let resolved = enforce_ha_resolution(
+            &state,
+            &ha_state,
+            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        );
+        assert_eq!(resolved.disposition, ForwardingDisposition::HAInactive);
+    }
+
+    #[test]
+    fn ha_resolution_allows_fresh_active_owner_rg() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let ha_state = Arc::new(Mutex::new(BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )])));
+        let resolved = enforce_ha_resolution(
+            &state,
+            &ha_state,
+            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
         );
     }
 

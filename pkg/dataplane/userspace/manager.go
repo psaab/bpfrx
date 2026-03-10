@@ -42,12 +42,17 @@ type Manager struct {
 	generation uint64
 	syncCancel context.CancelFunc
 	lastStatus ProcessStatus
+	haGroups   map[int]HAGroupStatus
 }
 
 func New() *Manager {
 	inner := dataplane.New()
 	inner.XDPEntryProg = "xdp_userspace_prog"
-	return &Manager{DataPlane: inner, inner: inner}
+	return &Manager{
+		DataPlane: inner,
+		inner:     inner,
+		haGroups:  make(map[int]HAGroupStatus),
+	}
 }
 
 func (m *Manager) Load() error {
@@ -98,6 +103,9 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	}
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return result, fmt.Errorf("sync helper status: %w", err)
+	}
+	if err := m.syncHAStateLocked(); err != nil {
+		return result, fmt.Errorf("publish userspace HA state: %w", err)
 	}
 	m.ensureStatusLoopLocked()
 	m.cfg = ucfg
@@ -981,6 +989,56 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 		return ControlResponse{}, errors.New(resp.Error)
 	}
 	return resp, nil
+}
+
+func (m *Manager) syncHAStateLocked() error {
+	if m.proc == nil || m.proc.Process == nil || len(m.haGroups) == 0 {
+		return nil
+	}
+	groups := make([]HAGroupStatus, 0, len(m.haGroups))
+	for _, group := range m.haGroups {
+		groups = append(groups, group)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		return groups[i].RGID < groups[j].RGID
+	})
+	var status ProcessStatus
+	req := ControlRequest{
+		Type: "update_ha_state",
+		HAState: &HAStateUpdateRequest{
+			Groups: groups,
+		},
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		return err
+	}
+	return m.applyHelperStatusLocked(&status)
+}
+
+func (m *Manager) UpdateRGActive(rgID int, active bool) error {
+	if err := m.inner.UpdateRGActive(rgID, active); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	group := m.haGroups[rgID]
+	group.RGID = rgID
+	group.Active = active
+	m.haGroups[rgID] = group
+	return m.syncHAStateLocked()
+}
+
+func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error {
+	if err := m.inner.UpdateHAWatchdog(rgID, timestamp); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	group := m.haGroups[rgID]
+	group.RGID = rgID
+	group.WatchdogTimestamp = timestamp
+	m.haGroups[rgID] = group
+	return m.syncHAStateLocked()
 }
 
 func (m *Manager) requestLocked(req ControlRequest, status *ProcessStatus) error {

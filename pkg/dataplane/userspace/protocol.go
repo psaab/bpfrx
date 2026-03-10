@@ -15,6 +15,7 @@ type ControlRequest struct {
 	Type          string                    `json:"type"`
 	Snapshot      *ConfigSnapshot           `json:"snapshot,omitempty"`
 	Forwarding    *ForwardingControlRequest `json:"forwarding,omitempty"`
+	HAState       *HAStateUpdateRequest     `json:"ha_state,omitempty"`
 	Queue         *QueueControlRequest      `json:"queue,omitempty"`
 	Binding       *BindingControlRequest    `json:"binding,omitempty"`
 	Packet        *InjectPacketRequest      `json:"packet,omitempty"`
@@ -157,11 +158,22 @@ type ProcessStatus struct {
 	NeighborEntries        int                   `json:"neighbor_entries,omitempty"`
 	RouteEntries           int                   `json:"route_entries,omitempty"`
 	WorkerHeartbeats       []time.Time           `json:"worker_heartbeats,omitempty"`
+	HAGroups               []HAGroupStatus       `json:"ha_groups,omitempty"`
 	Queues                 []QueueStatus         `json:"queues,omitempty"`
 	Bindings               []BindingStatus       `json:"bindings,omitempty"`
 	RecentExceptions       []ExceptionStatus     `json:"recent_exceptions,omitempty"`
 	LastResolution         *PacketResolution     `json:"last_resolution,omitempty"`
 	SlowPath               SlowPathStatus        `json:"slow_path,omitempty"`
+}
+
+type HAStateUpdateRequest struct {
+	Groups []HAGroupStatus `json:"groups,omitempty"`
+}
+
+type HAGroupStatus struct {
+	RGID              int    `json:"rg_id"`
+	Active            bool   `json:"active"`
+	WatchdogTimestamp uint64 `json:"watchdog_timestamp,omitempty"`
 }
 
 type SlowPathStatus struct {

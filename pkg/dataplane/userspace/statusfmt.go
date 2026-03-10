@@ -108,6 +108,13 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  Interface addresses:       %d\n", status.InterfaceAddresses)
 	fmt.Fprintf(&b, "  Neighbor entries:          %d\n", status.NeighborEntries)
 	fmt.Fprintf(&b, "  Route entries:             %d\n", status.RouteEntries)
+	if len(status.HAGroups) > 0 {
+		parts := make([]string, 0, len(status.HAGroups))
+		for _, group := range status.HAGroups {
+			parts = append(parts, fmt.Sprintf("rg%d active=%t watchdog=%d", group.RGID, group.Active, group.WatchdogTimestamp))
+		}
+		fmt.Fprintf(&b, "  HA groups:                 %s\n", strings.Join(parts, "; "))
+	}
 	if status.LastResolution != nil {
 		fmt.Fprintf(&b, "  Last resolution:           %s", status.LastResolution.Disposition)
 		if status.LastResolution.LocalIfindex > 0 {

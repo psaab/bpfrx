@@ -209,6 +209,8 @@ struct ControlRequest {
     snapshot: Option<ConfigSnapshot>,
     #[serde(default)]
     forwarding: Option<ForwardingControlRequest>,
+    #[serde(rename = "ha_state", default)]
+    ha_state: Option<HAStateUpdateRequest>,
     #[serde(default)]
     queue: Option<QueueControlRequest>,
     #[serde(default)]
@@ -261,6 +263,8 @@ struct ProcessStatus {
     route_entries: usize,
     #[serde(rename = "worker_heartbeats", default)]
     worker_heartbeats: Vec<DateTime<Utc>>,
+    #[serde(rename = "ha_groups", default)]
+    ha_groups: Vec<HAGroupStatus>,
     #[serde(default)]
     queues: Vec<QueueStatus>,
     #[serde(default)]
@@ -366,6 +370,22 @@ struct PacketResolution {
 struct ForwardingControlRequest {
     #[serde(default)]
     armed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct HAStateUpdateRequest {
+    #[serde(default)]
+    groups: Vec<HAGroupStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct HAGroupStatus {
+    #[serde(rename = "rg_id", default)]
+    rg_id: i32,
+    #[serde(default)]
+    active: bool,
+    #[serde(rename = "watchdog_timestamp", default)]
+    watchdog_timestamp: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -670,6 +690,7 @@ fn run() -> Result<(), String> {
             neighbor_entries: 0,
             route_entries: 0,
             worker_heartbeats: Vec::new(),
+            ha_groups: Vec::new(),
             queues: Vec::new(),
             bindings: Vec::new(),
             recent_exceptions: Vec::new(),
@@ -840,6 +861,17 @@ fn handle_stream(
                     response.error = "missing forwarding state".to_string();
                 }
             }
+            "update_ha_state" => {
+                if let Some(ha_req) = request.ha_state {
+                    guard.status.ha_groups = ha_req.groups.clone();
+                    guard.afxdp.update_ha_state(&ha_req.groups);
+                    refresh_status(&mut guard);
+                    persist_state = true;
+                } else {
+                    response.ok = false;
+                    response.error = "missing HA state".to_string();
+                }
+            }
             "set_queue_state" => {
                 if let Some(queue_req) = request.queue {
                     let mut found = false;
@@ -983,6 +1015,7 @@ fn refresh_status(state: &mut ServerState) {
     let (reconcile_calls, reconcile_stage) = state.afxdp.reconcile_debug();
     state.status.debug_reconcile_calls = reconcile_calls;
     state.status.debug_reconcile_stage = reconcile_stage;
+    state.status.ha_groups = state.afxdp.ha_groups();
     state.status.enabled = state.status.forwarding_armed
         && state.status.capabilities.forwarding_supported
         && state
