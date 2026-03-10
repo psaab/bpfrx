@@ -209,6 +209,37 @@ impl SessionTable {
         );
     }
 
+    pub fn promote_synced(
+        &mut self,
+        key: &SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        now: Instant,
+        protocol: u8,
+        tcp_flags: u8,
+    ) -> bool {
+        let Some(entry) = self.sessions.get_mut(key) else {
+            return false;
+        };
+        if !entry.metadata.synced {
+            return false;
+        }
+        entry.decision = decision;
+        entry.metadata = metadata.clone();
+        entry.last_seen = now;
+        entry.expires_after = session_timeout(protocol, tcp_flags);
+        entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+        if !metadata.is_reverse {
+            self.push_delta(SessionDelta {
+                kind: SessionDeltaKind::Open,
+                key: key.clone(),
+                decision,
+                metadata,
+            });
+        }
+        true
+    }
+
     pub fn delete(&mut self, key: &SessionKey) {
         self.sessions.remove(key);
     }
@@ -423,6 +454,70 @@ mod tests {
         );
         assert!(table.drain_deltas(8).is_empty());
         let _ = table.lookup(&key, now + Duration::from_millis(2), TCP_FIN);
+        assert!(table.drain_deltas(8).is_empty());
+    }
+
+    #[test]
+    fn promote_synced_forward_session_emits_open_delta() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let now = Instant::now();
+        let mut synced = metadata();
+        synced.synced = true;
+        table.upsert_synced(key.clone(), decision(), synced, now, PROTO_TCP, 0x10);
+        let mut promoted = metadata();
+        promoted.synced = false;
+        assert!(table.promote_synced(
+            &key,
+            decision(),
+            promoted.clone(),
+            now + Duration::from_millis(1),
+            PROTO_TCP,
+            0x10,
+        ));
+        let hit = table.lookup(&key, now + Duration::from_millis(2), 0x10);
+        assert_eq!(
+            hit,
+            Some(SessionLookup {
+                decision: decision(),
+                metadata: promoted.clone(),
+            })
+        );
+        let deltas = table.drain_deltas(8);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
+        assert_eq!(deltas[0].key, key);
+        assert_eq!(deltas[0].metadata, promoted);
+    }
+
+    #[test]
+    fn promote_synced_reverse_session_stays_quiet() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let now = Instant::now();
+        let mut synced = metadata();
+        synced.synced = true;
+        synced.is_reverse = true;
+        table.upsert_synced(key.clone(), decision(), synced, now, PROTO_TCP, 0x10);
+        let mut promoted = metadata();
+        promoted.synced = false;
+        promoted.is_reverse = true;
+        assert!(table.promote_synced(
+            &key,
+            decision(),
+            promoted.clone(),
+            now + Duration::from_millis(1),
+            PROTO_TCP,
+            0x10,
+        ));
+        let hit = table.lookup(&key, now + Duration::from_millis(2), 0x10);
+        assert_eq!(
+            hit,
+            Some(SessionLookup {
+                decision: decision(),
+                metadata: promoted,
+            })
+        );
         assert!(table.drain_deltas(8).is_empty());
     }
 }

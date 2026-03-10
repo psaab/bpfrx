@@ -688,6 +688,18 @@ struct SessionSyncRequest {
     egress_zone: String,
     #[serde(rename = "owner_rg_id", default)]
     owner_rg_id: i32,
+    #[serde(rename = "egress_ifindex", default)]
+    egress_ifindex: i32,
+    #[serde(rename = "tx_ifindex", default)]
+    tx_ifindex: i32,
+    #[serde(rename = "tx_vlan_id", default)]
+    tx_vlan_id: u16,
+    #[serde(rename = "next_hop", default)]
+    next_hop: String,
+    #[serde(rename = "neighbor_mac", default)]
+    neighbor_mac: String,
+    #[serde(rename = "src_mac", default)]
+    src_mac: String,
     #[serde(rename = "nat_src_ip", default)]
     nat_src_ip: String,
     #[serde(rename = "nat_dst_ip", default)]
@@ -1226,6 +1238,24 @@ fn build_synced_session_key(
 
 fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionEntry, String> {
     let key = build_synced_session_key(req)?;
+    let next_hop = if req.next_hop.is_empty() {
+        None
+    } else {
+        Some(
+            req.next_hop
+                .parse()
+                .map_err(|e| format!("parse next_hop {}: {e}", req.next_hop))?,
+        )
+    };
+    let neighbor_mac = parse_session_sync_mac(&req.neighbor_mac)
+        .map_err(|e| format!("parse neighbor_mac {}: {e}", req.neighbor_mac))?;
+    let src_mac = parse_session_sync_mac(&req.src_mac)
+        .map_err(|e| format!("parse src_mac {}: {e}", req.src_mac))?;
+    let tx_ifindex = if req.tx_ifindex > 0 {
+        req.tx_ifindex
+    } else {
+        req.egress_ifindex
+    };
     let nat_src = if req.nat_src_ip.is_empty() {
         None
     } else {
@@ -1250,14 +1280,18 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
         key,
         decision: crate::session::SessionDecision {
             resolution: afxdp::ForwardingResolution {
-                disposition: afxdp::ForwardingDisposition::ForwardCandidate,
+                disposition: if req.egress_ifindex > 0 || req.tx_ifindex > 0 {
+                    afxdp::ForwardingDisposition::ForwardCandidate
+                } else {
+                    afxdp::ForwardingDisposition::NoRoute
+                },
                 local_ifindex: 0,
-                egress_ifindex: 0,
-                tx_ifindex: 0,
-                next_hop: None,
-                neighbor_mac: None,
-                src_mac: None,
-                tx_vlan_id: 0,
+                egress_ifindex: req.egress_ifindex,
+                tx_ifindex,
+                next_hop,
+                neighbor_mac,
+                src_mac,
+                tx_vlan_id: req.tx_vlan_id,
             },
             nat: crate::nat::NatDecision {
                 rewrite_src: nat_src,
@@ -1272,6 +1306,25 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             synced: true,
         },
     })
+}
+
+fn parse_session_sync_mac(value: &str) -> Result<Option<[u8; 6]>, String> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let mut out = [0u8; 6];
+    let mut count = 0usize;
+    for (i, part) in value.split(':').enumerate() {
+        if i >= out.len() {
+            return Err("too many octets".to_string());
+        }
+        out[i] = u8::from_str_radix(part, 16).map_err(|e| e.to_string())?;
+        count += 1;
+    }
+    if count != out.len() {
+        return Err("expected 6 octets".to_string());
+    }
+    Ok(Some(out))
 }
 
 fn reconcile_status_bindings(state: &mut ServerState) {

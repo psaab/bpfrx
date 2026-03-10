@@ -7,6 +7,68 @@ import (
 	"github.com/psaab/bpfrx/pkg/config"
 )
 
+func TestFindUserspaceEgressInterfaceSnapshotPrefersVLANUnit(t *testing.T) {
+	snapshot := &ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{
+			{
+				Name:            "ge-0/0/2",
+				Ifindex:         6,
+				ParentIfindex:   0,
+				RedundancyGroup: 1,
+			},
+			{
+				Name:            "reth0.80",
+				Ifindex:         12,
+				ParentIfindex:   6,
+				VLANID:          80,
+				RedundancyGroup: 1,
+			},
+		},
+	}
+	iface, ok := findUserspaceEgressInterfaceSnapshot(snapshot, 6, 80)
+	if !ok {
+		t.Fatal("expected VLAN unit match")
+	}
+	if iface.Ifindex != 12 || iface.ParentIfindex != 6 || iface.RedundancyGroup != 1 {
+		t.Fatalf("unexpected interface snapshot: %+v", iface)
+	}
+}
+
+func TestSessionSyncEgressLockedDerivesOwnerAndTxPath(t *testing.T) {
+	m := &Manager{
+		lastSnapshot: &ConfigSnapshot{
+			Interfaces: []InterfaceSnapshot{
+				{
+					Name:            "reth0.80",
+					Ifindex:         12,
+					ParentIfindex:   6,
+					VLANID:          80,
+					RedundancyGroup: 1,
+				},
+			},
+		},
+	}
+	egress, tx, owner := m.sessionSyncEgressLocked(6, 80)
+	if egress != 12 {
+		t.Fatalf("egress = %d, want 12", egress)
+	}
+	if tx != 6 {
+		t.Fatalf("tx = %d, want 6", tx)
+	}
+	if owner != 1 {
+		t.Fatalf("owner = %d, want 1", owner)
+	}
+}
+
+func TestMacStringSuppressesZeroAndFormatsValue(t *testing.T) {
+	if got := macString([]byte{0, 0, 0, 0, 0, 0}); got != "" {
+		t.Fatalf("zero MAC = %q, want empty", got)
+	}
+	if got := macString([]byte{0x02, 0xbf, 0x72, 0x01, 0x01, 0x01}); got != "02:bf:72:01:01:01" {
+		t.Fatalf("formatted MAC = %q", got)
+	}
+}
+
 func TestDeriveUserspaceConfigDefaults(t *testing.T) {
 	cfg := deriveUserspaceConfig(&config.Config{})
 	if cfg.Workers != 1 {

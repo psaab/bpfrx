@@ -37,14 +37,15 @@ type Manager struct {
 	dataplane.DataPlane
 	inner *dataplane.Manager
 
-	mu         sync.Mutex
-	proc       *exec.Cmd
-	cfg        config.UserspaceConfig
-	clusterHA  bool
-	generation uint64
-	syncCancel context.CancelFunc
-	lastStatus ProcessStatus
-	haGroups   map[int]HAGroupStatus
+	mu           sync.Mutex
+	proc         *exec.Cmd
+	cfg          config.UserspaceConfig
+	clusterHA    bool
+	generation   uint64
+	syncCancel   context.CancelFunc
+	lastStatus   ProcessStatus
+	lastSnapshot *ConfigSnapshot
+	haGroups     map[int]HAGroupStatus
 }
 
 func New() *Manager {
@@ -115,6 +116,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	}
 	m.ensureStatusLoopLocked()
 	m.cfg = ucfg
+	m.lastSnapshot = snap
 	return result, nil
 }
 
@@ -1784,7 +1786,10 @@ func (m *Manager) syncSessionV4Locked(op string, key dataplane.SessionKey, val *
 	if val != nil {
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
-		req.OwnerRGID = 0
+		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
+		req.TXVLANID = val.FibVlanID
+		req.NeighborMAC = macString(val.FibDmac[:])
+		req.SrcMAC = macString(val.FibSmac[:])
 		req.NATSrcIP = ipString(nativeUint32ToIP(val.NATSrcIP))
 		req.NATDstIP = ipString(nativeUint32ToIP(val.NATDstIP))
 		req.IsReverse = val.IsReverse != 0
@@ -1814,7 +1819,10 @@ func (m *Manager) syncSessionV6Locked(op string, key dataplane.SessionKeyV6, val
 	if val != nil {
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
-		req.OwnerRGID = 0
+		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
+		req.TXVLANID = val.FibVlanID
+		req.NeighborMAC = macString(val.FibDmac[:])
+		req.SrcMAC = macString(val.FibSmac[:])
 		req.NATSrcIP = ipString(net.IP(val.NATSrcIP[:]))
 		req.NATDstIP = ipString(net.IP(val.NATDstIP[:]))
 		req.IsReverse = val.IsReverse != 0
@@ -1878,6 +1886,66 @@ func ipString(ip net.IP) string {
 		return ""
 	}
 	return ip.String()
+}
+
+func macString(raw []byte) string {
+	if len(raw) < 6 {
+		return ""
+	}
+	allZero := true
+	for i := 0; i < 6; i++ {
+		if raw[i] != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return ""
+	}
+	return net.HardwareAddr(raw[:6]).String()
+}
+
+func (m *Manager) sessionSyncEgressLocked(fibIfindex int, fibVlanID uint16) (egressIfindex, txIfindex, ownerRGID int) {
+	snapshot := m.lastSnapshot
+	if snapshot == nil || fibIfindex <= 0 {
+		return fibIfindex, fibIfindex, 0
+	}
+	if iface, ok := findUserspaceEgressInterfaceSnapshot(snapshot, fibIfindex, fibVlanID); ok {
+		egress := iface.Ifindex
+		if egress <= 0 {
+			egress = fibIfindex
+		}
+		tx := iface.ParentIfindex
+		if tx <= 0 {
+			tx = egress
+		}
+		return egress, tx, iface.RedundancyGroup
+	}
+	return fibIfindex, fibIfindex, 0
+}
+
+func findUserspaceEgressInterfaceSnapshot(snapshot *ConfigSnapshot, fibIfindex int, fibVlanID uint16) (InterfaceSnapshot, bool) {
+	if snapshot == nil {
+		return InterfaceSnapshot{}, false
+	}
+	if fibVlanID != 0 {
+		for _, iface := range snapshot.Interfaces {
+			if iface.ParentIfindex == fibIfindex && iface.VLANID == int(fibVlanID) {
+				return iface, true
+			}
+		}
+	}
+	for _, iface := range snapshot.Interfaces {
+		if iface.Ifindex == fibIfindex {
+			return iface, true
+		}
+	}
+	for _, iface := range snapshot.Interfaces {
+		if iface.ParentIfindex == fibIfindex {
+			return iface, true
+		}
+	}
+	return InterfaceSnapshot{}, false
 }
 
 const userspaceBindingReady = 1

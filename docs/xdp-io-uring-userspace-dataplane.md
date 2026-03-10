@@ -751,12 +751,17 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
 - the Rust helper now has the first HA fabric slice for established traffic:
   owner-RG-aware session state, HA watchdog enforcement, and plain fabric redirect
   for existing/synced sessions when the local node is no longer the active owner
+- synced-session import now carries cached egress/VLAN/MAC metadata from the mirrored
+  dataplane session state, and a synced session is promoted back to local ownership on
+  first successful forward so later close/reopen deltas are generated again after failover
+- zone-encoded fabric redirect for brand-new flows to peer-owned RGs is implemented,
+  including ingress-zone override on the receiving node and suppression of fake dynamic
+  neighbor learning from those packets
 
 What is still intentionally not implemented:
 
 - full policy parity: AppID/application-identification matching, global policies,
   schedulers, counters, and logging semantics
-- zone-encoded fabric redirect for brand-new flows to peer-owned RGs
 - shared-memory snapshot regions
 - io_uring-backed slow-path transport beyond bounded TUN reinjection
 
@@ -879,6 +884,10 @@ Implemented today:
 - explicit fabric-link snapshots in the userspace runtime, including parent/overlay ifindex mapping and peer-address visibility
 - userspace helper status and CLI output for tracked `fab0`/`fab1` links
 - plain fabric redirect for established or synced sessions whose owner RG is inactive locally
+- mirrored synced-session install into the Rust workers, including cached egress/VLAN/MAC
+  forwarding metadata from the dataplane session mirror
+- promotion of imported synced sessions back to local ownership on first successful forward
+  so future session deltas are generated again after takeover
 - zone-encoded fabric redirect for brand-new flows to peer-owned RGs
 - receiving-node fabric ingress zone override from the encoded source MAC on `fab0`/`fab1`
 - suppression of fake dynamic-neighbor learning from zone-encoded fabric packets

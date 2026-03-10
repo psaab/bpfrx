@@ -361,19 +361,25 @@ type SessionDeltaDrainRequest struct {
 }
 
 type SessionSyncRequest struct {
-	Operation   string `json:"operation,omitempty"`
-	AddrFamily  uint8  `json:"addr_family,omitempty"`
-	Protocol    uint8  `json:"protocol,omitempty"`
-	SrcIP       string `json:"src_ip,omitempty"`
-	DstIP       string `json:"dst_ip,omitempty"`
-	SrcPort     uint16 `json:"src_port,omitempty"`
-	DstPort     uint16 `json:"dst_port,omitempty"`
-	IngressZone string `json:"ingress_zone,omitempty"`
-	EgressZone  string `json:"egress_zone,omitempty"`
-	OwnerRGID   int    `json:"owner_rg_id,omitempty"`
-	NATSrcIP    string `json:"nat_src_ip,omitempty"`
-	NATDstIP    string `json:"nat_dst_ip,omitempty"`
-	IsReverse   bool   `json:"is_reverse,omitempty"`
+	Operation     string `json:"operation,omitempty"`
+	AddrFamily    uint8  `json:"addr_family,omitempty"`
+	Protocol      uint8  `json:"protocol,omitempty"`
+	SrcIP         string `json:"src_ip,omitempty"`
+	DstIP         string `json:"dst_ip,omitempty"`
+	SrcPort       uint16 `json:"src_port,omitempty"`
+	DstPort       uint16 `json:"dst_port,omitempty"`
+	IngressZone   string `json:"ingress_zone,omitempty"`
+	EgressZone    string `json:"egress_zone,omitempty"`
+	OwnerRGID     int    `json:"owner_rg_id,omitempty"`
+	EgressIfindex int    `json:"egress_ifindex,omitempty"`
+	TXIfindex     int    `json:"tx_ifindex,omitempty"`
+	TXVLANID      uint16 `json:"tx_vlan_id,omitempty"`
+	NextHop       string `json:"next_hop,omitempty"`
+	NeighborMAC   string `json:"neighbor_mac,omitempty"`
+	SrcMAC        string `json:"src_mac,omitempty"`
+	NATSrcIP      string `json:"nat_src_ip,omitempty"`
+	NATDstIP      string `json:"nat_dst_ip,omitempty"`
+	IsReverse     bool   `json:"is_reverse,omitempty"`
 }
 
 type SessionDeltaInfo struct {

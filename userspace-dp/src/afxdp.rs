@@ -1239,20 +1239,51 @@ fn poll_binding(
                             debug.from_zone = hit.metadata.ingress_zone.clone();
                             debug.to_zone = hit.metadata.egress_zone.clone();
                         }
-                        let target = resolution_target_for_session(flow, decision);
                         decision.resolution = redirect_via_fabric_if_needed(
                             forwarding,
                             enforce_ha_resolution(
                                 forwarding,
                                 ha_state,
-                                lookup_forwarding_resolution_with_dynamic(
+                                lookup_forwarding_resolution_for_session(
                                     forwarding,
                                     dynamic_neighbors,
-                                    target,
+                                    flow,
+                                    decision,
                                 ),
                             ),
                             meta.ingress_ifindex as i32,
                         );
+                        if hit.metadata.synced
+                            && decision.resolution.disposition
+                                == ForwardingDisposition::ForwardCandidate
+                        {
+                            let mut promoted = hit.metadata.clone();
+                            promoted.synced = false;
+                            if promoted.owner_rg_id <= 0 {
+                                promoted.owner_rg_id = owner_rg_for_flow(
+                                    forwarding,
+                                    decision.resolution.egress_ifindex,
+                                );
+                            }
+                            if sessions.promote_synced(
+                                &flow.forward_key,
+                                decision,
+                                promoted.clone(),
+                                now,
+                                meta.protocol,
+                                meta.tcp_flags,
+                            ) {
+                                let promoted_entry = SyncedSessionEntry {
+                                    key: flow.forward_key.clone(),
+                                    decision,
+                                    metadata: promoted,
+                                    protocol: meta.protocol,
+                                    tcp_flags: meta.tcp_flags,
+                                };
+                                publish_shared_session(shared_sessions, &promoted_entry);
+                                replicate_session_upsert(peer_worker_commands, &promoted_entry);
+                            }
+                        }
                         decision
                     } else if let Some(shared) =
                         lookup_shared_session(shared_sessions, &flow.forward_key)
@@ -1272,20 +1303,50 @@ fn poll_binding(
                             debug.to_zone = replica.metadata.egress_zone.clone();
                         }
                         let mut decision = replica.decision;
-                        let target = resolution_target_for_session(flow, decision);
                         decision.resolution = redirect_via_fabric_if_needed(
                             forwarding,
                             enforce_ha_resolution(
                                 forwarding,
                                 ha_state,
-                                lookup_forwarding_resolution_with_dynamic(
+                                lookup_forwarding_resolution_for_session(
                                     forwarding,
                                     dynamic_neighbors,
-                                    target,
+                                    flow,
+                                    decision,
                                 ),
                             ),
                             meta.ingress_ifindex as i32,
                         );
+                        if decision.resolution.disposition
+                            == ForwardingDisposition::ForwardCandidate
+                        {
+                            let mut promoted = replica.metadata.clone();
+                            promoted.synced = false;
+                            if promoted.owner_rg_id <= 0 {
+                                promoted.owner_rg_id = owner_rg_for_flow(
+                                    forwarding,
+                                    decision.resolution.egress_ifindex,
+                                );
+                            }
+                            if sessions.promote_synced(
+                                &flow.forward_key,
+                                decision,
+                                promoted.clone(),
+                                now,
+                                meta.protocol,
+                                meta.tcp_flags,
+                            ) {
+                                let promoted_entry = SyncedSessionEntry {
+                                    key: flow.forward_key.clone(),
+                                    decision,
+                                    metadata: promoted,
+                                    protocol: meta.protocol,
+                                    tcp_flags: meta.tcp_flags,
+                                };
+                                publish_shared_session(shared_sessions, &promoted_entry);
+                                replicate_session_upsert(peer_worker_commands, &promoted_entry);
+                            }
+                        }
                         decision
                     } else {
                         binding.live.session_misses.fetch_add(1, Ordering::Relaxed);
@@ -2288,6 +2349,45 @@ fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> SessionKey {
 
 fn resolution_target_for_session(flow: &SessionFlow, decision: SessionDecision) -> IpAddr {
     decision.nat.rewrite_dst.unwrap_or(flow.dst_ip)
+}
+
+fn cached_session_resolution(
+    forwarding: &ForwardingState,
+    cached: ForwardingResolution,
+) -> Option<ForwardingResolution> {
+    if cached.egress_ifindex <= 0 || cached.neighbor_mac.is_none() {
+        return None;
+    }
+    let mut fallback = cached;
+    fallback.disposition = ForwardingDisposition::ForwardCandidate;
+    if fallback.tx_ifindex <= 0 {
+        fallback.tx_ifindex = resolve_tx_binding_ifindex(forwarding, fallback.egress_ifindex);
+    }
+    if let Some(egress) = forwarding.egress.get(&fallback.egress_ifindex) {
+        if fallback.src_mac.is_none() {
+            fallback.src_mac = Some(egress.src_mac);
+        }
+        if fallback.tx_vlan_id == 0 {
+            fallback.tx_vlan_id = egress.vlan_id;
+        }
+    }
+    Some(fallback)
+}
+
+fn lookup_forwarding_resolution_for_session(
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    flow: &SessionFlow,
+    decision: SessionDecision,
+) -> ForwardingResolution {
+    let target = resolution_target_for_session(flow, decision);
+    let resolved = lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target);
+    match resolved.disposition {
+        ForwardingDisposition::NoRoute | ForwardingDisposition::MissingNeighbor => {
+            cached_session_resolution(forwarding, decision.resolution).unwrap_or(resolved)
+        }
+        _ => resolved,
+    }
 }
 
 fn apply_worker_commands(
@@ -5691,6 +5791,57 @@ mod tests {
             resolution_target_for_session(&flow, decision),
             IpAddr::V6("2001:559:8585:ef00::100".parse().expect("lan"))
         );
+    }
+
+    #[test]
+    fn session_resolution_falls_back_to_cached_neighbor_on_miss() {
+        let mut state = build_forwarding_state(&nat_snapshot());
+        state.neighbors.clear();
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 5201,
+            },
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+                neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+        let resolved = lookup_forwarding_resolution_for_session(
+            &state,
+            &Arc::new(Mutex::new(BTreeMap::new())),
+            &flow,
+            decision,
+        );
+        let expected_src = state
+            .egress
+            .get(&12)
+            .map(|egress| egress.src_mac)
+            .expect("egress src mac");
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.egress_ifindex, 12);
+        assert_eq!(resolved.tx_ifindex, 11);
+        assert_eq!(resolved.neighbor_mac, decision.resolution.neighbor_mac);
+        assert_eq!(resolved.src_mac, Some(expected_src));
+        assert_eq!(resolved.tx_vlan_id, 80);
     }
 
     #[test]
