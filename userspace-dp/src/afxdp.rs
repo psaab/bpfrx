@@ -31,7 +31,8 @@ const USERSPACE_META_VERSION: u16 = 2;
 const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 64;
-const RESERVED_TX_FRAMES: u32 = 64;
+const MIN_RESERVED_TX_FRAMES: u32 = 64;
+const MAX_RESERVED_TX_FRAMES: u32 = 512;
 const STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
@@ -990,7 +991,9 @@ impl BindingWorker {
         let rx = user.map_rx().map_err(|e| format!("map rx ring: {e}"))?;
         let tx = user.map_tx().map_err(|e| format!("map tx ring: {e}"))?;
         bind_user_with_retry(&umem, &user)?;
-        let reserved_tx = RESERVED_TX_FRAMES
+        let reserved_tx = ring_entries
+            .saturating_div(4)
+            .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
             .min(ring_entries.saturating_sub(1))
             .max(1);
         prime_fill_ring(&umem, &mut device, reserved_tx)?;
@@ -1776,6 +1779,7 @@ fn drain_pending_tx(binding: &mut BindingWorker) {
     if pending.is_empty() {
         return;
     }
+    let mut retry = VecDeque::new();
     while let Some(req) = pending.pop_front() {
         match transmit_frame(binding, &req.bytes) {
             Ok(len) => {
@@ -1785,24 +1789,38 @@ fn drain_pending_tx(binding: &mut BindingWorker) {
                     .tx_bytes
                     .fetch_add(len as u64, Ordering::Relaxed);
             }
-            Err(err) => {
+            Err(TxError::Retry(err)) => {
+                binding.live.set_error(err);
+                retry.push_back(req);
+                retry.append(&mut pending);
+                break;
+            }
+            Err(TxError::Drop(err)) => {
                 binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
                 binding.live.set_error(err);
             }
         }
     }
+    if !retry.is_empty() {
+        binding.live.prepend_pending_tx(retry);
+    }
 }
 
-fn transmit_frame(binding: &mut BindingWorker, frame: &[u8]) -> Result<usize, String> {
+enum TxError {
+    Retry(String),
+    Drop(String),
+}
+
+fn transmit_frame(binding: &mut BindingWorker, frame: &[u8]) -> Result<usize, TxError> {
     let Some(offset) = binding.free_tx_frames.pop_front() else {
-        return Err("no free TX frame available".to_string());
+        return Err(TxError::Retry("no free TX frame available".to_string()));
     };
     let Some(area) = binding.area.slice_mut(offset as usize, frame.len()) else {
         binding.free_tx_frames.push_front(offset);
-        return Err(format!(
+        return Err(TxError::Drop(format!(
             "tx frame slice out of range: offset={offset} len={}",
             frame.len()
-        ));
+        )));
     };
     area.copy_from_slice(frame);
     let mut writer = binding.tx.transmit(1);
@@ -1815,7 +1833,7 @@ fn transmit_frame(binding: &mut BindingWorker, frame: &[u8]) -> Result<usize, St
     drop(writer);
     if inserted != 1 {
         binding.free_tx_frames.push_front(offset);
-        return Err("tx ring insert failed".to_string());
+        return Err(TxError::Retry("tx ring insert failed".to_string()));
     }
     if binding.tx.needs_wakeup() {
         binding.tx.wake();
@@ -3921,6 +3939,13 @@ impl BindingLiveState {
         match self.pending_tx.lock() {
             Ok(mut pending) => core::mem::take(&mut *pending),
             Err(_) => VecDeque::new(),
+        }
+    }
+
+    fn prepend_pending_tx(&self, mut retry: VecDeque<TxRequest>) {
+        if let Ok(mut pending) = self.pending_tx.lock() {
+            retry.append(&mut *pending);
+            *pending = retry;
         }
     }
 
