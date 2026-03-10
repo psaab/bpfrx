@@ -181,8 +181,19 @@ func TestDeriveUserspaceCapabilitiesDetectsFirewallFeatures(t *testing.T) {
 	if caps.ForwardingSupported {
 		t.Fatal("ForwardingSupported = true, want false")
 	}
-	if len(caps.UnsupportedReasons) < 5 {
+	if len(caps.UnsupportedReasons) < 4 {
 		t.Fatalf("UnsupportedReasons = %+v, want multiple reasons", caps.UnsupportedReasons)
+	}
+}
+
+func TestDeriveUserspaceCapabilitiesAllowsDNSFlowKnobs(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Flow.AllowDNSReply = true
+	cfg.Security.Flow.AllowEmbeddedICMP = true
+
+	caps := deriveUserspaceCapabilities(cfg)
+	if !caps.ForwardingSupported {
+		t.Fatalf("ForwardingSupported = false, unexpected reasons: %+v", caps.UnsupportedReasons)
 	}
 }
 

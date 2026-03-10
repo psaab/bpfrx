@@ -746,6 +746,7 @@ struct ForwardingState {
     ifindex_to_name: BTreeMap<i32, String>,
     ifindex_to_zone: BTreeMap<i32, String>,
     egress: BTreeMap<i32, EgressInterface>,
+    allow_dns_reply: bool,
     policy: PolicyState,
     source_nat_rules: Vec<SourceNatRule>,
 }
@@ -1096,7 +1097,10 @@ fn poll_binding(
                             );
                             let owner_rg_id =
                                 owner_rg_for_flow(forwarding, resolution.egress_ifindex);
-                            if let PolicyAction::Permit = evaluate_policy(
+                            if allow_unsolicited_dns_reply(forwarding, flow) {
+                                // Match the XDP fast path: unsolicited DNS replies bypass
+                                // policy/session install when the flow knob is enabled.
+                            } else if let PolicyAction::Permit = evaluate_policy(
                                 &forwarding.policy,
                                 &from_zone,
                                 &to_zone,
@@ -2113,6 +2117,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             .insert((neigh.ifindex, ip), NeighborEntry { mac });
     }
     state.policy = parse_policy_state(&snapshot.default_policy, &snapshot.policies);
+    state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.source_nat_rules = parse_source_nat_rules(&snapshot.source_nat_rules);
     state
 }
@@ -2377,6 +2382,12 @@ fn zone_pair_for_flow(
         .map(|iface| iface.zone.clone())
         .unwrap_or_default();
     (from_zone, to_zone)
+}
+
+fn allow_unsolicited_dns_reply(forwarding: &ForwardingState, flow: &SessionFlow) -> bool {
+    forwarding.allow_dns_reply
+        && flow.forward_key.protocol == PROTO_UDP
+        && flow.forward_key.src_port == 53
 }
 
 fn owner_rg_for_flow(forwarding: &ForwardingState, egress_ifindex: i32) -> i32 {
@@ -4087,6 +4098,27 @@ mod tests {
                 rewrite_dst: None,
             })
         );
+    }
+
+    #[test]
+    fn unsolicited_dns_reply_respects_flow_knob() {
+        let mut state = build_forwarding_state(&nat_snapshot());
+        let flow = SessionFlow {
+            src_ip: "172.16.80.53".parse().expect("src"),
+            dst_ip: "10.0.61.102".parse().expect("dst"),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_UDP,
+                src_ip: "172.16.80.53".parse().expect("src"),
+                dst_ip: "10.0.61.102".parse().expect("dst"),
+                src_port: 53,
+                dst_port: 5353,
+            },
+        };
+        state.allow_dns_reply = true;
+        assert!(allow_unsolicited_dns_reply(&state, &flow));
+        state.allow_dns_reply = false;
+        assert!(!allow_unsolicited_dns_reply(&state, &flow));
     }
 
     #[test]

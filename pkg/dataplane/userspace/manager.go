@@ -169,8 +169,6 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	if cfg.Security.Flow.TCPSession != nil ||
 		cfg.Security.Flow.UDPSessionTimeout != 0 ||
 		cfg.Security.Flow.ICMPSessionTimeout != 0 ||
-		cfg.Security.Flow.AllowDNSReply ||
-		cfg.Security.Flow.AllowEmbeddedICMP ||
 		cfg.Security.Flow.GREPerformanceAcceleration ||
 		cfg.Security.Flow.TCPMSSIPsecVPN != 0 ||
 		cfg.Security.Flow.TCPMSSGreIn != 0 ||
@@ -313,6 +311,10 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		Interfaces:    buildInterfaceSnapshots(cfg),
 		Neighbors:     buildNeighborSnapshots(cfg),
 		Routes:        buildRouteSnapshots(cfg),
+		Flow: FlowSnapshot{
+			AllowDNSReply:     cfg.Security.Flow.AllowDNSReply,
+			AllowEmbeddedICMP: cfg.Security.Flow.AllowEmbeddedICMP,
+		},
 		DefaultPolicy: policyActionString(cfg.Security.DefaultPolicy),
 		Policies:      buildPolicySnapshots(cfg),
 		SourceNAT:     buildSourceNATSnapshots(cfg),

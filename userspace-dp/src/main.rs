@@ -93,6 +93,14 @@ struct RouteSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct FlowSnapshot {
+    #[serde(rename = "allow_dns_reply", default)]
+    allow_dns_reply: bool,
+    #[serde(rename = "allow_embedded_icmp", default)]
+    allow_embedded_icmp: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct NeighborSnapshot {
     #[serde(default)]
     interface: String,
@@ -129,6 +137,8 @@ struct ConfigSnapshot {
     neighbors: Vec<NeighborSnapshot>,
     #[serde(default)]
     routes: Vec<RouteSnapshot>,
+    #[serde(default)]
+    flow: FlowSnapshot,
     #[serde(rename = "default_policy", default)]
     default_policy: String,
     #[serde(default)]

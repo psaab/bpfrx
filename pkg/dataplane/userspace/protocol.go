@@ -40,11 +40,17 @@ type ConfigSnapshot struct {
 	Interfaces    []InterfaceSnapshot     `json:"interfaces,omitempty"`
 	Neighbors     []NeighborSnapshot      `json:"neighbors,omitempty"`
 	Routes        []RouteSnapshot         `json:"routes,omitempty"`
+	Flow          FlowSnapshot            `json:"flow,omitempty"`
 	DefaultPolicy string                  `json:"default_policy,omitempty"`
 	Policies      []PolicyRuleSnapshot    `json:"policies,omitempty"`
 	SourceNAT     []SourceNATRuleSnapshot `json:"source_nat_rules,omitempty"`
 	Config        *config.Config          `json:"config,omitempty"`
 	Userspace     config.UserspaceConfig  `json:"userspace"`
+}
+
+type FlowSnapshot struct {
+	AllowDNSReply     bool `json:"allow_dns_reply,omitempty"`
+	AllowEmbeddedICMP bool `json:"allow_embedded_icmp,omitempty"`
 }
 
 type SnapshotSummary struct {
