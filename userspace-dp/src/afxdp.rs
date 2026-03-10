@@ -1439,43 +1439,46 @@ fn poll_binding(
                                         flow.src_ip,
                                     ),
                                 );
-                                if reverse_resolution.disposition
-                                    == ForwardingDisposition::ForwardCandidate
-                                {
-                                    let reverse_decision = SessionDecision {
-                                        resolution: reverse_resolution,
-                                        nat: decision.nat.reverse(flow.src_ip, flow.dst_ip),
+                                // Install the reverse entry even if the initial reply-side
+                                // resolution is not immediately usable. On live traffic the
+                                // first server reply can arrive before the reverse neighbor
+                                // state has converged on every worker, and dropping the reverse
+                                // entry creation turns that race into a hard policy miss. The
+                                // hit path re-resolves on demand and can fall back to the
+                                // cached decision when neighbor convergence is still in flight.
+                                let reverse_decision = SessionDecision {
+                                    resolution: reverse_resolution,
+                                    nat: decision.nat.reverse(flow.src_ip, flow.dst_ip),
+                                };
+                                let reverse_key = flow.reverse_key_with_nat(decision.nat);
+                                let reverse_metadata = SessionMetadata {
+                                    ingress_zone: to_zone.clone(),
+                                    egress_zone: from_zone.clone(),
+                                    owner_rg_id,
+                                    is_reverse: true,
+                                    synced: false,
+                                };
+                                if sessions.install_with_protocol(
+                                    reverse_key.clone(),
+                                    reverse_decision,
+                                    reverse_metadata.clone(),
+                                    now,
+                                    meta.protocol,
+                                    meta.tcp_flags,
+                                ) {
+                                    created += 1;
+                                    let reverse_entry = SyncedSessionEntry {
+                                        key: reverse_key,
+                                        decision: reverse_decision,
+                                        metadata: reverse_metadata,
+                                        protocol: meta.protocol,
+                                        tcp_flags: meta.tcp_flags,
                                     };
-                                    let reverse_key = flow.reverse_key_with_nat(decision.nat);
-                                    let reverse_metadata = SessionMetadata {
-                                        ingress_zone: to_zone.clone(),
-                                        egress_zone: from_zone.clone(),
-                                        owner_rg_id,
-                                        is_reverse: true,
-                                        synced: false,
-                                    };
-                                    if sessions.install_with_protocol(
-                                        reverse_key.clone(),
-                                        reverse_decision,
-                                        reverse_metadata.clone(),
-                                        now,
-                                        meta.protocol,
-                                        meta.tcp_flags,
-                                    ) {
-                                        created += 1;
-                                        let reverse_entry = SyncedSessionEntry {
-                                            key: reverse_key,
-                                            decision: reverse_decision,
-                                            metadata: reverse_metadata,
-                                            protocol: meta.protocol,
-                                            tcp_flags: meta.tcp_flags,
-                                        };
-                                        publish_shared_session(shared_sessions, &reverse_entry);
-                                        replicate_session_upsert(
-                                            peer_worker_commands,
-                                            &reverse_entry,
-                                        );
-                                    }
+                                    publish_shared_session(shared_sessions, &reverse_entry);
+                                    replicate_session_upsert(
+                                        peer_worker_commands,
+                                        &reverse_entry,
+                                    );
                                 }
                                 if created > 0 {
                                     binding
