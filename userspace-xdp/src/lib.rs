@@ -192,7 +192,15 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
 
     let data = ctx.data();
     let data_end = ctx.data_end();
-    let Some(parsed) = parse_packet(data, data_end) else {
+    let Some((eth_proto, vlan_id, l3_offset)) = parse_l2(data, data_end) else {
+        return Ok(xdp_action::XDP_PASS);
+    };
+    let parsed = match eth_proto {
+        ETH_P_IP => parse_ipv4(data, data_end, vlan_id, l3_offset),
+        ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, l3_offset),
+        _ => return Ok(xdp_action::XDP_PASS),
+    };
+    let Some(parsed) = parsed else {
         return fallback_to_main(ctx);
     };
 
@@ -306,16 +314,6 @@ struct ParsedPacket {
     dst_v4: u32,
     dst_v6: [u8; 16],
     dst_addr: [u8; 16],
-}
-
-fn parse_packet(data: usize, data_end: usize) -> Option<ParsedPacket> {
-    let (eth_proto, vlan_id, l3_offset) = parse_l2(data, data_end)?;
-
-    match eth_proto {
-        ETH_P_IP => parse_ipv4(data, data_end, vlan_id, l3_offset),
-        ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, l3_offset),
-        _ => None,
-    }
 }
 
 fn parse_l2(data: usize, data_end: usize) -> Option<(u16, u16, u16)> {
