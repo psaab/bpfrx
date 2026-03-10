@@ -1391,6 +1391,158 @@ func (m *Manager) DrainSessionDeltas(max uint32) ([]SessionDeltaInfo, ProcessSta
 	return resp.SessionDeltas, status, nil
 }
 
+func (m *Manager) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
+	if err := m.inner.SetSessionV4(key, val); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.syncSessionV4Locked("upsert", key, &val)
+	return nil
+}
+
+func (m *Manager) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
+	if err := m.inner.SetSessionV6(key, val); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.syncSessionV6Locked("upsert", key, &val)
+	return nil
+}
+
+func (m *Manager) DeleteSession(key dataplane.SessionKey) error {
+	if err := m.inner.DeleteSession(key); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.syncSessionV4Locked("delete", key, nil)
+	return nil
+}
+
+func (m *Manager) DeleteSessionV6(key dataplane.SessionKeyV6) error {
+	if err := m.inner.DeleteSessionV6(key); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.syncSessionV6Locked("delete", key, nil)
+	return nil
+}
+
+func (m *Manager) syncSessionV4Locked(op string, key dataplane.SessionKey, val *dataplane.SessionValue) error {
+	if m.proc == nil {
+		return nil
+	}
+	req := SessionSyncRequest{
+		Operation:  op,
+		AddrFamily: dataplane.AFInet,
+		Protocol:   key.Protocol,
+		SrcIP:      net.IP(key.SrcIP[:]).String(),
+		DstIP:      net.IP(key.DstIP[:]).String(),
+		SrcPort:    key.SrcPort,
+		DstPort:    key.DstPort,
+	}
+	if val != nil {
+		req.IngressZone = m.zoneNameByID(val.IngressZone)
+		req.EgressZone = m.zoneNameByID(val.EgressZone)
+		req.OwnerRGID = 0
+		req.NATSrcIP = ipString(nativeUint32ToIP(val.NATSrcIP))
+		req.NATDstIP = ipString(nativeUint32ToIP(val.NATDstIP))
+		req.IsReverse = val.IsReverse != 0
+		if val.Flags&dataplane.SessFlagSNAT == 0 {
+			req.NATSrcIP = ""
+		}
+		if val.Flags&dataplane.SessFlagDNAT == 0 {
+			req.NATDstIP = ""
+		}
+	}
+	return m.syncSessionRequestLocked(req)
+}
+
+func (m *Manager) syncSessionV6Locked(op string, key dataplane.SessionKeyV6, val *dataplane.SessionValueV6) error {
+	if m.proc == nil {
+		return nil
+	}
+	req := SessionSyncRequest{
+		Operation:  op,
+		AddrFamily: dataplane.AFInet6,
+		Protocol:   key.Protocol,
+		SrcIP:      net.IP(key.SrcIP[:]).String(),
+		DstIP:      net.IP(key.DstIP[:]).String(),
+		SrcPort:    key.SrcPort,
+		DstPort:    key.DstPort,
+	}
+	if val != nil {
+		req.IngressZone = m.zoneNameByID(val.IngressZone)
+		req.EgressZone = m.zoneNameByID(val.EgressZone)
+		req.OwnerRGID = 0
+		req.NATSrcIP = ipString(net.IP(val.NATSrcIP[:]))
+		req.NATDstIP = ipString(net.IP(val.NATDstIP[:]))
+		req.IsReverse = val.IsReverse != 0
+		if val.Flags&dataplane.SessFlagSNAT == 0 {
+			req.NATSrcIP = ""
+		}
+		if val.Flags&dataplane.SessFlagDNAT == 0 {
+			req.NATDstIP = ""
+		}
+	}
+	return m.syncSessionRequestLocked(req)
+}
+
+func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{
+		Type:        "sync_session",
+		SessionSync: &req,
+	}, &status); err != nil {
+		slog.Warn("userspace session sync mirror failed", "operation", req.Operation, "err", err)
+		return err
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		slog.Warn("userspace session sync status apply failed", "operation", req.Operation, "err", err)
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) zoneNameByID(zoneID uint16) string {
+	if zoneID == 0 {
+		return ""
+	}
+	if cr := m.inner.LastCompileResult(); cr != nil {
+		for name, id := range cr.ZoneIDs {
+			if id == zoneID {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+func nativeUint32ToIP(v uint32) net.IP {
+	if v == 0 {
+		return nil
+	}
+	var raw [4]byte
+	binary.NativeEndian.PutUint32(raw[:], v)
+	return net.IPv4(raw[0], raw[1], raw[2], raw[3]).To4()
+}
+
+func ipString(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	if v4 := ip.To4(); v4 != nil && v4.Equal(net.IPv4zero) {
+		return ""
+	}
+	if v6 := ip.To16(); v6 != nil && v6.Equal(net.IPv6zero) {
+		return ""
+	}
+	return ip.String()
+}
+
 const userspaceBindingReady = 1
 
 type userspaceBindingKey struct {

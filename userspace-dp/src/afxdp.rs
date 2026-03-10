@@ -322,11 +322,13 @@ impl Coordinator {
             let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
             let heartbeat = Arc::new(AtomicI64::new(now_nanos()));
+            let commands = Arc::new(Mutex::new(VecDeque::new()));
             let recent_exceptions = self.recent_exceptions.clone();
             let last_resolution = self.last_resolution.clone();
             let slow_path = self.slow_path.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
+            let commands_clone = commands.clone();
             let validation = self.validation;
             let forwarding = forwarding.clone();
             let ha_state = self.ha_state.clone();
@@ -342,6 +344,7 @@ impl Coordinator {
                         slow_path,
                         recent_exceptions,
                         last_resolution,
+                        commands_clone,
                         stop_clone,
                         heartbeat_clone,
                     );
@@ -357,6 +360,7 @@ impl Coordinator {
                         WorkerHandle {
                             stop,
                             heartbeat,
+                            commands,
                             join: Some(join),
                         },
                     );
@@ -453,6 +457,22 @@ impl Coordinator {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
+        for handle in self.workers.values() {
+            if let Ok(mut pending) = handle.commands.lock() {
+                pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
+            }
+        }
+    }
+
+    pub fn delete_synced_session(&self, key: SessionKey) {
+        for handle in self.workers.values() {
+            if let Ok(mut pending) = handle.commands.lock() {
+                pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
+            }
+        }
     }
 
     pub fn worker_heartbeats(&self) -> Vec<chrono::DateTime<Utc>> {
@@ -707,6 +727,7 @@ impl Coordinator {
 struct WorkerHandle {
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicI64>,
+    commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -903,6 +924,21 @@ struct TxRequest {
     bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SyncedSessionEntry {
+    pub(crate) key: SessionKey,
+    pub(crate) decision: SessionDecision,
+    pub(crate) metadata: SessionMetadata,
+    pub(crate) protocol: u8,
+    pub(crate) tcp_flags: u8,
+}
+
+#[derive(Clone, Debug)]
+enum WorkerCommand {
+    UpsertSynced(SyncedSessionEntry),
+    DeleteSynced(SessionKey),
+}
+
 impl BindingWorker {
     fn create(
         binding: &BindingStatus,
@@ -1077,7 +1113,15 @@ fn poll_binding(
                     let now = Instant::now();
                     if let Some(hit) = sessions.lookup(&flow.forward_key, now, meta.tcp_flags) {
                         binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
-                        hit
+                        let mut decision = hit.decision;
+                        if hit.metadata.synced {
+                            decision.resolution = enforce_ha_resolution(
+                                forwarding,
+                                ha_state,
+                                lookup_forwarding_resolution(forwarding, flow.dst_ip),
+                            );
+                        }
+                        decision
                     } else {
                         binding.live.session_misses.fetch_add(1, Ordering::Relaxed);
                         let resolution = enforce_ha_resolution(
@@ -1124,6 +1168,7 @@ fn poll_binding(
                                         egress_zone: to_zone.clone(),
                                         owner_rg_id,
                                         is_reverse: false,
+                                        synced: false,
                                     },
                                     now,
                                     meta.protocol,
@@ -1151,6 +1196,7 @@ fn poll_binding(
                                             egress_zone: from_zone.clone(),
                                             owner_rg_id,
                                             is_reverse: true,
+                                            synced: false,
                                         },
                                         now,
                                         meta.protocol,
@@ -1794,6 +1840,32 @@ fn record_forwarding_disposition(
     }
 }
 
+fn apply_worker_commands(
+    commands: &Arc<Mutex<VecDeque<WorkerCommand>>>,
+    sessions: &mut SessionTable,
+) {
+    let pending = match commands.lock() {
+        Ok(mut pending) => core::mem::take(&mut *pending),
+        Err(_) => return,
+    };
+    let now = Instant::now();
+    for cmd in pending {
+        match cmd {
+            WorkerCommand::UpsertSynced(entry) => {
+                sessions.upsert_synced(
+                    entry.key,
+                    entry.decision,
+                    entry.metadata,
+                    now,
+                    entry.protocol,
+                    entry.tcp_flags,
+                );
+            }
+            WorkerCommand::DeleteSynced(key) => sessions.delete(&key),
+        }
+    }
+}
+
 fn worker_loop(
     worker_id: u32,
     binding_plans: Vec<BindingPlan>,
@@ -1803,6 +1875,7 @@ fn worker_loop(
     slow_path: Option<Arc<SlowPathReinjector>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: Arc<Mutex<Option<PacketResolution>>>,
+    commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicI64>,
 ) {
@@ -1824,6 +1897,7 @@ fn worker_loop(
     let mut last_stats_poll = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         heartbeat.store(now_nanos(), Ordering::Relaxed);
+        apply_worker_commands(&commands, &mut sessions);
         let poll_stats = last_stats_poll.elapsed() >= STATS_POLL_INTERVAL;
         let mut did_work = false;
         for idx in 0..bindings.len() {

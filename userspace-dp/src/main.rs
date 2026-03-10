@@ -5,6 +5,7 @@ mod session;
 mod slowpath;
 mod state_writer;
 
+use afxdp::SyncedSessionEntry;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -227,6 +228,8 @@ struct ControlRequest {
     binding: Option<BindingControlRequest>,
     #[serde(default)]
     packet: Option<InjectPacketRequest>,
+    #[serde(rename = "session_sync", default)]
+    session_sync: Option<SessionSyncRequest>,
     #[serde(rename = "session_deltas", default)]
     session_deltas: Option<SessionDeltaDrainRequest>,
 }
@@ -586,6 +589,36 @@ struct InjectPacketRequest {
     destination_ip: String,
     #[serde(rename = "emit_on_wire", default)]
     emit_on_wire: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct SessionSyncRequest {
+    #[serde(default)]
+    operation: String,
+    #[serde(rename = "addr_family", default)]
+    addr_family: u8,
+    #[serde(default)]
+    protocol: u8,
+    #[serde(rename = "src_ip", default)]
+    src_ip: String,
+    #[serde(rename = "dst_ip", default)]
+    dst_ip: String,
+    #[serde(rename = "src_port", default)]
+    src_port: u16,
+    #[serde(rename = "dst_port", default)]
+    dst_port: u16,
+    #[serde(rename = "ingress_zone", default)]
+    ingress_zone: String,
+    #[serde(rename = "egress_zone", default)]
+    egress_zone: String,
+    #[serde(rename = "owner_rg_id", default)]
+    owner_rg_id: i32,
+    #[serde(rename = "nat_src_ip", default)]
+    nat_src_ip: String,
+    #[serde(rename = "nat_dst_ip", default)]
+    nat_dst_ip: String,
+    #[serde(rename = "is_reverse", default)]
+    is_reverse: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -960,6 +993,41 @@ fn handle_stream(
                     response.error = "missing packet injection request".to_string();
                 }
             }
+            "sync_session" => {
+                if let Some(sync_req) = request.session_sync {
+                    match sync_req.operation.as_str() {
+                        "upsert" => match build_synced_session_entry(&sync_req) {
+                            Ok(entry) => {
+                                guard.afxdp.upsert_synced_session(entry);
+                                refresh_status(&mut guard);
+                                persist_state = true;
+                            }
+                            Err(err) => {
+                                response.ok = false;
+                                response.error = err;
+                            }
+                        },
+                        "delete" => match build_synced_session_key(&sync_req) {
+                            Ok(key) => {
+                                guard.afxdp.delete_synced_session(key);
+                                refresh_status(&mut guard);
+                                persist_state = true;
+                            }
+                            Err(err) => {
+                                response.ok = false;
+                                response.error = err;
+                            }
+                        },
+                        other => {
+                            response.ok = false;
+                            response.error = format!("unknown session sync operation {other}");
+                        }
+                    }
+                } else {
+                    response.ok = false;
+                    response.error = "missing session sync request".to_string();
+                }
+            }
             "drain_session_deltas" => {
                 let max = request
                     .session_deltas
@@ -1048,6 +1116,72 @@ fn forwarding_unsupported_error(cap: &UserspaceCapabilities) -> String {
         "userspace live forwarding is not supported: {}",
         cap.unsupported_reasons.join("; ")
     )
+}
+
+fn build_synced_session_key(
+    req: &SessionSyncRequest,
+) -> Result<crate::session::SessionKey, String> {
+    Ok(crate::session::SessionKey {
+        addr_family: req.addr_family,
+        protocol: req.protocol,
+        src_ip: req
+            .src_ip
+            .parse()
+            .map_err(|e| format!("parse src_ip {}: {e}", req.src_ip))?,
+        dst_ip: req
+            .dst_ip
+            .parse()
+            .map_err(|e| format!("parse dst_ip {}: {e}", req.dst_ip))?,
+        src_port: req.src_port,
+        dst_port: req.dst_port,
+    })
+}
+
+fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionEntry, String> {
+    let key = build_synced_session_key(req)?;
+    let nat_src = if req.nat_src_ip.is_empty() {
+        None
+    } else {
+        Some(
+            req.nat_src_ip
+                .parse()
+                .map_err(|e| format!("parse nat_src_ip {}: {e}", req.nat_src_ip))?,
+        )
+    };
+    let nat_dst = if req.nat_dst_ip.is_empty() {
+        None
+    } else {
+        Some(
+            req.nat_dst_ip
+                .parse()
+                .map_err(|e| format!("parse nat_dst_ip {}: {e}", req.nat_dst_ip))?,
+        )
+    };
+    Ok(SyncedSessionEntry {
+        protocol: req.protocol,
+        tcp_flags: 0,
+        key,
+        decision: crate::session::SessionDecision {
+            resolution: afxdp::ForwardingResolution {
+                disposition: afxdp::ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 0,
+                next_hop: None,
+                neighbor_mac: None,
+            },
+            nat: crate::nat::NatDecision {
+                rewrite_src: nat_src,
+                rewrite_dst: nat_dst,
+            },
+        },
+        metadata: crate::session::SessionMetadata {
+            ingress_zone: req.ingress_zone.clone(),
+            egress_zone: req.egress_zone.clone(),
+            owner_rg_id: req.owner_rg_id,
+            is_reverse: req.is_reverse,
+            synced: true,
+        },
+    })
 }
 
 fn reconcile_status_bindings(state: &mut ServerState) {

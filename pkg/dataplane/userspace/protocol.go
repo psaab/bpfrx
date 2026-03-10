@@ -19,6 +19,7 @@ type ControlRequest struct {
 	Queue         *QueueControlRequest      `json:"queue,omitempty"`
 	Binding       *BindingControlRequest    `json:"binding,omitempty"`
 	Packet        *InjectPacketRequest      `json:"packet,omitempty"`
+	SessionSync   *SessionSyncRequest       `json:"session_sync,omitempty"`
 	SessionDeltas *SessionDeltaDrainRequest `json:"session_deltas,omitempty"`
 }
 
@@ -315,6 +316,22 @@ type InjectPacketRequest struct {
 
 type SessionDeltaDrainRequest struct {
 	Max uint32 `json:"max,omitempty"`
+}
+
+type SessionSyncRequest struct {
+	Operation   string `json:"operation,omitempty"`
+	AddrFamily  uint8  `json:"addr_family,omitempty"`
+	Protocol    uint8  `json:"protocol,omitempty"`
+	SrcIP       string `json:"src_ip,omitempty"`
+	DstIP       string `json:"dst_ip,omitempty"`
+	SrcPort     uint16 `json:"src_port,omitempty"`
+	DstPort     uint16 `json:"dst_port,omitempty"`
+	IngressZone string `json:"ingress_zone,omitempty"`
+	EgressZone  string `json:"egress_zone,omitempty"`
+	OwnerRGID   int    `json:"owner_rg_id,omitempty"`
+	NATSrcIP    string `json:"nat_src_ip,omitempty"`
+	NATDstIP    string `json:"nat_dst_ip,omitempty"`
+	IsReverse   bool   `json:"is_reverse,omitempty"`
 }
 
 type SessionDeltaInfo struct {

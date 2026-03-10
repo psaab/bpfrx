@@ -49,6 +49,13 @@ pub(crate) struct SessionMetadata {
     pub(crate) egress_zone: String,
     pub(crate) owner_rg_id: i32,
     pub(crate) is_reverse: bool,
+    pub(crate) synced: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionLookup {
+    pub(crate) decision: SessionDecision,
+    pub(crate) metadata: SessionMetadata,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,7 +115,7 @@ impl SessionTable {
             .collect::<Vec<_>>();
         for key in &stale {
             if let Some(entry) = self.sessions.remove(key) {
-                if !entry.metadata.is_reverse {
+                if !entry.metadata.is_reverse && !entry.metadata.synced {
                     self.push_delta(SessionDelta {
                         kind: SessionDeltaKind::Close,
                         key: key.clone(),
@@ -128,17 +135,20 @@ impl SessionTable {
         key: &SessionKey,
         now: Instant,
         tcp_flags: u8,
-    ) -> Option<SessionDecision> {
+    ) -> Option<SessionLookup> {
         let remove_after =
             matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
         let result = self.sessions.get_mut(key).map(|entry| {
             entry.last_seen = now;
             entry.expires_after = session_timeout(key.protocol, tcp_flags);
-            entry.decision
+            SessionLookup {
+                decision: entry.decision,
+                metadata: entry.metadata.clone(),
+            }
         });
         if remove_after {
             if let Some(entry) = self.sessions.remove(key) {
-                if !entry.metadata.is_reverse {
+                if !entry.metadata.is_reverse && !entry.metadata.synced {
                     self.push_delta(SessionDelta {
                         kind: SessionDeltaKind::Close,
                         key: key.clone(),
@@ -173,7 +183,7 @@ impl SessionTable {
                 expires_after: session_timeout(protocol, tcp_flags),
             },
         );
-        if !metadata.is_reverse {
+        if !metadata.is_reverse && !metadata.synced {
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
                 key,
@@ -182,6 +192,30 @@ impl SessionTable {
             });
         }
         true
+    }
+
+    pub fn upsert_synced(
+        &mut self,
+        key: SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        now: Instant,
+        protocol: u8,
+        tcp_flags: u8,
+    ) {
+        self.sessions.insert(
+            key,
+            SessionEntry {
+                decision,
+                metadata,
+                last_seen: now,
+                expires_after: session_timeout(protocol, tcp_flags),
+            },
+        );
+    }
+
+    pub fn delete(&mut self, key: &SessionKey) {
+        self.sessions.remove(key);
     }
 
     pub fn drain_deltas(&mut self, max: usize) -> Vec<SessionDelta> {
@@ -270,6 +304,7 @@ mod tests {
             egress_zone: "wan".to_string(),
             owner_rg_id: 1,
             is_reverse: false,
+            synced: false,
         }
     }
 
@@ -287,7 +322,13 @@ mod tests {
             0x10
         ));
         let hit = table.lookup(&key, now + Duration::from_millis(1), 0x10);
-        assert_eq!(hit, Some(decision()));
+        assert_eq!(
+            hit,
+            Some(SessionLookup {
+                decision: decision(),
+                metadata: metadata(),
+            })
+        );
         let deltas = table.drain_deltas(8);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
@@ -333,7 +374,13 @@ mod tests {
         ));
         let _ = table.drain_deltas(8);
         let hit = table.lookup(&key, now + Duration::from_millis(1), TCP_FIN);
-        assert_eq!(hit, Some(decision()));
+        assert_eq!(
+            hit,
+            Some(SessionLookup {
+                decision: decision(),
+                metadata: metadata(),
+            })
+        );
         assert!(
             table
                 .lookup(&key, now + Duration::from_millis(2), 0x10)
@@ -343,5 +390,33 @@ mod tests {
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
         assert_eq!(deltas[0].key, key);
+    }
+
+    #[test]
+    fn synced_sessions_do_not_emit_deltas() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let now = Instant::now();
+        let mut synced = metadata();
+        synced.synced = true;
+        table.upsert_synced(
+            key.clone(),
+            decision(),
+            synced.clone(),
+            now,
+            PROTO_TCP,
+            0x10,
+        );
+        let hit = table.lookup(&key, now + Duration::from_millis(1), 0x10);
+        assert_eq!(
+            hit,
+            Some(SessionLookup {
+                decision: decision(),
+                metadata: synced,
+            })
+        );
+        assert!(table.drain_deltas(8).is_empty());
+        let _ = table.lookup(&key, now + Duration::from_millis(2), TCP_FIN);
+        assert!(table.drain_deltas(8).is_empty());
     }
 }
