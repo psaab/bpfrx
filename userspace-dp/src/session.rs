@@ -59,6 +59,13 @@ pub(crate) struct SessionLookup {
     pub(crate) metadata: SessionMetadata,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardSessionMatch {
+    pub(crate) key: SessionKey,
+    pub(crate) decision: SessionDecision,
+    pub(crate) metadata: SessionMetadata,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionDeltaKind {
     Open,
@@ -151,6 +158,22 @@ impl SessionTable {
                 decision: entry.decision,
                 metadata: entry.metadata.clone(),
             }
+        })
+    }
+
+    pub fn find_forward_nat_match(&self, reply_key: &SessionKey) -> Option<ForwardSessionMatch> {
+        self.sessions.iter().find_map(|(key, entry)| {
+            if entry.metadata.is_reverse {
+                return None;
+            }
+            if !reply_matches_forward_nat(key, entry.decision.nat, reply_key) {
+                return None;
+            }
+            Some(ForwardSessionMatch {
+                key: key.clone(),
+                decision: entry.decision,
+                metadata: entry.metadata.clone(),
+            })
         })
     }
 
@@ -277,6 +300,34 @@ fn session_timeout(protocol: u8, tcp_flags: u8) -> Duration {
         PROTO_UDP => UDP_SESSION_TIMEOUT,
         PROTO_ICMP | PROTO_ICMPV6 => ICMP_SESSION_TIMEOUT,
         _ => OTHER_SESSION_TIMEOUT,
+    }
+}
+
+pub(crate) fn reply_matches_forward_nat(
+    forward_key: &SessionKey,
+    nat: NatDecision,
+    reply_key: &SessionKey,
+) -> bool {
+    if forward_key.addr_family != reply_key.addr_family || forward_key.protocol != reply_key.protocol
+    {
+        return false;
+    }
+    reverse_wire_key(forward_key, nat) == *reply_key
+}
+
+fn reverse_wire_key(forward_key: &SessionKey, nat: NatDecision) -> SessionKey {
+    let (src_port, dst_port) = if matches!(forward_key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        (forward_key.src_port, forward_key.dst_port)
+    } else {
+        (forward_key.dst_port, forward_key.src_port)
+    };
+    SessionKey {
+        addr_family: forward_key.addr_family,
+        protocol: forward_key.protocol,
+        src_ip: nat.rewrite_dst.unwrap_or(forward_key.dst_ip),
+        dst_ip: nat.rewrite_src.unwrap_or(forward_key.src_ip),
+        src_port,
+        dst_port,
     }
 }
 
@@ -519,5 +570,61 @@ mod tests {
             })
         );
         assert!(table.drain_deltas(8).is_empty());
+    }
+
+    #[test]
+    fn reply_match_finds_tcp_snat_reverse_tuple() {
+        let forward = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 42424,
+            dst_port: 5201,
+        };
+        let reply = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            src_port: 5201,
+            dst_port: 42424,
+        };
+        assert!(reply_matches_forward_nat(
+            &forward,
+            NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_dst: None,
+            },
+            &reply,
+        ));
+    }
+
+    #[test]
+    fn reply_match_finds_icmp_snat_reverse_tuple() {
+        let forward = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_ICMP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 0x1234,
+            dst_port: 0,
+        };
+        let reply = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_ICMP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            src_port: 0x1234,
+            dst_port: 0,
+        };
+        assert!(reply_matches_forward_nat(
+            &forward,
+            NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_dst: None,
+            },
+            &reply,
+        ));
     }
 }

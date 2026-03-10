@@ -5,7 +5,8 @@ use super::{
 use crate::nat::{NatDecision, SourceNatRule, match_source_nat, parse_source_nat_rules};
 use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
 use crate::session::{
-    SessionDecision, SessionDelta, SessionDeltaKind, SessionKey, SessionMetadata, SessionTable,
+    ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
+    SessionLookup, SessionMetadata, SessionTable, reply_matches_forward_nat,
 };
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus};
 use chrono::Utc;
@@ -1348,6 +1349,43 @@ fn poll_binding(
                             }
                         }
                         decision
+                    } else if let Some(repaired) = repair_reverse_session_from_forward(
+                        sessions,
+                        shared_sessions,
+                        peer_worker_commands,
+                        forwarding,
+                        ha_state,
+                        dynamic_neighbors,
+                        flow,
+                        now,
+                        meta.protocol,
+                        meta.tcp_flags,
+                    ) {
+                        binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
+                        binding
+                            .live
+                            .session_creates
+                            .fetch_add(1, Ordering::Relaxed);
+                        if let Some(debug) = debug.as_mut() {
+                            debug.from_zone = repaired.metadata.ingress_zone.clone();
+                            debug.to_zone = repaired.metadata.egress_zone.clone();
+                        }
+                        let mut decision = repaired.decision;
+                        decision.resolution = redirect_via_fabric_if_needed(
+                            forwarding,
+                            enforce_ha_resolution(
+                                forwarding,
+                                ha_state,
+                                lookup_forwarding_resolution_for_session(
+                                    forwarding,
+                                    dynamic_neighbors,
+                                    flow,
+                                    decision,
+                                ),
+                            ),
+                            meta.ingress_ifindex as i32,
+                        );
+                        decision
                     } else {
                         binding.live.session_misses.fetch_add(1, Ordering::Relaxed);
                         let resolution = enforce_ha_resolution(
@@ -2456,6 +2494,89 @@ fn lookup_shared_session(
         .lock()
         .ok()
         .and_then(|sessions| sessions.get(key).cloned())
+}
+
+fn lookup_shared_forward_nat_match(
+    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    reply_key: &SessionKey,
+) -> Option<SyncedSessionEntry> {
+    shared_sessions.lock().ok().and_then(|sessions| {
+        sessions
+            .values()
+            .find(|entry| {
+                !entry.metadata.is_reverse
+                    && reply_matches_forward_nat(&entry.key, entry.decision.nat, reply_key)
+            })
+            .cloned()
+    })
+}
+
+fn repair_reverse_session_from_forward(
+    sessions: &mut SessionTable,
+    shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    forwarding: &ForwardingState,
+    ha_state: &Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
+    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    flow: &SessionFlow,
+    now: Instant,
+    protocol: u8,
+    tcp_flags: u8,
+) -> Option<SessionLookup> {
+    let forward_match = sessions.find_forward_nat_match(&flow.forward_key).or_else(|| {
+        lookup_shared_forward_nat_match(shared_sessions, &flow.forward_key).map(|entry| {
+            ForwardSessionMatch {
+                key: entry.key,
+                decision: entry.decision,
+                metadata: entry.metadata,
+            }
+        })
+    })?;
+
+    let reverse_decision = SessionDecision {
+        resolution: enforce_ha_resolution(
+            forwarding,
+            ha_state,
+            lookup_forwarding_resolution_with_dynamic(
+                forwarding,
+                dynamic_neighbors,
+                forward_match.key.src_ip,
+            ),
+        ),
+        nat: forward_match
+            .decision
+            .nat
+            .reverse(forward_match.key.src_ip, forward_match.key.dst_ip),
+    };
+    let reverse_metadata = SessionMetadata {
+        ingress_zone: forward_match.metadata.egress_zone.clone(),
+        egress_zone: forward_match.metadata.ingress_zone.clone(),
+        owner_rg_id: forward_match.metadata.owner_rg_id,
+        is_reverse: true,
+        synced: false,
+    };
+    if sessions.install_with_protocol(
+        flow.forward_key.clone(),
+        reverse_decision,
+        reverse_metadata.clone(),
+        now,
+        protocol,
+        tcp_flags,
+    ) {
+        let reverse_entry = SyncedSessionEntry {
+            key: flow.forward_key.clone(),
+            decision: reverse_decision,
+            metadata: reverse_metadata.clone(),
+            protocol,
+            tcp_flags,
+        };
+        publish_shared_session(shared_sessions, &reverse_entry);
+        replicate_session_upsert(peer_worker_commands, &reverse_entry);
+    }
+    Some(SessionLookup {
+        decision: reverse_decision,
+        metadata: reverse_metadata,
+    })
 }
 
 fn publish_shared_session(
