@@ -860,6 +860,93 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		}
 	}
 
+	// Auto-add HOST_INBOUND_GRE to zones carrying GRE tunnel transport.
+	// When a GRE tunnel is configured, the outer encapsulated packets must
+	// reach the kernel for decapsulation.  Without this, the zone's
+	// host-inbound policy blocks outer GRE (protocol 47) because it's not
+	// explicitly listed as a system-service.
+	autoFlags := make(map[string]uint32) // zone name → extra flags
+	for _, ifCfg := range cfg.Interfaces.Interfaces {
+		tunnels := []*config.TunnelConfig{}
+		if ifCfg.Tunnel != nil {
+			tunnels = append(tunnels, ifCfg.Tunnel)
+		}
+		for _, unit := range ifCfg.Units {
+			if unit.Tunnel != nil {
+				tunnels = append(tunnels, unit.Tunnel)
+			}
+		}
+		for _, tun := range tunnels {
+			if tun.Source == "" {
+				continue
+			}
+			srcIP := net.ParseIP(tun.Source)
+			if srcIP == nil {
+				continue
+			}
+			var flag uint32
+			if tun.Mode == "gre" || tun.Mode == "" {
+				flag = HostInboundGRE
+			}
+			if flag == 0 {
+				continue
+			}
+			// Find which zone's interface carries this tunnel source IP.
+			for zoneName, zone := range cfg.Security.Zones {
+				for _, ifRef := range zone.Interfaces {
+					_, cn, un, _ := resolveInterfaceRef(ifRef, cfg)
+					ic, ok := cfg.Interfaces.Interfaces[cn]
+					if !ok {
+						continue
+					}
+					u, ok := ic.Units[un]
+					if !ok {
+						continue
+					}
+					for _, addr := range u.Addresses {
+						ip, _, err := net.ParseCIDR(addr)
+						if err != nil {
+							continue
+						}
+						if ip.Equal(srcIP) {
+							autoFlags[zoneName] |= flag
+						}
+					}
+				}
+			}
+		}
+	}
+	for zoneName, flags := range autoFlags {
+		zid, ok := result.ZoneIDs[zoneName]
+		if !ok {
+			continue
+		}
+		zone := cfg.Security.Zones[zoneName]
+		var existing uint32
+		if zone.HostInboundTraffic != nil {
+			for _, svc := range zone.HostInboundTraffic.SystemServices {
+				if f, ok := HostInboundServiceFlags[svc]; ok {
+					existing |= f
+				}
+			}
+			for _, proto := range zone.HostInboundTraffic.Protocols {
+				if f, ok := HostInboundProtocolFlags[proto]; ok {
+					existing |= f
+				}
+			}
+		}
+		if existing&flags != flags {
+			merged := existing | flags
+			zc := ZoneConfig{HostInbound: merged}
+			if zone.TCPRst {
+				zc.TCPRst = 1
+			}
+			dp.SetZoneConfig(zid, zc)
+			slog.Info("auto-added host-inbound for tunnel transport",
+				"zone", zoneName, "flags", fmt.Sprintf("0x%x", flags))
+		}
+	}
+
 	// Store pending XDP ifindexes for deferred attachment after all compile phases.
 	result.pendingXDP = xdpIfindexes
 	result.tunnelIfindexes = tunnelIfindexes
