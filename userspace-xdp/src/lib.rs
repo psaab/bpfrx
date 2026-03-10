@@ -11,7 +11,7 @@ use aya_ebpf::{
 use core::mem;
 
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
-const USERSPACE_META_VERSION: u16 = 2;
+const USERSPACE_META_VERSION: u16 = 3;
 const USERSPACE_BINDING_READY: u32 = 1;
 const USERSPACE_FALLBACK_MAIN: u32 = 0;
 const USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS: u32 = 5000;
@@ -23,6 +23,8 @@ const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
+const PROTO_ICMP: u8 = 1;
+const PROTO_ICMPV6: u8 = 58;
 const MAX_EXT_HDRS: usize = 6;
 const NEXTHDR_HOP: u8 = 0;
 const NEXTHDR_ROUTING: u8 = 43;
@@ -65,6 +67,10 @@ struct UserspaceDpMeta {
     dscp: u8,
     dscp_rewrite: u8,
     reserved: u16,
+    flow_src_port: u16,
+    flow_dst_port: u16,
+    flow_src_addr: [u8; 16],
+    flow_dst_addr: [u8; 16],
     config_generation: u64,
     fib_generation: u32,
     reserved2: u32,
@@ -256,6 +262,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             dscp: parsed.dscp,
             dscp_rewrite: 0xff,
             reserved: 0,
+            flow_src_port: parsed.flow_src_port,
+            flow_dst_port: parsed.flow_dst_port,
+            flow_src_addr: parsed.src_addr,
+            flow_dst_addr: parsed.dst_addr,
             config_generation: ctrl.config_generation,
             fib_generation: ctrl.fib_generation,
             reserved2: 0,
@@ -288,9 +298,13 @@ struct ParsedPacket {
     addr_family: u8,
     protocol: u8,
     tcp_flags: u8,
+    flow_src_port: u16,
+    flow_dst_port: u16,
     dscp: u8,
+    src_addr: [u8; 16],
     dst_v4: u32,
     dst_v6: [u8; 16],
+    dst_addr: [u8; 16],
 }
 
 fn parse_packet(data: usize, data_end: usize) -> Option<ParsedPacket> {
@@ -327,8 +341,14 @@ fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
     let protocol = unsafe { (*iph).protocol };
     let tos = unsafe { (*iph).tos };
     let l4_offset = l3_offset.checked_add(ihl as u16)?;
-    let (payload_offset, tcp_flags) = parse_l4(data, data_end, l4_offset, protocol)?;
+    let (payload_offset, tcp_flags, flow_src_port, flow_dst_port) =
+        parse_l4(data, data_end, l4_offset, protocol)?;
+    let src_bytes = read_bytes(data, data_end, l3_offset as usize + 12, 4)?;
     let dst_bytes = read_bytes(data, data_end, l3_offset as usize + 16, 4)?;
+    let mut src_addr = [0u8; 16];
+    src_addr[..4].copy_from_slice(src_bytes);
+    let mut dst_addr = [0u8; 16];
+    dst_addr[..4].copy_from_slice(dst_bytes);
     Some(ParsedPacket {
         vlan_id,
         l3_offset,
@@ -337,9 +357,13 @@ fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
         addr_family: AF_INET,
         protocol,
         tcp_flags,
+        flow_src_port,
+        flow_dst_port,
         dscp: tos >> 2,
+        src_addr,
         dst_v4: u32::from_be_bytes([dst_bytes[0], dst_bytes[1], dst_bytes[2], dst_bytes[3]]),
         dst_v6: [0; 16],
+        dst_addr,
     })
 }
 
@@ -388,7 +412,10 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
 
     let flow_lbl0 = unsafe { (*ip6).flow_lbl[0] };
     let dscp = ((version_priority & 0x0f) << 2) | (flow_lbl0 >> 6);
-    let (payload_offset, tcp_flags) = parse_l4(data, data_end, offset, protocol)?;
+    let (payload_offset, tcp_flags, flow_src_port, flow_dst_port) =
+        parse_l4(data, data_end, offset, protocol)?;
+    let mut src_addr = [0u8; 16];
+    src_addr.copy_from_slice(read_bytes(data, data_end, l3_offset as usize + 8, 16)?);
     let mut dst_v6 = [0u8; 16];
     dst_v6.copy_from_slice(read_bytes(data, data_end, l3_offset as usize + 24, 16)?);
     Some(ParsedPacket {
@@ -399,9 +426,13 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
         addr_family: AF_INET6,
         protocol,
         tcp_flags,
+        flow_src_port,
+        flow_dst_port,
         dscp,
+        src_addr,
         dst_v4: 0,
         dst_v6,
+        dst_addr: dst_v6,
     })
 }
 
@@ -429,8 +460,9 @@ fn should_fallback_early(pkt: &ParsedPacket) -> bool {
 fn is_local_destination(pkt: &ParsedPacket) -> bool {
     match pkt.addr_family {
         AF_INET => unsafe { USERSPACE_LOCAL_V4.get(&pkt.dst_v4) }.is_some(),
-        AF_INET6 => unsafe { USERSPACE_LOCAL_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_v6 }) }
-            .is_some(),
+        AF_INET6 => {
+            unsafe { USERSPACE_LOCAL_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_v6 }) }.is_some()
+        }
         _ => true,
     }
 }
@@ -447,7 +479,12 @@ fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
     ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80
 }
 
-fn parse_l4(data: usize, data_end: usize, l4_offset: u16, protocol: u8) -> Option<(u16, u8)> {
+fn parse_l4(
+    data: usize,
+    data_end: usize,
+    l4_offset: u16,
+    protocol: u8,
+) -> Option<(u16, u8, u16, u16)> {
     match protocol {
         PROTO_TCP => {
             let bytes = read_bytes(data, data_end, l4_offset as usize, 14)?;
@@ -456,10 +493,32 @@ fn parse_l4(data: usize, data_end: usize, l4_offset: u16, protocol: u8) -> Optio
                 return None;
             }
             read_bytes(data, data_end, l4_offset as usize, data_offset as usize)?;
-            Some((l4_offset.checked_add(data_offset)?, bytes[13]))
+            Some((
+                l4_offset.checked_add(data_offset)?,
+                bytes[13],
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                u16::from_be_bytes([bytes[2], bytes[3]]),
+            ))
         }
-        PROTO_UDP => Some((l4_offset.checked_add(8)?, 0)),
-        _ => Some((l4_offset, 0)),
+        PROTO_UDP => {
+            let bytes = read_bytes(data, data_end, l4_offset as usize, 8)?;
+            Some((
+                l4_offset.checked_add(8)?,
+                0,
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                u16::from_be_bytes([bytes[2], bytes[3]]),
+            ))
+        }
+        PROTO_ICMP | PROTO_ICMPV6 => {
+            let bytes = read_bytes(data, data_end, l4_offset as usize, 8)?;
+            Some((
+                l4_offset.checked_add(8)?,
+                0,
+                u16::from_be_bytes([bytes[4], bytes[5]]),
+                0,
+            ))
+        }
+        _ => Some((l4_offset, 0, 0, 0)),
     }
 }
 

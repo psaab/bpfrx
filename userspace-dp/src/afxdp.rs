@@ -28,7 +28,7 @@ use xdpilone::xdp::XdpDesc;
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig, User};
 
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
-const USERSPACE_META_VERSION: u16 = 2;
+const USERSPACE_META_VERSION: u16 = 3;
 const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 64;
@@ -73,6 +73,10 @@ struct UserspaceDpMeta {
     dscp: u8,
     dscp_rewrite: u8,
     reserved: u16,
+    flow_src_port: u16,
+    flow_dst_port: u16,
+    flow_src_addr: [u8; 16],
+    flow_dst_addr: [u8; 16],
     config_generation: u64,
     fib_generation: u32,
     reserved2: u32,
@@ -1362,10 +1366,7 @@ fn poll_binding(
                         meta.tcp_flags,
                     ) {
                         binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
-                        binding
-                            .live
-                            .session_creates
-                            .fetch_add(1, Ordering::Relaxed);
+                        binding.live.session_creates.fetch_add(1, Ordering::Relaxed);
                         if let Some(debug) = debug.as_mut() {
                             debug.from_zone = repaired.metadata.ingress_zone.clone();
                             debug.to_zone = repaired.metadata.egress_zone.clone();
@@ -1513,10 +1514,7 @@ fn poll_binding(
                                         tcp_flags: meta.tcp_flags,
                                     };
                                     publish_shared_session(shared_sessions, &reverse_entry);
-                                    replicate_session_upsert(
-                                        peer_worker_commands,
-                                        &reverse_entry,
-                                    );
+                                    replicate_session_upsert(peer_worker_commands, &reverse_entry);
                                 }
                                 if created > 0 {
                                     binding
@@ -1838,6 +1836,9 @@ fn parse_session_flow(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
 ) -> Option<SessionFlow> {
+    if let Some(flow) = parse_session_flow_from_meta(meta) {
+        return Some(flow);
+    }
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     if matches!(meta.addr_family as i32, libc::AF_INET) {
         if let Some(flow) = parse_ipv4_session_flow_from_frame(frame, meta) {
@@ -1903,6 +1904,39 @@ fn parse_session_flow(
         }
         _ => None,
     }
+}
+
+fn parse_session_flow_from_meta(meta: UserspaceDpMeta) -> Option<SessionFlow> {
+    let (src_ip, dst_ip) = match meta.addr_family as i32 {
+        libc::AF_INET => {
+            let src = meta.flow_src_addr.get(..4)?;
+            let dst = meta.flow_dst_addr.get(..4)?;
+            (
+                IpAddr::V4(Ipv4Addr::new(src[0], src[1], src[2], src[3])),
+                IpAddr::V4(Ipv4Addr::new(dst[0], dst[1], dst[2], dst[3])),
+            )
+        }
+        libc::AF_INET6 => (
+            IpAddr::V6(Ipv6Addr::from(meta.flow_src_addr)),
+            IpAddr::V6(Ipv6Addr::from(meta.flow_dst_addr)),
+        ),
+        _ => return None,
+    };
+    if src_ip.is_unspecified() || dst_ip.is_unspecified() {
+        return None;
+    }
+    Some(SessionFlow {
+        src_ip,
+        dst_ip,
+        forward_key: SessionKey {
+            addr_family: meta.addr_family,
+            protocol: meta.protocol,
+            src_ip,
+            dst_ip,
+            src_port: meta.flow_src_port,
+            dst_port: meta.flow_dst_port,
+        },
+    })
 }
 
 fn parse_ipv4_session_flow_from_frame(frame: &[u8], meta: UserspaceDpMeta) -> Option<SessionFlow> {
@@ -2577,15 +2611,17 @@ fn repair_reverse_session_from_forward(
     protocol: u8,
     tcp_flags: u8,
 ) -> Option<SessionLookup> {
-    let forward_match = sessions.find_forward_nat_match(&flow.forward_key).or_else(|| {
-        lookup_shared_forward_nat_match(shared_sessions, &flow.forward_key).map(|entry| {
-            ForwardSessionMatch {
-                key: entry.key,
-                decision: entry.decision,
-                metadata: entry.metadata,
-            }
-        })
-    })?;
+    let forward_match = sessions
+        .find_forward_nat_match(&flow.forward_key)
+        .or_else(|| {
+            lookup_shared_forward_nat_match(shared_sessions, &flow.forward_key).map(|entry| {
+                ForwardSessionMatch {
+                    key: entry.key,
+                    decision: entry.decision,
+                    metadata: entry.metadata,
+                }
+            })
+        })?;
 
     let reverse_decision = SessionDecision {
         resolution: enforce_ha_resolution(
@@ -5288,6 +5324,10 @@ mod tests {
             version: USERSPACE_META_VERSION,
             length: std::mem::size_of::<UserspaceDpMeta>() as u16,
             addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            flow_src_port: 0x1234,
+            flow_src_addr: [172, 16, 80, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            flow_dst_addr: [172, 16, 80, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             config_generation: 11,
             fib_generation: 7,
             ..UserspaceDpMeta::default()
@@ -5296,10 +5336,10 @@ mod tests {
 
     fn vlan_icmp_reply_frame() -> Vec<u8> {
         let mut frame = vec![
-            0x02, 0xbf, 0x72, 0x16, 0x02, 0x00, 0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5, 0x81,
-            0x00, 0x00, 0x50, 0x08, 0x00, 0x45, 0x00, 0x00, 0x54, 0x00, 0x00, 0x00, 0x00,
-            0x40, 0x01, 0x00, 0x00, 0xac, 0x10, 0x50, 0xc8, 0xac, 0x10, 0x50, 0x08, 0x00,
-            0x00, 0x00, 0x00, 0x12, 0x34, 0x00, 0x01,
+            0x02, 0xbf, 0x72, 0x16, 0x02, 0x00, 0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5, 0x81, 0x00,
+            0x00, 0x50, 0x08, 0x00, 0x45, 0x00, 0x00, 0x54, 0x00, 0x00, 0x00, 0x00, 0x40, 0x01,
+            0x00, 0x00, 0xac, 0x10, 0x50, 0xc8, 0xac, 0x10, 0x50, 0x08, 0x00, 0x00, 0x00, 0x00,
+            0x12, 0x34, 0x00, 0x01,
         ];
         frame.resize(98, 0);
         frame
@@ -5377,6 +5417,27 @@ mod tests {
             XdpDesc {
                 addr: 0,
                 len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+        )
+        .expect("flow");
+        assert_eq!(flow.src_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        assert_eq!(flow.dst_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
+        assert_eq!(flow.forward_key.src_port, 0x1234);
+        assert_eq!(flow.forward_key.dst_port, 0);
+    }
+
+    #[test]
+    fn parse_session_flow_prefers_tuple_stamped_in_metadata() {
+        let mut area = MmapArea::new(256).expect("mmap");
+        area.slice_mut(0, 64).expect("slice").fill(0xaa);
+        let meta = valid_meta();
+        let flow = parse_session_flow(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: 64,
                 options: 0,
             },
             meta,

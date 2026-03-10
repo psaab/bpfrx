@@ -308,7 +308,8 @@ pub(crate) fn reply_matches_forward_nat(
     nat: NatDecision,
     reply_key: &SessionKey,
 ) -> bool {
-    if forward_key.addr_family != reply_key.addr_family || forward_key.protocol != reply_key.protocol
+    if forward_key.addr_family != reply_key.addr_family
+        || forward_key.protocol != reply_key.protocol
     {
         return false;
     }
