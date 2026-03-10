@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -263,6 +264,17 @@ func (m *Manager) ApplyTunnels(tunnels []*config.TunnelConfig) error {
 			slog.Warn("failed to create tunnel",
 				"name", tc.Name, "mode", tc.Mode, "err", err)
 			continue
+		}
+
+		// IPv6 GRE: disable encaplimit to avoid adding an IPv6
+		// Destination Options extension header.  Many transit networks
+		// drop IPv6 packets with extension headers (RFC 7872).
+		if isIPv6 && (tc.Mode == "gre" || tc.Mode == "") {
+			if out, err := exec.Command("ip", "link", "set", tc.Name,
+				"type", "ip6gre", "encaplimit", "none").CombinedOutput(); err != nil {
+				slog.Warn("failed to set tunnel encaplimit",
+					"name", tc.Name, "err", err, "output", string(out))
+			}
 		}
 
 		if err := m.nlHandle.LinkSetUp(tunnelLink); err != nil {
