@@ -655,6 +655,21 @@ zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		return XDP_DROP;
 	}
 
+	/* MSS clamping for SYN/SYN-ACK on the fast path.
+	 * xdp_conntrack (where MSS clamping normally lives) is
+	 * bypassed for established sessions — clamp here so
+	 * server SYN-ACKs get MSS-limited on tunnel interfaces. */
+	if (fc && meta->protocol == PROTO_TCP &&
+	    (meta->tcp_flags & 0x02)) {
+		__u16 mss = fc->tcp_mss_ipsec;
+		if (fc->tcp_mss_gre_in > 0 &&
+		    (fc->tcp_mss_gre_in < mss || mss == 0))
+			mss = fc->tcp_mss_gre_in;
+		if (mss > 0)
+			tcp_mss_clamp(ctx, meta->l4_offset, mss,
+				      meta->csum_partial);
+	}
+
 	bpf_tail_call(ctx, &xdp_progs, next_prog);
 	return XDP_PASS;
 }
@@ -770,6 +785,18 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 					sess->app_id, CLOSE_REASON_TIMEOUT);
 		inc_counter(GLOBAL_CTR_DROPS);
 		return XDP_DROP;
+	}
+
+	/* MSS clamping for SYN/SYN-ACK on the fast path (IPv6). */
+	if (fc && meta->protocol == PROTO_TCP &&
+	    (meta->tcp_flags & 0x02)) {
+		__u16 mss = fc->tcp_mss_ipsec;
+		if (fc->tcp_mss_gre_in > 0 &&
+		    (fc->tcp_mss_gre_in < mss || mss == 0))
+			mss = fc->tcp_mss_gre_in;
+		if (mss > 0)
+			tcp_mss_clamp(ctx, meta->l4_offset, mss,
+				      meta->csum_partial);
 	}
 
 	bpf_tail_call(ctx, &xdp_progs, next_prog);

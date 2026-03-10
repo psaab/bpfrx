@@ -459,13 +459,17 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	__u32 fib_flags = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
-	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED ||
-	    rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
-		/* NOT_FWDED: original sender is a local address
-		 * (firewall-originated traffic).  Deliver locally.
-		 * NO_NEIGH: route exists but no ARP — let kernel
-		 * forward.  Both set fwd_ifindex=0 for XDP_PASS. */
+	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED) {
+		/* Original sender is a local address (firewall-originated
+		 * traffic).  Deliver locally via host-inbound path. */
 		meta->fwd_ifindex = 0;
+	} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+		/* Route exists but no ARP entry (e.g. POINTOPOINT tunnel
+		 * interfaces never have neighbors).  Let kernel forward.
+		 * Mark KERNEL_ROUTE so xdp_forward skips host-inbound
+		 * policy — this is transit traffic, not host-bound. */
+		meta->fwd_ifindex = 0;
+		meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 	} else if (rc != BPF_FIB_LKUP_RET_SUCCESS) {
 		/* No route (BLACKHOLE/UNREACHABLE) — in a split-RG
 		 * cluster the original client's subnet is on the peer.
@@ -667,13 +671,17 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	__u32 fib_flags6 = meta->routing_table ? BPF_FIB_LOOKUP_TBID : 0;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags6);
-	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED ||
-	    rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
-		/* NOT_FWDED: original sender is a local address
-		 * (firewall-originated traffic).  Deliver locally.
-		 * NO_NEIGH: route exists but no NDP — let kernel
-		 * forward.  Both set fwd_ifindex=0 for XDP_PASS. */
+	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED) {
+		/* Original sender is a local address (firewall-originated
+		 * traffic).  Deliver locally via host-inbound path. */
 		meta->fwd_ifindex = 0;
+	} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+		/* Route exists but no NDP entry (e.g. POINTOPOINT tunnel
+		 * interfaces never have neighbors).  Let kernel forward.
+		 * Mark KERNEL_ROUTE so xdp_forward skips host-inbound
+		 * policy — this is transit traffic, not host-bound. */
+		meta->fwd_ifindex = 0;
+		meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 	} else if (rc != BPF_FIB_LKUP_RET_SUCCESS) {
 		/* No route (BLACKHOLE/UNREACHABLE) — same as IPv4:
 		 * defer fabric redirect to xdp_forward (after NAT). */

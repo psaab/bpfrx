@@ -2031,23 +2031,20 @@ tcp_mss_clamp(struct xdp_md *ctx, __u16 l4_offset, __u16 max_mss,
 	if (l4_offset > 200)
 		return -1;
 
-	/* Ensure at least TCP header + 40 bytes of options (max) */
-	if (data + l4_offset + 60 > data_end)
+	/* Ensure at least TCP header + 4 bytes of options to peek at
+	 * option kind/length fields.  The MSS value read is separately
+	 * guarded by the (mss_ptr + 1) > data_end check below. */
+	if (data + l4_offset + 24 > data_end)
 		return 0;
 
-	/*
-	 * Check the first 4 bytes of TCP options (offset 20 from TCP start).
-	 * MSS is almost always the first option in SYN packets.
-	 * Option format: kind(1) len(1) value(2) = {0x02, 0x04, MSS_HI, MSS_LO}
-	 *
-	 * Also check a few other common positions (NOP-padded layouts):
-	 * - offset 0: MSS first (most common)
-	 * - offset 1: after one NOP
-	 * - offset 2: after two NOPs
-	 *
-	 * We use absolute offsets from data to keep the verifier's
-	 * packet range valid throughout.
-	 */
+	/* Account for TCP timestamps (NOP+NOP+TS = 12 bytes) that
+	 * will be present in every data segment.  Without this,
+	 * data packets exceed the tunnel/path MTU by 12 bytes
+	 * (IP 20 + TCP 32 + MSS vs the MTU = IP 20 + TCP 20 + MSS).
+	 * Nearly all modern TCP stacks use timestamps. */
+	if (max_mss > 12)
+		max_mss -= 12;
+
 	__u8 *opt_base = (__u8 *)data + l4_offset + 20;
 	__be16 *mss_ptr = 0;
 	struct tcphdr *tcp = data + l4_offset;
@@ -2074,6 +2071,7 @@ tcp_mss_clamp(struct xdp_md *ctx, __u16 l4_offset, __u16 max_mss,
 
 	if (!mss_ptr)
 		return 0;
+
 	if ((void *)(mss_ptr + 1) > data_end)
 		return 0;
 
@@ -2114,28 +2112,28 @@ tc_tcp_mss_clamp(struct __sk_buff *skb, __u16 l4_offset, __u16 max_mss,
 	if (l4_offset > 200)
 		return -1;
 
-	if (data + l4_offset + 60 > data_end)
+	if (data + l4_offset + 24 > data_end)
 		return 0;
+
+	/* Account for TCP timestamps (same as XDP variant above). */
+	if (max_mss > 12)
+		max_mss -= 12;
 
 	__u8 *opt_base = (__u8 *)data + l4_offset + 20;
 	__be16 *mss_ptr = 0;
 	struct tcphdr *tcp = data + l4_offset;
 
-	/* Position 0: MSS at start of options (most common) */
 	if (opt_base[0] == TCPOPT_MSS && opt_base[1] == TCPOPT_MSS_LEN) {
 		mss_ptr = (__be16 *)(opt_base + 2);
 	}
-	/* Position 1: NOP + MSS */
 	else if (opt_base[0] == TCPOPT_NOP &&
 		 opt_base[1] == TCPOPT_MSS && opt_base[2] == TCPOPT_MSS_LEN) {
 		mss_ptr = (__be16 *)(opt_base + 3);
 	}
-	/* Position 2: NOP + NOP + MSS */
 	else if (opt_base[0] == TCPOPT_NOP && opt_base[1] == TCPOPT_NOP &&
 		 opt_base[2] == TCPOPT_MSS && opt_base[3] == TCPOPT_MSS_LEN) {
 		mss_ptr = (__be16 *)(opt_base + 4);
 	}
-	/* Position: after SACK_PERM (kind=4,len=2) + MSS */
 	else if (opt_base[0] == 4 && opt_base[1] == 2 &&
 		 opt_base[2] == TCPOPT_MSS && opt_base[3] == TCPOPT_MSS_LEN) {
 		mss_ptr = (__be16 *)(opt_base + 4);
