@@ -325,7 +325,7 @@ func TestBuildLocalAddressEntries(t *testing.T) {
 	}
 }
 
-func TestBuildLocalAddressEntriesExcludesInterfaceSNATAddresses(t *testing.T) {
+func TestBuildLocalAddressEntriesIncludesInterfaceSNATAddressesForFallback(t *testing.T) {
 	snapshot := &ConfigSnapshot{
 		Interfaces: []InterfaceSnapshot{
 			{
@@ -353,18 +353,22 @@ func TestBuildLocalAddressEntriesExcludesInterfaceSNATAddresses(t *testing.T) {
 		}},
 	}
 	got := buildLocalAddressEntries(snapshot)
-	if len(got) != 2 {
-		t.Fatalf("len(got) = %d, want 2 (%+v)", len(got), got)
+	if len(got) != 4 {
+		t.Fatalf("len(got) = %d, want 4 (%+v)", len(got), got)
 	}
+	var sawWanV4, sawWanV6 bool
+	var wanV6 [16]byte
+	copy(wanV6[:], []byte(net.ParseIP("2001:559:8585:80::8").To16()))
 	for _, entry := range got {
 		if entry.v4 && entry.v4Key == 0xac105008 {
-			t.Fatalf("unexpected WAN IPv4 SNAT address in local map: %+v", got)
+			sawWanV4 = true
 		}
-		var wanV6 [16]byte
-		copy(wanV6[:], []byte(net.ParseIP("2001:559:8585:80::8").To16()))
 		if !entry.v4 && entry.v6Key.Addr == wanV6 {
-			t.Fatalf("unexpected WAN IPv6 SNAT address in local map: %+v", got)
+			sawWanV6 = true
 		}
+	}
+	if !sawWanV4 || !sawWanV6 {
+		t.Fatalf("missing WAN interface NAT addresses in local map: %+v", got)
 	}
 }
 
