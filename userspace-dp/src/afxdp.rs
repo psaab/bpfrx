@@ -979,7 +979,7 @@ struct BindingIdentity {
     ifindex: i32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SessionFlow {
     src_ip: IpAddr,
     dst_ip: IpAddr,
@@ -1836,15 +1836,26 @@ fn parse_session_flow(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
 ) -> Option<SessionFlow> {
-    if let Some(flow) = parse_session_flow_from_meta(meta) {
-        return Some(flow);
-    }
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    if matches!(meta.addr_family as i32, libc::AF_INET) {
-        if let Some(flow) = parse_ipv4_session_flow_from_frame(frame, meta) {
-            return Some(flow);
+    let meta_flow = parse_session_flow_from_meta(meta);
+    let frame_flow = if matches!(meta.addr_family as i32, libc::AF_INET) {
+        parse_ipv4_session_flow_from_frame(frame, meta)
+    } else {
+        parse_session_flow_from_frame(frame, meta)
+    };
+    match (meta_flow, frame_flow) {
+        (Some(meta_flow), Some(frame_flow)) => {
+            if meta_flow == frame_flow {
+                return Some(meta_flow);
+            }
+            return Some(frame_flow);
         }
+        (Some(flow), None) | (None, Some(flow)) => return Some(flow),
+        (None, None) => {}
     }
+    
+    // Final defensive fallback for non-IPv4 paths that do not go through the
+    // frame parser above.
     let l3 = meta.l3_offset as usize;
     let l4 = meta.l4_offset as usize;
     match meta.addr_family as i32 {
@@ -1878,6 +1889,39 @@ fn parse_session_flow(
                 },
             })
         }
+        libc::AF_INET6 => {
+            if frame.len() < l3 + 40 || frame.len() < l4 {
+                return None;
+            }
+            let src_ip = IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[l3 + 8..l3 + 24]).ok()?,
+            ));
+            let dst_ip = IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[l3 + 24..l3 + 40]).ok()?,
+            ));
+            let (src_port, dst_port) = parse_flow_ports(frame, l4, meta.protocol)?;
+            Some(SessionFlow {
+                src_ip,
+                dst_ip,
+                forward_key: SessionKey {
+                    addr_family: meta.addr_family,
+                    protocol: meta.protocol,
+                    src_ip,
+                    dst_ip,
+                    src_port,
+                    dst_port,
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_session_flow_from_frame(frame: &[u8], meta: UserspaceDpMeta) -> Option<SessionFlow> {
+    let l3 = meta.l3_offset as usize;
+    let l4 = meta.l4_offset as usize;
+    match meta.addr_family as i32 {
+        libc::AF_INET => parse_ipv4_session_flow_from_frame(frame, meta),
         libc::AF_INET6 => {
             if frame.len() < l3 + 40 || frame.len() < l4 {
                 return None;
@@ -5438,6 +5482,36 @@ mod tests {
             XdpDesc {
                 addr: 0,
                 len: 64,
+                options: 0,
+            },
+            meta,
+        )
+        .expect("flow");
+        assert_eq!(flow.src_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        assert_eq!(flow.dst_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
+        assert_eq!(flow.forward_key.src_port, 0x1234);
+        assert_eq!(flow.forward_key.dst_port, 0);
+    }
+
+    #[test]
+    fn parse_session_flow_prefers_frame_tuple_on_mismatch() {
+        let frame = vlan_icmp_reply_frame();
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let mut meta = valid_meta();
+        meta.l3_offset = 18;
+        meta.l4_offset = 38;
+        meta.flow_src_addr[..4].copy_from_slice(&[10, 0, 61, 102]);
+        meta.flow_dst_addr[..4].copy_from_slice(&[172, 16, 80, 200]);
+        meta.flow_src_port = 0xbeef;
+        meta.flow_dst_port = 0;
+        let flow = parse_session_flow(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
                 options: 0,
             },
             meta,
