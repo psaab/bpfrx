@@ -31,10 +31,13 @@ const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
 const USERSPACE_META_VERSION: u16 = 3;
 const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
-const RX_BATCH_SIZE: u32 = 64;
+const RX_BATCH_SIZE: u32 = 256;
 const MIN_RESERVED_TX_FRAMES: u32 = 64;
 const MAX_RESERVED_TX_FRAMES: u32 = 512;
-const TX_BATCH_SIZE: usize = 64;
+const TX_BATCH_SIZE: usize = 256;
+const IDLE_YIELD_ITERS: u32 = 64;
+const IDLE_SLEEP_AFTER: u32 = 256;
+const IDLE_SLEEP_US: u64 = 50;
 const STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const NEIGHBOR_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
@@ -2859,6 +2862,7 @@ fn worker_loop(
     }
     let mut last_stats_poll = Instant::now();
     let mut last_neighbor_sync = Instant::now() - NEIGHBOR_SYNC_INTERVAL;
+    let mut idle_iters = 0u32;
     while !stop.load(Ordering::Relaxed) {
         heartbeat.store(now_nanos(), Ordering::Relaxed);
         apply_worker_commands(&commands, &mut sessions);
@@ -2893,8 +2897,17 @@ fn worker_loop(
         if poll_stats {
             last_stats_poll = Instant::now();
         }
-        if !did_work {
-            thread::sleep(Duration::from_millis(1));
+        if did_work {
+            idle_iters = 0;
+            continue;
+        }
+        idle_iters = idle_iters.saturating_add(1);
+        if idle_iters <= IDLE_YIELD_ITERS {
+            thread::yield_now();
+        } else if idle_iters <= IDLE_SLEEP_AFTER {
+            std::hint::spin_loop();
+        } else {
+            thread::sleep(Duration::from_micros(IDLE_SLEEP_US));
         }
     }
     heartbeat.store(now_nanos(), Ordering::Relaxed);
