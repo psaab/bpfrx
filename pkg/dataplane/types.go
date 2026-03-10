@@ -286,6 +286,7 @@ const (
 	HostInboundVRRP            = 1 << 18
 	HostInboundESP             = 1 << 19
 	HostInboundRouterDiscovery = 1 << 20
+	HostInboundGRE             = 1 << 21
 	HostInboundAll             = 0xFFFFFFFF
 )
 
@@ -308,6 +309,7 @@ var HostInboundServiceFlags = map[string]uint32{
 	"ike":        HostInboundIKE,
 	"dhcpv6":     HostInboundDHCPv6,
 	"ipsec":      HostInboundESP,
+	"gre":        HostInboundGRE,
 	"all":        HostInboundAll,
 }
 

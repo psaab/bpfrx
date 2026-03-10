@@ -59,6 +59,10 @@ host_inbound_flag(struct pkt_meta *meta)
 	if (proto == PROTO_ESP)
 		return HOST_INBOUND_ESP;
 
+	/* GRE (protocol 47) — tunnel termination */
+	if (proto == PROTO_GRE)
+		return HOST_INBOUND_GRE;
+
 	/* VRRP (protocol 112) */
 	if (proto == PROTO_VRRP)
 		return HOST_INBOUND_VRRP;

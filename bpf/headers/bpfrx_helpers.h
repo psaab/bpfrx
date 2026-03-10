@@ -1237,6 +1237,10 @@ host_inbound_flag(struct pkt_meta *meta)
 	if (proto == PROTO_ESP)
 		return HOST_INBOUND_ESP;
 
+	/* GRE (protocol 47) → HOST_INBOUND_GRE (tunnel termination) */
+	if (proto == PROTO_GRE)
+		return HOST_INBOUND_GRE;
+
 	/* TCP/UDP port-based services */
 	__u16 port = bpf_ntohs(meta->dst_port);
 	switch (port) {
