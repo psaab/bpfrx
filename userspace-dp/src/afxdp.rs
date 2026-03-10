@@ -1359,12 +1359,13 @@ fn forward_live_packet(
     if decision.nat.rewrite_dst.is_some() {
         ingress_live.dnat_packets.fetch_add(1, Ordering::Relaxed);
     }
+    let target_ifindex = resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex);
     let Some(target_live) = find_target_live(
         left,
         ingress_ifindex,
         ingress_live.clone(),
         right,
-        decision.resolution.egress_ifindex,
+        target_ifindex,
     ) else {
         record_exception(
             recent_exceptions,
@@ -1388,6 +1389,15 @@ fn forward_live_packet(
             Some(meta),
         );
     }
+}
+
+fn resolve_tx_binding_ifindex(forwarding: &ForwardingState, egress_ifindex: i32) -> i32 {
+    forwarding
+        .egress
+        .get(&egress_ifindex)
+        .map(|iface| iface.bind_ifindex)
+        .filter(|ifindex| *ifindex > 0)
+        .unwrap_or(egress_ifindex)
 }
 
 fn maybe_reinject_slow_path(
@@ -4541,6 +4551,12 @@ mod tests {
             resolved.disposition,
             ForwardingDisposition::NextTableUnsupported
         );
+    }
+
+    #[test]
+    fn tx_binding_resolution_prefers_bind_ifindex_for_vlan_units() {
+        let state = build_forwarding_state(&nat_snapshot());
+        assert_eq!(resolve_tx_binding_ifindex(&state, 12), 11);
     }
 
     #[test]
