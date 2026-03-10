@@ -66,11 +66,11 @@ runtime_mode() {
 		prog_check="$(run_fw0 'ip -details link show dev ge-0-0-1; echo ---; ip -details link show dev ge-0-0-2')"
 		helper_stats="$(run_fw0 'cli -c "show chassis cluster data-plane statistics"')"
 		if grep -Eq 'Forwarding supported:[[:space:]]+true' <<<"$helper_stats" &&
-			[[ "$prog_check" == *"name xdp_userspace_prog"* ]]; then
+			[[ "$prog_check" == *"name xdp_userspace_p"* ]]; then
 			printf 'supported\n'
 			return 0
 		fi
-		if [[ "$prog_check" == *"name xdp_main_prog"* ]] &&
+		if [[ "$prog_check" == *"name xdp_main_p"* ]] &&
 			grep -Eq 'Forwarding supported:[[:space:]]+false' <<<"$helper_stats" &&
 			grep -Eq 'Enabled:[[:space:]]+false' <<<"$helper_stats" &&
 			grep -Eq 'Bound bindings:[[:space:]]+0/[0-9]+' <<<"$helper_stats"; then
