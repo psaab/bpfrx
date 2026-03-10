@@ -135,6 +135,8 @@ struct ConfigSnapshot {
     #[serde(default)]
     interfaces: Vec<InterfaceSnapshot>,
     #[serde(default)]
+    fabrics: Vec<FabricSnapshot>,
+    #[serde(default)]
     neighbors: Vec<NeighborSnapshot>,
     #[serde(default)]
     routes: Vec<RouteSnapshot>,
@@ -150,6 +152,25 @@ struct ConfigSnapshot {
     userspace: serde_json::Value,
     #[serde(default)]
     config: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct FabricSnapshot {
+    name: String,
+    #[serde(rename = "parent_interface", default)]
+    parent_interface: String,
+    #[serde(rename = "parent_linux_name", default)]
+    parent_linux_name: String,
+    #[serde(rename = "parent_ifindex", default)]
+    parent_ifindex: i32,
+    #[serde(rename = "overlay_linux_name", default)]
+    overlay_linux_name: String,
+    #[serde(rename = "overlay_ifindex", default)]
+    overlay_ifindex: i32,
+    #[serde(rename = "rx_queues", default)]
+    rx_queues: usize,
+    #[serde(rename = "peer_address", default)]
+    peer_address: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -278,6 +299,8 @@ struct ProcessStatus {
     worker_heartbeats: Vec<DateTime<Utc>>,
     #[serde(rename = "ha_groups", default)]
     ha_groups: Vec<HAGroupStatus>,
+    #[serde(default)]
+    fabrics: Vec<FabricSnapshot>,
     #[serde(default)]
     queues: Vec<QueueStatus>,
     #[serde(default)]
@@ -734,6 +757,7 @@ fn run() -> Result<(), String> {
             route_entries: 0,
             worker_heartbeats: Vec::new(),
             ha_groups: Vec::new(),
+            fabrics: Vec::new(),
             queues: Vec::new(),
             bindings: Vec::new(),
             recent_exceptions: Vec::new(),
@@ -1087,6 +1111,11 @@ fn refresh_status(state: &mut ServerState) {
         .map(|s| s.neighbors.len())
         .unwrap_or(0);
     state.status.route_entries = state.snapshot.as_ref().map(|s| s.routes.len()).unwrap_or(0);
+    state.status.fabrics = state
+        .snapshot
+        .as_ref()
+        .map(|s| s.fabrics.clone())
+        .unwrap_or_default();
     state.status.worker_heartbeats = state.afxdp.worker_heartbeats();
     state.status.debug_worker_threads = state.afxdp.worker_count();
     state.status.debug_identity_slots = state.afxdp.identity_count();

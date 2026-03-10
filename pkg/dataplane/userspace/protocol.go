@@ -39,6 +39,7 @@ type ConfigSnapshot struct {
 	Capabilities  UserspaceCapabilities   `json:"capabilities"`
 	MapPins       UserspaceMapPins        `json:"map_pins"`
 	Interfaces    []InterfaceSnapshot     `json:"interfaces,omitempty"`
+	Fabrics       []FabricSnapshot        `json:"fabrics,omitempty"`
 	Neighbors     []NeighborSnapshot      `json:"neighbors,omitempty"`
 	Routes        []RouteSnapshot         `json:"routes,omitempty"`
 	Flow          FlowSnapshot            `json:"flow,omitempty"`
@@ -80,6 +81,17 @@ type InterfaceSnapshot struct {
 	MTU             int                        `json:"mtu,omitempty"`
 	HardwareAddr    string                     `json:"hardware_addr,omitempty"`
 	Addresses       []InterfaceAddressSnapshot `json:"addresses,omitempty"`
+}
+
+type FabricSnapshot struct {
+	Name            string `json:"name"`
+	ParentInterface string `json:"parent_interface,omitempty"`
+	ParentLinuxName string `json:"parent_linux_name,omitempty"`
+	ParentIfindex   int    `json:"parent_ifindex,omitempty"`
+	OverlayLinux    string `json:"overlay_linux_name,omitempty"`
+	OverlayIfindex  int    `json:"overlay_ifindex,omitempty"`
+	RXQueues        int    `json:"rx_queues,omitempty"`
+	PeerAddress     string `json:"peer_address,omitempty"`
 }
 
 type SourceNATRuleSnapshot struct {
@@ -166,6 +178,7 @@ type ProcessStatus struct {
 	RouteEntries           int                   `json:"route_entries,omitempty"`
 	WorkerHeartbeats       []time.Time           `json:"worker_heartbeats,omitempty"`
 	HAGroups               []HAGroupStatus       `json:"ha_groups,omitempty"`
+	Fabrics                []FabricSnapshot      `json:"fabrics,omitempty"`
 	Queues                 []QueueStatus         `json:"queues,omitempty"`
 	Bindings               []BindingStatus       `json:"bindings,omitempty"`
 	RecentExceptions       []ExceptionStatus     `json:"recent_exceptions,omitempty"`

@@ -20,6 +20,9 @@ func TestFormatStatusSummary(t *testing.T) {
 		InterfaceAddresses:     6,
 		NeighborEntries:        9,
 		RouteEntries:           4,
+		Fabrics: []FabricSnapshot{
+			{Name: "fab0", ParentLinuxName: "ge-0-0-0", ParentIfindex: 7, OverlayLinux: "fab0", OverlayIfindex: 17, RXQueues: 4, PeerAddress: "10.99.1.2"},
+		},
 		LastResolution: &PacketResolution{
 			Disposition:   "forward_candidate",
 			EgressIfindex: 11,
@@ -49,6 +52,7 @@ func TestFormatStatusSummary(t *testing.T) {
 		"Interface addresses:       6",
 		"Neighbor entries:          9",
 		"Route entries:             4",
+		"Fabric links:              fab0 parent=ge-0-0-0 peer=10.99.1.2",
 		"Last resolution:           forward_candidate egress-ifindex=11 next-hop=172.16.50.1 mac=00:10:db:ff:10:01",
 		"Bound bindings:            2/2",
 		"XSK-registered bindings:   1/2",
@@ -73,6 +77,9 @@ func TestFormatStatusSummary(t *testing.T) {
 
 func TestFormatBindings(t *testing.T) {
 	status := ProcessStatus{
+		Fabrics: []FabricSnapshot{
+			{Name: "fab0", ParentLinuxName: "ge-0-0-0", ParentIfindex: 7, OverlayLinux: "fab0", OverlayIfindex: 17, RXQueues: 4, PeerAddress: "10.99.1.2"},
+		},
 		Queues: []QueueStatus{
 			{QueueID: 0, WorkerID: 0, Interfaces: []string{"ge-0-0-1", "ge-0-0-2"}, Registered: true, Armed: false, Ready: false},
 		},
@@ -88,6 +95,8 @@ func TestFormatBindings(t *testing.T) {
 	out := FormatBindings(status)
 	for _, want := range []string{
 		"Userspace queues:",
+		"Userspace fabric links:",
+		"fab0",
 		"Userspace bindings:",
 		"ge-0-0-1,ge-0-0-2",
 		"ge-0-0-1",

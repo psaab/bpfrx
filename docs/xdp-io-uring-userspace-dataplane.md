@@ -873,9 +873,12 @@ Implemented today:
 - zone-pair policy snapshots from the Go control plane
 - default-policy permit/deny behavior in the Rust worker
 - per-flow zone policy evaluation before session create/install
+- explicit fabric-link snapshots in the userspace runtime, including parent/overlay ifindex mapping and peer-address visibility
+- userspace helper status and CLI output for tracked `fab0`/`fab1` links
 
 Not implemented yet:
 - worker-local timer wheels or batched expiry structures beyond lazy GC
+- peer-owned RG fabric forwarding and receiving-node fabric packet handling
 - full NAT parity: destination NAT, static NAT, NAT64, NATv6v4, and pool-based source NAT
 - full policy parity: address-books, applications/AppID, global policies, counters,
   reject semantics, and logging

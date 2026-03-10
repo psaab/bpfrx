@@ -311,6 +311,7 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		MapPins:       userspaceMapPins(),
 		Userspace:     ucfg,
 		Interfaces:    buildInterfaceSnapshots(cfg),
+		Fabrics:       buildFabricSnapshots(cfg),
 		Neighbors:     buildNeighborSnapshots(cfg),
 		Routes:        buildRouteSnapshots(cfg),
 		Flow: FlowSnapshot{
@@ -331,6 +332,59 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 			HAEnabled:      cfg.Chassis.Cluster != nil,
 		},
 	}
+}
+
+func buildFabricSnapshots(cfg *config.Config) []FabricSnapshot {
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return nil
+	}
+	cc := cfg.Chassis.Cluster
+	type fabricInput struct {
+		name string
+		peer string
+	}
+	inputs := []fabricInput{
+		{name: cc.FabricInterface, peer: cc.FabricPeerAddress},
+		{name: cc.Fabric1Interface, peer: cc.Fabric1PeerAddress},
+	}
+	var out []FabricSnapshot
+	seen := make(map[string]struct{}, len(inputs))
+	for _, in := range inputs {
+		if in.name == "" {
+			continue
+		}
+		if _, ok := seen[in.name]; ok {
+			continue
+		}
+		seen[in.name] = struct{}{}
+		ifCfg := cfg.Interfaces.Interfaces[in.name]
+		if ifCfg == nil {
+			continue
+		}
+		parentName := ifCfg.LocalFabricMember
+		parentLinux := config.LinuxIfName(parentName)
+		parentIfindex, _, _, _ := buildLinkSnapshot(parentLinux)
+		overlayLinux := config.LinuxIfName(in.name)
+		overlayIfindex, _, _, _ := buildLinkSnapshot(overlayLinux)
+		rxQueues := 0
+		if parentLinux != "" {
+			rxQueues = userspaceRXQueueCount(parentLinux)
+		}
+		out = append(out, FabricSnapshot{
+			Name:            in.name,
+			ParentInterface: parentName,
+			ParentLinuxName: parentLinux,
+			ParentIfindex:   parentIfindex,
+			OverlayLinux:    overlayLinux,
+			OverlayIfindex:  overlayIfindex,
+			RXQueues:        rxQueues,
+			PeerAddress:     in.peer,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out
 }
 
 func userspaceMapPins() UserspaceMapPins {

@@ -115,6 +115,20 @@ func FormatStatusSummary(status ProcessStatus) string {
 		}
 		fmt.Fprintf(&b, "  HA groups:                 %s\n", strings.Join(parts, "; "))
 	}
+	if len(status.Fabrics) > 0 {
+		parts := make([]string, 0, len(status.Fabrics))
+		for _, fabric := range status.Fabrics {
+			part := fabric.Name
+			if fabric.ParentLinuxName != "" {
+				part += fmt.Sprintf(" parent=%s", fabric.ParentLinuxName)
+			}
+			if fabric.PeerAddress != "" {
+				part += fmt.Sprintf(" peer=%s", fabric.PeerAddress)
+			}
+			parts = append(parts, part)
+		}
+		fmt.Fprintf(&b, "  Fabric links:              %s\n", strings.Join(parts, "; "))
+	}
 	if status.LastResolution != nil {
 		fmt.Fprintf(&b, "  Last resolution:           %s", status.LastResolution.Disposition)
 		if status.LastResolution.LocalIfindex > 0 {
@@ -199,6 +213,23 @@ func FormatBindings(status ProcessStatus) string {
 		}
 	}
 	fmt.Fprintln(&b)
+
+	if len(status.Fabrics) > 0 {
+		fmt.Fprintln(&b, "Userspace fabric links:")
+		fmt.Fprintf(&b, "  %-8s %-16s %-8s %-16s %-8s %-7s %s\n", "Name", "Parent", "PIfidx", "Overlay", "OIfidx", "Queues", "Peer")
+		for _, fabric := range status.Fabrics {
+			fmt.Fprintf(&b, "  %-8s %-16s %-8d %-16s %-8d %-7d %s\n",
+				fabric.Name,
+				fabric.ParentLinuxName,
+				fabric.ParentIfindex,
+				fabric.OverlayLinux,
+				fabric.OverlayIfindex,
+				fabric.RXQueues,
+				fabric.PeerAddress,
+			)
+		}
+		fmt.Fprintln(&b)
+	}
 
 	fmt.Fprintln(&b, "Userspace bindings:")
 	if len(status.Bindings) == 0 {
