@@ -2313,9 +2313,9 @@ fn transmit_frame(binding: &mut BindingWorker, frame: &[u8]) -> Result<usize, Tx
         binding.free_tx_frames.push_front(offset);
         return Err(TxError::Retry("tx ring insert failed".to_string()));
     }
-    if binding.tx.needs_wakeup() {
-        binding.tx.wake();
-    }
+    // Reliability first: some mlx5/XSK paths do not consistently surface a
+    // wakeup hint before the TX side needs a kick. Always kick after commit.
+    binding.tx.wake();
     Ok(frame.len())
 }
 
@@ -6439,5 +6439,102 @@ mod tests {
         assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
         assert_eq!(&out[26..30], &[10, 0, 61, 100]);
         assert_eq!(out[22], 63);
+    }
+
+    fn tcp_checksum_ok_ipv4(packet: &[u8]) -> bool {
+        let ihl = usize::from(packet[0] & 0x0f) * 4;
+        let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+        let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+        checksum16_ipv4(src, dst, PROTO_TCP, &packet[ihl..]) == 0
+    }
+
+    #[test]
+    fn apply_nat_ipv4_recomputes_tcp_checksum() {
+        let mut packet = vec![
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0,
+            61, 102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x01, 0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
+            b'd', b'a', b't', b'a',
+        ];
+        let ip_sum = checksum16(&packet[..20]);
+        packet[10] = (ip_sum >> 8) as u8;
+        packet[11] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut packet, 20, PROTO_TCP, false).expect("initial tcp sum");
+        assert!(tcp_checksum_ok_ipv4(&packet));
+
+        apply_nat_ipv4(
+            &mut packet,
+            PROTO_TCP,
+            NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_dst: None,
+            },
+        )
+        .expect("apply nat");
+
+        assert_eq!(&packet[12..16], &[172, 16, 80, 8]);
+        assert!(tcp_checksum_ok_ipv4(&packet));
+    }
+
+    #[test]
+    fn build_forwarded_frame_keeps_tcp_checksum_valid_after_snat() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0,
+            61, 102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x01, 0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
+            b'd', b'a', b't', b'a',
+        ]);
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len()).expect("slice").copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            ..UserspaceDpMeta::default()
+        };
+        let out = build_forwarded_frame(
+            &area,
+            XdpDesc { addr: 0, len: frame.len() as u32, options: 0 },
+            meta,
+            &SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::ForwardCandidate,
+                    local_ifindex: 0,
+                    egress_ifindex: 12,
+                    tx_ifindex: 11,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+                    neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                    src_mac: None,
+                    tx_vlan_id: 80,
+                },
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                    rewrite_dst: None,
+                },
+            },
+            &state,
+        )
+        .expect("forwarded frame");
+
+        assert_eq!(&out[30..34], &[172, 16, 80, 8]);
+        assert_eq!(out[26], 63);
+        assert!(tcp_checksum_ok_ipv4(&out[18..]));
     }
 }
