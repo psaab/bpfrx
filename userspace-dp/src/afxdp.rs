@@ -31,10 +31,10 @@ const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
 const USERSPACE_META_VERSION: u16 = 3;
 const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
-const RX_BATCH_SIZE: u32 = 256;
+const RX_BATCH_SIZE: u32 = 128;
 const MIN_RESERVED_TX_FRAMES: u32 = 64;
 const MAX_RESERVED_TX_FRAMES: u32 = 512;
-const TX_BATCH_SIZE: usize = 256;
+const TX_BATCH_SIZE: usize = 128;
 const IDLE_YIELD_ITERS: u32 = 64;
 const IDLE_SLEEP_AFTER: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
@@ -2863,6 +2863,7 @@ fn worker_loop(
     let mut last_stats_poll = Instant::now();
     let mut last_neighbor_sync = Instant::now() - NEIGHBOR_SYNC_INTERVAL;
     let mut idle_iters = 0u32;
+    let mut poll_start = 0usize;
     while !stop.load(Ordering::Relaxed) {
         heartbeat.store(now_nanos(), Ordering::Relaxed);
         apply_worker_commands(&commands, &mut sessions);
@@ -2874,7 +2875,12 @@ fn worker_loop(
             last_neighbor_sync = Instant::now();
         }
         let mut did_work = false;
-        for idx in 0..bindings.len() {
+        for offset in 0..bindings.len() {
+            let idx = if bindings.is_empty() {
+                0
+            } else {
+                (poll_start + offset) % bindings.len()
+            };
             if poll_binding(
                 idx,
                 &mut bindings,
@@ -2893,6 +2899,9 @@ fn worker_loop(
             ) {
                 did_work = true;
             }
+        }
+        if !bindings.is_empty() {
+            poll_start = (poll_start + 1) % bindings.len();
         }
         if poll_stats {
             last_stats_poll = Instant::now();
