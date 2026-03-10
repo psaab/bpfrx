@@ -2,15 +2,15 @@ use super::{
     BindingStatus, ConfigSnapshot, ExceptionStatus, HAGroupStatus, InjectPacketRequest,
     InterfaceSnapshot, PacketResolution, SessionDeltaInfo,
 };
-use arc_swap::ArcSwap;
-use crate::nat::{NatDecision, SourceNatRule, match_source_nat, parse_source_nat_rules};
-use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
+use crate::nat::{match_source_nat, parse_source_nat_rules, NatDecision, SourceNatRule};
+use crate::policy::{evaluate_policy, parse_policy_state, PolicyAction, PolicyState};
 use crate::prefix::{PrefixV4, PrefixV6};
 use crate::session::{
-    ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
-    SessionLookup, SessionMetadata, SessionTable, reply_matches_forward_nat,
+    reply_matches_forward_nat, ForwardSessionMatch, SessionDecision, SessionDelta,
+    SessionDeltaKind, SessionKey, SessionLookup, SessionMetadata, SessionTable,
 };
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus};
+use arc_swap::ArcSwap;
 use chrono::Utc;
 use core::ffi::{c_int, c_void};
 use core::num::NonZeroU32;
@@ -972,10 +972,10 @@ impl ForwardingResolution {
             src_port: debug.map(|d| d.src_port).unwrap_or_default(),
             dst_port: debug.map(|d| d.dst_port).unwrap_or_default(),
             from_zone: debug
-                .and_then(|d| d.from_zone.clone())
+                .and_then(|d| d.from_zone.as_ref().map(|zone| zone.to_string()))
                 .unwrap_or_default(),
             to_zone: debug
-                .and_then(|d| d.to_zone.clone())
+                .and_then(|d| d.to_zone.as_ref().map(|zone| zone.to_string()))
                 .unwrap_or_default(),
         }
     }
@@ -1011,6 +1011,7 @@ struct BindingWorker {
     last_heartbeat_update_ns: u64,
     last_rx_wake_ns: u64,
     last_tx_wake_ns: u64,
+    outstanding_tx: u32,
     empty_rx_polls: u32,
     last_learned_neighbor: Option<LearnedNeighborKey>,
 }
@@ -1081,8 +1082,8 @@ struct ResolutionDebug {
     dst_ip: Option<IpAddr>,
     src_port: u16,
     dst_port: u16,
-    from_zone: Option<String>,
-    to_zone: Option<String>,
+    from_zone: Option<Arc<str>>,
+    to_zone: Option<Arc<str>>,
 }
 
 impl ResolutionDebug {
@@ -1167,17 +1168,15 @@ impl BindingWorker {
         let (user, rx, tx, bind_mode) =
             match open_user_rings(&umem, &sock, ring_entries, XSK_BIND_FLAGS_PREFERRED) {
                 Ok(bound) => bound,
-                Err(preferred_err) => open_user_rings(
-                    &umem,
-                    &sock,
-                    ring_entries,
-                    XSK_BIND_FLAGS_FALLBACK,
-                )
-                .map_err(|fallback_err| {
-                    format!(
+                Err(preferred_err) => {
+                    open_user_rings(&umem, &sock, ring_entries, XSK_BIND_FLAGS_FALLBACK).map_err(
+                        |fallback_err| {
+                            format!(
                         "configure AF_XDP rings: zerocopy={preferred_err}; fallback={fallback_err}"
                     )
-                })?,
+                        },
+                    )?
+                }
             };
         let reserved_tx = ring_entries
             .saturating_div(2)
@@ -1200,7 +1199,8 @@ impl BindingWorker {
             live.set_xsk_registered(true);
             live.clear_error();
         }
-        if let Err(err) = touch_heartbeat(heartbeat_map_fd, binding.slot, &live) {
+        let init_now = monotonic_nanos();
+        if let Err(err) = touch_heartbeat(heartbeat_map_fd, binding.slot, &live, init_now) {
             live.set_error(format!("update heartbeat slot: {err}"));
         }
         Ok(Self {
@@ -1226,9 +1226,10 @@ impl BindingWorker {
             scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
             scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
             heartbeat_map_fd,
-            last_heartbeat_update_ns: monotonic_nanos(),
-            last_rx_wake_ns: monotonic_nanos(),
-            last_tx_wake_ns: monotonic_nanos(),
+            last_heartbeat_update_ns: init_now,
+            last_rx_wake_ns: init_now,
+            last_tx_wake_ns: init_now,
+            outstanding_tx: 0,
             empty_rx_polls: 0,
             last_learned_neighbor: None,
         })
@@ -1319,10 +1320,9 @@ fn poll_binding(
     };
     let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
-    let reaped = reap_tx_completions(binding);
-    let tx_work = drain_pending_tx(binding);
-    let fill_work = drain_pending_fill(binding);
-    let mut did_work = reaped > 0 || tx_work || fill_work;
+    let tx_work = drain_pending_tx(binding, now_ns);
+    let fill_work = drain_pending_fill(binding, now_ns);
+    let mut did_work = tx_work || fill_work;
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
         let available = binding.rx.available().min(RX_BATCH_SIZE);
         if available == 0 {
@@ -1382,10 +1382,8 @@ fn poll_binding(
                             binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
                             let mut decision = hit.decision;
                             if let Some(debug) = debug.as_mut() {
-                                debug.from_zone =
-                                    Some(hit.metadata.ingress_zone.to_string());
-                                debug.to_zone =
-                                    Some(hit.metadata.egress_zone.to_string());
+                                debug.from_zone = Some(hit.metadata.ingress_zone.clone());
+                                debug.to_zone = Some(hit.metadata.egress_zone.clone());
                             }
                             decision.resolution = redirect_via_fabric_if_needed(
                                 forwarding,
@@ -1448,10 +1446,8 @@ fn poll_binding(
                                 meta.tcp_flags,
                             );
                             if let Some(debug) = debug.as_mut() {
-                                debug.from_zone =
-                                    Some(replica.metadata.ingress_zone.to_string());
-                                debug.to_zone =
-                                    Some(replica.metadata.egress_zone.to_string());
+                                debug.from_zone = Some(replica.metadata.ingress_zone.clone());
+                                debug.to_zone = Some(replica.metadata.egress_zone.clone());
                             }
                             let mut decision = replica.decision;
                             decision.resolution = redirect_via_fabric_if_needed(
@@ -1516,10 +1512,8 @@ fn poll_binding(
                             binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
                             binding.live.session_creates.fetch_add(1, Ordering::Relaxed);
                             if let Some(debug) = debug.as_mut() {
-                                debug.from_zone =
-                                    Some(repaired.metadata.ingress_zone.to_string());
-                                debug.to_zone =
-                                    Some(repaired.metadata.egress_zone.to_string());
+                                debug.from_zone = Some(repaired.metadata.ingress_zone.clone());
+                                debug.to_zone = Some(repaired.metadata.egress_zone.clone());
                             }
                             let mut decision = repaired.decision;
                             decision.resolution = redirect_via_fabric_if_needed(
@@ -1558,23 +1552,19 @@ fn poll_binding(
                                 resolution,
                                 nat: NatDecision::default(),
                             };
+                            let (from_zone, to_zone) = zone_pair_for_flow_with_override(
+                                forwarding,
+                                meta.ingress_ifindex as i32,
+                                ingress_zone_override.as_deref(),
+                                resolution.egress_ifindex,
+                            );
+                            let from_zone_arc = Arc::<str>::from(from_zone.as_str());
+                            let to_zone_arc = Arc::<str>::from(to_zone.as_str());
                             if let Some(debug) = debug.as_mut() {
-                                let (from_zone, to_zone) = zone_pair_for_flow_with_override(
-                                    forwarding,
-                                    meta.ingress_ifindex as i32,
-                                    ingress_zone_override.as_deref(),
-                                    resolution.egress_ifindex,
-                                );
-                                debug.from_zone = Some(from_zone);
-                                debug.to_zone = Some(to_zone);
+                                debug.from_zone = Some(from_zone_arc.clone());
+                                debug.to_zone = Some(to_zone_arc.clone());
                             }
                             if resolution.disposition == ForwardingDisposition::ForwardCandidate {
-                                let (from_zone, to_zone) = zone_pair_for_flow_with_override(
-                                    forwarding,
-                                    meta.ingress_ifindex as i32,
-                                    ingress_zone_override.as_deref(),
-                                    resolution.egress_ifindex,
-                                );
                                 let owner_rg_id =
                                     owner_rg_for_flow(forwarding, resolution.egress_ifindex);
                                 if allow_unsolicited_dns_reply(forwarding, flow) {
@@ -1600,8 +1590,8 @@ fn poll_binding(
                                     .unwrap_or_default();
                                     let mut created = 0u64;
                                     let forward_metadata = SessionMetadata {
-                                        ingress_zone: Arc::<str>::from(from_zone.as_str()),
-                                        egress_zone: Arc::<str>::from(to_zone.as_str()),
+                                        ingress_zone: from_zone_arc.clone(),
+                                        egress_zone: to_zone_arc.clone(),
                                         owner_rg_id,
                                         is_reverse: false,
                                         synced: false,
@@ -1651,8 +1641,8 @@ fn poll_binding(
                                     };
                                     let reverse_key = flow.reverse_key_with_nat(decision.nat);
                                     let reverse_metadata = SessionMetadata {
-                                        ingress_zone: Arc::<str>::from(to_zone.as_str()),
-                                        egress_zone: Arc::<str>::from(from_zone.as_str()),
+                                        ingress_zone: to_zone_arc,
+                                        egress_zone: from_zone_arc,
                                         owner_rg_id,
                                         is_reverse: true,
                                         synced: false,
@@ -1692,13 +1682,14 @@ fn poll_binding(
                             } else if resolution.disposition == ForwardingDisposition::HAInactive
                                 && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
                             {
-                                if let Some((Some(from_zone), _)) = debug.as_ref().map(|debug| {
-                                    (debug.from_zone.clone(), debug.to_zone.clone())
-                                })
+                                if let Some((Some(from_zone), _)) = debug
+                                    .as_ref()
+                                    .map(|debug| (debug.from_zone.clone(), debug.to_zone.clone()))
                                 {
-                                    if let Some(redirect) =
-                                        resolve_zone_encoded_fabric_redirect(forwarding, &from_zone)
-                                    {
+                                    if let Some(redirect) = resolve_zone_encoded_fabric_redirect(
+                                        forwarding,
+                                        from_zone.as_ref(),
+                                    ) {
                                         decision.resolution = redirect;
                                     }
                                 }
@@ -1784,6 +1775,7 @@ fn poll_binding(
             binding,
             right,
             &mut pending_forwards,
+            now_ns,
             forwarding,
             &ident,
             recent_exceptions,
@@ -1793,7 +1785,7 @@ fn poll_binding(
             binding
                 .pending_fill_frames
                 .extend(binding.scratch_recycle.drain(..));
-            let _ = drain_pending_fill(binding);
+            let _ = drain_pending_fill(binding, now_ns);
         }
         binding
             .live
@@ -1846,6 +1838,7 @@ fn enqueue_pending_forwards(
     ingress_binding: &mut BindingWorker,
     right: &mut [BindingWorker],
     pending_forwards: &mut Vec<PendingForwardRequest>,
+    now_ns: u64,
     forwarding: &ForwardingState,
     ingress_ident: &BindingIdentity,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
@@ -1876,8 +1869,7 @@ fn enqueue_pending_forwards(
         // subset that does not overlap RX descriptors on the same worker.
         let ingress_area = unsafe { &*ingress_area_ptr };
         if target_binding.free_tx_frames.is_empty() {
-            let _ = drain_pending_tx(target_binding);
-            let _ = reap_tx_completions(target_binding);
+            let _ = drain_pending_tx(target_binding, now_ns);
         }
         if let Some(offset) = target_binding.free_tx_frames.pop_front() {
             match target_binding
@@ -1960,11 +1952,11 @@ fn enqueue_pending_forwards(
         if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
             || target_binding.pending_tx_local.len() >= TX_BATCH_SIZE
         {
-            let _ = drain_pending_tx(target_binding);
+            let _ = drain_pending_tx(target_binding, now_ns);
         }
         ingress_binding.pending_fill_frames.push_back(source_offset);
         if ingress_binding.pending_fill_frames.len() >= FILL_DRAIN_WATERMARK {
-            let _ = drain_pending_fill(ingress_binding);
+            let _ = drain_pending_fill(ingress_binding, now_ns);
         }
     }
 }
@@ -2502,6 +2494,9 @@ fn session_delta_event(kind: SessionDeltaKind) -> &'static str {
 }
 
 fn reap_tx_completions(binding: &mut BindingWorker) -> u32 {
+    if binding.outstanding_tx == 0 {
+        return 0;
+    }
     let available = binding.device.available();
     if available == 0 {
         return 0;
@@ -2513,10 +2508,11 @@ fn reap_tx_completions(binding: &mut BindingWorker) -> u32 {
         reaped += 1;
     }
     completed.release();
+    binding.outstanding_tx = binding.outstanding_tx.saturating_sub(reaped);
     reaped
 }
 
-fn drain_pending_fill(binding: &mut BindingWorker) -> bool {
+fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bool {
     if binding.pending_fill_frames.is_empty() {
         return false;
     }
@@ -2552,7 +2548,7 @@ fn drain_pending_fill(binding: &mut BindingWorker) -> bool {
         }
     }
     binding.scratch_fill.clear();
-    maybe_wake_rx(binding, true, monotonic_nanos());
+    maybe_wake_rx(binding, true, now_ns);
     true
 }
 
@@ -2576,10 +2572,17 @@ fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, now_ns: u64) {
     binding.empty_rx_polls = 0;
 }
 
-fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
-    let mut did_work = false;
+fn drain_pending_tx(binding: &mut BindingWorker, now_ns: u64) -> bool {
+    if binding.outstanding_tx == 0
+        && binding.pending_tx_prepared.is_empty()
+        && binding.pending_tx_local.is_empty()
+        && binding.live.pending_tx_empty()
+    {
+        return false;
+    }
+    let mut did_work = reap_tx_completions(binding) > 0;
     while !binding.pending_tx_prepared.is_empty() {
-        match transmit_prepared_batch(binding) {
+        match transmit_prepared_batch(binding, now_ns) {
             Ok((packets, bytes)) => {
                 if packets == 0 {
                     break;
@@ -2601,9 +2604,19 @@ fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
             }
         }
     }
-    let mut pending = core::mem::take(&mut binding.pending_tx_local);
-    let mut shared = binding.live.take_pending_tx();
-    pending.append(&mut shared);
+    let mut pending = if binding.pending_tx_local.is_empty() {
+        binding.live.take_pending_tx()
+    } else {
+        core::mem::take(&mut binding.pending_tx_local)
+    };
+    if !binding.live.pending_tx_empty() {
+        let mut shared = binding.live.take_pending_tx();
+        if pending.is_empty() {
+            pending = shared;
+        } else if !shared.is_empty() {
+            pending.append(&mut shared);
+        }
+    }
     if pending.is_empty() {
         return did_work || !binding.pending_tx_prepared.is_empty();
     }
@@ -2611,7 +2624,7 @@ fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
     while let Some(req) = pending.pop_front() {
         retry.push_back(req);
         if retry.len() >= TX_BATCH_SIZE || binding.free_tx_frames.is_empty() || pending.is_empty() {
-            match transmit_batch(binding, &mut retry) {
+            match transmit_batch(binding, &mut retry, now_ns) {
                 Ok((packets, bytes)) => {
                     if packets > 0 {
                         did_work = true;
@@ -2652,6 +2665,7 @@ enum TxError {
 fn transmit_batch(
     binding: &mut BindingWorker,
     pending: &mut VecDeque<TxRequest>,
+    now_ns: u64,
 ) -> Result<(u64, u64), TxError> {
     if pending.is_empty() {
         return Ok((0, 0));
@@ -2664,7 +2678,7 @@ fn transmit_batch(
         .min(binding.free_tx_frames.len())
         .min(TX_BATCH_SIZE);
     if batch_size == 0 {
-        maybe_wake_tx(binding, true, monotonic_nanos());
+        maybe_wake_tx(binding, true, now_ns);
         return Err(TxError::Retry("no free TX frame available".to_string()));
     }
 
@@ -2689,27 +2703,33 @@ fn transmit_batch(
     }
 
     if binding.scratch_local_tx.is_empty() {
-        maybe_wake_tx(binding, true, monotonic_nanos());
+        maybe_wake_tx(binding, true, now_ns);
         return Err(TxError::Retry("no prepared TX frame available".to_string()));
     }
 
     let mut writer = binding.tx.transmit(binding.scratch_local_tx.len() as u32);
-    let inserted = writer.insert(binding.scratch_local_tx.iter().map(|(offset, req)| XdpDesc {
-        addr: *offset,
-        len: req.bytes.len() as u32,
-        options: 0,
-    }));
+    let inserted = writer.insert(
+        binding
+            .scratch_local_tx
+            .iter()
+            .map(|(offset, req)| XdpDesc {
+                addr: *offset,
+                len: req.bytes.len() as u32,
+                options: 0,
+            }),
+    );
     writer.commit();
     drop(writer);
 
     if inserted == 0 {
-        maybe_wake_tx(binding, true, monotonic_nanos());
+        maybe_wake_tx(binding, true, now_ns);
         while let Some((offset, req)) = binding.scratch_local_tx.pop() {
             binding.free_tx_frames.push_front(offset);
             pending.push_front(req);
         }
         return Err(TxError::Retry("tx ring insert failed".to_string()));
     }
+    binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
@@ -2723,11 +2743,14 @@ fn transmit_batch(
         }
     }
 
-    maybe_wake_tx(binding, inserted < batch_size as u32, monotonic_nanos());
+    maybe_wake_tx(binding, inserted < batch_size as u32, now_ns);
     Ok((sent_packets, sent_bytes))
 }
 
-fn transmit_prepared_batch(binding: &mut BindingWorker) -> Result<(u64, u64), TxError> {
+fn transmit_prepared_batch(
+    binding: &mut BindingWorker,
+    now_ns: u64,
+) -> Result<(u64, u64), TxError> {
     if binding.pending_tx_prepared.is_empty() {
         return Ok((0, 0));
     }
@@ -2743,7 +2766,9 @@ fn transmit_prepared_batch(binding: &mut BindingWorker) -> Result<(u64, u64), Tx
         return Ok((0, 0));
     }
 
-    let mut writer = binding.tx.transmit(binding.scratch_prepared_tx.len() as u32);
+    let mut writer = binding
+        .tx
+        .transmit(binding.scratch_prepared_tx.len() as u32);
     let inserted = writer.insert(binding.scratch_prepared_tx.iter().map(|req| XdpDesc {
         addr: req.offset,
         len: req.len,
@@ -2753,12 +2778,13 @@ fn transmit_prepared_batch(binding: &mut BindingWorker) -> Result<(u64, u64), Tx
     drop(writer);
 
     if inserted == 0 {
-        maybe_wake_tx(binding, true, monotonic_nanos());
+        maybe_wake_tx(binding, true, now_ns);
         while let Some(req) = binding.scratch_prepared_tx.pop() {
             binding.pending_tx_prepared.push_front(req);
         }
         return Err(TxError::Retry("prepared tx ring insert failed".to_string()));
     }
+    binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
@@ -2771,7 +2797,7 @@ fn transmit_prepared_batch(binding: &mut BindingWorker) -> Result<(u64, u64), Tx
         }
     }
 
-    maybe_wake_tx(binding, inserted < batch_size as u32, monotonic_nanos());
+    maybe_wake_tx(binding, inserted < batch_size as u32, now_ns);
     Ok((sent_packets, sent_bytes))
 }
 
@@ -2823,10 +2849,10 @@ fn record_exception(
                 src_port: debug.map(|d| d.src_port).unwrap_or_default(),
                 dst_port: debug.map(|d| d.dst_port).unwrap_or_default(),
                 from_zone: debug
-                    .and_then(|d| d.from_zone.clone())
+                    .and_then(|d| d.from_zone.as_ref().map(|zone| zone.to_string()))
                     .unwrap_or_default(),
                 to_zone: debug
-                    .and_then(|d| d.to_zone.clone())
+                    .and_then(|d| d.to_zone.as_ref().map(|zone| zone.to_string()))
                     .unwrap_or_default(),
             },
         );
@@ -3304,8 +3330,7 @@ fn worker_loop(
                     .fetch_add(expired, Ordering::Relaxed);
             }
         }
-        let poll_stats =
-            loop_now_ns.saturating_sub(last_stats_poll_ns) >= STATS_POLL_INTERVAL_NS;
+        let poll_stats = loop_now_ns.saturating_sub(last_stats_poll_ns) >= STATS_POLL_INTERVAL_NS;
         let poll_neighbors = worker_id == 0
             && loop_now_ns.saturating_sub(last_neighbor_sync_ns) >= NEIGHBOR_SYNC_INTERVAL_NS;
         if poll_neighbors {
@@ -4767,27 +4792,25 @@ fn build_forwarded_frame_into(
         return None;
     }
     let payload = &frame[l3..];
-    let (src_mac, vlan_id, apply_nat) = if decision.resolution.disposition
-        == ForwardingDisposition::FabricRedirect
-    {
-        (
-            decision.resolution.src_mac?,
-            decision.resolution.tx_vlan_id,
-            false,
-        )
-    } else {
-        (
-            decision.resolution.src_mac
-                .or_else(|| {
+    let (src_mac, vlan_id, apply_nat) =
+        if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
+            (
+                decision.resolution.src_mac?,
+                decision.resolution.tx_vlan_id,
+                false,
+            )
+        } else {
+            (
+                decision.resolution.src_mac.or_else(|| {
                     forwarding
                         .egress
                         .get(&decision.resolution.egress_ifindex)
                         .map(|egress| egress.src_mac)
                 })?,
-            decision.resolution.tx_vlan_id,
-            true,
-        )
-    };
+                decision.resolution.tx_vlan_id,
+                true,
+            )
+        };
     let eth_len = if vlan_id > 0 { 18 } else { 14 };
     let ether_type = match meta.addr_family as i32 {
         libc::AF_INET => 0x0800,
@@ -5262,7 +5285,13 @@ fn adjust_l4_checksum_ipv4_src(
     old_src: Ipv4Addr,
     new_src: Ipv4Addr,
 ) -> Option<()> {
-    adjust_l4_checksum_ipv4_words(packet, ihl, protocol, &ipv4_words(old_src), &ipv4_words(new_src))
+    adjust_l4_checksum_ipv4_words(
+        packet,
+        ihl,
+        protocol,
+        &ipv4_words(old_src),
+        &ipv4_words(new_src),
+    )
 }
 
 fn adjust_l4_checksum_ipv4_dst(
@@ -5272,7 +5301,13 @@ fn adjust_l4_checksum_ipv4_dst(
     old_dst: Ipv4Addr,
     new_dst: Ipv4Addr,
 ) -> Option<()> {
-    adjust_l4_checksum_ipv4_words(packet, ihl, protocol, &ipv4_words(old_dst), &ipv4_words(new_dst))
+    adjust_l4_checksum_ipv4_words(
+        packet,
+        ihl,
+        protocol,
+        &ipv4_words(old_dst),
+        &ipv4_words(new_dst),
+    )
 }
 
 fn adjust_l4_checksum_ipv4_words(
@@ -5575,7 +5610,12 @@ fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
     if now_ns.saturating_sub(binding.last_heartbeat_update_ns) < HEARTBEAT_UPDATE_INTERVAL_NS {
         return;
     }
-    match touch_heartbeat(binding.heartbeat_map_fd, binding.slot, &binding.live) {
+    match touch_heartbeat(
+        binding.heartbeat_map_fd,
+        binding.slot,
+        &binding.live,
+        now_ns,
+    ) {
         Ok(()) => binding.last_heartbeat_update_ns = now_ns,
         Err(err) => binding
             .live
@@ -5583,10 +5623,14 @@ fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
     }
 }
 
-fn touch_heartbeat(map_fd: c_int, slot: u32, live: &BindingLiveState) -> io::Result<()> {
-    let monotonic = monotonic_nanos();
-    update_heartbeat_slot(map_fd, slot, monotonic)?;
-    live.set_last_heartbeat();
+fn touch_heartbeat(
+    map_fd: c_int,
+    slot: u32,
+    live: &BindingLiveState,
+    now_ns: u64,
+) -> io::Result<()> {
+    update_heartbeat_slot(map_fd, slot, now_ns)?;
+    live.set_last_heartbeat_at(now_ns);
     Ok(())
 }
 
@@ -5791,9 +5835,8 @@ impl BindingLiveState {
         self.bind_mode.store(mode.as_u8(), Ordering::Relaxed);
     }
 
-    fn set_last_heartbeat(&self) {
-        self.last_heartbeat
-            .store(monotonic_nanos(), Ordering::Relaxed);
+    fn set_last_heartbeat_at(&self, now_ns: u64) {
+        self.last_heartbeat.store(now_ns, Ordering::Relaxed);
     }
 
     fn clear_error(&self) {
