@@ -1586,6 +1586,8 @@ fn forward_live_packet(
     let Some(target_live) = find_target_live(
         left,
         ingress_ifindex,
+        ingress_ident.queue_id,
+        ingress_ident.worker_id,
         ingress_live.clone(),
         right,
         target_ifindex,
@@ -1901,6 +1903,8 @@ fn learn_dynamic_neighbor(
 fn find_target_live(
     left: &[BindingWorker],
     ingress_ifindex: i32,
+    ingress_queue_id: u32,
+    ingress_worker_id: u32,
     ingress_live: Arc<BindingLiveState>,
     right: &[BindingWorker],
     egress_ifindex: i32,
@@ -1908,12 +1912,23 @@ fn find_target_live(
     if ingress_ifindex == egress_ifindex {
         return Some(ingress_live);
     }
-    for binding in left.iter().chain(right.iter()) {
-        if binding.ifindex == egress_ifindex {
-            return Some(binding.live.clone());
-        }
-    }
-    None
+    let candidates = left
+        .iter()
+        .chain(right.iter())
+        .filter(|binding| binding.ifindex == egress_ifindex)
+        .collect::<Vec<_>>();
+    candidates
+        .iter()
+        .find(|binding| binding.queue_id == ingress_queue_id)
+        .copied()
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|binding| binding.worker_id == ingress_worker_id)
+                .copied()
+        })
+        .or_else(|| candidates.first().copied())
+        .map(|binding| binding.live.clone())
 }
 
 fn flush_session_deltas(
