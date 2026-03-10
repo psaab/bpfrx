@@ -44,6 +44,7 @@ const BIND_RETRY_ATTEMPTS: usize = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
 const HA_WATCHDOG_STALE_AFTER_SECS: u64 = 2;
+const FABRIC_ZONE_MAC_MAGIC: u8 = 0xfe;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const PROTO_ICMP: u8 = 1;
@@ -816,6 +817,8 @@ struct ForwardingState {
     neighbors: BTreeMap<(i32, IpAddr), NeighborEntry>,
     ifindex_to_name: BTreeMap<i32, String>,
     ifindex_to_zone: BTreeMap<i32, String>,
+    zone_name_to_id: BTreeMap<String, u16>,
+    zone_id_to_name: BTreeMap<u16, String>,
     egress: BTreeMap<i32, EgressInterface>,
     fabrics: Vec<FabricLink>,
     allow_dns_reply: bool,
@@ -1222,6 +1225,8 @@ fn poll_binding(
                         dynamic_neighbors,
                     );
                 }
+                let ingress_zone_override =
+                    parse_zone_encoded_fabric_ingress(&binding.area, desc, meta, forwarding);
                 let mut debug = flow
                     .as_ref()
                     .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
@@ -1298,18 +1303,20 @@ fn poll_binding(
                             nat: NatDecision::default(),
                         };
                         if let Some(debug) = debug.as_mut() {
-                            let (from_zone, to_zone) = zone_pair_for_flow(
+                            let (from_zone, to_zone) = zone_pair_for_flow_with_override(
                                 forwarding,
                                 meta.ingress_ifindex as i32,
+                                ingress_zone_override.as_deref(),
                                 resolution.egress_ifindex,
                             );
                             debug.from_zone = from_zone;
                             debug.to_zone = to_zone;
                         }
                         if resolution.disposition == ForwardingDisposition::ForwardCandidate {
-                            let (from_zone, to_zone) = zone_pair_for_flow(
+                            let (from_zone, to_zone) = zone_pair_for_flow_with_override(
                                 forwarding,
                                 meta.ingress_ifindex as i32,
+                                ingress_zone_override.as_deref(),
                                 resolution.egress_ifindex,
                             );
                             let owner_rg_id =
@@ -1418,6 +1425,19 @@ fn poll_binding(
                             } else {
                                 decision.resolution.disposition =
                                     ForwardingDisposition::PolicyDenied;
+                            }
+                        } else if resolution.disposition == ForwardingDisposition::HAInactive
+                            && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                        {
+                            if let Some((from_zone, _)) = debug
+                                .as_ref()
+                                .map(|debug| (debug.from_zone.clone(), debug.to_zone.clone()))
+                            {
+                                if let Some(redirect) =
+                                    resolve_zone_encoded_fabric_redirect(forwarding, &from_zone)
+                                {
+                                    decision.resolution = redirect;
+                                }
                             }
                         }
                         decision
@@ -1794,6 +1814,30 @@ fn parse_flow_ports(frame: &[u8], l4: usize, protocol: u8) -> Option<(u16, u16)>
     }
 }
 
+fn parse_zone_encoded_fabric_ingress(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    forwarding: &ForwardingState,
+) -> Option<String> {
+    if !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32) {
+        return None;
+    }
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    if frame.len() < 12 {
+        return None;
+    }
+    if frame[6] != 0x02
+        || frame[7] != 0xbf
+        || frame[8] != 0x72
+        || frame[9] != FABRIC_ZONE_MAC_MAGIC
+        || frame[10] != 0x00
+    {
+        return None;
+    }
+    forwarding.zone_id_to_name.get(&(frame[11] as u16)).cloned()
+}
+
 fn learn_dynamic_neighbor_from_packet(
     area: &MmapArea,
     desc: XdpDesc,
@@ -1806,6 +1850,14 @@ fn learn_dynamic_neighbor_from_packet(
         return;
     };
     if frame.len() < 12 {
+        return;
+    }
+    if frame[6] == 0x02
+        && frame[7] == 0xbf
+        && frame[8] == 0x72
+        && frame[9] == FABRIC_ZONE_MAC_MAGIC
+        && frame[10] == 0x00
+    {
         return;
     }
     let mut src_mac = [0u8; 6];
@@ -2510,6 +2562,14 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     let mut linux_to_ifindex = BTreeMap::new();
     let mut mac_by_ifindex = BTreeMap::new();
 
+    for zone in &snapshot.zones {
+        if zone.id == 0 || zone.name.is_empty() {
+            continue;
+        }
+        state.zone_name_to_id.insert(zone.name.clone(), zone.id);
+        state.zone_id_to_name.insert(zone.id, zone.name.clone());
+    }
+
     for iface in &snapshot.interfaces {
         if iface.ifindex <= 0 {
             continue;
@@ -2963,10 +3023,18 @@ fn zone_pair_for_flow(
     ingress_ifindex: i32,
     egress_ifindex: i32,
 ) -> (String, String) {
-    let from_zone = forwarding
-        .ifindex_to_zone
-        .get(&ingress_ifindex)
-        .cloned()
+    zone_pair_for_flow_with_override(forwarding, ingress_ifindex, None, egress_ifindex)
+}
+
+fn zone_pair_for_flow_with_override(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    ingress_zone_override: Option<&str>,
+    egress_ifindex: i32,
+) -> (String, String) {
+    let from_zone = ingress_zone_override
+        .map(|zone| zone.to_string())
+        .or_else(|| forwarding.ifindex_to_zone.get(&ingress_ifindex).cloned())
         .unwrap_or_default();
     let to_zone = forwarding
         .egress
@@ -3012,6 +3080,19 @@ fn resolve_fabric_redirect(forwarding: &ForwardingState) -> Option<ForwardingRes
         src_mac: Some(fabric.local_mac),
         tx_vlan_id: 0,
     })
+}
+
+fn resolve_zone_encoded_fabric_redirect(
+    forwarding: &ForwardingState,
+    ingress_zone: &str,
+) -> Option<ForwardingResolution> {
+    let mut resolution = resolve_fabric_redirect(forwarding)?;
+    let zone_id = forwarding.zone_name_to_id.get(ingress_zone).copied()?;
+    if zone_id == 0 || zone_id > u8::MAX as u16 {
+        return None;
+    }
+    resolution.src_mac = Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, zone_id as u8]);
+    Some(resolution)
 }
 
 fn redirect_via_fabric_if_needed(
@@ -4486,11 +4567,15 @@ mod tests {
     use super::*;
     use crate::{
         FabricSnapshot, InterfaceAddressSnapshot, InterfaceSnapshot, NeighborSnapshot,
-        PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot,
+        PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot, ZoneSnapshot,
     };
 
     fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
         ConfigSnapshot {
+            zones: vec![ZoneSnapshot {
+                name: "wan".to_string(),
+                id: 1,
+            }],
             interfaces: vec![InterfaceSnapshot {
                 name: "ge-0/0/0.50".to_string(),
                 zone: "wan".to_string(),
@@ -4669,6 +4754,16 @@ mod tests {
 
     fn nat_snapshot() -> ConfigSnapshot {
         ConfigSnapshot {
+            zones: vec![
+                ZoneSnapshot {
+                    name: "lan".to_string(),
+                    id: 1,
+                },
+                ZoneSnapshot {
+                    name: "wan".to_string(),
+                    id: 2,
+                },
+            ],
             interfaces: vec![
                 InterfaceSnapshot {
                     name: "reth1.0".to_string(),
@@ -5034,6 +5129,115 @@ mod tests {
         assert_eq!(
             redirected.src_mac,
             Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01])
+        );
+    }
+
+    #[test]
+    fn zone_encoded_fabric_redirect_preserves_ingress_zone() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let redirected =
+            resolve_zone_encoded_fabric_redirect(&state, "lan").expect("zone-encoded redirect");
+        assert_eq!(
+            redirected.disposition,
+            ForwardingDisposition::FabricRedirect
+        );
+        assert_eq!(redirected.egress_ifindex, 21);
+        assert_eq!(redirected.tx_ifindex, 21);
+        assert_eq!(
+            redirected.src_mac,
+            Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01])
+        );
+    }
+
+    #[test]
+    fn parse_zone_encoded_fabric_ingress_uses_zone_override() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let mut frame = vec![0u8; 64];
+        frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]);
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 21,
+            ..UserspaceDpMeta::default()
+        };
+        assert_eq!(
+            parse_zone_encoded_fabric_ingress(
+                &area,
+                XdpDesc {
+                    addr: 0,
+                    len: frame.len() as u32,
+                    options: 0,
+                },
+                meta,
+                &state,
+            ),
+            Some("lan".to_string())
+        );
+    }
+
+    #[test]
+    fn zone_encoded_fabric_ingress_skips_dynamic_neighbor_learning() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let mut frame = vec![0u8; 64];
+        frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]);
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let neighbors = Arc::new(Mutex::new(BTreeMap::new()));
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 21,
+            ..UserspaceDpMeta::default()
+        };
+        learn_dynamic_neighbor_from_packet(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            &state,
+            &neighbors,
+        );
+        assert!(neighbors.lock().expect("neighbors").is_empty());
+    }
+
+    #[test]
+    fn new_flow_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let ha_state = Arc::new(Mutex::new(BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )])));
+        let blocked = enforce_ha_resolution(
+            &state,
+            &ha_state,
+            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        );
+        assert_eq!(blocked.disposition, ForwardingDisposition::HAInactive);
+        let (from_zone, _) = zone_pair_for_flow(&state, 24, blocked.egress_ifindex);
+        let redirected =
+            resolve_zone_encoded_fabric_redirect(&state, &from_zone).expect("fabric redirect");
+        assert_eq!(
+            redirected.disposition,
+            ForwardingDisposition::FabricRedirect
+        );
+        assert_eq!(
+            redirected.src_mac,
+            Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01])
         );
     }
 

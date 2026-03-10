@@ -38,6 +38,7 @@ type ConfigSnapshot struct {
 	Summary       SnapshotSummary         `json:"summary"`
 	Capabilities  UserspaceCapabilities   `json:"capabilities"`
 	MapPins       UserspaceMapPins        `json:"map_pins"`
+	Zones         []ZoneSnapshot          `json:"zones,omitempty"`
 	Interfaces    []InterfaceSnapshot     `json:"interfaces,omitempty"`
 	Fabrics       []FabricSnapshot        `json:"fabrics,omitempty"`
 	Neighbors     []NeighborSnapshot      `json:"neighbors,omitempty"`
@@ -63,6 +64,11 @@ type SnapshotSummary struct {
 	PolicyCount    int    `json:"policy_count"`
 	SchedulerCount int    `json:"scheduler_count"`
 	HAEnabled      bool   `json:"ha_enabled"`
+}
+
+type ZoneSnapshot struct {
+	Name string `json:"name"`
+	ID   uint16 `json:"id"`
 }
 
 type InterfaceSnapshot struct {

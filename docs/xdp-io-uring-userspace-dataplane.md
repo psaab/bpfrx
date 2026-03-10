@@ -878,10 +878,14 @@ Implemented today:
 - per-flow zone policy evaluation before session create/install
 - explicit fabric-link snapshots in the userspace runtime, including parent/overlay ifindex mapping and peer-address visibility
 - userspace helper status and CLI output for tracked `fab0`/`fab1` links
+- plain fabric redirect for established or synced sessions whose owner RG is inactive locally
+- zone-encoded fabric redirect for brand-new flows to peer-owned RGs
+- receiving-node fabric ingress zone override from the encoded source MAC on `fab0`/`fab1`
+- suppression of fake dynamic-neighbor learning from zone-encoded fabric packets
 
 Not implemented yet:
 - worker-local timer wheels or batched expiry structures beyond lazy GC
-- peer-owned RG fabric forwarding and receiving-node fabric packet handling
+- full HA/fabric parity beyond basic redirect and ingress-zone preservation
 - full NAT parity: destination NAT, static NAT, NAT64, NATv6v4, and pool-based source NAT
 - full policy parity: address-books, applications/AppID, global policies, counters,
   reject semantics, and logging

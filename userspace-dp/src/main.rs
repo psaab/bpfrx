@@ -133,6 +133,8 @@ struct ConfigSnapshot {
     #[serde(rename = "map_pins", default)]
     map_pins: MapPins,
     #[serde(default)]
+    zones: Vec<ZoneSnapshot>,
+    #[serde(default)]
     interfaces: Vec<InterfaceSnapshot>,
     #[serde(default)]
     fabrics: Vec<FabricSnapshot>,
@@ -152,6 +154,13 @@ struct ConfigSnapshot {
     userspace: serde_json::Value,
     #[serde(default)]
     config: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct ZoneSnapshot {
+    name: String,
+    #[serde(default)]
+    id: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

@@ -481,6 +481,7 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		Capabilities:  deriveUserspaceCapabilities(cfg),
 		MapPins:       userspaceMapPins(),
 		Userspace:     ucfg,
+		Zones:         buildZoneSnapshots(cfg),
 		Interfaces:    buildInterfaceSnapshots(cfg),
 		Fabrics:       buildFabricSnapshots(cfg),
 		Neighbors:     buildNeighborSnapshots(cfg),
@@ -503,6 +504,25 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 			HAEnabled:      cfg.Chassis.Cluster != nil,
 		},
 	}
+}
+
+func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
+	if cfg == nil || len(cfg.Security.Zones) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]ZoneSnapshot, 0, len(names))
+	for i, name := range names {
+		out = append(out, ZoneSnapshot{
+			Name: name,
+			ID:   uint16(i + 1),
+		})
+	}
+	return out
 }
 
 func buildFabricSnapshots(cfg *config.Config) []FabricSnapshot {
