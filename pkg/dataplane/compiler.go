@@ -300,10 +300,15 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 			}
 		}
 
-		// Try native XDP first. If any interface lacks native support,
-		// ALL must use generic mode for bpf_redirect_map compatibility.
+		// Try native XDP first on non-tunnel interfaces.
+		// Tunnel interfaces (GRE, ip6gre, XFRM) lack native XDP support
+		// and must always use generic mode — but they should NOT force
+		// all other interfaces into generic mode.
 		needGeneric := false
 		for _, ifidx := range result.pendingXDP {
+			if result.tunnelIfindexes[ifidx] {
+				continue // tunnels always get generic below
+			}
 			if err := m.AttachXDP(ifidx, false); err != nil {
 				if strings.Contains(err.Error(), "already attached") {
 					continue
@@ -319,11 +324,19 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 			for _, ifidx := range result.pendingXDP {
 				m.DetachXDP(ifidx)
 			}
-			for _, ifidx := range result.pendingXDP {
-				if err := m.AttachXDP(ifidx, true); err != nil {
-					if !strings.Contains(err.Error(), "already attached") {
-						return nil, fmt.Errorf("attach XDP generic to ifindex %d: %w", ifidx, err)
-					}
+			// Clear IFACE_FLAG_NATIVE_XDP from all iface_zone_map
+			// entries since everything runs in generic mode.
+			m.clearNativeXDPFlags()
+		}
+		// Attach remaining interfaces: generic-only for tunnels,
+		// or all interfaces if needGeneric.
+		for _, ifidx := range result.pendingXDP {
+			if !needGeneric && !result.tunnelIfindexes[ifidx] {
+				continue // already attached native above
+			}
+			if err := m.AttachXDP(ifidx, true); err != nil {
+				if !strings.Contains(err.Error(), "already attached") {
+					return nil, fmt.Errorf("attach XDP generic to ifindex %d: %w", ifidx, err)
 				}
 			}
 		}
@@ -712,6 +725,10 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			}
 			if izFlags&IfaceFlagTunnel != 0 {
 				tunnelIfindexes[physIface.Index] = true
+			} else {
+				// Optimistically set native XDP flag for non-tunnel
+				// interfaces.  Cleared in needGeneric fallback below.
+				izFlags |= IfaceFlagNativeXDP
 			}
 			if err := dp.SetZone(physIface.Index, uint16(vlanID), zid, tableID, izFlags, rgID, screenFlags); err != nil {
 				return fmt.Errorf("set zone for %s vlan %d (ifindex %d): %w",

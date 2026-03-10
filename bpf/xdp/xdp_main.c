@@ -61,18 +61,21 @@ int xdp_main_prog(struct xdp_md *ctx)
 	void *data_end = (void *)(long)ctx->data_end;
 	__u16 l3_offset, eth_proto, vlan_id = 0;
 
+	/* Look up interface zone config early — needed for tunnel
+	 * detection and native_xdp flag. */
+	struct iface_zone_key zk = {
+		.ifindex = ctx->ingress_ifindex,
+		.vlan_id = 0,
+	};
+	struct iface_zone_value *zv =
+		bpf_map_lookup_elem(&iface_zone_map, &zk);
+
 	/* Tunnel interfaces (GRE, ip6gre, XFRM) deliver raw IP with no
 	 * Ethernet header.  Detect via IFACE_FLAG_TUNNEL and prepend a
 	 * pseudo-Ethernet header so the rest of the pipeline has
 	 * consistent Ethernet framing.  xdp_forward strips it before
 	 * any XDP_PASS back to the kernel. */
 	{
-		struct iface_zone_key zk = {
-			.ifindex = ctx->ingress_ifindex,
-			.vlan_id = 0,
-		};
-		struct iface_zone_value *zv =
-			bpf_map_lookup_elem(&iface_zone_map, &zk);
 		if (zv && (zv->flags & IFACE_FLAG_TUNNEL)) {
 			__u8 *first = data;
 			if ((void *)(first + 1) > data_end)
@@ -132,10 +135,11 @@ int xdp_main_prog(struct xdp_md *ctx)
 	meta->now_sec = (__u32)(bpf_ktime_get_coarse_ns() / 1000000000ULL);
 	meta->ktime_ns = 0;
 
-	/* Note: native_xdp detection removed — always run CHECKSUM_PARTIAL
-	 * detection in set_l4_csum_flags().  The ~10-30 insn cost is
-	 * negligible, and skipping it for generic XDP (which preserves
-	 * skb checksums) corrupts TCP/UDP checksums after NAT. */
+	/* Native XDP (driver mode) never has CHECKSUM_PARTIAL — skip the
+	 * ~10-30 insn pseudo-header computation in set_l4_csum_flags().
+	 * Generic XDP preserves skb checksums, so detection is required. */
+	if (zv && (zv->flags & IFACE_FLAG_NATIVE_XDP))
+		meta->native_xdp = 1;
 
 	/* Strip VLAN tag if present so pipeline sees plain Ethernet */
 	if (vlan_id != 0) {

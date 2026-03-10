@@ -200,6 +200,24 @@ func (m *Manager) ClearIfaceZoneMap() error {
 	return nil
 }
 
+// clearNativeXDPFlags removes IfaceFlagNativeXDP from all iface_zone_map
+// entries.  Called when falling back from native to generic XDP mode.
+func (m *Manager) clearNativeXDPFlags() {
+	zm, ok := m.maps["iface_zone_map"]
+	if !ok {
+		return
+	}
+	var key IfaceZoneKey
+	var val IfaceZoneValue
+	iter := zm.Iterate()
+	for iter.Next(&key, &val) {
+		if val.Flags&IfaceFlagNativeXDP != 0 {
+			val.Flags &^= IfaceFlagNativeXDP
+			zm.Update(key, val, ebpf.UpdateAny)
+		}
+	}
+}
+
 // ClearVlanIfaceMap deletes all vlan_iface_map entries.
 func (m *Manager) ClearVlanIfaceMap() error {
 	zm, ok := m.maps["vlan_iface_map"]

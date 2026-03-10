@@ -725,6 +725,9 @@ const MaxRedundancyGroups = 16
 // IfaceFlagTunnel marks an interface as a tunnel (GRE/IPsec).
 const IfaceFlagTunnel = 1 << 0
 
+// IfaceFlagNativeXDP marks an interface with native/driver XDP (no CHECKSUM_PARTIAL).
+const IfaceFlagNativeXDP = 1 << 1
+
 // VlanIfaceInfo mirrors the C struct vlan_iface_info.
 type VlanIfaceInfo struct {
 	ParentIfindex uint32
