@@ -1493,6 +1493,8 @@ type userspaceCtrlValue struct {
 	HeartbeatTimeoutMS uint32
 }
 
+const userspaceMetadataVersion = 3
+
 func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
 	ctrlMap := m.inner.Map("userspace_ctrl")
 	if ctrlMap == nil {
@@ -1526,7 +1528,7 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
 		Enabled:            0,
-		MetadataVersion:    2,
+		MetadataVersion:    userspaceMetadataVersion,
 		Workers:            uint32(cfg.Workers),
 		Flags:              0,
 		ConfigGeneration:   0,
@@ -1633,7 +1635,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
 		Enabled:            0,
-		MetadataVersion:    2,
+		MetadataVersion:    userspaceMetadataVersion,
 		Workers:            uint32(maxInt(status.Workers, 1)),
 		Flags:              0,
 		ConfigGeneration:   status.LastSnapshotGeneration,
