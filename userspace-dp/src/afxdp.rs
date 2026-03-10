@@ -1220,13 +1220,14 @@ fn poll_binding(
                             debug.to_zone = hit.metadata.egress_zone.clone();
                         }
                         if hit.metadata.synced {
+                            let target = resolution_target_for_session(flow, decision);
                             decision.resolution = enforce_ha_resolution(
                                 forwarding,
                                 ha_state,
                                 lookup_forwarding_resolution_with_dynamic(
                                     forwarding,
                                     dynamic_neighbors,
-                                    flow.dst_ip,
+                                    target,
                                 ),
                             );
                         }
@@ -1250,13 +1251,14 @@ fn poll_binding(
                         }
                         let mut decision = replica.decision;
                         if replica.metadata.synced {
+                            let target = resolution_target_for_session(flow, decision);
                             decision.resolution = enforce_ha_resolution(
                                 forwarding,
                                 ha_state,
                                 lookup_forwarding_resolution_with_dynamic(
                                     forwarding,
                                     dynamic_neighbors,
-                                    flow.dst_ip,
+                                    target,
                                 ),
                             );
                         }
@@ -2176,6 +2178,10 @@ fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> SessionKey {
         src_port,
         dst_port,
     }
+}
+
+fn resolution_target_for_session(flow: &SessionFlow, decision: SessionDecision) -> IpAddr {
+    decision.nat.rewrite_dst.unwrap_or(flow.dst_ip)
 }
 
 fn apply_worker_commands(
@@ -5163,6 +5169,41 @@ mod tests {
         assert!(replica.metadata.synced);
         assert_eq!(replica.key, entry.key);
         assert_eq!(replica.decision, entry.decision);
+    }
+
+    #[test]
+    fn resolution_target_uses_rewritten_destination_for_reverse_dnat() {
+        let flow = SessionFlow {
+            src_ip: IpAddr::V6("2001:559:8585:80::200".parse().expect("src")),
+            dst_ip: IpAddr::V6("2001:559:8585:80::8".parse().expect("dst")),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: PROTO_ICMPV6,
+                src_ip: IpAddr::V6("2001:559:8585:80::200".parse().expect("src")),
+                dst_ip: IpAddr::V6("2001:559:8585:80::8".parse().expect("dst")),
+                src_port: 0x1234,
+                dst_port: 0,
+            },
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 5,
+                next_hop: Some(IpAddr::V6(
+                    "2001:559:8585:ef00::100".parse().expect("next hop"),
+                )),
+                neighbor_mac: Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+            },
+            nat: NatDecision {
+                rewrite_src: None,
+                rewrite_dst: Some(IpAddr::V6("2001:559:8585:ef00::100".parse().expect("lan"))),
+            },
+        };
+        assert_eq!(
+            resolution_target_for_session(&flow, decision),
+            IpAddr::V6("2001:559:8585:ef00::100".parse().expect("lan"))
+        );
     }
 
     #[test]
