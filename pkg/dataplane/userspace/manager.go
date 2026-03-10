@@ -647,9 +647,10 @@ func buildRouteSnapshots(cfg *config.Config) []RouteSnapshot {
 			if route == nil {
 				continue
 			}
+			tableName, familyName := normalizeRouteSnapshotFamily(table, family, route.Destination)
 			snap := RouteSnapshot{
-				Table:       table,
-				Family:      family,
+				Table:       tableName,
+				Family:      familyName,
 				Destination: route.Destination,
 				Discard:     route.Discard,
 				NextTable:   route.NextTable,
@@ -694,6 +695,28 @@ func buildRouteSnapshots(cfg *config.Config) []RouteSnapshot {
 		return out[i].Destination < out[j].Destination
 	})
 	return out
+}
+
+func normalizeRouteSnapshotFamily(table, family, destination string) (string, string) {
+	isIPv6 := strings.Contains(destination, ":")
+	if isIPv6 {
+		family = "inet6"
+		switch {
+		case table == "inet.0":
+			table = "inet6.0"
+		case strings.HasSuffix(table, ".inet.0"):
+			table = strings.TrimSuffix(table, ".inet.0") + ".inet6.0"
+		}
+		return table, family
+	}
+	family = "inet"
+	switch {
+	case table == "inet6.0":
+		table = "inet.0"
+	case strings.HasSuffix(table, ".inet6.0"):
+		table = strings.TrimSuffix(table, ".inet6.0") + ".inet.0"
+	}
+	return table, family
 }
 
 func buildSourceNATSnapshots(cfg *config.Config) []SourceNATRuleSnapshot {

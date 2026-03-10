@@ -141,6 +141,31 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	}
 }
 
+func TestBuildRouteSnapshotsNormalizesFamilyFromDestination(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.RoutingOptions.StaticRoutes = []*config.StaticRoute{
+		{Destination: "::/0", NextHops: []config.NextHopEntry{{Address: "2001:db8::1"}}},
+	}
+	cfg.RoutingInstances = []*config.RoutingInstanceConfig{
+		{
+			Name: "blue",
+			StaticRoutes: []*config.StaticRoute{
+				{Destination: "2001:db8:1::/64", NextTable: "core"},
+			},
+		},
+	}
+	routes := buildRouteSnapshots(cfg)
+	if len(routes) != 2 {
+		t.Fatalf("len(routes) = %d, want 2", len(routes))
+	}
+	if routes[0].Family != "inet6" || routes[0].Table != "blue.inet6.0" {
+		t.Fatalf("routes[0] = %+v, want family inet6 table blue.inet6.0", routes[0])
+	}
+	if routes[1].Family != "inet6" || routes[1].Table != "inet6.0" {
+		t.Fatalf("routes[1] = %+v, want family inet6 table inet6.0", routes[1])
+	}
+}
+
 func TestBuildLocalAddressEntries(t *testing.T) {
 	snapshot := &ConfigSnapshot{
 		Interfaces: []InterfaceSnapshot{

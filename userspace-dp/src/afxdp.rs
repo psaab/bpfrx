@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -78,6 +79,7 @@ pub struct Coordinator {
     slow_path: Option<Arc<SlowPathReinjector>>,
     last_slow_path_status: SlowPathStatus,
     ha_state: Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
+    dynamic_neighbors: Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
@@ -99,6 +101,7 @@ impl Coordinator {
             slow_path: None,
             last_slow_path_status: SlowPathStatus::default(),
             ha_state: Arc::new(Mutex::new(BTreeMap::new())),
+            dynamic_neighbors: Arc::new(Mutex::new(BTreeMap::new())),
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
@@ -144,6 +147,9 @@ impl Coordinator {
         self.map_fd = None;
         self.heartbeat_map_fd = None;
         self.forwarding = ForwardingState::default();
+        if let Ok(mut neighbors) = self.dynamic_neighbors.lock() {
+            neighbors.clear();
+        }
         if let Ok(mut recent) = self.recent_exceptions.lock() {
             recent.clear();
         }
@@ -332,6 +338,7 @@ impl Coordinator {
             let validation = self.validation;
             let forwarding = forwarding.clone();
             let ha_state = self.ha_state.clone();
+            let dynamic_neighbors = self.dynamic_neighbors.clone();
             let join = thread::Builder::new()
                 .name(format!("bpfrx-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -341,6 +348,7 @@ impl Coordinator {
                         validation,
                         forwarding,
                         ha_state,
+                        dynamic_neighbors,
                         slow_path,
                         recent_exceptions,
                         last_resolution,
@@ -1053,6 +1061,7 @@ fn poll_binding(
     validation: ValidationState,
     forwarding: &ForwardingState,
     ha_state: &Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
+    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
@@ -1118,7 +1127,11 @@ fn poll_binding(
                             decision.resolution = enforce_ha_resolution(
                                 forwarding,
                                 ha_state,
-                                lookup_forwarding_resolution(forwarding, flow.dst_ip),
+                                lookup_forwarding_resolution_with_dynamic(
+                                    forwarding,
+                                    dynamic_neighbors,
+                                    flow.dst_ip,
+                                ),
                             );
                         }
                         decision
@@ -1127,7 +1140,11 @@ fn poll_binding(
                         let resolution = enforce_ha_resolution(
                             forwarding,
                             ha_state,
-                            lookup_forwarding_resolution(forwarding, flow.dst_ip),
+                            lookup_forwarding_resolution_with_dynamic(
+                                forwarding,
+                                dynamic_neighbors,
+                                flow.dst_ip,
+                            ),
                         );
                         let mut decision = SessionDecision {
                             resolution,
@@ -1179,7 +1196,11 @@ fn poll_binding(
                                 let reverse_resolution = enforce_ha_resolution(
                                     forwarding,
                                     ha_state,
-                                    lookup_forwarding_resolution(forwarding, flow.src_ip),
+                                    lookup_forwarding_resolution_with_dynamic(
+                                        forwarding,
+                                        dynamic_neighbors,
+                                        flow.src_ip,
+                                    ),
                                 );
                                 if reverse_resolution.disposition
                                     == ForwardingDisposition::ForwardCandidate
@@ -1223,7 +1244,13 @@ fn poll_binding(
                         resolution: enforce_ha_resolution(
                             forwarding,
                             ha_state,
-                            resolve_forwarding(&binding.area, desc, meta, forwarding),
+                            resolve_forwarding(
+                                &binding.area,
+                                desc,
+                                meta,
+                                forwarding,
+                                dynamic_neighbors,
+                            ),
                         ),
                         nat: NatDecision::default(),
                     }
@@ -1872,6 +1899,7 @@ fn worker_loop(
     validation: ValidationState,
     forwarding: Arc<ForwardingState>,
     ha_state: Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
+    dynamic_neighbors: Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
     slow_path: Option<Arc<SlowPathReinjector>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: Arc<Mutex<Option<PacketResolution>>>,
@@ -1908,6 +1936,7 @@ fn worker_loop(
                 validation,
                 &forwarding,
                 &ha_state,
+                &dynamic_neighbors,
                 slow_path.as_ref(),
                 &recent_exceptions,
                 &last_resolution,
@@ -2140,9 +2169,10 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         if let Ok(prefix) = route.destination.parse::<Ipv4Net>() {
             let (next_hop, ifindex) =
                 resolve_route_target_v4(route, &name_to_ifindex, &linux_to_ifindex, &state);
+            let table = canonical_route_table(&route.table, false);
             state
                 .routes_v4
-                .entry(route.table.clone())
+                .entry(table)
                 .or_default()
                 .push(RouteEntryV4 {
                     prefix,
@@ -2156,9 +2186,10 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         if let Ok(prefix) = route.destination.parse::<Ipv6Net>() {
             let (next_hop, ifindex) =
                 resolve_route_target_v6(route, &name_to_ifindex, &linux_to_ifindex, &state);
+            let table = canonical_route_table(&route.table, true);
             state
                 .routes_v6
-                .entry(route.table.clone())
+                .entry(table)
                 .or_default()
                 .push(RouteEntryV6 {
                     prefix,
@@ -2194,6 +2225,25 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.source_nat_rules = parse_source_nat_rules(&snapshot.source_nat_rules);
     state
+}
+
+fn canonical_route_table(table: &str, is_ipv6: bool) -> String {
+    if is_ipv6 {
+        if table == "inet.0" {
+            return "inet6.0".to_string();
+        }
+        if let Some(prefix) = table.strip_suffix(".inet.0") {
+            return format!("{prefix}.inet6.0");
+        }
+        return table.to_string();
+    }
+    if table == "inet6.0" {
+        return "inet.0".to_string();
+    }
+    if let Some(prefix) = table.strip_suffix(".inet6.0") {
+        return format!("{prefix}.inet.0");
+    }
+    table.to_string()
 }
 
 fn pick_interface_v4(iface: &InterfaceSnapshot) -> Option<Ipv4Addr> {
@@ -2348,7 +2398,8 @@ fn infer_connected_ifindex_v6(state: &ForwardingState, ip: Ipv6Addr) -> Option<i
 }
 
 fn neighbor_state_usable(state: &str) -> bool {
-    !(state.contains("failed") || state.contains("incomplete"))
+    let normalized = state.to_ascii_lowercase();
+    !(normalized.contains("failed") || normalized.contains("incomplete"))
 }
 
 fn parse_mac(s: &str) -> Option<[u8; 6]> {
@@ -2408,6 +2459,7 @@ fn resolve_forwarding(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     state: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
 ) -> ForwardingResolution {
     let Some(dst) = parse_packet_destination(area, desc, meta) else {
         return ForwardingResolution {
@@ -2418,7 +2470,7 @@ fn resolve_forwarding(
             neighbor_mac: None,
         };
     };
-    lookup_forwarding_resolution(state, dst)
+    lookup_forwarding_resolution_with_dynamic(state, dynamic_neighbors, dst)
 }
 
 fn match_source_nat_for_flow(
@@ -2521,6 +2573,22 @@ fn lookup_forwarding_for_ip(state: &ForwardingState, dst: IpAddr) -> ForwardingD
 }
 
 fn lookup_forwarding_resolution(state: &ForwardingState, dst: IpAddr) -> ForwardingResolution {
+    lookup_forwarding_resolution_inner(state, None, dst)
+}
+
+fn lookup_forwarding_resolution_with_dynamic(
+    state: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+    dst: IpAddr,
+) -> ForwardingResolution {
+    lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst)
+}
+
+fn lookup_forwarding_resolution_inner(
+    state: &ForwardingState,
+    dynamic_neighbors: Option<&Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>>,
+    dst: IpAddr,
+) -> ForwardingResolution {
     match dst {
         IpAddr::V4(ip) => {
             if state.local_v4.contains(&ip) {
@@ -2538,7 +2606,7 @@ fn lookup_forwarding_resolution(state: &ForwardingState, dst: IpAddr) -> Forward
                     neighbor_mac: None,
                 };
             }
-            lookup_forwarding_resolution_v4(state, ip, DEFAULT_V4_TABLE, 0)
+            lookup_forwarding_resolution_v4(state, dynamic_neighbors, ip, DEFAULT_V4_TABLE, 0)
         }
         IpAddr::V6(ip) => {
             if state.local_v6.contains(&ip) {
@@ -2556,13 +2624,14 @@ fn lookup_forwarding_resolution(state: &ForwardingState, dst: IpAddr) -> Forward
                     neighbor_mac: None,
                 };
             }
-            lookup_forwarding_resolution_v6(state, ip, DEFAULT_V6_TABLE, 0)
+            lookup_forwarding_resolution_v6(state, dynamic_neighbors, ip, DEFAULT_V6_TABLE, 0)
         }
     }
 }
 
 fn lookup_forwarding_resolution_v4(
     state: &ForwardingState,
+    dynamic_neighbors: Option<&Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>>,
     ip: Ipv4Addr,
     table: &str,
     depth: usize,
@@ -2586,7 +2655,12 @@ fn lookup_forwarding_resolution_v4(
         .find(|entry| entry.prefix.contains(&ip));
     match choose_v4_route(static_match, connected_match) {
         Some(ResolvedRouteV4::Connected { ifindex }) => {
-            let neighbor = state.neighbors.get(&(ifindex, IpAddr::V4(ip)));
+            let neighbor = lookup_neighbor_entry(
+                state,
+                dynamic_neighbors,
+                ifindex,
+                IpAddr::V4(ip),
+            );
             ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
@@ -2595,7 +2669,7 @@ fn lookup_forwarding_resolution_v4(
                 },
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
-                next_hop: Some(IpAddr::V4(ip)),
+                    next_hop: Some(IpAddr::V4(ip)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
             }
         }
@@ -2624,7 +2698,13 @@ fn lookup_forwarding_resolution_v4(
                         neighbor_mac: None,
                     };
                 }
-                return lookup_forwarding_resolution_v4(state, ip, &next_table_name, depth + 1);
+                return lookup_forwarding_resolution_v4(
+                    state,
+                    dynamic_neighbors,
+                    ip,
+                    &next_table_name,
+                    depth + 1,
+                );
             }
             if ifindex <= 0 {
                 return ForwardingResolution {
@@ -2636,7 +2716,12 @@ fn lookup_forwarding_resolution_v4(
                 };
             }
             let target = next_hop.unwrap_or(ip);
-            let neighbor = state.neighbors.get(&(ifindex, IpAddr::V4(target)));
+            let neighbor = lookup_neighbor_entry(
+                state,
+                dynamic_neighbors,
+                ifindex,
+                IpAddr::V4(target),
+            );
             ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
@@ -2661,6 +2746,7 @@ fn lookup_forwarding_resolution_v4(
 
 fn lookup_forwarding_resolution_v6(
     state: &ForwardingState,
+    dynamic_neighbors: Option<&Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>>,
     ip: Ipv6Addr,
     table: &str,
     depth: usize,
@@ -2684,7 +2770,12 @@ fn lookup_forwarding_resolution_v6(
         .find(|entry| entry.prefix.contains(&ip));
     match choose_v6_route(static_match, connected_match) {
         Some(ResolvedRouteV6::Connected { ifindex }) => {
-            let neighbor = state.neighbors.get(&(ifindex, IpAddr::V6(ip)));
+            let neighbor = lookup_neighbor_entry(
+                state,
+                dynamic_neighbors,
+                ifindex,
+                IpAddr::V6(ip),
+            );
             ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
@@ -2722,7 +2813,13 @@ fn lookup_forwarding_resolution_v6(
                         neighbor_mac: None,
                     };
                 }
-                return lookup_forwarding_resolution_v6(state, ip, &next_table_name, depth + 1);
+                return lookup_forwarding_resolution_v6(
+                    state,
+                    dynamic_neighbors,
+                    ip,
+                    &next_table_name,
+                    depth + 1,
+                );
             }
             if ifindex <= 0 {
                 return ForwardingResolution {
@@ -2734,7 +2831,12 @@ fn lookup_forwarding_resolution_v6(
                 };
             }
             let target = next_hop.unwrap_or(ip);
-            let neighbor = state.neighbors.get(&(ifindex, IpAddr::V6(target)));
+            let neighbor = lookup_neighbor_entry(
+                state,
+                dynamic_neighbors,
+                ifindex,
+                IpAddr::V6(target),
+            );
             ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
@@ -2755,6 +2857,93 @@ fn lookup_forwarding_resolution_v6(
             neighbor_mac: None,
         },
     }
+}
+
+fn lookup_neighbor_entry(
+    state: &ForwardingState,
+    dynamic_neighbors: Option<&Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>>,
+    ifindex: i32,
+    target: IpAddr,
+) -> Option<NeighborEntry> {
+    if let Some(entry) = state.neighbors.get(&(ifindex, target)).copied() {
+        return Some(entry);
+    }
+    let Some(dynamic_neighbors) = dynamic_neighbors else {
+        return None;
+    };
+    if let Ok(cache) = dynamic_neighbors.lock() {
+        if let Some(entry) = cache.get(&(ifindex, target)).copied() {
+            return Some(entry);
+        }
+    }
+    let ifname = state.ifindex_to_name.get(&ifindex)?.clone();
+    let entry = refresh_dynamic_neighbor(&ifname, target)?;
+    if let Ok(mut cache) = dynamic_neighbors.lock() {
+        cache.insert((ifindex, target), entry);
+    }
+    Some(entry)
+}
+
+fn refresh_dynamic_neighbor(ifname: &str, target: IpAddr) -> Option<NeighborEntry> {
+    if let Some(entry) = read_neighbor_entry(ifname, target) {
+        return Some(entry);
+    }
+    trigger_neighbor_probe(ifname, target);
+    read_neighbor_entry(ifname, target)
+}
+
+fn read_neighbor_entry(ifname: &str, target: IpAddr) -> Option<NeighborEntry> {
+    let mut cmd = Command::new("ip");
+    match target {
+        IpAddr::V4(_) => {
+            cmd.arg("-4");
+        }
+        IpAddr::V6(_) => {
+            cmd.arg("-6");
+        }
+    }
+    let output = cmd
+        .args(["neigh", "show", "to", &target.to_string(), "dev", ifname])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_neighbor_output(String::from_utf8_lossy(&output.stdout).as_ref(), target)
+}
+
+fn trigger_neighbor_probe(ifname: &str, target: IpAddr) {
+    let mut cmd = Command::new("ping");
+    match target {
+        IpAddr::V4(_) => {
+            cmd.args(["-4", "-c", "1", "-W", "1", "-I", ifname, &target.to_string()]);
+        }
+        IpAddr::V6(_) => {
+            cmd.args(["-6", "-c", "1", "-W", "1", "-I", ifname, &target.to_string()]);
+        }
+    }
+    let _ = cmd.output();
+}
+
+fn parse_neighbor_output(output: &str, target: IpAddr) -> Option<NeighborEntry> {
+    let target_str = target.to_string();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.is_empty() || fields[0] != target_str {
+            continue;
+        }
+        if fields.iter().any(|field| !neighbor_state_usable(field)) {
+            continue;
+        }
+        let lladdr = fields.iter().position(|field| *field == "lladdr")?;
+        let mac = parse_mac(fields.get(lladdr + 1)?).or_else(|| {
+            fields
+                .get(lladdr + 1)
+                .and_then(|candidate| parse_mac(candidate.trim()))
+        })?;
+        return Some(NeighborEntry { mac });
+    }
+    None
 }
 
 fn build_injected_packet(
@@ -4296,6 +4485,51 @@ mod tests {
         assert_eq!(
             resolved_v6.next_hop,
             Some(IpAddr::V6("2001:559:8585:50::1".parse().expect("v6 nh")))
+        );
+    }
+
+    #[test]
+    fn forwarding_state_normalizes_ipv6_routes_emitted_in_inet_table() {
+        let mut snapshot = forwarding_snapshot(true);
+        snapshot.routes[1].table = "inet.0".to_string();
+        snapshot.routes[1].family = "inet".to_string();
+        let state = build_forwarding_state(&snapshot);
+        let resolved = lookup_forwarding_resolution(
+            &state,
+            IpAddr::V6("2606:4700:4700::1111".parse().expect("ipv6")),
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.egress_ifindex, 12);
+        assert_eq!(
+            resolved.next_hop,
+            Some(IpAddr::V6("2001:559:8585:50::1".parse().expect("v6 nh")))
+        );
+    }
+
+    #[test]
+    fn dynamic_neighbor_cache_enables_forward_candidate() {
+        let state = build_forwarding_state(&forwarding_snapshot(false));
+        let dynamic_neighbors = Arc::new(Mutex::new(BTreeMap::from([(
+            (12, IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+            NeighborEntry {
+                mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            },
+        )])));
+        let resolved = lookup_forwarding_resolution_with_dynamic(
+            &state,
+            &dynamic_neighbors,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(
+            resolved.neighbor_mac,
+            Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
         );
     }
 

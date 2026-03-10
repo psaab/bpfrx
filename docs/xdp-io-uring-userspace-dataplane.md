@@ -729,6 +729,10 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
   - track config/FIB generation mismatches
   - resolve stateless forwarding decisions from connected and static routes
   - recurse through `next-table` static route chains
+  - normalize misclassified IPv6 route snapshots onto `inet6.0`/`*.inet6.0`
+    at runtime so `::/0` and other IPv6 routes do not strand on `inet.0`
+  - refresh neighbor state on-demand on forwarding misses by probing kernel
+    ARP/NDP state and caching live adjacency results per worker
   - record bounded recent exception summaries
   - accept synthetic packet injection requests for safe validation on lab clusters
 - `bpfrxd` already publishes interface, address, neighbor, and static-route summaries
