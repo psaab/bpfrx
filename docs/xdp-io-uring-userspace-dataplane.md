@@ -855,6 +855,7 @@ Implemented today:
 - bidirectional session key installation
 - lazy expiry and session counters in helper status
 - bounded worker-local session delta journals with drainable control-plane export
+- Go-side bridge from worker-local session deltas into the existing HA/session-sync transport
 - interface-mode source NAT rule snapshots from the Go control plane
 - per-session NAT decisions and reply-direction key installation
 - source and destination IP rewrite on the Rust fast path for interface-mode source NAT
@@ -863,7 +864,6 @@ Implemented today:
 - per-flow zone policy evaluation before session create/install
 
 Not implemented yet:
-- integration of worker-local session delta export into the existing HA/session-sync transport
 - worker-local timer wheels or batched expiry structures beyond lazy GC
 - full NAT parity: destination NAT, static NAT, NAT64, NATv6v4, and pool-based source NAT
 - full policy parity: address-books, applications/AppID, global policies, counters,
