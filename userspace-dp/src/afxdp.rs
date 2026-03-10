@@ -3088,6 +3088,9 @@ fn lookup_forwarding_resolution_for_session(
     flow: &SessionFlow,
     decision: SessionDecision,
 ) -> ForwardingResolution {
+    if let Some(cached) = cached_session_resolution(forwarding, decision.resolution) {
+        return cached;
+    }
     let target = resolution_target_for_session(flow, decision);
     let resolved = lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target);
     match resolved.disposition {
@@ -4856,15 +4859,27 @@ fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
         IpAddr::V4(ip) => Some(ip),
         _ => None,
     });
+    let ihl = ((packet[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return None;
+    }
+    if new_src.is_some() && new_dst.is_none() {
+        let new_src = new_src?;
+        packet.get_mut(12..16)?.copy_from_slice(&new_src.octets());
+        adjust_l4_checksum_ipv4_src(packet, ihl, protocol, old_src, new_src)?;
+        return Some(());
+    }
+    if new_dst.is_some() && new_src.is_none() {
+        let new_dst = new_dst?;
+        packet.get_mut(16..20)?.copy_from_slice(&new_dst.octets());
+        adjust_l4_checksum_ipv4_dst(packet, ihl, protocol, old_dst, new_dst)?;
+        return Some(());
+    }
     if let Some(ip) = new_src {
         packet.get_mut(12..16)?.copy_from_slice(&ip.octets());
     }
     if let Some(ip) = new_dst {
         packet.get_mut(16..20)?.copy_from_slice(&ip.octets());
-    }
-    let ihl = ((packet[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || packet.len() < ihl {
-        return None;
     }
     let new_src = new_src.unwrap_or(old_src);
     let new_dst = new_dst.unwrap_or(old_dst);
@@ -4904,6 +4919,18 @@ fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
         IpAddr::V6(ip) => Some(ip),
         _ => None,
     });
+    if new_src.is_some() && new_dst.is_none() {
+        let new_src = new_src?;
+        packet.get_mut(8..24)?.copy_from_slice(&new_src.octets());
+        adjust_l4_checksum_ipv6_src(packet, protocol, old_src, new_src)?;
+        return Some(());
+    }
+    if new_dst.is_some() && new_src.is_none() {
+        let new_dst = new_dst?;
+        packet.get_mut(24..40)?.copy_from_slice(&new_dst.octets());
+        adjust_l4_checksum_ipv6_dst(packet, protocol, old_dst, new_dst)?;
+        return Some(());
+    }
     if let Some(ip) = new_src {
         packet.get_mut(8..24)?.copy_from_slice(&ip.octets());
     }
@@ -5200,6 +5227,100 @@ fn adjust_l4_checksum_ipv6(
     ]);
     let mut updated = checksum16_adjust(current, &ipv6_words(old_src), &ipv6_words(new_src));
     updated = checksum16_adjust(updated, &ipv6_words(old_dst), &ipv6_words(new_dst));
+    if matches!(protocol, PROTO_UDP | PROTO_ICMPV6) && updated == 0 {
+        updated = 0xffff;
+    }
+    packet
+        .get_mut(checksum_offset..checksum_offset + 2)?
+        .copy_from_slice(&updated.to_be_bytes());
+    Some(())
+}
+
+fn adjust_l4_checksum_ipv4_src(
+    packet: &mut [u8],
+    ihl: usize,
+    protocol: u8,
+    old_src: Ipv4Addr,
+    new_src: Ipv4Addr,
+) -> Option<()> {
+    adjust_l4_checksum_ipv4_words(packet, ihl, protocol, &ipv4_words(old_src), &ipv4_words(new_src))
+}
+
+fn adjust_l4_checksum_ipv4_dst(
+    packet: &mut [u8],
+    ihl: usize,
+    protocol: u8,
+    old_dst: Ipv4Addr,
+    new_dst: Ipv4Addr,
+) -> Option<()> {
+    adjust_l4_checksum_ipv4_words(packet, ihl, protocol, &ipv4_words(old_dst), &ipv4_words(new_dst))
+}
+
+fn adjust_l4_checksum_ipv4_words(
+    packet: &mut [u8],
+    ihl: usize,
+    protocol: u8,
+    old_words: &[u16],
+    new_words: &[u16],
+) -> Option<()> {
+    let checksum_offset = match protocol {
+        PROTO_TCP => ihl.checked_add(16)?,
+        PROTO_UDP => ihl.checked_add(6)?,
+        _ => return Some(()),
+    };
+    let current = u16::from_be_bytes([
+        *packet.get(checksum_offset)?,
+        *packet.get(checksum_offset + 1)?,
+    ]);
+    if matches!(protocol, PROTO_UDP) && current == 0 {
+        return Some(());
+    }
+    let updated = checksum16_adjust(current, old_words, new_words);
+    let updated = if matches!(protocol, PROTO_UDP) && updated == 0 {
+        0xffff
+    } else {
+        updated
+    };
+    packet
+        .get_mut(checksum_offset..checksum_offset + 2)?
+        .copy_from_slice(&updated.to_be_bytes());
+    Some(())
+}
+
+fn adjust_l4_checksum_ipv6_src(
+    packet: &mut [u8],
+    protocol: u8,
+    old_src: Ipv6Addr,
+    new_src: Ipv6Addr,
+) -> Option<()> {
+    adjust_l4_checksum_ipv6_words(packet, protocol, &ipv6_words(old_src), &ipv6_words(new_src))
+}
+
+fn adjust_l4_checksum_ipv6_dst(
+    packet: &mut [u8],
+    protocol: u8,
+    old_dst: Ipv6Addr,
+    new_dst: Ipv6Addr,
+) -> Option<()> {
+    adjust_l4_checksum_ipv6_words(packet, protocol, &ipv6_words(old_dst), &ipv6_words(new_dst))
+}
+
+fn adjust_l4_checksum_ipv6_words(
+    packet: &mut [u8],
+    protocol: u8,
+    old_words: &[u16],
+    new_words: &[u16],
+) -> Option<()> {
+    let checksum_offset = match protocol {
+        PROTO_TCP => 40usize.checked_add(16)?,
+        PROTO_UDP | PROTO_ICMPV6 => 40usize.checked_add(6)?,
+        _ => return Some(()),
+    };
+    let current = u16::from_be_bytes([
+        *packet.get(checksum_offset)?,
+        *packet.get(checksum_offset + 1)?,
+    ]);
+    let mut updated = checksum16_adjust(current, old_words, new_words);
     if matches!(protocol, PROTO_UDP | PROTO_ICMPV6) && updated == 0 {
         updated = 0xffff;
     }
