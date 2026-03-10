@@ -105,14 +105,22 @@ type SourceNATRuleSnapshot struct {
 	PoolName             string   `json:"pool_name,omitempty"`
 }
 
+type PolicyApplicationSnapshot struct {
+	Name            string `json:"name"`
+	Protocol        string `json:"protocol,omitempty"`
+	SourcePort      string `json:"source_port,omitempty"`
+	DestinationPort string `json:"destination_port,omitempty"`
+}
+
 type PolicyRuleSnapshot struct {
-	Name                 string   `json:"name"`
-	FromZone             string   `json:"from_zone,omitempty"`
-	ToZone               string   `json:"to_zone,omitempty"`
-	SourceAddresses      []string `json:"source_addresses,omitempty"`
-	DestinationAddresses []string `json:"destination_addresses,omitempty"`
-	Applications         []string `json:"applications,omitempty"`
-	Action               string   `json:"action,omitempty"`
+	Name                 string                      `json:"name"`
+	FromZone             string                      `json:"from_zone,omitempty"`
+	ToZone               string                      `json:"to_zone,omitempty"`
+	SourceAddresses      []string                    `json:"source_addresses,omitempty"`
+	DestinationAddresses []string                    `json:"destination_addresses,omitempty"`
+	Applications         []string                    `json:"applications,omitempty"`
+	ApplicationTerms     []PolicyApplicationSnapshot `json:"application_terms,omitempty"`
+	Action               string                      `json:"action,omitempty"`
 }
 
 type InterfaceAddressSnapshot struct {

@@ -205,8 +205,21 @@ struct PolicyRuleSnapshot {
     destination_addresses: Vec<String>,
     #[serde(default)]
     applications: Vec<String>,
+    #[serde(rename = "application_terms", default)]
+    application_terms: Vec<PolicyApplicationSnapshot>,
     #[serde(default)]
     action: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct PolicyApplicationSnapshot {
+    name: String,
+    #[serde(default)]
+    protocol: String,
+    #[serde(rename = "source_port", default)]
+    source_port: String,
+    #[serde(rename = "destination_port", default)]
+    destination_port: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

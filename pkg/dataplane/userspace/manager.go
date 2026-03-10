@@ -233,7 +233,7 @@ func userspaceSupportsSecurityPolicies(cfg *config.Config) bool {
 			}
 			if !userspacePolicyAddressesSupported(cfg, pol.Match.SourceAddresses) ||
 				!userspacePolicyAddressesSupported(cfg, pol.Match.DestinationAddresses) ||
-				!userspacePolicyApplicationsSupported(pol.Match.Applications) {
+				!userspacePolicyApplicationsSupported(cfg, pol.Match.Applications) {
 				return false
 			}
 		}
@@ -358,16 +358,88 @@ func resolveUserspaceAddressBookEntry(cfg *config.Config, name string) ([]string
 	return expanded, true
 }
 
-func userspacePolicyApplicationsSupported(apps []string) bool {
+func userspacePolicyApplicationsSupported(cfg *config.Config, apps []string) bool {
+	_, ok := expandUserspacePolicyApplications(cfg, apps)
+	return ok
+}
+
+func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]PolicyApplicationSnapshot, bool) {
 	if len(apps) == 0 {
-		return true
+		return nil, true
 	}
-	for _, app := range apps {
-		if app != "" && app != "any" {
-			return false
+	expanded := make([]PolicyApplicationSnapshot, 0, len(apps))
+	seen := make(map[string]struct{}, len(apps))
+	for _, appName := range apps {
+		if appName == "" || appName == "any" {
+			return nil, true
+		}
+		resolved, ok := resolveUserspaceApplicationNames(cfg, appName)
+		if !ok || len(resolved) == 0 {
+			return nil, false
+		}
+		for _, resolvedName := range resolved {
+			app, ok := config.ResolveApplication(resolvedName, cfg.Applications.Applications)
+			if !ok || app == nil {
+				return nil, false
+			}
+			proto := normalizeUserspaceApplicationProtocol(app.Protocol)
+			if proto == "" {
+				return nil, false
+			}
+			snap := PolicyApplicationSnapshot{
+				Name:            resolvedName,
+				Protocol:        proto,
+				SourcePort:      app.SourcePort,
+				DestinationPort: app.DestinationPort,
+			}
+			key := strings.Join([]string{snap.Name, snap.Protocol, snap.SourcePort, snap.DestinationPort}, "\x00")
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			expanded = append(expanded, snap)
 		}
 	}
-	return true
+	sort.Slice(expanded, func(i, j int) bool {
+		if expanded[i].Name != expanded[j].Name {
+			return expanded[i].Name < expanded[j].Name
+		}
+		if expanded[i].Protocol != expanded[j].Protocol {
+			return expanded[i].Protocol < expanded[j].Protocol
+		}
+		if expanded[i].SourcePort != expanded[j].SourcePort {
+			return expanded[i].SourcePort < expanded[j].SourcePort
+		}
+		return expanded[i].DestinationPort < expanded[j].DestinationPort
+	})
+	return expanded, true
+}
+
+func resolveUserspaceApplicationNames(cfg *config.Config, name string) ([]string, bool) {
+	if cfg == nil || name == "" {
+		return nil, false
+	}
+	if _, ok := config.ResolveApplication(name, cfg.Applications.Applications); ok {
+		return []string{name}, true
+	}
+	if _, ok := config.ResolveApplicationSet(name, cfg.Applications.ApplicationSets); ok {
+		expanded, err := config.ExpandApplicationSet(name, &cfg.Applications)
+		if err != nil || len(expanded) == 0 {
+			return nil, false
+		}
+		sort.Strings(expanded)
+		return slices.Compact(expanded), true
+	}
+	return nil, false
+}
+
+func normalizeUserspaceApplicationProtocol(proto string) string {
+	switch strings.ToLower(strings.TrimSpace(proto)) {
+	case "icmp6":
+		return "icmpv6"
+	default:
+		return strings.ToLower(strings.TrimSpace(proto))
+	}
 }
 
 func userspaceSupportsSourceNAT(ruleSets []*config.NATRuleSet) bool {
@@ -934,6 +1006,10 @@ func buildPolicySnapshots(cfg *config.Config) []PolicyRuleSnapshot {
 			if !ok {
 				destinationAddresses = append([]string(nil), pol.Match.DestinationAddresses...)
 			}
+			applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
+			if !ok {
+				applicationTerms = nil
+			}
 			out = append(out, PolicyRuleSnapshot{
 				Name:                 pol.Name,
 				FromZone:             zpp.FromZone,
@@ -941,6 +1017,7 @@ func buildPolicySnapshots(cfg *config.Config) []PolicyRuleSnapshot {
 				SourceAddresses:      sourceAddresses,
 				DestinationAddresses: destinationAddresses,
 				Applications:         append([]string(nil), pol.Match.Applications...),
+				ApplicationTerms:     applicationTerms,
 				Action:               policyActionString(pol.Action),
 			})
 		}

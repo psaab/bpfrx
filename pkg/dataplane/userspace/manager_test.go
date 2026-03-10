@@ -426,6 +426,72 @@ func TestUserspaceRejectsUnknownAddressBookPolicyMatches(t *testing.T) {
 	}
 }
 
+func TestUserspaceSupportsNamedApplicationPolicyMatches(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.DefaultPolicy = config.PolicyDeny
+	cfg.Applications.ApplicationSets = map[string]*config.ApplicationSet{
+		"web-apps": {
+			Name:         "web-apps",
+			Applications: []string{"junos-http", "junos-https"},
+		},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan", Interfaces: []string{"reth1"}},
+		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
+	}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "lan",
+		ToZone:   "wan",
+		Policies: []*config.Policy{{
+			Name: "allow-web",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"web-apps"},
+			},
+			Action: config.PolicyPermit,
+		}},
+	}}
+	if !userspaceSupportsSecurityPolicies(cfg) {
+		t.Fatal("userspaceSupportsSecurityPolicies = false, want true with resolvable application-set")
+	}
+	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if len(snap.Policies) != 1 {
+		t.Fatalf("len(Policies) = %d, want 1", len(snap.Policies))
+	}
+	terms := snap.Policies[0].ApplicationTerms
+	if len(terms) != 2 {
+		t.Fatalf("ApplicationTerms = %+v, want two expanded applications", terms)
+	}
+	if terms[0].Protocol != "tcp" || terms[0].DestinationPort == "" {
+		t.Fatalf("unexpected first application term: %+v", terms[0])
+	}
+}
+
+func TestUserspaceRejectsUnknownApplicationPolicyMatches(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan", Interfaces: []string{"reth1"}},
+		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
+	}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "lan",
+		ToZone:   "wan",
+		Policies: []*config.Policy{{
+			Name: "allow-missing-app",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"missing-app"},
+			},
+			Action: config.PolicyPermit,
+		}},
+	}}
+	if userspaceSupportsSecurityPolicies(cfg) {
+		t.Fatal("userspaceSupportsSecurityPolicies = true, want false with unresolved application")
+	}
+}
+
 func TestBuildSnapshotIncludesUnitInterfaces(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{

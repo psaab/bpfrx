@@ -746,13 +746,13 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
   decisions, forward-path SNAT rewrite, and reverse-path reply DNAT rewrite
 - the Rust helper now has a first worker-local zone-policy slice:
   ordered zone-pair policy snapshots, default-policy handling, address-book-expanded
-  `any`/CIDR/IP source and destination matching, and per-session permit/deny gating
-  before install
+  `any`/CIDR/IP source and destination matching, named application and application-set
+  protocol/port matching, and per-session permit/deny gating before install
 
 What is still intentionally not implemented:
 
-- full policy parity: application matching, global policies, schedulers, counters,
-  and logging semantics
+- full policy parity: AppID/application-identification matching, global policies,
+  schedulers, counters, and logging semantics
 - shared-memory snapshot regions
 - io_uring-backed slow-path transport beyond bounded TUN reinjection
 

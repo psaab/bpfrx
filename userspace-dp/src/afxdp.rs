@@ -1304,6 +1304,9 @@ fn poll_binding(
                                 &to_zone,
                                 flow.src_ip,
                                 flow.dst_ip,
+                                flow.forward_key.protocol,
+                                flow.forward_key.src_port,
+                                flow.forward_key.dst_port,
                             ) {
                                 decision.nat = match_source_nat_for_flow(
                                     forwarding,
@@ -4596,6 +4599,7 @@ mod tests {
                 source_addresses: vec!["any".to_string()],
                 destination_addresses: vec!["any".to_string()],
                 applications: vec!["any".to_string()],
+                application_terms: Vec::new(),
                 action: "permit".to_string(),
             }],
             neighbors: vec![
@@ -4658,6 +4662,7 @@ mod tests {
                 source_addresses: vec!["any".to_string()],
                 destination_addresses: vec!["any".to_string()],
                 applications: vec!["any".to_string()],
+                application_terms: Vec::new(),
                 action: "permit".to_string(),
             }],
             ..Default::default()
@@ -4896,7 +4901,10 @@ mod tests {
                 &from_zone,
                 &to_zone,
                 flow.src_ip,
-                flow.dst_ip
+                flow.dst_ip,
+                flow.forward_key.protocol,
+                flow.forward_key.src_port,
+                flow.forward_key.dst_port,
             ),
             PolicyAction::Permit
         );
@@ -4924,7 +4932,10 @@ mod tests {
                 &from_zone,
                 &to_zone,
                 flow.src_ip,
-                flow.dst_ip
+                flow.dst_ip,
+                flow.forward_key.protocol,
+                flow.forward_key.src_port,
+                flow.forward_key.dst_port,
             ),
             PolicyAction::Deny
         );
