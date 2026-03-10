@@ -1313,14 +1313,16 @@ fn poll_binding(
             .session_expires
             .fetch_add(expired, Ordering::Relaxed);
     }
-    flush_session_deltas(
-        &ident,
-        &binding.live,
-        sessions.drain_deltas(256),
-        shared_sessions,
-        recent_session_deltas,
-        peer_worker_commands,
-    );
+    if sessions.has_pending_deltas() {
+        flush_session_deltas(
+            &ident,
+            &binding.live,
+            sessions.drain_deltas(256),
+            shared_sessions,
+            recent_session_deltas,
+            peer_worker_commands,
+        );
+    }
     let reaped = reap_tx_completions(binding);
     let tx_work = drain_pending_tx(binding);
     let fill_work = drain_pending_fill(binding);
@@ -1768,14 +1770,16 @@ fn poll_binding(
                 binding.scratch_recycle.push(desc.addr);
             }
         }
-        flush_session_deltas(
-            &ident,
-            &binding.live,
-            sessions.drain_deltas(256),
-            shared_sessions,
-            recent_session_deltas,
-            peer_worker_commands,
-        );
+        if sessions.has_pending_deltas() {
+            flush_session_deltas(
+                &ident,
+                &binding.live,
+                sessions.drain_deltas(256),
+                shared_sessions,
+                recent_session_deltas,
+                peer_worker_commands,
+            );
+        }
         received.release();
         drop(received);
         let mut pending_forwards = core::mem::take(&mut binding.scratch_forwards);
@@ -1826,14 +1830,11 @@ fn build_live_forward_request(
     if decision.nat.rewrite_dst.is_some() {
         ingress_live.dnat_packets.fetch_add(1, Ordering::Relaxed);
     }
-    let target_ifindex = resolve_tx_binding_ifindex(
-        forwarding,
-        if decision.resolution.tx_ifindex > 0 {
-            decision.resolution.tx_ifindex
-        } else {
-            decision.resolution.egress_ifindex
-        },
-    );
+    let target_ifindex = if decision.resolution.tx_ifindex > 0 {
+        decision.resolution.tx_ifindex
+    } else {
+        resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
+    };
     Some(PendingForwardRequest {
         target_ifindex,
         ingress_queue_id: ingress_ident.queue_id,
@@ -3033,6 +3034,23 @@ fn cached_session_resolution(
         }
     }
     Some(fallback)
+}
+
+fn populate_egress_resolution(
+    state: &ForwardingState,
+    egress_ifindex: i32,
+    resolution: &mut ForwardingResolution,
+) {
+    if egress_ifindex <= 0 {
+        return;
+    }
+    if let Some(egress) = state.egress.get(&egress_ifindex) {
+        resolution.tx_ifindex = egress.bind_ifindex.max(egress_ifindex);
+        resolution.src_mac = Some(egress.src_mac);
+        resolution.tx_vlan_id = egress.vlan_id;
+    } else if resolution.tx_ifindex <= 0 {
+        resolution.tx_ifindex = egress_ifindex;
+    }
 }
 
 fn lookup_forwarding_resolution_for_session(
@@ -4246,7 +4264,7 @@ fn lookup_forwarding_resolution_v4(
     match choose_v4_route(static_match, connected_match) {
         Some(ResolvedRouteV4::Connected { ifindex }) => {
             let neighbor = lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V4(ip));
-            ForwardingResolution {
+            let mut resolution = ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
                 } else {
@@ -4259,7 +4277,9 @@ fn lookup_forwarding_resolution_v4(
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
                 tx_vlan_id: 0,
-            }
+            };
+            populate_egress_resolution(state, ifindex, &mut resolution);
+            resolution
         }
         Some(ResolvedRouteV4::Static {
             ifindex,
@@ -4315,7 +4335,7 @@ fn lookup_forwarding_resolution_v4(
             let target = next_hop.unwrap_or(ip);
             let neighbor =
                 lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V4(target));
-            ForwardingResolution {
+            let mut resolution = ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
                 } else {
@@ -4328,7 +4348,9 @@ fn lookup_forwarding_resolution_v4(
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
                 tx_vlan_id: 0,
-            }
+            };
+            populate_egress_resolution(state, ifindex, &mut resolution);
+            resolution
         }
         None => ForwardingResolution {
             disposition: ForwardingDisposition::NoRoute,
@@ -4373,7 +4395,7 @@ fn lookup_forwarding_resolution_v6(
     match choose_v6_route(static_match, connected_match) {
         Some(ResolvedRouteV6::Connected { ifindex }) => {
             let neighbor = lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V6(ip));
-            ForwardingResolution {
+            let mut resolution = ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
                 } else {
@@ -4386,7 +4408,9 @@ fn lookup_forwarding_resolution_v6(
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
                 tx_vlan_id: 0,
-            }
+            };
+            populate_egress_resolution(state, ifindex, &mut resolution);
+            resolution
         }
         Some(ResolvedRouteV6::Static {
             ifindex,
@@ -4442,7 +4466,7 @@ fn lookup_forwarding_resolution_v6(
             let target = next_hop.unwrap_or(ip);
             let neighbor =
                 lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V6(target));
-            ForwardingResolution {
+            let mut resolution = ForwardingResolution {
                 disposition: if neighbor.is_some() {
                     ForwardingDisposition::ForwardCandidate
                 } else {
@@ -4455,7 +4479,9 @@ fn lookup_forwarding_resolution_v6(
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
                 tx_vlan_id: 0,
-            }
+            };
+            populate_egress_resolution(state, ifindex, &mut resolution);
+            resolution
         }
         None => ForwardingResolution {
             disposition: ForwardingDisposition::NoRoute,
@@ -4690,17 +4716,27 @@ fn build_forwarded_frame_into(
         return None;
     }
     let payload = &frame[l3..];
-    let (src_mac, vlan_id, apply_nat) =
-        if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
-            (
-                decision.resolution.src_mac?,
-                decision.resolution.tx_vlan_id,
-                false,
-            )
-        } else {
-            let egress = forwarding.egress.get(&decision.resolution.egress_ifindex)?;
-            (egress.src_mac, egress.vlan_id, true)
-        };
+    let (src_mac, vlan_id, apply_nat) = if decision.resolution.disposition
+        == ForwardingDisposition::FabricRedirect
+    {
+        (
+            decision.resolution.src_mac?,
+            decision.resolution.tx_vlan_id,
+            false,
+        )
+    } else {
+        (
+            decision.resolution.src_mac
+                .or_else(|| {
+                    forwarding
+                        .egress
+                        .get(&decision.resolution.egress_ifindex)
+                        .map(|egress| egress.src_mac)
+                })?,
+            decision.resolution.tx_vlan_id,
+            true,
+        )
+    };
     let eth_len = if vlan_id > 0 { 18 } else { 14 };
     let ether_type = match meta.addr_family as i32 {
         libc::AF_INET => 0x0800,

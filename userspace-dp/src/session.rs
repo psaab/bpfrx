@@ -280,6 +280,10 @@ impl SessionTable {
         out
     }
 
+    pub fn has_pending_deltas(&self) -> bool {
+        !self.deltas.is_empty()
+    }
+
     fn push_delta(&mut self, delta: SessionDelta) {
         if self.deltas.len() >= MAX_SESSION_DELTAS {
             self.delta_drops = self.delta_drops.saturating_add(1);
