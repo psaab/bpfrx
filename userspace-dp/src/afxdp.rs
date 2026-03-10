@@ -2713,9 +2713,6 @@ fn record_forwarding_disposition(
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
 ) {
-    if let Ok(mut last) = last_resolution.lock() {
-        *last = Some(resolution.status(debug));
-    }
     match resolution.disposition {
         ForwardingDisposition::LocalDelivery => {
             live.local_delivery_packets.fetch_add(1, Ordering::Relaxed);
@@ -2725,6 +2722,7 @@ fn record_forwarding_disposition(
                 .fetch_add(1, Ordering::Relaxed);
         }
         ForwardingDisposition::HAInactive => {
+            update_last_resolution(last_resolution, resolution, debug);
             live.exception_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -2736,6 +2734,7 @@ fn record_forwarding_disposition(
             );
         }
         ForwardingDisposition::PolicyDenied => {
+            update_last_resolution(last_resolution, resolution, debug);
             live.policy_denied_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -2747,6 +2746,7 @@ fn record_forwarding_disposition(
             );
         }
         ForwardingDisposition::NoRoute => {
+            update_last_resolution(last_resolution, resolution, debug);
             live.route_miss_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -2758,6 +2758,7 @@ fn record_forwarding_disposition(
             );
         }
         ForwardingDisposition::MissingNeighbor => {
+            update_last_resolution(last_resolution, resolution, debug);
             live.neighbor_miss_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -2769,6 +2770,7 @@ fn record_forwarding_disposition(
             );
         }
         ForwardingDisposition::DiscardRoute => {
+            update_last_resolution(last_resolution, resolution, debug);
             live.discard_route_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -2780,6 +2782,7 @@ fn record_forwarding_disposition(
             );
         }
         ForwardingDisposition::NextTableUnsupported => {
+            update_last_resolution(last_resolution, resolution, debug);
             live.next_table_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -2790,6 +2793,16 @@ fn record_forwarding_disposition(
                 debug,
             );
         }
+    }
+}
+
+fn update_last_resolution(
+    last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
+    resolution: ForwardingResolution,
+    debug: Option<&ResolutionDebug>,
+) {
+    if let Ok(mut last) = last_resolution.lock() {
+        *last = Some(resolution.status(debug));
     }
 }
 
