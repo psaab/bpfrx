@@ -34,6 +34,7 @@ const RX_BATCH_SIZE: u32 = 64;
 const MIN_RESERVED_TX_FRAMES: u32 = 64;
 const MAX_RESERVED_TX_FRAMES: u32 = 512;
 const STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const NEIGHBOR_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
@@ -2187,10 +2188,16 @@ fn worker_loop(
         }
     }
     let mut last_stats_poll = Instant::now();
+    let mut last_neighbor_sync = Instant::now() - NEIGHBOR_SYNC_INTERVAL;
     while !stop.load(Ordering::Relaxed) {
         heartbeat.store(now_nanos(), Ordering::Relaxed);
         apply_worker_commands(&commands, &mut sessions);
         let poll_stats = last_stats_poll.elapsed() >= STATS_POLL_INTERVAL;
+        let poll_neighbors = worker_id == 0 && last_neighbor_sync.elapsed() >= NEIGHBOR_SYNC_INTERVAL;
+        if poll_neighbors {
+            sync_dynamic_neighbors(&forwarding, &dynamic_neighbors);
+            last_neighbor_sync = Instant::now();
+        }
         let mut did_work = false;
         for idx in 0..bindings.len() {
             if poll_binding(
@@ -3166,6 +3173,34 @@ fn lookup_neighbor_entry(
     Some(entry)
 }
 
+fn sync_dynamic_neighbors(
+    state: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
+) {
+    let mut updates = Vec::new();
+    for (ifindex, iface) in &state.egress {
+        let Some(ifname) = state.ifindex_to_name.get(ifindex) else {
+            continue;
+        };
+        updates.extend(read_neighbor_entries(ifname).into_iter().map(|(ip, entry)| ((*ifindex, ip), entry)));
+        if iface.bind_ifindex > 0 && iface.bind_ifindex != *ifindex {
+            updates.extend(
+                read_neighbor_entries(ifname)
+                    .into_iter()
+                    .map(|(ip, entry)| ((iface.bind_ifindex, ip), entry)),
+            );
+        }
+    }
+    if updates.is_empty() {
+        return;
+    }
+    if let Ok(mut cache) = dynamic_neighbors.lock() {
+        for (key, entry) in updates {
+            cache.insert(key, entry);
+        }
+    }
+}
+
 fn refresh_dynamic_neighbor(ifname: &str, target: IpAddr) -> Option<NeighborEntry> {
     if let Some(entry) = read_neighbor_entry(ifname, target) {
         return Some(entry);
@@ -3175,23 +3210,41 @@ fn refresh_dynamic_neighbor(ifname: &str, target: IpAddr) -> Option<NeighborEntr
 }
 
 fn read_neighbor_entry(ifname: &str, target: IpAddr) -> Option<NeighborEntry> {
-    let mut cmd = Command::new("ip");
-    match target {
-        IpAddr::V4(_) => {
-            cmd.arg("-4");
-        }
-        IpAddr::V6(_) => {
-            cmd.arg("-6");
-        }
-    }
-    let output = cmd
-        .args(["neigh", "show", "to", &target.to_string(), "dev", ifname])
+    let family = match target {
+        IpAddr::V4(_) => "-4",
+        IpAddr::V6(_) => "-6",
+    };
+    let output = Command::new("ip")
+        .args([family, "neigh", "show", "to", &target.to_string(), "dev", ifname])
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
+    if output.status.success() {
+        if let Some(entry) = parse_neighbor_output(String::from_utf8_lossy(&output.stdout).as_ref(), target) {
+            return Some(entry);
+        }
     }
-    parse_neighbor_output(String::from_utf8_lossy(&output.stdout).as_ref(), target)
+    read_neighbor_entries(ifname)
+        .into_iter()
+        .find_map(|(ip, entry)| if ip == target { Some(entry) } else { None })
+}
+
+fn read_neighbor_entries(ifname: &str) -> Vec<(IpAddr, NeighborEntry)> {
+    let mut out = Vec::new();
+    for family in ["-4", "-6"] {
+        let Ok(output) = Command::new("ip")
+            .args([family, "neigh", "show", "dev", ifname])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        out.extend(parse_neighbor_entries(
+            String::from_utf8_lossy(&output.stdout).as_ref(),
+        ));
+    }
+    out
 }
 
 fn trigger_neighbor_probe(ifname: &str, target: IpAddr) {
@@ -3208,24 +3261,36 @@ fn trigger_neighbor_probe(ifname: &str, target: IpAddr) {
 }
 
 fn parse_neighbor_output(output: &str, target: IpAddr) -> Option<NeighborEntry> {
-    let target_str = target.to_string();
+    parse_neighbor_entries(output)
+        .into_iter()
+        .find_map(|(ip, entry)| if ip == target { Some(entry) } else { None })
+}
+
+fn parse_neighbor_entries(output: &str) -> Vec<(IpAddr, NeighborEntry)> {
+    let mut out = Vec::new();
     for line in output.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.is_empty() || fields[0] != target_str {
+        if fields.is_empty() {
             continue;
         }
         if fields.iter().any(|field| !neighbor_state_usable(field)) {
             continue;
         }
-        let lladdr = fields.iter().position(|field| *field == "lladdr")?;
-        let mac = parse_mac(fields.get(lladdr + 1)?).or_else(|| {
-            fields
-                .get(lladdr + 1)
-                .and_then(|candidate| parse_mac(candidate.trim()))
-        })?;
-        return Some(NeighborEntry { mac });
+        let Ok(ip) = fields[0].parse::<IpAddr>() else {
+            continue;
+        };
+        let Some(lladdr) = fields.iter().position(|field| *field == "lladdr") else {
+            continue;
+        };
+        let Some(candidate) = fields.get(lladdr + 1) else {
+            continue;
+        };
+        let Some(mac) = parse_mac(candidate).or_else(|| parse_mac(candidate.trim())) else {
+            continue;
+        };
+        out.push((ip, NeighborEntry { mac }));
     }
-    None
+    out
 }
 
 fn build_injected_packet(
@@ -4820,6 +4885,18 @@ mod tests {
             resolved.neighbor_mac,
             Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
         );
+    }
+
+    #[test]
+    fn parse_neighbor_entries_accepts_stale_ipv4_and_ipv6_rows() {
+        let parsed = parse_neighbor_entries(
+            "172.16.80.200 lladdr ba:86:e9:f6:4b:d5 STALE\n2001:559:8585:80::200 lladdr ba:86:e9:f6:4b:d5 STALE\n",
+        );
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        assert_eq!(parsed[1].0, IpAddr::V6("2001:559:8585:80::200".parse().expect("ipv6")));
+        assert_eq!(parsed[0].1.mac, [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
+        assert_eq!(parsed[1].1.mac, [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
     }
 
     #[test]
