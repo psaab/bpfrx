@@ -85,7 +85,8 @@ The validator does this in order:
 2. waits for CLI availability on both firewalls
 3. determines whether the runtime is in `supported` or `legacy` mode
 4. for supported mode:
-   - detects the active HA owner
+   - pins the isolated validation run to the preferred active node (`node0` by default for RGs 1 and 2)
+   - forces `cluster-userspace-host` to keep accepting IPv6 RAs (`accept_ra=2`)
    - waits for userspace forwarding to auto-arm on the active node
    - if auto-arm does not settle, forces `request chassis cluster data-plane userspace forwarding arm` on the active owner once
    - records the active firewall and uses it for `perf`
@@ -109,7 +110,19 @@ Recent clean validation runs on the isolated userspace cluster are:
 
 Short-lived outliers can still happen immediately after rolling deploy while HA
 ownership and RA converge. That is why the validator now follows the active
-node and explicitly waits for IPv6 route state.
+node, pins the preferred validation owner, and explicitly waits for IPv6 route state.
+
+## Preferred Active Node
+
+The isolated userspace lab currently runs most reliably when `node0` owns the
+data RGs during automated validation. The validator now enforces that as part of
+the repeatable cycle instead of depending on whatever node happened to be active
+after the rolling deploy.
+
+This is controlled by:
+
+- `PREFERRED_ACTIVE_NODE` (default `0`)
+- `PREFERRED_ACTIVE_RGS` (default `1 2`)
 
 ## Operational Rule
 

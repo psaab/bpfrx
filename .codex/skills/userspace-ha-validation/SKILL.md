@@ -30,9 +30,11 @@ Commands:
 What the script enforces:
 
 - `bpfrxd` is reachable on both isolated firewalls before validation samples dataplane state
-- the active HA owner is detected instead of assuming `fw0`
+- the isolated validation run pins the preferred active node (`node0` by default for RGs `1 2`)
+- the active HA owner is then detected instead of assuming `fw0`
 - supported userspace configs auto-arm forwarding on the active owner
 - if auto-arm does not settle, the script forces one `forwarding arm` on the active owner and rechecks
+- `cluster-userspace-host` is forced to keep accepting IPv6 RAs before route checks
 - `cluster-userspace-host` has an IPv6 default route from RA
 - if the IPv6 default route is missing, repeated `rdisc6 -1 eth0` is run before tests
 - one unmeasured warm-up `iperf3` pass is run for each address family

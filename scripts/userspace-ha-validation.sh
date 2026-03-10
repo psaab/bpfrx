@@ -10,6 +10,8 @@ PARALLEL="${PARALLEL:-4}"
 MIN_GBPS_V4="${MIN_GBPS_V4:-18.0}"
 MIN_GBPS_V6="${MIN_GBPS_V6:-18.0}"
 MARGINAL_GBPS_EPSILON="${MARGINAL_GBPS_EPSILON:-0.25}"
+PREFERRED_ACTIVE_NODE="${PREFERRED_ACTIVE_NODE:-0}"
+PREFERRED_ACTIVE_RGS="${PREFERRED_ACTIVE_RGS:-1 2}"
 WITH_PERF=0
 DEPLOY=0
 
@@ -122,6 +124,60 @@ active_owner_vm() {
 	return 1
 }
 
+rg_primary_node() {
+	local vm="$1"
+	local rg="$2"
+	local status
+	status="$(run_vm "$vm" 'cli -c "show chassis cluster status"' 2>/dev/null || true)"
+	if grep -Eq "Redundancy group: ${rg} " <<<"$status"; then
+		if awk -v rg="$rg" '
+			$0 ~ ("Redundancy group: " rg " ") { in_rg=1; next }
+			in_rg && /^Redundancy group:/ { in_rg=0 }
+			in_rg && /primary/ { print $1; exit }
+		' <<<"$status"; then
+			return 0
+		fi
+	fi
+	return 1
+}
+
+ensure_preferred_active_node() {
+	local preferred_vm="$FW0"
+	local preferred_name="node0"
+	if [[ "$PREFERRED_ACTIVE_NODE" == "1" ]]; then
+		preferred_vm="$FW1"
+		preferred_name="node1"
+	fi
+	info "pinning userspace validation to ${preferred_name} for RGs:${PREFERRED_ACTIVE_RGS}"
+	run_host 'sysctl -qw net.ipv6.conf.eth0.accept_ra=2 || true'
+	for rg in $PREFERRED_ACTIVE_RGS; do
+		local current=""
+		current="$(rg_primary_node "$FW0" "$rg" || true)"
+		if [[ "$current" == "$preferred_name" ]]; then
+			continue
+		fi
+		run_vm "$FW0" "cli -c \"request chassis cluster failover redundancy-group ${rg} node ${PREFERRED_ACTIVE_NODE}\" >/tmp/userspace-failover-rg${rg}.out"
+	done
+	local tries=45
+	while (( tries > 0 )); do
+		local all_good=1
+		for rg in $PREFERRED_ACTIVE_RGS; do
+			local current=""
+			current="$(rg_primary_node "$FW0" "$rg" || true)"
+			if [[ "$current" != "$preferred_name" ]]; then
+				all_good=0
+				break
+			fi
+		done
+		if (( all_good == 1 )); then
+			return 0
+		fi
+		sleep 1
+		tries=$((tries - 1))
+	done
+	die "preferred validation owner ${preferred_name} did not take over RGs:${PREFERRED_ACTIVE_RGS}"
+}
+
 wait_for_active_supported_runtime() {
 	local tries=30
 	while (( tries > 0 )); do
@@ -190,6 +246,7 @@ if [[ "${MODE}" == "legacy" ]]; then
 	info "validating legacy fallback state"
 else
 	info "supported userspace runtime detected"
+	ensure_preferred_active_node
 	arm_supported_runtime
 fi
 
