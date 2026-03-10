@@ -1163,21 +1163,16 @@ impl BindingWorker {
         live: Arc<BindingLiveState>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let info = ifinfo_from_binding(binding)?;
-        let sock = Socket::new(&info).map_err(|e| format!("create socket: {e}"))?;
-        let mut device = worker_umem
-            .umem
-            .fq_cq(&sock)
-            .map_err(|e| format!("create fq/cq: {e}"))?;
-        let (user, rx, tx, bind_mode) = match open_user_rings(
-            &worker_umem.umem,
-            &sock,
+        let (user, rx, tx, bind_mode, mut device) = match open_binding_worker_rings(
+            worker_umem,
+            &info,
             ring_entries,
             XSK_BIND_FLAGS_PREFERRED,
         ) {
             Ok(bound) => bound,
-            Err(preferred_err) => open_user_rings(
-                &worker_umem.umem,
-                &sock,
+            Err(preferred_err) => open_binding_worker_rings(
+                worker_umem,
+                &info,
                 ring_entries,
                 XSK_BIND_FLAGS_FALLBACK,
             )
@@ -1260,6 +1255,31 @@ impl WorkerUmem {
             .map_err(|e| format!("create umem: {e}"))?;
         Ok(Self { area, umem })
     }
+}
+
+fn open_binding_worker_rings(
+    worker_umem: &WorkerUmem,
+    info: &IfInfo,
+    ring_entries: u32,
+    bind_flags: u16,
+) -> Result<
+    (
+        User,
+        xdpilone::RingRx,
+        xdpilone::RingTx,
+        XskBindMode,
+        xdpilone::DeviceQueue,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let sock = Socket::new(info).map_err(|e| format!("create socket: {e}"))?;
+    let device = worker_umem
+        .umem
+        .fq_cq(&sock)
+        .map_err(|e| format!("create fq/cq: {e}"))?;
+    let (user, rx, tx, bind_mode) =
+        open_user_rings(&worker_umem.umem, &sock, ring_entries, bind_flags)?;
+    Ok((user, rx, tx, bind_mode, device))
 }
 
 fn open_user_rings(
