@@ -218,7 +218,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let Some(parsed) = parse_packet(data, data_end) else {
         return fallback_to_main(ctx);
     };
-    if should_fallback_local(&parsed) {
+    if should_fallback_early(&parsed) {
         return fallback_to_main(ctx);
     }
 
@@ -403,7 +403,7 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
     })
 }
 
-fn should_fallback_local(pkt: &ParsedPacket) -> bool {
+fn should_fallback_early(pkt: &ParsedPacket) -> bool {
     match pkt.addr_family {
         AF_INET => {
             if pkt.dst_v4 == 0xffff_ffff
@@ -412,14 +412,13 @@ fn should_fallback_local(pkt: &ParsedPacket) -> bool {
             {
                 return true;
             }
-            unsafe { USERSPACE_LOCAL_V4.get(&pkt.dst_v4) }.is_some()
+            false
         }
         AF_INET6 => {
             if pkt.dst_v6[0] == 0xff || is_ipv6_link_local(pkt.dst_v6) {
                 return true;
             }
-            let key = UserspaceLocalV6Key { addr: pkt.dst_v6 };
-            unsafe { USERSPACE_LOCAL_V6.get(&key) }.is_some()
+            false
         }
         _ => true,
     }
