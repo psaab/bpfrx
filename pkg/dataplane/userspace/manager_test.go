@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"net"
 	"testing"
 
 	"github.com/psaab/bpfrx/pkg/config"
@@ -196,6 +197,7 @@ func TestBuildLocalAddressEntries(t *testing.T) {
 		Interfaces: []InterfaceSnapshot{
 			{
 				Name: "reth0.50",
+				Zone: "wan",
 				Addresses: []InterfaceAddressSnapshot{
 					{Family: "inet", Address: "172.16.50.8/24"},
 					{Family: "inet6", Address: "2001:559:8585:50::8/64"},
@@ -203,6 +205,7 @@ func TestBuildLocalAddressEntries(t *testing.T) {
 			},
 			{
 				Name: "reth1.0",
+				Zone: "lan",
 				Addresses: []InterfaceAddressSnapshot{
 					{Family: "inet", Address: "10.0.61.1/24"},
 					{Family: "inet6", Address: "fe80::1/128"},
@@ -214,6 +217,49 @@ func TestBuildLocalAddressEntries(t *testing.T) {
 	got := buildLocalAddressEntries(snapshot)
 	if len(got) != 5 {
 		t.Fatalf("len(got) = %d, want 5 (%+v)", len(got), got)
+	}
+}
+
+func TestBuildLocalAddressEntriesExcludesInterfaceSNATAddresses(t *testing.T) {
+	snapshot := &ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{
+			{
+				Name: "reth0.80",
+				Zone: "wan",
+				Addresses: []InterfaceAddressSnapshot{
+					{Family: "inet", Address: "172.16.80.8/24"},
+					{Family: "inet6", Address: "2001:559:8585:80::8/64"},
+				},
+			},
+			{
+				Name: "reth1.0",
+				Zone: "lan",
+				Addresses: []InterfaceAddressSnapshot{
+					{Family: "inet", Address: "10.0.61.1/24"},
+					{Family: "inet6", Address: "2001:559:8585:ef00::1/64"},
+				},
+			},
+		},
+		SourceNAT: []SourceNATRuleSnapshot{{
+			Name:          "snat",
+			FromZone:      "lan",
+			ToZone:        "wan",
+			InterfaceMode: true,
+		}},
+	}
+	got := buildLocalAddressEntries(snapshot)
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2 (%+v)", len(got), got)
+	}
+	for _, entry := range got {
+		if entry.v4 && entry.v4Key == 0xac105008 {
+			t.Fatalf("unexpected WAN IPv4 SNAT address in local map: %+v", got)
+		}
+		var wanV6 [16]byte
+		copy(wanV6[:], []byte(net.ParseIP("2001:559:8585:80::8").To16()))
+		if !entry.v4 && entry.v6Key.Addr == wanV6 {
+			t.Fatalf("unexpected WAN IPv6 SNAT address in local map: %+v", got)
+		}
 	}
 }
 

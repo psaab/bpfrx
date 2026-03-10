@@ -1702,6 +1702,7 @@ func buildLocalAddressEntries(snapshot *ConfigSnapshot) []userspaceLocalAddressE
 	if snapshot == nil {
 		return nil
 	}
+	excludedV4, excludedV6 := buildNATTranslatedLocalAddressExclusions(snapshot)
 	seenV4 := make(map[uint32]bool)
 	seenV6 := make(map[[16]byte]bool)
 	out := make([]userspaceLocalAddressEntry, 0)
@@ -1713,6 +1714,9 @@ func buildLocalAddressEntries(snapshot *ConfigSnapshot) []userspaceLocalAddressE
 			}
 			if v4 := ip.To4(); v4 != nil {
 				key := binary.BigEndian.Uint32(v4)
+				if excludedV4[key] {
+					continue
+				}
 				if seenV4[key] {
 					continue
 				}
@@ -1722,6 +1726,9 @@ func buildLocalAddressEntries(snapshot *ConfigSnapshot) []userspaceLocalAddressE
 			}
 			var key [16]byte
 			copy(key[:], ip.To16())
+			if excludedV6[key] {
+				continue
+			}
 			if seenV6[key] {
 				continue
 			}
@@ -1730,6 +1737,86 @@ func buildLocalAddressEntries(snapshot *ConfigSnapshot) []userspaceLocalAddressE
 		}
 	}
 	return out
+}
+
+func buildNATTranslatedLocalAddressExclusions(snapshot *ConfigSnapshot) (map[uint32]bool, map[[16]byte]bool) {
+	excludedV4 := make(map[uint32]bool)
+	excludedV6 := make(map[[16]byte]bool)
+	if snapshot == nil || len(snapshot.SourceNAT) == 0 || len(snapshot.Interfaces) == 0 {
+		return excludedV4, excludedV6
+	}
+	toZones := make(map[string]bool)
+	for _, rule := range snapshot.SourceNAT {
+		if !rule.InterfaceMode || rule.Off || rule.ToZone == "" {
+			continue
+		}
+		toZones[rule.ToZone] = true
+	}
+	if len(toZones) == 0 {
+		return excludedV4, excludedV6
+	}
+	for _, iface := range snapshot.Interfaces {
+		if iface.Zone == "" || !toZones[iface.Zone] {
+			continue
+		}
+		if ip := pickInterfaceSnapshotV4(iface); ip != nil {
+			excludedV4[binary.BigEndian.Uint32(ip.To4())] = true
+		}
+		if ip := pickInterfaceSnapshotV6(iface); ip != nil {
+			var key [16]byte
+			copy(key[:], ip.To16())
+			excludedV6[key] = true
+		}
+	}
+	return excludedV4, excludedV6
+}
+
+func pickInterfaceSnapshotV4(iface InterfaceSnapshot) net.IP {
+	var fallback net.IP
+	for _, addr := range iface.Addresses {
+		if addr.Family != "inet" {
+			continue
+		}
+		ip, _, err := net.ParseCIDR(addr.Address)
+		if err != nil || ip == nil {
+			continue
+		}
+		v4 := ip.To4()
+		if v4 == nil {
+			continue
+		}
+		if fallback == nil {
+			fallback = append(net.IP(nil), v4...)
+		}
+		if !v4.IsLinkLocalUnicast() {
+			return append(net.IP(nil), v4...)
+		}
+	}
+	return fallback
+}
+
+func pickInterfaceSnapshotV6(iface InterfaceSnapshot) net.IP {
+	var fallback net.IP
+	for _, addr := range iface.Addresses {
+		if addr.Family != "inet6" {
+			continue
+		}
+		ip, _, err := net.ParseCIDR(addr.Address)
+		if err != nil || ip == nil {
+			continue
+		}
+		v6 := ip.To16()
+		if v6 == nil {
+			continue
+		}
+		if fallback == nil {
+			fallback = append(net.IP(nil), v6...)
+		}
+		if !v6.IsLinkLocalUnicast() {
+			return append(net.IP(nil), v6...)
+		}
+	}
+	return fallback
 }
 
 func (m *Manager) ensureStatusLoopLocked() {
