@@ -44,6 +44,8 @@ const XSK_BIND_FLAGS_PREFERRED: u16 =
 const IDLE_YIELD_ITERS: u32 = 64;
 const IDLE_SLEEP_AFTER: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
+const RX_WAKE_IDLE_POLLS: u32 = 32;
+const RX_WAKE_MIN_INTERVAL: Duration = Duration::from_micros(200);
 const STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const NEIGHBOR_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
@@ -987,6 +989,8 @@ struct BindingWorker {
     pending_fill_frames: VecDeque<u64>,
     heartbeat_map_fd: c_int,
     last_heartbeat_update: Instant,
+    last_rx_wake: Instant,
+    empty_rx_polls: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1188,6 +1192,8 @@ impl BindingWorker {
             pending_fill_frames: VecDeque::new(),
             heartbeat_map_fd,
             last_heartbeat_update: Instant::now(),
+            last_rx_wake: Instant::now(),
+            empty_rx_polls: 0,
         })
     }
 
@@ -1296,15 +1302,13 @@ fn poll_binding(
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
         let available = binding.rx.available().min(RX_BATCH_SIZE);
         if available == 0 {
-            if binding.device.needs_wakeup() {
-                binding.device.wake();
-                binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
-            }
+            maybe_wake_rx(binding, false);
             if poll_stats {
                 poll_kernel_stats(&binding.user, &binding.live);
             }
             return did_work;
         }
+        binding.empty_rx_polls = 0;
 
         let mut received = binding.rx.receive(available);
         let mut recycle = Vec::with_capacity(available as usize);
@@ -2504,11 +2508,29 @@ fn drain_pending_fill(binding: &mut BindingWorker) -> bool {
             binding.pending_fill_frames.push_front(offset);
         }
     }
-    if binding.device.needs_wakeup() {
-        binding.device.wake();
-        binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
-    }
+    maybe_wake_rx(binding, true);
     true
+}
+
+fn maybe_wake_rx(binding: &mut BindingWorker, force: bool) {
+    if !binding.device.needs_wakeup() {
+        binding.empty_rx_polls = 0;
+        return;
+    }
+    let now = Instant::now();
+    if !force {
+        binding.empty_rx_polls = binding.empty_rx_polls.saturating_add(1);
+        if binding.empty_rx_polls < RX_WAKE_IDLE_POLLS {
+            return;
+        }
+        if now.duration_since(binding.last_rx_wake) < RX_WAKE_MIN_INTERVAL {
+            return;
+        }
+    }
+    binding.device.wake();
+    binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
+    binding.last_rx_wake = now;
+    binding.empty_rx_polls = 0;
 }
 
 fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
