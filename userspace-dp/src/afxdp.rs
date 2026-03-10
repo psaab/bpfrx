@@ -1349,15 +1349,15 @@ fn poll_binding(
                     .metadata_packets
                     .fetch_add(1, Ordering::Relaxed);
                 let disposition = classify_metadata(meta, validation);
-                record_disposition(
-                    &ident,
-                    &binding.live,
-                    disposition,
-                    desc.len as u32,
-                    Some(meta),
-                    recent_exceptions,
-                );
                 if disposition == PacketDisposition::Valid {
+                    binding
+                        .live
+                        .validated_packets
+                        .fetch_add(1, Ordering::Relaxed);
+                    binding
+                        .live
+                        .validated_bytes
+                        .fetch_add(desc.len as u64, Ordering::Relaxed);
                     let flow = parse_session_flow(&binding.area, desc, meta);
                     if let Some(flow) = flow.as_ref() {
                         learn_dynamic_neighbor_from_packet(
@@ -1713,21 +1713,15 @@ fn poll_binding(
                             nat: NatDecision::default(),
                         }
                     };
-                    record_forwarding_disposition(
-                        &ident,
-                        &binding.live,
-                        decision.resolution,
-                        desc.len as u32,
-                        Some(meta),
-                        debug.as_ref(),
-                        recent_exceptions,
-                        last_resolution,
-                    );
                     if matches!(
                         decision.resolution.disposition,
                         ForwardingDisposition::ForwardCandidate
                             | ForwardingDisposition::FabricRedirect
                     ) {
+                        binding
+                            .live
+                            .forward_candidate_packets
+                            .fetch_add(1, Ordering::Relaxed);
                         if let Some(request) = build_live_forward_request(
                             &ident,
                             &binding.live,
@@ -1740,6 +1734,16 @@ fn poll_binding(
                             recycle_now = false;
                         }
                     } else {
+                        record_forwarding_disposition(
+                            &ident,
+                            &binding.live,
+                            decision.resolution,
+                            desc.len as u32,
+                            Some(meta),
+                            debug.as_ref(),
+                            recent_exceptions,
+                            last_resolution,
+                        );
                         maybe_reinject_slow_path(
                             &ident,
                             &binding.live,
@@ -1751,6 +1755,15 @@ fn poll_binding(
                             recent_exceptions,
                         );
                     }
+                } else {
+                    record_disposition(
+                        &ident,
+                        &binding.live,
+                        disposition,
+                        desc.len as u32,
+                        Some(meta),
+                        recent_exceptions,
+                    );
                 }
             } else {
                 binding.live.metadata_errors.fetch_add(1, Ordering::Relaxed);
