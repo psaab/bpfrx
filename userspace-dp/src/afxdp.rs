@@ -1,8 +1,9 @@
 use super::{
     BindingStatus, ConfigSnapshot, ExceptionStatus, InjectPacketRequest, InterfaceSnapshot,
-    PacketResolution,
+    PacketResolution, SourceNATRuleSnapshot,
 };
-use crate::session::{SessionKey, SessionTable};
+use crate::nat::{NatDecision, SourceNatRule, match_source_nat, parse_source_nat_rules};
+use crate::session::{SessionDecision, SessionKey, SessionTable};
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus};
 use chrono::Utc;
 use core::ffi::{c_int, c_void};
@@ -183,6 +184,8 @@ impl Coordinator {
             binding.session_misses = 0;
             binding.session_creates = 0;
             binding.session_expires = 0;
+            binding.snat_packets = 0;
+            binding.dnat_packets = 0;
             binding.slow_path_packets = 0;
             binding.slow_path_bytes = 0;
             binding.slow_path_drops = 0;
@@ -566,6 +569,8 @@ impl Coordinator {
                 binding.session_misses = snap.session_misses;
                 binding.session_creates = snap.session_creates;
                 binding.session_expires = snap.session_expires;
+                binding.snat_packets = snap.snat_packets;
+                binding.dnat_packets = snap.dnat_packets;
                 binding.slow_path_packets = snap.slow_path_packets;
                 binding.slow_path_bytes = snap.slow_path_bytes;
                 binding.slow_path_drops = snap.slow_path_drops;
@@ -607,6 +612,8 @@ impl Coordinator {
                 binding.session_misses = 0;
                 binding.session_creates = 0;
                 binding.session_expires = 0;
+                binding.snat_packets = 0;
+                binding.dnat_packets = 0;
                 binding.slow_path_packets = 0;
                 binding.slow_path_bytes = 0;
                 binding.slow_path_drops = 0;
@@ -664,7 +671,9 @@ struct ForwardingState {
     routes_v6: BTreeMap<String, Vec<RouteEntryV6>>,
     neighbors: BTreeMap<(i32, IpAddr), NeighborEntry>,
     ifindex_to_name: BTreeMap<i32, String>,
+    ifindex_to_zone: BTreeMap<i32, String>,
     egress: BTreeMap<i32, EgressInterface>,
+    source_nat_rules: Vec<SourceNatRule>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -703,11 +712,12 @@ struct NeighborEntry {
     mac: [u8; 6],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct EgressInterface {
     bind_ifindex: i32,
     vlan_id: u16,
     src_mac: [u8; 6],
+    zone: String,
     primary_v4: Option<Ipv4Addr>,
     primary_v6: Option<Ipv6Addr>,
 }
@@ -787,7 +797,19 @@ struct SessionFlow {
     src_ip: IpAddr,
     dst_ip: IpAddr,
     forward_key: SessionKey,
-    reverse_key: SessionKey,
+}
+
+impl SessionFlow {
+    fn reverse_key_with_nat(&self, nat: NatDecision) -> SessionKey {
+        SessionKey {
+            addr_family: self.forward_key.addr_family,
+            protocol: self.forward_key.protocol,
+            src_ip: nat.rewrite_dst.unwrap_or(self.dst_ip),
+            dst_ip: nat.rewrite_src.unwrap_or(self.src_ip),
+            src_port: self.forward_key.dst_port,
+            dst_port: self.forward_key.src_port,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -963,7 +985,7 @@ fn poll_binding(
             );
             if disposition == PacketDisposition::Valid {
                 let flow = parse_session_flow(&binding.area, desc, meta);
-                let resolution = if let Some(flow) = flow.as_ref() {
+                let decision = if let Some(flow) = flow.as_ref() {
                     let now = Instant::now();
                     if let Some(hit) = sessions.lookup(&flow.forward_key, now, meta.tcp_flags) {
                         binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
@@ -971,11 +993,22 @@ fn poll_binding(
                     } else {
                         binding.live.session_misses.fetch_add(1, Ordering::Relaxed);
                         let resolution = lookup_forwarding_resolution(forwarding, flow.dst_ip);
+                        let mut decision = SessionDecision {
+                            resolution,
+                            nat: NatDecision::default(),
+                        };
                         if resolution.disposition == ForwardingDisposition::ForwardCandidate {
+                            decision.nat = match_source_nat_for_flow(
+                                forwarding,
+                                meta.ingress_ifindex as i32,
+                                resolution.egress_ifindex,
+                                flow,
+                            )
+                            .unwrap_or_default();
                             let mut created = 0u64;
                             if sessions.install_with_protocol(
                                 flow.forward_key.clone(),
-                                resolution,
+                                decision,
                                 now,
                                 meta.protocol,
                                 meta.tcp_flags,
@@ -987,9 +1020,13 @@ fn poll_binding(
                             if reverse_resolution.disposition
                                 == ForwardingDisposition::ForwardCandidate
                             {
+                                let reverse_decision = SessionDecision {
+                                    resolution: reverse_resolution,
+                                    nat: decision.nat.reverse(flow.src_ip, flow.dst_ip),
+                                };
                                 if sessions.install_with_protocol(
-                                    flow.reverse_key.clone(),
-                                    reverse_resolution,
+                                    flow.reverse_key_with_nat(decision.nat),
+                                    reverse_decision,
                                     now,
                                     meta.protocol,
                                     meta.tcp_flags,
@@ -1004,21 +1041,24 @@ fn poll_binding(
                                     .fetch_add(created, Ordering::Relaxed);
                             }
                         }
-                        resolution
+                        decision
                     }
                 } else {
-                    resolve_forwarding(&binding.area, desc, meta, forwarding)
+                    SessionDecision {
+                        resolution: resolve_forwarding(&binding.area, desc, meta, forwarding),
+                        nat: NatDecision::default(),
+                    }
                 };
                 record_forwarding_disposition(
                     &ident,
                     &binding.live,
-                    resolution.clone(),
+                    decision.resolution,
                     desc.len as u32,
                     Some(meta),
                     recent_exceptions,
                     last_resolution,
                 );
-                if resolution.disposition == ForwardingDisposition::ForwardCandidate {
+                if decision.resolution.disposition == ForwardingDisposition::ForwardCandidate {
                     forward_live_packet(
                         left,
                         &ident,
@@ -1029,7 +1069,7 @@ fn poll_binding(
                         forwarding,
                         desc,
                         meta,
-                        &resolution,
+                        &decision,
                         recent_exceptions,
                     );
                 } else {
@@ -1040,7 +1080,7 @@ fn poll_binding(
                         &binding.area,
                         desc,
                         meta,
-                        resolution,
+                        decision.resolution,
                         recent_exceptions,
                     );
                 }
@@ -1093,11 +1133,10 @@ fn forward_live_packet(
     forwarding: &ForwardingState,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
-    resolution: &ForwardingResolution,
+    decision: &SessionDecision,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
-    let Some(frame) = build_forwarded_frame(ingress_area, desc, meta, resolution, forwarding)
-    else {
+    let Some(frame) = build_forwarded_frame(ingress_area, desc, meta, decision, forwarding) else {
         record_exception(
             recent_exceptions,
             ingress_ident,
@@ -1107,12 +1146,18 @@ fn forward_live_packet(
         );
         return;
     };
+    if decision.nat.rewrite_src.is_some() {
+        ingress_live.snat_packets.fetch_add(1, Ordering::Relaxed);
+    }
+    if decision.nat.rewrite_dst.is_some() {
+        ingress_live.dnat_packets.fetch_add(1, Ordering::Relaxed);
+    }
     let Some(target_live) = find_target_live(
         left,
         ingress_ifindex,
         ingress_live.clone(),
         right,
-        resolution.egress_ifindex,
+        decision.resolution.egress_ifindex,
     ) else {
         record_exception(
             recent_exceptions,
@@ -1267,14 +1312,6 @@ fn parse_session_flow(
                     src_port,
                     dst_port,
                 },
-                reverse_key: SessionKey {
-                    addr_family: meta.addr_family,
-                    protocol: meta.protocol,
-                    src_ip: dst_ip,
-                    dst_ip: src_ip,
-                    src_port: dst_port,
-                    dst_port: src_port,
-                },
             })
         }
         libc::AF_INET6 => {
@@ -1298,14 +1335,6 @@ fn parse_session_flow(
                     dst_ip,
                     src_port,
                     dst_port,
-                },
-                reverse_key: SessionKey {
-                    addr_family: meta.addr_family,
-                    protocol: meta.protocol,
-                    src_ip: dst_ip,
-                    dst_ip: src_ip,
-                    src_port: dst_port,
-                    dst_port: src_port,
                 },
             })
         }
@@ -1747,6 +1776,21 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         if !iface.linux_name.is_empty() {
             linux_to_ifindex.insert(iface.linux_name.clone(), iface.ifindex);
         }
+        if !iface.zone.is_empty() {
+            state
+                .ifindex_to_zone
+                .insert(iface.ifindex, iface.zone.clone());
+            if iface.parent_ifindex > 0 {
+                match state.ifindex_to_zone.get(&iface.parent_ifindex) {
+                    Some(existing) if existing != &iface.zone => {}
+                    _ => {
+                        state
+                            .ifindex_to_zone
+                            .insert(iface.parent_ifindex, iface.zone.clone());
+                    }
+                }
+            }
+        }
         if let Some(mac) = parse_mac(&iface.hardware_addr) {
             mac_by_ifindex.insert(iface.ifindex, mac);
         }
@@ -1794,6 +1838,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                 bind_ifindex,
                 vlan_id: iface.vlan_id.max(0) as u16,
                 src_mac,
+                zone: iface.zone.clone(),
                 primary_v4: pick_interface_v4(iface),
                 primary_v6: pick_interface_v6(iface),
             },
@@ -1861,6 +1906,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             .neighbors
             .insert((neigh.ifindex, ip), NeighborEntry { mac });
     }
+    state.source_nat_rules = parse_source_nat_rules(&snapshot.source_nat_rules);
     state
 }
 
@@ -2087,6 +2133,34 @@ fn resolve_forwarding(
         };
     };
     lookup_forwarding_resolution(state, dst)
+}
+
+fn match_source_nat_for_flow(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    egress_ifindex: i32,
+    flow: &SessionFlow,
+) -> Option<NatDecision> {
+    let from_zone = forwarding
+        .ifindex_to_zone
+        .get(&ingress_ifindex)
+        .map(|zone| zone.as_str())
+        .unwrap_or("");
+    let to_zone = forwarding
+        .egress
+        .get(&egress_ifindex)
+        .map(|iface| iface.zone.as_str())
+        .unwrap_or("");
+    let egress = forwarding.egress.get(&egress_ifindex)?;
+    match_source_nat(
+        &forwarding.source_nat_rules,
+        from_zone,
+        to_zone,
+        flow.src_ip,
+        flow.dst_ip,
+        egress.primary_v4,
+        egress.primary_v6,
+    )
 }
 
 #[cfg(test)]
@@ -2350,11 +2424,11 @@ fn build_forwarded_frame(
     area: &MmapArea,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
-    resolution: &ForwardingResolution,
+    decision: &SessionDecision,
     forwarding: &ForwardingState,
 ) -> Option<Vec<u8>> {
-    let dst_mac = resolution.neighbor_mac?;
-    let egress = forwarding.egress.get(&resolution.egress_ifindex)?;
+    let dst_mac = decision.resolution.neighbor_mac?;
+    let egress = forwarding.egress.get(&decision.resolution.egress_ifindex)?;
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     let l3 = meta.l3_offset as usize;
     if l3 >= frame.len() {
@@ -2389,6 +2463,7 @@ fn build_forwarded_frame(
             if out[ip_start + 8] <= 1 {
                 return None;
             }
+            apply_nat_ipv4(&mut out[ip_start..], meta.protocol, decision.nat)?;
             out[ip_start + 8] -= 1;
             out[ip_start + 10] = 0;
             out[ip_start + 11] = 0;
@@ -2403,11 +2478,66 @@ fn build_forwarded_frame(
             if out[ip_start + 7] <= 1 {
                 return None;
             }
+            apply_nat_ipv6(&mut out[ip_start..], meta.protocol, decision.nat)?;
             out[ip_start + 7] -= 1;
         }
         _ => return None,
     }
     Some(out)
+}
+
+fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<()> {
+    if nat == NatDecision::default() {
+        return Some(());
+    }
+    if packet.len() < 20 {
+        return None;
+    }
+    if let Some(IpAddr::V4(ip)) = nat.rewrite_src {
+        packet.get_mut(12..16)?.copy_from_slice(&ip.octets());
+    }
+    if let Some(IpAddr::V4(ip)) = nat.rewrite_dst {
+        packet.get_mut(16..20)?.copy_from_slice(&ip.octets());
+    }
+    let ihl = ((packet[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return None;
+    }
+    match protocol {
+        PROTO_TCP => recompute_l4_checksum_ipv4(packet, ihl, protocol, false)?,
+        PROTO_UDP => {
+            let checksum_offset = ihl.checked_add(6)?;
+            let keep_zero = packet
+                .get(checksum_offset..checksum_offset + 2)
+                .map(|bytes| bytes == [0, 0])
+                .unwrap_or(false);
+            if !keep_zero {
+                recompute_l4_checksum_ipv4(packet, ihl, protocol, false)?;
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<()> {
+    if nat == NatDecision::default() {
+        return Some(());
+    }
+    if packet.len() < 40 {
+        return None;
+    }
+    if let Some(IpAddr::V6(ip)) = nat.rewrite_src {
+        packet.get_mut(8..24)?.copy_from_slice(&ip.octets());
+    }
+    if let Some(IpAddr::V6(ip)) = nat.rewrite_dst {
+        packet.get_mut(24..40)?.copy_from_slice(&ip.octets());
+    }
+    match protocol {
+        PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => recompute_l4_checksum_ipv6(packet, protocol)?,
+        _ => {}
+    }
+    Some(())
 }
 
 fn build_injected_ipv4(
@@ -2499,7 +2629,7 @@ fn build_injected_ipv6(
     for i in 0..payload_len {
         frame.push((i & 0xff) as u8);
     }
-    let icmp_sum = checksum16_ipv6(src_ip, dst_ip, &frame[icmp_start..]);
+    let icmp_sum = checksum16_ipv6(src_ip, dst_ip, PROTO_ICMPV6, &frame[icmp_start..]);
     frame[icmp_start + 2] = (icmp_sum >> 8) as u8;
     frame[icmp_start + 3] = icmp_sum as u8;
     Ok(frame)
@@ -2530,14 +2660,104 @@ fn checksum16(bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-fn checksum16_ipv6(src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8]) -> u16 {
+fn checksum16_ipv6(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, payload: &[u8]) -> u16 {
     let mut pseudo = Vec::with_capacity(40 + payload.len());
     pseudo.extend_from_slice(&src.octets());
     pseudo.extend_from_slice(&dst.octets());
     pseudo.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, 58]);
+    pseudo.extend_from_slice(&[0, 0, 0, next_header]);
     pseudo.extend_from_slice(payload);
     checksum16(&pseudo)
+}
+
+fn checksum16_ipv4(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, payload: &[u8]) -> u16 {
+    let mut pseudo = Vec::with_capacity(12 + payload.len());
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.push(0);
+    pseudo.push(protocol);
+    pseudo.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    pseudo.extend_from_slice(payload);
+    checksum16(&pseudo)
+}
+
+fn recompute_l4_checksum_ipv4(
+    packet: &mut [u8],
+    ihl: usize,
+    protocol: u8,
+    zero_offset: bool,
+) -> Option<()> {
+    let segment = packet.get(ihl..)?;
+    match protocol {
+        PROTO_TCP => {
+            if segment.len() < 20 {
+                return None;
+            }
+            packet.get_mut(ihl + 16..ihl + 18)?.copy_from_slice(&[0, 0]);
+            let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+            let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+            let sum = checksum16_ipv4(src, dst, protocol, packet.get(ihl..)?);
+            packet
+                .get_mut(ihl + 16..ihl + 18)?
+                .copy_from_slice(&sum.to_be_bytes());
+        }
+        PROTO_UDP => {
+            if segment.len() < 8 {
+                return None;
+            }
+            packet.get_mut(ihl + 6..ihl + 8)?.copy_from_slice(&[0, 0]);
+            let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+            let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+            let sum = checksum16_ipv4(src, dst, protocol, packet.get(ihl..)?);
+            let sum = if zero_offset && sum == 0 { 0xffff } else { sum };
+            packet
+                .get_mut(ihl + 6..ihl + 8)?
+                .copy_from_slice(&sum.to_be_bytes());
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+fn recompute_l4_checksum_ipv6(packet: &mut [u8], protocol: u8) -> Option<()> {
+    let payload = packet.get(40..)?;
+    let src = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(8..24)?).ok()?);
+    let dst = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(24..40)?).ok()?);
+    match protocol {
+        PROTO_TCP => {
+            if payload.len() < 20 {
+                return None;
+            }
+            packet.get_mut(40 + 16..40 + 18)?.copy_from_slice(&[0, 0]);
+            let sum = checksum16_ipv6(src, dst, PROTO_TCP, packet.get(40..)?);
+            packet
+                .get_mut(40 + 16..40 + 18)?
+                .copy_from_slice(&sum.to_be_bytes());
+        }
+        PROTO_UDP => {
+            if payload.len() < 8 {
+                return None;
+            }
+            packet.get_mut(40 + 6..40 + 8)?.copy_from_slice(&[0, 0]);
+            let sum = checksum16_ipv6(src, dst, PROTO_UDP, packet.get(40..)?);
+            let sum = if sum == 0 { 0xffff } else { sum };
+            packet
+                .get_mut(40 + 6..40 + 8)?
+                .copy_from_slice(&sum.to_be_bytes());
+        }
+        PROTO_ICMPV6 => {
+            if payload.len() < 4 {
+                return None;
+            }
+            packet.get_mut(40 + 2..40 + 4)?.copy_from_slice(&[0, 0]);
+            let sum = checksum16_ipv6(src, dst, PROTO_ICMPV6, packet.get(40..)?);
+            packet
+                .get_mut(40 + 2..40 + 4)?
+                .copy_from_slice(&sum.to_be_bytes());
+        }
+        _ => {}
+    }
+    Some(())
 }
 
 enum ResolvedRouteV4 {
@@ -2815,6 +3035,8 @@ struct BindingLiveState {
     session_misses: AtomicU64,
     session_creates: AtomicU64,
     session_expires: AtomicU64,
+    snat_packets: AtomicU64,
+    dnat_packets: AtomicU64,
     slow_path_packets: AtomicU64,
     slow_path_bytes: AtomicU64,
     slow_path_drops: AtomicU64,
@@ -2857,6 +3079,8 @@ impl BindingLiveState {
             session_misses: AtomicU64::new(0),
             session_creates: AtomicU64::new(0),
             session_expires: AtomicU64::new(0),
+            snat_packets: AtomicU64::new(0),
+            dnat_packets: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
             slow_path_bytes: AtomicU64::new(0),
             slow_path_drops: AtomicU64::new(0),
@@ -2924,6 +3148,8 @@ impl BindingLiveState {
             session_misses: self.session_misses.load(Ordering::Relaxed),
             session_creates: self.session_creates.load(Ordering::Relaxed),
             session_expires: self.session_expires.load(Ordering::Relaxed),
+            snat_packets: self.snat_packets.load(Ordering::Relaxed),
+            dnat_packets: self.dnat_packets.load(Ordering::Relaxed),
             slow_path_packets: self.slow_path_packets.load(Ordering::Relaxed),
             slow_path_bytes: self.slow_path_bytes.load(Ordering::Relaxed),
             slow_path_drops: self.slow_path_drops.load(Ordering::Relaxed),
@@ -2986,6 +3212,8 @@ struct BindingLiveSnapshot {
     session_misses: u64,
     session_creates: u64,
     session_expires: u64,
+    snat_packets: u64,
+    dnat_packets: u64,
     slow_path_packets: u64,
     slow_path_bytes: u64,
     slow_path_drops: u64,
@@ -3008,6 +3236,7 @@ mod tests {
         ConfigSnapshot {
             interfaces: vec![InterfaceSnapshot {
                 name: "ge-0/0/0.50".to_string(),
+                zone: "wan".to_string(),
                 linux_name: "ge-0-0-0.50".to_string(),
                 ifindex: 12,
                 hardware_addr: "02:bf:72:00:50:08".to_string(),
@@ -3069,6 +3298,14 @@ mod tests {
             } else {
                 vec![]
             },
+            source_nat_rules: vec![SourceNATRuleSnapshot {
+                name: "snat".to_string(),
+                from_zone: "lan".to_string(),
+                to_zone: "wan".to_string(),
+                source_addresses: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+                interface_mode: true,
+                ..Default::default()
+            }],
             ..Default::default()
         }
     }
@@ -3077,6 +3314,7 @@ mod tests {
         ConfigSnapshot {
             interfaces: vec![InterfaceSnapshot {
                 name: "ge-0/0/0.50".to_string(),
+                zone: "wan".to_string(),
                 linux_name: "ge-0-0-0.50".to_string(),
                 ifindex: 12,
                 hardware_addr: "02:bf:72:00:50:08".to_string(),
@@ -3168,6 +3406,114 @@ mod tests {
                 discard: false,
                 next_table: "inet.0".to_string(),
             }],
+            ..Default::default()
+        }
+    }
+
+    fn nat_snapshot() -> ConfigSnapshot {
+        ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "reth1.0".to_string(),
+                    zone: "lan".to_string(),
+                    linux_name: "ge-0-0-1".to_string(),
+                    ifindex: 24,
+                    hardware_addr: "02:bf:72:01:00:01".to_string(),
+                    addresses: vec![
+                        InterfaceAddressSnapshot {
+                            family: "inet".to_string(),
+                            address: "10.0.61.1/24".to_string(),
+                            scope: 0,
+                        },
+                        InterfaceAddressSnapshot {
+                            family: "inet6".to_string(),
+                            address: "2001:559:8585:ef00::1/64".to_string(),
+                            scope: 0,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "reth0.80".to_string(),
+                    zone: "wan".to_string(),
+                    linux_name: "ge-0-0-0.80".to_string(),
+                    ifindex: 12,
+                    parent_ifindex: 11,
+                    vlan_id: 80,
+                    hardware_addr: "02:bf:72:00:80:08".to_string(),
+                    addresses: vec![
+                        InterfaceAddressSnapshot {
+                            family: "inet".to_string(),
+                            address: "172.16.80.8/24".to_string(),
+                            scope: 0,
+                        },
+                        InterfaceAddressSnapshot {
+                            family: "inet6".to_string(),
+                            address: "2001:559:8585:80::8/64".to_string(),
+                            scope: 0,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+            routes: vec![
+                RouteSnapshot {
+                    table: "inet.0".to_string(),
+                    family: "inet".to_string(),
+                    destination: "0.0.0.0/0".to_string(),
+                    next_hops: vec!["172.16.80.1@reth0.80".to_string()],
+                    discard: false,
+                    next_table: String::new(),
+                },
+                RouteSnapshot {
+                    table: "inet6.0".to_string(),
+                    family: "inet6".to_string(),
+                    destination: "::/0".to_string(),
+                    next_hops: vec!["2001:559:8585:80::1@reth0.80".to_string()],
+                    discard: false,
+                    next_table: String::new(),
+                },
+            ],
+            source_nat_rules: vec![
+                SourceNATRuleSnapshot {
+                    name: "snat".to_string(),
+                    from_zone: "lan".to_string(),
+                    to_zone: "wan".to_string(),
+                    source_addresses: vec!["0.0.0.0/0".to_string()],
+                    interface_mode: true,
+                    ..Default::default()
+                },
+                SourceNATRuleSnapshot {
+                    name: "snat6".to_string(),
+                    from_zone: "lan".to_string(),
+                    to_zone: "wan".to_string(),
+                    source_addresses: vec!["::/0".to_string()],
+                    interface_mode: true,
+                    ..Default::default()
+                },
+            ],
+            neighbors: vec![
+                NeighborSnapshot {
+                    interface: "ge-0-0-0.80".to_string(),
+                    ifindex: 12,
+                    family: "inet".to_string(),
+                    ip: "172.16.80.1".to_string(),
+                    mac: "00:11:22:33:44:55".to_string(),
+                    state: "reachable".to_string(),
+                    router: true,
+                    link_local: false,
+                },
+                NeighborSnapshot {
+                    interface: "ge-0-0-0.80".to_string(),
+                    ifindex: 12,
+                    family: "inet6".to_string(),
+                    ip: "2001:559:8585:80::1".to_string(),
+                    mac: "00:11:22:33:44:55".to_string(),
+                    state: "reachable".to_string(),
+                    router: true,
+                    link_local: false,
+                },
+            ],
             ..Default::default()
         }
     }
@@ -3269,6 +3615,54 @@ mod tests {
         assert_eq!(
             lookup_forwarding_for_ip(&missing_neighbor, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),),
             ForwardingDisposition::MissingNeighbor
+        );
+    }
+
+    #[test]
+    fn source_nat_selection_uses_interface_addresses() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let flow = SessionFlow {
+            src_ip: "10.0.61.102".parse().expect("src"),
+            dst_ip: "172.16.80.200".parse().expect("dst"),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: "10.0.61.102".parse().expect("src"),
+                dst_ip: "172.16.80.200".parse().expect("dst"),
+                src_port: 12345,
+                dst_port: 5201,
+            },
+        };
+        assert_eq!(
+            match_source_nat_for_flow(&state, 24, 12, &flow),
+            Some(NatDecision {
+                rewrite_src: Some("172.16.80.8".parse().expect("snat")),
+                rewrite_dst: None,
+            })
+        );
+    }
+
+    #[test]
+    fn source_nat_selection_uses_interface_addresses_v6() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let flow = SessionFlow {
+            src_ip: "2001:559:8585:ef00::100".parse().expect("src"),
+            dst_ip: "2001:559:8585:80::200".parse().expect("dst"),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: PROTO_TCP,
+                src_ip: "2001:559:8585:ef00::100".parse().expect("src"),
+                dst_ip: "2001:559:8585:80::200".parse().expect("dst"),
+                src_port: 12345,
+                dst_port: 5201,
+            },
+        };
+        assert_eq!(
+            match_source_nat_for_flow(&state, 24, 12, &flow),
+            Some(NatDecision {
+                rewrite_src: Some("2001:559:8585:80::8".parse().expect("snat")),
+                rewrite_dst: None,
+            })
         );
     }
 
@@ -3376,7 +3770,10 @@ mod tests {
                 options: 0,
             },
             meta,
-            &resolution,
+            &SessionDecision {
+                resolution,
+                nat: NatDecision::default(),
+            },
             &state,
         )
         .expect("forwarded frame");

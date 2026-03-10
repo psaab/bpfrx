@@ -31,10 +31,25 @@ func TestBuildSnapshotSummary(t *testing.T) {
 		"ge-0/0/1": {Name: "ge-0/0/1"},
 	}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
-		"trust":   {Name: "trust"},
-		"untrust": {Name: "untrust"},
+		"trust":   {Name: "trust", Interfaces: []string{"ge-0/0/1"}},
+		"untrust": {Name: "untrust", Interfaces: []string{"ge-0/0/0"}},
 	}
 	cfg.Security.Policies = []*config.ZonePairPolicies{{FromZone: "trust", ToZone: "untrust"}}
+	cfg.Security.NAT.Source = []*config.NATRuleSet{{
+		Name:     "src",
+		FromZone: "trust",
+		ToZone:   "untrust",
+		Rules: []*config.NATRule{{
+			Name: "snat",
+			Match: config.NATMatch{
+				SourceAddresses: []string{"0.0.0.0/0"},
+			},
+			Then: config.NATThen{
+				Type:      config.NATSource,
+				Interface: true,
+			},
+		}},
+	}}
 	cfg.Schedulers = map[string]*config.SchedulerConfig{"workhours": {Name: "workhours"}}
 	cfg.Chassis.Cluster = &config.ClusterConfig{ClusterID: 1}
 	cfg.RoutingOptions.StaticRoutes = []*config.StaticRoute{
@@ -84,6 +99,9 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	if snap.Interfaces[0].LinuxName != "ge-0-0-0" {
 		t.Fatalf("Interfaces[0].LinuxName = %q", snap.Interfaces[0].LinuxName)
 	}
+	if snap.Interfaces[0].Zone != "untrust" {
+		t.Fatalf("Interfaces[0].Zone = %q, want untrust", snap.Interfaces[0].Zone)
+	}
 	if len(snap.Routes) != 2 {
 		t.Fatalf("len(Routes) = %d, want 2", len(snap.Routes))
 	}
@@ -92,6 +110,12 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	}
 	if snap.Routes[1].Table != "vrf1.inet6.0" || snap.Routes[1].Destination != "::/0" {
 		t.Fatalf("Routes[1] = %+v", snap.Routes[1])
+	}
+	if len(snap.SourceNAT) != 1 {
+		t.Fatalf("len(SourceNAT) = %d, want 1", len(snap.SourceNAT))
+	}
+	if !snap.SourceNAT[0].InterfaceMode || snap.SourceNAT[0].FromZone != "trust" || snap.SourceNAT[0].ToZone != "untrust" {
+		t.Fatalf("SourceNAT[0] = %+v", snap.SourceNAT[0])
 	}
 }
 
@@ -156,6 +180,9 @@ func TestBuildSnapshotIncludesUnitInterfaces(t *testing.T) {
 			RedundantParent: "reth0",
 		},
 	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"wan": {Name: "wan", Interfaces: []string{"reth0.50"}},
+	}
 
 	snap := buildSnapshot(cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 1, 0)
 	got := map[string]InterfaceSnapshot{}
@@ -184,6 +211,9 @@ func TestBuildSnapshotIncludesUnitInterfaces(t *testing.T) {
 	}
 	if got["reth0.50"].VLANID != 50 {
 		t.Fatalf("reth0.50 VLANID = %d, want 50", got["reth0.50"].VLANID)
+	}
+	if got["reth0.50"].Zone != "wan" {
+		t.Fatalf("reth0.50 Zone = %q, want wan", got["reth0.50"].Zone)
 	}
 	if len(got["reth0.50"].Addresses) != 2 {
 		t.Fatalf("reth0.50 Addresses = %+v, want config fallback addresses", got["reth0.50"].Addresses)

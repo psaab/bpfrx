@@ -1,4 +1,5 @@
 mod afxdp;
+mod nat;
 mod session;
 mod slowpath;
 mod state_writer;
@@ -39,6 +40,8 @@ struct SnapshotSummary {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct InterfaceSnapshot {
     name: String,
+    #[serde(default)]
+    zone: String,
     #[serde(rename = "linux_name", default)]
     linux_name: String,
     #[serde(rename = "parent_linux_name", default)]
@@ -125,10 +128,31 @@ struct ConfigSnapshot {
     neighbors: Vec<NeighborSnapshot>,
     #[serde(default)]
     routes: Vec<RouteSnapshot>,
+    #[serde(rename = "source_nat_rules", default)]
+    source_nat_rules: Vec<SourceNATRuleSnapshot>,
     #[serde(default)]
     userspace: serde_json::Value,
     #[serde(default)]
     config: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct SourceNATRuleSnapshot {
+    name: String,
+    #[serde(rename = "from_zone", default)]
+    from_zone: String,
+    #[serde(rename = "to_zone", default)]
+    to_zone: String,
+    #[serde(rename = "source_addresses", default)]
+    source_addresses: Vec<String>,
+    #[serde(rename = "destination_addresses", default)]
+    destination_addresses: Vec<String>,
+    #[serde(rename = "interface_mode", default)]
+    interface_mode: bool,
+    #[serde(default)]
+    off: bool,
+    #[serde(rename = "pool_name", default)]
+    pool_name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -418,6 +442,10 @@ struct BindingStatus {
     session_creates: u64,
     #[serde(rename = "session_expires", default)]
     session_expires: u64,
+    #[serde(rename = "snat_packets", default)]
+    snat_packets: u64,
+    #[serde(rename = "dnat_packets", default)]
+    dnat_packets: u64,
     #[serde(rename = "slow_path_packets", default)]
     slow_path_packets: u64,
     #[serde(rename = "slow_path_bytes", default)]

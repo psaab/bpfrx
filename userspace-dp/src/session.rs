@@ -1,4 +1,5 @@
 use crate::afxdp::ForwardingResolution;
+use crate::nat::NatDecision;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -29,9 +30,15 @@ pub(crate) struct SessionKey {
 
 #[derive(Clone, Debug)]
 struct SessionEntry {
-    resolution: ForwardingResolution,
+    decision: SessionDecision,
     last_seen: Instant,
     expires_after: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SessionDecision {
+    pub(crate) resolution: ForwardingResolution,
+    pub(crate) nat: NatDecision,
 }
 
 pub(crate) struct SessionTable {
@@ -71,13 +78,13 @@ impl SessionTable {
         key: &SessionKey,
         now: Instant,
         tcp_flags: u8,
-    ) -> Option<ForwardingResolution> {
+    ) -> Option<SessionDecision> {
         let remove_after =
             matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
         let result = self.sessions.get_mut(key).map(|entry| {
             entry.last_seen = now;
             entry.expires_after = session_timeout(key.protocol, tcp_flags);
-            entry.resolution
+            entry.decision
         });
         if remove_after {
             let _ = self.sessions.remove(key);
@@ -88,7 +95,7 @@ impl SessionTable {
     pub fn install_with_protocol(
         &mut self,
         key: SessionKey,
-        resolution: ForwardingResolution,
+        decision: SessionDecision,
         now: Instant,
         protocol: u8,
         tcp_flags: u8,
@@ -100,7 +107,7 @@ impl SessionTable {
         self.sessions.insert(
             key,
             SessionEntry {
-                resolution,
+                decision,
                 last_seen: now,
                 expires_after: session_timeout(protocol, tcp_flags),
             },
@@ -161,14 +168,21 @@ mod tests {
         }
     }
 
+    fn decision() -> SessionDecision {
+        SessionDecision {
+            resolution: resolution(),
+            nat: NatDecision::default(),
+        }
+    }
+
     #[test]
     fn session_lookup_hits_after_install() {
         let mut table = SessionTable::new();
         let key = key_v4();
         let now = Instant::now();
-        assert!(table.install_with_protocol(key.clone(), resolution(), now, PROTO_TCP, 0x10));
+        assert!(table.install_with_protocol(key.clone(), decision(), now, PROTO_TCP, 0x10));
         let hit = table.lookup(&key, now + Duration::from_millis(1), 0x10);
-        assert_eq!(hit, Some(resolution()));
+        assert_eq!(hit, Some(decision()));
     }
 
     #[test]
@@ -176,7 +190,7 @@ mod tests {
         let mut table = SessionTable::new();
         let key = key_v6();
         let then = Instant::now() - Duration::from_secs(120);
-        assert!(table.install_with_protocol(key.clone(), resolution(), then, PROTO_UDP, 0));
+        assert!(table.install_with_protocol(key.clone(), decision(), then, PROTO_UDP, 0));
         table.last_gc = Instant::now() - Duration::from_secs(2);
         let expired = table.expire_stale(Instant::now());
         assert_eq!(expired, 1);
@@ -188,9 +202,9 @@ mod tests {
         let mut table = SessionTable::new();
         let key = key_v4();
         let now = Instant::now();
-        assert!(table.install_with_protocol(key.clone(), resolution(), now, PROTO_TCP, 0x10));
+        assert!(table.install_with_protocol(key.clone(), decision(), now, PROTO_TCP, 0x10));
         let hit = table.lookup(&key, now + Duration::from_millis(1), TCP_FIN);
-        assert_eq!(hit, Some(resolution()));
+        assert_eq!(hit, Some(decision()));
         assert!(
             table
                 .lookup(&key, now + Duration::from_millis(2), 0x10)

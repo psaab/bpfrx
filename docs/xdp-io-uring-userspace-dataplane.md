@@ -735,14 +735,17 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
   into the userspace snapshot contract
 - the Rust helper now has a bounded TUN-backed slow path for local-delivery and
   selected exception traffic, with explicit rate limits and helper-visible status counters
-- the Rust helper now has an initial per-worker session table for routed no-NAT traffic,
+- the Rust helper now has an initial per-worker session table for routed traffic,
   including bidirectional keying, lazy expiry, and cached forwarding resolution reuse
+- the Rust helper now has a first worker-local NAT slice for interface-mode source NAT:
+  ordered source-NAT rule snapshots, ingress/egress zone matching, per-session NAT
+  decisions, forward-path SNAT rewrite, and reverse-path reply DNAT rewrite
 
 What is still intentionally not implemented:
 
 - live packet redirect enablement for production traffic
-- stateful or policy/NAT-aware userspace forwarding
-- worker-local session/NAT/policy state
+- policy-aware userspace forwarding
+- worker-local policy state
 - shared-memory snapshot regions
 - io_uring-backed slow-path transport beyond bounded TUN reinjection
 
@@ -848,12 +851,15 @@ Implemented today:
 - per-worker session lookup/create/update scaffold for routed no-NAT traffic
 - bidirectional session key installation
 - lazy expiry and session counters in helper status
+- interface-mode source NAT rule snapshots from the Go control plane
+- per-session NAT decisions and reply-direction key installation
+- source and destination IP rewrite on the Rust fast path for interface-mode source NAT
 
 Not implemented yet:
-- NAT-aware session state
 - policy-aware session create/deny
 - HA/session-sync export from worker-local state
 - worker-local timer wheels or batched expiry structures beyond lazy GC
+- full NAT parity: destination NAT, static NAT, NAT64, NATv6v4, and pool-based source NAT
 
 ## Phase 5: Use io_uring for the non-AF_XDP parts
 

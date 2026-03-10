@@ -27,18 +27,19 @@ type ControlResponse struct {
 }
 
 type ConfigSnapshot struct {
-	Version       int                    `json:"version"`
-	Generation    uint64                 `json:"generation"`
-	FIBGeneration uint32                 `json:"fib_generation,omitempty"`
-	GeneratedAt   time.Time              `json:"generated_at"`
-	Summary       SnapshotSummary        `json:"summary"`
-	Capabilities  UserspaceCapabilities  `json:"capabilities"`
-	MapPins       UserspaceMapPins       `json:"map_pins"`
-	Interfaces    []InterfaceSnapshot    `json:"interfaces,omitempty"`
-	Neighbors     []NeighborSnapshot     `json:"neighbors,omitempty"`
-	Routes        []RouteSnapshot        `json:"routes,omitempty"`
-	Config        *config.Config         `json:"config,omitempty"`
-	Userspace     config.UserspaceConfig `json:"userspace"`
+	Version       int                     `json:"version"`
+	Generation    uint64                  `json:"generation"`
+	FIBGeneration uint32                  `json:"fib_generation,omitempty"`
+	GeneratedAt   time.Time               `json:"generated_at"`
+	Summary       SnapshotSummary         `json:"summary"`
+	Capabilities  UserspaceCapabilities   `json:"capabilities"`
+	MapPins       UserspaceMapPins        `json:"map_pins"`
+	Interfaces    []InterfaceSnapshot     `json:"interfaces,omitempty"`
+	Neighbors     []NeighborSnapshot      `json:"neighbors,omitempty"`
+	Routes        []RouteSnapshot         `json:"routes,omitempty"`
+	SourceNAT     []SourceNATRuleSnapshot `json:"source_nat_rules,omitempty"`
+	Config        *config.Config          `json:"config,omitempty"`
+	Userspace     config.UserspaceConfig  `json:"userspace"`
 }
 
 type SnapshotSummary struct {
@@ -53,6 +54,7 @@ type SnapshotSummary struct {
 
 type InterfaceSnapshot struct {
 	Name            string                     `json:"name"`
+	Zone            string                     `json:"zone,omitempty"`
 	LinuxName       string                     `json:"linux_name,omitempty"`
 	ParentLinuxName string                     `json:"parent_linux_name,omitempty"`
 	Ifindex         int                        `json:"ifindex,omitempty"`
@@ -66,6 +68,17 @@ type InterfaceSnapshot struct {
 	MTU             int                        `json:"mtu,omitempty"`
 	HardwareAddr    string                     `json:"hardware_addr,omitempty"`
 	Addresses       []InterfaceAddressSnapshot `json:"addresses,omitempty"`
+}
+
+type SourceNATRuleSnapshot struct {
+	Name                 string   `json:"name"`
+	FromZone             string   `json:"from_zone,omitempty"`
+	ToZone               string   `json:"to_zone,omitempty"`
+	SourceAddresses      []string `json:"source_addresses,omitempty"`
+	DestinationAddresses []string `json:"destination_addresses,omitempty"`
+	InterfaceMode        bool     `json:"interface_mode,omitempty"`
+	Off                  bool     `json:"off,omitempty"`
+	PoolName             string   `json:"pool_name,omitempty"`
 }
 
 type InterfaceAddressSnapshot struct {
@@ -220,6 +233,8 @@ type BindingStatus struct {
 	SessionMisses        uint64    `json:"session_misses,omitempty"`
 	SessionCreates       uint64    `json:"session_creates,omitempty"`
 	SessionExpires       uint64    `json:"session_expires,omitempty"`
+	SNATPackets          uint64    `json:"snat_packets,omitempty"`
+	DNATPackets          uint64    `json:"dnat_packets,omitempty"`
 	SlowPathPackets      uint64    `json:"slow_path_packets,omitempty"`
 	SlowPathBytes        uint64    `json:"slow_path_bytes,omitempty"`
 	SlowPathDrops        uint64    `json:"slow_path_drops,omitempty"`

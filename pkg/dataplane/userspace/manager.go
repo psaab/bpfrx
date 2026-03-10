@@ -151,12 +151,12 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	if len(cfg.Security.Zones) > 0 || len(cfg.Security.Policies) > 0 || len(cfg.Security.GlobalPolicies) > 0 {
 		addReason("security zones and policies still require the existing flow dataplane")
 	}
-	if len(cfg.Security.NAT.Source) > 0 ||
+	if !userspaceSupportsSourceNAT(cfg.Security.NAT.Source) ||
 		(cfg.Security.NAT.Destination != nil && len(cfg.Security.NAT.Destination.RuleSets) > 0) ||
 		len(cfg.Security.NAT.Static) > 0 ||
 		len(cfg.Security.NAT.NAT64) > 0 ||
 		cfg.Security.NAT.NATv6v4 != nil {
-		addReason("NAT and NAT64 are not implemented in the userspace dataplane")
+		addReason("full NAT and NAT64 are not implemented in the userspace dataplane")
 	}
 	if cfg.Security.Flow.TCPSession != nil ||
 		cfg.Security.Flow.UDPSessionTimeout != 0 ||
@@ -204,6 +204,24 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	return caps
 }
 
+func userspaceSupportsSourceNAT(ruleSets []*config.NATRuleSet) bool {
+	for _, rs := range ruleSets {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			if rule.Then.Interface || rule.Then.Off {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
 func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32) *ConfigSnapshot {
 	if cfg == nil {
 		return &ConfigSnapshot{
@@ -228,6 +246,7 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		Interfaces:    buildInterfaceSnapshots(cfg),
 		Neighbors:     buildNeighborSnapshots(cfg),
 		Routes:        buildRouteSnapshots(cfg),
+		SourceNAT:     buildSourceNATSnapshots(cfg),
 		Config:        cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
@@ -271,6 +290,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
 		return nil
 	}
+	zoneByInterface := buildInterfaceZoneMap(cfg)
 	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
 	for name := range cfg.Interfaces.Interfaces {
 		names = append(names, name)
@@ -286,6 +306,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 		ifindex, mtu, hardwareAddr, addresses := buildLinkSnapshot(linuxName)
 		out = append(out, InterfaceSnapshot{
 			Name:            name,
+			Zone:            zoneByInterface[name],
 			LinuxName:       linuxName,
 			ParentLinuxName: "",
 			Ifindex:         ifindex,
@@ -321,6 +342,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			addresses = mergeInterfaceAddressSnapshots(addresses, buildConfiguredAddressSnapshots(unit.Addresses))
 			out = append(out, InterfaceSnapshot{
 				Name:            unitName,
+				Zone:            zoneByInterface[unitName],
 				LinuxName:       linuxUnit,
 				ParentLinuxName: parentLinux,
 				Ifindex:         ifindex,
@@ -335,6 +357,33 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				HardwareAddr:    hardwareAddr,
 				Addresses:       addresses,
 			})
+		}
+	}
+	return out
+}
+
+func buildInterfaceZoneMap(cfg *config.Config) map[string]string {
+	if cfg == nil || len(cfg.Security.Zones) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(cfg.Security.Zones))
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+	for _, zoneName := range zoneNames {
+		zone := cfg.Security.Zones[zoneName]
+		if zone == nil {
+			continue
+		}
+		for _, iface := range zone.Interfaces {
+			if iface == "" {
+				continue
+			}
+			if _, exists := out[iface]; !exists {
+				out[iface] = zoneName
+			}
 		}
 	}
 	return out
@@ -560,6 +609,42 @@ func buildRouteSnapshots(cfg *config.Config) []RouteSnapshot {
 		}
 		return out[i].Destination < out[j].Destination
 	})
+	return out
+}
+
+func buildSourceNATSnapshots(cfg *config.Config) []SourceNATRuleSnapshot {
+	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
+		return nil
+	}
+	out := make([]SourceNATRuleSnapshot, 0)
+	for _, rs := range cfg.Security.NAT.Source {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			sourceAddrs := append([]string(nil), rule.Match.SourceAddresses...)
+			if len(sourceAddrs) == 0 && rule.Match.SourceAddress != "" {
+				sourceAddrs = append(sourceAddrs, rule.Match.SourceAddress)
+			}
+			destAddrs := append([]string(nil), rule.Match.DestinationAddresses...)
+			if len(destAddrs) == 0 && rule.Match.DestinationAddress != "" {
+				destAddrs = append(destAddrs, rule.Match.DestinationAddress)
+			}
+			out = append(out, SourceNATRuleSnapshot{
+				Name:                 rule.Name,
+				FromZone:             rs.FromZone,
+				ToZone:               rs.ToZone,
+				SourceAddresses:      sourceAddrs,
+				DestinationAddresses: destAddrs,
+				InterfaceMode:        rule.Then.Interface,
+				Off:                  rule.Then.Off,
+				PoolName:             rule.Then.PoolName,
+			})
+		}
+	}
 	return out
 }
 
