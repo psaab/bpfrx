@@ -91,6 +91,22 @@ int xdp_forward_prog(struct xdp_md *ctx)
 			inc_counter(GLOBAL_CTR_HOST_INBOUND);
 			return tunnel_pass(ctx, meta);
 		}
+		/*
+		 * Tunnel interface bypass: packets arriving on a tunnel
+		 * (GRE, ip6gre, XFRM) have already been validated at
+		 * the outer transport level by the zone where the
+		 * encapsulated packet was received.  The inner
+		 * decapsulated packet should not be subject to the
+		 * tunnel zone's host-inbound restrictions — those are
+		 * meant for direct network attacks, not tunnel-
+		 * authenticated traffic.  Without this, the firewall
+		 * cannot use services through tunnels (e.g. iperf3)
+		 * because TCP on arbitrary ports returns flag=0.
+		 */
+		if (meta->meta_flags & META_FLAG_TUNNEL) {
+			inc_counter(GLOBAL_CTR_HOST_INBOUND);
+			return tunnel_pass(ctx, meta);
+		}
 		__u32 zone_key = (__u32)meta->ingress_zone;
 		struct zone_config *zcfg = bpf_map_lookup_elem(&zone_configs, &zone_key);
 		if (zcfg && zcfg->host_inbound_flags != 0) {

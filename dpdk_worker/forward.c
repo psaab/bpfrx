@@ -114,6 +114,14 @@ forward_packet(struct rte_mbuf *pkt, struct pkt_meta *meta,
 	 * resolved, the packet is locally destined. Check host-inbound
 	 * policy before passing to the kernel stack. */
 	if (meta->fwd_ifindex == 0) {
+		/* Tunnel bypass: decapsulated inner packets already
+		 * validated at outer transport level — skip zone
+		 * host-inbound restrictions. */
+		if (meta->meta_flags & META_FLAG_TUNNEL) {
+			ctr_global_inc(ctx, GLOBAL_CTR_HOST_INBOUND);
+			rte_pktmbuf_free(pkt);
+			return;
+		}
 		if (meta->ingress_zone < MAX_ZONES && ctx->shm->zone_configs) {
 			struct zone_config *zc = &ctx->shm->zone_configs[meta->ingress_zone];
 			if (zc->host_inbound_flags != 0) {
