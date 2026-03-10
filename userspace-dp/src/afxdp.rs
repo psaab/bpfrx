@@ -1839,6 +1839,11 @@ fn parse_session_flow(
     meta: UserspaceDpMeta,
 ) -> Option<SessionFlow> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    if matches!(meta.addr_family as i32, libc::AF_INET) {
+        if let Some(flow) = parse_ipv4_session_flow_from_frame(frame, meta) {
+            return Some(flow);
+        }
+    }
     let l3 = meta.l3_offset as usize;
     let l4 = meta.l4_offset as usize;
     match meta.addr_family as i32 {
@@ -1898,6 +1903,55 @@ fn parse_session_flow(
         }
         _ => None,
     }
+}
+
+fn parse_ipv4_session_flow_from_frame(frame: &[u8], meta: UserspaceDpMeta) -> Option<SessionFlow> {
+    let mut l3 = 14usize;
+    if frame.len() < l3 {
+        return None;
+    }
+    let mut eth_proto = u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]);
+    if matches!(eth_proto, 0x8100 | 0x88a8) {
+        if frame.len() < l3 + 4 {
+            return None;
+        }
+        eth_proto = u16::from_be_bytes([*frame.get(16)?, *frame.get(17)?]);
+        l3 += 4;
+    }
+    if eth_proto != 0x0800 || frame.len() < l3 + 20 {
+        return None;
+    }
+    let ihl = usize::from(frame[l3] & 0x0f) * 4;
+    if ihl < 20 || frame.len() < l3 + ihl {
+        return None;
+    }
+    let protocol = frame[l3 + 9];
+    let l4 = l3 + ihl;
+    let src_ip = IpAddr::V4(Ipv4Addr::new(
+        frame[l3 + 12],
+        frame[l3 + 13],
+        frame[l3 + 14],
+        frame[l3 + 15],
+    ));
+    let dst_ip = IpAddr::V4(Ipv4Addr::new(
+        frame[l3 + 16],
+        frame[l3 + 17],
+        frame[l3 + 18],
+        frame[l3 + 19],
+    ));
+    let (src_port, dst_port) = parse_flow_ports(frame, l4, protocol)?;
+    Some(SessionFlow {
+        src_ip,
+        dst_ip,
+        forward_key: SessionKey {
+            addr_family: meta.addr_family,
+            protocol,
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+        },
+    })
 }
 
 fn parse_flow_ports(frame: &[u8], l4: usize, protocol: u8) -> Option<(u16, u16)> {
@@ -5240,6 +5294,17 @@ mod tests {
         }
     }
 
+    fn vlan_icmp_reply_frame() -> Vec<u8> {
+        let mut frame = vec![
+            0x02, 0xbf, 0x72, 0x16, 0x02, 0x00, 0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5, 0x81,
+            0x00, 0x00, 0x50, 0x08, 0x00, 0x45, 0x00, 0x00, 0x54, 0x00, 0x00, 0x00, 0x00,
+            0x40, 0x01, 0x00, 0x00, 0xac, 0x10, 0x50, 0xc8, 0xac, 0x10, 0x50, 0x08, 0x00,
+            0x00, 0x00, 0x00, 0x12, 0x34, 0x00, 0x01,
+        ];
+        frame.resize(98, 0);
+        frame
+    }
+
     #[test]
     fn metadata_classification_accepts_matching_generations() {
         let validation = ValidationState {
@@ -5288,6 +5353,39 @@ mod tests {
             classify_metadata(meta, validation),
             PacketDisposition::UnsupportedPacket
         );
+    }
+
+    #[test]
+    fn parse_session_flow_reparses_vlan_ipv4_reply_without_meta_offsets() {
+        let frame = vlan_icmp_reply_frame();
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            l3_offset: 14,
+            l4_offset: 34,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = parse_session_flow(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+        )
+        .expect("flow");
+        assert_eq!(flow.src_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        assert_eq!(flow.dst_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
+        assert_eq!(flow.forward_key.src_port, 0x1234);
+        assert_eq!(flow.forward_key.dst_port, 0);
     }
 
     #[test]
