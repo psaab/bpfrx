@@ -131,6 +131,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	}
 	if status.LastResolution != nil {
 		fmt.Fprintf(&b, "  Last resolution:           %s", status.LastResolution.Disposition)
+		if status.LastResolution.IngressIfindex > 0 {
+			fmt.Fprintf(&b, " ingress-ifindex=%d", status.LastResolution.IngressIfindex)
+		}
 		if status.LastResolution.LocalIfindex > 0 {
 			fmt.Fprintf(&b, " local-ifindex=%d", status.LastResolution.LocalIfindex)
 		}
@@ -142,6 +145,17 @@ func FormatStatusSummary(status ProcessStatus) string {
 		}
 		if status.LastResolution.NeighborMAC != "" {
 			fmt.Fprintf(&b, " mac=%s", status.LastResolution.NeighborMAC)
+		}
+		if status.LastResolution.SrcIP != "" || status.LastResolution.DstIP != "" {
+			fmt.Fprintf(&b, " flow=%s:%d->%s:%d",
+				status.LastResolution.SrcIP,
+				status.LastResolution.SrcPort,
+				status.LastResolution.DstIP,
+				status.LastResolution.DstPort,
+			)
+		}
+		if status.LastResolution.FromZone != "" || status.LastResolution.ToZone != "" {
+			fmt.Fprintf(&b, " zones=%s->%s", status.LastResolution.FromZone, status.LastResolution.ToZone)
 		}
 		fmt.Fprintln(&b)
 	}
@@ -253,6 +267,15 @@ func FormatBindings(status ProcessStatus) string {
 	for _, exc := range status.RecentExceptions {
 		fmt.Fprintf(&b, "  %s slot=%d queue=%d if=%s reason=%s len=%d af=%d proto=%d",
 			exc.Timestamp.Format(time.RFC3339), exc.Slot, exc.QueueID, exc.Interface, exc.Reason, exc.PacketLength, exc.AddrFamily, exc.Protocol)
+		if exc.IngressIfindex > 0 {
+			fmt.Fprintf(&b, " ingress-ifindex=%d", exc.IngressIfindex)
+		}
+		if exc.SrcIP != "" || exc.DstIP != "" {
+			fmt.Fprintf(&b, " flow=%s:%d->%s:%d", exc.SrcIP, exc.SrcPort, exc.DstIP, exc.DstPort)
+		}
+		if exc.FromZone != "" || exc.ToZone != "" {
+			fmt.Fprintf(&b, " zones=%s->%s", exc.FromZone, exc.ToZone)
+		}
 		if exc.ConfigGeneration != 0 || exc.FIBGeneration != 0 {
 			fmt.Fprintf(&b, " cfg=%d fib=%d", exc.ConfigGeneration, exc.FIBGeneration)
 		}

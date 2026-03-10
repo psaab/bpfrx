@@ -396,10 +396,24 @@ struct PacketResolution {
     local_ifindex: i32,
     #[serde(rename = "egress_ifindex", default)]
     egress_ifindex: i32,
+    #[serde(rename = "ingress_ifindex", default)]
+    ingress_ifindex: i32,
     #[serde(rename = "next_hop", default)]
     next_hop: String,
     #[serde(rename = "neighbor_mac", default)]
     neighbor_mac: String,
+    #[serde(rename = "src_ip", default)]
+    src_ip: String,
+    #[serde(rename = "dst_ip", default)]
+    dst_ip: String,
+    #[serde(rename = "src_port", default)]
+    src_port: u16,
+    #[serde(rename = "dst_port", default)]
+    dst_port: u16,
+    #[serde(rename = "from_zone", default)]
+    from_zone: String,
+    #[serde(rename = "to_zone", default)]
+    to_zone: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -580,6 +594,8 @@ struct ExceptionStatus {
     interface: String,
     #[serde(default)]
     ifindex: i32,
+    #[serde(rename = "ingress_ifindex", default)]
+    ingress_ifindex: i32,
     reason: String,
     #[serde(rename = "packet_length", default)]
     packet_length: u32,
@@ -591,6 +607,18 @@ struct ExceptionStatus {
     config_generation: u64,
     #[serde(rename = "fib_generation", default)]
     fib_generation: u32,
+    #[serde(rename = "src_ip", default)]
+    src_ip: String,
+    #[serde(rename = "dst_ip", default)]
+    dst_ip: String,
+    #[serde(rename = "src_port", default)]
+    src_port: u16,
+    #[serde(rename = "dst_port", default)]
+    dst_port: u16,
+    #[serde(rename = "from_zone", default)]
+    from_zone: String,
+    #[serde(rename = "to_zone", default)]
+    to_zone: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

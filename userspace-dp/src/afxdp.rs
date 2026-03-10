@@ -578,6 +578,7 @@ impl Coordinator {
                         resolution,
                         packet_length,
                         Some(meta),
+                        None,
                         &self.recent_exceptions,
                         &self.last_resolution,
                     );
@@ -592,7 +593,7 @@ impl Coordinator {
                         if resolution.disposition != ForwardingDisposition::ForwardCandidate {
                             return Err(format!(
                                 "destination is not forwardable via userspace TX: {}",
-                                resolution.status().disposition
+                                resolution.status(None).disposition
                             ));
                         }
                         let target_slot = self
@@ -627,6 +628,7 @@ impl Coordinator {
                         "invalid_destination_ip",
                         packet_length,
                         Some(meta),
+                        None,
                     );
                 }
             } else if req.emit_on_wire {
@@ -641,6 +643,7 @@ impl Coordinator {
             &ident,
             "metadata_parse",
             packet_length,
+            None,
             None,
         );
         Ok(())
@@ -870,7 +873,7 @@ pub(crate) struct ForwardingResolution {
 }
 
 impl ForwardingResolution {
-    fn status(self) -> PacketResolution {
+    fn status(self, debug: Option<&ResolutionDebug>) -> PacketResolution {
         PacketResolution {
             disposition: match self.disposition {
                 ForwardingDisposition::LocalDelivery => "local_delivery",
@@ -885,8 +888,15 @@ impl ForwardingResolution {
             .to_string(),
             local_ifindex: self.local_ifindex,
             egress_ifindex: self.egress_ifindex,
+            ingress_ifindex: debug.map(|d| d.ingress_ifindex).unwrap_or_default(),
             next_hop: self.next_hop.map(|ip| ip.to_string()).unwrap_or_default(),
             neighbor_mac: self.neighbor_mac.map(format_mac).unwrap_or_default(),
+            src_ip: debug.map(|d| d.src_ip.clone()).unwrap_or_default(),
+            dst_ip: debug.map(|d| d.dst_ip.clone()).unwrap_or_default(),
+            src_port: debug.map(|d| d.src_port).unwrap_or_default(),
+            dst_port: debug.map(|d| d.dst_port).unwrap_or_default(),
+            from_zone: debug.map(|d| d.from_zone.clone()).unwrap_or_default(),
+            to_zone: debug.map(|d| d.to_zone.clone()).unwrap_or_default(),
         }
     }
 }
@@ -932,6 +942,31 @@ struct SessionFlow {
 impl SessionFlow {
     fn reverse_key_with_nat(&self, nat: NatDecision) -> SessionKey {
         reverse_session_key(&self.forward_key, nat)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ResolutionDebug {
+    ingress_ifindex: i32,
+    src_ip: String,
+    dst_ip: String,
+    src_port: u16,
+    dst_port: u16,
+    from_zone: String,
+    to_zone: String,
+}
+
+impl ResolutionDebug {
+    fn from_flow(ingress_ifindex: i32, flow: &SessionFlow) -> Self {
+        Self {
+            ingress_ifindex,
+            src_ip: flow.src_ip.to_string(),
+            dst_ip: flow.dst_ip.to_string(),
+            src_port: flow.forward_key.src_port,
+            dst_port: flow.forward_key.dst_port,
+            from_zone: String::new(),
+            to_zone: String::new(),
+        }
     }
 }
 
@@ -1144,11 +1179,18 @@ fn poll_binding(
                         dynamic_neighbors,
                     );
                 }
+                let mut debug = flow
+                    .as_ref()
+                    .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
                 let decision = if let Some(flow) = flow.as_ref() {
                     let now = Instant::now();
                     if let Some(hit) = sessions.lookup(&flow.forward_key, now, meta.tcp_flags) {
                         binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
                         let mut decision = hit.decision;
+                        if let Some(debug) = debug.as_mut() {
+                            debug.from_zone = hit.metadata.ingress_zone.clone();
+                            debug.to_zone = hit.metadata.egress_zone.clone();
+                        }
                         if hit.metadata.synced {
                             decision.resolution = enforce_ha_resolution(
                                 forwarding,
@@ -1176,6 +1218,15 @@ fn poll_binding(
                             resolution,
                             nat: NatDecision::default(),
                         };
+                        if let Some(debug) = debug.as_mut() {
+                            let (from_zone, to_zone) = zone_pair_for_flow(
+                                forwarding,
+                                meta.ingress_ifindex as i32,
+                                resolution.egress_ifindex,
+                            );
+                            debug.from_zone = from_zone;
+                            debug.to_zone = to_zone;
+                        }
                         if resolution.disposition == ForwardingDisposition::ForwardCandidate {
                             let (from_zone, to_zone) = zone_pair_for_flow(
                                 forwarding,
@@ -1310,6 +1361,7 @@ fn poll_binding(
                     decision.resolution,
                     desc.len as u32,
                     Some(meta),
+                    debug.as_ref(),
                     recent_exceptions,
                     last_resolution,
                 );
@@ -1347,6 +1399,7 @@ fn poll_binding(
                 &ident,
                 "metadata_parse",
                 desc.len as u32,
+                None,
                 None,
             );
         }
@@ -1404,6 +1457,7 @@ fn forward_live_packet(
             "forward_build_failed",
             desc.len as u32,
             Some(meta),
+            None,
         );
         return;
     };
@@ -1427,6 +1481,7 @@ fn forward_live_packet(
             "missing_egress_binding",
             desc.len as u32,
             Some(meta),
+            None,
         );
         return;
     };
@@ -1441,6 +1496,7 @@ fn forward_live_packet(
             "enqueue_tx_failed",
             desc.len as u32,
             Some(meta),
+            None,
         );
     }
 }
@@ -1481,6 +1537,7 @@ fn maybe_reinject_slow_path(
             "slow_path_extract_failed",
             desc.len as u32,
             Some(meta),
+            None,
         );
         return;
     };
@@ -1493,6 +1550,7 @@ fn maybe_reinject_slow_path(
             "slow_path_unavailable",
             desc.len as u32,
             Some(meta),
+            None,
         );
         return;
     };
@@ -1511,6 +1569,7 @@ fn maybe_reinject_slow_path(
                 "slow_path_rate_limited",
                 desc.len as u32,
                 Some(meta),
+                None,
             );
         }
         Ok(EnqueueOutcome::QueueFull) => {
@@ -1521,6 +1580,7 @@ fn maybe_reinject_slow_path(
                 "slow_path_queue_full",
                 desc.len as u32,
                 Some(meta),
+                None,
             );
         }
         Err(err) => {
@@ -1532,6 +1592,7 @@ fn maybe_reinject_slow_path(
                 "slow_path_enqueue_failed",
                 desc.len as u32,
                 Some(meta),
+                None,
             );
         }
     }
@@ -1847,6 +1908,7 @@ fn record_exception(
     reason: &str,
     packet_length: u32,
     meta: Option<UserspaceDpMeta>,
+    debug: Option<&ResolutionDebug>,
 ) {
     if let Ok(mut recent) = recent_exceptions.lock() {
         push_recent_exception(
@@ -1858,12 +1920,19 @@ fn record_exception(
                 worker_id: binding.worker_id,
                 interface: binding.interface.clone(),
                 ifindex: binding.ifindex,
+                ingress_ifindex: debug.map(|d| d.ingress_ifindex).unwrap_or_default(),
                 reason: reason.to_string(),
                 packet_length,
                 addr_family: meta.map(|m| m.addr_family).unwrap_or(0),
                 protocol: meta.map(|m| m.protocol).unwrap_or(0),
                 config_generation: meta.map(|m| m.config_generation).unwrap_or(0),
                 fib_generation: meta.map(|m| m.fib_generation).unwrap_or(0),
+                src_ip: debug.map(|d| d.src_ip.clone()).unwrap_or_default(),
+                dst_ip: debug.map(|d| d.dst_ip.clone()).unwrap_or_default(),
+                src_port: debug.map(|d| d.src_port).unwrap_or_default(),
+                dst_port: debug.map(|d| d.dst_port).unwrap_or_default(),
+                from_zone: debug.map(|d| d.from_zone.clone()).unwrap_or_default(),
+                to_zone: debug.map(|d| d.to_zone.clone()).unwrap_or_default(),
             },
         );
     }
@@ -1891,6 +1960,7 @@ fn record_disposition(
                 "no_snapshot",
                 packet_length,
                 meta,
+                None,
             );
         }
         PacketDisposition::ConfigGenerationMismatch => {
@@ -1902,6 +1972,7 @@ fn record_disposition(
                 "config_generation_mismatch",
                 packet_length,
                 meta,
+                None,
             );
         }
         PacketDisposition::FibGenerationMismatch => {
@@ -1913,6 +1984,7 @@ fn record_disposition(
                 "fib_generation_mismatch",
                 packet_length,
                 meta,
+                None,
             );
         }
         PacketDisposition::UnsupportedPacket => {
@@ -1924,6 +1996,7 @@ fn record_disposition(
                 "unsupported_packet",
                 packet_length,
                 meta,
+                None,
             );
         }
     }
@@ -1935,11 +2008,12 @@ fn record_forwarding_disposition(
     resolution: ForwardingResolution,
     packet_length: u32,
     meta: Option<UserspaceDpMeta>,
+    debug: Option<&ResolutionDebug>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
 ) {
     if let Ok(mut last) = last_resolution.lock() {
-        *last = Some(resolution.status());
+        *last = Some(resolution.status(debug));
     }
     match resolution.disposition {
         ForwardingDisposition::LocalDelivery => {
@@ -1957,6 +2031,7 @@ fn record_forwarding_disposition(
                 "ha_inactive",
                 packet_length,
                 meta,
+                debug,
             );
         }
         ForwardingDisposition::PolicyDenied => {
@@ -1967,11 +2042,19 @@ fn record_forwarding_disposition(
                 "policy_denied",
                 packet_length,
                 meta,
+                debug,
             );
         }
         ForwardingDisposition::NoRoute => {
             live.route_miss_packets.fetch_add(1, Ordering::Relaxed);
-            record_exception(recent_exceptions, binding, "no_route", packet_length, meta);
+            record_exception(
+                recent_exceptions,
+                binding,
+                "no_route",
+                packet_length,
+                meta,
+                debug,
+            );
         }
         ForwardingDisposition::MissingNeighbor => {
             live.neighbor_miss_packets.fetch_add(1, Ordering::Relaxed);
@@ -1981,6 +2064,7 @@ fn record_forwarding_disposition(
                 "missing_neighbor",
                 packet_length,
                 meta,
+                debug,
             );
         }
         ForwardingDisposition::DiscardRoute => {
@@ -1991,6 +2075,7 @@ fn record_forwarding_disposition(
                 "discard_route",
                 packet_length,
                 meta,
+                debug,
             );
         }
         ForwardingDisposition::NextTableUnsupported => {
@@ -2001,6 +2086,7 @@ fn record_forwarding_disposition(
                 "next_table_unsupported",
                 packet_length,
                 meta,
+                debug,
             );
         }
     }

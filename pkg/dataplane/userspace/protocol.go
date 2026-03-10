@@ -212,11 +212,18 @@ type SlowPathStatus struct {
 }
 
 type PacketResolution struct {
-	Disposition   string `json:"disposition"`
-	LocalIfindex  int    `json:"local_ifindex,omitempty"`
-	EgressIfindex int    `json:"egress_ifindex,omitempty"`
-	NextHop       string `json:"next_hop,omitempty"`
-	NeighborMAC   string `json:"neighbor_mac,omitempty"`
+	Disposition    string `json:"disposition"`
+	LocalIfindex   int    `json:"local_ifindex,omitempty"`
+	EgressIfindex  int    `json:"egress_ifindex,omitempty"`
+	IngressIfindex int    `json:"ingress_ifindex,omitempty"`
+	NextHop        string `json:"next_hop,omitempty"`
+	NeighborMAC    string `json:"neighbor_mac,omitempty"`
+	SrcIP          string `json:"src_ip,omitempty"`
+	DstIP          string `json:"dst_ip,omitempty"`
+	SrcPort        uint16 `json:"src_port,omitempty"`
+	DstPort        uint16 `json:"dst_port,omitempty"`
+	FromZone       string `json:"from_zone,omitempty"`
+	ToZone         string `json:"to_zone,omitempty"`
 }
 
 type ForwardingControlRequest struct {
@@ -307,12 +314,19 @@ type ExceptionStatus struct {
 	WorkerID         uint32    `json:"worker_id"`
 	Interface        string    `json:"interface,omitempty"`
 	Ifindex          int       `json:"ifindex,omitempty"`
+	IngressIfindex   int       `json:"ingress_ifindex,omitempty"`
 	Reason           string    `json:"reason"`
 	PacketLength     uint32    `json:"packet_length,omitempty"`
 	AddrFamily       uint8     `json:"addr_family,omitempty"`
 	Protocol         uint8     `json:"protocol,omitempty"`
 	ConfigGeneration uint64    `json:"config_generation,omitempty"`
 	FIBGeneration    uint32    `json:"fib_generation,omitempty"`
+	SrcIP            string    `json:"src_ip,omitempty"`
+	DstIP            string    `json:"dst_ip,omitempty"`
+	SrcPort          uint16    `json:"src_port,omitempty"`
+	DstPort          uint16    `json:"dst_port,omitempty"`
+	FromZone         string    `json:"from_zone,omitempty"`
+	ToZone           string    `json:"to_zone,omitempty"`
 }
 
 type InjectPacketRequest struct {
