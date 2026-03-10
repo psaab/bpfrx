@@ -1034,7 +1034,9 @@ struct TxRequest {
 struct PendingForwardRequest {
     target_ifindex: i32,
     ingress_queue_id: u32,
-    frame: Vec<u8>,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    decision: SessionDecision,
 }
 
 struct PreparedTxRequest {
@@ -1603,18 +1605,12 @@ fn poll_binding(
                     if let Some(request) = build_live_forward_request(
                         &ident,
                         &binding.live,
-                        &binding.area,
                         desc,
                         meta,
                         &decision,
                         forwarding,
-                        recent_exceptions,
                     ) {
-                        pending_forwards.push(PendingForwardRequest {
-                            target_ifindex: request.target_ifindex,
-                            ingress_queue_id: ident.queue_id,
-                            frame: request.frame,
-                        });
+                        pending_forwards.push(request);
                     }
                 } else {
                     maybe_reinject_slow_path(
@@ -1657,6 +1653,7 @@ fn poll_binding(
         binding,
         right,
         pending_forwards,
+        forwarding,
         &ident,
         recent_exceptions,
     );
@@ -1682,25 +1679,11 @@ fn poll_binding(
 fn build_live_forward_request(
     ingress_ident: &BindingIdentity,
     ingress_live: &BindingLiveState,
-    ingress_area: &MmapArea,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
     forwarding: &ForwardingState,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) -> Option<PendingForwardRequest> {
-    let Some(frame) = build_forwarded_frame(ingress_area, desc, meta, decision, forwarding)
-    else {
-        record_exception(
-            recent_exceptions,
-            ingress_ident,
-            "forward_build_failed",
-            desc.len as u32,
-            Some(meta),
-            None,
-        );
-        return None;
-    };
     if decision.nat.rewrite_src.is_some() {
         ingress_live.snat_packets.fetch_add(1, Ordering::Relaxed);
     }
@@ -1718,7 +1701,9 @@ fn build_live_forward_request(
     Some(PendingForwardRequest {
         target_ifindex,
         ingress_queue_id: ingress_ident.queue_id,
-        frame,
+        desc,
+        meta,
+        decision: *decision,
     })
 }
 
@@ -1727,9 +1712,11 @@ fn enqueue_pending_forwards(
     ingress_binding: &mut BindingWorker,
     right: &mut [BindingWorker],
     pending_forwards: Vec<PendingForwardRequest>,
+    forwarding: &ForwardingState,
     ingress_ident: &BindingIdentity,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
+    let ingress_area_ptr: *const MmapArea = &ingress_binding.area;
     for request in pending_forwards {
         let Some(target_binding) = find_target_binding_mut(
         left,
@@ -1737,36 +1724,89 @@ fn enqueue_pending_forwards(
         request.ingress_queue_id,
         right,
         request.target_ifindex,
-    ) else {
+        ) else {
         record_exception(
             recent_exceptions,
             ingress_ident,
             "missing_egress_binding",
-            request.frame.len() as u32,
+            request.desc.len,
             None,
             None,
         );
             continue;
         };
+        // Safe because RX frames are not recycled back into the fill ring until
+        // after enqueue_pending_forwards completes, and TX uses a reserved frame
+        // subset that does not overlap RX descriptors on the same worker.
+        let ingress_area = unsafe { &*ingress_area_ptr };
         if let Some(offset) = target_binding.free_tx_frames.pop_front() {
             match target_binding
                 .area
-                .slice_mut(offset as usize, request.frame.len())
-            {
-                Some(area) => {
-                    area.copy_from_slice(&request.frame);
-                    target_binding.pending_tx_prepared.push_back(PreparedTxRequest {
-                        offset,
-                        len: request.frame.len() as u32,
-                    });
+                .slice_mut(offset as usize, UMEM_FRAME_SIZE as usize)
+                .and_then(|dst| {
+                    build_forwarded_frame_into(
+                        dst,
+                        ingress_area,
+                        request.desc,
+                        request.meta,
+                        &request.decision,
+                        forwarding,
+                    )
+                }) {
+                Some(frame_len) => {
+                    target_binding
+                        .pending_tx_prepared
+                        .push_back(PreparedTxRequest { offset, len: frame_len as u32 });
                 }
                 None => {
                     target_binding.free_tx_frames.push_front(offset);
-                    target_binding.pending_tx_local.push_back(TxRequest { bytes: request.frame });
+                    match build_forwarded_frame(
+                        ingress_area,
+                        request.desc,
+                        request.meta,
+                        &request.decision,
+                        forwarding,
+                    ) {
+                        Some(frame) => {
+                            target_binding.pending_tx_local.push_back(TxRequest { bytes: frame });
+                        }
+                        None => {
+                            record_exception(
+                                recent_exceptions,
+                                ingress_ident,
+                                "forward_build_failed",
+                                request.desc.len,
+                                Some(request.meta),
+                                None,
+                            );
+                            continue;
+                        }
+                    }
                 }
             }
         } else {
-            target_binding.pending_tx_local.push_back(TxRequest { bytes: request.frame });
+            match build_forwarded_frame(
+                ingress_area,
+                request.desc,
+                request.meta,
+                &request.decision,
+                forwarding,
+            ) {
+                Some(frame) => {
+                    target_binding.pending_tx_local.push_back(TxRequest { bytes: frame });
+                }
+                None => {
+                    record_exception(
+                        recent_exceptions,
+                        ingress_ident,
+                        "forward_build_failed",
+                        request.desc.len,
+                        Some(request.meta),
+                        None,
+                    );
+                    continue;
+                }
+            }
         }
         if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
             || target_binding.pending_tx_local.len() >= TX_BATCH_SIZE
@@ -4373,6 +4413,20 @@ fn build_forwarded_frame(
     decision: &SessionDecision,
     forwarding: &ForwardingState,
 ) -> Option<Vec<u8>> {
+    let mut out = vec![0u8; (desc.len as usize).saturating_add(4)];
+    let written = build_forwarded_frame_into(&mut out, area, desc, meta, decision, forwarding)?;
+    out.truncate(written);
+    Some(out)
+}
+
+fn build_forwarded_frame_into(
+    out: &mut [u8],
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+) -> Option<usize> {
     let dst_mac = decision.resolution.neighbor_mac?;
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     let l3 = meta.l3_offset as usize;
@@ -4397,9 +4451,13 @@ fn build_forwarded_frame(
         libc::AF_INET6 => 0x86dd,
         _ => return None,
     };
-    let mut out = Vec::with_capacity(eth_len + payload.len());
-    write_eth_header(&mut out, dst_mac, src_mac, vlan_id, ether_type);
-    out.extend_from_slice(payload);
+    let frame_len = eth_len + payload.len();
+    if frame_len > out.len() {
+        return None;
+    }
+    write_eth_header_slice(out.get_mut(..eth_len)?, dst_mac, src_mac, vlan_id, ether_type)?;
+    out.get_mut(eth_len..frame_len)?.copy_from_slice(payload);
+    let out = &mut out[..frame_len];
     let ip_start = eth_len;
     match meta.addr_family as i32 {
         libc::AF_INET => {
@@ -4437,7 +4495,7 @@ fn build_forwarded_frame(
         }
         _ => return None,
     }
-    Some(out)
+    Some(frame_len)
 }
 
 fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<()> {
@@ -4597,6 +4655,30 @@ fn write_eth_header(buf: &mut Vec<u8>, dst: [u8; 6], src: [u8; 6], vlan_id: u16,
         buf.extend_from_slice(&(vlan_id & 0x0fff).to_be_bytes());
     }
     buf.extend_from_slice(&ether_type.to_be_bytes());
+}
+
+fn write_eth_header_slice(
+    buf: &mut [u8],
+    dst: [u8; 6],
+    src: [u8; 6],
+    vlan_id: u16,
+    ether_type: u16,
+) -> Option<()> {
+    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    if buf.len() < eth_len {
+        return None;
+    }
+    buf.get_mut(0..6)?.copy_from_slice(&dst);
+    buf.get_mut(6..12)?.copy_from_slice(&src);
+    if vlan_id > 0 {
+        buf.get_mut(12..14)?.copy_from_slice(&0x8100u16.to_be_bytes());
+        buf.get_mut(14..16)?
+            .copy_from_slice(&(vlan_id & 0x0fff).to_be_bytes());
+        buf.get_mut(16..18)?.copy_from_slice(&ether_type.to_be_bytes());
+    } else {
+        buf.get_mut(12..14)?.copy_from_slice(&ether_type.to_be_bytes());
+    }
+    Some(())
 }
 
 fn checksum16(bytes: &[u8]) -> u16 {
