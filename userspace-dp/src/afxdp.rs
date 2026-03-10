@@ -41,9 +41,10 @@ const TX_BATCH_SIZE: usize = 256;
 const FILL_BATCH_SIZE: usize = 1024;
 const FILL_DRAIN_WATERMARK: usize = 64;
 const MAX_RX_BATCHES_PER_POLL: usize = 4;
-const XSK_BIND_FLAGS_FALLBACK: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP;
-const XSK_BIND_FLAGS_PREFERRED: u16 =
-    SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY;
+// Shared-UMEM owner sockets on mlx5 reject explicit NEED_WAKEUP/ZEROCOPY
+// flags on secondary queue owners. Use the working shared-UMEM owner
+// contract and query the actual bound mode after bind.
+const XSK_BIND_FLAGS_SHARED_UMEM_OWNER: u16 = 0;
 const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
@@ -348,7 +349,14 @@ impl Coordinator {
                     xsk_map_fd: map_fd.fd,
                     heartbeat_map_fd: heartbeat_map_fd.fd,
                     ring_entries,
+                    shared_owner: false,
                 });
+        }
+        for plans in workers.values_mut() {
+            plans.sort_by_key(|plan| (plan.status.queue_id, plan.status.slot));
+            if let Some(primary) = plans.first_mut() {
+                primary.shared_owner = true;
+            }
         }
         let planned_bindings: usize = workers.values().map(|group| group.len()).sum();
         self.last_planned_workers = workers.len();
@@ -822,6 +830,7 @@ struct BindingPlan {
     xsk_map_fd: c_int,
     heartbeat_map_fd: c_int,
     ring_entries: u32,
+    shared_owner: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1160,25 +1169,12 @@ impl BindingWorker {
         xsk_map_fd: c_int,
         heartbeat_map_fd: c_int,
         live: Arc<BindingLiveState>,
+        shared_owner: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let info = ifinfo_from_binding(binding)?;
-        let (user, rx, tx, bind_mode, mut device) = match open_binding_worker_rings(
-            worker_umem,
-            &info,
-            ring_entries,
-            XSK_BIND_FLAGS_PREFERRED,
-        ) {
-            Ok(bound) => bound,
-            Err(preferred_err) => open_binding_worker_rings(
-                worker_umem,
-                &info,
-                ring_entries,
-                XSK_BIND_FLAGS_FALLBACK,
-            )
-            .map_err(|fallback_err| {
-                format!("configure AF_XDP rings: zerocopy={preferred_err}; fallback={fallback_err}")
-            })?,
-        };
+        let (user, rx, tx, bind_mode, mut device) =
+            open_binding_worker_rings(worker_umem, &info, ring_entries, shared_owner)
+                .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
         prime_fill_ring_offsets(&mut device, &initial_fill_frames)?;
 
         live.set_bound(user.as_raw_fd());
@@ -1260,7 +1256,7 @@ fn open_binding_worker_rings(
     worker_umem: &WorkerUmem,
     info: &IfInfo,
     ring_entries: u32,
-    bind_flags: u16,
+    shared_owner: bool,
 ) -> Result<
     (
         User,
@@ -1271,13 +1267,18 @@ fn open_binding_worker_rings(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let sock = Socket::new(info).map_err(|e| format!("create socket: {e}"))?;
+    let sock = if shared_owner {
+        Socket::with_shared(info, &worker_umem.umem)
+            .map_err(|e| format!("create shared socket: {e}"))?
+    } else {
+        Socket::new(info).map_err(|e| format!("create socket: {e}"))?
+    };
     let device = worker_umem
         .umem
         .fq_cq(&sock)
         .map_err(|e| format!("create fq/cq: {e}"))?;
     let (user, rx, tx, bind_mode) =
-        open_user_rings(&worker_umem.umem, &sock, ring_entries, bind_flags)?;
+        open_user_rings(&worker_umem.umem, &sock, ring_entries, XSK_BIND_FLAGS_SHARED_UMEM_OWNER)?;
     Ok((user, rx, tx, bind_mode, device))
 }
 
@@ -3515,6 +3516,7 @@ fn worker_loop(
             plan.xsk_map_fd,
             plan.heartbeat_map_fd,
             plan.live.clone(),
+            plan.shared_owner,
         ) {
             Ok(binding) => bindings.push(binding),
             Err(err) => plan.live.set_error(err.to_string()),
