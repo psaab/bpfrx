@@ -327,7 +327,7 @@ impl Coordinator {
                 slot: binding.slot,
                 queue_id: binding.queue_id,
                 worker_id: binding.worker_id,
-                interface: binding.interface.clone(),
+                interface: Arc::<str>::from(binding.interface.as_str()),
                 ifindex: binding.ifindex,
             };
             self.identities.insert(binding.slot, identity);
@@ -989,7 +989,7 @@ struct BindingWorker {
     slot: u32,
     queue_id: u32,
     worker_id: u32,
-    interface: String,
+    interface: Arc<str>,
     ifindex: i32,
     live: Arc<BindingLiveState>,
     area: MmapArea,
@@ -1058,7 +1058,7 @@ struct BindingIdentity {
     slot: u32,
     queue_id: u32,
     worker_id: u32,
-    interface: String,
+    interface: Arc<str>,
     ifindex: i32,
 }
 
@@ -1207,7 +1207,7 @@ impl BindingWorker {
             slot: binding.slot,
             queue_id: binding.queue_id,
             worker_id: binding.worker_id,
-            interface: binding.interface.clone(),
+            interface: Arc::<str>::from(binding.interface.as_str()),
             ifindex: binding.ifindex,
             live,
             area,
@@ -1318,6 +1318,7 @@ fn poll_binding(
     let Some((binding, right)) = rest.split_first_mut() else {
         return false;
     };
+    let ha_runtime = ha_state.load();
     let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
     let tx_work = drain_pending_tx(binding, now_ns);
@@ -1387,9 +1388,9 @@ fn poll_binding(
                             }
                             decision.resolution = redirect_via_fabric_if_needed(
                                 forwarding,
-                                enforce_ha_resolution_at(
+                                enforce_ha_resolution_snapshot(
                                     forwarding,
-                                    ha_state,
+                                    ha_runtime.as_ref(),
                                     now_secs,
                                     lookup_forwarding_resolution_for_session(
                                         forwarding,
@@ -1452,9 +1453,9 @@ fn poll_binding(
                             let mut decision = replica.decision;
                             decision.resolution = redirect_via_fabric_if_needed(
                                 forwarding,
-                                enforce_ha_resolution_at(
+                                enforce_ha_resolution_snapshot(
                                     forwarding,
-                                    ha_state,
+                                    ha_runtime.as_ref(),
                                     now_secs,
                                     lookup_forwarding_resolution_for_session(
                                         forwarding,
@@ -1501,7 +1502,7 @@ fn poll_binding(
                             shared_sessions,
                             peer_worker_commands,
                             forwarding,
-                            ha_state,
+                            ha_runtime.as_ref(),
                             dynamic_neighbors,
                             flow,
                             now_ns,
@@ -1518,9 +1519,9 @@ fn poll_binding(
                             let mut decision = repaired.decision;
                             decision.resolution = redirect_via_fabric_if_needed(
                                 forwarding,
-                                enforce_ha_resolution_at(
+                                enforce_ha_resolution_snapshot(
                                     forwarding,
-                                    ha_state,
+                                    ha_runtime.as_ref(),
                                     now_secs,
                                     lookup_forwarding_resolution_for_session(
                                         forwarding,
@@ -1537,9 +1538,9 @@ fn poll_binding(
                             let resolution =
                                 interface_nat_local_resolution(forwarding, flow.dst_ip)
                                     .unwrap_or_else(|| {
-                                        enforce_ha_resolution_at(
+                                        enforce_ha_resolution_snapshot(
                                             forwarding,
-                                            ha_state,
+                                            ha_runtime.as_ref(),
                                             now_secs,
                                             lookup_forwarding_resolution_with_dynamic(
                                                 forwarding,
@@ -1618,9 +1619,9 @@ fn poll_binding(
                                             &forward_entry,
                                         );
                                     }
-                                    let reverse_resolution = enforce_ha_resolution_at(
+                                    let reverse_resolution = enforce_ha_resolution_snapshot(
                                         forwarding,
-                                        ha_state,
+                                        ha_runtime.as_ref(),
                                         now_secs,
                                         lookup_forwarding_resolution_with_dynamic(
                                             forwarding,
@@ -1698,9 +1699,9 @@ fn poll_binding(
                         }
                     } else {
                         SessionDecision {
-                            resolution: enforce_ha_resolution_at(
+                            resolution: enforce_ha_resolution_snapshot(
                                 forwarding,
-                                ha_state,
+                                ha_runtime.as_ref(),
                                 now_secs,
                                 resolve_forwarding(
                                     &binding.area,
@@ -2437,7 +2438,7 @@ fn flush_session_deltas(
             slot: ident.slot,
             queue_id: ident.queue_id,
             worker_id: ident.worker_id,
-            interface: ident.interface.clone(),
+            interface: ident.interface.to_string(),
             ifindex: ident.ifindex,
             event: session_delta_event(delta.kind).to_string(),
             addr_family: delta.key.addr_family,
@@ -2829,7 +2830,7 @@ fn record_exception(
                 slot: binding.slot,
                 queue_id: binding.queue_id,
                 worker_id: binding.worker_id,
-                interface: binding.interface.clone(),
+                interface: binding.interface.to_string(),
                 ifindex: binding.ifindex,
                 ingress_ifindex: debug.map(|d| d.ingress_ifindex).unwrap_or_default(),
                 reason: reason.to_string(),
@@ -3194,7 +3195,7 @@ fn repair_reverse_session_from_forward(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
-    ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     flow: &SessionFlow,
     now_ns: u64,
@@ -3215,7 +3216,7 @@ fn repair_reverse_session_from_forward(
         })?;
 
     let reverse_decision = SessionDecision {
-        resolution: enforce_ha_resolution_at(
+        resolution: enforce_ha_resolution_snapshot(
             forwarding,
             ha_state,
             now_secs,
@@ -4174,6 +4175,16 @@ fn enforce_ha_resolution_at(
     now_secs: u64,
     resolution: ForwardingResolution,
 ) -> ForwardingResolution {
+    let state = ha_state.load();
+    enforce_ha_resolution_snapshot(forwarding, state.as_ref(), now_secs, resolution)
+}
+
+fn enforce_ha_resolution_snapshot(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    resolution: ForwardingResolution,
+) -> ForwardingResolution {
     if resolution.disposition != ForwardingDisposition::ForwardCandidate {
         return resolution;
     }
@@ -4181,8 +4192,7 @@ fn enforce_ha_resolution_at(
     if owner_rg_id <= 0 {
         return resolution;
     }
-    let state = ha_state.load();
-    let Some(group) = state.get(&owner_rg_id) else {
+    let Some(group) = ha_state.get(&owner_rg_id) else {
         return ForwardingResolution {
             disposition: ForwardingDisposition::HAInactive,
             ..resolution
