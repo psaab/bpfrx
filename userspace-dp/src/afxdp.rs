@@ -1650,12 +1650,12 @@ fn poll_binding(
 }
 
 fn forward_live_packet(
-    left: &[BindingWorker],
+    left: &mut [BindingWorker],
     ingress_ident: &BindingIdentity,
     ingress_ifindex: i32,
     ingress_live: Arc<BindingLiveState>,
     ingress_area: &MmapArea,
-    right: &[BindingWorker],
+    right: &mut [BindingWorker],
     forwarding: &ForwardingState,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
@@ -1687,6 +1687,58 @@ fn forward_live_packet(
             decision.resolution.egress_ifindex
         },
     );
+    if let Some(target_binding) = find_target_binding_mut(
+        left,
+        right,
+        ingress_ident.queue_id,
+        ingress_ident.worker_id,
+        target_ifindex,
+    ) {
+        match transmit_immediate(target_binding, &frame) {
+            Ok(len) => {
+                target_binding
+                    .live
+                    .tx_packets
+                    .fetch_add(1, Ordering::Relaxed);
+                target_binding
+                    .live
+                    .tx_bytes
+                    .fetch_add(len as u64, Ordering::Relaxed);
+                return;
+            }
+            Err(TxError::Retry(err)) => {
+                target_binding.live.set_error(err);
+                if let Err(queue_err) = target_binding.live.enqueue_tx(TxRequest { bytes: frame }) {
+                    ingress_live.exception_packets.fetch_add(1, Ordering::Relaxed);
+                    ingress_live.set_error(queue_err.clone());
+                    record_exception(
+                        recent_exceptions,
+                        ingress_ident,
+                        "enqueue_tx_failed",
+                        desc.len as u32,
+                        Some(meta),
+                        None,
+                    );
+                }
+                return;
+            }
+            Err(TxError::Drop(err)) => {
+                ingress_live
+                    .exception_packets
+                    .fetch_add(1, Ordering::Relaxed);
+                ingress_live.set_error(err.clone());
+                record_exception(
+                    recent_exceptions,
+                    ingress_ident,
+                    "forward_tx_failed",
+                    desc.len as u32,
+                    Some(meta),
+                    None,
+                );
+                return;
+            }
+        }
+    }
     let Some(target_live) = find_target_live(
         left,
         ingress_ifindex,
@@ -2169,6 +2221,46 @@ fn find_target_live(
         .map(|binding| binding.live.clone())
 }
 
+fn find_target_binding_mut<'a>(
+    left: &'a mut [BindingWorker],
+    right: &'a mut [BindingWorker],
+    ingress_queue_id: u32,
+    ingress_worker_id: u32,
+    egress_ifindex: i32,
+) -> Option<&'a mut BindingWorker> {
+    if let Some(idx) = left
+        .iter()
+        .position(|binding| binding.ifindex == egress_ifindex && binding.queue_id == ingress_queue_id)
+    {
+        return Some(&mut left[idx]);
+    }
+    if let Some(idx) = right
+        .iter()
+        .position(|binding| binding.ifindex == egress_ifindex && binding.queue_id == ingress_queue_id)
+    {
+        return Some(&mut right[idx]);
+    }
+    if let Some(idx) = left
+        .iter()
+        .position(|binding| binding.ifindex == egress_ifindex && binding.worker_id == ingress_worker_id)
+    {
+        return Some(&mut left[idx]);
+    }
+    if let Some(idx) = right
+        .iter()
+        .position(|binding| binding.ifindex == egress_ifindex && binding.worker_id == ingress_worker_id)
+    {
+        return Some(&mut right[idx]);
+    }
+    if let Some(idx) = left.iter().position(|binding| binding.ifindex == egress_ifindex) {
+        return Some(&mut left[idx]);
+    }
+    if let Some(idx) = right.iter().position(|binding| binding.ifindex == egress_ifindex) {
+        return Some(&mut right[idx]);
+    }
+    None
+}
+
 fn flush_session_deltas(
     ident: &BindingIdentity,
     live: &BindingLiveState,
@@ -2330,6 +2422,34 @@ fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
         binding.live.prepend_pending_tx(retry);
     }
     did_work || !binding.live.pending_tx_empty()
+}
+
+fn transmit_immediate(binding: &mut BindingWorker, frame: &[u8]) -> Result<usize, TxError> {
+    let Some(offset) = binding.free_tx_frames.pop_front() else {
+        return Err(TxError::Retry("no free TX frame available".to_string()));
+    };
+    let Some(area) = binding.area.slice_mut(offset as usize, frame.len()) else {
+        binding.free_tx_frames.push_front(offset);
+        return Err(TxError::Drop(format!(
+            "tx frame slice out of range: offset={offset} len={}",
+            frame.len()
+        )));
+    };
+    area.copy_from_slice(frame);
+    let mut writer = binding.tx.transmit(1);
+    let inserted = writer.insert(core::iter::once(XdpDesc {
+        addr: offset,
+        len: frame.len() as u32,
+        options: 0,
+    }));
+    writer.commit();
+    drop(writer);
+    if inserted != 1 {
+        binding.free_tx_frames.push_front(offset);
+        return Err(TxError::Retry("tx ring insert failed".to_string()));
+    }
+    binding.tx.wake();
+    Ok(frame.len())
 }
 
 enum TxError {
