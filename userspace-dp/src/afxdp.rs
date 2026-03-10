@@ -2,6 +2,7 @@ use super::{
     BindingStatus, ConfigSnapshot, ExceptionStatus, HAGroupStatus, InjectPacketRequest,
     InterfaceSnapshot, PacketResolution, SessionDeltaInfo,
 };
+use arc_swap::ArcSwap;
 use crate::nat::{NatDecision, SourceNatRule, match_source_nat, parse_source_nat_rules};
 use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
 use crate::prefix::{PrefixV4, PrefixV6};
@@ -99,7 +100,7 @@ pub struct Coordinator {
     heartbeat_map_fd: Option<OwnedFd>,
     slow_path: Option<Arc<SlowPathReinjector>>,
     last_slow_path_status: SlowPathStatus,
-    ha_state: Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
+    ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
@@ -123,7 +124,7 @@ impl Coordinator {
             heartbeat_map_fd: None,
             slow_path: None,
             last_slow_path_status: SlowPathStatus::default(),
-            ha_state: Arc::new(Mutex::new(BTreeMap::new())),
+            ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             dynamic_neighbors: Arc::new(Mutex::new(BTreeMap::new())),
             shared_sessions: Arc::new(Mutex::new(HashMap::new())),
             live: BTreeMap::new(),
@@ -492,34 +493,29 @@ impl Coordinator {
     }
 
     pub fn update_ha_state(&self, groups: &[HAGroupStatus]) {
-        if let Ok(mut state) = self.ha_state.lock() {
-            state.clear();
-            for group in groups {
-                state.insert(
-                    group.rg_id,
-                    HAGroupRuntime {
-                        active: group.active,
-                        watchdog_timestamp: group.watchdog_timestamp,
-                    },
-                );
-            }
+        let mut state = BTreeMap::new();
+        for group in groups {
+            state.insert(
+                group.rg_id,
+                HAGroupRuntime {
+                    active: group.active,
+                    watchdog_timestamp: group.watchdog_timestamp,
+                },
+            );
         }
+        self.ha_state.store(Arc::new(state));
     }
 
     pub fn ha_groups(&self) -> Vec<HAGroupStatus> {
         self.ha_state
-            .lock()
-            .map(|state| {
-                state
-                    .iter()
-                    .map(|(rg_id, runtime)| HAGroupStatus {
-                        rg_id: *rg_id,
-                        active: runtime.active,
-                        watchdog_timestamp: runtime.watchdog_timestamp,
-                    })
-                    .collect()
+            .load()
+            .iter()
+            .map(|(rg_id, runtime)| HAGroupStatus {
+                rg_id: *rg_id,
+                active: runtime.active,
+                watchdog_timestamp: runtime.watchdog_timestamp,
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
@@ -1285,7 +1281,7 @@ fn poll_binding(
     now: Instant,
     now_ns: u64,
     forwarding: &ForwardingState,
-    ha_state: &Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
+    ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<&Arc<SlowPathReinjector>>,
@@ -3121,7 +3117,7 @@ fn repair_reverse_session_from_forward(
     shared_sessions: &Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
-    ha_state: &Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
+    ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
     flow: &SessionFlow,
     now: Instant,
@@ -3209,7 +3205,7 @@ fn worker_loop(
     binding_plans: Vec<BindingPlan>,
     validation: ValidationState,
     forwarding: Arc<ForwardingState>,
-    ha_state: Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
+    ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: Arc<Mutex<HashMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<Arc<SlowPathReinjector>>,
@@ -4061,7 +4057,7 @@ fn resolve_ingress_logical_ifindex(
 
 fn enforce_ha_resolution(
     forwarding: &ForwardingState,
-    ha_state: &Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
+    ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     resolution: ForwardingResolution,
 ) -> ForwardingResolution {
     if resolution.disposition != ForwardingDisposition::ForwardCandidate {
@@ -4071,12 +4067,7 @@ fn enforce_ha_resolution(
     if owner_rg_id <= 0 {
         return resolution;
     }
-    let Ok(state) = ha_state.lock() else {
-        return ForwardingResolution {
-            disposition: ForwardingDisposition::HAInactive,
-            ..resolution
-        };
-    };
+    let state = ha_state.load();
     let Some(group) = state.get(&owner_rg_id) else {
         return ForwardingResolution {
             disposition: ForwardingDisposition::HAInactive,
@@ -6364,7 +6355,7 @@ mod tests {
     #[test]
     fn ha_resolution_blocks_inactive_owner_rg() {
         let state = build_forwarding_state(&nat_snapshot());
-        let ha_state = Arc::new(Mutex::new(BTreeMap::from([(
+        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
             HAGroupRuntime {
                 active: false,
@@ -6382,7 +6373,7 @@ mod tests {
     #[test]
     fn ha_resolution_allows_fresh_active_owner_rg() {
         let state = build_forwarding_state(&nat_snapshot());
-        let ha_state = Arc::new(Mutex::new(BTreeMap::from([(
+        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
             HAGroupRuntime {
                 active: true,
@@ -6403,7 +6394,7 @@ mod tests {
     #[test]
     fn inactive_owner_rg_redirects_established_session_to_fabric() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
-        let ha_state = Arc::new(Mutex::new(BTreeMap::from([(
+        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
             HAGroupRuntime {
                 active: false,
@@ -6520,7 +6511,7 @@ mod tests {
     #[test]
     fn new_flow_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
-        let ha_state = Arc::new(Mutex::new(BTreeMap::from([(
+        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
             HAGroupRuntime {
                 active: false,
