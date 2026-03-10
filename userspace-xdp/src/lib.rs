@@ -192,9 +192,9 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
 
     let data = ctx.data();
     let data_end = ctx.data_end();
-    if !is_ip_packet(data, data_end) {
+    let Some(parsed) = parse_packet(data, data_end) else {
         return Ok(xdp_action::XDP_PASS);
-    }
+    };
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
@@ -225,9 +225,6 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
 
     let packet_len = data_end.saturating_sub(data);
-    let Some(parsed) = parse_packet(data, data_end) else {
-        return fallback_to_main(ctx);
-    };
     if should_fallback_early(&parsed) {
         return Ok(xdp_action::XDP_PASS);
     }
@@ -321,20 +318,16 @@ fn parse_packet(data: usize, data_end: usize) -> Option<ParsedPacket> {
     }
 }
 
-fn is_ip_packet(data: usize, data_end: usize) -> bool {
-    matches!(parse_l2(data, data_end), Some((ETH_P_IP | ETH_P_IPV6, _, _)))
-}
-
 fn parse_l2(data: usize, data_end: usize) -> Option<(u16, u16, u16)> {
-    let eth = read_ptr::<EthHdr>(data, data_end, 0)?;
-    let mut eth_proto = u16::from_be(unsafe { (*eth).proto });
+    let eth = read_bytes(data, data_end, 0, 14)?;
+    let mut eth_proto = u16::from_be_bytes([eth[12], eth[13]]);
     let mut l3_offset = mem::size_of::<EthHdr>() as u16;
     let mut vlan_id = 0u16;
 
     if eth_proto == ETH_P_8021Q || eth_proto == ETH_P_8021AD {
-        let vlan = read_ptr::<VlanHdr>(data, data_end, l3_offset as usize)?;
-        vlan_id = u16::from_be(unsafe { (*vlan).tci }) & 0x0fff;
-        eth_proto = u16::from_be(unsafe { (*vlan).encapsulated_proto });
+        let vlan = read_bytes(data, data_end, l3_offset as usize, 4)?;
+        vlan_id = u16::from_be_bytes([vlan[0], vlan[1]]) & 0x0fff;
+        eth_proto = u16::from_be_bytes([vlan[2], vlan[3]]);
         l3_offset += mem::size_of::<VlanHdr>() as u16;
     }
 
@@ -342,8 +335,8 @@ fn parse_l2(data: usize, data_end: usize) -> Option<(u16, u16, u16)> {
 }
 
 fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Option<ParsedPacket> {
-    let iph = read_ptr::<Ipv4Hdr>(data, data_end, l3_offset as usize)?;
-    let version_ihl = unsafe { (*iph).version_ihl };
+    let iph = read_bytes(data, data_end, l3_offset as usize, 20)?;
+    let version_ihl = iph[0];
     if (version_ihl >> 4) != 4 {
         return None;
     }
@@ -352,8 +345,8 @@ fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
         return None;
     }
     read_bytes(data, data_end, l3_offset as usize, ihl)?;
-    let protocol = unsafe { (*iph).protocol };
-    let tos = unsafe { (*iph).tos };
+    let protocol = iph[9];
+    let tos = iph[1];
     let l4_offset = l3_offset.checked_add(ihl as u16)?;
     let (payload_offset, tcp_flags, flow_src_port, flow_dst_port) =
         parse_l4(data, data_end, l4_offset, protocol)?;
@@ -382,20 +375,20 @@ fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
 }
 
 fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Option<ParsedPacket> {
-    let ip6 = read_ptr::<Ipv6Hdr>(data, data_end, l3_offset as usize)?;
-    let version_priority = unsafe { (*ip6).version_priority };
+    let ip6 = read_bytes(data, data_end, l3_offset as usize, 40)?;
+    let version_priority = ip6[0];
     if (version_priority >> 4) != 6 {
         return None;
     }
-    let mut protocol = unsafe { (*ip6).nexthdr };
+    let mut protocol = ip6[6];
     let mut offset = l3_offset.checked_add(mem::size_of::<Ipv6Hdr>() as u16)?;
 
     for _ in 0..MAX_EXT_HDRS {
         match protocol {
             NEXTHDR_HOP | NEXTHDR_ROUTING | NEXTHDR_DEST => {
-                let opt = read_ptr::<Ipv6OptHdr>(data, data_end, offset as usize)?;
-                protocol = unsafe { (*opt).nexthdr };
-                offset = offset.checked_add(((unsafe { (*opt).hdrlen } as u16) + 1) * 8)?;
+                let opt = read_bytes(data, data_end, offset as usize, 2)?;
+                protocol = opt[0];
+                offset = offset.checked_add(((opt[1] as u16) + 1) * 8)?;
                 read_bytes(
                     data,
                     data_end,
@@ -404,9 +397,9 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
                 )?;
             }
             NEXTHDR_AUTH => {
-                let opt = read_ptr::<Ipv6OptHdr>(data, data_end, offset as usize)?;
-                protocol = unsafe { (*opt).nexthdr };
-                offset = offset.checked_add(((unsafe { (*opt).hdrlen } as u16) + 2) * 4)?;
+                let opt = read_bytes(data, data_end, offset as usize, 2)?;
+                protocol = opt[0];
+                offset = offset.checked_add(((opt[1] as u16) + 2) * 4)?;
                 read_bytes(
                     data,
                     data_end,
@@ -415,8 +408,8 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
                 )?;
             }
             NEXTHDR_FRAGMENT => {
-                let frag = read_ptr::<FragHdr>(data, data_end, offset as usize)?;
-                protocol = unsafe { (*frag).nexthdr };
+                let frag = read_bytes(data, data_end, offset as usize, 8)?;
+                protocol = frag[0];
                 offset = offset.checked_add(mem::size_of::<FragHdr>() as u16)?;
             }
             NEXTHDR_NONE => break,
@@ -424,7 +417,7 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
         }
     }
 
-    let flow_lbl0 = unsafe { (*ip6).flow_lbl[0] };
+    let flow_lbl0 = ip6[1];
     let dscp = ((version_priority & 0x0f) << 2) | (flow_lbl0 >> 6);
     let (payload_offset, tcp_flags, flow_src_port, flow_dst_port) =
         parse_l4(data, data_end, offset, protocol)?;
@@ -534,14 +527,6 @@ fn parse_l4(
         }
         _ => Some((l4_offset, 0, 0, 0)),
     }
-}
-
-fn read_ptr<T>(data: usize, data_end: usize, offset: usize) -> Option<*const T> {
-    let len = mem::size_of::<T>();
-    if data.checked_add(offset)?.checked_add(len)? > data_end {
-        return None;
-    }
-    Some((data + offset) as *const T)
 }
 
 fn read_bytes<'a>(data: usize, data_end: usize, offset: usize, len: usize) -> Option<&'a [u8]> {
