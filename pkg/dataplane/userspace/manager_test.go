@@ -181,7 +181,7 @@ func TestDeriveUserspaceCapabilitiesDetectsFirewallFeatures(t *testing.T) {
 	if caps.ForwardingSupported {
 		t.Fatal("ForwardingSupported = true, want false")
 	}
-	if len(caps.UnsupportedReasons) < 4 {
+	if len(caps.UnsupportedReasons) < 3 {
 		t.Fatalf("UnsupportedReasons = %+v, want multiple reasons", caps.UnsupportedReasons)
 	}
 }

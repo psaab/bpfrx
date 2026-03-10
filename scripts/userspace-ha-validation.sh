@@ -59,25 +59,69 @@ wait_for_fw0_cli() {
 	return 1
 }
 
-wait_for_unsupported_runtime() {
+runtime_mode() {
 	local tries=20
 	local prog_check helper_stats
 	while (( tries > 0 )); do
 		prog_check="$(run_fw0 'ip -details link show dev ge-0-0-1; echo ---; ip -details link show dev ge-0-0-2')"
 		helper_stats="$(run_fw0 'cli -c "show chassis cluster data-plane statistics"')"
+		if grep -Eq 'Forwarding supported:[[:space:]]+true' <<<"$helper_stats" &&
+			[[ "$prog_check" == *"name xdp_userspace_prog"* ]]; then
+			printf 'supported\n'
+			return 0
+		fi
 		if [[ "$prog_check" == *"name xdp_main_prog"* ]] &&
 			grep -Eq 'Forwarding supported:[[:space:]]+false' <<<"$helper_stats" &&
 			grep -Eq 'Enabled:[[:space:]]+false' <<<"$helper_stats" &&
-			grep -Eq 'Bound bindings:[[:space:]]+0/8' <<<"$helper_stats"; then
+			grep -Eq 'Bound bindings:[[:space:]]+0/[0-9]+' <<<"$helper_stats"; then
+			printf 'legacy\n'
 			return 0
 		fi
 		sleep 1
 		tries=$((tries - 1))
 	done
-	echo "$prog_check"
-	echo "---"
-	echo "$helper_stats"
+	printf '%s\n---\n%s\n' "$prog_check" "$helper_stats" >&2
 	return 1
+}
+
+queue_ids() {
+	run_fw0 'python3 - <<'"'"'PY'"'"'
+import json
+with open("/run/bpfrx/userspace-dp.json", "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+queues = data.get("status", {}).get("queues", [])
+print(" ".join(str(q.get("queue_id")) for q in queues if "queue_id" in q))
+PY'
+}
+
+wait_for_enabled_userspace() {
+	local tries=30
+	while (( tries > 0 )); do
+		local stats
+		stats="$(run_fw0 'cli -c "show chassis cluster data-plane statistics"')"
+		if grep -Eq 'Enabled:[[:space:]]+true' <<<"$stats" &&
+			grep -Eq 'Forwarding supported:[[:space:]]+true' <<<"$stats" &&
+			grep -Eq 'Ready bindings:[[:space:]]+[1-9][0-9]*/[0-9]+' <<<"$stats"; then
+			return 0
+		fi
+		sleep 1
+		tries=$((tries - 1))
+	done
+	return 1
+}
+
+arm_supported_runtime() {
+	info "arming userspace forwarding on fw0"
+	run_fw0 'cli -c "request chassis cluster data-plane userspace forwarding arm" >/tmp/userspace-arm.out'
+	local queues
+	queues="$(queue_ids)"
+	for q in $queues; do
+		run_fw0 "cli -c \"request chassis cluster data-plane userspace queue ${q} arm\" >/tmp/userspace-queue-${q}.out"
+	done
+	wait_for_enabled_userspace || {
+		run_fw0 'cli -c "show chassis cluster data-plane statistics" >&2 || true'
+		die "userspace forwarding did not become enabled after arming fw0"
+	}
 }
 
 wait_for_ipv6_default_route() {
@@ -103,8 +147,15 @@ fi
 info "waiting for bpfrxd gRPC/CLI readiness"
 wait_for_fw0_cli || die "fw0 bpfrxd did not become reachable in time"
 
-info "validating unsupported userspace configs stay on legacy XDP"
-wait_for_unsupported_runtime || die "unsupported userspace config did not settle on legacy XDP/runtime state in time"
+info "detecting userspace runtime mode"
+MODE="$(runtime_mode)" || die "userspace runtime mode did not settle in time"
+info "runtime mode: ${MODE}"
+if [[ "${MODE}" == "legacy" ]]; then
+	info "validating legacy fallback state"
+else
+	info "supported userspace runtime detected"
+	arm_supported_runtime
+fi
 
 info "ensuring IPv6 default route via router advertisement"
 wait_for_ipv6_default_route || die "cluster userspace host still has no IPv6 default route after repeated RA solicitation"

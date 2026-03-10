@@ -153,9 +153,6 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 		caps.ForwardingSupported = false
 		caps.UnsupportedReasons = append(caps.UnsupportedReasons, reason)
 	}
-	if cfg.Chassis.Cluster != nil {
-		addReason("HA cluster ownership and fabric redirect are not implemented in the userspace dataplane")
-	}
 	if !userspaceSupportsSecurityPolicies(cfg) {
 		addReason("full security policy semantics are not implemented in the userspace dataplane")
 	}
