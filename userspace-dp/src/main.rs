@@ -8,7 +8,7 @@ mod state_writer;
 use afxdp::SyncedSessionEntry;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -1386,23 +1386,7 @@ fn replan_queues(
 ) -> Vec<BindingStatus> {
     let mut candidates: Vec<(String, usize)> = Vec::new();
     let mut ifindex_by_name: BTreeMap<String, i32> = BTreeMap::new();
-    let mut queue0_reserved_ifaces: BTreeSet<String> = BTreeSet::new();
     if let Some(snapshot) = snapshot {
-        for iface in &snapshot.interfaces {
-            if iface.addresses.is_empty() {
-                continue;
-            }
-            let bind_linux_name = if !iface.parent_linux_name.is_empty() {
-                iface.parent_linux_name.clone()
-            } else if !iface.linux_name.is_empty() {
-                iface.linux_name.clone()
-            } else {
-                linux_ifname(&iface.name)
-            };
-            if is_userspace_candidate_interface(&bind_linux_name) {
-                queue0_reserved_ifaces.insert(bind_linux_name);
-            }
-        }
         for iface in &snapshot.interfaces {
             if !is_userspace_candidate_interface(&iface.name) {
                 continue;
@@ -1423,13 +1407,7 @@ fn replan_queues(
             }
         }
     }
-    replan_bindings_from_candidates(
-        workers,
-        existing,
-        candidates,
-        ifindex_by_name,
-        &queue0_reserved_ifaces,
-    )
+    replan_bindings_from_candidates(workers, existing, candidates, ifindex_by_name)
 }
 
 fn replan_bindings_from_candidates(
@@ -1437,7 +1415,6 @@ fn replan_bindings_from_candidates(
     existing: &[BindingStatus],
     candidates: Vec<(String, usize)>,
     ifindex_by_name: BTreeMap<String, i32>,
-    queue0_reserved_ifaces: &BTreeSet<String>,
 ) -> Vec<BindingStatus> {
     let mut existing_by_slot = BTreeMap::new();
     for binding in existing {
@@ -1468,13 +1445,6 @@ fn replan_bindings_from_candidates(
             binding.interface = iface.clone();
             binding.ifindex = *ifindex_by_name.get(iface).unwrap_or(&0);
             if binding.ifindex <= 0 {
-                binding.registered = false;
-                binding.armed = false;
-                binding.ready = false;
-            } else if queue_id == 0 && queue0_reserved_ifaces.contains(iface) {
-                // Keep one queue on local-address interfaces on the kernel/XDP path
-                // so ARP/NDP/RA and other control-plane traffic do not have to share
-                // the incomplete userspace forwarding path during bring-up.
                 binding.registered = false;
                 binding.armed = false;
                 binding.ready = false;
@@ -1625,7 +1595,6 @@ mod tests {
             &existing,
             vec![("ge-0-0-1".to_string(), 1)],
             BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
-            &BTreeSet::new(),
         );
         if let Some(b0) = bindings.iter().find(|b| b.slot == 0) {
             assert!(b0.registered);
@@ -1654,7 +1623,6 @@ mod tests {
             &existing,
             vec![("ge-0-0-1".to_string(), 1)],
             BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
-            &BTreeSet::new(),
         );
         let b0 = bindings.iter().find(|b| b.slot == 0).expect("binding 0");
         assert!(!b0.registered);
@@ -1662,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_planner_reserves_queue_zero_for_local_address_interfaces() {
+    fn queue_planner_keeps_queue_zero_available_for_userspace() {
         let snapshot = ConfigSnapshot {
             interfaces: vec![
                 InterfaceSnapshot {
@@ -1696,8 +1664,7 @@ mod tests {
             .iter()
             .find(|b| b.interface == "ge-0-0-1" && b.queue_id == 1)
             .expect("queue 1 binding");
-        assert!(!q0.registered);
-        assert!(!q0.armed);
+        assert!(q0.registered);
         assert!(q1.registered);
     }
 
