@@ -2,6 +2,7 @@ use crate::afxdp::ForwardingResolution;
 use crate::nat::NatDecision;
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const SESSION_GC_INTERVAL: Duration = Duration::from_secs(1);
@@ -46,8 +47,8 @@ pub(crate) struct SessionDecision {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionMetadata {
-    pub(crate) ingress_zone: String,
-    pub(crate) egress_zone: String,
+    pub(crate) ingress_zone: Arc<str>,
+    pub(crate) egress_zone: Arc<str>,
     pub(crate) owner_rg_id: i32,
     pub(crate) is_reverse: bool,
     pub(crate) synced: bool,
@@ -381,8 +382,8 @@ mod tests {
 
     fn metadata() -> SessionMetadata {
         SessionMetadata {
-            ingress_zone: "lan".to_string(),
-            egress_zone: "wan".to_string(),
+            ingress_zone: Arc::<str>::from("lan"),
+            egress_zone: Arc::<str>::from("wan"),
             owner_rg_id: 1,
             is_reverse: false,
             synced: false,

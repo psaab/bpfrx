@@ -1303,8 +1303,8 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             },
         },
         metadata: crate::session::SessionMetadata {
-            ingress_zone: req.ingress_zone.clone(),
-            egress_zone: req.egress_zone.clone(),
+            ingress_zone: req.ingress_zone.clone().into(),
+            egress_zone: req.egress_zone.clone().into(),
             owner_rg_id: req.owner_rg_id,
             is_reverse: req.is_reverse,
             synced: true,

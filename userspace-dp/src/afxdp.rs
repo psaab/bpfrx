@@ -1367,8 +1367,10 @@ fn poll_binding(
                             binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
                             let mut decision = hit.decision;
                             if let Some(debug) = debug.as_mut() {
-                                debug.from_zone = Some(hit.metadata.ingress_zone.clone());
-                                debug.to_zone = Some(hit.metadata.egress_zone.clone());
+                                debug.from_zone =
+                                    Some(hit.metadata.ingress_zone.to_string());
+                                debug.to_zone =
+                                    Some(hit.metadata.egress_zone.to_string());
                             }
                             decision.resolution = redirect_via_fabric_if_needed(
                                 forwarding,
@@ -1430,8 +1432,10 @@ fn poll_binding(
                                 meta.tcp_flags,
                             );
                             if let Some(debug) = debug.as_mut() {
-                                debug.from_zone = Some(replica.metadata.ingress_zone.clone());
-                                debug.to_zone = Some(replica.metadata.egress_zone.clone());
+                                debug.from_zone =
+                                    Some(replica.metadata.ingress_zone.to_string());
+                                debug.to_zone =
+                                    Some(replica.metadata.egress_zone.to_string());
                             }
                             let mut decision = replica.decision;
                             decision.resolution = redirect_via_fabric_if_needed(
@@ -1494,8 +1498,10 @@ fn poll_binding(
                             binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
                             binding.live.session_creates.fetch_add(1, Ordering::Relaxed);
                             if let Some(debug) = debug.as_mut() {
-                                debug.from_zone = Some(repaired.metadata.ingress_zone.clone());
-                                debug.to_zone = Some(repaired.metadata.egress_zone.clone());
+                                debug.from_zone =
+                                    Some(repaired.metadata.ingress_zone.to_string());
+                                debug.to_zone =
+                                    Some(repaired.metadata.egress_zone.to_string());
                             }
                             let mut decision = repaired.decision;
                             decision.resolution = redirect_via_fabric_if_needed(
@@ -1574,8 +1580,8 @@ fn poll_binding(
                                     .unwrap_or_default();
                                     let mut created = 0u64;
                                     let forward_metadata = SessionMetadata {
-                                        ingress_zone: from_zone.clone(),
-                                        egress_zone: to_zone.clone(),
+                                        ingress_zone: Arc::<str>::from(from_zone.as_str()),
+                                        egress_zone: Arc::<str>::from(to_zone.as_str()),
                                         owner_rg_id,
                                         is_reverse: false,
                                         synced: false,
@@ -1624,8 +1630,8 @@ fn poll_binding(
                                     };
                                     let reverse_key = flow.reverse_key_with_nat(decision.nat);
                                     let reverse_metadata = SessionMetadata {
-                                        ingress_zone: to_zone.clone(),
-                                        egress_zone: from_zone.clone(),
+                                        ingress_zone: Arc::<str>::from(to_zone.as_str()),
+                                        egress_zone: Arc::<str>::from(from_zone.as_str()),
                                         owner_rg_id,
                                         is_reverse: true,
                                         synced: false,
@@ -2422,8 +2428,8 @@ fn flush_session_deltas(
             dst_ip: delta.key.dst_ip.to_string(),
             src_port: delta.key.src_port,
             dst_port: delta.key.dst_port,
-            ingress_zone: delta.metadata.ingress_zone,
-            egress_zone: delta.metadata.egress_zone,
+            ingress_zone: delta.metadata.ingress_zone.to_string(),
+            egress_zone: delta.metadata.egress_zone.to_string(),
             owner_rg_id: delta.metadata.owner_rg_id,
             egress_ifindex: delta.decision.resolution.egress_ifindex,
             next_hop: delta
@@ -6943,8 +6949,8 @@ mod tests {
                 },
             },
             metadata: SessionMetadata {
-                ingress_zone: "lan".to_string(),
-                egress_zone: "wan".to_string(),
+                ingress_zone: Arc::<str>::from("lan"),
+                egress_zone: Arc::<str>::from("wan"),
                 owner_rg_id: 1,
                 is_reverse: false,
                 synced: false,
