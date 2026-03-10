@@ -16,8 +16,8 @@ use core::ffi::{c_int, c_void};
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use rustc_hash::FxHashMap;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -61,12 +61,16 @@ const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
 
 type FastMap<K, V> = FxHashMap<K, V>;
+type FastSet<T> = FxHashSet<T>;
 const HA_WATCHDOG_STALE_AFTER_SECS: u64 = 2;
 const FABRIC_ZONE_MAC_MAGIC: u8 = 0xfe;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const PROTO_ICMP: u8 = 1;
 const PROTO_ICMPV6: u8 = 58;
+const SOL_XDP: c_int = 283;
+const XDP_OPTIONS: c_int = 8;
+const XDP_OPTIONS_ZEROCOPY: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -97,6 +101,11 @@ struct UserspaceDpMeta {
     config_generation: u64,
     fib_generation: u32,
     reserved2: u32,
+}
+
+#[repr(C)]
+struct XdpOptions {
+    flags: u32,
 }
 
 pub struct Coordinator {
@@ -834,8 +843,8 @@ enum PacketDisposition {
 
 #[derive(Clone, Debug, Default)]
 struct ForwardingState {
-    local_v4: Vec<Ipv4Addr>,
-    local_v6: Vec<Ipv6Addr>,
+    local_v4: FastSet<Ipv4Addr>,
+    local_v6: FastSet<Ipv6Addr>,
     interface_nat_v4: FastMap<Ipv4Addr, i32>,
     interface_nat_v6: FastMap<Ipv6Addr, i32>,
     connected_v4: Vec<ConnectedRouteV4>,
@@ -1275,12 +1284,35 @@ fn open_user_rings(
     let rx = user.map_rx().map_err(|e| format!("map rx ring: {e}"))?;
     let tx = user.map_tx().map_err(|e| format!("map tx ring: {e}"))?;
     bind_user_with_retry(umem, &user)?;
-    let bind_mode = if (bind_flags & SocketConfig::XDP_BIND_ZEROCOPY) != 0 {
+    let requested_mode = if (bind_flags & SocketConfig::XDP_BIND_ZEROCOPY) != 0 {
         XskBindMode::ZeroCopy
     } else {
         XskBindMode::Copy
     };
+    let bind_mode = query_bound_xsk_mode(user.as_raw_fd()).unwrap_or(requested_mode);
     Ok((user, rx, tx, bind_mode))
+}
+
+fn query_bound_xsk_mode(fd: c_int) -> Option<XskBindMode> {
+    let mut opt = XdpOptions { flags: 0 };
+    let mut optlen = core::mem::size_of::<XdpOptions>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_XDP,
+            XDP_OPTIONS,
+            (&mut opt as *mut XdpOptions).cast::<c_void>(),
+            &mut optlen,
+        )
+    };
+    if rc != 0 || optlen as usize != core::mem::size_of::<XdpOptions>() {
+        return None;
+    }
+    Some(if (opt.flags & XDP_OPTIONS_ZEROCOPY) != 0 {
+        XskBindMode::ZeroCopy
+    } else {
+        XskBindMode::Copy
+    })
 }
 
 fn bind_user_with_retry(
@@ -3771,7 +3803,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                     if excluded_local_v4.contains(&v4.addr()) {
                         state.interface_nat_v4.insert(v4.addr(), iface.ifindex);
                     } else {
-                        state.local_v4.push(v4.addr());
+                        state.local_v4.insert(v4.addr());
                     }
                     state.connected_v4.push(ConnectedRouteV4 {
                         prefix: PrefixV4::from_net(v4),
@@ -3782,7 +3814,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                     if excluded_local_v6.contains(&v6.addr()) {
                         state.interface_nat_v6.insert(v6.addr(), iface.ifindex);
                     } else {
-                        state.local_v6.push(v6.addr());
+                        state.local_v6.insert(v6.addr());
                     }
                     state.connected_v6.push(ConnectedRouteV6 {
                         prefix: PrefixV6::from_net(v6),
@@ -3920,10 +3952,10 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
 
 fn nat_translated_local_exclusions(
     snapshot: &ConfigSnapshot,
-) -> (BTreeSet<Ipv4Addr>, BTreeSet<Ipv6Addr>) {
-    let mut excluded_v4 = BTreeSet::new();
-    let mut excluded_v6 = BTreeSet::new();
-    let mut to_zones = BTreeSet::new();
+) -> (FastSet<Ipv4Addr>, FastSet<Ipv6Addr>) {
+    let mut excluded_v4 = FastSet::default();
+    let mut excluded_v6 = FastSet::default();
+    let mut to_zones = FastSet::default();
     for rule in &snapshot.source_nat_rules {
         if rule.interface_mode && !rule.off && !rule.to_zone.is_empty() {
             to_zones.insert(rule.to_zone.clone());
@@ -5058,12 +5090,13 @@ fn rewrite_forwarded_frame_in_place(
     decision: &SessionDecision,
 ) -> Option<u32> {
     let dst_mac = decision.resolution.neighbor_mac?;
-    let frame = unsafe { area.slice_mut_unchecked(desc.addr as usize, desc.len as usize)? };
+    let frame = unsafe { area.slice_mut_unchecked(desc.addr as usize, UMEM_FRAME_SIZE as usize)? };
+    let current_len = desc.len as usize;
     let l3 = meta.l3_offset as usize;
-    if l3 >= frame.len() {
+    if l3 >= current_len {
         return None;
     }
-    let payload_len = frame.len().checked_sub(l3)?;
+    let payload_len = current_len.checked_sub(l3)?;
     let (src_mac, vlan_id, apply_nat) =
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
             (
@@ -5220,8 +5253,6 @@ fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
     if packet.len() < 40 {
         return None;
     }
-    let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
-    let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
     let new_src = nat.rewrite_src.and_then(|ip| match ip {
         IpAddr::V6(ip) => Some(ip.octets()),
         _ => None,
@@ -5232,6 +5263,7 @@ fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
     });
     if new_src.is_some() && new_dst.is_none() {
         let new_src = new_src?;
+        let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
         packet.get_mut(8..24)?.copy_from_slice(&new_src);
         let new_src_words = ipv6_words_from_octets(new_src);
         adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
@@ -5239,11 +5271,14 @@ fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
     }
     if new_dst.is_some() && new_src.is_none() {
         let new_dst = new_dst?;
+        let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
         packet.get_mut(24..40)?.copy_from_slice(&new_dst);
         let new_dst_words = ipv6_words_from_octets(new_dst);
         adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
         return Some(());
     }
+    let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
+    let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
     if let Some(ip) = new_src {
         packet.get_mut(8..24)?.copy_from_slice(&ip);
     }
@@ -7806,6 +7841,12 @@ mod tests {
         checksum16_ipv4(src, dst, PROTO_TCP, &packet[ihl..]) == 0
     }
 
+    fn icmpv6_checksum_ok(packet: &[u8]) -> bool {
+        let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).expect("src"));
+        let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("dst"));
+        checksum16_ipv6(src, dst, PROTO_ICMPV6, &packet[40..]) == 0
+    }
+
     #[test]
     fn apply_nat_ipv4_recomputes_tcp_checksum() {
         let mut packet = vec![
@@ -7900,5 +7941,79 @@ mod tests {
         assert_eq!(&out[30..34], &[172, 16, 80, 8]);
         assert_eq!(out[26], 63);
         assert!(tcp_checksum_ok_ipv4(&out[18..]));
+    }
+
+    #[test]
+    fn rewrite_forwarded_frame_in_place_keeps_icmpv6_checksum_valid_after_snat() {
+        let src_ip = "2001:559:8585:ef00::100".parse::<Ipv6Addr>().unwrap();
+        let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x86dd,
+        );
+        frame.extend_from_slice(&[
+            0x60, 0x00, 0x00, 0x00, 0x00, 0x08, PROTO_ICMPV6, 64,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&[128, 0, 0, 0, 0x12, 0x34, 0x00, 0x01]);
+        let sum = checksum16_ipv6(src_ip, dst_ip, PROTO_ICMPV6, &frame[54..]);
+        frame[56] = (sum >> 8) as u8;
+        frame[57] = sum as u8;
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_ICMPV6,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 11,
+                next_hop: Some(IpAddr::V6(dst_ip)),
+                neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V6("2001:559:8585:80::8".parse().unwrap())),
+                ..NatDecision::default()
+            },
+        };
+        let frame_len = rewrite_forwarded_frame_in_place(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &decision,
+        )
+        .expect("in-place v6 forward");
+        let out = area.slice(0, frame_len as usize).expect("rewritten frame");
+        assert_eq!(&out[0..6], &[0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
+        assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]);
+        assert_eq!(out[25], 63);
+        assert_eq!(
+            Ipv6Addr::from(<[u8; 16]>::try_from(&out[26..42]).unwrap()),
+            "2001:559:8585:80::8".parse::<Ipv6Addr>().unwrap()
+        );
+        assert!(icmpv6_checksum_ok(&out[18..]));
     }
 }
