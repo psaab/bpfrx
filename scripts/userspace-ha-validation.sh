@@ -12,6 +12,7 @@ MIN_GBPS_V6="${MIN_GBPS_V6:-18.0}"
 MARGINAL_GBPS_EPSILON="${MARGINAL_GBPS_EPSILON:-0.25}"
 PREFERRED_ACTIVE_NODE="${PREFERRED_ACTIVE_NODE:-0}"
 PREFERRED_ACTIVE_RGS="${PREFERRED_ACTIVE_RGS:-1 2}"
+IPERF_TIMEOUT="${IPERF_TIMEOUT:-$((DURATION + 15))}"
 WITH_PERF=0
 DEPLOY=0
 
@@ -263,11 +264,13 @@ trap cleanup EXIT
 
 run_iperf_json() {
 	local family="$1" target="$2" outfile="$3"
-	local cmd
+	local cmd tmpfile timeout_sec
+	tmpfile="${outfile}.tmp"
+	timeout_sec="${IPERF_TIMEOUT}s"
 	if [[ "$family" == "6" ]]; then
-		cmd="rm -f ${outfile} ${outfile}.err; iperf3 -6 -J -c ${target} -P ${PARALLEL} -t ${DURATION} > ${outfile} 2>${outfile}.err"
+		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -6 -J -c ${target} -P ${PARALLEL} -t ${DURATION} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
 	else
-		cmd="rm -f ${outfile} ${outfile}.err; iperf3 -J -c ${target} -P ${PARALLEL} -t ${DURATION} > ${outfile} 2>${outfile}.err"
+		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -J -c ${target} -P ${PARALLEL} -t ${DURATION} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
 	fi
 	run_host "$cmd"
 }
