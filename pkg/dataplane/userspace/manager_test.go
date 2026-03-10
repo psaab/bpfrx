@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/vishvananda/netlink"
 )
 
 func TestFindUserspaceEgressInterfaceSnapshotPrefersVLANUnit(t *testing.T) {
@@ -90,8 +91,18 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	cfg.System.HostName = "fw-test"
 	cfg.System.DataplaneType = "userspace"
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
-		"ge-0/0/0": {Name: "ge-0/0/0"},
-		"ge-0/0/1": {Name: "ge-0/0/1"},
+		"ge-0/0/0": {
+			Name: "ge-0/0/0",
+			Units: map[int]*config.InterfaceUnit{
+				0: {Number: 0, Addresses: []string{"192.0.2.1/24", "2001:db8::1/64"}},
+			},
+		},
+		"ge-0/0/1": {
+			Name: "ge-0/0/1",
+			Units: map[int]*config.InterfaceUnit{
+				0: {Number: 0, Addresses: []string{"10.0.0.1/24"}},
+			},
+		},
 	}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
 		"trust":   {Name: "trust", Interfaces: []string{"ge-0/0/1"}},
@@ -166,8 +177,8 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	if !snap.Summary.HAEnabled {
 		t.Fatal("HAEnabled = false, want true")
 	}
-	if len(snap.Interfaces) != 2 {
-		t.Fatalf("len(Interfaces) = %d, want 2", len(snap.Interfaces))
+	if len(snap.Interfaces) != 4 {
+		t.Fatalf("len(Interfaces) = %d, want 4", len(snap.Interfaces))
 	}
 	if snap.Interfaces[0].Name != "ge-0/0/0" {
 		t.Fatalf("Interfaces[0].Name = %q", snap.Interfaces[0].Name)
@@ -178,14 +189,24 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	if snap.Interfaces[0].Zone != "untrust" {
 		t.Fatalf("Interfaces[0].Zone = %q, want untrust", snap.Interfaces[0].Zone)
 	}
-	if len(snap.Routes) != 2 {
-		t.Fatalf("len(Routes) = %d, want 2", len(snap.Routes))
+	if len(snap.Routes) < 4 {
+		t.Fatalf("len(Routes) = %d, want at least 4", len(snap.Routes))
 	}
-	if snap.Routes[0].Table != "inet.0" || snap.Routes[0].Destination != "0.0.0.0/0" {
-		t.Fatalf("Routes[0] = %+v", snap.Routes[0])
+	var sawDefaultV4, sawDefaultV6, sawConnectedV4, sawConnectedV6 bool
+	for _, route := range snap.Routes {
+		switch {
+		case route.Table == "inet.0" && route.Destination == "0.0.0.0/0":
+			sawDefaultV4 = true
+		case route.Table == "vrf1.inet6.0" && route.Destination == "::/0":
+			sawDefaultV6 = true
+		case route.Table == "inet.0" && route.Destination == "10.0.0.0/24":
+			sawConnectedV4 = true
+		case route.Table == "inet6.0" && route.Destination == "2001:db8::/64":
+			sawConnectedV6 = true
+		}
 	}
-	if snap.Routes[1].Table != "vrf1.inet6.0" || snap.Routes[1].Destination != "::/0" {
-		t.Fatalf("Routes[1] = %+v", snap.Routes[1])
+	if !sawDefaultV4 || !sawDefaultV6 || !sawConnectedV4 || !sawConnectedV6 {
+		t.Fatalf("Routes = %+v", snap.Routes)
 	}
 	if len(snap.SourceNAT) != 1 {
 		t.Fatalf("len(SourceNAT) = %d, want 1", len(snap.SourceNAT))
@@ -242,7 +263,7 @@ func TestBuildRouteSnapshotsNormalizesFamilyFromDestination(t *testing.T) {
 			},
 		},
 	}
-	routes := buildRouteSnapshots(cfg)
+	routes := buildRouteSnapshots(cfg, nil)
 	if len(routes) != 2 {
 		t.Fatalf("len(routes) = %d, want 2", len(routes))
 	}
@@ -251,6 +272,28 @@ func TestBuildRouteSnapshotsNormalizesFamilyFromDestination(t *testing.T) {
 	}
 	if routes[1].Family != "inet6" || routes[1].Table != "inet6.0" {
 		t.Fatalf("routes[1] = %+v, want family inet6 table inet6.0", routes[1])
+	}
+}
+
+func TestBuildRouteSnapshotsIncludesConnectedPrefixes(t *testing.T) {
+	routes := buildRouteSnapshots(&config.Config{}, []InterfaceSnapshot{
+		{
+			Name: "reth1.0",
+			Addresses: []InterfaceAddressSnapshot{
+				{Family: "inet", Address: "10.0.61.1/24", Scope: int(netlink.SCOPE_UNIVERSE)},
+				{Family: "inet6", Address: "2001:559:8585:ef00::1/64", Scope: int(netlink.SCOPE_UNIVERSE)},
+				{Family: "inet6", Address: "fe80::1/64", Scope: int(netlink.SCOPE_LINK)},
+			},
+		},
+	})
+	if len(routes) != 2 {
+		t.Fatalf("len(routes) = %d, want 2", len(routes))
+	}
+	if routes[0].Destination != "10.0.61.0/24" || routes[0].Table != "inet.0" {
+		t.Fatalf("routes[0] = %+v", routes[0])
+	}
+	if routes[1].Destination != "2001:559:8585:ef00::/64" || routes[1].Table != "inet6.0" {
+		t.Fatalf("routes[1] = %+v", routes[1])
 	}
 }
 

@@ -475,6 +475,7 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		}
 	}
 	policyCount := len(cfg.Security.Policies)
+	interfaces := buildInterfaceSnapshots(cfg)
 	return &ConfigSnapshot{
 		Version:       ProtocolVersion,
 		Generation:    generation,
@@ -484,10 +485,10 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		MapPins:       userspaceMapPins(),
 		Userspace:     ucfg,
 		Zones:         buildZoneSnapshots(cfg),
-		Interfaces:    buildInterfaceSnapshots(cfg),
+		Interfaces:    interfaces,
 		Fabrics:       buildFabricSnapshots(cfg),
 		Neighbors:     buildNeighborSnapshots(cfg),
-		Routes:        buildRouteSnapshots(cfg),
+		Routes:        buildRouteSnapshots(cfg, interfaces),
 		Flow: FlowSnapshot{
 			AllowDNSReply:     cfg.Security.Flow.AllowDNSReply,
 			AllowEmbeddedICMP: cfg.Security.Flow.AllowEmbeddedICMP,
@@ -889,11 +890,20 @@ func userspaceRXQueueCount(linuxName string) int {
 	return count
 }
 
-func buildRouteSnapshots(cfg *config.Config) []RouteSnapshot {
+func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []RouteSnapshot {
 	if cfg == nil {
 		return nil
 	}
 	out := make([]RouteSnapshot, 0)
+	seen := make(map[string]struct{})
+	addSnapshot := func(snap RouteSnapshot) {
+		key := snap.Table + "|" + snap.Family + "|" + snap.Destination + "|" + strings.Join(snap.NextHops, ",") + "|" + snap.NextTable
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, snap)
+	}
 	addRoutes := func(table, family string, routes []*config.StaticRoute) {
 		for _, route := range routes {
 			if route == nil {
@@ -917,7 +927,18 @@ func buildRouteSnapshots(cfg *config.Config) []RouteSnapshot {
 					snap.NextHops = append(snap.NextHops, "@"+nh.Interface)
 				}
 			}
-			out = append(out, snap)
+			addSnapshot(snap)
+		}
+	}
+	interfaceTablesV4, interfaceTablesV6 := buildInterfaceRouteTables(cfg)
+	addConnectedRoutes := func(family, table string, prefixes []string) {
+		for _, prefix := range prefixes {
+			snap := RouteSnapshot{
+				Table:       table,
+				Family:      family,
+				Destination: prefix,
+			}
+			addSnapshot(snap)
 		}
 	}
 	addRoutes("inet.0", "inet", cfg.RoutingOptions.StaticRoutes)
@@ -936,6 +957,22 @@ func buildRouteSnapshots(cfg *config.Config) []RouteSnapshot {
 			addRoutes(ri.Name+".inet6.0", "inet6", ri.Inet6StaticRoutes)
 		}
 	}
+	for _, iface := range interfaces {
+		if iface.Name == "" {
+			continue
+		}
+		v4Table := interfaceTablesV4[iface.Name]
+		if v4Table == "" {
+			v4Table = "inet.0"
+		}
+		v6Table := interfaceTablesV6[iface.Name]
+		if v6Table == "" {
+			v6Table = "inet6.0"
+		}
+		v4Prefixes, v6Prefixes := connectedPrefixesForInterface(iface)
+		addConnectedRoutes("inet", v4Table, v4Prefixes)
+		addConnectedRoutes("inet6", v6Table, v6Prefixes)
+	}
 
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Table != out[j].Table {
@@ -947,6 +984,59 @@ func buildRouteSnapshots(cfg *config.Config) []RouteSnapshot {
 		return out[i].Destination < out[j].Destination
 	})
 	return out
+}
+
+func buildInterfaceRouteTables(cfg *config.Config) (map[string]string, map[string]string) {
+	v4 := make(map[string]string)
+	v6 := make(map[string]string)
+	if cfg == nil {
+		return v4, v6
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil || ri.Name == "" {
+			continue
+		}
+		for _, ifname := range ri.Interfaces {
+			if ifname == "" {
+				continue
+			}
+			v4[ifname] = ri.Name + ".inet.0"
+			v6[ifname] = ri.Name + ".inet6.0"
+		}
+	}
+	return v4, v6
+}
+
+func connectedPrefixesForInterface(iface InterfaceSnapshot) ([]string, []string) {
+	var v4 []string
+	var v6 []string
+	for _, addr := range iface.Addresses {
+		if addr.Scope != 0 && addr.Scope != int(netlink.SCOPE_UNIVERSE) {
+			continue
+		}
+		ip, network, err := net.ParseCIDR(addr.Address)
+		if err != nil || network == nil {
+			continue
+		}
+		ones, bits := network.Mask.Size()
+		if ones <= 0 || ones == bits {
+			continue
+		}
+		network.IP = ip.Mask(network.Mask)
+		prefix := network.String()
+		switch addr.Family {
+		case "inet":
+			v4 = append(v4, prefix)
+		case "inet6":
+			if ip.IsLinkLocalUnicast() {
+				continue
+			}
+			v6 = append(v6, prefix)
+		}
+	}
+	slices.Sort(v4)
+	slices.Sort(v6)
+	return slices.Compact(v4), slices.Compact(v6)
 }
 
 func normalizeRouteSnapshotFamily(table, family, destination string) (string, string) {
