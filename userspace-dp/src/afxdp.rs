@@ -38,6 +38,9 @@ const TX_BATCH_SIZE: usize = 256;
 const FILL_BATCH_SIZE: usize = 1024;
 const FILL_DRAIN_WATERMARK: usize = 64;
 const MAX_RX_BATCHES_PER_POLL: usize = 4;
+const RX_WAKE_MIN_INTERVAL: Duration = Duration::from_micros(50);
+const TX_WAKE_MIN_INTERVAL: Duration = Duration::from_micros(50);
+const TX_WAKE_PENDING_THRESHOLD: u32 = 256;
 const XSK_BIND_FLAGS_FALLBACK: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP;
 const XSK_BIND_FLAGS_PREFERRED: u16 =
     SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY;
@@ -987,6 +990,8 @@ struct BindingWorker {
     pending_fill_frames: VecDeque<u64>,
     heartbeat_map_fd: c_int,
     last_heartbeat_update: Instant,
+    last_rx_wake: Instant,
+    last_tx_wake: Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1188,6 +1193,8 @@ impl BindingWorker {
             pending_fill_frames: VecDeque::new(),
             heartbeat_map_fd,
             last_heartbeat_update: Instant::now(),
+            last_rx_wake: Instant::now() - RX_WAKE_MIN_INTERVAL,
+            last_tx_wake: Instant::now() - TX_WAKE_MIN_INTERVAL,
         })
     }
 
@@ -1296,10 +1303,7 @@ fn poll_binding(
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
         let available = binding.rx.available().min(RX_BATCH_SIZE);
         if available == 0 {
-            if binding.device.needs_wakeup() {
-                binding.device.wake();
-                binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
-            }
+            maybe_wake_device(binding, fill_work);
             if poll_stats {
                 poll_kernel_stats(&binding.user, &binding.live);
             }
@@ -2504,10 +2508,7 @@ fn drain_pending_fill(binding: &mut BindingWorker) -> bool {
             binding.pending_fill_frames.push_front(offset);
         }
     }
-    if binding.device.needs_wakeup() {
-        binding.device.wake();
-        binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
-    }
+    maybe_wake_device(binding, true);
     true
 }
 
@@ -2706,10 +2707,33 @@ fn transmit_prepared_batch(binding: &mut BindingWorker) -> Result<(u64, u64), Tx
     Ok((sent_packets, sent_bytes))
 }
 
-fn maybe_wake_tx(binding: &BindingWorker) {
+fn maybe_wake_device(binding: &mut BindingWorker, force: bool) {
+    if !binding.device.needs_wakeup() {
+        return;
+    }
+    if !force && binding.last_rx_wake.elapsed() < RX_WAKE_MIN_INTERVAL {
+        return;
+    }
+    binding.device.wake();
+    binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
+    binding.last_rx_wake = Instant::now();
+}
+
+fn maybe_wake_tx(binding: &mut BindingWorker) {
     let bind_mode = XskBindMode::from_u8(binding.live.bind_mode.load(Ordering::Relaxed));
-    if !bind_mode.is_zerocopy() || binding.tx.needs_wakeup() {
+    if !bind_mode.is_zerocopy() {
         binding.tx.wake();
+        binding.last_tx_wake = Instant::now();
+        return;
+    }
+    if !binding.tx.needs_wakeup() {
+        return;
+    }
+    if binding.last_tx_wake.elapsed() >= TX_WAKE_MIN_INTERVAL
+        || binding.tx.pending() >= TX_WAKE_PENDING_THRESHOLD
+    {
+        binding.tx.wake();
+        binding.last_tx_wake = Instant::now();
     }
 }
 
