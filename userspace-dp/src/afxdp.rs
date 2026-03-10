@@ -1061,7 +1061,10 @@ impl BindingWorker {
                 &SocketConfig {
                     rx_size: NonZeroU32::new(ring_entries),
                     tx_size: NonZeroU32::new(ring_entries),
-                    bind_flags: SocketConfig::XDP_BIND_NEED_WAKEUP,
+                    // Copy mode is slower than zero-copy, but it preserves
+                    // kernel coexistence for local control-plane traffic while
+                    // the userspace dataplane is still incomplete.
+                    bind_flags: SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_COPY,
                 },
             )
             .map_err(|e| format!("configure rx ring: {e}"))?;
