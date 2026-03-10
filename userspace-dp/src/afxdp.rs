@@ -992,8 +992,6 @@ struct BindingWorker {
     interface: Arc<str>,
     ifindex: i32,
     live: Arc<BindingLiveState>,
-    area: MmapArea,
-    _umem: Umem,
     user: User,
     device: xdpilone::DeviceQueue,
     rx: xdpilone::RingRx,
@@ -1007,6 +1005,7 @@ struct BindingWorker {
     scratch_fill: Vec<u64>,
     scratch_prepared_tx: Vec<PreparedTxRequest>,
     scratch_local_tx: Vec<(u64, TxRequest)>,
+    in_flight_forward_recycles: FastMap<u64, u32>,
     heartbeat_map_fd: c_int,
     last_heartbeat_update_ns: u64,
     last_rx_wake_ns: u64,
@@ -1117,6 +1116,7 @@ struct PendingForwardRequest {
 struct PreparedTxRequest {
     offset: u64,
     len: u32,
+    recycle_slot: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1145,53 +1145,38 @@ enum WorkerCommand {
 impl BindingWorker {
     fn create(
         binding: &BindingStatus,
+        worker_umem: &WorkerUmem,
         ring_entries: u32,
+        reserved_tx_frames: VecDeque<u64>,
+        initial_fill_frames: Vec<u64>,
         xsk_map_fd: c_int,
         heartbeat_map_fd: c_int,
         live: Arc<BindingLiveState>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let area = MmapArea::new((ring_entries as usize) * (UMEM_FRAME_SIZE as usize))?;
-        let umem_cfg = UmemConfig {
-            fill_size: ring_entries,
-            complete_size: ring_entries,
-            frame_size: UMEM_FRAME_SIZE,
-            headroom: UMEM_HEADROOM,
-            flags: 0,
-        };
-        let umem = unsafe { Umem::new(umem_cfg, area.as_nonnull_slice()) }
-            .map_err(|e| format!("create umem: {e}"))?;
         let info = ifinfo_from_binding(binding)?;
-        let sock = Socket::with_shared(&info, &umem).map_err(|e| format!("create socket: {e}"))?;
-        let mut device = umem
+        let sock = Socket::new(&info).map_err(|e| format!("create socket: {e}"))?;
+        let mut device = worker_umem
+            .umem
             .fq_cq(&sock)
             .map_err(|e| format!("create fq/cq: {e}"))?;
-        let (user, rx, tx, bind_mode) =
-            match open_user_rings(&umem, &sock, ring_entries, XSK_BIND_FLAGS_PREFERRED) {
-                Ok(bound) => bound,
-                Err(preferred_err) => open_user_rings(
-                    &umem,
-                    &sock,
-                    ring_entries,
-                    XSK_BIND_FLAGS_FALLBACK,
-                )
-                .map_err(|fallback_err| {
-                    format!(
-                        "configure AF_XDP rings: zerocopy={preferred_err}; fallback={fallback_err}"
-                    )
-                })?,
-            };
-        let reserved_tx = ring_entries
-            .saturating_div(2)
-            .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
-            .min(ring_entries.saturating_sub(1))
-            .max(1);
-        prime_fill_ring(&umem, &mut device, reserved_tx)?;
-        let mut free_tx_frames = VecDeque::with_capacity(reserved_tx as usize);
-        for idx in 0..reserved_tx {
-            if let Some(frame) = umem.frame(BufIdx(idx)) {
-                free_tx_frames.push_back(frame.offset);
-            }
-        }
+        let (user, rx, tx, bind_mode) = match open_user_rings(
+            &worker_umem.umem,
+            &sock,
+            ring_entries,
+            XSK_BIND_FLAGS_PREFERRED,
+        ) {
+            Ok(bound) => bound,
+            Err(preferred_err) => open_user_rings(
+                &worker_umem.umem,
+                &sock,
+                ring_entries,
+                XSK_BIND_FLAGS_FALLBACK,
+            )
+            .map_err(|fallback_err| {
+                format!("configure AF_XDP rings: zerocopy={preferred_err}; fallback={fallback_err}")
+            })?,
+        };
+        prime_fill_ring_offsets(&mut device, &initial_fill_frames)?;
 
         live.set_bound(user.as_raw_fd());
         live.set_bind_mode(bind_mode);
@@ -1212,13 +1197,11 @@ impl BindingWorker {
             interface: Arc::<str>::from(binding.interface.as_str()),
             ifindex: binding.ifindex,
             live,
-            area,
-            _umem: umem,
             user,
             device,
             rx,
             tx,
-            free_tx_frames,
+            free_tx_frames: reserved_tx_frames,
             pending_tx_prepared: VecDeque::new(),
             pending_tx_local: VecDeque::new(),
             pending_fill_frames: VecDeque::new(),
@@ -1227,6 +1210,7 @@ impl BindingWorker {
             scratch_fill: Vec::with_capacity(FILL_BATCH_SIZE),
             scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
             scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
+            in_flight_forward_recycles: FastMap::default(),
             heartbeat_map_fd,
             last_heartbeat_update_ns: init_now,
             last_rx_wake_ns: init_now,
@@ -1245,6 +1229,27 @@ impl BindingWorker {
             interface: self.interface.clone(),
             ifindex: self.ifindex,
         }
+    }
+}
+
+struct WorkerUmem {
+    area: MmapArea,
+    umem: Umem,
+}
+
+impl WorkerUmem {
+    fn new(total_frames: u32) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let area = MmapArea::new((total_frames as usize) * (UMEM_FRAME_SIZE as usize))?;
+        let umem_cfg = UmemConfig {
+            fill_size: total_frames,
+            complete_size: total_frames,
+            frame_size: UMEM_FRAME_SIZE,
+            headroom: UMEM_HEADROOM,
+            flags: 0,
+        };
+        let umem = unsafe { Umem::new(umem_cfg, area.as_nonnull_slice()) }
+            .map_err(|e| format!("create umem: {e}"))?;
+        Ok(Self { area, umem })
     }
 }
 
@@ -1301,6 +1306,7 @@ fn bind_user_with_retry(
 fn poll_binding(
     binding_index: usize,
     bindings: &mut [BindingWorker],
+    area: &MmapArea,
     sessions: &mut SessionTable,
     validation: ValidationState,
     now_ns: u64,
@@ -1315,6 +1321,7 @@ fn poll_binding(
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     poll_stats: bool,
+    shared_recycles: &mut Vec<(u32, u64)>,
 ) -> bool {
     #[derive(Default)]
     struct BatchCounters {
@@ -1385,7 +1392,8 @@ fn poll_binding(
     };
     let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
-    let tx_work = drain_pending_tx(binding, now_ns);
+    let tx_work = drain_pending_tx(binding, area, now_ns, shared_recycles);
+    apply_shared_recycles(left, binding, right, shared_recycles);
     let fill_work = drain_pending_fill(binding, now_ns);
     let mut did_work = tx_work || fill_work;
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
@@ -1409,16 +1417,16 @@ fn poll_binding(
             batch_packets += 1;
             batch_bytes += desc.len as u64;
             let mut recycle_now = true;
-            if let Some(meta) = try_parse_metadata(&binding.area, desc) {
+            if let Some(meta) = try_parse_metadata(area, desc) {
                 counters.metadata_packets += 1;
                 let disposition = classify_metadata(meta, validation);
                 if disposition == PacketDisposition::Valid {
                     counters.validated_packets += 1;
                     counters.validated_bytes += desc.len as u64;
-                    let flow = parse_session_flow(&binding.area, desc, meta);
+                    let flow = parse_session_flow(area, desc, meta);
                     if let Some(flow) = flow.as_ref() {
                         learn_dynamic_neighbor_from_packet(
-                            &binding.area,
+                            area,
                             desc,
                             meta,
                             flow.src_ip,
@@ -1428,7 +1436,7 @@ fn poll_binding(
                         );
                     }
                     let ingress_zone_override =
-                        parse_zone_encoded_fabric_ingress(&binding.area, desc, meta, forwarding);
+                        parse_zone_encoded_fabric_ingress(area, desc, meta, forwarding);
                     let mut debug = flow
                         .as_ref()
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
@@ -1756,13 +1764,7 @@ fn poll_binding(
                                 forwarding,
                                 ha_state,
                                 now_secs,
-                                resolve_forwarding(
-                                    &binding.area,
-                                    desc,
-                                    meta,
-                                    forwarding,
-                                    dynamic_neighbors,
-                                ),
+                                resolve_forwarding(area, desc, meta, forwarding, dynamic_neighbors),
                             ),
                             nat: NatDecision::default(),
                         }
@@ -1800,7 +1802,7 @@ fn poll_binding(
                             &ident,
                             &binding.live,
                             slow_path,
-                            &binding.area,
+                            area,
                             desc,
                             meta,
                             decision.resolution,
@@ -1840,6 +1842,7 @@ fn poll_binding(
             left,
             binding,
             right,
+            area,
             &mut pending_forwards,
             now_ns,
             forwarding,
@@ -1853,6 +1856,7 @@ fn poll_binding(
                 .extend(binding.scratch_recycle.drain(..));
             let _ = drain_pending_fill(binding, now_ns);
         }
+        apply_shared_recycles(left, binding, right, shared_recycles);
         binding
             .live
             .rx_packets
@@ -1896,15 +1900,16 @@ fn enqueue_pending_forwards(
     left: &mut [BindingWorker],
     ingress_binding: &mut BindingWorker,
     right: &mut [BindingWorker],
+    area: &MmapArea,
     pending_forwards: &mut Vec<PendingForwardRequest>,
     now_ns: u64,
     forwarding: &ForwardingState,
     ingress_ident: &BindingIdentity,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
-    let ingress_area_ptr: *const MmapArea = &ingress_binding.area;
     for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
+        let ingress_slot = ingress_binding.slot;
         let Some(target_binding) = find_target_binding_mut(
             left,
             ingress_binding,
@@ -1923,99 +1928,140 @@ fn enqueue_pending_forwards(
             ingress_binding.pending_fill_frames.push_back(source_offset);
             continue;
         };
-        // Safe because RX frames are not recycled back into the fill ring until
-        // after enqueue_pending_forwards completes, and TX uses a reserved frame
-        // subset that does not overlap RX descriptors on the same worker.
-        let ingress_area = unsafe { &*ingress_area_ptr };
-        if target_binding.free_tx_frames.is_empty() {
-            let _ = drain_pending_tx(target_binding, now_ns);
-        }
-        if let Some(offset) = target_binding.free_tx_frames.pop_front() {
-            match target_binding
-                .area
-                .slice_mut(offset as usize, UMEM_FRAME_SIZE as usize)
-                .and_then(|dst| {
-                    build_forwarded_frame_into(
-                        dst,
-                        ingress_area,
-                        request.desc,
-                        request.meta,
-                        &request.decision,
-                    )
-                }) {
+        let mut post_recycles = Vec::new();
+        let mut build_failed = false;
+        let mut source_reused = false;
+        {
+            match rewrite_forwarded_frame_in_place(
+                area,
+                request.desc,
+                request.meta,
+                &request.decision,
+            ) {
                 Some(frame_len) => {
+                    source_reused = true;
                     target_binding
                         .pending_tx_prepared
                         .push_back(PreparedTxRequest {
-                            offset,
-                            len: frame_len as u32,
+                            offset: source_offset,
+                            len: frame_len,
+                            recycle_slot: Some(ingress_slot),
                         });
                 }
                 None => {
-                    target_binding.free_tx_frames.push_front(offset);
-                    match build_forwarded_frame(
-                        ingress_area,
-                        request.desc,
-                        request.meta,
-                        &request.decision,
-                        forwarding,
-                    ) {
-                        Some(frame) => {
-                            target_binding
-                                .pending_tx_local
-                                .push_back(TxRequest { bytes: frame });
+                    if target_binding.free_tx_frames.is_empty() {
+                        let _ = drain_pending_tx(target_binding, area, now_ns, &mut post_recycles);
+                    }
+                    if let Some(offset) = target_binding.free_tx_frames.pop_front() {
+                        match unsafe {
+                            area.slice_mut_unchecked(offset as usize, UMEM_FRAME_SIZE as usize)
                         }
-                        None => {
-                            record_exception(
-                                recent_exceptions,
-                                ingress_ident,
-                                "forward_build_failed",
-                                request.desc.len,
-                                Some(request.meta),
-                                None,
-                            );
-                            ingress_binding.pending_fill_frames.push_back(source_offset);
-                            continue;
+                        .and_then(|dst| {
+                            build_forwarded_frame_into(
+                                dst,
+                                area,
+                                request.desc,
+                                request.meta,
+                                &request.decision,
+                            )
+                        }) {
+                            Some(frame_len) => {
+                                target_binding
+                                    .pending_tx_prepared
+                                    .push_back(PreparedTxRequest {
+                                        offset,
+                                        len: frame_len as u32,
+                                        recycle_slot: None,
+                                    });
+                            }
+                            None => {
+                                target_binding.free_tx_frames.push_front(offset);
+                                match build_forwarded_frame(
+                                    area,
+                                    request.desc,
+                                    request.meta,
+                                    &request.decision,
+                                    forwarding,
+                                ) {
+                                    Some(frame) => {
+                                        target_binding
+                                            .pending_tx_local
+                                            .push_back(TxRequest { bytes: frame });
+                                    }
+                                    None => {
+                                        build_failed = true;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        match build_forwarded_frame(
+                            area,
+                            request.desc,
+                            request.meta,
+                            &request.decision,
+                            forwarding,
+                        ) {
+                            Some(frame) => {
+                                target_binding
+                                    .pending_tx_local
+                                    .push_back(TxRequest { bytes: frame });
+                            }
+                            None => {
+                                build_failed = true;
+                            }
                         }
                     }
                 }
             }
-        } else {
-            match build_forwarded_frame(
-                ingress_area,
-                request.desc,
-                request.meta,
-                &request.decision,
-                forwarding,
-            ) {
-                Some(frame) => {
-                    target_binding
-                        .pending_tx_local
-                        .push_back(TxRequest { bytes: frame });
-                }
-                None => {
-                    record_exception(
-                        recent_exceptions,
-                        ingress_ident,
-                        "forward_build_failed",
-                        request.desc.len,
-                        Some(request.meta),
-                        None,
-                    );
-                    ingress_binding.pending_fill_frames.push_back(source_offset);
-                    continue;
-                }
+            if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
+                || target_binding.pending_tx_local.len() >= TX_BATCH_SIZE
+            {
+                let _ = drain_pending_tx(target_binding, area, now_ns, &mut post_recycles);
             }
         }
-        if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
-            || target_binding.pending_tx_local.len() >= TX_BATCH_SIZE
-        {
-            let _ = drain_pending_tx(target_binding, now_ns);
+        apply_shared_recycles(left, ingress_binding, right, &mut post_recycles);
+        if build_failed {
+            record_exception(
+                recent_exceptions,
+                ingress_ident,
+                "forward_build_failed",
+                request.desc.len,
+                Some(request.meta),
+                None,
+            );
+            ingress_binding.pending_fill_frames.push_back(source_offset);
+            continue;
         }
-        ingress_binding.pending_fill_frames.push_back(source_offset);
+        if !source_reused {
+            ingress_binding.pending_fill_frames.push_back(source_offset);
+        }
         if ingress_binding.pending_fill_frames.len() >= FILL_DRAIN_WATERMARK {
             let _ = drain_pending_fill(ingress_binding, now_ns);
         }
+    }
+}
+
+fn apply_shared_recycles(
+    left: &mut [BindingWorker],
+    current: &mut BindingWorker,
+    right: &mut [BindingWorker],
+    shared_recycles: &mut Vec<(u32, u64)>,
+) {
+    for (slot, offset) in shared_recycles.drain(..) {
+        if current.slot == slot {
+            current.pending_fill_frames.push_back(offset);
+            continue;
+        }
+        if let Some(binding) = left.iter_mut().find(|binding| binding.slot == slot) {
+            binding.pending_fill_frames.push_back(offset);
+            continue;
+        }
+        if let Some(binding) = right.iter_mut().find(|binding| binding.slot == slot) {
+            binding.pending_fill_frames.push_back(offset);
+            continue;
+        }
+        current.pending_fill_frames.push_back(offset);
     }
 }
 
@@ -2558,7 +2604,7 @@ fn session_delta_event(kind: SessionDeltaKind) -> &'static str {
     }
 }
 
-fn reap_tx_completions(binding: &mut BindingWorker) -> u32 {
+fn reap_tx_completions(binding: &mut BindingWorker, shared_recycles: &mut Vec<(u32, u64)>) -> u32 {
     if binding.outstanding_tx == 0 {
         return 0;
     }
@@ -2569,7 +2615,11 @@ fn reap_tx_completions(binding: &mut BindingWorker) -> u32 {
     let mut reaped = 0u32;
     let mut completed = binding.device.complete(available);
     while let Some(offset) = completed.read() {
-        binding.free_tx_frames.push_back(offset);
+        if let Some(recycle_slot) = binding.in_flight_forward_recycles.remove(&offset) {
+            shared_recycles.push((recycle_slot, offset));
+        } else {
+            binding.free_tx_frames.push_back(offset);
+        }
         reaped += 1;
     }
     completed.release();
@@ -2637,7 +2687,12 @@ fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, now_ns: u64) {
     binding.empty_rx_polls = 0;
 }
 
-fn drain_pending_tx(binding: &mut BindingWorker, now_ns: u64) -> bool {
+fn drain_pending_tx(
+    binding: &mut BindingWorker,
+    area: &MmapArea,
+    now_ns: u64,
+    shared_recycles: &mut Vec<(u32, u64)>,
+) -> bool {
     if binding.outstanding_tx == 0
         && binding.pending_tx_prepared.is_empty()
         && binding.pending_tx_local.is_empty()
@@ -2645,7 +2700,7 @@ fn drain_pending_tx(binding: &mut BindingWorker, now_ns: u64) -> bool {
     {
         return false;
     }
-    let mut did_work = reap_tx_completions(binding) > 0;
+    let mut did_work = reap_tx_completions(binding, shared_recycles) > 0;
     while !binding.pending_tx_prepared.is_empty() {
         match transmit_prepared_batch(binding, now_ns) {
             Ok((packets, bytes)) => {
@@ -2689,7 +2744,7 @@ fn drain_pending_tx(binding: &mut BindingWorker, now_ns: u64) -> bool {
     while let Some(req) = pending.pop_front() {
         retry.push_back(req);
         if retry.len() >= TX_BATCH_SIZE || binding.free_tx_frames.is_empty() || pending.is_empty() {
-            match transmit_batch(binding, &mut retry, now_ns) {
+            match transmit_batch(binding, area, &mut retry, now_ns, shared_recycles) {
                 Ok((packets, bytes)) => {
                     if packets > 0 {
                         did_work = true;
@@ -2729,14 +2784,16 @@ enum TxError {
 
 fn transmit_batch(
     binding: &mut BindingWorker,
+    area: &MmapArea,
     pending: &mut VecDeque<TxRequest>,
     now_ns: u64,
+    shared_recycles: &mut Vec<(u32, u64)>,
 ) -> Result<(u64, u64), TxError> {
     if pending.is_empty() {
         return Ok((0, 0));
     }
     if binding.free_tx_frames.is_empty() {
-        let _ = reap_tx_completions(binding);
+        let _ = reap_tx_completions(binding, shared_recycles);
     }
     let batch_size = pending
         .len()
@@ -2756,14 +2813,15 @@ fn transmit_batch(
             pending.push_front(req);
             break;
         };
-        let Some(area) = binding.area.slice_mut(offset as usize, req.bytes.len()) else {
+        let Some(frame) = (unsafe { area.slice_mut_unchecked(offset as usize, req.bytes.len()) })
+        else {
             binding.free_tx_frames.push_front(offset);
             return Err(TxError::Drop(format!(
                 "tx frame slice out of range: offset={offset} len={}",
                 req.bytes.len()
             )));
         };
-        area.copy_from_slice(&req.bytes);
+        frame.copy_from_slice(&req.bytes);
         binding.scratch_local_tx.push((offset, req));
     }
 
@@ -2855,6 +2913,11 @@ fn transmit_prepared_batch(
     let mut sent_bytes = 0u64;
     for (idx, req) in binding.scratch_prepared_tx.drain(..).enumerate() {
         if idx < inserted as usize {
+            if let Some(recycle_slot) = req.recycle_slot {
+                binding
+                    .in_flight_forward_recycles
+                    .insert(req.offset, recycle_slot);
+            }
             sent_packets += 1;
             sent_bytes += req.len as u64;
         } else {
@@ -3363,11 +3426,48 @@ fn worker_loop(
 ) {
     pin_current_thread(worker_id);
     let mut sessions = SessionTable::new();
+    let total_frames = binding_plans
+        .iter()
+        .fold(0u32, |acc, plan| acc.saturating_add(plan.ring_entries));
+    let worker_umem = match WorkerUmem::new(total_frames.max(1)) {
+        Ok(worker_umem) => worker_umem,
+        Err(err) => {
+            eprintln!(
+                "bpfrx-userspace-dp: failed to create worker umem worker_id={} err={}",
+                worker_id, err
+            );
+            return;
+        }
+    };
     let mut bindings = Vec::with_capacity(binding_plans.len());
+    let mut frame_index = 0u32;
     for plan in binding_plans {
+        let reserved_tx = plan
+            .ring_entries
+            .saturating_div(2)
+            .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
+            .min(plan.ring_entries.saturating_sub(1))
+            .max(1);
+        let fill_frames = plan.ring_entries.saturating_sub(reserved_tx);
+        let mut reserved_tx_frames = VecDeque::with_capacity(reserved_tx as usize);
+        for idx in 0..reserved_tx {
+            if let Some(frame) = worker_umem.umem.frame(BufIdx(frame_index + idx)) {
+                reserved_tx_frames.push_back(frame.offset);
+            }
+        }
+        let mut initial_fill_frames = Vec::with_capacity(fill_frames as usize);
+        for idx in reserved_tx..plan.ring_entries {
+            if let Some(frame) = worker_umem.umem.frame(BufIdx(frame_index + idx)) {
+                initial_fill_frames.push(frame.offset);
+            }
+        }
+        frame_index = frame_index.saturating_add(plan.ring_entries);
         match BindingWorker::create(
             &plan.status,
+            &worker_umem,
             plan.ring_entries,
+            reserved_tx_frames,
+            initial_fill_frames,
             plan.xsk_map_fd,
             plan.heartbeat_map_fd,
             plan.live.clone(),
@@ -3381,6 +3481,7 @@ fn worker_loop(
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut hot_binding: Option<usize> = None;
+    let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
     while !stop.load(Ordering::Relaxed) {
         apply_worker_commands(&commands, &mut sessions);
         let loop_now_ns = monotonic_nanos();
@@ -3408,6 +3509,7 @@ fn worker_loop(
             if poll_binding(
                 idx,
                 &mut bindings,
+                &worker_umem.area,
                 &mut sessions,
                 validation,
                 loop_now_ns,
@@ -3422,6 +3524,7 @@ fn worker_loop(
                 &last_resolution,
                 &peer_worker_commands,
                 poll_stats,
+                &mut shared_recycles,
             ) {
                 did_work = true;
                 poll_start = idx;
@@ -3441,6 +3544,7 @@ fn worker_loop(
             if poll_binding(
                 idx,
                 &mut bindings,
+                &worker_umem.area,
                 &mut sessions,
                 validation,
                 loop_now_ns,
@@ -3455,6 +3559,7 @@ fn worker_loop(
                 &last_resolution,
                 &peer_worker_commands,
                 poll_stats,
+                &mut shared_recycles,
             ) {
                 did_work = true;
                 hot_binding = Some(idx);
@@ -3581,25 +3686,18 @@ fn poll_kernel_stats(user: &User, live: &BindingLiveState) {
     }
 }
 
-fn prime_fill_ring(
-    umem: &Umem,
+fn prime_fill_ring_offsets(
     device: &mut xdpilone::DeviceQueue,
-    skip_frames: u32,
+    offsets: &[u64],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let frame_count = umem.len_frames();
     let inserted = {
-        let available_frames = frame_count.saturating_sub(skip_frames);
-        let mut fill = device.fill(available_frames);
-        let inserted = fill.insert(
-            (skip_frames..frame_count)
-                .filter_map(|idx| umem.frame(BufIdx(idx)).map(|frame| frame.offset)),
-        );
+        let mut fill = device.fill(offsets.len() as u32);
+        let inserted = fill.insert(offsets.iter().copied());
         fill.commit();
         inserted
     };
-    let want = frame_count.saturating_sub(skip_frames);
-    if inserted != want {
-        return Err(format!("prefill fill ring inserted {inserted}/{want} frames").into());
+    if inserted != offsets.len() as u32 {
+        return Err(format!("prefill fill ring inserted {inserted}/{}", offsets.len()).into());
     }
     if device.needs_wakeup() {
         device.wake();
@@ -4953,6 +5051,108 @@ fn build_forwarded_frame_into(
     Some(frame_len)
 }
 
+fn rewrite_forwarded_frame_in_place(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    decision: &SessionDecision,
+) -> Option<u32> {
+    let dst_mac = decision.resolution.neighbor_mac?;
+    let frame = unsafe { area.slice_mut_unchecked(desc.addr as usize, desc.len as usize)? };
+    let l3 = meta.l3_offset as usize;
+    if l3 >= frame.len() {
+        return None;
+    }
+    let payload_len = frame.len().checked_sub(l3)?;
+    let (src_mac, vlan_id, apply_nat) =
+        if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
+            (
+                decision.resolution.src_mac?,
+                decision.resolution.tx_vlan_id,
+                false,
+            )
+        } else {
+            (
+                decision.resolution.src_mac?,
+                decision.resolution.tx_vlan_id,
+                true,
+            )
+        };
+    let eth_len = if vlan_id > 0 { 18usize } else { 14usize };
+    let ether_type = match meta.addr_family as i32 {
+        libc::AF_INET => 0x0800,
+        libc::AF_INET6 => 0x86dd,
+        _ => return None,
+    };
+    let frame_len = eth_len.checked_add(payload_len)?;
+    if frame_len > frame.len() {
+        return None;
+    }
+    if eth_len != l3 {
+        frame.copy_within(l3..l3 + payload_len, eth_len);
+    }
+    write_eth_header_slice(
+        frame.get_mut(..eth_len)?,
+        dst_mac,
+        src_mac,
+        vlan_id,
+        ether_type,
+    )?;
+    let packet = &mut frame[..frame_len];
+    let ip_start = eth_len;
+    match meta.addr_family as i32 {
+        libc::AF_INET => {
+            if packet.len() < ip_start + 20 {
+                return None;
+            }
+            let ihl = ((packet[ip_start] & 0x0f) as usize) * 4;
+            if ihl < 20 || packet.len() < ip_start + ihl {
+                return None;
+            }
+            if packet[ip_start + 8] <= 1 {
+                return None;
+            }
+            let old_src = Ipv4Addr::new(
+                packet[ip_start + 12],
+                packet[ip_start + 13],
+                packet[ip_start + 14],
+                packet[ip_start + 15],
+            );
+            let old_dst = Ipv4Addr::new(
+                packet[ip_start + 16],
+                packet[ip_start + 17],
+                packet[ip_start + 18],
+                packet[ip_start + 19],
+            );
+            let old_ttl = packet[ip_start + 8];
+            if apply_nat {
+                apply_nat_ipv4(&mut packet[ip_start..], meta.protocol, decision.nat)?;
+            }
+            packet[ip_start + 8] -= 1;
+            adjust_ipv4_header_checksum(
+                &mut packet[ip_start..ip_start + ihl],
+                old_src,
+                old_dst,
+                old_ttl,
+            )?;
+        }
+        libc::AF_INET6 => {
+            if packet.len() < ip_start + 40 {
+                return None;
+            }
+            if packet[ip_start + 7] <= 1 {
+                return None;
+            }
+            if apply_nat {
+                apply_nat_ipv6(&mut packet[ip_start..], meta.protocol, decision.nat)?;
+            }
+            packet[ip_start + 7] -= 1;
+        }
+        _ => return None,
+    }
+    Some(frame_len as u32)
+}
+
 fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<()> {
     if nat == NatDecision::default() {
         return Some(());
@@ -5787,6 +5987,10 @@ impl MmapArea {
     }
 
     fn slice_mut(&mut self, offset: usize, len: usize) -> Option<&mut [u8]> {
+        unsafe { self.slice_mut_unchecked(offset, len) }
+    }
+
+    unsafe fn slice_mut_unchecked(&self, offset: usize, len: usize) -> Option<&mut [u8]> {
         let end = offset.checked_add(len)?;
         if end > self.len {
             return None;
@@ -7474,6 +7678,60 @@ mod tests {
         .expect("forwarded frame");
         assert_eq!(&out[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
         assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]);
+        assert_eq!(out[22], 63);
+    }
+
+    #[test]
+    fn rewrite_forwarded_frame_in_place_reuses_rx_frame() {
+        let state = build_forwarding_state(&forwarding_snapshot(true));
+        let resolution =
+            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, 1, 0, 0, 192, 0, 2, 10, 8, 8, 8, 8,
+            8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01,
+        ]);
+        let sum = checksum16(&frame[14..34]);
+        frame[24] = (sum >> 8) as u8;
+        frame[25] = sum as u8;
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            addr_family: libc::AF_INET as u8,
+            ..UserspaceDpMeta::default()
+        };
+        let frame_len = rewrite_forwarded_frame_in_place(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &SessionDecision {
+                resolution,
+                nat: NatDecision::default(),
+            },
+        )
+        .expect("in-place forward");
+        let out = area.slice(0, frame_len as usize).expect("rewritten frame");
+        assert_eq!(&out[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]);
+        assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x0800);
         assert_eq!(out[22], 63);
     }
 
