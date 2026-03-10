@@ -49,7 +49,6 @@ const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
 const RX_WAKE_MIN_INTERVAL_NS: u64 = 200_000;
-const NEIGHBOR_SYNC_INTERVAL_NS: u64 = 1_000_000_000;
 const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
 const TX_WAKE_MIN_INTERVAL_NS: u64 = 50_000;
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
@@ -3522,7 +3521,6 @@ fn worker_loop(
             Err(err) => plan.live.set_error(err.to_string()),
         }
     }
-    let mut last_neighbor_sync_ns = 0u64;
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut hot_binding: Option<usize> = None;
@@ -3541,12 +3539,6 @@ fn worker_loop(
                     .session_expires
                     .fetch_add(expired, Ordering::Relaxed);
             }
-        }
-        let poll_neighbors = worker_id == 0
-            && loop_now_ns.saturating_sub(last_neighbor_sync_ns) >= NEIGHBOR_SYNC_INTERVAL_NS;
-        if poll_neighbors {
-            sync_dynamic_neighbors(&forwarding, &dynamic_neighbors);
-            last_neighbor_sync_ns = loop_now_ns;
         }
         let mut did_work = false;
         if let Some(idx) = hot_binding.filter(|idx| *idx < bindings.len()) {
