@@ -972,6 +972,7 @@ struct BindingWorker {
     rx: xdpilone::RingRx,
     tx: xdpilone::RingTx,
     free_tx_frames: VecDeque<u64>,
+    pending_tx_prepared: VecDeque<PreparedTxRequest>,
     pending_tx_local: VecDeque<TxRequest>,
     pending_fill_frames: VecDeque<u64>,
     heartbeat_map_fd: c_int,
@@ -1034,6 +1035,11 @@ struct PendingForwardRequest {
     target_ifindex: i32,
     ingress_queue_id: u32,
     frame: Vec<u8>,
+}
+
+struct PreparedTxRequest {
+    offset: u64,
+    len: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1124,6 +1130,7 @@ impl BindingWorker {
             rx,
             tx,
             free_tx_frames,
+            pending_tx_prepared: VecDeque::new(),
             pending_tx_local: VecDeque::new(),
             pending_fill_frames: VecDeque::new(),
             heartbeat_map_fd,
@@ -1741,10 +1748,29 @@ fn enqueue_pending_forwards(
         );
             continue;
         };
-        target_binding
-            .pending_tx_local
-            .push_back(TxRequest { bytes: request.frame });
-        if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
+        if let Some(offset) = target_binding.free_tx_frames.pop_front() {
+            match target_binding
+                .area
+                .slice_mut(offset as usize, request.frame.len())
+            {
+                Some(area) => {
+                    area.copy_from_slice(&request.frame);
+                    target_binding.pending_tx_prepared.push_back(PreparedTxRequest {
+                        offset,
+                        len: request.frame.len() as u32,
+                    });
+                }
+                None => {
+                    target_binding.free_tx_frames.push_front(offset);
+                    target_binding.pending_tx_local.push_back(TxRequest { bytes: request.frame });
+                }
+            }
+        } else {
+            target_binding.pending_tx_local.push_back(TxRequest { bytes: request.frame });
+        }
+        if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
+            || target_binding.pending_tx_local.len() >= TX_BATCH_SIZE
+        {
             let _ = drain_pending_tx(target_binding);
         }
     }
@@ -2325,14 +2351,34 @@ fn drain_pending_fill(binding: &mut BindingWorker) -> bool {
 }
 
 fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
+    let mut did_work = false;
+    while !binding.pending_tx_prepared.is_empty() {
+        match transmit_prepared_batch(binding) {
+            Ok((packets, bytes)) => {
+                if packets == 0 {
+                    break;
+                }
+                did_work = true;
+                binding.live.tx_packets.fetch_add(packets, Ordering::Relaxed);
+                binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            Err(TxError::Retry(err)) => {
+                binding.live.set_error(err);
+                return true;
+            }
+            Err(TxError::Drop(err)) => {
+                binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+                binding.live.set_error(err);
+            }
+        }
+    }
     let mut pending = core::mem::take(&mut binding.pending_tx_local);
     let mut shared = binding.live.take_pending_tx();
     pending.append(&mut shared);
     if pending.is_empty() {
-        return false;
+        return did_work || !binding.pending_tx_prepared.is_empty();
     }
     let mut retry = VecDeque::new();
-    let mut did_work = false;
     while let Some(req) = pending.pop_front() {
         retry.push_back(req);
         if retry.len() >= TX_BATCH_SIZE || binding.free_tx_frames.is_empty() || pending.is_empty() {
@@ -2360,7 +2406,10 @@ fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
         retry.append(&mut binding.pending_tx_local);
         binding.pending_tx_local = retry;
     }
-    did_work || !binding.pending_tx_local.is_empty() || !binding.live.pending_tx_empty()
+    did_work
+        || !binding.pending_tx_prepared.is_empty()
+        || !binding.pending_tx_local.is_empty()
+        || !binding.live.pending_tx_empty()
 }
 
 enum TxError {
@@ -2435,6 +2484,53 @@ fn transmit_batch(
 
     // Reliability first: some mlx5/XSK paths do not consistently surface a
     // wakeup hint before the TX side needs a kick. Always kick after commit.
+    binding.tx.wake();
+    Ok((sent_packets, sent_bytes))
+}
+
+fn transmit_prepared_batch(binding: &mut BindingWorker) -> Result<(u64, u64), TxError> {
+    if binding.pending_tx_prepared.is_empty() {
+        return Ok((0, 0));
+    }
+    let batch_size = binding.pending_tx_prepared.len().min(TX_BATCH_SIZE);
+    let mut batch = Vec::with_capacity(batch_size);
+    while batch.len() < batch_size {
+        let Some(req) = binding.pending_tx_prepared.pop_front() else {
+            break;
+        };
+        batch.push(req);
+    }
+    if batch.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let mut writer = binding.tx.transmit(batch.len() as u32);
+    let inserted = writer.insert(batch.iter().map(|req| XdpDesc {
+        addr: req.offset,
+        len: req.len,
+        options: 0,
+    }));
+    writer.commit();
+    drop(writer);
+
+    if inserted == 0 {
+        while let Some(req) = batch.pop() {
+            binding.pending_tx_prepared.push_front(req);
+        }
+        return Err(TxError::Retry("prepared tx ring insert failed".to_string()));
+    }
+
+    let mut sent_packets = 0u64;
+    let mut sent_bytes = 0u64;
+    for (idx, req) in batch.into_iter().enumerate() {
+        if idx < inserted as usize {
+            sent_packets += 1;
+            sent_bytes += req.len as u64;
+        } else {
+            binding.pending_tx_prepared.push_front(req);
+        }
+    }
+
     binding.tx.wake();
     Ok((sent_packets, sent_bytes))
 }
