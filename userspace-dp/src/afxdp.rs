@@ -1301,6 +1301,7 @@ fn poll_binding(
     sessions: &mut SessionTable,
     validation: ValidationState,
     now_ns: u64,
+    now_secs: u64,
     forwarding: &ForwardingState,
     ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
@@ -1388,9 +1389,10 @@ fn poll_binding(
                             }
                             decision.resolution = redirect_via_fabric_if_needed(
                                 forwarding,
-                                enforce_ha_resolution(
+                                enforce_ha_resolution_at(
                                     forwarding,
                                     ha_state,
+                                    now_secs,
                                     lookup_forwarding_resolution_for_session(
                                         forwarding,
                                         dynamic_neighbors,
@@ -1454,9 +1456,10 @@ fn poll_binding(
                             let mut decision = replica.decision;
                             decision.resolution = redirect_via_fabric_if_needed(
                                 forwarding,
-                                enforce_ha_resolution(
+                                enforce_ha_resolution_at(
                                     forwarding,
                                     ha_state,
+                                    now_secs,
                                     lookup_forwarding_resolution_for_session(
                                         forwarding,
                                         dynamic_neighbors,
@@ -1506,6 +1509,7 @@ fn poll_binding(
                             dynamic_neighbors,
                             flow,
                             now_ns,
+                            now_secs,
                             meta.protocol,
                             meta.tcp_flags,
                         ) {
@@ -1520,9 +1524,10 @@ fn poll_binding(
                             let mut decision = repaired.decision;
                             decision.resolution = redirect_via_fabric_if_needed(
                                 forwarding,
-                                enforce_ha_resolution(
+                                enforce_ha_resolution_at(
                                     forwarding,
                                     ha_state,
+                                    now_secs,
                                     lookup_forwarding_resolution_for_session(
                                         forwarding,
                                         dynamic_neighbors,
@@ -1538,9 +1543,10 @@ fn poll_binding(
                             let resolution =
                                 interface_nat_local_resolution(forwarding, flow.dst_ip)
                                     .unwrap_or_else(|| {
-                                        enforce_ha_resolution(
+                                        enforce_ha_resolution_at(
                                             forwarding,
                                             ha_state,
+                                            now_secs,
                                             lookup_forwarding_resolution_with_dynamic(
                                                 forwarding,
                                                 dynamic_neighbors,
@@ -1622,9 +1628,10 @@ fn poll_binding(
                                             &forward_entry,
                                         );
                                     }
-                                    let reverse_resolution = enforce_ha_resolution(
+                                    let reverse_resolution = enforce_ha_resolution_at(
                                         forwarding,
                                         ha_state,
+                                        now_secs,
                                         lookup_forwarding_resolution_with_dynamic(
                                             forwarding,
                                             dynamic_neighbors,
@@ -1700,9 +1707,10 @@ fn poll_binding(
                         }
                     } else {
                         SessionDecision {
-                            resolution: enforce_ha_resolution(
+                            resolution: enforce_ha_resolution_at(
                                 forwarding,
                                 ha_state,
+                                now_secs,
                                 resolve_forwarding(
                                     &binding.area,
                                     desc,
@@ -3164,6 +3172,7 @@ fn repair_reverse_session_from_forward(
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     flow: &SessionFlow,
     now_ns: u64,
+    now_secs: u64,
     protocol: u8,
     tcp_flags: u8,
 ) -> Option<SessionLookup> {
@@ -3180,9 +3189,10 @@ fn repair_reverse_session_from_forward(
         })?;
 
     let reverse_decision = SessionDecision {
-        resolution: enforce_ha_resolution(
+        resolution: enforce_ha_resolution_at(
             forwarding,
             ha_state,
+            now_secs,
             lookup_forwarding_resolution_with_dynamic(
                 forwarding,
                 dynamic_neighbors,
@@ -3283,6 +3293,7 @@ fn worker_loop(
     while !stop.load(Ordering::Relaxed) {
         apply_worker_commands(&commands, &mut sessions);
         let loop_now_ns = monotonic_nanos();
+        let loop_now_secs = loop_now_ns / 1_000_000_000;
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
         let expired = sessions.expire_stale(loop_now_ns);
         if expired > 0 {
@@ -3309,6 +3320,7 @@ fn worker_loop(
                 &mut sessions,
                 validation,
                 loop_now_ns,
+                loop_now_secs,
                 &forwarding,
                 &ha_state,
                 &dynamic_neighbors,
@@ -3341,6 +3353,7 @@ fn worker_loop(
                 &mut sessions,
                 validation,
                 loop_now_ns,
+                loop_now_secs,
                 &forwarding,
                 &ha_state,
                 &dynamic_neighbors,
@@ -4122,6 +4135,20 @@ fn enforce_ha_resolution(
     ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     resolution: ForwardingResolution,
 ) -> ForwardingResolution {
+    enforce_ha_resolution_at(
+        forwarding,
+        ha_state,
+        monotonic_nanos() / 1_000_000_000,
+        resolution,
+    )
+}
+
+fn enforce_ha_resolution_at(
+    forwarding: &ForwardingState,
+    ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
+    now_secs: u64,
+    resolution: ForwardingResolution,
+) -> ForwardingResolution {
     if resolution.disposition != ForwardingDisposition::ForwardCandidate {
         return resolution;
     }
@@ -4142,7 +4169,6 @@ fn enforce_ha_resolution(
             ..resolution
         };
     }
-    let now_secs = monotonic_nanos() / 1_000_000_000;
     if group.watchdog_timestamp == 0
         || now_secs < group.watchdog_timestamp
         || now_secs.saturating_sub(group.watchdog_timestamp) > HA_WATCHDOG_STALE_AFTER_SECS
