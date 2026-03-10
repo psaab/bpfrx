@@ -815,6 +815,8 @@ enum PacketDisposition {
 struct ForwardingState {
     local_v4: Vec<Ipv4Addr>,
     local_v6: Vec<Ipv6Addr>,
+    interface_nat_v4: BTreeMap<Ipv4Addr, i32>,
+    interface_nat_v6: BTreeMap<Ipv6Addr, i32>,
     connected_v4: Vec<ConnectedRouteV4>,
     connected_v6: Vec<ConnectedRouteV6>,
     routes_v4: BTreeMap<String, Vec<RouteEntryV4>>,
@@ -1389,15 +1391,18 @@ fn poll_binding(
                         decision
                     } else {
                         binding.live.session_misses.fetch_add(1, Ordering::Relaxed);
-                        let resolution = enforce_ha_resolution(
-                            forwarding,
-                            ha_state,
-                            lookup_forwarding_resolution_with_dynamic(
-                                forwarding,
-                                dynamic_neighbors,
-                                flow.dst_ip,
-                            ),
-                        );
+                        let resolution = interface_nat_local_resolution(forwarding, flow.dst_ip)
+                            .unwrap_or_else(|| {
+                                enforce_ha_resolution(
+                                    forwarding,
+                                    ha_state,
+                                    lookup_forwarding_resolution_with_dynamic(
+                                        forwarding,
+                                        dynamic_neighbors,
+                                        flow.dst_ip,
+                                    ),
+                                )
+                            });
                         let mut decision = SessionDecision {
                             resolution,
                             nat: NatDecision::default(),
@@ -1853,7 +1858,7 @@ fn parse_session_flow(
         (Some(flow), None) | (None, Some(flow)) => return Some(flow),
         (None, None) => {}
     }
-    
+
     // Final defensive fallback for non-IPv4 paths that do not go through the
     // frame parser above.
     let l3 = meta.l3_offset as usize;
@@ -2982,7 +2987,9 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             };
             match net {
                 IpNet::V4(v4) => {
-                    if !excluded_local_v4.contains(&v4.addr()) {
+                    if excluded_local_v4.contains(&v4.addr()) {
+                        state.interface_nat_v4.insert(v4.addr(), iface.ifindex);
+                    } else {
                         state.local_v4.push(v4.addr());
                     }
                     state.connected_v4.push(ConnectedRouteV4 {
@@ -2991,7 +2998,9 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                     });
                 }
                 IpNet::V6(v6) => {
-                    if !excluded_local_v6.contains(&v6.addr()) {
+                    if excluded_local_v6.contains(&v6.addr()) {
+                        state.interface_nat_v6.insert(v6.addr(), iface.ifindex);
+                    } else {
                         state.local_v6.push(v6.addr());
                     }
                     state.connected_v6.push(ConnectedRouteV6 {
@@ -3637,6 +3646,42 @@ fn lookup_forwarding_resolution_inner(
             }
             lookup_forwarding_resolution_v6(state, dynamic_neighbors, ip, DEFAULT_V6_TABLE, 0)
         }
+    }
+}
+
+fn interface_nat_local_resolution(
+    state: &ForwardingState,
+    dst: IpAddr,
+) -> Option<ForwardingResolution> {
+    match dst {
+        IpAddr::V4(ip) => state
+            .interface_nat_v4
+            .get(&ip)
+            .copied()
+            .map(|local_ifindex| ForwardingResolution {
+                disposition: ForwardingDisposition::LocalDelivery,
+                local_ifindex,
+                egress_ifindex: local_ifindex,
+                tx_ifindex: local_ifindex,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            }),
+        IpAddr::V6(ip) => state
+            .interface_nat_v6
+            .get(&ip)
+            .copied()
+            .map(|local_ifindex| ForwardingResolution {
+                disposition: ForwardingDisposition::LocalDelivery,
+                local_ifindex,
+                egress_ifindex: local_ifindex,
+                tx_ifindex: local_ifindex,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            }),
     }
 }
 
@@ -5831,6 +5876,28 @@ mod tests {
             resolved_v6.disposition,
             ForwardingDisposition::LocalDelivery
         );
+    }
+
+    #[test]
+    fn interface_snat_addresses_are_local_delivered_on_session_miss() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let resolved_v4 =
+            interface_nat_local_resolution(&state, "172.16.80.8".parse().expect("v4"))
+                .expect("v4 nat local delivery");
+        assert_eq!(
+            resolved_v4.disposition,
+            ForwardingDisposition::LocalDelivery
+        );
+        assert_eq!(resolved_v4.local_ifindex, 12);
+
+        let resolved_v6 =
+            interface_nat_local_resolution(&state, "2001:559:8585:80::8".parse().expect("v6"))
+                .expect("v6 nat local delivery");
+        assert_eq!(
+            resolved_v6.disposition,
+            ForwardingDisposition::LocalDelivery
+        );
+        assert_eq!(resolved_v6.local_ifindex, 12);
     }
 
     #[test]
