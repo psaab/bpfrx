@@ -177,6 +177,13 @@ type Daemon struct {
 	// from a previous primary run keeping hosts dual-pathing traffic.
 	startupGoodbyeRA map[int]bool
 
+	// startupActiveAnnounce tracks whether the one-shot active-side
+	// neighbor refresh has been sent for each RG on this daemon run.
+	// This covers restart/redeploy of an already-active direct-mode RG,
+	// where VIP ownership does not transition and the normal failover
+	// GARP/NA path would not fire.
+	startupActiveAnnounce map[int]bool
+
 	// linkByNameFn resolves a network interface by name. Defaults to
 	// netlink.LinkByName; overridden in tests.
 	linkByNameFn func(string) (netlink.Link, error)
@@ -5867,6 +5874,24 @@ func (d *Daemon) reconcileRGState() {
 			} else if tr.Changed {
 				d.directRemoveVIPs(rgID)
 			}
+		}
+
+		// Startup active-side announce: after a daemon restart, an RG can
+		// remain active without any ownership transition. In direct mode
+		// that means no failover event fires to refresh downstream ARP/NDP
+		// caches, so LAN hosts can keep a failed gateway entry until they
+		// happen to relearn it. Re-announce once per daemon run.
+		if noRethVRRP && tr.Active && !d.startupActiveAnnounce[rgID] {
+			if d.startupActiveAnnounce == nil {
+				d.startupActiveAnnounce = make(map[int]bool)
+			}
+			d.startupActiveAnnounce[rgID] = true
+			go d.directSendGARPs(rgID)
+			go func() {
+				if cfg := d.store.ActiveConfig(); cfg != nil {
+					d.resolveNeighbors(cfg)
+				}
+			}()
 		}
 
 		// RA/DHCP service reconciliation (#93): safety net for dropped
