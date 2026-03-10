@@ -237,7 +237,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         return fallback_to_main(ctx);
     }
     if is_local_destination(&parsed) {
-        return fallback_to_main(ctx);
+        return Ok(xdp_action::XDP_PASS);
     }
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
