@@ -1627,13 +1627,20 @@ fn poll_binding(
     );
     received.release();
     if !recycle.is_empty() {
-        let mut fill = binding.device.fill(recycle.len() as u32);
-        let inserted = fill.insert(recycle.into_iter());
-        fill.commit();
+        let inserted = {
+            let mut fill = binding.device.fill(recycle.len() as u32);
+            let inserted = fill.insert(recycle.into_iter());
+            fill.commit();
+            inserted
+        };
         if inserted == 0 {
             binding
                 .live
                 .set_error("fill ring insert returned 0".to_string());
+        }
+        if binding.device.needs_wakeup() {
+            binding.device.wake();
+            binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
         }
     }
     binding
