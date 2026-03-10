@@ -360,6 +360,10 @@ fn open_tun(name: &str) -> Result<(std::fs::File, String), String> {
     }
     let actual_name = ifr.name_string();
     set_if_up(&actual_name)?;
+    // Slow-path injected IPv4 replies arrive on the TUN device, but their
+    // reverse route still points at the real egress interface. Disable
+    // per-device rp_filter so the kernel accepts those packets.
+    set_ipv4_sysctl(&actual_name, "rp_filter", "0")?;
     Ok((tun, actual_name))
 }
 
@@ -396,6 +400,11 @@ fn set_if_up(name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn set_ipv4_sysctl(iface: &str, key: &str, value: &str) -> Result<(), String> {
+    let path = format!("/proc/sys/net/ipv4/conf/{iface}/{key}");
+    std::fs::write(&path, value).map_err(|e| format!("write {path}: {e}"))
 }
 
 #[repr(C)]
