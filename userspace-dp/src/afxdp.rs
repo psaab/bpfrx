@@ -969,6 +969,7 @@ struct BindingWorker {
     rx: xdpilone::RingRx,
     tx: xdpilone::RingTx,
     free_tx_frames: VecDeque<u64>,
+    pending_fill_frames: VecDeque<u64>,
     heartbeat_map_fd: c_int,
     last_heartbeat_update: Instant,
 }
@@ -1113,6 +1114,7 @@ impl BindingWorker {
             rx,
             tx,
             free_tx_frames,
+            pending_fill_frames: VecDeque::new(),
             heartbeat_map_fd,
             last_heartbeat_update: Instant::now(),
         })
@@ -1188,6 +1190,7 @@ fn poll_binding(
     );
     let reaped = reap_tx_completions(binding);
     let tx_work = drain_pending_tx(binding);
+    let fill_work = drain_pending_fill(binding);
     if binding.device.needs_wakeup() {
         binding.device.wake();
         binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -1197,7 +1200,7 @@ fn poll_binding(
         if poll_stats {
             poll_kernel_stats(&binding.user, &binding.live);
         }
-        return reaped > 0 || tx_work;
+        return reaped > 0 || tx_work || fill_work;
     }
 
     let mut received = binding.rx.receive(available);
@@ -1626,22 +1629,10 @@ fn poll_binding(
         peer_worker_commands,
     );
     received.release();
+    drop(received);
     if !recycle.is_empty() {
-        let inserted = {
-            let mut fill = binding.device.fill(recycle.len() as u32);
-            let inserted = fill.insert(recycle.into_iter());
-            fill.commit();
-            inserted
-        };
-        if inserted == 0 {
-            binding
-                .live
-                .set_error("fill ring insert returned 0".to_string());
-        }
-        if binding.device.needs_wakeup() {
-            binding.device.wake();
-            binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
-        }
+        binding.pending_fill_frames.extend(recycle.into_iter());
+        let _ = drain_pending_fill(binding);
     }
     binding
         .live
@@ -2261,6 +2252,48 @@ fn reap_tx_completions(binding: &mut BindingWorker) -> u32 {
     }
     completed.release();
     reaped
+}
+
+fn drain_pending_fill(binding: &mut BindingWorker) -> bool {
+    if binding.pending_fill_frames.is_empty() {
+        return false;
+    }
+    let batch_size = binding.pending_fill_frames.len().min(RX_BATCH_SIZE as usize);
+    let mut batch = Vec::with_capacity(batch_size);
+    while batch.len() < batch_size {
+        let Some(offset) = binding.pending_fill_frames.pop_front() else {
+            break;
+        };
+        batch.push(offset);
+    }
+    if batch.is_empty() {
+        return false;
+    }
+    let inserted = {
+        let mut fill = binding.device.fill(batch.len() as u32);
+        let inserted = fill.insert(batch.iter().copied());
+        fill.commit();
+        inserted
+    };
+    if inserted == 0 {
+        for offset in batch.into_iter().rev() {
+            binding.pending_fill_frames.push_front(offset);
+        }
+        binding
+            .live
+            .set_error("fill ring insert returned 0".to_string());
+        return !binding.pending_fill_frames.is_empty();
+    }
+    if inserted < batch.len() as u32 {
+        for offset in batch.into_iter().skip(inserted as usize).rev() {
+            binding.pending_fill_frames.push_front(offset);
+        }
+    }
+    if binding.device.needs_wakeup() {
+        binding.device.wake();
+        binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
+    }
+    true
 }
 
 fn drain_pending_tx(binding: &mut BindingWorker) -> bool {
