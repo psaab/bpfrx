@@ -1,4 +1,5 @@
 mod afxdp;
+mod session;
 mod slowpath;
 mod state_writer;
 
@@ -409,6 +410,14 @@ struct BindingStatus {
     fib_gen_mismatches: u64,
     #[serde(rename = "unsupported_packets", default)]
     unsupported_packets: u64,
+    #[serde(rename = "session_hits", default)]
+    session_hits: u64,
+    #[serde(rename = "session_misses", default)]
+    session_misses: u64,
+    #[serde(rename = "session_creates", default)]
+    session_creates: u64,
+    #[serde(rename = "session_expires", default)]
+    session_expires: u64,
     #[serde(rename = "slow_path_packets", default)]
     slow_path_packets: u64,
     #[serde(rename = "slow_path_bytes", default)]

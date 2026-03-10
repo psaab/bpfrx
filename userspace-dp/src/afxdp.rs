@@ -2,6 +2,7 @@ use super::{
     BindingStatus, ConfigSnapshot, ExceptionStatus, InjectPacketRequest, InterfaceSnapshot,
     PacketResolution,
 };
+use crate::session::{SessionKey, SessionTable};
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus};
 use chrono::Utc;
 use core::ffi::{c_int, c_void};
@@ -33,6 +34,10 @@ const MAX_RECENT_EXCEPTIONS: usize = 32;
 const BIND_RETRY_ATTEMPTS: usize = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
+const PROTO_TCP: u8 = 6;
+const PROTO_UDP: u8 = 17;
+const PROTO_ICMP: u8 = 1;
+const PROTO_ICMPV6: u8 = 58;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -174,6 +179,10 @@ impl Coordinator {
             binding.config_gen_mismatches = 0;
             binding.fib_gen_mismatches = 0;
             binding.unsupported_packets = 0;
+            binding.session_hits = 0;
+            binding.session_misses = 0;
+            binding.session_creates = 0;
+            binding.session_expires = 0;
             binding.slow_path_packets = 0;
             binding.slow_path_bytes = 0;
             binding.slow_path_drops = 0;
@@ -553,6 +562,10 @@ impl Coordinator {
                 binding.config_gen_mismatches = snap.config_gen_mismatches;
                 binding.fib_gen_mismatches = snap.fib_gen_mismatches;
                 binding.unsupported_packets = snap.unsupported_packets;
+                binding.session_hits = snap.session_hits;
+                binding.session_misses = snap.session_misses;
+                binding.session_creates = snap.session_creates;
+                binding.session_expires = snap.session_expires;
                 binding.slow_path_packets = snap.slow_path_packets;
                 binding.slow_path_bytes = snap.slow_path_bytes;
                 binding.slow_path_drops = snap.slow_path_drops;
@@ -590,6 +603,10 @@ impl Coordinator {
                 binding.config_gen_mismatches = 0;
                 binding.fib_gen_mismatches = 0;
                 binding.unsupported_packets = 0;
+                binding.session_hits = 0;
+                binding.session_misses = 0;
+                binding.session_creates = 0;
+                binding.session_expires = 0;
                 binding.slow_path_packets = 0;
                 binding.slow_path_bytes = 0;
                 binding.slow_path_drops = 0;
@@ -696,7 +713,7 @@ struct EgressInterface {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ForwardingDisposition {
+pub(crate) enum ForwardingDisposition {
     LocalDelivery,
     ForwardCandidate,
     NoRoute,
@@ -706,12 +723,12 @@ enum ForwardingDisposition {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ForwardingResolution {
-    disposition: ForwardingDisposition,
-    local_ifindex: i32,
-    egress_ifindex: i32,
-    next_hop: Option<IpAddr>,
-    neighbor_mac: Option<[u8; 6]>,
+pub(crate) struct ForwardingResolution {
+    pub(crate) disposition: ForwardingDisposition,
+    pub(crate) local_ifindex: i32,
+    pub(crate) egress_ifindex: i32,
+    pub(crate) next_hop: Option<IpAddr>,
+    pub(crate) neighbor_mac: Option<[u8; 6]>,
 }
 
 impl ForwardingResolution {
@@ -763,6 +780,14 @@ struct BindingIdentity {
     worker_id: u32,
     interface: String,
     ifindex: i32,
+}
+
+#[derive(Clone, Debug)]
+struct SessionFlow {
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    forward_key: SessionKey,
+    reverse_key: SessionKey,
 }
 
 #[derive(Clone, Debug)]
@@ -880,6 +905,7 @@ fn bind_user_with_retry(
 fn poll_binding(
     binding_index: usize,
     bindings: &mut [BindingWorker],
+    sessions: &mut SessionTable,
     validation: ValidationState,
     forwarding: &ForwardingState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
@@ -893,6 +919,13 @@ fn poll_binding(
     };
     let ident = binding.identity();
     maybe_touch_heartbeat(binding);
+    let expired = sessions.expire_stale(Instant::now());
+    if expired > 0 {
+        binding
+            .live
+            .session_expires
+            .fetch_add(expired, Ordering::Relaxed);
+    }
     reap_tx_completions(binding);
     drain_pending_tx(binding);
     if binding.device.needs_wakeup() {
@@ -929,7 +962,53 @@ fn poll_binding(
                 recent_exceptions,
             );
             if disposition == PacketDisposition::Valid {
-                let resolution = resolve_forwarding(&binding.area, desc, meta, forwarding);
+                let flow = parse_session_flow(&binding.area, desc, meta);
+                let resolution = if let Some(flow) = flow.as_ref() {
+                    let now = Instant::now();
+                    if let Some(hit) = sessions.lookup(&flow.forward_key, now, meta.tcp_flags) {
+                        binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
+                        hit
+                    } else {
+                        binding.live.session_misses.fetch_add(1, Ordering::Relaxed);
+                        let resolution = lookup_forwarding_resolution(forwarding, flow.dst_ip);
+                        if resolution.disposition == ForwardingDisposition::ForwardCandidate {
+                            let mut created = 0u64;
+                            if sessions.install_with_protocol(
+                                flow.forward_key.clone(),
+                                resolution,
+                                now,
+                                meta.protocol,
+                                meta.tcp_flags,
+                            ) {
+                                created += 1;
+                            }
+                            let reverse_resolution =
+                                lookup_forwarding_resolution(forwarding, flow.src_ip);
+                            if reverse_resolution.disposition
+                                == ForwardingDisposition::ForwardCandidate
+                            {
+                                if sessions.install_with_protocol(
+                                    flow.reverse_key.clone(),
+                                    reverse_resolution,
+                                    now,
+                                    meta.protocol,
+                                    meta.tcp_flags,
+                                ) {
+                                    created += 1;
+                                }
+                            }
+                            if created > 0 {
+                                binding
+                                    .live
+                                    .session_creates
+                                    .fetch_add(created, Ordering::Relaxed);
+                            }
+                        }
+                        resolution
+                    }
+                } else {
+                    resolve_forwarding(&binding.area, desc, meta, forwarding)
+                };
                 record_forwarding_disposition(
                     &ident,
                     &binding.live,
@@ -1149,6 +1228,107 @@ fn extract_l3_packet(area: &MmapArea, desc: XdpDesc, meta: UserspaceDpMeta) -> O
         return None;
     }
     Some(frame[l3..].to_vec())
+}
+
+fn parse_session_flow(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+) -> Option<SessionFlow> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    let l3 = meta.l3_offset as usize;
+    let l4 = meta.l4_offset as usize;
+    match meta.addr_family as i32 {
+        libc::AF_INET => {
+            if frame.len() < l3 + 20 || frame.len() < l4 {
+                return None;
+            }
+            let src_ip = IpAddr::V4(Ipv4Addr::new(
+                frame[l3 + 12],
+                frame[l3 + 13],
+                frame[l3 + 14],
+                frame[l3 + 15],
+            ));
+            let dst_ip = IpAddr::V4(Ipv4Addr::new(
+                frame[l3 + 16],
+                frame[l3 + 17],
+                frame[l3 + 18],
+                frame[l3 + 19],
+            ));
+            let (src_port, dst_port) = parse_flow_ports(frame, l4, meta.protocol)?;
+            Some(SessionFlow {
+                src_ip,
+                dst_ip,
+                forward_key: SessionKey {
+                    addr_family: meta.addr_family,
+                    protocol: meta.protocol,
+                    src_ip,
+                    dst_ip,
+                    src_port,
+                    dst_port,
+                },
+                reverse_key: SessionKey {
+                    addr_family: meta.addr_family,
+                    protocol: meta.protocol,
+                    src_ip: dst_ip,
+                    dst_ip: src_ip,
+                    src_port: dst_port,
+                    dst_port: src_port,
+                },
+            })
+        }
+        libc::AF_INET6 => {
+            if frame.len() < l3 + 40 || frame.len() < l4 {
+                return None;
+            }
+            let src_ip = IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[l3 + 8..l3 + 24]).ok()?,
+            ));
+            let dst_ip = IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[l3 + 24..l3 + 40]).ok()?,
+            ));
+            let (src_port, dst_port) = parse_flow_ports(frame, l4, meta.protocol)?;
+            Some(SessionFlow {
+                src_ip,
+                dst_ip,
+                forward_key: SessionKey {
+                    addr_family: meta.addr_family,
+                    protocol: meta.protocol,
+                    src_ip,
+                    dst_ip,
+                    src_port,
+                    dst_port,
+                },
+                reverse_key: SessionKey {
+                    addr_family: meta.addr_family,
+                    protocol: meta.protocol,
+                    src_ip: dst_ip,
+                    dst_ip: src_ip,
+                    src_port: dst_port,
+                    dst_port: src_port,
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_flow_ports(frame: &[u8], l4: usize, protocol: u8) -> Option<(u16, u16)> {
+    match protocol {
+        PROTO_TCP | PROTO_UDP => {
+            let bytes = frame.get(l4..l4 + 4)?;
+            Some((
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                u16::from_be_bytes([bytes[2], bytes[3]]),
+            ))
+        }
+        PROTO_ICMP | PROTO_ICMPV6 => {
+            let bytes = frame.get(l4 + 4..l4 + 6)?;
+            let ident = u16::from_be_bytes([bytes[0], bytes[1]]);
+            Some((ident, 0))
+        }
+        _ => None,
+    }
 }
 
 fn find_target_live(
@@ -1390,6 +1570,7 @@ fn worker_loop(
     heartbeat: Arc<AtomicI64>,
 ) {
     pin_current_thread(worker_id);
+    let mut sessions = SessionTable::new();
     let mut bindings = Vec::with_capacity(binding_plans.len());
     for plan in binding_plans {
         match BindingWorker::create(
@@ -1412,6 +1593,7 @@ fn worker_loop(
             if poll_binding(
                 idx,
                 &mut bindings,
+                &mut sessions,
                 validation,
                 &forwarding,
                 slow_path.as_ref(),
@@ -2628,6 +2810,10 @@ struct BindingLiveState {
     config_gen_mismatches: AtomicU64,
     fib_gen_mismatches: AtomicU64,
     unsupported_packets: AtomicU64,
+    session_hits: AtomicU64,
+    session_misses: AtomicU64,
+    session_creates: AtomicU64,
+    session_expires: AtomicU64,
     slow_path_packets: AtomicU64,
     slow_path_bytes: AtomicU64,
     slow_path_drops: AtomicU64,
@@ -2666,6 +2852,10 @@ impl BindingLiveState {
             config_gen_mismatches: AtomicU64::new(0),
             fib_gen_mismatches: AtomicU64::new(0),
             unsupported_packets: AtomicU64::new(0),
+            session_hits: AtomicU64::new(0),
+            session_misses: AtomicU64::new(0),
+            session_creates: AtomicU64::new(0),
+            session_expires: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
             slow_path_bytes: AtomicU64::new(0),
             slow_path_drops: AtomicU64::new(0),
@@ -2729,6 +2919,10 @@ impl BindingLiveState {
             config_gen_mismatches: self.config_gen_mismatches.load(Ordering::Relaxed),
             fib_gen_mismatches: self.fib_gen_mismatches.load(Ordering::Relaxed),
             unsupported_packets: self.unsupported_packets.load(Ordering::Relaxed),
+            session_hits: self.session_hits.load(Ordering::Relaxed),
+            session_misses: self.session_misses.load(Ordering::Relaxed),
+            session_creates: self.session_creates.load(Ordering::Relaxed),
+            session_expires: self.session_expires.load(Ordering::Relaxed),
             slow_path_packets: self.slow_path_packets.load(Ordering::Relaxed),
             slow_path_bytes: self.slow_path_bytes.load(Ordering::Relaxed),
             slow_path_drops: self.slow_path_drops.load(Ordering::Relaxed),
@@ -2787,6 +2981,10 @@ struct BindingLiveSnapshot {
     config_gen_mismatches: u64,
     fib_gen_mismatches: u64,
     unsupported_packets: u64,
+    session_hits: u64,
+    session_misses: u64,
+    session_creates: u64,
+    session_expires: u64,
     slow_path_packets: u64,
     slow_path_bytes: u64,
     slow_path_drops: u64,

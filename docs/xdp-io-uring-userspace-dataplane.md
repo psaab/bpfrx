@@ -735,6 +735,8 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
   into the userspace snapshot contract
 - the Rust helper now has a bounded TUN-backed slow path for local-delivery and
   selected exception traffic, with explicit rate limits and helper-visible status counters
+- the Rust helper now has an initial per-worker session table for routed no-NAT traffic,
+  including bidirectional keying, lazy expiry, and cached forwarding resolution reuse
 
 What is still intentionally not implemented:
 
@@ -824,6 +826,7 @@ Implemented today:
 - AF_XDP socket lifecycle/bootstrap
 - binding/queue planning
 - narrow stateless live-forward path for supported routed traffic
+- initial per-worker session tracking and cached forwarding resolution reuse
 - bounded TUN slow-path reinjection for local-delivery and selected exception traffic
 - synthetic packet validation path
 
@@ -839,7 +842,18 @@ For userspace, the right model is:
 - worker-local expiry wheels
 - batched aggregation to control plane
 
-Status: not implemented.
+Status: partially implemented.
+
+Implemented today:
+- per-worker session lookup/create/update scaffold for routed no-NAT traffic
+- bidirectional session key installation
+- lazy expiry and session counters in helper status
+
+Not implemented yet:
+- NAT-aware session state
+- policy-aware session create/deny
+- HA/session-sync export from worker-local state
+- worker-local timer wheels or batched expiry structures beyond lazy GC
 
 ## Phase 5: Use io_uring for the non-AF_XDP parts
 

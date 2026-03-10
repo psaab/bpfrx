@@ -216,6 +216,10 @@ type BindingStatus struct {
 	ConfigGenMismatches  uint64    `json:"config_gen_mismatches,omitempty"`
 	FIBGenMismatches     uint64    `json:"fib_gen_mismatches,omitempty"`
 	UnsupportedPackets   uint64    `json:"unsupported_packets,omitempty"`
+	SessionHits          uint64    `json:"session_hits,omitempty"`
+	SessionMisses        uint64    `json:"session_misses,omitempty"`
+	SessionCreates       uint64    `json:"session_creates,omitempty"`
+	SessionExpires       uint64    `json:"session_expires,omitempty"`
 	SlowPathPackets      uint64    `json:"slow_path_packets,omitempty"`
 	SlowPathBytes        uint64    `json:"slow_path_bytes,omitempty"`
 	SlowPathDrops        uint64    `json:"slow_path_drops,omitempty"`
