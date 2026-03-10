@@ -31,12 +31,13 @@ const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
 const USERSPACE_META_VERSION: u16 = 3;
 const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
-const RX_BATCH_SIZE: u32 = 128;
+const RX_BATCH_SIZE: u32 = 256;
 const MIN_RESERVED_TX_FRAMES: u32 = 64;
 const MAX_RESERVED_TX_FRAMES: u32 = 512;
-const TX_BATCH_SIZE: usize = 128;
-const FILL_BATCH_SIZE: usize = 512;
+const TX_BATCH_SIZE: usize = 256;
+const FILL_BATCH_SIZE: usize = 1024;
 const FILL_DRAIN_WATERMARK: usize = 64;
+const MAX_RX_BATCHES_PER_POLL: usize = 4;
 const XSK_BIND_FLAGS_FALLBACK: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP;
 const XSK_BIND_FLAGS_PREFERRED: u16 =
     SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY;
@@ -1291,473 +1292,485 @@ fn poll_binding(
     let reaped = reap_tx_completions(binding);
     let tx_work = drain_pending_tx(binding);
     let fill_work = drain_pending_fill(binding);
-    if binding.device.needs_wakeup() {
-        binding.device.wake();
-        binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
-    }
-    let available = binding.rx.available().min(RX_BATCH_SIZE);
-    if available == 0 {
-        if poll_stats {
-            poll_kernel_stats(&binding.user, &binding.live);
+    let mut did_work = reaped > 0 || tx_work || fill_work;
+    for _ in 0..MAX_RX_BATCHES_PER_POLL {
+        let available = binding.rx.available().min(RX_BATCH_SIZE);
+        if available == 0 {
+            if binding.device.needs_wakeup() {
+                binding.device.wake();
+                binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
+            }
+            if poll_stats {
+                poll_kernel_stats(&binding.user, &binding.live);
+            }
+            return did_work;
         }
-        return reaped > 0 || tx_work || fill_work;
-    }
 
-    let mut received = binding.rx.receive(available);
-    let mut recycle = Vec::with_capacity(available as usize);
-    let mut pending_forwards = Vec::with_capacity(available as usize);
-    let mut batch_packets = 0u64;
-    let mut batch_bytes = 0u64;
-    while let Some(desc) = received.read() {
-        batch_packets += 1;
-        batch_bytes += desc.len as u64;
-        let mut recycle_now = true;
-        if let Some(meta) = try_parse_metadata(&binding.area, desc) {
-            binding
-                .live
-                .metadata_packets
-                .fetch_add(1, Ordering::Relaxed);
-            let disposition = classify_metadata(meta, validation);
-            record_disposition(
-                &ident,
-                &binding.live,
-                disposition,
-                desc.len as u32,
-                Some(meta),
-                recent_exceptions,
-            );
-            if disposition == PacketDisposition::Valid {
-                let flow = parse_session_flow(&binding.area, desc, meta);
-                if let Some(flow) = flow.as_ref() {
-                    learn_dynamic_neighbor_from_packet(
-                        &binding.area,
-                        desc,
-                        meta,
-                        flow.src_ip,
-                        forwarding,
-                        dynamic_neighbors,
-                    );
-                }
-                let ingress_zone_override =
-                    parse_zone_encoded_fabric_ingress(&binding.area, desc, meta, forwarding);
-                let mut debug = flow
-                    .as_ref()
-                    .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
-                let decision = if let Some(flow) = flow.as_ref() {
-                    let now = Instant::now();
-                    if let Some(hit) = sessions.lookup(&flow.forward_key, now, meta.tcp_flags) {
-                        binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
-                        let mut decision = hit.decision;
-                        if let Some(debug) = debug.as_mut() {
-                            debug.from_zone = hit.metadata.ingress_zone.clone();
-                            debug.to_zone = hit.metadata.egress_zone.clone();
-                        }
-                        decision.resolution = redirect_via_fabric_if_needed(
+        let mut received = binding.rx.receive(available);
+        let mut recycle = Vec::with_capacity(available as usize);
+        let mut pending_forwards = Vec::with_capacity(available as usize);
+        let mut batch_packets = 0u64;
+        let mut batch_bytes = 0u64;
+        while let Some(desc) = received.read() {
+            batch_packets += 1;
+            batch_bytes += desc.len as u64;
+            let mut recycle_now = true;
+            if let Some(meta) = try_parse_metadata(&binding.area, desc) {
+                binding
+                    .live
+                    .metadata_packets
+                    .fetch_add(1, Ordering::Relaxed);
+                let disposition = classify_metadata(meta, validation);
+                record_disposition(
+                    &ident,
+                    &binding.live,
+                    disposition,
+                    desc.len as u32,
+                    Some(meta),
+                    recent_exceptions,
+                );
+                if disposition == PacketDisposition::Valid {
+                    let flow = parse_session_flow(&binding.area, desc, meta);
+                    if let Some(flow) = flow.as_ref() {
+                        learn_dynamic_neighbor_from_packet(
+                            &binding.area,
+                            desc,
+                            meta,
+                            flow.src_ip,
                             forwarding,
-                            enforce_ha_resolution(
+                            dynamic_neighbors,
+                        );
+                    }
+                    let ingress_zone_override =
+                        parse_zone_encoded_fabric_ingress(&binding.area, desc, meta, forwarding);
+                    let mut debug = flow
+                        .as_ref()
+                        .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
+                    let decision = if let Some(flow) = flow.as_ref() {
+                        let now = Instant::now();
+                        if let Some(hit) = sessions.lookup(&flow.forward_key, now, meta.tcp_flags) {
+                            binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
+                            let mut decision = hit.decision;
+                            if let Some(debug) = debug.as_mut() {
+                                debug.from_zone = hit.metadata.ingress_zone.clone();
+                                debug.to_zone = hit.metadata.egress_zone.clone();
+                            }
+                            decision.resolution = redirect_via_fabric_if_needed(
                                 forwarding,
-                                ha_state,
-                                lookup_forwarding_resolution_for_session(
-                                    forwarding,
-                                    dynamic_neighbors,
-                                    flow,
-                                    decision,
-                                ),
-                            ),
-                            meta.ingress_ifindex as i32,
-                        );
-                        if hit.metadata.synced
-                            && decision.resolution.disposition
-                                == ForwardingDisposition::ForwardCandidate
-                        {
-                            let mut promoted = hit.metadata.clone();
-                            promoted.synced = false;
-                            if promoted.owner_rg_id <= 0 {
-                                promoted.owner_rg_id = owner_rg_for_flow(
-                                    forwarding,
-                                    decision.resolution.egress_ifindex,
-                                );
-                            }
-                            if sessions.promote_synced(
-                                &flow.forward_key,
-                                decision,
-                                promoted.clone(),
-                                now,
-                                meta.protocol,
-                                meta.tcp_flags,
-                            ) {
-                                let promoted_entry = SyncedSessionEntry {
-                                    key: flow.forward_key.clone(),
-                                    decision,
-                                    metadata: promoted,
-                                    protocol: meta.protocol,
-                                    tcp_flags: meta.tcp_flags,
-                                };
-                                publish_shared_session(shared_sessions, &promoted_entry);
-                                replicate_session_upsert(peer_worker_commands, &promoted_entry);
-                            }
-                        }
-                        decision
-                    } else if let Some(shared) =
-                        lookup_shared_session(shared_sessions, &flow.forward_key)
-                    {
-                        binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
-                        let replica = synced_replica_entry(&shared);
-                        sessions.upsert_synced(
-                            replica.key.clone(),
-                            replica.decision,
-                            replica.metadata.clone(),
-                            now,
-                            replica.protocol,
-                            meta.tcp_flags,
-                        );
-                        if let Some(debug) = debug.as_mut() {
-                            debug.from_zone = replica.metadata.ingress_zone.clone();
-                            debug.to_zone = replica.metadata.egress_zone.clone();
-                        }
-                        let mut decision = replica.decision;
-                        decision.resolution = redirect_via_fabric_if_needed(
-                            forwarding,
-                            enforce_ha_resolution(
-                                forwarding,
-                                ha_state,
-                                lookup_forwarding_resolution_for_session(
-                                    forwarding,
-                                    dynamic_neighbors,
-                                    flow,
-                                    decision,
-                                ),
-                            ),
-                            meta.ingress_ifindex as i32,
-                        );
-                        if decision.resolution.disposition
-                            == ForwardingDisposition::ForwardCandidate
-                        {
-                            let mut promoted = replica.metadata.clone();
-                            promoted.synced = false;
-                            if promoted.owner_rg_id <= 0 {
-                                promoted.owner_rg_id = owner_rg_for_flow(
-                                    forwarding,
-                                    decision.resolution.egress_ifindex,
-                                );
-                            }
-                            if sessions.promote_synced(
-                                &flow.forward_key,
-                                decision,
-                                promoted.clone(),
-                                now,
-                                meta.protocol,
-                                meta.tcp_flags,
-                            ) {
-                                let promoted_entry = SyncedSessionEntry {
-                                    key: flow.forward_key.clone(),
-                                    decision,
-                                    metadata: promoted,
-                                    protocol: meta.protocol,
-                                    tcp_flags: meta.tcp_flags,
-                                };
-                                publish_shared_session(shared_sessions, &promoted_entry);
-                                replicate_session_upsert(peer_worker_commands, &promoted_entry);
-                            }
-                        }
-                        decision
-                    } else if let Some(repaired) = repair_reverse_session_from_forward(
-                        sessions,
-                        shared_sessions,
-                        peer_worker_commands,
-                        forwarding,
-                        ha_state,
-                        dynamic_neighbors,
-                        flow,
-                        now,
-                        meta.protocol,
-                        meta.tcp_flags,
-                    ) {
-                        binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
-                        binding.live.session_creates.fetch_add(1, Ordering::Relaxed);
-                        if let Some(debug) = debug.as_mut() {
-                            debug.from_zone = repaired.metadata.ingress_zone.clone();
-                            debug.to_zone = repaired.metadata.egress_zone.clone();
-                        }
-                        let mut decision = repaired.decision;
-                        decision.resolution = redirect_via_fabric_if_needed(
-                            forwarding,
-                            enforce_ha_resolution(
-                                forwarding,
-                                ha_state,
-                                lookup_forwarding_resolution_for_session(
-                                    forwarding,
-                                    dynamic_neighbors,
-                                    flow,
-                                    decision,
-                                ),
-                            ),
-                            meta.ingress_ifindex as i32,
-                        );
-                        decision
-                    } else {
-                        binding.live.session_misses.fetch_add(1, Ordering::Relaxed);
-                        let resolution = interface_nat_local_resolution(forwarding, flow.dst_ip)
-                            .unwrap_or_else(|| {
                                 enforce_ha_resolution(
                                     forwarding,
                                     ha_state,
-                                    lookup_forwarding_resolution_with_dynamic(
+                                    lookup_forwarding_resolution_for_session(
                                         forwarding,
                                         dynamic_neighbors,
-                                        flow.dst_ip,
+                                        flow,
+                                        decision,
                                     ),
-                                )
-                            });
-                        let mut decision = SessionDecision {
-                            resolution,
-                            nat: NatDecision::default(),
-                        };
-                        if let Some(debug) = debug.as_mut() {
-                            let (from_zone, to_zone) = zone_pair_for_flow_with_override(
-                                forwarding,
+                                ),
                                 meta.ingress_ifindex as i32,
-                                ingress_zone_override.as_deref(),
-                                resolution.egress_ifindex,
                             );
-                            debug.from_zone = from_zone;
-                            debug.to_zone = to_zone;
-                        }
-                        if resolution.disposition == ForwardingDisposition::ForwardCandidate {
-                            let (from_zone, to_zone) = zone_pair_for_flow_with_override(
-                                forwarding,
-                                meta.ingress_ifindex as i32,
-                                ingress_zone_override.as_deref(),
-                                resolution.egress_ifindex,
-                            );
-                            let owner_rg_id =
-                                owner_rg_for_flow(forwarding, resolution.egress_ifindex);
-                            if allow_unsolicited_dns_reply(forwarding, flow) {
-                                // Match the XDP fast path: unsolicited DNS replies bypass
-                                // policy/session install when the flow knob is enabled.
-                            } else if let PolicyAction::Permit = evaluate_policy(
-                                &forwarding.policy,
-                                &from_zone,
-                                &to_zone,
-                                flow.src_ip,
-                                flow.dst_ip,
-                                flow.forward_key.protocol,
-                                flow.forward_key.src_port,
-                                flow.forward_key.dst_port,
-                            ) {
-                                decision.nat = match_source_nat_for_flow(
-                                    forwarding,
-                                    &from_zone,
-                                    &to_zone,
-                                    resolution.egress_ifindex,
-                                    flow,
-                                )
-                                .unwrap_or_default();
-                                let mut created = 0u64;
-                                let forward_metadata = SessionMetadata {
-                                    ingress_zone: from_zone.clone(),
-                                    egress_zone: to_zone.clone(),
-                                    owner_rg_id,
-                                    is_reverse: false,
-                                    synced: false,
-                                };
-                                if sessions.install_with_protocol(
-                                    flow.forward_key.clone(),
+                            if hit.metadata.synced
+                                && decision.resolution.disposition
+                                    == ForwardingDisposition::ForwardCandidate
+                            {
+                                let mut promoted = hit.metadata.clone();
+                                promoted.synced = false;
+                                if promoted.owner_rg_id <= 0 {
+                                    promoted.owner_rg_id = owner_rg_for_flow(
+                                        forwarding,
+                                        decision.resolution.egress_ifindex,
+                                    );
+                                }
+                                if sessions.promote_synced(
+                                    &flow.forward_key,
                                     decision,
-                                    forward_metadata.clone(),
+                                    promoted.clone(),
                                     now,
                                     meta.protocol,
                                     meta.tcp_flags,
                                 ) {
-                                    created += 1;
-                                    let forward_entry = SyncedSessionEntry {
+                                    let promoted_entry = SyncedSessionEntry {
                                         key: flow.forward_key.clone(),
                                         decision,
-                                        metadata: forward_metadata,
+                                        metadata: promoted,
                                         protocol: meta.protocol,
                                         tcp_flags: meta.tcp_flags,
                                     };
-                                    publish_shared_session(shared_sessions, &forward_entry);
-                                    replicate_session_upsert(peer_worker_commands, &forward_entry);
+                                    publish_shared_session(shared_sessions, &promoted_entry);
+                                    replicate_session_upsert(peer_worker_commands, &promoted_entry);
                                 }
-                                let reverse_resolution = enforce_ha_resolution(
+                            }
+                            decision
+                        } else if let Some(shared) =
+                            lookup_shared_session(shared_sessions, &flow.forward_key)
+                        {
+                            binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
+                            let replica = synced_replica_entry(&shared);
+                            sessions.upsert_synced(
+                                replica.key.clone(),
+                                replica.decision,
+                                replica.metadata.clone(),
+                                now,
+                                replica.protocol,
+                                meta.tcp_flags,
+                            );
+                            if let Some(debug) = debug.as_mut() {
+                                debug.from_zone = replica.metadata.ingress_zone.clone();
+                                debug.to_zone = replica.metadata.egress_zone.clone();
+                            }
+                            let mut decision = replica.decision;
+                            decision.resolution = redirect_via_fabric_if_needed(
+                                forwarding,
+                                enforce_ha_resolution(
                                     forwarding,
                                     ha_state,
-                                    lookup_forwarding_resolution_with_dynamic(
+                                    lookup_forwarding_resolution_for_session(
                                         forwarding,
                                         dynamic_neighbors,
-                                        flow.src_ip,
+                                        flow,
+                                        decision,
                                     ),
-                                );
-                                // Install the reverse entry even if the initial reply-side
-                                // resolution is not immediately usable. On live traffic the
-                                // first server reply can arrive before the reverse neighbor
-                                // state has converged on every worker, and dropping the reverse
-                                // entry creation turns that race into a hard policy miss. The
-                                // hit path re-resolves on demand and can fall back to the
-                                // cached decision when neighbor convergence is still in flight.
-                                let reverse_decision = SessionDecision {
-                                    resolution: reverse_resolution,
-                                    nat: decision.nat.reverse(flow.src_ip, flow.dst_ip),
-                                };
-                                let reverse_key = flow.reverse_key_with_nat(decision.nat);
-                                let reverse_metadata = SessionMetadata {
-                                    ingress_zone: to_zone.clone(),
-                                    egress_zone: from_zone.clone(),
-                                    owner_rg_id,
-                                    is_reverse: true,
-                                    synced: false,
-                                };
-                                if sessions.install_with_protocol(
-                                    reverse_key.clone(),
-                                    reverse_decision,
-                                    reverse_metadata.clone(),
+                                ),
+                                meta.ingress_ifindex as i32,
+                            );
+                            if decision.resolution.disposition
+                                == ForwardingDisposition::ForwardCandidate
+                            {
+                                let mut promoted = replica.metadata.clone();
+                                promoted.synced = false;
+                                if promoted.owner_rg_id <= 0 {
+                                    promoted.owner_rg_id = owner_rg_for_flow(
+                                        forwarding,
+                                        decision.resolution.egress_ifindex,
+                                    );
+                                }
+                                if sessions.promote_synced(
+                                    &flow.forward_key,
+                                    decision,
+                                    promoted.clone(),
                                     now,
                                     meta.protocol,
                                     meta.tcp_flags,
                                 ) {
-                                    created += 1;
-                                    let reverse_entry = SyncedSessionEntry {
-                                        key: reverse_key,
-                                        decision: reverse_decision,
-                                        metadata: reverse_metadata,
+                                    let promoted_entry = SyncedSessionEntry {
+                                        key: flow.forward_key.clone(),
+                                        decision,
+                                        metadata: promoted,
                                         protocol: meta.protocol,
                                         tcp_flags: meta.tcp_flags,
                                     };
-                                    publish_shared_session(shared_sessions, &reverse_entry);
-                                    replicate_session_upsert(peer_worker_commands, &reverse_entry);
-                                }
-                                if created > 0 {
-                                    binding
-                                        .live
-                                        .session_creates
-                                        .fetch_add(created, Ordering::Relaxed);
-                                }
-                            } else {
-                                decision.resolution.disposition =
-                                    ForwardingDisposition::PolicyDenied;
-                            }
-                        } else if resolution.disposition == ForwardingDisposition::HAInactive
-                            && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
-                        {
-                            if let Some((from_zone, _)) = debug
-                                .as_ref()
-                                .map(|debug| (debug.from_zone.clone(), debug.to_zone.clone()))
-                            {
-                                if let Some(redirect) =
-                                    resolve_zone_encoded_fabric_redirect(forwarding, &from_zone)
-                                {
-                                    decision.resolution = redirect;
+                                    publish_shared_session(shared_sessions, &promoted_entry);
+                                    replicate_session_upsert(peer_worker_commands, &promoted_entry);
                                 }
                             }
-                        }
-                        decision
-                    }
-                } else {
-                    SessionDecision {
-                        resolution: enforce_ha_resolution(
+                            decision
+                        } else if let Some(repaired) = repair_reverse_session_from_forward(
+                            sessions,
+                            shared_sessions,
+                            peer_worker_commands,
                             forwarding,
                             ha_state,
-                            resolve_forwarding(
-                                &binding.area,
-                                desc,
-                                meta,
+                            dynamic_neighbors,
+                            flow,
+                            now,
+                            meta.protocol,
+                            meta.tcp_flags,
+                        ) {
+                            binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
+                            binding.live.session_creates.fetch_add(1, Ordering::Relaxed);
+                            if let Some(debug) = debug.as_mut() {
+                                debug.from_zone = repaired.metadata.ingress_zone.clone();
+                                debug.to_zone = repaired.metadata.egress_zone.clone();
+                            }
+                            let mut decision = repaired.decision;
+                            decision.resolution = redirect_via_fabric_if_needed(
                                 forwarding,
-                                dynamic_neighbors,
+                                enforce_ha_resolution(
+                                    forwarding,
+                                    ha_state,
+                                    lookup_forwarding_resolution_for_session(
+                                        forwarding,
+                                        dynamic_neighbors,
+                                        flow,
+                                        decision,
+                                    ),
+                                ),
+                                meta.ingress_ifindex as i32,
+                            );
+                            decision
+                        } else {
+                            binding.live.session_misses.fetch_add(1, Ordering::Relaxed);
+                            let resolution =
+                                interface_nat_local_resolution(forwarding, flow.dst_ip)
+                                    .unwrap_or_else(|| {
+                                        enforce_ha_resolution(
+                                            forwarding,
+                                            ha_state,
+                                            lookup_forwarding_resolution_with_dynamic(
+                                                forwarding,
+                                                dynamic_neighbors,
+                                                flow.dst_ip,
+                                            ),
+                                        )
+                                    });
+                            let mut decision = SessionDecision {
+                                resolution,
+                                nat: NatDecision::default(),
+                            };
+                            if let Some(debug) = debug.as_mut() {
+                                let (from_zone, to_zone) = zone_pair_for_flow_with_override(
+                                    forwarding,
+                                    meta.ingress_ifindex as i32,
+                                    ingress_zone_override.as_deref(),
+                                    resolution.egress_ifindex,
+                                );
+                                debug.from_zone = from_zone;
+                                debug.to_zone = to_zone;
+                            }
+                            if resolution.disposition == ForwardingDisposition::ForwardCandidate {
+                                let (from_zone, to_zone) = zone_pair_for_flow_with_override(
+                                    forwarding,
+                                    meta.ingress_ifindex as i32,
+                                    ingress_zone_override.as_deref(),
+                                    resolution.egress_ifindex,
+                                );
+                                let owner_rg_id =
+                                    owner_rg_for_flow(forwarding, resolution.egress_ifindex);
+                                if allow_unsolicited_dns_reply(forwarding, flow) {
+                                    // Match the XDP fast path: unsolicited DNS replies bypass
+                                    // policy/session install when the flow knob is enabled.
+                                } else if let PolicyAction::Permit = evaluate_policy(
+                                    &forwarding.policy,
+                                    &from_zone,
+                                    &to_zone,
+                                    flow.src_ip,
+                                    flow.dst_ip,
+                                    flow.forward_key.protocol,
+                                    flow.forward_key.src_port,
+                                    flow.forward_key.dst_port,
+                                ) {
+                                    decision.nat = match_source_nat_for_flow(
+                                        forwarding,
+                                        &from_zone,
+                                        &to_zone,
+                                        resolution.egress_ifindex,
+                                        flow,
+                                    )
+                                    .unwrap_or_default();
+                                    let mut created = 0u64;
+                                    let forward_metadata = SessionMetadata {
+                                        ingress_zone: from_zone.clone(),
+                                        egress_zone: to_zone.clone(),
+                                        owner_rg_id,
+                                        is_reverse: false,
+                                        synced: false,
+                                    };
+                                    if sessions.install_with_protocol(
+                                        flow.forward_key.clone(),
+                                        decision,
+                                        forward_metadata.clone(),
+                                        now,
+                                        meta.protocol,
+                                        meta.tcp_flags,
+                                    ) {
+                                        created += 1;
+                                        let forward_entry = SyncedSessionEntry {
+                                            key: flow.forward_key.clone(),
+                                            decision,
+                                            metadata: forward_metadata,
+                                            protocol: meta.protocol,
+                                            tcp_flags: meta.tcp_flags,
+                                        };
+                                        publish_shared_session(shared_sessions, &forward_entry);
+                                        replicate_session_upsert(
+                                            peer_worker_commands,
+                                            &forward_entry,
+                                        );
+                                    }
+                                    let reverse_resolution = enforce_ha_resolution(
+                                        forwarding,
+                                        ha_state,
+                                        lookup_forwarding_resolution_with_dynamic(
+                                            forwarding,
+                                            dynamic_neighbors,
+                                            flow.src_ip,
+                                        ),
+                                    );
+                                    // Install the reverse entry even if the initial reply-side
+                                    // resolution is not immediately usable. On live traffic the
+                                    // first server reply can arrive before the reverse neighbor
+                                    // state has converged on every worker, and dropping the reverse
+                                    // entry creation turns that race into a hard policy miss. The
+                                    // hit path re-resolves on demand and can fall back to the
+                                    // cached decision when neighbor convergence is still in flight.
+                                    let reverse_decision = SessionDecision {
+                                        resolution: reverse_resolution,
+                                        nat: decision.nat.reverse(flow.src_ip, flow.dst_ip),
+                                    };
+                                    let reverse_key = flow.reverse_key_with_nat(decision.nat);
+                                    let reverse_metadata = SessionMetadata {
+                                        ingress_zone: to_zone.clone(),
+                                        egress_zone: from_zone.clone(),
+                                        owner_rg_id,
+                                        is_reverse: true,
+                                        synced: false,
+                                    };
+                                    if sessions.install_with_protocol(
+                                        reverse_key.clone(),
+                                        reverse_decision,
+                                        reverse_metadata.clone(),
+                                        now,
+                                        meta.protocol,
+                                        meta.tcp_flags,
+                                    ) {
+                                        created += 1;
+                                        let reverse_entry = SyncedSessionEntry {
+                                            key: reverse_key,
+                                            decision: reverse_decision,
+                                            metadata: reverse_metadata,
+                                            protocol: meta.protocol,
+                                            tcp_flags: meta.tcp_flags,
+                                        };
+                                        publish_shared_session(shared_sessions, &reverse_entry);
+                                        replicate_session_upsert(
+                                            peer_worker_commands,
+                                            &reverse_entry,
+                                        );
+                                    }
+                                    if created > 0 {
+                                        binding
+                                            .live
+                                            .session_creates
+                                            .fetch_add(created, Ordering::Relaxed);
+                                    }
+                                } else {
+                                    decision.resolution.disposition =
+                                        ForwardingDisposition::PolicyDenied;
+                                }
+                            } else if resolution.disposition == ForwardingDisposition::HAInactive
+                                && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                            {
+                                if let Some((from_zone, _)) = debug
+                                    .as_ref()
+                                    .map(|debug| (debug.from_zone.clone(), debug.to_zone.clone()))
+                                {
+                                    if let Some(redirect) =
+                                        resolve_zone_encoded_fabric_redirect(forwarding, &from_zone)
+                                    {
+                                        decision.resolution = redirect;
+                                    }
+                                }
+                            }
+                            decision
+                        }
+                    } else {
+                        SessionDecision {
+                            resolution: enforce_ha_resolution(
+                                forwarding,
+                                ha_state,
+                                resolve_forwarding(
+                                    &binding.area,
+                                    desc,
+                                    meta,
+                                    forwarding,
+                                    dynamic_neighbors,
+                                ),
                             ),
-                        ),
-                        nat: NatDecision::default(),
-                    }
-                };
-                record_forwarding_disposition(
-                    &ident,
-                    &binding.live,
-                    decision.resolution,
-                    desc.len as u32,
-                    Some(meta),
-                    debug.as_ref(),
-                    recent_exceptions,
-                    last_resolution,
-                );
-                if matches!(
-                    decision.resolution.disposition,
-                    ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
-                ) {
-                    if let Some(request) = build_live_forward_request(
+                            nat: NatDecision::default(),
+                        }
+                    };
+                    record_forwarding_disposition(
                         &ident,
                         &binding.live,
-                        desc,
-                        meta,
-                        &decision,
-                        forwarding,
-                    ) {
-                        pending_forwards.push(request);
-                        recycle_now = false;
-                    }
-                } else {
-                    maybe_reinject_slow_path(
-                        &ident,
-                        &binding.live,
-                        slow_path,
-                        &binding.area,
-                        desc,
-                        meta,
                         decision.resolution,
+                        desc.len as u32,
+                        Some(meta),
+                        debug.as_ref(),
                         recent_exceptions,
+                        last_resolution,
                     );
+                    if matches!(
+                        decision.resolution.disposition,
+                        ForwardingDisposition::ForwardCandidate
+                            | ForwardingDisposition::FabricRedirect
+                    ) {
+                        if let Some(request) = build_live_forward_request(
+                            &ident,
+                            &binding.live,
+                            desc,
+                            meta,
+                            &decision,
+                            forwarding,
+                        ) {
+                            pending_forwards.push(request);
+                            recycle_now = false;
+                        }
+                    } else {
+                        maybe_reinject_slow_path(
+                            &ident,
+                            &binding.live,
+                            slow_path,
+                            &binding.area,
+                            desc,
+                            meta,
+                            decision.resolution,
+                            recent_exceptions,
+                        );
+                    }
                 }
+            } else {
+                binding.live.metadata_errors.fetch_add(1, Ordering::Relaxed);
+                record_exception(
+                    recent_exceptions,
+                    &ident,
+                    "metadata_parse",
+                    desc.len as u32,
+                    None,
+                    None,
+                );
             }
-        } else {
-            binding.live.metadata_errors.fetch_add(1, Ordering::Relaxed);
-            record_exception(
-                recent_exceptions,
-                &ident,
-                "metadata_parse",
-                desc.len as u32,
-                None,
-                None,
-            );
+            if recycle_now {
+                recycle.push(desc.addr);
+            }
         }
-        if recycle_now {
-            recycle.push(desc.addr);
+        flush_session_deltas(
+            &ident,
+            &binding.live,
+            sessions.drain_deltas(256),
+            shared_sessions,
+            recent_session_deltas,
+            peer_worker_commands,
+        );
+        received.release();
+        drop(received);
+        enqueue_pending_forwards(
+            left,
+            binding,
+            right,
+            pending_forwards,
+            forwarding,
+            &ident,
+            recent_exceptions,
+        );
+        if !recycle.is_empty() {
+            binding.pending_fill_frames.extend(recycle.into_iter());
+            let _ = drain_pending_fill(binding);
         }
+        binding
+            .live
+            .rx_packets
+            .fetch_add(batch_packets, Ordering::Relaxed);
+        binding
+            .live
+            .rx_bytes
+            .fetch_add(batch_bytes, Ordering::Relaxed);
+        binding.live.rx_batches.fetch_add(1, Ordering::Relaxed);
+        did_work = true;
     }
-    flush_session_deltas(
-        &ident,
-        &binding.live,
-        sessions.drain_deltas(256),
-        shared_sessions,
-        recent_session_deltas,
-        peer_worker_commands,
-    );
-    received.release();
-    drop(received);
-    enqueue_pending_forwards(
-        left,
-        binding,
-        right,
-        pending_forwards,
-        forwarding,
-        &ident,
-        recent_exceptions,
-    );
-    if !recycle.is_empty() {
-        binding.pending_fill_frames.extend(recycle.into_iter());
-        let _ = drain_pending_fill(binding);
-    }
-    binding
-        .live
-        .rx_packets
-        .fetch_add(batch_packets, Ordering::Relaxed);
-    binding
-        .live
-        .rx_bytes
-        .fetch_add(batch_bytes, Ordering::Relaxed);
-    binding.live.rx_batches.fetch_add(1, Ordering::Relaxed);
     if poll_stats {
         poll_kernel_stats(&binding.user, &binding.live);
     }
-    true
+    did_work
 }
 
 fn build_live_forward_request(
@@ -2642,9 +2655,7 @@ fn transmit_batch(
         }
     }
 
-    // Reliability first: some mlx5/XSK paths do not consistently surface a
-    // wakeup hint before the TX side needs a kick. Always kick after commit.
-    binding.tx.wake();
+    maybe_wake_tx(binding);
     Ok((sent_packets, sent_bytes))
 }
 
@@ -2691,8 +2702,15 @@ fn transmit_prepared_batch(binding: &mut BindingWorker) -> Result<(u64, u64), Tx
         }
     }
 
-    binding.tx.wake();
+    maybe_wake_tx(binding);
     Ok((sent_packets, sent_bytes))
+}
+
+fn maybe_wake_tx(binding: &BindingWorker) {
+    let bind_mode = XskBindMode::from_u8(binding.live.bind_mode.load(Ordering::Relaxed));
+    if !bind_mode.is_zerocopy() || binding.tx.needs_wakeup() {
+        binding.tx.wake();
+    }
 }
 
 fn record_exception(
@@ -3161,6 +3179,7 @@ fn worker_loop(
     let mut last_neighbor_sync = Instant::now() - NEIGHBOR_SYNC_INTERVAL;
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
+    let mut hot_binding: Option<usize> = None;
     while !stop.load(Ordering::Relaxed) {
         heartbeat.store(now_nanos(), Ordering::Relaxed);
         apply_worker_commands(&commands, &mut sessions);
@@ -3172,12 +3191,7 @@ fn worker_loop(
             last_neighbor_sync = Instant::now();
         }
         let mut did_work = false;
-        for offset in 0..bindings.len() {
-            let idx = if bindings.is_empty() {
-                0
-            } else {
-                (poll_start + offset) % bindings.len()
-            };
+        if let Some(idx) = hot_binding.filter(|idx| *idx < bindings.len()) {
             if poll_binding(
                 idx,
                 &mut bindings,
@@ -3195,6 +3209,38 @@ fn worker_loop(
                 poll_stats,
             ) {
                 did_work = true;
+                poll_start = idx;
+            } else {
+                hot_binding = None;
+            }
+        }
+        for offset in 0..bindings.len() {
+            let idx = if bindings.is_empty() {
+                0
+            } else {
+                (poll_start + offset) % bindings.len()
+            };
+            if Some(idx) == hot_binding {
+                continue;
+            }
+            if poll_binding(
+                idx,
+                &mut bindings,
+                &mut sessions,
+                validation,
+                &forwarding,
+                &ha_state,
+                &dynamic_neighbors,
+                &shared_sessions,
+                slow_path.as_ref(),
+                &recent_exceptions,
+                &recent_session_deltas,
+                &last_resolution,
+                &peer_worker_commands,
+                poll_stats,
+            ) {
+                did_work = true;
+                hot_binding = Some(idx);
             }
         }
         if !bindings.is_empty() {
