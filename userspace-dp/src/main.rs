@@ -305,6 +305,8 @@ struct ProcessStatus {
     queues: Vec<QueueStatus>,
     #[serde(default)]
     bindings: Vec<BindingStatus>,
+    #[serde(rename = "recent_session_deltas", default)]
+    recent_session_deltas: Vec<SessionDeltaInfo>,
     #[serde(rename = "recent_exceptions", default)]
     recent_exceptions: Vec<ExceptionStatus>,
     #[serde(rename = "last_resolution", skip_serializing_if = "Option::is_none")]
@@ -788,6 +790,7 @@ fn run() -> Result<(), String> {
             fabrics: Vec::new(),
             queues: Vec::new(),
             bindings: Vec::new(),
+            recent_session_deltas: Vec::new(),
             recent_exceptions: Vec::new(),
             last_resolution: None,
             slow_path: SlowPathStatus::default(),
@@ -1163,6 +1166,7 @@ fn refresh_status(state: &mut ServerState) {
             .iter()
             .any(|b| b.registered && b.armed && b.ready);
     state.status.queues = summarize_queues(&state.status.bindings);
+    state.status.recent_session_deltas = state.afxdp.recent_session_deltas();
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
     state.status.last_resolution = state.afxdp.last_resolution();
     state.status.slow_path = state.afxdp.slow_path_status().into();

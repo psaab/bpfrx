@@ -259,27 +259,44 @@ func FormatBindings(status ProcessStatus) string {
 		}
 		fmt.Fprintln(&b)
 	}
-	if len(status.RecentExceptions) == 0 {
+	if len(status.RecentExceptions) == 0 && len(status.RecentSessionDeltas) == 0 {
 		return b.String()
 	}
-	fmt.Fprintln(&b)
-	fmt.Fprintln(&b, "Recent userspace exceptions:")
-	for _, exc := range status.RecentExceptions {
-		fmt.Fprintf(&b, "  %s slot=%d queue=%d if=%s reason=%s len=%d af=%d proto=%d",
-			exc.Timestamp.Format(time.RFC3339), exc.Slot, exc.QueueID, exc.Interface, exc.Reason, exc.PacketLength, exc.AddrFamily, exc.Protocol)
-		if exc.IngressIfindex > 0 {
-			fmt.Fprintf(&b, " ingress-ifindex=%d", exc.IngressIfindex)
-		}
-		if exc.SrcIP != "" || exc.DstIP != "" {
-			fmt.Fprintf(&b, " flow=%s:%d->%s:%d", exc.SrcIP, exc.SrcPort, exc.DstIP, exc.DstPort)
-		}
-		if exc.FromZone != "" || exc.ToZone != "" {
-			fmt.Fprintf(&b, " zones=%s->%s", exc.FromZone, exc.ToZone)
-		}
-		if exc.ConfigGeneration != 0 || exc.FIBGeneration != 0 {
-			fmt.Fprintf(&b, " cfg=%d fib=%d", exc.ConfigGeneration, exc.FIBGeneration)
-		}
+	if len(status.RecentExceptions) > 0 {
 		fmt.Fprintln(&b)
+		fmt.Fprintln(&b, "Recent userspace exceptions:")
+		for _, exc := range status.RecentExceptions {
+			fmt.Fprintf(&b, "  %s slot=%d queue=%d if=%s reason=%s len=%d af=%d proto=%d",
+				exc.Timestamp.Format(time.RFC3339), exc.Slot, exc.QueueID, exc.Interface, exc.Reason, exc.PacketLength, exc.AddrFamily, exc.Protocol)
+			if exc.IngressIfindex > 0 {
+				fmt.Fprintf(&b, " ingress-ifindex=%d", exc.IngressIfindex)
+			}
+			if exc.SrcIP != "" || exc.DstIP != "" {
+				fmt.Fprintf(&b, " flow=%s:%d->%s:%d", exc.SrcIP, exc.SrcPort, exc.DstIP, exc.DstPort)
+			}
+			if exc.FromZone != "" || exc.ToZone != "" {
+				fmt.Fprintf(&b, " zones=%s->%s", exc.FromZone, exc.ToZone)
+			}
+			if exc.ConfigGeneration != 0 || exc.FIBGeneration != 0 {
+				fmt.Fprintf(&b, " cfg=%d fib=%d", exc.ConfigGeneration, exc.FIBGeneration)
+			}
+			fmt.Fprintln(&b)
+		}
+	}
+	if len(status.RecentSessionDeltas) > 0 {
+		fmt.Fprintln(&b)
+		fmt.Fprintln(&b, "Recent userspace session deltas:")
+		for _, delta := range status.RecentSessionDeltas {
+			fmt.Fprintf(&b, "  %s slot=%d queue=%d if=%s event=%s af=%d proto=%d flow=%s:%d->%s:%d zones=%s->%s owner-rg=%d egress-if=%d",
+				delta.Timestamp.Format(time.RFC3339), delta.Slot, delta.QueueID, delta.Interface, delta.Event, delta.AddrFamily, delta.Protocol, delta.SrcIP, delta.SrcPort, delta.DstIP, delta.DstPort, delta.IngressZone, delta.EgressZone, delta.OwnerRGID, delta.EgressIfindex)
+			if delta.NextHop != "" {
+				fmt.Fprintf(&b, " next-hop=%s", delta.NextHop)
+			}
+			if delta.NATSrcIP != "" || delta.NATDstIP != "" {
+				fmt.Fprintf(&b, " nat=%s->%s", delta.NATSrcIP, delta.NATDstIP)
+			}
+			fmt.Fprintln(&b)
+		}
 	}
 	return b.String()
 }

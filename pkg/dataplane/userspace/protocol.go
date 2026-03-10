@@ -181,6 +181,7 @@ type ProcessStatus struct {
 	Fabrics                []FabricSnapshot      `json:"fabrics,omitempty"`
 	Queues                 []QueueStatus         `json:"queues,omitempty"`
 	Bindings               []BindingStatus       `json:"bindings,omitempty"`
+	RecentSessionDeltas    []SessionDeltaInfo    `json:"recent_session_deltas,omitempty"`
 	RecentExceptions       []ExceptionStatus     `json:"recent_exceptions,omitempty"`
 	LastResolution         *PacketResolution     `json:"last_resolution,omitempty"`
 	SlowPath               SlowPathStatus        `json:"slow_path,omitempty"`

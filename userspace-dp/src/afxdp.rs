@@ -38,6 +38,7 @@ const NEIGHBOR_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
+const MAX_RECENT_SESSION_DELTAS: usize = 64;
 const MAX_PENDING_SESSION_DELTAS: usize = 4096;
 const BIND_RETRY_ATTEMPTS: usize = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -87,6 +88,7 @@ pub struct Coordinator {
     workers: BTreeMap<u32, WorkerHandle>,
     forwarding: ForwardingState,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     last_resolution: Arc<Mutex<Option<PacketResolution>>>,
     validation: ValidationState,
     last_planned_workers: usize,
@@ -109,6 +111,9 @@ impl Coordinator {
             workers: BTreeMap::new(),
             forwarding: ForwardingState::default(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
+            recent_session_deltas: Arc::new(Mutex::new(VecDeque::with_capacity(
+                MAX_RECENT_SESSION_DELTAS,
+            ))),
             last_resolution: Arc::new(Mutex::new(None)),
             validation: ValidationState::default(),
             last_planned_workers: 0,
@@ -153,6 +158,9 @@ impl Coordinator {
             neighbors.clear();
         }
         if let Ok(mut recent) = self.recent_exceptions.lock() {
+            recent.clear();
+        }
+        if let Ok(mut recent) = self.recent_session_deltas.lock() {
             recent.clear();
         }
         if let Ok(mut last) = self.last_resolution.lock() {
@@ -344,6 +352,7 @@ impl Coordinator {
                 .cloned()
                 .unwrap_or_else(|| Arc::new(Mutex::new(VecDeque::new())));
             let recent_exceptions = self.recent_exceptions.clone();
+            let recent_session_deltas = self.recent_session_deltas.clone();
             let last_resolution = self.last_resolution.clone();
             let slow_path = self.slow_path.clone();
             let stop_clone = stop.clone();
@@ -366,6 +375,7 @@ impl Coordinator {
                         dynamic_neighbors,
                         slow_path,
                         recent_exceptions,
+                        recent_session_deltas,
                         last_resolution,
                         commands_clone,
                         all_commands_clone,
@@ -419,6 +429,13 @@ impl Coordinator {
 
     pub fn recent_exceptions(&self) -> Vec<ExceptionStatus> {
         self.recent_exceptions
+            .lock()
+            .map(|recent| recent.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn recent_session_deltas(&self) -> Vec<SessionDeltaInfo> {
+        self.recent_session_deltas
             .lock()
             .map(|recent| recent.iter().cloned().collect())
             .unwrap_or_default()
@@ -1110,6 +1127,7 @@ fn poll_binding(
     dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
     worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     poll_stats: bool,
@@ -1131,6 +1149,7 @@ fn poll_binding(
         &ident,
         &binding.live,
         sessions.drain_deltas(256),
+        recent_session_deltas,
         worker_commands,
     );
     reap_tx_completions(binding);
@@ -1410,6 +1429,7 @@ fn poll_binding(
         &ident,
         &binding.live,
         sessions.drain_deltas(256),
+        recent_session_deltas,
         worker_commands,
     );
     received.release();
@@ -1767,10 +1787,11 @@ fn flush_session_deltas(
     ident: &BindingIdentity,
     live: &BindingLiveState,
     deltas: Vec<SessionDelta>,
+    recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
 ) {
     for delta in deltas {
-        live.push_session_delta(SessionDeltaInfo {
+        let info = SessionDeltaInfo {
             timestamp: Utc::now(),
             slot: ident.slot,
             queue_id: ident.queue_id,
@@ -1806,7 +1827,11 @@ fn flush_session_deltas(
                 .rewrite_dst
                 .map(|ip| ip.to_string())
                 .unwrap_or_default(),
-        });
+        };
+        live.push_session_delta(info.clone());
+        if let Ok(mut recent) = recent_session_deltas.lock() {
+            push_recent_session_delta(&mut recent, info);
+        }
         if delta.kind == SessionDeltaKind::Close {
             replicate_session_delete(worker_commands, &delta.key);
             replicate_session_delete(
@@ -2166,6 +2191,7 @@ fn worker_loop(
     dynamic_neighbors: Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
     slow_path: Option<Arc<SlowPathReinjector>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     last_resolution: Arc<Mutex<Option<PacketResolution>>>,
     commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
     worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
@@ -2210,6 +2236,7 @@ fn worker_loop(
                 &dynamic_neighbors,
                 slow_path.as_ref(),
                 &recent_exceptions,
+                &recent_session_deltas,
                 &last_resolution,
                 &worker_commands,
                 poll_stats,
@@ -2235,6 +2262,16 @@ fn push_recent_exception(
         recent_exceptions.pop_front();
     }
     recent_exceptions.push_back(exception);
+}
+
+fn push_recent_session_delta(
+    recent_session_deltas: &mut VecDeque<SessionDeltaInfo>,
+    delta: SessionDeltaInfo,
+) {
+    if recent_session_deltas.len() >= MAX_RECENT_SESSION_DELTAS {
+        recent_session_deltas.pop_front();
+    }
+    recent_session_deltas.push_back(delta);
 }
 
 fn now_nanos() -> i64 {
