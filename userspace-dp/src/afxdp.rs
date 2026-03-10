@@ -45,10 +45,10 @@ const IDLE_YIELD_ITERS: u32 = 64;
 const IDLE_SLEEP_AFTER: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
-const RX_WAKE_MIN_INTERVAL: Duration = Duration::from_micros(200);
-const STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const NEIGHBOR_SYNC_INTERVAL: Duration = Duration::from_secs(1);
-const HEARTBEAT_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
+const RX_WAKE_MIN_INTERVAL_NS: u64 = 200_000;
+const STATS_POLL_INTERVAL_NS: u64 = 1_000_000_000;
+const NEIGHBOR_SYNC_INTERVAL_NS: u64 = 1_000_000_000;
+const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
 const MAX_RECENT_SESSION_DELTAS: usize = 64;
@@ -998,8 +998,8 @@ struct BindingWorker {
     pending_tx_local: VecDeque<TxRequest>,
     pending_fill_frames: VecDeque<u64>,
     heartbeat_map_fd: c_int,
-    last_heartbeat_update: Instant,
-    last_rx_wake: Instant,
+    last_heartbeat_update_ns: u64,
+    last_rx_wake_ns: u64,
     empty_rx_polls: u32,
 }
 
@@ -1201,8 +1201,8 @@ impl BindingWorker {
             pending_tx_local: VecDeque::new(),
             pending_fill_frames: VecDeque::new(),
             heartbeat_map_fd,
-            last_heartbeat_update: Instant::now(),
-            last_rx_wake: Instant::now(),
+            last_heartbeat_update_ns: monotonic_nanos(),
+            last_rx_wake_ns: monotonic_nanos(),
             empty_rx_polls: 0,
         })
     }
@@ -1273,6 +1273,8 @@ fn poll_binding(
     bindings: &mut [BindingWorker],
     sessions: &mut SessionTable,
     validation: ValidationState,
+    now: Instant,
+    now_ns: u64,
     forwarding: &ForwardingState,
     ha_state: &Arc<Mutex<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: &Arc<Mutex<BTreeMap<(i32, IpAddr), NeighborEntry>>>,
@@ -1289,8 +1291,8 @@ fn poll_binding(
         return false;
     };
     let ident = binding.identity();
-    maybe_touch_heartbeat(binding);
-    let expired = sessions.expire_stale(Instant::now());
+    maybe_touch_heartbeat(binding, now_ns);
+    let expired = sessions.expire_stale(now);
     if expired > 0 {
         binding
             .live
@@ -1312,7 +1314,7 @@ fn poll_binding(
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
         let available = binding.rx.available().min(RX_BATCH_SIZE);
         if available == 0 {
-            maybe_wake_rx(binding, false);
+            maybe_wake_rx(binding, false, now_ns);
             if poll_stats {
                 poll_kernel_stats(&binding.user, &binding.live);
             }
@@ -1361,7 +1363,6 @@ fn poll_binding(
                         .as_ref()
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
                     let decision = if let Some(flow) = flow.as_ref() {
-                        let now = Instant::now();
                         if let Some(hit) = sessions.lookup(&flow.forward_key, now, meta.tcp_flags) {
                             binding.live.session_hits.fetch_add(1, Ordering::Relaxed);
                             let mut decision = hit.decision;
@@ -2518,28 +2519,27 @@ fn drain_pending_fill(binding: &mut BindingWorker) -> bool {
             binding.pending_fill_frames.push_front(offset);
         }
     }
-    maybe_wake_rx(binding, true);
+    maybe_wake_rx(binding, true, monotonic_nanos());
     true
 }
 
-fn maybe_wake_rx(binding: &mut BindingWorker, force: bool) {
+fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, now_ns: u64) {
     if !binding.device.needs_wakeup() {
         binding.empty_rx_polls = 0;
         return;
     }
-    let now = Instant::now();
     if !force {
         binding.empty_rx_polls = binding.empty_rx_polls.saturating_add(1);
         if binding.empty_rx_polls < RX_WAKE_IDLE_POLLS {
             return;
         }
-        if now.duration_since(binding.last_rx_wake) < RX_WAKE_MIN_INTERVAL {
+        if now_ns.saturating_sub(binding.last_rx_wake_ns) < RX_WAKE_MIN_INTERVAL_NS {
             return;
         }
     }
     binding.device.wake();
     binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
-    binding.last_rx_wake = now;
+    binding.last_rx_wake_ns = now_ns;
     binding.empty_rx_polls = 0;
 }
 
@@ -3217,20 +3217,23 @@ fn worker_loop(
             Err(err) => plan.live.set_error(err.to_string()),
         }
     }
-    let mut last_stats_poll = Instant::now();
-    let mut last_neighbor_sync = Instant::now() - NEIGHBOR_SYNC_INTERVAL;
+    let mut last_stats_poll_ns = 0u64;
+    let mut last_neighbor_sync_ns = 0u64;
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut hot_binding: Option<usize> = None;
     while !stop.load(Ordering::Relaxed) {
         heartbeat.store(now_nanos(), Ordering::Relaxed);
         apply_worker_commands(&commands, &mut sessions);
-        let poll_stats = last_stats_poll.elapsed() >= STATS_POLL_INTERVAL;
-        let poll_neighbors =
-            worker_id == 0 && last_neighbor_sync.elapsed() >= NEIGHBOR_SYNC_INTERVAL;
+        let loop_now = Instant::now();
+        let loop_now_ns = monotonic_nanos();
+        let poll_stats =
+            loop_now_ns.saturating_sub(last_stats_poll_ns) >= STATS_POLL_INTERVAL_NS;
+        let poll_neighbors = worker_id == 0
+            && loop_now_ns.saturating_sub(last_neighbor_sync_ns) >= NEIGHBOR_SYNC_INTERVAL_NS;
         if poll_neighbors {
             sync_dynamic_neighbors(&forwarding, &dynamic_neighbors);
-            last_neighbor_sync = Instant::now();
+            last_neighbor_sync_ns = loop_now_ns;
         }
         let mut did_work = false;
         if let Some(idx) = hot_binding.filter(|idx| *idx < bindings.len()) {
@@ -3239,6 +3242,8 @@ fn worker_loop(
                 &mut bindings,
                 &mut sessions,
                 validation,
+                loop_now,
+                loop_now_ns,
                 &forwarding,
                 &ha_state,
                 &dynamic_neighbors,
@@ -3270,6 +3275,8 @@ fn worker_loop(
                 &mut bindings,
                 &mut sessions,
                 validation,
+                loop_now,
+                loop_now_ns,
                 &forwarding,
                 &ha_state,
                 &dynamic_neighbors,
@@ -3289,7 +3296,7 @@ fn worker_loop(
             poll_start = (poll_start + 1) % bindings.len();
         }
         if poll_stats {
-            last_stats_poll = Instant::now();
+            last_stats_poll_ns = loop_now_ns;
         }
         if did_work {
             idle_iters = 0;
@@ -5331,12 +5338,12 @@ fn delete_heartbeat_slot(map_fd: c_int, slot: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn maybe_touch_heartbeat(binding: &mut BindingWorker) {
-    if binding.last_heartbeat_update.elapsed() < HEARTBEAT_UPDATE_INTERVAL {
+fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
+    if now_ns.saturating_sub(binding.last_heartbeat_update_ns) < HEARTBEAT_UPDATE_INTERVAL_NS {
         return;
     }
     match touch_heartbeat(binding.heartbeat_map_fd, binding.slot, &binding.live) {
-        Ok(()) => binding.last_heartbeat_update = Instant::now(),
+        Ok(()) => binding.last_heartbeat_update_ns = now_ns,
         Err(err) => binding
             .live
             .set_error(format!("update heartbeat slot: {err}")),
