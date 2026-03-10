@@ -35,6 +35,9 @@ const RX_BATCH_SIZE: u32 = 128;
 const MIN_RESERVED_TX_FRAMES: u32 = 64;
 const MAX_RESERVED_TX_FRAMES: u32 = 512;
 const TX_BATCH_SIZE: usize = 128;
+const XSK_BIND_FLAGS_FALLBACK: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP;
+const XSK_BIND_FLAGS_PREFERRED: u16 =
+    SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY;
 const IDLE_YIELD_ITERS: u32 = 64;
 const IDLE_SLEEP_AFTER: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
@@ -1082,19 +1085,21 @@ impl BindingWorker {
         let mut device = umem
             .fq_cq(&sock)
             .map_err(|e| format!("create fq/cq: {e}"))?;
-        let user = umem
-            .rx_tx(
-                &sock,
-                &SocketConfig {
-                    rx_size: NonZeroU32::new(ring_entries),
-                    tx_size: NonZeroU32::new(ring_entries),
-                    bind_flags: SocketConfig::XDP_BIND_NEED_WAKEUP,
-                },
-            )
-            .map_err(|e| format!("configure rx ring: {e}"))?;
-        let rx = user.map_rx().map_err(|e| format!("map rx ring: {e}"))?;
-        let tx = user.map_tx().map_err(|e| format!("map tx ring: {e}"))?;
-        bind_user_with_retry(&umem, &user)?;
+        let (user, rx, tx) =
+            match open_user_rings(&umem, &sock, ring_entries, XSK_BIND_FLAGS_PREFERRED) {
+                Ok(bound) => bound,
+                Err(preferred_err) => open_user_rings(
+                    &umem,
+                    &sock,
+                    ring_entries,
+                    XSK_BIND_FLAGS_FALLBACK,
+                )
+                .map_err(|fallback_err| {
+                    format!(
+                        "configure AF_XDP rings: zerocopy={preferred_err}; fallback={fallback_err}"
+                    )
+                })?,
+            };
         let reserved_tx = ring_entries
             .saturating_div(4)
             .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
@@ -1149,6 +1154,29 @@ impl BindingWorker {
             ifindex: self.ifindex,
         }
     }
+}
+
+fn open_user_rings(
+    umem: &Umem,
+    sock: &Socket,
+    ring_entries: u32,
+    bind_flags: u16,
+) -> Result<(User, xdpilone::RingRx, xdpilone::RingTx), Box<dyn std::error::Error + Send + Sync>>
+{
+    let user = umem
+        .rx_tx(
+            sock,
+            &SocketConfig {
+                rx_size: NonZeroU32::new(ring_entries),
+                tx_size: NonZeroU32::new(ring_entries),
+                bind_flags,
+            },
+        )
+        .map_err(|e| format!("configure rx/tx rings: {e}"))?;
+    let rx = user.map_rx().map_err(|e| format!("map rx ring: {e}"))?;
+    let tx = user.map_tx().map_err(|e| format!("map tx ring: {e}"))?;
+    bind_user_with_retry(umem, &user)?;
+    Ok((user, rx, tx))
 }
 
 fn bind_user_with_retry(
