@@ -14,6 +14,7 @@ Tracked inputs:
 - config: [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx-userspace-wip/docs/ha-cluster-userspace.conf)
 - validator: [userspace-ha-validation.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-ha-validation.sh)
 - phase cycle: [userspace-phase-cycle.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-phase-cycle.sh)
+- perf compare: [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-perf-compare.sh)
 
 ## Current Model
 
@@ -61,6 +62,12 @@ Optional perf capture on the active userspace firewall:
 ./scripts/userspace-ha-validation.sh --perf
 ```
 
+Perf-only compare workflow:
+
+```bash
+./scripts/userspace-perf-compare.sh
+```
+
 Standard phase workflow:
 
 ```bash
@@ -76,6 +83,10 @@ This is the required sequence after each userspace dataplane phase:
    - `loss:bpfrx-userspace-fw0`
    - `loss:bpfrx-userspace-fw1`
 4. run the isolated userspace HA validation script
+
+If the validation script is failing and you still need current performance data,
+run the perf-compare workflow next. It captures IPv4/IPv6 `iperf3` and `perf`
+artifacts without treating the current branch instability as a hard blocker.
 
 ## What The Validator Enforces
 

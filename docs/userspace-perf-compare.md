@@ -1,0 +1,51 @@
+# Userspace Perf Compare
+
+Use [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-perf-compare.sh) when you need a repeatable IPv4/IPv6 performance capture on the isolated userspace cluster without coupling the result to the pass/fail thresholds in `userspace-ha-validation.sh`.
+
+This is the right tool when:
+- the branch is still unstable and validation fails at a reachability or throughput gate
+- you still need current `perf` data from `bpfrx-userspace-fw0/1`
+- you want a side-by-side IPv4/IPv6 hotspot comparison with saved artifacts
+
+Inputs:
+- env: [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx-userspace-wip/test/incus/loss-userspace-cluster.env)
+- isolated config: [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx-userspace-wip/docs/ha-cluster-userspace.conf)
+- validator: [userspace-ha-validation.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-ha-validation.sh)
+- compare script: [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-perf-compare.sh)
+
+Run:
+
+```bash
+./scripts/userspace-perf-compare.sh
+./scripts/userspace-perf-compare.sh --duration 12 --parallel 4
+```
+
+What it does:
+1. waits for CLI readiness on both isolated firewalls
+2. ensures `cluster-userspace-host` is still accepting IPv6 RAs
+3. detects the active userspace firewall instead of assuming `fw0`
+4. records basic IPv4 and IPv6 reachability from `cluster-userspace-host`
+5. runs one IPv4 `iperf3` capture to `172.16.80.200`
+6. runs one IPv6 `iperf3` capture to `2001:559:8585:80::200`
+7. records `perf` on the active firewall for each family
+8. writes a compact markdown summary to `/tmp/userspace-perf-compare/summary.md`
+
+Artifacts written under `/tmp/userspace-perf-compare`:
+- `ipv4.json`
+- `ipv4.err`
+- `ipv4.perf.txt`
+- `ipv6.json`
+- `ipv6.err`
+- `ipv6.perf.txt`
+- `summary.md`
+
+Interpretation rule:
+- if `userspace-ha-validation.sh` passes, treat this script as profiling-only
+- if validation fails, treat this script as the profiling/debugging path and use the reachability section first
+
+Current expected hotspot categories:
+- `bpfrx_userspace_dp::afxdp::poll_binding`
+- `bpfrx_userspace_dp::afxdp::build_forwarded_frame_into`
+- `bpfrx_userspace_dp::afxdp::apply_nat_ipv6`
+- kernel AF_XDP copy or queue work such as `mlx5e_xsk_*`
+- remaining lookup cost from route, neighbor, or session structures

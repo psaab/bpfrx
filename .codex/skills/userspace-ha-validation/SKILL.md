@@ -13,6 +13,7 @@ Cluster inputs:
 - config: `docs/ha-cluster-userspace.conf`
 - script: `scripts/userspace-ha-validation.sh`
 - phase cycle: `scripts/userspace-phase-cycle.sh`
+- perf compare: `scripts/userspace-perf-compare.sh`
 
 Workflow:
 
@@ -25,6 +26,7 @@ Commands:
 ```bash
 ./scripts/userspace-phase-cycle.sh
 ./scripts/userspace-phase-cycle.sh --perf
+./scripts/userspace-perf-compare.sh
 ```
 
 What the script enforces:
@@ -44,6 +46,8 @@ What the script enforces:
 - optional `perf` capture runs on the active userspace firewall, not a hardcoded node
 
 Use `scripts/userspace-ha-validation.sh` directly only when you are debugging the validator itself.
+
+Use `scripts/userspace-perf-compare.sh` when validation is failing or when you need fresh IPv4/IPv6 hotspot data without the validator's throughput gates. Read [docs/userspace-perf-compare.md](/home/ps/git/codex-bpfrx-userspace-wip/docs/userspace-perf-compare.md) for the exact artifact layout and interpretation.
 
 If the script fails on IPv6 route state:
 
