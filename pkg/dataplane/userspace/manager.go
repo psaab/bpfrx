@@ -106,6 +106,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	}
 	ucfg := deriveUserspaceConfig(cfg)
 	snap := buildSnapshot(cfg, ucfg, m.bumpGeneration(), m.readFIBGeneration())
+	m.syncInterfaceAttachments(result, snap)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -133,6 +134,32 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	m.ensureStatusLoopLocked()
 	m.cfg = ucfg
 	return result, nil
+}
+
+func (m *Manager) syncInterfaceAttachments(result *dataplane.CompileResult, snapshot *ConfigSnapshot) {
+	if result == nil {
+		return
+	}
+	allowed := make(map[int]bool)
+	for _, ifindex := range buildUserspaceIngressIfindexes(snapshot) {
+		allowed[int(ifindex)] = true
+	}
+	for ifindex := range m.inner.XDPLinks() {
+		if allowed[ifindex] {
+			continue
+		}
+		if err := m.inner.DetachXDP(ifindex); err != nil {
+			slog.Warn("userspace: detach XDP from non-data interface failed", "ifindex", ifindex, "err", err)
+		}
+	}
+	for ifindex := range m.inner.TCLinks() {
+		if allowed[ifindex] {
+			continue
+		}
+		if err := m.inner.DetachTC(ifindex); err != nil {
+			slog.Warn("userspace: detach TC from non-data interface failed", "ifindex", ifindex, "err", err)
+		}
+	}
 }
 
 func (m *Manager) bumpGeneration() uint64 {

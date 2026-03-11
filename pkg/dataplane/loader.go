@@ -355,6 +355,14 @@ func (m *Manager) LastCompileResult() *CompileResult {
 	return m.lastCompile
 }
 
+func (m *Manager) XDPLinks() map[int]link.Link {
+	return m.xdpLinks
+}
+
+func (m *Manager) TCLinks() map[int]link.Link {
+	return m.tcLinks
+}
+
 // Close releases Go handles for eBPF resources but leaves pinned maps
 // and links in the kernel for the next daemon to reuse. This enables
 // hitless restarts — sessions survive and XDP/TC programs keep running.
