@@ -2199,7 +2199,7 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	seen := make(map[uint32]bool)
 	out := make([]uint32, 0)
 	for _, iface := range snapshot.Interfaces {
-		if iface.Zone == "" {
+		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
 		}
 		if iface.ParentIfindex > 0 {
@@ -2223,6 +2223,32 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
+}
+
+func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
+	name := iface.Name
+	base := name
+	if idx := strings.IndexByte(base, '.'); idx >= 0 {
+		base = base[:idx]
+	}
+	switch {
+	case strings.HasPrefix(base, "fxp"):
+		return true
+	case strings.HasPrefix(base, "em"):
+		return true
+	case strings.HasPrefix(base, "fab"):
+		return true
+	case base == "lo0":
+		return true
+	}
+	switch iface.Zone {
+	case "mgmt", "control":
+		return true
+	}
+	if iface.LocalFabric != "" {
+		return true
+	}
+	return false
 }
 
 func buildNATTranslatedLocalAddressExclusions(snapshot *ConfigSnapshot) (map[uint32]bool, map[[16]byte]bool) {
