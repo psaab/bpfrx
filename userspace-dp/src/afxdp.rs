@@ -2340,7 +2340,6 @@ fn enqueue_pending_forwards(
         let mut build_failed = false;
         let mut copied_source_frame = false;
         {
-            let target_area = (&target_binding.umem.area) as *const MmapArea;
             if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
                 &request.source_frame,
                 request.meta,
@@ -2363,102 +2362,35 @@ fn enqueue_pending_forwards(
                 }
             }
             if !copied_source_frame {
-                if target_binding.free_tx_frames.is_empty() {
-                    let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
-                }
-                if let Some(offset) = target_binding.free_tx_frames.pop_front() {
-                    match unsafe {
-                        (&*target_area)
-                            .slice_mut_unchecked(offset as usize, UMEM_FRAME_SIZE as usize)
-                    }
-                    .and_then(|dst| {
-                        build_forwarded_frame_into_from_frame(
-                            dst,
-                            &request.source_frame,
-                            request.meta,
-                            &request.decision,
+                match build_forwarded_frame_from_frame(
+                    &request.source_frame,
+                    request.meta,
+                    &request.decision,
+                    forwarding,
+                    expected_ports,
+                ) {
+                    Some(frame) => {
+                        if frame.len() > tx_frame_capacity() {
+                            record_exception(
+                                recent_exceptions,
+                                ingress_ident,
+                                "oversized_forward_frame",
+                                frame.len() as u32,
+                                Some(request.meta),
+                                None,
+                            );
+                            continue;
+                        }
+                        target_binding.pending_tx_local.push_back(TxRequest {
+                            bytes: frame,
                             expected_ports,
-                        )
-                    }) {
-                        Some(frame_len) => {
-                            target_binding
-                                .pending_tx_prepared
-                                .push_back(PreparedTxRequest {
-                                    offset,
-                                    len: frame_len as u32,
-                                    recycle_slot: None,
-                                    expected_ports,
-                                    expected_addr_family: request.meta.addr_family,
-                                    expected_protocol: request.meta.protocol,
-                                    flow_key: request.flow_key.clone(),
-                                });
-                        }
-                        None => {
-                            target_binding.free_tx_frames.push_front(offset);
-                            match build_forwarded_frame_from_frame(
-                                &request.source_frame,
-                                request.meta,
-                                &request.decision,
-                                forwarding,
-                                expected_ports,
-                            ) {
-                                Some(frame) => {
-                                    if frame.len() > tx_frame_capacity() {
-                                        record_exception(
-                                            recent_exceptions,
-                                            ingress_ident,
-                                            "oversized_forward_frame",
-                                            frame.len() as u32,
-                                            Some(request.meta),
-                                            None,
-                                        );
-                                        continue;
-                                    }
-                                    target_binding.pending_tx_local.push_back(TxRequest {
-                                        bytes: frame,
-                                        expected_ports,
-                                        expected_addr_family: request.meta.addr_family,
-                                        expected_protocol: request.meta.protocol,
-                                        flow_key: request.flow_key.clone(),
-                                    });
-                                }
-                                None => {
-                                    build_failed = true;
-                                }
-                            }
-                        }
+                            expected_addr_family: request.meta.addr_family,
+                            expected_protocol: request.meta.protocol,
+                            flow_key: request.flow_key.clone(),
+                        });
                     }
-                } else {
-                    match build_forwarded_frame_from_frame(
-                        &request.source_frame,
-                        request.meta,
-                        &request.decision,
-                        forwarding,
-                        expected_ports,
-                    ) {
-                        Some(frame) => {
-                            if frame.len() > tx_frame_capacity() {
-                                record_exception(
-                                    recent_exceptions,
-                                    ingress_ident,
-                                    "oversized_forward_frame",
-                                    frame.len() as u32,
-                                    Some(request.meta),
-                                    None,
-                                );
-                                continue;
-                            }
-                            target_binding.pending_tx_local.push_back(TxRequest {
-                                bytes: frame,
-                                expected_ports,
-                                expected_addr_family: request.meta.addr_family,
-                                expected_protocol: request.meta.protocol,
-                                flow_key: request.flow_key.clone(),
-                            });
-                        }
-                        None => {
-                            build_failed = true;
-                        }
+                    None => {
+                        build_failed = true;
                     }
                 }
             }
