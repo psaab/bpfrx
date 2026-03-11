@@ -11,7 +11,7 @@ use aya_ebpf::{
 use core::mem;
 
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
-const USERSPACE_META_VERSION: u16 = 3;
+const USERSPACE_META_VERSION: u16 = 4;
 const USERSPACE_BINDING_READY: u32 = 1;
 const USERSPACE_FALLBACK_MAIN: u32 = 0;
 const USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS: u32 = 5000;
@@ -39,6 +39,7 @@ struct UserspaceCtrl {
     enabled: u32,
     metadata_version: u32,
     workers: u32,
+    queue_count: u32,
     flags: u32,
     config_generation: u64,
     fib_generation: u32,
@@ -206,11 +207,19 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
+    let selected_queue = select_userspace_queue(ctrl, &parsed, rx_queue_index);
     let binding_key = UserspaceBindingKey {
         ifindex: ingress_ifindex,
-        queue_id: rx_queue_index,
+        queue_id: selected_queue,
     };
-    let binding = unsafe { USERSPACE_BINDINGS.get(&binding_key) };
+    let mut binding = unsafe { USERSPACE_BINDINGS.get(&binding_key) };
+    if binding.is_none() && selected_queue != rx_queue_index {
+        let fallback_key = UserspaceBindingKey {
+            ifindex: ingress_ifindex,
+            queue_id: rx_queue_index,
+        };
+        binding = unsafe { USERSPACE_BINDINGS.get(&fallback_key) };
+    }
     let Some(binding) = binding else {
         return fallback_to_main(&ctx);
     };
@@ -482,6 +491,74 @@ fn is_ipv4_link_local(ip: u32) -> bool {
 
 fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
     ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80
+}
+
+fn select_userspace_queue(ctrl: &UserspaceCtrl, pkt: &ParsedPacket, rx_queue_index: u32) -> u32 {
+    let queue_count = if ctrl.queue_count == 0 {
+        ctrl.workers
+    } else {
+        ctrl.queue_count
+    };
+    if queue_count <= 1 {
+        return 0;
+    }
+    let selected = flow_hash(pkt) % queue_count;
+    if selected >= queue_count {
+        rx_queue_index % queue_count
+    } else {
+        selected
+    }
+}
+
+fn flow_hash(pkt: &ParsedPacket) -> u32 {
+    let mut h = ((pkt.addr_family as u32) << 24) ^ ((pkt.protocol as u32) << 16);
+    let (port_lo, port_hi) = ordered_ports(pkt.flow_src_port, pkt.flow_dst_port);
+    h ^= ((port_lo as u32) << 16) | (port_hi as u32);
+    match pkt.addr_family {
+        AF_INET => {
+            let src = u32::from_be_bytes([
+                pkt.src_addr[0],
+                pkt.src_addr[1],
+                pkt.src_addr[2],
+                pkt.src_addr[3],
+            ]);
+            h ^= src ^ pkt.dst_v4;
+        }
+        AF_INET6 => {
+            h ^= ipv6_addr_hash(pkt.src_addr, pkt.dst_v6);
+        }
+        _ => {}
+    }
+    mix32(h)
+}
+
+fn ordered_ports(a: u16, b: u16) -> (u16, u16) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+fn ipv6_addr_hash(src: [u8; 16], dst: [u8; 16]) -> u32 {
+    let s0 = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
+    let s1 = u32::from_be_bytes([src[4], src[5], src[6], src[7]]);
+    let s2 = u32::from_be_bytes([src[8], src[9], src[10], src[11]]);
+    let s3 = u32::from_be_bytes([src[12], src[13], src[14], src[15]]);
+    let d0 = u32::from_be_bytes([dst[0], dst[1], dst[2], dst[3]]);
+    let d1 = u32::from_be_bytes([dst[4], dst[5], dst[6], dst[7]]);
+    let d2 = u32::from_be_bytes([dst[8], dst[9], dst[10], dst[11]]);
+    let d3 = u32::from_be_bytes([dst[12], dst[13], dst[14], dst[15]]);
+    let x0 = s0 ^ d0;
+    let x1 = s1 ^ d1;
+    let x2 = s2 ^ d2;
+    let x3 = s3 ^ d3;
+    x0.rotate_left(5) ^ x1.rotate_left(11) ^ x2.rotate_left(17) ^ x3.rotate_left(23)
+}
+
+fn mix32(mut x: u32) -> u32 {
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^= x >> 16;
+    x
 }
 
 fn parse_l4(

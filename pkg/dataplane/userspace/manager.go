@@ -1502,13 +1502,14 @@ type userspaceCtrlValue struct {
 	Enabled            uint32
 	MetadataVersion    uint32
 	Workers            uint32
+	QueueCount         uint32
 	Flags              uint32
 	ConfigGeneration   uint64
 	FIBGeneration      uint32
 	HeartbeatTimeoutMS uint32
 }
 
-const userspaceMetadataVersion = 3
+const userspaceMetadataVersion = 4
 
 func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
 	ctrlMap := m.inner.Map("userspace_ctrl")
@@ -1545,6 +1546,7 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 		Enabled:            0,
 		MetadataVersion:    userspaceMetadataVersion,
 		Workers:            uint32(cfg.Workers),
+		QueueCount:         uint32(maxInt(cfg.Workers, 1)),
 		Flags:              0,
 		ConfigGeneration:   0,
 		FIBGeneration:      0,
@@ -1652,6 +1654,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		Enabled:            0,
 		MetadataVersion:    userspaceMetadataVersion,
 		Workers:            uint32(maxInt(status.Workers, 1)),
+		QueueCount:         uint32(queueCountFromBindings(status.Bindings)),
 		Flags:              0,
 		ConfigGeneration:   status.LastSnapshotGeneration,
 		FIBGeneration:      status.LastFIBGeneration,
@@ -2283,4 +2286,20 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func queueCountFromBindings(bindings []BindingStatus) int {
+	maxQueueID := -1
+	for _, binding := range bindings {
+		if !binding.Registered || binding.Ifindex <= 0 {
+			continue
+		}
+		if int(binding.QueueID) > maxQueueID {
+			maxQueueID = int(binding.QueueID)
+		}
+	}
+	if maxQueueID < 0 {
+		return 1
+	}
+	return maxQueueID + 1
 }
