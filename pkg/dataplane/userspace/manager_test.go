@@ -516,6 +516,32 @@ func TestDesiredForwardingArmedDefaultsOnStandalone(t *testing.T) {
 	}
 }
 
+func TestStopLockedClearsLastStatus(t *testing.T) {
+	m := &Manager{
+		lastStatus: ProcessStatus{
+			PID:              1234,
+			Enabled:          true,
+			ForwardingArmed:  true,
+			Capabilities:     UserspaceCapabilities{ForwardingSupported: true},
+		},
+	}
+
+	m.stopLocked()
+
+	if m.lastStatus.PID != 0 {
+		t.Fatalf("lastStatus.PID = %d, want 0", m.lastStatus.PID)
+	}
+	if m.lastStatus.Enabled {
+		t.Fatal("lastStatus.Enabled = true, want false")
+	}
+	if m.lastStatus.ForwardingArmed {
+		t.Fatal("lastStatus.ForwardingArmed = true, want false")
+	}
+	if m.lastStatus.Capabilities.ForwardingSupported {
+		t.Fatal("lastStatus.Capabilities.ForwardingSupported = true, want false")
+	}
+}
+
 func TestUserspaceSupportsSimpleZonePolicies(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.DefaultPolicy = config.PolicyDeny

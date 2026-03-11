@@ -1320,6 +1320,7 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	if m.proc != nil {
 		m.stopLocked()
 	}
+	m.lastStatus = ProcessStatus{}
 	binary, err := findBinary(cfg.Binary)
 	if err != nil {
 		return err
@@ -1676,7 +1677,10 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	if err := m.syncIngressIfaceMapLocked(snapshot); err != nil {
 		return err
 	}
-	return m.syncLocalAddressMapsLocked(snapshot)
+	if err := m.syncLocalAddressMapsLocked(snapshot); err != nil {
+		return err
+	}
+	return m.syncInterfaceNATAddressMapsLocked(snapshot)
 }
 
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
@@ -1744,6 +1748,9 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		return err
 	}
 	if err := m.syncLocalAddressMapsLocked(m.lastSnapshot); err != nil {
+		return err
+	}
+	if err := m.syncInterfaceNATAddressMapsLocked(m.lastSnapshot); err != nil {
 		return err
 	}
 	m.lastStatus = *status
@@ -1827,6 +1834,60 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 		}
 		if err := localV6Map.Update(entry.v6Key, uint8(1), ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update userspace_local_v6 %+v: %w", entry.v6Key, err)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) error {
+	natV4Map := m.inner.Map("userspace_interface_nat_v4")
+	if natV4Map == nil {
+		return errors.New("userspace_interface_nat_v4 map not loaded")
+	}
+	natV6Map := m.inner.Map("userspace_interface_nat_v6")
+	if natV6Map == nil {
+		return errors.New("userspace_interface_nat_v6 map not loaded")
+	}
+
+	var (
+		natV4Key uint32
+		natV4Val uint8
+	)
+	natV4Iter := natV4Map.Iterate()
+	var natV4Keys []uint32
+	for natV4Iter.Next(&natV4Key, &natV4Val) {
+		natV4Keys = append(natV4Keys, natV4Key)
+	}
+	for _, key := range natV4Keys {
+		if err := natV4Map.Delete(key); err != nil {
+			return fmt.Errorf("delete userspace_interface_nat_v4 %08x: %w", key, err)
+		}
+	}
+
+	var (
+		natV6Key userspaceLocalV6Key
+		natV6Val uint8
+	)
+	natV6Iter := natV6Map.Iterate()
+	var natV6Keys []userspaceLocalV6Key
+	for natV6Iter.Next(&natV6Key, &natV6Val) {
+		natV6Keys = append(natV6Keys, natV6Key)
+	}
+	for _, key := range natV6Keys {
+		if err := natV6Map.Delete(key); err != nil {
+			return fmt.Errorf("delete userspace_interface_nat_v6 %+v: %w", key, err)
+		}
+	}
+
+	for _, entry := range buildInterfaceNATAddressEntries(snapshot) {
+		if entry.v4 {
+			if err := natV4Map.Update(entry.v4Key, uint8(1), ebpf.UpdateAny); err != nil {
+				return fmt.Errorf("update userspace_interface_nat_v4 %08x: %w", entry.v4Key, err)
+			}
+			continue
+		}
+		if err := natV6Map.Update(entry.v6Key, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_interface_nat_v6 %+v: %w", entry.v6Key, err)
 		}
 	}
 	return nil
@@ -2262,6 +2323,31 @@ func buildLocalAddressEntries(snapshot *ConfigSnapshot) []userspaceLocalAddressE
 	return out
 }
 
+func buildInterfaceNATAddressEntries(snapshot *ConfigSnapshot) []userspaceLocalAddressEntry {
+	if snapshot == nil {
+		return nil
+	}
+	excludedV4, excludedV6 := buildNATTranslatedLocalAddressExclusions(snapshot)
+	seenV4 := make(map[uint32]bool)
+	seenV6 := make(map[[16]byte]bool)
+	out := make([]userspaceLocalAddressEntry, 0)
+	for key := range excludedV4 {
+		if seenV4[key] {
+			continue
+		}
+		seenV4[key] = true
+		out = append(out, userspaceLocalAddressEntry{v4: true, v4Key: key})
+	}
+	for key := range excludedV6 {
+		if seenV6[key] {
+			continue
+		}
+		seenV6[key] = true
+		out = append(out, userspaceLocalAddressEntry{v6Key: userspaceLocalV6Key{Addr: key}})
+	}
+	return out
+}
+
 func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	if snapshot == nil {
 		return nil
@@ -2443,6 +2529,7 @@ func (m *Manager) stopLocked() {
 		m.syncCancel = nil
 	}
 	if m.proc == nil {
+		m.lastStatus = ProcessStatus{}
 		return
 	}
 	_ = m.requestLocked(ControlRequest{Type: "shutdown"}, nil)
@@ -2467,6 +2554,7 @@ func (m *Manager) stopLocked() {
 		}
 	}
 	m.proc = nil
+	m.lastStatus = ProcessStatus{}
 }
 
 func configEqual(a, b config.UserspaceConfig) bool {
