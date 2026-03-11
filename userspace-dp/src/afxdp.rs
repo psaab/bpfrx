@@ -120,6 +120,7 @@ struct XdpOptions {
 pub struct Coordinator {
     map_fd: Option<OwnedFd>,
     heartbeat_map_fd: Option<OwnedFd>,
+    session_map_fd: Option<OwnedFd>,
     slow_path: Option<Arc<SlowPathReinjector>>,
     last_slow_path_status: SlowPathStatus,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
@@ -144,6 +145,7 @@ impl Coordinator {
         Self {
             map_fd: None,
             heartbeat_map_fd: None,
+            session_map_fd: None,
             slow_path: None,
             last_slow_path_status: SlowPathStatus::default(),
             ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
@@ -196,6 +198,7 @@ impl Coordinator {
         self.slow_path = None;
         self.map_fd = None;
         self.heartbeat_map_fd = None;
+        self.session_map_fd = None;
         self.forwarding = ForwardingState::default();
         if let Ok(mut neighbors) = self.dynamic_neighbors.lock() {
             neighbors.clear();
@@ -308,6 +311,15 @@ impl Coordinator {
             }
             return;
         }
+        if snapshot.map_pins.sessions.is_empty() {
+            self.last_reconcile_stage = "missing_session_pin".to_string();
+            for binding in bindings.iter_mut() {
+                if binding.registered {
+                    binding.last_error = "missing session map pin path".to_string();
+                }
+            }
+            return;
+        }
         let map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.xsk) {
             Ok(fd) => fd,
             Err(err) => {
@@ -327,6 +339,18 @@ impl Coordinator {
                 for binding in bindings.iter_mut() {
                     if binding.registered {
                         binding.last_error = format!("open heartbeat map: {err}");
+                    }
+                }
+                return;
+            }
+        };
+        let session_map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.sessions) {
+            Ok(fd) => fd,
+            Err(err) => {
+                self.last_reconcile_stage = format!("open_session_map_failed:{err}");
+                for binding in bindings.iter_mut() {
+                    if binding.registered {
+                        binding.last_error = format!("open session map: {err}");
                     }
                 }
                 return;
@@ -357,6 +381,7 @@ impl Coordinator {
                     live,
                     xsk_map_fd: map_fd.fd,
                     heartbeat_map_fd: heartbeat_map_fd.fd,
+                    session_map_fd: session_map_fd.fd,
                     ring_entries,
                     shared_owner: false,
                 });
@@ -388,6 +413,7 @@ impl Coordinator {
         );
         self.map_fd = Some(map_fd);
         self.heartbeat_map_fd = Some(heartbeat_map_fd);
+        self.session_map_fd = Some(session_map_fd);
         let worker_command_queues: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = workers
             .keys()
             .copied()
@@ -864,6 +890,7 @@ struct BindingPlan {
     live: Arc<BindingLiveState>,
     xsk_map_fd: c_int,
     heartbeat_map_fd: c_int,
+    session_map_fd: c_int,
     ring_entries: u32,
     shared_owner: bool,
 }
@@ -1062,6 +1089,7 @@ struct BindingWorker {
     scratch_local_tx: Vec<(u64, TxRequest)>,
     in_flight_forward_recycles: FastMap<u64, u32>,
     heartbeat_map_fd: c_int,
+    session_map_fd: c_int,
     last_heartbeat_update_ns: u64,
     last_rx_wake_ns: u64,
     last_tx_wake_ns: u64,
@@ -1213,6 +1241,7 @@ impl BindingWorker {
         ring_entries: u32,
         xsk_map_fd: c_int,
         heartbeat_map_fd: c_int,
+        session_map_fd: c_int,
         live: Arc<BindingLiveState>,
         shared_owner: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -1286,6 +1315,7 @@ impl BindingWorker {
             scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
             in_flight_forward_recycles: FastMap::default(),
             heartbeat_map_fd,
+            session_map_fd,
             last_heartbeat_update_ns: init_now,
             last_rx_wake_ns: init_now,
             last_tx_wake_ns: init_now,
@@ -1357,12 +1387,7 @@ fn open_binding_worker_rings(
     } else {
         XSK_BIND_FLAGS_SHARED_UMEM_OWNER
     };
-    let (user, rx, tx) = open_user_rings(
-        &worker_umem.umem,
-        &sock,
-        ring_entries,
-        bind_flags,
-    )?;
+    let (user, rx, tx) = open_user_rings(&worker_umem.umem, &sock, ring_entries, bind_flags)?;
     let bind_mode = bind_user_rings(&worker_umem.umem, &device, &user, true)?;
     Ok((user, rx, tx, bind_mode, device))
 }
@@ -1404,10 +1429,7 @@ fn open_user_rings(
     sock: &Socket,
     ring_entries: u32,
     bind_flags: u16,
-) -> Result<
-    (User, xdpilone::RingRx, xdpilone::RingTx),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> Result<(User, xdpilone::RingRx, xdpilone::RingTx), Box<dyn std::error::Error + Send + Sync>> {
     let user = umem
         .rx_tx(
             sock,
@@ -1631,8 +1653,12 @@ fn poll_binding(
                             dynamic_neighbors,
                         );
                     }
-                    let ingress_zone_override =
-                        parse_zone_encoded_fabric_ingress(unsafe { &*area }, desc, meta, forwarding);
+                    let ingress_zone_override = parse_zone_encoded_fabric_ingress(
+                        unsafe { &*area },
+                        desc,
+                        meta,
+                        forwarding,
+                    );
                     let mut debug = flow
                         .as_ref()
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
@@ -1681,6 +1707,10 @@ fn poll_binding(
                                     meta.protocol,
                                     meta.tcp_flags,
                                 ) {
+                                    let _ = publish_live_session_key(
+                                        binding.session_map_fd,
+                                        &flow.forward_key,
+                                    );
                                     let promoted_entry = SyncedSessionEntry {
                                         key: flow.forward_key.clone(),
                                         decision,
@@ -1745,6 +1775,10 @@ fn poll_binding(
                                     meta.protocol,
                                     meta.tcp_flags,
                                 ) {
+                                    let _ = publish_live_session_key(
+                                        binding.session_map_fd,
+                                        &flow.forward_key,
+                                    );
                                     let promoted_entry = SyncedSessionEntry {
                                         key: flow.forward_key.clone(),
                                         decision,
@@ -1759,6 +1793,7 @@ fn poll_binding(
                             decision
                         } else if let Some(repaired) = repair_reverse_session_from_forward(
                             sessions,
+                            binding.session_map_fd,
                             shared_sessions,
                             peer_worker_commands,
                             forwarding,
@@ -1812,18 +1847,18 @@ fn poll_binding(
                                     meta.protocol,
                                 )
                             })
-                                    .unwrap_or_else(|| {
-                                        enforce_ha_resolution_snapshot(
-                                            forwarding,
-                                            ha_state,
-                                            now_secs,
-                                            lookup_forwarding_resolution_with_dynamic(
-                                                forwarding,
-                                                dynamic_neighbors,
-                                                resolution_target,
-                                            ),
-                                        )
-                                    });
+                            .unwrap_or_else(|| {
+                                enforce_ha_resolution_snapshot(
+                                    forwarding,
+                                    ha_state,
+                                    now_secs,
+                                    lookup_forwarding_resolution_with_dynamic(
+                                        forwarding,
+                                        dynamic_neighbors,
+                                        resolution_target,
+                                    ),
+                                )
+                            });
                             let mut decision = SessionDecision {
                                 resolution,
                                 nat: NatDecision::default(),
@@ -1880,6 +1915,10 @@ fn poll_binding(
                                         meta.protocol,
                                         meta.tcp_flags,
                                     ) {
+                                        let _ = publish_live_session_key(
+                                            binding.session_map_fd,
+                                            &flow.forward_key,
+                                        );
                                         created += 1;
                                         let forward_entry = SyncedSessionEntry {
                                             key: flow.forward_key.clone(),
@@ -1931,6 +1970,10 @@ fn poll_binding(
                                         meta.protocol,
                                         meta.tcp_flags,
                                     ) {
+                                        let _ = publish_live_session_key(
+                                            binding.session_map_fd,
+                                            &reverse_key,
+                                        );
                                         created += 1;
                                         let reverse_entry = SyncedSessionEntry {
                                             key: reverse_key,
@@ -2003,16 +2046,15 @@ fn poll_binding(
                         if decision.nat.rewrite_dst.is_some() {
                             counters.dnat_packets += 1;
                         }
-                        if let Some(request) =
-                            build_live_forward_request(
-                                &ident,
-                                desc,
-                                meta,
-                                &decision,
-                                forwarding,
-                                flow.as_ref(),
-                            )
-                        {
+                        if let Some(request) = build_live_forward_request(
+                            unsafe { &*area },
+                            &ident,
+                            desc,
+                            meta,
+                            &decision,
+                            forwarding,
+                            flow.as_ref(),
+                        ) {
                             binding.scratch_forwards.push(request);
                             recycle_now = false;
                         }
@@ -2115,6 +2157,7 @@ fn poll_binding(
 }
 
 fn build_live_forward_request(
+    area: &MmapArea,
     ingress_ident: &BindingIdentity,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
@@ -2134,9 +2177,29 @@ fn build_live_forward_request(
         desc,
         meta,
         decision: *decision,
-        expected_ports: flow.map(|flow| (flow.forward_key.src_port, flow.forward_key.dst_port)),
+        // The XDP-side metadata is the authoritative tuple for redirected packets. Some
+        // live AF_XDP frames arrive with transport bytes that do not match the original
+        // XDP-validated tuple, and trusting the frame bytes can put the wrong 5-tuple
+        // on the wire. Fall back to the frame only when metadata is incomplete.
+        expected_ports: authoritative_forward_ports(area, desc, meta),
         flow_key: flow.map(|flow| flow.forward_key.clone()),
     })
+}
+
+fn authoritative_forward_ports(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+) -> Option<(u16, u16)> {
+    if !matches!(meta.protocol, PROTO_TCP | PROTO_UDP) {
+        return None;
+    }
+    if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
+        return Some((meta.flow_src_port, meta.flow_dst_port));
+    }
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    let l4 = frame_l4_offset(frame, meta.addr_family)?;
+    parse_flow_ports(frame, l4, meta.protocol)
 }
 
 fn enqueue_pending_forwards(
@@ -2182,6 +2245,7 @@ fn enqueue_pending_forwards(
                 request.meta,
                 &request.decision,
                 forwarding,
+                request.expected_ports,
             ) {
                 for frame in segmented {
                     target_binding.pending_tx_local.push_back(TxRequest {
@@ -2955,6 +3019,7 @@ fn find_target_binding_mut<'a>(
 fn flush_session_deltas(
     ident: &BindingIdentity,
     live: &BindingLiveState,
+    session_map_fd: c_int,
     deltas: Vec<SessionDelta>,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
@@ -3003,8 +3068,10 @@ fn flush_session_deltas(
             push_recent_session_delta(&mut recent, info);
         }
         if delta.kind == SessionDeltaKind::Close {
+            delete_live_session_key(session_map_fd, &delta.key);
             remove_shared_session(shared_sessions, &delta.key);
             let reverse_key = reverse_session_key(&delta.key, delta.decision.nat);
+            delete_live_session_key(session_map_fd, &reverse_key);
             remove_shared_session(shared_sessions, &reverse_key);
             replicate_session_delete(peer_worker_commands, &delta.key);
             replicate_session_delete(
@@ -3272,8 +3339,7 @@ fn transmit_batch(
                 .umem
                 .area
                 .slice_mut_unchecked(offset as usize, req.bytes.len())
-        })
-        else {
+        }) else {
             binding.free_tx_frames.push_front(offset);
             return Err(TxError::Drop(format!(
                 "tx frame slice out of range: offset={offset} len={}",
@@ -3742,6 +3808,7 @@ fn lookup_forwarding_resolution_for_session(
 fn apply_worker_commands(
     commands: &Arc<Mutex<VecDeque<WorkerCommand>>>,
     sessions: &mut SessionTable,
+    session_map_fd: c_int,
 ) {
     let pending = match commands.lock() {
         Ok(mut pending) => core::mem::take(&mut *pending),
@@ -3760,7 +3827,10 @@ fn apply_worker_commands(
                     entry.tcp_flags,
                 );
             }
-            WorkerCommand::DeleteSynced(key) => sessions.delete(&key),
+            WorkerCommand::DeleteSynced(key) => {
+                sessions.delete(&key);
+                delete_live_session_key(session_map_fd, &key);
+            }
         }
     }
 }
@@ -3812,6 +3882,8 @@ fn teardown_tcp_rst_flow(
     let reverse_key = reverse_session_key(forward_key, nat);
     sessions.delete(forward_key);
     sessions.delete(&reverse_key);
+    delete_live_session_key(current.session_map_fd, forward_key);
+    delete_live_session_key(current.session_map_fd, &reverse_key);
     remove_shared_session(shared_sessions, forward_key);
     remove_shared_session(shared_sessions, &reverse_key);
     replicate_session_delete(peer_worker_commands, forward_key);
@@ -3963,6 +4035,7 @@ fn lookup_shared_forward_nat_match(
 
 fn repair_reverse_session_from_forward(
     sessions: &mut SessionTable,
+    session_map_fd: c_int,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
@@ -4017,6 +4090,7 @@ fn repair_reverse_session_from_forward(
         protocol,
         tcp_flags,
     ) {
+        let _ = publish_live_session_key(session_map_fd, &flow.forward_key);
         let reverse_entry = SyncedSessionEntry {
             key: flow.forward_key.clone(),
             decision: reverse_decision,
@@ -4077,6 +4151,7 @@ fn worker_loop(
             plan.ring_entries,
             plan.xsk_map_fd,
             plan.heartbeat_map_fd,
+            plan.session_map_fd,
             plan.live.clone(),
             plan.shared_owner,
         ) {
@@ -4088,7 +4163,11 @@ fn worker_loop(
     let mut poll_start = 0usize;
     let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
     while !stop.load(Ordering::Relaxed) {
-        apply_worker_commands(&commands, &mut sessions);
+        let session_map_fd = bindings
+            .first()
+            .map(|binding| binding.session_map_fd)
+            .unwrap_or(-1);
+        apply_worker_commands(&commands, &mut sessions, session_map_fd);
         let loop_now_ns = monotonic_nanos();
         let loop_now_secs = loop_now_ns / 1_000_000_000;
         let ha_runtime = ha_state.load();
@@ -4139,6 +4218,7 @@ fn worker_loop(
                 flush_session_deltas(
                     &ident,
                     &binding.live,
+                    binding.session_map_fd,
                     sessions.drain_deltas(256),
                     &shared_sessions,
                     &recent_session_deltas,
@@ -5567,6 +5647,7 @@ fn segment_forwarded_tcp_frames(
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
     forwarding: &ForwardingState,
+    expected_ports: Option<(u16, u16)>,
 ) -> Option<Vec<Vec<u8>>> {
     if meta.protocol != PROTO_TCP {
         return None;
@@ -5684,7 +5765,9 @@ fn segment_forwarded_tcp_frames(
 
         match meta.addr_family as i32 {
             libc::AF_INET => {
-                packet.get_mut(2..4)?.copy_from_slice(&(total_ip_len as u16).to_be_bytes());
+                packet
+                    .get_mut(2..4)?
+                    .copy_from_slice(&(total_ip_len as u16).to_be_bytes());
                 if packet[8] <= 1 {
                     return None;
                 }
@@ -5694,7 +5777,9 @@ fn segment_forwarded_tcp_frames(
                 packet[8] -= 1;
                 packet.get_mut(10..12)?.copy_from_slice(&[0, 0]);
                 let ip_sum = checksum16(packet.get(..ip_header_len)?);
-                packet.get_mut(10..12)?.copy_from_slice(&ip_sum.to_be_bytes());
+                packet
+                    .get_mut(10..12)?
+                    .copy_from_slice(&ip_sum.to_be_bytes());
                 recompute_l4_checksum_ipv4(packet, ip_header_len, meta.protocol, false)?;
             }
             libc::AF_INET6 => {
@@ -5712,6 +5797,12 @@ fn segment_forwarded_tcp_frames(
             }
             _ => return None,
         }
+        let _ = enforce_expected_ports(
+            &mut frame_out,
+            meta.addr_family,
+            meta.protocol,
+            expected_ports,
+        );
         out.push(frame_out);
         data_offset += chunk_len;
     }
@@ -6803,6 +6894,67 @@ impl Drop for OwnedFd {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserspaceSessionMapKey {
+    addr_family: u8,
+    protocol: u8,
+    pad: u16,
+    src_port: u16,
+    dst_port: u16,
+    src_addr: [u8; 16],
+    dst_addr: [u8; 16],
+}
+
+fn session_map_key(key: &SessionKey) -> UserspaceSessionMapKey {
+    fn encode_ip(ip: &IpAddr) -> [u8; 16] {
+        match ip {
+            IpAddr::V4(v4) => {
+                let mut out = [0u8; 16];
+                out[..4].copy_from_slice(&v4.octets());
+                out
+            }
+            IpAddr::V6(v6) => v6.octets(),
+        }
+    }
+    UserspaceSessionMapKey {
+        addr_family: key.addr_family,
+        protocol: key.protocol,
+        pad: 0,
+        src_port: key.src_port,
+        dst_port: key.dst_port,
+        src_addr: encode_ip(&key.src_ip),
+        dst_addr: encode_ip(&key.dst_ip),
+    }
+}
+
+fn publish_live_session_key(map_fd: c_int, key: &SessionKey) -> io::Result<()> {
+    let map_key = session_map_key(key);
+    let value = 1u8;
+    let rc = unsafe {
+        libbpf_sys::bpf_map_update_elem(
+            map_fd,
+            (&map_key as *const UserspaceSessionMapKey).cast::<c_void>(),
+            (&value as *const u8).cast::<c_void>(),
+            libbpf_sys::BPF_ANY as u64,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn delete_live_session_key(map_fd: c_int, key: &SessionKey) {
+    let map_key = session_map_key(key);
+    let _ = unsafe {
+        libbpf_sys::bpf_map_delete_elem(
+            map_fd,
+            (&map_key as *const UserspaceSessionMapKey).cast::<c_void>(),
+        )
+    };
+}
+
 struct MmapArea {
     ptr: NonNull<u8>,
     len: usize,
@@ -7065,14 +7217,10 @@ impl BindingLiveState {
             debug_pending_fill_frames: self.debug_pending_fill_frames.load(Ordering::Relaxed),
             debug_spare_fill_frames: self.debug_spare_fill_frames.load(Ordering::Relaxed),
             debug_free_tx_frames: self.debug_free_tx_frames.load(Ordering::Relaxed),
-            debug_pending_tx_prepared: self
-                .debug_pending_tx_prepared
-                .load(Ordering::Relaxed),
+            debug_pending_tx_prepared: self.debug_pending_tx_prepared.load(Ordering::Relaxed),
             debug_pending_tx_local: self.debug_pending_tx_local.load(Ordering::Relaxed),
             debug_outstanding_tx: self.debug_outstanding_tx.load(Ordering::Relaxed),
-            debug_in_flight_recycles: self
-                .debug_in_flight_recycles
-                .load(Ordering::Relaxed),
+            debug_in_flight_recycles: self.debug_in_flight_recycles.load(Ordering::Relaxed),
             last_heartbeat: monotonic_timestamp_to_datetime(
                 self.last_heartbeat.load(Ordering::Relaxed),
                 now_mono,
@@ -7152,26 +7300,26 @@ impl BindingLiveState {
 }
 
 fn update_binding_debug_state(binding: &BindingWorker) {
-    binding.live.debug_pending_fill_frames.store(
-        binding.pending_fill_frames.len() as u32,
-        Ordering::Relaxed,
-    );
-    binding.live.debug_spare_fill_frames.store(
-        binding.spare_fill_frames.len() as u32,
-        Ordering::Relaxed,
-    );
-    binding.live.debug_free_tx_frames.store(
-        binding.free_tx_frames.len() as u32,
-        Ordering::Relaxed,
-    );
-    binding.live.debug_pending_tx_prepared.store(
-        binding.pending_tx_prepared.len() as u32,
-        Ordering::Relaxed,
-    );
-    binding.live.debug_pending_tx_local.store(
-        binding.pending_tx_local.len() as u32,
-        Ordering::Relaxed,
-    );
+    binding
+        .live
+        .debug_pending_fill_frames
+        .store(binding.pending_fill_frames.len() as u32, Ordering::Relaxed);
+    binding
+        .live
+        .debug_spare_fill_frames
+        .store(binding.spare_fill_frames.len() as u32, Ordering::Relaxed);
+    binding
+        .live
+        .debug_free_tx_frames
+        .store(binding.free_tx_frames.len() as u32, Ordering::Relaxed);
+    binding
+        .live
+        .debug_pending_tx_prepared
+        .store(binding.pending_tx_prepared.len() as u32, Ordering::Relaxed);
+    binding
+        .live
+        .debug_pending_tx_local
+        .store(binding.pending_tx_local.len() as u32, Ordering::Relaxed);
     binding
         .live
         .debug_outstanding_tx
@@ -7805,9 +7953,7 @@ mod tests {
         frame.extend_from_slice(&0x8100u16.to_be_bytes());
         frame.extend_from_slice(&80u16.to_be_bytes());
         frame.extend_from_slice(&0x86ddu16.to_be_bytes());
-        frame.extend_from_slice(&[
-            0x60, 0, 0, 0, 0, 20, PROTO_TCP, 64,
-        ]);
+        frame.extend_from_slice(&[0x60, 0, 0, 0, 0, 20, PROTO_TCP, 64]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
         frame.extend_from_slice(&src_port.to_be_bytes());
@@ -8282,12 +8428,9 @@ mod tests {
         .expect("frame destination");
         assert_eq!(resolution_target, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
 
-        let resolved = interface_nat_local_resolution_on_session_miss(
-            &state,
-            resolution_target,
-            PROTO_ICMP,
-        )
-        .expect("nat local delivery");
+        let resolved =
+            interface_nat_local_resolution_on_session_miss(&state, resolution_target, PROTO_ICMP)
+                .expect("nat local delivery");
         assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
         assert_eq!(resolved.local_ifindex, 12);
     }
@@ -8316,13 +8459,9 @@ mod tests {
     #[test]
     fn ingress_interface_local_resolution_matches_vlan_local_address() {
         let state = build_forwarding_state(&nat_snapshot());
-        let resolved = ingress_interface_local_resolution(
-            &state,
-            11,
-            80,
-            "172.16.80.8".parse().expect("dst"),
-        )
-        .expect("ingress local delivery");
+        let resolved =
+            ingress_interface_local_resolution(&state, 11, 80, "172.16.80.8".parse().expect("dst"))
+                .expect("ingress local delivery");
         assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
         assert_eq!(resolved.local_ifindex, 12);
     }
@@ -9153,18 +9292,13 @@ mod tests {
             80,
             0x86dd,
         );
-        frame.extend_from_slice(&[
-            0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 63,
-        ]);
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 63]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
         frame.extend_from_slice(&[
             0x04, 0x01, 0x14, 0x51, // wrong src port 1025 -> 5201
-            0x31, 0x96, 0xc8, 0x32,
-            0x08, 0xf0, 0x5a, 0xc6,
-            0x50, 0x18, 0x00, 0x40,
-            0x00, 0x00, 0x00, 0x00,
-            b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+            0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
+            0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
         ]);
         recompute_l4_checksum_ipv6(&mut frame[18..], PROTO_TCP).expect("initial checksum");
         assert!(tcp_checksum_ok_ipv6(&frame[18..]));
@@ -9193,9 +9327,7 @@ mod tests {
             0,
             0x86dd,
         );
-        frame.extend_from_slice(&[
-            0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64,
-        ]);
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
         frame.extend_from_slice(&[
@@ -9276,9 +9408,7 @@ mod tests {
             0,
             0x86dd,
         );
-        frame.extend_from_slice(&[
-            0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64,
-        ]);
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
         frame.extend_from_slice(&[
@@ -9325,9 +9455,18 @@ mod tests {
             },
         };
         let mut out = [0u8; 256];
-        let frame_len =
-            build_forwarded_frame_into(&mut out, &area, XdpDesc { addr: 0, len: frame.len() as u32, options: 0 }, meta, &decision)
-                .expect("build forwarded frame");
+        let frame_len = build_forwarded_frame_into(
+            &mut out,
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &decision,
+        )
+        .expect("build forwarded frame");
         let out = &out[..frame_len];
         assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x8100);
         assert_eq!(u16::from_be_bytes([out[14], out[15]]) & 0x0fff, 80);
@@ -9354,9 +9493,7 @@ mod tests {
             0,
             0x86dd,
         );
-        frame.extend_from_slice(&[
-            0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64,
-        ]);
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
         frame.extend_from_slice(&real_src_port.to_be_bytes());
@@ -9421,6 +9558,183 @@ mod tests {
     }
 
     #[test]
+    fn build_live_forward_request_prefers_metadata_ports_for_ipv6_tcp() {
+        let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+        let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+        let real_src_port = 38276u16;
+        let real_dst_port = 5201u16;
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x86dd,
+        );
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&real_src_port.to_be_bytes());
+        frame.extend_from_slice(&real_dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
+            0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        ]);
+        recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            flow_src_port: 1025,
+            flow_dst_port: real_dst_port,
+            ..UserspaceDpMeta::default()
+        };
+        let bogus_flow = SessionFlow {
+            src_ip: IpAddr::V6(src_ip),
+            dst_ip: IpAddr::V6(dst_ip),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V6(src_ip),
+                dst_ip: IpAddr::V6(dst_ip),
+                src_port: 1025,
+                dst_port: real_dst_port,
+            },
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 11,
+                next_hop: Some(IpAddr::V6(dst_ip)),
+                neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V6("2001:559:8585:80::8".parse().unwrap())),
+                ..NatDecision::default()
+            },
+        };
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            12,
+            EgressInterface {
+                bind_ifindex: 11,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+                zone: "wan".to_string(),
+                redundancy_group: 1,
+                primary_v4: None,
+                primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
+            },
+        );
+        let ingress = BindingIdentity {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-1"),
+            ifindex: 10,
+        };
+
+        let req = build_live_forward_request(
+            &area,
+            &ingress,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &decision,
+            &forwarding,
+            Some(&bogus_flow),
+        )
+        .expect("request");
+        assert_eq!(req.expected_ports, Some((1025, real_dst_port)));
+    }
+
+    #[test]
+    fn build_live_forward_request_uses_metadata_ports_when_frame_ports_unavailable() {
+        let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+        let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+        let area = MmapArea::new(4096).expect("mmap");
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            flow_src_port: 1025,
+            flow_dst_port: 5201,
+            ..UserspaceDpMeta::default()
+        };
+        let bogus_flow = SessionFlow {
+            src_ip: IpAddr::V6(src_ip),
+            dst_ip: IpAddr::V6(dst_ip),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V6(src_ip),
+                dst_ip: IpAddr::V6(dst_ip),
+                src_port: 1025,
+                dst_port: 5201,
+            },
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 11,
+                next_hop: Some(IpAddr::V6(dst_ip)),
+                neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V6("2001:559:8585:80::8".parse().unwrap())),
+                ..NatDecision::default()
+            },
+        };
+        let ingress_ident = BindingIdentity {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-1"),
+            ifindex: 5,
+        };
+        let req = build_live_forward_request(
+            &area,
+            &ingress_ident,
+            XdpDesc {
+                addr: 0,
+                len: 0,
+                options: 0,
+            },
+            meta,
+            &decision,
+            &ForwardingState::default(),
+            Some(&bogus_flow),
+        )
+        .expect("request");
+        assert_eq!(req.expected_ports, Some((1025, 5201)));
+    }
+
+    #[test]
     fn build_forwarded_frame_into_keeps_ipv6_ports_when_frame_and_metadata_disagree() {
         let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
         let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
@@ -9434,19 +9748,14 @@ mod tests {
             0,
             0x86dd,
         );
-        frame.extend_from_slice(&[
-            0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64,
-        ]);
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
         frame.extend_from_slice(&real_src_port.to_be_bytes());
         frame.extend_from_slice(&real_dst_port.to_be_bytes());
         frame.extend_from_slice(&[
-            0x31, 0x96, 0xc8, 0x32,
-            0x08, 0xf0, 0x5a, 0xc6,
-            0x50, 0x18, 0x00, 0x40,
-            0x00, 0x00, 0x00, 0x00,
-            b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+            0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
+            0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
         ]);
         recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
 
@@ -9483,9 +9792,18 @@ mod tests {
             },
         };
         let mut out = [0u8; 256];
-        let frame_len =
-            build_forwarded_frame_into(&mut out, &area, XdpDesc { addr: 0, len: frame.len() as u32, options: 0 }, meta, &decision)
-                .expect("build forwarded frame");
+        let frame_len = build_forwarded_frame_into(
+            &mut out,
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &decision,
+        )
+        .expect("build forwarded frame");
         let out = &out[..frame_len];
         assert_eq!(tcp_ports_ipv6(&out[18..]), (real_src_port, real_dst_port));
         assert!(tcp_checksum_ok_ipv6(&out[18..]));
@@ -9513,11 +9831,8 @@ mod tests {
         frame.extend_from_slice(&real_src_port.to_be_bytes());
         frame.extend_from_slice(&real_dst_port.to_be_bytes());
         frame.extend_from_slice(&[
-            0x31, 0x96, 0xc8, 0x32,
-            0x08, 0xf0, 0x5a, 0xc6,
-            0x50, 0x18, 0x00, 0x40,
-            0x00, 0x00, 0x00, 0x00,
-            b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+            0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
+            0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
         ]);
         let ip_sum = checksum16(&frame[14..34]);
         frame[24] = (ip_sum >> 8) as u8;
@@ -9584,6 +9899,8 @@ mod tests {
     fn segment_forwarded_tcp_frames_splits_ipv6_snat_payload_by_mtu() {
         let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
         let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+        let src_port = 54688u16;
+        let dst_port = 5201u16;
         let mut frame = Vec::new();
         write_eth_header(
             &mut frame,
@@ -9595,12 +9912,20 @@ mod tests {
         let tcp_payload_len = 4096usize;
         let plen = (20 + tcp_payload_len) as u16;
         frame.extend_from_slice(&[
-            0x60, 0x00, 0x00, 0x00, (plen >> 8) as u8, plen as u8, PROTO_TCP, 64,
+            0x60,
+            0x00,
+            0x00,
+            0x00,
+            (plen >> 8) as u8,
+            plen as u8,
+            PROTO_TCP,
+            64,
         ]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
         frame.extend_from_slice(&[
-            0xd5, 0xa0, 0x14, 0x51, // 54688 -> 5201
             0x31, 0x96, 0xc8, 0x32, // seq
             0x08, 0xf0, 0x5a, 0xc6, // ack
             0x50, 0x18, 0x00, 0x40, // data offset/flags/window
@@ -9666,6 +9991,7 @@ mod tests {
             meta,
             &decision,
             &forwarding,
+            Some((src_port, dst_port)),
         )
         .expect("segmented");
         assert!(segments.len() > 1);
@@ -9686,6 +10012,109 @@ mod tests {
             }
         }
         assert_eq!(total_payload, tcp_payload_len);
+    }
+
+    #[test]
+    fn segment_forwarded_tcp_frames_repairs_ipv6_tcp_ports_when_metadata_disagrees() {
+        let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+        let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+        let src_port = 38276u16;
+        let dst_port = 5201u16;
+        let tcp_payload_len = 4096usize;
+        let plen = (20 + tcp_payload_len) as u16;
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x86dd,
+        );
+        frame.extend_from_slice(&[
+            0x60,
+            0x00,
+            0x00,
+            0x00,
+            (plen >> 8) as u8,
+            plen as u8,
+            PROTO_TCP,
+            64,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
+            0x00, 0x00,
+        ]);
+        frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+        recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+
+        let mut area = MmapArea::new(8192).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            flow_src_port: 1025,
+            flow_dst_port: dst_port,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 11,
+                next_hop: Some(IpAddr::V6(dst_ip)),
+                neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V6("2001:559:8585:80::8".parse().unwrap())),
+                ..NatDecision::default()
+            },
+        };
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            12,
+            EgressInterface {
+                bind_ifindex: 11,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+                zone: "wan".to_string(),
+                redundancy_group: 1,
+                primary_v4: None,
+                primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
+            },
+        );
+        let segments = segment_forwarded_tcp_frames(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &decision,
+            &forwarding,
+            Some((src_port, dst_port)),
+        )
+        .expect("segmented");
+        assert!(segments.len() > 1);
+        for seg in &segments {
+            assert_eq!(tcp_ports_ipv6(&seg[18..]), (src_port, dst_port));
+            assert!(tcp_checksum_ok_ipv6(&seg[18..]));
+        }
     }
 
     #[test]
@@ -9730,8 +10159,7 @@ mod tests {
             0x80, 0x10, 0x00, 0x3f, // data offset/flags/window
             0x00, 0x00, 0x00, 0x00, // checksum/urgent
             0x01, 0x01, 0x08, 0x0a, // TCP timestamp option
-            0x91, 0x9b, 0x0d, 0x5f,
-            0xd3, 0x53, 0x0f, 0x7f,
+            0x91, 0x9b, 0x0d, 0x5f, 0xd3, 0x53, 0x0f, 0x7f,
         ]);
         frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
         let ip_sum = checksum16(&frame[14..34]);
@@ -9796,6 +10224,7 @@ mod tests {
             meta,
             &decision,
             &forwarding,
+            Some((src_port, dst_port)),
         )
         .expect("segmented");
         assert!(segments.len() > 1);
@@ -9903,10 +10332,10 @@ mod tests {
             0x0800,
         );
         frame.extend_from_slice(&[
-            0x45, 0x00, 0x00, 0x30, 0x00, 0x02, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 172, 16,
-            80, 200, 172, 16, 80, 8, 0x14, 0x51, 0x9c, 0x40, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
-            0x00, 0x02, 0x50, 0x12, 0x20, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd',
-            b'a', b't', b'a',
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x02, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 172, 16, 80,
+            200, 172, 16, 80, 8, 0x14, 0x51, 0x9c, 0x40, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x02, 0x50, 0x12, 0x20, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a',
+            b't', b'a',
         ]);
         let ip_sum = checksum16(&frame[18..38]);
         frame[28] = (ip_sum >> 8) as u8;
