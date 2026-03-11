@@ -32,6 +32,18 @@ const NEXTHDR_FRAGMENT: u8 = 44;
 const NEXTHDR_AUTH: u8 = 51;
 const NEXTHDR_DEST: u8 = 60;
 const NEXTHDR_NONE: u8 = 59;
+const USERSPACE_FALLBACK_REASON_CTRL_DISABLED: u32 = 0;
+const USERSPACE_FALLBACK_REASON_PARSE_FAIL: u32 = 1;
+const USERSPACE_FALLBACK_REASON_BINDING_MISSING: u32 = 2;
+const USERSPACE_FALLBACK_REASON_BINDING_NOT_READY: u32 = 3;
+const USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING: u32 = 4;
+const USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE: u32 = 5;
+const USERSPACE_FALLBACK_REASON_ICMP: u32 = 6;
+const USERSPACE_FALLBACK_REASON_EARLY_FILTER: u32 = 7;
+const USERSPACE_FALLBACK_REASON_ADJUST_META: u32 = 8;
+const USERSPACE_FALLBACK_REASON_META_BOUNDS: u32 = 9;
+const USERSPACE_FALLBACK_REASON_REDIRECT_ERR: u32 = 10;
+const USERSPACE_FALLBACK_REASON_MAX: u32 = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -177,8 +189,18 @@ static USERSPACE_LOCAL_V4: HashMap<u32, u8> = HashMap::with_max_entries(8192, 0)
 #[map(name = "userspace_local_v6")]
 static USERSPACE_LOCAL_V6: HashMap<UserspaceLocalV6Key, u8> = HashMap::with_max_entries(8192, 0);
 
+#[map(name = "userspace_interface_nat_v4")]
+static USERSPACE_INTERFACE_NAT_V4: HashMap<u32, u8> = HashMap::with_max_entries(8192, 0);
+
+#[map(name = "userspace_interface_nat_v6")]
+static USERSPACE_INTERFACE_NAT_V6: HashMap<UserspaceLocalV6Key, u8> =
+    HashMap::with_max_entries(8192, 0);
+
 #[map(name = "userspace_fallback_progs")]
 static USERSPACE_FALLBACK_PROGS: ProgramArray = ProgramArray::with_max_entries(1, 0);
+
+#[map(name = "userspace_fallback_stats")]
+static USERSPACE_FALLBACK_STATS: Array<u64> = Array::with_max_entries(USERSPACE_FALLBACK_REASON_MAX, 0);
 
 #[xdp]
 pub fn xdp_userspace_prog(ctx: XdpContext) -> u32 {
@@ -191,7 +213,7 @@ pub fn xdp_userspace_prog(ctx: XdpContext) -> u32 {
 fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let ctrl = USERSPACE_CTRL.get(0).ok_or(0i64)?;
     if ctrl.enabled == 0 || ctrl.metadata_version != USERSPACE_META_VERSION as u32 {
-        return fallback_to_main(ctx);
+        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
     }
 
     let data = ctx.data();
@@ -205,7 +227,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         _ => return Ok(xdp_action::XDP_PASS),
     };
     let Some(parsed) = parsed else {
-        return fallback_to_main(ctx);
+        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
     };
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
@@ -213,7 +235,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         return Ok(xdp_action::XDP_PASS);
     }
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
-    let selected_queue = select_userspace_queue(ctrl, &parsed, rx_queue_index);
+    let selected_queue = select_userspace_queue(ctrl, rx_queue_index, &parsed);
     let binding_key = UserspaceBindingKey {
         ifindex: ingress_ifindex,
         queue_id: selected_queue,
@@ -227,14 +249,14 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         binding = unsafe { USERSPACE_BINDINGS.get(&fallback_key) };
     }
     let Some(binding) = binding else {
-        return fallback_to_main(&ctx);
+        return fallback_to_main(&ctx, USERSPACE_FALLBACK_REASON_BINDING_MISSING);
     };
     if (binding.flags & USERSPACE_BINDING_READY) == 0 {
-        return fallback_to_main(&ctx);
+        return fallback_to_main(&ctx, USERSPACE_FALLBACK_REASON_BINDING_NOT_READY);
     }
     let last_heartbeat = unsafe { USERSPACE_HEARTBEAT.get(&binding.slot) };
     let Some(last_heartbeat) = last_heartbeat else {
-        return fallback_to_main(ctx);
+        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
     };
     let timeout_ms = if ctrl.heartbeat_timeout_ms == 0 {
         USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS
@@ -244,12 +266,18 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let timeout_ns = (timeout_ms as u64) * 1_000_000;
     let now_ns = unsafe { bpf_ktime_get_ns() };
     if now_ns < *last_heartbeat || now_ns.saturating_sub(*last_heartbeat) > timeout_ns {
-        return fallback_to_main(ctx);
+        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
     }
 
     let packet_len = data_end.saturating_sub(data);
+    if matches!(parsed.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_ICMP);
+    }
     if should_fallback_early(&parsed) {
-        return fallback_to_main(ctx);
+        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
+    }
+    if is_icmp_to_interface_nat_local(&parsed) {
+        return Ok(xdp_action::XDP_PASS);
     }
     if is_local_destination(&parsed) {
         return Ok(xdp_action::XDP_PASS);
@@ -257,12 +285,12 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
     if adjust_rc != 0 {
-        return fallback_to_main(ctx);
+        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_ADJUST_META);
     }
 
     let meta_ptr = ctx.metadata() as *mut UserspaceDpMeta;
     if (meta_ptr as usize).saturating_add(mem::size_of::<UserspaceDpMeta>()) > ctx.metadata_end() {
-        return fallback_to_main(ctx);
+        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_META_BOUNDS);
     }
 
     unsafe {
@@ -298,15 +326,27 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
 
     match USERSPACE_XSK_MAP.redirect(binding.slot, 0) {
         Ok(action) => Ok(action),
-        Err(_) => fallback_to_main(ctx),
+        Err(_) => fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_REDIRECT_ERR),
     }
 }
 
-fn fallback_to_main(ctx: &XdpContext) -> Result<u32, i64> {
+fn fallback_to_main(ctx: &XdpContext, reason: u32) -> Result<u32, i64> {
+    incr_fallback_stat(reason);
     unsafe {
         let _ = USERSPACE_FALLBACK_PROGS.tail_call(ctx, USERSPACE_FALLBACK_MAIN);
     }
     Ok(xdp_action::XDP_DROP)
+}
+
+fn incr_fallback_stat(reason: u32) {
+    if reason >= USERSPACE_FALLBACK_REASON_MAX {
+        return;
+    }
+    if let Some(ptr) = USERSPACE_FALLBACK_STATS.get_ptr_mut(reason) {
+        unsafe {
+            *ptr = (*ptr).saturating_add(1);
+        }
+    }
 }
 
 fn pass_to_kernel_or_abort() -> u32 {
@@ -321,6 +361,7 @@ struct ParsedPacket {
     payload_offset: u16,
     addr_family: u8,
     protocol: u8,
+    icmp_type: u8,
     tcp_flags: u8,
     flow_src_port: u16,
     flow_dst_port: u16,
@@ -361,7 +402,7 @@ fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
     let protocol = iph[9];
     let tos = iph[1];
     let l4_offset = l3_offset.checked_add(ihl as u16)?;
-    let (payload_offset, tcp_flags, flow_src_port, flow_dst_port) =
+    let (payload_offset, tcp_flags, flow_src_port, flow_dst_port, icmp_type) =
         parse_l4(data, data_end, l4_offset, protocol)?;
     let src_bytes = read_bytes(data, data_end, l3_offset as usize + 12, 4)?;
     let dst_bytes = read_bytes(data, data_end, l3_offset as usize + 16, 4)?;
@@ -376,6 +417,7 @@ fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
         payload_offset,
         addr_family: AF_INET,
         protocol,
+        icmp_type,
         tcp_flags,
         flow_src_port,
         flow_dst_port,
@@ -432,7 +474,7 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
 
     let flow_lbl0 = ip6[1];
     let dscp = ((version_priority & 0x0f) << 2) | (flow_lbl0 >> 6);
-    let (payload_offset, tcp_flags, flow_src_port, flow_dst_port) =
+    let (payload_offset, tcp_flags, flow_src_port, flow_dst_port, icmp_type) =
         parse_l4(data, data_end, offset, protocol)?;
     let mut src_addr = [0u8; 16];
     src_addr.copy_from_slice(read_bytes(data, data_end, l3_offset as usize + 8, 16)?);
@@ -445,6 +487,7 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
         payload_offset,
         addr_family: AF_INET6,
         protocol,
+        icmp_type,
         tcp_flags,
         flow_src_port,
         flow_dst_port,
@@ -479,11 +522,39 @@ fn should_fallback_early(pkt: &ParsedPacket) -> bool {
 
 fn is_local_destination(pkt: &ParsedPacket) -> bool {
     match pkt.addr_family {
-        AF_INET => unsafe { USERSPACE_LOCAL_V4.get(&pkt.dst_v4) }.is_some(),
+        AF_INET => {
+            if unsafe { USERSPACE_INTERFACE_NAT_V4.get(&pkt.dst_v4) }.is_some() {
+                return false;
+            }
+            unsafe { USERSPACE_LOCAL_V4.get(&pkt.dst_v4) }.is_some()
+        }
         AF_INET6 => {
-            unsafe { USERSPACE_LOCAL_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_v6 }) }.is_some()
+            let key = UserspaceLocalV6Key { addr: pkt.dst_v6 };
+            if unsafe { USERSPACE_INTERFACE_NAT_V6.get(&key) }.is_some() {
+                return false;
+            }
+            unsafe { USERSPACE_LOCAL_V6.get(&key) }.is_some()
         }
         _ => true,
+    }
+}
+
+fn is_icmp_to_interface_nat_local(pkt: &ParsedPacket) -> bool {
+    match pkt.addr_family {
+        AF_INET => {
+            if pkt.protocol != PROTO_ICMP || pkt.icmp_type != 8 {
+                return false;
+            }
+            unsafe { USERSPACE_INTERFACE_NAT_V4.get(&pkt.dst_v4) }.is_some()
+        }
+        AF_INET6 => {
+            if pkt.protocol != PROTO_ICMPV6 || pkt.icmp_type != 128 {
+                return false;
+            }
+            unsafe { USERSPACE_INTERFACE_NAT_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_v6 }) }
+                .is_some()
+        }
+        _ => false,
     }
 }
 
@@ -499,7 +570,7 @@ fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
     ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80
 }
 
-fn select_userspace_queue(ctrl: &UserspaceCtrl, pkt: &ParsedPacket, rx_queue_index: u32) -> u32 {
+fn select_userspace_queue(ctrl: &UserspaceCtrl, rx_queue_index: u32, parsed: &ParsedPacket) -> u32 {
     let queue_count = if ctrl.queue_count == 0 {
         ctrl.workers
     } else {
@@ -508,63 +579,33 @@ fn select_userspace_queue(ctrl: &UserspaceCtrl, pkt: &ParsedPacket, rx_queue_ind
     if queue_count <= 1 {
         return 0;
     }
-    let selected = flow_hash(pkt) % queue_count;
-    if selected >= queue_count {
-        rx_queue_index % queue_count
+    if let Some(hash) = symmetric_flow_hash(parsed) {
+        return hash % queue_count;
+    }
+    rx_queue_index % queue_count
+}
+
+fn symmetric_flow_hash(parsed: &ParsedPacket) -> Option<u32> {
+    if parsed.protocol == 0 {
+        return None;
+    }
+    let (lo_port, hi_port) = if parsed.flow_src_port <= parsed.flow_dst_port {
+        (parsed.flow_src_port, parsed.flow_dst_port)
     } else {
-        selected
+        (parsed.flow_dst_port, parsed.flow_src_port)
+    };
+    if lo_port == 0 && hi_port == 0 {
+        return None;
     }
-}
-
-fn flow_hash(pkt: &ParsedPacket) -> u32 {
-    let mut h = ((pkt.addr_family as u32) << 24) ^ ((pkt.protocol as u32) << 16);
-    let (port_lo, port_hi) = ordered_ports(pkt.flow_src_port, pkt.flow_dst_port);
-    h ^= ((port_lo as u32) << 16) | (port_hi as u32);
-    match pkt.addr_family {
-        AF_INET => {
-            let src = u32::from_be_bytes([
-                pkt.src_addr[0],
-                pkt.src_addr[1],
-                pkt.src_addr[2],
-                pkt.src_addr[3],
-            ]);
-            h ^= src ^ pkt.dst_v4;
-        }
-        AF_INET6 => {
-            h ^= ipv6_addr_hash(pkt.src_addr, pkt.dst_v6);
-        }
-        _ => {}
-    }
-    mix32(h)
-}
-
-fn ordered_ports(a: u16, b: u16) -> (u16, u16) {
-    if a <= b { (a, b) } else { (b, a) }
-}
-
-fn ipv6_addr_hash(src: [u8; 16], dst: [u8; 16]) -> u32 {
-    let s0 = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
-    let s1 = u32::from_be_bytes([src[4], src[5], src[6], src[7]]);
-    let s2 = u32::from_be_bytes([src[8], src[9], src[10], src[11]]);
-    let s3 = u32::from_be_bytes([src[12], src[13], src[14], src[15]]);
-    let d0 = u32::from_be_bytes([dst[0], dst[1], dst[2], dst[3]]);
-    let d1 = u32::from_be_bytes([dst[4], dst[5], dst[6], dst[7]]);
-    let d2 = u32::from_be_bytes([dst[8], dst[9], dst[10], dst[11]]);
-    let d3 = u32::from_be_bytes([dst[12], dst[13], dst[14], dst[15]]);
-    let x0 = s0 ^ d0;
-    let x1 = s1 ^ d1;
-    let x2 = s2 ^ d2;
-    let x3 = s3 ^ d3;
-    x0.rotate_left(5) ^ x1.rotate_left(11) ^ x2.rotate_left(17) ^ x3.rotate_left(23)
-}
-
-fn mix32(mut x: u32) -> u32 {
-    x ^= x >> 16;
-    x = x.wrapping_mul(0x7feb_352d);
-    x ^= x >> 15;
-    x = x.wrapping_mul(0x846c_a68b);
-    x ^= x >> 16;
-    x
+    let mut hash = 0x9e37_79b9u32;
+    hash ^= u32::from(parsed.addr_family).wrapping_mul(0x85eb_ca6b);
+    hash = hash.rotate_left(13);
+    hash ^= u32::from(parsed.protocol).wrapping_mul(0xc2b2_ae35);
+    hash = hash.rotate_left(13);
+    hash ^= u32::from(lo_port).wrapping_mul(0x27d4_eb2d);
+    hash = hash.rotate_left(13);
+    hash ^= u32::from(hi_port).wrapping_mul(0x1656_67b1);
+    Some(hash)
 }
 
 fn parse_l4(
@@ -572,7 +613,7 @@ fn parse_l4(
     data_end: usize,
     l4_offset: u16,
     protocol: u8,
-) -> Option<(u16, u8, u16, u16)> {
+) -> Option<(u16, u8, u16, u16, u8)> {
     match protocol {
         PROTO_TCP => {
             let bytes = read_bytes(data, data_end, l4_offset as usize, 14)?;
@@ -586,6 +627,7 @@ fn parse_l4(
                 bytes[13],
                 u16::from_be_bytes([bytes[0], bytes[1]]),
                 u16::from_be_bytes([bytes[2], bytes[3]]),
+                0,
             ))
         }
         PROTO_UDP => {
@@ -595,6 +637,7 @@ fn parse_l4(
                 0,
                 u16::from_be_bytes([bytes[0], bytes[1]]),
                 u16::from_be_bytes([bytes[2], bytes[3]]),
+                0,
             ))
         }
         PROTO_ICMP | PROTO_ICMPV6 => {
@@ -604,9 +647,10 @@ fn parse_l4(
                 0,
                 u16::from_be_bytes([bytes[4], bytes[5]]),
                 0,
+                bytes[0],
             ))
         }
-        _ => Some((l4_offset, 0, 0, 0)),
+        _ => Some((l4_offset, 0, 0, 0, 0)),
     }
 }
 
