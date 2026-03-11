@@ -43,7 +43,19 @@ const USERSPACE_FALLBACK_REASON_EARLY_FILTER: u32 = 7;
 const USERSPACE_FALLBACK_REASON_ADJUST_META: u32 = 8;
 const USERSPACE_FALLBACK_REASON_META_BOUNDS: u32 = 9;
 const USERSPACE_FALLBACK_REASON_REDIRECT_ERR: u32 = 10;
+const USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION: u32 = 11;
 const USERSPACE_FALLBACK_REASON_MAX: u32 = 16;
+const USERSPACE_TRACE_STAGE_RECEIVED: u32 = 1;
+const USERSPACE_TRACE_STAGE_BINDING_MISSING: u32 = 2;
+const USERSPACE_TRACE_STAGE_BINDING_NOT_READY: u32 = 3;
+const USERSPACE_TRACE_STAGE_HEARTBEAT_MISSING: u32 = 4;
+const USERSPACE_TRACE_STAGE_HEARTBEAT_STALE: u32 = 5;
+const USERSPACE_TRACE_STAGE_ICMP_FALLBACK: u32 = 6;
+const USERSPACE_TRACE_STAGE_EARLY_FILTER: u32 = 7;
+const USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL: u32 = 8;
+const USERSPACE_TRACE_STAGE_LOCAL_DESTINATION: u32 = 9;
+const USERSPACE_TRACE_STAGE_REDIRECT: u32 = 10;
+const USERSPACE_TRACE_STAGE_REDIRECT_ERR: u32 = 11;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -107,6 +119,38 @@ struct UserspaceBindingValue {
 #[derive(Clone, Copy)]
 struct UserspaceLocalV6Key {
     addr: [u8; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserspaceSessionKey {
+    addr_family: u8,
+    protocol: u8,
+    pad: u16,
+    src_port: u16,
+    dst_port: u16,
+    src_addr: [u8; 16],
+    dst_addr: [u8; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserspaceTraceValue {
+    seq: u64,
+    stage: u32,
+    reason: u32,
+    ingress_ifindex: u32,
+    rx_queue_index: u32,
+    selected_queue: u32,
+    slot: u32,
+    vlan_id: u16,
+    addr_family: u8,
+    protocol: u8,
+    tcp_flags: u8,
+    flow_src_port: u16,
+    flow_dst_port: u16,
+    src_addr: [u8; 16],
+    dst_addr: [u8; 16],
 }
 
 #[repr(C, packed)]
@@ -196,11 +240,18 @@ static USERSPACE_INTERFACE_NAT_V4: HashMap<u32, u8> = HashMap::with_max_entries(
 static USERSPACE_INTERFACE_NAT_V6: HashMap<UserspaceLocalV6Key, u8> =
     HashMap::with_max_entries(8192, 0);
 
+#[map(name = "userspace_sessions")]
+static USERSPACE_SESSIONS: HashMap<UserspaceSessionKey, u8> =
+    HashMap::with_max_entries(262144, 0);
+
 #[map(name = "userspace_fallback_progs")]
 static USERSPACE_FALLBACK_PROGS: ProgramArray = ProgramArray::with_max_entries(1, 0);
 
 #[map(name = "userspace_fallback_stats")]
 static USERSPACE_FALLBACK_STATS: Array<u64> = Array::with_max_entries(USERSPACE_FALLBACK_REASON_MAX, 0);
+
+#[map(name = "userspace_trace")]
+static USERSPACE_TRACE: HashMap<u32, UserspaceTraceValue> = HashMap::with_max_entries(1024, 0);
 
 #[xdp]
 pub fn xdp_userspace_prog(ctx: XdpContext) -> u32 {
@@ -236,6 +287,15 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
     let selected_queue = select_userspace_queue(ctrl, rx_queue_index, &parsed);
+    record_trace(
+        ingress_ifindex,
+        rx_queue_index,
+        selected_queue,
+        u32::MAX,
+        USERSPACE_TRACE_STAGE_RECEIVED,
+        0,
+        &parsed,
+    );
     let binding_key = UserspaceBindingKey {
         ifindex: ingress_ifindex,
         queue_id: selected_queue,
@@ -249,13 +309,40 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         binding = unsafe { USERSPACE_BINDINGS.get(&fallback_key) };
     }
     let Some(binding) = binding else {
+        record_trace(
+            ingress_ifindex,
+            rx_queue_index,
+            selected_queue,
+            u32::MAX,
+            USERSPACE_TRACE_STAGE_BINDING_MISSING,
+            USERSPACE_FALLBACK_REASON_BINDING_MISSING,
+            &parsed,
+        );
         return fallback_to_main(&ctx, USERSPACE_FALLBACK_REASON_BINDING_MISSING);
     };
     if (binding.flags & USERSPACE_BINDING_READY) == 0 {
+        record_trace(
+            ingress_ifindex,
+            rx_queue_index,
+            selected_queue,
+            binding.slot,
+            USERSPACE_TRACE_STAGE_BINDING_NOT_READY,
+            USERSPACE_FALLBACK_REASON_BINDING_NOT_READY,
+            &parsed,
+        );
         return fallback_to_main(&ctx, USERSPACE_FALLBACK_REASON_BINDING_NOT_READY);
     }
     let last_heartbeat = unsafe { USERSPACE_HEARTBEAT.get(&binding.slot) };
     let Some(last_heartbeat) = last_heartbeat else {
+        record_trace(
+            ingress_ifindex,
+            rx_queue_index,
+            selected_queue,
+            binding.slot,
+            USERSPACE_TRACE_STAGE_HEARTBEAT_MISSING,
+            USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING,
+            &parsed,
+        );
         return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
     };
     let timeout_ms = if ctrl.heartbeat_timeout_ms == 0 {
@@ -266,20 +353,69 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let timeout_ns = (timeout_ms as u64) * 1_000_000;
     let now_ns = unsafe { bpf_ktime_get_ns() };
     if now_ns < *last_heartbeat || now_ns.saturating_sub(*last_heartbeat) > timeout_ns {
+        record_trace(
+            ingress_ifindex,
+            rx_queue_index,
+            selected_queue,
+            binding.slot,
+            USERSPACE_TRACE_STAGE_HEARTBEAT_STALE,
+            USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE,
+            &parsed,
+        );
         return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
     }
 
     let packet_len = data_end.saturating_sub(data);
     if matches!(parsed.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        record_trace(
+            ingress_ifindex,
+            rx_queue_index,
+            selected_queue,
+            binding.slot,
+            USERSPACE_TRACE_STAGE_ICMP_FALLBACK,
+            USERSPACE_FALLBACK_REASON_ICMP,
+            &parsed,
+        );
         return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_ICMP);
     }
     if should_fallback_early(&parsed) {
+        record_trace(
+            ingress_ifindex,
+            rx_queue_index,
+            selected_queue,
+            binding.slot,
+            USERSPACE_TRACE_STAGE_EARLY_FILTER,
+            USERSPACE_FALLBACK_REASON_EARLY_FILTER,
+            &parsed,
+        );
         return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
     if is_icmp_to_interface_nat_local(&parsed) {
+        record_trace(
+            ingress_ifindex,
+            rx_queue_index,
+            selected_queue,
+            binding.slot,
+            USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL,
+            0,
+            &parsed,
+        );
         return Ok(xdp_action::XDP_PASS);
     }
+    // Do not bounce interface-NAT reply traffic back to legacy XDP on a session-map miss.
+    // The Rust dataplane can repair the reverse flow from the forward NAT session, and
+    // forcing the first reply packet through fallback turns that race into a hard connect
+    // failure.
     if is_local_destination(&parsed) {
+        record_trace(
+            ingress_ifindex,
+            rx_queue_index,
+            selected_queue,
+            binding.slot,
+            USERSPACE_TRACE_STAGE_LOCAL_DESTINATION,
+            0,
+            &parsed,
+        );
         return Ok(xdp_action::XDP_PASS);
     }
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
@@ -324,9 +460,29 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         };
     }
 
+    record_trace(
+        ingress_ifindex,
+        rx_queue_index,
+        selected_queue,
+        binding.slot,
+        USERSPACE_TRACE_STAGE_REDIRECT,
+        0,
+        &parsed,
+    );
     match USERSPACE_XSK_MAP.redirect(binding.slot, 0) {
         Ok(action) => Ok(action),
-        Err(_) => fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_REDIRECT_ERR),
+        Err(_) => {
+            record_trace(
+                ingress_ifindex,
+                rx_queue_index,
+                selected_queue,
+                binding.slot,
+                USERSPACE_TRACE_STAGE_REDIRECT_ERR,
+                USERSPACE_FALLBACK_REASON_REDIRECT_ERR,
+                &parsed,
+            );
+            fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_REDIRECT_ERR)
+        }
     }
 }
 
@@ -347,6 +503,38 @@ fn incr_fallback_stat(reason: u32) {
             *ptr = (*ptr).saturating_add(1);
         }
     }
+}
+
+fn record_trace(
+    ingress_ifindex: u32,
+    rx_queue_index: u32,
+    selected_queue: u32,
+    slot: u32,
+    stage: u32,
+    reason: u32,
+    parsed: &ParsedPacket,
+) {
+    if matches!(parsed.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        return;
+    }
+    let value = UserspaceTraceValue {
+        seq: unsafe { bpf_ktime_get_ns() },
+        stage,
+        reason,
+        ingress_ifindex,
+        rx_queue_index,
+        selected_queue,
+        slot,
+        vlan_id: parsed.vlan_id,
+        addr_family: parsed.addr_family,
+        protocol: parsed.protocol,
+        tcp_flags: parsed.tcp_flags,
+        flow_src_port: parsed.flow_src_port,
+        flow_dst_port: parsed.flow_dst_port,
+        src_addr: parsed.src_addr,
+        dst_addr: parsed.dst_addr,
+    };
+    let _ = unsafe { USERSPACE_TRACE.insert(&ingress_ifindex, &value, 0) };
 }
 
 fn pass_to_kernel_or_abort() -> u32 {
@@ -558,6 +746,30 @@ fn is_icmp_to_interface_nat_local(pkt: &ParsedPacket) -> bool {
     }
 }
 
+fn is_interface_nat_destination(pkt: &ParsedPacket) -> bool {
+    match pkt.addr_family {
+        AF_INET => unsafe { USERSPACE_INTERFACE_NAT_V4.get(&pkt.dst_v4) }.is_some(),
+        AF_INET6 => unsafe {
+            USERSPACE_INTERFACE_NAT_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_v6 })
+        }
+        .is_some(),
+        _ => false,
+    }
+}
+
+fn has_live_userspace_session(pkt: &ParsedPacket) -> bool {
+    let key = UserspaceSessionKey {
+        addr_family: pkt.addr_family,
+        protocol: pkt.protocol,
+        pad: 0,
+        src_port: pkt.flow_src_port,
+        dst_port: pkt.flow_dst_port,
+        src_addr: pkt.src_addr,
+        dst_addr: pkt.dst_addr,
+    };
+    unsafe { USERSPACE_SESSIONS.get(&key) }.is_some()
+}
+
 fn is_ipv4_multicast(ip: u32) -> bool {
     (ip & 0xf000_0000) == 0xe000_0000
 }
@@ -570,7 +782,7 @@ fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
     ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80
 }
 
-fn select_userspace_queue(ctrl: &UserspaceCtrl, rx_queue_index: u32, parsed: &ParsedPacket) -> u32 {
+fn select_userspace_queue(ctrl: &UserspaceCtrl, rx_queue_index: u32, _parsed: &ParsedPacket) -> u32 {
     let queue_count = if ctrl.queue_count == 0 {
         ctrl.workers
     } else {
@@ -579,33 +791,15 @@ fn select_userspace_queue(ctrl: &UserspaceCtrl, rx_queue_index: u32, parsed: &Pa
     if queue_count <= 1 {
         return 0;
     }
-    if let Some(hash) = symmetric_flow_hash(parsed) {
-        return hash % queue_count;
-    }
+    /*
+     * AF_XDP delivery is queue-bound. XDP may only redirect to a socket bound
+     * to the packet's actual RX queue. Hashing to a different userspace queue
+     * here silently strands packets between redirect intent and ring delivery.
+     *
+     * Keep the XDP handoff on the ingress queue and let userspace do any
+     * higher-level work redistribution after the packet is received.
+     */
     rx_queue_index % queue_count
-}
-
-fn symmetric_flow_hash(parsed: &ParsedPacket) -> Option<u32> {
-    if parsed.protocol == 0 {
-        return None;
-    }
-    let (lo_port, hi_port) = if parsed.flow_src_port <= parsed.flow_dst_port {
-        (parsed.flow_src_port, parsed.flow_dst_port)
-    } else {
-        (parsed.flow_dst_port, parsed.flow_src_port)
-    };
-    if lo_port == 0 && hi_port == 0 {
-        return None;
-    }
-    let mut hash = 0x9e37_79b9u32;
-    hash ^= u32::from(parsed.addr_family).wrapping_mul(0x85eb_ca6b);
-    hash = hash.rotate_left(13);
-    hash ^= u32::from(parsed.protocol).wrapping_mul(0xc2b2_ae35);
-    hash = hash.rotate_left(13);
-    hash ^= u32::from(lo_port).wrapping_mul(0x27d4_eb2d);
-    hash = hash.rotate_left(13);
-    hash ^= u32::from(hi_port).wrapping_mul(0x1656_67b1);
-    Some(hash)
 }
 
 fn parse_l4(
