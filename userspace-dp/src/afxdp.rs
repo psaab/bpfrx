@@ -392,15 +392,15 @@ impl Coordinator {
         for plans in workers.values_mut() {
             plans.sort_by_key(|plan| (plan.status.queue_id, plan.status.ifindex, plan.status.slot));
             /*
-             * Each binding currently allocates its own UMEM in BindingWorker::create().
-             * Do not open the other binding on the worker with Socket::with_shared():
-             * that "shared root" split only makes sense when multiple bindings really
-             * share one UMEM. In the current per-binding-UMEM design it strands the
-             * non-root interface behind a bogus shared-socket setup, which matches the
-             * live symptom where WAN slots receive and LAN slots stay at zero.
+             * On the isolated mlx5 HA lab, the only AF_XDP socket path that actually
+             * delivers packets is Socket::with_shared(...). Socket::new(...) reports
+             * success and registers into the XSK map, but XDP redirects to those slots
+             * never reach userspace. Until we rework the socket bring-up around a real
+             * per-worker shared UMEM root, keep every binding on the shared-socket
+             * code path so both LAN and WAN queues can receive packets.
              */
             for plan in plans.iter_mut() {
-                plan.shared_owner = false;
+                plan.shared_owner = true;
             }
         }
         let planned_bindings: usize = workers.values().map(|group| group.len()).sum();
