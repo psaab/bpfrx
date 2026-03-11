@@ -2435,28 +2435,97 @@ fn enqueue_pending_forwards(
                 }
             }
             if !copied_source_frame {
-                match rewrite_forwarded_frame_in_place(
-                    unsafe { &*ingress_area },
-                    request.desc,
-                    request.meta,
-                    &request.decision,
-                    expected_ports,
-                ) {
-                    Some(frame_len) => {
-                        target_binding
-                            .pending_tx_prepared
-                            .push_back(PreparedTxRequest {
-                                offset: source_offset,
-                                len: frame_len,
-                                recycle_slot: Some(ingress_slot),
-                                expected_ports,
-                                expected_addr_family: request.meta.addr_family,
-                                expected_protocol: request.meta.protocol,
-                                flow_key: request.flow_key.clone(),
-                            });
-                        retained_source_frame = true;
+                /*
+                 * Prepared/in-place forwarding is only valid when ingress and egress share the
+                 * same UMEM backing. In the current design each binding owns its own UMEM, so a
+                 * LAN->WAN forward cannot submit the ingress descriptor offset on the WAN binding.
+                 * Doing so transmits whatever bytes happen to live at the same offset in the
+                 * egress binding's UMEM, which matches the observed "TX counted, server saw
+                 * nothing" failure.
+                 */
+                let can_rewrite_in_place = target_binding.slot == ingress_slot;
+                if can_rewrite_in_place {
+                    match rewrite_forwarded_frame_in_place(
+                        unsafe { &*ingress_area },
+                        request.desc,
+                        request.meta,
+                        &request.decision,
+                        expected_ports,
+                    ) {
+                        Some(frame_len) => {
+                            target_binding
+                                .pending_tx_prepared
+                                .push_back(PreparedTxRequest {
+                                    offset: source_offset,
+                                    len: frame_len,
+                                    recycle_slot: Some(ingress_slot),
+                                    expected_ports,
+                                    expected_addr_family: request.meta.addr_family,
+                                    expected_protocol: request.meta.protocol,
+                                    flow_key: request.flow_key.clone(),
+                                });
+                            retained_source_frame = true;
+                        }
+                        None => match build_forwarded_frame_from_frame(
+                            &request.source_frame,
+                            request.meta,
+                            &request.decision,
+                            forwarding,
+                            expected_ports,
+                        ) {
+                            Some(frame) => {
+                                if let Some(reason) = forward_tuple_mismatch_reason(
+                                    live_frame_ports_bytes(
+                                        &request.source_frame,
+                                        request.meta.addr_family,
+                                        request.meta.protocol,
+                                    ),
+                                    expected_ports,
+                                    live_frame_ports_bytes(
+                                        &frame,
+                                        request.meta.addr_family,
+                                        request.meta.protocol,
+                                    ),
+                                ) {
+                                    record_exception(
+                                        recent_exceptions,
+                                        ingress_ident,
+                                        &reason,
+                                        frame.len() as u32,
+                                        Some(request.meta),
+                                        None,
+                                    );
+                                    build_failed = true;
+                                    continue;
+                                }
+                                if frame.len() > tx_frame_capacity() {
+                                    record_exception(
+                                        recent_exceptions,
+                                        ingress_ident,
+                                        "oversized_forward_frame",
+                                        frame.len() as u32,
+                                        Some(request.meta),
+                                        None,
+                                    );
+                                    continue;
+                                }
+                                target_binding.pending_tx_local.push_back(TxRequest {
+                                    bytes: frame,
+                                    expected_ports,
+                                    expected_addr_family: request.meta.addr_family,
+                                    expected_protocol: request.meta.protocol,
+                                    flow_key: request.flow_key.clone(),
+                                });
+                                bound_pending_tx_local(target_binding);
+                            }
+                            None => {
+                                build_failed = true;
+                                fallback_to_slow_path = true;
+                            }
+                        },
                     }
-                    None => match build_forwarded_frame_from_frame(
+                } else {
+                    match build_forwarded_frame_from_frame(
                         &request.source_frame,
                         request.meta,
                         &request.decision,
@@ -2512,7 +2581,7 @@ fn enqueue_pending_forwards(
                             build_failed = true;
                             fallback_to_slow_path = true;
                         }
-                    },
+                    }
                 }
             }
             if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
