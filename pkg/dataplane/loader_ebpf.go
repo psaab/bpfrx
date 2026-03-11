@@ -200,6 +200,7 @@ func (m *Manager) loadAllObjects() error {
 	for _, name := range []string{
 		"userspace_ctrl",
 		"userspace_bindings",
+		"userspace_ingress_ifaces",
 		"userspace_heartbeat",
 		"userspace_xsk_map",
 		"userspace_local_v4",
@@ -225,6 +226,10 @@ func (m *Manager) loadAllObjects() error {
 	userspaceBindings, ok := userspaceCollection.Maps["userspace_bindings"]
 	if !ok {
 		return fmt.Errorf("Rust userspace_bindings map not found")
+	}
+	userspaceIngressIfaces, ok := userspaceCollection.Maps["userspace_ingress_ifaces"]
+	if !ok {
+		return fmt.Errorf("Rust userspace_ingress_ifaces map not found")
 	}
 	userspaceHeartbeat, ok := userspaceCollection.Maps["userspace_heartbeat"]
 	if !ok {
@@ -253,6 +258,7 @@ func (m *Manager) loadAllObjects() error {
 	}{
 		{name: "userspace_ctrl", m: userspaceCtrl, path: UserspaceCtrlPinPath()},
 		{name: "userspace_bindings", m: userspaceBindings, path: UserspaceBindingsPinPath()},
+		{name: "userspace_ingress_ifaces", m: userspaceIngressIfaces, path: UserspaceIngressIfacesPinPath()},
 		{name: "userspace_heartbeat", m: userspaceHeartbeat, path: UserspaceHeartbeatPinPath()},
 		{name: "userspace_xsk_map", m: userspaceXSK, path: UserspaceXSKMapPinPath()},
 		{name: "userspace_local_v4", m: userspaceLocalV4, path: UserspaceLocalV4PinPath()},
@@ -266,6 +272,7 @@ func (m *Manager) loadAllObjects() error {
 	m.programs["xdp_userspace_prog"] = userspaceProg
 	m.maps["userspace_ctrl"] = userspaceCtrl
 	m.maps["userspace_bindings"] = userspaceBindings
+	m.maps["userspace_ingress_ifaces"] = userspaceIngressIfaces
 	m.maps["userspace_heartbeat"] = userspaceHeartbeat
 	m.maps["userspace_xsk_map"] = userspaceXSK
 	m.maps["userspace_local_v4"] = userspaceLocalV4

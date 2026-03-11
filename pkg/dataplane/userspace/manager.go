@@ -1576,6 +1576,9 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 			return fmt.Errorf("delete userspace_heartbeat %d: %w", key, err)
 		}
 	}
+	if err := m.syncIngressIfaceMapLocked(snapshot); err != nil {
+		return err
+	}
 	return m.syncLocalAddressMapsLocked(snapshot)
 }
 
@@ -1640,10 +1643,41 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			return fmt.Errorf("update userspace_bindings %+v: %w", key, err)
 		}
 	}
+	if err := m.syncIngressIfaceMapLocked(m.lastSnapshot); err != nil {
+		return err
+	}
 	if err := m.syncLocalAddressMapsLocked(m.lastSnapshot); err != nil {
 		return err
 	}
 	m.lastStatus = *status
+	return nil
+}
+
+func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
+	ifaceMap := m.inner.Map("userspace_ingress_ifaces")
+	if ifaceMap == nil {
+		return errors.New("userspace_ingress_ifaces map not loaded")
+	}
+
+	var (
+		key  uint32
+		val  uint8
+		keys []uint32
+	)
+	iter := ifaceMap.Iterate()
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	for _, k := range keys {
+		if err := ifaceMap.Delete(k); err != nil {
+			return fmt.Errorf("delete userspace_ingress_ifaces %d: %w", k, err)
+		}
+	}
+	for _, ifindex := range buildUserspaceIngressIfindexes(snapshot) {
+		if err := ifaceMap.Update(ifindex, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_ingress_ifaces %d: %w", ifindex, err)
+		}
+	}
 	return nil
 }
 
@@ -2128,6 +2162,39 @@ func buildLocalAddressEntries(snapshot *ConfigSnapshot) []userspaceLocalAddressE
 			out = append(out, userspaceLocalAddressEntry{v6Key: userspaceLocalV6Key{Addr: key}})
 		}
 	}
+	return out
+}
+
+func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
+	if snapshot == nil {
+		return nil
+	}
+	seen := make(map[uint32]bool)
+	out := make([]uint32, 0)
+	for _, iface := range snapshot.Interfaces {
+		if iface.Zone == "" {
+			continue
+		}
+		if iface.ParentIfindex > 0 {
+			key := uint32(iface.ParentIfindex)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, key)
+			continue
+		}
+		if iface.Ifindex <= 0 {
+			continue
+		}
+		key := uint32(iface.Ifindex)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }
 

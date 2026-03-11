@@ -162,6 +162,9 @@ static USERSPACE_CTRL: Array<UserspaceCtrl> = Array::with_max_entries(1, 0);
 static USERSPACE_BINDINGS: HashMap<UserspaceBindingKey, UserspaceBindingValue> =
     HashMap::with_max_entries(4096, 0);
 
+#[map(name = "userspace_ingress_ifaces")]
+static USERSPACE_INGRESS_IFACES: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+
 #[map(name = "userspace_heartbeat")]
 static USERSPACE_HEARTBEAT: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
 
@@ -206,6 +209,9 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     };
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
+    if unsafe { USERSPACE_INGRESS_IFACES.get(&ingress_ifindex) }.is_none() {
+        return Ok(xdp_action::XDP_PASS);
+    }
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
     let selected_queue = select_userspace_queue(ctrl, &parsed, rx_queue_index);
     let binding_key = UserspaceBindingKey {

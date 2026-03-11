@@ -27,6 +27,10 @@ func UserspaceBindingsPinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_bindings")
 }
 
+func UserspaceIngressIfacesPinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_ingress_ifaces")
+}
+
 func UserspaceHeartbeatPinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_heartbeat")
 }
