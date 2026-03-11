@@ -83,6 +83,7 @@ pub(crate) struct SessionDelta {
 
 pub(crate) struct SessionTable {
     sessions: FxHashMap<SessionKey, SessionEntry>,
+    nat_reverse_index: FxHashMap<SessionKey, SessionKey>,
     deltas: VecDeque<SessionDelta>,
     last_gc_ns: u64,
     max_sessions: usize,
@@ -96,6 +97,7 @@ impl SessionTable {
     pub fn new() -> Self {
         Self {
             sessions: FxHashMap::default(),
+            nat_reverse_index: FxHashMap::default(),
             deltas: VecDeque::with_capacity(MAX_SESSION_DELTAS.min(256)),
             last_gc_ns: 0,
             max_sessions: DEFAULT_MAX_SESSIONS,
@@ -123,7 +125,7 @@ impl SessionTable {
             })
             .collect::<Vec<_>>();
         for key in &stale {
-            if let Some(entry) = self.sessions.remove(key) {
+            if let Some(entry) = self.remove_entry(key) {
                 if !entry.metadata.is_reverse && !entry.metadata.synced {
                     self.push_delta(SessionDelta {
                         kind: SessionDeltaKind::Close,
@@ -163,18 +165,15 @@ impl SessionTable {
     }
 
     pub fn find_forward_nat_match(&self, reply_key: &SessionKey) -> Option<ForwardSessionMatch> {
-        self.sessions.iter().find_map(|(key, entry)| {
-            if entry.metadata.is_reverse {
-                return None;
-            }
-            if !reply_matches_forward_nat(key, entry.decision.nat, reply_key) {
-                return None;
-            }
-            Some(ForwardSessionMatch {
-                key: key.clone(),
-                decision: entry.decision,
-                metadata: entry.metadata.clone(),
-            })
+        let forward_key = self.nat_reverse_index.get(reply_key)?;
+        let entry = self.sessions.get(forward_key)?;
+        if entry.metadata.is_reverse || !reply_matches_forward_nat(forward_key, entry.decision.nat, reply_key) {
+            return None;
+        }
+        Some(ForwardSessionMatch {
+            key: forward_key.clone(),
+            decision: entry.decision,
+            metadata: entry.metadata.clone(),
         })
     }
 
@@ -191,6 +190,7 @@ impl SessionTable {
             self.create_drops = self.create_drops.saturating_add(1);
             return false;
         }
+        self.remove_entry(&key);
         self.sessions.insert(
             key.clone(),
             SessionEntry {
@@ -201,6 +201,7 @@ impl SessionTable {
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
             },
         );
+        self.index_forward_nat_key(&key, decision, &metadata);
         if !metadata.is_reverse && !metadata.synced {
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
@@ -221,16 +222,19 @@ impl SessionTable {
         protocol: u8,
         tcp_flags: u8,
     ) {
+        self.remove_entry(&key);
+        let index_key = key.clone();
         self.sessions.insert(
             key,
             SessionEntry {
                 decision,
-                metadata,
+                metadata: metadata.clone(),
                 last_seen_ns: now_ns,
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
             },
         );
+        self.index_forward_nat_key(&index_key, decision, &metadata);
     }
 
     pub fn promote_synced(
@@ -242,10 +246,11 @@ impl SessionTable {
         protocol: u8,
         tcp_flags: u8,
     ) -> bool {
-        let Some(entry) = self.sessions.get_mut(key) else {
+        let Some(mut entry) = self.remove_entry(key) else {
             return false;
         };
         if !entry.metadata.synced {
+            self.sessions.insert(key.clone(), entry);
             return false;
         }
         entry.decision = decision;
@@ -253,6 +258,8 @@ impl SessionTable {
         entry.last_seen_ns = now_ns;
         entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags);
         entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+        self.sessions.insert(key.clone(), entry);
+        self.index_forward_nat_key(key, decision, &metadata);
         if !metadata.is_reverse {
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
@@ -265,7 +272,7 @@ impl SessionTable {
     }
 
     pub fn delete(&mut self, key: &SessionKey) {
-        self.sessions.remove(key);
+        self.remove_entry(key);
     }
 
     pub fn drain_deltas(&mut self, max: usize) -> Vec<SessionDelta> {
@@ -290,6 +297,40 @@ impl SessionTable {
             return;
         }
         self.deltas.push_back(delta);
+    }
+
+    fn remove_entry(&mut self, key: &SessionKey) -> Option<SessionEntry> {
+        let entry = self.sessions.remove(key)?;
+        self.remove_forward_nat_index(key, entry.decision, &entry.metadata);
+        Some(entry)
+    }
+
+    fn index_forward_nat_key(
+        &mut self,
+        key: &SessionKey,
+        decision: SessionDecision,
+        metadata: &SessionMetadata,
+    ) {
+        if metadata.is_reverse {
+            return;
+        }
+        self.nat_reverse_index
+            .insert(reverse_wire_key(key, decision.nat), key.clone());
+    }
+
+    fn remove_forward_nat_index(
+        &mut self,
+        key: &SessionKey,
+        decision: SessionDecision,
+        metadata: &SessionMetadata,
+    ) {
+        if metadata.is_reverse {
+            return;
+        }
+        let reverse_key = reverse_wire_key(key, decision.nat);
+        if matches!(self.nat_reverse_index.get(&reverse_key), Some(existing) if existing == key) {
+            self.nat_reverse_index.remove(&reverse_key);
+        }
     }
 }
 
@@ -628,5 +669,49 @@ mod tests {
             },
             &reply,
         ));
+    }
+
+    #[test]
+    fn find_forward_nat_match_uses_reverse_index() {
+        let mut table = SessionTable::new();
+        let forward = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 42424,
+            dst_port: 5201,
+        };
+        let reply = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            src_port: 5201,
+            dst_port: 42424,
+        };
+        let nat = NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+            rewrite_dst: None,
+        };
+        let decision = SessionDecision {
+            resolution: resolution(),
+            nat,
+        };
+        assert!(table.install_with_protocol(
+            forward.clone(),
+            decision,
+            metadata(),
+            1_000_000_000,
+            PROTO_TCP,
+            0x10
+        ));
+
+        let hit = table.find_forward_nat_match(&reply).expect("forward nat match");
+        assert_eq!(hit.key, forward);
+        assert_eq!(hit.decision.nat, nat);
+
+        table.delete(&hit.key);
+        assert!(table.find_forward_nat_match(&reply).is_none());
     }
 }

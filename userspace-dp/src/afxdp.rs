@@ -39,6 +39,7 @@ const MIN_RESERVED_TX_FRAMES: u32 = 256;
 const MAX_RESERVED_TX_FRAMES: u32 = 2048;
 const MIN_SPARE_RX_FRAMES: u32 = 512;
 const TX_BATCH_SIZE: usize = 256;
+const PENDING_TX_LIMIT_MULTIPLIER: usize = 2;
 const FILL_BATCH_SIZE: usize = 1024;
 const FILL_DRAIN_WATERMARK: usize = 64;
 const MAX_RX_BATCHES_PER_POLL: usize = 4;
@@ -129,6 +130,7 @@ pub struct Coordinator {
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
@@ -154,6 +156,7 @@ impl Coordinator {
             ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
             shared_sessions: Arc::new(Mutex::new(FastMap::default())),
+            shared_nat_sessions: Arc::new(Mutex::new(FastMap::default())),
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
@@ -439,6 +442,7 @@ impl Coordinator {
             let last_resolution = self.last_resolution.clone();
             let slow_path = self.slow_path.clone();
             let shared_sessions = self.shared_sessions.clone();
+            let shared_nat_sessions = self.shared_nat_sessions.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
             let commands_clone = commands.clone();
@@ -462,6 +466,7 @@ impl Coordinator {
                         ha_state,
                         dynamic_neighbors,
                         shared_sessions,
+                        shared_nat_sessions,
                         slow_path,
                         recent_exceptions,
                         recent_session_deltas,
@@ -585,7 +590,7 @@ impl Coordinator {
     }
 
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
-        publish_shared_session(&self.shared_sessions, &entry);
+        publish_shared_session(&self.shared_sessions, &self.shared_nat_sessions, &entry);
         for handle in self.workers.values() {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
@@ -594,7 +599,7 @@ impl Coordinator {
     }
 
     pub fn delete_synced_session(&self, key: SessionKey) {
-        remove_shared_session(&self.shared_sessions, &key);
+        remove_shared_session(&self.shared_sessions, &self.shared_nat_sessions, &key);
         for handle in self.workers.values() {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
@@ -1094,6 +1099,7 @@ struct BindingWorker {
     spare_fill_frames: VecDeque<u64>,
     pending_tx_prepared: VecDeque<PreparedTxRequest>,
     pending_tx_local: VecDeque<TxRequest>,
+    max_pending_tx: usize,
     pending_fill_frames: VecDeque<u64>,
     scratch_recycle: Vec<u64>,
     scratch_forwards: Vec<PendingForwardRequest>,
@@ -1315,9 +1321,11 @@ impl BindingWorker {
             }
         }
         let init_now = monotonic_nanos();
+        let max_pending_tx = pending_tx_capacity(ring_entries);
         if let Err(err) = touch_heartbeat(heartbeat_map_fd, binding.slot, &live, init_now) {
             live.set_error(format!("update heartbeat slot: {err}"));
         }
+        live.set_max_pending_tx(max_pending_tx);
         let binding = Self {
             slot: binding.slot,
             queue_id: binding.queue_id,
@@ -1334,6 +1342,7 @@ impl BindingWorker {
             spare_fill_frames,
             pending_tx_prepared: VecDeque::new(),
             pending_tx_local: VecDeque::new(),
+            max_pending_tx,
             pending_fill_frames: VecDeque::new(),
             scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
             scratch_forwards: Vec::with_capacity(RX_BATCH_SIZE as usize),
@@ -1418,8 +1427,8 @@ fn open_binding_worker_rings(
         ring_entries,
         XSK_BIND_FLAGS_SHARED_UMEM_OWNER,
     )?;
-    let bind_mode = bind_user_rings(&worker_umem.umem, &device, &user, shared_owner)
-        .unwrap_or(bind_mode);
+    let bind_mode =
+        bind_user_rings(&worker_umem.umem, &device, &user, shared_owner).unwrap_or(bind_mode);
     Ok((user, rx, tx, bind_mode, device))
 }
 
@@ -1529,7 +1538,11 @@ fn query_bound_xsk_socket(fd: c_int) -> Option<(i32, u32, u32)> {
     if rc != 0 || addrlen as usize != core::mem::size_of::<SockaddrXdp>() {
         return None;
     }
-    Some((addr.sxdp_ifindex as i32, addr.sxdp_queue_id, addr.sxdp_flags as u32))
+    Some((
+        addr.sxdp_ifindex as i32,
+        addr.sxdp_queue_id,
+        addr.sxdp_flags as u32,
+    ))
 }
 
 fn bind_user_with_retry(
@@ -1599,6 +1612,7 @@ fn poll_binding(
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     _recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
@@ -1783,7 +1797,11 @@ fn poll_binding(
                                         protocol: meta.protocol,
                                         tcp_flags: meta.tcp_flags,
                                     };
-                                    publish_shared_session(shared_sessions, &promoted_entry);
+                                    publish_shared_session(
+                                        shared_sessions,
+                                        shared_nat_sessions,
+                                        &promoted_entry,
+                                    );
                                     replicate_session_upsert(peer_worker_commands, &promoted_entry);
                                 }
                             }
@@ -1851,7 +1869,11 @@ fn poll_binding(
                                         protocol: meta.protocol,
                                         tcp_flags: meta.tcp_flags,
                                     };
-                                    publish_shared_session(shared_sessions, &promoted_entry);
+                                    publish_shared_session(
+                                        shared_sessions,
+                                        shared_nat_sessions,
+                                        &promoted_entry,
+                                    );
                                     replicate_session_upsert(peer_worker_commands, &promoted_entry);
                                 }
                             }
@@ -1860,6 +1882,7 @@ fn poll_binding(
                             sessions,
                             binding.session_map_fd,
                             shared_sessions,
+                            shared_nat_sessions,
                             peer_worker_commands,
                             forwarding,
                             ha_state,
@@ -1992,7 +2015,11 @@ fn poll_binding(
                                             protocol: meta.protocol,
                                             tcp_flags: meta.tcp_flags,
                                         };
-                                        publish_shared_session(shared_sessions, &forward_entry);
+                                        publish_shared_session(
+                                            shared_sessions,
+                                            shared_nat_sessions,
+                                            &forward_entry,
+                                        );
                                         replicate_session_upsert(
                                             peer_worker_commands,
                                             &forward_entry,
@@ -2047,7 +2074,11 @@ fn poll_binding(
                                             protocol: meta.protocol,
                                             tcp_flags: meta.tcp_flags,
                                         };
-                                        publish_shared_session(shared_sessions, &reverse_entry);
+                                        publish_shared_session(
+                                            shared_sessions,
+                                            shared_nat_sessions,
+                                            &reverse_entry,
+                                        );
                                         replicate_session_upsert(
                                             peer_worker_commands,
                                             &reverse_entry,
@@ -2141,7 +2172,7 @@ fn poll_binding(
                             unsafe { &*area },
                             desc,
                             meta,
-                            decision.resolution,
+                            decision,
                             recent_exceptions,
                         );
                     }
@@ -2181,12 +2212,14 @@ fn poll_binding(
                 right,
                 sessions,
                 shared_sessions,
+                shared_nat_sessions,
                 peer_worker_commands,
                 &forward_key,
                 nat,
                 &mut pending_forwards,
             );
         }
+        let ingress_live = binding.live.clone();
         enqueue_pending_forwards(
             left,
             binding,
@@ -2195,6 +2228,8 @@ fn poll_binding(
             now_ns,
             forwarding,
             &ident,
+            ingress_live.as_ref(),
+            slow_path,
             recent_exceptions,
         );
         binding.scratch_forwards = pending_forwards;
@@ -2236,15 +2271,16 @@ fn build_live_forward_request(
         resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
     };
     let source_frame = area.slice(desc.addr as usize, desc.len as usize)?.to_vec();
+    let expected_ports = authoritative_forward_ports(&source_frame, meta, flow);
     Some(PendingForwardRequest {
         target_ifindex,
         ingress_queue_id: ingress_ident.queue_id,
         source_offset: desc.addr,
         desc,
-        source_frame: source_frame.clone(),
+        source_frame,
         meta,
         decision: *decision,
-        expected_ports: authoritative_forward_ports(&source_frame, meta, flow),
+        expected_ports,
         flow_key: flow.map(|flow| flow.forward_key.clone()),
     })
 }
@@ -2264,25 +2300,13 @@ fn authoritative_forward_ports(
             None
         }
     });
+    let meta_ports = if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
+        Some((meta.flow_src_port, meta.flow_dst_port))
+    } else {
+        None
+    };
     let frame_ports = live_frame_ports_bytes(frame, meta.addr_family, meta.protocol);
-    match (frame_ports, flow_ports) {
-        (Some(frame_ports), Some(flow_ports)) => {
-            if frame_ports == flow_ports {
-                Some(frame_ports)
-            } else {
-                Some(flow_ports)
-            }
-        }
-        (Some(frame_ports), None) => Some(frame_ports),
-        (None, Some(flow_ports)) => Some(flow_ports),
-        (None, None) => {
-            if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
-                Some((meta.flow_src_port, meta.flow_dst_port))
-            } else {
-                None
-            }
-        }
-    }
+    flow_ports.or(meta_ports).or(frame_ports)
 }
 
 fn live_frame_ports(area: &MmapArea, desc: XdpDesc, meta: UserspaceDpMeta) -> Option<(u16, u16)> {
@@ -2326,18 +2350,19 @@ fn enqueue_pending_forwards(
     now_ns: u64,
     forwarding: &ForwardingState,
     ingress_ident: &BindingIdentity,
+    ingress_live: &BindingLiveState,
+    slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
     let ingress_area = (&ingress_binding.umem.area) as *const MmapArea;
     for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
-        let expected_ports =
-            request.expected_ports.or(live_frame_ports_bytes(
-                &request.source_frame,
-                request.meta.addr_family,
-                request.meta.protocol,
-            ));
+        let expected_ports = request.expected_ports.or(live_frame_ports_bytes(
+            &request.source_frame,
+            request.meta.addr_family,
+            request.meta.protocol,
+        ));
         let Some(target_binding) = find_target_binding_mut(
             left,
             ingress_binding,
@@ -2358,6 +2383,7 @@ fn enqueue_pending_forwards(
         };
         let mut post_recycles = Vec::new();
         let mut build_failed = false;
+        let mut fallback_to_slow_path = false;
         let mut copied_source_frame = false;
         let mut retained_source_frame = false;
         {
@@ -2401,6 +2427,7 @@ fn enqueue_pending_forwards(
                         expected_protocol: request.meta.protocol,
                         flow_key: request.flow_key.clone(),
                     });
+                    bound_pending_tx_local(target_binding);
                 }
                 copied_source_frame = true;
                 if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
@@ -2416,15 +2443,17 @@ fn enqueue_pending_forwards(
                     expected_ports,
                 ) {
                     Some(frame_len) => {
-                        target_binding.pending_tx_prepared.push_back(PreparedTxRequest {
-                            offset: source_offset,
-                            len: frame_len,
-                            recycle_slot: Some(ingress_slot),
-                            expected_ports,
-                            expected_addr_family: request.meta.addr_family,
-                            expected_protocol: request.meta.protocol,
-                            flow_key: request.flow_key.clone(),
-                        });
+                        target_binding
+                            .pending_tx_prepared
+                            .push_back(PreparedTxRequest {
+                                offset: source_offset,
+                                len: frame_len,
+                                recycle_slot: Some(ingress_slot),
+                                expected_ports,
+                                expected_addr_family: request.meta.addr_family,
+                                expected_protocol: request.meta.protocol,
+                                flow_key: request.flow_key.clone(),
+                            });
                         retained_source_frame = true;
                     }
                     None => match build_forwarded_frame_from_frame(
@@ -2435,51 +2464,53 @@ fn enqueue_pending_forwards(
                         expected_ports,
                     ) {
                         Some(frame) => {
-                        if let Some(reason) = forward_tuple_mismatch_reason(
-                            live_frame_ports_bytes(
-                                &request.source_frame,
-                                request.meta.addr_family,
-                                request.meta.protocol,
-                            ),
-                            expected_ports,
-                            live_frame_ports_bytes(
-                                &frame,
-                                request.meta.addr_family,
-                                request.meta.protocol,
-                            ),
-                        ) {
-                            record_exception(
-                                recent_exceptions,
-                                ingress_ident,
-                                &reason,
-                                frame.len() as u32,
-                                Some(request.meta),
-                                None,
-                            );
-                            build_failed = true;
-                            continue;
+                            if let Some(reason) = forward_tuple_mismatch_reason(
+                                live_frame_ports_bytes(
+                                    &request.source_frame,
+                                    request.meta.addr_family,
+                                    request.meta.protocol,
+                                ),
+                                expected_ports,
+                                live_frame_ports_bytes(
+                                    &frame,
+                                    request.meta.addr_family,
+                                    request.meta.protocol,
+                                ),
+                            ) {
+                                record_exception(
+                                    recent_exceptions,
+                                    ingress_ident,
+                                    &reason,
+                                    frame.len() as u32,
+                                    Some(request.meta),
+                                    None,
+                                );
+                                build_failed = true;
+                                continue;
+                            }
+                            if frame.len() > tx_frame_capacity() {
+                                record_exception(
+                                    recent_exceptions,
+                                    ingress_ident,
+                                    "oversized_forward_frame",
+                                    frame.len() as u32,
+                                    Some(request.meta),
+                                    None,
+                                );
+                                continue;
+                            }
+                            target_binding.pending_tx_local.push_back(TxRequest {
+                                bytes: frame,
+                                expected_ports,
+                                expected_addr_family: request.meta.addr_family,
+                                expected_protocol: request.meta.protocol,
+                                flow_key: request.flow_key.clone(),
+                            });
+                            bound_pending_tx_local(target_binding);
                         }
-                        if frame.len() > tx_frame_capacity() {
-                            record_exception(
-                                recent_exceptions,
-                                ingress_ident,
-                                "oversized_forward_frame",
-                                frame.len() as u32,
-                                Some(request.meta),
-                                None,
-                            );
-                            continue;
-                        }
-                        target_binding.pending_tx_local.push_back(TxRequest {
-                            bytes: frame,
-                            expected_ports,
-                            expected_addr_family: request.meta.addr_family,
-                            expected_protocol: request.meta.protocol,
-                            flow_key: request.flow_key.clone(),
-                        });
-                    }
                         None => {
                             build_failed = true;
+                            fallback_to_slow_path = true;
                         }
                     },
                 }
@@ -2501,6 +2532,18 @@ fn enqueue_pending_forwards(
                 Some(request.meta),
                 None,
             );
+            if fallback_to_slow_path {
+                maybe_reinject_slow_path_from_frame(
+                    ingress_ident,
+                    ingress_live,
+                    slow_path,
+                    &request.source_frame,
+                    request.meta,
+                    request.decision,
+                    recent_exceptions,
+                    "forward_build_slow_path",
+                );
+            }
             if !retained_source_frame {
                 ingress_binding.pending_fill_frames.push_back(source_offset);
             }
@@ -2566,11 +2609,11 @@ fn maybe_reinject_slow_path(
     area: &MmapArea,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
-    resolution: ForwardingResolution,
+    decision: SessionDecision,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
     if !matches!(
-        resolution.disposition,
+        decision.resolution.disposition,
         ForwardingDisposition::LocalDelivery
             | ForwardingDisposition::NoRoute
             | ForwardingDisposition::MissingNeighbor
@@ -2578,13 +2621,47 @@ fn maybe_reinject_slow_path(
     ) {
         return;
     }
-    let Some(packet) = extract_l3_packet(area, desc, meta) else {
+    let Some(frame) = area.slice(desc.addr as usize, desc.len as usize) else {
         live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
         record_exception(
             recent_exceptions,
             binding,
             "slow_path_extract_failed",
             desc.len as u32,
+            Some(meta),
+            None,
+        );
+        return;
+    };
+    maybe_reinject_slow_path_from_frame(
+        binding,
+        live,
+        slow_path,
+        frame,
+        meta,
+        decision,
+        recent_exceptions,
+        "slow_path",
+    );
+}
+
+fn maybe_reinject_slow_path_from_frame(
+    binding: &BindingIdentity,
+    live: &BindingLiveState,
+    slow_path: Option<&Arc<SlowPathReinjector>>,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    decision: SessionDecision,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    reason: &str,
+) {
+    let Some(packet) = extract_l3_packet_with_nat(frame, meta, decision.nat) else {
+        live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
+        record_exception(
+            recent_exceptions,
+            binding,
+            "slow_path_prepare_failed",
+            frame.len() as u32,
             Some(meta),
             None,
         );
@@ -2597,7 +2674,7 @@ fn maybe_reinject_slow_path(
             recent_exceptions,
             binding,
             "slow_path_unavailable",
-            desc.len as u32,
+            frame.len() as u32,
             Some(meta),
             None,
         );
@@ -2615,8 +2692,8 @@ fn maybe_reinject_slow_path(
             record_exception(
                 recent_exceptions,
                 binding,
-                "slow_path_rate_limited",
-                desc.len as u32,
+                &format!("{reason}_rate_limited"),
+                frame.len() as u32,
                 Some(meta),
                 None,
             );
@@ -2626,8 +2703,8 @@ fn maybe_reinject_slow_path(
             record_exception(
                 recent_exceptions,
                 binding,
-                "slow_path_queue_full",
-                desc.len as u32,
+                &format!("{reason}_queue_full"),
+                frame.len() as u32,
                 Some(meta),
                 None,
             );
@@ -2638,8 +2715,8 @@ fn maybe_reinject_slow_path(
             record_exception(
                 recent_exceptions,
                 binding,
-                "slow_path_enqueue_failed",
-                desc.len as u32,
+                &format!("{reason}_enqueue_failed"),
+                frame.len() as u32,
                 Some(meta),
                 None,
             );
@@ -2649,11 +2726,29 @@ fn maybe_reinject_slow_path(
 
 fn extract_l3_packet(area: &MmapArea, desc: XdpDesc, meta: UserspaceDpMeta) -> Option<Vec<u8>> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    extract_l3_packet_from_frame(frame, meta)
+}
+
+fn extract_l3_packet_from_frame(frame: &[u8], meta: UserspaceDpMeta) -> Option<Vec<u8>> {
     let l3 = meta.l3_offset as usize;
     if l3 >= frame.len() {
         return None;
     }
     Some(frame[l3..].to_vec())
+}
+
+fn extract_l3_packet_with_nat(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    nat: NatDecision,
+) -> Option<Vec<u8>> {
+    let mut packet = extract_l3_packet_from_frame(frame, meta)?;
+    match meta.addr_family as i32 {
+        libc::AF_INET => apply_nat_ipv4(&mut packet, meta.protocol, nat)?,
+        libc::AF_INET6 => apply_nat_ipv6(&mut packet, meta.protocol, nat)?,
+        _ => return None,
+    }
+    Some(packet)
 }
 
 fn parse_session_flow(
@@ -3146,10 +3241,7 @@ fn find_target_binding_mut<'a>(
     None
 }
 
-fn purge_queued_flows_for_closed_deltas(
-    bindings: &mut [BindingWorker],
-    deltas: &[SessionDelta],
-) {
+fn purge_queued_flows_for_closed_deltas(bindings: &mut [BindingWorker], deltas: &[SessionDelta]) {
     for delta in deltas {
         if delta.kind != SessionDeltaKind::Close {
             continue;
@@ -3167,6 +3259,7 @@ fn flush_session_deltas(
     session_map_fd: c_int,
     deltas: &[SessionDelta],
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
 ) {
@@ -3214,10 +3307,10 @@ fn flush_session_deltas(
         }
         if delta.kind == SessionDeltaKind::Close {
             delete_live_session_key(session_map_fd, &delta.key);
-            remove_shared_session(shared_sessions, &delta.key);
+            remove_shared_session(shared_sessions, shared_nat_sessions, &delta.key);
             let reverse_key = reverse_session_key(&delta.key, delta.decision.nat);
             delete_live_session_key(session_map_fd, &reverse_key);
-            remove_shared_session(shared_sessions, &reverse_key);
+            remove_shared_session(shared_sessions, shared_nat_sessions, &reverse_key);
             replicate_session_delete(peer_worker_commands, &delta.key);
             replicate_session_delete(
                 peer_worker_commands,
@@ -3347,6 +3440,23 @@ fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, now_ns: u64) {
     binding.empty_rx_polls = 0;
 }
 
+fn pending_tx_capacity(ring_entries: u32) -> usize {
+    (ring_entries as usize)
+        .saturating_mul(PENDING_TX_LIMIT_MULTIPLIER)
+        .max(TX_BATCH_SIZE.saturating_mul(2))
+}
+
+fn bound_pending_tx_local(binding: &mut BindingWorker) {
+    while binding.pending_tx_local.len() > binding.max_pending_tx {
+        if binding.pending_tx_local.pop_front().is_some() {
+            binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+            binding
+                .live
+                .set_error(format!("pending TX local overflow on slot {}", binding.slot));
+        }
+    }
+}
+
 fn drain_pending_tx(
     binding: &mut BindingWorker,
     now_ns: u64,
@@ -3429,6 +3539,7 @@ fn drain_pending_tx(
     if !retry.is_empty() {
         retry.append(&mut binding.pending_tx_local);
         binding.pending_tx_local = retry;
+        bound_pending_tx_local(binding);
     }
     update_binding_debug_state(binding);
     did_work
@@ -4018,6 +4129,7 @@ fn teardown_tcp_rst_flow(
     right: &mut [BindingWorker],
     sessions: &mut SessionTable,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forward_key: &SessionKey,
     nat: NatDecision,
@@ -4028,8 +4140,8 @@ fn teardown_tcp_rst_flow(
     sessions.delete(&reverse_key);
     delete_live_session_key(current.session_map_fd, forward_key);
     delete_live_session_key(current.session_map_fd, &reverse_key);
-    remove_shared_session(shared_sessions, forward_key);
-    remove_shared_session(shared_sessions, &reverse_key);
+    remove_shared_session(shared_sessions, shared_nat_sessions, forward_key);
+    remove_shared_session(shared_sessions, shared_nat_sessions, &reverse_key);
     replicate_session_delete(peer_worker_commands, forward_key);
     replicate_session_delete(peer_worker_commands, &reverse_key);
     cancel_pending_forwards(current, pending_forwards, forward_key, &reverse_key);
@@ -4163,24 +4275,20 @@ fn lookup_shared_session(
 }
 
 fn lookup_shared_forward_nat_match(
-    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     reply_key: &SessionKey,
 ) -> Option<SyncedSessionEntry> {
-    shared_sessions.lock().ok().and_then(|sessions| {
-        sessions
-            .values()
-            .find(|entry| {
-                !entry.metadata.is_reverse
-                    && reply_matches_forward_nat(&entry.key, entry.decision.nat, reply_key)
-            })
-            .cloned()
-    })
+    shared_nat_sessions
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(reply_key).cloned())
 }
 
 fn repair_reverse_session_from_forward(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
@@ -4194,7 +4302,7 @@ fn repair_reverse_session_from_forward(
     let forward_match = sessions
         .find_forward_nat_match(&flow.forward_key)
         .or_else(|| {
-            lookup_shared_forward_nat_match(shared_sessions, &flow.forward_key).map(|entry| {
+            lookup_shared_forward_nat_match(shared_nat_sessions, &flow.forward_key).map(|entry| {
                 ForwardSessionMatch {
                     key: entry.key,
                     decision: entry.decision,
@@ -4242,7 +4350,7 @@ fn repair_reverse_session_from_forward(
             protocol,
             tcp_flags,
         };
-        publish_shared_session(shared_sessions, &reverse_entry);
+        publish_shared_session(shared_sessions, shared_nat_sessions, &reverse_entry);
         replicate_session_upsert(peer_worker_commands, &reverse_entry);
     }
     Some(SessionLookup {
@@ -4253,19 +4361,30 @@ fn repair_reverse_session_from_forward(
 
 fn publish_shared_session(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     entry: &SyncedSessionEntry,
 ) {
     if let Ok(mut sessions) = shared_sessions.lock() {
         sessions.insert(entry.key.clone(), entry.clone());
     }
+    if !entry.metadata.is_reverse
+        && let Ok(mut sessions) = shared_nat_sessions.lock()
+    {
+        sessions.insert(reverse_session_key(&entry.key, entry.decision.nat), entry.clone());
+    }
 }
 
 fn remove_shared_session(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     key: &SessionKey,
 ) {
-    if let Ok(mut sessions) = shared_sessions.lock() {
-        sessions.remove(key);
+    if let Ok(mut sessions) = shared_sessions.lock()
+        && let Some(entry) = sessions.remove(key)
+        && !entry.metadata.is_reverse
+        && let Ok(mut nat_sessions) = shared_nat_sessions.lock()
+    {
+        nat_sessions.remove(&reverse_session_key(&entry.key, entry.decision.nat));
     }
 }
 
@@ -4277,6 +4396,7 @@ fn worker_loop(
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<Arc<SlowPathReinjector>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
@@ -4343,6 +4463,7 @@ fn worker_loop(
                 ha_runtime.as_ref(),
                 &dynamic_neighbors,
                 &shared_sessions,
+                &shared_nat_sessions,
                 slow_path.as_ref(),
                 &recent_exceptions,
                 &recent_session_deltas,
@@ -4367,6 +4488,7 @@ fn worker_loop(
                     binding.session_map_fd,
                     &deltas,
                     &shared_sessions,
+                    &shared_nat_sessions,
                     &recent_session_deltas,
                     &peer_worker_commands,
                 );
@@ -5876,8 +5998,11 @@ fn segment_forwarded_tcp_frames_from_frame(
         *payload.get(tcp_offset + 6)?,
         *payload.get(tcp_offset + 7)?,
     ]);
-    let enforced_ports =
-        expected_ports.or(live_frame_ports_bytes(frame, meta.addr_family, meta.protocol));
+    let enforced_ports = expected_ports.or(live_frame_ports_bytes(
+        frame,
+        meta.addr_family,
+        meta.protocol,
+    ));
     let tcp_header = payload.get(tcp_offset..tcp_offset + tcp_header_len)?;
     let ip_header = payload.get(..ip_header_len)?;
     let mut out = Vec::with_capacity((data.len() / segment_payload_max) + 1);
@@ -5934,9 +6059,7 @@ fn segment_forwarded_tcp_frames_from_frame(
                     enforced_ports,
                 )?;
                 let packet = frame_out.get_mut(eth_len..)?;
-                packet
-                    .get_mut(10..12)?
-                    .copy_from_slice(&[0, 0]);
+                packet.get_mut(10..12)?.copy_from_slice(&[0, 0]);
                 let ip_sum = checksum16(packet.get(..ip_header_len)?);
                 packet
                     .get_mut(10..12)?
@@ -5982,8 +6105,11 @@ fn build_forwarded_frame_into_from_frame(
     expected_ports: Option<(u16, u16)>,
 ) -> Option<usize> {
     let dst_mac = decision.resolution.neighbor_mac?;
-    let enforced_ports =
-        expected_ports.or(live_frame_ports_bytes(frame, meta.addr_family, meta.protocol));
+    let enforced_ports = expected_ports.or(live_frame_ports_bytes(
+        frame,
+        meta.addr_family,
+        meta.protocol,
+    ));
     let l3 = frame_l3_offset(frame)?;
     if l3 >= frame.len() {
         return None;
@@ -6055,8 +6181,9 @@ fn build_forwarded_frame_into_from_frame(
                 apply_nat_ipv4(&mut out[ip_start..], meta.protocol, decision.nat)?;
             }
             out[ip_start + 8] -= 1;
-            let enforced = enforce_expected_ports(out, meta.addr_family, meta.protocol, enforced_ports)
-                .unwrap_or(false);
+            let enforced =
+                enforce_expected_ports(out, meta.addr_family, meta.protocol, enforced_ports)
+                    .unwrap_or(false);
             adjust_ipv4_header_checksum(
                 &mut out[ip_start..ip_start + ihl],
                 old_src,
@@ -6081,8 +6208,9 @@ fn build_forwarded_frame_into_from_frame(
                 apply_nat_ipv6(&mut out[ip_start..], meta.protocol, decision.nat)?;
             }
             out[ip_start + 7] -= 1;
-            let enforced = enforce_expected_ports(out, meta.addr_family, meta.protocol, enforced_ports)
-                .unwrap_or(false);
+            let enforced =
+                enforce_expected_ports(out, meta.addr_family, meta.protocol, enforced_ports)
+                    .unwrap_or(false);
             if repaired_ports && !enforced {
                 recompute_l4_checksum_ipv6(&mut out[ip_start..], meta.protocol)?;
             }
@@ -6218,13 +6346,9 @@ fn rewrite_forwarded_frame_in_place(
                 old_dst,
                 old_ttl,
             )?;
-            let enforced = enforce_expected_ports(
-                packet,
-                meta.addr_family,
-                meta.protocol,
-                enforced_ports,
-            )
-            .unwrap_or(false);
+            let enforced =
+                enforce_expected_ports(packet, meta.addr_family, meta.protocol, enforced_ports)
+                    .unwrap_or(false);
             if repaired_ports && !enforced {
                 recompute_l4_checksum_ipv4(&mut packet[ip_start..], ihl, meta.protocol, true)?;
             }
@@ -6243,13 +6367,9 @@ fn rewrite_forwarded_frame_in_place(
                 apply_nat_ipv6(&mut packet[ip_start..], meta.protocol, decision.nat)?;
             }
             packet[ip_start + 7] -= 1;
-            let enforced = enforce_expected_ports(
-                packet,
-                meta.addr_family,
-                meta.protocol,
-                enforced_ports,
-            )
-            .unwrap_or(false);
+            let enforced =
+                enforce_expected_ports(packet, meta.addr_family, meta.protocol, enforced_ports)
+                    .unwrap_or(false);
             if repaired_ports && !enforced {
                 recompute_l4_checksum_ipv6(&mut packet[ip_start..], meta.protocol)?;
             }
@@ -7289,6 +7409,7 @@ struct BindingLiveState {
     debug_outstanding_tx: AtomicU32,
     debug_in_flight_recycles: AtomicU32,
     last_heartbeat: AtomicU64,
+    max_pending_tx: AtomicU32,
     pending_tx_len: AtomicU32,
     last_error: Mutex<String>,
     pending_tx: Mutex<VecDeque<TxRequest>>,
@@ -7351,6 +7472,7 @@ impl BindingLiveState {
             debug_outstanding_tx: AtomicU32::new(0),
             debug_in_flight_recycles: AtomicU32::new(0),
             last_heartbeat: AtomicU64::new(0),
+            max_pending_tx: AtomicU32::new(0),
             pending_tx_len: AtomicU32::new(0),
             last_error: Mutex::new(String::new()),
             pending_tx: Mutex::new(VecDeque::new()),
@@ -7379,6 +7501,11 @@ impl BindingLiveState {
 
     fn set_last_heartbeat_at(&self, now_ns: u64) {
         self.last_heartbeat.store(now_ns, Ordering::Relaxed);
+    }
+
+    fn set_max_pending_tx(&self, max_pending: usize) {
+        self.max_pending_tx
+            .store(max_pending.min(u32::MAX as usize) as u32, Ordering::Relaxed);
     }
 
     fn clear_error(&self) {
@@ -7474,8 +7601,15 @@ impl BindingLiveState {
     fn enqueue_tx(&self, req: TxRequest) -> Result<(), String> {
         match self.pending_tx.lock() {
             Ok(mut pending) => {
+                let max_pending = self.max_pending_tx.load(Ordering::Relaxed) as usize;
+                if max_pending > 0 && pending.len() >= max_pending {
+                    if pending.pop_front().is_some() {
+                        self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 pending.push_back(req);
-                self.pending_tx_len.fetch_add(1, Ordering::Relaxed);
+                self.pending_tx_len
+                    .store(pending.len().min(u32::MAX as usize) as u32, Ordering::Relaxed);
                 Ok(())
             }
             Err(_) => Err("pending_tx lock poisoned".to_string()),
@@ -9368,6 +9502,101 @@ mod tests {
 
         assert_eq!(&packet[12..16], &[172, 16, 80, 8]);
         assert!(tcp_checksum_ok_ipv4(&packet));
+    }
+
+    #[test]
+    fn extract_l3_packet_with_nat_rewrites_reverse_snat_reply_v4() {
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+            [0x02, 0xbf, 0x72, 0x00, 0x50, 0x08],
+            80,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 63, PROTO_TCP, 0x00, 0x00, 172, 16, 80,
+            200, 172, 16, 80, 8, 0x14, 0x51, 0x9c, 0x40, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x01, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd',
+            b'a', b't', b'a',
+        ]);
+        let ip_sum = checksum16(&frame[18..38]);
+        frame[28] = (ip_sum >> 8) as u8;
+        frame[29] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, false).expect("tcp sum");
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 18,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            ..UserspaceDpMeta::default()
+        };
+        let packet = extract_l3_packet_with_nat(
+            &frame,
+            meta,
+            NatDecision {
+                rewrite_src: None,
+                rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+            },
+        )
+        .expect("slow-path packet");
+        assert_eq!(&packet[12..16], &[172, 16, 80, 200]);
+        assert_eq!(&packet[16..20], &[10, 0, 61, 102]);
+        assert!(tcp_checksum_ok_ipv4(&packet));
+    }
+
+    #[test]
+    fn extract_l3_packet_with_nat_rewrites_reverse_snat_reply_v6() {
+        let src_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+        let dst_ip = "2001:559:8585:80::8".parse::<Ipv6Addr>().unwrap();
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+            [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            80,
+            0x86dd,
+        );
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 63]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&[
+            0x14, 0x51, 0x95, 0x2c, 0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x10,
+            0x00, 0x40, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+            b't', b'e', b's', b't',
+        ]);
+        recompute_l4_checksum_ipv6(&mut frame[18..], PROTO_TCP).expect("tcp sum");
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 18,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            ..UserspaceDpMeta::default()
+        };
+        let packet = extract_l3_packet_with_nat(
+            &frame,
+            meta,
+            NatDecision {
+                rewrite_src: None,
+                rewrite_dst: Some(IpAddr::V6("2001:559:8585:ef00::102".parse().unwrap())),
+            },
+        )
+        .expect("slow-path packet");
+        assert_eq!(
+            Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap()),
+            src_ip
+        );
+        assert_eq!(
+            Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
+            "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap()
+        );
+        assert!(tcp_checksum_ok_ipv6(&packet));
     }
 
     #[test]
