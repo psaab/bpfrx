@@ -1209,6 +1209,7 @@ struct PendingForwardRequest {
     ingress_queue_id: u32,
     source_offset: u64,
     desc: XdpDesc,
+    source_frame: Vec<u8>,
     meta: UserspaceDpMeta,
     decision: SessionDecision,
     expected_ports: Option<(u16, u16)>,
@@ -2234,21 +2235,22 @@ fn build_live_forward_request(
     } else {
         resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
     };
+    let source_frame = area.slice(desc.addr as usize, desc.len as usize)?.to_vec();
     Some(PendingForwardRequest {
         target_ifindex,
         ingress_queue_id: ingress_ident.queue_id,
         source_offset: desc.addr,
         desc,
+        source_frame: source_frame.clone(),
         meta,
         decision: *decision,
-        expected_ports: authoritative_forward_ports(area, desc, meta, flow),
+        expected_ports: authoritative_forward_ports(&source_frame, meta, flow),
         flow_key: flow.map(|flow| flow.forward_key.clone()),
     })
 }
 
 fn authoritative_forward_ports(
-    area: &MmapArea,
-    desc: XdpDesc,
+    frame: &[u8],
     meta: UserspaceDpMeta,
     flow: Option<&SessionFlow>,
 ) -> Option<(u16, u16)> {
@@ -2262,12 +2264,7 @@ fn authoritative_forward_ports(
             None
         }
     });
-    let frame_ports = area
-        .slice(desc.addr as usize, desc.len as usize)
-        .and_then(|frame| {
-            let l4 = frame_l4_offset(frame, meta.addr_family)?;
-            parse_flow_ports(frame, l4, meta.protocol)
-        });
+    let frame_ports = live_frame_ports_bytes(frame, meta.addr_family, meta.protocol);
     match (frame_ports, flow_ports) {
         (Some(frame_ports), Some(flow_ports)) => {
             if frame_ports == flow_ports {
@@ -2293,8 +2290,15 @@ fn live_frame_ports(area: &MmapArea, desc: XdpDesc, meta: UserspaceDpMeta) -> Op
         return None;
     }
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    let l4 = frame_l4_offset(frame, meta.addr_family)?;
-    parse_flow_ports(frame, l4, meta.protocol)
+    live_frame_ports_bytes(frame, meta.addr_family, meta.protocol)
+}
+
+fn live_frame_ports_bytes(frame: &[u8], addr_family: u8, protocol: u8) -> Option<(u16, u16)> {
+    if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
+        return None;
+    }
+    let l4 = frame_l4_offset(frame, addr_family)?;
+    parse_flow_ports(frame, l4, protocol)
 }
 
 fn enqueue_pending_forwards(
@@ -2312,7 +2316,7 @@ fn enqueue_pending_forwards(
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
         let expected_ports =
-            live_frame_ports(unsafe { &*ingress_area }, request.desc, request.meta)
+            live_frame_ports_bytes(&request.source_frame, request.meta.addr_family, request.meta.protocol)
                 .or(request.expected_ports);
         let Some(target_binding) = find_target_binding_mut(
             left,
@@ -2337,9 +2341,8 @@ fn enqueue_pending_forwards(
         let mut copied_source_frame = false;
         {
             let target_area = (&target_binding.umem.area) as *const MmapArea;
-            if let Some(segmented) = segment_forwarded_tcp_frames(
-                unsafe { &*ingress_area },
-                request.desc,
+            if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
+                &request.source_frame,
                 request.meta,
                 &request.decision,
                 forwarding,
@@ -2369,10 +2372,9 @@ fn enqueue_pending_forwards(
                             .slice_mut_unchecked(offset as usize, UMEM_FRAME_SIZE as usize)
                     }
                     .and_then(|dst| {
-                        build_forwarded_frame_into(
+                        build_forwarded_frame_into_from_frame(
                             dst,
-                            unsafe { &*ingress_area },
-                            request.desc,
+                            &request.source_frame,
                             request.meta,
                             &request.decision,
                             expected_ports,
@@ -2393,9 +2395,8 @@ fn enqueue_pending_forwards(
                         }
                         None => {
                             target_binding.free_tx_frames.push_front(offset);
-                            match build_forwarded_frame(
-                                unsafe { &*ingress_area },
-                                request.desc,
+                            match build_forwarded_frame_from_frame(
+                                &request.source_frame,
                                 request.meta,
                                 &request.decision,
                                 forwarding,
@@ -2428,9 +2429,8 @@ fn enqueue_pending_forwards(
                         }
                     }
                 } else {
-                    match build_forwarded_frame(
-                        unsafe { &*ingress_area },
-                        request.desc,
+                    match build_forwarded_frame_from_frame(
+                        &request.source_frame,
                         request.meta,
                         &request.decision,
                         forwarding,
@@ -3447,12 +3447,6 @@ fn transmit_batch(
                 req.bytes.len()
             )));
         };
-        let _ = enforce_expected_ports(
-            &mut req.bytes,
-            req.expected_addr_family,
-            req.expected_protocol,
-            req.expected_ports,
-        );
         frame.copy_from_slice(&req.bytes);
         binding.scratch_local_tx.push((offset, req));
     }
@@ -3545,12 +3539,6 @@ fn transmit_prepared_batch(
                 req.offset, req.len
             )));
         };
-        let _ = enforce_expected_ports(
-            frame,
-            req.expected_addr_family,
-            req.expected_protocol,
-            req.expected_ports,
-        );
     }
 
     let mut writer = binding
@@ -5729,23 +5717,22 @@ fn build_injected_packet(
     }
 }
 
-fn build_forwarded_frame(
-    area: &MmapArea,
-    desc: XdpDesc,
+fn build_forwarded_frame_from_frame(
+    frame: &[u8],
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
     _forwarding: &ForwardingState,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<Vec<u8>> {
-    let mut out = vec![0u8; (desc.len as usize).saturating_add(4)];
-    let written = build_forwarded_frame_into(&mut out, area, desc, meta, decision, expected_ports)?;
+    let mut out = vec![0u8; frame.len().saturating_add(4)];
+    let written =
+        build_forwarded_frame_into_from_frame(&mut out, frame, meta, decision, expected_ports)?;
     out.truncate(written);
     Some(out)
 }
 
-fn segment_forwarded_tcp_frames(
-    area: &MmapArea,
-    desc: XdpDesc,
+fn segment_forwarded_tcp_frames_from_frame(
+    frame: &[u8],
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
     forwarding: &ForwardingState,
@@ -5759,7 +5746,6 @@ fn segment_forwarded_tcp_frames(
         .get(&decision.resolution.egress_ifindex)
         .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex))?;
     let mtu = egress.mtu.max(1280);
-    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     let l3 = frame_l3_offset(frame)?;
     if l3 >= frame.len() {
         return None;
@@ -5833,7 +5819,7 @@ fn segment_forwarded_tcp_frames(
         *payload.get(tcp_offset + 6)?,
         *payload.get(tcp_offset + 7)?,
     ]);
-    let expected_ports = live_frame_ports(area, desc, meta).or(expected_ports);
+    let _expected_ports = live_frame_ports_bytes(frame, meta.addr_family, meta.protocol).or(expected_ports);
     let tcp_header = payload.get(tcp_offset..tcp_offset + tcp_header_len)?;
     let ip_header = payload.get(..ip_header_len)?;
     let mut out = Vec::with_capacity((data.len() / segment_payload_max) + 1);
@@ -5900,29 +5886,21 @@ fn segment_forwarded_tcp_frames(
             }
             _ => return None,
         }
-        let _ = enforce_expected_ports(
-            &mut frame_out,
-            meta.addr_family,
-            meta.protocol,
-            expected_ports,
-        );
         out.push(frame_out);
         data_offset += chunk_len;
     }
     Some(out)
 }
 
-fn build_forwarded_frame_into(
+fn build_forwarded_frame_into_from_frame(
     out: &mut [u8],
-    area: &MmapArea,
-    desc: XdpDesc,
+    frame: &[u8],
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<usize> {
     let dst_mac = decision.resolution.neighbor_mac?;
-    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    let expected_ports = live_frame_ports(area, desc, meta).or(expected_ports);
+    let _expected_ports = live_frame_ports_bytes(frame, meta.addr_family, meta.protocol).or(expected_ports);
     let l3 = frame_l3_offset(frame)?;
     if l3 >= frame.len() {
         return None;
@@ -6024,8 +6002,43 @@ fn build_forwarded_frame_into(
         }
         _ => return None,
     }
-    let _ = enforce_expected_ports(out, meta.addr_family, meta.protocol, expected_ports);
     Some(frame_len)
+}
+
+fn build_forwarded_frame(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<Vec<u8>> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    build_forwarded_frame_from_frame(frame, meta, decision, forwarding, expected_ports)
+}
+
+fn segment_forwarded_tcp_frames(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<Vec<Vec<u8>>> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    segment_forwarded_tcp_frames_from_frame(frame, meta, decision, forwarding, expected_ports)
+}
+
+fn build_forwarded_frame_into(
+    out: &mut [u8],
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    decision: &SessionDecision,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<usize> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    build_forwarded_frame_into_from_frame(out, frame, meta, decision, expected_ports)
 }
 
 fn rewrite_forwarded_frame_in_place(
@@ -6036,7 +6049,7 @@ fn rewrite_forwarded_frame_in_place(
     expected_ports: Option<(u16, u16)>,
 ) -> Option<u32> {
     let dst_mac = decision.resolution.neighbor_mac?;
-    let expected_ports = live_frame_ports(area, desc, meta).or(expected_ports);
+    let _expected_ports = live_frame_ports(area, desc, meta).or(expected_ports);
     let frame = unsafe { area.slice_mut_unchecked(desc.addr as usize, UMEM_FRAME_SIZE as usize)? };
     let current_len = desc.len as usize;
     let l3 = frame_l3_offset(&frame[..current_len])?;
@@ -6142,7 +6155,6 @@ fn rewrite_forwarded_frame_in_place(
         }
         _ => return None,
     }
-    let _ = enforce_expected_ports(packet, meta.addr_family, meta.protocol, expected_ports);
     Some(frame_len as u32)
 }
 
