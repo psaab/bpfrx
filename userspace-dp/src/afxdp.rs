@@ -1242,9 +1242,10 @@ struct WorkerUmem {
 impl WorkerUmem {
     fn new(total_frames: u32) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let area = MmapArea::new((total_frames as usize) * (UMEM_FRAME_SIZE as usize))?;
+        let ring_size = umem_ring_size(total_frames);
         let umem_cfg = UmemConfig {
-            fill_size: total_frames,
-            complete_size: total_frames,
+            fill_size: ring_size,
+            complete_size: ring_size,
             frame_size: UMEM_FRAME_SIZE,
             headroom: UMEM_HEADROOM,
             flags: 0,
@@ -1307,6 +1308,13 @@ fn binding_frame_count(ring_entries: u32) -> u32 {
     reserved_tx_frames(ring_entries)
         .saturating_add(ring_entries.max(1))
         .saturating_add(spare_fill_frames(ring_entries))
+}
+
+fn umem_ring_size(entries: u32) -> u32 {
+    entries
+        .max(64)
+        .checked_next_power_of_two()
+        .unwrap_or(entries.max(64))
 }
 
 fn open_user_rings(
