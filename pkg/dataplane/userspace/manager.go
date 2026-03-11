@@ -254,6 +254,11 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	if cfg.Services.FlowMonitoring != nil {
 		addReason("flow export offload is not implemented in the userspace dataplane")
 	}
+	if cc := cfg.Chassis.Cluster; cc != nil {
+		if cc.PrivateRGElection || cc.NoRethVRRP || cc.FabricInterface != "" || cc.Fabric1Interface != "" {
+			addReason("HA cluster ownership and fabric redirect are not implemented in the userspace dataplane")
+		}
+	}
 	return caps
 }
 

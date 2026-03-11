@@ -414,6 +414,31 @@ func TestDeriveUserspaceCapabilitiesAllowsDNSFlowKnobs(t *testing.T) {
 	}
 }
 
+func TestDeriveUserspaceCapabilitiesRejectsHAFabricConfigs(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chassis.Cluster = &config.ClusterConfig{
+		ClusterID:         22,
+		PrivateRGElection: true,
+		FabricInterface:   "fab0",
+		FabricPeerAddress: "10.99.13.2",
+	}
+
+	caps := deriveUserspaceCapabilities(cfg)
+	if caps.ForwardingSupported {
+		t.Fatal("ForwardingSupported = true, want false for HA/fabric config")
+	}
+	var found bool
+	for _, reason := range caps.UnsupportedReasons {
+		if reason == "HA cluster ownership and fabric redirect are not implemented in the userspace dataplane" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("UnsupportedReasons = %+v, missing HA/fabric reason", caps.UnsupportedReasons)
+	}
+}
+
 func TestDesiredForwardingArmedTracksClusterOwnership(t *testing.T) {
 	m := &Manager{
 		clusterHA: true,
