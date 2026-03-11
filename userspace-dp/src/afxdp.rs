@@ -31,7 +31,7 @@ use xdpilone::xdp::XdpDesc;
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig, User};
 
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
-const USERSPACE_META_VERSION: u16 = 3;
+const USERSPACE_META_VERSION: u16 = 4;
 const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 256;
