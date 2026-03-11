@@ -39,6 +39,7 @@ int xdp_cpumap_prog(struct xdp_md *ctx)
 	meta->ingress_ifindex = ctx->ingress_ifindex;
 	meta->ingress_vlan_id = vlan_id;
 	meta->dscp_rewrite = 0xFF; /* no DSCP rewrite by default */
+	meta->native_xdp = 1; /* cpumap only runs with native XDP */
 	meta->now_sec = (__u32)(bpf_ktime_get_coarse_ns() / 1000000000ULL);
 	meta->ktime_ns = 0;
 

@@ -33,6 +33,64 @@ int xdp_forward_prog(struct xdp_md *ctx)
 	 */
 	if (meta->fwd_ifindex == 0) {
 		/*
+		 * NAT re-FIB: after SNAT/DNAT reversal the destination
+		 * may have changed from a local address (the NAT'd IP)
+		 * to an external host.  This happens for VRF/tunnel
+		 * return traffic: zone FIB resolved the pre-NAT dest as
+		 * local (fwd_ifindex=0), but after NAT reversal the real
+		 * destination is in a different routing domain (e.g. the
+		 * LAN subnet, reachable only via the main table).
+		 *
+		 * Re-FIB using the default table (no TBID) to find the
+		 * correct egress.  On success, jump to the forwarding
+		 * path so the packet is redirected directly — avoiding
+		 * the kernel's VRF routing which would loop.
+		 */
+		if (meta->nat_flags) {
+			struct bpf_fib_lookup fib = {};
+			fib.family  = meta->addr_family;
+			fib.ifindex = ctx->ingress_ifindex;
+			/* Force main table: ingress may be in a VRF,
+			 * and bpf_fib_lookup honors l3mdev rules for
+			 * fib.ifindex.  DIRECT+TBID with RT_TABLE_MAIN
+			 * bypasses VRF routing entirely. */
+			fib.tbid    = 254; /* RT_TABLE_MAIN */
+			if (meta->addr_family == AF_INET) {
+				struct iphdr *iph_n = data +
+					sizeof(struct ethhdr);
+				if ((void *)(iph_n + 1) <= data_end) {
+					fib.ipv4_src = iph_n->saddr;
+					fib.ipv4_dst = iph_n->daddr;
+					fib.l4_protocol = iph_n->protocol;
+					fib.tot_len =
+						bpf_ntohs(iph_n->tot_len);
+				}
+			} else {
+				struct ipv6hdr *ip6_n = data +
+					sizeof(struct ethhdr);
+				if ((void *)(ip6_n + 1) <= data_end) {
+					__builtin_memcpy(fib.ipv6_src,
+						&ip6_n->saddr, 16);
+					__builtin_memcpy(fib.ipv6_dst,
+						&ip6_n->daddr, 16);
+					fib.l4_protocol = ip6_n->nexthdr;
+					fib.tot_len = bpf_ntohs(
+						ip6_n->payload_len);
+				}
+			}
+			int nat_rc = bpf_fib_lookup(ctx, &fib,
+				sizeof(fib), BPF_FIB_LOOKUP_DIRECT_TBID);
+			if (nat_rc == BPF_FIB_LKUP_RET_SUCCESS) {
+				meta->fwd_ifindex = fib.ifindex;
+				__builtin_memcpy(meta->fwd_dmac,
+					fib.dmac, ETH_ALEN);
+				__builtin_memcpy(meta->fwd_smac,
+					fib.smac, ETH_ALEN);
+				goto forward_transit;
+			}
+		}
+
+		/*
 		 * Kernel routing fallback: session traffic where BPF FIB
 		 * lookup failed (e.g. FRR routes not yet converged after
 		 * VRRP MASTER transition) but NAT has been reversed by
@@ -89,7 +147,23 @@ int xdp_forward_prog(struct xdp_md *ctx)
 			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
 				return XDP_DROP;
 			inc_counter(GLOBAL_CTR_HOST_INBOUND);
-			return XDP_PASS;
+			return tunnel_pass(ctx, meta);
+		}
+		/*
+		 * Tunnel interface bypass: packets arriving on a tunnel
+		 * (GRE, ip6gre, XFRM) have already been validated at
+		 * the outer transport level by the zone where the
+		 * encapsulated packet was received.  The inner
+		 * decapsulated packet should not be subject to the
+		 * tunnel zone's host-inbound restrictions — those are
+		 * meant for direct network attacks, not tunnel-
+		 * authenticated traffic.  Without this, the firewall
+		 * cannot use services through tunnels (e.g. iperf3)
+		 * because TCP on arbitrary ports returns flag=0.
+		 */
+		if (meta->meta_flags & META_FLAG_TUNNEL) {
+			inc_counter(GLOBAL_CTR_HOST_INBOUND);
+			return tunnel_pass(ctx, meta);
 		}
 		__u32 zone_key = (__u32)meta->ingress_zone;
 		struct zone_config *zcfg = bpf_map_lookup_elem(&zone_configs, &zone_key);
@@ -130,9 +204,10 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		}
 		inc_counter(GLOBAL_CTR_HOST_INBOUND);
 		/* flags==0 means no host-inbound configured → allow all */
-		return XDP_PASS;
+		return tunnel_pass(ctx, meta);
 	}
 
+forward_transit:
 	/*
 	 * TTL/hop-limit expiry check: if TTL would expire after
 	 * decrement, XDP_PASS the unmodified packet so the kernel
@@ -148,14 +223,14 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		if ((void *)(iph_ttl + 1) <= data_end && iph_ttl->ttl <= 1) {
 			if (meta->ingress_vlan_id != 0)
 				xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
-			return XDP_PASS;
+			return tunnel_pass(ctx, meta);
 		}
 	} else {
 		struct ipv6hdr *ip6h_ttl = data + sizeof(struct ethhdr);
 		if ((void *)(ip6h_ttl + 1) <= data_end && ip6h_ttl->hop_limit <= 1) {
 			if (meta->ingress_vlan_id != 0)
 				xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
-			return XDP_PASS;
+			return tunnel_pass(ctx, meta);
 		}
 	}
 
@@ -171,7 +246,7 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		inc_counter(GLOBAL_CTR_TX_PACKETS);
 		inc_iface_tx(meta->fwd_ifindex, meta->pkt_len);
 		inc_zone_egress((__u32)meta->egress_zone, meta->pkt_len);
-		return XDP_PASS;
+		return tunnel_pass(ctx, meta);
 	}
 
 	/* Push VLAN tag if egress is a VLAN sub-interface */
@@ -257,7 +332,7 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		/* Store mirror info in meta for TC egress to pick up */
 		meta->mirror_ifindex = mcfg->mirror_ifindex;
 		meta->mirror_rate = mcfg->rate;
-		return XDP_PASS;
+		return tunnel_pass(ctx, meta);
 	}
 
 	/* Redirect via devmap to egress interface */

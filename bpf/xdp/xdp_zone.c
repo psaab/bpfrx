@@ -655,6 +655,21 @@ zone_ct_update_v4(struct xdp_md *ctx, struct pkt_meta *meta,
 		return XDP_DROP;
 	}
 
+	/* MSS clamping for SYN/SYN-ACK on the fast path.
+	 * xdp_conntrack (where MSS clamping normally lives) is
+	 * bypassed for established sessions — clamp here so
+	 * server SYN-ACKs get MSS-limited on tunnel interfaces. */
+	if (fc && meta->protocol == PROTO_TCP &&
+	    (meta->tcp_flags & 0x02)) {
+		__u16 mss = fc->tcp_mss_ipsec;
+		if (fc->tcp_mss_gre_in > 0 &&
+		    (fc->tcp_mss_gre_in < mss || mss == 0))
+			mss = fc->tcp_mss_gre_in;
+		if (mss > 0)
+			tcp_mss_clamp(ctx, meta->l4_offset, mss,
+				      meta->csum_partial);
+	}
+
 	bpf_tail_call(ctx, &xdp_progs, next_prog);
 	return XDP_PASS;
 }
@@ -770,6 +785,18 @@ zone_ct_update_v6(struct xdp_md *ctx, struct pkt_meta *meta,
 					sess->app_id, CLOSE_REASON_TIMEOUT);
 		inc_counter(GLOBAL_CTR_DROPS);
 		return XDP_DROP;
+	}
+
+	/* MSS clamping for SYN/SYN-ACK on the fast path (IPv6). */
+	if (fc && meta->protocol == PROTO_TCP &&
+	    (meta->tcp_flags & 0x02)) {
+		__u16 mss = fc->tcp_mss_ipsec;
+		if (fc->tcp_mss_gre_in > 0 &&
+		    (fc->tcp_mss_gre_in < mss || mss == 0))
+			mss = fc->tcp_mss_gre_in;
+		if (mss > 0)
+			tcp_mss_clamp(ctx, meta->l4_offset, mss,
+				      meta->csum_partial);
 	}
 
 	bpf_tail_call(ctx, &xdp_progs, next_prog);
@@ -1435,11 +1462,10 @@ zone_resolved:
 	 * fields unnecessarily. */
 	fib.tbid = meta->routing_table;
 
-	/* Zone-decoded packets arrived on fabric (VRF slave).  The kernel's
-	 * bpf_fib_lookup still honors l3mdev rules even with BPF_FIB_LOOKUP_TBID,
-	 * so using the fabric ifindex as input device causes the lookup to hit
-	 * the VRF table instead of the requested main table.  Override with a
-	 * non-VRF data-plane ifindex stored in fabric_fwd. */
+	/* Zone-decoded packets arrived on fabric (VRF slave).  Even with
+	 * BPF_FIB_LOOKUP_DIRECT_TBID, the input ifindex still affects
+	 * neighbor resolution.  Override with a non-VRF data-plane ifindex
+	 * stored in fabric_fwd for correct output device selection. */
 	if (meta->routing_table == 254) {
 		if (ff_cached && ff_cached->fib_ifindex)
 			fib.ifindex = ff_cached->fib_ifindex;
@@ -1459,7 +1485,7 @@ zone_resolved:
 
 	__u32 fib_flags = 0;
 	if (meta->routing_table)
-		fib_flags = BPF_FIB_LOOKUP_TBID;
+		fib_flags = BPF_FIB_LOOKUP_DIRECT_TBID;
 	int rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), fib_flags);
 	TRACE_FIB_RESULT(rc, fib.ifindex);
 
@@ -1556,6 +1582,91 @@ zone_resolved:
 		 */
 		if (meta->fwd_ifindex == meta->ingress_ifindex &&
 		    meta->egress_vlan_id == meta->ingress_vlan_id) {
+			/*
+			 * Cross-VRF NAT return: pre-routing DNAT
+			 * changed dst but the VRF table has no
+			 * route — only a default back through the
+			 * same tunnel (loop).  Re-FIB via the main
+			 * table to reach the original LAN subnet.
+			 */
+			if (meta->nat_flags & SESS_FLAG_DNAT) {
+				/*
+				 * Two-phase cross-VRF re-FIB:
+				 * Phase 1: DIRECT_TBID + SKIP_NEIGH
+				 *   finds the correct egress interface
+				 *   via the main table (no neighbor
+				 *   resolution — DIRECT mode may miss
+				 *   STALE neighbor entries).
+				 * Phase 2: normal FIB from the output
+				 *   interface (non-VRF) resolves neighbor
+				 *   MACs for XDP redirect.
+				 */
+				struct bpf_fib_lookup fib2 = {};
+				setup_main_table_fib(
+					&fib2, meta,
+					ff_cached, ff1_cached);
+				int rc2 = bpf_fib_lookup(ctx,
+					&fib2, sizeof(fib2),
+					BPF_FIB_LOOKUP_DIRECT_TBID |
+					BPF_FIB_LOOKUP_SKIP_NEIGH);
+				if (rc2 ==
+				    BPF_FIB_LKUP_RET_SUCCESS) {
+					/* Phase 2: re-FIB from
+					 * output iface for MACs */
+					struct bpf_fib_lookup fib3
+						= {};
+					fib3.family =
+						meta->addr_family;
+					fib3.ifindex =
+						fib2.ifindex;
+					fib3.l4_protocol =
+						meta->protocol;
+					fib3.tot_len =
+						meta->pkt_len;
+					if (meta->addr_family ==
+					    AF_INET) {
+						fib3.ipv4_src =
+							fib2.ipv4_src;
+						fib3.ipv4_dst =
+							fib2.ipv4_dst;
+					} else {
+						__builtin_memcpy(
+							fib3.ipv6_src,
+							fib2.ipv6_src,
+							16);
+						__builtin_memcpy(
+							fib3.ipv6_dst,
+							fib2.ipv6_dst,
+							16);
+					}
+					int rc3 = bpf_fib_lookup(
+						ctx, &fib3,
+						sizeof(fib3),
+						BPF_FIB_LOOKUP_OUTPUT);
+					if (rc3 ==
+					    BPF_FIB_LKUP_RET_SUCCESS) {
+						resolve_fib_result(
+							meta, &fib3);
+						goto zone_session_update;
+					}
+					/* Phase 2 NO_NEIGH: route
+					 * correct, ARP not ready.
+					 * Use KERNEL_ROUTE but skip
+					 * FIB cache (zero MACs). */
+					resolve_fib_result(
+						meta, &fib3);
+					meta->meta_flags |=
+						META_FLAG_KERNEL_ROUTE;
+					if (sv4)
+						return zone_ct_update_v4(
+							ctx, meta, sv4,
+							ct_direction, fc);
+					bpf_tail_call(ctx,
+						&xdp_progs,
+						XDP_PROG_CONNTRACK);
+					return XDP_PASS;
+				}
+			}
 			if (sv4 != NULL) {
 				apply_dnat_before_fabric_redirect(ctx, meta);
 				int fab_rc =
@@ -1576,6 +1687,7 @@ zone_resolved:
 			}
 		}
 
+zone_session_update:
 		/* Populate FIB cache + conntrack fast-path using session
 		 * pointer from FIB cache check above (avoids duplicate
 		 * session lookup in xdp_conntrack). */
@@ -1618,7 +1730,7 @@ zone_resolved:
 			setup_main_table_fib(&fib2, meta,
 					     ff_cached, ff1_cached);
 			int rc2 = bpf_fib_lookup(ctx, &fib2,
-				sizeof(fib2), BPF_FIB_LOOKUP_TBID);
+				sizeof(fib2), BPF_FIB_LOOKUP_DIRECT_TBID);
 			if (rc2 == BPF_FIB_LKUP_RET_SUCCESS) {
 				resolve_fib_result(meta, &fib2);
 				bpf_tail_call(ctx, &xdp_progs,
@@ -1706,6 +1818,31 @@ zone_resolved:
 				      XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
+		/*
+		 * Tunnel interface: NO_NEIGH is permanent for POINTOPOINT
+		 * (no ARP/NDP entry will ever exist).  Unlike normal
+		 * NO_NEIGH where the kernel resolves ARP and retransmit
+		 * goes through the full pipeline, tunnel packets must be
+		 * processed on the FIRST attempt — go through the full
+		 * conntrack/policy/nat pipeline so SNAT is applied.
+		 * xdp_forward will XDP_PASS (redirect_capable=0).
+		 */
+		{
+			__u32 nn_if = fib.ifindex;
+			struct iface_zone_key nn_zk = {
+				.ifindex = nn_if, .vlan_id = 0,
+			};
+			struct iface_zone_value *nn_zv =
+				bpf_map_lookup_elem(&iface_zone_map,
+						    &nn_zk);
+			if (nn_zv && (nn_zv->flags & IFACE_FLAG_TUNNEL)) {
+				resolve_fib_result(meta, &fib);
+				meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
+				bpf_tail_call(ctx, &xdp_progs,
+					      XDP_PROG_CONNTRACK);
+				return XDP_PASS;
+			}
+		}
 		/* FABRIC_FWD transit: fabric redirects that failed both
 		 * zone-encoded and plain redirect (anti-loop) and have
 		 * no local session.  Drop rather than leaking transit
@@ -1790,7 +1927,7 @@ zone_resolved:
 						ff_cached, ff1_cached);
 					int rc3 = bpf_fib_lookup(
 						ctx, &fib3, sizeof(fib3),
-						BPF_FIB_LOOKUP_TBID);
+						BPF_FIB_LOOKUP_DIRECT_TBID);
 					if (rc3 ==
 					    BPF_FIB_LKUP_RET_SUCCESS) {
 						resolve_fib_result(

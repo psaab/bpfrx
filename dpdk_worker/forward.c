@@ -59,6 +59,10 @@ host_inbound_flag(struct pkt_meta *meta)
 	if (proto == PROTO_ESP)
 		return HOST_INBOUND_ESP;
 
+	/* GRE (protocol 47) — tunnel termination */
+	if (proto == PROTO_GRE)
+		return HOST_INBOUND_GRE;
+
 	/* VRRP (protocol 112) */
 	if (proto == PROTO_VRRP)
 		return HOST_INBOUND_VRRP;
@@ -110,6 +114,14 @@ forward_packet(struct rte_mbuf *pkt, struct pkt_meta *meta,
 	 * resolved, the packet is locally destined. Check host-inbound
 	 * policy before passing to the kernel stack. */
 	if (meta->fwd_ifindex == 0) {
+		/* Tunnel bypass: decapsulated inner packets already
+		 * validated at outer transport level — skip zone
+		 * host-inbound restrictions. */
+		if (meta->meta_flags & META_FLAG_TUNNEL) {
+			ctr_global_inc(ctx, GLOBAL_CTR_HOST_INBOUND);
+			rte_pktmbuf_free(pkt);
+			return;
+		}
 		if (meta->ingress_zone < MAX_ZONES && ctx->shm->zone_configs) {
 			struct zone_config *zc = &ctx->shm->zone_configs[meta->ingress_zone];
 			if (zc->host_inbound_flags != 0) {

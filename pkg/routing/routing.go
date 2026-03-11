@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -263,6 +264,17 @@ func (m *Manager) ApplyTunnels(tunnels []*config.TunnelConfig) error {
 			slog.Warn("failed to create tunnel",
 				"name", tc.Name, "mode", tc.Mode, "err", err)
 			continue
+		}
+
+		// IPv6 GRE: disable encaplimit to avoid adding an IPv6
+		// Destination Options extension header.  Many transit networks
+		// drop IPv6 packets with extension headers (RFC 7872).
+		if isIPv6 && (tc.Mode == "gre" || tc.Mode == "") {
+			if out, err := exec.Command("ip", "link", "set", tc.Name,
+				"type", "ip6gre", "encaplimit", "none").CombinedOutput(); err != nil {
+				slog.Warn("failed to set tunnel encaplimit",
+					"name", tc.Name, "err", err, "output", string(out))
+			}
 		}
 
 		if err := m.nlHandle.LinkSetUp(tunnelLink); err != nil {
@@ -1235,9 +1247,10 @@ func (m *Manager) clearRibGroupRules() error {
 }
 
 // pbrRulePriority is the base priority for policy-based routing ip rules.
-// After rib-group rules (33000-33099), before the default table (32766 is main).
-// We use 34000-34999 range.
-const pbrRulePriority = 34000
+// BEFORE the main table (32766) so the kernel also honors PBR for XDP_PASS'd
+// packets (e.g. SNAT'd traffic destined for a VRF/GRE tunnel).
+// We use 31000-31999 range.
+const pbrRulePriority = 31000
 
 // PBRRule describes a single policy-based routing rule derived from a
 // firewall filter term with a routing-instance action.

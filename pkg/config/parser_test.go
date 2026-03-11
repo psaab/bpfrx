@@ -2192,6 +2192,67 @@ routing-instances {
 	}
 }
 
+func TestFirewallFilterMultiAddressSet(t *testing.T) {
+	// Test that multiple set commands for the same address field produce
+	// a proper multi-value list, not duplicate container nodes.
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set firewall family inet filter pbr term route from destination-address 10.255.192.40/30",
+		"set firewall family inet filter pbr term route from destination-address 1.0.0.1/32",
+		"set firewall family inet filter pbr term route from source-address 192.203.228.0/24",
+		"set firewall family inet filter pbr term route from source-address 198.182.225.0/24",
+		"set firewall family inet filter pbr term route then routing-instance sfmix",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	f, ok := cfg.Firewall.FiltersInet["pbr"]
+	if !ok {
+		t.Fatal("expected pbr filter")
+	}
+	if len(f.Terms) != 1 {
+		t.Fatalf("expected 1 term, got %d", len(f.Terms))
+	}
+	term := f.Terms[0]
+	if len(term.DestAddresses) != 2 {
+		t.Errorf("expected 2 destination addresses, got %d: %v",
+			len(term.DestAddresses), term.DestAddresses)
+	}
+	if len(term.SourceAddresses) != 2 {
+		t.Errorf("expected 2 source addresses, got %d: %v",
+			len(term.SourceAddresses), term.SourceAddresses)
+	}
+	if term.RoutingInstance != "sfmix" {
+		t.Errorf("expected routing-instance sfmix, got %q", term.RoutingInstance)
+	}
+
+	// Verify show output contains all addresses
+	out := tree.Format()
+	if !strings.Contains(out, "10.255.192.40/30") {
+		t.Errorf("missing 10.255.192.40/30 in output:\n%s", out)
+	}
+	if !strings.Contains(out, "1.0.0.1/32") {
+		t.Errorf("missing 1.0.0.1/32 in output:\n%s", out)
+	}
+	if !strings.Contains(out, "192.203.228.0/24") {
+		t.Errorf("missing 192.203.228.0/24 in output:\n%s", out)
+	}
+	if !strings.Contains(out, "198.182.225.0/24") {
+		t.Errorf("missing 198.182.225.0/24 in output:\n%s", out)
+	}
+}
+
 func TestFirewallFilterSourcePort(t *testing.T) {
 	input := `firewall {
     family inet {

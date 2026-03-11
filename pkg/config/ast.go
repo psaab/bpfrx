@@ -1646,17 +1646,17 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"filter": {args: 1, children: map[string]*schemaNode{
 					"term": {args: 1, children: map[string]*schemaNode{
 						"from": {children: map[string]*schemaNode{
-							"source-address":          {children: nil},
-							"destination-address":     {children: nil},
+							"source-address":          {args: 1, multi: true, children: nil},
+							"destination-address":     {args: 1, multi: true, children: nil},
 							"source-prefix-list":      {children: nil},
 							"destination-prefix-list": {children: nil},
-							"protocol":                {args: 1, children: nil},
-							"dscp":                    {args: 1, children: nil},
-							"destination-port":        {children: nil},
-							"source-port":             {children: nil},
-							"icmp-type":               {args: 1, children: nil},
-							"icmp-code":               {args: 1, children: nil},
-							"tcp-flags":               {children: nil},
+							"protocol":                {args: 1, multi: true, children: nil},
+							"dscp":                    {args: 1, multi: true, children: nil},
+							"destination-port":        {args: 1, multi: true, children: nil},
+							"source-port":             {args: 1, multi: true, children: nil},
+							"icmp-type":               {args: 1, multi: true, children: nil},
+							"icmp-code":               {args: 1, multi: true, children: nil},
+							"tcp-flags":               {args: 1, multi: true, children: nil},
 							"is-fragment":             {children: nil},
 							"flexible-match-range": {children: map[string]*schemaNode{
 								"range": {args: 1, children: map[string]*schemaNode{
@@ -1690,17 +1690,17 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"filter": {args: 1, children: map[string]*schemaNode{
 					"term": {args: 1, children: map[string]*schemaNode{
 						"from": {children: map[string]*schemaNode{
-							"source-address":          {children: nil},
-							"destination-address":     {children: nil},
+							"source-address":          {args: 1, multi: true, children: nil},
+							"destination-address":     {args: 1, multi: true, children: nil},
 							"source-prefix-list":      {children: nil},
 							"destination-prefix-list": {children: nil},
-							"protocol":                {args: 1, children: nil},
-							"traffic-class":           {args: 1, children: nil},
-							"destination-port":        {children: nil},
-							"source-port":             {children: nil},
-							"icmp-type":               {args: 1, children: nil},
-							"icmp-code":               {args: 1, children: nil},
-							"tcp-flags":               {children: nil},
+							"protocol":                {args: 1, multi: true, children: nil},
+							"traffic-class":           {args: 1, multi: true, children: nil},
+							"destination-port":        {args: 1, multi: true, children: nil},
+							"source-port":             {args: 1, multi: true, children: nil},
+							"icmp-type":               {args: 1, multi: true, children: nil},
+							"icmp-code":               {args: 1, multi: true, children: nil},
+							"tcp-flags":               {args: 1, multi: true, children: nil},
 							"is-fragment":             {children: nil},
 							"flexible-match-range": {children: map[string]*schemaNode{
 								"range": {args: 1, children: map[string]*schemaNode{

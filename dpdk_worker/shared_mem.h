@@ -119,6 +119,7 @@ struct zone_config {
 #define HOST_INBOUND_VRRP        (1 << 18)
 #define HOST_INBOUND_ESP              (1 << 19)
 #define HOST_INBOUND_ROUTER_DISCOVERY (1 << 20)
+#define HOST_INBOUND_GRE             (1 << 21)
 #define HOST_INBOUND_ALL              0xFFFFFFFF
 
 /* ============================================================

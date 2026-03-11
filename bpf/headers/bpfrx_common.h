@@ -140,7 +140,7 @@ struct icmp6hdr {
 
 /* Maximum values */
 #define MAX_ZONES              64
-#define MAX_INTERFACES         256
+#define MAX_INTERFACES         2048
 #define MAX_LOGICAL_INTERFACES 512
 #define MAX_POLICIES           4096
 #define MAX_RULES_PER_POLICY   256
@@ -331,6 +331,7 @@ struct icmp6hdr {
 #define HOST_INBOUND_VRRP        (1 << 18)
 #define HOST_INBOUND_ESP              (1 << 19)
 #define HOST_INBOUND_ROUTER_DISCOVERY (1 << 20)
+#define HOST_INBOUND_GRE             (1 << 21)
 #define HOST_INBOUND_ALL              0xFFFFFFFF  /* permit all services */
 
 /* ============================================================
@@ -376,10 +377,22 @@ struct iface_zone_value {
  * issues (bridge filtering, SKB vlan_tci stripping in generic XDP). */
 #define FABRIC_ZONE_MAC_MAGIC 0xfe
 
-#define IFACE_FLAG_TUNNEL   (1 << 0)  /* GRE/IPsec tunnel interface */
+#define IFACE_FLAG_TUNNEL     (1 << 0)  /* GRE/IPsec tunnel interface */
+#define IFACE_FLAG_NATIVE_XDP (1 << 1)  /* interface runs native/driver XDP */
 
+#ifndef BPF_FIB_LOOKUP_DIRECT
+#define BPF_FIB_LOOKUP_DIRECT (1U << 0)
+#endif
 #ifndef BPF_FIB_LOOKUP_TBID
 #define BPF_FIB_LOOKUP_TBID (1U << 3)
+#endif
+
+/* BPF_FIB_LOOKUP_TBID only works when combined with BPF_FIB_LOOKUP_DIRECT.
+ * The kernel checks for TBID inside the DIRECT code path. */
+#define BPF_FIB_LOOKUP_DIRECT_TBID (BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_TBID)
+
+#ifndef BPF_FIB_LOOKUP_SKIP_NEIGH
+#define BPF_FIB_LOOKUP_SKIP_NEIGH (1U << 2)
 #endif
 
 /* Reverse mapping: sub-interface ifindex -> parent physical info */
