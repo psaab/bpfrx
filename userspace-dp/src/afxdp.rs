@@ -2187,11 +2187,7 @@ fn build_live_forward_request(
         desc,
         meta,
         decision: *decision,
-        // The XDP-side metadata is the authoritative tuple for redirected packets. Some
-        // live AF_XDP frames arrive with transport bytes that do not match the original
-        // XDP-validated tuple, and trusting the frame bytes can put the wrong 5-tuple
-        // on the wire. Fall back to the frame only when metadata is incomplete.
-        expected_ports: authoritative_forward_ports(area, desc, meta),
+        expected_ports: authoritative_forward_ports(area, desc, meta, flow),
         flow_key: flow.map(|flow| flow.forward_key.clone()),
     })
 }
@@ -2200,16 +2196,42 @@ fn authoritative_forward_ports(
     area: &MmapArea,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
+    flow: Option<&SessionFlow>,
 ) -> Option<(u16, u16)> {
     if !matches!(meta.protocol, PROTO_TCP | PROTO_UDP) {
         return None;
     }
-    if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
-        return Some((meta.flow_src_port, meta.flow_dst_port));
+    let flow_ports = flow.and_then(|flow| {
+        if flow.forward_key.src_port != 0 && flow.forward_key.dst_port != 0 {
+            Some((flow.forward_key.src_port, flow.forward_key.dst_port))
+        } else {
+            None
+        }
+    });
+    let frame_ports = area
+        .slice(desc.addr as usize, desc.len as usize)
+        .and_then(|frame| {
+            let l4 = frame_l4_offset(frame, meta.addr_family)?;
+            parse_flow_ports(frame, l4, meta.protocol)
+        });
+    match (frame_ports, flow_ports) {
+        (Some(frame_ports), Some(flow_ports)) => {
+            if frame_ports == flow_ports {
+                Some(flow_ports)
+            } else {
+                Some(frame_ports)
+            }
+        }
+        (Some(frame_ports), None) => Some(frame_ports),
+        (None, Some(flow_ports)) => Some(flow_ports),
+        (None, None) => {
+            if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
+                Some((meta.flow_src_port, meta.flow_dst_port))
+            } else {
+                None
+            }
+        }
     }
-    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    let l4 = frame_l4_offset(frame, meta.addr_family)?;
-    parse_flow_ports(frame, l4, meta.protocol)
 }
 
 fn enqueue_pending_forwards(
@@ -9568,7 +9590,7 @@ mod tests {
     }
 
     #[test]
-    fn build_live_forward_request_prefers_metadata_ports_for_ipv6_tcp() {
+    fn build_live_forward_request_prefers_frame_ports_for_ipv6_tcp() {
         let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
         let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
         let real_src_port = 38276u16;
@@ -9672,11 +9694,11 @@ mod tests {
             Some(&bogus_flow),
         )
         .expect("request");
-        assert_eq!(req.expected_ports, Some((1025, real_dst_port)));
+        assert_eq!(req.expected_ports, Some((real_src_port, real_dst_port)));
     }
 
     #[test]
-    fn build_live_forward_request_uses_metadata_ports_when_frame_ports_unavailable() {
+    fn build_live_forward_request_uses_flow_or_metadata_ports_when_frame_ports_unavailable() {
         let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
         let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
         let area = MmapArea::new(4096).expect("mmap");
@@ -9692,7 +9714,7 @@ mod tests {
             flow_dst_port: 5201,
             ..UserspaceDpMeta::default()
         };
-        let bogus_flow = SessionFlow {
+        let flow = SessionFlow {
             src_ip: IpAddr::V6(src_ip),
             dst_ip: IpAddr::V6(dst_ip),
             forward_key: SessionKey {
@@ -9700,7 +9722,7 @@ mod tests {
                 protocol: PROTO_TCP,
                 src_ip: IpAddr::V6(src_ip),
                 dst_ip: IpAddr::V6(dst_ip),
-                src_port: 1025,
+                src_port: 54688,
                 dst_port: 5201,
             },
         };
@@ -9738,10 +9760,10 @@ mod tests {
             meta,
             &decision,
             &ForwardingState::default(),
-            Some(&bogus_flow),
+            Some(&flow),
         )
         .expect("request");
-        assert_eq!(req.expected_ports, Some((1025, 5201)));
+        assert_eq!(req.expected_ports, Some((54688, 5201)));
     }
 
     #[test]
