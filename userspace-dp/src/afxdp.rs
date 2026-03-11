@@ -3121,11 +3121,26 @@ fn find_target_binding_mut<'a>(
     None
 }
 
+fn purge_queued_flows_for_closed_deltas(
+    bindings: &mut [BindingWorker],
+    deltas: &[SessionDelta],
+) {
+    for delta in deltas {
+        if delta.kind != SessionDeltaKind::Close {
+            continue;
+        }
+        let reverse_key = reverse_session_key(&delta.key, delta.decision.nat);
+        for binding in bindings.iter_mut() {
+            cancel_queued_flow_on_binding(binding, &delta.key, &reverse_key);
+        }
+    }
+}
+
 fn flush_session_deltas(
     ident: &BindingIdentity,
     live: &BindingLiveState,
     session_map_fd: c_int,
-    deltas: Vec<SessionDelta>,
+    deltas: &[SessionDelta],
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
@@ -4317,13 +4332,15 @@ fn worker_loop(
             poll_start = (poll_start + 1) % bindings.len();
         }
         if sessions.has_pending_deltas() {
+            let deltas = sessions.drain_deltas(256);
+            purge_queued_flows_for_closed_deltas(&mut bindings, &deltas);
             if let Some(binding) = bindings.first() {
                 let ident = binding.identity();
                 flush_session_deltas(
                     &ident,
                     &binding.live,
                     binding.session_map_fd,
-                    sessions.drain_deltas(256),
+                    &deltas,
                     &shared_sessions,
                     &recent_session_deltas,
                     &peer_worker_commands,
