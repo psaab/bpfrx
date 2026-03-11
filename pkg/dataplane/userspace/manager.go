@@ -110,6 +110,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.clusterHA = cfg != nil && cfg.Chassis.Cluster != nil
+	m.lastSnapshot = snap
 	if err := m.programBootstrapMapsLocked(snap, ucfg); err != nil {
 		return result, err
 	}
@@ -131,7 +132,6 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	}
 	m.ensureStatusLoopLocked()
 	m.cfg = ucfg
-	m.lastSnapshot = snap
 	return result, nil
 }
 
@@ -1524,14 +1524,6 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	if heartbeatMap == nil {
 		return errors.New("userspace_heartbeat map not loaded")
 	}
-	localV4Map := m.inner.Map("userspace_local_v4")
-	if localV4Map == nil {
-		return errors.New("userspace_local_v4 map not loaded")
-	}
-	localV6Map := m.inner.Map("userspace_local_v6")
-	if localV6Map == nil {
-		return errors.New("userspace_local_v6 map not loaded")
-	}
 	fallbackMap := m.inner.Map("userspace_fallback_progs")
 	if fallbackMap == nil {
 		return errors.New("userspace_fallback_progs map not loaded")
@@ -1584,46 +1576,7 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 			return fmt.Errorf("delete userspace_heartbeat %d: %w", key, err)
 		}
 	}
-	var (
-		localV4Key uint32
-		localV4Val uint8
-	)
-	localV4Iter := localV4Map.Iterate()
-	var localV4Keys []uint32
-	for localV4Iter.Next(&localV4Key, &localV4Val) {
-		localV4Keys = append(localV4Keys, localV4Key)
-	}
-	for _, key := range localV4Keys {
-		if err := localV4Map.Delete(key); err != nil {
-			return fmt.Errorf("delete userspace_local_v4 %08x: %w", key, err)
-		}
-	}
-	var (
-		localV6Key userspaceLocalV6Key
-		localV6Val uint8
-	)
-	localV6Iter := localV6Map.Iterate()
-	var localV6Keys []userspaceLocalV6Key
-	for localV6Iter.Next(&localV6Key, &localV6Val) {
-		localV6Keys = append(localV6Keys, localV6Key)
-	}
-	for _, key := range localV6Keys {
-		if err := localV6Map.Delete(key); err != nil {
-			return fmt.Errorf("delete userspace_local_v6 %+v: %w", key, err)
-		}
-	}
-	for _, entry := range buildLocalAddressEntries(snapshot) {
-		if entry.v4 {
-			if err := localV4Map.Update(entry.v4Key, uint8(1), ebpf.UpdateAny); err != nil {
-				return fmt.Errorf("update userspace_local_v4 %08x: %w", entry.v4Key, err)
-			}
-			continue
-		}
-		if err := localV6Map.Update(entry.v6Key, uint8(1), ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update userspace_local_v6 %+v: %w", entry.v6Key, err)
-		}
-	}
-	return nil
+	return m.syncLocalAddressMapsLocked(snapshot)
 }
 
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
@@ -1687,7 +1640,64 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			return fmt.Errorf("update userspace_bindings %+v: %w", key, err)
 		}
 	}
+	if err := m.syncLocalAddressMapsLocked(m.lastSnapshot); err != nil {
+		return err
+	}
 	m.lastStatus = *status
+	return nil
+}
+
+func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
+	localV4Map := m.inner.Map("userspace_local_v4")
+	if localV4Map == nil {
+		return errors.New("userspace_local_v4 map not loaded")
+	}
+	localV6Map := m.inner.Map("userspace_local_v6")
+	if localV6Map == nil {
+		return errors.New("userspace_local_v6 map not loaded")
+	}
+
+	var (
+		localV4Key uint32
+		localV4Val uint8
+	)
+	localV4Iter := localV4Map.Iterate()
+	var localV4Keys []uint32
+	for localV4Iter.Next(&localV4Key, &localV4Val) {
+		localV4Keys = append(localV4Keys, localV4Key)
+	}
+	for _, key := range localV4Keys {
+		if err := localV4Map.Delete(key); err != nil {
+			return fmt.Errorf("delete userspace_local_v4 %08x: %w", key, err)
+		}
+	}
+
+	var (
+		localV6Key userspaceLocalV6Key
+		localV6Val uint8
+	)
+	localV6Iter := localV6Map.Iterate()
+	var localV6Keys []userspaceLocalV6Key
+	for localV6Iter.Next(&localV6Key, &localV6Val) {
+		localV6Keys = append(localV6Keys, localV6Key)
+	}
+	for _, key := range localV6Keys {
+		if err := localV6Map.Delete(key); err != nil {
+			return fmt.Errorf("delete userspace_local_v6 %+v: %w", key, err)
+		}
+	}
+
+	for _, entry := range buildLocalAddressEntries(snapshot) {
+		if entry.v4 {
+			if err := localV4Map.Update(entry.v4Key, uint8(1), ebpf.UpdateAny); err != nil {
+				return fmt.Errorf("update userspace_local_v4 %08x: %w", entry.v4Key, err)
+			}
+			continue
+		}
+		if err := localV6Map.Update(entry.v6Key, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_local_v6 %+v: %w", entry.v6Key, err)
+		}
+	}
 	return nil
 }
 
