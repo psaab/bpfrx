@@ -2647,6 +2647,9 @@ fn parse_session_flow(
             if frame_flow == flow {
                 return Some(flow);
             }
+            if matches!(meta.protocol, PROTO_TCP | PROTO_UDP) {
+                return Some(frame_flow);
+            }
             return Some(flow);
         }
         return Some(flow);
@@ -10673,7 +10676,7 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch() {
+    fn authoritative_forward_ports_prefers_frame_tuple_when_frame_ports_mismatch() {
         let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
         let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
         let expected_src_port = 55068u16;
@@ -10727,12 +10730,12 @@ mod tests {
 
         assert_eq!(
             authoritative_forward_ports(&frame, meta, Some(&flow)),
-            Some((expected_src_port, dst_port))
+            Some((wrong_src_port, dst_port))
         );
     }
 
     #[test]
-    fn parse_session_flow_prefers_metadata_tuple_when_frame_ports_mismatch() {
+    fn parse_session_flow_prefers_frame_tuple_when_frame_ports_mismatch() {
         let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
         let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
         let expected_src_port = 55068u16;
@@ -10785,7 +10788,7 @@ mod tests {
             meta,
         )
         .expect("flow");
-        assert_eq!(flow.forward_key.src_port, expected_src_port);
+        assert_eq!(flow.forward_key.src_port, wrong_src_port);
         assert_eq!(flow.forward_key.dst_port, dst_port);
     }
 
