@@ -3954,8 +3954,19 @@ fn synced_replica_entry(entry: &SyncedSessionEntry) -> SyncedSessionEntry {
     replica
 }
 
-fn should_teardown_tcp_rst(meta: UserspaceDpMeta, flow: Option<&SessionFlow>) -> bool {
-    flow.is_some() && meta.protocol == PROTO_TCP && (meta.tcp_flags & TCP_FLAG_RST) != 0
+fn should_teardown_tcp_rst(_meta: UserspaceDpMeta, _flow: Option<&SessionFlow>) -> bool {
+    // Do not immediately delete live sessions on an observed TCP RST.
+    //
+    // On the current HA userspace dataplane, stray or misclassified reply-side
+    // RSTs can appear while the real flow is still active. Immediate teardown
+    // removes the pinned live-session keys from USERSPACE_SESSIONS, which then
+    // causes userspace-xdp to stop redirecting valid reply traffic and the
+    // kernel to emit follow-on RSTs that collapse the connection entirely.
+    //
+    // The session table already marks TCP entries as closing when FIN/RST is
+    // seen and ages them on the shorter TCP_CLOSING timeout. Rely on that
+    // path for now until RST provenance is made trustworthy again.
+    false
 }
 
 fn teardown_tcp_rst_flow(
