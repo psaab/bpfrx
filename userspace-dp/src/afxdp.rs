@@ -2306,7 +2306,7 @@ fn authoritative_forward_ports(
         None
     };
     let frame_ports = live_frame_ports_bytes(frame, meta.addr_family, meta.protocol);
-    flow_ports.or(meta_ports).or(frame_ports)
+    frame_ports.or(flow_ports).or(meta_ports)
 }
 
 fn live_frame_ports(area: &MmapArea, desc: XdpDesc, meta: UserspaceDpMeta) -> Option<(u16, u16)> {
@@ -2763,19 +2763,19 @@ fn parse_session_flow(
         parse_session_flow_from_frame(frame, meta)
     };
 
-    if let Some(flow) = parse_session_flow_from_meta(meta)
-        && metadata_tuple_complete(meta, &flow)
+    if let Some(meta_flow) = parse_session_flow_from_meta(meta)
+        && metadata_tuple_complete(meta, &meta_flow)
     {
         if let Some(frame_flow) = frame_flow.clone() {
-            if frame_flow == flow {
-                return Some(flow);
+            if frame_flow == meta_flow {
+                return Some(meta_flow);
             }
-            if matches!(meta.protocol, PROTO_TCP | PROTO_UDP) {
-                return Some(flow);
-            }
-            return Some(flow);
+            // The frame tuple is the on-wire truth. If metadata disagrees,
+            // prefer the reparsed frame rather than carrying stale tuple state
+            // into session lookup and forwarding.
+            return Some(frame_flow);
         }
-        return Some(flow);
+        return Some(meta_flow);
     }
 
     if let Some(flow) = frame_flow {
