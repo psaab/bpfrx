@@ -37,6 +37,7 @@ const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 256;
 const MIN_RESERVED_TX_FRAMES: u32 = 256;
 const MAX_RESERVED_TX_FRAMES: u32 = 2048;
+const MIN_SPARE_RX_FRAMES: u32 = 512;
 const TX_BATCH_SIZE: usize = 256;
 const FILL_BATCH_SIZE: usize = 1024;
 const FILL_DRAIN_WATERMARK: usize = 64;
@@ -1013,6 +1014,7 @@ struct BindingWorker {
     rx: xdpilone::RingRx,
     tx: xdpilone::RingTx,
     free_tx_frames: VecDeque<u64>,
+    spare_fill_frames: VecDeque<u64>,
     pending_tx_prepared: VecDeque<PreparedTxRequest>,
     pending_tx_local: VecDeque<TxRequest>,
     pending_fill_frames: VecDeque<u64>,
@@ -1165,6 +1167,7 @@ impl BindingWorker {
         ring_entries: u32,
         reserved_tx_frames: VecDeque<u64>,
         initial_fill_frames: Vec<u64>,
+        spare_fill_frames: VecDeque<u64>,
         xsk_map_fd: c_int,
         heartbeat_map_fd: c_int,
         live: Arc<BindingLiveState>,
@@ -1200,6 +1203,7 @@ impl BindingWorker {
             rx,
             tx,
             free_tx_frames: reserved_tx_frames,
+            spare_fill_frames,
             pending_tx_prepared: VecDeque::new(),
             pending_tx_local: VecDeque::new(),
             pending_fill_frames: VecDeque::new(),
@@ -1276,9 +1280,33 @@ fn open_binding_worker_rings(
         .umem
         .fq_cq(&sock)
         .map_err(|e| format!("create fq/cq: {e}"))?;
-    let (user, rx, tx, bind_mode) =
-        open_user_rings(&worker_umem.umem, &sock, ring_entries, XSK_BIND_FLAGS_SHARED_UMEM_OWNER)?;
+    let (user, rx, tx, bind_mode) = open_user_rings(
+        &worker_umem.umem,
+        &sock,
+        ring_entries,
+        XSK_BIND_FLAGS_SHARED_UMEM_OWNER,
+    )?;
     Ok((user, rx, tx, bind_mode, device))
+}
+
+fn reserved_tx_frames(ring_entries: u32) -> u32 {
+    ring_entries
+        .saturating_div(2)
+        .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
+        .min(ring_entries.saturating_sub(1))
+        .max(1)
+}
+
+fn spare_fill_frames(ring_entries: u32) -> u32 {
+    ring_entries
+        .saturating_div(2)
+        .clamp(MIN_SPARE_RX_FRAMES, ring_entries.max(MIN_SPARE_RX_FRAMES))
+}
+
+fn binding_frame_count(ring_entries: u32) -> u32 {
+    reserved_tx_frames(ring_entries)
+        .saturating_add(ring_entries.max(1))
+        .saturating_add(spare_fill_frames(ring_entries))
 }
 
 fn open_user_rings(
@@ -2672,13 +2700,25 @@ fn reap_tx_completions(binding: &mut BindingWorker, shared_recycles: &mut Vec<(u
 }
 
 fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bool {
-    if binding.pending_fill_frames.is_empty() {
+    if binding.pending_fill_frames.is_empty() && binding.spare_fill_frames.is_empty() {
         return false;
     }
-    let batch_size = binding.pending_fill_frames.len().min(FILL_BATCH_SIZE);
+    let batch_size = binding
+        .pending_fill_frames
+        .len()
+        .saturating_add(binding.spare_fill_frames.len())
+        .min(FILL_BATCH_SIZE);
     binding.scratch_fill.clear();
+    let mut pending_taken = 0usize;
     while binding.scratch_fill.len() < batch_size {
         let Some(offset) = binding.pending_fill_frames.pop_front() else {
+            break;
+        };
+        binding.scratch_fill.push(offset);
+        pending_taken += 1;
+    }
+    while binding.scratch_fill.len() < batch_size {
+        let Some(offset) = binding.spare_fill_frames.pop_front() else {
             break;
         };
         binding.scratch_fill.push(offset);
@@ -2693,17 +2733,28 @@ fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bool {
         inserted
     };
     if inserted == 0 {
-        for offset in binding.scratch_fill.drain(..).rev() {
-            binding.pending_fill_frames.push_front(offset);
+        for (idx, offset) in binding.scratch_fill.drain(..).enumerate().rev() {
+            if idx < pending_taken {
+                binding.pending_fill_frames.push_front(offset);
+            } else {
+                binding.spare_fill_frames.push_front(offset);
+            }
         }
-        binding
-            .live
-            .set_error("fill ring insert returned 0".to_string());
-        return !binding.pending_fill_frames.is_empty();
+        return false;
     }
     if inserted < binding.scratch_fill.len() as u32 {
-        for offset in binding.scratch_fill.drain(inserted as usize..).rev() {
-            binding.pending_fill_frames.push_front(offset);
+        for (idx, offset) in binding
+            .scratch_fill
+            .drain(inserted as usize..)
+            .enumerate()
+            .rev()
+        {
+            let absolute_idx = inserted as usize + idx;
+            if absolute_idx < pending_taken {
+                binding.pending_fill_frames.push_front(offset);
+            } else {
+                binding.spare_fill_frames.push_front(offset);
+            }
         }
     }
     binding.scratch_fill.clear();
@@ -3470,9 +3521,9 @@ fn worker_loop(
 ) {
     pin_current_thread(worker_id);
     let mut sessions = SessionTable::new();
-    let total_frames = binding_plans
-        .iter()
-        .fold(0u32, |acc, plan| acc.saturating_add(plan.ring_entries));
+    let total_frames = binding_plans.iter().fold(0u32, |acc, plan| {
+        acc.saturating_add(binding_frame_count(plan.ring_entries))
+    });
     let worker_umem = match WorkerUmem::new(total_frames.max(1)) {
         Ok(worker_umem) => worker_umem,
         Err(err) => {
@@ -3486,13 +3537,9 @@ fn worker_loop(
     let mut bindings = Vec::with_capacity(binding_plans.len());
     let mut frame_index = 0u32;
     for plan in binding_plans {
-        let reserved_tx = plan
-            .ring_entries
-            .saturating_div(2)
-            .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
-            .min(plan.ring_entries.saturating_sub(1))
-            .max(1);
-        let fill_frames = plan.ring_entries.saturating_sub(reserved_tx);
+        let reserved_tx = reserved_tx_frames(plan.ring_entries);
+        let fill_frames = plan.ring_entries.max(1);
+        let spare_fill = spare_fill_frames(plan.ring_entries);
         let mut reserved_tx_frames = VecDeque::with_capacity(reserved_tx as usize);
         for idx in 0..reserved_tx {
             if let Some(frame) = worker_umem.umem.frame(BufIdx(frame_index + idx)) {
@@ -3500,18 +3547,29 @@ fn worker_loop(
             }
         }
         let mut initial_fill_frames = Vec::with_capacity(fill_frames as usize);
-        for idx in reserved_tx..plan.ring_entries {
+        for idx in reserved_tx..reserved_tx.saturating_add(fill_frames) {
             if let Some(frame) = worker_umem.umem.frame(BufIdx(frame_index + idx)) {
                 initial_fill_frames.push(frame.offset);
             }
         }
-        frame_index = frame_index.saturating_add(plan.ring_entries);
+        let mut spare_fill_frames = VecDeque::with_capacity(spare_fill as usize);
+        for idx in reserved_tx.saturating_add(fill_frames)
+            ..reserved_tx
+                .saturating_add(fill_frames)
+                .saturating_add(spare_fill)
+        {
+            if let Some(frame) = worker_umem.umem.frame(BufIdx(frame_index + idx)) {
+                spare_fill_frames.push_back(frame.offset);
+            }
+        }
+        frame_index = frame_index.saturating_add(binding_frame_count(plan.ring_entries));
         match BindingWorker::create(
             &plan.status,
             &worker_umem,
             plan.ring_entries,
             reserved_tx_frames,
             initial_fill_frames,
+            spare_fill_frames,
             plan.xsk_map_fd,
             plan.heartbeat_map_fd,
             plan.live.clone(),
@@ -7943,9 +8001,7 @@ mod tests {
             0,
             0x86dd,
         );
-        frame.extend_from_slice(&[
-            0x60, 0x00, 0x00, 0x00, 0x00, 0x08, PROTO_ICMPV6, 64,
-        ]);
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x08, PROTO_ICMPV6, 64]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
         frame.extend_from_slice(&[128, 0, 0, 0, 0x12, 0x34, 0x00, 0x01]);
