@@ -1531,6 +1531,7 @@ type userspaceCtrlValue struct {
 	Workers            uint32
 	QueueCount         uint32
 	Flags              uint32
+	Pad                uint32
 	ConfigGeneration   uint64
 	FIBGeneration      uint32
 	HeartbeatTimeoutMS uint32
