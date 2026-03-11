@@ -42,14 +42,13 @@ const TX_BATCH_SIZE: usize = 256;
 const FILL_BATCH_SIZE: usize = 1024;
 const FILL_DRAIN_WATERMARK: usize = 64;
 const MAX_RX_BATCHES_PER_POLL: usize = 4;
-const XSK_BIND_FLAGS_FALLBACK: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP;
 /*
- * The current isolated HA lab can report successful zerocopy binds on mlx5 VFs
- * while LAN ingress redirected via XSKMAP never reaches the AF_XDP RX rings.
- * Force copy mode for now so the userspace dataplane stays functionally live,
- * then bring zerocopy back behind an explicit verified path.
+ * The last working shared-UMEM contract on the isolated mlx5 HA lab used the
+ * kernel-default AF_XDP bind flags and relied on the post-bind socket query to
+ * report the actual mode. Treat the designated shared-root socket specially and
+ * do not try to open every binding as an independent owner on the same UMEM.
  */
-const XSK_BIND_FLAGS_PREFERRED: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP;
+const XSK_BIND_FLAGS_SHARED_UMEM_OWNER: u16 = 0;
 const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
@@ -1285,7 +1284,7 @@ impl BindingWorker {
         }
         let info = ifinfo_from_binding(binding)?;
         let (user, rx, tx, bind_mode, mut device) =
-            open_binding_worker_rings(&worker_umem, binding, &info, ring_entries, shared_owner)
+            open_binding_worker_rings(&worker_umem, &info, ring_entries, shared_owner)
                 .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
         prime_fill_ring_offsets(&mut device, &initial_fill_frames)?;
 
@@ -1385,10 +1384,9 @@ impl WorkerUmem {
 
 fn open_binding_worker_rings(
     worker_umem: &WorkerUmem,
-    binding: &BindingStatus,
     info: &IfInfo,
     ring_entries: u32,
-    _shared_owner: bool,
+    shared_owner: bool,
 ) -> Result<
     (
         User,
@@ -1399,26 +1397,23 @@ fn open_binding_worker_rings(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let _ = binding;
-    let sock = Socket::new(info).map_err(|e| format!("create socket: {e}"))?;
+    let sock = if shared_owner {
+        Socket::with_shared(info, &worker_umem.umem)
+            .map_err(|e| format!("create shared socket: {e}"))?
+    } else {
+        Socket::new(info).map_err(|e| format!("create socket: {e}"))?
+    };
     let device = worker_umem
         .umem
         .fq_cq(&sock)
         .map_err(|e| format!("create fq/cq: {e}"))?;
-    let (user, rx, tx, bind_mode) =
-        match open_user_rings(&worker_umem.umem, &sock, ring_entries, XSK_BIND_FLAGS_PREFERRED) {
-            Ok(bound) => bound,
-            Err(preferred_err) => open_user_rings(
-                &worker_umem.umem,
-                &sock,
-                ring_entries,
-                XSK_BIND_FLAGS_FALLBACK,
-            )
-            .map_err(|fallback_err| {
-                format!("configure AF_XDP rings: zerocopy={preferred_err}; fallback={fallback_err}")
-            })?,
-        };
-    let bind_mode = bind_user_rings(&worker_umem.umem, &device, &user, false)
+    let (user, rx, tx, bind_mode) = open_user_rings(
+        &worker_umem.umem,
+        &sock,
+        ring_entries,
+        XSK_BIND_FLAGS_SHARED_UMEM_OWNER,
+    )?;
+    let bind_mode = bind_user_rings(&worker_umem.umem, &device, &user, shared_owner)
         .unwrap_or(bind_mode);
     Ok((user, rx, tx, bind_mode, device))
 }
