@@ -391,12 +391,16 @@ impl Coordinator {
         }
         for plans in workers.values_mut() {
             plans.sort_by_key(|plan| (plan.status.queue_id, plan.status.ifindex, plan.status.slot));
-            if let Some(primary) = plans.last_mut() {
-                // Prefer the highest-ifindex binding as the shared UMEM root.
-                // On the isolated HA lab this is the WAN-side VF, which is the
-                // only interface the kernel consistently accepts as the root
-                // shared socket for this worker layout.
-                primary.shared_owner = true;
+            /*
+             * Each binding currently allocates its own UMEM in BindingWorker::create().
+             * Do not open the other binding on the worker with Socket::with_shared():
+             * that "shared root" split only makes sense when multiple bindings really
+             * share one UMEM. In the current per-binding-UMEM design it strands the
+             * non-root interface behind a bogus shared-socket setup, which matches the
+             * live symptom where WAN slots receive and LAN slots stay at zero.
+             */
+            for plan in plans.iter_mut() {
+                plan.shared_owner = false;
             }
         }
         let planned_bindings: usize = workers.values().map(|group| group.len()).sum();
