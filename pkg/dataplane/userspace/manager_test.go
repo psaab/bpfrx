@@ -4,6 +4,8 @@ import (
 	"net"
 	"testing"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/rlimit"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/vishvananda/netlink"
 )
@@ -58,6 +60,58 @@ func TestSessionSyncEgressLockedDerivesOwnerAndTxPath(t *testing.T) {
 	}
 	if owner != 1 {
 		t.Fatalf("owner = %d, want 1", owner)
+	}
+}
+
+func TestMergeHAStateFromMaps(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	rgMap, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  1,
+		MaxEntries: 16,
+	})
+	if err != nil {
+		t.Fatalf("NewMap(rg_active): %v", err)
+	}
+	defer rgMap.Close()
+	wdMap, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  8,
+		MaxEntries: 16,
+	})
+	if err != nil {
+		t.Fatalf("NewMap(ha_watchdog): %v", err)
+	}
+	defer wdMap.Close()
+
+	rgID := uint32(2)
+	active := uint8(1)
+	watchdog := uint64(12345)
+	if err := rgMap.Update(rgID, active, ebpf.UpdateAny); err != nil {
+		t.Fatalf("rgMap.Update: %v", err)
+	}
+	if err := wdMap.Update(rgID, watchdog, ebpf.UpdateAny); err != nil {
+		t.Fatalf("wdMap.Update: %v", err)
+	}
+
+	merged, err := mergeHAStateFromMaps(rgMap, wdMap, map[int]HAGroupStatus{
+		0: {RGID: 0, Active: false},
+	})
+	if err != nil {
+		t.Fatalf("mergeHAStateFromMaps: %v", err)
+	}
+	if !merged[2].Active {
+		t.Fatal("merged[2].Active = false, want true")
+	}
+	if got := merged[2].WatchdogTimestamp; got != watchdog {
+		t.Fatalf("merged[2].WatchdogTimestamp = %d, want %d", got, watchdog)
+	}
+	if _, ok := merged[0]; !ok {
+		t.Fatal("existing RG 0 state was dropped")
 	}
 }
 

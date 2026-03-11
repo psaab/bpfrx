@@ -125,6 +125,9 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return result, fmt.Errorf("sync helper status: %w", err)
 	}
+	if err := m.refreshHAStateFromMapsLocked(); err != nil {
+		return result, fmt.Errorf("replay userspace HA state from maps: %w", err)
+	}
 	if err := m.syncHAStateLocked(); err != nil {
 		return result, fmt.Errorf("publish userspace HA state: %w", err)
 	}
@@ -1411,7 +1414,15 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 }
 
 func (m *Manager) syncHAStateLocked() error {
-	if m.proc == nil || m.proc.Process == nil || len(m.haGroups) == 0 {
+	if m.proc == nil || m.proc.Process == nil {
+		return nil
+	}
+	if len(m.haGroups) == 0 {
+		if err := m.refreshHAStateFromMapsLocked(); err != nil {
+			return err
+		}
+	}
+	if len(m.haGroups) == 0 {
 		return nil
 	}
 	groups := make([]HAGroupStatus, 0, len(m.haGroups))
@@ -1435,6 +1446,64 @@ func (m *Manager) syncHAStateLocked() error {
 		return err
 	}
 	return m.syncDesiredForwardingStateLocked()
+}
+
+func (m *Manager) refreshHAStateFromMapsLocked() error {
+	rgMap := m.inner.Map("rg_active")
+	if rgMap == nil {
+		return errors.New("rg_active map not loaded")
+	}
+	wdMap := m.inner.Map("ha_watchdog")
+	if wdMap == nil {
+		return errors.New("ha_watchdog map not loaded")
+	}
+	merged, err := mergeHAStateFromMaps(rgMap, wdMap, m.haGroups)
+	if err != nil {
+		return err
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	m.haGroups = merged
+	return nil
+}
+
+func mergeHAStateFromMaps(rgMap, wdMap *ebpf.Map, existing map[int]HAGroupStatus) (map[int]HAGroupStatus, error) {
+	seen := make(map[int]HAGroupStatus, len(existing))
+	for rgID, group := range existing {
+		seen[rgID] = group
+	}
+
+	var (
+		rgKey uint32
+		rgVal uint8
+	)
+	rgIter := rgMap.Iterate()
+	for rgIter.Next(&rgKey, &rgVal) {
+		group := seen[int(rgKey)]
+		group.RGID = int(rgKey)
+		group.Active = rgVal != 0
+		seen[int(rgKey)] = group
+	}
+	if err := rgIter.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rg_active: %w", err)
+	}
+
+	var (
+		wdKey uint32
+		wdVal uint64
+	)
+	wdIter := wdMap.Iterate()
+	for wdIter.Next(&wdKey, &wdVal) {
+		group := seen[int(wdKey)]
+		group.RGID = int(wdKey)
+		group.WatchdogTimestamp = wdVal
+		seen[int(wdKey)] = group
+	}
+	if err := wdIter.Err(); err != nil {
+		return nil, fmt.Errorf("iterate ha_watchdog: %w", err)
+	}
+	return seen, nil
 }
 
 func (m *Manager) desiredForwardingArmedLocked() bool {
