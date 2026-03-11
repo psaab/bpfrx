@@ -15,7 +15,10 @@ This branch also carries an experimental userspace dataplane:
 
 That userspace backend is real and testable on the isolated `loss` userspace lab in
 this branch, but it is still experimental. It is not yet feature-parity or
-performance-parity with the main eBPF dataplane.
+performance-parity with the main eBPF dataplane. In particular, HA cluster
+ownership and fabric redirect are not yet implemented in the Rust dataplane, so
+HA/fabric configs currently fall back to the legacy XDP/TC dataplane for real
+traffic.
 
 ## Architecture
 
@@ -31,7 +34,7 @@ Rust XDP userspace entry
   -> XSKMAP redirect
   -> Rust AF_XDP workers
   -> AF_XDP TX / bounded slow path
-  -> fallback to xdp_main for unsupported traffic or config
+  -> fallback to `xdp_main` for unsupported traffic or config
 ```
 
 - **14 BPF programs** (9 XDP ingress + 5 TC egress) chained via tail calls
@@ -41,7 +44,8 @@ Rust XDP userspace entry
 - **Three-phase config compilation**: Junos AST → typed Go structs → eBPF map entries
 - **Experimental userspace path**: Go control plane + Rust AF_XDP dataplane helper +
   Rust userspace-specific XDP entry, with the legacy XDP/TC firewall kept as the
-  guarded fallback and non-userspace dataplane
+  guarded fallback for unsupported traffic and unsupported configs, including the
+  current HA/fabric cluster configuration
 
 ## Features
 

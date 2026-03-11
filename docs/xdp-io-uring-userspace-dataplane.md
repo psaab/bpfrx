@@ -11,8 +11,11 @@ This file now serves two purposes:
 - the current branch status on `userspace-dataplane-rust-wip`
 
 Those are not the same thing. The branch has real Rust AF_XDP forwarding and real
-lab validation, but it is still experimental, incomplete for full HA/policy parity,
-and not yet at performance parity with the legacy XDP/TC dataplane.
+lab validation on supported non-HA paths, but it is still experimental, incomplete
+for full HA/policy parity, and not yet at performance parity with the legacy XDP/TC
+dataplane. The current isolated HA/fabric cluster on `loss` is intentionally gated
+back to legacy XDP for real traffic until HA ownership and fabric redirect are
+implemented in the Rust dataplane.
 
 ## Executive Summary
 

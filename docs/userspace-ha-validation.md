@@ -22,21 +22,16 @@ The isolated userspace cluster is no longer a legacy-only fallback case, but it 
 still an experimental branch-only environment.
 
 Current expected behavior:
-- the Rust userspace dataplane is supported on this isolated cluster
-- the active HA owner should auto-arm userspace forwarding
-- the standby node should keep userspace forwarding disabled
-- the validator should follow the active node, not assume `fw0` stays primary
+- this isolated HA/fabric cluster is a userspace development lab, but real traffic
+  currently stays on the legacy XDP dataplane
+- the userspace helper should stay present for control/status, but forwarding should
+  remain blocked on both nodes until HA ownership and fabric redirect are implemented
 
-The active firewall should show:
-- `Forwarding supported: true`
-- `Enabled: true`
-- `Forwarding armed: true`
-- `Ready bindings: <non-zero>`
-- `HA groups: ... rg1 active=true ...` or another active data RG
-
-The standby firewall should show:
+Each firewall should currently show:
+- `Forwarding supported: false`
 - `Enabled: false`
 - `Forwarding armed: false`
+- `Forwarding blocked by: HA cluster ownership and fabric redirect are not implemented in the userspace dataplane`
 
 On `cluster-userspace-host`:
 - IPv4 reachability to `172.16.80.200`
@@ -95,22 +90,16 @@ The validator does this in order:
 
 1. uses the tracked env/config in the repo, not `/tmp`
 2. waits for CLI availability on both firewalls
-3. determines whether the runtime is in `supported` or `legacy` mode
-4. for supported mode:
-   - pins the isolated validation run to the preferred active node (`node0` by default for RGs 1 and 2)
-   - forces `cluster-userspace-host` to keep accepting IPv6 RAs (`accept_ra=2`)
-   - waits for userspace forwarding to auto-arm on the active node
-   - if auto-arm does not settle, forces `request chassis cluster data-plane userspace forwarding arm` on the active owner once
-   - records the active firewall and uses it for `perf`
-5. for legacy mode:
-   - validates the fallback state instead of trying to arm userspace
-6. verifies an IPv6 default route on `cluster-userspace-host`
-7. if needed, runs repeated `rdisc6 -1 eth0` to force fresh RA convergence
-8. runs one unmeasured warm-up `iperf3` pass for IPv4 and IPv6
-9. runs repeated IPv4 `iperf3` to `172.16.80.200`
-10. runs repeated IPv6 `iperf3` to `2001:559:8585:80::200`
-11. retries one marginal near-threshold miss once
-12. optionally records `perf` data on the active userspace firewall
+3. verifies that the HA/fabric userspace runtime is correctly blocked and has fallen
+   back to legacy XDP forwarding
+4. forces `cluster-userspace-host` to keep accepting IPv6 RAs (`accept_ra=2`)
+5. verifies an IPv6 default route on `cluster-userspace-host`
+6. if needed, runs repeated `rdisc6 -1 eth0` to force fresh RA convergence
+7. runs one unmeasured warm-up `iperf3` pass for IPv4 and IPv6
+8. runs repeated IPv4 `iperf3` to `172.16.80.200`
+9. runs repeated IPv6 `iperf3` to `2001:559:8585:80::200`
+10. retries one marginal near-threshold miss once
+11. optionally records `perf` data on the active firewall
 
 ## Target And Interpretation
 
@@ -124,8 +113,10 @@ That is the target, not a guarantee of the current branch head.
 
 Current branch reality:
 
-- userspace forwarding is real and repeatable on the isolated lab
-- the branch is still under active forwarding-correctness and performance work
+- the isolated HA/fabric lab currently validates the safe fallback path, not Rust
+  userspace forwarding for real traffic
+- the branch is still under active forwarding-correctness and performance work on
+  supported userspace-forwarding paths
 - it is normal for the validator to fail while a phase is in progress
 - a failing validation run is signal; do not “fix” it by lowering the threshold
 
@@ -135,20 +126,8 @@ the required workflow and the target, not the current performance claim for ever
 branch head.
 
 Short-lived outliers can still happen immediately after rolling deploy while HA
-ownership and RA converge. That is why the validator follows the active node,
-pins the preferred validation owner, and explicitly waits for IPv6 route state.
-
-## Preferred Active Node
-
-The isolated userspace lab currently runs most reliably when `node0` owns the
-data RGs during automated validation. The validator now enforces that as part of
-the repeatable cycle instead of depending on whatever node happened to be active
-after the rolling deploy.
-
-This is controlled by:
-
-- `PREFERRED_ACTIVE_NODE` (default `0`)
-- `PREFERRED_ACTIVE_RGS` (default `1 2`)
+ownership and RA converge. That is why the validator explicitly waits for IPv6
+route state before throughput checks.
 
 ## Operational Rule
 

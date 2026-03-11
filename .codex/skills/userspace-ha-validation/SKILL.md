@@ -1,6 +1,6 @@
 ---
 name: userspace-ha-validation
-description: Validate the isolated loss userspace HA cluster, including HA owner detection, IPv6 router advertisements, repeated IPv4/IPv6 iperf3 runs, and optional perf capture on the active userspace firewall.
+description: Validate the isolated loss userspace HA cluster, including fallback-state checks, IPv6 router advertisements, repeated IPv4/IPv6 iperf3 runs, and optional perf capture on the active firewall.
 ---
 
 # Userspace HA Validation
@@ -34,10 +34,8 @@ Commands:
 What the script enforces:
 
 - `bpfrxd` is reachable on both isolated firewalls before validation samples dataplane state
-- the isolated validation run pins the preferred active node (`node0` by default for RGs `1 2`)
-- the active HA owner is then detected instead of assuming `fw0`
-- supported userspace configs auto-arm forwarding on the active owner
-- if auto-arm does not settle, the script forces one `forwarding arm` on the active owner and rechecks
+- the isolated HA/fabric lab is expected to stay on the legacy XDP dataplane for real traffic
+- the userspace helper must report that forwarding is blocked by missing HA ownership/fabric support
 - `cluster-userspace-host` is forced to keep accepting IPv6 RAs before route checks
 - `cluster-userspace-host` has an IPv6 default route from RA
 - if the IPv6 default route is missing, repeated `rdisc6 -1 eth0` is run before tests
@@ -54,6 +52,7 @@ Use `scripts/userspace-perf-compare.sh` when validation is failing or when you n
 The current branch reality is:
 
 - the Rust userspace dataplane is real and deployed on the isolated `loss` userspace lab
+- the current HA/fabric lab configuration is intentionally gated back to legacy XDP for real traffic
 - the legacy XDP dataplane is still the correctness and performance reference
 - `22-23 Gbps` is the target, not the guaranteed result of every current branch head
 
