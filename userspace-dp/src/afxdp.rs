@@ -2364,6 +2364,7 @@ fn enqueue_pending_forwards(
                             request.desc,
                             request.meta,
                             &request.decision,
+                            request.expected_ports,
                         )
                     }) {
                         Some(frame_len) => {
@@ -2387,6 +2388,7 @@ fn enqueue_pending_forwards(
                                 request.meta,
                                 &request.decision,
                                 forwarding,
+                                request.expected_ports,
                             ) {
                                 Some(frame) => {
                                     if frame.len() > tx_frame_capacity() {
@@ -2421,6 +2423,7 @@ fn enqueue_pending_forwards(
                         request.meta,
                         &request.decision,
                         forwarding,
+                        request.expected_ports,
                     ) {
                         Some(frame) => {
                             if frame.len() > tx_frame_capacity() {
@@ -5721,9 +5724,10 @@ fn build_forwarded_frame(
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
     _forwarding: &ForwardingState,
+    expected_ports: Option<(u16, u16)>,
 ) -> Option<Vec<u8>> {
     let mut out = vec![0u8; (desc.len as usize).saturating_add(4)];
-    let written = build_forwarded_frame_into(&mut out, area, desc, meta, decision)?;
+    let written = build_forwarded_frame_into(&mut out, area, desc, meta, decision, expected_ports)?;
     out.truncate(written);
     Some(out)
 }
@@ -5902,6 +5906,7 @@ fn build_forwarded_frame_into(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
+    expected_ports: Option<(u16, u16)>,
 ) -> Option<usize> {
     let dst_mac = decision.resolution.neighbor_mac?;
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
@@ -6006,6 +6011,7 @@ fn build_forwarded_frame_into(
         }
         _ => return None,
     }
+    let _ = enforce_expected_ports(out, meta.addr_family, meta.protocol, expected_ports);
     Some(frame_len)
 }
 
@@ -6014,6 +6020,7 @@ fn rewrite_forwarded_frame_in_place(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
+    expected_ports: Option<(u16, u16)>,
 ) -> Option<u32> {
     let dst_mac = decision.resolution.neighbor_mac?;
     let frame = unsafe { area.slice_mut_unchecked(desc.addr as usize, UMEM_FRAME_SIZE as usize)? };
@@ -6121,6 +6128,7 @@ fn rewrite_forwarded_frame_in_place(
         }
         _ => return None,
     }
+    let _ = enforce_expected_ports(packet, meta.addr_family, meta.protocol, expected_ports);
     Some(frame_len as u32)
 }
 
@@ -9066,6 +9074,7 @@ mod tests {
                 nat: NatDecision::default(),
             },
             &state,
+            None,
         )
         .expect("forwarded frame");
         assert_eq!(&out[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
@@ -9118,6 +9127,7 @@ mod tests {
                 resolution,
                 nat: NatDecision::default(),
             },
+            None,
         )
         .expect("in-place forward");
         let out = area.slice(0, frame_len as usize).expect("rewritten frame");
@@ -9183,6 +9193,7 @@ mod tests {
                 },
             },
             &state,
+            None,
         )
         .expect("fabric frame");
         assert_eq!(&out[0..6], &[0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
@@ -9292,6 +9303,7 @@ mod tests {
                 },
             },
             &state,
+            None,
         )
         .expect("forwarded frame");
 
@@ -9359,6 +9371,7 @@ mod tests {
             },
             meta,
             &decision,
+            None,
         )
         .expect("in-place v6 forward");
         let out = area.slice(0, frame_len as usize).expect("rewritten frame");
@@ -9487,6 +9500,7 @@ mod tests {
             },
             meta,
             &decision,
+            Some((54688, 5201)),
         )
         .expect("rewrite in place");
         let out = area.slice(0, frame_len as usize).expect("rewritten frame");
@@ -9570,6 +9584,7 @@ mod tests {
             },
             meta,
             &decision,
+            Some((54688, 5201)),
         )
         .expect("build forwarded frame");
         let out = &out[..frame_len];
@@ -9655,6 +9670,7 @@ mod tests {
             },
             meta,
             &decision,
+            Some((real_src_port, real_dst_port)),
         )
         .expect("build forwarded frame");
         let out = &out[..frame_len];
@@ -9907,6 +9923,7 @@ mod tests {
             },
             meta,
             &decision,
+            Some((real_src_port, real_dst_port)),
         )
         .expect("build forwarded frame");
         let out = &out[..frame_len];
@@ -9987,6 +10004,7 @@ mod tests {
             },
             meta,
             &decision,
+            Some((real_src_port, real_dst_port)),
         )
         .expect("build forwarded frame");
         let out = &out[..frame_len];
@@ -10414,6 +10432,7 @@ mod tests {
                     rewrite_dst: None,
                 },
             },
+            None,
         )
         .expect("rewrite in place");
 
@@ -10485,6 +10504,7 @@ mod tests {
                     rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
                 },
             },
+            None,
         )
         .expect("rewrite in place");
 
