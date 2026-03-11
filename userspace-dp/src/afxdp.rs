@@ -2356,6 +2356,7 @@ fn enqueue_pending_forwards(
         let mut post_recycles = Vec::new();
         let mut build_failed = false;
         let mut copied_source_frame = false;
+        let mut retained_source_frame = false;
         {
             if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
                 &request.source_frame,
@@ -2404,14 +2405,33 @@ fn enqueue_pending_forwards(
                 }
             }
             if !copied_source_frame {
-                match build_forwarded_frame_from_frame(
-                    &request.source_frame,
+                match rewrite_forwarded_frame_in_place(
+                    unsafe { &*ingress_area },
+                    request.desc,
                     request.meta,
                     &request.decision,
-                    forwarding,
                     expected_ports,
                 ) {
-                    Some(frame) => {
+                    Some(frame_len) => {
+                        target_binding.pending_tx_prepared.push_back(PreparedTxRequest {
+                            offset: source_offset,
+                            len: frame_len,
+                            recycle_slot: Some(ingress_slot),
+                            expected_ports,
+                            expected_addr_family: request.meta.addr_family,
+                            expected_protocol: request.meta.protocol,
+                            flow_key: request.flow_key.clone(),
+                        });
+                        retained_source_frame = true;
+                    }
+                    None => match build_forwarded_frame_from_frame(
+                        &request.source_frame,
+                        request.meta,
+                        &request.decision,
+                        forwarding,
+                        expected_ports,
+                    ) {
+                        Some(frame) => {
                         if let Some(reason) = forward_tuple_mismatch_reason(
                             live_frame_ports_bytes(
                                 &request.source_frame,
@@ -2455,9 +2475,10 @@ fn enqueue_pending_forwards(
                             flow_key: request.flow_key.clone(),
                         });
                     }
-                    None => {
-                        build_failed = true;
-                    }
+                        None => {
+                            build_failed = true;
+                        }
+                    },
                 }
             }
             if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
@@ -2477,10 +2498,14 @@ fn enqueue_pending_forwards(
                 Some(request.meta),
                 None,
             );
-            ingress_binding.pending_fill_frames.push_back(source_offset);
+            if !retained_source_frame {
+                ingress_binding.pending_fill_frames.push_back(source_offset);
+            }
             continue;
         }
-        ingress_binding.pending_fill_frames.push_back(source_offset);
+        if !retained_source_frame {
+            ingress_binding.pending_fill_frames.push_back(source_offset);
+        }
         if ingress_binding.pending_fill_frames.len() >= FILL_DRAIN_WATERMARK {
             let _ = drain_pending_fill(ingress_binding, now_ns);
         }
