@@ -2311,6 +2311,9 @@ fn enqueue_pending_forwards(
     for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
+        let expected_ports =
+            live_frame_ports(unsafe { &*ingress_area }, request.desc, request.meta)
+                .or(request.expected_ports);
         let Some(target_binding) = find_target_binding_mut(
             left,
             ingress_binding,
@@ -2340,12 +2343,12 @@ fn enqueue_pending_forwards(
                 request.meta,
                 &request.decision,
                 forwarding,
-                request.expected_ports,
+                expected_ports,
             ) {
                 for frame in segmented {
                     target_binding.pending_tx_local.push_back(TxRequest {
                         bytes: frame,
-                        expected_ports: request.expected_ports,
+                        expected_ports,
                         expected_addr_family: request.meta.addr_family,
                         expected_protocol: request.meta.protocol,
                         flow_key: request.flow_key.clone(),
@@ -2372,7 +2375,7 @@ fn enqueue_pending_forwards(
                             request.desc,
                             request.meta,
                             &request.decision,
-                            request.expected_ports,
+                            expected_ports,
                         )
                     }) {
                         Some(frame_len) => {
@@ -2382,7 +2385,7 @@ fn enqueue_pending_forwards(
                                     offset,
                                     len: frame_len as u32,
                                     recycle_slot: None,
-                                    expected_ports: request.expected_ports,
+                                    expected_ports,
                                     expected_addr_family: request.meta.addr_family,
                                     expected_protocol: request.meta.protocol,
                                     flow_key: request.flow_key.clone(),
@@ -2396,7 +2399,7 @@ fn enqueue_pending_forwards(
                                 request.meta,
                                 &request.decision,
                                 forwarding,
-                                request.expected_ports,
+                                expected_ports,
                             ) {
                                 Some(frame) => {
                                     if frame.len() > tx_frame_capacity() {
@@ -2412,7 +2415,7 @@ fn enqueue_pending_forwards(
                                     }
                                     target_binding.pending_tx_local.push_back(TxRequest {
                                         bytes: frame,
-                                        expected_ports: request.expected_ports,
+                                        expected_ports,
                                         expected_addr_family: request.meta.addr_family,
                                         expected_protocol: request.meta.protocol,
                                         flow_key: request.flow_key.clone(),
@@ -2431,7 +2434,7 @@ fn enqueue_pending_forwards(
                         request.meta,
                         &request.decision,
                         forwarding,
-                        request.expected_ports,
+                        expected_ports,
                     ) {
                         Some(frame) => {
                             if frame.len() > tx_frame_capacity() {
@@ -2447,7 +2450,7 @@ fn enqueue_pending_forwards(
                             }
                             target_binding.pending_tx_local.push_back(TxRequest {
                                 bytes: frame,
-                                expected_ports: request.expected_ports,
+                                expected_ports,
                                 expected_addr_family: request.meta.addr_family,
                                 expected_protocol: request.meta.protocol,
                                 flow_key: request.flow_key.clone(),
