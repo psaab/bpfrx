@@ -42,10 +42,9 @@ const TX_BATCH_SIZE: usize = 256;
 const FILL_BATCH_SIZE: usize = 1024;
 const FILL_DRAIN_WATERMARK: usize = 64;
 const MAX_RX_BATCHES_PER_POLL: usize = 4;
-// Shared-UMEM owner sockets on mlx5 reject explicit NEED_WAKEUP/ZEROCOPY
-// flags on secondary queue owners. Use the working shared-UMEM owner
-// contract and query the actual bound mode after bind.
-const XSK_BIND_FLAGS_SHARED_UMEM_OWNER: u16 = 0;
+const XSK_BIND_FLAGS_FALLBACK: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP;
+const XSK_BIND_FLAGS_PREFERRED: u16 =
+    SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY;
 const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
@@ -1376,25 +1375,28 @@ fn open_binding_worker_rings(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let sock = Socket::with_shared(info, &worker_umem.umem)
-        .map_err(|e| format!("create root socket: {e}"))?;
+    let _ = binding;
+    let sock = Socket::new(info).map_err(|e| format!("create socket: {e}"))?;
     let device = worker_umem
         .umem
         .fq_cq(&sock)
         .map_err(|e| format!("create fq/cq: {e}"))?;
-    let bind_flags = if should_force_copy_bind(binding) {
-        SocketConfig::XDP_BIND_COPY | SocketConfig::XDP_BIND_NEED_WAKEUP
-    } else {
-        XSK_BIND_FLAGS_SHARED_UMEM_OWNER
-    };
-    let (user, rx, tx) = open_user_rings(&worker_umem.umem, &sock, ring_entries, bind_flags)?;
-    let bind_mode = bind_user_rings(&worker_umem.umem, &device, &user, true)?;
+    let (user, rx, tx, bind_mode) =
+        match open_user_rings(&worker_umem.umem, &sock, ring_entries, XSK_BIND_FLAGS_PREFERRED) {
+            Ok(bound) => bound,
+            Err(preferred_err) => open_user_rings(
+                &worker_umem.umem,
+                &sock,
+                ring_entries,
+                XSK_BIND_FLAGS_FALLBACK,
+            )
+            .map_err(|fallback_err| {
+                format!("configure AF_XDP rings: zerocopy={preferred_err}; fallback={fallback_err}")
+            })?,
+        };
+    let bind_mode = bind_user_rings(&worker_umem.umem, &device, &user, false)
+        .unwrap_or(bind_mode);
     Ok((user, rx, tx, bind_mode, device))
-}
-
-fn should_force_copy_bind(binding: &BindingStatus) -> bool {
-    let _ = binding;
-    false
 }
 
 fn reserved_tx_frames(ring_entries: u32) -> u32 {
@@ -1429,7 +1431,10 @@ fn open_user_rings(
     sock: &Socket,
     ring_entries: u32,
     bind_flags: u16,
-) -> Result<(User, xdpilone::RingRx, xdpilone::RingTx), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (User, xdpilone::RingRx, xdpilone::RingTx, XskBindMode),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let user = umem
         .rx_tx(
             sock,
@@ -1442,7 +1447,12 @@ fn open_user_rings(
         .map_err(|e| format!("configure rx/tx rings: {e}"))?;
     let rx = user.map_rx().map_err(|e| format!("map rx ring: {e}"))?;
     let tx = user.map_tx().map_err(|e| format!("map tx ring: {e}"))?;
-    Ok((user, rx, tx))
+    let bind_mode = if (bind_flags & SocketConfig::XDP_BIND_ZEROCOPY) != 0 {
+        XskBindMode::ZeroCopy
+    } else {
+        XskBindMode::Copy
+    };
+    Ok((user, rx, tx, bind_mode))
 }
 
 fn query_bound_xsk_mode(fd: c_int) -> Option<XskBindMode> {
