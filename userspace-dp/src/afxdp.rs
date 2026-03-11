@@ -2270,7 +2270,7 @@ fn authoritative_forward_ports(
             if frame_ports == flow_ports {
                 Some(frame_ports)
             } else {
-                Some(frame_ports)
+                Some(flow_ports)
             }
         }
         (Some(frame_ports), None) => Some(frame_ports),
@@ -10676,7 +10676,7 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_forward_ports_prefers_frame_tuple_when_frame_ports_mismatch() {
+    fn authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch() {
         let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
         let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
         let expected_src_port = 55068u16;
@@ -10730,7 +10730,7 @@ mod tests {
 
         assert_eq!(
             authoritative_forward_ports(&frame, meta, Some(&flow)),
-            Some((wrong_src_port, dst_port))
+            Some((expected_src_port, dst_port))
         );
     }
 
