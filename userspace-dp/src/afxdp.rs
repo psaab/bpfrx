@@ -2306,7 +2306,7 @@ fn authoritative_forward_ports(
         None
     };
     let frame_ports = live_frame_ports_bytes(frame, meta.addr_family, meta.protocol);
-    frame_ports.or(flow_ports).or(meta_ports)
+    flow_ports.or(meta_ports).or(frame_ports)
 }
 
 fn live_frame_ports(area: &MmapArea, desc: XdpDesc, meta: UserspaceDpMeta) -> Option<(u16, u16)> {
@@ -2839,9 +2839,19 @@ fn parse_session_flow(
             if frame_flow == meta_flow {
                 return Some(meta_flow);
             }
-            // The frame tuple is the on-wire truth. If metadata disagrees,
-            // prefer the reparsed frame rather than carrying stale tuple state
-            // into session lookup and forwarding.
+            /*
+             * The userspace dataplane can observe post-copy or post-queue frame
+             * corruption in the L4 ports while the XDP-stamped metadata still
+             * carries the original ingress tuple. When the IP tuple matches but
+             * ports disagree, prefer the metadata tuple so session lookup and
+             * forwarding stay tied to the authoritative flow key.
+             *
+             * If the IP tuple itself disagrees, treat that as stale/wrong
+             * metadata and prefer the reparsed frame.
+             */
+            if frame_flow.src_ip == meta_flow.src_ip && frame_flow.dst_ip == meta_flow.dst_ip {
+                return Some(meta_flow);
+            }
             return Some(frame_flow);
         }
         return Some(meta_flow);
@@ -8385,7 +8395,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_flow_prefers_ipv6_frame_ports_when_metadata_disagrees() {
+    fn parse_session_flow_prefers_ipv6_metadata_ports_when_frame_ports_disagree() {
         let src_ip: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src");
         let dst_ip: Ipv6Addr = "2001:559:8585:80::200".parse().expect("dst");
         let src_port = 50662u16;
@@ -8437,7 +8447,7 @@ mod tests {
         .expect("flow");
         assert_eq!(flow.src_ip, IpAddr::V6(src_ip));
         assert_eq!(flow.dst_ip, IpAddr::V6(dst_ip));
-        assert_eq!(flow.forward_key.src_port, src_port);
+        assert_eq!(flow.forward_key.src_port, 1026);
         assert_eq!(flow.forward_key.dst_port, dst_port);
     }
 
