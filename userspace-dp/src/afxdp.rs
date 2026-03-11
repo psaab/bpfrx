@@ -43,8 +43,13 @@ const FILL_BATCH_SIZE: usize = 1024;
 const FILL_DRAIN_WATERMARK: usize = 64;
 const MAX_RX_BATCHES_PER_POLL: usize = 4;
 const XSK_BIND_FLAGS_FALLBACK: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP;
-const XSK_BIND_FLAGS_PREFERRED: u16 =
-    SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY;
+/*
+ * The current isolated HA lab can report successful zerocopy binds on mlx5 VFs
+ * while LAN ingress redirected via XSKMAP never reaches the AF_XDP RX rings.
+ * Force copy mode for now so the userspace dataplane stays functionally live,
+ * then bring zerocopy back behind an explicit verified path.
+ */
+const XSK_BIND_FLAGS_PREFERRED: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP;
 const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
@@ -765,6 +770,9 @@ impl Coordinator {
                 binding.xsk_bind_mode = snap.xsk_bind_mode;
                 binding.zero_copy = snap.zero_copy;
                 binding.socket_fd = snap.socket_fd;
+                binding.socket_ifindex = snap.socket_ifindex;
+                binding.socket_queue_id = snap.socket_queue_id;
+                binding.socket_bind_flags = snap.socket_bind_flags;
                 binding.rx_packets = snap.rx_packets;
                 binding.rx_bytes = snap.rx_bytes;
                 binding.rx_batches = snap.rx_batches;
@@ -823,6 +831,9 @@ impl Coordinator {
                 binding.xsk_bind_mode.clear();
                 binding.zero_copy = false;
                 binding.socket_fd = 0;
+                binding.socket_ifindex = 0;
+                binding.socket_queue_id = 0;
+                binding.socket_bind_flags = 0;
                 binding.rx_packets = 0;
                 binding.rx_bytes = 0;
                 binding.rx_batches = 0;
@@ -1280,11 +1291,24 @@ impl BindingWorker {
 
         live.set_bound(user.as_raw_fd());
         live.set_bind_mode(bind_mode);
+        if let Some((ifindex, queue_id, flags)) = query_bound_xsk_socket(user.as_raw_fd()) {
+            live.set_socket_binding(ifindex, queue_id, flags);
+            if ifindex != binding.ifindex || queue_id != binding.queue_id {
+                live.set_error(format!(
+                    "socket bound to ifindex {ifindex} queue {queue_id} flags 0x{flags:x}, expected ifindex {} queue {}",
+                    binding.ifindex, binding.queue_id
+                ));
+            }
+        }
         if let Err(err) = register_xsk_slot(xsk_map_fd, binding.slot, user.as_raw_fd()) {
             live.set_error(format!("register XSK slot: {err}"));
         } else {
             live.set_xsk_registered(true);
-            live.clear_error();
+            if binding.ifindex == live.socket_ifindex.load(Ordering::Relaxed)
+                && binding.queue_id == live.socket_queue_id.load(Ordering::Relaxed)
+            {
+                live.clear_error();
+            }
         }
         let init_now = monotonic_nanos();
         if let Err(err) = touch_heartbeat(heartbeat_map_fd, binding.slot, &live, init_now) {
@@ -1475,6 +1499,37 @@ fn query_bound_xsk_mode(fd: c_int) -> Option<XskBindMode> {
     } else {
         XskBindMode::Copy
     })
+}
+
+#[repr(C)]
+struct SockaddrXdp {
+    sxdp_family: u16,
+    sxdp_flags: u16,
+    sxdp_ifindex: u32,
+    sxdp_queue_id: u32,
+    sxdp_shared_umem_fd: u32,
+}
+
+fn query_bound_xsk_socket(fd: c_int) -> Option<(i32, u32, u32)> {
+    let mut addr = SockaddrXdp {
+        sxdp_family: 0,
+        sxdp_flags: 0,
+        sxdp_ifindex: 0,
+        sxdp_queue_id: 0,
+        sxdp_shared_umem_fd: 0,
+    };
+    let mut addrlen = core::mem::size_of::<SockaddrXdp>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            (&mut addr as *mut SockaddrXdp).cast::<libc::sockaddr>(),
+            &mut addrlen,
+        )
+    };
+    if rc != 0 || addrlen as usize != core::mem::size_of::<SockaddrXdp>() {
+        return None;
+    }
+    Some((addr.sxdp_ifindex as i32, addr.sxdp_queue_id, addr.sxdp_flags as u32))
 }
 
 fn bind_user_with_retry(
@@ -7050,6 +7105,9 @@ struct BindingLiveState {
     xsk_registered: AtomicBool,
     bind_mode: AtomicU8,
     socket_fd: AtomicI32,
+    socket_ifindex: AtomicI32,
+    socket_queue_id: AtomicU32,
+    socket_bind_flags: AtomicU32,
     rx_packets: AtomicU64,
     rx_bytes: AtomicU64,
     rx_batches: AtomicU64,
@@ -7109,6 +7167,9 @@ impl BindingLiveState {
             xsk_registered: AtomicBool::new(false),
             bind_mode: AtomicU8::new(XskBindMode::Unknown.as_u8()),
             socket_fd: AtomicI32::new(0),
+            socket_ifindex: AtomicI32::new(0),
+            socket_queue_id: AtomicU32::new(0),
+            socket_bind_flags: AtomicU32::new(0),
             rx_packets: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
             rx_batches: AtomicU64::new(0),
@@ -7167,6 +7228,12 @@ impl BindingLiveState {
         self.socket_fd.store(socket_fd, Ordering::Relaxed);
     }
 
+    fn set_socket_binding(&self, ifindex: i32, queue_id: u32, flags: u32) {
+        self.socket_ifindex.store(ifindex, Ordering::Relaxed);
+        self.socket_queue_id.store(queue_id, Ordering::Relaxed);
+        self.socket_bind_flags.store(flags, Ordering::Relaxed);
+    }
+
     fn set_xsk_registered(&self, value: bool) {
         self.xsk_registered.store(value, Ordering::Relaxed);
     }
@@ -7207,6 +7274,9 @@ impl BindingLiveState {
                 .to_string(),
             zero_copy: XskBindMode::from_u8(self.bind_mode.load(Ordering::Relaxed)).is_zerocopy(),
             socket_fd: self.socket_fd.load(Ordering::Relaxed),
+            socket_ifindex: self.socket_ifindex.load(Ordering::Relaxed),
+            socket_queue_id: self.socket_queue_id.load(Ordering::Relaxed),
+            socket_bind_flags: self.socket_bind_flags.load(Ordering::Relaxed),
             rx_packets: self.rx_packets.load(Ordering::Relaxed),
             rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
             rx_batches: self.rx_batches.load(Ordering::Relaxed),
@@ -7368,6 +7438,9 @@ struct BindingLiveSnapshot {
     xsk_bind_mode: String,
     zero_copy: bool,
     socket_fd: c_int,
+    socket_ifindex: i32,
+    socket_queue_id: u32,
+    socket_bind_flags: u32,
     rx_packets: u64,
     rx_bytes: u64,
     rx_batches: u64,
