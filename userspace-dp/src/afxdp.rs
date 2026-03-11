@@ -2268,7 +2268,7 @@ fn authoritative_forward_ports(
     match (frame_ports, flow_ports) {
         (Some(frame_ports), Some(flow_ports)) => {
             if frame_ports == flow_ports {
-                Some(flow_ports)
+                Some(frame_ports)
             } else {
                 Some(frame_ports)
             }
@@ -2299,6 +2299,23 @@ fn live_frame_ports_bytes(frame: &[u8], addr_family: u8, protocol: u8) -> Option
     }
     let l4 = frame_l4_offset(frame, addr_family)?;
     parse_flow_ports(frame, l4, protocol)
+}
+
+fn forward_tuple_mismatch_reason(
+    source_ports: Option<(u16, u16)>,
+    expected_ports: Option<(u16, u16)>,
+    built_ports: Option<(u16, u16)>,
+) -> Option<String> {
+    let expected = expected_ports.or(source_ports)?;
+    let built = built_ports?;
+    if built == expected {
+        return None;
+    }
+    let source = source_ports.unwrap_or((0, 0));
+    Some(format!(
+        "forward_tuple_mismatch:src={}:{} expected={}:{} built={}:{}",
+        source.0, source.1, expected.0, expected.1, built.0, built.1
+    ))
 }
 
 fn enqueue_pending_forwards(
@@ -2348,6 +2365,31 @@ fn enqueue_pending_forwards(
                 expected_ports,
             ) {
                 for frame in segmented {
+                    if let Some(reason) = forward_tuple_mismatch_reason(
+                        live_frame_ports_bytes(
+                            &request.source_frame,
+                            request.meta.addr_family,
+                            request.meta.protocol,
+                        ),
+                        expected_ports,
+                        live_frame_ports_bytes(
+                            &frame,
+                            request.meta.addr_family,
+                            request.meta.protocol,
+                        ),
+                    ) {
+                        record_exception(
+                            recent_exceptions,
+                            ingress_ident,
+                            &reason,
+                            frame.len() as u32,
+                            Some(request.meta),
+                            None,
+                        );
+                        build_failed = true;
+                        copied_source_frame = true;
+                        break;
+                    }
                     target_binding.pending_tx_local.push_back(TxRequest {
                         bytes: frame,
                         expected_ports,
@@ -2370,6 +2412,30 @@ fn enqueue_pending_forwards(
                     expected_ports,
                 ) {
                     Some(frame) => {
+                        if let Some(reason) = forward_tuple_mismatch_reason(
+                            live_frame_ports_bytes(
+                                &request.source_frame,
+                                request.meta.addr_family,
+                                request.meta.protocol,
+                            ),
+                            expected_ports,
+                            live_frame_ports_bytes(
+                                &frame,
+                                request.meta.addr_family,
+                                request.meta.protocol,
+                            ),
+                        ) {
+                            record_exception(
+                                recent_exceptions,
+                                ingress_ident,
+                                &reason,
+                                frame.len() as u32,
+                                Some(request.meta),
+                                None,
+                            );
+                            build_failed = true;
+                            continue;
+                        }
                         if frame.len() > tx_frame_capacity() {
                             record_exception(
                                 recent_exceptions,
@@ -2581,7 +2647,7 @@ fn parse_session_flow(
             if frame_flow == flow {
                 return Some(flow);
             }
-            return Some(frame_flow);
+            return Some(flow);
         }
         return Some(flow);
     }
@@ -10047,6 +10113,8 @@ mod tests {
             l4_offset: 54,
             addr_family: libc::AF_INET6 as u8,
             protocol: PROTO_TCP,
+            flow_src_addr: src_ip.octets(),
+            flow_dst_addr: dst_ip.octets(),
             flow_src_port: expected_src_port,
             flow_dst_port: dst_port,
             ..UserspaceDpMeta::default()
@@ -10548,6 +10616,8 @@ mod tests {
             l4_offset: 54,
             addr_family: libc::AF_INET6 as u8,
             protocol: PROTO_TCP,
+            flow_src_addr: src_ip.octets(),
+            flow_dst_addr: dst_ip.octets(),
             flow_src_port: expected_src_port,
             flow_dst_port: dst_port,
             ..UserspaceDpMeta::default()
@@ -10600,6 +10670,123 @@ mod tests {
             assert_eq!(tcp_ports_ipv6(&seg[18..]), (expected_src_port, dst_port));
             assert!(tcp_checksum_ok_ipv6(&seg[18..]));
         }
+    }
+
+    #[test]
+    fn authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch() {
+        let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+        let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+        let expected_src_port = 55068u16;
+        let wrong_src_port = 1041u16;
+        let dst_port = 5201u16;
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x86dd,
+        );
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&wrong_src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
+            0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        ]);
+        recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            flow_src_addr: src_ip.octets(),
+            flow_dst_addr: dst_ip.octets(),
+            flow_src_port: expected_src_port,
+            flow_dst_port: dst_port,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = SessionFlow {
+            src_ip: IpAddr::V6(src_ip),
+            dst_ip: IpAddr::V6(dst_ip),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V6(src_ip),
+                dst_ip: IpAddr::V6(dst_ip),
+                src_port: expected_src_port,
+                dst_port,
+            },
+        };
+
+        assert_eq!(
+            authoritative_forward_ports(&frame, meta, Some(&flow)),
+            Some((expected_src_port, dst_port))
+        );
+    }
+
+    #[test]
+    fn parse_session_flow_prefers_metadata_tuple_when_frame_ports_mismatch() {
+        let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+        let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+        let expected_src_port = 55068u16;
+        let wrong_src_port = 1041u16;
+        let dst_port = 5201u16;
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x86dd,
+        );
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&wrong_src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
+            0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        ]);
+        recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            flow_src_addr: src_ip.octets(),
+            flow_dst_addr: dst_ip.octets(),
+            flow_src_port: expected_src_port,
+            flow_dst_port: dst_port,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = parse_session_flow(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+        )
+        .expect("flow");
+        assert_eq!(flow.forward_key.src_port, expected_src_port);
+        assert_eq!(flow.forward_key.dst_port, dst_port);
     }
 
     #[test]
