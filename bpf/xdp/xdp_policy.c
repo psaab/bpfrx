@@ -1326,7 +1326,11 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				__be32 sess_nat_src_ip = 0, sess_nat_dst_ip = 0;
 				__be16 sess_nat_src_port = 0, sess_nat_dst_port = 0;
 				__be32 orig_src_ip = meta->src_ip.v4;
+				__be32 orig_dst_ip = (meta->nat_flags & SESS_FLAG_DNAT) ?
+					meta->nat_dst_ip.v4 : meta->dst_ip.v4;
 				__be16 orig_src_port = meta->src_port;
+				__be16 orig_dst_port = (meta->nat_flags & SESS_FLAG_DNAT) ?
+					meta->nat_dst_port : meta->dst_port;
 
 				/* Static NAT SNAT check (before dynamic SNAT) */
 				struct static_nat_key_v4 snk = {
@@ -1474,9 +1478,19 @@ int xdp_policy_prog(struct xdp_md *ctx)
 
 				TRACE_POLICY(meta, ACTION_PERMIT, rule->rule_id);
 
-				if (sess_log & LOG_FLAG_SESSION_INIT)
-					emit_event(meta, EVENT_TYPE_SESSION_OPEN,
-						   ACTION_PERMIT, 0, 0, 0);
+				if (sess_log & LOG_FLAG_SESSION_INIT) {
+					if (sess_nat_flags)
+						emit_event_nat4_orig(meta, EVENT_TYPE_SESSION_OPEN,
+								 ACTION_PERMIT, 0, 0,
+								 orig_src_ip, orig_dst_ip,
+								 orig_src_port, orig_dst_port,
+								 sess_nat_src_ip, sess_nat_dst_ip,
+								 sess_nat_src_port, sess_nat_dst_port,
+								 0, 0, 0, (__u16)pkt_app_id, 0);
+					else
+						emit_event(meta, EVENT_TYPE_SESSION_OPEN,
+							   ACTION_PERMIT, 0, 0, 0);
+				}
 
 				if (sess_nat_flags)
 					bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
@@ -1488,6 +1502,17 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				__u8 sess_nat_flags = 0;
 				__be16 sess_nat_src_port = 0, sess_nat_dst_port = 0;
 				__be16 orig_src_port = meta->src_port;
+				__u8 orig_src_ip[16] = {};
+				__u8 orig_dst_ip[16] = {};
+				__u8 zero_nat_ip[16] = {};
+				__be16 orig_dst_port = (meta->nat_flags & SESS_FLAG_DNAT) ?
+					meta->nat_dst_port : meta->dst_port;
+
+				__builtin_memcpy(orig_src_ip, meta->src_ip.v6, 16);
+				if (meta->nat_flags & SESS_FLAG_DNAT)
+					__builtin_memcpy(orig_dst_ip, meta->nat_dst_ip.v6, 16);
+				else
+					__builtin_memcpy(orig_dst_ip, meta->dst_ip.v6, 16);
 
 				/*
 				 * NAT64 forward path: allocate IPv4 SNAT address
@@ -1563,8 +1588,13 @@ int xdp_policy_prog(struct xdp_md *ctx)
 							meta->src_port = alloc_v4_port;
 
 							if (sess_log & LOG_FLAG_SESSION_INIT)
-								emit_event(meta, EVENT_TYPE_SESSION_OPEN,
-									   ACTION_PERMIT, 0, 0, 0);
+								emit_event_nat6_orig(meta, EVENT_TYPE_SESSION_OPEN,
+										     ACTION_PERMIT, 0, 0,
+										     orig_src_ip, orig_dst_ip,
+										     orig_src_port, orig_dst_port,
+										     meta->nat_src_ip.v6, nat_dst_ptr ? nat_dst_ptr : zero_nat_ip,
+										     alloc_v4_port, sess_nat_dst_port,
+										     0, 0, 0, (__u16)pkt_app_id, 0);
 
 							bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
 							return XDP_PASS;
@@ -1749,9 +1779,21 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				}
 				meta->nat_flags = sess_nat_flags;
 
-				if (sess_log & LOG_FLAG_SESSION_INIT)
-					emit_event(meta, EVENT_TYPE_SESSION_OPEN,
-						   ACTION_PERMIT, 0, 0, 0);
+				if (sess_log & LOG_FLAG_SESSION_INIT) {
+					if (sess_nat_flags) {
+						emit_event_nat6_orig(meta, EVENT_TYPE_SESSION_OPEN,
+								     ACTION_PERMIT, 0, 0,
+								     orig_src_ip, orig_dst_ip,
+								     orig_src_port, orig_dst_port,
+								     nat_src_ptr ? nat_src_ptr : zero_nat_ip,
+								     nat_dst_ptr ? nat_dst_ptr : zero_nat_ip,
+								     sess_nat_src_port, sess_nat_dst_port,
+								     0, 0, 0, (__u16)pkt_app_id, 0);
+					} else {
+						emit_event(meta, EVENT_TYPE_SESSION_OPEN,
+							   ACTION_PERMIT, 0, 0, 0);
+					}
+				}
 
 				if (sess_nat_flags)
 					bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
