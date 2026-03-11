@@ -2333,8 +2333,11 @@ fn enqueue_pending_forwards(
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
         let expected_ports =
-            live_frame_ports_bytes(&request.source_frame, request.meta.addr_family, request.meta.protocol)
-                .or(request.expected_ports);
+            request.expected_ports.or(live_frame_ports_bytes(
+                &request.source_frame,
+                request.meta.addr_family,
+                request.meta.protocol,
+            ));
         let Some(target_binding) = find_target_binding_mut(
             left,
             ingress_binding,
