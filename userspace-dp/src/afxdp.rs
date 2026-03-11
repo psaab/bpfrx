@@ -700,6 +700,7 @@ impl Coordinator {
                             expected_ports: None,
                             expected_addr_family: 0,
                             expected_protocol: 0,
+                            flow_key: None,
                         })?;
                     }
                 } else {
@@ -1159,6 +1160,7 @@ struct TxRequest {
     expected_ports: Option<(u16, u16)>,
     expected_addr_family: u8,
     expected_protocol: u8,
+    flow_key: Option<SessionKey>,
 }
 
 struct PendingForwardRequest {
@@ -1169,6 +1171,7 @@ struct PendingForwardRequest {
     meta: UserspaceDpMeta,
     decision: SessionDecision,
     expected_ports: Option<(u16, u16)>,
+    flow_key: Option<SessionKey>,
 }
 
 struct PreparedTxRequest {
@@ -1178,6 +1181,7 @@ struct PreparedTxRequest {
     expected_ports: Option<(u16, u16)>,
     expected_addr_family: u8,
     expected_protocol: u8,
+    flow_key: Option<SessionKey>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1601,6 +1605,7 @@ fn poll_binding(
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
         binding.scratch_forwards.clear();
+        let mut rst_teardowns: Vec<(SessionKey, NatDecision)> = Vec::new();
         let mut counters = BatchCounters::default();
         let mut batch_packets = 0u64;
         let mut batch_bytes = 0u64;
@@ -1986,6 +1991,11 @@ fn poll_binding(
                         ForwardingDisposition::ForwardCandidate
                             | ForwardingDisposition::FabricRedirect
                     ) {
+                        if should_teardown_tcp_rst(meta, flow.as_ref())
+                            && let Some(flow) = flow.as_ref()
+                        {
+                            rst_teardowns.push((flow.forward_key.clone(), decision.nat));
+                        }
                         counters.forward_candidate_packets += 1;
                         if decision.nat.rewrite_src.is_some() {
                             counters.snat_packets += 1;
@@ -2057,6 +2067,19 @@ fn poll_binding(
         drop(received);
         counters.flush(&binding.live);
         let mut pending_forwards = core::mem::take(&mut binding.scratch_forwards);
+        for (forward_key, nat) in rst_teardowns {
+            teardown_tcp_rst_flow(
+                left,
+                binding,
+                right,
+                sessions,
+                shared_sessions,
+                peer_worker_commands,
+                &forward_key,
+                nat,
+                &mut pending_forwards,
+            );
+        }
         enqueue_pending_forwards(
             left,
             binding,
@@ -2112,6 +2135,7 @@ fn build_live_forward_request(
         meta,
         decision: *decision,
         expected_ports: flow.map(|flow| (flow.forward_key.src_port, flow.forward_key.dst_port)),
+        flow_key: flow.map(|flow| flow.forward_key.clone()),
     })
 }
 
@@ -2166,6 +2190,7 @@ fn enqueue_pending_forwards(
                         expected_ports: request.expected_ports,
                         expected_addr_family: request.meta.addr_family,
                         expected_protocol: request.meta.protocol,
+                        flow_key: request.flow_key.clone(),
                     });
                 }
                 copied_source_frame = true;
@@ -2196,6 +2221,7 @@ fn enqueue_pending_forwards(
                                             expected_ports: request.expected_ports,
                                             expected_addr_family: request.meta.addr_family,
                                             expected_protocol: request.meta.protocol,
+                                            flow_key: request.flow_key.clone(),
                                         });
                     }
                     None => {
@@ -2226,6 +2252,7 @@ fn enqueue_pending_forwards(
                                             expected_ports: request.expected_ports,
                                             expected_addr_family: request.meta.addr_family,
                                             expected_protocol: request.meta.protocol,
+                                            flow_key: request.flow_key.clone(),
                                         });
                                 }
                                 None => {
@@ -2256,6 +2283,7 @@ fn enqueue_pending_forwards(
                                                     expected_ports: request.expected_ports,
                                                     expected_addr_family: request.meta.addr_family,
                                                     expected_protocol: request.meta.protocol,
+                                                    flow_key: request.flow_key.clone(),
                                                 });
                                         }
                                         None => {
@@ -2291,6 +2319,7 @@ fn enqueue_pending_forwards(
                                             expected_ports: request.expected_ports,
                                             expected_addr_family: request.meta.addr_family,
                                             expected_protocol: request.meta.protocol,
+                                            flow_key: request.flow_key.clone(),
                                         });
                                 }
                                 None => {
@@ -3798,6 +3827,148 @@ fn synced_replica_entry(entry: &SyncedSessionEntry) -> SyncedSessionEntry {
     let mut replica = entry.clone();
     replica.metadata.synced = true;
     replica
+}
+
+fn should_teardown_tcp_rst(meta: UserspaceDpMeta, flow: Option<&SessionFlow>) -> bool {
+    flow.is_some() && meta.protocol == PROTO_TCP && (meta.tcp_flags & TCP_FLAG_RST) != 0
+}
+
+fn teardown_tcp_rst_flow(
+    left: &mut [BindingWorker],
+    current: &mut BindingWorker,
+    right: &mut [BindingWorker],
+    sessions: &mut SessionTable,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    forward_key: &SessionKey,
+    nat: NatDecision,
+    pending_forwards: &mut Vec<PendingForwardRequest>,
+) {
+    let reverse_key = reverse_session_key(forward_key, nat);
+    sessions.delete(forward_key);
+    sessions.delete(&reverse_key);
+    remove_shared_session(shared_sessions, forward_key);
+    remove_shared_session(shared_sessions, &reverse_key);
+    replicate_session_delete(peer_worker_commands, forward_key);
+    replicate_session_delete(peer_worker_commands, &reverse_key);
+    cancel_pending_forwards(current, pending_forwards, forward_key, &reverse_key);
+    cancel_queued_flow(left, current, right, forward_key, &reverse_key);
+}
+
+fn cancel_queued_flow(
+    left: &mut [BindingWorker],
+    current: &mut BindingWorker,
+    right: &mut [BindingWorker],
+    forward_key: &SessionKey,
+    reverse_key: &SessionKey,
+) {
+    for binding in left.iter_mut() {
+        cancel_queued_flow_on_binding(binding, forward_key, reverse_key);
+    }
+    cancel_queued_flow_on_binding(current, forward_key, reverse_key);
+    for binding in right.iter_mut() {
+        cancel_queued_flow_on_binding(binding, forward_key, reverse_key);
+    }
+}
+
+fn cancel_queued_flow_on_binding(
+    binding: &mut BindingWorker,
+    forward_key: &SessionKey,
+    reverse_key: &SessionKey,
+) {
+    let mut kept_local = VecDeque::with_capacity(binding.pending_tx_local.len());
+    while let Some(req) = binding.pending_tx_local.pop_front() {
+        if tx_request_matches_flow(&req, forward_key, reverse_key) {
+            continue;
+        }
+        kept_local.push_back(req);
+    }
+    binding.pending_tx_local = kept_local;
+
+    let mut kept_prepared = VecDeque::with_capacity(binding.pending_tx_prepared.len());
+    while let Some(req) = binding.pending_tx_prepared.pop_front() {
+        if prepared_request_matches_flow(&req, forward_key, reverse_key) {
+            recycle_cancelled_prepared(binding, &req);
+            continue;
+        }
+        kept_prepared.push_back(req);
+    }
+    binding.pending_tx_prepared = kept_prepared;
+
+    if let Ok(mut pending) = binding.live.pending_tx.lock() {
+        let mut kept_shared = VecDeque::with_capacity(pending.len());
+        while let Some(req) = pending.pop_front() {
+            if tx_request_matches_flow(&req, forward_key, reverse_key) {
+                continue;
+            }
+            kept_shared.push_back(req);
+        }
+        binding
+            .live
+            .pending_tx_len
+            .store(kept_shared.len() as u32, Ordering::Relaxed);
+        *pending = kept_shared;
+    }
+
+    update_binding_debug_state(binding);
+}
+
+fn cancel_pending_forwards(
+    binding: &mut BindingWorker,
+    pending_forwards: &mut Vec<PendingForwardRequest>,
+    forward_key: &SessionKey,
+    reverse_key: &SessionKey,
+) {
+    let mut kept = Vec::with_capacity(pending_forwards.len());
+    for req in pending_forwards.drain(..) {
+        if pending_forward_matches_flow(&req, forward_key, reverse_key) {
+            binding.pending_fill_frames.push_back(req.source_offset);
+            continue;
+        }
+        kept.push(req);
+    }
+    *pending_forwards = kept;
+}
+
+fn recycle_cancelled_prepared(binding: &mut BindingWorker, req: &PreparedTxRequest) {
+    if matches!(req.recycle_slot, Some(slot) if slot == binding.slot) {
+        binding.pending_fill_frames.push_back(req.offset);
+    } else {
+        binding.free_tx_frames.push_back(req.offset);
+    }
+}
+
+fn tx_request_matches_flow(
+    req: &TxRequest,
+    forward_key: &SessionKey,
+    reverse_key: &SessionKey,
+) -> bool {
+    matches!(
+        req.flow_key.as_ref(),
+        Some(key) if key == forward_key || key == reverse_key
+    )
+}
+
+fn prepared_request_matches_flow(
+    req: &PreparedTxRequest,
+    forward_key: &SessionKey,
+    reverse_key: &SessionKey,
+) -> bool {
+    matches!(
+        req.flow_key.as_ref(),
+        Some(key) if key == forward_key || key == reverse_key
+    )
+}
+
+fn pending_forward_matches_flow(
+    req: &PendingForwardRequest,
+    forward_key: &SessionKey,
+    reverse_key: &SessionKey,
+) -> bool {
+    matches!(
+        req.flow_key.as_ref(),
+        Some(key) if key == forward_key || key == reverse_key
+    )
 }
 
 fn lookup_shared_session(
@@ -5927,8 +6098,39 @@ fn enforce_expected_ports(
     protocol: u8,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<bool> {
-    let _ = (frame, addr_family, protocol, expected_ports);
-    Some(false)
+    let Some((expected_src, expected_dst)) = expected_ports else {
+        return Some(false);
+    };
+    if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
+        return Some(false);
+    }
+    let l3 = frame_l3_offset(frame)?;
+    let l4 = frame_l4_offset(frame, addr_family)?;
+    let ports = frame.get(l4..l4 + 4)?;
+    let current_src = u16::from_be_bytes([ports[0], ports[1]]);
+    let current_dst = u16::from_be_bytes([ports[2], ports[3]]);
+    if current_src == expected_src && current_dst == expected_dst {
+        return Some(false);
+    }
+    frame
+        .get_mut(l4..l4 + 2)?
+        .copy_from_slice(&expected_src.to_be_bytes());
+    frame
+        .get_mut(l4 + 2..l4 + 4)?
+        .copy_from_slice(&expected_dst.to_be_bytes());
+    match addr_family as i32 {
+        libc::AF_INET => {
+            let packet = frame.get_mut(l3..)?;
+            let ihl = packet_rel_l4_offset(packet, addr_family)?;
+            recompute_l4_checksum_ipv4(packet, ihl, protocol, true)?;
+        }
+        libc::AF_INET6 => {
+            let packet = frame.get_mut(l3..)?;
+            recompute_l4_checksum_ipv6(packet, protocol)?;
+        }
+        _ => return Some(false),
+    }
+    Some(true)
 }
 
 fn restore_l4_tuple_from_meta(
@@ -8972,6 +9174,46 @@ mod tests {
         let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).expect("v6 src"));
         let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("v6 dst"));
         checksum16_ipv6(src, dst, PROTO_TCP, &packet[40..]) == 0
+    }
+
+    #[test]
+    fn enforce_expected_ports_repairs_ipv6_tcp_ports_and_checksum() {
+        let src_ip = "2001:559:8585:80::8".parse::<Ipv6Addr>().unwrap();
+        let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+            [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            80,
+            0x86dd,
+        );
+        frame.extend_from_slice(&[
+            0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 63,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&[
+            0x04, 0x01, 0x14, 0x51, // wrong src port 1025 -> 5201
+            0x31, 0x96, 0xc8, 0x32,
+            0x08, 0xf0, 0x5a, 0xc6,
+            0x50, 0x18, 0x00, 0x40,
+            0x00, 0x00, 0x00, 0x00,
+            b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        ]);
+        recompute_l4_checksum_ipv6(&mut frame[18..], PROTO_TCP).expect("initial checksum");
+        assert!(tcp_checksum_ok_ipv6(&frame[18..]));
+
+        let repaired = enforce_expected_ports(
+            &mut frame,
+            libc::AF_INET6 as u8,
+            PROTO_TCP,
+            Some((54688, 5201)),
+        )
+        .expect("repair");
+        assert!(repaired);
+        assert_eq!(tcp_ports_ipv6(&frame[18..]), (54688, 5201));
+        assert!(tcp_checksum_ok_ipv6(&frame[18..]));
     }
 
     #[test]
