@@ -34,14 +34,14 @@ Commands:
 What the script enforces:
 
 - `bpfrxd` is reachable on both isolated firewalls before validation samples dataplane state
-- the isolated HA/fabric lab is expected to stay on the legacy XDP dataplane for real traffic
-- the userspace helper must report that forwarding is blocked by missing HA ownership/fabric support
+- the runtime must settle cleanly into either supported userspace forwarding or legacy fallback
 - `cluster-userspace-host` is forced to keep accepting IPv6 RAs before route checks
 - `cluster-userspace-host` has an IPv6 default route from RA
 - if the IPv6 default route is missing, repeated `rdisc6 -1 eth0` is run before tests
 - one unmeasured warm-up `iperf3` pass is run for each address family
 - repeated IPv4 `iperf3` to `172.16.80.200` must stay above threshold
 - repeated IPv6 `iperf3` to `2001:559:8585:80::200` must stay above threshold
+- per-interval `iperf3 -J` output is parsed and a run fails if it starts fast and then collapses
 - one marginal near-threshold miss is retried once before the run is treated as failed
 - optional `perf` capture runs on the active userspace firewall, not a hardcoded node
 
@@ -52,7 +52,7 @@ Use `scripts/userspace-perf-compare.sh` when validation is failing or when you n
 The current branch reality is:
 
 - the Rust userspace dataplane is real and deployed on the isolated `loss` userspace lab
-- the current HA/fabric lab configuration is intentionally gated back to legacy XDP for real traffic
+- the validator must distinguish between intentional fallback and real userspace forwarding
 - the legacy XDP dataplane is still the correctness and performance reference
 - `22-23 Gbps` is the target, not the guaranteed result of every current branch head
 

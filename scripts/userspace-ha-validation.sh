@@ -10,9 +10,18 @@ PARALLEL="${PARALLEL:-4}"
 MIN_GBPS_V4="${MIN_GBPS_V4:-18.0}"
 MIN_GBPS_V6="${MIN_GBPS_V6:-18.0}"
 MARGINAL_GBPS_EPSILON="${MARGINAL_GBPS_EPSILON:-0.25}"
+IPERF_MIN_PEAK_GBPS="${IPERF_MIN_PEAK_GBPS:-2.0}"
+IPERF_MIN_TAIL_RATIO="${IPERF_MIN_TAIL_RATIO:-0.35}"
+IPERF_ZERO_GBPS="${IPERF_ZERO_GBPS:-0.05}"
+IPERF_STALL_GBPS="${IPERF_STALL_GBPS:-0.25}"
+IPERF_TAIL_WINDOW="${IPERF_TAIL_WINDOW:-2}"
 PREFERRED_ACTIVE_NODE="${PREFERRED_ACTIVE_NODE:-0}"
 PREFERRED_ACTIVE_RGS="${PREFERRED_ACTIVE_RGS:-1 2}"
 IPERF_TIMEOUT="${IPERF_TIMEOUT:-$((DURATION + 15))}"
+V4_TEST_TARGET="${V4_TEST_TARGET:-172.16.80.200}"
+V6_TEST_TARGET="${V6_TEST_TARGET:-2001:559:8585:80::200}"
+WAN_TEST_IFACE="${WAN_TEST_IFACE:-ge-0-0-2.80}"
+IPERF_METRICS="${PROJECT_ROOT}/scripts/iperf-json-metrics.py"
 WITH_PERF=0
 DEPLOY=0
 
@@ -231,6 +240,18 @@ wait_for_ipv6_default_route() {
 	return 1
 }
 
+ensure_dualstack_wan_neighbors() {
+	local vm="$1"
+	local mac=""
+	info "ensuring IPv4/IPv6 WAN neighbor state on ${vm}"
+	run_vm "$vm" "ping -6 -c 1 -W 1 ${V6_TEST_TARGET} >/dev/null 2>&1 || true"
+	mac="$(run_vm "$vm" "ip -6 neigh show dev ${WAN_TEST_IFACE} ${V6_TEST_TARGET} 2>/dev/null | sed -n 's/.* lladdr \\([^ ]*\\) .*/\\1/p' | head -n 1")"
+	if [[ -z "${mac}" ]]; then
+		die "unable to learn IPv6 neighbor MAC for ${V6_TEST_TARGET} on ${vm}:${WAN_TEST_IFACE}"
+	fi
+	run_vm "$vm" "ip neigh replace ${V4_TEST_TARGET} lladdr ${mac} nud permanent dev ${WAN_TEST_IFACE}"
+}
+
 if [[ $DEPLOY -eq 1 ]]; then
 	info "deploying isolated userspace cluster from ${ENV_FILE}"
 	BPFRX_CLUSTER_ENV="$ENV_FILE" "${PROJECT_ROOT}/test/incus/cluster-setup.sh" deploy all
@@ -254,9 +275,11 @@ fi
 info "ensuring IPv6 default route via router advertisement"
 wait_for_ipv6_default_route || die "cluster userspace host still has no IPv6 default route after repeated RA solicitation"
 
+ensure_dualstack_wan_neighbors "$ACTIVE_FW"
+
 info "basic reachability checks"
-run_host 'ping -c 2 -W 1 172.16.80.200 >/tmp/userspace-ping-v4.out'
-run_host 'ping -6 -c 2 -W 1 2001:559:8585:80::200 >/tmp/userspace-ping-v6.out'
+run_host "ping -c 2 -W 1 ${V4_TEST_TARGET} >/tmp/userspace-ping-v4.out"
+run_host "ping -6 -c 2 -W 1 ${V6_TEST_TARGET} >/tmp/userspace-ping-v6.out"
 
 summary_file="$(mktemp)"
 cleanup() { rm -f "$summary_file"; }
@@ -277,6 +300,17 @@ run_iperf_json() {
 
 parse_gbps() {
 	local path="$1"
+	local metrics
+	metrics="$(iperf_metrics "$path")"
+	if [[ "$metrics" == ERROR:* ]]; then
+		printf '%s\n' "$metrics"
+		return 0
+	fi
+	python3 -c 'import json,sys; print(f"{json.load(sys.stdin)[\"avg_gbps\"]:.3f}")' <<<"$metrics"
+}
+
+iperf_metrics() {
+	local path="$1"
 	if ! run_host "[ -s ${path} ]" >/dev/null 2>&1; then
 		local err
 		err="$(run_host "cat ${path}.err 2>/dev/null || true")"
@@ -286,18 +320,45 @@ parse_gbps() {
 		printf 'ERROR:%s\n' "$err"
 		return 0
 	fi
-	run_host "cat ${path}" | python3 -c '
+	run_host "python3 ${IPERF_METRICS} ${path} --tail-window ${IPERF_TAIL_WINDOW} --min-peak-gbps ${IPERF_MIN_PEAK_GBPS} --min-tail-ratio ${IPERF_MIN_TAIL_RATIO} --zero-gbps ${IPERF_ZERO_GBPS} --stall-gbps ${IPERF_STALL_GBPS}"
+}
+
+validate_sustained_iperf() {
+	local label="$1" run="$2" metrics="$3"
+	python3 - <<'PY' "$label" "$run" "$metrics"
 import json
 import sys
-data = json.load(sys.stdin)
-err = data.get("error")
-if err:
-    print("ERROR:" + err)
-    raise SystemExit(0)
-end = data["end"]
-bps = end.get("sum_sent", {}).get("bits_per_second", 0) or end.get("sum", {}).get("bits_per_second", 0)
-print(f"{bps / 1e9:.3f}")
-'
+
+label = sys.argv[1]
+run = sys.argv[2]
+metrics = json.loads(sys.argv[3])
+
+if metrics.get("error"):
+    raise SystemExit(f"{label} run {run} iperf error: {metrics['error']}")
+
+if metrics.get("collapse_detected"):
+    intervals = ", ".join(f"{v:.3f}" for v in metrics.get("interval_gbps", []))
+    raise SystemExit(
+        f"{label} run {run} sustained throughput collapse: {metrics['collapse_reason']} "
+        f"(peak={metrics['peak_gbps']:.3f} Gbps tail={metrics['tail_median_gbps']:.3f} Gbps "
+        f"intervals=[{intervals}])"
+    )
+PY
+}
+
+format_metrics_line() {
+	local metrics="$1"
+	python3 - <<'PY' "$metrics"
+import json
+import sys
+metrics = json.loads(sys.argv[1])
+intervals = ",".join(f"{value:.2f}" for value in metrics.get("interval_gbps", []))
+print(
+    f"avg={metrics['avg_gbps']:.3f} peak={metrics['peak_gbps']:.3f} "
+    f"tail={metrics['tail_median_gbps']:.3f} ratio={metrics['tail_peak_ratio']:.3f} "
+    f"retr={metrics['retransmits']} intervals=[{intervals}]"
+)
+PY
 }
 
 validate_threshold() {
@@ -321,17 +382,20 @@ warm_up_family() {
 
 validate_family() {
 	local label="$1" target="$2" family="$3" min_gbps="$4"
-	local i json gbps
+	local i json gbps metrics metrics_line
 	for i in $(seq 1 "$RUNS"); do
 		local attempt=1
 		while true; do
 			json="/tmp/${label}-${i}.json"
 			info "running ${label} iperf iteration ${i}/${RUNS}"
 			run_iperf_json "$family" "$target" "$json"
-			gbps="$(parse_gbps "$json")"
-			if [[ "$gbps" == ERROR:* ]]; then
-				die "${label} iperf failed: ${gbps#ERROR:}"
+			metrics="$(iperf_metrics "$json")"
+			if [[ "$metrics" == ERROR:* ]]; then
+				die "${label} iperf failed: ${metrics#ERROR:}"
 			fi
+			gbps="$(parse_gbps "$json")"
+			metrics_line="$(format_metrics_line "$metrics")"
+			validate_sustained_iperf "$label" "$i" "$metrics"
 			if python3 - <<'PY' "$gbps" "$min_gbps" "$MARGINAL_GBPS_EPSILON"
 import sys
 actual = float(sys.argv[1])
@@ -340,7 +404,7 @@ epsilon = float(sys.argv[3])
 sys.exit(0 if actual + epsilon >= minimum else 1)
 PY
 			then
-				printf '%s run %s: %s Gbps\n' "$label" "$i" "$gbps" | tee -a "$summary_file"
+				printf '%s run %s: %s Gbps %s\n' "$label" "$i" "$gbps" "$metrics_line" | tee -a "$summary_file"
 				if python3 - <<'PY' "$gbps" "$min_gbps"
 import sys
 actual = float(sys.argv[1])
@@ -357,7 +421,7 @@ PY
 				fi
 				break
 			fi
-			printf '%s run %s: %s Gbps\n' "$label" "$i" "$gbps" | tee -a "$summary_file"
+			printf '%s run %s: %s Gbps %s\n' "$label" "$i" "$gbps" "$metrics_line" | tee -a "$summary_file"
 			validate_threshold "$gbps" "$min_gbps" "$label" "$i"
 		done
 	done
@@ -379,15 +443,15 @@ run_perf_pair() {
 	run_active_fw "perf report --stdio -i ${perf_data} --sort symbol | sed -n '1,80p' > ${perf_report}"
 }
 
-warm_up_family ipv4 172.16.80.200 4
-warm_up_family ipv6 2001:559:8585:80::200 6
+warm_up_family ipv4 "${V4_TEST_TARGET}" 4
+warm_up_family ipv6 "${V6_TEST_TARGET}" 6
 
-validate_family ipv4 172.16.80.200 4 "$MIN_GBPS_V4"
-validate_family ipv6 2001:559:8585:80::200 6 "$MIN_GBPS_V6"
+validate_family ipv4 "${V4_TEST_TARGET}" 4 "$MIN_GBPS_V4"
+validate_family ipv6 "${V6_TEST_TARGET}" 6 "$MIN_GBPS_V6"
 
 if [[ $WITH_PERF -eq 1 ]]; then
-	run_perf_pair perf-userspace-ipv4 172.16.80.200 4
-	run_perf_pair perf-userspace-ipv6 2001:559:8585:80::200 6
+	run_perf_pair perf-userspace-ipv4 "${V4_TEST_TARGET}" 4
+	run_perf_pair perf-userspace-ipv6 "${V6_TEST_TARGET}" 6
 fi
 
 info "validation summary"

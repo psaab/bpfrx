@@ -18,22 +18,14 @@ Tracked inputs:
 
 ## Current Model
 
-The isolated userspace cluster is no longer a legacy-only fallback case, but it is
-still an experimental branch-only environment.
+The isolated userspace cluster is a userspace forwarding development lab. The
+validation workflow has to catch two classes of failure:
 
-Current expected behavior:
-- this isolated HA/fabric cluster is a userspace development lab, but real traffic
-  currently stays on the legacy XDP dataplane
-- the userspace helper should stay present for control/status, but forwarding should
-  remain blocked on both nodes until HA ownership and fabric redirect are implemented
+- hard failures: reachability, RA/default-route, helper/runtime readiness
+- soft failures: a run starts fast, then drops to near-zero after the first one or
+  two seconds
 
-Each firewall should currently show:
-- `Forwarding supported: false`
-- `Enabled: false`
-- `Forwarding armed: false`
-- `Forwarding blocked by: HA cluster ownership and fabric redirect are not implemented in the userspace dataplane`
-
-On `cluster-userspace-host`:
+On `cluster-userspace-host`, the minimum correctness bar remains:
 - IPv4 reachability to `172.16.80.200`
 - IPv6 reachability to `2001:559:8585:80::200`
 - IPv6 default route learned from RA on `eth0`
@@ -90,16 +82,16 @@ The validator does this in order:
 
 1. uses the tracked env/config in the repo, not `/tmp`
 2. waits for CLI availability on both firewalls
-3. verifies that the HA/fabric userspace runtime is correctly blocked and has fallen
-   back to legacy XDP forwarding
+3. checks whether the runtime settled into supported userspace forwarding or legacy fallback
 4. forces `cluster-userspace-host` to keep accepting IPv6 RAs (`accept_ra=2`)
 5. verifies an IPv6 default route on `cluster-userspace-host`
 6. if needed, runs repeated `rdisc6 -1 eth0` to force fresh RA convergence
 7. runs one unmeasured warm-up `iperf3` pass for IPv4 and IPv6
 8. runs repeated IPv4 `iperf3` to `172.16.80.200`
 9. runs repeated IPv6 `iperf3` to `2001:559:8585:80::200`
-10. retries one marginal near-threshold miss once
-11. optionally records `perf` data on the active firewall
+10. parses per-interval `iperf3 -J` output and fails if throughput cliffs after startup
+11. retries one marginal near-threshold miss once
+12. optionally records `perf` data on the active firewall
 
 ## Target And Interpretation
 
@@ -108,6 +100,7 @@ Validation target for this branch:
 - IPv4 `iperf3 -P 4 -t 5`: `22-23 Gbps`
 - IPv6 `iperf3 -P 4 -t 5`: `22-23 Gbps`
 - Retransmits: `0`
+- Sustained transfer: no “fast first second, then collapse to 0 bps” interval pattern
 
 That is the target, not a guarantee of the current branch head.
 
@@ -124,6 +117,10 @@ Use [userspace-perf-compare.md](/home/ps/git/codex-bpfrx-userspace-wip/docs/user
 for the current measured numbers and current hot-path deltas. This document defines
 the required workflow and the target, not the current performance claim for every
 branch head.
+
+The validator now treats interval collapse as a separate failure mode from average
+Gbps. A run that peaks high and then drops near zero is a failure even if the short
+overall average still looks superficially acceptable.
 
 Short-lived outliers can still happen immediately after rolling deploy while HA
 ownership and RA converge. That is why the validator explicitly waits for IPv6

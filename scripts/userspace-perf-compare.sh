@@ -9,6 +9,7 @@ IPERF_DURATION=8
 IPERF_PARALLEL=4
 PERF_SECONDS=$((IPERF_DURATION + 4))
 OUTPUT_DIR="/tmp/userspace-perf-compare"
+IPERF_METRICS="${PROJECT_ROOT}/scripts/iperf-json-metrics.py"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -166,6 +167,15 @@ else:
 PY
 }
 
+iperf_metrics() {
+	local path="$1"
+	if [[ ! -s "${path}" ]]; then
+		echo ""
+		return 0
+	fi
+	python3 "${IPERF_METRICS}" "${path}" 2>/dev/null || true
+}
+
 top_symbols() {
 	local report="$1"
 	grep -E 'bpfrx-userspace-dp|mlx5e_xsk|bpf_prog_|xsk_|htab_map_hash|lookup_nulls_elem_raw' "${report}" | head -n 12 || true
@@ -174,11 +184,13 @@ top_symbols() {
 write_summary() {
 	local fw="$1"
 	local out="${OUTPUT_DIR}/summary.md"
-	local v4_bps v6_bps v4_err v6_err
+	local v4_bps v6_bps v4_err v6_err v4_metrics v6_metrics
 	v4_bps="$(json_field "${OUTPUT_DIR}/ipv4.json" "end.sum_sent.bits_per_second")"
 	v6_bps="$(json_field "${OUTPUT_DIR}/ipv6.json" "end.sum_sent.bits_per_second")"
 	v4_err="$(json_field "${OUTPUT_DIR}/ipv4.json" "error")"
 	v6_err="$(json_field "${OUTPUT_DIR}/ipv6.json" "error")"
+	v4_metrics="$(iperf_metrics "${OUTPUT_DIR}/ipv4.json")"
+	v6_metrics="$(iperf_metrics "${OUTPUT_DIR}/ipv6.json")"
 
 	{
 		echo "# Userspace Perf Compare"
@@ -208,9 +220,39 @@ write_summary() {
 		if [[ -n "${v4_err}" ]]; then
 			echo "- IPv4 error: \`${v4_err}\`"
 		fi
+		if [[ -n "${v4_metrics}" ]]; then
+			echo "- IPv4 sustain: \`$(python3 - <<'PY' "$v4_metrics"
+import json, sys
+m = json.loads(sys.argv[1])
+status = "collapse" if m.get("collapse_detected") else "steady"
+print(f"{status}; peak={m['peak_gbps']:.3f} tail={m['tail_median_gbps']:.3f} ratio={m['tail_peak_ratio']:.3f}")
+PY
+)\`"
+			echo "- IPv4 intervals: \`$(python3 - <<'PY' "$v4_metrics"
+import json, sys
+m = json.loads(sys.argv[1])
+print(",".join(f"{v:.2f}" for v in m.get("interval_gbps", [])))
+PY
+)\`"
+		fi
 		echo "- IPv6 bps: \`${v6_bps:-0}\`"
 		if [[ -n "${v6_err}" ]]; then
 			echo "- IPv6 error: \`${v6_err}\`"
+		fi
+		if [[ -n "${v6_metrics}" ]]; then
+			echo "- IPv6 sustain: \`$(python3 - <<'PY' "$v6_metrics"
+import json, sys
+m = json.loads(sys.argv[1])
+status = "collapse" if m.get("collapse_detected") else "steady"
+print(f"{status}; peak={m['peak_gbps']:.3f} tail={m['tail_median_gbps']:.3f} ratio={m['tail_peak_ratio']:.3f}")
+PY
+)\`"
+			echo "- IPv6 intervals: \`$(python3 - <<'PY' "$v6_metrics"
+import json, sys
+m = json.loads(sys.argv[1])
+print(",".join(f"{v:.2f}" for v in m.get("interval_gbps", [])))
+PY
+)\`"
 		fi
 		echo
 		echo "## Perf Hot Symbols"

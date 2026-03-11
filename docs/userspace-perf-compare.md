@@ -10,6 +10,7 @@ This is the right tool when:
 - the branch is still unstable and validation fails at a reachability or throughput gate
 - you still need current `perf` data from `bpfrx-userspace-fw0/1`
 - you want a side-by-side IPv4/IPv6 hotspot comparison with saved artifacts
+- you need to confirm whether a run is truly sustained or only bursts in the first second
 
 Inputs:
 - env: [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx-userspace-wip/test/incus/loss-userspace-cluster.env)
@@ -32,7 +33,8 @@ What it does:
 5. runs one IPv4 `iperf3` capture to `172.16.80.200`
 6. runs one IPv6 `iperf3` capture to `2001:559:8585:80::200`
 7. records `perf` on the active firewall for each family
-8. writes a compact markdown summary to `/tmp/userspace-perf-compare/summary.md`
+8. computes interval-level sustain metrics from the `iperf3 -J` artifacts
+9. writes a compact markdown summary to `/tmp/userspace-perf-compare/summary.md`
 
 Artifacts written under `/tmp/userspace-perf-compare`:
 - `ipv4.json`
@@ -60,4 +62,7 @@ When interpreting the saved profile:
 - compare IPv4 and IPv6 on the same active userspace node
 - treat forwarding failures or connect-then-stall runs as correctness bugs first,
   not as throughput numbers
+- use the interval summary in `summary.md` to distinguish:
+  - a genuinely steady run
+  - a “fast first second, then cliff” run
 - use the reachability section in `summary.md` before trusting any `perf` sample
