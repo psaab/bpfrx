@@ -3750,6 +3750,14 @@ fn transmit_prepared_batch(
             break;
         };
         if req.len as usize > tx_frame_capacity() {
+            // Recycle the oversized req that triggered the drop, plus
+            // everything already popped into scratch, so UMEM frames
+            // are returned to the free pool instead of being orphaned.
+            let orphaned: Vec<_> = binding.scratch_prepared_tx.drain(..).collect();
+            recycle_cancelled_prepared(binding, &req);
+            for r in &orphaned {
+                recycle_cancelled_prepared(binding, r);
+            }
             return Err(TxError::Drop(format!(
                 "prepared tx frame exceeds UMEM frame capacity: len={} cap={}",
                 req.len,
@@ -3768,9 +3776,18 @@ fn transmit_prepared_batch(
                 .area
                 .slice_mut_unchecked(req.offset as usize, req.len as usize)
         }) else {
+            // Capture error values before draining the scratch buffer.
+            let err_offset = req.offset;
+            let err_len = req.len;
+            // Recycle all frames in scratch before returning error so
+            // UMEM frames are not permanently orphaned.
+            let orphaned: Vec<_> = binding.scratch_prepared_tx.drain(..).collect();
+            for r in &orphaned {
+                recycle_cancelled_prepared(binding, r);
+            }
             return Err(TxError::Drop(format!(
                 "prepared tx frame slice out of range: offset={} len={}",
-                req.offset, req.len
+                err_offset, err_len
             )));
         };
     }
