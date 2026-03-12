@@ -25,6 +25,8 @@ const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const PROTO_ICMP: u8 = 1;
 const PROTO_ICMPV6: u8 = 58;
+const TCP_FLAG_SYN: u8 = 0x02;
+const TCP_FLAG_ACK: u8 = 0x10;
 const MAX_EXT_HDRS: usize = 6;
 const NEXTHDR_HOP: u8 = 0;
 const NEXTHDR_ROUTING: u8 = 43;
@@ -44,6 +46,7 @@ const USERSPACE_FALLBACK_REASON_ADJUST_META: u32 = 8;
 const USERSPACE_FALLBACK_REASON_META_BOUNDS: u32 = 9;
 const USERSPACE_FALLBACK_REASON_REDIRECT_ERR: u32 = 10;
 const USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION: u32 = 11;
+const USERSPACE_FALLBACK_REASON_NO_SESSION: u32 = 12;
 const USERSPACE_FALLBACK_REASON_MAX: u32 = 16;
 const USERSPACE_TRACE_STAGE_RECEIVED: u32 = 1;
 const USERSPACE_TRACE_STAGE_BINDING_MISSING: u32 = 2;
@@ -56,6 +59,7 @@ const USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL: u32 = 8;
 const USERSPACE_TRACE_STAGE_LOCAL_DESTINATION: u32 = 9;
 const USERSPACE_TRACE_STAGE_REDIRECT: u32 = 10;
 const USERSPACE_TRACE_STAGE_REDIRECT_ERR: u32 = 11;
+const USERSPACE_TRACE_STAGE_NO_SESSION: u32 = 12;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -418,6 +422,21 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         );
         return Ok(xdp_action::XDP_PASS);
     }
+    // Only redirect packets that have an active userspace session or are
+    // connection-initiating (SYN). Unsessioned non-SYN traffic stays on
+    // the legacy BPF fast path to avoid bimodal processing (#200).
+    if !has_live_userspace_session(&parsed) && !is_connection_initiating(&parsed) {
+        record_trace(
+            ingress_ifindex,
+            rx_queue_index,
+            selected_queue,
+            binding.slot,
+            USERSPACE_TRACE_STAGE_NO_SESSION,
+            USERSPACE_FALLBACK_REASON_NO_SESSION,
+            &parsed,
+        );
+        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_NO_SESSION);
+    }
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
     if adjust_rc != 0 {
@@ -768,6 +787,14 @@ fn has_live_userspace_session(pkt: &ParsedPacket) -> bool {
         dst_addr: pkt.dst_addr,
     };
     unsafe { USERSPACE_SESSIONS.get(&key) }.is_some()
+}
+
+fn is_connection_initiating(pkt: &ParsedPacket) -> bool {
+    match pkt.protocol {
+        PROTO_TCP => (pkt.tcp_flags & TCP_FLAG_SYN) != 0 && (pkt.tcp_flags & TCP_FLAG_ACK) == 0,
+        PROTO_UDP | PROTO_ICMP | PROTO_ICMPV6 => true,
+        _ => true,
+    }
 }
 
 fn is_ipv4_multicast(ip: u32) -> bool {
