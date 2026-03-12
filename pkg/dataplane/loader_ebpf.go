@@ -206,6 +206,9 @@ func (m *Manager) loadAllObjects() error {
 		"userspace_local_v4",
 		"userspace_local_v6",
 		"userspace_fallback_progs",
+		"userspace_interface_nat_v4",
+		"userspace_interface_nat_v6",
+		"userspace_sessions",
 	} {
 		if ms, ok := userspaceSpec.Maps[name]; ok {
 			ms.Pinning = ebpf.PinByName
@@ -270,14 +273,10 @@ func (m *Manager) loadAllObjects() error {
 		}
 	}
 	m.programs["xdp_userspace_prog"] = userspaceProg
-	m.maps["userspace_ctrl"] = userspaceCtrl
-	m.maps["userspace_bindings"] = userspaceBindings
-	m.maps["userspace_ingress_ifaces"] = userspaceIngressIfaces
-	m.maps["userspace_heartbeat"] = userspaceHeartbeat
-	m.maps["userspace_xsk_map"] = userspaceXSK
-	m.maps["userspace_local_v4"] = userspaceLocalV4
-	m.maps["userspace_local_v6"] = userspaceLocalV6
-	m.maps["userspace_fallback_progs"] = userspaceFallback
+	// Register all userspace maps from the Rust XDP collection.
+	for name, umap := range userspaceCollection.Maps {
+		m.maps[name] = umap
+	}
 
 	// Extended replacements for xdp_policy which also includes NAT pool maps.
 	policyReplaceOpts := &ebpf.CollectionOptions{

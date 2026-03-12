@@ -246,6 +246,8 @@ struct MapPins {
     local_v4: String,
     #[serde(rename = "local_v6", default)]
     local_v6: String,
+    #[serde(default)]
+    sessions: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -607,6 +609,28 @@ struct BindingStatus {
     in_place_tx_packets: u64,
     #[serde(rename = "last_heartbeat", skip_serializing_if = "Option::is_none")]
     last_heartbeat: Option<DateTime<Utc>>,
+    #[serde(rename = "tx_completions", default)]
+    tx_completions: u64,
+    #[serde(rename = "socket_ifindex", default)]
+    socket_ifindex: i32,
+    #[serde(rename = "socket_queue_id", default)]
+    socket_queue_id: u32,
+    #[serde(rename = "socket_bind_flags", default)]
+    socket_bind_flags: u32,
+    #[serde(rename = "debug_pending_fill_frames", default)]
+    debug_pending_fill_frames: u32,
+    #[serde(rename = "debug_spare_fill_frames", default)]
+    debug_spare_fill_frames: u32,
+    #[serde(rename = "debug_free_tx_frames", default)]
+    debug_free_tx_frames: u32,
+    #[serde(rename = "debug_pending_tx_prepared", default)]
+    debug_pending_tx_prepared: u32,
+    #[serde(rename = "debug_pending_tx_local", default)]
+    debug_pending_tx_local: u32,
+    #[serde(rename = "debug_outstanding_tx", default)]
+    debug_outstanding_tx: u32,
+    #[serde(rename = "debug_in_flight_recycles", default)]
+    debug_in_flight_recycles: u32,
     #[serde(rename = "last_error", default)]
     last_error: String,
     #[serde(rename = "last_change", skip_serializing_if = "Option::is_none")]

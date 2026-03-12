@@ -1067,7 +1067,13 @@ send_icmp_unreach_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 static __noinline int
 send_icmp_unreach_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 {
-	/* Use session scratch as byte buffer for original headers (48 bytes). */
+	/*
+	 * Use session scratch as byte buffer:
+	 *   bytes  0-47: original IPv6+L4 headers (48 bytes)
+	 *   bytes 48-53: original src MAC (6 bytes)
+	 *   bytes 54-59: original dst MAC (6 bytes)
+	 * This avoids 12 bytes of stack for MAC arrays.
+	 */
 	__u32 scratch_idx = 1;
 	struct session_value *scratch = bpf_map_lookup_elem(
 		&session_v4_scratch, &scratch_idx);
@@ -1081,10 +1087,9 @@ send_icmp_unreach_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 	if (data + ETH_HLEN + 48 > data_end)
 		return XDP_DROP;
 
-	/* Save MACs from packet */
-	__u8 orig_smac[ETH_ALEN], orig_dmac[ETH_ALEN];
-	__builtin_memcpy(orig_smac, ((struct ethhdr *)data)->h_source, ETH_ALEN);
-	__builtin_memcpy(orig_dmac, ((struct ethhdr *)data)->h_dest, ETH_ALEN);
+	/* Save MACs from packet into scratch (bytes 48-59) */
+	__builtin_memcpy(orig_hdr + 48, ((struct ethhdr *)data)->h_source, ETH_ALEN);
+	__builtin_memcpy(orig_hdr + 54, ((struct ethhdr *)data)->h_dest, ETH_ALEN);
 
 	/* Save original IPv6 header (40 bytes) + first 8 bytes of L4 to scratch */
 	__builtin_memcpy(orig_hdr, data + ETH_HLEN, 48);
@@ -1117,9 +1122,9 @@ send_icmp_unreach_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 	struct ipv6hdr *ip6 = data + sizeof(struct ethhdr);
 	struct icmp6hdr *icmp6 = (void *)ip6 + sizeof(struct ipv6hdr);
 
-	/* Swap MACs */
-	__builtin_memcpy(eth->h_source, orig_dmac, ETH_ALEN);
-	__builtin_memcpy(eth->h_dest, orig_smac, ETH_ALEN);
+	/* Swap MACs (read from scratch bytes 48-59) */
+	__builtin_memcpy(eth->h_source, orig_hdr + 54, ETH_ALEN);
+	__builtin_memcpy(eth->h_dest, orig_hdr + 48, ETH_ALEN);
 	eth->h_proto = bpf_htons(ETH_P_IPV6);
 
 	/* Build IPv6 header: payload_len = 56 (ICMPv6 8 + payload 48) */
@@ -1138,10 +1143,15 @@ send_icmp_unreach_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 	/* Copy original headers to ICMPv6 payload (bytes 62-109) */
 	__builtin_memcpy((void *)icmp6 + sizeof(struct icmp6hdr), orig_hdr, 48);
 
-	/* Build ICMPv6 header: type 1 (dest unreachable), code 1 (admin prohibited) */
-	struct icmp6hdr icmp6_hdr = {};
-	icmp6_hdr.icmp6_type = 1;
-	icmp6_hdr.icmp6_code = 1;
+	/*
+	 * Build ICMPv6 header directly in packet (avoids 8-byte struct on stack).
+	 * type=1 (dest unreachable), code=1 (admin prohibited), checksum computed below.
+	 */
+	icmp6->icmp6_type = 1;
+	icmp6->icmp6_code = 1;
+	icmp6->icmp6_cksum = 0;
+	/* Zero the 4-byte "unused" field after the standard header fields */
+	*(__u32 *)((void *)icmp6 + 4) = 0;
 
 	/*
 	 * ICMPv6 checksum: pseudo-header + ICMPv6 message.
@@ -1167,11 +1177,8 @@ send_icmp_unreach_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 	icmp6_csum += bpf_htons(56);
 	icmp6_csum += bpf_htons(PROTO_ICMPV6);
 
-	/* ICMPv6 header (4 words, checksum field is 0) */
-	__u16 *h16 = (__u16 *)&icmp6_hdr;
-	#pragma unroll
-	for (int i = 0; i < 4; i++)
-		icmp6_csum += h16[i];
+	/* ICMPv6 header: type=1,code=1 → 0x0101 in network order, rest is zero */
+	icmp6_csum += 0x0101;
 
 	/* ICMPv6 payload: orig headers from scratch map (24 words) */
 	__u16 *p16 = (__u16 *)orig_hdr;
@@ -1181,10 +1188,7 @@ send_icmp_unreach_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	icmp6_csum = (icmp6_csum >> 16) + (icmp6_csum & 0xffff);
 	icmp6_csum += icmp6_csum >> 16;
-	icmp6_hdr.icmp6_cksum = ~icmp6_csum;
-
-	/* Write ICMPv6 header to packet */
-	*icmp6 = icmp6_hdr;
+	icmp6->icmp6_cksum = ~icmp6_csum;
 
 	return XDP_TX;
 }
@@ -1325,12 +1329,17 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				__u8 sess_nat_flags = 0;
 				__be32 sess_nat_src_ip = 0, sess_nat_dst_ip = 0;
 				__be16 sess_nat_src_port = 0, sess_nat_dst_port = 0;
-				__be32 orig_src_ip = meta->src_ip.v4;
-				__be32 orig_dst_ip = (meta->nat_flags & SESS_FLAG_DNAT) ?
-					meta->nat_dst_ip.v4 : meta->dst_ip.v4;
-				__be16 orig_src_port = meta->src_port;
-				__be16 orig_dst_port = (meta->nat_flags & SESS_FLAG_DNAT) ?
-					meta->nat_dst_port : meta->dst_port;
+
+				/*
+				 * Stash original src IP/port into unused v6 bytes
+				 * of meta (bytes 4-9 of the v6 union).  Avoids
+				 * stack locals that push the combined frame past
+				 * the 512-byte verifier limit.
+				 */
+				*(__be32 *)(meta->src_ip.v6 + 4) = meta->src_ip.v4;
+				*(__be16 *)(meta->src_ip.v6 + 8) = meta->src_port;
+#define orig_src_ip   (*(__be32 *)(meta->src_ip.v6 + 4))
+#define orig_src_port (*(__be16 *)(meta->src_ip.v6 + 8))
 
 				/* Static NAT SNAT check (before dynamic SNAT) */
 				struct static_nat_key_v4 snk = {
@@ -1482,8 +1491,12 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					if (sess_nat_flags)
 						emit_event_nat4_orig(meta, EVENT_TYPE_SESSION_OPEN,
 								 ACTION_PERMIT, 0, 0,
-								 orig_src_ip, orig_dst_ip,
-								 orig_src_port, orig_dst_port,
+								 orig_src_ip,
+								 (sess_nat_flags & SESS_FLAG_DNAT) ?
+									sess_nat_dst_ip : meta->dst_ip.v4,
+								 orig_src_port,
+								 (sess_nat_flags & SESS_FLAG_DNAT) ?
+									sess_nat_dst_port : meta->dst_port,
 								 sess_nat_src_ip, sess_nat_dst_ip,
 								 sess_nat_src_port, sess_nat_dst_port,
 								 0, 0, 0, (__u16)pkt_app_id, 0);
@@ -1497,22 +1510,32 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				else
 					bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
 				return XDP_PASS;
+#undef orig_src_ip
+#undef orig_src_port
 			} else {
 				/* IPv6 permit path */
 				__u8 sess_nat_flags = 0;
 				__be16 sess_nat_src_port = 0, sess_nat_dst_port = 0;
 				__be16 orig_src_port = meta->src_port;
-				__u8 orig_src_ip[16] = {};
-				__u8 orig_dst_ip[16] = {};
-				__u8 zero_nat_ip[16] = {};
 				__be16 orig_dst_port = (meta->nat_flags & SESS_FLAG_DNAT) ?
 					meta->nat_dst_port : meta->dst_port;
 
-				__builtin_memcpy(orig_src_ip, meta->src_ip.v6, 16);
-				if (meta->nat_flags & SESS_FLAG_DNAT)
-					__builtin_memcpy(orig_dst_ip, meta->nat_dst_ip.v6, 16);
-				else
-					__builtin_memcpy(orig_dst_ip, meta->dst_ip.v6, 16);
+				/*
+				 * Stash original IPs into session_v6_scratch[1]
+				 * (rev_val slot, free by the time we emit events).
+				 * Avoids 48 bytes of stack arrays that pushed the
+				 * combined frame past the 512-byte verifier limit.
+				 */
+				__u32 _orig_idx = 1;
+				struct session_value_v6 *_orig_stash =
+					bpf_map_lookup_elem(&session_v6_scratch, &_orig_idx);
+				if (_orig_stash) {
+					__builtin_memcpy(_orig_stash->nat_src_ip, meta->src_ip.v6, 16);
+					if (meta->nat_flags & SESS_FLAG_DNAT)
+						__builtin_memcpy(_orig_stash->nat_dst_ip, meta->nat_dst_ip.v6, 16);
+					else
+						__builtin_memcpy(_orig_stash->nat_dst_ip, meta->dst_ip.v6, 16);
+				}
 
 				/*
 				 * NAT64 forward path: allocate IPv4 SNAT address
@@ -1587,14 +1610,17 @@ int xdp_policy_prog(struct xdp_md *ctx)
 							meta->src_ip.v4 = alloc_v4_ip;
 							meta->src_port = alloc_v4_port;
 
-							if (sess_log & LOG_FLAG_SESSION_INIT)
+							if ((sess_log & LOG_FLAG_SESSION_INIT) && _orig_stash) {
+								static const __u8 _z16[16] = {};
 								emit_event_nat6_orig(meta, EVENT_TYPE_SESSION_OPEN,
 										     ACTION_PERMIT, 0, 0,
-										     orig_src_ip, orig_dst_ip,
+										     _orig_stash->nat_src_ip,
+										     _orig_stash->nat_dst_ip,
 										     orig_src_port, orig_dst_port,
-										     meta->nat_src_ip.v6, nat_dst_ptr ? nat_dst_ptr : zero_nat_ip,
+										     meta->nat_src_ip.v6, nat_dst_ptr ? nat_dst_ptr : _z16,
 										     alloc_v4_port, sess_nat_dst_port,
 										     0, 0, 0, (__u16)pkt_app_id, 0);
+							}
 
 							bpf_tail_call(ctx, &xdp_progs, XDP_PROG_NAT);
 							return XDP_PASS;
@@ -1780,16 +1806,19 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				meta->nat_flags = sess_nat_flags;
 
 				if (sess_log & LOG_FLAG_SESSION_INIT) {
-					if (sess_nat_flags) {
+					if (sess_nat_flags && _orig_stash) {
+						/* Use stashed originals from scratch map */
+						static const __u8 _zero16[16] = {};
 						emit_event_nat6_orig(meta, EVENT_TYPE_SESSION_OPEN,
 								     ACTION_PERMIT, 0, 0,
-								     orig_src_ip, orig_dst_ip,
+								     _orig_stash->nat_src_ip,
+								     _orig_stash->nat_dst_ip,
 								     orig_src_port, orig_dst_port,
-								     nat_src_ptr ? nat_src_ptr : zero_nat_ip,
-								     nat_dst_ptr ? nat_dst_ptr : zero_nat_ip,
+								     nat_src_ptr ? nat_src_ptr : _zero16,
+								     nat_dst_ptr ? nat_dst_ptr : _zero16,
 								     sess_nat_src_port, sess_nat_dst_port,
 								     0, 0, 0, (__u16)pkt_app_id, 0);
-					} else {
+					} else if (!sess_nat_flags) {
 						emit_event(meta, EVENT_TYPE_SESSION_OPEN,
 							   ACTION_PERMIT, 0, 0, 0);
 					}
