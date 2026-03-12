@@ -3760,6 +3760,11 @@ fn transmit_prepared_batch(
             break;
         };
         if req.len as usize > tx_frame_capacity() {
+            let orphaned: Vec<_> = binding.scratch_prepared_tx.drain(..).collect();
+            recycle_cancelled_prepared(binding, &req);
+            for r in &orphaned {
+                recycle_cancelled_prepared(binding, r);
+            }
             return Err(TxError::Drop(format!(
                 "prepared tx frame exceeds UMEM frame capacity: len={} cap={}",
                 req.len,
@@ -3773,9 +3778,15 @@ fn transmit_prepared_batch(
     }
     for req in &binding.scratch_prepared_tx {
         if binding.umem.area.slice(req.offset as usize, req.len as usize).is_none() {
+            let err_offset = req.offset;
+            let err_len = req.len;
+            let orphaned: Vec<_> = binding.scratch_prepared_tx.drain(..).collect();
+            for r in &orphaned {
+                recycle_cancelled_prepared(binding, r);
+            }
             return Err(TxError::Drop(format!(
                 "prepared tx frame slice out of range: offset={} len={}",
-                req.offset, req.len
+                err_offset, err_len
             )));
         }
     }
