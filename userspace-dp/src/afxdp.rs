@@ -2285,6 +2285,12 @@ fn build_live_forward_request(
     })
 }
 
+/// Returns the authoritative (src_port, dst_port) for a forwarded packet.
+///
+/// Priority: live frame bytes > session flow > XDP metadata.
+/// The frame reflects the actual packet state after any NAT rewrites, so it is
+/// the most trustworthy source. Session and metadata are fallbacks for truncated
+/// or unparseable frames only.
 fn authoritative_forward_ports(
     frame: &[u8],
     meta: UserspaceDpMeta,
@@ -2293,20 +2299,26 @@ fn authoritative_forward_ports(
     if !matches!(meta.protocol, PROTO_TCP | PROTO_UDP) {
         return None;
     }
-    let flow_ports = flow.and_then(|flow| {
-        if flow.forward_key.src_port != 0 && flow.forward_key.dst_port != 0 {
-            Some((flow.forward_key.src_port, flow.forward_key.dst_port))
+    // Live frame bytes are ground truth — post-NAT, post-rewrite.
+    if let Some(ports) = live_frame_ports_bytes(frame, meta.addr_family, meta.protocol) {
+        return Some(ports);
+    }
+    // Fallback: session flow key (may be pre-NAT).
+    if let Some(ports) = flow.and_then(|f| {
+        if f.forward_key.src_port != 0 && f.forward_key.dst_port != 0 {
+            Some((f.forward_key.src_port, f.forward_key.dst_port))
         } else {
             None
         }
-    });
-    let meta_ports = if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
+    }) {
+        return Some(ports);
+    }
+    // Last resort: XDP metadata tuple.
+    if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
         Some((meta.flow_src_port, meta.flow_dst_port))
     } else {
         None
-    };
-    let frame_ports = live_frame_ports_bytes(frame, meta.addr_family, meta.protocol);
-    flow_ports.or(meta_ports).or(frame_ports)
+    }
 }
 
 fn live_frame_ports(area: &MmapArea, desc: XdpDesc, meta: UserspaceDpMeta) -> Option<(u16, u16)> {
@@ -11040,11 +11052,11 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch() {
+    fn authoritative_forward_ports_prefers_frame_bytes_over_flow_and_meta() {
         let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
         let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
-        let expected_src_port = 55068u16;
-        let wrong_src_port = 1041u16;
+        let frame_src_port = 1041u16;
+        let stale_src_port = 55068u16;
         let dst_port = 5201u16;
         let mut frame = Vec::new();
         write_eth_header(
@@ -11057,7 +11069,7 @@ mod tests {
         frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
-        frame.extend_from_slice(&wrong_src_port.to_be_bytes());
+        frame.extend_from_slice(&frame_src_port.to_be_bytes());
         frame.extend_from_slice(&dst_port.to_be_bytes());
         frame.extend_from_slice(&[
             0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
@@ -11075,7 +11087,7 @@ mod tests {
             protocol: PROTO_TCP,
             flow_src_addr: src_ip.octets(),
             flow_dst_addr: dst_ip.octets(),
-            flow_src_port: expected_src_port,
+            flow_src_port: stale_src_port,
             flow_dst_port: dst_port,
             ..UserspaceDpMeta::default()
         };
@@ -11087,14 +11099,15 @@ mod tests {
                 protocol: PROTO_TCP,
                 src_ip: IpAddr::V6(src_ip),
                 dst_ip: IpAddr::V6(dst_ip),
-                src_port: expected_src_port,
+                src_port: stale_src_port,
                 dst_port,
             },
         };
 
+        // Frame bytes are ground truth — they reflect post-NAT packet state.
         assert_eq!(
             authoritative_forward_ports(&frame, meta, Some(&flow)),
-            Some((expected_src_port, dst_port))
+            Some((frame_src_port, dst_port))
         );
     }
 
