@@ -44,12 +44,21 @@ const FILL_BATCH_SIZE: usize = 1024;
 const FILL_DRAIN_WATERMARK: usize = 64;
 const MAX_RX_BATCHES_PER_POLL: usize = 4;
 /*
- * The last working shared-UMEM contract on the isolated mlx5 HA lab used the
- * kernel-default AF_XDP bind flags and relied on the post-bind socket query to
- * report the actual mode. Treat the designated shared-root socket specially and
- * do not try to open every binding as an independent owner on the same UMEM.
+ * Force XDP_COPY mode for AF_XDP sockets. In zero-copy mode on mlx5, XDP_PASS
+ * (used for ARP, host-bound management traffic, and fallback paths) permanently
+ * consumes fill ring frames — the kernel holds the UMEM frame in an SKB and
+ * never returns it to userspace's fill ring. This drains all 12K+ RX frames
+ * within seconds of sustained traffic, causing permanent rx_xsk_buff_alloc_err.
+ *
+ * In copy mode, XDP_PASS operates on kernel DMA buffers, not UMEM frames, so
+ * the fill ring is only consumed by XDP_REDIRECT→XSK (which userspace always
+ * recycles). The cost is one memcpy per redirected packet.
+ *
+ * TODO(#209): restore zero-copy by replacing XDP_PASS paths with cpumap
+ * redirect, which frees the XSK frame immediately while still delivering
+ * the packet to the kernel stack.
  */
-const XSK_BIND_FLAGS_SHARED_UMEM_OWNER: u16 = 0;
+const XSK_BIND_FLAGS_SHARED_UMEM_OWNER: u16 = SocketConfig::XDP_BIND_COPY;
 const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 50;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
