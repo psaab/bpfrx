@@ -2278,8 +2278,29 @@ fn build_live_forward_request(
     } else {
         resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
     };
+    // Capture ports from the live UMEM frame BEFORE copying — this is the
+    // ground truth for what the NIC delivered.  The .to_vec() copy may race
+    // with NIC DMA on reused descriptors in edge cases.
+    let live_ports = live_frame_ports(area, desc, meta);
     let source_frame = area.slice(desc.addr as usize, desc.len as usize)?.to_vec();
-    let expected_ports = authoritative_forward_ports(&source_frame, meta, flow);
+    // Prefer session flow ports (set by conntrack, immune to DMA races),
+    // then live frame ports, then metadata as last resort.
+    let expected_ports = flow
+        .and_then(|f| {
+            if f.forward_key.src_port != 0 && f.forward_key.dst_port != 0 {
+                Some((f.forward_key.src_port, f.forward_key.dst_port))
+            } else {
+                None
+            }
+        })
+        .or(live_ports)
+        .or_else(|| {
+            if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
+                Some((meta.flow_src_port, meta.flow_dst_port))
+            } else {
+                None
+            }
+        });
     Some(PendingForwardRequest {
         target_ifindex,
         ingress_queue_id: ingress_ident.queue_id,
@@ -2293,6 +2314,10 @@ fn build_live_forward_request(
     })
 }
 
+// Superseded by inline logic in build_live_forward_request() that reads ports
+// from the live UMEM area before .to_vec() copy (fixes #199).  Retained for
+// its unit test and potential future use.
+#[allow(dead_code)]
 fn authoritative_forward_ports(
     frame: &[u8],
     meta: UserspaceDpMeta,
@@ -10134,11 +10159,12 @@ mod tests {
     }
 
     #[test]
-    fn build_live_forward_request_prefers_frame_ports_for_ipv6_tcp() {
+    fn build_live_forward_request_prefers_session_flow_ports_over_frame() {
         let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
         let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
-        let real_src_port = 38276u16;
-        let real_dst_port = 5201u16;
+        let frame_src_port = 38276u16;
+        let frame_dst_port = 5201u16;
+        let session_src_port = 1025u16;
         let mut frame = Vec::new();
         write_eth_header(
             &mut frame,
@@ -10150,8 +10176,8 @@ mod tests {
         frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
-        frame.extend_from_slice(&real_src_port.to_be_bytes());
-        frame.extend_from_slice(&real_dst_port.to_be_bytes());
+        frame.extend_from_slice(&frame_src_port.to_be_bytes());
+        frame.extend_from_slice(&frame_dst_port.to_be_bytes());
         frame.extend_from_slice(&[
             0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
             0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
@@ -10170,11 +10196,13 @@ mod tests {
             l4_offset: 54,
             addr_family: libc::AF_INET6 as u8,
             protocol: PROTO_TCP,
-            flow_src_port: 1025,
-            flow_dst_port: real_dst_port,
+            flow_src_port: session_src_port,
+            flow_dst_port: frame_dst_port,
             ..UserspaceDpMeta::default()
         };
-        let bogus_flow = SessionFlow {
+        // Session flow ports differ from frame ports — session is authoritative
+        // because it is immune to UMEM DMA races.
+        let session_flow = SessionFlow {
             src_ip: IpAddr::V6(src_ip),
             dst_ip: IpAddr::V6(dst_ip),
             forward_key: SessionKey {
@@ -10182,8 +10210,8 @@ mod tests {
                 protocol: PROTO_TCP,
                 src_ip: IpAddr::V6(src_ip),
                 dst_ip: IpAddr::V6(dst_ip),
-                src_port: 1025,
-                dst_port: real_dst_port,
+                src_port: session_src_port,
+                dst_port: frame_dst_port,
             },
         };
         let decision = SessionDecision {
@@ -10235,7 +10263,105 @@ mod tests {
             meta,
             &decision,
             &forwarding,
-            Some(&bogus_flow),
+            Some(&session_flow),
+        )
+        .expect("request");
+        // Session flow ports (1025, 5201) take priority over frame ports (38276, 5201)
+        assert_eq!(req.expected_ports, Some((session_src_port, frame_dst_port)));
+    }
+
+    #[test]
+    fn build_live_forward_request_uses_live_frame_ports_when_no_session_flow() {
+        let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+        let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+        let real_src_port = 38276u16;
+        let real_dst_port = 5201u16;
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x86dd,
+        );
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&real_src_port.to_be_bytes());
+        frame.extend_from_slice(&real_dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
+            0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        ]);
+        recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            flow_src_port: 1025,
+            flow_dst_port: real_dst_port,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 11,
+                next_hop: Some(IpAddr::V6(dst_ip)),
+                neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V6("2001:559:8585:80::8".parse().unwrap())),
+                ..NatDecision::default()
+            },
+        };
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            12,
+            EgressInterface {
+                bind_ifindex: 11,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+                zone: "wan".to_string(),
+                redundancy_group: 1,
+                primary_v4: None,
+                primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
+            },
+        );
+        let ingress = BindingIdentity {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-1"),
+            ifindex: 10,
+        };
+
+        // No session flow — live frame ports should be used (over meta ports)
+        let req = build_live_forward_request(
+            &area,
+            &ingress,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &decision,
+            &forwarding,
+            None,
         )
         .expect("request");
         assert_eq!(req.expected_ports, Some((real_src_port, real_dst_port)));
