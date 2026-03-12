@@ -3762,17 +3762,12 @@ fn transmit_prepared_batch(
         return Ok((0, 0));
     }
     for req in &binding.scratch_prepared_tx {
-        let Some(frame) = (unsafe {
-            binding
-                .umem
-                .area
-                .slice_mut_unchecked(req.offset as usize, req.len as usize)
-        }) else {
+        if binding.umem.area.slice(req.offset as usize, req.len as usize).is_none() {
             return Err(TxError::Drop(format!(
                 "prepared tx frame slice out of range: offset={} len={}",
                 req.offset, req.len
             )));
-        };
+        }
     }
 
     let mut writer = binding
