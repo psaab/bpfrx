@@ -209,6 +209,12 @@ impl Coordinator {
         if let Ok(mut neighbors) = self.dynamic_neighbors.lock() {
             neighbors.clear();
         }
+        if let Ok(mut sessions) = self.shared_sessions.lock() {
+            sessions.clear();
+        }
+        if let Ok(mut nat_sessions) = self.shared_nat_sessions.lock() {
+            nat_sessions.clear();
+        }
         if let Ok(mut recent) = self.recent_exceptions.lock() {
             recent.clear();
         }
