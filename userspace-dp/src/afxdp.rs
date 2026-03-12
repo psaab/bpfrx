@@ -826,6 +826,7 @@ impl Coordinator {
                 binding.tx_bytes = snap.tx_bytes;
                 binding.tx_completions = snap.tx_completions;
                 binding.tx_errors = snap.tx_errors;
+                binding.in_place_tx_packets = snap.in_place_tx_packets;
                 binding.debug_pending_fill_frames = snap.debug_pending_fill_frames;
                 binding.debug_spare_fill_frames = snap.debug_spare_fill_frames;
                 binding.debug_free_tx_frames = snap.debug_free_tx_frames;
@@ -887,6 +888,7 @@ impl Coordinator {
                 binding.tx_bytes = 0;
                 binding.tx_completions = 0;
                 binding.tx_errors = 0;
+                binding.in_place_tx_packets = 0;
                 binding.debug_pending_fill_frames = 0;
                 binding.debug_spare_fill_frames = 0;
                 binding.debug_free_tx_frames = 0;
@@ -2442,12 +2444,13 @@ fn enqueue_pending_forwards(
             }
             if !copied_source_frame {
                 /*
-                 * Prepared/in-place forwarding is only valid when ingress and egress share the
-                 * same UMEM backing. In the current design each binding owns its own UMEM, so a
-                 * LAN->WAN forward cannot submit the ingress descriptor offset on the WAN binding.
-                 * Doing so transmits whatever bytes happen to live at the same offset in the
-                 * egress binding's UMEM, which matches the observed "TX counted, server saw
-                 * nothing" failure.
+                 * In-place TX optimization: rewrite the ingress frame directly in UMEM
+                 * and submit it to the TX ring without copying. This avoids a memcpy but
+                 * only works when ingress and egress share the same UMEM — which currently
+                 * means same-interface hairpin only (each binding owns its own UMEM).
+                 * Cross-interface forwards always take the copy path below.
+                 *
+                 * TODO(#205): extend to cross-interface by using shared UMEM across bindings.
                  */
                 let can_rewrite_in_place = target_binding.slot == ingress_slot;
                 if can_rewrite_in_place {
@@ -2470,6 +2473,7 @@ fn enqueue_pending_forwards(
                                     expected_protocol: request.meta.protocol,
                                     flow_key: request.flow_key.clone(),
                                 });
+                            target_binding.live.in_place_tx_packets.fetch_add(1, Ordering::Relaxed);
                             retained_source_frame = true;
                         }
                         None => match build_forwarded_frame_from_frame(
@@ -7481,6 +7485,7 @@ struct BindingLiveState {
     tx_bytes: AtomicU64,
     tx_completions: AtomicU64,
     tx_errors: AtomicU64,
+    in_place_tx_packets: AtomicU64,
     debug_pending_fill_frames: AtomicU32,
     debug_spare_fill_frames: AtomicU32,
     debug_free_tx_frames: AtomicU32,
@@ -7544,6 +7549,7 @@ impl BindingLiveState {
             tx_bytes: AtomicU64::new(0),
             tx_completions: AtomicU64::new(0),
             tx_errors: AtomicU64::new(0),
+            in_place_tx_packets: AtomicU64::new(0),
             debug_pending_fill_frames: AtomicU32::new(0),
             debug_spare_fill_frames: AtomicU32::new(0),
             debug_free_tx_frames: AtomicU32::new(0),
@@ -7658,6 +7664,7 @@ impl BindingLiveState {
             tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
             tx_completions: self.tx_completions.load(Ordering::Relaxed),
             tx_errors: self.tx_errors.load(Ordering::Relaxed),
+            in_place_tx_packets: self.in_place_tx_packets.load(Ordering::Relaxed),
             debug_pending_fill_frames: self.debug_pending_fill_frames.load(Ordering::Relaxed),
             debug_spare_fill_frames: self.debug_spare_fill_frames.load(Ordering::Relaxed),
             debug_free_tx_frames: self.debug_free_tx_frames.load(Ordering::Relaxed),
@@ -7829,6 +7836,7 @@ struct BindingLiveSnapshot {
     tx_bytes: u64,
     tx_completions: u64,
     tx_errors: u64,
+    in_place_tx_packets: u64,
     debug_pending_fill_frames: u32,
     debug_spare_fill_frames: u32,
     debug_free_tx_frames: u32,
