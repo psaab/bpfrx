@@ -47,8 +47,8 @@ func UserspaceLocalV6PinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_local_v6")
 }
 
-func SessionsPinPath() string {
-	return filepath.Join(bpfPinPath, "sessions")
+func UserspaceSessionsPinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_sessions")
 }
 
 // backendRegistry holds constructors for non-eBPF dataplane backends.
