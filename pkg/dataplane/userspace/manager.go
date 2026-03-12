@@ -634,6 +634,7 @@ func userspaceMapPins() UserspaceMapPins {
 		XSK:       dataplane.UserspaceXSKMapPinPath(),
 		LocalV4:   dataplane.UserspaceLocalV4PinPath(),
 		LocalV6:   dataplane.UserspaceLocalV6PinPath(),
+		Sessions:  dataplane.SessionsPinPath(),
 	}
 }
 

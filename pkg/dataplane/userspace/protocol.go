@@ -162,6 +162,7 @@ type UserspaceMapPins struct {
 	XSK       string `json:"xsk,omitempty"`
 	LocalV4   string `json:"local_v4,omitempty"`
 	LocalV6   string `json:"local_v6,omitempty"`
+	Sessions  string `json:"sessions,omitempty"`
 }
 
 type UserspaceCapabilities struct {

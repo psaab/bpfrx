@@ -47,6 +47,10 @@ func UserspaceLocalV6PinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_local_v6")
 }
 
+func SessionsPinPath() string {
+	return filepath.Join(bpfPinPath, "sessions")
+}
+
 // backendRegistry holds constructors for non-eBPF dataplane backends.
 // Sub-packages register themselves via RegisterBackend in their init().
 var backendRegistry = map[string]func() DataPlane{}
