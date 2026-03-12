@@ -569,7 +569,10 @@ var OperationalTree = map[string]*Node{
 		}},
 	}},
 	"clear": {Desc: "Clear statistics and protocol information", Children: map[string]*Node{
-		"arp": {Desc: "Clear ARP table"},
+		"arp":           {Desc: "Clear ARP table"},
+		"system":        {Desc: "Clear system information", Children: map[string]*Node{
+			"config-lock": {Desc: "Force clear stale configuration lock"},
+		}},
 		"interfaces": {Desc: "Clear interface information", Children: map[string]*Node{
 			"statistics": {Desc: "Clear interface statistics counters"},
 		}},

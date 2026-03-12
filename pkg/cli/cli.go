@@ -4186,10 +4186,27 @@ func (c *CLI) handleClear(args []string) error {
 		return c.handleClearDHCP(args[1:])
 	case "interfaces":
 		return c.handleClearInterfaces(args[1:])
+	case "system":
+		return c.handleClearSystem(args[1:])
 	default:
 		showHelp()
 		return nil
 	}
+}
+
+func (c *CLI) handleClearSystem(args []string) error {
+	if len(args) < 1 || args[0] != "config-lock" {
+		cmdtree.PrintTreeHelp("clear system:", operationalTree, "clear", "system")
+		return nil
+	}
+	holder, locked := c.store.ConfigHolder()
+	if !locked {
+		fmt.Println("No configuration lock held")
+		return nil
+	}
+	c.store.ForceExitConfigure()
+	fmt.Printf("Configuration lock cleared (was held by %s)\n", holder)
+	return nil
 }
 
 func (c *CLI) handleClearInterfaces(args []string) error {

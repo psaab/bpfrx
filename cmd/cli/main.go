@@ -2322,10 +2322,27 @@ func (c *ctl) handleClear(args []string) error {
 		return c.handleClearDHCP(args[1:])
 	case "interfaces":
 		return c.handleClearInterfaces(args[1:])
+	case "system":
+		return c.handleClearSystem(args[1:])
 	default:
 		showHelp()
 		return nil
 	}
+}
+
+func (c *ctl) handleClearSystem(args []string) error {
+	if len(args) < 1 || args[0] != "config-lock" {
+		printRemoteTreeHelp("clear system:", "clear", "system")
+		return nil
+	}
+	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
+		Action: "clear-config-lock",
+	})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Println(resp.Message)
+	return nil
 }
 
 func (c *ctl) handleClearInterfaces(args []string) error {

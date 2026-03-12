@@ -7914,6 +7914,14 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 		}
 		return &pb.SystemActionResponse{Message: "System zeroized. Configuration erased. Reboot to complete factory reset."}, nil
 
+	case "clear-config-lock":
+		holder, locked := s.store.ConfigHolder()
+		if !locked {
+			return &pb.SystemActionResponse{Message: "No configuration lock held"}, nil
+		}
+		s.store.ForceExitConfigure()
+		return &pb.SystemActionResponse{Message: fmt.Sprintf("Configuration lock cleared (was held by %s)", holder)}, nil
+
 	case "clear-arp":
 		out, err := exec.Command("ip", "-4", "neigh", "flush", "all").CombinedOutput()
 		if err != nil {
