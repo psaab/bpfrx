@@ -1704,6 +1704,15 @@ fn poll_binding(
     let fill_work = drain_pending_fill(binding, now_ns);
     let mut did_work = tx_work || fill_work;
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
+        // Backpressure: skip RX when TX queues are heavily loaded to prevent
+        // fill ring exhaustion. The NIC holds packets until we refill (#201).
+        let tx_backlog = binding.pending_tx_local.len() + binding.pending_tx_prepared.len();
+        if tx_backlog >= binding.max_pending_tx {
+            // Try to drain TX first — completions free frames for both TX and fill.
+            let _ = drain_pending_tx(binding, now_ns, shared_recycles);
+            return did_work;
+        }
+
         let available = binding.rx.available().min(RX_BATCH_SIZE);
         if available == 0 {
             maybe_wake_rx(binding, false, now_ns);
@@ -2461,6 +2470,7 @@ fn enqueue_pending_forwards(
                         flow_key: request.flow_key.clone(),
                     });
                     bound_pending_tx_local(target_binding);
+                    bound_pending_tx_prepared(target_binding);
                 }
                 copied_source_frame = true;
                 if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
@@ -2498,6 +2508,7 @@ fn enqueue_pending_forwards(
                                     expected_protocol: request.meta.protocol,
                                     flow_key: request.flow_key.clone(),
                                 });
+                            bound_pending_tx_prepared(target_binding);
                             target_binding.live.in_place_tx_packets.fetch_add(1, Ordering::Relaxed);
                             retained_source_frame = true;
                         }
@@ -2552,6 +2563,7 @@ fn enqueue_pending_forwards(
                                     flow_key: request.flow_key.clone(),
                                 });
                                 bound_pending_tx_local(target_binding);
+                                bound_pending_tx_prepared(target_binding);
                             }
                             None => {
                                 build_failed = true;
@@ -2611,6 +2623,7 @@ fn enqueue_pending_forwards(
                                 flow_key: request.flow_key.clone(),
                             });
                             bound_pending_tx_local(target_binding);
+                            bound_pending_tx_prepared(target_binding);
                         }
                         None => {
                             build_failed = true;
@@ -3571,6 +3584,19 @@ fn bound_pending_tx_local(binding: &mut BindingWorker) {
     }
 }
 
+fn bound_pending_tx_prepared(binding: &mut BindingWorker) {
+    let limit = binding.max_pending_tx;
+    while binding.pending_tx_prepared.len() > limit {
+        if let Some(req) = binding.pending_tx_prepared.pop_front() {
+            recycle_cancelled_prepared(binding, &req);
+            binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+            binding
+                .live
+                .set_error(format!("pending TX prepared overflow on slot {}", binding.slot));
+        }
+    }
+}
+
 fn drain_pending_tx(
     binding: &mut BindingWorker,
     now_ns: u64,
@@ -3655,6 +3681,7 @@ fn drain_pending_tx(
         binding.pending_tx_local = retry;
         bound_pending_tx_local(binding);
     }
+    bound_pending_tx_prepared(binding);
     update_binding_debug_state(binding);
     did_work
         || !binding.pending_tx_prepared.is_empty()
