@@ -51,6 +51,10 @@ func UserspaceSessionsPinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_sessions")
 }
 
+func UserspaceTracePinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_trace")
+}
+
 // backendRegistry holds constructors for non-eBPF dataplane backends.
 // Sub-packages register themselves via RegisterBackend in their init().
 var backendRegistry = map[string]func() DataPlane{}
@@ -228,6 +232,12 @@ type DataPlane interface {
 	// FIB
 	BumpFIBGeneration()
 	StartFIBSync(ctx context.Context) // DPDK: background route sync; eBPF: no-op
+
+	// NotifyLinkCycle signals that data-plane interfaces were taken DOWN/UP
+	// (e.g. during RETH MAC programming).  The userspace dataplane uses this
+	// to rebind AF_XDP sockets whose kernel-side RQ was destroyed by the
+	// link cycle.  No-op for the eBPF-only and DPDK dataplanes.
+	NotifyLinkCycle()
 
 	// Map statistics
 	GetMapStats() []MapStats

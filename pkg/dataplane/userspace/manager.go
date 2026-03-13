@@ -635,6 +635,7 @@ func userspaceMapPins() UserspaceMapPins {
 		LocalV4:   dataplane.UserspaceLocalV4PinPath(),
 		LocalV6:   dataplane.UserspaceLocalV6PinPath(),
 		Sessions:  dataplane.UserspaceSessionsPinPath(),
+		Trace:     dataplane.UserspaceTracePinPath(),
 	}
 }
 
@@ -1311,6 +1312,7 @@ func neighborStateString(state int) string {
 }
 
 func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
+	tuneSocketBuffers()
 	if m.proc != nil && m.proc.Process != nil && configEqual(m.cfg, cfg) {
 		if err := m.requestLocked(ControlRequest{Type: "ping"}, nil); err == nil {
 			return nil
@@ -1361,6 +1363,40 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	}
 	m.stopLocked()
 	return fmt.Errorf("userspace dataplane helper did not become ready at %s", cfg.ControlSocket)
+}
+
+// tuneSocketBuffers raises the kernel socket buffer limits so AF_XDP copy-mode
+// sockets can receive at line rate.  The default rmem_default (212992 = 208KB)
+// is far too small — copy-mode XSK pushes each packet through the socket
+// receive buffer and silently drops when it fills, causing throughput to stall
+// after an initial burst.
+func tuneSocketBuffers() {
+	const desired = 67108864 // 64 MB
+	paths := []string{
+		"/proc/sys/net/core/rmem_default",
+		"/proc/sys/net/core/rmem_max",
+		"/proc/sys/net/core/wmem_default",
+		"/proc/sys/net/core/wmem_max",
+	}
+	for _, path := range paths {
+		cur, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var curVal int
+		if _, err := fmt.Sscanf(strings.TrimSpace(string(cur)), "%d", &curVal); err != nil {
+			continue
+		}
+		if curVal >= desired {
+			continue
+		}
+		val := fmt.Sprintf("%d", desired)
+		if err := os.WriteFile(path, []byte(val), 0644); err != nil {
+			slog.Warn("failed to tune socket buffer", "path", path, "err", err)
+		} else {
+			slog.Info("tuned socket buffer for AF_XDP", "path", path, "from", curVal, "to", desired)
+		}
+	}
 }
 
 func findBinary(explicit string) (string, error) {
@@ -2516,6 +2552,12 @@ func (m *Manager) statusLoop(ctx context.Context) {
 				if err := m.applyHelperStatusLocked(&status); err != nil {
 					slog.Warn("userspace dataplane status sync failed", "err", err)
 				}
+				if m.clusterHA && len(m.haGroups) == 0 {
+					_ = m.refreshHAStateFromMapsLocked()
+				}
+				if err := m.syncDesiredForwardingStateLocked(); err != nil {
+					slog.Warn("userspace dataplane forwarding sync failed", "err", err)
+				}
 			} else {
 				slog.Warn("userspace dataplane status poll failed", "err", err)
 			}
@@ -2568,6 +2610,34 @@ func configEqual(a, b config.UserspaceConfig) bool {
 
 func (m *Manager) StartFIBSync(ctx context.Context) {
 	m.inner.StartFIBSync(ctx)
+}
+
+// NotifyLinkCycle tells the userspace helper to rebind all AF_XDP sockets.
+// In mlx5 (and other drivers), a link DOWN/UP cycle destroys the kernel-side
+// XSK receive queue.  The sockets remain open but no longer receive packets.
+// This is called after programRethMAC which takes RETH interfaces DOWN/UP.
+func (m *Manager) NotifyLinkCycle() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proc == nil || m.proc.Process == nil {
+		return
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "rebind"}, &status); err != nil {
+		slog.Warn("userspace: rebind after link cycle failed", "err", err)
+		return
+	}
+	_ = m.applyHelperStatusLocked(&status)
+	ready := 0
+	for _, b := range status.Bindings {
+		if b.Ready {
+			ready++
+		}
+	}
+	slog.Info("userspace: AF_XDP rebind initiated after link cycle",
+		"forwarding_armed", status.ForwardingArmed,
+		"bindings", len(status.Bindings),
+		"ready", ready)
 }
 
 func maxInt(a, b int) int {

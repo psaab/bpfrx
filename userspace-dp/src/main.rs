@@ -248,6 +248,8 @@ struct MapPins {
     local_v6: String,
     #[serde(default)]
     sessions: String,
+    #[serde(default)]
+    trace: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -811,6 +813,18 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    // Increase socket receive buffer defaults — needed for AF_XDP copy mode
+    // to avoid drops when the kernel backlog is large.
+    for sysctl in &[
+        "/proc/sys/net/core/rmem_default",
+        "/proc/sys/net/core/rmem_max",
+    ] {
+        if let Err(e) = fs::write(sysctl, "16777216") {
+            eprintln!("warn: set {sysctl}: {e}");
+        } else {
+            eprintln!("set {sysctl}=16777216");
+        }
+    }
     let args = parse_args()?;
     if let Some(parent) = Path::new(&args.control_socket).parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create control dir: {e}"))?;
@@ -898,6 +912,7 @@ fn run() -> Result<(), String> {
         guard.afxdp.stop();
         refresh_status(&mut guard);
     }
+    afxdp::remove_kernel_rst_suppression();
     write_state(&args.state_file, &state)?;
     let _ = fs::remove_file(&args.control_socket);
     Ok(())
@@ -1162,6 +1177,35 @@ fn handle_stream(
                 response.session_deltas = guard.afxdp.drain_session_deltas(max);
                 refresh_status(&mut guard);
                 persist_state = true;
+            }
+            "rebind" => {
+                // After a link DOWN/UP cycle (e.g. RETH MAC programming),
+                // the kernel destroys the XSK receive queue.  Stop all
+                // workers, clear binding state, and reconcile to recreate
+                // the AF_XDP sockets from scratch.
+                //
+                // No settle wait — worker threads create sockets async.
+                // The response returns immediately; sockets become ready
+                // within ~100ms as worker threads complete binding.
+                eprintln!("rebind: stopping workers and recreating AF_XDP sockets");
+                guard.afxdp.stop();
+                for binding in &mut guard.status.bindings {
+                    binding.bound = false;
+                    binding.xsk_registered = false;
+                    binding.xsk_bind_mode.clear();
+                    binding.zero_copy = false;
+                    binding.socket_fd = 0;
+                    binding.ready = false;
+                    binding.last_error.clear();
+                }
+                reconcile_status_bindings(&mut guard);
+                refresh_status(&mut guard);
+                persist_state = true;
+                eprintln!(
+                    "rebind: initiated, forwarding_armed={} bindings={}",
+                    guard.status.forwarding_armed,
+                    guard.status.bindings.len()
+                );
             }
             "shutdown" => {
                 guard.afxdp.stop();

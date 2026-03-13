@@ -36,12 +36,10 @@ const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 256;
 const MIN_RESERVED_TX_FRAMES: u32 = 256;
-const MAX_RESERVED_TX_FRAMES: u32 = 2048;
-const MIN_SPARE_RX_FRAMES: u32 = 512;
+const MAX_RESERVED_TX_FRAMES: u32 = 4096;
 const TX_BATCH_SIZE: usize = 256;
 const PENDING_TX_LIMIT_MULTIPLIER: usize = 2;
 const FILL_BATCH_SIZE: usize = 1024;
-const FILL_DRAIN_WATERMARK: usize = 64;
 const MAX_RX_BATCHES_PER_POLL: usize = 4;
 /*
  * Force XDP_COPY mode for AF_XDP sockets. In zero-copy mode on mlx5, XDP_PASS
@@ -58,9 +56,10 @@ const MAX_RX_BATCHES_PER_POLL: usize = 4;
  * redirect, which frees the XSK frame immediately while still delivering
  * the packet to the kernel stack.
  */
-const XSK_BIND_FLAGS_SHARED_UMEM_OWNER: u16 = SocketConfig::XDP_BIND_COPY;
+const XSK_BIND_FLAGS_SHARED_UMEM_OWNER: u16 =
+    SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_COPY;
 const IDLE_SPIN_ITERS: u32 = 256;
-const IDLE_SLEEP_US: u64 = 50;
+const IDLE_SLEEP_US: u64 = 1;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
 const RX_WAKE_MIN_INTERVAL_NS: u64 = 200_000;
 const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
@@ -409,14 +408,11 @@ impl Coordinator {
         }
         for plans in workers.values_mut() {
             plans.sort_by_key(|plan| (plan.status.queue_id, plan.status.ifindex, plan.status.slot));
-            /*
-             * On the isolated mlx5 HA lab, the only AF_XDP socket path that actually
-             * delivers packets is Socket::with_shared(...). Socket::new(...) reports
-             * success and registers into the XSK map, but XDP redirects to those slots
-             * never reach userspace. Until we rework the socket bring-up around a real
-             * per-worker shared UMEM root, keep every binding on the shared-socket
-             * code path so both LAN and WAN queues can receive packets.
-             */
+            // Each binding creates its own WorkerUmem (own AF_XDP socket FD).
+            // Socket::with_shared() clones the UMEM's FD, so socket == UMEM FD.
+            // bind() without SHARED_UMEM directly binds this socket to (ifindex, queue).
+            // Each binding is fully independent with its own UMEM/socket/rings.
+            // poll() on each binding's device triggers NAPI for that specific queue.
             for plan in plans.iter_mut() {
                 plan.shared_owner = true;
             }
@@ -837,7 +833,7 @@ impl Coordinator {
                 binding.tx_errors = snap.tx_errors;
                 binding.in_place_tx_packets = snap.in_place_tx_packets;
                 binding.debug_pending_fill_frames = snap.debug_pending_fill_frames;
-                binding.debug_spare_fill_frames = snap.debug_spare_fill_frames;
+                binding.debug_spare_fill_frames = 0;
                 binding.debug_free_tx_frames = snap.debug_free_tx_frames;
                 binding.debug_pending_tx_prepared = snap.debug_pending_tx_prepared;
                 binding.debug_pending_tx_local = snap.debug_pending_tx_local;
@@ -1113,7 +1109,6 @@ struct BindingWorker {
     rx: xdpilone::RingRx,
     tx: xdpilone::RingTx,
     free_tx_frames: VecDeque<u64>,
-    spare_fill_frames: VecDeque<u64>,
     pending_tx_prepared: VecDeque<PreparedTxRequest>,
     pending_tx_local: VecDeque<TxRequest>,
     max_pending_tx: usize,
@@ -1132,6 +1127,30 @@ struct BindingWorker {
     outstanding_tx: u32,
     empty_rx_polls: u32,
     last_learned_neighbor: Option<LearnedNeighborKey>,
+    dbg_fill_submitted: u64,
+    dbg_fill_failed: u64,
+    dbg_poll_cycles: u64,
+    dbg_backpressure: u64,
+    dbg_rx_empty: u64,
+    dbg_rx_wakeups: u64,
+    // TX pipeline debug counters
+    dbg_tx_ring_submitted: u64,   // descriptors inserted into TX ring
+    dbg_tx_ring_full: u64,        // times TX ring insert returned 0
+    dbg_completions_reaped: u64,  // completion descriptors read
+    dbg_sendto_calls: u64,        // number of sendto/wake calls
+    dbg_sendto_err: u64,          // sendto returned error (non-EAGAIN/ENOBUFS)
+    dbg_sendto_eagain: u64,       // sendto returned EAGAIN/EWOULDBLOCK
+    dbg_sendto_enobufs: u64,      // sendto returned ENOBUFS (kernel TX drop)
+    dbg_pending_overflow: u64,    // drops from bound_pending overflow
+    dbg_tx_tcp_rst: u64,          // TCP RST packets transmitted
+    // Ring diagnostics — raw values from xdpilone API
+    dbg_rx_avail_nonzero: u64,    // times rx.available() > 0
+    dbg_rx_avail_max: u32,        // max rx.available() seen this interval
+    dbg_fill_pending: u32,        // fill ring: userspace produced - kernel consumed
+    dbg_device_avail: u32,        // device queue available (completion ring pending)
+    dbg_rx_wake_sendto_ok: u64,   // sendto() returned >= 0 in maybe_wake_rx
+    dbg_rx_wake_sendto_err: u64,  // sendto() returned < 0 in maybe_wake_rx
+    dbg_rx_wake_sendto_errno: i32,// last errno from sendto in maybe_wake_rx
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1286,28 +1305,19 @@ impl BindingWorker {
         let worker_umem =
             WorkerUmem::new(total_frames).map_err(|err| format!("create binding umem: {err}"))?;
         let reserved_tx = reserved_tx_frames(ring_entries);
-        let fill_frames = ring_entries.max(1);
-        let spare_fill = spare_fill_frames(ring_entries);
         let mut reserved_tx_frames = VecDeque::with_capacity(reserved_tx as usize);
         for idx in 0..reserved_tx {
             if let Some(frame) = worker_umem.umem.frame(BufIdx(idx)) {
                 reserved_tx_frames.push_back(frame.offset);
             }
         }
-        let mut initial_fill_frames = Vec::with_capacity(fill_frames as usize);
-        for idx in reserved_tx..reserved_tx.saturating_add(fill_frames) {
+        // Pre-populate fill ring with ALL remaining frames — no spare held back.
+        // This maximizes the kernel's ability to place received packets and
+        // prevents fill ring starvation under burst conditions (copy-mode fix).
+        let mut initial_fill_frames = Vec::with_capacity((total_frames - reserved_tx) as usize);
+        for idx in reserved_tx..total_frames {
             if let Some(frame) = worker_umem.umem.frame(BufIdx(idx)) {
                 initial_fill_frames.push(frame.offset);
-            }
-        }
-        let mut spare_fill_frames = VecDeque::with_capacity(spare_fill as usize);
-        for idx in reserved_tx.saturating_add(fill_frames)
-            ..reserved_tx
-                .saturating_add(fill_frames)
-                .saturating_add(spare_fill)
-        {
-            if let Some(frame) = worker_umem.umem.frame(BufIdx(idx)) {
-                spare_fill_frames.push_back(frame.offset);
             }
         }
         let info = ifinfo_from_binding(binding)?;
@@ -1316,20 +1326,40 @@ impl BindingWorker {
                 .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
         prime_fill_ring_offsets(&mut device, &initial_fill_frames)?;
 
-        live.set_bound(user.as_raw_fd());
+        let user_fd = user.as_raw_fd();
+        live.set_bound(user_fd);
         live.set_bind_mode(bind_mode);
-        if let Some((ifindex, queue_id, flags)) = query_bound_xsk_socket(user.as_raw_fd()) {
+        let bound_info = query_bound_xsk_socket(user_fd);
+        if let Some((ifindex, queue_id, flags)) = bound_info {
             live.set_socket_binding(ifindex, queue_id, flags);
+            eprintln!(
+                "bpfrx-userspace-dp: binding slot={} fd={} shared_owner={} bound if{}q{} flags=0x{:x} mode={:?} (expected if{}q{})",
+                binding.slot, user_fd, shared_owner, ifindex, queue_id, flags, bind_mode,
+                binding.ifindex, binding.queue_id,
+            );
             if ifindex != binding.ifindex || queue_id != binding.queue_id {
                 live.set_error(format!(
                     "socket bound to ifindex {ifindex} queue {queue_id} flags 0x{flags:x}, expected ifindex {} queue {}",
                     binding.ifindex, binding.queue_id
                 ));
             }
+        } else {
+            eprintln!(
+                "bpfrx-userspace-dp: binding slot={} fd={} shared_owner={} getsockname FAILED — socket not bound!",
+                binding.slot, user_fd, shared_owner,
+            );
         }
-        if let Err(err) = register_xsk_slot(xsk_map_fd, binding.slot, user.as_raw_fd()) {
+        if let Err(err) = register_xsk_slot(xsk_map_fd, binding.slot, user_fd) {
+            eprintln!(
+                "bpfrx-userspace-dp: ERROR register_xsk_slot slot={} fd={}: {}",
+                binding.slot, user_fd, err,
+            );
             live.set_error(format!("register XSK slot: {err}"));
         } else {
+            eprintln!(
+                "bpfrx-userspace-dp: registered slot={} fd={} in XSKMAP",
+                binding.slot, user_fd,
+            );
             live.set_xsk_registered(true);
             if binding.ifindex == live.socket_ifindex.load(Ordering::Relaxed)
                 && binding.queue_id == live.socket_queue_id.load(Ordering::Relaxed)
@@ -1356,7 +1386,6 @@ impl BindingWorker {
             rx,
             tx,
             free_tx_frames: reserved_tx_frames,
-            spare_fill_frames,
             pending_tx_prepared: VecDeque::new(),
             pending_tx_local: VecDeque::new(),
             max_pending_tx,
@@ -1375,6 +1404,28 @@ impl BindingWorker {
             outstanding_tx: 0,
             empty_rx_polls: 0,
             last_learned_neighbor: None,
+            dbg_fill_submitted: 0,
+            dbg_fill_failed: 0,
+            dbg_poll_cycles: 0,
+            dbg_backpressure: 0,
+            dbg_rx_empty: 0,
+            dbg_rx_wakeups: 0,
+            dbg_tx_ring_submitted: 0,
+            dbg_tx_ring_full: 0,
+            dbg_completions_reaped: 0,
+            dbg_sendto_calls: 0,
+            dbg_sendto_err: 0,
+            dbg_sendto_eagain: 0,
+            dbg_sendto_enobufs: 0,
+            dbg_pending_overflow: 0,
+            dbg_tx_tcp_rst: 0,
+            dbg_rx_avail_nonzero: 0,
+            dbg_rx_avail_max: 0,
+            dbg_fill_pending: 0,
+            dbg_device_avail: 0,
+            dbg_rx_wake_sendto_ok: 0,
+            dbg_rx_wake_sendto_err: 0,
+            dbg_rx_wake_sendto_errno: 0,
         };
         update_binding_debug_state(&binding);
         Ok(binding)
@@ -1394,6 +1445,7 @@ impl BindingWorker {
 struct WorkerUmem {
     area: MmapArea,
     umem: Umem,
+    total_frames: u32,
 }
 
 impl WorkerUmem {
@@ -1409,7 +1461,7 @@ impl WorkerUmem {
         };
         let umem = unsafe { Umem::new(umem_cfg, area.as_nonnull_slice()) }
             .map_err(|e| format!("create umem: {e}"))?;
-        Ok(Self { area, umem })
+        Ok(Self { area, umem, total_frames })
     }
 }
 
@@ -1444,8 +1496,17 @@ fn open_binding_worker_rings(
         ring_entries,
         XSK_BIND_FLAGS_SHARED_UMEM_OWNER,
     )?;
-    let bind_mode =
-        bind_user_rings(&worker_umem.umem, &device, &user, shared_owner).unwrap_or(bind_mode);
+    let bind_mode = match bind_user_rings(&worker_umem.umem, &device, &user, shared_owner) {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!(
+                "bpfrx-userspace-dp: WARN bind_user_rings failed (shared_owner={}): {} — \
+                 using pre-bind mode {:?}",
+                shared_owner, e, bind_mode,
+            );
+            bind_mode
+        }
+    };
     Ok((user, rx, tx, bind_mode, device))
 }
 
@@ -1457,16 +1518,13 @@ fn reserved_tx_frames(ring_entries: u32) -> u32 {
         .max(1)
 }
 
-fn spare_fill_frames(ring_entries: u32) -> u32 {
-    ring_entries
-        .saturating_div(2)
-        .clamp(MIN_SPARE_RX_FRAMES, ring_entries.max(MIN_SPARE_RX_FRAMES))
-}
-
 fn binding_frame_count(ring_entries: u32) -> u32 {
+    // Allocate 2× ring_entries for fill ring so the NIC always has ample
+    // frames to place received packets into, even under burst conditions.
+    // This is the "Increase Fill Ring Size + Pre-populate UMEM" fix for
+    // copy-mode AF_XDP throughput stalls.
     reserved_tx_frames(ring_entries)
-        .saturating_add(ring_entries.max(1))
-        .saturating_add(spare_fill_frames(ring_entries))
+        .saturating_add(ring_entries.saturating_mul(2).max(1))
 }
 
 fn umem_ring_size(entries: u32) -> u32 {
@@ -1552,7 +1610,19 @@ fn query_bound_xsk_socket(fd: c_int) -> Option<(i32, u32, u32)> {
             &mut addrlen,
         )
     };
-    if rc != 0 || addrlen as usize != core::mem::size_of::<SockaddrXdp>() {
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        eprintln!(
+            "bpfrx-userspace-dp: getsockname(fd={}) failed: rc={} err={} addrlen={}",
+            fd, rc, err, addrlen,
+        );
+        return None;
+    }
+    if addrlen as usize != core::mem::size_of::<SockaddrXdp>() {
+        eprintln!(
+            "bpfrx-userspace-dp: getsockname(fd={}) size mismatch: got {} expected {} family={} ifindex={} queue={}",
+            fd, addrlen, core::mem::size_of::<SockaddrXdp>(), addr.sxdp_family, addr.sxdp_ifindex, addr.sxdp_queue_id,
+        );
         return None;
     }
     Some((
@@ -1588,11 +1658,16 @@ fn bind_user_rings(
     user: &User,
     shared_owner: bool,
 ) -> Result<XskBindMode, Box<dyn std::error::Error + Send + Sync>> {
+    let user_fd = user.as_raw_fd();
     for attempt in 0..BIND_RETRY_ATTEMPTS {
         let bind_result = umem.bind(user);
         match bind_result {
             Ok(()) => {
-                let bind_mode = query_bound_xsk_mode(user.as_raw_fd()).unwrap_or(XskBindMode::Copy);
+                let bind_mode = query_bound_xsk_mode(user_fd).unwrap_or(XskBindMode::Copy);
+                eprintln!(
+                    "bpfrx-userspace-dp: umem.bind(fd={}) OK on attempt {} mode={:?} shared_owner={}",
+                    user_fd, attempt, bind_mode, shared_owner,
+                );
                 return Ok(bind_mode);
             }
             Err(err) => {
@@ -1618,6 +1693,55 @@ fn bind_user_rings(
     Err(format!("bind AF_XDP socket via {binder}: exhausted retries").into())
 }
 
+#[derive(Default)]
+struct DebugPollCounters {
+    rx: u64,
+    tx: u64,
+    forward: u64,
+    local: u64,
+    session_hit: u64,
+    session_miss: u64,
+    session_create: u64,
+    no_route: u64,
+    missing_neigh: u64,
+    policy_deny: u64,
+    ha_inactive: u64,
+    no_egress_binding: u64,
+    build_fail: u64,
+    tx_err: u64,
+    metadata_err: u64,
+    disposition_other: u64,
+    enqueue_ok: u64,        // forwards successfully enqueued to target binding TX
+    enqueue_inplace: u64,   // in-place TX rewrites (same UMEM)
+    enqueue_direct: u64,    // direct-to-UMEM TX (cross binding)
+    enqueue_copy: u64,      // Vec copy-path TX
+    // Direction-specific counters
+    rx_from_trust: u64,     // packets received from trust-side interfaces
+    rx_from_wan: u64,       // packets received from wan-side interfaces
+    fwd_trust_to_wan: u64,  // forwards from trust to wan
+    fwd_wan_to_trust: u64,  // forwards from wan to trust
+    nat_applied_snat: u64,  // SNAT rewrites applied
+    nat_applied_dnat: u64,  // DNAT (reverse-SNAT) rewrites applied
+    nat_applied_none: u64,  // no NAT rewrite
+    frame_build_none: u64,  // build_forwarded_frame returned None (why?)
+    rx_tcp_rst: u64,        // TCP RST flags seen in RX frames
+    tx_tcp_rst: u64,        // TCP RST flags seen in TX frames (forwarded)
+    rx_bytes_total: u64,    // total RX bytes (for avg frame size calculation)
+    tx_bytes_total: u64,    // total TX bytes submitted to ring
+    rx_oversized: u64,      // RX frames where desc.len > 1514
+    rx_max_frame: u32,      // max desc.len seen in RX
+    tx_max_frame: u32,      // max frame len submitted to TX
+    seg_needed_but_none: u64, // oversized frames where segmentation returned None
+    wan_return_hits: u64,   // session hits for WAN return traffic (first N logged)
+    wan_return_misses: u64, // session misses for WAN return traffic
+    rx_tcp_fin: u64,        // TCP FIN flags seen in RX
+    rx_tcp_synack: u64,     // TCP SYN+ACK seen in RX
+    rx_tcp_zero_window: u64, // TCP zero-window seen in RX (forwarded frames)
+    fwd_tcp_fin: u64,       // TCP FIN in forwarded frames
+    fwd_tcp_rst: u64,       // TCP RST in forwarded frames
+    fwd_tcp_zero_window: u64, // zero-window in forwarded frames
+}
+
 fn poll_binding(
     binding_index: usize,
     bindings: &mut [BindingWorker],
@@ -1636,6 +1760,7 @@ fn poll_binding(
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     shared_recycles: &mut Vec<(u32, u64)>,
+    dbg: &mut DebugPollCounters,
 ) -> bool {
     #[derive(Default)]
     struct BatchCounters {
@@ -1712,18 +1837,31 @@ fn poll_binding(
     apply_shared_recycles(left, binding, right, shared_recycles);
     let fill_work = drain_pending_fill(binding, now_ns);
     let mut did_work = tx_work || fill_work;
+    binding.dbg_poll_cycles += 1;
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
         // Backpressure: skip RX when TX queues are heavily loaded to prevent
         // fill ring exhaustion. The NIC holds packets until we refill (#201).
         let tx_backlog = binding.pending_tx_local.len() + binding.pending_tx_prepared.len();
         if tx_backlog >= binding.max_pending_tx {
+            binding.dbg_backpressure += 1;
             // Try to drain TX first — completions free frames for both TX and fill.
             let _ = drain_pending_tx(binding, now_ns, shared_recycles);
             return did_work;
         }
 
-        let available = binding.rx.available().min(RX_BATCH_SIZE);
+        let raw_avail = binding.rx.available();
+        let available = raw_avail.min(RX_BATCH_SIZE);
+        if raw_avail > 0 {
+            binding.dbg_rx_avail_nonzero += 1;
+            if raw_avail > binding.dbg_rx_avail_max {
+                binding.dbg_rx_avail_max = raw_avail;
+            }
+        }
+        // Snapshot ring state for diagnostics
+        binding.dbg_fill_pending = binding.device.pending();
+        binding.dbg_device_avail = binding.device.available();
         if available == 0 {
+            binding.dbg_rx_empty += 1;
             maybe_wake_rx(binding, false, now_ns);
             return did_work;
         }
@@ -1739,6 +1877,104 @@ fn poll_binding(
         while let Some(desc) = received.read() {
             batch_packets += 1;
             batch_bytes += desc.len as u64;
+            dbg.rx += 1;
+            dbg.rx_bytes_total += desc.len as u64;
+            if desc.len > dbg.rx_max_frame {
+                dbg.rx_max_frame = desc.len;
+            }
+            if desc.len > 1514 {
+                dbg.rx_oversized += 1;
+                thread_local! {
+                    static OVERSIZED_RX_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+                }
+                OVERSIZED_RX_LOG.with(|c| {
+                    let n = c.get();
+                    if n < 20 {
+                        c.set(n + 1);
+                        eprintln!(
+                            "DBG OVERSIZED_RX[{}]: if={} q={} desc.len={} (exceeds ETH+MTU 1514)",
+                            n, ident.ifindex, ident.queue_id, desc.len,
+                        );
+                    }
+                });
+            }
+            // TCP flag detection on RX
+            if desc.len >= 54 {
+                if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize) {
+                    // Check for FIN, SYN+ACK, zero-window
+                    if let Some(tcp_info) = extract_tcp_flags_and_window(rx_frame) {
+                        if (tcp_info.0 & 0x01) != 0 { // FIN
+                            dbg.rx_tcp_fin += 1;
+                        }
+                        if (tcp_info.0 & 0x12) == 0x12 { // SYN+ACK
+                            dbg.rx_tcp_synack += 1;
+                        }
+                        if tcp_info.1 == 0 && (tcp_info.0 & 0x02) == 0 { // zero window, not SYN
+                            dbg.rx_tcp_zero_window += 1;
+                            if dbg.rx_tcp_zero_window <= 10 {
+                                eprintln!(
+                                    "RX_TCP_ZERO_WIN[{}]: if={} q={} len={} flags=0x{:02x}",
+                                    dbg.rx_tcp_zero_window, ident.ifindex, ident.queue_id,
+                                    desc.len, tcp_info.0,
+                                );
+                            }
+                        }
+                    }
+                    if frame_has_tcp_rst(rx_frame) {
+                        dbg.rx_tcp_rst += 1;
+                        thread_local! {
+                            static RX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+                        }
+                        RX_RST_LOG_COUNT.with(|c| {
+                            let n = c.get();
+                            if n < 50 {
+                                c.set(n + 1);
+                                let summary = decode_frame_summary(rx_frame);
+                                eprintln!(
+                                    "RST_DETECT RX[{}]: if={} q={} len={} {}",
+                                    n, ident.ifindex, ident.queue_id, desc.len, summary,
+                                );
+                                if n < 5 {
+                                    let hex_len = (desc.len as usize).min(rx_frame.len()).min(80);
+                                    let hex: String = rx_frame[..hex_len]
+                                        .iter()
+                                        .map(|b| format!("{:02x}", b))
+                                        .collect::<Vec<_>>()
+                                        .join(" ");
+                                    eprintln!("RST_DETECT RX_HEX[{n}]: {hex}");
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            // Poison check: detect if kernel recycled descriptor without writing data
+            if desc.len >= 8 {
+                if let Some(first8) = unsafe { &*area }.slice(desc.addr as usize, 8) {
+                    if first8 == &0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes() {
+                        eprintln!(
+                            "DBG POISON_DETECTED: if={} q={} desc.addr={:#x} desc.len={} — kernel returned poisoned frame!",
+                            ident.ifindex, ident.queue_id, desc.addr, desc.len,
+                        );
+                    }
+                }
+            }
+            if dbg.rx <= 10 {
+                if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize) {
+                    // Decode IP+TCP details from the frame
+                    let pkt_detail = decode_frame_summary(rx_frame);
+                    eprintln!(
+                        "DBG RX_ETH[{}]: if={} q={} len={} {}",
+                        dbg.rx, ident.ifindex, ident.queue_id, desc.len, pkt_detail,
+                    );
+                    // Full hex dump for first 3 packets
+                    if dbg.rx <= 3 {
+                        let dump_len = (desc.len as usize).min(rx_frame.len()).min(80);
+                        let hex: String = rx_frame[..dump_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                        eprintln!("DBG RX_HEX[{}]: {}", dbg.rx, hex);
+                    }
+                }
+            }
             let mut recycle_now = true;
             if let Some(meta) = try_parse_metadata(unsafe { &*area }, desc) {
                 counters.metadata_packets += 1;
@@ -1772,6 +2008,20 @@ fn poll_binding(
                             sessions.lookup(&flow.forward_key, now_ns, meta.tcp_flags)
                         {
                             counters.session_hits += 1;
+                            dbg.session_hit += 1;
+                            // Log first N session hits from WAN (return path)
+                            if meta.ingress_ifindex == 6 && dbg.wan_return_hits < 5 {
+                                dbg.wan_return_hits += 1;
+                                eprintln!(
+                                    "DBG WAN_RETURN_HIT[{}]: {}:{} -> {}:{} proto={} tcp_flags=0x{:02x} nat=({:?},{:?}) rev={}",
+                                    dbg.wan_return_hits,
+                                    flow.src_ip, flow.forward_key.src_port,
+                                    flow.dst_ip, flow.forward_key.dst_port,
+                                    meta.protocol, meta.tcp_flags,
+                                    hit.decision.nat.rewrite_src, hit.decision.nat.rewrite_dst,
+                                    hit.metadata.is_reverse,
+                                );
+                            }
                             let mut decision = hit.decision;
                             if let Some(debug) = debug.as_mut() {
                                 debug.from_zone = Some(hit.metadata.ingress_zone.clone());
@@ -1836,6 +2086,7 @@ fn poll_binding(
                             lookup_shared_session(shared_sessions, &flow.forward_key)
                         {
                             counters.session_hits += 1;
+                            dbg.session_hit += 1;
                             let replica = synced_replica_entry(&shared);
                             sessions.upsert_synced(
                                 replica.key.clone(),
@@ -1921,6 +2172,8 @@ fn poll_binding(
                         ) {
                             counters.session_hits += 1;
                             counters.session_creates += 1;
+                            dbg.session_hit += 1;
+                            dbg.session_create += 1;
                             if let Some(debug) = debug.as_mut() {
                                 debug.from_zone = Some(repaired.metadata.ingress_zone.clone());
                                 debug.to_zone = Some(repaired.metadata.egress_zone.clone());
@@ -1944,6 +2197,7 @@ fn poll_binding(
                             decision
                         } else {
                             counters.session_misses += 1;
+                            dbg.session_miss += 1;
                             let resolution_target =
                                 parse_packet_destination(unsafe { &*area }, desc, meta)
                                     .unwrap_or(flow.dst_ip);
@@ -1985,6 +2239,57 @@ fn poll_binding(
                             );
                             let from_zone_arc = Arc::<str>::from(from_zone.as_str());
                             let to_zone_arc = Arc::<str>::from(to_zone.as_str());
+                            // Debug: log session miss with flow details (throttled)
+                            // Always log trust/lan traffic (iperf3) regardless of throttle
+                            let is_trust_flow = meta.ingress_ifindex == 5
+                                || from_zone == "lan"
+                                || matches!(flow.src_ip, IpAddr::V4(ip) if ip.octets()[0] == 10);
+                            if dbg.session_miss <= 10 || is_trust_flow {
+                                eprintln!(
+                                    "DBG SESS_MISS[{}]: {}:{} -> {}:{} proto={} tcp_flags=0x{:02x} ingress_if={} disp={:?} egress_if={} neigh={:?} zone={}->{}",
+                                    dbg.session_miss,
+                                    flow.src_ip, flow.forward_key.src_port,
+                                    flow.dst_ip, flow.forward_key.dst_port,
+                                    meta.protocol, meta.tcp_flags,
+                                    meta.ingress_ifindex,
+                                    resolution.disposition,
+                                    resolution.egress_ifindex,
+                                    resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
+                                    from_zone, to_zone,
+                                );
+                                // If from WAN (if6), dump what session key was tried
+                                if meta.ingress_ifindex == 6 {
+                                    eprintln!(
+                                        "DBG SESS_MISS_KEY: af={} proto={} key={}:{}->{}:{} bpf_entries={} local_sessions={}",
+                                        flow.forward_key.addr_family, flow.forward_key.protocol,
+                                        flow.forward_key.src_ip, flow.forward_key.src_port,
+                                        flow.forward_key.dst_ip, flow.forward_key.dst_port,
+                                        count_bpf_session_entries(binding.session_map_fd),
+                                        sessions.len(),
+                                    );
+                                    // Dump all local sessions to compare
+                                    if dbg.session_miss <= 3 {
+                                        let mut sess_dump = String::new();
+                                        let mut count = 0;
+                                        sessions.iter(|key, decision, metadata| {
+                                            if count < 30 {
+                                                use std::fmt::Write;
+                                                let _ = write!(sess_dump,
+                                                    "\n  LOCAL_SESS: af={} proto={} {}:{}->{}:{} nat=({:?},{:?}) rev={} synced={}",
+                                                    key.addr_family, key.protocol,
+                                                    key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+                                                    decision.nat.rewrite_src, decision.nat.rewrite_dst,
+                                                    metadata.is_reverse, metadata.synced,
+                                                );
+                                                count += 1;
+                                            }
+                                        });
+                                        if !sess_dump.is_empty() {
+                                            eprintln!("DBG SESS_MISS_DUMP:{sess_dump}");
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(debug) = debug.as_mut() {
                                 debug.from_zone = Some(from_zone_arc.clone());
                                 debug.to_zone = Some(to_zone_arc.clone());
@@ -2092,6 +2397,51 @@ fn poll_binding(
                                             binding.session_map_fd,
                                             &reverse_key,
                                         );
+                                        // Verify reverse key was published correctly
+                                        if verify_session_key_in_bpf(binding.session_map_fd, &reverse_key) {
+                                            SESSION_PUBLISH_VERIFY_OK.fetch_add(1, Ordering::Relaxed);
+                                        } else {
+                                            SESSION_PUBLISH_VERIFY_FAIL.fetch_add(1, Ordering::Relaxed);
+                                            eprintln!(
+                                                "SESS_VERIFY_FAIL: reverse key NOT found after publish! \
+                                                 af={} proto={} {}:{} -> {}:{} (map_fd={})",
+                                                reverse_key.addr_family, reverse_key.protocol,
+                                                reverse_key.src_ip, reverse_key.src_port,
+                                                reverse_key.dst_ip, reverse_key.dst_port,
+                                                binding.session_map_fd,
+                                            );
+                                        }
+                                        // Also verify forward key
+                                        if !verify_session_key_in_bpf(binding.session_map_fd, &flow.forward_key) {
+                                            eprintln!(
+                                                "SESS_VERIFY_FAIL: forward key NOT found! \
+                                                 af={} proto={} {}:{} -> {}:{}",
+                                                flow.forward_key.addr_family, flow.forward_key.protocol,
+                                                flow.forward_key.src_ip, flow.forward_key.src_port,
+                                                flow.forward_key.dst_ip, flow.forward_key.dst_port,
+                                            );
+                                        }
+                                        // Log first N session creations with full details
+                                        let logged = SESSION_CREATIONS_LOGGED.fetch_add(1, Ordering::Relaxed);
+                                        if logged < 10 {
+                                            let fwd = &flow.forward_key;
+                                            eprintln!(
+                                                "SESS_CREATE[{}]: FWD af={} proto={} {}:{} -> {}:{} \
+                                                 | REV af={} proto={} {}:{} -> {}:{} \
+                                                 | NAT src={:?} dst={:?} \
+                                                 | map_fd={} bpf_entries={}",
+                                                logged, fwd.addr_family, fwd.protocol,
+                                                fwd.src_ip, fwd.src_port, fwd.dst_ip, fwd.dst_port,
+                                                reverse_key.addr_family, reverse_key.protocol,
+                                                reverse_key.src_ip, reverse_key.src_port,
+                                                reverse_key.dst_ip, reverse_key.dst_port,
+                                                decision.nat.rewrite_src, decision.nat.rewrite_dst,
+                                                binding.session_map_fd,
+                                                count_bpf_session_entries(binding.session_map_fd),
+                                            );
+                                            // Dump the BPF map contents
+                                            dump_bpf_session_entries(binding.session_map_fd, 20);
+                                        }
                                         created += 1;
                                         let reverse_entry = SyncedSessionEntry {
                                             key: reverse_key,
@@ -2112,8 +2462,23 @@ fn poll_binding(
                                     }
                                     if created > 0 {
                                         counters.session_creates += created;
+                                        dbg.session_create += created;
                                     }
                                 } else {
+                                    dbg.policy_deny += 1;
+                                    // Debug: log policy deny — always for trust flows
+                                    if dbg.policy_deny <= 3 || is_trust_flow {
+                                        eprintln!(
+                                            "DBG POLICY_DENY[{}]: {}:{} -> {}:{} proto={} zone={}->{}  ingress_if={} egress_if={}",
+                                            dbg.policy_deny,
+                                            flow.src_ip, flow.forward_key.src_port,
+                                            flow.dst_ip, flow.forward_key.dst_port,
+                                            meta.protocol,
+                                            from_zone, to_zone,
+                                            meta.ingress_ifindex,
+                                            resolution.egress_ifindex,
+                                        );
+                                    }
                                     decision.resolution.disposition =
                                         ForwardingDisposition::PolicyDenied;
                                 }
@@ -2156,6 +2521,112 @@ fn poll_binding(
                         ForwardingDisposition::ForwardCandidate
                             | ForwardingDisposition::FabricRedirect
                     ) {
+                        dbg.forward += 1;
+                        // Direction-specific tracking
+                        let ingress_if = meta.ingress_ifindex as i32;
+                        let egress_if = decision.resolution.egress_ifindex;
+                        if ingress_if == 5 {
+                            dbg.rx_from_trust += 1;
+                            dbg.fwd_trust_to_wan += 1;
+                        } else if ingress_if == 6 {
+                            dbg.rx_from_wan += 1;
+                            dbg.fwd_wan_to_trust += 1;
+                        }
+                        // NAT decision tracking
+                        if decision.nat.rewrite_src.is_some() && decision.nat.rewrite_dst.is_some() {
+                            dbg.nat_applied_snat += 1;
+                            dbg.nat_applied_dnat += 1;
+                        } else if decision.nat.rewrite_src.is_some() {
+                            dbg.nat_applied_snat += 1;
+                        } else if decision.nat.rewrite_dst.is_some() {
+                            dbg.nat_applied_dnat += 1;
+                        } else {
+                            dbg.nat_applied_none += 1;
+                        }
+                        // Log NAT details for first few forward-candidate packets
+                        if dbg.forward <= 10 {
+                            let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
+                            let nat_str = format!(
+                                "snat={:?} dnat={:?}",
+                                decision.nat.rewrite_src, decision.nat.rewrite_dst,
+                            );
+                            eprintln!(
+                                "DBG FWD_DECISION[{}]: ingress_if={} egress_if={} {} {} proto={}",
+                                dbg.forward, ingress_if, egress_if, flow_str, nat_str, meta.protocol,
+                            );
+                        }
+                        // TCP flag tracking on forwarded frames
+                        if meta.protocol == 6 {
+                            // Compare meta.tcp_flags from BPF shim with raw frame TCP flags
+                            let frame_data = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize);
+                            let raw_tcp_info = frame_data.and_then(|data| extract_tcp_flags_and_window(data));
+                            let raw_flags = raw_tcp_info.map(|(f, _)| f);
+                            let raw_window = raw_tcp_info.map(|(_, w)| w);
+                            // Log first 20 forwarded TCP packets: compare meta vs raw
+                            if dbg.forward <= 20 {
+                                let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
+                                eprintln!(
+                                    "FWD_TCP_CMP[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} l4_off={} {}",
+                                    dbg.forward, meta.tcp_flags,
+                                    raw_flags.map(|f| format!("0x{:02x}", f)).unwrap_or_else(|| "NONE".into()),
+                                    raw_window.map(|w| format!("{}", w)).unwrap_or_else(|| "NONE".into()),
+                                    desc.len, meta.l4_offset, flow_str,
+                                );
+                                // Hex dump bytes around TCP flags position in raw frame
+                                if let Some(data) = frame_data {
+                                    let l4 = meta.l4_offset as usize;
+                                    if data.len() > l4 + 20 {
+                                        let tcp_hdr: String = data[l4..l4+20].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                                        eprintln!("FWD_TCP_HDR[{}]: offset={} {}", dbg.forward, l4, tcp_hdr);
+                                    }
+                                }
+                            }
+                            if (meta.tcp_flags & 0x04) != 0 { // RST
+                                dbg.fwd_tcp_rst += 1;
+                                if dbg.fwd_tcp_rst <= 5 {
+                                    let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
+                                    eprintln!(
+                                        "FWD_TCP_RST_DETECT[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} fwd#={} {}",
+                                        dbg.fwd_tcp_rst, meta.tcp_flags,
+                                        raw_flags.map(|f| format!("0x{:02x}", f)).unwrap_or_else(|| "NONE".into()),
+                                        raw_window.map(|w| format!("{}", w)).unwrap_or_else(|| "NONE".into()),
+                                        desc.len, dbg.forward, flow_str,
+                                    );
+                                    // Hex dump TCP header when RST detected
+                                    if let Some(data) = frame_data {
+                                        let l4 = meta.l4_offset as usize;
+                                        if data.len() > l4 + 20 {
+                                            let tcp_hdr: String = data[l4..l4+20].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                                            eprintln!("FWD_TCP_RST_HDR[{}]: meta_off={} raw_off={} {}", dbg.fwd_tcp_rst, l4, frame_l3_offset(data).unwrap_or(0), tcp_hdr);
+                                        }
+                                    }
+                                }
+                            }
+                            if (meta.tcp_flags & 0x01) != 0 { // FIN
+                                dbg.fwd_tcp_fin += 1;
+                                if dbg.fwd_tcp_fin <= 5 {
+                                    let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
+                                    eprintln!(
+                                        "FWD_TCP_FIN[{}]: ingress_if={} {} tcp_flags=0x{:02x}",
+                                        dbg.fwd_tcp_fin, meta.ingress_ifindex, flow_str, meta.tcp_flags,
+                                    );
+                                }
+                            }
+                            // Detect zero-window in TCP frames by inspecting raw packet
+                            if let Some(win) = raw_window {
+                                if win == 0 {
+                                    dbg.fwd_tcp_zero_window += 1;
+                                    if dbg.fwd_tcp_zero_window <= 10 {
+                                        let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
+                                        eprintln!(
+                                            "FWD_TCP_ZERO_WIN[{}]: ingress_if={} {} meta_flags=0x{:02x} raw_flags={}",
+                                            dbg.fwd_tcp_zero_window, meta.ingress_ifindex, flow_str, meta.tcp_flags,
+                                            raw_flags.map(|f| format!("0x{:02x}", f)).unwrap_or_else(|| "NONE".into()),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         if should_teardown_tcp_rst(meta, flow.as_ref())
                             && let Some(flow) = flow.as_ref()
                         {
@@ -2177,10 +2648,76 @@ fn poll_binding(
                             forwarding,
                             flow.as_ref(),
                         ) {
+                            dbg.tx += 1; // track forward requests queued
+                            if dbg.tx <= 5 {
+                                let dst_mac_str = decision.resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])).unwrap_or_else(|| "NONE".into());
+                                let src_mac_str = decision.resolution.src_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])).unwrap_or_else(|| "NONE".into());
+                                let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
+                                eprintln!(
+                                    "DBG FWD_REQ: target_if={} egress_if={} tx_if={} len={} proto={} vlan={} dst_mac={} src_mac={} flow={}",
+                                    request.target_ifindex,
+                                    decision.resolution.egress_ifindex,
+                                    decision.resolution.tx_ifindex,
+                                    desc.len,
+                                    meta.protocol,
+                                    decision.resolution.tx_vlan_id,
+                                    dst_mac_str,
+                                    src_mac_str,
+                                    flow_str,
+                                );
+                            }
                             binding.scratch_forwards.push(request);
                             recycle_now = false;
+                        } else {
+                            dbg.build_fail += 1;
+                            if dbg.build_fail <= 3 {
+                                eprintln!(
+                                    "DBG FWD_BUILD_NONE: egress_if={} tx_if={} neigh={:?} src_mac={:?} len={} proto={}",
+                                    decision.resolution.egress_ifindex,
+                                    decision.resolution.tx_ifindex,
+                                    decision.resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
+                                    decision.resolution.src_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
+                                    desc.len,
+                                    meta.protocol,
+                                );
+                            }
                         }
                     } else {
+                        // Debug: count non-forward dispositions
+                        match decision.resolution.disposition {
+                            ForwardingDisposition::LocalDelivery => dbg.local += 1,
+                            ForwardingDisposition::NoRoute => {
+                                dbg.no_route += 1;
+                                if dbg.no_route <= 3 {
+                                    if let Some(flow) = flow.as_ref() {
+                                        eprintln!(
+                                            "DBG NO_ROUTE: {}:{} -> {}:{} proto={} ingress_if={}",
+                                            flow.src_ip, flow.forward_key.src_port,
+                                            flow.dst_ip, flow.forward_key.dst_port,
+                                            meta.protocol, meta.ingress_ifindex,
+                                        );
+                                    }
+                                }
+                            }
+                            ForwardingDisposition::MissingNeighbor => {
+                                dbg.missing_neigh += 1;
+                                if dbg.missing_neigh <= 3 {
+                                    if let Some(flow) = flow.as_ref() {
+                                        eprintln!(
+                                            "DBG MISS_NEIGH: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
+                                            flow.src_ip, flow.forward_key.src_port,
+                                            flow.dst_ip, flow.forward_key.dst_port,
+                                            meta.protocol,
+                                            decision.resolution.egress_ifindex,
+                                            decision.resolution.next_hop,
+                                        );
+                                    }
+                                }
+                            }
+                            ForwardingDisposition::PolicyDenied => dbg.policy_deny += 1,
+                            ForwardingDisposition::HAInactive => dbg.ha_inactive += 1,
+                            _ => dbg.disposition_other += 1,
+                        }
                         record_forwarding_disposition(
                             &ident,
                             &binding.live,
@@ -2213,6 +2750,7 @@ fn poll_binding(
                     );
                 }
             } else {
+                dbg.metadata_err += 1;
                 binding.live.metadata_errors.fetch_add(1, Ordering::Relaxed);
                 record_exception(
                     recent_exceptions,
@@ -2257,6 +2795,7 @@ fn poll_binding(
             ingress_live.as_ref(),
             slow_path,
             recent_exceptions,
+            dbg,
         );
         binding.scratch_forwards = pending_forwards;
         if !binding.scratch_recycle.is_empty() {
@@ -2303,22 +2842,79 @@ fn build_live_forward_request(
     let source_frame = area.slice(desc.addr as usize, desc.len as usize)?.to_vec();
     // Prefer session flow ports (set by conntrack, immune to DMA races),
     // then live frame ports, then metadata as last resort.
-    let expected_ports = flow
-        .and_then(|f| {
-            if f.forward_key.src_port != 0 && f.forward_key.dst_port != 0 {
-                Some((f.forward_key.src_port, f.forward_key.dst_port))
-            } else {
-                None
+    let session_ports = flow.and_then(|f| {
+        if f.forward_key.src_port != 0 && f.forward_key.dst_port != 0 {
+            Some((f.forward_key.src_port, f.forward_key.dst_port))
+        } else {
+            None
+        }
+    });
+    let meta_ports = if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
+        Some((meta.flow_src_port, meta.flow_dst_port))
+    } else {
+        None
+    };
+    let expected_ports = session_ports.or(live_ports).or(meta_ports);
+    // Diagnostic: detect expected_ports source and cross-check with copied frame
+    if meta.protocol == PROTO_TCP || meta.protocol == PROTO_UDP {
+        let copy_ports = live_frame_ports_bytes(&source_frame, meta.addr_family, meta.protocol);
+        let ports_source = if session_ports.is_some() {
+            "session"
+        } else if live_ports.is_some() {
+            "live"
+        } else if meta_ports.is_some() {
+            "meta"
+        } else {
+            "none"
+        };
+        // Log if the different port sources disagree — this catches DMA race
+        let all_agree = [session_ports, live_ports, meta_ports, copy_ports]
+            .iter()
+            .filter_map(|p| *p)
+            .collect::<Vec<_>>();
+        let disagreement = all_agree.windows(2).any(|w| w[0] != w[1]);
+        if disagreement {
+            thread_local! {
+                static PORT_DISAGREE_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
             }
-        })
-        .or(live_ports)
-        .or_else(|| {
-            if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
-                Some((meta.flow_src_port, meta.flow_dst_port))
-            } else {
-                None
+            PORT_DISAGREE_LOG.with(|c| {
+                let n = c.get();
+                if n < 100 {
+                    c.set(n + 1);
+                    eprintln!(
+                        "PORT_DISAGREE[{n}]: source={ports_source} session={session_ports:?} live={live_ports:?} meta={meta_ports:?} copy={copy_ports:?} expected={expected_ports:?} desc.addr={} desc.len={} proto={}",
+                        desc.addr, desc.len, meta.protocol,
+                    );
+                }
+            });
+        }
+        // Log when session is missing for non-SYN TCP
+        if meta.protocol == PROTO_TCP && session_ports.is_none() && flow.is_none() {
+            let tcp_flags = source_frame
+                .get(frame_l3_offset(&source_frame).unwrap_or(14)..)
+                .and_then(|ip| {
+                    let l4_off = packet_rel_l4_offset(ip, meta.addr_family).unwrap_or(20);
+                    ip.get(l4_off + 13).copied()
+                })
+                .unwrap_or(0);
+            if tcp_flags & 0x02 == 0 {
+                // Non-SYN without session
+                thread_local! {
+                    static SESS_MISS_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+                }
+                SESS_MISS_LOG.with(|c| {
+                    let n = c.get();
+                    if n < 100 {
+                        c.set(n + 1);
+                        eprintln!(
+                            "SESS_MISS_TCP[{n}]: flags=0x{tcp_flags:02x} expected={expected_ports:?} live={live_ports:?} meta={meta_ports:?} copy={copy_ports:?} desc.addr={} desc.len={}",
+                            desc.addr, desc.len,
+                        );
+                    }
+                });
             }
-        });
+        }
+    }
     Some(PendingForwardRequest {
         target_ifindex,
         ingress_queue_id: ingress_ident.queue_id,
@@ -2404,6 +3000,7 @@ fn enqueue_pending_forwards(
     ingress_live: &BindingLiveState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    dbg: &mut DebugPollCounters,
 ) {
     let ingress_area = (&ingress_binding.umem.area) as *const MmapArea;
     for request in pending_forwards.drain(..) {
@@ -2421,6 +3018,13 @@ fn enqueue_pending_forwards(
             right,
             request.target_ifindex,
         ) else {
+            dbg.no_egress_binding += 1;
+            if dbg.no_egress_binding <= 3 {
+                eprintln!(
+                    "DBG NO_EGRESS_BINDING: target_ifindex={} ingress_if={} ingress_q={}",
+                    request.target_ifindex, ingress_ident.ifindex, request.ingress_queue_id,
+                );
+            }
             record_exception(
                 recent_exceptions,
                 ingress_ident,
@@ -2471,6 +3075,7 @@ fn enqueue_pending_forwards(
                         copied_source_frame = true;
                         break;
                     }
+                    let seg_frame_len = frame.len();
                     target_binding.pending_tx_local.push_back(TxRequest {
                         bytes: frame,
                         expected_ports,
@@ -2480,11 +3085,44 @@ fn enqueue_pending_forwards(
                     });
                     bound_pending_tx_local(target_binding);
                     bound_pending_tx_prepared(target_binding);
+                    dbg.enqueue_ok += 1;
+                    dbg.enqueue_copy += 1;
+                    dbg.tx_bytes_total += seg_frame_len as u64;
+                    if (seg_frame_len as u32) > dbg.tx_max_frame {
+                        dbg.tx_max_frame = seg_frame_len as u32;
+                    }
                 }
                 copied_source_frame = true;
                 if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
                     let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
                 }
+            }
+            // Track when segmentation was needed but returned None
+            if !copied_source_frame && request.source_frame.len() > 1514 {
+                dbg.seg_needed_but_none += 1;
+                thread_local! {
+                    static SEG_MISS_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+                }
+                SEG_MISS_LOG.with(|c| {
+                    let n = c.get();
+                    if n < 20 {
+                        c.set(n + 1);
+                        let egress_mtu = forwarding
+                            .egress
+                            .get(&request.decision.resolution.egress_ifindex)
+                            .or_else(|| forwarding.egress.get(&request.decision.resolution.tx_ifindex))
+                            .map(|e| e.mtu);
+                        eprintln!(
+                            "DBG SEG_MISS[{}]: frame_len={} proto={} egress_if={} tx_if={} egress_mtu={:?} \
+                             target_if={} src_frame_bytes={}",
+                            n, request.source_frame.len(), request.meta.protocol,
+                            request.decision.resolution.egress_ifindex,
+                            request.decision.resolution.tx_ifindex,
+                            egress_mtu, request.target_ifindex,
+                            request.source_frame.len(),
+                        );
+                    }
+                });
             }
             if !copied_source_frame {
                 /*
@@ -2519,6 +3157,12 @@ fn enqueue_pending_forwards(
                                 });
                             bound_pending_tx_prepared(target_binding);
                             target_binding.live.in_place_tx_packets.fetch_add(1, Ordering::Relaxed);
+                            dbg.enqueue_ok += 1;
+                            dbg.enqueue_inplace += 1;
+                            dbg.tx_bytes_total += frame_len as u64;
+                            if frame_len > dbg.tx_max_frame {
+                                dbg.tx_max_frame = frame_len;
+                            }
                             retained_source_frame = true;
                         }
                         None => match build_forwarded_frame_from_frame(
@@ -2553,12 +3197,13 @@ fn enqueue_pending_forwards(
                                     build_failed = true;
                                     continue;
                                 }
-                                if frame.len() > tx_frame_capacity() {
+                                let cp1_len = frame.len();
+                                if cp1_len > tx_frame_capacity() {
                                     record_exception(
                                         recent_exceptions,
                                         ingress_ident,
                                         "oversized_forward_frame",
-                                        frame.len() as u32,
+                                        cp1_len as u32,
                                         Some(request.meta),
                                         None,
                                     );
@@ -2573,6 +3218,12 @@ fn enqueue_pending_forwards(
                                 });
                                 bound_pending_tx_local(target_binding);
                                 bound_pending_tx_prepared(target_binding);
+                                dbg.enqueue_ok += 1;
+                                dbg.enqueue_copy += 1;
+                                dbg.tx_bytes_total += cp1_len as u64;
+                                if (cp1_len as u32) > dbg.tx_max_frame {
+                                    dbg.tx_max_frame = cp1_len as u32;
+                                }
                             }
                             None => {
                                 build_failed = true;
@@ -2581,14 +3232,36 @@ fn enqueue_pending_forwards(
                         },
                     }
                 } else {
-                    match build_forwarded_frame_from_frame(
-                        &request.source_frame,
-                        request.meta,
-                        &request.decision,
-                        forwarding,
-                        expected_ports,
-                    ) {
-                        Some(frame) => {
+                    // Direct TX build: write the forwarded frame directly into
+                    // the target binding's UMEM TX frame, eliminating the
+                    // intermediate Vec allocation and one memcpy.
+                    let direct_built = if let Some(tx_offset) = target_binding.free_tx_frames.pop_front() {
+                        let target_area = &target_binding.umem.area;
+                        let written = unsafe {
+                            target_area.slice_mut_unchecked(tx_offset as usize, tx_frame_capacity())
+                        }
+                        .and_then(|out| {
+                            build_forwarded_frame_into_from_frame(
+                                out,
+                                &request.source_frame,
+                                request.meta,
+                                &request.decision,
+                                expected_ports,
+                            )
+                        });
+                        if let Some(written) = written {
+                            let built_ports = {
+                                let built_frame = unsafe {
+                                    target_area.slice_mut_unchecked(tx_offset as usize, written)
+                                };
+                                built_frame.and_then(|f| {
+                                    live_frame_ports_bytes(
+                                        f,
+                                        request.meta.addr_family,
+                                        request.meta.protocol,
+                                    )
+                                })
+                            };
                             if let Some(reason) = forward_tuple_mismatch_reason(
                                 live_frame_ports_bytes(
                                     &request.source_frame,
@@ -2596,47 +3269,124 @@ fn enqueue_pending_forwards(
                                     request.meta.protocol,
                                 ),
                                 expected_ports,
-                                live_frame_ports_bytes(
-                                    &frame,
-                                    request.meta.addr_family,
-                                    request.meta.protocol,
-                                ),
+                                built_ports,
                             ) {
+                                target_binding.free_tx_frames.push_front(tx_offset);
                                 record_exception(
                                     recent_exceptions,
                                     ingress_ident,
                                     &reason,
-                                    frame.len() as u32,
+                                    written as u32,
                                     Some(request.meta),
                                     None,
                                 );
                                 build_failed = true;
-                                continue;
-                            }
-                            if frame.len() > tx_frame_capacity() {
+                                true
+                            } else if written > tx_frame_capacity() {
+                                target_binding.free_tx_frames.push_front(tx_offset);
                                 record_exception(
                                     recent_exceptions,
                                     ingress_ident,
                                     "oversized_forward_frame",
-                                    frame.len() as u32,
+                                    written as u32,
                                     Some(request.meta),
                                     None,
                                 );
-                                continue;
+                                true
+                            } else {
+                                target_binding
+                                    .pending_tx_prepared
+                                    .push_back(PreparedTxRequest {
+                                        offset: tx_offset,
+                                        len: written as u32,
+                                        recycle_slot: None,
+                                        expected_ports,
+                                        expected_addr_family: request.meta.addr_family,
+                                        expected_protocol: request.meta.protocol,
+                                        flow_key: request.flow_key.clone(),
+                                    });
+                                bound_pending_tx_prepared(target_binding);
+                                dbg.enqueue_ok += 1;
+                                dbg.enqueue_direct += 1;
+                                dbg.tx_bytes_total += written as u64;
+                                if (written as u32) > dbg.tx_max_frame {
+                                    dbg.tx_max_frame = written as u32;
+                                }
+                                true
                             }
-                            target_binding.pending_tx_local.push_back(TxRequest {
-                                bytes: frame,
-                                expected_ports,
-                                expected_addr_family: request.meta.addr_family,
-                                expected_protocol: request.meta.protocol,
-                                flow_key: request.flow_key.clone(),
-                            });
-                            bound_pending_tx_local(target_binding);
-                            bound_pending_tx_prepared(target_binding);
+                        } else {
+                            target_binding.free_tx_frames.push_front(tx_offset);
+                            false
                         }
-                        None => {
-                            build_failed = true;
-                            fallback_to_slow_path = true;
+                    } else {
+                        false
+                    };
+                    // Fallback: Vec copy path when direct build unavailable.
+                    if !direct_built {
+                        match build_forwarded_frame_from_frame(
+                            &request.source_frame,
+                            request.meta,
+                            &request.decision,
+                            forwarding,
+                            expected_ports,
+                        ) {
+                            Some(frame) => {
+                                if let Some(reason) = forward_tuple_mismatch_reason(
+                                    live_frame_ports_bytes(
+                                        &request.source_frame,
+                                        request.meta.addr_family,
+                                        request.meta.protocol,
+                                    ),
+                                    expected_ports,
+                                    live_frame_ports_bytes(
+                                        &frame,
+                                        request.meta.addr_family,
+                                        request.meta.protocol,
+                                    ),
+                                ) {
+                                    record_exception(
+                                        recent_exceptions,
+                                        ingress_ident,
+                                        &reason,
+                                        frame.len() as u32,
+                                        Some(request.meta),
+                                        None,
+                                    );
+                                    build_failed = true;
+                                    continue;
+                                }
+                                let cp2_len = frame.len();
+                                if cp2_len > tx_frame_capacity() {
+                                    record_exception(
+                                        recent_exceptions,
+                                        ingress_ident,
+                                        "oversized_forward_frame",
+                                        cp2_len as u32,
+                                        Some(request.meta),
+                                        None,
+                                    );
+                                    continue;
+                                }
+                                target_binding.pending_tx_local.push_back(TxRequest {
+                                    bytes: frame,
+                                    expected_ports,
+                                    expected_addr_family: request.meta.addr_family,
+                                    expected_protocol: request.meta.protocol,
+                                    flow_key: request.flow_key.clone(),
+                                });
+                                bound_pending_tx_local(target_binding);
+                                bound_pending_tx_prepared(target_binding);
+                                dbg.enqueue_ok += 1;
+                                dbg.enqueue_copy += 1;
+                                dbg.tx_bytes_total += cp2_len as u64;
+                                if (cp2_len as u32) > dbg.tx_max_frame {
+                                    dbg.tx_max_frame = cp2_len as u32;
+                                }
+                            }
+                            None => {
+                                build_failed = true;
+                                fallback_to_slow_path = true;
+                            }
                         }
                     }
                 }
@@ -2650,6 +3400,13 @@ fn enqueue_pending_forwards(
         apply_shared_recycles(left, ingress_binding, right, &mut post_recycles);
         update_binding_debug_state(ingress_binding);
         if build_failed {
+            dbg.build_fail += 1;
+            if dbg.build_fail <= 3 {
+                eprintln!(
+                    "DBG BUILD_FAIL: target_ifindex={} len={} fallback_slow={}",
+                    request.target_ifindex, request.desc.len, fallback_to_slow_path,
+                );
+            }
             record_exception(
                 recent_exceptions,
                 ingress_ident,
@@ -2678,7 +3435,10 @@ fn enqueue_pending_forwards(
         if !retained_source_frame {
             ingress_binding.pending_fill_frames.push_back(source_offset);
         }
-        if ingress_binding.pending_fill_frames.len() >= FILL_DRAIN_WATERMARK {
+        // Always drain fill immediately — no watermark delay. In copy mode,
+        // the kernel queues packets in the socket buffer when the fill ring
+        // is low, causing latency spikes that stall TCP.
+        if !ingress_binding.pending_fill_frames.is_empty() {
             let _ = drain_pending_fill(ingress_binding, now_ns);
         }
         update_binding_debug_state(ingress_binding);
@@ -2981,6 +3741,95 @@ fn parse_session_flow(
     }
 }
 
+/// Check if a frame contains a TCP RST flag. Returns (is_rst, summary) for logging.
+fn frame_has_tcp_rst(frame: &[u8]) -> bool {
+    let l3 = match frame_l3_offset(frame) {
+        Some(off) => off,
+        None => return false,
+    };
+    let ip = match frame.get(l3..) {
+        Some(ip) if ip.len() >= 20 => ip,
+        _ => return false,
+    };
+    let (protocol, l4_offset) = match ip[0] >> 4 {
+        4 => {
+            let ihl = ((ip[0] & 0x0f) as usize) * 4;
+            (ip[9], ihl)
+        }
+        6 if ip.len() >= 40 => (ip[6], 40usize),
+        _ => return false,
+    };
+    if protocol != PROTO_TCP {
+        return false;
+    }
+    let tcp = match ip.get(l4_offset..) {
+        Some(t) if t.len() >= 14 => t,
+        _ => return false,
+    };
+    // TCP flags at offset 13: RST = 0x04
+    (tcp[13] & 0x04) != 0
+}
+
+/// Extract TCP flags and window from raw frame, auto-detecting L3 from Ethernet header.
+/// Returns (tcp_flags, tcp_window) or None.
+fn extract_tcp_flags_and_window(frame: &[u8]) -> Option<(u8, u16)> {
+    let l3 = frame_l3_offset(frame)?;
+    let ip = frame.get(l3..)?;
+    let (protocol, l4_offset) = match ip.first()? >> 4 {
+        4 => {
+            if ip.len() < 20 { return None; }
+            let ihl = ((ip[0] & 0x0f) as usize) * 4;
+            (ip[9], ihl)
+        }
+        6 => {
+            if ip.len() < 40 { return None; }
+            (ip[6], 40usize)
+        }
+        _ => return None,
+    };
+    if protocol != PROTO_TCP {
+        return None;
+    }
+    let tcp = ip.get(l4_offset..)?;
+    if tcp.len() < 16 {
+        return None;
+    }
+    let flags = tcp[13];
+    let window = u16::from_be_bytes([tcp[14], tcp[15]]);
+    Some((flags, window))
+}
+
+/// Extract TCP window size from raw frame data.
+/// Returns None if not a TCP frame or if frame is too short.
+fn extract_tcp_window(frame: &[u8], addr_family: u8) -> Option<u16> {
+    let l3 = match frame_l3_offset(frame) {
+        Some(off) => off,
+        None => return None,
+    };
+    let ip = frame.get(l3..)?;
+    let (protocol, l4_offset) = match addr_family as i32 {
+        libc::AF_INET => {
+            if ip.len() < 20 { return None; }
+            let ihl = ((ip[0] & 0x0f) as usize) * 4;
+            (ip[9], ihl)
+        }
+        libc::AF_INET6 => {
+            if ip.len() < 40 { return None; }
+            (ip[6], 40usize)
+        }
+        _ => return None,
+    };
+    if protocol != PROTO_TCP {
+        return None;
+    }
+    let tcp = ip.get(l4_offset..)?;
+    if tcp.len() < 16 {
+        return None;
+    }
+    // TCP window is at offset 14-15 (big-endian)
+    Some(u16::from_be_bytes([tcp[14], tcp[15]]))
+}
+
 fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     if frame.len() < 14 {
         return None;
@@ -2993,6 +3842,90 @@ fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
         return Some(18);
     }
     Some(14)
+}
+
+/// Decode an Ethernet frame into a human-readable summary showing IP src/dst,
+/// TCP/UDP ports, TCP flags, and checksums. For debugging packet forwarding.
+fn decode_frame_summary(frame: &[u8]) -> String {
+    let l3 = match frame_l3_offset(frame) {
+        Some(off) => off,
+        None => return String::new(),
+    };
+    let ip = &frame[l3..];
+    if ip.len() < 20 {
+        return String::new();
+    }
+    let version = ip[0] >> 4;
+    if version == 4 {
+        let ihl = ((ip[0] & 0x0f) as usize) * 4;
+        let total_len = u16::from_be_bytes([ip[2], ip[3]]);
+        let protocol = ip[9];
+        let ip_csum = u16::from_be_bytes([ip[10], ip[11]]);
+        let src = format!("{}.{}.{}.{}", ip[12], ip[13], ip[14], ip[15]);
+        let dst = format!("{}.{}.{}.{}", ip[16], ip[17], ip[18], ip[19]);
+        let ttl = ip[8];
+        if matches!(protocol, PROTO_TCP | PROTO_UDP) && ip.len() >= ihl + 8 {
+            let l4 = &ip[ihl..];
+            let sport = u16::from_be_bytes([l4[0], l4[1]]);
+            let dport = u16::from_be_bytes([l4[2], l4[3]]);
+            if protocol == PROTO_TCP && ip.len() >= ihl + 20 {
+                let seq = u32::from_be_bytes([l4[4], l4[5], l4[6], l4[7]]);
+                let ack = u32::from_be_bytes([l4[8], l4[9], l4[10], l4[11]]);
+                let flags = l4[13];
+                let tcp_csum = u16::from_be_bytes([l4[16], l4[17]]);
+                let flag_str = tcp_flags_str(flags);
+                format!(
+                    "IPv4 {}:{} -> {}:{} TCP [{flag_str}] seq={seq} ack={ack} ttl={ttl} ip_csum={ip_csum:#06x} tcp_csum={tcp_csum:#06x} ip_len={total_len}",
+                    src, sport, dst, dport,
+                )
+            } else if protocol == PROTO_UDP {
+                let udp_csum = u16::from_be_bytes([l4[6], l4[7]]);
+                format!(
+                    "IPv4 {}:{} -> {}:{} UDP ttl={ttl} ip_csum={ip_csum:#06x} udp_csum={udp_csum:#06x} ip_len={total_len}",
+                    src, sport, dst, dport,
+                )
+            } else {
+                format!("IPv4 {} -> {} proto={protocol} ttl={ttl} ip_len={total_len}", src, dst)
+            }
+        } else {
+            format!("IPv4 {} -> {} proto={protocol} ttl={ttl} ip_len={total_len}", src, dst)
+        }
+    } else if version == 6 && ip.len() >= 40 {
+        let payload_len = u16::from_be_bytes([ip[4], ip[5]]);
+        let next_header = ip[6];
+        let hop_limit = ip[7];
+        let src = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&ip[8..24]).unwrap_or([0; 16]));
+        let dst = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&ip[24..40]).unwrap_or([0; 16]));
+        if matches!(next_header, PROTO_TCP | PROTO_UDP) && ip.len() >= 48 {
+            let l4 = &ip[40..];
+            let sport = u16::from_be_bytes([l4[0], l4[1]]);
+            let dport = u16::from_be_bytes([l4[2], l4[3]]);
+            if next_header == PROTO_TCP && ip.len() >= 60 {
+                let flags = l4[13];
+                let flag_str = tcp_flags_str(flags);
+                format!("IPv6 [{src}]:{sport} -> [{dst}]:{dport} TCP [{flag_str}] hop={hop_limit} pl={payload_len}")
+            } else {
+                format!("IPv6 [{src}]:{sport} -> [{dst}]:{dport} proto={next_header} hop={hop_limit} pl={payload_len}")
+            }
+        } else {
+            format!("IPv6 [{src}] -> [{dst}] proto={next_header} hop={hop_limit} pl={payload_len}")
+        }
+    } else {
+        String::new()
+    }
+}
+
+fn tcp_flags_str(flags: u8) -> String {
+    let mut s = String::with_capacity(12);
+    if flags & 0x02 != 0 { s.push_str("SYN "); }
+    if flags & 0x10 != 0 { s.push_str("ACK "); }
+    if flags & 0x01 != 0 { s.push_str("FIN "); }
+    if flags & 0x04 != 0 { s.push_str("RST "); }
+    if flags & 0x08 != 0 { s.push_str("PSH "); }
+    if flags & 0x20 != 0 { s.push_str("URG "); }
+    if s.ends_with(' ') { s.truncate(s.len() - 1); }
+    if s.is_empty() { s.push_str("none"); }
+    s
 }
 
 fn frame_l4_offset(frame: &[u8], addr_family: u8) -> Option<usize> {
@@ -3442,6 +4375,14 @@ fn flush_session_deltas(
             push_recent_session_delta(&mut recent, info);
         }
         if delta.kind == SessionDeltaKind::Close {
+            eprintln!(
+                "SESS_DELETE: proto={} {}:{} -> {}:{} nat_src={:?} nat_dst={:?} bpf_entries_before={}",
+                delta.key.protocol,
+                delta.key.src_ip, delta.key.src_port,
+                delta.key.dst_ip, delta.key.dst_port,
+                delta.decision.nat.rewrite_src, delta.decision.nat.rewrite_dst,
+                count_bpf_session_entries(session_map_fd),
+            );
             delete_live_session_key(session_map_fd, &delta.key);
             remove_shared_session(shared_sessions, shared_nat_sessions, &delta.key);
             let reverse_key = reverse_session_key(&delta.key, delta.decision.nat);
@@ -3451,6 +4392,10 @@ fn flush_session_deltas(
             replicate_session_delete(
                 peer_worker_commands,
                 &reverse_session_key(&delta.key, delta.decision.nat),
+            );
+            eprintln!(
+                "SESS_DELETE_DONE: bpf_entries_after={}",
+                count_bpf_session_entries(session_map_fd),
             );
         }
     }
@@ -3484,6 +4429,7 @@ fn reap_tx_completions(binding: &mut BindingWorker, shared_recycles: &mut Vec<(u
     completed.release();
     drop(completed);
     binding.outstanding_tx = binding.outstanding_tx.saturating_sub(reaped);
+    binding.dbg_completions_reaped += reaped as u64;
     binding
         .live
         .tx_completions
@@ -3493,27 +4439,24 @@ fn reap_tx_completions(binding: &mut BindingWorker, shared_recycles: &mut Vec<(u
 }
 
 fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bool {
-    if binding.pending_fill_frames.is_empty() && binding.spare_fill_frames.is_empty() {
+    if binding.pending_fill_frames.is_empty() {
         return false;
     }
-    let batch_size = binding
-        .pending_fill_frames
-        .len()
-        .saturating_add(binding.spare_fill_frames.len())
-        .min(FILL_BATCH_SIZE);
+    let batch_size = binding.pending_fill_frames.len().min(FILL_BATCH_SIZE);
     binding.scratch_fill.clear();
-    let mut pending_taken = 0usize;
     while binding.scratch_fill.len() < batch_size {
         let Some(offset) = binding.pending_fill_frames.pop_front() else {
             break;
         };
-        binding.scratch_fill.push(offset);
-        pending_taken += 1;
-    }
-    while binding.scratch_fill.len() < batch_size {
-        let Some(offset) = binding.spare_fill_frames.pop_front() else {
-            break;
-        };
+        // Poison the frame before submitting to fill ring — the kernel should
+        // overwrite this with real packet data on RX. If we ever read back the
+        // poison pattern in the RX path, it means the kernel recycled a
+        // descriptor without writing packet data (stale/uninit frame).
+        if let Some(frame) = unsafe {
+            binding.umem.area.slice_mut_unchecked(offset as usize, 8)
+        } {
+            frame.copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes());
+        }
         binding.scratch_fill.push(offset);
     }
     if binding.scratch_fill.is_empty() {
@@ -3526,28 +4469,17 @@ fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bool {
         inserted
     };
     if inserted == 0 {
-        for (idx, offset) in binding.scratch_fill.drain(..).enumerate().rev() {
-            if idx < pending_taken {
-                binding.pending_fill_frames.push_front(offset);
-            } else {
-                binding.spare_fill_frames.push_front(offset);
-            }
+        binding.dbg_fill_failed += binding.scratch_fill.len() as u64;
+        for offset in binding.scratch_fill.drain(..).rev() {
+            binding.pending_fill_frames.push_front(offset);
         }
         return false;
     }
+    binding.dbg_fill_submitted += inserted as u64;
     if inserted < binding.scratch_fill.len() as u32 {
-        for (idx, offset) in binding
-            .scratch_fill
-            .drain(inserted as usize..)
-            .enumerate()
-            .rev()
-        {
-            let absolute_idx = inserted as usize + idx;
-            if absolute_idx < pending_taken {
-                binding.pending_fill_frames.push_front(offset);
-            } else {
-                binding.spare_fill_frames.push_front(offset);
-            }
+        binding.dbg_fill_failed += (binding.scratch_fill.len() as u32 - inserted) as u64;
+        for offset in binding.scratch_fill.drain(inserted as usize..).rev() {
+            binding.pending_fill_frames.push_front(offset);
         }
     }
     binding.scratch_fill.clear();
@@ -3557,10 +4489,13 @@ fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bool {
 }
 
 fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, now_ns: u64) {
-    if !binding.device.needs_wakeup() {
-        binding.empty_rx_polls = 0;
-        return;
-    }
+    // After submitting fill ring entries, we must kick NAPI so the driver
+    // consumes them and posts new RX WQEs. Without this, mlx5 increments
+    // rx_xsk_buff_alloc_err and silently drops all incoming packets.
+    //
+    // DeviceQueue::wake() calls poll(fd, events=0, timeout=0) — a literal
+    // no-op that does NOT trigger NAPI. We use sendto() instead, which
+    // triggers NAPI processing of both fill ring and TX ring entries.
     if !force {
         binding.empty_rx_polls = binding.empty_rx_polls.saturating_add(1);
         if binding.empty_rx_polls < RX_WAKE_IDLE_POLLS {
@@ -3570,7 +4505,24 @@ fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, now_ns: u64) {
             return;
         }
     }
-    binding.device.wake();
+    let fd = binding.device.as_raw_fd();
+    let rc = unsafe {
+        libc::sendto(
+            fd,
+            core::ptr::null_mut(),
+            0,
+            libc::MSG_DONTWAIT,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc >= 0 {
+        binding.dbg_rx_wake_sendto_ok += 1;
+    } else {
+        binding.dbg_rx_wake_sendto_err += 1;
+        binding.dbg_rx_wake_sendto_errno = unsafe { *libc::__errno_location() };
+    }
+    binding.dbg_rx_wakeups += 1;
     binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
     binding.last_rx_wake_ns = now_ns;
     binding.empty_rx_polls = 0;
@@ -3585,6 +4537,7 @@ fn pending_tx_capacity(ring_entries: u32) -> usize {
 fn bound_pending_tx_local(binding: &mut BindingWorker) {
     while binding.pending_tx_local.len() > binding.max_pending_tx {
         if binding.pending_tx_local.pop_front().is_some() {
+            binding.dbg_pending_overflow += 1;
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
             binding
                 .live
@@ -3597,6 +4550,7 @@ fn bound_pending_tx_prepared(binding: &mut BindingWorker) {
     let limit = binding.max_pending_tx;
     while binding.pending_tx_prepared.len() > limit {
         if let Some(req) = binding.pending_tx_prepared.pop_front() {
+            binding.dbg_pending_overflow += 1;
             recycle_cancelled_prepared(binding, &req);
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
             binding
@@ -3619,6 +4573,15 @@ fn drain_pending_tx(
         return false;
     }
     let mut did_work = reap_tx_completions(binding, shared_recycles) > 0;
+    // In copy mode, the kernel needs sendto() to process TX ring entries.
+    // If outstanding entries remain after reaping (kernel didn't finish in
+    // the previous kick), re-kick now so they don't stall forever.
+    if binding.outstanding_tx > 0
+        && binding.pending_tx_prepared.is_empty()
+        && binding.pending_tx_local.is_empty()
+    {
+        maybe_wake_tx(binding, false, now_ns);
+    }
     while !binding.pending_tx_prepared.is_empty() {
         match transmit_prepared_batch(binding, now_ns) {
             Ok((packets, bytes)) => {
@@ -3753,6 +4716,36 @@ fn transmit_batch(
             )));
         };
         frame.copy_from_slice(&req.bytes);
+        // RST detection: log when we're about to transmit a TCP RST
+        if frame_has_tcp_rst(&req.bytes) {
+            binding.dbg_tx_tcp_rst += 1;
+            thread_local! {
+                static TX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            TX_RST_LOG_COUNT.with(|c| {
+                let n = c.get();
+                if n < 50 {
+                    c.set(n + 1);
+                    let summary = decode_frame_summary(&req.bytes);
+                    eprintln!(
+                        "RST_DETECT TX[{}]: slot={} len={} {}",
+                        n,
+                        binding.slot,
+                        req.bytes.len(),
+                        summary,
+                    );
+                    if n < 5 {
+                        let hex_len = req.bytes.len().min(80);
+                        let hex: String = req.bytes[..hex_len]
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        eprintln!("RST_DETECT TX_HEX[{n}]: {hex}");
+                    }
+                }
+            });
+        }
         binding.scratch_local_tx.push((offset, req));
     }
 
@@ -3776,6 +4769,7 @@ fn transmit_batch(
     drop(writer);
 
     if inserted == 0 {
+        binding.dbg_tx_ring_full += 1;
         maybe_wake_tx(binding, true, now_ns);
         while let Some((offset, req)) = binding.scratch_local_tx.pop() {
             binding.free_tx_frames.push_front(offset);
@@ -3783,6 +4777,7 @@ fn transmit_batch(
         }
         return Err(TxError::Retry("tx ring insert failed".to_string()));
     }
+    binding.dbg_tx_ring_submitted += inserted as u64;
     binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
     let mut sent_packets = 0u64;
@@ -3852,6 +4847,39 @@ fn transmit_prepared_batch(
         }
     }
 
+    // RST detection on prepared TX path: check UMEM frames before submitting to TX ring
+    for req in &binding.scratch_prepared_tx {
+        if let Some(frame_data) = binding.umem.area.slice(req.offset as usize, req.len as usize) {
+            if frame_has_tcp_rst(frame_data) {
+                binding.dbg_tx_tcp_rst += 1;
+                thread_local! {
+                    static PREP_TX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+                }
+                PREP_TX_RST_LOG_COUNT.with(|c| {
+                    let n = c.get();
+                    if n < 50 {
+                        c.set(n + 1);
+                        let summary = decode_frame_summary(frame_data);
+                        eprintln!(
+                            "RST_DETECT PREP_TX[{}]: if={} q={} len={} {}",
+                            n, binding.identity().ifindex, binding.identity().queue_id,
+                            req.len, summary,
+                        );
+                        if n < 5 {
+                            let hex_len = (req.len as usize).min(frame_data.len()).min(80);
+                            let hex: String = frame_data[..hex_len]
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            eprintln!("RST_DETECT PREP_TX_HEX[{n}]: {hex}");
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     let mut writer = binding
         .tx
         .transmit(binding.scratch_prepared_tx.len() as u32);
@@ -3864,12 +4892,14 @@ fn transmit_prepared_batch(
     drop(writer);
 
     if inserted == 0 {
+        binding.dbg_tx_ring_full += 1;
         maybe_wake_tx(binding, true, now_ns);
         while let Some(req) = binding.scratch_prepared_tx.pop() {
             binding.pending_tx_prepared.push_front(req);
         }
         return Err(TxError::Retry("prepared tx ring insert failed".to_string()));
     }
+    binding.dbg_tx_ring_submitted += inserted as u64;
     binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
     let mut sent_packets = 0u64;
@@ -3904,7 +4934,44 @@ fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, now_ns: u64) {
         || force
         || now_ns.saturating_sub(binding.last_tx_wake_ns) >= TX_WAKE_MIN_INTERVAL_NS
     {
-        binding.tx.wake();
+        // Use direct sendto() instead of binding.tx.wake() so we can capture errors.
+        let fd = binding.tx.as_raw_fd();
+        let rc = unsafe {
+            libc::sendto(
+                fd,
+                core::ptr::null_mut(),
+                0,
+                libc::MSG_DONTWAIT,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        binding.dbg_sendto_calls += 1;
+        if rc < 0 {
+            let errno = unsafe { *libc::__errno_location() };
+            // EAGAIN/EWOULDBLOCK is normal for MSG_DONTWAIT; ENOBUFS means kernel dropped.
+            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                binding.dbg_sendto_eagain += 1;
+            } else if errno == libc::ENOBUFS {
+                binding.dbg_sendto_enobufs += 1;
+                if binding.dbg_sendto_enobufs <= 10 {
+                    eprintln!(
+                        "TX_ENOBUFS: slot={} if={} q={} outstanding_tx={} free_tx={}",
+                        binding.slot, binding.ifindex, binding.queue_id,
+                        binding.outstanding_tx, binding.free_tx_frames.len(),
+                    );
+                }
+            } else {
+                binding.dbg_sendto_err += 1;
+                if binding.dbg_sendto_err <= 5 {
+                    eprintln!(
+                        "DBG SENDTO_ERR: slot={} if={} q={} errno={} outstanding_tx={} free_tx={}",
+                        binding.slot, binding.ifindex, binding.queue_id,
+                        errno, binding.outstanding_tx, binding.free_tx_frames.len(),
+                    );
+                }
+            }
+        }
         binding.last_tx_wake_ns = now_ns;
     }
 }
@@ -4582,6 +5649,55 @@ fn worker_loop(
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
+    // Debug: periodic summary counters
+    let mut dbg_last_report_ns = monotonic_nanos();
+    let mut dbg_rx_total = 0u64;
+    let mut dbg_tx_total = 0u64;
+    let mut dbg_forward_total = 0u64;
+    let mut dbg_local_total = 0u64;
+    let mut dbg_session_hit = 0u64;
+    let mut dbg_session_miss = 0u64;
+    let mut dbg_session_create = 0u64;
+    let mut dbg_no_route = 0u64;
+    let mut dbg_missing_neigh = 0u64;
+    let mut dbg_policy_deny = 0u64;
+    let mut dbg_ha_inactive = 0u64;
+    let mut dbg_no_egress_binding = 0u64;
+    let mut dbg_build_fail = 0u64;
+    let mut dbg_tx_err = 0u64;
+    let mut dbg_metadata_err = 0u64;
+    let mut dbg_disposition_other = 0u64;
+    let mut dbg_enqueue_ok = 0u64;
+    let mut dbg_enqueue_inplace = 0u64;
+    let mut dbg_enqueue_direct = 0u64;
+    let mut dbg_enqueue_copy = 0u64;
+    let mut dbg_rx_from_trust = 0u64;
+    let mut dbg_rx_from_wan = 0u64;
+    let mut dbg_fwd_trust_to_wan = 0u64;
+    let mut dbg_fwd_wan_to_trust = 0u64;
+    let mut dbg_nat_snat = 0u64;
+    let mut dbg_nat_dnat = 0u64;
+    let mut dbg_nat_none = 0u64;
+    let mut dbg_frame_build_none = 0u64;
+    let mut dbg_rx_tcp_rst = 0u64;
+    let mut dbg_tx_tcp_rst = 0u64;
+    let mut dbg_rx_tcp_fin = 0u64;
+    let mut dbg_rx_tcp_synack = 0u64;
+    let mut dbg_rx_tcp_zero_window = 0u64;
+    let mut dbg_fwd_tcp_fin = 0u64;
+    let mut dbg_fwd_tcp_rst = 0u64;
+    let mut dbg_fwd_tcp_zero_window = 0u64;
+    let mut dbg_rx_bytes_total = 0u64;
+    let mut dbg_tx_bytes_total = 0u64;
+    let mut dbg_rx_oversized = 0u64;
+    let mut dbg_rx_max_frame = 0u32;
+    let mut dbg_tx_max_frame = 0u32;
+    let mut dbg_seg_needed_but_none = 0u64;
+    let mut prev_rx_total = 0u64;
+    let mut prev_fwd_total = 0u64;
+    let mut stall_prev_fwd = 0u64;
+    let mut stall_reported = false;
+    const DBG_REPORT_INTERVAL_NS: u64 = 1_000_000_000; // 1 second
     while !stop.load(Ordering::Relaxed) {
         let session_map_fd = bindings
             .first()
@@ -4602,6 +5718,7 @@ fn worker_loop(
             }
         }
         let mut did_work = false;
+        let mut dbg_poll = DebugPollCounters::default();
         for offset in 0..bindings.len() {
             let idx = if bindings.is_empty() {
                 0
@@ -4626,10 +5743,56 @@ fn worker_loop(
                 &last_resolution,
                 &peer_worker_commands,
                 &mut shared_recycles,
+                &mut dbg_poll,
             ) {
                 did_work = true;
             }
         }
+        dbg_rx_total += dbg_poll.rx;
+        dbg_tx_total += dbg_poll.tx;
+        dbg_forward_total += dbg_poll.forward;
+        dbg_local_total += dbg_poll.local;
+        dbg_session_hit += dbg_poll.session_hit;
+        dbg_session_miss += dbg_poll.session_miss;
+        dbg_session_create += dbg_poll.session_create;
+        dbg_no_route += dbg_poll.no_route;
+        dbg_missing_neigh += dbg_poll.missing_neigh;
+        dbg_policy_deny += dbg_poll.policy_deny;
+        dbg_ha_inactive += dbg_poll.ha_inactive;
+        dbg_no_egress_binding += dbg_poll.no_egress_binding;
+        dbg_build_fail += dbg_poll.build_fail;
+        dbg_tx_err += dbg_poll.tx_err;
+        dbg_metadata_err += dbg_poll.metadata_err;
+        dbg_disposition_other += dbg_poll.disposition_other;
+        dbg_enqueue_ok += dbg_poll.enqueue_ok;
+        dbg_enqueue_inplace += dbg_poll.enqueue_inplace;
+        dbg_enqueue_direct += dbg_poll.enqueue_direct;
+        dbg_enqueue_copy += dbg_poll.enqueue_copy;
+        dbg_rx_from_trust += dbg_poll.rx_from_trust;
+        dbg_rx_from_wan += dbg_poll.rx_from_wan;
+        dbg_fwd_trust_to_wan += dbg_poll.fwd_trust_to_wan;
+        dbg_fwd_wan_to_trust += dbg_poll.fwd_wan_to_trust;
+        dbg_nat_snat += dbg_poll.nat_applied_snat;
+        dbg_nat_dnat += dbg_poll.nat_applied_dnat;
+        dbg_nat_none += dbg_poll.nat_applied_none;
+        dbg_frame_build_none += dbg_poll.frame_build_none;
+        dbg_rx_tcp_rst += dbg_poll.rx_tcp_rst;
+        dbg_rx_tcp_fin += dbg_poll.rx_tcp_fin;
+        dbg_rx_tcp_synack += dbg_poll.rx_tcp_synack;
+        dbg_rx_tcp_zero_window += dbg_poll.rx_tcp_zero_window;
+        dbg_fwd_tcp_fin += dbg_poll.fwd_tcp_fin;
+        dbg_fwd_tcp_rst += dbg_poll.fwd_tcp_rst;
+        dbg_fwd_tcp_zero_window += dbg_poll.fwd_tcp_zero_window;
+        dbg_rx_bytes_total += dbg_poll.rx_bytes_total;
+        dbg_tx_bytes_total += dbg_poll.tx_bytes_total;
+        dbg_rx_oversized += dbg_poll.rx_oversized;
+        if dbg_poll.rx_max_frame > dbg_rx_max_frame {
+            dbg_rx_max_frame = dbg_poll.rx_max_frame;
+        }
+        if dbg_poll.tx_max_frame > dbg_tx_max_frame {
+            dbg_tx_max_frame = dbg_poll.tx_max_frame;
+        }
+        dbg_seg_needed_but_none += dbg_poll.seg_needed_but_none;
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
         }
@@ -4648,6 +5811,318 @@ fn worker_loop(
                     &recent_session_deltas,
                     &peer_worker_commands,
                 );
+            }
+        }
+        // Debug: periodic summary report
+        {
+            let elapsed = loop_now_ns.saturating_sub(dbg_last_report_ns);
+            if elapsed >= DBG_REPORT_INTERVAL_NS {
+                let secs = elapsed as f64 / 1_000_000_000.0;
+                let session_count = sessions.len();
+                let mut binding_summary = String::new();
+                for (i, b) in bindings.iter().enumerate() {
+                    use std::fmt::Write;
+                    let fill_pending = b.device.pending();
+                    let rx_avail = b.rx.available();
+                    let xsk_stats = b.device.statistics_v2().ok();
+                    let inflight_recycles = b.in_flight_forward_recycles.len() as u32;
+                    let scratch_recycle_len = b.scratch_recycle.len() as u32;
+                    let ptx_prepared = b.pending_tx_prepared.len() as u32;
+                    let ptx_local = b.pending_tx_local.len() as u32;
+                    let total_accounted = b.pending_fill_frames.len() as u32
+                        + fill_pending
+                        + rx_avail
+                        + b.free_tx_frames.len() as u32
+                        + b.outstanding_tx
+                        + inflight_recycles
+                        + scratch_recycle_len
+                        + ptx_prepared; // prepared TX holds UMEM frames
+                    let expected_total = b.umem.total_frames;
+                    let _ = write!(
+                        binding_summary,
+                        " [{}:if{}q{} pfill={} fring={} rxring={} free_tx={} otx={} ifl={} scr={} ptxp={} ptxl={} total={}/{} fill_ok={} polls={} bp={} rx_empty={} wake={}",
+                        i,
+                        b.ifindex,
+                        b.queue_id,
+                        b.pending_fill_frames.len(),
+                        fill_pending,
+                        rx_avail,
+                        b.free_tx_frames.len(),
+                        b.outstanding_tx,
+                        inflight_recycles,
+                        scratch_recycle_len,
+                        ptx_prepared,
+                        ptx_local,
+                        total_accounted,
+                        expected_total,
+                        b.dbg_fill_submitted,
+                        b.dbg_poll_cycles,
+                        b.dbg_backpressure,
+                        b.dbg_rx_empty,
+                        b.dbg_rx_wakeups,
+                    );
+                    // TX pipeline debug counters
+                    dbg_tx_tcp_rst += b.dbg_tx_tcp_rst;
+                    let _ = write!(
+                        binding_summary,
+                        " TX:ring_sub={}/ring_full={}/compl={}/sendto={}/err={}/eagain={}/enobufs={}/overflow={}/rst={}",
+                        b.dbg_tx_ring_submitted, b.dbg_tx_ring_full, b.dbg_completions_reaped,
+                        b.dbg_sendto_calls, b.dbg_sendto_err, b.dbg_sendto_eagain, b.dbg_sendto_enobufs,
+                        b.dbg_pending_overflow, b.dbg_tx_tcp_rst,
+                    );
+                    if let Some(s) = xsk_stats {
+                        let _ = write!(
+                            binding_summary,
+                            " xsk:drop={}/inv={}/rfull={}/fempty={}/tinv={}/tempty={}",
+                            s.rx_dropped, s.rx_invalid_descs, s.rx_ring_full,
+                            s.rx_fill_ring_empty_descs, s.tx_invalid_descs, s.tx_ring_empty_descs,
+                        );
+                    }
+                    // Socket error check (SO_ERROR) — detect kernel-side errors
+                    {
+                        let fd = b.rx.as_raw_fd();
+                        let mut so_err: c_int = 0;
+                        let mut so_err_len: libc::socklen_t = core::mem::size_of::<c_int>() as _;
+                        let rc = unsafe {
+                            libc::getsockopt(
+                                fd,
+                                libc::SOL_SOCKET,
+                                libc::SO_ERROR,
+                                &mut so_err as *mut c_int as *mut c_void,
+                                &mut so_err_len,
+                            )
+                        };
+                        if rc == 0 && so_err != 0 {
+                            let _ = write!(binding_summary, " SO_ERR={so_err}");
+                        }
+                    }
+                    // Ring diagnostics from xdpilone API
+                    let _ = write!(
+                        binding_summary,
+                        " RING:rx_nz={}/rx_max={}/fill_pend={}/dev_avail={} RX_WAKE:ok={}/err={}/errno={}",
+                        b.dbg_rx_avail_nonzero, b.dbg_rx_avail_max,
+                        b.dbg_fill_pending, b.dbg_device_avail,
+                        b.dbg_rx_wake_sendto_ok, b.dbg_rx_wake_sendto_err, b.dbg_rx_wake_sendto_errno,
+                    );
+                    // Direct mmap diagnosis: read raw ring producer/consumer
+                    if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) =
+                        diagnose_raw_ring_state(b.rx.as_raw_fd())
+                    {
+                        let _ = write!(
+                            binding_summary,
+                            " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}"
+                        );
+                    }
+                    // Frame leak detection
+                    if total_accounted != expected_total {
+                        let _ = write!(
+                            binding_summary,
+                            " FRAME_LEAK:{}",
+                            expected_total as i64 - total_accounted as i64,
+                        );
+                    }
+                    binding_summary.push(']');
+                }
+                eprintln!(
+                    "DBG w{}: {:.1}s rx={} tx={} fwd={} local={} sess_hit={} sess_miss={} sess_create={} \
+                     no_route={} miss_neigh={} pol_deny={} ha_inact={} no_egress={} build_fail={} \
+                     tx_err={} meta_err={} other={} enq_ok={} enq_ip={} enq_dir={} enq_cp={} sessions={} \
+                     DIR:trust_rx={}/wan_rx={}/t2w={}/w2t={} NAT:snat={}/dnat={}/none={}/bld_none={} RST:rx={}/tx={} \
+                     SIZE:rx_avg={}/rx_max={}/tx_avg={}/tx_max={}/rx_over={}/seg_miss={} \
+                     TCP_RX:fin={}/synack={}/zwin={} TCP_FWD:fin={}/rst={}/zwin={} \
+                     CSUM:verified={}/bad_ip={}/bad_l4={} \
+                     SESS_BPF:verify_ok={}/verify_fail={}/bpf_entries={} bindings:{}",
+                    worker_id,
+                    secs,
+                    dbg_rx_total,
+                    dbg_tx_total,
+                    dbg_forward_total,
+                    dbg_local_total,
+                    dbg_session_hit,
+                    dbg_session_miss,
+                    dbg_session_create,
+                    dbg_no_route,
+                    dbg_missing_neigh,
+                    dbg_policy_deny,
+                    dbg_ha_inactive,
+                    dbg_no_egress_binding,
+                    dbg_build_fail,
+                    dbg_tx_err,
+                    dbg_metadata_err,
+                    dbg_disposition_other,
+                    dbg_enqueue_ok,
+                    dbg_enqueue_inplace,
+                    dbg_enqueue_direct,
+                    dbg_enqueue_copy,
+                    session_count,
+                    dbg_rx_from_trust, dbg_rx_from_wan,
+                    dbg_fwd_trust_to_wan, dbg_fwd_wan_to_trust,
+                    dbg_nat_snat, dbg_nat_dnat, dbg_nat_none, dbg_frame_build_none,
+                    dbg_rx_tcp_rst, dbg_tx_tcp_rst,
+                    if dbg_rx_total > 0 { dbg_rx_bytes_total / dbg_rx_total } else { 0 },
+                    dbg_rx_max_frame,
+                    if dbg_enqueue_ok > 0 { dbg_tx_bytes_total / dbg_enqueue_ok } else { 0 },
+                    dbg_tx_max_frame,
+                    dbg_rx_oversized,
+                    dbg_seg_needed_but_none,
+                    dbg_rx_tcp_fin, dbg_rx_tcp_synack, dbg_rx_tcp_zero_window,
+                    dbg_fwd_tcp_fin, dbg_fwd_tcp_rst, dbg_fwd_tcp_zero_window,
+                    CSUM_VERIFIED_TOTAL.swap(0, Ordering::Relaxed),
+                    CSUM_BAD_IP_TOTAL.swap(0, Ordering::Relaxed),
+                    CSUM_BAD_L4_TOTAL.swap(0, Ordering::Relaxed),
+                    SESSION_PUBLISH_VERIFY_OK.swap(0, Ordering::Relaxed),
+                    SESSION_PUBLISH_VERIFY_FAIL.swap(0, Ordering::Relaxed),
+                    if let Some(b) = bindings.first() {
+                        count_bpf_session_entries(b.session_map_fd)
+                    } else { 0 },
+                    binding_summary,
+                );
+                // Print XDP shim fallback stats — tells us WHY packets stop
+                // being redirected to XSK.
+                if let Some(stats) = read_fallback_stats() {
+                    if !stats.is_empty() {
+                        let s: Vec<String> = stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
+                        eprintln!("DBG w{}: XDP_FALLBACK: {}", worker_id, s.join(" "));
+                    }
+                }
+                // Save prev counters BEFORE reset for stall detection below
+                prev_rx_total = dbg_rx_total;
+                prev_fwd_total = dbg_forward_total;
+                dbg_last_report_ns = loop_now_ns;
+                dbg_rx_total = 0;
+                dbg_tx_total = 0;
+                dbg_forward_total = 0;
+                dbg_local_total = 0;
+                dbg_session_hit = 0;
+                dbg_session_miss = 0;
+                dbg_session_create = 0;
+                dbg_no_route = 0;
+                dbg_missing_neigh = 0;
+                dbg_policy_deny = 0;
+                dbg_ha_inactive = 0;
+                dbg_no_egress_binding = 0;
+                dbg_build_fail = 0;
+                dbg_tx_err = 0;
+                dbg_metadata_err = 0;
+                dbg_disposition_other = 0;
+                dbg_enqueue_ok = 0;
+                dbg_enqueue_inplace = 0;
+                dbg_enqueue_direct = 0;
+                dbg_enqueue_copy = 0;
+                dbg_rx_from_trust = 0;
+                dbg_rx_from_wan = 0;
+                dbg_fwd_trust_to_wan = 0;
+                dbg_fwd_wan_to_trust = 0;
+                dbg_rx_bytes_total = 0;
+                dbg_tx_bytes_total = 0;
+                dbg_rx_oversized = 0;
+                dbg_rx_max_frame = 0;
+                dbg_tx_max_frame = 0;
+                dbg_seg_needed_but_none = 0;
+                // Stall detection: stall_prev_fwd is PREVIOUS interval's fwd count,
+                // prev_fwd_total is THIS interval's fwd count (saved before reset).
+                if stall_prev_fwd > 10 && prev_fwd_total == 0 && !stall_reported {
+                    stall_reported = true;
+                    eprintln!("DBG STALL_DETECTED: w{} two_ago_fwd={} this_interval_fwd={} this_interval_rx={} sessions={}",
+                        worker_id, stall_prev_fwd, prev_fwd_total, prev_rx_total, session_count);
+                    // Dump comprehensive per-binding state at stall moment
+                    for (si, sb) in bindings.iter().enumerate() {
+                        use std::fmt::Write;
+                        let fill_p = sb.device.pending();
+                        let rx_a = sb.rx.available();
+                        let ifl = sb.in_flight_forward_recycles.len() as u32;
+                        let ptxp = sb.pending_tx_prepared.len() as u32;
+                        let ptxl = sb.pending_tx_local.len() as u32;
+                        let total = sb.pending_fill_frames.len() as u32
+                            + fill_p + rx_a + sb.free_tx_frames.len() as u32
+                            + sb.outstanding_tx + ifl + sb.scratch_recycle.len() as u32 + ptxp;
+                        let raw = diagnose_raw_ring_state(sb.rx.as_raw_fd());
+                        let mut stall_line = format!(
+                            "DBG STALL_BINDING[{}]: if={} q={} pfill={} fring={} rxring={} free_tx={} otx={} ifl={} ptxp={} ptxl={} total={}/{}",
+                            si, sb.ifindex, sb.queue_id,
+                            sb.pending_fill_frames.len(), fill_p, rx_a,
+                            sb.free_tx_frames.len(), sb.outstanding_tx, ifl,
+                            ptxp, ptxl, total, sb.umem.total_frames,
+                        );
+                        if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) = raw {
+                            let _ = write!(stall_line,
+                                " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}");
+                        }
+                        if let Ok(Some(stats)) = sb.device.statistics_v2().map(Some) {
+                            let _ = write!(stall_line,
+                                " xsk:drop={}/rfull={}/fempty={}/tempty={}",
+                                stats.rx_dropped, stats.rx_ring_full,
+                                stats.rx_fill_ring_empty_descs, stats.tx_ring_empty_descs);
+                        }
+                        eprintln!("{stall_line}");
+                    }
+                    // Dump all session keys for this worker
+                    let mut sess_dump = String::new();
+                    let mut count = 0;
+                    sessions.iter(|key, decision, metadata| {
+                        if count < 20 {
+                            use std::fmt::Write;
+                            let _ = write!(sess_dump,
+                                "\n  SESS: {}:{} -> {}:{} proto={} nat=({:?},{:?}) is_rev={}",
+                                key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+                                key.protocol, decision.nat.rewrite_src, decision.nat.rewrite_dst,
+                                metadata.is_reverse,
+                            );
+                            count += 1;
+                        }
+                    });
+                    if !sess_dump.is_empty() {
+                        eprintln!("DBG STALL_SESSIONS:{sess_dump}");
+                    }
+                    // Dump fallback stats at stall time
+                    if let Some(stats) = read_fallback_stats() {
+                        if !stats.is_empty() {
+                            let s: Vec<String> = stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
+                            eprintln!("DBG STALL_FALLBACK: {}", s.join(" "));
+                        }
+                    }
+                    // Also dump BPF session count
+                    if let Some(b) = bindings.first() {
+                        eprintln!("DBG STALL_BPF_SESSIONS: entries={}", count_bpf_session_entries(b.session_map_fd));
+                    }
+                } else if prev_fwd_total > 0 {
+                    stall_reported = false;
+                }
+                stall_prev_fwd = prev_fwd_total;
+                dbg_nat_snat = 0;
+                dbg_nat_dnat = 0;
+                dbg_nat_none = 0;
+                dbg_frame_build_none = 0;
+                dbg_rx_tcp_rst = 0;
+                dbg_tx_tcp_rst = 0;
+                dbg_rx_tcp_fin = 0;
+                dbg_rx_tcp_synack = 0;
+                dbg_rx_tcp_zero_window = 0;
+                dbg_fwd_tcp_fin = 0;
+                dbg_fwd_tcp_rst = 0;
+                dbg_fwd_tcp_zero_window = 0;
+                for b in bindings.iter_mut() {
+                    b.dbg_fill_submitted = 0;
+                    b.dbg_fill_failed = 0;
+                    b.dbg_poll_cycles = 0;
+                    b.dbg_backpressure = 0;
+                    b.dbg_rx_empty = 0;
+                    b.dbg_rx_wakeups = 0;
+                    b.dbg_tx_ring_submitted = 0;
+                    b.dbg_tx_ring_full = 0;
+                    b.dbg_completions_reaped = 0;
+                    b.dbg_sendto_calls = 0;
+                    b.dbg_sendto_err = 0;
+                    b.dbg_sendto_eagain = 0;
+                    b.dbg_sendto_enobufs = 0;
+                    b.dbg_pending_overflow = 0;
+                    b.dbg_tx_tcp_rst = 0;
+                    b.dbg_rx_avail_nonzero = 0;
+                    b.dbg_rx_avail_max = 0;
+                    b.dbg_rx_wake_sendto_ok = 0;
+                    b.dbg_rx_wake_sendto_err = 0;
+                    b.dbg_rx_wake_sendto_errno = 0;
+                }
             }
         }
         if did_work {
@@ -4970,7 +6445,157 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     state.policy = parse_policy_state(&snapshot.default_policy, &snapshot.policies);
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.source_nat_rules = parse_source_nat_rules(&snapshot.source_nat_rules);
+
+    // Debug: dump zone mappings and policy rules
+    eprintln!("FWD_STATE: ifindex_to_zone={:?}", state.ifindex_to_zone);
+    eprintln!("FWD_STATE: egress keys={:?}", state.egress.keys().collect::<Vec<_>>());
+    for (ifidx, eg) in &state.egress {
+        eprintln!(
+            "FWD_STATE: egress[{}] bind={} zone={} vlan={} mtu={}",
+            ifidx, eg.bind_ifindex, eg.zone, eg.vlan_id, eg.mtu,
+        );
+    }
+    eprintln!(
+        "FWD_STATE: policy default={:?} rules={}",
+        state.policy.default_action,
+        state.policy.rules.len(),
+    );
+    for (i, rule) in state.policy.rules.iter().enumerate() {
+        eprintln!(
+            "FWD_STATE: policy[{}] {}->{}  action={:?} src_v4={} dst_v4={} apps={}",
+            i, rule.from_zone, rule.to_zone, rule.action,
+            rule.source_v4.len(), rule.destination_v4.len(),
+            rule.applications.len(),
+        );
+    }
+    eprintln!(
+        "FWD_STATE: local_v4={:?} interface_nat_v4={:?}",
+        state.local_v4, state.interface_nat_v4,
+    );
+    eprintln!(
+        "FWD_STATE: snat_rules={} connected_v4={} routes_v4={}",
+        state.source_nat_rules.len(),
+        state.connected_v4.len(),
+        state.routes_v4.values().map(|v| v.len()).sum::<usize>(),
+    );
+
+    // Install nftables rules to suppress kernel TCP RSTs from SNAT IPs.
+    //
+    // When the AF_XDP fill ring momentarily runs dry under high load,
+    // the mlx5 driver falls back to the regular RX path. Those leaked
+    // packets reach the kernel TCP stack which — having no matching
+    // socket — sends RSTs to the server, killing the connection.
+    // Blocking outgoing RSTs for SNAT-managed IPs is a targeted fix:
+    // the DP handles all TCP state for those addresses.
+    install_kernel_rst_suppression(&state);
+
     state
+}
+
+/// Install nftables rules to DROP outgoing TCP RSTs from interface-NAT
+/// (SNAT) addresses.  These addresses are owned by the userspace
+/// dataplane; the kernel has no sockets for them and should never emit
+/// RSTs.
+fn install_kernel_rst_suppression(state: &ForwardingState) {
+    let v4_addrs: Vec<String> = state.interface_nat_v4.keys().map(|ip| ip.to_string()).collect();
+    let v6_addrs: Vec<String> = state.interface_nat_v6.keys().map(|ip| ip.to_string()).collect();
+
+    if v4_addrs.is_empty() && v6_addrs.is_empty() {
+        // No SNAT addresses — clean up any previous rules.
+        let _ = Command::new("nft")
+            .args(["delete", "table", "inet", "bpfrx_dp_rst"])
+            .output();
+        return;
+    }
+
+    let mut rules = Vec::new();
+    rules.push("table inet bpfrx_dp_rst {".to_string());
+    rules.push("  chain output {".to_string());
+    rules.push("    type filter hook output priority 0; policy accept;".to_string());
+    for addr in &v4_addrs {
+        rules.push(format!(
+            "    ip saddr {} tcp flags & rst == rst counter drop",
+            addr
+        ));
+    }
+    for addr in &v6_addrs {
+        rules.push(format!(
+            "    ip6 saddr {} tcp flags & rst == rst counter drop",
+            addr
+        ));
+    }
+    rules.push("  }".to_string());
+    rules.push("}".to_string());
+
+    let nft_conf = rules.join("\n") + "\n";
+    let flush_and_load = format!("flush ruleset inet bpfrx_dp_rst\n{nft_conf}");
+
+    // Attempt atomic replace: flush + load in one nft -f invocation.
+    // If the table doesn't exist yet, flush will fail, so try plain load.
+    let result = Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(flush_and_load.as_bytes())?;
+            }
+            child.wait_with_output()
+        });
+
+    match result {
+        Ok(output) if output.status.success() => {
+            eprintln!(
+                "RST_SUPPRESS: installed nftables rules for {} v4 + {} v6 SNAT addresses",
+                v4_addrs.len(),
+                v6_addrs.len()
+            );
+        }
+        _ => {
+            // Flush failed (table didn't exist) — try creating fresh.
+            let result = Command::new("nft")
+                .args(["-f", "-"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        stdin.write_all(nft_conf.as_bytes())?;
+                    }
+                    child.wait_with_output()
+                });
+            match result {
+                Ok(output) if output.status.success() => {
+                    eprintln!(
+                        "RST_SUPPRESS: installed nftables rules for {} v4 + {} v6 SNAT addresses",
+                        v4_addrs.len(),
+                        v6_addrs.len()
+                    );
+                }
+                Ok(output) => {
+                    eprintln!(
+                        "RST_SUPPRESS: nft failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Err(err) => {
+                    eprintln!("RST_SUPPRESS: failed to run nft: {err}");
+                }
+            }
+        }
+    }
+}
+
+/// Remove the nftables RST suppression table on shutdown.
+pub(crate) fn remove_kernel_rst_suppression() {
+    let _ = Command::new("nft")
+        .args(["delete", "table", "inet", "bpfrx_dp_rst"])
+        .output();
 }
 
 fn nat_translated_local_exclusions(
@@ -6270,7 +7895,34 @@ fn build_forwarded_frame_into_from_frame(
     if l3 >= frame.len() {
         return None;
     }
-    let payload = &frame[l3..];
+    let raw_payload = &frame[l3..];
+    // Trim Ethernet padding: use ip_total_len so we don't carry trailing
+    // pad bytes (small frames padded to 60/64 by hardware).
+    let payload = if raw_payload.len() >= 4 {
+        let ip_version = raw_payload[0] >> 4;
+        if ip_version == 4 {
+            let ip_total_len =
+                u16::from_be_bytes([raw_payload[2], raw_payload[3]]) as usize;
+            if ip_total_len > 0 && ip_total_len < raw_payload.len() {
+                &raw_payload[..ip_total_len]
+            } else {
+                raw_payload
+            }
+        } else if ip_version == 6 && raw_payload.len() >= 40 {
+            let ipv6_payload_len =
+                u16::from_be_bytes([raw_payload[4], raw_payload[5]]) as usize;
+            let ip6_total = 40 + ipv6_payload_len;
+            if ip6_total > 0 && ip6_total < raw_payload.len() {
+                &raw_payload[..ip6_total]
+            } else {
+                raw_payload
+            }
+        } else {
+            raw_payload
+        }
+    } else {
+        raw_payload
+    };
     let (src_mac, vlan_id, apply_nat) =
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
             (
@@ -6373,6 +8025,57 @@ fn build_forwarded_frame_into_from_frame(
         }
         _ => return None,
     }
+    // Debug: dump first N built frames' Ethernet + IP headers to see post-NAT on wire
+    thread_local! {
+        static BUILD_FWD_DBG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    BUILD_FWD_DBG_COUNT.with(|c| {
+        let n = c.get();
+        if n < 30 {
+            c.set(n + 1);
+            let pkt_detail = decode_frame_summary(out);
+            eprintln!(
+                "DBG BUILT_ETH[{}]: vlan={} frame_len={} proto={} {}",
+                n, vlan_id, frame_len, meta.protocol, pkt_detail,
+            );
+            // For the first 3 frames, also dump the full IP+TCP header hex
+            if n < 3 {
+                let dump_len = frame_len.min(out.len()).min(eth_len + 60);
+                let hex: String = out[..dump_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                eprintln!("DBG BUILT_HEX[{n}]: {hex}");
+            }
+        }
+    });
+    // Checksum verification: recompute from scratch and compare to incremental update.
+    verify_built_frame_checksums(&out[..frame_len]);
+
+    // RST corruption check: detect if frame building introduced a TCP RST
+    // that wasn't in the source frame.
+    let out_has_rst = frame_has_tcp_rst(&out[..frame_len]);
+    let in_has_rst = frame_has_tcp_rst(frame);
+    if out_has_rst && !in_has_rst {
+        thread_local! {
+            static BUILD_RST_CORRUPT_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        BUILD_RST_CORRUPT_COUNT.with(|c| {
+            let n = c.get();
+            if n < 20 {
+                c.set(n + 1);
+                let in_summary = decode_frame_summary(frame);
+                let out_summary = decode_frame_summary(&out[..frame_len]);
+                eprintln!(
+                    "RST_CORRUPT BUILD[{}]: frame build INTRODUCED RST! in=[{}] out=[{}]",
+                    n, in_summary, out_summary,
+                );
+                let in_hex_len = frame.len().min(80);
+                let in_hex: String = frame[..in_hex_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                let out_hex_len = frame_len.min(out.len()).min(80);
+                let out_hex: String = out[..out_hex_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                eprintln!("RST_CORRUPT IN_HEX[{n}]: {in_hex}");
+                eprintln!("RST_CORRUPT OUT_HEX[{n}]: {out_hex}");
+            }
+        });
+    }
     Some(frame_len)
 }
 
@@ -6427,7 +8130,26 @@ fn rewrite_forwarded_frame_in_place(
     if l3 >= current_len {
         return None;
     }
-    let payload_len = current_len.checked_sub(l3)?;
+    let mut payload_len = current_len.checked_sub(l3)?;
+    // Trim Ethernet padding: use ip_total_len when available so we don't
+    // carry trailing pad bytes (small frames padded to 60/64 by hardware).
+    if payload_len >= 4 {
+        let ip_version = frame[l3] >> 4;
+        if ip_version == 4 {
+            let ip_total_len =
+                u16::from_be_bytes([frame[l3 + 2], frame[l3 + 3]]) as usize;
+            if ip_total_len > 0 && ip_total_len < payload_len {
+                payload_len = ip_total_len;
+            }
+        } else if ip_version == 6 && payload_len >= 40 {
+            let ipv6_payload_len =
+                u16::from_be_bytes([frame[l3 + 4], frame[l3 + 5]]) as usize;
+            let ip6_total = 40 + ipv6_payload_len;
+            if ip6_total > 0 && ip6_total < payload_len {
+                payload_len = ip6_total;
+            }
+        }
+    }
     let (src_mac, vlan_id, apply_nat) =
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
             (
@@ -6532,6 +8254,37 @@ fn rewrite_forwarded_frame_in_place(
         }
         _ => return None,
     }
+    // Debug: dump first N in-place rewritten frames' Ethernet headers
+    thread_local! {
+        static INPLACE_FWD_DBG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    INPLACE_FWD_DBG_COUNT.with(|c| {
+        let n = c.get();
+        if n < 10 {
+            c.set(n + 1);
+            let hdr_len = eth_len.min(packet.len()).min(22);
+            let hdr_hex: String = packet[..hdr_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+            let ip_info = if meta.addr_family as i32 == libc::AF_INET && packet.len() >= ip_start + 20 {
+                format!("src={}.{}.{}.{} dst={}.{}.{}.{}",
+                    packet[ip_start+12], packet[ip_start+13], packet[ip_start+14], packet[ip_start+15],
+                    packet[ip_start+16], packet[ip_start+17], packet[ip_start+18], packet[ip_start+19])
+            } else if meta.addr_family as i32 == libc::AF_INET6 && packet.len() >= ip_start + 40 {
+                let s = &packet[ip_start+8..ip_start+24];
+                let d = &packet[ip_start+24..ip_start+40];
+                format!("src={:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x} dst={:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
+                    s[0],s[1],s[2],s[3],s[4],s[5],s[6],s[7],s[8],s[9],s[10],s[11],s[12],s[13],s[14],s[15],
+                    d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15])
+            } else {
+                "unknown-af".to_string()
+            };
+            eprintln!(
+                "DBG INPLACE_ETH[{}]: eth=[{}] vlan={} frame_len={} proto={} {}",
+                n, hdr_hex, vlan_id, frame_len, meta.protocol, ip_info,
+            );
+        }
+    });
+    // Checksum verification for in-place path.
+    verify_built_frame_checksums(&packet[..frame_len]);
     Some(frame_len as u32)
 }
 
@@ -7188,6 +8941,184 @@ fn recompute_l4_checksum_ipv6(packet: &mut [u8], protocol: u8) -> Option<()> {
     Some(())
 }
 
+/// Verify IP + TCP/UDP checksums on a fully-built forwarded frame.
+/// Returns (ip_ok, l4_ok). Logs mismatches for the first N frames.
+static CSUM_VERIFIED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CSUM_BAD_IP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CSUM_BAD_L4_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn verify_built_frame_checksums(frame: &[u8]) -> (bool, bool) {
+    let l3 = match frame_l3_offset(frame) {
+        Some(o) => o,
+        None => return (true, true),
+    };
+    let packet = match frame.get(l3..) {
+        Some(p) if p.len() >= 20 => p,
+        _ => return (true, true),
+    };
+    // Only handle IPv4 TCP for now (main traffic under test).
+    if (packet[0] >> 4) != 4 {
+        return (true, true);
+    }
+    let ihl = ((packet[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return (true, true);
+    }
+    let protocol = packet[9];
+    // --- IP header checksum verification ---
+    let ip_header = match packet.get(..ihl) {
+        Some(h) => h,
+        None => return (true, true),
+    };
+    let ip_csum_in_frame = u16::from_be_bytes([ip_header[10], ip_header[11]]);
+    // Compute from scratch: zero out checksum field, compute, compare.
+    let mut ip_scratch = [0u8; 60]; // max IHL = 60
+    let scratch = &mut ip_scratch[..ihl];
+    scratch.copy_from_slice(ip_header);
+    scratch[10] = 0;
+    scratch[11] = 0;
+    let expected_ip_csum = checksum16(scratch);
+    let ip_ok = ip_csum_in_frame == expected_ip_csum;
+
+    // --- IP total length consistency ---
+    let ip_total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    let actual_l3_len = packet.len();
+    if ip_total_len != actual_l3_len {
+        thread_local! {
+            static IP_LEN_MISMATCH_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        IP_LEN_MISMATCH_LOG.with(|c| {
+            let n = c.get();
+            if n < 20 {
+                c.set(n + 1);
+                let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+                let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+                eprintln!(
+                    "IP_LEN_MISMATCH[{}]: ip_total_len={} actual_l3_len={} frame_len={} l3={} src={} dst={} proto={}",
+                    n, ip_total_len, actual_l3_len, frame.len(), l3, src, dst, protocol,
+                );
+            }
+        });
+    }
+
+    // --- L4 checksum verification (TCP or UDP) ---
+    // Use ip_total_len to bound the L4 segment — Ethernet padding bytes beyond
+    // ip_total_len must NOT be included in the checksum pseudo-header or payload.
+    let l4_len = if ip_total_len > ihl { ip_total_len - ihl } else { 0 };
+    let l4_ok = if protocol == PROTO_TCP {
+        let segment = match packet.get(ihl..ihl + l4_len) {
+            Some(s) if s.len() >= 20 => s,
+            _ => return (ip_ok, true),
+        };
+        let tcp_csum_in_frame = u16::from_be_bytes([segment[16], segment[17]]);
+        let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+        let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+        // Build pseudo-header + TCP with checksum zeroed.
+        let mut pseudo = Vec::with_capacity(12 + segment.len());
+        pseudo.extend_from_slice(&src.octets());
+        pseudo.extend_from_slice(&dst.octets());
+        pseudo.push(0);
+        pseudo.push(PROTO_TCP);
+        pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
+        pseudo.extend_from_slice(segment);
+        // Zero the checksum field in pseudo buffer (offset 12 + 16 = 28..30).
+        let csum_off = 12 + 16;
+        if pseudo.len() > csum_off + 1 {
+            pseudo[csum_off] = 0;
+            pseudo[csum_off + 1] = 0;
+        }
+        let expected_tcp_csum = checksum16(&pseudo);
+        tcp_csum_in_frame == expected_tcp_csum
+    } else if protocol == PROTO_UDP {
+        let segment = match packet.get(ihl..ihl + l4_len) {
+            Some(s) if s.len() >= 8 => s,
+            _ => return (ip_ok, true),
+        };
+        let udp_csum_in_frame = u16::from_be_bytes([segment[6], segment[7]]);
+        if udp_csum_in_frame == 0 {
+            true // zero = no checksum
+        } else {
+            let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+            let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+            let mut pseudo = Vec::with_capacity(12 + segment.len());
+            pseudo.extend_from_slice(&src.octets());
+            pseudo.extend_from_slice(&dst.octets());
+            pseudo.push(0);
+            pseudo.push(PROTO_UDP);
+            pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
+            pseudo.extend_from_slice(segment);
+            let csum_off = 12 + 6;
+            if pseudo.len() > csum_off + 1 {
+                pseudo[csum_off] = 0;
+                pseudo[csum_off + 1] = 0;
+            }
+            let expected_udp_csum = checksum16(&pseudo);
+            let expected_udp_csum = if expected_udp_csum == 0 { 0xffff } else { expected_udp_csum };
+            udp_csum_in_frame == expected_udp_csum
+        }
+    } else {
+        true
+    };
+
+    CSUM_VERIFIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !ip_ok {
+        CSUM_BAD_IP_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    if !l4_ok {
+        CSUM_BAD_L4_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+
+    thread_local! {
+        static CSUM_VERIFY_COUNT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    if !ip_ok || !l4_ok {
+        CSUM_VERIFY_COUNT.with(|c| {
+            let (total_bad, logged) = c.get();
+            c.set((total_bad + 1, logged));
+            if logged < 30 {
+                c.set((total_bad + 1, logged + 1));
+                let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+                let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+                eprintln!(
+                    "CSUM_BAD[{}]: ip_ok={} l4_ok={} proto={} ip_in={:#06x} ip_exp={:#06x} \
+                     src={} dst={} frame_len={} l3={} ihl={}",
+                    total_bad, ip_ok, l4_ok, protocol,
+                    ip_csum_in_frame, expected_ip_csum,
+                    src, dst, frame.len(), l3, ihl,
+                );
+                if !l4_ok && protocol == PROTO_TCP {
+                    let segment = &packet[ihl..];
+                    let tcp_csum = u16::from_be_bytes([segment[16], segment[17]]);
+                    let tcp_src = u16::from_be_bytes([segment[0], segment[1]]);
+                    let tcp_dst = u16::from_be_bytes([segment[2], segment[3]]);
+                    // Recompute to show expected
+                    let mut pseudo = Vec::with_capacity(12 + segment.len());
+                    pseudo.extend_from_slice(&src.octets());
+                    pseudo.extend_from_slice(&dst.octets());
+                    pseudo.push(0);
+                    pseudo.push(PROTO_TCP);
+                    pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
+                    pseudo.extend_from_slice(segment);
+                    pseudo[12 + 16] = 0;
+                    pseudo[12 + 17] = 0;
+                    let expected = checksum16(&pseudo);
+                    eprintln!(
+                        "CSUM_BAD_TCP[{}]: sport={} dport={} csum_in={:#06x} csum_exp={:#06x} seg_len={}",
+                        total_bad, tcp_src, tcp_dst, tcp_csum, expected, segment.len(),
+                    );
+                    // Hex dump of first 60 bytes of frame for deep debug
+                    if logged < 5 {
+                        let hex_len = frame.len().min(80);
+                        let hex: String = frame[..hex_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                        eprintln!("CSUM_BAD_HEX[{}]: {}", total_bad, hex);
+                    }
+                }
+            }
+        });
+    }
+    (ip_ok, l4_ok)
+}
+
 enum ResolvedRouteV4 {
     Connected {
         ifindex: i32,
@@ -7283,6 +9214,81 @@ fn try_parse_metadata(area: &MmapArea, desc: XdpDesc) -> Option<UserspaceDpMeta>
     Some(meta)
 }
 
+/// Read raw RX ring producer/consumer and fill ring producer/consumer directly
+/// from the kernel's shared memory, bypassing xdpilone's caching. Uses a
+/// separate getsockopt + mmap to independently verify the ring state.
+/// Raw ring state: (rxP, rxC, frP, frC, txP, txC, crP, crC)
+fn diagnose_raw_ring_state(sock_fd: c_int) -> Option<(u32, u32, u32, u32, u32, u32, u32, u32)> {
+    // SOL_XDP = 283, XDP_MMAP_OFFSETS = 1
+    const SOL_XDP: i32 = 283;
+    const XDP_MMAP_OFFSETS: i32 = 1;
+    const XDP_PGOFF_RX_RING: i64 = 0;
+    const XDP_PGOFF_TX_RING: i64 = 0x80000000;
+    const XDP_UMEM_PGOFF_FILL_RING: i64 = 0x100000000;
+    const XDP_UMEM_PGOFF_COMPLETION_RING: i64 = 0x180000000;
+
+    // xdp_mmap_offsets_v2 (kernel >= 5.4): 4 rings × 4 fields × u64 each
+    #[repr(C)]
+    #[derive(Default)]
+    struct XdpRingOffset {
+        producer: u64,
+        consumer: u64,
+        desc: u64,
+        flags: u64,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct XdpMmapOffsets {
+        rx: XdpRingOffset,
+        tx: XdpRingOffset,
+        fr: XdpRingOffset,
+        cr: XdpRingOffset,
+    }
+
+    let mut off = XdpMmapOffsets::default();
+    let mut optlen = core::mem::size_of::<XdpMmapOffsets>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            sock_fd,
+            SOL_XDP,
+            XDP_MMAP_OFFSETS,
+            (&mut off as *mut XdpMmapOffsets).cast::<libc::c_void>(),
+            &mut optlen,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+
+    fn read_ring_pair(sock_fd: c_int, off: &XdpRingOffset, pgoff: i64) -> (u32, u32) {
+        let map_len = (off.desc.max(off.consumer).max(off.producer) + 8) as usize;
+        let mmap_ptr = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                sock_fd,
+                pgoff,
+            )
+        };
+        if mmap_ptr == libc::MAP_FAILED {
+            return (0, 0);
+        }
+        let prod = unsafe { *(mmap_ptr.byte_add(off.producer as usize) as *const u32) };
+        let cons = unsafe { *(mmap_ptr.byte_add(off.consumer as usize) as *const u32) };
+        unsafe { libc::munmap(mmap_ptr, map_len) };
+        (prod, cons)
+    }
+
+    let (rx_prod, rx_cons) = read_ring_pair(sock_fd, &off.rx, XDP_PGOFF_RX_RING);
+    let (fr_prod, fr_cons) = read_ring_pair(sock_fd, &off.fr, XDP_UMEM_PGOFF_FILL_RING);
+    let (tx_prod, tx_cons) = read_ring_pair(sock_fd, &off.tx, XDP_PGOFF_TX_RING);
+    let (cr_prod, cr_cons) = read_ring_pair(sock_fd, &off.cr, XDP_UMEM_PGOFF_COMPLETION_RING);
+
+    Some((rx_prod, rx_cons, fr_prod, fr_cons, tx_prod, tx_cons, cr_prod, cr_cons))
+}
+
 fn register_xsk_slot(map_fd: c_int, slot: u32, sock_fd: c_int) -> io::Result<()> {
     let rc = unsafe {
         libbpf_sys::bpf_map_update_elem(
@@ -7332,7 +9338,8 @@ fn delete_heartbeat_slot(map_fd: c_int, slot: u32) -> io::Result<()> {
 }
 
 fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
-    if now_ns.saturating_sub(binding.last_heartbeat_update_ns) < HEARTBEAT_UPDATE_INTERVAL_NS {
+    let age_ns = now_ns.saturating_sub(binding.last_heartbeat_update_ns);
+    if age_ns < HEARTBEAT_UPDATE_INTERVAL_NS {
         return;
     }
     match touch_heartbeat(
@@ -7341,10 +9348,37 @@ fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
         &binding.live,
         now_ns,
     ) {
-        Ok(()) => binding.last_heartbeat_update_ns = now_ns,
-        Err(err) => binding
-            .live
-            .set_error(format!("update heartbeat slot: {err}")),
+        Ok(()) => {
+            // Log first few successful heartbeat updates and any that were late
+            thread_local! {
+                static HB_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            let age_ms = age_ns / 1_000_000;
+            if age_ms > 1000 {
+                eprintln!(
+                    "HB_UPDATE slot={} fd={} age={}ms now_ns={} LATE",
+                    binding.slot, binding.heartbeat_map_fd, age_ms, now_ns,
+                );
+            }
+            HB_LOG_COUNT.with(|c| {
+                let n = c.get();
+                if n < 5 {
+                    c.set(n + 1);
+                    eprintln!(
+                        "HB_UPDATE[{}] slot={} fd={} age={}ms now_ns={} OK",
+                        n, binding.slot, binding.heartbeat_map_fd, age_ms, now_ns,
+                    );
+                }
+            });
+            binding.last_heartbeat_update_ns = now_ns;
+        }
+        Err(err) => {
+            eprintln!(
+                "HB_UPDATE_ERR slot={} fd={} age={}ms err={}",
+                binding.slot, binding.heartbeat_map_fd, age_ns / 1_000_000, err,
+            );
+            binding.live.set_error(format!("update heartbeat slot: {err}"));
+        }
     }
 }
 
@@ -7441,6 +9475,179 @@ fn publish_live_session_key(map_fd: c_int, key: &SessionKey) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Verify a session key exists in the BPF map (read-back after publish).
+fn verify_session_key_in_bpf(map_fd: c_int, key: &SessionKey) -> bool {
+    let map_key = session_map_key(key);
+    let mut value = 0u8;
+    let rc = unsafe {
+        libbpf_sys::bpf_map_lookup_elem(
+            map_fd,
+            (&map_key as *const UserspaceSessionMapKey).cast::<c_void>(),
+            (&mut value as *mut u8).cast::<c_void>(),
+        )
+    };
+    rc == 0
+}
+
+/// Count total entries in the BPF USERSPACE_SESSIONS map.
+fn count_bpf_session_entries(map_fd: c_int) -> u32 {
+    let mut count = 0u32;
+    let key_size = core::mem::size_of::<UserspaceSessionMapKey>();
+    let mut key = vec![0u8; key_size];
+    let mut next_key = vec![0u8; key_size];
+    // First key
+    let rc = unsafe {
+        libbpf_sys::bpf_map_get_next_key(
+            map_fd,
+            core::ptr::null(),
+            next_key.as_mut_ptr().cast::<c_void>(),
+        )
+    };
+    if rc != 0 {
+        return 0;
+    }
+    count += 1;
+    key.copy_from_slice(&next_key);
+    loop {
+        let rc = unsafe {
+            libbpf_sys::bpf_map_get_next_key(
+                map_fd,
+                key.as_ptr().cast::<c_void>(),
+                next_key.as_mut_ptr().cast::<c_void>(),
+            )
+        };
+        if rc != 0 {
+            break;
+        }
+        count += 1;
+        key.copy_from_slice(&next_key);
+        if count > 10000 {
+            break; // safety limit
+        }
+    }
+    count
+}
+
+/// Dump first N entries from the BPF USERSPACE_SESSIONS map for debugging.
+fn dump_bpf_session_entries(map_fd: c_int, max_entries: u32) {
+    let key_size = core::mem::size_of::<UserspaceSessionMapKey>();
+    let mut key_bytes = vec![0u8; key_size];
+    let mut next_key_bytes = vec![0u8; key_size];
+    let mut value = 0u8;
+    let mut count = 0u32;
+    // First key
+    let rc = unsafe {
+        libbpf_sys::bpf_map_get_next_key(
+            map_fd,
+            core::ptr::null(),
+            next_key_bytes.as_mut_ptr().cast::<c_void>(),
+        )
+    };
+    if rc != 0 {
+        eprintln!("BPF_MAP_DUMP: empty (no entries)");
+        return;
+    }
+    loop {
+        // Read the key as UserspaceSessionMapKey
+        let map_key: UserspaceSessionMapKey =
+            unsafe { core::ptr::read(next_key_bytes.as_ptr().cast()) };
+        let _ = unsafe {
+            libbpf_sys::bpf_map_lookup_elem(
+                map_fd,
+                next_key_bytes.as_ptr().cast::<c_void>(),
+                (&mut value as *mut u8).cast::<c_void>(),
+            )
+        };
+        let src_ip = if map_key.addr_family == libc::AF_INET as u8 {
+            format!(
+                "{}.{}.{}.{}",
+                map_key.src_addr[0], map_key.src_addr[1],
+                map_key.src_addr[2], map_key.src_addr[3]
+            )
+        } else {
+            format!("v6[{:02x}{:02x}::{:02x}{:02x}]",
+                map_key.src_addr[0], map_key.src_addr[1],
+                map_key.src_addr[14], map_key.src_addr[15])
+        };
+        let dst_ip = if map_key.addr_family == libc::AF_INET as u8 {
+            format!(
+                "{}.{}.{}.{}",
+                map_key.dst_addr[0], map_key.dst_addr[1],
+                map_key.dst_addr[2], map_key.dst_addr[3]
+            )
+        } else {
+            format!("v6[{:02x}{:02x}::{:02x}{:02x}]",
+                map_key.dst_addr[0], map_key.dst_addr[1],
+                map_key.dst_addr[14], map_key.dst_addr[15])
+        };
+        eprintln!(
+            "BPF_MAP_DUMP[{}]: af={} proto={} {}:{} -> {}:{} val={}",
+            count, map_key.addr_family, map_key.protocol,
+            src_ip, map_key.src_port, dst_ip, map_key.dst_port, value,
+        );
+        count += 1;
+        if count >= max_entries {
+            break;
+        }
+        key_bytes.copy_from_slice(&next_key_bytes);
+        let rc = unsafe {
+            libbpf_sys::bpf_map_get_next_key(
+                map_fd,
+                key_bytes.as_ptr().cast::<c_void>(),
+                next_key_bytes.as_mut_ptr().cast::<c_void>(),
+            )
+        };
+        if rc != 0 {
+            break;
+        }
+    }
+    eprintln!("BPF_MAP_DUMP: total={count} entries");
+}
+
+static SESSION_PUBLISH_VERIFY_OK: AtomicU64 = AtomicU64::new(0);
+static SESSION_PUBLISH_VERIFY_FAIL: AtomicU64 = AtomicU64::new(0);
+static SESSION_CREATIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+const FALLBACK_STATS_PIN_PATH: &str = "/sys/fs/bpf/bpfrx/userspace_fallback_stats";
+const FALLBACK_REASON_NAMES: &[&str] = &[
+    "ctrl_disabled",    // 0
+    "parse_fail",       // 1
+    "binding_missing",  // 2
+    "binding_not_ready",// 3
+    "hb_missing",       // 4
+    "hb_stale",         // 5
+    "icmp",             // 6
+    "early_filter",     // 7
+    "adjust_meta",      // 8
+    "meta_bounds",      // 9
+    "redirect_err",     // 10
+    "iface_nat_no_sess",// 11
+    "no_session",       // 12
+];
+
+fn read_fallback_stats() -> Option<Vec<(String, u64)>> {
+    let fd = OwnedFd::open_bpf_map(FALLBACK_STATS_PIN_PATH).ok()?;
+    let mut result = Vec::new();
+    for idx in 0u32..16 {
+        let mut value = 0u64;
+        let rc = unsafe {
+            libbpf_sys::bpf_map_lookup_elem(
+                fd.fd,
+                (&idx as *const u32).cast::<c_void>(),
+                (&mut value as *mut u64).cast::<c_void>(),
+            )
+        };
+        if rc == 0 && value > 0 {
+            let name = FALLBACK_REASON_NAMES
+                .get(idx as usize)
+                .copied()
+                .unwrap_or("unknown");
+            result.push((name.to_string(), value));
+        }
+    }
+    Some(result)
 }
 
 fn delete_live_session_key(map_fd: c_int, key: &SessionKey) {
@@ -7837,7 +10044,7 @@ fn update_binding_debug_state(binding: &BindingWorker) {
     binding
         .live
         .debug_spare_fill_frames
-        .store(binding.spare_fill_frames.len() as u32, Ordering::Relaxed);
+        .store(0, Ordering::Relaxed);
     binding
         .live
         .debug_free_tx_frames

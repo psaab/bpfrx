@@ -209,6 +209,8 @@ func (m *Manager) loadAllObjects() error {
 		"userspace_interface_nat_v4",
 		"userspace_interface_nat_v6",
 		"userspace_sessions",
+		"userspace_trace",
+		"userspace_fallback_stats",
 	} {
 		if ms, ok := userspaceSpec.Maps[name]; ok {
 			ms.Pinning = ebpf.PinByName

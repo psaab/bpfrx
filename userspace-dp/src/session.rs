@@ -108,6 +108,10 @@ impl SessionTable {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
     pub fn expire_stale(&mut self, now_ns: u64) -> u64 {
         if self.last_gc_ns != 0 && now_ns.saturating_sub(self.last_gc_ns) < SESSION_GC_INTERVAL_NS {
             return 0;
@@ -126,6 +130,18 @@ impl SessionTable {
             .collect::<Vec<_>>();
         for key in &stale {
             if let Some(entry) = self.remove_entry(key) {
+                // Log every TCP session expiry with details
+                if key.protocol == PROTO_TCP {
+                    eprintln!(
+                        "SESS_EXPIRE: proto=TCP {}:{} -> {}:{} closing={} age_ns={} timeout_ns={} rev={} synced={} nat=({:?},{:?})",
+                        key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+                        entry.closing,
+                        now_ns.saturating_sub(entry.last_seen_ns),
+                        entry.expires_after_ns,
+                        entry.metadata.is_reverse, entry.metadata.synced,
+                        entry.decision.nat.rewrite_src, entry.decision.nat.rewrite_dst,
+                    );
+                }
                 if !entry.metadata.is_reverse && !entry.metadata.synced {
                     self.push_delta(SessionDelta {
                         kind: SessionDeltaKind::Close,
@@ -149,6 +165,16 @@ impl SessionTable {
     ) -> Option<SessionLookup> {
         self.sessions.get_mut(key).map(|entry| {
             if matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
+                if !entry.closing {
+                    // First time marking closing — log it
+                    let flag_str = if (tcp_flags & TCP_RST) != 0 { "RST" } else { "FIN" };
+                    eprintln!(
+                        "SESS_CLOSING: {} proto=TCP {}:{} -> {}:{} rev={} tcp_flags=0x{:02x}",
+                        flag_str,
+                        key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+                        entry.metadata.is_reverse, tcp_flags,
+                    );
+                }
                 entry.closing = true;
             }
             entry.last_seen_ns = now_ns;
@@ -289,6 +315,13 @@ impl SessionTable {
 
     pub fn has_pending_deltas(&self) -> bool {
         !self.deltas.is_empty()
+    }
+
+    /// Iterate over all session entries for diagnostic purposes.
+    pub fn iter(&self, mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata)) {
+        for (key, entry) in &self.sessions {
+            f(key, entry.decision, &entry.metadata);
+        }
     }
 
     fn push_delta(&mut self, delta: SessionDelta) {

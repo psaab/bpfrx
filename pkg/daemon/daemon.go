@@ -1766,6 +1766,14 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
+	// 2.6b2. Rebind AF_XDP sockets after RETH MAC programming.
+	// programRethMAC brings links DOWN/UP which destroys the kernel-side
+	// XSK receive queue for AF_XDP sockets.  Notify the userspace
+	// dataplane so it can recreate the sockets.
+	if d.dp != nil && d.cluster != nil && cfg.Chassis.Cluster != nil {
+		d.dp.NotifyLinkCycle()
+	}
+
 	// 2.6c. Reconcile proxy ARP entries for NAT addresses.
 	if len(cfg.Security.NAT.ProxyARP) > 0 {
 		ifaceMap := make(map[string]int)

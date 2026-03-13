@@ -1863,6 +1863,8 @@ func (m *Manager) ZeroStaleFilterConfigs(startID uint32) {
 // StartFIBSync is a no-op for eBPF — bpf_fib_lookup handles FIB queries in-kernel.
 func (m *Manager) StartFIBSync(_ context.Context) {}
 
+func (m *Manager) NotifyLinkCycle() {} // no-op: eBPF programs survive link cycles
+
 func (m *Manager) BumpFIBGeneration() {
 	zm, ok := m.maps["fib_gen_map"]
 	if !ok {

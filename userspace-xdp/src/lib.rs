@@ -322,7 +322,11 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_BINDING_MISSING,
             &parsed,
         );
-        return fallback_to_main(&ctx, USERSPACE_FALLBACK_REASON_BINDING_MISSING);
+        // Drop all TCP on DP-managed interfaces: legacy BPF has no session
+        // for DP-managed flows, so falling back generates RSTs that kill the
+        // real connection. TCP retransmit recovers from a single drop.
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_BINDING_MISSING);
+        return Ok(xdp_action::XDP_DROP);
     };
     if (binding.flags & USERSPACE_BINDING_READY) == 0 {
         record_trace(
@@ -334,7 +338,8 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_BINDING_NOT_READY,
             &parsed,
         );
-        return fallback_to_main(&ctx, USERSPACE_FALLBACK_REASON_BINDING_NOT_READY);
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_BINDING_NOT_READY);
+        return Ok(xdp_action::XDP_DROP);
     }
     let last_heartbeat = unsafe { USERSPACE_HEARTBEAT.get(&binding.slot) };
     let Some(last_heartbeat) = last_heartbeat else {
@@ -347,7 +352,8 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING,
             &parsed,
         );
-        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
+        return Ok(xdp_action::XDP_DROP);
     };
     let timeout_ms = if ctrl.heartbeat_timeout_ms == 0 {
         USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS
@@ -366,7 +372,8 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE,
             &parsed,
         );
-        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
+        return Ok(xdp_action::XDP_DROP);
     }
 
     let packet_len = data_end.saturating_sub(data);
@@ -423,8 +430,12 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         return Ok(xdp_action::XDP_PASS);
     }
     // Only redirect packets that have an active userspace session or are
-    // connection-initiating (SYN). Unsessioned non-SYN traffic stays on
-    // the legacy BPF fast path to avoid bimodal processing (#200).
+    // connection-initiating (SYN).  Non-SYN TCP without a session is a
+    // stray from a DP-managed flow (e.g. a retransmit that arrived on a
+    // queue whose binding was momentarily absent).  Falling back to
+    // legacy BPF is fatal: legacy conntrack has no matching session, so
+    // the firewall policy generates a RST that kills the real AF_XDP
+    // connection.  Dropping the stray is safe — TCP retransmit recovers.
     if !has_live_userspace_session(&parsed) && !is_connection_initiating(&parsed) {
         record_trace(
             ingress_ifindex,
@@ -435,7 +446,8 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_NO_SESSION,
             &parsed,
         );
-        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_NO_SESSION);
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_NO_SESSION);
+        return Ok(xdp_action::XDP_DROP);
     }
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
@@ -500,6 +512,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 USERSPACE_FALLBACK_REASON_REDIRECT_ERR,
                 &parsed,
             );
+            if is_interface_nat_destination(&parsed) {
+                incr_fallback_stat(USERSPACE_FALLBACK_REASON_REDIRECT_ERR);
+                return Ok(xdp_action::XDP_DROP);
+            }
             fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_REDIRECT_ERR)
         }
     }
