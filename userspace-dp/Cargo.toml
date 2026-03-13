@@ -3,6 +3,10 @@ name = "bpfrx-userspace-dp"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+debug-log = []
+
 [dependencies]
 arc-swap = "1.7"
 chrono = { version = "0.4", features = ["serde", "clock"] }

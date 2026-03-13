@@ -30,6 +30,15 @@ use std::time::Duration;
 use xdpilone::xdp::XdpDesc;
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig, User};
 
+/// Hot-path debug logging — compiled out unless `debug-log` feature is enabled.
+#[allow(unused_macros)]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "debug-log")]
+        eprintln!($($arg)*);
+    };
+}
+
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
 const USERSPACE_META_VERSION: u16 = 4;
 const UMEM_FRAME_SIZE: u32 = 4096;
@@ -1884,94 +1893,102 @@ fn poll_binding(
             }
             if desc.len > 1514 {
                 dbg.rx_oversized += 1;
-                thread_local! {
-                    static OVERSIZED_RX_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-                }
-                OVERSIZED_RX_LOG.with(|c| {
-                    let n = c.get();
-                    if n < 20 {
-                        c.set(n + 1);
-                        eprintln!(
-                            "DBG OVERSIZED_RX[{}]: if={} q={} desc.len={} (exceeds ETH+MTU 1514)",
-                            n, ident.ifindex, ident.queue_id, desc.len,
-                        );
+                if cfg!(feature = "debug-log") {
+                    thread_local! {
+                        static OVERSIZED_RX_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
                     }
-                });
+                    OVERSIZED_RX_LOG.with(|c| {
+                        let n = c.get();
+                        if n < 20 {
+                            c.set(n + 1);
+                            eprintln!(
+                                "DBG OVERSIZED_RX[{}]: if={} q={} desc.len={} (exceeds ETH+MTU 1514)",
+                                n, ident.ifindex, ident.queue_id, desc.len,
+                            );
+                        }
+                    });
+                }
             }
             // TCP flag detection on RX
-            if desc.len >= 54 {
-                if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize) {
-                    // Check for FIN, SYN+ACK, zero-window
-                    if let Some(tcp_info) = extract_tcp_flags_and_window(rx_frame) {
-                        if (tcp_info.0 & 0x01) != 0 { // FIN
-                            dbg.rx_tcp_fin += 1;
-                        }
-                        if (tcp_info.0 & 0x12) == 0x12 { // SYN+ACK
-                            dbg.rx_tcp_synack += 1;
-                        }
-                        if tcp_info.1 == 0 && (tcp_info.0 & 0x02) == 0 { // zero window, not SYN
-                            dbg.rx_tcp_zero_window += 1;
-                            if dbg.rx_tcp_zero_window <= 10 {
-                                eprintln!(
-                                    "RX_TCP_ZERO_WIN[{}]: if={} q={} len={} flags=0x{:02x}",
-                                    dbg.rx_tcp_zero_window, ident.ifindex, ident.queue_id,
-                                    desc.len, tcp_info.0,
-                                );
+            if cfg!(feature = "debug-log") {
+                if desc.len >= 54 {
+                    if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize) {
+                        // Check for FIN, SYN+ACK, zero-window
+                        if let Some(tcp_info) = extract_tcp_flags_and_window(rx_frame) {
+                            if (tcp_info.0 & 0x01) != 0 { // FIN
+                                dbg.rx_tcp_fin += 1;
                             }
-                        }
-                    }
-                    if frame_has_tcp_rst(rx_frame) {
-                        dbg.rx_tcp_rst += 1;
-                        thread_local! {
-                            static RX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-                        }
-                        RX_RST_LOG_COUNT.with(|c| {
-                            let n = c.get();
-                            if n < 50 {
-                                c.set(n + 1);
-                                let summary = decode_frame_summary(rx_frame);
-                                eprintln!(
-                                    "RST_DETECT RX[{}]: if={} q={} len={} {}",
-                                    n, ident.ifindex, ident.queue_id, desc.len, summary,
-                                );
-                                if n < 5 {
-                                    let hex_len = (desc.len as usize).min(rx_frame.len()).min(80);
-                                    let hex: String = rx_frame[..hex_len]
-                                        .iter()
-                                        .map(|b| format!("{:02x}", b))
-                                        .collect::<Vec<_>>()
-                                        .join(" ");
-                                    eprintln!("RST_DETECT RX_HEX[{n}]: {hex}");
+                            if (tcp_info.0 & 0x12) == 0x12 { // SYN+ACK
+                                dbg.rx_tcp_synack += 1;
+                            }
+                            if tcp_info.1 == 0 && (tcp_info.0 & 0x02) == 0 { // zero window, not SYN
+                                dbg.rx_tcp_zero_window += 1;
+                                if dbg.rx_tcp_zero_window <= 10 {
+                                    eprintln!(
+                                        "RX_TCP_ZERO_WIN[{}]: if={} q={} len={} flags=0x{:02x}",
+                                        dbg.rx_tcp_zero_window, ident.ifindex, ident.queue_id,
+                                        desc.len, tcp_info.0,
+                                    );
                                 }
                             }
-                        });
+                        }
+                        if frame_has_tcp_rst(rx_frame) {
+                            dbg.rx_tcp_rst += 1;
+                            thread_local! {
+                                static RX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+                            }
+                            RX_RST_LOG_COUNT.with(|c| {
+                                let n = c.get();
+                                if n < 50 {
+                                    c.set(n + 1);
+                                    let summary = decode_frame_summary(rx_frame);
+                                    eprintln!(
+                                        "RST_DETECT RX[{}]: if={} q={} len={} {}",
+                                        n, ident.ifindex, ident.queue_id, desc.len, summary,
+                                    );
+                                    if n < 5 {
+                                        let hex_len = (desc.len as usize).min(rx_frame.len()).min(80);
+                                        let hex: String = rx_frame[..hex_len]
+                                            .iter()
+                                            .map(|b| format!("{:02x}", b))
+                                            .collect::<Vec<_>>()
+                                            .join(" ");
+                                        eprintln!("RST_DETECT RX_HEX[{n}]: {hex}");
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
             }
             // Poison check: detect if kernel recycled descriptor without writing data
-            if desc.len >= 8 {
-                if let Some(first8) = unsafe { &*area }.slice(desc.addr as usize, 8) {
-                    if first8 == &0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes() {
-                        eprintln!(
-                            "DBG POISON_DETECTED: if={} q={} desc.addr={:#x} desc.len={} — kernel returned poisoned frame!",
-                            ident.ifindex, ident.queue_id, desc.addr, desc.len,
-                        );
+            if cfg!(feature = "debug-log") {
+                if desc.len >= 8 {
+                    if let Some(first8) = unsafe { &*area }.slice(desc.addr as usize, 8) {
+                        if first8 == &0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes() {
+                            eprintln!(
+                                "DBG POISON_DETECTED: if={} q={} desc.addr={:#x} desc.len={} — kernel returned poisoned frame!",
+                                ident.ifindex, ident.queue_id, desc.addr, desc.len,
+                            );
+                        }
                     }
                 }
             }
-            if dbg.rx <= 10 {
-                if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize) {
-                    // Decode IP+TCP details from the frame
-                    let pkt_detail = decode_frame_summary(rx_frame);
-                    eprintln!(
-                        "DBG RX_ETH[{}]: if={} q={} len={} {}",
-                        dbg.rx, ident.ifindex, ident.queue_id, desc.len, pkt_detail,
-                    );
-                    // Full hex dump for first 3 packets
-                    if dbg.rx <= 3 {
-                        let dump_len = (desc.len as usize).min(rx_frame.len()).min(80);
-                        let hex: String = rx_frame[..dump_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                        eprintln!("DBG RX_HEX[{}]: {}", dbg.rx, hex);
+            if cfg!(feature = "debug-log") {
+                if dbg.rx <= 10 {
+                    if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize) {
+                        // Decode IP+TCP details from the frame
+                        let pkt_detail = decode_frame_summary(rx_frame);
+                        eprintln!(
+                            "DBG RX_ETH[{}]: if={} q={} len={} {}",
+                            dbg.rx, ident.ifindex, ident.queue_id, desc.len, pkt_detail,
+                        );
+                        // Full hex dump for first 3 packets
+                        if dbg.rx <= 3 {
+                            let dump_len = (desc.len as usize).min(rx_frame.len()).min(80);
+                            let hex: String = rx_frame[..dump_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                            eprintln!("DBG RX_HEX[{}]: {}", dbg.rx, hex);
+                        }
                     }
                 }
             }
@@ -2239,53 +2256,55 @@ fn poll_binding(
                             );
                             let from_zone_arc = Arc::<str>::from(from_zone.as_str());
                             let to_zone_arc = Arc::<str>::from(to_zone.as_str());
-                            // Debug: log session miss with flow details (throttled)
                             // Always log trust/lan traffic (iperf3) regardless of throttle
                             let is_trust_flow = meta.ingress_ifindex == 5
                                 || from_zone == "lan"
                                 || matches!(flow.src_ip, IpAddr::V4(ip) if ip.octets()[0] == 10);
-                            if dbg.session_miss <= 10 || is_trust_flow {
-                                eprintln!(
-                                    "DBG SESS_MISS[{}]: {}:{} -> {}:{} proto={} tcp_flags=0x{:02x} ingress_if={} disp={:?} egress_if={} neigh={:?} zone={}->{}",
-                                    dbg.session_miss,
-                                    flow.src_ip, flow.forward_key.src_port,
-                                    flow.dst_ip, flow.forward_key.dst_port,
-                                    meta.protocol, meta.tcp_flags,
-                                    meta.ingress_ifindex,
-                                    resolution.disposition,
-                                    resolution.egress_ifindex,
-                                    resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
-                                    from_zone, to_zone,
-                                );
-                                // If from WAN (if6), dump what session key was tried
-                                if meta.ingress_ifindex == 6 {
+                            // Debug: log session miss with flow details (throttled)
+                            if cfg!(feature = "debug-log") {
+                                if dbg.session_miss <= 10 || is_trust_flow {
                                     eprintln!(
-                                        "DBG SESS_MISS_KEY: af={} proto={} key={}:{}->{}:{} bpf_entries={} local_sessions={}",
-                                        flow.forward_key.addr_family, flow.forward_key.protocol,
-                                        flow.forward_key.src_ip, flow.forward_key.src_port,
-                                        flow.forward_key.dst_ip, flow.forward_key.dst_port,
-                                        count_bpf_session_entries(binding.session_map_fd),
-                                        sessions.len(),
+                                        "DBG SESS_MISS[{}]: {}:{} -> {}:{} proto={} tcp_flags=0x{:02x} ingress_if={} disp={:?} egress_if={} neigh={:?} zone={}->{}",
+                                        dbg.session_miss,
+                                        flow.src_ip, flow.forward_key.src_port,
+                                        flow.dst_ip, flow.forward_key.dst_port,
+                                        meta.protocol, meta.tcp_flags,
+                                        meta.ingress_ifindex,
+                                        resolution.disposition,
+                                        resolution.egress_ifindex,
+                                        resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
+                                        from_zone, to_zone,
                                     );
-                                    // Dump all local sessions to compare
-                                    if dbg.session_miss <= 3 {
-                                        let mut sess_dump = String::new();
-                                        let mut count = 0;
-                                        sessions.iter(|key, decision, metadata| {
-                                            if count < 30 {
-                                                use std::fmt::Write;
-                                                let _ = write!(sess_dump,
-                                                    "\n  LOCAL_SESS: af={} proto={} {}:{}->{}:{} nat=({:?},{:?}) rev={} synced={}",
-                                                    key.addr_family, key.protocol,
-                                                    key.src_ip, key.src_port, key.dst_ip, key.dst_port,
-                                                    decision.nat.rewrite_src, decision.nat.rewrite_dst,
-                                                    metadata.is_reverse, metadata.synced,
-                                                );
-                                                count += 1;
+                                    // If from WAN (if6), dump what session key was tried
+                                    if meta.ingress_ifindex == 6 {
+                                        eprintln!(
+                                            "DBG SESS_MISS_KEY: af={} proto={} key={}:{}->{}:{} bpf_entries={} local_sessions={}",
+                                            flow.forward_key.addr_family, flow.forward_key.protocol,
+                                            flow.forward_key.src_ip, flow.forward_key.src_port,
+                                            flow.forward_key.dst_ip, flow.forward_key.dst_port,
+                                            count_bpf_session_entries(binding.session_map_fd),
+                                            sessions.len(),
+                                        );
+                                        // Dump all local sessions to compare
+                                        if dbg.session_miss <= 3 {
+                                            let mut sess_dump = String::new();
+                                            let mut count = 0;
+                                            sessions.iter(|key, decision, metadata| {
+                                                if count < 30 {
+                                                    use std::fmt::Write;
+                                                    let _ = write!(sess_dump,
+                                                        "\n  LOCAL_SESS: af={} proto={} {}:{}->{}:{} nat=({:?},{:?}) rev={} synced={}",
+                                                        key.addr_family, key.protocol,
+                                                        key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+                                                        decision.nat.rewrite_src, decision.nat.rewrite_dst,
+                                                        metadata.is_reverse, metadata.synced,
+                                                    );
+                                                    count += 1;
+                                                }
+                                            });
+                                            if !sess_dump.is_empty() {
+                                                eprintln!("DBG SESS_MISS_DUMP:{sess_dump}");
                                             }
-                                        });
-                                        if !sess_dump.is_empty() {
-                                            eprintln!("DBG SESS_MISS_DUMP:{sess_dump}");
                                         }
                                     }
                                 }
@@ -2544,85 +2563,89 @@ fn poll_binding(
                             dbg.nat_applied_none += 1;
                         }
                         // Log NAT details for first few forward-candidate packets
-                        if dbg.forward <= 10 {
-                            let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
-                            let nat_str = format!(
-                                "snat={:?} dnat={:?}",
-                                decision.nat.rewrite_src, decision.nat.rewrite_dst,
-                            );
-                            eprintln!(
-                                "DBG FWD_DECISION[{}]: ingress_if={} egress_if={} {} {} proto={}",
-                                dbg.forward, ingress_if, egress_if, flow_str, nat_str, meta.protocol,
-                            );
+                        if cfg!(feature = "debug-log") {
+                            if dbg.forward <= 10 {
+                                let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
+                                let nat_str = format!(
+                                    "snat={:?} dnat={:?}",
+                                    decision.nat.rewrite_src, decision.nat.rewrite_dst,
+                                );
+                                eprintln!(
+                                    "DBG FWD_DECISION[{}]: ingress_if={} egress_if={} {} {} proto={}",
+                                    dbg.forward, ingress_if, egress_if, flow_str, nat_str, meta.protocol,
+                                );
+                            }
                         }
                         // TCP flag tracking on forwarded frames
-                        if meta.protocol == 6 {
-                            // Compare meta.tcp_flags from BPF shim with raw frame TCP flags
-                            let frame_data = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize);
-                            let raw_tcp_info = frame_data.and_then(|data| extract_tcp_flags_and_window(data));
-                            let raw_flags = raw_tcp_info.map(|(f, _)| f);
-                            let raw_window = raw_tcp_info.map(|(_, w)| w);
-                            // Log first 20 forwarded TCP packets: compare meta vs raw
-                            if dbg.forward <= 20 {
-                                let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
-                                eprintln!(
-                                    "FWD_TCP_CMP[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} l4_off={} {}",
-                                    dbg.forward, meta.tcp_flags,
-                                    raw_flags.map(|f| format!("0x{:02x}", f)).unwrap_or_else(|| "NONE".into()),
-                                    raw_window.map(|w| format!("{}", w)).unwrap_or_else(|| "NONE".into()),
-                                    desc.len, meta.l4_offset, flow_str,
-                                );
-                                // Hex dump bytes around TCP flags position in raw frame
-                                if let Some(data) = frame_data {
-                                    let l4 = meta.l4_offset as usize;
-                                    if data.len() > l4 + 20 {
-                                        let tcp_hdr: String = data[l4..l4+20].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                                        eprintln!("FWD_TCP_HDR[{}]: offset={} {}", dbg.forward, l4, tcp_hdr);
-                                    }
-                                }
-                            }
-                            if (meta.tcp_flags & 0x04) != 0 { // RST
-                                dbg.fwd_tcp_rst += 1;
-                                if dbg.fwd_tcp_rst <= 5 {
+                        if cfg!(feature = "debug-log") {
+                            if meta.protocol == 6 {
+                                // Compare meta.tcp_flags from BPF shim with raw frame TCP flags
+                                let frame_data = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize);
+                                let raw_tcp_info = frame_data.and_then(|data| extract_tcp_flags_and_window(data));
+                                let raw_flags = raw_tcp_info.map(|(f, _)| f);
+                                let raw_window = raw_tcp_info.map(|(_, w)| w);
+                                // Log first 20 forwarded TCP packets: compare meta vs raw
+                                if dbg.forward <= 20 {
                                     let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
                                     eprintln!(
-                                        "FWD_TCP_RST_DETECT[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} fwd#={} {}",
-                                        dbg.fwd_tcp_rst, meta.tcp_flags,
+                                        "FWD_TCP_CMP[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} l4_off={} {}",
+                                        dbg.forward, meta.tcp_flags,
                                         raw_flags.map(|f| format!("0x{:02x}", f)).unwrap_or_else(|| "NONE".into()),
                                         raw_window.map(|w| format!("{}", w)).unwrap_or_else(|| "NONE".into()),
-                                        desc.len, dbg.forward, flow_str,
+                                        desc.len, meta.l4_offset, flow_str,
                                     );
-                                    // Hex dump TCP header when RST detected
+                                    // Hex dump bytes around TCP flags position in raw frame
                                     if let Some(data) = frame_data {
                                         let l4 = meta.l4_offset as usize;
                                         if data.len() > l4 + 20 {
                                             let tcp_hdr: String = data[l4..l4+20].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                                            eprintln!("FWD_TCP_RST_HDR[{}]: meta_off={} raw_off={} {}", dbg.fwd_tcp_rst, l4, frame_l3_offset(data).unwrap_or(0), tcp_hdr);
+                                            eprintln!("FWD_TCP_HDR[{}]: offset={} {}", dbg.forward, l4, tcp_hdr);
                                         }
                                     }
                                 }
-                            }
-                            if (meta.tcp_flags & 0x01) != 0 { // FIN
-                                dbg.fwd_tcp_fin += 1;
-                                if dbg.fwd_tcp_fin <= 5 {
-                                    let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
-                                    eprintln!(
-                                        "FWD_TCP_FIN[{}]: ingress_if={} {} tcp_flags=0x{:02x}",
-                                        dbg.fwd_tcp_fin, meta.ingress_ifindex, flow_str, meta.tcp_flags,
-                                    );
-                                }
-                            }
-                            // Detect zero-window in TCP frames by inspecting raw packet
-                            if let Some(win) = raw_window {
-                                if win == 0 {
-                                    dbg.fwd_tcp_zero_window += 1;
-                                    if dbg.fwd_tcp_zero_window <= 10 {
+                                if (meta.tcp_flags & 0x04) != 0 { // RST
+                                    dbg.fwd_tcp_rst += 1;
+                                    if dbg.fwd_tcp_rst <= 5 {
                                         let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
                                         eprintln!(
-                                            "FWD_TCP_ZERO_WIN[{}]: ingress_if={} {} meta_flags=0x{:02x} raw_flags={}",
-                                            dbg.fwd_tcp_zero_window, meta.ingress_ifindex, flow_str, meta.tcp_flags,
+                                            "FWD_TCP_RST_DETECT[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} fwd#={} {}",
+                                            dbg.fwd_tcp_rst, meta.tcp_flags,
                                             raw_flags.map(|f| format!("0x{:02x}", f)).unwrap_or_else(|| "NONE".into()),
+                                            raw_window.map(|w| format!("{}", w)).unwrap_or_else(|| "NONE".into()),
+                                            desc.len, dbg.forward, flow_str,
                                         );
+                                        // Hex dump TCP header when RST detected
+                                        if let Some(data) = frame_data {
+                                            let l4 = meta.l4_offset as usize;
+                                            if data.len() > l4 + 20 {
+                                                let tcp_hdr: String = data[l4..l4+20].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                                                eprintln!("FWD_TCP_RST_HDR[{}]: meta_off={} raw_off={} {}", dbg.fwd_tcp_rst, l4, frame_l3_offset(data).unwrap_or(0), tcp_hdr);
+                                            }
+                                        }
+                                    }
+                                }
+                                if (meta.tcp_flags & 0x01) != 0 { // FIN
+                                    dbg.fwd_tcp_fin += 1;
+                                    if dbg.fwd_tcp_fin <= 5 {
+                                        let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
+                                        eprintln!(
+                                            "FWD_TCP_FIN[{}]: ingress_if={} {} tcp_flags=0x{:02x}",
+                                            dbg.fwd_tcp_fin, meta.ingress_ifindex, flow_str, meta.tcp_flags,
+                                        );
+                                    }
+                                }
+                                // Detect zero-window in TCP frames by inspecting raw packet
+                                if let Some(win) = raw_window {
+                                    if win == 0 {
+                                        dbg.fwd_tcp_zero_window += 1;
+                                        if dbg.fwd_tcp_zero_window <= 10 {
+                                            let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
+                                            eprintln!(
+                                                "FWD_TCP_ZERO_WIN[{}]: ingress_if={} {} meta_flags=0x{:02x} raw_flags={}",
+                                                dbg.fwd_tcp_zero_window, meta.ingress_ifindex, flow_str, meta.tcp_flags,
+                                                raw_flags.map(|f| format!("0x{:02x}", f)).unwrap_or_else(|| "NONE".into()),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -2649,37 +2672,41 @@ fn poll_binding(
                             flow.as_ref(),
                         ) {
                             dbg.tx += 1; // track forward requests queued
-                            if dbg.tx <= 5 {
-                                let dst_mac_str = decision.resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])).unwrap_or_else(|| "NONE".into());
-                                let src_mac_str = decision.resolution.src_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])).unwrap_or_else(|| "NONE".into());
-                                let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
-                                eprintln!(
-                                    "DBG FWD_REQ: target_if={} egress_if={} tx_if={} len={} proto={} vlan={} dst_mac={} src_mac={} flow={}",
-                                    request.target_ifindex,
-                                    decision.resolution.egress_ifindex,
-                                    decision.resolution.tx_ifindex,
-                                    desc.len,
-                                    meta.protocol,
-                                    decision.resolution.tx_vlan_id,
-                                    dst_mac_str,
-                                    src_mac_str,
-                                    flow_str,
-                                );
+                            if cfg!(feature = "debug-log") {
+                                if dbg.tx <= 5 {
+                                    let dst_mac_str = decision.resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])).unwrap_or_else(|| "NONE".into());
+                                    let src_mac_str = decision.resolution.src_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])).unwrap_or_else(|| "NONE".into());
+                                    let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
+                                    eprintln!(
+                                        "DBG FWD_REQ: target_if={} egress_if={} tx_if={} len={} proto={} vlan={} dst_mac={} src_mac={} flow={}",
+                                        request.target_ifindex,
+                                        decision.resolution.egress_ifindex,
+                                        decision.resolution.tx_ifindex,
+                                        desc.len,
+                                        meta.protocol,
+                                        decision.resolution.tx_vlan_id,
+                                        dst_mac_str,
+                                        src_mac_str,
+                                        flow_str,
+                                    );
+                                }
                             }
                             binding.scratch_forwards.push(request);
                             recycle_now = false;
                         } else {
                             dbg.build_fail += 1;
-                            if dbg.build_fail <= 3 {
-                                eprintln!(
-                                    "DBG FWD_BUILD_NONE: egress_if={} tx_if={} neigh={:?} src_mac={:?} len={} proto={}",
-                                    decision.resolution.egress_ifindex,
-                                    decision.resolution.tx_ifindex,
-                                    decision.resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
-                                    decision.resolution.src_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
-                                    desc.len,
-                                    meta.protocol,
-                                );
+                            if cfg!(feature = "debug-log") {
+                                if dbg.build_fail <= 3 {
+                                    eprintln!(
+                                        "DBG FWD_BUILD_NONE: egress_if={} tx_if={} neigh={:?} src_mac={:?} len={} proto={}",
+                                        decision.resolution.egress_ifindex,
+                                        decision.resolution.tx_ifindex,
+                                        decision.resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
+                                        decision.resolution.src_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
+                                        desc.len,
+                                        meta.protocol,
+                                    );
+                                }
                             }
                         }
                     } else {
@@ -2688,29 +2715,33 @@ fn poll_binding(
                             ForwardingDisposition::LocalDelivery => dbg.local += 1,
                             ForwardingDisposition::NoRoute => {
                                 dbg.no_route += 1;
-                                if dbg.no_route <= 3 {
-                                    if let Some(flow) = flow.as_ref() {
-                                        eprintln!(
-                                            "DBG NO_ROUTE: {}:{} -> {}:{} proto={} ingress_if={}",
-                                            flow.src_ip, flow.forward_key.src_port,
-                                            flow.dst_ip, flow.forward_key.dst_port,
-                                            meta.protocol, meta.ingress_ifindex,
-                                        );
+                                if cfg!(feature = "debug-log") {
+                                    if dbg.no_route <= 3 {
+                                        if let Some(flow) = flow.as_ref() {
+                                            eprintln!(
+                                                "DBG NO_ROUTE: {}:{} -> {}:{} proto={} ingress_if={}",
+                                                flow.src_ip, flow.forward_key.src_port,
+                                                flow.dst_ip, flow.forward_key.dst_port,
+                                                meta.protocol, meta.ingress_ifindex,
+                                            );
+                                        }
                                     }
                                 }
                             }
                             ForwardingDisposition::MissingNeighbor => {
                                 dbg.missing_neigh += 1;
-                                if dbg.missing_neigh <= 3 {
-                                    if let Some(flow) = flow.as_ref() {
-                                        eprintln!(
-                                            "DBG MISS_NEIGH: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
-                                            flow.src_ip, flow.forward_key.src_port,
-                                            flow.dst_ip, flow.forward_key.dst_port,
-                                            meta.protocol,
-                                            decision.resolution.egress_ifindex,
-                                            decision.resolution.next_hop,
-                                        );
+                                if cfg!(feature = "debug-log") {
+                                    if dbg.missing_neigh <= 3 {
+                                        if let Some(flow) = flow.as_ref() {
+                                            eprintln!(
+                                                "DBG MISS_NEIGH: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
+                                                flow.src_ip, flow.forward_key.src_port,
+                                                flow.dst_ip, flow.forward_key.dst_port,
+                                                meta.protocol,
+                                                decision.resolution.egress_ifindex,
+                                                decision.resolution.next_hop,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -4717,34 +4748,36 @@ fn transmit_batch(
         };
         frame.copy_from_slice(&req.bytes);
         // RST detection: log when we're about to transmit a TCP RST
-        if frame_has_tcp_rst(&req.bytes) {
-            binding.dbg_tx_tcp_rst += 1;
-            thread_local! {
-                static TX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-            }
-            TX_RST_LOG_COUNT.with(|c| {
-                let n = c.get();
-                if n < 50 {
-                    c.set(n + 1);
-                    let summary = decode_frame_summary(&req.bytes);
-                    eprintln!(
-                        "RST_DETECT TX[{}]: slot={} len={} {}",
-                        n,
-                        binding.slot,
-                        req.bytes.len(),
-                        summary,
-                    );
-                    if n < 5 {
-                        let hex_len = req.bytes.len().min(80);
-                        let hex: String = req.bytes[..hex_len]
-                            .iter()
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        eprintln!("RST_DETECT TX_HEX[{n}]: {hex}");
-                    }
+        if cfg!(feature = "debug-log") {
+            if frame_has_tcp_rst(&req.bytes) {
+                binding.dbg_tx_tcp_rst += 1;
+                thread_local! {
+                    static TX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
                 }
-            });
+                TX_RST_LOG_COUNT.with(|c| {
+                    let n = c.get();
+                    if n < 50 {
+                        c.set(n + 1);
+                        let summary = decode_frame_summary(&req.bytes);
+                        eprintln!(
+                            "RST_DETECT TX[{}]: slot={} len={} {}",
+                            n,
+                            binding.slot,
+                            req.bytes.len(),
+                            summary,
+                        );
+                        if n < 5 {
+                            let hex_len = req.bytes.len().min(80);
+                            let hex: String = req.bytes[..hex_len]
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            eprintln!("RST_DETECT TX_HEX[{n}]: {hex}");
+                        }
+                    }
+                });
+            }
         }
         binding.scratch_local_tx.push((offset, req));
     }
@@ -4848,34 +4881,36 @@ fn transmit_prepared_batch(
     }
 
     // RST detection on prepared TX path: check UMEM frames before submitting to TX ring
-    for req in &binding.scratch_prepared_tx {
-        if let Some(frame_data) = binding.umem.area.slice(req.offset as usize, req.len as usize) {
-            if frame_has_tcp_rst(frame_data) {
-                binding.dbg_tx_tcp_rst += 1;
-                thread_local! {
-                    static PREP_TX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-                }
-                PREP_TX_RST_LOG_COUNT.with(|c| {
-                    let n = c.get();
-                    if n < 50 {
-                        c.set(n + 1);
-                        let summary = decode_frame_summary(frame_data);
-                        eprintln!(
-                            "RST_DETECT PREP_TX[{}]: if={} q={} len={} {}",
-                            n, binding.identity().ifindex, binding.identity().queue_id,
-                            req.len, summary,
-                        );
-                        if n < 5 {
-                            let hex_len = (req.len as usize).min(frame_data.len()).min(80);
-                            let hex: String = frame_data[..hex_len]
-                                .iter()
-                                .map(|b| format!("{:02x}", b))
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            eprintln!("RST_DETECT PREP_TX_HEX[{n}]: {hex}");
-                        }
+    if cfg!(feature = "debug-log") {
+        for req in &binding.scratch_prepared_tx {
+            if let Some(frame_data) = binding.umem.area.slice(req.offset as usize, req.len as usize) {
+                if frame_has_tcp_rst(frame_data) {
+                    binding.dbg_tx_tcp_rst += 1;
+                    thread_local! {
+                        static PREP_TX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
                     }
-                });
+                    PREP_TX_RST_LOG_COUNT.with(|c| {
+                        let n = c.get();
+                        if n < 50 {
+                            c.set(n + 1);
+                            let summary = decode_frame_summary(frame_data);
+                            eprintln!(
+                                "RST_DETECT PREP_TX[{}]: if={} q={} len={} {}",
+                                n, binding.identity().ifindex, binding.identity().queue_id,
+                                req.len, summary,
+                            );
+                            if n < 5 {
+                                let hex_len = (req.len as usize).min(frame_data.len()).min(80);
+                                let hex: String = frame_data[..hex_len]
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                eprintln!("RST_DETECT PREP_TX_HEX[{n}]: {hex}");
+                            }
+                        }
+                    });
+                }
             }
         }
     }
@@ -5679,13 +5714,21 @@ fn worker_loop(
     let mut dbg_nat_dnat = 0u64;
     let mut dbg_nat_none = 0u64;
     let mut dbg_frame_build_none = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_rx_tcp_rst = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_tx_tcp_rst = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_rx_tcp_fin = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_rx_tcp_synack = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_rx_tcp_zero_window = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_fwd_tcp_fin = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_fwd_tcp_rst = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_fwd_tcp_zero_window = 0u64;
     let mut dbg_rx_bytes_total = 0u64;
     let mut dbg_tx_bytes_total = 0u64;
@@ -5776,13 +5819,16 @@ fn worker_loop(
         dbg_nat_dnat += dbg_poll.nat_applied_dnat;
         dbg_nat_none += dbg_poll.nat_applied_none;
         dbg_frame_build_none += dbg_poll.frame_build_none;
-        dbg_rx_tcp_rst += dbg_poll.rx_tcp_rst;
-        dbg_rx_tcp_fin += dbg_poll.rx_tcp_fin;
-        dbg_rx_tcp_synack += dbg_poll.rx_tcp_synack;
-        dbg_rx_tcp_zero_window += dbg_poll.rx_tcp_zero_window;
-        dbg_fwd_tcp_fin += dbg_poll.fwd_tcp_fin;
-        dbg_fwd_tcp_rst += dbg_poll.fwd_tcp_rst;
-        dbg_fwd_tcp_zero_window += dbg_poll.fwd_tcp_zero_window;
+        #[cfg(feature = "debug-log")]
+        {
+            dbg_rx_tcp_rst += dbg_poll.rx_tcp_rst;
+            dbg_rx_tcp_fin += dbg_poll.rx_tcp_fin;
+            dbg_rx_tcp_synack += dbg_poll.rx_tcp_synack;
+            dbg_rx_tcp_zero_window += dbg_poll.rx_tcp_zero_window;
+            dbg_fwd_tcp_fin += dbg_poll.fwd_tcp_fin;
+            dbg_fwd_tcp_rst += dbg_poll.fwd_tcp_rst;
+            dbg_fwd_tcp_zero_window += dbg_poll.fwd_tcp_zero_window;
+        }
         dbg_rx_bytes_total += dbg_poll.rx_bytes_total;
         dbg_tx_bytes_total += dbg_poll.tx_bytes_total;
         dbg_rx_oversized += dbg_poll.rx_oversized;
@@ -5862,14 +5908,17 @@ fn worker_loop(
                         b.dbg_rx_wakeups,
                     );
                     // TX pipeline debug counters
-                    dbg_tx_tcp_rst += b.dbg_tx_tcp_rst;
+                    #[cfg(feature = "debug-log")]
+                    { dbg_tx_tcp_rst += b.dbg_tx_tcp_rst; }
                     let _ = write!(
                         binding_summary,
-                        " TX:ring_sub={}/ring_full={}/compl={}/sendto={}/err={}/eagain={}/enobufs={}/overflow={}/rst={}",
+                        " TX:ring_sub={}/ring_full={}/compl={}/sendto={}/err={}/eagain={}/enobufs={}/overflow={}",
                         b.dbg_tx_ring_submitted, b.dbg_tx_ring_full, b.dbg_completions_reaped,
                         b.dbg_sendto_calls, b.dbg_sendto_err, b.dbg_sendto_eagain, b.dbg_sendto_enobufs,
-                        b.dbg_pending_overflow, b.dbg_tx_tcp_rst,
+                        b.dbg_pending_overflow,
                     );
+                    #[cfg(feature = "debug-log")]
+                    let _ = write!(binding_summary, "/rst={}", b.dbg_tx_tcp_rst);
                     if let Some(s) = xsk_stats {
                         let _ = write!(
                             binding_summary,
@@ -5897,21 +5946,23 @@ fn worker_loop(
                         }
                     }
                     // Ring diagnostics from xdpilone API
-                    let _ = write!(
-                        binding_summary,
-                        " RING:rx_nz={}/rx_max={}/fill_pend={}/dev_avail={} RX_WAKE:ok={}/err={}/errno={}",
-                        b.dbg_rx_avail_nonzero, b.dbg_rx_avail_max,
-                        b.dbg_fill_pending, b.dbg_device_avail,
-                        b.dbg_rx_wake_sendto_ok, b.dbg_rx_wake_sendto_err, b.dbg_rx_wake_sendto_errno,
-                    );
-                    // Direct mmap diagnosis: read raw ring producer/consumer
-                    if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) =
-                        diagnose_raw_ring_state(b.rx.as_raw_fd())
-                    {
+                    if cfg!(feature = "debug-log") {
                         let _ = write!(
                             binding_summary,
-                            " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}"
+                            " RING:rx_nz={}/rx_max={}/fill_pend={}/dev_avail={} RX_WAKE:ok={}/err={}/errno={}",
+                            b.dbg_rx_avail_nonzero, b.dbg_rx_avail_max,
+                            b.dbg_fill_pending, b.dbg_device_avail,
+                            b.dbg_rx_wake_sendto_ok, b.dbg_rx_wake_sendto_err, b.dbg_rx_wake_sendto_errno,
                         );
+                        // Direct mmap diagnosis: read raw ring producer/consumer
+                        if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) =
+                            diagnose_raw_ring_state(b.rx.as_raw_fd())
+                        {
+                            let _ = write!(
+                                binding_summary,
+                                " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}"
+                            );
+                        }
                     }
                     // Frame leak detection
                     if total_accounted != expected_total {
@@ -5923,6 +5974,7 @@ fn worker_loop(
                     }
                     binding_summary.push(']');
                 }
+                #[cfg(feature = "debug-log")]
                 eprintln!(
                     "DBG w{}: {:.1}s rx={} tx={} fwd={} local={} sess_hit={} sess_miss={} sess_create={} \
                      no_route={} miss_neigh={} pol_deny={} ha_inact={} no_egress={} build_fail={} \
@@ -5977,17 +6029,62 @@ fn worker_loop(
                     } else { 0 },
                     binding_summary,
                 );
+                #[cfg(not(feature = "debug-log"))]
+                eprintln!(
+                    "DBG w{}: {:.1}s rx={} tx={} fwd={} local={} sess_hit={} sess_miss={} sess_create={} \
+                     no_route={} miss_neigh={} pol_deny={} ha_inact={} no_egress={} build_fail={} \
+                     tx_err={} meta_err={} other={} enq_ok={} enq_ip={} enq_dir={} enq_cp={} sessions={} \
+                     DIR:trust_rx={}/wan_rx={}/t2w={}/w2t={} NAT:snat={}/dnat={}/none={}/bld_none={} \
+                     SIZE:rx_avg={}/rx_max={}/tx_avg={}/tx_max={}/rx_over={}/seg_miss={} bindings:{}",
+                    worker_id,
+                    secs,
+                    dbg_rx_total,
+                    dbg_tx_total,
+                    dbg_forward_total,
+                    dbg_local_total,
+                    dbg_session_hit,
+                    dbg_session_miss,
+                    dbg_session_create,
+                    dbg_no_route,
+                    dbg_missing_neigh,
+                    dbg_policy_deny,
+                    dbg_ha_inactive,
+                    dbg_no_egress_binding,
+                    dbg_build_fail,
+                    dbg_tx_err,
+                    dbg_metadata_err,
+                    dbg_disposition_other,
+                    dbg_enqueue_ok,
+                    dbg_enqueue_inplace,
+                    dbg_enqueue_direct,
+                    dbg_enqueue_copy,
+                    session_count,
+                    dbg_rx_from_trust, dbg_rx_from_wan,
+                    dbg_fwd_trust_to_wan, dbg_fwd_wan_to_trust,
+                    dbg_nat_snat, dbg_nat_dnat, dbg_nat_none, dbg_frame_build_none,
+                    if dbg_rx_total > 0 { dbg_rx_bytes_total / dbg_rx_total } else { 0 },
+                    dbg_rx_max_frame,
+                    if dbg_enqueue_ok > 0 { dbg_tx_bytes_total / dbg_enqueue_ok } else { 0 },
+                    dbg_tx_max_frame,
+                    dbg_rx_oversized,
+                    dbg_seg_needed_but_none,
+                    binding_summary,
+                );
                 // Print XDP shim fallback stats — tells us WHY packets stop
                 // being redirected to XSK.
-                if let Some(stats) = read_fallback_stats() {
-                    if !stats.is_empty() {
-                        let s: Vec<String> = stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
-                        eprintln!("DBG w{}: XDP_FALLBACK: {}", worker_id, s.join(" "));
+                if cfg!(feature = "debug-log") {
+                    if let Some(stats) = read_fallback_stats() {
+                        if !stats.is_empty() {
+                            let s: Vec<String> = stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
+                            eprintln!("DBG w{}: XDP_FALLBACK: {}", worker_id, s.join(" "));
+                        }
                     }
                 }
                 // Save prev counters BEFORE reset for stall detection below
-                prev_rx_total = dbg_rx_total;
-                prev_fwd_total = dbg_forward_total;
+                if cfg!(feature = "debug-log") {
+                    prev_rx_total = dbg_rx_total;
+                    prev_fwd_total = dbg_forward_total;
+                }
                 dbg_last_report_ns = loop_now_ns;
                 dbg_rx_total = 0;
                 dbg_tx_total = 0;
@@ -6021,86 +6118,91 @@ fn worker_loop(
                 dbg_seg_needed_but_none = 0;
                 // Stall detection: stall_prev_fwd is PREVIOUS interval's fwd count,
                 // prev_fwd_total is THIS interval's fwd count (saved before reset).
-                if stall_prev_fwd > 10 && prev_fwd_total == 0 && !stall_reported {
-                    stall_reported = true;
-                    eprintln!("DBG STALL_DETECTED: w{} two_ago_fwd={} this_interval_fwd={} this_interval_rx={} sessions={}",
-                        worker_id, stall_prev_fwd, prev_fwd_total, prev_rx_total, session_count);
-                    // Dump comprehensive per-binding state at stall moment
-                    for (si, sb) in bindings.iter().enumerate() {
-                        use std::fmt::Write;
-                        let fill_p = sb.device.pending();
-                        let rx_a = sb.rx.available();
-                        let ifl = sb.in_flight_forward_recycles.len() as u32;
-                        let ptxp = sb.pending_tx_prepared.len() as u32;
-                        let ptxl = sb.pending_tx_local.len() as u32;
-                        let total = sb.pending_fill_frames.len() as u32
-                            + fill_p + rx_a + sb.free_tx_frames.len() as u32
-                            + sb.outstanding_tx + ifl + sb.scratch_recycle.len() as u32 + ptxp;
-                        let raw = diagnose_raw_ring_state(sb.rx.as_raw_fd());
-                        let mut stall_line = format!(
-                            "DBG STALL_BINDING[{}]: if={} q={} pfill={} fring={} rxring={} free_tx={} otx={} ifl={} ptxp={} ptxl={} total={}/{}",
-                            si, sb.ifindex, sb.queue_id,
-                            sb.pending_fill_frames.len(), fill_p, rx_a,
-                            sb.free_tx_frames.len(), sb.outstanding_tx, ifl,
-                            ptxp, ptxl, total, sb.umem.total_frames,
-                        );
-                        if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) = raw {
-                            let _ = write!(stall_line,
-                                " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}");
-                        }
-                        if let Ok(Some(stats)) = sb.device.statistics_v2().map(Some) {
-                            let _ = write!(stall_line,
-                                " xsk:drop={}/rfull={}/fempty={}/tempty={}",
-                                stats.rx_dropped, stats.rx_ring_full,
-                                stats.rx_fill_ring_empty_descs, stats.tx_ring_empty_descs);
-                        }
-                        eprintln!("{stall_line}");
-                    }
-                    // Dump all session keys for this worker
-                    let mut sess_dump = String::new();
-                    let mut count = 0;
-                    sessions.iter(|key, decision, metadata| {
-                        if count < 20 {
+                if cfg!(feature = "debug-log") {
+                    if stall_prev_fwd > 10 && prev_fwd_total == 0 && !stall_reported {
+                        stall_reported = true;
+                        eprintln!("DBG STALL_DETECTED: w{} two_ago_fwd={} this_interval_fwd={} this_interval_rx={} sessions={}",
+                            worker_id, stall_prev_fwd, prev_fwd_total, prev_rx_total, session_count);
+                        // Dump comprehensive per-binding state at stall moment
+                        for (si, sb) in bindings.iter().enumerate() {
                             use std::fmt::Write;
-                            let _ = write!(sess_dump,
-                                "\n  SESS: {}:{} -> {}:{} proto={} nat=({:?},{:?}) is_rev={}",
-                                key.src_ip, key.src_port, key.dst_ip, key.dst_port,
-                                key.protocol, decision.nat.rewrite_src, decision.nat.rewrite_dst,
-                                metadata.is_reverse,
+                            let fill_p = sb.device.pending();
+                            let rx_a = sb.rx.available();
+                            let ifl = sb.in_flight_forward_recycles.len() as u32;
+                            let ptxp = sb.pending_tx_prepared.len() as u32;
+                            let ptxl = sb.pending_tx_local.len() as u32;
+                            let total = sb.pending_fill_frames.len() as u32
+                                + fill_p + rx_a + sb.free_tx_frames.len() as u32
+                                + sb.outstanding_tx + ifl + sb.scratch_recycle.len() as u32 + ptxp;
+                            let raw = diagnose_raw_ring_state(sb.rx.as_raw_fd());
+                            let mut stall_line = format!(
+                                "DBG STALL_BINDING[{}]: if={} q={} pfill={} fring={} rxring={} free_tx={} otx={} ifl={} ptxp={} ptxl={} total={}/{}",
+                                si, sb.ifindex, sb.queue_id,
+                                sb.pending_fill_frames.len(), fill_p, rx_a,
+                                sb.free_tx_frames.len(), sb.outstanding_tx, ifl,
+                                ptxp, ptxl, total, sb.umem.total_frames,
                             );
-                            count += 1;
+                            if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) = raw {
+                                let _ = write!(stall_line,
+                                    " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}");
+                            }
+                            if let Ok(Some(stats)) = sb.device.statistics_v2().map(Some) {
+                                let _ = write!(stall_line,
+                                    " xsk:drop={}/rfull={}/fempty={}/tempty={}",
+                                    stats.rx_dropped, stats.rx_ring_full,
+                                    stats.rx_fill_ring_empty_descs, stats.tx_ring_empty_descs);
+                            }
+                            eprintln!("{stall_line}");
                         }
-                    });
-                    if !sess_dump.is_empty() {
-                        eprintln!("DBG STALL_SESSIONS:{sess_dump}");
-                    }
-                    // Dump fallback stats at stall time
-                    if let Some(stats) = read_fallback_stats() {
-                        if !stats.is_empty() {
-                            let s: Vec<String> = stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
-                            eprintln!("DBG STALL_FALLBACK: {}", s.join(" "));
+                        // Dump all session keys for this worker
+                        let mut sess_dump = String::new();
+                        let mut count = 0;
+                        sessions.iter(|key, decision, metadata| {
+                            if count < 20 {
+                                use std::fmt::Write;
+                                let _ = write!(sess_dump,
+                                    "\n  SESS: {}:{} -> {}:{} proto={} nat=({:?},{:?}) is_rev={}",
+                                    key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+                                    key.protocol, decision.nat.rewrite_src, decision.nat.rewrite_dst,
+                                    metadata.is_reverse,
+                                );
+                                count += 1;
+                            }
+                        });
+                        if !sess_dump.is_empty() {
+                            eprintln!("DBG STALL_SESSIONS:{sess_dump}");
                         }
+                        // Dump fallback stats at stall time
+                        if let Some(stats) = read_fallback_stats() {
+                            if !stats.is_empty() {
+                                let s: Vec<String> = stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
+                                eprintln!("DBG STALL_FALLBACK: {}", s.join(" "));
+                            }
+                        }
+                        // Also dump BPF session count
+                        if let Some(b) = bindings.first() {
+                            eprintln!("DBG STALL_BPF_SESSIONS: entries={}", count_bpf_session_entries(b.session_map_fd));
+                        }
+                    } else if prev_fwd_total > 0 {
+                        stall_reported = false;
                     }
-                    // Also dump BPF session count
-                    if let Some(b) = bindings.first() {
-                        eprintln!("DBG STALL_BPF_SESSIONS: entries={}", count_bpf_session_entries(b.session_map_fd));
-                    }
-                } else if prev_fwd_total > 0 {
-                    stall_reported = false;
+                    stall_prev_fwd = prev_fwd_total;
                 }
-                stall_prev_fwd = prev_fwd_total;
                 dbg_nat_snat = 0;
                 dbg_nat_dnat = 0;
                 dbg_nat_none = 0;
                 dbg_frame_build_none = 0;
-                dbg_rx_tcp_rst = 0;
-                dbg_tx_tcp_rst = 0;
-                dbg_rx_tcp_fin = 0;
-                dbg_rx_tcp_synack = 0;
-                dbg_rx_tcp_zero_window = 0;
-                dbg_fwd_tcp_fin = 0;
-                dbg_fwd_tcp_rst = 0;
-                dbg_fwd_tcp_zero_window = 0;
+                #[cfg(feature = "debug-log")]
+                {
+                    dbg_rx_tcp_rst = 0;
+                    dbg_tx_tcp_rst = 0;
+                    dbg_rx_tcp_fin = 0;
+                    dbg_rx_tcp_synack = 0;
+                    dbg_rx_tcp_zero_window = 0;
+                    dbg_fwd_tcp_fin = 0;
+                    dbg_fwd_tcp_rst = 0;
+                    dbg_fwd_tcp_zero_window = 0;
+                }
                 for b in bindings.iter_mut() {
                     b.dbg_fill_submitted = 0;
                     b.dbg_fill_failed = 0;
@@ -6116,7 +6218,8 @@ fn worker_loop(
                     b.dbg_sendto_eagain = 0;
                     b.dbg_sendto_enobufs = 0;
                     b.dbg_pending_overflow = 0;
-                    b.dbg_tx_tcp_rst = 0;
+                    #[cfg(feature = "debug-log")]
+                    { b.dbg_tx_tcp_rst = 0; }
                     b.dbg_rx_avail_nonzero = 0;
                     b.dbg_rx_avail_max = 0;
                     b.dbg_rx_wake_sendto_ok = 0;
@@ -6447,37 +6550,39 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     state.source_nat_rules = parse_source_nat_rules(&snapshot.source_nat_rules);
 
     // Debug: dump zone mappings and policy rules
-    eprintln!("FWD_STATE: ifindex_to_zone={:?}", state.ifindex_to_zone);
-    eprintln!("FWD_STATE: egress keys={:?}", state.egress.keys().collect::<Vec<_>>());
-    for (ifidx, eg) in &state.egress {
+    if cfg!(feature = "debug-log") {
+        eprintln!("FWD_STATE: ifindex_to_zone={:?}", state.ifindex_to_zone);
+        eprintln!("FWD_STATE: egress keys={:?}", state.egress.keys().collect::<Vec<_>>());
+        for (ifidx, eg) in &state.egress {
+            eprintln!(
+                "FWD_STATE: egress[{}] bind={} zone={} vlan={} mtu={}",
+                ifidx, eg.bind_ifindex, eg.zone, eg.vlan_id, eg.mtu,
+            );
+        }
         eprintln!(
-            "FWD_STATE: egress[{}] bind={} zone={} vlan={} mtu={}",
-            ifidx, eg.bind_ifindex, eg.zone, eg.vlan_id, eg.mtu,
+            "FWD_STATE: policy default={:?} rules={}",
+            state.policy.default_action,
+            state.policy.rules.len(),
+        );
+        for (i, rule) in state.policy.rules.iter().enumerate() {
+            eprintln!(
+                "FWD_STATE: policy[{}] {}->{}  action={:?} src_v4={} dst_v4={} apps={}",
+                i, rule.from_zone, rule.to_zone, rule.action,
+                rule.source_v4.len(), rule.destination_v4.len(),
+                rule.applications.len(),
+            );
+        }
+        eprintln!(
+            "FWD_STATE: local_v4={:?} interface_nat_v4={:?}",
+            state.local_v4, state.interface_nat_v4,
+        );
+        eprintln!(
+            "FWD_STATE: snat_rules={} connected_v4={} routes_v4={}",
+            state.source_nat_rules.len(),
+            state.connected_v4.len(),
+            state.routes_v4.values().map(|v| v.len()).sum::<usize>(),
         );
     }
-    eprintln!(
-        "FWD_STATE: policy default={:?} rules={}",
-        state.policy.default_action,
-        state.policy.rules.len(),
-    );
-    for (i, rule) in state.policy.rules.iter().enumerate() {
-        eprintln!(
-            "FWD_STATE: policy[{}] {}->{}  action={:?} src_v4={} dst_v4={} apps={}",
-            i, rule.from_zone, rule.to_zone, rule.action,
-            rule.source_v4.len(), rule.destination_v4.len(),
-            rule.applications.len(),
-        );
-    }
-    eprintln!(
-        "FWD_STATE: local_v4={:?} interface_nat_v4={:?}",
-        state.local_v4, state.interface_nat_v4,
-    );
-    eprintln!(
-        "FWD_STATE: snat_rules={} connected_v4={} routes_v4={}",
-        state.source_nat_rules.len(),
-        state.connected_v4.len(),
-        state.routes_v4.values().map(|v| v.len()).sum::<usize>(),
-    );
 
     // Install nftables rules to suppress kernel TCP RSTs from SNAT IPs.
     //
@@ -8026,55 +8131,61 @@ fn build_forwarded_frame_into_from_frame(
         _ => return None,
     }
     // Debug: dump first N built frames' Ethernet + IP headers to see post-NAT on wire
-    thread_local! {
-        static BUILD_FWD_DBG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    }
-    BUILD_FWD_DBG_COUNT.with(|c| {
-        let n = c.get();
-        if n < 30 {
-            c.set(n + 1);
-            let pkt_detail = decode_frame_summary(out);
-            eprintln!(
-                "DBG BUILT_ETH[{}]: vlan={} frame_len={} proto={} {}",
-                n, vlan_id, frame_len, meta.protocol, pkt_detail,
-            );
-            // For the first 3 frames, also dump the full IP+TCP header hex
-            if n < 3 {
-                let dump_len = frame_len.min(out.len()).min(eth_len + 60);
-                let hex: String = out[..dump_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                eprintln!("DBG BUILT_HEX[{n}]: {hex}");
-            }
+    if cfg!(feature = "debug-log") {
+        thread_local! {
+            static BUILD_FWD_DBG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
-    });
+        BUILD_FWD_DBG_COUNT.with(|c| {
+            let n = c.get();
+            if n < 30 {
+                c.set(n + 1);
+                let pkt_detail = decode_frame_summary(out);
+                eprintln!(
+                    "DBG BUILT_ETH[{}]: vlan={} frame_len={} proto={} {}",
+                    n, vlan_id, frame_len, meta.protocol, pkt_detail,
+                );
+                // For the first 3 frames, also dump the full IP+TCP header hex
+                if n < 3 {
+                    let dump_len = frame_len.min(out.len()).min(eth_len + 60);
+                    let hex: String = out[..dump_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                    eprintln!("DBG BUILT_HEX[{n}]: {hex}");
+                }
+            }
+        });
+    }
     // Checksum verification: recompute from scratch and compare to incremental update.
-    verify_built_frame_checksums(&out[..frame_len]);
+    if cfg!(feature = "debug-log") {
+        verify_built_frame_checksums(&out[..frame_len]);
+    }
 
     // RST corruption check: detect if frame building introduced a TCP RST
     // that wasn't in the source frame.
-    let out_has_rst = frame_has_tcp_rst(&out[..frame_len]);
-    let in_has_rst = frame_has_tcp_rst(frame);
-    if out_has_rst && !in_has_rst {
-        thread_local! {
-            static BUILD_RST_CORRUPT_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        }
-        BUILD_RST_CORRUPT_COUNT.with(|c| {
-            let n = c.get();
-            if n < 20 {
-                c.set(n + 1);
-                let in_summary = decode_frame_summary(frame);
-                let out_summary = decode_frame_summary(&out[..frame_len]);
-                eprintln!(
-                    "RST_CORRUPT BUILD[{}]: frame build INTRODUCED RST! in=[{}] out=[{}]",
-                    n, in_summary, out_summary,
-                );
-                let in_hex_len = frame.len().min(80);
-                let in_hex: String = frame[..in_hex_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                let out_hex_len = frame_len.min(out.len()).min(80);
-                let out_hex: String = out[..out_hex_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                eprintln!("RST_CORRUPT IN_HEX[{n}]: {in_hex}");
-                eprintln!("RST_CORRUPT OUT_HEX[{n}]: {out_hex}");
+    if cfg!(feature = "debug-log") {
+        let out_has_rst = frame_has_tcp_rst(&out[..frame_len]);
+        let in_has_rst = frame_has_tcp_rst(frame);
+        if out_has_rst && !in_has_rst {
+            thread_local! {
+                static BUILD_RST_CORRUPT_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
             }
-        });
+            BUILD_RST_CORRUPT_COUNT.with(|c| {
+                let n = c.get();
+                if n < 20 {
+                    c.set(n + 1);
+                    let in_summary = decode_frame_summary(frame);
+                    let out_summary = decode_frame_summary(&out[..frame_len]);
+                    eprintln!(
+                        "RST_CORRUPT BUILD[{}]: frame build INTRODUCED RST! in=[{}] out=[{}]",
+                        n, in_summary, out_summary,
+                    );
+                    let in_hex_len = frame.len().min(80);
+                    let in_hex: String = frame[..in_hex_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                    let out_hex_len = frame_len.min(out.len()).min(80);
+                    let out_hex: String = out[..out_hex_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                    eprintln!("RST_CORRUPT IN_HEX[{n}]: {in_hex}");
+                    eprintln!("RST_CORRUPT OUT_HEX[{n}]: {out_hex}");
+                }
+            });
+        }
     }
     Some(frame_len)
 }
@@ -8255,36 +8366,40 @@ fn rewrite_forwarded_frame_in_place(
         _ => return None,
     }
     // Debug: dump first N in-place rewritten frames' Ethernet headers
-    thread_local! {
-        static INPLACE_FWD_DBG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    }
-    INPLACE_FWD_DBG_COUNT.with(|c| {
-        let n = c.get();
-        if n < 10 {
-            c.set(n + 1);
-            let hdr_len = eth_len.min(packet.len()).min(22);
-            let hdr_hex: String = packet[..hdr_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-            let ip_info = if meta.addr_family as i32 == libc::AF_INET && packet.len() >= ip_start + 20 {
-                format!("src={}.{}.{}.{} dst={}.{}.{}.{}",
-                    packet[ip_start+12], packet[ip_start+13], packet[ip_start+14], packet[ip_start+15],
-                    packet[ip_start+16], packet[ip_start+17], packet[ip_start+18], packet[ip_start+19])
-            } else if meta.addr_family as i32 == libc::AF_INET6 && packet.len() >= ip_start + 40 {
-                let s = &packet[ip_start+8..ip_start+24];
-                let d = &packet[ip_start+24..ip_start+40];
-                format!("src={:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x} dst={:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
-                    s[0],s[1],s[2],s[3],s[4],s[5],s[6],s[7],s[8],s[9],s[10],s[11],s[12],s[13],s[14],s[15],
-                    d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15])
-            } else {
-                "unknown-af".to_string()
-            };
-            eprintln!(
-                "DBG INPLACE_ETH[{}]: eth=[{}] vlan={} frame_len={} proto={} {}",
-                n, hdr_hex, vlan_id, frame_len, meta.protocol, ip_info,
-            );
+    if cfg!(feature = "debug-log") {
+        thread_local! {
+            static INPLACE_FWD_DBG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
-    });
+        INPLACE_FWD_DBG_COUNT.with(|c| {
+            let n = c.get();
+            if n < 10 {
+                c.set(n + 1);
+                let hdr_len = eth_len.min(packet.len()).min(22);
+                let hdr_hex: String = packet[..hdr_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                let ip_info = if meta.addr_family as i32 == libc::AF_INET && packet.len() >= ip_start + 20 {
+                    format!("src={}.{}.{}.{} dst={}.{}.{}.{}",
+                        packet[ip_start+12], packet[ip_start+13], packet[ip_start+14], packet[ip_start+15],
+                        packet[ip_start+16], packet[ip_start+17], packet[ip_start+18], packet[ip_start+19])
+                } else if meta.addr_family as i32 == libc::AF_INET6 && packet.len() >= ip_start + 40 {
+                    let s = &packet[ip_start+8..ip_start+24];
+                    let d = &packet[ip_start+24..ip_start+40];
+                    format!("src={:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x} dst={:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
+                        s[0],s[1],s[2],s[3],s[4],s[5],s[6],s[7],s[8],s[9],s[10],s[11],s[12],s[13],s[14],s[15],
+                        d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15])
+                } else {
+                    "unknown-af".to_string()
+                };
+                eprintln!(
+                    "DBG INPLACE_ETH[{}]: eth=[{}] vlan={} frame_len={} proto={} {}",
+                    n, hdr_hex, vlan_id, frame_len, meta.protocol, ip_info,
+                );
+            }
+        });
+    }
     // Checksum verification for in-place path.
-    verify_built_frame_checksums(&packet[..frame_len]);
+    if cfg!(feature = "debug-log") {
+        verify_built_frame_checksums(&packet[..frame_len]);
+    }
     Some(frame_len as u32)
 }
 
