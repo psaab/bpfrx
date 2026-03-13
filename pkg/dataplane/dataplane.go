@@ -47,6 +47,10 @@ func UserspaceLocalV6PinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_local_v6")
 }
 
+func UserspaceCPUMapPinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_cpumap")
+}
+
 func UserspaceSessionsPinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_sessions")
 }

@@ -211,6 +211,7 @@ func (m *Manager) loadAllObjects() error {
 		"userspace_sessions",
 		"userspace_trace",
 		"userspace_fallback_stats",
+		"userspace_cpumap",
 	} {
 		if ms, ok := userspaceSpec.Maps[name]; ok {
 			ms.Pinning = ebpf.PinByName

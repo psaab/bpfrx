@@ -3,9 +3,9 @@
 
 use aya_ebpf::{
     bindings::{xdp_action, xdp_md},
-    helpers::r#gen::{bpf_ktime_get_ns, bpf_xdp_adjust_meta},
+    helpers::r#gen::{bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_xdp_adjust_meta},
     macros::{map, xdp},
-    maps::{Array, HashMap, ProgramArray, XskMap},
+    maps::{Array, CpuMap, HashMap, ProgramArray, XskMap},
     programs::XdpContext,
 };
 use core::mem;
@@ -48,6 +48,7 @@ const USERSPACE_FALLBACK_REASON_REDIRECT_ERR: u32 = 10;
 const USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION: u32 = 11;
 const USERSPACE_FALLBACK_REASON_NO_SESSION: u32 = 12;
 const USERSPACE_FALLBACK_REASON_MAX: u32 = 16;
+const USERSPACE_CTRL_FLAG_CPUMAP: u32 = 1;
 const USERSPACE_TRACE_STAGE_RECEIVED: u32 = 1;
 const USERSPACE_TRACE_STAGE_BINDING_MISSING: u32 = 2;
 const USERSPACE_TRACE_STAGE_BINDING_NOT_READY: u32 = 3;
@@ -257,6 +258,9 @@ static USERSPACE_FALLBACK_STATS: Array<u64> = Array::with_max_entries(USERSPACE_
 #[map(name = "userspace_trace")]
 static USERSPACE_TRACE: HashMap<u32, UserspaceTraceValue> = HashMap::with_max_entries(1024, 0);
 
+#[map(name = "userspace_cpumap")]
+static USERSPACE_CPUMAP: CpuMap = CpuMap::with_max_entries(256, 0);
+
 #[xdp]
 pub fn xdp_userspace_prog(ctx: XdpContext) -> u32 {
     match try_xdp_userspace(&ctx) {
@@ -268,26 +272,26 @@ pub fn xdp_userspace_prog(ctx: XdpContext) -> u32 {
 fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let ctrl = USERSPACE_CTRL.get(0).ok_or(0i64)?;
     if ctrl.enabled == 0 || ctrl.metadata_version != USERSPACE_META_VERSION as u32 {
-        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
+        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
     }
 
     let data = ctx.data();
     let data_end = ctx.data_end();
     let Some((eth_proto, vlan_id, l3_offset)) = parse_l2(data, data_end) else {
-        return Ok(xdp_action::XDP_PASS);
+        return Ok(cpumap_or_pass(ctrl));
     };
     let parsed = match eth_proto {
         ETH_P_IP => parse_ipv4(data, data_end, vlan_id, l3_offset),
         ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, l3_offset),
-        _ => return Ok(xdp_action::XDP_PASS),
+        _ => return Ok(cpumap_or_pass(ctrl)),
     };
     let Some(parsed) = parsed else {
-        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
+        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
     };
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
     if unsafe { USERSPACE_INGRESS_IFACES.get(&ingress_ifindex) }.is_none() {
-        return Ok(xdp_action::XDP_PASS);
+        return Ok(cpumap_or_pass(ctrl));
     }
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
     let selected_queue = select_userspace_queue(ctrl, rx_queue_index, &parsed);
@@ -387,7 +391,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_ICMP,
             &parsed,
         );
-        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_ICMP);
+        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_ICMP);
     }
     if should_fallback_early(&parsed) {
         record_trace(
@@ -399,7 +403,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_EARLY_FILTER,
             &parsed,
         );
-        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
+        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
     if is_icmp_to_interface_nat_local(&parsed) {
         record_trace(
@@ -411,7 +415,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             0,
             &parsed,
         );
-        return Ok(xdp_action::XDP_PASS);
+        return Ok(cpumap_or_pass(ctrl));
     }
     // Do not bounce interface-NAT reply traffic back to legacy XDP on a session-map miss.
     // The Rust dataplane can repair the reverse flow from the forward NAT session, and
@@ -427,7 +431,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             0,
             &parsed,
         );
-        return Ok(xdp_action::XDP_PASS);
+        return Ok(cpumap_or_pass(ctrl));
     }
     // Only redirect packets that have an active userspace session or are
     // connection-initiating (SYN).  Non-SYN TCP without a session is a
@@ -452,12 +456,12 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
     if adjust_rc != 0 {
-        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_ADJUST_META);
+        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_ADJUST_META);
     }
 
     let meta_ptr = ctx.metadata() as *mut UserspaceDpMeta;
     if (meta_ptr as usize).saturating_add(mem::size_of::<UserspaceDpMeta>()) > ctx.metadata_end() {
-        return fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_META_BOUNDS);
+        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_META_BOUNDS);
     }
 
     unsafe {
@@ -516,13 +520,18 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 incr_fallback_stat(USERSPACE_FALLBACK_REASON_REDIRECT_ERR);
                 return Ok(xdp_action::XDP_DROP);
             }
-            fallback_to_main(ctx, USERSPACE_FALLBACK_REASON_REDIRECT_ERR)
+            fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_REDIRECT_ERR)
         }
     }
 }
 
-fn fallback_to_main(ctx: &XdpContext, reason: u32) -> Result<u32, i64> {
+fn fallback_to_main(ctx: &XdpContext, _ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {
     incr_fallback_stat(reason);
+    // Always tail-call to the main eBPF pipeline for firewall processing.
+    // The main pipeline handles zone lookup, policy, NAT, and forwarding.
+    // Do NOT use cpumap here — it bypasses the firewall entirely.
+    // XDP_PASS from the main pipeline is safe in zero-copy mode: mlx5
+    // copies data and frees the XSK buffer automatically.
     unsafe {
         let _ = USERSPACE_FALLBACK_PROGS.tail_call(ctx, USERSPACE_FALLBACK_MAIN);
     }
@@ -573,6 +582,18 @@ fn record_trace(
 }
 
 fn pass_to_kernel_or_abort() -> u32 {
+    xdp_action::XDP_PASS
+}
+
+/// Deliver packet to kernel via cpumap redirect (avoids UMEM frame leak in
+/// zero-copy AF_XDP mode). Falls back to XDP_PASS when cpumap is not enabled.
+fn cpumap_or_pass(ctrl: &UserspaceCtrl) -> u32 {
+    if (ctrl.flags & USERSPACE_CTRL_FLAG_CPUMAP) != 0 {
+        let cpu = unsafe { bpf_get_smp_processor_id() };
+        if let Ok(action) = USERSPACE_CPUMAP.redirect(cpu, 0) {
+            return action;
+        }
+    }
     xdp_action::XDP_PASS
 }
 

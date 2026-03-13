@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -1645,6 +1646,7 @@ type userspaceCtrlValue struct {
 }
 
 const userspaceMetadataVersion = 4
+const userspaceCtrlFlagCPUMap = 1
 
 func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
 	ctrlMap := m.inner.Map("userspace_ctrl")
@@ -1668,13 +1670,21 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 		return errors.New("xdp_main_prog not loaded")
 	}
 
+	// Populate userspace_cpumap so the XDP shim can use cpumap redirect
+	// instead of XDP_PASS (required for zero-copy AF_XDP).
+	cpumapReady := m.setupUserspaceCPUMapLocked()
+
 	zero := uint32(0)
+	var ctrlFlags uint32
+	if cpumapReady {
+		ctrlFlags |= userspaceCtrlFlagCPUMap
+	}
 	ctrl := userspaceCtrlValue{
 		Enabled:            0,
 		MetadataVersion:    userspaceMetadataVersion,
 		Workers:            uint32(cfg.Workers),
 		QueueCount:         uint32(maxInt(cfg.Workers, 1)),
-		Flags:              0,
+		Flags:              ctrlFlags,
 		ConfigGeneration:   0,
 		FIBGeneration:      0,
 		HeartbeatTimeoutMS: 5000,
@@ -1720,6 +1730,40 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	return m.syncInterfaceNATAddressMapsLocked(snapshot)
 }
 
+// setupUserspaceCPUMapLocked populates the userspace_cpumap BPF map with one
+// entry per online CPU. This enables the XDP shim to use cpumap redirect
+// instead of XDP_PASS, which is required for zero-copy AF_XDP (XDP_PASS in
+// zero-copy mode permanently leaks UMEM frames).
+func (m *Manager) setupUserspaceCPUMapLocked() bool {
+	cpuMap := m.inner.Map("userspace_cpumap")
+	if cpuMap == nil {
+		slog.Warn("userspace_cpumap not found, zero-copy cpumap redirect disabled")
+		return false
+	}
+
+	numCPUs := runtime.NumCPU()
+	if numCPUs > 256 {
+		numCPUs = 256
+	}
+
+	// cpumap value: struct { __u32 qsize; int bpf_prog_fd; }
+	// With prog_fd=0, no cpumap program is attached — packets go straight
+	// to the kernel stack. This is sufficient for the XDP_PASS replacement
+	// paths (ARP, local destination, non-IP traffic).
+	for cpu := 0; cpu < numCPUs; cpu++ {
+		val := make([]byte, 8)
+		binary.NativeEndian.PutUint32(val[0:4], 2048) // qsize
+		binary.NativeEndian.PutUint32(val[4:8], 0)    // no attached program
+		if err := cpuMap.Update(uint32(cpu), val, ebpf.UpdateAny); err != nil {
+			slog.Warn("userspace_cpumap update failed", "cpu", cpu, "err", err)
+			return false
+		}
+	}
+
+	slog.Info("userspace cpumap enabled for zero-copy AF_XDP", "cpus", numCPUs)
+	return true
+}
+
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	ctrlMap := m.inner.Map("userspace_ctrl")
 	if ctrlMap == nil {
@@ -1743,13 +1787,19 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		}
 	}
 
+	// Preserve cpumap flag if cpumap is populated.
+	var ctrlFlags uint32
+	if cpuMap := m.inner.Map("userspace_cpumap"); cpuMap != nil {
+		ctrlFlags |= userspaceCtrlFlagCPUMap
+	}
+
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
 		Enabled:            0,
 		MetadataVersion:    userspaceMetadataVersion,
 		Workers:            uint32(maxInt(status.Workers, 1)),
 		QueueCount:         uint32(queueCountFromBindings(status.Bindings)),
-		Flags:              0,
+		Flags:              ctrlFlags,
 		ConfigGeneration:   status.LastSnapshotGeneration,
 		FIBGeneration:      status.LastFIBGeneration,
 		HeartbeatTimeoutMS: 5000,

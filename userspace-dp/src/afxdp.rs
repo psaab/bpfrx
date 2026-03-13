@@ -61,11 +61,15 @@ const MAX_RX_BATCHES_PER_POLL: usize = 4;
  * the fill ring is only consumed by XDP_REDIRECT→XSK (which userspace always
  * recycles). The cost is one memcpy per redirected packet.
  *
- * TODO(#209): restore zero-copy by replacing XDP_PASS paths with cpumap
- * redirect, which frees the XSK frame immediately while still delivering
- * the packet to the kernel stack.
+ * Zero-copy is now restored (#209): the XDP shim replaces all XDP_PASS paths
+ * with cpumap redirect (USERSPACE_CPUMAP), which frees the XSK frame
+ * immediately while still delivering the packet to the kernel stack.
+ * The bind flags try zero-copy first and fall back to copy mode if the
+ * driver doesn't support it.
  */
-const XSK_BIND_FLAGS_SHARED_UMEM_OWNER: u16 =
+const XSK_BIND_FLAGS_ZEROCOPY: u16 =
+    SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY;
+const XSK_BIND_FLAGS_COPY: u16 =
     SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_COPY;
 const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 1;
@@ -1489,6 +1493,34 @@ fn open_binding_worker_rings(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
+    // Try zero-copy first, fall back to copy mode if the driver doesn't support it.
+    match try_open_bind(worker_umem, info, ring_entries, shared_owner, XSK_BIND_FLAGS_ZEROCOPY) {
+        Ok(result) => return Ok(result),
+        Err(e) => {
+            eprintln!(
+                "bpfrx-userspace-dp: zero-copy bind failed: {e} — falling back to copy mode"
+            );
+        }
+    }
+    try_open_bind(worker_umem, info, ring_entries, shared_owner, XSK_BIND_FLAGS_COPY)
+}
+
+fn try_open_bind(
+    worker_umem: &WorkerUmem,
+    info: &IfInfo,
+    ring_entries: u32,
+    shared_owner: bool,
+    flags: u16,
+) -> Result<
+    (
+        User,
+        xdpilone::RingRx,
+        xdpilone::RingTx,
+        XskBindMode,
+        xdpilone::DeviceQueue,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let sock = if shared_owner {
         Socket::with_shared(info, &worker_umem.umem)
             .map_err(|e| format!("create shared socket: {e}"))?
@@ -1503,17 +1535,12 @@ fn open_binding_worker_rings(
         &worker_umem.umem,
         &sock,
         ring_entries,
-        XSK_BIND_FLAGS_SHARED_UMEM_OWNER,
+        flags,
     )?;
     let bind_mode = match bind_user_rings(&worker_umem.umem, &device, &user, shared_owner) {
         Ok(mode) => mode,
         Err(e) => {
-            eprintln!(
-                "bpfrx-userspace-dp: WARN bind_user_rings failed (shared_owner={}): {} — \
-                 using pre-bind mode {:?}",
-                shared_owner, e, bind_mode,
-            );
-            bind_mode
+            return Err(e);
         }
     };
     Ok((user, rx, tx, bind_mode, device))
