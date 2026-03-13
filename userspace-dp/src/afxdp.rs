@@ -1855,6 +1855,11 @@ fn poll_binding(
             binding.dbg_backpressure += 1;
             // Try to drain TX first — completions free frames for both TX and fill.
             let _ = drain_pending_tx(binding, now_ns, shared_recycles);
+            apply_shared_recycles(left, binding, right, shared_recycles);
+            // Critical: drain fill ring even under backpressure so the NIC can
+            // still receive packets. Without this, fill ring starvation causes
+            // mlx5 to fall back to non-XSK NAPI, leaking packets to the kernel.
+            let _ = drain_pending_fill(binding, now_ns);
             return did_work;
         }
 
@@ -2829,13 +2834,22 @@ fn poll_binding(
             dbg,
         );
         binding.scratch_forwards = pending_forwards;
+        // Eager TX completion reaping: free TX frames immediately after
+        // enqueueing forwards so they can be recycled to fill ring within
+        // the same poll cycle. Without this, completions wait until next
+        // poll entry, starving the fill ring during sustained forwarding.
+        reap_tx_completions(binding, shared_recycles);
+        // Also reap completions on the egress bindings that just transmitted.
+        for other in left.iter_mut().chain(right.iter_mut()) {
+            reap_tx_completions(other, shared_recycles);
+        }
+        apply_shared_recycles(left, binding, right, shared_recycles);
         if !binding.scratch_recycle.is_empty() {
             binding
                 .pending_fill_frames
                 .extend(binding.scratch_recycle.drain(..));
-            let _ = drain_pending_fill(binding, now_ns);
         }
-        apply_shared_recycles(left, binding, right, shared_recycles);
+        let _ = drain_pending_fill(binding, now_ns);
         update_binding_debug_state(binding);
         binding
             .live
@@ -9464,27 +9478,28 @@ fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
         now_ns,
     ) {
         Ok(()) => {
-            // Log first few successful heartbeat updates and any that were late
-            thread_local! {
-                static HB_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-            }
-            let age_ms = age_ns / 1_000_000;
-            if age_ms > 1000 {
-                eprintln!(
-                    "HB_UPDATE slot={} fd={} age={}ms now_ns={} LATE",
-                    binding.slot, binding.heartbeat_map_fd, age_ms, now_ns,
-                );
-            }
-            HB_LOG_COUNT.with(|c| {
-                let n = c.get();
-                if n < 5 {
-                    c.set(n + 1);
+            if cfg!(feature = "debug-log") {
+                thread_local! {
+                    static HB_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+                }
+                let age_ms = age_ns / 1_000_000;
+                if age_ms > 1000 {
                     eprintln!(
-                        "HB_UPDATE[{}] slot={} fd={} age={}ms now_ns={} OK",
-                        n, binding.slot, binding.heartbeat_map_fd, age_ms, now_ns,
+                        "HB_UPDATE slot={} fd={} age={}ms now_ns={} LATE",
+                        binding.slot, binding.heartbeat_map_fd, age_ms, now_ns,
                     );
                 }
-            });
+                HB_LOG_COUNT.with(|c| {
+                    let n = c.get();
+                    if n < 5 {
+                        c.set(n + 1);
+                        eprintln!(
+                            "HB_UPDATE[{}] slot={} fd={} age={}ms now_ns={} OK",
+                            n, binding.slot, binding.heartbeat_map_fd, age_ms, now_ns,
+                        );
+                    }
+                });
+            }
             binding.last_heartbeat_update_ns = now_ns;
         }
         Err(err) => {

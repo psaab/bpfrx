@@ -930,7 +930,7 @@ fn parse_args() -> Result<Args, String> {
         .to_string_lossy()
         .to_string();
     let mut workers = 1usize;
-    let mut ring_entries = 1024usize;
+    let mut ring_entries = 4096usize;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
