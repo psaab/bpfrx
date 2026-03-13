@@ -4555,7 +4555,14 @@ fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bool {
         }
     }
     binding.scratch_fill.clear();
-    maybe_wake_rx(binding, true, now_ns);
+    // Only wake NAPI when the kernel signals it needs fill ring entries.
+    // Without this gate, every drain_pending_fill triggers a sendto() syscall
+    // (142K/sec at line rate), spending ~20% CPU in syscall entry/exit overhead.
+    // The NEED_WAKEUP flag is set by the driver when its fill ring cache is
+    // empty; waking at any other time is a no-op that wastes a syscall.
+    if binding.device.needs_wakeup() {
+        maybe_wake_rx(binding, true, now_ns);
+    }
     update_binding_debug_state(binding);
     true
 }
