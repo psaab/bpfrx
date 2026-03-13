@@ -75,6 +75,10 @@ const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 1;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
 const RX_WAKE_MIN_INTERVAL_NS: u64 = 200_000;
+/// Safety-net interval for fill ring wakes when needs_wakeup is clear.
+/// Prevents lost-wakeup stalls from the race: commit() → check needs_wakeup
+/// (clear) → kernel exhausts cache → sets needs_wakeup → userspace doesn't see it.
+const FILL_WAKE_SAFETY_INTERVAL_NS: u64 = 500_000; // 500µs
 const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
 const TX_WAKE_MIN_INTERVAL_NS: u64 = 50_000;
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
@@ -4555,12 +4559,14 @@ fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bool {
         }
     }
     binding.scratch_fill.clear();
-    // Only wake NAPI when the kernel signals it needs fill ring entries.
-    // Without this gate, every drain_pending_fill triggers a sendto() syscall
-    // (142K/sec at line rate), spending ~20% CPU in syscall entry/exit overhead.
-    // The NEED_WAKEUP flag is set by the driver when its fill ring cache is
-    // empty; waking at any other time is a no-op that wastes a syscall.
-    if binding.device.needs_wakeup() {
+    // Only wake NAPI when the kernel signals it needs fill ring entries,
+    // or as a safety net every FILL_WAKE_SAFETY_INTERVAL_NS to prevent
+    // lost-wakeup stalls from the race between commit() and needs_wakeup.
+    // Without the needs_wakeup gate, every drain triggers a sendto() syscall
+    // (142K/sec at line rate), spending ~20% CPU in syscall entry/exit.
+    if binding.device.needs_wakeup()
+        || now_ns.saturating_sub(binding.last_rx_wake_ns) >= FILL_WAKE_SAFETY_INTERVAL_NS
+    {
         maybe_wake_rx(binding, true, now_ns);
     }
     update_binding_debug_state(binding);
@@ -6650,105 +6656,134 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
 /// dataplane; the kernel has no sockets for them and should never emit
 /// RSTs.
 fn install_kernel_rst_suppression(state: &ForwardingState) {
+    use nftables::batch::Batch;
+    use nftables::expr::{BinaryOperation, Expression, NamedExpression, Payload, PayloadField};
+    use nftables::schema::{Chain, NfListObject, Rule, Table};
+    use nftables::stmt::{Counter, Match, Operator, Statement};
+    use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
+
     let v4_addrs: Vec<String> = state.interface_nat_v4.keys().map(|ip| ip.to_string()).collect();
     let v6_addrs: Vec<String> = state.interface_nat_v6.keys().map(|ip| ip.to_string()).collect();
 
+    let table_name = "bpfrx_dp_rst";
+    let chain_name = "output";
+
+    // Delete existing table (ignore error if it doesn't exist).
+    {
+        let mut batch = Batch::new();
+        batch.delete(NfListObject::Table(Table {
+            family: NfFamily::INet,
+            name: table_name.into(),
+            handle: None,
+        }));
+        let _ = nftables::helper::apply_ruleset(&batch.to_nftables());
+    }
+
     if v4_addrs.is_empty() && v6_addrs.is_empty() {
-        // No SNAT addresses — clean up any previous rules.
-        let _ = Command::new("nft")
-            .args(["delete", "table", "inet", "bpfrx_dp_rst"])
-            .output();
         return;
     }
 
-    let mut rules = Vec::new();
-    rules.push("table inet bpfrx_dp_rst {".to_string());
-    rules.push("  chain output {".to_string());
-    rules.push("    type filter hook output priority 0; policy accept;".to_string());
+    // Build fresh table + chain + rules.
+    let mut batch = Batch::new();
+    batch.add(NfListObject::Table(Table {
+        family: NfFamily::INet,
+        name: table_name.into(),
+        handle: None,
+    }));
+    batch.add(NfListObject::Chain(Chain {
+        family: NfFamily::INet,
+        table: table_name.into(),
+        name: chain_name.into(),
+        newname: None,
+        handle: None,
+        _type: Some(NfChainType::Filter),
+        hook: Some(NfHook::Output),
+        prio: Some(0),
+        dev: None,
+        policy: Some(NfChainPolicy::Accept),
+    }));
+
+    // Helper: build rule statements for "proto saddr X tcp flags & rst != 0 counter drop".
+    let rst_drop_rule = |proto: &'static str, addr: &str| -> Vec<Statement<'static>> {
+        vec![
+            Statement::Match(Match {
+                left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                    PayloadField {
+                        protocol: proto.into(),
+                        field: "saddr".into(),
+                    },
+                ))),
+                right: Expression::String(addr.to_string().into()),
+                op: Operator::EQ,
+            }),
+            Statement::Match(Match {
+                left: Expression::BinaryOperation(Box::new(BinaryOperation::AND(
+                    Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                        PayloadField {
+                            protocol: "tcp".into(),
+                            field: "flags".into(),
+                        },
+                    ))),
+                    Expression::Number(4), // RST flag
+                ))),
+                right: Expression::Number(0),
+                op: Operator::NEQ,
+            }),
+            Statement::Counter(Counter::Anonymous(None)),
+            Statement::Drop(None),
+        ]
+    };
+
     for addr in &v4_addrs {
-        rules.push(format!(
-            "    ip saddr {} tcp flags & rst == rst counter drop",
-            addr
-        ));
+        batch.add(NfListObject::Rule(Rule {
+            family: NfFamily::INet,
+            table: table_name.into(),
+            chain: chain_name.into(),
+            expr: rst_drop_rule("ip", addr).into(),
+            handle: None,
+            index: None,
+            comment: None,
+        }));
     }
     for addr in &v6_addrs {
-        rules.push(format!(
-            "    ip6 saddr {} tcp flags & rst == rst counter drop",
-            addr
-        ));
+        batch.add(NfListObject::Rule(Rule {
+            family: NfFamily::INet,
+            table: table_name.into(),
+            chain: chain_name.into(),
+            expr: rst_drop_rule("ip6", addr).into(),
+            handle: None,
+            index: None,
+            comment: None,
+        }));
     }
-    rules.push("  }".to_string());
-    rules.push("}".to_string());
 
-    let nft_conf = rules.join("\n") + "\n";
-    let flush_and_load = format!("flush ruleset inet bpfrx_dp_rst\n{nft_conf}");
-
-    // Attempt atomic replace: flush + load in one nft -f invocation.
-    // If the table doesn't exist yet, flush will fail, so try plain load.
-    let result = Command::new("nft")
-        .args(["-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(flush_and_load.as_bytes())?;
-            }
-            child.wait_with_output()
-        });
-
-    match result {
-        Ok(output) if output.status.success() => {
+    match nftables::helper::apply_ruleset(&batch.to_nftables()) {
+        Ok(()) => {
             eprintln!(
                 "RST_SUPPRESS: installed nftables rules for {} v4 + {} v6 SNAT addresses",
                 v4_addrs.len(),
                 v6_addrs.len()
             );
         }
-        _ => {
-            // Flush failed (table didn't exist) — try creating fresh.
-            let result = Command::new("nft")
-                .args(["-f", "-"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .and_then(|mut child| {
-                    use std::io::Write;
-                    if let Some(stdin) = child.stdin.as_mut() {
-                        stdin.write_all(nft_conf.as_bytes())?;
-                    }
-                    child.wait_with_output()
-                });
-            match result {
-                Ok(output) if output.status.success() => {
-                    eprintln!(
-                        "RST_SUPPRESS: installed nftables rules for {} v4 + {} v6 SNAT addresses",
-                        v4_addrs.len(),
-                        v6_addrs.len()
-                    );
-                }
-                Ok(output) => {
-                    eprintln!(
-                        "RST_SUPPRESS: nft failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                Err(err) => {
-                    eprintln!("RST_SUPPRESS: failed to run nft: {err}");
-                }
-            }
+        Err(err) => {
+            eprintln!("RST_SUPPRESS: failed to apply nftables rules: {err}");
         }
     }
 }
 
 /// Remove the nftables RST suppression table on shutdown.
 pub(crate) fn remove_kernel_rst_suppression() {
-    let _ = Command::new("nft")
-        .args(["delete", "table", "inet", "bpfrx_dp_rst"])
-        .output();
+    use nftables::batch::Batch;
+    use nftables::schema::{NfListObject, Table};
+    use nftables::types::NfFamily;
+
+    let mut batch = Batch::new();
+    batch.delete(NfListObject::Table(Table {
+        family: NfFamily::INet,
+        name: "bpfrx_dp_rst".into(),
+        handle: None,
+    }));
+    let _ = nftables::helper::apply_ruleset(&batch.to_nftables());
 }
 
 fn nat_translated_local_exclusions(
