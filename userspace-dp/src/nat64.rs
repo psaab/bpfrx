@@ -112,6 +112,7 @@ impl Nat64State {
             rewrite_src_port: None,
             rewrite_dst_port: None,
             nat64: true,
+            nptv6: false,
         }
     }
 }

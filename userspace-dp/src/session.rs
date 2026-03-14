@@ -888,6 +888,7 @@ mod tests {
             rewrite_src_port: None,
             rewrite_dst_port: Some(8080),
             nat64: false,
+            nptv6: false,
         };
         // Reply: internal:8080 -> egress:54321
         let expected_reply = SessionKey {

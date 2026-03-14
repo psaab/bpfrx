@@ -857,6 +857,124 @@ func TestBuildPolicySnapshotsIncludesGlobalPolicies(t *testing.T) {
 	}
 }
 
+func TestUserspaceSupportsScreenProfilesBasic(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"basic": {
+			Name: "basic",
+			TCP:  config.TCPScreen{Land: true, SynFin: true},
+			ICMP: config.ICMPScreen{FloodThreshold: 100},
+		},
+	}
+	if !userspaceSupportsScreenProfiles(cfg) {
+		t.Fatal("basic screen profile should be supported")
+	}
+}
+
+func TestUserspaceSupportsScreenProfilesRejectsSynCookie(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"basic": {
+			Name: "basic",
+			TCP:  config.TCPScreen{Land: true},
+		},
+	}
+	if userspaceSupportsScreenProfiles(cfg) {
+		t.Fatal("syn-cookie mode should not be supported")
+	}
+}
+
+func TestUserspaceSupportsScreenProfilesRejectsPortScan(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"scan": {
+			Name: "scan",
+			TCP:  config.TCPScreen{PortScanThreshold: 100},
+		},
+	}
+	if userspaceSupportsScreenProfiles(cfg) {
+		t.Fatal("port scan threshold should not be supported")
+	}
+}
+
+func TestUserspaceSupportsScreenProfilesRejectsSessionLimit(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"limit": {
+			Name:         "limit",
+			LimitSession: config.LimitSessionScreen{SourceIPBased: 100},
+		},
+	}
+	if userspaceSupportsScreenProfiles(cfg) {
+		t.Fatal("session limiting should not be supported")
+	}
+}
+
+func TestDeriveUserspaceCapabilitiesAllowsBasicScreenProfile(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", ScreenProfile: "basic"},
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"basic": {
+			Name: "basic",
+			TCP:  config.TCPScreen{Land: true, SynFin: true},
+			ICMP: config.ICMPScreen{FloodThreshold: 100},
+		},
+	}
+	caps := deriveUserspaceCapabilities(cfg)
+	if !caps.ForwardingSupported {
+		t.Fatalf("ForwardingSupported = false, reasons: %+v", caps.UnsupportedReasons)
+	}
+}
+
+func TestDeriveUserspaceCapabilitiesRejectsSynCookieScreen(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", ScreenProfile: "flood"},
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"flood": {
+			Name: "flood",
+			TCP:  config.TCPScreen{SynFlood: &config.SynFloodConfig{AttackThreshold: 100}},
+		},
+	}
+	caps := deriveUserspaceCapabilities(cfg)
+	if caps.ForwardingSupported {
+		t.Fatal("ForwardingSupported = true, want false (syn-cookie)")
+	}
+}
+
+func TestBuildScreenSnapshotsMatchesZoneToProfile(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust":   {Name: "trust", ScreenProfile: "basic"},
+		"untrust": {Name: "untrust"},
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"basic": {
+			Name: "basic",
+			TCP:  config.TCPScreen{Land: true, SynFin: true},
+			ICMP: config.ICMPScreen{FloodThreshold: 50},
+		},
+	}
+	snaps := buildScreenSnapshots(cfg)
+	if len(snaps) != 1 {
+		t.Fatalf("len(snaps) = %d, want 1", len(snaps))
+	}
+	if snaps[0].Zone != "trust" {
+		t.Fatalf("Zone = %q, want trust", snaps[0].Zone)
+	}
+	if !snaps[0].Land || !snaps[0].SynFin {
+		t.Fatalf("unexpected screen flags: %+v", snaps[0])
+	}
+	if snaps[0].ICMPFloodThreshold != 50 {
+		t.Fatalf("ICMPFloodThreshold = %d, want 50", snaps[0].ICMPFloodThreshold)
+	}
+}
+
 func TestDeriveUserspaceCapabilitiesAllowsSessionTimeouts(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Flow.TCPSession = &config.TCPSessionConfig{

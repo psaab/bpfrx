@@ -213,31 +213,20 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	if !userspaceSupportsSecurityPolicies(cfg) {
 		addReason("full security policy semantics are not implemented in the userspace dataplane")
 	}
-	if !userspaceSupportsSourceNAT(cfg.Security.NAT.Source) {
-		addReason("source NAT pool mode is not implemented in the userspace dataplane")
-	}
-	if cfg.Security.NAT.Destination != nil && len(cfg.Security.NAT.Destination.RuleSets) > 0 {
-		addReason("destination NAT is not implemented in the userspace dataplane")
-	}
-	// Static NAT (1:1) is supported — check only for unsupported NPTv6 rules
-	for _, rs := range cfg.Security.NAT.Static {
-		if rs == nil {
-			continue
-		}
-		for _, rule := range rs.Rules {
-			if rule != nil && rule.IsNPTv6 {
-				addReason("NPTv6 is not implemented in the userspace dataplane")
-				break
-			}
-		}
+	if !userspaceSupportsSourceNAT(cfg.Security.NAT.Source) ||
+		(cfg.Security.NAT.Destination != nil && len(cfg.Security.NAT.Destination.RuleSets) > 0) ||
+		hasNonNptv6StaticNAT(cfg) ||
+		cfg.Security.NAT.NATv6v4 != nil {
+		addReason("full NAT features (destination NAT, static NAT, NATv6v4) are not implemented in the userspace dataplane")
 	}
 	// NAT64 is supported — NATv6v4 config (no-v6-frag-header option) is fine
 	// Session timeouts (TCP/UDP/ICMP) are supported — only gate on unsupported flow features
-	if cfg.Security.Flow.GREPerformanceAcceleration ||
-		cfg.Security.Flow.TCPMSSIPsecVPN != 0 ||
-		cfg.Security.Flow.TCPMSSGreIn != 0 ||
-		cfg.Security.Flow.TCPMSSGreOut != 0 {
-		addReason("GRE acceleration and TCP MSS clamping are not implemented in the userspace dataplane")
+	// TCP MSS clamping is supported in the userspace dataplane
+	if cfg.Security.Flow.GREPerformanceAcceleration {
+		addReason("GRE acceleration is not implemented in the userspace dataplane")
+	}
+	if !userspaceSupportsScreenProfiles(cfg) {
+		addReason("screen features requiring SYN cookies, port scan, IP sweep, or session limiting are not implemented in the userspace dataplane")
 	}
 	if len(cfg.Firewall.FiltersInet) > 0 || len(cfg.Firewall.FiltersInet6) > 0 ||
 		len(cfg.Firewall.Policers) > 0 || len(cfg.Firewall.ThreeColorPolicers) > 0 {
@@ -565,6 +554,8 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		StaticNAT:      buildStaticNATSnapshots(cfg),
 		DestinationNAT: buildDestinationNATSnapshots(cfg),
 		NAT64:          buildNAT64Snapshots(cfg),
+		Nptv6:          buildNptv6Snapshots(cfg),
+		Screens:        buildScreenSnapshots(cfg),
 		Config:        cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
@@ -1354,10 +1345,129 @@ func buildNAT64Snapshots(cfg *config.Config) []NAT64RuleSnapshot {
 	return out
 }
 
+func buildNptv6Snapshots(cfg *config.Config) []Nptv6RuleSnapshot {
+	if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
+		return nil
+	}
+	var out []Nptv6RuleSnapshot
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || !rule.IsNPTv6 {
+				continue
+			}
+			out = append(out, Nptv6RuleSnapshot{
+				Name:           rule.Name,
+				FromZone:       rs.FromZone,
+				ExternalPrefix: rule.Match,
+				InternalPrefix: rule.Then,
+			})
+		}
+	}
+	return out
+}
+
+// hasNonNptv6StaticNAT returns true if the config has any static NAT rules
+// that are NOT NPTv6. NPTv6 rules are supported by the userspace dataplane.
+func hasNonNptv6StaticNAT(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule != nil && !rule.IsNPTv6 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
+	if cfg == nil || len(cfg.Security.Screen) == 0 || len(cfg.Security.Zones) == 0 {
+		return nil
+	}
+	var out []ScreenProfileSnapshot
+	for _, zone := range cfg.Security.Zones {
+		if zone == nil || zone.ScreenProfile == "" {
+			continue
+		}
+		sp := cfg.Security.Screen[zone.ScreenProfile]
+		if sp == nil {
+			continue
+		}
+		snap := ScreenProfileSnapshot{
+			Zone:        zone.Name,
+			Land:        sp.TCP.Land,
+			SynFin:      sp.TCP.SynFin,
+			NoFlag:   sp.TCP.NoFlag,
+			FinNoAck:    sp.TCP.FinNoAck,
+			WinNuke:     sp.TCP.WinNuke,
+			PingDeath:   sp.ICMP.PingDeath,
+			Teardrop:    sp.IP.TearDrop,
+			SourceRoute: sp.IP.SourceRouteOption,
+		}
+		if sp.ICMP.FloodThreshold > 0 {
+			snap.ICMPFloodThreshold = uint32(sp.ICMP.FloodThreshold)
+		}
+		if sp.UDP.FloodThreshold > 0 {
+			snap.UDPFloodThreshold = uint32(sp.UDP.FloodThreshold)
+		}
+		if sp.TCP.SynFlood != nil && sp.TCP.SynFlood.AttackThreshold > 0 {
+			snap.SYNFloodThreshold = uint32(sp.TCP.SynFlood.AttackThreshold)
+		}
+		// Only include profiles that have at least one check enabled
+		if snap.Land || snap.SynFin || snap.NoFlag || snap.FinNoAck ||
+			snap.WinNuke || snap.PingDeath || snap.Teardrop ||
+			snap.SourceRoute ||
+			snap.ICMPFloodThreshold > 0 || snap.UDPFloodThreshold > 0 ||
+			snap.SYNFloodThreshold > 0 {
+			out = append(out, snap)
+		}
+	}
+	return out
+}
+
+// userspaceSupportsScreenProfiles returns true if the configured screen
+// profiles only use checks that the userspace dataplane implements.
+// SYN cookies, port scan/IP sweep tracking, and per-IP session limiting
+// require eBPF-specific facilities and are not supported.
+func userspaceSupportsScreenProfiles(cfg *config.Config) bool {
+	if cfg == nil || len(cfg.Security.Screen) == 0 {
+		return true
+	}
+	if cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie" {
+		return false
+	}
+	for _, sp := range cfg.Security.Screen {
+		if sp == nil {
+			continue
+		}
+		if sp.TCP.PortScanThreshold > 0 {
+			return false
+		}
+		if sp.IP.IPSweepThreshold > 0 {
+			return false
+		}
+		if sp.LimitSession.SourceIPBased > 0 || sp.LimitSession.DestinationIPBased > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func buildFlowSnapshot(cfg *config.Config) FlowSnapshot {
 	snap := FlowSnapshot{
 		AllowDNSReply:      cfg.Security.Flow.AllowDNSReply,
 		AllowEmbeddedICMP:  cfg.Security.Flow.AllowEmbeddedICMP,
+		TCPMSSIPsecVPN:     cfg.Security.Flow.TCPMSSIPsecVPN,
+		TCPMSSGreIn:        cfg.Security.Flow.TCPMSSGreIn,
+		TCPMSSGreOut:       cfg.Security.Flow.TCPMSSGreOut,
 		UDPSessionTimeout:  cfg.Security.Flow.UDPSessionTimeout,
 		ICMPSessionTimeout: cfg.Security.Flow.ICMPSessionTimeout,
 	}

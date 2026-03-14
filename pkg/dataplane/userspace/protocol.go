@@ -50,6 +50,8 @@ type ConfigSnapshot struct {
 	StaticNAT      []StaticNATRuleSnapshot      `json:"static_nat_rules,omitempty"`
 	DestinationNAT []DestinationNATRuleSnapshot `json:"destination_nat_rules,omitempty"`
 	NAT64          []NAT64RuleSnapshot          `json:"nat64_rules,omitempty"`
+	Nptv6          []Nptv6RuleSnapshot          `json:"nptv6_rules,omitempty"`
+	Screens        []ScreenProfileSnapshot      `json:"screens,omitempty"`
 	Config        *config.Config          `json:"config,omitempty"`
 	Userspace     config.UserspaceConfig  `json:"userspace"`
 }
@@ -57,6 +59,10 @@ type ConfigSnapshot struct {
 type FlowSnapshot struct {
 	AllowDNSReply      bool `json:"allow_dns_reply,omitempty"`
 	AllowEmbeddedICMP  bool `json:"allow_embedded_icmp,omitempty"`
+	TCPMSSAllTCP       int  `json:"tcp_mss_all_tcp,omitempty"`
+	TCPMSSIPsecVPN     int  `json:"tcp_mss_ipsec_vpn,omitempty"`
+	TCPMSSGreIn        int  `json:"tcp_mss_gre_in,omitempty"`
+	TCPMSSGreOut       int  `json:"tcp_mss_gre_out,omitempty"`
 	TCPSessionTimeout  int  `json:"tcp_session_timeout,omitempty"`  // seconds, 0=default
 	UDPSessionTimeout  int  `json:"udp_session_timeout,omitempty"`  // seconds, 0=default
 	ICMPSessionTimeout int  `json:"icmp_session_timeout,omitempty"` // seconds, 0=default
@@ -143,6 +149,33 @@ type NAT64RuleSnapshot struct {
 	Name          string   `json:"name"`
 	Prefix        string   `json:"prefix"`         // e.g. "64:ff9b::/96"
 	PoolAddresses []string `json:"pool_addresses"` // resolved IPv4 pool addresses
+}
+
+// Nptv6RuleSnapshot captures an NPTv6 (RFC 6296) stateless prefix translation
+// rule for the userspace dataplane.
+type Nptv6RuleSnapshot struct {
+	Name           string `json:"name"`
+	FromZone       string `json:"from_zone,omitempty"`
+	InternalPrefix string `json:"internal_prefix"` // e.g. "fd35:1940:0027::/48"
+	ExternalPrefix string `json:"external_prefix"` // e.g. "2602:fd41:0070::/48"
+}
+
+// ScreenProfileSnapshot captures a per-zone screen profile for the userspace
+// dataplane. Mirrors the BPF screen_config structure.
+type ScreenProfileSnapshot struct {
+	Zone               string `json:"zone"`
+	Land               bool   `json:"land,omitempty"`
+	SynFin             bool   `json:"syn_fin,omitempty"`
+	NoFlag             bool   `json:"tcp_no_flag,omitempty"`
+	FinNoAck           bool   `json:"fin_no_ack,omitempty"`
+	WinNuke            bool   `json:"winnuke,omitempty"`
+	PingDeath          bool   `json:"ping_death,omitempty"`
+	Teardrop           bool   `json:"teardrop,omitempty"`
+	ICMPFragment       bool   `json:"icmp_fragment,omitempty"`
+	SourceRoute        bool   `json:"source_route,omitempty"`
+	ICMPFloodThreshold uint32 `json:"icmp_flood_threshold,omitempty"`
+	UDPFloodThreshold  uint32 `json:"udp_flood_threshold,omitempty"`
+	SYNFloodThreshold  uint32 `json:"syn_flood_threshold,omitempty"`
 }
 
 type PolicyApplicationSnapshot struct {
@@ -344,6 +377,7 @@ type BindingStatus struct {
 	SessionDeltaDropped   uint64    `json:"session_delta_dropped,omitempty"`
 	SessionDeltaDrained   uint64    `json:"session_delta_drained,omitempty"`
 	PolicyDeniedPackets   uint64    `json:"policy_denied_packets,omitempty"`
+	ScreenDrops           uint64    `json:"screen_drops,omitempty"`
 	SNATPackets           uint64    `json:"snat_packets,omitempty"`
 	DNATPackets           uint64    `json:"dnat_packets,omitempty"`
 	SlowPathPackets       uint64    `json:"slow_path_packets,omitempty"`

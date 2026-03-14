@@ -14,6 +14,9 @@ pub(crate) struct NatDecision {
     /// The forward session key is IPv6 and the reverse session key is IPv4
     /// (or vice versa for the return direction).
     pub(crate) nat64: bool,
+    /// When true, this is an NPTv6 (RFC 6296) stateless prefix translation.
+    /// No L4 checksum update is needed -- the prefix rewrite is checksum-neutral.
+    pub(crate) nptv6: bool,
 }
 
 impl NatDecision {
@@ -30,6 +33,7 @@ impl NatDecision {
             rewrite_src_port: self.rewrite_dst_port.map(|_| original_dst_port),
             rewrite_dst_port: self.rewrite_src_port.map(|_| original_src_port),
             nat64: self.nat64,
+            nptv6: self.nptv6,
         }
     }
 
@@ -42,6 +46,7 @@ impl NatDecision {
             rewrite_src_port: self.rewrite_src_port.or(other.rewrite_src_port),
             rewrite_dst_port: self.rewrite_dst_port.or(other.rewrite_dst_port),
             nat64: self.nat64 || other.nat64,
+            nptv6: self.nptv6 || other.nptv6,
         }
     }
 }
@@ -335,6 +340,7 @@ impl DnatTable {
             rewrite_src_port: None,
             rewrite_dst_port,
             nat64: false,
+            nptv6: false,
         })
     }
 
@@ -817,6 +823,7 @@ mod tests {
             rewrite_src_port: None,
             rewrite_dst_port: Some(8080),
             nat64: false,
+            nptv6: false,
         };
         // Reverse should turn rewrite_dst -> rewrite_src and port mapping too
         let reversed = decision.reverse(

@@ -4,7 +4,9 @@ use super::{
 };
 use crate::nat::{DnatTable, NatDecision, SourceNatRule, StaticNatTable, match_source_nat, parse_source_nat_rules};
 use crate::nat64::{Nat64ReverseInfo, Nat64State};
+use crate::nptv6::Nptv6State;
 use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
+use crate::screen::{ScreenPacketInfo, ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info};
 use crate::prefix::{PrefixV4, PrefixV6};
 use crate::session::{
     ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
@@ -837,6 +839,7 @@ impl Coordinator {
                 binding.session_delta_dropped = snap.session_delta_dropped;
                 binding.session_delta_drained = snap.session_delta_drained;
                 binding.policy_denied_packets = snap.policy_denied_packets;
+                binding.screen_drops = snap.screen_drops;
                 binding.snat_packets = snap.snat_packets;
                 binding.dnat_packets = snap.dnat_packets;
                 binding.slow_path_packets = snap.slow_path_packets;
@@ -985,6 +988,16 @@ struct ForwardingState {
     static_nat: StaticNatTable,
     dnat_table: DnatTable,
     nat64: Nat64State,
+    nptv6: Nptv6State,
+    screen_profiles: FastMap<String, ScreenProfile>,
+    /// TCP MSS clamping: max MSS for all TCP SYN/SYN-ACK packets (0 = disabled).
+    tcp_mss_all_tcp: u16,
+    /// TCP MSS clamping for IPsec VPN traffic (0 = disabled).
+    tcp_mss_ipsec_vpn: u16,
+    /// TCP MSS clamping for GRE ingress traffic (0 = disabled).
+    tcp_mss_gre_in: u16,
+    /// TCP MSS clamping for GRE egress traffic (0 = disabled).
+    tcp_mss_gre_out: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1836,6 +1849,7 @@ fn poll_binding(
     binding_index: usize,
     bindings: &mut [BindingWorker],
     sessions: &mut SessionTable,
+    screen: &mut ScreenState,
     validation: ValidationState,
     now_ns: u64,
     now_secs: u64,
@@ -2119,6 +2133,56 @@ fn poll_binding(
                         meta,
                         forwarding,
                     );
+                    // Screen/IDS check — runs BEFORE session lookup.
+                    // Resolve ingress zone name for screen profile lookup.
+                    if screen.has_profiles() {
+                        if let Some(flow) = flow.as_ref() {
+                            let zone_name = ingress_zone_override
+                                .as_deref()
+                                .or_else(|| forwarding.ifindex_to_zone.get(&(meta.ingress_ifindex as i32)).map(|s| s.as_str()));
+                            if let Some(zone_name) = zone_name {
+                                let l3_off = if meta.ingress_vlan_id > 0 {
+                                    18
+                                } else {
+                                    14 // default Ethernet header
+                                };
+                                let screen_pkt = if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize) {
+                                    extract_screen_info(
+                                        rx_frame,
+                                        meta.addr_family,
+                                        meta.protocol,
+                                        meta.tcp_flags,
+                                        meta.pkt_len,
+                                        flow.src_ip,
+                                        flow.dst_ip,
+                                        flow.forward_key.src_port,
+                                        flow.forward_key.dst_port,
+                                        l3_off,
+                                    )
+                                } else {
+                                    ScreenPacketInfo {
+                                        addr_family: meta.addr_family,
+                                        protocol: meta.protocol,
+                                        tcp_flags: meta.tcp_flags,
+                                        src_ip: flow.src_ip,
+                                        dst_ip: flow.dst_ip,
+                                        src_port: flow.forward_key.src_port,
+                                        dst_port: flow.forward_key.dst_port,
+                                        pkt_len: meta.pkt_len,
+                                        is_fragment: false,
+                                        ip_ihl: 5,
+                                        ip_frag_off: 0,
+                                        ip_total_len: 0,
+                                    }
+                                };
+                                if let ScreenVerdict::Drop(_reason) = screen.check_packet(zone_name, &screen_pkt, now_secs) {
+                                    binding.live.screen_drops.fetch_add(1, Ordering::Relaxed);
+                                    binding.scratch_recycle.push(desc.addr);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let mut debug = flow
                         .as_ref()
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
@@ -2350,11 +2414,29 @@ fn poll_binding(
                             };
                             let pre_routing_dnat = dnat_decision.or(static_dnat_decision);
 
+                            // --- NPTv6 inbound pre-routing ---
+                            // If dst matches an external NPTv6 prefix, translate the
+                            // destination to the internal prefix. This is stateless
+                            // prefix translation (RFC 6296) -- no L4 checksum update.
+                            let nptv6_inbound = if pre_routing_dnat.is_none() {
+                                if let IpAddr::V6(mut dst_v6) = resolution_target {
+                                    if forwarding.nptv6.translate_inbound(&mut dst_v6) {
+                                        Some(dst_v6)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
                             // --- NAT64 pre-routing ---
                             // If dst is IPv6 matching a NAT64 prefix, extract IPv4
                             // dest and allocate an IPv4 SNAT address. Route lookup
                             // must use the IPv4 destination.
-                            let nat64_match = if pre_routing_dnat.is_none() {
+                            let nat64_match = if pre_routing_dnat.is_none() && nptv6_inbound.is_none() {
                                 if let IpAddr::V6(dst_v6) = resolution_target {
                                     forwarding.nat64.match_ipv6_dest(dst_v6).and_then(|(idx, dst_v4)| {
                                         let snat_v4 = forwarding.nat64.allocate_v4_source(idx)?;
@@ -2369,6 +2451,8 @@ fn poll_binding(
 
                             let effective_resolution_target = if let Some((_, dst_v4, _, _)) = &nat64_match {
                                 IpAddr::V4(*dst_v4)
+                            } else if let Some(internal_dst) = nptv6_inbound {
+                                IpAddr::V6(internal_dst)
                             } else {
                                 match &pre_routing_dnat {
                                     Some(d) => d.rewrite_dst.unwrap_or(resolution_target),
@@ -2402,9 +2486,16 @@ fn poll_binding(
                                     ),
                                 )
                             });
+                            let nptv6_nat = nptv6_inbound.map(|internal_dst| NatDecision {
+                                rewrite_src: None,
+                                rewrite_dst: Some(IpAddr::V6(internal_dst)),
+                                nat64: false,
+                                nptv6: true,
+                                ..NatDecision::default()
+                            });
                             let mut decision = SessionDecision {
                                 resolution,
-                                nat: pre_routing_dnat.unwrap_or_default(),
+                                nat: nptv6_nat.or(pre_routing_dnat).unwrap_or_default(),
                             };
                             let (from_zone, to_zone) = zone_pair_for_flow_with_override(
                                 forwarding,
@@ -2512,23 +2603,57 @@ fn poll_binding(
                                             orig_dst_v6: orig_dst_v6,
                                         })
                                     } else {
-                                        // Check static NAT SNAT, then interface SNAT.
+                                        // Check NPTv6 outbound, then static NAT SNAT, then interface SNAT.
                                         // Use merge() to combine with any pre-routing DNAT
                                         // decision rather than overwriting it.
-                                        let snat_decision = forwarding
-                                            .static_nat
-                                            .match_snat(flow.src_ip, &from_zone)
-                                            .or_else(|| {
-                                                match_source_nat_for_flow(
-                                                    forwarding,
-                                                    &from_zone,
-                                                    &to_zone,
-                                                    resolution.egress_ifindex,
-                                                    flow,
-                                                )
-                                            })
-                                            .unwrap_or_default();
-                                        decision.nat = decision.nat.merge(snat_decision);
+                                        if decision.nat.rewrite_dst.is_none() {
+                                            // Try NPTv6 outbound: if src matches an internal prefix,
+                                            // translate to external prefix (stateless, no L4 csum update).
+                                            let nptv6_snat = if let IpAddr::V6(mut src_v6) = flow.src_ip {
+                                                if forwarding.nptv6.translate_outbound(&mut src_v6) {
+                                                    Some(NatDecision {
+                                                        rewrite_src: Some(IpAddr::V6(src_v6)),
+                                                        rewrite_dst: None,
+                                                        nat64: false,
+                                                        nptv6: true,
+                                                        ..NatDecision::default()
+                                                    })
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            };
+                                            decision.nat = nptv6_snat
+                                                .or_else(|| forwarding
+                                                    .static_nat
+                                                    .match_snat(flow.src_ip, &from_zone))
+                                                .or_else(|| {
+                                                    match_source_nat_for_flow(
+                                                        forwarding,
+                                                        &from_zone,
+                                                        &to_zone,
+                                                        resolution.egress_ifindex,
+                                                        flow,
+                                                    )
+                                                })
+                                                .unwrap_or_default();
+                                        } else {
+                                            let snat_decision = forwarding
+                                                .static_nat
+                                                .match_snat(flow.src_ip, &from_zone)
+                                                .or_else(|| {
+                                                    match_source_nat_for_flow(
+                                                        forwarding,
+                                                        &from_zone,
+                                                        &to_zone,
+                                                        resolution.egress_ifindex,
+                                                        flow,
+                                                    )
+                                                })
+                                                .unwrap_or_default();
+                                            decision.nat = decision.nat.merge(snat_decision);
+                                        }
                                         None
                                     };
                                     let mut created = 0u64;
@@ -5943,6 +6068,8 @@ fn worker_loop(
 ) {
     pin_current_thread(worker_id);
     let mut sessions = SessionTable::new();
+    let mut screen_state = ScreenState::new();
+    screen_state.update_profiles(forwarding.screen_profiles.clone());
     sessions.set_timeouts(forwarding.session_timeouts);
     let mut bindings = Vec::with_capacity(binding_plans.len());
     for plan in binding_plans {
@@ -6050,6 +6177,7 @@ fn worker_loop(
                 idx,
                 &mut bindings,
                 &mut sessions,
+                &mut screen_state,
                 validation,
                 loop_now_ns,
                 loop_now_secs,
@@ -6585,6 +6713,33 @@ fn ifinfo_from_binding(
     Ok(info)
 }
 
+fn build_screen_profiles(snapshot: &ConfigSnapshot) -> FxHashMap<String, ScreenProfile> {
+    let mut profiles = FxHashMap::default();
+    for sp in &snapshot.screens {
+        if sp.zone.is_empty() {
+            continue;
+        }
+        profiles.insert(
+            sp.zone.clone(),
+            ScreenProfile {
+                land: sp.land,
+                syn_fin: sp.syn_fin,
+                no_flag: sp.tcp_no_flag,
+                fin_no_ack: sp.fin_no_ack,
+                winnuke: sp.winnuke,
+                ping_death: sp.ping_death,
+                teardrop: sp.teardrop,
+                icmp_fragment: sp.icmp_fragment,
+                source_route: sp.source_route,
+                icmp_flood_threshold: sp.icmp_flood_threshold,
+                udp_flood_threshold: sp.udp_flood_threshold,
+                syn_flood_threshold: sp.syn_flood_threshold,
+            },
+        );
+    }
+    profiles
+}
+
 fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     let mut state = ForwardingState::default();
     let mut name_to_ifindex = BTreeMap::new();
@@ -6795,6 +6950,12 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     state.static_nat = StaticNatTable::from_snapshots(&snapshot.static_nat_rules);
     state.dnat_table = DnatTable::from_snapshots(&snapshot.destination_nat_rules);
     state.nat64 = Nat64State::from_snapshots(&snapshot.nat64_rules);
+    state.nptv6 = Nptv6State::from_snapshots(&snapshot.nptv6_rules);
+    state.screen_profiles = build_screen_profiles(snapshot);
+    state.tcp_mss_all_tcp = snapshot.flow.tcp_mss_all_tcp;
+    state.tcp_mss_ipsec_vpn = snapshot.flow.tcp_mss_ipsec_vpn;
+    state.tcp_mss_gre_in = snapshot.flow.tcp_mss_gre_in;
+    state.tcp_mss_gre_out = snapshot.flow.tcp_mss_gre_out;
 
     // Add static NAT external IPs as local delivery targets so inbound
     // traffic destined to external IPs is recognized by the firewall.
@@ -6850,10 +7011,11 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             state.local_v4, state.interface_nat_v4,
         );
         eprintln!(
-            "FWD_STATE: snat_rules={} static_nat={} dnat_table={} connected_v4={} routes_v4={}",
+            "FWD_STATE: snat_rules={} static_nat={} dnat_table={} nptv6={} connected_v4={} routes_v4={}",
             state.source_nat_rules.len(),
             if state.static_nat.is_empty() { 0 } else { state.static_nat.external_ips().count() },
             if state.dnat_table.is_empty() { 0 } else { state.dnat_table.destination_ips().count() },
+            if state.nptv6.is_empty() { 0 } else { state.nptv6.external_prefixes().len() },
             state.connected_v4.len(),
             state.routes_v4.values().map(|v| v.len()).sum::<usize>(),
         );
@@ -7590,6 +7752,143 @@ fn enforce_ha_resolution_snapshot(
         };
     }
     resolution
+}
+
+/// Return the effective TCP MSS clamp value for the current config.
+/// Returns 0 if MSS clamping is disabled.
+fn effective_tcp_mss(forwarding: &ForwardingState) -> u16 {
+    if forwarding.tcp_mss_all_tcp > 0 {
+        return forwarding.tcp_mss_all_tcp;
+    }
+    // IPsec VPN and GRE MSS values are returned when configured;
+    // the caller is responsible for checking the tunnel context.
+    if forwarding.tcp_mss_ipsec_vpn > 0 {
+        return forwarding.tcp_mss_ipsec_vpn;
+    }
+    0
+}
+
+/// Clamp TCP MSS option in-place in an L3 packet (starting at IP header).
+/// `max_mss` is the maximum allowed MSS value.
+/// Returns true if the MSS was clamped.
+fn clamp_tcp_mss(packet: &mut [u8], max_mss: u16) -> bool {
+    if max_mss == 0 {
+        return false;
+    }
+    // Determine L3 header length and protocol.
+    if packet.is_empty() {
+        return false;
+    }
+    let version = packet[0] >> 4;
+    let (l4_offset, protocol) = match version {
+        4 => {
+            if packet.len() < 20 {
+                return false;
+            }
+            let ihl = (packet[0] & 0x0F) as usize * 4;
+            (ihl, packet[9])
+        }
+        6 => {
+            if packet.len() < 40 {
+                return false;
+            }
+            (40, packet[6])
+        }
+        _ => return false,
+    };
+    if protocol != PROTO_TCP {
+        return false;
+    }
+    let tcp = match packet.get_mut(l4_offset..) {
+        Some(s) if s.len() >= 20 => s,
+        _ => return false,
+    };
+    let flags = tcp[13];
+    // Only clamp on SYN or SYN+ACK
+    if (flags & 0x02) == 0 {
+        return false;
+    }
+    let data_offset = ((tcp[12] >> 4) as usize) * 4;
+    if data_offset < 20 || tcp.len() < data_offset {
+        return false;
+    }
+    // Walk TCP options looking for MSS (kind=2, len=4)
+    let mut pos = 20;
+    while pos + 4 <= data_offset {
+        let kind = tcp[pos];
+        if kind == 0 {
+            break; // end of options
+        }
+        if kind == 1 {
+            pos += 1; // NOP
+            continue;
+        }
+        let opt_len = tcp[pos + 1] as usize;
+        if opt_len < 2 || pos + opt_len > data_offset {
+            break;
+        }
+        if kind == 2 && opt_len == 4 {
+            let current_mss = u16::from_be_bytes([tcp[pos + 2], tcp[pos + 3]]);
+            if current_mss > max_mss {
+                // Clamp MSS and adjust TCP checksum
+                let old_bytes = [tcp[pos + 2], tcp[pos + 3]];
+                tcp[pos + 2..pos + 4].copy_from_slice(&max_mss.to_be_bytes());
+                // Incremental checksum update
+                let old_val = u16::from_be_bytes(old_bytes) as u32;
+                let new_val = max_mss as u32;
+                let old_csum = u16::from_be_bytes([tcp[16], tcp[17]]) as u32;
+                let mut sum = (!old_csum & 0xFFFF) + old_val + (!new_val & 0xFFFF);
+                sum = (sum & 0xFFFF) + (sum >> 16);
+                sum = (sum & 0xFFFF) + (sum >> 16);
+                tcp[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+                return true;
+            }
+            return false;
+        }
+        pos += opt_len;
+    }
+    false
+}
+
+/// Clamp TCP MSS in a full Ethernet frame starting at `l3_offset`.
+fn clamp_tcp_mss_frame(frame: &mut [u8], l3_offset: usize, max_mss: u16) -> bool {
+    if max_mss == 0 || l3_offset >= frame.len() {
+        return false;
+    }
+    clamp_tcp_mss(&mut frame[l3_offset..], max_mss)
+}
+
+const ICMP_TE_MAX_PER_SEC: u32 = 100;
+
+/// Rate limiter for ICMP Time Exceeded messages.
+struct IcmpTeRateLimiter {
+    max_per_sec: u32,
+    count: u32,
+    window_start_ns: u64,
+}
+
+impl IcmpTeRateLimiter {
+    fn new(max_per_sec: u32) -> Self {
+        Self {
+            max_per_sec,
+            count: 0,
+            window_start_ns: 0,
+        }
+    }
+
+    fn allow(&mut self, now_ns: u64) -> bool {
+        let window = now_ns / 1_000_000_000;
+        let prev_window = self.window_start_ns / 1_000_000_000;
+        if window != prev_window {
+            self.count = 0;
+            self.window_start_ns = now_ns;
+        }
+        if self.count >= self.max_per_sec {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -8968,19 +9267,26 @@ fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
         _ => None,
     });
 
-    // --- IPv6 address rewriting ---
+    // NPTv6 (RFC 6296): prefix translation is checksum-neutral by design --
+    // the adjustment word preserves the ones-complement sum of the full address.
+    // Skip L4 checksum updates entirely for NPTv6 rewrites.
+    let skip_l4_csum = nat.nptv6;
     if new_src.is_some() && new_dst.is_none() {
         let new_src = new_src?;
         let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
         packet.get_mut(8..24)?.copy_from_slice(&new_src);
-        let new_src_words = ipv6_words_from_octets(new_src);
-        adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
+        if !skip_l4_csum {
+            let new_src_words = ipv6_words_from_octets(new_src);
+            adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
+        }
     } else if new_dst.is_some() && new_src.is_none() {
         let new_dst = new_dst?;
         let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
         packet.get_mut(24..40)?.copy_from_slice(&new_dst);
-        let new_dst_words = ipv6_words_from_octets(new_dst);
-        adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
+        if !skip_l4_csum {
+            let new_dst_words = ipv6_words_from_octets(new_dst);
+            adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
+        }
     } else if new_src.is_some() || new_dst.is_some() {
         let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
         let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
@@ -8990,14 +9296,16 @@ fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
         if let Some(ip) = new_dst {
             packet.get_mut(24..40)?.copy_from_slice(&ip);
         }
-        let new_src_words = new_src.map(ipv6_words_from_octets).unwrap_or(old_src_words);
-        let new_dst_words = new_dst.map(ipv6_words_from_octets).unwrap_or(old_dst_words);
-        match protocol {
-            PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {
-                adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
-                adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
+        if !skip_l4_csum {
+            let new_src_words = new_src.map(ipv6_words_from_octets).unwrap_or(old_src_words);
+            let new_dst_words = new_dst.map(ipv6_words_from_octets).unwrap_or(old_dst_words);
+            match protocol {
+                PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {
+                    adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
+                    adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -10474,6 +10782,7 @@ struct BindingLiveState {
     session_delta_dropped: AtomicU64,
     session_delta_drained: AtomicU64,
     policy_denied_packets: AtomicU64,
+    screen_drops: AtomicU64,
     snat_packets: AtomicU64,
     dnat_packets: AtomicU64,
     slow_path_packets: AtomicU64,
@@ -10538,6 +10847,7 @@ impl BindingLiveState {
             session_delta_dropped: AtomicU64::new(0),
             session_delta_drained: AtomicU64::new(0),
             policy_denied_packets: AtomicU64::new(0),
+            screen_drops: AtomicU64::new(0),
             snat_packets: AtomicU64::new(0),
             dnat_packets: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
@@ -10653,6 +10963,7 @@ impl BindingLiveState {
             session_delta_dropped: self.session_delta_dropped.load(Ordering::Relaxed),
             session_delta_drained: self.session_delta_drained.load(Ordering::Relaxed),
             policy_denied_packets: self.policy_denied_packets.load(Ordering::Relaxed),
+            screen_drops: self.screen_drops.load(Ordering::Relaxed),
             snat_packets: self.snat_packets.load(Ordering::Relaxed),
             dnat_packets: self.dnat_packets.load(Ordering::Relaxed),
             slow_path_packets: self.slow_path_packets.load(Ordering::Relaxed),
@@ -10831,6 +11142,7 @@ struct BindingLiveSnapshot {
     session_delta_dropped: u64,
     session_delta_drained: u64,
     policy_denied_packets: u64,
+    screen_drops: u64,
     snat_packets: u64,
     dnat_packets: u64,
     slow_path_packets: u64,

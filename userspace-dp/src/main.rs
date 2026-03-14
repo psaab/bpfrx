@@ -1,8 +1,10 @@
 mod afxdp;
 mod nat;
 mod nat64;
+mod nptv6;
 mod policy;
 mod prefix;
+mod screen;
 mod session;
 mod slowpath;
 mod state_writer;
@@ -101,6 +103,14 @@ struct FlowSnapshot {
     allow_dns_reply: bool,
     #[serde(rename = "allow_embedded_icmp", default)]
     allow_embedded_icmp: bool,
+    #[serde(rename = "tcp_mss_all_tcp", default)]
+    tcp_mss_all_tcp: u16,
+    #[serde(rename = "tcp_mss_ipsec_vpn", default)]
+    tcp_mss_ipsec_vpn: u16,
+    #[serde(rename = "tcp_mss_gre_in", default)]
+    tcp_mss_gre_in: u16,
+    #[serde(rename = "tcp_mss_gre_out", default)]
+    tcp_mss_gre_out: u16,
     #[serde(rename = "tcp_session_timeout", default)]
     tcp_session_timeout: u64,
     #[serde(rename = "udp_session_timeout", default)]
@@ -164,6 +174,10 @@ struct ConfigSnapshot {
     destination_nat_rules: Vec<DestinationNATRuleSnapshot>,
     #[serde(rename = "nat64_rules", default)]
     nat64_rules: Vec<NAT64RuleSnapshot>,
+    #[serde(rename = "nptv6_rules", default)]
+    nptv6_rules: Vec<Nptv6RuleSnapshot>,
+    #[serde(default)]
+    screens: Vec<ScreenProfileSnapshot>,
     #[serde(default)]
     userspace: serde_json::Value,
     #[serde(default)]
@@ -250,6 +264,46 @@ struct NAT64RuleSnapshot {
     prefix: String,
     #[serde(rename = "pool_addresses", default)]
     pool_addresses: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct Nptv6RuleSnapshot {
+    name: String,
+    #[serde(rename = "from_zone", default)]
+    from_zone: String,
+    #[serde(rename = "internal_prefix", default)]
+    internal_prefix: String,
+    #[serde(rename = "external_prefix", default)]
+    external_prefix: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct ScreenProfileSnapshot {
+    zone: String,
+    #[serde(default)]
+    land: bool,
+    #[serde(rename = "syn_fin", default)]
+    syn_fin: bool,
+    #[serde(rename = "tcp_no_flag", default)]
+    tcp_no_flag: bool,
+    #[serde(rename = "fin_no_ack", default)]
+    fin_no_ack: bool,
+    #[serde(default)]
+    winnuke: bool,
+    #[serde(rename = "ping_death", default)]
+    ping_death: bool,
+    #[serde(default)]
+    teardrop: bool,
+    #[serde(rename = "icmp_fragment", default)]
+    icmp_fragment: bool,
+    #[serde(rename = "source_route", default)]
+    source_route: bool,
+    #[serde(rename = "icmp_flood_threshold", default)]
+    icmp_flood_threshold: u32,
+    #[serde(rename = "udp_flood_threshold", default)]
+    udp_flood_threshold: u32,
+    #[serde(rename = "syn_flood_threshold", default)]
+    syn_flood_threshold: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -635,6 +689,8 @@ struct BindingStatus {
     session_delta_drained: u64,
     #[serde(rename = "policy_denied_packets", default)]
     policy_denied_packets: u64,
+    #[serde(rename = "screen_drops", default)]
+    screen_drops: u64,
     #[serde(rename = "snat_packets", default)]
     snat_packets: u64,
     #[serde(rename = "dnat_packets", default)]
