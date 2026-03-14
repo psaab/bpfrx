@@ -1,5 +1,6 @@
 CLANG ?= clang
 GO ?= go
+CARGO ?= $(HOME)/.cargo/bin/cargo
 BINARY := bpfrxd
 PREFIX ?= /usr/local
 
@@ -12,7 +13,7 @@ LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime
 # eBPF compilation flags
 BPF_CFLAGS := -O2 -g -Wall -Werror -target bpf
 
-.PHONY: all generate build build-ctl proto install clean test test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg build-dpdk-worker build-dpdk clean-dpdk
+.PHONY: all generate build build-ctl build-userspace-dp proto install clean test test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg build-dpdk-worker build-dpdk clean-dpdk
 
 all: generate build build-ctl
 
@@ -27,6 +28,11 @@ build:
 # Build the remote CLI client
 build-ctl:
 	CGO_ENABLED=0 $(GO) build -o cli ./cmd/cli
+
+# Build the userspace dataplane helper
+build-userspace-dp:
+	$(CARGO) build --manifest-path userspace-dp/Cargo.toml --release
+	install -m 0755 userspace-dp/target/release/bpfrx-userspace-dp ./bpfrx-userspace-dp
 
 # Generate protobuf/gRPC code
 proto:
@@ -43,9 +49,10 @@ test:
 	$(GO) test ./...
 
 clean: clean-dpdk
-	rm -f $(BINARY) cli
+	rm -f $(BINARY) cli bpfrx-userspace-dp
 	rm -f pkg/dataplane/*_bpfel.go pkg/dataplane/*_bpfeb.go
 	rm -f pkg/dataplane/*_bpfel.o pkg/dataplane/*_bpfeb.o
+	rm -rf userspace-dp/target
 
 # Test environment management (Incus VM/container)
 .PHONY: test-env-init test-vm test-ct test-deploy test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal

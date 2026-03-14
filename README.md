@@ -4,6 +4,22 @@ eBPF zone-based firewall with native Junos configuration syntax.
 
 bpfrx is a high-performance stateful firewall built on Linux eBPF (XDP + TC) that replicates Juniper vSRX capabilities. It uses the familiar Junos hierarchical configuration syntax and provides a full interactive CLI with tab completion and `?` help.
 
+This branch also carries an experimental userspace dataplane:
+
+- the existing Go control plane still owns config, HA, and runtime reconciliation
+- the default dataplane is still the existing eBPF XDP/TC pipeline
+- an alternate Rust userspace dataplane is being built around:
+  - `userspace-xdp` for the userspace-specific XDP handoff path
+  - `userspace-dp` for AF_XDP workers, slow path, and userspace forwarding
+  - `pkg/dataplane/userspace` for the Go control-plane bridge
+
+That userspace backend is real and testable on the isolated `loss` userspace lab in
+this branch, but it is still experimental. It is not yet feature-parity or
+performance-parity with the main eBPF dataplane. In particular, HA cluster
+ownership and fabric redirect are not yet implemented in the Rust dataplane, so
+HA/fabric configs currently fall back to the legacy XDP/TC dataplane for real
+traffic.
+
 ## Architecture
 
 ```
@@ -11,11 +27,25 @@ XDP Ingress: main -> screen -> zone -> conntrack -> policy -> nat -> nat64 -> fo
 TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 ```
 
+Experimental userspace dataplane on this branch:
+
+```text
+Rust XDP userspace entry
+  -> XSKMAP redirect
+  -> Rust AF_XDP workers
+  -> AF_XDP TX / bounded slow path
+  -> fallback to `xdp_main` for unsupported traffic or config
+```
+
 - **14 BPF programs** (9 XDP ingress + 5 TC egress) chained via tail calls
 - **Go userspace** (cilium/ebpf) handles config compilation, session GC, and management APIs
 - **Per-CPU scratch maps** pass metadata between pipeline stages
 - **Dual session entries** (forward + reverse) in conntrack hash map
 - **Three-phase config compilation**: Junos AST → typed Go structs → eBPF map entries
+- **Experimental userspace path**: Go control plane + Rust AF_XDP dataplane helper +
+  Rust userspace-specific XDP entry, with the legacy XDP/TC firewall kept as the
+  guarded fallback for unsupported traffic and unsupported configs, including the
+  current HA/fabric cluster configuration
 
 ## Features
 
@@ -147,11 +177,18 @@ set security policies from-zone trust to-zone untrust policy allow-all then perm
 
 ## Performance
 
-- **25+ Gbps** with native XDP (i40e/ice PF passthrough)
-- **15.6 Gbps** with virtio-net
-- **Hitless restarts** with zero packet loss
-- **~60ms cluster failover** (30ms VRRP, ~97ms masterDown interval)
-- **Near-instant planned shutdown** (priority-0 burst, peer takes over in ~1ms)
+- **Main eBPF dataplane**
+  - **25+ Gbps** with native XDP (i40e/ice PF passthrough)
+  - **15.6 Gbps** with virtio-net
+  - **Hitless restarts** with zero packet loss
+  - **~60ms cluster failover** (30ms VRRP, ~97ms masterDown interval)
+  - **Near-instant planned shutdown** (priority-0 burst, peer takes over in ~1ms)
+- **Experimental userspace dataplane on this branch**
+  - real AF_XDP forwarding exists on the isolated `loss` userspace lab
+  - throughput is still under active optimization and should not be treated as at-parity
+    with the main XDP dataplane yet
+  - the current target is `22-23 Gbps` IPv4 and IPv6 on the isolated userspace lab,
+    but this branch does not guarantee that today
 
 ## Test Environment
 
@@ -169,6 +206,25 @@ make cluster-init    # Create networks + profile
 make cluster-create  # Launch fw0 + fw1 + LAN host
 make cluster-deploy  # Rolling deploy: secondary first, then primary (preserves traffic)
 ```
+
+Userspace dataplane branch workflow:
+
+```bash
+# Isolated userspace HA cluster on loss
+./scripts/userspace-phase-cycle.sh
+./scripts/userspace-phase-cycle.sh --perf
+./scripts/userspace-perf-compare.sh
+```
+
+Those workflows operate on the tracked isolated userspace cluster:
+
+- env: `test/incus/loss-userspace-cluster.env`
+- config: `docs/ha-cluster-userspace.conf`
+- firewalls:
+  - `loss:bpfrx-userspace-fw0`
+  - `loss:bpfrx-userspace-fw1`
+- host:
+  - `loss:cluster-userspace-host`
 
 ### Cluster Deployment
 
@@ -203,6 +259,7 @@ To deploy to a single node: `make cluster-deploy NODE=0` or `make cluster-deploy
 | `pkg/cmdtree/` | Single source of truth for all CLI command trees |
 | `pkg/configstore/` | Candidate/active/commit/rollback, atomic DB persistence |
 | `pkg/dataplane/` | eBPF loader, map management, bpf2go bindings |
+| `pkg/dataplane/userspace/` | Go bridge for the experimental Rust userspace dataplane |
 | `pkg/daemon/` | Daemon lifecycle, reconciliation, interface management |
 | `pkg/cluster/` | Chassis cluster HA (state machine, session sync, config sync) |
 | `pkg/vrrp/` | Native VRRPv3 state machine (30ms RETH advertisements) |
@@ -228,6 +285,8 @@ To deploy to a single node: `make cluster-deploy NODE=0` or `make cluster-deploy
 | `proto/bpfrx/v1/` | Protobuf service definition |
 | `cmd/bpfrxd/` | Daemon main binary |
 | `cmd/cli/` | Remote CLI client binary |
+| `userspace-xdp/` | Rust userspace-specific XDP entry program |
+| `userspace-dp/` | Rust AF_XDP userspace dataplane process |
 | `docs/` | Protocol docs, test plans, feature gaps |
 | `test/incus/` | Test environment scripts and configs |
 
@@ -243,6 +302,9 @@ See `docs/` for detailed design documents:
 - `optimizations.md` — Performance profiling and optimization notes
 - `test_env.md` — Test topology and validation steps
 - `feature-gaps.md` — vSRX feature parity tracking
+- `xdp-io-uring-userspace-dataplane.md` — Userspace dataplane design and current branch status
+- `userspace-ha-validation.md` — Required deploy/validate cycle for the isolated userspace lab
+- `userspace-perf-compare.md` — Repeatable IPv4/IPv6 `iperf3` + `perf` capture on the isolated userspace lab
 
 ## Requirements
 
