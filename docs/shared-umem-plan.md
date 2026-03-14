@@ -227,7 +227,45 @@ fn rebalance_fill_rings(
 |------|--------|
 | `userspace-dp/src/afxdp.rs` | Shared UMEM creation, frame pool, in-place forwarding |
 
-## Testing
+## Result: NOT FEASIBLE (2026-03-14)
+
+**Shared UMEM across different NICs does not support zero-copy mode.**
+
+The loss cluster has two Mellanox ConnectX-5 NICs on separate PCI buses:
+- ge-0-0-1: `0000:08:00.0` (mlx5_core)
+- ge-0-0-2: `0000:09:00.0` (mlx5_core)
+
+AF_XDP zero-copy requires the NIC driver to DMA-map the UMEM pages. When
+two sockets share one UMEM but bind to different physical NICs, the second
+socket's `bind()` fails with `EINVAL` because the mlx5 driver cannot map
+pages already DMA-mapped by a different device. The fallback is copy mode
+for the second socket, which means:
+
+- First socket: zero-copy (no memcpy on RX/TX)
+- Second socket: copy mode (kernel copies every frame into/out of UMEM)
+
+This is **worse** than the original per-binding UMEM approach where both
+sockets run in zero-copy mode with a single user-space memcpy for cross-
+interface forwarding.
+
+### What would make this work
+
+Shared UMEM zero-copy works when all sockets bind to the **same NIC**
+(same PCI device, different queues). This applies to:
+- Multi-queue on a single NIC (RSS distribution)
+- VLAN sub-interfaces on the same physical port
+
+For cross-NIC forwarding, the memcpy is unavoidable at the AF_XDP level.
+The remaining optimization path is to make the existing memcpy cheaper
+(e.g., page flipping, io_uring registered buffers, or batched copies
+with prefetch).
+
+### Changes reverted
+
+The implementation in `userspace-dp/src/afxdp.rs` was reverted to the
+per-binding UMEM approach. This plan document is retained for reference.
+
+## Original Testing Plan
 
 1. `cargo build --release` — compiles
 2. Deploy to loss cluster: `loss:bpfrx-userspace-fw0` + `loss:bpfrx-userspace-fw1`
