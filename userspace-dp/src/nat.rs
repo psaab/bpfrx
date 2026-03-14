@@ -1,4 +1,4 @@
-use crate::{SourceNATRuleSnapshot, StaticNATRuleSnapshot};
+use crate::{DestinationNATRuleSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot};
 use crate::prefix::{PrefixV4, PrefixV6};
 use ipnet::IpNet;
 use rustc_hash::FxHashMap;
@@ -8,6 +8,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 pub(crate) struct NatDecision {
     pub(crate) rewrite_src: Option<IpAddr>,
     pub(crate) rewrite_dst: Option<IpAddr>,
+    pub(crate) rewrite_src_port: Option<u16>,
+    pub(crate) rewrite_dst_port: Option<u16>,
     /// When true, this is a NAT64 cross-address-family translation.
     /// The forward session key is IPv6 and the reverse session key is IPv4
     /// (or vice versa for the return direction).
@@ -15,11 +17,31 @@ pub(crate) struct NatDecision {
 }
 
 impl NatDecision {
-    pub(crate) fn reverse(self, original_src: IpAddr, original_dst: IpAddr) -> Self {
+    pub(crate) fn reverse(
+        self,
+        original_src: IpAddr,
+        original_dst: IpAddr,
+        original_src_port: u16,
+        original_dst_port: u16,
+    ) -> Self {
         Self {
             rewrite_src: self.rewrite_dst.map(|_| original_dst),
             rewrite_dst: self.rewrite_src.map(|_| original_src),
+            rewrite_src_port: self.rewrite_dst_port.map(|_| original_dst_port),
+            rewrite_dst_port: self.rewrite_src_port.map(|_| original_src_port),
             nat64: self.nat64,
+        }
+    }
+
+    /// Merge two NAT decisions, preferring fields already set in `self`.
+    /// Used to combine a pre-routing DNAT decision with a post-policy SNAT decision.
+    pub(crate) fn merge(self, other: NatDecision) -> Self {
+        Self {
+            rewrite_src: self.rewrite_src.or(other.rewrite_src),
+            rewrite_dst: self.rewrite_dst.or(other.rewrite_dst),
+            rewrite_src_port: self.rewrite_src_port.or(other.rewrite_src_port),
+            rewrite_dst_port: self.rewrite_dst_port.or(other.rewrite_dst_port),
+            nat64: self.nat64 || other.nat64,
         }
     }
 }
@@ -205,6 +227,134 @@ fn nets_match_v6(nets: &[PrefixV6], ip: Ipv6Addr) -> bool {
     nets.is_empty() || nets.iter().any(|net| net.contains(ip))
 }
 
+// ---------------------------------------------------------------------------
+// Destination NAT (DNAT) table — O(1) lookup by (protocol, dst_ip, dst_port)
+// ---------------------------------------------------------------------------
+
+const PROTO_TCP: u8 = 6;
+const PROTO_UDP: u8 = 17;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct DnatKey {
+    pub protocol: u8,
+    pub dst_ip: IpAddr,
+    pub dst_port: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DnatValue {
+    pub new_dst_ip: IpAddr,
+    pub new_dst_port: u16,
+}
+
+/// Destination NAT lookup table.
+///
+/// Entries are keyed by `(protocol, dst_ip, dst_port)`. A wildcard port
+/// entry (`dst_port = 0`) matches any destination port when no exact-port
+/// entry exists.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DnatTable {
+    entries: FxHashMap<DnatKey, DnatValue>,
+}
+
+impl DnatTable {
+    pub(crate) fn from_snapshots(snaps: &[DestinationNATRuleSnapshot]) -> Self {
+        let mut table = DnatTable::default();
+        for snap in snaps {
+            let dst_ip: IpAddr = match snap.destination_address.parse() {
+                Ok(ip) => ip,
+                Err(_) => continue,
+            };
+            let pool_ip: IpAddr = match snap.pool_address.parse() {
+                Ok(ip) => ip,
+                Err(_) => continue,
+            };
+            // Determine protocol(s) to insert entries for.
+            let protos: Vec<u8> = match snap.protocol.as_str() {
+                "tcp" => vec![PROTO_TCP],
+                "udp" => vec![PROTO_UDP],
+                "" => {
+                    if snap.destination_port != 0 {
+                        // Port-based rule with no explicit protocol: default TCP
+                        vec![PROTO_TCP]
+                    } else {
+                        // No protocol, no port: expand to both TCP and UDP
+                        vec![PROTO_TCP, PROTO_UDP]
+                    }
+                }
+                _ => continue,
+            };
+            for proto in protos {
+                table.entries.insert(
+                    DnatKey {
+                        protocol: proto,
+                        dst_ip,
+                        dst_port: snap.destination_port,
+                    },
+                    DnatValue {
+                        new_dst_ip: pool_ip,
+                        new_dst_port: if snap.pool_port != 0 {
+                            snap.pool_port
+                        } else {
+                            snap.destination_port
+                        },
+                    },
+                );
+            }
+        }
+        table
+    }
+
+    /// Look up a DNAT entry for the given packet fields.
+    ///
+    /// 1. Exact match: `(protocol, dst_ip, dst_port)`
+    /// 2. Wildcard port fallback: `(protocol, dst_ip, 0)`
+    pub(crate) fn lookup(&self, protocol: u8, dst_ip: IpAddr, dst_port: u16) -> Option<NatDecision> {
+        let value = self
+            .entries
+            .get(&DnatKey {
+                protocol,
+                dst_ip,
+                dst_port,
+            })
+            .or_else(|| {
+                self.entries.get(&DnatKey {
+                    protocol,
+                    dst_ip,
+                    dst_port: 0,
+                })
+            })?;
+        let rewrite_dst_port = if value.new_dst_port != 0 && value.new_dst_port != dst_port {
+            Some(value.new_dst_port)
+        } else {
+            None
+        };
+        Some(NatDecision {
+            rewrite_src: None,
+            rewrite_dst: Some(value.new_dst_ip),
+            rewrite_src_port: None,
+            rewrite_dst_port,
+            nat64: false,
+        })
+    }
+
+    /// Returns true if the table has any entries.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns all destination IPs (the external/public IPs that DNAT rules match on).
+    /// These must be registered as local addresses so traffic to them is recognized.
+    pub(crate) fn destination_ips(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        // Deduplicate by collecting unique dst_ip values.
+        let mut seen = FxHashMap::default();
+        for key in self.entries.keys() {
+            seen.entry(key.dst_ip).or_insert(());
+        }
+        seen.into_keys()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,7 +443,7 @@ mod tests {
 
     #[test]
     fn reverse_decision_turns_snat_into_reply_dnat() {
-        let decision = NatDecision { 
+        let decision = NatDecision {
             rewrite_src: Some("172.16.80.8".parse().expect("snat")),
             rewrite_dst: None,
          ..NatDecision::default() };
@@ -301,6 +451,8 @@ mod tests {
             decision.reverse(
                 "10.0.61.102".parse().expect("orig src"),
                 "172.16.80.200".parse().expect("orig dst"),
+                12345,
+                443,
             ),
             NatDecision {
                 rewrite_src: None,
@@ -448,7 +600,7 @@ mod tests {
         // reverse().rewrite_dst = self.rewrite_src.map(|_| original_src) = None
         let original_src: IpAddr = "198.51.100.1".parse().expect("peer");
         let original_dst: IpAddr = "203.0.113.10".parse().expect("ext");
-        let reverse = dnat.reverse(original_src, original_dst);
+        let reverse = dnat.reverse(original_src, original_dst, 54321, 80);
         assert_eq!(
             reverse,
             NatDecision {
@@ -518,5 +670,291 @@ mod tests {
         assert_eq!(ips.len(), 2);
         assert!(ips.contains(&"203.0.113.10".parse::<IpAddr>().unwrap()));
         assert!(ips.contains(&"203.0.113.20".parse::<IpAddr>().unwrap()));
+    }
+
+    // --- DNAT table tests ---
+
+    #[test]
+    fn dnat_basic_lookup_tcp() {
+        let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
+            name: "web".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }]);
+        let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80);
+        assert_eq!(
+            decision,
+            Some(NatDecision {
+                rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+                rewrite_dst_port: Some(8080),
+                ..NatDecision::default()
+            })
+        );
+    }
+
+    #[test]
+    fn dnat_wildcard_port_fallback() {
+        // port=0 entry matches any destination port
+        let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
+            name: "any-port".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 0,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 0,
+            ..DestinationNATRuleSnapshot::default()
+        }]);
+        // Any port should match via wildcard
+        let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 12345);
+        assert!(decision.is_some());
+        let d = decision.unwrap();
+        assert_eq!(d.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
+        // port=0 wildcard: no port rewrite
+        assert_eq!(d.rewrite_dst_port, None);
+    }
+
+    #[test]
+    fn dnat_protocol_specificity() {
+        // TCP entry should not match UDP lookups
+        let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
+            name: "tcp-only".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }]);
+        assert!(table
+            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80)
+            .is_some());
+        assert!(table
+            .lookup(PROTO_UDP, "203.0.113.10".parse().unwrap(), 80)
+            .is_none());
+    }
+
+    #[test]
+    fn dnat_ipv6_lookup() {
+        let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
+            name: "web-v6".to_string(),
+            destination_address: "2001:db8::1".to_string(),
+            destination_port: 443,
+            protocol: "tcp".to_string(),
+            pool_address: "fd00::1".to_string(),
+            pool_port: 8443,
+            ..DestinationNATRuleSnapshot::default()
+        }]);
+        let decision = table.lookup(PROTO_TCP, "2001:db8::1".parse().unwrap(), 443);
+        assert_eq!(
+            decision,
+            Some(NatDecision {
+                rewrite_dst: Some("fd00::1".parse().unwrap()),
+                rewrite_dst_port: Some(8443),
+                ..NatDecision::default()
+            })
+        );
+    }
+
+    #[test]
+    fn dnat_multiple_entries() {
+        let table = DnatTable::from_snapshots(&[
+            DestinationNATRuleSnapshot {
+                name: "http".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                name: "https".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ]);
+        let http = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80);
+        assert_eq!(http.unwrap().rewrite_dst_port, Some(8080));
+        let https = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443);
+        assert_eq!(https.unwrap().rewrite_dst_port, Some(8443));
+    }
+
+    #[test]
+    fn dnat_no_match_returns_none() {
+        let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
+            name: "web".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }]);
+        // Different IP
+        assert!(table
+            .lookup(PROTO_TCP, "203.0.113.99".parse().unwrap(), 80)
+            .is_none());
+        // Different port (no wildcard entry)
+        assert!(table
+            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443)
+            .is_none());
+    }
+
+    #[test]
+    fn dnat_port_aware_reverse() {
+        // DNAT: rewrite dst to internal, rewrite dst_port from 80 to 8080
+        let decision = NatDecision {
+            rewrite_src: None,
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            rewrite_src_port: None,
+            rewrite_dst_port: Some(8080),
+            nat64: false,
+        };
+        // Reverse should turn rewrite_dst -> rewrite_src and port mapping too
+        let reversed = decision.reverse(
+            "198.51.100.1".parse().unwrap(), // original src
+            "203.0.113.10".parse().unwrap(), // original dst
+            54321,                           // original src_port
+            80,                              // original dst_port
+        );
+        assert_eq!(reversed.rewrite_src, Some("203.0.113.10".parse().unwrap()));
+        assert_eq!(reversed.rewrite_dst, None);
+        assert_eq!(reversed.rewrite_src_port, Some(80));
+        assert_eq!(reversed.rewrite_dst_port, None);
+    }
+
+    #[test]
+    fn dnat_snat_merge_preserves_both() {
+        let dnat = NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        };
+        let snat = NatDecision {
+            rewrite_src: Some("10.0.0.1".parse().unwrap()),
+            ..NatDecision::default()
+        };
+        let merged = dnat.merge(snat);
+        assert_eq!(merged.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
+        assert_eq!(merged.rewrite_dst_port, Some(8080));
+        assert_eq!(merged.rewrite_src, Some("10.0.0.1".parse().unwrap()));
+        assert_eq!(merged.rewrite_src_port, None);
+    }
+
+    #[test]
+    fn default_nat_decision_unchanged() {
+        let d = NatDecision::default();
+        assert_eq!(d.rewrite_src, None);
+        assert_eq!(d.rewrite_dst, None);
+        assert_eq!(d.rewrite_src_port, None);
+        assert_eq!(d.rewrite_dst_port, None);
+        assert!(!d.nat64);
+    }
+
+    #[test]
+    fn dnat_empty_protocol_expands_to_both() {
+        let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
+            name: "both".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 0,
+            protocol: String::new(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 0,
+            ..DestinationNATRuleSnapshot::default()
+        }]);
+        // Both TCP and UDP should match
+        assert!(table
+            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 53)
+            .is_some());
+        assert!(table
+            .lookup(PROTO_UDP, "203.0.113.10".parse().unwrap(), 53)
+            .is_some());
+    }
+
+    #[test]
+    fn dnat_same_port_no_port_rewrite() {
+        // When pool_port == destination_port, no port rewrite needed
+        let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
+            name: "same-port".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 80,
+            ..DestinationNATRuleSnapshot::default()
+        }]);
+        let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80).unwrap();
+        assert_eq!(decision.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
+        // Same port: no rewrite needed
+        assert_eq!(decision.rewrite_dst_port, None);
+    }
+
+    #[test]
+    fn dnat_destination_ips_iterator() {
+        let table = DnatTable::from_snapshots(&[
+            DestinationNATRuleSnapshot {
+                name: "web".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                name: "ssh".to_string(),
+                destination_address: "203.0.113.20".to_string(),
+                destination_port: 22,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.20".to_string(),
+                pool_port: 22,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ]);
+        let mut ips: Vec<IpAddr> = table.destination_ips().collect();
+        ips.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        assert_eq!(ips.len(), 2);
+        assert!(ips.contains(&"203.0.113.10".parse::<IpAddr>().unwrap()));
+        assert!(ips.contains(&"203.0.113.20".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn dnat_exact_port_beats_wildcard() {
+        let table = DnatTable::from_snapshots(&[
+            DestinationNATRuleSnapshot {
+                name: "wildcard".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 0,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.100".to_string(),
+                pool_port: 0,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                name: "exact".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ]);
+        // Exact match should win over wildcard
+        let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80).unwrap();
+        assert_eq!(decision.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
+        assert_eq!(decision.rewrite_dst_port, Some(8080));
+        // Non-matching port should fall through to wildcard
+        let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443).unwrap();
+        assert_eq!(decision.rewrite_dst, Some("192.168.1.100".parse().unwrap()));
+        assert_eq!(decision.rewrite_dst_port, None);
     }
 }

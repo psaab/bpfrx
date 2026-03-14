@@ -2,7 +2,7 @@ use super::{
     BindingStatus, ConfigSnapshot, ExceptionStatus, HAGroupStatus, InjectPacketRequest,
     InterfaceSnapshot, PacketResolution, SessionDeltaInfo,
 };
-use crate::nat::{NatDecision, SourceNatRule, StaticNatTable, match_source_nat, parse_source_nat_rules};
+use crate::nat::{DnatTable, NatDecision, SourceNatRule, StaticNatTable, match_source_nat, parse_source_nat_rules};
 use crate::nat64::{Nat64ReverseInfo, Nat64State};
 use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
 use crate::prefix::{PrefixV4, PrefixV6};
@@ -981,6 +981,7 @@ struct ForwardingState {
     policy: PolicyState,
     source_nat_rules: Vec<SourceNatRule>,
     static_nat: StaticNatTable,
+    dnat_table: DnatTable,
     nat64: Nat64State,
 }
 
@@ -2318,11 +2319,10 @@ fn poll_binding(
                                 parse_packet_destination(unsafe { &*area }, desc, meta)
                                     .unwrap_or(flow.dst_ip);
 
-                            // --- Static NAT DNAT (pre-routing) ---
-                            // Check if the packet's destination matches a static NAT
-                            // external IP. If so, the routing lookup must use the
-                            // translated (internal) IP so the packet reaches the
-                            // correct host.
+                            // --- DNAT pre-routing ---
+                            // Check DNAT table first (port-based DNAT), then
+                            // fall back to static NAT DNAT (IP-only 1:1).
+                            // The translated destination affects FIB lookup.
                             let ingress_zone_name = ingress_zone_override
                                 .as_deref()
                                 .or_else(|| {
@@ -2332,14 +2332,27 @@ fn poll_binding(
                                         .map(|s| s.as_str())
                                 })
                                 .unwrap_or("");
-                            let static_dnat_decision =
-                                forwarding.static_nat.match_dnat(resolution_target, ingress_zone_name);
+                            let dnat_decision = if !forwarding.dnat_table.is_empty() {
+                                forwarding.dnat_table.lookup(
+                                    meta.protocol,
+                                    resolution_target,
+                                    flow.forward_key.dst_port,
+                                )
+                            } else {
+                                None
+                            };
+                            let static_dnat_decision = if dnat_decision.is_none() {
+                                forwarding.static_nat.match_dnat(resolution_target, ingress_zone_name)
+                            } else {
+                                None
+                            };
+                            let pre_routing_dnat = dnat_decision.or(static_dnat_decision);
 
                             // --- NAT64 pre-routing ---
                             // If dst is IPv6 matching a NAT64 prefix, extract IPv4
                             // dest and allocate an IPv4 SNAT address. Route lookup
                             // must use the IPv4 destination.
-                            let nat64_match = if static_dnat_decision.is_none() {
+                            let nat64_match = if pre_routing_dnat.is_none() {
                                 if let IpAddr::V6(dst_v6) = resolution_target {
                                     forwarding.nat64.match_ipv6_dest(dst_v6).and_then(|(idx, dst_v4)| {
                                         let snat_v4 = forwarding.nat64.allocate_v4_source(idx)?;
@@ -2355,7 +2368,7 @@ fn poll_binding(
                             let effective_resolution_target = if let Some((_, dst_v4, _, _)) = &nat64_match {
                                 IpAddr::V4(*dst_v4)
                             } else {
-                                match &static_dnat_decision {
+                                match &pre_routing_dnat {
                                     Some(d) => d.rewrite_dst.unwrap_or(resolution_target),
                                     None => resolution_target,
                                 }
@@ -2389,7 +2402,7 @@ fn poll_binding(
                             });
                             let mut decision = SessionDecision {
                                 resolution,
-                                nat: static_dnat_decision.unwrap_or_default(),
+                                nat: pre_routing_dnat.unwrap_or_default(),
                             };
                             let (from_zone, to_zone) = zone_pair_for_flow_with_override(
                                 forwarding,
@@ -2484,24 +2497,23 @@ fn poll_binding(
                                             orig_dst_v6: orig_dst_v6,
                                         })
                                     } else {
-                                        // If static NAT DNAT already matched (pre-routing),
-                                        // keep that decision. Otherwise check static NAT
-                                        // SNAT, then fall through to interface SNAT.
-                                        if decision.nat.rewrite_dst.is_none() {
-                                            decision.nat = forwarding
-                                                .static_nat
-                                                .match_snat(flow.src_ip, &from_zone)
-                                                .or_else(|| {
-                                                    match_source_nat_for_flow(
-                                                        forwarding,
-                                                        &from_zone,
-                                                        &to_zone,
-                                                        resolution.egress_ifindex,
-                                                        flow,
-                                                    )
-                                                })
-                                                .unwrap_or_default();
-                                        }
+                                        // Check static NAT SNAT, then interface SNAT.
+                                        // Use merge() to combine with any pre-routing DNAT
+                                        // decision rather than overwriting it.
+                                        let snat_decision = forwarding
+                                            .static_nat
+                                            .match_snat(flow.src_ip, &from_zone)
+                                            .or_else(|| {
+                                                match_source_nat_for_flow(
+                                                    forwarding,
+                                                    &from_zone,
+                                                    &to_zone,
+                                                    resolution.egress_ifindex,
+                                                    flow,
+                                                )
+                                            })
+                                            .unwrap_or_default();
+                                        decision.nat = decision.nat.merge(snat_decision);
                                         None
                                     };
                                     let mut created = 0u64;
@@ -2562,7 +2574,12 @@ fn poll_binding(
                                     // cached decision when neighbor convergence is still in flight.
                                     let reverse_decision = SessionDecision {
                                         resolution: reverse_resolution,
-                                        nat: decision.nat.reverse(flow.src_ip, flow.dst_ip),
+                                        nat: decision.nat.reverse(
+                                            flow.src_ip,
+                                            flow.dst_ip,
+                                            flow.forward_key.src_port,
+                                            flow.forward_key.dst_port,
+                                        ),
                                     };
                                     // For NAT64: the reverse key is IPv4 (different AF
                                     // from the forward IPv6 key). The reply arrives as
@@ -4593,6 +4610,8 @@ fn flush_session_deltas(
                 .rewrite_dst
                 .map(|ip| ip.to_string())
                 .unwrap_or_default(),
+            nat_src_port: delta.decision.nat.rewrite_src_port.unwrap_or(0),
+            nat_dst_port: delta.decision.nat.rewrite_dst_port.unwrap_or(0),
         };
         live.push_session_delta(info.clone());
         if let Ok(mut recent) = recent_session_deltas.lock() {
@@ -5436,7 +5455,10 @@ fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> SessionKey {
     let (src_port, dst_port) = if matches!(key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
         (key.src_port, key.dst_port)
     } else {
-        (key.dst_port, key.src_port)
+        (
+            nat.rewrite_dst_port.unwrap_or(key.dst_port),
+            nat.rewrite_src_port.unwrap_or(key.src_port),
+        )
     };
     let wire_src = nat.rewrite_dst.unwrap_or(key.dst_ip);
     let wire_dst = nat.rewrite_src.unwrap_or(key.src_ip);
@@ -5817,7 +5839,12 @@ fn repair_reverse_session_from_forward(
         nat: forward_match
             .decision
             .nat
-            .reverse(forward_match.key.src_ip, forward_match.key.dst_ip),
+            .reverse(
+                forward_match.key.src_ip,
+                forward_match.key.dst_ip,
+                forward_match.key.src_port,
+                forward_match.key.dst_port,
+            ),
     };
     let reverse_metadata = SessionMetadata {
         ingress_zone: forward_match.metadata.egress_zone.clone(),
@@ -6744,6 +6771,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.source_nat_rules = parse_source_nat_rules(&snapshot.source_nat_rules);
     state.static_nat = StaticNatTable::from_snapshots(&snapshot.static_nat_rules);
+    state.dnat_table = DnatTable::from_snapshots(&snapshot.destination_nat_rules);
     state.nat64 = Nat64State::from_snapshots(&snapshot.nat64_rules);
 
     // Add static NAT external IPs as local delivery targets so inbound
@@ -6755,6 +6783,19 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             }
             IpAddr::V6(v6) => {
                 state.local_v6.insert(*v6);
+            }
+        }
+    }
+
+    // Add DNAT destination IPs as local delivery targets so traffic
+    // to those IPs is recognized as locally-destined and processed.
+    for dst_ip in state.dnat_table.destination_ips() {
+        match dst_ip {
+            IpAddr::V4(v4) => {
+                state.local_v4.insert(v4);
+            }
+            IpAddr::V6(v6) => {
+                state.local_v6.insert(v6);
             }
         }
     }
@@ -6787,9 +6828,10 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             state.local_v4, state.interface_nat_v4,
         );
         eprintln!(
-            "FWD_STATE: snat_rules={} static_nat={} connected_v4={} routes_v4={}",
+            "FWD_STATE: snat_rules={} static_nat={} dnat_table={} connected_v4={} routes_v4={}",
             state.source_nat_rules.len(),
             if state.static_nat.is_empty() { 0 } else { state.static_nat.external_ips().count() },
+            if state.dnat_table.is_empty() { 0 } else { state.dnat_table.destination_ips().count() },
             state.connected_v4.len(),
             state.routes_v4.values().map(|v| v.len()).sum::<usize>(),
         );
@@ -8721,42 +8763,46 @@ fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
     if ihl < 20 || packet.len() < ihl {
         return None;
     }
+
+    // --- IP address rewriting ---
     if new_src.is_some() && new_dst.is_none() {
         let new_src = new_src?;
         packet.get_mut(12..16)?.copy_from_slice(&new_src.octets());
         adjust_l4_checksum_ipv4_src(packet, ihl, protocol, old_src, new_src)?;
-        return Some(());
-    }
-    if new_dst.is_some() && new_src.is_none() {
+    } else if new_dst.is_some() && new_src.is_none() {
         let new_dst = new_dst?;
         packet.get_mut(16..20)?.copy_from_slice(&new_dst.octets());
         adjust_l4_checksum_ipv4_dst(packet, ihl, protocol, old_dst, new_dst)?;
-        return Some(());
-    }
-    if let Some(ip) = new_src {
-        packet.get_mut(12..16)?.copy_from_slice(&ip.octets());
-    }
-    if let Some(ip) = new_dst {
-        packet.get_mut(16..20)?.copy_from_slice(&ip.octets());
-    }
-    let new_src = new_src.unwrap_or(old_src);
-    let new_dst = new_dst.unwrap_or(old_dst);
-    match protocol {
-        PROTO_TCP => {
-            adjust_l4_checksum_ipv4(packet, ihl, protocol, old_src, new_src, old_dst, new_dst)?
+    } else if new_src.is_some() || new_dst.is_some() {
+        if let Some(ip) = new_src {
+            packet.get_mut(12..16)?.copy_from_slice(&ip.octets());
         }
-        PROTO_UDP => {
-            let checksum_offset = ihl.checked_add(6)?;
-            let keep_zero = packet
-                .get(checksum_offset..checksum_offset + 2)
-                .map(|bytes| bytes == [0, 0])
-                .unwrap_or(false);
-            if !keep_zero {
-                adjust_l4_checksum_ipv4(packet, ihl, protocol, old_src, new_src, old_dst, new_dst)?;
+        if let Some(ip) = new_dst {
+            packet.get_mut(16..20)?.copy_from_slice(&ip.octets());
+        }
+        let new_src = new_src.unwrap_or(old_src);
+        let new_dst = new_dst.unwrap_or(old_dst);
+        match protocol {
+            PROTO_TCP => {
+                adjust_l4_checksum_ipv4(packet, ihl, protocol, old_src, new_src, old_dst, new_dst)?
             }
+            PROTO_UDP => {
+                let checksum_offset = ihl.checked_add(6)?;
+                let keep_zero = packet
+                    .get(checksum_offset..checksum_offset + 2)
+                    .map(|bytes| bytes == [0, 0])
+                    .unwrap_or(false);
+                if !keep_zero {
+                    adjust_l4_checksum_ipv4(packet, ihl, protocol, old_src, new_src, old_dst, new_dst)?;
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
+
+    // --- L4 port rewriting (after IP rewriting) ---
+    apply_nat_port_rewrite(packet, ihl, protocol, nat)?;
+
     Some(())
 }
 
@@ -8775,39 +8821,112 @@ fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<(
         IpAddr::V6(ip) => Some(ip.octets()),
         _ => None,
     });
+
+    // --- IPv6 address rewriting ---
     if new_src.is_some() && new_dst.is_none() {
         let new_src = new_src?;
         let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
         packet.get_mut(8..24)?.copy_from_slice(&new_src);
         let new_src_words = ipv6_words_from_octets(new_src);
         adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
-        return Some(());
-    }
-    if new_dst.is_some() && new_src.is_none() {
+    } else if new_dst.is_some() && new_src.is_none() {
         let new_dst = new_dst?;
         let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
         packet.get_mut(24..40)?.copy_from_slice(&new_dst);
         let new_dst_words = ipv6_words_from_octets(new_dst);
         adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
+    } else if new_src.is_some() || new_dst.is_some() {
+        let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
+        let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
+        if let Some(ip) = new_src {
+            packet.get_mut(8..24)?.copy_from_slice(&ip);
+        }
+        if let Some(ip) = new_dst {
+            packet.get_mut(24..40)?.copy_from_slice(&ip);
+        }
+        let new_src_words = new_src.map(ipv6_words_from_octets).unwrap_or(old_src_words);
+        let new_dst_words = new_dst.map(ipv6_words_from_octets).unwrap_or(old_dst_words);
+        match protocol {
+            PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {
+                adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
+                adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
+            }
+            _ => {}
+        }
+    }
+
+    // --- L4 port rewriting (after IP rewriting) ---
+    // IPv6 header is always 40 bytes (no IHL).
+    apply_nat_port_rewrite(packet, 40, protocol, nat)?;
+
+    Some(())
+}
+
+/// Rewrite L4 source/destination ports and incrementally update the L4 checksum.
+/// Port rewriting MUST happen AFTER IP address rewriting to avoid double-counting
+/// in the checksum. Skips ICMP (no ports).
+fn apply_nat_port_rewrite(
+    packet: &mut [u8],
+    l4_offset: usize,
+    protocol: u8,
+    nat: NatDecision,
+) -> Option<()> {
+    if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
         return Some(());
     }
-    let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
-    let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
-    if let Some(ip) = new_src {
-        packet.get_mut(8..24)?.copy_from_slice(&ip);
+    if packet.len() < l4_offset + 4 {
+        return Some(());
     }
-    if let Some(ip) = new_dst {
-        packet.get_mut(24..40)?.copy_from_slice(&ip);
-    }
-    let new_src_words = new_src.map(ipv6_words_from_octets).unwrap_or(old_src_words);
-    let new_dst_words = new_dst.map(ipv6_words_from_octets).unwrap_or(old_dst_words);
-    match protocol {
-        PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {
-            adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
-            adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
+
+    if let Some(new_src_port) = nat.rewrite_src_port {
+        let port_offset = l4_offset; // TCP/UDP src port at offset +0
+        let old_port = u16::from_be_bytes([packet[port_offset], packet[port_offset + 1]]);
+        if old_port != new_src_port {
+            packet[port_offset..port_offset + 2].copy_from_slice(&new_src_port.to_be_bytes());
+            adjust_l4_checksum_port(packet, l4_offset, protocol, old_port, new_src_port)?;
         }
-        _ => {}
     }
+
+    if let Some(new_dst_port) = nat.rewrite_dst_port {
+        let port_offset = l4_offset + 2; // TCP/UDP dst port at offset +2
+        let old_port = u16::from_be_bytes([packet[port_offset], packet[port_offset + 1]]);
+        if old_port != new_dst_port {
+            packet[port_offset..port_offset + 2].copy_from_slice(&new_dst_port.to_be_bytes());
+            adjust_l4_checksum_port(packet, l4_offset, protocol, old_port, new_dst_port)?;
+        }
+    }
+
+    Some(())
+}
+
+/// Incremental L4 checksum update for a single 16-bit port change.
+fn adjust_l4_checksum_port(
+    packet: &mut [u8],
+    l4_offset: usize,
+    protocol: u8,
+    old_port: u16,
+    new_port: u16,
+) -> Option<()> {
+    let checksum_offset = match protocol {
+        PROTO_TCP => l4_offset.checked_add(16)?,
+        PROTO_UDP => l4_offset.checked_add(6)?,
+        _ => return Some(()),
+    };
+    let current = u16::from_be_bytes([
+        *packet.get(checksum_offset)?,
+        *packet.get(checksum_offset + 1)?,
+    ]);
+    // Skip UDP IPv4 checksum update when checksum is 0 (optional for IPv4 UDP)
+    if matches!(protocol, PROTO_UDP) && current == 0 {
+        return Some(());
+    }
+    let mut updated = checksum16_adjust(current, &[old_port], &[new_port]);
+    if matches!(protocol, PROTO_UDP) && updated == 0 {
+        updated = 0xffff;
+    }
+    packet
+        .get_mut(checksum_offset..checksum_offset + 2)?
+        .copy_from_slice(&updated.to_be_bytes());
     Some(())
 }
 

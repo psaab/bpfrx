@@ -407,7 +407,10 @@ fn reverse_wire_key(forward_key: &SessionKey, nat: NatDecision) -> SessionKey {
     let (src_port, dst_port) = if matches!(forward_key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
         (forward_key.src_port, forward_key.dst_port)
     } else {
-        (forward_key.dst_port, forward_key.src_port)
+        (
+            nat.rewrite_dst_port.unwrap_or(forward_key.dst_port),
+            nat.rewrite_src_port.unwrap_or(forward_key.src_port),
+        )
     };
     let wire_src = nat.rewrite_dst.unwrap_or(forward_key.dst_ip);
     let wire_dst = nat.rewrite_src.unwrap_or(forward_key.src_ip);
@@ -771,6 +774,140 @@ mod tests {
         ));
 
         let hit = table.find_forward_nat_match(&reply).expect("forward nat match");
+        assert_eq!(hit.key, forward);
+        assert_eq!(hit.decision.nat, nat);
+
+        table.delete(&hit.key);
+        assert!(table.find_forward_nat_match(&reply).is_none());
+    }
+
+    #[test]
+    fn dnat_port_in_reverse_wire_key() {
+        // Forward: client:54321 -> external:80, DNAT rewrites dst to internal:8080
+        let forward = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            src_port: 54321,
+            dst_port: 80,
+        };
+        let nat = NatDecision {
+            rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        };
+        // Reply from internal:8080 -> client:54321
+        let expected_reply = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            src_port: 8080,
+            dst_port: 54321,
+        };
+        assert!(reply_matches_forward_nat(&forward, nat, &expected_reply));
+    }
+
+    #[test]
+    fn dnat_plus_snat_ports_in_reverse_key() {
+        // Forward: client:54321 -> external:80
+        // DNAT: dst -> internal:8080, SNAT: src -> egress_ip
+        let forward = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            src_port: 54321,
+            dst_port: 80,
+        };
+        let nat = NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
+            rewrite_src_port: None,
+            rewrite_dst_port: Some(8080),
+            nat64: false,
+        };
+        // Reply: internal:8080 -> egress:54321
+        let expected_reply = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            src_port: 8080,
+            dst_port: 54321,
+        };
+        assert!(reply_matches_forward_nat(&forward, nat, &expected_reply));
+    }
+
+    #[test]
+    fn icmp_port_handling_unchanged_with_dnat_ports() {
+        // ICMP ignores port rewriting even if NatDecision has port fields set
+        let forward = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_ICMP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            src_port: 0x1234,
+            dst_port: 0,
+        };
+        let nat = NatDecision {
+            rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        };
+        // ICMP reverse: ports stay the same (ICMP has no port semantics)
+        let expected_reply = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_ICMP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            src_port: 0x1234,
+            dst_port: 0,
+        };
+        assert!(reply_matches_forward_nat(&forward, nat, &expected_reply));
+    }
+
+    #[test]
+    fn find_forward_nat_match_with_dnat_port_rewrite() {
+        let mut table = SessionTable::new();
+        // Forward: client:54321 -> external:80 with DNAT to internal:8080
+        let forward = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            src_port: 54321,
+            dst_port: 80,
+        };
+        // Reply from internal:8080 -> client:54321
+        let reply = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            src_port: 8080,
+            dst_port: 54321,
+        };
+        let nat = NatDecision {
+            rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        };
+        let decision = SessionDecision {
+            resolution: resolution(),
+            nat,
+        };
+        assert!(table.install_with_protocol(
+            forward.clone(),
+            decision,
+            metadata(),
+            1_000_000_000,
+            PROTO_TCP,
+            0x10
+        ));
+
+        let hit = table.find_forward_nat_match(&reply).expect("forward nat match with port");
         assert_eq!(hit.key, forward);
         assert_eq!(hit.decision.nat, nat);
 

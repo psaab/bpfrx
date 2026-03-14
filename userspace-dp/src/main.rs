@@ -154,6 +154,8 @@ struct ConfigSnapshot {
     source_nat_rules: Vec<SourceNATRuleSnapshot>,
     #[serde(rename = "static_nat_rules", default)]
     static_nat_rules: Vec<StaticNATRuleSnapshot>,
+    #[serde(rename = "destination_nat_rules", default)]
+    destination_nat_rules: Vec<DestinationNATRuleSnapshot>,
     #[serde(rename = "nat64_rules", default)]
     nat64_rules: Vec<NAT64RuleSnapshot>,
     #[serde(default)]
@@ -216,6 +218,23 @@ struct StaticNATRuleSnapshot {
     external_ip: String,
     #[serde(rename = "internal_ip", default)]
     internal_ip: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct DestinationNATRuleSnapshot {
+    name: String,
+    #[serde(rename = "from_zone", default)]
+    from_zone: String,
+    #[serde(rename = "destination_address", default)]
+    destination_address: String,
+    #[serde(rename = "destination_port", default)]
+    destination_port: u16,
+    #[serde(default)]
+    protocol: String,
+    #[serde(rename = "pool_address", default)]
+    pool_address: String,
+    #[serde(rename = "pool_port", default)]
+    pool_port: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -762,6 +781,10 @@ struct SessionSyncRequest {
     nat_src_ip: String,
     #[serde(rename = "nat_dst_ip", default)]
     nat_dst_ip: String,
+    #[serde(rename = "nat_src_port", default)]
+    nat_src_port: u16,
+    #[serde(rename = "nat_dst_port", default)]
+    nat_dst_port: u16,
     #[serde(rename = "is_reverse", default)]
     is_reverse: bool,
 }
@@ -813,6 +836,10 @@ struct SessionDeltaInfo {
     nat_src_ip: String,
     #[serde(rename = "nat_dst_ip", default)]
     nat_dst_ip: String,
+    #[serde(rename = "nat_src_port", default)]
+    nat_src_port: u16,
+    #[serde(rename = "nat_dst_port", default)]
+    nat_dst_port: u16,
 }
 
 #[derive(Debug)]
@@ -1387,6 +1414,16 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
                 .map_err(|e| format!("parse nat_dst_ip {}: {e}", req.nat_dst_ip))?,
         )
     };
+    let nat_src_port = if req.nat_src_port != 0 {
+        Some(req.nat_src_port)
+    } else {
+        None
+    };
+    let nat_dst_port = if req.nat_dst_port != 0 {
+        Some(req.nat_dst_port)
+    } else {
+        None
+    };
     Ok(SyncedSessionEntry {
         protocol: req.protocol,
         tcp_flags: 0,
@@ -1409,6 +1446,8 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             nat: crate::nat::NatDecision {
                 rewrite_src: nat_src,
                 rewrite_dst: nat_dst,
+                rewrite_src_port: nat_src_port,
+                rewrite_dst_port: nat_dst_port,
                 ..crate::nat::NatDecision::default()
             },
         },

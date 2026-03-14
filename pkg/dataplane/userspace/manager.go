@@ -2376,12 +2376,16 @@ func (m *Manager) syncSessionV4Locked(op string, key dataplane.SessionKey, val *
 		req.SrcMAC = macString(val.FibSmac[:])
 		req.NATSrcIP = ipString(nativeUint32ToIP(val.NATSrcIP))
 		req.NATDstIP = ipString(nativeUint32ToIP(val.NATDstIP))
+		req.NATSrcPort = val.NATSrcPort
+		req.NATDstPort = val.NATDstPort
 		req.IsReverse = val.IsReverse != 0
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
+			req.NATSrcPort = 0
 		}
 		if val.Flags&dataplane.SessFlagDNAT == 0 {
 			req.NATDstIP = ""
+			req.NATDstPort = 0
 		}
 	}
 	return m.syncSessionRequestLocked(req)
@@ -2409,12 +2413,16 @@ func (m *Manager) syncSessionV6Locked(op string, key dataplane.SessionKeyV6, val
 		req.SrcMAC = macString(val.FibSmac[:])
 		req.NATSrcIP = ipString(net.IP(val.NATSrcIP[:]))
 		req.NATDstIP = ipString(net.IP(val.NATDstIP[:]))
+		req.NATSrcPort = val.NATSrcPort
+		req.NATDstPort = val.NATDstPort
 		req.IsReverse = val.IsReverse != 0
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
+			req.NATSrcPort = 0
 		}
 		if val.Flags&dataplane.SessFlagDNAT == 0 {
 			req.NATDstIP = ""
+			req.NATDstPort = 0
 		}
 	}
 	return m.syncSessionRequestLocked(req)

@@ -109,6 +109,8 @@ impl Nat64State {
         NatDecision {
             rewrite_src: Some(IpAddr::V4(snat_v4)),
             rewrite_dst: Some(IpAddr::V4(dst_v4)),
+            rewrite_src_port: None,
+            rewrite_dst_port: None,
             nat64: true,
         }
     }

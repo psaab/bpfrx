@@ -46,9 +46,10 @@ type ConfigSnapshot struct {
 	Flow          FlowSnapshot            `json:"flow,omitempty"`
 	DefaultPolicy string                  `json:"default_policy,omitempty"`
 	Policies      []PolicyRuleSnapshot    `json:"policies,omitempty"`
-	SourceNAT     []SourceNATRuleSnapshot `json:"source_nat_rules,omitempty"`
-	StaticNAT     []StaticNATRuleSnapshot `json:"static_nat_rules,omitempty"`
-	NAT64         []NAT64RuleSnapshot     `json:"nat64_rules,omitempty"`
+	SourceNAT      []SourceNATRuleSnapshot      `json:"source_nat_rules,omitempty"`
+	StaticNAT      []StaticNATRuleSnapshot      `json:"static_nat_rules,omitempty"`
+	DestinationNAT []DestinationNATRuleSnapshot `json:"destination_nat_rules,omitempty"`
+	NAT64          []NAT64RuleSnapshot          `json:"nat64_rules,omitempty"`
 	Config        *config.Config          `json:"config,omitempty"`
 	Userspace     config.UserspaceConfig  `json:"userspace"`
 }
@@ -118,6 +119,19 @@ type StaticNATRuleSnapshot struct {
 	FromZone   string `json:"from_zone,omitempty"`
 	ExternalIP string `json:"external_ip"`
 	InternalIP string `json:"internal_ip"`
+}
+
+// DestinationNATRuleSnapshot captures a pre-expanded DNAT table entry for the
+// userspace dataplane. Each snapshot is one (protocol, destination IP, destination port)
+// tuple. The Go builder handles multi-port and protocol expansion.
+type DestinationNATRuleSnapshot struct {
+	Name               string `json:"name"`
+	FromZone           string `json:"from_zone,omitempty"`
+	DestinationAddress string `json:"destination_address"`
+	DestinationPort    uint16 `json:"destination_port,omitempty"`
+	Protocol           string `json:"protocol,omitempty"` // "tcp", "udp", or ""
+	PoolAddress        string `json:"pool_address"`
+	PoolPort           uint16 `json:"pool_port,omitempty"`
 }
 
 // NAT64RuleSnapshot captures a NAT64 prefix and its IPv4 source pool for the
@@ -400,6 +414,8 @@ type SessionSyncRequest struct {
 	SrcMAC        string `json:"src_mac,omitempty"`
 	NATSrcIP      string `json:"nat_src_ip,omitempty"`
 	NATDstIP      string `json:"nat_dst_ip,omitempty"`
+	NATSrcPort    uint16 `json:"nat_src_port,omitempty"`
+	NATDstPort    uint16 `json:"nat_dst_port,omitempty"`
 	IsReverse     bool   `json:"is_reverse,omitempty"`
 }
 
@@ -424,4 +440,6 @@ type SessionDeltaInfo struct {
 	NextHop       string    `json:"next_hop,omitempty"`
 	NATSrcIP      string    `json:"nat_src_ip,omitempty"`
 	NATDstIP      string    `json:"nat_dst_ip,omitempty"`
+	NATSrcPort    uint16    `json:"nat_src_port,omitempty"`
+	NATDstPort    uint16    `json:"nat_dst_port,omitempty"`
 }
