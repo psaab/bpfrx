@@ -66,7 +66,7 @@ system {
 | NPTv6 (RFC 6296) | Yes | No (fallback) |
 | Screen/IDS | Yes | No (fallback) |
 | Firewall filters | Yes | No (fallback) |
-| Global policies | Yes | No (fallback) |
+| Global policies | Yes | Yes |
 | TCP MSS clamping | Yes | No (fallback) |
 | GRE tunnels | Yes | No (fallback) |
 | IPsec / XFRM | Yes | No (fallback) |
