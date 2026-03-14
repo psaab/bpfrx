@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -229,12 +230,12 @@ func main() {
 var errExit = fmt.Errorf("exit")
 
 type ctl struct {
-	client     pb.BpfrxServiceClient
-	rl         *readline.Instance
-	hostname   string
-	username   string
-	configMode bool
-	editPath   []string
+	client        pb.BpfrxServiceClient
+	rl            *readline.Instance
+	hostname      string
+	username      string
+	configMode    bool
+	editPath      []string
 	clusterRole   string // "primary", "secondary", or "" (not clustered)
 	clusterNodeID int32
 
@@ -2662,12 +2663,22 @@ func (c *ctl) handleRequestChassis(args []string) error {
 		return nil
 	}
 	args = args[1:] // consume "cluster"
-	if len(args) == 0 || args[0] != "failover" {
+	if len(args) == 0 {
 		printRemoteTreeHelp("request chassis cluster:", "request", "chassis", "cluster")
 		return nil
 	}
-	args = args[1:] // consume "failover"
+	switch args[0] {
+	case "failover":
+		return c.handleRequestChassisClusterFailover(args[1:])
+	case "data-plane":
+		return c.handleRequestChassisClusterDataPlane(args[1:])
+	default:
+		printRemoteTreeHelp("request chassis cluster:", "request", "chassis", "cluster")
+		return nil
+	}
+}
 
+func (c *ctl) handleRequestChassisClusterFailover(args []string) error {
 	// "request chassis cluster failover reset redundancy-group <N>"
 	if len(args) >= 1 && args[0] == "reset" {
 		if len(args) < 3 || args[1] != "redundancy-group" {
@@ -2687,7 +2698,6 @@ func (c *ctl) handleRequestChassis(args []string) error {
 	// "request chassis cluster failover redundancy-group <N> [node <N>]"
 	if len(args) >= 2 && args[0] == "redundancy-group" {
 		actionSuffix := args[1]
-		// Pass "node <N>" if specified.
 		if len(args) >= 4 && args[2] == "node" {
 			actionSuffix += ":node" + args[3]
 		}
@@ -2703,6 +2713,59 @@ func (c *ctl) handleRequestChassis(args []string) error {
 	}
 
 	return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N> [node <N>]")
+}
+
+func (c *ctl) handleRequestChassisClusterDataPlane(args []string) error {
+	if len(args) == 0 || args[0] != "userspace" {
+		printRemoteTreeHelp("request chassis cluster data-plane:", "request", "chassis", "cluster", "data-plane")
+		return nil
+	}
+	args = args[1:]
+	var action string
+	var target string
+	switch {
+	case len(args) > 0 && args[0] == "inject-packet":
+		slot, mode, extra, err := dpuserspace.ParseInjectPacketCommand(args)
+		if err != nil {
+			return err
+		}
+		action = fmt.Sprintf("userspace-inject:%d:%s", slot, mode)
+		target = extra["destination-ip"]
+	case len(args) > 0 && args[0] == "forwarding":
+		armed, err := dpuserspace.ParseForwardingCommand(args)
+		if err != nil {
+			return err
+		}
+		if armed {
+			action = "userspace-forwarding:arm"
+		} else {
+			action = "userspace-forwarding:disarm"
+		}
+	case len(args) > 0 && args[0] == "queue":
+		queueID, _, _, err := dpuserspace.ParseQueueCommand(args)
+		if err != nil {
+			return err
+		}
+		action = fmt.Sprintf("userspace-queue:%d:%s", queueID, strings.ToLower(args[2]))
+	case len(args) > 0 && args[0] == "binding":
+		slot, _, _, err := dpuserspace.ParseBindingCommand(args)
+		if err != nil {
+			return err
+		}
+		action = fmt.Sprintf("userspace-binding:%d:%s", slot, strings.ToLower(args[3]))
+	default:
+		printRemoteTreeHelp("request chassis cluster data-plane userspace:", "request", "chassis", "cluster", "data-plane", "userspace")
+		return nil
+	}
+	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
+		Action: action,
+		Target: target,
+	})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Println(resp.Message)
+	return nil
 }
 
 func (c *ctl) handleRequestDHCP(args []string) error {

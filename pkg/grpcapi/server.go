@@ -36,6 +36,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/conntrack"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/dhcpserver"
 	"github.com/psaab/bpfrx/pkg/feeds"
@@ -97,6 +98,41 @@ type Server struct {
 	version          string
 	fabricPeerAddrFn func() []string
 	fabricVRFDevice  string
+}
+
+type sessionEgressKey struct {
+	ifindex uint32
+	vlanID  uint16
+}
+
+func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
+	provider, ok := s.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return dpuserspace.ProcessStatus{}, fmt.Errorf("userspace status unavailable")
+	}
+	return provider.Status()
+}
+
+func (s *Server) userspaceDataplaneControl() (interface {
+	Status() (dpuserspace.ProcessStatus, error)
+	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
+	SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
+}, error) {
+	provider, ok := s.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+		SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
+		SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+		SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+		InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("userspace dataplane control unavailable")
+	}
+	return provider, nil
 }
 
 // NewServer creates a new gRPC server.
@@ -807,6 +843,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	// Build reverse zone ID → name map, policy name map, and zone→interface map.
 	zoneNames := make(map[uint16]string)
 	zoneIfaces := make(map[uint16]string) // zone ID → first interface name
+	egressIfaces := make(map[sessionEgressKey]string)
 	var policyNames map[uint32]string
 	var appNames map[uint16]string
 	if cr := s.dp.LastCompileResult(); cr != nil {
@@ -821,6 +858,30 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 			if cr := s.dp.LastCompileResult(); cr != nil {
 				if zid, ok := cr.ZoneIDs[zoneName]; ok && len(zone.Interfaces) > 0 {
 					zoneIfaces[zid] = zone.Interfaces[0]
+				}
+			}
+		}
+		for ifName, ifc := range cfg.Interfaces.Interfaces {
+			resolvedParent := config.LinuxIfName(strings.SplitN(cfg.ResolveReth(ifName), ".", 2)[0])
+			parentLink, err := net.InterfaceByName(resolvedParent)
+			if err != nil {
+				continue
+			}
+			for _, unit := range ifc.Units {
+				displayName := ifName
+				if unit.Number != 0 || unit.VlanID != 0 {
+					displayName = fmt.Sprintf("%s.%d", ifName, unit.Number)
+				}
+				vlanID := uint16(unit.VlanID)
+				if vlanID == 0 && unit.Number > 0 {
+					vlanID = uint16(unit.Number)
+				}
+				key := sessionEgressKey{
+					ifindex: uint32(parentLink.Index),
+					vlanID:  vlanID,
+				}
+				if _, exists := egressIfaces[key]; !exists {
+					egressIfaces[key] = displayName
 				}
 			}
 		}
@@ -872,7 +933,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 				val.FwdPackets += rev.FwdPackets
 				val.FwdBytes += rev.FwdBytes
 			}
-			se := sessionEntryV4(key, val, now, zoneNames, policyNames, zoneIfaces, haActive)
+			se := sessionEntryV4(key, val, now, zoneNames, policyNames, zoneIfaces, egressIfaces, haActive)
 			se.Application = appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
 			all = append(all, se)
 		}
@@ -917,7 +978,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 				val.FwdPackets += rev.FwdPackets
 				val.FwdBytes += rev.FwdBytes
 			}
-			se := sessionEntryV6(key, val, now, zoneNames, policyNames, zoneIfaces, haActive)
+			se := sessionEntryV6(key, val, now, zoneNames, policyNames, zoneIfaces, egressIfaces, haActive)
 			se.Application = appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
 			all = append(all, se)
 		}
@@ -3049,14 +3110,17 @@ func uint32ToIP(v uint32) net.IP {
 	return ip
 }
 
-func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, haActive bool) *pb.SessionEntry {
+func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, egressIfaces map[sessionEgressKey]string, haActive bool) *pb.SessionEntry {
 	inIf := zoneIfaces[val.IngressZone]
 	if inIf == "" {
 		inIf = zoneNames[val.IngressZone]
 	}
-	outIf := zoneIfaces[val.EgressZone]
+	outIf := egressIfaces[sessionEgressKey{ifindex: val.FibIfindex, vlanID: val.FibVlanID}]
 	if outIf == "" {
-		outIf = zoneNames[val.EgressZone]
+		outIf = zoneIfaces[val.EgressZone]
+		if outIf == "" {
+			outIf = zoneNames[val.EgressZone]
+		}
 	}
 	se := &pb.SessionEntry{
 		SrcAddr:          net.IP(key.SrcIP[:]).String(),
@@ -3100,14 +3164,17 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 	return se
 }
 
-func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, haActive bool) *pb.SessionEntry {
+func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, egressIfaces map[sessionEgressKey]string, haActive bool) *pb.SessionEntry {
 	inIf := zoneIfaces[val.IngressZone]
 	if inIf == "" {
 		inIf = zoneNames[val.IngressZone]
 	}
-	outIf := zoneIfaces[val.EgressZone]
+	outIf := egressIfaces[sessionEgressKey{ifindex: val.FibIfindex, vlanID: val.FibVlanID}]
 	if outIf == "" {
-		outIf = zoneNames[val.EgressZone]
+		outIf = zoneIfaces[val.EgressZone]
+		if outIf == "" {
+			outIf = zoneNames[val.EgressZone]
+		}
 	}
 	se := &pb.SessionEntry{
 		SrcAddr:          net.IP(key.SrcIP[:]).String(),
@@ -6462,6 +6529,10 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			break
 		}
 		buf.WriteString(s.cluster.FormatDataPlaneStatistics())
+		if status, err := s.userspaceDataplaneStatus(); err == nil {
+			buf.WriteString("\n")
+			buf.WriteString(dpuserspace.FormatStatusSummary(status))
+		}
 
 	case "chassis-cluster-data-plane-interfaces":
 		if s.cluster == nil {
@@ -6469,6 +6540,10 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			break
 		}
 		buf.WriteString(s.cluster.FormatDataPlaneInterfaces())
+		if status, err := s.userspaceDataplaneStatus(); err == nil {
+			buf.WriteString("\n")
+			buf.WriteString(dpuserspace.FormatBindings(status))
+		}
 
 	case "chassis-cluster-ip-monitoring-status":
 		if s.cluster == nil {
@@ -8098,6 +8173,106 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 			return &pb.SystemActionResponse{
 				Message: fmt.Sprintf("Manual failover triggered for redundancy group %d", rgID),
 			}, nil
+		}
+		if strings.HasPrefix(req.Action, "userspace-inject:") {
+			provider, err := s.userspaceDataplaneControl()
+			if err != nil {
+				return nil, status.Error(codes.Unavailable, err.Error())
+			}
+			rest := strings.TrimPrefix(req.Action, "userspace-inject:")
+			parts := strings.SplitN(rest, ":", 2)
+			if len(parts) != 2 {
+				return nil, status.Error(codes.InvalidArgument, "usage: userspace-inject:<slot>:<mode>")
+			}
+			slot, err := strconv.Atoi(parts[0])
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid userspace slot: %s", parts[0])
+			}
+			mode := parts[1]
+			statusNow, err := provider.Status()
+			if err != nil {
+				return nil, status.Errorf(codes.Unavailable, "userspace status: %v", err)
+			}
+			extra := map[string]string{}
+			if req.Target != "" {
+				extra["destination-ip"] = req.Target
+			}
+			injectReq, err := dpuserspace.BuildInjectPacketRequest(uint32(slot), mode, extra, statusNow)
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+			statusAfter, err := provider.InjectPacket(injectReq)
+			if err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "userspace inject: %v", err)
+			}
+			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			return &pb.SystemActionResponse{Message: msg}, nil
+		}
+		if strings.HasPrefix(req.Action, "userspace-forwarding:") {
+			provider, err := s.userspaceDataplaneControl()
+			if err != nil {
+				return nil, status.Error(codes.Unavailable, err.Error())
+			}
+			armed, err := dpuserspace.ParseForwardingCommand([]string{"forwarding", strings.TrimPrefix(req.Action, "userspace-forwarding:")})
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+			statusAfter, err := provider.SetForwardingArmed(armed)
+			if err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "userspace forwarding control: %v", err)
+			}
+			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			return &pb.SystemActionResponse{Message: msg}, nil
+		}
+		if strings.HasPrefix(req.Action, "userspace-queue:") {
+			provider, err := s.userspaceDataplaneControl()
+			if err != nil {
+				return nil, status.Error(codes.Unavailable, err.Error())
+			}
+			rest := strings.TrimPrefix(req.Action, "userspace-queue:")
+			parts := strings.SplitN(rest, ":", 2)
+			if len(parts) != 2 {
+				return nil, status.Error(codes.InvalidArgument, "usage: userspace-queue:<queue>:<register|unregister|arm|disarm>")
+			}
+			queueID, err := strconv.Atoi(parts[0])
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid userspace queue: %s", parts[0])
+			}
+			registered, armed, err := dpuserspace.ParseRegistrationOperation(parts[1])
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+			statusAfter, err := provider.SetQueueState(uint32(queueID), registered, armed)
+			if err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "userspace queue control: %v", err)
+			}
+			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			return &pb.SystemActionResponse{Message: msg}, nil
+		}
+		if strings.HasPrefix(req.Action, "userspace-binding:") {
+			provider, err := s.userspaceDataplaneControl()
+			if err != nil {
+				return nil, status.Error(codes.Unavailable, err.Error())
+			}
+			rest := strings.TrimPrefix(req.Action, "userspace-binding:")
+			parts := strings.SplitN(rest, ":", 2)
+			if len(parts) != 2 {
+				return nil, status.Error(codes.InvalidArgument, "usage: userspace-binding:<slot>:<register|unregister|arm|disarm>")
+			}
+			slot, err := strconv.Atoi(parts[0])
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid userspace slot: %s", parts[0])
+			}
+			registered, armed, err := dpuserspace.ParseRegistrationOperation(parts[1])
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+			statusAfter, err := provider.SetBindingState(uint32(slot), registered, armed)
+			if err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "userspace binding control: %v", err)
+			}
+			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			return &pb.SystemActionResponse{Message: msg}, nil
 		}
 		return nil, status.Errorf(codes.InvalidArgument, "unknown action: %s", req.Action)
 	}

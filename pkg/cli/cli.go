@@ -32,6 +32,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/dhcprelay"
 	"github.com/psaab/bpfrx/pkg/dhcpserver"
@@ -3306,6 +3307,18 @@ func (c *CLI) showFlowSession(args []string) error {
 			}
 		}
 	}
+	egressIfaces := buildSessionEgressIfaces(f.cfg)
+	sessionEgressIf := func(fibIfindex uint32, fibVlanID uint16, zoneID uint16, zoneName string) string {
+		if fibIfindex != 0 {
+			if ifName, ok := egressIfaces[sessionIfaceKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
+				return ifName
+			}
+		}
+		if ifName := zoneIfaces[zoneID]; ifName != "" {
+			return ifName
+		}
+		return zoneName
+	}
 
 	now := monotonicSeconds()
 
@@ -3445,10 +3458,7 @@ func (c *CLI) showFlowSession(args []string) error {
 			outSrcIP = natIP.String()
 			outSrcPort = natPort
 		}
-		outIf := zoneIfaces[val.EgressZone]
-		if outIf == "" {
-			outIf = outZone
-		}
+		outIf := sessionEgressIf(val.FibIfindex, val.FibVlanID, val.EgressZone, outZone)
 		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
 			outIf, val.RevPackets, val.RevBytes)
@@ -3593,10 +3603,7 @@ func (c *CLI) showFlowSession(args []string) error {
 			outSrcIP = natIP.String()
 			outSrcPort = natPort
 		}
-		outIf := zoneIfaces[val.EgressZone]
-		if outIf == "" {
-			outIf = outZone
-		}
+		outIf := sessionEgressIf(val.FibIfindex, val.FibVlanID, val.EgressZone, outZone)
 		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
 			outIf, val.RevPackets, val.RevBytes)
@@ -11479,6 +11486,10 @@ func (c *CLI) showChassisClusterDataPlaneStats() error {
 		return nil
 	}
 	fmt.Print(c.cluster.FormatDataPlaneStatistics())
+	if status, err := c.userspaceDataplaneStatus(); err == nil {
+		fmt.Println()
+		fmt.Print(dpuserspace.FormatStatusSummary(status))
+	}
 	return nil
 }
 
@@ -11488,7 +11499,41 @@ func (c *CLI) showChassisClusterDataPlaneInterfaces() error {
 		return nil
 	}
 	fmt.Print(c.cluster.FormatDataPlaneInterfaces())
+	if status, err := c.userspaceDataplaneStatus(); err == nil {
+		fmt.Println()
+		fmt.Print(dpuserspace.FormatBindings(status))
+	}
 	return nil
+}
+
+func (c *CLI) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
+	provider, ok := c.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return dpuserspace.ProcessStatus{}, fmt.Errorf("userspace status unavailable")
+	}
+	return provider.Status()
+}
+
+func (c *CLI) userspaceDataplaneControl() (interface {
+	Status() (dpuserspace.ProcessStatus, error)
+	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
+	SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
+}, error) {
+	provider, ok := c.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+		SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
+		SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+		SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+		InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("userspace dataplane control unavailable")
+	}
+	return provider, nil
 }
 
 func (c *CLI) showChassisClusterIPMonitoringStatus() error {
@@ -12139,17 +12184,27 @@ func (c *CLI) handleRequestChassis(args []string) error {
 		return nil
 	}
 	args = args[1:] // consume "cluster"
-	if len(args) == 0 || args[0] != "failover" {
+	if len(args) == 0 {
 		fmt.Println("request chassis cluster:")
 		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children["cluster"].Children))
 		return nil
 	}
-	args = args[1:] // consume "failover"
+	switch args[0] {
+	case "failover":
+		return c.handleRequestChassisClusterFailover(args[1:])
+	case "data-plane":
+		return c.handleRequestChassisClusterDataPlane(args[1:])
+	default:
+		fmt.Println("request chassis cluster:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children["cluster"].Children))
+		return nil
+	}
+}
 
+func (c *CLI) handleRequestChassisClusterFailover(args []string) error {
 	if c.cluster == nil {
 		return fmt.Errorf("cluster not configured")
 	}
-
 	// "request chassis cluster failover reset redundancy-group <N>"
 	if len(args) >= 1 && args[0] == "reset" {
 		if len(args) < 3 || args[1] != "redundancy-group" {
@@ -12181,14 +12236,12 @@ func (c *CLI) handleRequestChassis(args []string) error {
 			}
 			localNode := c.cluster.NodeID()
 			if targetNode == localNode {
-				// "node <local>" → make local primary → ask peer to failover
 				if err := c.cluster.RequestPeerFailover(rgID); err != nil {
 					return err
 				}
 				fmt.Printf("Manual failover triggered for redundancy group %d (requesting peer to resign)\n", rgID)
 				return nil
 			}
-			// "node <peer>" → make peer primary → local failover
 		}
 
 		if err := c.cluster.ManualFailover(rgID); err != nil {
@@ -12199,6 +12252,75 @@ func (c *CLI) handleRequestChassis(args []string) error {
 	}
 
 	return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N> [node <N>]")
+}
+
+func (c *CLI) handleRequestChassisClusterDataPlane(args []string) error {
+	if len(args) == 0 || args[0] != "userspace" {
+		fmt.Println("request chassis cluster data-plane:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children["cluster"].Children["data-plane"].Children))
+		return nil
+	}
+	provider, err := c.userspaceDataplaneControl()
+	if err != nil {
+		return err
+	}
+	args = args[1:]
+
+	var status dpuserspace.ProcessStatus
+	switch {
+	case len(args) > 0 && args[0] == "inject-packet":
+		slot, mode, extra, err := dpuserspace.ParseInjectPacketCommand(args)
+		if err != nil {
+			return err
+		}
+		status, err = provider.Status()
+		if err != nil {
+			return err
+		}
+		req, err := dpuserspace.BuildInjectPacketRequest(slot, mode, extra, status)
+		if err != nil {
+			return err
+		}
+		status, err = provider.InjectPacket(req)
+		if err != nil {
+			return err
+		}
+	case len(args) > 0 && args[0] == "forwarding":
+		armed, err := dpuserspace.ParseForwardingCommand(args)
+		if err != nil {
+			return err
+		}
+		status, err = provider.SetForwardingArmed(armed)
+		if err != nil {
+			return err
+		}
+	case len(args) > 0 && args[0] == "queue":
+		queueID, registered, armed, err := dpuserspace.ParseQueueCommand(args)
+		if err != nil {
+			return err
+		}
+		status, err = provider.SetQueueState(queueID, registered, armed)
+		if err != nil {
+			return err
+		}
+	case len(args) > 0 && args[0] == "binding":
+		slot, registered, armed, err := dpuserspace.ParseBindingCommand(args)
+		if err != nil {
+			return err
+		}
+		status, err = provider.SetBindingState(slot, registered, armed)
+		if err != nil {
+			return err
+		}
+	default:
+		fmt.Println("request chassis cluster data-plane userspace:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children["cluster"].Children["data-plane"].Children["userspace"].Children))
+		return nil
+	}
+	fmt.Print(dpuserspace.FormatStatusSummary(status))
+	fmt.Println()
+	fmt.Print(dpuserspace.FormatBindings(status))
+	return nil
 }
 
 func (c *CLI) handleRequestDHCP(args []string) error {
