@@ -35,7 +35,7 @@ NIC → XDP Shim (session-gated redirect) → AF_XDP socket
 - **Per-worker architecture**: one thread per RSS queue, lock-free forwarding
 - **Zero-copy AF_XDP** with cpumap redirect for kernel pass-through
 - **Automatic fallback**: unsupported features cause transparent fallback to the eBPF dataplane
-- **Best for**: high-throughput transit forwarding with basic SNAT/policy
+- **Best for**: high-throughput transit forwarding with stateful NAT (SNAT, static 1:1, NAT64) and zone policy
 - **See**: [`docs/userspace-dataplane-architecture.md`](docs/userspace-dataplane-architecture.md) for full design details
 
 **To select the userspace dataplane:**
@@ -58,7 +58,8 @@ system {
 | Stateful forwarding | Yes | Yes |
 | Source NAT (interface) | Yes | Yes |
 | Destination NAT | Yes | No (fallback) |
-| Static NAT / NAT64 | Yes | No (fallback) |
+| Static NAT (1:1) | Yes | Yes |
+| NAT64 (IPv6↔IPv4) | Yes | Yes |
 | Zone policies | Yes | Yes |
 | Firewall filters | Yes | No (fallback) |
 | IPsec / tunnels | Yes | No (fallback) |
@@ -327,6 +328,7 @@ See `docs/` for detailed design documents:
 - `shared-umem-plan.md` — Shared UMEM investigation (cross-NIC infeasibility analysis)
 - `userspace-ha-validation.md` — HA failover validation procedures
 - `userspace-perf-compare.md` — Throughput benchmarking methodology
+- `userspace-dnat-plan.md` — Destination NAT implementation plan for userspace dataplane
 
 ## Requirements
 
