@@ -1,0 +1,11 @@
+[package]
+name = "bpfrx-userspace-xdp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aya-ebpf = "0.1.1"
+aya-ebpf-macros = "0.1.2"
+
+[lib]
+crate-type = ["cdylib"]
