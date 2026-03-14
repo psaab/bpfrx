@@ -31,6 +31,11 @@ const (
 	goodbyeCount = 3
 	// Delay between goodbye RAs.
 	goodbyeDelay = 50 * time.Millisecond
+	// Number of startup RAs to send so hosts quickly relearn a default router
+	// after daemon restart, failover, or link flap.
+	startupBurstCount = 3
+	// Delay between startup RAs.
+	startupBurstDelay = 100 * time.Millisecond
 
 	// Default prefix lifetimes per RFC 4861.
 	defaultValidLifetime    = 2592000 // 30 days
@@ -124,8 +129,9 @@ func (s *sender) stop() {
 func (s *sender) run() {
 	defer close(s.stopped)
 
-	// Send initial RA immediately.
-	s.sendRA()
+	// Send an initial burst so hosts do not wait for the periodic timer to
+	// relearn a default router after bpfrxd restarts or HA role changes.
+	s.sendStartupBurst()
 
 	advTimer := time.NewTimer(s.randomAdvInterval())
 	defer advTimer.Stop()
@@ -163,6 +169,15 @@ func (s *sender) run() {
 			s.sendRA()
 			// Reset periodic timer after RS-triggered RA.
 			advTimer.Reset(s.randomAdvInterval())
+		}
+	}
+}
+
+func (s *sender) sendStartupBurst() {
+	for i := 0; i < startupBurstCount; i++ {
+		s.sendRA()
+		if i < startupBurstCount-1 {
+			time.Sleep(startupBurstDelay)
 		}
 	}
 }

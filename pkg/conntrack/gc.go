@@ -67,6 +67,13 @@ type GC struct {
 	// Per-IP session limiting: when enabled, GC accumulates per-src/dst
 	// session counts and pushes them to BPF maps for xdp_screen to check.
 	sessionLimitEnabled bool
+
+	// SkipSweep, when non-nil and returning true, causes GC to skip
+	// the expensive BPF session map scan entirely. Used when the
+	// userspace dataplane manages sessions in its own hash table —
+	// the BPF map scan wastes ~19% CPU on maps that aren't used for
+	// active session tracking.
+	SkipSweep func() bool
 }
 
 // NewGC creates a new session garbage collector.
@@ -138,6 +145,13 @@ type expiredSessionV6 struct {
 }
 
 func (gc *GC) sweep() time.Duration {
+	// When userspace dataplane is active, skip the BPF session map scan
+	// entirely — sessions are managed in user-space. Without this, the
+	// batch lookup burns ~19% CPU scanning maps not used for forwarding.
+	if gc.SkipSweep != nil && gc.SkipSweep() {
+		return gc.interval
+	}
+
 	// Fast path: if no sessions existed on last sweep AND no new sessions
 	// have been created since, skip the entire iteration.  This eliminates
 	// ~25% CPU from empty-table batch lookups on idle firewalls.

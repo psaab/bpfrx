@@ -93,8 +93,8 @@ type SyncStatsSnapshot struct {
 	FencesReceived    uint64
 	Errors            uint64
 	DeletesDropped    uint64
-	Connected    bool
-	ActiveFabric int // 0=fab0, 1=fab1, -1=disconnected
+	Connected         bool
+	ActiveFabric      int // 0=fab0, 1=fab1, -1=disconnected
 
 	BulkSyncStartTime int64
 	BulkSyncEndTime   int64
@@ -106,21 +106,21 @@ type SyncStatsSnapshot struct {
 
 // SessionSync manages TCP-based session state replication between cluster peers.
 type SessionSync struct {
-	localAddr string // local listen address (e.g. ":4785")
-	peerAddr  string // peer connect address (e.g. "10.0.0.2:4785")
-	dp        dataplane.DataPlane
-	stats     SyncStats
-	mu        sync.Mutex
-	conn0     net.Conn   // fab0 connection (preferred)
-	conn1     net.Conn   // fab1 connection (fallback)
-	writeMu   sync.Mutex // serializes all conn.Write calls (sendLoop + writeMsg)
-	listener  net.Listener
+	localAddr  string // local listen address (e.g. ":4785")
+	peerAddr   string // peer connect address (e.g. "10.0.0.2:4785")
+	dp         dataplane.DataPlane
+	stats      SyncStats
+	mu         sync.Mutex
+	conn0      net.Conn   // fab0 connection (preferred)
+	conn1      net.Conn   // fab1 connection (fallback)
+	writeMu    sync.Mutex // serializes all conn.Write calls (sendLoop + writeMsg)
+	listener   net.Listener
 	localAddr1 string       // secondary fabric listen address ("" = single-fabric)
 	peerAddr1  string       // secondary fabric peer address
 	listener1  net.Listener // secondary fabric listener
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	sendCh    chan []byte // buffered channel for outgoing messages
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	sendCh     chan []byte // buffered channel for outgoing messages
 
 	// OnConfigReceived is called when a config sync message arrives from peer.
 	// The callback receives the full config text. Set by the daemon before Start().
@@ -161,7 +161,7 @@ type SessionSync struct {
 
 	IsPrimaryFn        func() bool         // returns true if local node is primary for RG 0
 	IsPrimaryForRGFn   func(rgID int) bool // returns true if local is primary for given RG
-	lastSweepTime uint64 // monotonic seconds of last sync sweep
+	lastSweepTime      uint64              // monotonic seconds of last sync sweep
 	syncBackfillNeeded atomic.Bool         // replay sweep window on send queue overflow
 	lastNewCounter     uint64              // last seen GLOBAL_CTR_SESSIONS_NEW
 	lastClosedCounter  uint64              // last seen GLOBAL_CTR_SESSIONS_CLOSED
@@ -179,9 +179,9 @@ type SessionSync struct {
 	// Delete journal: bounded ring buffer for delete messages during disconnect.
 	// Deletes are journaled when queueMessage fails (disconnect), then flushed
 	// on reconnect before normal sync resumes.
-	deleteJournalMu sync.Mutex
-	deleteJournal   [][]byte // ring buffer of encoded delete messages
-	deleteJournalCap int     // max entries (default 10000)
+	deleteJournalMu  sync.Mutex
+	deleteJournal    [][]byte // ring buffer of encoded delete messages
+	deleteJournalCap int      // max entries (default 10000)
 
 	// bulkSendMu serializes entire BulkSync() calls so two concurrent
 	// callers (e.g. acceptLoop and connectLoop) cannot interleave.
@@ -198,6 +198,10 @@ type SessionSync struct {
 	bulkRecvV4       map[dataplane.SessionKey]struct{}
 	bulkRecvV6       map[dataplane.SessionKeyV6]struct{}
 	bulkZoneSnapshot map[uint16]bool // snapshot of ShouldSyncZone at BulkStart
+}
+
+type sessionSyncSweepProfiler interface {
+	SessionSyncSweepProfile() (enabled bool, activeInterval, idleInterval time.Duration)
 }
 
 // deleteJournalDefaultCap is the default max entries in the delete journal.
@@ -474,9 +478,8 @@ func (s *SessionSync) StartSyncSweep(ctx context.Context) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		// Adaptive interval: 1s when sessions were synced (minimize
-		// replication lag), 10s when idle (avoid 10M-bucket hash walk).
-		interval := time.Second
+		activeInterval, idleInterval := s.sweepIntervals()
+		interval := activeInterval
 		timer := time.NewTimer(interval)
 		defer timer.Stop()
 
@@ -485,20 +488,45 @@ func (s *SessionSync) StartSyncSweep(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-timer.C:
+				activeInterval, idleInterval = s.sweepIntervals()
 				synced := s.syncSweep()
 				if synced > 0 || s.syncBackfillNeeded.Load() {
-					interval = time.Second
+					interval = activeInterval
 				} else {
-					// Back off when nothing to sync. Cap at 10s
-					// so new sessions are caught within one
-					// GC interval even without ring buffer events.
-					interval = min(interval*2, 10*time.Second)
+					// Back off when nothing to sync so the authoritative dataplane
+					// is not batch-walked unnecessarily. Userspace forwarding can
+					// override these intervals because it already streams create/close
+					// deltas out of band and only needs periodic refreshes.
+					interval = min(interval*2, idleInterval)
 				}
 				timer.Reset(interval)
 			}
 		}
 	}()
 	slog.Info("cluster sync: sweep started")
+}
+
+func (s *SessionSync) sweepIntervals() (time.Duration, time.Duration) {
+	return sweepIntervalsForDataPlane(s.dp)
+}
+
+func sweepIntervalsForDataPlane(dp any) (time.Duration, time.Duration) {
+	activeInterval := time.Second
+	idleInterval := 10 * time.Second
+	if profiler, ok := dp.(sessionSyncSweepProfiler); ok {
+		if enabled, active, idle := profiler.SessionSyncSweepProfile(); enabled {
+			if active > 0 {
+				activeInterval = active
+			}
+			if idle > 0 {
+				idleInterval = idle
+			}
+		}
+	}
+	if idleInterval < activeInterval {
+		idleInterval = activeInterval
+	}
+	return activeInterval, idleInterval
 }
 
 // ShouldSyncZone returns true if the local node should sync sessions for

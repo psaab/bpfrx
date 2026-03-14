@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/configstore"
 	"github.com/psaab/bpfrx/pkg/conntrack"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/dhcprelay"
 	"github.com/psaab/bpfrx/pkg/dhcpserver"
@@ -175,9 +177,21 @@ type Daemon struct {
 	// from a previous primary run keeping hosts dual-pathing traffic.
 	startupGoodbyeRA map[int]bool
 
+	// startupActiveAnnounce tracks whether the one-shot active-side
+	// neighbor refresh has been sent for each RG on this daemon run.
+	// This covers restart/redeploy of an already-active direct-mode RG,
+	// where VIP ownership does not transition and the normal failover
+	// GARP/NA path would not fire.
+	startupActiveAnnounce map[int]bool
+
 	// linkByNameFn resolves a network interface by name. Defaults to
 	// netlink.LinkByName; overridden in tests.
 	linkByNameFn func(string) (netlink.Link, error)
+
+	// userspaceSessionIDs allocates synthetic session IDs for sessions
+	// learned from the userspace dataplane helper before they enter the
+	// existing HA/session-sync transport.
+	userspaceSessionIDs atomic.Uint64
 }
 
 // New creates a new Daemon.
@@ -390,6 +404,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 		gc := conntrack.NewGC(d.dp, 10*time.Second)
 		d.gc = gc
+
+		// When the userspace dataplane is active, skip BPF session map
+		// GC entirely — sessions are managed in user-space. Without
+		// this, BatchLookup burns ~19% CPU scanning maps not used for
+		// forwarding decisions.
+		if _, ok := d.dp.(userspaceSessionDeltaDrainer); ok {
+			gc.SkipSweep = func() bool { return true }
+		}
 
 		// In cluster mode, GC should only expire sessions when this node
 		// is primary.  The peer primary ages sessions and syncs deletes.
@@ -1752,6 +1774,14 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
+	// 2.6b2. Rebind AF_XDP sockets after RETH MAC programming.
+	// programRethMAC brings links DOWN/UP which destroys the kernel-side
+	// XSK receive queue for AF_XDP sockets.  Notify the userspace
+	// dataplane so it can recreate the sockets.
+	if d.dp != nil && d.cluster != nil && cfg.Chassis.Cluster != nil {
+		d.dp.NotifyLinkCycle()
+	}
+
 	// 2.6c. Reconcile proxy ARP entries for NAT addresses.
 	if len(cfg.Security.NAT.ProxyARP) > 0 {
 		ifaceMap := make(map[string]int)
@@ -2765,6 +2795,162 @@ func buildZoneIDs(cfg *config.Config) map[string]uint16 {
 	return ids
 }
 
+type userspaceSessionDeltaDrainer interface {
+	DrainSessionDeltas(max uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error)
+}
+
+func daemonMonotonicSeconds() uint64 {
+	var ts unix.Timespec
+	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	return uint64(ts.Sec)
+}
+
+func userspaceSessionTimeout(proto uint8) uint32 {
+	switch proto {
+	case 6:
+		return 300
+	case 17:
+		return 60
+	case 1, 58:
+		return 15
+	default:
+		return 30
+	}
+}
+
+func userspaceReverseKeyV4(key dataplane.SessionKey, delta dpuserspace.SessionDeltaInfo) dataplane.SessionKey {
+	rev := dataplane.SessionKey{
+		SrcIP:    key.DstIP,
+		DstIP:    key.SrcIP,
+		SrcPort:  key.DstPort,
+		DstPort:  key.SrcPort,
+		Protocol: key.Protocol,
+	}
+	if ip := net.ParseIP(delta.NATDstIP).To4(); ip != nil {
+		copy(rev.SrcIP[:], ip)
+	}
+	if ip := net.ParseIP(delta.NATSrcIP).To4(); ip != nil {
+		copy(rev.DstIP[:], ip)
+	}
+	return rev
+}
+
+func userspaceReverseKeyV6(key dataplane.SessionKeyV6, delta dpuserspace.SessionDeltaInfo) dataplane.SessionKeyV6 {
+	rev := dataplane.SessionKeyV6{
+		SrcIP:    key.DstIP,
+		DstIP:    key.SrcIP,
+		SrcPort:  key.DstPort,
+		DstPort:  key.SrcPort,
+		Protocol: key.Protocol,
+	}
+	if ip := net.ParseIP(delta.NATDstIP).To16(); ip != nil {
+		copy(rev.SrcIP[:], ip)
+	}
+	if ip := net.ParseIP(delta.NATSrcIP).To16(); ip != nil {
+		copy(rev.DstIP[:], ip)
+	}
+	return rev
+}
+
+func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKey, dataplane.SessionValue, bool) {
+	src := net.ParseIP(delta.SrcIP).To4()
+	dst := net.ParseIP(delta.DstIP).To4()
+	if src == nil || dst == nil {
+		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
+	}
+	var key dataplane.SessionKey
+	copy(key.SrcIP[:], src)
+	copy(key.DstIP[:], dst)
+	key.SrcPort = delta.SrcPort
+	key.DstPort = delta.DstPort
+	key.Protocol = delta.Protocol
+
+	ingressZone := zoneIDs[delta.IngressZone]
+	egressZone := zoneIDs[delta.EgressZone]
+	if ingressZone == 0 || egressZone == 0 {
+		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
+	}
+
+	now := daemonMonotonicSeconds()
+	val := dataplane.SessionValue{
+		State:       4, // SESS_STATE_ESTABLISHED
+		SessionID:   uint64(now)<<16 | uint64(delta.Slot&0xffff),
+		Created:     now,
+		LastSeen:    now,
+		Timeout:     userspaceSessionTimeout(delta.Protocol),
+		IngressZone: ingressZone,
+		EgressZone:  egressZone,
+		ReverseKey:  userspaceReverseKeyV4(key, delta),
+	}
+	if delta.EgressIfindex > 0 {
+		val.FibIfindex = uint32(delta.EgressIfindex)
+	}
+	if ip := net.ParseIP(delta.NATSrcIP).To4(); ip != nil {
+		val.Flags |= dataplane.SessFlagSNAT
+		val.NATSrcIP = binary.NativeEndian.Uint32(ip)
+		val.NATSrcPort = key.SrcPort
+	}
+	if ip := net.ParseIP(delta.NATDstIP).To4(); ip != nil {
+		val.Flags |= dataplane.SessFlagDNAT
+		val.NATDstIP = binary.NativeEndian.Uint32(ip)
+		val.NATDstPort = key.DstPort
+	}
+	return key, val, true
+}
+
+func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKeyV6, dataplane.SessionValueV6, bool) {
+	src := net.ParseIP(delta.SrcIP).To16()
+	dst := net.ParseIP(delta.DstIP).To16()
+	if src == nil || dst == nil {
+		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false
+	}
+	var key dataplane.SessionKeyV6
+	copy(key.SrcIP[:], src)
+	copy(key.DstIP[:], dst)
+	key.SrcPort = delta.SrcPort
+	key.DstPort = delta.DstPort
+	key.Protocol = delta.Protocol
+
+	ingressZone := zoneIDs[delta.IngressZone]
+	egressZone := zoneIDs[delta.EgressZone]
+	if ingressZone == 0 || egressZone == 0 {
+		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false
+	}
+
+	now := daemonMonotonicSeconds()
+	val := dataplane.SessionValueV6{
+		State:       4, // SESS_STATE_ESTABLISHED
+		SessionID:   uint64(now)<<16 | uint64(delta.Slot&0xffff),
+		Created:     now,
+		LastSeen:    now,
+		Timeout:     userspaceSessionTimeout(delta.Protocol),
+		IngressZone: ingressZone,
+		EgressZone:  egressZone,
+		ReverseKey:  userspaceReverseKeyV6(key, delta),
+	}
+	if delta.EgressIfindex > 0 {
+		val.FibIfindex = uint32(delta.EgressIfindex)
+	}
+	if ip := net.ParseIP(delta.NATSrcIP).To16(); ip != nil {
+		val.Flags |= dataplane.SessFlagSNAT
+		copy(val.NATSrcIP[:], ip)
+		val.NATSrcPort = key.SrcPort
+	}
+	if ip := net.ParseIP(delta.NATDstIP).To16(); ip != nil {
+		val.Flags |= dataplane.SessFlagDNAT
+		copy(val.NATDstIP[:], ip)
+		val.NATDstPort = key.DstPort
+	}
+	return key, val, true
+}
+
+func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, ingressZone uint16) bool {
+	if delta.OwnerRGID > 0 && d.sessionSync != nil && d.sessionSync.IsPrimaryForRGFn != nil {
+		return d.sessionSync.IsPrimaryForRGFn(delta.OwnerRGID)
+	}
+	return d.sessionSync != nil && d.sessionSync.ShouldSyncZone(ingressZone)
+}
+
 // buildZoneRGMap builds a zone_id→RG mapping by looking up which interfaces
 // belong to each zone, then checking those interfaces' RedundancyGroup.
 // Zones with RETH interfaces inherit the RETH's RG; non-RETH zones are not
@@ -2811,6 +2997,76 @@ func rgHasRETH(cfg *config.Config, rgID int) bool {
 		}
 	}
 	return false
+}
+
+func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
+	drainer, ok := d.dp.(userspaceSessionDeltaDrainer)
+	if !ok || d.cluster == nil || d.sessionSync == nil {
+		return
+	}
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		if d.cluster == nil || d.sessionSync == nil {
+			return
+		}
+		if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
+			continue
+		}
+
+		cfg := d.store.ActiveConfig()
+		if cfg == nil {
+			continue
+		}
+		zoneIDs := buildZoneIDs(cfg)
+
+		deltas, _, err := drainer.DrainSessionDeltas(256)
+		if err != nil {
+			slog.Debug("userspace session delta drain failed", "err", err)
+			continue
+		}
+
+		for _, delta := range deltas {
+			switch strings.ToLower(delta.Event) {
+			case "open":
+				switch delta.AddrFamily {
+				case dataplane.AFInet:
+					key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
+					if !ok || !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
+						continue
+					}
+					d.sessionSync.QueueSessionV4(key, val)
+				case dataplane.AFInet6:
+					key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
+					if !ok || !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
+						continue
+					}
+					d.sessionSync.QueueSessionV6(key, val)
+				}
+			case "close":
+				switch delta.AddrFamily {
+				case dataplane.AFInet:
+					key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
+					if ok && d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
+						d.sessionSync.QueueDeleteV4(key)
+					}
+				case dataplane.AFInet6:
+					key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
+					if ok && d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
+						d.sessionSync.QueueDeleteV6(key)
+					}
+				}
+			}
+		}
+	}
 }
 
 // parseAddrPair parses "ip:port" or "[ip]:port" into net.IPs and IPv6 flag.
@@ -4388,6 +4644,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 						return d.cluster != nil && d.cluster.IsLocalPrimary(rgID)
 					}
 					d.sessionSync.StartSyncSweep(commsCtx)
+					go d.syncUserspaceSessionDeltas(commsCtx)
 				}
 
 				break
@@ -5645,6 +5902,24 @@ func (d *Daemon) reconcileRGState() {
 			} else if tr.Changed {
 				d.directRemoveVIPs(rgID)
 			}
+		}
+
+		// Startup active-side announce: after a daemon restart, an RG can
+		// remain active without any ownership transition. In direct mode
+		// that means no failover event fires to refresh downstream ARP/NDP
+		// caches, so LAN hosts can keep a failed gateway entry until they
+		// happen to relearn it. Re-announce once per daemon run.
+		if noRethVRRP && tr.Active && !d.startupActiveAnnounce[rgID] {
+			if d.startupActiveAnnounce == nil {
+				d.startupActiveAnnounce = make(map[int]bool)
+			}
+			d.startupActiveAnnounce[rgID] = true
+			go d.directSendGARPs(rgID)
+			go func() {
+				if cfg := d.store.ActiveConfig(); cfg != nil {
+					d.resolveNeighbors(cfg)
+				}
+			}()
 		}
 
 		// RA/DHCP service reconciliation (#93): safety net for dropped

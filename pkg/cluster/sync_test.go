@@ -1326,7 +1326,7 @@ func TestConcurrentSyncWriters(t *testing.T) {
 
 	const writersPerType = 5
 	const msgsPerWriter = 50
-	totalExpected := writersPerType*msgsPerWriter*2 // session + control
+	totalExpected := writersPerType * msgsPerWriter * 2 // session + control
 
 	// Receiver: read all messages and verify framing.
 	type result struct {
@@ -1592,4 +1592,49 @@ func TestSessionQueueDoesNotJournal(t *testing.T) {
 		t.Fatal("session updates should not be journaled")
 	}
 	ss.deleteJournalMu.Unlock()
+}
+
+type mockSweepProfilerDP struct {
+	active time.Duration
+	idle   time.Duration
+}
+
+func (m mockSweepProfilerDP) SessionSyncSweepProfile() (bool, time.Duration, time.Duration) {
+	return true, m.active, m.idle
+}
+
+func TestSweepIntervalsDefault(t *testing.T) {
+	active, idle := sweepIntervalsForDataPlane(nil)
+	if active != time.Second {
+		t.Fatalf("active interval = %v, want %v", active, time.Second)
+	}
+	if idle != 10*time.Second {
+		t.Fatalf("idle interval = %v, want %v", idle, 10*time.Second)
+	}
+}
+
+func TestSweepIntervalsDataplaneOverride(t *testing.T) {
+	active, idle := sweepIntervalsForDataPlane(mockSweepProfilerDP{
+		active: 15 * time.Second,
+		idle:   60 * time.Second,
+	})
+	if active != 15*time.Second {
+		t.Fatalf("active interval = %v, want %v", active, 15*time.Second)
+	}
+	if idle != 60*time.Second {
+		t.Fatalf("idle interval = %v, want %v", idle, 60*time.Second)
+	}
+}
+
+func TestSweepIntervalsClampIdleToActive(t *testing.T) {
+	active, idle := sweepIntervalsForDataPlane(mockSweepProfilerDP{
+		active: 20 * time.Second,
+		idle:   5 * time.Second,
+	})
+	if active != 20*time.Second {
+		t.Fatalf("active interval = %v, want %v", active, 20*time.Second)
+	}
+	if idle != 20*time.Second {
+		t.Fatalf("idle interval = %v, want %v", idle, 20*time.Second)
+	}
 }
