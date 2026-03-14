@@ -1268,7 +1268,6 @@ struct PendingForwardRequest {
     ingress_queue_id: u32,
     source_offset: u64,
     desc: XdpDesc,
-    source_frame: Vec<u8>,
     meta: UserspaceDpMeta,
     decision: SessionDecision,
     expected_ports: Option<(u16, u16)>,
@@ -2909,11 +2908,11 @@ fn build_live_forward_request(
     } else {
         resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
     };
-    // Capture ports from the live UMEM frame BEFORE copying — this is the
-    // ground truth for what the NIC delivered.  The .to_vec() copy may race
-    // with NIC DMA on reused descriptors in edge cases.
+    // Capture ports from the live UMEM frame — this is the ground truth
+    // for what the NIC delivered.
     let live_ports = live_frame_ports(area, desc, meta);
-    let source_frame = area.slice(desc.addr as usize, desc.len as usize)?.to_vec();
+    // Verify the UMEM slice is accessible (validates addr/len).
+    let _ = area.slice(desc.addr as usize, desc.len as usize)?;
     // Prefer session flow ports (set by conntrack, immune to DMA races),
     // then live frame ports, then metadata as last resort.
     let session_ports = flow.and_then(|f| {
@@ -2929,71 +2928,11 @@ fn build_live_forward_request(
         None
     };
     let expected_ports = session_ports.or(live_ports).or(meta_ports);
-    // Diagnostic: detect expected_ports source and cross-check with copied frame
-    if meta.protocol == PROTO_TCP || meta.protocol == PROTO_UDP {
-        let copy_ports = live_frame_ports_bytes(&source_frame, meta.addr_family, meta.protocol);
-        let ports_source = if session_ports.is_some() {
-            "session"
-        } else if live_ports.is_some() {
-            "live"
-        } else if meta_ports.is_some() {
-            "meta"
-        } else {
-            "none"
-        };
-        // Log if the different port sources disagree — this catches DMA race
-        let all_agree = [session_ports, live_ports, meta_ports, copy_ports]
-            .iter()
-            .filter_map(|p| *p)
-            .collect::<Vec<_>>();
-        let disagreement = all_agree.windows(2).any(|w| w[0] != w[1]);
-        if cfg!(feature = "debug-log") && disagreement {
-            thread_local! {
-                static PORT_DISAGREE_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-            }
-            PORT_DISAGREE_LOG.with(|c| {
-                let n = c.get();
-                if n < 100 {
-                    c.set(n + 1);
-                    debug_log!(
-                        "PORT_DISAGREE[{n}]: source={ports_source} session={session_ports:?} live={live_ports:?} meta={meta_ports:?} copy={copy_ports:?} expected={expected_ports:?} desc.addr={} desc.len={} proto={}",
-                        desc.addr, desc.len, meta.protocol,
-                    );
-                }
-            });
-        }
-        // Log when session is missing for non-SYN TCP
-        if cfg!(feature = "debug-log") && meta.protocol == PROTO_TCP && session_ports.is_none() && flow.is_none() {
-            let tcp_flags = source_frame
-                .get(frame_l3_offset(&source_frame).unwrap_or(14)..)
-                .and_then(|ip| {
-                    let l4_off = packet_rel_l4_offset(ip, meta.addr_family).unwrap_or(20);
-                    ip.get(l4_off + 13).copied()
-                })
-                .unwrap_or(0);
-            if tcp_flags & 0x02 == 0 {
-                thread_local! {
-                    static SESS_MISS_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-                }
-                SESS_MISS_LOG.with(|c| {
-                    let n = c.get();
-                    if n < 100 {
-                        c.set(n + 1);
-                        debug_log!(
-                            "SESS_MISS_TCP[{n}]: flags=0x{tcp_flags:02x} expected={expected_ports:?} live={live_ports:?} meta={meta_ports:?} copy={copy_ports:?} desc.addr={} desc.len={}",
-                            desc.addr, desc.len,
-                        );
-                    }
-                });
-            }
-        }
-    }
     Some(PendingForwardRequest {
         target_ifindex,
         ingress_queue_id: ingress_ident.queue_id,
         source_offset: desc.addr,
         desc,
-        source_frame,
         meta,
         decision: *decision,
         expected_ports,
@@ -3079,8 +3018,17 @@ fn enqueue_pending_forwards(
     for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
+        // Read source frame directly from ingress UMEM — no heap copy needed.
+        // The frame is safe to read: RX ring released but frame not yet returned
+        // to fill ring (that happens after this function completes).
+        let Some(source_frame) = (unsafe { &*ingress_area })
+            .slice(request.source_offset as usize, request.desc.len as usize)
+        else {
+            ingress_binding.pending_fill_frames.push_back(source_offset);
+            continue;
+        };
         let expected_ports = request.expected_ports.or(live_frame_ports_bytes(
-            &request.source_frame,
+            source_frame,
             request.meta.addr_family,
             request.meta.protocol,
         ));
@@ -3116,37 +3064,39 @@ fn enqueue_pending_forwards(
         let mut retained_source_frame = false;
         {
             if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
-                &request.source_frame,
+                source_frame,
                 request.meta,
                 &request.decision,
                 forwarding,
                 expected_ports,
             ) {
                 for frame in segmented {
-                    if let Some(reason) = forward_tuple_mismatch_reason(
-                        live_frame_ports_bytes(
-                            &request.source_frame,
-                            request.meta.addr_family,
-                            request.meta.protocol,
-                        ),
-                        expected_ports,
-                        live_frame_ports_bytes(
-                            &frame,
-                            request.meta.addr_family,
-                            request.meta.protocol,
-                        ),
-                    ) {
-                        record_exception(
-                            recent_exceptions,
-                            ingress_ident,
-                            &reason,
-                            frame.len() as u32,
-                            Some(request.meta),
-                            None,
-                        );
-                        build_failed = true;
-                        copied_source_frame = true;
-                        break;
+                    if cfg!(feature = "debug-log") {
+                        if let Some(reason) = forward_tuple_mismatch_reason(
+                            live_frame_ports_bytes(
+                                source_frame,
+                                request.meta.addr_family,
+                                request.meta.protocol,
+                            ),
+                            expected_ports,
+                            live_frame_ports_bytes(
+                                &frame,
+                                request.meta.addr_family,
+                                request.meta.protocol,
+                            ),
+                        ) {
+                            record_exception(
+                                recent_exceptions,
+                                ingress_ident,
+                                &reason,
+                                frame.len() as u32,
+                                Some(request.meta),
+                                None,
+                            );
+                            build_failed = true;
+                            copied_source_frame = true;
+                            break;
+                        }
                     }
                     let seg_frame_len = frame.len();
                     target_binding.pending_tx_local.push_back(TxRequest {
@@ -3171,7 +3121,7 @@ fn enqueue_pending_forwards(
                 }
             }
             // Track when segmentation was needed but returned None
-            if !copied_source_frame && request.source_frame.len() > 1514 {
+            if !copied_source_frame && source_frame.len() > 1514 {
                 dbg.seg_needed_but_none += 1;
                 thread_local! {
                     static SEG_MISS_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -3188,11 +3138,11 @@ fn enqueue_pending_forwards(
                         eprintln!(
                             "DBG SEG_MISS[{}]: frame_len={} proto={} egress_if={} tx_if={} egress_mtu={:?} \
                              target_if={} src_frame_bytes={}",
-                            n, request.source_frame.len(), request.meta.protocol,
+                            n, source_frame.len(), request.meta.protocol,
                             request.decision.resolution.egress_ifindex,
                             request.decision.resolution.tx_ifindex,
                             egress_mtu, request.target_ifindex,
-                            request.source_frame.len(),
+                            source_frame.len(),
                         );
                     }
                 });
@@ -3239,36 +3189,38 @@ fn enqueue_pending_forwards(
                             retained_source_frame = true;
                         }
                         None => match build_forwarded_frame_from_frame(
-                            &request.source_frame,
+                            source_frame,
                             request.meta,
                             &request.decision,
                             forwarding,
                             expected_ports,
                         ) {
                             Some(frame) => {
-                                if let Some(reason) = forward_tuple_mismatch_reason(
-                                    live_frame_ports_bytes(
-                                        &request.source_frame,
-                                        request.meta.addr_family,
-                                        request.meta.protocol,
-                                    ),
-                                    expected_ports,
-                                    live_frame_ports_bytes(
-                                        &frame,
-                                        request.meta.addr_family,
-                                        request.meta.protocol,
-                                    ),
-                                ) {
-                                    record_exception(
-                                        recent_exceptions,
-                                        ingress_ident,
-                                        &reason,
-                                        frame.len() as u32,
-                                        Some(request.meta),
-                                        None,
-                                    );
-                                    build_failed = true;
-                                    continue;
+                                if cfg!(feature = "debug-log") {
+                                    if let Some(reason) = forward_tuple_mismatch_reason(
+                                        live_frame_ports_bytes(
+                                            source_frame,
+                                            request.meta.addr_family,
+                                            request.meta.protocol,
+                                        ),
+                                        expected_ports,
+                                        live_frame_ports_bytes(
+                                            &frame,
+                                            request.meta.addr_family,
+                                            request.meta.protocol,
+                                        ),
+                                    ) {
+                                        record_exception(
+                                            recent_exceptions,
+                                            ingress_ident,
+                                            &reason,
+                                            frame.len() as u32,
+                                            Some(request.meta),
+                                            None,
+                                        );
+                                        build_failed = true;
+                                        continue;
+                                    }
                                 }
                                 let cp1_len = frame.len();
                                 if cp1_len > tx_frame_capacity() {
@@ -3316,44 +3268,50 @@ fn enqueue_pending_forwards(
                         .and_then(|out| {
                             build_forwarded_frame_into_from_frame(
                                 out,
-                                &request.source_frame,
+                                source_frame,
                                 request.meta,
                                 &request.decision,
                                 expected_ports,
                             )
                         });
                         if let Some(written) = written {
-                            let built_ports = {
-                                let built_frame = unsafe {
+                            // Debug-only: validate built frame ports match expected.
+                            // enforce_expected_ports() in build_forwarded_frame_into_from_frame
+                            // already ensures correctness; this catches builder bugs.
+                            if cfg!(feature = "debug-log") {
+                                let built_ports = unsafe {
                                     target_area.slice_mut_unchecked(tx_offset as usize, written)
-                                };
-                                built_frame.and_then(|f| {
+                                }
+                                .and_then(|f| {
                                     live_frame_ports_bytes(
                                         f,
                                         request.meta.addr_family,
                                         request.meta.protocol,
                                     )
-                                })
-                            };
-                            if let Some(reason) = forward_tuple_mismatch_reason(
-                                live_frame_ports_bytes(
-                                    &request.source_frame,
-                                    request.meta.addr_family,
-                                    request.meta.protocol,
-                                ),
-                                expected_ports,
-                                built_ports,
-                            ) {
+                                });
+                                if let Some(reason) = forward_tuple_mismatch_reason(
+                                    live_frame_ports_bytes(
+                                        source_frame,
+                                        request.meta.addr_family,
+                                        request.meta.protocol,
+                                    ),
+                                    expected_ports,
+                                    built_ports,
+                                ) {
+                                    target_binding.free_tx_frames.push_front(tx_offset);
+                                    record_exception(
+                                        recent_exceptions,
+                                        ingress_ident,
+                                        &reason,
+                                        written as u32,
+                                        Some(request.meta),
+                                        None,
+                                    );
+                                    build_failed = true;
+                                }
+                            }
+                            if build_failed {
                                 target_binding.free_tx_frames.push_front(tx_offset);
-                                record_exception(
-                                    recent_exceptions,
-                                    ingress_ident,
-                                    &reason,
-                                    written as u32,
-                                    Some(request.meta),
-                                    None,
-                                );
-                                build_failed = true;
                                 true
                             } else if written > tx_frame_capacity() {
                                 target_binding.free_tx_frames.push_front(tx_offset);
@@ -3397,36 +3355,38 @@ fn enqueue_pending_forwards(
                     // Fallback: Vec copy path when direct build unavailable.
                     if !direct_built {
                         match build_forwarded_frame_from_frame(
-                            &request.source_frame,
+                            source_frame,
                             request.meta,
                             &request.decision,
                             forwarding,
                             expected_ports,
                         ) {
                             Some(frame) => {
-                                if let Some(reason) = forward_tuple_mismatch_reason(
-                                    live_frame_ports_bytes(
-                                        &request.source_frame,
-                                        request.meta.addr_family,
-                                        request.meta.protocol,
-                                    ),
-                                    expected_ports,
-                                    live_frame_ports_bytes(
-                                        &frame,
-                                        request.meta.addr_family,
-                                        request.meta.protocol,
-                                    ),
-                                ) {
-                                    record_exception(
-                                        recent_exceptions,
-                                        ingress_ident,
-                                        &reason,
-                                        frame.len() as u32,
-                                        Some(request.meta),
-                                        None,
-                                    );
-                                    build_failed = true;
-                                    continue;
+                                if cfg!(feature = "debug-log") {
+                                    if let Some(reason) = forward_tuple_mismatch_reason(
+                                        live_frame_ports_bytes(
+                                            source_frame,
+                                            request.meta.addr_family,
+                                            request.meta.protocol,
+                                        ),
+                                        expected_ports,
+                                        live_frame_ports_bytes(
+                                            &frame,
+                                            request.meta.addr_family,
+                                            request.meta.protocol,
+                                        ),
+                                    ) {
+                                        record_exception(
+                                            recent_exceptions,
+                                            ingress_ident,
+                                            &reason,
+                                            frame.len() as u32,
+                                            Some(request.meta),
+                                            None,
+                                        );
+                                        build_failed = true;
+                                        continue;
+                                    }
                                 }
                                 let cp2_len = frame.len();
                                 if cp2_len > tx_frame_capacity() {
@@ -3493,7 +3453,7 @@ fn enqueue_pending_forwards(
                     ingress_ident,
                     ingress_live,
                     slow_path,
-                    &request.source_frame,
+                    source_frame,
                     request.meta,
                     request.decision,
                     recent_exceptions,
@@ -8139,7 +8099,7 @@ fn build_forwarded_frame_into_from_frame(
             }
             out[ip_start + 8] -= 1;
             let enforced =
-                enforce_expected_ports(out, meta.addr_family, meta.protocol, enforced_ports)
+                enforce_expected_ports_at(out, ip_start, ip_start + rel_l4, meta.addr_family, meta.protocol, enforced_ports)
                     .unwrap_or(false);
             adjust_ipv4_header_checksum(
                 &mut out[ip_start..ip_start + ihl],
@@ -8166,7 +8126,7 @@ fn build_forwarded_frame_into_from_frame(
             }
             out[ip_start + 7] -= 1;
             let enforced =
-                enforce_expected_ports(out, meta.addr_family, meta.protocol, enforced_ports)
+                enforce_expected_ports_at(out, ip_start, ip_start + rel_l4, meta.addr_family, meta.protocol, enforced_ports)
                     .unwrap_or(false);
             if repaired_ports && !enforced {
                 recompute_l4_checksum_ipv6(&mut out[ip_start..], meta.protocol)?;
@@ -8572,6 +8532,50 @@ fn enforce_expected_ports(
     }
     let l3 = frame_l3_offset(frame)?;
     let l4 = frame_l4_offset(frame, addr_family)?;
+    let ports = frame.get(l4..l4 + 4)?;
+    let current_src = u16::from_be_bytes([ports[0], ports[1]]);
+    let current_dst = u16::from_be_bytes([ports[2], ports[3]]);
+    if current_src == expected_src && current_dst == expected_dst {
+        return Some(false);
+    }
+    frame
+        .get_mut(l4..l4 + 2)?
+        .copy_from_slice(&expected_src.to_be_bytes());
+    frame
+        .get_mut(l4 + 2..l4 + 4)?
+        .copy_from_slice(&expected_dst.to_be_bytes());
+    match addr_family as i32 {
+        libc::AF_INET => {
+            let packet = frame.get_mut(l3..)?;
+            let ihl = packet_rel_l4_offset(packet, addr_family)?;
+            recompute_l4_checksum_ipv4(packet, ihl, protocol, true)?;
+        }
+        libc::AF_INET6 => {
+            let packet = frame.get_mut(l3..)?;
+            recompute_l4_checksum_ipv6(packet, protocol)?;
+        }
+        _ => return Some(false),
+    }
+    Some(true)
+}
+
+/// Like enforce_expected_ports, but takes pre-computed L3/L4 offsets to avoid
+/// redundant header parsing in the hot path.
+#[inline]
+fn enforce_expected_ports_at(
+    frame: &mut [u8],
+    l3: usize,
+    l4: usize,
+    addr_family: u8,
+    protocol: u8,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<bool> {
+    let Some((expected_src, expected_dst)) = expected_ports else {
+        return Some(false);
+    };
+    if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
+        return Some(false);
+    }
     let ports = frame.get(l4..l4 + 4)?;
     let current_src = u16::from_be_bytes([ports[0], ports[1]]);
     let current_dst = u16::from_be_bytes([ports[2], ports[3]]);
