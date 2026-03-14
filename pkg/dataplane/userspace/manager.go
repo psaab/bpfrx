@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -212,12 +213,25 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	if !userspaceSupportsSecurityPolicies(cfg) {
 		addReason("full security policy semantics are not implemented in the userspace dataplane")
 	}
-	if !userspaceSupportsSourceNAT(cfg.Security.NAT.Source) ||
-		(cfg.Security.NAT.Destination != nil && len(cfg.Security.NAT.Destination.RuleSets) > 0) ||
-		len(cfg.Security.NAT.Static) > 0 ||
-		cfg.Security.NAT.NATv6v4 != nil {
-		addReason("full NAT features (destination NAT, static NAT, NATv6v4) are not implemented in the userspace dataplane")
+	if !userspaceSupportsSourceNAT(cfg.Security.NAT.Source) {
+		addReason("source NAT pool mode is not implemented in the userspace dataplane")
 	}
+	if cfg.Security.NAT.Destination != nil && len(cfg.Security.NAT.Destination.RuleSets) > 0 {
+		addReason("destination NAT is not implemented in the userspace dataplane")
+	}
+	// Static NAT (1:1) is supported — check only for unsupported NPTv6 rules
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule != nil && rule.IsNPTv6 {
+				addReason("NPTv6 is not implemented in the userspace dataplane")
+				break
+			}
+		}
+	}
+	// NAT64 is supported — NATv6v4 config (no-v6-frag-header option) is fine
 	if cfg.Security.Flow.TCPSession != nil ||
 		cfg.Security.Flow.UDPSessionTimeout != 0 ||
 		cfg.Security.Flow.ICMPSessionTimeout != 0 ||
@@ -542,9 +556,10 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		},
 		DefaultPolicy: policyActionString(cfg.Security.DefaultPolicy),
 		Policies:      buildPolicySnapshots(cfg),
-		SourceNAT:     buildSourceNATSnapshots(cfg),
-		StaticNAT:     buildStaticNATSnapshots(cfg),
-		NAT64:         buildNAT64Snapshots(cfg),
+		SourceNAT:      buildSourceNATSnapshots(cfg),
+		StaticNAT:      buildStaticNATSnapshots(cfg),
+		DestinationNAT: buildDestinationNATSnapshots(cfg),
+		NAT64:          buildNAT64Snapshots(cfg),
 		Config:        cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
@@ -1167,6 +1182,141 @@ func buildStaticNATSnapshots(cfg *config.Config) []StaticNATRuleSnapshot {
 				ExternalIP: rule.Match,
 				InternalIP: rule.Then,
 			})
+		}
+	}
+	return out
+}
+
+// appPortsFromSpec parses a port specification like "80", "1024-65535" into a
+// list of port numbers. Mirrors the logic in pkg/dataplane/compiler.go.
+func appPortsFromSpec(spec string) []int {
+	if spec == "" {
+		return nil
+	}
+	if strings.Contains(spec, "-") {
+		parts := strings.SplitN(spec, "-", 2)
+		lo, err := strconv.ParseUint(parts[0], 10, 16)
+		if err != nil {
+			return nil
+		}
+		hi, err := strconv.ParseUint(parts[1], 10, 16)
+		if err != nil {
+			return nil
+		}
+		if hi > lo {
+			var ports []int
+			for p := lo; p <= hi; p++ {
+				ports = append(ports, int(p))
+			}
+			return ports
+		}
+		return []int{int(lo)}
+	}
+	p, err := strconv.ParseUint(spec, 10, 16)
+	if err != nil {
+		return nil
+	}
+	return []int{int(p)}
+}
+
+func buildDestinationNATSnapshots(cfg *config.Config) []DestinationNATRuleSnapshot {
+	if cfg == nil || cfg.Security.NAT.Destination == nil || len(cfg.Security.NAT.Destination.RuleSets) == 0 {
+		return nil
+	}
+	var out []DestinationNATRuleSnapshot
+	for _, rs := range cfg.Security.NAT.Destination.RuleSets {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.Then.PoolName == "" {
+				continue
+			}
+			pool, ok := cfg.Security.NAT.Destination.Pools[rule.Then.PoolName]
+			if !ok || pool == nil || pool.Address == "" {
+				continue
+			}
+			if rule.Match.DestinationAddress == "" {
+				continue
+			}
+
+			// Resolve application match to protocol+ports if specified.
+			type appTerm struct {
+				proto string
+				ports []int
+			}
+			var appTerms []appTerm
+
+			if rule.Match.Application != "" {
+				userApps := cfg.Applications.Applications
+				app, found := config.ResolveApplication(rule.Match.Application, userApps)
+				if found {
+					appTerms = append(appTerms, appTerm{proto: app.Protocol, ports: appPortsFromSpec(app.DestinationPort)})
+				} else if _, isSet := cfg.Applications.ApplicationSets[rule.Match.Application]; isSet {
+					expanded, err := config.ExpandApplicationSet(rule.Match.Application, &cfg.Applications)
+					if err == nil {
+						for _, termName := range expanded {
+							tApp, ok := config.ResolveApplication(termName, userApps)
+							if !ok {
+								continue
+							}
+							appTerms = append(appTerms, appTerm{proto: tApp.Protocol, ports: appPortsFromSpec(tApp.DestinationPort)})
+						}
+					}
+				}
+			}
+
+			// If no application terms resolved, use explicit match values
+			if len(appTerms) == 0 {
+				appTerms = []appTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
+			}
+
+			for _, term := range appTerms {
+				var dstPorts []uint16
+				if len(term.ports) > 0 {
+					for _, p := range term.ports {
+						dstPorts = append(dstPorts, uint16(p))
+					}
+				} else if rule.Match.DestinationPort != 0 {
+					dstPorts = []uint16{uint16(rule.Match.DestinationPort)}
+				} else {
+					dstPorts = []uint16{0}
+				}
+
+				for _, dstPort := range dstPorts {
+					poolPort := dstPort
+					if pool.Port != 0 {
+						poolPort = uint16(pool.Port)
+					}
+
+					// Determine protocol string for the snapshot.
+					proto := term.proto
+					if proto == "" && dstPort != 0 {
+						proto = "tcp" // default for port-based DNAT
+					}
+
+					// Strip the destination address CIDR suffix for the snapshot
+					// (DNAT matches exact host IPs).
+					dstAddr := rule.Match.DestinationAddress
+					if idx := strings.IndexByte(dstAddr, '/'); idx != -1 {
+						dstAddr = dstAddr[:idx]
+					}
+					poolAddr := pool.Address
+					if idx := strings.IndexByte(poolAddr, '/'); idx != -1 {
+						poolAddr = poolAddr[:idx]
+					}
+
+					out = append(out, DestinationNATRuleSnapshot{
+						Name:               rule.Name,
+						FromZone:           rs.FromZone,
+						DestinationAddress: dstAddr,
+						DestinationPort:    dstPort,
+						Protocol:           proto,
+						PoolAddress:        poolAddr,
+						PoolPort:           poolPort,
+					})
+				}
+			}
 		}
 	}
 	return out
