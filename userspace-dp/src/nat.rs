@@ -1,12 +1,17 @@
-use crate::SourceNATRuleSnapshot;
+use crate::{SourceNATRuleSnapshot, StaticNATRuleSnapshot};
 use crate::prefix::{PrefixV4, PrefixV6};
 use ipnet::IpNet;
+use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct NatDecision {
     pub(crate) rewrite_src: Option<IpAddr>,
     pub(crate) rewrite_dst: Option<IpAddr>,
+    /// When true, this is a NAT64 cross-address-family translation.
+    /// The forward session key is IPv6 and the reverse session key is IPv4
+    /// (or vice versa for the return direction).
+    pub(crate) nat64: bool,
 }
 
 impl NatDecision {
@@ -14,6 +19,7 @@ impl NatDecision {
         Self {
             rewrite_src: self.rewrite_dst.map(|_| original_dst),
             rewrite_dst: self.rewrite_src.map(|_| original_src),
+            nat64: self.nat64,
         }
     }
 }
@@ -103,11 +109,92 @@ pub(crate) fn match_source_nat(
             return Some(NatDecision {
                 rewrite_src,
                 rewrite_dst: None,
+                ..NatDecision::default()
             });
         }
         return Some(NatDecision::default());
     }
     None
+}
+
+/// Static 1:1 NAT entry (bidirectional).
+#[derive(Clone, Debug)]
+pub(crate) struct StaticNatEntry {
+    pub(crate) external_ip: IpAddr,
+    pub(crate) internal_ip: IpAddr,
+    pub(crate) from_zone: String,
+}
+
+/// Lookup table for static NAT -- indexed by IP for O(1) matching.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StaticNatTable {
+    /// external_ip -> entry (for inbound DNAT)
+    dnat: FxHashMap<IpAddr, StaticNatEntry>,
+    /// internal_ip -> entry (for outbound SNAT)
+    snat: FxHashMap<IpAddr, StaticNatEntry>,
+}
+
+impl StaticNatTable {
+    pub(crate) fn from_snapshots(snaps: &[StaticNATRuleSnapshot]) -> Self {
+        let mut table = StaticNatTable::default();
+        for snap in snaps {
+            let external_ip: IpAddr = match snap.external_ip.parse() {
+                Ok(ip) => ip,
+                Err(_) => continue,
+            };
+            let internal_ip: IpAddr = match snap.internal_ip.parse() {
+                Ok(ip) => ip,
+                Err(_) => continue,
+            };
+            let entry = StaticNatEntry {
+                external_ip,
+                internal_ip,
+                from_zone: snap.from_zone.clone(),
+            };
+            table.dnat.insert(external_ip, entry.clone());
+            table.snat.insert(internal_ip, entry);
+        }
+        table
+    }
+
+    /// Match inbound: if dst_ip is an external IP, return DNAT decision.
+    pub(crate) fn match_dnat(&self, dst_ip: IpAddr, ingress_zone: &str) -> Option<NatDecision> {
+        let entry = self.dnat.get(&dst_ip)?;
+        if !entry.from_zone.is_empty() && entry.from_zone != ingress_zone {
+            return None;
+        }
+        Some(NatDecision {
+            rewrite_src: None,
+            rewrite_dst: Some(entry.internal_ip),
+            ..NatDecision::default()
+        })
+    }
+
+    /// Match outbound: if src_ip is an internal IP, return SNAT decision.
+    ///
+    /// Note: from_zone is NOT checked for SNAT. The zone constraint on the
+    /// static NAT rule set (`from zone X`) controls which ingress zone
+    /// triggers DNAT only. For SNAT (outbound), the internal IP match is
+    /// sufficient -- the traffic originates from the internal host regardless
+    /// of which zone it enters through.
+    pub(crate) fn match_snat(&self, src_ip: IpAddr, _ingress_zone: &str) -> Option<NatDecision> {
+        let entry = self.snat.get(&src_ip)?;
+        Some(NatDecision {
+            rewrite_src: Some(entry.external_ip),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        })
+    }
+
+    /// Returns true if the table has any entries.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.dnat.is_empty()
+    }
+
+    /// Returns all external IPs (for local delivery recognition).
+    pub(crate) fn external_ips(&self) -> impl Iterator<Item = &IpAddr> {
+        self.dnat.keys()
+    }
 }
 
 fn nets_match_v4(nets: &[PrefixV4], ip: Ipv4Addr) -> bool {
@@ -146,6 +233,7 @@ mod tests {
             Some(NatDecision {
                 rewrite_src: Some("172.16.80.8".parse().expect("snat")),
                 rewrite_dst: None,
+                ..NatDecision::default()
             })
         );
     }
@@ -174,6 +262,7 @@ mod tests {
             Some(NatDecision {
                 rewrite_src: Some("2001:559:8585:80::8".parse().expect("snat")),
                 rewrite_dst: None,
+                ..NatDecision::default()
             })
         );
     }
@@ -204,10 +293,10 @@ mod tests {
 
     #[test]
     fn reverse_decision_turns_snat_into_reply_dnat() {
-        let decision = NatDecision {
+        let decision = NatDecision { 
             rewrite_src: Some("172.16.80.8".parse().expect("snat")),
             rewrite_dst: None,
-        };
+         ..NatDecision::default() };
         assert_eq!(
             decision.reverse(
                 "10.0.61.102".parse().expect("orig src"),
@@ -216,7 +305,218 @@ mod tests {
             NatDecision {
                 rewrite_src: None,
                 rewrite_dst: Some("10.0.61.102".parse().expect("orig src")),
+                ..NatDecision::default()
             }
         );
+    }
+
+    #[test]
+    fn static_nat_dnat_matches_external_ip_v4() {
+        let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
+            name: "static-1".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }]);
+        let decision = table.match_dnat("203.0.113.10".parse().expect("ext"), "untrust");
+        assert_eq!(
+            decision,
+            Some(NatDecision {
+                rewrite_src: None,
+                rewrite_dst: Some("192.168.1.10".parse().expect("int")),
+                ..NatDecision::default()
+            })
+        );
+    }
+
+    #[test]
+    fn static_nat_snat_matches_internal_ip_v4() {
+        let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
+            name: "static-1".to_string(),
+            from_zone: "trust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }]);
+        let decision = table.match_snat("192.168.1.10".parse().expect("int"), "trust");
+        assert_eq!(
+            decision,
+            Some(NatDecision { 
+                rewrite_src: Some("203.0.113.10".parse().expect("ext")),
+                rewrite_dst: None,
+             ..NatDecision::default() })
+        );
+    }
+
+    #[test]
+    fn static_nat_dnat_matches_external_ip_v6() {
+        let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
+            name: "static-v6".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "2001:db8::1".to_string(),
+            internal_ip: "fd00::1".to_string(),
+        }]);
+        let decision = table.match_dnat("2001:db8::1".parse().expect("ext"), "untrust");
+        assert_eq!(
+            decision,
+            Some(NatDecision {
+                rewrite_src: None,
+                rewrite_dst: Some("fd00::1".parse().expect("int")),
+                ..NatDecision::default()
+            })
+        );
+    }
+
+    #[test]
+    fn static_nat_snat_matches_internal_ip_v6() {
+        let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
+            name: "static-v6".to_string(),
+            from_zone: "trust".to_string(),
+            external_ip: "2001:db8::1".to_string(),
+            internal_ip: "fd00::1".to_string(),
+        }]);
+        let decision = table.match_snat("fd00::1".parse().expect("int"), "trust");
+        assert_eq!(
+            decision,
+            Some(NatDecision { 
+                rewrite_src: Some("2001:db8::1".parse().expect("ext")),
+                rewrite_dst: None,
+             ..NatDecision::default() })
+        );
+    }
+
+    #[test]
+    fn static_nat_zone_mismatch_returns_none_for_dnat() {
+        let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
+            name: "static-1".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }]);
+        // DNAT from wrong zone should fail
+        assert!(table
+            .match_dnat("203.0.113.10".parse().expect("ext"), "trust")
+            .is_none());
+        // SNAT does not check from_zone -- internal IP match is sufficient.
+        // Traffic from internal host gets SNAT regardless of ingress zone.
+        assert!(table
+            .match_snat("192.168.1.10".parse().expect("int"), "dmz")
+            .is_some());
+    }
+
+    #[test]
+    fn static_nat_empty_zone_matches_any() {
+        let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
+            name: "static-any".to_string(),
+            from_zone: String::new(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }]);
+        assert!(table
+            .match_dnat("203.0.113.10".parse().expect("ext"), "untrust")
+            .is_some());
+        assert!(table
+            .match_dnat("203.0.113.10".parse().expect("ext"), "trust")
+            .is_some());
+        assert!(table
+            .match_snat("192.168.1.10".parse().expect("int"), "trust")
+            .is_some());
+    }
+
+    #[test]
+    fn static_nat_bidirectional_reverse() {
+        let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
+            name: "static-1".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }]);
+        // Inbound DNAT: external -> internal
+        let dnat = table
+            .match_dnat("203.0.113.10".parse().expect("ext"), "untrust")
+            .expect("dnat");
+        assert_eq!(
+            dnat,
+            NatDecision {
+                rewrite_src: None,
+                rewrite_dst: Some("192.168.1.10".parse().expect("int")),
+                ..NatDecision::default()
+            }
+        );
+        // The reverse of DNAT should produce SNAT: on reply packets from
+        // the internal host, rewrite src back to the external IP.
+        // reverse().rewrite_src = self.rewrite_dst.map(|_| original_dst) = Some(external)
+        // reverse().rewrite_dst = self.rewrite_src.map(|_| original_src) = None
+        let original_src: IpAddr = "198.51.100.1".parse().expect("peer");
+        let original_dst: IpAddr = "203.0.113.10".parse().expect("ext");
+        let reverse = dnat.reverse(original_src, original_dst);
+        assert_eq!(
+            reverse,
+            NatDecision {
+                rewrite_src: Some(original_dst),
+                rewrite_dst: None,
+                ..NatDecision::default()
+            }
+        );
+    }
+
+    #[test]
+    fn static_nat_no_match_returns_none() {
+        let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
+            name: "static-1".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }]);
+        assert!(table
+            .match_dnat("203.0.113.99".parse().expect("unknown"), "untrust")
+            .is_none());
+        assert!(table
+            .match_snat("192.168.1.99".parse().expect("unknown"), "trust")
+            .is_none());
+    }
+
+    #[test]
+    fn static_nat_invalid_ip_skipped() {
+        let table = StaticNatTable::from_snapshots(&[
+            StaticNATRuleSnapshot {
+                name: "bad".to_string(),
+                from_zone: String::new(),
+                external_ip: "not-an-ip".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+            },
+            StaticNATRuleSnapshot {
+                name: "good".to_string(),
+                from_zone: String::new(),
+                external_ip: "203.0.113.10".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+            },
+        ]);
+        // The bad entry should be skipped, the good one should work
+        assert!(table
+            .match_dnat("203.0.113.10".parse().expect("ext"), "any")
+            .is_some());
+    }
+
+    #[test]
+    fn static_nat_external_ips_iterator() {
+        let table = StaticNatTable::from_snapshots(&[
+            StaticNATRuleSnapshot {
+                name: "s1".to_string(),
+                from_zone: String::new(),
+                external_ip: "203.0.113.10".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+            },
+            StaticNATRuleSnapshot {
+                name: "s2".to_string(),
+                from_zone: String::new(),
+                external_ip: "203.0.113.20".to_string(),
+                internal_ip: "192.168.1.20".to_string(),
+            },
+        ]);
+        let mut ips: Vec<IpAddr> = table.external_ips().copied().collect();
+        ips.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        assert_eq!(ips.len(), 2);
+        assert!(ips.contains(&"203.0.113.10".parse::<IpAddr>().unwrap()));
+        assert!(ips.contains(&"203.0.113.20".parse::<IpAddr>().unwrap()));
     }
 }

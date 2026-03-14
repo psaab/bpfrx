@@ -215,9 +215,8 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	if !userspaceSupportsSourceNAT(cfg.Security.NAT.Source) ||
 		(cfg.Security.NAT.Destination != nil && len(cfg.Security.NAT.Destination.RuleSets) > 0) ||
 		len(cfg.Security.NAT.Static) > 0 ||
-		len(cfg.Security.NAT.NAT64) > 0 ||
 		cfg.Security.NAT.NATv6v4 != nil {
-		addReason("full NAT and NAT64 are not implemented in the userspace dataplane")
+		addReason("full NAT features (destination NAT, static NAT, NATv6v4) are not implemented in the userspace dataplane")
 	}
 	if cfg.Security.Flow.TCPSession != nil ||
 		cfg.Security.Flow.UDPSessionTimeout != 0 ||
@@ -544,6 +543,8 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		DefaultPolicy: policyActionString(cfg.Security.DefaultPolicy),
 		Policies:      buildPolicySnapshots(cfg),
 		SourceNAT:     buildSourceNATSnapshots(cfg),
+		StaticNAT:     buildStaticNATSnapshots(cfg),
+		NAT64:         buildNAT64Snapshots(cfg),
 		Config:        cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
@@ -1143,6 +1144,57 @@ func buildSourceNATSnapshots(cfg *config.Config) []SourceNATRuleSnapshot {
 				PoolName:             rule.Then.PoolName,
 			})
 		}
+	}
+	return out
+}
+
+func buildStaticNATSnapshots(cfg *config.Config) []StaticNATRuleSnapshot {
+	if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
+		return nil
+	}
+	out := make([]StaticNATRuleSnapshot, 0)
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.IsNPTv6 {
+				continue
+			}
+			out = append(out, StaticNATRuleSnapshot{
+				Name:       rule.Name,
+				FromZone:   rs.FromZone,
+				ExternalIP: rule.Match,
+				InternalIP: rule.Then,
+			})
+		}
+	}
+	return out
+}
+
+func buildNAT64Snapshots(cfg *config.Config) []NAT64RuleSnapshot {
+	if cfg == nil || len(cfg.Security.NAT.NAT64) == 0 {
+		return nil
+	}
+	out := make([]NAT64RuleSnapshot, 0, len(cfg.Security.NAT.NAT64))
+	for _, rs := range cfg.Security.NAT.NAT64 {
+		if rs == nil || rs.Prefix == "" {
+			continue
+		}
+		var poolAddresses []string
+		if rs.SourcePool != "" {
+			if pool, ok := cfg.Security.NAT.SourcePools[rs.SourcePool]; ok && pool != nil {
+				if pool.Address != "" {
+					poolAddresses = append(poolAddresses, pool.Address)
+				}
+				poolAddresses = append(poolAddresses, pool.Addresses...)
+			}
+		}
+		out = append(out, NAT64RuleSnapshot{
+			Name:          rs.Name,
+			Prefix:        rs.Prefix,
+			PoolAddresses: poolAddresses,
+		})
 	}
 	return out
 }

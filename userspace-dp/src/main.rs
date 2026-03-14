@@ -1,5 +1,6 @@
 mod afxdp;
 mod nat;
+mod nat64;
 mod policy;
 mod prefix;
 mod session;
@@ -151,6 +152,10 @@ struct ConfigSnapshot {
     policies: Vec<PolicyRuleSnapshot>,
     #[serde(rename = "source_nat_rules", default)]
     source_nat_rules: Vec<SourceNATRuleSnapshot>,
+    #[serde(rename = "static_nat_rules", default)]
+    static_nat_rules: Vec<StaticNATRuleSnapshot>,
+    #[serde(rename = "nat64_rules", default)]
+    nat64_rules: Vec<NAT64RuleSnapshot>,
     #[serde(default)]
     userspace: serde_json::Value,
     #[serde(default)]
@@ -200,6 +205,26 @@ struct SourceNATRuleSnapshot {
     off: bool,
     #[serde(rename = "pool_name", default)]
     pool_name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct StaticNATRuleSnapshot {
+    name: String,
+    #[serde(rename = "from_zone", default)]
+    from_zone: String,
+    #[serde(rename = "external_ip", default)]
+    external_ip: String,
+    #[serde(rename = "internal_ip", default)]
+    internal_ip: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct NAT64RuleSnapshot {
+    name: String,
+    #[serde(default)]
+    prefix: String,
+    #[serde(rename = "pool_addresses", default)]
+    pool_addresses: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1384,6 +1409,7 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             nat: crate::nat::NatDecision {
                 rewrite_src: nat_src,
                 rewrite_dst: nat_dst,
+                ..crate::nat::NatDecision::default()
             },
         },
         metadata: crate::session::SessionMetadata {
@@ -1392,6 +1418,7 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             owner_rg_id: req.owner_rg_id,
             is_reverse: req.is_reverse,
             synced: true,
+            nat64_reverse: None,
         },
     })
 }

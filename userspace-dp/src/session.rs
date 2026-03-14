@@ -1,5 +1,6 @@
 use crate::afxdp::ForwardingResolution;
 use crate::nat::NatDecision;
+use crate::nat64::Nat64ReverseInfo;
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::net::IpAddr;
@@ -52,6 +53,9 @@ pub(crate) struct SessionMetadata {
     pub(crate) owner_rg_id: i32,
     pub(crate) is_reverse: bool,
     pub(crate) synced: bool,
+    /// For NAT64 sessions: stores original IPv6 addresses so reverse IPv4
+    /// replies can be translated back.
+    pub(crate) nat64_reverse: Option<Nat64ReverseInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -387,10 +391,14 @@ pub(crate) fn reply_matches_forward_nat(
     nat: NatDecision,
     reply_key: &SessionKey,
 ) -> bool {
-    if forward_key.addr_family != reply_key.addr_family
-        || forward_key.protocol != reply_key.protocol
-    {
-        return false;
+    // For NAT64, the reply AF differs from the forward AF; skip the AF/proto
+    // equality check since reverse_wire_key() computes the correct cross-AF key.
+    if !nat.nat64 {
+        if forward_key.addr_family != reply_key.addr_family
+            || forward_key.protocol != reply_key.protocol
+        {
+            return false;
+        }
     }
     reverse_wire_key(forward_key, nat) == *reply_key
 }
@@ -401,11 +409,32 @@ fn reverse_wire_key(forward_key: &SessionKey, nat: NatDecision) -> SessionKey {
     } else {
         (forward_key.dst_port, forward_key.src_port)
     };
+    let wire_src = nat.rewrite_dst.unwrap_or(forward_key.dst_ip);
+    let wire_dst = nat.rewrite_src.unwrap_or(forward_key.src_ip);
+    // NAT64: the reverse (reply) packet is a different address family.
+    // Determine the AF from the NAT-rewritten addresses.
+    let (addr_family, protocol) = if nat.nat64 {
+        let af = match wire_src {
+            std::net::IpAddr::V4(_) => libc::AF_INET as u8,
+            std::net::IpAddr::V6(_) => libc::AF_INET6 as u8,
+        };
+        // ICMPv6 ↔ ICMP protocol mapping.
+        let proto = if af == libc::AF_INET as u8 && forward_key.protocol == PROTO_ICMPV6 {
+            PROTO_ICMP
+        } else if af == libc::AF_INET6 as u8 && forward_key.protocol == PROTO_ICMP {
+            PROTO_ICMPV6
+        } else {
+            forward_key.protocol
+        };
+        (af, proto)
+    } else {
+        (forward_key.addr_family, forward_key.protocol)
+    };
     SessionKey {
-        addr_family: forward_key.addr_family,
-        protocol: forward_key.protocol,
-        src_ip: nat.rewrite_dst.unwrap_or(forward_key.dst_ip),
-        dst_ip: nat.rewrite_src.unwrap_or(forward_key.src_ip),
+        addr_family,
+        protocol,
+        src_ip: wire_src,
+        dst_ip: wire_dst,
         src_port,
         dst_port,
     }
@@ -465,6 +494,7 @@ mod tests {
             owner_rg_id: 1,
             is_reverse: false,
             synced: false,
+            nat64_reverse: None,
         }
     }
 
@@ -668,10 +698,10 @@ mod tests {
         };
         assert!(reply_matches_forward_nat(
             &forward,
-            NatDecision {
+            NatDecision { 
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                 rewrite_dst: None,
-            },
+             ..NatDecision::default() },
             &reply,
         ));
     }
@@ -696,10 +726,10 @@ mod tests {
         };
         assert!(reply_matches_forward_nat(
             &forward,
-            NatDecision {
+            NatDecision { 
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                 rewrite_dst: None,
-            },
+             ..NatDecision::default() },
             &reply,
         ));
     }
@@ -723,10 +753,10 @@ mod tests {
             src_port: 5201,
             dst_port: 42424,
         };
-        let nat = NatDecision {
+        let nat = NatDecision { 
             rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
             rewrite_dst: None,
-        };
+         ..NatDecision::default() };
         let decision = SessionDecision {
             resolution: resolution(),
             nat,

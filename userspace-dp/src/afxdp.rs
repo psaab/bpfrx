@@ -2,7 +2,8 @@ use super::{
     BindingStatus, ConfigSnapshot, ExceptionStatus, HAGroupStatus, InjectPacketRequest,
     InterfaceSnapshot, PacketResolution, SessionDeltaInfo,
 };
-use crate::nat::{NatDecision, SourceNatRule, match_source_nat, parse_source_nat_rules};
+use crate::nat::{NatDecision, SourceNatRule, StaticNatTable, match_source_nat, parse_source_nat_rules};
+use crate::nat64::{Nat64ReverseInfo, Nat64State};
 use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
 use crate::prefix::{PrefixV4, PrefixV6};
 use crate::session::{
@@ -979,6 +980,8 @@ struct ForwardingState {
     allow_dns_reply: bool,
     policy: PolicyState,
     source_nat_rules: Vec<SourceNatRule>,
+    static_nat: StaticNatTable,
+    nat64: Nat64State,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1273,6 +1276,8 @@ struct PendingForwardRequest {
     decision: SessionDecision,
     expected_ports: Option<(u16, u16)>,
     flow_key: Option<SessionKey>,
+    /// NAT64 reverse info for cross-AF translation (IPv4 reply → IPv6).
+    nat64_reverse: Option<Nat64ReverseInfo>,
 }
 
 struct PreparedTxRequest {
@@ -2312,17 +2317,61 @@ fn poll_binding(
                             let resolution_target =
                                 parse_packet_destination(unsafe { &*area }, desc, meta)
                                     .unwrap_or(flow.dst_ip);
+
+                            // --- Static NAT DNAT (pre-routing) ---
+                            // Check if the packet's destination matches a static NAT
+                            // external IP. If so, the routing lookup must use the
+                            // translated (internal) IP so the packet reaches the
+                            // correct host.
+                            let ingress_zone_name = ingress_zone_override
+                                .as_deref()
+                                .or_else(|| {
+                                    forwarding
+                                        .ifindex_to_zone
+                                        .get(&(meta.ingress_ifindex as i32))
+                                        .map(|s| s.as_str())
+                                })
+                                .unwrap_or("");
+                            let static_dnat_decision =
+                                forwarding.static_nat.match_dnat(resolution_target, ingress_zone_name);
+
+                            // --- NAT64 pre-routing ---
+                            // If dst is IPv6 matching a NAT64 prefix, extract IPv4
+                            // dest and allocate an IPv4 SNAT address. Route lookup
+                            // must use the IPv4 destination.
+                            let nat64_match = if static_dnat_decision.is_none() {
+                                if let IpAddr::V6(dst_v6) = resolution_target {
+                                    forwarding.nat64.match_ipv6_dest(dst_v6).and_then(|(idx, dst_v4)| {
+                                        let snat_v4 = forwarding.nat64.allocate_v4_source(idx)?;
+                                        Some((idx, dst_v4, snat_v4, dst_v6))
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            let effective_resolution_target = if let Some((_, dst_v4, _, _)) = &nat64_match {
+                                IpAddr::V4(*dst_v4)
+                            } else {
+                                match &static_dnat_decision {
+                                    Some(d) => d.rewrite_dst.unwrap_or(resolution_target),
+                                    None => resolution_target,
+                                }
+                            };
+
                             let resolution = ingress_interface_local_resolution_on_session_miss(
                                 forwarding,
                                 meta.ingress_ifindex as i32,
                                 meta.ingress_vlan_id,
-                                resolution_target,
+                                effective_resolution_target,
                                 meta.protocol,
                             )
                             .or_else(|| {
                                 interface_nat_local_resolution_on_session_miss(
                                     forwarding,
-                                    resolution_target,
+                                    effective_resolution_target,
                                     meta.protocol,
                                 )
                             })
@@ -2334,13 +2383,13 @@ fn poll_binding(
                                     lookup_forwarding_resolution_with_dynamic(
                                         forwarding,
                                         dynamic_neighbors,
-                                        resolution_target,
+                                        effective_resolution_target,
                                     ),
                                 )
                             });
                             let mut decision = SessionDecision {
                                 resolution,
-                                nat: NatDecision::default(),
+                                nat: static_dnat_decision.unwrap_or_default(),
                             };
                             let (from_zone, to_zone) = zone_pair_for_flow_with_override(
                                 forwarding,
@@ -2423,14 +2472,38 @@ fn poll_binding(
                                     flow.forward_key.src_port,
                                     flow.forward_key.dst_port,
                                 ) {
-                                    decision.nat = match_source_nat_for_flow(
-                                        forwarding,
-                                        &from_zone,
-                                        &to_zone,
-                                        resolution.egress_ifindex,
-                                        flow,
-                                    )
-                                    .unwrap_or_default();
+                                    // NAT64: cross-family translation takes
+                                    // priority over same-family SNAT.
+                                    let nat64_info = if let Some((_, dst_v4, snat_v4, orig_dst_v6)) = nat64_match {
+                                        decision.nat = Nat64State::forward_decision(snat_v4, dst_v4);
+                                        Some(Nat64ReverseInfo {
+                                            orig_src_v6: match flow.src_ip {
+                                                IpAddr::V6(v6) => v6,
+                                                _ => std::net::Ipv6Addr::UNSPECIFIED,
+                                            },
+                                            orig_dst_v6: orig_dst_v6,
+                                        })
+                                    } else {
+                                        // If static NAT DNAT already matched (pre-routing),
+                                        // keep that decision. Otherwise check static NAT
+                                        // SNAT, then fall through to interface SNAT.
+                                        if decision.nat.rewrite_dst.is_none() {
+                                            decision.nat = forwarding
+                                                .static_nat
+                                                .match_snat(flow.src_ip, &from_zone)
+                                                .or_else(|| {
+                                                    match_source_nat_for_flow(
+                                                        forwarding,
+                                                        &from_zone,
+                                                        &to_zone,
+                                                        resolution.egress_ifindex,
+                                                        flow,
+                                                    )
+                                                })
+                                                .unwrap_or_default();
+                                        }
+                                        None
+                                    };
                                     let mut created = 0u64;
                                     let forward_metadata = SessionMetadata {
                                         ingress_zone: from_zone_arc.clone(),
@@ -2438,6 +2511,7 @@ fn poll_binding(
                                         owner_rg_id,
                                         is_reverse: false,
                                         synced: false,
+                                        nat64_reverse: nat64_info,
                                     };
                                     if sessions.install_with_protocol(
                                         flow.forward_key.clone(),
@@ -2490,13 +2564,48 @@ fn poll_binding(
                                         resolution: reverse_resolution,
                                         nat: decision.nat.reverse(flow.src_ip, flow.dst_ip),
                                     };
-                                    let reverse_key = flow.reverse_key_with_nat(decision.nat);
+                                    // For NAT64: the reverse key is IPv4 (different AF
+                                    // from the forward IPv6 key). The reply arrives as
+                                    // IPv4: src=dst_v4, dst=snat_v4.
+                                    let (reverse_key, reverse_protocol) = if let Some(ref info) = nat64_info {
+                                        let nat = decision.nat;
+                                        let dst_v4 = match nat.rewrite_dst {
+                                            Some(IpAddr::V4(v4)) => v4,
+                                            _ => Ipv4Addr::UNSPECIFIED,
+                                        };
+                                        let snat_v4 = match nat.rewrite_src {
+                                            Some(IpAddr::V4(v4)) => v4,
+                                            _ => Ipv4Addr::UNSPECIFIED,
+                                        };
+                                        // Map protocol: ICMPv6→ICMP for the reverse key.
+                                        let rev_proto = match meta.protocol {
+                                            PROTO_ICMPV6 => PROTO_ICMP,
+                                            p => p,
+                                        };
+                                        let (src_port, dst_port) = if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+                                            (flow.forward_key.src_port, flow.forward_key.dst_port)
+                                        } else {
+                                            (flow.forward_key.dst_port, flow.forward_key.src_port)
+                                        };
+                                        (SessionKey {
+                                            addr_family: libc::AF_INET as u8,
+                                            protocol: rev_proto,
+                                            src_ip: IpAddr::V4(dst_v4),
+                                            dst_ip: IpAddr::V4(snat_v4),
+                                            src_port,
+                                            dst_port,
+                                        }, rev_proto)
+                                    } else {
+                                        (flow.reverse_key_with_nat(decision.nat), meta.protocol)
+                                    };
+                                    let _ = reverse_protocol; // used below for install
                                     let reverse_metadata = SessionMetadata {
                                         ingress_zone: to_zone_arc,
                                         egress_zone: from_zone_arc,
                                         owner_rg_id,
                                         is_reverse: true,
                                         synced: false,
+                                        nat64_reverse: nat64_info,
                                     };
                                     if sessions.install_with_protocol(
                                         reverse_key.clone(),
@@ -2992,6 +3101,7 @@ fn build_live_forward_request(
         decision: *decision,
         expected_ports,
         flow_key: flow.map(|flow| flow.forward_key.clone()),
+        nat64_reverse: None,
     })
 }
 
@@ -3200,6 +3310,10 @@ fn enqueue_pending_forwards(
                 });
             }
             if !copied_source_frame {
+                // NAT64: header size changes prevent in-place rewrite.
+                // Always use copy path with NAT64-specific frame builder.
+                let is_nat64 = request.decision.nat.nat64;
+
                 /*
                  * In-place TX optimization: rewrite the ingress frame directly in UMEM
                  * and submit it to the TX ring without copying. This avoids a memcpy but
@@ -3209,7 +3323,7 @@ fn enqueue_pending_forwards(
                  *
                  * TODO(#205): extend to cross-interface by using shared UMEM across bindings.
                  */
-                let can_rewrite_in_place = target_binding.slot == ingress_slot;
+                let can_rewrite_in_place = target_binding.slot == ingress_slot && !is_nat64;
                 if can_rewrite_in_place {
                     match rewrite_forwarded_frame_in_place(
                         unsafe { &*ingress_area },
@@ -3240,13 +3354,22 @@ fn enqueue_pending_forwards(
                             }
                             retained_source_frame = true;
                         }
-                        None => match build_forwarded_frame_from_frame(
-                            source_frame,
-                            request.meta,
-                            &request.decision,
-                            forwarding,
-                            expected_ports,
-                        ) {
+                        None => match if is_nat64 {
+                            build_nat64_forwarded_frame(
+                                source_frame,
+                                request.meta,
+                                &request.decision,
+                                request.nat64_reverse.as_ref(),
+                            )
+                        } else {
+                            build_forwarded_frame_from_frame(
+                                source_frame,
+                                request.meta,
+                                &request.decision,
+                                forwarding,
+                                expected_ports,
+                            )
+                        } {
                             Some(frame) => {
                                 if cfg!(feature = "debug-log") {
                                     if let Some(reason) = forward_tuple_mismatch_reason(
@@ -3312,7 +3435,11 @@ fn enqueue_pending_forwards(
                     // Direct TX build: write the forwarded frame directly into
                     // the target binding's UMEM TX frame, eliminating the
                     // intermediate Vec allocation and one memcpy.
-                    let direct_built = if let Some(tx_offset) = target_binding.free_tx_frames.pop_front() {
+                    // NAT64 cannot use direct TX (header size changes), so
+                    // it falls through to the copy path below.
+                    let direct_built = if is_nat64 {
+                        false
+                    } else if let Some(tx_offset) = target_binding.free_tx_frames.pop_front() {
                         let target_area = &target_binding.umem.area;
                         let written = unsafe {
                             target_area.slice_mut_unchecked(tx_offset as usize, tx_frame_capacity())
@@ -3406,13 +3533,22 @@ fn enqueue_pending_forwards(
                     };
                     // Fallback: Vec copy path when direct build unavailable.
                     if !direct_built {
-                        match build_forwarded_frame_from_frame(
-                            source_frame,
-                            request.meta,
-                            &request.decision,
-                            forwarding,
-                            expected_ports,
-                        ) {
+                        match if is_nat64 {
+                            build_nat64_forwarded_frame(
+                                source_frame,
+                                request.meta,
+                                &request.decision,
+                                request.nat64_reverse.as_ref(),
+                            )
+                        } else {
+                            build_forwarded_frame_from_frame(
+                                source_frame,
+                                request.meta,
+                                &request.decision,
+                                forwarding,
+                                expected_ports,
+                            )
+                        } {
                             Some(frame) => {
                                 if cfg!(feature = "debug-log") {
                                     if let Some(reason) = forward_tuple_mismatch_reason(
@@ -5302,11 +5438,29 @@ fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> SessionKey {
     } else {
         (key.dst_port, key.src_port)
     };
+    let wire_src = nat.rewrite_dst.unwrap_or(key.dst_ip);
+    let wire_dst = nat.rewrite_src.unwrap_or(key.src_ip);
+    let (addr_family, protocol) = if nat.nat64 {
+        let af = match wire_src {
+            IpAddr::V4(_) => libc::AF_INET as u8,
+            IpAddr::V6(_) => libc::AF_INET6 as u8,
+        };
+        let proto = if af == libc::AF_INET as u8 && key.protocol == PROTO_ICMPV6 {
+            PROTO_ICMP
+        } else if af == libc::AF_INET6 as u8 && key.protocol == PROTO_ICMP {
+            PROTO_ICMPV6
+        } else {
+            key.protocol
+        };
+        (af, proto)
+    } else {
+        (key.addr_family, key.protocol)
+    };
     SessionKey {
-        addr_family: key.addr_family,
-        protocol: key.protocol,
-        src_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
-        dst_ip: nat.rewrite_src.unwrap_or(key.src_ip),
+        addr_family,
+        protocol,
+        src_ip: wire_src,
+        dst_ip: wire_dst,
         src_port,
         dst_port,
     }
@@ -5671,6 +5825,7 @@ fn repair_reverse_session_from_forward(
         owner_rg_id: forward_match.metadata.owner_rg_id,
         is_reverse: true,
         synced: false,
+        nat64_reverse: None,
     };
     if sessions.install_with_protocol(
         flow.forward_key.clone(),
@@ -6588,6 +6743,21 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     state.policy = parse_policy_state(&snapshot.default_policy, &snapshot.policies);
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.source_nat_rules = parse_source_nat_rules(&snapshot.source_nat_rules);
+    state.static_nat = StaticNatTable::from_snapshots(&snapshot.static_nat_rules);
+    state.nat64 = Nat64State::from_snapshots(&snapshot.nat64_rules);
+
+    // Add static NAT external IPs as local delivery targets so inbound
+    // traffic destined to external IPs is recognized by the firewall.
+    for ext_ip in state.static_nat.external_ips() {
+        match ext_ip {
+            IpAddr::V4(v4) => {
+                state.local_v4.insert(*v4);
+            }
+            IpAddr::V6(v6) => {
+                state.local_v6.insert(*v6);
+            }
+        }
+    }
 
     // Debug: dump zone mappings and policy rules
     if cfg!(feature = "debug-log") {
@@ -6617,8 +6787,9 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             state.local_v4, state.interface_nat_v4,
         );
         eprintln!(
-            "FWD_STATE: snat_rules={} connected_v4={} routes_v4={}",
+            "FWD_STATE: snat_rules={} static_nat={} connected_v4={} routes_v4={}",
             state.source_nat_rules.len(),
+            if state.static_nat.is_empty() { 0 } else { state.static_nat.external_ips().count() },
             state.connected_v4.len(),
             state.routes_v4.values().map(|v| v.len()).sum::<usize>(),
         );
@@ -7848,6 +8019,46 @@ fn build_injected_packet(
     match dst {
         IpAddr::V4(dst_v4) => build_injected_ipv4(req, dst_mac, dst_v4, egress),
         IpAddr::V6(dst_v6) => build_injected_ipv6(req, dst_mac, dst_v6, egress),
+    }
+}
+
+/// Build a forwarded frame for NAT64 packets. NAT64 changes the IP address
+/// family so the frame size changes (IPv6→IPv4 shrinks by 20, IPv4→IPv6 grows
+/// by 20). This always uses a copy path — in-place rewrite is not possible.
+fn build_nat64_forwarded_frame(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    decision: &SessionDecision,
+    nat64_reverse: Option<&Nat64ReverseInfo>,
+) -> Option<Vec<u8>> {
+    let dst_mac = decision.resolution.neighbor_mac?;
+    let src_mac = decision.resolution.src_mac?;
+    let vlan_id = decision.resolution.tx_vlan_id;
+
+    match meta.addr_family as i32 {
+        libc::AF_INET6 => {
+            // Forward direction: IPv6 → IPv4.
+            let snat_v4 = match decision.nat.rewrite_src {
+                Some(IpAddr::V4(v4)) => v4,
+                _ => return None,
+            };
+            let dst_v4 = match decision.nat.rewrite_dst {
+                Some(IpAddr::V4(v4)) => v4,
+                _ => return None,
+            };
+            crate::nat64::build_nat64_v6_to_v4_frame(
+                frame, snat_v4, dst_v4, dst_mac, src_mac, vlan_id,
+            )
+        }
+        libc::AF_INET => {
+            // Reverse direction: IPv4 → IPv6 (reply from server).
+            let info = nat64_reverse?;
+            // Reply: src_v6 = original dst (NAT64 prefix + server), dst_v6 = original client
+            crate::nat64::build_nat64_v4_to_v6_frame(
+                frame, info.orig_dst_v6, info.orig_src_v6, dst_mac, src_mac, vlan_id,
+            )
+        }
+        _ => None,
     }
 }
 
@@ -10384,7 +10595,8 @@ mod tests {
     use super::*;
     use crate::{
         FabricSnapshot, InterfaceAddressSnapshot, InterfaceSnapshot, NeighborSnapshot,
-        PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot, ZoneSnapshot,
+        PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot,
+        ZoneSnapshot,
     };
 
     fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
@@ -11315,10 +11527,10 @@ mod tests {
         let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
         assert_eq!(
             match_source_nat_for_flow(&state, &from_zone, &to_zone, 12, &flow),
-            Some(NatDecision {
+            Some(NatDecision { 
                 rewrite_src: Some("172.16.80.8".parse().expect("snat")),
                 rewrite_dst: None,
-            })
+             ..NatDecision::default() })
         );
     }
 
@@ -11340,10 +11552,10 @@ mod tests {
         let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
         assert_eq!(
             match_source_nat_for_flow(&state, &from_zone, &to_zone, 12, &flow),
-            Some(NatDecision {
+            Some(NatDecision { 
                 rewrite_src: Some("2001:559:8585:80::8".parse().expect("snat")),
                 rewrite_dst: None,
-            })
+             ..NatDecision::default() })
         );
     }
 
@@ -11807,6 +12019,7 @@ mod tests {
                 owner_rg_id: 1,
                 is_reverse: false,
                 synced: false,
+                nat64_reverse: None,
             },
             protocol: PROTO_TCP,
             tcp_flags: 0,
@@ -11847,6 +12060,7 @@ mod tests {
             nat: NatDecision {
                 rewrite_src: None,
                 rewrite_dst: Some(IpAddr::V6("2001:559:8585:ef00::100".parse().expect("lan"))),
+                ..NatDecision::default()
             },
         };
         assert_eq!(
@@ -12115,10 +12329,10 @@ mod tests {
         apply_nat_ipv4(
             &mut packet,
             PROTO_TCP,
-            NatDecision {
+            NatDecision { 
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                 rewrite_dst: None,
-            },
+             ..NatDecision::default() },
         )
         .expect("apply nat");
 
@@ -12162,6 +12376,7 @@ mod tests {
             NatDecision {
                 rewrite_src: None,
                 rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                ..NatDecision::default()
             },
         )
         .expect("slow-path packet");
@@ -12207,6 +12422,7 @@ mod tests {
             NatDecision {
                 rewrite_src: None,
                 rewrite_dst: Some(IpAddr::V6("2001:559:8585:ef00::102".parse().unwrap())),
+                ..NatDecision::default()
             },
         )
         .expect("slow-path packet");
@@ -12275,10 +12491,10 @@ mod tests {
                     src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
                     tx_vlan_id: 80,
                 },
-                nat: NatDecision {
+                nat: NatDecision { 
                     rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                     rewrite_dst: None,
-                },
+                 ..NatDecision::default() },
             },
             &state,
             None,
@@ -13987,10 +14203,10 @@ mod tests {
                     src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
                     tx_vlan_id: 80,
                 },
-                nat: NatDecision {
+                nat: NatDecision { 
                     rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                     rewrite_dst: None,
-                },
+                 ..NatDecision::default() },
             },
             None,
         )
@@ -14062,6 +14278,7 @@ mod tests {
                 nat: NatDecision {
                     rewrite_src: None,
                     rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                    ..NatDecision::default()
                 },
             },
             None,
@@ -14073,5 +14290,267 @@ mod tests {
         assert_eq!(&out[30..34], &[10, 0, 61, 102]);
         assert_eq!(out[22], 63);
         assert!(tcp_checksum_ok_ipv4(&out[14..]));
+    }
+
+    // --- Static NAT integration tests ---
+
+    fn static_nat_snapshot() -> ConfigSnapshot {
+        ConfigSnapshot {
+            zones: vec![
+                ZoneSnapshot {
+                    name: "trust".to_string(),
+                    id: 1,
+                },
+                ZoneSnapshot {
+                    name: "untrust".to_string(),
+                    id: 2,
+                },
+            ],
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "ge-0/0/0".to_string(),
+                    zone: "trust".to_string(),
+                    linux_name: "ge-0-0-0".to_string(),
+                    ifindex: 5,
+                    hardware_addr: "02:bf:72:01:00:00".to_string(),
+                    addresses: vec![InterfaceAddressSnapshot {
+                        family: "inet".to_string(),
+                        address: "192.168.1.1/24".to_string(),
+                        scope: 0,
+                    }],
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "ge-0/0/1".to_string(),
+                    zone: "untrust".to_string(),
+                    linux_name: "ge-0-0-1".to_string(),
+                    ifindex: 6,
+                    hardware_addr: "02:bf:72:01:00:01".to_string(),
+                    addresses: vec![InterfaceAddressSnapshot {
+                        family: "inet".to_string(),
+                        address: "203.0.113.1/24".to_string(),
+                        scope: 0,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            routes: vec![RouteSnapshot {
+                table: "inet.0".to_string(),
+                family: "inet".to_string(),
+                destination: "0.0.0.0/0".to_string(),
+                next_hops: vec!["203.0.113.254@ge-0/0/1".to_string()],
+                discard: false,
+                next_table: String::new(),
+            }],
+            static_nat_rules: vec![StaticNATRuleSnapshot {
+                name: "web-server".to_string(),
+                from_zone: "untrust".to_string(),
+                external_ip: "203.0.113.10".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+            }],
+            default_policy: "deny".to_string(),
+            policies: vec![
+                PolicyRuleSnapshot {
+                    name: "allow-inbound".to_string(),
+                    from_zone: "untrust".to_string(),
+                    to_zone: "trust".to_string(),
+                    source_addresses: vec!["any".to_string()],
+                    destination_addresses: vec!["any".to_string()],
+                    applications: vec!["any".to_string()],
+                    action: "permit".to_string(),
+                    ..Default::default()
+                },
+                PolicyRuleSnapshot {
+                    name: "allow-outbound".to_string(),
+                    from_zone: "trust".to_string(),
+                    to_zone: "untrust".to_string(),
+                    source_addresses: vec!["any".to_string()],
+                    destination_addresses: vec!["any".to_string()],
+                    applications: vec!["any".to_string()],
+                    action: "permit".to_string(),
+                    ..Default::default()
+                },
+            ],
+            neighbors: vec![
+                NeighborSnapshot {
+                    interface: "ge-0-0-0".to_string(),
+                    ifindex: 5,
+                    family: "inet".to_string(),
+                    ip: "192.168.1.10".to_string(),
+                    mac: "aa:bb:cc:dd:ee:10".to_string(),
+                    state: "reachable".to_string(),
+                    ..Default::default()
+                },
+                NeighborSnapshot {
+                    interface: "ge-0-0-1".to_string(),
+                    ifindex: 6,
+                    family: "inet".to_string(),
+                    ip: "203.0.113.254".to_string(),
+                    mac: "aa:bb:cc:dd:ee:fe".to_string(),
+                    state: "reachable".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn static_nat_external_ip_recognized_as_local() {
+        let state = build_forwarding_state(&static_nat_snapshot());
+        // The external IP 203.0.113.10 should be in local_v4 so traffic
+        // destined to it is recognized by the firewall.
+        assert!(
+            state.local_v4.contains(&"203.0.113.10".parse::<Ipv4Addr>().unwrap()),
+            "static NAT external IP must be in local_v4"
+        );
+    }
+
+    #[test]
+    fn static_nat_dnat_routes_to_internal_ip() {
+        let state = build_forwarding_state(&static_nat_snapshot());
+        // Simulate inbound: packet from 198.51.100.1 -> 203.0.113.10
+        // The static NAT DNAT should match and the resolution should route
+        // to the internal host 192.168.1.10 (on trust interface ifindex=5).
+        let dnat = state
+            .static_nat
+            .match_dnat("203.0.113.10".parse().unwrap(), "untrust");
+        assert!(dnat.is_some(), "DNAT must match external IP from untrust");
+        let dnat = dnat.unwrap();
+        assert_eq!(
+            dnat.rewrite_dst,
+            Some("192.168.1.10".parse::<IpAddr>().unwrap())
+        );
+
+        // After DNAT translation, resolution target is internal IP
+        let internal_ip: IpAddr = "192.168.1.10".parse().unwrap();
+        let resolution =
+            lookup_forwarding_resolution_with_dynamic(&state, &Default::default(), internal_ip);
+        // Should resolve to trust interface (ifindex 5) via connected route
+        assert_eq!(resolution.egress_ifindex, 5);
+    }
+
+    #[test]
+    fn static_nat_snat_rewrites_outbound_source() {
+        let state = build_forwarding_state(&static_nat_snapshot());
+        // Simulate outbound: packet from 192.168.1.10 -> 198.51.100.1
+        // coming from trust zone. Static NAT SNAT should rewrite src
+        // to external IP 203.0.113.10.
+        // SNAT does not check from_zone -- internal IP match is sufficient.
+        let snat = state
+            .static_nat
+            .match_snat("192.168.1.10".parse().unwrap(), "trust");
+        assert!(snat.is_some(), "SNAT should match internal IP regardless of zone");
+        assert_eq!(
+            snat.unwrap().rewrite_src,
+            Some("203.0.113.10".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn static_nat_snat_matches_when_zone_is_empty() {
+        // Create a snapshot where from_zone is empty (matches any zone)
+        let mut snapshot = static_nat_snapshot();
+        snapshot.static_nat_rules = vec![StaticNATRuleSnapshot {
+            name: "web-server".to_string(),
+            from_zone: String::new(), // matches any zone
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }];
+        let state = build_forwarding_state(&snapshot);
+
+        // Now SNAT should match from any zone
+        let snat = state
+            .static_nat
+            .match_snat("192.168.1.10".parse().unwrap(), "trust");
+        assert!(snat.is_some());
+        let snat = snat.unwrap();
+        assert_eq!(
+            snat.rewrite_src,
+            Some("203.0.113.10".parse::<IpAddr>().unwrap())
+        );
+        assert!(snat.rewrite_dst.is_none());
+    }
+
+    #[test]
+    fn static_nat_takes_priority_over_interface_snat() {
+        // Create snapshot with both static NAT and interface SNAT
+        let mut snapshot = static_nat_snapshot();
+        snapshot.static_nat_rules = vec![StaticNATRuleSnapshot {
+            name: "static-web".to_string(),
+            from_zone: String::new(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }];
+        snapshot.source_nat_rules = vec![SourceNATRuleSnapshot {
+            name: "interface-snat".to_string(),
+            from_zone: "trust".to_string(),
+            to_zone: "untrust".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            interface_mode: true,
+            ..Default::default()
+        }];
+        let state = build_forwarding_state(&snapshot);
+
+        // For src=192.168.1.10, static NAT should match first
+        let static_match = state
+            .static_nat
+            .match_snat("192.168.1.10".parse().unwrap(), "trust");
+        assert!(
+            static_match.is_some(),
+            "static NAT should match internal IP"
+        );
+        assert_eq!(
+            static_match.unwrap().rewrite_src,
+            Some("203.0.113.10".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn static_nat_v6_dnat_and_snat() {
+        let mut snapshot = static_nat_snapshot();
+        snapshot.static_nat_rules = vec![StaticNATRuleSnapshot {
+            name: "v6-server".to_string(),
+            from_zone: String::new(),
+            external_ip: "2001:db8::10".to_string(),
+            internal_ip: "fd00::10".to_string(),
+        }];
+        // Add v6 addresses to interfaces
+        snapshot.interfaces[0].addresses.push(InterfaceAddressSnapshot {
+            family: "inet6".to_string(),
+            address: "fd00::1/64".to_string(),
+            scope: 0,
+        });
+        snapshot.interfaces[1].addresses.push(InterfaceAddressSnapshot {
+            family: "inet6".to_string(),
+            address: "2001:db8::1/64".to_string(),
+            scope: 0,
+        });
+        let state = build_forwarding_state(&snapshot);
+
+        // External v6 IP should be in local_v6
+        assert!(state
+            .local_v6
+            .contains(&"2001:db8::10".parse::<Ipv6Addr>().unwrap()));
+
+        // DNAT match
+        let dnat = state
+            .static_nat
+            .match_dnat("2001:db8::10".parse().unwrap(), "any-zone");
+        assert!(dnat.is_some());
+        assert_eq!(
+            dnat.unwrap().rewrite_dst,
+            Some("fd00::10".parse::<IpAddr>().unwrap())
+        );
+
+        // SNAT match
+        let snat = state
+            .static_nat
+            .match_snat("fd00::10".parse().unwrap(), "trust");
+        assert!(snat.is_some());
+        assert_eq!(
+            snat.unwrap().rewrite_src,
+            Some("2001:db8::10".parse::<IpAddr>().unwrap())
+        );
     }
 }

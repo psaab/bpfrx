@@ -47,6 +47,8 @@ type ConfigSnapshot struct {
 	DefaultPolicy string                  `json:"default_policy,omitempty"`
 	Policies      []PolicyRuleSnapshot    `json:"policies,omitempty"`
 	SourceNAT     []SourceNATRuleSnapshot `json:"source_nat_rules,omitempty"`
+	StaticNAT     []StaticNATRuleSnapshot `json:"static_nat_rules,omitempty"`
+	NAT64         []NAT64RuleSnapshot     `json:"nat64_rules,omitempty"`
 	Config        *config.Config          `json:"config,omitempty"`
 	Userspace     config.UserspaceConfig  `json:"userspace"`
 }
@@ -109,6 +111,21 @@ type SourceNATRuleSnapshot struct {
 	InterfaceMode        bool     `json:"interface_mode,omitempty"`
 	Off                  bool     `json:"off,omitempty"`
 	PoolName             string   `json:"pool_name,omitempty"`
+}
+
+type StaticNATRuleSnapshot struct {
+	Name       string `json:"name"`
+	FromZone   string `json:"from_zone,omitempty"`
+	ExternalIP string `json:"external_ip"`
+	InternalIP string `json:"internal_ip"`
+}
+
+// NAT64RuleSnapshot captures a NAT64 prefix and its IPv4 source pool for the
+// userspace dataplane.
+type NAT64RuleSnapshot struct {
+	Name          string   `json:"name"`
+	Prefix        string   `json:"prefix"`         // e.g. "64:ff9b::/96"
+	PoolAddresses []string `json:"pool_addresses"` // resolved IPv4 pool addresses
 }
 
 type PolicyApplicationSnapshot struct {
