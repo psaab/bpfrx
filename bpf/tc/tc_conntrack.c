@@ -404,9 +404,15 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 		 * driver prepends outer headers to the same skb, so
 		 * ingress_ifindex is still set from the original inner
 		 * packet.  The inner packet was validated by XDP — the
-		 * outer encapsulation is trusted local kernel work. */
+		 * outer encapsulation is trusted local kernel work.
+		 * Create a session so XDP ingress can match the return
+		 * (decapsulated reply) via the reverse conntrack entry. */
 		if (meta->protocol == PROTO_GRE ||
 		    meta->protocol == PROTO_ESP) {
+			if (meta->addr_family == AF_INET)
+				tc_create_session_v4(meta);
+			else
+				tc_create_session_v6(meta);
 			bpf_tail_call(skb, &tc_progs,
 				      TC_PROG_FORWARD);
 			return TC_ACT_OK;

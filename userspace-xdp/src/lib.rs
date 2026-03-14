@@ -389,19 +389,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
 
     let packet_len = data_end.saturating_sub(data);
-    if matches!(parsed.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        record_trace(
-            ctrl.flags,
-            ingress_ifindex,
-            rx_queue_index,
-            selected_queue,
-            binding.slot,
-            USERSPACE_TRACE_STAGE_ICMP_FALLBACK,
-            USERSPACE_FALLBACK_REASON_ICMP,
-            &parsed,
-        );
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_ICMP);
-    }
+    // ICMP/ICMPv6 is now handled by the userspace dataplane — no fallback needed.
     if should_fallback_early(&parsed) {
         record_trace(
             ctrl.flags,
