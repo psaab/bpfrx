@@ -60,7 +60,7 @@ system {
 | Application matching | Yes | Yes |
 | Source NAT (interface) | Yes | Yes |
 | Source NAT (pool) | Yes | No (fallback) |
-| Destination NAT | Yes | No (fallback) |
+| Destination NAT | Yes | Yes |
 | Static NAT (1:1) | Yes | Yes |
 | NAT64 (IPv6↔IPv4) | Yes | Yes |
 | NPTv6 (RFC 6296) | Yes | No (fallback) |
