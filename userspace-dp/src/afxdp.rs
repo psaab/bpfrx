@@ -1703,6 +1703,10 @@ fn bind_user_rings(
         match bind_result {
             Ok(()) => {
                 let bind_mode = query_bound_xsk_mode(user_fd).unwrap_or(XskBindMode::Copy);
+                // Enable per-socket NAPI busy polling for lower-latency
+                // packet delivery. The kernel will spin-poll the NIC's NAPI
+                // context from sendto()/poll() instead of waiting for softirq.
+                set_busy_poll_opts(user_fd);
                 eprintln!(
                     "bpfrx-userspace-dp: umem.bind(fd={}) OK on attempt {} mode={:?} shared_owner={}",
                     user_fd, attempt, bind_mode, shared_owner,
@@ -1730,6 +1734,43 @@ fn bind_user_rings(
         "umem.bind(owner)"
     };
     Err(format!("bind AF_XDP socket via {binder}: exhausted retries").into())
+}
+
+/// Set per-socket busy-poll options for NAPI affinity. When the kernel's
+/// `net.core.busy_poll` sysctl is also non-zero, sendto() on this socket
+/// will busy-poll the NIC's NAPI context instead of relying on softirq
+/// scheduling, reducing the user↔softirq context switch overhead.
+fn set_busy_poll_opts(fd: c_int) {
+    const SO_BUSY_POLL: c_int = 46;
+    const SO_PREFER_BUSY_POLL: c_int = 69;
+    const SO_BUSY_POLL_BUDGET: c_int = 70;
+    // busy_poll timeout in µs — how long sendto() will spin-poll NAPI
+    let busy_poll_us: c_int = 50;
+    let prefer: c_int = 1;
+    let budget: c_int = 256;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_BUSY_POLL,
+            &busy_poll_us as *const _ as *const libc::c_void,
+            core::mem::size_of::<c_int>() as u32,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_PREFER_BUSY_POLL,
+            &prefer as *const _ as *const libc::c_void,
+            core::mem::size_of::<c_int>() as u32,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_BUSY_POLL_BUDGET,
+            &budget as *const _ as *const libc::c_void,
+            core::mem::size_of::<c_int>() as u32,
+        );
+    }
 }
 
 #[derive(Default)]
@@ -3015,6 +3056,7 @@ fn enqueue_pending_forwards(
     dbg: &mut DebugPollCounters,
 ) {
     let ingress_area = (&ingress_binding.umem.area) as *const MmapArea;
+    let mut post_recycles: Vec<(u32, u64)> = Vec::new();
     for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
@@ -3053,7 +3095,7 @@ fn enqueue_pending_forwards(
             ingress_binding.pending_fill_frames.push_back(source_offset);
             continue;
         };
-        let mut post_recycles = Vec::new();
+        post_recycles.clear();
         let mut build_failed = false;
         let mut fallback_to_slow_path = false;
         let mut copied_source_frame = false;
@@ -3671,6 +3713,20 @@ fn parse_session_flow(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
 ) -> Option<SessionFlow> {
+    // Fast path: for TCP/UDP with complete metadata tuple, use meta directly
+    // without parsing the frame. This avoids UMEM reads and L3/L4 header
+    // parsing for every established-flow packet. ICMP is excluded because
+    // BPF may stamp outer-header IPs that differ from the session key
+    // (e.g., ICMP error messages with embedded inner headers).
+    if matches!(meta.protocol, PROTO_TCP | PROTO_UDP)
+        && let Some(meta_flow) = parse_session_flow_from_meta(meta)
+        && metadata_tuple_complete(meta, &meta_flow)
+    {
+        return Some(meta_flow);
+    }
+
+    // Slow path: meta incomplete or non-TCP/UDP — parse from the actual frame
+    // and cross-reference with meta.
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     let frame_flow = if matches!(meta.addr_family as i32, libc::AF_INET) {
         parse_ipv4_session_flow_from_frame(frame, meta)
@@ -3678,27 +3734,16 @@ fn parse_session_flow(
         parse_session_flow_from_frame(frame, meta)
     };
 
+    // For non-TCP/UDP (e.g. ICMP): when meta is complete, prefer meta unless
+    // frame IPs disagree (e.g. ICMP error with embedded inner header).
     if let Some(meta_flow) = parse_session_flow_from_meta(meta)
         && metadata_tuple_complete(meta, &meta_flow)
     {
-        if let Some(frame_flow) = frame_flow.clone() {
-            if frame_flow == meta_flow {
-                return Some(meta_flow);
-            }
-            /*
-             * The userspace dataplane can observe post-copy or post-queue frame
-             * corruption in the L4 ports while the XDP-stamped metadata still
-             * carries the original ingress tuple. When the IP tuple matches but
-             * ports disagree, prefer the metadata tuple so session lookup and
-             * forwarding stay tied to the authoritative flow key.
-             *
-             * If the IP tuple itself disagrees, treat that as stale/wrong
-             * metadata and prefer the reparsed frame.
-             */
+        if let Some(ref frame_flow) = frame_flow {
             if frame_flow.src_ip == meta_flow.src_ip && frame_flow.dst_ip == meta_flow.dst_ip {
                 return Some(meta_flow);
             }
-            return Some(frame_flow);
+            return Some(frame_flow.clone());
         }
         return Some(meta_flow);
     }
@@ -4485,10 +4530,12 @@ fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bool {
         // overwrite this with real packet data on RX. If we ever read back the
         // poison pattern in the RX path, it means the kernel recycled a
         // descriptor without writing packet data (stale/uninit frame).
-        if let Some(frame) = unsafe {
-            binding.umem.area.slice_mut_unchecked(offset as usize, 8)
-        } {
-            frame.copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes());
+        if cfg!(feature = "debug-log") {
+            if let Some(frame) = unsafe {
+                binding.umem.area.slice_mut_unchecked(offset as usize, 8)
+            } {
+                frame.copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes());
+            }
         }
         binding.scratch_fill.push(offset);
     }
@@ -5323,8 +5370,16 @@ fn apply_worker_commands(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
 ) {
-    let pending = match commands.lock() {
-        Ok(mut pending) => core::mem::take(&mut *pending),
+    // Hot path: try_lock avoids blocking on the mutex when another thread
+    // holds it (rare) and avoids the cost of lock+unlock on empty queues
+    // when there's nothing to do (common case during steady-state forwarding).
+    let pending = match commands.try_lock() {
+        Ok(mut pending) => {
+            if pending.is_empty() {
+                return;
+            }
+            core::mem::take(&mut *pending)
+        }
         Err(_) => return,
     };
     let now_ns = monotonic_nanos();

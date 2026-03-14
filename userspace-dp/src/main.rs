@@ -825,6 +825,19 @@ fn run() -> Result<(), String> {
             eprintln!("set {sysctl}=16777216");
         }
     }
+    // Enable NAPI busy polling: when AF_XDP sockets call sendto(), the
+    // kernel will spin-poll the NIC's NAPI context directly instead of
+    // deferring to softirq.  This reduces user↔softirq context switches.
+    for (path, val) in &[
+        ("/proc/sys/net/core/busy_poll", "50"),
+        ("/proc/sys/net/core/busy_read", "50"),
+    ] {
+        if let Err(e) = fs::write(path, val) {
+            eprintln!("warn: set {path}: {e}");
+        } else {
+            eprintln!("set {path}={val}");
+        }
+    }
     let args = parse_args()?;
     if let Some(parent) = Path::new(&args.control_socket).parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create control dir: {e}"))?;
