@@ -2063,9 +2063,9 @@ fn poll_binding(
                             counters.session_hits += 1;
                             dbg.session_hit += 1;
                             // Log first N session hits from WAN (return path)
-                            if meta.ingress_ifindex == 6 && dbg.wan_return_hits < 5 {
+                            if cfg!(feature = "debug-log") && meta.ingress_ifindex == 6 && dbg.wan_return_hits < 5 {
                                 dbg.wan_return_hits += 1;
-                                eprintln!(
+                                debug_log!(
                                     "DBG WAN_RETURN_HIT[{}]: {}:{} -> {}:{} proto={} tcp_flags=0x{:02x} nat=({:?},{:?}) rev={}",
                                     dbg.wan_return_hits,
                                     flow.src_ip, flow.forward_key.src_port,
@@ -2452,50 +2452,49 @@ fn poll_binding(
                                             binding.session_map_fd,
                                             &reverse_key,
                                         );
-                                        // Verify reverse key was published correctly
-                                        if verify_session_key_in_bpf(binding.session_map_fd, &reverse_key) {
-                                            SESSION_PUBLISH_VERIFY_OK.fetch_add(1, Ordering::Relaxed);
-                                        } else {
-                                            SESSION_PUBLISH_VERIFY_FAIL.fetch_add(1, Ordering::Relaxed);
-                                            eprintln!(
-                                                "SESS_VERIFY_FAIL: reverse key NOT found after publish! \
-                                                 af={} proto={} {}:{} -> {}:{} (map_fd={})",
-                                                reverse_key.addr_family, reverse_key.protocol,
-                                                reverse_key.src_ip, reverse_key.src_port,
-                                                reverse_key.dst_ip, reverse_key.dst_port,
-                                                binding.session_map_fd,
-                                            );
-                                        }
-                                        // Also verify forward key
-                                        if !verify_session_key_in_bpf(binding.session_map_fd, &flow.forward_key) {
-                                            eprintln!(
-                                                "SESS_VERIFY_FAIL: forward key NOT found! \
-                                                 af={} proto={} {}:{} -> {}:{}",
-                                                flow.forward_key.addr_family, flow.forward_key.protocol,
-                                                flow.forward_key.src_ip, flow.forward_key.src_port,
-                                                flow.forward_key.dst_ip, flow.forward_key.dst_port,
-                                            );
-                                        }
-                                        // Log first N session creations with full details
-                                        let logged = SESSION_CREATIONS_LOGGED.fetch_add(1, Ordering::Relaxed);
-                                        if logged < 10 {
-                                            let fwd = &flow.forward_key;
-                                            eprintln!(
-                                                "SESS_CREATE[{}]: FWD af={} proto={} {}:{} -> {}:{} \
-                                                 | REV af={} proto={} {}:{} -> {}:{} \
-                                                 | NAT src={:?} dst={:?} \
-                                                 | map_fd={} bpf_entries={}",
-                                                logged, fwd.addr_family, fwd.protocol,
-                                                fwd.src_ip, fwd.src_port, fwd.dst_ip, fwd.dst_port,
-                                                reverse_key.addr_family, reverse_key.protocol,
-                                                reverse_key.src_ip, reverse_key.src_port,
-                                                reverse_key.dst_ip, reverse_key.dst_port,
-                                                decision.nat.rewrite_src, decision.nat.rewrite_dst,
-                                                binding.session_map_fd,
-                                                count_bpf_session_entries(binding.session_map_fd),
-                                            );
-                                            // Dump the BPF map contents
-                                            dump_bpf_session_entries(binding.session_map_fd, 20);
+                                        // Verify session keys and log creations (debug-only: BPF syscalls)
+                                        if cfg!(feature = "debug-log") {
+                                            if verify_session_key_in_bpf(binding.session_map_fd, &reverse_key) {
+                                                SESSION_PUBLISH_VERIFY_OK.fetch_add(1, Ordering::Relaxed);
+                                            } else {
+                                                SESSION_PUBLISH_VERIFY_FAIL.fetch_add(1, Ordering::Relaxed);
+                                                debug_log!(
+                                                    "SESS_VERIFY_FAIL: reverse key NOT found after publish! \
+                                                     af={} proto={} {}:{} -> {}:{} (map_fd={})",
+                                                    reverse_key.addr_family, reverse_key.protocol,
+                                                    reverse_key.src_ip, reverse_key.src_port,
+                                                    reverse_key.dst_ip, reverse_key.dst_port,
+                                                    binding.session_map_fd,
+                                                );
+                                            }
+                                            if !verify_session_key_in_bpf(binding.session_map_fd, &flow.forward_key) {
+                                                debug_log!(
+                                                    "SESS_VERIFY_FAIL: forward key NOT found! \
+                                                     af={} proto={} {}:{} -> {}:{}",
+                                                    flow.forward_key.addr_family, flow.forward_key.protocol,
+                                                    flow.forward_key.src_ip, flow.forward_key.src_port,
+                                                    flow.forward_key.dst_ip, flow.forward_key.dst_port,
+                                                );
+                                            }
+                                            let logged = SESSION_CREATIONS_LOGGED.fetch_add(1, Ordering::Relaxed);
+                                            if logged < 10 {
+                                                let fwd = &flow.forward_key;
+                                                debug_log!(
+                                                    "SESS_CREATE[{}]: FWD af={} proto={} {}:{} -> {}:{} \
+                                                     | REV af={} proto={} {}:{} -> {}:{} \
+                                                     | NAT src={:?} dst={:?} \
+                                                     | map_fd={} bpf_entries={}",
+                                                    logged, fwd.addr_family, fwd.protocol,
+                                                    fwd.src_ip, fwd.src_port, fwd.dst_ip, fwd.dst_port,
+                                                    reverse_key.addr_family, reverse_key.protocol,
+                                                    reverse_key.src_ip, reverse_key.src_port,
+                                                    reverse_key.dst_ip, reverse_key.dst_port,
+                                                    decision.nat.rewrite_src, decision.nat.rewrite_dst,
+                                                    binding.session_map_fd,
+                                                    count_bpf_session_entries(binding.session_map_fd),
+                                                );
+                                                dump_bpf_session_entries(binding.session_map_fd, 20);
+                                            }
                                         }
                                         created += 1;
                                         let reverse_entry = SyncedSessionEntry {
@@ -2521,9 +2520,8 @@ fn poll_binding(
                                     }
                                 } else {
                                     dbg.policy_deny += 1;
-                                    // Debug: log policy deny — always for trust flows
-                                    if dbg.policy_deny <= 3 || is_trust_flow {
-                                        eprintln!(
+                                    if cfg!(feature = "debug-log") && (dbg.policy_deny <= 3 || is_trust_flow) {
+                                        debug_log!(
                                             "DBG POLICY_DENY[{}]: {}:{} -> {}:{} proto={} zone={}->{}  ingress_if={} egress_if={}",
                                             dbg.policy_deny,
                                             flow.src_ip, flow.forward_key.src_port,
@@ -2949,7 +2947,7 @@ fn build_live_forward_request(
             .filter_map(|p| *p)
             .collect::<Vec<_>>();
         let disagreement = all_agree.windows(2).any(|w| w[0] != w[1]);
-        if disagreement {
+        if cfg!(feature = "debug-log") && disagreement {
             thread_local! {
                 static PORT_DISAGREE_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
             }
@@ -2957,7 +2955,7 @@ fn build_live_forward_request(
                 let n = c.get();
                 if n < 100 {
                     c.set(n + 1);
-                    eprintln!(
+                    debug_log!(
                         "PORT_DISAGREE[{n}]: source={ports_source} session={session_ports:?} live={live_ports:?} meta={meta_ports:?} copy={copy_ports:?} expected={expected_ports:?} desc.addr={} desc.len={} proto={}",
                         desc.addr, desc.len, meta.protocol,
                     );
@@ -2965,7 +2963,7 @@ fn build_live_forward_request(
             });
         }
         // Log when session is missing for non-SYN TCP
-        if meta.protocol == PROTO_TCP && session_ports.is_none() && flow.is_none() {
+        if cfg!(feature = "debug-log") && meta.protocol == PROTO_TCP && session_ports.is_none() && flow.is_none() {
             let tcp_flags = source_frame
                 .get(frame_l3_offset(&source_frame).unwrap_or(14)..)
                 .and_then(|ip| {
@@ -2974,7 +2972,6 @@ fn build_live_forward_request(
                 })
                 .unwrap_or(0);
             if tcp_flags & 0x02 == 0 {
-                // Non-SYN without session
                 thread_local! {
                     static SESS_MISS_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
                 }
@@ -2982,7 +2979,7 @@ fn build_live_forward_request(
                     let n = c.get();
                     if n < 100 {
                         c.set(n + 1);
-                        eprintln!(
+                        debug_log!(
                             "SESS_MISS_TCP[{n}]: flags=0x{tcp_flags:02x} expected={expected_ports:?} live={live_ports:?} meta={meta_ports:?} copy={copy_ports:?} desc.addr={} desc.len={}",
                             desc.addr, desc.len,
                         );
@@ -3095,8 +3092,8 @@ fn enqueue_pending_forwards(
             request.target_ifindex,
         ) else {
             dbg.no_egress_binding += 1;
-            if dbg.no_egress_binding <= 3 {
-                eprintln!(
+            if cfg!(feature = "debug-log") && dbg.no_egress_binding <= 3 {
+                debug_log!(
                     "DBG NO_EGRESS_BINDING: target_ifindex={} ingress_if={} ingress_q={}",
                     request.target_ifindex, ingress_ident.ifindex, request.ingress_queue_id,
                 );
@@ -4451,14 +4448,16 @@ fn flush_session_deltas(
             push_recent_session_delta(&mut recent, info);
         }
         if delta.kind == SessionDeltaKind::Close {
-            eprintln!(
-                "SESS_DELETE: proto={} {}:{} -> {}:{} nat_src={:?} nat_dst={:?} bpf_entries_before={}",
-                delta.key.protocol,
-                delta.key.src_ip, delta.key.src_port,
-                delta.key.dst_ip, delta.key.dst_port,
-                delta.decision.nat.rewrite_src, delta.decision.nat.rewrite_dst,
-                count_bpf_session_entries(session_map_fd),
-            );
+            if cfg!(feature = "debug-log") {
+                debug_log!(
+                    "SESS_DELETE: proto={} {}:{} -> {}:{} nat_src={:?} nat_dst={:?} bpf_entries_before={}",
+                    delta.key.protocol,
+                    delta.key.src_ip, delta.key.src_port,
+                    delta.key.dst_ip, delta.key.dst_port,
+                    delta.decision.nat.rewrite_src, delta.decision.nat.rewrite_dst,
+                    count_bpf_session_entries(session_map_fd),
+                );
+            }
             delete_live_session_key(session_map_fd, &delta.key);
             remove_shared_session(shared_sessions, shared_nat_sessions, &delta.key);
             let reverse_key = reverse_session_key(&delta.key, delta.decision.nat);
@@ -4469,10 +4468,12 @@ fn flush_session_deltas(
                 peer_worker_commands,
                 &reverse_session_key(&delta.key, delta.decision.nat),
             );
-            eprintln!(
-                "SESS_DELETE_DONE: bpf_entries_after={}",
-                count_bpf_session_entries(session_map_fd),
-            );
+            if cfg!(feature = "debug-log") {
+                debug_log!(
+                    "SESS_DELETE_DONE: bpf_entries_after={}",
+                    count_bpf_session_entries(session_map_fd),
+                );
+            }
         }
     }
 }
