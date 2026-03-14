@@ -56,20 +56,30 @@ system {
 | Capability | eBPF (default) | Userspace |
 |------------|---------------|-----------|
 | Stateful forwarding | Yes | Yes |
+| Zone policies | Yes | Yes |
+| Application matching | Yes | Yes |
 | Source NAT (interface) | Yes | Yes |
+| Source NAT (pool) | Yes | No (fallback) |
 | Destination NAT | Yes | No (fallback) |
 | Static NAT (1:1) | Yes | Yes |
 | NAT64 (IPv6↔IPv4) | Yes | Yes |
-| Zone policies | Yes | Yes |
+| NPTv6 (RFC 6296) | Yes | No (fallback) |
+| Screen/IDS | Yes | No (fallback) |
 | Firewall filters | Yes | No (fallback) |
-| IPsec / tunnels | Yes | No (fallback) |
+| Global policies | Yes | No (fallback) |
 | TCP MSS clamping | Yes | No (fallback) |
+| GRE tunnels | Yes | No (fallback) |
+| IPsec / XFRM | Yes | No (fallback) |
+| Policy-based routing | Yes | No (fallback) |
+| ECMP multipath | Yes | Partial |
+| VLANs (802.1Q) | Yes | Yes |
 | Flow export (NetFlow) | Yes | No (fallback) |
+| Per-packet syslog | Yes | No (fallback) |
 | HA cluster | Yes | Yes |
 | Session sync | Yes | Yes |
 | Throughput (25G mlx5) | 22+ Gbps | 23+ Gbps |
 
-When "No (fallback)" is listed, the feature is handled by the eBPF pipeline transparently — the userspace dataplane detects unsupported configuration and defers those packets to the kernel BPF path.
+When "No (fallback)" is listed, the feature is handled by the eBPF pipeline transparently — the userspace dataplane detects unsupported configuration and defers those packets to the kernel BPF path. See [`docs/userspace-dataplane-gaps.md`](docs/userspace-dataplane-gaps.md) for the full gap analysis and priority roadmap.
 
 ## Architecture
 
@@ -329,6 +339,7 @@ See `docs/` for detailed design documents:
 - `userspace-ha-validation.md` — HA failover validation procedures
 - `userspace-perf-compare.md` — Throughput benchmarking methodology
 - `userspace-dnat-plan.md` — Destination NAT implementation plan for userspace dataplane
+- `userspace-dataplane-gaps.md` — Feature gap analysis: userspace vs eBPF dataplane
 
 ## Requirements
 
