@@ -232,14 +232,12 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 		}
 	}
 	// NAT64 is supported — NATv6v4 config (no-v6-frag-header option) is fine
-	if cfg.Security.Flow.TCPSession != nil ||
-		cfg.Security.Flow.UDPSessionTimeout != 0 ||
-		cfg.Security.Flow.ICMPSessionTimeout != 0 ||
-		cfg.Security.Flow.GREPerformanceAcceleration ||
+	// Session timeouts (TCP/UDP/ICMP) are supported — only gate on unsupported flow features
+	if cfg.Security.Flow.GREPerformanceAcceleration ||
 		cfg.Security.Flow.TCPMSSIPsecVPN != 0 ||
 		cfg.Security.Flow.TCPMSSGreIn != 0 ||
 		cfg.Security.Flow.TCPMSSGreOut != 0 {
-		addReason("stateful flow processing is not implemented in the userspace dataplane")
+		addReason("GRE acceleration and TCP MSS clamping are not implemented in the userspace dataplane")
 	}
 	if len(cfg.Firewall.FiltersInet) > 0 || len(cfg.Firewall.FiltersInet6) > 0 ||
 		len(cfg.Firewall.Policers) > 0 || len(cfg.Firewall.ThreeColorPolicers) > 0 {
@@ -280,8 +278,18 @@ func userspaceSupportsSecurityPolicies(cfg *config.Config) bool {
 	if cfg == nil {
 		return true
 	}
-	if len(cfg.Security.GlobalPolicies) > 0 {
-		return false
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if pol == nil {
+			continue
+		}
+		if pol.SchedulerName != "" || pol.Count {
+			return false
+		}
+		if !userspacePolicyAddressesSupported(cfg, pol.Match.SourceAddresses) ||
+			!userspacePolicyAddressesSupported(cfg, pol.Match.DestinationAddresses) ||
+			!userspacePolicyApplicationsSupported(cfg, pol.Match.Applications) {
+			return false
+		}
 	}
 	for _, zpp := range cfg.Security.Policies {
 		if zpp == nil {
@@ -550,10 +558,7 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		Fabrics:       buildFabricSnapshots(cfg),
 		Neighbors:     buildNeighborSnapshots(cfg),
 		Routes:        buildRouteSnapshots(cfg, interfaces),
-		Flow: FlowSnapshot{
-			AllowDNSReply:     cfg.Security.Flow.AllowDNSReply,
-			AllowEmbeddedICMP: cfg.Security.Flow.AllowEmbeddedICMP,
-		},
+		Flow: buildFlowSnapshot(cfg),
 		DefaultPolicy: policyActionString(cfg.Security.DefaultPolicy),
 		Policies:      buildPolicySnapshots(cfg),
 		SourceNAT:      buildSourceNATSnapshots(cfg),
@@ -1349,8 +1354,21 @@ func buildNAT64Snapshots(cfg *config.Config) []NAT64RuleSnapshot {
 	return out
 }
 
+func buildFlowSnapshot(cfg *config.Config) FlowSnapshot {
+	snap := FlowSnapshot{
+		AllowDNSReply:      cfg.Security.Flow.AllowDNSReply,
+		AllowEmbeddedICMP:  cfg.Security.Flow.AllowEmbeddedICMP,
+		UDPSessionTimeout:  cfg.Security.Flow.UDPSessionTimeout,
+		ICMPSessionTimeout: cfg.Security.Flow.ICMPSessionTimeout,
+	}
+	if cfg.Security.Flow.TCPSession != nil {
+		snap.TCPSessionTimeout = cfg.Security.Flow.TCPSession.EstablishedTimeout
+	}
+	return snap
+}
+
 func buildPolicySnapshots(cfg *config.Config) []PolicyRuleSnapshot {
-	if cfg == nil || len(cfg.Security.Policies) == 0 {
+	if cfg == nil || (len(cfg.Security.Policies) == 0 && len(cfg.Security.GlobalPolicies) == 0) {
 		return nil
 	}
 	out := make([]PolicyRuleSnapshot, 0)
@@ -1385,6 +1403,34 @@ func buildPolicySnapshots(cfg *config.Config) []PolicyRuleSnapshot {
 				Action:               policyActionString(pol.Action),
 			})
 		}
+	}
+	// Global policies match traffic regardless of zone pair.
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if pol == nil {
+			continue
+		}
+		sourceAddresses, ok := expandUserspacePolicyAddresses(cfg, pol.Match.SourceAddresses)
+		if !ok {
+			sourceAddresses = append([]string(nil), pol.Match.SourceAddresses...)
+		}
+		destinationAddresses, ok := expandUserspacePolicyAddresses(cfg, pol.Match.DestinationAddresses)
+		if !ok {
+			destinationAddresses = append([]string(nil), pol.Match.DestinationAddresses...)
+		}
+		applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
+		if !ok {
+			applicationTerms = nil
+		}
+		out = append(out, PolicyRuleSnapshot{
+			Name:                 pol.Name,
+			FromZone:             "junos-global",
+			ToZone:               "junos-global",
+			SourceAddresses:      sourceAddresses,
+			DestinationAddresses: destinationAddresses,
+			Applications:         append([]string(nil), pol.Match.Applications...),
+			ApplicationTerms:     applicationTerms,
+			Action:               policyActionString(pol.Action),
+		})
 	}
 	return out
 }

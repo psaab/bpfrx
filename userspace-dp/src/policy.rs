@@ -102,10 +102,16 @@ pub(crate) fn evaluate_policy(
     dst_port: u16,
 ) -> PolicyAction {
     for rule in &state.rules {
-        if !rule.from_zone.is_empty() && rule.from_zone != from_zone {
+        if !rule.from_zone.is_empty()
+            && rule.from_zone != from_zone
+            && rule.from_zone != "junos-global"
+        {
             continue;
         }
-        if !rule.to_zone.is_empty() && rule.to_zone != to_zone {
+        if !rule.to_zone.is_empty()
+            && rule.to_zone != to_zone
+            && rule.to_zone != "junos-global"
+        {
             continue;
         }
         if !applications_match(&rule.applications, protocol, src_port, dst_port) {
@@ -437,6 +443,107 @@ mod tests {
                 PROTO_TCP,
                 40000,
                 443,
+            ),
+            PolicyAction::Permit
+        );
+    }
+
+    #[test]
+    fn global_policy_matches_any_zone_pair() {
+        let state = parse_policy_state(
+            "deny",
+            &[PolicyRuleSnapshot {
+                name: "global-allow".to_string(),
+                from_zone: "junos-global".to_string(),
+                to_zone: "junos-global".to_string(),
+                source_addresses: vec!["any".to_string()],
+                destination_addresses: vec!["any".to_string()],
+                applications: vec!["any".to_string()],
+                application_terms: Vec::new(),
+                action: "permit".to_string(),
+            }],
+        );
+        // Should match any zone pair
+        assert_eq!(
+            evaluate_policy(
+                &state,
+                "trust",
+                "untrust",
+                "10.0.0.1".parse().expect("src"),
+                "8.8.8.8".parse().expect("dst"),
+                PROTO_TCP,
+                12345,
+                443,
+            ),
+            PolicyAction::Permit
+        );
+        assert_eq!(
+            evaluate_policy(
+                &state,
+                "dmz",
+                "wan",
+                "192.168.1.1".parse().expect("src"),
+                "1.1.1.1".parse().expect("dst"),
+                PROTO_UDP,
+                5555,
+                53,
+            ),
+            PolicyAction::Permit
+        );
+    }
+
+    #[test]
+    fn global_policy_evaluated_after_zone_specific() {
+        let state = parse_policy_state(
+            "deny",
+            &[
+                PolicyRuleSnapshot {
+                    name: "deny-trust-to-untrust".to_string(),
+                    from_zone: "trust".to_string(),
+                    to_zone: "untrust".to_string(),
+                    source_addresses: vec!["any".to_string()],
+                    destination_addresses: vec!["any".to_string()],
+                    applications: vec!["any".to_string()],
+                    application_terms: Vec::new(),
+                    action: "deny".to_string(),
+                },
+                PolicyRuleSnapshot {
+                    name: "global-allow".to_string(),
+                    from_zone: "junos-global".to_string(),
+                    to_zone: "junos-global".to_string(),
+                    source_addresses: vec!["any".to_string()],
+                    destination_addresses: vec!["any".to_string()],
+                    applications: vec!["any".to_string()],
+                    application_terms: Vec::new(),
+                    action: "permit".to_string(),
+                },
+            ],
+        );
+        // Zone-specific deny should take precedence (evaluated first)
+        assert_eq!(
+            evaluate_policy(
+                &state,
+                "trust",
+                "untrust",
+                "10.0.0.1".parse().expect("src"),
+                "8.8.8.8".parse().expect("dst"),
+                PROTO_TCP,
+                12345,
+                80,
+            ),
+            PolicyAction::Deny
+        );
+        // Different zone pair should hit the global permit
+        assert_eq!(
+            evaluate_policy(
+                &state,
+                "dmz",
+                "wan",
+                "10.0.0.1".parse().expect("src"),
+                "8.8.8.8".parse().expect("dst"),
+                PROTO_TCP,
+                12345,
+                80,
             ),
             PolicyAction::Permit
         );

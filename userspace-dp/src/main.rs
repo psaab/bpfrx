@@ -101,6 +101,12 @@ struct FlowSnapshot {
     allow_dns_reply: bool,
     #[serde(rename = "allow_embedded_icmp", default)]
     allow_embedded_icmp: bool,
+    #[serde(rename = "tcp_session_timeout", default)]
+    tcp_session_timeout: u64,
+    #[serde(rename = "udp_session_timeout", default)]
+    udp_session_timeout: u64,
+    #[serde(rename = "icmp_session_timeout", default)]
+    icmp_session_timeout: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

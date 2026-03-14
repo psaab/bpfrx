@@ -796,3 +796,111 @@ func TestMergeInterfaceAddressSnapshots(t *testing.T) {
 		t.Fatalf("missing addresses: %+v from %+v", want, got)
 	}
 }
+
+func TestUserspaceSupportsGlobalPolicies(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.DefaultPolicy = config.PolicyDeny
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust":   {Name: "trust", Interfaces: []string{"reth1"}},
+		"untrust": {Name: "untrust", Interfaces: []string{"reth0.80"}},
+	}
+	cfg.Security.GlobalPolicies = []*config.Policy{{
+		Name: "global-allow",
+		Match: config.PolicyMatch{
+			SourceAddresses:      []string{"any"},
+			DestinationAddresses: []string{"any"},
+			Applications:         []string{"any"},
+		},
+		Action: config.PolicyPermit,
+	}}
+	if !userspaceSupportsSecurityPolicies(cfg) {
+		t.Fatal("userspaceSupportsSecurityPolicies = false, want true with simple global policies")
+	}
+}
+
+func TestBuildPolicySnapshotsIncludesGlobalPolicies(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "trust",
+		ToZone:   "untrust",
+		Policies: []*config.Policy{{
+			Name: "zone-allow",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"any"},
+			},
+			Action: config.PolicyPermit,
+		}},
+	}}
+	cfg.Security.GlobalPolicies = []*config.Policy{{
+		Name: "global-deny-all",
+		Match: config.PolicyMatch{
+			SourceAddresses:      []string{"any"},
+			DestinationAddresses: []string{"any"},
+			Applications:         []string{"any"},
+		},
+		Action: config.PolicyDeny,
+	}}
+	snap := buildPolicySnapshots(cfg)
+	if len(snap) != 2 {
+		t.Fatalf("len(snap) = %d, want 2", len(snap))
+	}
+	if snap[0].FromZone != "trust" || snap[0].ToZone != "untrust" {
+		t.Fatalf("snap[0] = %+v, want zone-specific policy", snap[0])
+	}
+	if snap[1].FromZone != "junos-global" || snap[1].ToZone != "junos-global" {
+		t.Fatalf("snap[1] = %+v, want global policy", snap[1])
+	}
+	if snap[1].Name != "global-deny-all" {
+		t.Fatalf("snap[1].Name = %q, want global-deny-all", snap[1].Name)
+	}
+}
+
+func TestDeriveUserspaceCapabilitiesAllowsSessionTimeouts(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Flow.TCPSession = &config.TCPSessionConfig{
+		EstablishedTimeout: 120,
+	}
+	cfg.Security.Flow.UDPSessionTimeout = 30
+	cfg.Security.Flow.ICMPSessionTimeout = 10
+	caps := deriveUserspaceCapabilities(cfg)
+	if !caps.ForwardingSupported {
+		t.Fatalf("ForwardingSupported = false, unexpected reasons: %+v", caps.UnsupportedReasons)
+	}
+}
+
+func TestBuildFlowSnapshotIncludesTimeouts(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Flow.AllowDNSReply = true
+	cfg.Security.Flow.AllowEmbeddedICMP = true
+	cfg.Security.Flow.TCPSession = &config.TCPSessionConfig{
+		EstablishedTimeout: 120,
+	}
+	cfg.Security.Flow.UDPSessionTimeout = 30
+	cfg.Security.Flow.ICMPSessionTimeout = 10
+	snap := buildFlowSnapshot(cfg)
+	if !snap.AllowDNSReply {
+		t.Fatal("AllowDNSReply = false")
+	}
+	if !snap.AllowEmbeddedICMP {
+		t.Fatal("AllowEmbeddedICMP = false")
+	}
+	if snap.TCPSessionTimeout != 120 {
+		t.Fatalf("TCPSessionTimeout = %d, want 120", snap.TCPSessionTimeout)
+	}
+	if snap.UDPSessionTimeout != 30 {
+		t.Fatalf("UDPSessionTimeout = %d, want 30", snap.UDPSessionTimeout)
+	}
+	if snap.ICMPSessionTimeout != 10 {
+		t.Fatalf("ICMPSessionTimeout = %d, want 10", snap.ICMPSessionTimeout)
+	}
+}
+
+func TestBuildFlowSnapshotNilTCPSession(t *testing.T) {
+	cfg := &config.Config{}
+	snap := buildFlowSnapshot(cfg)
+	if snap.TCPSessionTimeout != 0 {
+		t.Fatalf("TCPSessionTimeout = %d, want 0", snap.TCPSessionTimeout)
+	}
+}

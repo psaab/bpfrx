@@ -978,6 +978,8 @@ struct ForwardingState {
     egress: FastMap<i32, EgressInterface>,
     fabrics: Vec<FabricLink>,
     allow_dns_reply: bool,
+    allow_embedded_icmp: bool,
+    session_timeouts: crate::session::SessionTimeouts,
     policy: PolicyState,
     source_nat_rules: Vec<SourceNatRule>,
     static_nat: StaticNatTable,
@@ -2475,6 +2477,19 @@ fn poll_binding(
                                 if allow_unsolicited_dns_reply(forwarding, flow) {
                                     // Match the XDP fast path: unsolicited DNS replies bypass
                                     // policy/session install when the flow knob is enabled.
+                                } else if forwarding.allow_embedded_icmp
+                                    && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+                                    && try_embedded_icmp_session_match(
+                                        unsafe { &*area },
+                                        desc,
+                                        meta,
+                                        sessions,
+                                        now_ns,
+                                    )
+                                    .is_some()
+                                {
+                                    // ICMP error with an embedded packet matching an existing
+                                    // session — permit without policy check or session install.
                                 } else if let PolicyAction::Permit = evaluate_policy(
                                     &forwarding.policy,
                                     &from_zone,
@@ -5928,6 +5943,7 @@ fn worker_loop(
 ) {
     pin_current_thread(worker_id);
     let mut sessions = SessionTable::new();
+    sessions.set_timeouts(forwarding.session_timeouts);
     let mut bindings = Vec::with_capacity(binding_plans.len());
     for plan in binding_plans {
         match BindingWorker::create(
@@ -6769,6 +6785,12 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     }
     state.policy = parse_policy_state(&snapshot.default_policy, &snapshot.policies);
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
+    state.allow_embedded_icmp = snapshot.flow.allow_embedded_icmp;
+    state.session_timeouts = crate::session::SessionTimeouts::from_seconds(
+        snapshot.flow.tcp_session_timeout,
+        snapshot.flow.udp_session_timeout,
+        snapshot.flow.icmp_session_timeout,
+    );
     state.source_nat_rules = parse_source_nat_rules(&snapshot.source_nat_rules);
     state.static_nat = StaticNatTable::from_snapshots(&snapshot.static_nat_rules);
     state.dnat_table = DnatTable::from_snapshots(&snapshot.destination_nat_rules);
@@ -7305,6 +7327,130 @@ fn zone_pair_for_flow_with_override(
         .map(|iface| iface.zone.clone())
         .unwrap_or_default();
     (from_zone, to_zone)
+}
+
+/// Returns true if the protocol and ICMP type indicate an ICMP error message
+/// (Destination Unreachable, Time Exceeded, Parameter Problem, Packet Too Big).
+fn is_icmp_error(protocol: u8, icmp_type: u8) -> bool {
+    match protocol {
+        PROTO_ICMP => matches!(icmp_type, 3 | 11 | 12), // Dest Unreach, Time Exceeded, Param Problem
+        PROTO_ICMPV6 => matches!(icmp_type, 1 | 2 | 3 | 4), // Dest Unreach, Packet Too Big, Time Exceeded, Param Problem
+        _ => false,
+    }
+}
+
+/// Parse the embedded IP+L4 headers from an ICMP error payload and look up the
+/// corresponding session. Returns the session lookup if found.
+///
+/// ICMP error format (after outer IP header):
+///   [type(1)][code(1)][checksum(2)][unused(4)][ embedded IP header ... ]
+///
+/// The embedded IP header contains the original packet's src/dst and the first
+/// 8 bytes of the original L4 header (enough for ports).
+fn try_embedded_icmp_session_match(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    sessions: &mut SessionTable,
+    now_ns: u64,
+) -> Option<SessionLookup> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    let l4 = meta.l4_offset as usize;
+
+    // Read ICMP type (first byte of L4 header)
+    let icmp_type = *frame.get(l4)?;
+    if !is_icmp_error(meta.protocol, icmp_type) {
+        return None;
+    }
+
+    // ICMP error header is 8 bytes: type(1) + code(1) + checksum(2) + unused(4)
+    let embedded_ip_start = l4 + 8;
+
+    match meta.protocol {
+        PROTO_ICMP => {
+            // Embedded IPv4 header
+            if frame.len() < embedded_ip_start + 28 {
+                // Need at least 20 byte IP header + 8 bytes L4
+                return None;
+            }
+            let ihl = ((frame[embedded_ip_start] & 0x0F) as usize) * 4;
+            if ihl < 20 || frame.len() < embedded_ip_start + ihl + 4 {
+                return None;
+            }
+            let emb_protocol = frame[embedded_ip_start + 9];
+            let emb_src = IpAddr::V4(Ipv4Addr::new(
+                frame[embedded_ip_start + 12],
+                frame[embedded_ip_start + 13],
+                frame[embedded_ip_start + 14],
+                frame[embedded_ip_start + 15],
+            ));
+            let emb_dst = IpAddr::V4(Ipv4Addr::new(
+                frame[embedded_ip_start + 16],
+                frame[embedded_ip_start + 17],
+                frame[embedded_ip_start + 18],
+                frame[embedded_ip_start + 19],
+            ));
+            let emb_l4 = embedded_ip_start + ihl;
+            let (emb_src_port, emb_dst_port) = if matches!(emb_protocol, PROTO_TCP | PROTO_UDP) {
+                let bytes = frame.get(emb_l4..emb_l4 + 4)?;
+                (
+                    u16::from_be_bytes([bytes[0], bytes[1]]),
+                    u16::from_be_bytes([bytes[2], bytes[3]]),
+                )
+            } else if matches!(emb_protocol, PROTO_ICMP) {
+                let bytes = frame.get(emb_l4 + 4..emb_l4 + 6)?;
+                (u16::from_be_bytes([bytes[0], bytes[1]]), 0)
+            } else {
+                (0, 0)
+            };
+            let embedded_key = SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: emb_protocol,
+                src_ip: emb_src,
+                dst_ip: emb_dst,
+                src_port: emb_src_port,
+                dst_port: emb_dst_port,
+            };
+            sessions.lookup(&embedded_key, now_ns, 0)
+        }
+        PROTO_ICMPV6 => {
+            // Embedded IPv6 header
+            if frame.len() < embedded_ip_start + 48 {
+                // 40 byte IPv6 header + 8 bytes L4
+                return None;
+            }
+            let emb_protocol = frame[embedded_ip_start + 6]; // next header
+            let emb_src = IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[embedded_ip_start + 8..embedded_ip_start + 24]).ok()?,
+            ));
+            let emb_dst = IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[embedded_ip_start + 24..embedded_ip_start + 40]).ok()?,
+            ));
+            let emb_l4 = embedded_ip_start + 40;
+            let (emb_src_port, emb_dst_port) = if matches!(emb_protocol, PROTO_TCP | PROTO_UDP) {
+                let bytes = frame.get(emb_l4..emb_l4 + 4)?;
+                (
+                    u16::from_be_bytes([bytes[0], bytes[1]]),
+                    u16::from_be_bytes([bytes[2], bytes[3]]),
+                )
+            } else if matches!(emb_protocol, PROTO_ICMPV6) {
+                let bytes = frame.get(emb_l4 + 4..emb_l4 + 6)?;
+                (u16::from_be_bytes([bytes[0], bytes[1]]), 0)
+            } else {
+                (0, 0)
+            };
+            let embedded_key = SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: emb_protocol,
+                src_ip: emb_src,
+                dst_ip: emb_dst,
+                src_port: emb_src_port,
+                dst_port: emb_dst_port,
+            };
+            sessions.lookup(&embedded_key, now_ns, 0)
+        }
+        _ => None,
+    }
 }
 
 fn allow_unsolicited_dns_reply(forwarding: &ForwardingState, flow: &SessionFlow) -> bool {
@@ -14671,5 +14817,64 @@ mod tests {
             snat.unwrap().rewrite_src,
             Some("2001:db8::10".parse::<IpAddr>().unwrap())
         );
+    }
+
+    #[test]
+    fn is_icmp_error_identifies_v4_types() {
+        // ICMPv4 error types
+        assert!(is_icmp_error(PROTO_ICMP, 3));  // Destination Unreachable
+        assert!(is_icmp_error(PROTO_ICMP, 11)); // Time Exceeded
+        assert!(is_icmp_error(PROTO_ICMP, 12)); // Parameter Problem
+        // Non-error types
+        assert!(!is_icmp_error(PROTO_ICMP, 0));  // Echo Reply
+        assert!(!is_icmp_error(PROTO_ICMP, 8));  // Echo Request
+    }
+
+    #[test]
+    fn is_icmp_error_identifies_v6_types() {
+        // ICMPv6 error types
+        assert!(is_icmp_error(PROTO_ICMPV6, 1)); // Destination Unreachable
+        assert!(is_icmp_error(PROTO_ICMPV6, 2)); // Packet Too Big
+        assert!(is_icmp_error(PROTO_ICMPV6, 3)); // Time Exceeded
+        assert!(is_icmp_error(PROTO_ICMPV6, 4)); // Parameter Problem
+        // Non-error types
+        assert!(!is_icmp_error(PROTO_ICMPV6, 128)); // Echo Request
+        assert!(!is_icmp_error(PROTO_ICMPV6, 129)); // Echo Reply
+    }
+
+    #[test]
+    fn is_icmp_error_rejects_non_icmp_protocols() {
+        assert!(!is_icmp_error(PROTO_TCP, 3));
+        assert!(!is_icmp_error(PROTO_UDP, 3));
+    }
+
+    #[test]
+    fn forwarding_state_includes_session_timeouts() {
+        let snapshot = nat_snapshot();
+        let state = build_forwarding_state(&snapshot);
+        // Default timeouts when snapshot has 0 values
+        assert_eq!(state.session_timeouts.tcp_established_ns, 300_000_000_000);
+        assert_eq!(state.session_timeouts.udp_ns, 60_000_000_000);
+        assert_eq!(state.session_timeouts.icmp_ns, 15_000_000_000);
+    }
+
+    #[test]
+    fn forwarding_state_custom_session_timeouts() {
+        let mut snapshot = nat_snapshot();
+        snapshot.flow.tcp_session_timeout = 120;
+        snapshot.flow.udp_session_timeout = 30;
+        snapshot.flow.icmp_session_timeout = 5;
+        let state = build_forwarding_state(&snapshot);
+        assert_eq!(state.session_timeouts.tcp_established_ns, 120_000_000_000);
+        assert_eq!(state.session_timeouts.udp_ns, 30_000_000_000);
+        assert_eq!(state.session_timeouts.icmp_ns, 5_000_000_000);
+    }
+
+    #[test]
+    fn forwarding_state_allow_embedded_icmp_wired() {
+        let mut snapshot = nat_snapshot();
+        assert!(!build_forwarding_state(&snapshot).allow_embedded_icmp);
+        snapshot.flow.allow_embedded_icmp = true;
+        assert!(build_forwarding_state(&snapshot).allow_embedded_icmp);
     }
 }

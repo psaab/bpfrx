@@ -55,8 +55,11 @@ type ConfigSnapshot struct {
 }
 
 type FlowSnapshot struct {
-	AllowDNSReply     bool `json:"allow_dns_reply,omitempty"`
-	AllowEmbeddedICMP bool `json:"allow_embedded_icmp,omitempty"`
+	AllowDNSReply      bool `json:"allow_dns_reply,omitempty"`
+	AllowEmbeddedICMP  bool `json:"allow_embedded_icmp,omitempty"`
+	TCPSessionTimeout  int  `json:"tcp_session_timeout,omitempty"`  // seconds, 0=default
+	UDPSessionTimeout  int  `json:"udp_session_timeout,omitempty"`  // seconds, 0=default
+	ICMPSessionTimeout int  `json:"icmp_session_timeout,omitempty"` // seconds, 0=default
 }
 
 type SnapshotSummary struct {

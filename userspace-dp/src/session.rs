@@ -8,11 +8,53 @@ use std::sync::Arc;
 
 const SESSION_GC_INTERVAL_NS: u64 = 1_000_000_000;
 const DEFAULT_MAX_SESSIONS: usize = 131072;
-const TCP_SESSION_TIMEOUT_NS: u64 = 300_000_000_000;
+const DEFAULT_TCP_SESSION_TIMEOUT_NS: u64 = 300_000_000_000;
 const TCP_CLOSING_TIMEOUT_NS: u64 = 30_000_000_000;
-const UDP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
-const ICMP_SESSION_TIMEOUT_NS: u64 = 15_000_000_000;
+const DEFAULT_UDP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
+const DEFAULT_ICMP_SESSION_TIMEOUT_NS: u64 = 15_000_000_000;
 const OTHER_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
+
+/// Configurable session timeout values (in nanoseconds).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SessionTimeouts {
+    pub(crate) tcp_established_ns: u64,
+    pub(crate) udp_ns: u64,
+    pub(crate) icmp_ns: u64,
+}
+
+impl Default for SessionTimeouts {
+    fn default() -> Self {
+        Self {
+            tcp_established_ns: DEFAULT_TCP_SESSION_TIMEOUT_NS,
+            udp_ns: DEFAULT_UDP_SESSION_TIMEOUT_NS,
+            icmp_ns: DEFAULT_ICMP_SESSION_TIMEOUT_NS,
+        }
+    }
+}
+
+impl SessionTimeouts {
+    /// Build from snapshot timeout values (in seconds). A value of 0 means use
+    /// the default.
+    pub(crate) fn from_seconds(tcp_secs: u64, udp_secs: u64, icmp_secs: u64) -> Self {
+        Self {
+            tcp_established_ns: if tcp_secs > 0 {
+                tcp_secs * 1_000_000_000
+            } else {
+                DEFAULT_TCP_SESSION_TIMEOUT_NS
+            },
+            udp_ns: if udp_secs > 0 {
+                udp_secs * 1_000_000_000
+            } else {
+                DEFAULT_UDP_SESSION_TIMEOUT_NS
+            },
+            icmp_ns: if icmp_secs > 0 {
+                icmp_secs * 1_000_000_000
+            } else {
+                DEFAULT_ICMP_SESSION_TIMEOUT_NS
+            },
+        }
+    }
+}
 const MAX_SESSION_DELTAS: usize = 4096;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -91,6 +133,7 @@ pub(crate) struct SessionTable {
     deltas: VecDeque<SessionDelta>,
     last_gc_ns: u64,
     max_sessions: usize,
+    timeouts: SessionTimeouts,
     expired: u64,
     create_drops: u64,
     delta_drops: u64,
@@ -105,11 +148,17 @@ impl SessionTable {
             deltas: VecDeque::with_capacity(MAX_SESSION_DELTAS.min(256)),
             last_gc_ns: 0,
             max_sessions: DEFAULT_MAX_SESSIONS,
+            timeouts: SessionTimeouts::default(),
             expired: 0,
             create_drops: 0,
             delta_drops: 0,
             delta_drained: 0,
         }
+    }
+
+    /// Update the configurable session timeouts.
+    pub fn set_timeouts(&mut self, timeouts: SessionTimeouts) {
+        self.timeouts = timeouts;
     }
 
     pub fn len(&self) -> usize {
@@ -185,7 +234,7 @@ impl SessionTable {
             entry.expires_after_ns = if matches!(key.protocol, PROTO_TCP) && entry.closing {
                 TCP_CLOSING_TIMEOUT_NS
             } else {
-                session_timeout_ns(key.protocol, tcp_flags)
+                session_timeout_ns(key.protocol, tcp_flags, &self.timeouts)
             };
             SessionLookup {
                 decision: entry.decision,
@@ -227,7 +276,7 @@ impl SessionTable {
                 decision,
                 metadata: metadata.clone(),
                 last_seen_ns: now_ns,
-                expires_after_ns: session_timeout_ns(protocol, tcp_flags),
+                expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
             },
         );
@@ -260,7 +309,7 @@ impl SessionTable {
                 decision,
                 metadata: metadata.clone(),
                 last_seen_ns: now_ns,
-                expires_after_ns: session_timeout_ns(protocol, tcp_flags),
+                expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
             },
         );
@@ -286,7 +335,7 @@ impl SessionTable {
         entry.decision = decision;
         entry.metadata = metadata.clone();
         entry.last_seen_ns = now_ns;
-        entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags);
+        entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &self.timeouts);
         entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
         self.sessions.insert(key.clone(), entry);
         self.index_forward_nat_key(key, decision, &metadata);
@@ -325,6 +374,18 @@ impl SessionTable {
     pub fn iter(&self, mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata)) {
         for (key, entry) in &self.sessions {
             f(key, entry.decision, &entry.metadata);
+        }
+    }
+
+    /// Iterate over all session entries with idle time (in nanoseconds).
+    pub fn iter_with_idle(
+        &self,
+        now_ns: u64,
+        mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, u64),
+    ) {
+        for (key, entry) in &self.sessions {
+            let idle_ns = now_ns.saturating_sub(entry.last_seen_ns);
+            f(key, entry.decision, &entry.metadata, idle_ns);
         }
     }
 
@@ -371,17 +432,17 @@ impl SessionTable {
     }
 }
 
-fn session_timeout_ns(protocol: u8, tcp_flags: u8) -> u64 {
+fn session_timeout_ns(protocol: u8, tcp_flags: u8, timeouts: &SessionTimeouts) -> u64 {
     match protocol {
         PROTO_TCP => {
             if (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
                 TCP_CLOSING_TIMEOUT_NS
             } else {
-                TCP_SESSION_TIMEOUT_NS
+                timeouts.tcp_established_ns
             }
         }
-        PROTO_UDP => UDP_SESSION_TIMEOUT_NS,
-        PROTO_ICMP | PROTO_ICMPV6 => ICMP_SESSION_TIMEOUT_NS,
+        PROTO_UDP => timeouts.udp_ns,
+        PROTO_ICMP | PROTO_ICMPV6 => timeouts.icmp_ns,
         _ => OTHER_SESSION_TIMEOUT_NS,
     }
 }
@@ -913,5 +974,131 @@ mod tests {
 
         table.delete(&hit.key);
         assert!(table.find_forward_nat_match(&reply).is_none());
+    }
+
+    #[test]
+    fn configurable_tcp_timeout_changes_session_expiry() {
+        let mut table = SessionTable::new();
+        table.set_timeouts(SessionTimeouts::from_seconds(60, 0, 0));
+        let key = key_v4();
+        let now = 1_000_000_000u64;
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        // Session should expire after 60s (configured), not 300s (default)
+        table.last_gc_ns = now + 59_000_000_000;
+        let expired = table.expire_stale(now + 59_000_000_000 + SESSION_GC_INTERVAL_NS);
+        assert_eq!(expired, 0, "session should not expire before 60s");
+
+        table.last_gc_ns = now + 61_000_000_000;
+        let expired = table.expire_stale(now + 61_000_000_000 + SESSION_GC_INTERVAL_NS);
+        assert_eq!(expired, 1, "session should expire after 60s");
+    }
+
+    #[test]
+    fn configurable_udp_timeout_changes_session_expiry() {
+        let mut table = SessionTable::new();
+        table.set_timeouts(SessionTimeouts::from_seconds(0, 120, 0));
+        let key = key_v6();
+        let now = 1_000_000_000u64;
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            now,
+            PROTO_UDP,
+            0,
+        ));
+        // Should not expire at 60s (the old default)
+        table.last_gc_ns = now + 61_000_000_000;
+        let expired = table.expire_stale(now + 61_000_000_000 + SESSION_GC_INTERVAL_NS);
+        assert_eq!(expired, 0, "session should not expire before 120s");
+
+        // Should expire after 120s
+        table.last_gc_ns = now + 121_000_000_000;
+        let expired = table.expire_stale(now + 121_000_000_000 + SESSION_GC_INTERVAL_NS);
+        assert_eq!(expired, 1, "session should expire after 120s");
+    }
+
+    #[test]
+    fn default_timeouts_match_original_values() {
+        let t = SessionTimeouts::default();
+        assert_eq!(t.tcp_established_ns, 300_000_000_000);
+        assert_eq!(t.udp_ns, 60_000_000_000);
+        assert_eq!(t.icmp_ns, 15_000_000_000);
+    }
+
+    #[test]
+    fn from_seconds_zero_uses_default() {
+        let t = SessionTimeouts::from_seconds(0, 0, 0);
+        assert_eq!(t.tcp_established_ns, DEFAULT_TCP_SESSION_TIMEOUT_NS);
+        assert_eq!(t.udp_ns, DEFAULT_UDP_SESSION_TIMEOUT_NS);
+        assert_eq!(t.icmp_ns, DEFAULT_ICMP_SESSION_TIMEOUT_NS);
+    }
+
+    #[test]
+    fn from_seconds_overrides_values() {
+        let t = SessionTimeouts::from_seconds(120, 30, 5);
+        assert_eq!(t.tcp_established_ns, 120_000_000_000);
+        assert_eq!(t.udp_ns, 30_000_000_000);
+        assert_eq!(t.icmp_ns, 5_000_000_000);
+    }
+
+    #[test]
+    fn iter_with_idle_reports_idle_time() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let install_time = 1_000_000_000u64;
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_time,
+            PROTO_TCP,
+            0x10,
+        ));
+
+        let now = install_time + 5_000_000_000; // 5 seconds later
+        let mut found = false;
+        table.iter_with_idle(now, |k, _decision, _metadata, idle_ns| {
+            if k == &key {
+                assert_eq!(idle_ns, 5_000_000_000);
+                found = true;
+            }
+        });
+        assert!(found, "session should be found in iter_with_idle");
+    }
+
+    #[test]
+    fn iter_with_idle_reflects_last_seen_update() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let install_time = 1_000_000_000u64;
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_time,
+            PROTO_TCP,
+            0x10,
+        ));
+        // Touch the session 3 seconds later
+        let touch_time = install_time + 3_000_000_000;
+        let _ = table.lookup(&key, touch_time, 0x10);
+
+        // Check idle time 5 seconds after install (2 seconds after last touch)
+        let now = install_time + 5_000_000_000;
+        let mut idle = 0u64;
+        table.iter_with_idle(now, |k, _, _, idle_ns| {
+            if k == &key {
+                idle = idle_ns;
+            }
+        });
+        assert_eq!(idle, 2_000_000_000, "idle should be 2s since last touch");
     }
 }
