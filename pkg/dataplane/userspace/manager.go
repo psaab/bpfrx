@@ -48,6 +48,7 @@ type Manager struct {
 	lastSnapshot       *ConfigSnapshot
 	haGroups           map[int]HAGroupStatus
 	lastIngressIfaces  []uint32
+	lastBindingIndices []uint32
 }
 
 func New() *Manager {
@@ -1649,6 +1650,7 @@ type userspaceCtrlValue struct {
 const userspaceMetadataVersion = 4
 const userspaceCtrlFlagCPUMap = 1
 const userspaceCtrlFlagTrace = 2
+const bindingQueuesPerIface = 16 // must match BINDING_QUEUES_PER_IFACE in BPF
 
 func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
 	ctrlMap := m.inner.Map("userspace_ctrl")
@@ -1699,17 +1701,13 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 		return fmt.Errorf("update userspace_fallback_progs: %w", err)
 	}
 
-	var key userspaceBindingKey
-	var val userspaceBindingValue
-	iter := bindingsMap.Iterate()
-	var keys []userspaceBindingKey
-	for iter.Next(&key, &val) {
-		keys = append(keys, key)
-	}
-	for _, key := range keys {
-		if err := bindingsMap.Delete(key); err != nil {
-			return fmt.Errorf("delete userspace_bindings %+v: %w", key, err)
+	// Bindings map is now an Array — zero previously-set indices.
+	{
+		var zeroBinding userspaceBindingValue
+		for _, idx := range m.lastBindingIndices {
+			_ = bindingsMap.Update(idx, zeroBinding, ebpf.UpdateAny)
 		}
+		m.lastBindingIndices = nil
 	}
 	// Heartbeat map is now an Array — zero used slots instead of deleting.
 	// Slots with value 0 appear as stale (bpf_ktime_get_ns() >> 0) so the
@@ -1773,17 +1771,13 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		return errors.New("userspace_bindings map not loaded")
 	}
 
-	var key userspaceBindingKey
-	var val userspaceBindingValue
-	iter := bindingsMap.Iterate()
-	var keys []userspaceBindingKey
-	for iter.Next(&key, &val) {
-		keys = append(keys, key)
-	}
-	for _, key := range keys {
-		if err := bindingsMap.Delete(key); err != nil {
-			return fmt.Errorf("delete userspace_bindings %+v: %w", key, err)
+	// Bindings map is now an Array — zero previously-set indices.
+	{
+		var zeroBinding userspaceBindingValue
+		for _, idx := range m.lastBindingIndices {
+			_ = bindingsMap.Update(idx, zeroBinding, ebpf.UpdateAny)
 		}
+		m.lastBindingIndices = nil
 	}
 
 	// Preserve cpumap flag if cpumap is populated.
@@ -1818,17 +1812,15 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		if binding.Registered && binding.Armed && binding.Ready {
 			flags = userspaceBindingReady
 		}
-		key := userspaceBindingKey{
-			Ifindex: uint32(binding.Ifindex),
-			QueueID: binding.QueueID,
-		}
+		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
 		val := userspaceBindingValue{
 			Slot:  binding.Slot,
 			Flags: flags,
 		}
-		if err := bindingsMap.Update(key, val, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update userspace_bindings %+v: %w", key, err)
+		if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_bindings idx=%d (if=%d q=%d): %w", idx, binding.Ifindex, binding.QueueID, err)
 		}
+		m.lastBindingIndices = append(m.lastBindingIndices, idx)
 	}
 	if err := m.syncIngressIfaceMapLocked(m.lastSnapshot); err != nil {
 		return err

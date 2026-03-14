@@ -50,6 +50,8 @@ const USERSPACE_FALLBACK_REASON_NO_SESSION: u32 = 12;
 const USERSPACE_FALLBACK_REASON_MAX: u32 = 16;
 const USERSPACE_CTRL_FLAG_CPUMAP: u32 = 1;
 const USERSPACE_CTRL_FLAG_TRACE: u32 = 2;
+const BINDING_QUEUES_PER_IFACE: u32 = 16;
+const BINDING_ARRAY_MAX_ENTRIES: u32 = 1024 * BINDING_QUEUES_PER_IFACE; // 16384
 const USERSPACE_TRACE_STAGE_RECEIVED: u32 = 1;
 const USERSPACE_TRACE_STAGE_BINDING_MISSING: u32 = 2;
 const USERSPACE_TRACE_STAGE_BINDING_NOT_READY: u32 = 3;
@@ -220,9 +222,11 @@ struct FragHdr {
 #[map(name = "userspace_ctrl")]
 static USERSPACE_CTRL: Array<UserspaceCtrl> = Array::with_max_entries(1, 0);
 
+// Array indexed by (ifindex * BINDING_QUEUES_PER_IFACE + queue_id).
+// Go manager populates entries; unoccupied entries have flags=0.
 #[map(name = "userspace_bindings")]
-static USERSPACE_BINDINGS: HashMap<UserspaceBindingKey, UserspaceBindingValue> =
-    HashMap::with_max_entries(4096, 0);
+static USERSPACE_BINDINGS: Array<UserspaceBindingValue> =
+    Array::with_max_entries(BINDING_ARRAY_MAX_ENTRIES, 0);
 
 #[map(name = "userspace_ingress_ifaces")]
 static USERSPACE_INGRESS_IFACES: Array<u8> = Array::with_max_entries(1024, 0);
@@ -306,34 +310,32 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         0,
         &parsed,
     );
-    let binding_key = UserspaceBindingKey {
-        ifindex: ingress_ifindex,
-        queue_id: selected_queue,
-    };
-    let mut binding = unsafe { USERSPACE_BINDINGS.get(&binding_key) };
-    if binding.is_none() && selected_queue != rx_queue_index {
-        let fallback_key = UserspaceBindingKey {
-            ifindex: ingress_ifindex,
-            queue_id: rx_queue_index,
-        };
-        binding = unsafe { USERSPACE_BINDINGS.get(&fallback_key) };
+    let binding_idx = ingress_ifindex * BINDING_QUEUES_PER_IFACE + selected_queue;
+    let mut binding = USERSPACE_BINDINGS.get(binding_idx);
+    // Treat zero-flags (unpopulated Array entry) as missing.
+    if binding.map_or(true, |b| b.flags == 0) && selected_queue != rx_queue_index {
+        let fallback_idx = ingress_ifindex * BINDING_QUEUES_PER_IFACE + rx_queue_index;
+        binding = USERSPACE_BINDINGS.get(fallback_idx);
     }
-    let Some(binding) = binding else {
-        record_trace(
-            ctrl.flags,
-            ingress_ifindex,
-            rx_queue_index,
-            selected_queue,
-            u32::MAX,
-            USERSPACE_TRACE_STAGE_BINDING_MISSING,
-            USERSPACE_FALLBACK_REASON_BINDING_MISSING,
-            &parsed,
-        );
-        // Drop all TCP on DP-managed interfaces: legacy BPF has no session
-        // for DP-managed flows, so falling back generates RSTs that kill the
-        // real connection. TCP retransmit recovers from a single drop.
-        incr_fallback_stat(USERSPACE_FALLBACK_REASON_BINDING_MISSING);
-        return Ok(xdp_action::XDP_DROP);
+    let binding = match binding {
+        Some(b) if b.flags != 0 => b,
+        _ => {
+            record_trace(
+                ctrl.flags,
+                ingress_ifindex,
+                rx_queue_index,
+                selected_queue,
+                u32::MAX,
+                USERSPACE_TRACE_STAGE_BINDING_MISSING,
+                USERSPACE_FALLBACK_REASON_BINDING_MISSING,
+                &parsed,
+            );
+            // Drop all TCP on DP-managed interfaces: legacy BPF has no session
+            // for DP-managed flows, so falling back generates RSTs that kill the
+            // real connection. TCP retransmit recovers from a single drop.
+            incr_fallback_stat(USERSPACE_FALLBACK_REASON_BINDING_MISSING);
+            return Ok(xdp_action::XDP_DROP);
+        }
     };
     if (binding.flags & USERSPACE_BINDING_READY) == 0 {
         record_trace(
@@ -413,56 +415,59 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         );
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
-    if is_icmp_to_interface_nat_local(&parsed) {
-        record_trace(
-            ctrl.flags,
-            ingress_ifindex,
-            rx_queue_index,
-            selected_queue,
-            binding.slot,
-            USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL,
-            0,
-            &parsed,
-        );
-        return Ok(cpumap_or_pass(ctrl));
-    }
-    // Do not bounce interface-NAT reply traffic back to legacy XDP on a session-map miss.
-    // The Rust dataplane can repair the reverse flow from the forward NAT session, and
-    // forcing the first reply packet through fallback turns that race into a hard connect
-    // failure.
-    if is_local_destination(&parsed) {
-        record_trace(
-            ctrl.flags,
-            ingress_ifindex,
-            rx_queue_index,
-            selected_queue,
-            binding.slot,
-            USERSPACE_TRACE_STAGE_LOCAL_DESTINATION,
-            0,
-            &parsed,
-        );
-        return Ok(cpumap_or_pass(ctrl));
-    }
-    // Only redirect packets that have an active userspace session or are
-    // connection-initiating (SYN).  Non-SYN TCP without a session is a
-    // stray from a DP-managed flow (e.g. a retransmit that arrived on a
-    // queue whose binding was momentarily absent).  Falling back to
-    // legacy BPF is fatal: legacy conntrack has no matching session, so
-    // the firewall policy generates a RST that kills the real AF_XDP
-    // connection.  Dropping the stray is safe — TCP retransmit recovers.
-    if !has_live_userspace_session(&parsed) && !is_connection_initiating(&parsed) {
-        record_trace(
-            ctrl.flags,
-            ingress_ifindex,
-            rx_queue_index,
-            selected_queue,
-            binding.slot,
-            USERSPACE_TRACE_STAGE_NO_SESSION,
-            USERSPACE_FALLBACK_REASON_NO_SESSION,
-            &parsed,
-        );
-        incr_fallback_stat(USERSPACE_FALLBACK_REASON_NO_SESSION);
-        return Ok(xdp_action::XDP_DROP);
+    // Fast path: for established TCP/UDP sessions, skip LOCAL and
+    // INTERFACE_NAT hash map lookups — if the session exists, the
+    // destination cannot be local (userspace DP only creates sessions
+    // for transit traffic). This eliminates 2-3 hash map lookups per
+    // packet on the hot path.
+    if has_live_userspace_session(&parsed) {
+        // Session exists — go directly to metadata stamping + XSK redirect.
+    } else {
+        // Session miss — run full checks for new connections.
+        if is_icmp_to_interface_nat_local(&parsed) {
+            record_trace(
+                ctrl.flags,
+                ingress_ifindex,
+                rx_queue_index,
+                selected_queue,
+                binding.slot,
+                USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL,
+                0,
+                &parsed,
+            );
+            return Ok(cpumap_or_pass(ctrl));
+        }
+        if is_local_destination(&parsed) {
+            record_trace(
+                ctrl.flags,
+                ingress_ifindex,
+                rx_queue_index,
+                selected_queue,
+                binding.slot,
+                USERSPACE_TRACE_STAGE_LOCAL_DESTINATION,
+                0,
+                &parsed,
+            );
+            return Ok(cpumap_or_pass(ctrl));
+        }
+        // Only redirect connection-initiating packets (SYN for TCP).
+        // Non-SYN TCP without a session is a stray — dropping is safe,
+        // TCP retransmit recovers. Falling back to legacy BPF is fatal
+        // (no matching session → RST kills the real connection).
+        if !is_connection_initiating(&parsed) {
+            record_trace(
+                ctrl.flags,
+                ingress_ifindex,
+                rx_queue_index,
+                selected_queue,
+                binding.slot,
+                USERSPACE_TRACE_STAGE_NO_SESSION,
+                USERSPACE_FALLBACK_REASON_NO_SESSION,
+                &parsed,
+            );
+            incr_fallback_stat(USERSPACE_FALLBACK_REASON_NO_SESSION);
+            return Ok(xdp_action::XDP_DROP);
+        }
     }
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
