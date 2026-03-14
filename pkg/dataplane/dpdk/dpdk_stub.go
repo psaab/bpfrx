@@ -324,6 +324,7 @@ func (m *Manager) NewEventSource() (dataplane.EventSource, error) { return nil, 
 
 func (m *Manager) StartFIBSync(_ context.Context) {}
 func (m *Manager) BumpFIBGeneration()             {}
+func (m *Manager) NotifyLinkCycle()               {}
 
 // --- Map statistics ---
 

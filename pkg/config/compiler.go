@@ -4891,6 +4891,12 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 
 func compileSystem(node *Node, sys *SystemConfig) error {
 	for _, child := range node.Children {
+		if child.Name() == "dataplane-type" && len(child.Keys) >= 2 {
+			sys.DataplaneType = child.Keys[1]
+			break
+		}
+	}
+	for _, child := range node.Children {
 		switch child.Name() {
 		case "host-name":
 			if len(child.Keys) >= 2 {
@@ -5052,9 +5058,17 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 				sys.InternetOptions.NoIPv6RejectZeroHopLimit = true
 			}
 		case "dataplane":
-			sys.DPDKDataplane = &DPDKConfig{}
-			if err := compileDPDKDataplane(child, sys.DPDKDataplane); err != nil {
-				return err
+			switch sys.DataplaneType {
+			case "userspace":
+				sys.UserspaceDataplane = &UserspaceConfig{}
+				if err := compileUserspaceDataplane(child, sys.UserspaceDataplane); err != nil {
+					return err
+				}
+			default:
+				sys.DPDKDataplane = &DPDKConfig{}
+				if err := compileDPDKDataplane(child, sys.DPDKDataplane); err != nil {
+					return err
+				}
 			}
 		case "syslog":
 			sys.Syslog = &SystemSyslogConfig{}
@@ -5232,6 +5246,28 @@ func compileDPDKDataplane(node *Node, cfg *DPDKConfig) error {
 					}
 				}
 				cfg.Ports = append(cfg.Ports, port)
+			}
+		}
+	}
+	return nil
+}
+
+func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
+	for _, child := range node.Children {
+		switch child.Name() {
+		case "binary":
+			cfg.Binary = nodeVal(child)
+		case "control-socket":
+			cfg.ControlSocket = nodeVal(child)
+		case "state-file":
+			cfg.StateFile = nodeVal(child)
+		case "workers":
+			if v := nodeVal(child); v != "" {
+				cfg.Workers, _ = strconv.Atoi(v)
+			}
+		case "ring-entries":
+			if v := nodeVal(child); v != "" {
+				cfg.RingEntries, _ = strconv.Atoi(v)
 			}
 		}
 	}

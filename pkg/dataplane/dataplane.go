@@ -3,6 +3,7 @@ package dataplane
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/bpfrx/pkg/config"
@@ -13,9 +14,50 @@ var _ DataPlane = (*Manager)(nil)
 
 // Dataplane type constants used in system { dataplane-type <type>; }.
 const (
-	TypeEBPF = "ebpf" // default
-	TypeDPDK = "dpdk"
+	TypeEBPF      = "ebpf" // default
+	TypeDPDK      = "dpdk"
+	TypeUserspace = "userspace"
 )
+
+func UserspaceCtrlPinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_ctrl")
+}
+
+func UserspaceBindingsPinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_bindings")
+}
+
+func UserspaceIngressIfacesPinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_ingress_ifaces")
+}
+
+func UserspaceHeartbeatPinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_heartbeat")
+}
+
+func UserspaceXSKMapPinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_xsk_map")
+}
+
+func UserspaceLocalV4PinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_local_v4")
+}
+
+func UserspaceLocalV6PinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_local_v6")
+}
+
+func UserspaceCPUMapPinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_cpumap")
+}
+
+func UserspaceSessionsPinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_sessions")
+}
+
+func UserspaceTracePinPath() string {
+	return filepath.Join(bpfPinPath, "userspace_trace")
+}
 
 // backendRegistry holds constructors for non-eBPF dataplane backends.
 // Sub-packages register themselves via RegisterBackend in their init().
@@ -36,7 +78,7 @@ func NewDataPlane(dpType string) (DataPlane, error) {
 		if ctor, ok := backendRegistry[dpType]; ok {
 			return ctor(), nil
 		}
-		return nil, fmt.Errorf("unknown dataplane type %q (valid: ebpf, dpdk)", dpType)
+		return nil, fmt.Errorf("unknown dataplane type %q (valid: ebpf, dpdk, userspace)", dpType)
 	}
 }
 
@@ -194,6 +236,12 @@ type DataPlane interface {
 	// FIB
 	BumpFIBGeneration()
 	StartFIBSync(ctx context.Context) // DPDK: background route sync; eBPF: no-op
+
+	// NotifyLinkCycle signals that data-plane interfaces were taken DOWN/UP
+	// (e.g. during RETH MAC programming).  The userspace dataplane uses this
+	// to rebind AF_XDP sockets whose kernel-side RQ was destroyed by the
+	// link cycle.  No-op for the eBPF-only and DPDK dataplanes.
+	NotifyLinkCycle()
 
 	// Map statistics
 	GetMapStats() []MapStats

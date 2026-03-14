@@ -17,6 +17,7 @@ const linkPinPath = "/sys/fs/bpf/bpfrx/links"
 // These produce the *_bpfel.go files with embedded ELF objects.
 //
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpMain ../../bpf/xdp/xdp_main.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
+//go:generate bash build-userspace-xdp.sh
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpScreen ../../bpf/xdp/xdp_screen.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpZone ../../bpf/xdp/xdp_zone.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 bpfrxXdpConntrack ../../bpf/xdp/xdp_conntrack.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
@@ -41,6 +42,7 @@ type Manager struct {
 	lastCompile   *CompileResult
 	PersistentNAT *PersistentNATTable
 	EnableCPUMap  bool // Enable cpumap multi-CPU distribution (adds startup overhead)
+	XDPEntryProg  string
 }
 
 // New creates a new dataplane Manager.
@@ -51,6 +53,7 @@ func New() *Manager {
 		xdpLinks:      make(map[int]link.Link),
 		tcLinks:       make(map[int]link.Link),
 		PersistentNAT: NewPersistentNATTable(),
+		XDPEntryProg:  "xdp_main_prog",
 	}
 }
 
@@ -84,9 +87,13 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 		return fmt.Errorf("eBPF programs not loaded")
 	}
 
-	prog, ok := m.programs["xdp_main_prog"]
+	entryProg := m.XDPEntryProg
+	if entryProg == "" {
+		entryProg = "xdp_main_prog"
+	}
+	prog, ok := m.programs[entryProg]
 	if !ok {
-		return fmt.Errorf("xdp_main_prog not found")
+		return fmt.Errorf("%s not found", entryProg)
 	}
 
 	if _, exists := m.xdpLinks[ifindex]; exists {
@@ -326,6 +333,11 @@ func (m *Manager) Map(name string) *ebpf.Map {
 	return m.maps[name]
 }
 
+// Program returns a named eBPF program, or nil if not found.
+func (m *Manager) Program(name string) *ebpf.Program {
+	return m.programs[name]
+}
+
 // NewEventSource creates an EventSource that reads from the eBPF events ring buffer.
 func (m *Manager) NewEventSource() (EventSource, error) {
 	evMap := m.maps["events"]
@@ -359,6 +371,14 @@ func (s *ebpfEventSource) Close() error {
 // LastCompileResult returns the result from the most recent Compile call.
 func (m *Manager) LastCompileResult() *CompileResult {
 	return m.lastCompile
+}
+
+func (m *Manager) XDPLinks() map[int]link.Link {
+	return m.xdpLinks
+}
+
+func (m *Manager) TCLinks() map[int]link.Link {
+	return m.tcLinks
 }
 
 // Close releases Go handles for eBPF resources but leaves pinned maps

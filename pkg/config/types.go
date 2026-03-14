@@ -46,9 +46,30 @@ func SlotToNodeID(slot int) int {
 // Built from interfaces that have RedundantParent set.
 func (c *Config) RethToPhysical() map[string]string {
 	m := make(map[string]string)
+	bestScore := make(map[string]int)
+	localNodeID := -1
+	if c.Chassis.Cluster != nil {
+		localNodeID = c.Chassis.Cluster.NodeID
+	}
 	for _, ifc := range c.Interfaces.Interfaces {
 		if ifc.RedundantParent != "" {
-			m[ifc.RedundantParent] = ifc.Name
+			score := 1
+			if localNodeID >= 0 {
+				slot := InterfaceSlot(ifc.Name)
+				if slot >= 0 {
+					if SlotToNodeID(slot) == localNodeID {
+						score = 2
+					} else {
+						score = 0
+					}
+				}
+			}
+			prev, ok := m[ifc.RedundantParent]
+			if !ok || score > bestScore[ifc.RedundantParent] ||
+				(score == bestScore[ifc.RedundantParent] && ifc.Name < prev) {
+				m[ifc.RedundantParent] = ifc.Name
+				bestScore[ifc.RedundantParent] = score
+			}
 		}
 	}
 	return m
@@ -268,8 +289,9 @@ type SystemConfig struct {
 	BackupRouterDst    string   // backup router destination prefix
 	Lo0FilterInputV4   string   // lo0 unit 0 family inet filter input (host-bound filtering)
 	Lo0FilterInputV6   string   // lo0 unit 0 family inet6 filter input (host-bound filtering)
-	DataplaneType      string   // "ebpf" (default) or "dpdk"
+	DataplaneType      string   // "ebpf" (default), "dpdk", or "userspace"
 	DPDKDataplane      *DPDKConfig
+	UserspaceDataplane *UserspaceConfig
 	InternetOptions    *InternetOptionsConfig
 	Services           *SystemServicesConfig
 	Syslog             *SystemSyslogConfig
@@ -306,6 +328,15 @@ type DPDKPort struct {
 	Interface  string // logical interface name (e.g. "wan0")
 	RXMode     string // per-port RX mode override
 	Cores      string // per-port core list override
+}
+
+// UserspaceConfig holds separate-process userspace dataplane configuration.
+type UserspaceConfig struct {
+	Binary        string `json:"binary"`         // helper process path
+	ControlSocket string `json:"control_socket"` // unix control socket path
+	StateFile     string `json:"state_file"`     // helper state file path
+	Workers       int    `json:"workers"`        // worker thread count
+	RingEntries   int    `json:"ring_entries"`   // planned AF_XDP ring entries
 }
 
 // RootAuthConfig holds root-authentication settings.
