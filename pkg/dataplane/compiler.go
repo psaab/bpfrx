@@ -4467,7 +4467,26 @@ func (r *CompileResult) tuneInterfaceBuffers(link netlink.Link) {
 		os.WriteFile(path, []byte(singleCPUMask(cpu)), 0644)
 	}
 
+	// Set RSS hash key for better queue distribution with AF_XDP.
+	// The default Toeplitz hash key can concentrate flows with similar
+	// 5-tuples onto the same queues. This key provides better spread.
+	configureRSSHashKey(name)
+
 	r.ethtoolApplied["buffers:"+name] = true
+}
+
+// configureRSSHashKey sets a well-distributed RSS hash key via ethtool -X.
+// This improves AF_XDP queue utilization when traffic has limited source
+// diversity (e.g. few clients with same src IP, varying only src port).
+func configureRSSHashKey(name string) {
+	key := "6d:5a:56:da:25:5b:0e:c2:41:67:25:3d:43:a3:8f:b0:" +
+		"d0:ca:2b:cb:ae:7b:30:b4:77:cb:2d:a3:80:30:f2:0c:" +
+		"8c:da:5b:6a:25:30:17:9a"
+	out, err := exec.Command("ethtool", "-X", name, "hkey", key).CombinedOutput()
+	if err != nil {
+		slog.Debug("failed to set RSS hash key",
+			"interface", name, "err", fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))
+	}
 }
 
 // parseRingParams extracts max and current TX ring sizes from ethtool -g output.
