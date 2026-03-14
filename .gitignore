@@ -1,8 +1,11 @@
 # Go
 /bpfrxd
+/bpfrx-userspace-dp
 /cli
 *.test
 *.out
+
+/userspace-dp/target/
 
 # eBPF generated
 *_bpfel.go
