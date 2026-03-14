@@ -52,6 +52,9 @@ type ConfigSnapshot struct {
 	NAT64          []NAT64RuleSnapshot          `json:"nat64_rules,omitempty"`
 	Nptv6          []Nptv6RuleSnapshot          `json:"nptv6_rules,omitempty"`
 	Screens        []ScreenProfileSnapshot      `json:"screens,omitempty"`
+	Filters        []FirewallFilterSnapshot     `json:"filters,omitempty"`
+	Policers       []PolicerSnapshot            `json:"policers,omitempty"`
+	FlowExport     *FlowExportSnapshot          `json:"flow_export,omitempty"`
 	Config        *config.Config          `json:"config,omitempty"`
 	Userspace     config.UserspaceConfig  `json:"userspace"`
 }
@@ -63,9 +66,12 @@ type FlowSnapshot struct {
 	TCPMSSIPsecVPN     int  `json:"tcp_mss_ipsec_vpn,omitempty"`
 	TCPMSSGreIn        int  `json:"tcp_mss_gre_in,omitempty"`
 	TCPMSSGreOut       int  `json:"tcp_mss_gre_out,omitempty"`
-	TCPSessionTimeout  int  `json:"tcp_session_timeout,omitempty"`  // seconds, 0=default
-	UDPSessionTimeout  int  `json:"udp_session_timeout,omitempty"`  // seconds, 0=default
-	ICMPSessionTimeout int  `json:"icmp_session_timeout,omitempty"` // seconds, 0=default
+	TCPSessionTimeout  int    `json:"tcp_session_timeout,omitempty"`  // seconds, 0=default
+	UDPSessionTimeout  int    `json:"udp_session_timeout,omitempty"`  // seconds, 0=default
+	ICMPSessionTimeout int    `json:"icmp_session_timeout,omitempty"` // seconds, 0=default
+	GREAcceleration    bool   `json:"gre_acceleration,omitempty"`     // extract GRE key into session ports
+	Lo0FilterInputV4   string `json:"lo0_filter_input_v4,omitempty"`  // lo0 inet input filter name
+	Lo0FilterInputV6   string `json:"lo0_filter_input_v6,omitempty"`  // lo0 inet6 input filter name
 }
 
 type SnapshotSummary struct {
@@ -99,6 +105,8 @@ type InterfaceSnapshot struct {
 	MTU             int                        `json:"mtu,omitempty"`
 	HardwareAddr    string                     `json:"hardware_addr,omitempty"`
 	Addresses       []InterfaceAddressSnapshot `json:"addresses,omitempty"`
+	FilterInputV4   string                     `json:"filter_input_v4,omitempty"`
+	FilterInputV6   string                     `json:"filter_input_v6,omitempty"`
 }
 
 type FabricSnapshot struct {
@@ -176,6 +184,51 @@ type ScreenProfileSnapshot struct {
 	ICMPFloodThreshold uint32 `json:"icmp_flood_threshold,omitempty"`
 	UDPFloodThreshold  uint32 `json:"udp_flood_threshold,omitempty"`
 	SYNFloodThreshold  uint32 `json:"syn_flood_threshold,omitempty"`
+	// Advanced screen features for userspace dataplane
+	SessionLimitSrc    uint32 `json:"session_limit_src,omitempty"`
+	SessionLimitDst    uint32 `json:"session_limit_dst,omitempty"`
+	PortScanThreshold  uint32 `json:"port_scan_threshold,omitempty"`
+	IPSweepThreshold   uint32 `json:"ip_sweep_threshold,omitempty"`
+}
+
+type FirewallFilterSnapshot struct {
+	Name   string                 `json:"name"`
+	Family string                 `json:"family"` // "inet" or "inet6"
+	Terms  []FirewallTermSnapshot `json:"terms"`
+}
+
+type FirewallTermSnapshot struct {
+	Name            string   `json:"name"`
+	SourceAddresses []string `json:"source_addresses,omitempty"`
+	DestAddresses   []string `json:"destination_addresses,omitempty"`
+	Protocols       []string `json:"protocols,omitempty"`
+	SourcePorts     []string `json:"source_ports,omitempty"`  // "80" or "1024-65535"
+	DestPorts       []string `json:"destination_ports,omitempty"`
+	DSCPValues      []uint8  `json:"dscp_values,omitempty"`
+	Action          string   `json:"action"` // "accept", "discard", "reject"
+	Count           string   `json:"count,omitempty"`
+	Log             bool     `json:"log,omitempty"`
+	PolicerName     string   `json:"policer,omitempty"`
+	RoutingInstance string   `json:"routing_instance,omitempty"`
+	ForwardingClass string   `json:"forwarding_class,omitempty"`
+	DSCPRewrite     uint8    `json:"dscp_rewrite,omitempty"`
+}
+
+type PolicerSnapshot struct {
+	Name          string `json:"name"`
+	BandwidthBps  uint64 `json:"bandwidth_bps"`
+	BurstBytes    uint64 `json:"burst_bytes"`
+	DiscardExcess bool   `json:"discard_excess"`
+}
+
+// FlowExportSnapshot captures flow monitoring/export configuration for the
+// userspace dataplane.
+type FlowExportSnapshot struct {
+	CollectorAddress string `json:"collector_address"`
+	CollectorPort    int    `json:"collector_port"`
+	SamplingRate     int    `json:"sampling_rate"`
+	ActiveTimeout    int    `json:"active_timeout,omitempty"`   // seconds, 0=default 60
+	InactiveTimeout  int    `json:"inactive_timeout,omitempty"` // seconds, 0=default 15
 }
 
 type PolicyApplicationSnapshot struct {

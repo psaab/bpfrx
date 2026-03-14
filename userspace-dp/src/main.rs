@@ -1,4 +1,6 @@
 mod afxdp;
+mod filter;
+mod flowexport;
 mod nat;
 mod nat64;
 mod nptv6;
@@ -74,6 +76,10 @@ struct InterfaceSnapshot {
     hardware_addr: String,
     #[serde(default)]
     addresses: Vec<InterfaceAddressSnapshot>,
+    #[serde(rename = "filter_input_v4", default)]
+    filter_input_v4: String,
+    #[serde(rename = "filter_input_v6", default)]
+    filter_input_v6: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -117,6 +123,12 @@ struct FlowSnapshot {
     udp_session_timeout: u64,
     #[serde(rename = "icmp_session_timeout", default)]
     icmp_session_timeout: u64,
+    #[serde(rename = "gre_acceleration", default)]
+    gre_acceleration: bool,
+    #[serde(rename = "lo0_filter_input_v4", default)]
+    lo0_filter_input_v4: String,
+    #[serde(rename = "lo0_filter_input_v6", default)]
+    lo0_filter_input_v6: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -179,6 +191,12 @@ struct ConfigSnapshot {
     #[serde(default)]
     screens: Vec<ScreenProfileSnapshot>,
     #[serde(default)]
+    filters: Vec<FirewallFilterSnapshot>,
+    #[serde(default)]
+    policers: Vec<PolicerSnapshot>,
+    #[serde(rename = "flow_export", default)]
+    flow_export: Option<FlowExportSnapshot>,
+    #[serde(default)]
     userspace: serde_json::Value,
     #[serde(default)]
     config: serde_json::Value,
@@ -227,6 +245,12 @@ struct SourceNATRuleSnapshot {
     off: bool,
     #[serde(rename = "pool_name", default)]
     pool_name: String,
+    #[serde(rename = "pool_addresses", default)]
+    pool_addresses: Vec<String>,
+    #[serde(rename = "port_low", default)]
+    port_low: u16,
+    #[serde(rename = "port_high", default)]
+    port_high: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -304,6 +328,79 @@ struct ScreenProfileSnapshot {
     udp_flood_threshold: u32,
     #[serde(rename = "syn_flood_threshold", default)]
     syn_flood_threshold: u32,
+    #[serde(rename = "session_limit_src", default)]
+    session_limit_src: u32,
+    #[serde(rename = "session_limit_dst", default)]
+    session_limit_dst: u32,
+    #[serde(rename = "port_scan_threshold", default)]
+    port_scan_threshold: u32,
+    #[serde(rename = "ip_sweep_threshold", default)]
+    ip_sweep_threshold: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct FirewallFilterSnapshot {
+    name: String,
+    #[serde(default)]
+    family: String,
+    #[serde(default)]
+    terms: Vec<FirewallTermSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct FirewallTermSnapshot {
+    name: String,
+    #[serde(rename = "source_addresses", default)]
+    source_addresses: Vec<String>,
+    #[serde(rename = "destination_addresses", default)]
+    destination_addresses: Vec<String>,
+    #[serde(default)]
+    protocols: Vec<String>,
+    #[serde(rename = "source_ports", default)]
+    source_ports: Vec<String>,
+    #[serde(rename = "destination_ports", default)]
+    destination_ports: Vec<String>,
+    #[serde(rename = "dscp_values", default)]
+    dscp_values: Vec<u8>,
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    count: String,
+    #[serde(default)]
+    log: bool,
+    #[serde(default)]
+    policer: String,
+    #[serde(rename = "routing_instance", default)]
+    routing_instance: String,
+    #[serde(rename = "forwarding_class", default)]
+    forwarding_class: String,
+    #[serde(rename = "dscp_rewrite", default)]
+    dscp_rewrite: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct PolicerSnapshot {
+    name: String,
+    #[serde(rename = "bandwidth_bps", default)]
+    bandwidth_bps: u64,
+    #[serde(rename = "burst_bytes", default)]
+    burst_bytes: u64,
+    #[serde(rename = "discard_excess", default)]
+    discard_excess: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct FlowExportSnapshot {
+    #[serde(rename = "collector_address", default)]
+    collector_address: String,
+    #[serde(rename = "collector_port", default)]
+    collector_port: u16,
+    #[serde(rename = "sampling_rate", default)]
+    sampling_rate: u32,
+    #[serde(rename = "active_timeout", default)]
+    active_timeout: u32,
+    #[serde(rename = "inactive_timeout", default)]
+    inactive_timeout: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

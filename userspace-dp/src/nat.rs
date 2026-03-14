@@ -3,6 +3,7 @@ use crate::prefix::{PrefixV4, PrefixV6};
 use ipnet::IpNet;
 use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct NatDecision {
@@ -51,6 +52,81 @@ impl NatDecision {
     }
 }
 
+/// Round-robin port allocator for pool-mode SNAT.
+///
+/// Each pool address gets its own atomic counter. Ports are allocated by
+/// incrementing the counter and wrapping within [port_low, port_high].
+/// No per-port tracking — session expiry naturally frees ports.
+#[derive(Debug)]
+pub(crate) struct PortAllocator {
+    /// One atomic counter per pool address, used for round-robin port allocation.
+    counters: Vec<AtomicU32>,
+    /// Index for round-robin address selection.
+    addr_counter: AtomicU32,
+    pub(crate) port_low: u16,
+    pub(crate) port_high: u16,
+}
+
+impl Clone for PortAllocator {
+    fn clone(&self) -> Self {
+        Self {
+            counters: self
+                .counters
+                .iter()
+                .map(|c| AtomicU32::new(c.load(Ordering::Relaxed)))
+                .collect(),
+            addr_counter: AtomicU32::new(self.addr_counter.load(Ordering::Relaxed)),
+            port_low: self.port_low,
+            port_high: self.port_high,
+        }
+    }
+}
+
+impl Default for PortAllocator {
+    fn default() -> Self {
+        Self {
+            counters: Vec::new(),
+            addr_counter: AtomicU32::new(0),
+            port_low: 1024,
+            port_high: 65535,
+        }
+    }
+}
+
+impl PortAllocator {
+    pub(crate) fn new(num_addresses: usize, port_low: u16, port_high: u16) -> Self {
+        let counters = (0..num_addresses)
+            .map(|_| AtomicU32::new(0))
+            .collect();
+        Self {
+            counters,
+            addr_counter: AtomicU32::new(0),
+            port_low,
+            port_high,
+        }
+    }
+
+    /// Pick the next pool address index (round-robin).
+    pub(crate) fn next_address_index(&self) -> usize {
+        if self.counters.is_empty() {
+            return 0;
+        }
+        let idx = self.addr_counter.fetch_add(1, Ordering::Relaxed);
+        (idx as usize) % self.counters.len()
+    }
+
+    /// Allocate the next port for the given address index.
+    pub(crate) fn next_port(&self, addr_index: usize) -> u16 {
+        let range = (self.port_high as u32).saturating_sub(self.port_low as u32) + 1;
+        if range == 0 || addr_index >= self.counters.len() {
+            return self.port_low;
+        }
+        let counter = &self.counters[addr_index];
+        let val = counter.fetch_add(1, Ordering::Relaxed);
+        self.port_low + (val % range) as u16
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SourceNatRule {
     pub(crate) from_zone: String,
@@ -61,6 +137,9 @@ pub(crate) struct SourceNatRule {
     pub(crate) destination_v6: Vec<PrefixV6>,
     pub(crate) interface_mode: bool,
     pub(crate) off: bool,
+    pub(crate) pool_addresses_v4: Vec<Ipv4Addr>,
+    pub(crate) pool_addresses_v6: Vec<Ipv6Addr>,
+    pub(crate) pool_allocator: PortAllocator,
 }
 
 impl SourceNatRule {
@@ -107,6 +186,23 @@ pub(crate) fn parse_source_nat_rules(snaps: &[SourceNATRuleSnapshot]) -> Vec<Sou
                 Err(_) => {}
             }
         }
+        // Parse pool addresses and port range for pool-mode SNAT.
+        for addr_str in &snap.pool_addresses {
+            // Pool addresses may be bare IPs or /32 CIDRs — strip the mask.
+            let ip_str = addr_str.split('/').next().unwrap_or(addr_str);
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                match ip {
+                    IpAddr::V4(v4) => rule.pool_addresses_v4.push(v4),
+                    IpAddr::V6(v6) => rule.pool_addresses_v6.push(v6),
+                }
+            }
+        }
+        let total_pool = rule.pool_addresses_v4.len() + rule.pool_addresses_v6.len();
+        if total_pool > 0 {
+            let port_low = if snap.port_low > 0 { snap.port_low } else { 1024 };
+            let port_high = if snap.port_high > 0 { snap.port_high } else { 65535 };
+            rule.pool_allocator = PortAllocator::new(total_pool, port_low, port_high);
+        }
         out.push(rule);
     }
     out
@@ -138,6 +234,39 @@ pub(crate) fn match_source_nat(
                 rewrite_dst: None,
                 ..NatDecision::default()
             });
+        }
+        // Pool-mode SNAT: pick address round-robin, allocate port.
+        match src_ip {
+            IpAddr::V4(_) if !rule.pool_addresses_v4.is_empty() => {
+                let addr_idx = rule.pool_allocator.next_address_index();
+                // addr_idx is mod total_pool; v4 addresses are at indices 0..v4_len
+                let v4_idx = addr_idx % rule.pool_addresses_v4.len();
+                let pool_addr = rule.pool_addresses_v4[v4_idx];
+                let port = rule.pool_allocator.next_port(addr_idx);
+                return Some(NatDecision {
+                    rewrite_src: Some(IpAddr::V4(pool_addr)),
+                    rewrite_dst: None,
+                    rewrite_src_port: Some(port),
+                    rewrite_dst_port: None,
+                    ..NatDecision::default()
+                });
+            }
+            IpAddr::V6(_) if !rule.pool_addresses_v6.is_empty() => {
+                let addr_idx = rule.pool_allocator.next_address_index();
+                // v6 addresses are stored after v4 addresses in the allocator
+                let v6_offset = rule.pool_addresses_v4.len();
+                let v6_idx = (addr_idx.wrapping_sub(v6_offset)) % rule.pool_addresses_v6.len();
+                let pool_addr = rule.pool_addresses_v6[v6_idx];
+                let port = rule.pool_allocator.next_port(addr_idx);
+                return Some(NatDecision {
+                    rewrite_src: Some(IpAddr::V6(pool_addr)),
+                    rewrite_dst: None,
+                    rewrite_src_port: Some(port),
+                    rewrite_dst_port: None,
+                    ..NatDecision::default()
+                });
+            }
+            _ => {}
         }
         return Some(NatDecision::default());
     }
@@ -963,5 +1092,246 @@ mod tests {
         let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443).unwrap();
         assert_eq!(decision.rewrite_dst, Some("192.168.1.100".parse().unwrap()));
         assert_eq!(decision.rewrite_dst_port, None);
+    }
+
+    // --- Pool-mode SNAT tests ---
+
+    #[test]
+    fn pool_snat_single_address_rewrites_src_and_port() {
+        let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+            name: "pool-snat".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "my-pool".to_string(),
+            pool_addresses: vec!["203.0.113.1/32".to_string()],
+            port_low: 1024,
+            port_high: 65535,
+            ..SourceNATRuleSnapshot::default()
+        }]);
+        let decision = match_source_nat(
+            &rules,
+            "lan",
+            "wan",
+            "10.0.1.100".parse().expect("src"),
+            "8.8.8.8".parse().expect("dst"),
+            None,
+            None,
+        );
+        let d = decision.expect("should match pool rule");
+        assert_eq!(d.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+        assert!(d.rewrite_src_port.is_some());
+        let port = d.rewrite_src_port.unwrap();
+        assert!(port >= 1024 && port <= 65535, "port {} out of range", port);
+        assert_eq!(d.rewrite_dst, None);
+        assert_eq!(d.rewrite_dst_port, None);
+    }
+
+    #[test]
+    fn pool_snat_multiple_addresses_round_robin() {
+        let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+            name: "pool-multi".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "multi-pool".to_string(),
+            pool_addresses: vec![
+                "203.0.113.1".to_string(),
+                "203.0.113.2".to_string(),
+                "203.0.113.3".to_string(),
+            ],
+            port_low: 1024,
+            port_high: 65535,
+            ..SourceNATRuleSnapshot::default()
+        }]);
+        let mut seen_addrs = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let d = match_source_nat(
+                &rules,
+                "lan",
+                "wan",
+                "10.0.1.100".parse().unwrap(),
+                "8.8.8.8".parse().unwrap(),
+                None,
+                None,
+            )
+            .expect("should match");
+            if let Some(IpAddr::V4(addr)) = d.rewrite_src {
+                seen_addrs.insert(addr);
+            }
+        }
+        // After 6 allocations across 3 addresses, all should have been used.
+        assert_eq!(seen_addrs.len(), 3, "expected round-robin across all 3 addresses, got {:?}", seen_addrs);
+    }
+
+    #[test]
+    fn pool_snat_port_range_wrapping() {
+        let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+            name: "small-range".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "small".to_string(),
+            pool_addresses: vec!["203.0.113.1".to_string()],
+            port_low: 10000,
+            port_high: 10002,
+            ..SourceNATRuleSnapshot::default()
+        }]);
+        let mut ports = Vec::new();
+        for _ in 0..6 {
+            let d = match_source_nat(
+                &rules,
+                "lan",
+                "wan",
+                "10.0.1.100".parse().unwrap(),
+                "8.8.8.8".parse().unwrap(),
+                None,
+                None,
+            )
+            .expect("should match");
+            ports.push(d.rewrite_src_port.unwrap());
+        }
+        // With range [10000, 10002] (3 ports), allocations should wrap.
+        assert_eq!(ports[0], 10000);
+        assert_eq!(ports[1], 10001);
+        assert_eq!(ports[2], 10002);
+        assert_eq!(ports[3], 10000);
+        assert_eq!(ports[4], 10001);
+        assert_eq!(ports[5], 10002);
+    }
+
+    #[test]
+    fn pool_snat_combined_with_dnat() {
+        // Pre-routing DNAT decision
+        let dnat = NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        };
+        // Post-policy pool SNAT decision
+        let snat = NatDecision {
+            rewrite_src: Some("203.0.113.1".parse().unwrap()),
+            rewrite_src_port: Some(40000),
+            ..NatDecision::default()
+        };
+        let merged = dnat.merge(snat);
+        assert_eq!(merged.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
+        assert_eq!(merged.rewrite_dst_port, Some(8080));
+        assert_eq!(merged.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+        assert_eq!(merged.rewrite_src_port, Some(40000));
+    }
+
+    #[test]
+    fn pool_snat_reverse_session_key() {
+        let decision = NatDecision {
+            rewrite_src: Some("203.0.113.1".parse().unwrap()),
+            rewrite_src_port: Some(40000),
+            ..NatDecision::default()
+        };
+        let reversed = decision.reverse(
+            "10.0.1.100".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+            12345,
+            443,
+        );
+        assert_eq!(reversed.rewrite_src, None);
+        assert_eq!(reversed.rewrite_dst, Some("10.0.1.100".parse().unwrap()));
+        assert_eq!(reversed.rewrite_src_port, None);
+        assert_eq!(reversed.rewrite_dst_port, Some(12345));
+    }
+
+    #[test]
+    fn pool_snat_v6_single_address() {
+        let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+            name: "pool-v6".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["::/0".to_string()],
+            pool_name: "v6-pool".to_string(),
+            pool_addresses: vec!["2001:db8::1".to_string()],
+            port_low: 2000,
+            port_high: 3000,
+            ..SourceNATRuleSnapshot::default()
+        }]);
+        let decision = match_source_nat(
+            &rules,
+            "lan",
+            "wan",
+            "fd00::100".parse().expect("src"),
+            "2001:db8:1::1".parse().expect("dst"),
+            None,
+            None,
+        );
+        let d = decision.expect("should match pool v6 rule");
+        assert_eq!(d.rewrite_src, Some("2001:db8::1".parse().unwrap()));
+        assert!(d.rewrite_src_port.is_some());
+        let port = d.rewrite_src_port.unwrap();
+        assert!(port >= 2000 && port <= 3000, "port {} out of range", port);
+    }
+
+    #[test]
+    fn pool_snat_default_port_range() {
+        // When port_low and port_high are 0, defaults to 1024..65535
+        let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+            name: "default-range".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "default".to_string(),
+            pool_addresses: vec!["203.0.113.1".to_string()],
+            port_low: 0,
+            port_high: 0,
+            ..SourceNATRuleSnapshot::default()
+        }]);
+        let d = match_source_nat(
+            &rules,
+            "lan",
+            "wan",
+            "10.0.1.100".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+            None,
+            None,
+        )
+        .expect("should match");
+        let port = d.rewrite_src_port.unwrap();
+        assert!(port >= 1024 && port <= 65535, "port {} out of default range", port);
+    }
+
+    #[test]
+    fn pool_snat_zone_mismatch_returns_none() {
+        let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+            name: "pool-zone".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "p".to_string(),
+            pool_addresses: vec!["203.0.113.1".to_string()],
+            port_low: 1024,
+            port_high: 65535,
+            ..SourceNATRuleSnapshot::default()
+        }]);
+        assert!(match_source_nat(
+            &rules,
+            "dmz",  // wrong from_zone
+            "wan",
+            "10.0.1.100".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+            None,
+            None,
+        ).is_none());
+    }
+
+    #[test]
+    fn port_allocator_basic() {
+        let alloc = PortAllocator::new(2, 5000, 5002);
+        // Address selection round-robin
+        assert_eq!(alloc.next_address_index(), 0);
+        assert_eq!(alloc.next_address_index(), 1);
+        assert_eq!(alloc.next_address_index(), 0);
+        // Port allocation for address 0
+        assert_eq!(alloc.next_port(0), 5000);
+        assert_eq!(alloc.next_port(0), 5001);
+        assert_eq!(alloc.next_port(0), 5002);
+        assert_eq!(alloc.next_port(0), 5000); // wraps
     }
 }

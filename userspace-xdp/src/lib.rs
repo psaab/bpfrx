@@ -438,24 +438,9 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             );
             return Ok(cpumap_or_pass(ctrl));
         }
-        // Only redirect connection-initiating packets (SYN for TCP).
-        // Non-SYN TCP without a session is a stray — dropping is safe,
-        // TCP retransmit recovers. Falling back to legacy BPF is fatal
-        // (no matching session → RST kills the real connection).
-        if !is_connection_initiating(&parsed) {
-            record_trace(
-                ctrl.flags,
-                ingress_ifindex,
-                rx_queue_index,
-                selected_queue,
-                binding.slot,
-                USERSPACE_TRACE_STAGE_NO_SESSION,
-                USERSPACE_FALLBACK_REASON_NO_SESSION,
-                &parsed,
-            );
-            incr_fallback_stat(USERSPACE_FALLBACK_REASON_NO_SESSION);
-            return Ok(xdp_action::XDP_DROP);
-        }
+        // Let all session misses through to the userspace dataplane.
+        // The userspace DP will evaluate policy and either create a
+        // session (new flow) or drop (stale non-SYN TCP / policy deny).
     }
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };

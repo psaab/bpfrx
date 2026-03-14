@@ -100,6 +100,8 @@ const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const PROTO_ICMP: u8 = 1;
 const PROTO_ICMPV6: u8 = 58;
+const PROTO_GRE: u8 = 47;
+const PROTO_ESP: u8 = 50;
 const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_RST: u8 = 0x04;
 const TCP_FLAG_PSH: u8 = 0x08;
@@ -990,6 +992,14 @@ struct ForwardingState {
     nat64: Nat64State,
     nptv6: Nptv6State,
     screen_profiles: FastMap<String, ScreenProfile>,
+    /// Ifindexes of tunnel interfaces (GRE, ip6gre, XFRM) that deliver raw IP.
+    tunnel_interfaces: FastSet<i32>,
+    /// Firewall filter state for input filtering.
+    filter_state: crate::filter::FilterState,
+    /// GRE performance acceleration: extract GRE key into session ports.
+    gre_acceleration: bool,
+    /// Flow export configuration (NetFlow v9).
+    flow_export_config: Option<crate::flowexport::FlowExportConfig>,
     /// TCP MSS clamping: max MSS for all TCP SYN/SYN-ACK packets (0 = disabled).
     tcp_mss_all_tcp: u16,
     /// TCP MSS clamping for IPsec VPN traffic (0 = disabled).
@@ -2181,6 +2191,39 @@ fn poll_binding(
                                     continue;
                                 }
                             }
+                        }
+                    }
+                    // IPsec passthrough: ESP (proto 50) and IKE (UDP 500/4500)
+                    // must be handled by the kernel XFRM subsystem. Send these
+                    // packets to the slow-path TUN device so the kernel can
+                    // encrypt/decrypt via XFRM, then recycle the UMEM frame.
+                    if let Some(flow) = flow.as_ref() {
+                        if is_ipsec_traffic(meta.protocol, flow.forward_key.dst_port) {
+                            let ipsec_decision = SessionDecision {
+                                resolution: ForwardingResolution {
+                                    disposition: ForwardingDisposition::LocalDelivery,
+                                    local_ifindex: 0,
+                                    egress_ifindex: 0,
+                                    tx_ifindex: 0,
+                                    next_hop: None,
+                                    neighbor_mac: None,
+                                    src_mac: None,
+                                    tx_vlan_id: 0,
+                                },
+                                nat: NatDecision::default(),
+                            };
+                            maybe_reinject_slow_path(
+                                &ident,
+                                &binding.live,
+                                slow_path,
+                                unsafe { &*area },
+                                desc,
+                                meta,
+                                ipsec_decision,
+                                recent_exceptions,
+                            );
+                            binding.scratch_recycle.push(desc.addr);
+                            continue;
                         }
                     }
                     let mut debug = flow
@@ -6734,6 +6777,10 @@ fn build_screen_profiles(snapshot: &ConfigSnapshot) -> FxHashMap<String, ScreenP
                 icmp_flood_threshold: sp.icmp_flood_threshold,
                 udp_flood_threshold: sp.udp_flood_threshold,
                 syn_flood_threshold: sp.syn_flood_threshold,
+                session_limit_src: sp.session_limit_src,
+                session_limit_dst: sp.session_limit_dst,
+                port_scan_threshold: sp.port_scan_threshold,
+                ip_sweep_threshold: sp.ip_sweep_threshold,
             },
         );
     }
@@ -6783,6 +6830,9 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                     }
                 }
             }
+        }
+        if iface.tunnel {
+            state.tunnel_interfaces.insert(iface.ifindex);
         }
         if let Some(mac) = parse_mac(&iface.hardware_addr) {
             mac_by_ifindex.insert(iface.ifindex, mac);
@@ -6956,6 +7006,18 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     state.tcp_mss_ipsec_vpn = snapshot.flow.tcp_mss_ipsec_vpn;
     state.tcp_mss_gre_in = snapshot.flow.tcp_mss_gre_in;
     state.tcp_mss_gre_out = snapshot.flow.tcp_mss_gre_out;
+    // Build filter state from snapshot
+    state.filter_state = crate::filter::parse_filter_state(&snapshot.filters, &snapshot.policers, &snapshot.interfaces, &snapshot.flow.lo0_filter_input_v4, &snapshot.flow.lo0_filter_input_v6);
+    // Build flow export config from snapshot
+    state.flow_export_config = snapshot.flow_export.as_ref().and_then(|fe| {
+        let addr = format!("{}:{}", fe.collector_address, fe.collector_port);
+        addr.parse::<std::net::SocketAddr>().ok().map(|collector| crate::flowexport::FlowExportConfig {
+            collector,
+            sampling_rate: fe.sampling_rate,
+            active_timeout_secs: fe.active_timeout as u64,
+            inactive_timeout_secs: fe.inactive_timeout as u64,
+        })
+    });
 
     // Add static NAT external IPs as local delivery targets so inbound
     // traffic destined to external IPs is recognized by the firewall.
@@ -7889,6 +7951,13 @@ impl IcmpTeRateLimiter {
         self.count += 1;
         true
     }
+}
+
+/// Returns true if the packet is IPsec traffic (ESP protocol 50 or IKE UDP
+/// ports 500/4500) that should be passed to the kernel for XFRM processing.
+#[inline]
+fn is_ipsec_traffic(protocol: u8, dst_port: u16) -> bool {
+    protocol == PROTO_ESP || (protocol == PROTO_UDP && (dst_port == 500 || dst_port == 4500))
 }
 
 #[cfg(test)]

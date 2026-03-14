@@ -213,53 +213,30 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	if !userspaceSupportsSecurityPolicies(cfg) {
 		addReason("full security policy semantics are not implemented in the userspace dataplane")
 	}
-	if !userspaceSupportsSourceNAT(cfg.Security.NAT.Source) ||
-		(cfg.Security.NAT.Destination != nil && len(cfg.Security.NAT.Destination.RuleSets) > 0) ||
-		hasNonNptv6StaticNAT(cfg) ||
-		cfg.Security.NAT.NATv6v4 != nil {
-		addReason("full NAT features (destination NAT, static NAT, NATv6v4) are not implemented in the userspace dataplane")
+	if !userspaceSupportsSourceNAT(cfg.Security.NAT.Source) {
+		addReason("pool-mode source NAT is not implemented in the userspace dataplane")
 	}
 	// NAT64 is supported — NATv6v4 config (no-v6-frag-header option) is fine
 	// Session timeouts (TCP/UDP/ICMP) are supported — only gate on unsupported flow features
 	// TCP MSS clamping is supported in the userspace dataplane
-	if cfg.Security.Flow.GREPerformanceAcceleration {
-		addReason("GRE acceleration is not implemented in the userspace dataplane")
-	}
+	// GRE acceleration (key extraction into session ports) is supported
 	if !userspaceSupportsScreenProfiles(cfg) {
-		addReason("screen features requiring SYN cookies, port scan, IP sweep, or session limiting are not implemented in the userspace dataplane")
+		addReason("screen features requiring SYN cookies are not implemented in the userspace dataplane")
 	}
-	if len(cfg.Firewall.FiltersInet) > 0 || len(cfg.Firewall.FiltersInet6) > 0 ||
-		len(cfg.Firewall.Policers) > 0 || len(cfg.Firewall.ThreeColorPolicers) > 0 {
-		addReason("firewall filters are not implemented in the userspace dataplane")
+	// Firewall filters and policers are now supported in the userspace dataplane.
+	// Three-color policers remain unsupported.
+	if len(cfg.Firewall.ThreeColorPolicers) > 0 {
+		addReason("three-color policers are not implemented in the userspace dataplane")
 	}
-	if cfg.Security.IPsec.Gateways != nil || cfg.Security.IPsec.VPNs != nil || cfg.Security.IPsec.Policies != nil || cfg.Security.IPsec.IKEPolicies != nil {
-		addReason("IPsec and secure tunnel processing are not implemented in the userspace dataplane")
-	}
-	for _, iface := range cfg.Interfaces.Interfaces {
-		if iface == nil {
-			continue
-		}
-		if iface.Tunnel != nil {
-			addReason("tunnel interfaces are not implemented in the userspace dataplane")
-			break
-		}
-		for _, unit := range iface.Units {
-			if unit != nil && unit.Tunnel != nil {
-				addReason("tunnel interfaces are not implemented in the userspace dataplane")
-				break
-			}
-		}
-		if !caps.ForwardingSupported && len(caps.UnsupportedReasons) > 0 &&
-			caps.UnsupportedReasons[len(caps.UnsupportedReasons)-1] == "tunnel interfaces are not implemented in the userspace dataplane" {
-			break
-		}
-	}
+	// IPsec: kernel XFRM handles ESP encryption/decryption; the userspace
+	// dataplane passes ESP/IKE traffic to the kernel via the slow-path.
+	// Tunnel interfaces (GRE, ip6gre, XFRM) are handled by the eBPF
+	// pipeline which prepends/strips the pseudo-Ethernet header. The
+	// userspace worker detects ESP/IKE and routes to slow-path for XFRM.
 	if cfg.ForwardingOptions.PortMirroring != nil {
 		addReason("port mirroring is not implemented in the userspace dataplane")
 	}
-	if cfg.Services.FlowMonitoring != nil {
-		addReason("flow export offload is not implemented in the userspace dataplane")
-	}
+	// Flow export (NetFlow v9) is now supported in the userspace dataplane.
 	return caps
 }
 
@@ -271,9 +248,8 @@ func userspaceSupportsSecurityPolicies(cfg *config.Config) bool {
 		if pol == nil {
 			continue
 		}
-		if pol.SchedulerName != "" || pol.Count {
-			return false
-		}
+		// SchedulerName and Count are informational — not forwarding-critical.
+		// Schedulers define time windows (not DSCP), and counters are advisory.
 		if !userspacePolicyAddressesSupported(cfg, pol.Match.SourceAddresses) ||
 			!userspacePolicyAddressesSupported(cfg, pol.Match.DestinationAddresses) ||
 			!userspacePolicyApplicationsSupported(cfg, pol.Match.Applications) {
@@ -287,9 +263,6 @@ func userspaceSupportsSecurityPolicies(cfg *config.Config) bool {
 		for _, pol := range zpp.Policies {
 			if pol == nil {
 				continue
-			}
-			if pol.SchedulerName != "" || pol.Count {
-				return false
 			}
 			if !userspacePolicyAddressesSupported(cfg, pol.Match.SourceAddresses) ||
 				!userspacePolicyAddressesSupported(cfg, pol.Match.DestinationAddresses) ||
@@ -556,6 +529,9 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		NAT64:          buildNAT64Snapshots(cfg),
 		Nptv6:          buildNptv6Snapshots(cfg),
 		Screens:        buildScreenSnapshots(cfg),
+		Filters:        buildFirewallFilterSnapshots(cfg),
+		Policers:       buildPolicerSnapshots(cfg),
+		FlowExport:     buildFlowExportSnapshot(cfg),
 		Config:        cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
@@ -739,6 +715,8 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				MTU:             mtu,
 				HardwareAddr:    hardwareAddr,
 				Addresses:       addresses,
+				FilterInputV4:   unit.FilterInputV4,
+				FilterInputV6:   unit.FilterInputV6,
 			})
 		}
 	}
@@ -1421,12 +1399,26 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 		if sp.TCP.SynFlood != nil && sp.TCP.SynFlood.AttackThreshold > 0 {
 			snap.SYNFloodThreshold = uint32(sp.TCP.SynFlood.AttackThreshold)
 		}
+		if sp.LimitSession.SourceIPBased > 0 {
+			snap.SessionLimitSrc = uint32(sp.LimitSession.SourceIPBased)
+		}
+		if sp.LimitSession.DestinationIPBased > 0 {
+			snap.SessionLimitDst = uint32(sp.LimitSession.DestinationIPBased)
+		}
+		if sp.TCP.PortScanThreshold > 0 {
+			snap.PortScanThreshold = uint32(sp.TCP.PortScanThreshold)
+		}
+		if sp.IP.IPSweepThreshold > 0 {
+			snap.IPSweepThreshold = uint32(sp.IP.IPSweepThreshold)
+		}
 		// Only include profiles that have at least one check enabled
 		if snap.Land || snap.SynFin || snap.NoFlag || snap.FinNoAck ||
 			snap.WinNuke || snap.PingDeath || snap.Teardrop ||
 			snap.SourceRoute ||
 			snap.ICMPFloodThreshold > 0 || snap.UDPFloodThreshold > 0 ||
-			snap.SYNFloodThreshold > 0 {
+			snap.SYNFloodThreshold > 0 ||
+			snap.SessionLimitSrc > 0 || snap.SessionLimitDst > 0 ||
+			snap.PortScanThreshold > 0 || snap.IPSweepThreshold > 0 {
 			out = append(out, snap)
 		}
 	}
@@ -1435,28 +1427,15 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 
 // userspaceSupportsScreenProfiles returns true if the configured screen
 // profiles only use checks that the userspace dataplane implements.
-// SYN cookies, port scan/IP sweep tracking, and per-IP session limiting
-// require eBPF-specific facilities and are not supported.
+// SYN cookies require eBPF-specific facilities and are not supported.
+// Port scan detection, IP sweep detection, and per-IP session limiting
+// are now implemented in the userspace dataplane.
 func userspaceSupportsScreenProfiles(cfg *config.Config) bool {
 	if cfg == nil || len(cfg.Security.Screen) == 0 {
 		return true
 	}
 	if cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie" {
 		return false
-	}
-	for _, sp := range cfg.Security.Screen {
-		if sp == nil {
-			continue
-		}
-		if sp.TCP.PortScanThreshold > 0 {
-			return false
-		}
-		if sp.IP.IPSweepThreshold > 0 {
-			return false
-		}
-		if sp.LimitSession.SourceIPBased > 0 || sp.LimitSession.DestinationIPBased > 0 {
-			return false
-		}
 	}
 	return true
 }
@@ -1470,11 +1449,185 @@ func buildFlowSnapshot(cfg *config.Config) FlowSnapshot {
 		TCPMSSGreOut:       cfg.Security.Flow.TCPMSSGreOut,
 		UDPSessionTimeout:  cfg.Security.Flow.UDPSessionTimeout,
 		ICMPSessionTimeout: cfg.Security.Flow.ICMPSessionTimeout,
+		GREAcceleration:    cfg.Security.Flow.GREPerformanceAcceleration,
+		Lo0FilterInputV4:   cfg.System.Lo0FilterInputV4,
+		Lo0FilterInputV6:   cfg.System.Lo0FilterInputV6,
 	}
 	if cfg.Security.Flow.TCPSession != nil {
 		snap.TCPSessionTimeout = cfg.Security.Flow.TCPSession.EstablishedTimeout
 	}
 	return snap
+}
+
+func buildFlowExportSnapshot(cfg *config.Config) *FlowExportSnapshot {
+	if cfg == nil || cfg.Services.FlowMonitoring == nil {
+		return nil
+	}
+	fm := cfg.Services.FlowMonitoring
+	if fm.Version9 == nil || len(fm.Version9.Templates) == 0 {
+		return nil
+	}
+	// Find sampling config for flow server
+	if cfg.ForwardingOptions.Sampling == nil {
+		return nil
+	}
+	for _, inst := range cfg.ForwardingOptions.Sampling.Instances {
+		if inst == nil {
+			continue
+		}
+		rate := inst.InputRate
+		if rate <= 0 {
+			rate = 1
+		}
+		families := []*config.SamplingFamily{inst.FamilyInet, inst.FamilyInet6}
+		for _, fam := range families {
+			if fam == nil {
+				continue
+			}
+			for _, server := range fam.FlowServers {
+				if server == nil || server.Address == "" || server.Port == 0 {
+					continue
+				}
+				snap := &FlowExportSnapshot{
+					CollectorAddress: server.Address,
+					CollectorPort:    server.Port,
+					SamplingRate:     rate,
+				}
+				// Use template config if the server references one
+				if server.Version9Template != "" && fm.Version9.Templates != nil {
+					if tmpl, ok := fm.Version9.Templates[server.Version9Template]; ok {
+						snap.ActiveTimeout = tmpl.FlowActiveTimeout
+						snap.InactiveTimeout = tmpl.FlowInactiveTimeout
+					}
+				}
+				return snap
+			}
+		}
+	}
+	return nil
+}
+
+func buildFirewallFilterSnapshots(cfg *config.Config) []FirewallFilterSnapshot {
+	if cfg == nil {
+		return nil
+	}
+	var out []FirewallFilterSnapshot
+	// inet filters
+	inetNames := make([]string, 0, len(cfg.Firewall.FiltersInet))
+	for name := range cfg.Firewall.FiltersInet {
+		inetNames = append(inetNames, name)
+	}
+	sort.Strings(inetNames)
+	for _, name := range inetNames {
+		filter := cfg.Firewall.FiltersInet[name]
+		if filter == nil {
+			continue
+		}
+		snap := FirewallFilterSnapshot{
+			Name:   name,
+			Family: "inet",
+			Terms:  buildFilterTermSnapshots(filter, cfg),
+		}
+		out = append(out, snap)
+	}
+	// inet6 filters
+	inet6Names := make([]string, 0, len(cfg.Firewall.FiltersInet6))
+	for name := range cfg.Firewall.FiltersInet6 {
+		inet6Names = append(inet6Names, name)
+	}
+	sort.Strings(inet6Names)
+	for _, name := range inet6Names {
+		filter := cfg.Firewall.FiltersInet6[name]
+		if filter == nil {
+			continue
+		}
+		snap := FirewallFilterSnapshot{
+			Name:   name,
+			Family: "inet6",
+			Terms:  buildFilterTermSnapshots(filter, cfg),
+		}
+		out = append(out, snap)
+	}
+	return out
+}
+
+func buildFilterTermSnapshots(filter *config.FirewallFilter, cfg *config.Config) []FirewallTermSnapshot {
+	if filter == nil || len(filter.Terms) == 0 {
+		return nil
+	}
+	terms := make([]FirewallTermSnapshot, 0, len(filter.Terms))
+	for _, term := range filter.Terms {
+		if term == nil {
+			continue
+		}
+		snap := FirewallTermSnapshot{
+			Name:            term.Name,
+			Action:          term.Action,
+			Count:           term.Count,
+			Log:             term.Log,
+			PolicerName:     term.Policer,
+			RoutingInstance: term.RoutingInstance,
+			ForwardingClass: term.ForwardingClass,
+		}
+		// Source addresses (CIDRs)
+		snap.SourceAddresses = append(snap.SourceAddresses, term.SourceAddresses...)
+		// Destination addresses (CIDRs)
+		snap.DestAddresses = append(snap.DestAddresses, term.DestAddresses...)
+		// Protocols
+		if term.Protocol != "" {
+			snap.Protocols = []string{term.Protocol}
+		}
+		// Source ports
+		snap.SourcePorts = append(snap.SourcePorts, term.SourcePorts...)
+		// Destination ports
+		snap.DestPorts = append(snap.DestPorts, term.DestinationPorts...)
+		// DSCP
+		if term.DSCP != "" {
+			if val, ok := dataplane.DSCPValues[strings.ToLower(term.DSCP)]; ok {
+				snap.DSCPValues = []uint8{val}
+			} else if v, err := strconv.Atoi(term.DSCP); err == nil && v >= 0 && v <= 63 {
+				snap.DSCPValues = []uint8{uint8(v)}
+			}
+		}
+		// DSCP rewrite
+		if term.DSCPRewrite != "" {
+			if val, ok := dataplane.DSCPValues[strings.ToLower(term.DSCPRewrite)]; ok {
+				snap.DSCPRewrite = val
+			} else if v, err := strconv.Atoi(term.DSCPRewrite); err == nil && v >= 0 && v <= 63 {
+				snap.DSCPRewrite = uint8(v)
+			}
+		}
+		terms = append(terms, snap)
+	}
+	return terms
+}
+
+func buildPolicerSnapshots(cfg *config.Config) []PolicerSnapshot {
+	if cfg == nil || len(cfg.Firewall.Policers) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Firewall.Policers))
+	for name := range cfg.Firewall.Policers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]PolicerSnapshot, 0, len(names))
+	for _, name := range names {
+		pol := cfg.Firewall.Policers[name]
+		if pol == nil {
+			continue
+		}
+		snap := PolicerSnapshot{
+			Name:         name,
+			BandwidthBps: pol.BandwidthLimit,
+			BurstBytes:   pol.BurstSizeLimit,
+		}
+		if pol.ThenAction == "discard" {
+			snap.DiscardExcess = true
+		}
+		out = append(out, snap)
+	}
+	return out
 }
 
 func buildPolicySnapshots(cfg *config.Config) []PolicyRuleSnapshot {

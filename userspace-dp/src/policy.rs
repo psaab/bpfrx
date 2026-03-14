@@ -2,6 +2,7 @@ use crate::prefix::{PrefixV4, PrefixV6};
 use crate::{PolicyApplicationSnapshot, PolicyRuleSnapshot};
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -24,7 +25,7 @@ impl Default for PolicyAction {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct PolicyRule {
     pub(crate) from_zone: String,
     pub(crate) to_zone: String,
@@ -34,6 +35,23 @@ pub(crate) struct PolicyRule {
     pub(crate) destination_v6: Vec<PrefixV6>,
     pub(crate) applications: Vec<ApplicationMatch>,
     pub(crate) action: PolicyAction,
+    pub(crate) hit_count: AtomicU64,
+}
+
+impl Clone for PolicyRule {
+    fn clone(&self) -> Self {
+        Self {
+            from_zone: self.from_zone.clone(),
+            to_zone: self.to_zone.clone(),
+            source_v4: self.source_v4.clone(),
+            source_v6: self.source_v6.clone(),
+            destination_v4: self.destination_v4.clone(),
+            destination_v6: self.destination_v6.clone(),
+            applications: self.applications.clone(),
+            action: self.action,
+            hit_count: AtomicU64::new(self.hit_count.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,12 +140,14 @@ pub(crate) fn evaluate_policy(
                 if nets_match_v4(&rule.source_v4, src)
                     && nets_match_v4(&rule.destination_v4, dst) =>
             {
+                rule.hit_count.fetch_add(1, Ordering::Relaxed);
                 return rule.action;
             }
             (IpAddr::V6(src), IpAddr::V6(dst))
                 if nets_match_v6(&rule.source_v6, src)
                     && nets_match_v6(&rule.destination_v6, dst) =>
             {
+                rule.hit_count.fetch_add(1, Ordering::Relaxed);
                 return rule.action;
             }
             _ => {}

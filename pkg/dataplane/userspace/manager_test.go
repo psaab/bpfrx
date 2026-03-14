@@ -444,16 +444,90 @@ func TestDeriveUserspaceCapabilitiesDetectsFirewallFeatures(t *testing.T) {
 	cfg.Security.Zones = map[string]*config.ZoneConfig{"trust": {Name: "trust"}}
 	cfg.Security.NAT.Source = []*config.NATRuleSet{{Name: "src"}}
 	cfg.Security.Flow.AllowDNSReply = true
+	// Firewall filters (inet/inet6) and single-rate policers are now supported.
+	// Only three-color policers remain unsupported.
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{"f1": {Name: "f1"}}
-	cfg.Security.IPsec.Gateways = map[string]*config.IPsecGateway{"gw1": {Name: "gw1"}}
 	cfg.Services.FlowMonitoring = &config.FlowMonitoringConfig{}
 
 	caps := deriveUserspaceCapabilities(cfg)
-	if caps.ForwardingSupported {
-		t.Fatal("ForwardingSupported = true, want false")
+	if !caps.ForwardingSupported {
+		t.Fatalf("ForwardingSupported = false; firewall filters and flow monitoring are now supported. Reasons: %+v", caps.UnsupportedReasons)
 	}
-	if len(caps.UnsupportedReasons) < 3 {
-		t.Fatalf("UnsupportedReasons = %+v, want multiple reasons", caps.UnsupportedReasons)
+}
+
+func TestDeriveUserspaceCapabilitiesGatesThreeColorPolicers(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Firewall.ThreeColorPolicers = map[string]*config.ThreeColorPolicerConfig{
+		"tcp1": {Name: "tcp1", CIR: 1000000, CBS: 50000},
+	}
+
+	caps := deriveUserspaceCapabilities(cfg)
+	if caps.ForwardingSupported {
+		t.Fatal("ForwardingSupported = true, want false for three-color policers")
+	}
+	found := false
+	for _, r := range caps.UnsupportedReasons {
+		if r == "three-color policers are not implemented in the userspace dataplane" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected three-color policer unsupported reason, got: %+v", caps.UnsupportedReasons)
+	}
+}
+
+func TestDeriveUserspaceCapabilitiesAllowsFirewallFilters(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"protect-RE": {Name: "protect-RE"},
+	}
+	cfg.Firewall.Policers = map[string]*config.PolicerConfig{
+		"1mbps": {Name: "1mbps", BandwidthLimit: 125000, BurstSizeLimit: 50000},
+	}
+
+	caps := deriveUserspaceCapabilities(cfg)
+	if !caps.ForwardingSupported {
+		t.Fatalf("ForwardingSupported = false, unexpected reasons: %+v", caps.UnsupportedReasons)
+	}
+}
+
+func TestDeriveUserspaceCapabilitiesAllowsIPsecConfig(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.IPsec.Gateways = map[string]*config.IPsecGateway{
+		"gw1": {Name: "gw1"},
+	}
+	cfg.Security.IPsec.VPNs = map[string]*config.IPsecVPN{
+		"vpn1": {Name: "vpn1", Gateway: "gw1"},
+	}
+	caps := deriveUserspaceCapabilities(cfg)
+	if !caps.ForwardingSupported {
+		t.Fatalf("ForwardingSupported = false; IPsec should not gate userspace forwarding. Reasons: %+v", caps.UnsupportedReasons)
+	}
+}
+
+func TestDeriveUserspaceCapabilitiesAllowsTunnelInterfaces(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"st0": {
+			Name:   "st0",
+			Tunnel: &config.TunnelConfig{},
+			Units: map[int]*config.InterfaceUnit{
+				0: {Tunnel: &config.TunnelConfig{}},
+			},
+		},
+	}
+	caps := deriveUserspaceCapabilities(cfg)
+	if !caps.ForwardingSupported {
+		t.Fatalf("ForwardingSupported = false; tunnel interfaces should not gate userspace forwarding. Reasons: %+v", caps.UnsupportedReasons)
+	}
+}
+
+func TestDeriveUserspaceCapabilitiesAllowsFlowMonitoring(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Services.FlowMonitoring = &config.FlowMonitoringConfig{}
+	caps := deriveUserspaceCapabilities(cfg)
+	if !caps.ForwardingSupported {
+		t.Fatalf("ForwardingSupported = false, want true (flow monitoring now supported); reasons: %+v", caps.UnsupportedReasons)
 	}
 }
 
@@ -885,7 +959,7 @@ func TestUserspaceSupportsScreenProfilesRejectsSynCookie(t *testing.T) {
 	}
 }
 
-func TestUserspaceSupportsScreenProfilesRejectsPortScan(t *testing.T) {
+func TestUserspaceSupportsScreenProfilesAllowsPortScan(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Screen = map[string]*config.ScreenProfile{
 		"scan": {
@@ -893,12 +967,12 @@ func TestUserspaceSupportsScreenProfilesRejectsPortScan(t *testing.T) {
 			TCP:  config.TCPScreen{PortScanThreshold: 100},
 		},
 	}
-	if userspaceSupportsScreenProfiles(cfg) {
-		t.Fatal("port scan threshold should not be supported")
+	if !userspaceSupportsScreenProfiles(cfg) {
+		t.Fatal("port scan threshold should now be supported in userspace dataplane")
 	}
 }
 
-func TestUserspaceSupportsScreenProfilesRejectsSessionLimit(t *testing.T) {
+func TestUserspaceSupportsScreenProfilesAllowsSessionLimit(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Screen = map[string]*config.ScreenProfile{
 		"limit": {
@@ -906,8 +980,8 @@ func TestUserspaceSupportsScreenProfilesRejectsSessionLimit(t *testing.T) {
 			LimitSession: config.LimitSessionScreen{SourceIPBased: 100},
 		},
 	}
-	if userspaceSupportsScreenProfiles(cfg) {
-		t.Fatal("session limiting should not be supported")
+	if !userspaceSupportsScreenProfiles(cfg) {
+		t.Fatal("session limiting should now be supported in userspace dataplane")
 	}
 }
 
@@ -1020,5 +1094,130 @@ func TestBuildFlowSnapshotNilTCPSession(t *testing.T) {
 	snap := buildFlowSnapshot(cfg)
 	if snap.TCPSessionTimeout != 0 {
 		t.Fatalf("TCPSessionTimeout = %d, want 0", snap.TCPSessionTimeout)
+	}
+}
+
+func TestBuildInterfaceSnapshotSetsTunnelFlag(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"st0": {
+			Name:   "st0",
+			Tunnel: &config.TunnelConfig{},
+			Units: map[int]*config.InterfaceUnit{
+				0: {},
+			},
+		},
+		"ge-0-0-0": {
+			Name: "ge-0-0-0",
+		},
+	}
+	snaps := buildInterfaceSnapshots(cfg)
+	tunnelFound := false
+	nonTunnelFound := false
+	for _, snap := range snaps {
+		if snap.Name == "st0" || snap.Name == "st0.0" {
+			if !snap.Tunnel {
+				t.Errorf("interface %s: Tunnel = false, want true", snap.Name)
+			}
+			tunnelFound = true
+		}
+		if snap.Name == "ge-0-0-0" {
+			if snap.Tunnel {
+				t.Errorf("interface %s: Tunnel = true, want false", snap.Name)
+			}
+			nonTunnelFound = true
+		}
+	}
+	if !tunnelFound {
+		t.Error("tunnel interface st0/st0.0 not found in snapshots")
+	}
+	if !nonTunnelFound {
+		t.Error("non-tunnel interface ge-0-0-0 not found in snapshots")
+	}
+}
+
+func TestBuildScreenSnapshotsIncludesAdvancedFields(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", ScreenProfile: "advanced"},
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"advanced": {
+			Name: "advanced",
+			TCP:  config.TCPScreen{PortScanThreshold: 100},
+			IP:   config.IPScreen{IPSweepThreshold: 50},
+			LimitSession: config.LimitSessionScreen{
+				SourceIPBased:      200,
+				DestinationIPBased: 300,
+			},
+		},
+	}
+	snaps := buildScreenSnapshots(cfg)
+	if len(snaps) != 1 {
+		t.Fatalf("len(snaps) = %d, want 1", len(snaps))
+	}
+	if snaps[0].PortScanThreshold != 100 {
+		t.Fatalf("PortScanThreshold = %d, want 100", snaps[0].PortScanThreshold)
+	}
+	if snaps[0].IPSweepThreshold != 50 {
+		t.Fatalf("IPSweepThreshold = %d, want 50", snaps[0].IPSweepThreshold)
+	}
+	if snaps[0].SessionLimitSrc != 200 {
+		t.Fatalf("SessionLimitSrc = %d, want 200", snaps[0].SessionLimitSrc)
+	}
+	if snaps[0].SessionLimitDst != 300 {
+		t.Fatalf("SessionLimitDst = %d, want 300", snaps[0].SessionLimitDst)
+	}
+}
+
+func TestBuildFlowExportSnapshot(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Services.FlowMonitoring = &config.FlowMonitoringConfig{
+		Version9: &config.NetFlowV9Config{
+			Templates: map[string]*config.NetFlowV9Template{
+				"tmpl1": {
+					Name:              "tmpl1",
+					FlowActiveTimeout: 120,
+				},
+			},
+		},
+	}
+	cfg.ForwardingOptions.Sampling = &config.SamplingConfig{
+		Instances: map[string]*config.SamplingInstance{
+			"inst1": {
+				Name:      "inst1",
+				InputRate: 100,
+				FamilyInet: &config.SamplingFamily{
+					FlowServers: []*config.FlowServer{
+						{Address: "10.0.1.1", Port: 9995, Version9Template: "tmpl1"},
+					},
+				},
+			},
+		},
+	}
+
+	snap := buildFlowExportSnapshot(cfg)
+	if snap == nil {
+		t.Fatal("expected non-nil flow export snapshot")
+	}
+	if snap.CollectorAddress != "10.0.1.1" {
+		t.Fatalf("CollectorAddress = %q, want 10.0.1.1", snap.CollectorAddress)
+	}
+	if snap.CollectorPort != 9995 {
+		t.Fatalf("CollectorPort = %d, want 9995", snap.CollectorPort)
+	}
+	if snap.SamplingRate != 100 {
+		t.Fatalf("SamplingRate = %d, want 100", snap.SamplingRate)
+	}
+	if snap.ActiveTimeout != 120 {
+		t.Fatalf("ActiveTimeout = %d, want 120", snap.ActiveTimeout)
+	}
+}
+
+func TestBuildFlowExportSnapshotNilWhenNoConfig(t *testing.T) {
+	cfg := &config.Config{}
+	snap := buildFlowExportSnapshot(cfg)
+	if snap != nil {
+		t.Fatal("expected nil flow export snapshot with no config")
 	}
 }
