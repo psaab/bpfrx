@@ -405,6 +405,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		gc := conntrack.NewGC(d.dp, 10*time.Second)
 		d.gc = gc
 
+		// When the userspace dataplane is active, skip BPF session map
+		// GC entirely — sessions are managed in user-space. Without
+		// this, BatchLookup burns ~19% CPU scanning maps not used for
+		// forwarding decisions.
+		if _, ok := d.dp.(userspaceSessionDeltaDrainer); ok {
+			gc.SkipSweep = func() bool { return true }
+		}
+
 		// In cluster mode, GC should only expire sessions when this node
 		// is primary.  The peer primary ages sessions and syncs deletes.
 		if d.cluster != nil {
