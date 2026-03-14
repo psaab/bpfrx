@@ -56,30 +56,25 @@ system {
 | Capability | eBPF (default) | Userspace |
 |------------|---------------|-----------|
 | Stateful forwarding | Yes | Yes |
-| Zone policies | Yes | Yes |
+| Zone + global policies | Yes | Yes |
 | Application matching | Yes | Yes |
-| Source NAT (interface) | Yes | Yes |
-| Source NAT (pool) | Yes | No (fallback) |
+| Source NAT (interface + pool) | Yes | Yes |
 | Destination NAT | Yes | Yes |
 | Static NAT (1:1) | Yes | Yes |
 | NAT64 (IPv6↔IPv4) | Yes | Yes |
 | NPTv6 (RFC 6296) | Yes | Yes |
-| Screen/IDS | Yes | Yes |
-| Firewall filters | Yes | No (fallback) |
-| Global policies | Yes | Yes |
+| Screen/IDS (11 checks) | Yes | Yes |
+| Firewall filters + policers | Yes | Yes |
 | TCP MSS clamping | Yes | Yes |
-| GRE tunnels | Yes | No (fallback) |
-| IPsec / XFRM | Yes | No (fallback) |
-| Policy-based routing | Yes | No (fallback) |
-| ECMP multipath | Yes | Partial |
+| GRE tunnel transit | Yes | Yes (passthrough) |
+| IPsec / XFRM | Yes | Yes (passthrough) |
 | VLANs (802.1Q) | Yes | Yes |
-| Flow export (NetFlow) | Yes | No (fallback) |
-| Per-packet syslog | Yes | No (fallback) |
-| HA cluster | Yes | Yes |
-| Session sync | Yes | Yes |
+| Flow export (NetFlow v9) | Yes | Yes |
+| HA cluster + session sync | Yes | Yes |
+| SYN cookie flood protection | Yes | No (fallback) |
 | Throughput (25G mlx5) | 22+ Gbps | 23+ Gbps |
 
-When "No (fallback)" is listed, the feature is handled by the eBPF pipeline transparently — the userspace dataplane detects unsupported configuration and defers those packets to the kernel BPF path. See [`docs/userspace-dataplane-gaps.md`](docs/userspace-dataplane-gaps.md) for the full gap analysis and priority roadmap.
+The only remaining eBPF fallback is SYN cookie flood protection, which requires kernel-level TCP state. All other features are handled natively by the userspace dataplane. See [`docs/userspace-dataplane-gaps.md`](docs/userspace-dataplane-gaps.md) for details.
 
 ## Architecture
 
