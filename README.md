@@ -63,11 +63,11 @@ system {
 | Destination NAT | Yes | Yes |
 | Static NAT (1:1) | Yes | Yes |
 | NAT64 (IPv6↔IPv4) | Yes | Yes |
-| NPTv6 (RFC 6296) | Yes | No (fallback) |
-| Screen/IDS | Yes | No (fallback) |
+| NPTv6 (RFC 6296) | Yes | Yes |
+| Screen/IDS | Yes | Yes |
 | Firewall filters | Yes | No (fallback) |
 | Global policies | Yes | Yes |
-| TCP MSS clamping | Yes | No (fallback) |
+| TCP MSS clamping | Yes | Yes |
 | GRE tunnels | Yes | No (fallback) |
 | IPsec / XFRM | Yes | No (fallback) |
 | Policy-based routing | Yes | No (fallback) |
