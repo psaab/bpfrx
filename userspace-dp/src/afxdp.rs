@@ -6084,47 +6084,7 @@ fn worker_loop(
                     } else { 0 },
                     binding_summary,
                 );
-                #[cfg(not(feature = "debug-log"))]
-                eprintln!(
-                    "DBG w{}: {:.1}s rx={} tx={} fwd={} local={} sess_hit={} sess_miss={} sess_create={} \
-                     no_route={} miss_neigh={} pol_deny={} ha_inact={} no_egress={} build_fail={} \
-                     tx_err={} meta_err={} other={} enq_ok={} enq_ip={} enq_dir={} enq_cp={} sessions={} \
-                     DIR:trust_rx={}/wan_rx={}/t2w={}/w2t={} NAT:snat={}/dnat={}/none={}/bld_none={} \
-                     SIZE:rx_avg={}/rx_max={}/tx_avg={}/tx_max={}/rx_over={}/seg_miss={} bindings:{}",
-                    worker_id,
-                    secs,
-                    dbg_rx_total,
-                    dbg_tx_total,
-                    dbg_forward_total,
-                    dbg_local_total,
-                    dbg_session_hit,
-                    dbg_session_miss,
-                    dbg_session_create,
-                    dbg_no_route,
-                    dbg_missing_neigh,
-                    dbg_policy_deny,
-                    dbg_ha_inactive,
-                    dbg_no_egress_binding,
-                    dbg_build_fail,
-                    dbg_tx_err,
-                    dbg_metadata_err,
-                    dbg_disposition_other,
-                    dbg_enqueue_ok,
-                    dbg_enqueue_inplace,
-                    dbg_enqueue_direct,
-                    dbg_enqueue_copy,
-                    session_count,
-                    dbg_rx_from_trust, dbg_rx_from_wan,
-                    dbg_fwd_trust_to_wan, dbg_fwd_wan_to_trust,
-                    dbg_nat_snat, dbg_nat_dnat, dbg_nat_none, dbg_frame_build_none,
-                    if dbg_rx_total > 0 { dbg_rx_bytes_total / dbg_rx_total } else { 0 },
-                    dbg_rx_max_frame,
-                    if dbg_enqueue_ok > 0 { dbg_tx_bytes_total / dbg_enqueue_ok } else { 0 },
-                    dbg_tx_max_frame,
-                    dbg_rx_oversized,
-                    dbg_seg_needed_but_none,
-                    binding_summary,
-                );
+                // Non-debug builds: no per-second stats dump (use debug-log feature for verbose output).
                 // Print XDP shim fallback stats — tells us WHY packets stop
                 // being redirected to XSK.
                 if cfg!(feature = "debug-log") {
