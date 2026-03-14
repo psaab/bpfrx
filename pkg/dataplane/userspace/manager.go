@@ -38,15 +38,16 @@ type Manager struct {
 	dataplane.DataPlane
 	inner *dataplane.Manager
 
-	mu           sync.Mutex
-	proc         *exec.Cmd
-	cfg          config.UserspaceConfig
-	clusterHA    bool
-	generation   uint64
-	syncCancel   context.CancelFunc
-	lastStatus   ProcessStatus
-	lastSnapshot *ConfigSnapshot
-	haGroups     map[int]HAGroupStatus
+	mu                 sync.Mutex
+	proc               *exec.Cmd
+	cfg                config.UserspaceConfig
+	clusterHA          bool
+	generation         uint64
+	syncCancel         context.CancelFunc
+	lastStatus         ProcessStatus
+	lastSnapshot       *ConfigSnapshot
+	haGroups           map[int]HAGroupStatus
+	lastIngressIfaces  []uint32
 }
 
 func New() *Manager {
@@ -1647,6 +1648,7 @@ type userspaceCtrlValue struct {
 
 const userspaceMetadataVersion = 4
 const userspaceCtrlFlagCPUMap = 1
+const userspaceCtrlFlagTrace = 2
 
 func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
 	ctrlMap := m.inner.Map("userspace_ctrl")
@@ -1709,16 +1711,13 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 			return fmt.Errorf("delete userspace_bindings %+v: %w", key, err)
 		}
 	}
-	var hbKey uint32
-	var hbVal uint64
-	hbIter := heartbeatMap.Iterate()
-	var hbKeys []uint32
-	for hbIter.Next(&hbKey, &hbVal) {
-		hbKeys = append(hbKeys, hbKey)
-	}
-	for _, key := range hbKeys {
-		if err := heartbeatMap.Delete(key); err != nil {
-			return fmt.Errorf("delete userspace_heartbeat %d: %w", key, err)
+	// Heartbeat map is now an Array — zero used slots instead of deleting.
+	// Slots with value 0 appear as stale (bpf_ktime_get_ns() >> 0) so the
+	// XDP shim correctly refuses to redirect until userspace begins updating.
+	{
+		var zeroHB uint64
+		for slot := uint32(0); slot < uint32(cfg.Workers)*2*16; slot++ {
+			_ = heartbeatMap.Update(slot, zeroHB, ebpf.UpdateAny)
 		}
 	}
 	if err := m.syncIngressIfaceMapLocked(snapshot); err != nil {
@@ -1850,24 +1849,16 @@ func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
 		return errors.New("userspace_ingress_ifaces map not loaded")
 	}
 
-	var (
-		key  uint32
-		val  uint8
-		keys []uint32
-	)
-	iter := ifaceMap.Iterate()
-	for iter.Next(&key, &val) {
-		keys = append(keys, key)
+	// Map is now an Array[1024] — zero previous entries, set new ones to 1.
+	for _, k := range m.lastIngressIfaces {
+		_ = ifaceMap.Update(k, uint8(0), ebpf.UpdateAny)
 	}
-	for _, k := range keys {
-		if err := ifaceMap.Delete(k); err != nil {
-			return fmt.Errorf("delete userspace_ingress_ifaces %d: %w", k, err)
-		}
-	}
+	m.lastIngressIfaces = nil
 	for _, ifindex := range buildUserspaceIngressIfindexes(snapshot) {
 		if err := ifaceMap.Update(ifindex, uint8(1), ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update userspace_ingress_ifaces %d: %w", ifindex, err)
 		}
+		m.lastIngressIfaces = append(m.lastIngressIfaces, ifindex)
 	}
 	return nil
 }

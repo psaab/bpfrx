@@ -49,6 +49,7 @@ const USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION: u32 = 11;
 const USERSPACE_FALLBACK_REASON_NO_SESSION: u32 = 12;
 const USERSPACE_FALLBACK_REASON_MAX: u32 = 16;
 const USERSPACE_CTRL_FLAG_CPUMAP: u32 = 1;
+const USERSPACE_CTRL_FLAG_TRACE: u32 = 2;
 const USERSPACE_TRACE_STAGE_RECEIVED: u32 = 1;
 const USERSPACE_TRACE_STAGE_BINDING_MISSING: u32 = 2;
 const USERSPACE_TRACE_STAGE_BINDING_NOT_READY: u32 = 3;
@@ -224,10 +225,10 @@ static USERSPACE_BINDINGS: HashMap<UserspaceBindingKey, UserspaceBindingValue> =
     HashMap::with_max_entries(4096, 0);
 
 #[map(name = "userspace_ingress_ifaces")]
-static USERSPACE_INGRESS_IFACES: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+static USERSPACE_INGRESS_IFACES: Array<u8> = Array::with_max_entries(1024, 0);
 
 #[map(name = "userspace_heartbeat")]
-static USERSPACE_HEARTBEAT: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
+static USERSPACE_HEARTBEAT: Array<u64> = Array::with_max_entries(4096, 0);
 
 #[map(name = "userspace_xsk_map")]
 static USERSPACE_XSK_MAP: XskMap = XskMap::with_max_entries(4096, 0);
@@ -290,12 +291,13 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     };
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
-    if unsafe { USERSPACE_INGRESS_IFACES.get(&ingress_ifindex) }.is_none() {
+    if USERSPACE_INGRESS_IFACES.get(ingress_ifindex).map_or(true, |v| *v == 0) {
         return Ok(cpumap_or_pass(ctrl));
     }
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
     let selected_queue = select_userspace_queue(ctrl, rx_queue_index, &parsed);
     record_trace(
+        ctrl.flags,
         ingress_ifindex,
         rx_queue_index,
         selected_queue,
@@ -318,6 +320,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
     let Some(binding) = binding else {
         record_trace(
+            ctrl.flags,
             ingress_ifindex,
             rx_queue_index,
             selected_queue,
@@ -334,6 +337,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     };
     if (binding.flags & USERSPACE_BINDING_READY) == 0 {
         record_trace(
+            ctrl.flags,
             ingress_ifindex,
             rx_queue_index,
             selected_queue,
@@ -345,9 +349,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         incr_fallback_stat(USERSPACE_FALLBACK_REASON_BINDING_NOT_READY);
         return Ok(xdp_action::XDP_DROP);
     }
-    let last_heartbeat = unsafe { USERSPACE_HEARTBEAT.get(&binding.slot) };
+    let last_heartbeat = USERSPACE_HEARTBEAT.get(binding.slot);
     let Some(last_heartbeat) = last_heartbeat else {
         record_trace(
+            ctrl.flags,
             ingress_ifindex,
             rx_queue_index,
             selected_queue,
@@ -368,6 +373,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let now_ns = unsafe { bpf_ktime_get_ns() };
     if now_ns < *last_heartbeat || now_ns.saturating_sub(*last_heartbeat) > timeout_ns {
         record_trace(
+            ctrl.flags,
             ingress_ifindex,
             rx_queue_index,
             selected_queue,
@@ -383,6 +389,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let packet_len = data_end.saturating_sub(data);
     if matches!(parsed.protocol, PROTO_ICMP | PROTO_ICMPV6) {
         record_trace(
+            ctrl.flags,
             ingress_ifindex,
             rx_queue_index,
             selected_queue,
@@ -395,6 +402,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
     if should_fallback_early(&parsed) {
         record_trace(
+            ctrl.flags,
             ingress_ifindex,
             rx_queue_index,
             selected_queue,
@@ -407,6 +415,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
     if is_icmp_to_interface_nat_local(&parsed) {
         record_trace(
+            ctrl.flags,
             ingress_ifindex,
             rx_queue_index,
             selected_queue,
@@ -423,6 +432,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     // failure.
     if is_local_destination(&parsed) {
         record_trace(
+            ctrl.flags,
             ingress_ifindex,
             rx_queue_index,
             selected_queue,
@@ -442,6 +452,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     // connection.  Dropping the stray is safe — TCP retransmit recovers.
     if !has_live_userspace_session(&parsed) && !is_connection_initiating(&parsed) {
         record_trace(
+            ctrl.flags,
             ingress_ifindex,
             rx_queue_index,
             selected_queue,
@@ -496,6 +507,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
 
     record_trace(
+        ctrl.flags,
         ingress_ifindex,
         rx_queue_index,
         selected_queue,
@@ -508,6 +520,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         Ok(action) => Ok(action),
         Err(_) => {
             record_trace(
+                ctrl.flags,
                 ingress_ifindex,
                 rx_queue_index,
                 selected_queue,
@@ -550,6 +563,7 @@ fn incr_fallback_stat(reason: u32) {
 }
 
 fn record_trace(
+    ctrl_flags: u32,
     ingress_ifindex: u32,
     rx_queue_index: u32,
     selected_queue: u32,
@@ -558,6 +572,9 @@ fn record_trace(
     reason: u32,
     parsed: &ParsedPacket,
 ) {
+    if (ctrl_flags & USERSPACE_CTRL_FLAG_TRACE) == 0 {
+        return;
+    }
     if matches!(parsed.protocol, PROTO_ICMP | PROTO_ICMPV6) {
         return;
     }
