@@ -1,0 +1,193 @@
+cluster:
+  name: userspace-ha-loss
+  env_file: test/incus/loss-userspace-cluster.env
+  firewall_config: docs/ha-cluster-userspace.conf
+  notes:
+    - VM WAN/LAN VFs are attached with Incus device type `pci`.
+    - Once those VFs are assigned to a VM, the host-side Linux netdev may disappear because the VF is bound to `vfio-pci`.
+    - For the firewall VMs, the PCI address is the authoritative identifier, not a host netdev name.
+    - The test host uses a container NIC, so its LAN VF is expected to resolve to a host netdev via `netdev_for_pci()`.
+  sriov:
+    wan:
+      parent: mlx0
+      vm_vf_pci:
+        node0: "0000:65:00.4"
+        node1: "0000:65:00.5"
+    lan:
+      parent: mlx1
+      vlan: 3667
+      vm_vf_pci:
+        node0: "0000:65:05.4"
+        node1: "0000:65:05.5"
+      host_vf_pci: "0000:65:05.6"
+  bridges:
+    mgmt: incusbr0
+    heartbeat: bpu-hb0
+    fabric: bpu-fab0
+
+instances:
+  bpfrx-userspace-fw0:
+    role: firewall
+    type: vm
+    node_id: 0
+    cluster:
+      peer_address: 10.99.12.2/30
+      fabric_peer_address: 10.99.13.2/30
+      control_interface: em0
+    host_devices:
+      mgmt_bridge:
+        incus_device: eth0
+        host_network: incusbr0
+        guest_nic: enp5s0
+        runtime_name: fxp0
+        zone: mgmt
+      heartbeat_bridge:
+        incus_device: eth1
+        host_network: bpu-hb0
+        guest_nic: enp6s0
+        runtime_name: em0
+        zone: control
+      fabric_bridge:
+        incus_device: eth2
+        host_network: bpu-fab0
+        guest_nic: enp7s0
+        runtime_name: fab0
+        zone: control
+      wan_vf:
+        incus_device: wan-vf
+        attach_mode: pci
+        pci_address: "0000:65:00.4"
+        guest_runtime_name: ge-0-0-2
+        redundant_parent: reth0
+        zone: wan
+        units:
+          - unit: 50
+            vlan_id: 50
+            ipv4: 172.16.50.8/24
+            ipv6: 2001:559:8585:50::8/64
+          - unit: 80
+            vlan_id: 80
+            ipv4: 172.16.80.8/24
+            ipv6: 2001:559:8585:80::8/64
+      lan_vf:
+        incus_device: lan-vf
+        attach_mode: pci
+        pci_address: "0000:65:05.4"
+        host_parent: mlx1
+        host_vlan: 3667
+        guest_runtime_name: ge-0-0-1
+        redundant_parent: reth1
+        zone: lan
+        units:
+          - unit: 0
+            ipv4: 10.0.61.1/24
+            ipv6: 2001:559:8585:ef00::1/64
+    router_advertisement:
+      interface: reth1.0
+      default_lifetime: 180
+      max_advertisement_interval: 30
+      min_advertisement_interval: 10
+      prefixes:
+        - 2001:559:8585:ef00::/64
+      dns_servers:
+        - 2001:4860:4860::8888
+    dhcp_local_server:
+      group: lan-pool
+      interface: reth1.0
+      subnet: 10.0.61.0/24
+      pool: 10.0.61.100-10.0.61.199
+      router: 10.0.61.1
+      dns_server: 8.8.8.8
+
+  bpfrx-userspace-fw1:
+    role: firewall
+    type: vm
+    node_id: 1
+    cluster:
+      peer_address: 10.99.12.1/30
+      fabric_peer_address: 10.99.13.1/30
+      control_interface: em0
+    host_devices:
+      mgmt_bridge:
+        incus_device: eth0
+        host_network: incusbr0
+        guest_nic: enp5s0
+        runtime_name: fxp0
+        zone: mgmt
+      heartbeat_bridge:
+        incus_device: eth1
+        host_network: bpu-hb0
+        guest_nic: enp6s0
+        runtime_name: em0
+        zone: control
+      fabric_bridge:
+        incus_device: eth2
+        host_network: bpu-fab0
+        guest_nic: enp7s0
+        runtime_name: fab1
+        zone: control
+      wan_vf:
+        incus_device: wan-vf
+        attach_mode: pci
+        pci_address: "0000:65:00.5"
+        guest_runtime_name: ge-7-0-2
+        redundant_parent: reth0
+        zone: wan
+        units:
+          - unit: 50
+            vlan_id: 50
+            ipv4: 172.16.50.8/24
+            ipv6: 2001:559:8585:50::8/64
+          - unit: 80
+            vlan_id: 80
+            ipv4: 172.16.80.8/24
+            ipv6: 2001:559:8585:80::8/64
+      lan_vf:
+        incus_device: lan-vf
+        attach_mode: pci
+        pci_address: "0000:65:05.5"
+        host_parent: mlx1
+        host_vlan: 3667
+        guest_runtime_name: ge-7-0-1
+        redundant_parent: reth1
+        zone: lan
+        units:
+          - unit: 0
+            ipv4: 10.0.61.1/24
+            ipv6: 2001:559:8585:ef00::1/64
+
+  cluster-userspace-host:
+    role: test-host
+    type: container
+    host_devices:
+      lan_vf:
+        incus_device: eth0
+        attach_mode: physical
+        pci_address: "0000:65:05.6"
+        host_parent: mlx1
+        host_vlan: 3667
+        host_netdev_resolution: netdev_for_pci("0000:65:05.6")
+        purpose: downstream_lan_client
+    networking:
+      ipv4: 10.0.61.102/24
+      ipv4_gateway: 10.0.61.1
+      ipv6_prefix: 2001:559:8585:ef00::/64
+      ipv6_addressing: router_advertisement
+      expected_default_router: 2001:559:8585:ef00::1
+
+zones:
+  mgmt:
+    interfaces:
+      - fxp0
+  control:
+    interfaces:
+      - em0
+      - fab0
+      - fab1
+  wan:
+    interfaces:
+      - reth0.50
+      - reth0.80
+  lan:
+    interfaces:
+      - reth1.0

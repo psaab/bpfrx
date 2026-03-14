@@ -5,6 +5,18 @@ Date: 2026-03-06
 Note: This is an architecture exploration document. It is intentionally grounded in
 bpfrx's current XDP/TC, HA, and `pkg/dataplane.DataPlane` model.
 
+This file now serves two purposes:
+
+- the target design for the userspace dataplane
+- the current branch status on `userspace-dataplane-rust-wip`
+
+Those are not the same thing. The branch has real Rust AF_XDP forwarding and real
+lab validation on supported non-HA paths, but it is still experimental, incomplete
+for full HA/policy parity, and not yet at performance parity with the legacy XDP/TC
+dataplane. The current isolated HA/fabric cluster on `loss` is intentionally gated
+back to legacy XDP for real traffic until HA ownership and fabric redirect are
+implemented in the Rust dataplane.
+
 ## Executive Summary
 
 If the goal is "use XDP to hand packets to a multithreaded userspace dataplane and
@@ -145,6 +157,25 @@ Recommended language split:
 
 Go is still fine for orchestration, snapshots, HA control, APIs, and service management.
 It is not the language I would choose for the steady-state AF_XDP worker loop.
+
+### Rust boundary in the current plan
+
+For the userspace dataplane path, the XDP handoff program should live in Rust too.
+
+Reason:
+
+- the handoff ABI and AF_XDP queue model are owned by the Rust userspace dataplane
+- keeping the userspace entry path in the same language makes metadata evolution,
+  queue handoff, and future userspace-owned parsing easier to reason about
+- the existing C/libbpf/bpf2go pipeline is still useful for the main firewall path
+  and as the guarded fallback while the Rust dataplane matures
+
+So the current plan is:
+
+- keep the main firewall XDP/TC pipeline in the existing C/libbpf/bpf2go toolchain
+- move the userspace-specific XDP entry and the separate dataplane process to Rust
+- use a narrow fallback boundary from the Rust XDP entry into `xdp_main` until
+  the Rust dataplane owns live forwarding end-to-end
 
 ### Support Envelope
 
@@ -693,12 +724,91 @@ This gives deterministic failure instead of undefined stale forwarding.
 
 ## What an Implementation Would Look Like in bpfrx
 
+### Current repo state
+
+As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-tree:
+
+- `system dataplane-type userspace` is implemented
+- `bpfrxd` can launch a separate Rust helper process
+- a dedicated Rust `xdp_userspace` entry program exists and can hand off to an `XSKMAP`
+- pinned control maps exist for userspace enablement, binding state, and AF_XDP sockets
+- the Rust helper can:
+  - plan per-interface/per-queue bindings
+  - create UMEM and AF_XDP sockets
+  - register sockets into the pinned XSK map
+  - publish helper/binding status through the existing CLI/gRPC surfaces
+  - consume and validate stamped metadata
+  - track config/FIB generation mismatches
+  - resolve stateless forwarding decisions from connected and static routes
+  - recurse through `next-table` static route chains
+  - normalize misclassified IPv6 route snapshots onto `inet6.0`/`*.inet6.0`
+    at runtime so `::/0` and other IPv6 routes do not strand on `inet.0`
+  - refresh neighbor state on-demand on forwarding misses by probing kernel
+    ARP/NDP state and caching live adjacency results per worker
+  - record bounded recent exception summaries
+  - accept synthetic packet injection requests for safe validation on lab clusters
+- `bpfrxd` already publishes interface, address, neighbor, and static-route summaries
+  into the userspace snapshot contract
+- the Rust helper now has a bounded TUN-backed slow path for local-delivery and
+  selected exception traffic, with explicit rate limits and helper-visible status counters
+- the Rust helper now has an initial per-worker session table for routed traffic,
+  including bidirectional keying, lazy expiry, and cached forwarding resolution reuse
+- the Rust helper now has a shared-UMEM worker model across bindings, including
+  in-place rewrite/recycle support for same-worker forwarded traffic
+- the Rust helper now has a first worker-local NAT slice for interface-mode source NAT:
+  ordered source-NAT rule snapshots, ingress/egress zone matching, per-session NAT
+  decisions, forward-path SNAT rewrite, and reverse-path reply DNAT rewrite
+- the Rust helper now has a first worker-local zone-policy slice:
+  ordered zone-pair policy snapshots, default-policy handling, address-book-expanded
+  `any`/CIDR/IP source and destination matching, named application and application-set
+  protocol/port matching, and per-session permit/deny gating before install
+- the Rust helper now has the first HA fabric slice for established traffic:
+  owner-RG-aware session state, HA watchdog enforcement, and plain fabric redirect
+  for existing/synced sessions when the local node is no longer the active owner
+- synced-session import now carries cached egress/VLAN/MAC metadata from the mirrored
+  dataplane session state, and a synced session is promoted back to local ownership on
+  first successful forward so later close/reopen deltas are generated again after failover
+- zone-encoded fabric redirect for brand-new flows to peer-owned RGs is implemented,
+  including ingress-zone override on the receiving node and suppression of fake dynamic
+  neighbor learning from those packets
+
+What is still intentionally not implemented:
+
+- full policy parity: AppID/application-identification matching, global policies,
+  schedulers, counters, and logging semantics
+- shared-memory snapshot regions
+- io_uring-backed slow-path transport beyond bounded TUN reinjection
+- performance parity with the legacy XDP/TC dataplane; current userspace forwarding
+  is still under active perf-guided tuning and should not be described as at-target
+  or production-ready
+
+### Current support boundary
+
+The current branch reality is:
+
+- authoritative validation target: the isolated userspace cluster on `loss`
+- the userspace dataplane can be armed and exercised there
+- the legacy XDP/TC dataplane remains the default and the correctness reference
+- current userspace work is focused on:
+  - forwarding correctness
+  - AF_XDP/Rust hot-path performance
+  - closing the gap to the `22-23 Gbps` target on the isolated lab
+
+Do not read this document as claiming that the userspace dataplane is already a
+drop-in replacement for the existing eBPF dataplane. It is not there yet.
+
+That means the backend is now a real forwarding bring-up target with a real native
+helper, not just a design sketch. It is still experimental and not yet a drop-in
+replacement for the existing eBPF dataplane.
+
 ## Phase 1: Add a new dataplane backend type
 
 Add a new backend type, likely:
 - `TypeAFXDPUring` or `TypeUser`
 
 Keep the existing `DataPlane` interface and implement a new backend alongside eBPF and DPDK.
+
+Status: implemented.
 
 ## Phase 2: Shrink XDP to a front-end classifier
 
@@ -708,6 +818,19 @@ Replace the full XDP tail-call chain on selected interfaces with:
 - HA guard
 - metadata stamp
 - XSK redirect
+
+Status: implemented for supported configs; guarded fallback remains for unsupported configs.
+
+Current `xdp_userspace` behavior:
+- parse
+- metadata stamp
+- gated XSK redirect if a binding is marked ready
+- safe fallback tail call into `xdp_main` otherwise
+
+That means the userspace-specific XDP boundary is now Rust-owned, while the
+existing C pipeline remains the fallback and the non-userspace dataplane.
+
+The remaining missing part is broader feature coverage and parity, not the handoff itself.
 
 ## Phase 3: Build a separate native userspace dataplane process
 
@@ -744,6 +867,26 @@ Recommended internal structure:
 
 Rust is the best default implementation language for this process.
 
+Status: partially implemented.
+
+Implemented today:
+- separate Rust helper process
+- Unix control socket
+- status/state publication
+- AF_XDP socket lifecycle/bootstrap
+- binding/queue planning
+- narrow stateless live-forward path for supported routed traffic
+- initial per-worker session tracking and cached forwarding resolution reuse
+- bounded TUN slow-path reinjection for local-delivery and selected exception traffic
+- synthetic packet validation path
+- shared-UMEM forwarding across bindings with in-place frame reuse on the common
+  same-worker forward path
+
+Not implemented yet:
+- per-worker watchdog maps beyond the current binding heartbeat map
+- full live forwarding parity for HA, NAT, zones/policy, and stateful flows
+- enough hot-path optimization to claim parity with the legacy dataplane
+
 ## Phase 4: Move session/NAT/policy into worker-local tables
 
 Do not preserve the current "global map + GC sweep" design as-is.
@@ -751,6 +894,45 @@ For userspace, the right model is:
 - sharded tables
 - worker-local expiry wheels
 - batched aggregation to control plane
+
+Status: partially implemented.
+
+Implemented today:
+- per-worker session lookup/create/update scaffold for routed no-NAT traffic
+- bidirectional session key installation
+- lazy expiry and session counters in helper status
+- bounded worker-local session delta journals with drainable control-plane export
+- owner RG tagging on worker-local session deltas from the resolved egress interface
+- Go-side bridge from worker-local session deltas into the existing HA/session-sync transport
+- owner-aware HA/session-sync export that prefers RG ownership over pure zone fallback
+- daemon-to-helper propagation of `rg_active` and HA watchdog state
+- HA-aware userspace forwarding resolution that blocks egress on inactive or stale owner RGs
+- flow knob snapshots for `allow-dns-reply` and `allow-embedded-icmp`
+- `allow-dns-reply` bypass handling on the Rust fast path for unsolicited UDP replies from port 53
+- `allow-embedded-icmp` treated as supported because local-destination ICMP error traffic stays on the legacy fallback path
+- interface-mode source NAT rule snapshots from the Go control plane
+- per-session NAT decisions and reply-direction key installation
+- source and destination IP rewrite on the Rust fast path for interface-mode source NAT
+- zone-pair policy snapshots from the Go control plane
+- default-policy permit/deny behavior in the Rust worker
+- per-flow zone policy evaluation before session create/install
+- explicit fabric-link snapshots in the userspace runtime, including parent/overlay ifindex mapping and peer-address visibility
+- userspace helper status and CLI output for tracked `fab0`/`fab1` links
+- plain fabric redirect for established or synced sessions whose owner RG is inactive locally
+- mirrored synced-session install into the Rust workers, including cached egress/VLAN/MAC
+  forwarding metadata from the dataplane session mirror
+- promotion of imported synced sessions back to local ownership on first successful forward
+  so future session deltas are generated again after takeover
+- zone-encoded fabric redirect for brand-new flows to peer-owned RGs
+- receiving-node fabric ingress zone override from the encoded source MAC on `fab0`/`fab1`
+- suppression of fake dynamic-neighbor learning from zone-encoded fabric packets
+
+Not implemented yet:
+- worker-local timer wheels or batched expiry structures beyond lazy GC
+- full HA/fabric parity beyond basic redirect and ingress-zone preservation
+- full NAT parity: destination NAT, static NAT, NAT64, NATv6v4, and pool-based source NAT
+- full policy parity: address-books, applications/AppID, global policies, counters,
+  reject semantics, and logging
 
 ## Phase 5: Use io_uring for the non-AF_XDP parts
 
@@ -762,6 +944,15 @@ Once the packet fast path is correct, add io_uring to:
 - helper socket polling
 
 That is the order that makes architectural sense.
+
+Status: partially implemented.
+
+Implemented today:
+- helper state persistence through `io_uring` with sync fallback
+- slow-path TUN reinjection through `io_uring` with sync fallback
+
+Not implemented yet:
+- io_uring-backed session-sync / export transport
 
 ## Performance Rules If This Must Be Extremely Fast
 
@@ -799,6 +990,14 @@ Required CLI / API surface:
 - `show dataplane xsk`
 - `show dataplane backpressure`
 - `show cluster shard-sync`
+
+Implemented now:
+
+- `show chassis cluster data-plane statistics`
+- `show chassis cluster data-plane interfaces`
+
+Those commands already surface userspace helper state, queue/binding layout, packet
+validation counters, and bounded recent exception summaries.
 
 Without that, bring-up and HA debugging will be mostly guesswork.
 
