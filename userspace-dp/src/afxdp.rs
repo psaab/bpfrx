@@ -1139,6 +1139,7 @@ struct BindingWorker {
     heartbeat_map_fd: c_int,
     session_map_fd: c_int,
     last_heartbeat_update_ns: u64,
+    debug_state_counter: u32,
     last_rx_wake_ns: u64,
     last_tx_wake_ns: u64,
     outstanding_tx: u32,
@@ -1389,7 +1390,7 @@ impl BindingWorker {
             live.set_error(format!("update heartbeat slot: {err}"));
         }
         live.set_max_pending_tx(max_pending_tx);
-        let binding = Self {
+        let mut binding = Self {
             slot: binding.slot,
             queue_id: binding.queue_id,
             worker_id: binding.worker_id,
@@ -1415,6 +1416,7 @@ impl BindingWorker {
             heartbeat_map_fd,
             session_map_fd,
             last_heartbeat_update_ns: init_now,
+            debug_state_counter: 0,
             last_rx_wake_ns: init_now,
             last_tx_wake_ns: init_now,
             outstanding_tx: 0,
@@ -1443,7 +1445,7 @@ impl BindingWorker {
             dbg_rx_wake_sendto_err: 0,
             dbg_rx_wake_sendto_errno: 0,
         };
-        update_binding_debug_state(&binding);
+        update_binding_debug_state(&mut binding);
         Ok(binding)
     }
 
@@ -1844,6 +1846,9 @@ fn poll_binding(
 ) -> bool {
     #[derive(Default)]
     struct BatchCounters {
+        rx_packets: u64,
+        rx_bytes: u64,
+        rx_batches: u64,
         metadata_packets: u64,
         validated_packets: u64,
         validated_bytes: u64,
@@ -1857,6 +1862,21 @@ fn poll_binding(
 
     impl BatchCounters {
         fn flush(&mut self, live: &BindingLiveState) {
+            if self.rx_packets != 0 {
+                live.rx_packets
+                    .fetch_add(self.rx_packets, Ordering::Relaxed);
+                self.rx_packets = 0;
+            }
+            if self.rx_bytes != 0 {
+                live.rx_bytes
+                    .fetch_add(self.rx_bytes, Ordering::Relaxed);
+                self.rx_bytes = 0;
+            }
+            if self.rx_batches != 0 {
+                live.rx_batches
+                    .fetch_add(self.rx_batches, Ordering::Relaxed);
+                self.rx_batches = 0;
+            }
             if self.metadata_packets != 0 {
                 live.metadata_packets
                     .fetch_add(self.metadata_packets, Ordering::Relaxed);
@@ -1957,11 +1977,9 @@ fn poll_binding(
         binding.scratch_forwards.clear();
         let mut rst_teardowns: Vec<(SessionKey, NatDecision)> = Vec::new();
         let mut counters = BatchCounters::default();
-        let mut batch_packets = 0u64;
-        let mut batch_bytes = 0u64;
         while let Some(desc) = received.read() {
-            batch_packets += 1;
-            batch_bytes += desc.len as u64;
+            counters.rx_packets += 1;
+            counters.rx_bytes += desc.len as u64;
             dbg.rx += 1;
             dbg.rx_bytes_total += desc.len as u64;
             if desc.len > dbg.rx_max_frame {
@@ -2872,7 +2890,6 @@ fn poll_binding(
         }
         received.release();
         drop(received);
-        counters.flush(&binding.live);
         let mut pending_forwards = core::mem::take(&mut binding.scratch_forwards);
         for (forward_key, nat) in rst_teardowns {
             teardown_tcp_rst_flow(
@@ -2888,7 +2905,11 @@ fn poll_binding(
                 &mut pending_forwards,
             );
         }
-        let ingress_live = binding.live.clone();
+        // Use raw pointer to avoid Arc::clone (~5% CPU from lock incq).
+        // Safety: the Arc<BindingLiveState> outlives this function call;
+        // binding is borrowed mutably by enqueue_pending_forwards but
+        // ingress_live is only used for read-only error logging inside it.
+        let ingress_live: *const BindingLiveState = &*binding.live;
         enqueue_pending_forwards(
             left,
             binding,
@@ -2897,7 +2918,7 @@ fn poll_binding(
             now_ns,
             forwarding,
             &ident,
-            ingress_live.as_ref(),
+            unsafe { &*ingress_live },
             slow_path,
             recent_exceptions,
             dbg,
@@ -2919,16 +2940,9 @@ fn poll_binding(
                 .extend(binding.scratch_recycle.drain(..));
         }
         let _ = drain_pending_fill(binding, now_ns);
+        counters.rx_batches += 1;
+        counters.flush(&binding.live);
         update_binding_debug_state(binding);
-        binding
-            .live
-            .rx_packets
-            .fetch_add(batch_packets, Ordering::Relaxed);
-        binding
-            .live
-            .rx_bytes
-            .fetch_add(batch_bytes, Ordering::Relaxed);
-        binding.live.rx_batches.fetch_add(1, Ordering::Relaxed);
         did_work = true;
     }
     update_binding_debug_state(binding);
@@ -10268,7 +10282,13 @@ impl BindingLiveState {
     }
 }
 
-fn update_binding_debug_state(binding: &BindingWorker) {
+fn update_binding_debug_state(binding: &mut BindingWorker) {
+    // Use a simple modular counter to avoid 7 atomic stores on every call.
+    // At ~1M calls/sec, checking every 65536 calls ≈ every 65ms.
+    binding.debug_state_counter = binding.debug_state_counter.wrapping_add(1);
+    if binding.debug_state_counter & 0xFFFF != 0 {
+        return;
+    }
     binding
         .live
         .debug_pending_fill_frames
