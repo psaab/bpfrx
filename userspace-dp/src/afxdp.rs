@@ -2908,13 +2908,11 @@ fn build_live_forward_request(
     } else {
         resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
     };
-    // Capture ports from the live UMEM frame — this is the ground truth
-    // for what the NIC delivered.
-    let live_ports = live_frame_ports(area, desc, meta);
     // Verify the UMEM slice is accessible (validates addr/len).
     let _ = area.slice(desc.addr as usize, desc.len as usize)?;
     // Prefer session flow ports (set by conntrack, immune to DMA races),
-    // then live frame ports, then metadata as last resort.
+    // then live frame ports (lazy — only parsed if session ports unavailable),
+    // then metadata as last resort.
     let session_ports = flow.and_then(|f| {
         if f.forward_key.src_port != 0 && f.forward_key.dst_port != 0 {
             Some((f.forward_key.src_port, f.forward_key.dst_port))
@@ -2927,7 +2925,9 @@ fn build_live_forward_request(
     } else {
         None
     };
-    let expected_ports = session_ports.or(live_ports).or(meta_ports);
+    let expected_ports = session_ports
+        .or_else(|| live_frame_ports(area, desc, meta))
+        .or(meta_ports);
     Some(PendingForwardRequest {
         target_ifindex,
         ingress_queue_id: ingress_ident.queue_id,
@@ -3027,11 +3027,7 @@ fn enqueue_pending_forwards(
             ingress_binding.pending_fill_frames.push_back(source_offset);
             continue;
         };
-        let expected_ports = request.expected_ports.or(live_frame_ports_bytes(
-            source_frame,
-            request.meta.addr_family,
-            request.meta.protocol,
-        ));
+        let expected_ports = request.expected_ports;
         let Some(target_binding) = find_target_binding_mut(
             left,
             ingress_binding,
@@ -7995,12 +7991,13 @@ fn build_forwarded_frame_into_from_frame(
     expected_ports: Option<(u16, u16)>,
 ) -> Option<usize> {
     let dst_mac = decision.resolution.neighbor_mac?;
-    let enforced_ports = expected_ports.or(live_frame_ports_bytes(
-        frame,
-        meta.addr_family,
-        meta.protocol,
-    ));
-    let l3 = frame_l3_offset(frame)?;
+    let enforced_ports = expected_ports;
+    // Use meta L3 offset when it's a valid Ethernet header size (14 or 18),
+    // otherwise re-derive from the frame's ethertype.
+    let l3 = match meta.l3_offset {
+        14 | 18 => meta.l3_offset as usize,
+        _ => frame_l3_offset(frame)?,
+    };
     if l3 >= frame.len() {
         return None;
     }
@@ -8091,7 +8088,8 @@ fn build_forwarded_frame_into_from_frame(
                 out[ip_start + 19],
             );
             let old_ttl = out[ip_start + 8];
-            let rel_l4 = packet_rel_l4_offset(&out[ip_start..], meta.addr_family)?;
+            // IHL already computed above — use directly instead of re-parsing.
+            let rel_l4 = ihl;
             let repaired_ports =
                 restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4).unwrap_or(false);
             if apply_nat {
@@ -8118,7 +8116,14 @@ fn build_forwarded_frame_into_from_frame(
             if out[ip_start + 7] <= 1 {
                 return None;
             }
-            let rel_l4 = packet_rel_l4_offset(&out[ip_start..], meta.addr_family)?;
+            // Use meta-derived L4 offset when valid (>= 40 for IPv6 base header,
+            // avoids walking extension headers). Fall back to parsing otherwise.
+            let meta_rel = meta.l4_offset.wrapping_sub(meta.l3_offset) as usize;
+            let rel_l4 = if meta_rel >= 40 && meta.l4_offset > meta.l3_offset {
+                meta_rel
+            } else {
+                packet_rel_l4_offset(&out[ip_start..], meta.addr_family)?
+            };
             let repaired_ports =
                 restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4).unwrap_or(false);
             if apply_nat {
@@ -8238,10 +8243,13 @@ fn rewrite_forwarded_frame_in_place(
     expected_ports: Option<(u16, u16)>,
 ) -> Option<u32> {
     let dst_mac = decision.resolution.neighbor_mac?;
-    let enforced_ports = expected_ports.or(live_frame_ports(area, desc, meta));
+    let enforced_ports = expected_ports;
     let frame = unsafe { area.slice_mut_unchecked(desc.addr as usize, UMEM_FRAME_SIZE as usize)? };
     let current_len = desc.len as usize;
-    let l3 = frame_l3_offset(&frame[..current_len])?;
+    let l3 = match meta.l3_offset {
+        14 | 18 => meta.l3_offset as usize,
+        _ => frame_l3_offset(&frame[..current_len])?,
+    };
     if l3 >= current_len {
         return None;
     }
@@ -8326,7 +8334,7 @@ fn rewrite_forwarded_frame_in_place(
                 packet[ip_start + 19],
             );
             let old_ttl = packet[ip_start + 8];
-            let rel_l4 = packet_rel_l4_offset(&packet[ip_start..], meta.addr_family)?;
+            let rel_l4 = ihl;
             let repaired_ports =
                 restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
             if apply_nat {
@@ -8353,7 +8361,12 @@ fn rewrite_forwarded_frame_in_place(
             if packet[ip_start + 7] <= 1 {
                 return None;
             }
-            let rel_l4 = packet_rel_l4_offset(&packet[ip_start..], meta.addr_family)?;
+            let meta_rel = meta.l4_offset.wrapping_sub(meta.l3_offset) as usize;
+            let rel_l4 = if meta_rel >= 40 && meta.l4_offset > meta.l3_offset {
+                meta_rel
+            } else {
+                packet_rel_l4_offset(&packet[ip_start..], meta.addr_family)?
+            };
             let repaired_ports =
                 restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
             if apply_nat {
@@ -10956,7 +10969,10 @@ mod tests {
         .expect("flow");
         assert_eq!(flow.src_ip, IpAddr::V6(src_ip));
         assert_eq!(flow.dst_ip, IpAddr::V6(dst_ip));
-        assert_eq!(flow.forward_key.src_port, src_port);
+        // When IPs match, parse_session_flow prefers metadata ports over
+        // frame-parsed ports (metadata is stamped by BPF before any DMA
+        // corruption). The meta port (1025) wins over the frame port (50662).
+        assert_eq!(flow.forward_key.src_port, 1025);
         assert_eq!(flow.forward_key.dst_port, dst_port);
     }
 
