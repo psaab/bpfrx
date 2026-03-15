@@ -2609,13 +2609,10 @@ fn poll_binding(
                                 debug.from_zone = Some(from_zone_arc.clone());
                                 debug.to_zone = Some(to_zone_arc.clone());
                             }
-                            if resolution.disposition == ForwardingDisposition::ForwardCandidate {
-                                let owner_rg_id =
-                                    owner_rg_for_flow(forwarding, resolution.egress_ifindex);
-                                if allow_unsolicited_dns_reply(forwarding, flow) {
-                                    // Match the XDP fast path: unsolicited DNS replies bypass
-                                    // policy/session install when the flow knob is enabled.
-                                } else if forwarding.allow_embedded_icmp
+                            // Embedded ICMP NAT reversal: runs for ANY disposition
+                            // because the SNAT'd destination resolves as MissingNeighbor
+                            // (the firewall's own address has no ARP entry).
+                            if forwarding.allow_embedded_icmp
                                     && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
                                     && try_embedded_icmp_session_match(
                                         unsafe { &*area },
@@ -2628,6 +2625,7 @@ fn poll_binding(
                                 {
                                     // ICMP error with an embedded packet matching an existing
                                     // session. Attempt NAT reversal if the session has SNAT.
+                                    eprintln!("ICMP_TE_MATCH: embedded session found, attempting NAT reversal");
                                     if let Some(icmp_match) = try_embedded_icmp_nat_match(
                                         unsafe { &*area },
                                         desc,
@@ -2637,6 +2635,7 @@ fn poll_binding(
                                         dynamic_neighbors,
                                         now_ns,
                                     ) {
+                                        eprintln!("ICMP_TE_NAT: match found, nat={:?} orig_src={} resolution={:?}", icmp_match.nat, icmp_match.original_src, icmp_match.resolution.disposition);
                                         if icmp_match.nat.rewrite_src.is_some() {
                                             let frame_data = unsafe { &*area }
                                                 .slice(desc.addr as usize, desc.len as usize);
@@ -2655,6 +2654,7 @@ fn poll_binding(
                                                     _ => None,
                                                 }
                                             });
+                                            eprintln!("ICMP_TE_BUILD: rewritten={}", rewritten.is_some());
                                             if let Some(rewritten_frame) = rewritten {
                                                 let icmp_decision = SessionDecision {
                                                     resolution: icmp_match.resolution,
@@ -2669,6 +2669,7 @@ fn poll_binding(
                                                             icmp_decision.resolution.egress_ifindex,
                                                         )
                                                     };
+                                                eprintln!("ICMP_TE_TX: target_ifindex={} frame_len={}", target_ifindex, rewritten_frame.len());
                                                 binding.scratch_forwards.push(
                                                     PendingForwardRequest {
                                                         target_ifindex,
@@ -2686,11 +2687,18 @@ fn poll_binding(
                                                 recycle_now = false;
                                             }
                                         }
+                                    } else {
+                                        eprintln!("ICMP_TE_MATCH: nat_match returned None (no forward session found via NAT reverse index)");
                                     }
                                     // Permit without policy check or session install.
                                     // If NAT reversal was applied, the prebuilt frame
-                                    // is already queued. If not, the existing resolution
-                                    // (routing toward the outer dst) handles forwarding.
+                                    // is already queued. If not, fall through to slow-path.
+                                } else if resolution.disposition == ForwardingDisposition::ForwardCandidate {
+                                let owner_rg_id =
+                                    owner_rg_for_flow(forwarding, resolution.egress_ifindex);
+                                if allow_unsolicited_dns_reply(forwarding, flow) {
+                                    // Match the XDP fast path: unsolicited DNS replies bypass
+                                    // policy/session install when the flow knob is enabled.
                                 } else if let PolicyAction::Permit = evaluate_policy(
                                     &forwarding.policy,
                                     &from_zone,
