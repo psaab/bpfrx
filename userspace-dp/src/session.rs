@@ -63,6 +63,14 @@ const PROTO_ICMPV6: u8 = 58;
 const TCP_FIN: u8 = 0x01;
 const TCP_RST: u8 = 0x04;
 
+#[allow(unused_macros)]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "debug-log")]
+        eprintln!($($arg)*);
+    };
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct SessionKey {
     pub addr_family: u8,
@@ -183,9 +191,8 @@ impl SessionTable {
             .collect::<Vec<_>>();
         for key in &stale {
             if let Some(entry) = self.remove_entry(key) {
-                // Log every TCP session expiry with details
                 if key.protocol == PROTO_TCP {
-                    eprintln!(
+                    debug_log!(
                         "SESS_EXPIRE: proto=TCP {}:{} -> {}:{} closing={} age_ns={} timeout_ns={} rev={} synced={} nat=({:?},{:?})",
                         key.src_ip, key.src_port, key.dst_ip, key.dst_port,
                         entry.closing,
@@ -219,11 +226,9 @@ impl SessionTable {
         self.sessions.get_mut(key).map(|entry| {
             if matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
                 if !entry.closing {
-                    // First time marking closing — log it
-                    let flag_str = if (tcp_flags & TCP_RST) != 0 { "RST" } else { "FIN" };
-                    eprintln!(
+                    debug_log!(
                         "SESS_CLOSING: {} proto=TCP {}:{} -> {}:{} rev={} tcp_flags=0x{:02x}",
-                        flag_str,
+                        if (tcp_flags & TCP_RST) != 0 { "RST" } else { "FIN" },
                         key.src_ip, key.src_port, key.dst_ip, key.dst_port,
                         entry.metadata.is_reverse, tcp_flags,
                     );

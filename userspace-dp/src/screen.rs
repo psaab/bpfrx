@@ -96,6 +96,7 @@ impl RateCounter {
 
     /// Reset counter (used in tests).
     #[cfg(test)]
+    #[allow(dead_code)]
     fn reset(&mut self) {
         self.count = 0;
         self.window_start_secs = 0;
@@ -458,6 +459,7 @@ impl ScreenState {
     }
 
     /// Returns true if any zone has session limits, port scan, or IP sweep enabled.
+    #[allow(dead_code)]
     pub fn has_advanced_features(&self) -> bool {
         self.profiles.values().any(|p| {
             p.session_limit_src > 0
@@ -874,7 +876,7 @@ mod tests {
 
     #[test]
     fn teardrop_first_fragment_passes() {
-        let mut state = make_state("trust", default_profile());
+        let _state = make_state("trust", default_profile());
         let pkt = ScreenPacketInfo {
             addr_family: libc::AF_INET as u8,
             protocol: PROTO_TCP,
