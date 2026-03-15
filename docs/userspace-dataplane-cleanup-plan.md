@@ -18,10 +18,9 @@ Related documents:
 Current execution state as of 2026-03-15:
 
 1. Phase 1 is complete and merged on `master` via PR `#222`.
-2. Phase 2 is complete on branch `fix/userspace-phase2-icmp-extract` via
-   PR `#223` and is pending merge.
-3. Phase 5 is partially complete on `master` via PR `#221`.
-4. Phase 3 is the next active cleanup phase.
+2. Phase 2 is complete and merged on `master` via PR `#225`.
+3. Phase 3 is complete on the current branch and is ready for PR review.
+4. Phase 5 is partially complete on `master` via PR `#221`.
 5. Phases 4 and 6 have not started as formal cleanup phases yet.
 
 Latest status-sync update for this document:
@@ -72,10 +71,9 @@ Completed under this plan:
 
 Still left to do at a high level:
 
-1. Start the formal tuple/session authority cleanup in Phase 3.
-2. Clean up AF_XDP queue and frame ownership in Phase 4.
-3. Finish hardening validation coverage in Phase 5.
-4. Only then do the serious sustained-throughput optimization work in Phase 6.
+1. Start the formal AF_XDP queue and frame-ownership cleanup in Phase 4.
+2. Finish hardening validation coverage in Phase 5.
+3. Only then do the serious sustained-throughput optimization work in Phase 6.
 
 ## Current Baseline
 
@@ -253,20 +251,52 @@ Phase 2 result:
 
 ## Phase 3: Tuple Authority And Session Resolution Cleanup
 
-Status: Next Active Phase
+Status: Complete On Branch, Ready For PR
 
-Preparatory work already exists:
+Completed:
 
-1. Recent userspace fixes reduced tuple-authority and embedded-ICMP bugs before
-   this cleanup plan started.
-2. Phase 2 extraction is intentionally setting up this phase by moving ICMP and
-   embedded-ICMP logic into smaller modules first.
+1. Session resolution for the worker fast path is now centralized in
+   [userspace-dp/src/afxdp/session_glue.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/session_glue.rs)
+   instead of being split across direct-hit, shared-hit, and reverse-repair
+   branches inside `afxdp.rs`.
+2. Shared-session lookup and forward-NAT reverse lookup are now centralized via:
+   - `lookup_session_across_scopes(...)`
+   - `lookup_forward_nat_across_scopes(...)`
+3. Reverse-session installation from a forward NAT match is now centralized via:
+   - `install_reverse_session_from_forward_match(...)`
+4. Synced-session promotion is now centralized via:
+   - `maybe_promote_synced_session(...)`
+5. The worker fast path now uses one entrypoint for existing-session resolution:
+   - `resolve_flow_session_decision(...)`
+6. Embedded ICMP and ICMPv6 NAT-reversal lookup now use the same shared/local
+   session and shared/local NAT-reverse helpers rather than maintaining a
+   parallel lookup stack.
+7. Focused Rust tests passed for:
+   - shared session resolution
+   - shared NAT-reverse resolution
+   - IPv4 and IPv6 tuple-authority regressions
+   - IPv4 and IPv6 embedded ICMP return-path handling
+8. Live validation on `loss:bpfrx-userspace-fw0/1` passed after deployment:
+   - userspace forwarding armed on `bpfrx-userspace-fw0`
+   - IPv4 internal reachability to `172.16.80.200`
+   - IPv6 internal reachability to `2001:559:8585:80::200`
+   - IPv4 TTL=1 probe to `1.1.1.1` returns time-exceeded
+   - IPv6 hop-limit=1 probe to `2607:f8b0:4005:814::200e` returns time-exceeded
+   - IPv4 `mtr 1.1.1.1` first hop and destination visibility are correct
+   - IPv6 `mtr 2607:f8b0:4005:814::200e` first hop and destination visibility
+     are correct
+   - single-stream IPv4 and IPv6 `iperf3` both complete through the userspace
+     dataplane
 
-Still left:
+Delivered in:
 
-1. Define one authoritative tuple model per stage and enforce it consistently.
-2. Consolidate reverse-session and NAT-reverse resolution.
-3. Remove duplicated repair logic that still lives inside `afxdp.rs`.
+1. Current branch commits after the Phase 2 base carry the completed Phase 3
+   session-resolution cleanup and the matching documentation update.
+2. Additional note:
+   - the standard validator shell path currently aborts early on TTL probes
+     because `ping -t 1` returns a non-zero exit status even when the expected
+     time-exceeded response is present; this is a Phase 5 validation-script bug,
+     not a Phase 3 dataplane regression
 
 ### Purpose
 
@@ -297,6 +327,13 @@ inconsistent ownership of the packet tuple and NAT state.
 2. Embedded ICMP handling no longer needs special-case repairs sprinkled across
    the worker loop.
 3. Session and NAT regression tests cover both IPv4 and IPv6 return paths.
+
+Phase 3 result:
+
+1. Achieved on the branch and validated live on the isolated userspace HA lab.
+2. The remaining validation issue for traceroute checks is now in the shell
+   harness, not in the Rust dataplane.
+3. The next cleanup phase is Phase 4.
 
 ## Phase 4: AF_XDP Queue, TX, And Recycle Cleanup
 
@@ -411,9 +448,8 @@ Status: Not Started
 
 Why it is still deferred:
 
-1. Phase 3 tuple/session authority cleanup has not started formally yet.
-2. Phase 4 queue/frame lifecycle cleanup has not started formally yet.
-4. Performance work before those phases would stack new tuning on top of code
+1. Phase 4 queue/frame lifecycle cleanup has not started formally yet.
+2. Performance work before that phase would stack new tuning on top of code
    that is still too hard to reason about.
 
 ### Purpose
