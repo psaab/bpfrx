@@ -271,9 +271,9 @@ run_ttl_probe() {
 	local family="$1" target="$2" outfile="$3"
 	local cmd
 	if [[ "$family" == "6" ]]; then
-		cmd="ping -6 -c 1 -W 2 -t 1 ${target} > ${outfile}"
+		cmd="rm -f ${outfile}; if ping -6 -c 1 -W 2 -t 1 ${target} > ${outfile} 2>&1; then :; else rc=\$?; if [[ \$rc -gt 1 ]]; then echo \"ping exited with status \$rc\" >> ${outfile}; exit \$rc; fi; fi"
 	else
-		cmd="ping -c 1 -W 2 -t 1 ${target} > ${outfile}"
+		cmd="rm -f ${outfile}; if ping -c 1 -W 2 -t 1 ${target} > ${outfile} 2>&1; then :; else rc=\$?; if [[ \$rc -gt 1 ]]; then echo \"ping exited with status \$rc\" >> ${outfile}; exit \$rc; fi; fi"
 	fi
 	run_host "$cmd"
 }
@@ -391,18 +391,18 @@ run_iperf_json() {
 }
 
 parse_gbps() {
-	local path="$1"
-	local metrics
-	metrics="$(iperf_metrics "$path")"
+	local metrics="$1"
 	if [[ "$metrics" == ERROR:* ]]; then
 		printf '%s\n' "$metrics"
 		return 0
 	fi
-	python3 -c 'import json,sys; print(f"{json.load(sys.stdin)[\"avg_gbps\"]:.3f}")' <<<"$metrics"
+	python3 -c 'import json,sys; print("{:.3f}".format(json.load(sys.stdin)["avg_gbps"]))' <<<"$metrics"
 }
 
 iperf_metrics() {
 	local path="$1"
+	local local_json
+	local metrics
 	if ! run_host "[ -s ${path} ]" >/dev/null 2>&1; then
 		local err
 		err="$(run_host "cat ${path}.err 2>/dev/null || true")"
@@ -412,7 +412,24 @@ iperf_metrics() {
 		printf 'ERROR:%s\n' "$err"
 		return 0
 	fi
-	run_host "python3 ${IPERF_METRICS} ${path} --tail-window ${IPERF_TAIL_WINDOW} --min-peak-gbps ${IPERF_MIN_PEAK_GBPS} --min-tail-ratio ${IPERF_MIN_TAIL_RATIO} --zero-gbps ${IPERF_ZERO_GBPS} --stall-gbps ${IPERF_STALL_GBPS}"
+	local_json="$(mktemp)"
+	if ! run_host "cat ${path}" >"${local_json}"; then
+		rm -f "${local_json}"
+		printf 'ERROR:failed to fetch iperf3 JSON output from cluster host\n'
+		return 0
+	fi
+	if ! metrics="$(python3 "${IPERF_METRICS}" "${local_json}" \
+		--tail-window "${IPERF_TAIL_WINDOW}" \
+		--min-peak-gbps "${IPERF_MIN_PEAK_GBPS}" \
+		--min-tail-ratio "${IPERF_MIN_TAIL_RATIO}" \
+		--zero-gbps "${IPERF_ZERO_GBPS}" \
+		--stall-gbps "${IPERF_STALL_GBPS}")"; then
+		rm -f "${local_json}"
+		printf 'ERROR:failed to summarize iperf3 JSON output\n'
+		return 0
+	fi
+	rm -f "${local_json}"
+	printf '%s\n' "${metrics}"
 }
 
 validate_sustained_iperf() {
@@ -485,7 +502,7 @@ validate_family() {
 			if [[ "$metrics" == ERROR:* ]]; then
 				die "${label} iperf failed: ${metrics#ERROR:}"
 			fi
-			gbps="$(parse_gbps "$json")"
+			gbps="$(parse_gbps "$metrics")"
 			metrics_line="$(format_metrics_line "$metrics")"
 			validate_sustained_iperf "$label" "$i" "$metrics"
 			if python3 - <<'PY' "$gbps" "$min_gbps" "$MARGINAL_GBPS_EPSILON"
