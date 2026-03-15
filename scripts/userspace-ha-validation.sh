@@ -20,7 +20,10 @@ PREFERRED_ACTIVE_RGS="${PREFERRED_ACTIVE_RGS:-1 2}"
 IPERF_TIMEOUT="${IPERF_TIMEOUT:-$((DURATION + 15))}"
 V4_TEST_TARGET="${V4_TEST_TARGET:-172.16.80.200}"
 V6_TEST_TARGET="${V6_TEST_TARGET:-2001:559:8585:80::200}"
-WAN_TEST_IFACE="${WAN_TEST_IFACE:-ge-0-0-2.80}"
+MTR_V4_TARGET="${MTR_V4_TARGET:-1.1.1.1}"
+MTR_V6_TARGET="${MTR_V6_TARGET:-2607:f8b0:4005:814::200e}"
+MTR_REPORT_CYCLES="${MTR_REPORT_CYCLES:-1}"
+WAN_TEST_IFACE="${WAN_TEST_IFACE:-}"
 IPERF_METRICS="${PROJECT_ROOT}/scripts/iperf-json-metrics.py"
 WITH_PERF=0
 DEPLOY=0
@@ -243,13 +246,100 @@ wait_for_ipv6_default_route() {
 ensure_dualstack_wan_neighbors() {
 	local vm="$1"
 	local mac=""
+	local wan_iface=""
+	if [[ -n "${WAN_TEST_IFACE}" ]]; then
+		wan_iface="${WAN_TEST_IFACE}"
+	else
+		wan_iface="$(run_vm "$vm" "ip -6 route get ${V6_TEST_TARGET} 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\) .*/\\1/p' | head -n 1")"
+		if [[ -z "${wan_iface}" ]]; then
+			wan_iface="$(run_vm "$vm" "ip route get ${V4_TEST_TARGET} 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\) .*/\\1/p' | head -n 1")"
+		fi
+	fi
+	if [[ -z "${wan_iface}" ]]; then
+		die "unable to detect WAN test interface for ${vm}"
+	fi
 	info "ensuring IPv4/IPv6 WAN neighbor state on ${vm}"
 	run_vm "$vm" "ping -6 -c 1 -W 1 ${V6_TEST_TARGET} >/dev/null 2>&1 || true"
-	mac="$(run_vm "$vm" "ip -6 neigh show dev ${WAN_TEST_IFACE} ${V6_TEST_TARGET} 2>/dev/null | sed -n 's/.* lladdr \\([^ ]*\\) .*/\\1/p' | head -n 1")"
+	mac="$(run_vm "$vm" "ip -6 neigh show dev ${wan_iface} ${V6_TEST_TARGET} 2>/dev/null | sed -n 's/.* lladdr \\([^ ]*\\) .*/\\1/p' | head -n 1")"
 	if [[ -z "${mac}" ]]; then
-		die "unable to learn IPv6 neighbor MAC for ${V6_TEST_TARGET} on ${vm}:${WAN_TEST_IFACE}"
+		die "unable to learn IPv6 neighbor MAC for ${V6_TEST_TARGET} on ${vm}:${wan_iface}"
 	fi
-	run_vm "$vm" "ip neigh replace ${V4_TEST_TARGET} lladdr ${mac} nud permanent dev ${WAN_TEST_IFACE}"
+	run_vm "$vm" "ip neigh replace ${V4_TEST_TARGET} lladdr ${mac} nud permanent dev ${wan_iface}"
+}
+
+run_ttl_probe() {
+	local family="$1" target="$2" outfile="$3"
+	local cmd
+	if [[ "$family" == "6" ]]; then
+		cmd="ping -6 -c 1 -W 2 -t 1 ${target} > ${outfile}"
+	else
+		cmd="ping -c 1 -W 2 -t 1 ${target} > ${outfile}"
+	fi
+	run_host "$cmd"
+}
+
+validate_ttl_probe() {
+	local label="$1" path="$2"
+	local output
+	output="$(run_host "cat ${path}")"
+	if ! grep -Eq 'Time to live exceeded|Time exceeded: Hop limit|Time exceeded' <<<"$output"; then
+		die "${label} TTL=1 probe did not return time-exceeded: ${output}"
+	fi
+	printf '%s ttl probe: ok\n' "$label" | tee -a "$summary_file"
+}
+
+run_mtr_report() {
+	local family="$1" target="$2" outfile="$3"
+	local cmd
+	if [[ "$family" == "6" ]]; then
+		cmd="mtr -6 ${target} --report --report-cycles=${MTR_REPORT_CYCLES} > ${outfile}"
+	else
+		cmd="mtr ${target} --report --report-cycles=${MTR_REPORT_CYCLES} > ${outfile}"
+	fi
+	run_host "$cmd"
+}
+
+validate_mtr_report() {
+	local label="$1" path="$2"
+	local report
+	report="$(run_host "cat ${path}")"
+	python3 - <<'PY' "$label" "$report"
+import re
+import sys
+
+label = sys.argv[1]
+report = sys.argv[2]
+hop_lines = [line for line in report.splitlines() if re.match(r"\s*\d+\.\|--", line)]
+if not hop_lines:
+    raise SystemExit(f"{label} mtr produced no hop lines")
+
+first = hop_lines[0]
+last = hop_lines[-1]
+if "???" in first:
+    raise SystemExit(f"{label} mtr first hop unresolved: {first}")
+if "???" in last or "100.0%" in last:
+    raise SystemExit(f"{label} mtr destination unresolved: {last}")
+PY
+	printf '%s mtr: ok\n' "$label" | tee -a "$summary_file"
+}
+
+validate_traceroute_visibility() {
+	local ttl_v4="/tmp/userspace-ttl-v4.txt"
+	local ttl_v6="/tmp/userspace-ttl-v6.txt"
+	local mtr_v4="/tmp/userspace-mtr-v4.txt"
+	local mtr_v6="/tmp/userspace-mtr-v6.txt"
+
+	info "validating IPv4 traceroute visibility via ${MTR_V4_TARGET}"
+	run_ttl_probe 4 "${MTR_V4_TARGET}" "${ttl_v4}"
+	validate_ttl_probe "ipv4" "${ttl_v4}"
+	run_mtr_report 4 "${MTR_V4_TARGET}" "${mtr_v4}"
+	validate_mtr_report "ipv4" "${mtr_v4}"
+
+	info "validating IPv6 traceroute visibility via ${MTR_V6_TARGET}"
+	run_ttl_probe 6 "${MTR_V6_TARGET}" "${ttl_v6}"
+	validate_ttl_probe "ipv6" "${ttl_v6}"
+	run_mtr_report 6 "${MTR_V6_TARGET}" "${mtr_v6}"
+	validate_mtr_report "ipv6" "${mtr_v6}"
 }
 
 if [[ $DEPLOY -eq 1 ]]; then
@@ -284,6 +374,8 @@ run_host "ping -6 -c 2 -W 1 ${V6_TEST_TARGET} >/tmp/userspace-ping-v6.out"
 summary_file="$(mktemp)"
 cleanup() { rm -f "$summary_file"; }
 trap cleanup EXIT
+
+validate_traceroute_visibility
 
 run_iperf_json() {
 	local family="$1" target="$2" outfile="$3"

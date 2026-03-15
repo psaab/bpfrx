@@ -86,12 +86,18 @@ The validator does this in order:
 4. forces `cluster-userspace-host` to keep accepting IPv6 RAs (`accept_ra=2`)
 5. verifies an IPv6 default route on `cluster-userspace-host`
 6. if needed, runs repeated `rdisc6 -1 eth0` to force fresh RA convergence
-7. runs one unmeasured warm-up `iperf3` pass for IPv4 and IPv6
-8. runs repeated IPv4 `iperf3` to `172.16.80.200`
-9. runs repeated IPv6 `iperf3` to `2001:559:8585:80::200`
-10. parses per-interval `iperf3 -J` output and fails if throughput cliffs after startup
-11. retries one marginal near-threshold miss once
-12. optionally records `perf` data on the active firewall
+7. derives the active WAN test interface from the current primary node's route table
+8. runs deterministic TTL-expired probes to:
+   - IPv4 `1.1.1.1`
+   - IPv6 `2607:f8b0:4005:814::200e`
+9. records one-cycle `mtr` reports to those same public IPv4/IPv6 targets
+10. fails if the first hop is unresolved or the destination hop is unresolved
+11. runs one unmeasured warm-up `iperf3` pass for IPv4 and IPv6
+12. runs repeated IPv4 `iperf3` to `172.16.80.200`
+13. runs repeated IPv6 `iperf3` to `2001:559:8585:80::200`
+14. parses per-interval `iperf3 -J` output and fails if throughput cliffs after startup
+15. retries one marginal near-threshold miss once
+16. optionally records `perf` data on the active firewall
 
 ## Target And Interpretation
 
@@ -124,6 +130,21 @@ tree state.
 The validator now treats interval collapse as a separate failure mode from average
 Gbps. A run that peaks high and then drops near zero is a failure even if the short
 overall average still looks superficially acceptable.
+
+The validator also treats traceroute visibility as a standard correctness gate.
+It does not require every internet hop to answer. It does require:
+
+- the firewall hop to answer TTL-expired probes
+- the final destination hop in `mtr` to resolve for both:
+  - `1.1.1.1`
+  - `2607:f8b0:4005:814::200e`
+
+Artifacts kept on `cluster-userspace-host`:
+
+- `/tmp/userspace-ttl-v4.txt`
+- `/tmp/userspace-ttl-v6.txt`
+- `/tmp/userspace-mtr-v4.txt`
+- `/tmp/userspace-mtr-v6.txt`
 
 Short-lived outliers can still happen immediately after rolling deploy while HA
 ownership and RA converge. That is why the validator explicitly waits for IPv6

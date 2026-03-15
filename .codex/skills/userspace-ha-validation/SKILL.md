@@ -38,6 +38,13 @@ What the script enforces:
 - `cluster-userspace-host` is forced to keep accepting IPv6 RAs before route checks
 - `cluster-userspace-host` has an IPv6 default route from RA
 - if the IPv6 default route is missing, repeated `rdisc6 -1 eth0` is run before tests
+- the active WAN test interface is derived from the current primary node's route table, not hardcoded per chassis
+- deterministic TTL-expired probes must work to:
+  - `1.1.1.1`
+  - `2607:f8b0:4005:814::200e`
+- one-cycle `mtr` reports to those two targets must show:
+  - a resolved first hop
+  - a resolved destination hop
 - one unmeasured warm-up `iperf3` pass is run for each address family
 - repeated IPv4 `iperf3` to `172.16.80.200` must stay above threshold
 - repeated IPv6 `iperf3` to `2001:559:8585:80::200` must stay above threshold
