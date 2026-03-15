@@ -235,9 +235,13 @@ logic auditable.
 Phase 2 result:
 
 1. Achieved on the branch and validated live.
-2. The unresolved `virtio_net` AF_XDP fabric bring-up issue remains, but it is
-   now clearly isolated as a runtime capability/problem-space issue rather than
-   a reason to keep `afxdp.rs` as a monolith.
+2. The `virtio_net` fabric AF_XDP bring-up issue is resolved for the current
+   HA lab:
+   - `virtio_net` `ifindex 4` binds cleanly in copy mode via the UMEM-owner
+     path with `bind_flags=0`
+   - `mlx5_core` remains on the existing zerocopy UMEM-owner path
+3. The remaining work now moves cleanly into Phase 3 rather than being blocked
+   on AF_XDP driver bring-up.
 
 ## Phase 3: Tuple Authority And Session Resolution Cleanup
 
@@ -296,11 +300,13 @@ Relevant known issues still left for this phase:
    `userspace-dp/src/afxdp.rs`.
 2. The common forward path and fallback paths still share more queueing logic
    than they should.
-3. AF_XDP driver-specific bring-up behavior is still being clarified, and the
-   `virtio_net` fabric path remains a live investigation topic.
-4. The unresolved fabric issue is specifically that `virtio_net` AF_XDP bind on
-   `ifindex 4` still fails with both currently implemented strategies, even
-   though `mlx5_core` bindings are healthy.
+3. AF_XDP driver-specific bring-up behavior is now understood for the current
+   lab:
+   - `mlx5_core` should stay on the current zerocopy UMEM-owner path
+   - `virtio_net` should stay on the copy-mode UMEM-owner path with
+     `bind_flags=0`
+4. The queue/frame cleanup can now proceed without the `virtio_net` fabric bind
+   problem distorting live validation.
 
 ### Purpose
 
@@ -397,9 +403,8 @@ Status: Not Started
 
 Why it is still deferred:
 
-1. The structural split in Phase 2 is not finished.
-2. Tuple/session authority cleanup has not started formally yet.
-3. Queue/frame lifecycle cleanup has not started formally yet.
+1. Phase 3 tuple/session authority cleanup has not started formally yet.
+2. Phase 4 queue/frame lifecycle cleanup has not started formally yet.
 4. Performance work before those phases would stack new tuning on top of code
    that is still too hard to reason about.
 
@@ -459,7 +464,8 @@ This order is deliberate.
    processing.
 2. Consolidate reverse-session and NAT-reverse lookup paths now that the helper
    clusters live in separate modules.
-3. Continue investigating the unresolved `virtio_net` fabric AF_XDP bind
-   contract without changing the `mlx5_core` path globally.
+3. Keep the resolved driver split intact:
+   - `mlx5_core` on zerocopy UMEM-owner
+   - `virtio_net` on auto-mode copy UMEM-owner
 4. Keep the new traceroute and `mtr` checks as the mandatory correctness gate
    for any Phase 3 or Phase 4 changes.
