@@ -2609,14 +2609,21 @@ fn poll_binding(
                                 debug.from_zone = Some(from_zone_arc.clone());
                                 debug.to_zone = Some(to_zone_arc.clone());
                             }
-                            // Embedded ICMP NAT reversal: runs for ANY disposition
-                            // because the SNAT'd destination resolves as MissingNeighbor
-                            // (the firewall's own address has no ARP entry).
-                            // Go directly to nat_match (includes cross-worker shared
-                            // session lookup) — skip the per-worker-only pre-check.
-                            if forwarding.allow_embedded_icmp
-                                    && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
-                                {
+                            // Embedded ICMP NAT reversal applies only to actual ICMP error
+                            // packets. Echo and other non-error ICMP traffic should follow
+                            // the ordinary policy/session path.
+                            let is_embedded_icmp_error = if forwarding.allow_embedded_icmp
+                                && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+                            {
+                                unsafe { &*area }
+                                    .slice(desc.addr as usize, desc.len as usize)
+                                    .and_then(|fr| fr.get(meta.l4_offset as usize).copied())
+                                    .map(|icmp_type| is_icmp_error(meta.protocol, icmp_type))
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            };
+                            if is_embedded_icmp_error {
                                     if let Some(icmp_match) = try_embedded_icmp_nat_match(
                                         unsafe { &*area },
                                         desc,
@@ -2768,191 +2775,211 @@ fn poll_binding(
                                         }
                                         None
                                     };
-                                    let mut created = 0u64;
-                                    let forward_metadata = SessionMetadata {
-                                        ingress_zone: from_zone_arc.clone(),
-                                        egress_zone: to_zone_arc.clone(),
-                                        owner_rg_id,
-                                        is_reverse: false,
-                                        synced: false,
-                                        nat64_reverse: nat64_info,
-                                    };
-                                    if sessions.install_with_protocol(
-                                        flow.forward_key.clone(),
-                                        decision,
-                                        forward_metadata.clone(),
-                                        now_ns,
-                                        meta.protocol,
-                                        meta.tcp_flags,
-                                    ) {
-                                        let _ = publish_live_session_key(
-                                            binding.session_map_fd,
-                                            &flow.forward_key,
-                                        );
-                                        created += 1;
-                                        let forward_entry = SyncedSessionEntry {
-                                            key: flow.forward_key.clone(),
-                                            decision,
-                                            metadata: forward_metadata,
-                                            protocol: meta.protocol,
-                                            tcp_flags: meta.tcp_flags,
-                                        };
-                                        publish_shared_session(
-                                            shared_sessions,
-                                            shared_nat_sessions,
-                                            &forward_entry,
-                                        );
-                                        replicate_session_upsert(
-                                            peer_worker_commands,
-                                            &forward_entry,
-                                        );
-                                    }
-                                    let reverse_resolution = enforce_ha_resolution_snapshot(
-                                        forwarding,
-                                        ha_state,
-                                        now_secs,
-                                        lookup_forwarding_resolution_with_dynamic(
-                                            forwarding,
-                                            dynamic_neighbors,
-                                            flow.src_ip,
-                                        ),
-                                    );
-                                    // Install the reverse entry even if the initial reply-side
-                                    // resolution is not immediately usable. On live traffic the
-                                    // first server reply can arrive before the reverse neighbor
-                                    // state has converged on every worker, and dropping the reverse
-                                    // entry creation turns that race into a hard policy miss. The
-                                    // hit path re-resolves on demand and can fall back to the
-                                    // cached decision when neighbor convergence is still in flight.
-                                    let reverse_decision = SessionDecision {
-                                        resolution: reverse_resolution,
-                                        nat: decision.nat.reverse(
-                                            flow.src_ip,
-                                            flow.dst_ip,
-                                            flow.forward_key.src_port,
-                                            flow.forward_key.dst_port,
-                                        ),
-                                    };
-                                    // For NAT64: the reverse key is IPv4 (different AF
-                                    // from the forward IPv6 key). The reply arrives as
-                                    // IPv4: src=dst_v4, dst=snat_v4.
-                                    let (reverse_key, reverse_protocol) = if let Some(ref info) = nat64_info {
-                                        let nat = decision.nat;
-                                        let dst_v4 = match nat.rewrite_dst {
-                                            Some(IpAddr::V4(v4)) => v4,
-                                            _ => Ipv4Addr::UNSPECIFIED,
-                                        };
-                                        let snat_v4 = match nat.rewrite_src {
-                                            Some(IpAddr::V4(v4)) => v4,
-                                            _ => Ipv4Addr::UNSPECIFIED,
-                                        };
-                                        // Map protocol: ICMPv6→ICMP for the reverse key.
-                                        let rev_proto = match meta.protocol {
-                                            PROTO_ICMPV6 => PROTO_ICMP,
-                                            p => p,
-                                        };
-                                        let (src_port, dst_port) = if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-                                            (flow.forward_key.src_port, flow.forward_key.dst_port)
-                                        } else {
-                                            (flow.forward_key.dst_port, flow.forward_key.src_port)
-                                        };
-                                        (SessionKey {
-                                            addr_family: libc::AF_INET as u8,
-                                            protocol: rev_proto,
-                                            src_ip: IpAddr::V4(dst_v4),
-                                            dst_ip: IpAddr::V4(snat_v4),
-                                            src_port,
-                                            dst_port,
-                                        }, rev_proto)
+                                    let local_icmp_te = unsafe { &*area }
+                                        .slice(desc.addr as usize, desc.len as usize)
+                                        .and_then(|frame| {
+                                            build_local_time_exceeded_request(
+                                                frame,
+                                                desc,
+                                                meta,
+                                                &ident,
+                                                flow,
+                                                forwarding,
+                                                dynamic_neighbors,
+                                                ha_state,
+                                                now_secs,
+                                            )
+                                        });
+                                    if let Some(request) = local_icmp_te {
+                                        binding.scratch_forwards.push(request);
+                                        recycle_now = false;
                                     } else {
-                                        (flow.reverse_key_with_nat(decision.nat), meta.protocol)
-                                    };
-                                    let _ = reverse_protocol; // used below for install
-                                    let reverse_metadata = SessionMetadata {
-                                        ingress_zone: to_zone_arc,
-                                        egress_zone: from_zone_arc,
-                                        owner_rg_id,
-                                        is_reverse: true,
-                                        synced: false,
-                                        nat64_reverse: nat64_info,
-                                    };
-                                    if sessions.install_with_protocol(
-                                        reverse_key.clone(),
-                                        reverse_decision,
-                                        reverse_metadata.clone(),
-                                        now_ns,
-                                        meta.protocol,
-                                        meta.tcp_flags,
-                                    ) {
-                                        let _ = publish_live_session_key(
-                                            binding.session_map_fd,
-                                            &reverse_key,
-                                        );
-                                        // Verify session keys and log creations (debug-only: BPF syscalls)
-                                        if cfg!(feature = "debug-log") {
-                                            if verify_session_key_in_bpf(binding.session_map_fd, &reverse_key) {
-                                                SESSION_PUBLISH_VERIFY_OK.fetch_add(1, Ordering::Relaxed);
-                                            } else {
-                                                SESSION_PUBLISH_VERIFY_FAIL.fetch_add(1, Ordering::Relaxed);
-                                                debug_log!(
-                                                    "SESS_VERIFY_FAIL: reverse key NOT found after publish! \
-                                                     af={} proto={} {}:{} -> {}:{} (map_fd={})",
-                                                    reverse_key.addr_family, reverse_key.protocol,
-                                                    reverse_key.src_ip, reverse_key.src_port,
-                                                    reverse_key.dst_ip, reverse_key.dst_port,
-                                                    binding.session_map_fd,
-                                                );
-                                            }
-                                            if !verify_session_key_in_bpf(binding.session_map_fd, &flow.forward_key) {
-                                                debug_log!(
-                                                    "SESS_VERIFY_FAIL: forward key NOT found! \
-                                                     af={} proto={} {}:{} -> {}:{}",
-                                                    flow.forward_key.addr_family, flow.forward_key.protocol,
-                                                    flow.forward_key.src_ip, flow.forward_key.src_port,
-                                                    flow.forward_key.dst_ip, flow.forward_key.dst_port,
-                                                );
-                                            }
-                                            let logged = SESSION_CREATIONS_LOGGED.fetch_add(1, Ordering::Relaxed);
-                                            if logged < 10 {
-                                                let fwd = &flow.forward_key;
-                                                debug_log!(
-                                                    "SESS_CREATE[{}]: FWD af={} proto={} {}:{} -> {}:{} \
-                                                     | REV af={} proto={} {}:{} -> {}:{} \
-                                                     | NAT src={:?} dst={:?} \
-                                                     | map_fd={} bpf_entries={}",
-                                                    logged, fwd.addr_family, fwd.protocol,
-                                                    fwd.src_ip, fwd.src_port, fwd.dst_ip, fwd.dst_port,
-                                                    reverse_key.addr_family, reverse_key.protocol,
-                                                    reverse_key.src_ip, reverse_key.src_port,
-                                                    reverse_key.dst_ip, reverse_key.dst_port,
-                                                    decision.nat.rewrite_src, decision.nat.rewrite_dst,
-                                                    binding.session_map_fd,
-                                                    count_bpf_session_entries(binding.session_map_fd),
-                                                );
-                                                dump_bpf_session_entries(binding.session_map_fd, 20);
-                                            }
-                                        }
-                                        created += 1;
-                                        let reverse_entry = SyncedSessionEntry {
-                                            key: reverse_key,
-                                            decision: reverse_decision,
-                                            metadata: reverse_metadata,
-                                            protocol: meta.protocol,
-                                            tcp_flags: meta.tcp_flags,
+                                        let mut created = 0u64;
+                                        let forward_metadata = SessionMetadata {
+                                            ingress_zone: from_zone_arc.clone(),
+                                            egress_zone: to_zone_arc.clone(),
+                                            owner_rg_id,
+                                            is_reverse: false,
+                                            synced: false,
+                                            nat64_reverse: nat64_info,
                                         };
-                                        publish_shared_session(
-                                            shared_sessions,
-                                            shared_nat_sessions,
-                                            &reverse_entry,
+                                        if sessions.install_with_protocol(
+                                            flow.forward_key.clone(),
+                                            decision,
+                                            forward_metadata.clone(),
+                                            now_ns,
+                                            meta.protocol,
+                                            meta.tcp_flags,
+                                        ) {
+                                            let _ = publish_live_session_key(
+                                                binding.session_map_fd,
+                                                &flow.forward_key,
+                                            );
+                                            created += 1;
+                                            let forward_entry = SyncedSessionEntry {
+                                                key: flow.forward_key.clone(),
+                                                decision,
+                                                metadata: forward_metadata,
+                                                protocol: meta.protocol,
+                                                tcp_flags: meta.tcp_flags,
+                                            };
+                                            publish_shared_session(
+                                                shared_sessions,
+                                                shared_nat_sessions,
+                                                &forward_entry,
+                                            );
+                                            replicate_session_upsert(
+                                                peer_worker_commands,
+                                                &forward_entry,
+                                            );
+                                        }
+                                        let reverse_resolution = enforce_ha_resolution_snapshot(
+                                            forwarding,
+                                            ha_state,
+                                            now_secs,
+                                            lookup_forwarding_resolution_with_dynamic(
+                                                forwarding,
+                                                dynamic_neighbors,
+                                                flow.src_ip,
+                                            ),
                                         );
-                                        replicate_session_upsert(
-                                            peer_worker_commands,
-                                            &reverse_entry,
-                                        );
-                                    }
-                                    if created > 0 {
-                                        counters.session_creates += created;
-                                        dbg.session_create += created;
+                                        // Install the reverse entry even if the initial reply-side
+                                        // resolution is not immediately usable. On live traffic the
+                                        // first server reply can arrive before the reverse neighbor
+                                        // state has converged on every worker, and dropping the reverse
+                                        // entry creation turns that race into a hard policy miss. The
+                                        // hit path re-resolves on demand and can fall back to the
+                                        // cached decision when neighbor convergence is still in flight.
+                                        let reverse_decision = SessionDecision {
+                                            resolution: reverse_resolution,
+                                            nat: decision.nat.reverse(
+                                                flow.src_ip,
+                                                flow.dst_ip,
+                                                flow.forward_key.src_port,
+                                                flow.forward_key.dst_port,
+                                            ),
+                                        };
+                                        // For NAT64: the reverse key is IPv4 (different AF
+                                        // from the forward IPv6 key). The reply arrives as
+                                        // IPv4: src=dst_v4, dst=snat_v4.
+                                        let (reverse_key, reverse_protocol) = if let Some(ref info) = nat64_info {
+                                            let nat = decision.nat;
+                                            let dst_v4 = match nat.rewrite_dst {
+                                                Some(IpAddr::V4(v4)) => v4,
+                                                _ => Ipv4Addr::UNSPECIFIED,
+                                            };
+                                            let snat_v4 = match nat.rewrite_src {
+                                                Some(IpAddr::V4(v4)) => v4,
+                                                _ => Ipv4Addr::UNSPECIFIED,
+                                            };
+                                            // Map protocol: ICMPv6→ICMP for the reverse key.
+                                            let rev_proto = match meta.protocol {
+                                                PROTO_ICMPV6 => PROTO_ICMP,
+                                                p => p,
+                                            };
+                                            let (src_port, dst_port) = if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+                                                (flow.forward_key.src_port, flow.forward_key.dst_port)
+                                            } else {
+                                                (flow.forward_key.dst_port, flow.forward_key.src_port)
+                                            };
+                                            (SessionKey {
+                                                addr_family: libc::AF_INET as u8,
+                                                protocol: rev_proto,
+                                                src_ip: IpAddr::V4(dst_v4),
+                                                dst_ip: IpAddr::V4(snat_v4),
+                                                src_port,
+                                                dst_port,
+                                            }, rev_proto)
+                                        } else {
+                                            (flow.reverse_key_with_nat(decision.nat), meta.protocol)
+                                        };
+                                        let _ = reverse_protocol; // used below for install
+                                        let reverse_metadata = SessionMetadata {
+                                            ingress_zone: to_zone_arc,
+                                            egress_zone: from_zone_arc,
+                                            owner_rg_id,
+                                            is_reverse: true,
+                                            synced: false,
+                                            nat64_reverse: nat64_info,
+                                        };
+                                        if sessions.install_with_protocol(
+                                            reverse_key.clone(),
+                                            reverse_decision,
+                                            reverse_metadata.clone(),
+                                            now_ns,
+                                            meta.protocol,
+                                            meta.tcp_flags,
+                                        ) {
+                                            let _ = publish_live_session_key(
+                                                binding.session_map_fd,
+                                                &reverse_key,
+                                            );
+                                            // Verify session keys and log creations (debug-only: BPF syscalls)
+                                            if cfg!(feature = "debug-log") {
+                                                if verify_session_key_in_bpf(binding.session_map_fd, &reverse_key) {
+                                                    SESSION_PUBLISH_VERIFY_OK.fetch_add(1, Ordering::Relaxed);
+                                                } else {
+                                                    SESSION_PUBLISH_VERIFY_FAIL.fetch_add(1, Ordering::Relaxed);
+                                                    debug_log!(
+                                                        "SESS_VERIFY_FAIL: reverse key NOT found after publish! \
+                                                         af={} proto={} {}:{} -> {}:{} (map_fd={})",
+                                                        reverse_key.addr_family, reverse_key.protocol,
+                                                        reverse_key.src_ip, reverse_key.src_port,
+                                                        reverse_key.dst_ip, reverse_key.dst_port,
+                                                        binding.session_map_fd,
+                                                    );
+                                                }
+                                                if !verify_session_key_in_bpf(binding.session_map_fd, &flow.forward_key) {
+                                                    debug_log!(
+                                                        "SESS_VERIFY_FAIL: forward key NOT found! \
+                                                         af={} proto={} {}:{} -> {}:{}",
+                                                        flow.forward_key.addr_family, flow.forward_key.protocol,
+                                                        flow.forward_key.src_ip, flow.forward_key.src_port,
+                                                        flow.forward_key.dst_ip, flow.forward_key.dst_port,
+                                                    );
+                                                }
+                                                let logged = SESSION_CREATIONS_LOGGED.fetch_add(1, Ordering::Relaxed);
+                                                if logged < 10 {
+                                                    let fwd = &flow.forward_key;
+                                                    debug_log!(
+                                                        "SESS_CREATE[{}]: FWD af={} proto={} {}:{} -> {}:{} \
+                                                         | REV af={} proto={} {}:{} -> {}:{} \
+                                                         | NAT src={:?} dst={:?} \
+                                                         | map_fd={} bpf_entries={}",
+                                                        logged, fwd.addr_family, fwd.protocol,
+                                                        fwd.src_ip, fwd.src_port, fwd.dst_ip, fwd.dst_port,
+                                                        reverse_key.addr_family, reverse_key.protocol,
+                                                        reverse_key.src_ip, reverse_key.src_port,
+                                                        reverse_key.dst_ip, reverse_key.dst_port,
+                                                        decision.nat.rewrite_src, decision.nat.rewrite_dst,
+                                                        binding.session_map_fd,
+                                                        count_bpf_session_entries(binding.session_map_fd),
+                                                    );
+                                                    dump_bpf_session_entries(binding.session_map_fd, 20);
+                                                }
+                                            }
+                                            created += 1;
+                                            let reverse_entry = SyncedSessionEntry {
+                                                key: reverse_key,
+                                                decision: reverse_decision,
+                                                metadata: reverse_metadata,
+                                                protocol: meta.protocol,
+                                                tcp_flags: meta.tcp_flags,
+                                            };
+                                            publish_shared_session(
+                                                shared_sessions,
+                                                shared_nat_sessions,
+                                                &reverse_entry,
+                                            );
+                                            replicate_session_upsert(
+                                                peer_worker_commands,
+                                                &reverse_entry,
+                                            );
+                                        }
+                                        if created > 0 {
+                                            counters.session_creates += created;
+                                            dbg.session_create += created;
+                                        }
                                     }
                                 } else {
                                     dbg.policy_deny += 1;
@@ -7674,6 +7701,212 @@ struct EmbeddedIcmpMatch {
     resolution: ForwardingResolution,
     /// Session metadata (zones, RG).
     metadata: SessionMetadata,
+}
+
+fn packet_ttl_would_expire(frame: &[u8], meta: UserspaceDpMeta) -> Option<bool> {
+    let l3 = match meta.l3_offset {
+        14 | 18 => meta.l3_offset as usize,
+        _ => frame_l3_offset(frame)?,
+    };
+    match meta.addr_family as i32 {
+        libc::AF_INET => Some(*frame.get(l3 + 8)? <= 1),
+        libc::AF_INET6 => Some(*frame.get(l3 + 7)? <= 1),
+        _ => None,
+    }
+}
+
+fn build_local_time_exceeded_request(
+    frame: &[u8],
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    ingress_ident: &BindingIdentity,
+    _flow: &SessionFlow,
+    forwarding: &ForwardingState,
+    _dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    _ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    _now_secs: u64,
+) -> Option<PendingForwardRequest> {
+    if !matches!(packet_ttl_would_expire(frame, meta), Some(true)) {
+        return None;
+    }
+
+    let egress = forwarding.egress.get(&ingress_ident.ifindex)?;
+    let target_ifindex = if egress.bind_ifindex > 0 {
+        egress.bind_ifindex
+    } else {
+        ingress_ident.ifindex
+    };
+    let prebuilt_frame = match meta.addr_family as i32 {
+        libc::AF_INET => build_local_time_exceeded_v4(frame, meta, ingress_ident.ifindex, forwarding),
+        libc::AF_INET6 => build_local_time_exceeded_v6(frame, meta, ingress_ident.ifindex, forwarding),
+        _ => return None,
+    }?;
+
+    Some(PendingForwardRequest {
+        target_ifindex,
+        ingress_queue_id: ingress_ident.queue_id,
+        source_offset: desc.addr,
+        desc,
+        meta,
+        decision: SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: ingress_ident.ifindex,
+                tx_ifindex: target_ifindex,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: Some(egress.src_mac),
+                tx_vlan_id: egress.vlan_id,
+            },
+            nat: NatDecision::default(),
+        },
+        expected_ports: None,
+        flow_key: None,
+        nat64_reverse: None,
+        prebuilt_frame: Some(prebuilt_frame),
+    })
+}
+
+fn ingress_reply_l2(frame: &[u8]) -> Option<([u8; 6], [u8; 6], u16)> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let dst_mac = <[u8; 6]>::try_from(frame.get(0..6)?).ok()?;
+    let src_mac = <[u8; 6]>::try_from(frame.get(6..12)?).ok()?;
+    let eth_proto = u16::from_be_bytes([frame[12], frame[13]]);
+    let vlan_id = if matches!(eth_proto, 0x8100 | 0x88a8) {
+        let tci = u16::from_be_bytes([*frame.get(14)?, *frame.get(15)?]);
+        tci & 0x0fff
+    } else {
+        0
+    };
+    Some((src_mac, dst_mac, vlan_id))
+}
+
+fn build_local_time_exceeded_v4(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    ingress_ifindex: i32,
+    forwarding: &ForwardingState,
+) -> Option<Vec<u8>> {
+    let egress = forwarding.egress.get(&ingress_ifindex)?;
+    let (dst_mac, fallback_src_mac, ingress_vlan_id) = ingress_reply_l2(frame)?;
+    let src_ip = egress.primary_v4?;
+    let src_mac = egress.src_mac;
+    let l3 = match meta.l3_offset {
+        14 | 18 => meta.l3_offset as usize,
+        _ => frame_l3_offset(frame)?,
+    };
+    let packet = frame.get(l3..)?;
+    if packet.len() < 20 {
+        return None;
+    }
+    let ihl = ((packet[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return None;
+    }
+    let dst_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    let packet_len = total_len.min(packet.len());
+    let quoted_len = packet_len.min(ihl.saturating_add(8));
+    let vlan_id = if ingress_vlan_id > 0 {
+        ingress_vlan_id
+    } else {
+        egress.vlan_id
+    };
+    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let total_len = 20usize.checked_add(8)?.checked_add(quoted_len)?;
+    let mut out = Vec::with_capacity(eth_len + total_len);
+    write_eth_header(
+        &mut out,
+        dst_mac,
+        if src_mac == [0; 6] { fallback_src_mac } else { src_mac },
+        vlan_id,
+        0x0800,
+    );
+    let ip_start = out.len();
+    out.extend_from_slice(&[
+        0x45,
+        0x00,
+        ((total_len as u16) >> 8) as u8,
+        (total_len as u16) as u8,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        64,
+        PROTO_ICMP,
+        0,
+        0,
+    ]);
+    out.extend_from_slice(&src_ip.octets());
+    out.extend_from_slice(&dst_ip.octets());
+    let ip_sum = checksum16(&out[ip_start..ip_start + 20]);
+    out[ip_start + 10..ip_start + 12].copy_from_slice(&ip_sum.to_be_bytes());
+    let icmp_start = out.len();
+    out.extend_from_slice(&[11, 0, 0, 0, 0, 0, 0, 0]);
+    out.extend_from_slice(packet.get(..quoted_len)?);
+    let icmp_sum = checksum16(&out[icmp_start..]);
+    out[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_sum.to_be_bytes());
+    Some(out)
+}
+
+fn build_local_time_exceeded_v6(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    ingress_ifindex: i32,
+    forwarding: &ForwardingState,
+) -> Option<Vec<u8>> {
+    let egress = forwarding.egress.get(&ingress_ifindex)?;
+    let (dst_mac, fallback_src_mac, ingress_vlan_id) = ingress_reply_l2(frame)?;
+    let src_ip = egress.primary_v6?;
+    let src_mac = egress.src_mac;
+    let l3 = match meta.l3_offset {
+        14 | 18 => meta.l3_offset as usize,
+        _ => frame_l3_offset(frame)?,
+    };
+    let packet = frame.get(l3..)?;
+    if packet.len() < 40 {
+        return None;
+    }
+    let dst_ip = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(8..24)?).ok()?);
+    let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let packet_len = (40 + payload_len).min(packet.len());
+    let quoted_len = packet_len.min(48);
+    let vlan_id = if ingress_vlan_id > 0 {
+        ingress_vlan_id
+    } else {
+        egress.vlan_id
+    };
+    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let outer_payload_len = 8usize.checked_add(quoted_len)?;
+    let mut out = Vec::with_capacity(eth_len + 40 + outer_payload_len);
+    write_eth_header(
+        &mut out,
+        dst_mac,
+        if src_mac == [0; 6] { fallback_src_mac } else { src_mac },
+        vlan_id,
+        0x86dd,
+    );
+    out.extend_from_slice(&[
+        0x60,
+        0x00,
+        0x00,
+        0x00,
+        ((outer_payload_len as u16) >> 8) as u8,
+        (outer_payload_len as u16) as u8,
+        PROTO_ICMPV6,
+        64,
+    ]);
+    out.extend_from_slice(&src_ip.octets());
+    out.extend_from_slice(&dst_ip.octets());
+    let icmp_start = out.len();
+    out.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
+    out.extend_from_slice(packet.get(..quoted_len)?);
+    let icmp_sum = checksum16_ipv6(src_ip, dst_ip, PROTO_ICMPV6, &out[icmp_start..]);
+    out[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_sum.to_be_bytes());
+    Some(out)
 }
 
 /// Returns true if the protocol and ICMP type indicate an ICMP error message
@@ -16189,6 +16422,157 @@ mod tests {
         assert!(!build_forwarding_state(&snapshot).allow_embedded_icmp);
         snapshot.flow.allow_embedded_icmp = true;
         assert!(build_forwarding_state(&snapshot).allow_embedded_icmp);
+    }
+
+    fn build_icmp_echo_frame_v4(src: Ipv4Addr, dst: Ipv4Addr, ttl: u8) -> Vec<u8> {
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, ttl, PROTO_ICMP, 0x00, 0x00,
+        ]);
+        frame.extend_from_slice(&src.octets());
+        frame.extend_from_slice(&dst.octets());
+        let ip_csum = checksum16(&frame[14..34]);
+        frame[24..26].copy_from_slice(&ip_csum.to_be_bytes());
+        let icmp_start = frame.len();
+        frame.extend_from_slice(&[8, 0, 0x00, 0x00, 0x12, 0x34, 0x00, 0x01]);
+        let icmp_csum = checksum16(&frame[icmp_start..]);
+        frame[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_csum.to_be_bytes());
+        frame
+    }
+
+    fn build_icmp_echo_frame_v6(src: Ipv6Addr, dst: Ipv6Addr, hop_limit: u8) -> Vec<u8> {
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x86dd,
+        );
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x08, PROTO_ICMPV6, hop_limit]);
+        frame.extend_from_slice(&src.octets());
+        frame.extend_from_slice(&dst.octets());
+        let icmp_start = frame.len();
+        frame.extend_from_slice(&[128, 0, 0x00, 0x00, 0x12, 0x34, 0x00, 0x01]);
+        let icmp_csum = checksum16_ipv6(src, dst, PROTO_ICMPV6, &frame[icmp_start..]);
+        frame[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_csum.to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn packet_ttl_would_expire_identifies_v4_and_v6() {
+        let frame_v4 = build_icmp_echo_frame_v4(
+            Ipv4Addr::new(10, 0, 61, 102),
+            Ipv4Addr::new(1, 1, 1, 1),
+            1,
+        );
+        let meta_v4 = UserspaceDpMeta {
+            l3_offset: 14,
+            addr_family: libc::AF_INET as u8,
+            ..UserspaceDpMeta::default()
+        };
+        assert_eq!(packet_ttl_would_expire(&frame_v4, meta_v4), Some(true));
+
+        let frame_v6 = build_icmp_echo_frame_v6(
+            "2001:559:8585:ef00::102".parse().unwrap(),
+            "2606:4700:4700::1111".parse().unwrap(),
+            2,
+        );
+        let meta_v6 = UserspaceDpMeta {
+            l3_offset: 14,
+            addr_family: libc::AF_INET6 as u8,
+            ..UserspaceDpMeta::default()
+        };
+        assert_eq!(packet_ttl_would_expire(&frame_v6, meta_v6), Some(false));
+    }
+
+    #[test]
+    fn build_local_time_exceeded_v4_quotes_original_packet() {
+        let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
+        let frame = build_icmp_echo_frame_v4(client_ip, dst_ip, 1);
+        let meta = UserspaceDpMeta {
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            5,
+            EgressInterface {
+                bind_ifindex: 5,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+                zone: "lan".to_string(),
+                redundancy_group: 1,
+                primary_v4: Some(Ipv4Addr::new(10, 0, 61, 1)),
+                primary_v6: None,
+            },
+        );
+        let out = build_local_time_exceeded_v4(&frame, meta, 5, &forwarding)
+            .expect("build local IPv4 TE");
+        assert_eq!(&out[0..6], &[0x00, 0x25, 0x90, 0x12, 0x34, 0x56]);
+        assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]);
+        assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x0800);
+        assert_eq!(Ipv4Addr::new(out[26], out[27], out[28], out[29]), Ipv4Addr::new(10, 0, 61, 1));
+        assert_eq!(Ipv4Addr::new(out[30], out[31], out[32], out[33]), client_ip);
+        assert_eq!(out[34], 11);
+        assert_eq!(out[35], 0);
+        let quoted_ip_start = 42;
+        assert_eq!(Ipv4Addr::new(out[quoted_ip_start + 12], out[quoted_ip_start + 13], out[quoted_ip_start + 14], out[quoted_ip_start + 15]), client_ip);
+        assert_eq!(Ipv4Addr::new(out[quoted_ip_start + 16], out[quoted_ip_start + 17], out[quoted_ip_start + 18], out[quoted_ip_start + 19]), dst_ip);
+        assert_eq!(out[quoted_ip_start + 8], 1);
+    }
+
+    #[test]
+    fn build_local_time_exceeded_v6_quotes_original_packet() {
+        let client_ip: Ipv6Addr = "2001:559:8585:ef00::102".parse().unwrap();
+        let dst_ip: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+        let frame = build_icmp_echo_frame_v6(client_ip, dst_ip, 1);
+        let meta = UserspaceDpMeta {
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_ICMPV6,
+            ..UserspaceDpMeta::default()
+        };
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            5,
+            EgressInterface {
+                bind_ifindex: 5,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+                zone: "lan".to_string(),
+                redundancy_group: 1,
+                primary_v4: None,
+                primary_v6: Some("2001:559:8585:ef00::1".parse().unwrap()),
+            },
+        );
+        let out = build_local_time_exceeded_v6(&frame, meta, 5, &forwarding)
+            .expect("build local IPv6 TE");
+        assert_eq!(&out[0..6], &[0x00, 0x25, 0x90, 0x12, 0x34, 0x56]);
+        assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]);
+        assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x86dd);
+        assert_eq!(Ipv6Addr::from(<[u8; 16]>::try_from(&out[22..38]).unwrap()), "2001:559:8585:ef00::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(Ipv6Addr::from(<[u8; 16]>::try_from(&out[38..54]).unwrap()), client_ip);
+        assert_eq!(out[54], 3);
+        assert_eq!(out[55], 0);
+        let quoted_ip_start = 62;
+        assert_eq!(Ipv6Addr::from(<[u8; 16]>::try_from(&out[quoted_ip_start + 8..quoted_ip_start + 24]).unwrap()), client_ip);
+        assert_eq!(Ipv6Addr::from(<[u8; 16]>::try_from(&out[quoted_ip_start + 24..quoted_ip_start + 40]).unwrap()), dst_ip);
+        assert_eq!(out[quoted_ip_start + 7], 1);
     }
 
     // --- ICMP error NAT reversal tests ---
