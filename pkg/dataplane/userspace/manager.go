@@ -1014,6 +1014,44 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []R
 		addConnectedRoutes("inet6", v6Table, v6Prefixes)
 	}
 
+	// Add synthetic routes for ip rule entries that implement inter-VRF
+	// route leaking (rib-groups, next-table). These rules send traffic
+	// matching a destination prefix to a different routing table.
+	// Without these, the userspace FIB can't cross-reference VRF tables.
+	tableIDToName := make(map[int]string)
+	for _, inst := range cfg.RoutingInstances {
+		if inst != nil && inst.TableID > 0 {
+			tableIDToName[inst.TableID] = inst.Name + ".inet.0"
+		}
+	}
+	for _, family := range []int{syscall.AF_INET, syscall.AF_INET6} {
+		rules, err := netlink.RuleList(family)
+		if err != nil {
+			continue
+		}
+		for _, rule := range rules {
+			if rule.Dst == nil || rule.Table <= 0 {
+				continue
+			}
+			tableName, ok := tableIDToName[rule.Table]
+			if !ok {
+				continue
+			}
+			familyStr := "inet"
+			mainTable := "inet.0"
+			if family == syscall.AF_INET6 {
+				familyStr = "inet6"
+				mainTable = "inet6.0"
+			}
+			addSnapshot(RouteSnapshot{
+				Table:     mainTable,
+				Family:    familyStr,
+				Destination: rule.Dst.String(),
+				NextTable: tableName,
+			})
+		}
+	}
+
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Table != out[j].Table {
 			return out[i].Table < out[j].Table

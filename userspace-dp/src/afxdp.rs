@@ -7982,7 +7982,7 @@ fn lookup_forwarding_resolution_inner(
     dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
     dst: IpAddr,
 ) -> ForwardingResolution {
-    match dst {
+    let mut resolution = match dst {
         IpAddr::V4(ip) => {
             if state.local_v4.contains(&ip) {
                 let local_ifindex = state
@@ -8025,7 +8025,15 @@ fn lookup_forwarding_resolution_inner(
             }
             lookup_forwarding_resolution_v6(state, dynamic_neighbors, ip, DEFAULT_V6_TABLE, 0)
         }
+    };
+    // Tunnel interfaces (GRE, ip6gre, XFRM) can't be reached via AF_XDP TX.
+    // Route these to slow-path so the kernel handles encapsulation.
+    if matches!(resolution.disposition, ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor)
+        && state.tunnel_interfaces.contains(&resolution.egress_ifindex)
+    {
+        resolution.disposition = ForwardingDisposition::MissingNeighbor;
     }
+    resolution
 }
 
 fn interface_nat_local_resolution(
