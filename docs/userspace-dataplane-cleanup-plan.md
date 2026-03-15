@@ -24,6 +24,14 @@ Current execution state as of 2026-03-15:
 4. Phase 3 is the next active cleanup phase.
 5. Phases 4 and 6 have not started as formal cleanup phases yet.
 
+Latest status-sync update for this document:
+
+1. PR `#226` records the current cleanup-plan state on top of `master`.
+2. That update specifically captures:
+   - Phase 2 completion status
+   - the resolved `virtio_net` fabric AF_XDP bind outcome on `ifindex 4`
+   - the remaining work for Phases 3 through 6
+
 Completed under this plan:
 
 1. Production dataplane debug noise is now gated behind `debug-log` instead of
