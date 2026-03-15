@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) fn reap_tx_completions(binding: &mut BindingWorker, shared_recycles: &mut Vec<(u32, u64)>) -> u32 {
+pub(super) fn reap_tx_completions(
+    binding: &mut BindingWorker,
+    shared_recycles: &mut Vec<(u32, u64)>,
+) -> u32 {
     if binding.outstanding_tx == 0 {
         return 0;
     }
@@ -9,17 +12,17 @@ pub(super) fn reap_tx_completions(binding: &mut BindingWorker, shared_recycles: 
         return 0;
     }
     let mut reaped = 0u32;
+    let mut completed_offsets = Vec::with_capacity(available as usize);
     let mut completed = binding.device.complete(available);
     while let Some(offset) = completed.read() {
-        if let Some(recycle_slot) = binding.in_flight_forward_recycles.remove(&offset) {
-            shared_recycles.push((recycle_slot, offset));
-        } else {
-            binding.free_tx_frames.push_back(offset);
-        }
+        completed_offsets.push(offset);
         reaped += 1;
     }
     completed.release();
     drop(completed);
+    for offset in completed_offsets {
+        recycle_completed_tx_offset(binding, shared_recycles, offset);
+    }
     binding.outstanding_tx = binding.outstanding_tx.saturating_sub(reaped);
     binding.dbg_completions_reaped += reaped as u64;
     binding
@@ -45,9 +48,9 @@ pub(super) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bo
         // poison pattern in the RX path, it means the kernel recycled a
         // descriptor without writing packet data (stale/uninit frame).
         if cfg!(feature = "debug-log") {
-            if let Some(frame) = unsafe {
-                binding.umem.area.slice_mut_unchecked(offset as usize, 8)
-            } {
+            if let Some(frame) =
+                unsafe { binding.umem.area.slice_mut_unchecked(offset as usize, 8) }
+            {
                 frame.copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes());
             }
         }
@@ -142,9 +145,10 @@ pub(super) fn bound_pending_tx_local(binding: &mut BindingWorker) {
         if binding.pending_tx_local.pop_front().is_some() {
             binding.dbg_pending_overflow += 1;
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
-            binding
-                .live
-                .set_error(format!("pending TX local overflow on slot {}", binding.slot));
+            binding.live.set_error(format!(
+                "pending TX local overflow on slot {}",
+                binding.slot
+            ));
         }
     }
 }
@@ -154,11 +158,12 @@ pub(super) fn bound_pending_tx_prepared(binding: &mut BindingWorker) {
     while binding.pending_tx_prepared.len() > limit {
         if let Some(req) = binding.pending_tx_prepared.pop_front() {
             binding.dbg_pending_overflow += 1;
-            recycle_cancelled_prepared(binding, &req);
+            recycle_prepared_immediately(binding, &req);
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
-            binding
-                .live
-                .set_error(format!("pending TX prepared overflow on slot {}", binding.slot));
+            binding.live.set_error(format!(
+                "pending TX prepared overflow on slot {}",
+                binding.slot
+            ));
         }
     }
 }
@@ -168,11 +173,7 @@ pub(super) fn drain_pending_tx(
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) -> bool {
-    if binding.outstanding_tx == 0
-        && binding.pending_tx_prepared.is_empty()
-        && binding.pending_tx_local.is_empty()
-        && binding.live.pending_tx_empty()
-    {
+    if !binding_has_pending_tx_work(binding) {
         return false;
     }
     let mut did_work = reap_tx_completions(binding, shared_recycles) > 0;
@@ -208,19 +209,7 @@ pub(super) fn drain_pending_tx(
             }
         }
     }
-    let mut pending = if binding.pending_tx_local.is_empty() {
-        binding.live.take_pending_tx()
-    } else {
-        core::mem::take(&mut binding.pending_tx_local)
-    };
-    if !binding.live.pending_tx_empty() {
-        let mut shared = binding.live.take_pending_tx();
-        if pending.is_empty() {
-            pending = shared;
-        } else if !shared.is_empty() {
-            pending.append(&mut shared);
-        }
-    }
+    let mut pending = take_pending_tx_requests(binding);
     if pending.is_empty() {
         return did_work || !binding.pending_tx_prepared.is_empty();
     }
@@ -252,9 +241,7 @@ pub(super) fn drain_pending_tx(
         }
     }
     if !retry.is_empty() {
-        retry.append(&mut binding.pending_tx_local);
-        binding.pending_tx_local = retry;
-        bound_pending_tx_local(binding);
+        restore_pending_tx_requests(binding, retry);
     }
     bound_pending_tx_prepared(binding);
     update_binding_debug_state(binding);
@@ -267,6 +254,71 @@ pub(super) fn drain_pending_tx(
 pub(super) enum TxError {
     Retry(String),
     Drop(String),
+}
+
+fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
+    binding.outstanding_tx > 0
+        || !binding.pending_tx_prepared.is_empty()
+        || !binding.pending_tx_local.is_empty()
+        || !binding.live.pending_tx_empty()
+}
+
+fn merge_pending_tx_requests(
+    mut local: VecDeque<TxRequest>,
+    mut shared: VecDeque<TxRequest>,
+) -> VecDeque<TxRequest> {
+    if local.is_empty() {
+        return shared;
+    }
+    if !shared.is_empty() {
+        local.append(&mut shared);
+    }
+    local
+}
+
+fn take_pending_tx_requests(binding: &mut BindingWorker) -> VecDeque<TxRequest> {
+    let local = core::mem::take(&mut binding.pending_tx_local);
+    let shared = binding.live.take_pending_tx();
+    merge_pending_tx_requests(local, shared)
+}
+
+fn restore_pending_tx_requests(binding: &mut BindingWorker, mut retry: VecDeque<TxRequest>) {
+    retry.append(&mut binding.pending_tx_local);
+    binding.pending_tx_local = retry;
+    bound_pending_tx_local(binding);
+}
+
+fn apply_prepared_recycle(
+    free_tx_frames: &mut VecDeque<u64>,
+    shared_recycles: &mut Vec<(u32, u64)>,
+    recycle: PreparedTxRecycle,
+    offset: u64,
+) {
+    match recycle {
+        PreparedTxRecycle::FreeTxFrame => free_tx_frames.push_back(offset),
+        PreparedTxRecycle::FillOnSlot(slot) => shared_recycles.push((slot, offset)),
+    }
+}
+
+fn recycle_completed_tx_offset(
+    binding: &mut BindingWorker,
+    shared_recycles: &mut Vec<(u32, u64)>,
+    offset: u64,
+) {
+    if let Some(recycle) = binding.in_flight_prepared_recycles.remove(&offset) {
+        apply_prepared_recycle(
+            &mut binding.free_tx_frames,
+            shared_recycles,
+            recycle,
+            offset,
+        );
+    } else {
+        binding.free_tx_frames.push_back(offset);
+    }
+}
+
+fn recycle_prepared_immediately(binding: &mut BindingWorker, req: &PreparedTxRequest) {
+    recycle_cancelled_prepared(binding, req);
 }
 
 pub(super) fn transmit_batch(
@@ -341,7 +393,8 @@ pub(super) fn transmit_batch(
                     if n < 50 {
                         c.set(n + 1);
                         let summary = decode_frame_summary(&req.bytes);
-                        eprintln!("RST_DETECT TX[{}]: slot={} len={} {}",
+                        eprintln!(
+                            "RST_DETECT TX[{}]: slot={} len={} {}",
                             n,
                             binding.slot,
                             req.bytes.len(),
@@ -431,9 +484,9 @@ pub(super) fn transmit_prepared_batch(
         };
         if req.len as usize > tx_frame_capacity() {
             let orphaned: Vec<_> = binding.scratch_prepared_tx.drain(..).collect();
-            recycle_cancelled_prepared(binding, &req);
+            recycle_prepared_immediately(binding, &req);
             for r in &orphaned {
-                recycle_cancelled_prepared(binding, r);
+                recycle_prepared_immediately(binding, r);
             }
             return Err(TxError::Drop(format!(
                 "prepared tx frame exceeds UMEM frame capacity: len={} cap={}",
@@ -447,12 +500,17 @@ pub(super) fn transmit_prepared_batch(
         return Ok((0, 0));
     }
     for req in &binding.scratch_prepared_tx {
-        if binding.umem.area.slice(req.offset as usize, req.len as usize).is_none() {
+        if binding
+            .umem
+            .area
+            .slice(req.offset as usize, req.len as usize)
+            .is_none()
+        {
             let err_offset = req.offset;
             let err_len = req.len;
             let orphaned: Vec<_> = binding.scratch_prepared_tx.drain(..).collect();
             for r in &orphaned {
-                recycle_cancelled_prepared(binding, r);
+                recycle_prepared_immediately(binding, r);
             }
             return Err(TxError::Drop(format!(
                 "prepared tx frame slice out of range: offset={} len={}",
@@ -464,7 +522,11 @@ pub(super) fn transmit_prepared_batch(
     // RST detection on prepared TX path: check UMEM frames before submitting to TX ring
     if cfg!(feature = "debug-log") {
         for req in &binding.scratch_prepared_tx {
-            if let Some(frame_data) = binding.umem.area.slice(req.offset as usize, req.len as usize) {
+            if let Some(frame_data) = binding
+                .umem
+                .area
+                .slice(req.offset as usize, req.len as usize)
+            {
                 if frame_has_tcp_rst(frame_data) {
                     binding.dbg_tx_tcp_rst += 1;
                     thread_local! {
@@ -475,9 +537,13 @@ pub(super) fn transmit_prepared_batch(
                         if n < 50 {
                             c.set(n + 1);
                             let summary = decode_frame_summary(frame_data);
-                            eprintln!("RST_DETECT PREP_TX[{}]: if={} q={} len={} {}",
-                                n, binding.identity().ifindex, binding.identity().queue_id,
-                                req.len, summary,
+                            eprintln!(
+                                "RST_DETECT PREP_TX[{}]: if={} q={} len={} {}",
+                                n,
+                                binding.identity().ifindex,
+                                binding.identity().queue_id,
+                                req.len,
+                                summary,
                             );
                             if n < 5 {
                                 let hex_len = (req.len as usize).min(frame_data.len()).min(80);
@@ -522,11 +588,9 @@ pub(super) fn transmit_prepared_batch(
     let mut retry_tail = Vec::new();
     for (idx, req) in binding.scratch_prepared_tx.drain(..).enumerate() {
         if idx < inserted as usize {
-            if let Some(recycle_slot) = req.recycle_slot {
-                binding
-                    .in_flight_forward_recycles
-                    .insert(req.offset, recycle_slot);
-            }
+            binding
+                .in_flight_prepared_recycles
+                .insert(req.offset, req.recycle);
             sent_packets += 1;
             sent_bytes += req.len as u64;
         } else {
@@ -572,20 +636,101 @@ pub(super) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, now_ns: u6
                 if binding.dbg_sendto_enobufs <= 10 {
                     eprintln!(
                         "TX_ENOBUFS: slot={} if={} q={} outstanding_tx={} free_tx={}",
-                        binding.slot, binding.ifindex, binding.queue_id,
-                        binding.outstanding_tx, binding.free_tx_frames.len(),
+                        binding.slot,
+                        binding.ifindex,
+                        binding.queue_id,
+                        binding.outstanding_tx,
+                        binding.free_tx_frames.len(),
                     );
                 }
             } else {
                 binding.dbg_sendto_err += 1;
                 if binding.dbg_sendto_err <= 5 {
-                    eprintln!("DBG SENDTO_ERR: slot={} if={} q={} errno={} outstanding_tx={} free_tx={}",
-                        binding.slot, binding.ifindex, binding.queue_id,
-                        errno, binding.outstanding_tx, binding.free_tx_frames.len(),
+                    eprintln!(
+                        "DBG SENDTO_ERR: slot={} if={} q={} errno={} outstanding_tx={} free_tx={}",
+                        binding.slot,
+                        binding.ifindex,
+                        binding.queue_id,
+                        errno,
+                        binding.outstanding_tx,
+                        binding.free_tx_frames.len(),
                     );
                 }
             }
         }
         binding.last_tx_wake_ns = now_ns;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_pending_tx_requests_appends_shared_after_local() {
+        let local = VecDeque::from(vec![
+            TxRequest {
+                bytes: vec![1],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+            },
+            TxRequest {
+                bytes: vec![2],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+            },
+        ]);
+        let shared = VecDeque::from(vec![TxRequest {
+            bytes: vec![3],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+        }]);
+
+        let merged = merge_pending_tx_requests(local, shared);
+        let bytes: Vec<Vec<u8>> = merged.into_iter().map(|req| req.bytes).collect();
+        assert_eq!(bytes, vec![vec![1], vec![2], vec![3]]);
+    }
+
+    #[test]
+    fn merge_pending_tx_requests_uses_shared_when_local_empty() {
+        let shared = VecDeque::from(vec![TxRequest {
+            bytes: vec![9],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET6 as u8,
+            expected_protocol: PROTO_UDP,
+            flow_key: None,
+        }]);
+
+        let merged = merge_pending_tx_requests(VecDeque::new(), shared);
+        let bytes: Vec<Vec<u8>> = merged.into_iter().map(|req| req.bytes).collect();
+        assert_eq!(bytes, vec![vec![9]]);
+    }
+
+    #[test]
+    fn apply_prepared_recycle_routes_fill_and_free_explicitly() {
+        let mut free_tx_frames = VecDeque::new();
+        let mut shared_recycles = Vec::new();
+
+        apply_prepared_recycle(
+            &mut free_tx_frames,
+            &mut shared_recycles,
+            PreparedTxRecycle::FreeTxFrame,
+            41,
+        );
+        apply_prepared_recycle(
+            &mut free_tx_frames,
+            &mut shared_recycles,
+            PreparedTxRecycle::FillOnSlot(7),
+            42,
+        );
+
+        assert_eq!(free_tx_frames, VecDeque::from(vec![41]));
+        assert_eq!(shared_recycles, vec![(7, 42)]);
     }
 }

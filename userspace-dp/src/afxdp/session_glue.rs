@@ -37,7 +37,10 @@ pub(super) fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> Session
     }
 }
 
-pub(super) fn resolution_target_for_session(flow: &SessionFlow, decision: SessionDecision) -> IpAddr {
+pub(super) fn resolution_target_for_session(
+    flow: &SessionFlow,
+    decision: SessionDecision,
+) -> IpAddr {
     decision.nat.rewrite_dst.unwrap_or(flow.dst_ip)
 }
 
@@ -289,10 +292,12 @@ pub(super) fn cancel_pending_forwards(
 }
 
 pub(super) fn recycle_cancelled_prepared(binding: &mut BindingWorker, req: &PreparedTxRequest) {
-    if matches!(req.recycle_slot, Some(slot) if slot == binding.slot) {
-        binding.pending_fill_frames.push_back(req.offset);
-    } else {
-        binding.free_tx_frames.push_back(req.offset);
+    match req.recycle {
+        PreparedTxRecycle::FreeTxFrame => binding.free_tx_frames.push_back(req.offset),
+        PreparedTxRecycle::FillOnSlot(slot) if slot == binding.slot => {
+            binding.pending_fill_frames.push_back(req.offset);
+        }
+        PreparedTxRecycle::FillOnSlot(_) => binding.free_tx_frames.push_back(req.offset),
     }
 }
 
@@ -399,17 +404,15 @@ pub(super) fn lookup_forward_nat_across_scopes(
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     reply_key: &SessionKey,
 ) -> Option<ForwardSessionMatch> {
-    sessions
-        .find_forward_nat_match(reply_key)
-        .or_else(|| {
-            lookup_shared_forward_nat_match(shared_nat_sessions, reply_key).map(|entry| {
-                ForwardSessionMatch {
-                    key: entry.key,
-                    decision: entry.decision,
-                    metadata: entry.metadata,
-                }
-            })
+    sessions.find_forward_nat_match(reply_key).or_else(|| {
+        lookup_shared_forward_nat_match(shared_nat_sessions, reply_key).map(|entry| {
+            ForwardSessionMatch {
+                key: entry.key,
+                decision: entry.decision,
+                metadata: entry.metadata,
+            }
         })
+    })
 }
 
 fn materialize_shared_session_hit(
@@ -531,7 +534,8 @@ fn maybe_promote_synced_session(
     protocol: u8,
     tcp_flags: u8,
 ) -> SessionMetadata {
-    if !metadata.synced || decision.resolution.disposition != ForwardingDisposition::ForwardCandidate
+    if !metadata.synced
+        || decision.resolution.disposition != ForwardingDisposition::ForwardCandidate
     {
         return metadata.clone();
     }
@@ -541,14 +545,7 @@ fn maybe_promote_synced_session(
     if promoted.owner_rg_id <= 0 {
         promoted.owner_rg_id = owner_rg_for_flow(forwarding, decision.resolution.egress_ifindex);
     }
-    if sessions.promote_synced(
-        key,
-        decision,
-        promoted.clone(),
-        now_ns,
-        protocol,
-        tcp_flags,
-    ) {
+    if sessions.promote_synced(key, decision, promoted.clone(), now_ns, protocol, tcp_flags) {
         let _ = publish_live_session_key(session_map_fd, key);
         let promoted_entry = SyncedSessionEntry {
             key: key.clone(),
@@ -621,12 +618,7 @@ pub(super) fn resolve_flow_session_decision(
             forwarding,
             ha_state,
             now_secs,
-            lookup_forwarding_resolution_for_session(
-                forwarding,
-                dynamic_neighbors,
-                flow,
-                decision,
-            ),
+            lookup_forwarding_resolution_for_session(forwarding, dynamic_neighbors, flow, decision),
         ),
         ingress_ifindex,
     );
@@ -662,7 +654,10 @@ pub(super) fn publish_shared_session(
     if !entry.metadata.is_reverse
         && let Ok(mut sessions) = shared_nat_sessions.lock()
     {
-        sessions.insert(reverse_session_key(&entry.key, entry.decision.nat), entry.clone());
+        sessions.insert(
+            reverse_session_key(&entry.key, entry.decision.nat),
+            entry.clone(),
+        );
     }
 }
 
