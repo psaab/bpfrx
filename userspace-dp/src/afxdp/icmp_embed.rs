@@ -356,9 +356,11 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                     metadata: fwd.metadata,
                 });
             }
-            if let Ok(nat_sessions) = shared_nat_sessions.lock()
-                && let Some(entry) = nat_sessions.get(&reply_key)
-            {
+            let shared_nat_entry = shared_nat_sessions
+                .lock()
+                .ok()
+                .and_then(|nat_sessions| nat_sessions.get(&reply_key).cloned());
+            if let Some(entry) = shared_nat_entry {
                 let nat = entry.decision.nat;
                 let original_src = entry.key.src_ip;
                 let original_src_port = entry.key.src_port;
@@ -491,9 +493,11 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                     metadata: fwd.metadata,
                 });
             }
-            if let Ok(nat_sessions) = shared_nat_sessions.lock()
-                && let Some(entry) = nat_sessions.get(&reply_key)
-            {
+            let shared_nat_entry = shared_nat_sessions
+                .lock()
+                .ok()
+                .and_then(|nat_sessions| nat_sessions.get(&reply_key).cloned());
+            if let Some(entry) = shared_nat_entry {
                 let nat = entry.decision.nat;
                 let original_src = entry.key.src_ip;
                 let original_src_port = entry.key.src_port;
