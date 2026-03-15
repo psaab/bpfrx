@@ -2125,20 +2125,6 @@ fn poll_binding(
             let mut recycle_now = true;
             if let Some(meta) = try_parse_metadata(unsafe { &*area }, desc) {
                 counters.metadata_packets += 1;
-                // DEBUG: log ALL packets on WAN interface (ifindex 6)
-                if meta.ingress_ifindex == 6 || matches!(meta.protocol, 1 | 58) {
-                    static ICMP_RX_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let c = ICMP_RX_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if c < 100 {
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/icmp_rx_debug.log") {
-                            use std::io::Write;
-                            let icmp_type = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
-                                .and_then(|fr| fr.get(meta.l4_offset as usize).copied()).unwrap_or(255);
-                            let _ = writeln!(f, "ICMP_RX[{}]: proto={} af={} l4_off={} icmp_type={} len={} if={} slot={}",
-                                c, meta.protocol, meta.addr_family, meta.l4_offset, icmp_type, desc.len, meta.ingress_ifindex, binding.slot);
-                        }
-                    }
-                }
                 let disposition = classify_metadata(meta, validation);
                 if disposition == PacketDisposition::Valid {
                     counters.validated_packets += 1;
@@ -2626,35 +2612,11 @@ fn poll_binding(
                             // Embedded ICMP NAT reversal: runs for ANY disposition
                             // because the SNAT'd destination resolves as MissingNeighbor
                             // (the firewall's own address has no ARP entry).
-                            // DEBUG: log ALL session misses to see what arrives
-                            {
-                                static MISS_LOG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                                let c = MISS_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if c < 50 {
-                                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/icmp_te_debug.log") {
-                                        use std::io::Write;
-                                        let _ = writeln!(f, "SESS_MISS[{}]: proto={} af={} src={} dst={} disp={:?} allow_emb={} is_icmp={}",
-                                            c, meta.protocol, meta.addr_family, flow.src_ip, flow.dst_ip,
-                                            resolution.disposition, forwarding.allow_embedded_icmp,
-                                            matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6));
-                                    }
-                                }
-                            }
                             // Go directly to nat_match (includes cross-worker shared
                             // session lookup) — skip the per-worker-only pre-check.
                             if forwarding.allow_embedded_icmp
                                     && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
                                 {
-                                    // DEBUG: write to file to confirm this code path executes
-                                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/icmp_te_debug.log") {
-                                        use std::io::Write;
-                                        let _ = writeln!(f, "ICMP_TE: proto={} type={} src={} dst={} af={}",
-                                            meta.protocol, if meta.l4_offset as usize <= (desc.len as usize).saturating_sub(1) {
-                                                unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
-                                                    .and_then(|fr| fr.get(meta.l4_offset as usize).copied()).unwrap_or(255)
-                                            } else { 255 },
-                                            flow.src_ip, flow.dst_ip, meta.addr_family);
-                                    }
                                     if let Some(icmp_match) = try_embedded_icmp_nat_match(
                                         unsafe { &*area },
                                         desc,
@@ -2665,7 +2627,6 @@ fn poll_binding(
                                         shared_nat_sessions,
                                         now_ns,
                                     ) {
-                                        eprintln!("ICMP_TE_NAT: match found, nat={:?} orig_src={} resolution={:?}", icmp_match.nat, icmp_match.original_src, icmp_match.resolution.disposition);
                                         if icmp_match.nat.rewrite_src.is_some() {
                                             let icmp_resolution = finalize_embedded_icmp_resolution(
                                                 forwarding,
@@ -2691,7 +2652,6 @@ fn poll_binding(
                                                     _ => None,
                                                 }
                                             });
-                                            eprintln!("ICMP_TE_BUILD: rewritten={}", rewritten.is_some());
                                             if let Some(rewritten_frame) = rewritten {
                                                 let icmp_decision = SessionDecision {
                                                     resolution: icmp_resolution,
@@ -2706,7 +2666,6 @@ fn poll_binding(
                                                             icmp_decision.resolution.egress_ifindex,
                                                         )
                                                     };
-                                                eprintln!("ICMP_TE_TX: target_ifindex={} frame_len={}", target_ifindex, rewritten_frame.len());
                                                 binding.scratch_forwards.push(
                                                     PendingForwardRequest {
                                                         target_ifindex,
@@ -2723,11 +2682,6 @@ fn poll_binding(
                                                 );
                                                 recycle_now = false;
                                             }
-                                        }
-                                    } else {
-                                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/icmp_te_debug.log") {
-                                            use std::io::Write;
-                                            let _ = writeln!(f, "ICMP_TE_NAT_MISS: no forward session via NAT reverse index");
                                         }
                                     }
                                     // Permit without policy check or session install.
@@ -6277,14 +6231,6 @@ fn worker_loop(
         ) {
             Ok(binding) => bindings.push(binding),
             Err(err) => plan.live.set_error(err.to_string()),
-        }
-    }
-    // DEBUG: verify file writes work from worker thread
-    {
-        use std::io::Write;
-        match std::fs::OpenOptions::new().create(true).append(true).open("/tmp/worker_startup.log") {
-            Ok(mut f) => { let _ = writeln!(f, "worker {} started with {} bindings", worker_id, bindings.len()); }
-            Err(e) => eprintln!("WORKER {} CANNOT WRITE /tmp/: {}", worker_id, e),
         }
     }
     let mut idle_iters = 0u32;
