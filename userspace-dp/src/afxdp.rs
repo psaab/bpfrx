@@ -1993,158 +1993,7 @@ fn poll_binding(
                         .as_ref()
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
                     let decision = if let Some(flow) = flow.as_ref() {
-                        if let Some(hit) =
-                            sessions.lookup(&flow.forward_key, now_ns, meta.tcp_flags)
-                        {
-                            counters.session_hits += 1;
-                            dbg.session_hit += 1;
-                            // Log first N session hits from WAN (return path)
-                            if cfg!(feature = "debug-log") && meta.ingress_ifindex == 6 && dbg.wan_return_hits < 5 {
-                                dbg.wan_return_hits += 1;
-                                debug_log!(
-                                    "DBG WAN_RETURN_HIT[{}]: {}:{} -> {}:{} proto={} tcp_flags=0x{:02x} nat=({:?},{:?}) rev={}",
-                                    dbg.wan_return_hits,
-                                    flow.src_ip, flow.forward_key.src_port,
-                                    flow.dst_ip, flow.forward_key.dst_port,
-                                    meta.protocol, meta.tcp_flags,
-                                    hit.decision.nat.rewrite_src, hit.decision.nat.rewrite_dst,
-                                    hit.metadata.is_reverse,
-                                );
-                            }
-                            let mut decision = hit.decision;
-                            if let Some(debug) = debug.as_mut() {
-                                debug.from_zone = Some(hit.metadata.ingress_zone.clone());
-                                debug.to_zone = Some(hit.metadata.egress_zone.clone());
-                            }
-                            decision.resolution = redirect_via_fabric_if_needed(
-                                forwarding,
-                                enforce_ha_resolution_snapshot(
-                                    forwarding,
-                                    ha_state,
-                                    now_secs,
-                                    lookup_forwarding_resolution_for_session(
-                                        forwarding,
-                                        dynamic_neighbors,
-                                        flow,
-                                        decision,
-                                    ),
-                                ),
-                                meta.ingress_ifindex as i32,
-                            );
-                            if hit.metadata.synced
-                                && decision.resolution.disposition
-                                    == ForwardingDisposition::ForwardCandidate
-                            {
-                                let mut promoted = hit.metadata.clone();
-                                promoted.synced = false;
-                                if promoted.owner_rg_id <= 0 {
-                                    promoted.owner_rg_id = owner_rg_for_flow(
-                                        forwarding,
-                                        decision.resolution.egress_ifindex,
-                                    );
-                                }
-                                if sessions.promote_synced(
-                                    &flow.forward_key,
-                                    decision,
-                                    promoted.clone(),
-                                    now_ns,
-                                    meta.protocol,
-                                    meta.tcp_flags,
-                                ) {
-                                    let _ = publish_live_session_key(
-                                        binding.session_map_fd,
-                                        &flow.forward_key,
-                                    );
-                                    let promoted_entry = SyncedSessionEntry {
-                                        key: flow.forward_key.clone(),
-                                        decision,
-                                        metadata: promoted,
-                                        protocol: meta.protocol,
-                                        tcp_flags: meta.tcp_flags,
-                                    };
-                                    publish_shared_session(
-                                        shared_sessions,
-                                        shared_nat_sessions,
-                                        &promoted_entry,
-                                    );
-                                    replicate_session_upsert(peer_worker_commands, &promoted_entry);
-                                }
-                            }
-                            decision
-                        } else if let Some(shared) =
-                            lookup_shared_session(shared_sessions, &flow.forward_key)
-                        {
-                            counters.session_hits += 1;
-                            dbg.session_hit += 1;
-                            let replica = synced_replica_entry(&shared);
-                            sessions.upsert_synced(
-                                replica.key.clone(),
-                                replica.decision,
-                                replica.metadata.clone(),
-                                now_ns,
-                                replica.protocol,
-                                meta.tcp_flags,
-                            );
-                            if let Some(debug) = debug.as_mut() {
-                                debug.from_zone = Some(replica.metadata.ingress_zone.clone());
-                                debug.to_zone = Some(replica.metadata.egress_zone.clone());
-                            }
-                            let mut decision = replica.decision;
-                            decision.resolution = redirect_via_fabric_if_needed(
-                                forwarding,
-                                enforce_ha_resolution_snapshot(
-                                    forwarding,
-                                    ha_state,
-                                    now_secs,
-                                    lookup_forwarding_resolution_for_session(
-                                        forwarding,
-                                        dynamic_neighbors,
-                                        flow,
-                                        decision,
-                                    ),
-                                ),
-                                meta.ingress_ifindex as i32,
-                            );
-                            if decision.resolution.disposition
-                                == ForwardingDisposition::ForwardCandidate
-                            {
-                                let mut promoted = replica.metadata.clone();
-                                promoted.synced = false;
-                                if promoted.owner_rg_id <= 0 {
-                                    promoted.owner_rg_id = owner_rg_for_flow(
-                                        forwarding,
-                                        decision.resolution.egress_ifindex,
-                                    );
-                                }
-                                if sessions.promote_synced(
-                                    &flow.forward_key,
-                                    decision,
-                                    promoted.clone(),
-                                    now_ns,
-                                    meta.protocol,
-                                    meta.tcp_flags,
-                                ) {
-                                    let _ = publish_live_session_key(
-                                        binding.session_map_fd,
-                                        &flow.forward_key,
-                                    );
-                                    let promoted_entry = SyncedSessionEntry {
-                                        key: flow.forward_key.clone(),
-                                        decision,
-                                        metadata: promoted,
-                                        protocol: meta.protocol,
-                                        tcp_flags: meta.tcp_flags,
-                                    };
-                                    publish_shared_session(
-                                        shared_sessions,
-                                        shared_nat_sessions,
-                                        &promoted_entry,
-                                    );
-                                    replicate_session_upsert(peer_worker_commands, &promoted_entry);
-                                }
-                            }
-                            decision
-                        } else if let Some(repaired) = repair_reverse_session_from_forward(
+                        if let Some(resolved) = resolve_flow_session_decision(
                             sessions,
                             binding.session_map_fd,
                             shared_sessions,
@@ -2158,32 +2007,39 @@ fn poll_binding(
                             now_secs,
                             meta.protocol,
                             meta.tcp_flags,
+                            meta.ingress_ifindex as i32,
                         ) {
                             counters.session_hits += 1;
-                            counters.session_creates += 1;
                             dbg.session_hit += 1;
-                            dbg.session_create += 1;
-                            if let Some(debug) = debug.as_mut() {
-                                debug.from_zone = Some(repaired.metadata.ingress_zone.clone());
-                                debug.to_zone = Some(repaired.metadata.egress_zone.clone());
+                            if resolved.created {
+                                counters.session_creates += 1;
+                                dbg.session_create += 1;
                             }
-                            let mut decision = repaired.decision;
-                            decision.resolution = redirect_via_fabric_if_needed(
-                                forwarding,
-                                enforce_ha_resolution_snapshot(
-                                    forwarding,
-                                    ha_state,
-                                    now_secs,
-                                    lookup_forwarding_resolution_for_session(
-                                        forwarding,
-                                        dynamic_neighbors,
-                                        flow,
-                                        decision,
-                                    ),
-                                ),
-                                meta.ingress_ifindex as i32,
-                            );
-                            decision
+                            // Log first N session hits from WAN (return path)
+                            if cfg!(feature = "debug-log")
+                                && meta.ingress_ifindex == 6
+                                && dbg.wan_return_hits < 5
+                            {
+                                dbg.wan_return_hits += 1;
+                                debug_log!(
+                                    "DBG WAN_RETURN_HIT[{}]: {}:{} -> {}:{} proto={} tcp_flags=0x{:02x} nat=({:?},{:?}) rev={}",
+                                    dbg.wan_return_hits,
+                                    flow.src_ip,
+                                    flow.forward_key.src_port,
+                                    flow.dst_ip,
+                                    flow.forward_key.dst_port,
+                                    meta.protocol,
+                                    meta.tcp_flags,
+                                    resolved.decision.nat.rewrite_src,
+                                    resolved.decision.nat.rewrite_dst,
+                                    resolved.metadata.is_reverse,
+                                );
+                            }
+                            if let Some(debug) = debug.as_mut() {
+                                debug.from_zone = Some(resolved.metadata.ingress_zone.clone());
+                                debug.to_zone = Some(resolved.metadata.egress_zone.clone());
+                            }
+                            resolved.decision
                         } else {
                             counters.session_misses += 1;
                             dbg.session_miss += 1;
