@@ -18,10 +18,11 @@ Related documents:
 Current execution state as of 2026-03-15:
 
 1. Phase 1 is complete and merged on `master` via PR `#222`.
-2. Phase 2 is in progress on branch `fix/userspace-phase2-icmp-extract` via
-   PR `#223`.
+2. Phase 2 is complete on branch `fix/userspace-phase2-icmp-extract` via
+   PR `#223` and is pending merge.
 3. Phase 5 is partially complete on `master` via PR `#221`.
-4. Phases 3, 4, and 6 have not started as formal cleanup phases yet.
+4. Phase 3 is the next active cleanup phase.
+5. Phases 4 and 6 have not started as formal cleanup phases yet.
 
 Completed under this plan:
 
@@ -32,26 +33,37 @@ Completed under this plan:
 3. Standard userspace validation now includes traceroute and `mtr` checks for:
    - IPv4 to `1.1.1.1`
    - IPv6 to `2607:f8b0:4005:814::200e`
-4. Phase 2 extraction has already split the first ICMP helper groups out of
-   `userspace-dp/src/afxdp.rs` into:
+4. Phase 2 extracted the main helper clusters out of `userspace-dp/src/afxdp.rs`
+   into:
+   - `userspace-dp/src/afxdp/bind.rs`
    - `userspace-dp/src/afxdp/icmp.rs`
    - `userspace-dp/src/afxdp/icmp_embed.rs`
-5. The Phase 2 branch also carries the driver-aware AF_XDP bind strategy work
+   - `userspace-dp/src/afxdp/frame.rs`
+   - `userspace-dp/src/afxdp/session_glue.rs`
+   - `userspace-dp/src/afxdp/tx.rs`
+5. `userspace-dp/src/afxdp.rs` was reduced from the previous monolith size to a
+   smaller coordinator-oriented file:
+   - before Phase 2 completion: about `17.6k` lines
+   - after Phase 2 completion: about `12.3k` lines
+6. The Phase 2 branch also carries the driver-aware AF_XDP bind strategy work
    and the shared-lock-ordering fix found during PR review.
-6. The current working tree is mid-extraction of AF_XDP bind/open helpers into:
-   - `userspace-dp/src/afxdp/bind.rs`
-   - updated `userspace-dp/src/afxdp.rs`
-7. Live validation already proved that the bind strategy logic is correct for
+7. Live validation proved that the extracted Phase 2 branch still forwards
+   correctly through the userspace dataplane on the active node:
+   - userspace forwarding armed on `bpfrx-userspace-fw0`
+   - IPv4 and IPv6 internal reachability working
+   - IPv4 and IPv6 TTL=1 probes return native time-exceeded responses
+   - IPv4 and IPv6 `mtr` still show the same unresolved intermediate hops as
+     before, but first hop and destination visibility remain correct
+8. Live validation already proved that the bind strategy logic is correct for
    `mlx5_core`, but `virtio_net` fabric bindings still fail AF_XDP bring-up
    with both currently known strategies.
 
 Still left to do at a high level:
 
-1. Finish the Phase 2 `afxdp.rs` split beyond ICMP helpers.
-2. Start the formal tuple/session authority cleanup in Phase 3.
-3. Clean up AF_XDP queue and frame ownership in Phase 4.
-4. Finish hardening validation coverage in Phase 5.
-5. Only then do the serious sustained-throughput optimization work in Phase 6.
+1. Start the formal tuple/session authority cleanup in Phase 3.
+2. Clean up AF_XDP queue and frame ownership in Phase 4.
+3. Finish hardening validation coverage in Phase 5.
+4. Only then do the serious sustained-throughput optimization work in Phase 6.
 
 ## Current Baseline
 
@@ -134,9 +146,9 @@ runtime" problems.
 
 ## Phase 2: Split `afxdp.rs` Into Real Submodules
 
-Status: In Progress
+Status: Complete On Branch, Pending Merge
 
-Completed so far:
+Completed:
 
 1. Local TTL-expiry detection, ICMP/ICMPv6 Time Exceeded builders, ICMP error
    classification, and related local-request helpers were extracted into
@@ -145,27 +157,23 @@ Completed so far:
    [userspace-dp/src/afxdp/icmp_embed.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/icmp_embed.rs).
 3. Shared lock ordering in embedded ICMP resolution was fixed during the PR
    review cycle.
-4. Driver-aware AF_XDP bind strategy logic exists and is now part of the
-   extraction surface that still needs to be split cleanly from
-   `userspace-dp/src/afxdp.rs`.
-
-Currently in progress:
-
-1. Extract AF_XDP bind/open strategy helpers into a dedicated bind module.
-2. Keep `mlx5_core` on the current shared-owner path while treating
-   `virtio_net` as a per-driver strategy decision rather than a global change.
-3. Preserve the already validated live behavior while moving that setup logic
-   out of `userspace-dp/src/afxdp.rs`.
-
-Current implementation checkpoint:
-
-1. `userspace-dp/src/afxdp/bind.rs` exists locally but the extraction is not
-   finished yet.
-2. The current tree has in-progress edits in:
-   - [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
-   - [userspace-dp/src/afxdp/bind.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/bind.rs)
-3. This bind extraction slice has not been build-validated yet in the current
-   working tree and has not been redeployed live in this in-progress form.
+4. AF_XDP bind/open strategy helpers were extracted into
+   [userspace-dp/src/afxdp/bind.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/bind.rs).
+5. Session and reverse-session lookup / repair glue was extracted into
+   [userspace-dp/src/afxdp/session_glue.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/session_glue.rs).
+6. Frame parsing, tuple parsing, frame build, NAT rewrite, and checksum helpers
+   were extracted into
+   [userspace-dp/src/afxdp/frame.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/frame.rs).
+7. TX queueing, completion, recycle, and wake helpers were extracted into
+   [userspace-dp/src/afxdp/tx.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/tx.rs).
+8. Focused Rust tests passed after the extraction.
+9. The extracted branch was deployed live to:
+   - `loss:bpfrx-userspace-fw0`
+   - `loss:bpfrx-userspace-fw1`
+10. Live validation on the active userspace node confirmed:
+   - userspace forwarding armed successfully
+   - internal dual-stack reachability still works
+   - native IPv4 and IPv6 traceroute time-exceeded behavior still works
 
 Live findings already established for this extraction area:
 
@@ -177,17 +185,6 @@ Live findings already established for this extraction area:
 3. That means the remaining live problem is not a wrong global bind choice; it
    is an unresolved `virtio_net` AF_XDP capability or contract issue.
 
-Still left in this phase:
-
-1. Extract RX metadata parse and packet classification helpers.
-2. Extract session and reverse-session lookup glue.
-3. Extract NAT and frame rewrite helpers that do not need worker-local state.
-4. Extract TX queue, completion, and recycle handling.
-5. Reduce `userspace-dp/src/afxdp.rs` to a worker/coordinator layer instead of
-   an implementation monolith.
-6. Finish the bind/open extraction cleanly enough that the build passes and the
-   live driver-specific behavior is unchanged.
-
 Delivered so far in:
 
 1. PR `#223`
@@ -197,6 +194,8 @@ Delivered so far in:
    - `19bc561` `userspace: extract embedded icmp helpers`
    - `6b1d65f` `userspace: probe AF_XDP bind strategy per driver`
    - `af89e42` `userspace: complete embedded icmp extraction and fix shared lock ordering`
+   - additional completion commits on the same branch finish the bind, frame,
+     session-glue, and TX extraction work
 
 ### Purpose
 
@@ -229,9 +228,16 @@ logic auditable.
    logic.
 3. Review diffs for dataplane fixes become smaller and easier to validate.
 
+Phase 2 result:
+
+1. Achieved on the branch and validated live.
+2. The unresolved `virtio_net` AF_XDP fabric bring-up issue remains, but it is
+   now clearly isolated as a runtime capability/problem-space issue rather than
+   a reason to keep `afxdp.rs` as a monolith.
+
 ## Phase 3: Tuple Authority And Session Resolution Cleanup
 
-Status: Not Started As A Formal Cleanup Phase
+Status: Next Active Phase
 
 Preparatory work already exists:
 
@@ -445,14 +451,11 @@ This order is deliberate.
 
 ## Immediate Next Steps
 
-1. Finish the in-progress AF_XDP bind/open extraction from
-   `userspace-dp/src/afxdp.rs`.
-2. Continue Phase 2 by extracting RX/session/TX helper clusters.
-3. Build-validate the current bind extraction slice before doing further
-   refactoring on top of it.
-4. Revalidate live userspace binding behavior on `bpfrx-userspace-fw0/1` after
-   the bind extraction is complete.
-5. Continue investigating the unresolved `virtio_net` fabric AF_XDP bind
+1. Start Phase 3 by making tuple authority explicit at each stage of packet
+   processing.
+2. Consolidate reverse-session and NAT-reverse lookup paths now that the helper
+   clusters live in separate modules.
+3. Continue investigating the unresolved `virtio_net` fabric AF_XDP bind
    contract without changing the `mlx5_core` path globally.
-6. Start Phase 3 only after `afxdp.rs` is smaller and the bind/extraction work
-   has stabilized.
+4. Keep the new traceroute and `mtr` checks as the mandatory correctness gate
+   for any Phase 3 or Phase 4 changes.
