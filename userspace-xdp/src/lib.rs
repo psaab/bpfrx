@@ -391,7 +391,13 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
 
     let packet_len = data_end.saturating_sub(data);
-    // ICMP/ICMPv6 is now handled by the userspace dataplane — no fallback needed.
+    // GRE (47) and ESP (50) must be delivered to the kernel for tunnel
+    // decapsulation. XDP_PASS directly — do NOT use fallback_to_main
+    // (the tail-call can fail silently, dropping the packet).
+    if matches!(parsed.protocol, PROTO_GRE | PROTO_ESP) {
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_EARLY_FILTER);
+        return Ok(cpumap_or_pass(ctrl));
+    }
     if should_fallback_early(&parsed) {
         record_trace(
             ctrl.flags,
@@ -741,12 +747,8 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
 }
 
 fn should_fallback_early(pkt: &ParsedPacket) -> bool {
-    // GRE (47) and ESP (50) are tunnel encapsulation protocols that must
-    // be delivered to the kernel for decapsulation (GRE→gr-0-0-0, ESP→XFRM).
-    // The userspace DP cannot decapsulate these — always fall back to eBPF.
-    if matches!(pkt.protocol, PROTO_GRE | PROTO_ESP) {
-        return true;
-    }
+    // GRE and ESP are handled before this function — see the
+    // cpumap_or_pass call in try_xdp_userspace().
     match pkt.addr_family {
         AF_INET => {
             if pkt.dst_v4 == 0xffff_ffff
