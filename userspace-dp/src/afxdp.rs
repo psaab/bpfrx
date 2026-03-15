@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -443,19 +444,11 @@ impl Coordinator {
                     heartbeat_map_fd: heartbeat_map_fd.fd,
                     session_map_fd: session_map_fd.fd,
                     ring_entries,
-                    shared_owner: false,
+                    bind_strategy: preferred_bind_strategy(binding),
                 });
         }
         for plans in workers.values_mut() {
             plans.sort_by_key(|plan| (plan.status.queue_id, plan.status.ifindex, plan.status.slot));
-            // Each binding creates its own WorkerUmem (own AF_XDP socket FD).
-            // Socket::with_shared() clones the UMEM's FD, so socket == UMEM FD.
-            // bind() without SHARED_UMEM directly binds this socket to (ifindex, queue).
-            // Each binding is fully independent with its own UMEM/socket/rings.
-            // poll() on each binding's device triggers NAPI for that specific queue.
-            for plan in plans.iter_mut() {
-                plan.shared_owner = true;
-            }
         }
         let planned_bindings: usize = workers.values().map(|group| group.len()).sum();
         self.last_planned_workers = workers.len();
@@ -964,7 +957,26 @@ struct BindingPlan {
     heartbeat_map_fd: c_int,
     session_map_fd: c_int,
     ring_entries: u32,
-    shared_owner: bool,
+    bind_strategy: AfXdpBindStrategy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfXdpBindStrategy {
+    UmemOwnerSocket,
+    SeparateOwnerSocket,
+}
+
+impl AfXdpBindStrategy {
+    fn uses_umem_owner_socket(self) -> bool {
+        matches!(self, Self::UmemOwnerSocket)
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::UmemOwnerSocket => "umem-owner-socket",
+            Self::SeparateOwnerSocket => "separate-owner-socket",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1377,11 +1389,12 @@ impl BindingWorker {
         heartbeat_map_fd: c_int,
         session_map_fd: c_int,
         live: Arc<BindingLiveState>,
-        shared_owner: bool,
+        bind_strategy: AfXdpBindStrategy,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let total_frames = binding_frame_count(ring_entries).max(1);
         let worker_umem =
             WorkerUmem::new(total_frames).map_err(|err| format!("create binding umem: {err}"))?;
+        let driver_name = interface_driver_name(&binding.interface);
         let reserved_tx = reserved_tx_frames(ring_entries);
         let mut reserved_tx_frames = VecDeque::with_capacity(reserved_tx as usize);
         for idx in 0..reserved_tx {
@@ -1400,7 +1413,13 @@ impl BindingWorker {
         }
         let info = ifinfo_from_binding(binding)?;
         let (user, rx, tx, bind_mode, mut device) =
-            open_binding_worker_rings(&worker_umem, &info, ring_entries, shared_owner)
+            open_binding_worker_rings(
+                &worker_umem,
+                &info,
+                ring_entries,
+                bind_strategy,
+                driver_name.as_deref(),
+            )
                 .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
         prime_fill_ring_offsets(&mut device, &initial_fill_frames)?;
 
@@ -1412,8 +1431,13 @@ impl BindingWorker {
         // ifindex/queue_id directly — umem.bind() already validated these.
         live.set_socket_binding(binding.ifindex, binding.queue_id, 0);
         eprintln!(
-            "bpfrx-userspace-dp: binding slot={} fd={} shared_owner={} bound if{}q{} mode={:?}",
-            binding.slot, user_fd, shared_owner, binding.ifindex, binding.queue_id, bind_mode,
+            "bpfrx-userspace-dp: binding slot={} fd={} strategy={} bound if{}q{} mode={:?}",
+            binding.slot,
+            user_fd,
+            bind_strategy.describe(),
+            binding.ifindex,
+            binding.queue_id,
+            bind_mode,
         );
         if let Err(err) = register_xsk_slot(xsk_map_fd, binding.slot, user_fd) {
             eprintln!(
@@ -1532,7 +1556,8 @@ fn open_binding_worker_rings(
     worker_umem: &WorkerUmem,
     info: &IfInfo,
     ring_entries: u32,
-    shared_owner: bool,
+    bind_strategy: AfXdpBindStrategy,
+    driver_name: Option<&str>,
 ) -> Result<
     (
         User,
@@ -1544,22 +1569,59 @@ fn open_binding_worker_rings(
     Box<dyn std::error::Error + Send + Sync>,
 > {
     // Try zero-copy first, fall back to copy mode if the driver doesn't support it.
-    match try_open_bind(worker_umem, info, ring_entries, shared_owner, XSK_BIND_FLAGS_ZEROCOPY) {
+    match try_open_bind(worker_umem, info, ring_entries, bind_strategy, XSK_BIND_FLAGS_ZEROCOPY) {
         Ok(result) => return Ok(result),
         Err(e) => {
             eprintln!(
-                "bpfrx-userspace-dp: zero-copy bind failed: {e} — falling back to copy mode"
+                "bpfrx-userspace-dp: zero-copy bind failed using {}: {e} — falling back to copy mode",
+                bind_strategy.describe(),
             );
         }
     }
-    try_open_bind(worker_umem, info, ring_entries, shared_owner, XSK_BIND_FLAGS_COPY)
+    match try_open_bind(worker_umem, info, ring_entries, bind_strategy, XSK_BIND_FLAGS_COPY) {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            let Some(fallback_strategy) = alternate_bind_strategy(driver_name, bind_strategy) else {
+                return Err(err);
+            };
+            eprintln!(
+                "bpfrx-userspace-dp: copy-mode bind failed using {} on driver {:?}: {} — retrying {}",
+                bind_strategy.describe(),
+                driver_name,
+                err,
+                fallback_strategy.describe(),
+            );
+            match try_open_bind(
+                worker_umem,
+                info,
+                ring_entries,
+                fallback_strategy,
+                XSK_BIND_FLAGS_ZEROCOPY,
+            ) {
+                Ok(result) => Ok(result),
+                Err(e) => {
+                    eprintln!(
+                        "bpfrx-userspace-dp: zero-copy bind failed using {}: {e} — falling back to copy mode",
+                        fallback_strategy.describe(),
+                    );
+                    try_open_bind(
+                        worker_umem,
+                        info,
+                        ring_entries,
+                        fallback_strategy,
+                        XSK_BIND_FLAGS_COPY,
+                    )
+                }
+            }
+        }
+    }
 }
 
 fn try_open_bind(
     worker_umem: &WorkerUmem,
     info: &IfInfo,
     ring_entries: u32,
-    shared_owner: bool,
+    bind_strategy: AfXdpBindStrategy,
     flags: u16,
 ) -> Result<
     (
@@ -1571,7 +1633,7 @@ fn try_open_bind(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let sock = if shared_owner {
+    let sock = if bind_strategy.uses_umem_owner_socket() {
         Socket::with_shared(info, &worker_umem.umem)
             .map_err(|e| format!("create shared socket: {e}"))?
     } else {
@@ -1587,7 +1649,7 @@ fn try_open_bind(
         ring_entries,
         flags,
     )?;
-    let bind_mode = match bind_user_rings(&worker_umem.umem, &device, &user, shared_owner) {
+    let bind_mode = match bind_user_rings(&worker_umem.umem, &device, &user, bind_strategy) {
         Ok(mode) => mode,
         Err(e) => {
             return Err(e);
@@ -1696,7 +1758,7 @@ fn bind_user_rings(
     umem: &Umem,
     _device: &xdpilone::DeviceQueue,
     user: &User,
-    shared_owner: bool,
+    bind_strategy: AfXdpBindStrategy,
 ) -> Result<XskBindMode, Box<dyn std::error::Error + Send + Sync>> {
     let user_fd = user.as_raw_fd();
     for attempt in 0..BIND_RETRY_ATTEMPTS {
@@ -1709,8 +1771,11 @@ fn bind_user_rings(
                 // context from sendto()/poll() instead of waiting for softirq.
                 set_busy_poll_opts(user_fd);
                 eprintln!(
-                    "bpfrx-userspace-dp: umem.bind(fd={}) OK on attempt {} mode={:?} shared_owner={}",
-                    user_fd, attempt, bind_mode, shared_owner,
+                    "bpfrx-userspace-dp: umem.bind(fd={}) OK on attempt {} mode={:?} strategy={}",
+                    user_fd,
+                    attempt,
+                    bind_mode,
+                    bind_strategy.describe(),
                 );
                 return Ok(bind_mode);
             }
@@ -1720,19 +1785,19 @@ fn bind_user_rings(
                     thread::sleep(BIND_RETRY_DELAY);
                     continue;
                 }
-                let binder = if shared_owner {
-                    "umem.bind(shared-root)"
+                let binder = if bind_strategy.uses_umem_owner_socket() {
+                    "umem.bind(umem-owner)"
                 } else {
-                    "umem.bind(owner)"
+                    "umem.bind(separate-owner)"
                 };
                 return Err(format!("bind AF_XDP socket via {binder}: {msg}").into());
             }
         }
     }
-    let binder = if shared_owner {
-        "umem.bind(shared-root)"
+    let binder = if bind_strategy.uses_umem_owner_socket() {
+        "umem.bind(umem-owner)"
     } else {
-        "umem.bind(owner)"
+        "umem.bind(separate-owner)"
     };
     Err(format!("bind AF_XDP socket via {binder}: exhausted retries").into())
 }
@@ -6294,7 +6359,7 @@ fn worker_loop(
             plan.heartbeat_map_fd,
             plan.session_map_fd,
             plan.live.clone(),
-            plan.shared_owner,
+            plan.bind_strategy,
         ) {
             Ok(binding) => bindings.push(binding),
             Err(err) => plan.live.set_error(err.to_string()),
@@ -6984,6 +7049,41 @@ fn ifinfo_from_binding(
         .map_err(|e| format!("lookup ifindex {}: {e}", binding.ifindex))?;
     info.set_queue(binding.queue_id);
     Ok(info)
+}
+
+fn interface_driver_name(ifname: &str) -> Option<String> {
+    if ifname.is_empty() {
+        return None;
+    }
+    let driver_link = Path::new("/sys/class/net")
+        .join(ifname)
+        .join("device")
+        .join("driver");
+    let target = std::fs::read_link(driver_link).ok()?;
+    target.file_name()?.to_str().map(str::to_string)
+}
+
+fn bind_strategy_for_driver(driver: Option<&str>) -> AfXdpBindStrategy {
+    match driver {
+        Some("virtio_net") => AfXdpBindStrategy::SeparateOwnerSocket,
+        _ => AfXdpBindStrategy::UmemOwnerSocket,
+    }
+}
+
+fn preferred_bind_strategy(binding: &BindingStatus) -> AfXdpBindStrategy {
+    bind_strategy_for_driver(interface_driver_name(&binding.interface).as_deref())
+}
+
+fn alternate_bind_strategy(
+    driver: Option<&str>,
+    current: AfXdpBindStrategy,
+) -> Option<AfXdpBindStrategy> {
+    match (driver, current) {
+        (Some("virtio_net"), AfXdpBindStrategy::SeparateOwnerSocket) => {
+            Some(AfXdpBindStrategy::UmemOwnerSocket)
+        }
+        _ => None,
+    }
 }
 
 fn build_screen_profiles(snapshot: &ConfigSnapshot) -> FxHashMap<String, ScreenProfile> {
@@ -12196,6 +12296,33 @@ mod tests {
         PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot,
         ZoneSnapshot,
     };
+
+    #[test]
+    fn mlx5_keeps_umem_owner_bind_strategy() {
+        assert_eq!(
+            bind_strategy_for_driver(Some("mlx5_core")),
+            AfXdpBindStrategy::UmemOwnerSocket
+        );
+        assert_eq!(
+            alternate_bind_strategy(Some("mlx5_core"), AfXdpBindStrategy::UmemOwnerSocket),
+            None
+        );
+    }
+
+    #[test]
+    fn virtio_prefers_separate_owner_then_falls_back() {
+        assert_eq!(
+            bind_strategy_for_driver(Some("virtio_net")),
+            AfXdpBindStrategy::SeparateOwnerSocket
+        );
+        assert_eq!(
+            alternate_bind_strategy(
+                Some("virtio_net"),
+                AfXdpBindStrategy::SeparateOwnerSocket,
+            ),
+            Some(AfXdpBindStrategy::UmemOwnerSocket)
+        );
+    }
 
     fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
         ConfigSnapshot {
