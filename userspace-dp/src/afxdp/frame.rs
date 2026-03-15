@@ -25,7 +25,11 @@ pub(super) fn authoritative_forward_ports(
     flow_ports.or(meta_ports).or(frame_ports)
 }
 
-pub(super) fn live_frame_ports(area: &MmapArea, desc: XdpDesc, meta: UserspaceDpMeta) -> Option<(u16, u16)> {
+pub(super) fn live_frame_ports(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+) -> Option<(u16, u16)> {
     if !matches!(meta.protocol, PROTO_TCP | PROTO_UDP) {
         return None;
     }
@@ -33,7 +37,11 @@ pub(super) fn live_frame_ports(area: &MmapArea, desc: XdpDesc, meta: UserspaceDp
     live_frame_ports_bytes(frame, meta.addr_family, meta.protocol)
 }
 
-pub(super) fn live_frame_ports_bytes(frame: &[u8], addr_family: u8, protocol: u8) -> Option<(u16, u16)> {
+pub(super) fn live_frame_ports_bytes(
+    frame: &[u8],
+    addr_family: u8,
+    protocol: u8,
+) -> Option<(u16, u16)> {
     if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
         return None;
     }
@@ -148,7 +156,9 @@ pub(super) fn enqueue_pending_forwards(
             if cfg!(feature = "debug-log") && dbg.no_egress_binding <= 3 {
                 debug_log!(
                     "DBG NO_EGRESS_BINDING: target_ifindex={} ingress_if={} ingress_q={}",
-                    request.target_ifindex, ingress_ident.ifindex, request.ingress_queue_id,
+                    request.target_ifindex,
+                    ingress_ident.ifindex,
+                    request.ingress_queue_id,
                 );
             }
             record_exception(
@@ -279,14 +289,17 @@ pub(super) fn enqueue_pending_forwards(
                                 .push_back(PreparedTxRequest {
                                     offset: source_offset,
                                     len: frame_len,
-                                    recycle_slot: Some(ingress_slot),
+                                    recycle: PreparedTxRecycle::FillOnSlot(ingress_slot),
                                     expected_ports,
                                     expected_addr_family: request.meta.addr_family,
                                     expected_protocol: request.meta.protocol,
                                     flow_key: request.flow_key.clone(),
                                 });
                             bound_pending_tx_prepared(target_binding);
-                            target_binding.live.in_place_tx_packets.fetch_add(1, Ordering::Relaxed);
+                            target_binding
+                                .live
+                                .in_place_tx_packets
+                                .fetch_add(1, Ordering::Relaxed);
                             dbg.enqueue_ok += 1;
                             dbg.enqueue_inplace += 1;
                             dbg.tx_bytes_total += frame_len as u64;
@@ -450,7 +463,7 @@ pub(super) fn enqueue_pending_forwards(
                                     .push_back(PreparedTxRequest {
                                         offset: tx_offset,
                                         len: written as u32,
-                                        recycle_slot: None,
+                                        recycle: PreparedTxRecycle::FreeTxFrame,
                                         expected_ports,
                                         expected_addr_family: request.meta.addr_family,
                                         expected_protocol: request.meta.protocol,
@@ -776,7 +789,11 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
 }
 
 #[allow(dead_code)]
-pub(super) fn extract_l3_packet(area: &MmapArea, desc: XdpDesc, meta: UserspaceDpMeta) -> Option<Vec<u8>> {
+pub(super) fn extract_l3_packet(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+) -> Option<Vec<u8>> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     extract_l3_packet_from_frame(frame, meta)
 }
@@ -946,12 +963,16 @@ pub(super) fn extract_tcp_flags_and_window(frame: &[u8]) -> Option<(u8, u16)> {
     let ip = frame.get(l3..)?;
     let (protocol, l4_offset) = match ip.first()? >> 4 {
         4 => {
-            if ip.len() < 20 { return None; }
+            if ip.len() < 20 {
+                return None;
+            }
             let ihl = ((ip[0] & 0x0f) as usize) * 4;
             (ip[9], ihl)
         }
         6 => {
-            if ip.len() < 40 { return None; }
+            if ip.len() < 40 {
+                return None;
+            }
             (ip[6], 40usize)
         }
         _ => return None,
@@ -979,12 +1000,16 @@ pub(super) fn extract_tcp_window(frame: &[u8], addr_family: u8) -> Option<u16> {
     let ip = frame.get(l3..)?;
     let (protocol, l4_offset) = match addr_family as i32 {
         libc::AF_INET => {
-            if ip.len() < 20 { return None; }
+            if ip.len() < 20 {
+                return None;
+            }
             let ihl = ((ip[0] & 0x0f) as usize) * 4;
             (ip[9], ihl)
         }
         libc::AF_INET6 => {
-            if ip.len() < 40 { return None; }
+            if ip.len() < 40 {
+                return None;
+            }
             (ip[6], 40usize)
         }
         _ => return None,
@@ -1055,10 +1080,16 @@ pub(super) fn decode_frame_summary(frame: &[u8]) -> String {
                     src, sport, dst, dport,
                 )
             } else {
-                format!("IPv4 {} -> {} proto={protocol} ttl={ttl} ip_len={total_len}", src, dst)
+                format!(
+                    "IPv4 {} -> {} proto={protocol} ttl={ttl} ip_len={total_len}",
+                    src, dst
+                )
             }
         } else {
-            format!("IPv4 {} -> {} proto={protocol} ttl={ttl} ip_len={total_len}", src, dst)
+            format!(
+                "IPv4 {} -> {} proto={protocol} ttl={ttl} ip_len={total_len}",
+                src, dst
+            )
         }
     } else if version == 6 && ip.len() >= 40 {
         let payload_len = u16::from_be_bytes([ip[4], ip[5]]);
@@ -1073,9 +1104,13 @@ pub(super) fn decode_frame_summary(frame: &[u8]) -> String {
             if next_header == PROTO_TCP && ip.len() >= 60 {
                 let flags = l4[13];
                 let flag_str = tcp_flags_str(flags);
-                format!("IPv6 [{src}]:{sport} -> [{dst}]:{dport} TCP [{flag_str}] hop={hop_limit} pl={payload_len}")
+                format!(
+                    "IPv6 [{src}]:{sport} -> [{dst}]:{dport} TCP [{flag_str}] hop={hop_limit} pl={payload_len}"
+                )
             } else {
-                format!("IPv6 [{src}]:{sport} -> [{dst}]:{dport} proto={next_header} hop={hop_limit} pl={payload_len}")
+                format!(
+                    "IPv6 [{src}]:{sport} -> [{dst}]:{dport} proto={next_header} hop={hop_limit} pl={payload_len}"
+                )
             }
         } else {
             format!("IPv6 [{src}] -> [{dst}] proto={next_header} hop={hop_limit} pl={payload_len}")
@@ -1087,14 +1122,30 @@ pub(super) fn decode_frame_summary(frame: &[u8]) -> String {
 
 pub(super) fn tcp_flags_str(flags: u8) -> String {
     let mut s = String::with_capacity(12);
-    if flags & 0x02 != 0 { s.push_str("SYN "); }
-    if flags & 0x10 != 0 { s.push_str("ACK "); }
-    if flags & 0x01 != 0 { s.push_str("FIN "); }
-    if flags & 0x04 != 0 { s.push_str("RST "); }
-    if flags & 0x08 != 0 { s.push_str("PSH "); }
-    if flags & 0x20 != 0 { s.push_str("URG "); }
-    if s.ends_with(' ') { s.truncate(s.len() - 1); }
-    if s.is_empty() { s.push_str("none"); }
+    if flags & 0x02 != 0 {
+        s.push_str("SYN ");
+    }
+    if flags & 0x10 != 0 {
+        s.push_str("ACK ");
+    }
+    if flags & 0x01 != 0 {
+        s.push_str("FIN ");
+    }
+    if flags & 0x04 != 0 {
+        s.push_str("RST ");
+    }
+    if flags & 0x08 != 0 {
+        s.push_str("PSH ");
+    }
+    if flags & 0x20 != 0 {
+        s.push_str("URG ");
+    }
+    if s.ends_with(' ') {
+        s.truncate(s.len() - 1);
+    }
+    if s.is_empty() {
+        s.push_str("none");
+    }
     s
 }
 
@@ -1217,7 +1268,10 @@ pub(super) fn metadata_tuple_complete(meta: UserspaceDpMeta, flow: &SessionFlow)
     }
 }
 
-pub(super) fn parse_session_flow_from_frame(frame: &[u8], meta: UserspaceDpMeta) -> Option<SessionFlow> {
+pub(super) fn parse_session_flow_from_frame(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+) -> Option<SessionFlow> {
     match meta.addr_family as i32 {
         libc::AF_INET => parse_ipv4_session_flow_from_frame(frame, meta),
         libc::AF_INET6 => {
@@ -1283,7 +1337,10 @@ pub(super) fn parse_session_flow_from_meta(meta: UserspaceDpMeta) -> Option<Sess
     })
 }
 
-pub(super) fn parse_ipv4_session_flow_from_frame(frame: &[u8], meta: UserspaceDpMeta) -> Option<SessionFlow> {
+pub(super) fn parse_ipv4_session_flow_from_frame(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+) -> Option<SessionFlow> {
     let mut l3 = 14usize;
     if frame.len() < l3 {
         return None;
@@ -1422,7 +1479,12 @@ pub(super) fn build_nat64_forwarded_frame(
             let info = nat64_reverse?;
             // Reply: src_v6 = original dst (NAT64 prefix + server), dst_v6 = original client
             crate::nat64::build_nat64_v4_to_v6_frame(
-                frame, info.orig_dst_v6, info.orig_src_v6, dst_mac, src_mac, vlan_id,
+                frame,
+                info.orig_dst_v6,
+                info.orig_src_v6,
+                dst_mac,
+                src_mac,
+                vlan_id,
             )
         }
         _ => None,
@@ -1654,16 +1716,14 @@ pub(super) fn build_forwarded_frame_into_from_frame(
     let payload = if raw_payload.len() >= 4 {
         let ip_version = raw_payload[0] >> 4;
         if ip_version == 4 {
-            let ip_total_len =
-                u16::from_be_bytes([raw_payload[2], raw_payload[3]]) as usize;
+            let ip_total_len = u16::from_be_bytes([raw_payload[2], raw_payload[3]]) as usize;
             if ip_total_len > 0 && ip_total_len < raw_payload.len() {
                 &raw_payload[..ip_total_len]
             } else {
                 raw_payload
             }
         } else if ip_version == 6 && raw_payload.len() >= 40 {
-            let ipv6_payload_len =
-                u16::from_be_bytes([raw_payload[4], raw_payload[5]]) as usize;
+            let ipv6_payload_len = u16::from_be_bytes([raw_payload[4], raw_payload[5]]) as usize;
             let ip6_total = 40 + ipv6_payload_len;
             if ip6_total > 0 && ip6_total < raw_payload.len() {
                 &raw_payload[..ip6_total]
@@ -1743,9 +1803,15 @@ pub(super) fn build_forwarded_frame_into_from_frame(
                 apply_nat_ipv4(&mut out[ip_start..], meta.protocol, decision.nat)?;
             }
             out[ip_start + 8] -= 1;
-            let enforced =
-                enforce_expected_ports_at(out, ip_start, ip_start + rel_l4, meta.addr_family, meta.protocol, enforced_ports)
-                    .unwrap_or(false);
+            let enforced = enforce_expected_ports_at(
+                out,
+                ip_start,
+                ip_start + rel_l4,
+                meta.addr_family,
+                meta.protocol,
+                enforced_ports,
+            )
+            .unwrap_or(false);
             adjust_ipv4_header_checksum(
                 &mut out[ip_start..ip_start + ihl],
                 old_src,
@@ -1777,9 +1843,15 @@ pub(super) fn build_forwarded_frame_into_from_frame(
                 apply_nat_ipv6(&mut out[ip_start..], meta.protocol, decision.nat)?;
             }
             out[ip_start + 7] -= 1;
-            let enforced =
-                enforce_expected_ports_at(out, ip_start, ip_start + rel_l4, meta.addr_family, meta.protocol, enforced_ports)
-                    .unwrap_or(false);
+            let enforced = enforce_expected_ports_at(
+                out,
+                ip_start,
+                ip_start + rel_l4,
+                meta.addr_family,
+                meta.protocol,
+                enforced_ports,
+            )
+            .unwrap_or(false);
             if repaired_ports && !enforced {
                 recompute_l4_checksum_ipv6(&mut out[ip_start..], meta.protocol)?;
             }
@@ -1796,13 +1868,18 @@ pub(super) fn build_forwarded_frame_into_from_frame(
             if n < 30 {
                 c.set(n + 1);
                 let pkt_detail = decode_frame_summary(out);
-                eprintln!("DBG BUILT_ETH[{}]: vlan={} frame_len={} proto={} {}",
+                eprintln!(
+                    "DBG BUILT_ETH[{}]: vlan={} frame_len={} proto={} {}",
                     n, vlan_id, frame_len, meta.protocol, pkt_detail,
                 );
                 // For the first 3 frames, also dump the full IP+TCP header hex
                 if n < 3 {
                     let dump_len = frame_len.min(out.len()).min(eth_len + 60);
-                    let hex: String = out[..dump_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                    let hex: String = out[..dump_len]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     eprintln!("DBG BUILT_HEX[{n}]: {hex}");
                 }
             }
@@ -1828,13 +1905,22 @@ pub(super) fn build_forwarded_frame_into_from_frame(
                     c.set(n + 1);
                     let in_summary = decode_frame_summary(frame);
                     let out_summary = decode_frame_summary(&out[..frame_len]);
-                    eprintln!("RST_CORRUPT BUILD[{}]: frame build INTRODUCED RST! in=[{}] out=[{}]",
+                    eprintln!(
+                        "RST_CORRUPT BUILD[{}]: frame build INTRODUCED RST! in=[{}] out=[{}]",
                         n, in_summary, out_summary,
                     );
                     let in_hex_len = frame.len().min(80);
-                    let in_hex: String = frame[..in_hex_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                    let in_hex: String = frame[..in_hex_len]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     let out_hex_len = frame_len.min(out.len()).min(80);
-                    let out_hex: String = out[..out_hex_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                    let out_hex: String = out[..out_hex_len]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     eprintln!("RST_CORRUPT IN_HEX[{n}]: {in_hex}");
                     eprintln!("RST_CORRUPT OUT_HEX[{n}]: {out_hex}");
                 }
@@ -1907,14 +1993,12 @@ pub(super) fn rewrite_forwarded_frame_in_place(
     if payload_len >= 4 {
         let ip_version = frame[l3] >> 4;
         if ip_version == 4 {
-            let ip_total_len =
-                u16::from_be_bytes([frame[l3 + 2], frame[l3 + 3]]) as usize;
+            let ip_total_len = u16::from_be_bytes([frame[l3 + 2], frame[l3 + 3]]) as usize;
             if ip_total_len > 0 && ip_total_len < payload_len {
                 payload_len = ip_total_len;
             }
         } else if ip_version == 6 && payload_len >= 40 {
-            let ipv6_payload_len =
-                u16::from_be_bytes([frame[l3 + 4], frame[l3 + 5]]) as usize;
+            let ipv6_payload_len = u16::from_be_bytes([frame[l3 + 4], frame[l3 + 5]]) as usize;
             let ip6_total = 40 + ipv6_payload_len;
             if ip6_total > 0 && ip6_total < payload_len {
                 payload_len = ip6_total;
@@ -2119,7 +2203,9 @@ pub(super) fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) 
                     .map(|bytes| bytes == [0, 0])
                     .unwrap_or(false);
                 if !keep_zero {
-                    adjust_l4_checksum_ipv4(packet, ihl, protocol, old_src, new_src, old_dst, new_dst)?;
+                    adjust_l4_checksum_ipv4(
+                        packet, ihl, protocol, old_src, new_src, old_dst, new_dst,
+                    )?;
                 }
             }
             _ => {}
@@ -2182,8 +2268,18 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
             let new_dst_words = new_dst.map(ipv6_words_from_octets).unwrap_or(old_dst_words);
             match protocol {
                 PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {
-                    adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
-                    adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
+                    adjust_l4_checksum_ipv6_words(
+                        packet,
+                        protocol,
+                        &old_src_words,
+                        &new_src_words,
+                    )?;
+                    adjust_l4_checksum_ipv6_words(
+                        packet,
+                        protocol,
+                        &old_dst_words,
+                        &new_dst_words,
+                    )?;
                 }
                 _ => {}
             }
@@ -2465,7 +2561,13 @@ pub(super) fn build_injected_ipv6(
     Ok(frame)
 }
 
-pub(super) fn write_eth_header(buf: &mut Vec<u8>, dst: [u8; 6], src: [u8; 6], vlan_id: u16, ether_type: u16) {
+pub(super) fn write_eth_header(
+    buf: &mut Vec<u8>,
+    dst: [u8; 6],
+    src: [u8; 6],
+    vlan_id: u16,
+    ether_type: u16,
+) {
     buf.extend_from_slice(&dst);
     buf.extend_from_slice(&src);
     if vlan_id > 0 {
@@ -2589,7 +2691,12 @@ pub(super) fn adjust_ipv4_header_checksum(
     Some(())
 }
 
-pub(super) fn checksum16_ipv6(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, payload: &[u8]) -> u16 {
+pub(super) fn checksum16_ipv6(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    next_header: u8,
+    payload: &[u8],
+) -> u16 {
     let mut pseudo = Vec::with_capacity(40 + payload.len());
     pseudo.extend_from_slice(&src.octets());
     pseudo.extend_from_slice(&dst.octets());
@@ -2923,7 +3030,11 @@ pub(super) fn verify_built_frame_checksums(frame: &[u8]) -> (bool, bool) {
     // --- L4 checksum verification (TCP or UDP) ---
     // Use ip_total_len to bound the L4 segment — Ethernet padding bytes beyond
     // ip_total_len must NOT be included in the checksum pseudo-header or payload.
-    let l4_len = if ip_total_len > ihl { ip_total_len - ihl } else { 0 };
+    let l4_len = if ip_total_len > ihl {
+        ip_total_len - ihl
+    } else {
+        0
+    };
     let l4_ok = if protocol == PROTO_TCP {
         let segment = match packet.get(ihl..ihl + l4_len) {
             Some(s) if s.len() >= 20 => s,
@@ -2972,7 +3083,11 @@ pub(super) fn verify_built_frame_checksums(frame: &[u8]) -> (bool, bool) {
                 pseudo[csum_off + 1] = 0;
             }
             let expected_udp_csum = checksum16(&pseudo);
-            let expected_udp_csum = if expected_udp_csum == 0 { 0xffff } else { expected_udp_csum };
+            let expected_udp_csum = if expected_udp_csum == 0 {
+                0xffff
+            } else {
+                expected_udp_csum
+            };
             udp_csum_in_frame == expected_udp_csum
         }
     } else {

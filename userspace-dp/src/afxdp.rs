@@ -2,12 +2,16 @@ use super::{
     BindingStatus, ConfigSnapshot, ExceptionStatus, HAGroupStatus, InjectPacketRequest,
     InterfaceSnapshot, PacketResolution, SessionDeltaInfo,
 };
-use crate::nat::{DnatTable, NatDecision, SourceNatRule, StaticNatTable, match_source_nat, parse_source_nat_rules};
+use crate::nat::{
+    DnatTable, NatDecision, SourceNatRule, StaticNatTable, match_source_nat, parse_source_nat_rules,
+};
 use crate::nat64::{Nat64ReverseInfo, Nat64State};
 use crate::nptv6::Nptv6State;
 use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
-use crate::screen::{ScreenPacketInfo, ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info};
 use crate::prefix::{PrefixV4, PrefixV6};
+use crate::screen::{
+    ScreenPacketInfo, ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info,
+};
 use crate::session::{
     ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
     SessionLookup, SessionMetadata, SessionTable,
@@ -41,47 +45,47 @@ macro_rules! debug_log {
     };
 }
 
-#[path = "afxdp/icmp.rs"]
-mod icmp;
-#[path = "afxdp/icmp_embed.rs"]
-mod icmp_embed;
 #[path = "afxdp/bind.rs"]
 mod bind;
 #[path = "afxdp/frame.rs"]
 mod frame;
+#[path = "afxdp/icmp.rs"]
+mod icmp;
+#[path = "afxdp/icmp_embed.rs"]
+mod icmp_embed;
 #[path = "afxdp/session_glue.rs"]
 mod session_glue;
 #[path = "afxdp/tx.rs"]
 mod tx;
 
+#[cfg(test)]
+use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
     AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
     open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets,
     reserved_tx_frames, umem_ring_size,
 };
 #[cfg(test)]
-use self::bind::{AfXdpBinder, alternate_bind_strategy, bind_strategy_for_driver, binder_for_strategy};
-#[cfg(test)]
-use self::bind::bind_flag_candidates_for_driver;
-use self::icmp::{
-    build_local_time_exceeded_request, is_icmp_error,
+use self::bind::{
+    AfXdpBinder, alternate_bind_strategy, bind_strategy_for_driver, binder_for_strategy,
 };
+use self::frame::*;
+use self::icmp::{build_local_time_exceeded_request, is_icmp_error};
 #[cfg(test)]
 use self::icmp::{
     build_local_time_exceeded_v4, build_local_time_exceeded_v6, packet_ttl_would_expire,
-};
-use self::icmp_embed::{
-    build_nat_reversed_icmp_error_v4, build_nat_reversed_icmp_error_v6,
-    finalize_embedded_icmp_resolution, try_embedded_icmp_nat_match,
 };
 #[cfg(test)]
 use self::icmp_embed::{
     EmbeddedIcmpMatch, try_embedded_icmp_nat_match_from_frame,
     try_embedded_icmp_session_match_from_frame,
 };
-use self::frame::*;
-use self::tx::*;
+use self::icmp_embed::{
+    build_nat_reversed_icmp_error_v4, build_nat_reversed_icmp_error_v6,
+    finalize_embedded_icmp_resolution, try_embedded_icmp_nat_match,
+};
 use self::session_glue::*;
+use self::tx::*;
 
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
 const USERSPACE_META_VERSION: u16 = 4;
@@ -113,8 +117,7 @@ const MAX_RX_BATCHES_PER_POLL: usize = 4;
  */
 const XSK_BIND_FLAGS_ZEROCOPY: u16 =
     SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY;
-const XSK_BIND_FLAGS_COPY: u16 =
-    SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_COPY;
+const XSK_BIND_FLAGS_COPY: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_COPY;
 const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 1;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
@@ -1202,7 +1205,7 @@ struct BindingWorker {
     scratch_fill: Vec<u64>,
     scratch_prepared_tx: Vec<PreparedTxRequest>,
     scratch_local_tx: Vec<(u64, TxRequest)>,
-    in_flight_forward_recycles: FastMap<u64, u32>,
+    in_flight_prepared_recycles: FastMap<u64, PreparedTxRecycle>,
     heartbeat_map_fd: c_int,
     session_map_fd: c_int,
     last_heartbeat_update_ns: u64,
@@ -1219,23 +1222,23 @@ struct BindingWorker {
     dbg_rx_empty: u64,
     dbg_rx_wakeups: u64,
     // TX pipeline debug counters
-    dbg_tx_ring_submitted: u64,   // descriptors inserted into TX ring
-    dbg_tx_ring_full: u64,        // times TX ring insert returned 0
-    dbg_completions_reaped: u64,  // completion descriptors read
-    dbg_sendto_calls: u64,        // number of sendto/wake calls
-    dbg_sendto_err: u64,          // sendto returned error (non-EAGAIN/ENOBUFS)
-    dbg_sendto_eagain: u64,       // sendto returned EAGAIN/EWOULDBLOCK
-    dbg_sendto_enobufs: u64,      // sendto returned ENOBUFS (kernel TX drop)
-    dbg_pending_overflow: u64,    // drops from bound_pending overflow
-    dbg_tx_tcp_rst: u64,          // TCP RST packets transmitted
+    dbg_tx_ring_submitted: u64,  // descriptors inserted into TX ring
+    dbg_tx_ring_full: u64,       // times TX ring insert returned 0
+    dbg_completions_reaped: u64, // completion descriptors read
+    dbg_sendto_calls: u64,       // number of sendto/wake calls
+    dbg_sendto_err: u64,         // sendto returned error (non-EAGAIN/ENOBUFS)
+    dbg_sendto_eagain: u64,      // sendto returned EAGAIN/EWOULDBLOCK
+    dbg_sendto_enobufs: u64,     // sendto returned ENOBUFS (kernel TX drop)
+    dbg_pending_overflow: u64,   // drops from bound_pending overflow
+    dbg_tx_tcp_rst: u64,         // TCP RST packets transmitted
     // Ring diagnostics — raw values from xdpilone API
-    dbg_rx_avail_nonzero: u64,    // times rx.available() > 0
-    dbg_rx_avail_max: u32,        // max rx.available() seen this interval
-    dbg_fill_pending: u32,        // fill ring: userspace produced - kernel consumed
-    dbg_device_avail: u32,        // device queue available (completion ring pending)
-    dbg_rx_wake_sendto_ok: u64,   // sendto() returned >= 0 in maybe_wake_rx
-    dbg_rx_wake_sendto_err: u64,  // sendto() returned < 0 in maybe_wake_rx
-    dbg_rx_wake_sendto_errno: i32,// last errno from sendto in maybe_wake_rx
+    dbg_rx_avail_nonzero: u64,     // times rx.available() > 0
+    dbg_rx_avail_max: u32,         // max rx.available() seen this interval
+    dbg_fill_pending: u32,         // fill ring: userspace produced - kernel consumed
+    dbg_device_avail: u32,         // device queue available (completion ring pending)
+    dbg_rx_wake_sendto_ok: u64,    // sendto() returned >= 0 in maybe_wake_rx
+    dbg_rx_wake_sendto_err: u64,   // sendto() returned < 0 in maybe_wake_rx
+    dbg_rx_wake_sendto_errno: i32, // last errno from sendto in maybe_wake_rx
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1354,7 +1357,7 @@ struct PendingForwardRequest {
 struct PreparedTxRequest {
     offset: u64,
     len: u32,
-    recycle_slot: Option<u32>,
+    recycle: PreparedTxRecycle,
     #[allow(dead_code)]
     expected_ports: Option<(u16, u16)>,
     #[allow(dead_code)]
@@ -1362,6 +1365,12 @@ struct PreparedTxRequest {
     #[allow(dead_code)]
     expected_protocol: u8,
     flow_key: Option<SessionKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedTxRecycle {
+    FreeTxFrame,
+    FillOnSlot(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1426,7 +1435,7 @@ impl BindingWorker {
                 bind_strategy,
                 driver_name.as_deref(),
             )
-                .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
+            .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
         prime_fill_ring_offsets(&mut device, &initial_fill_frames)?;
 
         let user_fd = user.as_raw_fd();
@@ -1487,7 +1496,7 @@ impl BindingWorker {
             scratch_fill: Vec::with_capacity(FILL_BATCH_SIZE),
             scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
             scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
-            in_flight_forward_recycles: FastMap::default(),
+            in_flight_prepared_recycles: FastMap::default(),
             heartbeat_map_fd,
             session_map_fd,
             last_heartbeat_update_ns: init_now,
@@ -1554,7 +1563,11 @@ impl WorkerUmem {
         };
         let umem = unsafe { Umem::new(umem_cfg, area.as_nonnull_slice()) }
             .map_err(|e| format!("create umem: {e}"))?;
-        Ok(Self { area, umem, total_frames })
+        Ok(Self {
+            area,
+            umem,
+            total_frames,
+        })
     }
 }
 
@@ -1589,37 +1602,37 @@ struct DebugPollCounters {
     #[allow(dead_code)]
     metadata_err: u64,
     disposition_other: u64,
-    enqueue_ok: u64,        // forwards successfully enqueued to target binding TX
-    enqueue_inplace: u64,   // in-place TX rewrites (same UMEM)
-    enqueue_direct: u64,    // direct-to-UMEM TX (cross binding)
-    enqueue_copy: u64,      // Vec copy-path TX
+    enqueue_ok: u64,      // forwards successfully enqueued to target binding TX
+    enqueue_inplace: u64, // in-place TX rewrites (same UMEM)
+    enqueue_direct: u64,  // direct-to-UMEM TX (cross binding)
+    enqueue_copy: u64,    // Vec copy-path TX
     // Direction-specific counters
-    rx_from_trust: u64,     // packets received from trust-side interfaces
-    rx_from_wan: u64,       // packets received from wan-side interfaces
-    fwd_trust_to_wan: u64,  // forwards from trust to wan
-    fwd_wan_to_trust: u64,  // forwards from wan to trust
-    nat_applied_snat: u64,  // SNAT rewrites applied
-    nat_applied_dnat: u64,  // DNAT (reverse-SNAT) rewrites applied
-    nat_applied_none: u64,  // no NAT rewrite
+    rx_from_trust: u64,    // packets received from trust-side interfaces
+    rx_from_wan: u64,      // packets received from wan-side interfaces
+    fwd_trust_to_wan: u64, // forwards from trust to wan
+    fwd_wan_to_trust: u64, // forwards from wan to trust
+    nat_applied_snat: u64, // SNAT rewrites applied
+    nat_applied_dnat: u64, // DNAT (reverse-SNAT) rewrites applied
+    nat_applied_none: u64, // no NAT rewrite
     #[allow(dead_code)]
-    frame_build_none: u64,  // build_forwarded_frame returned None (why?)
-    rx_tcp_rst: u64,        // TCP RST flags seen in RX frames
+    frame_build_none: u64, // build_forwarded_frame returned None (why?)
+    rx_tcp_rst: u64,       // TCP RST flags seen in RX frames
     #[allow(dead_code)]
-    tx_tcp_rst: u64,        // TCP RST flags seen in TX frames (forwarded)
-    rx_bytes_total: u64,    // total RX bytes (for avg frame size calculation)
-    tx_bytes_total: u64,    // total TX bytes submitted to ring
-    rx_oversized: u64,      // RX frames where desc.len > 1514
-    rx_max_frame: u32,      // max desc.len seen in RX
-    tx_max_frame: u32,      // max frame len submitted to TX
+    tx_tcp_rst: u64, // TCP RST flags seen in TX frames (forwarded)
+    rx_bytes_total: u64,   // total RX bytes (for avg frame size calculation)
+    tx_bytes_total: u64,   // total TX bytes submitted to ring
+    rx_oversized: u64,     // RX frames where desc.len > 1514
+    rx_max_frame: u32,     // max desc.len seen in RX
+    tx_max_frame: u32,     // max frame len submitted to TX
     seg_needed_but_none: u64, // oversized frames where segmentation returned None
-    wan_return_hits: u64,   // session hits for WAN return traffic (first N logged)
+    wan_return_hits: u64,  // session hits for WAN return traffic (first N logged)
     #[allow(dead_code)]
     wan_return_misses: u64, // session misses for WAN return traffic
-    rx_tcp_fin: u64,        // TCP FIN flags seen in RX
-    rx_tcp_synack: u64,     // TCP SYN+ACK seen in RX
+    rx_tcp_fin: u64,       // TCP FIN flags seen in RX
+    rx_tcp_synack: u64,    // TCP SYN+ACK seen in RX
     rx_tcp_zero_window: u64, // TCP zero-window seen in RX (forwarded frames)
-    fwd_tcp_fin: u64,       // TCP FIN in forwarded frames
-    fwd_tcp_rst: u64,       // TCP RST in forwarded frames
+    fwd_tcp_fin: u64,      // TCP FIN in forwarded frames
+    fwd_tcp_rst: u64,      // TCP RST in forwarded frames
     fwd_tcp_zero_window: u64, // zero-window in forwarded frames
 }
 
@@ -1668,8 +1681,7 @@ fn poll_binding(
                 self.rx_packets = 0;
             }
             if self.rx_bytes != 0 {
-                live.rx_bytes
-                    .fetch_add(self.rx_bytes, Ordering::Relaxed);
+                live.rx_bytes.fetch_add(self.rx_bytes, Ordering::Relaxed);
                 self.rx_bytes = 0;
             }
             if self.rx_batches != 0 {
@@ -1805,21 +1817,30 @@ fn poll_binding(
             // TCP flag detection on RX
             if cfg!(feature = "debug-log") {
                 if desc.len >= 54 {
-                    if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize) {
+                    if let Some(rx_frame) =
+                        unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
+                    {
                         // Check for FIN, SYN+ACK, zero-window
                         if let Some(tcp_info) = extract_tcp_flags_and_window(rx_frame) {
-                            if (tcp_info.0 & 0x01) != 0 { // FIN
+                            if (tcp_info.0 & 0x01) != 0 {
+                                // FIN
                                 dbg.rx_tcp_fin += 1;
                             }
-                            if (tcp_info.0 & 0x12) == 0x12 { // SYN+ACK
+                            if (tcp_info.0 & 0x12) == 0x12 {
+                                // SYN+ACK
                                 dbg.rx_tcp_synack += 1;
                             }
-                            if tcp_info.1 == 0 && (tcp_info.0 & 0x02) == 0 { // zero window, not SYN
+                            if tcp_info.1 == 0 && (tcp_info.0 & 0x02) == 0 {
+                                // zero window, not SYN
                                 dbg.rx_tcp_zero_window += 1;
                                 if dbg.rx_tcp_zero_window <= 10 {
-                                    eprintln!("RX_TCP_ZERO_WIN[{}]: if={} q={} len={} flags=0x{:02x}",
-                                        dbg.rx_tcp_zero_window, ident.ifindex, ident.queue_id,
-                                        desc.len, tcp_info.0,
+                                    eprintln!(
+                                        "RX_TCP_ZERO_WIN[{}]: if={} q={} len={} flags=0x{:02x}",
+                                        dbg.rx_tcp_zero_window,
+                                        ident.ifindex,
+                                        ident.queue_id,
+                                        desc.len,
+                                        tcp_info.0,
                                     );
                                 }
                             }
@@ -1834,11 +1855,13 @@ fn poll_binding(
                                 if n < 50 {
                                     c.set(n + 1);
                                     let summary = decode_frame_summary(rx_frame);
-                                    eprintln!("RST_DETECT RX[{}]: if={} q={} len={} {}",
+                                    eprintln!(
+                                        "RST_DETECT RX[{}]: if={} q={} len={} {}",
                                         n, ident.ifindex, ident.queue_id, desc.len, summary,
                                     );
                                     if n < 5 {
-                                        let hex_len = (desc.len as usize).min(rx_frame.len()).min(80);
+                                        let hex_len =
+                                            (desc.len as usize).min(rx_frame.len()).min(80);
                                         let hex: String = rx_frame[..hex_len]
                                             .iter()
                                             .map(|b| format!("{:02x}", b))
@@ -1857,7 +1880,8 @@ fn poll_binding(
                 if desc.len >= 8 {
                     if let Some(first8) = unsafe { &*area }.slice(desc.addr as usize, 8) {
                         if first8 == &0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes() {
-                            eprintln!("DBG POISON_DETECTED: if={} q={} desc.addr={:#x} desc.len={} — kernel returned poisoned frame!",
+                            eprintln!(
+                                "DBG POISON_DETECTED: if={} q={} desc.addr={:#x} desc.len={} — kernel returned poisoned frame!",
                                 ident.ifindex, ident.queue_id, desc.addr, desc.len,
                             );
                         }
@@ -1866,16 +1890,23 @@ fn poll_binding(
             }
             if cfg!(feature = "debug-log") {
                 if dbg.rx <= 10 {
-                    if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize) {
+                    if let Some(rx_frame) =
+                        unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
+                    {
                         // Decode IP+TCP details from the frame
                         let pkt_detail = decode_frame_summary(rx_frame);
-                        eprintln!("DBG RX_ETH[{}]: if={} q={} len={} {}",
+                        eprintln!(
+                            "DBG RX_ETH[{}]: if={} q={} len={} {}",
                             dbg.rx, ident.ifindex, ident.queue_id, desc.len, pkt_detail,
                         );
                         // Full hex dump for first 3 packets
                         if dbg.rx <= 3 {
                             let dump_len = (desc.len as usize).min(rx_frame.len()).min(80);
-                            let hex: String = rx_frame[..dump_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                            let hex: String = rx_frame[..dump_len]
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
                             eprintln!("DBG RX_HEX[{}]: {}", dbg.rx, hex);
                         }
                     }
@@ -1910,16 +1941,21 @@ fn poll_binding(
                     // Resolve ingress zone name for screen profile lookup.
                     if screen.has_profiles() {
                         if let Some(flow) = flow.as_ref() {
-                            let zone_name = ingress_zone_override
-                                .as_deref()
-                                .or_else(|| forwarding.ifindex_to_zone.get(&(meta.ingress_ifindex as i32)).map(|s| s.as_str()));
+                            let zone_name = ingress_zone_override.as_deref().or_else(|| {
+                                forwarding
+                                    .ifindex_to_zone
+                                    .get(&(meta.ingress_ifindex as i32))
+                                    .map(|s| s.as_str())
+                            });
                             if let Some(zone_name) = zone_name {
                                 let l3_off = if meta.ingress_vlan_id > 0 {
                                     18
                                 } else {
                                     14 // default Ethernet header
                                 };
-                                let screen_pkt = if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize) {
+                                let screen_pkt = if let Some(rx_frame) =
+                                    unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
+                                {
                                     extract_screen_info(
                                         rx_frame,
                                         meta.addr_family,
@@ -1948,7 +1984,9 @@ fn poll_binding(
                                         ip_total_len: 0,
                                     }
                                 };
-                                if let ScreenVerdict::Drop(_reason) = screen.check_packet(zone_name, &screen_pkt, now_secs) {
+                                if let ScreenVerdict::Drop(_reason) =
+                                    screen.check_packet(zone_name, &screen_pkt, now_secs)
+                                {
                                     binding.live.screen_drops.fetch_add(1, Ordering::Relaxed);
                                     binding.scratch_recycle.push(desc.addr);
                                     continue;
@@ -2070,7 +2108,9 @@ fn poll_binding(
                                 None
                             };
                             let static_dnat_decision = if dnat_decision.is_none() {
-                                forwarding.static_nat.match_dnat(resolution_target, ingress_zone_name)
+                                forwarding
+                                    .static_nat
+                                    .match_dnat(resolution_target, ingress_zone_name)
                             } else {
                                 None
                             };
@@ -2098,29 +2138,34 @@ fn poll_binding(
                             // If dst is IPv6 matching a NAT64 prefix, extract IPv4
                             // dest and allocate an IPv4 SNAT address. Route lookup
                             // must use the IPv4 destination.
-                            let nat64_match = if pre_routing_dnat.is_none() && nptv6_inbound.is_none() {
-                                if let IpAddr::V6(dst_v6) = resolution_target {
-                                    forwarding.nat64.match_ipv6_dest(dst_v6).and_then(|(idx, dst_v4)| {
-                                        let snat_v4 = forwarding.nat64.allocate_v4_source(idx)?;
-                                        Some((idx, dst_v4, snat_v4, dst_v6))
-                                    })
+                            let nat64_match =
+                                if pre_routing_dnat.is_none() && nptv6_inbound.is_none() {
+                                    if let IpAddr::V6(dst_v6) = resolution_target {
+                                        forwarding.nat64.match_ipv6_dest(dst_v6).and_then(
+                                            |(idx, dst_v4)| {
+                                                let snat_v4 =
+                                                    forwarding.nat64.allocate_v4_source(idx)?;
+                                                Some((idx, dst_v4, snat_v4, dst_v6))
+                                            },
+                                        )
+                                    } else {
+                                        None
+                                    }
                                 } else {
                                     None
-                                }
-                            } else {
-                                None
-                            };
+                                };
 
-                            let effective_resolution_target = if let Some((_, dst_v4, _, _)) = &nat64_match {
-                                IpAddr::V4(*dst_v4)
-                            } else if let Some(internal_dst) = nptv6_inbound {
-                                IpAddr::V6(internal_dst)
-                            } else {
-                                match &pre_routing_dnat {
-                                    Some(d) => d.rewrite_dst.unwrap_or(resolution_target),
-                                    None => resolution_target,
-                                }
-                            };
+                            let effective_resolution_target =
+                                if let Some((_, dst_v4, _, _)) = &nat64_match {
+                                    IpAddr::V4(*dst_v4)
+                                } else if let Some(internal_dst) = nptv6_inbound {
+                                    IpAddr::V6(internal_dst)
+                                } else {
+                                    match &pre_routing_dnat {
+                                        Some(d) => d.rewrite_dst.unwrap_or(resolution_target),
+                                        None => resolution_target,
+                                    }
+                                };
 
                             let resolution = ingress_interface_local_resolution_on_session_miss(
                                 forwarding,
@@ -2174,23 +2219,35 @@ fn poll_binding(
                             // Debug: log session miss with flow details (throttled)
                             if cfg!(feature = "debug-log") {
                                 if dbg.session_miss <= 10 || is_trust_flow {
-                                    eprintln!("DBG SESS_MISS[{}]: {}:{} -> {}:{} proto={} tcp_flags=0x{:02x} ingress_if={} disp={:?} egress_if={} neigh={:?} zone={}->{}",
+                                    eprintln!(
+                                        "DBG SESS_MISS[{}]: {}:{} -> {}:{} proto={} tcp_flags=0x{:02x} ingress_if={} disp={:?} egress_if={} neigh={:?} zone={}->{}",
                                         dbg.session_miss,
-                                        flow.src_ip, flow.forward_key.src_port,
-                                        flow.dst_ip, flow.forward_key.dst_port,
-                                        meta.protocol, meta.tcp_flags,
+                                        flow.src_ip,
+                                        flow.forward_key.src_port,
+                                        flow.dst_ip,
+                                        flow.forward_key.dst_port,
+                                        meta.protocol,
+                                        meta.tcp_flags,
                                         meta.ingress_ifindex,
                                         resolution.disposition,
                                         resolution.egress_ifindex,
-                                        resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
-                                        from_zone, to_zone,
+                                        resolution.neighbor_mac.map(|m| format!(
+                                            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                            m[0], m[1], m[2], m[3], m[4], m[5]
+                                        )),
+                                        from_zone,
+                                        to_zone,
                                     );
                                     // If from WAN (if6), dump what session key was tried
                                     if meta.ingress_ifindex == 6 {
-                                        eprintln!("DBG SESS_MISS_KEY: af={} proto={} key={}:{}->{}:{} bpf_entries={} local_sessions={}",
-                                            flow.forward_key.addr_family, flow.forward_key.protocol,
-                                            flow.forward_key.src_ip, flow.forward_key.src_port,
-                                            flow.forward_key.dst_ip, flow.forward_key.dst_port,
+                                        eprintln!(
+                                            "DBG SESS_MISS_KEY: af={} proto={} key={}:{}->{}:{} bpf_entries={} local_sessions={}",
+                                            flow.forward_key.addr_family,
+                                            flow.forward_key.protocol,
+                                            flow.forward_key.src_ip,
+                                            flow.forward_key.src_port,
+                                            flow.forward_key.dst_ip,
+                                            flow.forward_key.dst_port,
                                             count_bpf_session_entries(binding.session_map_fd),
                                             sessions.len(),
                                         );
@@ -2237,134 +2294,137 @@ fn poll_binding(
                                 false
                             };
                             if is_embedded_icmp_error {
+                                #[cfg(feature = "debug-log")]
+                                let icmpv6_trace = meta.protocol == PROTO_ICMPV6
+                                    && ICMPV6_EMBED_LOGGED.fetch_add(1, Ordering::Relaxed) < 32;
+                                if let Some(icmp_match) = try_embedded_icmp_nat_match(
+                                    unsafe { &*area },
+                                    desc,
+                                    meta,
+                                    sessions,
+                                    forwarding,
+                                    dynamic_neighbors,
+                                    shared_sessions,
+                                    shared_nat_sessions,
+                                    now_ns,
+                                ) {
                                     #[cfg(feature = "debug-log")]
-                                    let icmpv6_trace = meta.protocol == PROTO_ICMPV6
-                                        && ICMPV6_EMBED_LOGGED.fetch_add(1, Ordering::Relaxed) < 32;
-                                    if let Some(icmp_match) = try_embedded_icmp_nat_match(
-                                        unsafe { &*area },
-                                        desc,
-                                        meta,
-                                        sessions,
-                                        forwarding,
-                                        dynamic_neighbors,
-                                        shared_sessions,
-                                        shared_nat_sessions,
-                                        now_ns,
-                                    ) {
-                                        #[cfg(feature = "debug-log")]
-                                        if icmpv6_trace {
-                                            debug_log!(
-                                                "ICMPV6_EMBED: match orig_src={} orig_port={} nat={:?} resolution={:?} egress_if={} tx_if={} neigh={:?}",
-                                                icmp_match.original_src,
-                                                icmp_match.original_src_port,
-                                                icmp_match.nat,
-                                                icmp_match.resolution.disposition,
-                                                icmp_match.resolution.egress_ifindex,
-                                                icmp_match.resolution.tx_ifindex,
-                                                icmp_match.resolution.neighbor_mac,
-                                            );
-                                        }
-                                        if icmp_match.nat.rewrite_src.is_some() {
-                                            let icmp_resolution = finalize_embedded_icmp_resolution(
-                                                forwarding,
-                                                ha_state,
-                                                now_secs,
-                                                meta.ingress_ifindex as i32,
-                                                &icmp_match,
-                                            );
-                                            let frame_data = unsafe { &*area }
-                                                .slice(desc.addr as usize, desc.len as usize);
-                                            let rewritten = frame_data.and_then(|frame| {
-                                                match meta.addr_family as i32 {
-                                                    libc::AF_INET => {
-                                                        build_nat_reversed_icmp_error_v4(
-                                                            frame, meta, &icmp_match,
-                                                        )
-                                                    }
-                                                    libc::AF_INET6 => {
-                                                        build_nat_reversed_icmp_error_v6(
-                                                            frame, meta, &icmp_match,
-                                                        )
-                                                    }
-                                                    _ => None,
-                                                }
-                                            });
-                                            if let Some(rewritten_frame) = rewritten {
-                                                let icmp_decision = SessionDecision {
-                                                    resolution: icmp_resolution,
-                                                    nat: NatDecision::default(),
-                                                };
-                                                let target_ifindex =
-                                                    if icmp_decision.resolution.tx_ifindex > 0 {
-                                                        icmp_decision.resolution.tx_ifindex
-                                                    } else {
-                                                        resolve_tx_binding_ifindex(
-                                                            forwarding,
-                                                            icmp_decision.resolution.egress_ifindex,
-                                                        )
-                                                    };
-                                                binding.scratch_forwards.push(
-                                                    PendingForwardRequest {
-                                                        target_ifindex,
-                                                        ingress_queue_id: ident.queue_id,
-                                                        source_offset: desc.addr,
-                                                        desc,
-                                                        meta,
-                                                        decision: icmp_decision,
-                                                        expected_ports: None,
-                                                        flow_key: None,
-                                                        nat64_reverse: None,
-                                                        prebuilt_frame: Some(rewritten_frame),
-                                                    },
-                                                );
-                                                recycle_now = false;
-                                                #[cfg(feature = "debug-log")]
-                                                if icmpv6_trace {
-                                                    debug_log!(
-                                                        "ICMPV6_EMBED: queued resolution={:?} egress_if={} tx_if={} target_if={}",
-                                                        icmp_decision.resolution.disposition,
+                                    if icmpv6_trace {
+                                        debug_log!(
+                                            "ICMPV6_EMBED: match orig_src={} orig_port={} nat={:?} resolution={:?} egress_if={} tx_if={} neigh={:?}",
+                                            icmp_match.original_src,
+                                            icmp_match.original_src_port,
+                                            icmp_match.nat,
+                                            icmp_match.resolution.disposition,
+                                            icmp_match.resolution.egress_ifindex,
+                                            icmp_match.resolution.tx_ifindex,
+                                            icmp_match.resolution.neighbor_mac,
+                                        );
+                                    }
+                                    if icmp_match.nat.rewrite_src.is_some() {
+                                        let icmp_resolution = finalize_embedded_icmp_resolution(
+                                            forwarding,
+                                            ha_state,
+                                            now_secs,
+                                            meta.ingress_ifindex as i32,
+                                            &icmp_match,
+                                        );
+                                        let frame_data = unsafe { &*area }
+                                            .slice(desc.addr as usize, desc.len as usize);
+                                        let rewritten = frame_data.and_then(|frame| {
+                                            match meta.addr_family as i32 {
+                                                libc::AF_INET => build_nat_reversed_icmp_error_v4(
+                                                    frame,
+                                                    meta,
+                                                    &icmp_match,
+                                                ),
+                                                libc::AF_INET6 => build_nat_reversed_icmp_error_v6(
+                                                    frame,
+                                                    meta,
+                                                    &icmp_match,
+                                                ),
+                                                _ => None,
+                                            }
+                                        });
+                                        if let Some(rewritten_frame) = rewritten {
+                                            let icmp_decision = SessionDecision {
+                                                resolution: icmp_resolution,
+                                                nat: NatDecision::default(),
+                                            };
+                                            let target_ifindex =
+                                                if icmp_decision.resolution.tx_ifindex > 0 {
+                                                    icmp_decision.resolution.tx_ifindex
+                                                } else {
+                                                    resolve_tx_binding_ifindex(
+                                                        forwarding,
                                                         icmp_decision.resolution.egress_ifindex,
-                                                        icmp_decision.resolution.tx_ifindex,
-                                                        target_ifindex,
-                                                    );
-                                                }
-                                            } else {
-                                                #[cfg(feature = "debug-log")]
-                                                if icmpv6_trace {
-                                                    debug_log!(
-                                                        "ICMPV6_EMBED: build_none resolution={:?} egress_if={} tx_if={} neigh={:?}",
-                                                        icmp_resolution.disposition,
-                                                        icmp_resolution.egress_ifindex,
-                                                        icmp_resolution.tx_ifindex,
-                                                        icmp_resolution.neighbor_mac,
-                                                    );
-                                                }
+                                                    )
+                                                };
+                                            binding.scratch_forwards.push(PendingForwardRequest {
+                                                target_ifindex,
+                                                ingress_queue_id: ident.queue_id,
+                                                source_offset: desc.addr,
+                                                desc,
+                                                meta,
+                                                decision: icmp_decision,
+                                                expected_ports: None,
+                                                flow_key: None,
+                                                nat64_reverse: None,
+                                                prebuilt_frame: Some(rewritten_frame),
+                                            });
+                                            recycle_now = false;
+                                            #[cfg(feature = "debug-log")]
+                                            if icmpv6_trace {
+                                                debug_log!(
+                                                    "ICMPV6_EMBED: queued resolution={:?} egress_if={} tx_if={} target_if={}",
+                                                    icmp_decision.resolution.disposition,
+                                                    icmp_decision.resolution.egress_ifindex,
+                                                    icmp_decision.resolution.tx_ifindex,
+                                                    target_ifindex,
+                                                );
                                             }
                                         } else {
                                             #[cfg(feature = "debug-log")]
                                             if icmpv6_trace {
-                                                debug_log!("ICMPV6_EMBED: no_rewrite nat={:?}", icmp_match.nat);
+                                                debug_log!(
+                                                    "ICMPV6_EMBED: build_none resolution={:?} egress_if={} tx_if={} neigh={:?}",
+                                                    icmp_resolution.disposition,
+                                                    icmp_resolution.egress_ifindex,
+                                                    icmp_resolution.tx_ifindex,
+                                                    icmp_resolution.neighbor_mac,
+                                                );
                                             }
                                         }
                                     } else {
                                         #[cfg(feature = "debug-log")]
                                         if icmpv6_trace {
                                             debug_log!(
-                                                "ICMPV6_EMBED: no_match outer={}:{} -> {}:{} ingress_if={} from_zone={} to_zone={}",
-                                                flow.src_ip,
-                                                flow.forward_key.src_port,
-                                                flow.dst_ip,
-                                                flow.forward_key.dst_port,
-                                                meta.ingress_ifindex,
-                                                from_zone,
-                                                to_zone,
+                                                "ICMPV6_EMBED: no_rewrite nat={:?}",
+                                                icmp_match.nat
                                             );
                                         }
                                     }
-                                    // Permit without policy check or session install.
-                                    // If NAT reversal was applied, the prebuilt frame
-                                    // is already queued. If not, fall through to slow-path.
-                                } else if resolution.disposition == ForwardingDisposition::ForwardCandidate {
+                                } else {
+                                    #[cfg(feature = "debug-log")]
+                                    if icmpv6_trace {
+                                        debug_log!(
+                                            "ICMPV6_EMBED: no_match outer={}:{} -> {}:{} ingress_if={} from_zone={} to_zone={}",
+                                            flow.src_ip,
+                                            flow.forward_key.src_port,
+                                            flow.dst_ip,
+                                            flow.forward_key.dst_port,
+                                            meta.ingress_ifindex,
+                                            from_zone,
+                                            to_zone,
+                                        );
+                                    }
+                                }
+                                // Permit without policy check or session install.
+                                // If NAT reversal was applied, the prebuilt frame
+                                // is already queued. If not, fall through to slow-path.
+                            } else if resolution.disposition
+                                == ForwardingDisposition::ForwardCandidate
+                            {
                                 let owner_rg_id =
                                     owner_rg_for_flow(forwarding, resolution.egress_ifindex);
                                 if allow_unsolicited_dns_reply(forwarding, flow) {
@@ -2382,8 +2442,15 @@ fn poll_binding(
                                 ) {
                                     // NAT64: cross-family translation takes
                                     // priority over same-family SNAT.
-                                    let nat64_info = if let Some((_, dst_v4, snat_v4, orig_dst_v6)) = nat64_match {
-                                        decision.nat = Nat64State::forward_decision(snat_v4, dst_v4);
+                                    let nat64_info = if let Some((
+                                        _,
+                                        dst_v4,
+                                        snat_v4,
+                                        orig_dst_v6,
+                                    )) = nat64_match
+                                    {
+                                        decision.nat =
+                                            Nat64State::forward_decision(snat_v4, dst_v4);
                                         Some(Nat64ReverseInfo {
                                             orig_src_v6: match flow.src_ip {
                                                 IpAddr::V6(v6) => v6,
@@ -2398,8 +2465,11 @@ fn poll_binding(
                                         if decision.nat.rewrite_dst.is_none() {
                                             // Try NPTv6 outbound: if src matches an internal prefix,
                                             // translate to external prefix (stateless, no L4 csum update).
-                                            let nptv6_snat = if let IpAddr::V6(mut src_v6) = flow.src_ip {
-                                                if forwarding.nptv6.translate_outbound(&mut src_v6) {
+                                            let nptv6_snat = if let IpAddr::V6(mut src_v6) =
+                                                flow.src_ip
+                                            {
+                                                if forwarding.nptv6.translate_outbound(&mut src_v6)
+                                                {
                                                     Some(NatDecision {
                                                         rewrite_src: Some(IpAddr::V6(src_v6)),
                                                         rewrite_dst: None,
@@ -2414,9 +2484,11 @@ fn poll_binding(
                                                 None
                                             };
                                             decision.nat = nptv6_snat
-                                                .or_else(|| forwarding
-                                                    .static_nat
-                                                    .match_snat(flow.src_ip, &from_zone))
+                                                .or_else(|| {
+                                                    forwarding
+                                                        .static_nat
+                                                        .match_snat(flow.src_ip, &from_zone)
+                                                })
                                                 .or_else(|| {
                                                     match_source_nat_for_flow(
                                                         forwarding,
@@ -2532,7 +2604,9 @@ fn poll_binding(
                                         // For NAT64: the reverse key is IPv4 (different AF
                                         // from the forward IPv6 key). The reply arrives as
                                         // IPv4: src=dst_v4, dst=snat_v4.
-                                        let (reverse_key, reverse_protocol) = if nat64_info.is_some() {
+                                        let (reverse_key, reverse_protocol) = if nat64_info
+                                            .is_some()
+                                        {
                                             let nat = decision.nat;
                                             let dst_v4 = match nat.rewrite_dst {
                                                 Some(IpAddr::V4(v4)) => v4,
@@ -2547,19 +2621,31 @@ fn poll_binding(
                                                 PROTO_ICMPV6 => PROTO_ICMP,
                                                 p => p,
                                             };
-                                            let (src_port, dst_port) = if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-                                                (flow.forward_key.src_port, flow.forward_key.dst_port)
+                                            let (src_port, dst_port) = if matches!(
+                                                meta.protocol,
+                                                PROTO_ICMP | PROTO_ICMPV6
+                                            ) {
+                                                (
+                                                    flow.forward_key.src_port,
+                                                    flow.forward_key.dst_port,
+                                                )
                                             } else {
-                                                (flow.forward_key.dst_port, flow.forward_key.src_port)
+                                                (
+                                                    flow.forward_key.dst_port,
+                                                    flow.forward_key.src_port,
+                                                )
                                             };
-                                            (SessionKey {
-                                                addr_family: libc::AF_INET as u8,
-                                                protocol: rev_proto,
-                                                src_ip: IpAddr::V4(dst_v4),
-                                                dst_ip: IpAddr::V4(snat_v4),
-                                                src_port,
-                                                dst_port,
-                                            }, rev_proto)
+                                            (
+                                                SessionKey {
+                                                    addr_family: libc::AF_INET as u8,
+                                                    protocol: rev_proto,
+                                                    src_ip: IpAddr::V4(dst_v4),
+                                                    dst_ip: IpAddr::V4(snat_v4),
+                                                    src_port,
+                                                    dst_port,
+                                                },
+                                                rev_proto,
+                                            )
                                         } else {
                                             (flow.reverse_key_with_nat(decision.nat), meta.protocol)
                                         };
@@ -2586,46 +2672,74 @@ fn poll_binding(
                                             );
                                             // Verify session keys and log creations (debug-only: BPF syscalls)
                                             if cfg!(feature = "debug-log") {
-                                                if verify_session_key_in_bpf(binding.session_map_fd, &reverse_key) {
-                                                    SESSION_PUBLISH_VERIFY_OK.fetch_add(1, Ordering::Relaxed);
+                                                if verify_session_key_in_bpf(
+                                                    binding.session_map_fd,
+                                                    &reverse_key,
+                                                ) {
+                                                    SESSION_PUBLISH_VERIFY_OK
+                                                        .fetch_add(1, Ordering::Relaxed);
                                                 } else {
-                                                    SESSION_PUBLISH_VERIFY_FAIL.fetch_add(1, Ordering::Relaxed);
+                                                    SESSION_PUBLISH_VERIFY_FAIL
+                                                        .fetch_add(1, Ordering::Relaxed);
                                                     debug_log!(
                                                         "SESS_VERIFY_FAIL: reverse key NOT found after publish! \
                                                          af={} proto={} {}:{} -> {}:{} (map_fd={})",
-                                                        reverse_key.addr_family, reverse_key.protocol,
-                                                        reverse_key.src_ip, reverse_key.src_port,
-                                                        reverse_key.dst_ip, reverse_key.dst_port,
+                                                        reverse_key.addr_family,
+                                                        reverse_key.protocol,
+                                                        reverse_key.src_ip,
+                                                        reverse_key.src_port,
+                                                        reverse_key.dst_ip,
+                                                        reverse_key.dst_port,
                                                         binding.session_map_fd,
                                                     );
                                                 }
-                                                if !verify_session_key_in_bpf(binding.session_map_fd, &flow.forward_key) {
+                                                if !verify_session_key_in_bpf(
+                                                    binding.session_map_fd,
+                                                    &flow.forward_key,
+                                                ) {
                                                     debug_log!(
                                                         "SESS_VERIFY_FAIL: forward key NOT found! \
                                                          af={} proto={} {}:{} -> {}:{}",
-                                                        flow.forward_key.addr_family, flow.forward_key.protocol,
-                                                        flow.forward_key.src_ip, flow.forward_key.src_port,
-                                                        flow.forward_key.dst_ip, flow.forward_key.dst_port,
+                                                        flow.forward_key.addr_family,
+                                                        flow.forward_key.protocol,
+                                                        flow.forward_key.src_ip,
+                                                        flow.forward_key.src_port,
+                                                        flow.forward_key.dst_ip,
+                                                        flow.forward_key.dst_port,
                                                     );
                                                 }
-                                                let logged = SESSION_CREATIONS_LOGGED.fetch_add(1, Ordering::Relaxed);
+                                                let logged = SESSION_CREATIONS_LOGGED
+                                                    .fetch_add(1, Ordering::Relaxed);
                                                 if logged < 10 {
                                                     debug_log!(
                                                         "SESS_CREATE[{}]: FWD af={} proto={} {}:{} -> {}:{} \
                                                          | REV af={} proto={} {}:{} -> {}:{} \
                                                          | NAT src={:?} dst={:?} \
                                                          | map_fd={} bpf_entries={}",
-                                                        logged, flow.forward_key.addr_family, flow.forward_key.protocol,
-                                                        flow.forward_key.src_ip, flow.forward_key.src_port,
-                                                        flow.forward_key.dst_ip, flow.forward_key.dst_port,
-                                                        reverse_key.addr_family, reverse_key.protocol,
-                                                        reverse_key.src_ip, reverse_key.src_port,
-                                                        reverse_key.dst_ip, reverse_key.dst_port,
-                                                        decision.nat.rewrite_src, decision.nat.rewrite_dst,
+                                                        logged,
+                                                        flow.forward_key.addr_family,
+                                                        flow.forward_key.protocol,
+                                                        flow.forward_key.src_ip,
+                                                        flow.forward_key.src_port,
+                                                        flow.forward_key.dst_ip,
+                                                        flow.forward_key.dst_port,
+                                                        reverse_key.addr_family,
+                                                        reverse_key.protocol,
+                                                        reverse_key.src_ip,
+                                                        reverse_key.src_port,
+                                                        reverse_key.dst_ip,
+                                                        reverse_key.dst_port,
+                                                        decision.nat.rewrite_src,
+                                                        decision.nat.rewrite_dst,
                                                         binding.session_map_fd,
-                                                        count_bpf_session_entries(binding.session_map_fd),
+                                                        count_bpf_session_entries(
+                                                            binding.session_map_fd
+                                                        ),
                                                     );
-                                                    dump_bpf_session_entries(binding.session_map_fd, 20);
+                                                    dump_bpf_session_entries(
+                                                        binding.session_map_fd,
+                                                        20,
+                                                    );
                                                 }
                                             }
                                             created += 1;
@@ -2653,14 +2767,19 @@ fn poll_binding(
                                     }
                                 } else {
                                     dbg.policy_deny += 1;
-                                    if cfg!(feature = "debug-log") && (dbg.policy_deny <= 3 || is_trust_flow) {
+                                    if cfg!(feature = "debug-log")
+                                        && (dbg.policy_deny <= 3 || is_trust_flow)
+                                    {
                                         debug_log!(
                                             "DBG POLICY_DENY[{}]: {}:{} -> {}:{} proto={} zone={}->{}  ingress_if={} egress_if={}",
                                             dbg.policy_deny,
-                                            flow.src_ip, flow.forward_key.src_port,
-                                            flow.dst_ip, flow.forward_key.dst_port,
+                                            flow.src_ip,
+                                            flow.forward_key.src_port,
+                                            flow.dst_ip,
+                                            flow.forward_key.dst_port,
                                             meta.protocol,
-                                            from_zone, to_zone,
+                                            from_zone,
+                                            to_zone,
                                             meta.ingress_ifindex,
                                             resolution.egress_ifindex,
                                         );
@@ -2719,7 +2838,8 @@ fn poll_binding(
                             dbg.fwd_wan_to_trust += 1;
                         }
                         // NAT decision tracking
-                        if decision.nat.rewrite_src.is_some() && decision.nat.rewrite_dst.is_some() {
+                        if decision.nat.rewrite_src.is_some() && decision.nat.rewrite_dst.is_some()
+                        {
                             dbg.nat_applied_snat += 1;
                             dbg.nat_applied_dnat += 1;
                         } else if decision.nat.rewrite_src.is_some() {
@@ -2732,13 +2852,30 @@ fn poll_binding(
                         // Log NAT details for first few forward-candidate packets
                         if cfg!(feature = "debug-log") {
                             if dbg.forward <= 10 {
-                                let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
+                                let flow_str = flow
+                                    .as_ref()
+                                    .map(|f| {
+                                        format!(
+                                            "{}:{} -> {}:{}",
+                                            f.src_ip,
+                                            f.forward_key.src_port,
+                                            f.dst_ip,
+                                            f.forward_key.dst_port
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "no-flow".into());
                                 let nat_str = format!(
                                     "snat={:?} dnat={:?}",
                                     decision.nat.rewrite_src, decision.nat.rewrite_dst,
                                 );
-                                eprintln!("DBG FWD_DECISION[{}]: ingress_if={} egress_if={} {} {} proto={}",
-                                    dbg.forward, ingress_if, egress_if, flow_str, nat_str, meta.protocol,
+                                eprintln!(
+                                    "DBG FWD_DECISION[{}]: ingress_if={} egress_if={} {} {} proto={}",
+                                    dbg.forward,
+                                    ingress_if,
+                                    egress_if,
+                                    flow_str,
+                                    nat_str,
+                                    meta.protocol,
                                 );
                             }
                         }
@@ -2746,54 +2883,128 @@ fn poll_binding(
                         if cfg!(feature = "debug-log") {
                             if meta.protocol == 6 {
                                 // Compare meta.tcp_flags from BPF shim with raw frame TCP flags
-                                let frame_data = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize);
-                                let raw_tcp_info = frame_data.and_then(|data| extract_tcp_flags_and_window(data));
+                                let frame_data =
+                                    unsafe { &*area }.slice(desc.addr as usize, desc.len as usize);
+                                let raw_tcp_info =
+                                    frame_data.and_then(|data| extract_tcp_flags_and_window(data));
                                 let raw_flags = raw_tcp_info.map(|(f, _)| f);
                                 let raw_window = raw_tcp_info.map(|(_, w)| w);
                                 // Log first 20 forwarded TCP packets: compare meta vs raw
                                 if dbg.forward <= 20 {
-                                    let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
-                                    eprintln!("FWD_TCP_CMP[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} l4_off={} {}",
-                                        dbg.forward, meta.tcp_flags,
-                                        raw_flags.map(|f| format!("0x{:02x}", f)).unwrap_or_else(|| "NONE".into()),
-                                        raw_window.map(|w| format!("{}", w)).unwrap_or_else(|| "NONE".into()),
-                                        desc.len, meta.l4_offset, flow_str,
+                                    let flow_str = flow
+                                        .as_ref()
+                                        .map(|f| {
+                                            format!(
+                                                "{}:{} -> {}:{}",
+                                                f.src_ip,
+                                                f.forward_key.src_port,
+                                                f.dst_ip,
+                                                f.forward_key.dst_port
+                                            )
+                                        })
+                                        .unwrap_or_else(|| "no-flow".into());
+                                    eprintln!(
+                                        "FWD_TCP_CMP[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} l4_off={} {}",
+                                        dbg.forward,
+                                        meta.tcp_flags,
+                                        raw_flags
+                                            .map(|f| format!("0x{:02x}", f))
+                                            .unwrap_or_else(|| "NONE".into()),
+                                        raw_window
+                                            .map(|w| format!("{}", w))
+                                            .unwrap_or_else(|| "NONE".into()),
+                                        desc.len,
+                                        meta.l4_offset,
+                                        flow_str,
                                     );
                                     // Hex dump bytes around TCP flags position in raw frame
                                     if let Some(data) = frame_data {
                                         let l4 = meta.l4_offset as usize;
                                         if data.len() > l4 + 20 {
-                                            let tcp_hdr: String = data[l4..l4+20].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                                            eprintln!("FWD_TCP_HDR[{}]: offset={} {}", dbg.forward, l4, tcp_hdr);
+                                            let tcp_hdr: String = data[l4..l4 + 20]
+                                                .iter()
+                                                .map(|b| format!("{:02x}", b))
+                                                .collect::<Vec<_>>()
+                                                .join(" ");
+                                            eprintln!(
+                                                "FWD_TCP_HDR[{}]: offset={} {}",
+                                                dbg.forward, l4, tcp_hdr
+                                            );
                                         }
                                     }
                                 }
-                                if (meta.tcp_flags & 0x04) != 0 { // RST
+                                if (meta.tcp_flags & 0x04) != 0 {
+                                    // RST
                                     dbg.fwd_tcp_rst += 1;
                                     if dbg.fwd_tcp_rst <= 5 {
-                                        let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
-                                        eprintln!("FWD_TCP_RST_DETECT[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} fwd#={} {}",
-                                            dbg.fwd_tcp_rst, meta.tcp_flags,
-                                            raw_flags.map(|f| format!("0x{:02x}", f)).unwrap_or_else(|| "NONE".into()),
-                                            raw_window.map(|w| format!("{}", w)).unwrap_or_else(|| "NONE".into()),
-                                            desc.len, dbg.forward, flow_str,
+                                        let flow_str = flow
+                                            .as_ref()
+                                            .map(|f| {
+                                                format!(
+                                                    "{}:{} -> {}:{}",
+                                                    f.src_ip,
+                                                    f.forward_key.src_port,
+                                                    f.dst_ip,
+                                                    f.forward_key.dst_port
+                                                )
+                                            })
+                                            .unwrap_or_else(|| "no-flow".into());
+                                        eprintln!(
+                                            "FWD_TCP_RST_DETECT[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} fwd#={} {}",
+                                            dbg.fwd_tcp_rst,
+                                            meta.tcp_flags,
+                                            raw_flags
+                                                .map(|f| format!("0x{:02x}", f))
+                                                .unwrap_or_else(|| "NONE".into()),
+                                            raw_window
+                                                .map(|w| format!("{}", w))
+                                                .unwrap_or_else(|| "NONE".into()),
+                                            desc.len,
+                                            dbg.forward,
+                                            flow_str,
                                         );
                                         // Hex dump TCP header when RST detected
                                         if let Some(data) = frame_data {
                                             let l4 = meta.l4_offset as usize;
                                             if data.len() > l4 + 20 {
-                                                let tcp_hdr: String = data[l4..l4+20].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                                                eprintln!("FWD_TCP_RST_HDR[{}]: meta_off={} raw_off={} {}", dbg.fwd_tcp_rst, l4, frame_l3_offset(data).unwrap_or(0), tcp_hdr);
+                                                let tcp_hdr: String = data[l4..l4 + 20]
+                                                    .iter()
+                                                    .map(|b| format!("{:02x}", b))
+                                                    .collect::<Vec<_>>()
+                                                    .join(" ");
+                                                eprintln!(
+                                                    "FWD_TCP_RST_HDR[{}]: meta_off={} raw_off={} {}",
+                                                    dbg.fwd_tcp_rst,
+                                                    l4,
+                                                    frame_l3_offset(data).unwrap_or(0),
+                                                    tcp_hdr
+                                                );
                                             }
                                         }
                                     }
                                 }
-                                if (meta.tcp_flags & 0x01) != 0 { // FIN
+                                if (meta.tcp_flags & 0x01) != 0 {
+                                    // FIN
                                     dbg.fwd_tcp_fin += 1;
                                     if dbg.fwd_tcp_fin <= 5 {
-                                        let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
-                                        eprintln!("FWD_TCP_FIN[{}]: ingress_if={} {} tcp_flags=0x{:02x}",
-                                            dbg.fwd_tcp_fin, meta.ingress_ifindex, flow_str, meta.tcp_flags,
+                                        let flow_str = flow
+                                            .as_ref()
+                                            .map(|f| {
+                                                format!(
+                                                    "{}:{} -> {}:{}",
+                                                    f.src_ip,
+                                                    f.forward_key.src_port,
+                                                    f.dst_ip,
+                                                    f.forward_key.dst_port
+                                                )
+                                            })
+                                            .unwrap_or_else(|| "no-flow".into());
+                                        eprintln!(
+                                            "FWD_TCP_FIN[{}]: ingress_if={} {} tcp_flags=0x{:02x}",
+                                            dbg.fwd_tcp_fin,
+                                            meta.ingress_ifindex,
+                                            flow_str,
+                                            meta.tcp_flags,
                                         );
                                     }
                                 }
@@ -2802,10 +3013,27 @@ fn poll_binding(
                                     if win == 0 {
                                         dbg.fwd_tcp_zero_window += 1;
                                         if dbg.fwd_tcp_zero_window <= 10 {
-                                            let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
-                                            eprintln!("FWD_TCP_ZERO_WIN[{}]: ingress_if={} {} meta_flags=0x{:02x} raw_flags={}",
-                                                dbg.fwd_tcp_zero_window, meta.ingress_ifindex, flow_str, meta.tcp_flags,
-                                                raw_flags.map(|f| format!("0x{:02x}", f)).unwrap_or_else(|| "NONE".into()),
+                                            let flow_str = flow
+                                                .as_ref()
+                                                .map(|f| {
+                                                    format!(
+                                                        "{}:{} -> {}:{}",
+                                                        f.src_ip,
+                                                        f.forward_key.src_port,
+                                                        f.dst_ip,
+                                                        f.forward_key.dst_port
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| "no-flow".into());
+                                            eprintln!(
+                                                "FWD_TCP_ZERO_WIN[{}]: ingress_if={} {} meta_flags=0x{:02x} raw_flags={}",
+                                                dbg.fwd_tcp_zero_window,
+                                                meta.ingress_ifindex,
+                                                flow_str,
+                                                meta.tcp_flags,
+                                                raw_flags
+                                                    .map(|f| format!("0x{:02x}", f))
+                                                    .unwrap_or_else(|| "NONE".into()),
                                             );
                                         }
                                     }
@@ -2836,10 +3064,40 @@ fn poll_binding(
                             dbg.tx += 1; // track forward requests queued
                             if cfg!(feature = "debug-log") {
                                 if dbg.tx <= 5 {
-                                    let dst_mac_str = decision.resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])).unwrap_or_else(|| "NONE".into());
-                                    let src_mac_str = decision.resolution.src_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])).unwrap_or_else(|| "NONE".into());
-                                    let flow_str = flow.as_ref().map(|f| format!("{}:{} -> {}:{}", f.src_ip, f.forward_key.src_port, f.dst_ip, f.forward_key.dst_port)).unwrap_or_else(|| "no-flow".into());
-                                    eprintln!("DBG FWD_REQ: target_if={} egress_if={} tx_if={} len={} proto={} vlan={} dst_mac={} src_mac={} flow={}",
+                                    let dst_mac_str = decision
+                                        .resolution
+                                        .neighbor_mac
+                                        .map(|m| {
+                                            format!(
+                                                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                                m[0], m[1], m[2], m[3], m[4], m[5]
+                                            )
+                                        })
+                                        .unwrap_or_else(|| "NONE".into());
+                                    let src_mac_str = decision
+                                        .resolution
+                                        .src_mac
+                                        .map(|m| {
+                                            format!(
+                                                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                                m[0], m[1], m[2], m[3], m[4], m[5]
+                                            )
+                                        })
+                                        .unwrap_or_else(|| "NONE".into());
+                                    let flow_str = flow
+                                        .as_ref()
+                                        .map(|f| {
+                                            format!(
+                                                "{}:{} -> {}:{}",
+                                                f.src_ip,
+                                                f.forward_key.src_port,
+                                                f.dst_ip,
+                                                f.forward_key.dst_port
+                                            )
+                                        })
+                                        .unwrap_or_else(|| "no-flow".into());
+                                    eprintln!(
+                                        "DBG FWD_REQ: target_if={} egress_if={} tx_if={} len={} proto={} vlan={} dst_mac={} src_mac={} flow={}",
                                         request.target_ifindex,
                                         decision.resolution.egress_ifindex,
                                         decision.resolution.tx_ifindex,
@@ -2858,11 +3116,18 @@ fn poll_binding(
                             dbg.build_fail += 1;
                             if cfg!(feature = "debug-log") {
                                 if dbg.build_fail <= 3 {
-                                    eprintln!("DBG FWD_BUILD_NONE: egress_if={} tx_if={} neigh={:?} src_mac={:?} len={} proto={}",
+                                    eprintln!(
+                                        "DBG FWD_BUILD_NONE: egress_if={} tx_if={} neigh={:?} src_mac={:?} len={} proto={}",
                                         decision.resolution.egress_ifindex,
                                         decision.resolution.tx_ifindex,
-                                        decision.resolution.neighbor_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
-                                        decision.resolution.src_mac.map(|m| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])),
+                                        decision.resolution.neighbor_mac.map(|m| format!(
+                                            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                            m[0], m[1], m[2], m[3], m[4], m[5]
+                                        )),
+                                        decision.resolution.src_mac.map(|m| format!(
+                                            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                            m[0], m[1], m[2], m[3], m[4], m[5]
+                                        )),
                                         desc.len,
                                         meta.protocol,
                                     );
@@ -2878,10 +3143,14 @@ fn poll_binding(
                                 if cfg!(feature = "debug-log") {
                                     if dbg.no_route <= 3 {
                                         if let Some(flow) = flow.as_ref() {
-                                            eprintln!("DBG NO_ROUTE: {}:{} -> {}:{} proto={} ingress_if={}",
-                                                flow.src_ip, flow.forward_key.src_port,
-                                                flow.dst_ip, flow.forward_key.dst_port,
-                                                meta.protocol, meta.ingress_ifindex,
+                                            eprintln!(
+                                                "DBG NO_ROUTE: {}:{} -> {}:{} proto={} ingress_if={}",
+                                                flow.src_ip,
+                                                flow.forward_key.src_port,
+                                                flow.dst_ip,
+                                                flow.forward_key.dst_port,
+                                                meta.protocol,
+                                                meta.ingress_ifindex,
                                             );
                                         }
                                     }
@@ -2892,9 +3161,12 @@ fn poll_binding(
                                 if cfg!(feature = "debug-log") {
                                     if dbg.missing_neigh <= 3 {
                                         if let Some(flow) = flow.as_ref() {
-                                            eprintln!("DBG MISS_NEIGH: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
-                                                flow.src_ip, flow.forward_key.src_port,
-                                                flow.dst_ip, flow.forward_key.dst_port,
+                                            eprintln!(
+                                                "DBG MISS_NEIGH: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
+                                                flow.src_ip,
+                                                flow.forward_key.src_port,
+                                                flow.dst_ip,
+                                                flow.forward_key.dst_port,
                                                 meta.protocol,
                                                 decision.resolution.egress_ifindex,
                                                 decision.resolution.next_hop,
@@ -3245,9 +3517,12 @@ fn flush_session_deltas(
                 debug_log!(
                     "SESS_DELETE: proto={} {}:{} -> {}:{} nat_src={:?} nat_dst={:?} bpf_entries_before={}",
                     delta.key.protocol,
-                    delta.key.src_ip, delta.key.src_port,
-                    delta.key.dst_ip, delta.key.dst_port,
-                    delta.decision.nat.rewrite_src, delta.decision.nat.rewrite_dst,
+                    delta.key.src_ip,
+                    delta.key.src_port,
+                    delta.key.dst_ip,
+                    delta.key.dst_port,
+                    delta.decision.nat.rewrite_src,
+                    delta.decision.nat.rewrite_dst,
                     count_bpf_session_entries(session_map_fd),
                 );
             }
@@ -3277,7 +3552,6 @@ fn session_delta_event(kind: SessionDeltaKind) -> &'static str {
         SessionDeltaKind::Close => "close",
     }
 }
-
 
 fn record_exception(
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
@@ -3491,7 +3765,6 @@ fn update_last_resolution(
         *last = Some(resolution.status(debug));
     }
 }
-
 
 fn worker_loop(
     worker_id: u32,
@@ -3767,7 +4040,7 @@ fn worker_loop(
                     let fill_pending = b.device.pending();
                     let rx_avail = b.rx.available();
                     let xsk_stats = b.device.statistics_v2().ok();
-                    let inflight_recycles = b.in_flight_forward_recycles.len() as u32;
+                    let inflight_recycles = b.in_flight_prepared_recycles.len() as u32;
                     let scratch_recycle_len = b.scratch_recycle.len() as u32;
                     let ptx_prepared = b.pending_tx_prepared.len() as u32;
                     let ptx_local = b.pending_tx_local.len() as u32;
@@ -3805,12 +4078,19 @@ fn worker_loop(
                     );
                     // TX pipeline debug counters
                     #[cfg(feature = "debug-log")]
-                    { dbg_tx_tcp_rst += b.dbg_tx_tcp_rst; }
+                    {
+                        dbg_tx_tcp_rst += b.dbg_tx_tcp_rst;
+                    }
                     let _ = write!(
                         binding_summary,
                         " TX:ring_sub={}/ring_full={}/compl={}/sendto={}/err={}/eagain={}/enobufs={}/overflow={}",
-                        b.dbg_tx_ring_submitted, b.dbg_tx_ring_full, b.dbg_completions_reaped,
-                        b.dbg_sendto_calls, b.dbg_sendto_err, b.dbg_sendto_eagain, b.dbg_sendto_enobufs,
+                        b.dbg_tx_ring_submitted,
+                        b.dbg_tx_ring_full,
+                        b.dbg_completions_reaped,
+                        b.dbg_sendto_calls,
+                        b.dbg_sendto_err,
+                        b.dbg_sendto_eagain,
+                        b.dbg_sendto_enobufs,
                         b.dbg_pending_overflow,
                     );
                     #[cfg(feature = "debug-log")]
@@ -3819,8 +4099,12 @@ fn worker_loop(
                         let _ = write!(
                             binding_summary,
                             " xsk:drop={}/inv={}/rfull={}/fempty={}/tinv={}/tempty={}",
-                            s.rx_dropped, s.rx_invalid_descs, s.rx_ring_full,
-                            s.rx_fill_ring_empty_descs, s.tx_invalid_descs, s.tx_ring_empty_descs,
+                            s.rx_dropped,
+                            s.rx_invalid_descs,
+                            s.rx_ring_full,
+                            s.rx_fill_ring_empty_descs,
+                            s.tx_invalid_descs,
+                            s.tx_ring_empty_descs,
                         );
                     }
                     // Socket error check (SO_ERROR) — detect kernel-side errors
@@ -3846,9 +4130,13 @@ fn worker_loop(
                         let _ = write!(
                             binding_summary,
                             " RING:rx_nz={}/rx_max={}/fill_pend={}/dev_avail={} RX_WAKE:ok={}/err={}/errno={}",
-                            b.dbg_rx_avail_nonzero, b.dbg_rx_avail_max,
-                            b.dbg_fill_pending, b.dbg_device_avail,
-                            b.dbg_rx_wake_sendto_ok, b.dbg_rx_wake_sendto_err, b.dbg_rx_wake_sendto_errno,
+                            b.dbg_rx_avail_nonzero,
+                            b.dbg_rx_avail_max,
+                            b.dbg_fill_pending,
+                            b.dbg_device_avail,
+                            b.dbg_rx_wake_sendto_ok,
+                            b.dbg_rx_wake_sendto_err,
+                            b.dbg_rx_wake_sendto_errno,
                         );
                         // Direct mmap diagnosis: read raw ring producer/consumer
                         if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) =
@@ -3871,7 +4159,8 @@ fn worker_loop(
                     binding_summary.push(']');
                 }
                 #[cfg(feature = "debug-log")]
-                eprintln!("DBG w{}: {:.1}s rx={} tx={} fwd={} local={} sess_hit={} sess_miss={} sess_create={} \
+                eprintln!(
+                    "DBG w{}: {:.1}s rx={} tx={} fwd={} local={} sess_hit={} sess_miss={} sess_create={} \
                      no_route={} miss_neigh={} pol_deny={} ha_inact={} no_egress={} build_fail={} \
                      tx_err={} meta_err={} other={} enq_ok={} enq_ip={} enq_dir={} enq_cp={} sessions={} \
                      DIR:trust_rx={}/wan_rx={}/t2w={}/w2t={} NAT:snat={}/dnat={}/none={}/bld_none={} RST:rx={}/tx={} \
@@ -3902,18 +4191,36 @@ fn worker_loop(
                     dbg_enqueue_direct,
                     dbg_enqueue_copy,
                     session_count,
-                    dbg_rx_from_trust, dbg_rx_from_wan,
-                    dbg_fwd_trust_to_wan, dbg_fwd_wan_to_trust,
-                    dbg_nat_snat, dbg_nat_dnat, dbg_nat_none, dbg_frame_build_none,
-                    dbg_rx_tcp_rst, dbg_tx_tcp_rst,
-                    if dbg_rx_total > 0 { dbg_rx_bytes_total / dbg_rx_total } else { 0 },
+                    dbg_rx_from_trust,
+                    dbg_rx_from_wan,
+                    dbg_fwd_trust_to_wan,
+                    dbg_fwd_wan_to_trust,
+                    dbg_nat_snat,
+                    dbg_nat_dnat,
+                    dbg_nat_none,
+                    dbg_frame_build_none,
+                    dbg_rx_tcp_rst,
+                    dbg_tx_tcp_rst,
+                    if dbg_rx_total > 0 {
+                        dbg_rx_bytes_total / dbg_rx_total
+                    } else {
+                        0
+                    },
                     dbg_rx_max_frame,
-                    if dbg_enqueue_ok > 0 { dbg_tx_bytes_total / dbg_enqueue_ok } else { 0 },
+                    if dbg_enqueue_ok > 0 {
+                        dbg_tx_bytes_total / dbg_enqueue_ok
+                    } else {
+                        0
+                    },
                     dbg_tx_max_frame,
                     dbg_rx_oversized,
                     dbg_seg_needed_but_none,
-                    dbg_rx_tcp_fin, dbg_rx_tcp_synack, dbg_rx_tcp_zero_window,
-                    dbg_fwd_tcp_fin, dbg_fwd_tcp_rst, dbg_fwd_tcp_zero_window,
+                    dbg_rx_tcp_fin,
+                    dbg_rx_tcp_synack,
+                    dbg_rx_tcp_zero_window,
+                    dbg_fwd_tcp_fin,
+                    dbg_fwd_tcp_rst,
+                    dbg_fwd_tcp_zero_window,
                     CSUM_VERIFIED_TOTAL.swap(0, Ordering::Relaxed),
                     CSUM_BAD_IP_TOTAL.swap(0, Ordering::Relaxed),
                     CSUM_BAD_L4_TOTAL.swap(0, Ordering::Relaxed),
@@ -3921,7 +4228,9 @@ fn worker_loop(
                     SESSION_PUBLISH_VERIFY_FAIL.swap(0, Ordering::Relaxed),
                     if let Some(b) = bindings.first() {
                         count_bpf_session_entries(b.session_map_fd)
-                    } else { 0 },
+                    } else {
+                        0
+                    },
                     binding_summary,
                 );
                 // Non-debug builds: no per-second stats dump (use debug-log feature for verbose output).
@@ -3930,7 +4239,8 @@ fn worker_loop(
                 if cfg!(feature = "debug-log") {
                     if let Some(stats) = read_fallback_stats() {
                         if !stats.is_empty() {
-                            let s: Vec<String> = stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
+                            let s: Vec<String> =
+                                stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
                             eprintln!("DBG w{}: XDP_FALLBACK: {}", worker_id, s.join(" "));
                         }
                     }
@@ -3988,36 +4298,58 @@ fn worker_loop(
                 if cfg!(feature = "debug-log") {
                     if stall_prev_fwd > 10 && prev_fwd_total == 0 && !stall_reported {
                         stall_reported = true;
-                        eprintln!("DBG STALL_DETECTED: w{} two_ago_fwd={} this_interval_fwd={} this_interval_rx={} sessions={}",
-                            worker_id, stall_prev_fwd, prev_fwd_total, prev_rx_total, session_count);
+                        eprintln!(
+                            "DBG STALL_DETECTED: w{} two_ago_fwd={} this_interval_fwd={} this_interval_rx={} sessions={}",
+                            worker_id, stall_prev_fwd, prev_fwd_total, prev_rx_total, session_count
+                        );
                         // Dump comprehensive per-binding state at stall moment
                         for (si, sb) in bindings.iter().enumerate() {
                             use std::fmt::Write;
                             let fill_p = sb.device.pending();
                             let rx_a = sb.rx.available();
-                            let ifl = sb.in_flight_forward_recycles.len() as u32;
+                            let ifl = sb.in_flight_prepared_recycles.len() as u32;
                             let ptxp = sb.pending_tx_prepared.len() as u32;
                             let ptxl = sb.pending_tx_local.len() as u32;
                             let total = sb.pending_fill_frames.len() as u32
-                                + fill_p + rx_a + sb.free_tx_frames.len() as u32
-                                + sb.outstanding_tx + ifl + sb.scratch_recycle.len() as u32 + ptxp;
+                                + fill_p
+                                + rx_a
+                                + sb.free_tx_frames.len() as u32
+                                + sb.outstanding_tx
+                                + ifl
+                                + sb.scratch_recycle.len() as u32
+                                + ptxp;
                             let raw = diagnose_raw_ring_state(sb.rx.as_raw_fd());
                             let mut stall_line = format!(
                                 "DBG STALL_BINDING[{}]: if={} q={} pfill={} fring={} rxring={} free_tx={} otx={} ifl={} ptxp={} ptxl={} total={}/{}",
-                                si, sb.ifindex, sb.queue_id,
-                                sb.pending_fill_frames.len(), fill_p, rx_a,
-                                sb.free_tx_frames.len(), sb.outstanding_tx, ifl,
-                                ptxp, ptxl, total, sb.umem.total_frames,
+                                si,
+                                sb.ifindex,
+                                sb.queue_id,
+                                sb.pending_fill_frames.len(),
+                                fill_p,
+                                rx_a,
+                                sb.free_tx_frames.len(),
+                                sb.outstanding_tx,
+                                ifl,
+                                ptxp,
+                                ptxl,
+                                total,
+                                sb.umem.total_frames,
                             );
                             if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) = raw {
-                                let _ = write!(stall_line,
-                                    " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}");
+                                let _ = write!(
+                                    stall_line,
+                                    " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}"
+                                );
                             }
                             if let Ok(Some(stats)) = sb.device.statistics_v2().map(Some) {
-                                let _ = write!(stall_line,
+                                let _ = write!(
+                                    stall_line,
                                     " xsk:drop={}/rfull={}/fempty={}/tempty={}",
-                                    stats.rx_dropped, stats.rx_ring_full,
-                                    stats.rx_fill_ring_empty_descs, stats.tx_ring_empty_descs);
+                                    stats.rx_dropped,
+                                    stats.rx_ring_full,
+                                    stats.rx_fill_ring_empty_descs,
+                                    stats.tx_ring_empty_descs
+                                );
                             }
                             eprintln!("{stall_line}");
                         }
@@ -4027,10 +4359,16 @@ fn worker_loop(
                         sessions.iter(|key, decision, metadata| {
                             if count < 20 {
                                 use std::fmt::Write;
-                                let _ = write!(sess_dump,
+                                let _ = write!(
+                                    sess_dump,
                                     "\n  SESS: {}:{} -> {}:{} proto={} nat=({:?},{:?}) is_rev={}",
-                                    key.src_ip, key.src_port, key.dst_ip, key.dst_port,
-                                    key.protocol, decision.nat.rewrite_src, decision.nat.rewrite_dst,
+                                    key.src_ip,
+                                    key.src_port,
+                                    key.dst_ip,
+                                    key.dst_port,
+                                    key.protocol,
+                                    decision.nat.rewrite_src,
+                                    decision.nat.rewrite_dst,
                                     metadata.is_reverse,
                                 );
                                 count += 1;
@@ -4042,13 +4380,17 @@ fn worker_loop(
                         // Dump fallback stats at stall time
                         if let Some(stats) = read_fallback_stats() {
                             if !stats.is_empty() {
-                                let s: Vec<String> = stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
+                                let s: Vec<String> =
+                                    stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
                                 eprintln!("DBG STALL_FALLBACK: {}", s.join(" "));
                             }
                         }
                         // Also dump BPF session count
                         if let Some(b) = bindings.first() {
-                            eprintln!("DBG STALL_BPF_SESSIONS: entries={}", count_bpf_session_entries(b.session_map_fd));
+                            eprintln!(
+                                "DBG STALL_BPF_SESSIONS: entries={}",
+                                count_bpf_session_entries(b.session_map_fd)
+                            );
                         }
                     } else if prev_fwd_total > 0 {
                         stall_reported = false;
@@ -4089,7 +4431,9 @@ fn worker_loop(
                     b.dbg_sendto_enobufs = 0;
                     b.dbg_pending_overflow = 0;
                     #[cfg(feature = "debug-log")]
-                    { b.dbg_tx_tcp_rst = 0; }
+                    {
+                        b.dbg_tx_tcp_rst = 0;
+                    }
                     b.dbg_rx_avail_nonzero = 0;
                     b.dbg_rx_avail_max = 0;
                     b.dbg_rx_wake_sendto_ok = 0;
@@ -4439,15 +4783,23 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     state.tcp_mss_gre_in = snapshot.flow.tcp_mss_gre_in;
     state.tcp_mss_gre_out = snapshot.flow.tcp_mss_gre_out;
     // Build filter state from snapshot
-    state.filter_state = crate::filter::parse_filter_state(&snapshot.filters, &snapshot.policers, &snapshot.interfaces, &snapshot.flow.lo0_filter_input_v4, &snapshot.flow.lo0_filter_input_v6);
+    state.filter_state = crate::filter::parse_filter_state(
+        &snapshot.filters,
+        &snapshot.policers,
+        &snapshot.interfaces,
+        &snapshot.flow.lo0_filter_input_v4,
+        &snapshot.flow.lo0_filter_input_v6,
+    );
     // Build flow export config from snapshot
     state.flow_export_config = snapshot.flow_export.as_ref().and_then(|fe| {
         let addr = format!("{}:{}", fe.collector_address, fe.collector_port);
-        addr.parse::<std::net::SocketAddr>().ok().map(|collector| crate::flowexport::FlowExportConfig {
-            collector,
-            sampling_rate: fe.sampling_rate,
-            active_timeout_secs: fe.active_timeout as u64,
-            inactive_timeout_secs: fe.inactive_timeout as u64,
+        addr.parse::<std::net::SocketAddr>().ok().map(|collector| {
+            crate::flowexport::FlowExportConfig {
+                collector,
+                sampling_rate: fe.sampling_rate,
+                active_timeout_secs: fe.active_timeout as u64,
+                inactive_timeout_secs: fe.inactive_timeout as u64,
+            }
         })
     });
 
@@ -4481,31 +4833,60 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     #[cfg(feature = "debug-log")]
     {
         debug_log!("FWD_STATE: ifindex_to_zone={:?}", state.ifindex_to_zone);
-        debug_log!("FWD_STATE: egress keys={:?}", state.egress.keys().collect::<Vec<_>>());
+        debug_log!(
+            "FWD_STATE: egress keys={:?}",
+            state.egress.keys().collect::<Vec<_>>()
+        );
         for (ifidx, eg) in &state.egress {
-            debug_log!("FWD_STATE: egress[{}] bind={} zone={} vlan={} mtu={}",
-                ifidx, eg.bind_ifindex, eg.zone, eg.vlan_id, eg.mtu,
+            debug_log!(
+                "FWD_STATE: egress[{}] bind={} zone={} vlan={} mtu={}",
+                ifidx,
+                eg.bind_ifindex,
+                eg.zone,
+                eg.vlan_id,
+                eg.mtu,
             );
         }
-        debug_log!("FWD_STATE: policy default={:?} rules={}",
+        debug_log!(
+            "FWD_STATE: policy default={:?} rules={}",
             state.policy.default_action,
             state.policy.rules.len(),
         );
         for (i, rule) in state.policy.rules.iter().enumerate() {
-            debug_log!("FWD_STATE: policy[{}] {}->{}  action={:?} src_v4={} dst_v4={} apps={}",
-                i, rule.from_zone, rule.to_zone, rule.action,
-                rule.source_v4.len(), rule.destination_v4.len(),
+            debug_log!(
+                "FWD_STATE: policy[{}] {}->{}  action={:?} src_v4={} dst_v4={} apps={}",
+                i,
+                rule.from_zone,
+                rule.to_zone,
+                rule.action,
+                rule.source_v4.len(),
+                rule.destination_v4.len(),
                 rule.applications.len(),
             );
         }
-        debug_log!("FWD_STATE: local_v4={:?} interface_nat_v4={:?}",
-            state.local_v4, state.interface_nat_v4,
+        debug_log!(
+            "FWD_STATE: local_v4={:?} interface_nat_v4={:?}",
+            state.local_v4,
+            state.interface_nat_v4,
         );
-        debug_log!("FWD_STATE: snat_rules={} static_nat={} dnat_table={} nptv6={} connected_v4={} routes_v4={}",
+        debug_log!(
+            "FWD_STATE: snat_rules={} static_nat={} dnat_table={} nptv6={} connected_v4={} routes_v4={}",
             state.source_nat_rules.len(),
-            if state.static_nat.is_empty() { 0 } else { state.static_nat.external_ips().count() },
-            if state.dnat_table.is_empty() { 0 } else { state.dnat_table.destination_ips().count() },
-            if state.nptv6.is_empty() { 0 } else { state.nptv6.external_prefixes().len() },
+            if state.static_nat.is_empty() {
+                0
+            } else {
+                state.static_nat.external_ips().count()
+            },
+            if state.dnat_table.is_empty() {
+                0
+            } else {
+                state.dnat_table.destination_ips().count()
+            },
+            if state.nptv6.is_empty() {
+                0
+            } else {
+                state.nptv6.external_prefixes().len()
+            },
             state.connected_v4.len(),
             state.routes_v4.values().map(|v| v.len()).sum::<usize>(),
         );
@@ -4535,8 +4916,16 @@ fn install_kernel_rst_suppression(state: &ForwardingState) {
     use nftables::stmt::{Counter, Match, Operator, Statement};
     use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 
-    let v4_addrs: Vec<String> = state.interface_nat_v4.keys().map(|ip| ip.to_string()).collect();
-    let v6_addrs: Vec<String> = state.interface_nat_v6.keys().map(|ip| ip.to_string()).collect();
+    let v4_addrs: Vec<String> = state
+        .interface_nat_v4
+        .keys()
+        .map(|ip| ip.to_string())
+        .collect();
+    let v6_addrs: Vec<String> = state
+        .interface_nat_v6
+        .keys()
+        .map(|ip| ip.to_string())
+        .collect();
 
     let table_name = "bpfrx_dp_rst";
     let chain_name = "output";
@@ -5338,8 +5727,10 @@ fn lookup_forwarding_resolution_inner(
     };
     // Tunnel interfaces (GRE, ip6gre, XFRM) can't be reached via AF_XDP TX.
     // Route these to slow-path so the kernel handles encapsulation.
-    if matches!(resolution.disposition, ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor)
-        && state.tunnel_interfaces.contains(&resolution.egress_ifindex)
+    if matches!(
+        resolution.disposition,
+        ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor
+    ) && state.tunnel_interfaces.contains(&resolution.egress_ifindex)
     {
         resolution.disposition = ForwardingDisposition::MissingNeighbor;
     }
@@ -5890,7 +6281,6 @@ fn parse_neighbor_entries(output: &str) -> Vec<(IpAddr, NeighborEntry)> {
     out
 }
 
-
 enum ResolvedRouteV4 {
     Connected {
         ifindex: i32,
@@ -6038,7 +6428,9 @@ fn diagnose_raw_ring_state(sock_fd: c_int) -> Option<(u32, u32, u32, u32, u32, u
     let (tx_prod, tx_cons) = read_ring_pair(sock_fd, &off.tx, XDP_PGOFF_TX_RING);
     let (cr_prod, cr_cons) = read_ring_pair(sock_fd, &off.cr, XDP_UMEM_PGOFF_COMPLETION_RING);
 
-    Some((rx_prod, rx_cons, fr_prod, fr_cons, tx_prod, tx_cons, cr_prod, cr_cons))
+    Some((
+        rx_prod, rx_cons, fr_prod, fr_cons, tx_prod, tx_cons, cr_prod, cr_cons,
+    ))
 }
 
 fn register_xsk_slot(map_fd: c_int, slot: u32, sock_fd: c_int) -> io::Result<()> {
@@ -6109,15 +6501,23 @@ fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
                 if age_ms > 1000 {
                     debug_log!(
                         "HB_UPDATE slot={} fd={} age={}ms now_ns={} LATE",
-                        binding.slot, binding.heartbeat_map_fd, age_ms, now_ns,
+                        binding.slot,
+                        binding.heartbeat_map_fd,
+                        age_ms,
+                        now_ns,
                     );
                 }
                 HB_LOG_COUNT.with(|c| {
                     let n = c.get();
                     if n < 5 {
                         c.set(n + 1);
-                        debug_log!("HB_UPDATE[{}] slot={} fd={} age={}ms now_ns={} OK",
-                            n, binding.slot, binding.heartbeat_map_fd, age_ms, now_ns,
+                        debug_log!(
+                            "HB_UPDATE[{}] slot={} fd={} age={}ms now_ns={} OK",
+                            n,
+                            binding.slot,
+                            binding.heartbeat_map_fd,
+                            age_ms,
+                            now_ns,
                         );
                     }
                 });
@@ -6127,9 +6527,14 @@ fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
         Err(err) => {
             eprintln!(
                 "HB_UPDATE_ERR slot={} fd={} age={}ms err={}",
-                binding.slot, binding.heartbeat_map_fd, age_ns / 1_000_000, err,
+                binding.slot,
+                binding.heartbeat_map_fd,
+                age_ns / 1_000_000,
+                err,
             );
-            binding.live.set_error(format!("update heartbeat slot: {err}"));
+            binding
+                .live
+                .set_error(format!("update heartbeat slot: {err}"));
         }
     }
 }
@@ -6318,28 +6723,47 @@ fn dump_bpf_session_entries(map_fd: c_int, max_entries: u32) {
             let src_ip = if map_key.addr_family == libc::AF_INET as u8 {
                 format!(
                     "{}.{}.{}.{}",
-                    map_key.src_addr[0], map_key.src_addr[1],
-                    map_key.src_addr[2], map_key.src_addr[3]
+                    map_key.src_addr[0],
+                    map_key.src_addr[1],
+                    map_key.src_addr[2],
+                    map_key.src_addr[3]
                 )
             } else {
-                format!("v6[{:02x}{:02x}::{:02x}{:02x}]",
-                    map_key.src_addr[0], map_key.src_addr[1],
-                    map_key.src_addr[14], map_key.src_addr[15])
+                format!(
+                    "v6[{:02x}{:02x}::{:02x}{:02x}]",
+                    map_key.src_addr[0],
+                    map_key.src_addr[1],
+                    map_key.src_addr[14],
+                    map_key.src_addr[15]
+                )
             };
             let dst_ip = if map_key.addr_family == libc::AF_INET as u8 {
                 format!(
                     "{}.{}.{}.{}",
-                    map_key.dst_addr[0], map_key.dst_addr[1],
-                    map_key.dst_addr[2], map_key.dst_addr[3]
+                    map_key.dst_addr[0],
+                    map_key.dst_addr[1],
+                    map_key.dst_addr[2],
+                    map_key.dst_addr[3]
                 )
             } else {
-                format!("v6[{:02x}{:02x}::{:02x}{:02x}]",
-                    map_key.dst_addr[0], map_key.dst_addr[1],
-                    map_key.dst_addr[14], map_key.dst_addr[15])
+                format!(
+                    "v6[{:02x}{:02x}::{:02x}{:02x}]",
+                    map_key.dst_addr[0],
+                    map_key.dst_addr[1],
+                    map_key.dst_addr[14],
+                    map_key.dst_addr[15]
+                )
             };
-            debug_log!("BPF_MAP_DUMP[{}]: af={} proto={} {}:{} -> {}:{} val={}",
-                count, map_key.addr_family, map_key.protocol,
-                src_ip, map_key.src_port, dst_ip, map_key.dst_port, value,
+            debug_log!(
+                "BPF_MAP_DUMP[{}]: af={} proto={} {}:{} -> {}:{} val={}",
+                count,
+                map_key.addr_family,
+                map_key.protocol,
+                src_ip,
+                map_key.src_port,
+                dst_ip,
+                map_key.dst_port,
+                value,
             );
         }
         count += 1;
@@ -6369,19 +6793,19 @@ static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 const FALLBACK_STATS_PIN_PATH: &str = "/sys/fs/bpf/bpfrx/userspace_fallback_stats";
 const FALLBACK_REASON_NAMES: &[&str] = &[
-    "ctrl_disabled",    // 0
-    "parse_fail",       // 1
-    "binding_missing",  // 2
-    "binding_not_ready",// 3
-    "hb_missing",       // 4
-    "hb_stale",         // 5
-    "icmp",             // 6
-    "early_filter",     // 7
-    "adjust_meta",      // 8
-    "meta_bounds",      // 9
-    "redirect_err",     // 10
-    "iface_nat_no_sess",// 11
-    "no_session",       // 12
+    "ctrl_disabled",     // 0
+    "parse_fail",        // 1
+    "binding_missing",   // 2
+    "binding_not_ready", // 3
+    "hb_missing",        // 4
+    "hb_stale",          // 5
+    "icmp",              // 6
+    "early_filter",      // 7
+    "adjust_meta",       // 8
+    "meta_bounds",       // 9
+    "redirect_err",      // 10
+    "iface_nat_no_sess", // 11
+    "no_session",        // 12
 ];
 
 fn read_fallback_stats() -> Option<Vec<(String, u64)>> {
@@ -6734,8 +7158,10 @@ impl BindingLiveState {
                     }
                 }
                 pending.push_back(req);
-                self.pending_tx_len
-                    .store(pending.len().min(u32::MAX as usize) as u32, Ordering::Relaxed);
+                self.pending_tx_len.store(
+                    pending.len().min(u32::MAX as usize) as u32,
+                    Ordering::Relaxed,
+                );
                 Ok(())
             }
             Err(_) => Err("pending_tx lock poisoned".to_string()),
@@ -6828,7 +7254,7 @@ fn update_binding_debug_state(binding: &mut BindingWorker) {
         .debug_outstanding_tx
         .store(binding.outstanding_tx, Ordering::Relaxed);
     binding.live.debug_in_flight_recycles.store(
-        binding.in_flight_forward_recycles.len() as u32,
+        binding.in_flight_prepared_recycles.len() as u32,
         Ordering::Relaxed,
     );
 }
@@ -6923,10 +7349,7 @@ mod tests {
             AfXdpBindStrategy::UmemOwnerSocket
         );
         assert_eq!(
-            alternate_bind_strategy(
-                Some("virtio_net"),
-                AfXdpBindStrategy::UmemOwnerSocket,
-            ),
+            alternate_bind_strategy(Some("virtio_net"), AfXdpBindStrategy::UmemOwnerSocket,),
             None
         );
         assert_eq!(
@@ -8062,10 +8485,11 @@ mod tests {
         let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
         assert_eq!(
             match_source_nat_for_flow(&state, &from_zone, &to_zone, 12, &flow),
-            Some(NatDecision { 
+            Some(NatDecision {
                 rewrite_src: Some("172.16.80.8".parse().expect("snat")),
                 rewrite_dst: None,
-             ..NatDecision::default() })
+                ..NatDecision::default()
+            })
         );
     }
 
@@ -8087,10 +8511,11 @@ mod tests {
         let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
         assert_eq!(
             match_source_nat_for_flow(&state, &from_zone, &to_zone, 12, &flow),
-            Some(NatDecision { 
+            Some(NatDecision {
                 rewrite_src: Some("2001:559:8585:80::8".parse().expect("snat")),
                 rewrite_dst: None,
-             ..NatDecision::default() })
+                ..NatDecision::default()
+            })
         );
     }
 
@@ -8864,10 +9289,11 @@ mod tests {
         apply_nat_ipv4(
             &mut packet,
             PROTO_TCP,
-            NatDecision { 
+            NatDecision {
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                 rewrite_dst: None,
-             ..NatDecision::default() },
+                ..NatDecision::default()
+            },
         )
         .expect("apply nat");
 
@@ -9026,10 +9452,11 @@ mod tests {
                     src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
                     tx_vlan_id: 80,
                 },
-                nat: NatDecision { 
+                nat: NatDecision {
                     rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                     rewrite_dst: None,
-                 ..NatDecision::default() },
+                    ..NatDecision::default()
+                },
             },
             &state,
             None,
@@ -10839,10 +11266,11 @@ mod tests {
                     src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
                     tx_vlan_id: 80,
                 },
-                nat: NatDecision { 
+                nat: NatDecision {
                     rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                     rewrite_dst: None,
-                 ..NatDecision::default() },
+                    ..NatDecision::default()
+                },
             },
             None,
         )
@@ -11037,7 +11465,9 @@ mod tests {
         // The external IP 203.0.113.10 should be in local_v4 so traffic
         // destined to it is recognized by the firewall.
         assert!(
-            state.local_v4.contains(&"203.0.113.10".parse::<Ipv4Addr>().unwrap()),
+            state
+                .local_v4
+                .contains(&"203.0.113.10".parse::<Ipv4Addr>().unwrap()),
             "static NAT external IP must be in local_v4"
         );
     }
@@ -11076,7 +11506,10 @@ mod tests {
         let snat = state
             .static_nat
             .match_snat("192.168.1.10".parse().unwrap(), "trust");
-        assert!(snat.is_some(), "SNAT should match internal IP regardless of zone");
+        assert!(
+            snat.is_some(),
+            "SNAT should match internal IP regardless of zone"
+        );
         assert_eq!(
             snat.unwrap().rewrite_src,
             Some("203.0.113.10".parse::<IpAddr>().unwrap())
@@ -11152,22 +11585,28 @@ mod tests {
             internal_ip: "fd00::10".to_string(),
         }];
         // Add v6 addresses to interfaces
-        snapshot.interfaces[0].addresses.push(InterfaceAddressSnapshot {
-            family: "inet6".to_string(),
-            address: "fd00::1/64".to_string(),
-            scope: 0,
-        });
-        snapshot.interfaces[1].addresses.push(InterfaceAddressSnapshot {
-            family: "inet6".to_string(),
-            address: "2001:db8::1/64".to_string(),
-            scope: 0,
-        });
+        snapshot.interfaces[0]
+            .addresses
+            .push(InterfaceAddressSnapshot {
+                family: "inet6".to_string(),
+                address: "fd00::1/64".to_string(),
+                scope: 0,
+            });
+        snapshot.interfaces[1]
+            .addresses
+            .push(InterfaceAddressSnapshot {
+                family: "inet6".to_string(),
+                address: "2001:db8::1/64".to_string(),
+                scope: 0,
+            });
         let state = build_forwarding_state(&snapshot);
 
         // External v6 IP should be in local_v6
-        assert!(state
-            .local_v6
-            .contains(&"2001:db8::10".parse::<Ipv6Addr>().unwrap()));
+        assert!(
+            state
+                .local_v6
+                .contains(&"2001:db8::10".parse::<Ipv6Addr>().unwrap())
+        );
 
         // DNAT match
         let dnat = state
@@ -11193,12 +11632,12 @@ mod tests {
     #[test]
     fn is_icmp_error_identifies_v4_types() {
         // ICMPv4 error types
-        assert!(is_icmp_error(PROTO_ICMP, 3));  // Destination Unreachable
+        assert!(is_icmp_error(PROTO_ICMP, 3)); // Destination Unreachable
         assert!(is_icmp_error(PROTO_ICMP, 11)); // Time Exceeded
         assert!(is_icmp_error(PROTO_ICMP, 12)); // Parameter Problem
         // Non-error types
-        assert!(!is_icmp_error(PROTO_ICMP, 0));  // Echo Reply
-        assert!(!is_icmp_error(PROTO_ICMP, 8));  // Echo Request
+        assert!(!is_icmp_error(PROTO_ICMP, 0)); // Echo Reply
+        assert!(!is_icmp_error(PROTO_ICMP, 8)); // Echo Request
     }
 
     #[test]
@@ -11293,11 +11732,8 @@ mod tests {
 
     #[test]
     fn packet_ttl_would_expire_identifies_v4_and_v6() {
-        let frame_v4 = build_icmp_echo_frame_v4(
-            Ipv4Addr::new(10, 0, 61, 102),
-            Ipv4Addr::new(1, 1, 1, 1),
-            1,
-        );
+        let frame_v4 =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 1);
         let meta_v4 = UserspaceDpMeta {
             l3_offset: 14,
             addr_family: libc::AF_INET as u8,
@@ -11349,13 +11785,32 @@ mod tests {
         assert_eq!(&out[0..6], &[0x00, 0x25, 0x90, 0x12, 0x34, 0x56]);
         assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]);
         assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x0800);
-        assert_eq!(Ipv4Addr::new(out[26], out[27], out[28], out[29]), Ipv4Addr::new(10, 0, 61, 1));
+        assert_eq!(
+            Ipv4Addr::new(out[26], out[27], out[28], out[29]),
+            Ipv4Addr::new(10, 0, 61, 1)
+        );
         assert_eq!(Ipv4Addr::new(out[30], out[31], out[32], out[33]), client_ip);
         assert_eq!(out[34], 11);
         assert_eq!(out[35], 0);
         let quoted_ip_start = 42;
-        assert_eq!(Ipv4Addr::new(out[quoted_ip_start + 12], out[quoted_ip_start + 13], out[quoted_ip_start + 14], out[quoted_ip_start + 15]), client_ip);
-        assert_eq!(Ipv4Addr::new(out[quoted_ip_start + 16], out[quoted_ip_start + 17], out[quoted_ip_start + 18], out[quoted_ip_start + 19]), dst_ip);
+        assert_eq!(
+            Ipv4Addr::new(
+                out[quoted_ip_start + 12],
+                out[quoted_ip_start + 13],
+                out[quoted_ip_start + 14],
+                out[quoted_ip_start + 15]
+            ),
+            client_ip
+        );
+        assert_eq!(
+            Ipv4Addr::new(
+                out[quoted_ip_start + 16],
+                out[quoted_ip_start + 17],
+                out[quoted_ip_start + 18],
+                out[quoted_ip_start + 19]
+            ),
+            dst_ip
+        );
         assert_eq!(out[quoted_ip_start + 8], 1);
     }
 
@@ -11390,13 +11845,29 @@ mod tests {
         assert_eq!(&out[0..6], &[0x00, 0x25, 0x90, 0x12, 0x34, 0x56]);
         assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]);
         assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x86dd);
-        assert_eq!(Ipv6Addr::from(<[u8; 16]>::try_from(&out[22..38]).unwrap()), "2001:559:8585:ef00::1".parse::<Ipv6Addr>().unwrap());
-        assert_eq!(Ipv6Addr::from(<[u8; 16]>::try_from(&out[38..54]).unwrap()), client_ip);
+        assert_eq!(
+            Ipv6Addr::from(<[u8; 16]>::try_from(&out[22..38]).unwrap()),
+            "2001:559:8585:ef00::1".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(
+            Ipv6Addr::from(<[u8; 16]>::try_from(&out[38..54]).unwrap()),
+            client_ip
+        );
         assert_eq!(out[54], 3);
         assert_eq!(out[55], 0);
         let quoted_ip_start = 62;
-        assert_eq!(Ipv6Addr::from(<[u8; 16]>::try_from(&out[quoted_ip_start + 8..quoted_ip_start + 24]).unwrap()), client_ip);
-        assert_eq!(Ipv6Addr::from(<[u8; 16]>::try_from(&out[quoted_ip_start + 24..quoted_ip_start + 40]).unwrap()), dst_ip);
+        assert_eq!(
+            Ipv6Addr::from(
+                <[u8; 16]>::try_from(&out[quoted_ip_start + 8..quoted_ip_start + 24]).unwrap()
+            ),
+            client_ip
+        );
+        assert_eq!(
+            Ipv6Addr::from(
+                <[u8; 16]>::try_from(&out[quoted_ip_start + 24..quoted_ip_start + 40]).unwrap()
+            ),
+            dst_ip
+        );
         assert_eq!(out[quoted_ip_start + 7], 1);
     }
 
@@ -11428,9 +11899,18 @@ mod tests {
         let mut embedded = Vec::new();
         // Embedded IPv4 header (20 bytes, IHL=5)
         embedded.extend_from_slice(&[
-            0x45, 0x00, 0x00, 0x00, // version/IHL, DSCP, total length (fill later)
-            0x00, 0x01, 0x00, 0x00, // ID, flags, fragment offset
-            64, embedded_proto, 0x00, 0x00, // TTL, protocol, checksum (fill later)
+            0x45,
+            0x00,
+            0x00,
+            0x00, // version/IHL, DSCP, total length (fill later)
+            0x00,
+            0x01,
+            0x00,
+            0x00, // ID, flags, fragment offset
+            64,
+            embedded_proto,
+            0x00,
+            0x00, // TTL, protocol, checksum (fill later)
         ]);
         embedded.extend_from_slice(&snat_ip.octets()); // src
         embedded.extend_from_slice(&server_ip.octets()); // dst
@@ -11498,9 +11978,7 @@ mod tests {
         let snat_port: u16 = 40000;
         let client_port: u16 = 12345;
 
-        let frame = build_icmp_te_frame_v4(
-            router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP,
-        );
+        let frame = build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP);
 
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
@@ -11552,7 +12030,10 @@ mod tests {
 
         // Verify outer IP dst is now the original client
         let outer_dst = Ipv4Addr::new(result[30], result[31], result[32], result[33]);
-        assert_eq!(outer_dst, client_ip, "outer IP dst should be original client");
+        assert_eq!(
+            outer_dst, client_ip,
+            "outer IP dst should be original client"
+        );
 
         // Verify outer IP src is still the router
         let outer_src = Ipv4Addr::new(result[26], result[27], result[28], result[29]);
@@ -11581,7 +12062,10 @@ mod tests {
         // Verify embedded TCP src port is now the original client port
         let emb_l4_start = emb_ip_start + 20; // IHL=5, so 20 bytes
         let emb_port = u16::from_be_bytes([result[emb_l4_start], result[emb_l4_start + 1]]);
-        assert_eq!(emb_port, client_port, "embedded src port should be original");
+        assert_eq!(
+            emb_port, client_port,
+            "embedded src port should be original"
+        );
 
         // Verify outer IP checksum is valid
         let outer_ihl = ((result[14] & 0x0f) as usize) * 4;
@@ -11591,12 +12075,18 @@ mod tests {
         // Verify outer ICMP checksum is valid
         let icmp_start = 14 + outer_ihl;
         let icmp_csum_check = checksum16(&result[icmp_start..]);
-        assert_eq!(icmp_csum_check, 0, "outer ICMP checksum should be valid (0)");
+        assert_eq!(
+            icmp_csum_check, 0,
+            "outer ICMP checksum should be valid (0)"
+        );
 
         // Verify embedded IP checksum is valid
         let emb_ihl = ((result[emb_ip_start] & 0x0f) as usize) * 4;
         let emb_ip_csum_check = checksum16(&result[emb_ip_start..emb_ip_start + emb_ihl]);
-        assert_eq!(emb_ip_csum_check, 0, "embedded IP checksum should be valid (0)");
+        assert_eq!(
+            emb_ip_csum_check, 0,
+            "embedded IP checksum should be valid (0)"
+        );
     }
 
     #[test]
@@ -11609,9 +12099,7 @@ mod tests {
         let snat_port: u16 = 50000;
         let client_port: u16 = 5353;
 
-        let frame = build_icmp_te_frame_v4(
-            router_ip, snat_ip, server_ip, snat_port, 53, PROTO_UDP,
-        );
+        let frame = build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, snat_port, 53, PROTO_UDP);
 
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
@@ -11660,7 +12148,10 @@ mod tests {
         let emb_ip_start = 42; // eth(14) + outer_ip(20) + icmp_hdr(8)
         let emb_l4_start = emb_ip_start + 20;
         let emb_port = u16::from_be_bytes([result[emb_l4_start], result[emb_l4_start + 1]]);
-        assert_eq!(emb_port, client_port, "embedded UDP src port should be original");
+        assert_eq!(
+            emb_port, client_port,
+            "embedded UDP src port should be original"
+        );
 
         // Verify all checksums
         let ip_csum_check = checksum16(&result[14..34]);
@@ -11691,8 +12182,7 @@ mod tests {
         // Embedded IP+TCP
         let mut embedded = Vec::new();
         embedded.extend_from_slice(&[
-            0x45, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-            64, PROTO_TCP, 0x00, 0x00,
+            0x45, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00,
         ]);
         embedded.extend_from_slice(&snat_ip.octets());
         embedded.extend_from_slice(&server_ip.octets());
@@ -11854,9 +12344,7 @@ mod tests {
         let snat_port: u16 = 40000;
         let client_port: u16 = 12345;
 
-        let frame = build_icmpv6_te_frame(
-            router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP,
-        );
+        let frame = build_icmpv6_te_frame(router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP);
 
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
@@ -11908,7 +12396,10 @@ mod tests {
         // Verify outer IPv6 dst is now the original client (bytes 24..40 in IPv6)
         let outer_dst_bytes: [u8; 16] = result[38..54].try_into().unwrap();
         let outer_dst = Ipv6Addr::from(outer_dst_bytes);
-        assert_eq!(outer_dst, client_ip, "outer IPv6 dst should be original client");
+        assert_eq!(
+            outer_dst, client_ip,
+            "outer IPv6 dst should be original client"
+        );
 
         // Verify outer IPv6 src is still the router (bytes 8..24 in IPv6)
         let outer_src_bytes: [u8; 16] = result[22..38].try_into().unwrap();
@@ -11922,7 +12413,10 @@ mod tests {
             .try_into()
             .unwrap();
         let emb_src = Ipv6Addr::from(emb_src_bytes);
-        assert_eq!(emb_src, client_ip, "embedded IPv6 src should be original client");
+        assert_eq!(
+            emb_src, client_ip,
+            "embedded IPv6 src should be original client"
+        );
 
         // Verify embedded dst is still the server
         let emb_dst_bytes: [u8; 16] = result[emb_ip_start + 24..emb_ip_start + 40]
@@ -11934,7 +12428,10 @@ mod tests {
         // Verify embedded TCP src port
         let emb_l4_start = emb_ip_start + 40;
         let emb_port = u16::from_be_bytes([result[emb_l4_start], result[emb_l4_start + 1]]);
-        assert_eq!(emb_port, client_port, "embedded src port should be original");
+        assert_eq!(
+            emb_port, client_port,
+            "embedded src port should be original"
+        );
 
         // Verify ICMPv6 checksum is valid
         let icmp6_start = 54; // eth(14) + ipv6(40)
@@ -11947,7 +12444,10 @@ mod tests {
         icmp6_copy[3] = 0;
         let expected_csum = checksum16_ipv6(src_v6, dst_v6, PROTO_ICMPV6, &icmp6_copy);
         let actual_csum = u16::from_be_bytes([icmp6_data[2], icmp6_data[3]]);
-        assert_eq!(actual_csum, expected_csum, "ICMPv6 checksum should be valid");
+        assert_eq!(
+            actual_csum, expected_csum,
+            "ICMPv6 checksum should be valid"
+        );
     }
 
     #[test]
@@ -12049,7 +12549,10 @@ mod tests {
         assert_eq!(icmp_match.original_src, IpAddr::V6(internal_client));
         assert_eq!(icmp_match.original_src_port, echo_id);
         assert!(icmp_match.nat.nptv6);
-        assert_eq!(icmp_match.nat.rewrite_src, Some(IpAddr::V6(external_client)));
+        assert_eq!(
+            icmp_match.nat.rewrite_src,
+            Some(IpAddr::V6(external_client))
+        );
     }
 
     #[test]
@@ -12188,7 +12691,10 @@ mod tests {
         .expect("should match embedded ICMPv6 error");
 
         assert_eq!(icmp_match.original_src, IpAddr::V6(internal_client));
-        assert_eq!(icmp_match.resolution.disposition, ForwardingDisposition::ForwardCandidate);
+        assert_eq!(
+            icmp_match.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
         assert_eq!(icmp_match.resolution.egress_ifindex, 24);
         assert_eq!(icmp_match.resolution.tx_ifindex, 24);
         assert_eq!(
@@ -12204,9 +12710,7 @@ mod tests {
         let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
         let server_ip = Ipv4Addr::new(1, 1, 1, 1);
 
-        let frame = build_icmp_te_frame_v4(
-            router_ip, snat_ip, server_ip, 40000, 80, PROTO_TCP,
-        );
+        let frame = build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, 40000, 80, PROTO_TCP);
 
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
@@ -12221,7 +12725,11 @@ mod tests {
 
         let mut sessions = SessionTable::new();
         // Don't install any sessions
-        let result = try_embedded_icmp_session_match_from_frame(&frame, meta, &mut sessions, 1_000_000);
-        assert!(result.is_none(), "should return None when no session matches");
+        let result =
+            try_embedded_icmp_session_match_from_frame(&frame, meta, &mut sessions, 1_000_000);
+        assert!(
+            result.is_none(),
+            "should return None when no session matches"
+        );
     }
 }
