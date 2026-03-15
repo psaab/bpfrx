@@ -2667,6 +2667,13 @@ fn poll_binding(
                                     ) {
                                         eprintln!("ICMP_TE_NAT: match found, nat={:?} orig_src={} resolution={:?}", icmp_match.nat, icmp_match.original_src, icmp_match.resolution.disposition);
                                         if icmp_match.nat.rewrite_src.is_some() {
+                                            let icmp_resolution = finalize_embedded_icmp_resolution(
+                                                forwarding,
+                                                ha_state,
+                                                now_secs,
+                                                meta.ingress_ifindex as i32,
+                                                &icmp_match,
+                                            );
                                             let frame_data = unsafe { &*area }
                                                 .slice(desc.addr as usize, desc.len as usize);
                                             let rewritten = frame_data.and_then(|frame| {
@@ -2687,7 +2694,7 @@ fn poll_binding(
                                             eprintln!("ICMP_TE_BUILD: rewritten={}", rewritten.is_some());
                                             if let Some(rewritten_frame) = rewritten {
                                                 let icmp_decision = SessionDecision {
-                                                    resolution: icmp_match.resolution,
+                                                    resolution: icmp_resolution,
                                                     nat: NatDecision::default(),
                                                 };
                                                 let target_ifindex =
@@ -8478,6 +8485,27 @@ fn resolve_zone_encoded_fabric_redirect(
     Some(resolution)
 }
 
+fn finalize_embedded_icmp_resolution(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    ingress_ifindex: i32,
+    icmp_match: &EmbeddedIcmpMatch,
+) -> ForwardingResolution {
+    let enforced =
+        enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, icmp_match.resolution);
+    if enforced.disposition == ForwardingDisposition::HAInactive
+        && !ingress_is_fabric(forwarding, ingress_ifindex)
+    {
+        if let Some(redirect) =
+            resolve_zone_encoded_fabric_redirect(forwarding, icmp_match.metadata.ingress_zone.as_ref())
+        {
+            return redirect;
+        }
+    }
+    redirect_via_fabric_if_needed(forwarding, enforced, ingress_ifindex)
+}
+
 fn redirect_via_fabric_if_needed(
     forwarding: &ForwardingState,
     resolution: ForwardingResolution,
@@ -12892,6 +12920,108 @@ mod tests {
             redirected.src_mac,
             Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01])
         );
+    }
+
+    #[test]
+    fn embedded_icmp_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let ha_state = BTreeMap::from([(
+            2,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )]);
+        let icmp_match = EmbeddedIcmpMatch {
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                ..NatDecision::default()
+            },
+            original_src: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            original_src_port: 33434,
+            embedded_proto: PROTO_UDP,
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 24,
+                tx_ifindex: 24,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x01, 0x00, 0x01]),
+                tx_vlan_id: 0,
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("wan"),
+                egress_zone: Arc::<str>::from("lan"),
+                owner_rg_id: 2,
+                is_reverse: false,
+                synced: false,
+                nat64_reverse: None,
+            },
+        };
+
+        let resolved = finalize_embedded_icmp_resolution(
+            &state,
+            &ha_state,
+            monotonic_nanos() / 1_000_000_000,
+            12,
+            &icmp_match,
+        );
+        assert_eq!(resolved.disposition, ForwardingDisposition::FabricRedirect);
+        assert_eq!(resolved.egress_ifindex, 21);
+        assert_eq!(resolved.tx_ifindex, 21);
+        assert_eq!(
+            resolved.src_mac,
+            Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x02])
+        );
+    }
+
+    #[test]
+    fn embedded_icmp_from_fabric_does_not_redirect_back_to_fabric() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let ha_state = BTreeMap::from([(
+            2,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )]);
+        let icmp_match = EmbeddedIcmpMatch {
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                ..NatDecision::default()
+            },
+            original_src: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            original_src_port: 33434,
+            embedded_proto: PROTO_UDP,
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 24,
+                tx_ifindex: 24,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x01, 0x00, 0x01]),
+                tx_vlan_id: 0,
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("wan"),
+                egress_zone: Arc::<str>::from("lan"),
+                owner_rg_id: 2,
+                is_reverse: false,
+                synced: false,
+                nat64_reverse: None,
+            },
+        };
+
+        let resolved = finalize_embedded_icmp_resolution(
+            &state,
+            &ha_state,
+            monotonic_nanos() / 1_000_000_000,
+            21,
+            &icmp_match,
+        );
+        assert_eq!(resolved.disposition, ForwardingDisposition::HAInactive);
     }
 
     #[test]
