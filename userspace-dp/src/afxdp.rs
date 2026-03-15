@@ -60,7 +60,9 @@ use self::bind::{
     reserved_tx_frames, umem_ring_size,
 };
 #[cfg(test)]
-use self::bind::{alternate_bind_strategy, bind_strategy_for_driver};
+use self::bind::{AfXdpBinder, alternate_bind_strategy, bind_strategy_for_driver, binder_for_strategy};
+#[cfg(test)]
+use self::bind::bind_flag_candidates_for_driver;
 use self::icmp::{
     build_local_time_exceeded_request, is_icmp_error,
 };
@@ -1416,7 +1418,7 @@ impl BindingWorker {
             }
         }
         let info = ifinfo_from_binding(binding)?;
-        let (user, rx, tx, bind_mode, mut device) =
+        let (user, rx, tx, bind_mode, actual_bind_strategy, mut device) =
             open_binding_worker_rings(
                 &worker_umem,
                 &info,
@@ -1438,7 +1440,7 @@ impl BindingWorker {
             "bpfrx-userspace-dp: binding slot={} fd={} strategy={} bound if{}q{} mode={:?}",
             binding.slot,
             user_fd,
-            bind_strategy.describe(),
+            actual_bind_strategy.describe(),
             binding.ifindex,
             binding.queue_id,
             bind_mode,
@@ -7059,17 +7061,26 @@ mod tests {
     }
 
     #[test]
-    fn virtio_prefers_separate_owner_then_falls_back() {
+    fn virtio_uses_auto_mode_umem_owner_strategy() {
         assert_eq!(
             bind_strategy_for_driver(Some("virtio_net")),
-            AfXdpBindStrategy::SeparateOwnerSocket
+            AfXdpBindStrategy::UmemOwnerSocket
         );
         assert_eq!(
             alternate_bind_strategy(
                 Some("virtio_net"),
-                AfXdpBindStrategy::SeparateOwnerSocket,
+                AfXdpBindStrategy::UmemOwnerSocket,
             ),
-            Some(AfXdpBindStrategy::UmemOwnerSocket)
+            None
+        );
+        assert_eq!(
+            binder_for_strategy(AfXdpBindStrategy::UmemOwnerSocket),
+            AfXdpBinder::Umem
+        );
+        assert_eq!(bind_flag_candidates_for_driver(Some("virtio_net")), &[0]);
+        assert_eq!(
+            bind_flag_candidates_for_driver(Some("mlx5_core")),
+            &[XSK_BIND_FLAGS_ZEROCOPY, XSK_BIND_FLAGS_COPY]
         );
     }
 

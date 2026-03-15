@@ -54,9 +54,13 @@ Completed under this plan:
    - IPv4 and IPv6 TTL=1 probes return native time-exceeded responses
    - IPv4 and IPv6 `mtr` still show the same unresolved intermediate hops as
      before, but first hop and destination visibility remain correct
-8. Live validation already proved that the bind strategy logic is correct for
-   `mlx5_core`, but `virtio_net` fabric bindings still fail AF_XDP bring-up
-   with both currently known strategies.
+8. Live validation now proves the runtime AF_XDP bind split is correct for the
+   current hardware mix:
+   - `mlx5_core` stays on the existing UMEM-owner zerocopy path
+   - `virtio_net` fabric bindings on `ifindex 4` now bind cleanly in copy mode
+     via the UMEM-owner path with `bind_flags=0`
+   - active node validation on `bpfrx-userspace-fw0` shows `24/24` bound and
+     `24/24` ready bindings after deploy
 
 Still left to do at a high level:
 
@@ -179,11 +183,11 @@ Live findings already established for this extraction area:
 
 1. `mlx5_core` requires the current shared-owner / UMEM-owner bind path in this
    implementation.
-2. `virtio_net` on the fabric interface still fails AF_XDP bind with:
-   - separate-owner socket strategy
-   - UMEM-owner socket fallback
-3. That means the remaining live problem is not a wrong global bind choice; it
-   is an unresolved `virtio_net` AF_XDP capability or contract issue.
+2. `virtio_net` on the fabric interface binds reliably with the UMEM-owner path
+   in copy mode when `bind_flags=0` are used.
+3. The attempted separate-owner `virtio_net` path was removed from the active
+   strategy selection after live validation showed the direct UMEM-owner
+   auto-mode path was the correct contract for this environment.
 
 Delivered so far in:
 

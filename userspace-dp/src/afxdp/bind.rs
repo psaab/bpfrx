@@ -3,9 +3,13 @@ use core::num::NonZeroU32;
 use std::path::Path;
 use xdpilone::{IfInfo, Socket, SocketConfig};
 
+const AUTO_BIND_FLAGS: [u16; 1] = [0];
+const EXPLICIT_MODE_BIND_FLAGS: [u16; 2] = [XSK_BIND_FLAGS_ZEROCOPY, XSK_BIND_FLAGS_COPY];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AfXdpBindStrategy {
     UmemOwnerSocket,
+    #[allow(dead_code)]
     SeparateOwnerSocket,
 }
 
@@ -20,6 +24,13 @@ impl AfXdpBindStrategy {
             Self::SeparateOwnerSocket => "separate-owner-socket",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AfXdpBinder {
+    Umem,
+    #[allow(dead_code)]
+    DeviceQueue,
 }
 
 pub(super) fn binding_frame_count(ring_entries: u32) -> u32 {
@@ -53,55 +64,64 @@ pub(super) fn open_binding_worker_rings(
         xdpilone::RingRx,
         xdpilone::RingTx,
         XskBindMode,
+        AfXdpBindStrategy,
         xdpilone::DeviceQueue,
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    match try_open_bind(worker_umem, info, ring_entries, bind_strategy, XSK_BIND_FLAGS_ZEROCOPY) {
-        Ok(result) => return Ok(result),
-        Err(e) => {
-            eprintln!(
-                "bpfrx-userspace-dp: zero-copy bind failed using {}: {e} — falling back to copy mode",
-                bind_strategy.describe(),
-            );
-        }
+    let bind_flag_candidates = bind_flag_candidates_for_driver(driver_name);
+    let mut strategies = vec![bind_strategy];
+    if let Some(fallback_strategy) = alternate_bind_strategy(driver_name, bind_strategy) {
+        strategies.push(fallback_strategy);
     }
-    match try_open_bind(worker_umem, info, ring_entries, bind_strategy, XSK_BIND_FLAGS_COPY) {
-        Ok(result) => Ok(result),
-        Err(err) => {
-            let Some(fallback_strategy) = alternate_bind_strategy(driver_name, bind_strategy) else {
-                return Err(err);
-            };
-            eprintln!(
-                "bpfrx-userspace-dp: copy-mode bind failed using {} on driver {:?}: {} — retrying {}",
-                bind_strategy.describe(),
-                driver_name,
-                err,
-                fallback_strategy.describe(),
-            );
-            match try_open_bind(
-                worker_umem,
-                info,
-                ring_entries,
-                fallback_strategy,
-                XSK_BIND_FLAGS_ZEROCOPY,
-            ) {
-                Ok(result) => Ok(result),
-                Err(e) => {
-                    eprintln!(
-                        "bpfrx-userspace-dp: zero-copy bind failed using {}: {e} — falling back to copy mode",
-                        fallback_strategy.describe(),
-                    );
-                    try_open_bind(
-                        worker_umem,
-                        info,
-                        ring_entries,
-                        fallback_strategy,
-                        XSK_BIND_FLAGS_COPY,
-                    )
+    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    for (strategy_idx, strategy) in strategies.iter().copied().enumerate() {
+        for (flags_idx, flags) in bind_flag_candidates.iter().copied().enumerate() {
+            match try_open_bind(worker_umem, info, ring_entries, strategy, flags) {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    last_err = Some(err);
+                    let more_flag_attempts = flags_idx + 1 < bind_flag_candidates.len();
+                    let more_strategy_attempts = strategy_idx + 1 < strategies.len();
+                    if more_flag_attempts {
+                        eprintln!(
+                            "bpfrx-userspace-dp: {} bind failed using {}: {} — trying {}",
+                            describe_bind_flags(flags),
+                            strategy.describe(),
+                            last_err.as_ref().unwrap(),
+                            describe_bind_flags(bind_flag_candidates[flags_idx + 1]),
+                        );
+                    } else if more_strategy_attempts {
+                        eprintln!(
+                            "bpfrx-userspace-dp: {} bind failed using {} on driver {:?}: {} — retrying {}",
+                            describe_bind_flags(flags),
+                            strategy.describe(),
+                            driver_name,
+                            last_err.as_ref().unwrap(),
+                            strategies[strategy_idx + 1].describe(),
+                        );
+                    }
                 }
             }
         }
+    }
+    Err(last_err.unwrap_or_else(|| "AF_XDP bind: no attempts executed".into()))
+}
+
+pub(super) fn bind_flag_candidates_for_driver(driver: Option<&str>) -> &'static [u16] {
+    match driver {
+        Some("virtio_net") => &AUTO_BIND_FLAGS,
+        _ => &EXPLICIT_MODE_BIND_FLAGS,
+    }
+}
+
+fn describe_bind_flags(flags: u16) -> &'static str {
+    if flags == 0 {
+        "auto-mode"
+    } else if (flags & SocketConfig::XDP_BIND_ZEROCOPY) != 0 {
+        "zero-copy"
+    } else {
+        "copy-mode"
     }
 }
 
@@ -126,8 +146,15 @@ pub(super) fn prime_fill_ring_offsets(
 
 pub(super) fn bind_strategy_for_driver(driver: Option<&str>) -> AfXdpBindStrategy {
     match driver {
-        Some("virtio_net") => AfXdpBindStrategy::SeparateOwnerSocket,
         _ => AfXdpBindStrategy::UmemOwnerSocket,
+    }
+}
+
+pub(super) fn binder_for_strategy(strategy: AfXdpBindStrategy) -> AfXdpBinder {
+    if strategy.uses_umem_owner_socket() {
+        AfXdpBinder::Umem
+    } else {
+        AfXdpBinder::DeviceQueue
     }
 }
 
@@ -136,9 +163,6 @@ pub(super) fn alternate_bind_strategy(
     current: AfXdpBindStrategy,
 ) -> Option<AfXdpBindStrategy> {
     match (driver, current) {
-        (Some("virtio_net"), AfXdpBindStrategy::SeparateOwnerSocket) => {
-            Some(AfXdpBindStrategy::UmemOwnerSocket)
-        }
         _ => None,
     }
 }
@@ -182,24 +206,35 @@ fn try_open_bind(
         xdpilone::RingRx,
         xdpilone::RingTx,
         XskBindMode,
+        AfXdpBindStrategy,
         xdpilone::DeviceQueue,
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let sock = if bind_strategy.uses_umem_owner_socket() {
-        Socket::with_shared(info, &worker_umem.umem)
-            .map_err(|e| format!("create shared socket: {e}"))?
+    let (device, user, rx, tx, bind_mode) = if bind_strategy.uses_umem_owner_socket() {
+        let sock = Socket::with_shared(info, &worker_umem.umem)
+            .map_err(|e| format!("create shared socket: {e}"))?;
+        let device = worker_umem
+            .umem
+            .fq_cq(&sock)
+            .map_err(|e| format!("create fq/cq: {e}"))?;
+        let (user, rx, tx, _requested_mode) =
+            open_user_rings(&worker_umem.umem, &sock, ring_entries, flags)?;
+        let bind_mode = bind_user_rings(&worker_umem.umem, &device, &user, bind_strategy)?;
+        (device, user, rx, tx, bind_mode)
     } else {
-        Socket::new(info).map_err(|e| format!("create socket: {e}"))?
+        let owner_sock = Socket::new(info).map_err(|e| format!("create owner socket: {e}"))?;
+        let device = worker_umem
+            .umem
+            .fq_cq(&owner_sock)
+            .map_err(|e| format!("create fq/cq: {e}"))?;
+        let user_sock = Socket::new(info).map_err(|e| format!("create user socket: {e}"))?;
+        let (user, rx, tx, _requested_mode) =
+            open_user_rings(&worker_umem.umem, &user_sock, ring_entries, flags)?;
+        let bind_mode = bind_user_rings(&worker_umem.umem, &device, &user, bind_strategy)?;
+        (device, user, rx, tx, bind_mode)
     };
-    let device = worker_umem
-        .umem
-        .fq_cq(&sock)
-        .map_err(|e| format!("create fq/cq: {e}"))?;
-    let (user, rx, tx, _bind_mode) =
-        open_user_rings(&worker_umem.umem, &sock, ring_entries, flags)?;
-    let bind_mode = bind_user_rings(&worker_umem.umem, &device, &user, bind_strategy)?;
-    Ok((user, rx, tx, bind_mode, device))
+    Ok((user, rx, tx, bind_mode, bind_strategy, device))
 }
 
 fn open_user_rings(
@@ -276,13 +311,17 @@ fn bind_user_with_retry(
 
 fn bind_user_rings(
     umem: &Umem,
-    _device: &xdpilone::DeviceQueue,
+    device: &xdpilone::DeviceQueue,
     user: &User,
     bind_strategy: AfXdpBindStrategy,
 ) -> Result<XskBindMode, Box<dyn std::error::Error + Send + Sync>> {
     let user_fd = user.as_raw_fd();
+    let binder = binder_for_strategy(bind_strategy);
     for attempt in 0..BIND_RETRY_ATTEMPTS {
-        let bind_result = umem.bind(user);
+        let bind_result = match binder {
+            AfXdpBinder::Umem => umem.bind(user),
+            AfXdpBinder::DeviceQueue => device.bind(user),
+        };
         match bind_result {
             Ok(()) => {
                 let bind_mode = query_bound_xsk_mode(user_fd).unwrap_or(XskBindMode::Copy);
@@ -302,21 +341,19 @@ fn bind_user_rings(
                     thread::sleep(BIND_RETRY_DELAY);
                     continue;
                 }
-                let binder = if bind_strategy.uses_umem_owner_socket() {
-                    "umem.bind(umem-owner)"
-                } else {
-                    "umem.bind(separate-owner)"
+                let binder_name = match binder {
+                    AfXdpBinder::Umem => "umem.bind(umem-owner)",
+                    AfXdpBinder::DeviceQueue => "device.bind(separate-owner)",
                 };
-                return Err(format!("bind AF_XDP socket via {binder}: {msg}").into());
+                return Err(format!("bind AF_XDP socket via {binder_name}: {msg}").into());
             }
         }
     }
-    let binder = if bind_strategy.uses_umem_owner_socket() {
-        "umem.bind(umem-owner)"
-    } else {
-        "umem.bind(separate-owner)"
+    let binder_name = match binder {
+        AfXdpBinder::Umem => "umem.bind(umem-owner)",
+        AfXdpBinder::DeviceQueue => "device.bind(separate-owner)",
     };
-    Err(format!("bind AF_XDP socket via {binder}: exhausted retries").into())
+    Err(format!("bind AF_XDP socket via {binder_name}: exhausted retries").into())
 }
 
 fn set_busy_poll_opts(fd: c_int) {
