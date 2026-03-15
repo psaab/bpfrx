@@ -1304,6 +1304,10 @@ struct PendingForwardRequest {
     flow_key: Option<SessionKey>,
     /// NAT64 reverse info for cross-AF translation (IPv4 reply → IPv6).
     nat64_reverse: Option<Nat64ReverseInfo>,
+    /// Pre-built frame bytes that bypass normal frame building.
+    /// Used for ICMP error NAT reversal where the embedded packet
+    /// rewrites are already applied and the frame is ready for TX.
+    prebuilt_frame: Option<Vec<u8>>,
 }
 
 struct PreparedTxRequest {
@@ -2623,7 +2627,70 @@ fn poll_binding(
                                     .is_some()
                                 {
                                     // ICMP error with an embedded packet matching an existing
-                                    // session — permit without policy check or session install.
+                                    // session. Attempt NAT reversal if the session has SNAT.
+                                    if let Some(icmp_match) = try_embedded_icmp_nat_match(
+                                        unsafe { &*area },
+                                        desc,
+                                        meta,
+                                        sessions,
+                                        forwarding,
+                                        dynamic_neighbors,
+                                        now_ns,
+                                    ) {
+                                        if icmp_match.nat.rewrite_src.is_some() {
+                                            let frame_data = unsafe { &*area }
+                                                .slice(desc.addr as usize, desc.len as usize);
+                                            let rewritten = frame_data.and_then(|frame| {
+                                                match meta.addr_family as i32 {
+                                                    libc::AF_INET => {
+                                                        build_nat_reversed_icmp_error_v4(
+                                                            frame, meta, &icmp_match,
+                                                        )
+                                                    }
+                                                    libc::AF_INET6 => {
+                                                        build_nat_reversed_icmp_error_v6(
+                                                            frame, meta, &icmp_match,
+                                                        )
+                                                    }
+                                                    _ => None,
+                                                }
+                                            });
+                                            if let Some(rewritten_frame) = rewritten {
+                                                let icmp_decision = SessionDecision {
+                                                    resolution: icmp_match.resolution,
+                                                    nat: NatDecision::default(),
+                                                };
+                                                let target_ifindex =
+                                                    if icmp_decision.resolution.tx_ifindex > 0 {
+                                                        icmp_decision.resolution.tx_ifindex
+                                                    } else {
+                                                        resolve_tx_binding_ifindex(
+                                                            forwarding,
+                                                            icmp_decision.resolution.egress_ifindex,
+                                                        )
+                                                    };
+                                                binding.scratch_forwards.push(
+                                                    PendingForwardRequest {
+                                                        target_ifindex,
+                                                        ingress_queue_id: ident.queue_id,
+                                                        source_offset: desc.addr,
+                                                        desc,
+                                                        meta,
+                                                        decision: icmp_decision,
+                                                        expected_ports: None,
+                                                        flow_key: None,
+                                                        nat64_reverse: None,
+                                                        prebuilt_frame: Some(rewritten_frame),
+                                                    },
+                                                );
+                                                recycle_now = false;
+                                            }
+                                        }
+                                    }
+                                    // Permit without policy check or session install.
+                                    // If NAT reversal was applied, the prebuilt frame
+                                    // is already queued. If not, the existing resolution
+                                    // (routing toward the outer dst) handles forwarding.
                                 } else if let PolicyAction::Permit = evaluate_policy(
                                     &forwarding.policy,
                                     &from_zone,
@@ -3302,6 +3369,7 @@ fn build_live_forward_request(
         expected_ports,
         flow_key: flow.map(|flow| flow.forward_key.clone()),
         nat64_reverse: None,
+        prebuilt_frame: None,
     })
 }
 
@@ -3384,6 +3452,40 @@ fn enqueue_pending_forwards(
     for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
+
+        // Fast path: prebuilt frame (e.g. ICMP error NAT reversal).
+        // The frame is already fully rewritten — just enqueue for TX.
+        if let Some(prebuilt) = request.prebuilt_frame {
+            let Some(target_binding) = find_target_binding_mut(
+                left,
+                ingress_binding,
+                request.ingress_queue_id,
+                right,
+                request.target_ifindex,
+            ) else {
+                ingress_binding.pending_fill_frames.push_back(source_offset);
+                continue;
+            };
+            let frame_len = prebuilt.len();
+            target_binding.pending_tx_local.push_back(TxRequest {
+                bytes: prebuilt,
+                expected_ports: None,
+                expected_addr_family: request.meta.addr_family,
+                expected_protocol: request.meta.protocol,
+                flow_key: None,
+            });
+            bound_pending_tx_local(target_binding);
+            bound_pending_tx_prepared(target_binding);
+            dbg.enqueue_ok += 1;
+            dbg.enqueue_copy += 1;
+            dbg.tx_bytes_total += frame_len as u64;
+            if (frame_len as u32) > dbg.tx_max_frame {
+                dbg.tx_max_frame = frame_len as u32;
+            }
+            ingress_binding.pending_fill_frames.push_back(source_offset);
+            continue;
+        }
+
         // Read source frame directly from ingress UMEM — no heap copy needed.
         // The frame is safe to read: RX ring released but frame not yet returned
         // to fill ring (that happens after this function completes).
@@ -7553,6 +7655,25 @@ fn zone_pair_for_flow_with_override(
     (from_zone, to_zone)
 }
 
+/// Information returned from an embedded ICMP error session match that includes
+/// NAT reversal data needed to rewrite the ICMP error packet back to the
+/// original pre-NAT client.
+#[derive(Clone, Debug)]
+struct EmbeddedIcmpMatch {
+    /// The forward session's NAT decision (has rewrite_src for SNAT).
+    nat: NatDecision,
+    /// The original (pre-NAT) source IP of the client.
+    original_src: IpAddr,
+    /// The original source port (if port SNAT was applied).
+    original_src_port: u16,
+    /// The embedded packet's L4 protocol.
+    embedded_proto: u8,
+    /// Forwarding resolution toward the original client.
+    resolution: ForwardingResolution,
+    /// Session metadata (zones, RG).
+    metadata: SessionMetadata,
+}
+
 /// Returns true if the protocol and ICMP type indicate an ICMP error message
 /// (Destination Unreachable, Time Exceeded, Parameter Problem, Packet Too Big).
 fn is_icmp_error(protocol: u8, icmp_type: u8) -> bool {
@@ -7579,6 +7700,16 @@ fn try_embedded_icmp_session_match(
     now_ns: u64,
 ) -> Option<SessionLookup> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    try_embedded_icmp_session_match_from_frame(frame, meta, sessions, now_ns)
+}
+
+/// Core embedded ICMP session match logic operating on a frame slice.
+fn try_embedded_icmp_session_match_from_frame(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    sessions: &mut SessionTable,
+    now_ns: u64,
+) -> Option<SessionLookup> {
     let l4 = meta.l4_offset as usize;
 
     // Read ICMP type (first byte of L4 header)
@@ -7706,6 +7837,469 @@ fn try_embedded_icmp_session_match(
         }
         _ => None,
     }
+}
+
+/// Extended embedded ICMP session match that returns full NAT reversal info.
+///
+/// Unlike `try_embedded_icmp_session_match` which only confirms a match exists,
+/// this function extracts the original (pre-NAT) source IP and port from the
+/// matched session, and resolves forwarding toward the original client.
+///
+/// The embedded packet in an ICMP error from an intermediate router looks like:
+///   [outer IP: src=router, dst=SNAT'd addr] [ICMP error] [embedded: src=SNAT'd addr, dst=server]
+///
+/// The forward session has: src=original_client, dst=server, nat_src=SNAT'd addr.
+/// We reverse this: outer dst -> original_client, embedded src -> original_client.
+fn try_embedded_icmp_nat_match(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    sessions: &mut SessionTable,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    now_ns: u64,
+) -> Option<EmbeddedIcmpMatch> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    try_embedded_icmp_nat_match_from_frame(frame, meta, sessions, forwarding, dynamic_neighbors, now_ns)
+}
+
+/// Core implementation of embedded ICMP NAT match operating on a frame slice.
+fn try_embedded_icmp_nat_match_from_frame(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    sessions: &mut SessionTable,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    now_ns: u64,
+) -> Option<EmbeddedIcmpMatch> {
+    let l4 = meta.l4_offset as usize;
+    let icmp_type = *frame.get(l4)?;
+    if !is_icmp_error(meta.protocol, icmp_type) {
+        return None;
+    }
+
+    let embedded_ip_start = l4 + 8;
+
+    match meta.protocol {
+        PROTO_ICMP => {
+            if frame.len() < embedded_ip_start + 28 {
+                return None;
+            }
+            let ihl = ((frame[embedded_ip_start] & 0x0F) as usize) * 4;
+            if ihl < 20 || frame.len() < embedded_ip_start + ihl + 4 {
+                return None;
+            }
+            let emb_protocol = frame[embedded_ip_start + 9];
+            let emb_src_v4 = Ipv4Addr::new(
+                frame[embedded_ip_start + 12],
+                frame[embedded_ip_start + 13],
+                frame[embedded_ip_start + 14],
+                frame[embedded_ip_start + 15],
+            );
+            let emb_dst_v4 = Ipv4Addr::new(
+                frame[embedded_ip_start + 16],
+                frame[embedded_ip_start + 17],
+                frame[embedded_ip_start + 18],
+                frame[embedded_ip_start + 19],
+            );
+            let emb_src = IpAddr::V4(emb_src_v4);
+            let emb_dst = IpAddr::V4(emb_dst_v4);
+            let emb_l4 = embedded_ip_start + ihl;
+            let (emb_src_port, emb_dst_port) = if matches!(emb_protocol, PROTO_TCP | PROTO_UDP) {
+                let bytes = frame.get(emb_l4..emb_l4 + 4)?;
+                (
+                    u16::from_be_bytes([bytes[0], bytes[1]]),
+                    u16::from_be_bytes([bytes[2], bytes[3]]),
+                )
+            } else if matches!(emb_protocol, PROTO_ICMP) {
+                let bytes = frame.get(emb_l4 + 4..emb_l4 + 6)?;
+                (u16::from_be_bytes([bytes[0], bytes[1]]), 0)
+            } else {
+                (0, 0)
+            };
+            // The embedded packet is the original outgoing packet (post-SNAT).
+            // The forward session key is: src=original_client, dst=emb_dst.
+            // The NAT reverse index maps: SNAT'd tuple -> forward session key.
+            let embedded_key = SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: emb_protocol,
+                src_ip: emb_src,
+                dst_ip: emb_dst,
+                src_port: emb_src_port,
+                dst_port: emb_dst_port,
+            };
+            // Try NAT reverse index first (most common: embedded src is SNAT'd).
+            let forward_match = sessions.find_forward_nat_match(&embedded_key);
+            if let Some(fwd) = forward_match {
+                let nat = fwd.decision.nat;
+                // The forward session's src_ip is the original client.
+                let original_src = fwd.key.src_ip;
+                let original_src_port = fwd.key.src_port;
+                let resolution = lookup_forwarding_resolution_with_dynamic(
+                    forwarding, dynamic_neighbors, original_src,
+                );
+                return Some(EmbeddedIcmpMatch {
+                    nat,
+                    original_src,
+                    original_src_port,
+                    embedded_proto: emb_protocol,
+                    resolution,
+                    metadata: fwd.metadata,
+                });
+            }
+            // Fallback: direct/reversed session lookup (non-NAT case or
+            // session key matches directly).
+            let lookup = sessions.lookup(&embedded_key, now_ns, 0).or_else(|| {
+                let reversed = SessionKey {
+                    addr_family: libc::AF_INET as u8,
+                    protocol: emb_protocol,
+                    src_ip: emb_dst,
+                    dst_ip: emb_src,
+                    src_port: emb_dst_port,
+                    dst_port: emb_src_port,
+                };
+                sessions.lookup(&reversed, now_ns, 0)
+            });
+            lookup.map(|sl| {
+                // No NAT reversal needed — the embedded packet's source is
+                // already the original client.
+                let resolution = lookup_forwarding_resolution_with_dynamic(
+                    forwarding, dynamic_neighbors, emb_src,
+                );
+                EmbeddedIcmpMatch {
+                    nat: NatDecision::default(),
+                    original_src: emb_src,
+                    original_src_port: emb_src_port,
+                    embedded_proto: emb_protocol,
+                    resolution,
+                    metadata: sl.metadata,
+                }
+            })
+        }
+        PROTO_ICMPV6 => {
+            if frame.len() < embedded_ip_start + 48 {
+                return None;
+            }
+            let emb_protocol = frame[embedded_ip_start + 6];
+            let emb_src = IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[embedded_ip_start + 8..embedded_ip_start + 24]).ok()?,
+            ));
+            let emb_dst = IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[embedded_ip_start + 24..embedded_ip_start + 40]).ok()?,
+            ));
+            let emb_l4 = embedded_ip_start + 40;
+            let (emb_src_port, emb_dst_port) = if matches!(emb_protocol, PROTO_TCP | PROTO_UDP) {
+                let bytes = frame.get(emb_l4..emb_l4 + 4)?;
+                (
+                    u16::from_be_bytes([bytes[0], bytes[1]]),
+                    u16::from_be_bytes([bytes[2], bytes[3]]),
+                )
+            } else if matches!(emb_protocol, PROTO_ICMPV6) {
+                let bytes = frame.get(emb_l4 + 4..emb_l4 + 6)?;
+                (u16::from_be_bytes([bytes[0], bytes[1]]), 0)
+            } else {
+                (0, 0)
+            };
+            let embedded_key = SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: emb_protocol,
+                src_ip: emb_src,
+                dst_ip: emb_dst,
+                src_port: emb_src_port,
+                dst_port: emb_dst_port,
+            };
+            let forward_match = sessions.find_forward_nat_match(&embedded_key);
+            if let Some(fwd) = forward_match {
+                let nat = fwd.decision.nat;
+                let original_src = fwd.key.src_ip;
+                let original_src_port = fwd.key.src_port;
+                let resolution = lookup_forwarding_resolution_with_dynamic(
+                    forwarding, dynamic_neighbors, original_src,
+                );
+                return Some(EmbeddedIcmpMatch {
+                    nat,
+                    original_src,
+                    original_src_port,
+                    embedded_proto: emb_protocol,
+                    resolution,
+                    metadata: fwd.metadata,
+                });
+            }
+            let lookup = sessions.lookup(&embedded_key, now_ns, 0).or_else(|| {
+                let reversed = SessionKey {
+                    addr_family: libc::AF_INET6 as u8,
+                    protocol: emb_protocol,
+                    src_ip: emb_dst,
+                    dst_ip: emb_src,
+                    src_port: emb_dst_port,
+                    dst_port: emb_src_port,
+                };
+                sessions.lookup(&reversed, now_ns, 0)
+            });
+            lookup.map(|sl| {
+                let resolution = lookup_forwarding_resolution_with_dynamic(
+                    forwarding, dynamic_neighbors, emb_src,
+                );
+                EmbeddedIcmpMatch {
+                    nat: NatDecision::default(),
+                    original_src: emb_src,
+                    original_src_port: emb_src_port,
+                    embedded_proto: emb_protocol,
+                    resolution,
+                    metadata: sl.metadata,
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Build a NAT-reversed ICMP error frame for IPv4.
+///
+/// Rewrites:
+/// 1. Outer IP dst: SNAT'd address -> original client IP
+/// 2. Embedded IP src: SNAT'd address -> original client IP
+/// 3. Embedded L4 src port: SNAT'd port -> original port (if port NAT)
+/// 4. Embedded IP header checksum (incremental for src change)
+/// 5. Outer ICMP checksum (recomputed from scratch since embedded bytes changed)
+/// 6. Outer IP header checksum (recomputed from scratch since dst changed)
+/// 7. New Ethernet header with correct dst MAC from FIB lookup
+///
+/// Returns the complete rewritten Ethernet frame, or None on parse failure.
+fn build_nat_reversed_icmp_error_v4(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    icmp_match: &EmbeddedIcmpMatch,
+) -> Option<Vec<u8>> {
+    let l3 = meta.l3_offset as usize;
+    let l4 = meta.l4_offset as usize;
+    if l3 >= frame.len() || l4 >= frame.len() || l3 >= l4 {
+        return None;
+    }
+    let packet = frame.get(l3..)?;
+    if packet.len() < 20 {
+        return None;
+    }
+    let ihl = ((packet[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || packet.len() < ihl + 8 {
+        return None;
+    }
+
+    let original_client = match icmp_match.original_src {
+        IpAddr::V4(v4) => v4,
+        _ => return None,
+    };
+
+    // Compute Ethernet header size from L3 offset.
+    let eth_len = l3;
+    let dst_mac = icmp_match.resolution.neighbor_mac?;
+    let src_mac = icmp_match.resolution.src_mac?;
+    let vlan_id = icmp_match.resolution.tx_vlan_id;
+
+    // Trim incoming payload to IP total length (strip Ethernet padding).
+    let ip_total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    let payload = if ip_total_len > 0 && ip_total_len < packet.len() {
+        &packet[..ip_total_len]
+    } else {
+        packet
+    };
+
+    // Build output frame: new Ethernet header + modified IP payload.
+    let out_eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let mut out = vec![0u8; out_eth_len + payload.len()];
+    write_eth_header_slice(out.get_mut(..out_eth_len)?, dst_mac, src_mac, vlan_id, 0x0800)?;
+    out.get_mut(out_eth_len..)?.copy_from_slice(payload);
+
+    let pkt = &mut out[out_eth_len..];
+
+    // --- Step 1: Rewrite outer IP dst ---
+    pkt.get_mut(16..20)?.copy_from_slice(&original_client.octets());
+
+    // --- Step 2+3: Rewrite embedded packet ---
+    let icmp_offset = ihl; // ICMP header starts at IHL
+    let emb_ip_offset = icmp_offset + 8; // Embedded IP starts 8 bytes into ICMP
+    if pkt.len() < emb_ip_offset + 20 {
+        return None;
+    }
+    let emb_ihl = ((pkt[emb_ip_offset] & 0x0f) as usize) * 4;
+    if emb_ihl < 20 || pkt.len() < emb_ip_offset + emb_ihl {
+        return None;
+    }
+
+    // Rewrite embedded src IP.
+    pkt.get_mut(emb_ip_offset + 12..emb_ip_offset + 16)?
+        .copy_from_slice(&original_client.octets());
+
+    // Update embedded IP header checksum incrementally for src change.
+    // Read old checksum, zero it, recompute from scratch (simpler, ICMP errors are rare).
+    {
+        pkt.get_mut(emb_ip_offset + 10..emb_ip_offset + 12)?
+            .copy_from_slice(&[0, 0]);
+        let emb_ip_header = pkt.get(emb_ip_offset..emb_ip_offset + emb_ihl)?;
+        let csum = checksum16(emb_ip_header);
+        pkt.get_mut(emb_ip_offset + 10..emb_ip_offset + 12)?
+            .copy_from_slice(&csum.to_be_bytes());
+    }
+
+    // Rewrite embedded L4 src port if port NAT was applied.
+    let emb_l4_offset = emb_ip_offset + emb_ihl;
+    if icmp_match.nat.rewrite_src_port.is_some() || icmp_match.nat.rewrite_src.is_some() {
+        let emb_proto = icmp_match.embedded_proto;
+        if matches!(emb_proto, PROTO_TCP | PROTO_UDP) && pkt.len() >= emb_l4_offset + 2 {
+            pkt.get_mut(emb_l4_offset..emb_l4_offset + 2)?
+                .copy_from_slice(&icmp_match.original_src_port.to_be_bytes());
+        } else if emb_proto == PROTO_ICMP && pkt.len() >= emb_l4_offset + 6 {
+            // ICMP echo ID is at offset +4 in the embedded ICMP header.
+            let old_id_bytes = pkt.get(emb_l4_offset + 4..emb_l4_offset + 6)?;
+            let old_id = u16::from_be_bytes([old_id_bytes[0], old_id_bytes[1]]);
+            if old_id != icmp_match.original_src_port {
+                pkt.get_mut(emb_l4_offset + 4..emb_l4_offset + 6)?
+                    .copy_from_slice(&icmp_match.original_src_port.to_be_bytes());
+                // Embedded ICMP checksum covers echo ID — update it.
+                if pkt.len() >= emb_l4_offset + 4 {
+                    let old_csum = u16::from_be_bytes([
+                        pkt[emb_l4_offset + 2],
+                        pkt[emb_l4_offset + 3],
+                    ]);
+                    let new_csum = checksum16_adjust(
+                        old_csum,
+                        &[old_id],
+                        &[icmp_match.original_src_port],
+                    );
+                    pkt.get_mut(emb_l4_offset + 2..emb_l4_offset + 4)?
+                        .copy_from_slice(&new_csum.to_be_bytes());
+                }
+            }
+        }
+    }
+
+    // --- Step 5: Recompute outer ICMP checksum from scratch ---
+    // The ICMP checksum covers: type(1) + code(1) + checksum(2) + unused(4) + payload.
+    // Zero checksum field, then compute over the entire ICMP message.
+    pkt.get_mut(icmp_offset + 2..icmp_offset + 4)?
+        .copy_from_slice(&[0, 0]);
+    let icmp_data = pkt.get(icmp_offset..)?;
+    let icmp_csum = checksum16(icmp_data);
+    pkt.get_mut(icmp_offset + 2..icmp_offset + 4)?
+        .copy_from_slice(&icmp_csum.to_be_bytes());
+
+    // --- Step 6: Recompute outer IP header checksum from scratch ---
+    pkt.get_mut(10..12)?.copy_from_slice(&[0, 0]);
+    let ip_header = pkt.get(..ihl)?;
+    let ip_csum = checksum16(ip_header);
+    pkt.get_mut(10..12)?.copy_from_slice(&ip_csum.to_be_bytes());
+
+    Some(out)
+}
+
+/// Build a NAT-reversed ICMPv6 error frame for IPv6.
+///
+/// Rewrites:
+/// 1. Outer IPv6 dst: SNAT'd address -> original client IPv6
+/// 2. Embedded IPv6 src: SNAT'd address -> original client IPv6
+/// 3. Embedded L4 src port: SNAT'd port -> original port (if port NAT)
+/// 4. Outer ICMPv6 checksum (recomputed from scratch — covers pseudo-header)
+/// 5. New Ethernet header with correct dst MAC from FIB lookup
+///
+/// IPv6 has no IP header checksum, simplifying the rewrite vs IPv4.
+fn build_nat_reversed_icmp_error_v6(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    icmp_match: &EmbeddedIcmpMatch,
+) -> Option<Vec<u8>> {
+    let l3 = meta.l3_offset as usize;
+    let l4 = meta.l4_offset as usize;
+    if l3 >= frame.len() || l4 >= frame.len() || l3 >= l4 {
+        return None;
+    }
+    let packet = frame.get(l3..)?;
+    if packet.len() < 40 {
+        return None;
+    }
+
+    let original_client_bytes = match icmp_match.original_src {
+        IpAddr::V6(v6) => v6.octets(),
+        _ => return None,
+    };
+
+    let dst_mac = icmp_match.resolution.neighbor_mac?;
+    let src_mac = icmp_match.resolution.src_mac?;
+    let vlan_id = icmp_match.resolution.tx_vlan_id;
+
+    // Trim to IPv6 total length (40 header + payload_len).
+    let ipv6_payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let ip6_total = 40 + ipv6_payload_len;
+    let payload = if ip6_total > 0 && ip6_total < packet.len() {
+        &packet[..ip6_total]
+    } else {
+        packet
+    };
+
+    let out_eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let mut out = vec![0u8; out_eth_len + payload.len()];
+    write_eth_header_slice(out.get_mut(..out_eth_len)?, dst_mac, src_mac, vlan_id, 0x86dd)?;
+    out.get_mut(out_eth_len..)?.copy_from_slice(payload);
+
+    let pkt = &mut out[out_eth_len..];
+
+    // --- Step 1: Rewrite outer IPv6 dst (bytes 24..40) ---
+    pkt.get_mut(24..40)?.copy_from_slice(&original_client_bytes);
+
+    // --- Step 2: Rewrite embedded IPv6 src ---
+    let icmp_offset = 40; // ICMPv6 starts after fixed IPv6 header
+    let emb_ip_offset = icmp_offset + 8; // Embedded IPv6 starts 8 bytes into ICMPv6
+    if pkt.len() < emb_ip_offset + 40 {
+        return None;
+    }
+    // Embedded IPv6 src is at emb_ip_offset + 8..+24
+    pkt.get_mut(emb_ip_offset + 8..emb_ip_offset + 24)?
+        .copy_from_slice(&original_client_bytes);
+
+    // --- Step 3: Rewrite embedded L4 src port ---
+    let emb_l4_offset = emb_ip_offset + 40;
+    if icmp_match.nat.rewrite_src_port.is_some() || icmp_match.nat.rewrite_src.is_some() {
+        let emb_proto = icmp_match.embedded_proto;
+        if matches!(emb_proto, PROTO_TCP | PROTO_UDP) && pkt.len() >= emb_l4_offset + 2 {
+            pkt.get_mut(emb_l4_offset..emb_l4_offset + 2)?
+                .copy_from_slice(&icmp_match.original_src_port.to_be_bytes());
+        } else if emb_proto == PROTO_ICMPV6 && pkt.len() >= emb_l4_offset + 6 {
+            // ICMPv6 echo ID is at offset +4 in the embedded ICMPv6 header.
+            let old_id_bytes = pkt.get(emb_l4_offset + 4..emb_l4_offset + 6)?;
+            let old_id = u16::from_be_bytes([old_id_bytes[0], old_id_bytes[1]]);
+            if old_id != icmp_match.original_src_port {
+                pkt.get_mut(emb_l4_offset + 4..emb_l4_offset + 6)?
+                    .copy_from_slice(&icmp_match.original_src_port.to_be_bytes());
+                // Update embedded ICMPv6 checksum for echo ID change.
+                if pkt.len() >= emb_l4_offset + 4 {
+                    let old_csum = u16::from_be_bytes([
+                        pkt[emb_l4_offset + 2],
+                        pkt[emb_l4_offset + 3],
+                    ]);
+                    let new_csum = checksum16_adjust(
+                        old_csum,
+                        &[old_id],
+                        &[icmp_match.original_src_port],
+                    );
+                    pkt.get_mut(emb_l4_offset + 2..emb_l4_offset + 4)?
+                        .copy_from_slice(&new_csum.to_be_bytes());
+                }
+            }
+        }
+    }
+
+    // --- Step 4: Recompute outer ICMPv6 checksum from scratch ---
+    // ICMPv6 checksum covers pseudo-header (src, dst, length, next_header=58)
+    // plus the entire ICMPv6 message.
+    pkt.get_mut(icmp_offset + 2..icmp_offset + 4)?
+        .copy_from_slice(&[0, 0]);
+    let src_v6 = Ipv6Addr::from(<[u8; 16]>::try_from(pkt.get(8..24)?).ok()?);
+    let dst_v6 = Ipv6Addr::from(<[u8; 16]>::try_from(pkt.get(24..40)?).ok()?);
+    let icmp6_data = pkt.get(icmp_offset..)?;
+    let icmp6_csum = checksum16_ipv6(src_v6, dst_v6, PROTO_ICMPV6, icmp6_data);
+    pkt.get_mut(icmp_offset + 2..icmp_offset + 4)?
+        .copy_from_slice(&icmp6_csum.to_be_bytes());
+
+    Some(out)
 }
 
 fn allow_unsolicited_dns_reply(forwarding: &ForwardingState, flow: &SessionFlow) -> bool {
@@ -15296,5 +15890,583 @@ mod tests {
         assert!(!build_forwarding_state(&snapshot).allow_embedded_icmp);
         snapshot.flow.allow_embedded_icmp = true;
         assert!(build_forwarding_state(&snapshot).allow_embedded_icmp);
+    }
+
+    // --- ICMP error NAT reversal tests ---
+
+    /// Build an IPv4 ICMP Time Exceeded frame with an embedded TCP packet.
+    /// outer: [Eth][IP: src=router_ip, dst=snat_ip][ICMP type=11 code=0]
+    ///        [Embedded: IP src=snat_ip, dst=server_ip, proto=TCP][TCP src=snat_port, dst=server_port]
+    fn build_icmp_te_frame_v4(
+        router_ip: Ipv4Addr,
+        snat_ip: Ipv4Addr,
+        server_ip: Ipv4Addr,
+        snat_port: u16,
+        server_port: u16,
+        embedded_proto: u8,
+    ) -> Vec<u8> {
+        let mut frame = Vec::new();
+        // Ethernet header
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], // dst MAC
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56], // src MAC
+            0,
+            0x0800,
+        );
+        let ip_start = frame.len(); // 14
+
+        // Build embedded IP+L4 first to know sizes
+        let mut embedded = Vec::new();
+        // Embedded IPv4 header (20 bytes, IHL=5)
+        embedded.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x00, // version/IHL, DSCP, total length (fill later)
+            0x00, 0x01, 0x00, 0x00, // ID, flags, fragment offset
+            64, embedded_proto, 0x00, 0x00, // TTL, protocol, checksum (fill later)
+        ]);
+        embedded.extend_from_slice(&snat_ip.octets()); // src
+        embedded.extend_from_slice(&server_ip.octets()); // dst
+        // Embedded L4: first 8 bytes
+        if matches!(embedded_proto, PROTO_TCP | PROTO_UDP) {
+            embedded.extend_from_slice(&snat_port.to_be_bytes());
+            embedded.extend_from_slice(&server_port.to_be_bytes());
+            embedded.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // seq/other
+        } else if embedded_proto == PROTO_ICMP {
+            embedded.extend_from_slice(&[8, 0, 0x00, 0x00]); // echo request, checksum
+            embedded.extend_from_slice(&snat_port.to_be_bytes()); // echo ID
+            embedded.extend_from_slice(&[0x00, 0x01]); // seq
+        }
+        // Fill embedded IP total length
+        let emb_total = embedded.len() as u16;
+        embedded[2..4].copy_from_slice(&emb_total.to_be_bytes());
+        // Compute embedded IP checksum
+        embedded[10..12].copy_from_slice(&[0, 0]);
+        let emb_ip_csum = checksum16(&embedded[..20]);
+        embedded[10..12].copy_from_slice(&emb_ip_csum.to_be_bytes());
+
+        // Outer ICMP header: type=11 (Time Exceeded), code=0, checksum, unused
+        let mut icmp = Vec::new();
+        icmp.extend_from_slice(&[11, 0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // type, code, csum, unused
+        icmp.extend_from_slice(&embedded);
+        // Compute ICMP checksum
+        icmp[2..4].copy_from_slice(&[0, 0]);
+        let icmp_csum = checksum16(&icmp);
+        icmp[2..4].copy_from_slice(&icmp_csum.to_be_bytes());
+
+        // Outer IPv4 header
+        let outer_total_len = (20 + icmp.len()) as u16;
+        frame.extend_from_slice(&[
+            0x45, 0x00, // version/IHL, DSCP
+        ]);
+        frame.extend_from_slice(&outer_total_len.to_be_bytes()); // total length
+        frame.extend_from_slice(&[
+            0x00, 0x02, 0x00, 0x00, // ID, flags
+            64, PROTO_ICMP, 0x00, 0x00, // TTL, protocol, checksum
+        ]);
+        frame.extend_from_slice(&router_ip.octets()); // src
+        frame.extend_from_slice(&snat_ip.octets()); // dst
+
+        // Compute outer IP checksum
+        frame[ip_start + 10..ip_start + 12].copy_from_slice(&[0, 0]);
+        let ip_csum = checksum16(&frame[ip_start..ip_start + 20]);
+        frame[ip_start + 10..ip_start + 12].copy_from_slice(&ip_csum.to_be_bytes());
+
+        // Append ICMP payload
+        frame.extend_from_slice(&icmp);
+
+        frame
+    }
+
+    #[test]
+    fn icmp_te_nat_reversal_v4_rewrites_outer_dst_and_embedded_src() {
+        // Scenario: client 10.0.61.102 -> server 1.1.1.1, SNAT'd to 172.16.80.8
+        // Router 10.0.0.1 sends ICMP Time Exceeded back to 172.16.80.8
+        // NAT reversal: outer dst 172.16.80.8 -> 10.0.61.102,
+        //               embedded src 172.16.80.8 -> 10.0.61.102
+        let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+        let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+        let snat_port: u16 = 40000;
+        let client_port: u16 = 12345;
+
+        let frame = build_icmp_te_frame_v4(
+            router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP,
+        );
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+
+        let icmp_match = EmbeddedIcmpMatch {
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_src_port: Some(snat_port),
+                ..NatDecision::default()
+            },
+            original_src: IpAddr::V4(client_ip),
+            original_src_port: client_port,
+            embedded_proto: PROTO_TCP,
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 5,
+                tx_ifindex: 5,
+                next_hop: Some(IpAddr::V4(client_ip)),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+                tx_vlan_id: 0,
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("untrust"),
+                egress_zone: Arc::<str>::from("trust"),
+                owner_rg_id: 0,
+                is_reverse: false,
+                synced: false,
+                nat64_reverse: None,
+            },
+        };
+
+        let result = build_nat_reversed_icmp_error_v4(&frame, meta, &icmp_match)
+            .expect("should build NAT-reversed frame");
+
+        // Verify Ethernet header
+        assert_eq!(&result[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // dst MAC
+        assert_eq!(&result[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]); // src MAC
+        assert_eq!(&result[12..14], &[0x08, 0x00]); // ethertype IPv4
+
+        // Verify outer IP dst is now the original client
+        let outer_dst = Ipv4Addr::new(result[30], result[31], result[32], result[33]);
+        assert_eq!(outer_dst, client_ip, "outer IP dst should be original client");
+
+        // Verify outer IP src is still the router
+        let outer_src = Ipv4Addr::new(result[26], result[27], result[28], result[29]);
+        assert_eq!(outer_src, router_ip, "outer IP src should remain router");
+
+        // Verify embedded IP src is now the original client
+        // Embedded IP starts at: eth(14) + outer_ip(20) + icmp_hdr(8) = 42
+        let emb_ip_start = 42;
+        let emb_src = Ipv4Addr::new(
+            result[emb_ip_start + 12],
+            result[emb_ip_start + 13],
+            result[emb_ip_start + 14],
+            result[emb_ip_start + 15],
+        );
+        assert_eq!(emb_src, client_ip, "embedded src should be original client");
+
+        // Verify embedded dst is still the server
+        let emb_dst = Ipv4Addr::new(
+            result[emb_ip_start + 16],
+            result[emb_ip_start + 17],
+            result[emb_ip_start + 18],
+            result[emb_ip_start + 19],
+        );
+        assert_eq!(emb_dst, server_ip, "embedded dst should remain server");
+
+        // Verify embedded TCP src port is now the original client port
+        let emb_l4_start = emb_ip_start + 20; // IHL=5, so 20 bytes
+        let emb_port = u16::from_be_bytes([result[emb_l4_start], result[emb_l4_start + 1]]);
+        assert_eq!(emb_port, client_port, "embedded src port should be original");
+
+        // Verify outer IP checksum is valid
+        let outer_ihl = ((result[14] & 0x0f) as usize) * 4;
+        let ip_csum_check = checksum16(&result[14..14 + outer_ihl]);
+        assert_eq!(ip_csum_check, 0, "outer IP checksum should be valid (0)");
+
+        // Verify outer ICMP checksum is valid
+        let icmp_start = 14 + outer_ihl;
+        let icmp_csum_check = checksum16(&result[icmp_start..]);
+        assert_eq!(icmp_csum_check, 0, "outer ICMP checksum should be valid (0)");
+
+        // Verify embedded IP checksum is valid
+        let emb_ihl = ((result[emb_ip_start] & 0x0f) as usize) * 4;
+        let emb_ip_csum_check = checksum16(&result[emb_ip_start..emb_ip_start + emb_ihl]);
+        assert_eq!(emb_ip_csum_check, 0, "embedded IP checksum should be valid (0)");
+    }
+
+    #[test]
+    fn icmp_te_nat_reversal_v4_with_port_snat() {
+        // Same as above but verifying UDP port reversal specifically
+        let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+        let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+        let snat_port: u16 = 50000;
+        let client_port: u16 = 5353;
+
+        let frame = build_icmp_te_frame_v4(
+            router_ip, snat_ip, server_ip, snat_port, 53, PROTO_UDP,
+        );
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+
+        let icmp_match = EmbeddedIcmpMatch {
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_src_port: Some(snat_port),
+                ..NatDecision::default()
+            },
+            original_src: IpAddr::V4(client_ip),
+            original_src_port: client_port,
+            embedded_proto: PROTO_UDP,
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 5,
+                tx_ifindex: 5,
+                next_hop: Some(IpAddr::V4(client_ip)),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+                tx_vlan_id: 0,
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("untrust"),
+                egress_zone: Arc::<str>::from("trust"),
+                owner_rg_id: 0,
+                is_reverse: false,
+                synced: false,
+                nat64_reverse: None,
+            },
+        };
+
+        let result = build_nat_reversed_icmp_error_v4(&frame, meta, &icmp_match)
+            .expect("should build NAT-reversed frame");
+
+        // Verify embedded UDP src port is now the original client port
+        let emb_ip_start = 42; // eth(14) + outer_ip(20) + icmp_hdr(8)
+        let emb_l4_start = emb_ip_start + 20;
+        let emb_port = u16::from_be_bytes([result[emb_l4_start], result[emb_l4_start + 1]]);
+        assert_eq!(emb_port, client_port, "embedded UDP src port should be original");
+
+        // Verify all checksums
+        let ip_csum_check = checksum16(&result[14..34]);
+        assert_eq!(ip_csum_check, 0, "outer IP checksum should be valid");
+        let icmp_csum_check = checksum16(&result[34..]);
+        assert_eq!(icmp_csum_check, 0, "outer ICMP checksum should be valid");
+    }
+
+    #[test]
+    fn icmp_dest_unreach_nat_reversal_v4() {
+        // ICMP Destination Unreachable (type 3, code 1) with embedded TCP
+        let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+        let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+
+        // Build ICMP Destination Unreachable frame manually
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x0800,
+        );
+        let ip_start = frame.len();
+
+        // Embedded IP+TCP
+        let mut embedded = Vec::new();
+        embedded.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            64, PROTO_TCP, 0x00, 0x00,
+        ]);
+        embedded.extend_from_slice(&snat_ip.octets());
+        embedded.extend_from_slice(&server_ip.octets());
+        let emb_total = (20 + 8) as u16;
+        embedded[2..4].copy_from_slice(&emb_total.to_be_bytes());
+        embedded.extend_from_slice(&40000u16.to_be_bytes()); // src port (SNAT'd)
+        embedded.extend_from_slice(&80u16.to_be_bytes()); // dst port
+        embedded.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // seq
+        embedded[10..12].copy_from_slice(&[0, 0]);
+        let emb_ip_csum = checksum16(&embedded[..20]);
+        embedded[10..12].copy_from_slice(&emb_ip_csum.to_be_bytes());
+
+        // ICMP type=3 (Dest Unreach), code=1 (Host Unreachable)
+        let mut icmp = Vec::new();
+        icmp.extend_from_slice(&[3, 1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        icmp.extend_from_slice(&embedded);
+        icmp[2..4].copy_from_slice(&[0, 0]);
+        let icmp_csum = checksum16(&icmp);
+        icmp[2..4].copy_from_slice(&icmp_csum.to_be_bytes());
+
+        // Outer IP
+        let outer_total = (20 + icmp.len()) as u16;
+        frame.extend_from_slice(&[0x45, 0x00]);
+        frame.extend_from_slice(&outer_total.to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x02, 0x00, 0x00, 64, PROTO_ICMP, 0x00, 0x00]);
+        frame.extend_from_slice(&router_ip.octets());
+        frame.extend_from_slice(&snat_ip.octets());
+        frame[ip_start + 10..ip_start + 12].copy_from_slice(&[0, 0]);
+        let ip_csum = checksum16(&frame[ip_start..ip_start + 20]);
+        frame[ip_start + 10..ip_start + 12].copy_from_slice(&ip_csum.to_be_bytes());
+        frame.extend_from_slice(&icmp);
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+
+        let icmp_match = EmbeddedIcmpMatch {
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_src_port: Some(40000),
+                ..NatDecision::default()
+            },
+            original_src: IpAddr::V4(client_ip),
+            original_src_port: 12345,
+            embedded_proto: PROTO_TCP,
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 5,
+                tx_ifindex: 5,
+                next_hop: Some(IpAddr::V4(client_ip)),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+                tx_vlan_id: 0,
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("untrust"),
+                egress_zone: Arc::<str>::from("trust"),
+                owner_rg_id: 0,
+                is_reverse: false,
+                synced: false,
+                nat64_reverse: None,
+            },
+        };
+
+        let result = build_nat_reversed_icmp_error_v4(&frame, meta, &icmp_match)
+            .expect("should build NAT-reversed frame");
+
+        // Verify outer IP dst is client
+        let outer_dst = Ipv4Addr::new(result[30], result[31], result[32], result[33]);
+        assert_eq!(outer_dst, client_ip);
+
+        // Verify ICMP type/code NOT modified
+        assert_eq!(result[34], 3, "ICMP type must remain Dest Unreach");
+        assert_eq!(result[35], 1, "ICMP code must remain Host Unreachable");
+
+        // Verify checksums
+        let ip_csum_check = checksum16(&result[14..34]);
+        assert_eq!(ip_csum_check, 0);
+        let icmp_csum_check = checksum16(&result[34..]);
+        assert_eq!(icmp_csum_check, 0);
+    }
+
+    /// Build an IPv6 ICMPv6 Time Exceeded frame with an embedded TCP packet.
+    fn build_icmpv6_te_frame(
+        router_ip: Ipv6Addr,
+        snat_ip: Ipv6Addr,
+        server_ip: Ipv6Addr,
+        snat_port: u16,
+        server_port: u16,
+        embedded_proto: u8,
+    ) -> Vec<u8> {
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x86dd,
+        );
+
+        // Build embedded IPv6+L4
+        let mut embedded = Vec::new();
+        // IPv6 header (40 bytes)
+        embedded.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]); // version, traffic class, flow label
+        let emb_payload_len = 8u16; // 8 bytes of L4
+        embedded.extend_from_slice(&emb_payload_len.to_be_bytes());
+        embedded.push(embedded_proto); // next header
+        embedded.push(64); // hop limit
+        embedded.extend_from_slice(&snat_ip.octets()); // src
+        embedded.extend_from_slice(&server_ip.octets()); // dst
+        // Embedded L4: first 8 bytes
+        if matches!(embedded_proto, PROTO_TCP | PROTO_UDP) {
+            embedded.extend_from_slice(&snat_port.to_be_bytes());
+            embedded.extend_from_slice(&server_port.to_be_bytes());
+            embedded.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        } else if embedded_proto == PROTO_ICMPV6 {
+            embedded.extend_from_slice(&[128, 0, 0x00, 0x00]); // echo request, checksum
+            embedded.extend_from_slice(&snat_port.to_be_bytes()); // echo ID
+            embedded.extend_from_slice(&[0x00, 0x01]); // seq
+        }
+
+        // ICMPv6 header: type=3 (Time Exceeded), code=0, checksum, unused
+        let mut icmp6 = Vec::new();
+        icmp6.extend_from_slice(&[3, 0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        icmp6.extend_from_slice(&embedded);
+
+        // Outer IPv6 header
+        let payload_len = icmp6.len() as u16;
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+        frame.extend_from_slice(&payload_len.to_be_bytes());
+        frame.push(PROTO_ICMPV6); // next header
+        frame.push(64); // hop limit
+        frame.extend_from_slice(&router_ip.octets()); // src
+        frame.extend_from_slice(&snat_ip.octets()); // dst
+
+        // Compute ICMPv6 checksum (covers pseudo-header)
+        icmp6[2..4].copy_from_slice(&[0, 0]);
+        let csum = checksum16_ipv6(router_ip, snat_ip, PROTO_ICMPV6, &icmp6);
+        icmp6[2..4].copy_from_slice(&csum.to_be_bytes());
+
+        frame.extend_from_slice(&icmp6);
+        frame
+    }
+
+    #[test]
+    fn icmpv6_te_nat_reversal_v6_rewrites_outer_dst_and_embedded_src() {
+        let router_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let snat_ip: Ipv6Addr = "2001:db8:1::100".parse().unwrap();
+        let client_ip: Ipv6Addr = "fd00::102".parse().unwrap();
+        let server_ip: Ipv6Addr = "2001:db8:2::1".parse().unwrap();
+        let snat_port: u16 = 40000;
+        let client_port: u16 = 12345;
+
+        let frame = build_icmpv6_te_frame(
+            router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP,
+        );
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_ICMPV6,
+            ..UserspaceDpMeta::default()
+        };
+
+        let icmp_match = EmbeddedIcmpMatch {
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V6(snat_ip)),
+                rewrite_src_port: Some(snat_port),
+                ..NatDecision::default()
+            },
+            original_src: IpAddr::V6(client_ip),
+            original_src_port: client_port,
+            embedded_proto: PROTO_TCP,
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 5,
+                tx_ifindex: 5,
+                next_hop: Some(IpAddr::V6(client_ip)),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+                tx_vlan_id: 0,
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("untrust"),
+                egress_zone: Arc::<str>::from("trust"),
+                owner_rg_id: 0,
+                is_reverse: false,
+                synced: false,
+                nat64_reverse: None,
+            },
+        };
+
+        let result = build_nat_reversed_icmp_error_v6(&frame, meta, &icmp_match)
+            .expect("should build NAT-reversed ICMPv6 frame");
+
+        // Verify Ethernet header
+        assert_eq!(&result[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // dst MAC
+        assert_eq!(&result[12..14], &[0x86, 0xdd]); // ethertype IPv6
+
+        // Verify outer IPv6 dst is now the original client (bytes 24..40 in IPv6)
+        let outer_dst_bytes: [u8; 16] = result[38..54].try_into().unwrap();
+        let outer_dst = Ipv6Addr::from(outer_dst_bytes);
+        assert_eq!(outer_dst, client_ip, "outer IPv6 dst should be original client");
+
+        // Verify outer IPv6 src is still the router (bytes 8..24 in IPv6)
+        let outer_src_bytes: [u8; 16] = result[22..38].try_into().unwrap();
+        let outer_src = Ipv6Addr::from(outer_src_bytes);
+        assert_eq!(outer_src, router_ip, "outer IPv6 src should remain router");
+
+        // Verify embedded IPv6 src is now the original client
+        // Embedded IPv6 starts at: eth(14) + outer_ipv6(40) + icmpv6_hdr(8) = 62
+        let emb_ip_start = 62;
+        let emb_src_bytes: [u8; 16] = result[emb_ip_start + 8..emb_ip_start + 24]
+            .try_into()
+            .unwrap();
+        let emb_src = Ipv6Addr::from(emb_src_bytes);
+        assert_eq!(emb_src, client_ip, "embedded IPv6 src should be original client");
+
+        // Verify embedded dst is still the server
+        let emb_dst_bytes: [u8; 16] = result[emb_ip_start + 24..emb_ip_start + 40]
+            .try_into()
+            .unwrap();
+        let emb_dst = Ipv6Addr::from(emb_dst_bytes);
+        assert_eq!(emb_dst, server_ip, "embedded IPv6 dst should remain server");
+
+        // Verify embedded TCP src port
+        let emb_l4_start = emb_ip_start + 40;
+        let emb_port = u16::from_be_bytes([result[emb_l4_start], result[emb_l4_start + 1]]);
+        assert_eq!(emb_port, client_port, "embedded src port should be original");
+
+        // Verify ICMPv6 checksum is valid
+        let icmp6_start = 54; // eth(14) + ipv6(40)
+        let src_v6 = Ipv6Addr::from(outer_src_bytes);
+        let dst_v6 = Ipv6Addr::from(outer_dst_bytes);
+        let icmp6_data = &result[icmp6_start..];
+        // Zero checksum and recompute
+        let mut icmp6_copy = icmp6_data.to_vec();
+        icmp6_copy[2] = 0;
+        icmp6_copy[3] = 0;
+        let expected_csum = checksum16_ipv6(src_v6, dst_v6, PROTO_ICMPV6, &icmp6_copy);
+        let actual_csum = u16::from_be_bytes([icmp6_data[2], icmp6_data[3]]);
+        assert_eq!(actual_csum, expected_csum, "ICMPv6 checksum should be valid");
+    }
+
+    #[test]
+    fn no_match_embedded_icmp_returns_none() {
+        // An ICMP error with no matching session should return None
+        let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+        let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+
+        let frame = build_icmp_te_frame_v4(
+            router_ip, snat_ip, server_ip, 40000, 80, PROTO_TCP,
+        );
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+
+        let mut sessions = SessionTable::new();
+        // Don't install any sessions
+        let result = try_embedded_icmp_session_match_from_frame(&frame, meta, &mut sessions, 1_000_000);
+        assert!(result.is_none(), "should return None when no session matches");
     }
 }
