@@ -3589,6 +3589,22 @@ fn enqueue_pending_forwards(
             right,
             request.target_ifindex,
         ) else {
+            // No XSK binding for the target interface (e.g. fabric link).
+            // Fall back to slow-path so the kernel can forward the packet.
+            if request.decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
+                maybe_reinject_slow_path(
+                    ingress_ident,
+                    ingress_live,
+                    slow_path,
+                    unsafe { &*ingress_area },
+                    request.desc,
+                    request.meta,
+                    request.decision,
+                    recent_exceptions,
+                );
+                ingress_binding.pending_fill_frames.push_back(source_offset);
+                continue;
+            }
             dbg.no_egress_binding += 1;
             if cfg!(feature = "debug-log") && dbg.no_egress_binding <= 3 {
                 debug_log!(
