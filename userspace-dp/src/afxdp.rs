@@ -48,14 +48,19 @@ mod icmp;
 #[path = "afxdp/icmp_embed.rs"]
 mod icmp_embed;
 
-use self::icmp::{
-    build_local_time_exceeded_request, build_local_time_exceeded_v4,
-    build_local_time_exceeded_v6, is_icmp_error, packet_ttl_would_expire,
-};
+use self::icmp::{build_local_time_exceeded_request, is_icmp_error};
 use self::icmp_embed::{
-    EmbeddedIcmpMatch, build_nat_reversed_icmp_error_v4, build_nat_reversed_icmp_error_v6,
+    build_nat_reversed_icmp_error_v4, build_nat_reversed_icmp_error_v6,
     finalize_embedded_icmp_resolution, try_embedded_icmp_nat_match,
-    try_embedded_icmp_nat_match_from_frame, try_embedded_icmp_session_match_from_frame,
+};
+#[cfg(test)]
+use self::icmp::{
+    build_local_time_exceeded_v4, build_local_time_exceeded_v6, packet_ttl_would_expire,
+};
+#[cfg(test)]
+use self::icmp_embed::{
+    EmbeddedIcmpMatch, try_embedded_icmp_nat_match_from_frame,
+    try_embedded_icmp_session_match_from_frame,
 };
 
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
