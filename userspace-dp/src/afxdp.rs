@@ -100,6 +100,7 @@ const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const PROTO_ICMP: u8 = 1;
 const PROTO_ICMPV6: u8 = 58;
+#[allow(dead_code)]
 const PROTO_GRE: u8 = 47;
 const PROTO_ESP: u8 = 50;
 const TCP_FLAG_FIN: u8 = 0x01;
@@ -997,6 +998,7 @@ struct ForwardingState {
     /// Firewall filter state for input filtering.
     filter_state: crate::filter::FilterState,
     /// GRE performance acceleration: extract GRE key into session ports.
+    #[allow(dead_code)]
     gre_acceleration: bool,
     /// Flow export configuration (NetFlow v9).
     flow_export_config: Option<crate::flowexport::FlowExportConfig>,
@@ -1150,6 +1152,7 @@ struct BindingWorker {
     ifindex: i32,
     umem: WorkerUmem,
     live: Arc<BindingLiveState>,
+    #[allow(dead_code)]
     user: User,
     device: xdpilone::DeviceQueue,
     rx: xdpilone::RingRx,
@@ -1287,8 +1290,11 @@ impl ResolutionDebug {
 #[derive(Clone, Debug)]
 struct TxRequest {
     bytes: Vec<u8>,
+    #[allow(dead_code)]
     expected_ports: Option<(u16, u16)>,
+    #[allow(dead_code)]
     expected_addr_family: u8,
+    #[allow(dead_code)]
     expected_protocol: u8,
     flow_key: Option<SessionKey>,
 }
@@ -1314,8 +1320,11 @@ struct PreparedTxRequest {
     offset: u64,
     len: u32,
     recycle_slot: Option<u32>,
+    #[allow(dead_code)]
     expected_ports: Option<(u16, u16)>,
+    #[allow(dead_code)]
     expected_addr_family: u8,
+    #[allow(dead_code)]
     expected_protocol: u8,
     flow_key: Option<SessionKey>,
 }
@@ -1645,6 +1654,7 @@ fn query_bound_xsk_mode(fd: c_int) -> Option<XskBindMode> {
     })
 }
 
+#[allow(dead_code)]
 fn bind_user_with_retry(
     umem: &Umem,
     user: &User,
@@ -1750,19 +1760,32 @@ fn set_busy_poll_opts(fd: c_int) {
 #[derive(Default)]
 struct DebugPollCounters {
     rx: u64,
+    #[allow(dead_code)]
     tx: u64,
     forward: u64,
+    #[allow(dead_code)]
     local: u64,
+    #[allow(dead_code)]
     session_hit: u64,
+    #[allow(dead_code)]
     session_miss: u64,
+    #[allow(dead_code)]
     session_create: u64,
+    #[allow(dead_code)]
     no_route: u64,
+    #[allow(dead_code)]
     missing_neigh: u64,
+    #[allow(dead_code)]
     policy_deny: u64,
+    #[allow(dead_code)]
     ha_inactive: u64,
+    #[allow(dead_code)]
     no_egress_binding: u64,
+    #[allow(dead_code)]
     build_fail: u64,
+    #[allow(dead_code)]
     tx_err: u64,
+    #[allow(dead_code)]
     metadata_err: u64,
     disposition_other: u64,
     enqueue_ok: u64,        // forwards successfully enqueued to target binding TX
@@ -1777,8 +1800,10 @@ struct DebugPollCounters {
     nat_applied_snat: u64,  // SNAT rewrites applied
     nat_applied_dnat: u64,  // DNAT (reverse-SNAT) rewrites applied
     nat_applied_none: u64,  // no NAT rewrite
+    #[allow(dead_code)]
     frame_build_none: u64,  // build_forwarded_frame returned None (why?)
     rx_tcp_rst: u64,        // TCP RST flags seen in RX frames
+    #[allow(dead_code)]
     tx_tcp_rst: u64,        // TCP RST flags seen in TX frames (forwarded)
     rx_bytes_total: u64,    // total RX bytes (for avg frame size calculation)
     tx_bytes_total: u64,    // total TX bytes submitted to ring
@@ -1787,6 +1812,7 @@ struct DebugPollCounters {
     tx_max_frame: u32,      // max frame len submitted to TX
     seg_needed_but_none: u64, // oversized frames where segmentation returned None
     wan_return_hits: u64,   // session hits for WAN return traffic (first N logged)
+    #[allow(dead_code)]
     wan_return_misses: u64, // session misses for WAN return traffic
     rx_tcp_fin: u64,        // TCP FIN flags seen in RX
     rx_tcp_synack: u64,     // TCP SYN+ACK seen in RX
@@ -2927,14 +2953,14 @@ fn poll_binding(
                                                 }
                                                 let logged = SESSION_CREATIONS_LOGGED.fetch_add(1, Ordering::Relaxed);
                                                 if logged < 10 {
-                                                    let fwd = &flow.forward_key;
                                                     debug_log!(
                                                         "SESS_CREATE[{}]: FWD af={} proto={} {}:{} -> {}:{} \
                                                          | REV af={} proto={} {}:{} -> {}:{} \
                                                          | NAT src={:?} dst={:?} \
                                                          | map_fd={} bpf_entries={}",
-                                                        logged, fwd.addr_family, fwd.protocol,
-                                                        fwd.src_ip, fwd.src_port, fwd.dst_ip, fwd.dst_port,
+                                                        logged, flow.forward_key.addr_family, flow.forward_key.protocol,
+                                                        flow.forward_key.src_ip, flow.forward_key.src_port,
+                                                        flow.forward_key.dst_ip, flow.forward_key.dst_port,
                                                         reverse_key.addr_family, reverse_key.protocol,
                                                         reverse_key.src_ip, reverse_key.src_port,
                                                         reverse_key.dst_ip, reverse_key.dst_port,
@@ -3582,7 +3608,6 @@ fn enqueue_pending_forwards(
                                 None,
                             );
                             build_failed = true;
-                            copied_source_frame = true;
                             break;
                         }
                     }
@@ -3718,7 +3743,6 @@ fn enqueue_pending_forwards(
                                             Some(request.meta),
                                             None,
                                         );
-                                        build_failed = true;
                                         continue;
                                     }
                                 }
@@ -3897,7 +3921,6 @@ fn enqueue_pending_forwards(
                                             Some(request.meta),
                                             None,
                                         );
-                                        build_failed = true;
                                         continue;
                                     }
                                 }
@@ -4159,6 +4182,7 @@ fn maybe_reinject_slow_path_from_frame(
     }
 }
 
+#[allow(dead_code)]
 fn extract_l3_packet(area: &MmapArea, desc: XdpDesc, meta: UserspaceDpMeta) -> Option<Vec<u8>> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     extract_l3_packet_from_frame(frame, meta)
@@ -4353,6 +4377,7 @@ fn extract_tcp_flags_and_window(frame: &[u8]) -> Option<(u8, u16)> {
 
 /// Extract TCP window size from raw frame data.
 /// Returns None if not a TCP frame or if frame is too short.
+#[allow(dead_code)]
 fn extract_tcp_window(frame: &[u8], addr_family: u8) -> Option<u16> {
     let l3 = match frame_l3_offset(frame) {
         Some(off) => off,
@@ -6262,32 +6287,58 @@ fn worker_loop(
     // Debug: periodic summary counters
     let mut dbg_last_report_ns = monotonic_nanos();
     let mut dbg_rx_total = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_tx_total = 0u64;
     let mut dbg_forward_total = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_local_total = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_session_hit = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_session_miss = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_session_create = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_no_route = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_missing_neigh = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_policy_deny = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_ha_inactive = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_no_egress_binding = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_build_fail = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_tx_err = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_metadata_err = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_disposition_other = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_enqueue_ok = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_enqueue_inplace = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_enqueue_direct = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_enqueue_copy = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_rx_from_trust = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_rx_from_wan = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_fwd_trust_to_wan = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_fwd_wan_to_trust = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_nat_snat = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_nat_dnat = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_nat_none = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_frame_build_none = 0u64;
     #[cfg(feature = "debug-log")]
     let mut dbg_rx_tcp_rst = 0u64;
@@ -6305,11 +6356,17 @@ fn worker_loop(
     let mut dbg_fwd_tcp_rst = 0u64;
     #[cfg(feature = "debug-log")]
     let mut dbg_fwd_tcp_zero_window = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_rx_bytes_total = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_tx_bytes_total = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_rx_oversized = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut dbg_rx_max_frame = 0u32;
+    #[cfg(feature = "debug-log")]
     let mut dbg_tx_max_frame = 0u32;
+    #[cfg(feature = "debug-log")]
     let mut dbg_seg_needed_but_none = 0u64;
     let mut prev_rx_total = 0u64;
     let mut prev_fwd_total = 0u64;
@@ -6368,33 +6425,42 @@ fn worker_loop(
             }
         }
         dbg_rx_total += dbg_poll.rx;
-        dbg_tx_total += dbg_poll.tx;
+        #[cfg(feature = "debug-log")]
+        {
+            dbg_tx_total += dbg_poll.tx;
+        }
         dbg_forward_total += dbg_poll.forward;
-        dbg_local_total += dbg_poll.local;
-        dbg_session_hit += dbg_poll.session_hit;
-        dbg_session_miss += dbg_poll.session_miss;
-        dbg_session_create += dbg_poll.session_create;
-        dbg_no_route += dbg_poll.no_route;
-        dbg_missing_neigh += dbg_poll.missing_neigh;
-        dbg_policy_deny += dbg_poll.policy_deny;
-        dbg_ha_inactive += dbg_poll.ha_inactive;
-        dbg_no_egress_binding += dbg_poll.no_egress_binding;
-        dbg_build_fail += dbg_poll.build_fail;
-        dbg_tx_err += dbg_poll.tx_err;
-        dbg_metadata_err += dbg_poll.metadata_err;
-        dbg_disposition_other += dbg_poll.disposition_other;
-        dbg_enqueue_ok += dbg_poll.enqueue_ok;
-        dbg_enqueue_inplace += dbg_poll.enqueue_inplace;
-        dbg_enqueue_direct += dbg_poll.enqueue_direct;
-        dbg_enqueue_copy += dbg_poll.enqueue_copy;
-        dbg_rx_from_trust += dbg_poll.rx_from_trust;
-        dbg_rx_from_wan += dbg_poll.rx_from_wan;
-        dbg_fwd_trust_to_wan += dbg_poll.fwd_trust_to_wan;
-        dbg_fwd_wan_to_trust += dbg_poll.fwd_wan_to_trust;
-        dbg_nat_snat += dbg_poll.nat_applied_snat;
-        dbg_nat_dnat += dbg_poll.nat_applied_dnat;
-        dbg_nat_none += dbg_poll.nat_applied_none;
-        dbg_frame_build_none += dbg_poll.frame_build_none;
+        #[cfg(feature = "debug-log")]
+        {
+            dbg_local_total += dbg_poll.local;
+            dbg_session_hit += dbg_poll.session_hit;
+            dbg_session_miss += dbg_poll.session_miss;
+            dbg_session_create += dbg_poll.session_create;
+            dbg_no_route += dbg_poll.no_route;
+            dbg_missing_neigh += dbg_poll.missing_neigh;
+            dbg_policy_deny += dbg_poll.policy_deny;
+            dbg_ha_inactive += dbg_poll.ha_inactive;
+            dbg_no_egress_binding += dbg_poll.no_egress_binding;
+            dbg_build_fail += dbg_poll.build_fail;
+            dbg_tx_err += dbg_poll.tx_err;
+            dbg_metadata_err += dbg_poll.metadata_err;
+        }
+        #[cfg(feature = "debug-log")]
+        {
+            dbg_disposition_other += dbg_poll.disposition_other;
+            dbg_enqueue_ok += dbg_poll.enqueue_ok;
+            dbg_enqueue_inplace += dbg_poll.enqueue_inplace;
+            dbg_enqueue_direct += dbg_poll.enqueue_direct;
+            dbg_enqueue_copy += dbg_poll.enqueue_copy;
+            dbg_rx_from_trust += dbg_poll.rx_from_trust;
+            dbg_rx_from_wan += dbg_poll.rx_from_wan;
+            dbg_fwd_trust_to_wan += dbg_poll.fwd_trust_to_wan;
+            dbg_fwd_wan_to_trust += dbg_poll.fwd_wan_to_trust;
+            dbg_nat_snat += dbg_poll.nat_applied_snat;
+            dbg_nat_dnat += dbg_poll.nat_applied_dnat;
+            dbg_nat_none += dbg_poll.nat_applied_none;
+            dbg_frame_build_none += dbg_poll.frame_build_none;
+        }
         #[cfg(feature = "debug-log")]
         {
             dbg_rx_tcp_rst += dbg_poll.rx_tcp_rst;
@@ -6405,16 +6471,19 @@ fn worker_loop(
             dbg_fwd_tcp_rst += dbg_poll.fwd_tcp_rst;
             dbg_fwd_tcp_zero_window += dbg_poll.fwd_tcp_zero_window;
         }
-        dbg_rx_bytes_total += dbg_poll.rx_bytes_total;
-        dbg_tx_bytes_total += dbg_poll.tx_bytes_total;
-        dbg_rx_oversized += dbg_poll.rx_oversized;
-        if dbg_poll.rx_max_frame > dbg_rx_max_frame {
-            dbg_rx_max_frame = dbg_poll.rx_max_frame;
+        #[cfg(feature = "debug-log")]
+        {
+            dbg_rx_bytes_total += dbg_poll.rx_bytes_total;
+            dbg_tx_bytes_total += dbg_poll.tx_bytes_total;
+            dbg_rx_oversized += dbg_poll.rx_oversized;
+            if dbg_poll.rx_max_frame > dbg_rx_max_frame {
+                dbg_rx_max_frame = dbg_poll.rx_max_frame;
+            }
+            if dbg_poll.tx_max_frame > dbg_tx_max_frame {
+                dbg_tx_max_frame = dbg_poll.tx_max_frame;
+            }
+            dbg_seg_needed_but_none += dbg_poll.seg_needed_but_none;
         }
-        if dbg_poll.tx_max_frame > dbg_tx_max_frame {
-            dbg_tx_max_frame = dbg_poll.tx_max_frame;
-        }
-        dbg_seg_needed_but_none += dbg_poll.seg_needed_but_none;
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
         }
@@ -6439,6 +6508,7 @@ fn worker_loop(
         {
             let elapsed = loop_now_ns.saturating_sub(dbg_last_report_ns);
             if elapsed >= DBG_REPORT_INTERVAL_NS {
+                #[cfg(feature = "debug-log")]
                 let secs = elapsed as f64 / 1_000_000_000.0;
                 let session_count = sessions.len();
                 let mut binding_summary = String::new();
@@ -6622,35 +6692,47 @@ fn worker_loop(
                 }
                 dbg_last_report_ns = loop_now_ns;
                 dbg_rx_total = 0;
-                dbg_tx_total = 0;
+                #[cfg(feature = "debug-log")]
+                {
+                    dbg_tx_total = 0;
+                }
                 dbg_forward_total = 0;
-                dbg_local_total = 0;
-                dbg_session_hit = 0;
-                dbg_session_miss = 0;
-                dbg_session_create = 0;
-                dbg_no_route = 0;
-                dbg_missing_neigh = 0;
-                dbg_policy_deny = 0;
-                dbg_ha_inactive = 0;
-                dbg_no_egress_binding = 0;
-                dbg_build_fail = 0;
-                dbg_tx_err = 0;
-                dbg_metadata_err = 0;
-                dbg_disposition_other = 0;
-                dbg_enqueue_ok = 0;
-                dbg_enqueue_inplace = 0;
-                dbg_enqueue_direct = 0;
-                dbg_enqueue_copy = 0;
-                dbg_rx_from_trust = 0;
-                dbg_rx_from_wan = 0;
-                dbg_fwd_trust_to_wan = 0;
-                dbg_fwd_wan_to_trust = 0;
-                dbg_rx_bytes_total = 0;
-                dbg_tx_bytes_total = 0;
-                dbg_rx_oversized = 0;
-                dbg_rx_max_frame = 0;
-                dbg_tx_max_frame = 0;
-                dbg_seg_needed_but_none = 0;
+                #[cfg(feature = "debug-log")]
+                {
+                    dbg_local_total = 0;
+                    dbg_session_hit = 0;
+                    dbg_session_miss = 0;
+                    dbg_session_create = 0;
+                    dbg_no_route = 0;
+                    dbg_missing_neigh = 0;
+                    dbg_policy_deny = 0;
+                    dbg_ha_inactive = 0;
+                    dbg_no_egress_binding = 0;
+                    dbg_build_fail = 0;
+                    dbg_tx_err = 0;
+                    dbg_metadata_err = 0;
+                }
+                #[cfg(feature = "debug-log")]
+                {
+                    dbg_disposition_other = 0;
+                    dbg_enqueue_ok = 0;
+                    dbg_enqueue_inplace = 0;
+                    dbg_enqueue_direct = 0;
+                    dbg_enqueue_copy = 0;
+                    dbg_rx_from_trust = 0;
+                    dbg_rx_from_wan = 0;
+                    dbg_fwd_trust_to_wan = 0;
+                    dbg_fwd_wan_to_trust = 0;
+                }
+                #[cfg(feature = "debug-log")]
+                {
+                    dbg_rx_bytes_total = 0;
+                    dbg_tx_bytes_total = 0;
+                    dbg_rx_oversized = 0;
+                    dbg_rx_max_frame = 0;
+                    dbg_tx_max_frame = 0;
+                    dbg_seg_needed_but_none = 0;
+                }
                 // Stall detection: stall_prev_fwd is PREVIOUS interval's fwd count,
                 // prev_fwd_total is THIS interval's fwd count (saved before reset).
                 if cfg!(feature = "debug-log") {
@@ -6723,10 +6805,13 @@ fn worker_loop(
                     }
                     stall_prev_fwd = prev_fwd_total;
                 }
-                dbg_nat_snat = 0;
-                dbg_nat_dnat = 0;
-                dbg_nat_none = 0;
-                dbg_frame_build_none = 0;
+                #[cfg(feature = "debug-log")]
+                {
+                    dbg_nat_snat = 0;
+                    dbg_nat_dnat = 0;
+                    dbg_nat_none = 0;
+                    dbg_frame_build_none = 0;
+                }
                 #[cfg(feature = "debug-log")]
                 {
                     dbg_rx_tcp_rst = 0;
@@ -7172,7 +7257,8 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     }
 
     // Debug: dump zone mappings and policy rules
-    if cfg!(feature = "debug-log") {
+    #[cfg(feature = "debug-log")]
+    {
         debug_log!("FWD_STATE: ifindex_to_zone={:?}", state.ifindex_to_zone);
         debug_log!("FWD_STATE: egress keys={:?}", state.egress.keys().collect::<Vec<_>>());
         for (ifidx, eg) in &state.egress {
@@ -7917,6 +8003,7 @@ fn is_icmp_error(protocol: u8, icmp_type: u8) -> bool {
 ///
 /// The embedded IP header contains the original packet's src/dst and the first
 /// 8 bytes of the original L4 header (enough for ports).
+#[allow(dead_code)]
 fn try_embedded_icmp_session_match(
     area: &MmapArea,
     desc: XdpDesc,
@@ -8491,6 +8578,7 @@ fn build_nat_reversed_icmp_error_v4(
     };
 
     // Compute Ethernet header size from L3 offset.
+    #[cfg(feature = "debug-log")]
     let eth_len = l3;
     let dst_mac = icmp_match.resolution.neighbor_mac?;
     let src_mac = icmp_match.resolution.src_mac?;
@@ -8870,6 +8958,7 @@ fn enforce_ha_resolution_snapshot(
 
 /// Return the effective TCP MSS clamp value for the current config.
 /// Returns 0 if MSS clamping is disabled.
+#[allow(dead_code)]
 fn effective_tcp_mss(forwarding: &ForwardingState) -> u16 {
     if forwarding.tcp_mss_all_tcp > 0 {
         return forwarding.tcp_mss_all_tcp;
@@ -8885,6 +8974,7 @@ fn effective_tcp_mss(forwarding: &ForwardingState) -> u16 {
 /// Clamp TCP MSS option in-place in an L3 packet (starting at IP header).
 /// `max_mss` is the maximum allowed MSS value.
 /// Returns true if the MSS was clamped.
+#[allow(dead_code)]
 fn clamp_tcp_mss(packet: &mut [u8], max_mss: u16) -> bool {
     if max_mss == 0 {
         return false;
@@ -8965,6 +9055,7 @@ fn clamp_tcp_mss(packet: &mut [u8], max_mss: u16) -> bool {
 }
 
 /// Clamp TCP MSS in a full Ethernet frame starting at `l3_offset`.
+#[allow(dead_code)]
 fn clamp_tcp_mss_frame(frame: &mut [u8], l3_offset: usize, max_mss: u16) -> bool {
     if max_mss == 0 || l3_offset >= frame.len() {
         return false;
@@ -8972,6 +9063,7 @@ fn clamp_tcp_mss_frame(frame: &mut [u8], l3_offset: usize, max_mss: u16) -> bool
     clamp_tcp_mss(&mut frame[l3_offset..], max_mss)
 }
 
+#[allow(dead_code)]
 const ICMP_TE_MAX_PER_SEC: u32 = 100;
 
 /// Rate limiter for ICMP Time Exceeded messages.
@@ -10280,7 +10372,8 @@ fn rewrite_forwarded_frame_in_place(
         _ => return None,
     }
     // Debug: dump first N in-place rewritten frames' Ethernet headers
-    if cfg!(feature = "debug-log") {
+    #[cfg(feature = "debug-log")]
+    {
         thread_local! {
             static INPLACE_FWD_DBG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
@@ -11155,12 +11248,15 @@ fn verify_built_frame_checksums(frame: &[u8]) -> (bool, bool) {
             let n = c.get();
             if n < 20 {
                 c.set(n + 1);
-                let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-                let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-                debug_log!(
-                    "IP_LEN_MISMATCH[{}]: ip_total_len={} actual_l3_len={} frame_len={} l3={} src={} dst={} proto={}",
-                    n, ip_total_len, actual_l3_len, frame.len(), l3, src, dst, protocol,
-                );
+                #[cfg(feature = "debug-log")]
+                {
+                    let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+                    let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+                    debug_log!(
+                        "IP_LEN_MISMATCH[{}]: ip_total_len={} actual_l3_len={} frame_len={} l3={} src={} dst={} proto={}",
+                        n, ip_total_len, actual_l3_len, frame.len(), l3, src, dst, protocol,
+                    );
+                }
             }
         });
     }
@@ -11693,6 +11789,7 @@ fn count_bpf_session_entries(map_fd: c_int) -> u32 {
 }
 
 /// Dump first N entries from the BPF USERSPACE_SESSIONS map for debugging.
+#[allow(unused_variables)]
 fn dump_bpf_session_entries(map_fd: c_int, max_entries: u32) {
     let key_size = core::mem::size_of::<UserspaceSessionMapKey>();
     let mut key_bytes = vec![0u8; key_size];
@@ -11722,32 +11819,35 @@ fn dump_bpf_session_entries(map_fd: c_int, max_entries: u32) {
                 (&mut value as *mut u8).cast::<c_void>(),
             )
         };
-        let src_ip = if map_key.addr_family == libc::AF_INET as u8 {
-            format!(
-                "{}.{}.{}.{}",
-                map_key.src_addr[0], map_key.src_addr[1],
-                map_key.src_addr[2], map_key.src_addr[3]
-            )
-        } else {
-            format!("v6[{:02x}{:02x}::{:02x}{:02x}]",
-                map_key.src_addr[0], map_key.src_addr[1],
-                map_key.src_addr[14], map_key.src_addr[15])
-        };
-        let dst_ip = if map_key.addr_family == libc::AF_INET as u8 {
-            format!(
-                "{}.{}.{}.{}",
-                map_key.dst_addr[0], map_key.dst_addr[1],
-                map_key.dst_addr[2], map_key.dst_addr[3]
-            )
-        } else {
-            format!("v6[{:02x}{:02x}::{:02x}{:02x}]",
-                map_key.dst_addr[0], map_key.dst_addr[1],
-                map_key.dst_addr[14], map_key.dst_addr[15])
-        };
-        debug_log!("BPF_MAP_DUMP[{}]: af={} proto={} {}:{} -> {}:{} val={}",
-            count, map_key.addr_family, map_key.protocol,
-            src_ip, map_key.src_port, dst_ip, map_key.dst_port, value,
-        );
+        #[cfg(feature = "debug-log")]
+        {
+            let src_ip = if map_key.addr_family == libc::AF_INET as u8 {
+                format!(
+                    "{}.{}.{}.{}",
+                    map_key.src_addr[0], map_key.src_addr[1],
+                    map_key.src_addr[2], map_key.src_addr[3]
+                )
+            } else {
+                format!("v6[{:02x}{:02x}::{:02x}{:02x}]",
+                    map_key.src_addr[0], map_key.src_addr[1],
+                    map_key.src_addr[14], map_key.src_addr[15])
+            };
+            let dst_ip = if map_key.addr_family == libc::AF_INET as u8 {
+                format!(
+                    "{}.{}.{}.{}",
+                    map_key.dst_addr[0], map_key.dst_addr[1],
+                    map_key.dst_addr[2], map_key.dst_addr[3]
+                )
+            } else {
+                format!("v6[{:02x}{:02x}::{:02x}{:02x}]",
+                    map_key.dst_addr[0], map_key.dst_addr[1],
+                    map_key.dst_addr[14], map_key.dst_addr[15])
+            };
+            debug_log!("BPF_MAP_DUMP[{}]: af={} proto={} {}:{} -> {}:{} val={}",
+                count, map_key.addr_family, map_key.protocol,
+                src_ip, map_key.src_port, dst_ip, map_key.dst_port, value,
+            );
+        }
         count += 1;
         if count >= max_entries {
             break;
@@ -12883,7 +12983,7 @@ mod tests {
             .expect("slice")
             .copy_from_slice(&frame);
 
-        let mut meta = UserspaceDpMeta {
+        let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
             version: USERSPACE_META_VERSION,
             length: std::mem::size_of::<UserspaceDpMeta>() as u16,

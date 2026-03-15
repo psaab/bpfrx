@@ -226,10 +226,9 @@ impl SessionTable {
         self.sessions.get_mut(key).map(|entry| {
             if matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
                 if !entry.closing {
-                    let flag_str = if (tcp_flags & TCP_RST) != 0 { "RST" } else { "FIN" };
                     debug_log!(
                         "SESS_CLOSING: {} proto=TCP {}:{} -> {}:{} rev={} tcp_flags=0x{:02x}",
-                        flag_str,
+                        if (tcp_flags & TCP_RST) != 0 { "RST" } else { "FIN" },
                         key.src_ip, key.src_port, key.dst_ip, key.dst_port,
                         entry.metadata.is_reverse, tcp_flags,
                     );

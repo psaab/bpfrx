@@ -32,6 +32,7 @@ pub(crate) enum FilterAction {
 }
 
 /// Compiled filter term with pre-parsed match criteria.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct FilterTerm {
     pub(crate) name: String,
@@ -59,6 +60,7 @@ pub(crate) struct PortRange {
 }
 
 /// A compiled firewall filter (ordered list of terms).
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct Filter {
     pub(crate) name: String,
@@ -67,6 +69,7 @@ pub(crate) struct Filter {
 }
 
 /// Token-bucket policer state.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct PolicerState {
     pub(crate) name: String,

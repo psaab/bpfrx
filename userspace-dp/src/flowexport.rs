@@ -18,14 +18,23 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::Instant;
 
 /// NetFlow v9 field type IDs.
+#[allow(dead_code)]
 const NF9_IN_BYTES: u16 = 1;
+#[allow(dead_code)]
 const NF9_IN_PKTS: u16 = 2;
+#[allow(dead_code)]
 const NF9_PROTOCOL: u16 = 4;
+#[allow(dead_code)]
 const NF9_L4_SRC_PORT: u16 = 7;
+#[allow(dead_code)]
 const NF9_IPV4_SRC_ADDR: u16 = 8;
+#[allow(dead_code)]
 const NF9_L4_DST_PORT: u16 = 11;
+#[allow(dead_code)]
 const NF9_IPV4_DST_ADDR: u16 = 12;
+#[allow(dead_code)]
 const NF9_LAST_SWITCHED: u16 = 21;
+#[allow(dead_code)]
 const NF9_FIRST_SWITCHED: u16 = 22;
 
 /// NetFlow v9 header version.
@@ -35,6 +44,7 @@ const NETFLOW_V9_VERSION: u16 = 9;
 const TEMPLATE_ID: u16 = 256;
 
 /// Number of fields in the template.
+#[allow(dead_code)]
 const TEMPLATE_FIELD_COUNT: u16 = 9;
 
 /// Default flush interval in seconds.
@@ -69,6 +79,7 @@ pub(crate) struct FlowExportConfig {
     pub collector: SocketAddr,
     pub sampling_rate: u32,
     pub active_timeout_secs: u64,
+    #[allow(dead_code)]
     pub inactive_timeout_secs: u64,
 }
 
@@ -81,9 +92,12 @@ pub(crate) struct FlowExporter {
     session_counter: u64,
     boot_instant: Instant,
     last_flush_ns: u64,
+    #[allow(dead_code)]
     last_template_ns: u64,
     source_id: u32,
+    #[allow(dead_code)]
     flush_interval_ns: u64,
+    #[allow(dead_code)]
     template_interval_ns: u64,
 }
 
@@ -161,6 +175,7 @@ impl FlowExporter {
     }
 
     /// Periodic tick: flush records if the interval has elapsed or buffer is full.
+    #[allow(dead_code)]
     pub fn tick(&mut self, now_ns: u64) {
         if self.socket.is_none() {
             return;
@@ -269,6 +284,7 @@ impl FlowExporter {
     }
 
     /// Send a template flowset so the collector knows the record format.
+    #[allow(dead_code)]
     fn send_template(&mut self, now_ns: u64) {
         let socket = match &self.socket {
             Some(s) => s,
