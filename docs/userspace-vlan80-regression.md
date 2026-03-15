@@ -10,7 +10,7 @@ Environment:
 - test host:
   - `loss:cluster-userspace-host`
 - tracked config:
-  - [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx-userspace-wip/docs/ha-cluster-userspace.conf)
+  - [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx/docs/ha-cluster-userspace.conf)
 
 This file is historical. It captures a closed lab regression and should not be read
 as the explanation for current userspace forwarding bugs on this branch.
@@ -202,4 +202,4 @@ Current remaining userspace work is in the forwarding path itself:
 - closing the gap to the `22-23 Gbps` target on the isolated lab
 
 Current repeatable validation is documented in
-[userspace-ha-validation.md](/home/ps/git/codex-bpfrx-userspace-wip/docs/userspace-ha-validation.md).
+[userspace-ha-validation.md](/home/ps/git/codex-bpfrx/docs/userspace-ha-validation.md).

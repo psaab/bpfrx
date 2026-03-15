@@ -20,8 +20,8 @@ Workflow:
 1. After each userspace dataplane phase, run the phase-cycle script from the repo root.
 2. The phase-cycle script pushes the current branch, deploys `bpfrx-userspace-fw0/1`, and then runs the validation script.
 3. Use `--perf` when the phase needs fresh `perf` profiles on whichever userspace firewall is active after deploy.
-4. Treat the validator threshold as the target for the branch, not as proof that the
-   current branch head already meets it.
+4. Treat the validator threshold as the target for the current tree, not as proof that the
+   current tree state already meets it.
 
 Commands:
 
@@ -47,14 +47,14 @@ What the script enforces:
 
 Use `scripts/userspace-ha-validation.sh` directly only when you are debugging the validator itself.
 
-Use `scripts/userspace-perf-compare.sh` when validation is failing or when you need fresh IPv4/IPv6 hotspot data without the validator's throughput gates. Read [docs/userspace-perf-compare.md](/home/ps/git/codex-bpfrx-userspace-wip/docs/userspace-perf-compare.md) for the exact artifact layout and interpretation.
+Use `scripts/userspace-perf-compare.sh` when validation is failing or when you need fresh IPv4/IPv6 hotspot data without the validator's throughput gates. Read [docs/userspace-perf-compare.md](/home/ps/git/codex-bpfrx/docs/userspace-perf-compare.md) for the exact artifact layout and interpretation.
 
-The current branch reality is:
+The current tree reality is:
 
 - the Rust userspace dataplane is real and deployed on the isolated `loss` userspace lab
 - the validator must distinguish between intentional fallback and real userspace forwarding
 - the legacy XDP dataplane is still the correctness and performance reference
-- `22-23 Gbps` is the target, not the guaranteed result of every current branch head
+- `22-23 Gbps` is the target, not the guaranteed result of every current tree state
 
 If the script fails on IPv6 route state:
 
