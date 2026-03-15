@@ -211,9 +211,8 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	if !userspaceSupportsSecurityPolicies(cfg) {
 		addReason("full security policy semantics are not implemented in the userspace dataplane")
 	}
-	if !userspaceSupportsSourceNAT(cfg.Security.NAT.Source) {
-		addReason("pool-mode source NAT is not implemented in the userspace dataplane")
-	}
+	// Pool-mode source NAT is now implemented in the userspace dataplane
+	// (PortAllocator with round-robin address + port allocation).
 	// NAT64 is supported — NATv6v4 config (no-v6-frag-header option) is fine
 	// Session timeouts (TCP/UDP/ICMP) are supported — only gate on unsupported flow features
 	// TCP MSS clamping is supported in the userspace dataplane
@@ -2422,7 +2421,7 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 		localV4Keys = append(localV4Keys, localV4Key)
 	}
 	for _, key := range localV4Keys {
-		if err := localV4Map.Delete(key); err != nil {
+		if err := localV4Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_local_v4 %08x: %w", key, err)
 		}
 	}
@@ -2437,7 +2436,7 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 		localV6Keys = append(localV6Keys, localV6Key)
 	}
 	for _, key := range localV6Keys {
-		if err := localV6Map.Delete(key); err != nil {
+		if err := localV6Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_local_v6 %+v: %w", key, err)
 		}
 	}
@@ -2476,7 +2475,7 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		natV4Keys = append(natV4Keys, natV4Key)
 	}
 	for _, key := range natV4Keys {
-		if err := natV4Map.Delete(key); err != nil {
+		if err := natV4Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_interface_nat_v4 %08x: %w", key, err)
 		}
 	}
@@ -2491,7 +2490,7 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		natV6Keys = append(natV6Keys, natV6Key)
 	}
 	for _, key := range natV6Keys {
-		if err := natV6Map.Delete(key); err != nil {
+		if err := natV6Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_interface_nat_v6 %+v: %w", key, err)
 		}
 	}

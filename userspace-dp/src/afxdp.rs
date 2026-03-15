@@ -1381,26 +1381,14 @@ impl BindingWorker {
         let user_fd = user.as_raw_fd();
         live.set_bound(user_fd);
         live.set_bind_mode(bind_mode);
-        let bound_info = query_bound_xsk_socket(user_fd);
-        if let Some((ifindex, queue_id, flags)) = bound_info {
-            live.set_socket_binding(ifindex, queue_id, flags);
-            eprintln!(
-                "bpfrx-userspace-dp: binding slot={} fd={} shared_owner={} bound if{}q{} flags=0x{:x} mode={:?} (expected if{}q{})",
-                binding.slot, user_fd, shared_owner, ifindex, queue_id, flags, bind_mode,
-                binding.ifindex, binding.queue_id,
-            );
-            if ifindex != binding.ifindex || queue_id != binding.queue_id {
-                live.set_error(format!(
-                    "socket bound to ifindex {ifindex} queue {queue_id} flags 0x{flags:x}, expected ifindex {} queue {}",
-                    binding.ifindex, binding.queue_id
-                ));
-            }
-        } else {
-            eprintln!(
-                "bpfrx-userspace-dp: binding slot={} fd={} shared_owner={} getsockname FAILED — socket not bound!",
-                binding.slot, user_fd, shared_owner,
-            );
-        }
+        // getsockname() returns ENOTSUP on AF_XDP sockets (kernel doesn't
+        // implement it for this family).  Use the binding plan's expected
+        // ifindex/queue_id directly — umem.bind() already validated these.
+        live.set_socket_binding(binding.ifindex, binding.queue_id, 0);
+        eprintln!(
+            "bpfrx-userspace-dp: binding slot={} fd={} shared_owner={} bound if{}q{} mode={:?}",
+            binding.slot, user_fd, shared_owner, binding.ifindex, binding.queue_id, bind_mode,
+        );
         if let Err(err) = register_xsk_slot(xsk_map_fd, binding.slot, user_fd) {
             eprintln!(
                 "bpfrx-userspace-dp: ERROR register_xsk_slot slot={} fd={}: {}",
@@ -1413,11 +1401,7 @@ impl BindingWorker {
                 binding.slot, user_fd,
             );
             live.set_xsk_registered(true);
-            if binding.ifindex == live.socket_ifindex.load(Ordering::Relaxed)
-                && binding.queue_id == live.socket_queue_id.load(Ordering::Relaxed)
-            {
-                live.clear_error();
-            }
+            live.clear_error();
         }
         let init_now = monotonic_nanos();
         let max_pending_tx = pending_tx_capacity(ring_entries);
@@ -1659,53 +1643,6 @@ fn query_bound_xsk_mode(fd: c_int) -> Option<XskBindMode> {
     } else {
         XskBindMode::Copy
     })
-}
-
-#[repr(C)]
-struct SockaddrXdp {
-    sxdp_family: u16,
-    sxdp_flags: u16,
-    sxdp_ifindex: u32,
-    sxdp_queue_id: u32,
-    sxdp_shared_umem_fd: u32,
-}
-
-fn query_bound_xsk_socket(fd: c_int) -> Option<(i32, u32, u32)> {
-    let mut addr = SockaddrXdp {
-        sxdp_family: 0,
-        sxdp_flags: 0,
-        sxdp_ifindex: 0,
-        sxdp_queue_id: 0,
-        sxdp_shared_umem_fd: 0,
-    };
-    let mut addrlen = core::mem::size_of::<SockaddrXdp>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockname(
-            fd,
-            (&mut addr as *mut SockaddrXdp).cast::<libc::sockaddr>(),
-            &mut addrlen,
-        )
-    };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
-        eprintln!(
-            "bpfrx-userspace-dp: getsockname(fd={}) failed: rc={} err={} addrlen={}",
-            fd, rc, err, addrlen,
-        );
-        return None;
-    }
-    if addrlen as usize != core::mem::size_of::<SockaddrXdp>() {
-        eprintln!(
-            "bpfrx-userspace-dp: getsockname(fd={}) size mismatch: got {} expected {} family={} ifindex={} queue={}",
-            fd, addrlen, core::mem::size_of::<SockaddrXdp>(), addr.sxdp_family, addr.sxdp_ifindex, addr.sxdp_queue_id,
-        );
-        return None;
-    }
-    Some((
-        addr.sxdp_ifindex as i32,
-        addr.sxdp_queue_id,
-        addr.sxdp_flags as u32,
-    ))
 }
 
 fn bind_user_with_retry(
