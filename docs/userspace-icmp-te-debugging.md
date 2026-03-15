@@ -1,6 +1,6 @@
 # Userspace Dataplane: ICMP Error NAT Reversal — Debugging Notes
 
-Last updated: 2026-03-15
+Last updated: 2026-03-15 04:30 UTC
 
 ## Problem
 
@@ -64,6 +64,18 @@ Evidence:
 - `tcpdump -i ge-0-0-2 "src host 2602:ffd3:0:2::7"` → 0 packets captured
 - Remote tcpdump shows replies being sent
 - Outbound GRE visible on ge-0-0-2
+
+## Current State (c5cb982)
+
+The XDP shim now starts with `xdp_main_prog` and swaps to `xdp_userspace_prog` when `forwarding_armed` transitions to true. When armed and primary, ICMP TE from intermediate routers reaches the userspace DP but the session-miss debug log (`/tmp/icmp_te_debug.log`) is NEVER created. This means either:
+
+1. The ICMP TE packets hit an existing session (session hit path, bypass session-miss entirely)
+2. The ICMP TE packets take a different code path before reaching the session-miss block
+3. The Rust child process can't write to `/tmp/` (permissions/namespace issue)
+
+Next debugging step: add debug logging to the session HIT path to see if ICMP TE matches an established session. Also verify `/tmp/` is writable from the Rust worker threads.
+
+Key finding: when forwarding is NOT armed (HA secondary), `xdp_main_prog` runs and the eBPF embedded ICMP handler works correctly. When forwarding IS armed, the userspace shim redirects ICMP TE to userspace where the NAT reversal doesn't work (per-worker session isolation + cross-worker shared session lookup issue).
 
 ## XDP Shim Fixes Applied
 
