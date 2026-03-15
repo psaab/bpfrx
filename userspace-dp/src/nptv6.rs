@@ -203,6 +203,7 @@ impl Nptv6State {
     }
 
     /// Returns all external prefixes as (prefix_addr, prefix_len) pairs.
+    #[allow(dead_code)]
     pub(crate) fn external_prefixes(&self) -> Vec<(Ipv6Addr, u8)> {
         self.inbound
             .iter()

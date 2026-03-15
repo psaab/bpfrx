@@ -343,6 +343,7 @@ impl StaticNatTable {
     }
 
     /// Returns true if the table has any entries.
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.dnat.is_empty()
     }
@@ -474,6 +475,7 @@ impl DnatTable {
     }
 
     /// Returns true if the table has any entries.
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -1122,7 +1124,7 @@ mod tests {
         assert_eq!(d.rewrite_src, Some("203.0.113.1".parse().unwrap()));
         assert!(d.rewrite_src_port.is_some());
         let port = d.rewrite_src_port.unwrap();
-        assert!(port >= 1024 && port <= 65535, "port {} out of range", port);
+        assert!(port >= 1024, "port {} out of range", port);
         assert_eq!(d.rewrite_dst, None);
         assert_eq!(d.rewrite_dst_port, None);
     }
@@ -1294,7 +1296,7 @@ mod tests {
         )
         .expect("should match");
         let port = d.rewrite_src_port.unwrap();
-        assert!(port >= 1024 && port <= 65535, "port {} out of default range", port);
+        assert!(port >= 1024, "port {} out of default range", port);
     }
 
     #[test]
