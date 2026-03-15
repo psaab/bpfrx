@@ -13,6 +13,46 @@ Related documents:
 - [userspace-debug-map.md](userspace-debug-map.md)
 - [afxdp-packet-processing.md](afxdp-packet-processing.md)
 
+## Status Snapshot
+
+Current execution state as of 2026-03-15:
+
+1. Phase 1 is complete and merged on `master` via PR `#222`.
+2. Phase 2 is in progress on branch `fix/userspace-phase2-icmp-extract` via
+   PR `#223`.
+3. Phase 5 is partially complete on `master` via PR `#221`.
+4. Phases 3, 4, and 6 have not started as formal cleanup phases yet.
+
+Completed under this plan:
+
+1. Production dataplane debug noise is now gated behind `debug-log` instead of
+   being emitted by default.
+2. `userspace-dp` default-build warning debt was reduced from `145` warnings to
+   `0`.
+3. Standard userspace validation now includes traceroute and `mtr` checks for:
+   - IPv4 to `1.1.1.1`
+   - IPv6 to `2607:f8b0:4005:814::200e`
+4. Phase 2 extraction has already split the first ICMP helper groups out of
+   `userspace-dp/src/afxdp.rs` into:
+   - `userspace-dp/src/afxdp/icmp.rs`
+   - `userspace-dp/src/afxdp/icmp_embed.rs`
+5. The Phase 2 branch also carries the driver-aware AF_XDP bind strategy work
+   and the shared-lock-ordering fix found during PR review.
+6. The current working tree is mid-extraction of AF_XDP bind/open helpers into:
+   - `userspace-dp/src/afxdp/bind.rs`
+   - updated `userspace-dp/src/afxdp.rs`
+7. Live validation already proved that the bind strategy logic is correct for
+   `mlx5_core`, but `virtio_net` fabric bindings still fail AF_XDP bring-up
+   with both currently known strategies.
+
+Still left to do at a high level:
+
+1. Finish the Phase 2 `afxdp.rs` split beyond ICMP helpers.
+2. Start the formal tuple/session authority cleanup in Phase 3.
+3. Clean up AF_XDP queue and frame ownership in Phase 4.
+4. Finish hardening validation coverage in Phase 5.
+5. Only then do the serious sustained-throughput optimization work in Phase 6.
+
 ## Current Baseline
 
 The code review on current `master` found these main problems:
@@ -47,6 +87,22 @@ The code review on current `master` found these main problems:
 
 ## Phase 1: Logging And Warning Cleanup
 
+Status: Complete
+
+Completed:
+
+1. Nonessential dataplane debug logging was gated behind `debug-log`.
+2. Operator-facing lifecycle logging remained enabled.
+3. Warning cleanup was completed across `userspace-dp`.
+4. Default `cargo test --no-run` warning count for `userspace-dp` is now `0`.
+
+Delivered in:
+
+1. PR `#222`
+2. Commits:
+   - `58660cf` `userspace: start phase1 dataplane cleanup`
+   - `84e53c3` `userspace: finish phase1 dataplane cleanup`
+
 ### Purpose
 
 Reduce noise and remove the current class of "debugging residue shipped into the
@@ -77,6 +133,70 @@ runtime" problems.
 3. The remaining warnings are intentional and documented.
 
 ## Phase 2: Split `afxdp.rs` Into Real Submodules
+
+Status: In Progress
+
+Completed so far:
+
+1. Local TTL-expiry detection, ICMP/ICMPv6 Time Exceeded builders, ICMP error
+   classification, and related local-request helpers were extracted into
+   [userspace-dp/src/afxdp/icmp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/icmp.rs).
+2. Embedded ICMP and ICMPv6 helper logic was extracted into
+   [userspace-dp/src/afxdp/icmp_embed.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/icmp_embed.rs).
+3. Shared lock ordering in embedded ICMP resolution was fixed during the PR
+   review cycle.
+4. Driver-aware AF_XDP bind strategy logic exists and is now part of the
+   extraction surface that still needs to be split cleanly from
+   `userspace-dp/src/afxdp.rs`.
+
+Currently in progress:
+
+1. Extract AF_XDP bind/open strategy helpers into a dedicated bind module.
+2. Keep `mlx5_core` on the current shared-owner path while treating
+   `virtio_net` as a per-driver strategy decision rather than a global change.
+3. Preserve the already validated live behavior while moving that setup logic
+   out of `userspace-dp/src/afxdp.rs`.
+
+Current implementation checkpoint:
+
+1. `userspace-dp/src/afxdp/bind.rs` exists locally but the extraction is not
+   finished yet.
+2. The current tree has in-progress edits in:
+   - [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
+   - [userspace-dp/src/afxdp/bind.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/bind.rs)
+3. This bind extraction slice has not been build-validated yet in the current
+   working tree and has not been redeployed live in this in-progress form.
+
+Live findings already established for this extraction area:
+
+1. `mlx5_core` requires the current shared-owner / UMEM-owner bind path in this
+   implementation.
+2. `virtio_net` on the fabric interface still fails AF_XDP bind with:
+   - separate-owner socket strategy
+   - UMEM-owner socket fallback
+3. That means the remaining live problem is not a wrong global bind choice; it
+   is an unresolved `virtio_net` AF_XDP capability or contract issue.
+
+Still left in this phase:
+
+1. Extract RX metadata parse and packet classification helpers.
+2. Extract session and reverse-session lookup glue.
+3. Extract NAT and frame rewrite helpers that do not need worker-local state.
+4. Extract TX queue, completion, and recycle handling.
+5. Reduce `userspace-dp/src/afxdp.rs` to a worker/coordinator layer instead of
+   an implementation monolith.
+6. Finish the bind/open extraction cleanly enough that the build passes and the
+   live driver-specific behavior is unchanged.
+
+Delivered so far in:
+
+1. PR `#223`
+2. Commits already on that branch:
+   - `e4453a7` `userspace: start phase2 icmp helper extraction`
+   - `cf587cd` `userspace: retry neighbor refresh after probe`
+   - `19bc561` `userspace: extract embedded icmp helpers`
+   - `6b1d65f` `userspace: probe AF_XDP bind strategy per driver`
+   - `af89e42` `userspace: complete embedded icmp extraction and fix shared lock ordering`
 
 ### Purpose
 
@@ -111,6 +231,21 @@ logic auditable.
 
 ## Phase 3: Tuple Authority And Session Resolution Cleanup
 
+Status: Not Started As A Formal Cleanup Phase
+
+Preparatory work already exists:
+
+1. Recent userspace fixes reduced tuple-authority and embedded-ICMP bugs before
+   this cleanup plan started.
+2. Phase 2 extraction is intentionally setting up this phase by moving ICMP and
+   embedded-ICMP logic into smaller modules first.
+
+Still left:
+
+1. Define one authoritative tuple model per stage and enforce it consistently.
+2. Consolidate reverse-session and NAT-reverse resolution.
+3. Remove duplicated repair logic that still lives inside `afxdp.rs`.
+
 ### Purpose
 
 Stop the repeated class of reply-path and embedded-ICMP regressions caused by
@@ -143,6 +278,20 @@ inconsistent ownership of the packet tuple and NAT state.
 
 ## Phase 4: AF_XDP Queue, TX, And Recycle Cleanup
 
+Status: Not Started
+
+Relevant known issues still left for this phase:
+
+1. Queue ownership and frame lifecycle are still too implicit in
+   `userspace-dp/src/afxdp.rs`.
+2. The common forward path and fallback paths still share more queueing logic
+   than they should.
+3. AF_XDP driver-specific bring-up behavior is still being clarified, and the
+   `virtio_net` fabric path remains a live investigation topic.
+4. The unresolved fabric issue is specifically that `virtio_net` AF_XDP bind on
+   `ifindex 4` still fails with both currently implemented strategies, even
+   though `mlx5_core` bindings are healthy.
+
 ### Purpose
 
 Make frame ownership and queue backpressure predictable before further
@@ -173,6 +322,31 @@ performance tuning.
    engineering queue behavior.
 
 ## Phase 5: Validation And Regression Hardening
+
+Status: Partially Complete
+
+Completed so far:
+
+1. Standard userspace validation now checks IPv4 traceroute and `mtr` behavior
+   to `1.1.1.1`.
+2. Standard userspace validation now checks IPv6 traceroute and `mtr` behavior
+   to `2607:f8b0:4005:814::200e`.
+3. Sustained-throughput collapse detection was already added before this plan
+   and remains part of the normal workflow.
+
+Delivered in:
+
+1. PR `#221`
+2. Commit:
+   - `4a5006f` `test: add traceroute checks to userspace validation`
+
+Still left:
+
+1. Add more direct regression coverage for tuple authority and embedded ICMP
+   corner cases.
+2. Add coverage for AF_XDP build-failure fallback behavior.
+3. Keep synchronized capture workflows available as diagnosis tools, not first
+   line validation.
 
 ### Purpose
 
@@ -208,6 +382,16 @@ Move current manual failure discovery into repeatable test coverage.
 3. Manual capture/debug skills remain for diagnosis, not for basic detection.
 
 ## Phase 6: Performance Optimization On A Cleaner Base
+
+Status: Not Started
+
+Why it is still deferred:
+
+1. The structural split in Phase 2 is not finished.
+2. Tuple/session authority cleanup has not started formally yet.
+3. Queue/frame lifecycle cleanup has not started formally yet.
+4. Performance work before those phases would stack new tuning on top of code
+   that is still too hard to reason about.
 
 ### Purpose
 
@@ -259,10 +443,16 @@ This order is deliberate.
 - Validation before optimization so wins and regressions are measured the same
   way every time.
 
-## Immediate Next Tasks
+## Immediate Next Steps
 
-1. Finish Phase 1 by removing or gating the remaining always-on dataplane
-   `eprintln!` paths.
-2. Carve ICMP and ICMPv6 error handling out of `afxdp.rs`.
-3. Reduce the warning count enough that new warnings become actionable.
-4. Add the traceroute checks to the standard userspace validation flow.
+1. Finish the in-progress AF_XDP bind/open extraction from
+   `userspace-dp/src/afxdp.rs`.
+2. Continue Phase 2 by extracting RX/session/TX helper clusters.
+3. Build-validate the current bind extraction slice before doing further
+   refactoring on top of it.
+4. Revalidate live userspace binding behavior on `bpfrx-userspace-fw0/1` after
+   the bind extraction is complete.
+5. Continue investigating the unresolved `virtio_net` fabric AF_XDP bind
+   contract without changing the `mlx5_core` path globally.
+6. Start Phase 3 only after `afxdp.rs` is smaller and the bind/extraction work
+   has stabilized.
