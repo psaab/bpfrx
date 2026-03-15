@@ -98,6 +98,8 @@ const MAX_RECENT_SESSION_DELTAS: usize = 64;
 const MAX_PENDING_SESSION_DELTAS: usize = 4096;
 const BIND_RETRY_ATTEMPTS: usize = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
+const NEIGHBOR_PROBE_ATTEMPTS: usize = 5;
+const NEIGHBOR_PROBE_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
 
 type FastMap<K, V> = FxHashMap<K, V>;
@@ -9397,7 +9399,15 @@ fn refresh_dynamic_neighbor(ifname: &str, target: IpAddr) -> Option<NeighborEntr
         return Some(entry);
     }
     trigger_neighbor_probe(ifname, target);
-    read_neighbor_entry(ifname, target)
+    for attempt in 0..NEIGHBOR_PROBE_ATTEMPTS {
+        if attempt > 0 {
+            thread::sleep(NEIGHBOR_PROBE_DELAY);
+        }
+        if let Some(entry) = read_neighbor_entry(ifname, target) {
+            return Some(entry);
+        }
+    }
+    None
 }
 
 fn read_neighbor_entry(ifname: &str, target: IpAddr) -> Option<NeighborEntry> {
