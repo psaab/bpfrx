@@ -2624,6 +2624,9 @@ fn poll_binding(
                                 false
                             };
                             if is_embedded_icmp_error {
+                                    #[cfg(feature = "debug-log")]
+                                    let icmpv6_trace = meta.protocol == PROTO_ICMPV6
+                                        && ICMPV6_EMBED_LOGGED.fetch_add(1, Ordering::Relaxed) < 32;
                                     if let Some(icmp_match) = try_embedded_icmp_nat_match(
                                         unsafe { &*area },
                                         desc,
@@ -2631,9 +2634,23 @@ fn poll_binding(
                                         sessions,
                                         forwarding,
                                         dynamic_neighbors,
+                                        shared_sessions,
                                         shared_nat_sessions,
                                         now_ns,
                                     ) {
+                                        #[cfg(feature = "debug-log")]
+                                        if icmpv6_trace {
+                                            debug_log!(
+                                                "ICMPV6_EMBED: match orig_src={} orig_port={} nat={:?} resolution={:?} egress_if={} tx_if={} neigh={:?}",
+                                                icmp_match.original_src,
+                                                icmp_match.original_src_port,
+                                                icmp_match.nat,
+                                                icmp_match.resolution.disposition,
+                                                icmp_match.resolution.egress_ifindex,
+                                                icmp_match.resolution.tx_ifindex,
+                                                icmp_match.resolution.neighbor_mac,
+                                            );
+                                        }
                                         if icmp_match.nat.rewrite_src.is_some() {
                                             let icmp_resolution = finalize_embedded_icmp_resolution(
                                                 forwarding,
@@ -2688,7 +2705,47 @@ fn poll_binding(
                                                     },
                                                 );
                                                 recycle_now = false;
+                                                #[cfg(feature = "debug-log")]
+                                                if icmpv6_trace {
+                                                    debug_log!(
+                                                        "ICMPV6_EMBED: queued resolution={:?} egress_if={} tx_if={} target_if={}",
+                                                        icmp_decision.resolution.disposition,
+                                                        icmp_decision.resolution.egress_ifindex,
+                                                        icmp_decision.resolution.tx_ifindex,
+                                                        target_ifindex,
+                                                    );
+                                                }
+                                            } else {
+                                                #[cfg(feature = "debug-log")]
+                                                if icmpv6_trace {
+                                                    debug_log!(
+                                                        "ICMPV6_EMBED: build_none resolution={:?} egress_if={} tx_if={} neigh={:?}",
+                                                        icmp_resolution.disposition,
+                                                        icmp_resolution.egress_ifindex,
+                                                        icmp_resolution.tx_ifindex,
+                                                        icmp_resolution.neighbor_mac,
+                                                    );
+                                                }
                                             }
+                                        } else {
+                                            #[cfg(feature = "debug-log")]
+                                            if icmpv6_trace {
+                                                debug_log!("ICMPV6_EMBED: no_rewrite nat={:?}", icmp_match.nat);
+                                            }
+                                        }
+                                    } else {
+                                        #[cfg(feature = "debug-log")]
+                                        if icmpv6_trace {
+                                            debug_log!(
+                                                "ICMPV6_EMBED: no_match outer={}:{} -> {}:{} ingress_if={} from_zone={} to_zone={}",
+                                                flow.src_ip,
+                                                flow.forward_key.src_port,
+                                                flow.dst_ip,
+                                                flow.forward_key.dst_port,
+                                                meta.ingress_ifindex,
+                                                from_zone,
+                                                to_zone,
+                                            );
                                         }
                                     }
                                     // Permit without policy check or session install.
@@ -3953,10 +4010,13 @@ fn enqueue_pending_forwards(
         update_binding_debug_state(ingress_binding);
         if build_failed {
             dbg.build_fail += 1;
+            #[cfg(feature = "debug-log")]
             if dbg.build_fail <= 3 {
-                eprintln!(
+                debug_log!(
                     "DBG BUILD_FAIL: target_ifindex={} len={} fallback_slow={}",
-                    request.target_ifindex, request.desc.len, fallback_to_slow_path,
+                    request.target_ifindex,
+                    request.desc.len,
+                    fallback_to_slow_path,
                 );
             }
             record_exception(
@@ -8110,11 +8170,21 @@ fn try_embedded_icmp_nat_match(
     sessions: &mut SessionTable,
     forwarding: &ForwardingState,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     now_ns: u64,
 ) -> Option<EmbeddedIcmpMatch> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    try_embedded_icmp_nat_match_from_frame(frame, meta, sessions, forwarding, dynamic_neighbors, shared_nat_sessions, now_ns)
+    try_embedded_icmp_nat_match_from_frame(
+        frame,
+        meta,
+        sessions,
+        forwarding,
+        dynamic_neighbors,
+        shared_sessions,
+        shared_nat_sessions,
+        now_ns,
+    )
 }
 
 /// Core implementation of embedded ICMP NAT match operating on a frame slice.
@@ -8124,6 +8194,7 @@ fn try_embedded_icmp_nat_match_from_frame(
     sessions: &mut SessionTable,
     forwarding: &ForwardingState,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     now_ns: u64,
 ) -> Option<EmbeddedIcmpMatch> {
@@ -8197,8 +8268,15 @@ fn try_embedded_icmp_nat_match_from_frame(
                 let nat = fwd.decision.nat;
                 let original_src = fwd.key.src_ip;
                 let original_src_port = fwd.key.src_port;
-                let resolution = lookup_forwarding_resolution_with_dynamic(
-                    forwarding, dynamic_neighbors, original_src,
+                let resolution = embedded_icmp_return_resolution(
+                    sessions,
+                    shared_sessions,
+                    forwarding,
+                    dynamic_neighbors,
+                    &fwd.key,
+                    fwd.decision,
+                    original_src,
+                    now_ns,
                 );
                 return Some(EmbeddedIcmpMatch {
                     nat,
@@ -8217,8 +8295,13 @@ fn try_embedded_icmp_nat_match_from_frame(
                     let nat = entry.decision.nat;
                     let original_src = entry.key.src_ip;
                     let original_src_port = entry.key.src_port;
-                    let resolution = lookup_forwarding_resolution_with_dynamic(
-                        forwarding, dynamic_neighbors, original_src,
+                    let resolution = embedded_icmp_return_resolution_from_shared(
+                        shared_sessions,
+                        forwarding,
+                        dynamic_neighbors,
+                        &entry.key,
+                        entry.decision,
+                        original_src,
                     );
                     return Some(EmbeddedIcmpMatch {
                         nat,
@@ -8244,11 +8327,20 @@ fn try_embedded_icmp_nat_match_from_frame(
                 sessions.lookup(&reversed, now_ns, 0)
             });
             lookup.map(|sl| {
-                // No NAT reversal needed — the embedded packet's source is
-                // already the original client.
-                let resolution = lookup_forwarding_resolution_with_dynamic(
-                    forwarding, dynamic_neighbors, emb_src,
-                );
+                let resolution = if sl.metadata.is_reverse {
+                    sl.decision.resolution
+                } else {
+                    embedded_icmp_return_resolution(
+                        sessions,
+                        shared_sessions,
+                        forwarding,
+                        dynamic_neighbors,
+                        &embedded_key,
+                        sl.decision,
+                        emb_src,
+                        now_ns,
+                    )
+                };
                 EmbeddedIcmpMatch {
                     nat: NatDecision::default(),
                     original_src: emb_src,
@@ -8264,9 +8356,9 @@ fn try_embedded_icmp_nat_match_from_frame(
                 return None;
             }
             let emb_protocol = frame[embedded_ip_start + 6];
-            let emb_src = IpAddr::V6(Ipv6Addr::from(
+            let emb_src_wire = Ipv6Addr::from(
                 <[u8; 16]>::try_from(&frame[embedded_ip_start + 8..embedded_ip_start + 24]).ok()?,
-            ));
+            );
             let emb_dst = IpAddr::V6(Ipv6Addr::from(
                 <[u8; 16]>::try_from(&frame[embedded_ip_start + 24..embedded_ip_start + 40]).ok()?,
             ));
@@ -8283,10 +8375,13 @@ fn try_embedded_icmp_nat_match_from_frame(
             } else {
                 (0, 0)
             };
+            let mut emb_src_lookup_v6 = emb_src_wire;
+            let _nptv6_reverse = forwarding.nptv6.translate_inbound(&mut emb_src_lookup_v6);
+            let emb_src_lookup = IpAddr::V6(emb_src_lookup_v6);
             let embedded_key = SessionKey {
                 addr_family: libc::AF_INET6 as u8,
                 protocol: emb_protocol,
-                src_ip: emb_src,
+                src_ip: emb_src_lookup,
                 dst_ip: emb_dst,
                 src_port: emb_src_port,
                 dst_port: emb_dst_port,
@@ -8296,7 +8391,7 @@ fn try_embedded_icmp_nat_match_from_frame(
                 addr_family: libc::AF_INET6 as u8,
                 protocol: emb_protocol,
                 src_ip: emb_dst,
-                dst_ip: emb_src,
+                dst_ip: IpAddr::V6(emb_src_wire),
                 src_port: if matches!(emb_protocol, PROTO_ICMPV6) { emb_src_port } else { emb_dst_port },
                 dst_port: if matches!(emb_protocol, PROTO_ICMPV6) { emb_dst_port } else { emb_src_port },
             };
@@ -8305,8 +8400,15 @@ fn try_embedded_icmp_nat_match_from_frame(
                 let nat = fwd.decision.nat;
                 let original_src = fwd.key.src_ip;
                 let original_src_port = fwd.key.src_port;
-                let resolution = lookup_forwarding_resolution_with_dynamic(
-                    forwarding, dynamic_neighbors, original_src,
+                let resolution = embedded_icmp_return_resolution(
+                    sessions,
+                    shared_sessions,
+                    forwarding,
+                    dynamic_neighbors,
+                    &fwd.key,
+                    fwd.decision,
+                    original_src,
+                    now_ns,
                 );
                 return Some(EmbeddedIcmpMatch {
                     nat,
@@ -8323,8 +8425,13 @@ fn try_embedded_icmp_nat_match_from_frame(
                     let nat = entry.decision.nat;
                     let original_src = entry.key.src_ip;
                     let original_src_port = entry.key.src_port;
-                    let resolution = lookup_forwarding_resolution_with_dynamic(
-                        forwarding, dynamic_neighbors, original_src,
+                    let resolution = embedded_icmp_return_resolution_from_shared(
+                        shared_sessions,
+                        forwarding,
+                        dynamic_neighbors,
+                        &entry.key,
+                        entry.decision,
+                        original_src,
                     );
                     return Some(EmbeddedIcmpMatch {
                         nat,
@@ -8341,19 +8448,30 @@ fn try_embedded_icmp_nat_match_from_frame(
                     addr_family: libc::AF_INET6 as u8,
                     protocol: emb_protocol,
                     src_ip: emb_dst,
-                    dst_ip: emb_src,
+                    dst_ip: emb_src_lookup,
                     src_port: emb_dst_port,
                     dst_port: emb_src_port,
                 };
                 sessions.lookup(&reversed, now_ns, 0)
             });
             lookup.map(|sl| {
-                let resolution = lookup_forwarding_resolution_with_dynamic(
-                    forwarding, dynamic_neighbors, emb_src,
-                );
+                let resolution = if sl.metadata.is_reverse {
+                    sl.decision.resolution
+                } else {
+                    embedded_icmp_return_resolution(
+                        sessions,
+                        shared_sessions,
+                        forwarding,
+                        dynamic_neighbors,
+                        &embedded_key,
+                        sl.decision,
+                        emb_src_lookup,
+                        now_ns,
+                    )
+                };
                 EmbeddedIcmpMatch {
-                    nat: NatDecision::default(),
-                    original_src: emb_src,
+                    nat: sl.decision.nat,
+                    original_src: emb_src_lookup,
                     original_src_port: emb_src_port,
                     embedded_proto: emb_protocol,
                     resolution,
@@ -8363,6 +8481,47 @@ fn try_embedded_icmp_nat_match_from_frame(
         }
         _ => None,
     }
+}
+
+fn embedded_icmp_return_resolution(
+    sessions: &mut SessionTable,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    forward_key: &SessionKey,
+    forward_decision: SessionDecision,
+    original_src: IpAddr,
+    now_ns: u64,
+) -> ForwardingResolution {
+    let reverse_key = reverse_session_key(forward_key, forward_decision.nat);
+    if let Some(reverse) = sessions.lookup(&reverse_key, now_ns, 0) {
+        return reverse.decision.resolution;
+    }
+    embedded_icmp_return_resolution_from_shared(
+        shared_sessions,
+        forwarding,
+        dynamic_neighbors,
+        forward_key,
+        forward_decision,
+        original_src,
+    )
+}
+
+fn embedded_icmp_return_resolution_from_shared(
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    forward_key: &SessionKey,
+    forward_decision: SessionDecision,
+    original_src: IpAddr,
+) -> ForwardingResolution {
+    let reverse_key = reverse_session_key(forward_key, forward_decision.nat);
+    if let Ok(sessions) = shared_sessions.lock()
+        && let Some(reverse) = sessions.get(&reverse_key)
+    {
+        return reverse.decision.resolution;
+    }
+    lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, original_src)
 }
 
 /// Build a NAT-reversed ICMP error frame for IPv4.
@@ -10807,7 +10966,8 @@ fn adjust_l4_checksum_ipv6(
 ) -> Option<()> {
     let checksum_offset = match protocol {
         PROTO_TCP => 40usize.checked_add(16)?,
-        PROTO_UDP | PROTO_ICMPV6 => 40usize.checked_add(6)?,
+        PROTO_UDP => 40usize.checked_add(6)?,
+        PROTO_ICMPV6 => 40usize.checked_add(2)?,
         _ => return Some(()),
     };
     let current = u16::from_be_bytes([
@@ -10914,7 +11074,8 @@ fn adjust_l4_checksum_ipv6_words(
 ) -> Option<()> {
     let checksum_offset = match protocol {
         PROTO_TCP => 40usize.checked_add(16)?,
-        PROTO_UDP | PROTO_ICMPV6 => 40usize.checked_add(6)?,
+        PROTO_UDP => 40usize.checked_add(6)?,
+        PROTO_ICMPV6 => 40usize.checked_add(2)?,
         _ => return Some(()),
     };
     let current = u16::from_be_bytes([
@@ -11679,6 +11840,8 @@ fn dump_bpf_session_entries(map_fd: c_int, max_entries: u32) {
 static SESSION_PUBLISH_VERIFY_OK: AtomicU64 = AtomicU64::new(0);
 static SESSION_PUBLISH_VERIFY_FAIL: AtomicU64 = AtomicU64::new(0);
 static SESSION_CREATIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "debug-log")]
+static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 const FALLBACK_STATS_PIN_PATH: &str = "/sys/fs/bpf/bpfrx/userspace_fallback_stats";
 const FALLBACK_REASON_NAMES: &[&str] = &[
@@ -14388,6 +14551,107 @@ mod tests {
             "2001:559:8585:80::8".parse::<Ipv6Addr>().unwrap()
         );
         assert!(icmpv6_checksum_ok(&out[18..]));
+    }
+
+    #[test]
+    fn rewrite_forwarded_frame_in_place_keeps_icmpv6_echo_identifier_and_sequence() {
+        let src_ip = "2001:559:8585:ef00::100".parse::<Ipv6Addr>().unwrap();
+        let dst_ip = "2607:f8b0:4005:814::200e".parse::<Ipv6Addr>().unwrap();
+        let echo_id = 0x3e0f;
+        let echo_seq = 0x80e9;
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x86dd,
+        );
+        frame.extend_from_slice(&[0x60, 0x07, 0x9f, 0x9c, 0x00, 0x18, PROTO_ICMPV6, 2]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&[
+            128,
+            0,
+            0,
+            0,
+            (echo_id >> 8) as u8,
+            echo_id as u8,
+            (echo_seq >> 8) as u8,
+            echo_seq as u8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        let sum = checksum16_ipv6(src_ip, dst_ip, PROTO_ICMPV6, &frame[54..]);
+        frame[56] = (sum >> 8) as u8;
+        frame[57] = sum as u8;
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_ICMPV6,
+            flow_src_port: echo_id,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 11,
+                next_hop: Some(IpAddr::V6(dst_ip)),
+                neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V6("2001:559:8585:50::8".parse().unwrap())),
+                ..NatDecision::default()
+            },
+        };
+
+        let frame_len = rewrite_forwarded_frame_in_place(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &decision,
+            None,
+        )
+        .expect("in-place v6 echo forward");
+        let out = area.slice(0, frame_len as usize).expect("rewritten frame");
+
+        let packet = &out[18..];
+        assert_eq!(packet[40], 128);
+        assert_eq!(packet[41], 0);
+        assert_eq!(u16::from_be_bytes([packet[44], packet[45]]), echo_id);
+        assert_eq!(u16::from_be_bytes([packet[46], packet[47]]), echo_seq);
+        assert!(icmpv6_checksum_ok(packet));
     }
 
     fn tcp_ports_ipv6(packet: &[u8]) -> (u16, u16) {
@@ -17123,6 +17387,253 @@ mod tests {
         let expected_csum = checksum16_ipv6(src_v6, dst_v6, PROTO_ICMPV6, &icmp6_copy);
         let actual_csum = u16::from_be_bytes([icmp6_data[2], icmp6_data[3]]);
         assert_eq!(actual_csum, expected_csum, "ICMPv6 checksum should be valid");
+    }
+
+    #[test]
+    fn icmpv6_te_nptv6_reverse_lookup_restores_internal_client() {
+        let router_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let external_client: Ipv6Addr = "2602:fd41:70:100::102".parse().unwrap();
+        let internal_client: Ipv6Addr = "fd35:1940:27:100::102".parse().unwrap();
+        let server_ip: Ipv6Addr = "2607:f8b0:4005:814::200e".parse().unwrap();
+        let echo_id: u16 = 0x8234;
+
+        let frame = build_icmpv6_te_frame(
+            router_ip,
+            external_client,
+            server_ip,
+            echo_id,
+            0,
+            PROTO_ICMPV6,
+        );
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_ICMPV6,
+            ..UserspaceDpMeta::default()
+        };
+
+        let mut forwarding = ForwardingState::default();
+        forwarding.nptv6 = Nptv6State::from_snapshots(&[crate::Nptv6RuleSnapshot {
+            name: "nptv6-test".to_string(),
+            from_zone: "wan".to_string(),
+            internal_prefix: "fd35:1940:0027::/48".to_string(),
+            external_prefix: "2602:fd41:0070::/48".to_string(),
+        }]);
+
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 24,
+                tx_ifindex: 24,
+                next_hop: Some(IpAddr::V6(internal_client)),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V6(external_client)),
+                rewrite_dst: None,
+                rewrite_src_port: None,
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: true,
+            },
+        };
+        let metadata = SessionMetadata {
+            ingress_zone: Arc::<str>::from("lan"),
+            egress_zone: Arc::<str>::from("wan"),
+            owner_rg_id: 0,
+            is_reverse: false,
+            synced: false,
+            nat64_reverse: None,
+        };
+        let mut sessions = SessionTable::new();
+        assert!(sessions.install_with_protocol(
+            SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: PROTO_ICMPV6,
+                src_ip: IpAddr::V6(internal_client),
+                dst_ip: IpAddr::V6(server_ip),
+                src_port: echo_id,
+                dst_port: 0,
+            },
+            decision,
+            metadata,
+            1_000_000,
+            PROTO_ICMPV6,
+            0,
+        ));
+
+        let neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let icmp_match = try_embedded_icmp_nat_match_from_frame(
+            &frame,
+            meta,
+            &mut sessions,
+            &forwarding,
+            &neighbors,
+            &shared_sessions,
+            &shared_nat_sessions,
+            1_000_000,
+        )
+        .expect("should match embedded ICMPv6 error");
+
+        assert_eq!(icmp_match.original_src, IpAddr::V6(internal_client));
+        assert_eq!(icmp_match.original_src_port, echo_id);
+        assert!(icmp_match.nat.nptv6);
+        assert_eq!(icmp_match.nat.rewrite_src, Some(IpAddr::V6(external_client)));
+    }
+
+    #[test]
+    fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
+        let router_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let external_client: Ipv6Addr = "2602:fd41:70:100::102".parse().unwrap();
+        let internal_client: Ipv6Addr = "fd35:1940:27:100::102".parse().unwrap();
+        let server_ip: Ipv6Addr = "2607:f8b0:4005:814::200e".parse().unwrap();
+        let echo_id: u16 = 0x8234;
+
+        let frame = build_icmpv6_te_frame(
+            router_ip,
+            external_client,
+            server_ip,
+            echo_id,
+            0,
+            PROTO_ICMPV6,
+        );
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_ICMPV6,
+            ..UserspaceDpMeta::default()
+        };
+
+        let mut forwarding = ForwardingState::default();
+        forwarding.nptv6 = Nptv6State::from_snapshots(&[crate::Nptv6RuleSnapshot {
+            name: "nptv6-test".to_string(),
+            from_zone: "wan".to_string(),
+            internal_prefix: "fd35:1940:0027::/48".to_string(),
+            external_prefix: "2602:fd41:0070::/48".to_string(),
+        }]);
+
+        let forward_key = SessionKey {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_ICMPV6,
+            src_ip: IpAddr::V6(internal_client),
+            dst_ip: IpAddr::V6(server_ip),
+            src_port: echo_id,
+            dst_port: 0,
+        };
+        let forward_decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 11,
+                next_hop: Some(IpAddr::V6(server_ip)),
+                neighbor_mac: Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V6(external_client)),
+                rewrite_dst: None,
+                rewrite_src_port: None,
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: true,
+            },
+        };
+        let forward_metadata = SessionMetadata {
+            ingress_zone: Arc::<str>::from("lan"),
+            egress_zone: Arc::<str>::from("wan"),
+            owner_rg_id: 0,
+            is_reverse: false,
+            synced: false,
+            nat64_reverse: None,
+        };
+
+        let reverse_key = reverse_session_key(&forward_key, forward_decision.nat);
+        let reverse_resolution = ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 24,
+            tx_ifindex: 24,
+            next_hop: Some(IpAddr::V6(internal_client)),
+            neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]),
+            tx_vlan_id: 0,
+        };
+        let reverse_decision = SessionDecision {
+            resolution: reverse_resolution,
+            nat: forward_decision.nat.reverse(
+                forward_key.src_ip,
+                forward_key.dst_ip,
+                forward_key.src_port,
+                forward_key.dst_port,
+            ),
+        };
+        let reverse_metadata = SessionMetadata {
+            ingress_zone: Arc::<str>::from("wan"),
+            egress_zone: Arc::<str>::from("lan"),
+            owner_rg_id: 0,
+            is_reverse: true,
+            synced: false,
+            nat64_reverse: None,
+        };
+
+        let mut sessions = SessionTable::new();
+        assert!(sessions.install_with_protocol(
+            forward_key.clone(),
+            forward_decision,
+            forward_metadata,
+            1_000_000,
+            PROTO_ICMPV6,
+            0,
+        ));
+        assert!(sessions.install_with_protocol(
+            reverse_key,
+            reverse_decision,
+            reverse_metadata,
+            1_000_000,
+            PROTO_ICMPV6,
+            0,
+        ));
+
+        let neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let icmp_match = try_embedded_icmp_nat_match_from_frame(
+            &frame,
+            meta,
+            &mut sessions,
+            &forwarding,
+            &neighbors,
+            &shared_sessions,
+            &shared_nat_sessions,
+            1_000_000,
+        )
+        .expect("should match embedded ICMPv6 error");
+
+        assert_eq!(icmp_match.original_src, IpAddr::V6(internal_client));
+        assert_eq!(icmp_match.resolution.disposition, ForwardingDisposition::ForwardCandidate);
+        assert_eq!(icmp_match.resolution.egress_ifindex, 24);
+        assert_eq!(icmp_match.resolution.tx_ifindex, 24);
+        assert_eq!(
+            icmp_match.resolution.neighbor_mac,
+            Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+        );
     }
 
     #[test]
