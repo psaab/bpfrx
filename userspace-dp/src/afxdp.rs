@@ -2125,6 +2125,20 @@ fn poll_binding(
             let mut recycle_now = true;
             if let Some(meta) = try_parse_metadata(unsafe { &*area }, desc) {
                 counters.metadata_packets += 1;
+                // DEBUG: log ALL packets on WAN interface (ifindex 6)
+                if meta.ingress_ifindex == 6 || matches!(meta.protocol, 1 | 58) {
+                    static ICMP_RX_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let c = ICMP_RX_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if c < 100 {
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/icmp_rx_debug.log") {
+                            use std::io::Write;
+                            let icmp_type = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
+                                .and_then(|fr| fr.get(meta.l4_offset as usize).copied()).unwrap_or(255);
+                            let _ = writeln!(f, "ICMP_RX[{}]: proto={} af={} l4_off={} icmp_type={} len={} if={} slot={}",
+                                c, meta.protocol, meta.addr_family, meta.l4_offset, icmp_type, desc.len, meta.ingress_ifindex, binding.slot);
+                        }
+                    }
+                }
                 let disposition = classify_metadata(meta, validation);
                 if disposition == PacketDisposition::Valid {
                     counters.validated_packets += 1;
@@ -6256,6 +6270,14 @@ fn worker_loop(
         ) {
             Ok(binding) => bindings.push(binding),
             Err(err) => plan.live.set_error(err.to_string()),
+        }
+    }
+    // DEBUG: verify file writes work from worker thread
+    {
+        use std::io::Write;
+        match std::fs::OpenOptions::new().create(true).append(true).open("/tmp/worker_startup.log") {
+            Ok(mut f) => { let _ = writeln!(f, "worker {} started with {} bindings", worker_id, bindings.len()); }
+            Err(e) => eprintln!("WORKER {} CANNOT WRITE /tmp/: {}", worker_id, e),
         }
     }
     let mut idle_iters = 0u32;

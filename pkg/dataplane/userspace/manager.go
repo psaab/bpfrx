@@ -96,11 +96,12 @@ func (m *Manager) Teardown() error {
 }
 
 func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
-	// Always start with xdp_main_prog. The userspace XDP shim is loaded
-	// dynamically when forwarding_armed transitions to true (via
-	// syncDesiredForwardingStateLocked). This ensures the eBPF pipeline
-	// handles all traffic during startup and HA failover.
-	m.inner.XDPEntryProg = "xdp_main_prog"
+	caps := deriveUserspaceCapabilities(cfg)
+	if caps.ForwardingSupported {
+		m.inner.XDPEntryProg = "xdp_userspace_prog"
+	} else {
+		m.inner.XDPEntryProg = "xdp_main_prog"
+	}
 	result, err := m.inner.Compile(cfg)
 	if err != nil {
 		return nil, err
@@ -2131,19 +2132,6 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 	if m.lastStatus.ForwardingArmed == desired {
 		return nil
 	}
-	// Swap XDP entry program: when armed, use the userspace XDP shim
-	// so AF_XDP sockets receive transit traffic. When not armed (HA
-	// secondary), use xdp_main_prog so the eBPF pipeline handles
-	// everything (including embedded ICMP NAT reversal for mtr).
-	if desired && m.lastStatus.Capabilities.ForwardingSupported {
-		if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
-			slog.Warn("failed to swap to userspace XDP shim", "err", err)
-		}
-	} else {
-		if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
-			slog.Warn("failed to swap to xdp_main_prog", "err", err)
-		}
-	}
 	var status ProcessStatus
 	req := ControlRequest{
 		Type: "set_forwarding_state",
@@ -2303,9 +2291,9 @@ func (m *Manager) setupUserspaceCPUMapLocked() bool {
 	}
 
 	// cpumap value: struct { __u32 qsize; int bpf_prog_fd; }
-	// With prog_fd=0, no cpumap program is attached — packets go straight
-	// to the kernel stack. This is sufficient for the XDP_PASS replacement
-	// paths (ARP, local destination, non-IP traffic).
+	// cpumap value: struct { __u32 qsize; int bpf_prog_fd; }
+	// With prog_fd=0, no cpumap program is attached — packets go to kernel.
+	// TODO: attach xdp_cpumap_prog for eBPF embedded ICMP NAT reversal.
 	for cpu := 0; cpu < numCPUs; cpu++ {
 		val := make([]byte, 8)
 		binary.NativeEndian.PutUint32(val[0:4], 2048) // qsize
