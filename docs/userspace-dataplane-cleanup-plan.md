@@ -21,7 +21,8 @@ Current execution state as of 2026-03-15:
 2. Phase 2 is complete and merged on `master` via PR `#225`.
 3. Phase 3 is complete on the current branch via PR `#228`.
 4. Phase 4 is complete on the current branch and ready for PR review.
-5. Phase 5 is partially complete on `master` via PR `#221`.
+5. Phase 5 is in progress on the current branch and is partially complete on
+   `master` via PR `#221`.
 6. Phase 6 has not started as a formal cleanup phase yet.
 
 Latest status-sync update for this document:
@@ -72,10 +73,9 @@ Completed under this plan:
 
 Still left to do at a high level:
 
-1. Finish hardening validation coverage in Phase 5.
-2. Fix the userspace validation shell harness so TTL / hop-limit probes are
-   treated as success when they return the expected native time-exceeded reply.
-3. Only then do the serious sustained-throughput optimization work in Phase 6.
+1. Finish the remaining regression hardening in Phase 5 beyond the TTL /
+   hop-limit shell-harness fix.
+2. Only then do the serious sustained-throughput optimization work in Phase 6.
 
 ## Current Baseline
 
@@ -410,7 +410,7 @@ Phase 4 result:
 
 ## Phase 5: Validation And Regression Hardening
 
-Status: Partially Complete
+Status: In Progress
 
 Completed so far:
 
@@ -420,6 +420,16 @@ Completed so far:
    to `2607:f8b0:4005:814::200e`.
 3. Sustained-throughput collapse detection was already added before this plan
    and remains part of the normal workflow.
+4. On the current branch, the shell harness now accepts TTL / hop-limit probe
+   exit status `1` when the captured output contains the expected native
+   time-exceeded response.
+5. On the current branch, `iperf3 -J` output is now analyzed on the repo host
+   instead of assuming `python3` exists on `cluster-userspace-host`.
+6. On the current branch, direct regression coverage was added for:
+   - non-error ICMP packets not triggering embedded NAT reversal
+   - slow-path fallback no-op behavior for forward-candidate traffic
+   - slow-path extract-failure accounting
+   - slow-path unavailable accounting
 
 Delivered in:
 
@@ -429,13 +439,12 @@ Delivered in:
 
 Still left:
 
-1. Fix the shell harness so TTL / hop-limit probes do not fail the validation
-   script when they return the expected time-exceeded reply with non-zero exit
-   status.
-2. Add more direct regression coverage for tuple authority and embedded ICMP
-   corner cases.
-3. Add coverage for AF_XDP build-failure fallback behavior.
-4. Keep synchronized capture workflows available as diagnosis tools, not first
+1. Add more direct regression coverage for tuple authority and embedded ICMP
+   corner cases beyond the current non-error / no-match coverage.
+2. Add end-to-end regression coverage for the specific AF_XDP forward-build
+   failure path inside `enqueue_pending_forwards`, not just the lower-level
+   slow-path fallback helpers.
+3. Keep synchronized capture workflows available as diagnosis tools, not first
    line validation.
 
 ### Purpose
