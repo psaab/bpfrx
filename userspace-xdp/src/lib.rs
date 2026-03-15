@@ -24,6 +24,8 @@ const AF_INET6: u8 = 10;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const PROTO_ICMP: u8 = 1;
+const PROTO_GRE: u8 = 47;
+const PROTO_ESP: u8 = 50;
 const PROTO_ICMPV6: u8 = 58;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_ACK: u8 = 0x10;
@@ -739,6 +741,12 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
 }
 
 fn should_fallback_early(pkt: &ParsedPacket) -> bool {
+    // GRE (47) and ESP (50) are tunnel encapsulation protocols that must
+    // be delivered to the kernel for decapsulation (GRE→gr-0-0-0, ESP→XFRM).
+    // The userspace DP cannot decapsulate these — always fall back to eBPF.
+    if matches!(pkt.protocol, PROTO_GRE | PROTO_ESP) {
+        return true;
+    }
     match pkt.addr_family {
         AF_INET => {
             if pkt.dst_v4 == 0xffff_ffff
