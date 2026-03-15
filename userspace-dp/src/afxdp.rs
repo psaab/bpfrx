@@ -44,10 +44,17 @@ macro_rules! debug_log {
 
 #[path = "afxdp/icmp.rs"]
 mod icmp;
+#[path = "afxdp/icmp_embed.rs"]
+mod icmp_embed;
 
 use self::icmp::{
     build_local_time_exceeded_request, build_local_time_exceeded_v4,
     build_local_time_exceeded_v6, is_icmp_error, packet_ttl_would_expire,
+};
+use self::icmp_embed::{
+    EmbeddedIcmpMatch, build_nat_reversed_icmp_error_v4, build_nat_reversed_icmp_error_v6,
+    finalize_embedded_icmp_resolution, try_embedded_icmp_nat_match,
+    try_embedded_icmp_nat_match_from_frame, try_embedded_icmp_session_match_from_frame,
 };
 
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
@@ -7772,6 +7779,7 @@ fn zone_pair_for_flow_with_override(
     (from_zone, to_zone)
 }
 
+<<<<<<< HEAD
 /// Information returned from an embedded ICMP error session match that includes
 /// NAT reversal data needed to rewrite the ICMP error packet back to the
 /// original pre-NAT client.
@@ -8586,6 +8594,8 @@ fn build_nat_reversed_icmp_error_v6(
     Some(out)
 }
 
+=======
+>>>>>>> abc2a08 (userspace: extract embedded icmp helpers)
 fn allow_unsolicited_dns_reply(forwarding: &ForwardingState, flow: &SessionFlow) -> bool {
     forwarding.allow_dns_reply
         && flow.forward_key.protocol == PROTO_UDP
@@ -8635,33 +8645,6 @@ fn resolve_zone_encoded_fabric_redirect(
     }
     resolution.src_mac = Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, zone_id as u8]);
     Some(resolution)
-}
-
-fn finalize_embedded_icmp_resolution(
-    forwarding: &ForwardingState,
-    ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    now_secs: u64,
-    ingress_ifindex: i32,
-    icmp_match: &EmbeddedIcmpMatch,
-) -> ForwardingResolution {
-    let enforced =
-        enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, icmp_match.resolution);
-    if !ingress_is_fabric(forwarding, ingress_ifindex)
-        && matches!(
-            enforced.disposition,
-            ForwardingDisposition::HAInactive
-                | ForwardingDisposition::NoRoute
-                | ForwardingDisposition::DiscardRoute
-        )
-    {
-        if let Some(redirect) = resolve_zone_encoded_fabric_redirect(
-            forwarding,
-            icmp_match.metadata.ingress_zone.as_ref(),
-        ) {
-            return redirect;
-        }
-    }
-    redirect_via_fabric_if_needed(forwarding, enforced, ingress_ifindex)
 }
 
 fn redirect_via_fabric_if_needed(
