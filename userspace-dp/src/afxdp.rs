@@ -7635,7 +7635,24 @@ fn try_embedded_icmp_session_match(
                 src_port: emb_src_port,
                 dst_port: emb_dst_port,
             };
-            sessions.lookup(&embedded_key, now_ns, 0)
+            // Try direct lookup first (embedded packet matches a session key).
+            // If that fails, try the reversed key (embedded packet is the
+            // outgoing SNAT'd packet, so reverse matches the NAT reverse index).
+            sessions.lookup(&embedded_key, now_ns, 0).or_else(|| {
+                let reversed = SessionKey {
+                    addr_family: libc::AF_INET as u8,
+                    protocol: emb_protocol,
+                    src_ip: emb_dst,
+                    dst_ip: emb_src,
+                    src_port: emb_dst_port,
+                    dst_port: emb_src_port,
+                };
+                sessions.lookup(&reversed, now_ns, 0)
+            }).or_else(|| {
+                sessions.find_forward_nat_match(&embedded_key).map(|m| {
+                    SessionLookup { decision: m.decision, metadata: m.metadata }
+                })
+            })
         }
         PROTO_ICMPV6 => {
             // Embedded IPv6 header
@@ -7671,7 +7688,21 @@ fn try_embedded_icmp_session_match(
                 src_port: emb_src_port,
                 dst_port: emb_dst_port,
             };
-            sessions.lookup(&embedded_key, now_ns, 0)
+            sessions.lookup(&embedded_key, now_ns, 0).or_else(|| {
+                let reversed = SessionKey {
+                    addr_family: libc::AF_INET6 as u8,
+                    protocol: emb_protocol,
+                    src_ip: emb_dst,
+                    dst_ip: emb_src,
+                    src_port: emb_dst_port,
+                    dst_port: emb_src_port,
+                };
+                sessions.lookup(&reversed, now_ns, 0)
+            }).or_else(|| {
+                sessions.find_forward_nat_match(&embedded_key).map(|m| {
+                    SessionLookup { decision: m.decision, metadata: m.metadata }
+                })
+            })
         }
         _ => None,
     }
