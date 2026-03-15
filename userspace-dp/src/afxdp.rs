@@ -5950,6 +5950,7 @@ fn apply_worker_commands(
     for cmd in pending {
         match cmd {
             WorkerCommand::UpsertSynced(entry) => {
+                let key = entry.key.clone();
                 sessions.upsert_synced(
                     entry.key,
                     entry.decision,
@@ -5958,6 +5959,7 @@ fn apply_worker_commands(
                     entry.protocol,
                     entry.tcp_flags,
                 );
+                let _ = publish_live_session_key(session_map_fd, &key);
             }
             WorkerCommand::DeleteSynced(key) => {
                 sessions.delete(&key);
