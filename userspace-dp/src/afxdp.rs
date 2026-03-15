@@ -3743,7 +3743,8 @@ fn enqueue_pending_forwards(
                                             Some(request.meta),
                                             None,
                                         );
-                                        continue;
+                                        // Don't continue — the frame was built successfully,
+                                        // forward it anyway. Mismatch is diagnostic only.
                                     }
                                 }
                                 let cp1_len = frame.len();
@@ -3921,7 +3922,8 @@ fn enqueue_pending_forwards(
                                             Some(request.meta),
                                             None,
                                         );
-                                        continue;
+                                        // Don't continue — the frame was built successfully,
+                                        // forward it anyway. Mismatch is diagnostic only.
                                     }
                                 }
                                 let cp2_len = frame.len();
@@ -8579,7 +8581,7 @@ fn build_nat_reversed_icmp_error_v4(
 
     // Compute Ethernet header size from L3 offset.
     #[cfg(feature = "debug-log")]
-    let eth_len = l3;
+    let _eth_len = l3;
     let dst_mac = icmp_match.resolution.neighbor_mac?;
     let src_mac = icmp_match.resolution.src_mac?;
     let vlan_id = icmp_match.resolution.tx_vlan_id;
