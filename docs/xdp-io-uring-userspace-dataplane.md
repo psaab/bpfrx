@@ -5,17 +5,17 @@ Date: 2026-03-06
 Note: This is an architecture exploration document. It is intentionally grounded in
 bpfrx's current XDP/TC, HA, and `pkg/dataplane.DataPlane` model.
 
-This file now serves two purposes:
+This file is now best read as a design and migration-history document.
 
-- the target design for the userspace dataplane
-- the current branch status on `userspace-dataplane-rust-wip`
+For current `master` behavior, use:
 
-Those are not the same thing. The branch has real Rust AF_XDP forwarding and real
-lab validation on supported non-HA paths, but it is still experimental, incomplete
-for full HA/policy parity, and not yet at performance parity with the legacy XDP/TC
-dataplane. The current isolated HA/fabric cluster on `loss` is intentionally gated
-back to legacy XDP for real traffic until HA ownership and fabric redirect are
-implemented in the Rust dataplane.
+- [`userspace-dataplane-architecture.md`](userspace-dataplane-architecture.md) for the current architecture
+- [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md) for the current admission boundary
+- the current code in `pkg/dataplane/userspace/`, `userspace-xdp/`, and `userspace-dp/`
+
+Some historical branch-status notes remain below because they explain design
+tradeoffs and fallback boundaries, but they should not be treated as the
+authoritative runtime status for `master`.
 
 ## Executive Summary
 

@@ -8,6 +8,12 @@ networking stack for stateful firewall processing. It runs alongside
 the existing BPF XDP pipeline as a parallel forwarding path optimized
 for high-throughput TCP/UDP forwarding.
 
+This document tracks the current `master` architecture. It is not a claim
+that every supported configuration already reaches feature or performance
+parity with the legacy eBPF dataplane. For the exact admission gate, use
+[`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md). For active
+debugging entry points, use [`userspace-debug-map.md`](userspace-debug-map.md).
+
 ```
                         ┌─────────────────────────────────┐
                         │          bpfrxd (Go)             │
@@ -59,19 +65,20 @@ Packet arrives at NIC
   ├─ Non-IP (ARP, etc.) ──────────────────► cpumap → kernel stack
   ├─ Multicast / broadcast ────────────────► cpumap → kernel stack
   ├─ Local destination ────────────────────► cpumap → kernel stack
+  ├─ GRE / ESP / explicit fallback cases ──► tail-call → legacy XDP pipeline
   │
   ├─ Has active session in BPF map? ───YES─► XDP_REDIRECT → XSK socket
   │
-  ├─ Connection-initiating (SYN/new)? ─YES─► XDP_REDIRECT → XSK socket
+  ├─ Session miss but still transit traffic ─► XDP_REDIRECT → XSK socket
   │
-  └─ Non-initiating without session ───────► DROP (TCP retransmit recovers)
+  └─ Binding/heartbeat failure on DP-managed interface ─► DROP or explicit fallback
 ```
 
 **Key design decisions:**
 
-- **Session-gated redirect**: Only redirects packets when the userspace
-  session table has an entry. Prevents packet black holes during startup
-  and graceful degradation when userspace is restarting.
+- **Session-aware, not session-only redirect**: live sessions skip extra
+  local/interface-NAT checks, but transit session misses are still redirected
+  so the Rust dataplane can perform first-packet policy/NAT/FIB evaluation.
 
 - **cpumap for kernel pass-through**: In AF_XDP zero-copy mode, XDP_PASS
   permanently consumes UMEM frames (the kernel holds them in SKBs). The
@@ -79,10 +86,10 @@ Packet arrives at NIC
   frees the XSK frame while still delivering the packet to the kernel
   networking stack.
 
-- **Connection-init filtering**: Non-SYN TCP packets without a session
-  are dropped rather than redirected. The sender will retransmit, and
-  by then the session will exist. This prevents userspace from needing
-  to handle mid-stream TCP.
+- **Fail closed on dead bindings**: if a binding is missing, not ready, or
+  its heartbeat is stale on a userspace-managed interface, the shim drops
+  rather than blindly passing packets into the kernel path and creating
+  spurious RST/black-hole behavior.
 
 - **Heartbeat watchdog**: Each worker writes a timestamp to a BPF array
   map every 250ms. The shim checks freshness (5s timeout) and refuses
@@ -147,8 +154,8 @@ RX from AF_XDP ring (up to 256 frames per batch, 4 batches per poll)
   ├─ Build egress frame (MAC rewrite, VLAN tag)
   │
   └─ TX submission
-      ├─ Same binding: in-place UMEM rewrite (zero copy)
-      └─ Cross binding: memcpy to target UMEM frame
+      ├─ Same binding: in-place UMEM rewrite when possible
+      └─ Cross binding: copy into target binding UMEM on the common path
 ```
 
 #### AF_XDP Ring Management
@@ -191,9 +198,10 @@ Each binding manages four rings:
 
 **Zero-copy vs copy mode:**
 - Zero-copy: NIC DMA writes directly into UMEM. No kernel memcpy.
-  Requires driver support (mlx5). XDP_PASS leaks frames (hence cpumap).
-- Copy mode: Kernel copies packet data into UMEM. Works with any NIC.
-  Fallback when zero-copy bind fails.
+  Requires driver support and safe kernel-pass handling.
+- Copy mode: Kernel copies packet data into UMEM. The current tree still
+  contains mlx5/copy-mode mitigations and debugging around fill-ring pressure,
+  so do not read "AF_XDP" as meaning "always zero-copy" on current `master`.
 
 #### Session Table (`session.rs`)
 

@@ -23,20 +23,21 @@ TC Egress:   main → screen_egress → conntrack → nat → forward
 
 ### Userspace Dataplane
 
-An alternative Rust-based forwarding engine that receives packets via AF_XDP sockets and processes them in userspace. A minimal XDP shim steers transit traffic to userspace while unsupported traffic falls back to the kernel BPF pipeline.
+An alternative Rust-based forwarding engine that receives packets via AF_XDP sockets and processes them in userspace. A Rust XDP shim stamps metadata, redirects transit traffic into AF_XDP, and still hands kernel-owned or unsupported traffic back to the kernel/BPF path when needed.
 
 ```
-NIC → XDP Shim (session-gated redirect) → AF_XDP socket
+NIC → XDP shim (live-session + new-flow redirect, kernel pass-through, explicit fallback)
+    → AF_XDP socket
     → Rust worker thread (session → policy → NAT → FIB → TX)
     → AF_XDP TX ring → NIC
 ```
 
-- **23+ Gbps** on 25G mlx5 ConnectX-5 (93% line rate)
-- **Per-worker architecture**: one thread per RSS queue, lock-free forwarding
-- **Zero-copy AF_XDP** with cpumap redirect for kernel pass-through
-- **Automatic fallback**: unsupported features cause transparent fallback to the eBPF dataplane
-- **Best for**: high-throughput transit forwarding with stateful NAT (SNAT, static 1:1, NAT64) and zone policy
-- **See**: [`docs/userspace-dataplane-architecture.md`](docs/userspace-dataplane-architecture.md) for full design details
+- **Per-worker architecture**: one worker per queue shard, with session/NAT/policy/FIB handled in Rust
+- **AF_XDP fast path**: current code supports both copy and zero-copy modes depending on driver/path behavior
+- **Kernel pass-through**: cpumap-assisted delivery keeps local/kernel-owned traffic out of the AF_XDP fast path
+- **Automatic fallback**: unsupported configs and explicit error paths still fall back to the legacy eBPF dataplane
+- **Best for**: active development of the Rust forwarding path and high-throughput transit forwarding on supported configs
+- **See**: [`docs/userspace-dataplane-architecture.md`](docs/userspace-dataplane-architecture.md) for the current architecture and [`docs/userspace-debug-map.md`](docs/userspace-debug-map.md) for the active debugging map
 
 **To select the userspace dataplane:**
 
@@ -58,23 +59,23 @@ system {
 | Stateful forwarding | Yes | Yes |
 | Zone + global policies | Yes | Yes |
 | Application matching | Yes | Yes |
-| Source NAT (interface + pool) | Yes | Yes |
+| Source NAT (interface + pool) | Yes | Interface mode yes; pool mode still gated |
 | Destination NAT | Yes | Yes |
 | Static NAT (1:1) | Yes | Yes |
 | NAT64 (IPv6↔IPv4) | Yes | Yes |
 | NPTv6 (RFC 6296) | Yes | Yes |
-| Screen/IDS (11 checks) | Yes | Yes |
-| Firewall filters + policers | Yes | Yes |
+| Screen/IDS (11 checks) | Yes | Most checks yes; SYN-cookie behavior falls back |
+| Firewall filters + policers | Yes | Filters yes; three-color policers still gated |
 | TCP MSS clamping | Yes | Yes |
 | GRE tunnel transit | Yes | Yes (passthrough) |
 | IPsec / XFRM | Yes | Yes (passthrough) |
 | VLANs (802.1Q) | Yes | Yes |
 | Flow export (NetFlow v9) | Yes | Yes |
-| HA cluster + session sync | Yes | Yes |
+| HA cluster + session sync | Yes | Integrated, but still under active hardening |
 | SYN cookie flood protection | Yes | No (fallback) |
-| Throughput (25G mlx5) | 22+ Gbps | 23+ Gbps |
+| Throughput (25G mlx5) | 22+ Gbps | See validation/perf docs for current results |
 
-The only remaining eBPF fallback is SYN cookie flood protection, which requires kernel-level TCP state. All other features are handled natively by the userspace dataplane. See [`docs/userspace-dataplane-gaps.md`](docs/userspace-dataplane-gaps.md) for details.
+The userspace dataplane now covers most of the transit feature set in native Rust, but it is not "fallback-free". Current explicit gates in code still include pool-mode SNAT admission, SYN-cookie-dependent screen behavior, three-color policers, and port mirroring. The exact admission boundary is documented in [`docs/userspace-dataplane-gaps.md`](docs/userspace-dataplane-gaps.md).
 
 ## Architecture
 
@@ -222,10 +223,10 @@ set security policies from-zone trust to-zone untrust policy allow-all then perm
   - **~60ms cluster failover** (30ms VRRP, ~97ms masterDown interval)
   - **Near-instant planned shutdown** (priority-0 burst, peer takes over in ~1ms)
 - **Userspace dataplane**
-  - **23+ Gbps** on 25G mlx5 ConnectX-5 with 6 workers (93% line rate)
-  - **Zero-copy AF_XDP** with cpumap redirect for XDP_PASS paths
-  - **Lock-free forwarding**: no mutexes on per-packet hot path
-  - **HA cluster support**: session sync, fabric redirect, ~60ms failover
+  - **AF_XDP-based forwarding** with per-worker Rust session/NAT/policy/FIB processing
+  - **Copy or zero-copy mode** depending on NIC driver/path behavior
+  - **Kernel pass-through via cpumap** for local and other kernel-owned traffic
+  - **See** [`docs/userspace-ha-validation.md`](docs/userspace-ha-validation.md) and [`docs/userspace-perf-compare.md`](docs/userspace-perf-compare.md) for current validation and profiling workflow
 
 ## Test Environment
 
@@ -329,6 +330,7 @@ See `docs/` for detailed design documents:
 - `test_env.md` — Test topology and validation steps
 - `feature-gaps.md` — vSRX feature parity tracking
 - `userspace-dataplane-architecture.md` — Comprehensive userspace AF_XDP dataplane architecture
+- `userspace-debug-map.md` — Active file/function map for userspace forwarding and debugging
 - `xdp-io-uring-userspace-dataplane.md` — Original userspace dataplane design document
 - `shared-umem-plan.md` — Shared UMEM investigation (cross-NIC infeasibility analysis)
 - `userspace-ha-validation.md` — HA failover validation procedures

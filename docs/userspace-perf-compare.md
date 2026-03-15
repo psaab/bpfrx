@@ -1,22 +1,22 @@
 # Userspace Perf Compare
 
-Use [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-perf-compare.sh) when you need a repeatable IPv4/IPv6 performance capture on the isolated userspace cluster without coupling the result to the pass/fail thresholds in `userspace-ha-validation.sh`.
+Use [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx/scripts/userspace-perf-compare.sh) when you need a repeatable IPv4/IPv6 performance capture on the isolated userspace cluster without coupling the result to the pass/fail thresholds in `userspace-ha-validation.sh`.
 
-This is the authoritative workflow for current branch measurements. During active
+This is the authoritative workflow for current-tree measurements. During active
 performance work, do not cite the validation doc’s `22-23 Gbps` target as if it
-describes the current branch head. Use this workflow and the saved artifacts instead.
+describes the current tree state. Use this workflow and the saved artifacts instead.
 
 This is the right tool when:
-- the branch is still unstable and validation fails at a reachability or throughput gate
+- the current tree is still unstable and validation fails at a reachability or throughput gate
 - you still need current `perf` data from `bpfrx-userspace-fw0/1`
 - you want a side-by-side IPv4/IPv6 hotspot comparison with saved artifacts
 - you need to confirm whether a run is truly sustained or only bursts in the first second
 
 Inputs:
-- env: [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx-userspace-wip/test/incus/loss-userspace-cluster.env)
-- isolated config: [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx-userspace-wip/docs/ha-cluster-userspace.conf)
-- validator: [userspace-ha-validation.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-ha-validation.sh)
-- compare script: [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-perf-compare.sh)
+- env: [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx/test/incus/loss-userspace-cluster.env)
+- isolated config: [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx/docs/ha-cluster-userspace.conf)
+- validator: [userspace-ha-validation.sh](/home/ps/git/codex-bpfrx/scripts/userspace-ha-validation.sh)
+- compare script: [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx/scripts/userspace-perf-compare.sh)
 
 Run:
 

@@ -1,6 +1,6 @@
 # Userspace HA Validation
 
-Date: 2026-03-09
+Date: 2026-03-14
 
 This document captures the current repeatable validation path for the isolated
 userspace cluster on `loss`:
@@ -10,11 +10,11 @@ userspace cluster on `loss`:
 - `loss:cluster-userspace-host`
 
 Tracked inputs:
-- env: [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx-userspace-wip/test/incus/loss-userspace-cluster.env)
-- config: [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx-userspace-wip/docs/ha-cluster-userspace.conf)
-- validator: [userspace-ha-validation.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-ha-validation.sh)
-- phase cycle: [userspace-phase-cycle.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-phase-cycle.sh)
-- perf compare: [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-perf-compare.sh)
+- env: [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx/test/incus/loss-userspace-cluster.env)
+- config: [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx/docs/ha-cluster-userspace.conf)
+- validator: [userspace-ha-validation.sh](/home/ps/git/codex-bpfrx/scripts/userspace-ha-validation.sh)
+- phase cycle: [userspace-phase-cycle.sh](/home/ps/git/codex-bpfrx/scripts/userspace-phase-cycle.sh)
+- perf compare: [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx/scripts/userspace-perf-compare.sh)
 
 ## Current Model
 
@@ -74,7 +74,7 @@ This is the required sequence after each userspace dataplane phase:
 
 If the validation script is failing and you still need current performance data,
 run the perf-compare workflow next. It captures IPv4/IPv6 `iperf3` and `perf`
-artifacts without treating the current branch instability as a hard blocker.
+artifacts without treating current tree instability as a hard blocker.
 
 ## What The Validator Enforces
 
@@ -95,28 +95,31 @@ The validator does this in order:
 
 ## Target And Interpretation
 
-Validation target for this branch:
+Validation target for the active userspace forwarding path:
 
 - IPv4 `iperf3 -P 4 -t 5`: `22-23 Gbps`
 - IPv6 `iperf3 -P 4 -t 5`: `22-23 Gbps`
 - Retransmits: `0`
 - Sustained transfer: no “fast first second, then collapse to 0 bps” interval pattern
 
-That is the target, not a guarantee of the current branch head.
+That is the target, not a guarantee of the current tree state.
 
-Current branch reality:
+Current `master` reality:
 
-- the isolated HA/fabric lab currently validates the safe fallback path, not Rust
-  userspace forwarding for real traffic
-- the branch is still under active forwarding-correctness and performance work on
-  supported userspace-forwarding paths
+- the isolated HA lab is used for both active userspace-forwarding work and
+  safe fallback verification, depending on the active config and runtime gate
+- the validator must therefore first determine whether the node settled into:
+  - active userspace forwarding, or
+  - legacy eBPF fallback
+- the tree is still under active forwarding-correctness and performance work on
+  the AF_XDP fast path
 - it is normal for the validator to fail while a phase is in progress
 - a failing validation run is signal; do not “fix” it by lowering the threshold
 
-Use [userspace-perf-compare.md](/home/ps/git/codex-bpfrx-userspace-wip/docs/userspace-perf-compare.md)
+Use [userspace-perf-compare.md](/home/ps/git/codex-bpfrx/docs/userspace-perf-compare.md)
 for the current measured numbers and current hot-path deltas. This document defines
 the required workflow and the target, not the current performance claim for every
-branch head.
+tree state.
 
 The validator now treats interval collapse as a separate failure mode from average
 Gbps. A run that peaks high and then drops near zero is a failure even if the short
@@ -128,11 +131,11 @@ route state before throughput checks.
 
 ## Operational Rule
 
-For the isolated userspace cluster, do not use `/tmp/bpfrx-loss-userspace.env`
-or `/tmp/ha-cluster-userspace.conf` as the source of truth.
+For the isolated userspace cluster, do not use `/tmp` cluster env/config files
+as the source of truth.
 
 Use:
 
-- [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx-userspace-wip/test/incus/loss-userspace-cluster.env)
-- [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx-userspace-wip/docs/ha-cluster-userspace.conf)
-- [userspace-phase-cycle.sh](/home/ps/git/codex-bpfrx-userspace-wip/scripts/userspace-phase-cycle.sh)
+- [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx/test/incus/loss-userspace-cluster.env)
+- [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx/docs/ha-cluster-userspace.conf)
+- [userspace-phase-cycle.sh](/home/ps/git/codex-bpfrx/scripts/userspace-phase-cycle.sh)

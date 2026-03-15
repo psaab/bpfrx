@@ -52,7 +52,7 @@ Implemented in commit `aefed32`:
   - spare fill frames
 - stopped treating a temporary zero insert as a hard runtime error
 
-Code: [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx-userspace-wip/userspace-dp/src/afxdp.rs)
+Code: [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
 
 ### Shared-UMEM ring-size fix
 
@@ -61,7 +61,7 @@ Implemented in commit `5086741`:
 - rounded shared UMEM `fill_size` / `complete_size` to a power of two before `fq_cq()` creation
 - kept the spare-frame design without breaking AF_XDP bring-up on mlx5
 
-Code: [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx-userspace-wip/userspace-dp/src/afxdp.rs)
+Code: [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
 
 ## Verification
 
