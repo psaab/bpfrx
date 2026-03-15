@@ -11090,12 +11090,12 @@ mod tests {
             0,
             0x86dd,
         );
-        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x18, PROTO_UDP, 64]);
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x14, PROTO_UDP, 64]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
         frame.extend_from_slice(&src_port.to_be_bytes());
         frame.extend_from_slice(&dst_port.to_be_bytes());
-        frame.extend_from_slice(&[0x00, 0x18, 0x00, 0x00]);
+        frame.extend_from_slice(&[0x00, 0x14, 0x00, 0x00]);
         frame.extend_from_slice(b"userspace-udp");
         recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_UDP).expect("udp sum");
 
