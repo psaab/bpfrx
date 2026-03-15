@@ -11022,6 +11022,101 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_forward_ports_prefers_metadata_tuple_when_flow_missing() {
+        let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let dst_ip = Ipv4Addr::new(172, 16, 80, 200);
+        let expected_src_port = 55068u16;
+        let wrong_src_port = 1041u16;
+        let dst_port = 5201u16;
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&wrong_src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
+            0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+        ]);
+        let ip_csum = checksum16(&frame[14..34]);
+        frame[24..26].copy_from_slice(&ip_csum.to_be_bytes());
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+
+        let mut flow_src_addr = [0u8; 16];
+        flow_src_addr[..4].copy_from_slice(&src_ip.octets());
+        let mut flow_dst_addr = [0u8; 16];
+        flow_dst_addr[..4].copy_from_slice(&dst_ip.octets());
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            flow_src_addr,
+            flow_dst_addr,
+            flow_src_port: expected_src_port,
+            flow_dst_port: dst_port,
+            ..UserspaceDpMeta::default()
+        };
+
+        assert_eq!(
+            authoritative_forward_ports(&frame, meta, None),
+            Some((expected_src_port, dst_port))
+        );
+    }
+
+    #[test]
+    fn authoritative_forward_ports_falls_back_to_live_frame_ports_when_metadata_missing() {
+        let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+        let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+        let src_port = 55068u16;
+        let dst_port = 5201u16;
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x86dd,
+        );
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x18, PROTO_UDP, 64]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x18, 0x00, 0x00]);
+        frame.extend_from_slice(b"userspace-udp");
+        recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_UDP).expect("udp sum");
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_UDP,
+            ..UserspaceDpMeta::default()
+        };
+
+        assert_eq!(
+            authoritative_forward_ports(&frame, meta, None),
+            Some((src_port, dst_port))
+        );
+    }
+
+    #[test]
     fn parse_session_flow_prefers_metadata_tuple_when_frame_ports_mismatch() {
         let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
         let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
@@ -12734,6 +12829,106 @@ mod tests {
     }
 
     #[test]
+    fn embedded_icmp_nat_match_uses_shared_nat_session_for_ipv4() {
+        let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+        let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+        let snat_port: u16 = 40000;
+        let client_port: u16 = 12345;
+
+        let frame = build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+
+        let mut sessions = SessionTable::new();
+        let forwarding = build_forwarding_state(&nat_snapshot());
+        let neighbors = Arc::new(Mutex::new(FastMap::default()));
+        learn_dynamic_neighbor(
+            &forwarding,
+            &neighbors,
+            24,
+            0,
+            IpAddr::V4(client_ip),
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        );
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+
+        let entry = SyncedSessionEntry {
+            key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(client_ip),
+                dst_ip: IpAddr::V4(server_ip),
+                src_port: client_port,
+                dst_port: 80,
+            },
+            decision: SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::ForwardCandidate,
+                    local_ifindex: 0,
+                    egress_ifindex: 12,
+                    tx_ifindex: 12,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                    neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                    src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+                    tx_vlan_id: 80,
+                },
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(snat_ip)),
+                    rewrite_dst: None,
+                    rewrite_src_port: Some(snat_port),
+                    rewrite_dst_port: None,
+                    nat64: false,
+                    nptv6: false,
+                },
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("lan"),
+                egress_zone: Arc::<str>::from("wan"),
+                owner_rg_id: 0,
+                is_reverse: false,
+                synced: true,
+                nat64_reverse: None,
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        publish_shared_session(&shared_sessions, &shared_nat_sessions, &entry);
+
+        let icmp_match = try_embedded_icmp_nat_match_from_frame(
+            &frame,
+            meta,
+            &mut sessions,
+            &forwarding,
+            &neighbors,
+            &shared_sessions,
+            &shared_nat_sessions,
+            1_000_000,
+        )
+        .expect("shared NAT session should match embedded ICMP");
+
+        assert_eq!(icmp_match.original_src, IpAddr::V4(client_ip));
+        assert_eq!(icmp_match.original_src_port, client_port);
+        assert_eq!(icmp_match.nat.rewrite_src, Some(IpAddr::V4(snat_ip)));
+        assert_eq!(icmp_match.resolution.egress_ifindex, 24);
+        assert_eq!(icmp_match.resolution.tx_ifindex, 24);
+        assert_eq!(
+            icmp_match.resolution.neighbor_mac,
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+    }
+
+    #[test]
     fn embedded_icmp_nat_match_ignores_non_error_echo() {
         let client_ip = Ipv4Addr::new(10, 0, 61, 102);
         let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
@@ -12774,7 +12969,8 @@ mod tests {
 
     #[test]
     fn maybe_reinject_slow_path_ignores_forward_candidate_disposition() {
-        let frame = build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
+        let frame =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
         let mut area = MmapArea::new(4096).expect("mmap");
         area.slice_mut(0, frame.len())
             .expect("slice")
@@ -12893,7 +13089,8 @@ mod tests {
 
     #[test]
     fn maybe_reinject_slow_path_from_frame_records_unavailable() {
-        let frame = build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
+        let frame =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
         let binding = BindingIdentity {
             slot: 7,
             queue_id: 0,
@@ -12944,5 +13141,136 @@ mod tests {
         let last = exceptions.back().expect("exception recorded");
         assert_eq!(last.reason, "slow_path_unavailable");
         assert_eq!(last.ifindex, 6);
+    }
+
+    #[test]
+    fn handle_forward_build_failure_records_build_and_slow_path_failures() {
+        let frame =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
+        let binding = BindingIdentity {
+            slot: 7,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-2"),
+            ifindex: 6,
+        };
+        let live = BindingLiveState::new();
+        let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::NoRoute,
+                local_ifindex: 0,
+                egress_ifindex: 0,
+                tx_ifindex: 0,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+        let mut dbg = DebugPollCounters::default();
+
+        handle_forward_build_failure(
+            &binding,
+            &live,
+            None,
+            &recent_exceptions,
+            &mut dbg,
+            6,
+            frame.len() as u32,
+            &frame,
+            meta,
+            decision,
+            true,
+        );
+
+        assert_eq!(dbg.build_fail, 1);
+        assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 0);
+        assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 1);
+        let reasons: Vec<String> = recent_exceptions
+            .lock()
+            .expect("exceptions")
+            .iter()
+            .map(|entry| entry.reason.clone())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec!["forward_build_failed", "slow_path_unavailable"]
+        );
+    }
+
+    #[test]
+    fn handle_forward_build_failure_without_fallback_only_records_build_failure() {
+        let frame =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
+        let binding = BindingIdentity {
+            slot: 7,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-2"),
+            ifindex: 6,
+        };
+        let live = BindingLiveState::new();
+        let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+                neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+                src_mac: Some([6, 7, 8, 9, 10, 11]),
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+        let mut dbg = DebugPollCounters::default();
+
+        handle_forward_build_failure(
+            &binding,
+            &live,
+            None,
+            &recent_exceptions,
+            &mut dbg,
+            12,
+            frame.len() as u32,
+            &frame,
+            meta,
+            decision,
+            false,
+        );
+
+        assert_eq!(dbg.build_fail, 1);
+        assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 0);
+        assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 0);
+        let reasons: Vec<String> = recent_exceptions
+            .lock()
+            .expect("exceptions")
+            .iter()
+            .map(|entry| entry.reason.clone())
+            .collect();
+        assert_eq!(reasons, vec!["forward_build_failed"]);
     }
 }
