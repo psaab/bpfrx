@@ -90,12 +90,15 @@ The validator does this in order:
 8. runs deterministic TTL-expired probes to:
    - IPv4 `1.1.1.1`
    - IPv6 `2607:f8b0:4005:814::200e`
+   - the validator treats `ping` exit status `1` as expected for these probes
+     when the returned output contains the native time-exceeded response
 9. records one-cycle `mtr` reports to those same public IPv4/IPv6 targets
 10. fails if the first hop is unresolved or the destination hop is unresolved
 11. runs one unmeasured warm-up `iperf3` pass for IPv4 and IPv6
 12. runs repeated IPv4 `iperf3` to `172.16.80.200`
 13. runs repeated IPv6 `iperf3` to `2001:559:8585:80::200`
-14. parses per-interval `iperf3 -J` output and fails if throughput cliffs after startup
+14. pulls `iperf3 -J` JSON back to the repo host, parses it locally, and fails
+    if throughput cliffs after startup
 15. retries one marginal near-threshold miss once
 16. optionally records `perf` data on the active firewall
 
@@ -139,12 +142,29 @@ It does not require every internet hop to answer. It does require:
   - `1.1.1.1`
   - `2607:f8b0:4005:814::200e`
 
+For the TTL / hop-limit probes, a non-zero `ping` exit code is not itself a
+failure. The validator accepts the probe when the returned output contains the
+expected native time-exceeded text from the userspace firewall.
+
 Artifacts kept on `cluster-userspace-host`:
 
 - `/tmp/userspace-ttl-v4.txt`
 - `/tmp/userspace-ttl-v6.txt`
 - `/tmp/userspace-mtr-v4.txt`
 - `/tmp/userspace-mtr-v6.txt`
+- `/tmp/ipv4-*.json`
+- `/tmp/ipv6-*.json`
+
+The `cluster-userspace-host` only needs the runtime tools used to generate the
+artifacts:
+
+- `ping`
+- `mtr`
+- `iperf3`
+
+The interval-collapse analysis runs on the repo host using
+[iperf-json-metrics.py](/home/ps/git/codex-bpfrx/scripts/iperf-json-metrics.py),
+so the cluster test host does not need `python3`.
 
 Short-lived outliers can still happen immediately after rolling deploy while HA
 ownership and RA converge. That is why the validator explicitly waits for IPv6

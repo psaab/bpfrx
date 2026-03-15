@@ -42,17 +42,24 @@ What the script enforces:
 - deterministic TTL-expired probes must work to:
   - `1.1.1.1`
   - `2607:f8b0:4005:814::200e`
+  - `ping` exit status `1` is expected for these probes if the returned output
+    contains the native time-exceeded response
 - one-cycle `mtr` reports to those two targets must show:
   - a resolved first hop
   - a resolved destination hop
 - one unmeasured warm-up `iperf3` pass is run for each address family
 - repeated IPv4 `iperf3` to `172.16.80.200` must stay above threshold
 - repeated IPv6 `iperf3` to `2001:559:8585:80::200` must stay above threshold
-- per-interval `iperf3 -J` output is parsed and a run fails if it starts fast and then collapses
+- per-interval `iperf3 -J` output is copied back to the repo host, parsed
+  locally, and a run fails if it starts fast and then collapses
 - one marginal near-threshold miss is retried once before the run is treated as failed
 - optional `perf` capture runs on the active userspace firewall, not a hardcoded node
 
 Use `scripts/userspace-ha-validation.sh` directly only when you are debugging the validator itself.
+
+`cluster-userspace-host` only needs `ping`, `mtr`, and `iperf3`. The JSON
+interval analysis runs on the repo host with `scripts/iperf-json-metrics.py`,
+so do not assume `python3` exists on the test host.
 
 Use `scripts/userspace-perf-compare.sh` when validation is failing or when you need fresh IPv4/IPv6 hotspot data without the validator's throughput gates. Read [docs/userspace-perf-compare.md](/home/ps/git/codex-bpfrx/docs/userspace-perf-compare.md) for the exact artifact layout and interpretation.
 
