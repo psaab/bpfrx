@@ -588,9 +588,11 @@ pub(super) fn transmit_prepared_batch(
     let mut retry_tail = Vec::new();
     for (idx, req) in binding.scratch_prepared_tx.drain(..).enumerate() {
         if idx < inserted as usize {
-            binding
-                .in_flight_prepared_recycles
-                .insert(req.offset, req.recycle);
+            if let PreparedTxRecycle::FillOnSlot(_) = req.recycle {
+                binding
+                    .in_flight_prepared_recycles
+                    .insert(req.offset, req.recycle);
+            }
             sent_packets += 1;
             sent_bytes += req.len as u64;
         } else {

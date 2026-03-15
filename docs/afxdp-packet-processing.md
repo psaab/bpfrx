@@ -47,8 +47,8 @@ WorkerUmem {
 Current live behavior on the userspace HA lab is:
 
 1. `mlx5_core` ingress bindings use the UMEM-owner zerocopy path.
-2. `virtio_net` fabric bindings use the UMEM-owner copy-mode path with
-   `bind_flags=0`.
+2. `virtio_net` fabric bindings use the UMEM-owner auto-mode path with
+   `bind_flags=0`, which resolves to copy mode in this environment.
 
 That split was validated live during the Phase 2 cleanup work.  The failed
 `virtio_net` separate-owner probe was removed from the active strategy because
