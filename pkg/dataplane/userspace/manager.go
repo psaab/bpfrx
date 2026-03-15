@@ -96,14 +96,11 @@ func (m *Manager) Teardown() error {
 }
 
 func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
-	caps := deriveUserspaceCapabilities(cfg)
-	if caps.ForwardingSupported {
-		m.inner.XDPEntryProg = "xdp_userspace_prog"
-	} else {
-		// Unsupported configs must remain on the existing XDP dataplane
-		// until the userspace runtime can own forwarding safely.
-		m.inner.XDPEntryProg = "xdp_main_prog"
-	}
+	// Always start with xdp_main_prog. The userspace XDP shim is loaded
+	// dynamically when forwarding_armed transitions to true (via
+	// syncDesiredForwardingStateLocked). This ensures the eBPF pipeline
+	// handles all traffic during startup and HA failover.
+	m.inner.XDPEntryProg = "xdp_main_prog"
 	result, err := m.inner.Compile(cfg)
 	if err != nil {
 		return nil, err
@@ -2133,6 +2130,19 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 	desired := m.desiredForwardingArmedLocked()
 	if m.lastStatus.ForwardingArmed == desired {
 		return nil
+	}
+	// Swap XDP entry program: when armed, use the userspace XDP shim
+	// so AF_XDP sockets receive transit traffic. When not armed (HA
+	// secondary), use xdp_main_prog so the eBPF pipeline handles
+	// everything (including embedded ICMP NAT reversal for mtr).
+	if desired && m.lastStatus.Capabilities.ForwardingSupported {
+		if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+			slog.Warn("failed to swap to userspace XDP shim", "err", err)
+		}
+	} else {
+		if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
+			slog.Warn("failed to swap to xdp_main_prog", "err", err)
+		}
 	}
 	var status ProcessStatus
 	req := ControlRequest{

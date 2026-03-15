@@ -145,6 +145,31 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 	return nil
 }
 
+// SwapXDPEntryProg atomically replaces the XDP entry program on all
+// attached interfaces. Used to switch between the userspace XDP shim
+// and xdp_main_prog based on HA forwarding state.
+func (m *Manager) SwapXDPEntryProg(name string) error {
+	prog, ok := m.programs[name]
+	if !ok {
+		return fmt.Errorf("XDP program %q not found", name)
+	}
+	if m.XDPEntryProg == name {
+		return nil // already using this program
+	}
+	var errs []error
+	for ifindex, l := range m.xdpLinks {
+		if err := l.Update(prog); err != nil {
+			errs = append(errs, fmt.Errorf("swap XDP on ifindex %d: %w", ifindex, err))
+		}
+	}
+	if len(errs) > 0 {
+		return errs[0]
+	}
+	m.XDPEntryProg = name
+	slog.Info("swapped XDP entry program", "program", name, "interfaces", len(m.xdpLinks))
+	return nil
+}
+
 // DetachXDP detaches the XDP program from the given interface and
 // removes its pin file.
 func (m *Manager) DetachXDP(ifindex int) error {
