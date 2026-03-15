@@ -2612,20 +2612,35 @@ fn poll_binding(
                             // Embedded ICMP NAT reversal: runs for ANY disposition
                             // because the SNAT'd destination resolves as MissingNeighbor
                             // (the firewall's own address has no ARP entry).
+                            // DEBUG: log ALL session misses to see what arrives
+                            {
+                                static MISS_LOG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                let c = MISS_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if c < 50 {
+                                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/icmp_te_debug.log") {
+                                        use std::io::Write;
+                                        let _ = writeln!(f, "SESS_MISS[{}]: proto={} af={} src={} dst={} disp={:?} allow_emb={} is_icmp={}",
+                                            c, meta.protocol, meta.addr_family, flow.src_ip, flow.dst_ip,
+                                            resolution.disposition, forwarding.allow_embedded_icmp,
+                                            matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6));
+                                    }
+                                }
+                            }
+                            // Go directly to nat_match (includes cross-worker shared
+                            // session lookup) — skip the per-worker-only pre-check.
                             if forwarding.allow_embedded_icmp
                                     && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
-                                    && try_embedded_icmp_session_match(
-                                        unsafe { &*area },
-                                        desc,
-                                        meta,
-                                        sessions,
-                                        now_ns,
-                                    )
-                                    .is_some()
                                 {
-                                    // ICMP error with an embedded packet matching an existing
-                                    // session. Attempt NAT reversal if the session has SNAT.
-                                    eprintln!("ICMP_TE_MATCH: embedded session found, attempting NAT reversal");
+                                    // DEBUG: write to file to confirm this code path executes
+                                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/icmp_te_debug.log") {
+                                        use std::io::Write;
+                                        let _ = writeln!(f, "ICMP_TE: proto={} type={} src={} dst={} af={}",
+                                            meta.protocol, if meta.l4_offset as usize <= (desc.len as usize).saturating_sub(1) {
+                                                unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
+                                                    .and_then(|fr| fr.get(meta.l4_offset as usize).copied()).unwrap_or(255)
+                                            } else { 255 },
+                                            flow.src_ip, flow.dst_ip, meta.addr_family);
+                                    }
                                     if let Some(icmp_match) = try_embedded_icmp_nat_match(
                                         unsafe { &*area },
                                         desc,
@@ -2689,7 +2704,10 @@ fn poll_binding(
                                             }
                                         }
                                     } else {
-                                        eprintln!("ICMP_TE_MATCH: nat_match returned None (no forward session found via NAT reverse index)");
+                                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/icmp_te_debug.log") {
+                                            use std::io::Write;
+                                            let _ = writeln!(f, "ICMP_TE_NAT_MISS: no forward session via NAT reverse index");
+                                        }
                                     }
                                     // Permit without policy check or session install.
                                     // If NAT reversal was applied, the prebuilt frame

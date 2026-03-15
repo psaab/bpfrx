@@ -279,7 +279,13 @@ pub fn xdp_userspace_prog(ctx: XdpContext) -> u32 {
 fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let ctrl = USERSPACE_CTRL.get(0).ok_or(0i64)?;
     if ctrl.enabled == 0 || ctrl.metadata_version != USERSPACE_META_VERSION as u32 {
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
+        // Use cpumap_or_pass instead of fallback_to_main because the
+        // tail-call to xdp_main_prog is unreliable (aya-ebpf framework
+        // silently drops packets when the tail-call fails). cpumap
+        // delivers to a different CPU where the cpumap entry program
+        // runs the eBPF pipeline. XDP_PASS goes directly to kernel.
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
+        return Ok(cpumap_or_pass(ctrl));
     }
 
     let data = ctx.data();
@@ -293,7 +299,8 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         _ => return Ok(cpumap_or_pass(ctrl)),
     };
     let Some(parsed) = parsed else {
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_PARSE_FAIL);
+        return Ok(cpumap_or_pass(ctrl));
     };
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
@@ -409,7 +416,8 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_EARLY_FILTER,
             &parsed,
         );
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_EARLY_FILTER);
+        return Ok(cpumap_or_pass(ctrl));
     }
     // Fast path: for established TCP/UDP sessions, skip LOCAL and
     // INTERFACE_NAT hash map lookups — if the session exists, the
@@ -453,12 +461,14 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
     if adjust_rc != 0 {
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_ADJUST_META);
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_ADJUST_META);
+        return Ok(cpumap_or_pass(ctrl));
     }
 
     let meta_ptr = ctx.metadata() as *mut UserspaceDpMeta;
     if (meta_ptr as usize).saturating_add(mem::size_of::<UserspaceDpMeta>()) > ctx.metadata_end() {
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_META_BOUNDS);
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_META_BOUNDS);
+        return Ok(cpumap_or_pass(ctrl));
     }
 
     unsafe {
@@ -519,7 +529,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 incr_fallback_stat(USERSPACE_FALLBACK_REASON_REDIRECT_ERR);
                 return Ok(xdp_action::XDP_DROP);
             }
-            fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_REDIRECT_ERR)
+            {
+                incr_fallback_stat(USERSPACE_FALLBACK_REASON_REDIRECT_ERR);
+                Ok(cpumap_or_pass(ctrl))
+            }
         }
     }
 }
