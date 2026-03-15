@@ -12732,4 +12732,217 @@ mod tests {
             "should return None when no session matches"
         );
     }
+
+    #[test]
+    fn embedded_icmp_nat_match_ignores_non_error_echo() {
+        let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
+        let frame = build_icmp_echo_frame_v4(client_ip, dst_ip, 64);
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+
+        let mut sessions = SessionTable::new();
+        let forwarding = ForwardingState::default();
+        let neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+
+        let result = try_embedded_icmp_nat_match_from_frame(
+            &frame,
+            meta,
+            &mut sessions,
+            &forwarding,
+            &neighbors,
+            &shared_sessions,
+            &shared_nat_sessions,
+            1_000_000,
+        );
+        assert!(
+            result.is_none(),
+            "non-error ICMP echo should not trigger embedded NAT reversal"
+        );
+    }
+
+    #[test]
+    fn maybe_reinject_slow_path_ignores_forward_candidate_disposition() {
+        let frame = build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+
+        let binding = BindingIdentity {
+            slot: 3,
+            queue_id: 2,
+            worker_id: 1,
+            interface: Arc::<str>::from("ge-0-0-1"),
+            ifindex: 5,
+        };
+        let live = BindingLiveState::new();
+        let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 6,
+                tx_ifindex: 6,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+                neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+                src_mac: Some([6, 7, 8, 9, 10, 11]),
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+
+        maybe_reinject_slow_path(
+            &binding,
+            &live,
+            None,
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            decision,
+            &recent_exceptions,
+        );
+
+        assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 0);
+        assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 0);
+        assert!(recent_exceptions.lock().expect("exceptions").is_empty());
+    }
+
+    #[test]
+    fn maybe_reinject_slow_path_records_extract_failure_for_invalid_desc() {
+        let area = MmapArea::new(128).expect("mmap");
+        let binding = BindingIdentity {
+            slot: 3,
+            queue_id: 2,
+            worker_id: 1,
+            interface: Arc::<str>::from("ge-0-0-1"),
+            ifindex: 5,
+        };
+        let live = BindingLiveState::new();
+        let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::NoRoute,
+                local_ifindex: 0,
+                egress_ifindex: 0,
+                tx_ifindex: 0,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+
+        maybe_reinject_slow_path(
+            &binding,
+            &live,
+            None,
+            &area,
+            XdpDesc {
+                addr: 512,
+                len: 96,
+                options: 0,
+            },
+            meta,
+            decision,
+            &recent_exceptions,
+        );
+
+        assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 1);
+        let exceptions = recent_exceptions.lock().expect("exceptions");
+        let last = exceptions.back().expect("exception recorded");
+        assert_eq!(last.reason, "slow_path_extract_failed");
+        assert_eq!(last.packet_length, 96);
+    }
+
+    #[test]
+    fn maybe_reinject_slow_path_from_frame_records_unavailable() {
+        let frame = build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
+        let binding = BindingIdentity {
+            slot: 7,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-2"),
+            ifindex: 6,
+        };
+        let live = BindingLiveState::new();
+        let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::NoRoute,
+                local_ifindex: 0,
+                egress_ifindex: 0,
+                tx_ifindex: 0,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+
+        maybe_reinject_slow_path_from_frame(
+            &binding,
+            &live,
+            None,
+            &frame,
+            meta,
+            decision,
+            &recent_exceptions,
+            "forward_build_slow_path",
+        );
+
+        assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 0);
+        assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 1);
+        let exceptions = recent_exceptions.lock().expect("exceptions");
+        let last = exceptions.back().expect("exception recorded");
+        assert_eq!(last.reason, "slow_path_unavailable");
+        assert_eq!(last.ifindex, 6);
+    }
 }

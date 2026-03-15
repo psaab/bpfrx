@@ -425,6 +425,11 @@ Completed so far:
    time-exceeded response.
 5. On the current branch, `iperf3 -J` output is now analyzed on the repo host
    instead of assuming `python3` exists on `cluster-userspace-host`.
+6. On the current branch, direct regression coverage was added for:
+   - non-error ICMP packets not triggering embedded NAT reversal
+   - slow-path fallback no-op behavior for forward-candidate traffic
+   - slow-path extract-failure accounting
+   - slow-path unavailable accounting
 
 Delivered in:
 
@@ -435,8 +440,10 @@ Delivered in:
 Still left:
 
 1. Add more direct regression coverage for tuple authority and embedded ICMP
-   corner cases.
-2. Add coverage for AF_XDP build-failure fallback behavior.
+   corner cases beyond the current non-error / no-match coverage.
+2. Add end-to-end regression coverage for the specific AF_XDP forward-build
+   failure path inside `enqueue_pending_forwards`, not just the lower-level
+   slow-path fallback helpers.
 3. Keep synchronized capture workflows available as diagnosis tools, not first
    line validation.
 
