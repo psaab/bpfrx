@@ -7775,12 +7775,21 @@ fn try_embedded_icmp_session_match_from_frame(
                     protocol: emb_protocol,
                     src_ip: emb_dst,
                     dst_ip: emb_src,
-                    src_port: emb_dst_port,
-                    dst_port: emb_src_port,
+                    src_port: if matches!(emb_protocol, PROTO_ICMP) { emb_src_port } else { emb_dst_port },
+                    dst_port: if matches!(emb_protocol, PROTO_ICMP) { emb_dst_port } else { emb_src_port },
                 };
                 sessions.lookup(&reversed, now_ns, 0)
             }).or_else(|| {
-                sessions.find_forward_nat_match(&embedded_key).map(|m| {
+                // NAT reverse index: swap to reply format
+                let reply_key = SessionKey {
+                    addr_family: libc::AF_INET as u8,
+                    protocol: emb_protocol,
+                    src_ip: emb_dst,
+                    dst_ip: emb_src,
+                    src_port: if matches!(emb_protocol, PROTO_ICMP) { emb_src_port } else { emb_dst_port },
+                    dst_port: if matches!(emb_protocol, PROTO_ICMP) { emb_dst_port } else { emb_src_port },
+                };
+                sessions.find_forward_nat_match(&reply_key).map(|m| {
                     SessionLookup { decision: m.decision, metadata: m.metadata }
                 })
             })
@@ -7825,12 +7834,21 @@ fn try_embedded_icmp_session_match_from_frame(
                     protocol: emb_protocol,
                     src_ip: emb_dst,
                     dst_ip: emb_src,
-                    src_port: emb_dst_port,
-                    dst_port: emb_src_port,
+                    src_port: if matches!(emb_protocol, PROTO_ICMPV6) { emb_src_port } else { emb_dst_port },
+                    dst_port: if matches!(emb_protocol, PROTO_ICMPV6) { emb_dst_port } else { emb_src_port },
                 };
                 sessions.lookup(&reversed, now_ns, 0)
             }).or_else(|| {
-                sessions.find_forward_nat_match(&embedded_key).map(|m| {
+                // NAT reverse index: swap to reply format
+                let reply_key = SessionKey {
+                    addr_family: libc::AF_INET6 as u8,
+                    protocol: emb_protocol,
+                    src_ip: emb_dst,
+                    dst_ip: emb_src,
+                    src_port: if matches!(emb_protocol, PROTO_ICMPV6) { emb_src_port } else { emb_dst_port },
+                    dst_port: if matches!(emb_protocol, PROTO_ICMPV6) { emb_dst_port } else { emb_src_port },
+                };
+                sessions.find_forward_nat_match(&reply_key).map(|m| {
                     SessionLookup { decision: m.decision, metadata: m.metadata }
                 })
             })
@@ -7918,8 +7936,6 @@ fn try_embedded_icmp_nat_match_from_frame(
                 (0, 0)
             };
             // The embedded packet is the original outgoing packet (post-SNAT).
-            // The forward session key is: src=original_client, dst=emb_dst.
-            // The NAT reverse index maps: SNAT'd tuple -> forward session key.
             let embedded_key = SessionKey {
                 addr_family: libc::AF_INET as u8,
                 protocol: emb_protocol,
@@ -7928,8 +7944,18 @@ fn try_embedded_icmp_nat_match_from_frame(
                 src_port: emb_src_port,
                 dst_port: emb_dst_port,
             };
+            // The NAT reverse index is keyed by the *reply* tuple
+            // (src=remote, dst=SNAT'd), so swap src/dst.
+            let reply_key = SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: emb_protocol,
+                src_ip: emb_dst,
+                dst_ip: emb_src,
+                src_port: if matches!(emb_protocol, PROTO_ICMP) { emb_src_port } else { emb_dst_port },
+                dst_port: if matches!(emb_protocol, PROTO_ICMP) { emb_dst_port } else { emb_src_port },
+            };
             // Try NAT reverse index first (most common: embedded src is SNAT'd).
-            let forward_match = sessions.find_forward_nat_match(&embedded_key);
+            let forward_match = sessions.find_forward_nat_match(&reply_key);
             if let Some(fwd) = forward_match {
                 let nat = fwd.decision.nat;
                 // The forward session's src_ip is the original client.
@@ -8008,7 +8034,16 @@ fn try_embedded_icmp_nat_match_from_frame(
                 src_port: emb_src_port,
                 dst_port: emb_dst_port,
             };
-            let forward_match = sessions.find_forward_nat_match(&embedded_key);
+            // Swap to reply key format (NAT reverse index is keyed by reply tuple)
+            let reply_key = SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: emb_protocol,
+                src_ip: emb_dst,
+                dst_ip: emb_src,
+                src_port: if matches!(emb_protocol, PROTO_ICMPV6) { emb_src_port } else { emb_dst_port },
+                dst_port: if matches!(emb_protocol, PROTO_ICMPV6) { emb_dst_port } else { emb_src_port },
+            };
+            let forward_match = sessions.find_forward_nat_match(&reply_key);
             if let Some(fwd) = forward_match {
                 let nat = fwd.decision.nat;
                 let original_src = fwd.key.src_ip;
