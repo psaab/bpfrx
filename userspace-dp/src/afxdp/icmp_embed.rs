@@ -98,49 +98,15 @@ pub(super) fn try_embedded_icmp_session_match_from_frame(
                 src_port: emb_src_port,
                 dst_port: emb_dst_port,
             };
-            sessions
-                .lookup(&embedded_key, now_ns, 0)
-                .or_else(|| {
-                    let reversed = SessionKey {
-                        addr_family: libc::AF_INET as u8,
-                        protocol: emb_protocol,
-                        src_ip: emb_dst,
-                        dst_ip: emb_src,
-                        src_port: if matches!(emb_protocol, PROTO_ICMP) {
-                            emb_src_port
-                        } else {
-                            emb_dst_port
-                        },
-                        dst_port: if matches!(emb_protocol, PROTO_ICMP) {
-                            emb_dst_port
-                        } else {
-                            emb_src_port
-                        },
-                    };
-                    sessions.lookup(&reversed, now_ns, 0)
-                })
-                .or_else(|| {
-                    let reply_key = SessionKey {
-                        addr_family: libc::AF_INET as u8,
-                        protocol: emb_protocol,
-                        src_ip: emb_dst,
-                        dst_ip: emb_src,
-                        src_port: if matches!(emb_protocol, PROTO_ICMP) {
-                            emb_src_port
-                        } else {
-                            emb_dst_port
-                        },
-                        dst_port: if matches!(emb_protocol, PROTO_ICMP) {
-                            emb_dst_port
-                        } else {
-                            emb_src_port
-                        },
-                    };
-                    sessions.find_forward_nat_match(&reply_key).map(|m| SessionLookup {
-                        decision: m.decision,
-                        metadata: m.metadata,
-                    })
-                })
+            let reverse_key = embedded_reply_key(
+                libc::AF_INET as u8,
+                emb_protocol,
+                emb_src,
+                emb_dst,
+                emb_src_port,
+                emb_dst_port,
+            );
+            lookup_embedded_session(sessions, &embedded_key, &reverse_key, now_ns)
         }
         PROTO_ICMPV6 => {
             if frame.len() < embedded_ip_start + 48 {
@@ -176,49 +142,15 @@ pub(super) fn try_embedded_icmp_session_match_from_frame(
                 src_port: emb_src_port,
                 dst_port: emb_dst_port,
             };
-            sessions
-                .lookup(&embedded_key, now_ns, 0)
-                .or_else(|| {
-                    let reversed = SessionKey {
-                        addr_family: libc::AF_INET6 as u8,
-                        protocol: emb_protocol,
-                        src_ip: emb_dst,
-                        dst_ip: emb_src,
-                        src_port: if matches!(emb_protocol, PROTO_ICMPV6) {
-                            emb_src_port
-                        } else {
-                            emb_dst_port
-                        },
-                        dst_port: if matches!(emb_protocol, PROTO_ICMPV6) {
-                            emb_dst_port
-                        } else {
-                            emb_src_port
-                        },
-                    };
-                    sessions.lookup(&reversed, now_ns, 0)
-                })
-                .or_else(|| {
-                    let reply_key = SessionKey {
-                        addr_family: libc::AF_INET6 as u8,
-                        protocol: emb_protocol,
-                        src_ip: emb_dst,
-                        dst_ip: emb_src,
-                        src_port: if matches!(emb_protocol, PROTO_ICMPV6) {
-                            emb_src_port
-                        } else {
-                            emb_dst_port
-                        },
-                        dst_port: if matches!(emb_protocol, PROTO_ICMPV6) {
-                            emb_dst_port
-                        } else {
-                            emb_src_port
-                        },
-                    };
-                    sessions.find_forward_nat_match(&reply_key).map(|m| SessionLookup {
-                        decision: m.decision,
-                        metadata: m.metadata,
-                    })
-                })
+            let reverse_key = embedded_reply_key(
+                libc::AF_INET6 as u8,
+                emb_protocol,
+                emb_src,
+                emb_dst,
+                emb_src_port,
+                emb_dst_port,
+            );
+            lookup_embedded_session(sessions, &embedded_key, &reverse_key, now_ns)
         }
         _ => None,
     }
@@ -317,23 +249,19 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                 src_port: emb_src_port,
                 dst_port: emb_dst_port,
             };
-            let reply_key = SessionKey {
-                addr_family: libc::AF_INET as u8,
-                protocol: emb_protocol,
-                src_ip: emb_dst,
-                dst_ip: emb_src,
-                src_port: if matches!(emb_protocol, PROTO_ICMP) {
-                    emb_src_port
-                } else {
-                    emb_dst_port
-                },
-                dst_port: if matches!(emb_protocol, PROTO_ICMP) {
-                    emb_dst_port
-                } else {
-                    emb_src_port
-                },
-            };
-            if let Some(fwd) = sessions.find_forward_nat_match(&reply_key) {
+            let reverse_key = embedded_reply_key(
+                libc::AF_INET as u8,
+                emb_protocol,
+                emb_src,
+                emb_dst,
+                emb_src_port,
+                emb_dst_port,
+            );
+            if let Some(fwd) = lookup_forward_nat_across_scopes(
+                sessions,
+                shared_nat_sessions,
+                &reverse_key,
+            ) {
                 let nat = fwd.decision.nat;
                 let original_src = fwd.key.src_ip;
                 let original_src_port = fwd.key.src_port;
@@ -356,44 +284,13 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                     metadata: fwd.metadata,
                 });
             }
-            let shared_nat_entry = shared_nat_sessions
-                .lock()
-                .ok()
-                .and_then(|nat_sessions| nat_sessions.get(&reply_key).cloned());
-            if let Some(entry) = shared_nat_entry {
-                let nat = entry.decision.nat;
-                let original_src = entry.key.src_ip;
-                let original_src_port = entry.key.src_port;
-                let resolution = embedded_icmp_return_resolution_from_shared(
-                    shared_sessions,
-                    forwarding,
-                    dynamic_neighbors,
-                    &entry.key,
-                    entry.decision,
-                    original_src,
-                );
-                return Some(EmbeddedIcmpMatch {
-                    nat,
-                    original_src,
-                    original_src_port,
-                    embedded_proto: emb_protocol,
-                    resolution,
-                    metadata: entry.metadata.clone(),
-                });
-            }
-            let lookup = sessions.lookup(&embedded_key, now_ns, 0).or_else(|| {
-                let reversed = SessionKey {
-                    addr_family: libc::AF_INET as u8,
-                    protocol: emb_protocol,
-                    src_ip: emb_dst,
-                    dst_ip: emb_src,
-                    src_port: emb_dst_port,
-                    dst_port: emb_src_port,
-                };
-                sessions.lookup(&reversed, now_ns, 0)
-            });
-            lookup.map(|sl| {
-                let resolution = if sl.metadata.is_reverse {
+            lookup_session_across_scopes(sessions, shared_sessions, &embedded_key, now_ns, 0)
+                .or_else(|| {
+                    lookup_session_across_scopes(sessions, shared_sessions, &reverse_key, now_ns, 0)
+                })
+                .map(|resolved| {
+                    let sl = resolved.lookup;
+                    let resolution = if sl.metadata.is_reverse {
                     sl.decision.resolution
                 } else {
                     embedded_icmp_return_resolution(
@@ -408,7 +305,7 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                     )
                 };
                 EmbeddedIcmpMatch {
-                    nat: NatDecision::default(),
+                    nat: sl.decision.nat,
                     original_src: emb_src,
                     original_src_port: emb_src_port,
                     embedded_proto: emb_protocol,
@@ -454,23 +351,19 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                 src_port: emb_src_port,
                 dst_port: emb_dst_port,
             };
-            let reply_key = SessionKey {
-                addr_family: libc::AF_INET6 as u8,
-                protocol: emb_protocol,
-                src_ip: emb_dst,
-                dst_ip: IpAddr::V6(emb_src_wire),
-                src_port: if matches!(emb_protocol, PROTO_ICMPV6) {
-                    emb_src_port
-                } else {
-                    emb_dst_port
-                },
-                dst_port: if matches!(emb_protocol, PROTO_ICMPV6) {
-                    emb_dst_port
-                } else {
-                    emb_src_port
-                },
-            };
-            if let Some(fwd) = sessions.find_forward_nat_match(&reply_key) {
+            let reverse_key = embedded_reply_key(
+                libc::AF_INET6 as u8,
+                emb_protocol,
+                emb_src_wire.into(),
+                emb_dst,
+                emb_src_port,
+                emb_dst_port,
+            );
+            if let Some(fwd) = lookup_forward_nat_across_scopes(
+                sessions,
+                shared_nat_sessions,
+                &reverse_key,
+            ) {
                 let nat = fwd.decision.nat;
                 let original_src = fwd.key.src_ip;
                 let original_src_port = fwd.key.src_port;
@@ -493,44 +386,27 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                     metadata: fwd.metadata,
                 });
             }
-            let shared_nat_entry = shared_nat_sessions
-                .lock()
-                .ok()
-                .and_then(|nat_sessions| nat_sessions.get(&reply_key).cloned());
-            if let Some(entry) = shared_nat_entry {
-                let nat = entry.decision.nat;
-                let original_src = entry.key.src_ip;
-                let original_src_port = entry.key.src_port;
-                let resolution = embedded_icmp_return_resolution_from_shared(
-                    shared_sessions,
-                    forwarding,
-                    dynamic_neighbors,
-                    &entry.key,
-                    entry.decision,
-                    original_src,
-                );
-                return Some(EmbeddedIcmpMatch {
-                    nat,
-                    original_src,
-                    original_src_port,
-                    embedded_proto: emb_protocol,
-                    resolution,
-                    metadata: entry.metadata.clone(),
-                });
-            }
-            let lookup = sessions.lookup(&embedded_key, now_ns, 0).or_else(|| {
-                let reversed = SessionKey {
-                    addr_family: libc::AF_INET6 as u8,
-                    protocol: emb_protocol,
-                    src_ip: emb_dst,
-                    dst_ip: emb_src_lookup,
-                    src_port: emb_dst_port,
-                    dst_port: emb_src_port,
-                };
-                sessions.lookup(&reversed, now_ns, 0)
-            });
-            lookup.map(|sl| {
-                let resolution = if sl.metadata.is_reverse {
+            lookup_session_across_scopes(sessions, shared_sessions, &embedded_key, now_ns, 0)
+                .or_else(|| {
+                    let shared_reverse_key = embedded_reply_key(
+                        libc::AF_INET6 as u8,
+                        emb_protocol,
+                        emb_src_lookup,
+                        emb_dst,
+                        emb_src_port,
+                        emb_dst_port,
+                    );
+                    lookup_session_across_scopes(
+                        sessions,
+                        shared_sessions,
+                        &shared_reverse_key,
+                        now_ns,
+                        0,
+                    )
+                })
+                .map(|resolved| {
+                    let sl = resolved.lookup;
+                    let resolution = if sl.metadata.is_reverse {
                     sl.decision.resolution
                 } else {
                     embedded_icmp_return_resolution(
@@ -569,34 +445,57 @@ fn embedded_icmp_return_resolution(
     now_ns: u64,
 ) -> ForwardingResolution {
     let reverse_key = reverse_session_key(forward_key, forward_decision.nat);
-    if let Some(reverse) = sessions.lookup(&reverse_key, now_ns, 0) {
-        return reverse.decision.resolution;
-    }
-    embedded_icmp_return_resolution_from_shared(
-        shared_sessions,
-        forwarding,
-        dynamic_neighbors,
-        forward_key,
-        forward_decision,
-        original_src,
-    )
-}
-
-fn embedded_icmp_return_resolution_from_shared(
-    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
-    forward_key: &SessionKey,
-    forward_decision: SessionDecision,
-    original_src: IpAddr,
-) -> ForwardingResolution {
-    let reverse_key = reverse_session_key(forward_key, forward_decision.nat);
-    if let Ok(sessions) = shared_sessions.lock()
-        && let Some(reverse) = sessions.get(&reverse_key)
+    if let Some(reverse) =
+        lookup_session_across_scopes(sessions, shared_sessions, &reverse_key, now_ns, 0)
     {
-        return reverse.decision.resolution;
+        return reverse.lookup.decision.resolution;
     }
     lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, original_src)
+}
+
+fn lookup_embedded_session(
+    sessions: &mut SessionTable,
+    embedded_key: &SessionKey,
+    reverse_key: &SessionKey,
+    now_ns: u64,
+) -> Option<SessionLookup> {
+    sessions
+        .lookup(embedded_key, now_ns, 0)
+        .or_else(|| sessions.lookup(reverse_key, now_ns, 0))
+        .or_else(|| {
+            sessions.find_forward_nat_match(reverse_key).map(|m| SessionLookup {
+                decision: m.decision,
+                metadata: m.metadata,
+            })
+        })
+}
+
+fn embedded_reply_key(
+    addr_family: u8,
+    protocol: u8,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+) -> SessionKey {
+    let (reply_src_port, reply_dst_port) =
+        embedded_reply_ports(protocol, src_port, dst_port);
+    SessionKey {
+        addr_family,
+        protocol,
+        src_ip: dst_ip,
+        dst_ip: src_ip,
+        src_port: reply_src_port,
+        dst_port: reply_dst_port,
+    }
+}
+
+fn embedded_reply_ports(protocol: u8, src_port: u16, dst_port: u16) -> (u16, u16) {
+    if matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        (src_port, dst_port)
+    } else {
+        (dst_port, src_port)
+    }
 }
 
 pub(super) fn build_nat_reversed_icmp_error_v4(

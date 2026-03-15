@@ -349,7 +349,221 @@ pub(super) fn lookup_shared_forward_nat_match(
         .and_then(|sessions| sessions.get(reply_key).cloned())
 }
 
-pub(super) fn repair_reverse_session_from_forward(
+#[derive(Clone, Debug)]
+pub(super) struct ResolvedSessionLookup {
+    pub(super) lookup: SessionLookup,
+    pub(super) shared_entry: Option<SyncedSessionEntry>,
+}
+
+impl ResolvedSessionLookup {
+    fn local(lookup: SessionLookup) -> Self {
+        Self {
+            lookup,
+            shared_entry: None,
+        }
+    }
+
+    fn shared(entry: SyncedSessionEntry) -> Self {
+        Self {
+            lookup: SessionLookup {
+                decision: entry.decision,
+                metadata: entry.metadata.clone(),
+            },
+            shared_entry: Some(entry),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ResolvedFlowSessionDecision {
+    pub(super) decision: SessionDecision,
+    pub(super) metadata: SessionMetadata,
+    pub(super) created: bool,
+}
+
+pub(super) fn lookup_session_across_scopes(
+    sessions: &mut SessionTable,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    key: &SessionKey,
+    now_ns: u64,
+    tcp_flags: u8,
+) -> Option<ResolvedSessionLookup> {
+    sessions
+        .lookup(key, now_ns, tcp_flags)
+        .map(ResolvedSessionLookup::local)
+        .or_else(|| lookup_shared_session(shared_sessions, key).map(ResolvedSessionLookup::shared))
+}
+
+pub(super) fn lookup_forward_nat_across_scopes(
+    sessions: &SessionTable,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    reply_key: &SessionKey,
+) -> Option<ForwardSessionMatch> {
+    sessions
+        .find_forward_nat_match(reply_key)
+        .or_else(|| {
+            lookup_shared_forward_nat_match(shared_nat_sessions, reply_key).map(|entry| {
+                ForwardSessionMatch {
+                    key: entry.key,
+                    decision: entry.decision,
+                    metadata: entry.metadata,
+                }
+            })
+        })
+}
+
+fn materialize_shared_session_hit(
+    sessions: &mut SessionTable,
+    resolved: &ResolvedSessionLookup,
+    now_ns: u64,
+    tcp_flags: u8,
+) -> SessionLookup {
+    if let Some(shared) = resolved.shared_entry.as_ref() {
+        let replica = synced_replica_entry(shared);
+        sessions.upsert_synced(
+            replica.key.clone(),
+            replica.decision,
+            replica.metadata.clone(),
+            now_ns,
+            replica.protocol,
+            tcp_flags,
+        );
+        return SessionLookup {
+            decision: replica.decision,
+            metadata: replica.metadata,
+        };
+    }
+    resolved.lookup.clone()
+}
+
+fn build_reverse_session_from_forward_match(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    forward_match: ForwardSessionMatch,
+    now_secs: u64,
+) -> SessionLookup {
+    let decision = SessionDecision {
+        resolution: enforce_ha_resolution_snapshot(
+            forwarding,
+            ha_state,
+            now_secs,
+            lookup_forwarding_resolution_with_dynamic(
+                forwarding,
+                dynamic_neighbors,
+                forward_match.key.src_ip,
+            ),
+        ),
+        nat: forward_match.decision.nat.reverse(
+            forward_match.key.src_ip,
+            forward_match.key.dst_ip,
+            forward_match.key.src_port,
+            forward_match.key.dst_port,
+        ),
+    };
+    let metadata = SessionMetadata {
+        ingress_zone: forward_match.metadata.egress_zone.clone(),
+        egress_zone: forward_match.metadata.ingress_zone.clone(),
+        owner_rg_id: forward_match.metadata.owner_rg_id,
+        is_reverse: true,
+        synced: false,
+        nat64_reverse: None,
+    };
+    SessionLookup { decision, metadata }
+}
+
+fn install_reverse_session_from_forward_match(
+    sessions: &mut SessionTable,
+    session_map_fd: c_int,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    reverse_key: &SessionKey,
+    forward_match: ForwardSessionMatch,
+    now_ns: u64,
+    now_secs: u64,
+    protocol: u8,
+    tcp_flags: u8,
+) -> SessionLookup {
+    let reverse = build_reverse_session_from_forward_match(
+        forwarding,
+        ha_state,
+        dynamic_neighbors,
+        forward_match,
+        now_secs,
+    );
+    if sessions.install_with_protocol(
+        reverse_key.clone(),
+        reverse.decision,
+        reverse.metadata.clone(),
+        now_ns,
+        protocol,
+        tcp_flags,
+    ) {
+        let _ = publish_live_session_key(session_map_fd, reverse_key);
+        let reverse_entry = SyncedSessionEntry {
+            key: reverse_key.clone(),
+            decision: reverse.decision,
+            metadata: reverse.metadata.clone(),
+            protocol,
+            tcp_flags,
+        };
+        publish_shared_session(shared_sessions, shared_nat_sessions, &reverse_entry);
+        replicate_session_upsert(peer_worker_commands, &reverse_entry);
+    }
+    reverse
+}
+
+fn maybe_promote_synced_session(
+    sessions: &mut SessionTable,
+    session_map_fd: c_int,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    forwarding: &ForwardingState,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    now_ns: u64,
+    protocol: u8,
+    tcp_flags: u8,
+) -> SessionMetadata {
+    if !metadata.synced || decision.resolution.disposition != ForwardingDisposition::ForwardCandidate
+    {
+        return metadata.clone();
+    }
+
+    let mut promoted = metadata.clone();
+    promoted.synced = false;
+    if promoted.owner_rg_id <= 0 {
+        promoted.owner_rg_id = owner_rg_for_flow(forwarding, decision.resolution.egress_ifindex);
+    }
+    if sessions.promote_synced(
+        key,
+        decision,
+        promoted.clone(),
+        now_ns,
+        protocol,
+        tcp_flags,
+    ) {
+        let _ = publish_live_session_key(session_map_fd, key);
+        let promoted_entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision,
+            metadata: promoted.clone(),
+            protocol,
+            tcp_flags,
+        };
+        publish_shared_session(shared_sessions, shared_nat_sessions, &promoted_entry);
+        replicate_session_upsert(peer_worker_commands, &promoted_entry);
+    }
+    promoted
+}
+
+pub(super) fn resolve_flow_session_decision(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -363,70 +577,77 @@ pub(super) fn repair_reverse_session_from_forward(
     now_secs: u64,
     protocol: u8,
     tcp_flags: u8,
-) -> Option<SessionLookup> {
-    let forward_match = sessions
-        .find_forward_nat_match(&flow.forward_key)
-        .or_else(|| {
-            lookup_shared_forward_nat_match(shared_nat_sessions, &flow.forward_key).map(|entry| {
-                ForwardSessionMatch {
-                    key: entry.key,
-                    decision: entry.decision,
-                    metadata: entry.metadata,
-                }
-            })
-        })?;
+    ingress_ifindex: i32,
+) -> Option<ResolvedFlowSessionDecision> {
+    let (resolved, created) = if let Some(hit) = lookup_session_across_scopes(
+        sessions,
+        shared_sessions,
+        &flow.forward_key,
+        now_ns,
+        tcp_flags,
+    ) {
+        (
+            materialize_shared_session_hit(sessions, &hit, now_ns, tcp_flags),
+            false,
+        )
+    } else {
+        let forward_match =
+            lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)?;
+        (
+            install_reverse_session_from_forward_match(
+                sessions,
+                session_map_fd,
+                shared_sessions,
+                shared_nat_sessions,
+                peer_worker_commands,
+                forwarding,
+                ha_state,
+                dynamic_neighbors,
+                &flow.forward_key,
+                forward_match,
+                now_ns,
+                now_secs,
+                protocol,
+                tcp_flags,
+            ),
+            true,
+        )
+    };
 
-    let reverse_decision = SessionDecision {
-        resolution: enforce_ha_resolution_snapshot(
+    let mut decision = resolved.decision;
+    decision.resolution = redirect_via_fabric_if_needed(
+        forwarding,
+        enforce_ha_resolution_snapshot(
             forwarding,
             ha_state,
             now_secs,
-            lookup_forwarding_resolution_with_dynamic(
+            lookup_forwarding_resolution_for_session(
                 forwarding,
                 dynamic_neighbors,
-                forward_match.key.src_ip,
+                flow,
+                decision,
             ),
         ),
-        nat: forward_match
-            .decision
-            .nat
-            .reverse(
-                forward_match.key.src_ip,
-                forward_match.key.dst_ip,
-                forward_match.key.src_port,
-                forward_match.key.dst_port,
-            ),
-    };
-    let reverse_metadata = SessionMetadata {
-        ingress_zone: forward_match.metadata.egress_zone.clone(),
-        egress_zone: forward_match.metadata.ingress_zone.clone(),
-        owner_rg_id: forward_match.metadata.owner_rg_id,
-        is_reverse: true,
-        synced: false,
-        nat64_reverse: None,
-    };
-    if sessions.install_with_protocol(
-        flow.forward_key.clone(),
-        reverse_decision,
-        reverse_metadata.clone(),
+        ingress_ifindex,
+    );
+    let metadata = maybe_promote_synced_session(
+        sessions,
+        session_map_fd,
+        shared_sessions,
+        shared_nat_sessions,
+        peer_worker_commands,
+        forwarding,
+        &flow.forward_key,
+        decision,
+        &resolved.metadata,
         now_ns,
         protocol,
         tcp_flags,
-    ) {
-        let _ = publish_live_session_key(session_map_fd, &flow.forward_key);
-        let reverse_entry = SyncedSessionEntry {
-            key: flow.forward_key.clone(),
-            decision: reverse_decision,
-            metadata: reverse_metadata.clone(),
-            protocol,
-            tcp_flags,
-        };
-        publish_shared_session(shared_sessions, shared_nat_sessions, &reverse_entry);
-        replicate_session_upsert(peer_worker_commands, &reverse_entry);
-    }
-    Some(SessionLookup {
-        decision: reverse_decision,
-        metadata: reverse_metadata,
+    );
+    Some(ResolvedFlowSessionDecision {
+        decision,
+        metadata,
+        created,
     })
 }
 
@@ -456,5 +677,122 @@ pub(super) fn remove_shared_session(
         && let Ok(mut nat_sessions) = shared_nat_sessions.lock()
     {
         nat_sessions.remove(&reverse_session_key(&entry.key, entry.decision.nat));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn test_resolution() -> ForwardingResolution {
+        ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 12,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+            neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+            src_mac: Some([6, 7, 8, 9, 10, 11]),
+            tx_vlan_id: 0,
+        }
+    }
+
+    fn test_metadata() -> SessionMetadata {
+        SessionMetadata {
+            ingress_zone: Arc::<str>::from("lan"),
+            egress_zone: Arc::<str>::from("wan"),
+            owner_rg_id: 1,
+            is_reverse: false,
+            synced: false,
+            nat64_reverse: None,
+        }
+    }
+
+    fn test_decision() -> SessionDecision {
+        SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision::default(),
+        }
+    }
+
+    fn test_key() -> SessionKey {
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 55068,
+            dst_port: 5201,
+        }
+    }
+
+    #[test]
+    fn lookup_session_across_scopes_returns_shared_entry() {
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision: test_decision(),
+            metadata: SessionMetadata {
+                synced: true,
+                ..test_metadata()
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        shared_sessions
+            .lock()
+            .expect("shared lock")
+            .insert(key.clone(), entry.clone());
+
+        let resolved = lookup_session_across_scopes(&mut sessions, &shared_sessions, &key, 1, 0)
+            .expect("shared hit");
+        assert!(resolved.shared_entry.is_some());
+        assert_eq!(resolved.lookup.decision, entry.decision);
+        assert_eq!(resolved.lookup.metadata, entry.metadata);
+    }
+
+    #[test]
+    fn lookup_forward_nat_across_scopes_returns_shared_nat_entry() {
+        let sessions = SessionTable::new();
+        let key = SessionKey {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_ICMPV6,
+            src_ip: IpAddr::V6("fd35:1940:27:100::102".parse::<Ipv6Addr>().unwrap()),
+            dst_ip: IpAddr::V6("2607:f8b0:4005:814::200e".parse::<Ipv6Addr>().unwrap()),
+            src_port: 0x8234,
+            dst_port: 0,
+        };
+        let decision = SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V6(
+                    "2602:fd41:70:100::102".parse::<Ipv6Addr>().unwrap(),
+                )),
+                nptv6: true,
+                ..NatDecision::default()
+            },
+        };
+        let entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision,
+            metadata: test_metadata(),
+            protocol: PROTO_ICMPV6,
+            tcp_flags: 0,
+        };
+        let reply_key = reverse_session_key(&key, decision.nat);
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        shared_nat_sessions
+            .lock()
+            .expect("shared nat lock")
+            .insert(reply_key.clone(), entry.clone());
+
+        let hit = lookup_forward_nat_across_scopes(&sessions, &shared_nat_sessions, &reply_key)
+            .expect("shared forward nat hit");
+        assert_eq!(hit.key, entry.key);
+        assert_eq!(hit.decision, entry.decision);
+        assert_eq!(hit.metadata, entry.metadata);
     }
 }
