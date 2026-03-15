@@ -1701,6 +1701,7 @@ fn replan_queues(
 ) -> Vec<BindingStatus> {
     let mut candidates: Vec<(String, usize)> = Vec::new();
     let mut ifindex_by_name: BTreeMap<String, i32> = BTreeMap::new();
+    let mut seen_linux: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(snapshot) = snapshot {
         for iface in &snapshot.interfaces {
             if !is_userspace_candidate_interface(&iface.name) {
@@ -1718,8 +1719,28 @@ fn replan_queues(
             };
             if rx_queues > 0 {
                 ifindex_by_name.insert(linux_name.clone(), iface.ifindex);
+                seen_linux.insert(linux_name.clone());
                 candidates.push((linux_name, rx_queues));
             }
+        }
+        // Include fabric parent interfaces so the userspace DP can transmit
+        // fabric-redirect packets via XSK TX (and receive fabric ingress).
+        for fabric in &snapshot.fabrics {
+            if fabric.parent_ifindex <= 0 || fabric.parent_linux_name.is_empty() {
+                continue;
+            }
+            if seen_linux.contains(&fabric.parent_linux_name) {
+                continue;
+            }
+            let rx_queues = if fabric.rx_queues > 0 {
+                fabric.rx_queues
+            } else {
+                rx_queue_count(&fabric.parent_linux_name)
+            };
+            let rx_queues = rx_queues.max(1); // fabric needs at least 1 queue for TX
+            ifindex_by_name.insert(fabric.parent_linux_name.clone(), fabric.parent_ifindex);
+            seen_linux.insert(fabric.parent_linux_name.clone());
+            candidates.push((fabric.parent_linux_name.clone(), rx_queues));
         }
     }
     replan_bindings_from_candidates(workers, existing, candidates, ifindex_by_name)
@@ -1889,6 +1910,83 @@ mod tests {
                 || b.interface.starts_with("et-")
         }));
         assert!(bindings.iter().all(|b| b.registered));
+    }
+
+    #[test]
+    fn queue_planner_includes_fabric_parent_interface() {
+        // The fabric parent (ge-0/0/0) is not in snapshot.interfaces but is
+        // referenced by snapshot.fabrics.  It needs an XSK binding so the
+        // userspace DP can transmit fabric-redirect packets.
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "ge-0/0/1".to_string(),
+                    linux_name: "ge-0-0-1".to_string(),
+                    ifindex: 11,
+                    rx_queues: 1,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "ge-0/0/2".to_string(),
+                    linux_name: "ge-0-0-2".to_string(),
+                    ifindex: 12,
+                    rx_queues: 1,
+                    ..Default::default()
+                },
+            ],
+            fabrics: vec![FabricSnapshot {
+                name: "fab0".to_string(),
+                parent_interface: "ge-0/0/0".to_string(),
+                parent_linux_name: "ge-0-0-0".to_string(),
+                parent_ifindex: 21,
+                overlay_linux_name: "fab0".to_string(),
+                overlay_ifindex: 101,
+                rx_queues: 1,
+                peer_address: "10.99.13.2".to_string(),
+            }],
+            ..Default::default()
+        };
+        let bindings = replan_queues(Some(&snapshot), 1, &[]);
+        // Should have 3 bindings: ge-0-0-1, ge-0-0-2, ge-0-0-0 (fabric parent)
+        assert_eq!(bindings.len(), 3);
+        let fabric_binding = bindings
+            .iter()
+            .find(|b| b.interface == "ge-0-0-0")
+            .expect("fabric parent binding missing");
+        assert_eq!(fabric_binding.ifindex, 21);
+        assert!(fabric_binding.registered);
+    }
+
+    #[test]
+    fn queue_planner_deduplicates_fabric_parent_already_in_interfaces() {
+        // When the fabric parent is already in snapshot.interfaces (e.g. as a
+        // RETH member), it should not be duplicated.
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                name: "ge-0/0/0".to_string(),
+                linux_name: "ge-0-0-0".to_string(),
+                ifindex: 21,
+                rx_queues: 1,
+                ..Default::default()
+            }],
+            fabrics: vec![FabricSnapshot {
+                name: "fab0".to_string(),
+                parent_interface: "ge-0/0/0".to_string(),
+                parent_linux_name: "ge-0-0-0".to_string(),
+                parent_ifindex: 21,
+                overlay_linux_name: "fab0".to_string(),
+                overlay_ifindex: 101,
+                rx_queues: 1,
+                peer_address: "10.99.13.2".to_string(),
+            }],
+            ..Default::default()
+        };
+        let bindings = replan_queues(Some(&snapshot), 1, &[]);
+        // ge-0-0-0 appears in both interfaces and fabrics but should only
+        // produce one binding.
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].interface, "ge-0-0-0");
+        assert_eq!(bindings[0].ifindex, 21);
     }
 
     #[test]

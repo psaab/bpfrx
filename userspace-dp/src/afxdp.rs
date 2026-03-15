@@ -3589,8 +3589,9 @@ fn enqueue_pending_forwards(
             right,
             request.target_ifindex,
         ) else {
-            // No XSK binding for the target interface (e.g. fabric link).
-            // Fall back to slow-path so the kernel can forward the packet.
+            // No XSK binding for the target interface.  Normally fabric
+            // parents have bindings; this is a safety-net fallback in case
+            // the binding is not yet ready or bind() failed.
             if request.decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
                 maybe_reinject_slow_path(
                     ingress_ident,

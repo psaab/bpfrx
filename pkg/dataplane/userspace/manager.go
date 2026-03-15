@@ -3002,6 +3002,20 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 		seen[key] = true
 		out = append(out, key)
 	}
+	// Include fabric parent interfaces so the XDP shim is attached and
+	// XSK bind() succeeds.  This enables both fabric-redirect TX and
+	// fabric ingress RX in the userspace dataplane.
+	for _, fab := range snapshot.Fabrics {
+		if fab.ParentIfindex <= 0 {
+			continue
+		}
+		key := uint32(fab.ParentIfindex)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }

@@ -1221,3 +1221,82 @@ func TestBuildFlowExportSnapshotNilWhenNoConfig(t *testing.T) {
 		t.Fatal("expected nil flow export snapshot with no config")
 	}
 }
+
+func TestBuildUserspaceIngressIfindexesIncludesFabricParent(t *testing.T) {
+	snapshot := &ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{
+			{
+				Name:    "ge-0/0/1",
+				Zone:    "lan",
+				Ifindex: 11,
+			},
+			{
+				Name:    "ge-0/0/2",
+				Zone:    "wan",
+				Ifindex: 12,
+			},
+		},
+		Fabrics: []FabricSnapshot{
+			{
+				Name:            "fab0",
+				ParentInterface: "ge-0/0/0",
+				ParentLinuxName: "ge-0-0-0",
+				ParentIfindex:   21,
+				OverlayLinux:    "fab0",
+				OverlayIfindex:  101,
+				RXQueues:        1,
+				PeerAddress:     "10.99.13.2",
+			},
+		},
+	}
+	ifindexes := buildUserspaceIngressIfindexes(snapshot)
+	found := false
+	for _, idx := range ifindexes {
+		if idx == 21 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("fabric parent ifindex 21 not in ingress ifindexes: %v", ifindexes)
+	}
+	if len(ifindexes) != 3 {
+		t.Fatalf("expected 3 ingress ifindexes (2 data + 1 fabric), got %d: %v", len(ifindexes), ifindexes)
+	}
+}
+
+func TestBuildUserspaceIngressIfindexesDeduplicatesFabricParent(t *testing.T) {
+	// If the fabric parent is already in the data interface list, it should
+	// not be duplicated.
+	snapshot := &ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{
+			{
+				Name:    "ge-0/0/0",
+				Zone:    "lan",
+				Ifindex: 21,
+			},
+		},
+		Fabrics: []FabricSnapshot{
+			{
+				Name:            "fab0",
+				ParentInterface: "ge-0/0/0",
+				ParentLinuxName: "ge-0-0-0",
+				ParentIfindex:   21,
+				OverlayLinux:    "fab0",
+				OverlayIfindex:  101,
+				RXQueues:        1,
+				PeerAddress:     "10.99.13.2",
+			},
+		},
+	}
+	ifindexes := buildUserspaceIngressIfindexes(snapshot)
+	count := 0
+	for _, idx := range ifindexes {
+		if idx == 21 {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("fabric parent ifindex 21 appeared %d times in ingress ifindexes: %v", count, ifindexes)
+	}
+}
