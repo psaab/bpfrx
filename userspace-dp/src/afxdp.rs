@@ -1287,6 +1287,47 @@ struct BindingIdentity {
     ifindex: i32,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct WorkerBindingLookup {
+    by_if_queue: FastMap<(i32, u32), usize>,
+    first_by_if: FastMap<i32, usize>,
+    by_slot: FastMap<u32, usize>,
+}
+
+impl WorkerBindingLookup {
+    fn from_bindings(bindings: &[BindingWorker]) -> Self {
+        let mut lookup = Self::default();
+        for (index, binding) in bindings.iter().enumerate() {
+            lookup
+                .by_if_queue
+                .insert((binding.ifindex, binding.queue_id), index);
+            lookup.first_by_if.entry(binding.ifindex).or_insert(index);
+            lookup.by_slot.insert(binding.slot, index);
+        }
+        lookup
+    }
+
+    fn target_index(
+        &self,
+        current_index: usize,
+        current_ifindex: i32,
+        ingress_queue_id: u32,
+        egress_ifindex: i32,
+    ) -> Option<usize> {
+        if current_ifindex == egress_ifindex {
+            return Some(current_index);
+        }
+        self.by_if_queue
+            .get(&(egress_ifindex, ingress_queue_id))
+            .copied()
+            .or_else(|| self.first_by_if.get(&egress_ifindex).copied())
+    }
+
+    fn slot_index(&self, slot: u32) -> Option<usize> {
+        self.by_slot.get(&slot).copied()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SessionFlow {
     src_ip: IpAddr,
@@ -1639,6 +1680,7 @@ struct DebugPollCounters {
 fn poll_binding(
     binding_index: usize,
     bindings: &mut [BindingWorker],
+    binding_lookup: &WorkerBindingLookup,
     sessions: &mut SessionTable,
     screen: &mut ScreenState,
     validation: ValidationState,
@@ -1746,7 +1788,14 @@ fn poll_binding(
     let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
     let tx_work = drain_pending_tx(binding, now_ns, shared_recycles);
-    apply_shared_recycles(left, binding, right, shared_recycles);
+    apply_shared_recycles(
+        left,
+        binding_index,
+        binding,
+        right,
+        binding_lookup,
+        shared_recycles,
+    );
     let fill_work = drain_pending_fill(binding, now_ns);
     let mut did_work = tx_work || fill_work;
     binding.dbg_poll_cycles += 1;
@@ -1758,7 +1807,14 @@ fn poll_binding(
             binding.dbg_backpressure += 1;
             // Try to drain TX first — completions free frames for both TX and fill.
             let _ = drain_pending_tx(binding, now_ns, shared_recycles);
-            apply_shared_recycles(left, binding, right, shared_recycles);
+            apply_shared_recycles(
+                left,
+                binding_index,
+                binding,
+                right,
+                binding_lookup,
+                shared_recycles,
+            );
             // Critical: drain fill ring even under backpressure so the NIC can
             // still receive packets. Without this, fill ring starvation causes
             // mlx5 to fall back to non-XSK NAPI, leaking packets to the kernel.
@@ -1768,15 +1824,17 @@ fn poll_binding(
 
         let raw_avail = binding.rx.available();
         let available = raw_avail.min(RX_BATCH_SIZE);
-        if raw_avail > 0 {
-            binding.dbg_rx_avail_nonzero += 1;
-            if raw_avail > binding.dbg_rx_avail_max {
-                binding.dbg_rx_avail_max = raw_avail;
+        if cfg!(feature = "debug-log") {
+            if raw_avail > 0 {
+                binding.dbg_rx_avail_nonzero += 1;
+                if raw_avail > binding.dbg_rx_avail_max {
+                    binding.dbg_rx_avail_max = raw_avail;
+                }
             }
+            // Ring diagnostics are only consumed by debug-log summaries.
+            binding.dbg_fill_pending = binding.device.pending();
+            binding.dbg_device_avail = binding.device.available();
         }
-        // Snapshot ring state for diagnostics
-        binding.dbg_fill_pending = binding.device.pending();
-        binding.dbg_device_avail = binding.device.available();
         if available == 0 {
             binding.dbg_rx_empty += 1;
             maybe_wake_rx(binding, false, now_ns);
@@ -3250,8 +3308,10 @@ fn poll_binding(
         let ingress_live: *const BindingLiveState = &*binding.live;
         enqueue_pending_forwards(
             left,
+            binding_index,
             binding,
             right,
+            binding_lookup,
             &mut pending_forwards,
             now_ns,
             forwarding,
@@ -3271,7 +3331,14 @@ fn poll_binding(
         for other in left.iter_mut().chain(right.iter_mut()) {
             reap_tx_completions(other, shared_recycles);
         }
-        apply_shared_recycles(left, binding, right, shared_recycles);
+        apply_shared_recycles(
+            left,
+            binding_index,
+            binding,
+            right,
+            binding_lookup,
+            shared_recycles,
+        );
         if !binding.scratch_recycle.is_empty() {
             binding
                 .pending_fill_frames
@@ -3411,39 +3478,38 @@ fn learn_dynamic_neighbor(
     }
 }
 
+fn binding_by_index_mut<'a>(
+    left: &'a mut [BindingWorker],
+    current_index: usize,
+    current: &'a mut BindingWorker,
+    right: &'a mut [BindingWorker],
+    target_index: usize,
+) -> Option<&'a mut BindingWorker> {
+    if target_index == current_index {
+        return Some(current);
+    }
+    if target_index < current_index {
+        return left.get_mut(target_index);
+    }
+    right.get_mut(target_index.saturating_sub(current_index + 1))
+}
+
 fn find_target_binding_mut<'a>(
     left: &'a mut [BindingWorker],
+    current_index: usize,
     ingress_binding: &'a mut BindingWorker,
     ingress_queue_id: u32,
     right: &'a mut [BindingWorker],
+    binding_lookup: &WorkerBindingLookup,
     egress_ifindex: i32,
 ) -> Option<&'a mut BindingWorker> {
-    if ingress_binding.ifindex == egress_ifindex {
-        return Some(ingress_binding);
-    }
-    if let Some(pos) = left.iter().position(|binding| {
-        binding.ifindex == egress_ifindex && binding.queue_id == ingress_queue_id
-    }) {
-        return Some(&mut left[pos]);
-    }
-    if let Some(pos) = right.iter().position(|binding| {
-        binding.ifindex == egress_ifindex && binding.queue_id == ingress_queue_id
-    }) {
-        return Some(&mut right[pos]);
-    }
-    if let Some(pos) = left
-        .iter()
-        .position(|binding| binding.ifindex == egress_ifindex)
-    {
-        return Some(&mut left[pos]);
-    }
-    if let Some(pos) = right
-        .iter()
-        .position(|binding| binding.ifindex == egress_ifindex)
-    {
-        return Some(&mut right[pos]);
-    }
-    None
+    let target_index = binding_lookup.target_index(
+        current_index,
+        ingress_binding.ifindex,
+        ingress_queue_id,
+        egress_ifindex,
+    )?;
+    binding_by_index_mut(left, current_index, ingress_binding, right, target_index)
 }
 
 fn purge_queued_flows_for_closed_deltas(bindings: &mut [BindingWorker], deltas: &[SessionDelta]) {
@@ -3804,6 +3870,7 @@ fn worker_loop(
             Err(err) => plan.live.set_error(err.to_string()),
         }
     }
+    let binding_lookup = WorkerBindingLookup::from_bindings(&bindings);
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
@@ -3926,6 +3993,7 @@ fn worker_loop(
             if poll_binding(
                 idx,
                 &mut bindings,
+                &binding_lookup,
                 &mut sessions,
                 &mut screen_state,
                 validation,
@@ -7361,6 +7429,26 @@ mod tests {
             bind_flag_candidates_for_driver(Some("mlx5_core")),
             &[XSK_BIND_FLAGS_ZEROCOPY, XSK_BIND_FLAGS_COPY]
         );
+    }
+
+    #[test]
+    fn worker_binding_lookup_prefers_same_queue_binding() {
+        let mut lookup = WorkerBindingLookup::default();
+        lookup.by_if_queue.insert((5, 0), 0);
+        lookup.by_if_queue.insert((5, 1), 1);
+        lookup.first_by_if.insert(5, 0);
+
+        assert_eq!(lookup.target_index(2, 7, 1, 5), Some(1));
+        assert_eq!(lookup.target_index(2, 7, 3, 5), Some(0));
+        assert_eq!(lookup.target_index(2, 5, 1, 5), Some(2));
+    }
+
+    #[test]
+    fn worker_binding_lookup_resolves_slot_index() {
+        let mut lookup = WorkerBindingLookup::default();
+        lookup.by_slot.insert(11, 3);
+        assert_eq!(lookup.slot_index(11), Some(3));
+        assert_eq!(lookup.slot_index(99), None);
     }
 
     fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {

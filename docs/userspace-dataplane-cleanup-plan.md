@@ -21,9 +21,9 @@ Current execution state as of 2026-03-15:
 2. Phase 2 is complete and merged on `master` via PR `#225`.
 3. Phase 3 is complete and merged on `master` via PR `#228`.
 4. Phase 4 is complete and merged on `master` via PR `#229`.
-5. Phase 5 is complete on the current branch; the traceroute / harness pieces
-   are already merged on `master` via PRs `#221` and `#230`.
-6. Phase 6 has not started as a formal cleanup phase yet.
+5. Phase 5 is complete and merged on `master` via PR `#231` plus the earlier
+   traceroute / harness PRs `#221` and `#230`.
+6. Phase 6 is now in progress on the current branch.
 
 Latest status-sync update for this document:
 
@@ -73,9 +73,9 @@ Completed under this plan:
 
 Still left to do at a high level:
 
-1. Merge the final Phase 5 regression-coverage completion work.
-2. Start the sustained-throughput optimization work in Phase 6 on top of the
+1. Continue sustained-throughput optimization work in Phase 6 on top of the
    cleaned dataplane surface.
+2. Merge the measured Phase 6 slices once the branch state is packaged cleanly.
 
 ## Current Baseline
 
@@ -500,14 +500,39 @@ Phase 5 result:
 
 ## Phase 6: Performance Optimization On A Cleaner Base
 
-Status: Not Started
+Status: In Progress
 
-Why it is still deferred:
+Current measured state on the Phase 6 branch:
 
-1. The cleanup phases are now far enough along that Phase 6 can start cleanly,
-   but it has not been kicked off as a dedicated workstream yet.
-2. Performance work should now proceed against the cleaned Phase 1-5 baseline
-   instead of the older monolithic / lightly-tested dataplane.
+1. A fresh live baseline was captured on the cleaned Phase 1-5 dataplane:
+   - initial `userspace-perf-compare` baseline before Phase 6 tuning:
+     - IPv4 about `21.48 Gbps`
+     - IPv6 about `19.95 Gbps`
+2. The first Phase 6 slice added worker-local binding lookup indices so the
+   hot forward/recycle path stops linearly scanning bindings by ifindex/slot.
+3. The second Phase 6 slice compiled AF_XDP ring diagnostic snapshots out of
+   the normal release path, keeping them only under `debug-log`.
+4. The third Phase 6 slice removed avoidable cloning from the common
+   session-hit path in `session_glue`.
+5. Live validation on the current Phase 6 branch shows the userspace dataplane
+   still passes the correctness gate:
+   - IPv4 TTL probe: pass
+   - IPv6 TTL probe: pass
+   - IPv4 `mtr`: pass
+   - IPv6 `mtr`: pass
+6. Recent live validation throughput on the Phase 6 branch:
+   - IPv4 about `19.55 Gbps`
+   - IPv6 about `18.97 Gbps`
+7. Current hot symbols after these slices still point to the same remaining
+   work:
+   - `bpfrx_userspace_dp::afxdp::poll_binding`
+   - `bpfrx_userspace_dp::afxdp::frame::enqueue_pending_forwards`
+   - `bpfrx_userspace_dp::afxdp::frame::apply_nat_ipv6`
+8. The session-resolution slice materially reduced the common session-hit cost
+   in `perf`:
+   - IPv4 `resolve_flow_session_decision` dropped from roughly `4.15%` to
+     about `2.43%`
+   - IPv6 `resolve_flow_session_decision` dropped to about `3.41%`
 
 ### Purpose
 
@@ -538,6 +563,8 @@ have been stabilized.
 1. Sustained throughput remains high after startup rather than collapsing.
 2. Performance improvements are measured by the standard userspace workflow.
 3. Optimization changes land on top of a clearer, smaller fast-path surface.
+4. The remaining hot symbols on the live branch are explained and intentionally
+   targeted rather than guessed at.
 
 ## Recommended Execution Order
 
@@ -561,10 +588,12 @@ This order is deliberate.
 
 ## Immediate Next Steps
 
-1. Merge the final Phase 5 regression-coverage completion work.
-2. Start Phase 6 with a fresh live profile on the cleaned dataplane baseline.
-3. Keep the resolved driver split intact:
+1. Keep the resolved driver split intact:
    - `mlx5_core` on zerocopy UMEM-owner
    - `virtio_net` on auto-mode copy UMEM-owner
-4. Keep the traceroute, `mtr`, and throughput-collapse checks as the mandatory
+2. Keep the traceroute, `mtr`, and throughput-collapse checks as the mandatory
    correctness gate for any Phase 6 performance changes.
+3. Continue Phase 6 on the measured remaining costs:
+   - `poll_binding`
+   - `enqueue_pending_forwards`
+   - `apply_nat_ipv6`
