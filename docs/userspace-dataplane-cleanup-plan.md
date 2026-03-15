@@ -19,9 +19,10 @@ Current execution state as of 2026-03-15:
 
 1. Phase 1 is complete and merged on `master` via PR `#222`.
 2. Phase 2 is complete and merged on `master` via PR `#225`.
-3. Phase 3 is complete on the current branch and is ready for PR review.
-4. Phase 5 is partially complete on `master` via PR `#221`.
-5. Phases 4 and 6 have not started as formal cleanup phases yet.
+3. Phase 3 is complete on the current branch via PR `#228`.
+4. Phase 4 is complete on the current branch and ready for PR review.
+5. Phase 5 is partially complete on `master` via PR `#221`.
+6. Phase 6 has not started as a formal cleanup phase yet.
 
 Latest status-sync update for this document:
 
@@ -71,8 +72,9 @@ Completed under this plan:
 
 Still left to do at a high level:
 
-1. Start the formal AF_XDP queue and frame-ownership cleanup in Phase 4.
-2. Finish hardening validation coverage in Phase 5.
+1. Finish hardening validation coverage in Phase 5.
+2. Fix the userspace validation shell harness so TTL / hop-limit probes are
+   treated as success when they return the expected native time-exceeded reply.
 3. Only then do the serious sustained-throughput optimization work in Phase 6.
 
 ## Current Baseline
@@ -337,21 +339,36 @@ Phase 3 result:
 
 ## Phase 4: AF_XDP Queue, TX, And Recycle Cleanup
 
-Status: Not Started
+Status: Complete On Current Branch, Pending PR
 
-Relevant known issues still left for this phase:
+Completed:
 
-1. Queue ownership and frame lifecycle are still too implicit in
-   `userspace-dp/src/afxdp.rs`.
-2. The common forward path and fallback paths still share more queueing logic
-   than they should.
-3. AF_XDP driver-specific bring-up behavior is now understood for the current
-   lab:
-   - `mlx5_core` should stay on the current zerocopy UMEM-owner path
-   - `virtio_net` should stay on the copy-mode UMEM-owner path with
-     `bind_flags=0`
-4. The queue/frame cleanup can now proceed without the `virtio_net` fabric bind
-   problem distorting live validation.
+1. Prepared-TX recycle ownership is now explicit in code via
+   `PreparedTxRecycle` instead of the older implicit `Option<u32>` slot model.
+2. Completion handling now routes all prepared-TX recycle decisions through a
+   single explicit helper path instead of open-coded slot restoration.
+3. Pending prepared/local TX request merging, draining, and restoration are now
+   centralized in `userspace-dp/src/afxdp/tx.rs`.
+4. Immediate prepared-TX cancellation now uses the same recycle ownership model
+   as completion reaping.
+5. Focused Rust tests were added for:
+   - pending TX merge order
+   - shared/local queue merge behavior
+   - explicit prepared recycle routing
+6. The Phase 4 slice was deployed live to:
+   - `loss:bpfrx-userspace-fw0`
+   - `loss:bpfrx-userspace-fw1`
+7. Live validation on the active userspace node (`bpfrx-userspace-fw0`) passed:
+   - `24/24` bindings bound and ready
+   - IPv4 and IPv6 internal reachability
+   - native IPv4 and IPv6 time-exceeded responses
+   - IPv4 and IPv6 `mtr` first-hop and destination visibility unchanged
+   - short single-stream `iperf3` runs completed without collapse
+8. The remaining issue discovered during this validation is not a dataplane
+   queue bug:
+   - `scripts/userspace-ha-validation.sh` still aborts early because
+     `ping -t 1` / `ping -6 -t 1` return non-zero even when the expected
+     time-exceeded response is present
 
 ### Purpose
 
@@ -382,6 +399,15 @@ performance tuning.
 3. The common forward path is clear enough to profile without first reverse
    engineering queue behavior.
 
+Phase 4 result:
+
+1. Achieved on the current branch and validated live on the isolated userspace
+   HA lab.
+2. Queue and completion ownership is now explicit enough to reason about from
+   `userspace-dp/src/afxdp/tx.rs`.
+3. The next cleanup phase is Phase 5 validation hardening, starting with the
+   TTL / hop-limit shell-harness fix.
+
 ## Phase 5: Validation And Regression Hardening
 
 Status: Partially Complete
@@ -403,10 +429,13 @@ Delivered in:
 
 Still left:
 
-1. Add more direct regression coverage for tuple authority and embedded ICMP
+1. Fix the shell harness so TTL / hop-limit probes do not fail the validation
+   script when they return the expected time-exceeded reply with non-zero exit
+   status.
+2. Add more direct regression coverage for tuple authority and embedded ICMP
    corner cases.
-2. Add coverage for AF_XDP build-failure fallback behavior.
-3. Keep synchronized capture workflows available as diagnosis tools, not first
+3. Add coverage for AF_XDP build-failure fallback behavior.
+4. Keep synchronized capture workflows available as diagnosis tools, not first
    line validation.
 
 ### Purpose

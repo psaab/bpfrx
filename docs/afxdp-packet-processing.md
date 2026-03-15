@@ -2,8 +2,8 @@
 
 ## 1. Architecture Overview
 
-The userspace dataplane uses AF_XDP (copy mode) on mlx5 NICs to receive and
-transmit packets through shared UMEM memory regions.  An XDP shim program
+The userspace dataplane uses AF_XDP with driver-specific bind/runtime modes to
+receive and transmit packets through shared UMEM memory regions.  An XDP shim program
 (`xdp_userspace_prog` in `userspace-xdp/src/lib.rs`) runs on each ingress
 interface and steers matching packets to AF_XDP sockets via an XSKMAP
 (`userspace_xsk_map`).
@@ -42,19 +42,17 @@ WorkerUmem {
 }
 ```
 
-### Why copy mode (not zero-copy)
+### Current runtime mode by driver
 
-Zero-copy mode on mlx5 permanently leaks UMEM frames when the XDP shim
-returns `XDP_PASS`.  The kernel places the UMEM frame into an SKB and never
-returns it to the fill ring.  With any XDP_PASS path (ARP, management traffic,
-ICMP fallback, local destinations), all 12K+ RX frames drain within seconds of
-sustained traffic, producing permanent `rx_xsk_buff_alloc_err`.
+Current live behavior on the userspace HA lab is:
 
-In copy mode, `XDP_PASS` operates on kernel DMA buffers.  UMEM frames are only
-consumed by `XDP_REDIRECT -> XSK`, and userspace always recycles them.  The
-cost is one `memcpy` per redirected packet.
+1. `mlx5_core` ingress bindings use the UMEM-owner zerocopy path.
+2. `virtio_net` fabric bindings use the UMEM-owner copy-mode path with
+   `bind_flags=0`.
 
-See `TODO(#209)` in `afxdp.rs:55` for the zero-copy restoration plan.
+That split was validated live during the Phase 2 cleanup work.  The failed
+`virtio_net` separate-owner probe was removed from the active strategy because
+it was not the correct bind contract for this environment.
 
 ## 2. The Fill Ring Exhaustion Bug
 
@@ -127,95 +125,49 @@ The rules are:
 **Validation**: 1m / 100m / 500m / 1g downloads complete at ~107 MB/s through
 NAT.  Before the fix, 1g downloads failed 100% of the time.
 
-## 4. Improvement Plan
+## 4. Queue And Frame Ownership After Phase 4
 
-### 4a. Fill Ring Management
+Phase 4 of the cleanup plan made the prepared-TX recycle path explicit.
 
-**Drain fill ring during TX backpressure.**  The backpressure early-exit path
-(`afxdp.rs:1849`) returns without calling `drain_pending_fill()`.  Fix: insert
-a `drain_pending_fill(binding, now_ns)` call before `return did_work` so
-recycled frames reach the fill ring even when TX is congested.
+### 4a. Explicit prepared-TX recycle ownership
 
-**Increase default `ring_entries`.**  Current default is 1024
-(`main.rs:933`).  With `binding_frame_count()` allocating `2 * ring_entries`
-fill frames, that gives 2048 fill slots.  Increasing to 4096 or 8192 provides
-a larger buffer pool to absorb bursts before exhaustion.
+Prepared TX requests now carry an explicit recycle destination instead of the
+older implicit "maybe a slot, maybe a TX frame" model:
 
-**Adaptive fill ring watermark.**  Monitor `pending_fill_frames.len()` relative
-to capacity.  If it drops below 50%, trigger aggressive refill from all
-available recycled frames (TX completions, shared recycles) before processing
-the next RX batch.
+```rust
+enum PreparedTxRecycle {
+    FreeTxFrame,
+    FillOnSlot(u32),
+}
+```
 
-### 4b. TX Completion Optimization
+This makes it obvious whether a completed prepared transmit should:
 
-**Eager completion reaping.**  TX completions currently happen once per poll
-cycle (`drain_pending_tx` at `afxdp.rs:1836`).  On cross-binding forwarding,
-completed TX frames often need to become fill ring frames on the originating
-binding.  Reap completions more frequently -- after every RX batch, not just at
-poll entry.
+1. return a reserved TX frame to the TX frame pool, or
+2. replenish the fill path for a specific ingress slot.
 
-**Reduce TX backlog limit.**  `PENDING_TX_LIMIT_MULTIPLIER` is 2
-(`afxdp.rs:49`), giving `max_pending_tx = ring_entries * 2`.  Lowering this
-activates backpressure earlier, before fill ring starvation reaches critical
-levels.  Combined with the fill-ring-during-backpressure fix, earlier
-backpressure becomes safe.
+### 4b. Centralized queue merge / drain / restore helpers
 
-### 4c. Zero-Copy Restoration (Long-term, Issue #209)
+Pending local and prepared TX requests are now merged and restored through a
+single helper path in `userspace-dp/src/afxdp/tx.rs` instead of open-coded
+queue stitching in multiple places.
 
-The fundamental blocker is that `XDP_PASS` in zero-copy mode permanently leaks
-UMEM frames.  The solution is to eliminate all `XDP_PASS` paths in the XDP
-shim:
+That cleanup made three things explicit:
 
-| Current XDP_PASS path | Replacement |
-|------------------------|-------------|
-| ARP | `cpumap` redirect to CPU processing queue |
-| Management traffic (local dest) | `cpumap` redirect |
-| ICMP fallback | `cpumap` redirect |
-| Non-IP ethertype | `cpumap` redirect |
-| Unknown/error paths | `cpumap` redirect |
+1. merge order between local and shared prepared requests
+2. when pending requests are restored after backpressure or partial transmit
+3. how completion reaping maps offsets back to either TX-frame free or
+   fill-ring replenishment
 
-`cpumap` redirect frees the XSK frame immediately while still delivering the
-packet to the kernel stack via a new SKB.  This eliminates copy-mode `memcpy`
-overhead entirely.
+### 4c. What is still left
 
-Requires:
-- BPF shim changes: replace all `XDP_PASS` returns with `bpf_redirect_map(&CPUMAP, cpu, 0)`.
-- A cpumap program entry point for kernel delivery.
-- Testing that cpumap redirect does not lose VLAN tags or metadata needed by the legacy pipeline.
+Phase 4 was about making ownership explicit, not finishing throughput tuning.
+The remaining work is now cleaner:
 
-### 4d. Poll Loop Optimization
-
-**`NEED_WAKEUP`**: Already enabled (`XDP_BIND_NEED_WAKEUP` in bind flags,
-`afxdp.rs:60`).  Reduces unnecessary `sendto()` calls when the kernel doesn't
-need waking.
-
-**Idle sleep**: Set to 1us (`IDLE_SLEEP_US`, `afxdp.rs:62`) for fast response
-to new packets.  The idle spin count (`IDLE_SPIN_ITERS=256`) avoids the
-syscall cost of `nanosleep` for brief gaps.
-
-**Batch sizes**: `RX_BATCH_SIZE=256`, `FILL_BATCH_SIZE=1024`
-(`afxdp.rs:45,50`).  Up to `MAX_RX_BATCHES_PER_POLL=4` RX batches per poll
-cycle, processing up to 1024 packets before re-checking TX and fill rings.
-
-**Debug logging overhead**: The `debug_log!` macro (`afxdp.rs:34`) is gated
-behind a compile-time `debug-log` Cargo feature (`userspace-dp/Cargo.toml:8`).
-Without the feature, all per-packet TCP flag parsing, RST detection, hex dumps,
-and checksum verification are compiled out -- zero overhead in production.
-
-### 4e. Multi-Queue Scaling
-
-Each AF_XDP binding handles one `(ifindex, queue_id)` pair.  mlx5 supports RSS
-across multiple RX queues.  Scaling path:
-
-1. Configure multiple RX queues on the mlx5 interface (`ethtool -L <iface> combined N`).
-2. Create N AF_XDP bindings, one per queue, each with its own `WorkerUmem`.
-3. Worker threads poll their respective bindings independently.
-4. RSS distributes flows across queues; each worker processes a subset of traffic.
-
-The `Coordinator` already supports multiple bindings per worker
-(`afxdp.rs:132-150`), and bindings are grouped by `worker_id`.  The main gap
-is coordinating session table access across workers (currently a single
-`SessionTable` per worker thread).
+1. measure and optimize sustained forwarding throughput
+2. reduce retransmits on the common forward path
+3. improve validation so TTL / hop-limit probes do not fail the shell harness
+   when they correctly return time-exceeded with a non-zero exit code
 
 ## 5. Performance Metrics
 
@@ -228,14 +180,15 @@ is coordinating session table access across workers (currently a single
 | Poll cycle budget | 4 RX batches x 256 packets = 1024 packets/cycle |
 
 **Bottlenecks** (ordered by impact):
-1. Copy-mode `memcpy` per packet
-2. Single-queue processing (no RSS fan-out)
-3. Fill ring starvation during TX backpressure
+1. Common forward-path retransmits and sustained-throughput collapse
+2. Queue drain / completion / recycle cost in the mixed copy/zerocopy runtime
+3. Single-queue processing (no RSS fan-out)
 4. Session table contention (if multi-queue)
 
 **Monitoring**:
 - `ethtool -S <iface> | grep xsk` -- driver-level AF_XDP stats (`rx_xsk_buff_alloc_err`, `rx_xsk_packets`, etc.)
-- Periodic `DBG w{worker_id}:` summary in journal (every 1s, always enabled)
+- `show chassis cluster data-plane statistics`
+- `show chassis cluster data-plane interfaces`
 - `dbg_backpressure` counter tracks TX backpressure events per binding
 
 ## 6. Debug Instrumentation
@@ -246,15 +199,6 @@ is coordinating session table access across workers (currently a single
 |-------|----------|
 | Without `debug-log` | Zero-overhead production build. `debug_log!()` compiles to nothing. |
 | With `debug-log` | Per-packet TCP flag parsing, RST detection, hex dumps, checksum verification, session dumps, stall detection, ring diagnostics. |
-
-**Periodic summary (always enabled)**: Every 1s (`DBG_REPORT_INTERVAL_NS`,
-`afxdp.rs:5716`), each worker logs counters including rx/tx/fwd totals,
-session hit/miss/create, NAT counters, RST counts, direction breakdowns,
-and ring state.  Format:
-
-```
-DBG w0: 1.0s rx=15234 tx=15100 fwd=14900 local=334 sess_hit=14800 sess_miss=100 ...
-```
 
 **XDP fallback stats**: The shim maintains per-reason counters in
 `userspace_fallback_stats` (array map with `USERSPACE_FALLBACK_REASON_MAX`
