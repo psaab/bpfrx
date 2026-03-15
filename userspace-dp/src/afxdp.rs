@@ -2633,6 +2633,7 @@ fn poll_binding(
                                         sessions,
                                         forwarding,
                                         dynamic_neighbors,
+                                        shared_nat_sessions,
                                         now_ns,
                                     ) {
                                         eprintln!("ICMP_TE_NAT: match found, nat={:?} orig_src={} resolution={:?}", icmp_match.nat, icmp_match.original_src, icmp_match.resolution.disposition);
@@ -7883,10 +7884,11 @@ fn try_embedded_icmp_nat_match(
     sessions: &mut SessionTable,
     forwarding: &ForwardingState,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     now_ns: u64,
 ) -> Option<EmbeddedIcmpMatch> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    try_embedded_icmp_nat_match_from_frame(frame, meta, sessions, forwarding, dynamic_neighbors, now_ns)
+    try_embedded_icmp_nat_match_from_frame(frame, meta, sessions, forwarding, dynamic_neighbors, shared_nat_sessions, now_ns)
 }
 
 /// Core implementation of embedded ICMP NAT match operating on a frame slice.
@@ -7896,6 +7898,7 @@ fn try_embedded_icmp_nat_match_from_frame(
     sessions: &mut SessionTable,
     forwarding: &ForwardingState,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     now_ns: u64,
 ) -> Option<EmbeddedIcmpMatch> {
     let l4 = meta.l4_offset as usize;
@@ -7962,11 +7965,10 @@ fn try_embedded_icmp_nat_match_from_frame(
                 src_port: if matches!(emb_protocol, PROTO_ICMP) { emb_src_port } else { emb_dst_port },
                 dst_port: if matches!(emb_protocol, PROTO_ICMP) { emb_dst_port } else { emb_src_port },
             };
-            // Try NAT reverse index first (most common: embedded src is SNAT'd).
+            // Try per-worker NAT reverse index first.
             let forward_match = sessions.find_forward_nat_match(&reply_key);
             if let Some(fwd) = forward_match {
                 let nat = fwd.decision.nat;
-                // The forward session's src_ip is the original client.
                 let original_src = fwd.key.src_ip;
                 let original_src_port = fwd.key.src_port;
                 let resolution = lookup_forwarding_resolution_with_dynamic(
@@ -7980,6 +7982,27 @@ fn try_embedded_icmp_nat_match_from_frame(
                     resolution,
                     metadata: fwd.metadata,
                 });
+            }
+            // Cross-worker fallback: the outbound session may be on a different
+            // worker (RSS distributes ICMP TE replies differently than the
+            // original probes). Check the shared NAT session table.
+            if let Ok(nat_sessions) = shared_nat_sessions.lock() {
+                if let Some(entry) = nat_sessions.get(&reply_key) {
+                    let nat = entry.decision.nat;
+                    let original_src = entry.key.src_ip;
+                    let original_src_port = entry.key.src_port;
+                    let resolution = lookup_forwarding_resolution_with_dynamic(
+                        forwarding, dynamic_neighbors, original_src,
+                    );
+                    return Some(EmbeddedIcmpMatch {
+                        nat,
+                        original_src,
+                        original_src_port,
+                        embedded_proto: emb_protocol,
+                        resolution,
+                        metadata: entry.metadata.clone(),
+                    });
+                }
             }
             // Fallback: direct/reversed session lookup (non-NAT case or
             // session key matches directly).
@@ -8067,6 +8090,25 @@ fn try_embedded_icmp_nat_match_from_frame(
                     resolution,
                     metadata: fwd.metadata,
                 });
+            }
+            // Cross-worker fallback via shared NAT sessions.
+            if let Ok(nat_sessions) = shared_nat_sessions.lock() {
+                if let Some(entry) = nat_sessions.get(&reply_key) {
+                    let nat = entry.decision.nat;
+                    let original_src = entry.key.src_ip;
+                    let original_src_port = entry.key.src_port;
+                    let resolution = lookup_forwarding_resolution_with_dynamic(
+                        forwarding, dynamic_neighbors, original_src,
+                    );
+                    return Some(EmbeddedIcmpMatch {
+                        nat,
+                        original_src,
+                        original_src_port,
+                        embedded_proto: emb_protocol,
+                        resolution,
+                        metadata: entry.metadata.clone(),
+                    });
+                }
             }
             let lookup = sessions.lookup(&embedded_key, now_ns, 0).or_else(|| {
                 let reversed = SessionKey {
