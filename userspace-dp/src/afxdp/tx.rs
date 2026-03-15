@@ -296,6 +296,11 @@ pub(super) fn transmit_batch(
             break;
         };
         if req.bytes.len() > tx_frame_capacity() {
+            // Unwind already-prepared entries before returning.
+            for (off, r) in binding.scratch_local_tx.drain(..) {
+                binding.free_tx_frames.push_back(off);
+                pending.push_front(r);
+            }
             return Err(TxError::Drop(format!(
                 "local tx frame exceeds UMEM frame capacity: len={} cap={}",
                 req.bytes.len(),
@@ -313,6 +318,11 @@ pub(super) fn transmit_batch(
                 .slice_mut_unchecked(offset as usize, req.bytes.len())
         }) else {
             binding.free_tx_frames.push_front(offset);
+            // Unwind already-prepared entries before returning.
+            for (off, r) in binding.scratch_local_tx.drain(..) {
+                binding.free_tx_frames.push_back(off);
+                pending.push_front(r);
+            }
             return Err(TxError::Drop(format!(
                 "tx frame slice out of range: offset={offset} len={}",
                 req.bytes.len()
