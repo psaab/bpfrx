@@ -575,36 +575,19 @@ pub(super) fn enqueue_pending_forwards(
         apply_shared_recycles(left, ingress_binding, right, &mut post_recycles);
         update_binding_debug_state(ingress_binding);
         if build_failed {
-            dbg.build_fail += 1;
-            #[cfg(feature = "debug-log")]
-            if dbg.build_fail <= 3 {
-                debug_log!(
-                    "DBG BUILD_FAIL: target_ifindex={} len={} fallback_slow={}",
-                    request.target_ifindex,
-                    request.desc.len,
-                    fallback_to_slow_path,
-                );
-            }
-            record_exception(
-                recent_exceptions,
+            handle_forward_build_failure(
                 ingress_ident,
-                "forward_build_failed",
+                ingress_live,
+                slow_path,
+                recent_exceptions,
+                dbg,
+                request.target_ifindex,
                 request.desc.len,
-                Some(request.meta),
-                None,
+                source_frame,
+                request.meta,
+                request.decision,
+                fallback_to_slow_path,
             );
-            if fallback_to_slow_path {
-                maybe_reinject_slow_path_from_frame(
-                    ingress_ident,
-                    ingress_live,
-                    slow_path,
-                    source_frame,
-                    request.meta,
-                    request.decision,
-                    recent_exceptions,
-                    "forward_build_slow_path",
-                );
-            }
             if !retained_source_frame {
                 ingress_binding.pending_fill_frames.push_back(source_offset);
             }
@@ -620,6 +603,51 @@ pub(super) fn enqueue_pending_forwards(
             let _ = drain_pending_fill(ingress_binding, now_ns);
         }
         update_binding_debug_state(ingress_binding);
+    }
+}
+
+pub(super) fn handle_forward_build_failure(
+    binding: &BindingIdentity,
+    live: &BindingLiveState,
+    slow_path: Option<&Arc<SlowPathReinjector>>,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    dbg: &mut DebugPollCounters,
+    _target_ifindex: i32,
+    packet_length: u32,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    decision: SessionDecision,
+    fallback_to_slow_path: bool,
+) {
+    dbg.build_fail += 1;
+    #[cfg(feature = "debug-log")]
+    if dbg.build_fail <= 3 {
+        debug_log!(
+            "DBG BUILD_FAIL: target_ifindex={} len={} fallback_slow={}",
+            _target_ifindex,
+            packet_length,
+            fallback_to_slow_path,
+        );
+    }
+    record_exception(
+        recent_exceptions,
+        binding,
+        "forward_build_failed",
+        packet_length,
+        Some(meta),
+        None,
+    );
+    if fallback_to_slow_path {
+        maybe_reinject_slow_path_from_frame(
+            binding,
+            live,
+            slow_path,
+            frame,
+            meta,
+            decision,
+            recent_exceptions,
+            "forward_build_slow_path",
+        );
     }
 }
 

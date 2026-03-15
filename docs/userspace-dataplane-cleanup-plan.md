@@ -19,10 +19,10 @@ Current execution state as of 2026-03-15:
 
 1. Phase 1 is complete and merged on `master` via PR `#222`.
 2. Phase 2 is complete and merged on `master` via PR `#225`.
-3. Phase 3 is complete on the current branch via PR `#228`.
-4. Phase 4 is complete on the current branch and ready for PR review.
-5. Phase 5 is in progress on the current branch and is partially complete on
-   `master` via PR `#221`.
+3. Phase 3 is complete and merged on `master` via PR `#228`.
+4. Phase 4 is complete and merged on `master` via PR `#229`.
+5. Phase 5 is complete on the current branch; the traceroute / harness pieces
+   are already merged on `master` via PRs `#221` and `#230`.
 6. Phase 6 has not started as a formal cleanup phase yet.
 
 Latest status-sync update for this document:
@@ -73,9 +73,9 @@ Completed under this plan:
 
 Still left to do at a high level:
 
-1. Finish the remaining regression hardening in Phase 5 beyond the TTL /
-   hop-limit shell-harness fix.
-2. Only then do the serious sustained-throughput optimization work in Phase 6.
+1. Merge the final Phase 5 regression-coverage completion work.
+2. Start the sustained-throughput optimization work in Phase 6 on top of the
+   cleaned dataplane surface.
 
 ## Current Baseline
 
@@ -253,7 +253,7 @@ Phase 2 result:
 
 ## Phase 3: Tuple Authority And Session Resolution Cleanup
 
-Status: Complete On Branch, Ready For PR
+Status: Complete And Merged
 
 Completed:
 
@@ -292,8 +292,7 @@ Completed:
 
 Delivered in:
 
-1. Current branch commits after the Phase 2 base carry the completed Phase 3
-   session-resolution cleanup and the matching documentation update.
+1. PR `#228`
 2. Additional note:
    - the standard validator shell path currently aborts early on TTL probes
      because `ping -t 1` returns a non-zero exit status even when the expected
@@ -332,14 +331,15 @@ inconsistent ownership of the packet tuple and NAT state.
 
 Phase 3 result:
 
-1. Achieved on the branch and validated live on the isolated userspace HA lab.
+1. Achieved and merged on `master`; validated live on the isolated userspace HA
+   lab.
 2. The remaining validation issue for traceroute checks is now in the shell
    harness, not in the Rust dataplane.
 3. The next cleanup phase is Phase 4.
 
 ## Phase 4: AF_XDP Queue, TX, And Recycle Cleanup
 
-Status: Complete On Current Branch, Pending PR
+Status: Complete And Merged
 
 Completed:
 
@@ -401,8 +401,8 @@ performance tuning.
 
 Phase 4 result:
 
-1. Achieved on the current branch and validated live on the isolated userspace
-   HA lab.
+1. Achieved and merged on `master`; validated live on the isolated userspace HA
+   lab.
 2. Queue and completion ownership is now explicit enough to reason about from
    `userspace-dp/src/afxdp/tx.rs`.
 3. The next cleanup phase is Phase 5 validation hardening, starting with the
@@ -410,7 +410,7 @@ Phase 4 result:
 
 ## Phase 5: Validation And Regression Hardening
 
-Status: In Progress
+Status: Complete On Current Branch, Ready For PR
 
 Completed so far:
 
@@ -430,21 +430,31 @@ Completed so far:
    - slow-path fallback no-op behavior for forward-candidate traffic
    - slow-path extract-failure accounting
    - slow-path unavailable accounting
+7. On the current branch, tuple-authority regression coverage now also checks:
+   - metadata tuple preference when the flow tuple is absent
+   - live-frame fallback when metadata ports are missing
+8. On the current branch, embedded ICMP NAT reversal now has direct regression
+   coverage for shared-NAT-session lookup across worker scopes.
+9. On the current branch, the exact `enqueue_pending_forwards` build-failure
+   path is now covered through the extracted `handle_forward_build_failure(...)`
+   helper, including:
+   - `forward_build_failed`
+   - `forward_build_slow_path`
+   - no-fallback build-failure behavior
 
 Delivered in:
 
 1. PR `#221`
-2. Commit:
+2. PR `#230`
+3. Commit:
    - `4a5006f` `test: add traceroute checks to userspace validation`
+4. Current branch commit(s) complete the remaining direct regression coverage
+   for tuple authority, embedded ICMP shared-NAT lookup, and the
+   `enqueue_pending_forwards` build-failure fallback path.
 
 Still left:
 
-1. Add more direct regression coverage for tuple authority and embedded ICMP
-   corner cases beyond the current non-error / no-match coverage.
-2. Add end-to-end regression coverage for the specific AF_XDP forward-build
-   failure path inside `enqueue_pending_forwards`, not just the lower-level
-   slow-path fallback helpers.
-3. Keep synchronized capture workflows available as diagnosis tools, not first
+1. Keep synchronized capture workflows available as diagnosis tools, not first
    line validation.
 
 ### Purpose
@@ -480,15 +490,24 @@ Move current manual failure discovery into repeatable test coverage.
 2. The standard validation workflow catches the main correctness regressions.
 3. Manual capture/debug skills remain for diagnosis, not for basic detection.
 
+Phase 5 result:
+
+1. Achieved on the current branch.
+2. Traceroute, throughput-cliff detection, tuple-authority regressions,
+   embedded ICMP shared-scope lookup, and AF_XDP forward-build failure fallback
+   now all have direct automated coverage.
+3. The remaining work under this plan is Phase 6 performance optimization.
+
 ## Phase 6: Performance Optimization On A Cleaner Base
 
 Status: Not Started
 
 Why it is still deferred:
 
-1. Phase 4 queue/frame lifecycle cleanup has not started formally yet.
-2. Performance work before that phase would stack new tuning on top of code
-   that is still too hard to reason about.
+1. The cleanup phases are now far enough along that Phase 6 can start cleanly,
+   but it has not been kicked off as a dedicated workstream yet.
+2. Performance work should now proceed against the cleaned Phase 1-5 baseline
+   instead of the older monolithic / lightly-tested dataplane.
 
 ### Purpose
 
@@ -542,12 +561,10 @@ This order is deliberate.
 
 ## Immediate Next Steps
 
-1. Start Phase 3 by making tuple authority explicit at each stage of packet
-   processing.
-2. Consolidate reverse-session and NAT-reverse lookup paths now that the helper
-   clusters live in separate modules.
+1. Merge the final Phase 5 regression-coverage completion work.
+2. Start Phase 6 with a fresh live profile on the cleaned dataplane baseline.
 3. Keep the resolved driver split intact:
    - `mlx5_core` on zerocopy UMEM-owner
    - `virtio_net` on auto-mode copy UMEM-owner
-4. Keep the new traceroute and `mtr` checks as the mandatory correctness gate
-   for any Phase 3 or Phase 4 changes.
+4. Keep the traceroute, `mtr`, and throughput-collapse checks as the mandatory
+   correctness gate for any Phase 6 performance changes.
