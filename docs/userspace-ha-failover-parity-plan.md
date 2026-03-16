@@ -16,14 +16,21 @@ request chassis cluster failover redundancy-group 1 node <peer>
 Current status:
 
 - the original userspace failover collapse is fixed in the local working tree
+- current `master` still shows a bounded but unacceptable failover trough in the
+  dedicated validator:
+  - `5` zero-throughput intervals on `master` during RG1 failover
+- this branch closes that remaining single-failover gap too
 - exact repro now survives:
   - `iperf3 -c 172.16.80.200 -P 4 -t 60`
   - `request chassis cluster failover redundancy-group 1 node 1`
 - latest manual validation result:
   - `0` zero-throughput `SUM` intervals after failover
   - final 60s sender rate: `15.8 Gbps`
-- remaining work is now parity hardening and stress coverage, not first-fix
-  bring-up
+- latest scripted validation result on this branch:
+  - `0` zero-throughput intervals after RG1 failover
+  - sender throughput: `17.4 Gbps`
+- remaining work is now parity hardening, repeated failover stress, and
+  post-move cold-connect latency, not first-fix bring-up
 
 This is not a generic whole-node reboot problem. It is an active/active per-RG
 handoff problem where existing flows must survive a WAN RG ownership move.
@@ -115,6 +122,36 @@ Result:
 1. the new owner now preserves the TCP flow across the RG move
 2. the exact 60-second `iperf3` repro survives failover
 
+### 3. Synced Sessions Lost Original `fabric_ingress`
+
+Cluster session sync preserved the flow key, NAT fields, and cached forwarding
+state, but it did not preserve whether the original flow arrived from the peer
+fabric. Reconstructed synced sessions on the peer were therefore rebuilt with
+`fabric_ingress=false`.
+
+Effect:
+
+1. the peer helper lost the correct reverse-session return semantics after takeover
+2. current `master` could still show multiple zero-throughput intervals during
+   the RG1 failover validator even though the flow eventually survived
+3. the first post-failover packets depended on slower re-learning rather than
+   landing directly on the correct fabric-aware session metadata
+
+Fix:
+
+1. export `fabric_ingress` in userspace session deltas
+2. preserve it through the daemon session-sync bridge
+3. mirror it into `SessionSyncRequest`
+4. rebuild synced sessions in the Rust helper with the original
+   `fabric_ingress` metadata intact
+
+Result:
+
+1. the dedicated RG1 failover validator now passes with `0` zero-throughput
+   intervals on this branch
+2. synced-session takeover preserves the same fabric-aware return semantics as
+   the original forward session
+
 ## Known Gaps Between Userspace And eBPF
 
 ### 1. Dedicated Failover Validation Needs One More Tightening Pass
@@ -150,7 +187,7 @@ That is more moving pieces than the legacy conntrack path.
 
 ### 3. Userspace Session Sync Still Preserves A Thinner Forwarding Snapshot
 
-The userspace sync request format can carry:
+The userspace sync request format now carries:
 
 1. `egress_ifindex`
 2. `tx_ifindex`
@@ -159,6 +196,7 @@ The userspace sync request format can carry:
 5. `neighbor_mac`
 6. `src_mac`
 7. NAT rewrite fields
+8. `fabric_ingress`
 
 But the userspace delta bridge in
 [pkg/daemon/daemon.go](../pkg/daemon/daemon.go)
@@ -214,7 +252,7 @@ Status: First Critical Gap Fixed
 
 ### Phase D: Forwarding Metadata Parity
 
-Status: In Progress
+Status: First Critical Gap Fixed
 
 1. Compare userspace session-sync payload shape against the legacy conntrack shape.
 2. Extend userspace sync payload if failover requires more cached forwarding metadata.
@@ -250,9 +288,8 @@ Userspace reaches parity for this problem when all of the following are true:
 
 ## Immediate Next Steps
 
-1. rerun the dedicated failover validator after the reachability-preflight fix
-   and make it the standard RG1 gate
-2. investigate the residual post-failover `missing_neighbor` exceptions on the
-   new owner even though the TCP flow now survives
-3. compare repeated failover / failback behavior against the legacy eBPF stress
+1. promote the dedicated failover validator to the standard RG1 acceptance gate
+2. compare repeated failover / failback behavior against the legacy eBPF stress
    tests and close any remaining parity gaps
+3. close the remaining post-move cold-connect latency gap so the first new
+   connection after RG ownership change does not need a warm-up round

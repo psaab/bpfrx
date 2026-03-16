@@ -670,10 +670,17 @@ type SessionCountValue struct {
 	Count uint32
 }
 
-// Per-rule logging flags (matches C LOG_FLAG_* defines).
+// Per-rule logging flags (matches C LOG_FLAG_* defines in bpf/headers/).
 const (
 	LogFlagSessionInit  = 1 << 0
 	LogFlagSessionClose = 1 << 1
+)
+
+// Userspace-only session sync metadata piggybacked through SessionValue.LogFlags.
+// These bits are NOT defined in the BPF C headers — they are only used by the
+// Go/Rust userspace dataplane for session sync and are never written by eBPF.
+const (
+	LogFlagUserspaceFabricIngress = 1 << 7
 )
 
 // Event type constants.

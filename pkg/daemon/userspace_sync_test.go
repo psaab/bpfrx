@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/psaab/bpfrx/pkg/cluster"
+	"github.com/psaab/bpfrx/pkg/dataplane"
 	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 )
 
@@ -28,6 +29,7 @@ func TestUserspaceSessionFromDeltaV4(t *testing.T) {
 		SrcMAC:        "02:bf:72:00:50:08",
 		NATSrcIP:      "172.16.80.8",
 		NATSrcPort:    40000,
+		FabricIngress: true,
 	}
 
 	key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
@@ -61,6 +63,9 @@ func TestUserspaceSessionFromDeltaV4(t *testing.T) {
 	if userspaceNetworkToHost16(val.ReverseKey.DstPort) != 40000 {
 		t.Fatalf("unexpected reverse dst port: %d", val.ReverseKey.DstPort)
 	}
+	if val.LogFlags&dataplane.LogFlagUserspaceFabricIngress == 0 {
+		t.Fatalf("expected fabric ingress marker in log flags: %#x", val.LogFlags)
+	}
 }
 
 func TestUserspaceSessionFromDeltaV6(t *testing.T) {
@@ -83,6 +88,7 @@ func TestUserspaceSessionFromDeltaV6(t *testing.T) {
 		SrcMAC:        "02:bf:72:00:50:08",
 		NATSrcIP:      "2001:559:8585:80::8",
 		NATSrcPort:    40000,
+		FabricIngress: true,
 	}
 
 	key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
@@ -115,6 +121,9 @@ func TestUserspaceSessionFromDeltaV6(t *testing.T) {
 	}
 	if userspaceNetworkToHost16(val.ReverseKey.DstPort) != 40000 {
 		t.Fatalf("unexpected reverse dst port: %d", val.ReverseKey.DstPort)
+	}
+	if val.LogFlags&dataplane.LogFlagUserspaceFabricIngress == 0 {
+		t.Fatalf("expected fabric ingress marker in log flags: %#x", val.LogFlags)
 	}
 }
 

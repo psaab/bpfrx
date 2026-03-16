@@ -508,6 +508,7 @@ type SessionSyncRequest struct {
 	NATDstIP      string `json:"nat_dst_ip,omitempty"`
 	NATSrcPort    uint16 `json:"nat_src_port,omitempty"`
 	NATDstPort    uint16 `json:"nat_dst_port,omitempty"`
+	FabricIngress bool   `json:"fabric_ingress,omitempty"`
 	IsReverse     bool   `json:"is_reverse,omitempty"`
 }
 
@@ -538,4 +539,5 @@ type SessionDeltaInfo struct {
 	NATDstIP      string    `json:"nat_dst_ip,omitempty"`
 	NATSrcPort    uint16    `json:"nat_src_port,omitempty"`
 	NATDstPort    uint16    `json:"nat_dst_port,omitempty"`
+	FabricIngress bool      `json:"fabric_ingress,omitempty"`
 }
