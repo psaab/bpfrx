@@ -129,19 +129,33 @@ pub(super) fn apply_worker_commands(
         match cmd {
             WorkerCommand::UpsertSynced(entry) => {
                 let key = entry.key.clone();
-                sessions.upsert_synced(
+                let is_reverse = entry.metadata.is_reverse;
+                if sessions.upsert_synced(
                     entry.key,
                     entry.decision,
                     entry.metadata,
                     now_ns,
                     entry.protocol,
                     entry.tcp_flags,
-                );
-                let _ = publish_live_session_key(session_map_fd, &key);
+                ) {
+                    let _ = publish_live_session_entry(
+                        session_map_fd,
+                        &key,
+                        entry.decision.nat,
+                        is_reverse,
+                    );
+                }
             }
             WorkerCommand::DeleteSynced(key) => {
+                let delete_alias = sessions.lookup(&key, now_ns, 0).map(|lookup| {
+                    (lookup.decision.nat, lookup.metadata.is_reverse)
+                });
                 sessions.delete(&key);
-                delete_live_session_key(session_map_fd, &key);
+                if let Some((nat, is_reverse)) = delete_alias {
+                    delete_live_session_entry(session_map_fd, &key, nat, is_reverse);
+                } else {
+                    delete_live_session_key(session_map_fd, &key);
+                }
             }
         }
     }
@@ -198,6 +212,7 @@ pub(super) fn teardown_tcp_rst_flow(
     sessions: &mut SessionTable,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forward_key: &SessionKey,
     nat: NatDecision,
@@ -206,10 +221,20 @@ pub(super) fn teardown_tcp_rst_flow(
     let reverse_key = reverse_session_key(forward_key, nat);
     sessions.delete(forward_key);
     sessions.delete(&reverse_key);
-    delete_live_session_key(current.session_map_fd, forward_key);
-    delete_live_session_key(current.session_map_fd, &reverse_key);
-    remove_shared_session(shared_sessions, shared_nat_sessions, forward_key);
-    remove_shared_session(shared_sessions, shared_nat_sessions, &reverse_key);
+    delete_live_session_entry(current.session_map_fd, forward_key, nat, false);
+    delete_live_session_entry(current.session_map_fd, &reverse_key, nat, true);
+    remove_shared_session(
+        shared_sessions,
+        shared_nat_sessions,
+        shared_forward_wire_sessions,
+        forward_key,
+    );
+    remove_shared_session(
+        shared_sessions,
+        shared_nat_sessions,
+        shared_forward_wire_sessions,
+        &reverse_key,
+    );
     replicate_session_delete(peer_worker_commands, forward_key);
     replicate_session_delete(peer_worker_commands, &reverse_key);
     cancel_pending_forwards(current, pending_forwards, forward_key, &reverse_key);
@@ -354,15 +379,27 @@ pub(super) fn lookup_shared_forward_nat_match(
         .and_then(|sessions| sessions.get(reply_key).cloned())
 }
 
+pub(super) fn lookup_shared_forward_wire_match(
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    wire_key: &SessionKey,
+) -> Option<SyncedSessionEntry> {
+    shared_forward_wire_sessions
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(wire_key).cloned())
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct ResolvedSessionLookup {
+    pub(super) key: SessionKey,
     pub(super) lookup: SessionLookup,
     pub(super) shared_entry: Option<SyncedSessionEntry>,
 }
 
 impl ResolvedSessionLookup {
-    fn local(lookup: SessionLookup) -> Self {
+    fn local(key: SessionKey, lookup: SessionLookup) -> Self {
         Self {
+            key,
             lookup,
             shared_entry: None,
         }
@@ -370,6 +407,7 @@ impl ResolvedSessionLookup {
 
     fn shared(entry: SyncedSessionEntry) -> Self {
         Self {
+            key: entry.key.clone(),
             lookup: SessionLookup {
                 decision: entry.decision,
                 metadata: entry.metadata.clone(),
@@ -389,14 +427,30 @@ pub(super) struct ResolvedFlowSessionDecision {
 pub(super) fn lookup_session_across_scopes(
     sessions: &mut SessionTable,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     key: &SessionKey,
     now_ns: u64,
     tcp_flags: u8,
 ) -> Option<ResolvedSessionLookup> {
     sessions
         .lookup(key, now_ns, tcp_flags)
-        .map(ResolvedSessionLookup::local)
+        .map(|lookup| ResolvedSessionLookup::local(key.clone(), lookup))
+        .or_else(|| {
+            sessions.find_forward_wire_match(key).map(|matched| {
+                ResolvedSessionLookup::local(
+                    matched.key,
+                    SessionLookup {
+                        decision: matched.decision,
+                        metadata: matched.metadata,
+                    },
+                )
+            })
+        })
         .or_else(|| lookup_shared_session(shared_sessions, key).map(ResolvedSessionLookup::shared))
+        .or_else(|| {
+            lookup_shared_forward_wire_match(shared_forward_wire_sessions, key)
+                .map(ResolvedSessionLookup::shared)
+        })
 }
 
 pub(super) fn lookup_forward_nat_across_scopes(
@@ -485,17 +539,23 @@ pub(super) fn reverse_resolution_for_session(
     fabric_ingress: bool,
     now_secs: u64,
 ) -> ForwardingResolution {
+    let resolved = lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip);
     if fabric_ingress
+        && owner_rg_for_flow(forwarding, resolved.egress_ifindex) > 0
+        && !matches!(
+            ha_state.get(&owner_rg_for_flow(forwarding, resolved.egress_ifindex)),
+            Some(group)
+                if group.active
+                    && group.watchdog_timestamp != 0
+                    && now_secs >= group.watchdog_timestamp
+                    && now_secs.saturating_sub(group.watchdog_timestamp)
+                        <= HA_WATCHDOG_STALE_AFTER_SECS
+        )
         && let Some(redirect) = resolve_zone_encoded_fabric_redirect(forwarding, ingress_zone)
     {
         return redirect;
     }
-    enforce_ha_resolution_snapshot(
-        forwarding,
-        ha_state,
-        now_secs,
-        lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip),
-    )
+    enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, resolved)
 }
 
 fn install_reverse_session_from_forward_match(
@@ -503,6 +563,7 @@ fn install_reverse_session_from_forward_match(
     session_map_fd: c_int,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
@@ -529,7 +590,7 @@ fn install_reverse_session_from_forward_match(
         protocol,
         tcp_flags,
     ) {
-        let _ = publish_live_session_key(session_map_fd, reverse_key);
+        let _ = publish_live_session_entry(session_map_fd, reverse_key, reverse.decision.nat, true);
         let reverse_entry = SyncedSessionEntry {
             key: reverse_key.clone(),
             decision: reverse.decision,
@@ -537,7 +598,12 @@ fn install_reverse_session_from_forward_match(
             protocol,
             tcp_flags,
         };
-        publish_shared_session(shared_sessions, shared_nat_sessions, &reverse_entry);
+        publish_shared_session(
+            shared_sessions,
+            shared_nat_sessions,
+            shared_forward_wire_sessions,
+            &reverse_entry,
+        );
         replicate_session_upsert(peer_worker_commands, &reverse_entry);
     }
     reverse
@@ -548,6 +614,7 @@ fn maybe_promote_synced_session(
     session_map_fd: c_int,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
     key: &SessionKey,
@@ -569,7 +636,7 @@ fn maybe_promote_synced_session(
         promoted.owner_rg_id = owner_rg_for_flow(forwarding, decision.resolution.egress_ifindex);
     }
     if sessions.promote_synced(key, decision, promoted.clone(), now_ns, protocol, tcp_flags) {
-        let _ = publish_live_session_key(session_map_fd, key);
+        let _ = publish_live_session_entry(session_map_fd, key, decision.nat, promoted.is_reverse);
         let promoted_entry = SyncedSessionEntry {
             key: key.clone(),
             decision,
@@ -577,7 +644,12 @@ fn maybe_promote_synced_session(
             protocol,
             tcp_flags,
         };
-        publish_shared_session(shared_sessions, shared_nat_sessions, &promoted_entry);
+        publish_shared_session(
+            shared_sessions,
+            shared_nat_sessions,
+            shared_forward_wire_sessions,
+            &promoted_entry,
+        );
         replicate_session_upsert(peer_worker_commands, &promoted_entry);
     }
     promoted
@@ -588,6 +660,7 @@ pub(super) fn resolve_flow_session_decision(
     session_map_fd: c_int,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
@@ -599,23 +672,31 @@ pub(super) fn resolve_flow_session_decision(
     tcp_flags: u8,
     ingress_ifindex: i32,
 ) -> Option<ResolvedFlowSessionDecision> {
-    let (resolved, created) = if let Some(hit) = lookup_session_across_scopes(
+    let (resolved_key, resolved, created) = if let Some(hit) = lookup_session_across_scopes(
         sessions,
         shared_sessions,
+        shared_forward_wire_sessions,
         &flow.forward_key,
         now_ns,
         tcp_flags,
     ) {
-        (materialize_shared_session_hit(sessions, hit, now_ns, tcp_flags), false)
+        let resolved_key = hit.key.clone();
+        (
+            resolved_key,
+            materialize_shared_session_hit(sessions, hit, now_ns, tcp_flags),
+            false,
+        )
     } else {
         let forward_match =
             lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)?;
         (
+            flow.forward_key.clone(),
             install_reverse_session_from_forward_match(
                 sessions,
                 session_map_fd,
                 shared_sessions,
                 shared_nat_sessions,
+                shared_forward_wire_sessions,
                 peer_worker_commands,
                 forwarding,
                 ha_state,
@@ -647,9 +728,10 @@ pub(super) fn resolve_flow_session_decision(
         session_map_fd,
         shared_sessions,
         shared_nat_sessions,
+        shared_forward_wire_sessions,
         peer_worker_commands,
         forwarding,
-        &flow.forward_key,
+        &resolved_key,
         decision,
         resolved.metadata,
         now_ns,
@@ -666,6 +748,7 @@ pub(super) fn resolve_flow_session_decision(
 pub(super) fn publish_shared_session(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     entry: &SyncedSessionEntry,
 ) {
     if let Ok(mut sessions) = shared_sessions.lock() {
@@ -674,16 +757,27 @@ pub(super) fn publish_shared_session(
     if !entry.metadata.is_reverse
         && let Ok(mut sessions) = shared_nat_sessions.lock()
     {
-        sessions.insert(
-            reverse_session_key(&entry.key, entry.decision.nat),
-            entry.clone(),
-        );
+        let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
+        sessions.insert(reverse_wire.clone(), entry.clone());
+        let reverse_canonical = reverse_canonical_key(&entry.key, entry.decision.nat);
+        if reverse_canonical != reverse_wire {
+            sessions.insert(reverse_canonical, entry.clone());
+        }
+    }
+    if !entry.metadata.is_reverse
+        && let Ok(mut sessions) = shared_forward_wire_sessions.lock()
+    {
+        let wire_key = forward_wire_key(&entry.key, entry.decision.nat);
+        if wire_key != entry.key {
+            sessions.insert(wire_key, entry.clone());
+        }
     }
 }
 
 pub(super) fn remove_shared_session(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     key: &SessionKey,
 ) {
     if let Ok(mut sessions) = shared_sessions.lock()
@@ -691,7 +785,18 @@ pub(super) fn remove_shared_session(
         && !entry.metadata.is_reverse
         && let Ok(mut nat_sessions) = shared_nat_sessions.lock()
     {
-        nat_sessions.remove(&reverse_session_key(&entry.key, entry.decision.nat));
+        let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
+        nat_sessions.remove(&reverse_wire);
+        let reverse_canonical = reverse_canonical_key(&entry.key, entry.decision.nat);
+        if reverse_canonical != reverse_wire {
+            nat_sessions.remove(&reverse_canonical);
+        }
+        if let Ok(mut forward_wire_sessions) = shared_forward_wire_sessions.lock() {
+            let wire_key = forward_wire_key(&entry.key, entry.decision.nat);
+            if wire_key != entry.key {
+                forward_wire_sessions.remove(&wire_key);
+            }
+        }
     }
 }
 
@@ -758,14 +863,68 @@ mod tests {
             tcp_flags: 0,
         };
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
         shared_sessions
             .lock()
             .expect("shared lock")
             .insert(key.clone(), entry.clone());
 
-        let resolved = lookup_session_across_scopes(&mut sessions, &shared_sessions, &key, 1, 0)
-            .expect("shared hit");
+        let resolved = lookup_session_across_scopes(
+            &mut sessions,
+            &shared_sessions,
+            &shared_forward_wire_sessions,
+            &key,
+            1,
+            0,
+        )
+        .expect("shared hit");
         assert!(resolved.shared_entry.is_some());
+        assert_eq!(resolved.key, key);
+        assert_eq!(resolved.lookup.decision, entry.decision);
+        assert_eq!(resolved.lookup.metadata, entry.metadata);
+    }
+
+    #[test]
+    fn lookup_session_across_scopes_returns_shared_forward_wire_entry() {
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        let entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision,
+            metadata: SessionMetadata {
+                synced: true,
+                ..test_metadata()
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let translated_key = forward_wire_key(&key, decision.nat);
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        shared_forward_wire_sessions
+            .lock()
+            .expect("shared forward-wire lock")
+            .insert(translated_key.clone(), entry.clone());
+
+        let resolved = lookup_session_across_scopes(
+            &mut sessions,
+            &shared_sessions,
+            &shared_forward_wire_sessions,
+            &translated_key,
+            1,
+            0,
+        )
+        .expect("shared forward-wire hit");
+        assert!(resolved.shared_entry.is_some());
+        assert_eq!(resolved.key, key);
         assert_eq!(resolved.lookup.decision, entry.decision);
         assert_eq!(resolved.lookup.metadata, entry.metadata);
     }
@@ -810,5 +969,202 @@ mod tests {
         assert_eq!(hit.key, entry.key);
         assert_eq!(hit.decision, entry.decision);
         assert_eq!(hit.metadata, entry.metadata);
+    }
+
+    #[test]
+    fn lookup_forward_nat_across_scopes_returns_shared_canonical_reverse_entry() {
+        let sessions = SessionTable::new();
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        let entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision,
+            metadata: SessionMetadata {
+                synced: true,
+                ..test_metadata()
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let canonical_reply = reverse_canonical_key(&key, decision.nat);
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        shared_nat_sessions
+            .lock()
+            .expect("shared nat lock")
+            .insert(canonical_reply.clone(), entry.clone());
+
+        let hit =
+            lookup_forward_nat_across_scopes(&sessions, &shared_nat_sessions, &canonical_reply)
+                .expect("shared canonical reverse hit");
+        assert_eq!(hit.key, entry.key);
+        assert_eq!(hit.decision, entry.decision);
+        assert_eq!(hit.metadata, entry.metadata);
+    }
+
+    #[test]
+    fn publish_and_remove_shared_session_tracks_forward_wire_alias() {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        let entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision,
+            metadata: test_metadata(),
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let translated_key = forward_wire_key(&key, decision.nat);
+
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry,
+        );
+        let alias_hit = lookup_shared_forward_wire_match(
+            &shared_forward_wire_sessions,
+            &translated_key,
+        )
+        .expect("forward-wire alias should be published");
+        assert_eq!(alias_hit.key, key);
+
+        remove_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry.key,
+        );
+        assert!(
+            lookup_shared_forward_wire_match(&shared_forward_wire_sessions, &translated_key)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn publish_and_remove_shared_session_tracks_canonical_reverse_alias() {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        let entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision,
+            metadata: test_metadata(),
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let canonical_reply = reverse_canonical_key(&key, decision.nat);
+
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry,
+        );
+        let alias_hit = lookup_shared_forward_nat_match(&shared_nat_sessions, &canonical_reply)
+            .expect("canonical reverse alias should be published");
+        assert_eq!(alias_hit.key, key);
+
+        remove_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry.key,
+        );
+        assert!(lookup_shared_forward_nat_match(&shared_nat_sessions, &canonical_reply).is_none());
+    }
+
+    #[test]
+    fn resolve_flow_session_decision_uses_canonical_key_for_translated_forward_hit() {
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        let translated_key = forward_wire_key(&key, decision.nat);
+        let entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision,
+            metadata: SessionMetadata {
+                synced: true,
+                ..test_metadata()
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry,
+        );
+
+        let flow = SessionFlow {
+            src_ip: translated_key.src_ip,
+            dst_ip: translated_key.dst_ip,
+            forward_key: translated_key.clone(),
+        };
+        let forwarding = ForwardingState::default();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let peer_worker_commands = Vec::new();
+        let resolved = resolve_flow_session_decision(
+            &mut sessions,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &peer_worker_commands,
+            &forwarding,
+            &BTreeMap::new(),
+            &dynamic_neighbors,
+            &flow,
+            1_000_000,
+            1,
+            PROTO_TCP,
+            0x10,
+            0,
+        )
+        .expect("translated forward hit should resolve");
+
+        assert!(!resolved.created);
+        assert!(!resolved.metadata.synced);
+        assert!(sessions.lookup(&translated_key, 1_000_000, 0x10).is_none());
+        let local_hit = sessions
+            .find_forward_wire_match(&translated_key)
+            .expect("local canonical session should keep forward-wire alias");
+        assert_eq!(local_hit.key, key);
+        assert_eq!(resolved.decision.nat, decision.nat);
     }
 }

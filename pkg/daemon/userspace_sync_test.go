@@ -157,6 +157,54 @@ func TestUserspaceSessionFromDeltaUsesNetworkByteOrderPorts(t *testing.T) {
 	}
 }
 
+func TestUserspaceSessionFromDeltaV4PreservesPortForAddressOnlySNAT(t *testing.T) {
+	zoneIDs := map[string]uint16{"lan": 1, "wan": 2}
+	delta := dpuserspace.SessionDeltaInfo{
+		Event:       "open",
+		AddrFamily:  2,
+		Protocol:    6,
+		SrcIP:       "10.0.61.102",
+		DstIP:       "172.16.80.200",
+		SrcPort:     50952,
+		DstPort:     5201,
+		IngressZone: "lan",
+		EgressZone:  "wan",
+		NATSrcIP:    "172.16.80.8",
+	}
+
+	_, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
+	if !ok {
+		t.Fatal("expected v4 delta to convert")
+	}
+	if got := userspaceNetworkToHost16(val.NATSrcPort); got != delta.SrcPort {
+		t.Fatalf("nat src port roundtrip = %d, want %d", got, delta.SrcPort)
+	}
+}
+
+func TestUserspaceSessionFromDeltaV6PreservesPortForAddressOnlySNAT(t *testing.T) {
+	zoneIDs := map[string]uint16{"lan": 1, "wan": 2}
+	delta := dpuserspace.SessionDeltaInfo{
+		Event:       "open",
+		AddrFamily:  10,
+		Protocol:    6,
+		SrcIP:       "2001:559:8585:ef00::100",
+		DstIP:       "2001:559:8585:80::200",
+		SrcPort:     50952,
+		DstPort:     5201,
+		IngressZone: "lan",
+		EgressZone:  "wan",
+		NATSrcIP:    "2001:559:8585:80::8",
+	}
+
+	_, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
+	if !ok {
+		t.Fatal("expected v6 delta to convert")
+	}
+	if got := userspaceNetworkToHost16(val.NATSrcPort); got != delta.SrcPort {
+		t.Fatalf("nat src port roundtrip = %d, want %d", got, delta.SrcPort)
+	}
+}
+
 func TestShouldSyncUserspaceDeltaPrefersOwnerRG(t *testing.T) {
 	d := &Daemon{
 		sessionSync: &cluster.SessionSync{

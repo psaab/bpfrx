@@ -170,6 +170,7 @@ pub(super) fn try_embedded_icmp_nat_match(
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     now_ns: u64,
 ) -> Option<EmbeddedIcmpMatch> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
@@ -181,6 +182,7 @@ pub(super) fn try_embedded_icmp_nat_match(
         dynamic_neighbors,
         shared_sessions,
         shared_nat_sessions,
+        shared_forward_wire_sessions,
         now_ns,
     )
 }
@@ -194,6 +196,7 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     now_ns: u64,
 ) -> Option<EmbeddedIcmpMatch> {
     let l4 = meta.l4_offset as usize;
@@ -268,6 +271,7 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                 let resolution = embedded_icmp_return_resolution(
                     sessions,
                     shared_sessions,
+                    shared_forward_wire_sessions,
                     forwarding,
                     dynamic_neighbors,
                     &fwd.key,
@@ -284,10 +288,24 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                     metadata: fwd.metadata,
                 });
             }
-            lookup_session_across_scopes(sessions, shared_sessions, &embedded_key, now_ns, 0)
-                .or_else(|| {
-                    lookup_session_across_scopes(sessions, shared_sessions, &reverse_key, now_ns, 0)
-                })
+            lookup_session_across_scopes(
+                sessions,
+                shared_sessions,
+                shared_forward_wire_sessions,
+                &embedded_key,
+                now_ns,
+                0,
+            )
+            .or_else(|| {
+                lookup_session_across_scopes(
+                    sessions,
+                    shared_sessions,
+                    shared_forward_wire_sessions,
+                    &reverse_key,
+                    now_ns,
+                    0,
+                )
+            })
                 .map(|resolved| {
                     let sl = resolved.lookup;
                     let resolution = if sl.metadata.is_reverse {
@@ -296,6 +314,7 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                     embedded_icmp_return_resolution(
                         sessions,
                         shared_sessions,
+                        shared_forward_wire_sessions,
                         forwarding,
                         dynamic_neighbors,
                         &embedded_key,
@@ -370,6 +389,7 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                 let resolution = embedded_icmp_return_resolution(
                     sessions,
                     shared_sessions,
+                    shared_forward_wire_sessions,
                     forwarding,
                     dynamic_neighbors,
                     &fwd.key,
@@ -386,8 +406,15 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                     metadata: fwd.metadata,
                 });
             }
-            lookup_session_across_scopes(sessions, shared_sessions, &embedded_key, now_ns, 0)
-                .or_else(|| {
+            lookup_session_across_scopes(
+                sessions,
+                shared_sessions,
+                shared_forward_wire_sessions,
+                &embedded_key,
+                now_ns,
+                0,
+            )
+            .or_else(|| {
                     let shared_reverse_key = embedded_reply_key(
                         libc::AF_INET6 as u8,
                         emb_protocol,
@@ -399,6 +426,7 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                     lookup_session_across_scopes(
                         sessions,
                         shared_sessions,
+                        shared_forward_wire_sessions,
                         &shared_reverse_key,
                         now_ns,
                         0,
@@ -412,6 +440,7 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                     embedded_icmp_return_resolution(
                         sessions,
                         shared_sessions,
+                        shared_forward_wire_sessions,
                         forwarding,
                         dynamic_neighbors,
                         &embedded_key,
@@ -437,6 +466,7 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
 fn embedded_icmp_return_resolution(
     sessions: &mut SessionTable,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     forwarding: &ForwardingState,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     forward_key: &SessionKey,
@@ -445,9 +475,14 @@ fn embedded_icmp_return_resolution(
     now_ns: u64,
 ) -> ForwardingResolution {
     let reverse_key = reverse_session_key(forward_key, forward_decision.nat);
-    if let Some(reverse) =
-        lookup_session_across_scopes(sessions, shared_sessions, &reverse_key, now_ns, 0)
-    {
+    if let Some(reverse) = lookup_session_across_scopes(
+        sessions,
+        shared_sessions,
+        shared_forward_wire_sessions,
+        &reverse_key,
+        now_ns,
+        0,
+    ) {
         return reverse.lookup.decision.resolution;
     }
     lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, original_src)

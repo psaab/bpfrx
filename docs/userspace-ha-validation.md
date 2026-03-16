@@ -64,6 +64,12 @@ Dedicated RG failover survivability workflow:
 ./scripts/userspace-ha-failover-validation.sh
 ```
 
+Dedicated steady-state split-RG fabric workflow:
+
+```bash
+./scripts/userspace-ha-failover-validation.sh --steady-only --source-node 1 --target-node 0
+```
+
 Standard phase workflow:
 
 ```bash
@@ -83,6 +89,20 @@ This is the required sequence after each userspace dataplane phase:
 For failover-specific HA/session work, also run the dedicated RG failover
 validator. The steady-state validator is not enough to prove that an existing
 TCP flow survives a manual RG ownership move.
+
+For fabric-path performance and stream-stability work, also run the failover
+validator in `--steady-only` mode with RG1 pinned to the peer owner. That
+isolates the split-RG fabric path without failover churn and catches
+"starts fast, then all streams go to 0" regressions before any RG transition.
+
+Current use of that gate:
+
+- `--steady-only --source-node 1 --target-node 0` is the standard split-RG
+  fabric-path repro for the isolated userspace lab
+- the acceptance bar is:
+  - `0` aggregate zero-throughput intervals
+  - `0` per-stream zero-throughput intervals
+  - all streams still carrying traffic at the end of the steady-state window
 
 If the validation script is failing and you still need current performance data,
 run the perf-compare workflow next. It captures IPv4/IPv6 `iperf3` and `perf`
@@ -113,6 +133,17 @@ The validator does this in order:
     if throughput cliffs after startup
 15. retries one marginal near-threshold miss once
 16. optionally records `perf` data on the active firewall
+
+The dedicated RG failover validator now adds two stricter HA gates:
+
+1. a steady-state pre-failover observation window after session sync completes
+2. `0.00 bits/sec` enforcement during that window for both:
+   - aggregate `[SUM]` output
+   - individual `iperf3` streams
+
+This matters because a split-RG fabric-path bug can kill streams before the
+first failover. That must fail as a fabric regression, not be misclassified as
+a failover-survivability regression.
 
 ## Target And Interpretation
 

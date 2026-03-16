@@ -29,8 +29,29 @@ Current status:
 - latest scripted validation result on this branch:
   - `0` zero-throughput intervals after RG1 failover
   - sender throughput: `17.4 Gbps`
-- remaining work is now parity hardening, repeated failover stress, and
-  post-move cold-connect latency, not first-fix bring-up
+- latest strict split-RG steady-state validation result on this branch:
+  - `0` zero-throughput intervals before any failover
+  - `0` per-stream zero-throughput intervals
+  - sender throughput: `17.8 Gbps`
+- latest strict RG1 failover validation result on this branch:
+  - `0` zero-throughput intervals across the full run
+  - `0` per-stream zero-throughput intervals
+  - sender throughput: `6.70 Gbps`
+- the failover validator is now being hardened for stress parity:
+  - repeated failover / failback cycles
+  - per-stream `0.00 bits/sec` checks, not just `[SUM]`
+  - minimum-duration enforcement so `iperf3` cannot finish before the cycle plan
+  - zero-port TCP session preflight checks so stale session pollution does not
+    invalidate stress results
+- the validator now also has a `--steady-only` split-RG fabric mode and a strict
+  pre-failover observe window so "streams already dead before failover" is
+  caught as a steady-state fabric regression instead of a failover regression
+- remaining work is now parity hardening and performance parity:
+  - repeated failover stress
+  - higher split-RG fabric throughput
+  - higher post-failover throughput
+  - post-move cold-connect latency
+  not first-fix bring-up
 
 This is not a generic whole-node reboot problem. It is an active/active per-RG
 handoff problem where existing flows must survive a WAN RG ownership move.
@@ -152,6 +173,36 @@ Result:
 2. synced-session takeover preserves the same fabric-aware return semantics as
    the original forward session
 
+### 4. Passive Peer Reverse Resolution Re-Redirected Steady-State Fabric Returns
+
+The peer-side helper kept `fabric_ingress=true` on synced forward sessions and
+then treated that as an unconditional "send the reverse path back to fabric"
+signal when it had to derive a reverse session locally.
+
+Effect:
+
+1. the split-RG steady-state fabric path could start at line rate and then drop
+   all `iperf3` streams to `0.00 bits/sec` within a few seconds
+2. the passive peer accumulated huge session-miss counts while still
+   transmitting fabric traffic
+3. the bug reproduced even before the first failover, so it was contaminating
+   HA validation with a pure steady-state fabric failure
+
+Fix:
+
+1. keep the `fabric_ingress` hint
+2. but only use zone-encoded fabric redirect for the reverse path when the
+   target egress RG is inactive on the current node
+3. if the peer owns the client-side RG, resolve the reverse path locally
+   instead of bouncing it back across fabric
+
+Result:
+
+1. the strict split-RG steady-state validator now passes with `0`
+   zero-throughput intervals
+2. the failover validator still passes with `0` zero-throughput intervals
+3. the remaining gap is throughput parity, not stream collapse
+
 ## Known Gaps Between Userspace And eBPF
 
 ### 1. Dedicated Failover Validation Needs One More Tightening Pass
@@ -230,7 +281,9 @@ Status: Mostly Complete
 
 1. Add a dedicated userspace RG1 failover validation script.
 2. Make it prove that an existing `iperf3` flow survives a manual RG1 failover.
-3. Keep artifacts and state snapshots so failures are diagnosable after the run.
+3. Add a split-RG steady-state mode so fabric-link regressions can be isolated
+   without failover churn.
+4. Keep artifacts and state snapshots so failures are diagnosable after the run.
 
 ### Phase B: Observability Gap
 
@@ -269,13 +322,17 @@ Status: First Critical Gap Fixed
 
 ### Phase F: Stress Parity
 
-Status: Not Started
+Status: In Progress
 
 1. After single RG1 failover passes, add repeated failover / failback coverage.
 2. Use the legacy stress test semantics as the acceptance bar:
    - no dead streams
+   - no per-stream `0.00 bits/sec` intervals during the failover window
    - no permanent `0.00 bits/sec` intervals
    - throughput recovery after each failover window
+3. Require clean-state preflight before the stress run starts:
+   - no stale zero-port TCP sessions for the `iperf3` target
+   - no recycled old flow state hiding the current branch behavior
 
 ## Success Criteria
 
@@ -283,13 +340,21 @@ Userspace reaches parity for this problem when all of the following are true:
 
 1. a long-running `iperf3 -c 172.16.80.200 -P 4 -t 60` survives manual RG1 failover
 2. the new owner forwards the existing sessions without requiring a reconnect
-3. the dedicated userspace failover validator passes repeatably
-4. the remaining failover behavior is explained by the same rules as the eBPF dataplane
+3. repeated failover / failback stress does not collapse all streams to
+   `0.00 bits/sec`
+4. the dedicated userspace failover validator passes repeatably from a clean
+   session baseline
+5. the remaining failover behavior is explained by the same rules as the eBPF dataplane
 
 ## Immediate Next Steps
 
-1. promote the dedicated failover validator to the standard RG1 acceptance gate
-2. compare repeated failover / failback behavior against the legacy eBPF stress
-   tests and close any remaining parity gaps
-3. close the remaining post-move cold-connect latency gap so the first new
+1. rerun repeated failover / failback stress from a clean deploy so the result
+   is not contaminated by stale session state
+2. if repeated stress still fails, identify whether the new failure is:
+   - session sync corruption
+   - zero-port TCP session creation
+   - fabric-link forwarding continuity under repeated RG flips
+3. promote the dedicated failover validator to the standard RG1 acceptance gate
+   once the repeated-cycle stress case passes
+4. close the remaining post-move cold-connect latency gap so the first new
    connection after RG ownership change does not need a warm-up round
