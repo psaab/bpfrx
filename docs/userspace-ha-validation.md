@@ -13,8 +13,10 @@ Tracked inputs:
 - env: [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx/test/incus/loss-userspace-cluster.env)
 - config: [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx/docs/ha-cluster-userspace.conf)
 - validator: [userspace-ha-validation.sh](/home/ps/git/codex-bpfrx/scripts/userspace-ha-validation.sh)
+- failover validator: [userspace-ha-failover-validation.sh](/home/ps/git/codex-bpfrx/scripts/userspace-ha-failover-validation.sh)
 - phase cycle: [userspace-phase-cycle.sh](/home/ps/git/codex-bpfrx/scripts/userspace-phase-cycle.sh)
 - perf compare: [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx/scripts/userspace-perf-compare.sh)
+- failover parity plan: [userspace-ha-failover-parity-plan.md](/home/ps/git/codex-bpfrx/docs/userspace-ha-failover-parity-plan.md)
 
 ## Current Model
 
@@ -56,6 +58,12 @@ Perf-only compare workflow:
 ./scripts/userspace-perf-compare.sh
 ```
 
+Dedicated RG failover survivability workflow:
+
+```bash
+./scripts/userspace-ha-failover-validation.sh
+```
+
 Standard phase workflow:
 
 ```bash
@@ -71,6 +79,10 @@ This is the required sequence after each userspace dataplane phase:
    - `loss:bpfrx-userspace-fw0`
    - `loss:bpfrx-userspace-fw1`
 4. run the isolated userspace HA validation script
+
+For failover-specific HA/session work, also run the dedicated RG failover
+validator. The steady-state validator is not enough to prove that an existing
+TCP flow survives a manual RG ownership move.
 
 If the validation script is failing and you still need current performance data,
 run the perf-compare workflow next. It captures IPv4/IPv6 `iperf3` and `perf`
