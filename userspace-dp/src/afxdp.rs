@@ -1271,7 +1271,6 @@ struct BindingWorker {
     worker_id: u32,
     interface: Arc<str>,
     ifindex: i32,
-    identity: BindingIdentity,
     umem: WorkerUmem,
     live: Arc<BindingLiveState>,
     #[allow(dead_code)]
@@ -1607,13 +1606,6 @@ impl BindingWorker {
             worker_id: binding.worker_id,
             interface: Arc::<str>::from(binding.interface.as_str()),
             ifindex: binding.ifindex,
-            identity: BindingIdentity {
-                slot: binding.slot,
-                queue_id: binding.queue_id,
-                worker_id: binding.worker_id,
-                interface: Arc::<str>::from(binding.interface.as_str()),
-                ifindex: binding.ifindex,
-            },
             umem: worker_umem,
             live,
             user,
@@ -1668,7 +1660,13 @@ impl BindingWorker {
     }
 
     fn identity(&self) -> BindingIdentity {
-        self.identity.clone()
+        BindingIdentity {
+            slot: self.slot,
+            queue_id: self.queue_id,
+            worker_id: self.worker_id,
+            interface: self.interface.clone(),
+            ifindex: self.ifindex,
+        }
     }
 }
 
@@ -1871,18 +1869,19 @@ fn poll_binding(
     let Some((binding, right)) = rest.split_first_mut() else {
         return false;
     };
+    update_binding_debug_state(binding);
+    let area = (&binding.umem.area) as *const MmapArea;
+    let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
     let tx_work = drain_pending_tx(binding, now_ns, shared_recycles);
-    if !shared_recycles.is_empty() {
-        apply_shared_recycles(
-            left,
-            binding_index,
-            binding,
-            right,
-            binding_lookup,
-            shared_recycles,
-        );
-    }
+    apply_shared_recycles(
+        left,
+        binding_index,
+        binding,
+        right,
+        binding_lookup,
+        shared_recycles,
+    );
     let fill_work = drain_pending_fill(binding, now_ns);
     let mut did_work = tx_work || fill_work;
     binding.dbg_poll_cycles += 1;
@@ -1894,16 +1893,14 @@ fn poll_binding(
             binding.dbg_backpressure += 1;
             // Try to drain TX first — completions free frames for both TX and fill.
             let _ = drain_pending_tx(binding, now_ns, shared_recycles);
-            if !shared_recycles.is_empty() {
-                apply_shared_recycles(
-                    left,
-                    binding_index,
-                    binding,
-                    right,
-                    binding_lookup,
-                    shared_recycles,
-                );
-            }
+            apply_shared_recycles(
+                left,
+                binding_index,
+                binding,
+                right,
+                binding_lookup,
+                shared_recycles,
+            );
             // Critical: drain fill ring even under backpressure so the NIC can
             // still receive packets. Without this, fill ring starvation causes
             // mlx5 to fall back to non-XSK NAPI, leaking packets to the kernel.
@@ -1930,8 +1927,6 @@ fn poll_binding(
             return did_work;
         }
         binding.empty_rx_polls = 0;
-        let area = (&binding.umem.area) as *const MmapArea;
-        let ident = binding.identity();
 
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
