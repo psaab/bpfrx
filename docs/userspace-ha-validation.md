@@ -10,11 +10,13 @@ userspace cluster on `loss`:
 - `loss:cluster-userspace-host`
 
 Tracked inputs:
-- env: [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx/test/incus/loss-userspace-cluster.env)
-- config: [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx/docs/ha-cluster-userspace.conf)
-- validator: [userspace-ha-validation.sh](/home/ps/git/codex-bpfrx/scripts/userspace-ha-validation.sh)
-- phase cycle: [userspace-phase-cycle.sh](/home/ps/git/codex-bpfrx/scripts/userspace-phase-cycle.sh)
-- perf compare: [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx/scripts/userspace-perf-compare.sh)
+- env: [loss-userspace-cluster.env](../test/incus/loss-userspace-cluster.env)
+- config: [ha-cluster-userspace.conf](../docs/ha-cluster-userspace.conf)
+- validator: [userspace-ha-validation.sh](../scripts/userspace-ha-validation.sh)
+- failover validator: [userspace-ha-failover-validation.sh](../scripts/userspace-ha-failover-validation.sh)
+- phase cycle: [userspace-phase-cycle.sh](../scripts/userspace-phase-cycle.sh)
+- perf compare: [userspace-perf-compare.sh](../scripts/userspace-perf-compare.sh)
+- failover parity plan: [userspace-ha-failover-parity-plan.md](../docs/userspace-ha-failover-parity-plan.md)
 
 ## Current Model
 
@@ -56,6 +58,12 @@ Perf-only compare workflow:
 ./scripts/userspace-perf-compare.sh
 ```
 
+Dedicated RG failover survivability workflow:
+
+```bash
+./scripts/userspace-ha-failover-validation.sh
+```
+
 Standard phase workflow:
 
 ```bash
@@ -71,6 +79,10 @@ This is the required sequence after each userspace dataplane phase:
    - `loss:bpfrx-userspace-fw0`
    - `loss:bpfrx-userspace-fw1`
 4. run the isolated userspace HA validation script
+
+For failover-specific HA/session work, also run the dedicated RG failover
+validator. The steady-state validator is not enough to prove that an existing
+TCP flow survives a manual RG ownership move.
 
 If the validation script is failing and you still need current performance data,
 run the perf-compare workflow next. It captures IPv4/IPv6 `iperf3` and `perf`
@@ -125,7 +137,7 @@ Current `master` reality:
 - it is normal for the validator to fail while a phase is in progress
 - a failing validation run is signal; do not “fix” it by lowering the threshold
 
-Use [userspace-perf-compare.md](/home/ps/git/codex-bpfrx/docs/userspace-perf-compare.md)
+Use [userspace-perf-compare.md](../docs/userspace-perf-compare.md)
 for the current measured numbers and current hot-path deltas. This document defines
 the required workflow and the target, not the current performance claim for every
 tree state.
@@ -163,7 +175,7 @@ artifacts:
 - `iperf3`
 
 The interval-collapse analysis runs on the repo host using
-[iperf-json-metrics.py](/home/ps/git/codex-bpfrx/scripts/iperf-json-metrics.py),
+[iperf-json-metrics.py](../scripts/iperf-json-metrics.py),
 so the cluster test host does not need `python3`.
 
 Short-lived outliers can still happen immediately after rolling deploy while HA
@@ -177,6 +189,6 @@ as the source of truth.
 
 Use:
 
-- [loss-userspace-cluster.env](/home/ps/git/codex-bpfrx/test/incus/loss-userspace-cluster.env)
-- [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx/docs/ha-cluster-userspace.conf)
-- [userspace-phase-cycle.sh](/home/ps/git/codex-bpfrx/scripts/userspace-phase-cycle.sh)
+- [loss-userspace-cluster.env](../test/incus/loss-userspace-cluster.env)
+- [ha-cluster-userspace.conf](../docs/ha-cluster-userspace.conf)
+- [userspace-phase-cycle.sh](../scripts/userspace-phase-cycle.sh)
