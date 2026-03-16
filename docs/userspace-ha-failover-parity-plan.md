@@ -27,9 +27,9 @@ The pre-userspace dataplane already solved this class of failure.
 
 Relevant reference points:
 
-1. [test-failover.sh](/home/ps/git/codex-bpfrx/test/incus/test-failover.sh)
-2. [test-stress-failover.sh](/home/ps/git/codex-bpfrx/test/incus/test-stress-failover.sh)
-3. [test-double-failover.sh](/home/ps/git/codex-bpfrx/test/incus/test-double-failover.sh)
+1. [test-failover.sh](../test/incus/test-failover.sh)
+2. [test-stress-failover.sh](../test/incus/test-stress-failover.sh)
+3. [test-double-failover.sh](../test/incus/test-double-failover.sh)
 4. `3e7491a` `Fix TCP stream death during rapid active/active failovers`
 5. `12ac482` `Fix mtr/traceroute on cluster secondary via fabric redirect`
 
@@ -98,7 +98,7 @@ The userspace sync request format can carry:
 7. NAT rewrite fields
 
 But the userspace delta bridge in
-[pkg/daemon/daemon.go](/home/ps/git/codex-bpfrx/pkg/daemon/daemon.go)
+[pkg/daemon/daemon.go](../pkg/daemon/daemon.go)
 currently rebuilds sync state mostly from:
 
 1. session key
@@ -113,7 +113,7 @@ the legacy dataplane did.
 
 The userspace dataplane now has fabric XSK bindings and fabric redirect support,
 but the legacy eBPF path in
-[bpf/xdp/xdp_zone.c](/home/ps/git/codex-bpfrx/bpf/xdp/xdp_zone.c)
+[bpf/xdp/xdp_zone.c](../bpf/xdp/xdp_zone.c)
 still remains the richer, more battle-tested reference for:
 
 1. existing-session redirect on inactive RG
