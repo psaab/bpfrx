@@ -22,14 +22,19 @@ func TestUserspaceSessionFromDeltaV4(t *testing.T) {
 		EgressZone:    "wan",
 		OwnerRGID:     1,
 		EgressIfindex: 12,
+		TXIfindex:     11,
+		TXVLANID:      80,
+		NeighborMAC:   "aa:bb:cc:dd:ee:ff",
+		SrcMAC:        "02:bf:72:00:50:08",
 		NATSrcIP:      "172.16.80.8",
+		NATSrcPort:    40000,
 	}
 
 	key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
 	if !ok {
 		t.Fatal("expected v4 delta to convert")
 	}
-	if key.SrcPort != 12345 || key.DstPort != 5201 {
+	if userspaceNetworkToHost16(key.SrcPort) != 12345 || userspaceNetworkToHost16(key.DstPort) != 5201 {
 		t.Fatalf("unexpected key ports: %+v", key)
 	}
 	if val.IngressZone != 1 || val.EgressZone != 2 {
@@ -40,6 +45,21 @@ func TestUserspaceSessionFromDeltaV4(t *testing.T) {
 	}
 	if got := val.NATSrcIP; got != binary.NativeEndian.Uint32([]byte{172, 16, 80, 8}) {
 		t.Fatalf("unexpected nat src ip: %08x", got)
+	}
+	if userspaceNetworkToHost16(val.NATSrcPort) != 40000 {
+		t.Fatalf("unexpected nat src port: %d", val.NATSrcPort)
+	}
+	if val.FibIfindex != 11 || val.FibVlanID != 80 {
+		t.Fatalf("unexpected fib egress metadata: ifindex=%d vlan=%d", val.FibIfindex, val.FibVlanID)
+	}
+	if val.FibDmac != [6]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff} {
+		t.Fatalf("unexpected fib dmac: %v", val.FibDmac)
+	}
+	if val.FibSmac != [6]byte{0x02, 0xbf, 0x72, 0x00, 0x50, 0x08} {
+		t.Fatalf("unexpected fib smac: %v", val.FibSmac)
+	}
+	if userspaceNetworkToHost16(val.ReverseKey.DstPort) != 40000 {
+		t.Fatalf("unexpected reverse dst port: %d", val.ReverseKey.DstPort)
 	}
 }
 
@@ -57,14 +77,19 @@ func TestUserspaceSessionFromDeltaV6(t *testing.T) {
 		EgressZone:    "wan",
 		OwnerRGID:     1,
 		EgressIfindex: 12,
+		TXIfindex:     11,
+		TXVLANID:      80,
+		NeighborMAC:   "00:11:22:33:44:55",
+		SrcMAC:        "02:bf:72:00:50:08",
 		NATSrcIP:      "2001:559:8585:80::8",
+		NATSrcPort:    40000,
 	}
 
 	key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
 	if !ok {
 		t.Fatal("expected v6 delta to convert")
 	}
-	if key.SrcPort != 5555 || key.DstPort != 53 {
+	if userspaceNetworkToHost16(key.SrcPort) != 5555 || userspaceNetworkToHost16(key.DstPort) != 53 {
 		t.Fatalf("unexpected key ports: %+v", key)
 	}
 	if val.IngressZone != 1 || val.EgressZone != 2 {
@@ -75,6 +100,51 @@ func TestUserspaceSessionFromDeltaV6(t *testing.T) {
 	}
 	if val.NATSrcIP == [16]byte{} {
 		t.Fatalf("expected NAT src v6 address to be set")
+	}
+	if userspaceNetworkToHost16(val.NATSrcPort) != 40000 {
+		t.Fatalf("unexpected nat src port: %d", val.NATSrcPort)
+	}
+	if val.FibIfindex != 11 || val.FibVlanID != 80 {
+		t.Fatalf("unexpected fib egress metadata: ifindex=%d vlan=%d", val.FibIfindex, val.FibVlanID)
+	}
+	if val.FibDmac != [6]byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55} {
+		t.Fatalf("unexpected fib dmac: %v", val.FibDmac)
+	}
+	if val.FibSmac != [6]byte{0x02, 0xbf, 0x72, 0x00, 0x50, 0x08} {
+		t.Fatalf("unexpected fib smac: %v", val.FibSmac)
+	}
+	if userspaceNetworkToHost16(val.ReverseKey.DstPort) != 40000 {
+		t.Fatalf("unexpected reverse dst port: %d", val.ReverseKey.DstPort)
+	}
+}
+
+func TestUserspaceSessionFromDeltaUsesNetworkByteOrderPorts(t *testing.T) {
+	zoneIDs := map[string]uint16{"lan": 1, "wan": 2}
+	delta := dpuserspace.SessionDeltaInfo{
+		Event:       "open",
+		AddrFamily:  2,
+		Protocol:    6,
+		SrcIP:       "10.0.61.102",
+		DstIP:       "172.16.80.200",
+		SrcPort:     50952,
+		DstPort:     5201,
+		IngressZone: "lan",
+		EgressZone:  "wan",
+		NATSrcIP:    "172.16.80.8",
+	}
+
+	key, _, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
+	if !ok {
+		t.Fatal("expected v4 delta to convert")
+	}
+	if key.SrcPort == delta.SrcPort || key.DstPort == delta.DstPort {
+		t.Fatalf("ports were not converted to network order: %+v", key)
+	}
+	if got := userspaceNetworkToHost16(key.SrcPort); got != delta.SrcPort {
+		t.Fatalf("src port roundtrip = %d, want %d", got, delta.SrcPort)
+	}
+	if got := userspaceNetworkToHost16(key.DstPort); got != delta.DstPort {
+		t.Fatalf("dst port roundtrip = %d, want %d", got, delta.DstPort)
 	}
 }
 

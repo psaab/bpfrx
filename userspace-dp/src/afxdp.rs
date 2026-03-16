@@ -252,6 +252,10 @@ impl Coordinator {
     }
 
     pub fn stop(&mut self) {
+        self.stop_inner(true);
+    }
+
+    fn stop_inner(&mut self, clear_synced_state: bool) {
         for handle in self.workers.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
         }
@@ -286,11 +290,13 @@ impl Coordinator {
         if let Ok(mut neighbors) = self.dynamic_neighbors.lock() {
             neighbors.clear();
         }
-        if let Ok(mut sessions) = self.shared_sessions.lock() {
-            sessions.clear();
-        }
-        if let Ok(mut nat_sessions) = self.shared_nat_sessions.lock() {
-            nat_sessions.clear();
+        if clear_synced_state {
+            if let Ok(mut sessions) = self.shared_sessions.lock() {
+                sessions.clear();
+            }
+            if let Ok(mut nat_sessions) = self.shared_nat_sessions.lock() {
+                nat_sessions.clear();
+            }
         }
         if let Ok(mut recent) = self.recent_exceptions.lock() {
             recent.clear();
@@ -307,6 +313,30 @@ impl Coordinator {
         self.last_reconcile_stage = "stopped".to_string();
     }
 
+    fn snapshot_shared_session_entries(&self) -> Vec<SyncedSessionEntry> {
+        self.shared_sessions
+            .lock()
+            .map(|sessions| sessions.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn replay_synced_sessions(
+        &self,
+        entries: &[SyncedSessionEntry],
+        worker_command_queues: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+        session_map_fd: c_int,
+    ) -> usize {
+        if entries.is_empty() {
+            return 0;
+        }
+        let worker_queues = worker_command_queues.values().cloned().collect::<Vec<_>>();
+        for entry in entries {
+            let _ = publish_live_session_key(session_map_fd, &entry.key);
+            replicate_session_upsert(&worker_queues, entry);
+        }
+        entries.len()
+    }
+
     pub fn reconcile(
         &mut self,
         snapshot: Option<&ConfigSnapshot>,
@@ -315,7 +345,8 @@ impl Coordinator {
     ) {
         self.reconcile_calls += 1;
         self.last_reconcile_stage = "start".to_string();
-        self.stop();
+        let preserved_synced_sessions = self.snapshot_shared_session_entries();
+        self.stop_inner(false);
         for binding in bindings.iter_mut() {
             binding.bound = false;
             binding.xsk_registered = false;
@@ -493,6 +524,7 @@ impl Coordinator {
             planned_bindings,
             self.live.len()
         );
+        let session_map_raw_fd = session_map_fd.fd;
         self.map_fd = Some(map_fd);
         self.heartbeat_map_fd = Some(heartbeat_map_fd);
         self.session_map_fd = Some(session_map_fd);
@@ -501,6 +533,18 @@ impl Coordinator {
             .copied()
             .map(|worker_id| (worker_id, Arc::new(Mutex::new(VecDeque::new()))))
             .collect();
+        let replayed_synced_sessions = self.replay_synced_sessions(
+            &preserved_synced_sessions,
+            &worker_command_queues,
+            session_map_raw_fd,
+        );
+        if replayed_synced_sessions > 0 {
+            self.last_reconcile_stage = format!(
+                "replayed_synced:{}:workers={}",
+                replayed_synced_sessions,
+                worker_command_queues.len()
+            );
+        }
         for (worker_id, binding_plans) in workers {
             let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
@@ -3553,11 +3597,25 @@ fn flush_session_deltas(
             egress_zone: delta.metadata.egress_zone.to_string(),
             owner_rg_id: delta.metadata.owner_rg_id,
             egress_ifindex: delta.decision.resolution.egress_ifindex,
+            tx_ifindex: delta.decision.resolution.tx_ifindex,
+            tx_vlan_id: delta.decision.resolution.tx_vlan_id,
             next_hop: delta
                 .decision
                 .resolution
                 .next_hop
                 .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            neighbor_mac: delta
+                .decision
+                .resolution
+                .neighbor_mac
+                .map(format_mac)
+                .unwrap_or_default(),
+            src_mac: delta
+                .decision
+                .resolution
+                .src_mac
+                .map(format_mac)
                 .unwrap_or_default(),
             nat_src_ip: delta
                 .decision
@@ -4812,15 +4870,18 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         let Ok(peer_addr) = fabric.peer_address.parse::<IpAddr>() else {
             continue;
         };
-        let local_mac = match mac_by_ifindex.get(&fabric.parent_ifindex).copied() {
-            Some(mac) => mac,
-            None => continue,
+        let local_mac = parse_mac(&fabric.local_mac)
+            .or_else(|| mac_by_ifindex.get(&fabric.parent_ifindex).copied());
+        let Some(local_mac) = local_mac else {
+            continue;
         };
-        let peer_mac = state
-            .neighbors
-            .get(&(fabric.overlay_ifindex, peer_addr))
-            .or_else(|| state.neighbors.get(&(fabric.parent_ifindex, peer_addr)))
-            .map(|entry| entry.mac);
+        let peer_mac = parse_mac(&fabric.peer_mac).or_else(|| {
+            state
+                .neighbors
+                .get(&(fabric.overlay_ifindex, peer_addr))
+                .or_else(|| state.neighbors.get(&(fabric.parent_ifindex, peer_addr)))
+                .map(|entry| entry.mac)
+        });
         let Some(peer_mac) = peer_mac else {
             continue;
         };
@@ -7782,6 +7843,8 @@ mod tests {
             overlay_ifindex: 101,
             rx_queues: 2,
             peer_address: "10.99.13.2".to_string(),
+            local_mac: "02:bf:72:ff:00:01".to_string(),
+            peer_mac: "00:aa:bb:cc:dd:ee".to_string(),
         }];
         snapshot.neighbors.push(NeighborSnapshot {
             interface: "fab0".to_string(),
@@ -8229,6 +8292,29 @@ mod tests {
             redirected.src_mac,
             Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01])
         );
+    }
+
+    #[test]
+    fn build_forwarding_state_uses_fabric_snapshot_macs_without_parent_interface() {
+        let mut snapshot = nat_snapshot();
+        snapshot.fabrics = vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_interface: "ge-0/0/0".to_string(),
+            parent_linux_name: "ge-0-0-0".to_string(),
+            parent_ifindex: 21,
+            overlay_linux_name: "fab0".to_string(),
+            overlay_ifindex: 101,
+            rx_queues: 2,
+            peer_address: "10.99.13.2".to_string(),
+            local_mac: "02:bf:72:ff:00:01".to_string(),
+            peer_mac: "00:aa:bb:cc:dd:ee".to_string(),
+        }];
+        let state = build_forwarding_state(&snapshot);
+        let redirect = resolve_fabric_redirect(&state).expect("fabric redirect");
+        assert_eq!(redirect.egress_ifindex, 21);
+        assert_eq!(redirect.tx_ifindex, 21);
+        assert_eq!(redirect.neighbor_mac, Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]));
+        assert_eq!(redirect.src_mac, Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]));
     }
 
     #[test]
@@ -9076,6 +9162,111 @@ mod tests {
         assert!(replica.metadata.synced);
         assert_eq!(replica.key, entry.key);
         assert_eq!(replica.decision, entry.decision);
+    }
+
+    #[test]
+    fn reconcile_stop_preserves_shared_synced_sessions() {
+        let mut coordinator = Coordinator::new();
+        let entry = SyncedSessionEntry {
+            key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 5201,
+            },
+            decision: SessionDecision {
+                resolution: lookup_forwarding_resolution(
+                    &build_forwarding_state(&nat_snapshot()),
+                    IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                ),
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                    ..NatDecision::default()
+                },
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("lan"),
+                egress_zone: Arc::<str>::from("wan"),
+                owner_rg_id: 1,
+                is_reverse: false,
+                synced: true,
+                nat64_reverse: None,
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        publish_shared_session(
+            &coordinator.shared_sessions,
+            &coordinator.shared_nat_sessions,
+            &entry,
+        );
+
+        coordinator.stop_inner(false);
+
+        let preserved = coordinator.snapshot_shared_session_entries();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].key, entry.key);
+        assert_eq!(preserved[0].decision, entry.decision);
+
+        coordinator.stop();
+        assert!(coordinator.snapshot_shared_session_entries().is_empty());
+    }
+
+    #[test]
+    fn replay_synced_sessions_requeues_preserved_entries_for_new_workers() {
+        let coordinator = Coordinator::new();
+        let entry = SyncedSessionEntry {
+            key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 5201,
+            },
+            decision: SessionDecision {
+                resolution: lookup_forwarding_resolution(
+                    &build_forwarding_state(&nat_snapshot()),
+                    IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                ),
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                    ..NatDecision::default()
+                },
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("lan"),
+                egress_zone: Arc::<str>::from("wan"),
+                owner_rg_id: 1,
+                is_reverse: false,
+                synced: true,
+                nat64_reverse: None,
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let worker_command_queues = BTreeMap::from([
+            (0u32, Arc::new(Mutex::new(VecDeque::new()))),
+            (1u32, Arc::new(Mutex::new(VecDeque::new()))),
+        ]);
+
+        let replayed =
+            coordinator.replay_synced_sessions(&[entry.clone()], &worker_command_queues, -1);
+        assert_eq!(replayed, 1);
+
+        for commands in worker_command_queues.values() {
+            let pending = commands.lock().expect("worker command queue");
+            assert_eq!(pending.len(), 1);
+            match pending.front().expect("queued command") {
+                WorkerCommand::UpsertSynced(replayed_entry) => {
+                    assert_eq!(replayed_entry.key, entry.key);
+                    assert!(replayed_entry.metadata.synced);
+                }
+                other => panic!("unexpected command queued during replay: {other:?}"),
+            }
+        }
     }
 
     #[test]
