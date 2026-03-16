@@ -139,6 +139,7 @@ pub(crate) struct SessionDelta {
 pub(crate) struct SessionTable {
     sessions: FxHashMap<SessionKey, SessionEntry>,
     nat_reverse_index: FxHashMap<SessionKey, SessionKey>,
+    forward_wire_index: FxHashMap<SessionKey, SessionKey>,
     deltas: VecDeque<SessionDelta>,
     last_gc_ns: u64,
     max_sessions: usize,
@@ -154,6 +155,7 @@ impl SessionTable {
         Self {
             sessions: FxHashMap::default(),
             nat_reverse_index: FxHashMap::default(),
+            forward_wire_index: FxHashMap::default(),
             deltas: VecDeque::with_capacity(MAX_SESSION_DELTAS.min(256)),
             last_gc_ns: 0,
             max_sessions: DEFAULT_MAX_SESSIONS,
@@ -253,6 +255,19 @@ impl SessionTable {
         let forward_key = self.nat_reverse_index.get(reply_key)?;
         let entry = self.sessions.get(forward_key)?;
         if entry.metadata.is_reverse || !reply_matches_forward_nat(forward_key, entry.decision.nat, reply_key) {
+            return None;
+        }
+        Some(ForwardSessionMatch {
+            key: forward_key.clone(),
+            decision: entry.decision,
+            metadata: entry.metadata.clone(),
+        })
+    }
+
+    pub fn find_forward_wire_match(&self, wire_key: &SessionKey) -> Option<ForwardSessionMatch> {
+        let forward_key = self.forward_wire_index.get(wire_key)?;
+        let entry = self.sessions.get(forward_key)?;
+        if entry.metadata.is_reverse || forward_wire_key(forward_key, entry.decision.nat) != *wire_key {
             return None;
         }
         Some(ForwardSessionMatch {
@@ -420,6 +435,10 @@ impl SessionTable {
         }
         self.nat_reverse_index
             .insert(reverse_wire_key(key, decision.nat), key.clone());
+        let forward_wire = forward_wire_key(key, decision.nat);
+        if forward_wire != *key {
+            self.forward_wire_index.insert(forward_wire, key.clone());
+        }
     }
 
     fn remove_forward_nat_index(
@@ -434,6 +453,10 @@ impl SessionTable {
         let reverse_key = reverse_wire_key(key, decision.nat);
         if matches!(self.nat_reverse_index.get(&reverse_key), Some(existing) if existing == key) {
             self.nat_reverse_index.remove(&reverse_key);
+        }
+        let forward_wire = forward_wire_key(key, decision.nat);
+        if matches!(self.forward_wire_index.get(&forward_wire), Some(existing) if existing == key) {
+            self.forward_wire_index.remove(&forward_wire);
         }
     }
 }
@@ -468,6 +491,43 @@ pub(crate) fn reply_matches_forward_nat(
         }
     }
     reverse_wire_key(forward_key, nat) == *reply_key
+}
+
+pub(crate) fn forward_wire_key(forward_key: &SessionKey, nat: NatDecision) -> SessionKey {
+    let (src_port, dst_port) = if matches!(forward_key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        (forward_key.src_port, forward_key.dst_port)
+    } else {
+        (
+            nat.rewrite_src_port.unwrap_or(forward_key.src_port),
+            nat.rewrite_dst_port.unwrap_or(forward_key.dst_port),
+        )
+    };
+    let wire_src = nat.rewrite_src.unwrap_or(forward_key.src_ip);
+    let wire_dst = nat.rewrite_dst.unwrap_or(forward_key.dst_ip);
+    let (addr_family, protocol) = if nat.nat64 {
+        let af = match wire_src {
+            std::net::IpAddr::V4(_) => libc::AF_INET as u8,
+            std::net::IpAddr::V6(_) => libc::AF_INET6 as u8,
+        };
+        let proto = if af == libc::AF_INET as u8 && forward_key.protocol == PROTO_ICMPV6 {
+            PROTO_ICMP
+        } else if af == libc::AF_INET6 as u8 && forward_key.protocol == PROTO_ICMP {
+            PROTO_ICMPV6
+        } else {
+            forward_key.protocol
+        };
+        (af, proto)
+    } else {
+        (forward_key.addr_family, forward_key.protocol)
+    };
+    SessionKey {
+        addr_family,
+        protocol,
+        src_ip: wire_src,
+        dst_ip: wire_dst,
+        src_port,
+        dst_port,
+    }
 }
 
 fn reverse_wire_key(forward_key: &SessionKey, nat: NatDecision) -> SessionKey {
@@ -847,6 +907,53 @@ mod tests {
 
         table.delete(&hit.key);
         assert!(table.find_forward_nat_match(&reply).is_none());
+    }
+
+    #[test]
+    fn find_forward_wire_match_uses_translated_forward_index() {
+        let mut table = SessionTable::new();
+        let forward = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 42528,
+            dst_port: 5201,
+        };
+        let translated = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 42528,
+            dst_port: 5201,
+        };
+        let nat = NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+            rewrite_src_port: Some(42528),
+            ..NatDecision::default()
+        };
+        let decision = SessionDecision {
+            resolution: resolution(),
+            nat,
+        };
+        assert!(table.install_with_protocol(
+            forward.clone(),
+            decision,
+            metadata(),
+            1_000_000_000,
+            PROTO_TCP,
+            0x10
+        ));
+
+        let hit = table
+            .find_forward_wire_match(&translated)
+            .expect("forward wire match");
+        assert_eq!(hit.key, forward);
+        assert_eq!(hit.decision.nat, nat);
+
+        table.delete(&hit.key);
+        assert!(table.find_forward_wire_match(&translated).is_none());
     }
 
     #[test]

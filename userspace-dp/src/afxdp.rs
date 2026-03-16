@@ -14,7 +14,7 @@ use crate::screen::{
 };
 use crate::session::{
     ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
-    SessionLookup, SessionMetadata, SessionTable,
+    SessionLookup, SessionMetadata, SessionTable, forward_wire_key,
 };
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus};
 use arc_swap::ArcSwap;
@@ -208,6 +208,7 @@ pub struct Coordinator {
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
@@ -234,6 +235,7 @@ impl Coordinator {
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
             shared_sessions: Arc::new(Mutex::new(FastMap::default())),
             shared_nat_sessions: Arc::new(Mutex::new(FastMap::default())),
+            shared_forward_wire_sessions: Arc::new(Mutex::new(FastMap::default())),
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
@@ -296,6 +298,9 @@ impl Coordinator {
             }
             if let Ok(mut nat_sessions) = self.shared_nat_sessions.lock() {
                 nat_sessions.clear();
+            }
+            if let Ok(mut forward_wire_sessions) = self.shared_forward_wire_sessions.lock() {
+                forward_wire_sessions.clear();
             }
         }
         if let Ok(mut recent) = self.recent_exceptions.lock() {
@@ -559,6 +564,7 @@ impl Coordinator {
             let slow_path = self.slow_path.clone();
             let shared_sessions = self.shared_sessions.clone();
             let shared_nat_sessions = self.shared_nat_sessions.clone();
+            let shared_forward_wire_sessions = self.shared_forward_wire_sessions.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
             let commands_clone = commands.clone();
@@ -583,6 +589,7 @@ impl Coordinator {
                         dynamic_neighbors,
                         shared_sessions,
                         shared_nat_sessions,
+                        shared_forward_wire_sessions,
                         slow_path,
                         recent_exceptions,
                         recent_session_deltas,
@@ -706,7 +713,12 @@ impl Coordinator {
     }
 
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
-        publish_shared_session(&self.shared_sessions, &self.shared_nat_sessions, &entry);
+        publish_shared_session(
+            &self.shared_sessions,
+            &self.shared_nat_sessions,
+            &self.shared_forward_wire_sessions,
+            &entry,
+        );
         for handle in self.workers.values() {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
@@ -715,7 +727,12 @@ impl Coordinator {
     }
 
     pub fn delete_synced_session(&self, key: SessionKey) {
-        remove_shared_session(&self.shared_sessions, &self.shared_nat_sessions, &key);
+        remove_shared_session(
+            &self.shared_sessions,
+            &self.shared_nat_sessions,
+            &self.shared_forward_wire_sessions,
+            &key,
+        );
         for handle in self.workers.values() {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
@@ -1736,6 +1753,7 @@ fn poll_binding(
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     _recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
@@ -2141,6 +2159,7 @@ fn poll_binding(
                             binding.session_map_fd,
                             shared_sessions,
                             shared_nat_sessions,
+                            shared_forward_wire_sessions,
                             peer_worker_commands,
                             forwarding,
                             ha_state,
@@ -2467,6 +2486,7 @@ fn poll_binding(
                                     dynamic_neighbors,
                                     shared_sessions,
                                     shared_nat_sessions,
+                                    shared_forward_wire_sessions,
                                     now_ns,
                                 ) {
                                     #[cfg(feature = "debug-log")]
@@ -2735,6 +2755,7 @@ fn poll_binding(
                                             publish_shared_session(
                                                 shared_sessions,
                                                 shared_nat_sessions,
+                                                shared_forward_wire_sessions,
                                                 &forward_entry,
                                             );
                                             replicate_session_upsert(
@@ -2920,6 +2941,7 @@ fn poll_binding(
                                             publish_shared_session(
                                                 shared_sessions,
                                                 shared_nat_sessions,
+                                                shared_forward_wire_sessions,
                                                 &reverse_entry,
                                             );
                                             replicate_session_upsert(
@@ -3406,6 +3428,7 @@ fn poll_binding(
                 sessions,
                 shared_sessions,
                 shared_nat_sessions,
+                shared_forward_wire_sessions,
                 peer_worker_commands,
                 &forward_key,
                 nat,
@@ -3653,6 +3676,7 @@ fn flush_session_deltas(
     deltas: &[SessionDelta],
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
 ) {
@@ -3730,10 +3754,20 @@ fn flush_session_deltas(
                 );
             }
             delete_live_session_key(session_map_fd, &delta.key);
-            remove_shared_session(shared_sessions, shared_nat_sessions, &delta.key);
+            remove_shared_session(
+                shared_sessions,
+                shared_nat_sessions,
+                shared_forward_wire_sessions,
+                &delta.key,
+            );
             let reverse_key = reverse_session_key(&delta.key, delta.decision.nat);
             delete_live_session_key(session_map_fd, &reverse_key);
-            remove_shared_session(shared_sessions, shared_nat_sessions, &reverse_key);
+            remove_shared_session(
+                shared_sessions,
+                shared_nat_sessions,
+                shared_forward_wire_sessions,
+                &reverse_key,
+            );
             replicate_session_delete(peer_worker_commands, &delta.key);
             replicate_session_delete(
                 peer_worker_commands,
@@ -3978,6 +4012,7 @@ fn worker_loop(
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     slow_path: Option<Arc<SlowPathReinjector>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
@@ -4141,6 +4176,7 @@ fn worker_loop(
                 &dynamic_neighbors,
                 &shared_sessions,
                 &shared_nat_sessions,
+                &shared_forward_wire_sessions,
                 slow_path.as_ref(),
                 &recent_exceptions,
                 &recent_session_deltas,
@@ -4227,6 +4263,7 @@ fn worker_loop(
                     &deltas,
                     &shared_sessions,
                     &shared_nat_sessions,
+                    &shared_forward_wire_sessions,
                     &recent_session_deltas,
                     &peer_worker_commands,
                 );
@@ -9319,6 +9356,7 @@ mod tests {
         publish_shared_session(
             &coordinator.shared_sessions,
             &coordinator.shared_nat_sessions,
+            &coordinator.shared_forward_wire_sessions,
             &entry,
         );
 
@@ -13176,6 +13214,7 @@ mod tests {
         let neighbors = Arc::new(Mutex::new(FastMap::default()));
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
         let icmp_match = try_embedded_icmp_nat_match_from_frame(
             &frame,
             meta,
@@ -13184,6 +13223,7 @@ mod tests {
             &neighbors,
             &shared_sessions,
             &shared_nat_sessions,
+            &shared_forward_wire_sessions,
             1_000_000,
         )
         .expect("should match embedded ICMPv6 error");
@@ -13322,6 +13362,7 @@ mod tests {
         let neighbors = Arc::new(Mutex::new(FastMap::default()));
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
         let icmp_match = try_embedded_icmp_nat_match_from_frame(
             &frame,
             meta,
@@ -13330,6 +13371,7 @@ mod tests {
             &neighbors,
             &shared_sessions,
             &shared_nat_sessions,
+            &shared_forward_wire_sessions,
             1_000_000,
         )
         .expect("should match embedded ICMPv6 error");
@@ -13453,7 +13495,13 @@ mod tests {
             protocol: PROTO_TCP,
             tcp_flags: 0,
         };
-        publish_shared_session(&shared_sessions, &shared_nat_sessions, &entry);
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry,
+        );
 
         let icmp_match = try_embedded_icmp_nat_match_from_frame(
             &frame,
@@ -13463,6 +13511,7 @@ mod tests {
             &neighbors,
             &shared_sessions,
             &shared_nat_sessions,
+            &shared_forward_wire_sessions,
             1_000_000,
         )
         .expect("shared NAT session should match embedded ICMP");
@@ -13500,6 +13549,7 @@ mod tests {
         let neighbors = Arc::new(Mutex::new(FastMap::default()));
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
 
         let result = try_embedded_icmp_nat_match_from_frame(
             &frame,
@@ -13509,6 +13559,7 @@ mod tests {
             &neighbors,
             &shared_sessions,
             &shared_nat_sessions,
+            &shared_forward_wire_sessions,
             1_000_000,
         );
         assert!(
