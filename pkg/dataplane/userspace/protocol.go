@@ -31,21 +31,21 @@ type ControlResponse struct {
 }
 
 type ConfigSnapshot struct {
-	Version       int                     `json:"version"`
-	Generation    uint64                  `json:"generation"`
-	FIBGeneration uint32                  `json:"fib_generation,omitempty"`
-	GeneratedAt   time.Time               `json:"generated_at"`
-	Summary       SnapshotSummary         `json:"summary"`
-	Capabilities  UserspaceCapabilities   `json:"capabilities"`
-	MapPins       UserspaceMapPins        `json:"map_pins"`
-	Zones         []ZoneSnapshot          `json:"zones,omitempty"`
-	Interfaces    []InterfaceSnapshot     `json:"interfaces,omitempty"`
-	Fabrics       []FabricSnapshot        `json:"fabrics,omitempty"`
-	Neighbors     []NeighborSnapshot      `json:"neighbors,omitempty"`
-	Routes        []RouteSnapshot         `json:"routes,omitempty"`
-	Flow          FlowSnapshot            `json:"flow,omitempty"`
-	DefaultPolicy string                  `json:"default_policy,omitempty"`
-	Policies      []PolicyRuleSnapshot    `json:"policies,omitempty"`
+	Version        int                          `json:"version"`
+	Generation     uint64                       `json:"generation"`
+	FIBGeneration  uint32                       `json:"fib_generation,omitempty"`
+	GeneratedAt    time.Time                    `json:"generated_at"`
+	Summary        SnapshotSummary              `json:"summary"`
+	Capabilities   UserspaceCapabilities        `json:"capabilities"`
+	MapPins        UserspaceMapPins             `json:"map_pins"`
+	Zones          []ZoneSnapshot               `json:"zones,omitempty"`
+	Interfaces     []InterfaceSnapshot          `json:"interfaces,omitempty"`
+	Fabrics        []FabricSnapshot             `json:"fabrics,omitempty"`
+	Neighbors      []NeighborSnapshot           `json:"neighbors,omitempty"`
+	Routes         []RouteSnapshot              `json:"routes,omitempty"`
+	Flow           FlowSnapshot                 `json:"flow,omitempty"`
+	DefaultPolicy  string                       `json:"default_policy,omitempty"`
+	Policies       []PolicyRuleSnapshot         `json:"policies,omitempty"`
 	SourceNAT      []SourceNATRuleSnapshot      `json:"source_nat_rules,omitempty"`
 	StaticNAT      []StaticNATRuleSnapshot      `json:"static_nat_rules,omitempty"`
 	DestinationNAT []DestinationNATRuleSnapshot `json:"destination_nat_rules,omitempty"`
@@ -55,17 +55,17 @@ type ConfigSnapshot struct {
 	Filters        []FirewallFilterSnapshot     `json:"filters,omitempty"`
 	Policers       []PolicerSnapshot            `json:"policers,omitempty"`
 	FlowExport     *FlowExportSnapshot          `json:"flow_export,omitempty"`
-	Config        *config.Config          `json:"config,omitempty"`
-	Userspace     config.UserspaceConfig  `json:"userspace"`
+	Config         *config.Config               `json:"config,omitempty"`
+	Userspace      config.UserspaceConfig       `json:"userspace"`
 }
 
 type FlowSnapshot struct {
-	AllowDNSReply      bool `json:"allow_dns_reply,omitempty"`
-	AllowEmbeddedICMP  bool `json:"allow_embedded_icmp,omitempty"`
-	TCPMSSAllTCP       int  `json:"tcp_mss_all_tcp,omitempty"`
-	TCPMSSIPsecVPN     int  `json:"tcp_mss_ipsec_vpn,omitempty"`
-	TCPMSSGreIn        int  `json:"tcp_mss_gre_in,omitempty"`
-	TCPMSSGreOut       int  `json:"tcp_mss_gre_out,omitempty"`
+	AllowDNSReply      bool   `json:"allow_dns_reply,omitempty"`
+	AllowEmbeddedICMP  bool   `json:"allow_embedded_icmp,omitempty"`
+	TCPMSSAllTCP       int    `json:"tcp_mss_all_tcp,omitempty"`
+	TCPMSSIPsecVPN     int    `json:"tcp_mss_ipsec_vpn,omitempty"`
+	TCPMSSGreIn        int    `json:"tcp_mss_gre_in,omitempty"`
+	TCPMSSGreOut       int    `json:"tcp_mss_gre_out,omitempty"`
 	TCPSessionTimeout  int    `json:"tcp_session_timeout,omitempty"`  // seconds, 0=default
 	UDPSessionTimeout  int    `json:"udp_session_timeout,omitempty"`  // seconds, 0=default
 	ICMPSessionTimeout int    `json:"icmp_session_timeout,omitempty"` // seconds, 0=default
@@ -118,6 +118,8 @@ type FabricSnapshot struct {
 	OverlayIfindex  int    `json:"overlay_ifindex,omitempty"`
 	RXQueues        int    `json:"rx_queues,omitempty"`
 	PeerAddress     string `json:"peer_address,omitempty"`
+	LocalMAC        string `json:"local_mac,omitempty"`
+	PeerMAC         string `json:"peer_mac,omitempty"`
 }
 
 type SourceNATRuleSnapshot struct {
@@ -185,10 +187,10 @@ type ScreenProfileSnapshot struct {
 	UDPFloodThreshold  uint32 `json:"udp_flood_threshold,omitempty"`
 	SYNFloodThreshold  uint32 `json:"syn_flood_threshold,omitempty"`
 	// Advanced screen features for userspace dataplane
-	SessionLimitSrc    uint32 `json:"session_limit_src,omitempty"`
-	SessionLimitDst    uint32 `json:"session_limit_dst,omitempty"`
-	PortScanThreshold  uint32 `json:"port_scan_threshold,omitempty"`
-	IPSweepThreshold   uint32 `json:"ip_sweep_threshold,omitempty"`
+	SessionLimitSrc   uint32 `json:"session_limit_src,omitempty"`
+	SessionLimitDst   uint32 `json:"session_limit_dst,omitempty"`
+	PortScanThreshold uint32 `json:"port_scan_threshold,omitempty"`
+	IPSweepThreshold  uint32 `json:"ip_sweep_threshold,omitempty"`
 }
 
 type FirewallFilterSnapshot struct {
@@ -202,7 +204,7 @@ type FirewallTermSnapshot struct {
 	SourceAddresses []string `json:"source_addresses,omitempty"`
 	DestAddresses   []string `json:"destination_addresses,omitempty"`
 	Protocols       []string `json:"protocols,omitempty"`
-	SourcePorts     []string `json:"source_ports,omitempty"`  // "80" or "1024-65535"
+	SourcePorts     []string `json:"source_ports,omitempty"` // "80" or "1024-65535"
 	DestPorts       []string `json:"destination_ports,omitempty"`
 	DSCPValues      []uint8  `json:"dscp_values,omitempty"`
 	Action          string   `json:"action"` // "accept", "discard", "reject"
@@ -527,7 +529,11 @@ type SessionDeltaInfo struct {
 	EgressZone    string    `json:"egress_zone,omitempty"`
 	OwnerRGID     int       `json:"owner_rg_id,omitempty"`
 	EgressIfindex int       `json:"egress_ifindex,omitempty"`
+	TXIfindex     int       `json:"tx_ifindex,omitempty"`
+	TXVLANID      uint16    `json:"tx_vlan_id,omitempty"`
 	NextHop       string    `json:"next_hop,omitempty"`
+	NeighborMAC   string    `json:"neighbor_mac,omitempty"`
+	SrcMAC        string    `json:"src_mac,omitempty"`
 	NATSrcIP      string    `json:"nat_src_ip,omitempty"`
 	NATDstIP      string    `json:"nat_dst_ip,omitempty"`
 	NATSrcPort    uint16    `json:"nat_src_port,omitempty"`

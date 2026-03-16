@@ -226,6 +226,10 @@ struct FabricSnapshot {
     rx_queues: usize,
     #[serde(rename = "peer_address", default)]
     peer_address: String,
+    #[serde(rename = "local_mac", default)]
+    local_mac: String,
+    #[serde(rename = "peer_mac", default)]
+    peer_mac: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -989,8 +993,16 @@ struct SessionDeltaInfo {
     owner_rg_id: i32,
     #[serde(rename = "egress_ifindex", default)]
     egress_ifindex: i32,
+    #[serde(rename = "tx_ifindex", default)]
+    tx_ifindex: i32,
+    #[serde(rename = "tx_vlan_id", default)]
+    tx_vlan_id: u16,
     #[serde(rename = "next_hop", default)]
     next_hop: String,
+    #[serde(rename = "neighbor_mac", default)]
+    neighbor_mac: String,
+    #[serde(rename = "src_mac", default)]
+    src_mac: String,
     #[serde(rename = "nat_src_ip", default)]
     nat_src_ip: String,
     #[serde(rename = "nat_dst_ip", default)]
@@ -1614,6 +1626,8 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             ingress_zone: req.ingress_zone.clone().into(),
             egress_zone: req.egress_zone.clone().into(),
             owner_rg_id: req.owner_rg_id,
+            // Cluster session sync does not yet preserve original fabric ingress.
+            fabric_ingress: false,
             is_reverse: req.is_reverse,
             synced: true,
             nat64_reverse: None,
@@ -1943,6 +1957,8 @@ mod tests {
                 overlay_ifindex: 101,
                 rx_queues: 1,
                 peer_address: "10.99.13.2".to_string(),
+                local_mac: String::new(),
+                peer_mac: String::new(),
             }],
             ..Default::default()
         };
@@ -1978,6 +1994,8 @@ mod tests {
                 overlay_ifindex: 101,
                 rx_queues: 1,
                 peer_address: "10.99.13.2".to_string(),
+                local_mac: String::new(),
+                peer_mac: String::new(),
             }],
             ..Default::default()
         };

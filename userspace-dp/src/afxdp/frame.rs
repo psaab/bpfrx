@@ -188,6 +188,7 @@ pub(super) fn enqueue_pending_forwards(
                 request.meta,
                 &request.decision,
                 forwarding,
+                request.apply_nat_on_fabric,
                 expected_ports,
             ) {
                 for frame in segmented {
@@ -325,6 +326,7 @@ pub(super) fn enqueue_pending_forwards(
                                 request.meta,
                                 &request.decision,
                                 forwarding,
+                                request.apply_nat_on_fabric,
                                 expected_ports,
                             )
                         } {
@@ -407,6 +409,7 @@ pub(super) fn enqueue_pending_forwards(
                                 source_frame,
                                 request.meta,
                                 &request.decision,
+                                request.apply_nat_on_fabric,
                                 expected_ports,
                             )
                         });
@@ -503,6 +506,7 @@ pub(super) fn enqueue_pending_forwards(
                                 request.meta,
                                 &request.decision,
                                 forwarding,
+                                request.apply_nat_on_fabric,
                                 expected_ports,
                             )
                         } {
@@ -1528,11 +1532,18 @@ pub(super) fn build_forwarded_frame_from_frame(
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
     _forwarding: &ForwardingState,
+    apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<Vec<u8>> {
     let mut out = vec![0u8; frame.len().saturating_add(4)];
-    let written =
-        build_forwarded_frame_into_from_frame(&mut out, frame, meta, decision, expected_ports)?;
+    let written = build_forwarded_frame_into_from_frame(
+        &mut out,
+        frame,
+        meta,
+        decision,
+        apply_nat_on_fabric,
+        expected_ports,
+    )?;
     out.truncate(written);
     Some(out)
 }
@@ -1542,6 +1553,7 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
     forwarding: &ForwardingState,
+    apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<Vec<Vec<u8>>> {
     if meta.protocol != PROTO_TCP {
@@ -1604,7 +1616,7 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
             (
                 decision.resolution.src_mac?,
                 decision.resolution.tx_vlan_id,
-                false,
+                apply_nat_on_fabric,
             )
         } else {
             (
@@ -1729,6 +1741,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
     frame: &[u8],
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
+    apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<usize> {
     let dst_mac = decision.resolution.neighbor_mac?;
@@ -1773,7 +1786,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
             (
                 decision.resolution.src_mac?,
                 decision.resolution.tx_vlan_id,
-                false,
+                apply_nat_on_fabric,
             )
         } else {
             (
@@ -1972,7 +1985,7 @@ pub(super) fn build_forwarded_frame(
     expected_ports: Option<(u16, u16)>,
 ) -> Option<Vec<u8>> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    build_forwarded_frame_from_frame(frame, meta, decision, forwarding, expected_ports)
+    build_forwarded_frame_from_frame(frame, meta, decision, forwarding, false, expected_ports)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1985,7 +1998,14 @@ pub(super) fn segment_forwarded_tcp_frames(
     expected_ports: Option<(u16, u16)>,
 ) -> Option<Vec<Vec<u8>>> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    segment_forwarded_tcp_frames_from_frame(frame, meta, decision, forwarding, expected_ports)
+    segment_forwarded_tcp_frames_from_frame(
+        frame,
+        meta,
+        decision,
+        forwarding,
+        false,
+        expected_ports,
+    )
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1998,7 +2018,7 @@ pub(super) fn build_forwarded_frame_into(
     expected_ports: Option<(u16, u16)>,
 ) -> Option<usize> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    build_forwarded_frame_into_from_frame(out, frame, meta, decision, expected_ports)
+    build_forwarded_frame_into_from_frame(out, frame, meta, decision, false, expected_ports)
 }
 
 pub(super) fn rewrite_forwarded_frame_in_place(

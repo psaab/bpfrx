@@ -196,6 +196,22 @@ session_count() {
 	run_vm "$vm" "cli -c \"show security flow session destination-prefix ${IPERF_TARGET}\" 2>/dev/null | grep -c 'Session State: Valid' || true"
 }
 
+validate_target_reachability() {
+	local ping_log="/tmp/userspace-rg${RG}-ping.out"
+	local tcp_log="/tmp/userspace-rg${RG}-tcp.out"
+	run_host "ping -c 3 -W 1 ${IPERF_TARGET} >${ping_log} 2>&1 || true"
+	if run_host "grep -q 'bytes from' ${ping_log}"; then
+		return 0
+	fi
+	# Some targets drop the first probe while ARP/NDP settles. Fall back to a
+	# TCP handshake against the iperf3 server so failover validation does not
+	# fail before the actual RG transition is exercised.
+	if run_host "timeout 3 bash -lc 'echo > /dev/tcp/${IPERF_TARGET}/5201' >${tcp_log} 2>&1"; then
+		return 0
+	fi
+	return 1
+}
+
 start_iperf() {
 	local attempt
 	for attempt in 1 2 3; do
@@ -214,6 +230,10 @@ start_iperf() {
 
 iperf_alive() {
 	run_host "pgrep -x iperf3 >/dev/null"
+}
+
+iperf_completed() {
+	run_host "grep -q 'iperf Done' ${REMOTE_IPERF_LOG}"
 }
 
 wait_for_iperf_finish() {
@@ -286,7 +306,7 @@ ensure_rg_owner "$RG" "$SOURCE_NODE"
 arm_userspace_runtime
 
 info "validating basic reachability to ${IPERF_TARGET}"
-run_host "ping -c 2 -W 1 ${IPERF_TARGET} >/tmp/userspace-rg${RG}-ping.out" || die "cluster host cannot reach ${IPERF_TARGET}"
+validate_target_reachability || die "cluster host cannot reach ${IPERF_TARGET}"
 
 SOURCE_VM="$(vm_for_node "$SOURCE_NODE")"
 TARGET_VM="$(vm_for_node "$TARGET_NODE")"
@@ -335,6 +355,8 @@ info "observing post-failover traffic for ${POST_FAILOVER_OBSERVE}s"
 sleep "${POST_FAILOVER_OBSERVE}"
 if iperf_alive; then
 	pass "iperf3 still alive after post-failover observe window"
+elif iperf_completed; then
+	pass "iperf3 completed during post-failover observe window"
 else
 	fail "iperf3 died during post-failover observe window"
 fi

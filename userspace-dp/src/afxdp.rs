@@ -252,6 +252,10 @@ impl Coordinator {
     }
 
     pub fn stop(&mut self) {
+        self.stop_inner(true);
+    }
+
+    fn stop_inner(&mut self, clear_synced_state: bool) {
         for handle in self.workers.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
         }
@@ -286,11 +290,13 @@ impl Coordinator {
         if let Ok(mut neighbors) = self.dynamic_neighbors.lock() {
             neighbors.clear();
         }
-        if let Ok(mut sessions) = self.shared_sessions.lock() {
-            sessions.clear();
-        }
-        if let Ok(mut nat_sessions) = self.shared_nat_sessions.lock() {
-            nat_sessions.clear();
+        if clear_synced_state {
+            if let Ok(mut sessions) = self.shared_sessions.lock() {
+                sessions.clear();
+            }
+            if let Ok(mut nat_sessions) = self.shared_nat_sessions.lock() {
+                nat_sessions.clear();
+            }
         }
         if let Ok(mut recent) = self.recent_exceptions.lock() {
             recent.clear();
@@ -307,6 +313,30 @@ impl Coordinator {
         self.last_reconcile_stage = "stopped".to_string();
     }
 
+    fn snapshot_shared_session_entries(&self) -> Vec<SyncedSessionEntry> {
+        self.shared_sessions
+            .lock()
+            .map(|sessions| sessions.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn replay_synced_sessions(
+        &self,
+        entries: &[SyncedSessionEntry],
+        worker_command_queues: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+        session_map_fd: c_int,
+    ) -> usize {
+        if entries.is_empty() {
+            return 0;
+        }
+        let worker_queues = worker_command_queues.values().cloned().collect::<Vec<_>>();
+        for entry in entries {
+            let _ = publish_live_session_key(session_map_fd, &entry.key);
+            replicate_session_upsert(&worker_queues, entry);
+        }
+        entries.len()
+    }
+
     pub fn reconcile(
         &mut self,
         snapshot: Option<&ConfigSnapshot>,
@@ -315,7 +345,8 @@ impl Coordinator {
     ) {
         self.reconcile_calls += 1;
         self.last_reconcile_stage = "start".to_string();
-        self.stop();
+        let preserved_synced_sessions = self.snapshot_shared_session_entries();
+        self.stop_inner(false);
         for binding in bindings.iter_mut() {
             binding.bound = false;
             binding.xsk_registered = false;
@@ -493,6 +524,7 @@ impl Coordinator {
             planned_bindings,
             self.live.len()
         );
+        let session_map_raw_fd = session_map_fd.fd;
         self.map_fd = Some(map_fd);
         self.heartbeat_map_fd = Some(heartbeat_map_fd);
         self.session_map_fd = Some(session_map_fd);
@@ -501,6 +533,18 @@ impl Coordinator {
             .copied()
             .map(|worker_id| (worker_id, Arc::new(Mutex::new(VecDeque::new()))))
             .collect();
+        let replayed_synced_sessions = self.replay_synced_sessions(
+            &preserved_synced_sessions,
+            &worker_command_queues,
+            session_map_raw_fd,
+        );
+        if replayed_synced_sessions > 0 {
+            self.last_reconcile_stage = format!(
+                "replayed_synced:{}:workers={}",
+                replayed_synced_sessions,
+                worker_command_queues.len()
+            );
+        }
         for (worker_id, binding_plans) in workers {
             let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
@@ -1385,6 +1429,7 @@ struct PendingForwardRequest {
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     decision: SessionDecision,
+    apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
     flow_key: Option<SessionKey>,
     /// NAT64 reverse info for cross-AF translation (IPv4 reply → IPv6).
@@ -2088,6 +2133,8 @@ fn poll_binding(
                     let mut debug = flow
                         .as_ref()
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
+                    let mut session_ingress_zone: Option<Arc<str>> = None;
+                    let mut apply_nat_on_fabric = false;
                     let decision = if let Some(flow) = flow.as_ref() {
                         if let Some(resolved) = resolve_flow_session_decision(
                             sessions,
@@ -2135,6 +2182,8 @@ fn poll_binding(
                                 debug.from_zone = Some(resolved.metadata.ingress_zone.clone());
                                 debug.to_zone = Some(resolved.metadata.egress_zone.clone());
                             }
+                            session_ingress_zone = Some(resolved.metadata.ingress_zone.clone());
+                            apply_nat_on_fabric = true;
                             resolved.decision
                         } else {
                             counters.session_misses += 1;
@@ -2142,6 +2191,60 @@ fn poll_binding(
                             let resolution_target =
                                 parse_packet_destination(unsafe { &*area }, desc, meta)
                                     .unwrap_or(flow.dst_ip);
+
+                            // Cluster peer return fast path:
+                            // a non-initiating TCP packet arriving from zone-encoded fabric
+                            // ingress has already been policy/NAT-validated by the active owner.
+                            // The first SYN-ACK can beat session publication to the inactive
+                            // owner, so allow a one-packet local forward here instead of
+                            // treating it as a fresh lan->lan flow and dropping it in policy.
+                            if meta.protocol == PROTO_TCP
+                                && ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                                && let Some(ingress_zone) = ingress_zone_override.as_deref()
+                                && ((meta.tcp_flags & TCP_FLAG_SYN) == 0
+                                    || (meta.tcp_flags & 0x10) != 0)
+                            {
+                                let fabric_return_resolution =
+                                    lookup_forwarding_resolution_with_dynamic(
+                                        forwarding,
+                                        dynamic_neighbors,
+                                        resolution_target,
+                                    );
+                                let fabric_return_zone = forwarding
+                                    .ifindex_to_zone
+                                    .get(&fabric_return_resolution.egress_ifindex)
+                                    .map(|zone| zone.as_str());
+                                if fabric_return_resolution.disposition
+                                    == ForwardingDisposition::ForwardCandidate
+                                    && fabric_return_zone == Some(ingress_zone)
+                                {
+                                    let fabric_return_decision = SessionDecision {
+                                        resolution: fabric_return_resolution,
+                                        nat: NatDecision::default(),
+                                    };
+                                    let ingress_ident = BindingIdentity {
+                                        slot: binding.slot,
+                                        queue_id: binding.queue_id,
+                                        worker_id: binding.worker_id,
+                                        interface: binding.interface.clone(),
+                                        ifindex: binding.ifindex,
+                                    };
+                                    if let Some(request) = build_live_forward_request(
+                                        unsafe { &*area },
+                                        &ingress_ident,
+                                        desc,
+                                        meta,
+                                        &fabric_return_decision,
+                                        forwarding,
+                                        Some(flow),
+                                        None,
+                                        false,
+                                    ) {
+                                        binding.scratch_forwards.push(request);
+                                        continue;
+                                    }
+                                }
+                            }
 
                             // --- DNAT pre-routing ---
                             // Check DNAT table first (port-based DNAT), then
@@ -2425,6 +2528,7 @@ fn poll_binding(
                                                 desc,
                                                 meta,
                                                 decision: icmp_decision,
+                                                apply_nat_on_fabric: false,
                                                 expected_ports: None,
                                                 flow_key: None,
                                                 nat64_reverse: None,
@@ -2595,10 +2699,13 @@ fn poll_binding(
                                         recycle_now = false;
                                     } else {
                                         let mut created = 0u64;
+                                        let fabric_ingress =
+                                            ingress_is_fabric(forwarding, meta.ingress_ifindex as i32);
                                         let forward_metadata = SessionMetadata {
                                             ingress_zone: from_zone_arc.clone(),
                                             egress_zone: to_zone_arc.clone(),
                                             owner_rg_id,
+                                            fabric_ingress,
                                             is_reverse: false,
                                             synced: false,
                                             nat64_reverse: nat64_info,
@@ -2633,15 +2740,14 @@ fn poll_binding(
                                                 &forward_entry,
                                             );
                                         }
-                                        let reverse_resolution = enforce_ha_resolution_snapshot(
+                                        let reverse_resolution = reverse_resolution_for_session(
                                             forwarding,
                                             ha_state,
+                                            dynamic_neighbors,
+                                            flow.src_ip,
+                                            from_zone_arc.as_ref(),
+                                            fabric_ingress,
                                             now_secs,
-                                            lookup_forwarding_resolution_with_dynamic(
-                                                forwarding,
-                                                dynamic_neighbors,
-                                                flow.src_ip,
-                                            ),
                                         );
                                         // Install the reverse entry even if the initial reply-side
                                         // resolution is not immediately usable. On live traffic the
@@ -2712,6 +2818,7 @@ fn poll_binding(
                                             ingress_zone: to_zone_arc,
                                             egress_zone: from_zone_arc,
                                             owner_rg_id,
+                                            fabric_ingress,
                                             is_reverse: true,
                                             synced: false,
                                             nat64_reverse: nat64_info,
@@ -3118,6 +3225,8 @@ fn poll_binding(
                             &decision,
                             forwarding,
                             flow.as_ref(),
+                            session_ingress_zone.as_ref(),
+                            apply_nat_on_fabric,
                         ) {
                             dbg.tx += 1; // track forward requests queued
                             if cfg!(feature = "debug-log") {
@@ -3362,6 +3471,8 @@ fn build_live_forward_request(
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     flow: Option<&SessionFlow>,
+    fabric_ingress_zone: Option<&Arc<str>>,
+    apply_nat_on_fabric: bool,
 ) -> Option<PendingForwardRequest> {
     let target_ifindex = if decision.resolution.tx_ifindex > 0 {
         decision.resolution.tx_ifindex
@@ -3388,13 +3499,22 @@ fn build_live_forward_request(
     let expected_ports = session_ports
         .or_else(|| live_frame_ports(area, desc, meta))
         .or(meta_ports);
+    let mut decision = *decision;
+    if decision.resolution.disposition == ForwardingDisposition::FabricRedirect
+        && let Some(ingress_zone) = fabric_ingress_zone
+        && let Some(zone_redirect) =
+            resolve_zone_encoded_fabric_redirect(forwarding, ingress_zone.as_ref())
+    {
+        decision.resolution.src_mac = zone_redirect.src_mac;
+    }
     Some(PendingForwardRequest {
         target_ifindex,
         ingress_queue_id: ingress_ident.queue_id,
         source_offset: desc.addr,
         desc,
         meta,
-        decision: *decision,
+        decision,
+        apply_nat_on_fabric,
         expected_ports,
         flow_key: flow.map(|flow| flow.forward_key.clone()),
         nat64_reverse: None,
@@ -3553,11 +3673,25 @@ fn flush_session_deltas(
             egress_zone: delta.metadata.egress_zone.to_string(),
             owner_rg_id: delta.metadata.owner_rg_id,
             egress_ifindex: delta.decision.resolution.egress_ifindex,
+            tx_ifindex: delta.decision.resolution.tx_ifindex,
+            tx_vlan_id: delta.decision.resolution.tx_vlan_id,
             next_hop: delta
                 .decision
                 .resolution
                 .next_hop
                 .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            neighbor_mac: delta
+                .decision
+                .resolution
+                .neighbor_mac
+                .map(format_mac)
+                .unwrap_or_default(),
+            src_mac: delta
+                .decision
+                .resolution
+                .src_mac
+                .map(format_mac)
                 .unwrap_or_default(),
             nat_src_ip: delta
                 .decision
@@ -4812,15 +4946,18 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         let Ok(peer_addr) = fabric.peer_address.parse::<IpAddr>() else {
             continue;
         };
-        let local_mac = match mac_by_ifindex.get(&fabric.parent_ifindex).copied() {
-            Some(mac) => mac,
-            None => continue,
+        let local_mac = parse_mac(&fabric.local_mac)
+            .or_else(|| mac_by_ifindex.get(&fabric.parent_ifindex).copied());
+        let Some(local_mac) = local_mac else {
+            continue;
         };
-        let peer_mac = state
-            .neighbors
-            .get(&(fabric.overlay_ifindex, peer_addr))
-            .or_else(|| state.neighbors.get(&(fabric.parent_ifindex, peer_addr)))
-            .map(|entry| entry.mac);
+        let peer_mac = parse_mac(&fabric.peer_mac).or_else(|| {
+            state
+                .neighbors
+                .get(&(fabric.overlay_ifindex, peer_addr))
+                .or_else(|| state.neighbors.get(&(fabric.parent_ifindex, peer_addr)))
+                .map(|entry| entry.mac)
+        });
         let Some(peer_mac) = peer_mac else {
             continue;
         };
@@ -7782,6 +7919,8 @@ mod tests {
             overlay_ifindex: 101,
             rx_queues: 2,
             peer_address: "10.99.13.2".to_string(),
+            local_mac: "02:bf:72:ff:00:01".to_string(),
+            peer_mac: "00:aa:bb:cc:dd:ee".to_string(),
         }];
         snapshot.neighbors.push(NeighborSnapshot {
             interface: "fab0".to_string(),
@@ -8232,6 +8371,29 @@ mod tests {
     }
 
     #[test]
+    fn build_forwarding_state_uses_fabric_snapshot_macs_without_parent_interface() {
+        let mut snapshot = nat_snapshot();
+        snapshot.fabrics = vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_interface: "ge-0/0/0".to_string(),
+            parent_linux_name: "ge-0-0-0".to_string(),
+            parent_ifindex: 21,
+            overlay_linux_name: "fab0".to_string(),
+            overlay_ifindex: 101,
+            rx_queues: 2,
+            peer_address: "10.99.13.2".to_string(),
+            local_mac: "02:bf:72:ff:00:01".to_string(),
+            peer_mac: "00:aa:bb:cc:dd:ee".to_string(),
+        }];
+        let state = build_forwarding_state(&snapshot);
+        let redirect = resolve_fabric_redirect(&state).expect("fabric redirect");
+        assert_eq!(redirect.egress_ifindex, 21);
+        assert_eq!(redirect.tx_ifindex, 21);
+        assert_eq!(redirect.neighbor_mac, Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]));
+        assert_eq!(redirect.src_mac, Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]));
+    }
+
+    #[test]
     fn zone_encoded_fabric_redirect_preserves_ingress_zone() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let redirected =
@@ -8343,6 +8505,37 @@ mod tests {
     }
 
     #[test]
+    fn fabric_originated_reverse_session_uses_zone_encoded_fabric_redirect() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let ha_state = BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )]);
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+
+        let resolved = reverse_resolution_for_session(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            "lan",
+            true,
+            monotonic_nanos() / 1_000_000_000,
+        );
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::FabricRedirect);
+        assert_eq!(resolved.egress_ifindex, 21);
+        assert_eq!(resolved.tx_ifindex, 21);
+        assert_eq!(
+            resolved.src_mac,
+            Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01])
+        );
+    }
+
+    #[test]
     fn embedded_icmp_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let ha_state = BTreeMap::from([(
@@ -8374,7 +8567,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("wan"),
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -8422,7 +8616,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("wan"),
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -8470,7 +8665,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("wan"),
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -8520,7 +8716,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("wan"),
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -9065,7 +9262,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("lan"),
                 egress_zone: Arc::<str>::from("wan"),
                 owner_rg_id: 1,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -9076,6 +9274,113 @@ mod tests {
         assert!(replica.metadata.synced);
         assert_eq!(replica.key, entry.key);
         assert_eq!(replica.decision, entry.decision);
+    }
+
+    #[test]
+    fn reconcile_stop_preserves_shared_synced_sessions() {
+        let mut coordinator = Coordinator::new();
+        let entry = SyncedSessionEntry {
+            key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 5201,
+            },
+            decision: SessionDecision {
+                resolution: lookup_forwarding_resolution(
+                    &build_forwarding_state(&nat_snapshot()),
+                    IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                ),
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                    ..NatDecision::default()
+                },
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("lan"),
+                egress_zone: Arc::<str>::from("wan"),
+                owner_rg_id: 1,
+                fabric_ingress: false,
+            is_reverse: false,
+                synced: true,
+                nat64_reverse: None,
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        publish_shared_session(
+            &coordinator.shared_sessions,
+            &coordinator.shared_nat_sessions,
+            &entry,
+        );
+
+        coordinator.stop_inner(false);
+
+        let preserved = coordinator.snapshot_shared_session_entries();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].key, entry.key);
+        assert_eq!(preserved[0].decision, entry.decision);
+
+        coordinator.stop();
+        assert!(coordinator.snapshot_shared_session_entries().is_empty());
+    }
+
+    #[test]
+    fn replay_synced_sessions_requeues_preserved_entries_for_new_workers() {
+        let coordinator = Coordinator::new();
+        let entry = SyncedSessionEntry {
+            key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 5201,
+            },
+            decision: SessionDecision {
+                resolution: lookup_forwarding_resolution(
+                    &build_forwarding_state(&nat_snapshot()),
+                    IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                ),
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                    ..NatDecision::default()
+                },
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("lan"),
+                egress_zone: Arc::<str>::from("wan"),
+                owner_rg_id: 1,
+                fabric_ingress: false,
+            is_reverse: false,
+                synced: true,
+                nat64_reverse: None,
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let worker_command_queues = BTreeMap::from([
+            (0u32, Arc::new(Mutex::new(VecDeque::new()))),
+            (1u32, Arc::new(Mutex::new(VecDeque::new()))),
+        ]);
+
+        let replayed =
+            coordinator.replay_synced_sessions(&[entry.clone()], &worker_command_queues, -1);
+        assert_eq!(replayed, 1);
+
+        for commands in worker_command_queues.values() {
+            let pending = commands.lock().expect("worker command queue");
+            assert_eq!(pending.len(), 1);
+            match pending.front().expect("queued command") {
+                WorkerCommand::UpsertSynced(replayed_entry) => {
+                    assert_eq!(replayed_entry.key, entry.key);
+                    assert!(replayed_entry.metadata.synced);
+                }
+                other => panic!("unexpected command queued during replay: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -10129,6 +10434,8 @@ mod tests {
             &decision,
             &forwarding,
             Some(&session_flow),
+            None,
+            false,
         )
         .expect("request");
         // Session flow ports (1025, 5201) take priority over frame ports (38276, 5201)
@@ -10227,6 +10534,8 @@ mod tests {
             &decision,
             &forwarding,
             None,
+            None,
+            false,
         )
         .expect("request");
         assert_eq!(req.expected_ports, Some((real_src_port, real_dst_port)));
@@ -10296,9 +10605,145 @@ mod tests {
             &decision,
             &ForwardingState::default(),
             Some(&flow),
+            None,
+            false,
         )
         .expect("request");
         assert_eq!(req.expected_ports, Some((54688, 5201)));
+    }
+
+    #[test]
+    fn build_live_forward_request_marks_session_fabric_redirect_for_nat_and_zone() {
+        let forwarding = build_forwarding_state(&nat_snapshot_with_fabric());
+        let fabric_redirect = resolve_fabric_redirect(&forwarding).expect("fabric redirect");
+        let zone_redirect =
+            resolve_zone_encoded_fabric_redirect(&forwarding, "wan").expect("zone redirect");
+        let mut area = MmapArea::new(256).expect("mmap");
+        area.slice_mut(0, 64).expect("slice").fill(0xaa);
+        let ingress_ident = BindingIdentity {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("fab0"),
+            ifindex: 21,
+        };
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            flow_src_port: 5201,
+            flow_dst_port: 44278,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: fabric_redirect,
+            nat: NatDecision {
+                rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                ..NatDecision::default()
+            },
+        };
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+                src_port: 5201,
+                dst_port: 44278,
+            },
+        };
+
+        let req = build_live_forward_request(
+            &area,
+            &ingress_ident,
+            XdpDesc {
+                addr: 0,
+                len: 64,
+                options: 0,
+            },
+            meta,
+            &decision,
+            &forwarding,
+            Some(&flow),
+            Some(&Arc::<str>::from("wan")),
+            true,
+        )
+        .expect("request");
+
+        assert!(req.apply_nat_on_fabric);
+        assert_eq!(req.decision.resolution.disposition, ForwardingDisposition::FabricRedirect);
+        assert_eq!(req.decision.resolution.src_mac, zone_redirect.src_mac);
+    }
+
+    #[test]
+    fn build_forwarded_frame_applies_nat_on_fabric_when_requested() {
+        let forwarding = build_forwarding_state(&nat_snapshot_with_fabric());
+        let fabric_redirect = resolve_fabric_redirect(&forwarding).expect("fabric redirect");
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x10, 0xdb, 0xff, 0x10, 0x01],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x28, 0x00, 0x02, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 172, 16,
+            80, 200, 172, 16, 80, 8, 0x14, 0x51, 0xac, 0xf6, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x02, 0x50, 0x12, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+        assert!(tcp_checksum_ok_ipv4(&frame[14..]));
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            flow_src_port: 5201,
+            flow_dst_port: 44278,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: fabric_redirect,
+            nat: NatDecision {
+                rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                ..NatDecision::default()
+            },
+        };
+
+        let no_nat = build_forwarded_frame_from_frame(
+            &frame,
+            meta,
+            &decision,
+            &forwarding,
+            false,
+            Some((5201, 44278)),
+        )
+        .expect("frame without nat");
+        assert_eq!(&no_nat[30..34], &[172, 16, 80, 8]);
+
+        let nat = build_forwarded_frame_from_frame(
+            &frame,
+            meta,
+            &decision,
+            &forwarding,
+            true,
+            Some((5201, 44278)),
+        )
+        .expect("frame with nat");
+        assert_eq!(&nat[30..34], &[10, 0, 61, 102]);
+        assert!(tcp_checksum_ok_ipv4(&nat[14..]));
     }
 
     #[test]
@@ -12197,7 +12642,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("untrust"),
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -12318,7 +12764,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("untrust"),
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -12432,7 +12879,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("untrust"),
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -12563,7 +13011,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("untrust"),
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -12693,6 +13142,7 @@ mod tests {
             ingress_zone: Arc::<str>::from("lan"),
             egress_zone: Arc::<str>::from("wan"),
             owner_rg_id: 0,
+            fabric_ingress: false,
             is_reverse: false,
             synced: false,
             nat64_reverse: None,
@@ -12806,6 +13256,7 @@ mod tests {
             ingress_zone: Arc::<str>::from("lan"),
             egress_zone: Arc::<str>::from("wan"),
             owner_rg_id: 0,
+            fabric_ingress: false,
             is_reverse: false,
             synced: false,
             nat64_reverse: None,
@@ -12835,6 +13286,7 @@ mod tests {
             ingress_zone: Arc::<str>::from("wan"),
             egress_zone: Arc::<str>::from("lan"),
             owner_rg_id: 0,
+            fabric_ingress: false,
             is_reverse: true,
             synced: false,
             nat64_reverse: None,
@@ -12984,7 +13436,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("lan"),
                 egress_zone: Arc::<str>::from("wan"),
                 owner_rg_id: 0,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: true,
                 nat64_reverse: None,
             },

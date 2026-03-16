@@ -1,14 +1,22 @@
 package userspace
 
 import (
+	"encoding/binary"
 	"net"
 	"testing"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/dataplane"
 	"github.com/vishvananda/netlink"
 )
+
+func hostToNetwork16(v uint16) uint16 {
+	var raw [2]byte
+	binary.BigEndian.PutUint16(raw[:], v)
+	return binary.NativeEndian.Uint16(raw[:])
+}
 
 func TestFindUserspaceEgressInterfaceSnapshotPrefersVLANUnit(t *testing.T) {
 	snapshot := &ConfigSnapshot{
@@ -60,6 +68,96 @@ func TestSessionSyncEgressLockedDerivesOwnerAndTxPath(t *testing.T) {
 	}
 	if owner != 1 {
 		t.Fatalf("owner = %d, want 1", owner)
+	}
+}
+
+func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
+	m := &Manager{
+		inner: dataplane.New(),
+		lastSnapshot: &ConfigSnapshot{
+			Interfaces: []InterfaceSnapshot{{
+				Name:            "reth0.80",
+				Ifindex:         12,
+				ParentIfindex:   6,
+				VLANID:          80,
+				RedundancyGroup: 1,
+			}},
+		},
+	}
+	key := dataplane.SessionKey{
+		SrcIP:    [4]byte{10, 0, 61, 102},
+		DstIP:    [4]byte{172, 16, 80, 200},
+		SrcPort:  hostToNetwork16(50952),
+		DstPort:  hostToNetwork16(5201),
+		Protocol: 6,
+	}
+	val := &dataplane.SessionValue{
+		IngressZone: 1,
+		EgressZone:  2,
+		Flags:       dataplane.SessFlagSNAT,
+		FibIfindex:  6,
+		FibVlanID:   80,
+		NATSrcIP:    binary.NativeEndian.Uint32([]byte{172, 16, 80, 8}),
+		NATSrcPort:  hostToNetwork16(40000),
+	}
+	req := m.buildSessionSyncRequestV4("upsert", key, val)
+	if req.SrcPort != 50952 || req.DstPort != 5201 {
+		t.Fatalf("unexpected host-order request ports: %+v", req)
+	}
+	if req.NATSrcPort != 40000 {
+		t.Fatalf("unexpected nat src port: %d", req.NATSrcPort)
+	}
+}
+
+func TestBuildSessionSyncRequestV6ConvertsPortsToHostOrder(t *testing.T) {
+	m := &Manager{
+		inner: dataplane.New(),
+		lastSnapshot: &ConfigSnapshot{
+			Interfaces: []InterfaceSnapshot{{
+				Name:            "reth0.80",
+				Ifindex:         12,
+				ParentIfindex:   6,
+				VLANID:          80,
+				RedundancyGroup: 1,
+			}},
+		},
+	}
+	var srcIP, dstIP [16]byte
+	copy(srcIP[:], net.ParseIP("2001:559:8585:ef00::100").To16())
+	copy(dstIP[:], net.ParseIP("2001:559:8585:80::200").To16())
+	var natSrc [16]byte
+	copy(natSrc[:], net.ParseIP("2001:559:8585:80::8").To16())
+	key := dataplane.SessionKeyV6{
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+		SrcPort:  hostToNetwork16(50952),
+		DstPort:  hostToNetwork16(5201),
+		Protocol: 6,
+	}
+	val := &dataplane.SessionValueV6{
+		IngressZone: 1,
+		EgressZone:  2,
+		Flags:       dataplane.SessFlagSNAT,
+		FibIfindex:  6,
+		FibVlanID:   80,
+		NATSrcIP:    natSrc,
+		NATSrcPort:  hostToNetwork16(40000),
+	}
+	req := m.buildSessionSyncRequestV6("upsert", key, val)
+	if req.SrcPort != 50952 || req.DstPort != 5201 {
+		t.Fatalf("unexpected host-order request ports: %+v", req)
+	}
+	if req.NATSrcPort != 40000 {
+		t.Fatalf("unexpected nat src port: %d", req.NATSrcPort)
+	}
+}
+
+func TestShouldMirrorUserspaceSessionSkipsReverseEntries(t *testing.T) {
+	if !shouldMirrorUserspaceSession(0) {
+		t.Fatal("expected forward sessions to be mirrored")
+	}
+	if shouldMirrorUserspaceSession(1) {
+		t.Fatal("expected reverse sessions to be skipped")
 	}
 }
 
@@ -593,10 +691,10 @@ func TestDesiredForwardingArmedDefaultsOnStandalone(t *testing.T) {
 func TestStopLockedClearsLastStatus(t *testing.T) {
 	m := &Manager{
 		lastStatus: ProcessStatus{
-			PID:              1234,
-			Enabled:          true,
-			ForwardingArmed:  true,
-			Capabilities:     UserspaceCapabilities{ForwardingSupported: true},
+			PID:             1234,
+			Enabled:         true,
+			ForwardingArmed: true,
+			Capabilities:    UserspaceCapabilities{ForwardingSupported: true},
 		},
 	}
 
