@@ -505,21 +505,21 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 	policyCount := len(cfg.Security.Policies)
 	interfaces := buildInterfaceSnapshots(cfg)
 	return &ConfigSnapshot{
-		Version:       ProtocolVersion,
-		Generation:    generation,
-		FIBGeneration: fibGeneration,
-		GeneratedAt:   time.Now().UTC(),
-		Capabilities:  deriveUserspaceCapabilities(cfg),
-		MapPins:       userspaceMapPins(),
-		Userspace:     ucfg,
-		Zones:         buildZoneSnapshots(cfg),
-		Interfaces:    interfaces,
-		Fabrics:       buildFabricSnapshots(cfg),
-		Neighbors:     buildNeighborSnapshots(cfg),
-		Routes:        buildRouteSnapshots(cfg, interfaces),
-		Flow: buildFlowSnapshot(cfg),
-		DefaultPolicy: policyActionString(cfg.Security.DefaultPolicy),
-		Policies:      buildPolicySnapshots(cfg),
+		Version:        ProtocolVersion,
+		Generation:     generation,
+		FIBGeneration:  fibGeneration,
+		GeneratedAt:    time.Now().UTC(),
+		Capabilities:   deriveUserspaceCapabilities(cfg),
+		MapPins:        userspaceMapPins(),
+		Userspace:      ucfg,
+		Zones:          buildZoneSnapshots(cfg),
+		Interfaces:     interfaces,
+		Fabrics:        buildFabricSnapshots(cfg),
+		Neighbors:      buildNeighborSnapshots(cfg),
+		Routes:         buildRouteSnapshots(cfg, interfaces),
+		Flow:           buildFlowSnapshot(cfg),
+		DefaultPolicy:  policyActionString(cfg.Security.DefaultPolicy),
+		Policies:       buildPolicySnapshots(cfg),
 		SourceNAT:      buildSourceNATSnapshots(cfg),
 		StaticNAT:      buildStaticNATSnapshots(cfg),
 		DestinationNAT: buildDestinationNATSnapshots(cfg),
@@ -529,7 +529,7 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		Filters:        buildFirewallFilterSnapshots(cfg),
 		Policers:       buildPolicerSnapshots(cfg),
 		FlowExport:     buildFlowExportSnapshot(cfg),
-		Config:        cfg,
+		Config:         cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
 			DataplaneType:  cfg.System.DataplaneType,
@@ -590,13 +590,14 @@ func buildFabricSnapshots(cfg *config.Config) []FabricSnapshot {
 		}
 		parentName := ifCfg.LocalFabricMember
 		parentLinux := config.LinuxIfName(parentName)
-		parentIfindex, _, _, _ := buildLinkSnapshot(parentLinux)
+		parentIfindex, _, parentMAC, _ := buildLinkSnapshot(parentLinux)
 		overlayLinux := config.LinuxIfName(in.name)
 		overlayIfindex, _, _, _ := buildLinkSnapshot(overlayLinux)
 		rxQueues := 0
 		if parentLinux != "" {
 			rxQueues = userspaceRXQueueCount(parentLinux)
 		}
+		peerMAC := buildFabricPeerMAC(overlayIfindex, parentIfindex, in.peer)
 		out = append(out, FabricSnapshot{
 			Name:            in.name,
 			ParentInterface: parentName,
@@ -606,12 +607,41 @@ func buildFabricSnapshots(cfg *config.Config) []FabricSnapshot {
 			OverlayIfindex:  overlayIfindex,
 			RXQueues:        rxQueues,
 			PeerAddress:     in.peer,
+			LocalMAC:        parentMAC,
+			PeerMAC:         peerMAC,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+func buildFabricPeerMAC(overlayIfindex, parentIfindex int, peer string) string {
+	ip := net.ParseIP(peer)
+	if ip == nil {
+		return ""
+	}
+	family := netlink.FAMILY_V4
+	if ip.To4() == nil {
+		family = netlink.FAMILY_V6
+	}
+	for _, ifindex := range []int{overlayIfindex, parentIfindex} {
+		if ifindex <= 0 {
+			continue
+		}
+		neighs, err := netlink.NeighList(ifindex, family)
+		if err != nil {
+			continue
+		}
+		for _, neigh := range neighs {
+			if neigh.IP == nil || !neigh.IP.Equal(ip) || neigh.HardwareAddr == nil {
+				continue
+			}
+			return neigh.HardwareAddr.String()
+		}
+	}
+	return ""
 }
 
 func userspaceMapPins() UserspaceMapPins {
@@ -1041,10 +1071,10 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []R
 				mainTable = "inet6.0"
 			}
 			addSnapshot(RouteSnapshot{
-				Table:     mainTable,
-				Family:    familyStr,
+				Table:       mainTable,
+				Family:      familyStr,
 				Destination: rule.Dst.String(),
-				NextTable: tableName,
+				NextTable:   tableName,
 			})
 		}
 	}
@@ -1418,7 +1448,7 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 			Zone:        zone.Name,
 			Land:        sp.TCP.Land,
 			SynFin:      sp.TCP.SynFin,
-			NoFlag:   sp.TCP.NoFlag,
+			NoFlag:      sp.TCP.NoFlag,
 			FinNoAck:    sp.TCP.FinNoAck,
 			WinNuke:     sp.TCP.WinNuke,
 			PingDeath:   sp.ICMP.PingDeath,
@@ -2662,6 +2692,9 @@ func (m *Manager) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionVa
 	if err := m.inner.SetSessionV4(key, val); err != nil {
 		return err
 	}
+	if !shouldMirrorUserspaceSession(val.IsReverse) {
+		return nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	_ = m.syncSessionV4Locked("upsert", key, &val)
@@ -2672,10 +2705,17 @@ func (m *Manager) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.Session
 	if err := m.inner.SetSessionV6(key, val); err != nil {
 		return err
 	}
+	if !shouldMirrorUserspaceSession(val.IsReverse) {
+		return nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	_ = m.syncSessionV6Locked("upsert", key, &val)
 	return nil
+}
+
+func shouldMirrorUserspaceSession(isReverse uint8) bool {
+	return isReverse == 0
 }
 
 func (m *Manager) DeleteSession(key dataplane.SessionKey) error {
@@ -2702,14 +2742,19 @@ func (m *Manager) syncSessionV4Locked(op string, key dataplane.SessionKey, val *
 	if m.proc == nil {
 		return nil
 	}
+	req := m.buildSessionSyncRequestV4(op, key, val)
+	return m.syncSessionRequestLocked(req)
+}
+
+func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey, val *dataplane.SessionValue) SessionSyncRequest {
 	req := SessionSyncRequest{
 		Operation:  op,
 		AddrFamily: dataplane.AFInet,
 		Protocol:   key.Protocol,
 		SrcIP:      net.IP(key.SrcIP[:]).String(),
 		DstIP:      net.IP(key.DstIP[:]).String(),
-		SrcPort:    key.SrcPort,
-		DstPort:    key.DstPort,
+		SrcPort:    networkUint16ToHost(key.SrcPort),
+		DstPort:    networkUint16ToHost(key.DstPort),
 	}
 	if val != nil {
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
@@ -2720,8 +2765,8 @@ func (m *Manager) syncSessionV4Locked(op string, key dataplane.SessionKey, val *
 		req.SrcMAC = macString(val.FibSmac[:])
 		req.NATSrcIP = ipString(nativeUint32ToIP(val.NATSrcIP))
 		req.NATDstIP = ipString(nativeUint32ToIP(val.NATDstIP))
-		req.NATSrcPort = val.NATSrcPort
-		req.NATDstPort = val.NATDstPort
+		req.NATSrcPort = networkUint16ToHost(val.NATSrcPort)
+		req.NATDstPort = networkUint16ToHost(val.NATDstPort)
 		req.IsReverse = val.IsReverse != 0
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
@@ -2732,21 +2777,26 @@ func (m *Manager) syncSessionV4Locked(op string, key dataplane.SessionKey, val *
 			req.NATDstPort = 0
 		}
 	}
-	return m.syncSessionRequestLocked(req)
+	return req
 }
 
 func (m *Manager) syncSessionV6Locked(op string, key dataplane.SessionKeyV6, val *dataplane.SessionValueV6) error {
 	if m.proc == nil {
 		return nil
 	}
+	req := m.buildSessionSyncRequestV6(op, key, val)
+	return m.syncSessionRequestLocked(req)
+}
+
+func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV6, val *dataplane.SessionValueV6) SessionSyncRequest {
 	req := SessionSyncRequest{
 		Operation:  op,
 		AddrFamily: dataplane.AFInet6,
 		Protocol:   key.Protocol,
 		SrcIP:      net.IP(key.SrcIP[:]).String(),
 		DstIP:      net.IP(key.DstIP[:]).String(),
-		SrcPort:    key.SrcPort,
-		DstPort:    key.DstPort,
+		SrcPort:    networkUint16ToHost(key.SrcPort),
+		DstPort:    networkUint16ToHost(key.DstPort),
 	}
 	if val != nil {
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
@@ -2757,8 +2807,8 @@ func (m *Manager) syncSessionV6Locked(op string, key dataplane.SessionKeyV6, val
 		req.SrcMAC = macString(val.FibSmac[:])
 		req.NATSrcIP = ipString(net.IP(val.NATSrcIP[:]))
 		req.NATDstIP = ipString(net.IP(val.NATDstIP[:]))
-		req.NATSrcPort = val.NATSrcPort
-		req.NATDstPort = val.NATDstPort
+		req.NATSrcPort = networkUint16ToHost(val.NATSrcPort)
+		req.NATDstPort = networkUint16ToHost(val.NATDstPort)
 		req.IsReverse = val.IsReverse != 0
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
@@ -2769,7 +2819,7 @@ func (m *Manager) syncSessionV6Locked(op string, key dataplane.SessionKeyV6, val
 			req.NATDstPort = 0
 		}
 	}
-	return m.syncSessionRequestLocked(req)
+	return req
 }
 
 func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
@@ -2809,6 +2859,12 @@ func nativeUint32ToIP(v uint32) net.IP {
 	var raw [4]byte
 	binary.NativeEndian.PutUint32(raw[:], v)
 	return net.IPv4(raw[0], raw[1], raw[2], raw[3]).To4()
+}
+
+func networkUint16ToHost(v uint16) uint16 {
+	var raw [2]byte
+	binary.NativeEndian.PutUint16(raw[:], v)
+	return binary.BigEndian.Uint16(raw[:])
 }
 
 func ipString(ip net.IP) string {

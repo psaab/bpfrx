@@ -2818,6 +2818,18 @@ func userspaceSessionTimeout(proto uint8) uint32 {
 	}
 }
 
+func userspaceHostToNetwork16(v uint16) uint16 {
+	var raw [2]byte
+	binary.BigEndian.PutUint16(raw[:], v)
+	return binary.NativeEndian.Uint16(raw[:])
+}
+
+func userspaceNetworkToHost16(v uint16) uint16 {
+	var raw [2]byte
+	binary.NativeEndian.PutUint16(raw[:], v)
+	return binary.BigEndian.Uint16(raw[:])
+}
+
 func userspaceReverseKeyV4(key dataplane.SessionKey, delta dpuserspace.SessionDeltaInfo) dataplane.SessionKey {
 	rev := dataplane.SessionKey{
 		SrcIP:    key.DstIP,
@@ -2831,6 +2843,12 @@ func userspaceReverseKeyV4(key dataplane.SessionKey, delta dpuserspace.SessionDe
 	}
 	if ip := net.ParseIP(delta.NATSrcIP).To4(); ip != nil {
 		copy(rev.DstIP[:], ip)
+	}
+	if delta.NATDstPort != 0 {
+		rev.SrcPort = userspaceHostToNetwork16(delta.NATDstPort)
+	}
+	if delta.NATSrcPort != 0 {
+		rev.DstPort = userspaceHostToNetwork16(delta.NATSrcPort)
 	}
 	return rev
 }
@@ -2849,7 +2867,26 @@ func userspaceReverseKeyV6(key dataplane.SessionKeyV6, delta dpuserspace.Session
 	if ip := net.ParseIP(delta.NATSrcIP).To16(); ip != nil {
 		copy(rev.DstIP[:], ip)
 	}
+	if delta.NATDstPort != 0 {
+		rev.SrcPort = userspaceHostToNetwork16(delta.NATDstPort)
+	}
+	if delta.NATSrcPort != 0 {
+		rev.DstPort = userspaceHostToNetwork16(delta.NATSrcPort)
+	}
 	return rev
+}
+
+func userspaceParseSyncMAC(raw string) [6]byte {
+	var out [6]byte
+	if raw == "" {
+		return out
+	}
+	mac, err := net.ParseMAC(raw)
+	if err != nil || len(mac) != len(out) {
+		return out
+	}
+	copy(out[:], mac)
+	return out
 }
 
 func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKey, dataplane.SessionValue, bool) {
@@ -2861,8 +2898,8 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	var key dataplane.SessionKey
 	copy(key.SrcIP[:], src)
 	copy(key.DstIP[:], dst)
-	key.SrcPort = delta.SrcPort
-	key.DstPort = delta.DstPort
+	key.SrcPort = userspaceHostToNetwork16(delta.SrcPort)
+	key.DstPort = userspaceHostToNetwork16(delta.DstPort)
 	key.Protocol = delta.Protocol
 
 	ingressZone := zoneIDs[delta.IngressZone]
@@ -2882,18 +2919,23 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		EgressZone:  egressZone,
 		ReverseKey:  userspaceReverseKeyV4(key, delta),
 	}
-	if delta.EgressIfindex > 0 {
+	if delta.TXIfindex > 0 {
+		val.FibIfindex = uint32(delta.TXIfindex)
+	} else if delta.EgressIfindex > 0 {
 		val.FibIfindex = uint32(delta.EgressIfindex)
 	}
+	val.FibVlanID = delta.TXVLANID
+	val.FibDmac = userspaceParseSyncMAC(delta.NeighborMAC)
+	val.FibSmac = userspaceParseSyncMAC(delta.SrcMAC)
 	if ip := net.ParseIP(delta.NATSrcIP).To4(); ip != nil {
 		val.Flags |= dataplane.SessFlagSNAT
 		val.NATSrcIP = binary.NativeEndian.Uint32(ip)
-		val.NATSrcPort = key.SrcPort
+		val.NATSrcPort = userspaceHostToNetwork16(delta.NATSrcPort)
 	}
 	if ip := net.ParseIP(delta.NATDstIP).To4(); ip != nil {
 		val.Flags |= dataplane.SessFlagDNAT
 		val.NATDstIP = binary.NativeEndian.Uint32(ip)
-		val.NATDstPort = key.DstPort
+		val.NATDstPort = userspaceHostToNetwork16(delta.NATDstPort)
 	}
 	return key, val, true
 }
@@ -2907,8 +2949,8 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	var key dataplane.SessionKeyV6
 	copy(key.SrcIP[:], src)
 	copy(key.DstIP[:], dst)
-	key.SrcPort = delta.SrcPort
-	key.DstPort = delta.DstPort
+	key.SrcPort = userspaceHostToNetwork16(delta.SrcPort)
+	key.DstPort = userspaceHostToNetwork16(delta.DstPort)
 	key.Protocol = delta.Protocol
 
 	ingressZone := zoneIDs[delta.IngressZone]
@@ -2928,18 +2970,23 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		EgressZone:  egressZone,
 		ReverseKey:  userspaceReverseKeyV6(key, delta),
 	}
-	if delta.EgressIfindex > 0 {
+	if delta.TXIfindex > 0 {
+		val.FibIfindex = uint32(delta.TXIfindex)
+	} else if delta.EgressIfindex > 0 {
 		val.FibIfindex = uint32(delta.EgressIfindex)
 	}
+	val.FibVlanID = delta.TXVLANID
+	val.FibDmac = userspaceParseSyncMAC(delta.NeighborMAC)
+	val.FibSmac = userspaceParseSyncMAC(delta.SrcMAC)
 	if ip := net.ParseIP(delta.NATSrcIP).To16(); ip != nil {
 		val.Flags |= dataplane.SessFlagSNAT
 		copy(val.NATSrcIP[:], ip)
-		val.NATSrcPort = key.SrcPort
+		val.NATSrcPort = userspaceHostToNetwork16(delta.NATSrcPort)
 	}
 	if ip := net.ParseIP(delta.NATDstIP).To16(); ip != nil {
 		val.Flags |= dataplane.SessFlagDNAT
 		copy(val.NATDstIP[:], ip)
-		val.NATDstPort = key.DstPort
+		val.NATDstPort = userspaceHostToNetwork16(delta.NATDstPort)
 	}
 	return key, val, true
 }
