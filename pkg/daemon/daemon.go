@@ -2960,6 +2960,9 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	if delta.FabricIngress {
 		val.LogFlags |= dataplane.LogFlagUserspaceFabricIngress
 	}
+	if delta.FabricIngress {
+		val.LogFlags |= dataplane.LogFlagUserspaceFabricIngress
+	}
 	return key, val, true
 }
 
@@ -3010,6 +3013,9 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		val.Flags |= dataplane.SessFlagDNAT
 		copy(val.NATDstIP[:], ip)
 		val.NATDstPort = userspaceHostToNetwork16(effectiveUserspaceNATDstPort(delta))
+	}
+	if delta.FabricIngress {
+		val.LogFlags |= dataplane.LogFlagUserspaceFabricIngress
 	}
 	if delta.FabricIngress {
 		val.LogFlags |= dataplane.LogFlagUserspaceFabricIngress
