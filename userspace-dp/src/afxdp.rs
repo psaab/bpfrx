@@ -1429,6 +1429,7 @@ struct PendingForwardRequest {
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     decision: SessionDecision,
+    apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
     flow_key: Option<SessionKey>,
     /// NAT64 reverse info for cross-AF translation (IPv4 reply → IPv6).
@@ -2132,6 +2133,8 @@ fn poll_binding(
                     let mut debug = flow
                         .as_ref()
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
+                    let mut session_ingress_zone: Option<Arc<str>> = None;
+                    let mut apply_nat_on_fabric = false;
                     let decision = if let Some(flow) = flow.as_ref() {
                         if let Some(resolved) = resolve_flow_session_decision(
                             sessions,
@@ -2179,6 +2182,8 @@ fn poll_binding(
                                 debug.from_zone = Some(resolved.metadata.ingress_zone.clone());
                                 debug.to_zone = Some(resolved.metadata.egress_zone.clone());
                             }
+                            session_ingress_zone = Some(resolved.metadata.ingress_zone.clone());
+                            apply_nat_on_fabric = true;
                             resolved.decision
                         } else {
                             counters.session_misses += 1;
@@ -2186,6 +2191,60 @@ fn poll_binding(
                             let resolution_target =
                                 parse_packet_destination(unsafe { &*area }, desc, meta)
                                     .unwrap_or(flow.dst_ip);
+
+                            // Cluster peer return fast path:
+                            // a non-initiating TCP packet arriving from zone-encoded fabric
+                            // ingress has already been policy/NAT-validated by the active owner.
+                            // The first SYN-ACK can beat session publication to the inactive
+                            // owner, so allow a one-packet local forward here instead of
+                            // treating it as a fresh lan->lan flow and dropping it in policy.
+                            if meta.protocol == PROTO_TCP
+                                && ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                                && let Some(ingress_zone) = ingress_zone_override.as_deref()
+                                && ((meta.tcp_flags & TCP_FLAG_SYN) == 0
+                                    || (meta.tcp_flags & 0x10) != 0)
+                            {
+                                let fabric_return_resolution =
+                                    lookup_forwarding_resolution_with_dynamic(
+                                        forwarding,
+                                        dynamic_neighbors,
+                                        resolution_target,
+                                    );
+                                let fabric_return_zone = forwarding
+                                    .ifindex_to_zone
+                                    .get(&fabric_return_resolution.egress_ifindex)
+                                    .map(|zone| zone.as_str());
+                                if fabric_return_resolution.disposition
+                                    == ForwardingDisposition::ForwardCandidate
+                                    && fabric_return_zone == Some(ingress_zone)
+                                {
+                                    let fabric_return_decision = SessionDecision {
+                                        resolution: fabric_return_resolution,
+                                        nat: NatDecision::default(),
+                                    };
+                                    let ingress_ident = BindingIdentity {
+                                        slot: binding.slot,
+                                        queue_id: binding.queue_id,
+                                        worker_id: binding.worker_id,
+                                        interface: binding.interface.clone(),
+                                        ifindex: binding.ifindex,
+                                    };
+                                    if let Some(request) = build_live_forward_request(
+                                        unsafe { &*area },
+                                        &ingress_ident,
+                                        desc,
+                                        meta,
+                                        &fabric_return_decision,
+                                        forwarding,
+                                        Some(flow),
+                                        None,
+                                        false,
+                                    ) {
+                                        binding.scratch_forwards.push(request);
+                                        continue;
+                                    }
+                                }
+                            }
 
                             // --- DNAT pre-routing ---
                             // Check DNAT table first (port-based DNAT), then
@@ -2469,6 +2528,7 @@ fn poll_binding(
                                                 desc,
                                                 meta,
                                                 decision: icmp_decision,
+                                                apply_nat_on_fabric: false,
                                                 expected_ports: None,
                                                 flow_key: None,
                                                 nat64_reverse: None,
@@ -2639,10 +2699,13 @@ fn poll_binding(
                                         recycle_now = false;
                                     } else {
                                         let mut created = 0u64;
+                                        let fabric_ingress =
+                                            ingress_is_fabric(forwarding, meta.ingress_ifindex as i32);
                                         let forward_metadata = SessionMetadata {
                                             ingress_zone: from_zone_arc.clone(),
                                             egress_zone: to_zone_arc.clone(),
                                             owner_rg_id,
+                                            fabric_ingress,
                                             is_reverse: false,
                                             synced: false,
                                             nat64_reverse: nat64_info,
@@ -2677,15 +2740,14 @@ fn poll_binding(
                                                 &forward_entry,
                                             );
                                         }
-                                        let reverse_resolution = enforce_ha_resolution_snapshot(
+                                        let reverse_resolution = reverse_resolution_for_session(
                                             forwarding,
                                             ha_state,
+                                            dynamic_neighbors,
+                                            flow.src_ip,
+                                            from_zone_arc.as_ref(),
+                                            fabric_ingress,
                                             now_secs,
-                                            lookup_forwarding_resolution_with_dynamic(
-                                                forwarding,
-                                                dynamic_neighbors,
-                                                flow.src_ip,
-                                            ),
                                         );
                                         // Install the reverse entry even if the initial reply-side
                                         // resolution is not immediately usable. On live traffic the
@@ -2756,6 +2818,7 @@ fn poll_binding(
                                             ingress_zone: to_zone_arc,
                                             egress_zone: from_zone_arc,
                                             owner_rg_id,
+                                            fabric_ingress,
                                             is_reverse: true,
                                             synced: false,
                                             nat64_reverse: nat64_info,
@@ -3162,6 +3225,8 @@ fn poll_binding(
                             &decision,
                             forwarding,
                             flow.as_ref(),
+                            session_ingress_zone.as_ref(),
+                            apply_nat_on_fabric,
                         ) {
                             dbg.tx += 1; // track forward requests queued
                             if cfg!(feature = "debug-log") {
@@ -3406,6 +3471,8 @@ fn build_live_forward_request(
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     flow: Option<&SessionFlow>,
+    fabric_ingress_zone: Option<&Arc<str>>,
+    apply_nat_on_fabric: bool,
 ) -> Option<PendingForwardRequest> {
     let target_ifindex = if decision.resolution.tx_ifindex > 0 {
         decision.resolution.tx_ifindex
@@ -3432,13 +3499,22 @@ fn build_live_forward_request(
     let expected_ports = session_ports
         .or_else(|| live_frame_ports(area, desc, meta))
         .or(meta_ports);
+    let mut decision = *decision;
+    if decision.resolution.disposition == ForwardingDisposition::FabricRedirect
+        && let Some(ingress_zone) = fabric_ingress_zone
+        && let Some(zone_redirect) =
+            resolve_zone_encoded_fabric_redirect(forwarding, ingress_zone.as_ref())
+    {
+        decision.resolution.src_mac = zone_redirect.src_mac;
+    }
     Some(PendingForwardRequest {
         target_ifindex,
         ingress_queue_id: ingress_ident.queue_id,
         source_offset: desc.addr,
         desc,
         meta,
-        decision: *decision,
+        decision,
+        apply_nat_on_fabric,
         expected_ports,
         flow_key: flow.map(|flow| flow.forward_key.clone()),
         nat64_reverse: None,
@@ -8429,6 +8505,37 @@ mod tests {
     }
 
     #[test]
+    fn fabric_originated_reverse_session_uses_zone_encoded_fabric_redirect() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let ha_state = BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )]);
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+
+        let resolved = reverse_resolution_for_session(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            "lan",
+            true,
+            monotonic_nanos() / 1_000_000_000,
+        );
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::FabricRedirect);
+        assert_eq!(resolved.egress_ifindex, 21);
+        assert_eq!(resolved.tx_ifindex, 21);
+        assert_eq!(
+            resolved.src_mac,
+            Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01])
+        );
+    }
+
+    #[test]
     fn embedded_icmp_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let ha_state = BTreeMap::from([(
@@ -8460,7 +8567,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("wan"),
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -8508,7 +8616,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("wan"),
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -8556,7 +8665,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("wan"),
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -8606,7 +8716,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("wan"),
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -9151,7 +9262,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("lan"),
                 egress_zone: Arc::<str>::from("wan"),
                 owner_rg_id: 1,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -9190,7 +9302,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("lan"),
                 egress_zone: Arc::<str>::from("wan"),
                 owner_rg_id: 1,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: true,
                 nat64_reverse: None,
             },
@@ -9240,7 +9353,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("lan"),
                 egress_zone: Arc::<str>::from("wan"),
                 owner_rg_id: 1,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: true,
                 nat64_reverse: None,
             },
@@ -10320,6 +10434,8 @@ mod tests {
             &decision,
             &forwarding,
             Some(&session_flow),
+            None,
+            false,
         )
         .expect("request");
         // Session flow ports (1025, 5201) take priority over frame ports (38276, 5201)
@@ -10418,6 +10534,8 @@ mod tests {
             &decision,
             &forwarding,
             None,
+            None,
+            false,
         )
         .expect("request");
         assert_eq!(req.expected_ports, Some((real_src_port, real_dst_port)));
@@ -10487,9 +10605,145 @@ mod tests {
             &decision,
             &ForwardingState::default(),
             Some(&flow),
+            None,
+            false,
         )
         .expect("request");
         assert_eq!(req.expected_ports, Some((54688, 5201)));
+    }
+
+    #[test]
+    fn build_live_forward_request_marks_session_fabric_redirect_for_nat_and_zone() {
+        let forwarding = build_forwarding_state(&nat_snapshot_with_fabric());
+        let fabric_redirect = resolve_fabric_redirect(&forwarding).expect("fabric redirect");
+        let zone_redirect =
+            resolve_zone_encoded_fabric_redirect(&forwarding, "wan").expect("zone redirect");
+        let mut area = MmapArea::new(256).expect("mmap");
+        area.slice_mut(0, 64).expect("slice").fill(0xaa);
+        let ingress_ident = BindingIdentity {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("fab0"),
+            ifindex: 21,
+        };
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            flow_src_port: 5201,
+            flow_dst_port: 44278,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: fabric_redirect,
+            nat: NatDecision {
+                rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                ..NatDecision::default()
+            },
+        };
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+                src_port: 5201,
+                dst_port: 44278,
+            },
+        };
+
+        let req = build_live_forward_request(
+            &area,
+            &ingress_ident,
+            XdpDesc {
+                addr: 0,
+                len: 64,
+                options: 0,
+            },
+            meta,
+            &decision,
+            &forwarding,
+            Some(&flow),
+            Some(&Arc::<str>::from("wan")),
+            true,
+        )
+        .expect("request");
+
+        assert!(req.apply_nat_on_fabric);
+        assert_eq!(req.decision.resolution.disposition, ForwardingDisposition::FabricRedirect);
+        assert_eq!(req.decision.resolution.src_mac, zone_redirect.src_mac);
+    }
+
+    #[test]
+    fn build_forwarded_frame_applies_nat_on_fabric_when_requested() {
+        let forwarding = build_forwarding_state(&nat_snapshot_with_fabric());
+        let fabric_redirect = resolve_fabric_redirect(&forwarding).expect("fabric redirect");
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x10, 0xdb, 0xff, 0x10, 0x01],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x28, 0x00, 0x02, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 172, 16,
+            80, 200, 172, 16, 80, 8, 0x14, 0x51, 0xac, 0xf6, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x02, 0x50, 0x12, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+        assert!(tcp_checksum_ok_ipv4(&frame[14..]));
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            flow_src_port: 5201,
+            flow_dst_port: 44278,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: fabric_redirect,
+            nat: NatDecision {
+                rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                ..NatDecision::default()
+            },
+        };
+
+        let no_nat = build_forwarded_frame_from_frame(
+            &frame,
+            meta,
+            &decision,
+            &forwarding,
+            false,
+            Some((5201, 44278)),
+        )
+        .expect("frame without nat");
+        assert_eq!(&no_nat[30..34], &[172, 16, 80, 8]);
+
+        let nat = build_forwarded_frame_from_frame(
+            &frame,
+            meta,
+            &decision,
+            &forwarding,
+            true,
+            Some((5201, 44278)),
+        )
+        .expect("frame with nat");
+        assert_eq!(&nat[30..34], &[10, 0, 61, 102]);
+        assert!(tcp_checksum_ok_ipv4(&nat[14..]));
     }
 
     #[test]
@@ -12388,7 +12642,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("untrust"),
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -12509,7 +12764,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("untrust"),
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -12623,7 +12879,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("untrust"),
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -12754,7 +13011,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("untrust"),
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -12884,6 +13142,7 @@ mod tests {
             ingress_zone: Arc::<str>::from("lan"),
             egress_zone: Arc::<str>::from("wan"),
             owner_rg_id: 0,
+            fabric_ingress: false,
             is_reverse: false,
             synced: false,
             nat64_reverse: None,
@@ -12997,6 +13256,7 @@ mod tests {
             ingress_zone: Arc::<str>::from("lan"),
             egress_zone: Arc::<str>::from("wan"),
             owner_rg_id: 0,
+            fabric_ingress: false,
             is_reverse: false,
             synced: false,
             nat64_reverse: None,
@@ -13026,6 +13286,7 @@ mod tests {
             ingress_zone: Arc::<str>::from("wan"),
             egress_zone: Arc::<str>::from("lan"),
             owner_rg_id: 0,
+            fabric_ingress: false,
             is_reverse: true,
             synced: false,
             nat64_reverse: None,
@@ -13175,7 +13436,8 @@ mod tests {
                 ingress_zone: Arc::<str>::from("lan"),
                 egress_zone: Arc::<str>::from("wan"),
                 owner_rg_id: 0,
-                is_reverse: false,
+                fabric_ingress: false,
+            is_reverse: false,
                 synced: true,
                 nat64_reverse: None,
             },

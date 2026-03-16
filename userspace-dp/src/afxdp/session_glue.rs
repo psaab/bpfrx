@@ -446,17 +446,17 @@ fn build_reverse_session_from_forward_match(
     forward_match: ForwardSessionMatch,
     now_secs: u64,
 ) -> SessionLookup {
+    let resolution = reverse_resolution_for_session(
+        forwarding,
+        ha_state,
+        dynamic_neighbors,
+        forward_match.key.src_ip,
+        forward_match.metadata.ingress_zone.as_ref(),
+        forward_match.metadata.fabric_ingress,
+        now_secs,
+    );
     let decision = SessionDecision {
-        resolution: enforce_ha_resolution_snapshot(
-            forwarding,
-            ha_state,
-            now_secs,
-            lookup_forwarding_resolution_with_dynamic(
-                forwarding,
-                dynamic_neighbors,
-                forward_match.key.src_ip,
-            ),
-        ),
+        resolution,
         nat: forward_match.decision.nat.reverse(
             forward_match.key.src_ip,
             forward_match.key.dst_ip,
@@ -468,11 +468,34 @@ fn build_reverse_session_from_forward_match(
         ingress_zone: forward_match.metadata.egress_zone.clone(),
         egress_zone: forward_match.metadata.ingress_zone.clone(),
         owner_rg_id: forward_match.metadata.owner_rg_id,
+        fabric_ingress: forward_match.metadata.fabric_ingress,
         is_reverse: true,
         synced: false,
         nat64_reverse: None,
     };
     SessionLookup { decision, metadata }
+}
+
+pub(super) fn reverse_resolution_for_session(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    target_ip: IpAddr,
+    ingress_zone: &str,
+    fabric_ingress: bool,
+    now_secs: u64,
+) -> ForwardingResolution {
+    if fabric_ingress
+        && let Some(redirect) = resolve_zone_encoded_fabric_redirect(forwarding, ingress_zone)
+    {
+        return redirect;
+    }
+    enforce_ha_resolution_snapshot(
+        forwarding,
+        ha_state,
+        now_secs,
+        lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip),
+    )
 }
 
 fn install_reverse_session_from_forward_match(
@@ -695,6 +718,7 @@ mod tests {
             ingress_zone: Arc::<str>::from("lan"),
             egress_zone: Arc::<str>::from("wan"),
             owner_rg_id: 1,
+            fabric_ingress: false,
             is_reverse: false,
             synced: false,
             nat64_reverse: None,

@@ -1626,6 +1626,8 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             ingress_zone: req.ingress_zone.clone().into(),
             egress_zone: req.egress_zone.clone().into(),
             owner_rg_id: req.owner_rg_id,
+            // Cluster session sync does not yet preserve original fabric ingress.
+            fabric_ingress: false,
             is_reverse: req.is_reverse,
             synced: true,
             nat64_reverse: None,

@@ -101,6 +101,7 @@ pub(crate) struct SessionMetadata {
     pub(crate) ingress_zone: Arc<str>,
     pub(crate) egress_zone: Arc<str>,
     pub(crate) owner_rg_id: i32,
+    pub(crate) fabric_ingress: bool,
     pub(crate) is_reverse: bool,
     pub(crate) synced: bool,
     /// For NAT64 sessions: stores original IPv6 addresses so reverse IPv4
@@ -561,6 +562,7 @@ mod tests {
             ingress_zone: Arc::<str>::from("lan"),
             egress_zone: Arc::<str>::from("wan"),
             owner_rg_id: 1,
+            fabric_ingress: false,
             is_reverse: false,
             synced: false,
             nat64_reverse: None,
