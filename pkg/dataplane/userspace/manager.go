@@ -2134,20 +2134,22 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 		return false
 	}
 	hasDataRG := false
-	for rgID, group := range m.haGroups {
+	for rgID := range m.haGroups {
 		if rgID <= 0 {
 			continue
 		}
 		hasDataRG = true
+	}
+	if hasDataRG {
+		// Keep the helper armed on standby HA nodes so stale-MAC traffic can
+		// stay in the userspace fabric redirect path during ownership moves.
+		// Per-packet HA resolution still decides whether traffic is forwarded
+		// locally or redirected to the active peer.
+		return true
+	}
+	for _, group := range m.haGroups {
 		if group.Active {
 			return true
-		}
-	}
-	if !hasDataRG {
-		for _, group := range m.haGroups {
-			if group.Active {
-				return true
-			}
 		}
 	}
 	return false

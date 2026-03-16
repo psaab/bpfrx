@@ -612,14 +612,18 @@ elif (( TOTAL_CYCLES == 1 )); then
 	fi
 else
 	for (( cycle = 1; cycle <= TOTAL_CYCLES; cycle++ )); do
-		if (( cycle > 1 )); then
-			run_failover_phase "$cycle" "$SOURCE_NODE" "$TARGET_NODE" "failover" 0
-		fi
-		final_phase=0
+		failover_final_phase=0
 		if (( cycle == TOTAL_CYCLES )); then
-			final_phase=1
+			failover_final_phase=1
 		fi
-		run_failover_phase "$cycle" "$TARGET_NODE" "$SOURCE_NODE" "failback" "$final_phase"
+		if (( cycle > 1 )); then
+			run_failover_phase "$cycle" "$SOURCE_NODE" "$TARGET_NODE" "failover" "$failover_final_phase"
+		fi
+		failback_final_phase=0
+		if (( cycle == TOTAL_CYCLES )); then
+			failback_final_phase=1
+		fi
+		run_failover_phase "$cycle" "$TARGET_NODE" "$SOURCE_NODE" "failback" "$failback_final_phase"
 	done
 fi
 

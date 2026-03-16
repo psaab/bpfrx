@@ -32,11 +32,19 @@ Current status:
 - latest strict split-RG steady-state validation result on this branch:
   - `0` zero-throughput intervals before any failover
   - `0` per-stream zero-throughput intervals
-  - sender throughput: `17.8 Gbps`
+  - sender throughput: `17.8 Gbps` before the stale-session handoff work
+  - sender throughput: `6.99 Gbps` on the current HA perf branch after keeping
+    the standby helper armed for correctness
 - latest strict RG1 failover validation result on this branch:
+  - repeated `3`-cycle failover/failback run now passes
   - `0` zero-throughput intervals across the full run
   - `0` per-stream zero-throughput intervals
-  - sender throughput: `6.70 Gbps`
+  - sender throughput: `10.6 Gbps`
+- standby HA nodes now keep the userspace helper armed and all bindings ready
+  even with no locally active data RGs
+- that closes the stale-MAC / stale-neighbor parity gap where traffic could
+  land on the old owner during the ownership transition and fall out of the
+  userspace fabric path
 - the failover validator is now being hardened for stress parity:
   - repeated failover / failback cycles
   - per-stream `0.00 bits/sec` checks, not just `[SUM]`
@@ -203,9 +211,68 @@ Result:
 2. the failover validator still passes with `0` zero-throughput intervals
 3. the remaining gap is throughput parity, not stream collapse
 
+### 5. Standby Nodes Fell Out Of The Userspace Fabric Path
+
+The userspace manager only armed the helper when the local node owned at least
+one active data RG. On the standby node that meant:
+
+1. `Enabled=false`
+2. `Forwarding armed=false`
+3. `Bound bindings=0/24`
+
+Effect:
+
+1. stale-MAC traffic arriving on the old owner during failback did not stay in
+   the userspace HA fabric path
+2. repeated failover / failback runs still showed brief but real
+   `0.00 bits/sec` troughs even after the stale-session demotion fix
+3. the inactive owner behaved unlike the legacy eBPF dataplane, which always
+   kept the fabric redirect path available
+
+Fix:
+
+1. keep the userspace helper armed on HA standby nodes whenever userspace
+   forwarding is supported and data RGs exist
+2. leave the actual per-packet forwarding decision under HA resolution, so
+   inactive owners still redirect or drop according to the normal userspace HA
+   path instead of forwarding locally
+
+Result:
+
+1. the standby node now remains `Enabled=true` with `24/24` bindings ready
+2. the repeated `3`-cycle RG1 failover / failback validator passes with:
+   - `0` aggregate zero-throughput intervals
+   - `0` per-stream zero-throughput intervals
+   - `10.6 Gbps` sender throughput
+3. the remaining HA gap is now throughput parity on the split-RG fabric path,
+   not stream survival
+
 ## Known Gaps Between Userspace And eBPF
 
-### 1. Dedicated Failover Validation Needs One More Tightening Pass
+### 1. Throughput Parity On The Split-RG Fabric Path Is Still Missing
+
+Reliability is materially better now, but the fabric path is still slower than
+the non-HA userspace target.
+
+Current measured baselines on the HA perf branch:
+
+1. strict split-RG steady-state validator:
+   - `6.99 Gbps`
+2. repeated `3`-cycle failover / failback validator:
+   - `10.6 Gbps`
+3. normal HA validator with RGs pinned to node0:
+   - IPv4 `15.783 Gbps`
+   - IPv6 `17.378 Gbps`
+
+The next performance work should target the current hot symbols on the fabric
+path, especially:
+
+1. `bpfrx_userspace_dp::afxdp::poll_binding`
+2. `bpfrx_userspace_dp::afxdp::frame::enqueue_pending_forwards`
+3. `bpfrx_userspace_dp::afxdp::session_glue::resolve_flow_session_decision`
+4. `memcpy_orig` on the copy-mode fabric path
+
+### 2. Dedicated Failover Validation Needs Promotion To The Default HA Gate
 
 The standard userspace HA validator exercises:
 
@@ -213,12 +280,17 @@ The standard userspace HA validator exercises:
 2. traceroute / `mtr` visibility
 3. sustained `iperf3` throughput
 
-That gap is mostly closed by
-[userspace-ha-failover-validation.sh](../scripts/userspace-ha-failover-validation.sh),
-but the scripted workflow still needs to be re-run after the new reachability
-preflight tightening and then promoted to the normal acceptance path.
+The dedicated
+[userspace-ha-failover-validation.sh](../scripts/userspace-ha-failover-validation.sh)
+is now strict enough to be the real HA acceptance gate, because it catches:
 
-### 2. Synced Session Pickup Is Still More Fragile In Userspace
+1. pre-failover split-RG stream collapse
+2. repeated failover / failback zero-throughput troughs
+3. stale zero-port TCP session pollution
+
+That workflow now needs to be treated as the normal HA gate instead of a debug-only script.
+
+### 3. Synced Session Pickup Is Still More Fragile In Userspace
 
 Userspace uses:
 
@@ -236,7 +308,7 @@ The new owner must:
 
 That is more moving pieces than the legacy conntrack path.
 
-### 3. Userspace Session Sync Still Preserves A Thinner Forwarding Snapshot
+### 4. Userspace Session Sync Still Preserves A Thinner Forwarding Snapshot
 
 The userspace sync request format now carries:
 
@@ -261,7 +333,7 @@ currently rebuilds sync state mostly from:
 That means the failover owner may need to re-resolve more forwarding state than
 the legacy dataplane did.
 
-### 4. Fabric Redirect Parity Still Needs Stress Proof
+### 5. Fabric Redirect Parity Still Needs Stress Proof
 
 The userspace dataplane now has fabric XSK bindings and fabric redirect support,
 but the legacy eBPF path in

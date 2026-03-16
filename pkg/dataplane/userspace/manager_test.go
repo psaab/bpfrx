@@ -663,7 +663,7 @@ func TestDeriveUserspaceCapabilitiesAllowsHAFabricConfigs(t *testing.T) {
 	}
 }
 
-func TestDesiredForwardingArmedTracksClusterOwnership(t *testing.T) {
+func TestDesiredForwardingArmedKeepsClusterStandbyArmed(t *testing.T) {
 	m := &Manager{
 		clusterHA: true,
 		lastStatus: ProcessStatus{
@@ -675,12 +675,31 @@ func TestDesiredForwardingArmedTracksClusterOwnership(t *testing.T) {
 			2: {RGID: 2, Active: false},
 		},
 	}
-	if m.desiredForwardingArmedLocked() {
-		t.Fatal("desiredForwardingArmedLocked() = true, want false with no active data RG")
+	if !m.desiredForwardingArmedLocked() {
+		t.Fatal("desiredForwardingArmedLocked() = false, want true on standby HA node with data RGs")
 	}
 	m.haGroups[2] = HAGroupStatus{RGID: 2, Active: true}
 	if !m.desiredForwardingArmedLocked() {
 		t.Fatal("desiredForwardingArmedLocked() = false, want true with active data RG")
+	}
+}
+
+func TestDesiredForwardingArmedRequiresDataRGOrActiveLocalOnlyGroup(t *testing.T) {
+	m := &Manager{
+		clusterHA: true,
+		lastStatus: ProcessStatus{
+			Capabilities: UserspaceCapabilities{ForwardingSupported: true},
+		},
+		haGroups: map[int]HAGroupStatus{
+			0: {RGID: 0, Active: true},
+		},
+	}
+	if !m.desiredForwardingArmedLocked() {
+		t.Fatal("desiredForwardingArmedLocked() = false, want true with active local-only RG")
+	}
+	m.haGroups[0] = HAGroupStatus{RGID: 0, Active: false}
+	if m.desiredForwardingArmedLocked() {
+		t.Fatal("desiredForwardingArmedLocked() = true, want false with no data RG and no active local-only RG")
 	}
 }
 

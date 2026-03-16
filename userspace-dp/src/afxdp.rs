@@ -692,6 +692,7 @@ impl Coordinator {
     }
 
     pub fn update_ha_state(&self, groups: &[HAGroupStatus]) {
+        let previous = self.ha_state.load();
         let mut state = BTreeMap::new();
         for group in groups {
             state.insert(
@@ -702,7 +703,23 @@ impl Coordinator {
                 },
             );
         }
+        let demoted_rgs = demoted_owner_rgs(previous.as_ref(), &state);
         self.ha_state.store(Arc::new(state));
+        if !demoted_rgs.is_empty() {
+            demote_shared_owner_rgs(
+                &self.shared_sessions,
+                &self.shared_nat_sessions,
+                &self.shared_forward_wire_sessions,
+                &demoted_rgs,
+            );
+            for handle in self.workers.values() {
+                if let Ok(mut pending) = handle.commands.lock() {
+                    for rg_id in &demoted_rgs {
+                        pending.push_back(WorkerCommand::DemoteOwnerRG(*rg_id));
+                    }
+                }
+            }
+        }
     }
 
     pub fn ha_groups(&self) -> Vec<HAGroupStatus> {
@@ -1502,6 +1519,7 @@ pub(crate) struct SyncedSessionEntry {
 enum WorkerCommand {
     UpsertSynced(SyncedSessionEntry),
     DeleteSynced(SessionKey),
+    DemoteOwnerRG(i32),
 }
 
 impl BindingWorker {
@@ -4152,10 +4170,10 @@ fn worker_loop(
             .first()
             .map(|binding| binding.session_map_fd)
             .unwrap_or(-1);
-        apply_worker_commands(&commands, &mut sessions, session_map_fd);
         let loop_now_ns = monotonic_nanos();
         let loop_now_secs = loop_now_ns / 1_000_000_000;
         let ha_runtime = ha_state.load();
+        apply_worker_commands(&commands, &mut sessions, session_map_fd, ha_runtime.as_ref());
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
         let expired = sessions.expire_stale(loop_now_ns);
         if expired > 0 {
@@ -5764,6 +5782,22 @@ fn enforce_ha_resolution_snapshot(
         };
     }
     resolution
+}
+
+fn demoted_owner_rgs(
+    previous: &BTreeMap<i32, HAGroupRuntime>,
+    current: &BTreeMap<i32, HAGroupRuntime>,
+) -> Vec<i32> {
+    previous
+        .iter()
+        .filter_map(|(rg_id, old)| {
+            let became_inactive = match current.get(rg_id) {
+                Some(new) => old.active && !new.active,
+                None => old.active,
+            };
+            became_inactive.then_some(*rg_id)
+        })
+        .collect()
 }
 
 /// Return the effective TCP MSS clamp value for the current config.
@@ -9513,6 +9547,44 @@ mod tests {
                 other => panic!("unexpected command queued during replay: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn demoted_owner_rgs_detects_active_to_inactive_transitions() {
+        let previous = BTreeMap::from([
+            (
+                1,
+                HAGroupRuntime {
+                    active: true,
+                    watchdog_timestamp: 11,
+                },
+            ),
+            (
+                2,
+                HAGroupRuntime {
+                    active: true,
+                    watchdog_timestamp: 12,
+                },
+            ),
+        ]);
+        let current = BTreeMap::from([
+            (
+                1,
+                HAGroupRuntime {
+                    active: false,
+                    watchdog_timestamp: 21,
+                },
+            ),
+            (
+                2,
+                HAGroupRuntime {
+                    active: true,
+                    watchdog_timestamp: 22,
+                },
+            ),
+        ]);
+
+        assert_eq!(demoted_owner_rgs(&previous, &current), vec![1]);
     }
 
     #[test]
