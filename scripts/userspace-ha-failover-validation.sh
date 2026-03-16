@@ -62,6 +62,7 @@ FW1="${REMOTE_PREFIX}${VM1}"
 HOST="${REMOTE_PREFIX}${LAN_HOST}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp/userspace-ha-failover-rg${RG}-$(date +%Y%m%d-%H%M%S)}"
 REMOTE_IPERF_LOG="/tmp/userspace-iperf-rg${RG}-failover.log"
+REMOTE_IPERF_UNIT="userspace-ha-rg${RG}-iperf3.service"
 FAILED=0
 
 info() { printf '==> %s\n' "$*"; }
@@ -268,8 +269,8 @@ validate_target_reachability() {
 start_iperf() {
 	local attempt
 	for attempt in 1 2 3; do
-		run_host "pkill -9 iperf3 2>/dev/null || true; rm -f ${REMOTE_IPERF_LOG}"
-		run_host "iperf3 --forceflush --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > ${REMOTE_IPERF_LOG} 2>&1 &"
+		run_host "systemctl stop ${REMOTE_IPERF_UNIT} >/dev/null 2>&1 || true; systemctl reset-failed ${REMOTE_IPERF_UNIT} >/dev/null 2>&1 || true; pkill -9 iperf3 2>/dev/null || true; rm -f ${REMOTE_IPERF_LOG}"
+		run_host "systemd-run --quiet --unit ${REMOTE_IPERF_UNIT%.service} /bin/sh -c $(printf %q "exec iperf3 --forceflush --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > ${REMOTE_IPERF_LOG} 2>&1")"
 		sleep 8
 		if ! run_host "pgrep -x iperf3 >/dev/null"; then
 			info "iperf3 exited on attempt ${attempt}, retrying"
@@ -445,6 +446,7 @@ restore_cluster() {
 
 cleanup() {
 	copy_artifacts
+	run_host "systemctl stop ${REMOTE_IPERF_UNIT} >/dev/null 2>&1 || true; systemctl reset-failed ${REMOTE_IPERF_UNIT} >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
 	restore_cluster
 	printf 'Artifacts: %s\n' "${ARTIFACT_DIR}"
 }
