@@ -22,13 +22,17 @@ fi
 IPERF_STREAMS="${IPERF_STREAMS:-4}"
 SYNC_WAIT="${SYNC_WAIT:-5}"
 FAILOVER_WAIT="${FAILOVER_WAIT:-30}"
+PRE_FAILOVER_OBSERVE="${PRE_FAILOVER_OBSERVE:-10}"
 MIN_SESSIONS="${MIN_SESSIONS:-4}"
 MIN_THROUGHPUT="${MIN_THROUGHPUT:-1.0}"
 MAX_ZERO_INTERVALS="${MAX_ZERO_INTERVALS:-2}"
 MAX_STREAM_ZERO_INTERVALS="${MAX_STREAM_ZERO_INTERVALS:-0}"
+MAX_PREFLIGHT_ZERO_INTERVALS="${MAX_PREFLIGHT_ZERO_INTERVALS:-0}"
+MAX_PREFLIGHT_STREAM_ZERO_INTERVALS="${MAX_PREFLIGHT_STREAM_ZERO_INTERVALS:-0}"
 POST_FAILOVER_OBSERVE="${POST_FAILOVER_OBSERVE:-10}"
 RESTORE_SOURCE_NODE="${RESTORE_SOURCE_NODE:-1}"
 ALLOW_STALE_SESSIONS="${ALLOW_STALE_SESSIONS:-0}"
+STEADY_ONLY=0
 DEPLOY=0
 
 while [[ $# -gt 0 ]]; do
@@ -45,6 +49,7 @@ while [[ $# -gt 0 ]]; do
 	--interval) CYCLE_INTERVAL="$2"; shift ;;
 	--sync-wait) SYNC_WAIT="$2"; shift ;;
 	--failover-wait) FAILOVER_WAIT="$2"; shift ;;
+	--steady-only) STEADY_ONLY=1 ;;
 	*)
 		echo "unknown arg: $1" >&2
 		exit 2
@@ -73,6 +78,10 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 required_iperf_duration() {
 	local cycles="$1"
 	local interval="$2"
+	if (( STEADY_ONLY == 1 )); then
+		printf '%s\n' "$(( PRE_FAILOVER_OBSERVE + SYNC_WAIT + 10 ))"
+		return 0
+	fi
 	if (( cycles > 1 )); then
 		printf '%s\n' "$(( cycles * interval * 2 + cycles * 10 + SYNC_WAIT + 20 ))"
 	else
@@ -287,6 +296,41 @@ recent_dead_streams() {
 	run_host "tail -n ${tail_lines} ${REMOTE_IPERF_LOG} 2>/dev/null | grep -E '^\[[[:space:]]*[0-9]+\]' | tail -n ${IPERF_STREAMS} | grep -c '0.00 bits/sec' || true"
 }
 
+recent_iperf_lines() {
+	local intervals="$1"
+	local tail_lines=$(( intervals * (IPERF_STREAMS + 3) + 16 ))
+	run_host "tail -n ${tail_lines} ${REMOTE_IPERF_LOG} 2>/dev/null || true"
+}
+
+count_recent_zero_intervals() {
+	local intervals="$1"
+	recent_iperf_lines "$intervals" |
+		grep -E '^\[[[:space:]]*[0-9]+\]|^\[SUM\]' 2>/dev/null |
+		grep -c '0.00 bits/sec' || true
+}
+
+count_recent_stream_zero_intervals() {
+	local intervals="$1"
+	recent_iperf_lines "$intervals" |
+		grep -E '^\[[[:space:]]*[0-9]+\]' 2>/dev/null |
+		grep -c '0.00 bits/sec' || true
+}
+
+count_recent_zero_streams() {
+	local intervals="$1"
+	python3 - <<'PY' "$(recent_iperf_lines "$intervals")"
+import re
+import sys
+
+zero_streams = set()
+for line in sys.argv[1].splitlines():
+    m = re.match(r'^\[\s*(\d+)\]', line)
+    if m and "0.00 bits/sec" in line:
+        zero_streams.add(m.group(1))
+print(len(zero_streams))
+PY
+}
+
 iperf_alive() {
 	run_host "pgrep -x iperf3 >/dev/null"
 }
@@ -406,6 +450,35 @@ validate_cycle_health() {
 	fi
 }
 
+validate_pre_failover_health() {
+	local owner_vm="$1"
+	local owner_name="$2"
+	local zero_intervals stream_zero_intervals zero_streams
+
+	info "observing steady-state traffic for ${PRE_FAILOVER_OBSERVE}s before failover"
+	if ! cycle_sleep "$PRE_FAILOVER_OBSERVE"; then
+		fail "steady-state preflight: iperf3 exited before ${PRE_FAILOVER_OBSERVE}s observe window elapsed"
+	fi
+	capture_vm_state "$SOURCE_VM" "pre-failover-source"
+	capture_vm_state "$TARGET_VM" "pre-failover-target"
+	validate_cycle_health 0 "steady-state" "$owner_vm" "$owner_name" 0
+
+	zero_intervals="$(count_recent_zero_intervals "$PRE_FAILOVER_OBSERVE")"
+	if [[ "$zero_intervals" -le "$MAX_PREFLIGHT_ZERO_INTERVALS" ]]; then
+		pass "steady-state preflight: ${zero_intervals} zero-throughput intervals (<= ${MAX_PREFLIGHT_ZERO_INTERVALS})"
+	else
+		fail "steady-state preflight: ${zero_intervals} zero-throughput intervals (> ${MAX_PREFLIGHT_ZERO_INTERVALS})"
+	fi
+
+	stream_zero_intervals="$(count_recent_stream_zero_intervals "$PRE_FAILOVER_OBSERVE")"
+	zero_streams="$(count_recent_zero_streams "$PRE_FAILOVER_OBSERVE")"
+	if [[ "$stream_zero_intervals" -le "$MAX_PREFLIGHT_STREAM_ZERO_INTERVALS" ]]; then
+		pass "steady-state preflight: ${stream_zero_intervals} per-stream zero-throughput intervals (<= ${MAX_PREFLIGHT_STREAM_ZERO_INTERVALS})"
+	else
+		fail "steady-state preflight: ${stream_zero_intervals} per-stream zero-throughput intervals across ${zero_streams} stream(s) (> ${MAX_PREFLIGHT_STREAM_ZERO_INTERVALS})"
+	fi
+}
+
 run_failover_phase() {
 	local cycle="$1"
 	local from_node="$2"
@@ -501,13 +574,22 @@ else
 	pass "target owner has ${target_count} synced sessions"
 fi
 
-if (( TOTAL_CYCLES == 1 )); then
+validate_pre_failover_health "$SOURCE_VM" "$(node_name "$SOURCE_NODE")"
+
+if (( STEADY_ONLY == 1 )); then
+	info "steady-only mode: skipping RG${RG} failover"
+elif (( TOTAL_CYCLES == 1 )); then
 	run_failover_phase 1 "$SOURCE_NODE" "$TARGET_NODE" "failover" 1
 else
 	run_failover_phase 1 "$SOURCE_NODE" "$TARGET_NODE" "failover" 0
 fi
 
-if (( TOTAL_CYCLES == 1 )); then
+if (( STEADY_ONLY == 1 )); then
+	capture_vm_state "$SOURCE_VM" "steady-only-source"
+	capture_vm_state "$TARGET_VM" "steady-only-target"
+	wait_for_iperf_finish || true
+	copy_artifacts
+elif (( TOTAL_CYCLES == 1 )); then
 	capture_vm_state "$SOURCE_VM" "after-source"
 	capture_vm_state "$TARGET_VM" "after-target"
 

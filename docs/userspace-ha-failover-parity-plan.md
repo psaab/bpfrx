@@ -35,6 +35,9 @@ Current status:
   - minimum-duration enforcement so `iperf3` cannot finish before the cycle plan
   - zero-port TCP session preflight checks so stale session pollution does not
     invalidate stress results
+- the validator now also has a `--steady-only` split-RG fabric mode and a strict
+  pre-failover observe window so "streams already dead before failover" is
+  caught as a steady-state fabric regression instead of a failover regression
 - remaining work is now parity hardening, repeated failover stress, fabric-link
   throughput stability, and post-move cold-connect latency, not first-fix bring-up
 
@@ -236,7 +239,9 @@ Status: Mostly Complete
 
 1. Add a dedicated userspace RG1 failover validation script.
 2. Make it prove that an existing `iperf3` flow survives a manual RG1 failover.
-3. Keep artifacts and state snapshots so failures are diagnosable after the run.
+3. Add a split-RG steady-state mode so fabric-link regressions can be isolated
+   without failover churn.
+4. Keep artifacts and state snapshots so failures are diagnosable after the run.
 
 ### Phase B: Observability Gap
 
