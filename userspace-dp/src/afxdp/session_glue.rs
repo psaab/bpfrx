@@ -130,20 +130,21 @@ pub(super) fn apply_worker_commands(
             WorkerCommand::UpsertSynced(entry) => {
                 let key = entry.key.clone();
                 let is_reverse = entry.metadata.is_reverse;
-                sessions.upsert_synced(
+                if sessions.upsert_synced(
                     entry.key,
                     entry.decision,
                     entry.metadata,
                     now_ns,
                     entry.protocol,
                     entry.tcp_flags,
-                );
-                let _ = publish_live_session_entry(
-                    session_map_fd,
-                    &key,
-                    entry.decision.nat,
-                    is_reverse,
-                );
+                ) {
+                    let _ = publish_live_session_entry(
+                        session_map_fd,
+                        &key,
+                        entry.decision.nat,
+                        is_reverse,
+                    );
+                }
             }
             WorkerCommand::DeleteSynced(key) => {
                 let delete_alias = sessions.lookup(&key, now_ns, 0).map(|lookup| {

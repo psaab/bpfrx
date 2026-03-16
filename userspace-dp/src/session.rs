@@ -323,9 +323,9 @@ impl SessionTable {
         now_ns: u64,
         protocol: u8,
         tcp_flags: u8,
-    ) {
+    ) -> bool {
         if matches!(self.sessions.get(&key), Some(existing) if !existing.metadata.synced) {
-            return;
+            return false;
         }
         self.remove_entry(&key);
         let index_key = key.clone();
@@ -340,6 +340,7 @@ impl SessionTable {
             },
         );
         self.index_forward_nat_key(&index_key, decision, &metadata);
+        true
     }
 
     pub fn promote_synced(
