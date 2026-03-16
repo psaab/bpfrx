@@ -606,7 +606,10 @@ pub(super) fn resolve_flow_session_decision(
         now_ns,
         tcp_flags,
     ) {
-        (materialize_shared_session_hit(sessions, hit, now_ns, tcp_flags), false)
+        (
+            materialize_shared_session_hit(sessions, hit, now_ns, tcp_flags),
+            false,
+        )
     } else {
         let forward_match =
             lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)?;

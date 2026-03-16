@@ -220,7 +220,9 @@ pub(crate) fn evaluate_lo0_filter(
     }
     let family = if is_v6 { "inet6" } else { "inet" };
     let key = format!("{family}:{filter_name}");
-    evaluate_filter(state, &key, src_ip, dst_ip, protocol, src_port, dst_port, dscp)
+    evaluate_filter(
+        state, &key, src_ip, dst_ip, protocol, src_port, dst_port, dscp,
+    )
 }
 
 /// Evaluate the per-interface input filter for a given address family.
@@ -248,7 +250,9 @@ pub(crate) fn evaluate_interface_filter(
     }
     let family = if is_v6 { "inet6" } else { "inet" };
     let key = format!("{family}:{filter_name}");
-    evaluate_filter(state, &key, src_ip, dst_ip, protocol, src_port, dst_port, dscp)
+    evaluate_filter(
+        state, &key, src_ip, dst_ip, protocol, src_port, dst_port, dscp,
+    )
 }
 
 /// Check whether a single filter term matches the given packet fields.
@@ -333,11 +337,7 @@ pub(crate) fn parse_filter_state(
         let filter = Filter {
             name: snap.name.clone(),
             family: snap.family.clone(),
-            terms: snap
-                .terms
-                .iter()
-                .map(|t| parse_term(t))
-                .collect(),
+            terms: snap.terms.iter().map(|t| parse_term(t)).collect(),
         };
         state.filters.insert(key, filter);
     }
@@ -762,10 +762,7 @@ mod tests {
 
         // After 1 second, tokens should have refilled
         let conforming = policer.consume(1_000_000_000, 1000);
-        assert!(
-            conforming,
-            "packet after refill should conform"
-        );
+        assert!(conforming, "packet after refill should conform");
     }
 
     #[test]
@@ -1013,18 +1010,20 @@ mod tests {
             &[FirewallFilterSnapshot {
                 name: "dscp-filter".into(),
                 family: "inet".into(),
-                terms: vec![FirewallTermSnapshot {
-                    name: "match-ef".into(),
-                    dscp_values: vec![46],
-                    action: "accept".into(),
-                    dscp_rewrite: 0,
-                    ..Default::default()
-                },
-                FirewallTermSnapshot {
-                    name: "deny-rest".into(),
-                    action: "discard".into(),
-                    ..Default::default()
-                }],
+                terms: vec![
+                    FirewallTermSnapshot {
+                        name: "match-ef".into(),
+                        dscp_values: vec![46],
+                        action: "accept".into(),
+                        dscp_rewrite: 0,
+                        ..Default::default()
+                    },
+                    FirewallTermSnapshot {
+                        name: "deny-rest".into(),
+                        action: "discard".into(),
+                        ..Default::default()
+                    },
+                ],
             }],
             &[],
         );

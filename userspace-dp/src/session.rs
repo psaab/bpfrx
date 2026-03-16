@@ -195,12 +195,17 @@ impl SessionTable {
                 if key.protocol == PROTO_TCP {
                     debug_log!(
                         "SESS_EXPIRE: proto=TCP {}:{} -> {}:{} closing={} age_ns={} timeout_ns={} rev={} synced={} nat=({:?},{:?})",
-                        key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+                        key.src_ip,
+                        key.src_port,
+                        key.dst_ip,
+                        key.dst_port,
                         entry.closing,
                         now_ns.saturating_sub(entry.last_seen_ns),
                         entry.expires_after_ns,
-                        entry.metadata.is_reverse, entry.metadata.synced,
-                        entry.decision.nat.rewrite_src, entry.decision.nat.rewrite_dst,
+                        entry.metadata.is_reverse,
+                        entry.metadata.synced,
+                        entry.decision.nat.rewrite_src,
+                        entry.decision.nat.rewrite_dst,
                     );
                 }
                 if !entry.metadata.is_reverse && !entry.metadata.synced {
@@ -229,9 +234,17 @@ impl SessionTable {
                 if !entry.closing {
                     debug_log!(
                         "SESS_CLOSING: {} proto=TCP {}:{} -> {}:{} rev={} tcp_flags=0x{:02x}",
-                        if (tcp_flags & TCP_RST) != 0 { "RST" } else { "FIN" },
-                        key.src_ip, key.src_port, key.dst_ip, key.dst_port,
-                        entry.metadata.is_reverse, tcp_flags,
+                        if (tcp_flags & TCP_RST) != 0 {
+                            "RST"
+                        } else {
+                            "FIN"
+                        },
+                        key.src_ip,
+                        key.src_port,
+                        key.dst_ip,
+                        key.dst_port,
+                        entry.metadata.is_reverse,
+                        tcp_flags,
                     );
                 }
                 entry.closing = true;
@@ -252,7 +265,9 @@ impl SessionTable {
     pub fn find_forward_nat_match(&self, reply_key: &SessionKey) -> Option<ForwardSessionMatch> {
         let forward_key = self.nat_reverse_index.get(reply_key)?;
         let entry = self.sessions.get(forward_key)?;
-        if entry.metadata.is_reverse || !reply_matches_forward_nat(forward_key, entry.decision.nat, reply_key) {
+        if entry.metadata.is_reverse
+            || !reply_matches_forward_nat(forward_key, entry.decision.nat, reply_key)
+        {
             return None;
         }
         Some(ForwardSessionMatch {
@@ -769,10 +784,11 @@ mod tests {
         };
         assert!(reply_matches_forward_nat(
             &forward,
-            NatDecision { 
+            NatDecision {
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                 rewrite_dst: None,
-             ..NatDecision::default() },
+                ..NatDecision::default()
+            },
             &reply,
         ));
     }
@@ -797,10 +813,11 @@ mod tests {
         };
         assert!(reply_matches_forward_nat(
             &forward,
-            NatDecision { 
+            NatDecision {
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                 rewrite_dst: None,
-             ..NatDecision::default() },
+                ..NatDecision::default()
+            },
             &reply,
         ));
     }
@@ -824,10 +841,11 @@ mod tests {
             src_port: 5201,
             dst_port: 42424,
         };
-        let nat = NatDecision { 
+        let nat = NatDecision {
             rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
             rewrite_dst: None,
-         ..NatDecision::default() };
+            ..NatDecision::default()
+        };
         let decision = SessionDecision {
             resolution: resolution(),
             nat,
@@ -841,7 +859,9 @@ mod tests {
             0x10
         ));
 
-        let hit = table.find_forward_nat_match(&reply).expect("forward nat match");
+        let hit = table
+            .find_forward_nat_match(&reply)
+            .expect("forward nat match");
         assert_eq!(hit.key, forward);
         assert_eq!(hit.decision.nat, nat);
 
@@ -976,7 +996,9 @@ mod tests {
             0x10
         ));
 
-        let hit = table.find_forward_nat_match(&reply).expect("forward nat match with port");
+        let hit = table
+            .find_forward_nat_match(&reply)
+            .expect("forward nat match with port");
         assert_eq!(hit.key, forward);
         assert_eq!(hit.decision.nat, nat);
 

@@ -126,10 +126,7 @@ pub(crate) fn evaluate_policy(
         {
             continue;
         }
-        if !rule.to_zone.is_empty()
-            && rule.to_zone != to_zone
-            && rule.to_zone != "junos-global"
-        {
+        if !rule.to_zone.is_empty() && rule.to_zone != to_zone && rule.to_zone != "junos-global" {
             continue;
         }
         if !applications_match(&rule.applications, protocol, src_port, dst_port) {

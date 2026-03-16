@@ -34,18 +34,18 @@ const TCP_URG: u8 = 0x20;
 /// Extracted from raw packet bytes for speed — no allocations.
 #[derive(Debug, Clone)]
 pub(crate) struct ScreenPacketInfo {
-    pub addr_family: u8,      // AF_INET=2, AF_INET6=10
-    pub protocol: u8,         // IPPROTO_*
-    pub tcp_flags: u8,        // TCP flags byte
+    pub addr_family: u8, // AF_INET=2, AF_INET6=10
+    pub protocol: u8,    // IPPROTO_*
+    pub tcp_flags: u8,   // TCP flags byte
     pub src_ip: IpAddr,
     pub dst_ip: IpAddr,
-    pub src_port: u16,        // host byte order
-    pub dst_port: u16,        // host byte order
-    pub pkt_len: u16,         // total packet length from meta
+    pub src_port: u16, // host byte order
+    pub dst_port: u16, // host byte order
+    pub pkt_len: u16,  // total packet length from meta
     pub is_fragment: bool,
-    pub ip_ihl: u8,           // IPv4 IHL field (header length in 32-bit words)
-    pub ip_frag_off: u16,     // raw frag_off field (network byte order already parsed)
-    pub ip_total_len: u16,    // IPv4 total length
+    pub ip_ihl: u8,        // IPv4 IHL field (header length in 32-bit words)
+    pub ip_frag_off: u16,  // raw frag_off field (network byte order already parsed)
+    pub ip_total_len: u16, // IPv4 total length
 }
 
 /// Screen profile configuration for a zone. Mirrors the BPF `screen_config`.
@@ -60,13 +60,13 @@ pub(crate) struct ScreenProfile {
     pub teardrop: bool,
     pub icmp_fragment: bool,
     pub source_route: bool,
-    pub icmp_flood_threshold: u32,  // packets per second, 0 = disabled
-    pub udp_flood_threshold: u32,   // packets per second, 0 = disabled
-    pub syn_flood_threshold: u32,   // SYN packets per second per zone, 0 = disabled
-    pub session_limit_src: u32,     // max sessions per source IP, 0 = disabled
-    pub session_limit_dst: u32,     // max sessions per destination IP, 0 = disabled
-    pub port_scan_threshold: u32,   // unique dst ports per src IP within window, 0 = disabled
-    pub ip_sweep_threshold: u32,    // unique dst IPs per src IP within window, 0 = disabled
+    pub icmp_flood_threshold: u32, // packets per second, 0 = disabled
+    pub udp_flood_threshold: u32,  // packets per second, 0 = disabled
+    pub syn_flood_threshold: u32,  // SYN packets per second per zone, 0 = disabled
+    pub session_limit_src: u32,    // max sessions per source IP, 0 = disabled
+    pub session_limit_dst: u32,    // max sessions per destination IP, 0 = disabled
+    pub port_scan_threshold: u32,  // unique dst ports per src IP within window, 0 = disabled
+    pub ip_sweep_threshold: u32,   // unique dst IPs per src IP within window, 0 = disabled
 }
 
 /// Result of a screen check.
@@ -174,7 +174,10 @@ impl PortScanTracker {
         if threshold == 0 {
             return false;
         }
-        let entry = self.per_src.entry(src_ip).or_insert_with(|| (now_secs, FxHashSet::default()));
+        let entry = self
+            .per_src
+            .entry(src_ip)
+            .or_insert_with(|| (now_secs, FxHashSet::default()));
         // Reset window if expired
         if now_secs.saturating_sub(entry.0) >= self.window_secs {
             entry.0 = now_secs;
@@ -214,7 +217,10 @@ impl IpSweepTracker {
         if threshold == 0 {
             return false;
         }
-        let entry = self.per_src.entry(src_ip).or_insert_with(|| (now_secs, FxHashSet::default()));
+        let entry = self
+            .per_src
+            .entry(src_ip)
+            .or_insert_with(|| (now_secs, FxHashSet::default()));
         // Reset window if expired
         if now_secs.saturating_sub(entry.0) >= self.window_secs {
             entry.0 = now_secs;
@@ -234,7 +240,7 @@ impl IpSweepTracker {
 
 /// Per-zone screen state with mutable rate counters and advanced trackers.
 pub(crate) struct ScreenState {
-    profiles: FxHashMap<String, ScreenProfile>,  // zone_name -> profile
+    profiles: FxHashMap<String, ScreenProfile>, // zone_name -> profile
     // Per-zone rate counters
     icmp_counters: FxHashMap<String, RateCounter>,
     udp_counters: FxHashMap<String, RateCounter>,
@@ -330,10 +336,7 @@ impl ScreenState {
 
         // Teardrop: overlapping IP fragments (IPv4 only)
         // Non-first fragment with tiny payload (< 8 bytes)
-        if profile.teardrop
-            && pkt.addr_family == libc::AF_INET as u8
-            && pkt.is_fragment
-        {
+        if profile.teardrop && pkt.addr_family == libc::AF_INET as u8 && pkt.is_fragment {
             let frag_offset = pkt.ip_frag_off & 0x1FFF;
             if frag_offset > 0 {
                 let hdr_len = (pkt.ip_ihl as u16) * 4;
@@ -355,10 +358,7 @@ impl ScreenState {
         }
 
         // IP source route option: IPv4 with IHL > 5 (options present)
-        if profile.source_route
-            && pkt.addr_family == libc::AF_INET as u8
-            && pkt.ip_ihl > 5
-        {
+        if profile.source_route && pkt.addr_family == libc::AF_INET as u8 && pkt.ip_ihl > 5 {
             return ScreenVerdict::Drop("ip-source-route");
         }
 
@@ -368,10 +368,7 @@ impl ScreenState {
         if profile.icmp_flood_threshold > 0
             && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
         {
-            let counter = self
-                .icmp_counters
-                .entry(zone.to_string())
-                .or_default();
+            let counter = self.icmp_counters.entry(zone.to_string()).or_default();
             if counter.increment(now_secs, profile.icmp_flood_threshold) {
                 return ScreenVerdict::Drop("icmp-flood");
             }
@@ -379,10 +376,7 @@ impl ScreenState {
 
         // UDP flood
         if profile.udp_flood_threshold > 0 && pkt.protocol == PROTO_UDP {
-            let counter = self
-                .udp_counters
-                .entry(zone.to_string())
-                .or_default();
+            let counter = self.udp_counters.entry(zone.to_string()).or_default();
             if counter.increment(now_secs, profile.udp_flood_threshold) {
                 return ScreenVerdict::Drop("udp-flood");
             }
@@ -392,10 +386,7 @@ impl ScreenState {
         if profile.syn_flood_threshold > 0 && pkt.protocol == PROTO_TCP {
             let tf = pkt.tcp_flags;
             if (tf & TCP_SYN) != 0 && (tf & TCP_ACK) == 0 {
-                let counter = self
-                    .syn_counters
-                    .entry(zone.to_string())
-                    .or_default();
+                let counter = self.syn_counters.entry(zone.to_string()).or_default();
                 if counter.increment(now_secs, profile.syn_flood_threshold) {
                     return ScreenVerdict::Drop("syn-flood");
                 }
@@ -411,7 +402,12 @@ impl ScreenState {
 
             // Port scan detection: count unique dst ports per src IP
             if is_syn && profile.port_scan_threshold > 0 {
-                if self.port_scan.check(pkt.src_ip, pkt.dst_port, now_secs, profile.port_scan_threshold) {
+                if self.port_scan.check(
+                    pkt.src_ip,
+                    pkt.dst_port,
+                    now_secs,
+                    profile.port_scan_threshold,
+                ) {
                     return ScreenVerdict::Drop("port-scan");
                 }
             }
@@ -419,19 +415,28 @@ impl ScreenState {
 
         // IP sweep detection: count unique dst IPs per src IP (all protocols)
         if profile.ip_sweep_threshold > 0 {
-            if self.ip_sweep.check(pkt.src_ip, pkt.dst_ip, now_secs, profile.ip_sweep_threshold) {
+            if self
+                .ip_sweep
+                .check(pkt.src_ip, pkt.dst_ip, now_secs, profile.ip_sweep_threshold)
+            {
                 return ScreenVerdict::Drop("ip-sweep");
             }
         }
 
         // Per-IP session limits: check before session creation
         if profile.session_limit_src > 0 {
-            if self.session_limits.check_src(pkt.src_ip, profile.session_limit_src) {
+            if self
+                .session_limits
+                .check_src(pkt.src_ip, profile.session_limit_src)
+            {
                 return ScreenVerdict::Drop("session-limit-src");
             }
         }
         if profile.session_limit_dst > 0 {
-            if self.session_limits.check_dst(pkt.dst_ip, profile.session_limit_dst) {
+            if self
+                .session_limits
+                .check_dst(pkt.dst_ip, profile.session_limit_dst)
+            {
                 return ScreenVerdict::Drop("session-limit-dst");
             }
         }
@@ -866,7 +871,7 @@ mod tests {
             is_fragment: true,
             ip_ihl: 5,
             ip_frag_off: 0x0001 | 0x2000, // offset=1 (non-first frag), MF=1
-            ip_total_len: 24,              // 20 byte header + 4 byte payload (< 8)
+            ip_total_len: 24,             // 20 byte header + 4 byte payload (< 8)
         };
         assert_eq!(
             state.check_packet("trust", &pkt, 1),
@@ -1187,7 +1192,7 @@ mod tests {
         // IP header at offset 14
         frame[14] = 0x45; // version=4, ihl=5
         frame[16] = 0x00; // total_len high
-        frame[17] = 20;   // total_len low = 20
+        frame[17] = 20; // total_len low = 20
         frame[20] = 0x20; // flags=MF, offset=0
         frame[21] = 0x00;
 
@@ -1368,10 +1373,7 @@ mod tests {
         // ACK packets (established traffic) should not trigger port scan
         for port in [80, 443, 8080, 22] {
             let pkt = tcp_pkt(src, dst, 1234, port, TCP_ACK);
-            assert_eq!(
-                state.check_packet("trust", &pkt, 100),
-                ScreenVerdict::Pass,
-            );
+            assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass,);
         }
     }
 

@@ -34,8 +34,7 @@ pub(super) enum AfXdpBinder {
 }
 
 pub(super) fn binding_frame_count(ring_entries: u32) -> u32 {
-    reserved_tx_frames(ring_entries)
-        .saturating_add(ring_entries.saturating_mul(2).max(1))
+    reserved_tx_frames(ring_entries).saturating_add(ring_entries.saturating_mul(2).max(1))
 }
 
 pub(super) fn ifinfo_from_binding(

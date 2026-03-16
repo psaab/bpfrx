@@ -34,8 +34,12 @@ pub(super) fn build_local_time_exceeded_request(
         ingress_ident.ifindex
     };
     let prebuilt_frame = match meta.addr_family as i32 {
-        libc::AF_INET => build_local_time_exceeded_v4(frame, meta, ingress_ident.ifindex, forwarding),
-        libc::AF_INET6 => build_local_time_exceeded_v6(frame, meta, ingress_ident.ifindex, forwarding),
+        libc::AF_INET => {
+            build_local_time_exceeded_v4(frame, meta, ingress_ident.ifindex, forwarding)
+        }
+        libc::AF_INET6 => {
+            build_local_time_exceeded_v6(frame, meta, ingress_ident.ifindex, forwarding)
+        }
         _ => return None,
     }?;
 
@@ -119,7 +123,11 @@ pub(super) fn build_local_time_exceeded_v4(
     write_eth_header(
         &mut out,
         dst_mac,
-        if src_mac == [0; 6] { fallback_src_mac } else { src_mac },
+        if src_mac == [0; 6] {
+            fallback_src_mac
+        } else {
+            src_mac
+        },
         vlan_id,
         0x0800,
     );
@@ -183,7 +191,11 @@ pub(super) fn build_local_time_exceeded_v6(
     write_eth_header(
         &mut out,
         dst_mac,
-        if src_mac == [0; 6] { fallback_src_mac } else { src_mac },
+        if src_mac == [0; 6] {
+            fallback_src_mac
+        } else {
+            src_mac
+        },
         vlan_id,
         0x86dd,
     );
