@@ -727,10 +727,10 @@ impl Coordinator {
                 .values()
                 .map(|handle| handle.commands.clone())
                 .collect::<Vec<_>>();
-            let session_map_fd = self
-                .session_map_fd
-                .as_ref()
-                .map_or(-1, |fd| fd.fd);
+            let Some(session_map_ref) = self.session_map_fd.as_ref() else {
+                return;
+            };
+            let session_map_fd = session_map_ref.fd;
             let now_secs = monotonic_nanos() / 1_000_000_000;
             let current = self.ha_state.load();
             prewarm_reverse_synced_sessions_for_owner_rgs(
