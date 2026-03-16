@@ -129,6 +129,7 @@ pub(super) fn apply_worker_commands(
         match cmd {
             WorkerCommand::UpsertSynced(entry) => {
                 let key = entry.key.clone();
+                let is_reverse = entry.metadata.is_reverse;
                 sessions.upsert_synced(
                     entry.key,
                     entry.decision,
@@ -137,11 +138,23 @@ pub(super) fn apply_worker_commands(
                     entry.protocol,
                     entry.tcp_flags,
                 );
-                let _ = publish_live_session_key(session_map_fd, &key);
+                let _ = publish_live_session_entry(
+                    session_map_fd,
+                    &key,
+                    entry.decision.nat,
+                    is_reverse,
+                );
             }
             WorkerCommand::DeleteSynced(key) => {
+                let delete_alias = sessions.lookup(&key, now_ns, 0).map(|lookup| {
+                    (lookup.decision.nat, lookup.metadata.is_reverse)
+                });
                 sessions.delete(&key);
-                delete_live_session_key(session_map_fd, &key);
+                if let Some((nat, is_reverse)) = delete_alias {
+                    delete_live_session_entry(session_map_fd, &key, nat, is_reverse);
+                } else {
+                    delete_live_session_key(session_map_fd, &key);
+                }
             }
         }
     }
@@ -207,8 +220,8 @@ pub(super) fn teardown_tcp_rst_flow(
     let reverse_key = reverse_session_key(forward_key, nat);
     sessions.delete(forward_key);
     sessions.delete(&reverse_key);
-    delete_live_session_key(current.session_map_fd, forward_key);
-    delete_live_session_key(current.session_map_fd, &reverse_key);
+    delete_live_session_entry(current.session_map_fd, forward_key, nat, false);
+    delete_live_session_entry(current.session_map_fd, &reverse_key, nat, true);
     remove_shared_session(
         shared_sessions,
         shared_nat_sessions,
@@ -570,7 +583,7 @@ fn install_reverse_session_from_forward_match(
         protocol,
         tcp_flags,
     ) {
-        let _ = publish_live_session_key(session_map_fd, reverse_key);
+        let _ = publish_live_session_entry(session_map_fd, reverse_key, reverse.decision.nat, true);
         let reverse_entry = SyncedSessionEntry {
             key: reverse_key.clone(),
             decision: reverse.decision,
@@ -616,7 +629,7 @@ fn maybe_promote_synced_session(
         promoted.owner_rg_id = owner_rg_for_flow(forwarding, decision.resolution.egress_ifindex);
     }
     if sessions.promote_synced(key, decision, promoted.clone(), now_ns, protocol, tcp_flags) {
-        let _ = publish_live_session_key(session_map_fd, key);
+        let _ = publish_live_session_entry(session_map_fd, key, decision.nat, promoted.is_reverse);
         let promoted_entry = SyncedSessionEntry {
             key: key.clone(),
             decision,

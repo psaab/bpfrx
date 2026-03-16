@@ -336,7 +336,12 @@ impl Coordinator {
         }
         let worker_queues = worker_command_queues.values().cloned().collect::<Vec<_>>();
         for entry in entries {
-            let _ = publish_live_session_key(session_map_fd, &entry.key);
+            let _ = publish_live_session_entry(
+                session_map_fd,
+                &entry.key,
+                entry.decision.nat,
+                entry.metadata.is_reverse,
+            );
             replicate_session_upsert(&worker_queues, entry);
         }
         entries.len()
@@ -2740,9 +2745,11 @@ fn poll_binding(
                                             meta.protocol,
                                             meta.tcp_flags,
                                         ) {
-                                            let _ = publish_live_session_key(
+                                            let _ = publish_live_session_entry(
                                                 binding.session_map_fd,
                                                 &flow.forward_key,
+                                                decision.nat,
+                                                false,
                                             );
                                             created += 1;
                                             let forward_entry = SyncedSessionEntry {
@@ -3753,7 +3760,12 @@ fn flush_session_deltas(
                     count_bpf_session_entries(session_map_fd),
                 );
             }
-            delete_live_session_key(session_map_fd, &delta.key);
+            delete_live_session_entry(
+                session_map_fd,
+                &delta.key,
+                delta.decision.nat,
+                delta.metadata.is_reverse,
+            );
             remove_shared_session(
                 shared_sessions,
                 shared_nat_sessions,
@@ -3761,7 +3773,7 @@ fn flush_session_deltas(
                 &delta.key,
             );
             let reverse_key = reverse_session_key(&delta.key, delta.decision.nat);
-            delete_live_session_key(session_map_fd, &reverse_key);
+            delete_live_session_entry(session_map_fd, &reverse_key, delta.decision.nat, true);
             remove_shared_session(
                 shared_sessions,
                 shared_nat_sessions,
@@ -6879,6 +6891,22 @@ fn publish_live_session_key(map_fd: c_int, key: &SessionKey) -> io::Result<()> {
     Ok(())
 }
 
+fn publish_live_session_entry(
+    map_fd: c_int,
+    key: &SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+) -> io::Result<()> {
+    publish_live_session_key(map_fd, key)?;
+    if !is_reverse {
+        let wire_key = forward_wire_key(key, nat);
+        if wire_key != *key {
+            publish_live_session_key(map_fd, &wire_key)?;
+        }
+    }
+    Ok(())
+}
+
 /// Verify a session key exists in the BPF map (read-back after publish).
 fn verify_session_key_in_bpf(map_fd: c_int, key: &SessionKey) -> bool {
     let map_key = session_map_key(key);
@@ -7084,6 +7112,16 @@ fn delete_live_session_key(map_fd: c_int, key: &SessionKey) {
             (&map_key as *const UserspaceSessionMapKey).cast::<c_void>(),
         )
     };
+}
+
+fn delete_live_session_entry(map_fd: c_int, key: &SessionKey, nat: NatDecision, is_reverse: bool) {
+    delete_live_session_key(map_fd, key);
+    if !is_reverse {
+        let wire_key = forward_wire_key(key, nat);
+        if wire_key != *key {
+            delete_live_session_key(map_fd, &wire_key);
+        }
+    }
 }
 
 struct MmapArea {
