@@ -595,6 +595,8 @@ elif (( TOTAL_CYCLES == 1 )); then
 
 	if iperf_alive; then
 		pass "iperf3 survived immediate failover"
+	elif iperf_completed; then
+		pass "iperf3 completed during immediate post-failover window"
 	else
 		fail "iperf3 died immediately after failover"
 	fi

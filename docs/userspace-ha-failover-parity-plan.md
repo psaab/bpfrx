@@ -29,6 +29,14 @@ Current status:
 - latest scripted validation result on this branch:
   - `0` zero-throughput intervals after RG1 failover
   - sender throughput: `17.4 Gbps`
+- latest strict split-RG steady-state validation result on this branch:
+  - `0` zero-throughput intervals before any failover
+  - `0` per-stream zero-throughput intervals
+  - sender throughput: `17.8 Gbps`
+- latest strict RG1 failover validation result on this branch:
+  - `0` zero-throughput intervals across the full run
+  - `0` per-stream zero-throughput intervals
+  - sender throughput: `6.70 Gbps`
 - the failover validator is now being hardened for stress parity:
   - repeated failover / failback cycles
   - per-stream `0.00 bits/sec` checks, not just `[SUM]`
@@ -38,8 +46,12 @@ Current status:
 - the validator now also has a `--steady-only` split-RG fabric mode and a strict
   pre-failover observe window so "streams already dead before failover" is
   caught as a steady-state fabric regression instead of a failover regression
-- remaining work is now parity hardening, repeated failover stress, fabric-link
-  throughput stability, and post-move cold-connect latency, not first-fix bring-up
+- remaining work is now parity hardening and performance parity:
+  - repeated failover stress
+  - higher split-RG fabric throughput
+  - higher post-failover throughput
+  - post-move cold-connect latency
+  not first-fix bring-up
 
 This is not a generic whole-node reboot problem. It is an active/active per-RG
 handoff problem where existing flows must survive a WAN RG ownership move.
@@ -160,6 +172,36 @@ Result:
    intervals on this branch
 2. synced-session takeover preserves the same fabric-aware return semantics as
    the original forward session
+
+### 4. Passive Peer Reverse Resolution Re-Redirected Steady-State Fabric Returns
+
+The peer-side helper kept `fabric_ingress=true` on synced forward sessions and
+then treated that as an unconditional "send the reverse path back to fabric"
+signal when it had to derive a reverse session locally.
+
+Effect:
+
+1. the split-RG steady-state fabric path could start at line rate and then drop
+   all `iperf3` streams to `0.00 bits/sec` within a few seconds
+2. the passive peer accumulated huge session-miss counts while still
+   transmitting fabric traffic
+3. the bug reproduced even before the first failover, so it was contaminating
+   HA validation with a pure steady-state fabric failure
+
+Fix:
+
+1. keep the `fabric_ingress` hint
+2. but only use zone-encoded fabric redirect for the reverse path when the
+   target egress RG is inactive on the current node
+3. if the peer owns the client-side RG, resolve the reverse path locally
+   instead of bouncing it back across fabric
+
+Result:
+
+1. the strict split-RG steady-state validator now passes with `0`
+   zero-throughput intervals
+2. the failover validator still passes with `0` zero-throughput intervals
+3. the remaining gap is throughput parity, not stream collapse
 
 ## Known Gaps Between Userspace And eBPF
 

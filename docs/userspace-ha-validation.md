@@ -95,6 +95,15 @@ validator in `--steady-only` mode with RG1 pinned to the peer owner. That
 isolates the split-RG fabric path without failover churn and catches
 "starts fast, then all streams go to 0" regressions before any RG transition.
 
+Current use of that gate:
+
+- `--steady-only --source-node 1 --target-node 0` is the standard split-RG
+  fabric-path repro for the isolated userspace lab
+- the acceptance bar is:
+  - `0` aggregate zero-throughput intervals
+  - `0` per-stream zero-throughput intervals
+  - all streams still carrying traffic at the end of the steady-state window
+
 If the validation script is failing and you still need current performance data,
 run the perf-compare workflow next. It captures IPv4/IPv6 `iperf3` and `perf`
 artifacts without treating current tree instability as a hard blocker.
