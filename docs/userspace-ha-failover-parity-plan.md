@@ -333,7 +333,7 @@ currently rebuilds sync state mostly from:
 That means the failover owner may need to re-resolve more forwarding state than
 the legacy dataplane did.
 
-### 4. Fabric Redirect Parity Still Needs Stress Proof
+### 5. Fabric Redirect Parity Still Needs Stress Proof
 
 The userspace dataplane now has fabric XSK bindings and fabric redirect support,
 but the legacy eBPF path in
