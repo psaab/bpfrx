@@ -107,10 +107,28 @@ pub(super) fn lookup_forwarding_resolution_for_session(
     }
 }
 
+fn owner_rg_is_locally_active(
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    owner_rg_id: i32,
+    now_secs: u64,
+) -> bool {
+    owner_rg_id > 0
+        && matches!(
+            ha_state.get(&owner_rg_id),
+            Some(group)
+                if group.active
+                    && group.watchdog_timestamp != 0
+                    && now_secs >= group.watchdog_timestamp
+                    && now_secs.saturating_sub(group.watchdog_timestamp)
+                        <= HA_WATCHDOG_STALE_AFTER_SECS
+        )
+}
+
 pub(super) fn apply_worker_commands(
     commands: &Arc<Mutex<VecDeque<WorkerCommand>>>,
     sessions: &mut SessionTable,
     session_map_fd: c_int,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
 ) {
     // Hot path: try_lock avoids blocking on the mutex when another thread
     // holds it (rare) and avoids the cost of lock+unlock on empty queues
@@ -125,11 +143,20 @@ pub(super) fn apply_worker_commands(
         Err(_) => return,
     };
     let now_ns = monotonic_nanos();
+    let now_secs = now_ns / 1_000_000_000;
     for cmd in pending {
         match cmd {
+            WorkerCommand::DemoteOwnerRG(owner_rg_id) => {
+                sessions.demote_owner_rg(owner_rg_id);
+            }
             WorkerCommand::UpsertSynced(entry) => {
                 let key = entry.key.clone();
                 let is_reverse = entry.metadata.is_reverse;
+                let allow_replace_local = !owner_rg_is_locally_active(
+                    ha_state,
+                    entry.metadata.owner_rg_id,
+                    now_secs,
+                );
                 if sessions.upsert_synced(
                     entry.key,
                     entry.decision,
@@ -137,6 +164,7 @@ pub(super) fn apply_worker_commands(
                     now_ns,
                     entry.protocol,
                     entry.tcp_flags,
+                    allow_replace_local,
                 ) {
                     let _ = publish_live_session_entry(
                         session_map_fd,
@@ -180,6 +208,44 @@ pub(super) fn replicate_session_delete(
     for commands in worker_commands {
         if let Ok(mut pending) = commands.lock() {
             pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
+        }
+    }
+}
+
+pub(super) fn demote_shared_owner_rgs(
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    owner_rgs: &[i32],
+) {
+    if owner_rgs.is_empty() {
+        return;
+    }
+    let should_demote = |entry: &SyncedSessionEntry| owner_rgs.contains(&entry.metadata.owner_rg_id);
+    if let Ok(mut sessions) = shared_sessions.lock() {
+        sessions.retain(|_, entry| {
+            if !should_demote(entry) {
+                return true;
+            }
+            if entry.metadata.is_reverse {
+                return false;
+            }
+            entry.metadata.synced = true;
+            true
+        });
+    }
+    if let Ok(mut sessions) = shared_nat_sessions.lock() {
+        for entry in sessions.values_mut() {
+            if should_demote(entry) {
+                entry.metadata.synced = true;
+            }
+        }
+    }
+    if let Ok(mut sessions) = shared_forward_wire_sessions.lock() {
+        for entry in sessions.values_mut() {
+            if should_demote(entry) {
+                entry.metadata.synced = true;
+            }
         }
     }
 }
@@ -484,6 +550,7 @@ fn materialize_shared_session_hit(
             now_ns,
             replica.protocol,
             tcp_flags,
+            false,
         );
         return SessionLookup {
             decision: replica.decision,
@@ -1166,5 +1233,226 @@ mod tests {
             .expect("local canonical session should keep forward-wire alias");
         assert_eq!(local_hit.key, key);
         assert_eq!(resolved.decision.nat, decision.nat);
+    }
+
+    #[test]
+    fn apply_worker_commands_replaces_stale_local_session_for_inactive_owner_rg() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let live_metadata = test_metadata();
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            test_decision(),
+            live_metadata,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        let synced_metadata = SessionMetadata {
+            synced: true,
+            ..test_metadata()
+        };
+        let synced_decision = SessionDecision {
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+            ..test_decision()
+        };
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::UpsertSynced(SyncedSessionEntry {
+                key: key.clone(),
+                decision: synced_decision,
+                metadata: synced_metadata.clone(),
+                protocol: PROTO_TCP,
+                tcp_flags: 0x10,
+            }));
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(
+            1,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: 0,
+            },
+        );
+
+        apply_worker_commands(&commands, &mut sessions, -1, &ha_state);
+
+        let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("synced hit");
+        assert_eq!(hit.metadata, synced_metadata);
+        assert_eq!(hit.decision, synced_decision);
+    }
+
+    #[test]
+    fn apply_worker_commands_preserves_local_session_for_active_owner_rg() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let live_decision = test_decision();
+        let live_metadata = test_metadata();
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            live_decision,
+            live_metadata.clone(),
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        let synced_decision = SessionDecision {
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+            ..test_decision()
+        };
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::UpsertSynced(SyncedSessionEntry {
+                key: key.clone(),
+                decision: synced_decision,
+                metadata: SessionMetadata {
+                    synced: true,
+                    ..test_metadata()
+                },
+                protocol: PROTO_TCP,
+                tcp_flags: 0x10,
+            }));
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        );
+
+        apply_worker_commands(&commands, &mut sessions, -1, &ha_state);
+
+        let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("live hit");
+        assert_eq!(hit.metadata, live_metadata);
+        assert_eq!(hit.decision, live_decision);
+    }
+
+    #[test]
+    fn apply_worker_commands_demotes_local_sessions_for_owner_rg() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let mut live_metadata = test_metadata();
+        live_metadata.owner_rg_id = 1;
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            test_decision(),
+            live_metadata,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::DemoteOwnerRG(1));
+
+        apply_worker_commands(&commands, &mut sessions, -1, &BTreeMap::new());
+
+        let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("demoted hit");
+        assert!(hit.metadata.synced);
+    }
+
+    #[test]
+    fn apply_worker_commands_drops_reverse_local_sessions_for_owner_rg() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let mut key = test_key();
+        key.src_ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+        key.dst_ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8));
+        let mut reverse_metadata = test_metadata();
+        reverse_metadata.owner_rg_id = 1;
+        reverse_metadata.is_reverse = true;
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            test_decision(),
+            reverse_metadata,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::DemoteOwnerRG(1));
+
+        apply_worker_commands(&commands, &mut sessions, -1, &BTreeMap::new());
+
+        assert!(sessions.lookup(&key, 2_000_000, 0x10).is_none());
+    }
+
+    #[test]
+    fn demote_shared_owner_rgs_drops_reverse_entries_and_marks_forward_synced() {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let forward = SyncedSessionEntry {
+            key: test_key(),
+            decision: test_decision(),
+            metadata: test_metadata(),
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        };
+        let reverse = SyncedSessionEntry {
+            key: reverse_session_key(&forward.key, forward.decision.nat),
+            decision: test_decision(),
+            metadata: SessionMetadata {
+                is_reverse: true,
+                ..test_metadata()
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        };
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &forward,
+        );
+        shared_sessions
+            .lock()
+            .expect("shared sessions")
+            .insert(reverse.key.clone(), reverse.clone());
+
+        demote_shared_owner_rgs(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &[1],
+        );
+
+        let shared_forward = shared_sessions
+            .lock()
+            .expect("shared sessions")
+            .get(&forward.key)
+            .cloned()
+            .expect("forward entry");
+        assert!(shared_forward.metadata.synced);
+        assert!(
+            !shared_sessions
+                .lock()
+                .expect("shared sessions")
+                .contains_key(&reverse.key)
+        );
+        let reverse_alias = reverse_session_key(&forward.key, forward.decision.nat);
+        let nat_alias = shared_nat_sessions
+            .lock()
+            .expect("shared nat")
+            .get(&reverse_alias)
+            .cloned()
+            .expect("nat alias");
+        assert!(nat_alias.metadata.synced);
     }
 }

@@ -323,8 +323,11 @@ impl SessionTable {
         now_ns: u64,
         protocol: u8,
         tcp_flags: u8,
+        allow_replace_local: bool,
     ) -> bool {
-        if matches!(self.sessions.get(&key), Some(existing) if !existing.metadata.synced) {
+        if matches!(self.sessions.get(&key), Some(existing) if !existing.metadata.synced)
+            && !allow_replace_local
+        {
             return false;
         }
         self.remove_entry(&key);
@@ -379,6 +382,29 @@ impl SessionTable {
 
     pub fn delete(&mut self, key: &SessionKey) {
         self.remove_entry(key);
+    }
+
+    pub fn demote_owner_rg(&mut self, owner_rg_id: i32) -> usize {
+        if owner_rg_id <= 0 {
+            return 0;
+        }
+        let mut affected = 0usize;
+        let mut drop_reverse = Vec::new();
+        for (key, entry) in &mut self.sessions {
+            if entry.metadata.owner_rg_id != owner_rg_id || entry.metadata.synced {
+                continue;
+            }
+            if entry.metadata.is_reverse {
+                drop_reverse.push(key.clone());
+            } else {
+                entry.metadata.synced = true;
+            }
+            affected = affected.saturating_add(1);
+        }
+        for key in drop_reverse {
+            self.remove_entry(&key);
+        }
+        affected
     }
 
     pub fn drain_deltas(&mut self, max: usize) -> Vec<SessionDelta> {
@@ -749,6 +775,7 @@ mod tests {
             now,
             PROTO_TCP,
             0x10,
+            false,
         );
         let hit = table.lookup(&key, now + 1_000_000, 0x10);
         assert_eq!(
@@ -793,10 +820,48 @@ mod tests {
             now + 1_000_000,
             PROTO_TCP,
             0x10,
+            false,
         );
         let hit = table.lookup(&key, now + 2_000_000, 0x10).expect("live session");
         assert_eq!(hit.metadata, live);
         assert_eq!(hit.decision, decision());
+    }
+
+    #[test]
+    fn upsert_synced_can_replace_live_local_session_when_allowed() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let now = 1_000_000_000u64;
+        let live = metadata();
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            live,
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        let mut synced = metadata();
+        synced.synced = true;
+        let synced_decision = SessionDecision {
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                ..NatDecision::default()
+            },
+            ..decision()
+        };
+        assert!(table.upsert_synced(
+            key.clone(),
+            synced_decision,
+            synced.clone(),
+            now + 1_000_000,
+            PROTO_TCP,
+            0x10,
+            true,
+        ));
+        let hit = table.lookup(&key, now + 2_000_000, 0x10).expect("synced session");
+        assert_eq!(hit.metadata, synced);
+        assert_eq!(hit.decision, synced_decision);
     }
 
     #[test]
@@ -806,7 +871,7 @@ mod tests {
         let now = 1_000_000_000u64;
         let mut synced = metadata();
         synced.synced = true;
-        table.upsert_synced(key.clone(), decision(), synced, now, PROTO_TCP, 0x10);
+        table.upsert_synced(key.clone(), decision(), synced, now, PROTO_TCP, 0x10, false);
         let mut promoted = metadata();
         promoted.synced = false;
         assert!(table.promote_synced(
@@ -840,7 +905,7 @@ mod tests {
         let mut synced = metadata();
         synced.synced = true;
         synced.is_reverse = true;
-        table.upsert_synced(key.clone(), decision(), synced, now, PROTO_TCP, 0x10);
+        table.upsert_synced(key.clone(), decision(), synced, now, PROTO_TCP, 0x10, false);
         let mut promoted = metadata();
         promoted.synced = false;
         promoted.is_reverse = true;
@@ -861,6 +926,70 @@ mod tests {
             })
         );
         assert!(table.drain_deltas(8).is_empty());
+    }
+
+    #[test]
+    fn demote_owner_rg_marks_forward_entries_synced_and_drops_reverse_entries() {
+        let mut table = SessionTable::new();
+        let now = 1_000_000_000u64;
+        let key_a = key_v4();
+        let key_b = SessionKey {
+            src_port: 42425,
+            ..key_v4()
+        };
+        let key_other = SessionKey {
+            src_port: 42426,
+            ..key_v4()
+        };
+        let mut metadata_a = metadata();
+        metadata_a.owner_rg_id = 1;
+        let mut metadata_b = metadata();
+        metadata_b.owner_rg_id = 1;
+        metadata_b.is_reverse = true;
+        let mut metadata_other = metadata();
+        metadata_other.owner_rg_id = 2;
+        assert!(table.install_with_protocol(
+            key_a.clone(),
+            decision(),
+            metadata_a,
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        assert!(table.install_with_protocol(
+            key_b.clone(),
+            decision(),
+            metadata_b,
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        assert!(table.install_with_protocol(
+            key_other.clone(),
+            decision(),
+            metadata_other.clone(),
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+
+        assert_eq!(table.demote_owner_rg(1), 2);
+
+        assert!(
+            table
+                .lookup(&key_a, now + 1_000_000, 0x10)
+                .expect("demoted key_a")
+                .metadata
+                .synced
+        );
+        assert!(table.lookup(&key_b, now + 1_000_000, 0x10).is_none());
+        assert_eq!(
+            table
+                .lookup(&key_other, now + 1_000_000, 0x10)
+                .expect("other rg")
+                .metadata,
+            metadata_other
+        );
     }
 
     #[test]
