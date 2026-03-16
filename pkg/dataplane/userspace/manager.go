@@ -2767,6 +2767,7 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 		req.NATDstIP = ipString(nativeUint32ToIP(val.NATDstIP))
 		req.NATSrcPort = networkUint16ToHost(val.NATSrcPort)
 		req.NATDstPort = networkUint16ToHost(val.NATDstPort)
+		req.FabricIngress = val.LogFlags&dataplane.LogFlagUserspaceFabricIngress != 0
 		req.IsReverse = val.IsReverse != 0
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
@@ -2809,6 +2810,7 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		req.NATDstIP = ipString(net.IP(val.NATDstIP[:]))
 		req.NATSrcPort = networkUint16ToHost(val.NATSrcPort)
 		req.NATDstPort = networkUint16ToHost(val.NATDstPort)
+		req.FabricIngress = val.LogFlags&dataplane.LogFlagUserspaceFabricIngress != 0
 		req.IsReverse = val.IsReverse != 0
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""

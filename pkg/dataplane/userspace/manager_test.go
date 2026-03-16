@@ -95,6 +95,7 @@ func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 		IngressZone: 1,
 		EgressZone:  2,
 		Flags:       dataplane.SessFlagSNAT,
+		LogFlags:    dataplane.LogFlagUserspaceFabricIngress,
 		FibIfindex:  6,
 		FibVlanID:   80,
 		NATSrcIP:    binary.NativeEndian.Uint32([]byte{172, 16, 80, 8}),
@@ -106,6 +107,9 @@ func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 	}
 	if req.NATSrcPort != 40000 {
 		t.Fatalf("unexpected nat src port: %d", req.NATSrcPort)
+	}
+	if !req.FabricIngress {
+		t.Fatalf("expected fabric_ingress to be preserved: %+v", req)
 	}
 }
 
@@ -138,6 +142,7 @@ func TestBuildSessionSyncRequestV6ConvertsPortsToHostOrder(t *testing.T) {
 		IngressZone: 1,
 		EgressZone:  2,
 		Flags:       dataplane.SessFlagSNAT,
+		LogFlags:    dataplane.LogFlagUserspaceFabricIngress,
 		FibIfindex:  6,
 		FibVlanID:   80,
 		NATSrcIP:    natSrc,
@@ -149,6 +154,9 @@ func TestBuildSessionSyncRequestV6ConvertsPortsToHostOrder(t *testing.T) {
 	}
 	if req.NATSrcPort != 40000 {
 		t.Fatalf("unexpected nat src port: %d", req.NATSrcPort)
+	}
+	if !req.FabricIngress {
+		t.Fatalf("expected fabric_ingress to be preserved: %+v", req)
 	}
 }
 

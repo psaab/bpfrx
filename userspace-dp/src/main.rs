@@ -948,6 +948,8 @@ struct SessionSyncRequest {
     nat_src_port: u16,
     #[serde(rename = "nat_dst_port", default)]
     nat_dst_port: u16,
+    #[serde(rename = "fabric_ingress", default)]
+    fabric_ingress: bool,
     #[serde(rename = "is_reverse", default)]
     is_reverse: bool,
 }
@@ -1011,6 +1013,8 @@ struct SessionDeltaInfo {
     nat_src_port: u16,
     #[serde(rename = "nat_dst_port", default)]
     nat_dst_port: u16,
+    #[serde(rename = "fabric_ingress", default)]
+    fabric_ingress: bool,
 }
 
 #[derive(Debug)]
@@ -1626,8 +1630,7 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             ingress_zone: req.ingress_zone.clone().into(),
             egress_zone: req.egress_zone.clone().into(),
             owner_rg_id: req.owner_rg_id,
-            // Cluster session sync does not yet preserve original fabric ingress.
-            fabric_ingress: false,
+            fabric_ingress: req.fabric_ingress,
             is_reverse: req.is_reverse,
             synced: true,
             nat64_reverse: None,
@@ -2005,6 +2008,32 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].interface, "ge-0-0-0");
         assert_eq!(bindings[0].ifindex, 21);
+    }
+
+    #[test]
+    fn build_synced_session_entry_preserves_fabric_ingress() {
+        let req = SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: "10.0.61.102".to_string(),
+            dst_ip: "172.16.80.200".to_string(),
+            src_port: 40000,
+            dst_port: 5201,
+            ingress_zone: "lan".to_string(),
+            egress_zone: "wan".to_string(),
+            owner_rg_id: 1,
+            egress_ifindex: 5,
+            tx_ifindex: 5,
+            tx_vlan_id: 80,
+            fabric_ingress: true,
+            ..SessionSyncRequest::default()
+        };
+
+        let entry = build_synced_session_entry(&req).expect("synced session entry");
+        assert!(entry.metadata.fabric_ingress);
+        assert!(entry.metadata.synced);
+        assert_eq!(entry.metadata.owner_rg_id, 1);
     }
 
     #[test]

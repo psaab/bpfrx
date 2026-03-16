@@ -2699,8 +2699,10 @@ fn poll_binding(
                                         recycle_now = false;
                                     } else {
                                         let mut created = 0u64;
-                                        let fabric_ingress =
-                                            ingress_is_fabric(forwarding, meta.ingress_ifindex as i32);
+                                        let fabric_ingress = ingress_is_fabric(
+                                            forwarding,
+                                            meta.ingress_ifindex as i32,
+                                        );
                                         let forward_metadata = SessionMetadata {
                                             ingress_zone: from_zone_arc.clone(),
                                             egress_zone: to_zone_arc.clone(),
@@ -3707,6 +3709,7 @@ fn flush_session_deltas(
                 .unwrap_or_default(),
             nat_src_port: delta.decision.nat.rewrite_src_port.unwrap_or(0),
             nat_dst_port: delta.decision.nat.rewrite_dst_port.unwrap_or(0),
+            fabric_ingress: delta.metadata.fabric_ingress,
         };
         live.push_session_delta(info.clone());
         if let Ok(mut recent) = recent_session_deltas.lock() {
@@ -8389,7 +8392,10 @@ mod tests {
         let redirect = resolve_fabric_redirect(&state).expect("fabric redirect");
         assert_eq!(redirect.egress_ifindex, 21);
         assert_eq!(redirect.tx_ifindex, 21);
-        assert_eq!(redirect.neighbor_mac, Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]));
+        assert_eq!(
+            redirect.neighbor_mac,
+            Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee])
+        );
         assert_eq!(redirect.src_mac, Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]));
     }
 
@@ -8568,7 +8574,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -8617,7 +8623,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -8666,7 +8672,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -8717,7 +8723,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("lan"),
                 owner_rg_id: 2,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -9263,7 +9269,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("wan"),
                 owner_rg_id: 1,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -9303,7 +9309,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("wan"),
                 owner_rg_id: 1,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: true,
                 nat64_reverse: None,
             },
@@ -9354,7 +9360,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("wan"),
                 owner_rg_id: 1,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: true,
                 nat64_reverse: None,
             },
@@ -10677,7 +10683,10 @@ mod tests {
         .expect("request");
 
         assert!(req.apply_nat_on_fabric);
-        assert_eq!(req.decision.resolution.disposition, ForwardingDisposition::FabricRedirect);
+        assert_eq!(
+            req.decision.resolution.disposition,
+            ForwardingDisposition::FabricRedirect
+        );
         assert_eq!(req.decision.resolution.src_mac, zone_redirect.src_mac);
     }
 
@@ -10694,9 +10703,9 @@ mod tests {
             0x0800,
         );
         frame.extend_from_slice(&[
-            0x45, 0x00, 0x00, 0x28, 0x00, 0x02, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 172, 16,
-            80, 200, 172, 16, 80, 8, 0x14, 0x51, 0xac, 0xf6, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
-            0x00, 0x02, 0x50, 0x12, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x45, 0x00, 0x00, 0x28, 0x00, 0x02, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 172, 16, 80,
+            200, 172, 16, 80, 8, 0x14, 0x51, 0xac, 0xf6, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x02, 0x50, 0x12, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]);
         let ip_sum = checksum16(&frame[14..34]);
         frame[24] = (ip_sum >> 8) as u8;
@@ -12643,7 +12652,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -12765,7 +12774,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -12880,7 +12889,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -13012,7 +13021,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("trust"),
                 owner_rg_id: 0,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: false,
                 nat64_reverse: None,
             },
@@ -13437,7 +13446,7 @@ mod tests {
                 egress_zone: Arc::<str>::from("wan"),
                 owner_rg_id: 0,
                 fabric_ingress: false,
-            is_reverse: false,
+                is_reverse: false,
                 synced: true,
                 nat64_reverse: None,
             },

@@ -674,6 +674,8 @@ type SessionCountValue struct {
 const (
 	LogFlagSessionInit  = 1 << 0
 	LogFlagSessionClose = 1 << 1
+	// Userspace-only session sync metadata piggybacked through SessionValue.LogFlags.
+	LogFlagUserspaceFabricIngress = 1 << 7
 )
 
 // Event type constants.
