@@ -58,6 +58,7 @@ pub(super) fn build_local_time_exceeded_request(
             },
             nat: NatDecision::default(),
         },
+        apply_nat_on_fabric: false,
         expected_ports: None,
         flow_key: None,
         nat64_reverse: None,
