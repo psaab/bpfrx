@@ -8602,12 +8602,46 @@ mod tests {
     }
 
     #[test]
-    fn fabric_originated_reverse_session_uses_zone_encoded_fabric_redirect() {
+    fn fabric_originated_reverse_session_prefers_local_client_delivery_when_rg_active() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let ha_state = BTreeMap::from([(
-            1,
+            2,
             HAGroupRuntime {
                 active: true,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )]);
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        dynamic_neighbors.lock().expect("neighbors").insert(
+            (24, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+            NeighborEntry {
+                mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+            },
+        );
+
+        let resolved = reverse_resolution_for_session(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            "lan",
+            true,
+            monotonic_nanos() / 1_000_000_000,
+        );
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::ForwardCandidate);
+        assert_eq!(resolved.egress_ifindex, 24);
+        assert_eq!(resolved.tx_ifindex, 24);
+    }
+
+    #[test]
+    fn fabric_originated_reverse_session_uses_zone_encoded_fabric_redirect_when_client_rg_inactive()
+    {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let ha_state = BTreeMap::from([(
+            2,
+            HAGroupRuntime {
+                active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
             },
         )]);

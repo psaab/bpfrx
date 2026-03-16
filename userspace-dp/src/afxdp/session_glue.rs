@@ -538,17 +538,23 @@ pub(super) fn reverse_resolution_for_session(
     fabric_ingress: bool,
     now_secs: u64,
 ) -> ForwardingResolution {
+    let resolved = lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip);
     if fabric_ingress
+        && owner_rg_for_flow(forwarding, resolved.egress_ifindex) > 0
+        && !matches!(
+            ha_state.get(&owner_rg_for_flow(forwarding, resolved.egress_ifindex)),
+            Some(group)
+                if group.active
+                    && group.watchdog_timestamp != 0
+                    && now_secs >= group.watchdog_timestamp
+                    && now_secs.saturating_sub(group.watchdog_timestamp)
+                        <= HA_WATCHDOG_STALE_AFTER_SECS
+        )
         && let Some(redirect) = resolve_zone_encoded_fabric_redirect(forwarding, ingress_zone)
     {
         return redirect;
     }
-    enforce_ha_resolution_snapshot(
-        forwarding,
-        ha_state,
-        now_secs,
-        lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip),
-    )
+    enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, resolved)
 }
 
 fn install_reverse_session_from_forward_match(
