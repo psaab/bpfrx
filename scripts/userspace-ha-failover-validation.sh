@@ -206,7 +206,10 @@ validate_target_reachability() {
 	# Some targets drop the first probe while ARP/NDP settles. Fall back to a
 	# TCP handshake against the iperf3 server so failover validation does not
 	# fail before the actual RG transition is exercised.
-	run_host "timeout 3 bash -lc 'echo > /dev/tcp/${IPERF_TARGET}/5201' >${tcp_log} 2>&1"
+	if run_host "timeout 3 bash -lc 'echo > /dev/tcp/${IPERF_TARGET}/5201' >${tcp_log} 2>&1"; then
+		return 0
+	fi
+	return 1
 }
 
 start_iperf() {

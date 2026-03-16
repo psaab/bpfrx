@@ -126,7 +126,7 @@ The standard userspace HA validator exercises:
 3. sustained `iperf3` throughput
 
 That gap is mostly closed by
-[userspace-ha-failover-validation.sh](/home/ps/git/codex-bpfrx/scripts/userspace-ha-failover-validation.sh),
+[userspace-ha-failover-validation.sh](../scripts/userspace-ha-failover-validation.sh),
 but the scripted workflow still needs to be re-run after the new reachability
 preflight tightening and then promoted to the normal acceptance path.
 
