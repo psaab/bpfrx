@@ -254,7 +254,9 @@ impl SessionTable {
     pub fn find_forward_nat_match(&self, reply_key: &SessionKey) -> Option<ForwardSessionMatch> {
         let forward_key = self.nat_reverse_index.get(reply_key)?;
         let entry = self.sessions.get(forward_key)?;
-        if entry.metadata.is_reverse || !reply_matches_forward_nat(forward_key, entry.decision.nat, reply_key) {
+        if entry.metadata.is_reverse
+            || !reply_matches_forward_session(forward_key, entry.decision.nat, reply_key)
+        {
             return None;
         }
         Some(ForwardSessionMatch {
@@ -322,6 +324,9 @@ impl SessionTable {
         protocol: u8,
         tcp_flags: u8,
     ) {
+        if matches!(self.sessions.get(&key), Some(existing) if !existing.metadata.synced) {
+            return;
+        }
         self.remove_entry(&key);
         let index_key = key.clone();
         self.sessions.insert(
@@ -435,6 +440,10 @@ impl SessionTable {
         }
         self.nat_reverse_index
             .insert(reverse_wire_key(key, decision.nat), key.clone());
+        let reverse_canonical = reverse_canonical_key(key, decision.nat);
+        if reverse_canonical != *key {
+            self.nat_reverse_index.insert(reverse_canonical, key.clone());
+        }
         let forward_wire = forward_wire_key(key, decision.nat);
         if forward_wire != *key {
             self.forward_wire_index.insert(forward_wire, key.clone());
@@ -450,9 +459,14 @@ impl SessionTable {
         if metadata.is_reverse {
             return;
         }
-        let reverse_key = reverse_wire_key(key, decision.nat);
-        if matches!(self.nat_reverse_index.get(&reverse_key), Some(existing) if existing == key) {
-            self.nat_reverse_index.remove(&reverse_key);
+        let reverse_wire = reverse_wire_key(key, decision.nat);
+        if matches!(self.nat_reverse_index.get(&reverse_wire), Some(existing) if existing == key) {
+            self.nat_reverse_index.remove(&reverse_wire);
+        }
+        let reverse_canonical = reverse_canonical_key(key, decision.nat);
+        if matches!(self.nat_reverse_index.get(&reverse_canonical), Some(existing) if existing == key)
+        {
+            self.nat_reverse_index.remove(&reverse_canonical);
         }
         let forward_wire = forward_wire_key(key, decision.nat);
         if matches!(self.forward_wire_index.get(&forward_wire), Some(existing) if existing == key) {
@@ -476,21 +490,13 @@ fn session_timeout_ns(protocol: u8, tcp_flags: u8, timeouts: &SessionTimeouts) -
     }
 }
 
-pub(crate) fn reply_matches_forward_nat(
+pub(crate) fn reply_matches_forward_session(
     forward_key: &SessionKey,
     nat: NatDecision,
     reply_key: &SessionKey,
 ) -> bool {
-    // For NAT64, the reply AF differs from the forward AF; skip the AF/proto
-    // equality check since reverse_wire_key() computes the correct cross-AF key.
-    if !nat.nat64 {
-        if forward_key.addr_family != reply_key.addr_family
-            || forward_key.protocol != reply_key.protocol
-        {
-            return false;
-        }
-    }
     reverse_wire_key(forward_key, nat) == *reply_key
+        || reverse_canonical_key(forward_key, nat) == *reply_key
 }
 
 pub(crate) fn forward_wire_key(forward_key: &SessionKey, nat: NatDecision) -> SessionKey {
@@ -567,6 +573,17 @@ fn reverse_wire_key(forward_key: &SessionKey, nat: NatDecision) -> SessionKey {
         dst_ip: wire_dst,
         src_port,
         dst_port,
+    }
+}
+
+pub(crate) fn reverse_canonical_key(forward_key: &SessionKey, _nat: NatDecision) -> SessionKey {
+    SessionKey {
+        addr_family: forward_key.addr_family,
+        protocol: forward_key.protocol,
+        src_ip: forward_key.dst_ip,
+        dst_ip: forward_key.src_ip,
+        src_port: forward_key.dst_port,
+        dst_port: forward_key.src_port,
     }
 }
 
@@ -746,6 +763,42 @@ mod tests {
     }
 
     #[test]
+    fn upsert_synced_does_not_clobber_live_local_session() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let now = 1_000_000_000u64;
+        let mut live = metadata();
+        live.fabric_ingress = true;
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            live.clone(),
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        let mut synced = metadata();
+        synced.synced = true;
+        table.upsert_synced(
+            key.clone(),
+            SessionDecision {
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                    ..NatDecision::default()
+                },
+                ..decision()
+            },
+            synced,
+            now + 1_000_000,
+            PROTO_TCP,
+            0x10,
+        );
+        let hit = table.lookup(&key, now + 2_000_000, 0x10).expect("live session");
+        assert_eq!(hit.metadata, live);
+        assert_eq!(hit.decision, decision());
+    }
+
+    #[test]
     fn promote_synced_forward_session_emits_open_delta() {
         let mut table = SessionTable::new();
         let key = key_v4();
@@ -827,7 +880,7 @@ mod tests {
             src_port: 5201,
             dst_port: 42424,
         };
-        assert!(reply_matches_forward_nat(
+        assert!(reply_matches_forward_session(
             &forward,
             NatDecision { 
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -855,7 +908,7 @@ mod tests {
             src_port: 0x1234,
             dst_port: 0,
         };
-        assert!(reply_matches_forward_nat(
+        assert!(reply_matches_forward_session(
             &forward,
             NatDecision { 
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -907,6 +960,52 @@ mod tests {
 
         table.delete(&hit.key);
         assert!(table.find_forward_nat_match(&reply).is_none());
+    }
+
+    #[test]
+    fn find_forward_nat_match_uses_canonical_reverse_index() {
+        let mut table = SessionTable::new();
+        let forward = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 42424,
+            dst_port: 5201,
+        };
+        let canonical_reply = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            src_port: 5201,
+            dst_port: 42424,
+        };
+        let nat = NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+            ..NatDecision::default()
+        };
+        let decision = SessionDecision {
+            resolution: resolution(),
+            nat,
+        };
+        assert!(table.install_with_protocol(
+            forward.clone(),
+            decision,
+            metadata(),
+            1_000_000_000,
+            PROTO_TCP,
+            0x10
+        ));
+
+        let hit = table
+            .find_forward_nat_match(&canonical_reply)
+            .expect("canonical reverse match");
+        assert_eq!(hit.key, forward);
+        assert_eq!(hit.decision.nat, nat);
+
+        table.delete(&hit.key);
+        assert!(table.find_forward_nat_match(&canonical_reply).is_none());
     }
 
     #[test]
@@ -981,7 +1080,7 @@ mod tests {
             src_port: 8080,
             dst_port: 54321,
         };
-        assert!(reply_matches_forward_nat(&forward, nat, &expected_reply));
+        assert!(reply_matches_forward_session(&forward, nat, &expected_reply));
     }
 
     #[test]
@@ -1013,7 +1112,7 @@ mod tests {
             src_port: 8080,
             dst_port: 54321,
         };
-        assert!(reply_matches_forward_nat(&forward, nat, &expected_reply));
+        assert!(reply_matches_forward_session(&forward, nat, &expected_reply));
     }
 
     #[test]
@@ -1041,7 +1140,7 @@ mod tests {
             src_port: 0x1234,
             dst_port: 0,
         };
-        assert!(reply_matches_forward_nat(&forward, nat, &expected_reply));
+        assert!(reply_matches_forward_session(&forward, nat, &expected_reply));
     }
 
     #[test]
