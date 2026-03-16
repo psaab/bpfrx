@@ -32,6 +32,7 @@ MAX_PREFLIGHT_STREAM_ZERO_INTERVALS="${MAX_PREFLIGHT_STREAM_ZERO_INTERVALS:-0}"
 POST_FAILOVER_OBSERVE="${POST_FAILOVER_OBSERVE:-10}"
 RESTORE_SOURCE_NODE="${RESTORE_SOURCE_NODE:-1}"
 ALLOW_STALE_SESSIONS="${ALLOW_STALE_SESSIONS:-0}"
+IPERF_COMPLETION_GRACE_SEC="${IPERF_COMPLETION_GRACE_SEC:-2}"
 STEADY_ONLY=0
 DEPLOY=0
 
@@ -339,6 +340,23 @@ iperf_completed() {
 	run_host "grep -q 'iperf Done' ${REMOTE_IPERF_LOG}"
 }
 
+iperf_observed_end_remote() {
+	run_host "grep -E '^\[[[:space:]]*([0-9]+|SUM)\]' ${REMOTE_IPERF_LOG} 2>/dev/null | tail -n 1 | sed -n -E 's/^\\[[^]]+\\][[:space:]]+([0-9]+\\.[0-9]+)-([0-9]+\\.[0-9]+)[[:space:]]+sec.*/\\2/p' || true"
+}
+
+iperf_reached_expected_duration_remote() {
+	local observed_end
+	observed_end="$(iperf_observed_end_remote)"
+	if [[ -z "${observed_end}" ]]; then
+		return 1
+	fi
+	awk "BEGIN{exit !(${observed_end} >= (${IPERF_DURATION} - ${IPERF_COMPLETION_GRACE_SEC}))}"
+}
+
+iperf_effectively_completed_remote() {
+	iperf_completed || iperf_reached_expected_duration_remote
+}
+
 wait_for_iperf_finish() {
 	local tries=$((IPERF_DURATION + 20))
 	while (( tries > 0 )); do
@@ -356,32 +374,88 @@ copy_artifacts() {
 	run_host "cat ${REMOTE_IPERF_LOG} 2>/dev/null || true" >"${ARTIFACT_DIR}/iperf3.log"
 }
 
-count_zero_intervals() {
-	grep -E '^\[  [0-9]|^\[ [0-9][0-9]|\[SUM\]' "${ARTIFACT_DIR}/iperf3.log" 2>/dev/null | grep -c '0.00 bits/sec' || true
-}
-
-count_stream_zero_intervals() {
-	grep -E '^\[[[:space:]]*[0-9]+\]' "${ARTIFACT_DIR}/iperf3.log" 2>/dev/null | grep -c '0.00 bits/sec' || true
-}
-
-count_zero_streams() {
-	python3 - <<'PY' "${ARTIFACT_DIR}/iperf3.log"
+iperf_log_metric() {
+	python3 - <<'PY' "${ARTIFACT_DIR}/iperf3.log" "${IPERF_DURATION}" "${IPERF_COMPLETION_GRACE_SEC}" "$1"
 import pathlib
 import re
+import statistics
 import sys
 
 path = pathlib.Path(sys.argv[1])
+duration = float(sys.argv[2])
+grace = float(sys.argv[3])
+metric = sys.argv[4]
+
 if not path.exists():
-    print(0)
+    print("0")
     raise SystemExit(0)
 
-zero_streams = set()
-for line in path.read_text().splitlines():
-    m = re.match(r'^\[\s*(\d+)\]', line)
-    if m and "0.00 bits/sec" in line:
-        zero_streams.add(m.group(1))
-print(len(zero_streams))
+unit_scale = {"K": 1e3, "M": 1e6, "G": 1e9, None: 1.0}
+interval_re = re.compile(
+    r'^\[\s*(\d+|SUM)\]\s+([0-9]+\.[0-9]+)-([0-9]+\.[0-9]+)\s+sec\s+.*?([0-9]+\.[0-9]+)\s+([KMG])?bits/sec'
+)
+sender_re = re.compile(r'^\[SUM\].*?([0-9]+\.[0-9]+)\s+([KMG])bits/sec\s+.*sender$')
+
+intervals = []
+sender_bps = None
+
+for line in path.read_text(encoding="utf-8").splitlines():
+    sender = sender_re.match(line)
+    if sender:
+        sender_bps = float(sender.group(1)) * unit_scale[sender.group(2)]
+        continue
+    m = interval_re.match(line)
+    if not m:
+        continue
+    ident, start, end, value, unit = m.groups()
+    intervals.append((ident, float(start), float(end), float(value) * unit_scale[unit]))
+
+observed_end = max((end for _, _, end, _ in intervals), default=0.0)
+ignore_teardown = sender_bps is None and observed_end >= (duration - grace)
+teardown_cutoff = duration - grace if ignore_teardown else None
+
+filtered = []
+for ident, start, end, bps in intervals:
+    if teardown_cutoff is not None and end >= teardown_cutoff:
+        continue
+    filtered.append((ident, start, end, bps))
+
+sum_intervals = [bps for ident, _, _, bps in filtered if ident == "SUM"]
+stream_zero_records = [(ident, start, end) for ident, start, end, bps in filtered if ident != "SUM" and bps <= 0.0]
+sum_zero_records = [(start, end) for ident, start, end, bps in filtered if ident == "SUM" and bps <= 0.0]
+
+if metric == "observed_end":
+    print(f"{observed_end:.3f}")
+elif metric == "completed_without_summary":
+    print("1" if ignore_teardown else "0")
+elif metric == "zero_intervals":
+    print(len(sum_zero_records) + len(stream_zero_records))
+elif metric == "stream_zero_intervals":
+    print(len(stream_zero_records))
+elif metric == "zero_streams":
+    print(len({ident for ident, _, _ in stream_zero_records}))
+elif metric == "sender_gbps":
+    if sender_bps is not None:
+        print(f"{sender_bps / 1e9:.3f}")
+    elif sum_intervals:
+        print(f"{statistics.mean(sum_intervals) / 1e9:.3f}")
+    else:
+        print("0")
+else:
+    raise SystemExit(f"unsupported metric: {metric}")
 PY
+}
+
+count_zero_intervals() {
+	iperf_log_metric zero_intervals
+}
+
+count_stream_zero_intervals() {
+	iperf_log_metric stream_zero_intervals
+}
+
+count_zero_streams() {
+	iperf_log_metric zero_streams
 }
 
 extract_sender_throughput() {
@@ -395,14 +469,21 @@ extract_sender_throughput() {
 		awk "BEGIN{printf \"%.3f\", ${BASH_REMATCH[1]} / 1000}"
 		return 0
 	fi
-	printf '0\n'
+	iperf_log_metric sender_gbps
 }
 
 cycle_sleep() {
 	local seconds="$1"
+	local allow_expected_completion="${2:-0}"
 	local remaining="$seconds"
 	while (( remaining > 0 )); do
-		if ! iperf_alive && ! iperf_completed; then
+		if ! iperf_alive; then
+			if iperf_completed; then
+				return 0
+			fi
+			if [[ "$allow_expected_completion" == "1" ]] && iperf_reached_expected_duration_remote; then
+				return 0
+			fi
 			return 1
 		fi
 		sleep 1
@@ -420,7 +501,7 @@ validate_cycle_health() {
 	local count dead_streams zero_source zero_target
 	if iperf_alive; then
 		pass "cycle ${cycle} ${label}: iperf3 alive on ${owner_name}"
-	elif iperf_completed; then
+	elif iperf_effectively_completed_remote; then
 		if [[ "$final_phase" == "1" ]]; then
 			pass "cycle ${cycle} ${label}: iperf3 completed during final phase"
 		else
@@ -497,7 +578,7 @@ run_failover_phase() {
 	ACTIVE_FW="$(wait_for_userspace_rg_owner "$RG")" || die "userspace forwarding did not settle on ${to_name} during cycle ${cycle} ${phase}"
 	pass "cycle ${cycle} ${phase}: userspace forwarding active on ${ACTIVE_FW}"
 	capture_cycle_state "$cycle" "$phase"
-	if ! cycle_sleep "$CYCLE_INTERVAL"; then
+	if ! cycle_sleep "$CYCLE_INTERVAL" "$final_phase"; then
 		fail "cycle ${cycle} ${phase}: iperf3 exited before ${CYCLE_INTERVAL}s interval elapsed"
 	fi
 	capture_cycle_state "$cycle" "${phase}-post"
@@ -595,17 +676,17 @@ elif (( TOTAL_CYCLES == 1 )); then
 
 	if iperf_alive; then
 		pass "iperf3 survived immediate failover"
-	elif iperf_completed; then
+	elif iperf_effectively_completed_remote; then
 		pass "iperf3 completed during immediate post-failover window"
 	else
 		fail "iperf3 died immediately after failover"
 	fi
 
 	info "observing post-failover traffic for ${POST_FAILOVER_OBSERVE}s"
-	sleep "${POST_FAILOVER_OBSERVE}"
+	cycle_sleep "${POST_FAILOVER_OBSERVE}" 1 || true
 	if iperf_alive; then
 		pass "iperf3 still alive after post-failover observe window"
-	elif iperf_completed; then
+	elif iperf_effectively_completed_remote; then
 		pass "iperf3 completed during post-failover observe window"
 	else
 		fail "iperf3 died during post-failover observe window"

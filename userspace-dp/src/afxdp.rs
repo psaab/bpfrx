@@ -704,6 +704,7 @@ impl Coordinator {
             );
         }
         let demoted_rgs = demoted_owner_rgs(previous.as_ref(), &state);
+        let activated_rgs = activated_owner_rgs(previous.as_ref(), &state);
         self.ha_state.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
             demote_shared_owner_rgs(
@@ -720,6 +721,31 @@ impl Coordinator {
                 }
             }
         }
+        if !activated_rgs.is_empty() {
+            let worker_commands = self
+                .workers
+                .values()
+                .map(|handle| handle.commands.clone())
+                .collect::<Vec<_>>();
+            let Some(session_map_ref) = self.session_map_fd.as_ref() else {
+                return;
+            };
+            let session_map_fd = session_map_ref.fd;
+            let now_secs = monotonic_nanos() / 1_000_000_000;
+            let current = self.ha_state.load();
+            prewarm_reverse_synced_sessions_for_owner_rgs(
+                &self.shared_sessions,
+                &self.shared_nat_sessions,
+                &self.shared_forward_wire_sessions,
+                &worker_commands,
+                session_map_fd,
+                &self.forwarding,
+                current.as_ref(),
+                &self.dynamic_neighbors,
+                &activated_rgs,
+                now_secs,
+            );
+        }
     }
 
     pub fn ha_groups(&self) -> Vec<HAGroupStatus> {
@@ -735,29 +761,81 @@ impl Coordinator {
     }
 
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let ha_state = self.ha_state.load();
+        let reverse_entry = if !entry.metadata.is_reverse
+            && owner_rg_is_locally_active(ha_state.as_ref(), entry.metadata.owner_rg_id, now_secs)
+        {
+            synthesized_synced_reverse_entry(
+                &self.forwarding,
+                ha_state.as_ref(),
+                &self.dynamic_neighbors,
+                &entry,
+                now_secs,
+            )
+        } else {
+            None
+        };
         publish_shared_session(
             &self.shared_sessions,
             &self.shared_nat_sessions,
             &self.shared_forward_wire_sessions,
             &entry,
         );
+        if let Some(reverse) = &reverse_entry {
+            publish_shared_session(
+                &self.shared_sessions,
+                &self.shared_nat_sessions,
+                &self.shared_forward_wire_sessions,
+                reverse,
+            );
+            if let Some(session_map_fd) = self.session_map_fd.as_ref() {
+                let _ = publish_live_session_entry(session_map_fd.fd, &reverse.key, reverse.decision.nat, true);
+            }
+        }
         for handle in self.workers.values() {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
+                if let Some(reverse) = &reverse_entry {
+                    pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
+                }
             }
         }
     }
 
     pub fn delete_synced_session(&self, key: SessionKey) {
+        let reverse_key = self
+            .shared_sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(&key).cloned())
+            .and_then(|entry| {
+                if entry.metadata.is_reverse {
+                    None
+                } else {
+                    Some(reverse_session_key(&entry.key, entry.decision.nat))
+                }
+            });
         remove_shared_session(
             &self.shared_sessions,
             &self.shared_nat_sessions,
             &self.shared_forward_wire_sessions,
             &key,
         );
+        if let Some(reverse_key) = &reverse_key {
+            remove_shared_session(
+                &self.shared_sessions,
+                &self.shared_nat_sessions,
+                &self.shared_forward_wire_sessions,
+                reverse_key,
+            );
+        }
         for handle in self.workers.values() {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
+                if let Some(reverse_key) = &reverse_key {
+                    pending.push_back(WorkerCommand::DeleteSynced(reverse_key.clone()));
+                }
             }
         }
     }
@@ -5800,6 +5878,22 @@ fn demoted_owner_rgs(
         .collect()
 }
 
+fn activated_owner_rgs(
+    previous: &BTreeMap<i32, HAGroupRuntime>,
+    current: &BTreeMap<i32, HAGroupRuntime>,
+) -> Vec<i32> {
+    current
+        .iter()
+        .filter_map(|(rg_id, new)| {
+            let became_active = match previous.get(rg_id) {
+                Some(old) => !old.active && new.active,
+                None => new.active,
+            };
+            became_active.then_some(*rg_id)
+        })
+        .collect()
+}
+
 /// Return the effective TCP MSS clamp value for the current config.
 /// Returns 0 if MSS clamping is disabled.
 #[allow(dead_code)]
@@ -9585,6 +9679,44 @@ mod tests {
         ]);
 
         assert_eq!(demoted_owner_rgs(&previous, &current), vec![1]);
+    }
+
+    #[test]
+    fn activated_owner_rgs_detects_inactive_to_active_transitions() {
+        let previous = BTreeMap::from([
+            (
+                1,
+                HAGroupRuntime {
+                    active: false,
+                    watchdog_timestamp: 11,
+                },
+            ),
+            (
+                2,
+                HAGroupRuntime {
+                    active: true,
+                    watchdog_timestamp: 12,
+                },
+            ),
+        ]);
+        let current = BTreeMap::from([
+            (
+                1,
+                HAGroupRuntime {
+                    active: true,
+                    watchdog_timestamp: 21,
+                },
+            ),
+            (
+                2,
+                HAGroupRuntime {
+                    active: true,
+                    watchdog_timestamp: 22,
+                },
+            ),
+        ]);
+
+        assert_eq!(activated_owner_rgs(&previous, &current), vec![1]);
     }
 
     #[test]
