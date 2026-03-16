@@ -417,12 +417,12 @@ pub(super) fn lookup_forward_nat_across_scopes(
 
 fn materialize_shared_session_hit(
     sessions: &mut SessionTable,
-    resolved: &ResolvedSessionLookup,
+    resolved: ResolvedSessionLookup,
     now_ns: u64,
     tcp_flags: u8,
 ) -> SessionLookup {
-    if let Some(shared) = resolved.shared_entry.as_ref() {
-        let replica = synced_replica_entry(shared);
+    if let Some(shared) = resolved.shared_entry {
+        let replica = synced_replica_entry(&shared);
         sessions.upsert_synced(
             replica.key.clone(),
             replica.decision,
@@ -436,7 +436,7 @@ fn materialize_shared_session_hit(
             metadata: replica.metadata,
         };
     }
-    resolved.lookup.clone()
+    resolved.lookup
 }
 
 fn build_reverse_session_from_forward_match(
@@ -529,7 +529,7 @@ fn maybe_promote_synced_session(
     forwarding: &ForwardingState,
     key: &SessionKey,
     decision: SessionDecision,
-    metadata: &SessionMetadata,
+    metadata: SessionMetadata,
     now_ns: u64,
     protocol: u8,
     tcp_flags: u8,
@@ -537,10 +537,10 @@ fn maybe_promote_synced_session(
     if !metadata.synced
         || decision.resolution.disposition != ForwardingDisposition::ForwardCandidate
     {
-        return metadata.clone();
+        return metadata;
     }
 
-    let mut promoted = metadata.clone();
+    let mut promoted = metadata;
     promoted.synced = false;
     if promoted.owner_rg_id <= 0 {
         promoted.owner_rg_id = owner_rg_for_flow(forwarding, decision.resolution.egress_ifindex);
@@ -583,10 +583,7 @@ pub(super) fn resolve_flow_session_decision(
         now_ns,
         tcp_flags,
     ) {
-        (
-            materialize_shared_session_hit(sessions, &hit, now_ns, tcp_flags),
-            false,
-        )
+        (materialize_shared_session_hit(sessions, hit, now_ns, tcp_flags), false)
     } else {
         let forward_match =
             lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)?;
@@ -631,7 +628,7 @@ pub(super) fn resolve_flow_session_decision(
         forwarding,
         &flow.forward_key,
         decision,
-        &resolved.metadata,
+        resolved.metadata,
         now_ns,
         protocol,
         tcp_flags,

@@ -68,8 +68,10 @@ pub(super) fn forward_tuple_mismatch_reason(
 
 pub(super) fn enqueue_pending_forwards(
     left: &mut [BindingWorker],
+    ingress_index: usize,
     ingress_binding: &mut BindingWorker,
     right: &mut [BindingWorker],
+    binding_lookup: &WorkerBindingLookup,
     pending_forwards: &mut Vec<PendingForwardRequest>,
     now_ns: u64,
     forwarding: &ForwardingState,
@@ -90,9 +92,11 @@ pub(super) fn enqueue_pending_forwards(
         if let Some(prebuilt) = request.prebuilt_frame {
             let Some(target_binding) = find_target_binding_mut(
                 left,
+                ingress_index,
                 ingress_binding,
                 request.ingress_queue_id,
                 right,
+                binding_lookup,
                 request.target_ifindex,
             ) else {
                 ingress_binding.pending_fill_frames.push_back(source_offset);
@@ -107,7 +111,6 @@ pub(super) fn enqueue_pending_forwards(
                 flow_key: None,
             });
             bound_pending_tx_local(target_binding);
-            bound_pending_tx_prepared(target_binding);
             dbg.enqueue_ok += 1;
             dbg.enqueue_copy += 1;
             dbg.tx_bytes_total += frame_len as u64;
@@ -130,9 +133,11 @@ pub(super) fn enqueue_pending_forwards(
         let expected_ports = request.expected_ports;
         let Some(target_binding) = find_target_binding_mut(
             left,
+            ingress_index,
             ingress_binding,
             request.ingress_queue_id,
             right,
+            binding_lookup,
             request.target_ifindex,
         ) else {
             // No XSK binding for the target interface.  Normally fabric
@@ -221,7 +226,6 @@ pub(super) fn enqueue_pending_forwards(
                         flow_key: request.flow_key.clone(),
                     });
                     bound_pending_tx_local(target_binding);
-                    bound_pending_tx_prepared(target_binding);
                     dbg.enqueue_ok += 1;
                     dbg.enqueue_copy += 1;
                     dbg.tx_bytes_total += seg_frame_len as u64;
@@ -371,7 +375,6 @@ pub(super) fn enqueue_pending_forwards(
                                     flow_key: request.flow_key.clone(),
                                 });
                                 bound_pending_tx_local(target_binding);
-                                bound_pending_tx_prepared(target_binding);
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_copy += 1;
                                 dbg.tx_bytes_total += cp1_len as u64;
@@ -550,7 +553,6 @@ pub(super) fn enqueue_pending_forwards(
                                     flow_key: request.flow_key.clone(),
                                 });
                                 bound_pending_tx_local(target_binding);
-                                bound_pending_tx_prepared(target_binding);
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_copy += 1;
                                 dbg.tx_bytes_total += cp2_len as u64;
@@ -572,7 +574,14 @@ pub(super) fn enqueue_pending_forwards(
                 let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
             }
         }
-        apply_shared_recycles(left, ingress_binding, right, &mut post_recycles);
+        apply_shared_recycles(
+            left,
+            ingress_index,
+            ingress_binding,
+            right,
+            binding_lookup,
+            &mut post_recycles,
+        );
         update_binding_debug_state(ingress_binding);
         if build_failed {
             handle_forward_build_failure(
@@ -653,22 +662,17 @@ pub(super) fn handle_forward_build_failure(
 
 pub(super) fn apply_shared_recycles(
     left: &mut [BindingWorker],
+    current_index: usize,
     current: &mut BindingWorker,
     right: &mut [BindingWorker],
+    binding_lookup: &WorkerBindingLookup,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) {
     for (slot, offset) in shared_recycles.drain(..) {
-        if current.slot == slot {
-            current.pending_fill_frames.push_back(offset);
-            update_binding_debug_state(current);
-            continue;
-        }
-        if let Some(binding) = left.iter_mut().find(|binding| binding.slot == slot) {
-            binding.pending_fill_frames.push_back(offset);
-            update_binding_debug_state(binding);
-            continue;
-        }
-        if let Some(binding) = right.iter_mut().find(|binding| binding.slot == slot) {
+        if let Some(target_index) = binding_lookup.slot_index(slot)
+            && let Some(binding) =
+                binding_by_index_mut(left, current_index, current, right, target_index)
+        {
             binding.pending_fill_frames.push_back(offset);
             update_binding_debug_state(binding);
             continue;
