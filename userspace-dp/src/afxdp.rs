@@ -14,7 +14,7 @@ use crate::screen::{
 };
 use crate::session::{
     ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
-    SessionLookup, SessionMetadata, SessionTable, forward_wire_key,
+    SessionLookup, SessionMetadata, SessionTable, forward_wire_key, reverse_canonical_key,
 };
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus};
 use arc_swap::ArcSwap;
@@ -6903,6 +6903,14 @@ fn publish_live_session_entry(
         if wire_key != *key {
             publish_live_session_key(map_fd, &wire_key)?;
         }
+        let reverse_wire = reverse_session_key(key, nat);
+        if reverse_wire != *key {
+            publish_live_session_key(map_fd, &reverse_wire)?;
+        }
+        let reverse_canonical = reverse_canonical_key(key, nat);
+        if reverse_canonical != *key && reverse_canonical != reverse_wire {
+            publish_live_session_key(map_fd, &reverse_canonical)?;
+        }
     }
     Ok(())
 }
@@ -7120,6 +7128,14 @@ fn delete_live_session_entry(map_fd: c_int, key: &SessionKey, nat: NatDecision, 
         let wire_key = forward_wire_key(key, nat);
         if wire_key != *key {
             delete_live_session_key(map_fd, &wire_key);
+        }
+        let reverse_wire = reverse_session_key(key, nat);
+        if reverse_wire != *key {
+            delete_live_session_key(map_fd, &reverse_wire);
+        }
+        let reverse_canonical = reverse_canonical_key(key, nat);
+        if reverse_canonical != *key && reverse_canonical != reverse_wire {
+            delete_live_session_key(map_fd, &reverse_canonical);
         }
     }
 }

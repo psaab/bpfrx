@@ -750,10 +750,12 @@ pub(super) fn publish_shared_session(
     if !entry.metadata.is_reverse
         && let Ok(mut sessions) = shared_nat_sessions.lock()
     {
-        sessions.insert(
-            reverse_session_key(&entry.key, entry.decision.nat),
-            entry.clone(),
-        );
+        let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
+        sessions.insert(reverse_wire.clone(), entry.clone());
+        let reverse_canonical = reverse_canonical_key(&entry.key, entry.decision.nat);
+        if reverse_canonical != reverse_wire {
+            sessions.insert(reverse_canonical, entry.clone());
+        }
     }
     if !entry.metadata.is_reverse
         && let Ok(mut sessions) = shared_forward_wire_sessions.lock()
@@ -776,7 +778,12 @@ pub(super) fn remove_shared_session(
         && !entry.metadata.is_reverse
         && let Ok(mut nat_sessions) = shared_nat_sessions.lock()
     {
-        nat_sessions.remove(&reverse_session_key(&entry.key, entry.decision.nat));
+        let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
+        nat_sessions.remove(&reverse_wire);
+        let reverse_canonical = reverse_canonical_key(&entry.key, entry.decision.nat);
+        if reverse_canonical != reverse_wire {
+            nat_sessions.remove(&reverse_canonical);
+        }
         if let Ok(mut forward_wire_sessions) = shared_forward_wire_sessions.lock() {
             let wire_key = forward_wire_key(&entry.key, entry.decision.nat);
             if wire_key != entry.key {
@@ -958,6 +965,43 @@ mod tests {
     }
 
     #[test]
+    fn lookup_forward_nat_across_scopes_returns_shared_canonical_reverse_entry() {
+        let sessions = SessionTable::new();
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        let entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision,
+            metadata: SessionMetadata {
+                synced: true,
+                ..test_metadata()
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let canonical_reply = reverse_canonical_key(&key, decision.nat);
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        shared_nat_sessions
+            .lock()
+            .expect("shared nat lock")
+            .insert(canonical_reply.clone(), entry.clone());
+
+        let hit =
+            lookup_forward_nat_across_scopes(&sessions, &shared_nat_sessions, &canonical_reply)
+                .expect("shared canonical reverse hit");
+        assert_eq!(hit.key, entry.key);
+        assert_eq!(hit.decision, entry.decision);
+        assert_eq!(hit.metadata, entry.metadata);
+    }
+
+    #[test]
     fn publish_and_remove_shared_session_tracks_forward_wire_alias() {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -1003,6 +1047,48 @@ mod tests {
             lookup_shared_forward_wire_match(&shared_forward_wire_sessions, &translated_key)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn publish_and_remove_shared_session_tracks_canonical_reverse_alias() {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        let entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision,
+            metadata: test_metadata(),
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let canonical_reply = reverse_canonical_key(&key, decision.nat);
+
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry,
+        );
+        let alias_hit = lookup_shared_forward_nat_match(&shared_nat_sessions, &canonical_reply)
+            .expect("canonical reverse alias should be published");
+        assert_eq!(alias_hit.key, key);
+
+        remove_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry.key,
+        );
+        assert!(lookup_shared_forward_nat_match(&shared_nat_sessions, &canonical_reply).is_none());
     }
 
     #[test]

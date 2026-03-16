@@ -2853,6 +2853,26 @@ func userspaceReverseKeyV4(key dataplane.SessionKey, delta dpuserspace.SessionDe
 	return rev
 }
 
+func effectiveUserspaceNATSrcPort(delta dpuserspace.SessionDeltaInfo) uint16 {
+	if delta.NATSrcPort != 0 {
+		return delta.NATSrcPort
+	}
+	if delta.NATSrcIP != "" {
+		return delta.SrcPort
+	}
+	return 0
+}
+
+func effectiveUserspaceNATDstPort(delta dpuserspace.SessionDeltaInfo) uint16 {
+	if delta.NATDstPort != 0 {
+		return delta.NATDstPort
+	}
+	if delta.NATDstIP != "" {
+		return delta.DstPort
+	}
+	return 0
+}
+
 func userspaceReverseKeyV6(key dataplane.SessionKeyV6, delta dpuserspace.SessionDeltaInfo) dataplane.SessionKeyV6 {
 	rev := dataplane.SessionKeyV6{
 		SrcIP:    key.DstIP,
@@ -2930,12 +2950,12 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	if ip := net.ParseIP(delta.NATSrcIP).To4(); ip != nil {
 		val.Flags |= dataplane.SessFlagSNAT
 		val.NATSrcIP = binary.NativeEndian.Uint32(ip)
-		val.NATSrcPort = userspaceHostToNetwork16(delta.NATSrcPort)
+		val.NATSrcPort = userspaceHostToNetwork16(effectiveUserspaceNATSrcPort(delta))
 	}
 	if ip := net.ParseIP(delta.NATDstIP).To4(); ip != nil {
 		val.Flags |= dataplane.SessFlagDNAT
 		val.NATDstIP = binary.NativeEndian.Uint32(ip)
-		val.NATDstPort = userspaceHostToNetwork16(delta.NATDstPort)
+		val.NATDstPort = userspaceHostToNetwork16(effectiveUserspaceNATDstPort(delta))
 	}
 	if delta.FabricIngress {
 		val.LogFlags |= dataplane.LogFlagUserspaceFabricIngress
@@ -2984,12 +3004,12 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	if ip := net.ParseIP(delta.NATSrcIP).To16(); ip != nil {
 		val.Flags |= dataplane.SessFlagSNAT
 		copy(val.NATSrcIP[:], ip)
-		val.NATSrcPort = userspaceHostToNetwork16(delta.NATSrcPort)
+		val.NATSrcPort = userspaceHostToNetwork16(effectiveUserspaceNATSrcPort(delta))
 	}
 	if ip := net.ParseIP(delta.NATDstIP).To16(); ip != nil {
 		val.Flags |= dataplane.SessFlagDNAT
 		copy(val.NATDstIP[:], ip)
-		val.NATDstPort = userspaceHostToNetwork16(delta.NATDstPort)
+		val.NATDstPort = userspaceHostToNetwork16(effectiveUserspaceNATDstPort(delta))
 	}
 	if delta.FabricIngress {
 		val.LogFlags |= dataplane.LogFlagUserspaceFabricIngress
