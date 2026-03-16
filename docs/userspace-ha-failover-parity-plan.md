@@ -29,8 +29,14 @@ Current status:
 - latest scripted validation result on this branch:
   - `0` zero-throughput intervals after RG1 failover
   - sender throughput: `17.4 Gbps`
-- remaining work is now parity hardening, repeated failover stress, and
-  post-move cold-connect latency, not first-fix bring-up
+- the failover validator is now being hardened for stress parity:
+  - repeated failover / failback cycles
+  - per-stream `0.00 bits/sec` checks, not just `[SUM]`
+  - minimum-duration enforcement so `iperf3` cannot finish before the cycle plan
+  - zero-port TCP session preflight checks so stale session pollution does not
+    invalidate stress results
+- remaining work is now parity hardening, repeated failover stress, fabric-link
+  throughput stability, and post-move cold-connect latency, not first-fix bring-up
 
 This is not a generic whole-node reboot problem. It is an active/active per-RG
 handoff problem where existing flows must survive a WAN RG ownership move.
@@ -269,13 +275,17 @@ Status: First Critical Gap Fixed
 
 ### Phase F: Stress Parity
 
-Status: Not Started
+Status: In Progress
 
 1. After single RG1 failover passes, add repeated failover / failback coverage.
 2. Use the legacy stress test semantics as the acceptance bar:
    - no dead streams
+   - no per-stream `0.00 bits/sec` intervals during the failover window
    - no permanent `0.00 bits/sec` intervals
    - throughput recovery after each failover window
+3. Require clean-state preflight before the stress run starts:
+   - no stale zero-port TCP sessions for the `iperf3` target
+   - no recycled old flow state hiding the current branch behavior
 
 ## Success Criteria
 
@@ -283,13 +293,21 @@ Userspace reaches parity for this problem when all of the following are true:
 
 1. a long-running `iperf3 -c 172.16.80.200 -P 4 -t 60` survives manual RG1 failover
 2. the new owner forwards the existing sessions without requiring a reconnect
-3. the dedicated userspace failover validator passes repeatably
-4. the remaining failover behavior is explained by the same rules as the eBPF dataplane
+3. repeated failover / failback stress does not collapse all streams to
+   `0.00 bits/sec`
+4. the dedicated userspace failover validator passes repeatably from a clean
+   session baseline
+5. the remaining failover behavior is explained by the same rules as the eBPF dataplane
 
 ## Immediate Next Steps
 
-1. promote the dedicated failover validator to the standard RG1 acceptance gate
-2. compare repeated failover / failback behavior against the legacy eBPF stress
-   tests and close any remaining parity gaps
-3. close the remaining post-move cold-connect latency gap so the first new
+1. rerun repeated failover / failback stress from a clean deploy so the result
+   is not contaminated by stale session state
+2. if repeated stress still fails, identify whether the new failure is:
+   - session sync corruption
+   - zero-port TCP session creation
+   - fabric-link forwarding continuity under repeated RG flips
+3. promote the dedicated failover validator to the standard RG1 acceptance gate
+   once the repeated-cycle stress case passes
+4. close the remaining post-move cold-connect latency gap so the first new
    connection after RG ownership change does not need a warm-up round

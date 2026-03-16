@@ -8,15 +8,27 @@ RG="${RG:-1}"
 SOURCE_NODE="${SOURCE_NODE:-0}"
 TARGET_NODE="${TARGET_NODE:-1}"
 IPERF_TARGET="${IPERF_TARGET:-172.16.80.200}"
-IPERF_DURATION="${IPERF_DURATION:-60}"
+TOTAL_CYCLES="${TOTAL_CYCLES:-1}"
+CYCLE_INTERVAL="${CYCLE_INTERVAL:-10}"
+if [[ -z "${IPERF_DURATION:-}" ]]; then
+	if (( TOTAL_CYCLES > 1 )); then
+		IPERF_DURATION="$(( TOTAL_CYCLES * CYCLE_INTERVAL * 2 + 30 ))"
+	else
+		IPERF_DURATION=60
+	fi
+else
+	IPERF_DURATION="${IPERF_DURATION}"
+fi
 IPERF_STREAMS="${IPERF_STREAMS:-4}"
 SYNC_WAIT="${SYNC_WAIT:-5}"
 FAILOVER_WAIT="${FAILOVER_WAIT:-30}"
 MIN_SESSIONS="${MIN_SESSIONS:-4}"
 MIN_THROUGHPUT="${MIN_THROUGHPUT:-1.0}"
 MAX_ZERO_INTERVALS="${MAX_ZERO_INTERVALS:-2}"
+MAX_STREAM_ZERO_INTERVALS="${MAX_STREAM_ZERO_INTERVALS:-0}"
 POST_FAILOVER_OBSERVE="${POST_FAILOVER_OBSERVE:-10}"
 RESTORE_SOURCE_NODE="${RESTORE_SOURCE_NODE:-1}"
+ALLOW_STALE_SESSIONS="${ALLOW_STALE_SESSIONS:-0}"
 DEPLOY=0
 
 while [[ $# -gt 0 ]]; do
@@ -29,6 +41,8 @@ while [[ $# -gt 0 ]]; do
 	--target) IPERF_TARGET="$2"; shift ;;
 	--duration) IPERF_DURATION="$2"; shift ;;
 	--parallel) IPERF_STREAMS="$2"; shift ;;
+	--cycles) TOTAL_CYCLES="$2"; shift ;;
+	--interval) CYCLE_INTERVAL="$2"; shift ;;
 	--sync-wait) SYNC_WAIT="$2"; shift ;;
 	--failover-wait) FAILOVER_WAIT="$2"; shift ;;
 	*)
@@ -54,6 +68,16 @@ info() { printf '==> %s\n' "$*"; }
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*" >&2; FAILED=1; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+required_iperf_duration() {
+	local cycles="$1"
+	local interval="$2"
+	if (( cycles > 1 )); then
+		printf '%s\n' "$(( cycles * interval * 2 + cycles * 10 + SYNC_WAIT + 20 ))"
+	else
+		printf '%s\n' "$(( POST_FAILOVER_OBSERVE + SYNC_WAIT + 10 ))"
+	fi
+}
 
 run_host() {
 	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "$1")"
@@ -191,6 +215,35 @@ capture_vm_state() {
 	run_vm "$vm" "cli -c \"show security flow session destination-prefix ${IPERF_TARGET}\"" >"${ARTIFACT_DIR}/${label}-sessions.txt" 2>&1 || true
 }
 
+capture_cycle_state() {
+	local cycle="$1"
+	local phase="$2"
+	capture_vm_state "$FW0" "cycle${cycle}-${phase}-fw0"
+	capture_vm_state "$FW1" "cycle${cycle}-${phase}-fw1"
+}
+
+zero_port_tcp_sessions() {
+	local vm="$1"
+	run_vm "$vm" "cli -c \"show security flow session destination-prefix ${IPERF_TARGET}\" 2>/dev/null | grep -Ec '^[[:space:]]+(In|Out): .*\\/0;tcp' || true"
+}
+
+validate_clean_session_baseline() {
+	local source_zero target_zero
+	source_zero="$(zero_port_tcp_sessions "$SOURCE_VM")"
+	target_zero="$(zero_port_tcp_sessions "$TARGET_VM")"
+	if [[ "$source_zero" -gt 0 || "$target_zero" -gt 0 ]]; then
+		capture_vm_state "$SOURCE_VM" "preflight-source"
+		capture_vm_state "$TARGET_VM" "preflight-target"
+		if [[ "$ALLOW_STALE_SESSIONS" == "1" ]]; then
+			fail "preflight: stale zero-port TCP sessions present (source=${source_zero} target=${target_zero})"
+		else
+			die "preflight: stale zero-port TCP sessions present (source=${source_zero} target=${target_zero}); redeploy or clear flow state before stress testing"
+		fi
+	else
+		pass "preflight: no stale zero-port TCP sessions on source or target owner"
+	fi
+}
+
 session_count() {
 	local vm="$1"
 	run_vm "$vm" "cli -c \"show security flow session destination-prefix ${IPERF_TARGET}\" 2>/dev/null | grep -c 'Session State: Valid' || true"
@@ -228,6 +281,11 @@ start_iperf() {
 	return 1
 }
 
+recent_dead_streams() {
+	local tail_lines=$(( IPERF_STREAMS * 2 + 8 ))
+	run_host "tail -n ${tail_lines} ${REMOTE_IPERF_LOG} 2>/dev/null | grep -E '^\[[[:space:]]*[0-9]+\]' | tail -n ${IPERF_STREAMS} | grep -c '0.00 bits/sec' || true"
+}
+
 iperf_alive() {
 	run_host "pgrep -x iperf3 >/dev/null"
 }
@@ -257,6 +315,30 @@ count_zero_intervals() {
 	grep -E '^\[  [0-9]|^\[ [0-9][0-9]|\[SUM\]' "${ARTIFACT_DIR}/iperf3.log" 2>/dev/null | grep -c '0.00 bits/sec' || true
 }
 
+count_stream_zero_intervals() {
+	grep -E '^\[[[:space:]]*[0-9]+\]' "${ARTIFACT_DIR}/iperf3.log" 2>/dev/null | grep -c '0.00 bits/sec' || true
+}
+
+count_zero_streams() {
+	python3 - <<'PY' "${ARTIFACT_DIR}/iperf3.log"
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    print(0)
+    raise SystemExit(0)
+
+zero_streams = set()
+for line in path.read_text().splitlines():
+    m = re.match(r'^\[\s*(\d+)\]', line)
+    if m and "0.00 bits/sec" in line:
+        zero_streams.add(m.group(1))
+print(len(zero_streams))
+PY
+}
+
 extract_sender_throughput() {
 	local line
 	line="$(grep '\[SUM\].*sender' "${ARTIFACT_DIR}/iperf3.log" 2>/dev/null | tail -1 || true)"
@@ -269,6 +351,83 @@ extract_sender_throughput() {
 		return 0
 	fi
 	printf '0\n'
+}
+
+cycle_sleep() {
+	local seconds="$1"
+	local remaining="$seconds"
+	while (( remaining > 0 )); do
+		if ! iperf_alive && ! iperf_completed; then
+			return 1
+		fi
+		sleep 1
+		remaining=$((remaining - 1))
+	done
+	return 0
+}
+
+validate_cycle_health() {
+	local cycle="$1"
+	local label="$2"
+	local owner_vm="$3"
+	local owner_name="$4"
+	local final_phase="$5"
+	local count dead_streams zero_source zero_target
+	if iperf_alive; then
+		pass "cycle ${cycle} ${label}: iperf3 alive on ${owner_name}"
+	elif iperf_completed; then
+		if [[ "$final_phase" == "1" ]]; then
+			pass "cycle ${cycle} ${label}: iperf3 completed during final phase"
+		else
+			fail "cycle ${cycle} ${label}: iperf3 completed before all failover phases finished"
+		fi
+	else
+		fail "cycle ${cycle} ${label}: iperf3 died"
+	fi
+	count="$(session_count "$owner_vm")"
+	if [[ "$count" -lt "$MIN_SESSIONS" ]]; then
+		fail "cycle ${cycle} ${label}: ${owner_name} has only ${count} sessions (expected >= ${MIN_SESSIONS})"
+	else
+		pass "cycle ${cycle} ${label}: ${owner_name} has ${count} sessions"
+	fi
+	dead_streams="$(recent_dead_streams)"
+	if [[ "$dead_streams" -gt 0 ]]; then
+		fail "cycle ${cycle} ${label}: ${dead_streams}/${IPERF_STREAMS} streams at 0.00 bits/sec"
+	else
+		pass "cycle ${cycle} ${label}: all ${IPERF_STREAMS} streams carrying traffic"
+	fi
+	zero_source="$(zero_port_tcp_sessions "$FW0")"
+	zero_target="$(zero_port_tcp_sessions "$FW1")"
+	if [[ "$zero_source" -gt 0 || "$zero_target" -gt 0 ]]; then
+		fail "cycle ${cycle} ${label}: zero-port TCP sessions present (fw0=${zero_source} fw1=${zero_target})"
+	else
+		pass "cycle ${cycle} ${label}: no zero-port TCP sessions present"
+	fi
+}
+
+run_failover_phase() {
+	local cycle="$1"
+	local from_node="$2"
+	local to_node="$3"
+	local phase="$4"
+	local final_phase="$5"
+	local from_vm to_vm to_name
+	from_vm="$(vm_for_node "$from_node")"
+	to_vm="$(vm_for_node "$to_node")"
+	to_name="$(node_name "$to_node")"
+
+	info "cycle ${cycle}: ${phase} RG${RG} to ${to_name}"
+	run_vm "$from_vm" "cli -c \"request chassis cluster failover redundancy-group ${RG} node ${to_node}\" >/tmp/userspace-rg${RG}-${phase}-cycle${cycle}.out"
+	wait_for_rg_owner "$RG" "$to_node" "$FAILOVER_WAIT" || die "RG${RG} did not move to ${to_name} during cycle ${cycle} ${phase}"
+	pass "cycle ${cycle} ${phase}: RG${RG} moved to ${to_name}"
+	ACTIVE_FW="$(wait_for_userspace_rg_owner "$RG")" || die "userspace forwarding did not settle on ${to_name} during cycle ${cycle} ${phase}"
+	pass "cycle ${cycle} ${phase}: userspace forwarding active on ${ACTIVE_FW}"
+	capture_cycle_state "$cycle" "$phase"
+	if ! cycle_sleep "$CYCLE_INTERVAL"; then
+		fail "cycle ${cycle} ${phase}: iperf3 exited before ${CYCLE_INTERVAL}s interval elapsed"
+	fi
+	capture_cycle_state "$cycle" "${phase}-post"
+	validate_cycle_health "$cycle" "$phase" "$to_vm" "$to_name" "$final_phase"
 }
 
 restore_cluster() {
@@ -293,6 +452,11 @@ trap cleanup EXIT
 
 mkdir -p "${ARTIFACT_DIR}"
 
+min_duration="$(required_iperf_duration "$TOTAL_CYCLES" "$CYCLE_INTERVAL")"
+if (( IPERF_DURATION < min_duration )); then
+	die "iperf duration ${IPERF_DURATION}s too short for ${TOTAL_CYCLES} cycle(s); need at least ${min_duration}s"
+fi
+
 if [[ $DEPLOY -eq 1 ]]; then
 	info "deploying isolated userspace cluster from ${ENV_FILE}"
 	BPFRX_CLUSTER_ENV="$ENV_FILE" "${PROJECT_ROOT}/test/incus/cluster-setup.sh" deploy all
@@ -310,6 +474,7 @@ validate_target_reachability || die "cluster host cannot reach ${IPERF_TARGET}"
 
 SOURCE_VM="$(vm_for_node "$SOURCE_NODE")"
 TARGET_VM="$(vm_for_node "$TARGET_NODE")"
+validate_clean_session_baseline
 capture_vm_state "$SOURCE_VM" "before-source"
 capture_vm_state "$TARGET_VM" "before-target"
 
@@ -334,31 +499,42 @@ else
 	pass "target owner has ${target_count} synced sessions"
 fi
 
-info "triggering manual RG${RG} failover to $(node_name "$TARGET_NODE")"
-run_vm "$SOURCE_VM" "cli -c \"request chassis cluster failover redundancy-group ${RG} node ${TARGET_NODE}\" >/tmp/userspace-rg${RG}-failover.out"
-wait_for_rg_owner "$RG" "$TARGET_NODE" "$FAILOVER_WAIT" || die "RG${RG} did not move to $(node_name "$TARGET_NODE") after failover"
-pass "RG${RG} moved to $(node_name "$TARGET_NODE")"
-
-ACTIVE_FW="$(wait_for_userspace_rg_owner "$RG")" || die "userspace forwarding did not settle on the new RG${RG} owner"
-pass "userspace forwarding active on new owner ${ACTIVE_FW}"
-
-capture_vm_state "$SOURCE_VM" "after-source"
-capture_vm_state "$TARGET_VM" "after-target"
-
-if iperf_alive; then
-	pass "iperf3 survived immediate failover"
+if (( TOTAL_CYCLES == 1 )); then
+	run_failover_phase 1 "$SOURCE_NODE" "$TARGET_NODE" "failover" 1
 else
-	fail "iperf3 died immediately after failover"
+	run_failover_phase 1 "$SOURCE_NODE" "$TARGET_NODE" "failover" 0
 fi
 
-info "observing post-failover traffic for ${POST_FAILOVER_OBSERVE}s"
-sleep "${POST_FAILOVER_OBSERVE}"
-if iperf_alive; then
-	pass "iperf3 still alive after post-failover observe window"
-elif iperf_completed; then
-	pass "iperf3 completed during post-failover observe window"
+if (( TOTAL_CYCLES == 1 )); then
+	capture_vm_state "$SOURCE_VM" "after-source"
+	capture_vm_state "$TARGET_VM" "after-target"
+
+	if iperf_alive; then
+		pass "iperf3 survived immediate failover"
+	else
+		fail "iperf3 died immediately after failover"
+	fi
+
+	info "observing post-failover traffic for ${POST_FAILOVER_OBSERVE}s"
+	sleep "${POST_FAILOVER_OBSERVE}"
+	if iperf_alive; then
+		pass "iperf3 still alive after post-failover observe window"
+	elif iperf_completed; then
+		pass "iperf3 completed during post-failover observe window"
+	else
+		fail "iperf3 died during post-failover observe window"
+	fi
 else
-	fail "iperf3 died during post-failover observe window"
+	for (( cycle = 1; cycle <= TOTAL_CYCLES; cycle++ )); do
+		if (( cycle > 1 )); then
+			run_failover_phase "$cycle" "$SOURCE_NODE" "$TARGET_NODE" "failover" 0
+		fi
+		final_phase=0
+		if (( cycle == TOTAL_CYCLES )); then
+			final_phase=1
+		fi
+		run_failover_phase "$cycle" "$TARGET_NODE" "$SOURCE_NODE" "failback" "$final_phase"
+	done
 fi
 
 wait_for_iperf_finish || true
@@ -369,6 +545,14 @@ if [[ "$zero_intervals" -le "$MAX_ZERO_INTERVALS" ]]; then
 	pass "${zero_intervals} zero-throughput intervals (<= ${MAX_ZERO_INTERVALS})"
 else
 	fail "${zero_intervals} zero-throughput intervals (> ${MAX_ZERO_INTERVALS})"
+fi
+
+stream_zero_intervals="$(count_stream_zero_intervals)"
+zero_streams="$(count_zero_streams)"
+if [[ "$stream_zero_intervals" -le "$MAX_STREAM_ZERO_INTERVALS" ]]; then
+	pass "${stream_zero_intervals} per-stream zero-throughput intervals (<= ${MAX_STREAM_ZERO_INTERVALS})"
+else
+	fail "${stream_zero_intervals} per-stream zero-throughput intervals across ${zero_streams} stream(s) (> ${MAX_STREAM_ZERO_INTERVALS})"
 fi
 
 throughput="$(extract_sender_throughput)"
