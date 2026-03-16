@@ -243,7 +243,6 @@ pub(super) fn drain_pending_tx(
     if !retry.is_empty() {
         restore_pending_tx_requests(binding, retry);
     }
-    bound_pending_tx_prepared(binding);
     update_binding_debug_state(binding);
     did_work
         || !binding.pending_tx_prepared.is_empty()
@@ -319,6 +318,15 @@ fn recycle_completed_tx_offset(
 
 fn recycle_prepared_immediately(binding: &mut BindingWorker, req: &PreparedTxRequest) {
     recycle_cancelled_prepared(binding, req);
+}
+
+fn remember_prepared_recycle(
+    in_flight_prepared_recycles: &mut FastMap<u64, PreparedTxRecycle>,
+    req: &PreparedTxRequest,
+) {
+    if let PreparedTxRecycle::FillOnSlot(_) = req.recycle {
+        in_flight_prepared_recycles.insert(req.offset, req.recycle);
+    }
 }
 
 pub(super) fn transmit_batch(
@@ -588,9 +596,7 @@ pub(super) fn transmit_prepared_batch(
     let mut retry_tail = Vec::new();
     for (idx, req) in binding.scratch_prepared_tx.drain(..).enumerate() {
         if idx < inserted as usize {
-            binding
-                .in_flight_prepared_recycles
-                .insert(req.offset, req.recycle);
+            remember_prepared_recycle(&mut binding.in_flight_prepared_recycles, &req);
             sent_packets += 1;
             sent_bytes += req.len as u64;
         } else {
@@ -732,5 +738,42 @@ mod tests {
 
         assert_eq!(free_tx_frames, VecDeque::from(vec![41]));
         assert_eq!(shared_recycles, vec![(7, 42)]);
+    }
+
+    #[test]
+    fn remember_prepared_recycle_tracks_only_shared_fill_recycles() {
+        let mut in_flight_prepared_recycles = FastMap::default();
+
+        remember_prepared_recycle(
+            &mut in_flight_prepared_recycles,
+            &PreparedTxRequest {
+                offset: 41,
+                len: 64,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+            },
+        );
+        remember_prepared_recycle(
+            &mut in_flight_prepared_recycles,
+            &PreparedTxRequest {
+                offset: 42,
+                len: 64,
+                recycle: PreparedTxRecycle::FillOnSlot(7),
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+            },
+        );
+
+        assert_eq!(in_flight_prepared_recycles.len(), 1);
+        assert_eq!(
+            in_flight_prepared_recycles.get(&42),
+            Some(&PreparedTxRecycle::FillOnSlot(7))
+        );
+        assert!(!in_flight_prepared_recycles.contains_key(&41));
     }
 }

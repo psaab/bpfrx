@@ -111,7 +111,6 @@ pub(super) fn enqueue_pending_forwards(
                 flow_key: None,
             });
             bound_pending_tx_local(target_binding);
-            bound_pending_tx_prepared(target_binding);
             dbg.enqueue_ok += 1;
             dbg.enqueue_copy += 1;
             dbg.tx_bytes_total += frame_len as u64;
@@ -227,7 +226,6 @@ pub(super) fn enqueue_pending_forwards(
                         flow_key: request.flow_key.clone(),
                     });
                     bound_pending_tx_local(target_binding);
-                    bound_pending_tx_prepared(target_binding);
                     dbg.enqueue_ok += 1;
                     dbg.enqueue_copy += 1;
                     dbg.tx_bytes_total += seg_frame_len as u64;
@@ -377,7 +375,6 @@ pub(super) fn enqueue_pending_forwards(
                                     flow_key: request.flow_key.clone(),
                                 });
                                 bound_pending_tx_local(target_binding);
-                                bound_pending_tx_prepared(target_binding);
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_copy += 1;
                                 dbg.tx_bytes_total += cp1_len as u64;
@@ -556,7 +553,6 @@ pub(super) fn enqueue_pending_forwards(
                                     flow_key: request.flow_key.clone(),
                                 });
                                 bound_pending_tx_local(target_binding);
-                                bound_pending_tx_prepared(target_binding);
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_copy += 1;
                                 dbg.tx_bytes_total += cp2_len as u64;

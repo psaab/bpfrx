@@ -18,12 +18,12 @@ Related documents:
 Current execution state as of 2026-03-15:
 
 1. Phase 1 is complete and merged on `master` via PR `#222`.
-2. Phase 2 is complete and merged on `master` via PR `#225`.
+2. Phase 2 is complete and merged on `master` via PRs `#223` and `#225`.
 3. Phase 3 is complete and merged on `master` via PR `#228`.
 4. Phase 4 is complete and merged on `master` via PR `#229`.
-5. Phase 5 is complete and merged on `master` via PR `#231` plus the earlier
-   traceroute / harness PRs `#221` and `#230`.
-6. Phase 6 is now in progress on the current branch.
+5. Phase 5 is complete and merged on `master` via PRs `#221`, `#230`, and
+   `#231`.
+6. Phase 6 is in progress on branch `fix/userspace-phase6-performance`.
 
 Latest status-sync update for this document:
 
@@ -75,7 +75,10 @@ Still left to do at a high level:
 
 1. Continue sustained-throughput optimization work in Phase 6 on top of the
    cleaned dataplane surface.
-2. Merge the measured Phase 6 slices once the branch state is packaged cleanly.
+2. Convert the currently kept Phase 6 micro-optimizations into a clean PR and
+   keep the rejected experiments out of the branch history.
+3. Tighten measurement discipline before landing more hot-path changes because
+   the lab currently shows meaningful run-to-run throughput variance.
 
 ## Current Baseline
 
@@ -158,7 +161,7 @@ runtime" problems.
 
 ## Phase 2: Split `afxdp.rs` Into Real Submodules
 
-Status: Complete On Branch, Pending Merge
+Status: Complete And Merged
 
 Completed:
 
@@ -197,10 +200,11 @@ Live findings already established for this extraction area:
    strategy selection after live validation showed the direct UMEM-owner
    auto-mode path was the correct contract for this environment.
 
-Delivered so far in:
+Delivered in:
 
 1. PR `#223`
-2. Commits already on that branch:
+2. PR `#225`
+3. Commits across those branches:
    - `e4453a7` `userspace: start phase2 icmp helper extraction`
    - `cf587cd` `userspace: retry neighbor refresh after probe`
    - `19bc561` `userspace: extract embedded icmp helpers`
@@ -410,7 +414,7 @@ Phase 4 result:
 
 ## Phase 5: Validation And Regression Hardening
 
-Status: Complete On Current Branch, Ready For PR
+Status: Complete And Merged
 
 Completed so far:
 
@@ -420,22 +424,22 @@ Completed so far:
    to `2607:f8b0:4005:814::200e`.
 3. Sustained-throughput collapse detection was already added before this plan
    and remains part of the normal workflow.
-4. On the current branch, the shell harness now accepts TTL / hop-limit probe
+4. The shell harness now accepts TTL / hop-limit probe
    exit status `1` when the captured output contains the expected native
    time-exceeded response.
-5. On the current branch, `iperf3 -J` output is now analyzed on the repo host
+5. `iperf3 -J` output is now analyzed on the repo host
    instead of assuming `python3` exists on `cluster-userspace-host`.
-6. On the current branch, direct regression coverage was added for:
+6. Direct regression coverage was added for:
    - non-error ICMP packets not triggering embedded NAT reversal
    - slow-path fallback no-op behavior for forward-candidate traffic
    - slow-path extract-failure accounting
    - slow-path unavailable accounting
-7. On the current branch, tuple-authority regression coverage now also checks:
+7. Tuple-authority regression coverage now also checks:
    - metadata tuple preference when the flow tuple is absent
    - live-frame fallback when metadata ports are missing
-8. On the current branch, embedded ICMP NAT reversal now has direct regression
+8. Embedded ICMP NAT reversal now has direct regression
    coverage for shared-NAT-session lookup across worker scopes.
-9. On the current branch, the exact `enqueue_pending_forwards` build-failure
+9. The exact `enqueue_pending_forwards` build-failure
    path is now covered through the extracted `handle_forward_build_failure(...)`
    helper, including:
    - `forward_build_failed`
@@ -448,8 +452,8 @@ Delivered in:
 2. PR `#230`
 3. Commit:
    - `4a5006f` `test: add traceroute checks to userspace validation`
-4. Current branch commit(s) complete the remaining direct regression coverage
-   for tuple authority, embedded ICMP shared-NAT lookup, and the
+4. PR `#231` completes the remaining direct regression coverage for tuple
+   authority, embedded ICMP shared-NAT lookup, and the
    `enqueue_pending_forwards` build-failure fallback path.
 
 Still left:
@@ -492,7 +496,7 @@ Move current manual failure discovery into repeatable test coverage.
 
 Phase 5 result:
 
-1. Achieved on the current branch.
+1. Achieved and merged on `master`.
 2. Traceroute, throughput-cliff detection, tuple-authority regressions,
    embedded ICMP shared-scope lookup, and AF_XDP forward-build failure fallback
    now all have direct automated coverage.
@@ -504,35 +508,59 @@ Status: In Progress
 
 Current measured state on the Phase 6 branch:
 
-1. A fresh live baseline was captured on the cleaned Phase 1-5 dataplane:
-   - initial `userspace-perf-compare` baseline before Phase 6 tuning:
-     - IPv4 about `21.48 Gbps`
-     - IPv6 about `19.95 Gbps`
-2. The first Phase 6 slice added worker-local binding lookup indices so the
-   hot forward/recycle path stops linearly scanning bindings by ifindex/slot.
-3. The second Phase 6 slice compiled AF_XDP ring diagnostic snapshots out of
-   the normal release path, keeping them only under `debug-log`.
-4. The third Phase 6 slice removed avoidable cloning from the common
-   session-hit path in `session_glue`.
-5. Live validation on the current Phase 6 branch shows the userspace dataplane
+1. The current kept Phase 6 slice is intentionally small:
+   - `userspace-dp/src/afxdp/tx.rs`
+     - only `PreparedTxRecycle::FillOnSlot(_)` is tracked in
+       `in_flight_prepared_recycles`
+     - the redundant final `bound_pending_tx_prepared(binding)` in
+       `drain_pending_tx(...)` was removed
+   - `userspace-dp/src/afxdp/frame.rs`
+     - redundant `bound_pending_tx_prepared(target_binding)` calls were removed
+       from pure local-copy enqueue paths in `enqueue_pending_forwards(...)`
+2. Larger Phase 6 experiments were tested live and rejected because they did
+   not hold throughput:
+   - target-binding cache in `enqueue_pending_forwards(...)`
+   - `apply_nat_ipv6` fast-path experiment
+   - TCP/UDP no-op removal around `restore_l4_tuple_from_meta(...)`
+   - idle-binding poll thinning
+   - borrowed `BindingIdentity` fast-path refactor
+   - larger RX-batch polling
+3. Live validation on the current Phase 6 branch shows the userspace dataplane
    still passes the correctness gate:
    - IPv4 TTL probe: pass
    - IPv6 TTL probe: pass
    - IPv4 `mtr`: pass
    - IPv6 `mtr`: pass
-6. Recent live validation throughput on the Phase 6 branch:
-   - IPv4 about `19.55 Gbps`
-   - IPv6 about `18.97 Gbps`
+4. Direct repeated `iperf3` runs on the current kept slice are steady within
+   each run but variable across runs:
+   - IPv4 about `18.10` to `22.13 Gbps`
+   - IPv6 about `16.19` to `20.43 Gbps`
+5. The latest paired `userspace-perf-compare.sh` run on the same slice was:
+   - IPv4 about `17.81 Gbps`
+   - IPv6 about `17.68 Gbps`
+   - both families were internally steady rather than collapsing after
+     startup
+6. Helper counters on the active node during that paired perf run confirm that
+   traffic is traversing userspace without starvation symptoms:
+   - `24/24` bindings bound and ready
+   - `TX errors: 0`
+   - `Neighbor misses: 0` during the measured interval
+   - about `25.5M` forwarded packets and `37.39 GB` transmitted in the sample
 7. Current hot symbols after these slices still point to the same remaining
    work:
    - `bpfrx_userspace_dp::afxdp::poll_binding`
    - `bpfrx_userspace_dp::afxdp::frame::enqueue_pending_forwards`
+   - `bpfrx_userspace_dp::afxdp::frame::build_forwarded_frame_into_from_frame`
    - `bpfrx_userspace_dp::afxdp::frame::apply_nat_ipv6`
-8. The session-resolution slice materially reduced the common session-hit cost
-   in `perf`:
-   - IPv4 `resolve_flow_session_decision` dropped from roughly `4.15%` to
-     about `2.43%`
-   - IPv6 `resolve_flow_session_decision` dropped to about `3.41%`
+8. The earlier session-resolution cleanup is holding:
+   - IPv4 `resolve_flow_session_decision` is now around `2.38%`
+   - IPv6 `resolve_flow_session_decision` is now around `3.46%`
+9. The remaining Phase 6 problem is measurement-quality optimization work, not
+   correctness:
+   - there is no current evidence of AF_XDP starvation, queue collapse, or
+     traceroute regression on the kept slice
+   - there is clear run-to-run throughput variance, so only large measured wins
+     should be kept
 
 ### Purpose
 
@@ -561,10 +589,13 @@ have been stabilized.
 ### Exit Criteria
 
 1. Sustained throughput remains high after startup rather than collapsing.
-2. Performance improvements are measured by the standard userspace workflow.
+2. Performance improvements are measured by the standard userspace workflow and
+   by repeated direct `iperf3` runs so run-to-run variance is visible.
 3. Optimization changes land on top of a clearer, smaller fast-path surface.
 4. The remaining hot symbols on the live branch are explained and intentionally
    targeted rather than guessed at.
+5. The kept Phase 6 branch contains only measured wins; rejected experiments do
+   not remain mixed into the branch.
 
 ## Recommended Execution Order
 
@@ -596,4 +627,7 @@ This order is deliberate.
 3. Continue Phase 6 on the measured remaining costs:
    - `poll_binding`
    - `enqueue_pending_forwards`
+   - `build_forwarded_frame_into_from_frame`
    - `apply_nat_ipv6`
+4. Keep release-build warning debt in non-hot subsystems visible while Phase 6
+   work continues so new perf changes do not disappear into unrelated noise.
