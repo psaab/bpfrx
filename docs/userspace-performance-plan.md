@@ -109,7 +109,7 @@ Exit criteria:
 
 ### Phase 3: Poll Loop Fixed-Cost Reduction
 
-Status: Pending
+Status: In progress
 
 Purpose:
 - reduce `poll_binding` cost without reintroducing stalls or failover lag
@@ -118,6 +118,18 @@ Focus areas:
 1. RX wake policy only when there is evidence it is profitable
 2. reduce idle binding work without skipping real traffic
 3. keep `RingRx::available()` from becoming the dominant empty-poll tax
+
+Current measured slice:
+1. `cf3878c` batches binding live-counter flushes once per poll instead of once
+   per received batch
+2. a clean manual IPv4 transit run after deploy stayed steady at about
+   `18.7 Gbps`
+3. matched perf on active `fw0` showed:
+   - `poll_binding` about `16.47%`
+   - `__memmove_evex_unaligned_erms` about `16.85%`
+   - `enqueue_pending_forwards` about `5.07%`
+4. this is a valid keep, but it is not the main win; the direct-path copy is
+   still the largest remaining single cost
 
 Non-goal:
 1. no more blind wake-throttling or idle-thinning experiments
