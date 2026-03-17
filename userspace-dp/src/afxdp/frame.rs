@@ -1666,7 +1666,7 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
             )
         };
     let eth_len = if vlan_id > 0 { 18 } else { 14 };
-    let ether_type: u16 = match meta.addr_family as i32 {
+    let ether_type = match meta.addr_family as i32 {
         libc::AF_INET => 0x0800,
         libc::AF_INET6 => 0x86dd,
         _ => return None,
@@ -1836,34 +1836,28 @@ pub(super) fn build_forwarded_frame_into_from_frame(
             )
         };
     let eth_len = if vlan_id > 0 { 18 } else { 14 };
-    let ether_type: u16 = match meta.addr_family as i32 {
+    let ether_type = match meta.addr_family as i32 {
         libc::AF_INET => 0x0800,
         libc::AF_INET6 => 0x86dd,
         _ => return None,
     };
-    let payload_len = payload.len();
-    let frame_len = eth_len + payload_len;
+    let frame_len = eth_len + payload.len();
     if frame_len > out.len() {
         return None;
     }
+    write_eth_header_slice(
+        out.get_mut(..eth_len)?,
+        dst_mac,
+        src_mac,
+        vlan_id,
+        ether_type,
+    )?;
+    let payload_out = out.get_mut(eth_len..frame_len)?;
+    // Source and destination are distinct buffers on the direct-build path.
+    // Use an explicit non-overlapping copy so the hot path does not route
+    // through memmove semantics.
     unsafe {
-        let out_ptr = out.as_mut_ptr();
-        let ether_type_bytes = ether_type.to_be_bytes();
-        core::ptr::copy_nonoverlapping(dst_mac.as_ptr(), out_ptr, 6);
-        core::ptr::copy_nonoverlapping(src_mac.as_ptr(), out_ptr.add(6), 6);
-        if vlan_id > 0 {
-            core::ptr::copy_nonoverlapping(0x8100u16.to_be_bytes().as_ptr(), out_ptr.add(12), 2);
-            core::ptr::copy_nonoverlapping(
-                (vlan_id & 0x0fff).to_be_bytes().as_ptr(),
-                out_ptr.add(14),
-                2,
-            );
-            core::ptr::copy_nonoverlapping(ether_type_bytes.as_ptr(), out_ptr.add(16), 2);
-        } else {
-            core::ptr::copy_nonoverlapping(ether_type_bytes.as_ptr(), out_ptr.add(12), 2);
-        }
-        // Source and destination are distinct buffers on the direct-build path.
-        core::ptr::copy_nonoverlapping(payload.as_ptr(), out_ptr.add(eth_len), payload_len);
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), payload_out.as_mut_ptr(), payload.len());
     }
     let out = &mut out[..frame_len];
     let ip_start = eth_len;
