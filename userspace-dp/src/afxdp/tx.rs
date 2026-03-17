@@ -12,17 +12,22 @@ pub(super) fn reap_tx_completions(
         return 0;
     }
     let mut reaped = 0u32;
-    let mut completed_offsets = Vec::with_capacity(available as usize);
+    binding.scratch_tx_completions.clear();
+    binding
+        .scratch_tx_completions
+        .reserve(available as usize);
     let mut completed = binding.device.complete(available);
     while let Some(offset) = completed.read() {
-        completed_offsets.push(offset);
+        binding.scratch_tx_completions.push(offset);
         reaped += 1;
     }
     completed.release();
     drop(completed);
-    for offset in completed_offsets {
+    let mut completed_offsets = core::mem::take(&mut binding.scratch_tx_completions);
+    for offset in completed_offsets.drain(..) {
         recycle_completed_tx_offset(binding, shared_recycles, offset);
     }
+    binding.scratch_tx_completions = completed_offsets;
     binding.outstanding_tx = binding.outstanding_tx.saturating_sub(reaped);
     binding.dbg_completions_reaped += reaped as u64;
     binding
