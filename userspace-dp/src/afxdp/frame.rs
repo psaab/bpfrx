@@ -90,13 +90,14 @@ pub(super) fn enqueue_pending_forwards(
         // Fast path: prebuilt frame (e.g. ICMP error NAT reversal).
         // The frame is already fully rewritten — just enqueue for TX.
         if let Some(prebuilt) = request.prebuilt_frame {
-            let Some(target_binding) = find_target_binding_mut(
+            let Some(target_binding) = resolve_pending_forward_target_binding(
                 left,
                 ingress_index,
                 ingress_binding,
                 request.ingress_queue_id,
                 right,
                 binding_lookup,
+                request.target_binding_index,
                 request.target_ifindex,
             ) else {
                 ingress_binding.pending_fill_frames.push_back(source_offset);
@@ -132,13 +133,14 @@ pub(super) fn enqueue_pending_forwards(
             continue;
         };
         let expected_ports = request.expected_ports;
-        let Some(target_binding) = find_target_binding_mut(
+        let Some(target_binding) = resolve_pending_forward_target_binding(
             left,
             ingress_index,
             ingress_binding,
             request.ingress_queue_id,
             right,
             binding_lookup,
+            request.target_binding_index,
             request.target_ifindex,
         ) else {
             // No XSK binding for the target interface.  Normally fabric
@@ -628,6 +630,30 @@ pub(super) fn enqueue_pending_forwards(
         }
         update_binding_debug_state(ingress_binding);
     }
+}
+
+fn resolve_pending_forward_target_binding<'a>(
+    left: &'a mut [BindingWorker],
+    ingress_index: usize,
+    ingress_binding: &'a mut BindingWorker,
+    ingress_queue_id: u32,
+    right: &'a mut [BindingWorker],
+    binding_lookup: &WorkerBindingLookup,
+    target_binding_index: Option<usize>,
+    target_ifindex: i32,
+) -> Option<&'a mut BindingWorker> {
+    if let Some(target_index) = target_binding_index {
+        return binding_by_index_mut(left, ingress_index, ingress_binding, right, target_index);
+    }
+    find_target_binding_mut(
+        left,
+        ingress_index,
+        ingress_binding,
+        ingress_queue_id,
+        right,
+        binding_lookup,
+        target_ifindex,
+    )
 }
 
 pub(super) fn handle_forward_build_failure(

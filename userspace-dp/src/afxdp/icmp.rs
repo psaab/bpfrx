@@ -41,6 +41,7 @@ pub(super) fn build_local_time_exceeded_request(
 
     Some(PendingForwardRequest {
         target_ifindex,
+        target_binding_index: None,
         ingress_queue_id: ingress_ident.queue_id,
         source_offset: desc.addr,
         desc,
