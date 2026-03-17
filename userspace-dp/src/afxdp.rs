@@ -120,6 +120,7 @@ const XSK_BIND_FLAGS_ZEROCOPY: u16 =
 const XSK_BIND_FLAGS_COPY: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_COPY;
 const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 1;
+const INTERRUPT_POLL_TIMEOUT_MS: i32 = 1;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
 const RX_WAKE_MIN_INTERVAL_NS: u64 = 200_000;
 /// Safety-net interval for fill ring wakes when needs_wakeup is clear.
@@ -2611,6 +2612,44 @@ fn poll_binding(
                                 debug.from_zone = Some(from_zone_arc.clone());
                                 debug.to_zone = Some(to_zone_arc.clone());
                             }
+                            if resolution.disposition == ForwardingDisposition::LocalDelivery {
+                                let local_metadata = SessionMetadata {
+                                    ingress_zone: from_zone_arc.clone(),
+                                    egress_zone: to_zone_arc.clone(),
+                                    owner_rg_id: 0,
+                                    fabric_ingress: false,
+                                    is_reverse: false,
+                                    // Keep firewall-local sessions in the helper only.
+                                    // They need cross-worker lookup, but they must not emit
+                                    // deltas into HA sync or be published into USERSPACE_SESSIONS.
+                                    synced: true,
+                                    nat64_reverse: None,
+                                };
+                                if sessions.install_with_protocol(
+                                    flow.forward_key.clone(),
+                                    decision,
+                                    local_metadata.clone(),
+                                    now_ns,
+                                    meta.protocol,
+                                    meta.tcp_flags,
+                                ) {
+                                    let local_entry = SyncedSessionEntry {
+                                        key: flow.forward_key.clone(),
+                                        decision,
+                                        metadata: local_metadata,
+                                        protocol: meta.protocol,
+                                        tcp_flags: meta.tcp_flags,
+                                    };
+                                    publish_shared_session(
+                                        shared_sessions,
+                                        shared_nat_sessions,
+                                        shared_forward_wire_sessions,
+                                        &local_entry,
+                                    );
+                                    counters.session_creates += 1;
+                                    dbg.session_create += 1;
+                                }
+                            }
                             // Embedded ICMP NAT reversal applies only to actual ICMP error
                             // packets. Echo and other non-error ICMP traffic should follow
                             // the ordinary policy/session path.
@@ -2871,6 +2910,8 @@ fn poll_binding(
                                         recycle_now = false;
                                     } else {
                                         let mut created = 0u64;
+                                        let track_in_userspace = decision.resolution.disposition
+                                            != ForwardingDisposition::LocalDelivery;
                                         let fabric_ingress = ingress_is_fabric(
                                             forwarding,
                                             meta.ingress_ifindex as i32,
@@ -2884,20 +2925,16 @@ fn poll_binding(
                                             synced: false,
                                             nat64_reverse: nat64_info,
                                         };
-                                        if sessions.install_with_protocol(
-                                            flow.forward_key.clone(),
-                                            decision,
-                                            forward_metadata.clone(),
-                                            now_ns,
-                                            meta.protocol,
-                                            meta.tcp_flags,
-                                        ) {
-                                            let _ = publish_live_session_entry(
-                                                binding.session_map_fd,
-                                                &flow.forward_key,
-                                                decision.nat,
-                                                false,
-                                            );
+                                        if track_in_userspace
+                                            && sessions.install_with_protocol(
+                                                flow.forward_key.clone(),
+                                                decision,
+                                                forward_metadata.clone(),
+                                                now_ns,
+                                                meta.protocol,
+                                                meta.tcp_flags,
+                                            )
+                                        {
                                             created += 1;
                                             let forward_entry = SyncedSessionEntry {
                                                 key: flow.forward_key.clone(),
@@ -2906,6 +2943,12 @@ fn poll_binding(
                                                 protocol: meta.protocol,
                                                 tcp_flags: meta.tcp_flags,
                                             };
+                                            let _ = publish_live_session_entry(
+                                                binding.session_map_fd,
+                                                &flow.forward_key,
+                                                decision.nat,
+                                                false,
+                                            );
                                             publish_shared_session(
                                                 shared_sessions,
                                                 shared_nat_sessions,
@@ -2945,51 +2988,50 @@ fn poll_binding(
                                         // For NAT64: the reverse key is IPv4 (different AF
                                         // from the forward IPv6 key). The reply arrives as
                                         // IPv4: src=dst_v4, dst=snat_v4.
-                                        let (reverse_key, reverse_protocol) = if nat64_info
-                                            .is_some()
-                                        {
-                                            let nat = decision.nat;
-                                            let dst_v4 = match nat.rewrite_dst {
-                                                Some(IpAddr::V4(v4)) => v4,
-                                                _ => Ipv4Addr::UNSPECIFIED,
-                                            };
-                                            let snat_v4 = match nat.rewrite_src {
-                                                Some(IpAddr::V4(v4)) => v4,
-                                                _ => Ipv4Addr::UNSPECIFIED,
-                                            };
-                                            // Map protocol: ICMPv6→ICMP for the reverse key.
-                                            let rev_proto = match meta.protocol {
-                                                PROTO_ICMPV6 => PROTO_ICMP,
-                                                p => p,
-                                            };
-                                            let (src_port, dst_port) = if matches!(
-                                                meta.protocol,
-                                                PROTO_ICMP | PROTO_ICMPV6
-                                            ) {
+                                        let (reverse_key, reverse_protocol) =
+                                            if nat64_info.is_some() {
+                                                let nat = decision.nat;
+                                                let dst_v4 = match nat.rewrite_dst {
+                                                    Some(IpAddr::V4(v4)) => v4,
+                                                    _ => Ipv4Addr::UNSPECIFIED,
+                                                };
+                                                let snat_v4 = match nat.rewrite_src {
+                                                    Some(IpAddr::V4(v4)) => v4,
+                                                    _ => Ipv4Addr::UNSPECIFIED,
+                                                };
+                                                // Map protocol: ICMPv6→ICMP for the reverse key.
+                                                let rev_proto = match meta.protocol {
+                                                    PROTO_ICMPV6 => PROTO_ICMP,
+                                                    p => p,
+                                                };
+                                                let (src_port, dst_port) = if matches!(
+                                                    meta.protocol,
+                                                    PROTO_ICMP | PROTO_ICMPV6
+                                                ) {
+                                                    (
+                                                        flow.forward_key.src_port,
+                                                        flow.forward_key.dst_port,
+                                                    )
+                                                } else {
+                                                    (
+                                                        flow.forward_key.dst_port,
+                                                        flow.forward_key.src_port,
+                                                    )
+                                                };
                                                 (
-                                                    flow.forward_key.src_port,
-                                                    flow.forward_key.dst_port,
+                                                    SessionKey {
+                                                        addr_family: libc::AF_INET as u8,
+                                                        protocol: rev_proto,
+                                                        src_ip: IpAddr::V4(dst_v4),
+                                                        dst_ip: IpAddr::V4(snat_v4),
+                                                        src_port,
+                                                        dst_port,
+                                                    },
+                                                    rev_proto,
                                                 )
                                             } else {
-                                                (
-                                                    flow.forward_key.dst_port,
-                                                    flow.forward_key.src_port,
-                                                )
+                                                (flow.reverse_key_with_nat(decision.nat), meta.protocol)
                                             };
-                                            (
-                                                SessionKey {
-                                                    addr_family: libc::AF_INET as u8,
-                                                    protocol: rev_proto,
-                                                    src_ip: IpAddr::V4(dst_v4),
-                                                    dst_ip: IpAddr::V4(snat_v4),
-                                                    src_port,
-                                                    dst_port,
-                                                },
-                                                rev_proto,
-                                            )
-                                        } else {
-                                            (flow.reverse_key_with_nat(decision.nat), meta.protocol)
-                                        };
                                         let _ = reverse_protocol; // used below for install
                                         let reverse_metadata = SessionMetadata {
                                             ingress_zone: to_zone_arc,
@@ -3000,108 +3042,110 @@ fn poll_binding(
                                             synced: false,
                                             nat64_reverse: nat64_info,
                                         };
-                                        if sessions.install_with_protocol(
-                                            reverse_key.clone(),
-                                            reverse_decision,
-                                            reverse_metadata.clone(),
-                                            now_ns,
-                                            meta.protocol,
-                                            meta.tcp_flags,
-                                        ) {
+                                        if track_in_userspace
+                                            && sessions.install_with_protocol(
+                                                reverse_key.clone(),
+                                                reverse_decision,
+                                                reverse_metadata.clone(),
+                                                now_ns,
+                                                meta.protocol,
+                                                meta.tcp_flags,
+                                            )
+                                        {
                                             let _ = publish_live_session_key(
-                                                binding.session_map_fd,
-                                                &reverse_key,
-                                            );
-                                            // Verify session keys and log creations (debug-only: BPF syscalls)
-                                            if cfg!(feature = "debug-log") {
-                                                if verify_session_key_in_bpf(
                                                     binding.session_map_fd,
                                                     &reverse_key,
-                                                ) {
-                                                    SESSION_PUBLISH_VERIFY_OK
+                                                );
+                                                // Verify session keys and log creations (debug-only: BPF syscalls)
+                                                if cfg!(feature = "debug-log") {
+                                                    if verify_session_key_in_bpf(
+                                                        binding.session_map_fd,
+                                                        &reverse_key,
+                                                    ) {
+                                                        SESSION_PUBLISH_VERIFY_OK
+                                                            .fetch_add(1, Ordering::Relaxed);
+                                                    } else {
+                                                        SESSION_PUBLISH_VERIFY_FAIL
+                                                            .fetch_add(1, Ordering::Relaxed);
+                                                        debug_log!(
+                                                            "SESS_VERIFY_FAIL: reverse key NOT found after publish! \
+                                                             af={} proto={} {}:{} -> {}:{} (map_fd={})",
+                                                            reverse_key.addr_family,
+                                                            reverse_key.protocol,
+                                                            reverse_key.src_ip,
+                                                            reverse_key.src_port,
+                                                            reverse_key.dst_ip,
+                                                            reverse_key.dst_port,
+                                                            binding.session_map_fd,
+                                                        );
+                                                    }
+                                                    if !verify_session_key_in_bpf(
+                                                        binding.session_map_fd,
+                                                        &flow.forward_key,
+                                                    ) {
+                                                        debug_log!(
+                                                            "SESS_VERIFY_FAIL: forward key NOT found! \
+                                                             af={} proto={} {}:{} -> {}:{}",
+                                                            flow.forward_key.addr_family,
+                                                            flow.forward_key.protocol,
+                                                            flow.forward_key.src_ip,
+                                                            flow.forward_key.src_port,
+                                                            flow.forward_key.dst_ip,
+                                                            flow.forward_key.dst_port,
+                                                        );
+                                                    }
+                                                    let logged = SESSION_CREATIONS_LOGGED
                                                         .fetch_add(1, Ordering::Relaxed);
-                                                } else {
-                                                    SESSION_PUBLISH_VERIFY_FAIL
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                    debug_log!(
-                                                        "SESS_VERIFY_FAIL: reverse key NOT found after publish! \
-                                                         af={} proto={} {}:{} -> {}:{} (map_fd={})",
-                                                        reverse_key.addr_family,
-                                                        reverse_key.protocol,
-                                                        reverse_key.src_ip,
-                                                        reverse_key.src_port,
-                                                        reverse_key.dst_ip,
-                                                        reverse_key.dst_port,
-                                                        binding.session_map_fd,
-                                                    );
+                                                    if logged < 10 {
+                                                        debug_log!(
+                                                            "SESS_CREATE[{}]: FWD af={} proto={} {}:{} -> {}:{} \
+                                                             | REV af={} proto={} {}:{} -> {}:{} \
+                                                             | NAT src={:?} dst={:?} \
+                                                             | map_fd={} bpf_entries={}",
+                                                            logged,
+                                                            flow.forward_key.addr_family,
+                                                            flow.forward_key.protocol,
+                                                            flow.forward_key.src_ip,
+                                                            flow.forward_key.src_port,
+                                                            flow.forward_key.dst_ip,
+                                                            flow.forward_key.dst_port,
+                                                            reverse_key.addr_family,
+                                                            reverse_key.protocol,
+                                                            reverse_key.src_ip,
+                                                            reverse_key.src_port,
+                                                            reverse_key.dst_ip,
+                                                            reverse_key.dst_port,
+                                                            decision.nat.rewrite_src,
+                                                            decision.nat.rewrite_dst,
+                                                            binding.session_map_fd,
+                                                            count_bpf_session_entries(
+                                                                binding.session_map_fd
+                                                            ),
+                                                        );
+                                                        dump_bpf_session_entries(
+                                                            binding.session_map_fd,
+                                                            20,
+                                                        );
+                                                    }
                                                 }
-                                                if !verify_session_key_in_bpf(
-                                                    binding.session_map_fd,
-                                                    &flow.forward_key,
-                                                ) {
-                                                    debug_log!(
-                                                        "SESS_VERIFY_FAIL: forward key NOT found! \
-                                                         af={} proto={} {}:{} -> {}:{}",
-                                                        flow.forward_key.addr_family,
-                                                        flow.forward_key.protocol,
-                                                        flow.forward_key.src_ip,
-                                                        flow.forward_key.src_port,
-                                                        flow.forward_key.dst_ip,
-                                                        flow.forward_key.dst_port,
-                                                    );
-                                                }
-                                                let logged = SESSION_CREATIONS_LOGGED
-                                                    .fetch_add(1, Ordering::Relaxed);
-                                                if logged < 10 {
-                                                    debug_log!(
-                                                        "SESS_CREATE[{}]: FWD af={} proto={} {}:{} -> {}:{} \
-                                                         | REV af={} proto={} {}:{} -> {}:{} \
-                                                         | NAT src={:?} dst={:?} \
-                                                         | map_fd={} bpf_entries={}",
-                                                        logged,
-                                                        flow.forward_key.addr_family,
-                                                        flow.forward_key.protocol,
-                                                        flow.forward_key.src_ip,
-                                                        flow.forward_key.src_port,
-                                                        flow.forward_key.dst_ip,
-                                                        flow.forward_key.dst_port,
-                                                        reverse_key.addr_family,
-                                                        reverse_key.protocol,
-                                                        reverse_key.src_ip,
-                                                        reverse_key.src_port,
-                                                        reverse_key.dst_ip,
-                                                        reverse_key.dst_port,
-                                                        decision.nat.rewrite_src,
-                                                        decision.nat.rewrite_dst,
-                                                        binding.session_map_fd,
-                                                        count_bpf_session_entries(
-                                                            binding.session_map_fd
-                                                        ),
-                                                    );
-                                                    dump_bpf_session_entries(
-                                                        binding.session_map_fd,
-                                                        20,
-                                                    );
-                                                }
-                                            }
-                                            created += 1;
-                                            let reverse_entry = SyncedSessionEntry {
-                                                key: reverse_key,
-                                                decision: reverse_decision,
-                                                metadata: reverse_metadata,
-                                                protocol: meta.protocol,
-                                                tcp_flags: meta.tcp_flags,
-                                            };
-                                            publish_shared_session(
-                                                shared_sessions,
-                                                shared_nat_sessions,
-                                                shared_forward_wire_sessions,
-                                                &reverse_entry,
-                                            );
-                                            replicate_session_upsert(
-                                                peer_worker_commands,
-                                                &reverse_entry,
-                                            );
+                                                created += 1;
+                                                let reverse_entry = SyncedSessionEntry {
+                                                    key: reverse_key,
+                                                    decision: reverse_decision,
+                                                    metadata: reverse_metadata,
+                                                    protocol: meta.protocol,
+                                                    tcp_flags: meta.tcp_flags,
+                                                };
+                                                publish_shared_session(
+                                                    shared_sessions,
+                                                    shared_nat_sessions,
+                                                    shared_forward_wire_sessions,
+                                                    &reverse_entry,
+                                                );
+                                                replicate_session_upsert(
+                                                    peer_worker_commands,
+                                                    &reverse_entry,
+                                                );
                                         }
                                         if created > 0 {
                                             counters.session_creates += created;
@@ -4204,6 +4248,18 @@ fn worker_loop(
         }
     }
     let binding_lookup = WorkerBindingLookup::from_bindings(&bindings);
+    let mut interrupt_poll_fds = if poll_mode == crate::PollMode::Interrupt {
+        bindings
+            .iter()
+            .map(|binding| libc::pollfd {
+                fd: binding.device.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
@@ -4864,20 +4920,24 @@ fn worker_loop(
                 }
             }
             crate::PollMode::Interrupt => {
-                // Interrupt mode: use poll() to block until the kernel
-                // delivers packets via interrupt, avoiding CPU burn.
-                if !bindings.is_empty() {
-                    let fd = bindings[0].device.as_raw_fd();
-                    let mut pfd = libc::pollfd {
-                        fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
+                // Interrupt mode still needs a short local spin before blocking.
+                // Firewall-local TCP flows are ACK-latency-sensitive; blocking
+                // immediately on the first empty poll collapses cwnd badly.
+                if idle_iters <= IDLE_SPIN_ITERS {
+                    std::hint::spin_loop();
+                } else if !interrupt_poll_fds.is_empty() {
+                    for pfd in &mut interrupt_poll_fds {
+                        pfd.revents = 0;
+                    }
                     unsafe {
-                        libc::poll(&mut pfd, 1, 1); // 1ms timeout
+                        libc::poll(
+                            interrupt_poll_fds.as_mut_ptr(),
+                            interrupt_poll_fds.len() as libc::nfds_t,
+                            INTERRUPT_POLL_TIMEOUT_MS,
+                        );
                     }
                 } else {
-                    thread::sleep(Duration::from_millis(1));
+                    thread::sleep(Duration::from_millis(INTERRUPT_POLL_TIMEOUT_MS as u64));
                 }
             }
         }
@@ -8903,6 +8963,108 @@ mod tests {
             resolved.src_mac,
             Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01])
         );
+    }
+
+    #[test]
+    fn reverse_session_prefers_interface_snat_ipv4_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let ha_state = BTreeMap::new();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+
+        let resolved = reverse_resolution_for_session(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            "wan",
+            false,
+            monotonic_nanos() / 1_000_000_000,
+        );
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved.local_ifindex, 12);
+        assert_eq!(resolved.egress_ifindex, 12);
+        assert_eq!(resolved.tx_ifindex, 12);
+    }
+
+    #[test]
+    fn reverse_session_prefers_interface_snat_ipv6_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let ha_state = BTreeMap::new();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+
+        let resolved = reverse_resolution_for_session(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            "2001:559:8585:80::8".parse().expect("dst"),
+            "wan",
+            false,
+            monotonic_nanos() / 1_000_000_000,
+        );
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved.local_ifindex, 12);
+        assert_eq!(resolved.egress_ifindex, 12);
+        assert_eq!(resolved.tx_ifindex, 12);
+    }
+
+    #[test]
+    fn session_hit_keeps_interface_snat_ipv4_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+                src_port: 5201,
+                dst_port: 43600,
+            },
+        };
+        let decision = SessionDecision {
+            resolution: interface_nat_local_resolution(&state, flow.dst_ip)
+                .expect("interface nat local delivery"),
+            nat: NatDecision::default(),
+        };
+
+        let resolved =
+            lookup_forwarding_resolution_for_session(&state, &dynamic_neighbors, &flow, decision);
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved.local_ifindex, 12);
+    }
+
+    #[test]
+    fn session_hit_keeps_interface_snat_ipv6_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let flow = SessionFlow {
+            src_ip: "2001:559:8585:80::200".parse().expect("src"),
+            dst_ip: "2001:559:8585:80::8".parse().expect("dst"),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: PROTO_TCP,
+                src_ip: "2001:559:8585:80::200".parse().expect("src"),
+                dst_ip: "2001:559:8585:80::8".parse().expect("dst"),
+                src_port: 5201,
+                dst_port: 43600,
+            },
+        };
+        let decision = SessionDecision {
+            resolution: interface_nat_local_resolution(&state, flow.dst_ip)
+                .expect("interface nat local delivery"),
+            nat: NatDecision::default(),
+        };
+
+        let resolved =
+            lookup_forwarding_resolution_for_session(&state, &dynamic_neighbors, &flow, decision);
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved.local_ifindex, 12);
     }
 
     #[test]

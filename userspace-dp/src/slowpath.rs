@@ -8,9 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const DEFAULT_QUEUE_DEPTH: usize = 256;
-const DEFAULT_RATE_LIMIT_PACKETS_PER_SEC: u64 = 2000;
-const DEFAULT_RATE_LIMIT_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
+// Firewall-local traffic is reinjected through the slow path. Keep the queue
+// bounded, but do not rate-limit it so aggressively that normal TCP ACK
+// traffic collapses sender throughput.
+const DEFAULT_QUEUE_DEPTH: usize = 16_384;
+const DEFAULT_RATE_LIMIT_PACKETS_PER_SEC: u64 = 1_000_000;
+const DEFAULT_RATE_LIMIT_BYTES_PER_SEC: u64 = 4 * 1024 * 1024 * 1024;
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
@@ -247,7 +250,7 @@ fn slow_path_worker(name: &str, rx: Receiver<PacketRequest>, status: Arc<SharedS
     status.set_device_name(&actual_name);
     status.active.store(true, Ordering::Relaxed);
 
-    let mut mode = match IoUring::new(32) {
+    let mut mode = match IoUring::new(256) {
         Ok(ring) => {
             status.set_mode("io_uring");
             WriteMode::IoUring(ring)
