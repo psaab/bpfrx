@@ -255,7 +255,7 @@ pub(super) enum TxError {
     Drop(String),
 }
 
-pub(super) fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
+fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
     binding.outstanding_tx > 0
         || !binding.pending_tx_prepared.is_empty()
         || !binding.pending_tx_local.is_empty()
