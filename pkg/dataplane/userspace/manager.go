@@ -2151,17 +2151,7 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 	if !m.clusterHA {
 		return true
 	}
-	if len(m.haGroups) == 0 {
-		return false
-	}
-	hasDataRG := false
-	for rgID := range m.haGroups {
-		if rgID <= 0 {
-			continue
-		}
-		hasDataRG = true
-	}
-	if hasDataRG {
+	if m.configHasDataRGLocked() {
 		// Keep the helper armed on standby HA nodes so stale-MAC traffic can
 		// stay in the userspace fabric redirect path during ownership moves.
 		// Per-packet HA resolution still decides whether traffic is forwarded
@@ -2170,6 +2160,18 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 	}
 	for _, group := range m.haGroups {
 		if group.Active {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) configHasDataRGLocked() bool {
+	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil || m.lastSnapshot.Config.Chassis.Cluster == nil {
+		return false
+	}
+	for _, rg := range m.lastSnapshot.Config.Chassis.Cluster.RedundancyGroups {
+		if rg != nil && rg.ID > 0 {
 			return true
 		}
 	}

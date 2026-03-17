@@ -263,22 +263,22 @@ func TestDesiredForwardingArmedUsesSeededConfiguredDataRGs(t *testing.T) {
 			Capabilities: UserspaceCapabilities{ForwardingSupported: true},
 		},
 		haGroups: make(map[int]HAGroupStatus),
-	}
-	cfg := &config.Config{
-		Chassis: config.ChassisConfig{
-			Cluster: &config.ClusterConfig{
-				RedundancyGroups: []*config.RedundancyGroup{
-					{ID: 1},
-					{ID: 2},
+		lastSnapshot: &ConfigSnapshot{
+			Config: &config.Config{
+				Chassis: config.ChassisConfig{
+					Cluster: &config.ClusterConfig{
+						RedundancyGroups: []*config.RedundancyGroup{
+							{ID: 1},
+							{ID: 2},
+						},
+					},
 				},
 			},
 		},
 	}
 
-	m.seedHAGroupInventoryLocked(cfg)
-
 	if !m.desiredForwardingArmedLocked() {
-		t.Fatal("desiredForwardingArmedLocked() = false, want true for seeded standby data RGs")
+		t.Fatal("desiredForwardingArmedLocked() = false, want true for configured standby data RGs")
 	}
 }
 
