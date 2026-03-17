@@ -1243,6 +1243,12 @@ fn handle_stream(
             "ping" | "status" => {}
             "apply_snapshot" => {
                 if let Some(snapshot) = request.snapshot {
+                    eprintln!(
+                        "CTRL_REQ: apply_snapshot generation={} fib_generation={} forwarding_armed_before={}",
+                        snapshot.generation,
+                        snapshot.fib_generation,
+                        guard.status.forwarding_armed
+                    );
                     guard.status.last_snapshot_generation = snapshot.generation;
                     guard.status.last_fib_generation = snapshot.fib_generation;
                     guard.status.last_snapshot_at = Some(snapshot.generated_at);
@@ -1265,6 +1271,11 @@ fn handle_stream(
             }
             "set_forwarding_state" => {
                 if let Some(forwarding_req) = request.forwarding {
+                    eprintln!(
+                        "CTRL_REQ: set_forwarding_state armed={} forwarding_armed_before={}",
+                        forwarding_req.armed,
+                        guard.status.forwarding_armed
+                    );
                     if forwarding_req.armed && !guard.status.capabilities.forwarding_supported {
                         response.ok = false;
                         response.error = forwarding_unsupported_error(&guard.status.capabilities);
@@ -1285,6 +1296,11 @@ fn handle_stream(
             }
             "update_ha_state" => {
                 if let Some(ha_req) = request.ha_state {
+                    eprintln!(
+                        "CTRL_REQ: update_ha_state groups={} forwarding_armed={}",
+                        ha_req.groups.len(),
+                        guard.status.forwarding_armed
+                    );
                     guard.status.ha_groups = ha_req.groups.clone();
                     guard.afxdp.update_ha_state(&ha_req.groups);
                     refresh_status(&mut guard);
