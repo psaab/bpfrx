@@ -1297,6 +1297,7 @@ fn handle_stream(
             }
             "update_ha_state" => {
                 if let Some(ha_req) = request.ha_state {
+                    #[cfg(feature = "debug-log")]
                     eprintln!(
                         "CTRL_REQ: update_ha_state groups={} forwarding_armed={}",
                         ha_req.groups.len(),

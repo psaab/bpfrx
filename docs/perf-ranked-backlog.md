@@ -3,7 +3,7 @@
 This document is historical and primarily describes the older eBPF/XDP
 performance backlog. It is not the primary plan for the current Rust AF_XDP
 userspace dataplane. Use
-[userspace-performance-plan.md](/home/ps/git/codex-bpfrx/docs/userspace-performance-plan.md)
+[userspace-performance-plan.md](../docs/userspace-performance-plan.md)
 for current userspace optimization work.
 
 Date: 2026-03-07

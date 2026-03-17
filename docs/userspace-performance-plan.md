@@ -10,13 +10,13 @@ It replaces the older mixed backlog that targeted the eBPF/XDP pipeline.
 
 Current perf documentation in this tree is mixed in quality:
 
-1. [userspace-perf-compare.md](/home/ps/git/codex-bpfrx/docs/userspace-perf-compare.md) is valid.
+1. [userspace-perf-compare.md](../docs/userspace-perf-compare.md) is valid.
    - It is the right measurement workflow for current userspace branches.
-2. [shared-umem-plan.md](/home/ps/git/codex-bpfrx/docs/shared-umem-plan.md) is valid, but only as a
+2. [shared-umem-plan.md](../docs/shared-umem-plan.md) is valid, but only as a
    constrained side plan.
    - It matters for same-device `mlx5` cases.
    - It does not address the current HA lab's cross-NIC transit bottleneck.
-3. [perf-ranked-backlog.md](/home/ps/git/codex-bpfrx/docs/perf-ranked-backlog.md) is not valid for
+3. [perf-ranked-backlog.md](../docs/perf-ranked-backlog.md) is not valid for
    the current branch as a primary plan.
    - It describes the older eBPF/XDP pipeline hotspots such as `xdp_main_prog`
      and `xdp_nat_prog`.
@@ -91,7 +91,7 @@ Purpose:
 
 Landed or active slices:
 1. `eb958ec` trims session-hit resolution overhead in
-   [session_glue.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/session_glue.rs)
+   [session_glue.rs](../userspace-dp/src/afxdp/session_glue.rs)
 2. the current branch adds target-binding index caching for normal forward
    requests so `enqueue_pending_forwards()` does not redo the same binding
    lookup on the hot path
