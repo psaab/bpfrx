@@ -44,6 +44,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	var txPackets uint64
 	var txBytes uint64
 	var txErrors uint64
+	var directTXPackets uint64
+	var copyTXPackets uint64
+	var inPlaceTXPackets uint64
 	var slowPathPackets uint64
 	var slowPathDrops uint64
 	for _, binding := range status.Bindings {
@@ -82,6 +85,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 		txPackets += binding.TXPackets
 		txBytes += binding.TXBytes
 		txErrors += binding.TXErrors
+		directTXPackets += binding.DirectTXPackets
+		copyTXPackets += binding.CopyTXPackets
+		inPlaceTXPackets += binding.InPlaceTXPackets
 		slowPathPackets += binding.SlowPathPackets
 		slowPathDrops += binding.SlowPathDrops
 	}
@@ -190,6 +196,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  TX packets:                %d\n", txPackets)
 	fmt.Fprintf(&b, "  TX bytes:                  %d\n", txBytes)
 	fmt.Fprintf(&b, "  TX errors:                 %d\n", txErrors)
+	fmt.Fprintf(&b, "  Direct TX packets:         %d\n", directTXPackets)
+	fmt.Fprintf(&b, "  Copy-path TX packets:      %d\n", copyTXPackets)
+	fmt.Fprintf(&b, "  In-place TX packets:       %d\n", inPlaceTXPackets)
 	fmt.Fprintf(&b, "  Slow path active:          %t\n", status.SlowPath.Active)
 	if status.SlowPath.DeviceName != "" {
 		fmt.Fprintf(&b, "  Slow path device:          %s\n", status.SlowPath.DeviceName)
@@ -255,14 +264,14 @@ func FormatBindings(status ProcessStatus) string {
 		fmt.Fprintln(&b, "  none")
 		return b.String()
 	}
-	fmt.Fprintf(&b, "  %-6s %-7s %-8s %-10s %-7s %-7s %-7s %-5s %-8s %-8s %-9s %-9s %-9s %-9s %-9s %-9s %s\n", "Slot", "Queue", "Worker", "Registered", "Armed", "Ready", "Bound", "XSK", "Mode", "Ifindex", "RXPkts", "TXPkts", "SessHit", "SlowPkts", "ExcPkts", "RtMiss", "Interface")
+	fmt.Fprintf(&b, "  %-6s %-7s %-8s %-10s %-7s %-7s %-7s %-5s %-8s %-8s %-9s %-9s %-8s %-8s %-8s %-9s %-9s %-9s %-9s %s\n", "Slot", "Queue", "Worker", "Registered", "Armed", "Ready", "Bound", "XSK", "Mode", "Ifindex", "RXPkts", "TXPkts", "DirTx", "CopyTx", "InPlTx", "SessHit", "SlowPkts", "ExcPkts", "RtMiss", "Interface")
 	for _, binding := range status.Bindings {
 		mode := binding.XSKBindMode
 		if mode == "" {
 			mode = "-"
 		}
-		fmt.Fprintf(&b, "  %-6d %-7d %-8d %-10t %-7t %-7t %-7t %-5t %-8s %-8d %-9d %-9d %-9d %-9d %-9d %-9d %s",
-			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Armed, binding.Ready, binding.Bound, binding.XSKRegistered, mode, binding.Ifindex, binding.RXPackets, binding.TXPackets, binding.SessionHits, binding.SlowPathPackets, binding.ExceptionPackets, binding.RouteMissPackets, binding.Interface)
+		fmt.Fprintf(&b, "  %-6d %-7d %-8d %-10t %-7t %-7t %-7t %-5t %-8s %-8d %-9d %-9d %-8d %-8d %-8d %-9d %-9d %-9d %-9d %s",
+			binding.Slot, binding.QueueID, binding.WorkerID, binding.Registered, binding.Armed, binding.Ready, binding.Bound, binding.XSKRegistered, mode, binding.Ifindex, binding.RXPackets, binding.TXPackets, binding.DirectTXPackets, binding.CopyTXPackets, binding.InPlaceTXPackets, binding.SessionHits, binding.SlowPathPackets, binding.ExceptionPackets, binding.RouteMissPackets, binding.Interface)
 		if binding.LastError != "" {
 			fmt.Fprintf(&b, " (%s)", binding.LastError)
 		}

@@ -444,6 +444,9 @@ type BindingStatus struct {
 	TXPackets             uint64    `json:"tx_packets,omitempty"`
 	TXBytes               uint64    `json:"tx_bytes,omitempty"`
 	TXErrors              uint64    `json:"tx_errors,omitempty"`
+	DirectTXPackets       uint64    `json:"direct_tx_packets,omitempty"`
+	CopyTXPackets         uint64    `json:"copy_tx_packets,omitempty"`
+	InPlaceTXPackets      uint64    `json:"in_place_tx_packets,omitempty"`
 	LastHeartbeat         time.Time `json:"last_heartbeat,omitempty"`
 	LastError             string    `json:"last_error,omitempty"`
 	LastChange            time.Time `json:"last_change,omitempty"`
