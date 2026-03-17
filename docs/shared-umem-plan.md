@@ -1,6 +1,6 @@
 # Shared UMEM Implementation Plan (#205)
 
-Status: In Progress
+Status: Experimental / Blocked From Baseline Runtime
 
 ## Problem
 
@@ -28,6 +28,26 @@ out.get_mut(eth_len..frame_len)?.copy_from_slice(payload);
 
 This is the primary remaining bottleneck preventing the userspace
 dataplane from reaching native XDP line rate on transit traffic.
+
+## Current Reality On 2026-03-17
+
+The same-device shared-UMEM prototype is not part of the accepted HA baseline.
+
+What happened:
+
+1. the prototype was merged into normal worker startup on `master`
+2. the HA lab immediately regressed to `16/24` bound and ready bindings
+3. `ifindex 5` and `6` multi-queue `mlx5` bindings failed with:
+   - `configure AF_XDP rings: create fq/cq: Device or resource busy`
+4. the restored baseline branch disables shared-UMEM runtime grouping again and
+   returns the lab to `24/24` bound and ready bindings
+
+So the current rule is explicit:
+
+- same-device shared UMEM remains a prototype
+- it must not be enabled in the default HA runtime path
+- any reintroduction needs an explicit gate plus live validation on a topology
+  that actually exercises the intended same-device path
 
 ## Goal
 
@@ -220,12 +240,15 @@ The remaining optimization path is to make the existing memcpy cheaper
 
 ## Current Prototype Status (2026-03-17)
 
-The safe reintegration path is now started in the code on the prototype
-branch, but live validation exposed two important limits:
+The safe reintegration path is still the same in principle, but current live
+validation exposed three practical limits:
 
 - the current HA lab does not have a proof topology for this prototype
 - the current implementation is not yet deployable on the HA lab because
   shared UMEM still uses the wrong AF_XDP queue ownership contract
+- the prototype was already shown to be unsafe as a default runtime path on the
+  HA lab, so it is now explicitly branch-only work until those issues are
+  closed
 
 ### Narrow scope
 
@@ -288,8 +311,8 @@ with:
 
 - `configure AF_XDP rings: create fq/cq: Device or resource busy`
 
-That means the next implementation step is not more performance work. It is
-correct AF_XDP shared-UMEM bring-up:
+That means the next implementation step is not more baseline performance work.
+It is correct AF_XDP shared-UMEM bring-up on an isolated branch:
 
 1. establish the right FQ/CQ ownership model for one shared UMEM
 2. bind secondary queues/sockets against that owner correctly
@@ -306,6 +329,10 @@ correct AF_XDP shared-UMEM bring-up:
   direct builder copy path
 
 ## Original Testing Plan
+
+This testing plan is no longer valid as a baseline HA validation plan. It is
+only valid for the prototype branch after the queue-ownership issue is fixed
+and a real same-device proof topology is available.
 
 1. `cargo build --release` — compiles
 2. Deploy to loss cluster: `loss:bpfrx-userspace-fw0` + `loss:bpfrx-userspace-fw1`

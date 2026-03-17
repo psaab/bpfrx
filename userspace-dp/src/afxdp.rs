@@ -66,12 +66,13 @@ mod tx;
 use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
     AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
-    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets,
-    reserved_tx_frames, shared_umem_group_key, shared_umem_group_key_for_device, umem_ring_size,
+    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets, reserved_tx_frames,
+    umem_ring_size,
 };
 #[cfg(test)]
 use self::bind::{
     AfXdpBinder, alternate_bind_strategy, bind_strategy_for_driver, binder_for_strategy,
+    shared_umem_group_key_for_device,
 };
 use self::frame::*;
 use self::icmp::{build_local_time_exceeded_request, is_icmp_error};
@@ -2040,7 +2041,6 @@ fn poll_binding(
     };
     update_binding_debug_state(binding);
     let area = binding.umem.area() as *const MmapArea;
-    let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
     let tx_work = drain_pending_tx(binding, now_ns, shared_recycles);
     apply_shared_recycles(
@@ -4344,97 +4344,26 @@ fn worker_loop(
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
     sessions.set_timeouts(forwarding.session_timeouts);
-    let mut shared_group_members: BTreeMap<String, usize> = BTreeMap::new();
-    let mut shared_group_frames: BTreeMap<String, u32> = BTreeMap::new();
-    for plan in &binding_plans {
-        if let Some(group_key) = shared_umem_group_key(&plan.status) {
-            *shared_group_members.entry(group_key.clone()).or_default() += 1;
-            *shared_group_frames.entry(group_key).or_default() +=
-                binding_frame_count(plan.ring_entries).max(1);
-        }
-    }
-    let mut shared_umem_pools: BTreeMap<String, WorkerUmemPool> = BTreeMap::new();
-    for (group_key, members) in &shared_group_members {
-        if *members < 2 {
-            continue;
-        }
-        let total_frames = shared_group_frames.get(group_key).copied().unwrap_or(0);
-        match WorkerUmemPool::new(total_frames) {
-            Ok(pool) => {
-                eprintln!(
-                    "bpfrx-userspace-dp: worker_id={} shared-umem group={} members={} frames={}",
-                    worker_id, group_key, members, total_frames,
-                );
-                shared_umem_pools.insert(group_key.clone(), pool);
-            }
-            Err(err) => {
-                eprintln!(
-                    "bpfrx-userspace-dp: worker_id={} failed shared-umem group={} members={} err={}",
-                    worker_id, group_key, members, err,
-                );
-            }
-        }
-    }
     let mut bindings = Vec::with_capacity(binding_plans.len());
     for plan in binding_plans {
-        let shared_group = shared_umem_group_key(&plan.status)
-            .filter(|key| shared_group_members.get(key).copied().unwrap_or(0) > 1);
-        let binding = if let Some(group_key) = shared_group.as_ref() {
-            if let Some(pool) = shared_umem_pools.get_mut(group_key) {
-                BindingWorker::create(
-                    &plan.status,
-                    plan.ring_entries,
-                    plan.xsk_map_fd,
-                    plan.heartbeat_map_fd,
-                    plan.session_map_fd,
-                    plan.live.clone(),
-                    plan.bind_strategy,
-                    plan.poll_mode,
-                    pool.umem.clone(),
-                    &mut pool.free_frames,
-                    true,
-                )
-            } else {
-                let total_frames = binding_frame_count(plan.ring_entries).max(1);
-                let mut private_pool = WorkerUmemPool::new(total_frames)
-                    .map_err(|err| format!("create binding umem: {err}"));
-                match private_pool.as_mut() {
-                    Ok(pool) => BindingWorker::create(
-                        &plan.status,
-                        plan.ring_entries,
-                        plan.xsk_map_fd,
-                        plan.heartbeat_map_fd,
-                        plan.session_map_fd,
-                        plan.live.clone(),
-                        plan.bind_strategy,
-                        plan.poll_mode,
-                        pool.umem.clone(),
-                        &mut pool.free_frames,
-                        false,
-                    ),
-                    Err(err) => Err(err.to_string().into()),
-                }
-            }
-        } else {
-            let total_frames = binding_frame_count(plan.ring_entries).max(1);
-            let mut private_pool =
-                WorkerUmemPool::new(total_frames).map_err(|err| format!("create binding umem: {err}"));
-            match private_pool.as_mut() {
-                Ok(pool) => BindingWorker::create(
-                    &plan.status,
-                    plan.ring_entries,
-                    plan.xsk_map_fd,
-                    plan.heartbeat_map_fd,
-                    plan.session_map_fd,
-                    plan.live.clone(),
-                    plan.bind_strategy,
-                    plan.poll_mode,
-                    pool.umem.clone(),
-                    &mut pool.free_frames,
-                    false,
-                ),
-                Err(err) => Err(err.to_string().into()),
-            }
+        let total_frames = binding_frame_count(plan.ring_entries).max(1);
+        let mut private_pool =
+            WorkerUmemPool::new(total_frames).map_err(|err| format!("create binding umem: {err}"));
+        let binding = match private_pool.as_mut() {
+            Ok(pool) => BindingWorker::create(
+                &plan.status,
+                plan.ring_entries,
+                plan.xsk_map_fd,
+                plan.heartbeat_map_fd,
+                plan.session_map_fd,
+                plan.live.clone(),
+                plan.bind_strategy,
+                plan.poll_mode,
+                pool.umem.clone(),
+                &mut pool.free_frames,
+                false,
+            ),
+            Err(err) => Err(err.to_string().into()),
         };
         match binding {
             Ok(binding) => bindings.push(binding),

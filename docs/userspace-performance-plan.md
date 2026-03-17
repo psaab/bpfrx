@@ -10,21 +10,57 @@ completed cleanup work in [userspace-dataplane-cleanup-plan.md](userspace-datapl
 
 ## Status Snapshot
 
-All issues described here were identified via code audit on 2026-03-17 against
-current `master`.
+Current execution state on 2026-03-17:
 
-Current status:
+- `master` is not a trustworthy HA perf baseline as merged.
+- `bec25c0` enabled the same-device shared-UMEM prototype in normal worker
+  startup, which left the HA lab half-bound at `16/24` bindings.
+- The restored baseline branch disables that runtime path again and brings the
+  HA lab back to:
+  - `24/24` bound bindings
+  - `24/24` ready bindings
+  - working IPv4/IPv6 internal reachability
+  - working IPv4/IPv6 TTL or hop-limit time-exceeded replies
+- A short userspace HA validation pass on the restored baseline is healthy:
+  - IPv4 about `17.45 Gbps`
+  - IPv6 about `19.77 Gbps`
+  - IPv4/IPv6 `mtr` and traceroute visibility: `ok`
+- The current transit hotspot stack on that restored baseline is:
+  - `poll_binding` about `17.4%`
+  - `__memmove_evex_unaligned_erms` about `12.8-16.7%`
+  - `enqueue_pending_forwards` about `4.7-5.8%`
+  - `resolve_flow_session_decision` about `2.3-2.6%`
+- Runtime counters on the same runs show `Copy-path TX packets: 0`, so the
+  current throughput ceiling is the direct cross-NIC path, not fallback.
 
-- Phases 1-6 in this document are still not started.
-- Phase 7 is now in progress on the same-device shared-UMEM prototype branch.
-- The latest transit perf profile shows the remaining dominant cost is the
-  direct-path payload copy, not the copy-path fallback:
-  - `poll_binding` about `17.6%`
-  - `__memmove_evex_unaligned_erms` about `16.7%`
-  - `enqueue_pending_forwards` about `5.8%`
-- Runtime counters on the same run showed `Copy-path TX packets: 0`, so
-  the current optimization target is the direct builder in
-  `build_forwarded_frame_into_from_frame()`.
+## Active Phase Order
+
+This active phase order supersedes the older issue-first ordering below.
+
+1. Phase 0: Restore and hold a valid HA baseline.
+   - Status: Complete on `fix/userspace-disable-shared-umem-runtime`
+   - Purpose: keep the HA lab at `24/24` ready bindings before any more perf
+     work
+2. Phase 1: `poll_binding` fixed-cost reduction.
+   - Status: In Progress
+   - Scope: empty-poll overhead, unnecessary per-poll work, `RingRx::available`
+     pressure
+3. Phase 2: direct-build control overhead.
+   - Status: Next
+   - Scope: `enqueue_pending_forwards()` and
+     `build_forwarded_frame_into_from_frame()` control cost, not refill policy
+4. Phase 3: session-resolution overhead.
+   - Status: Next
+   - Scope: `resolve_flow_session_decision()` and
+     `lookup_session_across_scopes()` after direct-build control work
+5. Phase 4: structural cross-NIC copy ceiling.
+   - Status: Deferred
+   - Scope: accept that cross-NIC transit still pays a full payload copy and
+     only tackle this after the control overhead work is exhausted
+6. Phase 5: reliability and observability backlog.
+   - Status: Deferred
+   - Scope: frame leak detection, in-flight TX timeout, session-sync atomicity,
+     SYN cookies
 
 ## Issue Inventory
 
@@ -229,7 +265,7 @@ Extract MSS/window scale, create session, forward.
 
 ## Phase 7: Cross-Binding Forward Optimization (M1)
 
-Status: In Progress
+Status: Experimental / Not Part Of The Baseline Runtime
 
 ### Root Cause
 
@@ -276,9 +312,9 @@ Current validation status:
   the HA lab (`create fq/cq: Device or resource busy` on the second queue
   in a shared group)
 
-So Phase 7 is still structurally correct as a direction, but not ready to
-use as the active HA perf branch. Cross-NIC HA performance work should stay
-on the normal HA branch and remain focused on:
+So Phase 7 is still structurally correct as a direction, but it is not ready
+to be enabled in the HA baseline runtime. Cross-NIC HA performance work should
+stay on the normal HA branch and remain focused on:
 
 - `poll_binding`
 - `enqueue_pending_forwards`
@@ -344,23 +380,22 @@ Status: Not Started
 
 ## Execution Order
 
-1. **Phase 1** (C1) — fill ring starvation, highest throughput impact
-2. **Phase 3** (H1) — in-flight TX timeout, same file area
-3. **Phase 9** (M3) — frame audit, validates Phase 1+3
-4. **Phase 10** (M4) — production visibility for frame issues
-5. **Phase 2** (C2) — lock contention, second highest measured impact
-6. **Phase 4** (H2) — session sync atomicity, HA correctness
-7. **Phase 5** (H3) — reverse session metadata, HA correctness
-8. **Phase 8** (M2) — session lifecycle cleanup
-9. **Phase 7** (M1) — cross-binding optimization, requires stable frames
-10. **Phase 6** (H4) — SYN cookies, eBPF fallback provides coverage
-
-Frame lifecycle correctness first, lock contention second, HA correctness
-third, performance optimization fourth, feature gap last.
+1. Restore and keep the HA baseline valid at `24/24` ready bindings
+2. Continue low-risk `poll_binding` fixed-cost cuts
+3. Target direct-build control overhead in `enqueue_pending_forwards()` and
+   `build_forwarded_frame_into_from_frame()`
+4. Revisit session-resolution cost after the direct-build work settles
+5. Keep the structural cross-NIC copy ceiling separate from control-path work
+6. Reintroduce same-device shared UMEM only behind an explicit experimental
+   gate after it proves clean on a real same-device topology
+7. Return to the deferred backlog items only after the main throughput path is
+   stable again
 
 ## Measurement Discipline
 
 All changes measured using:
+- `show chassis cluster data-plane interfaces` must show `24/24` bound and
+  `24/24` ready before any perf result is accepted
 - `scripts/userspace-perf-compare.sh` for A/B throughput
 - `iperf3 -P 4 -t 30` (min 3 runs)
 - `perf record`/`perf report` for hot-symbol validation
