@@ -83,6 +83,8 @@ pub(super) fn enqueue_pending_forwards(
 ) {
     let ingress_area = ingress_binding.umem.area() as *const MmapArea;
     let mut post_recycles: Vec<(u32, u64)> = Vec::new();
+    let mut cached_target_index: Option<usize> = None;
+    let mut cached_target_ptr: Option<*mut BindingWorker> = None;
     for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
@@ -90,7 +92,7 @@ pub(super) fn enqueue_pending_forwards(
         // Fast path: prebuilt frame (e.g. ICMP error NAT reversal).
         // The frame is already fully rewritten — just enqueue for TX.
         if let Some(prebuilt) = request.prebuilt_frame {
-            let Some(target_binding) = resolve_pending_forward_target_binding(
+            let Some(target_binding) = resolve_pending_forward_target_binding_cached(
                 left,
                 ingress_index,
                 ingress_binding,
@@ -99,6 +101,8 @@ pub(super) fn enqueue_pending_forwards(
                 binding_lookup,
                 request.target_binding_index,
                 request.target_ifindex,
+                &mut cached_target_index,
+                &mut cached_target_ptr,
             ) else {
                 ingress_binding.pending_fill_frames.push_back(source_offset);
                 continue;
@@ -134,7 +138,7 @@ pub(super) fn enqueue_pending_forwards(
         };
         let expected_ports = request.expected_ports;
         let ingress_umem_ptr = ingress_binding.umem.allocation_ptr();
-        let Some(target_binding) = resolve_pending_forward_target_binding(
+        let Some(target_binding) = resolve_pending_forward_target_binding_cached(
             left,
             ingress_index,
             ingress_binding,
@@ -143,6 +147,8 @@ pub(super) fn enqueue_pending_forwards(
             binding_lookup,
             request.target_binding_index,
             request.target_ifindex,
+            &mut cached_target_index,
+            &mut cached_target_ptr,
         ) else {
             // No XSK binding for the target interface.  Normally fabric
             // parents have bindings; this is a safety-net fallback in case
@@ -636,6 +642,71 @@ pub(super) fn enqueue_pending_forwards(
         }
         update_binding_debug_state(ingress_binding);
     }
+}
+
+fn binding_ptr_by_index(
+    left: &mut [BindingWorker],
+    ingress_index: usize,
+    right: &mut [BindingWorker],
+    target_index: usize,
+) -> Option<*mut BindingWorker> {
+    if target_index < ingress_index {
+        return left.get_mut(target_index).map(|binding| binding as *mut _);
+    }
+    let right_index = target_index.checked_sub(ingress_index + 1)?;
+    right.get_mut(right_index).map(|binding| binding as *mut _)
+}
+
+fn resolve_pending_forward_target_binding_cached<'a>(
+    left: &'a mut [BindingWorker],
+    ingress_index: usize,
+    ingress_binding: &'a mut BindingWorker,
+    ingress_queue_id: u32,
+    right: &'a mut [BindingWorker],
+    binding_lookup: &WorkerBindingLookup,
+    target_binding_index: Option<usize>,
+    target_ifindex: i32,
+    cached_target_index: &mut Option<usize>,
+    cached_target_ptr: &mut Option<*mut BindingWorker>,
+) -> Option<&'a mut BindingWorker> {
+    let Some(target_index) = target_binding_index else {
+        *cached_target_index = None;
+        *cached_target_ptr = None;
+        return resolve_pending_forward_target_binding(
+            left,
+            ingress_index,
+            ingress_binding,
+            ingress_queue_id,
+            right,
+            binding_lookup,
+            None,
+            target_ifindex,
+        );
+    };
+    if target_index == ingress_index {
+        *cached_target_index = None;
+        *cached_target_ptr = None;
+        return Some(ingress_binding);
+    }
+    if *cached_target_index != Some(target_index) {
+        *cached_target_ptr = binding_ptr_by_index(left, ingress_index, right, target_index);
+        *cached_target_index = cached_target_ptr.map(|_| target_index);
+    }
+    cached_target_ptr
+        .and_then(|ptr| unsafe { ptr.as_mut() })
+        .or_else(|| {
+            *cached_target_index = None;
+            resolve_pending_forward_target_binding(
+                left,
+                ingress_index,
+                ingress_binding,
+                ingress_queue_id,
+                right,
+                binding_lookup,
+                Some(target_index),
+                target_ifindex,
+            )
+        })
 }
 
 fn resolve_pending_forward_target_binding<'a>(
