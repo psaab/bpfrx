@@ -1,4 +1,4 @@
-use crate::afxdp::ForwardingResolution;
+use crate::afxdp::{ForwardingDisposition, ForwardingResolution};
 use crate::nat::NatDecision;
 use crate::nat64::Nat64ReverseInfo;
 use rustc_hash::FxHashMap;
@@ -136,6 +136,13 @@ pub(crate) struct SessionDelta {
     pub(crate) metadata: SessionMetadata,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExpiredSession {
+    pub(crate) key: SessionKey,
+    pub(crate) decision: SessionDecision,
+    pub(crate) metadata: SessionMetadata,
+}
+
 pub(crate) struct SessionTable {
     sessions: FxHashMap<SessionKey, SessionEntry>,
     nat_reverse_index: FxHashMap<SessionKey, SessionKey>,
@@ -176,9 +183,9 @@ impl SessionTable {
         self.sessions.len()
     }
 
-    pub fn expire_stale(&mut self, now_ns: u64) -> u64 {
+    pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
         if self.last_gc_ns != 0 && now_ns.saturating_sub(self.last_gc_ns) < SESSION_GC_INTERVAL_NS {
-            return 0;
+            return Vec::new();
         }
         self.last_gc_ns = now_ns;
         let stale = self
@@ -192,32 +199,49 @@ impl SessionTable {
                 }
             })
             .collect::<Vec<_>>();
+        let mut expired_entries = Vec::with_capacity(stale.len());
         for key in &stale {
             if let Some(entry) = self.remove_entry(key) {
+                let decision = entry.decision;
+                let metadata = entry.metadata;
                 if key.protocol == PROTO_TCP {
                     debug_log!(
                         "SESS_EXPIRE: proto=TCP {}:{} -> {}:{} closing={} age_ns={} timeout_ns={} rev={} synced={} nat=({:?},{:?})",
-                        key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+                        key.src_ip,
+                        key.src_port,
+                        key.dst_ip,
+                        key.dst_port,
                         entry.closing,
                         now_ns.saturating_sub(entry.last_seen_ns),
                         entry.expires_after_ns,
-                        entry.metadata.is_reverse, entry.metadata.synced,
-                        entry.decision.nat.rewrite_src, entry.decision.nat.rewrite_dst,
+                        metadata.is_reverse,
+                        metadata.synced,
+                        decision.nat.rewrite_src,
+                        decision.nat.rewrite_dst,
                     );
                 }
-                if !entry.metadata.is_reverse && !entry.metadata.synced {
+                if !metadata.is_reverse && !metadata.synced {
                     self.push_delta(SessionDelta {
                         kind: SessionDeltaKind::Close,
                         key: key.clone(),
-                        decision: entry.decision,
-                        metadata: entry.metadata,
+                        decision,
+                        metadata: metadata.clone(),
                     });
                 }
+                expired_entries.push(ExpiredSession {
+                    key: key.clone(),
+                    decision,
+                    metadata,
+                });
             }
         }
-        let expired = stale.len() as u64;
+        let expired = expired_entries.len() as u64;
         self.expired = self.expired.saturating_add(expired);
-        expired
+        expired_entries
+    }
+
+    pub fn expire_stale(&mut self, now_ns: u64) -> u64 {
+        self.expire_stale_entries(now_ns).len() as u64
     }
 
     pub fn lookup(
@@ -231,9 +255,17 @@ impl SessionTable {
                 if !entry.closing {
                     debug_log!(
                         "SESS_CLOSING: {} proto=TCP {}:{} -> {}:{} rev={} tcp_flags=0x{:02x}",
-                        if (tcp_flags & TCP_RST) != 0 { "RST" } else { "FIN" },
-                        key.src_ip, key.src_port, key.dst_ip, key.dst_port,
-                        entry.metadata.is_reverse, tcp_flags,
+                        if (tcp_flags & TCP_RST) != 0 {
+                            "RST"
+                        } else {
+                            "FIN"
+                        },
+                        key.src_ip,
+                        key.src_port,
+                        key.dst_ip,
+                        key.dst_port,
+                        entry.metadata.is_reverse,
+                        tcp_flags,
                     );
                 }
                 entry.closing = true;
@@ -269,7 +301,9 @@ impl SessionTable {
     pub fn find_forward_wire_match(&self, wire_key: &SessionKey) -> Option<ForwardSessionMatch> {
         let forward_key = self.forward_wire_index.get(wire_key)?;
         let entry = self.sessions.get(forward_key)?;
-        if entry.metadata.is_reverse || forward_wire_key(forward_key, entry.decision.nat) != *wire_key {
+        if entry.metadata.is_reverse
+            || forward_wire_key(forward_key, entry.decision.nat) != *wire_key
+        {
             return None;
         }
         Some(ForwardSessionMatch {
@@ -384,6 +418,22 @@ impl SessionTable {
         self.remove_entry(key);
     }
 
+    pub fn take_synced_local(&mut self, key: &SessionKey) -> Option<SessionLookup> {
+        let Some(entry) = self.sessions.get(key) else {
+            return None;
+        };
+        if !entry.metadata.synced
+            || entry.metadata.is_reverse
+            || entry.decision.resolution.disposition != ForwardingDisposition::LocalDelivery
+        {
+            return None;
+        }
+        self.remove_entry(key).map(|entry| SessionLookup {
+            decision: entry.decision,
+            metadata: entry.metadata,
+        })
+    }
+
     pub fn demote_owner_rg(&mut self, owner_rg_id: i32) -> usize {
         if owner_rg_id <= 0 {
             return 0;
@@ -469,7 +519,8 @@ impl SessionTable {
             .insert(reverse_wire_key(key, decision.nat), key.clone());
         let reverse_canonical = reverse_canonical_key(key, decision.nat);
         if reverse_canonical != *key {
-            self.nat_reverse_index.insert(reverse_canonical, key.clone());
+            self.nat_reverse_index
+                .insert(reverse_canonical, key.clone());
         }
         let forward_wire = forward_wire_key(key, decision.nat);
         if forward_wire != *key {
@@ -725,6 +776,82 @@ mod tests {
     }
 
     #[test]
+    fn expire_stale_entries_returns_helper_only_local_sessions() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let then = 1_000_000_000u64;
+        let local_metadata = SessionMetadata {
+            synced: true,
+            ..metadata()
+        };
+        let local_decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::LocalDelivery,
+                ..resolution()
+            },
+            nat: NatDecision::default(),
+        };
+        assert!(table.install_with_protocol(
+            key.clone(),
+            local_decision,
+            local_metadata.clone(),
+            then,
+            PROTO_TCP,
+            0x10,
+        ));
+        table.last_gc_ns = then + 301_000_000_000;
+        let expired = table.expire_stale_entries(then + 302_000_000_000);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].key, key);
+        assert_eq!(expired[0].decision, local_decision);
+        assert_eq!(expired[0].metadata, local_metadata);
+        assert!(table.drain_deltas(8).is_empty());
+    }
+
+    #[test]
+    fn take_synced_local_only_removes_helper_local_sessions() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let now = 1_000_000_000u64;
+        let local_metadata = SessionMetadata {
+            synced: true,
+            ..metadata()
+        };
+        let local_decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::LocalDelivery,
+                ..resolution()
+            },
+            nat: NatDecision::default(),
+        };
+        assert!(table.install_with_protocol(
+            key.clone(),
+            local_decision,
+            local_metadata.clone(),
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        let removed = table
+            .take_synced_local(&key)
+            .expect("local session removed");
+        assert_eq!(removed.decision, local_decision);
+        assert_eq!(removed.metadata, local_metadata);
+        assert!(table.lookup(&key, now + 1_000_000, 0x10).is_none());
+
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        assert!(table.take_synced_local(&key).is_none());
+        assert!(table.lookup(&key, now + 1_000_000, 0x10).is_some());
+    }
+
+    #[test]
     fn tcp_fin_keeps_session_until_closing_timeout() {
         let mut table = SessionTable::new();
         let key = key_v4();
@@ -822,7 +949,9 @@ mod tests {
             0x10,
             false,
         );
-        let hit = table.lookup(&key, now + 2_000_000, 0x10).expect("live session");
+        let hit = table
+            .lookup(&key, now + 2_000_000, 0x10)
+            .expect("live session");
         assert_eq!(hit.metadata, live);
         assert_eq!(hit.decision, decision());
     }
@@ -833,14 +962,7 @@ mod tests {
         let key = key_v4();
         let now = 1_000_000_000u64;
         let live = metadata();
-        assert!(table.install_with_protocol(
-            key.clone(),
-            decision(),
-            live,
-            now,
-            PROTO_TCP,
-            0x10,
-        ));
+        assert!(table.install_with_protocol(key.clone(), decision(), live, now, PROTO_TCP, 0x10,));
         let mut synced = metadata();
         synced.synced = true;
         let synced_decision = SessionDecision {
@@ -859,7 +981,9 @@ mod tests {
             0x10,
             true,
         ));
-        let hit = table.lookup(&key, now + 2_000_000, 0x10).expect("synced session");
+        let hit = table
+            .lookup(&key, now + 2_000_000, 0x10)
+            .expect("synced session");
         assert_eq!(hit.metadata, synced);
         assert_eq!(hit.decision, synced_decision);
     }
@@ -1012,10 +1136,11 @@ mod tests {
         };
         assert!(reply_matches_forward_session(
             &forward,
-            NatDecision { 
+            NatDecision {
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                 rewrite_dst: None,
-             ..NatDecision::default() },
+                ..NatDecision::default()
+            },
             &reply,
         ));
     }
@@ -1040,10 +1165,11 @@ mod tests {
         };
         assert!(reply_matches_forward_session(
             &forward,
-            NatDecision { 
+            NatDecision {
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
                 rewrite_dst: None,
-             ..NatDecision::default() },
+                ..NatDecision::default()
+            },
             &reply,
         ));
     }
@@ -1067,10 +1193,11 @@ mod tests {
             src_port: 5201,
             dst_port: 42424,
         };
-        let nat = NatDecision { 
+        let nat = NatDecision {
             rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
             rewrite_dst: None,
-         ..NatDecision::default() };
+            ..NatDecision::default()
+        };
         let decision = SessionDecision {
             resolution: resolution(),
             nat,
@@ -1084,7 +1211,9 @@ mod tests {
             0x10
         ));
 
-        let hit = table.find_forward_nat_match(&reply).expect("forward nat match");
+        let hit = table
+            .find_forward_nat_match(&reply)
+            .expect("forward nat match");
         assert_eq!(hit.key, forward);
         assert_eq!(hit.decision.nat, nat);
 
@@ -1210,7 +1339,11 @@ mod tests {
             src_port: 8080,
             dst_port: 54321,
         };
-        assert!(reply_matches_forward_session(&forward, nat, &expected_reply));
+        assert!(reply_matches_forward_session(
+            &forward,
+            nat,
+            &expected_reply
+        ));
     }
 
     #[test]
@@ -1242,7 +1375,11 @@ mod tests {
             src_port: 8080,
             dst_port: 54321,
         };
-        assert!(reply_matches_forward_session(&forward, nat, &expected_reply));
+        assert!(reply_matches_forward_session(
+            &forward,
+            nat,
+            &expected_reply
+        ));
     }
 
     #[test]
@@ -1270,7 +1407,11 @@ mod tests {
             src_port: 0x1234,
             dst_port: 0,
         };
-        assert!(reply_matches_forward_session(&forward, nat, &expected_reply));
+        assert!(reply_matches_forward_session(
+            &forward,
+            nat,
+            &expected_reply
+        ));
     }
 
     #[test]
@@ -1312,7 +1453,9 @@ mod tests {
             0x10
         ));
 
-        let hit = table.find_forward_nat_match(&reply).expect("forward nat match with port");
+        let hit = table
+            .find_forward_nat_match(&reply)
+            .expect("forward nat match with port");
         assert_eq!(hit.key, forward);
         assert_eq!(hit.decision.nat, nat);
 
