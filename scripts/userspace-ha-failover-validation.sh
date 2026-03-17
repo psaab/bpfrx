@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+IPERF_METRICS="${PROJECT_ROOT}/scripts/iperf-json-metrics.py"
 ENV_FILE="${BPFRX_CLUSTER_ENV:-${PROJECT_ROOT}/test/incus/loss-userspace-cluster.env}"
 RG="${RG:-1}"
 SOURCE_NODE="${SOURCE_NODE:-0}"
@@ -29,6 +30,8 @@ MAX_ZERO_INTERVALS="${MAX_ZERO_INTERVALS:-2}"
 MAX_STREAM_ZERO_INTERVALS="${MAX_STREAM_ZERO_INTERVALS:-0}"
 MAX_PREFLIGHT_ZERO_INTERVALS="${MAX_PREFLIGHT_ZERO_INTERVALS:-0}"
 MAX_PREFLIGHT_STREAM_ZERO_INTERVALS="${MAX_PREFLIGHT_STREAM_ZERO_INTERVALS:-0}"
+MAX_RETRANSMITS="${MAX_RETRANSMITS:-}"
+MAX_RETRANSMITS_PER_GB="${MAX_RETRANSMITS_PER_GB:-}"
 POST_FAILOVER_OBSERVE="${POST_FAILOVER_OBSERVE:-10}"
 RESTORE_SOURCE_NODE="${RESTORE_SOURCE_NODE:-1}"
 ALLOW_STALE_SESSIONS="${ALLOW_STALE_SESSIONS:-0}"
@@ -69,6 +72,8 @@ HOST="${REMOTE_PREFIX}${LAN_HOST}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp/userspace-ha-failover-rg${RG}-$(date +%Y%m%d-%H%M%S)}"
 REMOTE_IPERF_LOG="/tmp/userspace-iperf-rg${RG}-failover.log"
 REMOTE_IPERF_UNIT="userspace-ha-rg${RG}-iperf3.service"
+LOCAL_IPERF_LOG="${ARTIFACT_DIR}/iperf3.log"
+LOCAL_IPERF_METRICS="${ARTIFACT_DIR}/iperf3.metrics.json"
 FAILED=0
 
 info() { printf '==> %s\n' "$*"; }
@@ -280,7 +285,7 @@ start_iperf() {
 	local attempt
 	for attempt in 1 2 3; do
 		run_host "systemctl stop ${REMOTE_IPERF_UNIT} >/dev/null 2>&1 || true; systemctl reset-failed ${REMOTE_IPERF_UNIT} >/dev/null 2>&1 || true; pkill -9 iperf3 2>/dev/null || true; rm -f ${REMOTE_IPERF_LOG}"
-		run_host "systemd-run --quiet --unit ${REMOTE_IPERF_UNIT%.service} /bin/sh -c $(printf %q "exec iperf3 --forceflush --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > ${REMOTE_IPERF_LOG} 2>&1")"
+		run_host "systemd-run --quiet --unit ${REMOTE_IPERF_UNIT%.service} /bin/sh -c $(printf %q "exec iperf3 --json-stream --forceflush --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > ${REMOTE_IPERF_LOG} 2>&1")"
 		sleep 8
 		if ! run_host "pgrep -x iperf3 >/dev/null"; then
 			info "iperf3 exited on attempt ${attempt}, retrying"
@@ -292,44 +297,82 @@ start_iperf() {
 	return 1
 }
 
-recent_dead_streams() {
-	local tail_lines=$(( IPERF_STREAMS * 2 + 8 ))
-	run_host "tail -n ${tail_lines} ${REMOTE_IPERF_LOG} 2>/dev/null | grep -E '^\[[[:space:]]*[0-9]+\]' | tail -n ${IPERF_STREAMS} | grep -c '0.00 bits/sec' || true"
+recent_interval_metric() {
+	local intervals="$1"
+	local metric="$2"
+	local tail_lines=$(( intervals + 8 ))
+	local recent_lines
+	recent_lines="$(run_host "tail -n ${tail_lines} ${REMOTE_IPERF_LOG} 2>/dev/null || true")"
+	python3 - "$metric" "$recent_lines" <<'PY'
+import json
+import sys
+
+metric = sys.argv[1]
+raw_lines = sys.argv[2]
+intervals = []
+for raw in raw_lines.splitlines():
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        event = json.loads(raw)
+    except Exception:
+        continue
+    if event.get("event") == "interval":
+        intervals.append(event.get("data") or {})
+
+if not intervals:
+    print("0")
+    raise SystemExit(0)
+
+last = intervals[-1]
+stream_zero_total = 0
+zero_streams = set()
+aggregate_zero_total = 0
+for interval in intervals:
+    if float((interval.get("sum") or {}).get("bits_per_second") or 0.0) <= 0.0:
+        aggregate_zero_total += 1
+    for stream in interval.get("streams", []):
+        if float(stream.get("bits_per_second") or 0.0) <= 0.0:
+            stream_zero_total += 1
+            zero_streams.add(str(stream.get("socket") or stream.get("id") or "?"))
+
+if metric == "dead_streams":
+    print(
+        sum(
+            1
+            for stream in last.get("streams", [])
+            if float(stream.get("bits_per_second") or 0.0) <= 0.0
+        )
+    )
+elif metric == "zero_intervals":
+    print(aggregate_zero_total + stream_zero_total)
+elif metric == "stream_zero_intervals":
+    print(stream_zero_total)
+elif metric == "zero_streams":
+    print(len(zero_streams))
+else:
+    raise SystemExit(f"unsupported recent interval metric: {metric}")
+PY
 }
 
-recent_iperf_lines() {
-	local intervals="$1"
-	local tail_lines=$(( intervals * (IPERF_STREAMS + 3) + 16 ))
-	run_host "tail -n ${tail_lines} ${REMOTE_IPERF_LOG} 2>/dev/null || true"
+recent_dead_streams() {
+	recent_interval_metric 1 dead_streams
 }
 
 count_recent_zero_intervals() {
 	local intervals="$1"
-	recent_iperf_lines "$intervals" |
-		grep -E '^\[[[:space:]]*[0-9]+\]|^\[SUM\]' 2>/dev/null |
-		grep -c '0.00 bits/sec' || true
+	recent_interval_metric "$intervals" zero_intervals
 }
 
 count_recent_stream_zero_intervals() {
 	local intervals="$1"
-	recent_iperf_lines "$intervals" |
-		grep -E '^\[[[:space:]]*[0-9]+\]' 2>/dev/null |
-		grep -c '0.00 bits/sec' || true
+	recent_interval_metric "$intervals" stream_zero_intervals
 }
 
 count_recent_zero_streams() {
 	local intervals="$1"
-	python3 - <<'PY' "$(recent_iperf_lines "$intervals")"
-import re
-import sys
-
-zero_streams = set()
-for line in sys.argv[1].splitlines():
-    m = re.match(r'^\[\s*(\d+)\]', line)
-    if m and "0.00 bits/sec" in line:
-        zero_streams.add(m.group(1))
-print(len(zero_streams))
-PY
+	recent_interval_metric "$intervals" zero_streams
 }
 
 iperf_alive() {
@@ -337,11 +380,31 @@ iperf_alive() {
 }
 
 iperf_completed() {
-	run_host "grep -q 'iperf Done' ${REMOTE_IPERF_LOG}"
+	run_host "grep -q '\"event\":\"end\"' ${REMOTE_IPERF_LOG}"
 }
 
 iperf_observed_end_remote() {
-	run_host "grep -E '^\[[[:space:]]*([0-9]+|SUM)\]' ${REMOTE_IPERF_LOG} 2>/dev/null | tail -n 1 | sed -n -E 's/^\\[[^]]+\\][[:space:]]+([0-9]+\\.[0-9]+)-([0-9]+\\.[0-9]+)[[:space:]]+sec.*/\\2/p' || true"
+	local recent_lines
+	recent_lines="$(run_host "tail -n 32 ${REMOTE_IPERF_LOG} 2>/dev/null || true")"
+	python3 - "$recent_lines" <<'PY'
+import json
+import sys
+
+observed = 0.0
+for raw in sys.argv[1].splitlines():
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        event = json.loads(raw)
+    except Exception:
+        continue
+    if event.get("event") == "interval":
+        observed = max(observed, float((event.get("data") or {}).get("sum", {}).get("end") or 0.0))
+    elif event.get("event") == "end":
+        observed = max(observed, float((event.get("data") or {}).get("sum_sent", {}).get("end") or 0.0))
+print(f"{observed:.3f}" if observed > 0 else "")
+PY
 }
 
 iperf_reached_expected_duration_remote() {
@@ -371,105 +434,79 @@ wait_for_iperf_finish() {
 
 copy_artifacts() {
 	mkdir -p "${ARTIFACT_DIR}"
-	run_host "cat ${REMOTE_IPERF_LOG} 2>/dev/null || true" >"${ARTIFACT_DIR}/iperf3.log"
+	run_host "cat ${REMOTE_IPERF_LOG} 2>/dev/null || true" >"${LOCAL_IPERF_LOG}"
+	if ! python3 "${IPERF_METRICS}" "${LOCAL_IPERF_LOG}" >"${LOCAL_IPERF_METRICS}" 2>"${ARTIFACT_DIR}/iperf3.metrics.err"; then
+		printf '{"ok":false,"error":"metrics_parse_failed"}\n' >"${LOCAL_IPERF_METRICS}"
+	fi
 }
 
-iperf_log_metric() {
-	python3 - <<'PY' "${ARTIFACT_DIR}/iperf3.log" "${IPERF_DURATION}" "${IPERF_COMPLETION_GRACE_SEC}" "$1"
+iperf_metrics_field() {
+	python3 - "${LOCAL_IPERF_METRICS}" "$1" <<'PY'
+import json
 import pathlib
-import re
-import statistics
 import sys
 
 path = pathlib.Path(sys.argv[1])
-duration = float(sys.argv[2])
-grace = float(sys.argv[3])
-metric = sys.argv[4]
-
+field = sys.argv[2]
 if not path.exists():
-    print("0")
+    print("")
     raise SystemExit(0)
 
-unit_scale = {"K": 1e3, "M": 1e6, "G": 1e9, None: 1.0}
-interval_re = re.compile(
-    r'^\[\s*(\d+|SUM)\]\s+([0-9]+\.[0-9]+)-([0-9]+\.[0-9]+)\s+sec\s+.*?([0-9]+\.[0-9]+)\s+([KMG])?bits/sec'
-)
-sender_re = re.compile(r'^\[SUM\].*?([0-9]+\.[0-9]+)\s+([KMG])bits/sec\s+.*sender$')
-
-intervals = []
-sender_bps = None
-
-for line in path.read_text(encoding="utf-8").splitlines():
-    sender = sender_re.match(line)
-    if sender:
-        sender_bps = float(sender.group(1)) * unit_scale[sender.group(2)]
-        continue
-    m = interval_re.match(line)
-    if not m:
-        continue
-    ident, start, end, value, unit = m.groups()
-    intervals.append((ident, float(start), float(end), float(value) * unit_scale[unit]))
-
-observed_end = max((end for _, _, end, _ in intervals), default=0.0)
-ignore_teardown = sender_bps is None and observed_end >= (duration - grace)
-teardown_cutoff = duration - grace if ignore_teardown else None
-
-filtered = []
-for ident, start, end, bps in intervals:
-    if teardown_cutoff is not None and end >= teardown_cutoff:
-        continue
-    filtered.append((ident, start, end, bps))
-
-sum_intervals = [bps for ident, _, _, bps in filtered if ident == "SUM"]
-stream_zero_records = [(ident, start, end) for ident, start, end, bps in filtered if ident != "SUM" and bps <= 0.0]
-sum_zero_records = [(start, end) for ident, start, end, bps in filtered if ident == "SUM" and bps <= 0.0]
-
-if metric == "observed_end":
-    print(f"{observed_end:.3f}")
-elif metric == "completed_without_summary":
-    print("1" if ignore_teardown else "0")
-elif metric == "zero_intervals":
-    print(len(sum_zero_records) + len(stream_zero_records))
-elif metric == "stream_zero_intervals":
-    print(len(stream_zero_records))
-elif metric == "zero_streams":
-    print(len({ident for ident, _, _ in stream_zero_records}))
-elif metric == "sender_gbps":
-    if sender_bps is not None:
-        print(f"{sender_bps / 1e9:.3f}")
-    elif sum_intervals:
-        print(f"{statistics.mean(sum_intervals) / 1e9:.3f}")
-    else:
-        print("0")
+data = json.loads(path.read_text(encoding="utf-8"))
+value = data.get(field, "")
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif isinstance(value, (int, float)):
+    print(value)
 else:
-    raise SystemExit(f"unsupported metric: {metric}")
+    print(value)
 PY
 }
 
 count_zero_intervals() {
-	iperf_log_metric zero_intervals
+	iperf_metrics_field zero_intervals_total
 }
 
 count_stream_zero_intervals() {
-	iperf_log_metric stream_zero_intervals
+	iperf_metrics_field stream_zero_intervals_total
 }
 
 count_zero_streams() {
-	iperf_log_metric zero_streams
+	iperf_metrics_field zero_streams_total
 }
 
 extract_sender_throughput() {
-	local line
-	line="$(grep '\[SUM\].*sender' "${ARTIFACT_DIR}/iperf3.log" 2>/dev/null | tail -1 || true)"
-	if [[ "$line" =~ ([0-9.]+)[[:space:]]+Gbits/sec ]]; then
-		printf '%s\n' "${BASH_REMATCH[1]}"
+	local value
+	value="$(iperf_metrics_field avg_gbps)"
+	printf '%.3f\n' "${value:-0}"
+}
+
+extract_retransmits() {
+	local value
+	value="$(iperf_metrics_field retransmits)"
+	printf '%s\n' "${value:-0}"
+}
+
+iperf_collapse_detected() {
+	[[ "$(iperf_metrics_field collapse_detected)" == "true" ]]
+}
+
+iperf_collapse_reason() {
+	iperf_metrics_field collapse_reason
+}
+
+iperf_completed_local() {
+	[[ "$(iperf_metrics_field completed)" == "true" ]]
+}
+
+iperf_effectively_completed_local() {
+	local completed observed_end
+	completed="$(iperf_metrics_field completed)"
+	if [[ "$completed" == "true" ]]; then
 		return 0
 	fi
-	if [[ "$line" =~ ([0-9.]+)[[:space:]]+Mbits/sec ]]; then
-		awk "BEGIN{printf \"%.3f\", ${BASH_REMATCH[1]} / 1000}"
-		return 0
-	fi
-	iperf_log_metric sender_gbps
+	observed_end="$(iperf_metrics_field observed_end_sec)"
+	awk "BEGIN{exit !(${observed_end:-0} >= (${IPERF_DURATION} - ${IPERF_COMPLETION_GRACE_SEC}))}"
 }
 
 cycle_sleep() {
@@ -733,8 +770,35 @@ else
 	fail "sender throughput too low: ${throughput} Gbps"
 fi
 
-if grep -q "iperf Done" "${ARTIFACT_DIR}/iperf3.log" 2>/dev/null; then
+retransmits="$(extract_retransmits)"
+pass "sender retransmits ${retransmits}"
+if [[ -n "${MAX_RETRANSMITS}" ]]; then
+	if [[ "${retransmits}" -le "${MAX_RETRANSMITS}" ]]; then
+		pass "retransmits ${retransmits} within limit ${MAX_RETRANSMITS}"
+	else
+		fail "retransmits ${retransmits} exceed limit ${MAX_RETRANSMITS}"
+	fi
+fi
+
+if [[ -n "${MAX_RETRANSMITS_PER_GB}" ]]; then
+	retrans_per_gb="$(awk "BEGIN{if (${throughput} <= 0) {print 0} else {printf \"%.3f\", ${retransmits} / ${throughput}}}")"
+	if awk "BEGIN{exit !(${retrans_per_gb} <= ${MAX_RETRANSMITS_PER_GB})}"; then
+		pass "retransmits per Gbps ${retrans_per_gb} within limit ${MAX_RETRANSMITS_PER_GB}"
+	else
+		fail "retransmits per Gbps ${retrans_per_gb} exceed limit ${MAX_RETRANSMITS_PER_GB}"
+	fi
+fi
+
+if iperf_collapse_detected; then
+	fail "iperf3 interval collapse detected: $(iperf_collapse_reason)"
+else
+	pass "iperf3 interval collapse not detected"
+fi
+
+if iperf_completed_local; then
 	pass "iperf3 completed successfully"
+elif iperf_effectively_completed_local && awk "BEGIN{exit !(${throughput} >= ${MIN_THROUGHPUT})}"; then
+	pass "iperf3 data transfer completed with adequate throughput despite control socket disruption"
 elif awk "BEGIN{exit !(${throughput} >= ${MIN_THROUGHPUT})}"; then
 	pass "iperf3 data transfer completed with adequate throughput despite control socket disruption"
 else
