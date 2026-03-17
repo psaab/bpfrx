@@ -1881,6 +1881,7 @@ fn poll_binding(
 ) -> bool {
     #[derive(Default)]
     struct BatchCounters {
+        touched: bool,
         rx_packets: u64,
         rx_bytes: u64,
         rx_batches: u64,
@@ -1897,6 +1898,9 @@ fn poll_binding(
 
     impl BatchCounters {
         fn flush(&mut self, live: &BindingLiveState) {
+            if !self.touched {
+                return;
+            }
             if self.rx_packets != 0 {
                 live.rx_packets
                     .fetch_add(self.rx_packets, Ordering::Relaxed);
@@ -1956,6 +1960,7 @@ fn poll_binding(
                     .fetch_add(self.dnat_packets, Ordering::Relaxed);
                 self.dnat_packets = 0;
             }
+            self.touched = false;
         }
     }
 
@@ -1964,7 +1969,6 @@ fn poll_binding(
         return false;
     };
     let area = (&binding.umem.area) as *const MmapArea;
-    let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
     let tx_work = drain_pending_tx(binding, now_ns, shared_recycles);
     apply_shared_recycles(
@@ -1979,6 +1983,7 @@ fn poll_binding(
     let mut did_work = tx_work || fill_work;
     binding.dbg_poll_cycles += 1;
     let mut counters = BatchCounters::default();
+    let mut ident: Option<BindingIdentity> = None;
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
         // Backpressure: skip RX when TX queues are heavily loaded to prevent
         // fill ring exhaustion. The NIC holds packets until we refill (#201).
@@ -2025,12 +2030,17 @@ fn poll_binding(
             return did_work;
         }
         binding.empty_rx_polls = 0;
+        if ident.is_none() {
+            ident = Some(binding.identity());
+        }
+        let ident = ident.as_ref().expect("identity initialized when RX has work");
 
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
         binding.scratch_forwards.clear();
         let mut rst_teardowns: Vec<(SessionKey, NatDecision)> = Vec::new();
         while let Some(desc) = received.read() {
+            counters.touched = true;
             counters.rx_packets += 1;
             counters.rx_bytes += desc.len as u64;
             dbg.rx += 1;

@@ -130,6 +130,17 @@ Current measured slice:
    - `enqueue_pending_forwards` about `5.07%`
 4. this is a valid keep, but it is not the main win; the direct-path copy is
    still the largest remaining single cost
+5. the current slice on top of that defers ingress-identity construction until
+   RX work actually exists and skips zero-counter flush walks on empty polls
+6. matched perf on active `fw0` for that slice showed:
+   - `poll_binding` about `16.06%`
+   - `__memmove_evex_unaligned_erms` about `14.38%`
+   - `enqueue_pending_forwards` about `4.68%`
+   - `resolve_flow_session_decision` about `2.72%`
+7. the same slice stayed clean under the HA failover gate:
+   - `0` aggregate zero-throughput intervals
+   - `0` per-stream zero-throughput intervals
+   - about `21.1 Gbps` sender throughput during the 30s RG1 failover run
 
 Non-goal:
 1. no more blind wake-throttling or idle-thinning experiments
