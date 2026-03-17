@@ -66,8 +66,8 @@ mod tx;
 use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
     AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
-    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets,
-    reserved_tx_frames, umem_ring_size,
+    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets, reserved_tx_frames,
+    umem_ring_size,
 };
 #[cfg(test)]
 use self::bind::{
@@ -1575,8 +1575,6 @@ struct PendingForwardRequest {
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
     flow_key: Option<SessionKey>,
-    may_segment_tcp: bool,
-    is_nat64: bool,
     /// NAT64 reverse info for cross-AF translation (IPv4 reply → IPv6).
     nat64_reverse: Option<Nat64ReverseInfo>,
     /// Pre-built frame bytes that bypass normal frame building.
@@ -2109,9 +2107,7 @@ fn poll_binding(
         if ident.is_none() {
             ident = Some(binding.identity());
         }
-        let ident = ident
-            .as_ref()
-            .expect("identity initialized when RX has work");
+        let ident = ident.as_ref().expect("identity initialized when RX has work");
 
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
@@ -2850,8 +2846,6 @@ fn poll_binding(
                                                 apply_nat_on_fabric: false,
                                                 expected_ports: None,
                                                 flow_key: None,
-                                                may_segment_tcp: false,
-                                                is_nat64: false,
                                                 nat64_reverse: None,
                                                 prebuilt_frame: Some(rewritten_frame),
                                             });
@@ -3842,15 +3836,6 @@ fn build_live_forward_request(
     let expected_ports = session_ports
         .or_else(|| live_frame_ports(area, desc, meta))
         .or(meta_ports);
-    let l3_hint = match meta.l3_offset {
-        14 | 18 => meta.l3_offset as usize,
-        _ => 14,
-    };
-    let egress_mtu = forwarding
-        .egress
-        .get(&decision.resolution.egress_ifindex)
-        .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex))
-        .map(|egress| egress.mtu.max(1280));
     let mut decision = *decision;
     if decision.resolution.disposition == ForwardingDisposition::FabricRedirect
         && let Some(ingress_zone) = fabric_ingress_zone
@@ -3870,11 +3855,6 @@ fn build_live_forward_request(
         apply_nat_on_fabric,
         expected_ports,
         flow_key: flow.map(|flow| flow.forward_key.clone()),
-        may_segment_tcp: meta.protocol == PROTO_TCP
-            && egress_mtu
-                .map(|mtu| desc.len as usize > l3_hint.saturating_add(mtu as usize))
-                .unwrap_or(false),
-        is_nat64: decision.nat.nat64,
         nat64_reverse: None,
         prebuilt_frame: None,
     })
@@ -8160,10 +8140,7 @@ mod tests {
             ),
             None
         );
-        assert_eq!(
-            shared_umem_group_key_for_device(Some("mlx5_core"), None),
-            None
-        );
+        assert_eq!(shared_umem_group_key_for_device(Some("mlx5_core"), None), None);
     }
 
     #[test]
@@ -11619,80 +11596,6 @@ mod tests {
 
         assert_eq!(req.target_ifindex, 11);
         assert_eq!(req.target_binding_index, Some(5));
-        assert!(!req.may_segment_tcp);
-    }
-
-    #[test]
-    fn build_live_forward_request_marks_large_tcp_for_segmentation_check() {
-        let mut area = MmapArea::new(2048).expect("mmap");
-        area.slice_mut(0, 1600).expect("slice").fill(0xaa);
-        let ingress_ident = BindingIdentity {
-            slot: 7,
-            queue_id: 3,
-            worker_id: 0,
-            interface: Arc::<str>::from("ge-0-0-1"),
-            ifindex: 10,
-        };
-        let meta = UserspaceDpMeta {
-            magic: USERSPACE_META_MAGIC,
-            version: USERSPACE_META_VERSION,
-            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
-            l3_offset: 14,
-            l4_offset: 34,
-            addr_family: libc::AF_INET as u8,
-            protocol: PROTO_TCP,
-            flow_src_port: 12345,
-            flow_dst_port: 5201,
-            ..UserspaceDpMeta::default()
-        };
-        let decision = SessionDecision {
-            resolution: ForwardingResolution {
-                disposition: ForwardingDisposition::ForwardCandidate,
-                local_ifindex: 0,
-                egress_ifindex: 12,
-                tx_ifindex: 11,
-                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
-                neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
-                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
-                tx_vlan_id: 80,
-            },
-            nat: NatDecision::default(),
-        };
-        let mut forwarding = ForwardingState::default();
-        forwarding.egress.insert(
-            12,
-            EgressInterface {
-                bind_ifindex: 11,
-                vlan_id: 80,
-                mtu: 1500,
-                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
-                zone: "wan".to_string(),
-                redundancy_group: 1,
-                primary_v4: Some(Ipv4Addr::new(172, 16, 80, 8)),
-                primary_v6: None,
-            },
-        );
-
-        let req = build_live_forward_request(
-            &area,
-            &WorkerBindingLookup::default(),
-            2,
-            &ingress_ident,
-            XdpDesc {
-                addr: 0,
-                len: 1600,
-                options: 0,
-            },
-            meta,
-            &decision,
-            &forwarding,
-            None,
-            None,
-            false,
-        )
-        .expect("request");
-
-        assert!(req.may_segment_tcp);
     }
 
     #[test]

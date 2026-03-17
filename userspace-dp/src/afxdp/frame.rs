@@ -187,67 +187,65 @@ pub(super) fn enqueue_pending_forwards(
         let mut copied_source_frame = false;
         let mut retained_source_frame = false;
         {
-            if request.may_segment_tcp {
-                if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
-                    source_frame,
-                    request.meta,
-                    &request.decision,
-                    forwarding,
-                    request.apply_nat_on_fabric,
-                    expected_ports,
-                ) {
-                    for frame in segmented {
-                        if cfg!(feature = "debug-log") {
-                            if let Some(reason) = forward_tuple_mismatch_reason(
-                                live_frame_ports_bytes(
-                                    source_frame,
-                                    request.meta.addr_family,
-                                    request.meta.protocol,
-                                ),
-                                expected_ports,
-                                live_frame_ports_bytes(
-                                    &frame,
-                                    request.meta.addr_family,
-                                    request.meta.protocol,
-                                ),
-                            ) {
-                                record_exception(
-                                    recent_exceptions,
-                                    ingress_ident,
-                                    &reason,
-                                    frame.len() as u32,
-                                    Some(request.meta),
-                                    None,
-                                );
-                                build_failed = true;
-                                break;
-                            }
-                        }
-                        let seg_frame_len = frame.len();
-                        target_binding.pending_tx_local.push_back(TxRequest {
-                            bytes: frame,
+            if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
+                source_frame,
+                request.meta,
+                &request.decision,
+                forwarding,
+                request.apply_nat_on_fabric,
+                expected_ports,
+            ) {
+                for frame in segmented {
+                    if cfg!(feature = "debug-log") {
+                        if let Some(reason) = forward_tuple_mismatch_reason(
+                            live_frame_ports_bytes(
+                                source_frame,
+                                request.meta.addr_family,
+                                request.meta.protocol,
+                            ),
                             expected_ports,
-                            expected_addr_family: request.meta.addr_family,
-                            expected_protocol: request.meta.protocol,
-                            flow_key: request.flow_key.clone(),
-                        });
-                        bound_pending_tx_local(target_binding);
-                        dbg.enqueue_ok += 1;
-                        dbg.enqueue_copy += 1;
-                        target_binding.pending_copy_tx_packets += 1;
-                        dbg.tx_bytes_total += seg_frame_len as u64;
-                        if (seg_frame_len as u32) > dbg.tx_max_frame {
-                            dbg.tx_max_frame = seg_frame_len as u32;
+                            live_frame_ports_bytes(
+                                &frame,
+                                request.meta.addr_family,
+                                request.meta.protocol,
+                            ),
+                        ) {
+                            record_exception(
+                                recent_exceptions,
+                                ingress_ident,
+                                &reason,
+                                frame.len() as u32,
+                                Some(request.meta),
+                                None,
+                            );
+                            build_failed = true;
+                            break;
                         }
                     }
-                    copied_source_frame = true;
-                    if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
-                        let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
+                    let seg_frame_len = frame.len();
+                    target_binding.pending_tx_local.push_back(TxRequest {
+                        bytes: frame,
+                        expected_ports,
+                        expected_addr_family: request.meta.addr_family,
+                        expected_protocol: request.meta.protocol,
+                        flow_key: request.flow_key.clone(),
+                    });
+                    bound_pending_tx_local(target_binding);
+                    dbg.enqueue_ok += 1;
+                    dbg.enqueue_copy += 1;
+                    target_binding.pending_copy_tx_packets += 1;
+                    dbg.tx_bytes_total += seg_frame_len as u64;
+                    if (seg_frame_len as u32) > dbg.tx_max_frame {
+                        dbg.tx_max_frame = seg_frame_len as u32;
                     }
+                }
+                copied_source_frame = true;
+                if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
+                    let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
                 }
             }
             // Track when segmentation was needed but returned None
-            if request.may_segment_tcp && !copied_source_frame {
+            if !copied_source_frame && source_frame.len() > 1514 {
                 dbg.seg_needed_but_none += 1;
                 thread_local! {
                     static SEG_MISS_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -273,6 +271,10 @@ pub(super) fn enqueue_pending_forwards(
                 });
             }
             if !copied_source_frame {
+                // NAT64: header size changes prevent in-place rewrite.
+                // Always use copy path with NAT64-specific frame builder.
+                let is_nat64 = request.decision.nat.nat64;
+
                 /*
                  * In-place TX optimization: rewrite the ingress frame directly in UMEM
                  * and submit it to the target binding's TX ring without copying.
@@ -281,7 +283,7 @@ pub(super) fn enqueue_pending_forwards(
                  * same-device shared-UMEM prototype.
                  */
                 let can_rewrite_in_place =
-                    target_binding.umem.allocation_ptr() == ingress_umem_ptr && !request.is_nat64;
+                    target_binding.umem.allocation_ptr() == ingress_umem_ptr && !is_nat64;
                 if can_rewrite_in_place {
                     match rewrite_forwarded_frame_in_place(
                         unsafe { &*ingress_area },
@@ -312,7 +314,7 @@ pub(super) fn enqueue_pending_forwards(
                             }
                             retained_source_frame = true;
                         }
-                        None => match if request.is_nat64 {
+                        None => match if is_nat64 {
                             build_nat64_forwarded_frame(
                                 source_frame,
                                 request.meta,
@@ -396,27 +398,118 @@ pub(super) fn enqueue_pending_forwards(
                     // intermediate Vec allocation and one memcpy.
                     // NAT64 cannot use direct TX (header size changes), so
                     // it falls through to the copy path below.
-                    let direct_built = match try_enqueue_direct_forward_fast_path(
-                        target_binding,
-                        source_frame,
-                        &request,
-                        now_ns,
-                        ingress_ident,
-                        recent_exceptions,
-                        dbg,
-                        &mut post_recycles,
-                    ) {
-                        DirectForwardFastPath::Enqueued => true,
-                        DirectForwardFastPath::BuildFailed => {
-                            build_failed = true;
-                            fallback_to_slow_path = true;
-                            true
+                    let mut direct_tx_offset = target_binding.free_tx_frames.pop_front();
+                    if direct_tx_offset.is_none()
+                        && (target_binding.outstanding_tx > 0
+                            || !target_binding.pending_tx_prepared.is_empty()
+                            || !target_binding.pending_tx_local.is_empty())
+                    {
+                        let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
+                        direct_tx_offset = target_binding.free_tx_frames.pop_front();
+                    }
+                    let direct_built = if is_nat64 {
+                        // NAT64 can't use direct TX — return the frame if we popped one.
+                        if let Some(off) = direct_tx_offset {
+                            target_binding.free_tx_frames.push_front(off);
                         }
-                        DirectForwardFastPath::NotTaken => false,
+                        false
+                    } else if let Some(tx_offset) = direct_tx_offset {
+                        let target_area = target_binding.umem.area();
+                        let written = unsafe {
+                            target_area.slice_mut_unchecked(tx_offset as usize, tx_frame_capacity())
+                        }
+                        .and_then(|out| {
+                            build_forwarded_frame_into_from_frame(
+                                out,
+                                source_frame,
+                                request.meta,
+                                &request.decision,
+                                request.apply_nat_on_fabric,
+                                expected_ports,
+                            )
+                        });
+                        if let Some(written) = written {
+                            // Debug-only: validate built frame ports match expected.
+                            // enforce_expected_ports() in build_forwarded_frame_into_from_frame
+                            // already ensures correctness; this catches builder bugs.
+                            if cfg!(feature = "debug-log") {
+                                let built_ports = unsafe {
+                                    target_area.slice_mut_unchecked(tx_offset as usize, written)
+                                }
+                                .and_then(|f| {
+                                    live_frame_ports_bytes(
+                                        f,
+                                        request.meta.addr_family,
+                                        request.meta.protocol,
+                                    )
+                                });
+                                if let Some(reason) = forward_tuple_mismatch_reason(
+                                    live_frame_ports_bytes(
+                                        source_frame,
+                                        request.meta.addr_family,
+                                        request.meta.protocol,
+                                    ),
+                                    expected_ports,
+                                    built_ports,
+                                ) {
+                                    target_binding.free_tx_frames.push_front(tx_offset);
+                                    record_exception(
+                                        recent_exceptions,
+                                        ingress_ident,
+                                        &reason,
+                                        written as u32,
+                                        Some(request.meta),
+                                        None,
+                                    );
+                                    build_failed = true;
+                                }
+                            }
+                            if build_failed {
+                                target_binding.free_tx_frames.push_front(tx_offset);
+                                true
+                            } else if written > tx_frame_capacity() {
+                                target_binding.free_tx_frames.push_front(tx_offset);
+                                record_exception(
+                                    recent_exceptions,
+                                    ingress_ident,
+                                    "oversized_forward_frame",
+                                    written as u32,
+                                    Some(request.meta),
+                                    None,
+                                );
+                                true
+                            } else {
+                                target_binding
+                                    .pending_tx_prepared
+                                    .push_back(PreparedTxRequest {
+                                        offset: tx_offset,
+                                        len: written as u32,
+                                        recycle: PreparedTxRecycle::FreeTxFrame,
+                                        expected_ports,
+                                        expected_addr_family: request.meta.addr_family,
+                                        expected_protocol: request.meta.protocol,
+                                        flow_key: request.flow_key.clone(),
+                                    });
+                                bound_pending_tx_prepared(target_binding);
+                                dbg.enqueue_ok += 1;
+                                dbg.enqueue_direct += 1;
+                                target_binding.pending_direct_tx_packets += 1;
+                                dbg.tx_bytes_total += written as u64;
+                                if (written as u32) > dbg.tx_max_frame {
+                                    dbg.tx_max_frame = written as u32;
+                                }
+                                true
+                            }
+                        } else {
+                            target_binding.free_tx_frames.push_front(tx_offset);
+                            false
+                        }
+                    } else {
+                        false
                     };
                     // Fallback: Vec copy path when direct build unavailable.
                     if !direct_built {
-                        match if request.is_nat64 {
+                        match if is_nat64 {
                             build_nat64_forwarded_frame(
                                 source_frame,
                                 request.meta,
@@ -543,114 +636,6 @@ pub(super) fn enqueue_pending_forwards(
         }
         update_binding_debug_state(ingress_binding);
     }
-}
-
-enum DirectForwardFastPath {
-    Enqueued,
-    BuildFailed,
-    NotTaken,
-}
-
-fn try_enqueue_direct_forward_fast_path(
-    target_binding: &mut BindingWorker,
-    source_frame: &[u8],
-    request: &PendingForwardRequest,
-    now_ns: u64,
-    ingress_ident: &BindingIdentity,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
-    dbg: &mut DebugPollCounters,
-    post_recycles: &mut Vec<(u32, u64)>,
-) -> DirectForwardFastPath {
-    if request.is_nat64 {
-        return DirectForwardFastPath::NotTaken;
-    }
-    let mut direct_tx_offset = target_binding.free_tx_frames.pop_front();
-    if direct_tx_offset.is_none()
-        && (target_binding.outstanding_tx > 0
-            || !target_binding.pending_tx_prepared.is_empty()
-            || !target_binding.pending_tx_local.is_empty())
-    {
-        let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
-        direct_tx_offset = target_binding.free_tx_frames.pop_front();
-    }
-    let Some(tx_offset) = direct_tx_offset else {
-        return DirectForwardFastPath::NotTaken;
-    };
-    let target_area = target_binding.umem.area();
-    let written =
-        unsafe { target_area.slice_mut_unchecked(tx_offset as usize, tx_frame_capacity()) }
-            .and_then(|out| {
-                build_forwarded_frame_into_from_frame(
-                    out,
-                    source_frame,
-                    request.meta,
-                    &request.decision,
-                    request.apply_nat_on_fabric,
-                    request.expected_ports,
-                )
-            });
-    let Some(written) = written else {
-        target_binding.free_tx_frames.push_front(tx_offset);
-        return DirectForwardFastPath::NotTaken;
-    };
-    if cfg!(feature = "debug-log") {
-        let built_ports = unsafe { target_area.slice_mut_unchecked(tx_offset as usize, written) }
-            .and_then(|frame| {
-                live_frame_ports_bytes(frame, request.meta.addr_family, request.meta.protocol)
-            });
-        if let Some(reason) = forward_tuple_mismatch_reason(
-            live_frame_ports_bytes(
-                source_frame,
-                request.meta.addr_family,
-                request.meta.protocol,
-            ),
-            request.expected_ports,
-            built_ports,
-        ) {
-            target_binding.free_tx_frames.push_front(tx_offset);
-            record_exception(
-                recent_exceptions,
-                ingress_ident,
-                &reason,
-                written as u32,
-                Some(request.meta),
-                None,
-            );
-            return DirectForwardFastPath::BuildFailed;
-        }
-    }
-    if written > tx_frame_capacity() {
-        target_binding.free_tx_frames.push_front(tx_offset);
-        record_exception(
-            recent_exceptions,
-            ingress_ident,
-            "oversized_forward_frame",
-            written as u32,
-            Some(request.meta),
-            None,
-        );
-        return DirectForwardFastPath::BuildFailed;
-    }
-    target_binding
-        .pending_tx_prepared
-        .push_back(PreparedTxRequest {
-            offset: tx_offset,
-            len: written as u32,
-            recycle: PreparedTxRecycle::FreeTxFrame,
-            expected_ports: request.expected_ports,
-            expected_addr_family: request.meta.addr_family,
-            expected_protocol: request.meta.protocol,
-            flow_key: request.flow_key.clone(),
-        });
-    bound_pending_tx_prepared(target_binding);
-    dbg.enqueue_ok += 1;
-    dbg.enqueue_direct += 1;
-    target_binding.pending_direct_tx_packets += 1;
-    dbg.tx_bytes_total += written as u64;
-    if (written as u32) > dbg.tx_max_frame {
-        dbg.tx_max_frame = written as u32;
-    }
-    DirectForwardFastPath::Enqueued
 }
 
 fn resolve_pending_forward_target_binding<'a>(
