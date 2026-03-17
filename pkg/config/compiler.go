@@ -5269,6 +5269,10 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 			if v := nodeVal(child); v != "" {
 				cfg.RingEntries, _ = strconv.Atoi(v)
 			}
+		case "poll-mode":
+			if v := nodeVal(child); v == "interrupt" || v == "busy-poll" {
+				cfg.PollMode = v
+			}
 		}
 	}
 	return nil

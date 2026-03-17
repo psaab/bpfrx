@@ -337,6 +337,7 @@ type UserspaceConfig struct {
 	StateFile     string `json:"state_file"`     // helper state file path
 	Workers       int    `json:"workers"`        // worker thread count
 	RingEntries   int    `json:"ring_entries"`   // planned AF_XDP ring entries
+	PollMode      string `json:"poll_mode"`      // "busy-poll" (default) or "interrupt"
 }
 
 // RootAuthConfig holds root-authentication settings.

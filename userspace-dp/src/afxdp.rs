@@ -221,6 +221,7 @@ pub struct Coordinator {
     last_planned_bindings: usize,
     reconcile_calls: u64,
     last_reconcile_stage: String,
+    pub poll_mode: crate::PollMode,
 }
 
 impl Coordinator {
@@ -250,6 +251,7 @@ impl Coordinator {
             last_planned_bindings: 0,
             reconcile_calls: 0,
             last_reconcile_stage: "idle".to_string(),
+            poll_mode: crate::PollMode::BusyPoll,
         }
     }
 
@@ -514,6 +516,7 @@ impl Coordinator {
                     session_map_fd: session_map_fd.fd,
                     ring_entries,
                     bind_strategy: preferred_bind_strategy(binding),
+                    poll_mode: self.poll_mode,
                 });
         }
         for plans in workers.values_mut() {
@@ -582,6 +585,7 @@ impl Coordinator {
             let forwarding = forwarding.clone();
             let ha_state = self.ha_state.clone();
             let dynamic_neighbors = self.dynamic_neighbors.clone();
+            let worker_poll_mode = self.poll_mode;
             let join = thread::Builder::new()
                 .name(format!("bpfrx-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -603,6 +607,7 @@ impl Coordinator {
                         peer_commands_clone,
                         stop_clone,
                         heartbeat_clone,
+                        worker_poll_mode,
                     );
                 });
             match join {
@@ -1147,6 +1152,7 @@ struct BindingPlan {
     session_map_fd: c_int,
     ring_entries: u32,
     bind_strategy: AfXdpBindStrategy,
+    poll_mode: crate::PollMode,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1609,6 +1615,7 @@ impl BindingWorker {
         session_map_fd: c_int,
         live: Arc<BindingLiveState>,
         bind_strategy: AfXdpBindStrategy,
+        poll_mode: crate::PollMode,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let total_frames = binding_frame_count(ring_entries).max(1);
         let worker_umem =
@@ -1638,6 +1645,7 @@ impl BindingWorker {
                 ring_entries,
                 bind_strategy,
                 driver_name.as_deref(),
+                poll_mode,
             )
             .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
         prime_fill_ring_offsets(&mut device, &initial_fill_frames)?;
@@ -4129,6 +4137,7 @@ fn worker_loop(
     peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
+    poll_mode: crate::PollMode,
 ) {
     pin_current_thread(worker_id);
     let mut sessions = SessionTable::new();
@@ -4145,6 +4154,7 @@ fn worker_loop(
             plan.session_map_fd,
             plan.live.clone(),
             plan.bind_strategy,
+            plan.poll_mode,
         ) {
             Ok(binding) => bindings.push(binding),
             Err(err) => plan.live.set_error(err.to_string()),
@@ -4797,10 +4807,31 @@ fn worker_loop(
             continue;
         }
         idle_iters = idle_iters.saturating_add(1);
-        if idle_iters <= IDLE_SPIN_ITERS {
-            std::hint::spin_loop();
-        } else {
-            thread::sleep(Duration::from_micros(IDLE_SLEEP_US));
+        match poll_mode {
+            crate::PollMode::BusyPoll => {
+                if idle_iters <= IDLE_SPIN_ITERS {
+                    std::hint::spin_loop();
+                } else {
+                    thread::sleep(Duration::from_micros(IDLE_SLEEP_US));
+                }
+            }
+            crate::PollMode::Interrupt => {
+                // Interrupt mode: use poll() to block until the kernel
+                // delivers packets via interrupt, avoiding CPU burn.
+                if !bindings.is_empty() {
+                    let fd = bindings[0].device.as_raw_fd();
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    unsafe {
+                        libc::poll(&mut pfd, 1, 1); // 1ms timeout
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
         }
     }
     heartbeat.store(monotonic_nanos(), Ordering::Relaxed);
