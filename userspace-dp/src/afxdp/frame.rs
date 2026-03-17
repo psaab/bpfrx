@@ -82,7 +82,7 @@ pub(super) fn enqueue_pending_forwards(
     dbg: &mut DebugPollCounters,
 ) {
     let ingress_area = ingress_binding.umem.area() as *const MmapArea;
-    let mut post_recycles: Vec<(u32, u64)> = Vec::new();
+    let mut post_recycles = core::mem::take(&mut ingress_binding.scratch_shared_recycles);
     for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
@@ -636,6 +636,7 @@ pub(super) fn enqueue_pending_forwards(
         }
         update_binding_debug_state(ingress_binding);
     }
+    ingress_binding.scratch_shared_recycles = post_recycles;
 }
 
 fn resolve_pending_forward_target_binding<'a>(
