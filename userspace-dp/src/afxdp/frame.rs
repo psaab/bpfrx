@@ -134,13 +134,14 @@ pub(super) fn enqueue_pending_forwards(
         };
         let expected_ports = request.expected_ports;
         let ingress_umem_ptr = ingress_binding.umem.allocation_ptr();
-        let Some(target_binding) = find_target_binding_mut(
+        let Some(target_binding) = resolve_pending_forward_target_binding(
             left,
             ingress_index,
             ingress_binding,
             request.ingress_queue_id,
             right,
             binding_lookup,
+            request.target_binding_index,
             request.target_ifindex,
         ) else {
             // No XSK binding for the target interface.  Normally fabric
@@ -594,14 +595,16 @@ pub(super) fn enqueue_pending_forwards(
                 let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
             }
         }
-        apply_shared_recycles(
-            left,
-            ingress_index,
-            ingress_binding,
-            right,
-            binding_lookup,
-            &mut post_recycles,
-        );
+        if !post_recycles.is_empty() {
+            apply_shared_recycles(
+                left,
+                ingress_index,
+                ingress_binding,
+                right,
+                binding_lookup,
+                &mut post_recycles,
+            );
+        }
         update_binding_debug_state(ingress_binding);
         if build_failed {
             handle_forward_build_failure(
