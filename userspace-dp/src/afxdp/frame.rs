@@ -113,10 +113,7 @@ pub(super) fn enqueue_pending_forwards(
             bound_pending_tx_local(target_binding);
             dbg.enqueue_ok += 1;
             dbg.enqueue_copy += 1;
-            target_binding
-                .live
-                .copy_tx_packets
-                .fetch_add(1, Ordering::Relaxed);
+            target_binding.pending_copy_tx_packets += 1;
             dbg.tx_bytes_total += frame_len as u64;
             if (frame_len as u32) > dbg.tx_max_frame {
                 dbg.tx_max_frame = frame_len as u32;
@@ -233,10 +230,7 @@ pub(super) fn enqueue_pending_forwards(
                     bound_pending_tx_local(target_binding);
                     dbg.enqueue_ok += 1;
                     dbg.enqueue_copy += 1;
-                    target_binding
-                        .live
-                        .copy_tx_packets
-                        .fetch_add(1, Ordering::Relaxed);
+                    target_binding.pending_copy_tx_packets += 1;
                     dbg.tx_bytes_total += seg_frame_len as u64;
                     if (seg_frame_len as u32) > dbg.tx_max_frame {
                         dbg.tx_max_frame = seg_frame_len as u32;
@@ -309,10 +303,7 @@ pub(super) fn enqueue_pending_forwards(
                                     flow_key: request.flow_key.clone(),
                                 });
                             bound_pending_tx_prepared(target_binding);
-                            target_binding
-                                .live
-                                .in_place_tx_packets
-                                .fetch_add(1, Ordering::Relaxed);
+                            target_binding.pending_in_place_tx_packets += 1;
                             dbg.enqueue_ok += 1;
                             dbg.enqueue_inplace += 1;
                             dbg.tx_bytes_total += frame_len as u64;
@@ -387,10 +378,7 @@ pub(super) fn enqueue_pending_forwards(
                                 bound_pending_tx_local(target_binding);
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_copy += 1;
-                                target_binding
-                                    .live
-                                    .copy_tx_packets
-                                    .fetch_add(1, Ordering::Relaxed);
+                                target_binding.pending_copy_tx_packets += 1;
                                 dbg.tx_bytes_total += cp1_len as u64;
                                 if (cp1_len as u32) > dbg.tx_max_frame {
                                     dbg.tx_max_frame = cp1_len as u32;
@@ -499,10 +487,7 @@ pub(super) fn enqueue_pending_forwards(
                                 bound_pending_tx_prepared(target_binding);
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_direct += 1;
-                                target_binding
-                                    .live
-                                    .direct_tx_packets
-                                    .fetch_add(1, Ordering::Relaxed);
+                                target_binding.pending_direct_tx_packets += 1;
                                 dbg.tx_bytes_total += written as u64;
                                 if (written as u32) > dbg.tx_max_frame {
                                     dbg.tx_max_frame = written as u32;
@@ -584,10 +569,7 @@ pub(super) fn enqueue_pending_forwards(
                                 bound_pending_tx_local(target_binding);
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_copy += 1;
-                                target_binding
-                                    .live
-                                    .copy_tx_packets
-                                    .fetch_add(1, Ordering::Relaxed);
+                                target_binding.pending_copy_tx_packets += 1;
                                 dbg.tx_bytes_total += cp2_len as u64;
                                 if (cp2_len as u32) > dbg.tx_max_frame {
                                     dbg.tx_max_frame = cp2_len as u32;

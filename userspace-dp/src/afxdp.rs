@@ -1409,6 +1409,9 @@ struct BindingWorker {
     dbg_rx_wake_sendto_ok: u64,    // sendto() returned >= 0 in maybe_wake_rx
     dbg_rx_wake_sendto_err: u64,   // sendto() returned < 0 in maybe_wake_rx
     dbg_rx_wake_sendto_errno: i32, // last errno from sendto in maybe_wake_rx
+    pending_direct_tx_packets: u64,
+    pending_copy_tx_packets: u64,
+    pending_in_place_tx_packets: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1741,6 +1744,9 @@ impl BindingWorker {
             dbg_rx_wake_sendto_ok: 0,
             dbg_rx_wake_sendto_err: 0,
             dbg_rx_wake_sendto_errno: 0,
+            pending_direct_tx_packets: 0,
+            pending_copy_tx_packets: 0,
+            pending_in_place_tx_packets: 0,
         };
         update_binding_debug_state(&mut binding);
         Ok(binding)
@@ -7675,6 +7681,27 @@ fn update_binding_debug_state(binding: &mut BindingWorker) {
     binding.debug_state_counter = binding.debug_state_counter.wrapping_add(1);
     if binding.debug_state_counter & 0xFFFF != 0 {
         return;
+    }
+    if binding.pending_direct_tx_packets != 0 {
+        binding
+            .live
+            .direct_tx_packets
+            .fetch_add(binding.pending_direct_tx_packets, Ordering::Relaxed);
+        binding.pending_direct_tx_packets = 0;
+    }
+    if binding.pending_copy_tx_packets != 0 {
+        binding
+            .live
+            .copy_tx_packets
+            .fetch_add(binding.pending_copy_tx_packets, Ordering::Relaxed);
+        binding.pending_copy_tx_packets = 0;
+    }
+    if binding.pending_in_place_tx_packets != 0 {
+        binding
+            .live
+            .in_place_tx_packets
+            .fetch_add(binding.pending_in_place_tx_packets, Ordering::Relaxed);
+        binding.pending_in_place_tx_packets = 0;
     }
     binding
         .live
