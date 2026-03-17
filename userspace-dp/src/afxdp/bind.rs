@@ -195,15 +195,7 @@ pub(super) fn interface_driver_name(ifname: &str) -> Option<String> {
     target.file_name()?.to_str().map(str::to_string)
 }
 
-pub(super) fn interface_device_path(ifname: &str) -> Option<String> {
-    if ifname.is_empty() {
-        return None;
-    }
-    let device_link = Path::new("/sys/class/net").join(ifname).join("device");
-    let target = std::fs::canonicalize(device_link).ok()?;
-    Some(target.to_string_lossy().into_owned())
-}
-
+#[cfg(test)]
 pub(super) fn shared_umem_group_key_for_device(
     driver: Option<&str>,
     device_path: Option<&str>,
@@ -213,12 +205,6 @@ pub(super) fn shared_umem_group_key_for_device(
         (Some("mlx5_core"), Some(path)) if !path.is_empty() => Some(format!("mlx5:{path}")),
         _ => None,
     }
-}
-
-pub(super) fn shared_umem_group_key(binding: &BindingStatus) -> Option<String> {
-    let driver = interface_driver_name(&binding.interface);
-    let device_path = interface_device_path(&binding.interface);
-    shared_umem_group_key_for_device(driver.as_deref(), device_path.as_deref())
 }
 
 fn try_open_bind(
