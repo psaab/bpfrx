@@ -161,7 +161,8 @@ impl SharedStatus {
 }
 
 pub struct SlowPathReinjector {
-    tx: SyncSender<PacketRequest>,
+    tx: Option<SyncSender<PacketRequest>>,
+    join: Option<thread::JoinHandle<()>>,
     limiter: Mutex<RateLimiter>,
     status: Arc<SharedStatus>,
 }
@@ -172,12 +173,13 @@ impl SlowPathReinjector {
         let (tx, rx) = mpsc::sync_channel(DEFAULT_QUEUE_DEPTH);
         let thread_status = status.clone();
         let name = name.to_string();
-        thread::Builder::new()
+        let join = thread::Builder::new()
             .name("bpfrx-slowpath".to_string())
             .spawn(move || slow_path_worker(&name, rx, thread_status))
             .map_err(|e| format!("spawn slow-path worker: {e}"))?;
         Ok(Self {
-            tx,
+            tx: Some(tx),
+            join: Some(join),
             limiter: Mutex::new(RateLimiter::new(
                 DEFAULT_RATE_LIMIT_PACKETS_PER_SEC,
                 DEFAULT_RATE_LIMIT_BYTES_PER_SEC,
@@ -204,7 +206,17 @@ impl SlowPathReinjector {
             return Ok(EnqueueOutcome::RateLimited);
         }
         self.status.queued_packets.fetch_add(1, Ordering::Relaxed);
-        match self.tx.try_send(PacketRequest { bytes }) {
+        let Some(tx) = self.tx.as_ref() else {
+            self.status.queued_packets.fetch_sub(1, Ordering::Relaxed);
+            self.status.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            self.status
+                .dropped_bytes
+                .fetch_add(packet_len, Ordering::Relaxed);
+            let err = "slow-path worker is not running".to_string();
+            self.status.set_last_error(err.clone());
+            return Err(err);
+        };
+        match tx.try_send(PacketRequest { bytes }) {
             Ok(()) => Ok(EnqueueOutcome::Accepted),
             Err(TrySendError::Full(req)) => {
                 self.status.queued_packets.fetch_sub(1, Ordering::Relaxed);
@@ -235,6 +247,15 @@ impl SlowPathReinjector {
     }
 }
 
+impl Drop for SlowPathReinjector {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 fn slow_path_worker(name: &str, rx: Receiver<PacketRequest>, status: Arc<SharedStatus>) {
     let (tun, actual_name) = match open_tun(name) {
         Ok(v) => v,
@@ -246,6 +267,7 @@ fn slow_path_worker(name: &str, rx: Receiver<PacketRequest>, status: Arc<SharedS
     };
     status.set_device_name(&actual_name);
     status.active.store(true, Ordering::Relaxed);
+    let mut last_ipv4_sysctl_refresh = Instant::now() - Duration::from_secs(1);
 
     let mut mode = match IoUring::new(32) {
         Ok(ring) => {
@@ -261,6 +283,12 @@ fn slow_path_worker(name: &str, rx: Receiver<PacketRequest>, status: Arc<SharedS
 
     while let Ok(req) = rx.recv() {
         status.queued_packets.fetch_sub(1, Ordering::Relaxed);
+        if last_ipv4_sysctl_refresh.elapsed() >= Duration::from_secs(1) {
+            if let Err(err) = ensure_ipv4_sysctl_value(&actual_name, "rp_filter", "0") {
+                status.set_last_error(err);
+            }
+            last_ipv4_sysctl_refresh = Instant::now();
+        }
         let result = match &mut mode {
             WriteMode::IoUring(ring) => write_packet_io_uring(ring, tun.as_raw_fd(), &req.bytes)
                 .or_else(|_| write_packet_sync(tun.as_raw_fd(), &req.bytes)),
@@ -361,9 +389,10 @@ fn open_tun(name: &str) -> Result<(std::fs::File, String), String> {
     let actual_name = ifr.name_string();
     set_if_up(&actual_name)?;
     // Slow-path injected IPv4 replies arrive on the TUN device, but their
-    // reverse route still points at the real egress interface. Disable
-    // per-device rp_filter so the kernel accepts those packets.
-    set_ipv4_sysctl(&actual_name, "rp_filter", "0")?;
+    // reverse route still points at the real egress interface. New links may
+    // get a wildcard rp_filter reapplied shortly after creation, so keep
+    // forcing the per-device value until the interface settles.
+    ensure_ipv4_sysctl_value(&actual_name, "rp_filter", "0")?;
     Ok((tun, actual_name))
 }
 
@@ -405,6 +434,33 @@ fn set_if_up(name: &str) -> Result<(), String> {
 fn set_ipv4_sysctl(iface: &str, key: &str, value: &str) -> Result<(), String> {
     let path = format!("/proc/sys/net/ipv4/conf/{iface}/{key}");
     std::fs::write(&path, value).map_err(|e| format!("write {path}: {e}"))
+}
+
+fn read_ipv4_sysctl(iface: &str, key: &str) -> Result<String, String> {
+    let path = format!("/proc/sys/net/ipv4/conf/{iface}/{key}");
+    std::fs::read_to_string(&path)
+        .map(|value| value.trim().to_string())
+        .map_err(|e| format!("read {path}: {e}"))
+}
+
+fn ensure_ipv4_sysctl_value(iface: &str, key: &str, value: &str) -> Result<(), String> {
+    let mut last_error = String::new();
+    for _ in 0..20 {
+        set_ipv4_sysctl(iface, key, value)?;
+        match read_ipv4_sysctl(iface, key) {
+            Ok(current) if current == value => return Ok(()),
+            Ok(current) => {
+                last_error = format!(
+                    "verify /proc/sys/net/ipv4/conf/{iface}/{key}: got {current}, want {value}"
+                );
+            }
+            Err(err) => {
+                last_error = err;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(last_error)
 }
 
 #[repr(C)]

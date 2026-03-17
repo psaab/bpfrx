@@ -2871,6 +2871,8 @@ fn poll_binding(
                                         recycle_now = false;
                                     } else {
                                         let mut created = 0u64;
+                                        let track_in_userspace = decision.resolution.disposition
+                                            != ForwardingDisposition::LocalDelivery;
                                         let fabric_ingress = ingress_is_fabric(
                                             forwarding,
                                             meta.ingress_ifindex as i32,
@@ -2884,14 +2886,16 @@ fn poll_binding(
                                             synced: false,
                                             nat64_reverse: nat64_info,
                                         };
-                                        if sessions.install_with_protocol(
-                                            flow.forward_key.clone(),
-                                            decision,
-                                            forward_metadata.clone(),
-                                            now_ns,
-                                            meta.protocol,
-                                            meta.tcp_flags,
-                                        ) {
+                                        if track_in_userspace
+                                            && sessions.install_with_protocol(
+                                                flow.forward_key.clone(),
+                                                decision,
+                                                forward_metadata.clone(),
+                                                now_ns,
+                                                meta.protocol,
+                                                meta.tcp_flags,
+                                            )
+                                        {
                                             let _ = publish_live_session_entry(
                                                 binding.session_map_fd,
                                                 &flow.forward_key,
@@ -3000,14 +3004,16 @@ fn poll_binding(
                                             synced: false,
                                             nat64_reverse: nat64_info,
                                         };
-                                        if sessions.install_with_protocol(
-                                            reverse_key.clone(),
-                                            reverse_decision,
-                                            reverse_metadata.clone(),
-                                            now_ns,
-                                            meta.protocol,
-                                            meta.tcp_flags,
-                                        ) {
+                                        if track_in_userspace
+                                            && sessions.install_with_protocol(
+                                                reverse_key.clone(),
+                                                reverse_decision,
+                                                reverse_metadata.clone(),
+                                                now_ns,
+                                                meta.protocol,
+                                                meta.tcp_flags,
+                                            )
+                                        {
                                             let _ = publish_live_session_key(
                                                 binding.session_map_fd,
                                                 &reverse_key,
@@ -6240,11 +6246,8 @@ fn interface_nat_local_resolution(
 fn interface_nat_local_resolution_on_session_miss(
     state: &ForwardingState,
     dst: IpAddr,
-    protocol: u8,
+    _protocol: u8,
 ) -> Option<ForwardingResolution> {
-    if !matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        return None;
-    }
     interface_nat_local_resolution(state, dst)
 }
 
@@ -6289,11 +6292,8 @@ fn ingress_interface_local_resolution_on_session_miss(
     ingress_ifindex: i32,
     ingress_vlan_id: u16,
     dst: IpAddr,
-    protocol: u8,
+    _protocol: u8,
 ) -> Option<ForwardingResolution> {
-    if !matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        return None;
-    }
     ingress_interface_local_resolution(state, ingress_ifindex, ingress_vlan_id, dst)
 }
 
@@ -9259,24 +9259,25 @@ mod tests {
     }
 
     #[test]
-    fn tcp_session_miss_does_not_local_deliver_interface_nat_address() {
+    fn tcp_session_miss_local_delivers_interface_nat_address() {
         let state = build_forwarding_state(&nat_snapshot());
-        assert!(
-            interface_nat_local_resolution_on_session_miss(
-                &state,
-                "172.16.80.8".parse().expect("v4"),
-                PROTO_TCP,
-            )
-            .is_none()
-        );
-        assert!(
-            interface_nat_local_resolution_on_session_miss(
-                &state,
-                "2001:559:8585:80::8".parse().expect("v6"),
-                PROTO_UDP,
-            )
-            .is_none()
-        );
+        let resolved_v4 = interface_nat_local_resolution_on_session_miss(
+            &state,
+            "172.16.80.8".parse().expect("v4"),
+            PROTO_TCP,
+        )
+        .expect("v4 tcp local delivery");
+        assert_eq!(resolved_v4.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved_v4.local_ifindex, 12);
+
+        let resolved_v6 = interface_nat_local_resolution_on_session_miss(
+            &state,
+            "2001:559:8585:80::8".parse().expect("v6"),
+            PROTO_UDP,
+        )
+        .expect("v6 udp local delivery");
+        assert_eq!(resolved_v6.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved_v6.local_ifindex, 12);
     }
 
     #[test]
@@ -9290,28 +9291,29 @@ mod tests {
     }
 
     #[test]
-    fn tcp_session_miss_does_not_local_deliver_ingress_vlan_address() {
+    fn tcp_session_miss_local_delivers_ingress_vlan_address() {
         let state = build_forwarding_state(&nat_snapshot());
-        assert!(
-            ingress_interface_local_resolution_on_session_miss(
-                &state,
-                11,
-                80,
-                "172.16.80.8".parse().expect("dst"),
-                PROTO_TCP,
-            )
-            .is_none()
-        );
-        assert!(
-            ingress_interface_local_resolution_on_session_miss(
-                &state,
-                11,
-                80,
-                "2001:559:8585:80::8".parse().expect("dst"),
-                PROTO_UDP,
-            )
-            .is_none()
-        );
+        let resolved_v4 = ingress_interface_local_resolution_on_session_miss(
+            &state,
+            11,
+            80,
+            "172.16.80.8".parse().expect("dst"),
+            PROTO_TCP,
+        )
+        .expect("v4 tcp ingress local delivery");
+        assert_eq!(resolved_v4.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved_v4.local_ifindex, 12);
+
+        let resolved_v6 = ingress_interface_local_resolution_on_session_miss(
+            &state,
+            11,
+            80,
+            "2001:559:8585:80::8".parse().expect("dst"),
+            PROTO_UDP,
+        )
+        .expect("v6 udp ingress local delivery");
+        assert_eq!(resolved_v6.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved_v6.local_ifindex, 12);
     }
 
     #[test]
